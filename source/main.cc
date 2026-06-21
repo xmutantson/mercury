@@ -688,6 +688,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_liveness();
             }
+            // In-band FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER regression (the
+            // 785-frame decode-but-0-deliver rework). Member test on a throwaway controller
+            // (builds its own CMD/telecom_system per case). Fast + deterministic, no IONOS/RF.
+            // data-flow-inband-retx-epoch.md §5.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_deliver();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -901,6 +909,7 @@ int main(int argc, char *argv[])
     bool test_inband_fallback_cli = false;  // --test-inband-fallback: in-band Stage 4 — LOST-TAG DOWN-LADDER.
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_downladder_cli = false;  // --test-inband-downladder: down-ladder BREAK-orphan + silent-snapshot regression.
+    bool test_inband_deliver_cli = false;  // --test-inband-deliver: forward-healthy reverse-ACK miss -> NO-BREAK deliver regression.
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
@@ -1653,6 +1662,20 @@ int main(int argc, char *argv[])
             // bytes). PART B: a silent (0-peak) snapshot does NOT tick the dead-batch streak.
             // See arq_responder.cc test_inband_downladder + data-flow-inband-downladder.md.
             test_inband_downladder_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-deliver") == 0)
+        {
+            // In-band FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER regression
+            // (one-shot at startup, exit rc). Drives the production connect-liveness guard
+            // discriminator: a forward-healthy miss (in-flight DATA batch + a lower rung)
+            // routes to the NO-BREAK re-present (partial prev preserved + contiguous bsi),
+            // while a genuine dead/livelock STILL BREAKs and a genuine config-change STILL
+            // clears/epochs. fail-before: rebuild with -DINBAND_DELIVER_FAILBEFORE (the
+            // discriminator is removed -> the forward-healthy miss BREAKs -> 0 deliver).
+            // See arq_responder.cc test_inband_deliver + data-flow-inband-retx-epoch.md §5.
+            test_inband_deliver_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3209,6 +3232,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_downladder();
             printf("[FLAG] Inband-downladder test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_deliver_cli) {
+            // In-band FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER regression (one-shot,
+            // exit rc). Builds its own CMD/telecom_system instances per case internally.
+            printf("[FLAG] --test-inband-deliver: invoking in-band forward-healthy reverse-ACK "
+                   "miss -> NO-BREAK deliver regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_deliver();
+            printf("[FLAG] Inband-deliver test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

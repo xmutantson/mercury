@@ -5,9 +5,13 @@ redesign 1b1ee01 + the §3 deliver-before-break 98edd4d + liveness guard 9b916b7
 guard connect-gate 1994a85).
 Scope: the `MERCURY_INBAND_RATE=1` ON arm's residual **decode-but-0-deliver** under a
 forward-healthy reverse-ACK turnaround miss → CMD EXHAUSTED-BREAK.
-Status: **AUDIT COMPLETE — CLAUDE.md §2/§5 STOP. The 0-deliver is NOT a single
-point-fixable root; it is THREE coupled holes across the BREAK / cmd-epoch /
-RX-reshrink boundary. NO FIX IMPLEMENTED (per the gate). Owner decision required.**
+Status: **IMPLEMENTED (owner-ratified). The §5 consolidated rework is in: a forward-
+healthy reverse-ACK turnaround MISS on a still-decoding inband link is routed to the
+NO-BREAK `inband_route_failure_demote()` re-present instead of the connect-liveness
+guard's `send_break_pattern()`. Closes HOLE A/B/C at once; the genuine BREAK (true-loss)
+and config-change paths are intact. Paired regression `--test-inband-deliver` (3 cases,
+fail-before reproduces the 0-deliver). Build o3 green; `--test` exit 0; legacy
+byte-identical (purely additive, feature-gated). See §7.**
 
 This is the 4th+ defect in the same gearshift-acq → delivery layer boundary
 (after the D1→D5 prev-bump chain). Per CLAUDE.md §2 a config-unchanged no-op BREAK
@@ -249,4 +253,91 @@ case asserting clear/epoch STILL happen).
 - [?] Does a NO-BREAK re-present need a ROBUST_0 coordination round for a genuinely
   faded reverse channel, or can the contiguous re-send ride the current OFDM config?
   (`inband_route_failure_demote` re-coordinates via SET_CONFIG; a same-config
-  re-present may not need it.) Resolve in the §5 design.
+  re-present may not need it.) Resolve in the §5 design. **[RESOLVED in §7: the
+  re-present demotes ONE rung (config_ladder_down) via the unilateral CONFIG_TAG, so it
+  re-coordinates onto a lower OFDM rung — it does NOT need a ROBUST_0 round; the genuine
+  fade is still caught by the down-ladder + the bottom-rung dead-batch floor.]**
+
+---
+
+## §7. IMPLEMENTED ROUTING + DISCRIMINATOR (the ratified §5 rework)
+
+Commit on `fix/inband-downladder-delivery`. Purely ADDITIVE (4 files, +506/-0): nothing
+in any legacy path was edited; the only new live-path code sits inside the already-
+`inband_rate_feature_enabled()`-gated `inband_connect_liveness_guard()`.
+
+### §7.1 Where the BREAK was actually coming from (the §6 [?] resolved by source)
+Every inband DATA-path Class-A trigger (retx-runaway :1628, turbo :2574/:2680/:2776,
+emergency-NACK :4693, frame-gearshift :4073/:4295) ALREADY routes through
+`inband_route_failure_demote()` first and only reaches `send_break_pattern()` via
+`inband_cmd_dead_batch_floor_reached()` (the SESSION_DEAD floor, at the ladder bottom).
+The **one** inband path that fires a BREAK on a forward-healthy CONNECTED link is the
+**connect-liveness guard** (`inband_connect_liveness_guard()`, arq_commander.cc:3066):
+it fires when `link_status==CONNECTED` AND `stats.nAcked_data` is FLAT for N polls AND
+not in a data phase. **`stats.nAcked_data` advances ONLY on a RECEIVED reverse-ACK/SACK**
+(the sole producers are arq_commander.cc:61, :3659, :3688, :3714 — VERIFIED). A
+forward-HEALTHY reverse-ACK turnaround MISS — the RX decodes our forward DATA fine but
+its SACK lands outside the CMD listen window — therefore leaves `nAcked_data` flat and
+trips this guard, which fired the `send_break_pattern()` that detonated HOLE A/B/C. So
+the §6 [?] is resolved from source: the trigger is the **connect-liveness guard**, not a
+data-path BREAK.
+
+### §7.2 The rework (file:line old→new)
+- **arq_commander.cc:3061 NEW** `cmd_has_inflight_data_batch() const` — true iff any
+  `messages_tx[i].status != FREE && length > 0` (the same in-flight-frame scan every
+  BREAK/demote re-stage uses, e.g. :298/:386/:2923). The CMD-side proxy for
+  "forward-healthy / not genuinely dead".
+- **arq_commander.cc:3178-3198 NEW** (inside the guard's production `#else`, BEFORE the
+  `INBAND_LIVENESS_MAX_BREAKS` check, gated `#ifndef INBAND_DELIVER_FAILBEFORE`): if
+  `cmd_has_inflight_data_batch() && !config_is_at_bottom(current_configuration,
+  robust_enabled)` → `inband_route_failure_demote(config_ladder_down(current,robust),
+  "forward_healthy_revack_miss")`; on success re-arm the stall window + the liveness-break
+  budget and `return true` (NO `send_break_pattern`, NO `emergency_break_active`). On a
+  no-op demote (raced to the bottom) it falls through to the genuine BREAK below
+  (unchanged). The pre-existing BREAK firing at :3200+ is byte-untouched.
+- **arq.h:3402 NEW** declaration of `cmd_has_inflight_data_batch()`.
+
+### §7.3 The discriminator (forward-healthy vs true-loss) — correct at BOTH edges
+- forward-HEALTHY ⇔ an in-flight forward DATA batch is queued (`messages_tx[]` non-FREE)
+  AND a lower rung exists. The no-break demote PRESERVES the retx queue + partial prev
+  (no `send_break_pattern` ⇒ the RX `break_detected` handler is never entered ⇒ no
+  ROBUST_0 reshrink-orphan — HOLE B), rolls `cmd_batch_seq_id` back to `min_inflight_bsi`
+  (contiguous re-present, no D3.1 GAP-ABORT — HOLE A), and never tears down a healthy link
+  (HOLE C). Does NOT tick the true-loss floor; does NOT consume the liveness-break budget.
+- genuine DEAD/livelock ⇔ NO in-flight DATA batch (a connect/negotiate handshake stuck
+  with zero forward DATA ever — the guard's original purpose) OR already at the ladder
+  bottom (no rung to demote to). Falls through to the bounded §7 BREAK→ROBUST_0, intact.
+- **Too-narrow edge** (re-opens the 0-deliver): closed — the demote preserves the partial
+  prev + contiguous bsi (verified: `--test-inband-deliver` PART A/B flip vs fail-before).
+- **Too-broad edge** (strands a dead session in a no-break loop): closed — each demote
+  LOWERS the rung; at the bottom the demote returns false ⇒ the genuine BREAK fires, and
+  the `INBAND_LIVENESS_MAX_BREAKS` hard-reset still backstops a link the demotes can't save.
+
+### §7.4 Invariants now HELD (cf. the §2 violation table)
+| # | Invariant | Status after §7 |
+|---|-----------|-----------------|
+| INV-1 | a RECEIVED-partial in-flight batch survives until delivered/lost | **HELD** — no `send_break_pattern` on a forward-healthy miss ⇒ the RX prev-wipe (arq_responder.cc:482-483) is never reached; the partial survives + completes on the contiguous re-present (`--test-inband-deliver` B1-B3). |
+| INV-2 | `cmd_batch_seq_id` advances only for a genuinely-new batch | **HELD** — the no-break route rolls the bsi back to `min_inflight_bsi` (PART A4). |
+| INV-3 | the in-flight retx queue survives until delivered/lost | **HELD on the forward-healthy path** — the no-break re-present re-queues plaintext at the lower rung (the demote's own `clear_retx_queue` is a re-stage, not a loss); on a GENUINE config-change/true-loss the clear is correct (PART D3). |
+| INV-5 | a BREAK is a real recovery event, never a config NO-OP | **HELD** — a forward-healthy reverse-ACK miss never reaches a BREAK at all; the config-NO-OP EXHAUSTED-BREAK is no longer reached by this trigger. |
+
+### §7.5 Paired regression — `--test-inband-deliver` (arq_responder.cc `test_inband_deliver`)
+Wired into `mercury.exe --test` (main.cc) + a standalone `--test-inband-deliver` flag.
+fail-before = rebuild with `-DINBAND_DELIVER_FAILBEFORE` (removes BOTH the guard
+discriminator AND switches the test to assert the bug state). VERIFIED both arms:
+- **PART A** (CMD routing): pass-after NO BREAK (`emergency_break_active==0`), demoted
+  CONFIG_10→9, bsi rolled 10→7, floor+liveness-budget untouched. fail-before: BREAK fired
+  (`==1`), NOT demoted (stays 10), bsi NOT rolled.
+- **PART B** (RX consequence): pass-after a 24/25 PARTIAL prev is PRESERVED → completes →
+  all 25 frames (400 B) delivered in order. fail-before: the BREAK reshrink orphans the
+  partial (received 24→1) → **0 app bytes** (the HW 0-deliver, faithfully reproduced).
+- **PART C** (genuine true-loss STILL BREAKs): (i) the guard with NO in-flight DATA STILL
+  fires the BREAK; (ii) at the ladder bottom the SESSION_DEAD floor STILL fires at exactly
+  N∈{1,2,3}. Identical in both arms (the discriminator does not weaken the death path).
+- **PART D** (genuine config-change STILL clears/epochs): retx cleared, unilateral config
+  applied, bsi rolled, the unilateral one-shot armed. Identical in both arms.
+
+Build: `bash build.sh o3` green. `mercury.exe --test` exit 0, all 6 groups `failed=0`
+(incl. `test_inband_liveness` + `test_inband_downladder`, which drive the SAME guard /
+deliver primitives → no regression). Legacy byte-identical by construction (+506/-0,
+feature-gated; OFF early-returns from the guard before the discriminator).

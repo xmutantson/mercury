@@ -1996,6 +1996,20 @@ public:
   // inband_try_down_ladder_on_decode_fail. data-flow-inband-downladder.md §3/§5.3.
   int test_inband_downladder();
 
+  // IN-BAND FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER REGRESSION (CLI
+  // --test-inband-deliver). The 785-frame decode-but-0-deliver rework: a forward-healthy
+  // reverse-ACK turnaround MISS (nAcked_data flat) tripped the connect-liveness guard's
+  // BREAK, detonating the three coupled holes (retx-clear/bsi-advance, RX partial-prev
+  // wipe, config-NO-OP teardown). PART A: the guard routes a forward-healthy miss (an
+  // in-flight DATA batch + a lower rung) to the NO-BREAK re-present + rolls the bsi back
+  // contiguous. PART B: the RX consequence — a 24/25 PARTIAL prev is PRESERVED (no BREAK ->
+  // no ROBUST_0 reshrink orphan) and delivers; fail-before the reshrink orphans it -> 0
+  // bytes. PART C: a GENUINE total loss (no in-flight DATA, or at the ladder bottom) STILL
+  // BREAKs. PART D: a GENUINE config-change demote STILL clears/epochs. fail-before
+  // (-DINBAND_DELIVER_FAILBEFORE removes the discriminator): PART A/B FAIL (the 0-deliver),
+  // PART C/D PASS (unchanged). Returns 0=PASS, 1=FAIL. data-flow-inband-retx-epoch.md §5.
+  int test_inband_deliver();
+
   // STAGE 4c D5 BREAK-OBSOLETE TEST (CLI --test-inband-no-break). Synthetic-fire of the
   // COMMANDER Class-A degradation routing: PART A drives inband_route_failure_demote (the
   // body all four Class-A sites call) and asserts the link DEMOTES one rung and stays
@@ -3399,6 +3413,14 @@ public:
   // genuine send_break_pattern() should fire.
   int  cmd_inband_session_dead_batches = 0;
   bool inband_cmd_dead_batch_floor_reached();
+  // FORWARD-HEALTHY discriminator (data-flow-inband-retx-epoch.md §5). True iff the
+  // commander still holds an in-flight forward DATA batch in messages_tx[] (any non-FREE,
+  // length>0 slot). The CMD-side proxy for "still delivering forward / not genuinely
+  // dead": a forward-healthy reverse-ACK turnaround MISS leaves the just-aired batch in
+  // messages_tx[] awaiting its missed reverse-ACK; a genuine connect/negotiate livelock
+  // holds NO in-flight DATA batch. Used by inband_connect_liveness_guard() to route a
+  // forward-healthy miss to the NO-BREAK re-present instead of the BREAK->ROBUST cascade.
+  bool cmd_has_inflight_data_batch() const;
   // ---- In-band CONNECT-LIVENESS GUARD (data-flow-inband-connect-liveness.md) ----
   // The retained true-loss BREAK is wired only to a DATA-loss tick
   // (inband_cmd_dead_batch_floor_reached). A connect/negotiate handshake that stalls

@@ -3049,6 +3049,23 @@ bool cl_arq_controller::inband_cmd_dead_batch_floor_reached()
 // arq_responder.cc sees the SAME bound.)
 // ============================================================================
 
+// FORWARD-HEALTHY discriminator (data-flow-inband-retx-epoch.md §5). True iff the
+// commander still holds an in-flight forward DATA batch in messages_tx[] (one or more
+// non-FREE, non-empty slots). This is the CMD-side proxy for "the link is still
+// delivering forward / not genuinely dead": a forward-healthy reverse-ACK turnaround
+// MISS leaves the just-aired batch sitting in messages_tx[] awaiting its (missed)
+// reverse-ACK, so the slots are still occupied; a genuine connect/negotiate livelock
+// (zero forward DATA ever) has NO in-flight DATA batch. The detector is the SAME
+// non-FREE && length>0 scan every BREAK/demote re-stage uses (e.g. :298, :386, :2923).
+// Const, side-effect-free; safe to call from the once-per-poll liveness guard.
+bool cl_arq_controller::cmd_has_inflight_data_batch() const
+{
+	for(int i=0; i<nMessages; i++)
+		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+			return true;
+	return false;
+}
+
 int cl_arq_controller::inband_liveness_stall_polls_count()
 {
 	if(inband_liveness_stall_polls < 0)
@@ -3124,6 +3141,63 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	fflush(stdout);
 	return false;   // no recovery: the livelock is reproduced (test asserts BREAK-count==0)
 #else
+	// ── FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK RE-PRESENT (data-flow-inband-retx-
+	//    epoch.md §5; closes HOLE A/B/C of the in-band 0-deliver). ──────────────────────
+	// stats.nAcked_data advances ONLY when the CMD RECEIVES a reverse-ACK/SACK (the only
+	// producers are arq_commander.cc:61/:3659/:3688/:3714). A forward-HEALTHY reverse-ACK
+	// turnaround MISS — the RX is decoding our forward DATA fine, but its SACK lands
+	// outside the CMD listen window — therefore leaves nAcked_data FLAT and trips this
+	// stall, even though the link is alive. Firing send_break_pattern() here detonates the
+	// three coupled holes (the EXHAUSTED-BREAK clears the retx queue + advances the bsi
+	// epoch; the RX break_detected handler wipes the in-flight PARTIAL prev; a config-NO-OP
+	// teardown of a healthy link), delivering 0 bytes of a still-decoding 785-frame stream.
+	//
+	// DISCRIMINATOR (correct at BOTH edges):
+	//   forward-HEALTHY  ⇔ an in-flight forward DATA batch is still queued in messages_tx[]
+	//                      (cmd_has_inflight_data_batch()) AND a lower rung exists
+	//                      (!config_is_at_bottom). Route to inband_route_failure_demote():
+	//                      it PRESERVES the in-flight retx queue + partial prev (no
+	//                      send_break_pattern ⇒ the RX never wipes the prev), rolls
+	//                      cmd_batch_seq_id back to the in-flight bsi (the re-sent batch is
+	//                      CONTIGUOUS ⇒ no GAP-ABORT), and re-presents on the lower rung —
+	//                      so the partial batch DELIVERS. NOT a liveness BREAK; does NOT
+	//                      consume the INBAND_LIVENESS_MAX_BREAKS budget; does NOT tick the
+	//                      true-loss floor (a re-present is not a death).
+	//   genuine DEAD/livelock ⇔ NO in-flight DATA batch (a connect/negotiate handshake stuck
+	//                      with zero forward DATA ever) OR already at the ladder bottom (no
+	//                      rung to demote to). Falls through UNCHANGED to the bounded
+	//                      §7 true-loss BREAK→ROBUST_0 below — the genuine recovery is intact.
+	// Too-narrow edge (re-opens the 0-deliver) is closed because the demote preserves the
+	// partial prev + contiguous bsi. Too-broad edge (stranding a dead session in a no-break
+	// loop) is closed because each demote LOWERS the rung; at the bottom the demote returns
+	// false and the genuine BREAK fires — and the INBAND_LIVENESS_MAX_BREAKS hard-reset below
+	// still backstops a link the demotes cannot rescue.
+	// FAIL-BEFORE (-DINBAND_DELIVER_FAILBEFORE, --test-inband-deliver): the discriminator is
+	// REMOVED so a forward-healthy miss falls through to the BREAK below — reproducing the
+	// retx-clear/bsi-advance/partial-prev-wipe 0-deliver the rework closes.
+#ifndef INBAND_DELIVER_FAILBEFORE
+	if(cmd_has_inflight_data_batch()
+	   && !config_is_at_bottom(current_configuration, robust_enabled))
+	{
+		int demote_target = config_ladder_down(current_configuration, robust_enabled);
+		if(inband_route_failure_demote(demote_target, "forward_healthy_revack_miss"))
+		{
+			printf("[INBAND-LIVENESS] forward-healthy reverse-ACK MISS (nAcked_data flat but a "
+				"forward DATA batch is in flight at config %d) — routed to the NO-BREAK "
+				"re-present (demote -> %d), NOT the BREAK->ROBUST cascade; the in-flight partial "
+				"batch is preserved and delivers contiguously\n",
+				current_configuration, demote_target);
+			fflush(stdout);
+			// A re-present is forward progress, not a death — re-arm the stall window and the
+			// liveness-break budget so a recovered link is not later mis-classified as dead.
+			cmd_inband_liveness_no_progress_polls = 0;
+			cmd_inband_liveness_breaks            = 0;
+			return true;   // the demote owns the next transition (caller returns)
+		}
+		// demote was a no-op (raced to a bottom rung) — fall through to the genuine BREAK.
+	}
+#endif // INBAND_DELIVER_FAILBEFORE
+
 	if(cmd_inband_liveness_breaks >= INBAND_LIVENESS_MAX_BREAKS)
 	{
 		// Bounded escalation: repeated liveness BREAKs did not recover the link -> it is

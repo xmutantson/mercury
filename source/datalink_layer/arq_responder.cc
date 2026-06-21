@@ -7446,6 +7446,382 @@ int cl_arq_controller::test_inband_downladder()
 }
 
 // ============================================================================
+// In-band FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK DELIVER — --test-inband-deliver
+// data-flow-inband-retx-epoch.md §5.  (the 785-frame decode-but-0-deliver rework)
+// ============================================================================
+//
+// The in-band ON arm decoded 785 forward DATA frames yet delivered 0 bytes: a forward-
+// HEALTHY reverse-ACK turnaround MISS (the RX's SACK lands outside the CMD listen window,
+// so stats.nAcked_data — advanced ONLY on a RECEIVED reverse-ACK — stays flat) tripped the
+// CONNECT-LIVENESS guard, which fired send_break_pattern(). The BREAK detonated three
+// coupled holes: the EXHAUSTED-BREAK cleared the retx queue + advanced the bsi epoch (A);
+// the RX break_detected handler wiped the in-flight PARTIAL prev (B); a config-NO-OP teardown
+// of a healthy link (C). The rework routes a forward-healthy miss — an in-flight DATA batch
+// still queued (cmd_has_inflight_data_batch()) AND a lower rung exists — to the NO-BREAK
+// inband_route_failure_demote() re-present (preserves the retx queue + partial prev, rolls
+// the bsi back contiguous), and ONLY a genuine dead/livelock (no in-flight DATA, or at the
+// ladder bottom) still BREAKs.
+//
+//   PART A — Case (1): a forward-healthy reverse-ACK miss routes NO-BREAK and rolls the bsi
+//     epoch back to the in-flight batch (contiguous re-present). fail-before
+//     (-DINBAND_DELIVER_FAILBEFORE removes the discriminator): the guard FIRES the BREAK,
+//     does NOT demote, does NOT roll the bsi back.
+//   PART B — Case (1) RX consequence: because NO BREAK is sent, the RX break_detected
+//     handler is never entered, so a RECEIVED-PARTIAL in-flight batch (24/25) is PRESERVED
+//     (no ROBUST_0 reshrink orphan); the partial completes + delivers after the contiguous
+//     re-present. fail-before: the BREAK reshrink orphans the partial -> 0 bytes (the HW
+//     0-deliver). Drives the SAME production deliver/orphan primitives test_inband_downladder
+//     uses, here on a PARTIAL (received<expected) prev — the case
+//     deliver_complete_inflight_before_break canNOT rescue (arq_common.cc:4012).
+//   PART C — Case (2): a GENUINE total session loss STILL BREAKs. (i) the guard with NO
+//     in-flight DATA batch (a connect/negotiate livelock) STILL fires the §7 BREAK; (ii) at
+//     the ladder bottom the dead-batch floor STILL fires the BREAK at exactly SESSION_DEAD.
+//   PART D — Case (3): a GENUINE config-CHANGE demote STILL clears/epochs (the retx queue is
+//     cleared, the unilateral config applies, the SET_CONFIG tag is queued) — the no-break
+//     route reuses this body, but it remains a real config transition.
+//
+// Returns 0 = ALL PASS, 1 = any FAIL. fail-before arm: PART A/B FAIL (the 0-deliver), PART
+// C/D PASS (those paths are unchanged) — i.e. the discriminator is load-bearing for delivery
+// and surgically scoped (it does NOT weaken the genuine BREAK / config-change paths).
+int cl_arq_controller::test_inband_deliver()
+{
+	const char* TAG = "[TEST-INBAND-DELIVER]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). ---
+	const char* prev_ir = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_ir_s = prev_ir ? std::string(prev_ir) : std::string();
+	bool had_ir = (prev_ir != NULL);
+	const char* prev_lp = std::getenv("MERCURY_INBAND_LIVENESS_POLLS");
+	std::string prev_lp_s = prev_lp ? std::string(prev_lp) : std::string();
+	bool had_lp = (prev_lp != NULL);
+	auto putenv_kv = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	auto restore_env = [&](){
+		putenv_kv("MERCURY_INBAND_RATE",           had_ir ? prev_ir_s.c_str() : "");
+		putenv_kv("MERCURY_INBAND_LIVENESS_POLLS", had_lp ? prev_lp_s.c_str() : "");
+	};
+
+	const int STALL_N = 5;   // shrink the liveness threshold so the directed loop is fast
+
+	// Build a fresh COMMANDER at `cfg`, inband-resolution forced ON, link CONNECTED in the
+	// control-plane stall signature (TRANSMITTING_CONTROL, nAcked_data flat). passive_monitor
+	// no-ops the real PHY BREAK so the guard's DECISION (emergency_break_active / the demote)
+	// is the observable — the SAME technique test_inband_liveness uses.
+	auto make_cmd = [&](int cfg, cl_telecom_system** out_ts) -> cl_arq_controller* {
+		putenv_kv("MERCURY_INBAND_RATE", "1");
+		char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%d", STALL_N);
+		putenv_kv("MERCURY_INBAND_LIVENESS_POLLS", nbuf);
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* cmd = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE;
+		cmd->telecom_system = ts;
+		cmd->narrowband_enabled = NO;
+		cmd->role = COMMANDER;
+		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;   // ladder path: target=negotiated
+		cmd->load_configuration(cfg, FULL, NO);
+		cmd->link_status = CONNECTED;
+		cmd->connection_status = TRANSMITTING_CONTROL;       // the livelock signature
+		cmd->sack_v2_enabled = true;
+		cmd->compression_enabled = false;                    // v2 in-order path (bsi rollback)
+		cmd->gear_shift_on = YES;
+		cmd->robust_enabled = NO;
+		cmd->inband_rate_enabled = 1;
+		cmd->inband_liveness_stall_polls = -1;               // force env re-resolve
+		cmd->send_break_pattern_count = 0;
+		cmd->passive_monitor = true;                         // no-op the real PHY BREAK
+		*out_ts = ts;
+		return cmd;
+	};
+
+	// Stage an IN-FLIGHT (partial) forward DATA batch in messages_tx[] at bsi=B, with the
+	// epoch counter already advanced ahead of B (cmd_batch_seq_id = B + ahead) — exactly the
+	// pre-fix state a turnaround miss leaves: the batch is aired + sitting in messages_tx[]
+	// awaiting its missed reverse-ACK, while cmd_batch_seq_id moved on. Returns B.
+	auto stage_inflight_batch = [&](cl_arq_controller* cmd, int B, int n_frames, int ahead) {
+		for(int i=0;i<cmd->nMessages;i++) cmd->messages_tx[i].status = FREE;
+		for(int i=0;i<n_frames && i<cmd->nMessages;i++)
+		{
+			cmd->messages_tx[i].status       = PENDING_ACK;   // in flight (non-FREE)
+			cmd->messages_tx[i].length       = 16;
+			cmd->messages_tx[i].batch_seq_id  = B & 0xFF;
+			for(int j=0;j<16;j++) cmd->messages_tx[i].data[j] = (char)(i*7+j);
+		}
+		cmd->cmd_batch_seq_id = (B + ahead) & 0xFF;
+	};
+
+	// ========================================================================
+	// PART A — Case (1): a forward-healthy reverse-ACK MISS routes NO-BREAK + rolls the bsi
+	// epoch back to the in-flight batch (contiguous re-present). Run BOTH arms in ONE process.
+	// ========================================================================
+	{
+		const int CFG_FROM = CONFIG_10;                                  // ladder idx 13
+		const int CFG_TO   = config_ladder_down(CFG_FROM, /*robust*/NO); // CONFIG_9
+		const int B        = 7;                                          // in-flight batch bsi
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_FROM, &ts);
+		stage_inflight_batch(cmd, B, /*n_frames=*/24, /*ahead=*/3);      // 24/25 partial; epoch +3
+
+		check(cmd->cmd_has_inflight_data_batch(),
+			"A0 an in-flight forward DATA batch is queued (the link is forward-healthy)",
+			cmd->cmd_has_inflight_data_batch() ? 1 : 0, 1);
+		check(cmd->current_configuration == CFG_FROM,
+			"A0b CMD starts at CONFIG_10", cmd->current_configuration, CFG_FROM);
+
+		// Drive the PRODUCTION guard across the stall (stats.nAcked_data held flat — the
+		// reverse-ACK miss). At the threshold the guard decides BREAK-or-demote.
+		bool fired = false;
+		for(int p=1; p<=STALL_N+2; p++)
+			if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+		check(fired, "A1 the guard reached its decision at the stall threshold",
+			fired ? 1 : 0, 1);
+
+#ifndef INBAND_DELIVER_FAILBEFORE
+		// PASS-AFTER: the discriminator routed the forward-healthy miss to the NO-BREAK
+		// re-present. NO BREAK state armed; the link demoted one rung; the bsi epoch rolled
+		// back to the in-flight batch so the re-sent batch is CONTIGUOUS (no GAP-ABORT).
+		check(cmd->emergency_break_active == 0,
+			"A2 NO BREAK fired (forward-healthy miss routed to the no-break re-present)",
+			cmd->emergency_break_active, 0);
+		check(cmd->current_configuration == CFG_TO,
+			"A3 link STAYS ALIVE, demoted one rung to CONFIG_9 (re-present, not ROBUST_0 BREAK)",
+			cmd->current_configuration, CFG_TO);
+		check((cmd->cmd_batch_seq_id & 0xFF) == (B & 0xFF),
+			"A4 cmd_batch_seq_id ROLLED BACK to the in-flight bsi (contiguous, no D3.1 GAP-ABORT)",
+			cmd->cmd_batch_seq_id & 0xFF, B & 0xFF);
+		check(cmd->cmd_inband_session_dead_batches == 0,
+			"A5 the true-loss floor did NOT tick (a re-present is not a death)",
+			cmd->cmd_inband_session_dead_batches, 0);
+		check(cmd->cmd_inband_liveness_breaks == 0,
+			"A6 the liveness-BREAK budget was NOT consumed (re-present is not a liveness BREAK)",
+			cmd->cmd_inband_liveness_breaks, 0);
+#else
+		// FAIL-BEFORE: the discriminator is removed, so a forward-healthy miss reaches the
+		// BREAK -> the retx queue clears + the bsi epoch is NOT rolled back -> the RX gaps ->
+		// 0 delivered. Assert the (broken) BREAK-fired state the rework eliminates.
+		printf("%s INBAND_DELIVER_FAILBEFORE: discriminator REMOVED — a forward-healthy miss "
+			"BREAKs (the 0-deliver cascade)\n", TAG);
+		fflush(stdout);
+		check(cmd->emergency_break_active == 1,
+			"A2 FAILBEFORE: the BREAK fired on a forward-healthy miss (the bug)",
+			cmd->emergency_break_active, 1);
+		check(cmd->current_configuration == CFG_FROM,
+			"A3 FAILBEFORE: the link was NOT demoted (BREAK->ROBUST_0 teardown instead)",
+			cmd->current_configuration, CFG_FROM);
+		check((cmd->cmd_batch_seq_id & 0xFF) != (B & 0xFF),
+			"A4 FAILBEFORE: the bsi epoch was NOT rolled back (the re-present gaps)",
+			cmd->cmd_batch_seq_id & 0xFF, (B + 3) & 0xFF);
+#endif
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART B — Case (1) RX consequence: a RECEIVED-PARTIAL in-flight prev (24/25) is
+	// PRESERVED on the no-break path (the RX break_detected handler is never entered, so the
+	// ROBUST_0 reshrink that orphans it never runs) — and on the fail-before BREAK path the
+	// reshrink orphans it -> 0 bytes. Models the SAME RX reshrink-orphan primitive
+	// test_inband_downladder PART A drives, here on a PARTIAL prev (the case
+	// deliver_complete_inflight_before_break canNOT rescue: arq_common.cc:4012 received<exp).
+	// ========================================================================
+	{
+		putenv_kv("MERCURY_INBAND_RATE", "1");
+		this->nMessages          = 255;
+		this->max_data_length    = 170;
+		this->max_message_length = 200;
+		this->max_header_length  = 6;
+		int alloc_rc = init_messages_buffers();
+		if(alloc_rc != SUCCESSFUL)
+		{
+			printf("%s ERROR: init_messages_buffers() failed (rc=%d)\n", TAG, alloc_rc);
+			fflush(stdout);
+			restore_env();
+			return 1;
+		}
+		this->fifo_buffer_rx.set_size(262144);
+		this->fifo_buffer_rx.flush();
+
+		const int N       = 25;   // OFDM batch size
+		const int RECVD   = 24;   // a 24/25 PARTIAL in-flight batch (one tail frame missing)
+		const int SUB_LEN = 16;
+		this->sack_v2_enabled                   = true;
+		this->sack_enabled                      = true;
+		this->axis3_sack_mode                   = 1;
+		this->compression_enabled               = false;
+		this->passive_monitor                   = false;
+		this->link_status                       = CONNECTED;
+		this->connection_status                 = RECEIVING;
+		this->inband_rate_enabled               = 1;
+		this->data_batch_size                   = N;
+		this->batch_data_delivered              = false;
+		this->rsp_current_expected_batch_seq_id = 4;
+		this->rsp_last_delivered_batch_seq_id   = 3;
+		this->rsp_prev_batch_seq_id             = 3;
+		this->rsp_prev_batch_active             = true;
+		this->rsp_prev_batch_received_count     = RECVD;   // PARTIAL
+		this->rsp_prev_batch_expected_count     = N;
+
+		for(int i=0;i<this->nMessages;i++)
+		{
+			messages_rx_prev[i].status = FREE; messages_rx_prev[i].length = 0;
+			messages_rx_prev[i].batch_seq_id = -1; messages_rx[i].status = FREE;
+		}
+		for(int i=0;i<RECVD;i++)
+		{
+			messages_rx_prev[i].type            = DATA_LONG;
+			messages_rx_prev[i].id              = (char)(unsigned char)i;
+			messages_rx_prev[i].length          = SUB_LEN;
+			messages_rx_prev[i].status          = RECEIVED;
+			messages_rx_prev[i].batch_seq_id    = 3;
+			messages_rx_prev[i].sequence_number = (char)(unsigned char)i;
+			for(int j=0;j<SUB_LEN;j++) messages_rx_prev[i].data[j] = (char)(i*7+j);
+		}
+
+#ifdef INBAND_DELIVER_FAILBEFORE
+		// FAIL-BEFORE: a BREAK was sent -> the RX break_detected handler runs the ROBUST_0
+		// reshrink (deliver_complete_inflight_before_break hard-returns 0 for a PARTIAL prev),
+		// orphaning the 24 RECEIVED frames -> the batch is no longer deliverable -> 0 bytes.
+		int saved_cfg = this->current_configuration;
+		this->current_configuration = robust_enabled ? ROBUST_0 : CONFIG_0;
+		(void)deliver_complete_inflight_before_break();   // returns 0 (partial — cannot rescue)
+		set_data_batch_size(1);                            // rescan_prev_on_batch_shrink: orphan
+		this->current_configuration = saved_cfg;
+		check(rsp_prev_batch_received_count < RECVD,
+			"B1 FAILBEFORE: the BREAK reshrink ORPHANED the partial prev (received collapsed)",
+			rsp_prev_batch_received_count, RECVD - 1);
+		check((this->fifo_buffer_rx.get_size() - this->fifo_buffer_rx.get_free_size()) == 0,
+			"B2 FAILBEFORE: 0 app bytes delivered (the HW 0-deliver of a still-decoding batch)",
+			this->fifo_buffer_rx.get_size() - this->fifo_buffer_rx.get_free_size(), 0);
+#else
+		// PASS-AFTER: NO BREAK is sent (the CMD took the no-break re-present), so the RX
+		// break_detected handler is NEVER entered and the reshrink NEVER runs. The partial
+		// prev survives intact; the missing tail frame arrives on the contiguous re-present
+		// (modeled here as the RX receiving frame 24), the batch COMPLETES, and the standard
+		// prev-deliver flushes all 25 frames in order. We drive the production deliver
+		// primitive (deliver_complete_inflight_before_break) AFTER the completion to prove the
+		// preserved batch delivers (no orphan, no reshrink touched it).
+		check(rsp_prev_batch_active && rsp_prev_batch_received_count == RECVD,
+			"B1 the PARTIAL prev is PRESERVED (no BREAK -> no ROBUST_0 reshrink orphan)",
+			rsp_prev_batch_received_count, RECVD);
+		// The contiguous re-present lands the missing tail frame (slot 24).
+		messages_rx_prev[RECVD].type            = DATA_LONG;
+		messages_rx_prev[RECVD].id              = (char)(unsigned char)RECVD;
+		messages_rx_prev[RECVD].length          = SUB_LEN;
+		messages_rx_prev[RECVD].status          = RECEIVED;
+		messages_rx_prev[RECVD].batch_seq_id    = 3;
+		messages_rx_prev[RECVD].sequence_number = (char)(unsigned char)RECVD;
+		for(int j=0;j<SUB_LEN;j++) messages_rx_prev[RECVD].data[j] = (char)(RECVD*7+j);
+		rsp_prev_batch_received_count = N;   // now COMPLETE (25/25)
+		int delivered = deliver_complete_inflight_before_break();
+		check(delivered == 1,
+			"B2 the now-COMPLETE preserved batch delivers (helper flushed it)", delivered, 1);
+		check((this->fifo_buffer_rx.get_size() - this->fifo_buffer_rx.get_free_size()) == N*SUB_LEN,
+			"B3 all 25 frames delivered to the app in order (the 0-deliver is closed)",
+			this->fifo_buffer_rx.get_size() - this->fifo_buffer_rx.get_free_size(), N*SUB_LEN);
+#endif
+	}
+
+	// ========================================================================
+	// PART C — Case (2): a GENUINE total session loss STILL BREAKs (the discriminator does
+	// NOT weaken the death path). Two sub-cases, run on BOTH arms (the genuine BREAK is
+	// UNCHANGED by the discriminator, so these PASS in fail-before too).
+	// ========================================================================
+	{
+		// (i) The connect-liveness guard with NO in-flight DATA batch (a connect/negotiate
+		// livelock — zero forward DATA ever) STILL fires the §7 BREAK.
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_10, &ts);
+		for(int i=0;i<cmd->nMessages;i++) cmd->messages_tx[i].status = FREE;   // no in-flight DATA
+		check(!cmd->cmd_has_inflight_data_batch(),
+			"C0 no in-flight DATA batch (a genuine connect/negotiate livelock)",
+			cmd->cmd_has_inflight_data_batch() ? 1 : 0, 0);
+		bool fired = false;
+		for(int p=1; p<=STALL_N+2; p++)
+			if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+		check(fired && cmd->emergency_break_active == 1,
+			"C1 a genuine livelock (no in-flight DATA) STILL fires the BREAK->ROBUST_0",
+			(fired && cmd->emergency_break_active == 1) ? 1 : 0, 1);
+		delete cmd; delete ts;
+	}
+	{
+		// (ii) At the ladder BOTTOM the SESSION_DEAD_BATCHES floor STILL fires the one
+		// permitted BREAK at exactly the Nth total-loss batch (sweep N in {1,2,3}).
+		for(int N=1; N<=3; N++)
+		{
+			char nbuf[16]; snprintf(nbuf, sizeof(nbuf), "%d", N);
+			putenv_kv("MERCURY_INBAND_DEAD_BATCHES", nbuf);
+			cl_telecom_system* ts = nullptr;
+			cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+			cmd->inband_dead_batches_limit = -1;
+			check(config_is_at_bottom(cmd->current_configuration, NO),
+				"C2 CMD at the ladder BOTTOM (no rung to demote to)",
+				config_is_at_bottom(cmd->current_configuration, NO) ? 1 : 0, 1);
+			int fired_at = -1;
+			for(int b=1; b<=N+1; b++)
+				if(cmd->inband_cmd_dead_batch_floor_reached()) { fired_at = b; break; }
+			char what[96];
+			snprintf(what, sizeof(what),
+				"C3-N%d the SESSION_DEAD_BATCHES BREAK still fires at EXACTLY batch %d", N, N);
+			check(fired_at == N, what, fired_at, N);
+			delete cmd; delete ts;
+		}
+		putenv_kv("MERCURY_INBAND_DEAD_BATCHES", "");
+	}
+
+	// ========================================================================
+	// PART D — Case (3): a GENUINE config-CHANGE demote STILL clears the retx queue + applies
+	// the unilateral config + queues the SET_CONFIG tag (the no-break route reuses this body,
+	// but a config change is a REAL transition — it must still epoch/clear). UNCHANGED by the
+	// discriminator -> PASS on both arms.
+	// ========================================================================
+	{
+		const int CFG_FROM = CONFIG_10;
+		const int CFG_TO   = config_ladder_down(CFG_FROM, /*robust*/NO);   // CONFIG_9
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_FROM, &ts);
+		cmd->connection_status = TRANSMITTING_DATA;
+		// Stage an in-flight batch + a stale retransmit queue entry the demote must CLEAR.
+		stage_inflight_batch(cmd, /*B=*/9, /*n_frames=*/5, /*ahead=*/2);
+		cmd->retransmit_count = 4;
+		bool routed = cmd->inband_route_failure_demote(CFG_TO, "test_genuine_config_change");
+		check(routed, "D1 the genuine config-change demote ROUTED (helper returned true)",
+			routed ? 1 : 0, 1);
+		check(cmd->current_configuration == CFG_TO,
+			"D2 the config CHANGED (unilateral apply to CONFIG_9)", cmd->current_configuration, CFG_TO);
+		check(cmd->retransmit_count == 0,
+			"D3 the retx queue was CLEARED (a config change epochs/clears)", cmd->retransmit_count, 0);
+		check((cmd->cmd_batch_seq_id & 0xFF) == 9,
+			"D4 the bsi rolled to the in-flight batch (contiguous re-stage at the new config)",
+			cmd->cmd_batch_seq_id & 0xFF, 9);
+		// Under inband, SET_CONFIG takes the UNILATERAL path: the config applies NOW + the next
+		// send_batch W1-emits the CONFIG_TAG, and the control slot is FREED (zero SET_CONFIG on
+		// the wire) with inband_unilateral_armed set (consumed in process_messages_tx_control to
+		// re-route back to TRANSMITTING_DATA). Mirrors test_inband_no_break A4.
+		check(cmd->messages_control.status == FREE,
+			"D5 NO SET_CONFIG control frame on the wire (unilateral CONFIG_TAG path)",
+			cmd->messages_control.status, FREE);
+		check(cmd->inband_unilateral_armed,
+			"D6 the unilateral one-shot re-route is ARMED (the config-change transition)",
+			cmd->inband_unilateral_armed ? 1 : 0, 1);
+		delete cmd; delete ts;
+	}
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK), in-process test
 // ============================================================================
 //
