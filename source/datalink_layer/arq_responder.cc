@@ -536,20 +536,31 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && link_status == CONNECTED
 		   && connection_status == RECEIVING
 		   && !passive_monitor
+		   && (rx_fresh_window_decoded_this_pass              // a FRESH window was staged+decoded this pass
+		       || inband_freshwin_gate_defeat())              // (A/B fail-before knob restores pre-fix firing)
 		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
 		   && is_ofdm_config(current_configuration)           // tag only rides OFDM batches
 		   && rsp_current_expected_batch_seq_id >= 0)         // IN-FLIGHT active batch only
 		{
-			// FIRING GATE (data-flow-inband-downladder.md §2/§5.2, defect #2): the
-			// `messages_rx_buffer.status != RECEIVED` term alone fires on EVERY benign
-			// inter-frame receive() pass that stored no frame — including idle / no-active-
-			// batch passes. Under a lossy demote those benign ticks accumulated into the
-			// terminal-BREAK streak and detonated a FALSE BREAK (HW 0-byte). Require an
-			// IN-FLIGHT ACTIVE batch (rsp_current_expected_batch_seq_id >= 0 i.e. bsi_lsb !=
-			// 255): a lost CONFIG_TAG can only happen WITHIN a batch we are tracking. A
-			// no-active-batch pass (between batches / pre-adopt) is NOT a lost tag and must
-			// never tick the dead-batch streak. The per-decoder prescan inside the resync
-			// (the energy backstop) handles the signal-present-but-silent-snapshot case.
+			// FIRING GATE (data-flow-inband-downladder.md §2/§5.2, defect #2 + §2.1 the
+			// fresh-window term). TWO terms guard the firing frequency:
+			//   (a) rx_fresh_window_decoded_this_pass — receive() actually re-staged a
+			//       FRESH capture window and attempted a primary decode THIS pass
+			//       (arq_common.cc:10624 frames_to_read==0 branch). Without it the gate
+			//       fired on EVERY benign inter-frame pass (the ~500 Hz ARQ loop, receive()
+			//       taking the frames_to_read!=0 early-exit at arq_common.cc:12158 WITHOUT
+			//       re-staging) — re-probing the STALE staged buffer (the last decoded frame,
+			//       energy>=0.05 -> the window energy gate PASSES). That was the 3127 "all
+			//       silent" HW firings burning the receive loop. A lost CONFIG_TAG can only
+			//       be diagnosed on a pass where a fresh frame STAGED and FAILED to decode,
+			//       so this term does NOT suppress a genuine signal-present loss (a real
+			//       lost-tag frame stages a fresh window -> the flag is true).
+			//   (b) `messages_rx_buffer.status != RECEIVED` alone also fires on idle /
+			//       no-active-batch passes; require an IN-FLIGHT ACTIVE batch
+			//       (rsp_current_expected_batch_seq_id >= 0 i.e. bsi_lsb != 255): a lost
+			//       CONFIG_TAG can only happen WITHIN a batch we are tracking. The
+			//       window-level + per-decoder energy prescans inside the resync remain the
+			//       signal-present-but-silent-snapshot backstop.
 			inband_try_down_ladder_on_decode_fail();
 
 			// TERMINAL BREAK (design §7): the dead-batch streak reached
@@ -7437,6 +7448,135 @@ int cl_arq_controller::test_inband_downladder()
 		if(created_mutex && capture_prep_mutex != NULL)
 		{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
 #endif
+	}
+
+	// ========================================================================
+	// PART C — THE FRESH-WINDOW FIRING GATE (data-flow-inband-downladder.md §2.1)
+	// ========================================================================
+	// The HW 3127 "all silent" down-ladder firings were the caller firing on EVERY benign
+	// inter-frame receive() pass during an active batch: receive() took the
+	// frames_to_read!=0 early-exit (arq_common.cc:12158) WITHOUT re-staging, leaving the
+	// staged buffer STALE-but-loud (the last decoded frame, energy>=0.05), so the snapshot
+	// energy gate PASSED and the bank ran. FIX: the caller gate now also requires
+	// rx_fresh_window_decoded_this_pass — receive() only sets it on the frames_to_read==0
+	// branch that actually re-stages+decodes a fresh window.
+	//
+	// This drives the EXACT production gate predicate (the && chain at arq_responder.cc:535).
+	// FAIL-BEFORE (the bug): on a STALE inter-frame pass (flag=false) the OLD gate (without
+	// the flag term) was TRUE -> the down-ladder fired on silence. PASS-AFTER: the gate is
+	// FALSE on a stale pass and TRUE only on a fresh-window decode-FAIL — so a GENUINE
+	// signal-present loss (which DOES stage a fresh window -> flag=true) still fires.
+	{
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode    = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		rx->telecom_system       = ts_rx;
+		rx->narrowband_enabled   = NO;
+		rx->role                 = RESPONDER;
+		rx->robust_enabled       = YES;
+		rx->sack_v2_enabled      = true;
+		rx->inband_rate_enabled  = 1;                 // feature ON
+		rx->load_configuration(CONFIG_1, FULL, NO);   // an OFDM rung (is_ofdm_config == true)
+		rx->link_status          = CONNECTED;
+		rx->connection_status    = RECEIVING;
+		rx->passive_monitor      = false;
+		rx->messages_rx_buffer.status = FREE;         // != RECEIVED: no frame stored this pass
+		rx->rsp_current_expected_batch_seq_id = 4;    // IN-FLIGHT active batch
+
+		// EXACT production firing predicate (mirror of arq_responder.cc:535-542, including the
+		// fail-before defeat knob). The ONLY variable across the arms is the fresh-window flag
+		// (and the env defeat knob, which restores the pre-fix unconditional firing).
+		auto would_fire = [&]() -> bool {
+			return rx->inband_rate_feature_enabled()
+			    && rx->link_status == CONNECTED
+			    && rx->connection_status == RECEIVING
+			    && !rx->passive_monitor
+			    && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			    && rx->messages_rx_buffer.status != RECEIVED
+			    && is_ofdm_config(rx->current_configuration)
+			    && rx->rsp_current_expected_batch_seq_id >= 0;
+		};
+
+		// Sanity: with the flag dropped, ALL OTHER gate terms are TRUE (so the flag is the
+		// sole discriminator — proves this test would FAIL-BEFORE, i.e. the old gate fired).
+		rx->rx_fresh_window_decoded_this_pass = false;
+		bool gate_terms_minus_flag =
+			    rx->inband_rate_feature_enabled()
+			 && rx->link_status == CONNECTED
+			 && rx->connection_status == RECEIVING
+			 && !rx->passive_monitor
+			 && rx->messages_rx_buffer.status != RECEIVED
+			 && is_ofdm_config(rx->current_configuration)
+			 && rx->rsp_current_expected_batch_seq_id >= 0;
+		check(gate_terms_minus_flag,
+			"C0 every gate term EXCEPT the fresh-window flag is satisfied (flag is the discriminator)",
+			gate_terms_minus_flag ? 1 : 0, 1);
+
+		// C1 — STALE inter-frame pass: the fresh-window flag is FALSE -> the gate must NOT
+		// fire (the 3127-firing case is now a cheap no-op; no bank, no log, no streak tick).
+		check(would_fire() == false,
+			"C1 STALE inter-frame pass (no fresh window) -> down-ladder does NOT fire",
+			would_fire() ? 1 : 0, 0);
+
+		// C2 — GENUINE fresh-window decode-FAIL: receive() staged + attempted a fresh decode
+		// this pass (flag TRUE) -> the gate MUST fire so a real lost-tag resync is preserved.
+		rx->rx_fresh_window_decoded_this_pass = true;
+		check(would_fire() == true,
+			"C2 FRESH-window decode-fail on an active batch -> down-ladder DOES fire (resync preserved)",
+			would_fire() ? 1 : 0, 1);
+
+		// C3 — the flag is the SOLE deciding term: flipping ONLY it flips the gate.
+		rx->rx_fresh_window_decoded_this_pass = false;
+		bool off = would_fire();
+		rx->rx_fresh_window_decoded_this_pass = true;
+		bool on  = would_fire();
+		check(off == false && on == true,
+			"C3 the fresh-window flag alone toggles the gate (false->no-fire, true->fire)",
+			(off ? 2 : 0) + (on ? 1 : 0), 1);
+
+		delete rx; delete ts_rx;
+	}
+
+	// PART C4 — explicit FAIL-BEFORE arm via the env defeat knob (one binary A/B). With
+	// MERCURY_INBAND_FRESHWIN_DEFEAT=1 the gate ignores the fresh-window flag, restoring the
+	// PRE-FIX behavior: a STALE inter-frame pass (flag=false) STILL fires the down-ladder
+	// (the 3127-firing bug). A fresh controller re-resolves the cached knob.
+	{
+		set_env("MERCURY_INBAND_FRESHWIN_DEFEAT", "1");
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode    = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		rx->telecom_system       = ts_rx;
+		rx->narrowband_enabled   = NO;
+		rx->role                 = RESPONDER;
+		rx->robust_enabled       = YES;
+		rx->sack_v2_enabled      = true;
+		rx->inband_rate_enabled  = 1;
+		rx->load_configuration(CONFIG_1, FULL, NO);
+		rx->link_status          = CONNECTED;
+		rx->connection_status    = RECEIVING;
+		rx->passive_monitor      = false;
+		rx->messages_rx_buffer.status = FREE;
+		rx->rsp_current_expected_batch_seq_id = 4;
+		rx->rx_fresh_window_decoded_this_pass = false;   // STALE inter-frame pass
+
+		bool fires_on_stale =
+			    rx->inband_rate_feature_enabled()
+			 && rx->link_status == CONNECTED
+			 && rx->connection_status == RECEIVING
+			 && !rx->passive_monitor
+			 && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			 && rx->messages_rx_buffer.status != RECEIVED
+			 && is_ofdm_config(rx->current_configuration)
+			 && rx->rsp_current_expected_batch_seq_id >= 0;
+		check(fires_on_stale,
+			"C4 FAIL-BEFORE (DEFEAT=1): the OLD gate FIRES the down-ladder on a stale pass (the bug)",
+			fires_on_stale ? 1 : 0, 1);
+
+		delete rx; delete ts_rx;
+		set_env("MERCURY_INBAND_FRESHWIN_DEFEAT", "");
 	}
 
 	restore_env();

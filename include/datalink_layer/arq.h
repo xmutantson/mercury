@@ -3362,6 +3362,14 @@ public:
   bool inband_down_defeat_snapfix();
   int  inband_down_defeat_snapfix_cached = -1;   // -1=unresolved, 0=off (fixed), 1=defeat
 
+  // FAIL-BEFORE / A-B knob (data-flow-inband-downladder.md §2.1): MERCURY_INBAND_FRESHWIN_DEFEAT
+  // (cached). 1 = the down-ladder firing gate IGNORES rx_fresh_window_decoded_this_pass, i.e.
+  // the PRE-FIX behavior that fired on EVERY stale inter-frame pass during an active batch (the
+  // 3127 "all silent" HW firings). Default 0 = the fresh-window gate is active. Production never
+  // sets it; the regression flips it to reproduce the firing-on-silence then confirm the gate.
+  bool inband_freshwin_gate_defeat();
+  int  inband_freshwin_gate_defeat_cached = -1;  // -1=unresolved, 0=off (gated), 1=defeat
+
   // PER-PASS PHY-REBUILD LEAK FIX (data-flow-inband-downladder-delivery): the ROBUST-floor
   // buffer_Nsymb is a CONSTANT for a given bandwidth (the config is always FULL_CONFIG_LADDER[0]),
   // so probe the throwaway cl_telecom_system ONCE and memo it keyed by narrowband_enabled. Without
@@ -3922,6 +3930,16 @@ public:
   static const int       BREAK_KOFN_K          = 2;  // consecutive probe matches required to detonate; bench-tunable
   long long rx_receive_frame_index{0};
   long long last_forward_ofdm_decode_frame{-1000000};  // far in the past => not recent at start
+  // FIX (data-flow-inband-downladder.md §2.1): true iff THIS receive() pass actually
+  // staged a FRESH capture window and attempted a primary decode (the frames_to_read==0
+  // branch ran). On a benign inter-frame pass receive() takes the frames_to_read!=0
+  // early-exit (arq_common.cc:12158) WITHOUT re-staging, so the staged buffer holds the
+  // LAST decoded frame (stale-but-loud, energy>=0.05). The inband down-ladder gate
+  // (arq_responder.cc) requires this so a lost-tag resync fires ONLY on a genuine
+  // fresh-window decode-FAIL, NOT on every stale inter-frame re-probe (the 3127 "all
+  // silent" HW firings). Set in receive(); cleared at the top of every receive() pass.
+  // ALWAYS maintained but read ONLY inside the inband-gated block -> legacy byte-identical.
+  bool      rx_fresh_window_decoded_this_pass{false};
   int       break_probe_consec_match{0};               // K-of-N accumulator (reset on non-match / consume / reset)
   // True iff the env MERCURY_BREAK_FH_GATE is set (cached once). The ONE gate-enable
   // source of truth shared by break_fh_suppress(), break_kofn_corroborate(),

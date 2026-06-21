@@ -3698,6 +3698,23 @@ bool cl_arq_controller::inband_down_defeat_snapfix()
 	return inband_down_defeat_snapfix_cached == 1;
 }
 
+// FAIL-BEFORE / A-B knob (data-flow-inband-downladder.md §2.1): resolve+cache
+// MERCURY_INBAND_FRESHWIN_DEFEAT. When 1 the down-ladder firing gate IGNORES the
+// rx_fresh_window_decoded_this_pass term (the PRE-FIX behavior that fired on every stale
+// inter-frame pass during an active batch — the 3127 "all silent" HW firings). Default 0 =
+// the fresh-window gate is active (a stale inter-frame pass is a cheap no-op). Production
+// never sets it; the regression flips it to reproduce the firing-on-silence then confirm
+// the gate. -1 = unresolved, cached on first call.
+bool cl_arq_controller::inband_freshwin_gate_defeat()
+{
+	if(inband_freshwin_gate_defeat_cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_INBAND_FRESHWIN_DEFEAT");
+		inband_freshwin_gate_defeat_cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return inband_freshwin_gate_defeat_cached == 1;
+}
+
 // RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §7 / §8 [?]): seat the primary capture
 // ring's buffer_Nsymb_min to the DEEPEST reachable down-ladder rung (ROBUST_0) so the ring
 // PHYSICALLY holds a full robust-rung frame the down-ladder can read. Without this the
@@ -10600,6 +10617,13 @@ void cl_arq_controller::receive()
 	// when MERCURY_BREAK_FH_GATE is unset nothing consumes it -> byte-identical.
 	rx_receive_frame_index++;
 
+	// FIX (data-flow-inband-downladder.md §2.1): assume NO fresh decode this pass; the
+	// frames_to_read==0 staging branch below sets it true when it actually re-stages and
+	// decodes. The inband down-ladder caller gate reads this so a lost-tag resync fires
+	// ONLY on a genuine fresh-window decode-FAIL, never on a stale inter-frame re-probe.
+	// ALWAYS maintained; read ONLY inside the inband-gated block -> legacy byte-identical.
+	rx_fresh_window_decoded_this_pass = false;
+
 	int signal_period = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate; // in samples
 	int symbol_period = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
 
@@ -10616,7 +10640,12 @@ void cl_arq_controller::receive()
 
 	if(telecom_system->data_container.frames_to_read==0)
 	{
-
+		// FIX (data-flow-inband-downladder.md §2.1): a FRESH capture window is staged and a
+		// primary decode is attempted on THIS pass (vs the frames_to_read!=0 early-exit
+		// below, which re-probes a STALE staged buffer). Mark it so the inband down-ladder
+		// fires only on a genuine fresh-window decode-FAIL. Set for BOTH OK and FAIL outcomes
+		// (a real lost-tag frame STAGES then FAILs to decode — exactly the resync case).
+		rx_fresh_window_decoded_this_pass = true;
 
 		int rwi = telecom_system->data_container.ring_write_index;
 		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data, &telecom_system->data_container.passband_delayed_data[rwi], signal_period * sizeof(double));

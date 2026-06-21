@@ -78,6 +78,48 @@ tracking; a no-active-batch / pre-adopt / idle pass is not a lost tag and must
 never tick the streak. The term is added inside the block that already requires
 `inband_rate_feature_enabled()`, so the legacy path is untouched.
 
+### §2.1 FIX #2b — the FRESH-WINDOW firing term (the HW ~8KB throughput cap)
+`arq_responder.cc:535-542` (same call gate) + `arq_common.cc receive()`.
+
+**The bug (HW-VERIFIED, `ib_on_c4_rsp.log`):** the redesign capped at ~8KB because
+the RX down-ladder fired **3127×** logging `no trial decoder saw signal (all silent)`
+(`arq_common.cc:~4244`) — burning the ~500 Hz receive loop on benign inter-frame passes
+instead of decoding forward DATA. ROOT CAUSE (trace, 2026-06-21): the call gate's
+`messages_rx_buffer.status != RECEIVED` term is TRUE on **every** no-frame pass during an
+active batch (status only goes RECEIVED on a decode, `arq_common.cc:11420`); the ARQ loop
+runs `receive()` blocking-paced; and `receive()` only re-stages a fresh capture window +
+attempts a decode on the `frames_to_read==0` branch (`arq_common.cc:10624`), taking the
+`frames_to_read!=0` **early-exit** (`arq_common.cc:12158`) on inter-frame passes WITHOUT
+re-staging. So the staged buffer (`ready_to_process_passband_delayed_data`, the snapshot
+source) holds the LAST decoded frame — **stale-but-loud** (energy ≥ 0.05) — and the §1
+window energy gate PASSES on stale energy, running the bank every benign pass.
+`frames_to_read` is NOT a usable gate: a genuine fresh-window decode-FAIL re-arms it
+non-zero (anti-spin, `arq_common.cc:11767/12055`) **before** the down-ladder runs.
+
+**FIX:** new one-shot member `rx_fresh_window_decoded_this_pass`
+(`include/datalink_layer/arq.h`). `receive()` clears it at the top of every pass and sets
+it TRUE only inside the `frames_to_read==0` staging+decode branch (`arq_common.cc`). The
+call gate adds `&& (rx_fresh_window_decoded_this_pass || inband_freshwin_gate_defeat())`.
+A STALE inter-frame pass (no fresh window) is now a cheap no-op: the down-ladder is not
+even entered (no bank, no log, no streak tick). A GENUINE lost-tag frame DOES stage a
+fresh window (`frames_to_read==0` → flag TRUE) then FAILs to decode, so the resync still
+fires — this term **cannot** suppress a signal-present loss. ALWAYS-maintained but read
+ONLY inside the `inband_rate_feature_enabled()` block (C++ short-circuit) ⇒ legacy
+byte-identical. `MERCURY_INBAND_FRESHWIN_DEFEAT=1` (`inband_freshwin_gate_defeat()`,
+`arq_common.cc`) restores the pre-fix unconditional firing (one-binary A/B fail-before).
+
+**Why this is the right discriminator (not a threshold band-aid):** `frames_to_read==0`
+is the modem's OWN "a fresh frame window is ready to process" signal (the same condition
+that stages the buffer the primary decodes from). We reuse it, not a magic number, and we
+do not touch the energy thresholds. The §1 window + per-decoder energy prescans REMAIN as
+the signal-present-but-silent-snapshot backstop; this term removes the upstream churn.
+
+**Regression** (`test_inband_downladder` PART C/C4, in `--test`): C0 asserts every gate
+term except the flag is satisfied on a stale pass (the flag is the sole discriminator —
+the old gate fired); C1 stale pass → gate FALSE (no fire); C2 fresh-window FAIL → gate
+TRUE (resync preserved); C3 the flag alone toggles the gate; C4 fail-before
+(`DEFEAT=1`) → the old gate FIRES on a stale pass (reproduces the bug). All PASS.
+
 ---
 
 ## §3. FIX #3 — decouple BREAK from delivery
