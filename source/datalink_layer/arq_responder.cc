@@ -7815,6 +7815,71 @@ int cl_arq_controller::test_inband_deliver()
 		delete cmd; delete ts;
 	}
 
+	// ========================================================================
+	// PART E — PER-PASS PHY-REBUILD LEAK (the ON-arm 0-deliver root cause). The HW ON arm
+	// decoded 0 OFDM frames where legacy OFF decoded 810 because inband_seat_robust_ring_floor()
+	// — called every CONNECTED+RECEIVING receive() pass — did a FULL M=200 MFSK
+	// load_configuration on a throwaway cl_telecom_system EVERY pass (HW: 2793x), starving the
+	// OFDM decode PHY. The fix caches the ROBUST-floor buffer_Nsymb (a per-bandwidth constant)
+	// + an idempotent fast-path, so the steady-state seat loop does ZERO PHY rebuilds.
+	// FAIL-BEFORE (-DINBAND_DELIVER_FAILBEFORE): the helper skips the cache -> N probes for N
+	// passes. PASS-AFTER (default): <=1 probe across N passes. Also asserts the cached Nsymb
+	// equals an uncached fresh probe (correctness preserved) and the floor still SEATS the ring
+	// on a genuine event.
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_10, &ts);   // a high-OFDM rung (small ring)
+		cmd->connection_status = RECEIVING;
+
+		// (1) CORRECTNESS: an UNCACHED fresh probe of the ROBUST floor Nsymb (independent of the
+		// controller's memo) must equal what the (now-cached) helper returns.
+		int fresh_floor;
+		{
+			cl_telecom_system probe;
+			probe.narrowband_enabled = cmd->telecom_system->narrowband_enabled;
+			probe.load_configuration(FULL_CONFIG_LADDER[0]);
+			fresh_floor = probe.data_container.buffer_Nsymb.load();
+		}
+		int helper_floor = cmd->inband_robust_floor_buffer_nsymb();   // primes the cache (1 probe)
+		check(helper_floor > 0 && helper_floor == fresh_floor,
+			"E1 the (cached) ROBUST-floor Nsymb == a fresh uncached probe (value unchanged)",
+			helper_floor, fresh_floor);
+
+		// (2) GENUINE SEAT still works: the small high-OFDM ring is grown to the floor on the
+		// first seat (buffer_Nsymb_min raised). This is the load-bearing behavior the cache must
+		// not break.
+		cmd->telecom_system->data_container.buffer_Nsymb_min = 0;   // un-seated start
+		cmd->inband_seat_robust_ring_floor();
+		check(cmd->telecom_system->data_container.buffer_Nsymb_min == fresh_floor,
+			"E2 the floor STILL SEATS the ring on a genuine first seat (buffer_Nsymb_min raised)",
+			cmd->telecom_system->data_container.buffer_Nsymb_min, fresh_floor);
+
+		// (3) THE LEAK: drive the steady-state RX seat path N times and count throwaway PHY
+		// probes. Reset the counter AFTER the genuine first seat so we measure only the
+		// steady-state repeats (the per-pass cost the HW saw 2793x).
+		const int PASSES = 50;
+		cmd->inband_floor_probe_count = 0;
+		for(int p = 0; p < PASSES; p++)
+			cmd->inband_seat_robust_ring_floor();   // the EXACT production hot-path call
+#ifndef INBAND_DELIVER_FAILBEFORE
+		// PASS-AFTER: the idempotent fast-path + cache => ZERO throwaway PHY rebuilds across all
+		// PASSES steady-state seats (the leak is gone; the OFDM decode PHY is never starved).
+		check(cmd->inband_floor_probe_count == 0,
+			"E3 ZERO per-pass PHY rebuilds across a steady-receive seat loop (leak eliminated)",
+			cmd->inband_floor_probe_count, 0);
+#else
+		// FAIL-BEFORE: the cache is compiled out -> the helper probes on EVERY seat call ->
+		// one full M=200 MFSK PHY rebuild per pass (the 2793x HW leak, scaled to PASSES here).
+		printf("%s INBAND_DELIVER_FAILBEFORE: cache compiled out — per-pass PHY rebuild leak "
+			"reproduced\n", TAG);
+		fflush(stdout);
+		check(cmd->inband_floor_probe_count == PASSES,
+			"E3 FAILBEFORE: a throwaway PHY rebuild on EVERY pass (the per-pass leak / 0-deliver)",
+			cmd->inband_floor_probe_count, PASSES);
+#endif
+		delete cmd; delete ts;
+	}
+
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);

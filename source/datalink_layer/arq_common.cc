@@ -3627,11 +3627,26 @@ int cl_arq_controller::inband_down_window_buffer_nsymb()
 	// config it actually scopes is FULL_CONFIG_LADDER[lo_idx] after that same clamp.
 	int count = cur_idx - lo_idx + 1;
 	if(count > INBAND_DOWN_D_MAX + 1) lo_idx = cur_idx - INBAND_DOWN_D_MAX;
+	// PER-PASS PHY-REBUILD LEAK FIX (same anti-pattern as inband_robust_floor_buffer_nsymb):
+	// the window buffer_Nsymb depends ONLY on (lo_idx, bandwidth) — both stable across a steady
+	// receive — so memo the throwaway-PHY probe keyed by that pair. Invalidate when either
+	// changes. The INBAND_DELIVER_FAILBEFORE arm skips the cache (reproduces the leak).
+	int nb = telecom_system->narrowband_enabled;
+#ifndef INBAND_DELIVER_FAILBEFORE
+	if(inband_down_window_nsymb_cached >= 0
+	   && inband_down_window_nsymb_cache_lo == lo_idx
+	   && inband_down_window_nsymb_cache_nb == nb)
+		return inband_down_window_nsymb_cached;
+#endif
 	int low_cfg = FULL_CONFIG_LADDER[lo_idx];
+	inband_floor_probe_count++;              // TEST diagnostic: a real throwaway PHY probe ran
 	cl_telecom_system tmp;
-	tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+	tmp.narrowband_enabled = nb;
 	tmp.load_configuration(low_cfg);
 	int n = tmp.data_container.buffer_Nsymb.load();
+	inband_down_window_nsymb_cached    = n;  // memo (constant for this lo_idx + bandwidth)
+	inband_down_window_nsymb_cache_lo  = lo_idx;
+	inband_down_window_nsymb_cache_nb  = nb;
 	return n;   // tmp destructs here, freeing its buffers
 }
 
@@ -3645,11 +3660,26 @@ int cl_arq_controller::inband_down_window_buffer_nsymb()
 int cl_arq_controller::inband_robust_floor_buffer_nsymb()
 {
 	if(telecom_system == NULL) return 0;
+	// PER-PASS PHY-REBUILD LEAK FIX: the ROBUST-floor buffer_Nsymb depends ONLY on the
+	// bandwidth (the config is fixed = FULL_CONFIG_LADDER[0]). Probe ONCE per bandwidth and
+	// memo it; subsequent calls (every CONNECTED+RECEIVING pass via inband_seat_robust_ring_floor)
+	// return the cache with ZERO throwaway cl_telecom_system / load_configuration. Before this
+	// the per-pass full M=200 MFSK PHY init starved the OFDM decode PHY (HW: 2793 rebuilds,
+	// ofdm_ok=0, 0 bytes). Invalidate on a NB/WB switch (the only variable). The
+	// INBAND_DELIVER_FAILBEFORE arm SKIPS the cache so the regression reproduces the leak.
+	int nb = telecom_system->narrowband_enabled;
+#ifndef INBAND_DELIVER_FAILBEFORE
+	if(inband_robust_floor_nsymb_cached >= 0 && inband_robust_floor_nsymb_cache_nb == nb)
+		return inband_robust_floor_nsymb_cached;
+#endif
 	int floor_cfg = FULL_CONFIG_LADDER[0];   // ROBUST_0 (the most-robust, largest frame)
+	inband_floor_probe_count++;              // TEST diagnostic: a real throwaway PHY probe ran
 	cl_telecom_system tmp;
-	tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+	tmp.narrowband_enabled = nb;
 	tmp.load_configuration(floor_cfg);
 	int n = tmp.data_container.buffer_Nsymb.load();
+	inband_robust_floor_nsymb_cached   = n;  // memo (constant for this bandwidth)
+	inband_robust_floor_nsymb_cache_nb = nb;
 	return n;   // tmp destructs here
 }
 
@@ -3684,7 +3714,19 @@ void cl_arq_controller::inband_seat_robust_ring_floor()
 	if(!inband_rate_feature_enabled()) return;
 	if(inband_down_defeat_snapfix()) return;          // fail-before arm: leave the ring small
 	if(telecom_system == NULL) return;
-	int floor_nsymb = inband_robust_floor_buffer_nsymb();
+	// IDEMPOTENT FAST-PATH (before ANY probe cost): once the ring is seated to the warm-cached
+	// floor for the CURRENT bandwidth, the steady-state RX pass returns here doing literally
+	// nothing — no helper call, no throwaway cl_telecom_system. This is the hot path on every
+	// CONNECTED+RECEIVING receive() pass; the per-pass leak it eliminates was the ON-arm
+	// 0-deliver (HW: 2793 redundant M=200 PHY rebuilds starved the OFDM decode PHY). Compiled
+	// out under INBAND_DELIVER_FAILBEFORE so the regression reproduces the per-pass probe leak.
+#ifndef INBAND_DELIVER_FAILBEFORE
+	if(inband_robust_floor_nsymb_cached >= 0
+	   && inband_robust_floor_nsymb_cache_nb == telecom_system->narrowband_enabled
+	   && telecom_system->data_container.buffer_Nsymb_min >= inband_robust_floor_nsymb_cached)
+		return;
+#endif
+	int floor_nsymb = inband_robust_floor_buffer_nsymb();   // probes ONCE per bandwidth, then cached
 	if(floor_nsymb <= 0) return;
 	if(telecom_system->data_container.buffer_Nsymb_min >= floor_nsymb)
 		return;                                       // already seated (idempotent)

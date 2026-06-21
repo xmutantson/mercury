@@ -3362,6 +3362,24 @@ public:
   bool inband_down_defeat_snapfix();
   int  inband_down_defeat_snapfix_cached = -1;   // -1=unresolved, 0=off (fixed), 1=defeat
 
+  // PER-PASS PHY-REBUILD LEAK FIX (data-flow-inband-downladder-delivery): the ROBUST-floor
+  // buffer_Nsymb is a CONSTANT for a given bandwidth (the config is always FULL_CONFIG_LADDER[0]),
+  // so probe the throwaway cl_telecom_system ONCE and memo it keyed by narrowband_enabled. Without
+  // this, inband_seat_robust_ring_floor() (called every CONNECTED+RECEIVING pass) did a full
+  // M=200 MFSK load_configuration on the hot RX path EVERY pass (HW: 2793x) -> the OFDM decode PHY
+  // was starved -> ofdm_ok=0 -> 0 bytes delivered on the ON arm. -1 = unmemoized; >=0 = cached
+  // floor Nsymb; cache_nb records the bandwidth the value was probed for (invalidated on NB/WB
+  // switch). Same memo for inband_down_window_buffer_nsymb() keyed by (lo_idx, nb).
+  int  inband_robust_floor_nsymb_cached = -1;    // -1=unmemoized, >=0=cached floor buffer_Nsymb
+  int  inband_robust_floor_nsymb_cache_nb = -1;  // narrowband_enabled the cache was built for
+  int  inband_down_window_nsymb_cached = -1;     // -1=unmemoized, >=0=cached window buffer_Nsymb
+  int  inband_down_window_nsymb_cache_lo = -1;   // lo_idx the cache was built for
+  int  inband_down_window_nsymb_cache_nb = -1;   // narrowband_enabled the cache was built for
+  // TEST-ONLY diagnostic: counts throwaway cl_telecom_system PHY probes (load_configuration) the
+  // two nsymb helpers perform. The regression in test_inband_deliver asserts this stays flat (<=1)
+  // across a steady-receive seat loop (pass-after) vs N (fail-before). Production never reads it.
+  long inband_floor_probe_count = 0;
+
   // Stage 3b GEARSHIFT DRIVE (unilateral drop). When MERCURY_INBAND_RATE is set,
   // add_message_control(SET_CONFIG) takes the UNILATERAL path (inband_unilateral_config_change)
   // instead of queueing a SET_CONFIG control handshake: it loads the gearshift
