@@ -7880,6 +7880,82 @@ int cl_arq_controller::test_inband_deliver()
 		delete cmd; delete ts;
 	}
 
+	// ========================================================================
+	// PART F — PER-CALL PHY-REBUILD LEAK, INSTANCE #2 (inband_ensure_down_decoders). The SAME
+	// throwaway-tmp + load_configuration anti-pattern as PART E, but in the down-ladder bank
+	// builder: it probed the bank's common buffer_Nsymb with a fresh cl_telecom_system EVERY
+	// call (a full CONFIG-11 OFDM PHY init), even though the bank SLOTS were already reused.
+	// On a degraded RX every decode-fail pass with an active batch fires the down-ladder ->
+	// this probe ran 44x in v6 cycle1 ON, on the hot capture thread, starving the OFDM decode
+	// PHY (the SAME 0-deliver mechanism as the floor leak). The fix memos want_buffer_nsymb
+	// keyed by (capped lo_idx, bandwidth) and skips the tmp construction when unchanged.
+	// FAIL-BEFORE (-DINBAND_DELIVER_FAILBEFORE): the cache is compiled out -> N probes / N calls.
+	// PASS-AFTER (default): ONE probe on the first build, ZERO on all steady-state repeats. Also
+	// asserts the cached bank Nsymb == an uncached fresh probe (correctness) and the bank still
+	// builds the right number of decoders.
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_10, &ts);   // ladder idx 13; current_configuration set
+		cmd->connection_status = RECEIVING;
+		// Bypass real Schmidl-Cox acquisition in the bank slots (the production-test idiom; the
+		// builder forwards this to each decoder's ofdm_forced_delay). Not load-bearing for the
+		// probe count — just keeps the decoders cheap/deterministic.
+		cmd->inband_test_forced_down_delay = 0;
+
+		int cur_idx = config_ladder_index(cmd->current_configuration);   // free fn (common_defines.h)
+		check(cur_idx >= 0, "F0 CONFIG_10 is on the ladder (cur_idx resolved)", cur_idx >= 0 ? 1 : 0, 1);
+		int D = cmd->inband_down_window_depth();
+		int lo_idx = cur_idx - D; if(lo_idx < 0) lo_idx = 0;
+		int hi_idx = cur_idx;
+
+		// (1) CORRECTNESS: an UNCACHED fresh probe of the bank's common (lowest-index = most
+		// robust) buffer Nsymb must equal what the builder caches. Mirror the builder's window cap.
+		int cap_lo = lo_idx;
+		if((hi_idx - cap_lo + 1) > INBAND_DOWN_D_MAX + 1) cap_lo = hi_idx - INBAND_DOWN_D_MAX;
+		int fresh_bank;
+		{
+			cl_telecom_system probe;
+			probe.narrowband_enabled = cmd->telecom_system->narrowband_enabled;
+			probe.load_configuration(FULL_CONFIG_LADDER[cap_lo]);
+			fresh_bank = probe.data_container.buffer_Nsymb.load();
+		}
+
+		// (2) THE LEAK: drive the bank builder N times for the SAME window and count throwaway PHY
+		// probes. The FIRST call builds the bank (1 probe, real slot construction); every repeat
+		// must reuse both the cached size AND the bank slots.
+		const int CALLS = 40;
+		cmd->inband_floor_probe_count = 0;
+		int n0 = cmd->inband_ensure_down_decoders(lo_idx, hi_idx);   // first build (1 probe expected)
+		check(n0 > 0, "F1 the down-decoder bank built (>=1 live decoder)", n0 > 0 ? 1 : 0, 1);
+		check(cmd->inband_down_buffer_nsymb == fresh_bank,
+			"F2 the cached bank buffer_Nsymb == a fresh uncached probe (value unchanged)",
+			cmd->inband_down_buffer_nsymb, fresh_bank);
+		long probes_after_first = cmd->inband_floor_probe_count;
+		for(int p = 0; p < CALLS; p++)
+			cmd->inband_ensure_down_decoders(lo_idx, hi_idx);   // the EXACT production hot-path call
+		long steady_probes = cmd->inband_floor_probe_count - probes_after_first;
+#ifndef INBAND_DELIVER_FAILBEFORE
+		// PASS-AFTER: exactly ONE probe total (the first build); ZERO across all CALLS repeats.
+		check(probes_after_first == 1,
+			"F3 the first bank build does exactly ONE PHY probe", probes_after_first, 1);
+		check(steady_probes == 0,
+			"F4 ZERO per-call PHY rebuilds across a steady down-ladder loop (leak #2 eliminated)",
+			steady_probes, 0);
+#else
+		// FAIL-BEFORE: the cache is compiled out -> one full PHY rebuild on EVERY call (the 44x HW
+		// leak, scaled to CALLS+1 here).
+		printf("%s INBAND_DELIVER_FAILBEFORE: bank-probe cache compiled out — per-call PHY rebuild "
+			"leak reproduced\n", TAG);
+		fflush(stdout);
+		check(probes_after_first == 1,
+			"F3 FAILBEFORE: the first call still probes once", probes_after_first, 1);
+		check(steady_probes == CALLS,
+			"F4 FAILBEFORE: a throwaway PHY rebuild on EVERY call (the per-call leak #2)",
+			steady_probes, CALLS);
+#endif
+		delete cmd; delete ts;
+	}
+
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);

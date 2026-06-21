@@ -3788,13 +3788,36 @@ int cl_arq_controller::inband_ensure_down_decoders(int lo_idx, int hi_idx)
 	// the window. The lowest ladder index in the window is the most robust (most
 	// symbols). Probe it once with a throwaway decoder (the SAME idiom
 	// init_monitor_decoders uses, arq_common.cc:1746-1753).
+	//
+	// PER-PASS PHY-REBUILD LEAK FIX (SAME CLASS as inband_robust_floor_buffer_nsymb /
+	// inband_down_window_buffer_nsymb): the common bank buffer_Nsymb depends ONLY on
+	// (lo_idx, bandwidth). This helper runs on EVERY down-ladder fire (a degraded RX pass
+	// that decode-failed with an active batch; v6 cycle1 ON: 44 CONFIG-11 PHY rebuilds), so
+	// memo the throwaway-PHY probe keyed by (capped lo_idx, nb) and skip the tmp construction
+	// when unchanged. The bank SLOTS were always reused; only this size PROBE leaked. The
+	// INBAND_DELIVER_FAILBEFORE arm SKIPS the cache so the regression reproduces the per-call
+	// rebuild. Invalidate on lo_idx (window slide / config switch) or NB/WB change.
+	int nb = telecom_system->narrowband_enabled;
 	int want_buffer_nsymb;
+#ifndef INBAND_DELIVER_FAILBEFORE
+	if(inband_ensure_bank_nsymb_cached >= 0
+	   && inband_ensure_bank_nsymb_cache_lo == lo_idx
+	   && inband_ensure_bank_nsymb_cache_nb == nb)
+	{
+		want_buffer_nsymb = inband_ensure_bank_nsymb_cached;
+	}
+	else
+#endif
 	{
 		int low_cfg = FULL_CONFIG_LADDER[lo_idx];
+		inband_floor_probe_count++;          // TEST diagnostic: a real throwaway PHY probe ran
 		cl_telecom_system tmp;
-		tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+		tmp.narrowband_enabled = nb;
 		tmp.load_configuration(low_cfg);
 		want_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
+		inband_ensure_bank_nsymb_cached    = want_buffer_nsymb;  // memo (constant for lo_idx + nb)
+		inband_ensure_bank_nsymb_cache_lo  = lo_idx;
+		inband_ensure_bank_nsymb_cache_nb  = nb;
 		// tmp destructs here, freeing its buffers.
 	}
 	// If the bandwidth changed (NB/WB) the cached buffer size is stale -> rebuild all.

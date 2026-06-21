@@ -234,3 +234,68 @@ Result: `[TEST-INBAND-DOWNLADDER] ALL PASS (failed=0)`; full `--test` EXIT=0.
   observed defect (CFG15 traffic, OFDM-to-OFDM demote) the staged window is
   sufficient. [?] confirm on the bench whether a multi-rung robust resync needs the
   ring-floor seat in addition to the staged-buffer source.
+
+## §8. FIX #4 — the per-pass PHY-rebuild leak CLASS (ON-arm 0-deliver)
+The HW ON arm decoded 0 OFDM frames / delivered 0 bytes where legacy OFF decoded
+810 — not because the down-ladder logic was wrong, but because the inband RX path
+ran a FULL throwaway-`cl_telecom_system` + `load_configuration()` PHY init **per
+receive pass** on the hot capture thread, starving the OFDM decode PHY. A fresh
+`cl_telecom_system` has `current_configuration == CONFIG_NONE`, so the
+`load_configuration` dedup (telecom_system.cc:~10052) is bypassed → a full reinit
+every call. This is a CLASS (the throwaway-tmp + `load_configuration` size-probe
+idiom), not a single site:
+
+- **Instance #1 (c7b4aca)**: `inband_robust_floor_buffer_nsymb()`
+  (arq_common.cc:3660) via `inband_seat_robust_ring_floor()` (arq_common.cc:3712),
+  called EVERY CONNECTED+RECEIVING pass (arq_responder.cc:520). HW: 2793 rebuilds.
+  Fixed: memo keyed by `narrowband_enabled` + an idempotent fast-path that returns
+  before any probe once the ring is seated. `inband_down_window_buffer_nsymb()`
+  (arq_common.cc:3619) got the same memo (keyed by `lo_idx + nb`) — though it has
+  no live production caller today (the snapshot is sized from the primary
+  `signal_period` at arq_common.cc:4134, not this helper).
+- **Instance #2 (this fix)**: `inband_ensure_down_decoders()` (arq_common.cc:3779)
+  probed the bank's common `buffer_Nsymb` with a throwaway tmp + `load_configuration`
+  EVERY call (arq_common.cc:3787-3799 pre-fix). The bank SLOTS were always reused
+  (the `inband_down_decoder_cfg[i] == cfg` `continue`, arq_common.cc:3833), but the
+  size PROBE leaked. This runs on EVERY down-ladder fire (a degraded RX pass that
+  decode-failed with an active in-flight batch — arq_responder.cc:535-553); v6
+  cycle1 ON saw 44 CONFIG-11 PHY rebuilds. Fixed: memo `want_buffer_nsymb` keyed by
+  (capped `lo_idx`, `nb`); skip the tmp construction when unchanged.
+
+PRODUCERS of the three memo keys: `current_configuration` (config switch /
+down-ladder adopt / BREAK→ROBUST_0 reseed → `lo_idx` changes → invalidates) and
+`narrowband_enabled` (NB/WB switch → `nb` changes → invalidates). Both already
+force a bank rebuild via the `want_buffer_nsymb != inband_down_buffer_nsymb`
+free-all at arq_common.cc:3824, so the memo can never serve a stale size to the
+bank. CONSUMERS: the bank build loop (3828) reads `inband_down_buffer_nsymb`; the
+seat (3734) reads the floor cache. CORRECTNESS asserted in `--test-inband-deliver`
+PART E/F: the memoized Nsymb == a fresh uncached probe for every site.
+
+SWEEP RESULT (all `load_configuration(` + throwaway `cl_telecom_system` in
+arq_common.cc / arq_responder.cc / arq_commander.cc):
+- arq_common.cc:1767, 1822 — `init_monitor_decoders` throwaway probes: **one-time**
+  (init), not on the RX pass.
+- arq_common.cc:3643/3677 (memoized #1), 3814 (memoized #2) — the three leak sites,
+  ALL now cached.
+- arq_common.cc:3822, 3845 — the GENUINE reused decoder banks (`continue`-gated by
+  config id) — NOT touched; zero rebuilds on a steady same-window loop.
+- All other `load_configuration(` in the three files are **event-driven** production
+  config switches (SET_CONFIG / demote / BREAK / NB-switch / session init) or live
+  inside `test_*` functions — none run per RX pass.
+
+VERDICT: after FIX #4, ZERO per-pass throwaway-PHY `load_configuration` calls remain
+on the inband steady RX path. The only remaining down-ladder work is its FUNCTIONAL
+0-recovery thrash (the snapshot/firing/BREAK-decouple FIXes #1–#3), handled
+separately above.
+
+## §9. Regression — `--test-inband-deliver` PART E/F
+PART E (FIX #1) and PART F (FIX #4 instance #2) each drive the production hot-path
+helper in a steady loop and count throwaway PHY probes via `inband_floor_probe_count`:
+- **PART E** (`inband_seat_robust_ring_floor` × 50): fail-before
+  (`-DINBAND_DELIVER_FAILBEFORE`) = 50 probes; pass-after = 0. Plus E1 (cached floor
+  == fresh probe), E2 (genuine first seat still grows the ring).
+- **PART F** (`inband_ensure_down_decoders` × 41): fail-before = 1 (first build) + 40
+  (per-call); pass-after = 1 (first build) + 0 (steady). Plus F2 (cached bank Nsymb
+  == fresh probe), F1 (bank still builds).
+Both arms in one binary; `./mercury.exe --test` green; legacy byte-identical
+(inband-gated; default-off render md5 unchanged).

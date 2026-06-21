@@ -3375,9 +3375,20 @@ public:
   int  inband_down_window_nsymb_cached = -1;     // -1=unmemoized, >=0=cached window buffer_Nsymb
   int  inband_down_window_nsymb_cache_lo = -1;   // lo_idx the cache was built for
   int  inband_down_window_nsymb_cache_nb = -1;   // narrowband_enabled the cache was built for
+  // SAME LEAK CLASS, instance #2: inband_ensure_down_decoders() probed the bank's common
+  // buffer_Nsymb with a throwaway cl_telecom_system + load_configuration EVERY call. The bank
+  // SLOTS were already reused, but the want_buffer_nsymb PROBE ran unconditionally — a full
+  // CONFIG-11 OFDM PHY init per down-ladder fire (v6 cycle1 ON: 44x) on the hot capture thread,
+  // the SAME starvation as the floor leak. The bank's common buffer depends ONLY on (lo_idx,
+  // bandwidth), so memo it keyed by that pair and skip the tmp construction when unchanged.
+  // -1 = unmemoized; >=0 = cached bank buffer_Nsymb. Invalidated on lo_idx / NB-WB change.
+  int  inband_ensure_bank_nsymb_cached  = -1;    // -1=unmemoized, >=0=cached bank buffer_Nsymb
+  int  inband_ensure_bank_nsymb_cache_lo = -1;   // capped lo_idx the cache was built for
+  int  inband_ensure_bank_nsymb_cache_nb = -1;   // narrowband_enabled the cache was built for
   // TEST-ONLY diagnostic: counts throwaway cl_telecom_system PHY probes (load_configuration) the
-  // two nsymb helpers perform. The regression in test_inband_deliver asserts this stays flat (<=1)
-  // across a steady-receive seat loop (pass-after) vs N (fail-before). Production never reads it.
+  // nsymb helpers AND inband_ensure_down_decoders' bank-buffer probe perform. The regression in
+  // test_inband_deliver asserts this stays flat (0) across a steady-receive seat / down-ladder
+  // loop (pass-after) vs N (fail-before). Production never reads it.
   long inband_floor_probe_count = 0;
 
   // Stage 3b GEARSHIFT DRIVE (unilateral drop). When MERCURY_INBAND_RATE is set,
