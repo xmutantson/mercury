@@ -58,15 +58,15 @@ SetupDialog::SetupDialog()
     , radio_type_(0)
     , control_port_(7002)
     , data_port_(7003)
-    , connection_timeout_ms_(60000)
-    , link_timeout_ms_(120000)
-    , max_connection_attempts_(10)
+    , connection_timeout_ms_(15000)   // single source of truth = INI/CLI default (main.cc:788)
+    , link_timeout_ms_(30000)         // single source of truth = INI/CLI default (main.cc:790)
+    , max_connection_attempts_(15)    // single source of truth = INI/CLI default (main.cc:789)
     , exit_on_disconnect_(false)
     , ptt_on_delay_ms_(100)
     , ptt_off_delay_ms_(200)
     , pilot_tone_ms_(0)
     , pilot_tone_hz_(250)
-    , gear_shift_enabled_(true)
+    , gear_shift_enabled_(false)      // single source of truth = INI default (ini:215) & headless NO_GEAR_SHIFT (main.cc:775)
     , initial_config_(ROBUST_0)   // overwritten from g_settings on open; kept consistent with the INI default
     , ldpc_iterations_max_(50)
     , coarse_freq_sync_enabled_(false)
@@ -74,11 +74,14 @@ SetupDialog::SetupDialog()
     , bandwidth_mode_(0)
     , guard_interval_idx_(GI_DEFAULT_IDX)
     , hide_console_(false)
+    , break_fh_gate_enabled_(true)       // proven, default-ON (arq_common.cc)
+    , turnaround_rephase_enabled_(true)  // proven, default-ON (arq_common.cc)
     , encryption_mode_(0)
 {
     memset(my_callsign_, 0, sizeof(my_callsign_));
     strncpy(my_callsign_, "N0CALL", sizeof(my_callsign_) - 1);
     memset(psk_hex_, 0, sizeof(psk_hex_));
+    memset(rate_table_path_, 0, sizeof(rate_table_path_));
 }
 
 SetupDialog::~SetupDialog() {
@@ -130,6 +133,11 @@ void SetupDialog::loadSettings() {
     encryption_mode_ = g_settings.encryption_mode;
     strncpy(psk_hex_, g_settings.psk_hex.c_str(), sizeof(psk_hex_) - 1);
     psk_hex_[sizeof(psk_hex_) - 1] = 0;
+
+    break_fh_gate_enabled_ = g_settings.break_fh_gate_enabled;
+    turnaround_rephase_enabled_ = g_settings.turnaround_rephase_enabled;
+    strncpy(rate_table_path_, g_settings.rate_table_path.c_str(), sizeof(rate_table_path_) - 1);
+    rate_table_path_[sizeof(rate_table_path_) - 1] = 0;
 }
 
 bool SetupDialog::render() {
@@ -187,39 +195,7 @@ bool SetupDialog::render() {
 
         ImGui::SetCursorPosX(start_x);
         if (ImGui::Button("OK", ImVec2(button_width, 0))) {
-            // Apply all settings
-            g_settings.my_callsign = my_callsign_;
-            g_settings.radio_type = (radio_type_ == 1) ? "sbitx" : "stockhf";
-            g_settings.control_port = control_port_;
-            g_settings.data_port = data_port_;
-            g_settings.connection_timeout_ms = connection_timeout_ms_;
-            g_settings.link_timeout_ms = link_timeout_ms_;
-            g_settings.max_connection_attempts = max_connection_attempts_;
-            g_settings.exit_on_disconnect = exit_on_disconnect_;
-            g_settings.ptt_on_delay_ms = ptt_on_delay_ms_;
-            g_settings.ptt_off_delay_ms = ptt_off_delay_ms_;
-            g_settings.pilot_tone_ms = pilot_tone_ms_;
-            g_settings.pilot_tone_hz = pilot_tone_hz_;
-            g_settings.gear_shift_enabled = gear_shift_enabled_;
-            g_settings.initial_config = initial_config_;
-            g_settings.ldpc_iterations_max = ldpc_iterations_max_;
-            g_gui_state.ldpc_iterations_max.store(ldpc_iterations_max_);
-            g_settings.coarse_freq_sync_enabled = coarse_freq_sync_enabled_;
-            g_gui_state.coarse_freq_sync_enabled.store(coarse_freq_sync_enabled_);
-            g_settings.robust_mode_enabled = robust_mode_enabled_;
-            g_gui_state.robust_mode_enabled.store(robust_mode_enabled_);
-            g_settings.bandwidth_mode = bandwidth_mode_;
-            g_gui_state.bandwidth_mode.store(bandwidth_mode_);
-            // narrowband_enabled driven by bandwidth_mode: always start NB
-            g_settings.narrowband_enabled = true;
-            g_gui_state.narrowband_enabled.store(true);
-            g_settings.guard_interval_ms = GI_VALUES_MS[guard_interval_idx_];
-            g_settings.hide_console = hide_console_;
-            g_settings.log_enabled = log_file_enabled_;
-            g_settings.encryption_mode = encryption_mode_;
-            g_gui_state.encryption_mode.store(encryption_mode_);
-            g_settings.psk_hex = psk_hex_;
-
+            applyToSettings();   // writes g_settings AND persists the INI (footgun fix)
             settings_applied = true;
             is_open_ = false;
         }
@@ -231,44 +207,61 @@ bool SetupDialog::render() {
 
         ImGui::SameLine();
         if (ImGui::Button("Apply", ImVec2(button_width, 0))) {
-            g_settings.my_callsign = my_callsign_;
-            g_settings.radio_type = (radio_type_ == 1) ? "sbitx" : "stockhf";
-            g_settings.control_port = control_port_;
-            g_settings.data_port = data_port_;
-            g_settings.connection_timeout_ms = connection_timeout_ms_;
-            g_settings.link_timeout_ms = link_timeout_ms_;
-            g_settings.max_connection_attempts = max_connection_attempts_;
-            g_settings.exit_on_disconnect = exit_on_disconnect_;
-            g_settings.ptt_on_delay_ms = ptt_on_delay_ms_;
-            g_settings.ptt_off_delay_ms = ptt_off_delay_ms_;
-            g_settings.pilot_tone_ms = pilot_tone_ms_;
-            g_settings.pilot_tone_hz = pilot_tone_hz_;
-            g_settings.gear_shift_enabled = gear_shift_enabled_;
-            g_settings.initial_config = initial_config_;
-            g_settings.ldpc_iterations_max = ldpc_iterations_max_;
-            g_gui_state.ldpc_iterations_max.store(ldpc_iterations_max_);
-            g_settings.coarse_freq_sync_enabled = coarse_freq_sync_enabled_;
-            g_gui_state.coarse_freq_sync_enabled.store(coarse_freq_sync_enabled_);
-            g_settings.robust_mode_enabled = robust_mode_enabled_;
-            g_gui_state.robust_mode_enabled.store(robust_mode_enabled_);
-            g_settings.bandwidth_mode = bandwidth_mode_;
-            g_gui_state.bandwidth_mode.store(bandwidth_mode_);
-            // narrowband_enabled driven by bandwidth_mode: always start NB
-            g_settings.narrowband_enabled = true;
-            g_gui_state.narrowband_enabled.store(true);
-            g_settings.guard_interval_ms = GI_VALUES_MS[guard_interval_idx_];
-            g_settings.hide_console = hide_console_;
-            g_settings.log_enabled = log_file_enabled_;
-            g_settings.encryption_mode = encryption_mode_;
-            g_gui_state.encryption_mode.store(encryption_mode_);
-            g_settings.psk_hex = psk_hex_;
-
+            applyToSettings();   // writes g_settings AND persists the INI (footgun fix)
             settings_applied = true;
         }
     }
     ImGui::End();
 
     return settings_applied;
+}
+
+// Copy dialog fields into g_settings, then persist to disk. Previously OK/Apply
+// only wrote g_settings (in-memory) and the INI was saved ONLY by the separate
+// Advanced->"Save Settings to File" button or a soundcard restart, so a user who
+// edited a setting and clicked OK lost it on exit. Now both OK and Apply persist.
+void SetupDialog::applyToSettings() {
+    g_settings.my_callsign = my_callsign_;
+    g_settings.radio_type = (radio_type_ == 1) ? "sbitx" : "stockhf";
+    g_settings.control_port = control_port_;
+    g_settings.data_port = data_port_;
+    g_settings.connection_timeout_ms = connection_timeout_ms_;
+    g_settings.link_timeout_ms = link_timeout_ms_;
+    g_settings.max_connection_attempts = max_connection_attempts_;
+    g_settings.exit_on_disconnect = exit_on_disconnect_;
+    g_settings.ptt_on_delay_ms = ptt_on_delay_ms_;
+    g_settings.ptt_off_delay_ms = ptt_off_delay_ms_;
+    g_settings.pilot_tone_ms = pilot_tone_ms_;
+    g_settings.pilot_tone_hz = pilot_tone_hz_;
+    g_settings.gear_shift_enabled = gear_shift_enabled_;
+    g_settings.initial_config = initial_config_;
+    g_settings.ldpc_iterations_max = ldpc_iterations_max_;
+    g_gui_state.ldpc_iterations_max.store(ldpc_iterations_max_);
+    g_settings.coarse_freq_sync_enabled = coarse_freq_sync_enabled_;
+    g_gui_state.coarse_freq_sync_enabled.store(coarse_freq_sync_enabled_);
+    g_settings.robust_mode_enabled = robust_mode_enabled_;
+    g_gui_state.robust_mode_enabled.store(robust_mode_enabled_);
+    g_settings.bandwidth_mode = bandwidth_mode_;
+    g_gui_state.bandwidth_mode.store(bandwidth_mode_);
+    // narrowband_enabled driven by bandwidth_mode: always start NB
+    g_settings.narrowband_enabled = true;
+    g_gui_state.narrowband_enabled.store(true);
+    g_settings.guard_interval_ms = GI_VALUES_MS[guard_interval_idx_];
+    g_settings.hide_console = hide_console_;
+    g_settings.log_enabled = log_file_enabled_;
+    g_settings.encryption_mode = encryption_mode_;
+    g_gui_state.encryption_mode.store(encryption_mode_);
+    g_settings.psk_hex = psk_hex_;
+
+    // Proven features previously env-only (effective on next modem restart; the
+    // env vars are applied from these INI values at startup in main.cc).
+    g_settings.break_fh_gate_enabled = break_fh_gate_enabled_;
+    g_settings.turnaround_rephase_enabled = turnaround_rephase_enabled_;
+    g_settings.rate_table_path = rate_table_path_;
+
+    // FOOTGUN FIX: persist immediately so OK/Apply survive exit without needing
+    // the separate Advanced->"Save Settings to File" step.
+    g_settings.save(getDefaultConfigPath());
 }
 
 void SetupDialog::renderStationTab() {
@@ -472,6 +465,34 @@ void SetupDialog::renderGearShiftTab() {
     ImGui::TextWrapped("Gear shifting automatically adjusts the modulation configuration based on channel conditions. "
                        "Turboshift probes the link bidirectionally at connection time, then the success-based "
                        "ladder maintains the optimal rate during data transfer.");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::Text("Performance Features");
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(proven; restart to apply)");
+    ImGui::Spacing();
+
+    ImGui::Checkbox("Turnaround re-phase (long-batch reverse-ACK)", &turnaround_rephase_enabled_);
+    ImGui::TextWrapped("Re-centers the reverse-ACK listen window later on long OFDM batches so the "
+                       "end-of-batch SACK lands in window. Proven throughput fix. Leave ON.");
+
+    ImGui::Spacing();
+
+    ImGui::Checkbox("BREAK forward-health gate", &break_fh_gate_enabled_);
+    ImGui::TextWrapped("Suppresses spurious BREAK->ROBUST_0 collapses while the forward link is healthy. "
+                       "Proven fix. Leave ON.");
+
+    ImGui::Spacing();
+
+    ImGui::Text("Rate table:");
+    ImGui::SameLine(180);
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("##rate_table_path", rate_table_path_, sizeof(rate_table_path_));
+    ImGui::TextWrapped("Optional path to an effective-rate optimizer table (JSON). "
+                       "Leave empty to use the modem's built-in default search.");
 }
 
 void SetupDialog::renderAdvancedTab() {

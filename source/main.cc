@@ -2261,6 +2261,47 @@ start_modem:
                 printf("Using TCP ports from settings: control=%d, data=%d\n",
                        g_settings.control_port, g_settings.data_port);
             }
+
+            // Surface proven, previously env-only modem features from the INI by
+            // translating each into its MERCURY_* env var HERE, before the ARQ
+            // controller / telecom_system are constructed and first read them
+            // (break_fh_gate_enabled / turnaround_rephase_enabled_common cache on
+            // first call; opt_load_rate_table reads $MERCURY_RATE_TABLE). A var
+            // already present in the environment WINS over the INI so a command
+            // line A/B override is never clobbered. Mirrors the _putenv_s/setenv
+            // pattern at arq_commander.cc.
+            {
+                auto set_env = [](const char* k, const char* v) {
+#if defined(_WIN32)
+                    _putenv_s(k, v);
+#else
+                    setenv(k, v, 1);
+#endif
+                };
+                // BREAK forward-health gate: env is a DISABLE hatch (presence =
+                // disabled). Only set it when the user turned the gate OFF in the
+                // GUI and didn't already set the env on the command line.
+                if (!g_settings.break_fh_gate_enabled &&
+                    std::getenv("MERCURY_BREAK_FH_GATE_DISABLE") == nullptr) {
+                    set_env("MERCURY_BREAK_FH_GATE_DISABLE", "1");
+                    printf("Feature: BREAK forward-health gate DISABLED (from INI)\n");
+                }
+                // Turnaround re-phase: default-ON; env "0" disables. Only set
+                // when OFF in the GUI and not already overridden on the CLI.
+                if (!g_settings.turnaround_rephase_enabled &&
+                    std::getenv("MERCURY_TURNAROUND_REPHASE") == nullptr) {
+                    set_env("MERCURY_TURNAROUND_REPHASE", "0");
+                    printf("Feature: turnaround re-phase DISABLED (from INI)\n");
+                }
+                // Rate-table path: only when the user supplied one and the env
+                // isn't already set on the CLI.
+                if (!g_settings.rate_table_path.empty() &&
+                    std::getenv("MERCURY_RATE_TABLE") == nullptr) {
+                    set_env("MERCURY_RATE_TABLE", g_settings.rate_table_path.c_str());
+                    printf("Feature: rate table path = %s (from INI)\n",
+                           g_settings.rate_table_path.c_str());
+                }
+            }
         } else {
             printf("No settings file found, using defaults\n");
         }

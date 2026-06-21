@@ -245,6 +245,12 @@ void MercurySettings::setDefaults() {
     // Logging
     log_enabled = false;
 
+    // Proven features (previously env-only). Defaults match the shipped modem
+    // defaults so a fresh INI reproduces the modem's default-on behavior:
+    break_fh_gate_enabled = true;      // arq_common.cc default-ON
+    turnaround_rephase_enabled = true; // arq_common.cc default-ON
+    rate_table_path = "";              // empty => modem's built-in search chain
+
     // Per-signal-type tx_gain overrides — NaN = no override, use code default.
     // See ini_parser.h comment + plan §7.13.21.
     for (int s = 0; s < TX_GAIN_NSIG; s++)
@@ -326,6 +332,12 @@ bool MercurySettings::load(const std::string& filename) {
     // Logging
     log_enabled = ini.getBool("Logging", "LogEnabled", log_enabled);
 
+    // Proven features (previously env-only). main.cc translates each into the
+    // corresponding MERCURY_* env var at startup, before the modem reads it.
+    break_fh_gate_enabled = ini.getBool("Features", "BreakForwardHealthGate", break_fh_gate_enabled);
+    turnaround_rephase_enabled = ini.getBool("Features", "TurnaroundRephase", turnaround_rephase_enabled);
+    rate_table_path = ini.getString("Features", "RateTablePath", rate_table_path);
+
     // Per-signal-type tx_gain overrides (plan §7.13.21). Absent key => NaN
     // => keep code default. INI section [TxGain] keys SIG_MODE, e.g. OFDM_WB.
     for (int s = 0; s < TX_GAIN_NSIG; s++) {
@@ -399,6 +411,11 @@ bool MercurySettings::save(const std::string& filename) {
 
     // Logging
     ini.setBool("Logging", "LogEnabled", log_enabled);
+
+    // Proven features (previously env-only).
+    ini.setBool("Features", "BreakForwardHealthGate", break_fh_gate_enabled);
+    ini.setBool("Features", "TurnaroundRephase", turnaround_rephase_enabled);
+    ini.setString("Features", "RateTablePath", rate_table_path);
 
     // Per-signal-type tx_gain overrides — only write entries that have been
     // explicitly set (non-NaN), so a fresh INI doesn't get polluted with the

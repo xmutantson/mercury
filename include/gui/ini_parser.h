@@ -105,6 +105,17 @@ struct MercurySettings {
     // Logging
     bool log_enabled;      // Enable logging to <exe_dir>/logs/<timestamp>.log
 
+    // Proven modem features that were previously ENV-only (MERCURY_* vars).
+    // These are surfaced as INI keys + Setup-dialog controls; main.cc translates
+    // each INI value into the corresponding env var BEFORE the modem reads it.
+    // Defaults MUST match each feature's shipped default in the modem source:
+    //   break_fh_gate     default-ON  (arq_common.cc:break_fh_gate_enabled)
+    //   turnaround_rephase default-ON (arq_common.cc:turnaround_rephase_enabled_common)
+    //   rate_table_path   empty => modem's built-in path-resolution chain.
+    bool break_fh_gate_enabled;     // [Features] BreakForwardHealthGate (default true)
+    bool turnaround_rephase_enabled;// [Features] TurnaroundRephase       (default true)
+    std::string rate_table_path;    // [Features] RateTablePath (empty => default search)
+
     // Per-signal-type tx_gain overrides (calibration backlog, plan §7.13.21).
     // Indexed as tx_gain_override[signal_type][nb_mode] where signal_type matches
     // tx_signal_type enum (MFSK_1S=0, MFSK_2S=1, OFDM=2, ACK=3, BREAK=4) and

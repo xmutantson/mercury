@@ -44,6 +44,15 @@ public:
     void loadSettings();
 
 private:
+    /**
+     * @brief Copy dialog fields into g_settings and persist to the INI file.
+     *
+     * Shared by both OK and Apply so the two paths can never drift. The persist
+     * (g_settings.save) is the FIX for the "OK does not write the INI" footgun:
+     * edits now survive exit without a separate Advanced->Save Settings step.
+     */
+    void applyToSettings();
+
     bool is_open_;
     int current_tab_;
 
@@ -92,6 +101,12 @@ private:
     // Advanced
     bool hide_console_;
     bool log_file_enabled_;
+
+    // Proven features previously env-only (surfaced 2026-06-21). Wired to the
+    // MERCURY_* env vars at INI load in main.cc.
+    bool break_fh_gate_enabled_;      // MERCURY_BREAK_FH_GATE_DISABLE (inverse)
+    bool turnaround_rephase_enabled_; // MERCURY_TURNAROUND_REPHASE
+    char rate_table_path_[260];       // MERCURY_RATE_TABLE (empty = default)
 
     // Security
     int encryption_mode_;  // ENCRYPT_OFF=0, ENCRYPT_STRICT=1, ENCRYPT_FAST=2
