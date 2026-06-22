@@ -39,9 +39,17 @@
 extern "C" {
 #endif
 
-/* v1 universal dictionary version. 0 = reserved (no dict / cold). 1..7 valid
- * (3-bit field in the streaming header). Bump on ANY change to WINLINK_DICT_RAW. */
-#define WINLINK_DICT_VERSION       1
+/* Universal dictionary version. 0 = reserved (no dict / cold). 1..7 valid
+ * (3-bit field in the streaming header). Bump on ANY change to WINLINK_DICT_RAW.
+ *   v1: hand-curated 3703B boilerplate (RFC822/MIME + ICS form scaffolding).
+ *   v2: ZDICT-trained generalizable Winlink boilerplate (METAR/TAF, NWS forecast
+ *       tables, Saildocs, email-quote structure, MIME envelope) mined from a real
+ *       transmitted-traffic corpus + PII-scrubbed, combined with the v1 form
+ *       scaffolding. 15191B raw (operator-specific signature filler stripped).
+ *       ~1.39x more wire reduction on held-out small messages (held-out
+ *       small-regime x-VARA 1.64->2.27). See
+ *       tools/winlink_dict_v2.txt + fact-documents/data-flow-winlink-dict-priming.md. */
+#define WINLINK_DICT_VERSION       2
 #define WINLINK_DICT_VERSION_NONE  0   /* cold / no-dict tag in a streaming frame */
 #define WINLINK_DICT_VERSION_MAX   7   /* 3-bit header field cap */
 
