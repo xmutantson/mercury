@@ -524,6 +524,12 @@ cl_arq_controller::cl_arq_controller()
 	gearshift_timeout=1000;
 	connection_timeout=30000;
 	nResends=3;
+	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
+	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at
+	// Commander connect-accept (CONNECT skips reset_session_state).
+	session_data_frame_sent = false;
+	session_data_frame_received = false;
+	break_noprogress_cycles = 0;
 	stats.nSent_data=0;
 	stats.nAcked_data=0;
 	stats.nReceived_data=0;
@@ -3994,6 +4000,10 @@ void cl_arq_controller::reset_session_state()
 	                                 // starvation streak on session reset / new CONNECT.
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
+	// IDLE-SWITCHROLE-RACE recovery (idle-switchrole-race.md §3): fresh session —
+	// no dead-BREAK streak accrued yet. (Also reset at Commander connect-accept,
+	// arq_commander.cc, since CONNECT skips reset_session_state.)
+	break_noprogress_cycles = 0;
 	ceiling_success_count = 0;
 	break_detected = NO;
 	break_probe_consec_match = 0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
@@ -4028,6 +4038,13 @@ void cl_arq_controller::reset_session_state()
 	kx_data_len = 0;
 
 	// Data exchange
+	// IDLE-SWITCHROLE-RACE per-session flags (idle-switchrole-race.md §2/§3/§5.5):
+	// fresh session has neither sent nor received a data frame -> the idle
+	// SWITCH_ROLE handoff stays suppressed and the BREAK no-progress discriminator
+	// starts clean. (Also reset at Commander connect-accept since CONNECT skips
+	// reset_session_state, arq_common.cc:801.)
+	session_data_frame_sent = false;
+	session_data_frame_received = false;
 	block_under_tx = NO;
 	consecutive_data_acks = 0;
 	success_rate_data_clean = 100.0;  // CLEAN-BATCH VIABILITY (§9) — neutral per session

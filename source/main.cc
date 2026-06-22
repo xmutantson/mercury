@@ -710,6 +710,15 @@ int main(int argc, char *argv[])
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
             failed += test_sigterm_handler();
+            // IDLE-SWITCHROLE-RACE regression gates (idle-switchrole-race.md §4):
+            // B (trigger-gate, B1+B2) and C (no-progress teardown + neg-control).
+            // Both are in-process synthetic-fire (no PHY/audio) so they belong in
+            // the master suite as permanent regression gates.
+            {
+                cl_arq_controller ARQ_isr;
+                failed += ARQ_isr.test_idle_switch_role_race();
+                failed += ARQ_isr.test_break_noprogress_teardown();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
@@ -950,6 +959,14 @@ int main(int argc, char *argv[])
                                         // panic counter, and BREAK still reaches ROBUST_0. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §8.
     bool test_clean_batch_viability_cli = false; // --test-clean-batch-viability: CLEAN-BATCH VIABILITY regression (§9).
+    bool test_idle_switch_role_race_cli = false; // --test-idle-switch-role-race: idle SWITCH_ROLE race regression.
+                                        // Drives the REAL process_buffer_data_commander() idle branch with a freshly-
+                                        // CONNECTED empty-tx Commander; asserts SWITCH_ROLE is queued before any data
+                                        // (the connected-but-0-deliver root cause). FAILS-BEFORE on monitor. One-shot.
+    bool test_break_noprogress_cli = false; // --test-break-noprogress-teardown: BREAK no-progress teardown regression
+                                        // (idle-switchrole-race.md §3/§4 Part C). Replays the shared break_noprogress_step
+                                        // kernel: teardown fires at exactly K dead cycles; progress on a live BREAK resets
+                                        // the streak (negative control). FAILS-BEFORE with -DBREAK_NOPROGRESS_FAILBEFORE.
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
                                         // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
@@ -1713,6 +1730,27 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-compress-frame-fill.md §5.
             test_robust0_compress_deadlock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-idle-switch-role-race") == 0)
+        {
+            // Idle SWITCH_ROLE race regression — one-shot at startup, then exit
+            // with the test's rc. FAILS-BEFORE evidence for the
+            // connected-but-0-deliver bench bug (empty-tx Commander gives its
+            // role away before the app's first data write).
+            test_idle_switch_role_race_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-break-noprogress-teardown") == 0)
+        {
+            // BREAK no-progress teardown regression — one-shot at startup, then
+            // exit with the test's rc. Part C of the idle-switchrole-race fix:
+            // a never-fed BREAK spiral must reach a graceful teardown at K dead
+            // cycles instead of re-arming the watchdog forever. FAILS-BEFORE with
+            // -DBREAK_NOPROGRESS_FAILBEFORE (the kernel never escalates).
+            test_break_noprogress_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3183,6 +3221,33 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_robust0_compress_deadlock();
             printf("[FLAG] Robust0-compress-deadlock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_idle_switch_role_race_cli) {
+            // Idle SWITCH_ROLE race regression (one-shot, then exit rc). Drives
+            // the REAL process_buffer_data_commander() idle branch with a
+            // freshly-CONNECTED empty-tx Commander; asserts SWITCH_ROLE is queued
+            // before any data write — the connected-but-0-deliver root cause.
+            printf("[FLAG] --test-idle-switch-role-race: invoking idle SWITCH_ROLE "
+                   "race regression (FAILS-BEFORE evidence)\n");
+            fflush(stdout);
+            int rc = ARQ.test_idle_switch_role_race();
+            printf("[FLAG] Idle-switch-role-race test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_break_noprogress_cli) {
+            // BREAK no-progress teardown regression (one-shot, then exit rc).
+            // Replays the shared break_noprogress_step kernel that the EXHAUSTED
+            // re-arm site uses; asserts teardown at exactly K dead cycles and the
+            // negative control (progress resets the streak). Part C of the
+            // connected-but-0-deliver fix. See fact-documents/idle-switchrole-race.md.
+            printf("[FLAG] --test-break-noprogress-teardown: invoking BREAK no-progress "
+                   "teardown regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_break_noprogress_teardown();
+            printf("[FLAG] Break-noprogress-teardown test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

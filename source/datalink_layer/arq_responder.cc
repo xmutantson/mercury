@@ -99,6 +99,11 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	if(messages_rx[loc].status==FREE || messages_rx[loc].status==ACKED)
 	{
 		stats.nReceived_data++;
+		// IDLE-SWITCHROLE-RACE recovery (idle-switchrole-race.md §3): this session
+		// has DELIVERED an RX data frame -> real forward progress. The BREAK
+		// no-progress teardown discriminator (Part C) keys on this per-session bool
+		// (NOT raw stats.nReceived_data, which is cumulative across sessions).
+		session_data_frame_received = true;
 	}
 	messages_rx[loc].status=RECEIVED;
 	success=SUCCESSFUL;

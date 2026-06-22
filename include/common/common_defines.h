@@ -324,6 +324,32 @@ inline int session_floor_anchor(bool robust_enabled, int start_config) {
 // blocks the intended panic jump to ROBUST_0.
 static const int BREAK_DROP_STEP_MAX = 16;   // OFDM ladder span (CONFIG_16 -> CONFIG_0)
 
+// IDLE-SWITCHROLE-RACE recovery bound (idle-switchrole-race.md §3/§6). Number of
+// consecutive NO-PROGRESS BREAK-EXHAUSTED re-arms (no RX data this session AND tx
+// FIFO empty AND a zero-byte re-queue) tolerated before conceding the link is dead
+// and routing to the FORCED-fallback teardown (arq_common.cc:3053-3065). This is a
+// structural escalation count, NOT a tuned margin: the watchdog never disconnects
+// (arq_common.cc:2985 re-arms itself) so without this a never-fed link spins
+// forever; the only legacy escape is the 180 s FORCED_ROLE_SWITCH_TIMEOUT keyed off
+// receiving_timer. K=4 gives ~one FORCED cycle of headroom (4 BREAK cycles ~ 25s
+// each) before tearing down. A live BREAK with ANY progress resets the counter to 0
+// (negative control), so this is a no-op on every healthy or recovering link.
+static const int BREAK_NOPROGRESS_TEARDOWN_K = 4;
+
+// PURE kernel of the BREAK no-progress escalation (idle-switchrole-race.md §3).
+// On a DEAD cycle (no_progress==true: no RX data this session AND empty TX AND a
+// zero-byte re-queue) increment `cycles` and return true ONLY once it reaches the
+// teardown bound K — the caller then routes to the FORCED-fallback teardown. On
+// ANY progress (no_progress==false) RESET `cycles` to 0 and return false (the
+// negative control: a live BREAK is never torn down). Production calls this at the
+// EXHAUSTED re-arm site; the unit test (test_break_noprogress_teardown) replays it
+// directly, same as break_drop_step_after_double's "test replays it" idiom.
+inline bool break_noprogress_step(int& cycles, bool no_progress) {
+	if(!no_progress) { cycles = 0; return false; }
+	cycles++;
+	return cycles >= BREAK_NOPROGRESS_TEARDOWN_K;
+}
+
 // Multiplicative-INCREASE half of the break_drop_step AARF, CAPPED. Production
 // calls this at BOTH doubling sites (arq_commander.cc:227/:327) instead of a bare
 // `break_drop_step *= 2`. PURE; the unit test (Part R) replays it directly.
