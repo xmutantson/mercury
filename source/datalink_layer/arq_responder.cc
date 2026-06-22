@@ -5756,13 +5756,24 @@ int cl_arq_controller::test_inband_liveness()
 	};
 
 	// ========================================================================
-	// PART A — a control-plane STALL fires a BREAK at EXACTLY the threshold
+	// PART A — a POST-DATA control-plane STALL fires a BREAK at EXACTLY the threshold
 	// ========================================================================
+	// Models an ESTABLISHED session (data HAS flowed: nAcked_data>0) that then livelocks in
+	// control-TX with nAcked_data flat. This is the guard's legitimate backstop: data flowed
+	// once, so the connect/negotiate exemption (PART F) does NOT apply and the guard arms.
 	{
 		cl_telecom_system* ts = nullptr;
 		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
 		check(cmd->inband_liveness_stall_polls_count() == STALL_N,
 			"A0 threshold resolves from env", cmd->inband_liveness_stall_polls_count(), STALL_N);
+
+		// Data HAS flowed this session (nAcked_data advanced earlier) but is now FLAT, and no
+		// data batch is in flight (messages_tx[] empty) — so the genuine BREAK path fires, not
+		// the A3/demote re-air (which needs an in-flight batch). This is the post-data control
+		// livelock the guard MUST still catch.
+		cmd->stats.nAcked_data            = 5;
+		cmd->cmd_inband_liveness_last_acked = 5;   // snapshot in sync: no new advance to reset
+		for(int i=0;i<cmd->nMessages;i++) cmd->messages_tx[i].status = FREE;   // no in-flight DATA
 
 		// Model the livelocked handshake: a STALE control message wedged PENDING_ACK with a
 		// distinctive id. The guard must cancel THIS stale slot as part of recovery.
@@ -5801,6 +5812,10 @@ int cl_arq_controller::test_inband_liveness()
 	{
 		cl_telecom_system* ts = nullptr;
 		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		// Data HAS flowed (post-data backstop armed; the connect/negotiate exemption — PART F —
+		// does not apply once a session is established) so the control-plane streak accrues.
+		cmd->stats.nAcked_data              = 5;
+		cmd->cmd_inband_liveness_last_acked = 5;   // in sync: no advance, streak accrues
 		// Accrue right up to (but not past) the threshold...
 		for(int p = 1; p < STALL_N; p++) cmd->inband_connect_liveness_guard();
 		check(cmd->cmd_inband_liveness_no_progress_polls == STALL_N - 1,
@@ -5830,6 +5845,10 @@ int cl_arq_controller::test_inband_liveness()
 	{
 		cl_telecom_system* ts = nullptr;
 		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		// Data HAS flowed (post-data backstop armed; the connect/negotiate exemption — PART F —
+		// does not apply once a session is established) so the bounded escalation can run.
+		cmd->stats.nAcked_data              = 5;
+		cmd->cmd_inband_liveness_last_acked = 5;
 		int breaks = 0, dropped_at = -1;
 		// Each episode: clear the in-flight BREAK (model "BREAK did not recover") and run
 		// the guard through another N data-less polls; count fires until the hard reset.
@@ -5902,15 +5921,81 @@ int cl_arq_controller::test_inband_liveness()
 		check(cmd->emergency_break_active == 0,
 			"E3 no BREAK state armed during the connect handshake",
 			cmd->emergency_break_active, 0);
-		// And once it transitions to CONNECTED with the stall persisting, the real
-		// livelock backstop DOES fire (the guard is armed, not disabled).
+		// And once it transitions to CONNECTED *with data having flowed* and the stall
+		// persisting, the real livelock backstop DOES fire (the guard is armed, not disabled).
+		// (Data must have flowed; a bare-CONNECTED control handshake with NO data ever is the
+		// connect/negotiate-exempt case covered by PART F.)
 		cmd->link_status = CONNECTED;
+		cmd->stats.nAcked_data             = 5;
+		cmd->cmd_inband_liveness_last_acked = 5;   // post-data: backstop is armed
 		int fired_at = -1;
 		for(int p = 1; p <= STALL_N + 2; p++)
 			if(cmd->inband_connect_liveness_guard()) { fired_at = p; break; }
 		check(fired_at == STALL_N,
-			"E4 once CONNECTED the stalled-livelock backstop fires at EXACTLY N",
+			"E4 once CONNECTED (post-data) the stalled-livelock backstop fires at EXACTLY N",
 			fired_at, STALL_N);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART F — CONNECT/NEGOTIATE-PHASE NO-FIRE (post-CONNECT control handshake, NO data ever):
+	// the post-connect WB-bandwidth negotiate ([BW-NEG] "initiating WB upgrade") sits in
+	// TRANSMITTING_CONTROL / RECEIVING_ACKS_CONTROL with nAcked_data flat at 0 and NO data
+	// batch ever queued for ~9s while a single SWITCH_BANDWIDTH frame airs. link_status is
+	// already CONNECTED (the upgrade runs post-connect), so the bare CONNECTED arming
+	// false-fired a true-loss BREAK and delivered 0 bytes. The guard must HOLD until a DATA
+	// session is established (data has flowed at least once).
+	//   fail-before (-DINBAND_NEGOTIATE_FAILBEFORE, exemption compiled out): the guard FIRES at
+	//     N during the negotiate -> F1/F2 FAIL. pass-after: holds for > N polls.
+	//   BACKSTOP PRESERVED: once a data batch is in flight (data has flowed), the SAME
+	//     control-plane stall DOES fire the backstop -> F3/F4.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		// Model the post-connect WB negotiate: CONNECTED, RECEIVING_ACKS_CONTROL, nAcked_data
+		// flat at 0, NO data ever queued (messages_tx[] empty, last_acked 0) — exactly the
+		// [BW-NEG] SWITCH_BANDWIDTH air window.
+		cmd->link_status                    = CONNECTED;
+		cmd->connection_status              = RECEIVING_ACKS_CONTROL;
+		cmd->stats.nAcked_data              = 0;
+		cmd->cmd_inband_liveness_last_acked = 0;
+		for(int i=0;i<cmd->nMessages;i++) cmd->messages_tx[i].status = FREE;   // no DATA ever queued
+		bool fired = false;
+		for(int p = 1; p <= STALL_N + 4; p++)   // well past the threshold
+			if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+		check(!fired,
+			"F1 the guard does NOT fire during the post-connect negotiate (no data ever)",
+			fired ? 1 : 0, 0);
+		check(cmd->cmd_inband_liveness_no_progress_polls == 0,
+			"F2 the no-data streak does NOT accrue during the control handshake (held at 0)",
+			cmd->cmd_inband_liveness_no_progress_polls, 0);
+		check(cmd->emergency_break_active == 0,
+			"F2b no BREAK state armed during the negotiate handshake",
+			cmd->emergency_break_active, 0);
+
+		// BACKSTOP PRESERVED: stage an in-flight DATA batch (data has now flowed) at the
+		// ladder BOTTOM (ROBUST_0) so the A3/demote re-air does NOT intercept (no lower rung) —
+		// the SAME control-plane stall must now arm the genuine livelock backstop and fire.
+		cmd->load_configuration(ROBUST_0, FULL, NO);   // bottom rung: !config_is_at_bottom is false
+		cmd->connection_status = RECEIVING_ACKS_CONTROL;
+		for(int i=0;i<8 && i<cmd->nMessages;i++)
+		{
+			cmd->messages_tx[i].status      = PENDING_ACK;   // in-flight DATA batch (data has flowed)
+			cmd->messages_tx[i].length      = 16;
+			cmd->messages_tx[i].batch_seq_id = 0;
+		}
+		cmd->cmd_inband_liveness_no_progress_polls = 0;
+		cmd->cmd_inband_liveness_breaks            = 0;
+		int fired_at = -1;
+		for(int p = 1; p <= STALL_N + 2; p++)
+			if(cmd->inband_connect_liveness_guard()) { fired_at = p; break; }
+		check(fired_at == STALL_N,
+			"F3 with data in flight (data has flowed) the backstop fires at EXACTLY N",
+			fired_at, STALL_N);
+		check(cmd->emergency_break_active == 1,
+			"F4 the backstop armed the emergency-break recovery (genuine post-data livelock)",
+			cmd->emergency_break_active, 1);
 		delete cmd; delete ts;
 	}
 
@@ -7932,19 +8017,29 @@ int cl_arq_controller::test_inband_deliver()
 	// UNCHANGED by the discriminator, so these PASS in fail-before too).
 	// ========================================================================
 	{
-		// (i) The connect-liveness guard with NO in-flight DATA batch (a connect/negotiate
-		// livelock — zero forward DATA ever) STILL fires the §7 BREAK.
+		// (i) A POST-DATA control-plane livelock with NO in-flight DATA batch STILL fires the
+		// §7 BREAK. (Updated 2026-06-22 with the connect/negotiate-exemption fix,
+		// data-flow-inband-connect-liveness.md §5: a PRE-data control stall — no ack ever AND
+		// no batch queued — is now exempted because it is indistinguishable from the legitimate
+		// ~9s WB-bandwidth negotiate that previously false-fired a 0-deliver BREAK. The guard's
+		// genuine-death backstop is preserved for an ESTABLISHED session: once data has flowed
+		// (cmd_inband_liveness_last_acked>0) a control livelock with no rescuable in-flight batch
+		// STILL fires the BREAK exactly as before. That post-data case is the genuine death this
+		// asserts; a never-fed session's death is caught by the link/connection watchdogs + the
+		// SESSION_DEAD_BATCHES floor in sub-case (ii), not by this guard.)
 		cl_telecom_system* ts = nullptr;
 		cl_arq_controller* cmd = make_cmd(CONFIG_10, &ts);
 		for(int i=0;i<cmd->nMessages;i++) cmd->messages_tx[i].status = FREE;   // no in-flight DATA
+		cmd->stats.nAcked_data              = 5;   // data HAS flowed: established session
+		cmd->cmd_inband_liveness_last_acked = 5;   // in sync: now FLAT -> the post-data livelock
 		check(!cmd->cmd_has_inflight_data_batch(),
-			"C0 no in-flight DATA batch (a genuine connect/negotiate livelock)",
+			"C0 no in-flight DATA batch (a genuine post-data control livelock)",
 			cmd->cmd_has_inflight_data_batch() ? 1 : 0, 0);
 		bool fired = false;
 		for(int p=1; p<=STALL_N+2; p++)
 			if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
 		check(fired && cmd->emergency_break_active == 1,
-			"C1 a genuine livelock (no in-flight DATA) STILL fires the BREAK->ROBUST_0",
+			"C1 a genuine post-data livelock (no in-flight DATA) STILL fires the BREAK->ROBUST_0",
 			(fired && cmd->emergency_break_active == 1) ? 1 : 0, 1);
 		delete cmd; delete ts;
 	}

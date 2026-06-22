@@ -3229,6 +3229,41 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 		return false;
 	}
 
+	// CONNECT/NEGOTIATE CONTROL HANDSHAKE — the guard must NOT arm until a DATA session
+	// is actually ESTABLISHED (data-flow-inband-connect-liveness.md §5; data-flow-inband-
+	// a3-decouple.md). link_status==CONNECTED is reached BEFORE the post-connect WB-bandwidth
+	// negotiate runs: when both ends are WB-capable, [BW-NEG] "initiating WB upgrade" queues a
+	// single SWITCH_BANDWIDTH control op (one CONFIG_100/ROBUST_0 frame, ~9s on the wire) and
+	// sits in TRANSMITTING_CONTROL/RECEIVING_ACKS_CONTROL with nAcked_data flat at 0 for the
+	// whole negotiate (arq_commander.cc:5872-5879). That is a LEGITIMATE control handshake —
+	// NOT a livelock — but its state signature is identical to the dead-control case, so the
+	// bare link_status==CONNECTED arming false-fired a true-loss BREAK ~0.56s before the RSP
+	// even received the SWITCH_BANDWIDTH, aborting the negotiate and delivering 0 bytes (the
+	// legacy/OFF path runs the IDENTICAL ~9s negotiate then reaches DATA). The guard's purpose
+	// is to backstop an ESTABLISHED-but-stalled DATA session; gate arming on "a DATA frame has
+	// been queued/acked at least once," not bare CONNECTED. "Data has ever flowed" ⇔ a data ACK
+	// was seen (cmd_inband_liveness_last_acked>0, monotonic per session) OR a data batch is
+	// currently in flight (cmd_has_inflight_data_batch()). Until then hold the streak at 0.
+	// BACKSTOP PRESERVED (the genuine-death net is intact): a POST-DATA control-plane livelock
+	// (RECEIVING_ACKS_CONTROL stuck forever AFTER data flowed) ALWAYS satisfies one of the two —
+	// last_acked>0 if any data was acked, OR an inflight batch is still queued — so the early-out
+	// is skipped and the guard arms exactly as before. Only the pristine PRE-DATA connect/
+	// negotiate handshake (no ack ever AND no batch queued) is exempted.
+	// FAIL-BEFORE (-DINBAND_NEGOTIATE_FAILBEFORE, --test-inband-liveness PART F): the
+	// connect/negotiate exemption is compiled OUT so a pre-DATA control handshake accrues
+	// the streak and false-fires a BREAK at N — reproducing the WB-negotiate 0-deliver.
+#ifndef INBAND_NEGOTIATE_FAILBEFORE
+	bool data_ever_flowed = (cmd_inband_liveness_last_acked > 0)
+	                     || cmd_has_inflight_data_batch();
+	if(!data_ever_flowed
+	   && (connection_status == TRANSMITTING_CONTROL
+	    || connection_status == RECEIVING_ACKS_CONTROL))
+	{
+		cmd_inband_liveness_no_progress_polls = 0;
+		return false;
+	}
+#endif
+
 	// Control-TX / Idle / control-ACK-wait with NO forward DATA progress: accrue.
 	cmd_inband_liveness_no_progress_polls++;
 	if(cmd_inband_liveness_no_progress_polls < inband_liveness_stall_polls_count())
