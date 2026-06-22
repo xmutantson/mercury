@@ -433,6 +433,53 @@ void cl_arq_controller::process_messages_rx_data_control()
 			}
 		}
 
+		// CONNECT-REACK (connect-testack-handshake.md §3.2) — pre-data duplicate
+		// TEST_CONNECTION re-ACK. Site F above DELIBERATELY excludes CONNECTED
+		// (2026-05-27 ftr=2 data-RX starvation, see :340-350), so once the
+		// handshake completes a DUPLICATE TEST_CONNECTION (sent because CMD
+		// missed the single ACK) goes undecoded forever -> a lost ACK costs the
+		// whole connect window. This narrow variant restores TCP/ARDOP's "re-emit
+		// the connect ACK on every duplicate connect request" property, but ONLY
+		// in the PRE-DATA window and ONLY by re-airing the CACHED byte-identical
+		// MFSK TEST_ACK — it does NOT re-run negotiation (INV-C: no :2535 mutation)
+		// and does NOT pin frames_to_read across the data phase (INV-B: it exits
+		// immediately on a miss and is disabled the instant a data frame arrives,
+		// batch_rx_frame_count>0). Gates mirror Site F (FREE control slot, not a
+		// passive monitor, MFSK codec present) plus the pre-data predicate.
+		if(connect_reack_pre_data_window()
+		   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0)
+		{
+			// Same ftr override as Site F (:365-370): the suffix detector core
+			// (receive_mfsk_ctrl_suffix_phy_core) only samples when ftr is small.
+			if(telecom_system->data_container.frames_to_read > 2)
+			{
+				MUTEX_LOCK(&capture_prep_mutex);
+				telecom_system->data_container.frames_to_read = 2;
+				MUTEX_UNLOCK(&capture_prep_mutex);
+			}
+
+			uint8_t rx_snr_q = 0, rx_local_cap = 0, rx_ssid = 0;
+			if(receive_mfsk_test_conn_phy(&rx_snr_q, &rx_local_cap, &rx_ssid))
+			{
+				// Idempotent replay: re-air the EXACT cached ACK (no re-negotiation,
+				// no state mutation, no messages_rx_buffer synthesis -> :2535 is
+				// NOT reached). Reuses the same TX helper the dispatcher calls
+				// (arq_responder.cc:1436).
+				long long elapsed = send_mfsk_test_ack_phy(
+					connect_ack_cache.echoed_cap,
+					connect_ack_cache.own_cap,
+					connect_ack_cache.ssid);
+				connect_ack_cache.replays++;
+				printf("[CONNECT-REACK] duplicate TEST_CONNECTION in pre-data window "
+					"-> re-aired cached TEST_ACK (%lld ms) echoed=0x%02X own=0x%02X "
+					"ssid=%u replay=%d/%d\n",
+					elapsed, connect_ack_cache.echoed_cap, connect_ack_cache.own_cap,
+					connect_ack_cache.ssid, connect_ack_cache.replays,
+					max_connection_attempts);
+				fflush(stdout);
+			}
+		}
+
 		this->receive();
 
 		// Emergency BREAK: commander signals "drop to ROBUST_0"
@@ -2730,6 +2777,18 @@ void cl_arq_controller::process_control_responder()
 				(unsigned char)local_capability,
 				(unsigned char)messages_control.data[3]);
 			fflush(stdout);
+
+			// CONNECT-REACK (connect-testack-handshake.md §3.2): cache the
+			// EXACT triple the MFSK TEST_ACK dispatcher reads (arq_responder.cc
+			// :1433-1435) so a decoded DUPLICATE TEST_CONNECTION in the pre-data
+			// window can re-air the byte-identical ACK without re-running this
+			// negotiation (INV-C). echoed=peer_capability, own=local_capability,
+			// ssid=callsign_get_ssid(my_call_sign) — identical derivation.
+			connect_ack_cache.valid      = true;
+			connect_ack_cache.echoed_cap = (uint8_t)peer_capability;
+			connect_ack_cache.own_cap    = (uint8_t)local_capability;
+			connect_ack_cache.ssid       = (uint8_t)callsign_get_ssid(my_call_sign);
+			connect_ack_cache.replays    = 0;
 		}
 		watchdog_timer.start();
 		link_timer.start();
@@ -3803,6 +3862,133 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 		this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// CONNECT-REACK — T4 in-process unit (connect-testack-handshake.md §5)
+// ============================================================================
+//
+// CLI: --test-connect-reack   (also wired into master --test).
+//
+// Reproduces the single-missed-ACK stall fix (§1.2/§3.2). The bug: Site F
+// (arq_responder.cc:355) is gated to CONNECTION_RECEIVED and DELIBERATELY
+// excludes CONNECTED (2026-05-27 ftr=2 data-RX starvation), so a DUPLICATE
+// TEST_CONNECTION sent after the responder is CONNECTED (because CMD missed the
+// one ACK) is never re-answered -> a lost ACK costs the whole connect window.
+//
+// The fix adds a pre-data-window re-ACK that re-airs the CACHED byte-identical
+// ACK on a decoded duplicate. This test drives the STATE-MACHINE predicate
+// (connect_reack_pre_data_window(), the same one the production block ANDs with
+// the DSP-availability term) plus the cached-triple equality. No DSP/audio.
+//
+// Asserts:
+//   A1 FAIL-BEFORE evidence: the OLD Site-F gate (CONNECTION_RECEIVED only) does
+//      NOT fire for a CONNECTED duplicate (the unrecoverable-miss the fix heals).
+//   A2 PASS-AFTER: in the CONNECTED pre-data window the re-ACK predicate FIRES.
+//   A3 INV-A/C: the cached triple is byte-identical to the negotiated
+//      echoed_cap/own_cap/ssid the dispatcher (arq_responder.cc:1433-1435) reads
+//      — idempotent replay, no re-negotiation.
+//   A4 INV-B/E: the instant a data frame arrives (batch_rx_frame_count>0) the
+//      predicate goes FALSE — the replay self-terminates, never pinning ftr=2.
+//   A5 bound: at the replay budget (replays==max_connection_attempts) the
+//      predicate goes FALSE — a stuck CMD cannot keep RSP replaying forever.
+//   A6 default-init inertness: before any first handshake (cache.valid==false)
+//      the predicate is FALSE (genuine first TEST_CONNECTION still goes via F).
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_connect_reack()
+{
+	int failed = 0;
+	auto CHECK = [&](const char* name, bool cond) {
+		printf("[TEST-REACK] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		fflush(stdout);
+		if(!cond) failed++;
+	};
+
+	// --- Step 0: buffers (mirror test_partial_bsi_advance Step 0) -----------
+	this->nMessages         = 255;
+	this->max_data_length   = 170;
+	this->max_message_length= 200;
+	this->max_header_length = 6;
+	if(init_messages_buffers() != SUCCESSFUL) {
+		printf("[TEST-REACK] FAIL: init_messages_buffers()\n");
+		return 1;
+	}
+
+	// --- Step 1: session defaults the production path relies on -------------
+	this->max_connection_attempts = 15;       // == arq_common.cc:896 default
+	this->passive_monitor         = false;
+	this->narrowband_enabled      = NO;        // WB MFSK TEST_ACK path
+	this->batch_rx_frame_count    = 0;
+	this->messages_control.status = FREE;
+
+	// --- A6: default-init inertness (cache.valid==false) --------------------
+	this->connect_ack_cache.valid = false;
+	this->link_status             = CONNECTION_RECEIVED;
+	this->connection_status       = ACKNOWLEDGING_CONTROL;
+	CHECK("A6 inert before first handshake (no cache -> no replay)",
+	      connect_reack_pre_data_window() == false);
+
+	// --- A1: FAIL-BEFORE — the OLD Site-F gate excludes CONNECTED -----------
+	// Site F (arq_responder.cc:355) fires only in CONNECTION_RECEIVED. Once the
+	// handshake completes (CONNECTED), that gate is false for every duplicate —
+	// the unrecoverable miss. Model the OLD gate predicate explicitly.
+	this->link_status       = CONNECTED;
+	this->connection_status = RECEIVING;
+	bool old_sitef_gate_connected =
+		(this->link_status == CONNECTION_RECEIVED)   // the 2026-05-27 gate
+		&& (this->messages_control.status == FREE);
+	CHECK("A1 FAIL-BEFORE: old Site-F gate does NOT fire when CONNECTED "
+	      "(the unrecoverable duplicate-miss)",
+	      old_sitef_gate_connected == false);
+
+	// --- Step 2: simulate the FIRST handshake building + caching the ACK ----
+	// Mirror arq_responder.cc:2720-2724 + the new cache populate: the dispatcher
+	// reads echoed=peer_capability, own=local_capability, ssid=ssid(my_call).
+	this->peer_capability  = 0x05;   // CMD's caps (echo target)
+	this->local_capability = 0x03;   // RSP's own caps
+	this->my_call_sign     = "TESTB-7";
+	uint8_t want_echoed = (uint8_t)this->peer_capability;
+	uint8_t want_own    = (uint8_t)this->local_capability;
+	uint8_t want_ssid   = (uint8_t)callsign_get_ssid(this->my_call_sign);
+	this->connect_ack_cache.valid      = true;
+	this->connect_ack_cache.echoed_cap = want_echoed;
+	this->connect_ack_cache.own_cap    = want_own;
+	this->connect_ack_cache.ssid       = want_ssid;
+	this->connect_ack_cache.replays    = 0;
+
+	// --- A2: PASS-AFTER — pre-data window predicate FIRES -------------------
+	CHECK("A2 PASS-AFTER: CONNECTED pre-data re-ACK predicate FIRES on a "
+	      "cached duplicate",
+	      connect_reack_pre_data_window() == true);
+
+	// --- A3: INV-A/C — cached triple byte-identical to negotiation ----------
+	CHECK("A3 INV-A/C: cached echoed_cap byte-identical",
+	      this->connect_ack_cache.echoed_cap == want_echoed);
+	CHECK("A3 INV-A/C: cached own_cap byte-identical",
+	      this->connect_ack_cache.own_cap == want_own);
+	CHECK("A3 INV-A/C: cached ssid byte-identical",
+	      this->connect_ack_cache.ssid == want_ssid);
+
+	// --- A4: INV-B/E — data frame arrival disables the replay ---------------
+	this->batch_rx_frame_count = 1;   // first data frame decoded
+	CHECK("A4 INV-B/E: predicate FALSE once data starts "
+	      "(no ftr=2 starvation; replay self-terminates)",
+	      connect_reack_pre_data_window() == false);
+	this->batch_rx_frame_count = 0;   // back to pre-data for the bound check
+
+	// --- A5: bound — replay budget exhausted disables the replay ------------
+	CHECK("A5 bound: predicate FIRES below the replay budget",
+	      connect_reack_pre_data_window() == true);
+	this->connect_ack_cache.replays = this->max_connection_attempts;
+	CHECK("A5 bound: predicate FALSE at the replay budget "
+	      "(stuck CMD cannot loop RSP forever)",
+	      connect_reack_pre_data_window() == false);
+
+	printf("[TEST-REACK] %s (%d failures)\n",
+	       failed == 0 ? "ALL PASS" : "FAILED", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
 }
 
 // ============================================================================

@@ -719,6 +719,13 @@ int main(int argc, char *argv[])
                 failed += ARQ_isr.test_idle_switch_role_race();
                 failed += ARQ_isr.test_break_noprogress_teardown();
             }
+            // CONNECT-REACK T4 (connect-testack-handshake.md §5): in-process
+            // synthetic-fire unit for the duplicate-TEST_CONNECTION re-ACK
+            // pre-data window. No PHY/audio -> permanent regression gate.
+            {
+                cl_arq_controller ARQ_reack;
+                failed += ARQ_reack.test_connect_reack();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
@@ -728,6 +735,14 @@ int main(int argc, char *argv[])
         // would terminate the process (signal-killed exit) = the fail-before.
         if (strcmp(argv[i], "--test-sigterm-handler") == 0) {
             int failed = test_sigterm_handler();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-connect-reack : run ONLY the CONNECT-REACK T4 in-process unit
+        // (duplicate-TEST_CONNECTION pre-data re-ACK) and exit. Fast +
+        // deterministic; see arq_responder.cc::test_connect_reack().
+        if (strcmp(argv[i], "--test-connect-reack") == 0) {
+            cl_arq_controller ARQ_reack;
+            int failed = ARQ_reack.test_connect_reack();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock

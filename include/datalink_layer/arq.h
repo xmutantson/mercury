@@ -1556,6 +1556,30 @@ public:
   // happens. One-shot, exits rc.
   int test_break_noprogress_teardown();
 
+  // CONNECT-REACK (connect-testack-handshake.md §3.2) — the pre-data-window
+  // state-machine predicate that gates the duplicate-TEST_CONNECTION re-ACK.
+  // Single-sourced so the production block (arq_responder.cc Site-F sibling)
+  // and the T4 unit test cannot drift. Excludes the DSP-availability term
+  // (telecom_system->ack_mfsk.connect_pattern_nsymb > 0), which the production
+  // caller ANDs separately (the unit test has no live codec). Returns true iff
+  // CONNECTED + RECEIVING + no data yet + a cached ACK exists + replay budget
+  // remains + a FREE control slot + not a passive monitor + not narrowband.
+  inline bool connect_reack_pre_data_window() const {
+    return link_status == CONNECTED
+        && connection_status == RECEIVING
+        && batch_rx_frame_count == 0
+        && connect_ack_cache.valid
+        && connect_ack_cache.replays < max_connection_attempts
+        && messages_control.status == FREE
+        && !passive_monitor
+        && narrowband_enabled != YES;
+  }
+  // T4 in-process unit (--test-connect-reack): drives RSP to the CONNECTED
+  // pre-data window with a cached ACK, asserts the re-ACK predicate fires for a
+  // duplicate, is byte-identical (INV-A/C), and self-disables once data starts
+  // (INV-B/E) / at the replay bound. 0 PASS / 1 FAIL.
+  int test_connect_reack();
+
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,
   // and proves the TX-path spin-loops (ptt_busy_wait + drain_playback_wait)
@@ -2857,6 +2881,23 @@ public:
   // delivery commit (arq_responder.cc:101, beside nReceived_data++); RESET with
   // the other session flags.
   bool session_data_frame_received;
+
+  // CONNECT-REACK (connect-testack-handshake.md §3.2) — cached
+  // TEST_CONNECTION_ACK triple captured at the FIRST TEST_CONNECTION so the
+  // responder can re-air the byte-identical MFSK TEST_ACK on a DUPLICATE
+  // TEST_CONNECTION it decodes while already CONNECTED (pre-data window only),
+  // healing a single lost ACK in one round trip WITHOUT re-running negotiation
+  // (INV-C) and WITHOUT pinning frames_to_read across the data phase (INV-B).
+  // valid stays false until the first handshake builds the ACK (so the replay
+  // is inert before any genuine TEST_CONNECTION). RESET with the session flags.
+  struct {
+    bool    valid;       // a first-handshake ACK has been built this session
+    uint8_t echoed_cap;  // == peer_capability (echo of CMD's caps)
+    uint8_t own_cap;     // == local_capability (RSP's own caps)
+    uint8_t ssid;        // == callsign_get_ssid(my_call_sign)
+    int     replays;     // duplicate re-airs this session (bounded, see §3.2)
+  } connect_ack_cache;
+
   int gearshift_timeout;
   int connection_timeout;
 
