@@ -629,6 +629,85 @@ static const int TURNAROUND_ACCRUAL_MS_PER_S = 30; // relay-locked (8606389); ms
 // re-centered phase (the accrual cancels the MEAN late-shift; the guard covers the variance). Bounded.
 static const int ACCRUAL_PHASE_GUARD_MS    = 150;
 
+// ===========================================================================
+// FORGIVING-ACK TIER 2 — cumulative-n_r status report (self-healing spine)
+// fact-documents/data-flow-forgiving-ack.md TIER 2.
+// ===========================================================================
+// A missed reverse-ACK is SUPERSEDED by the next one: the SACK's 8-bit bsi field
+// is reinterpreted (when the CAP_CUMULATIVE_ACK capability is negotiated on BOTH
+// ends) as n_r = the cumulative contiguous delivery high-water
+// (rsp_last_delivered_batch_seq_id). A later report's n_r covers everything every
+// earlier report would have, so a residual miss is recovered FOR FREE on the next
+// turnaround (STANAG-5066 acknowledged-through semantics). SEMANTICS-only — no
+// wire-width change; the 30/32-bit selective bitmap is unchanged (it describes the
+// batch ABOVE n_r). Both helpers are PURE so --test-cumulative-ack drives the EXACT
+// production predicates; -DCUMULATIVE_ACK_FAILBEFORE pins the apply to the per-batch
+// fallback for the fail-before arm.
+
+// CUMULATIVE_ACK_WINDOW: how many batches BACKWARD from n_r the CMD will accept as
+// cumulatively-acknowledged. Mercury is batch-level stop-and-wait (cmd_batch_seq_id
+// advances per SENT batch, one batch outstanding), so the outstanding batch is at
+// most a couple back; W=8 recovers up to 8 superseded reports (matched to the Tier-1
+// re-air bound) while staying FAR below the mod-256 half-window (128) so the forward/
+// backward wrap direction is never ambiguous. TUNABLE.
+static const int CUMULATIVE_ACK_WINDOW = 8;
+
+// SEND helper (RSP, producer): choose the value written into the SACK bsi field.
+// When the cumulative cap is negotiated AND a high-water exists, send n_r (the
+// contiguous high-water, which by INV-T2-CONTIG can never point past an undelivered
+// batch); otherwise send the legacy per-batch bsi (byte-identical default-off). A
+// high_water < 0 (nothing delivered yet) falls back to per_batch_bsi so a fresh
+// session never emits a 0xFF/garbage n_r. Returns a value already masked to 8 bits.
+inline unsigned char cumulative_ack_bsi_field(unsigned char per_batch_bsi,
+		int high_water, bool cap_on) {
+	if (cap_on && high_water >= 0)
+		return (unsigned char)(high_water & 0xFF);
+	return per_batch_bsi;
+}
+
+// APPLY helper (CMD, consumer): does a received report with high-water n_r address
+// `target_bsi` (the batch the CMD is waiting on)?
+//   cap_on  == false : pure per-batch fallback -> return per_batch_in_window
+//                      (the legacy rx_bsi==cmd_bsi||rx_bsi==prev_bsi test the caller
+//                      already computed). This is the interop-safe path: a Tier-2 CMD
+//                      that did NOT negotiate the cap with this RSP never reinterprets
+//                      the RSP's per-batch bsi as an n_r.
+//   cap_on  == true  : cumulative -> target_bsi is addressed iff it lies in the
+//                      window [n_r - W .. n_r + 1] (mod 256). Two sub-ranges, each
+//                      grounded in the wire semantics:
+//                       (a) [n_r - W .. n_r]: target is at-or-below the contiguous
+//                           delivery high-water ⇒ CONFIRMED DELIVERED. This is the
+//                           cumulative ACK / SELF-HEAL (a later n_r retires a batch
+//                           whose own earlier report was missed). By INV-T2-CONTIG
+//                           n_r never points past an undelivered batch, so "≤ n_r =
+//                           delivered" is a TRUE statement, never optimistic.
+//                       (b) n_r + 1 (forward overhang of EXACTLY 1): the in-flight
+//                           PARTIAL batch the 30-bit selective bitmap describes (the
+//                           contiguous successor of the high-water; Mercury is batch-
+//                           level stop-and-wait so the only batch above n_r is n_r+1).
+//                           The overhang is BOUNDED to 1 — never an arbitrary forward
+//                           reach — so a corrupt n_r still cannot ACK a far-future /
+//                           unsent batch (§T2.4 safety preserved).
+//                      A STALE (older) n_r leaves a newer outstanding batch outside
+//                      [n_r-W .. n_r+1] ⇒ UNaddressed ⇒ the CMD keeps waiting / re-airs.
+// -DCUMULATIVE_ACK_FAILBEFORE pins this to the per-batch fallback even when cap_on,
+// so the self-heal assertion fails before / passes after in the same binary.
+inline bool cumulative_ack_covers(int rx_n_r, int target_bsi, bool cap_on,
+		bool per_batch_in_window) {
+#ifdef CUMULATIVE_ACK_FAILBEFORE
+	(void)rx_n_r; (void)target_bsi; (void)cap_on;
+	return per_batch_in_window;   // FAIL-BEFORE: no cumulative recovery (per-batch only).
+#else
+	if (!cap_on) return per_batch_in_window;
+	unsigned nr   = (unsigned)(rx_n_r     & 0xFF);
+	unsigned tgt  = (unsigned)(target_bsi & 0xFF);
+	unsigned succ = (nr + 1u) & 0xFFu;            // the selective-bitmap batch n_r+1
+	if (tgt == succ) return true;                 // (b) in-flight partial batch (overhang 1)
+	unsigned back = (nr - tgt) & 0xFFu;           // forward distance target->n_r (mod 256)
+	return back <= (unsigned)CUMULATIVE_ACK_WINDOW;  // (a) at-or-below the high-water
+#endif
+}
+
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
 // (which preserve the audio buffer) vs cross-modulation switches (which destroy it).

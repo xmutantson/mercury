@@ -1526,6 +1526,34 @@ public:
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
 
+  // FORGIVING-ACK Tier-2 cumulative-n_r regression (--test-cumulative-ack).
+  // Drives the SELF-HEAL (a lost report recovered by the next n_r), the
+  // contiguous-high-water GAP-INVARIANT (n_r NEVER ACKs a gap — driven through the
+  // REAL advance_last_delivered + delivery_step_is_gap producers), the CAPABILITY
+  // GATE (cap-off → per-batch fallback, no misapply). Replays the PURE
+  // cumulative_ack_bsi_field() / cumulative_ack_covers() helpers; the gap arm uses
+  // the production high-water producer. Returns 0 on pass, 1 on fail.
+  // NOTE: ported onto a monitor-based tree that does NOT carry the Tier-1 decouple
+  // (test_forgiving_ack / forgiving_ack_should_decouple) — A3 does NOT touch the
+  // demote; the Part-D "composes with Tier-1" arm uses only the PURE A3 helpers.
+  // See fact-documents/data-flow-forgiving-ack.md §T2.6.
+  int test_cumulative_ack();
+
+  // T5 — the §2 DECOUPLE-SAFETY CHECKPOINT (--test-a3-decouple-safety). The gate
+  // that MUST be GREEN before the Phase-2 demote-decouple is attempted. With A3
+  // ENABLED and the demote UNTOUCHED, proves at the TRANSFER level (byte
+  // accounting) that (T5a) a SINGLE forward-healthy reverse-ACK miss is
+  // NON-LOAD-BEARING — the next turn's cumulative n_r supersedes the dropped
+  // report, the cursor advances PAST the dropped batch, and the multi-batch
+  // transfer COMPLETES byte-faithful with ZERO re-air of received frames (the
+  // explicit anti-0-bytes proof; FAIL-BEFORE -DCUMULATIVE_ACK_FAILBEFORE STALLS) —
+  // and (T5b) SUSTAINED loss (dead reverse channel: high-water frozen, A3 cannot
+  // cover the undelivered batch) STILL exhausts the production nResends countdown
+  // -> FAILED_ -> demote/BREAK (the genuine-death net is intact, A3 untouched).
+  // Drives the REAL advance_last_delivered / delivery_step_is_gap producers + the
+  // REAL cumulative_ack_covers consumer apply. Returns 0 (gate GREEN) / 1 (RED).
+  int test_a3_decouple_safety();
+
   // ROBUST_0 + streaming-compression deadlock regression
   // (data-flow-compress-frame-fill.md). Drives the REAL
   // process_buffer_data_commander() data-fill path at ROBUST_0 frame
@@ -1788,6 +1816,17 @@ public:
   // Resolve + cache the MERCURY_INBAND_RATE env flag. Returns true iff the
   // feature is enabled. Cheap after the first call (cached in inband_rate_enabled).
   bool inband_rate_feature_enabled();
+
+  // A3 demote-decouple gate (data-flow-inband-a3-decouple.md §1.2). Returns true iff
+  // BOTH the env opt-in MERCURY_INBAND_A3_DECOUPLE is set (cached in
+  // inband_a3_decouple_env) AND the A3 cumulative-ACK capability is NEGOTIATED for this
+  // session (cumulative_ack_enabled). When true, a forward-healthy reverse-ACK miss
+  // RE-AIRS the same config (relying on the cumulative n_r to self-heal the missed ACK)
+  // instead of demoting one rung — removing the unbounded config-walk that strands the
+  // RSP down-window. The cumulative_ack_enabled half is the STRICT SEQUENCING guard: we
+  // refuse to decouple (remove the demote) unless the self-heal spine is present, else
+  // the link would crawl/dead. Default-off ≡ byte-identical (the demote stays in place).
+  bool inband_a3_decouple_enabled();
 
   // TX EMIT (design §6). Decide whether the batch about to be sent at config
   // `batch_cfg` differs from the last-announced config and, if so, build the
@@ -3235,6 +3274,11 @@ public:
   int     inband_last_announced_config; // CONFIG_NONE until the first tag
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
+  // A3 demote-decouple env cache (data-flow-inband-a3-decouple.md): the env half of
+  //   inband_a3_decouple_enabled(). -1 = unresolved, 0 = off, 1 = on. Env-keyed (resolved
+  //   once + ctor-cached, NOT reset per-session — same discipline as inband_rate_enabled).
+  //   The live gate ALSO requires cumulative_ack_enabled (the negotiated A3 self-heal spine).
+  int     inband_a3_decouple_env;       // -1 = unresolved, 0 = off, 1 = on
 
   // ── STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (inband-reliability-
   //    design.md §1/§4) ──
@@ -3591,6 +3635,15 @@ public:
   cl_cipher_suite cipher_suite;       // Per-connection cipher state (ephemeral keys, session key)
   int encryption_mode;                // ENCRYPT_OFF, ENCRYPT_STRICT, ENCRYPT_FAST
   bool encryption_enabled;            // Negotiated: both sides have CAP_ENCRYPTION and mode != OFF
+  // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1):
+  // negotiated session flag — both ends advertised CAP_CUMULATIVE_ACK (which is itself
+  // gated by the env opt-in MERCURY_CUMULATIVE_ACK on the local advertise). When true,
+  // the RSP writes n_r (the contiguous delivery high-water) into the SACK bsi field and
+  // the CMD interprets a received bsi as "everything <= n_r is acknowledged" (bounded
+  // backward window). Default-off ≡ byte-identical + interop-safe (any non-Tier-2 peer
+  // leaves the bit clear → both_support false → per-batch fallback). Computed once at
+  // the TEST_CONNECTION / TEST_CONNECTION_ACK negotiation, cleared on session reset.
+  bool cumulative_ack_enabled;        // Negotiated: both sides have CAP_CUMULATIVE_ACK
   uint64_t tx_batch_counter;          // Monotonic counter for encrypt nonces (TX direction)
   uint64_t rx_batch_counter;          // Monotonic counter for decrypt nonces (RX direction)
   int consecutive_auth_failures;      // Auth failures since last success (3 → disconnect)

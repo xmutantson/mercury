@@ -86,6 +86,23 @@ static inline bool turnaround_rephase_enabled_common()
 	return cached != 0;
 }
 
+// FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1): the LOCAL
+// advertise gate. We ONLY set CAP_CUMULATIVE_ACK in local_capability when the env
+// opt-in MERCURY_CUMULATIVE_ACK is present. Default-off ⇒ the bit is never set ⇒
+// both_support is false on BOTH ends ⇒ the reshape never engages ⇒ byte-identical to
+// the Tier-1 base + interop-safe with any non-Tier-2 peer. Returns the cap bit to OR
+// into local_capability (0 when the env is unset). Cached like SACK_TRACE.
+static inline uint8_t cumulative_ack_advertise_bit()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_CUMULATIVE_ACK");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached ? (uint8_t)CAP_CUMULATIVE_ACK : (uint8_t)0;
+}
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -746,6 +763,7 @@ cl_arq_controller::cl_arq_controller()
 	inband_last_announced_config=CONFIG_NONE;
 	inband_tx_epoch_parity=0;
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
+	inband_a3_decouple_env=-1;  // unresolved; inband_a3_decouple_enabled() caches the env half
 	inband_unilateral_armed=false;  // Stage 3b: set by the SET_CONFIG builder unilateral path
 	// STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (design §1/§4). A fresh
 	// session has nothing announced, so the re-tag is disarmed and no config is confirmed.
@@ -793,6 +811,7 @@ cl_arq_controller::cl_arq_controller()
 	batch_uncompressed_size=0;
 	encryption_mode=ENCRYPT_OFF;
 	encryption_enabled=false;
+	cumulative_ack_enabled=false;  // FORGIVING-ACK Tier 2: fresh session never inherits a negotiated cap
 	tx_batch_counter=0;
 	rx_batch_counter=0;
 	consecutive_auth_failures=0;
@@ -2470,6 +2489,24 @@ bool cl_arq_controller::inband_rate_feature_enabled()
 		inband_rate_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
 	}
 	return inband_rate_enabled == 1;
+}
+
+// A3 demote-decouple gate (data-flow-inband-a3-decouple.md §1.2). STRICT-SEQUENCED:
+// the env opt-in MERCURY_INBAND_A3_DECOUPLE arms it, but it ONLY engages once the A3
+// cumulative-ACK capability is NEGOTIATED for this session (cumulative_ack_enabled) —
+// the self-heal spine must be present before the demote is removed, otherwise a missed
+// reverse-ACK never retires and the link crawls/dead. With cumulative_ack_enabled false
+// (no A3 negotiated, or session not yet up) this returns false ⇒ the existing demote
+// stays in place ⇒ byte-identical. The env half is cached; the negotiated half is
+// re-read live (it flips at the TEST_CONNECTION negotiation / clears on session reset).
+bool cl_arq_controller::inband_a3_decouple_enabled()
+{
+	if(inband_a3_decouple_env < 0)
+	{
+		const char* e = std::getenv("MERCURY_INBAND_A3_DECOUPLE");
+		inband_a3_decouple_env = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return inband_a3_decouple_env == 1 && cumulative_ack_enabled;
 }
 
 // In-band rate adaptation (Stage 3a): build the combined CONFIG_TAG suffix tones.
@@ -5551,7 +5588,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -5648,7 +5685,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -5684,7 +5721,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -5702,7 +5739,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -5721,7 +5758,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -5879,6 +5916,10 @@ void cl_arq_controller::reset_session_state()
 	cmd_inband_liveness_last_acked = 0;
 	cmd_inband_liveness_no_progress_polls = 0;
 	cmd_inband_liveness_breaks = 0;
+	// A3 demote-decouple env cache (inband_a3_decouple_env) is NOT reset here: it is env-keyed
+	// (process-stable), not session-keyed — the same "resolved once + cached" discipline as the
+	// sibling inband_rate_enabled (ctor-init only). The cumulative_ack_enabled half of the gate
+	// (the session-keyed part) IS cleared with the other negotiated-cap state below.
 	// STAGE 4d: a fresh session has nothing announced, so the D1 re-tag is disarmed and
 	// nothing is confirmed (mirrors the ctor init). The R floor cache (inband_retag_min)
 	// is env-keyed not session-keyed, so it is NOT reset here (resolved once + cached).
@@ -5968,6 +6009,9 @@ void cl_arq_controller::reset_session_state()
 	// Encryption — wipe all key material (volatile memset, compiler can't elide)
 	cipher_suite.wipe();
 	encryption_enabled = false;
+	// FORGIVING-ACK Tier 2: clear the negotiated cumulative-ACK cap on session reset /
+	// new CONNECT so it is re-negotiated from scratch (never carries across a reset).
+	cumulative_ack_enabled = false;
 #ifdef MERCURY_GUI_ENABLED
 	g_gui_state.encryption_active.store(false);
 	// Don't clear psk_mismatch here — let it persist so the GUI shows the error.

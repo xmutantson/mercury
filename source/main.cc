@@ -729,6 +729,21 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_deliver();
             }
+            // FORGIVING-ACK Tier-2 cumulative-n_r self-heal / gap-invariant / cap-gate
+            // regression (the A3 predicate proof). Member test on a throwaway controller;
+            // PURE in-process synthetic-fire, no IONOS/RF. data-flow-forgiving-ack.md §T2.6.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_cumulative_ack();
+            }
+            // A3 DECOUPLE-SAFETY CHECKPOINT (§2): single-miss non-load-bearing (anti-0-bytes,
+            // byte-faithful) + genuine-death net intact, demote IN PLACE. Member test on a
+            // throwaway controller; PURE in-process synthetic-fire. data-flow-forgiving-ack.md
+            // §T2.2/§6.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_a3_decouple_safety();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -1029,6 +1044,8 @@ int main(int argc, char *argv[])
                                         // a real compressible payload; asserts >0 application bytes are staged. FAILS on
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
+    bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
+    bool test_a3_decouple_safety_cli = false; // --test-a3-decouple-safety: the §2 CHECKPOINT — single-miss non-load-bearing (anti-0-bytes, byte-faithful) + genuine-death net intact, demote IN PLACE (data-flow-forgiving-ack.md §T2.2/§6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
@@ -1795,6 +1812,33 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_data_ack_multiwindow
             // + fact-documents/data-flow-data-ack-sack-correlator.md §7.
             test_data_ack_multiwindow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cumulative-ack") == 0)
+        {
+            // FORGIVING-ACK Tier-2 cumulative-n_r regression (feat/forgiving-ack-tier1,
+            // failing-first under -DCUMULATIVE_ACK_FAILBEFORE). Drives the SELF-HEAL
+            // (a lost report recovered by the next n_r), the contiguous-high-water
+            // GAP-INVARIANT (n_r NEVER ACKs a gap — via the REAL advance_last_delivered
+            // + delivery_step_is_gap producers), the CAPABILITY GATE (cap-off ->
+            // per-batch fallback), and COMPOSITION with Tier-1. See
+            // fact-documents/data-flow-forgiving-ack.md §T2.6.
+            test_cumulative_ack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-a3-decouple-safety") == 0)
+        {
+            // T5 — the §2 DECOUPLE-SAFETY CHECKPOINT. With A3 ENABLED and the
+            // demote UNTOUCHED, prove (T5a) a SINGLE forward-healthy reverse-ACK
+            // miss is NON-LOAD-BEARING — delivery advances, the multi-batch
+            // transfer completes byte-faithful via the next turn's cumulative n_r
+            // (the explicit anti-0-bytes proof; FAIL-BEFORE -DCUMULATIVE_ACK_FAILBEFORE
+            // STALLS) — and (T5b) SUSTAINED loss STILL exhausts nResends -> BREAK
+            // (the genuine-death net is intact). Gate that MUST be GREEN before the
+            // Phase-2 demote-decouple. See data-flow-forgiving-ack.md §T2.2/§6.
+            test_a3_decouple_safety_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3236,6 +3280,35 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_retx_clear_on_recovery();
             printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_cumulative_ack_cli) {
+            // FORGIVING-ACK Tier-2 cumulative-n_r regression (one-shot, then exit rc).
+            // Drives the self-heal (a lost report recovered by the next n_r), the
+            // contiguous-high-water gap-invariant (n_r never ACKs a gap), the
+            // capability gate (cap-off -> per-batch fallback), and composition with
+            // Tier-1. See fact-documents/data-flow-forgiving-ack.md §T2.6.
+            printf("[FLAG] --test-cumulative-ack: invoking Tier-2 cumulative-n_r "
+                   "self-heal regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_cumulative_ack();
+            printf("[FLAG] Cumulative-ACK test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_a3_decouple_safety_cli) {
+            // T5 — the §2 DECOUPLE-SAFETY CHECKPOINT (one-shot, then exit rc).
+            // With A3 enabled + the demote in place, proves a single reverse-ACK
+            // miss is non-load-bearing (delivery advances, byte-faithful — the
+            // anti-0-bytes proof) AND sustained loss still BREAKs (genuine-death
+            // net intact). Drives the REAL advance_last_delivered/delivery_step_is_gap
+            // producers + the REAL cumulative_ack_covers consumer apply.
+            printf("[FLAG] --test-a3-decouple-safety: invoking the §2 decouple-safety "
+                   "checkpoint (single-miss non-load-bearing + genuine-death net)\n");
+            fflush(stdout);
+            int rc = ARQ.test_a3_decouple_safety();
+            printf("[FLAG] A3 decouple-safety checkpoint complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -403,7 +403,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 				// arq_commander.cc:466-475:
 				//   data[0]   = TEST_CONNECTION
 				//   data[1..4]= u_SNR.char4_SNR (float SNR_uplink)
-				//   data[5]   = local_capability (peer's cap byte; gated to 2 bits)
+				//   data[5]   = local_capability (peer's cap byte; MFSK ctrl carries the
+				//               low 3 negotiable bits CAP_NEGOTIABLE_MASK=0x07)
 				//   data[6]   = peer SSID
 				//   length    = 7
 				//   sequence_number = control_batch_size - 1 so the consumer
@@ -1253,14 +1254,20 @@ void cl_arq_controller::process_messages_rx_data_control()
 									if (data_batch_size >= 30)      bitmap_u32 = 0x3FFFFFFFu;
 									else if (data_batch_size <= 0)  bitmap_u32 = 0u;
 									else                            bitmap_u32 = (1u << data_batch_size) - 1u;
-									printf("[RSP-MFSK-SACK] prev-delivered path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
-										(unsigned)prev_ack_bsi, (unsigned)bitmap_u32, data_batch_size);
+									// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): n_r in the bsi field when
+									// negotiated (the prev-deliver high-water was just advanced at :911).
+									unsigned char wire_bsi = cumulative_ack_bsi_field(
+										prev_ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+									printf("[RSP-MFSK-SACK] prev-delivered path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
+										(unsigned)prev_ack_bsi, (unsigned)wire_bsi,
+										rsp_last_delivered_batch_seq_id, cumulative_ack_enabled ? 1 : 0,
+										(unsigned)bitmap_u32, data_batch_size);
 									fflush(stdout);
 									// WALL-B FIX-9 D2 REFINE (§2.1): prev-delivered = a batch recovered via the
 									// SACK/retransmit prev-storage path -> a RETRANSMIT turnaround -> arm the D2
 									// robust reverse-ACK geometry (settle) for this ACK.
 									ack_tx_retx_turnaround = true;
-									long long mfsk_ms = send_mfsk_ack_sack(prev_ack_bsi, bitmap_u32);
+									long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
 									if (mfsk_ms > 0)
 									{
 										printf("[TX-ACK-SACK] prev-delivered via MFSK suffix wire_ms=%lld\n", mfsk_ms);
@@ -2126,14 +2133,27 @@ void cl_arq_controller::process_messages_acknowledging_data()
 									if (sack_bitmap[i])
 										bitmap_u32 |= (1u << i);
 								}
-								printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
-									(unsigned)sacked_bsi, (unsigned)bitmap_u32, data_batch_size);
+								// FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md
+								// §T2.0/§T2.3): when the cumulative cap is negotiated, the bsi FIELD
+								// carries n_r (the contiguous delivery high-water,
+								// rsp_last_delivered_batch_seq_id) instead of the partial batch's bsi.
+								// The 30-bit bitmap is UNCHANGED — it still describes the in-flight
+								// PARTIAL batch, which in Mercury's stop-and-wait is exactly the
+								// contiguous successor n_r+1 (the CMD applies the bitmap by SLOT INDEX
+								// to its current messages_tx[], independent of the bsi value). Default-
+								// off ⇒ field == sacked_bsi (byte-identical).
+								unsigned char wire_bsi = cumulative_ack_bsi_field(
+									sacked_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+								printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
+									(unsigned)sacked_bsi, (unsigned)wire_bsi,
+									rsp_last_delivered_batch_seq_id, cumulative_ack_enabled ? 1 : 0,
+									(unsigned)bitmap_u32, data_batch_size);
 								fflush(stdout);
 								// WALL-B FIX-9 D2 REFINE (§2.1): partial = NAcking an incomplete batch -> the
 								// CMD will retransmit -> THIS is the retransmit turnaround the drift slip rides
 								// on -> arm the D2 robust reverse-ACK geometry (settle) for this ACK.
 								ack_tx_retx_turnaround = true;
-								long long mfsk_ms = send_mfsk_ack_sack(sacked_bsi, bitmap_u32);
+								long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
 								if (mfsk_ms > 0)
 								{
 									printf("[TX-ACK-SACK] partial via MFSK suffix wire_ms=%lld\n",
@@ -2149,7 +2169,11 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							}
 							if (!used_mfsk_path)
 							{
-								send_sack_v2_frame(sack_bitmap, data_batch_size, sacked_bsi);
+								// FORGIVING-ACK Tier 2: same bsi-field reshape on the OFDM SACK_RSP
+								// transport (n_r in the field when negotiated; bitmap unchanged).
+								unsigned char wire_bsi = cumulative_ack_bsi_field(
+									sacked_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+								send_sack_v2_frame(sack_bitmap, data_batch_size, wire_bsi);
 							}
 						}
 					}
@@ -2324,14 +2348,23 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					bitmap_u32 = 0u;
 				else
 					bitmap_u32 = (1u << data_batch_size) - 1u;
-				printf("[RSP-MFSK-SACK] clean path: batch_seq_id=%u bitmap=0x%08x nframes=%d\n",
-					(unsigned)ack_bsi, (unsigned)bitmap_u32, data_batch_size);
+				// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): the clean-ACK bsi field carries n_r
+				// (the contiguous delivery high-water) when negotiated. THE SELF-HEAL: if an
+				// EARLIER clean ACK was missed, the high-water is now AHEAD of this batch's
+				// own bsi, so n_r retroactively confirms the earlier batch FOR FREE on this
+				// turnaround. The all-ones bitmap is unchanged. Default-off ⇒ field == ack_bsi.
+				unsigned char wire_bsi = cumulative_ack_bsi_field(
+					ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+				printf("[RSP-MFSK-SACK] clean path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
+					(unsigned)ack_bsi, (unsigned)wire_bsi,
+					rsp_last_delivered_batch_seq_id, cumulative_ack_enabled ? 1 : 0,
+					(unsigned)bitmap_u32, data_batch_size);
 				fflush(stdout);
 				// WALL-B FIX-9 D2 REFINE (§2.1): clean = a fully-received first-pass batch ACK (the
 				// dominant clean-channel case) -> NOT a retransmit turnaround -> NO robust settle (key
 				// on the tight OFDM turnaround, byte-identical to D2-off / D3-base; recovers the cost).
 				ack_tx_retx_turnaround = false;
-				long long mfsk_ms = send_mfsk_ack_sack(ack_bsi, bitmap_u32);
+				long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
 				if (mfsk_ms > 0)
 				{
 					printf("[TX-ACK-SACK] clean via MFSK suffix wire_ms=%lld\n",
@@ -2751,6 +2784,20 @@ void cl_arq_controller::process_control_responder()
 					peer_capability);
 			}
 		}
+
+		// FORGIVING-ACK Tier 2 negotiation (fact-documents/data-flow-forgiving-ack.md
+		// §T2.1): the cumulative-n_r SACK reshape engages ONLY when BOTH ends advertise
+		// CAP_CUMULATIVE_ACK (the local advertise is itself env-gated by
+		// MERCURY_CUMULATIVE_ACK, so default-off ≡ both_support false ≡ per-batch +
+		// byte-identical). SAME both_support pattern as encryption above. Interop-safe:
+		// a non-Tier-2 commander leaves bit 2 clear → cumulative_ack_enabled false →
+		// per-batch fallback on the RSP send AND the CMD apply.
+		cumulative_ack_enabled = (local_capability & CAP_CUMULATIVE_ACK)
+		                      && (peer_capability  & CAP_CUMULATIVE_ACK);
+		printf("[FORGIVING-ACK-T2] cumulative-n_r SACK %s (local_cap=0x%02X peer_cap=0x%02X)\n",
+			cumulative_ack_enabled ? "NEGOTIATED" : "off",
+			(unsigned)local_capability, (unsigned)peer_capability);
+		fflush(stdout);
 
 		// Streaming compression is unconditional (CAP_STREAMING removed).
 		// Still requires compression to be on; -F off disables both.
@@ -8103,6 +8150,123 @@ int cl_arq_controller::test_inband_deliver()
 			steady_probes, CALLS);
 #endif
 		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART G — A3 DEMOTE-DECOUPLE (the spec's "PART F"; named G here because a PART F
+	// already exists above). data-flow-inband-a3-decouple.md §6. Drives >=6 consecutive
+	// FORWARD-HEALTHY reverse-ACK misses through the PRODUCTION guard
+	// inband_connect_liveness_guard() in TWO runtime arms (toggling MERCURY_INBAND_A3_DECOUPLE,
+	// no recompile):
+	//   - DECOUPLE OFF (fail-before): the existing path DEMOTES one rung per stall, walking the
+	//     config WELL BELOW CFG_FROM (the HW CFG15->6 walk that escapes the RSP D=4 window).
+	//   - DECOUPLE ON  + cumulative_ack_enabled (pass-after): the guard RE-AIRS the SAME config
+	//     on every miss; current_configuration STAYS at CFG_FROM, cmd_batch_seq_id is UNCHANGED
+	//     (no epoch roll/orphan), the in-flight batch is still queued, NO BREAK fired, and the
+	//     liveness-BREAK budget is untouched.
+	// Assertions are ABSOLUTE (hard fail-before / pass-after), not flipped-expectation toggles.
+	{
+		const char* prev_dc = std::getenv("MERCURY_INBAND_A3_DECOUPLE");
+		std::string prev_dc_s = prev_dc ? std::string(prev_dc) : std::string();
+		bool had_dc = (prev_dc != NULL);
+
+		const int CFG_FROM = CONFIG_10;   // ladder idx 13 (the high-OFDM rung the HW started at)
+		const int MISSES   = 6;           // >= 6 consecutive forward-healthy reverse-ACK misses
+		const int B        = 7;           // in-flight batch bsi (held across the run)
+		const int AHEAD    = 0;           // epoch == in-flight bsi (the re-air must not move it)
+
+		// ---- ARM 1: DECOUPLE OFF (fail-before) — reproduce the config-walk. ----
+		putenv_kv("MERCURY_INBAND_A3_DECOUPLE", "");   // gate OFF
+		{
+			cl_telecom_system* ts = nullptr;
+			cl_arq_controller* cmd = make_cmd(CFG_FROM, &ts);
+			cmd->cumulative_ack_enabled = true;            // A3 negotiated (irrelevant when gate off)
+			cmd->inband_a3_decouple_env = -1;              // force env re-resolve (-> 0, off)
+
+			int demotes = 0;
+			for(int m = 0; m < MISSES; m++)
+			{
+				// Re-establish the forward-healthy stall precondition each cycle: the prior demote
+				// freed messages_tx[] + restaged from FIFO, so re-stage an in-flight batch and put
+				// the link back in the control-plane stall signature (nAcked_data flat).
+				stage_inflight_batch(cmd, B, /*n_frames=*/24, /*ahead=*/0);
+				cmd->connection_status              = TRANSMITTING_CONTROL;
+				cmd->cmd_inband_liveness_no_progress_polls = 0;
+				int cfg_before = cmd->current_configuration;
+				bool fired = false;
+				for(int p = 1; p <= STALL_N + 2; p++)
+					if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+				if(fired && cmd->current_configuration < cfg_before) demotes++;
+			}
+			// The signature of the bug: the config WALKED DOWN ~MISSES rungs, well below CFG_FROM
+			// (CONFIG_10 - 6 == CONFIG_4 on the OFDM ladder, robust_enabled=NO -> config-1 per step).
+			check(cmd->current_configuration <= CFG_FROM - MISSES,
+				"G1 OFF (fail-before): the config WALKED DOWN >=6 rungs below CFG_FROM (the HW config-walk)",
+				cmd->current_configuration, CFG_FROM - MISSES);
+			check(cmd->current_configuration < CFG_FROM,
+				"G1b OFF: current_configuration left CFG_FROM (demote-per-stall reproduced)",
+				cmd->current_configuration, CFG_FROM - 1);
+			check(demotes >= MISSES - 1,
+				"G1c OFF: a demote fired on (nearly) every one of the 6 misses",
+				demotes, MISSES);
+			delete cmd; delete ts;
+		}
+
+		// ---- ARM 2: DECOUPLE ON + A3 negotiated (pass-after) — re-air, no walk. ----
+		putenv_kv("MERCURY_INBAND_A3_DECOUPLE", "1");   // gate ON
+		{
+			cl_telecom_system* ts = nullptr;
+			cl_arq_controller* cmd = make_cmd(CFG_FROM, &ts);
+			cmd->cumulative_ack_enabled = true;            // A3 self-heal spine NEGOTIATED (required)
+			cmd->inband_a3_decouple_env = -1;              // force env re-resolve (-> 1, on)
+
+			// Stage the in-flight batch ONCE: the re-air leaves messages_tx[] untouched, so the
+			// SAME batch must persist across all 6 misses (the test asserts it stays queued).
+			stage_inflight_batch(cmd, B, /*n_frames=*/24, /*ahead=*/AHEAD);
+			int bsi_before = cmd->cmd_batch_seq_id & 0xFF;
+
+			check(cmd->inband_a3_decouple_enabled(),
+				"G2 ON: the decouple gate is ARMED (env set AND cumulative_ack_enabled negotiated)",
+				cmd->inband_a3_decouple_enabled() ? 1 : 0, 1);
+
+			int reairs = 0;
+			for(int m = 0; m < MISSES; m++)
+			{
+				cmd->connection_status                     = TRANSMITTING_CONTROL;
+				cmd->cmd_inband_liveness_no_progress_polls = 0;
+				bool fired = false;
+				for(int p = 1; p <= STALL_N + 2; p++)
+					if(cmd->inband_connect_liveness_guard()) { fired = true; break; }
+				if(fired) reairs++;
+				// The re-air leaves the config + epoch + batch untouched — assert INVARIANTLY each
+				// cycle (catch ANY single-cycle drift, not just the end state).
+				if(cmd->current_configuration != CFG_FROM) break;
+			}
+			check(reairs == MISSES,
+				"G3 ON: the guard reached a decision (re-air) on all 6 misses", reairs, MISSES);
+			check(cmd->current_configuration == CFG_FROM,
+				"G4 ON: current_configuration STAYS at CFG_FROM across all 6 misses (NO config-walk)",
+				cmd->current_configuration, CFG_FROM);
+			check((cmd->cmd_batch_seq_id & 0xFF) == bsi_before,
+				"G5 ON: cmd_batch_seq_id is UNCHANGED (no epoch roll -> no orphaned in-flight batch)",
+				cmd->cmd_batch_seq_id & 0xFF, bsi_before);
+			check(cmd->cmd_has_inflight_data_batch(),
+				"G6 ON: the in-flight batch is STILL QUEUED (re-air left messages_tx[] untouched)",
+				cmd->cmd_has_inflight_data_batch() ? 1 : 0, 1);
+			check(cmd->emergency_break_active == 0,
+				"G7 ON: NO BREAK fired across the 6 misses (a re-air is not a death)",
+				cmd->emergency_break_active, 0);
+			check(cmd->cmd_inband_liveness_breaks == 0,
+				"G8 ON: the liveness-BREAK budget was NOT consumed (re-air != liveness BREAK)",
+				cmd->cmd_inband_liveness_breaks, 0);
+			check(cmd->cmd_inband_session_dead_batches == 0,
+				"G9 ON: the true-loss floor did NOT tick (a re-air is not a death)",
+				cmd->cmd_inband_session_dead_batches, 0);
+			delete cmd; delete ts;
+		}
+
+		// Restore the decouple env to its prior value (the global restore_env below does not own it).
+		putenv_kv("MERCURY_INBAND_A3_DECOUPLE", had_dc ? prev_dc_s.c_str() : "");
 	}
 
 	restore_env();
