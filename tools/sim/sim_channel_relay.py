@@ -969,6 +969,21 @@ def main():
                          "a2b/b2a virtual-clock split to K*1024 samples "
                          "(~K*21ms). K=1 = strict lockstep (default); relax to "
                          "4-8 if it throttles throughput materially.")
+    ap.add_argument("--realtime", type=int, default=None, choices=(0, 1),
+                    help="V2 WALL-CLOCK real-time pacing (sim-virtual-testbed-design "
+                         "§2.6; fact-documents/data-flow-sim-realtime-pacing.md). When 1, "
+                         "the forwarder releases AT MOST one chunk per direction per "
+                         "1024/48000 s (=21.333 ms) of WALL clock, so the capture ring is "
+                         "fed at true 48 kHz instead of as-fast-as-the-host-computes (the "
+                         "FTRT cheat). This DECOUPLES the capture ring from decode (a late "
+                         "reverse-ACK now arrives late in wall time and can MISS its window "
+                         "-> the turnaround miss EMERGES). RT forces --idle-bigstep OFF and "
+                         "supersedes the PDES barrier (wall-clock IS the inter-peer "
+                         "coupling). DEFAULT: env MERCURY_SIM_REALTIME (0/1), else 0 "
+                         "(FTRT, byte-identical to baseline). RT pacing changes only WHEN a "
+                         "chunk is released, never its CONTENT, so a render is bit-identical "
+                         "modulo arrival time; with RT off the scheduler is the original "
+                         "flat-out loop (N2 byte-identity preserved).")
     ap.add_argument("--wire-stamp", type=int, default=0, choices=(0, 1),
                     help="prepend the 8-byte <Q per-direction END-sample stamp to "
                          "each forwarded chunk (8192->8200 B). DEFAULT 0 (bare "
@@ -991,6 +1006,14 @@ def main():
     drift_on = (args.drift_ppm_a2b != 0.0 or args.drift_ppm_b2a != 0.0)
     ptt_on = (args.ptt_latency_ms > 0.0)
     turn_on = bool(args.turnaround_drift)
+    # V2 real-time pacing (default-off byte-identical). CLI --realtime wins; else
+    # the MERCURY_SIM_REALTIME env (the SAME env the modem bridges read so a probe
+    # can flip BOTH halves with one variable); else 0 (FTRT baseline). Read once
+    # here, never mid-run, so there is no torn read.
+    if args.realtime is not None:
+        realtime_on = bool(args.realtime)
+    else:
+        realtime_on = (os.environ.get("MERCURY_SIM_REALTIME", "0") not in ("0", "", None))
     if (args.ptt_latency_jitter_ms > 0.0) and not ptt_on:
         ap.error("--ptt-latency-jitter-ms requires --ptt-latency-ms > 0")
     # The faithful turnaround model is the CORRECTED axis; the old tone-resampler
@@ -1042,6 +1065,13 @@ def main():
         f"turnaround_drift={turn_on}(ppm a2b={args.turnaround_ppm_a2b},"
         f"b2a={args.turnaround_ppm_b2a},jit={args.turnaround_jitter_ms}ms) "
         f"wire={'STAMPED(8200,needs feat/sim-clock modem)' if args.wire_stamp else 'BARE(8192,compatible)'}")
+    if realtime_on:
+        log("NOTE: V2 WALL-CLOCK real-time pacing ENABLED (MERCURY_SIM_REALTIME) — "
+            "forwarder releases one chunk/direction per 21.333 ms wall clock (true "
+            "48 kHz drip); idle-bigstep FORCED OFF, PDES barrier superseded by the "
+            "wall clock. The capture ring is decoupled from decode -> the turnaround "
+            "window-miss can EMERGE. Signal CONTENT is bit-exact (only release TIME "
+            "is paced); RT-OFF is byte-identical to baseline.")
     if turn_on:
         log("NOTE: FAITHFUL turnaround-drift model ENABLED (SIMFIDELITY M1-M4) — "
             "integer silence insert/drop re-times bursts (signal samples "
@@ -1176,6 +1206,14 @@ def main():
     # AFTER --barrier-k so an explicit larger --barrier-k still wins).
     if turn_on:
         BARRIER_K = max(BARRIER_K, 4)
+    # V2: under real-time pacing the per-direction wall clock IS the inter-peer
+    # coupling (both directions release at 48 kHz wall-clock), so the K-chunk PDES
+    # credit barrier is SUPERSEDED — give generous credit so the barrier never
+    # throttles the wall pacer (which would re-introduce a host-compute coupling on
+    # top of the wall coupling). Wall-clock keeps the split bounded by scheduling
+    # jitter (sub-chunk), tighter than the K-chunk barrier (data-flow §5 INV-3).
+    if realtime_on:
+        BARRIER_K = max(BARRIER_K, 64)
     # Bounded inbound queues: a reader thread per direction blocks on the socket,
     # applies the channel, and hands the processed chunk to the forwarder. The
     # small maxsize back-pressures a reader whose direction is K-credit-blocked so
@@ -1206,6 +1244,18 @@ def main():
     # Disable with --idle-bigstep 1 to recover strict 1:1 (determinism A/B baseline).
     BIGSTEP = max(1, args.idle_bigstep)
     SILENCE_EPS = 1e-12   # inbound raw mean-square below this == modem idle silence
+    # V2: real-time pacing REQUIRES strict 1:1 forwarding — coalescing idle silence
+    # (bigstep) collapses a real wall-clock turnaround gap into one chunk, which is
+    # exactly the FTRT time-compression RT removes. Force BIGSTEP=1 in RT (data-flow
+    # §2.3 / §5 INV-4). (Production/FTRT path keeps the user --idle-bigstep.)
+    if realtime_on:
+        BIGSTEP = 1
+    # V2 wall-clock release period: one CHUNK_SAMPLES block = 1024/48000 s of real
+    # time per direction. The forwarder gates each direction independently on this
+    # deadline so the capture ring is fed at true 48 kHz (sim-virtual-testbed-design
+    # §2.1). monotonic clock; lazily initialized per direction on first forward.
+    RT_CHUNK_PERIOD_S = CHUNK_SAMPLES / FS   # 21.333 ms
+    rt_next_release = {"a2b": None, "b2a": None}   # per-direction wall deadline
 
     def reader(src, key, ch):
         """Block on the socket, run the channel, enqueue (processed_out, silent).
@@ -1334,6 +1384,21 @@ def main():
         other = "b2a" if key == "a2b" else "a2b"
         if counters[key] - counters[other] >= BARRIER_K:
             return WOULDBLOCK            # credit-blocked: wait for `other`
+        # V2 real-time gate (root-cause pacing): release this direction's next
+        # chunk only when WALL time crosses its per-direction 48 kHz deadline. Not
+        # yet due -> WOULDBLOCK so the scheduler yields (the 0.5 ms reader-fill
+        # sleep) and re-polls; the capture ring is therefore fed at true 48 kHz,
+        # NOT as-fast-as-the-host-computes (the FTRT cheat removed). We check the
+        # deadline BEFORE consuming the queue so a not-yet-due chunk is left in the
+        # queue (no peek-and-discard, no reorder). RT off -> this whole block is
+        # skipped and the forward is the original flat-out path (byte-identical).
+        if realtime_on:
+            now = time.monotonic()
+            dl = rt_next_release[key]
+            if dl is None:
+                dl = now                 # first chunk of this direction: due now
+            if now < dl:
+                return WOULDBLOCK        # not yet due — wall-clock paced
         try:
             out, silent = inq[key].get_nowait()
         except queue.Empty:
@@ -1341,6 +1406,16 @@ def main():
         if out is None:                  # reader signalled close
             stop.set()
             return CLOSED
+        if realtime_on:
+            # Advance the deadline by exactly one chunk period from the SCHEDULED
+            # release time (dl), not from `now`, so transient host scheduling jitter
+            # does not accumulate into permanent slow drift. But if we have fallen
+            # MORE than one period behind (host briefly oversubscribed), re-anchor
+            # to `now` so we do not then burst-catch-up faster than real time (that
+            # would re-introduce FTRT). Net: the long-run release rate is 48 kHz.
+            now2 = time.monotonic()
+            base = dl if (now2 - dl) < RT_CHUNK_PERIOD_S else now2
+            rt_next_release[key] = base + RT_CHUNK_PERIOD_S
         counters[key] += 1
         _account(key, 1, silent)
         return _send_stamped(key, out)
