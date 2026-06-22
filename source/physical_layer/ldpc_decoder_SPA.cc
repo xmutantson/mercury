@@ -43,7 +43,7 @@ static inline bool ldpc_fwdback_enabled()
 {
 	static const int v = []{
 		const char* e = std::getenv("MERCURY_LDPC_FWDBACK");
-		return (e && *e) ? atoi(e) : 0;
+		return (e && *e) ? atoi(e) : 1;
 	}();
 	return v != 0;
 }
