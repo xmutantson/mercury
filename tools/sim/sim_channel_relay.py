@@ -515,6 +515,41 @@ class PttLatencyModel:
 
 
 # ---------------------------------------------------------------------------
+# CONNECT-REACK T1 — deterministic single-burst eraser (TEST-ONLY).
+# ---------------------------------------------------------------------------
+# Counts SIGNAL BURSTS on a direction (each silent->signal rising edge is a new
+# burst, mirroring the PTT onset detector) and zeros the RAW channel input of
+# the Nth burst's signal chunks. Zeroing pre-channel input means the far end
+# sees the calibrated noise floor (ch.process(zeros)) exactly where that burst
+# would have been -> a clean ERASURE of one whole reverse transmission, the
+# deterministic "CMD missed the single TEST_ACK" failure the re-ACK fix heals.
+# target_burst==0 -> disabled (identity pass-through, byte-identical).
+class BurstEraser:
+    def __init__(self, target_burst):
+        self.target = int(target_burst)        # 1-based; 0 = disabled
+        self.enabled = self.target > 0
+        self.prev_silent = True                # link starts idle
+        self.burst_idx = 0                     # signal bursts seen so far
+        self.n_erased_chunks = 0
+        self.last_onset = 0                    # burst idx if this chunk was an edge
+
+    def maybe_erase(self, samples, silent):
+        """Given a raw inbound CHUNK and its silent flag, return the (possibly
+        zeroed) samples. Advances the burst index on each silent->signal edge."""
+        if not self.enabled:
+            return samples
+        self.last_onset = 0                    # set to new burst idx on an edge
+        if (not silent) and self.prev_silent:
+            self.burst_idx += 1                # a new burst keyed up
+            self.last_onset = self.burst_idx
+        self.prev_silent = silent
+        if (not silent) and self.burst_idx == self.target:
+            self.n_erased_chunks += 1
+            return [0.0] * CHUNK_SAMPLES       # erase this burst's signal
+        return samples
+
+
+# ---------------------------------------------------------------------------
 # FAITHFUL turnaround-timing de-alignment model (the DEFAULT drift path).
 # ---------------------------------------------------------------------------
 # WHY this SUPERSEDES DriftResampler (SIMFIDELITY_ROOTCAUSE.md §1-§3, derived
@@ -905,6 +940,17 @@ def main():
     ap.add_argument("--fade-depth", type=float, default=0.0,
                     help="(DEPRECATED) old flat-fade depth; use --profile instead")
     ap.add_argument("--seed", type=int, default=1)
+    # ---- CONNECT-REACK T1: deterministic single-ACK loss (test-only) ---------
+    # Erase (zero the channel input of) the Nth SIGNAL BURST on the b2a
+    # (RSP->CMD) direction, 1-based. Burst #1 is the START_CONNECTION ACK,
+    # burst #2 is the FIRST TEST_CONNECTION_ACK. --erase-b2a-burst 2 thus
+    # deterministically loses the single TEST_ACK while the START_CONNECTION ACK
+    # still lands -> the responder reaches CONNECTED, then every duplicate
+    # TEST_CONNECTION must be re-answered (connect-testack-handshake.md §5/T1).
+    # DEFAULT 0 == disabled == byte-identical channel.
+    ap.add_argument("--erase-b2a-burst", type=int, default=0,
+                    help="TEST-ONLY: zero the Nth RSP->CMD signal burst (1-based; "
+                         "2 = first TEST_CONNECTION_ACK). DEFAULT 0 (disabled).")
     # ---- Inter-peer sample-clock drift + PTT turnaround model (OPT-IN) -------
     # DEFAULT OFF (0). On == FIX9 mechanism repro (sample-rate skew that
     # de-aligns the half-duplex CFG16 turnaround); see DriftResampler /
@@ -1118,6 +1164,10 @@ def main():
                                   Xoshiro(args.seed * 2246822519 & 0xFFFFFFFF)),
            "b2a": PttLatencyModel(args.ptt_latency_ms, args.ptt_latency_jitter_ms,
                                   Xoshiro(args.seed * 3266489917 & 0xFFFFFFFF))}
+    # CONNECT-REACK T1 single-burst eraser (TEST-ONLY). Only the b2a (RSP->CMD)
+    # direction can carry a TEST_ACK; a2b is disabled (target 0 = inert).
+    eraser = {"a2b": BurstEraser(0),
+              "b2a": BurstEraser(args.erase_b2a_burst)}
     # FAITHFUL turnaround-timing model (M1-M3; SIMFIDELITY_ROOTCAUSE §3.2). Per
     # direction: ±ppm crystal slip + seeded per-key-up jitter realized as integer
     # silence insert/drop (signal samples bit-exact). enabled only with
@@ -1282,6 +1332,22 @@ def main():
                 if v > SILENCE_EPS or v < -SILENCE_EPS:
                     silent = False
                     break
+            # --- CONNECT-REACK T1 (TEST-ONLY): deterministically erase one whole
+            # reverse burst (the single TEST_ACK). Runs on the RAW pre-channel
+            # samples so the far end sees the calibrated noise floor in its place.
+            # `silent` is recomputed from the erased samples below so airtime
+            # accounting / onset edges treat the erased burst as silence. -------
+            samples = eraser[key].maybe_erase(samples, silent)
+            if eraser[key].enabled and eraser[key].last_onset:
+                log(f"BURST-ERASER {key}: burst #{eraser[key].last_onset} onset "
+                    f"(target={eraser[key].target}, "
+                    f"erased_chunks={eraser[key].n_erased_chunks})")
+            if not silent:
+                silent = True
+                for v in samples:
+                    if v > SILENCE_EPS or v < -SILENCE_EPS:
+                        silent = False
+                        break
             # --- PTT keying latency (OPT-IN): on a silent->signal onset, inject
             # ptt_latency_ms of channel-noise SILENCE ahead of the burst so the
             # far end sees it arrive late (the half-duplex turnaround the sim

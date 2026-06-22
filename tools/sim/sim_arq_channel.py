@@ -527,6 +527,10 @@ def main():
                     help="impulse/burst erasure fraction (orthogonal to fading)")
     ap.add_argument("--burst", action="store_true",
                     help="Gilbert-Elliott bursty impulse dropout (impulse knob)")
+    # CONNECT-REACK T1 (connect-testack-handshake.md §5): deterministically erase
+    # the Nth RSP->CMD signal burst (2 = first TEST_CONNECTION_ACK). 0=disabled.
+    ap.add_argument("--erase-b2a-burst", type=int, default=0,
+                    help="TEST-ONLY: drop the Nth RSP->CMD burst (2=first TEST_ACK)")
     # deprecated flat-fade knobs (superseded by --profile); kept for compat.
     ap.add_argument("--fade-hz", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--fade-depth", type=float, default=0.0, help=argparse.SUPPRESS)
@@ -755,6 +759,7 @@ def main():
                      "--turnaround-ppm-a2b", str(args.turnaround_ppm_a2b),
                      "--turnaround-ppm-b2a", str(args.turnaround_ppm_b2a),
                      "--turnaround-jitter-ms", str(args.turnaround_jitter_ms),
+                     "--erase-b2a-burst", str(args.erase_b2a_burst),
                      "--airtime-json", relay_airtime_json,
                      "--log", relay_log]
         if args.turnaround_drift:
