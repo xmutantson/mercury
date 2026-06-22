@@ -301,7 +301,7 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
  		// eagerly even if #3's env is unset).
  		static const int synd_earlyterm_env = []{
  			const char* e = std::getenv("MERCURY_SYND_EARLYTERM");
- 			return (e && *e) ? atoi(e) : 0;
+ 			return (e && *e) ? atoi(e) : 1;
  		}();
  		int et_mode = early_term_speculative ? 2 : (synd_earlyterm_env != 0 ? 1 : 0);
  		last_early_term_iter = -1;

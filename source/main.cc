@@ -641,6 +641,38 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test wall-clock watchdog. `--test` is a Monte-Carlo suite with no internal
+// time bound; on the RPi bench a wedged test used to hang forever, pinning a
+// core at 99% (stacked orphans -> thermal throttle -> CPU jitter that tips OFDM
+// acquisition onto sub-peaks). Arm a detached timer thread on entry to any
+// --test* dispatch: if the suite has not returned (and exited the process) by
+// the deadline, force a NON-ZERO exit so a wedged test can never hang. On normal
+// completion main() returns first and the still-sleeping detached thread is
+// abandoned with the process, so the watchdog never fires on a healthy run.
+// Deadline is MERCURY_TEST_WATCHDOG_S seconds (default 600; <=0 disables).
+static void arm_test_watchdog() {
+    long deadline_s = 600;
+    const char* env = getenv("MERCURY_TEST_WATCHDOG_S");
+    if (env && *env) {
+        char* end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env) deadline_s = v;
+    }
+    if (deadline_s <= 0) return;   // explicitly disabled
+    std::thread([deadline_s]() {
+        std::this_thread::sleep_for(std::chrono::seconds(deadline_s));
+        fprintf(stderr,
+            "\n[TEST-WATCHDOG] --test exceeded %ld s wall clock — aborting with "
+            "non-zero exit 70 (set MERCURY_TEST_WATCHDOG_S to tune, <=0 to disable).\n",
+            deadline_s);
+        fflush(stderr);
+        // Exit 70 (EX_SOFTWARE): non-zero so callers see failure, and distinct
+        // from GNU `timeout`'s own 124 so a wedged-test self-abort is
+        // distinguishable from an external timeout kill in deploy/CI logs.
+        _exit(70);
+    }).detach();
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -670,6 +702,7 @@ int main(int argc, char *argv[])
     // init so the test process stays minimal.
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
+            arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             int failed = run_mfsk_ctrl_codec_tests();
             failed += run_sim_clock_tests();
             failed += run_winlink_dict_tests();
@@ -700,6 +733,16 @@ int main(int argc, char *argv[])
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
             failed += test_sigterm_handler();
+            // IDLE-SWITCHROLE-RACE regression gates (idle-switchrole-race.md §4):
+            // B (trigger-gate, B1+B2) and C (no-progress teardown + neg-control).
+            // Both are in-process synthetic-fire (no PHY/audio) so they belong in
+            // the master suite as permanent regression gates. MERGE COMPOSE: kept
+            // alongside the redesign's in-band regression gates above (both belong).
+            {
+                cl_arq_controller ARQ_isr;
+                failed += ARQ_isr.test_idle_switch_role_race();
+                failed += ARQ_isr.test_break_noprogress_teardown();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
@@ -972,6 +1015,14 @@ int main(int argc, char *argv[])
                                         // panic counter, and BREAK still reaches ROBUST_0. One-shot, exits rc. See
                                         // fact-documents/gearshift-start-and-recovery.md §8.
     bool test_clean_batch_viability_cli = false; // --test-clean-batch-viability: CLEAN-BATCH VIABILITY regression (§9).
+    bool test_idle_switch_role_race_cli = false; // --test-idle-switch-role-race: idle SWITCH_ROLE race regression.
+                                        // Drives the REAL process_buffer_data_commander() idle branch with a freshly-
+                                        // CONNECTED empty-tx Commander; asserts SWITCH_ROLE is queued before any data
+                                        // (the connected-but-0-deliver root cause). FAILS-BEFORE on monitor. One-shot.
+    bool test_break_noprogress_cli = false; // --test-break-noprogress-teardown: BREAK no-progress teardown regression
+                                        // (idle-switchrole-race.md §3/§4 Part C). Replays the shared break_noprogress_step
+                                        // kernel: teardown fires at exactly K dead cycles; progress on a live BREAK resets
+                                        // the streak (negative control). FAILS-BEFORE with -DBREAK_NOPROGRESS_FAILBEFORE.
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
                                         // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
@@ -1888,6 +1939,27 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-idle-switch-role-race") == 0)
+        {
+            // Idle SWITCH_ROLE race regression — one-shot at startup, then exit
+            // with the test's rc. FAILS-BEFORE evidence for the
+            // connected-but-0-deliver bench bug (empty-tx Commander gives its
+            // role away before the app's first data write).
+            test_idle_switch_role_race_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-break-noprogress-teardown") == 0)
+        {
+            // BREAK no-progress teardown regression — one-shot at startup, then
+            // exit with the test's rc. Part C of the idle-switchrole-race fix:
+            // a never-fed BREAK spiral must reach a graceful teardown at K dead
+            // cycles instead of re-arming the watchdog forever. FAILS-BEFORE with
+            // -DBREAK_NOPROGRESS_FAILBEFORE (the kernel never escalates).
+            test_break_noprogress_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strncmp(argv[i], "--test-policy-axis2-ceiling-fire=", 33) == 0)
         {
             // SACK Design A Step 12 — synthetic Axis-2 proven-ceiling fire
@@ -2432,6 +2504,47 @@ start_modem:
                 base_tcp_port = g_settings.control_port;
                 printf("Using TCP ports from settings: control=%d, data=%d\n",
                        g_settings.control_port, g_settings.data_port);
+            }
+
+            // Surface proven, previously env-only modem features from the INI by
+            // translating each into its MERCURY_* env var HERE, before the ARQ
+            // controller / telecom_system are constructed and first read them
+            // (break_fh_gate_enabled / turnaround_rephase_enabled_common cache on
+            // first call; opt_load_rate_table reads $MERCURY_RATE_TABLE). A var
+            // already present in the environment WINS over the INI so a command
+            // line A/B override is never clobbered. Mirrors the _putenv_s/setenv
+            // pattern at arq_commander.cc.
+            {
+                auto set_env = [](const char* k, const char* v) {
+#if defined(_WIN32)
+                    _putenv_s(k, v);
+#else
+                    setenv(k, v, 1);
+#endif
+                };
+                // BREAK forward-health gate: env is a DISABLE hatch (presence =
+                // disabled). Only set it when the user turned the gate OFF in the
+                // GUI and didn't already set the env on the command line.
+                if (!g_settings.break_fh_gate_enabled &&
+                    std::getenv("MERCURY_BREAK_FH_GATE_DISABLE") == nullptr) {
+                    set_env("MERCURY_BREAK_FH_GATE_DISABLE", "1");
+                    printf("Feature: BREAK forward-health gate DISABLED (from INI)\n");
+                }
+                // Turnaround re-phase: default-ON; env "0" disables. Only set
+                // when OFF in the GUI and not already overridden on the CLI.
+                if (!g_settings.turnaround_rephase_enabled &&
+                    std::getenv("MERCURY_TURNAROUND_REPHASE") == nullptr) {
+                    set_env("MERCURY_TURNAROUND_REPHASE", "0");
+                    printf("Feature: turnaround re-phase DISABLED (from INI)\n");
+                }
+                // Rate-table path: only when the user supplied one and the env
+                // isn't already set on the CLI.
+                if (!g_settings.rate_table_path.empty() &&
+                    std::getenv("MERCURY_RATE_TABLE") == nullptr) {
+                    set_env("MERCURY_RATE_TABLE", g_settings.rate_table_path.c_str());
+                    printf("Feature: rate table path = %s (from INI)\n",
+                           g_settings.rate_table_path.c_str());
+                }
             }
         } else {
             printf("No settings file found, using defaults\n");
@@ -3459,6 +3572,33 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_robust0_compress_deadlock();
             printf("[FLAG] Robust0-compress-deadlock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_idle_switch_role_race_cli) {
+            // Idle SWITCH_ROLE race regression (one-shot, then exit rc). Drives
+            // the REAL process_buffer_data_commander() idle branch with a
+            // freshly-CONNECTED empty-tx Commander; asserts SWITCH_ROLE is queued
+            // before any data write — the connected-but-0-deliver root cause.
+            printf("[FLAG] --test-idle-switch-role-race: invoking idle SWITCH_ROLE "
+                   "race regression (FAILS-BEFORE evidence)\n");
+            fflush(stdout);
+            int rc = ARQ.test_idle_switch_role_race();
+            printf("[FLAG] Idle-switch-role-race test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_break_noprogress_cli) {
+            // BREAK no-progress teardown regression (one-shot, then exit rc).
+            // Replays the shared break_noprogress_step kernel that the EXHAUSTED
+            // re-arm site uses; asserts teardown at exactly K dead cycles and the
+            // negative control (progress resets the streak). Part C of the
+            // connected-but-0-deliver fix. See fact-documents/idle-switchrole-race.md.
+            printf("[FLAG] --test-break-noprogress-teardown: invoking BREAK no-progress "
+                   "teardown regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_break_noprogress_teardown();
+            printf("[FLAG] Break-noprogress-teardown test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

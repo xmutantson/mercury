@@ -6461,6 +6461,11 @@ static void test_ofdm_fine_timing_magnitude_clean_no_regression() {
 static bool break_fh_eval_frame(cl_arq_controller& arq, bool gate_on,
                                 bool recent_forward_ofdm, bool probe_matched) {
 	cl_arq_controller::break_fh_gate_test_override = gate_on ? 1 : 0;
+	// DATA-PHASE benefit tests run with a data batch in flight: the control-phase guard in
+	// break_fh_suppress()/break_kofn_corroborate() makes the gate inert at frame_count==0, so
+	// these existing alias/BREAK cases must assert the data-phase behavior (frame_count>0).
+	// The dedicated control-phase test below leaves frame_count==0 to prove the FIX.
+	if (arq.batch_rx_frame_count <= 0) arq.batch_rx_frame_count = 1;
 	// Model the forward-health latch: advance the receive-frame index one tick, and if a
 	// forward OFDM frame is "recent" latch it AT this tick (delta 0 <= window).
 	arq.rx_receive_frame_index++;
@@ -6525,6 +6530,7 @@ static void test_break_fh_gate() {
 	{
 		cl_arq_controller arq;
 		cl_arq_controller::break_fh_gate_test_override = 1;
+		arq.batch_rx_frame_count = 1;   // data phase: the control-phase guard is past
 		// Latch a forward OFDM decode, then advance the receive index past the window
 		// WITHOUT another forward decode: break_fh_suppress() must read "not recent".
 		arq.rx_receive_frame_index = 100;
@@ -6637,6 +6643,68 @@ static void test_break_fh_gate() {
 		}
 	}
 
+	// ---- Test C: CONTROL-PHASE inertness (fix/break-fh-control-phase) ----
+	// ROOT CAUSE of the CFG15 0-byte regression: the forward-health latch (:9391) is set on
+	// ANY decoded OFDM frame INCLUDING the SET_CONFIG control frame, before the type is parsed
+	// (:9439). During the SET_CONFIG handshake batch_rx_frame_count==0 (no DATA batch yet), so
+	// the gate WRONGLY engaged on the control round-trip -> the SET_CONFIG never consummated ->
+	// [BREAK] retries exhausted -> CFG15->CFG0 -> 0 bytes. FIX: both predicates go inert at
+	// batch_rx_frame_count<=0 (behave exactly as gate-OFF), so a needed control-phase BREAK is
+	// never suppressed/corroborate-gated. This test FAILS-BEFORE the guards (gate engages at
+	// frame_count==0) and PASSES-AFTER.
+	{
+		cl_arq_controller::break_fh_gate_test_override = 1;   // gate ENABLED (default-on prod state)
+
+		// (a) CONTROL phase (batch_rx_frame_count==0) with a RECENT forward OFDM decode (the
+		//     SET_CONFIG ACK just decoded, latching :9391). The gate must be INERT:
+		//       break_fh_suppress()==false (never suppress) AND
+		//       break_kofn_corroborate(p)==p (pass-through == gate-off semantics).
+		{
+			cl_arq_controller arq;
+			arq.batch_rx_frame_count = 0;                       // control/SET_CONFIG phase
+			arq.rx_receive_frame_index = 500;
+			arq.last_forward_ofdm_decode_frame = 500;           // recent forward (control) OFDM frame
+			// FAIL-BEFORE: without the guard, suppress() returns true here (latch is recent).
+			if (arq.break_fh_suppress()) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(a): control-phase (frame_count==0) break_fh_suppress() engaged — a needed SET_CONFIG BREAK would be suppressed (REGRESSION)");
+				return;
+			}
+			// FAIL-BEFORE: without the guard, corroborate(true) returns false (needs K) here.
+			arq.break_probe_consec_match = 0;
+			if (arq.break_kofn_corroborate(true) != true) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(a): control-phase break_kofn_corroborate(true) did not pass-through (gate corroborate-gated the control BREAK — REGRESSION)");
+				return;
+			}
+			if (arq.break_kofn_corroborate(false) != false) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(a): control-phase break_kofn_corroborate(false) must pass-through false");
+				return;
+			}
+		}
+
+		// (b) DATA phase (batch_rx_frame_count>0) with the SAME recent-forward state: the gate
+		//     STILL suppresses + corroborate-gates (the data-phase benefit is PRESERVED).
+		{
+			cl_arq_controller arq;
+			arq.batch_rx_frame_count = 3;                       // data batch in flight
+			arq.rx_receive_frame_index = 500;
+			arq.last_forward_ofdm_decode_frame = 500;           // recent forward OFDM data frame
+			if (!arq.break_fh_suppress()) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(b): DATA-phase break_fh_suppress() did NOT suppress on a recent forward decode — the gate benefit was lost");
+				return;
+			}
+			arq.break_probe_consec_match = 0;
+			if (arq.break_kofn_corroborate(true) != false) {
+				cl_arq_controller::break_fh_gate_test_override = -1;
+				test_fail(name, "C(b): DATA-phase break_kofn_corroborate(true) detonated on a single match — K-of-N benefit lost");
+				return;
+			}
+		}
+	}
+
 	cl_arq_controller::break_fh_gate_test_override = -1;   // restore production env path
 	test_pass(name);
 }
@@ -6655,6 +6723,22 @@ int run_mfsk_ctrl_codec_tests() {
 	g_passes   = 0;
 	printf("=== MFSK ctrl-suffix codec tests (Phase B Wave 1 + Wave 2 v2 + Wave 3) ===\n");
 
+	// HEAVY-SWEEP gate. The cliff/FAR Monte-Carlo sweeps below (FN=4000 noise
+	// trials + hundreds of decode trials across a sigma axis, per config) are what
+	// make the default --test a 15-20 min run. On the RPi deploy path that long run
+	// is also UNWATCHED — a wedged sweep pins a core at 99% (orphans stack -> thermal
+	// throttle -> CPU jitter -> OFDM acquisition tips onto sub-peaks), the exact bench
+	// poison this change de-risks. So the heavy sweeps run ONLY under
+	// MERCURY_HEAVY_SWEEP=1 (pre-merge / CI, mirroring the §6.P3 MERCURY_P3_SWEEP
+	// gate); the default --test keeps every CHEAP unit/round-trip/CRC assertion and
+	// becomes a fast, bounded deploy smoke. The skip is LOUD, never silent, and the
+	// assertions still run — they just move to the gated CI lane. The main.cc
+	// wall-clock watchdog is the unconditional backstop for either lane.
+	const bool heavy_sweep = (getenv("MERCURY_HEAVY_SWEEP") != NULL);
+	printf("=== [HEAVY-GATE] MERCURY_HEAVY_SWEEP=%s (cliff/FAR sweeps %s) ===\n",
+		heavy_sweep ? "1" : "(unset)", heavy_sweep ? "RUN" : "SKIPPED — default fast --test");
+	fflush(stdout);
+
 	// §6.P3 WIN-campaign data-frame detector cliff sweep (MEASURE-only,
 	// env-gated MERCURY_P3_SWEEP=1). Registered FIRST so the make-or-break
 	// numbers print before the slow §10/§11 sweeps. No-op without the env var.
@@ -6664,10 +6748,12 @@ int run_mfsk_ctrl_codec_tests() {
 	// fail-before/pass-after): M16×2 cliff deepening + M32×1 non-regression.
 	test_mfsk_data_preamble_stream_combiner();
 
-	// §6.P5 §13 fine-pass FAR cleanup guard (always-on, fail-before/pass-after):
+	// §6.P5 §13 fine-pass FAR cleanup guard (fail-before/pass-after):
 	// M16×2 production FAR drops 1.8e-2 → ~1.75e-3 (coarse-gate decision) while
-	// the coarse-combining acquisition gain is preserved.
-	test_mfsk_data_preamble_far_coarse_gate();
+	// the coarse-combining acquisition gain is preserved. HEAVY (FN=4000 pure-noise
+	// trials + 40 acquisition trials through time_sync_mfsk_corr at ROBUST_2) —
+	// behind the heavy-sweep gate so the default --test stays fast.
+	if (heavy_sweep) test_mfsk_data_preamble_far_coarse_gate();
 
 	// §1 codec primitives
 	test_pack_unpack_callsign_body_b36();
@@ -6729,7 +6815,7 @@ int run_mfsk_ctrl_codec_tests() {
 	test_suffix_soft_corrects_one_flip();
 	test_suffix_soft_pure_noise_far();
 	test_suffix_soft_nb_unsupported();
-	test_suffix_fec_cliff_sweep();   // [MEASURE] prints the acquisition-gain dB
+	if (heavy_sweep) test_suffix_fec_cliff_sweep();   // [MEASURE] acquisition-gain dB (heavy)
 
 	// §10 Tier-2 candidate A: soft GF(16) RA code (true deg-3 RA)
 	// (tier2-suffix-fec-gf16-spike.md)
@@ -6738,28 +6824,28 @@ int run_mfsk_ctrl_codec_tests() {
 	test_gf16_ra_byte_identical_when_off();
 	test_gf16_ra_passband_roundtrip_clean();
 	test_gf16_ra_pure_noise_far();
-	test_gf16_ra_cliff_sweep();      // [MEASURE] prints the GF(16) cliff + gain dB
+	if (heavy_sweep) test_gf16_ra_cliff_sweep();      // [MEASURE] GF(16) cliff + gain dB (heavy)
 	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
-	test_gf16_ra_production_path_cliff_sweep();
+	if (heavy_sweep) test_gf16_ra_production_path_cliff_sweep();   // heavy cliff sweep
 
 	// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation,
 	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the
 	// noncoherent beacon-combining dB, the base-matched floor, and FAR.
-	test_hail_detection_cliff_sweep();
+	if (heavy_sweep) test_hail_detection_cliff_sweep();   // heavy MEASURE+ASSERT sweep
 
 	// §17 CONNECT ctrl-suffix detection cliff + FAR under the relaxed
 	// CTRL_DETECT_METRIC_MIN=1.2 (tier2-suffix-fec-design.md §16/§17,
 	// 2026-05-31). MEASURE + ASSERT: rescued-decode count in the [1.2,3.0)
 	// metric band (fail-before on the 3.0 binary), decode-cliff depth, and
 	// pure-noise FAR on the uncoded CONNECT path.
-	test_ctrl_suffix_metric_gate_cliff_sweep();
+	if (heavy_sweep) test_ctrl_suffix_metric_gate_cliff_sweep();   // heavy MEASURE+ASSERT sweep
 
 	// §20 INCREMENT 2: noncoherent base-pattern COMBINING on the CONNECT
 	// handshake. MEASURE the base-pattern matched-count cliff at R=1/2/4
 	// (+2.2-2.5 dB/doubling expected) + the full establishment cliff; ASSERT
 	// R=4 deepens the matched-count materially vs R=1, byte-identical-when-off,
 	// FAR=0 on the combined path.
-	test_connect_preamble_combining_cliff_sweep();
+	if (heavy_sweep) test_connect_preamble_combining_cliff_sweep();   // heavy MEASURE+ASSERT sweep
 
 	// §21 PRODUCTION robust-tier-trigger behavior (tier2-suffix-fec-design.md §21,
 	// CAP_SUFFIX_FEC negotiation removed in cleanup/drop-suffix-fec-cap): ACK gate

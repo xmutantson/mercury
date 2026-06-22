@@ -494,3 +494,114 @@ so `clear_retx_queue()` needed no extension.
 
 **§10.2 Line-number note**: arq_common.cc line numbers above (and in §1–§9) drifted as
 the fixes added code; the cited symbols/anchors are authoritative, not the numbers.
+
+---
+
+## §11 M6 — BREAK-path lossless requeue (`cmd_batch_seq_id` rollback)
+
+**Branch** `feat/m6-lossless-requeue` (off `9afe802`). **Default-OFF** behind
+`MERCURY_BREAK_LOSSLESS_REQUEUE`; BYTE-IDENTICAL when unset. HELD (no merge/push/HW).
+
+### §11.1 Root cause (the recovery cascade's terminal bug)
+The Anchor-rung emergency BREAK (`arq_commander.cc`, the
+`emergency_nack_count >= emergency_nack_threshold` block ending in `send_break_pattern()`
++ `return`) fires in every HW cascade cell. It sets `emergency_break_active=1`, sends the
+BREAK pattern, and returns **WITHOUT rolling `cmd_batch_seq_id` back to the stranded
+in-flight batch**. The stranded batch's bytes ARE preserved: the BREAK recovery handler
+(`arq_commander.cc:288-296` ACK-phase / `:376-384` EXHAUSTED) FIFO-push-back + FREEs
+`messages_tx[]` on recovery — but that handler does NOT touch `cmd_batch_seq_id`. So the
+post-recovery re-send rebuilds the batch under the **already-advanced** epoch counter
+(`cmd_batch_seq_id` had incremented past the in-flight bsi at `arq_commander.cc:1915` when
+the batch was first dispatched). Meanwhile the RSP's BREAK self-heal
+(`arq_responder.cc:474-475`) resets `rsp_current/prev_expected = -1` but the delivery
+high-water `rsp_last_delivered_batch_seq_id` SURVIVES (INV-4). The next data frame
+re-adopts via `sack_v2_readopt_has_gap(fresh_bsi, high-water)` (`arq.h:1395`): a fresh
+epoch bsi is a `>=2` forward jump from the high-water → `[RSP-V2-GAP-ABORT]` → DROPPED →
+the transfer terminally dies. **The GAP-ABORT is CORRECT (integrity guard — NOT weakened).
+The bug is the BREAK leaving the hole.**
+
+### §11.2 The fix (`arq_commander.cc`, Anchor-rung BREAK, immediately before
+`send_break_pattern()`)
+Gated `break_lossless_requeue_enabled() && sack_v2_enabled && !compression_enabled` (the
+SAME preconditions FIX-9 D3 uses). PORTS the FIX-9 D3 capture+rollback verbatim: scan
+`messages_tx[]` for the EARLIEST (mod-256) non-FREE `batch_seq_id` = the in-flight batch's
+ORIGINAL bsi, then `cmd_batch_seq_id = min_inflight_bsi`. The recovery re-send then carries
+the CONTIGUOUS bsi the RSP expects next → `sack_v2_readopt_has_gap` returns false → no
+abort. The demote/BREAK mechanism itself is UNCHANGED; only the bsi bookkeeping is
+corrected. Helper `break_lossless_requeue_enabled()` (`arq_commander.cc`, next to
+`sack_rx_trace_enabled`): unset/`"0"` → 0 (disabled, byte-identical); any other non-empty
+value → 1.
+
+### §11.3 Producers of `cmd_batch_seq_id`
+- `arq_commander.cc:1673,1690` — assign `cmd_batch_seq_id & 0xFF` to each new-data frame's
+  `batch_seq_id` (the LABEL the wire carries).
+- `arq_commander.cc:1915` — `cmd_batch_seq_id = (cmd_batch_seq_id + 1) & 0xFF` AFTER a batch
+  with ≥1 new-data frame is dispatched (the advance that creates the epoch gap).
+- `arq_commander.cc` FIX-9 D3 demote (`:4018`) — `cmd_batch_seq_id = min_inflight_bsi`
+  (the EXISTING lossless rollback; the SET_CONFIG sibling of this fix).
+- **NEW (M6)** — Anchor-rung BREAK path — `cmd_batch_seq_id = min_inflight_bsi`
+  (default-off; the new producer this fix adds).
+- Session reset paths set it to a base (e.g. `reset_session_state`); not relevant to the
+  in-flight-strand window.
+
+### §11.4 Consumers of `cmd_batch_seq_id` (every read, and why the rollback is safe)
+1. **New-data frame bsi assignment** (`:1673,:1690`) — on the NEXT batch built post-BREAK.
+   After rollback this reads `min_inflight_bsi`, so the re-sent batch carries the
+   contiguous bsi. INTENDED — this IS the fix's effect.
+2. **SACK-v2 accept window** `{cmd_bsi, prev_bsi}` (`:128`, `:2826`, `:3019`,
+   `sack_v2_bsi_in_window`) — guards which incoming SACK_RSP frames are applied. After the
+   BREAK the link re-baselines at ROBUST_0 and re-climbs; no SACK_RSP for the OLD epoch is
+   in flight (the BREAK aborted the old PHY exchange), and any post-recovery SACK is for the
+   rolled-back-and-re-sent batch, which matches the rolled-back window. The D3 path relies
+   on the IDENTICAL property (it also rolls the counter back then re-emits). SAFE.
+3. **Diagnostic prints** (`:128,:1400,:1825,:1841,:2684,…`) — display only. SAFE.
+The recovery handler (`:219-396`) reads `messages_tx[]`, the FIFO, the config-ladder
+fields, `break_drop_step`, `emergency_previous_config` — it does NOT read or write
+`cmd_batch_seq_id`. So the rolled-back value set at the trigger SURVIVES untouched through
+recovery into the re-send. VERIFIED by `grep cmd_batch_seq_id` over `:219-396` (no hits).
+
+### §11.5 BREAK-vs-D3 equivalence (the §5 audit — is the rollback safe on the BREAK path?)
+The ONE worry: the D3 lossless-demote premise (CASE 8) is that the in-flight CFG16 batch
+was ALREADY DELIVERED by the RSP (high-water advanced past it) — a narrow reverse-ACK-
+starvation scenario. Does the generic Anchor-rung BREAK share a safe premise? **Yes, and
+the rollback is contiguous in BOTH sub-cases:**
+- The Anchor BREAK fires on `emergency_nack_count >= threshold` = K consecutive block-
+  failures with NO data-ACK (clean OR partial); ANY data-ACK resets the counter to 0
+  (`arq_commander.cc:4184`). So the stranded in-flight batch is one for which the CMD got
+  NO ACK. On the RSP it is in ONE of two states:
+  - **(a) Delivered, ACK lost** (the reverse-ACK-starvation / D3-like case): high-water
+    advanced TO the in-flight bsi. Re-presenting at `min_inflight_bsi == high-water` is a
+    DUPLICATE → `sack_v2_readopt_has_gap(b, b)` = false (dedup, INV-4). SAFE.
+  - **(b) Never delivered** (genuine forward-decode failure — the channel cratered): high-
+    water did NOT advance; it sits at `min_inflight_bsi - 1`. Re-presenting at
+    `min_inflight_bsi == high-water + 1` is the CONTIGUOUS successor →
+    `sack_v2_readopt_has_gap` = false. SAFE.
+- In BOTH sub-cases `min_inflight_bsi ∈ {high-water, high-water+1}` because the earliest
+  un-ACKed batch in `messages_tx[]` IS, by the in-order ARQ invariant, the next batch the
+  RSP needs after its contiguous-delivered high-water. This is the SAME invariant the D3
+  rollback relies on; the BREAK path does not weaken it. The hole the GAP-ABORT catches is
+  created ONLY by the fresh-epoch advance (skipping past `min_inflight_bsi`); rolling back
+  removes exactly that skip.
+- **Difference handled**: the D3 demote frees+pushes `messages_tx[]` AND rolls back at the
+  SAME site (`:3968-4018`). The BREAK defers the free+push to the recovery handler
+  (`:288-296/:376-384`). M6 captures `min_inflight_bsi` at the trigger (where
+  `messages_tx[]` still hold the stranded batch, BEFORE the recovery frees them) and rolls
+  back there; the deferred free+push is bsi-agnostic, so the split is benign. NO consumer
+  invariant breaks.
+- **Compression path**: gated OUT (`!compression_enabled`). `restore_tx_from_compressed()`
+  owns its own re-stage; unchanged. (Same scoping as D3.)
+
+### §11.6 Test (extends `--test-inorder-demote` CASE 1)
+`MERCURY_BREAK_LOSSLESS_REQUEUE` selector added to `test_inorder_demote()`. CASE 1 (BREAK
+cur=-1 re-adopt) now models both arms, driving the REAL `sack_v2_readopt_has_gap` +
+delivery commit + `fifo_buffer_rx`:
+- **fail-before** (knob unset): the recovery re-sends fresh-epoch bsi=8 →
+  `sack_v2_readopt_has_gap(8, high-water=4)` = true → GAP-ABORT, DROPPED, delivered EXACTLY
+  [0..4] (the pre-M6 behavior + FIX-8 regression guard — byte-identical).
+- **pass-after** (`MERCURY_BREAK_LOSSLESS_REQUEUE=1`): the BREAK rolled `cmd_batch_seq_id`
+  back to the earliest in-flight bsi (5 = high-water+1) → recovery re-sends contiguous bsi=5
+  → `sack_v2_readopt_has_gap(5, 4)` = false → NO abort, batch 5 delivered, [0..5] in-order
+  (192B), link CONNECTED.
+`MERCURY_GAP_ABORT_DEFEAT` (the integrity-guard silent-concat fail-before) is independent
+and preserved. The integrity battery (`--test-gap-abort`, `--test-partial-bsi-advance`,
+`--test-inorder-demote` knob-unset) stays green.

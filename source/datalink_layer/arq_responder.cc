@@ -101,6 +101,11 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	if(messages_rx[loc].status==FREE || messages_rx[loc].status==ACKED)
 	{
 		stats.nReceived_data++;
+		// IDLE-SWITCHROLE-RACE recovery (idle-switchrole-race.md §3): this session
+		// has DELIVERED an RX data frame -> real forward progress. The BREAK
+		// no-progress teardown discriminator (Part C) keys on this per-session bool
+		// (NOT raw stats.nReceived_data, which is cumulative across sessions).
+		session_data_frame_received = true;
 	}
 	messages_rx[loc].status=RECEIVED;
 	success=SUCCESSFUL;
@@ -871,6 +876,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 						// MERCURY_GAP_ABORT_DEFEAT=1 disables the abort on the SAME
 						// binary (restores pre-fix silent-concat) for the
 						// --test-gap-abort fail-before arm.
+						// QUARANTINED 2026-06-17: proven-broken (=1 defeats the loud
+						// D3.1 in-order integrity guard => silent non-contiguous
+						// delivery; BENCH-9 + cfg15_stall confirm the guard is the
+						// no-silent-wrong-bytes backstop). do-not-enable.
 						bool gap_defeat = false;
 						{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 						  if(e && *e && atoi(e)!=0) gap_defeat = true; }
@@ -9135,6 +9144,9 @@ int cl_arq_controller::test_inorder_demote()
 	bool defeat = false;
 	{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 	  if(e && *e && atoi(e)!=0) defeat = true; }
+	// QUARANTINED 2026-06-17: MERCURY_LOSSY_DEMOTE=1 reproduces the PRE-FIX lossy D3 16->15
+	// re-present that GAP-ABORTs (proven-broken); the lossless re-present (unset) is the fix.
+	// do-not-enable.
 	// WALL-B FIX-9 LOSSLESS-DEMOTE fail-before selector (CASE 8 only): MERCURY_LOSSY_DEMOTE=1 makes
 	// the D3 16->15 re-present model the PRE-FIX (lossy) behavior — re-send the in-flight batch under
 	// a FRESH higher epoch bsi (the cmd_batch_seq_id already advanced past it) -> the RSP sees a
@@ -9143,8 +9155,22 @@ int cl_arq_controller::test_inorder_demote()
 	bool lossy_demote = false;
 	{ const char* e = std::getenv("MERCURY_LOSSY_DEMOTE");
 	  if(e && *e && atoi(e)!=0) lossy_demote = true; }
-	printf("[TEST-INORDER-DEMOTE] start (MERCURY_GAP_ABORT_DEFEAT=%d MERCURY_LOSSY_DEMOTE=%d)\n",
-		defeat ? 1 : 0, lossy_demote ? 1 : 0);
+	// M6 BREAK-PATH LOSSLESS-REQUEUE selector (CASE 1 only). Mirrors the PRODUCTION knob
+	// break_lossless_requeue_enabled(), which is DEFAULT-ON 2026-06-18 (proven fix ships
+	// default-on). DEFAULT (no env): the fix arm — the BREAK rolls cmd_batch_seq_id back to
+	// the EARLIEST in-flight bsi (= high-water+1) BEFORE send_break_pattern(), so the recovery
+	// re-send carries the CONTIGUOUS bsi the RSP expects next -> no hole, delivered, link stays
+	// CONNECTED. MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE set (the escape hatch / fail-before):
+	// the BREAK strands the in-flight batch and the recovery re-sends it under a FRESH (advanced)
+	// epoch bsi (cmd_batch_seq_id was never rolled back) -> the post-BREAK re-adopt sees a
+	// NON-CONTIGUOUS hole vs the delivery high-water -> RSP-V2-GAP-ABORT. Same knob/semantics
+	// the production fix has on the wire bsi; the BYTES are identical (FIFO push-back preserves
+	// them). Independent of MERCURY_GAP_ABORT_DEFEAT (which still exercises the silent-concat
+	// fail-before for the integrity-guard regression).
+	bool break_lossless = (std::getenv("MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE") == nullptr);
+	printf("[TEST-INORDER-DEMOTE] start (MERCURY_GAP_ABORT_DEFEAT=%d MERCURY_LOSSY_DEMOTE=%d "
+		"break_lossless_enabled=%d [default-on; MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE clears])\n",
+		defeat ? 1 : 0, lossy_demote ? 1 : 0, break_lossless ? 1 : 0);
 	fflush(stdout);
 
 	this->nMessages          = 255;
@@ -9281,15 +9307,55 @@ int cl_arq_controller::test_inorder_demote()
 		return ok;
 	};
 
-	// === CASE 1: BREAK demote (cur=-1 re-adopt) — the FIX-8 path, must still hold.
+	// === CASE 1: BREAK demote (cur=-1 re-adopt) — the FIX-8 path AND the M6 BREAK-path
+	// lossless requeue. The in-flight batch 5 stranded by the BREAK was NEVER delivered
+	// (high-water STAYS 4 — the BREAK fired on emergency_nack_count, i.e. consecutive
+	// block-failures with NO data-ACK), so the next bsi the RSP expects is 5 (= high-water+1).
+	//   FAIL-BEFORE (MERCURY_BREAK_LOSSLESS_REQUEUE unset): the recovery re-sends under a FRESH
+	//     epoch bsi=8 (cmd_batch_seq_id was never rolled back) -> readopt sees
+	//     sack_v2_readopt_has_gap(8, high-water=4)=true -> RSP-V2-GAP-ABORT, DROPPED, delivered
+	//     EXACTLY [0..4] (the integrity guard correctly refused the apparent hole). This is the
+	//     pre-M6 behavior AND the FIX-8 regression guard — it must hold byte-identical.
+	//   PASS-AFTER (MERCURY_BREAK_LOSSLESS_REQUEUE set): the BREAK rolled cmd_batch_seq_id back to
+	//     the earliest in-flight bsi (5), so the recovery re-sends the CONTIGUOUS bsi=5 ->
+	//     sack_v2_readopt_has_gap(5, high-water=4)=false -> NO abort, batch 5 delivered, link
+	//     stays CONNECTED, stream continues. Drives the REAL sack_v2_readopt_has_gap + delivery
+	//     commit + fifo_buffer_rx — the exact production decision the M6 rollback changes.
 	{
 		deliver_clean_prefix();
-		// BREAK self-heal: wipe cur/prev to -1 (arq_responder.cc:474). Batches
-		// 5,6,7 stranded; high-water STAYS 4.
+		// BREAK self-heal: wipe cur/prev to -1 (arq_responder.cc:474). Batch 5 (and any
+		// later in-flight) stranded; high-water STAYS 4.
 		this->rsp_current_expected_batch_seq_id = -1;
 		this->rsp_prev_batch_seq_id             = -1;
-		bool delivered = readopt_and_deliver(8);   // present post-BREAK bsi=8
-		if(!check_case("CASE1-BREAK", !delivered)) fails++;
+		if(defeat || !break_lossless)
+		{
+			// defeat: silent-concat fail-before (gap guard off) — check_case defeat oracle.
+			// non-defeat + knob OFF: pre-M6 fresh-epoch re-send bsi=8 -> GAP-ABORT (the
+			// check_case non-defeat oracle: aborted, DROPPED, EXACTLY [0..4]).
+			bool delivered = readopt_and_deliver(8);   // pre-M6 fresh-epoch re-send
+			if(!check_case("CASE1-BREAK", !delivered)) fails++;
+		}
+		else
+		{
+			// M6 ON: the BREAK rolled cmd_batch_seq_id back -> recovery re-sends the CONTIGUOUS
+			// bsi=5 (= high-water 4 + 1). The re-adopt must ACCEPT it, NOT abort.
+			bool delivered = readopt_and_deliver(5);
+			bool aborted   = !delivered;
+			char drained[8 * BATCH_BYTES];
+			int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+			char want[6 * BATCH_BYTES];
+			for(int b=0; b<6; b++) batch_payload(b, &want[b*BATCH_BYTES]);
+			bool size_ok  = (popped == 6*BATCH_BYTES);
+			bool bytes_ok = size_ok && (memcmp(drained, want, 6*BATCH_BYTES) == 0);
+			bool ok = true;
+			if(aborted)                        { printf("[TEST-INORDER-DEMOTE] FAIL CASE1-BREAK-M6: contiguous re-send was spuriously ABORTED (M6 must NOT abort)\n"); ok=false; }
+			if(this->link_status != CONNECTED) { printf("[TEST-INORDER-DEMOTE] FAIL CASE1-BREAK-M6: link_status != CONNECTED (=%d)\n", this->link_status); ok=false; }
+			if(!size_ok)                       { printf("[TEST-INORDER-DEMOTE] FAIL CASE1-BREAK-M6: delivered %dB, want 192 ([0..5])\n", popped); ok=false; }
+			else if(!bytes_ok)                 { printf("[TEST-INORDER-DEMOTE] FAIL CASE1-BREAK-M6: delivered bytes != [0..5] (wrong seam)\n"); ok=false; }
+			if(!ok) fails++;
+			else printf("[TEST-INORDER-DEMOTE] CASE1-BREAK-M6 PASS: lossless contiguous BREAK re-queue delivered, [0..5] in-order (192B), link CONNECTED, no GAP-ABORT\n");
+			this->link_status = CONNECTED;
+		}
 	}
 
 	// === CASE 2: FIX-4 carve demote CFG16->CFG15 (SET_CONFIG-only, cur>=0).

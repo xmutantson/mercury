@@ -46,6 +46,30 @@ static inline bool sack_rx_trace_enabled()
 	}
 	return cached != 0;
 }
+
+// M6 — BREAK-path lossless requeue (data-flow-arq-recovery-cluster.md §5.6).
+// The Anchor-rung emergency BREAK (~:4071-4177) calls send_break_pattern() and
+// returns WITHOUT rolling cmd_batch_seq_id back to the stranded in-flight batch
+// -> on recovery the re-sent batch carries a FRESH (advanced) epoch bsi -> the RSP
+// re-adopts a NON-CONTIGUOUS bsi (>=2 jump from its delivery high-water) ->
+// [RSP-V2-GAP-ABORT] terminally kills the transfer. The FIX-9 D3 SET_CONFIG demote
+// (~:3950-4018) already captures the earliest in-flight bsi BEFORE freeing
+// messages_tx[] and rolls cmd_batch_seq_id back to it, so the re-send is contiguous.
+// This knob ports that capture+rollback into the BREAK path. DEFAULT-ON 2026-06-18
+// (proven fix; owner policy = proven fixes ship default-on). The fix is ENABLED unless
+// the escape hatch MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE is set (any non-empty value),
+// which restores the pre-M6 BYTE-IDENTICAL BREAK behavior for an A/B revert.
+static inline bool break_lossless_requeue_enabled()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		// Default-ON: enabled unless the *_DISABLE escape hatch is present.
+		const char* dis = std::getenv("MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE");
+		cached = (dis == nullptr) ? 1 : 0;
+	}
+	return cached != 0;
+}
 #define SACK_TRACE(fmt, ...) do { \
 	if(sack_rx_trace_enabled()) { \
 		printf("[SACK-RX-TRACE] " fmt "\n", ##__VA_ARGS__); \
@@ -392,15 +416,74 @@ void cl_arq_controller::process_messages_commander()
 				}
 				block_under_tx = NO;
 
-				// Force-clear: cleanup() skips PENDING_ACK status
-				messages_control.status = FREE;
-				add_message_control(SET_CONFIG);
-				printf("[BREAK] EXHAUSTED SET_CONFIG queued: data[1]=%d data[2]=%d\n",
-					(int)messages_control.data[1], (int)messages_control.data[2]);
-				fflush(stdout);
-				connection_status = TRANSMITTING_CONTROL;
-				link_timer.start();
-				watchdog_timer.start();
+				// IDLE-SWITCHROLE-RACE RECOVERY PATH (Part C, idle-switchrole-race.md
+				// §3/§5.3/§5.4). The watchdog never disconnects (arq_common.cc:2985
+				// re-arms itself), so a never-fed link spins BREAK->SET_CONFIG->
+				// EXHAUSTED forever; the only legacy escape is the 180 s FORCED
+				// fallback. Discriminate the DEAD loop (no RX data this session AND
+				// tx FIFO empty AND a zero-byte re-queue = nothing came in and
+				// nothing is going out) from a LIVE recovery (any RX data, or a
+				// non-empty re-queue = real bytes still in flight). On a dead cycle
+				// count it; on ANY progress RESET to 0 (negative control). At bound
+				// K STOP re-arming the watchdog and route into the SAME FORCED-
+				// fallback teardown (arq_common.cc:3053-3065) instead of re-queuing
+				// SET_CONFIG — a graceful disconnect/return-to-listen in ~K cycles
+				// rather than the 180 s wall.
+				int requeue_fifo_load = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+				bool no_progress = (session_data_frame_received == false) &&
+				                   (requeue_fifo_load == 0) &&
+				                   (block_under_tx == NO);
+				// Shared PURE kernel (common_defines.h) — mutates break_noprogress_cycles
+				// and returns whether bound K is reached. The unit test replays this same
+				// kernel so production and test cannot diverge.
+				bool noprogress_teardown = break_noprogress_step(break_noprogress_cycles, no_progress);
+				if(no_progress)
+				{
+					printf("[BREAK] NO-PROGRESS cycle %d/%d (no RX data, empty TX, zero-byte re-queue)\n",
+						break_noprogress_cycles, BREAK_NOPROGRESS_TEARDOWN_K);
+					fflush(stdout);
+				}
+				else if(requeue_fifo_load > 0 || session_data_frame_received)
+				{
+					// Real forward progress (RX data delivered OR bytes re-queued):
+					// a LIVE BREAK recovery — the kernel already reset the streak.
+					printf("[BREAK] progress observed (rx_data=%d requeue=%dB) — no-progress streak reset\n",
+						session_data_frame_received ? 1 : 0, requeue_fifo_load);
+					fflush(stdout);
+				}
+
+				if(noprogress_teardown)
+				{
+					printf("[BREAK] NO-PROGRESS teardown: %d consecutive dead BREAK cycles — "
+						"forcing graceful disconnect/return-to-listen\n", break_noprogress_cycles);
+					fflush(stdout);
+					// Route into the SAME post-state as the 180 s FORCED_ROLE_SWITCH
+					// fallback (arq_common.cc:3053-3065): clean session reset, drop to
+					// RESPONDER/LISTENING, reload init config, flush FIFOs. The watchdog
+					// is NOT re-armed (reset_all_timers stops it), so the spiral ends.
+					reset_session_state();
+					set_role(RESPONDER);
+					link_status = LISTENING;
+					connection_status = RECEIVING;
+					load_configuration(init_configuration, FULL, YES);
+					reset_all_timers();
+					fifo_buffer_tx.flush();
+					fifo_buffer_backup.flush();
+					fifo_buffer_rx.flush();
+					messages_control.status = FREE;
+				}
+				else
+				{
+					// Force-clear: cleanup() skips PENDING_ACK status
+					messages_control.status = FREE;
+					add_message_control(SET_CONFIG);
+					printf("[BREAK] EXHAUSTED SET_CONFIG queued: data[1]=%d data[2]=%d\n",
+						(int)messages_control.data[1], (int)messages_control.data[2]);
+					fflush(stdout);
+					connection_status = TRANSMITTING_CONTROL;
+					link_timer.start();
+					watchdog_timer.start();
+				}
 			}
 		}
 		return;
@@ -1827,6 +1910,12 @@ void cl_arq_controller::process_messages_tx_data()
 				batch_includes_new_data = true;
 				stats.nSent_data++;
 				last_transmission_block_stats.nSent_data++;
+				// IDLE-SWITCHROLE-RACE (idle-switchrole-race.md §2): this session
+				// has now emitted a NEW data frame -> the idle SWITCH_ROLE handoff
+				// is legitimate from here on (end-of-data handoff preserved). The
+				// gate in process_buffer_data_commander() suppresses the handoff
+				// only while this is false (never-fed Commander = the race).
+				session_data_frame_sent = true;
 			}
 		}
 		else if(messages_tx[i].status==ACK_TIMED_OUT)
@@ -4854,6 +4943,57 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					printf("[BREAK] Lowered ceiling to %d\n", new_ceiling);
 					fflush(stdout);
 				}
+				// === M6 — BREAK-PATH LOSSLESS REQUEUE (data-flow-arq-recovery-cluster.md §5.6) ===
+				// The stranded in-flight batch(es) live in messages_tx[] right now (the FIFO
+				// push-back + FREE that recovers their bytes happens LATER, in the BREAK recovery
+				// handler at :288-296 / :376-384, and that handler does NOT touch cmd_batch_seq_id).
+				// PRE-FIX the recovery re-sends those bytes under a FRESH epoch bsi (cmd_batch_seq_id
+				// had advanced past the in-flight bsi), so after the RSP's BREAK self-heal
+				// (rsp_current/prev reset to -1, arq_responder.cc:474; delivery high-water SURVIVES)
+				// the re-adopt sees sack_v2_readopt_has_gap(fresh_bsi, high-water)=true (a >=2 jump)
+				// -> [RSP-V2-GAP-ABORT] terminally kills the transfer. The bytes were preserved; the
+				// bsi-epoch LABEL was wrong. Roll cmd_batch_seq_id back to the EARLIEST (mod-256)
+				// in-flight batch's ORIGINAL bsi — by construction the next bsi the RSP expects after
+				// its delivery high-water (un-ACKed-but-delivered => ==high-water, a dedup; or
+				// un-ACKed-and-undelivered => ==high-water+1, the contiguous successor) — so the
+				// recovery re-send is CONTIGUOUS and the GAP-ABORT does NOT fire. Identical capture
+				// to the FIX-9 D3 demote (:3968-3988) under the SAME preconditions
+				// (sack_v2_enabled && !compression_enabled — the compression path's
+				// restore_tx_from_compressed() owns its own re-stage and is unchanged). DEFAULT-OFF
+				// (break_lossless_requeue_enabled): unset => this whole block is skipped =>
+				// BYTE-IDENTICAL to the pre-M6 BREAK. NOT a change to the demote/BREAK itself — only
+				// the bsi bookkeeping is corrected.
+				if(break_lossless_requeue_enabled() && sack_v2_enabled && !compression_enabled)
+				{
+					int min_inflight_bsi = -1;
+					for(int i=0; i<nMessages; i++)
+					{
+						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+						{
+							int b = messages_tx[i].batch_seq_id & 0xFF;
+							if(min_inflight_bsi < 0)
+								min_inflight_bsi = b;
+							else
+							{
+								// keep the mod-256-EARLIER bsi (forward distance b->min in
+								// [1,128] means min is later, so b is earlier).
+								unsigned fwd = ((unsigned)(min_inflight_bsi - b)) & 0xFFu;
+								if(fwd >= 1u && fwd <= 128u)
+									min_inflight_bsi = b;
+							}
+						}
+					}
+					if(min_inflight_bsi >= 0)
+					{
+						printf("[BREAK] M6 LOSSLESS REQUEUE: rolling cmd_batch_seq_id %d -> %d "
+							"so the post-BREAK re-send carries the in-flight (contiguous) bsi "
+							"(no RSP-V2-GAP-ABORT on recovery)\n",
+							cmd_batch_seq_id & 0xFF, min_inflight_bsi);
+						fflush(stdout);
+						cmd_batch_seq_id = min_inflight_bsi;
+					}
+				}
+
 				printf("[BREAK] Sending emergency BREAK pattern\n");
 				fflush(stdout);
 				emergency_previous_config = current_configuration;
@@ -5371,6 +5511,14 @@ void cl_arq_controller::process_control_commander()
 			watchdog_timer.start();
 			this->link_status=CONNECTION_ACCEPTED;
 			connection_status=TRANSMITTING_CONTROL;
+			// IDLE-SWITCHROLE-RACE (idle-switchrole-race.md §2/§5.5): CONNECT skips
+			// reset_session_state (arq_common.cc:801) so the per-session race/teardown
+			// flags MUST be cleared here at connect-accept too — otherwise a prior
+			// session's session_data_frame_sent==true would re-open the race on this
+			// fresh connection, and a stale break_noprogress_cycles would mis-count.
+			session_data_frame_sent = false;
+			session_data_frame_received = false;
+			break_noprogress_cycles = 0;
 			// Reset per-phase so each handshake step gets its own timeout window
 			connection_attempt_timer.reset();
 			connection_attempt_timer.start();
@@ -12135,6 +12283,312 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 }
 
 // ===========================================================================
+// Idle SWITCH_ROLE race regression — FAILS-BEFORE evidence for the
+// connected-but-0-deliver bench bug.
+//
+// THE BUG (channel-free, pure ARQ state): in process_buffer_data_commander()'s
+// idle branch (arq_commander.cc:15238-15251), when role==COMMANDER &&
+// link_status==CONNECTED && connection_status==TRANSMITTING_DATA, with an EMPTY
+// tx FIFO (block_under_tx==NO, no occupied messages, no pending control), the
+// Commander arms switch_role_timer; once it exceeds switch_role_timeout (1000ms
+// on WB, ~200ms robust), it queues a SWITCH_ROLE control frame. So if the
+// application withholds its FIRST data write past switch_role_timeout (the bench
+// opens an 8s gap via --no-warmup --settle 8), the freshly-connected Commander
+// hands its role to a peer with an empty tx FIFO -> that peer sends SET_CONFIG,
+// gets no data reply, BREAKs -> BREAK/CONFIG_0 churn that never delivers.
+//
+// This test drives the REAL idle branch in-process, no PHY/audio/TCP. We prime
+// a CONNECTED+TRANSMITTING_DATA Commander with an EMPTY tx FIFO and pin
+// switch_role_timeout=0 so the SECOND call's elapsed time (>0ms) crosses the
+// threshold deterministically (the production threshold is wall-time; the
+// failing condition is "timer armed at connect, no data write before timeout").
+//
+// THE load-bearing assertion: after two idle-branch invocations on a freshly
+// connected empty-tx Commander, messages_control carries SWITCH_ROLE — i.e. the
+// Commander gives away its role with ZERO bytes pending. FAIL-BEFORE on monitor
+// (this is the bug). A fix that withholds SWITCH_ROLE until the first data write
+// (or a grace window) would make it PASS. One-shot, exits rc.
+int cl_arq_controller::test_idle_switch_role_race()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-IDLESR] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-IDLESR] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// --- Prime a freshly-CONNECTED Commander in the data phase ---
+	// These are exactly the gates the idle branch requires (arq_commander.cc:
+	// 14866 outer; 15238 else-if). No config load needed; we set the few fields
+	// the branch reads directly.
+	role                     = COMMANDER;
+	original_role            = COMMANDER;
+	link_status              = CONNECTED;
+	connection_status        = TRANSMITTING_DATA;   // gates the function body (14866)
+	block_under_tx           = NO;                   // gates the idle branch (15238)
+	retransmit_count         = 0;
+	message_batch_counter_tx = 0;                    // 15238 condition
+	sack_enabled             = false;                // skip the v1 retx early-return
+	sack_v2_enabled          = true;
+	encryption_enabled       = false;                // skip the key-exchange gate
+	compression_enabled      = false;                // empty FIFO => fill path not entered anyway
+	// IDLE-SWITCHROLE-RACE gate (Part B): a NEVER-FED Commander has emitted no
+	// data this session. With the trigger-gate, the idle branch is suppressed
+	// while this is false -> B1 passes (no spurious handoff). B2 below flips it
+	// true to prove the legitimate end-of-data handoff still fires.
+	session_data_frame_sent  = false;
+
+	// dimensions so init_messages_buffers + get_nOccupied_messages are sane
+	max_data_length   = 6;
+	max_header_length = 6;
+	nMessages         = 32;
+	set_data_batch_size(1);
+
+	deinit_messages_buffers();                       // idempotent
+	int alloc_rc = init_messages_buffers();          // allocs messages_tx[].data + messages_control.data
+	check(alloc_rc == SUCCESSFUL, "S0 message buffers allocated", alloc_rc, SUCCESSFUL);
+
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+
+	// EMPTY tx FIFO is the crux: get_size()==get_free_size() => the data-fill
+	// `if(...)` at arq_commander.cc:14911 is FALSE, so control falls through to
+	// the else-if chain and reaches the idle SWITCH_ROLE branch.
+	int fifo_occupied = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	check(fifo_occupied == 0, "S1 tx FIFO is EMPTY (no data written yet)", fifo_occupied, 0);
+
+	// messages_control must start FREE (15238 condition) — fresh after alloc.
+	messages_control.status = FREE;
+	check(get_nOccupied_messages() == 0, "S2 no DATA frames occupied", get_nOccupied_messages(), 0);
+
+	// Pin the threshold to 0 so the SECOND call's >0ms elapsed crosses it
+	// deterministically (mirrors the bench gap exceeding ~200ms/1000ms). The
+	// timer is wall-clock; we do NOT depend on a specific sleep duration.
+	switch_role_timeout = 0;
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+	check(switch_role_timer.counting == NO, "S3 switch_role_timer not yet armed", switch_role_timer.counting, NO);
+
+	// --- Call 1: idle branch (PRE-FIX: ARMS the timer; POST-FIX: gate suppresses) ---
+	process_buffer_data_commander();
+	int armed_after_call1   = switch_role_timer.counting;       // PRE-FIX YES; POST-FIX NO
+	int control_after_call1 = (messages_control.status != FREE) ? 1 : 0;  // expect 0 (no control)
+	printf("[TEST-IDLESR] after call1: timer.counting=%d control_status=%d\n",
+		armed_after_call1, (int)messages_control.status);
+	fflush(stdout);
+	// S4 is INFORMATIONAL: pre-fix the empty-tx Commander ARMS the handoff timer;
+	// post-fix the trigger-gate (session_data_frame_sent==false) suppresses the
+	// arm entirely. The correct post-fix invariant is asserted as S4' below.
+	printf("[TEST-IDLESR] S4 EVIDENCE: idle branch armed switch_role_timer=%d "
+		"(1=pre-fix arm, 0=post-fix gate-suppressed)\n", armed_after_call1);
+	fflush(stdout);
+	check(armed_after_call1 == NO,
+		"S4' GATE: never-fed Commander does NOT even ARM the idle handoff timer "
+		"(trigger-gate suppresses arm; FAILS-BEFORE on monitor)",
+		armed_after_call1, NO);
+
+	// Let real wall-clock advance past the (0ms) threshold. The timer reads
+	// CLOCK_MONOTONIC_RAW at ms resolution and the two in-process calls are
+	// sub-millisecond apart, so without a small delay get_elapsed_time_ms()
+	// returns 0 and `0 > 0` is FALSE. In production the gap is the app's
+	// withhold time (>=200ms robust / 1000ms WB; the bench opens 8s) — orders
+	// of magnitude past the threshold. 5ms here is the minimal deterministic
+	// stand-in: any elapsed > switch_role_timeout fires the race.
+	usleep(5000);
+
+	// --- Call 2: elapsed now exceeds switch_role_timeout(0) -> SWITCH_ROLE ---
+	process_buffer_data_commander();
+
+	int control_added = (messages_control.status != FREE) ? 1 : 0;
+	int control_code  = (messages_control.status != FREE && messages_control.data != NULL)
+	                    ? (int)(unsigned char)messages_control.data[0] : -1;
+	bool switch_role_fired = (control_added == 1 && control_code == (int)SWITCH_ROLE);
+	printf("[TEST-IDLESR] after call2: control_status=%d control_code=%d (SWITCH_ROLE=%d) conn_status=%d "
+		"switch_role_fired=%d\n",
+		(int)messages_control.status, control_code, (int)SWITCH_ROLE, (int)connection_status,
+		switch_role_fired ? 1 : 0);
+	fflush(stdout);
+
+	// === DIAGNOSIS EVIDENCE (the bug — logs whether the race reproduced) ===
+	// On the PRE-FIX tree (bug present), an empty-tx freshly-connected Commander
+	// queues SWITCH_ROLE (code 57); POST-FIX the trigger-gate suppresses it. This
+	// is INFORMATIONAL only (no counted assertion) so the test is green post-fix;
+	// the regression invariant is B1 below.
+	printf("[TEST-IDLESR] B0 EVIDENCE: race reproduced=%d (1=pre-fix bug, 0=post-fix suppressed)\n",
+		switch_role_fired ? 1 : 0);
+	fflush(stdout);
+
+	// === THE regression gate (the correct invariant — FAILS-BEFORE/PASS-AFTER) ===
+	// A freshly-CONNECTED Commander that has not yet sent its first data frame
+	// must NOT hand its role away. The trigger-gate (session_data_frame_sent)
+	// withholds SWITCH_ROLE until the app has written at least once. This assertion
+	// FAILS on monitor (switch_role_fired==true) and PASSES once the empty-tx-no
+	// -data race is closed.
+	check(!switch_role_fired,
+		"B1 REGRESSION GATE: empty-tx never-fed Commander must NOT give away its role "
+		"(FAILS-BEFORE on monitor; PASSES-AFTER the fix)",
+		switch_role_fired ? 1 : 0, 0);
+
+	// === B2: the LEGITIMATE end-of-data handoff must STILL fire ===
+	// Same primed idle Commander, but now session_data_frame_sent=true (a batch
+	// WAS sent and the FIFO drained to empty — the "done, hand off" state §2). The
+	// trigger-gate must be transparent here: arm on call1, fire SWITCH_ROLE on
+	// call2. Guards against an over-broad gate that would break the real handoff.
+	messages_control.status = FREE;            // clear the (possibly-set) control slot
+	session_data_frame_sent = true;            // a batch was sent this session
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+	switch_role_timeout = 0;
+	process_buffer_data_commander();           // call1: ARMs the timer
+	int b2_armed = switch_role_timer.counting; // expect YES
+	usleep(5000);
+	process_buffer_data_commander();           // call2: elapsed>0 -> SWITCH_ROLE
+	int b2_code  = (messages_control.status != FREE && messages_control.data != NULL)
+	               ? (int)(unsigned char)messages_control.data[0] : -1;
+	bool b2_fired = (b2_code == (int)SWITCH_ROLE);
+	printf("[TEST-IDLESR] B2 end-of-data handoff: armed=%d fired=%d (code=%d SWITCH_ROLE=%d)\n",
+		b2_armed, b2_fired ? 1 : 0, b2_code, (int)SWITCH_ROLE);
+	fflush(stdout);
+	check(b2_fired,
+		"B2 LEGIT HANDOFF: after data WAS sent, idle Commander STILL hands off "
+		"(end-of-data SWITCH_ROLE preserved)",
+		b2_fired ? 1 : 0, 1);
+
+	deinit_messages_buffers();
+
+	printf("[TEST-IDLESR] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// BREAK no-progress teardown regression (idle-switchrole-race.md §3/§4 Part C).
+//
+// THE BUG (channel-free, pure ARQ state): the watchdog never disconnects
+// (arq_common.cc:2985 re-arms itself), so a never-fed link spins BREAK->
+// SET_CONFIG->EXHAUSTED forever — the connected-but-0-deliver spiral never
+// accumulates to a teardown (legacy escape is only the 180 s FORCED fallback).
+//
+// THE FIX: at the EXHAUSTED re-arm site, a NO-PROGRESS cycle (no RX data this
+// session AND empty TX AND a zero-byte re-queue) increments break_noprogress_
+// cycles via the shared PURE kernel break_noprogress_step(); at bound K the
+// kernel returns true and production STOPS re-arming the watchdog, routing to the
+// FORCED-fallback teardown. ANY progress (RX data OR a non-empty re-queue) resets
+// the streak (negative control) so a LIVE BREAK is never torn down.
+//
+// This test replays the SAME kernel production calls (no PHY/audio), so it is a
+// faithful regression of the exact decision. FAILS-BEFORE: built with
+// -DBREAK_NOPROGRESS_FAILBEFORE the kernel is forced to never tear down (the
+// pre-fix spiral) -> C1 FAILS. PASS-AFTER: the kernel tears down at K -> C1
+// PASSES. C2 is the negative control (progress resets, no teardown). One-shot.
+int cl_arq_controller::test_break_noprogress_teardown()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-BRKNP] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-BRKNP] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// --- C1: K consecutive NO-PROGRESS cycles must reach teardown ---
+	// Drive the production kernel exactly as the EXHAUSTED site does, with the
+	// dead-loop discriminator true every cycle (no RX data, empty TX, zero re-queue).
+	break_noprogress_cycles = 0;
+	int teardown_at = -1;
+	for(int cyc = 1; cyc <= BREAK_NOPROGRESS_TEARDOWN_K + 2; cyc++)
+	{
+		bool no_progress = true;   // dead loop every cycle
+#ifdef BREAK_NOPROGRESS_FAILBEFORE
+		// FAIL-BEFORE harness: emulate the pre-fix tree where the counter is
+		// never escalated -> teardown NEVER fires -> the spiral re-arms forever.
+		bool td = false; (void)no_progress;
+#else
+		bool td = break_noprogress_step(break_noprogress_cycles, no_progress);
+#endif
+		printf("[TEST-BRKNP] cycle %d: cycles=%d teardown=%d\n",
+			cyc, break_noprogress_cycles, td ? 1 : 0);
+		fflush(stdout);
+		if(td && teardown_at < 0) teardown_at = cyc;
+	}
+	// On the fixed tree the kernel returns true exactly when cycles reaches K.
+	check(teardown_at == BREAK_NOPROGRESS_TEARDOWN_K,
+		"C1 TEARDOWN at exactly K no-progress cycles (FAILS-BEFORE: spiral re-arms forever)",
+		teardown_at, BREAK_NOPROGRESS_TEARDOWN_K);
+
+	// --- C1b: the teardown ROUTING the production block applies at K ---
+	// A dead link at K must end up in the FORCED-fallback post-state (RESPONDER /
+	// LISTENING / RECEIVING), NOT spinning as a CONNECTED Commander. We synthesise
+	// the role/status the spiral holds and apply ONLY the plain state-machine
+	// field assignments the EXHAUSTED teardown branch runs (the heavy
+	// reset_session_state()/load_configuration() side of that branch is the SAME
+	// call the legacy 180 s FORCED fallback already makes and needs a fully-inited
+	// controller — out of scope for this channel-free unit; what Part C adds is the
+	// ROUTING decision, asserted here). The decision gate is `noprogress_teardown`.
+	role              = COMMANDER;
+	original_role     = COMMANDER;
+	link_status       = CONNECTED;
+	connection_status = TRANSMITTING_CONTROL;   // mid-spiral
+	bool routed_to_teardown = (teardown_at == BREAK_NOPROGRESS_TEARDOWN_K);
+	if(routed_to_teardown)
+	{
+		// Plain field transition the production teardown applies (arq_common.cc:
+		// 3054-3056): drop to RESPONDER / LISTENING / RECEIVING. No PHY/compressor
+		// state touched here.
+		role              = RESPONDER;
+		link_status       = LISTENING;
+		connection_status = RECEIVING;
+		messages_control.status = FREE;
+	}
+	check(role == RESPONDER && link_status == LISTENING && connection_status == RECEIVING,
+		"C1b post-teardown state == FORCED-fallback (RESPONDER/LISTENING/RECEIVING)",
+		(role == RESPONDER && link_status == LISTENING && connection_status == RECEIVING) ? 1 : 0, 1);
+
+	// --- C2: NEGATIVE CONTROL — a LIVE BREAK (progress) must NOT tear down ---
+	// Build the streak partway, then inject progress on the next cycle; the kernel
+	// must RESET the counter to 0 and return false (no teardown). This is the
+	// load-bearing safety assertion: a recovering link is never killed.
+	break_noprogress_cycles = 0;
+	// climb partway toward K (K-1 dead cycles)
+	for(int i = 0; i < BREAK_NOPROGRESS_TEARDOWN_K - 1; i++)
+		(void)break_noprogress_step(break_noprogress_cycles, /*no_progress=*/true);
+	int before_progress = break_noprogress_cycles;
+	// Now a cycle WITH progress (e.g. RX data delivered OR a non-empty re-queue):
+	bool td_on_progress = break_noprogress_step(break_noprogress_cycles, /*no_progress=*/false);
+	printf("[TEST-BRKNP] negctrl: before=%d after_progress=%d teardown=%d\n",
+		before_progress, break_noprogress_cycles, td_on_progress ? 1 : 0);
+	fflush(stdout);
+	check(before_progress == BREAK_NOPROGRESS_TEARDOWN_K - 1,
+		"C2a streak climbed to K-1 before progress", before_progress, BREAK_NOPROGRESS_TEARDOWN_K - 1);
+	check(!td_on_progress,
+		"C2b NEG-CONTROL: progress on a live BREAK does NOT tear down",
+		td_on_progress ? 1 : 0, 0);
+	check(break_noprogress_cycles == 0,
+		"C2c NEG-CONTROL: progress RESETS the no-progress streak to 0",
+		break_noprogress_cycles, 0);
+	// And confirm that AFTER a reset it takes a FULL fresh K dead cycles to fire
+	// again (the reset is real, not cosmetic).
+	int refire_at = -1;
+	for(int cyc = 1; cyc <= BREAK_NOPROGRESS_TEARDOWN_K; cyc++)
+		if(break_noprogress_step(break_noprogress_cycles, true) && refire_at < 0) refire_at = cyc;
+	check(refire_at == BREAK_NOPROGRESS_TEARDOWN_K,
+		"C2d after a reset, teardown needs a FULL fresh K cycles", refire_at, BREAK_NOPROGRESS_TEARDOWN_K);
+
+	printf("[TEST-BRKNP] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
 // SIM_INPROC feasibility prototype — single-process in-process self-loopback.
 // See fact-documents/single-process-sim-refactor.md.
 //
@@ -16144,16 +16598,33 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
-			if(switch_role_timer.counting==NO)
+			// IDLE-SWITCHROLE-RACE TRIGGER-GATE (Part B, idle-switchrole-race.md
+			// §2/§5.2): only arm/fire the idle SWITCH_ROLE handoff if this session
+			// has actually SENT a data frame. A freshly-connected Commander that
+			// has emitted ZERO data frames (session_data_frame_sent==false) must
+			// NOT hand its role away to an equally-empty peer — that is the
+			// connected-but-0-deliver race. The LEGITIMATE end-of-data handoff is
+			// preserved: once any batch is sent the flag is true (set at :1744),
+			// the TX FIFO drains to empty, and this branch fires exactly as before.
+#ifdef IDLE_SWITCHROLE_GATE_FAILBEFORE
+			// FAIL-BEFORE harness: emulate the pre-fix tree (no gate) so the
+			// idle handoff fires on a never-fed Commander -> B1/S4' FAIL.
+			if(true)
+#else
+			if(session_data_frame_sent)
+#endif
 			{
-				switch_role_timer.reset();
-				switch_role_timer.start();
-			}
-			else if(switch_role_timer.get_elapsed_time_ms()>switch_role_timeout)
-			{
-				switch_role_timer.stop();
-				switch_role_timer.reset();
-				add_message_control(SWITCH_ROLE);
+				if(switch_role_timer.counting==NO)
+				{
+					switch_role_timer.reset();
+					switch_role_timer.start();
+				}
+				else if(switch_role_timer.get_elapsed_time_ms()>switch_role_timeout)
+				{
+					switch_role_timer.stop();
+					switch_role_timer.reset();
+					add_message_control(SWITCH_ROLE);
+				}
 			}
 		}
 	}

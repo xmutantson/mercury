@@ -82,6 +82,10 @@ cl_telecom_system::cl_telecom_system()
 	// on BOTH peers (the R-B pin), and the live TX/RX paths (bigblock_send_one_block /
 	// bigblock_receive_carve) engage at the CFG16 OFDM rung. Default unset = stock OFF =
 	// byte-identical per-frame path. Not wired into the gearshift (that is P4).
+	// HELD 2026-06-17: cannot be a simple default-flip — the big-block path is NOT wired
+	// into the gearshift/optimizer (no climb can reach it) and the whole family is gated
+	// behind the unresolved CFG16-acquisition D1->D5 chain (CLAUDE.md STOP-gate). Needs
+	// gearshift wiring + the CFG16-acq fix before it can ship. Keep default-off.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_FRAMING");
 	  if(e && *e && atoi(e) != 0) bigblock_framing_enabled = true; }
 	receive_stats.iterations_done=-1;
@@ -3022,6 +3026,9 @@ skip_h_retry_point:
 
 			auto t4_ldpc = std::chrono::steady_clock::now();
 			// Turbo-EQ (RESEARCH_turbo-eq.md §4.1/§4.2). MERCURY_TURBO_ITERS (default 1
+			// unproven, default-off pending proof 2026-06-17: measured a sim NON-BEAT
+			// standalone (neither headline cell crosses the per-frame LDPC threshold; root
+			// blocker = cold-start), no HW net-win. Keep default-off until proven.
 			// = OFF, byte-identical) caps the iterative decision-directed CE loop. When
 			// >1 AND this is an OFDM (non-MFSK) frame, capture the LDPC a-posteriori LLR
 			// so the post-decode turbo refinement (the CRC-fail block below) can soft-
@@ -6096,16 +6103,39 @@ void cl_telecom_system::sfo_block_test()
 
 		if(bigblock)
 		{
-			// Place the WHOLE contiguous drifted block once (frame 0), anchored so
-			// the head preamble lands at symbol (full_pre+2) like the standard path.
-			// Subsequent frames are NOT re-placed/re-acquired: we decode each frame
-			// from the SAME window at the head-anchored NOMINAL stride.
+			// HELD-PATH RING-RELATIVE RE-SLIDE (harness-hygiene fix).
+			// The RX decode window (passband_delayed_data) is hard-capped at
+			// `buf_interp` by the production frame-completeness gate
+			// (telecom_system.cc:1745) and bounds gate (:1766); for WB CFG15/16
+			// `buf_interp` only spans ~6-9 frames. A 60-frame test block does NOT
+			// fit, so we CANNOT lay the whole block down once and march
+			// ofdm_forced_delay forward (the old code did exactly that — frame 0
+			// copied only `buf_interp-lead` samples and f>0 read ZEROS past frame
+			// ~9, manufacturing an SFO-INDEPENDENT decode cliff that was a buffer
+			// artifact, not a timing wall).
+			//
+			// Fix: keep ONE acquisition on the head (frame 0) but RE-SLIDE the
+			// STORAGE every frame — copy the CURRENT frame's drifted samples into
+			// the SAME head-anchored window each iteration — WITHOUT re-acquiring
+			// timing. The extraction delay stays PINNED at the head lock
+			// (head_delay_interp); no Schmidl-Cox after frame 0. Faithfulness: the
+			// whole block was SFO-drifted in place above, so frame f's true preamble
+			// sits at frame_off[f]+creep(f) in tx_block; copying the window from the
+			// NOMINAL offset frame_off[f] into the buffer leaves the preamble
+			// creep(f) samples off the pinned head delay. That growing in-window
+			// misalignment is exactly the held-path drift the per-frame pilot
+			// estimate + equalizer must absorb (HOLD) or fail (NO-GO). At SFO=0 the
+			// nominal offset is exact, so every frame is real signal at the pinned
+			// delay -> the cliff is gone (~all decode), proving it was the buffer.
 			if(f == 0)
 			{
 				for(int i = 0; i < buf_interp; i++) data_container.passband_delayed_data[i] = 0.0;
-				int copy_n = (int)(block_len);
-				if(lead + copy_n > buf_interp) copy_n = buf_interp - lead;
-				for(int i = 0; i < copy_n; i++)
+				// Frame 0 window: nominal offset frame_off[0]==0; copy a frame +
+				// slack (bounded by the block and the buffer), same span the per-
+				// frame path below uses.
+				int copy_n = win_frame_max;
+				if((long)copy_n > block_len) copy_n = (int)block_len;
+				for(int i = 0; i < copy_n && (lead + i) < buf_interp; i++)
 				{
 					double s = tx_block[(size_t)i];
 					if(!clean && sigma > 0.0)
@@ -6121,18 +6151,33 @@ void cl_telecom_system::sfo_block_test()
 			}
 			else
 			{
-				// NO re-acquisition: decode this frame at the head-anchored nominal
-				// position. The block was TX'd as equal-length FULL frames, so the
-				// nominal stride is `full_frame` interp-samples. The SFO has drifted
-				// the real content by ~ppm*cumulative_samples; the receiver, having
-				// only the head lock, does NOT know this drift -> the window is
-				// progressively misaligned across the tail (the big-block timing
-				// wall, if any).
-				ofdm_forced_delay = head_delay_interp + (long)f * (long)full_frame;
+				// RE-SLIDE the storage so this frame's window is always in-buffer,
+				// then decode at the PINNED head lock (NO re-acquisition). The copy
+				// destination is the head-anchored `lead`; the source is the NOMINAL
+				// TX offset frame_off[f] (== f*full_frame for the FULL arm). Any
+				// SFO creep already in tx_block displaces the preamble within the
+				// window relative to the pinned head delay -> the held-path drift.
+				for(int i = 0; i < buf_interp; i++) data_container.passband_delayed_data[i] = 0.0;
+				long  src = frame_off[f];
 				// NEGATIVE CONTROL: inject a cumulative per-frame misalignment that
 				// no per-frame pilot estimate can absorb (proves the harness bites).
-				if(notrack_ctrl)
-					ofdm_forced_delay += (long)f * (long)notrack_skew;
+				// In the re-slide model the storage moves with the copy, so we skew
+				// the copy DESTINATION (push the frame's content `f*skew` samples off
+				// the pinned head delay) — equivalent to the old extraction-delay
+				// skew, but now it survives because the data is actually present.
+				int   dest = lead;
+				if(notrack_ctrl) dest += (int)((long)f * (long)notrack_skew);
+				int copy_n = win_frame_max;
+				if(src + copy_n > block_len) copy_n = (int)(block_len - src);
+				for(int i = 0; i < copy_n && (dest + i) < buf_interp && (dest + i) >= 0; i++)
+				{
+					double s = tx_block[(size_t)src + i];
+					if(!clean && sigma > 0.0)
+						s += (double)((sigma / sqrtf(2.0f)) * awgn_channel.awgn_value_generator());
+					data_container.passband_delayed_data[dest + i] = s;
+				}
+				// PINNED head lock — held timing, no Schmidl-Cox re-acquire.
+				ofdm_forced_delay = head_delay_interp;
 				mfsk_fixed_delay  = -1;
 				st = this->receive_byte(data_container.passband_delayed_data,
 				                        data_container.hd_decoded_data_byte);
@@ -6197,9 +6242,9 @@ void cl_telecom_system::sfo_block_test()
 		{
 			std::cout << "[SFO-BLOCK] frame=" << f
 			          << " pre=" << frame_pre[f]
-			          << (bigblock ? " nominal_off=" : " expect_off=")
-			          << (bigblock ? (head_delay_interp + (long)f * (long)full_frame) : (long)lead)
-			          << (bigblock ? "(no-reacq)" : "(+drift)")
+			          << (bigblock ? " pinned_off=" : " expect_off=")
+			          << (bigblock ? head_delay_interp : (long)lead)
+			          << (bigblock ? "(reslide,no-reacq)" : "(+drift)")
 			          << " det=" << det
 			          << " metric=" << metric
 			          << " decoded=" << (st.message_decoded == YES ? 1 : 0)
@@ -6609,6 +6654,9 @@ void cl_telecom_system::sfo_grid_test()
 	double ppm     = env_f("MERCURY_SIM2_SFO_PPM", 0.0);
 	bool   track   = (env_i("MERCURY_SFO_GRID_TRACK", 0) != 0);     // STEP 2: CPE/PEG corrector
 	bool   no_interp = (env_i("MERCURY_SFO_GRID_NOINTERP", 0) != 0);// negative control
+	// HELD 2026-06-17: cannot be a simple default-flip — sim-harness-scoped, CHANNEL-GATED
+	// (REGRESSES ~2 dB on clean), and the production FADE-tier estimator-selector wiring is
+	// the unlanded follow-on (HW confirm pending). Keep default-off.
 	// TURBO_EQ_VERDICT.md §5 TINTERP-SEED: MERCURY_SFO_GRID_TURBO_SEED=tinterp drives
 	// the WHOLE recommended stack — it=0 INIT estimate = TINTERP (the warm faded seed)
 	// AND data_aided_channel_estimator keeps that TINTERP H as the low-confidence FLOOR
@@ -8091,6 +8139,8 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	// the stock RX relies on. The big-block preamble matched-filter reference is updated to
 	// match (bigblock_preamble_mf_snap, this file) since pre-eq reshapes the preamble too.
 	bool apply_preeq = (M != MOD_MFSK && pre_equalization_channel != NULL);
+	// QUARANTINED 2026-06-17: MERCURY_BIGBLOCK_NOPREEQ=1 DISABLES big-block pre-eq
+	// (an A/B escape hatch that turns off the fix); pre-eq is the default. do-not-enable.
 	{ const char* e=std::getenv("MERCURY_BIGBLOCK_NOPREEQ"); if(e && atoi(e)!=0) apply_preeq=false; }
 	if(apply_preeq)
 	{
@@ -9818,6 +9868,8 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	// before any rebuild/restore can move the data_container allocation, and run the whole
 	// decode (normalize + bigblock_rx_passband) against the snapshot. nSamples doubles are
 	// in-bounds here (data is sized Nofdm*buffer_Nsymb*interp at the live config, == nSamples).
+	// QUARANTINED 2026-06-17: MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1 re-enables a use-after-free
+	// (memory-safety defect); test-only fail-before hook, the snapshot is the fix. do-not-enable.
 	// REPRODUCER HOOK (bigblock-whiten-align): MERCURY_BIGBLOCK_DEFEAT_FIX_UAF=1 SKIPS this
 	// snapshot (restores the pre-fix dangling-`data` use-after-free) for the standalone UAF
 	// fail-before demo. The full-path regression (test_sim_inproc_bigblock_fullpath) does
@@ -10398,6 +10450,10 @@ void cl_telecom_system::load_configuration(int configuration)
 	// The estimator carries the cross-pilot AWGN nv-floor so every shared-state
 	// consumer is safe — see data-flow-noise_variance_estimate.md.
 	{
+		// HELD 2026-06-17: cannot be a global default-flip — TIME_INTERP is CHANNEL-GATED
+		// (sim-proven to beat VARA on GOOD/MOD fades but REGRESSES on clean). No production
+		// fade-tier SELECTOR is wired, so flipping it globally would fire on clean and
+		// regress. Ship requires the fade-tier selector + IONOS faithful-fade HW confirm.
 		const char* _ft = std::getenv("MERCURY_FADE_TINTERP");
 		if(_ft && atoi(_ft) != 0 && ofdm.channel_estimator == LEAST_SQUARE)
 		{

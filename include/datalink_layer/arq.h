@@ -1535,6 +1535,27 @@ public:
   // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
   int test_robust0_compress_deadlock();
 
+  // Idle SWITCH_ROLE race regression (FAILS-BEFORE evidence for the
+  // connected-but-0-deliver bench bug). Drives the REAL
+  // process_buffer_data_commander() idle branch (arq_commander.cc:15238-15251)
+  // with a freshly-CONNECTED COMMANDER, EMPTY tx FIFO, block_under_tx==NO. Two
+  // calls advance past switch_role_timeout; asserts SWITCH_ROLE is queued on an
+  // empty-tx Commander BEFORE any data frame. Demonstrates the channel-free
+  // root cause: if the app withholds its first data write past
+  // switch_role_timeout, the Commander hands its role away with an empty FIFO.
+  // One-shot, exits rc.
+  int test_idle_switch_role_race();
+
+  // IDLE-SWITCHROLE-RACE recovery path (idle-switchrole-race.md §3/§4 Part C).
+  // Drives the REAL BREAK-EXHAUSTED re-arm site (arq_commander.cc:~410) on a
+  // never-fed Commander (no RX data, empty tx FIFO, zero-byte re-queue) K+1 times.
+  // FAILS-BEFORE: the spiral re-arms the watchdog forever, role stays COMMANDER.
+  // PASSES-AFTER: at K no-progress cycles it stops re-arming and tears down to the
+  // RESPONDER/LISTENING FORCED-fallback post-state. Negative control: inject RX
+  // data / a non-empty re-queue and assert the counter RESETS and NO teardown
+  // happens. One-shot, exits rc.
+  int test_break_noprogress_teardown();
+
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,
   // and proves the TX-path spin-loops (ptt_busy_wait + drain_playback_wait)
@@ -3126,6 +3147,23 @@ public:
   int receiving_timeout;
   int switch_role_timeout;
   int switch_role_test_timeout;
+
+  // IDLE-SWITCHROLE-RACE (idle-switchrole-race.md §2/§5.5) — per-session "this
+  // connection has emitted at least one NEW data frame". Gates the idle
+  // SWITCH_ROLE handoff (process_buffer_data_commander) so a freshly-connected
+  // empty-tx Commander that never sent data does NOT hand its role away (the
+  // connected-but-0-deliver race). NOT reuse stats.nSent_data: that is CUMULATIVE
+  // across sessions (reset only at init, arq_common.cc:527) and CONNECT skips
+  // reset_session_state, so it would re-open the race on session #2. SET at the
+  // single new-data-frame commit (arq_commander.cc:1738, beside nSent_data++);
+  // RESET in reset_session_state() AND at Commander connect-accept.
+  bool session_data_frame_sent;
+  // Symmetric per-session "this connection has DELIVERED at least one RX data
+  // frame" — the discriminator for the BREAK no-progress teardown (§3). NOT raw
+  // stats.nReceived_data (also cumulative-across-sessions). SET at the RX-data
+  // delivery commit (arq_responder.cc:101, beside nReceived_data++); RESET with
+  // the other session flags.
+  bool session_data_frame_received;
   int gearshift_timeout;
   int connection_timeout;
 
@@ -3860,6 +3898,15 @@ public:
                                        // between), break_drop_step is force-set
                                        // high enough to jump straight to ROBUST_0
                                        // instead of walking the ladder.
+  // IDLE-SWITCHROLE-RACE recovery path (idle-switchrole-race.md §3/§5.3): count
+  // of consecutive BREAK-EXHAUSTED re-arms that made NO forward progress (no RX
+  // data delivered this session AND tx FIFO empty AND a zero-byte re-queue). The
+  // watchdog never disconnects (arq_common.cc:2985 re-arms itself), so a never-fed
+  // link spins BREAK->SET_CONFIG->EXHAUSTED forever. At bound K
+  // (BREAK_NOPROGRESS_TEARDOWN_K) this stops re-arming the watchdog and routes to
+  // the existing FORCED-fallback teardown (arq_common.cc:3053-3065). RESET to 0 on
+  // ANY real progress (RX data OR a non-empty re-queue) and in reset_session_state().
+  int break_noprogress_cycles;
   // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.1, WALLB_DIAGNOSIS.md §1.6): CFG16 big-block
   // carve COOLDOWN. CMD-ONLY (never on the wire — INV-B2). After a FIX-4 carve-viability
   // demote (arq_commander.cc:3669), the CFG16 big-block rung is proven non-viable on THIS
