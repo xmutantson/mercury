@@ -341,3 +341,83 @@ helper in a steady loop and count throwaway PHY probes via `inband_floor_probe_c
   == fresh probe), F1 (bank still builds).
 Both arms in one binary; `./mercury.exe --test` green; legacy byte-identical
 (inband-gated; default-off render md5 unchanged).
+
+## §10. FIX #5 — ROBUST-TIER lost-tag follow (the OFDM-only gate generalization)
+
+### §10.0 The bug (faithful realtime sim, MEASURED — `_fixrun/fb.*`)
+Redesign-on (`MERCURY_INBAND_RATE=1`), faithful realtime relay (`MERCURY_SIM_REALTIME=1`,
+FTRT 1.03× = wall≈airtime), WGN:18, start ROBUST_0, 12 KB target → **15 bytes delivered,
+stuck at ROBUST_0, then a true-loss BREAK**. Legacy (inband-off) delivers ~4259 B on the
+same channel. Root cause (clean single root): the RX config-tag-follow recovery is
+**OFDM-only**. The rate-adapt legitimately probes **ROBUST_0 → ROBUST_1** on the degraded
+channel (`is_ofdm_config(ROBUST_*)==false`, common_defines.h:125-130/186-191:
+ROBUST_0/1/2 = FULL_CONFIG_LADDER idx 0/1/2). Measured trajectory (`_fixrun/fb.modem.log`):
+- CMD `[INBAND-TX] CONFIG_TAG passband emit cfg=101 (ladder_idx=1)` × **3** (the up-probe).
+- RSP `CONFIG_TAG follow` count = **0** — the RX never follows.
+- RSP `[RX-TIMEOUT] No frames decoded. cfg=100` × **10** (~60 s stuck at ROBUST_0).
+- CMD `[INBAND-LIVENESS] … firing the retained true-loss BREAK (#1/3)`.
+
+Why neither recovery fires at robust:
+1. The **W2 adopt-follow** (arq_responder.cc:974, inside `[RSP-V2-ADOPT]`) only runs after a
+   SUCCESSFUL DATA decode — impossible across the ROBUST_0/ROBUST_1 MFSK PHY mismatch.
+2. The **Stage-4 OFDM down-ladder** (arq_responder.cc:588-596) is GATED
+   `is_ofdm_config(current_configuration)` (FALSE at robust). Even if ungated, its
+   `inband_down_ladder_resync` searches the window `FULL_CONFIG_LADDER[lo..hi=cur_idx]`
+   **DOWNWARD** (arq_common.cc:3967-3981) — it structurally cannot reach the UP-probe
+   target idx 1 from cur idx 0.
+The liveness BREAK is downstream fallout, not a 2nd root.
+
+### §10.1 The fix (arq_responder.cc:576-622, the block ADDED before the OFDM down-ladder)
+Add a robust-tier sibling to the OFDM down-ladder, gated on the **complement**
+`!is_ofdm_config(current_configuration)` (all other firing terms identical: feature-on,
+CONNECTED+RECEIVING, !passive_monitor, fresh-window, `messages_rx_buffer.status!=RECEIVED`,
+`rsp_current_expected_batch_seq_id>=0`). It calls the SHARED direction-agnostic real-tag
+follow `inband_detect_follow_from_capture(0xFF,0xFF,&fc)` (arq_common.cc:3434), which:
+- sizes a capture-tail snapshot from the **current robust PHY geometry** and reads the live
+  ring tail under `capture_prep_mutex` (arq_common.cc:3468-3482) — this IS the robust-ring
+  snapshot. The **robust-ring floor seat** (arq_responder.cc:567-574 →
+  `inband_seat_robust_ring_floor`) guarantees the ring physically holds a full robust frame
+  whose tail carries the tag (`emit_config_tag_passband` fires for ROBUST_0/1 — the tag rides
+  the M=16 robust suffix, arq_common.cc:2803-2805);
+- runs `detect_and_follow_config_tag` → `FULL_CONFIG_LADDER[r.cfg_index]`, which follows
+  **UP or DOWN** (arq_common.cc:3008-3056), recovering the ROBUST_0→ROBUST_1 up-probe;
+- on a CRC/LDPC-bound follow runs the HINGE via `inband_adopt_resynced_config`; the caller
+  re-arms the receiving timer. No tag in the tail (steady state / silence) → cheap false,
+  no action, no streak tick, no BREAK.
+The OFDM down-ladder `if` block is left **byte-identical** (still `is_ofdm_config && …`).
+
+### §10.2 Producers / Consumers (CLAUDE.md §5)
+- **Producer**: CMD CONFIG_TAG (`emit_config_tag_passband`, arq_common.cc:2796; tagged from
+  `inband_route_failure_demote`/`inband_unilateral_config_change`). May tag ANY ladder config
+  INCLUDING robust (ladder_idx 0..31, no OFDM gate) — VERIFIED on the wire (cfg=100 ×2,
+  cfg=101 ×3 in `_fixrun/fb.modem.log`).
+- **Consumer (changed)**: the RX lost-tag recovery. BEFORE: only the OFDM down-ladder, gated
+  off at robust → robust tags unfollowable. AFTER: robust tags are followed via the real-tag
+  path; OFDM tags continue via the down-ladder (unchanged).
+- **Robust-ring snapshot geometry**: `inband_detect_follow_from_capture` reads the SAME ring
+  the production tag-decode (`decode_config_tag_from_passband`) and the OFDM follow read; the
+  tail length is computed from `data_container.Nofdm/interpolation_rate/buffer_Nsymb` at the
+  CURRENT (robust) config — correct for a robust resync. The floor-seat (§8 FIX #4 instance #1)
+  keeps `buffer_Nsymb_min` ≥ the robust floor so the tail is never truncated.
+
+### §10.3 Invariants the fix changes (consumers re-checked)
+- **INV-OFDM-FOLLOW (preserved)**: the OFDM down-ladder block is unchanged (separate `if`,
+  `is_ofdm_config` retained). The two robust/OFDM blocks are mutually exclusive on
+  `is_ofdm_config(current_configuration)` → never both fire in one pass → no double-adopt.
+- **INV-ADOPT (preserved)**: the `[RSP-V2-ADOPT]` adopt-path follow (:906/:974) is untouched;
+  it still gates on `rsp_current_expected_batch_seq_id < 0` and a successful DATA frame. The
+  robust follow runs the SAME `inband_adopt_resynced_config` HINGE (capture-flush + D3.1
+  re-baseline back to bsi=-1) so the next robust frame re-adopts through the gap-gate exactly
+  as the OFDM follow does — no divergence.
+- **INV-NO-BLIND-GUESS (preserved)**: the robust follow adopts ONLY on a CRC-12 + cfg_index
+  corroborated tag (FAR ~1e-8); a silent / no-tag tail self-rejects. Unlike the OFDM blind
+  down-ladder it does not even attempt a speculative decode, so it cannot tick the
+  terminal-BREAK streak — the robust path is strictly less aggressive (follow-only).
+
+### §10.4 Evidence (faithful realtime sim, WGN:18, 12 KB, inband-on)
+- FAIL-BEFORE (HEAD 61e5eaa, `_fixrun/fb.*`): rx=**15 B**, final ROBUST_0, RSP follow=0,
+  10× RX-TIMEOUT, INBAND-LIVENESS BREAK, md5_match=false.
+- PASS-AFTER (`_fixrun/pa.*`): see commit message / §10.4 below — the RX follows cfg=101,
+  delivers e2e comparable to legacy, no ~60 s stall, no liveness BREAK.
+- Default-off (`MERCURY_INBAND_RATE` unset): the whole block is feature-gated → legacy
+  byte-identical.

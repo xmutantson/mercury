@@ -573,6 +573,60 @@ void cl_arq_controller::process_messages_rx_data_control()
 			inband_seat_robust_ring_floor();
 		}
 
+		// ─── STAGE 4 RANK-2: ROBUST-TIER LOST-TAG FOLLOW (data-flow-inband-downladder.md §10) ───
+		// The OFDM down-ladder below is GATED is_ofdm_config(current_configuration) (the
+		// blind DATA-frame down-window only makes sense when the RX is at an OFDM rung).
+		// But the rate-adapt legitimately operates in the ROBUST tier on a degraded channel
+		// (WGN:18: the CMD probes ROBUST_0 -> ROBUST_1 via the CONFIG_TAG). When the RX is
+		// parked at ROBUST_0 (is_ofdm_config==false) and the CMD has moved to ROBUST_1, the
+		// W2 adopt-follow (:974) cannot fire (no DATA frame decodes across the ROBUST_0/
+		// ROBUST_1 MFSK PHY mismatch) AND the OFDM down-ladder is gated off -> the RX stays at
+		// ROBUST_0, logs `[RX-TIMEOUT] No frames decoded` for ~60s, INBAND-LIVENESS arms and
+		// fires a true-loss BREAK (measured: _fixrun/fb — CMD emits CONFIG_TAG cfg=101 x3, RSP
+		// follow count 0, 10x RX-TIMEOUT cfg=100, 15 bytes delivered then BREAK).
+		//
+		// RECOVERY (the on-design counterpart of the OFDM down-ladder): run the SHARED
+		// direction-agnostic real-tag follow inband_detect_follow_from_capture, which reads the
+		// ACTUAL CONFIG_TAG burst from the captured robust frame tail (the tag rides the M=16
+		// robust suffix — emit_config_tag_passband fires for ROBUST_0/ROBUST_1 too) and follows
+		// it UP or DOWN via detect_and_follow_config_tag -> FULL_CONFIG_LADDER[cfg_index]. This
+		// is the correct mechanism for the robust tier because the up-probe (ROBUST_0->ROBUST_1)
+		// is an UPWARD move the downward-only inband_down_ladder_resync structurally cannot
+		// recover. The robust-ring floor seat at :567-574 guarantees the live ring physically
+		// holds a full robust frame, so inband_detect_follow_from_capture's tail snapshot (sized
+		// from the current robust PHY geometry, read under capture_prep_mutex) holds the tag.
+		// On a real CRC/LDPC-bound follow the HINGE re-baselines the window and the next pass
+		// acquires ROBUST_1 + delivers. No tag present in the tail (steady state / genuine
+		// silence) -> a cheap false, no action, no BREAK. Feature-gated -> legacy byte-identical.
+		if(inband_rate_feature_enabled()
+		   && link_status == CONNECTED
+		   && connection_status == RECEIVING
+		   && !passive_monitor
+		   && (rx_fresh_window_decoded_this_pass
+		       || inband_freshwin_gate_defeat())
+		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
+		   && !is_ofdm_config(current_configuration)          // ROBUST tier (the OFDM gate's complement)
+		   && rsp_current_expected_batch_seq_id >= 0)         // IN-FLIGHT active batch only
+		{
+			// bsi binding 0xFF: across a possibly-lost robust tag the RX does not track the
+			// TX bsi (mirrors the Stage-4 OFDM resync, arq_common.cc:4275). The FWHT peak +
+			// GF(16)+CRC-12 + cfg_index corroboration are the accept gates. expect_parity=0xFF.
+			int rb_fc = current_configuration;
+			int rb_fol = inband_detect_follow_from_capture(
+				/*expect_bsi_lsb=*/0xFF, /*expect_parity=*/0xFF, &rb_fc);
+			if(rb_fol == 1)
+			{
+				printf("[INBAND-RX] ROBUST-TIER tag-follow to CONFIG_%d (was robust); "
+					"BREAK avoided (real CONFIG_TAG, not a blind guess)\n", rb_fc);
+				fflush(stdout);
+				// A successful follow re-arms the receiving window for the new config and
+				// resets the DECODE_FAIL NACK throttle (inband_adopt_resynced_config already
+				// re-armed the throttle); re-arm the receiving timer so the loop keeps pumping.
+				calculate_receiving_timeout();
+				receiving_timer.start();
+			}
+		}
+
 		// ─── STAGE 4: LOST-TAG BOUNDED DOWN-LADDER (design §4 / §7) ───
 		// The §3.2 outcome-3 recovery. receive() above (:433) returned with NO decoded
 		// DATA frame at current_configuration AND no CRC-valid CONFIG_TAG followed (the
