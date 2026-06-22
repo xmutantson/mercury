@@ -529,6 +529,8 @@ cl_arq_controller::cl_arq_controller()
 	// Commander connect-accept (CONNECT skips reset_session_state).
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
+	// CONNECT-REACK (connect-testack-handshake.md §3): init the ACK cache empty.
+	connect_ack_cache.valid = false;
 	break_noprogress_cycles = 0;
 	stats.nSent_data=0;
 	stats.nAcked_data=0;
@@ -4045,6 +4047,9 @@ void cl_arq_controller::reset_session_state()
 	// reset_session_state, arq_common.cc:801.)
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
+	// CONNECT-REACK (connect-testack-handshake.md §3/§4.3): clear the cached
+	// TEST_CONNECTION_ACK so a new session never replays a stale ACK.
+	connect_ack_cache.valid = false;
 	block_under_tx = NO;
 	consecutive_data_acks = 0;
 	success_rate_data_clean = 100.0;  // CLEAN-BATCH VIABILITY (§9) — neutral per session
