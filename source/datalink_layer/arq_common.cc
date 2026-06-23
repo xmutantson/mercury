@@ -3146,6 +3146,35 @@ bool cl_arq_controller::inband_unilateral_config_change(int target_cfg)
 	return true;
 }
 
+// HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §2). PURE predicate
+// (no side effects). The in-band unilateral CONFIG_TAG is the wrong transport for a
+// robust<->OFDM tier crossing: it serializes each rung's confirm behind the slow
+// data-SACK turnaround (~12.4s/rung), so the robust->OFDM cross slips past the budget
+// (VERIFIED: capped at ROBUST_2/53B vs legacy CONFIG_4/101B). The legacy SET_CONFIG
+// control handshake has a FAST DEDICATED ACK (decoupled from the data-SACK), crossing
+// ~3s earlier. Returns true when target_cfg is a VALID target on the OTHER tier from
+// current_configuration (is_robust_config differs) -> route via legacy SET_CONFIG.
+// Returns false for an INTRA-tier change (both robust, or both OFDM) -> keep the in-band
+// tag (where it works), and false for CONFIG_NONE (never a crossing). Off-feature, the
+// chokepoint never reaches here, so this need not gate on inband_rate_feature_enabled().
+bool cl_arq_controller::inband_config_change_is_tier_crossing(int target_cfg)
+{
+#ifdef INBAND_TIER_CROSSING_FAILBEFORE
+	// FAIL-BEFORE arm (the pre-hybrid redesign): EVERY in-band change took the
+	// unilateral CONFIG_TAG, including a robust<->OFDM crossing -> the cross
+	// serialized behind the data-SACK and slipped the budget. Pinning the predicate
+	// to "never a crossing" reproduces that (the chokepoint then routes the crossing
+	// through the slow in-band tag). The directed test asserts a crossing is NOT
+	// routed to SET_CONFIG here = the failing-before behavior.
+	(void)target_cfg;
+	return false;
+#else
+	if(target_cfg == CONFIG_NONE)
+		return false;
+	return is_robust_config(current_configuration) != is_robust_config(target_cfg);
+#endif
+}
+
 // ============================================================================
 // In-band rate adaptation — STAGE 4d: D1 repeat-until-followed + D4 climb/auto-demote
 // (inband-reliability-design.md §1 / §4)

@@ -836,7 +836,40 @@ int cl_arq_controller::add_message_control(char code)
 				int inband_target = (gear_shift_algorithm==SNR_BASED)
 					? get_configuration(measurements.SNR_downlink)
 					: negotiated_configuration;
-				if(inband_unilateral_config_change(inband_target))
+				// HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §2):
+				// the in-band unilateral CONFIG_TAG is the wrong transport for a
+				// robust<->OFDM TIER CROSSING. The tag serializes each rung's confirm
+				// behind the slow data-SACK turnaround (~12.4s/rung), so the
+				// robust->OFDM cross slips past the test budget (VERIFIED: redesign
+				// capped at ROBUST_2/53B vs legacy CONFIG_4/101B). Legacy's SET_CONFIG
+				// control handshake has a FAST DEDICATED ACK (decoupled from the
+				// data-SACK), crossing ~3s earlier. So: when the change CROSSES the
+				// tier boundary in EITHER direction (is_robust_config differs between
+				// the live config and the target), FALL THROUGH to the legacy SET_CONFIG
+				// builder (the proven fast cross). For INTRA-tier rate adapts (both
+				// robust, or both OFDM 0-16) keep the in-band tag (it works there, and
+				// the D1/D4/down-ladder/A3 machinery is all intra-tier). Strictly
+				// scoped to inband_rate_feature_enabled() -> flag-off byte-identical.
+				// A no-op/invalid target (same config, off-ladder) is NOT a crossing
+				// (inband_unilateral_config_change rejects it) and falls through too.
+				// The predicate is factored into inband_config_change_is_tier_crossing
+				// so the directed regression drives the EXACT production decision.
+				bool tier_crossing = inband_config_change_is_tier_crossing(inband_target);
+				if(tier_crossing)
+				{
+					printf("[INBAND-TX] TIER-CROSSING %d -> %d (robust<->OFDM): routing "
+						"via legacy SET_CONFIG control handshake (fast dedicated ACK), "
+						"NOT the in-band tag (which serializes behind the data-SACK)\n",
+						current_configuration, inband_target);
+					fflush(stdout);
+					// Fall through to the legacy SET_CONFIG builder below. Mirror the
+					// SUCCESS_BASED_LADDER target the builder expects: the producers
+					// already set negotiated_configuration (LADDER) or the builder
+					// recomputes get_configuration(SNR) (SNR_BASED) — either way the
+					// builder's forward_configuration matches inband_target, so no
+					// member needs adjusting here.
+				}
+				else if(inband_unilateral_config_change(inband_target))
 				{
 					// Unilateral path took it: NO control frame on the wire.
 					messages_control.status = FREE;
@@ -845,8 +878,9 @@ int cl_arq_controller::add_message_control(char code)
 					success = SUCCESSFUL;
 					return success;
 				}
-				// No-op drop (same config / invalid target): fall through to the legacy
-				// builder so behaviour matches the flag-off path for that degenerate case.
+				// No-op drop (same config / invalid target) OR tier-crossing: fall
+				// through to the legacy builder so behaviour matches the flag-off path
+				// for the crossing (fast SET_CONFIG ACK) and the degenerate case.
 			}
 
 			messages_control.data[0]=code;
@@ -9163,6 +9197,95 @@ int cl_arq_controller::test_a3_decouple_safety()
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed,
 		failed==0 ? "GREEN (demote-decouple SAFE TO ATTEMPT)"
 		          : "RED (do NOT proceed to demote-decouple)");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// HYBRID TIER-CROSSING ROUTING regression (data-flow-inband-tier-crossing.md §3).
+// The chokepoint add_message_control(SET_CONFIG) routing decision: a robust<->OFDM
+// TIER CROSSING must route via the legacy SET_CONFIG control handshake (fast dedicated
+// ACK), while an INTRA-tier rate adapt keeps the in-band unilateral CONFIG_TAG. This
+// drives the EXACT production predicate (inband_config_change_is_tier_crossing — the
+// same call the chokepoint makes) across the full target matrix. PURE in-process
+// synthetic-fire: no telecom_system, no PHY/audio, no IONOS/RF — a permanent gate.
+//
+// FAIL-BEFORE (-DINBAND_TIER_CROSSING_FAILBEFORE): the predicate is pinned to "never a
+// crossing" (the pre-hybrid redesign routed EVERY change through the in-band tag,
+// including the robust->OFDM cross that then slipped the budget at ROBUST_2/53B). Under
+// that macro the CROSSING assertions below FLIP (the crossing is NOT routed to
+// SET_CONFIG) -> the test fails-before. PASSES-AFTER with the hybrid predicate live.
+int cl_arq_controller::test_inband_tier_crossing_routing()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-TIER-CROSS] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-TIER-CROSS] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+#ifdef INBAND_TIER_CROSSING_FAILBEFORE
+	const bool hybrid_live = false;
+#else
+	const bool hybrid_live = true;
+#endif
+	printf("[TEST-TIER-CROSS] hybrid tier-crossing routing = %s\n",
+		hybrid_live ? "LIVE" : "FAIL-BEFORE(all in-band tag)");
+	fflush(stdout);
+
+	int saved_cfg = current_configuration;
+
+	// A pure predicate: cross == is_robust differs. The chokepoint routes a true here to
+	// the legacy SET_CONFIG builder, a false to inband_unilateral_config_change (the tag).
+	auto routes_to_set_config = [&](int from, int to) -> bool {
+		current_configuration = from;
+		return inband_config_change_is_tier_crossing(to);
+	};
+
+	// ── CROSSINGS (the PRODUCTION-CORRECT expectation: MUST route to SET_CONFIG) ──
+	// These assert == true UNCONDITIONALLY. Under -DINBAND_TIER_CROSSING_FAILBEFORE the
+	// predicate returns false (pre-hybrid: all in-band tag), so these FLIP to FAIL = the
+	// genuine fails-before. With the hybrid live they return true = passes-after.
+	// The load-bearing case: the redesign's robust->OFDM CLIMB (ROBUST_0 -> CONFIG_0).
+	check(routes_to_set_config(ROBUST_0, CONFIG_0) == true,
+		"robust->OFDM climb (ROBUST_0->CONFIG_0) routes to SET_CONFIG",
+		routes_to_set_config(ROBUST_0, CONFIG_0) ? 1 : 0, 1);
+	// The reverse crossing: an OFDM->robust demote (CONFIG_4 -> ROBUST_0).
+	check(routes_to_set_config(CONFIG_4, ROBUST_0) == true,
+		"OFDM->robust demote (CONFIG_4->ROBUST_0) routes to SET_CONFIG",
+		routes_to_set_config(CONFIG_4, ROBUST_0) ? 1 : 0, 1);
+	// Top-tier crossing (ROBUST_0 -> CONFIG_16) also crosses.
+	check(routes_to_set_config(ROBUST_0, CONFIG_16) == true,
+		"robust->OFDM top (ROBUST_0->CONFIG_16) routes to SET_CONFIG",
+		routes_to_set_config(ROBUST_0, CONFIG_16) ? 1 : 0, 1);
+	(void)hybrid_live;
+
+	// ── INTRA-TIER (must KEEP the in-band tag — NEVER route to SET_CONFIG, both arms) ──
+	// These assertions hold IDENTICALLY in fail-before and after (the macro only pins the
+	// crossing predicate to false, which matches intra-tier's expected false). They prove
+	// the fix does NOT over-route intra-tier adapts (the down-ladder/D1/D4/A3 machinery).
+	check(routes_to_set_config(CONFIG_0, CONFIG_4) == false,
+		"intra-OFDM up (CONFIG_0->CONFIG_4) keeps the in-band tag",
+		routes_to_set_config(CONFIG_0, CONFIG_4) ? 1 : 0, 0);
+	check(routes_to_set_config(CONFIG_16, CONFIG_4) == false,
+		"intra-OFDM down (CONFIG_16->CONFIG_4) keeps the in-band tag",
+		routes_to_set_config(CONFIG_16, CONFIG_4) ? 1 : 0, 0);
+	check(routes_to_set_config(ROBUST_0, ROBUST_0 + 1) == false,
+		"intra-robust (ROBUST_0->ROBUST_1) keeps the in-band tag",
+		routes_to_set_config(ROBUST_0, ROBUST_0 + 1) ? 1 : 0, 0);
+
+	// ── DEGENERATE: CONFIG_NONE target is never a crossing (both arms) ──────────
+	check(routes_to_set_config(ROBUST_0, CONFIG_NONE) == false,
+		"CONFIG_NONE target is never a crossing (falls through)",
+		routes_to_set_config(ROBUST_0, CONFIG_NONE) ? 1 : 0, 0);
+
+	current_configuration = saved_cfg;   // restore (no live-session leak)
+
+	printf("[TEST-TIER-CROSS] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }

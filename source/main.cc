@@ -753,6 +753,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_a3_decouple_safety();
             }
+            // HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §3):
+            // a robust<->OFDM crossing routes to the legacy SET_CONFIG handshake
+            // (fast dedicated ACK); intra-tier rate adapts keep the in-band tag.
+            // Member test on a throwaway controller; PURE in-process synthetic-fire,
+            // no PHY/audio/IONOS/RF -> permanent regression gate.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_tier_crossing_routing();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -791,6 +800,15 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-tier-crossing : run ONLY the hybrid tier-crossing routing
+        // regression (robust<->OFDM crossing -> legacy SET_CONFIG; intra-tier ->
+        // in-band tag) and exit. Fast + deterministic; see
+        // arq_commander.cc::test_inband_tier_crossing_routing.
+        if (strcmp(argv[i], "--test-inband-tier-crossing") == 0) {
+            cl_arq_controller ARQ_tc;
+            int failed = ARQ_tc.test_inband_tier_crossing_routing();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-adopt-preserve : run ONLY the robust->OFDM adopt live-burst PRESERVE

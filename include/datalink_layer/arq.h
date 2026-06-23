@@ -3627,6 +3627,18 @@ public:
   // if it was a no-op (same config / invalid target) so the builder can fall back.
   bool inband_unilateral_config_change(int target_cfg);
 
+  // HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §2). PURE predicate:
+  // does a config change from current_configuration to target_cfg CROSS the robust<->OFDM
+  // tier boundary (is_robust_config differs)? A crossing must use the legacy SET_CONFIG
+  // control handshake (fast dedicated ACK) instead of the in-band unilateral CONFIG_TAG
+  // (which serializes each rung behind the slow data-SACK turnaround). CONFIG_NONE target
+  // is never a crossing. No side effects — drives the chokepoint routing AND its directed
+  // regression (test_inband_tier_crossing_routing) identically.
+  bool inband_config_change_is_tier_crossing(int target_cfg);
+
+  // Directed regression for the hybrid tier-crossing routing (fails-before/passes-after).
+  int test_inband_tier_crossing_routing();
+
   // ── STAGE 4c — D5: BREAK truly obsolete (inband-reliability-design.md §5,
   //    data-flow-perbatch-config.md §S4C) ──
   // When MERCURY_INBAND_RATE is ON, a COMMANDER Class-A degradation/failure that
