@@ -111,7 +111,126 @@ the down-ladder, `rsp_current_expected_batch_seq_id`, and the in-band re-tag sta
 
 ---
 
-## §3. Tests (fails-before / passes-after)
+## §3. The cross-oscillation root + the reverse-ACK PIN (VERIFIED off-bench)
+
+After §1 routed the cross via legacy SET_CONFIG, the redesign STILL oscillated
+ROBUST_2 (102) ↔ CONFIG_0, never sustaining an OFDM rung, capped at CONFIG_0 with
+35 emergency BREAKs (`_pipe_ab/redesign360.arqlog`, WGN:40, `MERCURY_INBAND_RATE=1`).
+Legacy sustains the climb past CONFIG_0 on the SAME channel.
+
+### §3.1 Root (two-part, both VERIFIED from paired logs)
+
+**PART A — reverse-ACK pinned to the OFDM forward rung at the cross.** The redesign's
+intra-ROBUST climb (100→101→102) rides the in-band CONFIG_TAG (unilateral, NO
+SET_CONFIG), so `reverse_configuration` is NEVER seeded to a robust rung — it sits at
+its ctor sentinel `CONFIG_NONE` (`arq_common.cc:759`/`:6245`). At the robust→OFDM cross
+the §1 hybrid routes through the legacy SET_CONFIG builder, whose SUCCESS_BASED_LADDER
+fallthrough `if(reverse_configuration == CONFIG_NONE) reverse_configuration =
+forward_configuration` (`arq_commander.cc:~935`) sets reverse to the FORWARD OFDM rung
+(0). The reverse SACK suffix must then decode on OFDM-0 in a tight turnaround and TIMES
+OUT every cross:
+`[GEARSHIFT] SET_CONFIG: forward=0 reverse=0` → `[CMD-ACK-SNR] ACK detected, suffix
+timeout` → data-block-failure BREAK.
+LEGACY NEVER hits this: its SET_CONFIG climb seeds reverse to a ROBUST rung at the first
+step and HOLDS it for the whole climb — `forward=0 reverse=101` at the cross
+(`_a3proof/legacy_ftrt.modem.log`), so its reverse SACK rides a rock-solid MFSK rung.
+
+**PART B — the connect-LIVENESS GUARD false-fires a true-loss BREAK during the cross
+handshake (the dominant root; CORRECTED from the initial anchor-clamp hypothesis).**
+After PART A alone the reverse SACK rides ROBUST_2 (`reverse=102`) yet the oscillation
+PERSISTED: 8/8 remaining BREAKs were the connect-liveness guard
+(`inband_connect_liveness_guard`, `arq_commander.cc:3253`) firing
+`[INBAND-LIVENESS] no forward-DATA progress for 200 control-plane polls ... connect/
+negotiate LIVELOCK; firing the retained true-loss BREAK` (MEASURED, `_xfix/on_partA.arqlog`).
+MECHANISM: data flowed during the intra-ROBUST climb
+(`cmd_inband_liveness_last_acked=3`), so the connect/negotiate exemption
+(`arq_commander.cc:3324-3332`, which only covers the PRE-DATA handshake) no longer
+applies. The robust→OFDM cross then sits in `RECEIVING_ACKS_CONTROL` (conn=6) with
+`nAcked_data` FLAT for the whole cross (the SET_CONFIG ACK + the ~12.4s data-SACK
+turnaround at the robust rung), so the guard accrues 200 polls and false-fires. That
+BREAK then anchor-clamps to the robust anchor (`break_target_with_anchor`,
+`arq_commander.cc:185-191`, `config 102 -> 102`) → `UNILATERAL CONFIG 100 -> 102` →
+ROBUST_2 → re-cross → oscillate. This is the SAME guard-masquerading-as-architectural
+pattern as the WB-negotiate false-fire (§5 of data-flow-inband-connect-liveness.md) and
+the idle-switchrole race — a LEGITIMATE slow control handshake whose state signature is
+identical to a livelock. The anchor-clamp is the proximate snap-back, but the BREAK
+should never have fired: the deliberate upward tier-cross is not a livelock.
+
+### §3.2 The fix
+
+**PART A (the root-cause fix):** on an in-band tier-cross, PIN `reverse_configuration`
+to the ROBUST side of the boundary (mirroring legacy's reverse-robust hold) instead of
+letting it fall to the OFDM forward rung. Robust side = the LIVE config on a
+robust→OFDM up-cross (it just carried data reliably) or the TARGET on an OFDM→robust
+down-cross. Selector factored into the pure
+`cl_arq_controller::inband_tier_cross_reverse_config(from, to, inband_on)`
+(`arq_common.cc`, after `inband_config_change_is_tier_crossing`) so the production site
+AND the directed regression drive the EXACT same decision. Applied at the
+SUCCESS_BASED_LADDER reverse-seed (`arq_commander.cc:~930`), gated on
+`inband_rate_feature_enabled()` AND a real crossing → flag-off / intra-tier / SNR_BASED
+are byte-identical. With reverse on a robust MFSK rung the reverse SACK decodes across
+the cross → the cross is ACKed → no data-block-failure → no BREAK → no oscillation.
+
+**PART B (REQUIRED — the dominant root):** EXEMPT the in-band tier-crossing control
+handshake from the connect-liveness guard's stall accrual — the SAME exemption the
+WB-negotiate gets (§5 of data-flow-inband-connect-liveness.md), extended to cover the
+post-data tier-cross. While in a control phase (`TRANSMITTING_CONTROL` /
+`RECEIVING_ACKS_CONTROL`) AND the in-flight config change
+(`negotiated_configuration`) crosses the tier vs the live config, hold the streak at 0.
+Factored into the pure
+`cl_arq_controller::inband_tiercross_handshake_exempts_liveness(conn_status, target)`
+(`arq_common.cc`) so the guard site AND the directed regression drive the EXACT same
+decision. Applied at `arq_commander.cc:~3334` (right after the connect/negotiate
+exemption), under `#ifndef INBAND_TIERCROSS_LIVENESS_FAILBEFORE`. Self-limiting: once the
+cross ACKs (current==target, no longer a crossing) the exemption disengages and the
+guard resumes. BOUNDED + genuine-death net intact: a truly stuck cross is owned by the
+control-ACK-miss / FRAME-UP-FAILED tag-demote machinery (`arq_commander.cc:2897`/`:2984`),
+NOT this guard; and a POST-cross DATA stall (current==target, not a crossing) arms the
+guard normally. The anchor-clamp (PART B-proximate) is LEFT UNCHANGED — with the BREAK no
+longer false-firing, the clamp is no longer reached on the cross, and it remains correct
+for a GENUINE deep-SNR demote (the panic-jump bypass `:187` + anchor-DEMOTE escape
+`:5076-5111` are untouched).
+
+### §3.3 Files (this fix)
+- PART A — `arq_common.cc` `inband_tier_cross_reverse_config` (pure selector;
+  `INBAND_REVERSE_PIN_FAILBEFORE` reverts it to the no-pin fails-before);
+  `arq_commander.cc:~930` — the reverse-seed pin at the SET_CONFIG builder.
+- PART B — `arq_common.cc` `inband_tiercross_handshake_exempts_liveness` (pure predicate);
+  `arq_commander.cc:~3334` — the exemption in `inband_connect_liveness_guard`, under
+  `#ifndef INBAND_TIERCROSS_LIVENESS_FAILBEFORE` (the E2E fails-before macro).
+- `include/datalink_layer/arq.h` — declarations.
+- `arq_commander.cc::test_inband_tier_cross_reverse_pin` (covers BOTH parts) + `main.cc`
+  wiring (`--test` and `--test-inband-reverse-pin`).
+
+---
+
+## §3-tests'. Tests for §3 (reverse-pin + liveness exemption)
+
+- **Directed unit** `test_inband_tier_cross_reverse_pin` (`--test` +
+  `--test-inband-reverse-pin`): drives BOTH pure selectors across the matrix.
+  - PART A crossings (ROBUST_2→CONFIG_0, ROBUST_0→CONFIG_16, CONFIG_4→ROBUST_0) assert
+    reverse pinned to the robust rung; intra-tier / CONFIG_NONE / feature-OFF assert no
+    pin (CONFIG_NONE). FAILS-BEFORE (`-DINBAND_REVERSE_PIN_FAILBEFORE`): the 3 crossing
+    asserts FLIP to FAIL (got=CONFIG_NONE, exit 1) — MEASURED. PASSES-AFTER: all PASS
+    (exit 0) — MEASURED.
+  - PART B liveness exemption: cross-in-flight @ control phase asserts EXEMPT; intra-OFDM
+    control + DATA-phase assert NOT exempt. PASSES-AFTER all PASS — MEASURED.
+- **E2E (realtime-sim)**: WGN:40, `MERCURY_INBAND_RATE=1`, start ROBUST_0, 360s,
+  `--turnaround-drift`, `tools/sim/sim_arq_channel.py` (see `_xfix/`).
+  - BEFORE (redesign360, pre-fix): 35 BREAKs, capped at CONFIG_0, oscillates 102↔0,
+    rx≈311 B, `repro_deep_stall=true`.
+  - PART A only: 8 BREAKs (ALL 8 = liveness false-fire), still oscillates, rx≈354 B —
+    proves PART A necessary-but-insufficient and isolates PART B's root.
+  - PART A+B (passes-after, MEASURED `_xfix/on_partAB`): the tier-cross oscillation is
+    GONE — **1** cross 102→0 (vs 7 before), **0** cross-BREAKs, **0** liveness false-fires
+    on the cross. It crosses to CONFIG_0 (peak_config=CONFIG_0) and HOLDS it; the later
+    0→102 demote is a LEGITIMATE CONFIG_0 data-decode degradation routed via the NO-BREAK
+    tag-demote (`[INBAND-NOBREAK] frame_gearshift_data_failed_pat`), not the oscillation.
+    rx 311→397 B. Diagnosed bug (7-cross 35-BREAK 102↔0 limit cycle) RESOLVED.
+  - Fails-before macro for PART B: `-DINBAND_TIERCROSS_LIVENESS_FAILBEFORE` compiles out
+    the exemption → reproduces the oscillation.
+
+## §3-tests. Tests (fails-before / passes-after) — §1 routing
 
 - **Routing (unit)** `test_inband_tier_crossing_routing` (`--test` +
   `--test-inband-tier-crossing`): drives the production predicate across the matrix.
@@ -131,9 +250,118 @@ the down-ladder, `rsp_current_expected_batch_seq_id`, and the in-band re-tag sta
 
 ---
 
+## §5'. Cross-layer audit — `reverse_configuration` (the PART A pin)
+
+`reverse_configuration` is shared state (the responder→commander config for the reverse
+link / the post-SWITCH_ROLE return path). The PART A pin changes WHAT value it holds
+across a tier-cross. Audit per CLAUDE.md §5:
+
+1. **Producers** (writers of `reverse_configuration`):
+   - `arq_commander.cc:892` (SNR_BASED SET_CONFIG) — `get_configuration(SNR_uplink)`.
+     UNTOUCHED (the pin is in the SUCCESS_BASED_LADDER branch only).
+   - `arq_commander.cc:~899` (SUCCESS_BASED_LADDER seed) — the pin site. PRE-pin:
+     `if(==CONFIG_NONE) = forward_configuration`. POST-pin: on an in-band crossing,
+     `= the robust side`; otherwise the legacy seed runs UNCHANGED.
+   - BREAK recovery `:310-311` / `:404-405` — `if(==CONFIG_NONE) = target`. UNTOUCHED.
+   - Turbo `:5628`, `:6632` — `= start_config` / `current_configuration`. UNTOUCHED
+     (turbo is a separate climb engine; not reached on the in-band FRAME-UP cross).
+   - SWITCH_ROLE swap `:6210-6214` (CMD) / `arq_responder.cc:1907-1909` (RSP) —
+     swaps forward↔reverse. Reads the value; see consumers.
+   - Ctor / session reset `arq_common.cc:759`/`:6245` — `CONFIG_NONE` (the init the
+     redesign was stuck at, the root of PART A).
+   - RSP adopt `arq_responder.cc:3220` — `= messages_control.data[2]` (the wire field
+     the pin populates). This is the cross-link delivery of the pin to the peer.
+
+2. **Consumers** (readers):
+   - `messages_control.data[2]` at `arq_commander.cc:905` — the wire field. The pin
+     makes it a ROBUST rung on a cross; the RSP adopts it at `:3220`.
+   - SWITCH_ROLE swap (above): on a role swap the RSP's NEW forward = old reverse, i.e.
+     the RSP would TX its return-path data on the pinned rung. On a cross that is a
+     ROBUST rung (slow but reliable) — **this is exactly legacy's behavior** (legacy
+     held reverse=101 through the whole climb, so legacy's RSP also returns on robust
+     until the reverse direction climbs on its OWN SET_CONFIG). NOT a regression; the
+     reverse direction promotes independently later via its own intra-tier adapt.
+   - `cl_arq_controller::config_state_string` (`arq_common.cc:1923`) — diagnostic read.
+
+3. **Valid states / invariant**: before any producer writes, `reverse_configuration ==
+   CONFIG_NONE`. The pin only acts on a real in-band crossing; the `==CONFIG_NONE`
+   legacy fallback still runs AFTER the pin (so a non-crossing CONFIG_NONE still seeds
+   to forward, unchanged). The pin value is always a valid robust config (100–102), so
+   `data[2]` and the SWITCH_ROLE swap always see a loadable PHY config.
+
+4. **What the fix changes**: on an in-band tier-cross, `data[2]` carries a ROBUST rung
+   instead of the OFDM forward rung. Every consumer above either (a) is unaffected
+   (diagnostics, the SNR_BASED/turbo/BREAK producers), or (b) gets the legacy-equivalent
+   robust value (the wire field + the SWITCH_ROLE return path). No consumer assumes
+   reverse==forward on a cross — legacy proves the opposite is the correct, working
+   state.
+
+## §5''. Cross-layer audit — `inband_connect_liveness_guard` / emergency-BREAK (PART B)
+
+PART B changes WHEN the liveness guard accrues a stall. Audit per CLAUDE.md §5:
+
+1. **Producer of the guard decision**: only `inband_connect_liveness_guard()`
+   (`arq_commander.cc:3253`), called once per poll from `process_messages_commander`
+   (`:256`), and ONLY when `inband_rate_feature_enabled()` (the function early-returns
+   false OFF -> byte-identical legacy).
+2. **What the exemption gates**: the stall ACCRUAL (`cmd_inband_liveness_no_progress_polls++`)
+   and thus the BREAK fire. The exemption holds the streak at 0 while a tier-cross control
+   handshake is in flight. It does NOT touch `nAcked_data`, `cmd_batch_seq_id`, the retx
+   queue, `messages_tx[]`, or `current_configuration` — it only suppresses a false stall
+   count. So no batch/epoch/config shared state is perturbed.
+3. **Genuine-death net intact** (the over-broad edge):
+   - A truly stuck cross (RSP never ACKs the SET_CONFIG): the SET_CONFIG control message
+     exhausts its resends and the control-ACK-miss / FRAME-UP-FAILED handlers
+     (`arq_commander.cc:2897`/`:2984`) route it to the in-band tag-demote — NOT the
+     liveness guard. So a dead cross still recovers; the guard exempting it just removes
+     the DUPLICATE false BREAK that was racing the demote.
+   - A POST-cross DATA stall (the cross landed, current==target, NO longer a crossing):
+     `inband_config_change_is_tier_crossing` returns false → the exemption is OFF → the
+     guard arms exactly as before. The data-phase forward-healthy-miss demote
+     (`:3384`) and the `INBAND_LIVENESS_MAX_BREAKS` hard-reset backstop are unchanged.
+4. **Anchor-clamp UNCHANGED** (PART B-proximate): `break_target_with_anchor`
+   (`:185-191`) and the BREAK recovery SM are byte-identical. With the BREAK no longer
+   false-firing on the cross, the clamp is simply not reached there; for a GENUINE
+   deep-SNR demote it still clamps correctly (the panic-jump bypass `:187` + anchor-DEMOTE
+   escape `:5076-5111` are untouched). The deliberate upward cross is fixed by NOT firing
+   the BREAK, not by changing the clamp.
+5. **Legacy / intra-tier unaffected**: OFF the guard early-returns; an intra-tier control
+   op has `is_tier_crossing==false` → exemption OFF → the guard works as before. Verified
+   by the directed test's intra-OFDM-control and DATA-phase assertions.
+6. **SIBLING REGRESSION CAUGHT + CLOSED (CLAUDE.md §5 in action)**: the FIRST PART B cut
+   (exempt on `control phase && is_tier_crossing(negotiated)` ALONE) silently BROKE the
+   existing `test_inband_liveness` F3/F4 cases (`arq_responder.cc:6090-6111`) — a GENUINE
+   post-data control-plane livelock staged at the bottom rung (ROBUST_0, in-flight
+   PENDING_ACK batch) carries a stale CROSSING `negotiated_configuration`, so the bare
+   exemption swallowed it (the backstop never fired: got fired_at=-1 want 5). The
+   `--test` suite caught it (exit 1, all visible PASS but `[TEST-INBAND-LIVENESS] FAIL`
+   F3/F4) — baseline efc2260 exits 0, my pre-fix binary exit 1. FIX: add the THIRD
+   conjunct `!cmd_has_inflight_data_batch()` — the real FRAME-UP cross is a PURE control
+   op (data was pushed to FIFO at `arq_commander.cc:5515-5520`, no inflight batch) whereas
+   the genuine post-data livelock carries an inflight batch. The exemption now stands down
+   on F3/F4 (genuine backstop fires) and still fires on the real cross. Directed test
+   gains the `crossing target BUT inflight DATA → NOT exempt` assertion; `--test` exits 0,
+   F3/F4 green.
+
 ## §4. Open questions
 
 - [?] The full climb from ROBUST_0 to the OFDM boundary is slow (~100 s to the first
   robust promote at the hailing rate). That is a SEPARATE throughput question (does
   the redesign BEAT legacy end-to-end?) tracked under the A/B campaign; this fix only
   makes the crossing itself fast once the climb reaches the boundary.
+
+- [?] **SURFACED SIBLING (out of scope for this fix) — the `ROBUST_DWELL_BATCH_OP`
+  liveness false-fire.** After PART A+B fixed the tier-cross oscillation, the PART A+B
+  e2e (`_xfix/on_partAB.arqlog`) shows **5** residual `[INBAND-LIVENESS] ... LIVELOCK`
+  BREAKs, ALL on CONFIG_102 (ROBUST_2), EACH preceded by a `[CMD-ROBUST-DWELL]
+  ROBUST_DWELL_BATCH_OP TX` (`arq_commander.cc:1065`/`:5607`). This is the SAME
+  guard-masquerading-as-architectural pattern (a legitimate in-band control handshake —
+  the robust batch-size dwell op — sits in `RECEIVING_ACKS_CONTROL` with `nAcked_data`
+  flat, identical signature to a livelock) but on a DIFFERENT control op, NOT a
+  tier-cross, so PART B's tier-cross exemption correctly does not cover it. Each is in
+  budget (#1/3) and the link recovers + keeps delivering, so it is not fatal, but it adds
+  churn and keeps the BREAK count above legacy's ~0. The PRINCIPLED fix is to exempt ANY
+  legitimate in-band control op in flight from the liveness stall (the guard's purpose is
+  a DATA-phase livelock, not a control handshake) — but that BROADENS the liveness guard's
+  exemption to shared state and warrants its own §5 audit + owner ratification, so it is
+  deliberately LEFT for a follow-up rather than silently widened here.

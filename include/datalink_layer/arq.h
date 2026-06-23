@@ -3649,6 +3649,31 @@ public:
   // Directed regression for the hybrid tier-crossing routing (fails-before/passes-after).
   int test_inband_tier_crossing_routing();
 
+  // IN-BAND TIER-CROSSING REVERSE-ACK PIN (data-flow-inband-tier-crossing.md §3). PURE:
+  // on an in-band robust<->OFDM tier-cross, return the ROBUST rung the reverse SACK must
+  // ride so it decodes reliably across the cross (mirroring legacy's reverse-robust hold).
+  // The robust side of the crossing is `from` on a robust->OFDM up-cross (the live robust
+  // rung that just carried data) or `to` on an OFDM->robust down-cross (the target IS
+  // robust). Returns CONFIG_NONE when it is NOT an in-band crossing (the caller then keeps
+  // the legacy reverse seed). `inband_on` lets the directed test drive the feature gate
+  // without touching the env. No side effects — drives the production pin AND its directed
+  // regression (test_inband_tier_cross_reverse_pin) identically.
+  int inband_tier_cross_reverse_config(int from_cfg, int to_cfg, bool inband_on) const;
+
+  // Directed regression for the tier-cross reverse-ACK pin (fails-before/passes-after).
+  int test_inband_tier_cross_reverse_pin();
+
+  // IN-BAND TIER-CROSSING LIVENESS-GUARD EXEMPTION (data-flow-inband-tier-crossing.md §3
+  // PART B). PURE: should the connect-liveness guard NOT accrue a stall this poll because a
+  // deliberate robust<->OFDM tier-cross control handshake is in flight? THREE conjuncts: a
+  // control phase AND is_tier_crossing(target_cfg) AND NO forward DATA batch in flight
+  // (has_inflight_data==false — the discriminator that keeps a genuine post-data livelock,
+  // which carries an in-flight batch, from being swallowed). Drives the production exemption
+  // AND its directed regression identically. Non-const (calls the non-const tier-crossing
+  // predicate which reads current_configuration).
+  bool inband_tiercross_handshake_exempts_liveness(int conn_status, int target_cfg,
+                                                   bool has_inflight_data);
+
   // ── STAGE 4c — D5: BREAK truly obsolete (inband-reliability-design.md §5,
   //    data-flow-perbatch-config.md §S4C) ──
   // When MERCURY_INBAND_RATE is ON, a COMMANDER Class-A degradation/failure that

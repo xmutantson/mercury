@@ -895,6 +895,40 @@ int cl_arq_controller::add_message_control(char code)
 			{
 				// SUCCESS_BASED_LADDER: asymmetric — only update forward (TX direction)
 				forward_configuration = negotiated_configuration;
+				// IN-BAND TIER-CROSSING REVERSE-ACK PIN (data-flow-inband-tier-crossing.md
+				// §3, the cross-oscillation root). VERIFIED off-bench (_pipe_ab/redesign360):
+				// under MERCURY_INBAND_RATE=1 the intra-ROBUST climb (100->101->102) rides
+				// the in-band CONFIG_TAG (unilateral, NO SET_CONFIG), so reverse_configuration
+				// is NEVER seeded to a robust rung and sits at its ctor sentinel CONFIG_NONE.
+				// At the robust->OFDM tier-cross the hybrid routes HERE (legacy SET_CONFIG
+				// builder); the generic fallthrough below would then set reverse to
+				// forward_configuration = the FORWARD OFDM rung (0). The reverse SACK suffix
+				// must then decode on OFDM-0 in a tight turnaround and TIMES OUT
+				// ("suffix timeout") on every cross -> the BREAK SM clamps back to ROBUST_2
+				// -> 102<->0 oscillation, capped at CONFIG_0, 35 BREAKs. Legacy NEVER hits
+				// this: it pins reverse=101 (ROBUST_1) for the WHOLE climb (its SET_CONFIG
+				// climb seeds reverse robust at the first step), so its reverse SACK decodes
+				// on a rock-solid MFSK rung across the cross (legacy log: forward=0 reverse=101).
+				// FIX: on an in-band tier-cross, pin reverse to the ROBUST side of the
+				// crossing (the robust rung mirrors legacy's reverse-robust hold) instead of
+				// letting it fall to the OFDM forward rung. The robust side is the live config
+				// on a robust->OFDM up-cross (current_configuration, the rung that JUST carried
+				// data reliably) or the target on an OFDM->robust down-cross. Strictly gated on
+				// inband_rate_feature_enabled() AND inband_config_change_is_tier_crossing ->
+				// flag-off and intra-tier are byte-identical (the legacy seed below is untouched).
+				int robust_reverse = inband_tier_cross_reverse_config(
+					current_configuration, forward_configuration,
+					inband_rate_feature_enabled());
+				if(robust_reverse != CONFIG_NONE
+					&& reverse_configuration != robust_reverse)
+				{
+					printf("[INBAND-TX] TIER-CROSS reverse-ACK pin: reverse_configuration "
+						"%d -> %d (hold the robust rung across the cross so the reverse SACK "
+						"decodes on MFSK, mirroring legacy's reverse-robust hold)\n",
+						reverse_configuration, robust_reverse);
+					fflush(stdout);
+					reverse_configuration = robust_reverse;
+				}
 				// reverse_configuration preserved from other direction's gearshift
 				if(reverse_configuration == CONFIG_NONE)
 					reverse_configuration = forward_configuration;
@@ -3292,6 +3326,37 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	if(!data_ever_flowed
 	   && (connection_status == TRANSMITTING_CONTROL
 	    || connection_status == RECEIVING_ACKS_CONTROL))
+	{
+		cmd_inband_liveness_no_progress_polls = 0;
+		return false;
+	}
+#endif
+
+	// IN-BAND TIER-CROSSING CONTROL HANDSHAKE — the same exemption the WB-negotiate gets
+	// (data-flow-inband-tier-crossing.md §3 PART B). VERIFIED root (off-bench,
+	// _xfix/on_partA.arqlog): after data has flowed during the intra-ROBUST climb
+	// (cmd_inband_liveness_last_acked=3), the redesign promotes robust->OFDM via the §1
+	// hybrid SET_CONFIG control handshake. That cross legitimately sits in
+	// TRANSMITTING_CONTROL / RECEIVING_ACKS_CONTROL with nAcked_data FLAT for the whole
+	// cross (the SET_CONFIG ACK + the slow ~12.4s data-SACK turnaround at the robust rung),
+	// but data_ever_flowed is now TRUE so the connect/negotiate exemption above no longer
+	// covers it -> the guard accrues 200 polls and FALSE-FIRES a true-loss BREAK
+	// ("connect/negotiate LIVELOCK"). That BREAK then anchor-clamps the cross back to the
+	// robust anchor -> the 102<->0 oscillation (8/8 remaining BREAKs were this false-fire
+	// with PART A's reverse-pin live). A deliberate UPWARD tier-cross is NOT a livelock to
+	// retreat from — it is the intended move. EXEMPT it: while in a control phase AND the
+	// in-flight config change (negotiated_configuration) CROSSES the tier relative to the
+	// live config, hold the streak at 0 (mirrors the WB-negotiate hold). BOUNDED + genuine-
+	// death net intact: a truly stuck cross is owned by the control-ACK-miss / FRAME-UP-
+	// FAILED machinery (arq_commander.cc:2897/:2984 route it to the tag-demote), NOT this
+	// guard; once the cross ACKs or the gearshift abandons it the state leaves the control
+	// phase and the streak resumes. Strictly scoped to inband (the function early-returns
+	// OFF) + a real crossing -> intra-tier rate adapts and the legacy path are unaffected.
+	// FAIL-BEFORE (-DINBAND_TIERCROSS_LIVENESS_FAILBEFORE): the exemption is compiled OUT so
+	// the cross accrues the streak and false-fires — reproducing the oscillation.
+#ifndef INBAND_TIERCROSS_LIVENESS_FAILBEFORE
+	if(inband_tiercross_handshake_exempts_liveness(connection_status,
+			negotiated_configuration, cmd_has_inflight_data_batch()))
 	{
 		cmd_inband_liveness_no_progress_polls = 0;
 		return false;
@@ -9304,6 +9369,121 @@ int cl_arq_controller::test_inband_tier_crossing_routing()
 	current_configuration = saved_cfg;   // restore (no live-session leak)
 
 	printf("[TEST-TIER-CROSS] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// IN-BAND TIER-CROSSING REVERSE-ACK PIN regression (data-flow-inband-tier-crossing.md §3).
+// Drives the EXACT production selector (inband_tier_cross_reverse_config — the same call the
+// SET_CONFIG builder makes) across the crossing matrix. PURE in-process synthetic-fire: no
+// telecom_system, no PHY/audio, no IONOS/RF — a permanent gate.
+//
+// FAIL-BEFORE (-DINBAND_REVERSE_PIN_FAILBEFORE): the selector reverts to the buggy behavior
+// (return CONFIG_NONE for crossings too -> the builder's generic fallthrough sets reverse to
+// the FORWARD OFDM rung 0, the redesign's 102<->0 oscillation root). Under that macro the
+// CROSSING assertions below FLIP (expected robust rung != CONFIG_NONE) -> fails-before. The
+// load-bearing case is the robust->OFDM climb (ROBUST_2->CONFIG_0): want reverse pinned to
+// ROBUST_2 (the live robust rung), NOT CONFIG_0. PASSES-AFTER with the pin live.
+int cl_arq_controller::test_inband_tier_cross_reverse_pin()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-REVPIN] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-REVPIN] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+#ifdef INBAND_REVERSE_PIN_FAILBEFORE
+	// Reproduce the pre-fix behavior: NEVER pin on a crossing (reverse falls to the OFDM
+	// forward rung in the builder). The crossing assertions below then FLIP to FAIL.
+	auto rev = [&](int from, int to) -> int { (void)from; (void)to; return CONFIG_NONE; };
+	printf("[TEST-REVPIN] reverse-ACK pin = FAIL-BEFORE (no pin; reverse -> OFDM forward rung)\n");
+#else
+	auto rev = [&](int from, int to) -> int {
+		return inband_tier_cross_reverse_config(from, to, /*inband_on=*/true);
+	};
+	printf("[TEST-REVPIN] reverse-ACK pin = LIVE\n");
+#endif
+	fflush(stdout);
+
+	int saved_rp_cfg = current_configuration;   // PART B mutates current_configuration
+
+	// ── CROSSINGS: reverse MUST be pinned to the ROBUST side of the boundary ──────────
+	// The load-bearing case: the redesign's robust->OFDM CLIMB (ROBUST_2 -> CONFIG_0). The
+	// reverse SACK must ride ROBUST_2 (the live robust rung), NOT CONFIG_0 (the OFDM forward
+	// rung that times out in the tight turnaround). Under -DINBAND_REVERSE_PIN_FAILBEFORE
+	// rev() returns CONFIG_NONE here -> FAIL = the genuine fails-before.
+	check(rev(ROBUST_2, CONFIG_0) == ROBUST_2,
+		"robust->OFDM climb (ROBUST_2->CONFIG_0): reverse pinned ROBUST_2",
+		rev(ROBUST_2, CONFIG_0), ROBUST_2);
+	check(rev(ROBUST_0, CONFIG_16) == ROBUST_0,
+		"robust->OFDM top (ROBUST_0->CONFIG_16): reverse pinned ROBUST_0",
+		rev(ROBUST_0, CONFIG_16), ROBUST_0);
+	// OFDM->robust demote: the target IS robust -> pin reverse there.
+	check(rev(CONFIG_4, ROBUST_0) == ROBUST_0,
+		"OFDM->robust demote (CONFIG_4->ROBUST_0): reverse pinned ROBUST_0",
+		rev(CONFIG_4, ROBUST_0), ROBUST_0);
+
+	// ── INTRA-TIER and DEGENERATE: NEVER pin (return CONFIG_NONE so the builder keeps the
+	//    legacy reverse seed). These hold IDENTICALLY in fail-before and after — the macro
+	//    only suppresses the crossing pin, which already matches intra-tier's CONFIG_NONE. ─
+	check(inband_tier_cross_reverse_config(CONFIG_0, CONFIG_4, true) == CONFIG_NONE,
+		"intra-OFDM (CONFIG_0->CONFIG_4): no pin (legacy seed kept)",
+		inband_tier_cross_reverse_config(CONFIG_0, CONFIG_4, true), CONFIG_NONE);
+	check(inband_tier_cross_reverse_config(ROBUST_0, ROBUST_2, true) == CONFIG_NONE,
+		"intra-robust (ROBUST_0->ROBUST_2): no pin (legacy seed kept)",
+		inband_tier_cross_reverse_config(ROBUST_0, ROBUST_2, true), CONFIG_NONE);
+	check(inband_tier_cross_reverse_config(ROBUST_0, CONFIG_NONE, true) == CONFIG_NONE,
+		"CONFIG_NONE target: no pin",
+		inband_tier_cross_reverse_config(ROBUST_0, CONFIG_NONE, true), CONFIG_NONE);
+	// Feature OFF -> NEVER pin, even on a crossing (flag-off byte-identical legacy seed).
+	check(inband_tier_cross_reverse_config(ROBUST_2, CONFIG_0, false) == CONFIG_NONE,
+		"feature OFF on a crossing: no pin (legacy byte-identical)",
+		inband_tier_cross_reverse_config(ROBUST_2, CONFIG_0, false), CONFIG_NONE);
+
+	// ── PART B — LIVENESS-GUARD TIER-CROSS EXEMPTION ─────────────────────────────────
+	// While a robust<->OFDM tier-cross SET_CONFIG control handshake is in flight (a control
+	// phase AND the target crosses the tier vs the live config), the connect-liveness guard
+	// must NOT accrue a stall (the cross is the intended move, not a livelock). Drive the
+	// production exemption predicate. current_configuration is the live-config reference the
+	// tier-crossing predicate reads, so set it per case.
+	auto exempt = [&](int live, int conn, int target, bool inflight) -> bool {
+		current_configuration = live;
+		return inband_tiercross_handshake_exempts_liveness(conn, target, inflight);
+	};
+	// Cross in flight in a control phase, NO inflight DATA (the pure cross handshake) ->
+	// EXEMPT (the load-bearing case: robust->OFDM at RECEIVING_ACKS_CONTROL, the exact
+	// false-fire state from _xfix/on_partA.arqlog; the FRAME-UP saved data to FIFO so no
+	// inflight batch).
+	check(exempt(ROBUST_2, RECEIVING_ACKS_CONTROL, CONFIG_0, false) == true,
+		"cross handshake @ RECEIVING_ACKS_CONTROL (102->0), no inflight DATA: EXEMPT",
+		exempt(ROBUST_2, RECEIVING_ACKS_CONTROL, CONFIG_0, false) ? 1 : 0, 1);
+	check(exempt(ROBUST_0, TRANSMITTING_CONTROL, CONFIG_16, false) == true,
+		"cross handshake @ TRANSMITTING_CONTROL (100->16), no inflight DATA: EXEMPT",
+		exempt(ROBUST_0, TRANSMITTING_CONTROL, CONFIG_16, false) ? 1 : 0, 1);
+	// GENUINE post-data livelock: a crossing target BUT a DATA batch is in flight (the
+	// test_inband_liveness F3/F4 bottom-rung stall signature) -> NOT exempt, so the genuine
+	// backstop still fires. This is the discriminator that keeps the exemption narrow.
+	check(exempt(ROBUST_0, RECEIVING_ACKS_CONTROL, CONFIG_0, true) == false,
+		"crossing target BUT inflight DATA (genuine post-data livelock): NOT exempt",
+		exempt(ROBUST_0, RECEIVING_ACKS_CONTROL, CONFIG_0, true) ? 1 : 0, 0);
+	// NOT a crossing (intra-OFDM) in a control phase -> NOT exempt (the guard still works).
+	check(exempt(CONFIG_0, RECEIVING_ACKS_CONTROL, CONFIG_4, false) == false,
+		"intra-OFDM control op (0->4): liveness NOT exempt (guard intact)",
+		exempt(CONFIG_0, RECEIVING_ACKS_CONTROL, CONFIG_4, false) ? 1 : 0, 0);
+	// A crossing but in a DATA phase (not a control handshake) -> NOT exempt here (the
+	// data-phase has its own data_phase=0-streak branch above the exemption).
+	check(exempt(ROBUST_2, TRANSMITTING_DATA, CONFIG_0, false) == false,
+		"cross target but in DATA phase: not the control-handshake exemption",
+		exempt(ROBUST_2, TRANSMITTING_DATA, CONFIG_0, false) ? 1 : 0, 0);
+	current_configuration = saved_rp_cfg;   // restore
+
+	printf("[TEST-REVPIN] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

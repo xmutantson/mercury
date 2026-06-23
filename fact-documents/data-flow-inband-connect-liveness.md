@@ -94,3 +94,61 @@ inherits the audited BREAK semantics — it adds NO new mutation of batch/connec
 - **PASS-AFTER**: the guard fires send_break_pattern() within INBAND_LIVENESS_STALL_POLLS and the
   bound caps it; a data delivery resets the streak (no false-fire during data flow); OFF arm never
   fires (byte-identical).
+
+## §5 Connect/negotiate exemption — the WB-negotiate false-fire (fix 2026-06-22)
+
+### §5.1 The defect (sim-verified, FTRT `-x sim` ON arm)
+
+The §2 guard armed on bare `link_status==CONNECTED`, but CONNECTED is reached BEFORE the
+post-connect WB-bandwidth negotiate. When both ends are WB-capable, `[BW-NEG] Both WB-capable,
+initiating WB upgrade` (arq_commander.cc:5872-5879) calls `cleanup()` then `add_message_control(
+SWITCH_BANDWIDTH)` and sets `connection_status=TRANSMITTING_CONTROL` — a single CONFIG_100/ROBUST_0
+control frame (~9s on the wire). For that whole window the commander sits in
+TRANSMITTING_CONTROL/RECEIVING_ACKS_CONTROL (enum 5/6) with `nAcked_data` flat at 0 and NO in-flight
+DATA batch — a state signature IDENTICAL to a dead control livelock. The guard accrued the 200
+no-progress polls and false-fired a true-loss BREAK ~0.56s BEFORE the RSP received the
+SWITCH_BANDWIDTH, aborting the negotiate -> ROBUST_0 resync -> 3 retained BREAKs -> DROPPED -> 0
+bytes, never reaching DATA. LEGACY (guard OFF) runs the IDENTICAL ~9s negotiate then reaches DATA
+and climbs to CONFIG_16. SIM PROOF (`_a3proof/`): OLD ON `on_ftrt.modem.log` shows BREAK #1 at
+`T+0050.585` (0.002s after queuing SWITCH_BANDWIDTH at T+0050.583, nAcked_data=0) and the
+`[CMD] SWITCH_BANDWIDTH accepted` line NEVER appears; FIXED ON `sim_arq_channel.log` completes
+`[T+0052.043] [CMD] SWITCH_BANDWIDTH accepted, switching to WB`, then data flows (nAcked_data 0->3,
+delivered 0->15B) and the guard fires only at T+124 AFTER data flowed (the preserved backstop).
+
+### §5.2 The fix (arq_commander.cc:3231-3253, gate block ~3219-3253)
+
+Immediately after the `link_status != CONNECTED` exemption, hold the streak at 0 and early-out when
+the link is in a CONTROL handshake AND a DATA session has NOT yet been established:
+
+```
+bool data_ever_flowed = (cmd_inband_liveness_last_acked > 0) || cmd_has_inflight_data_batch();
+if(!data_ever_flowed
+   && (connection_status == TRANSMITTING_CONTROL || connection_status == RECEIVING_ACKS_CONTROL))
+{ cmd_inband_liveness_no_progress_polls = 0; return false; }
+```
+
+"Data has ever flowed" ⇔ a data ACK was seen this session (`cmd_inband_liveness_last_acked > 0`;
+monotonic per session, reset only at session init arq_common.cc:5916) OR a data batch is currently
+in flight (`cmd_has_inflight_data_batch()`). Equivalently: arm on "a DATA frame has been
+queued/acked at least once," NOT bare CONNECTED. Wrapped in `#ifndef INBAND_NEGOTIATE_FAILBEFORE`
+so the regression can reproduce the pre-fix false-fire.
+
+### §5.3 §5 cross-layer audit — BACKSTOP PRESERVED: **YES**
+
+- **Producers of `cmd_inband_liveness_last_acked`**: the guard, set to `stats.nAcked_data` on every
+  data-ACK advance (arq_commander.cc:3207) and on the hard-reset (arq_commander.cc:3345); init 0 at
+  ctor (arq.h:3556) + reset_session_state (arq_common.cc:5916). **Consumers**: only the guard
+  (the advance test :3205, and now the `data_ever_flowed` predicate :3251).
+- **Producers/consumers of the streak / breaks counters**: unchanged from §3 — only the guard
+  writes/reads them.
+- **Invariant the exemption must NOT break**: a POST-DATA control-plane livelock (stuck in
+  RECEIVING_ACKS_CONTROL forever AFTER data flowed) must STILL fire the BREAK. Verified: after data
+  flows, EITHER `cmd_inband_liveness_last_acked > 0` (some data was acked) OR
+  `cmd_has_inflight_data_batch()` (a batch is still queued) — so `data_ever_flowed` is true, the
+  early-out is SKIPPED, and the guard arms exactly as before. ONLY the pristine PRE-DATA connect/
+  negotiate handshake (no ack ever AND no batch queued) is exempted; its genuine death is caught by
+  the link/connection watchdogs (§1) and the SESSION_DEAD_BATCHES floor, not by this guard.
+- **Regression** (test_inband_liveness PART F + test_inband_deliver C1 updated; PART A/B/C/E reseed
+  data-has-flowed so they exercise the post-data backstop they intend): FAIL-BEFORE
+  (`-DINBAND_NEGOTIATE_FAILBEFORE`) — F1/F2b FAIL (the guard fires during the negotiate);
+  PASS-AFTER — F1/F2/F2b hold (no fire), F3/F4 confirm the backstop STILL fires with data in flight.

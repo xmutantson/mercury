@@ -762,6 +762,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_tier_crossing_routing();
             }
+            // IN-BAND TIER-CROSS REVERSE-ACK PIN regression (data-flow-inband-tier-
+            // crossing.md §3): a robust<->OFDM cross must pin reverse_configuration to
+            // the ROBUST side (not the OFDM forward rung), so the reverse SACK decodes on
+            // MFSK across the cross (the redesign's 102<->0 oscillation root). PURE in-
+            // process synthetic-fire — permanent regression gate.
+            {
+                cl_arq_controller test_revpin;
+                failed += test_revpin.test_inband_tier_cross_reverse_pin();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -809,6 +818,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-tier-crossing") == 0) {
             cl_arq_controller ARQ_tc;
             int failed = ARQ_tc.test_inband_tier_crossing_routing();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-reverse-pin : run ONLY the tier-cross reverse-ACK pin regression
+        // (robust<->OFDM cross -> reverse pinned to the robust rung, not the OFDM forward
+        // rung) and exit. Fast + deterministic; see
+        // arq_commander.cc::test_inband_tier_cross_reverse_pin. Build with
+        // -DINBAND_REVERSE_PIN_FAILBEFORE to reproduce the fails-before (no pin).
+        if (strcmp(argv[i], "--test-inband-reverse-pin") == 0) {
+            cl_arq_controller ARQ_rp;
+            int failed = ARQ_rp.test_inband_tier_cross_reverse_pin();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-adopt-preserve : run ONLY the robust->OFDM adopt live-burst PRESERVE

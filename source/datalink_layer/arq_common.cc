@@ -3175,6 +3175,69 @@ bool cl_arq_controller::inband_config_change_is_tier_crossing(int target_cfg)
 #endif
 }
 
+// IN-BAND TIER-CROSSING REVERSE-ACK PIN (data-flow-inband-tier-crossing.md §3) — the PURE
+// reverse-rung selector for an in-band robust<->OFDM tier-cross. VERIFIED root (off-bench,
+// _pipe_ab/redesign360): the redesign's intra-ROBUST climb rides the in-band CONFIG_TAG
+// (unilateral, NO SET_CONFIG), so reverse_configuration is NEVER seeded to a robust rung
+// and sits at its ctor sentinel CONFIG_NONE. At the robust->OFDM tier-cross the legacy
+// SET_CONFIG builder's generic fallthrough would set reverse to the FORWARD OFDM rung -> the
+// reverse SACK suffix must decode on OFDM in a tight turnaround and TIMES OUT on every cross
+// -> BREAK -> anchor-clamp -> 102<->0 oscillation. Legacy never hits this: it pins reverse to
+// a ROBUST rung for the whole climb (its SET_CONFIG climb seeds reverse robust), so the
+// reverse SACK rides a rock-solid MFSK rung across the cross (legacy log: forward=0 reverse=101).
+// This selector returns that robust rung: the live config on a robust->OFDM up-cross (it just
+// carried data reliably), or the target on an OFDM->robust down-cross (the target IS robust).
+// CONFIG_NONE => NOT an in-band crossing => caller keeps the legacy reverse seed. `inband_on`
+// is the feature gate (production passes inband_rate_feature_enabled(); the test drives it).
+int cl_arq_controller::inband_tier_cross_reverse_config(int from_cfg, int to_cfg,
+	bool inband_on) const
+{
+	if(!inband_on)
+		return CONFIG_NONE;                       // flag-off: legacy seed, byte-identical
+	if(to_cfg == CONFIG_NONE)
+		return CONFIG_NONE;                       // degenerate / no-op target
+	if(is_robust_config(from_cfg) == is_robust_config(to_cfg))
+		return CONFIG_NONE;                       // intra-tier — not a crossing
+	// Crossing: pin reverse to the ROBUST side of the boundary.
+	return is_robust_config(from_cfg) ? from_cfg  // robust->OFDM up-cross: hold the live rung
+	                                  : to_cfg;    // OFDM->robust down-cross: target is robust
+}
+
+// IN-BAND TIER-CROSSING LIVENESS-GUARD EXEMPTION (data-flow-inband-tier-crossing.md §3
+// PART B) — the PURE predicate the connect-liveness guard uses to NOT accrue a stall while
+// a deliberate robust<->OFDM tier-cross control handshake is in flight. A cross routes via
+// the §1 hybrid SET_CONFIG control handshake and legitimately sits in TRANSMITTING_CONTROL /
+// RECEIVING_ACKS_CONTROL with nAcked_data FLAT across the cross (the SET_CONFIG ACK + the
+// slow data-SACK turnaround) — identical signature to a livelock but it is the INTENDED
+// move, not a dead link. Reads is_tier_crossing(target) against the LIVE current_configuration
+// (the predicate's reference).
+//
+// THREE conjuncts, all required:
+//   (1) a control phase (TRANSMITTING_CONTROL / RECEIVING_ACKS_CONTROL), AND
+//   (2) the in-flight config change crosses the tier (is_tier_crossing(target)), AND
+//   (3) NO forward DATA batch is in flight (has_inflight_data == false).
+// Conjunct (3) is the discriminator that keeps the exemption from swallowing a GENUINE
+// post-data control-plane livelock: on the real FRAME-UP tier-cross the producer pushes
+// all messages_tx[] to the FIFO and frees them before the SET_CONFIG (arq_commander.cc:
+// 5515-5520), so cmd_has_inflight_data_batch() is FALSE during the cross handshake — the
+// cross is a PURE control op. But a stuck post-data session that happens to carry a stale
+// crossing `negotiated_configuration` (e.g. the bottom-rung ROBUST_0 livelock with an
+// in-flight PENDING_ACK batch — test_inband_liveness F3/F4) has has_inflight_data==TRUE, so
+// (3) is false and the exemption correctly STANDS DOWN, letting the genuine backstop fire.
+// True only when all three hold => the guard holds its streak at 0; otherwise it accrues as
+// before. No side effects — drives the production exemption AND its directed regression
+// identically. `has_inflight_data` is supplied by the caller (production passes
+// cmd_has_inflight_data_batch(); the test drives it).
+bool cl_arq_controller::inband_tiercross_handshake_exempts_liveness(int conn_status,
+	int target_cfg, bool has_inflight_data)
+{
+	bool in_control_phase = (conn_status == TRANSMITTING_CONTROL
+	                      || conn_status == RECEIVING_ACKS_CONTROL);
+	return in_control_phase
+	    && !has_inflight_data
+	    && inband_config_change_is_tier_crossing(target_cfg);
+}
+
 // ============================================================================
 // In-band rate adaptation — STAGE 4d: D1 repeat-until-followed + D4 climb/auto-demote
 // (inband-reliability-design.md §1 / §4)
