@@ -1721,6 +1721,12 @@ void cl_arq_controller::process_messages_acknowledging_control()
 					pad_messages_batch_tx(ack_batch_size);
 					send_batch();
 					load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+					// HYBRID SET_CONFIG CROSS: run the SAME OFDM-entry ring setup the
+					// unilateral adopt runs (shrink the oversized robust-floor ring back to
+					// the natural OFDM geometry) so a robust->OFDM data-config cross does not
+					// strand the ring-shrink (data-flow-robust-ofdm-adopt-flush.md §12).
+					if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
+						inband_finalize_ofdm_adopt_ring(data_configuration);
 				}
 			}
 		}
@@ -1749,6 +1755,10 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			{
 				if(g_verbose) { printf("[ACK-CTRL] Loading new data config %d (was %d)\n", data_configuration, current_configuration); fflush(stdout); }
 				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+				// HYBRID SET_CONFIG CROSS: run the shared OFDM-entry ring setup (ring-shrink)
+				// so a robust->OFDM cross is not stranded with an oversized acquisition ring.
+				if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
+					inband_finalize_ofdm_adopt_ring(data_configuration);
 			}
 		}
 		else
@@ -1762,6 +1772,10 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			pad_messages_batch_tx(ack_batch_size);
 			send_batch();
 			load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
+			// HYBRID SET_CONFIG CROSS: run the shared OFDM-entry ring setup (ring-shrink)
+			// so a robust->OFDM cross is not stranded with an oversized acquisition ring.
+			if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
+				inband_finalize_ofdm_adopt_ring(data_configuration);
 		}
 		// Capture frame + turnaround gap: CMD processing overhead only.
 		// See acknowledging_data for detailed comment.
@@ -8260,6 +8274,79 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 			check(nsymb_after >= robust_floor && nsymb_after > natural_c0,
 				"E2-DEFEAT (FAIL-BEFORE) ring stays OVERSIZED (preamble pinned at the tail beyond "
 				"upper_bound -> permanent `OFDM beyond-bounds`, never locks)",
+				nsymb_after, natural_c0);
+		}
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", "");
+
+	// ── PART E2 : THE HYBRID SET_CONFIG CROSS — close the FIX #1c reachability gap
+	//   (data-flow-robust-ofdm-adopt-flush.md §12). HEAD d28f02d routed the robust->OFDM
+	//   tier-cross through the legacy SET_CONFIG path: the responder adopts the DATA config
+	//   with plain load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES)
+	//   (arq_responder.cc:1723/1751/1764) and NEVER ran the ring-shrink, so the CONFIG_0 ring
+	//   stayed seated at the ROBUST floor (~1291 vs natural ~217). Every re-aired CONFIG_0
+	//   preamble then landed beyond the search upper bound (`OFDM beyond-bounds`) -> 0 forward
+	//   decode -> false-demote -> 36x loss to legacy at WGN:40. The fix calls the SHARED helper
+	//   inband_finalize_ofdm_adopt_ring(data_configuration) right after the cross's
+	//   load_configuration — the SAME setup the unilateral adopt runs. This Part reproduces the
+	//   cross EXACTLY: seat the robust floor (oversize the ring), do the cross's own
+	//   load_configuration(CONFIG_0, PHYSICAL_LAYER_ONLY, YES), then the helper.
+	//     PASS-AFTER (arm 0): the helper SHRINKS the ring to natural CONFIG_0 + sets the gate flag.
+	//     FAIL-BEFORE (arm 1, MERCURY_ADOPT_RING_SHRINK_DEFEAT=1): the helper's shrink is skipped
+	//       -> the ring stays OVERSIZED (the exact `OFDM beyond-bounds` stall the cross stranded).
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx(ROBUST_0);            // START in the ROBUST tier (the cross's origin)
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+
+		int natural_c0   = rx->inband_natural_ofdm_buffer_nsymb(CONFIG_0);
+		int robust_floor = rx->inband_robust_floor_buffer_nsymb();
+		bool oversize_possible = (robust_floor > natural_c0 && natural_c0 > 0);
+		check(oversize_possible,
+			"E2-0 robust floor larger than natural CONFIG_0 ring (the cross-path oversize amplifier)",
+			robust_floor, natural_c0 + 1);
+
+		// Seat the robust floor: model the redesign's down-ladder ring state at the cross instant.
+		rx->inband_seat_robust_ring_floor();
+		check((int)ts->data_container.buffer_Nsymb.load() >= robust_floor || !oversize_possible,
+			"E2-1 robust floor seated (ring oversized for OFDM acquisition before the cross)",
+			(int)ts->data_container.buffer_Nsymb.load(), robust_floor);
+
+		// THE CROSS, VERBATIM: the responder's data-config adopt is plain load_configuration with
+		// PHYSICAL_LAYER_ONLY + backup=YES (arq_responder.cc:1723/1751/1764). This re-runs set_size
+		// HONORING the still-raised buffer_Nsymb_min -> the ring is RE-ALLOCATED oversized.
+		rx->load_configuration(CONFIG_0, PHYSICAL_LAYER_ONLY, YES);
+		check((int)ts->data_container.buffer_Nsymb.load() > natural_c0 || !oversize_possible,
+			"E2-2 the bare cross load_configuration leaves the ring OVERSIZED (the stranded state)",
+			(int)ts->data_container.buffer_Nsymb.load(), natural_c0);
+
+		// THE FIX: the cross now calls the SHARED helper (gated inband + is_ofdm_config in production).
+		rx->inband_finalize_ofdm_adopt_ring(CONFIG_0);
+
+		int nsymb_after = (int)ts->data_container.buffer_Nsymb.load();
+		if(!defeat)
+		{
+			check(nsymb_after == natural_c0,
+				"E2-3-FIX the cross helper SHRANK the ring to natural CONFIG_0 (preamble back in-bounds "
+				"-> the cross can LOCK; reachability gap closed)",
+				nsymb_after, natural_c0);
+			check(rx->inband_ofdm_acq_ring_shrunk,
+				"E2-4-FIX inband_ofdm_acq_ring_shrunk set on the cross (per-pass robust re-seat suppressed)",
+				rx->inband_ofdm_acq_ring_shrunk ? 1 : 0, 1);
+			rx->inband_seat_robust_ring_floor();
+			check((int)ts->data_container.buffer_Nsymb.load() == natural_c0,
+				"E2-5-FIX re-seat SUPPRESSED while shrunk@OFDM after the cross (ring stays in-bounds)",
+				(int)ts->data_container.buffer_Nsymb.load(), natural_c0);
+		}
+		else
+		{
+			check(nsymb_after > natural_c0,
+				"E2-3-DEFEAT (FAIL-BEFORE) cross helper shrink skipped -> ring stays OVERSIZED "
+				"(`OFDM beyond-bounds`, never locks — the stranded-cross regression)",
 				nsymb_after, natural_c0);
 		}
 		delete rx; delete ts;

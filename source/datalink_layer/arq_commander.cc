@@ -13246,6 +13246,43 @@ int cl_arq_controller::test_climb_engine()
 			"X5 ceiling re-raise tops out AT the anchor (never above) regardless of streak depth",
 			config_ladder_index(c_cap), config_ladder_index(CONFIG_2));
 
+		// X6 — SECONDARY FIX: the robust/OFDM BOUNDARY tier-cross exemption
+		// (data-flow-robust-ofdm-adopt-flush.md §13). After a (false) demote pins BOTH
+		// the ceiling AND the anchor at robust-top (ROBUST_2) — the §16 TIER GATE forbids
+		// the anchor re-crossing into OFDM on robust evidence, so Rule 3 would cap the
+		// ceiling at ROBUST_2 forever and the +1 FRAME-UP probe to CONFIG_0 is walled. The
+		// exemption lets a re-proven robust-top anchor raise the ceiling EXACTLY one rung
+		// into the OFDM tier (the natural CONFIG_0 entry) so the cross can be re-attempted.
+		// ROBUST_2's sustained-anchor bar is N=1 (robust), so a single clean re-proof arms it.
+		{
+			int c_boundary = inband_ceiling_raise_target(
+				/*cur=*/ROBUST_2, /*anchor=*/ROBUST_2,
+				/*scfg=*/ROBUST_2, /*streak=*/sustained_anchor_threshold(ROBUST_2));
+			check(c_boundary == CONFIG_0,
+				"X6 robust-top anchor re-proven -> ceiling lifts ONE rung into OFDM (CONFIG_0); the "
+				"walled robust->OFDM +1 probe is re-enabled (post-demote deadlock unreachable)",
+				config_ladder_index(c_boundary), config_ladder_index(CONFIG_0));
+
+			// X6b — the exemption raises NO HIGHER than the one OFDM-entry rung: an already-
+			// CONFIG_0 ceiling at a robust-top anchor is a no-op (the +1 FRAME-UP clamp owns
+			// any further climb; the exemption never leaps past CONFIG_0).
+			int c_boundary2 = inband_ceiling_raise_target(
+				/*cur=*/CONFIG_0, /*anchor=*/ROBUST_2,
+				/*scfg=*/ROBUST_2, /*streak=*/sustained_anchor_threshold(ROBUST_2));
+			check(c_boundary2 == CONFIG_0,
+				"X6b robust-top exemption tops out AT the one OFDM-entry rung (no leap past CONFIG_0)",
+				config_ladder_index(c_boundary2), config_ladder_index(CONFIG_0));
+
+			// X6c — the exemption is STILL sustained-gated: streak below the robust bar holds
+			// the pin (no eager cross on a single fluke clean before the bar is met).
+			int c_boundary3 = inband_ceiling_raise_target(
+				/*cur=*/ROBUST_2, /*anchor=*/ROBUST_2,
+				/*scfg=*/ROBUST_2, /*streak=*/0);
+			check(c_boundary3 == ROBUST_2,
+				"X6c robust-top exemption stays sustained-gated (streak=0 holds the pin)",
+				config_ladder_index(c_boundary3), config_ladder_index(ROBUST_2));
+		}
+
 		// Restore a clean baseline for any later teardown.
 		supershift_proven_ceiling = -1;
 		clean_batches_at_current_config = 0;

@@ -988,6 +988,39 @@ public:
     // Rule 1: the demoted rung must have re-proven itself sustained-clean.
     if(clean_streak < sustained_anchor_threshold(streak_config))
       return current_ceiling;
+    // ── SECONDARY FIX (data-flow-robust-ofdm-adopt-flush.md §13): the robust/OFDM
+    //    BOUNDARY tier-cross exemption. ROOT of the post-demote deadlock at WGN:40:
+    //    after a (false) demote pins both the ceiling AND the anchor at robust-top
+    //    (ROBUST_2), the anchor can NEVER re-cross into the OFDM tier — the §16 TIER
+    //    GATE in data_anchor_raise_target refuses a robust->OFDM anchor cross on robust
+    //    evidence (a ROBUST clean ACK has a robust streak_config). So Rule 3 below caps
+    //    the ceiling AT that robust-top anchor forever, the FRAME-UP gate
+    //    (arq_commander.cc:5460: index(proposed) > index(ceiling) => blocked) walls the
+    //    +1 probe to CONFIG_0, and the link can NEVER re-attempt the cross even once the
+    //    ring is healthy and the channel recovered. The PRIMARY fix (ring-shrink) makes
+    //    the false-demote not happen in the first place; THIS is belt-and-suspenders for a
+    //    demote that already landed. EXEMPTION: when the re-proven anchor sits AT the top
+    //    robust rung (is_robust_config(anchor) && the next ladder rung is OFDM — i.e. the
+    //    natural CONFIG_0 entry), permit the ceiling to reach EXACTLY that one OFDM-entry
+    //    rung above robust-top — never higher. The existing +1 FRAME-UP anchor clamp
+    //    (arq_commander.cc:5468: proposed <= anchor+1) already permits CONFIG_0 above a
+    //    robust-top anchor, so this only lifts the CEILING wall; it probes ONE rung above
+    //    proven ground. If that CONFIG_0 probe fails, the gearshift decode-failure demote
+    //    (frame_gearshift_data_failed_nack/_pat / emergency_nack) re-pins the ceiling — so
+    //    no over-climb is opened (the +1 clamp remains the sole over-climb bound). Bounded,
+    //    inband-only (the sole caller is inband-gated, arq_commander.cc:5406).
+    {
+      int ai = config_ladder_index(anchor);
+      if(is_robust_config(anchor) && ai >= 0
+         && ai + 1 < FULL_CONFIG_LADDER_SIZE
+         && is_ofdm_config(FULL_CONFIG_LADDER[ai + 1]))
+      {
+        int ofdm_entry = FULL_CONFIG_LADDER[ai + 1];   // the natural CONFIG_0 entry
+        if(config_ladder_index(ofdm_entry) > config_ladder_index(current_ceiling))
+          return ofdm_entry;   // lift the ceiling one rung into the OFDM tier
+        return current_ceiling;
+      }
+    }
     // Rule 3: the target is the PROVEN anchor — never above it.
     if(config_ladder_index(anchor) <= config_ladder_index(current_ceiling))
       return current_ceiling;   // Rule 2: only ever RAISE
@@ -2066,6 +2099,22 @@ public:
   // paths are behaviourally IDENTICAL (one HINGE implementation, no divergence).
   // Caller guarantees followed_config != current_configuration (a real change).
   void inband_adopt_resynced_config(int followed_config);
+
+  // SHARED OFDM-ENTRY ADOPT SETUP (data-flow-robust-ofdm-adopt-flush.md §12) — the
+  // capture-ring geometry reconciliation an adopt INTO a config must run AFTER the PHY
+  // load: HINGE-1 stale-vs-live-burst flush/preserve, OFDM cursor re-anchor, FTR/anti-
+  // scroll re-init (fix #1b), and the natural-OFDM ring SHRINK + inband_ofdm_acq_ring_shrunk
+  // gate (fix #1c/#1d). Factored OUT of inband_adopt_resynced_config so BOTH adopt routes
+  // run IDENTICAL setup: (a) the redesign's UNILATERAL CONFIG_TAG-follow adopt, and (b) the
+  // HYBRID legacy SET_CONFIG cross (the responder's data-config adopt, arq_responder.cc:
+  // 1723/1751/1764) — which previously called only plain load_configuration and STRANDED the
+  // ring-shrink, leaving the CONFIG_0 ring oversized at the robust floor so every re-aired
+  // preamble landed beyond the search upper bound (`OFDM beyond-bounds`) -> 0 forward decode
+  // -> false-demote -> 36x loss to legacy at WGN:40. Caller MUST have already run
+  // load_configuration(adopted_config, ...) (so the PHY + ring geometry are at the new config)
+  // and MUST gate on inband_rate_feature_enabled() (legacy is byte-identical — never calls
+  // this). Honors the same MERCURY_ADOPT_* defeat knobs as the unilateral path.
+  void inband_finalize_ofdm_adopt_ring(int adopted_config);
 
   // Lazily (re)build the scoped down-window decoder bank for the configs in
   // FULL_CONFIG_LADDER[lo_idx .. hi_idx] (hi_idx-lo_idx+1 <= INBAND_DOWN_D_MAX+1).

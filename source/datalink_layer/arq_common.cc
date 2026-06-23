@@ -4305,6 +4305,37 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 
 	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
 
+	// OFDM-ENTRY ADOPT SETUP (HINGE-1 flush/preserve + cursor re-anchor + FTR re-init +
+	// natural-ring SHRINK). Factored into a shared helper so the HYBRID legacy SET_CONFIG
+	// cross (arq_responder.cc:1723/1751/1764) runs the SAME setup and can never again strand
+	// the ring-shrink (data-flow-robust-ofdm-adopt-flush.md §12).
+	inband_finalize_ofdm_adopt_ring(followed_config);
+
+	// HINGE-2: D3.1 bsi-window re-baseline + prev-storage drop (IDENTICAL to
+	// detect_and_follow_config_tag — rsp_last_delivered DELIBERATELY preserved).
+	if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+	{
+		rsp_current_expected_batch_seq_id = -1;
+		rsp_prev_batch_seq_id             = -1;
+		rsp_prev_batch_active             = false;
+		rsp_prev_batch_received_count     = 0;
+		rsp_prev_batch_expected_count     = 0;
+		bigblock_partial_armed            = false;
+		for(int i=0; i<this->nMessages; i++)
+			messages_rx_prev[i].status = FREE;
+	}
+}
+
+// SHARED OFDM-ENTRY ADOPT SETUP — see arq.h. Body is the VERBATIM capture-ring block
+// (HINGE-1 flush/preserve, OFDM cursor re-anchor, FTR/anti-scroll re-init #1b, natural ring
+// SHRINK + shrink-gate flag #1c/#1d) lifted out of inband_adopt_resynced_config so BOTH the
+// unilateral CONFIG_TAG-follow adopt AND the hybrid SET_CONFIG cross run identical setup.
+// `adopted_config` is the config just loaded; caller already ran load_configuration(adopted_
+// config, ...) and gated on inband_rate_feature_enabled().
+void cl_arq_controller::inband_finalize_ofdm_adopt_ring(int adopted_config)
+{
+	int followed_config = adopted_config;   // keep the original local name verbatim below
+
 	// HINGE-1: capture-buffer flush (IDENTICAL to detect_and_follow_config_tag and the
 	// SET_CONFIG RSP handler — stale OFDM preambles false-lock Schmidl-Cox at the new
 	// config without it). data-flow-robust-ofdm-adopt-flush.md §1/§6.
@@ -4506,20 +4537,6 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 			   && telecom_system->data_container.buffer_Nsymb.load() <= natural_nsymb)
 				inband_ofdm_acq_ring_shrunk = true;
 		}
-	}
-
-	// HINGE-2: D3.1 bsi-window re-baseline + prev-storage drop (IDENTICAL to
-	// detect_and_follow_config_tag — rsp_last_delivered DELIBERATELY preserved).
-	if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
-	{
-		rsp_current_expected_batch_seq_id = -1;
-		rsp_prev_batch_seq_id             = -1;
-		rsp_prev_batch_active             = false;
-		rsp_prev_batch_received_count     = 0;
-		rsp_prev_batch_expected_count     = 0;
-		bigblock_partial_armed            = false;
-		for(int i=0; i<this->nMessages; i++)
-			messages_rx_prev[i].status = FREE;
 	}
 }
 
