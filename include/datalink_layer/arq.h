@@ -2190,6 +2190,19 @@ public:
   // (preserve is OFDM-target-only). data-flow-robust-ofdm-adopt-flush.md §6/§8.
   int test_inband_adopt_preserve_live_burst();
 
+  // IN-BAND ROBUST->OFDM RING-SHRINK Nofdm-INVARIANT REGRESSION (CLI
+  // --test-inband-adopt-nofdm-invariant). The HINGE-1 ring-shrink
+  // (force_set_capture_ring_natural) re-derived the per-symbol OFDM geometry
+  // (Nofdm = Nfft+Ngi) from the LIVE ofdm.gi, which can be STALE at the cross
+  // (54/256 -> 310) while the just-loaded data_container.Nofdm holds the correct
+  // config geometry (3.0 ms GI -> Ngi=36 -> 292). The recompute overwrote 292 with
+  // 310 -> an 18-sample/symbol FFT-window drift -> LDPC iter=0 -> garbage CRC -> the
+  // CONFIG_0 under-decode (~53 B). The fix PRESERVES data_container.Nofdm across the
+  // shrink (Approach A). PASS-AFTER: Nofdm invariant (292). FAIL-BEFORE
+  // (MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1, same binary): Nofdm drifts 292->310.
+  // data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc.
+  int test_inband_adopt_nofdm_invariant();
+
   // IN-BAND FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER REGRESSION (CLI
   // --test-inband-deliver). The 785-frame decode-but-0-deliver rework: a forward-healthy
   // reverse-ACK turnaround MISS (nAcked_data flat) tripped the connect-liveness guard's

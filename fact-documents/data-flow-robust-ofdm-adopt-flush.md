@@ -535,3 +535,75 @@ The CONFIG_0 forward-decode RATE is too low to sustain/climb (seed 2001: 6 OFDM-
 This is a SEPARATE layer (CONFIG_0 decode rate / climb-from-CONFIG_0), NOT the capture-ring geometry.
 [?] Next: characterize why CONFIG_0 OFDM-OK rate stays low after a clean coarse lock (FTR/snapshot
 timing for the live re-aired burst, or the SNR margin at WGN:40 CONFIG_0).
+
+~~[?] OPEN as of §14.5~~ — RESOLVED in §15: the low CONFIG_0 OFDM-OK rate was the ring-shrink
+**Nofdm drift**, NOT FTR/snapshot timing or SNR margin. The §14 fix held buffer_Nsymb (ring SIZE);
+§15 holds Nofdm (per-symbol GEOMETRY), the remaining skew from the SAME throwaway-vs-live `ofdm.gi`
+disagreement.
+
+## §15 Fix — the ring-shrink Nofdm/GI drift (the CONFIG_0 under-decode root, diagnosis a468b2fc)
+
+### §15.1 The bug (VERIFIED — diagnosis run `_probe/lwp2001.arqlog`)
+
+After §14 (#1e fixes the ring SIZE re-grow), the redesign HELD CONFIG_0 but under-decoded (~53 B, all
+OFDM-FAIL `iter=0` with `meanH=0.98` + preamble metric `0.999`, garbage CRC `0xC7C3`) — the §14.5
+residual. ROOT: `force_set_capture_ring_natural()` (telecom_system.cc) — the HINGE-1 ring-shrink — RE-
+DERIVED the per-symbol OFDM geometry `Nofdm = ofdm.Nfft*(1+ofdm.gi)` from the LIVE `ofdm` object,
+which can be STALE at the cross. The just-completed `load_configuration` had installed the CORRECT
+`data_container.Nofdm` (CONFIG_0 with the startup 3.0 ms GI: `Ngi=36` → `Nofdm=292`; `main.cc:4103`
+writes `default_configurations.ofdm_gi = 36/256`), but the live `ofdm.gi` sat at the
+`physical_config.cc:37` default `54/256` → `Nofdm=310`. The recompute OVERWROTE 292 with 310.
+
+DIAGNOSIS LOG (the smoking gun — RSP, one CONFIG_0 visit):
+```
+T+0174.758 [RSP] init() done (... Nsymb=48 Nofdm=292 buffer_Nsymb=1291)   ← the LOAD: correct 292
+T+0174.994 [RSP] init() done (... Nsymb=48 Nofdm=310 buffer_Nsymb=212)    ← the SHRINK: drifted to 310
+T+0175.245 [CMD] init() done (... Nsymb=48 Nofdm=292 ...)                  ← CMD/TX stays 292
+```
+TX + the legacy demod run at Nofdm=292; the redesign RSP now demods at 310 → an **18-sample/symbol**
+(310−292) FFT-window drift accrues across the 48-symbol CONFIG_0 frame → degenerate LLRs → LDPC
+`iter=0` → garbage CRC. Legacy NEVER calls the shrink (keeps 292, decodes first try, climbs 0→16).
+
+This is the SAME root as §14's 212/217 size skew: the live `ofdm.gi` (54/256) disagreeing with the
+loaded geometry (36/256). §14 fixed the SIZE symptom (gating on `buffer_Nsymb_min`); §15 fixes the
+GEOMETRY symptom (Nofdm), the actual decode-killer. The shrink producing `buffer_Nsymb=212` (the
+throwaway number) instead of the correct 217 was the visible tell that its Nofdm arg was also wrong.
+
+### §15.2 The fix (Approach A — telecom_system.cc force_set_capture_ring_natural + force_resize_capture_ring)
+
+Drive the `Nofdm` argument to `set_size` from the AUTHORITATIVE, already-correct `data_container.Nofdm`
+(the value the load installed) instead of `ofdm.Nfft*(1+ofdm.gi)`, so the symbol geometry is INVARIANT
+across the ring resize — ONLY the ring SIZE (buffer_Nsymb) changes, which is the shrink's sole intent.
+Applied to BOTH ring-resize producers that share the recompute pattern:
+- `force_set_capture_ring_natural()` (the natural shrink, sole caller arq_common.cc:4520).
+- `force_resize_capture_ring()` (the robust-floor GROW, sole caller `inband_seat_robust_ring_floor`,
+  arq_common.cc:4010) — SIBLING-fixed for completeness (the floor dominates its buffer_Nsymb, but its
+  Nofdm field would drift identically if `ofdm.gi` were ever stale at a re-seat).
+FAIL-BEFORE / A-B knob `MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1` restores the legacy recompute on the
+SAME binary (reproduces 292→310). Production never sets it. With the fix, the live geometry now yields
+the CORRECT `buffer_Nsymb=217` (matching legacy / fix #1c's natural ring), not the throwaway's 212.
+
+### §15.3 Regression test (in-process, fails-before / passes-after)
+
+`cl_arq_controller::test_inband_adopt_nofdm_invariant()` (arq_responder.cc, CLI
+`--test-inband-adopt-nofdm-invariant`, also in the master `--test`). Installs the production 3.0 ms GI
+(`Ngi=36` → load `Nofdm=292`, mirroring main.cc:4103), seats the robust floor, runs the cross's bare
+`load_configuration(CONFIG_0, PHYSICAL_LAYER_ONLY, YES)`, PERTURBS the live `ofdm.gi` back to 54/256
+(modelling the exact production staleness — the finalize helper does NOT re-load, so it survives to the
+shrink), then runs `inband_finalize_ofdm_adopt_ring(CONFIG_0)` and asserts `data_container.Nofdm`
+INVARIANT. arm 0 (fix): 292 held. arm 1 (`MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1`): 292→310 (the bug).
+Also asserts the ring STILL shrank to the natural OFDM size (217 < 400) — geometry-preserve must not
+defeat the §14 size shrink. Master `--test` exit 0.
+
+### §15.4 §5 AUDIT — VERDICT: size-shrink + down-ladder re-seat + legacy preserved (YES)
+
+- (a) Ring-SIZE shrink (#1c/#1e, the 217 natural ring for preamble bounds): UNCHANGED. The fix touches
+  only the Nofdm `set_size` arg; `buffer_Nsymb` is computed from `buffer_Nsymb_min=0` (un-seated) →
+  natural sizing. The fix makes it yield the CORRECT 217 (was 212 under the drift). Adopt-preserve PART
+  E2/E4 still pass.
+- (b) Down-ladder robust-floor re-seat on demote: UNCHANGED. `inband_seat_robust_ring_floor` /
+  `force_resize_capture_ring` GROW the ring to the floor (floor dominates buffer_Nsymb); the sibling
+  Nofdm-preserve only holds the geometry invariant, never blocks the grow. F-tests + down-ladder test pass.
+- (c) Legacy: both functions are reached ONLY via `inband_rate_feature_enabled()`-gated paths; off →
+  neither runs → byte-identical. On the inband path, when `ofdm.gi` is NOT stale the preserved value
+  EQUALS the old recompute → no behavior change except in the stale window the bug lived in.

@@ -723,6 +723,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_adopt_preserve_live_burst();
             }
+            // ROBUST->OFDM ADOPT ring-shrink Nofdm-INVARIANT regression (diagnosis a468b2fc):
+            // the HINGE-1 shrink re-derived Nofdm (= Nfft+Ngi) from a STALE live ofdm.gi,
+            // drifting CONFIG_0 from 292 to 310 -> an 18-sample/symbol FFT-window drift ->
+            // LDPC iter=0 -> garbage CRC -> the CONFIG_0 under-decode (~53 B). The fix preserves
+            // the just-loaded data_container.Nofdm across the shrink. Member test on a throwaway
+            // controller (builds its own telecom_system). Fast + deterministic, no IONOS/RF.
+            // data-flow-robust-ofdm-adopt-flush.md §15.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_adopt_nofdm_invariant();
+            }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
             // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.
@@ -836,6 +847,14 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-adopt-preserve") == 0) {
             cl_arq_controller ARQ_adopt;
             int failed = ARQ_adopt.test_inband_adopt_preserve_live_burst();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-adopt-nofdm-invariant : run ONLY the robust->OFDM ring-shrink
+        // Nofdm-invariant regression (diagnosis a468b2fc) and exit. Fast + deterministic;
+        // see arq_responder.cc::test_inband_adopt_nofdm_invariant + data-flow-robust-ofdm-adopt-flush.md §15.
+        if (strcmp(argv[i], "--test-inband-adopt-nofdm-invariant") == 0) {
+            cl_arq_controller ARQ_nofdm;
+            int failed = ARQ_nofdm.test_inband_adopt_nofdm_invariant();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock

@@ -8487,6 +8487,176 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 	return failed == 0 ? 0 : 1;
 }
 
+// FIX (data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc): the OFDM SYMBOL GEOMETRY
+// (Nofdm = Nfft+Ngi) MUST be INVARIANT across the HINGE-1 robust->OFDM ring-shrink. The shrink
+// (force_set_capture_ring_natural, telecom_system.cc) un-seats the robust ring floor and re-runs
+// set_size to re-allocate the ring at the config's NATURAL buffer_Nsymb — but the PRE-FIX code
+// passed the Nofdm `set_size` argument as `ofdm.Nfft*(1+ofdm.gi)`, RE-DERIVING it from the LIVE
+// `ofdm` object. At the cross instant `ofdm.gi` can be STALE at the physical_config default
+// (54/256 -> Nofdm=310) while the JUST-LOADED data_container.Nofdm holds the correct config
+// geometry (with the startup 3.0 ms GI: Ngi=36 -> Nofdm=292). The recompute then OVERWROTE 292
+// with 310, so the redesign RSP demodulated CONFIG_0 at the wrong per-symbol stride -> an
+// 18-sample/symbol FFT-window drift across the 48-sym frame -> LDPC iter=0 -> garbage CRC ->
+// the CONFIG_0 under-decode (~53 B vs legacy's climb to CONFIG_16). DIAGNOSIS LOG
+// (_probe/lwp2001.arqlog): T+0174.758 load Nofdm=292 -> T+0174.994 shrink Nofdm=310.
+//
+// This directed test reproduces the cross EXACTLY in-process (no PHY/audio/IONOS/RF):
+//   1. Install the production 3.0 ms GI default (Ngi=36 -> CONFIG_0 Nofdm=292; the same write
+//      main.cc:4103 does at startup), so the LOAD installs data_container.Nofdm=292.
+//   2. Build the RX, seat the robust floor (oversize the ring — the redesign down-ladder state).
+//   3. PERTURB the live `ofdm.gi` back to the physical_config default 54/256 to MODEL the exact
+//      production staleness (the live `ofdm.gi` disagreeing with data_container.Nofdm). The
+//      legacy recompute then yields 310; the fix's PRESERVE yields the loaded 292.
+//   4. ADOPT into CONFIG_0 (runs the shrink) and assert data_container.Nofdm INVARIANT.
+//     PASS-AFTER (arm 0): Nofdm stays 292 across the shrink (geometry preserved -> RSP demods at
+//       the correct stride -> the frame decodes).
+//     FAIL-BEFORE (arm 1, MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1, SAME binary): the legacy
+//       recompute fires -> Nofdm 292->310 (the window-drift bug). Permanent regression gate.
+int cl_arq_controller::test_inband_adopt_nofdm_invariant()
+{
+	const char* TAG = "[TEST-INBAND-ADOPT-NOFDM-INVARIANT]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// The production 3.0 ms GI -> Ngi = round(3.0 * 12) = 36 -> CONFIG_0 Nofdm = 256+36 = 292.
+	// This is the EXACT value main.cc:4090-4106 installs at startup; the standalone --test path
+	// would otherwise keep the physical_config.cc:37 raw default (54/256 -> 310) and never see
+	// the 292 the production modem (and the diagnosis log) operate at.
+	const int   PROD_NGI       = (int)(3.0 * 12.0 + 0.5);   // 36
+	const float PROD_GI        = (float)PROD_NGI / 256.0f;  // 36/256
+	const int   EXPECT_NOFDM   = 256 + PROD_NGI;            // 292
+	const int   STALE_NOFDM    = 256 + 54;                  // 310 (physical_config default gi)
+
+	auto build_rx = [&](int start_cfg) -> std::pair<cl_arq_controller*, cl_telecom_system*> {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode    = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		// Install the production GI BEFORE the first load so the config loads at Nofdm=292.
+		ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI;
+		rx->telecom_system       = ts_rx;
+		rx->narrowband_enabled   = NO;
+		rx->role                 = RESPONDER;
+		rx->robust_enabled       = YES;
+		rx->sack_v2_enabled      = true;
+		rx->inband_rate_enabled  = 1;
+		rx->load_configuration(start_cfg, FULL, NO);
+		rx->link_status          = CONNECTED;
+		rx->connection_status    = RECEIVING;
+		rx->passive_monitor      = false;
+		rx->rsp_current_expected_batch_seq_id = 4;
+		return {rx, ts_rx};
+	};
+	auto paint_burst = [&](cl_telecom_system* ts, double amp, int rwi) {
+		int sp = ts->data_container.Nofdm * ts->data_container.buffer_Nsymb.load()
+		       * ts->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		for(int i = 0; i < 2 * sp; i++) ts->data_container.passband_delayed_data[i] = 0.0;
+		ts->data_container.ring_write_index = rwi;
+		if(amp > 0.0)
+			for(int i = 0; i < sp; i++) {
+				double s = amp * sin(0.37 * (double)i);
+				ts->data_container.passband_delayed_data[(rwi + i) % sp]        = s;
+				ts->data_container.passband_delayed_data[((rwi + i) % sp) + sp] = s;
+			}
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		return sp;
+	};
+
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx(ROBUST_0);          // START in the ROBUST tier (the cross's true origin)
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+
+		// Seat the robust floor (oversize the ring) — the redesign down-ladder ring state at the
+		// cross — so force_set_capture_ring_natural actually re-runs set_size (the shrink path).
+		rx->inband_seat_robust_ring_floor();
+
+		// THE CROSS, VERBATIM: the responder's data-config adopt is the bare load_configuration
+		// with PHYSICAL_LAYER_ONLY + backup=YES (arq_responder.cc:1723/1751/1764), the SAME first
+		// half inband_adopt_resynced_config runs internally. This installs the correct CONFIG_0
+		// geometry into data_container.Nofdm (292) and re-syncs ofdm.gi to the loaded default.
+		rx->load_configuration(CONFIG_0, PHYSICAL_LAYER_ONLY, YES);
+		check(ts->data_container.Nofdm == EXPECT_NOFDM,
+			"P0 the cross load installed the production CONFIG_0 geometry (Nofdm = Nfft+Ngi36)",
+			ts->data_container.Nofdm, EXPECT_NOFDM);
+
+		// MODEL THE PRODUCTION STALENESS (diagnosis a468b2fc): AFTER the load installs Nofdm=292
+		// into data_container, drive the LIVE ofdm.gi out of sync (back to the physical_config
+		// default 54/256). This is the exact disagreement the diagnosis traced at the cross instant
+		// (the live ofdm.gi disagreeing with the just-loaded data_container.Nofdm). The shrink's
+		// legacy recompute `ofdm.Nfft*(1+ofdm.gi)` now yields 310; the loaded Nofdm still holds 292.
+		// The finalize helper below does NOT re-run load_configuration, so this perturbation
+		// survives to the shrink — faithfully reproducing the production divergence.
+		ts->ofdm.gi = 54.0f / 256.0f;
+		check((int)(ts->ofdm.Nfft * (1 + ts->ofdm.gi)) == STALE_NOFDM,
+			"P1 live ofdm.gi perturbed stale (legacy recompute would yield 310 — the bug source)",
+			(int)(ts->ofdm.Nfft * (1 + ts->ofdm.gi)), STALE_NOFDM);
+
+		int nofdm_before = ts->data_container.Nofdm;
+		paint_burst(ts, 0.8, 3 * ts->data_container.Nofdm * ts->data_container.interpolation_rate);
+
+		// THE SECOND HALF of the adopt — HINGE-1 + the ring-shrink (force_set_capture_ring_natural).
+		// The SAME helper inband_adopt_resynced_config calls after its load_configuration.
+		rx->inband_finalize_ofdm_adopt_ring(CONFIG_0);
+		int nofdm_after = ts->data_container.Nofdm;
+
+		if(!defeat)
+		{
+			check(nofdm_after == nofdm_before && nofdm_after == EXPECT_NOFDM,
+				"INVARIANT-FIX data_container.Nofdm UNCHANGED across the ring-shrink (292 held -> "
+				"RSP demods CONFIG_0 at the correct per-symbol stride -> frame decodes)",
+				nofdm_after, EXPECT_NOFDM);
+			// The ring still SHRANK to the natural OFDM size (fix #1c/#1e intact — geometry-preserve
+			// must not defeat the size shrink).
+			check((int)ts->data_container.buffer_Nsymb.load() < 400,
+				"INVARIANT-FIX the ring STILL shrank to the natural OFDM size (#1c/#1e preserved)",
+				(int)ts->data_container.buffer_Nsymb.load(), 400);
+		}
+		else
+		{
+			check(nofdm_after == STALE_NOFDM,
+				"INVARIANT-DEFEAT (FAIL-BEFORE) the legacy recompute drifted Nofdm 292->310 "
+				"(18-sample/symbol FFT-window drift -> LDPC iter=0 -> garbage CRC -> ~53 B)",
+				nofdm_after, STALE_NOFDM);
+		}
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT", "");
+
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // ============================================================================
 // In-band FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK DELIVER — --test-inband-deliver
 // data-flow-inband-retx-epoch.md §5.  (the 785-frame decode-but-0-deliver rework)

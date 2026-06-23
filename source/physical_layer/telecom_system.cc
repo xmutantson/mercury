@@ -11072,6 +11072,18 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 
 	MUTEX_LOCK(&capture_prep_mutex);
 	data_container.buffer_Nsymb_min = min_nsymb;
+	// SIBLING of the §15 fix (diagnosis a468b2fc): like force_set_capture_ring_natural, this
+	// re-runs set_size to re-allocate the ring at the raised robust floor. PRESERVE the just-
+	// loaded data_container.Nofdm (the per-symbol OFDM geometry) instead of re-deriving it from
+	// the live `ofdm.gi`, which can be stale at a tier cross (54/256 -> 310 vs the loaded 292)
+	// and would otherwise drift data_container.Nofdm here too. The floor (min_nsymb) dominates
+	// buffer_Nsymb so the GROW is unaffected; only the Nofdm geometry is held invariant. Same
+	// inband scope (sole caller inband_seat_robust_ring_floor) + same FAIL-BEFORE knob.
+	int preserved_Nofdm = data_container.Nofdm;
+	bool nofdm_preserve_defeat = false;
+	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
+	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
+	int nofdm_arg = nofdm_preserve_defeat ? (int)(ofdm.Nfft*(1+ofdm.gi)) : preserved_Nofdm;
 	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),
 	// branching on the live modulation. set_size frees + re-allocates all data_container
 	// buffers honoring buffer_Nsymb_min (data_container.cc:161), so the ring grows.
@@ -11079,13 +11091,13 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 	{
 		int M_eff = 1 << mfsk.bits_per_symbol();
 		data_container.set_size(ofdm.Nsymb, ofdm.Nc, M_eff, ofdm.Nfft,
-			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
 			frequency_interpolation_rate);
 	}
 	else
 	{
 		data_container.set_size(ofdm.pilot_configurator.nData, ofdm.Nc, M, ofdm.Nfft,
-			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
 			frequency_interpolation_rate);
 	}
 	data_container.ring_write_index = 0;
@@ -11114,20 +11126,55 @@ void cl_telecom_system::force_set_capture_ring_natural()
 	if(data_container.Nofdm <= 0) return;
 	MUTEX_LOCK(&capture_prep_mutex);
 	data_container.buffer_Nsymb_min = 0;   // un-seat the raised robust floor
+
+	// FIX (data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc): preserve the
+	// per-symbol OFDM geometry (Nofdm = Nfft+Ngi) that the JUST-COMPLETED load_configuration
+	// installed, instead of RE-DERIVING it from the live `ofdm` object. The shrink runs at the
+	// HINGE-1 robust->OFDM cross (arq_common.cc:4520) immediately after load_configuration set
+	// data_container.Nofdm to the config's correct value (e.g. CONFIG_0 with the startup 3.0 ms
+	// GI -> Ngi=36 -> Nofdm=292; main.cc:4103 writes default_configurations.ofdm_gi=36/256). But
+	// the live `ofdm.gi` is NOT guaranteed in sync with data_container.Nofdm at this instant: a
+	// robust/MFSK dwell + the partial reinit_subsystems gating can leave `ofdm.gi` stale at the
+	// physical_config.cc:37 default (54/256 -> Nofdm=310). Recomputing `ofdm.Nfft*(1+ofdm.gi)`
+	// here then OVERWRITES the correct 292 with 310 (DIAGNOSIS LOG _probe/lwp2001.arqlog:
+	// T+0174.758 load Nofdm=292 -> T+0174.994 shrink Nofdm=310). TX + the legacy demod stay at
+	// 292; the redesign RSP now demods at 310 -> an 18-sample/symbol FFT-window drift accrues
+	// across the 48-sym CONFIG_0 frame -> degenerate LLRs -> LDPC iter=0 -> garbage CRC 0xC7C3 ->
+	// the CONFIG_0 under-decode (~53 B, all OFDM-FAIL with meanH 0.98 + preamble metric 0.999).
+	// Legacy NEVER calls this shrink, so it keeps 292 and climbs 0->16.
+	//
+	// APPROACH A: drive the Nofdm `set_size` argument from the AUTHORITATIVE, already-correct
+	// data_container.Nofdm (the value the load installed) so the GI/Nofdm symbol geometry is
+	// INVARIANT across the ring-shrink. ONLY the ring SIZE (buffer_Nsymb) changes — exactly the
+	// shrink's intent. Nc/Nsymb/preamble_nSymb/nData are taken from the same live `ofdm` the
+	// existing call used (they did not regress; only the gi-derived Nofdm did). Inband-scoped:
+	// this function is reached ONLY from the inband adopt path (arq_common.cc:4520, gated on
+	// inband_rate_feature_enabled()); legacy never calls it -> legacy byte-identical.
+	//
+	// FAIL-BEFORE / A-B knob: MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1 restores the legacy
+	// recompute `ofdm.Nfft*(1+ofdm.gi)` on the SAME binary, reproducing the 292->310 drift the
+	// directed test (test_inband_adopt_nofdm_invariant) asserts against. Production never sets it.
+	int preserved_Nofdm = data_container.Nofdm;   // installed by the load; the correct geometry
+	bool nofdm_preserve_defeat = false;
+	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
+	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
+	int nofdm_arg = nofdm_preserve_defeat ? (int)(ofdm.Nfft*(1+ofdm.gi)) : preserved_Nofdm;
+
 	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),
 	// branching on the live modulation. With buffer_Nsymb_min=0, set_size computes the config's
-	// NATURAL buffer_Nsymb (data_container.cc:147-163), re-allocating the ring at that size.
+	// NATURAL buffer_Nsymb (data_container.cc:147-163), re-allocating the ring at that size. The
+	// Nofdm arg is the PRESERVED value (Approach A) so the symbol geometry never drifts.
 	if(M == MOD_MFSK)
 	{
 		int M_eff = 1 << mfsk.bits_per_symbol();
 		data_container.set_size(ofdm.Nsymb, ofdm.Nc, M_eff, ofdm.Nfft,
-			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
 			frequency_interpolation_rate);
 	}
 	else
 	{
 		data_container.set_size(ofdm.pilot_configurator.nData, ofdm.Nc, M, ofdm.Nfft,
-			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
 			frequency_interpolation_rate);
 	}
 	data_container.ring_write_index = 0;
