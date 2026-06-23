@@ -4503,11 +4503,19 @@ void cl_arq_controller::inband_finalize_ofdm_adopt_ring(int adopted_config)
 		{
 			int natural_nsymb = inband_natural_ofdm_buffer_nsymb(followed_config);
 			int cur_nsymb = telecom_system->data_container.buffer_Nsymb.load();
-			if(natural_nsymb > 0 && cur_nsymb > natural_nsymb)
+			// FIX #1e: trigger the shrink on the AUTHORITATIVE "robust floor is seated" signal
+			// (buffer_Nsymb_min > 0) rather than the size compare `cur_nsymb > natural_nsymb`. The
+			// size compare used inband_natural_ofdm_buffer_nsymb() (a throwaway instance -> 212) which
+			// disagrees with the live force_set_capture_ring_natural() geometry (217); that 5-symbol
+			// skew is what broke the flag-set below. Gating the SHRINK on buffer_Nsymb_min>0 fires it
+			// EXACTLY when (and only when) a raised robust floor is oversizing the ring — immune to the
+			// size skew, idempotent (a no-op once the floor is un-seated). natural_nsymb is logged only.
+			if(telecom_system->data_container.buffer_Nsymb_min > 0)
 			{
-				printf("[INBAND-RX] HINGE-1 OFDM-RING SHRINK: CONFIG_%d ring buffer_Nsymb %d -> natural %d "
-					"(un-seat robust floor; oversized ring put every preamble at the tail beyond upper)\n",
-					followed_config, cur_nsymb, natural_nsymb);
+				printf("[INBAND-RX] HINGE-1 OFDM-RING SHRINK: CONFIG_%d ring buffer_Nsymb %d -> natural (~%d) "
+					"(un-seat robust floor min=%d; oversized ring put every preamble at the tail beyond upper)\n",
+					followed_config, cur_nsymb, natural_nsymb,
+					(int)telecom_system->data_container.buffer_Nsymb_min);
 				fflush(stdout);
 				telecom_system->force_set_capture_ring_natural();
 				// Re-arm the FTR/anti-scroll AFTER the realloc (set_size reset frames_to_read to
@@ -4520,22 +4528,37 @@ void cl_arq_controller::inband_finalize_ofdm_adopt_ring(int adopted_config)
 				telecom_system->data_container.frames_to_read = frame_symb2 + 10;
 				MUTEX_UNLOCK(&capture_prep_mutex);
 			}
-			// FIX #1d (data-flow-robust-ofdm-adopt-flush.md §11): set the shrink GATE flag whenever
-			// we adopt INTO an OFDM config AND the live ring is now at (or below) the natural OFDM
-			// geometry — NOT only when a physical shrink just ran. RATIONALE: the diagnosis found the
-			// shrink branch above did NOT fire in one run because the robust-floor seat had not yet
-			// grown the ring at the adopt instant (cur_nsymb == natural_nsymb -> the `>` test fails ->
-			// the flag was left UNSET). With the flag unset a LATER inband_seat_robust_ring_floor pass
-			// (its gate :3809 needs the flag) re-grows the ring 217->804 and re-blocks OFDM acquisition
-			// — the SAME lock-collapse, just deferred. The flag's true meaning is "we hold a
-			// natural-geometry OFDM lock; do NOT let a robust-floor seat re-grow it" — an invariant that
-			// must hold whenever the ring is at natural for this OFDM config, independent of the
-			// adopt-instant ordering. So set it whenever adopt_into_ofdm AND cur ring <= natural. The
-			// flag still clears on a demote to a robust config (:3811-3812 / :4149). ring_shrink_defeat
-			// gates this too (the FAIL-BEFORE arm keeps the oversized ring -> flag stays meaningful-off).
-			if(natural_nsymb > 0
-			   && telecom_system->data_container.buffer_Nsymb.load() <= natural_nsymb)
+			// FIX #1d / #1e (data-flow-robust-ofdm-adopt-flush.md §11/§14): set the shrink GATE flag
+			// whenever we adopt INTO an OFDM config AND the live capture ring's robust floor is
+			// UN-SEATED (buffer_Nsymb_min == 0) — i.e. the ring physically holds the NATURAL OFDM
+			// geometry, not the raised robust floor.
+			//
+			// FIX #1e ROOT (VERIFIED — diagnosis run _probe/lwp2001.arqlog, FINALIZE-PROBE):
+			//   "OFDM-RING SHRINK: CONFIG_0 ring 1291 -> natural 212"   then   ring is actually 217,
+			//   so the OLD gate `buffer_Nsymb.load() <= natural_nsymb` was `217 <= 212` == FALSE -> the
+			//   flag stayed 0 -> 2ms later inband_seat_robust_ring_floor re-grew the ring 217 -> 804 ->
+			//   every CONFIG_0 preamble back at the tail beyond upper_bound -> 0 forward decode -> the
+			//   commander false-demotes CONFIG_0 -> ROBUST_2 (the CONFIG_0<->ROBUST_2 oscillation, 53 B
+			//   vs legacy's climb to CONFIG_12-16 / 8000+ B). The 212-vs-217 mismatch is a 5-symbol
+			//   disagreement between inband_natural_ofdm_buffer_nsymb() (a THROWAWAY cl_telecom_system
+			//   whose fresh load yields 212) and force_set_capture_ring_natural() (the LIVE set_size
+			//   yields 217). Comparing the live ring against the throwaway's number is the fragile bug.
+			//   The AUTHORITATIVE signal the flag actually means — "the robust floor is un-seated and we
+			//   hold the natural OFDM ring" — is buffer_Nsymb_min == 0, which force_set_capture_ring_
+			//   natural() guarantees (telecom_system.cc:11116) and which inband_seat_robust_ring_floor()
+			//   re-raises on a real robust re-seat. Gating on it is immune to the 212/217 size skew and
+			//   to the adopt-instant ordering (the #1d concern). The flag still clears on a demote to a
+			//   robust config (:3972-3973 / :4376). ring_shrink_defeat keeps the oversized ring on the
+			//   FAIL-BEFORE arm, so buffer_Nsymb_min stays raised there -> flag stays meaningfully-off.
+			if(telecom_system->data_container.buffer_Nsymb_min == 0)
 				inband_ofdm_acq_ring_shrunk = true;
+			printf("[INBAND-RX] HINGE-1 OFDM-RING flag: CONFIG_%d ring=%d buf_min=%d shrunk=%d "
+				"(natural-geometry OFDM lock held; robust-floor re-seat suppressed)\n",
+				followed_config,
+				(int)telecom_system->data_container.buffer_Nsymb.load(),
+				(int)telecom_system->data_container.buffer_Nsymb_min,
+				(int)inband_ofdm_acq_ring_shrunk);
+			fflush(stdout);
 		}
 	}
 }

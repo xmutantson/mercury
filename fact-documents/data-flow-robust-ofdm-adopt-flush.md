@@ -390,3 +390,85 @@ OFDM, flag still set, a subsequent re-seat does not further re-grow). FAIL-BEFOR
 current flips non-OFDM, flag cleared — the collapse gate opens). Wired into `--test` +
 `--test-inband-adopt-preserve`. Measured (test build): floor=804, natural=212; PASS-AFTER winner=-1,
 FAIL-BEFORE winner=100.
+
+## §12 Fix — the HYBRID SET_CONFIG cross reachability gap (the SECOND cross-path miss)
+
+### §12.1 The bug (VERIFIED by code read + workflow wf_3bc471e6-829)
+
+Fixes #1/#1b/#1c/#1d live ONLY inside `inband_adopt_resynced_config` — the redesign's UNILATERAL
+CONFIG_TAG-follow adopt. But at HEAD d28f02d the robust→OFDM tier-cross routes through the HYBRID
+legacy SET_CONFIG path: the responder's data-config adopt at `arq_responder.cc:1723/1751/1764` is a
+PLAIN `load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES)`. That re-runs
+`telecom_system::set_size` HONORING the still-raised `buffer_Nsymb_min` (the robust-floor seat,
+`inband_seat_robust_ring_floor`) → the CONFIG_0 ring is RE-ALLOCATED at the ROBUST floor (~1291 sym,
+or ~804 in the unit harness) instead of the natural ~217. Neither the shrink (`force_set_capture_ring_
+natural`) nor the gate flag `inband_ofdm_acq_ring_shrunk` runs. Result: every re-aired CONFIG_0 preamble
+lands at the TAIL of the oversized window beyond `upper_bound` (`OFDM beyond-bounds pream=1278 upper=
+1239`) → ZERO forward frames decode → the responder sends no reverse ACK → the COMMANDER mislabels the
+deaf-responder FORWARD failure as a CONFIG_0 REVERSE degradation and false-demotes via `emergency_nack_
+threshold=3` → 36× loss to legacy at WGN:40 (REDESIGN flat 53B vs LEGACY climb to 5867B, seed s2000).
+
+### §12.2 The fix (factor the OFDM-entry setup into a SHARED helper)
+
+Extract the post-load OFDM-entry ring setup (HINGE-1 flush/preserve, OFDM cursor re-anchor, FTR re-init
+#1b, natural ring SHRINK + gate flag #1c/#1d) out of `inband_adopt_resynced_config` into a shared helper
+`inband_finalize_ofdm_adopt_ring(int adopted_config)` (arq_common.cc). `inband_adopt_resynced_config`
+now calls `load_configuration` → the helper → HINGE-2 bsi re-baseline (behaviorally identical). Each of
+the three SET_CONFIG cross sites (arq_responder.cc:1723/1751/1764) calls the helper right after its own
+`load_configuration(data_configuration, …)`, gated `inband_rate_feature_enabled() && is_ofdm_config
+(data_configuration)`. The cross can never again strand the shrink. FAIL-BEFORE: `MERCURY_ADOPT_RING_
+SHRINK_DEFEAT=1` (the same #1c knob) keeps the oversized ring on the cross.
+
+### §12.3 §1.2 SYSTEMIC AUDIT — which OTHER adopt-setup steps were stranded on the cross? (VERDICT)
+
+Enumerated every step `inband_adopt_resynced_config` runs and checked the cross:
+- **Ring SHRINK + flag (#1c/#1d)**: STRANDED — the load honors `buffer_Nsymb_min` → oversized. **THE bug. Folded into the shared helper.**
+- **OFDM cursors** (`ofdm_search_raw=0`, `ofdm_batch_active=false`, `delay_of_last_decoded_message=-1`):
+  NOT stranded — `telecom_system::load_configuration` resets them (telecom_system.cc:5244-5247).
+- **FTR/anti-scroll re-arm** (`frames_to_read=frame_symb+10`, `nUnder=0`): NOT stranded — the responder's
+  post-adopt FTR block re-arms it (arq_responder.cc:1818-1819) after all three cross sites.
+- **HINGE-2 bsi re-baseline** + **NACK throttle re-arm** (`inband_nack_emitted_for_dead_streak=false`):
+  UNILATERAL-adopt-specific. The coordinated SET_CONFIG cross owns its own bsi/session machinery; folding
+  the unilateral re-baseline in would double-reset. DELIBERATELY left out of the shared helper.
+
+### §12.4 §5 AUDIT — does the cross shrink break the down-ladder robust-floor need? (VERDICT: NO)
+
+The capture-ring geometry feeds BOTH the OFDM preamble search AND the down-ladder trial-decoder (which
+needs the robust floor to hold a ~336-sym ROBUST_0 frame). The cross shrink mirrors the unilateral path
+EXACTLY: `inband_ofdm_acq_ring_shrunk` is set so `inband_seat_robust_ring_floor` does NOT re-grow the
+ring while at an OFDM config (:3970); on a demote to a robust config the flag clears (:3972-3973 / :4346)
+so the floor re-seats BEFORE the down-ladder reads a robust frame. Asserted by Part E2-5 (re-seat
+suppressed while shrunk@OFDM after the cross) and the unchanged Part F durability tests. Everything is
+gated on `inband_rate_feature_enabled()`; the legacy path never calls the helper → byte-identical.
+
+### §12.5 Regression test (Part E2, arq_responder.cc test_inband_adopt_preserve_live_burst)
+
+Drives the cross VERBATIM: build at ROBUST_0 → seat the robust floor (ring 804) → the cross's own
+`load_configuration(CONFIG_0, PHYSICAL_LAYER_ONLY, YES)` (E2-2 asserts it leaves the ring 804, the
+stranded state) → the shared helper. PASS-AFTER (arm 0): E2-3 ring shrinks 804→212, E2-4 flag set, E2-5
+re-seat suppressed. FAIL-BEFORE (arm 1, `MERCURY_ADOPT_RING_SHRINK_DEFEAT=1`): E2-3 ring stays 804.
+
+## §13 Fix — the post-demote robust/OFDM ceiling deadlock (belt-and-suspenders)
+
+### §13.1 The structural deadlock (VERIFIED by code read)
+
+If a (false) demote already landed, `inband_route_failure_demote` pins `supershift_proven_ceiling =
+demote_target = ROBUST_2` (arq_commander.cc:3141). The §16 TIER GATE (`data_anchor_raise_target`,
+arq.h:938-941) refuses to raise the ANCHOR (`last_data_viable_config`) across the robust→OFDM boundary on
+robust evidence — a ROBUST clean ACK has a robust `streak_config`. So the anchor stays at robust-top,
+`inband_ceiling_raise_target` caps the ceiling AT that robust-top anchor (Rule 3), the FRAME-UP gate
+(arq_commander.cc:5460: `index(proposed) > index(ceiling)` ⇒ blocked) walls the +1 probe to CONFIG_0, and
+the link can NEVER re-attempt the cross even once the channel recovers. (The PRIMARY §12 fix makes the
+false-demote not happen; §13 covers a demote that already landed.)
+
+### §13.2 The fix (robust/OFDM boundary tier-cross exemption — bounded, inband-only)
+
+`inband_ceiling_raise_target` (arq.h): when the re-proven anchor sits AT the top robust rung
+(`is_robust_config(anchor)` and the next ladder rung is OFDM — the natural CONFIG_0 entry), permit the
+ceiling to reach EXACTLY that one OFDM-entry rung above robust-top — never higher. The existing +1
+FRAME-UP anchor clamp (arq_commander.cc:5468: `proposed ≤ anchor+1`) already permits CONFIG_0 above a
+robust-top anchor, so this only lifts the CEILING wall; it probes ONE rung above proven ground. If the
+CONFIG_0 probe fails, the gearshift decode-failure demote re-pins the ceiling — no over-climb opened (the
++1 clamp remains the sole over-climb bound). The sole caller is inband-gated (arq_commander.cc:5406), so
+legacy ceiling discipline is byte-identical. Tests X6/X6b/X6c (--test-climb-engine Part X): X6 lifts the
+ceiling robust-top→CONFIG_0 on re-proof; X6b tops out AT CONFIG_0 (no leap); X6c stays sustained-gated.
