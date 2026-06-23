@@ -726,6 +726,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
             }
+            // CLIMB-CHURN producer-side bsi rollback (data-flow-climb-up-bsi-rollback.md
+            // §6): in-process synthetic-fire — drives the REAL rollback producer +
+            // the REAL sack_v2_readopt_has_gap predicate, no PHY/audio. Permanent
+            // regression gate that the climb-UP promote re-presents an in-flight
+            // batch CONTIGUOUSLY (no >=2 RSP gap-HOLD).
+            {
+                cl_arq_controller ARQ_climb;
+                failed += ARQ_climb.test_climb_bsi_rollback();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
@@ -930,6 +939,7 @@ int main(int argc, char *argv[])
                                         // CRC12 pass), no-false-accept on pure silence. One-shot, exits rc.
                                         // See fact-documents/data-flow-data-ack-sack-correlator.md §7.
     bool test_inorder_demote_cli = false; // --test-inorder-demote: D3.1 — UNIFIED in-order delivery
+    bool test_climb_bsi_rollback_cli = false; // --test-climb-bsi-rollback: CLIMB-CHURN commander-side bsi rollback on a climb-UP promote
                                         // across EVERY demote case (BREAK + the 4 SET_CONFIG-only demotes +
                                         // PREV-BUMP strand). fail-before via MERCURY_GAP_ABORT_DEFEAT=1
                                         // (silent concat on the SET_CONFIG cases), pass-after aborts loudly
@@ -1633,6 +1643,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_inorder_demote
             // + bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
             test_inorder_demote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-climb-bsi-rollback") == 0)
+        {
+            // CLIMB-CHURN — commander-side bsi rollback on a climb-UP promote —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_commander.cc test_climb_bsi_rollback
+            // + fact-documents/data-flow-climb-up-bsi-rollback.md.
+            test_climb_bsi_rollback_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3095,6 +3115,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inorder_demote();
             printf("[FLAG] In-order-demote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_climb_bsi_rollback_cli) {
+            // CLIMB-CHURN — commander-side bsi rollback on a climb-UP promote (one-shot, exit rc).
+            printf("[FLAG] --test-climb-bsi-rollback: invoking CLIMB-CHURN "
+                   "commander-side bsi rollback regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_climb_bsi_rollback();
+            printf("[FLAG] Climb-bsi-rollback test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

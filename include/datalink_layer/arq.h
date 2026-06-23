@@ -488,6 +488,21 @@ public:
   void cleanup();
   void finish_turbo_direction();
 
+  // CLIMB-CHURN bsi rollback (data-flow-climb-up-bsi-rollback.md). The demote /
+  // BREAK paths (FIX-9 D3 arq_commander.cc:4057-4108, M6 :4271-4300) capture the
+  // EARLIEST (mod-256) in-flight batch bsi BEFORE freeing messages_tx[] and roll
+  // cmd_batch_seq_id back to it, so the re-presented batch stays CONTIGUOUS with
+  // the RSP's delivery high-water (no sack_v2_readopt_has_gap >=2 abort). The
+  // climb-UP promote SET_CONFIG emits (FRAME-UP :4615, turbo over-climb :4731,
+  // optimizer :697) did NOT — on a rapid mid-transfer climb the re-sent batch
+  // carried an ADVANCED epoch -> RSP gap-HOLD -> ~83 bps throttle. This helper
+  // ports that capture+rollback to the climb-up sites. It is a NO-OP unless
+  // sack_v2_enabled && !compression_enabled (identical gate to the demote
+  // rollback; the compression path's restore_tx_from_compressed() owns its own
+  // re-stage). MUST be called BEFORE messages_tx[] is freed. Returns the rolled
+  // bsi (>=0) if a rollback happened, else -1 (no in-flight batch / gated off).
+  int roll_back_cmd_bsi_to_inflight(const char* tag);
+
   // REAL FAST-PROBE follow-up (gearshift-climb-engine.md §18) — the SNR-decode
   // arm MUST be FALSE on every data-ACK wait. §14 (A1) widened the arm
   // (turbo_snr_ack_armed_for_gearshift) to fire on a steady-state +1 gearshift
@@ -1849,6 +1864,20 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
   int test_inorder_demote();
+
+  // CLIMB-CHURN producer-side bsi rollback (data-flow-climb-up-bsi-rollback.md
+  // §6). The COMMANDER-side mirror of test_gap_abort_on_readopt: drives the REAL
+  // roll_back_cmd_bsi_to_inflight() producer + the REAL sack_v2_readopt_has_gap()
+  // predicate as the RSP-side delivery oracle. Reproduces a rapid mid-transfer
+  // climb where cmd_batch_seq_id outran an in-flight (RSP-delivered, not yet
+  // CMD-ACKed) batch. fail-before (MERCURY_CLIMB_BSI_ROLLBACK_DEFEAT=1): no
+  // rollback -> re-present bsi is >=2 past last_delivered -> readopt_has_gap=true
+  // -> RSP would HOLD delivery. pass-after (defeat off): the helper rolls
+  // cmd_batch_seq_id back to the in-flight bsi -> contiguous successor ->
+  // readopt_has_gap=false -> delivery proceeds. Variants: multi-frame same-batch
+  // (earliest mod-256), mod-256 WRAP, compression-gated no-op, no-in-flight
+  // no-op. Returns 0=PASS, 1=FAIL. Default builds never call this.
+  int test_climb_bsi_rollback();
 
   // D5 — EOB-inference batch truncation (TRACK_C_D2D3D5_DESIGN.md §5.3 /
   // data-flow-prev-bump.md §8). CLI: --test-eob-loss-batch-truncation. Drives
