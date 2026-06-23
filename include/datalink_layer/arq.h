@@ -3537,6 +3537,10 @@ public:
   // RANK-1 FIX: the buffer_Nsymb of the deepest reachable rung (ROBUST_0). The primary
   // capture ring is seated to at least this (in symbols) so a full robust frame fits.
   int  inband_robust_floor_buffer_nsymb();
+  // FIX #1c (data-flow-robust-ofdm-adopt-flush.md §10): the NATURAL buffer_Nsymb of an OFDM
+  // config (no raised robust floor). The robust->OFDM adopt shrinks the oversized robust-floor
+  // ring back to this so the re-aired OFDM burst lands within the coarse-search bounds.
+  int  inband_natural_ofdm_buffer_nsymb(int ofdm_cfg);
   // RANK-1 FIX: seat the primary capture ring's buffer_Nsymb_min to the ROBUST floor
   // (re-applying the PHY config if the ring is currently smaller) so the down-ladder can
   // read a full robust frame. Idempotent; no-op when off / defeat set / already seated.
@@ -3564,6 +3568,15 @@ public:
   // switch). Same memo for inband_down_window_buffer_nsymb() keyed by (lo_idx, nb).
   int  inband_robust_floor_nsymb_cached = -1;    // -1=unmemoized, >=0=cached floor buffer_Nsymb
   int  inband_robust_floor_nsymb_cache_nb = -1;  // narrowband_enabled the cache was built for
+  // ROBUST->OFDM CROSSING FIX (data-flow-robust-ofdm-adopt-flush.md §10): set TRUE when the
+  // robust->OFDM in-band adopt shrinks the capture ring back to the OFDM config's NATURAL size
+  // (un-seating the raised robust floor) so the re-aired OFDM burst lands within the coarse-search
+  // bounds (the oversized robust-floor ring put every freshest preamble at the tail, beyond
+  // upper_bound -> permanent `OFDM beyond-bounds`). While TRUE, inband_seat_robust_ring_floor()
+  // MUST NOT re-grow the ring (it would re-introduce the oversize and re-block acquisition). Cleared
+  // when the RX leaves the OFDM tier (demote to a robust config), so the next down-ladder re-seats
+  // the floor BEFORE reading a robust frame. Off (legacy/!inband) -> always false -> byte-identical.
+  bool inband_ofdm_acq_ring_shrunk = false;
   int  inband_down_window_nsymb_cached = -1;     // -1=unmemoized, >=0=cached window buffer_Nsymb
   int  inband_down_window_nsymb_cache_lo = -1;   // lo_idx the cache was built for
   int  inband_down_window_nsymb_cache_nb = -1;   // narrowband_enabled the cache was built for

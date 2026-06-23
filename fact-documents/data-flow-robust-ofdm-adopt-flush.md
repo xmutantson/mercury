@@ -233,3 +233,89 @@ PART D pre-stages the stall (`frames_to_read=0`, `nUnder=99`), drives the OFDM-t
 asserts PASS-AFTER `frames_to_read == frame_symb+10` (>0) + `nUnder==0`; FAIL-BEFORE
 (`MERCURY_ADOPT_FTR_REARM_DEFEAT=1`, same binary) leaves `frames_to_read==0` (the ~101B stall
 signature). Wired into `--test` + `--test-inband-adopt-preserve`.
+
+---
+
+## §10 Fix #1c — RESTORE THE NATURAL OFDM ACQUISITION GEOMETRY (the last half of the class)
+
+### §10.1 The residual blocker (VERIFIED by the fair A/B `_fairgo/arm1_redesign.arqlog`)
+
+Fixes #1 + #1b STILL did not lock the robust→OFDM crossing. After the preserve + FTR re-arm
+(arm1, line 17585) the RX logged for the whole burst (11 s, T+151→162):
+
+```
+[RX-TIMING] OFDM beyond-bounds: pream=1279 upper=1239 metric=0.120 shift=8 search_raw=0
+[FTR-FAIL]  CONFIG_0 ftr=8 metric=0.120 batch=0 search_raw=0
+```
+
+The preamble was found at snapshot symbol **1279 > upper_bound 1239** with metric **0.12** (a false
+GI sub-peak — a REAL preamble is 0.999, cf. the working RSP lock `pream_symb=1230 metric=0.999 PASS`
+in `arm2_defeat.arqlog:17899`). The preamble slid 1279→1272→1266 then JUMPED back to 1276 — a
+NEW re-aired burst at the tail. It never reached `≤upper`.
+
+### §10.2 ROOT (VERIFIED — code read + the A/B geometry)
+
+The in-band redesign seats `buffer_Nsymb_min` to the ROBUST floor (`inband_seat_robust_ring_floor`,
+arq_common.cc:3781) so the blind down-ladder can read a full slow MFSK ROBUST_0 frame. That makes the
+**CONFIG_0 OFDM capture ring `buffer_Nsymb=1291`** (run-specific; the test build = 804). The NATURAL
+CONFIG_0 ring is **217** — the size LEGACY uses (legacy has NO robust-floor seat: `arm3_legacy.arqlog`
+shows `bufNsymb=217` EXCLUSIVELY, never 1291) and which locks 43× in a flat baseline.
+
+The snapshot reads `[ring_write_index, +signal_period)` (telecom_system.cc:5594); index 0 = oldest,
+index `buffer_Nsymb-1` = newest (the write head). The CMD RE-AIRS the CONFIG_0 burst continuously
+(`[CMD-TX] CONFIG_0 batch=6`, `[INBAND-TX] re-tag #1`), so the **freshest preamble always lands at
+the TAIL** of the oversized window — `pream_symb ≈ buffer_Nsymb (1279) > upper_bound (1239)` — with its
+frame DATA off-buffer (`1279+frame_symb 52 = 1331 > 1291`). **No `frames_to_read` value fixes this**:
+the re-air races the slide so the tail preamble never settles below `upper`. LEGACY never hits it —
+its 217 ring puts the tail preamble at `≈upper=165`, which FITS. **The robust-floor oversize is the
+inband-specific amplifier legacy lacks**, and it is the SHARED-crossing reliability lever (the natural
+geometry locks; the oversized one never does).
+
+This FALSIFIES §9.3's claim that "preserve + re-init COMPOSE": they do not, because the §9.3 audit
+assumed the read window placed the preamble in-bounds. In the robust-floor-OVERSIZED ring it places it
+at the tail, beyond `upper`.
+
+### §10.3 The fix (arq_common.cc:4257+, inband-scoped)
+
+On an adopt INTO an OFDM config, if the live ring is LARGER than that config's NATURAL size
+(`inband_natural_ofdm_buffer_nsymb(cfg)`, arq_common.cc:3738), UN-seat the floor and re-allocate the
+ring at the natural OFDM size (`cl_telecom_system::force_set_capture_ring_natural`,
+telecom_system.cc:11111 — mirrors `force_resize_capture_ring` but un-seats). Re-arm the FTR after the
+realloc (set_size zeroed the ring + reset `frames_to_read`). `inband_ofdm_acq_ring_shrunk` (new, arq.h)
+GATES the per-pass robust-floor re-seat (arq_common.cc:3809) so it cannot immediately re-grow the ring;
+the flag CLEARS on a demote to a robust config (arq_common.cc:3811-3812, :4149) so the next down-ladder
+re-seats the floor BEFORE it reads a robust frame. This restores LEGACY's exact natural geometry for
+OFDM acquisition — re-using the proven `set_size` path, not a new acquisition routine. Off path
+(`!inband_rate_feature_enabled`) never runs → legacy byte-identical. FAIL-BEFORE A/B:
+`MERCURY_ADOPT_RING_SHRINK_DEFEAT=1` keeps the oversized ring on the SAME binary.
+
+### §10.4 §5 AUDIT — the ring-geometry / coarse-search-window / seat composition (VERDICT: YES)
+
+- **Producers of `buffer_Nsymb`/`buffer_Nsymb_min`**: `data_container.set_size` (the only writer of
+  `buffer_Nsymb`, honoring `buffer_Nsymb_min` as a floor, data_container.cc:147-163);
+  `inband_seat_robust_ring_floor`/`force_resize_capture_ring` (raise the floor + grow);
+  `force_set_capture_ring_natural` (NEW — un-seat to 0 + shrink to natural). All hold
+  `capture_prep_mutex` across the realloc.
+- **Consumers of the geometry**: the coarse search `upper_bound = buffer_Nsymb-(Nsymb+rx_eff_preamble)`
+  (telecom_system.cc:1766) and `pream_symb_loc = delay/(Nofdm*interp)` (`:1721`); the ARQ
+  beyond-bounds gate `upper = buffer_Nsymb-frame_symb` (arq_common.cc:12054); the snapshot
+  `memcpy(&passband_delayed_data[rwi], signal_period)` (telecom_system.cc:5594). After the shrink ALL
+  read the natural size coherently (one `set_size` re-derives every dependent buffer), so the preserved/
+  re-aired preamble at the tail now sits at `≈upper_natural=165`, WITHIN `[lower=4, upper]`, frame fits.
+- **Invariant restored**: the down-ladder still needs the big ring to READ a robust frame — preserved
+  because the shrink is only kept while `is_ofdm_config(current_configuration)`; a demote clears the
+  flag and the next `inband_seat_robust_ring_floor` re-grows BEFORE the down-ladder reads (cold/stale/
+  MFSK-target adopt paths still flush + re-seat verbatim — `adopt_into_ofdm` false → no shrink).
+- **Uncommon paths**: cross-MODULATION crossing (set_size already reallocs) — the shrink is a no-op if
+  the ring is already ≤ natural; a robust-target adopt clears the flag (arq_common.cc:4149) so the floor
+  re-seats. The seat's idempotent fast-path cache (`inband_robust_floor_nsymb_cached`) is unaffected (the
+  shrink un-seats `buffer_Nsymb_min`, not the cache).
+
+### §10.5 Regression (PART E of test_inband_adopt_preserve_live_burst)
+
+PART E seats the robust floor (grows the live ring), drives the OFDM-target adopt, and asserts
+PASS-AFTER `buffer_Nsymb == natural_CONFIG_0` + `inband_ofdm_acq_ring_shrunk` set + a subsequent
+`inband_seat_robust_ring_floor()` does NOT re-grow it; FAIL-BEFORE (`MERCURY_ADOPT_RING_SHRINK_DEFEAT=1`,
+same binary) leaves the ring OVERSIZED (the permanent-beyond-bounds signature). Wired into `--test` +
+`--test-inband-adopt-preserve`. Measured (test build): floor=804, natural=212; shrink 804→212 PASS,
+defeat stays 804.

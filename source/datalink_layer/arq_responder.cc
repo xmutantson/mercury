@@ -7892,6 +7892,7 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
 		set_env("MERCURY_ADOPT_FLUSH_DEFEAT", "");
 		set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", "");
+		set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", "");
 	};
 
 	// The adopt takes capture_prep_mutex; create it if NULL (standalone test).
@@ -8113,6 +8114,75 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		delete rx; delete ts;
 	}
 	set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", "");
+
+	// ── PART E : FIX #1c — RESTORE THE NATURAL OFDM ACQUISITION GEOMETRY (data-flow-robust-ofdm-
+	//   adopt-flush.md §10). The redesign seats buffer_Nsymb_min to the ROBUST floor so the
+	//   down-ladder can read a slow MFSK frame; that makes the CONFIG_0 OFDM ring vastly larger
+	//   than one OFDM frame, so the continuously RE-AIRED preamble always lands at the TAIL of the
+	//   oversized snapshot window (pream_symb > upper_bound) -> permanent `OFDM beyond-bounds`,
+	//   never locks. The adopt-into-OFDM now UN-seats the floor and re-allocates the ring at the
+	//   config's NATURAL size (== legacy's geometry, which locks 43x).
+	//     PASS-AFTER (arm 0): with the robust floor seated (ring oversized), the OFDM-target adopt
+	//       SHRINKS buffer_Nsymb back to the natural CONFIG_0 size and sets inband_ofdm_acq_ring_shrunk.
+	//       A subsequent inband_seat_robust_ring_floor() does NOT re-grow it (the gate holds while at
+	//       an OFDM config). The natural size leaves the freshest preamble within [lower, upper].
+	//     FAIL-BEFORE (arm 1, MERCURY_ADOPT_RING_SHRINK_DEFEAT=1, same binary): the shrink is
+	//       skipped -> the ring stays OVERSIZED (the permanent-beyond-bounds stall signature).
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx(CONFIG_1);
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+
+		// The natural CONFIG_0 ring size + the robust floor (both probed the same way production does).
+		int natural_c0 = rx->inband_natural_ofdm_buffer_nsymb(CONFIG_0);
+		int robust_floor = rx->inband_robust_floor_buffer_nsymb();
+		bool oversize_possible = (robust_floor > natural_c0 && natural_c0 > 0);
+		check(oversize_possible,
+			"E0 robust floor is larger than the natural CONFIG_0 ring (the oversize amplifier exists)",
+			robust_floor, natural_c0 + 1);
+
+		// SEAT the robust floor (grows the live ring) — model the redesign's down-ladder state.
+		rx->inband_seat_robust_ring_floor();
+		int nsymb_seated = (int)ts->data_container.buffer_Nsymb.load();
+		check(nsymb_seated >= robust_floor || !oversize_possible,
+			"E1 robust floor seated: live ring grew to the floor (oversized for OFDM acquisition)",
+			nsymb_seated, robust_floor);
+
+		// Paint a loud burst so the preserve/energy probe sees a live burst, then ADOPT into CONFIG_0.
+		int sp0 = paint_burst(ts, 0.8, 3 * ts->data_container.Nofdm * ts->data_container.interpolation_rate);
+		(void)sp0;
+		rx->inband_adopt_resynced_config(CONFIG_0);
+
+		int nsymb_after = (int)ts->data_container.buffer_Nsymb.load();
+		if(!defeat)
+		{
+			check(nsymb_after == natural_c0,
+				"E2-FIX adopt SHRANK the ring to the natural CONFIG_0 size (re-aired preamble now "
+				"lands within [lower, upper] -> coarse search can LOCK)",
+				nsymb_after, natural_c0);
+			check(rx->inband_ofdm_acq_ring_shrunk,
+				"E3-FIX inband_ofdm_acq_ring_shrunk set (per-pass robust-floor re-seat suppressed "
+				"while at the OFDM config)",
+				rx->inband_ofdm_acq_ring_shrunk ? 1 : 0, 1);
+			// The robust-floor re-seat must NOT re-grow the ring while shrunk + at an OFDM config.
+			rx->inband_seat_robust_ring_floor();
+			check((int)ts->data_container.buffer_Nsymb.load() == natural_c0,
+				"E4-FIX re-seat is SUPPRESSED while shrunk@OFDM (ring stays natural -> stays in-bounds)",
+				(int)ts->data_container.buffer_Nsymb.load(), natural_c0);
+		}
+		else
+		{
+			check(nsymb_after >= robust_floor && nsymb_after > natural_c0,
+				"E2-DEFEAT (FAIL-BEFORE) ring stays OVERSIZED (preamble pinned at the tail beyond "
+				"upper_bound -> permanent `OFDM beyond-bounds`, never locks)",
+				nsymb_after, natural_c0);
+		}
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", "");
 
 #if defined(_WIN32)
 	if(created_mutex && capture_prep_mutex != NULL)

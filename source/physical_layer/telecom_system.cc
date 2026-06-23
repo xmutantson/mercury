@@ -11093,6 +11093,48 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 	MUTEX_UNLOCK(&capture_prep_mutex);
 }
 
+// Reset the capture ring to the CURRENT config's NATURAL buffer_Nsymb (un-seat any raised
+// buffer_Nsymb_min floor), WITHOUT a config change. The in-band robust-floor seat
+// (inband_seat_robust_ring_floor, arq_common.cc:3781) grows the primary ring to hold a full
+// slow ROBUST-rung MFSK frame so the blind down-ladder can read it. That floor is correct in
+// the ROBUST tier, but after the RX has ADOPTED a small-frame OFDM config it makes the
+// acquisition ring vastly larger than one OFDM frame (e.g. CONFIG_0: natural 217 sym vs robust
+// floor 1291 sym). With a continuously RE-AIRED OFDM burst the freshest preamble always lands
+// at the TAIL of the oversized snapshot window (pream_symb ~ buffer_Nsymb > upper_bound), so the
+// coarse search reports `OFDM beyond-bounds` forever and never locks — the robust->OFDM crossing
+// blocker (data-flow-robust-ofdm-adopt-flush.md §10). LEGACY never hits this: its CONFIG_0 ring
+// is the NATURAL 217 (no robust-floor seat), so the freshest tail preamble sits at ~upper and
+// FITS — it locks 43x. This restores that natural geometry for OFDM acquisition. The next
+// down-ladder demote re-seats the floor (inband_seat_robust_ring_floor) BEFORE the down-ladder
+// reads, so robust capture is unaffected. Mirrors force_resize_capture_ring but UN-seats instead
+// of growing; holds capture_prep_mutex across the realloc (Bug #42). No-op if no config loaded.
+void cl_telecom_system::force_set_capture_ring_natural()
+{
+	if(current_configuration == CONFIG_NONE) return;
+	if(data_container.Nofdm <= 0) return;
+	MUTEX_LOCK(&capture_prep_mutex);
+	data_container.buffer_Nsymb_min = 0;   // un-seat the raised robust floor
+	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),
+	// branching on the live modulation. With buffer_Nsymb_min=0, set_size computes the config's
+	// NATURAL buffer_Nsymb (data_container.cc:147-163), re-allocating the ring at that size.
+	if(M == MOD_MFSK)
+	{
+		int M_eff = 1 << mfsk.bits_per_symbol();
+		data_container.set_size(ofdm.Nsymb, ofdm.Nc, M_eff, ofdm.Nfft,
+			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	else
+	{
+		data_container.set_size(ofdm.pilot_configurator.nData, ofdm.Nc, M, ofdm.Nfft,
+			ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	data_container.ring_write_index = 0;
+	data_container.data_ready = 0;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+}
+
 void cl_telecom_system::return_to_last_configuration()
 {
 	int tmp;

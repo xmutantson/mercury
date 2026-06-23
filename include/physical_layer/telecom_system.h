@@ -823,6 +823,11 @@ public:
 	// raised buffer_Nsymb_min. Used to seat the in-band down-ladder robust ring floor
 	// (data-flow-inband-ondemote-zerobyte.md §7). Mutex-protected; idempotent.
 	void force_resize_capture_ring(int min_nsymb);
+	// Reset the capture ring to the CURRENT config's NATURAL buffer_Nsymb (un-seat any raised
+	// buffer_Nsymb_min). Restores the legacy OFDM-acquisition geometry after a robust->OFDM
+	// in-band adopt so the re-aired burst lands within the coarse-search bounds
+	// (data-flow-robust-ofdm-adopt-flush.md §10). Mutex-protected.
+	void force_set_capture_ring_natural();
 	int last_configuration;
 	int current_configuration;
 	void return_to_last_configuration();

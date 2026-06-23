@@ -3735,6 +3735,23 @@ int cl_arq_controller::inband_robust_floor_buffer_nsymb()
 	return n;   // tmp destructs here
 }
 
+// The NATURAL buffer_Nsymb of an OFDM config at the current bandwidth — i.e. the ring size
+// data_container.set_size computes with NO raised buffer_Nsymb_min floor (data_container.cc:147-163).
+// Used by the robust->OFDM adopt (fix #1c) to decide whether the live ring is OVERSIZED by the
+// robust-floor seat (and, if so, what to shrink it back to). Probes a throwaway cl_telecom_system
+// at `ofdm_cfg` (buffer_Nsymb_min defaults to 0 on a fresh instance, so load_configuration yields
+// the natural size). Called only on a config adopt (rare — not the hot RX path), so no memo is
+// needed. Returns 0 on a non-OFDM config or no telecom_system.
+int cl_arq_controller::inband_natural_ofdm_buffer_nsymb(int ofdm_cfg)
+{
+	if(telecom_system == NULL) return 0;
+	if(!is_ofdm_config(ofdm_cfg)) return 0;
+	cl_telecom_system tmp;                    // buffer_Nsymb_min defaults to 0 -> natural sizing
+	tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+	tmp.load_configuration(ofdm_cfg);
+	return tmp.data_container.buffer_Nsymb.load();   // tmp destructs here
+}
+
 // FAIL-BEFORE / A-B knob (data-flow-inband-ondemote-zerobyte.md §6): resolve+cache
 // MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX. When 1 the down-ladder snapshot is sized by the
 // PRIMARY config (the pre-fix behavior) AND the robust ring floor is NOT seated, so the
@@ -3783,6 +3800,16 @@ void cl_arq_controller::inband_seat_robust_ring_floor()
 	if(!inband_rate_feature_enabled()) return;
 	if(inband_down_defeat_snapfix()) return;          // fail-before arm: leave the ring small
 	if(telecom_system == NULL) return;
+	// FIX #1c: while the robust->OFDM adopt has shrunk the acquisition ring to its NATURAL OFDM
+	// size (data-flow-robust-ofdm-adopt-flush.md §10), DON'T re-grow it — re-introducing the
+	// robust-floor oversize would re-block OFDM acquisition (every preamble back at the tail beyond
+	// upper_bound). The shrink is only kept while the RX is at an OFDM config; on a demote to a
+	// robust config the flag is cleared (below) so this seat runs and the down-ladder reads a full
+	// robust frame. Off (!inband) -> flag never set -> no behavior change.
+	if(inband_ofdm_acq_ring_shrunk && is_ofdm_config(current_configuration))
+		return;
+	if(inband_ofdm_acq_ring_shrunk && !is_ofdm_config(current_configuration))
+		inband_ofdm_acq_ring_shrunk = false;   // left the OFDM tier -> allow the floor to re-seat
 	// IDEMPOTENT FAST-PATH (before ANY probe cost): once the ring is seated to the warm-cached
 	// floor for the CURRENT bandwidth, the steady-state RX pass returns here doing literally
 	// nothing — no helper call, no throwaway cl_telecom_system. This is the hot path on every
@@ -4117,6 +4144,9 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 		// OR'd in covers a mid-batch adopt (the first crossing from MFSK has active=false but
 		// the preamble energy is present, so the energy probe is the load-bearing signal).
 		bool adopt_into_ofdm = is_ofdm_config(followed_config);
+		// FIX #1c: a robust-target adopt leaves the OFDM tier -> clear the shrink flag so the next
+		// inband_seat_robust_ring_floor re-grows the ring for robust-frame capture (the down-ladder).
+		if(!adopt_into_ofdm) inband_ofdm_acq_ring_shrunk = false;
 		bool live_burst = telecom_system->receive_stats.ofdm_batch_active;
 		if(!live_burst
 		   && telecom_system->data_container.passband_delayed_data != NULL
@@ -4212,6 +4242,58 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 			fflush(stdout);
 		}
 		MUTEX_UNLOCK(&capture_prep_mutex);
+
+		// ── FIX #1c — RESTORE THE NATURAL OFDM ACQUISITION GEOMETRY (the LAST half of the
+		//    robust->OFDM transition class; data-flow-robust-ofdm-adopt-flush.md §10) ──
+		// Fix #1 PRESERVED the in-flight preamble and fix #1b re-armed the FTR/anti-scroll, yet the
+		// crossing STILL stalled: `[RX-TIMING] OFDM beyond-bounds: pream=1279 upper=1239 metric=0.12
+		// search_raw=0` for the whole burst, never PASS. ROOT (VERIFIED by the fair A/B + code read):
+		// the in-band redesign seats buffer_Nsymb_min to the ROBUST floor (inband_seat_robust_ring_floor,
+		// arq_common.cc:3781) so the down-ladder can read a full slow MFSK frame. That makes the CONFIG_0
+		// OFDM capture ring buffer_Nsymb=1291 — vs the NATURAL CONFIG_0 size 217 (the size LEGACY uses,
+		// which locks 43x). The snapshot reads [ring_write_index, +signal_period); the CMD RE-AIRS the
+		// CONFIG_0 burst continuously, so the freshest preamble ALWAYS lands at the TAIL of the oversized
+		// window — pream_symb ~ buffer_Nsymb (1279) > upper_bound = buffer_Nsymb-frame_symb (1239) — with
+		// its frame DATA off-buffer (1279+52 > 1291). No frames_to_read value fixes it: the re-air races
+		// the slide so the tail preamble never settles below upper. LEGACY never hits this (its CONFIG_0
+		// ring is 217: a tail preamble sits at ~upper=165 and FITS). The robust-floor oversize is the
+		// inband-specific amplifier legacy lacks — and it is the SHARED-crossing reliability lever (the
+		// natural geometry locks; the oversized one never does). FIX: when adopting INTO an OFDM config
+		// AND the ring is larger than that config's natural size, un-seat the floor and re-allocate the
+		// ring at the natural OFDM size (force_set_capture_ring_natural) so the re-aired burst lands in
+		// bounds — EXACTLY legacy's geometry. Re-arm the FTR after the realloc (set_size zeroed the ring
+		// and reset frames_to_read, data_container.cc:189). inband_ofdm_acq_ring_shrunk gates the
+		// per-pass robust-floor RE-SEAT (arq_common.cc:3781) so it cannot immediately re-grow the ring;
+		// the flag clears on the next demote to a robust config (the down-ladder re-seats the floor THEN,
+		// before it reads a robust frame). Off path (!inband_rate_feature_enabled) never runs -> legacy
+		// byte-identical. FAIL-BEFORE A/B: MERCURY_ADOPT_RING_SHRINK_DEFEAT=1 keeps the oversized ring on
+		// the SAME binary, reproducing the permanent `OFDM beyond-bounds` stall. Production never sets it.
+		bool ring_shrink_defeat = false;
+		{ const char* e = std::getenv("MERCURY_ADOPT_RING_SHRINK_DEFEAT");
+		  if(e && *e && atoi(e) != 0) ring_shrink_defeat = true; }
+		if(adopt_into_ofdm && !ftr_rearm_defeat && !ring_shrink_defeat)
+		{
+			int natural_nsymb = inband_natural_ofdm_buffer_nsymb(followed_config);
+			int cur_nsymb = telecom_system->data_container.buffer_Nsymb.load();
+			if(natural_nsymb > 0 && cur_nsymb > natural_nsymb)
+			{
+				printf("[INBAND-RX] HINGE-1 OFDM-RING SHRINK: CONFIG_%d ring buffer_Nsymb %d -> natural %d "
+					"(un-seat robust floor; oversized ring put every preamble at the tail beyond upper)\n",
+					followed_config, cur_nsymb, natural_nsymb);
+				fflush(stdout);
+				telecom_system->force_set_capture_ring_natural();
+				inband_ofdm_acq_ring_shrunk = true;
+				// Re-arm the FTR/anti-scroll AFTER the realloc (set_size reset frames_to_read to
+				// preamble_nSymb+Nsymb and zeroed the ring; data_container.cc:189). Use the SAME legacy
+				// formula as fix #1b so the snapshot fires once a full natural-geometry frame settled.
+				MUTEX_LOCK(&capture_prep_mutex);
+				telecom_system->data_container.nUnder_processing_events = 0;
+				int frame_symb2 = telecom_system->data_container.preamble_nSymb
+				                + telecom_system->data_container.Nsymb;
+				telecom_system->data_container.frames_to_read = frame_symb2 + 10;
+				MUTEX_UNLOCK(&capture_prep_mutex);
+			}
+		}
 	}
 
 	// HINGE-2: D3.1 bsi-window re-baseline + prev-storage drop (IDENTICAL to
