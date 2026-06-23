@@ -3784,6 +3784,21 @@ bool cl_arq_controller::inband_freshwin_gate_defeat()
 	return inband_freshwin_gate_defeat_cached == 1;
 }
 
+// FIX #1d FAIL-BEFORE / A-B knob (data-flow-robust-ofdm-adopt-flush.md §11): resolve+cache
+// MERCURY_ADOPT_RING_DURABILITY_DEFEAT. When 1 the down-ladder does NOT skip a robust trial
+// while holding a fresh OFDM lock (the PRE-FIX lock-collapse behavior). Default 0 = the guard
+// is active. Production never sets it; the regression flips it to reproduce the collapse then
+// confirm the guard. -1 = unresolved, cached on first call.
+bool cl_arq_controller::inband_adopt_ring_durability_defeat()
+{
+	if(inband_adopt_ring_durability_defeat_cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_ADOPT_RING_DURABILITY_DEFEAT");
+		inband_adopt_ring_durability_defeat_cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return inband_adopt_ring_durability_defeat_cached == 1;
+}
+
 // RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §7 / §8 [?]): seat the primary capture
 // ring's buffer_Nsymb_min to the DEEPEST reachable down-ladder rung (ROBUST_0) so the ring
 // PHYSICALLY holds a full robust-rung frame the down-ladder can read. Without this the
@@ -4011,6 +4026,42 @@ int cl_arq_controller::inband_down_ladder_resync(const double* audio, int audio_
 		cl_telecom_system* dec = inband_down_decoders[slot];
 		if(dec == NULL) continue;
 		int cfg = FULL_CONFIG_LADDER[idx];
+
+		// FIX #1d (data-flow-robust-ofdm-adopt-flush.md §11): DURABILITY of a fresh OFDM lock.
+		// We hold a FRESHLY-SHRUNK natural-geometry OFDM lock (inband_ofdm_acq_ring_shrunk set
+		// AND current_configuration is OFDM — fix #1c just shrank the ring to natural ~217 and the
+		// coarse search locked the re-aired preamble at metric~0.998). A single inter-frame
+		// decode-FAIL pass (the gate that fired this down-ladder, arq_responder.cc:642-650) over a
+		// window whose lo_idx reaches into the ROBUST tier (CONFIG_0 idx 3, D>=3 -> ROBUST_0 idx 0)
+		// can let a trial ROBUST decoder spuriously CRC/LDPC-pass on residual energy. Adopting it
+		// (inband_adopt_resynced_config below) reloads ROBUST_0 on the PRIMARY -> current_configuration
+		// flips non-OFDM -> the next inband_seat_robust_ring_floor CLEARS the shrink flag (:3811) and
+		// RE-GROWS the ring 217->804 (:3849) -> the live OFDM lock collapses (metric 0.998 -> 0.181)
+		// -> down-ladder total-loss -> TERMINAL BREAK -> ROBUST_0 -> 53B. A GENUINE CMD demote to
+		// robust would FIRST manifest as the OFDM lock dying across MANY passes (the dead-batch streak
+		// reaching SESSION_DEAD_BATCHES -> the §7 TERMINAL BREAK, which re-grows for robust capture via
+		// load_configuration(ROBUST_0) directly — NOT this path). So while holding a fresh OFDM lock,
+		// REJECT a transient robust trial: SKIP it (no receive_byte, no adopt). The loop still trials
+		// any OFDM rung below in the window (a legit in-OFDM rate-down adopt re-shrinks correctly,
+		// :4274); if NOTHING in the window decodes the caller ticks the dead-batch streak, so a REAL
+		// sustained loss STILL reaches the genuine demote. This does NOT touch the LEGITIMATE direct
+		// robust adopt (test_inband_down_resync_directed): there the RX never adopted INTO an OFDM
+		// config so inband_ofdm_acq_ring_shrunk is false -> the guard is inactive. Inband-scoped (the
+		// whole resync is feature-gated); off path never runs -> legacy byte-identical.
+		// FAIL-BEFORE A/B: MERCURY_ADOPT_RING_DURABILITY_DEFEAT=1 disables the guard on the SAME binary,
+		// reproducing the lock-collapse (the transient robust trial decodes + adopts -> re-grow). Prod never sets it.
+		if(is_robust_config(cfg)
+		   && inband_ofdm_acq_ring_shrunk
+		   && is_ofdm_config(current_configuration)
+		   && !inband_adopt_ring_durability_defeat())
+		{
+			printf("[INBAND-RX] DOWN-LADDER: skip ROBUST CONFIG_%d trial — holding a fresh OFDM lock "
+				"(ring shrunk@CONFIG_%d); a transient robust glimpse must NOT collapse the live lock "
+				"(genuine demote goes via the dead-batch streak -> TERMINAL BREAK)\n",
+				cfg, current_configuration);
+			fflush(stdout);
+			continue;   // no attempt counted (no receive_byte): a rejected transient is not a failed decode
+		}
 
 		// Copy the captured snapshot into this decoder's own scratch (never the
 		// primary's buffers — the staging discipline parallel_monitor_decode uses,
@@ -4282,7 +4333,6 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 					followed_config, cur_nsymb, natural_nsymb);
 				fflush(stdout);
 				telecom_system->force_set_capture_ring_natural();
-				inband_ofdm_acq_ring_shrunk = true;
 				// Re-arm the FTR/anti-scroll AFTER the realloc (set_size reset frames_to_read to
 				// preamble_nSymb+Nsymb and zeroed the ring; data_container.cc:189). Use the SAME legacy
 				// formula as fix #1b so the snapshot fires once a full natural-geometry frame settled.
@@ -4293,6 +4343,22 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 				telecom_system->data_container.frames_to_read = frame_symb2 + 10;
 				MUTEX_UNLOCK(&capture_prep_mutex);
 			}
+			// FIX #1d (data-flow-robust-ofdm-adopt-flush.md §11): set the shrink GATE flag whenever
+			// we adopt INTO an OFDM config AND the live ring is now at (or below) the natural OFDM
+			// geometry — NOT only when a physical shrink just ran. RATIONALE: the diagnosis found the
+			// shrink branch above did NOT fire in one run because the robust-floor seat had not yet
+			// grown the ring at the adopt instant (cur_nsymb == natural_nsymb -> the `>` test fails ->
+			// the flag was left UNSET). With the flag unset a LATER inband_seat_robust_ring_floor pass
+			// (its gate :3809 needs the flag) re-grows the ring 217->804 and re-blocks OFDM acquisition
+			// — the SAME lock-collapse, just deferred. The flag's true meaning is "we hold a
+			// natural-geometry OFDM lock; do NOT let a robust-floor seat re-grow it" — an invariant that
+			// must hold whenever the ring is at natural for this OFDM config, independent of the
+			// adopt-instant ordering. So set it whenever adopt_into_ofdm AND cur ring <= natural. The
+			// flag still clears on a demote to a robust config (:3811-3812 / :4149). ring_shrink_defeat
+			// gates this too (the FAIL-BEFORE arm keeps the oversized ring -> flag stays meaningful-off).
+			if(natural_nsymb > 0
+			   && telecom_system->data_container.buffer_Nsymb.load() <= natural_nsymb)
+				inband_ofdm_acq_ring_shrunk = true;
 		}
 	}
 

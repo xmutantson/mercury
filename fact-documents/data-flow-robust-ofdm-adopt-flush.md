@@ -319,3 +319,74 @@ PASS-AFTER `buffer_Nsymb == natural_CONFIG_0` + `inband_ofdm_acq_ring_shrunk` se
 same binary) leaves the ring OVERSIZED (the permanent-beyond-bounds signature). Wired into `--test` +
 `--test-inband-adopt-preserve`. Measured (test build): floor=804, natural=212; shrink 804→212 PASS,
 defeat stays 804.
+
+## §11 Fix #1d — DURABILITY of the fresh OFDM lock through a transient ROBUST probe (the residual collapse)
+
+### §11.1 The residual blocker (VERIFIED by the diagnosis + code read)
+
+Fixes #1/#1b/#1c make the robust→OFDM crossing LOCK (metric ~0.998, bufNsymb 217, ACK-SACKs a data
+batch). But ~5s later a TRANSIENT robust-tier reload collapsed the lock (metric 0.998 → 0.289 → 0.181)
+→ down-ladder total-loss → TERMINAL BREAK → ROBUST_0 → 53B. ROOT (two coupled defects):
+
+- **(A) The transient robust ADOPT.** The down-ladder fires on a single inter-frame decode-FAIL pass
+  even with a healthy lock (gate arq_responder.cc:642-650). Its window `[cur-D .. cur]` reaches the
+  ROBUST tier (CONFIG_0 idx 3, D≥3 → ROBUST_0 idx 0). A trial ROBUST_0 decoder spuriously CRC/LDPC-
+  passes on residual energy; `inband_down_ladder_resync` then `inband_adopt_resynced_config(ROBUST_0)`
+  (arq_common.cc:4076→4109) reloads ROBUST_0 on the PRIMARY → `current_configuration` flips non-OFDM →
+  the next `inband_seat_robust_ring_floor` CLEARS the shrink flag (:3811) and RE-GROWS the ring
+  217→804 (:3849) → the live lock collapses. The down-ladder's trial decode uses THROWAWAY decoders
+  (arq_common.cc:4011, never the primary) — so the trial is safe; the ADOPT that follows is the nuke.
+  NB: the `[PHY] Loading configuration 100/101/102` lines in the failing log are the benign THROWAWAY
+  probes (`inband_robust_floor_buffer_nsymb` tmp :3731, the down-decoder bank :3956, `inband_natural_
+  ofdm_buffer_nsymb` tmp :3751) — `force_resize_capture_ring`/`force_set_capture_ring_natural` call
+  `set_size` DIRECTLY and never `load_configuration`. The actual primary reload is the down-ladder adopt.
+- **(B) The shrink flag did not fire reliably (the secondary nondeterminism).** Fix #1c set
+  `inband_ofdm_acq_ring_shrunk` only inside the `cur_nsymb > natural_nsymb` shrink branch. If the
+  robust-floor seat had not yet grown the ring at the adopt instant (`cur_nsymb == natural_nsymb`,
+  adopt-ordering-dependent) the branch no-op'd and the flag was LEFT UNSET → a LATER seat re-grew the
+  ring (the same collapse, deferred).
+
+### §11.2 The fix (inband-scoped, two parts)
+
+- **(A) GUARD the transient robust adopt (arq_common.cc, inband_down_ladder_resync trial loop).** While
+  holding a fresh OFDM lock (`inband_ofdm_acq_ring_shrunk && is_ofdm_config(current_configuration)`),
+  SKIP a robust trial config (`is_robust_config(cfg)`) — no `receive_byte`, no adopt, no attempt counted.
+  The loop still trials any OFDM rung below (a legit in-OFDM rate-down re-shrinks correctly, :4274); if
+  NOTHING decodes the caller ticks the dead-batch streak, so a REAL sustained loss STILL reaches the
+  genuine §7 TERMINAL BREAK demote (which re-grows for robust capture via `load_configuration(ROBUST_0)`
+  directly). FAIL-BEFORE: `MERCURY_ADOPT_RING_DURABILITY_DEFEAT=1` disables the guard.
+- **(B) Set the flag reliably (arq_common.cc:4274+).** Set `inband_ofdm_acq_ring_shrunk = true` whenever
+  adopt_into_ofdm AND the ring is now ≤ the config's natural size — NOT only when a physical shrink ran.
+  The flag's true meaning is "we hold a natural-geometry OFDM lock; do not let a robust-floor seat
+  re-grow it" — an invariant independent of adopt-instant ordering. Still gated by `ring_shrink_defeat`
+  (the §10 FAIL-BEFORE arm keeps the oversized ring → flag stays meaningfully-off).
+
+### §11.3 §5 AUDIT — `inband_ofdm_acq_ring_shrunk` durability (VERDICT: YES)
+
+- **Producers of the flag**: set TRUE on adopt-into-OFDM @ natural geometry (arq_common.cc:4274+, now
+  ordering-independent); set FALSE on adopt into a robust config (:4149) and in the seat when flag-set +
+  non-OFDM (:3811-3812). **Consumer**: the seat's early-return suppress (:3809).
+- **Lock SURVIVES a transient robust probe**: the guard skips the robust trial → no adopt → the flag
+  stays set + current stays OFDM → the seat re-grow stays suppressed. VERIFIED (PART F PASS-AFTER:
+  winner=-1, current stays CONFIG_1, flag set, re-seat no-grows; FAIL-BEFORE: robust decodes+adopts→100,
+  flag cleared).
+- **Down-ladder STILL recovers a genuine loss**: a robust adopt is suppressed ONLY while a fresh OFDM
+  lock is held (flag set). A genuine CMD demote manifests as the OFDM lock dying across MANY passes →
+  the dead-batch streak reaches SESSION_DEAD_BATCHES → §7 TERMINAL BREAK → `load_configuration(ROBUST_0)`
+  (NOT this path) → flag clears → re-grow. The LEGITIMATE direct robust adopt
+  (`test_inband_down_resync` PART 2b: from CONFIG_1 with flag=false) is UNAFFECTED — guard inactive →
+  `CONFIG_100 DECODED → adopting` still fires (VERIFIED). The A3-DECOUPLE T5b3 GENUINE-DEATH test
+  (sustained loss → BREAK) still PASSES.
+- **Off path** (`!inband_rate_feature_enabled`): `inband_down_ladder_resync` returns -1 at :3985 before
+  the guard; the flag-set is inside the inband adopt → legacy byte-identical.
+
+### §11.4 Regression (PART F of test_inband_adopt_preserve_live_burst)
+
+PART F seats the robust floor (grows the ring to 804 = the vulnerable oversized-but-flagged window),
+sets the flag (models fix #1c's lock state), and drives `inband_down_ladder_resync` directly with a real
+ROBUST_0 frame. PASS-AFTER (guard active): the robust trial is SKIPPED (winner≠ROBUST_0, current stays
+OFDM, flag still set, a subsequent re-seat does not further re-grow). FAIL-BEFORE
+(`MERCURY_ADOPT_RING_DURABILITY_DEFEAT=1`, same binary): the robust trial DECODES + ADOPTS (winner=100,
+current flips non-OFDM, flag cleared — the collapse gate opens). Wired into `--test` +
+`--test-inband-adopt-preserve`. Measured (test build): floor=804, natural=212; PASS-AFTER winner=-1,
+FAIL-BEFORE winner=100.

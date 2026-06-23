@@ -7893,6 +7893,7 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		set_env("MERCURY_ADOPT_FLUSH_DEFEAT", "");
 		set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", "");
 		set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", "");
+		set_env("MERCURY_ADOPT_RING_DURABILITY_DEFEAT", "");
 	};
 
 	// The adopt takes capture_prep_mutex; create it if NULL (standalone test).
@@ -8183,6 +8184,129 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		delete rx; delete ts;
 	}
 	set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", "");
+
+	// ── PART F : FIX #1d — DURABILITY of the fresh OFDM lock through a TRANSIENT ROBUST PROBE
+	//   (data-flow-robust-ofdm-adopt-flush.md §11). After fix #1c shrinks the ring to natural and
+	//   the coarse search LOCKS (metric~0.998), a single inter-frame decode-FAIL pass fires the
+	//   down-ladder over a window whose lo_idx reaches the ROBUST tier (CONFIG_0 idx 3, D=4 ->
+	//   ROBUST_0 idx 0). A trial ROBUST_0 decoder can CRC/LDPC-pass on residual energy; the PRE-FIX
+	//   code ADOPTED it -> the primary reloads ROBUST_0 -> current_configuration flips non-OFDM ->
+	//   the next inband_seat_robust_ring_floor CLEARS the shrink flag + RE-GROWS the ring 217->804
+	//   -> the live OFDM lock collapses -> TERMINAL BREAK -> ROBUST_0 -> 53B. The guard SKIPS a
+	//   robust trial while holding a fresh OFDM lock, so the lock SURVIVES.
+	//     PASS-AFTER (arm 0): a real ROBUST_0 frame is fed to the down-ladder while the RX holds a
+	//       fresh CONFIG_0 lock (inband_ofdm_acq_ring_shrunk set). The guard SKIPS the ROBUST trial
+	//       -> NO adopt (current_configuration stays CONFIG_0) -> a subsequent robust-floor re-seat
+	//       does NOT re-grow the ring (stays natural) -> the lock survives.
+	//     FAIL-BEFORE (arm 1, MERCURY_ADOPT_RING_DURABILITY_DEFEAT=1, same binary): the guard is
+	//       disabled -> the ROBUST_0 trial decodes + ADOPTS -> current_configuration flips to ROBUST_0
+	//       -> the re-seat re-grows the ring (oversized again) -> the lock-collapse signature.
+	{
+		// Generate ONE real ROBUST_0 frame (the directed-test recipe, near-clean wire) so a trial
+		// ROBUST_0 decoder genuinely CRC/LDPC-passes — the transient false-positive the guard rejects.
+		std::vector<double> robust_frame;
+		int robust_span = 0;
+		{
+			cl_telecom_system* tg = new cl_telecom_system();
+			tg->operation_mode = ARQ_MODE; tg->narrowband_enabled = NO;
+			tg->load_configuration(ROBUST_0);
+			int interp = tg->frequency_interpolation_rate;
+			int Nofdm  = tg->data_container.Nofdm;
+			int preN   = tg->data_container.preamble_nSymb;
+			int Nsymb  = tg->data_container.Nsymb;
+			int fb = tg->get_frame_size_bytes(); if(fb <= 0) fb = 1;
+			std::vector<int> payload((size_t)fb, 0);
+			for(int i = 0; i < fb; i++) payload[i] = (i * 37 + 11) & 0xFF;
+			tg->transmit_byte(payload.data(), fb, tg->data_container.passband_data, SINGLE_MESSAGE);
+			int lead = 8;
+			int forced_delay = ((preN + 2) * Nofdm + lead) * interp;
+			int n_frame = (Nofdm * (Nsymb + preN)) * interp;
+			tg->awgn_channel.apply_with_delay(tg->data_container.passband_data,
+				tg->data_container.passband_delayed_data, 1e-3f, n_frame, forced_delay);
+			int span = forced_delay + n_frame + Nofdm * interp;
+			int cap = tg->data_container.Nofdm * tg->data_container.buffer_Nsymb.load() * interp;
+			if(span > cap) span = cap;
+			robust_frame.assign((size_t)span, 0.0);
+			for(int i = 0; i < span; i++) robust_frame[i] = tg->data_container.passband_delayed_data[i];
+			robust_span = span;
+			delete tg;
+		}
+		check(robust_span > 0, "F0 generated a real ROBUST_0 frame (a trial decoder will pass it)",
+			robust_span, 1);
+
+		for(int arm = 0; arm < 2; arm++)
+		{
+			bool defeat = (arm == 1);
+			set_env("MERCURY_ADOPT_RING_DURABILITY_DEFEAT", defeat ? "1" : "");
+
+			// RX holding a CONFIG_1 OFDM lock WITH the shrink flag set, but whose ring momentarily
+			// sits at the ROBUST FLOOR (804) — the exact vulnerable window: a robust-floor re-seat
+			// grew the ring while the flag was still set (the deferred-collapse path the §11 fix
+			// closes). The oversized ring lets the down-ladder snapshot hold a FULL robust frame, so
+			// a trial ROBUST_0 decoder genuinely passes — the transient false-positive. CONFIG_1 is
+			// ladder idx 4; down-window depth 4 -> lo_idx 0 -> ROBUST_0 in range.
+			auto pr = build_rx(CONFIG_1);
+			cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+			int natural_c1 = (int)ts->data_container.buffer_Nsymb.load();
+			rx->inband_ofdm_acq_ring_shrunk = false;       // allow the seat to grow the ring first
+			rx->inband_seat_robust_ring_floor();           // ring -> robust floor (804, the vulnerable size)
+			rx->inband_ofdm_acq_ring_shrunk = true;        // model fix #1c's lock state (flag set @ OFDM)
+			rx->inband_down_d = 4;                         // [CONFIG_1 idx4 - 4] -> ROBUST_0 idx0 in window
+			rx->inband_dead_batches_limit = 1000;          // do not BREAK during the directed probe
+			rx->rsp_current_expected_batch_seq_id = 4;     // an in-flight active batch
+			int robust_floor_nsymb = (int)ts->data_container.buffer_Nsymb.load();
+			check(robust_floor_nsymb > natural_c1,
+				"F-PRE ring grew to the robust floor (the vulnerable oversized-but-flagged window)",
+				robust_floor_nsymb, natural_c1);
+
+			// Drive the down-ladder DIRECTLY with the real ROBUST_0 frame (the transient probe).
+			int win_cap = ts->data_container.Nofdm * (int)ts->data_container.buffer_Nsymb.load()
+				* ts->data_container.interpolation_rate;
+			std::vector<double> snap((size_t)win_cap, 0.0);
+			int cpy = (robust_span < win_cap) ? robust_span : win_cap;
+			for(int i = 0; i < cpy; i++) snap[i] = robust_frame[(size_t)i];
+			int dlen = 0;
+			int winner = rx->inband_down_ladder_resync(snap.data(), win_cap,
+				rx->inband_down_window_depth(), /*expect_bsi_lsb=*/0xFF, NULL, &dlen);
+
+			if(!defeat)
+			{
+				// After the probe, run the production robust-floor re-seat (the per-pass hot path).
+				// The lock was kept (flag still set + at OFDM) -> the re-seat is suppressed -> the
+				// geometry is recoverable by fix #1c on the next adopt pass (the lock survives).
+				int nsymb_after_probe = (int)ts->data_container.buffer_Nsymb.load();
+				check(winner != ROBUST_0,
+					"F1-FIX guard SKIPPED the transient ROBUST_0 trial (no adopt away from the fresh OFDM lock)",
+					winner, CONFIG_1);
+				check(is_ofdm_config(rx->current_configuration),
+					"F2-FIX current_configuration STAYED an OFDM config (the live lock was not nuked)",
+					rx->current_configuration, CONFIG_1);
+				check(rx->inband_ofdm_acq_ring_shrunk,
+					"F3-FIX the shrink flag is STILL set (the transient probe did not clear it)",
+					rx->inband_ofdm_acq_ring_shrunk ? 1 : 0, 1);
+				rx->inband_seat_robust_ring_floor();
+				check((int)ts->data_container.buffer_Nsymb.load() == nsymb_after_probe,
+					"F4-FIX the robust-floor re-seat is SUPPRESSED while shrunk@OFDM (no further re-grow)",
+					(int)ts->data_container.buffer_Nsymb.load(), nsymb_after_probe);
+			}
+			else
+			{
+				// No guard -> the transient ROBUST_0 trial decodes + ADOPTS -> the primary reloads
+				// ROBUST_0 -> current_configuration flips non-OFDM -> the shrink flag is cleared.
+				check(winner == ROBUST_0,
+					"F1-DEFEAT (FAIL-BEFORE) the transient ROBUST_0 trial DECODED + ADOPTED (no guard)",
+					winner, ROBUST_0);
+				check(!is_ofdm_config(rx->current_configuration),
+					"F2-DEFEAT current_configuration flipped to ROBUST (the OFDM lock was nuked)",
+					rx->current_configuration, ROBUST_0);
+				check(!rx->inband_ofdm_acq_ring_shrunk,
+					"F3-DEFEAT the shrink flag was CLEARED by the robust adopt (the re-grow gate is now open)",
+					rx->inband_ofdm_acq_ring_shrunk ? 1 : 0, 0);
+			}
+			delete rx; delete ts;
+		}
+		set_env("MERCURY_ADOPT_RING_DURABILITY_DEFEAT", "");
+	}
 
 #if defined(_WIN32)
 	if(created_mutex && capture_prep_mutex != NULL)

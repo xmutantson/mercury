@@ -3558,6 +3558,16 @@ public:
   bool inband_freshwin_gate_defeat();
   int  inband_freshwin_gate_defeat_cached = -1;  // -1=unresolved, 0=off (gated), 1=defeat
 
+  // FIX #1d FAIL-BEFORE / A-B knob (data-flow-robust-ofdm-adopt-flush.md §11):
+  // MERCURY_ADOPT_RING_DURABILITY_DEFEAT (cached). 1 = the down-ladder does NOT skip a robust
+  // trial while holding a fresh OFDM lock (the PRE-FIX behavior: a transient robust glimpse
+  // decodes + adopts -> the primary reloads ROBUST_0 -> the shrink flag clears -> the ring
+  // re-grows -> the live OFDM lock collapses). Default 0 = the guard is active (the fresh OFDM
+  // lock is durable through a transient robust probe). Production never sets it; the regression
+  // flips it to reproduce the lock-collapse then confirm the guard.
+  bool inband_adopt_ring_durability_defeat();
+  int  inband_adopt_ring_durability_defeat_cached = -1;  // -1=unresolved, 0=off (guarded), 1=defeat
+
   // PER-PASS PHY-REBUILD LEAK FIX (data-flow-inband-downladder-delivery): the ROBUST-floor
   // buffer_Nsymb is a CONSTANT for a given bandwidth (the config is always FULL_CONFIG_LADDER[0]),
   // so probe the throwaway cl_telecom_system ONCE and memo it keyed by narrowband_enabled. Without
