@@ -7891,6 +7891,7 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 	auto restore_env = [&]() {
 		set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
 		set_env("MERCURY_ADOPT_FLUSH_DEFEAT", "");
+		set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", "");
 	};
 
 	// The adopt takes capture_prep_mutex; create it if NULL (standalone test).
@@ -8057,6 +8058,61 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		}
 		delete rx; delete ts;
 	}
+
+	// ── PART D : FIX #1b — OFDM-RX RE-INIT (FTR re-arm + nUnder reset) lets the preserved
+	//   burst RE-LOCK. Fix #1 preserved the samples but the RX still STALLED (~101B): after the
+	//   crossing the coarse search reported FTR-FAIL metric=0.13-0.24 search_raw=0 and never
+	//   re-locked, because the adopt left frames_to_read==0 (immediate snapshot of a partial
+	//   ring) and a stale nUnder_processing_events. Legacy SET_CONFIG/BREAK re-init re-arms
+	//   frames_to_read = frame_symb + 10 AND nUnder=0 (arq_responder.cc:1818-1819,
+	//   arq_common.cc:9425/9433). This part asserts the adopt now re-arms BOTH.
+	//     PASS-AFTER (arm 0): after an OFDM-target adopt, frames_to_read == frame_symb+10 (>0)
+	//       and nUnder_processing_events == 0 -> the capture thread accrues one full new-geometry
+	//       frame BEFORE the next snapshot, so the fresh anchor search sees a complete preamble.
+	//     FAIL-BEFORE (arm 1, MERCURY_ADOPT_FTR_REARM_DEFEAT=1, same binary): the re-arm is
+	//       skipped -> frames_to_read stays 0 (the ~101B stall signature).
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx(CONFIG_1);
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+		const int RWI = 3 * ts->data_container.Nofdm * ts->data_container.interpolation_rate;
+		paint_burst(ts, 0.8, RWI);
+
+		// Pre-stage the STALL condition the bug leaves: frames_to_read==0 (immediate snapshot)
+		// and a stale nUnder accrued during the robust-tier dwell.
+		ts->data_container.frames_to_read = 0;
+		ts->data_container.nUnder_processing_events = 99;
+
+		int frame_symb = ts->data_container.preamble_nSymb + ts->data_container.Nsymb;
+		rx->inband_adopt_resynced_config(CONFIG_0);   // OFDM target -> re-init should fire
+
+		int ftr_after    = (int)ts->data_container.frames_to_read.load();
+		int nunder_after = (int)ts->data_container.nUnder_processing_events.load();
+
+		if(!defeat)
+		{
+			check(ftr_after == frame_symb + 10,
+				"D1-REINIT frames_to_read re-armed to frame_symb+10 (capture fills a full "
+				"new-geometry frame before the next snapshot -> search can re-lock)",
+				ftr_after, frame_symb + 10);
+			check(nunder_after == 0,
+				"D2-REINIT nUnder_processing_events reset to 0 (anti-re-decode skip not scrolled "
+				"off the live preamble)",
+				nunder_after, 0);
+		}
+		else
+		{
+			check(ftr_after == 0,
+				"D1-DEFEAT (FAIL-BEFORE) frames_to_read left at 0 (immediate snapshot of a "
+				"partial ring -> metric 0.13-0.24, search_raw=0, ~101B stall)",
+				ftr_after, 0);
+		}
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", "");
 
 #if defined(_WIN32)
 	if(created_mutex && capture_prep_mutex != NULL)

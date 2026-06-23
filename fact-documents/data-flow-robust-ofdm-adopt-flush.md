@@ -138,9 +138,14 @@ Per-consumer:
   — `is_ofdm_config(followed_config)` is FALSE for a robust target, so the fix's live-preserve
   branch is NOT taken; the full flush runs verbatim (correct — a robust MFSK target wants a
   clean ring for the MFSK preamble search, and there is no "live OFDM burst" to preserve). ✓.
-- `nUnder_processing_events` — NOT touched by HINGE-1 (neither before nor after the fix);
-  unchanged. The anti-re-decode `ofdm_skip` math (telecom_system.cc:1390) sees
-  ofdm_search_raw=0 → ofdm_skip≈0 → a full-window search, which is what a fresh anchor wants.
+- `nUnder_processing_events` / `frames_to_read` — ~~NOT touched by HINGE-1 … which is what a
+  fresh anchor wants.~~ **FALSIFIED by the decisive A/B (see §9).** Fix #1's preserve DID land
+  (1 OFDM acquisition vs 0) but the RX still STALLED at ~101B: after the crossing the
+  re-anchored coarse search reported `FTR-FAIL CONFIG_0 metric=0.13-0.24 search_raw=0` and never
+  re-locked. The reason: leaving `frames_to_read==0` makes the very next rx_transfer snapshot the
+  ring IMMEDIATELY (telecom_system.cc:5402) before a full new-geometry frame is captured, and a
+  STALE `nUnder_processing_events` scrolls `ofdm_skip` (telecom_system.cc:1390) off the live
+  preamble. **Fix #1b** re-arms BOTH (the legacy receiver re-init) — see §9.
 
 ## §7 Cold/stale-adopt + MFSK-follow safety — VERDICT
 
@@ -161,3 +166,70 @@ energy and `ring_write_index` is preserved post-adopt (PASS-AFTER); a defeat arm
 (FAIL-BEFORE signature). A COLD arm (silent ring) asserts the full flush still runs. The PHY
 acquisition consequence is asserted via a coarse Schmidl-Cox search over the post-adopt ring:
 `search_raw>0` (lock) preserve vs `=0` (no lock) on the wiped/defeat arm.
+
+---
+
+## §9 Fix #1b — OFDM-receiver RE-INIT (the second half of the robust→OFDM class)
+
+### §9.1 The residual stall (VERIFIED by the decisive A/B + code read)
+
+Fix #1 (§1–§8) defeated the ring-WIPE: the in-flight preamble survives the adopt (the A/B
+measured 1 OFDM acquisition vs 0). But the redesign still STALLED at ~101B. The RX's
+re-anchored coarse/anchor search could NOT RE-LOCK after the preserved crossing:
+`FTR-FAIL CONFIG_0 metric=0.13-0.24 search_raw=0` ("all silent") for the rest of the burst —
+never decoded one CONFIG_0 frame → down-ladder → stall. LEGACY's coordinated SET_CONFIG path
+re-locks fine.
+
+ROOT (VERIFIED): `inband_adopt_resynced_config` preserved the SAMPLES but did NOT re-INITIALIZE
+the OFDM receiver's FTR/anti-scroll state for the new geometry. Every LEGACY config-change
+receiver re-init does TWO things the adopt was MISSING:
+1. `nUnder_processing_events = 0`
+2. `frames_to_read = frame_symb + 10` (a POSITIVE countdown; `frame_symb = preamble_nSymb + Nsymb`)
+
+Cited legacy sites (the proven recipe — REUSED verbatim, not reinvented):
+- SET_CONFIG post-ACK turnaround: arq_responder.cc:1818 (`frames_to_read = frame_symb + 10`),
+  :1819 (`nUnder_processing_events = 0`).
+- BREAK re-init: arq_common.cc:9425 (`nUnder=0`), :9433 (`frames_to_read = frame_symb + 10`).
+
+What the adopt did instead: `load_configuration` set `frames_to_read=0` (arq_common.cc:2084) —
+and on a cross-MODULATION switch (robust MFSK → OFDM) the PHY reinit `set_size` reseeds it to
+`preamble_nSymb+Nsymb` (data_container.cc:189), but on an OFDM→OFDM adopt NOTHING re-armed it,
+and `nUnder_processing_events` carried a stale value from the robust-tier dwell.
+
+Mechanism: with `frames_to_read==0` the next rx_transfer (telecom_system.cc:5402) snapshots the
+ring `&passband_delayed_data[rwi]` IMMEDIATELY — before the capture thread (audioio.c:1455
+`frames_to_read--`) re-fills a WHOLE fresh CONFIG_0 frame at the new geometry — and a stale
+`nUnder` scrolls the anti-re-decode skip `ofdm_skip = ofdm_search_raw - nUnder`
+(telecom_system.cc:1390) off the live preamble. Net: a partial/misaligned coarse window →
+metric 0.13-0.24 → never PASS → stall.
+
+### §9.2 The fix (arq_common.cc:4169+, inband-scoped)
+
+After the OFDM-cursor reset, when adopting INTO an OFDM config (`is_ofdm_config(followed_config)`),
+re-arm `nUnder_processing_events = 0` and `frames_to_read = preamble_nSymb + Nsymb + 10` (the
+legacy formula verbatim), under the same `capture_prep_mutex`. The capture thread then accrues
+one full new-geometry frame into the PRESERVED ring BEFORE the next snapshot, so the fresh anchor
+search sees a complete CONFIG_0 preamble and locks (`search_raw>0`). A robust/MFSK target keeps
+the destructive flush + its own MFSK FTR/search machinery (untouched). Off path
+(`!inband_rate_feature_enabled()`) never runs → legacy byte-identical.
+
+### §9.3 Preserve + re-init COMPOSE (the §5 audit — VERDICT: YES)
+
+The re-arm does NOT scroll the preserved preamble out of the ring: the ring size is
+`buffer_Nsymb = frame_symb + turnaround_symb + frame_symb + margin` (data_container.cc:159) ≫
+`frame_symb + 10`, so during the FTR fill the most-recent `buffer_Nsymb` symbols (the
+double-mapped read window) still contain the preserved preamble. While `frames_to_read > 0` the
+overrun counter `nUnder++` (audioio.c:1425, gated on `frames_to_read <= 0`) does NOT fire, so
+`nUnder` stays 0 and `ofdm_skip` stays at the fresh-anchor 0. The two fixes compose: fix #1 keeps
+the samples in the ring, fix #1b gives the capture thread time to complete the frame at the new
+geometry and positions the snapshot. On the cross-MODULATION crossing (where load_configuration
+reallocates+zeroes the ring, data_container.cc:248/170) the preserve is moot but the FTR re-arm
+is still the load-bearing step — `frame_symb+10` is a strict superset of the PHY reinit's
+`preamble_nSymb+Nsymb` reseed (+10 margin, +nUnder reset).
+
+### §9.4 Regression (PART D of test_inband_adopt_preserve_live_burst)
+
+PART D pre-stages the stall (`frames_to_read=0`, `nUnder=99`), drives the OFDM-target adopt, and
+asserts PASS-AFTER `frames_to_read == frame_symb+10` (>0) + `nUnder==0`; FAIL-BEFORE
+(`MERCURY_ADOPT_FTR_REARM_DEFEAT=1`, same binary) leaves `frames_to_read==0` (the ~101B stall
+signature). Wired into `--test` + `--test-inband-adopt-preserve`.
