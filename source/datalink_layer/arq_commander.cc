@@ -5288,6 +5288,26 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				last_data_viable_config = data_anchor_raise_target(
 					clean_batches_config, current_configuration,
 					last_data_viable_config, clean_batches_at_current_config);
+				// INBAND CEILING RE-RAISE (data-flow-inband-ceiling-reraise.md §3,
+				// option (b)): under the no-BREAK inband redesign the demote
+				// (inband_route_failure_demote, :3073) PINS supershift_proven_ceiling
+				// at the demoted rung, and the turbo/SUPERSHIFT/BREAK re-raise sites
+				// never fire on the inband path — so the FRAME-UP gate (:5340) walls
+				// ALL upward probing after a degrade (the deep_stall). Mirror the
+				// anchor raise above: once this (demoted) rung has re-proven itself
+				// sustained-clean, RAISE the ceiling to TRACK the freshly-updated
+				// proven anchor (never above it). The +1 anchor clamp (:5348-5350)
+				// then permits a single-rung probe above proven ground, and the
+				// gearshift's decode-failure demote re-pins if that probe fails —
+				// restoring re-climb without over-climb. SCOPED to inband only so
+				// legacy is BYTE-IDENTICAL (the helper is a no-op when ceiling<0, but
+				// the gate makes the intent explicit and guarantees the legacy
+				// turbo/BREAK ceiling discipline is untouched). PURE helper; replayed
+				// by --test-climb-engine Part X.
+				if(inband_rate_feature_enabled())
+					supershift_proven_ceiling = inband_ceiling_raise_target(
+						supershift_proven_ceiling, last_data_viable_config,
+						clean_batches_config, clean_batches_at_current_config);
 				// FIX-B — RESET the floor-probe back-off on a CLEAN OFDM batch
 				// (gearshift-floor-probe-backoff.md §5.3). This is the sole reset
 				// producer: a fully-delivered batch at an OFDM config proves an OFDM
@@ -12793,6 +12813,120 @@ int cl_arq_controller::test_climb_engine()
 		message_transmission_time_ms = saved_mtt;
 		data_batch_size = saved_batch;
 		current_configuration = saved_cfg;
+	}
+
+	// ================================================================
+	// Part X — IN-BAND CEILING RE-RAISE (data-flow-inband-ceiling-reraise.md).
+	// THE inband deep-stall: inband_route_failure_demote() PINS
+	// supershift_proven_ceiling at the demoted rung (:3073), and the ONLY
+	// production ceiling-RAISE sites are turbo/SUPERSHIFT/BREAK paths the no-BREAK
+	// inband demote never fires -> the FRAME-UP gate (:5340) walls ALL upward
+	// probing -> the link re-climbs NOTHING after a degrade (the 97B-vs-168B
+	// ~0.58x loss). The fix re-raises the ceiling to the PROVEN anchor once the
+	// demoted rung re-proves itself sustained-clean. This Part drives the REAL
+	// pure helper `inband_ceiling_raise_target` (the production decision) directly,
+	// then replays it inside the REAL FRAME-UP gate to assert the climb escapes.
+	//
+	// FAIL-BEFORE: build -DINBAND_CEILING_FAILBEFORE substitutes the BUGGY
+	// (pre-fix) behaviour — the ceiling stays pinned regardless of the clean
+	// streak — so X1/X3 (the re-raise + the modelled escape) FAIL.
+	{
+#ifdef INBAND_CEILING_FAILBEFORE
+		// Pre-fix stub: NO ceiling re-raise — the pin survives every clean batch.
+		auto ceiling_reraise = [&](int cur, int /*anchor*/, int /*scfg*/, int /*streak*/) -> int
+		{ return cur; };
+#else
+		auto ceiling_reraise = [&](int cur, int anchor, int scfg, int streak) -> int
+		{ return inband_ceiling_raise_target(cur, anchor, scfg, streak); };
+#endif
+
+		// SCENARIO: a clean CONFIG_2 link proved itself (anchor=CONFIG_2,
+		// ceiling=-1), then a degrade fired the inband demote to CONFIG_0 — which
+		// PINS the ceiling at CONFIG_0 (the bug) but leaves the anchor at CONFIG_2
+		// (the inband path never lowers last_data_viable_config). The channel then
+		// RECOVERS and CONFIG_0 delivers sustained-clean.
+		robust_enabled = YES; narrowband_enabled = NO;
+		max_config_override = -1; optimizer_disabled = true;
+		supershift_proven_ceiling = CONFIG_0;     // the inband-demote pin (:3073)
+		last_data_viable_config   = CONFIG_2;     // anchor NOT lowered by the demote
+		clean_batches_config            = CONFIG_0;
+		clean_batches_at_current_config = 0;
+
+		// X0 — FAIL-BEFORE sanity: BEFORE any sustained-clean proof the ceiling
+		// must NOT raise (streak below the bar). Passes in both arms.
+		int c0 = ceiling_reraise(supershift_proven_ceiling, last_data_viable_config,
+			clean_batches_config, /*streak=*/0);
+		check(c0 == CONFIG_0,
+			"X0 ceiling stays pinned with NO sustained-clean proof (streak=0)",
+			c0, CONFIG_0);
+
+		// X0b — ONE clean batch at CONFIG_0 (an OFDM rung, sustained-anchor N=2) is
+		// NOT yet enough: streak=1 < 2, so the helper must still hold the pin. This
+		// proves the re-raise is SUSTAINED-gated, not single-batch-eager.
+		clean_batches_at_current_config = 1;
+		int c1 = ceiling_reraise(supershift_proven_ceiling, last_data_viable_config,
+			clean_batches_config, clean_batches_at_current_config);
+		check(c1 == CONFIG_0,
+			"X0b ONE clean OFDM batch (streak=1 < N=2) does NOT yet raise the ceiling (sustained-gated)",
+			config_ladder_index(c1), config_ladder_index(CONFIG_0));
+
+		// SECOND consecutive clean batch at CONFIG_0 -> streak=2 (== N_OFDM). The
+		// rung has re-proven itself; the helper raises the ceiling to the PROVEN
+		// anchor (CONFIG_2). X1 is THE fix assertion: FAIL-BEFORE keeps it pinned.
+		clean_batches_at_current_config = 2;
+		supershift_proven_ceiling = ceiling_reraise(supershift_proven_ceiling,
+			last_data_viable_config, clean_batches_config,
+			clean_batches_at_current_config);
+		check(config_ladder_index(supershift_proven_ceiling) >
+		      config_ladder_index(CONFIG_0),
+			"X1 ceiling RE-RAISES above the demoted rung after a sustained-clean batch (deep-stall lifted)",
+			config_ladder_index(supershift_proven_ceiling), config_ladder_index(CONFIG_0));
+
+		// X2 — the raise is CAPPED at the proven anchor (never above
+		// last_data_viable_config) so the +1 clamp stays the sole over-climb bound.
+		check(config_ladder_index(supershift_proven_ceiling) <=
+		      config_ladder_index(last_data_viable_config),
+			"X2 ceiling re-raise CAPPED at the proven anchor (no over-climb past last_data_viable_config)",
+			config_ladder_index(supershift_proven_ceiling),
+			config_ladder_index(last_data_viable_config));
+
+		// X3 — END-TO-END re-climb escape: replay the REAL FRAME-UP gate (:5340 +
+		// the +1 clamp :5348) with the re-raised ceiling and assert a +1 probe is
+		// now PERMITTED off the demoted rung (pre-fix: walled -> deep_stall).
+		current_configuration = CONFIG_0;
+		int proposed = config_ladder_up(current_configuration, robust_enabled, false);
+		bool frame_ceiling_blocked =
+			(supershift_proven_ceiling >= 0 &&
+			 config_ladder_index(proposed) > config_ladder_index(supershift_proven_ceiling))
+			|| (max_config_override >= 0 && proposed > max_config_override);
+		if(config_ladder_index(proposed) >
+		   config_ladder_index(last_data_viable_config) + 1)
+			frame_ceiling_blocked = true;   // the +1 anchor clamp (unchanged)
+		check(!frame_ceiling_blocked,
+			"X3 FRAME-UP +1 probe PERMITTED off the demoted rung after the re-raise (re-climb restored, not deep_stall)",
+			frame_ceiling_blocked ? 1 : 0, 0);
+
+		// X4 — LEGACY BYTE-IDENTITY: a NEGATIVE ceiling (no inband demote happened,
+		// the legacy/clean state) is an identity no-op — the helper never invents a
+		// cap, so legacy ceiling discipline is untouched.
+		int c_legacy = inband_ceiling_raise_target(/*cur=*/-1, /*anchor=*/CONFIG_5,
+			/*scfg=*/CONFIG_5, /*streak=*/9);
+		check(c_legacy == -1,
+			"X4 helper is a no-op when ceiling<0 (legacy byte-identical: never invents a cap)",
+			c_legacy, -1);
+
+		// X5 — NO RAISE ABOVE THE ANCHOR even with a huge streak: a sustained-clean
+		// run at CONFIG_0 cannot push the ceiling past the CONFIG_2 anchor (the +1
+		// clamp owns the rung-by-rung climb above proven ground).
+		int c_cap = inband_ceiling_raise_target(/*cur=*/CONFIG_0, /*anchor=*/CONFIG_2,
+			/*scfg=*/CONFIG_0, /*streak=*/100);
+		check(c_cap == CONFIG_2,
+			"X5 ceiling re-raise tops out AT the anchor (never above) regardless of streak depth",
+			config_ladder_index(c_cap), config_ladder_index(CONFIG_2));
+
+		// Restore a clean baseline for any later teardown.
+		supershift_proven_ceiling = -1;
+		clean_batches_at_current_config = 0;
 	}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",

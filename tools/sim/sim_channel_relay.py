@@ -727,6 +727,25 @@ class Channel:
 
     def __init__(self, args, rng_seed):
         self.snr_db = args.snr            # SNR3k in dB
+        # ---- OPT-IN time-varying SNR schedule -------------------------
+        # Parse '<virt_s>:<WGN_label>' edges keyed to the per-direction
+        # virtual clock (sample_clock/FS). Sorted ascending by time. The
+        # t=0 edge (if present) sets the starting SNR; later edges fire in
+        # process() when the direction's virtual clock crosses them. The
+        # label is mapped label->SNR3k via WGN_TO_SNR3K exactly like --cell.
+        self.snr_schedule = []            # list of (virt_s, snr3k_db)
+        if getattr(args, "snr_schedule", None):
+            for tok in args.snr_schedule.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                ts, lbl = tok.split(":")
+                self.snr_schedule.append(
+                    (float(ts), float(lbl) + WGN_TO_SNR3K))
+            self.snr_schedule.sort(key=lambda e: e[0])
+            if self.snr_schedule and self.snr_schedule[0][0] <= 0.0:
+                self.snr_db = self.snr_schedule[0][1]
+        self._sched_idx = 0               # next un-fired edge
         self.loss = args.loss
         self.burst = args.burst
         self.profile = args.profile
@@ -866,6 +885,24 @@ class Channel:
                     out[i] = 0.0
 
         self.sample_clock += n
+
+        # --- OPT-IN SNR schedule: fire any edges the per-direction virtual
+        # clock has now crossed. Recompute snr_lin + noise_std from the new
+        # SNR3k via the SAME calibrated path (_noise_std_from_psig), so a
+        # degrade edge raises the AWGN floor for all subsequent chunks. The
+        # t=0 edge was applied in __init__; this only handles t>0 edges.
+        if self.snr_schedule:
+            virt_s = self.sample_clock / FS
+            fired = False
+            while (self._sched_idx < len(self.snr_schedule)
+                   and virt_s >= self.snr_schedule[self._sched_idx][0]):
+                self.snr_db = self.snr_schedule[self._sched_idx][1]
+                self._sched_idx += 1
+                fired = True
+            if fired:
+                self.snr_lin = 10.0 ** (self.snr_db / 10.0)
+                self.noise_std = self._noise_std_from_psig(self.p_sig)
+
         return out.tolist()
 
 
@@ -919,6 +956,14 @@ def main():
                          "Overridden by --cell.")
     ap.add_argument("--cell", default=None,
                     help="convenience SNR spec, e.g. WGN:-12 (SNR3k = label+2.4)")
+    ap.add_argument("--snr-schedule", default=None,
+                    help="OPT-IN time-varying SNR3k: comma list of "
+                         "'<virt_s>:<WGN_label>' edges keyed to the per-direction "
+                         "virtual clock, e.g. '0:40,30:18' (clean WGN:40 until 30 "
+                         "virtual-s, then degrade to WGN:18). Labels are mapped "
+                         "label->SNR3k via WGN_TO_SNR3K, same as --cell. When set, "
+                         "overrides --snr/--cell as the t=0 floor. Default off "
+                         "(byte-identical static channel).")
     ap.add_argument("--sig-ref", type=float, default=0.15,
                     help="initial TX passband RMS reference for the noise floor "
                          "before live TX power is measured (default 0.15)")
@@ -1111,6 +1156,10 @@ def main():
         f"turnaround_drift={turn_on}(ppm a2b={args.turnaround_ppm_a2b},"
         f"b2a={args.turnaround_ppm_b2a},jit={args.turnaround_jitter_ms}ms) "
         f"wire={'STAMPED(8200,needs feat/sim-clock modem)' if args.wire_stamp else 'BARE(8192,compatible)'}")
+    if getattr(args, "snr_schedule", None):
+        log(f"SNR-SCHEDULE (opt-in, keyed to per-direction virtual clock): "
+            f"{args.snr_schedule}  (label->SNR3k via +{WGN_TO_SNR3K}dB; "
+            f"overrides --snr/--cell as the t=0 floor)")
     if realtime_on:
         log("NOTE: V2 WALL-CLOCK real-time pacing ENABLED (MERCURY_SIM_REALTIME) — "
             "forwarder releases one chunk/direction per 21.333 ms wall clock (true "

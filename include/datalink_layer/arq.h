@@ -942,6 +942,58 @@ public:
     return streak_config;
   }
 
+  // INBAND CEILING RE-RAISE (data-flow-inband-ceiling-reraise.md §3) — the PURE
+  // policy that decides the new value of supershift_proven_ceiling after a
+  // sustained-clean batch UNDER THE IN-BAND NO-BREAK REDESIGN. ROOT of the
+  // inband deep-stall: inband_route_failure_demote() PINS
+  // supershift_proven_ceiling = demote_target on every tag-demote
+  // (arq_commander.cc:3073), but the ONLY production sites that RE-RAISE the
+  // ceiling live in the turbo / SUPERSHIFT / BREAK-recovery paths that the
+  // no-BREAK inband demote deliberately never fires. So after a degrade the
+  // ceiling stays pinned at the demoted rung and the FRAME-UP gate
+  // (arq_commander.cc:5340: index(proposed_frame) > index(ceiling) => blocked)
+  // walls ALL upward probing — the link re-climbs NOTHING once the channel
+  // recovers. Legacy re-climbs only because its BREAK->turbo recovery re-raises
+  // the ceiling; the inband path broke that borrowed pairing.
+  //
+  // THE FIX (option (b)): mirror data_anchor_raise_target — once the demoted
+  // rung has delivered N CONSECUTIVE clean batches (the SAME sustained-anchor
+  // bar §11 uses, robust N=1 / OFDM N=2), RAISE the ceiling to TRACK the proven
+  // anchor (current_anchor == last_data_viable_config). The +1 anchor clamp
+  // (arq_commander.cc:5348-5350) then permits a probe EXACTLY ONE rung above
+  // proven ground — never a leap back to the failed rung — and the gearshift's
+  // own decode-failure demote (frame_gearshift_data_failed_nack/_pat) re-pins
+  // the ceiling if that +1 probe fails. So this restores re-climb WITHOUT
+  // over-climb: the ceiling never exceeds the PROVEN anchor, and the existing
+  // +1 clamp remains the sole over-climb bound (audit §5). PURE; no side
+  // effects; the unit test (Part X) replays it directly.
+  //   current_ceiling  = supershift_proven_ceiling (the af-demote pin; <0 == no cap).
+  //   anchor           = last_data_viable_config (the §1.1 confirmed-delivery anchor;
+  //                      the SOLE target — we never raise the ceiling above proven ground).
+  //   streak_config    = clean_batches_config (the rung the clean STREAK accumulated at).
+  //   clean_streak     = clean_batches_at_current_config.
+  // Returns the (possibly raised) ceiling. RULES (mirror data_anchor_raise_target):
+  //   1. Enough consecutive cleans AT the streak's home rung (§11 bar).
+  //   2. Only ever RAISE — a candidate at or below the current cap is a no-op
+  //      (a NEGATIVE/absent cap is already "no ceiling": leave it; the demote is the
+  //      sole pin producer, so a <0 ceiling means no inband demote happened).
+  //   3. Cap the raise at the PROVEN anchor — never above last_data_viable_config
+  //      (so the +1 clamp stays the sole over-climb bound).
+  static int inband_ceiling_raise_target(int current_ceiling, int anchor,
+                                         int streak_config, int clean_streak)
+  {
+    // No active pin (the demote is the sole producer) => nothing to re-raise.
+    if(current_ceiling < 0)
+      return current_ceiling;
+    // Rule 1: the demoted rung must have re-proven itself sustained-clean.
+    if(clean_streak < sustained_anchor_threshold(streak_config))
+      return current_ceiling;
+    // Rule 3: the target is the PROVEN anchor — never above it.
+    if(config_ladder_index(anchor) <= config_ladder_index(current_ceiling))
+      return current_ceiling;   // Rule 2: only ever RAISE
+    return anchor;
+  }
+
   // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, Option 3, climb
   // follow-up ③) — the clean-streak evidence bar that ARMS fast-probing at a rung.
   // Reuses the SAME viability bar §11 uses to ANCHOR a rung

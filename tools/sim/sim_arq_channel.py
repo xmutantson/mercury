@@ -517,6 +517,11 @@ def main():
                          "Overridden by --cell.")
     ap.add_argument("--cell", default=None,
                     help="convenience SNR spec, e.g. WGN:-12 (SNR3k = label+2.4)")
+    ap.add_argument("--snr-schedule", default=None,
+                    help="OPT-IN time-varying SNR3k keyed to the relay virtual "
+                         "clock: comma list of '<virt_s>:<WGN_label>', e.g. "
+                         "'0:40,30:18'. Passed through to the relay; overrides "
+                         "--snr/--cell as the t=0 floor when set.")
     ap.add_argument("--profile", default="wgn",
                     help="fading profile: wgn (none), mpg/mpm/mpp (ITU HF)")
     ap.add_argument("--cfo-hz", type=float, default=0.0,
@@ -766,6 +771,8 @@ def main():
             relay_cmd.append("--turnaround-drift")
         if args.cell:
             relay_cmd += ["--cell", args.cell]
+        if args.snr_schedule:
+            relay_cmd += ["--snr-schedule", args.snr_schedule]
         if args.burst:
             relay_cmd.append("--burst")
         relay = subprocess.Popen(relay_cmd)
