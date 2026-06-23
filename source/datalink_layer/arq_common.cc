@@ -3180,6 +3180,60 @@ bool cl_arq_controller::inband_config_change_is_tier_crossing(int target_cfg)
 // (inband-reliability-design.md §1 / §4)
 // ============================================================================
 
+// PIPELINE-THE-CLIMB predicate (inband-reliability-design.md §1.8 — the climb-latency fix).
+// THE PROBLEM: the redesign's intra-OFDM climb pins at the bottom rung because FRAME-UP
+// (arq_commander.cc:5424) only advances consecutive_data_acks on a CLEAN, fully-acked batch
+// (promotion_allowed_on_batch(last_batch_fully_acked)). While a climb's re-tag is armed, the
+// climbed-to rung needs a FULL slow data-SACK round-trip (~12.4s) to produce that clean batch,
+// so the NEXT rung cannot fire until the prior rung's confirm lands -> ~12s/RUNG serialization
+// (legacy reaches CONFIG_16 via a fast decoupled SET_CONFIG control ACK; the redesign pins low).
+//
+// THE FIX: while a CLIMB re-tag is armed, let the FRAME-UP advance OPTIMISTICALLY on a
+// FORWARD-HEALTHY data ACK (data_ack_received==YES — partial SACK or clean), WITHOUT waiting
+// for the climbed-to rung's clean fully-acked confirm. The climb then pipelines: CONFIG_N ->
+// N+1 -> N+2 over consecutive batches, each re-anchoring inband_announce_bsi to the newest rung
+// (the arm at :3104-3108). A SINGLE returning SACK at-or-after the anchor then confirms the
+// WHOLE climbed-to rung (the confirm test :3217-3219 accepts any SACK >= anchor, and the RX
+// follow is per-batch + STATELESS :2941 — following rung N+1 needs no prior rung N), collapsing
+// N_rungs*12.4s into ONE confirm latency for the whole ramp.
+//
+// WHY SAFE ONLY UNDER INBAND (why §9's strict clean-batch gate stays for legacy): the §9
+// concern is "a string of partials at a MARGINAL rung climbs into a config that can't pass
+// data." Under inband that overshoot is RECOVERABLE — inband_retag_escalate_if_climb_exhausted
+// (:3244) is the safety net: if the optimistic climb outruns what the RX can follow, the climb
+// STALLS at the unfollowable rung (no re-anchor), inband_retag_count accrues to R, and it
+// AUTO-DEMOTES to inband_last_confirmed_config (the provably-reached floor) — never a BREAK,
+// never below the floor. Legacy has no such net, so its clean-batch gate is load-bearing and
+// is left BYTE-IDENTICAL (this predicate returns false when the feature is off / no climb armed).
+//
+// SCOPE GUARD: only a CLIMB re-tag (inband_retag_config above inband_pre_announce_config by
+// ladder index) pipelines. A DROP/lateral re-tag does NOT — the down-ladder covers a drop, and
+// optimistically "climbing" a drop is meaningless. A forward-healthy ack is required (the link
+// must be alive); on a hard data failure (data_ack_received==NO) the existing :4343 reset still
+// zeroes consecutive_data_acks (this predicate is only consulted on the ack-received branch).
+bool cl_arq_controller::inband_pipeline_climb_active()
+{
+#ifdef INBAND_PIPELINE_FAILBEFORE
+	// FAIL-BEFORE arm (the pre-pipeline redesign): the climb NEVER pipelines — every rung
+	// waits for its own CLEAN fully-acked confirm before the next FRAME-UP can fire
+	// (~12.4s/rung serialization). Pinning this predicate to false reproduces that strict
+	// clean-batch gate; the directed test's pass-after asserts (a partial SACK advances the
+	// climb MULTIPLE rungs) then FAIL, proving the pipeline relaxation is load-bearing.
+	return false;
+#else
+	if(!inband_rate_feature_enabled())
+		return false;
+	if(!inband_retag_armed)
+		return false;   // no climb in flight -> strict clean-batch gate (legacy semantics)
+	// CLIMB-UP only (the SAME predicate D4 escalation uses, :3253-3257): a re-tag whose
+	// target has a HIGHER ladder index than the pre-announce config. A drop/lateral does
+	// not pipeline.
+	int pre_idx    = config_ladder_index(inband_pre_announce_config);
+	int target_idx = config_ladder_index(inband_retag_config);
+	return (pre_idx >= 0 && target_idx > pre_idx);
+#endif
+}
+
 // Resolve+cache the R floor (the give-up-and-escalate count). MERCURY_INBAND_RETAG_MIN,
 // default 3, clamped to >=1 (design §1.2). A confirm STOPS the re-tag early regardless
 // of R (design §1.7 ruling: confirm dominates; R is only the no-confirm escalation gate).

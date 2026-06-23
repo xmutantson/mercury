@@ -3404,6 +3404,16 @@ public:
   int  inband_pre_announce_config   = CONFIG_NONE; // config BEFORE the announced change (climb-up basis)
   // Resolve+cache the R floor (>=1). MERCURY_INBAND_RETAG_MIN, default 3.
   int  inband_retag_min_count();
+  // PIPELINE-THE-CLIMB predicate (inband-reliability-design.md §1.8 — the climb-latency
+  // fix). True when a CLIMB-UP re-tag is armed under the inband feature: in that state
+  // FRAME-UP (arq_commander.cc:5424) advances OPTIMISTICALLY on a forward-healthy data ACK
+  // (no wait for the climbed-to rung's CLEAN fully-acked confirm), so the climb PIPELINES
+  // CONFIG_N->N+1->N+2 over consecutive batches and a single trailing SACK confirms the
+  // whole ramp — instead of the ~12.4s/rung serialization that pinned the redesign low.
+  // The overshoot net (inband_retag_escalate_if_climb_exhausted) recovers a too-eager
+  // climb to inband_last_confirmed_config, so the §9 clean-batch protection is preserved
+  // (and the legacy strict gate is byte-identical: false when off / no climb armed).
+  bool inband_pipeline_climb_active();
   // D1 implicit-confirm consumer: a returning SACK acked bsi `rx_bsi`. If the re-tag is
   // armed and rx_bsi is at-or-after inband_announce_bsi (mod-256 forward distance), the
   // announced config is CONFIRMED FOLLOWED: DISARM the re-tag, record

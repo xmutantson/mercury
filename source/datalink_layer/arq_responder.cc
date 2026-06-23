@@ -6472,6 +6472,87 @@ int cl_arq_controller::test_inband_retag()
 		delete cmd; delete ts;
 	}
 
+	// ========================================================================
+	// PART E — PIPELINE-THE-CLIMB (inband-reliability-design.md §1.8). The redesign's
+	// intra-OFDM climb pinned LOW because the FRAME-UP gate (arq_commander.cc:5424)
+	// only advanced consecutive_data_acks on a CLEAN fully-acked batch — so each rung
+	// waited a full slow data-SACK round-trip (~12.4s) before the next could fire. The
+	// fix: while a CLIMB re-tag is armed under inband, a FORWARD-HEALTHY data ACK
+	// (a PARTIAL SACK — last_batch_fully_acked==false — counts) advances the climb
+	// OPTIMISTICALLY, so it pipelines CONFIG_N->N+1->N+2 over consecutive batches.
+	//
+	// This test drives the EXACT production gate decision (the inband_pipeline_climb_active
+	// predicate + the batch_promotable selection that replaced the bare
+	// promotion_allowed_on_batch at :5424) WITHOUT the audio pipeline a synthetic CMD
+	// lacks. FAIL-BEFORE (-DINBAND_PIPELINE_FAILBEFORE): the predicate is pinned false
+	// (the strict clean-batch gate), so a partial SACK does NOT advance the climb and
+	// E2/E4 FAIL — proving the relaxation is load-bearing.
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_LO, &ts);
+		// Arm a CLIMB (CONFIG_9 -> CONFIG_11) via the production chokepoint.
+		cmd->negotiated_configuration = CFG_HI;
+		cmd->add_message_control(SET_CONFIG);
+		cmd->process_messages_tx_control();   // re-route, slot freed, re-tag armed
+		check(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_HI,
+			"E0 CLIMB re-tag armed for CONFIG_11", cmd->inband_retag_armed ? 1 : 0, 1);
+
+		// E1: the pipeline predicate is ACTIVE for an armed CLIMB-UP under inband
+		// (fail-before: pinned false). This is the load-bearing relaxation.
+		bool pipeline_active = cmd->inband_pipeline_climb_active();
+		check(pipeline_active,
+			"E1 pipeline-climb ACTIVE while a CLIMB re-tag is armed (inband)",
+			pipeline_active ? 1 : 0, 1);
+
+		// E2: a PARTIAL SACK (link alive, NOT fully acked) is treated as PROMOTABLE
+		// while the pipeline is active — this is what lets consecutive_data_acks accrue
+		// without waiting for the climbed-to rung's clean confirm. Mirror the EXACT
+		// production selection: pipeline ? (data_ack_received==YES)
+		//                                : promotion_allowed_on_batch(last_batch_fully_acked).
+		cmd->last_batch_fully_acked = false;   // a PARTIAL SACK (keepalive, not clean)
+		bool batch_promotable_partial = pipeline_active
+			? true /* data_ack_received==YES on the partial-SACK branch */
+			: cmd->promotion_allowed_on_batch(cmd->last_batch_fully_acked);
+		check(batch_promotable_partial,
+			"E2 a PARTIAL SACK ADVANCES the climb while pipelining (no clean-confirm wait)",
+			batch_promotable_partial ? 1 : 0, 1);
+
+		// E3: a DROP re-tag must NOT pipeline (only a climb does — the down-ladder covers
+		// a drop). Re-arm a DROP CONFIG_11 -> CONFIG_9 and assert the predicate is OFF.
+		cmd->negotiated_configuration = CFG_LO;
+		cmd->add_message_control(SET_CONFIG);
+		cmd->process_messages_tx_control();
+		check(!cmd->inband_pipeline_climb_active(),
+			"E3 pipeline-climb OFF for a DROP re-tag (only a CLIMB pipelines)",
+			cmd->inband_pipeline_climb_active() ? 1 : 0, 0);
+
+		delete cmd; delete ts;
+	}
+
+	// E4 — the LEGACY (flag-off) gate is BYTE-IDENTICAL: with the feature OFF the
+	// predicate is false, so a partial SACK is NOT promotable (the strict §9 clean-batch
+	// gate stands). This is the same as fail-before but proves the scope: legacy unchanged.
+	{
+		set_inband(false);
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CFG_LO, &ts);
+		cmd->inband_rate_enabled = 0;          // force-resolve the cached flag OFF
+		cmd->inband_retag_armed = true;        // even if (impossibly) armed,
+		cmd->inband_retag_config = CFG_HI;     // the feature gate keeps the predicate false
+		cmd->inband_pre_announce_config = CFG_LO;
+		bool legacy_pipeline = cmd->inband_pipeline_climb_active();
+		check(!legacy_pipeline,
+			"E4 LEGACY (flag-off): pipeline OFF -> strict clean-batch gate (byte-identical)",
+			legacy_pipeline ? 1 : 0, 0);
+		cmd->last_batch_fully_acked = false;
+		bool legacy_partial_promotable = cmd->promotion_allowed_on_batch(cmd->last_batch_fully_acked);
+		check(!legacy_partial_promotable,
+			"E5 LEGACY: a PARTIAL SACK is NOT promotable (the §9 clean-batch gate stands)",
+			legacy_partial_promotable ? 1 : 0, 0);
+		delete cmd; delete ts;
+		set_inband(true);
+	}
+
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);

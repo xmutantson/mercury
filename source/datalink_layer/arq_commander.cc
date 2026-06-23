@@ -5421,7 +5421,26 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// consecutive_data_acks — it is link-keepalive, not proof the rung carries
 		// full data. Without this gate a string of partials at a marginal rung
 		// climbs into a config that can't pass data. See §9.
-		if(data_ack_received==YES && promotion_allowed_on_batch(last_batch_fully_acked) &&
+		//
+		// PIPELINE-THE-CLIMB (inband-reliability-design.md §1.8): the strict
+		// clean-batch gate SERIALIZES the redesign's intra-OFDM climb at ~12.4s/rung
+		// — while a climb's re-tag is armed the climbed-to rung needs a full slow
+		// data-SACK round-trip to produce a CLEAN batch, so the next rung cannot fire
+		// until that confirm lands (legacy climbs fast via a decoupled SET_CONFIG
+		// control ACK; the redesign pins low). So: when a CLIMB re-tag is armed under
+		// the inband feature (inband_pipeline_climb_active), advance OPTIMISTICALLY on
+		// a FORWARD-HEALTHY data ACK (data_ack_received==YES, partial or clean) without
+		// waiting for the clean fully-acked confirm — the climb then pipelines and a
+		// single trailing SACK confirms the whole ramp. The overshoot net
+		// (inband_retag_escalate_if_climb_exhausted) recovers a too-eager climb to the
+		// last-confirmed floor, so §9's "climb into a config that can't pass data" is
+		// RECOVERABLE here (it was not under legacy — legacy keeps the strict gate,
+		// byte-identical: inband_pipeline_climb_active() returns false when off).
+		bool inband_climb_pipeline = inband_pipeline_climb_active();
+		bool batch_promotable = inband_climb_pipeline
+			? (data_ack_received==YES)
+			: promotion_allowed_on_batch(last_batch_fully_acked);
+		if(data_ack_received==YES && batch_promotable &&
 			gear_shift_on==YES && gear_shift_algorithm==SUCCESS_BASED_LADDER &&
 			messages_control.status==FREE &&
 			!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) &&
