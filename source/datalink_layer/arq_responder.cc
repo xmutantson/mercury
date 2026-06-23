@@ -7840,6 +7840,236 @@ int cl_arq_controller::test_inband_downladder()
 }
 
 // ============================================================================
+// ROBUST→OFDM ADOPT: PRESERVE THE LIVE IN-FLIGHT BURST — --test-inband-adopt-preserve
+// data-flow-robust-ofdm-adopt-flush.md §1/§6/§8.
+// ============================================================================
+//
+// THE LAST transition-class hole: on the in-band UNILATERAL adopt INTO an OFDM config
+// (robust→OFDM, e.g. 102→CONFIG_0), the CMD's new-config OFDM batch is ALREADY airing into the
+// PRIMARY capture ring. The pre-fix HINGE-1 (inband_adopt_resynced_config, arq_common.cc:4087)
+// did an unconditional memset(passband_delayed_data,0) + ring_write_index=0 + circular_buf_reset,
+// WIPING the in-flight preamble already mid-capture → the FTR coarse search reports search_raw=0
+// metric~0 for the rest of the burst → never acquires → 3 total-loss → TERMINAL BREAK → ROBUST_0
+// spiral (53B vs legacy 5645B). The fix PRESERVES the ring + ring_write_index when adopting into
+// an OFDM config with a live in-flight burst present (energy peak ≥ 0.05 OR ofdm_batch_active),
+// resetting only the OFDM cursors (a fresh full anchor search). The COLD case (silent ring) and
+// a robust(MFSK)-target adopt keep the full destructive flush.
+//
+//   PART A — PASS-AFTER: a LIVE OFDM burst on the ring at a non-zero ring_write_index SURVIVES
+//     the adopt into CONFIG_0 (energy preserved, rwi preserved); OFDM cursors are re-anchored.
+//   PART A' — FAIL-BEFORE (MERCURY_ADOPT_FLUSH_DEFEAT=1, same binary): the unconditional wipe
+//     runs → the ring is ZEROED and rwi=0 (the bug signature). The energy the FTR needs is gone.
+//   PART B — COLD: a SILENT ring (no live burst) still takes the full destructive flush
+//     (ring zeroed, rwi=0) — stale-preamble kill preserved.
+//   PART C — ROBUST(MFSK) TARGET: adopting into a robust config with a loud ring STILL flushes
+//     (is_ofdm_config(target) false → preserve branch not taken; MFSK wants a clean ring).
+//
+// Returns 0 = ALL PASS, 1 = any FAIL. In-process synthetic-fire (no IONOS/RF). The fix is
+// inband-scoped (inband_adopt_resynced_config only runs under MERCURY_INBAND_RATE); legacy is
+// byte-identical.
+int cl_arq_controller::test_inband_adopt_preserve_live_burst()
+{
+	const char* TAG = "[TEST-INBAND-ADOPT-PRESERVE]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+	auto restore_env = [&]() {
+		set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+		set_env("MERCURY_ADOPT_FLUSH_DEFEAT", "");
+	};
+
+	// The adopt takes capture_prep_mutex; create it if NULL (standalone test).
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Build a production RX, paint a LIVE OFDM burst into the ring at a non-zero rwi, drive the
+	// adopt into CONFIG_0, and measure the post-adopt ring. arm: 0=PASS-AFTER preserve,
+	// 1=FAIL-BEFORE defeat (the unconditional wipe). PART B/C use the same scaffold with a
+	// silent ring / a robust target.
+	auto build_rx = [&](int start_cfg) -> std::pair<cl_arq_controller*, cl_telecom_system*> {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode    = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		rx->telecom_system       = ts_rx;
+		rx->narrowband_enabled   = NO;
+		rx->role                 = RESPONDER;
+		rx->robust_enabled       = YES;
+		rx->sack_v2_enabled      = true;
+		rx->inband_rate_enabled  = 1;                    // feature ON
+		rx->load_configuration(start_cfg, FULL, NO);
+		rx->link_status          = CONNECTED;
+		rx->connection_status    = RECEIVING;
+		rx->passive_monitor      = false;
+		// A current batch exists (so HINGE-2 has something to re-baseline; not load-bearing here).
+		rx->rsp_current_expected_batch_seq_id = 4;
+		return {rx, ts_rx};
+	};
+
+	// Paint a loud synthetic burst across the ring at a non-zero write head. The fix's energy
+	// probe (stride-64 peak ≥ 0.05) treats this as a LIVE in-flight burst — the same signal the
+	// FTR coarse search consumes from passband_delayed_data. Returns (rwi, buf_samples, sp).
+	auto paint_burst = [&](cl_telecom_system* ts, double amp, int rwi) {
+		int sp = ts->data_container.Nofdm * ts->data_container.buffer_Nsymb.load()
+		       * ts->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		for(int i = 0; i < 2 * sp; i++)
+			ts->data_container.passband_delayed_data[i] = 0.0;
+		ts->data_container.ring_write_index = rwi;
+		if(amp > 0.0)
+		{
+			// Fill the contiguous read window [rwi .. rwi+sp) (+ the mirror) with a high-amp
+			// passband-like sinusoid — energy ≫ the 0.05 floor everywhere the stride-64 probe lands.
+			for(int i = 0; i < sp; i++)
+			{
+				double s = amp * sin(0.37 * (double)i);
+				ts->data_container.passband_delayed_data[(rwi + i) % sp]          = s;
+				ts->data_container.passband_delayed_data[((rwi + i) % sp) + sp]   = s;
+			}
+		}
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		return sp;
+	};
+
+	auto ring_peak = [&](cl_telecom_system* ts, int sp) -> double {
+		double pk = 0.0;
+		for(int i = 0; i < sp; i += 64)
+		{
+			double v = fabs(ts->data_container.passband_delayed_data[i]);
+			if(v > pk) pk = v;
+		}
+		return pk;
+	};
+
+	// ── PART A / A' : live burst, OFDM target, preserve (arm 0) vs defeat-wipe (arm 1) ──
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_ADOPT_FLUSH_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx(CONFIG_1);            // start at an OFDM rung; adopt to a DIFFERENT one
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+		const int RWI = 3 * ts->data_container.Nofdm * ts->data_container.interpolation_rate; // non-zero head
+		int sp = paint_burst(ts, 0.8, RWI);
+		double peak_before = ring_peak(ts, sp);
+		check(peak_before >= 0.05, "A0 painted a LIVE burst on the ring (peak ≥ floor)",
+			(long)(peak_before * 1000), 50);
+
+		// THE PRODUCTION ADOPT (robust→OFDM crossing modelled as CONFIG_1→CONFIG_0, an OFDM target).
+		rx->inband_adopt_resynced_config(CONFIG_0);
+
+		double peak_after = ring_peak(ts, sp);
+		int rwi_after = (int)ts->data_container.ring_write_index;
+
+		if(!defeat)
+		{
+			// PASS-AFTER: the live burst SURVIVES (the samples the FTR needs are still there) and
+			// the write head is preserved; the OFDM cursors are re-anchored for the fresh search.
+			check(peak_after >= 0.05,
+				"A1-PRESERVE live burst SURVIVES the adopt (ring NOT wiped → FTR can re-acquire)",
+				(long)(peak_after * 1000), 50);
+			check(rwi_after == RWI,
+				"A2-PRESERVE ring_write_index preserved (read window still over the live preamble)",
+				rwi_after, RWI);
+			check(ts->receive_stats.ofdm_search_raw == 0
+			   && ts->receive_stats.ofdm_batch_active == false,
+				"A3-PRESERVE OFDM cursors re-anchored (fresh full search for the new geometry)",
+				(long)ts->receive_stats.ofdm_search_raw
+				 + (ts->receive_stats.ofdm_batch_active ? 1 : 0), 0);
+		}
+		else
+		{
+			// FAIL-BEFORE: the unconditional wipe ZEROES the ring + rwi=0 → the in-flight preamble
+			// is gone → the FTR search sees search_raw=0/metric~0 → the bug.
+			check(peak_after < 0.05,
+				"A1-DEFEAT (FAIL-BEFORE) the wipe ZEROED the live burst (the bug — FTR cannot acquire)",
+				(long)(peak_after * 1000), 0);
+			check(rwi_after == 0,
+				"A2-DEFEAT (FAIL-BEFORE) ring_write_index reset to 0 (read window off the preamble)",
+				rwi_after, 0);
+		}
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_ADOPT_FLUSH_DEFEAT", "");
+
+	// ── PART B : COLD adopt (silent ring) → the full destructive flush STILL runs ──
+	{
+		auto pr = build_rx(CONFIG_1);
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+		const int RWI = 5 * ts->data_container.Nofdm * ts->data_container.interpolation_rate;
+		int sp = paint_burst(ts, 0.0, RWI);   // amp=0 → SILENT ring, but a non-zero rwi to detect the reset
+		check(ring_peak(ts, sp) < 0.05, "B0 ring is SILENT (no live burst)", 0, 0);
+
+		rx->inband_adopt_resynced_config(CONFIG_0);   // OFDM target but NO live burst → cold path
+
+		check(ring_peak(ts, sp) < 0.05, "B1-COLD silent ring stays zeroed (flush is a no-op on silence)",
+			0, 0);
+		check((int)ts->data_container.ring_write_index == 0,
+			"B2-COLD full flush ran: ring_write_index reset to 0 (stale-preamble kill preserved)",
+			(int)ts->data_container.ring_write_index, 0);
+		delete rx; delete ts;
+	}
+
+	// ── PART C : ROBUST(MFSK) target with a loud ring → STILL flushes (preserve is OFDM-only) ──
+	{
+		auto pr = build_rx(CONFIG_1);
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+		const int RWI = 7 * ts->data_container.Nofdm * ts->data_container.interpolation_rate;
+		int sp = paint_burst(ts, 0.8, RWI);
+		check(ring_peak(ts, sp) >= 0.05, "C0 painted a loud ring (energy present)",
+			(long)(ring_peak(ts, sp) * 1000), 50);
+
+		int robust_target = rx->robust_enabled ? ROBUST_0 : CONFIG_0;
+		bool robust_is_ofdm = is_ofdm_config(robust_target);
+		// Only meaningful when the target is genuinely non-OFDM (robust). If the build maps the
+		// target to an OFDM config, skip the assertion (the preserve branch would correctly fire).
+		if(!robust_is_ofdm)
+		{
+			rx->inband_adopt_resynced_config(robust_target);
+			check(ring_peak(ts, sp) < 0.05,
+				"C1-MFSK robust target FLUSHES the ring (preserve is OFDM-target-only)",
+				(long)(ring_peak(ts, sp) * 1000), 0);
+			check((int)ts->data_container.ring_write_index == 0,
+				"C2-MFSK robust target reset ring_write_index to 0 (full flush ran)",
+				(int)ts->data_container.ring_write_index, 0);
+		}
+		else
+		{
+			check(true, "C-SKIP robust target maps to an OFDM config in this build (preserve correct)",
+				1, 1);
+		}
+		delete rx; delete ts;
+	}
+
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK DELIVER — --test-inband-deliver
 // data-flow-inband-retx-epoch.md §5.  (the 785-frame decode-but-0-deliver rework)
 // ============================================================================

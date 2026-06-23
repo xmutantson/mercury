@@ -4083,18 +4083,85 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 
 	// HINGE-1: capture-buffer flush (IDENTICAL to detect_and_follow_config_tag and the
 	// SET_CONFIG RSP handler — stale OFDM preambles false-lock Schmidl-Cox at the new
-	// config without it).
+	// config without it). data-flow-robust-ofdm-adopt-flush.md §1/§6.
+	//
+	// SCOPE FIX (the LAST transition-class hole — robust->OFDM): on the redesign's UNILATERAL
+	// adopt INTO an OFDM config, the CMD's new-config OFDM batch is ALREADY airing into the
+	// PRIMARY ring (the down-ladder/tag only consumed frame 0 from a snapshot; the rest of the
+	// burst is still streaming, audioio.c:1430-1453). The unconditional memset+ring_write_index=0
+	// WIPES that in-flight preamble -> the FTR coarse search reports search_raw=0 metric~0 for
+	// the remaining burst, never acquires one OFDM frame -> 3 total-loss -> TERMINAL BREAK ->
+	// ROBUST_0 spiral (53B vs legacy 5645B). LEGACY avoids this via the lockstep SET_CONFIG
+	// handshake; the redesign races the flush against the live burst. The flush's LEGIT purpose
+	// (kill STALE old-config preambles) does NOT apply to a LIVE current-config burst.
+	//
+	// FIX: when adopting INTO an OFDM config AND a live in-flight OFDM burst is present (ring
+	// energy peak >= LIVE_BURST_PEAK over passband_delayed_data, OR ofdm_batch_active), PRESERVE
+	// the ring contents + ring_write_index (the very samples the new acquisition needs) and reset
+	// ONLY the OFDM cursors (ofdm_search_raw=0/ofdm_batch_active=false -> a fresh FULL anchor
+	// search re-locates frame 0 of the live burst at the new geometry, telecom_system.cc:1407
+	// predict-verify bypassed). The COLD case (no live burst, or a robust/MFSK target) keeps the
+	// full destructive flush VERBATIM (stale-preamble kill). The same active-batch-unsafe-to-flush
+	// guard the codebase already uses for inband_seat_robust_ring_floor (arq_responder.cc:567-573,
+	// "between frames: flush is safe"). FAIL-BEFORE A/B: MERCURY_ADOPT_FLUSH_DEFEAT=1 forces the
+	// unconditional wipe on the SAME binary (production never sets it).
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
 			* telecom_system->data_container.buffer_Nsymb
 			* telecom_system->data_container.interpolation_rate;
 		MUTEX_LOCK(&capture_prep_mutex);
-		if(capture_buffer != NULL)
-			circular_buf_reset(capture_buffer);
-		if(telecom_system->data_container.passband_delayed_data != NULL && buf_samples > 0)
-			memset(telecom_system->data_container.passband_delayed_data, 0,
-				2 * buf_samples * sizeof(double));
-		telecom_system->data_container.ring_write_index = 0;
+
+		// Is a LIVE in-flight OFDM burst sitting on the primary ring? Peak-energy probe over
+		// the double-mapped ring (stride 64, IDENTICAL gate to the down-ladder per-decoder
+		// prescan arq_common.cc:4015 and the snapshot energy gate :4272). ofdm_batch_active
+		// OR'd in covers a mid-batch adopt (the first crossing from MFSK has active=false but
+		// the preamble energy is present, so the energy probe is the load-bearing signal).
+		bool adopt_into_ofdm = is_ofdm_config(followed_config);
+		bool live_burst = telecom_system->receive_stats.ofdm_batch_active;
+		if(!live_burst
+		   && telecom_system->data_container.passband_delayed_data != NULL
+		   && buf_samples > 0)
+		{
+			const double LIVE_BURST_PEAK = 0.05;   // same noise/silence floor the prescans use
+			double pk = 0.0;
+			for(int i = 0; i < buf_samples; i += 64)
+			{
+				double v = fabs(telecom_system->data_container.passband_delayed_data[i]);
+				if(v > pk) { pk = v; if(pk >= LIVE_BURST_PEAK) break; }
+			}
+			live_burst = (pk >= LIVE_BURST_PEAK);
+		}
+		bool flush_defeat = false;
+		{ const char* e = std::getenv("MERCURY_ADOPT_FLUSH_DEFEAT");
+		  if(e && *e && atoi(e) != 0) flush_defeat = true; }
+
+		bool preserve_live = adopt_into_ofdm && live_burst && !flush_defeat;
+
+		if(preserve_live)
+		{
+			// LIVE-BURST PRESERVE: keep passband_delayed_data + ring_write_index + capture_buffer
+			// intact (the in-flight new-config preamble must stay in the read window). Reset only
+			// the OFDM cursors so the next receive() runs a FRESH FULL anchor search (re-locating
+			// frame 0 at the new geometry) instead of a stale predict-verify.
+			printf("[INBAND-RX] HINGE-1 LIVE-BURST PRESERVE: adopting into CONFIG_%d with an "
+				"in-flight OFDM burst on the ring (rwi=%d) -> ring KEPT, OFDM cursors re-anchored "
+				"(no wipe)\n",
+				followed_config, (int)telecom_system->data_container.ring_write_index);
+			fflush(stdout);
+		}
+		else
+		{
+			// COLD / stale-preamble / robust(MFSK)-target / defeat: the full destructive flush
+			// (stale OFDM preambles false-lock Schmidl-Cox at the new config without it).
+			if(capture_buffer != NULL)
+				circular_buf_reset(capture_buffer);
+			if(telecom_system->data_container.passband_delayed_data != NULL && buf_samples > 0)
+				memset(telecom_system->data_container.passband_delayed_data, 0,
+					2 * buf_samples * sizeof(double));
+			telecom_system->data_container.ring_write_index = 0;
+		}
+		// OFDM cursors are re-anchored on BOTH paths (the per-frame geometry changed; carrying a
+		// stale ofdm_search_raw/active would point the predict-verify at the wrong frame stride).
 		telecom_system->receive_stats.ofdm_search_raw = 0;
 		telecom_system->receive_stats.ofdm_batch_active = false;
 		telecom_system->receive_stats.delay_of_last_decoded_message = -1;

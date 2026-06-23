@@ -714,6 +714,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_downladder();
             }
+            // ROBUST->OFDM ADOPT live-burst PRESERVE regression (the last transition-class hole:
+            // the unilateral adopt into an OFDM config used to WIPE the in-flight preamble
+            // mid-capture -> no acquire -> TERMINAL BREAK -> ROBUST_0 spiral). Member test on a
+            // throwaway controller (builds its own telecom_system). Fast + deterministic, no
+            // IONOS/RF. data-flow-robust-ofdm-adopt-flush.md §6/§8.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_adopt_preserve_live_burst();
+            }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
             // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.
@@ -782,6 +791,14 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-adopt-preserve : run ONLY the robust->OFDM adopt live-burst PRESERVE
+        // regression (the last transition-class hole) and exit. Fast + deterministic; see
+        // arq_responder.cc::test_inband_adopt_preserve_live_burst + data-flow-robust-ofdm-adopt-flush.md.
+        if (strcmp(argv[i], "--test-inband-adopt-preserve") == 0) {
+            cl_arq_controller ARQ_adopt;
+            int failed = ARQ_adopt.test_inband_adopt_preserve_live_burst();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock

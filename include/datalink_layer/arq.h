@@ -2132,6 +2132,15 @@ public:
   // inband_try_down_ladder_on_decode_fail. data-flow-inband-downladder.md §3/§5.3.
   int test_inband_downladder();
 
+  // ROBUST->OFDM ADOPT: PRESERVE THE LIVE IN-FLIGHT BURST (CLI --test-inband-adopt-preserve).
+  // The last transition-class hole: the unilateral adopt INTO an OFDM config wiped the in-flight
+  // OFDM preamble already mid-capture (HINGE-1 unconditional ring memset) -> FTR search_raw=0 ->
+  // never acquires -> 3 total-loss -> TERMINAL BREAK -> ROBUST_0 spiral (53B vs legacy 5645B).
+  // PART A: a live burst SURVIVES the adopt (fail-before MERCURY_ADOPT_FLUSH_DEFEAT=1 wipes it).
+  // PART B: a cold/silent ring STILL flushes. PART C: a robust(MFSK) target STILL flushes
+  // (preserve is OFDM-target-only). data-flow-robust-ofdm-adopt-flush.md §6/§8.
+  int test_inband_adopt_preserve_live_burst();
+
   // IN-BAND FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER REGRESSION (CLI
   // --test-inband-deliver). The 785-frame decode-but-0-deliver rework: a forward-healthy
   // reverse-ACK turnaround MISS (nAcked_data flat) tripped the connect-liveness guard's
