@@ -472,3 +472,66 @@ CONFIG_0 probe fails, the gearshift decode-failure demote re-pins the ceiling �
 +1 clamp remains the sole over-climb bound). The sole caller is inband-gated (arq_commander.cc:5406), so
 legacy ceiling discipline is byte-identical. Tests X6/X6b/X6c (--test-climb-engine Part X): X6 lifts the
 ceiling robust-top→CONFIG_0 on re-proof; X6b tops out AT CONFIG_0 (no leap); X6c stays sustained-gated.
+
+## §14 Fix #1e — the cross ring re-grow (the 212-vs-217 flag-set skew, the CONFIG_0↔ROBUST_2 oscillation root)
+
+### §14.1 The residual (VERIFIED — diagnosis run `_probe/lwp2001.arqlog`, FINALIZE-PROBE + the seat re-grow log)
+
+After §12 (the cross runs `inband_finalize_ofdm_adopt_ring`) the redesign STILL stalled at WGN:40:
+the RSP crossed to CONFIG_0, the ring shrank 1291→217, then ~2 ms LATER `inband_seat_robust_ring_
+floor` RE-GREW the ring 217→804 — `OFDM beyond-bounds pream~200 upper=165` for the rest of the
+CONFIG_0 visit → 0 forward decode → the commander false-demoted CONFIG_0→ROBUST_2. The link
+OSCILLATED CONFIG_0↔ROBUST_2 every ~25 s, delivering ~53–268 B vs LEGACY's single clean cross +
+climb to CONFIG_12–16 / 8000+ B (seed 2000-2004, WGN:40, secs 360).
+
+ROOT (VERIFIED, the FINALIZE-PROBE line): `OFDM-RING SHRINK: CONFIG_0 ring 1291 -> natural 212` then
+the live ring is **217**, and the #1d flag-set gate was `buffer_Nsymb.load() <= natural_nsymb`
+= `217 <= 212` == **FALSE** → `inband_ofdm_acq_ring_shrunk` stayed 0 → the seat-gate (arq_common.cc:
+3970) did not suppress the per-pass re-seat → it re-grew the ring. The 212-vs-217 gap is a 5-symbol
+disagreement between `inband_natural_ofdm_buffer_nsymb()` (a THROWAWAY `cl_telecom_system`, fresh
+load ⇒ 212, arq_common.cc:3891) and `force_set_capture_ring_natural()` (the LIVE `set_size` ⇒ 217,
+telecom_system.cc:11111). The §11 #1d patch tried to widen the gate to `<=` but kept comparing the
+LIVE ring against the THROWAWAY number — the skew defeated it.
+
+### §14.2 The fix (arq_common.cc:4504-4561, inband-scoped)
+
+Gate BOTH the shrink trigger AND the flag-set on the AUTHORITATIVE robust-floor state, not the
+throwaway-vs-live size compare:
+- SHRINK trigger: `buffer_Nsymb_min > 0` (a raised robust floor is oversizing the ring) instead of
+  `cur_nsymb > natural_nsymb`. Fires exactly when a floor is seated; idempotent once un-seated.
+- FLAG set: `inband_ofdm_acq_ring_shrunk = true` iff `buffer_Nsymb_min == 0` (the floor is un-seated,
+  i.e. the live ring holds the NATURAL OFDM geometry — exactly what `force_set_capture_ring_natural()`
+  guarantees, telecom_system.cc:11116). Immune to the 212/217 skew and to adopt-instant ordering.
+
+`buffer_Nsymb_min == 0` IS the flag's true meaning ("robust floor un-seated, natural OFDM ring held").
+`inband_seat_robust_ring_floor()` re-raises `buffer_Nsymb_min` on a real robust re-seat, and the flag
+clears on a demote to a robust config (arq_common.cc:3972-3973 / :4376), so the down-ladder re-grows
+the floor THEN, before it reads a robust frame — the §12.4 down-ladder contract is preserved.
+
+### §14.3 §5 AUDIT — VERDICT: down-ladder + legacy preserved (YES)
+
+- Down-ladder (consumer needing the robust floor): unchanged. While shrunk@OFDM the seat is suppressed
+  (ring stays natural); on a demote to robust the flag clears → seat re-grows the floor (F-tests pass).
+- Legacy: the whole block runs only under `inband_rate_feature_enabled()` → byte-identical off.
+- FAIL-BEFORE: `MERCURY_ADOPT_RING_SHRINK_DEFEAT=1` skips the block → `buffer_Nsymb_min` stays raised →
+  ring stays oversized (E2-3-DEFEAT got=804). Knob preserved.
+
+### §14.4 Regression + sim (fails-before / passes-after)
+
+- `--test`: 58/0 pass. E2-3/E2-4/E2-5 (cross shrink + flag set + re-seat suppressed) and F3 (flag
+  durable through a transient probe) all PASS. (In the fresh unit harness live==throwaway==212, so the
+  OLD gate `212<=212` also passed there — the skew is sim-only, where the live system carried robust/
+  MFSK geometry; the new authoritative gate covers both.)
+- Single-seed sim (seed 2001, WGN:40): BEFORE the ring re-grew 217→804 every cross (`bounds=[4,752]`,
+  oscillation). AFTER: `OFDM-RING flag … ring=217 buf_min=0 shrunk=1`, ring HELD at 217 (`bounds=[4,165]`,
+  0× `[4,752]` re-grow), OFDM-OK frames decode, CONFIG_0 lock HELD ~63 s (no oscillation) vs the prior
+  ~25 s oscillation cycle.
+
+### §14.5 NOT the last residual (HONEST — OPEN [?])
+
+#1e eliminates the ring re-grow + the CONFIG_0↔ROBUST_2 oscillation, but the redesign at WGN:40 still
+HOLDS CONFIG_0 then eventually demotes to ROBUST_2 without climbing — far below legacy's CONFIG_12-16.
+The CONFIG_0 forward-decode RATE is too low to sustain/climb (seed 2001: 6 OFDM-OK over a 63 s hold).
+This is a SEPARATE layer (CONFIG_0 decode rate / climb-from-CONFIG_0), NOT the capture-ring geometry.
+[?] Next: characterize why CONFIG_0 OFDM-OK rate stays low after a clean coarse lock (FTR/snapshot
+timing for the live re-aired burst, or the SNR margin at WGN:40 CONFIG_0).
