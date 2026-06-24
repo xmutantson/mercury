@@ -542,3 +542,68 @@ implementing the re-seat would be the serial-misdiagnosis the memory BENCH-CLAIM
 (the root has shifted repeatedly this session). Re-seating forward batch geometry per rung remains an
 owner-ratifiable lever ONLY if re-framed against the DELIVERY-loop root — but it must NOT be sold as
 "matching legacy's per-rung 1-frame re-seat", because legacy has no such re-seat.
+
+## §12 FIX-3 ("RELAX FIX-1 to exempt a lead-frame-only recoverable hole") — SAFETY-FALSIFIED, NOT IMPLEMENTED (2026-06-24, STEP-1 verification this session)
+
+A FIX-3 session was tasked with TWO fixes, the first gated on a SAFETY verification:
+- **FIX (i):** relax the FIX-1 `inband_climb_hole_outstanding()` AND-term at the FRAME-UP fire
+  (`arq_commander.cc:5653-5654`) to exempt a lead-frame-only RECOVERABLE hole — claim: the climb may
+  fire on such a hole because the `[RSP-V2-PREV-DELIVERED]` cross-storage recovers frame-0 INDEPENDENTLY
+  of the CMD's retx, so `clear_retx_queue()` dropping the retx is harmless (no GAP-ABORT).
+- **FIX (ii):** auto-advertise `CAP_CUMULATIVE_ACK` when `inband_rate_feature_enabled()` (the A/B ran the
+  redesign without the cumulative-ack capability it depends on).
+
+The STEP-1 instruction was explicit: verify FIX (i)'s safety FIRSTHAND; if relaxing it re-opens the orphan,
+STOP and report, do NOT ship. **FIRSTHAND VERIFICATION FALSIFIES THE SAFETY CLAIM. FIX (i) IS UNSAFE — it
+re-opens the exact §10.1 step-5→6 orphan. NEITHER FIX SHIPPED** (FIX (ii) was prompt-gated on FIX (i) being
+SAFE). Evidence, source-cited on this HEAD:
+
+### §12.1 FIX (i) SAFETY — the cross-storage recovery is NOT independent of the retx (it is DOWNSTREAM of it)
+The claim "`[RSP-V2-PREV-DELIVERED]` recovers frame-0 independently of the retx" is FALSE. The recovery is
+a strict chain, every link of which depends on the retx the relaxed climb would drop:
+1. At SACK-capture the missing frame-0's ONLY surviving payload copy is saved into `retransmit_frames[]`
+   (`arq_commander.cc:4088`) and the ORIGINAL `messages_tx[i]` slot is marked `ACKED`
+   (`:4108`, comment: "so cleanup() frees the slot (payload saved above)"). After capture, `retransmit_frames[]`
+   is the SOLE source of frame-0's old-epoch payload.
+2. The CMD's ONLY wire-resend of the missing frame-0 is the mixbatch retx-prefix loop
+   (`arq_commander.cc:1861-1900`), which reads frame-0 EXCLUSIVELY from `retransmit_frames[0..R)`.
+3. The RSP's `messages_rx_prev[]` cross-storage fills ONLY via the PREV-RX path
+   (`arq_responder.cc:1122`), which requires frame-0 to ARRIVE ON THE WIRE — i.e. it is DOWNSTREAM of the
+   CMD's mixbatch retx, not independent of it. `rsp_prev_batch_received_count` reaches `expected_count`
+   (`:1190`, the PREV-DELIVER trigger) ONLY if every missing frame including frame-0 is re-sent and received.
+4. When the climb FIRES, the FRAME-UP block calls `clear_retx_queue()` (`arq_commander.cc:5733`); the
+   compressed path's `restore_tx_from_compressed()` ALSO calls `clear_retx_queue()` UNCONDITIONALLY first
+   (`arq_common.cc:13351`). Either way `retransmit_count` is zeroed → frame-0's old-epoch payload is
+   DISCARDED (`clear_retx_queue` comment `:1162`: the parallel arrays are read only over `[0,retransmit_count)`).
+5. Even if frame-0's BYTES survive in the backup buffer, `restore_tx_from_compressed()` re-queues them as
+   FRESH NEW-DATA under the NEW config/bsi (`arq_common.cc:13364/13377/13410`), NOT under the OLD batch's bsi.
+   They never fill `messages_rx_prev[loc]` for the OLD bsi → the old prev batch is NEVER PREV-DELIVERED
+   (`rsp_prev_batch_received_count < expected_count` forever) → the old bsi stays a HOLE below
+   `last_delivered` → `delivery_step_is_gap()` fires when the new batch delivers → `RSP-V2-GAP-ABORT`
+   (`arq_responder.cc:1255-1262`). **This is the exact §10.1 step-5→6 chain FIX-1 was built to prevent.**
+
+VERDICT: FIX (i) re-opens the orphan. The holistic HIGH-RISK flag was CORRECT; the FIX-3 diagnosis's
+"cross-storage is independent of the retx / SAFE" is the contradicted point and it is WRONG. STOPPED per the
+STEP-1 instruction. The current FIX-1 deferral (the ~77B/floor wedge) is the CORRECT trade — it prevents the
+orphan; the real residual is the DELIVERY-loop / climb-speed root §9.2/§2 already names, NOT the FIX-1 gate.
+
+### §12.2 FIX (ii) — the cumulative-ack dependency IS real and the A/B DID run it OFF (VERIFIED), but FIX (ii) was prompt-gated on FIX (i) being SAFE, so NOT shipped here
+- `inband_a3_decouple_enabled()` (`arq_common.cc:2505-2512`) = `inband_a3_decouple_env == 1 &&
+  cumulative_ack_enabled` — it depends on BOTH a SEPARATE env opt-in `MERCURY_INBAND_A3_DECOUPLE` (NOT
+  `MERCURY_INBAND_RATE`) AND the negotiated `cumulative_ack_enabled`.
+- `cumulative_ack_advertise_bit()` (`arq_common.cc:95-104`) sets `CAP_CUMULATIVE_ACK` ONLY when env
+  `MERCURY_CUMULATIVE_ACK` is present; default-OFF ⇒ never advertised ⇒ `cumulative_ack_enabled` stays false.
+- The A/B (`_msab/parity_fix1/aggregate.json`) ON-arm env is `{"MERCURY_INBAND_RATE":"1"}` ONLY — no
+  `MERCURY_CUMULATIVE_ACK`, no `MERCURY_INBAND_A3_DECOUPLE`. The ON logs show ZERO cumulative-ack/A3
+  negotiation markers AND ZERO `FRAME UP` across ALL 6 ON samples (climb permanently deferred, the FIX-1
+  wedge) vs OFF climbing to CONFIG_4/5/16. So the redesign A/B DID run with cumulative-ack OFF and A3 never
+  engaged. **Whether the redesign was ever intended to depend on cumulative-ack (auto-advertise it when
+  inband is on) is an OWNER decision** — but FIX (ii) must NOT be paired with FIX (i) (which is unsafe). If
+  the owner wants to re-run the A/B with the self-heal spine present, the minimal env change is to add
+  `MERCURY_CUMULATIVE_ACK=1` (+ `MERCURY_INBAND_A3_DECOUPLE=1` if the demote-decouple is also wanted) to the
+  ON arm — NO code change needed to test that hypothesis. Auto-advertising in code is a separate,
+  owner-ratifiable default-on decision, not a same-session chain behind an unsafe fix.
+
+STATUS: NO FIX-3 code implemented. FIX (i) is safety-falsified (re-opens the orphan); FIX (ii) is real but
+prompt-gated on FIX (i) and is an owner decision testable by an env flag first. The next lever remains the
+DELIVERY-loop / climb-speed root (§2/§9.2), not the FIX-1 hole-gate.
