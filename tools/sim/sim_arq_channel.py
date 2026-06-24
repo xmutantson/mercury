@@ -537,11 +537,26 @@ def main():
     # --secs is now a VIRTUAL-time dwell budget (sim/virtual-time-runbound):
     # the run is bounded by virtual time / transfer completion, not real seconds.
     ap.add_argument("--secs", type=int, default=180,
-                    help="VIRTUAL-time dwell budget in seconds (sim_clock, parsed "
-                         "from the relay vstamp). The run is bounded by VIRTUAL "
-                         "time / transfer completion, NOT real wall-clock seconds "
-                         "-> host-load-independent trajectory. A generous real "
-                         "watchdog (REAL_WATCHDOG_MULT x) only guards a true wedge.")
+                    help="VIRTUAL-time DATA-phase dwell budget in seconds (sim_clock, "
+                         "parsed from the relay vstamp). CONNECT-DWELL FIX: this "
+                         "budget is ANCHORED AT CONNECT — it starts counting only "
+                         "AFTER the ARQ link establishes (link_status:Connected), so "
+                         "the multi-leg LDPC connect handshake (which under RT pacing "
+                         "consumes ~75-85 virtual seconds) does NOT eat the data "
+                         "budget. The run is bounded by VIRTUAL DATA time / transfer "
+                         "completion, NOT real wall-clock seconds -> host-load-"
+                         "independent trajectory. A generous real watchdog "
+                         "(REAL_WATCHDOG_MULT x) only guards a true wedge.")
+    ap.add_argument("--connect-grace", type=int, default=150,
+                    help="VIRTUAL-time CONNECT grace in seconds (CONNECT_UNDER_RT_"
+                         "ROOTCAUSE §6.1). Before the link establishes the run is "
+                         "bounded ONLY by this grace (NOT --secs) — the modem keeps "
+                         "its own max_connection_attempts retry loop running, matching "
+                         "the HW teardown discipline (HW imposes no wall guillotine). "
+                         "Sized to the RT worst-case multi-leg LDPC handshake "
+                         "(~75-85s observed + margin). If the link never connects "
+                         "within this grace the run ends as 'connect_timeout'. The "
+                         "wedge/vclock-stall/real-watchdog guards still apply.")
     ap.add_argument("--target-bytes", type=int, default=0,
                     help="if >0, the run also COMPLETES as soon as delivered_bytes "
                          ">= this (with md5 match). 0 = no byte target (climb-sim: "
@@ -688,7 +703,24 @@ def main():
     time.sleep(1)
 
     logfile = open(os.path.join(MERCURY_ROOT, "sim_arq_channel.log"), "w")
-    relay_log = os.path.join(MERCURY_ROOT, "sim_channel_relay.log")
+    # CONNECT-DWELL FIX (CONNECT_UNDER_RT_ROOTCAUSE §6.1): the relay log is the
+    # SOLE virtual-clock source (read_relay_virtual_seconds). It was a FIXED shared
+    # path with NO pre-clean, so:
+    #   (1) a concurrent sim wrote into the same file (cross-run vstamp contamination),
+    #   (2) a STALE leftover log from a PRIOR run was read at monitor-loop iter 1
+    #       BEFORE this run's relay finished `open(args.log,"w")` truncating it. On
+    #       a loaded box (the fleet 56-core probe) the relay's interpreter startup
+    #       lags the harness's ~9s of launch sleeps, so the first vsecs read returned
+    #       the leftover's virtual seconds (observed vsecs=245.3 at real 1s) and the
+    #       run INSTANTLY bounded out -> 0% connect. PORT-SCOPE the log (concurrent-
+    #       safe) AND pre-clean it (the leftover can never be read).
+    relay_log = os.path.join(MERCURY_ROOT,
+                             f"sim_channel_relay_{args.port}.log")
+    try:
+        if os.path.exists(relay_log):
+            os.remove(relay_log)
+    except OSError:
+        pass
     # GAP #1: per-direction airtime breakdown the relay writes on graceful
     # shutdown; the harness reads it below to derive wire_bps_airtime. Scope it
     # to OUR auto-picked port so concurrent cells don't clobber each other's file.
@@ -711,6 +743,10 @@ def main():
     vsecs = 0.0
     vclock_ok = False
     bounded_by = "error"
+    # CONNECT-DWELL FIX: vstamp at link-up; anchors the DATA virtual budget so the
+    # connect handshake's ~75-85 virtual seconds do not dilute rx_bps/dwell. None
+    # until the link establishes (or never, if connect times out).
+    connect_vsecs = None
 
     def base_cmd(port, role):
         c = [args.bin, "-m", "ARQ", "-s", str(args.start_cfg), "-W",
@@ -806,21 +842,38 @@ def main():
         sockets.append(cmd_ctrl)
 
         # ============================================================
-        # VIRTUAL-TIME / COMPLETION-BOUND run loop (NOT real-time bound).
+        # CONNECT-ANCHORED VIRTUAL-TIME / COMPLETION-BOUND run loop.
         # ============================================================
-        # The run ends when ANY of:
-        #   (a) VIRTUAL time (relay vstamp / FS) reaches args.secs   [climb-sim]
-        #   (b) transfer COMPLETION: delivered_bytes >= --target-bytes [I7]
-        #   (c) a process died, OR
-        #   (d) a GENEROUS real-time watchdog fires (true wedge guard only), OR
-        #   (e) the virtual clock STALLS (relay stopped forwarding = wedge).
-        # Bound (d)/(e) NEVER truncate a healthy-but-slow climb: a healthy climb
-        # runs FTRT (real << virtual), and (e) only fires when virtual time is
-        # frozen. The decisive load-independence property comes from (a): same
-        # seed -> same virtual budget -> identical trajectory idle vs hammered.
+        # CONNECT-DWELL FIX (CONNECT_UNDER_RT_ROOTCAUSE §6.1): the run is split
+        # into a CONNECT phase and a DATA phase, with SEPARATE virtual budgets so
+        # the multi-leg LDPC connect handshake (which under RT pacing consumes
+        # ~75-85 virtual seconds) does NOT eat the data --secs budget (that was
+        # the 0%-connect blocker: --secs 70 expired DURING connect, before any
+        # data flowed). The run ends when ANY of:
+        #   PRE-CONNECT (st.connected == False):
+        #     (a0) the link establishes -> ANCHOR the data budget at this vstamp
+        #          (does NOT end the run; transitions to the data phase), OR
+        #     (a1) the CONNECT GRACE (--connect-grace virtual seconds) elapses
+        #          with no link -> bounded_by="connect_timeout" (matches the HW
+        #          teardown discipline: the modem ran its own retry loop to grace).
+        #   POST-CONNECT (st.connected == True):
+        #     (a)  DATA virtual time (vsecs - connect_vsecs) reaches args.secs, OR
+        #     (b)  transfer COMPLETION: delivered_bytes >= --target-bytes [I7].
+        #   ALWAYS (both phases):
+        #     (c)  a process died, OR
+        #     (d)  a GENEROUS real-time watchdog fires (true wedge guard only), OR
+        #     (e)  the virtual clock STALLS (relay stopped forwarding = wedge).
+        # Bound (d)/(e) NEVER truncate a healthy-but-slow climb. The decisive
+        # load-independence property is preserved: same seed -> same virtual data
+        # budget anchored at connect -> identical DATA trajectory idle vs hammered.
         start = time.time()
-        real_watchdog_s = max(args.secs * REAL_WATCHDOG_MULT, REAL_WATCHDOG_FLOOR)
-        print(f"\n=== monitoring up to {args.secs}s VIRTUAL "
+        # the real watchdog must cover BOTH the connect grace AND the data budget
+        # (both are virtual-second budgets; under RT, real ~= virtual, FTRT real <<
+        # virtual, so the generous mult still only fires on a true wedge).
+        real_watchdog_s = max((args.secs + args.connect_grace) * REAL_WATCHDOG_MULT,
+                              REAL_WATCHDOG_FLOOR)
+        print(f"\n=== monitoring: connect-grace {args.connect_grace}s VIRTUAL, "
+              f"then DATA budget {args.secs}s VIRTUAL anchored at connect "
               f"(real watchdog {real_watchdog_s:.0f}s, "
               f"target_bytes={args.target_bytes or 'none'}) ===\n")
         dead = False
@@ -833,13 +886,37 @@ def main():
             now = time.time()
             real_elapsed = now - start
 
-            # --- (a) virtual-time budget (the load-independent bound) ---------
             vsecs, vclock_ok = read_relay_virtual_seconds(relay_log)
-            if vclock_ok and vsecs >= args.secs:
-                bounded_by = "virtual_secs"
-                print(f"[BOUND] virtual budget reached: "
-                      f"vsecs={vsecs:.1f} >= {args.secs} (real {real_elapsed:.0f}s)")
-                break
+
+            # --- CONNECT-PHASE handling (anchor or grace) --------------------
+            if connect_vsecs is None:
+                if st.connected:
+                    # (a0) link is up -> anchor the DATA budget at the current
+                    # vstamp. Do NOT end the run; the data phase starts here.
+                    connect_vsecs = vsecs if vclock_ok else 0.0
+                    print(f"[CONNECT] link established at vsecs={connect_vsecs:.1f} "
+                          f"(real {real_elapsed:.0f}s) -> DATA budget {args.secs}s "
+                          f"VIRTUAL starts now")
+                    sys.stdout.flush()
+                elif vclock_ok and vsecs >= args.connect_grace:
+                    # (a1) connect grace exhausted without a link.
+                    bounded_by = "connect_timeout"
+                    print(f"[BOUND] connect grace exhausted: vsecs={vsecs:.1f} >= "
+                          f"{args.connect_grace} (real {real_elapsed:.0f}s), "
+                          f"link never established")
+                    break
+                # else: still connecting, within grace -> fall through to the
+                # ALWAYS guards (proc-died / wedge / watchdog) only.
+
+            # --- (a) DATA virtual-time budget (anchored at connect) ----------
+            if connect_vsecs is not None and vclock_ok:
+                data_vsecs = vsecs - connect_vsecs
+                if data_vsecs >= args.secs:
+                    bounded_by = "virtual_secs"
+                    print(f"[BOUND] data virtual budget reached: data_vsecs="
+                          f"{data_vsecs:.1f} >= {args.secs} "
+                          f"(total vsecs={vsecs:.1f}, real {real_elapsed:.0f}s)")
+                    break
 
             # --- (b) transfer completion (byte target + md5) -----------------
             if args.target_bytes > 0 and res["rx"] >= args.target_bytes:
@@ -885,8 +962,13 @@ def main():
             # progress line (every ~10 virtual seconds)
             if vclock_ok and vsecs >= last_report_v + 10.0:
                 last_report_v = vsecs
+                if connect_vsecs is None:
+                    phase = f"CONNECTING ({vsecs:.0f}/{args.connect_grace}s grace)"
+                else:
+                    phase = f"DATA ({vsecs - connect_vsecs:.0f}/{args.secs}s)"
                 print(f"[T+v{vsecs:7.1f}] (real {real_elapsed:6.0f}s) "
-                      f"rx={res['rx']}B cfg={cfg_name(st.switch_seq[-1]) if st.switch_seq else '-'}")
+                      f"rx={res['rx']}B cfg={cfg_name(st.switch_seq[-1]) if st.switch_seq else '-'} "
+                      f"{phase}")
                 sys.stdout.flush()
     except KeyboardInterrupt:
         pass
@@ -988,7 +1070,16 @@ def main():
     else:
         virtual_secs = vsecs if vsecs > 0 else 0.0
     real_secs = max(1.0, time.time() - t0)
-    dwell = max(1.0, virtual_secs)        # VIRTUAL dwell (load-independent)
+    # CONNECT-DWELL FIX: rx_bps is delivered bytes over the DATA virtual seconds
+    # (vstamp since link-up), NOT the whole window — the ~75-85 virtual-second
+    # connect handshake carries zero payload and would otherwise halve the rate.
+    # If the link never established (connect_vsecs is None) there is no data phase;
+    # fall back to the whole virtual window (rx is ~0 anyway).
+    if connect_vsecs is not None and virtual_secs > connect_vsecs:
+        data_virtual_secs = virtual_secs - connect_vsecs
+    else:
+        data_virtual_secs = virtual_secs
+    dwell = max(1.0, data_virtual_secs)   # VIRTUAL DATA dwell (load-independent)
     rx_bps = res["rx"] * 8 / dwell
     reached_ofdm = any(1 <= c <= 16 for c in seq)
     stalled = (not reached_ofdm) and rx_bps < 200
@@ -1034,8 +1125,11 @@ def main():
     print(f"bounded_by        : {bounded_by}")
     print(f"virtual_secs      : {virtual_secs:.1f}s  (real {real_secs:.1f}s, "
           f"FTRT {real_secs/max(1e-6,virtual_secs):.2f}x real/virtual)")
+    print(f"connect_vsecs     : "
+          f"{('%.1fs' % connect_vsecs) if connect_vsecs is not None else 'NEVER CONNECTED'}"
+          f"   data_virtual_secs: {data_virtual_secs:.1f}s")
     print(f"client rx bytes   : {res['rx']}  (~{rx_bps:.0f} bps over "
-          f"{dwell:.0f}s VIRTUAL)")
+          f"{dwell:.0f}s DATA-VIRTUAL)")
     # monitor: per-frame CHANNEL wire from the relay airtime-json (HW-representative
     # axis), independent of the climb-ramp-diluted virtual-clock rx_bps above.
     if wire_bps_airtime is not None:
@@ -1097,6 +1191,14 @@ def main():
                 # the run. wall_secs == virtual_secs ONLY by coincidence; a
                 # healthy FTRT run has wall_secs < virtual_secs.
                 "virtual_secs": round(virtual_secs, 1),
+                # CONNECT-DWELL FIX: connect_vsecs = the virtual second at which
+                # the link established (None if it never connected); data_virtual_secs
+                # = the virtual airtime AFTER connect (the rx_bps denominator). The
+                # connect handshake under RT consumes ~75-85 virtual seconds that are
+                # now EXCLUDED from the data-rate measurement.
+                "connect_vsecs": (round(connect_vsecs, 1)
+                                  if connect_vsecs is not None else None),
+                "data_virtual_secs": round(data_virtual_secs, 1),
                 "wall_secs": round(real_secs, 1),
                 "bounded_by": bounded_by,
                 "barrier_k": args.barrier_k,
