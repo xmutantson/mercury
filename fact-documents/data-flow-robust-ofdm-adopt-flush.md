@@ -859,3 +859,53 @@ turnaround pattern counted as `cmd_inband_session_dead_batches` / block-failures
 improvement (RX climb-killer removed, 189 vs 53 B); the CMD-side block-failure demote is the NEXT layer.
 [?] Next: the CMD-side block-failure / `cmd_inband_session_dead_batches` analog of the §19 zero-progress
 rate-limit (arq_commander.cc:3186, `[CMD] [BREAK] Block failure ... at config 0`).
+
+## §20 CMD-SIDE block-failure demote — NOT the §18/§19 sibling; it is a GENUINE marginal-link response (DO NOT mirror §19 — REPORT+STOP)
+
+After §19 removed the RX-side false BREAK, the redesign still ends ROBUST_2 via a CMD-side demote
+(`[CMD] [BREAK] Block failure #1/#2/#3 at config 0 (threshold=3)` → `Class-A degradation: demoting
+0 -> 102`, arq_commander.cc emergency_nack_count :4720 / threshold :4740). The hypothesis was that this
+is the SYMMETRIC commander-side sibling of §18/§19 (a false-count of partial-SACK-turnaround re-fires).
+VERIFIED FALSE.
+
+### §20.1 The block failures are REAL per-batch-period, not sub-second turnaround re-fires (VERIFIED `_residual/v19.arqlog`)
+
+The config-0 block-failure timestamps that reached the threshold: #1 T+0332.051, #2 T+0345.187, #3
+T+0358.401 — **~13 s apart = ONE REAL CONFIG_0 BATCH PERIOD each** (vs §19's 3 sub-second re-fires).
+emergency_nack_count ALREADY resets on any data-ACK (forward progress, arq_commander.cc:2451 etc.) — and
+it DID reset between an earlier #1 (T+0305) and the threshold streak (nAcked_data advanced 37→43). So the
+CMD-side counter is ALREADY zero-progress + real-period gated by construction; a §19-style TIME rate-limit
+would change NOTHING (3 genuine zero-progress real periods → the §19 classifier itself would tick 3× and
+demote).
+
+### §20.2 The real cause — the reverse confirmation genuinely does not arrive (VERIFIED)
+
+Every threshold block failure is preceded by `[CMD] [CMD-ACK-PAT] Timeout: no ACK detected,
+peak_matched=4-5/7 peak_metric=0.3-0.5` — the reverse MFSK ACK/SACK correlator matching only 4-5 of 7
+(sub-threshold = NOISE, no real ACK). In the window before #3 the RSP was `connection_status:Receiving`
+with `receiving_timer` climbing 6643→8176 ms and sent NO `TX-MFSK-ACK-SACK` — i.e. NO batch completed at
+the RSP to ACK, so no SACK was sent, so the CMD's reverse poll timed out. CONFIG_0 batches complete
+INTERMITTENTLY (some periods deliver — nAcked 37→43 — others stall with the RSP waiting), and after 3
+consecutive real periods with no completed/confirmed batch the CMD demotes. That is a GENUINE marginal-
+link response, not a false count.
+
+### §20.3 Verdict — DO NOT mirror §19 here (REPORT + STOP per §2)
+
+Mirroring §19's classifier onto emergency_nack_count would be a NO-OP (the failures are already real-
+period-paced) OR, if forced to suppress them, would MASK a genuine reverse-ACK-decode / forward-batch-
+completion failure — the "tune thresholds to make failing modes not fail in logs" anti-pattern CLAUDE.md
+forbids. The §19 RX-side fix STANDS (189 B vs 53 B, 0 RX BREAK, CONFIG_0 sustains). The remaining climb
+blocker is a DEEPER layer: the CONFIG_0 forward-batch-completion / reverse-MFSK-ACK reliability, NOT a
+false-count. No code change in §20.
+
+### §20.4 Honest is-this-the-last read
+
+NO — and the next blocker is NOT a quick point-fix. The chain so far: §17 descrambler (CONFIG_0 decodes)
+→ §19 dead-batch (CONFIG_0 sustains, no false RX BREAK) → §20 the CMD-side demote is a GENUINE marginal-
+link symptom (intermittent CONFIG_0 batch completion + sub-threshold reverse-MFSK-ACK). The diagnosis-
+flagged ROBUST_DWELL liveness false-fire and the slow ~100 s hailing climb up-ladder are plausibly part
+of THIS same forward-acquisition / reverse-confirmation reliability layer (the RSP's `receiving_timer`
+growing to 8 s without a batch completing is a dwell/liveness signature). The right next step is a
+DESIGNED investigation of the CONFIG_0 forward-batch-completion + reverse-ACK reliability (why a batch
+intermittently fails to complete at the RSP / the reverse MFSK ACK matches only 4-5/7), NOT another
+counter-guard. [?]
