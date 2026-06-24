@@ -3796,8 +3796,18 @@ public:
   // regression (test_inband_tier_cross_reverse_pin) identically.
   int inband_tier_cross_reverse_config(int from_cfg, int to_cfg, bool inband_on) const;
 
+  // IN-BAND +1 CLIMB TARGET (data-flow-inband-frame0-rolling-partial.md §7.2 option A) — the
+  // pure FRAME-UP climb-target selector. inband_plus1_on=true -> strict +1 (proposed_frame,
+  // suppress the SNR elevator so the reverse data-SACK decodes at the shared rung);
+  // inband_plus1_on=false -> legacy elevator-OR-+1 max (byte-identical). snr_elevator<0 means
+  // no elevator this poll. Drives the production decision AND test_inband_plus1_climb.
+  int inband_climb_target(int proposed_frame, int snr_elevator, bool inband_plus1_on) const;
+
   // Directed regression for the tier-cross reverse-ACK pin (fails-before/passes-after).
   int test_inband_tier_cross_reverse_pin();
+
+  // Directed regression for the in-band +1 climb (suppress the SNR-elevator jump).
+  int test_inband_plus1_climb();
 
   // KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
   // data-decoupled intra-tier climb confirm (inband_retag_confirm_from_base_pattern).

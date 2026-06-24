@@ -257,3 +257,81 @@ STATUS: NO fix implemented this session. The prompted reverse-pin-extension is f
 implementing it would be a symptom band-aid (CLAUDE.md §2) and risks the serial-misdiagnosis pattern the
 memory BENCH-CLAIM guard warns against. Recommended next session: option (A) +1-probe, with a fail-before/
 pass-after on the SACK_RSP-applied / nAcked-advance at the climbed rung.
+
+## §8 FIX IMPLEMENTED — option (A) the +1 climb (2026-06-24, follow-up session)
+
+§7 RE-CONFIRMED independently (logs re-read, file:line below) and option (A) chosen over (B)/(C):
+
+### §8.1 Root RE-CONFIRMED (the elevator JUMP is the data-SACK-stranding mechanism)
+- **The 0→3 jump = the SNR-elevator at `arq_commander.cc:5657-5663`** (pre-fix inline). At CONFIG_0
+  the +1 default `proposed_frame=config_ladder_up(CONFIG_0)=CONFIG_1`, but `elevator_target_from_snr()`
+  → `get_configuration(SNR_uplink−SUPERSHIFT_MARGIN_DB)` returns CONFIG_3 at WGN:40, so a SINGLE FRAME-UP
+  jumps 0→3. VERIFIED `modem_064839.log` T+201.166 `[GEARSHIFT] FRAME UP: 1 consecutive ACKs ... config 0 -> 3`.
+  Turbo is INACTIVE the whole redesign session (0 SUPERSHIFT/TURBO markers) → the FRAME-UP elevator
+  (`:5657`) is the ONLY multi-rung site reached on the in-band climb; the robust climbs 100→101→102 are
+  already +1.
+- **The jump airs a CONFIG_0-SIZED 24-frame batch at the slow CONFIG_3 rung.** VERIFIED `[TX-PEAK] frames=24
+  size=1579136 cfg=3` (modem_064839.log) vs LEGACY which only airs 24/25-frame batches at CONFIG_15/16 and
+  airs CONFIG_3/4 as `frames=1` (modem_032735.log). A 24-frame batch at 303 bps = a huge forward airtime →
+  the reverse data-SACK turnaround the robust-MFSK suffix (`bitmap=0x00df7ffe ... on CONFIG_-1`) cannot survive.
+- **Consequence VERIFIED:** the climb-CONFIRM works (`[INBAND-TX] CONFIRMED followed CONFIG_3 via BASE ACK
+  pattern mfsk_matched=7`, T+236.435 — the §6 keystone), but the data-SACK suffix CRC fails
+  (`[CMD-ACK-PAT] Timeout: no ACK detected, peak_matched=5/7`, T+238.801) → the CMD applies ZERO data-SACKs
+  after CONFIG_3 (last apply T+200.552 bsi=4) → `stats.nAcked_data` STUCK at 14 (legacy advances 0→15,
+  steady at 15 for 6860 polls) → BREAK at every rung. The RSP DID dispatch the SACK_RSP + the suffix
+  (T+237.338, 21/24); the CMD never applies either (the OFDM SACK_RSP CMD-apply count is 0 in BOTH arms —
+  legacy ALSO rides the robust-MFSK suffix and it decodes there because legacy's CONFIG_3 batches are 1 frame).
+
+### §8.2 Why (A) over (B)/(C)
+- (A) +1 climb: smallest, root-cause change. Keeps CMD/RSP rungs aligned AND keeps each rung's forward
+  batch + reverse turnaround small enough for the EXISTING reverse SACK transport to decode — attacks the
+  giant-batch + rung-mismatch root directly. The keystone (§6) already makes the climb CONFIRM rung-by-rung
+  cheap, so a +1 climb is the natural pacing. CHOSEN.
+- (B) route the bitmap via OFDM SACK_RSP at the climbed rung: larger change; and the logs show legacy's
+  data-SACK ALSO rides the robust-MFSK suffix (not SACK_RSP) and succeeds — so the suffix transport is NOT
+  inherently broken; it fails only under the giant-batch turnaround the elevator creates. (B) would re-architect
+  a transport that works once the batch is right. Deferred.
+- (C) MFSK suffix CRC fragility: the suffix decodes fine at the robust rungs (5 clean applies pre-jump) and in
+  legacy at every rung — it is not fragile per se; it is overwhelmed by the elevator's turnaround. Not the root.
+
+### §8.3 The fix (pure helper, production + test share it)
+- `arq_common.cc::inband_climb_target(proposed_frame, snr_elevator, inband_plus1_on)` (new pure selector):
+  in-band → `proposed_frame` (strict +1, elevator suppressed); legacy → elevator-OR-+1 max (byte-identical to
+  the pre-fix inline `negotiated = proposed; if(snr_ideal idx > proposed idx) negotiated = snr_ideal`).
+- `arq_commander.cc:~5656` — the FRAME-UP gate computes `snr_elevator` (only when the SNR/OFDM gate is met,
+  as before) and calls `inband_climb_target(...)` with `inband_plus1_on = inband_rate_feature_enabled()`
+  (pinned false under `-DINBAND_PLUS1_CLIMB_FAILBEFORE`).
+- `arq.h` declarations; `arq_commander.cc::test_inband_plus1_climb` + `main.cc` wiring
+  (`--test` battery + `--test-inband-plus1-climb`).
+
+### §8.4 §5 CROSS-LAYER AUDIT (shared state: the FRAME-UP climb target `negotiated_configuration`)
+1. **Producers of `negotiated_configuration` on the FRAME-UP path:** ONLY the `:5656` site (now via
+   `inband_climb_target`). Other producers (SNR_BASED SET_CONFIG `:892`, turbo `:6672/:6679/:6686`, BREAK
+   recovery) are on DIFFERENT paths — turbo is INACTIVE on the in-band climb (verified 0 markers), so they
+   are not reached. The robust-dwell op (`:5705`) runs only when FRAME-UP DECLINED (returns before this), so
+   it is downstream and unaffected.
+2. **Consumers of `negotiated_configuration`:** the `add_message_control(SET_CONFIG)` builder (`:5689`/`:834`
+   chokepoint), which under in-band routes intra-OFDM via the unilateral CONFIG_TAG and tier-cross via legacy
+   SET_CONFIG. A +1 in-band target is intra-tier (both OFDM) once past CONFIG_0 → the unilateral tag path,
+   UNCHANGED. The RSP follows the tag (down-ladder D=4 window) — a +1 step stays WELL within D=4 (it was the
+   multi-rung jump that risked escaping it). VERIFIED narrower than the pre-fix jump.
+3. **Valid states:** before this producer, `negotiated_configuration` carries the prior target. The fix only
+   changes WHICH config the FRAME-UP elects (proposed_frame vs elevator), never the surrounding state machine
+   (FIFO restore, retx clear, state transition all UNCHANGED).
+4. **Invariants:** the +1 anchor clamp (`:5552`, `last_data_viable_config+1`) STILL bounds the climb — the fix
+   only changes the target WITHIN that clamp (the elevator was the thing that could outrun it). The floor /
+   anti-thrash nets (`probe_rung_suppressed`, AARF `frame_shift_threshold`, the demote/BREAK escapes) read
+   `consecutive_data_acks`/`emergency_nack_count`, NOT the climb target — UNAFFECTED. The elevator only ever
+   RAISES; suppressing it can never drop below the +1, so the deep-SNR WGN:-10 anti-thrash (#2) is intact
+   (legacy keeps the elevator there anyway, and in-band at deep SNR the elevator's >-90 gate is unmet so the
+   in-band path is already +1 = byte-identical to legacy in that regime).
+5. **What the fix changes:** ONE assumption — "the FRAME-UP elects the SNR-ideal config (elevator) when the
+   forward SNR licenses it" → "the in-band FRAME-UP elects EXACTLY +1; legacy keeps the elevator." Every
+   consumer re-verified. Legacy/flag-off byte-identical (the helper's legacy branch reproduces the inline logic).
+
+### §8.5 Tests (fail-before / pass-after, VERIFIED)
+- `--test-inband-plus1-climb` PASS-AFTER (ALL PASS): in-band elevator(CONFIG_3) → CONFIG_1 (+1); legacy
+  elevator(CONFIG_3) → CONFIG_3 (honored, byte-identical); intra-OFDM in-band elevator(CONFIG_8) suppressed → +1.
+- FAIL-BEFORE (`-DINBAND_PLUS1_CLIMB_FAILBEFORE`, clean build): in-band A JUMPS 0→3 (got=3, the wedge
+  reproduced) and E JUMPS to CONFIG_8 — the exact elevator jumps that strand the reverse SACK. MEASURED.
+- Full `--test` suite: [result recorded in the commit]; production byte-identical off the flag.

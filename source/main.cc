@@ -813,6 +813,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_f0p;
                 failed += test_f0p.test_inband_frame0_partial();
             }
+            // IN-BAND +1 CLIMB regression (data-flow-inband-frame0-rolling-partial.md §7.2
+            // option A): under MERCURY_INBAND_RATE the FRAME-UP climb must step EXACTLY +1
+            // (suppress the SNR elevator that jumped CONFIG_0->3 and stranded the reverse
+            // data-SACK -> nAcked_data stuck -> BREAK at every rung). Legacy keeps the
+            // elevator (byte-identical). PURE in-process synthetic-fire — permanent
+            // regression gate. Fails-before: -DINBAND_PLUS1_CLIMB_FAILBEFORE.
+            {
+                cl_arq_controller test_p1;
+                failed += test_p1.test_inband_plus1_climb();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -890,6 +900,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-frame0-partial") == 0) {
             cl_arq_controller ARQ_f0p;
             int failed = ARQ_f0p.test_inband_frame0_partial();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-plus1-climb : run ONLY the in-band +1 climb regression (the FRAME-UP
+        // climb steps +1 under the inband feature, suppressing the SNR-elevator multi-rung
+        // jump; legacy keeps the elevator) and exit. Fast + deterministic; see
+        // arq_commander.cc::test_inband_plus1_climb + data-flow-inband-frame0-rolling-partial.md §7.
+        // Build with -DINBAND_PLUS1_CLIMB_FAILBEFORE to reproduce the fails-before (0->3 jump).
+        if (strcmp(argv[i], "--test-inband-plus1-climb") == 0) {
+            cl_arq_controller ARQ_p1;
+            int failed = ARQ_p1.test_inband_plus1_climb();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-adopt-preserve : run ONLY the robust->OFDM adopt live-burst PRESERVE

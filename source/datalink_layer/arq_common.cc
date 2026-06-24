@@ -3233,6 +3233,34 @@ int cl_arq_controller::inband_tier_cross_reverse_config(int from_cfg, int to_cfg
 	                                  : to_cfg;    // OFDM->robust down-cross: target is robust
 }
 
+// IN-BAND +1 CLIMB TARGET (data-flow-inband-frame0-rolling-partial.md §7.2 option A) — the
+// PURE selector the FRAME-UP gate uses to choose the climb's negotiated_configuration. The
+// data-anchored FRAME-UP can either step EXACTLY +1 (proposed_frame, the conservative ladder
+// step) or fire the SNR-elevator to a multi-rung-higher SNR-ideal config (snr_elevator).
+//   - LEGACY (inband_plus1_on=false): keep the elevator-OR-+1 MAX — fire the multi-rung jump
+//     when the SNR-ideal config outranks proposed_frame (byte-identical to the pre-fix inline
+//     logic: negotiated = proposed_frame, then raise to snr_elevator if it ladder-outranks).
+//   - IN-BAND (inband_plus1_on=true): SUPPRESS the elevator — always return proposed_frame so
+//     the climb steps ONE rung per FRAME-UP. This keeps the CMD/RSP rungs aligned across the
+//     climb and keeps each rung's forward batch + reverse turnaround small enough for the
+//     reverse data-SACK (robust-MFSK suffix) to decode at the shared rung. Without it the
+//     CONFIG_0->3 jump airs a CONFIG_0-sized 24-frame batch at the slow CONFIG_3 rung whose
+//     reverse-SACK turnaround the suffix CRC cannot survive -> nAcked_data stuck -> BREAK.
+// snr_elevator < 0 means "no elevator available this poll" (the caller's SNR/OFDM gate was
+// unmet) -> +1 either way. The selector ONLY ever RAISES toward snr_elevator and never below
+// proposed_frame, so suppressing it cannot drop below the +1 floor (anti-thrash intact).
+int cl_arq_controller::inband_climb_target(int proposed_frame, int snr_elevator,
+	bool inband_plus1_on) const
+{
+	if(inband_plus1_on)
+		return proposed_frame;                    // in-band: strict +1, suppress the elevator
+	// legacy: elevator-OR-+1 max (the pre-fix inline behaviour, byte-identical)
+	if(snr_elevator >= 0 &&
+	   config_ladder_index(snr_elevator) > config_ladder_index(proposed_frame))
+		return snr_elevator;
+	return proposed_frame;
+}
+
 // IN-BAND TIER-CROSSING LIVENESS-GUARD EXEMPTION (data-flow-inband-tier-crossing.md §3
 // PART B) — the PURE predicate the connect-liveness guard uses to NOT accrue a stall while
 // a deliberate robust<->OFDM tier-cross control handshake is in flight. A cross routes via

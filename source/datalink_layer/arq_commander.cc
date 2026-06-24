@@ -5653,15 +5653,38 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// add_message_control(SET_CONFIG), the state transition) is
 				// UNCHANGED — the elevator just sets a higher negotiated_configuration
 				// before the SAME SET_CONFIG goes out. See §13/§14.
-				negotiated_configuration = proposed_frame;     // the +1 default
+				// IN-BAND +1 CLIMB (data-flow-inband-frame0-rolling-partial.md §7.2
+				// option A — the REVERSE-SACK DELIVERY unblock). Under MERCURY_INBAND_RATE
+				// the reverse data-SACK rides the robust-MFSK suffix (the d28f02d pin), and
+				// the climb-CONFIRM rides the base ACK pattern (§6 keystone, decoupled). A
+				// MULTI-RUNG elevator jump (CONFIG_0->3 at WGN:40, verified
+				// _msab/keystone/_logsnap/modem_064839.log T+201.166 "FRAME UP config 0 -> 3")
+				// keeps the CONFIG_0-SIZED 24-frame batch but airs it at the much slower
+				// CONFIG_3 rung -> a giant forward batch whose reverse-SACK turnaround the
+				// robust-MFSK suffix CRC cannot survive (CMD-ACK-PAT peak_matched=5/7,
+				// suffix CRC fails) -> the data-SACK never applies -> stats.nAcked_data
+				// STUCK at 14 -> BREAK at every rung. Legacy never hits this: it only airs
+				// 24-frame batches at CONFIG_15/16 (short airtime), CONFIG_3/4 batches are
+				// 1 frame, and its nAcked_data advances 0->15 (modem_032735.log).
+				// FIX: on the in-band path climb EXACTLY ONE rung per FRAME-UP (keep
+				// proposed_frame, suppress the elevator) so the CMD/RSP rungs stay aligned
+				// and each rung's forward batch + reverse turnaround stays small enough for
+				// the reliable reverse SACK to decode at the shared rung. The elevator only
+				// RAISES; suppressing it never lowers below the +1, so the floor/anti-thrash
+				// nets are untouched. Legacy/flag-off keeps the elevator (byte-identical).
+				// The decision is the pure inband_climb_target() — production and the
+				// directed regression (test_inband_plus1_climb) drive the EXACT same logic.
+				int snr_elevator = -1;
 				if(gear_shift_on==YES && is_ofdm_config(current_configuration) &&
 				   measurements.SNR_uplink > -90)
-				{
-					int snr_ideal = elevator_target_from_snr();
-					if(config_ladder_index(snr_ideal) >
-					   config_ladder_index(proposed_frame))
-						negotiated_configuration = snr_ideal;  // multi-rung jump
-				}
+					snr_elevator = elevator_target_from_snr();
+#ifdef INBAND_PLUS1_CLIMB_FAILBEFORE
+				bool inband_plus1_on = false;  // fails-before: elevator jump NOT suppressed
+#else
+				bool inband_plus1_on = inband_rate_feature_enabled();
+#endif
+				negotiated_configuration =
+					inband_climb_target(proposed_frame, snr_elevator, inband_plus1_on);
 				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs (eff_thresh %d, base %d, clean-streak %d), config %d -> %d\n",
 					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
 					clean_batches_at_current_config, current_configuration, negotiated_configuration);
@@ -9821,6 +9844,94 @@ int cl_arq_controller::test_inband_basepattern_confirm()
 	inband_last_confirmed_config = CONFIG_NONE;
 
 	printf("[TEST-BASECONFIRM] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// IN-BAND +1 CLIMB (data-flow-inband-frame0-rolling-partial.md §7.2 option A) — directed
+// regression for the FRAME-UP climb-target selector inband_climb_target(). Drives the EXACT
+// production decision: in-band -> strict +1 (suppress the SNR elevator that jumped CONFIG_0->3
+// and stranded the reverse data-SACK); legacy -> elevator-OR-+1 max (byte-identical).
+// FAILS-BEFORE under -DINBAND_PLUS1_CLIMB_FAILBEFORE: the production caller passes
+// inband_plus1_on=false even when the feature is ON, so the in-band assertion (the climb
+// stays +1) FLIPS to FAIL (it jumps to the elevator target). PASSES-AFTER: in-band stays +1.
+int cl_arq_controller::test_inband_plus1_climb()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-PLUS1] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-PLUS1] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// The production gate computes inband_plus1_on = inband_rate_feature_enabled(), EXCEPT
+	// under -DINBAND_PLUS1_CLIMB_FAILBEFORE where it is pinned false. Mirror that here so the
+	// fails-before arm exercises the SAME wedge the production macro reproduces.
+#ifdef INBAND_PLUS1_CLIMB_FAILBEFORE
+	const bool inband_on_for_climb = false;   // fails-before: in-band NOT given strict +1
+	printf("[TEST-PLUS1] in-band +1 climb = FAIL-BEFORE (elevator NOT suppressed)\n");
+#else
+	const bool inband_on_for_climb = true;    // passes-after: in-band gets strict +1
+	printf("[TEST-PLUS1] in-band +1 climb = LIVE\n");
+#endif
+	fflush(stdout);
+
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+
+	// The verified wedge: at CONFIG_0, proposed_frame (+1 ladder step) = CONFIG_1, but the
+	// SNR elevator at WGN:40 returns CONFIG_3 -> legacy jumps 0->3 (the giant-batch wedge),
+	// in-band must stay 0->1.
+	int proposed_c0 = config_ladder_up(CONFIG_0, robust_enabled, narrowband_enabled == YES);
+	check(proposed_c0 == CONFIG_1, "precondition: config_ladder_up(CONFIG_0) == CONFIG_1",
+		proposed_c0, CONFIG_1);
+
+	// ---- A: IN-BAND climb with an elevator wanting CONFIG_3 -> strict +1 (CONFIG_1) ----
+	int a = inband_climb_target(proposed_c0, /*snr_elevator=*/CONFIG_3, inband_on_for_climb);
+#ifdef INBAND_PLUS1_CLIMB_FAILBEFORE
+	check(a == CONFIG_3, "A (fail-before) in-band JUMPS 0->3 (elevator, wedge reproduced)",
+		a, CONFIG_3);
+#else
+	check(a == CONFIG_1, "A in-band +1: elevator(CONFIG_3) SUPPRESSED -> CONFIG_1",
+		a, CONFIG_1);
+#endif
+
+	// ---- B: IN-BAND with no elevator (snr_elevator<0) -> +1 either way ----
+	int b = inband_climb_target(proposed_c0, /*snr_elevator=*/-1, inband_on_for_climb);
+	check(b == CONFIG_1, "B in-band, no elevator: +1 (CONFIG_1)", b, CONFIG_1);
+
+	// ---- C: LEGACY (inband_plus1_on=false) with elevator CONFIG_3 -> jumps to CONFIG_3 ----
+	// This holds in BOTH arms (legacy is byte-identical) — proves the elevator is preserved
+	// for the legacy path and the fix only changes the in-band branch.
+	int c = inband_climb_target(proposed_c0, /*snr_elevator=*/CONFIG_3, /*inband_plus1_on=*/false);
+	check(c == CONFIG_3, "C legacy: elevator(CONFIG_3) HONORED -> CONFIG_3 (byte-identical)",
+		c, CONFIG_3);
+
+	// ---- D: LEGACY with a LOWER elevator (<= proposed) -> +1 (elevator only RAISES) ----
+	// proposed_frame is the +1 ladder step from CONFIG_3 (=CONFIG_4); an elevator of CONFIG_1
+	// is BELOW it, so the helper keeps proposed_frame (the elevator never lowers below +1).
+	int proposed_c3 = config_ladder_up(CONFIG_3, robust_enabled, narrowband_enabled == YES);
+	int d = inband_climb_target(proposed_c3, /*snr_elevator=*/CONFIG_1, /*inband_plus1_on=*/false);
+	check(d == proposed_c3, "D legacy: elevator below proposed -> +1 (never lowers)",
+		d, proposed_c3);
+
+	// ---- E: intra-OFDM in-band climb (CONFIG_4) with elevator CONFIG_8 -> strict +1 ----
+	int proposed_c4 = config_ladder_up(CONFIG_4, robust_enabled, narrowband_enabled == YES);
+	int e = inband_climb_target(proposed_c4, /*snr_elevator=*/CONFIG_8, inband_on_for_climb);
+#ifdef INBAND_PLUS1_CLIMB_FAILBEFORE
+	check(e == CONFIG_8, "E (fail-before) intra-OFDM in-band JUMPS to CONFIG_8 (elevator)",
+		e, CONFIG_8);
+#else
+	check(e == proposed_c4, "E intra-OFDM in-band +1: elevator(CONFIG_8) SUPPRESSED",
+		e, proposed_c4);
+#endif
+
+	printf("[TEST-PLUS1] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
