@@ -193,3 +193,67 @@ to the intra-OFDM climb so the reverse SACK decodes at the climbed forward rung 
 intra-OFDM climb a +1 (CONFIG_0->1) probe rather than the SNR-elevator multi-rung jump (CONFIG_0
 ->3), so the reverse-turnaround margin degrades gradually and the demote re-pins one rung at a
 time.
+
+## §7 CORRECTION — the binding constraint is the reverse DATA-SACK TRANSPORT, not the reverse-ACK RUNG (VERIFIED, deeper read 2026-06-24, `_msab/keystone/_logsnap/modem_064839.log` redesign vs `modem_032735.log` legacy)
+
+§5/§6 above are PARTIALLY WRONG and the diagnostic line they cite is misread. Strike-throughs:
+
+- ~~"the CMD cannot decode the REVERSE SACK/ACK at that OFDM forward rung"~~ — FALSE. At CONFIG_3 the
+  reverse **base ACK pattern DECODES** (`[INBAND-TX] CONFIRMED followed CONFIG_3 via BASE ACK pattern
+  mfsk_matched=7 >= thr=7`, modem_064839.log T+236.435). The KEYSTONE decoupled-confirm works at the
+  climbed rung; the reverse RUNG is fine.
+- ~~"CMD-side FTR-FAIL CONFIG_3 metric=0.096 = the reverse-ACK decode failing"~~ — MISREAD. That FTR-FAIL
+  is the CMD's OFDM frame ACQUIRER spinning at `current_configuration`=3 while it WAITS in
+  RECEIVING_ACKS_DATA (the reverse MFSK ACK is caught by the no-side-effect `decode_ack_sack_from_passband`
+  peek, NOT the OFDM acquirer). It is a symptom of waiting, not the reverse-ACK decode.
+- ~~"the d28f02d robust reverse-pin does not carry through the intra-OFDM climb"~~ — FALSE. `reverse_configuration`
+  is set to 102 at the tier-cross (T+161.972) and is NEVER re-written for the rest of the session — the
+  pin HOLDS robust the whole climb. Extending it "through the climb" is a no-op; it is already held.
+
+### §7.1 The ACTUAL root (VERIFIED, every-rung, not config-3-specific)
+
+The BREAK trigger at config 3 is `[CMD-ACK-PAT] Timeout: no ACK detected, peak_matched=5/7 peak_metric=0.6`
+(T+238.801) — i.e. the **data-batch SACK** (the bsi+bitmap that says which of the 24 frames to retx)
+was NOT received. The SAME signature fires at EVERY rung in the redesign:
+`Data ACK pattern detected!` → `CONFIRMED via BASE ACK pattern (suffix CRC FAILED)` →
+`[CMD-ACK-PAT] Timeout: no ACK detected peak_matched=3/7..5/7` at ROBUST_1(101), ROBUST_2(102), AND CONFIG_3.
+The robust-MFSK suffix (GF(16)+CRC-12) CRC-fails consistently at WGN:40 on this turnaround.
+
+DECISIVE: `[CMD] stats.nAcked_data` is STUCK at 14 across the whole config-3 window. The RSP DID receive
+the forward data (`nReceived_data=33`) and DID dispatch the reliable OFDM SACK_RSP transport
+(`[RSP] [ACK-GATE-V2] dispatching OFDM SACK_RSP batch_seq_id=5, 21/24 received`, T+237.338) — but the CMD
+NEVER reflects it (no nAcked advance, zero CMD-side SACK_RSP apply). In LEGACY the contrast is exact:
+`nAcked_data` STEADILY ADVANCES 0→1→2→3→9→15 (modem_032735.log) — legacy's reverse data-SACK loop delivers.
+
+So the binding constraint is the **reverse DATA-ACK/SACK DELIVERY LOOP**: the d28f02d pin routes the
+data-SACK onto the robust-MFSK suffix whose CRC fails, while the OFDM SACK_RSP the RSP dispatches is not
+applied by the CMD across the cross/climb rung-mismatch (CMD at CONFIG_3, reverse pinned 102/robust-MFSK).
+The redesign confirms the CLIMB (base pattern) but never DELIVERS the data (SACK never applied) → BREAK at
+every rung. This is the **delivery-layer binding constraint** the memory note `delivery_layer_binding_constraint`
+already names (constraint = DELIVERY not PHY).
+
+### §7.2 Why the PROMPTED fix is FALSIFIED, and the real fix direction
+
+The prompted fix — "extend the d28f02d robust-MFSK reverse-pin THROUGH the intra-OFDM climb" — would NOT
+help and would likely WORSEN delivery: the pin is ALREADY held robust the whole climb, and robust-MFSK is
+the transport whose suffix CRC is FAILING. Pinning harder propagates the failing transport. The reverse RUNG
+is not the problem; the data-SACK TRANSPORT reliability is.
+
+Real fix candidates (for a clean, separately-scoped follow-up — NOT a same-session speculative chain, per
+CLAUDE.md §5):
+  (A) **+1 probe instead of the 0→3 SNR-elevator JUMP** (the §6 alternative, now PREFERRED): a single-rung
+      climb keeps the CMD/RSP rungs aligned, keeps the data batch + turnaround small per rung, and lets the
+      reliable OFDM SACK_RSP transport (which legacy uses and which the RSP already dispatches) decode at the
+      shared rung. This attacks the rung-mismatch + giant-batch root, not the reverse-pin symptom.
+  (B) **Make the data-SACK ride the reliable OFDM SACK_RSP at the climbed rung** rather than the fragile
+      robust-MFSK suffix — i.e. DECOUPLE the data-ACK transport from the reverse-pin the way legacy does,
+      keeping only the *climb-confirm* on the robust base pattern (KEYSTONE) and routing the *bitmap* via
+      SACK_RSP. Larger change; audit the SACK_RSP rung selection vs reverse_configuration first.
+  (C) The MFSK suffix CRC-12 fragility itself (peak_matched 3-5/7 at WGN:40) may be a turnaround
+      phase/window problem (multi-window recovery already exists, `MERCURY_DATA_ACK_MULTIWINDOW`) — worth
+      a separate isolation before (B).
+
+STATUS: NO fix implemented this session. The prompted reverse-pin-extension is falsified by the evidence;
+implementing it would be a symptom band-aid (CLAUDE.md §2) and risks the serial-misdiagnosis pattern the
+memory BENCH-CLAIM guard warns against. Recommended next session: option (A) +1-probe, with a fail-before/
+pass-after on the SACK_RSP-applied / nAcked-advance at the climbed rung.
