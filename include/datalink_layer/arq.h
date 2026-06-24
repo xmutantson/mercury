@@ -1579,6 +1579,13 @@ public:
   // never call this. See gearshift-start-and-recovery.md §9.8.
   int test_clean_batch_viability();
 
+  // IN-BAND CONFIG_0 ROLLING-PARTIAL climb-unblock regression (CLI --test-inband-frame0-partial).
+  // A lead-frame-only partial (bitmap bit0 clear, rest set) at an inband OFDM rung ADVANCES the
+  // FRAME-UP climb streak; a multi-frame-drop partial stays vetoed (§9). Returns 0 pass / 1 fail.
+  // Default builds never call this. Fails-before: -DINBAND_FRAME0_PARTIAL_FAILBEFORE.
+  // See fact-documents/data-flow-inband-frame0-rolling-partial.md.
+  int test_inband_frame0_partial();
+
   // climb-engine integrated regression (CLI --test-climb-engine). Parts A-H,
   // each fail-before / pass-after its fix:
   // (a) Bug 1: sack_clean_confirmation_accepted() split-dedupe — an all-ones
@@ -3488,6 +3495,17 @@ public:
   // climb to inband_last_confirmed_config, so the §9 clean-batch protection is preserved
   // (and the legacy strict gate is byte-identical: false when off / no climb armed).
   bool inband_pipeline_climb_active();
+  // IN-BAND CONFIG_0 ROLLING-PARTIAL climb unblock
+  // (fact-documents/data-flow-inband-frame0-rolling-partial.md §2). PURE predicate (no I/O):
+  // returns true iff the in-band feature is on, the live config is an OFDM-tier config, and the
+  // LAST partial SACK was a LEAD-FRAME-ONLY loss (last_partial_lead_frame_only). At CONFIG_0+
+  // the first OFDM frame of each batch bears the Schmidl-Cox acquisition burden and can fail the
+  // pre-LDPC SKIP-VAR gate while frames 1..N-1 ride the locked timing → a rolling 5/6 partial
+  // the retx recovers within one batch. Such a batch is a VIABLE rung: it must ADVANCE the
+  // FRAME-UP clean-streak, not veto it. A multi-frame-drop partial (a genuinely marginal rung)
+  // leaves last_partial_lead_frame_only false → this returns false → strict-clean gate stands.
+  // Flag-off / legacy → false (byte-identical). Replayed by --test-inband-frame0-partial.
+  bool inband_lead_frame_only_partial();
   // D1 implicit-confirm consumer: a returning SACK acked bsi `rx_bsi`. If the re-tag is
   // armed and rx_bsi is at-or-after inband_announce_bsi (mod-256 forward distance), the
   // announced config is CONFIRMED FOLLOWED: DISARM the re-tag, record
@@ -3963,6 +3981,16 @@ public:
   // See fact-documents/gearshift-start-and-recovery.md §9.
   double success_rate_data_clean;
   int consecutive_data_acks;       // Frame-level gearshift: consecutive successful data ACKs
+  // IN-BAND CONFIG_0 ROLLING-PARTIAL climb unblock
+  // (fact-documents/data-flow-inband-frame0-rolling-partial.md §2). The LAST PARTIAL SACK's
+  // signature: true iff the partial reported EXACTLY the LEAD frame (frame-0 / bit0) missing
+  // while every OTHER frame of the batch decoded (an acquisition-seam loss the retx machinery
+  // recovers within one batch). Set at BOTH partial producers (the MFSK-ACK-SACK and the OFDM
+  // SACK_RSP partial paths); cleared at every per-batch TX start and on every clean/full ACK.
+  // Read ONLY by inband_lead_frame_only_partial() at the FRAME-UP gate so the rolling CONFIG_0
+  // partial advances the climb streak instead of vetoing it. A MULTI-frame-drop partial leaves
+  // this false (the §9 anti-thrash veto is preserved). CMD-only.
+  bool last_partial_lead_frame_only = false;
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
   int  frame_gearshift_retry_count;   // §7.13.33: retries on PHY-switched first batch before BREAK (rx_mute timing race)

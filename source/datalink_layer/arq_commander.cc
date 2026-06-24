@@ -1664,6 +1664,7 @@ void cl_arq_controller::process_messages_tx_data()
 			telecom_system->data_container.frames_to_read = 4;
 		data_ack_received = NO;
 		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
+		last_partial_lead_frame_only = false;  // ROLLING-PARTIAL unblock — fresh per batch
 		clear_snr_arm_for_data_ack_wait(); // §18: arm MUST be false on every data-ACK wait
 		connection_status = RECEIVING_ACKS_DATA;
 		ack_diag_peak_matched = 0;
@@ -2213,6 +2214,7 @@ void cl_arq_controller::process_messages_tx_data()
 		}
 		data_ack_received=NO;
 		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
+		last_partial_lead_frame_only = false;  // ROLLING-PARTIAL unblock — fresh per batch
 		clear_snr_arm_for_data_ack_wait(); // §18: arm MUST be false on every data-ACK wait
 		connection_status=RECEIVING_ACKS_DATA;
 		ack_diag_peak_matched = 0;
@@ -3792,6 +3794,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										sack_bitmap[i] = ((rx_bitmap >> i) & 1u) ? true : false;
 									sack_detected = true;
 									cmd_last_applied_sack_bsi = (int)rx_bsi;
+									// ROLLING-PARTIAL unblock (data-flow-inband-frame0-rolling-partial.md
+									// §1/§2): record whether THIS partial is a LEAD-FRAME-ONLY loss
+									// (exactly bit0 clear, every other batch frame set). all_ones was
+									// computed just above (:3748). SIGNATURE: frame-0 (bit0) missing AND
+									// at most 2 frames missing total (the lead acquisition-seam frame plus
+									// at most the tail/EOB frame the seam can clip — the observed 0x3e and
+									// 0x1e rolling partials). A marginal rung drops >2 -> false (§9).
+									{
+										int n_miss = data_batch_size - __builtin_popcount(rx_bitmap & all_ones);
+										last_partial_lead_frame_only =
+											((rx_bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
+									}
 									// STAGE 4d (D1 CONFIRM): a PARTIAL SACK still PROVES the RX demodulated the
 									// batch at the announced config (it decoded SOME frames of it), so a PARTIAL
 									// confirms exactly like a CLEAN (design §1.7 ruling). DISARM the re-tag.
@@ -4117,6 +4131,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// promotion-gating flag FALSE (explicit; the per-batch TX-start reset
 				// already cleared it) and do NOT bump nBatches_fully_acked. nBatches_acked
 				// is still bumped below for its existing (stats) meaning — unchanged.
+				// ROLLING-PARTIAL unblock (data-flow-inband-frame0-rolling-partial.md
+				// §1/§2): record whether THIS OFDM SACK_RSP partial is a LEAD-FRAME-ONLY
+				// loss (frame-0 missing, every other batch frame present). Computed from
+				// sack_bitmap[] (filled by decode_sack_rsp above). Mirrors the MFSK partial
+				// site so BOTH partial transports feed the same FRAME-UP unblock predicate.
+				{
+					// frame-0 missing AND at most 2 frames missing total (lead acquisition-seam
+					// frame + at most the tail). Mirrors the MFSK-site signature.
+					int n_miss = 0;
+					for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
+						if(!sack_bitmap[i]) n_miss++;
+					last_partial_lead_frame_only =
+						(data_batch_size > 1) && !sack_bitmap[0] && (n_miss >= 1) && (n_miss <= 2);
+				}
 				last_batch_fully_acked = false;
 				stats.nBatches_acked++;
 				last_transmission_block_stats.nBatches_acked++;
@@ -4241,6 +4269,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// (WB CRC-gated by §8) both land here. The whole batch is delivered,
 				// so this batch MAY drive the four gearshift promotion consumers.
 				last_batch_fully_acked = true;
+				last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch is not a lead-only partial
 				stats.nBatches_acked++;
 				stats.nBatches_fully_acked++;
 				last_transmission_block_stats.nBatches_acked++;
@@ -4343,6 +4372,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// CLEAN-BATCH VIABILITY (§9): LDPC full-batch range ACK — clean
 					// (no SACK cycle), so this batch may drive promotion.
 					last_batch_fully_acked = true;
+					last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch
 					stats.nBatches_acked++;
 					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
@@ -4368,6 +4398,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// CLEAN-BATCH VIABILITY (§9): LDPC full-batch multi ACK — clean
 					// (no SACK cycle), so this batch may drive promotion.
 					last_batch_fully_acked = true;
+					last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch
 					stats.nBatches_acked++;
 					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
@@ -5435,6 +5466,45 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				if(is_ofdm_config(current_configuration))
 					probe_backoff_reset();
 			}
+			// ROLLING-PARTIAL ANCHOR RAISE (data-flow-inband-frame0-rolling-partial.md §2,
+			// the §5 sibling). The clean-batch branch above did NOT fire (the rolling CONFIG_0
+			// batch is a LEAD-FRAME-ONLY partial, not a true clean), so last_data_viable_config
+			// stays at the ROBUST tier (idx 2). The FRAME-UP +1 anchor clamp (:5510) then BLOCKS
+			// CONFIG_0(idx3)→CONFIG_1(idx4) because idx4 > anchor_idx(2)+1 — the streak fix alone
+			// cannot climb. ROOT: a lead-frame-only batch IS eventually FULLY delivered (every
+			// frame, frame-0 via retx within one batch), so the rung carries full data and is a
+			// valid anchor. Raise the anchor to THIS rung (and track the ceiling) so the +1 clamp
+			// permits the next-rung probe. NARROW: this is the ONLY clean-only producer extended;
+			// the panic/AARF/back-off resets above stay true-clean-gated (a multi-drop partial
+			// leaves last_partial_lead_frame_only false → this block is skipped → §9 anti-thrash
+			// for a genuinely marginal rung is untouched). The +1 clamp still bounds the climb to
+			// one rung above proven ground, and the gearshift's decode-failure demote re-pins if
+			// the next rung fails — restoring re-climb without over-climb. Inband + OFDM only.
+			else if(inband_lead_frame_only_partial())
+			{
+				if(current_configuration != clean_batches_config)
+				{
+					clean_batches_config = current_configuration;
+					clean_batches_at_current_config = 1;
+				}
+				else if(clean_batches_at_current_config < 1000000)
+					clean_batches_at_current_config++;
+				int prev_anchor = last_data_viable_config;
+				last_data_viable_config = data_anchor_raise_target(
+					clean_batches_config, current_configuration,
+					last_data_viable_config, clean_batches_at_current_config);
+				supershift_proven_ceiling = inband_ceiling_raise_target(
+					supershift_proven_ceiling, last_data_viable_config,
+					clean_batches_config, clean_batches_at_current_config);
+				if(last_data_viable_config != prev_anchor)
+				{
+					printf("[GEARSHIFT] ROLLING-PARTIAL anchor raise: lead-frame-only batch fully "
+						"delivered at config %d -> last_data_viable %d->%d (FRAME-UP +1 clamp now "
+						"permits the next-rung probe)\n",
+						current_configuration, prev_anchor, last_data_viable_config);
+					fflush(stdout);
+				}
+			}
 			// Don't reset ceiling_success_count here — it accumulates across blocks
 			frame_gearshift_just_applied = false;  // upshift survived — clear flag
 			frame_gearshift_retry_count = 0;       // §7.13.33 reset
@@ -5517,7 +5587,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// RECOVERABLE here (it was not under legacy — legacy keeps the strict gate,
 		// byte-identical: inband_pipeline_climb_active() returns false when off).
 		bool inband_climb_pipeline = inband_pipeline_climb_active();
-		bool batch_promotable = inband_climb_pipeline
+		// ROLLING-PARTIAL unblock (data-flow-inband-frame0-rolling-partial.md §1/§2): at
+		// CONFIG_0 (and any inband OFDM rung entered via the SET_CONFIG tier-cross, where NO
+		// re-tag is armed so inband_climb_pipeline is false) the FIRST OFDM frame of each batch
+		// bears the Schmidl-Cox acquisition burden and can fail the pre-LDPC SKIP-VAR gate while
+		// frames 1..N-1 ride the locked timing → a rolling 5/6 LEAD-FRAME-ONLY partial the retx
+		// recovers within one batch. Such a batch is a VIABLE rung: ADVANCE the climb streak on
+		// it (optimistic, like the pipeline-climb path) so FRAME-UP can fire CONFIG_0→1 instead
+		// of wedging on the rolling partial. inband_lead_frame_only_partial() is OFDM-only +
+		// gated on the lead-frame-only bitmap signature, so a MULTI-frame-drop partial (a
+		// genuinely marginal rung) stays vetoed (§9 anti-thrash) and legacy/flag-off is
+		// byte-identical (the predicate returns false). The retx still recovers frame-0 (the
+		// SACK machinery is UNCHANGED), and the +1 anchor clamp below still bounds the climb.
+		bool inband_lead_frame_partial = inband_lead_frame_only_partial();
+		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial)
 			? (data_ack_received==YES)
 			: promotion_allowed_on_batch(last_batch_fully_acked);
 		if(data_ack_received==YES && batch_promotable &&
@@ -8703,6 +8786,144 @@ int cl_arq_controller::test_clean_batch_viability()
 	breaks_since_last_data_success = 0;            // restore
 
 	printf("[TEST-CLEAN-BATCH] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// IN-BAND CONFIG_0 ROLLING-PARTIAL climb-unblock regression (CLI --test-inband-frame0-partial).
+// Captures the redesign's CONFIG_0 wedge (data-flow-inband-frame0-rolling-partial.md §1): at the
+// inband OFDM base rung the FIRST OFDM frame of each batch bears the Schmidl-Cox acquisition
+// burden and fails the pre-LDPC SKIP-VAR gate while frames 1..N-1 ride the locked timing → a
+// rolling 5/6 LEAD-FRAME-ONLY partial. Pre-fix the strict-clean FRAME-UP gate vetoed the climb on
+// that partial → wedge. The fix: such a partial ADVANCES the climb streak (inband_lead_frame_only
+// _partial()) so FRAME-UP fires CONFIG_0→1, while a MULTI-frame-drop partial stays vetoed (§9).
+//
+// This drives the EXACT production `batch_promotable` decision (arq_commander.cc FRAME-UP gate)
+// for three batch verdicts at CONFIG_0 under the in-band feature:
+//   A: lead-frame-only partial (bitmap=0x3e, 5/6, bit0 clear)  -> promotable (climb advances).
+//   B: multi-frame-drop partial (bitmap=0x0c, frames 0,1,4,5 missing) -> NOT promotable (vetoed).
+//   C: clean batch (bitmap=0x3f)                                -> promotable (unchanged path).
+// Plus the OFDM-tier gate (a robust rung never treats a lead-only partial as promotable) and the
+// flag-off byte-identity. Fails-before: -DINBAND_FRAME0_PARTIAL_FAILBEFORE pins the predicate
+// false → A FAILS (the rolling partial is vetoed → wedge reproduced). Returns 0 pass / 1 fail.
+int cl_arq_controller::test_inband_frame0_partial()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-FRAME0-PARTIAL] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-FRAME0-PARTIAL] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Force the in-band feature ON for this test (the predicate is feature-gated).
+	const char* prev = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev ? prev : "";
+	bool had_prev = (prev != NULL);
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	inband_rate_enabled = -1;   // force re-resolve of the env cache
+
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	data_batch_size = 6;
+
+	// Replays the EXACT producer→consumer chain: set last_partial_lead_frame_only from a
+	// bitmap exactly as the production partial sites compute it, then read the production
+	// predicate the FRAME-UP gate consumes. `clean` short-circuits to the clean path.
+	auto promotable_for = [&](int cfg, uint32_t bitmap, bool clean) -> bool {
+		current_configuration = cfg;
+		if(clean) {
+			last_partial_lead_frame_only = false;   // a clean batch clears it (production sites)
+			last_batch_fully_acked = true;
+		} else {
+			last_batch_fully_acked = false;
+			// production lead-frame-recoverable computation (mirror of the partial sites):
+			// frame-0 missing AND at most 2 frames missing total.
+			uint32_t all_ones = (1u << data_batch_size) - 1u;
+			int n_miss = data_batch_size - __builtin_popcount(bitmap & all_ones);
+			last_partial_lead_frame_only =
+				((bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
+		}
+		// EXACT production FRAME-UP gate input (arq_commander.cc):
+		bool inband_climb_pipeline = inband_pipeline_climb_active();
+		bool inband_lead_frame_partial = inband_lead_frame_only_partial();
+		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial)
+			? true /* data_ack_received==YES on any delivery */
+			: promotion_allowed_on_batch(last_batch_fully_acked);
+		return batch_promotable;
+	};
+
+	// Ensure no re-tag is armed (the CONFIG_0 tier-cross entry leaves it false), so the
+	// unblock comes from the lead-frame-only predicate, NOT the pipeline-climb path.
+	inband_retag_armed = false;
+
+	// ---- A: lead-frame-only partial (0x3e, frame-0 missing) at CONFIG_0 -> PROMOTABLE ----
+	bool a = promotable_for(CONFIG_0, 0x3eu, /*clean=*/false);
+#ifdef INBAND_FRAME0_PARTIAL_FAILBEFORE
+	check(a == false, "A (fail-before) lead-only partial VETOED (wedge reproduced)", a ? 1 : 0, 0);
+#else
+	check(a == true,  "A lead-frame-only partial (0x3e) PROMOTABLE (climb unblocked)", a ? 1 : 0, 1);
+#endif
+
+	// ---- A2: frame-0 + tail partial (0x1e, frames 0 AND 5 missing) at CONFIG_0 -> PROMOTABLE.
+	// The observed rolling MIXBATCH partial: frame-0 (acquisition seam) + the EOB tail frame.
+	bool a2 = promotable_for(CONFIG_0, 0x1eu, /*clean=*/false);
+#ifdef INBAND_FRAME0_PARTIAL_FAILBEFORE
+	check(a2 == false, "A2 (fail-before) frame0+tail partial VETOED", a2 ? 1 : 0, 0);
+#else
+	check(a2 == true,  "A2 frame0+tail partial (0x1e, 2 missing) PROMOTABLE", a2 ? 1 : 0, 1);
+#endif
+
+	// ---- B: multi-frame-drop partial (3 missing) at CONFIG_0 -> NOT promotable (anti-thrash) ----
+	bool b = promotable_for(CONFIG_0, 0x1cu, /*clean=*/false);   // frames 0,1,5 missing (3)
+	check(b == false, "B multi-drop partial (3 missing) NOT promotable (§9 anti-thrash preserved)",
+		b ? 1 : 0, 0);
+
+	// ---- B2: a partial WITH frame-0 PRESENT (only tail missing) -> NOT promotable (not a
+	// lead-frame loss; the lead frame decoded, so the rung is not the acquisition-seam case). ----
+	bool b2 = promotable_for(CONFIG_0, 0x1fu, /*clean=*/false);   // frame 5 missing, frame-0 present
+	check(b2 == false, "B2 tail-only partial (frame-0 present) NOT promotable", b2 ? 1 : 0, 0);
+
+	// ---- C: clean batch at CONFIG_0 -> promotable (unchanged clean path) ----
+	bool c = promotable_for(CONFIG_0, 0x3fu, /*clean=*/true);
+	check(c == true, "C clean batch promotable (unchanged)", c ? 1 : 0, 1);
+
+	// ---- D: lead-frame-only partial at a ROBUST rung -> NOT promotable (OFDM-only gate) ----
+	bool d = promotable_for(ROBUST_0, 0x3eu, /*clean=*/false);
+	check(d == false, "D lead-only partial at ROBUST rung NOT promotable (OFDM-only)",
+		d ? 1 : 0, 0);
+
+	// ---- E: flag-off byte-identity — feature off, lead-only partial is NOT promotable ----
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "");
+#else
+	unsetenv("MERCURY_INBAND_RATE");
+#endif
+	inband_rate_enabled = -1;
+	bool e = promotable_for(CONFIG_0, 0x3eu, /*clean=*/false);
+	check(e == false, "E feature-off: lead-only partial NOT promotable (legacy byte-identical)",
+		e ? 1 : 0, 0);
+
+	// restore env + cache + members
+	if(had_prev) {
+#ifdef _WIN32
+		_putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+#else
+		setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+#endif
+	}
+	inband_rate_enabled = -1;
+	last_partial_lead_frame_only = false;
+
+	printf("[TEST-FRAME0-PARTIAL] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

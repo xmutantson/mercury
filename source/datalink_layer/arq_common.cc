@@ -835,6 +835,7 @@ cl_arq_controller::cl_arq_controller()
 	gear_shift_down_consecutive_fails=0;
 	success_rate_data_clean=100.0;  // CLEAN-BATCH VIABILITY (§9) — neutral until first block
 	consecutive_data_acks=0;
+	last_partial_lead_frame_only=false;  // ROLLING-PARTIAL unblock — neutral until a partial sets it
 	frame_shift_threshold=3;
 	frame_gearshift_just_applied=false;
 	frame_gearshift_retry_count=0;
@@ -3323,6 +3324,28 @@ bool cl_arq_controller::inband_pipeline_climb_active()
 	int pre_idx    = config_ladder_index(inband_pre_announce_config);
 	int target_idx = config_ladder_index(inband_retag_config);
 	return (pre_idx >= 0 && target_idx > pre_idx);
+#endif
+}
+
+// IN-BAND CONFIG_0 ROLLING-PARTIAL climb unblock
+// (fact-documents/data-flow-inband-frame0-rolling-partial.md §2). PURE predicate. See the
+// header for the full rationale. true iff: the in-band feature is on, the live config is an
+// OFDM-tier config (the acquisition-seam loss is OFDM-only; robust MFSK has no Schmidl-Cox
+// frame-0 burden), and the last partial SACK was a LEAD-FRAME-ONLY loss. Used ONLY to relax
+// the FRAME-UP clean-streak gate for the rolling CONFIG_0 frame-0 partial.
+bool cl_arq_controller::inband_lead_frame_only_partial()
+{
+#ifdef INBAND_FRAME0_PARTIAL_FAILBEFORE
+	// FAIL-BEFORE arm: the rolling lead-frame-only partial NEVER unblocks the climb (the
+	// pre-fix strict-clean gate). The directed test's pass-after assert (a 5/6 lead-frame-only
+	// partial advances the streak) then FAILS, proving the relaxation is load-bearing.
+	return false;
+#else
+	if(!inband_rate_feature_enabled())
+		return false;
+	if(!is_ofdm_config(current_configuration))
+		return false;
+	return last_partial_lead_frame_only;
 #endif
 }
 

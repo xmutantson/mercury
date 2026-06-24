@@ -802,6 +802,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_baseconfirm;
                 failed += test_baseconfirm.test_inband_basepattern_confirm();
             }
+            // IN-BAND CONFIG_0 ROLLING-PARTIAL climb-unblock regression
+            // (data-flow-inband-frame0-rolling-partial.md §4): at the inband OFDM base rung the
+            // first OFDM frame of each batch fails the SKIP-VAR gate (acquisition seam) → a
+            // rolling lead-frame-only partial that pre-fix vetoed the FRAME-UP climb → CONFIG_0
+            // wedge. The fix advances the climb streak on that partial while a multi-drop partial
+            // stays vetoed. PURE in-process synthetic-fire — permanent regression gate.
+            // Fails-before: -DINBAND_FRAME0_PARTIAL_FAILBEFORE.
+            {
+                cl_arq_controller test_f0p;
+                failed += test_f0p.test_inband_frame0_partial();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -869,6 +880,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-basepattern-confirm") == 0) {
             cl_arq_controller ARQ_bc;
             int failed = ARQ_bc.test_inband_basepattern_confirm();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-frame0-partial : run ONLY the CONFIG_0 rolling-partial climb-unblock
+        // regression (a lead-frame-only partial at an inband OFDM rung advances the FRAME-UP
+        // climb streak; a multi-drop partial stays vetoed) and exit. Fast + deterministic; see
+        // arq_commander.cc::test_inband_frame0_partial + data-flow-inband-frame0-rolling-partial.md.
+        // Build with -DINBAND_FRAME0_PARTIAL_FAILBEFORE to reproduce the fails-before (wedge).
+        if (strcmp(argv[i], "--test-inband-frame0-partial") == 0) {
+            cl_arq_controller ARQ_f0p;
+            int failed = ARQ_f0p.test_inband_frame0_partial();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-adopt-preserve : run ONLY the robust->OFDM adopt live-burst PRESERVE
