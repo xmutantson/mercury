@@ -536,10 +536,11 @@ This is a SEPARATE layer (CONFIG_0 decode rate / climb-from-CONFIG_0), NOT the c
 [?] Next: characterize why CONFIG_0 OFDM-OK rate stays low after a clean coarse lock (FTR/snapshot
 timing for the live re-aired burst, or the SNR margin at WGN:40 CONFIG_0).
 
-~~[?] OPEN as of §14.5~~ — RESOLVED in §15: the low CONFIG_0 OFDM-OK rate was the ring-shrink
+~~[?] OPEN as of §14.5~~ — ~~RESOLVED in §15: the low CONFIG_0 OFDM-OK rate was the ring-shrink
 **Nofdm drift**, NOT FTR/snapshot timing or SNR margin. The §14 fix held buffer_Nsymb (ring SIZE);
 §15 holds Nofdm (per-symbol GEOMETRY), the remaining skew from the SAME throwaway-vs-live `ofdm.gi`
-disagreement.
+disagreement.~~ **WRONG — see §16: §15's "live Nofdm drift" was a mis-read of a THROWAWAY instance's
+log line; the LIVE ring is 217/292 (correct). The residual is a CLEAN-LOCK decode-bit mismatch, OPEN.**
 
 ## §15 Fix — the ring-shrink Nofdm/GI drift (the CONFIG_0 under-decode root, diagnosis a468b2fc)
 
@@ -607,3 +608,67 @@ defeat the §14 size shrink. Master `--test` exit 0.
 - (c) Legacy: both functions are reached ONLY via `inband_rate_feature_enabled()`-gated paths; off →
   neither runs → byte-identical. On the inband path, when `ofdm.gi` is NOT stale the preserved value
   EQUALS the old recompute → no behavior change except in the stale window the bug lived in.
+
+## §16 CORRECTION — §15's "live Nofdm drift" theory is FALSIFIED; the residual is a CLEAN-LOCK decode-bit mismatch (NOT geometry)
+
+### §16.1 What §15 mis-read (VERIFIED — `_probe/fix2001.arqlog`, the §15 binary's own diagnosis run)
+
+§15.1's "smoking gun" log mis-attributed a THROWAWAY instance's numbers to the LIVE RSP shrink. The
+second `[PHY] Loading configuration 0 (was -1)` at the cross is NOT a live re-load: it is the throwaway
+`cl_telecom_system tmp` constructed in `cl_arq_controller::inband_natural_ofdm_buffer_nsymb()`
+(arq_common.cc:3895) — called from `inband_finalize_ofdm_adopt_ring` (arq_common.cc:4504) purely to
+compute `natural_nsymb` for a LOG string. `tmp` starts at `current_configuration=-1` (ctor,
+telecom_system.cc:159) → its load logs "(was -1)" → its `init()` recomputes `tmp.data_container.Nofdm`
+and prints the throwaway's own `[PHY-SWITCH] init() done (... Nofdm=310 buffer_Nsymb=212)`. `tmp`
+DESTRUCTS at arq_common.cc:3898 — it never touches the LIVE `data_container`.
+
+PROOF the live ring is CORRECT: in the SAME `_probe/fix2001.arqlog` the live shrink flag log reads
+`[INBAND-RX] HINGE-1 OFDM-RING flag: CONFIG_0 ring=217 buf_min=0 shrunk=1` (L23581 / T+0194.112). The
+live ring is **217**, not the throwaway's 212; the live decode runs at **Nofdm=292**, not 310. Every
+live `[OFDM-SYNC] coarse:` line shows `count=292 bufNsymb=217 Nsymb=48` — the geometry §15 claimed was
+"drifted to 310" is in fact PRISTINE on the live path. §15 is therefore a **NO-OP** (confirmed: lwp2001
+pre-§15 and fix2001 post-§15 both deliver IDENTICAL 53 B / final ROBUST_2 / deep_stall=true).
+
+### §16.2 The REAL residual (VERIFIED — working-vs-broken, same `_probe/` runs)
+
+The CONFIG_0 under-decode is a **clean-lock decode-bit mismatch**, not geometry. Side-by-side at WGN:40
+CONFIG_0, IDENTICAL PHY params (`M=2 LDPC_rate=0.062 Nc=50 Nsymb=48 nBits=1600 Nofdm=292 ring=217`):
+
+| metric | LEGACY (`_abrun/legacy.arqlog`) | REDESIGN (`_probe/fix2001.arqlog`) |
+|---|---|---|
+| coarse metric | 0.998 | 0.997 (also reaches 0.999) |
+| noise_variance_estimate (var) | 0.024–0.037 | 0.018–0.037 (≥ as good) |
+| mean_H | 0.98 | 0.98–0.99 |
+| LDPC iter | 0 | 0 |
+| outcome | **13× OFDM-OK, 0 FAIL** | **0 OK, 198× OFDM-FAIL crc=0xC7C3** |
+
+The redesign achieves a PRISTINE lock (tight constellation var 0.018–0.037, mean_H 0.98–0.99, coarse
+0.997) yet LDPC converges at `iter=0` to a self-consistent codeword whose CRC16 is a CONSTANT 0xC7C3 for
+every one of 198 frames — across 7+ DIFFERENT anchor delays (13255, 22599, 30775, 41287, 47127, 75159…).
+A constant CRC across different delays RULES OUT a timing/FFT-window offset (that yields delay-varying
+garbage). Legacy decodes the IDENTICAL transmitted burst byte-correct. The `var=81.11` SKIP-VAR frames
+(75 of them) are a SEPARATE set (mis-anchored slides while the re-aired burst slides); the load-bearing
+failure is the 198 CLEAN-lock CRC fails that SHOULD have decoded.
+
+RULED OUT as the cause (each checked): geometry/Nofdm (live = 292/217, identical to legacy); PHY config
+params (identical active line); descrambler `bit_energy_dispersal_sequence` (re-seeded deterministically
+per-load at telecom_system.cc:5218–5222, identical CMD vs RSP; throwaway shares the process-global RNG
+(`rng_own_=false`, :56/:65) but the live RSP does NOT regenerate its sequence after the throwaway runs).
+
+### §16.3 Direction for the real fix (NOT YET IMPLEMENTED — [?])
+
+A clean, tight, well-equalized constellation that LDPC-converges (iter=0) to a CRC-failing codeword on a
+CLEAN channel, with a delay-INVARIANT constant CRC, points to a FIXED bit transform that differs between
+the redesign's tag-follow demod and legacy: a candidate is a **constellation phase-reference / BPSK
+polarity** resolved differently by the redesign's fresh FULL-anchor re-search (predict-verify bypassed,
+telecom_system.cc:1407) vs legacy's locked predict-verify, or a data-carrier interleaver/deframe phase
+that pilots tolerate (periodic) but data carriers do not. The §15/§14/#1c-#1e geometry work is COMPLETE
+and CORRECT (the live ring IS 217/292); building MORE geometry symmetry would be a 5th ghost-chase.
+
+### §16.4 §5 audit note
+
+No code changed in §16 (correction + re-direction only). The §15 commit 17fe801 telecom_system.cc
+Nofdm-preserve is a harmless no-op on the live path (it preserves a value that was already correct) and
+is byte-identical off the inband path; it can stay or be reverted — it neither helps nor hurts the
+residual. The fix-before/fix-after must target the DECODE-BIT mismatch on the live tag-follow path, not
+the (already-correct) capture-ring geometry.
