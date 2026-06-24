@@ -672,3 +672,65 @@ Nofdm-preserve is a harmless no-op on the live path (it preserves a value that w
 is byte-identical off the inband path; it can stay or be reverted — it neither helps nor hurts the
 residual. The fix-before/fix-after must target the DECODE-BIT mismatch on the live tag-follow path, not
 the (already-correct) capture-ring geometry.
+
+## §17 ROOT CAUSE FOUND + FIXED — the CONFIG_0 clean-lock CRC-fail is a DESCRAMBLER wipe (VERIFIED)
+
+§16 falsified the geometry theory and re-directed to a "clean-lock decode-bit mismatch." §17 is the
+VERIFIED root cause and the fix.
+
+### §17.1 The discriminator (VERIFIED — bit-level instrumentation, runs `_residual/bd3..bd5`)
+
+A `MERCURY_BITDIAG`-gated probe dumped, at each clean CONFIG_0 lock, the RX pre-LDPC LLRs vs candidate
+transforms and the TX-truth message bytes. Findings, all EXACT-MATCH across every frame:
+- POLARITY (global LLR sign flip) decode → iter=101, crc≠0 ⇒ **NOT a polarity/phase flip** (falsified).
+- `RX_decoded_message == TX_message XOR descrambler_sequence(seed=0)` — EXACT for all frames, all
+  batch seqs (the seq counter in byte 3/5 tracks through). The XOR mask `3D 6B D0 78 5C 2F 95 B8 …`
+  equals the seed-0 `bit_energy_dispersal_sequence` byte-for-byte.
+- Direct dump of the RSP's LIVE `bit_energy_dispersal_sequence` at CONFIG_0 decode = **ALL ZEROS**
+  (`00 00 …`), while the CMD's TX sequence = the correct `3D 6B D0 …`. ⇒ the RSP descrambles with an
+  all-zero sequence (a no-op) → recovers `M XOR S` → CRC fails with the constant 0xC7C3, iter=0.
+
+### §17.2 The mechanism (VERIFIED by code read + the all-zero dump)
+
+`init()` generates the descrambler AFTER its `data_container.set_size` (the `ts_srandom(seed)`+draw
+loop). The inband HINGE-1 ring-shrink `force_set_capture_ring_natural()` (and its sibling
+`force_resize_capture_ring()`) call `data_container.set_size()` DIRECTLY to resize the capture ring.
+`set_size` CDELETE+reallocates `bit_energy_dispersal_sequence` (data_container.cc:243→145, `new int[N_MAX]`
+= fresh ZEROED pages) — and NEITHER helper regenerated it. So after the shrink the RSP's descrambler is
+all-zero. LEGACY never calls the shrink (inband-only), so its descrambler (from init) survives → decodes
++ climbs 0→16. This is the SAME throwaway-vs-live disease family as §14/§15 (a direct set_size that
+skips an init side-effect), but it wipes the DESCRAMBLER, which §15's Nofdm-preserve never addressed —
+why §15 was a no-op (§16).
+
+### §17.3 The fix
+
+Factored the init descrambler regen into `cl_telecom_system::regenerate_bit_energy_dispersal_sequence()`
+and call it after the `set_size` in BOTH ring-resize helpers (and from init, unchanged behavior). Now any
+`data_container.set_size` is followed by a descrambler regen. FAIL-BEFORE knob
+`MERCURY_DESCRAMBLER_REGEN_DEFEAT=1` skips the regen (reproduces the all-zero bug on the same binary).
+
+### §17.4 LIVE-PATH test (fail-before / passes-after, NOT an isolation unit)
+
+`test_inband_descrambler_survives_ring_shrink()` (`--test-inband-descrambler-survives-shrink`, in master
+`--test`) drives the LIVE load(ROBUST_0)→seat-floor→load(CONFIG_0)→`inband_finalize_ofdm_adopt_ring`
+(=force_set_capture_ring_natural) path, then does a REAL scramble(M)^descramble round-trip with the RSP's
+post-shrink sequence vs the TX reference. arm 0 (fix): descrambler NON-ZERO, EQUALS the TX seq, round-trip
+== M. arm 1 (DEFEAT): all-zero, round-trip == M^S (the 0xC7C3 floor). Master `--test` exit 0.
+LIVE SIM (`_residual/fix.arqlog`, MERCURY_INBAND_RATE=1 WGN:40): RSP descr_seq now `3D 6B D0 …`,
+**CONFIG_0 OFDM-OK=5 (was 0), OFDM-FAIL=0 (was 198)**, DATA_LONG frames RX-BATCH-SEQ deliver.
+
+### §17.5 §5 AUDIT — descrambler vs every set_size producer
+
+Producers of `bit_energy_dispersal_sequence`: init() (after its set_size) + NOW both ring-resize helpers.
+Invalidator: ANY `data_container.set_size` (reallocs the array zeroed). Audited ALL 6 `data_container.set_size`
+callers in telecom_system.cc — 2 in init() (regen follows), 2 in force_resize_capture_ring (regen added),
+2 in force_set_capture_ring_natural (regen added). No other producer-invalidator. Consumers (TX scramble
+728, RX descramble, turbo scoring, ZF-SNR re-encode) all read the now-valid sequence. Legacy path never
+calls the helpers → byte-identical.
+
+### §17.6 RESIDUAL (honest)
+
+The descrambler fix makes CONFIG_0 DECODE + DELIVER (OFDM-OK + RX-BATCH-SEQ). The seed-2001 realtime run
+still showed final ROBUST_2/53 B because CONFIG_0 was reached LATE (~T+167 of a 240 s run) with no climb
+runway; this is a SEPARATE climb-latency/timing layer, not the decode bug. A WGN:40 A/B with adequate
+runway is needed to confirm climb-to-legacy. [?] Next: the climb behaviour now that the forward decode works.

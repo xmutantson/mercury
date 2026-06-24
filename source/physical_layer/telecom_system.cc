@@ -5215,12 +5215,10 @@ void cl_telecom_system::init()
 		reinit_subsystems.pre_equalization_channel=NO;
 	}
 
-	ts_srandom (bit_energy_dispersal_seed);   // §10.1: per-instance when opted in
-	bit_energy_dispersal_seed = default_configurations_telecom_system.bit_energy_dispersal_seed;
-	for(int i=0;i<ldpc.N;i++)
-	{
-		data_container.bit_energy_dispersal_sequence[i]=ts_random()%2;
-	}
+	// §10.1: per-instance when opted in. Factored to regenerate_bit_energy_dispersal_sequence()
+	// so the ring-resize helpers (force_resize_capture_ring / force_set_capture_ring_natural),
+	// whose set_size realloc wipes this array, regenerate it IDENTICALLY (§17).
+	regenerate_bit_energy_dispersal_sequence();
 
 	// Print active gain entry for this config (verbose only)
 	if(g_verbose) {
@@ -11062,6 +11060,22 @@ void cl_telecom_system::load_configuration(int configuration)
 // buffer_Nsymb_min, re-allocating passband_delayed_data at the larger size. Holds
 // capture_prep_mutex across the realloc (Bug #42). No-op if already large enough or no
 // config is loaded. Idempotent.
+// Regenerate the descrambler (bit_energy_dispersal) sequence — IDENTICAL to the init() tail
+// (telecom_system.cc, the ts_srandom(seed)+draw loop). init() runs this after its set_size;
+// the ring-resize helpers below call set_size DIRECTLY (without init), and set_size CDELETE+
+// reallocates bit_energy_dispersal_sequence (data_container.cc:243->145) as a fresh ZEROED
+// array — so without this regen the RX descrambles with all-zeros and recovers M XOR S (constant
+// CRC fail). data-flow-robust-ofdm-adopt-flush.md §17.
+void cl_telecom_system::regenerate_bit_energy_dispersal_sequence()
+{
+	if(data_container.bit_energy_dispersal_sequence == NULL) return;
+	if(ldpc.N <= 0 || ldpc.N > N_MAX) return;
+	ts_srandom(bit_energy_dispersal_seed);
+	bit_energy_dispersal_seed = default_configurations_telecom_system.bit_energy_dispersal_seed;
+	for(int i=0;i<ldpc.N;i++)
+		data_container.bit_energy_dispersal_sequence[i]=ts_random()%2;
+}
+
 void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 {
 	if(min_nsymb <= 0) return;
@@ -11100,6 +11114,10 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
 			frequency_interpolation_rate);
 	}
+	// §17 ROOT FIX: set_size CDELETE+reallocated bit_energy_dispersal_sequence as a fresh ZEROED
+	// array. init() regenerates the descrambler after ITS set_size; this helper must too, else the
+	// RX decodes with an all-zero descrambler -> recovers M XOR S -> constant CRC fail. Inband-scoped.
+	regenerate_bit_energy_dispersal_sequence();
 	data_container.ring_write_index = 0;
 	data_container.data_ready = 0;
 	MUTEX_UNLOCK(&capture_prep_mutex);
@@ -11177,6 +11195,24 @@ void cl_telecom_system::force_set_capture_ring_natural()
 			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
 			frequency_interpolation_rate);
 	}
+	// §17 ROOT FIX (the CONFIG_0 clean-lock CRC-fail root, VERIFIED): set_size CDELETE+reallocated
+	// bit_energy_dispersal_sequence as a fresh ZEROED array (data_container.cc:243->145). init()
+	// regenerates the descrambler after ITS set_size (the ts_srandom+draw loop); this HINGE-1 shrink
+	// calls set_size DIRECTLY and previously did NOT, so the RSP decoded CONFIG_0 with an all-zero
+	// descrambler -> recovered M XOR S (constant CRC 0xC7C3, iter=0) -> ~53 B + demote to ROBUST_2.
+	// VERIFIED: RSP live descr_seq dumped 00..00 here vs the CMD's correct 3D6BD0... (seed-0).
+	// Legacy never calls this -> legacy descrambler survives -> decodes + climbs. Regenerate it.
+	// FAIL-BEFORE knob MERCURY_DESCRAMBLER_REGEN_DEFEAT=1: skip the regen AND zero the array, to
+	// DETERMINISTICALLY reproduce the production all-zero symptom (VERIFIED bd5). Without the active
+	// zero, the test's set_size realloc can return the SAME just-freed block (old seq intact) and the
+	// bug self-hides — the heap-reuse the live sim avoided. Production never sets the knob.
+	{ const char* e = std::getenv("MERCURY_DESCRAMBLER_REGEN_DEFEAT");
+	  if(e && *e && atoi(e) != 0) {
+	    if(data_container.bit_energy_dispersal_sequence != NULL && ldpc.N > 0 && ldpc.N <= N_MAX)
+	      for(int i=0;i<ldpc.N;i++) data_container.bit_energy_dispersal_sequence[i]=0;
+	  } else {
+	    regenerate_bit_energy_dispersal_sequence();
+	  } }
 	data_container.ring_write_index = 0;
 	data_container.data_ready = 0;
 	MUTEX_UNLOCK(&capture_prep_mutex);

@@ -828,6 +828,13 @@ public:
 	// in-band adopt so the re-aired burst lands within the coarse-search bounds
 	// (data-flow-robust-ofdm-adopt-flush.md §10). Mutex-protected.
 	void force_set_capture_ring_natural();
+	// Regenerate data_container.bit_energy_dispersal_sequence from bit_energy_dispersal_seed.
+	// init() runs this after its set_size; the ring-resize helpers (force_resize_capture_ring /
+	// force_set_capture_ring_natural) call set_size DIRECTLY (without init), and set_size
+	// CDELETE+reallocates the sequence array (data_container.cc:243->145) as fresh ZEROED pages —
+	// wiping the descrambler. Both helpers must regenerate it or the RX descrambles with all-zeros
+	// (RX_msg = TX_msg XOR descrambler_seq -> constant CRC fail). data-flow-robust-ofdm-adopt-flush.md §17.
+	void regenerate_bit_energy_dispersal_sequence();
 	int last_configuration;
 	int current_configuration;
 	void return_to_last_configuration();

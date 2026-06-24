@@ -734,6 +734,11 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_adopt_nofdm_invariant();
             }
+            // §17: descrambler survives the inband ring-shrink (the CONFIG_0 clean-lock CRC-fail root).
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_descrambler_survives_ring_shrink();
+            }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
             // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.
@@ -855,6 +860,13 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-adopt-nofdm-invariant") == 0) {
             cl_arq_controller ARQ_nofdm;
             int failed = ARQ_nofdm.test_inband_adopt_nofdm_invariant();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-descrambler-survives-shrink : run ONLY the §17 descrambler-survives-
+        // ring-shrink regression (the CONFIG_0 clean-lock CRC-fail root) and exit.
+        if (strcmp(argv[i], "--test-inband-descrambler-survives-shrink") == 0) {
+            cl_arq_controller ARQ_descr;
+            int failed = ARQ_descr.test_inband_descrambler_survives_ring_shrink();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock

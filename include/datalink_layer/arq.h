@@ -2202,6 +2202,9 @@ public:
   // (MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1, same binary): Nofdm drifts 292->310.
   // data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc.
   int test_inband_adopt_nofdm_invariant();
+  // CONFIG_0 clean-lock CRC-fail ROOT: descrambler survives the inband ring-shrink
+  // (set_size realloc wiped bit_energy_dispersal_sequence). data-flow-robust-ofdm-adopt-flush.md §17.
+  int test_inband_descrambler_survives_ring_shrink();
 
   // IN-BAND FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER REGRESSION (CLI
   // --test-inband-deliver). The 785-frame decode-but-0-deliver rework: a forward-healthy

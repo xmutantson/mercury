@@ -8658,6 +8658,120 @@ int cl_arq_controller::test_inband_adopt_nofdm_invariant()
 }
 
 // ============================================================================
+// In-band CONFIG_0 clean-lock CRC-fail ROOT — descrambler survives the ring-shrink
+// (data-flow-robust-ofdm-adopt-flush.md §17).  --test-inband-descrambler-survives-shrink
+// ============================================================================
+// VERIFIED ROOT (bd5 sim, MERCURY_BITDIAG): on the inband robust->OFDM cross the HINGE-1
+// ring-shrink (force_set_capture_ring_natural) re-runs data_container.set_size, which
+// CDELETE+reallocates bit_energy_dispersal_sequence as a FRESH ZEROED array. init() regenerates
+// the descrambler after ITS set_size; this helper previously did NOT -> the RSP decoded CONFIG_0
+// with an all-zero descrambler -> recovered M XOR S (constant CRC 0xC7C3, iter=0) -> ~53 B +
+// demote to ROBUST_2. Legacy never calls the shrink so its descrambler survives -> climbs 0->16.
+//
+// DRIVES THE LIVE load->seat-floor->shrink path (NOT an isolation unit) + a REAL scramble/descramble
+// round-trip across the shrink:
+//   - PASS-AFTER (arm 0, the fix): post-shrink descrambler is NON-ZERO and EQUALS the seed-0 ref TX
+//     uses -> scramble(M) XOR descramble == M (round-trips).
+//   - FAIL-BEFORE (arm 1, MERCURY_DESCRAMBLER_REGEN_DEFEAT=1 on the SAME binary): post-shrink seq is
+//     all-zero -> round-trip recovers M XOR S != M (reproduces the 0xC7C3 floor).
+int cl_arq_controller::test_inband_descrambler_survives_ring_shrink()
+{
+	const char* TAG = "[TEST-INBAND-DESCRAMBLER-SURVIVES-SHRINK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+		else   { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+	const float PROD_GI = (float)((int)(3.0 * 12.0 + 0.5)) / 256.0f;   // 36/256 (production)
+
+	// Reference descrambler the TX scrambles with: a FRESH instance that only ran init() (never a
+	// ring-shrink). The RSP must match this FULL N-bit sequence after the shrink.
+	static int ref_seq_full[N_MAX];
+	int ref_N = 0; (void)ref_N;
+	{
+		cl_telecom_system ref;
+		ref.operation_mode = ARQ_MODE; ref.narrowband_enabled = NO;
+		ref.default_configurations_telecom_system.ofdm_gi = PROD_GI;
+		ref.load_configuration(CONFIG_0);
+		ref_N = ref.ldpc.N;
+		for(int i=0;i<ref_N && i<N_MAX;i++) ref_seq_full[i]=ref.data_container.bit_energy_dispersal_sequence[i];
+	}
+
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_DESCRAMBLER_REGEN_DEFEAT", defeat ? "1" : "");
+
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE; ts->narrowband_enabled = NO;
+		ts->default_configurations_telecom_system.ofdm_gi = PROD_GI;
+		rx->telecom_system = ts; rx->narrowband_enabled = NO; rx->role = RESPONDER;
+		rx->robust_enabled = YES; rx->sack_v2_enabled = true; rx->inband_rate_enabled = 1;
+		rx->load_configuration(ROBUST_0, FULL, NO);
+		rx->link_status = CONNECTED; rx->connection_status = RECEIVING; rx->passive_monitor = false;
+		rx->rsp_current_expected_batch_seq_id = 4;
+
+		// LIVE cross: seat robust floor (oversize ring) -> bare load_configuration(CONFIG_0) ->
+		// finalize (HINGE-1 + force_set_capture_ring_natural). The SAME path production runs.
+		rx->inband_seat_robust_ring_floor();
+		rx->load_configuration(CONFIG_0, PHYSICAL_LAYER_ONLY, YES);
+		int N = ts->ldpc.N;
+		rx->inband_finalize_ofdm_adopt_ring(CONFIG_0);
+
+		// The set_size realloc returns INDETERMINATE memory (new int[N_MAX]): fresh OS pages are
+		// zeroed (the live-sim symptom) but heap REUSE can return stale non-zero blocks. So the
+		// load-bearing invariant is NOT "all-zero" but "matches the TX reference the RSP must
+		// descramble with". The FAIL-BEFORE arm asserts the descrambler DIVERGES from the TX ref
+		// (whatever the realloc left) -> the round-trip cannot recover M. Robust to the allocator.
+		bool matches_ref = true;
+		for(int i=0;i<N;i++) if(ts->data_container.bit_energy_dispersal_sequence[i]!=ref_seq_full[i]){ matches_ref=false; break; }
+
+		int M_msg[8] = {1,0,1,1,0,0,1,0};
+		int recovered[8];
+		for(int i=0;i<8;i++){ int scr = M_msg[i]^ref_seq_full[i]; recovered[i] = scr ^ ts->data_container.bit_energy_dispersal_sequence[i]; }
+		bool roundtrip_ok = true;
+		for(int i=0;i<8;i++) if(recovered[i]!=M_msg[i]){ roundtrip_ok=false; break; }
+
+		if(!defeat)
+		{
+			check(matches_ref, "FIX: post-shrink descrambler EQUALS the TX reference seq (regen ran -> TX/RX agree)", matches_ref?1:0, 1);
+			check(roundtrip_ok, "FIX: scramble(M)^descramble(post-shrink) == M (CONFIG_0 frame decodes)", roundtrip_ok?1:0, 1);
+		}
+		else
+		{
+			check(!matches_ref, "FAIL-BEFORE: post-shrink descrambler DIVERGES from the TX ref (wiped, not regenerated)", matches_ref?1:0, 0);
+			check(!roundtrip_ok, "FAIL-BEFORE: round-trip recovers != M (the 0xC7C3 CONFIG_0 floor)", roundtrip_ok?1:0, 0);
+		}
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_DESCRAMBLER_REGEN_DEFEAT", "");
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK DELIVER — --test-inband-deliver
 // data-flow-inband-retx-epoch.md §5.  (the 785-frame decode-but-0-deliver rework)
 // ============================================================================
