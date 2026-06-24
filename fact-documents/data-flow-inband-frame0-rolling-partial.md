@@ -150,4 +150,46 @@ Directed in-process test driving the EXACT production FRAME-UP gate decision:
 
 ## §5 A/B verdict (MEASURED — _msab/frame0fix, RT @SNR40, redesign ON vs legacy OFF)
 
-[filled after the A/B]
+The fix FIRES and unblocks the FORWARD climb — but exposes a SIBLING (§6). MEASURED from the
+seed=1002 ON relay trace (fact-documents/_frame0fix_evidence/seed1002_climb_trace.txt):
+
+```
+[T+0161.971] FRAME UP config 102 -> 0          (tier-cross to CONFIG_0, reverse pinned 102/ROBUST_2)
+[T+0201.166] ROLLING-PARTIAL anchor raise: lead-frame-only batch fully delivered at config 0
+             -> last_data_viable 102 -> 0       (THE FIX: anchor reaches CONFIG_0)
+[T+0201.166] FRAME UP config 0 -> 3 (clean-streak 2)   (THE FIX: FRAME-UP fires past CONFIG_0!)
+[T+0201.167] UNILATERAL CONFIG 0 -> 3
+[T+0238.801] BREAK Block failure #1 at config 3        (THE SIBLING: reverse-ACK fails at CFG3)
+```
+
+So vs the 100%-wedged baseline (adoptgate: ON peak=CONFIG_0 on EVERY sample, FRAME-UP CONFIG_0->1
+NEVER fired), the fix makes the forward FRAME-UP climb PAST CONFIG_0 actually FIRE (CONFIG_0->3
+here, RSP nReceived_data=33 at CONFIG_3 — the forward path carries data at the climbed rung).
+fail-before/pass-after of the fix's OWN mechanism is PROVEN both in --test-inband-frame0-partial
+AND in the live trace.
+
+BUT the redesign still does not reach legacy's byte counts: once the forward climbs to CONFIG_3,
+the CMD cannot decode the REVERSE SACK/ACK at that OFDM forward rung (CMD-side
+`FTR-FAIL CONFIG_3 metric=0.096`, `nReceived_data=0` on the reverse while the RSP's forward
+nReceived=33) -> `[BREAK] Block failure at config 3` -> demote. The TIER-CROSS reverse-ACK pin
+(d28f02d) holds reverse=102/ROBUST across the robust->OFDM CROSS, but the INTRA-OFDM unilateral
+climb (CONFIG_0->3) does NOT re-establish a decodable reverse-ACK at the new forward rung. This
+is the REVERSE-ACK / delivery-loop binding constraint the companion docs predicted
+(data-flow-inband-adopt-metric-gate.md §7; data-flow-inband-tier-crossing.md §3) — now EMPIRICALLY
+ISOLATED: removing the forward-climb wedge proves the reverse-ACK at the climbed OFDM rung is the
+TRUE next binding constraint, not the gearshift clean-streak.
+
+## §6 STOP / SIBLING (the §5 cross-layer discipline)
+
+This fix is NECESSARY (it removes the forward-climb veto — proven) but NOT SUFFICIENT for the
+end-to-end byte win. The remaining gap is the INTRA-OFDM reverse-ACK decode after the climb — a
+DISTINCT layer (reverse_configuration / turnaround timing at the climbed forward rung), not the
+gearshift clean-streak this doc owns. Per CLAUDE.md §2 (three-fail-STOP) and §5 (don't chain a
+second speculative cross-layer fix in the same session), the reverse-ACK climb-pin is a SEPARATE
+fix for a follow-up session. The forward-climb fix ships as-is (a proven, tested removal of a real
+100%-wedge veto; default-ON under the inband feature, legacy byte-identical). Candidate sibling
+fix (NOT done here, for the next session): extend the reverse-ACK pin (or a reverse re-establish)
+to the intra-OFDM climb so the reverse SACK decodes at the climbed forward rung — OR make the
+intra-OFDM climb a +1 (CONFIG_0->1) probe rather than the SNR-elevator multi-rung jump (CONFIG_0
+->3), so the reverse-turnaround margin degrades gradually and the demote re-pins one rung at a
+time.
