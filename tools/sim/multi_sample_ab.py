@@ -122,6 +122,20 @@ import time
 # observations, with margin. NOTE: lower FTRT is BETTER (more headroom).
 FTRT_FAIR_MAX_DEFAULT = 0.85
 
+# RT-AWARE relaxation (added 2026-06-24). When the relay paces to WALL CLOCK
+# (MERCURY_SIM_REALTIME=1), FTRT = wall/virtual is ~1.0 BY CONSTRUCTION — the
+# sim CANNOT run faster than realtime because the relay deliberately holds each
+# frame to its wall-clock airtime. So the 0.85 fair-max (calibrated on the
+# FTRT-VARIABLE non-realtime relay, where 0.71 vs 1.01 separated healthy from
+# load-starved) FALSELY marks EVERY legitimate realtime sample "starved" and
+# yields NO_FAIR_PAIRS. Under RT the load deconfound is handled instead by the
+# connect-fix (the DATA --secs budget starts only AFTER link_status:Connected,
+# §sim_arq_channel.py) + arm interleaving, NOT by FTRT. So under RT we relax the
+# fair-max to a band that still flags a genuinely WEDGED host (wall >> virtual,
+# e.g. swap-thrash) while passing the expected FTRT≈1.0. 1.3 gives ~30% wall
+# slack over the virtual budget before a sample is called starved.
+FTRT_FAIR_MAX_REALTIME = 1.3
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -483,6 +497,16 @@ def _synth_feat(rx, delivered, bounded="completion", connected=True,
     }
 
 
+def resolve_ftrt_fair_max(user_value, realtime):
+    """RT-aware resolution of the FTRT fair-max gate. If the user passed an
+    explicit value, honor it. Else pick by pacing mode: FTRT_FAIR_MAX_REALTIME
+    under wall-clock (realtime==1) pacing where FTRT≈1.0 is expected, else
+    FTRT_FAIR_MAX_DEFAULT. Pure function so the selftest can verify it."""
+    if user_value is not None:
+        return user_value
+    return FTRT_FAIR_MAX_REALTIME if realtime == 1 else FTRT_FAIR_MAX_DEFAULT
+
+
 def interleave_schedule(n_arms, n_samples):
     """Build the (sample_idx, arm_idx) execution ORDER that interleaves arms so
     neither arm is systematically the loaded 2nd in a session. For each sample
@@ -636,6 +660,32 @@ def selftest():
     first3 = [sched3[3 * i][1] for i in range(3)]
     check("INTERLEAVE: 3-arm first rotates 0,1,2", first3 == [0, 1, 2])
 
+    # 9) RT-AWARE FTRT fair-max resolution: realtime picks the relaxed band so an
+    #    FTRT≈1.0 RT sample is NOT falsely starved; non-realtime keeps the strict
+    #    0.85; an explicit user value always wins.
+    check("RT-FAIRMAX: realtime=1 default -> 1.3 (RT-relaxed)",
+          resolve_ftrt_fair_max(None, 1) == FTRT_FAIR_MAX_REALTIME)
+    check("RT-FAIRMAX: realtime=0 default -> 0.85 (strict)",
+          resolve_ftrt_fair_max(None, 0) == FTRT_FAIR_MAX_DEFAULT)
+    check("RT-FAIRMAX: explicit value overrides RT default",
+          resolve_ftrt_fair_max(0.9, 1) == 0.9)
+    #   the payoff: a realtime FTRT≈1.0 sample is FAIR under the RT default but
+    #   STARVED under the strict 0.85 (the old false-NO_FAIR_PAIRS bug).
+    rt_sample = sample_features(
+        {"rx_bytes": 60000, "md5_match": True, "bounded_by": "completion",
+         "final_config": "CONFIG_15", "wall_secs": 250.0, "virtual_secs": 250.0,
+         "connected": True}, 65536, 0.999,
+        ftrt_fair_max=resolve_ftrt_fair_max(None, 1))
+    check("RT-FAIRMAX: FTRT≈1.0 RT sample is FAIR under RT default",
+          rt_sample["ftrt_fair"] is True)
+    rt_sample_strict = sample_features(
+        {"rx_bytes": 60000, "md5_match": True, "bounded_by": "completion",
+         "final_config": "CONFIG_15", "wall_secs": 250.0, "virtual_secs": 250.0,
+         "connected": True}, 65536, 0.999,
+        ftrt_fair_max=resolve_ftrt_fair_max(None, 0))
+    check("RT-FAIRMAX: same FTRT≈1.0 sample WOULD be starved under strict 0.85",
+          rt_sample_strict["ftrt_fair"] is False)
+
     print(f"\nSELFTEST {'OK' if ok else 'FAILED'}")
     return 0 if ok else 1
 
@@ -701,11 +751,14 @@ def main():
                     help="port-quad advance between samples when --ctrl-base set.")
     ap.add_argument("--sample-timeout", type=int, default=1200,
                     help="hard real-time ceiling per sample (s).")
-    ap.add_argument("--ftrt-fair-max", type=float, default=FTRT_FAIR_MAX_DEFAULT,
+    ap.add_argument("--ftrt-fair-max", type=float, default=None,
                     help="FTRT (wall/virtual) at/above which a sample is LOAD-STARVED "
-                         "and excluded from the load-fair median (default %.2f; lower "
-                         "FTRT = more faster-than-realtime headroom)."
-                         % FTRT_FAIR_MAX_DEFAULT)
+                         "and excluded from the load-fair median (lower FTRT = more "
+                         "faster-than-realtime headroom). DEFAULT IS RT-AWARE: %.2f "
+                         "when --realtime 1 (FTRT≈1.0 is expected under wall-clock "
+                         "pacing, NOT load), %.2f otherwise. Pass an explicit value to "
+                         "override."
+                         % (FTRT_FAIR_MAX_REALTIME, FTRT_FAIR_MAX_DEFAULT))
     ap.add_argument("--no-interleave", action="store_true",
                     help="run all of arm A then all of arm B (LEGACY order; "
                          "reintroduces the A/B run-order confound). Default OFF: "
@@ -727,6 +780,15 @@ def main():
 
     if args.selftest:
         return selftest()
+
+    # RT-AWARE FTRT fair-max resolution. If the user did NOT pass --ftrt-fair-max,
+    # pick the default by pacing mode: under realtime (wall-clock) pacing FTRT≈1.0
+    # is EXPECTED (the relay cannot outrun realtime), so the 0.85 non-RT fair-max
+    # would falsely starve every RT sample → NO_FAIR_PAIRS. See FTRT_FAIR_MAX_REALTIME.
+    if args.ftrt_fair_max is None:
+        args.ftrt_fair_max = resolve_ftrt_fair_max(None, args.realtime)
+        print(f"[MSAB] --ftrt-fair-max auto-set to {args.ftrt_fair_max} "
+              f"(realtime={args.realtime}; RT-aware default)", flush=True)
 
     if len(args.arm) < 2:
         ap.error("need at least two --arm specs (e.g. --arm 'ON:MERCURY_INBAND_RATE=1' "
