@@ -270,7 +270,7 @@ def sample_features(j, target_bytes, deliver_frac, ftrt_fair_max=FTRT_FAIR_MAX_D
     # the explicit deep-stall verdict.
     stall = bool((not delivered) and
                  (bounded in ("vclock_stall", "real_watchdog", "proc_died",
-                              "no_json")
+                              "no_json", "connect_timeout")
                   or j.get("repro_deep_stall")))
     final = j.get("final_config")
     sustained_high = bool(isinstance(final, str) and final.startswith("CONFIG_")
