@@ -3670,6 +3670,32 @@ public:
   bool inband_adopt_ring_durability_defeat();
   int  inband_adopt_ring_durability_defeat_cached = -1;  // -1=unresolved, 0=off (guarded), 1=defeat
 
+  // IN-BAND ADOPT CLEAN-LOCK METRIC GATE (data-flow-inband-adopt-metric-gate.md §2/§3).
+  // Gate the in-band tag-follow adopt on the NORMALIZED Schmidl-Cox metric over the SAME
+  // captured snapshot the OFDM acquisition is about to consume: a CRC-valid CONFIG_TAG is
+  // adopted ONLY when the OFDM lock is CLEAN (metric >= threshold). A contaminated / overlapping
+  // re-air window (metric ~0.5) is REJECTED → no follow → the RX retries on the next pass (the
+  // window refills toward a clean single-burst snapshot). Returns true = ADOPT may proceed,
+  // false = REJECT (contaminated; retry). Feature-gated (legacy byte-identical). `announced_cfg`
+  // is the tag-announced config (the metric is judged at the CURRENT loaded geometry — the
+  // re-aired base-rung burst the gate must judge — so announced_cfg is advisory/logging).
+  bool inband_adopt_metric_gate_ok(const double* snapshot, int len, int announced_cfg);
+  // The snapshot context the metric gate judges, set by the snapshot/capture adopt callers
+  // (inband_detect_follow_from_snapshot / inband_detect_follow_from_capture) immediately
+  // before they invoke detect_and_follow_config_tag, and cleared after. detect_and_follow_
+  // config_tag reads these at the single adopt-commit point so BOTH adopt routes share ONE
+  // gate (no divergence). NULL/0 = no snapshot context available → the gate passes through
+  // (the down-ladder adopt, which already self-gates on a CRC/LDPC decode, INV-C).
+  const double* inband_adopt_gate_snapshot     = NULL;
+  int           inband_adopt_gate_snapshot_len = 0;
+  // FAIL-BEFORE / A-B knob: MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT=1 (cached) SKIPS the gate
+  // (the PRE-FIX behavior: a contaminated 0.5 lock is adopted → SKIP-VAR → 0 forward decode).
+  // Default 0 = gate ACTIVE. Mirrors the MERCURY_ADOPT_*_DEFEAT pattern. -1 = unresolved.
+  int  inband_adopt_metric_gate_defeat_cached = -1;
+  // Threshold (cached): MERCURY_INBAND_ADOPT_METRIC_GATE, default 0.9 (the "prominent peak"
+  // discriminant the codebase cites at arq_common.cc:12586). Sweep-only override; <0 = unresolved.
+  double inband_adopt_metric_gate_threshold_cached = -1.0;
+
   // PER-PASS PHY-REBUILD LEAK FIX (data-flow-inband-downladder-delivery): the ROBUST-floor
   // buffer_Nsymb is a CONSTANT for a given bandwidth (the config is always FULL_CONFIG_LADDER[0]),
   // so probe the throwaway cl_telecom_system ONCE and memo it keyed by narrowband_enabled. Without

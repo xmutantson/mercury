@@ -7994,6 +7994,8 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", "");
 		set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", "");
 		set_env("MERCURY_ADOPT_RING_DURABILITY_DEFEAT", "");
+		set_env("MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT", "");
+		set_env("MERCURY_INBAND_ADOPT_METRIC_GATE", "");
 	};
 
 	// The adopt takes capture_prep_mutex; create it if NULL (standalone test).
@@ -8479,6 +8481,122 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 			delete rx; delete ts;
 		}
 		set_env("MERCURY_ADOPT_RING_DURABILITY_DEFEAT", "");
+	}
+
+	// ── PART G : CLEAN-LOCK ADOPT METRIC GATE (data-flow-inband-adopt-metric-gate.md §2/§3/§4) ──
+	//   THE BUG: under sustained base-rung re-air, a CRC-valid CONFIG_TAG decodes but the OFDM
+	//   acquisition over the SAME snapshot is CONTAMINATED (overlapping re-airs -> Schmidl-Cox
+	//   metric ~0.5 vs clean ~0.997). The pre-fix tag-follow adopt commits the demod anyway -> the
+	//   garbage channel estimate hits SKIP-VAR -> 0 forward decode -> PARTIAL -> retx storm -> the
+	//   CONFIG_0 wedge (209B vs legacy ~2400B). THE FIX gates the adopt on the snapshot's
+	//   NORMALIZED SC metric (>= 0.9, the "prominent peak" discriminant arq_common.cc:12586).
+	//     CLEAN snapshot (a REAL CONFIG_0 OFDM frame, near-clean wire): metric ~0.99 -> ADOPT.
+	//     CONTAMINATED snapshot (NO half-symbol periodicity — a passband sinusoid, the same paint
+	//       the energy probe uses): metric well below 0.9 -> REJECT (retry), NOT adopted.
+	//     FAIL-BEFORE (MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT=1, SAME binary): the gate is bypassed
+	//       -> the CONTAMINATED snapshot is ADMITTED (the pre-fix contaminated-adopt that wedges).
+	{
+		// Build a CONFIG_0-loaded telecom_system DIRECTLY (the PART F generator recipe — a fresh
+		// cl_telecom_system + load_configuration fully inits the OFDM PHY: Nfft/interp/preamble.
+		// build_rx's RX leaves the PHY un-init for a non-OFDM-driven scaffold, so use a dedicated
+		// system here). This SAME system measures the metric AND backs the controller's gate call.
+		cl_telecom_system* tgG = new cl_telecom_system();
+		tgG->operation_mode = ARQ_MODE; tgG->narrowband_enabled = NO;
+		tgG->load_configuration(CONFIG_0);
+
+		// Build a CLEAN CONFIG_0 OFDM snapshot: one real frame on a near-clean wire (the same
+		// transmit_byte + apply_with_delay recipe PART F uses). The Schmidl-Cox half-symbol
+		// periodicity of the real preamble makes the normalized metric ~0.99.
+		std::vector<double> clean_snap; int clean_len = 0;
+		{
+			int interp = tgG->frequency_interpolation_rate;
+			int Nofdm  = tgG->data_container.Nofdm;
+			int preN   = tgG->data_container.preamble_nSymb;
+			int Nsymb  = tgG->data_container.Nsymb;
+			int fb = tgG->get_frame_size_bytes(); if(fb <= 0) fb = 1;
+			std::vector<int> payload((size_t)fb, 0);
+			for(int i = 0; i < fb; i++) payload[i] = (i * 53 + 7) & 0xFF;
+			tgG->transmit_byte(payload.data(), fb, tgG->data_container.passband_data, SINGLE_MESSAGE);
+			int lead = 8;
+			int forced_delay = ((preN + 2) * Nofdm + lead) * interp;
+			int n_frame = (Nofdm * (Nsymb + preN)) * interp;
+			tgG->awgn_channel.apply_with_delay(tgG->data_container.passband_data,
+				tgG->data_container.passband_delayed_data, 1e-3f, n_frame, forced_delay);
+			int cap = tgG->data_container.Nofdm * tgG->data_container.buffer_Nsymb.load() * interp;
+			int span = forced_delay + n_frame + Nofdm * interp; if(span > cap) span = cap;
+			clean_snap.assign((size_t)span, 0.0);
+			for(int i = 0; i < span; i++) clean_snap[i] = tgG->data_container.passband_delayed_data[i];
+			clean_len = span;
+		}
+		check(clean_len > 0, "G0 generated a CLEAN CONFIG_0 OFDM snapshot (real preamble)", clean_len, 1);
+
+		// A controller whose telecom_system is the CONFIG_0-loaded OFDM system (so the gate's metric
+		// helper runs at a real OFDM geometry). Feature ON (the gate is feature-gated).
+		cl_arq_controller* rx = new cl_arq_controller();
+		rx->telecom_system      = tgG;
+		rx->narrowband_enabled  = NO;
+		rx->role                = RESPONDER;
+		rx->inband_rate_enabled = 1;
+		rx->current_configuration = CONFIG_0;
+
+		// Build a CONTAMINATED snapshot: a window with NO clean Schmidl-Cox lock anywhere — seeded
+		// white noise at the SAME RMS as the clean burst (the energy probe still sees a "live" window,
+		// but no L-period autocorrelation peak exists, so the normalized SC metric collapses far below
+		// the 0.9 prominent-peak threshold). This is the unambiguous "no prominent peak" class — the
+		// adopt-time discriminant. (NOTE: a bare sinusoid or a self-shifted copy are the WRONG models:
+		// the SC search scans EVERY position and any residual periodicity re-locks ~1.0; only a window
+		// with NO coherent L-period — noise — yields the sub-threshold metric the gate must reject.)
+		std::vector<double> contam_snap((size_t)clean_len, 0.0);
+		{
+			// RMS-match the clean burst so the contamination is a level-equivalent no-lock window.
+			double e = 0.0; for(int i = 0; i < clean_len; i++) e += clean_snap[(size_t)i]*clean_snap[(size_t)i];
+			double rms = (clean_len > 0) ? sqrt(e / (double)clean_len) : 0.1;
+			if(rms <= 0.0) rms = 0.1;
+			unsigned int s = 0x9E3779B1u;   // deterministic seed (repeatable test)
+			for(int i = 0; i < clean_len; i++)
+			{
+				s = s * 1664525u + 1013904223u;                 // LCG
+				double u = ((double)(s >> 8) / 16777216.0) * 2.0 - 1.0;   // uniform [-1,1]
+				contam_snap[(size_t)i] = u * rms * 1.7;          // ~RMS-matched white noise (no L-period)
+			}
+		}
+
+		// MEASURE the raw normalized SC metric the gate uses (direct PHY helper) — diagnostic.
+		double m_clean  = tgG->inband_snapshot_clean_lock_metric(clean_snap.data(),  clean_len, CONFIG_0);
+		double m_contam = tgG->inband_snapshot_clean_lock_metric(contam_snap.data(), clean_len, CONFIG_0);
+		printf("%s G-METRIC: clean=%.3f contaminated=%.3f (threshold 0.90)\n", TAG, m_clean, m_contam);
+		fflush(stdout);
+		check(m_clean >= 0.90,
+			"G1 CLEAN snapshot metric is a PROMINENT peak (>= 0.90) — the real preamble locks",
+			(long)(m_clean * 1000), 900);
+		check(m_contam < 0.90,
+			"G2 CONTAMINATED snapshot metric is BELOW the clean-lock threshold (< 0.90) — no prominent peak",
+			(long)(m_contam * 1000), 900);
+
+		// PASS-AFTER (gate ACTIVE, default): clean ADMITS, contaminated REJECTS.
+		set_env("MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT", "");
+		rx->inband_adopt_metric_gate_defeat_cached = -1;        // force a fresh env read
+		rx->inband_adopt_metric_gate_threshold_cached = -1.0;
+		bool clean_ok  = rx->inband_adopt_metric_gate_ok(clean_snap.data(),  clean_len, CONFIG_0);
+		bool contam_ok = rx->inband_adopt_metric_gate_ok(contam_snap.data(), clean_len, CONFIG_0);
+		check(clean_ok,
+			"G3-FIX gate ADMITS the clean lock (metric >= 0.90 -> adopt proceeds)", clean_ok ? 1 : 0, 1);
+		check(!contam_ok,
+			"G4-FIX gate REJECTS the contaminated lock (metric < 0.90 -> NO adopt, retry next pass)",
+			contam_ok ? 1 : 0, 0);
+
+		// FAIL-BEFORE (DEFEAT, same binary): the gate is bypassed -> the CONTAMINATED lock is ADMITTED
+		// (the pre-fix contaminated-adopt that reaches SKIP-VAR -> 0 decode -> the CONFIG_0 wedge).
+		set_env("MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT", "1");
+		rx->inband_adopt_metric_gate_defeat_cached = -1;        // force a fresh env read
+		bool contam_ok_defeat = rx->inband_adopt_metric_gate_ok(contam_snap.data(), clean_len, CONFIG_0);
+		check(contam_ok_defeat,
+			"G5-DEFEAT (FAIL-BEFORE) gate BYPASSED -> the contaminated lock is ADMITTED (the pre-fix "
+			"wedge: SKIP-VAR -> 0 forward decode)", contam_ok_defeat ? 1 : 0, 1);
+		set_env("MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT", "");
+		rx->inband_adopt_metric_gate_defeat_cached = -1;
+
+		delete rx; delete tgG;
 	}
 
 #if defined(_WIN32)

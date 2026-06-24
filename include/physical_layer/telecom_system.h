@@ -721,6 +721,19 @@ public:
 	// at 30 dB (BER 0.43). Called from BOTH receive_byte (extraction is byte-identical
 	// to the inline block — no stock-path drift) and receive_bigblock. No-op for MFSK.
 	void rx_passband_normalize_and_blank(double* pb, int pb_samples);
+	// IN-BAND ADOPT CLEAN-LOCK GATE (data-flow-inband-adopt-metric-gate.md §2) — compute the
+	// NORMALIZED Schmidl-Cox timing metric (|P|²/R² ∈ [0,1], SNR-invariant) over a captured
+	// passband SNAPSHOT, at the geometry the in-band tag ANNOUNCES, WITHOUT mutating any RX
+	// state (a LOCAL pad/baseband copy; never touches passband_delayed_data, the ring cursors,
+	// or receive_stats). Used by the in-band tag-follow adopt to REJECT a contaminated /
+	// overlapping re-air window (metric ~0.5) and only ADOPT a clean single-burst lock
+	// (metric ~0.997) — the "prominent peak" discriminant the codebase already cites
+	// (arq_common.cc:12586). `announced_cfg` is the config the tag announces (the metric is
+	// computed at the CURRENT loaded OFDM geometry — the caller has not yet load_configuration'd
+	// the new cfg, and the base-rung re-air geometry the gate must judge IS the current one;
+	// announced_cfg is advisory/logging only). Returns the metric in [0,1], or -1.0 if it
+	// cannot be computed (MFSK / no snapshot / not an OFDM config).
+	double inband_snapshot_clean_lock_metric(const double* snapshot, int len, int announced_cfg);
 	// #samples one big-block TX writes to `out` (= preamble + K*frame passband
 	// samples at the frozen layout). The ARQ/capture sizing needs this in P2; for
 	// P1 the loopback validator uses it to size buffers. Computed from the frozen

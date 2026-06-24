@@ -9961,6 +9961,62 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	return receive_stats;
 }
 
+// IN-BAND ADOPT CLEAN-LOCK GATE — data-flow-inband-adopt-metric-gate.md §2/§3.
+// Compute the NORMALIZED Schmidl-Cox timing metric over a captured passband SNAPSHOT, at
+// the CURRENT loaded OFDM geometry, WITHOUT mutating any RX state. This is a READ-ONLY
+// copy of the coarse-SC acquisition step the production receive_byte runs — it mixes a
+// LOCAL pad copy to a LOCAL baseband vector and never touches passband_delayed_data, the
+// ring cursors, ofdm_search_raw/ofdm_batch_active, or receive_stats (INV-A / INV §3.4).
+// Recipe is VERBATIM from the big-block head acquisition (telecom_system.cc:8276-8302):
+//   pad -> passband_to_baseband(interp=1, FIR_rx_time_sync) -> rational_resampler(DECIMATION)
+//   -> time_sync_preamble_halfsym -> normalized correlation = |P|²/R² in [0,1].
+// Returns the metric in [0,1], or -1.0 when not applicable (MFSK, no snapshot, or not an
+// OFDM config — the caller then SKIPS the gate, never blocking a non-OFDM adopt).
+double cl_telecom_system::inband_snapshot_clean_lock_metric(const double* snapshot, int len,
+                                                            int announced_cfg)
+{
+	(void)announced_cfg;   // advisory/logging only — metric is judged at the CURRENT geometry
+	if(snapshot == NULL || len <= 0) return -1.0;
+	if(M == MOD_MFSK)      return -1.0;   // MFSK has no Schmidl-Cox OFDM preamble
+
+	int Nfft  = ofdm.Nfft;
+	float gi  = ofdm.gi;
+	int Ngi   = (int)round((double)gi * (double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	int interp = frequency_interpolation_rate;
+	if(Nofdm <= 0 || interp <= 0) return -1.0;
+	int sym_samples = Nofdm * interp;
+	if(sym_samples <= 0) return -1.0;
+	int pre_nSymb = data_container.preamble_nSymb;
+	if(pre_nSymb < 1) pre_nSymb = 1;
+
+	// Pad the snapshot to a whole number of symbols (the big-block recipe), mix to baseband
+	// at the carrier (interp=1 keeps the full-rate FIR), then decimate for the coarse search.
+	int need_syms = (len / sym_samples) + 2;
+	if(need_syms < (pre_nSymb + 2)) need_syms = pre_nSymb + 2;
+	int buf_interp = Nofdm * need_syms * interp;
+	if(buf_interp <= 0) return -1.0;
+	std::vector<double> pad(buf_interp, 0.0);
+	int copy_n = (len < buf_interp) ? len : buf_interp;
+	for(int i = 0; i < copy_n; i++) pad[i] = snapshot[i];
+
+	std::vector<std::complex<double>> bb_interp(buf_interp);
+	ofdm.passband_to_baseband(pad.data(), buf_interp, bb_interp.data(),
+	                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+	                          &ofdm.FIR_rx_time_sync);
+	std::vector<std::complex<double>> bb_dec(Nofdm * need_syms);
+	ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
+
+	// Coarse Schmidl-Cox over the whole decimated window (the SAME call the production
+	// acquisition and the big-block head use). correlation = |P|²/R² normalized to [0,1].
+	TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
+		bb_dec.data(), Nofdm * need_syms, 1, 1, 0.0, pre_nSymb);
+	double m = coarse.correlation;
+	if(m < 0.0) m = 0.0;
+	if(m > 1.0) m = 1.0;
+	return m;
+}
+
 void cl_telecom_system::bigblock_livepath_loopback()
 {
 	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };

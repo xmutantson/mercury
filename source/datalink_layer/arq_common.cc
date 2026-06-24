@@ -3029,6 +3029,35 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 	if(followed_config == current_configuration)
 		return 0;
 
+	// ── CLEAN-LOCK ADOPT GATE (data-flow-inband-adopt-metric-gate.md §2/§3) ──
+	// A CRC-valid CONFIG_TAG decoded (the tiny RM16+gf16ra codeword) — but that is INDEPENDENT
+	// of the OFDM Schmidl-Cox acquisition over the SAME snapshot. Under sustained base-rung
+	// re-air the OFDM window is CONTAMINATED (overlapping bursts -> SC metric ~0.5 vs clean
+	// ~0.997), so demodulating frame 0 at the announced config yields a garbage channel estimate
+	// that the pre-LDPC SKIP-VAR gate (telecom_system.cc:2907) rejects -> 0 forward decode ->
+	// PARTIAL -> SACK-retx storm -> MORE re-airs (self-reinforcing wedge at CONFIG_0). Gate the
+	// adopt on the snapshot's NORMALIZED SC metric (>= 0.9, the "prominent peak" discriminant the
+	// codebase already cites at arq_common.cc:12586): a contaminated lock is REJECTED here (no
+	// follow) so the RX retries next pass on a fresher (clean single-burst) window. The snapshot
+	// context is set by the snapshot/capture callers; if absent (e.g. the down-ladder adopt,
+	// which already self-gates on a CRC/LDPC decode — INV-C) the gate passes through. Only
+	// applies to an OFDM-target adopt (the contamination is an OFDM-acquisition problem); a
+	// robust/MFSK target is judged by its own machinery. Feature-gated (legacy byte-identical).
+	if(is_ofdm_config(followed_config)
+	   && inband_adopt_gate_snapshot != NULL
+	   && inband_adopt_gate_snapshot_len > 0
+	   && !inband_adopt_metric_gate_ok(inband_adopt_gate_snapshot,
+	                                   inband_adopt_gate_snapshot_len, followed_config))
+	{
+		// Contaminated / overlapping re-air window: DO NOT adopt. Stay at the current config
+		// and retry on the next pass (the window refills toward a clean single-burst snapshot).
+		printf("[INBAND-RX] CONFIG_TAG follow DEFERRED: announced CONFIG_%d but the snapshot OFDM "
+			"lock is CONTAMINATED (< clean-lock threshold) — not adopting; retry next pass\n",
+			followed_config);
+		fflush(stdout);
+		return 0;
+	}
+
 	// FOLLOW (design §3.2 outcome 1): switch to the announced config. This single
 	// ARQ call writes current_configuration (arq_common.cc) AND reconfigures the PHY
 	// twin telecom_system->current_configuration (telecom_system.cc) coherently, so
@@ -3706,9 +3735,16 @@ int cl_arq_controller::inband_detect_follow_from_capture(uint8_t expect_bsi_lsb,
 		return 0;   // no burst in the tail -> no tag (steady state / lost tag = Stage 4)
 
 	// Wrap-decode + bind gates + FOLLOW (load_configuration both copies + HINGE port).
+	// CLEAN-LOCK ADOPT GATE (data-flow-inband-adopt-metric-gate.md §2): the captured ring TAIL
+	// in ready_to_process_passband_delayed_data IS the OFDM acquisition window — publish it so
+	// the adopt-commit point can reject a contaminated re-air. Cleared after the follow.
 	int followed_cfg = current_configuration;
+	inband_adopt_gate_snapshot     = telecom_system->data_container.ready_to_process_passband_delayed_data;
+	inband_adopt_gate_snapshot_len = tail_samples;
 	int followed = detect_and_follow_config_tag(energies.data(), chips, n_syms,
 		expect_bsi_lsb, expect_parity, &followed_cfg);
+	inband_adopt_gate_snapshot     = NULL;
+	inband_adopt_gate_snapshot_len = 0;
 	if(out_followed_config) *out_followed_config = followed_cfg;
 	return followed;
 }
@@ -3782,10 +3818,17 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 	// Wrap-decode (bsi + parity UNBOUND) + FOLLOW (load_configuration both copies + the
 	// HINGE port). detect_and_follow_config_tag no-ops if the decoded cfg == current
 	// (a stale re-detect of the previous tag), so a no-change is safe.
+	// CLEAN-LOCK ADOPT GATE (data-flow-inband-adopt-metric-gate.md §2): publish the SAME
+	// snapshot the OFDM acquisition is about to consume so the adopt-commit point can judge
+	// the OFDM lock quality and reject a contaminated re-air window. Cleared after the follow.
 	int cfg_before = current_configuration;
 	int followed_cfg = current_configuration;
+	inband_adopt_gate_snapshot     = snapshot;
+	inband_adopt_gate_snapshot_len = len;
 	int followed = detect_and_follow_config_tag(energies.data(), chips, n_syms,
 		/*expect_bsi_lsb=*/0xFF, /*expect_parity=*/0xFF, &followed_cfg);
+	inband_adopt_gate_snapshot     = NULL;
+	inband_adopt_gate_snapshot_len = 0;
 
 	// On a REAL switch, RE-STAGE the saved capture into the member buffer the follow
 	// just (re)allocated at the new config. NOTE: after the switch `snapshot` (the OLD
@@ -4011,6 +4054,63 @@ bool cl_arq_controller::inband_adopt_ring_durability_defeat()
 		inband_adopt_ring_durability_defeat_cached = (e && *e && atoi(e) != 0) ? 1 : 0;
 	}
 	return inband_adopt_ring_durability_defeat_cached == 1;
+}
+
+// IN-BAND ADOPT CLEAN-LOCK METRIC GATE — data-flow-inband-adopt-metric-gate.md §2/§3.
+// Returns true if the in-band tag-follow adopt MAY proceed (the OFDM lock over the captured
+// snapshot is CLEAN, normalized Schmidl-Cox metric >= threshold), false to REJECT (the window
+// is a contaminated / overlapping re-air, metric < threshold → no follow → retry next pass).
+// Feature-gated: when the in-band feature is off this is a no-op true (legacy byte-identical).
+// The DEFEAT knob (MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT=1) bypasses the gate (always true)
+// so the regression can reproduce the pre-fix contaminated-adopt fail-before on the SAME binary.
+bool cl_arq_controller::inband_adopt_metric_gate_ok(const double* snapshot, int len,
+                                                    int announced_cfg)
+{
+	// Off path: never gate (legacy is byte-identical — this is only called from inband paths,
+	// but be defensive so an accidental call can never alter non-inband behavior).
+	if(!inband_rate_feature_enabled()) return true;
+	if(telecom_system == NULL) return true;
+
+	// DEFEAT knob (cached): skip the gate entirely (PRE-FIX behavior — adopt the contaminated lock).
+	if(inband_adopt_metric_gate_defeat_cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT");
+		inband_adopt_metric_gate_defeat_cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	if(inband_adopt_metric_gate_defeat_cached == 1)
+	{
+		printf("[INBAND-RX] ADOPT-METRIC-GATE DEFEAT: gate bypassed (contaminated lock would be "
+			"adopted — fail-before arm)\n");
+		fflush(stdout);
+		return true;
+	}
+
+	// Threshold (cached): default 0.9 — the "prominent peak" discriminant the codebase already
+	// cites (arq_common.cc:12586: real preambles run metric >= 0.9). Sweep-only env override.
+	if(inband_adopt_metric_gate_threshold_cached < 0.0)
+	{
+		double t = 0.9;
+		const char* e = std::getenv("MERCURY_INBAND_ADOPT_METRIC_GATE");
+		if(e && *e) { double v = atof(e); if(v > 0.0 && v <= 1.0) t = v; }
+		inband_adopt_metric_gate_threshold_cached = t;
+	}
+	double thr = inband_adopt_metric_gate_threshold_cached;
+
+	double m = telecom_system->inband_snapshot_clean_lock_metric(snapshot, len, announced_cfg);
+	if(m < 0.0)
+	{
+		// Not applicable (MFSK / no snapshot / not an OFDM geometry) — do NOT block the adopt
+		// (the gate only protects the OFDM acquisition; a non-OFDM adopt is judged elsewhere,
+		// e.g. the down-ladder CRC, INV-C). Pass through.
+		return true;
+	}
+
+	bool ok = (m >= thr);
+	printf("[INBAND-RX] ADOPT-METRIC-GATE: snapshot Schmidl-Cox metric=%.3f (thr=%.2f) -> %s "
+		"adopt CONFIG_%d\n", m, thr, ok ? "CLEAN-LOCK ADOPT" : "CONTAMINATED REJECT (retry)",
+		announced_cfg);
+	fflush(stdout);
+	return ok;
 }
 
 // RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §7 / §8 [?]): seat the primary capture
