@@ -493,3 +493,52 @@ STATUS: FIX-1 implemented + tested. The next step (a long realtime A/B, redesign
 OWNER-driven, NOT run here. If the A/B shows the climb is now too SLOW (deferred too long) or the
 batch-sizing root (§9.2) still binds after the orphan is removed, that is a SEPARATE, owner-ratifiable
 lever — not a same-session speculative chain (CLAUDE.md §5).
+
+## §11 FIX-2 ("re-seat data_batch_size=1 on the unilateral climb") — MECHANISM FALSIFIED, NOT IMPLEMENTED (2026-06-24, STEP-1 verification this session)
+
+A FIX-2 session was tasked with: "the redesign's `inband_unilateral_config_change()` (`arq_common.cc:3111`)
+refills the TX FIFO at the new config but NEVER calls `set_data_batch_size(1)`, so it carries the PRIOR
+rung's MULTI-FRAME batch geometry across the climb; legacy's SET_CONFIG ACK-apply re-seats a 1-frame batch
+per OFDM rung; re-seat to 1 to match legacy." STEP-1 firsthand verification FALSIFIES the mechanism on
+THREE counts (source+log cited, this HEAD 7bba3ed):
+
+- ~~"the unilateral path NEVER re-seats data_batch_size, so it carries the prior rung's geometry"~~ — FALSE.
+  `inband_unilateral_config_change()` calls `load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES)`
+  (`arq_common.cc:3153`). `load_configuration` does NOT early-return for PHYSICAL_LAYER_ONLY (the `if(level!=FULL)`
+  at `:2077` is only a canary check; the body continues). Its OFDM batch-scaling block (`:2221-2237`,
+  NOT gated on `level==FULL`) calls `set_data_batch_size(fixed_batch)` with `fixed_batch = radio_batch_size`
+  (=25) clamped to `max_batch = round(30000/message_transmission_time_ms)`. So the unilateral path RE-SEATS
+  `data_batch_size` from the NEW config's frame time, exactly like a FULL load. NO prior geometry is carried.
+
+- ~~"legacy's SET_CONFIG ACK-apply re-seats a 1-frame batch per OFDM rung"~~ — FALSE. The legacy SET_CONFIG
+  ACK-apply (`arq_commander.cc:6516-6591`) calls the SAME `load_configuration(data_configuration,
+  PHYSICAL_LAYER_ONLY, YES)` (`:6526`) and refills the FIFO with the VERBATIM-identical loop
+  (`:6573-6591` == the unilateral `arq_common.cc:3155-3174`). It NEVER calls `set_data_batch_size(1)`.
+  Legacy and the redesign's unilateral path are BYTE-IDENTICAL w.r.t. batch sizing. There is no per-rung
+  `set_data_batch_size(1)` re-seat in legacy for the redesign to "miss".
+
+- VERIFIED on the wire (`_msab/keystone/_logsnap`, TX-PEAK `frames=N cfg=` histograms): BOTH arms air
+  `frames=6 cfg=0` (2× each). Legacy ADDITIONALLY reaches `frames=1` at cfg=0(1×)/4/13/14/15/16 and
+  `frames=25` at cfg=15/16. The redesign NEVER reaches `frames=1` at any OFDM rung; it airs `frames=6 cfg=0`
+  then `frames=24 cfg=3`. So the `frames=` divergence is REAL but its cause is NOT a `data_batch_size`
+  re-seat — `frames = message_batch_counter_tx = min(data_batch_size, #ADDED_TO_LIST messages available)`
+  (the TX batch-fill `arq_commander.cc:1941-2026`, capped at `:1945`/`:2003`/`:2022`). Legacy airs `frames=1`
+  at the transient OFDM rungs because it CLIMBS THROUGH them fast (the SET_CONFIG fast dedicated control-ACK)
+  with its FIFO mostly drained at each step (only ~1 frame queued); the redesign WEDGES at cfg=0/cfg=3 with a
+  full 6/24-frame backlog and thus packs the full `data_batch_size` cap.
+
+CONSEQUENCE — FIX-2 as specified would NOT help and is a SYMPTOM band-aid (CLAUDE.md §2):
+re-seating `data_batch_size=1` on the unilateral climb would force the redesign to deliver its real 6/24-frame
+backlog as 6/24 SEPARATE 1-frame batches, each with its OWN reverse-SACK turnaround — MORE turnarounds at the
+slow rung, not fewer — and the frame-0 Schmidl-Cox seam would then hit EVERY 1-frame batch (each batch's sole
+frame IS the lead frame), changing the rolling-partial character the existing FIX-1 / 2801d7c fixes rely on.
+The `frames=` count is a CONSEQUENCE of the wedge (slow climb + backlog accumulation), not its cause. The
+binding root remains the one §8.1/§9.2 already named: the reverse data-ACK/SACK DELIVERY LOOP at the climbed
+rung (the §8 +1-climb already suppresses the elevator JUMP; the residual is delivery throughput / climb speed),
+NOT a forward batch-geometry re-seat.
+
+STATUS: NO FIX-2 implemented. The prompted mechanism is falsified by firsthand source+log verification;
+implementing the re-seat would be the serial-misdiagnosis the memory BENCH-CLAIM guard warns against
+(the root has shifted repeatedly this session). Re-seating forward batch geometry per rung remains an
+owner-ratifiable lever ONLY if re-framed against the DELIVERY-loop root — but it must NOT be sold as
+"matching legacy's per-rung 1-frame re-seat", because legacy has no such re-seat.
