@@ -335,3 +335,61 @@ pass-after on the SACK_RSP-applied / nAcked-advance at the climbed rung.
 - FAIL-BEFORE (`-DINBAND_PLUS1_CLIMB_FAILBEFORE`, clean build): in-band A JUMPS 0→3 (got=3, the wedge
   reproduced) and E JUMPS to CONFIG_8 — the exact elevator jumps that strand the reverse SACK. MEASURED.
 - Full `--test` suite: [result recorded in the commit]; production byte-identical off the flag.
+
+## §9 CORRECTION — fix B ("make the CMD apply the OFDM SACK_RSP") is FALSIFIED; the §7 SACK_RSP framing is a MISREAD (VERIFIED 2026-06-24, `_msab/keystone/_logsnap/modem_064839.log` redesign vs `modem_032735.log` legacy + `_msab/sackdeliv/aggregate.json` trustworthy A/B)
+
+A fix-B session was tasked to "make the CMD APPLY the reliable OFDM SACK_RSP the RSP already sends" so
+`nAcked_data` advances. STEP-1 verification of the two cited logs FALSIFIES the premise. The §7.1 line
+"the RSP DID dispatch the reliable OFDM SACK_RSP transport ... but the CMD NEVER reflects it" is a
+MISREAD of the `[ACK-GATE-V2] dispatching OFDM SACK_RSP` log. Strike it:
+
+- ~~"the RSP dispatches a reliable OFDM SACK_RSP that the CMD ignores"~~ — FALSE. The
+  `[ACK-GATE-V2] dispatching OFDM SACK_RSP (...)` line (`arq_responder.cc:2212`) is the per-batch
+  ACK-GATE **announce**, printed BEFORE the transport-choice branch. The RSP then PREFERS the MFSK
+  suffix (`arq_responder.cc:2239/2290`: `used_mfsk_path`; `send_sack_v2_frame` is the FALLBACK, taken
+  only when the suffix path returns 0). On the wire BOTH arms used the MFSK suffix EXCLUSIVELY:
+  `[TX-ACK-SACK] ... via MFSK suffix` redesign 7×, legacy 7×; the actual OFDM SACK_RSP wire-TX
+  (`TX-SACK-V2` / `synthetic OFDM SACK_RSP TX`, `arq_responder.cc:3950`) fired **0×** in BOTH. No
+  SACK_RSP frame is ever put on the wire in either arm.
+- The CMD's OFDM SACK_RSP apply path EXISTS and is reachable (`arq_commander.cc:3923-3998`, entered
+  on `!mfsk_handled_this_poll` at `:3847`, prints `[CMD-SACK-V2] decoded SACK_RSP ... applying` at
+  `:3989`). It fired **0×** in BOTH arms — because the RSP sent no SACK_RSP frame to apply, not
+  because the CMD ignores it. **Legacy DELIVERS (2693 B median, climbs to CONFIG_3-15) WITHOUT EVER
+  APPLYING AN OFDM SACK_RSP.** So routing the redesign's bitmap onto SACK_RSP cannot make it match
+  legacy — legacy doesn't use that transport.
+
+### §9.1 The ACTUAL divergence (the reverse data-ACK that advances `nAcked_data` is the MFSK suffix in BOTH arms; the redesign's batch is too BIG for it)
+The reverse data-SACK that advances `nAcked_data` is the **robust-MFSK ACK-SACK suffix**, applied via
+`[CMD-MFSK-ACK-SACK] CLEAN/PARTIAL` (`arq_commander.cc:3714+`/`:3782`/`:3825`), in BOTH arms.
+MEASURED:
+- LEGACY: **5 CLEAN, 0 PARTIAL** MFSK-ACK-SACK → `nAcked_data` advances steadily 0→15; suffix
+  `peak_matched` reaches **7/7**. Legacy airs **`frames=1` at EVERY OFDM rung** (`TX-PEAK ... frames=1
+  cfg=0/15/16`), so the reverse turnaround is short and the GF(16)+CRC-12 suffix decodes cleanly.
+- REDESIGN: **3 CLEAN + 2 PARTIAL** → `nAcked_data` sticks at **14**, then suffix CRC starts failing
+  (`[CMD-ACK-PAT] Timeout: no ACK detected, peak_matched=3/7..5/7`, never above 5/7) → `[BREAK] Block
+  failure at config 3` (T+238.801). The redesign airs **`frames=24 cfg=3`** and **`frames=6 cfg=0`**
+  — the elevator JUMP (§8 root, the SNR-elevator `arq_commander.cc:5657`) packs a CONFIG_0-sized
+  24-frame batch onto the slow CONFIG_3 rung, whose long forward airtime/turnaround overwhelms the
+  (otherwise-working) suffix transport.
+
+CONCLUSION: the binding constraint is the **forward batch size / turnaround at the climbed rung**
+(the §8 elevator-jump root), NOT the reverse-SACK transport selection. Both arms share the identical
+MFSK-suffix reverse transport; legacy survives it by airing 1-frame batches, the redesign breaks it by
+airing giant batches. Fix B (route the bitmap via OFDM SACK_RSP) attacks a transport that (a) is never
+on the wire and (b) legacy never needs — a symptom band-aid (CLAUDE.md §2) and the exact
+serial-misdiagnosis the memory BENCH-CLAIM guard warns against.
+
+### §9.2 Status — NO fix B implemented; the open lever is the §8 +1-climb's batch sizing
+The §8 +1-climb (HEAD `65bb60b`) suppresses the elevator JUMP (CONFIG_0→3 → CONFIG_0→1), but the
+`_msab/sackdeliv` trustworthy A/B (this HEAD) still shows REDESIGN rx median **77 B** / CONFIG_0×5 +
+null×1, all stalled, vs LEGACY **2693 B** / CONFIG_3-15 (`rx_median_delta_pct=-97.1`). So even with
+the +1 climb the redesign does not reach the OFDM rungs in budget — the climb is too slow and/or the
+CONFIG_0 batch itself is multi-frame (`frames=6 cfg=0`) where legacy airs `frames=1`. The real next
+lever is **forward batch SIZING on the in-band climb** (match legacy's 1-frame batches at a fresh OFDM
+rung so the existing suffix transport survives the turnaround) — NOT a reverse-transport swap. This is
+the same "giant-batch turnaround" root §8.1 already named; it is a SEPARATE, owner-ratifiable change,
+not a same-session speculative chain (CLAUDE.md §5).
+
+This is an **architecture-shaped** boundary: the in-band unilateral climb tends to carry the prior
+rung's batch geometry across a rung change, where legacy's SET_CONFIG handshake re-seats a 1-frame
+batch at the new rung. Whether to re-seat the in-band batch geometry per rung is an OWNER decision.
