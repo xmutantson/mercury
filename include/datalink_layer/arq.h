@@ -3494,6 +3494,14 @@ public:
   // inband_last_confirmed_config, and STOP re-emitting. No-op when not armed / stale bsi.
   // Returns true if it disarmed (confirmed). Called from every SACK accept site.
   bool inband_retag_confirm_from_sack(int rx_bsi);
+  // KEYSTONE (data-flow-inband-tier-crossing.md §6): DATA-DECOUPLED intra-tier CLIMB confirm.
+  // When an EMITTED CLIMB re-tag is armed and the robust BASE ACK pattern matched
+  // (mfsk_matched >= ack_match_threshold), CONFIRM the climb even if the bsi-bearing SACK
+  // suffix CRC FAILED — the base pattern is DSP-more-robust than the suffix and proves the
+  // RX ACKed a forward batch at the announced config. Disarm post-state identical to
+  // inband_retag_confirm_from_sack. No-op when feature-off / not armed / not yet announced /
+  // sub-threshold / a DROP. Called at the CRC12-fail branch (arq_commander.cc:~3669).
+  bool inband_retag_confirm_from_base_pattern(int mfsk_matched, int ack_match_threshold);
   // D4 escalation: called after an armed re-tag emit. If the re-tag has reached the R
   // floor with NO confirm AND the announcement was a CLIMB-UP (the down-ladder cannot
   // rescue a lost climb), AUTO-DEMOTE to inband_last_confirmed_config via the chokepoint
@@ -3746,6 +3754,11 @@ public:
 
   // Directed regression for the tier-cross reverse-ACK pin (fails-before/passes-after).
   int test_inband_tier_cross_reverse_pin();
+
+  // KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
+  // data-decoupled intra-tier climb confirm (inband_retag_confirm_from_base_pattern).
+  // Fails-before under -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE.
+  int test_inband_basepattern_confirm();
 
   // IN-BAND TIER-CROSSING LIVENESS-GUARD EXEMPTION (data-flow-inband-tier-crossing.md §3
   // PART B). PURE: should the connect-liveness guard NOT accrue a stall this poll because a

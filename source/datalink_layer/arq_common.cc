@@ -3348,6 +3348,74 @@ bool cl_arq_controller::inband_retag_confirm_from_sack(int rx_bsi)
 	return true;
 }
 
+// KEYSTONE (data-flow-inband-tier-crossing.md §6) — the DATA-DECOUPLED intra-tier CLIMB
+// confirm. The reverse MFSK ACK the RX sends per data batch has a robust BASE tone-pattern
+// (correlation `mfsk_matched`, threshold `ack_match_threshold`=7/16, P(false)=2.4e-5/poll)
+// plus an appended bsi+bitmap SACK suffix (GF(16)+CRC-12). The CMD decodes both in one
+// `decode_ack_sack_from_passband` call (arq_commander.cc:3606), which returns mfsk_matched
+// INDEPENDENTLY of the suffix CRC. `inband_retag_confirm_from_sack` above only fires on the
+// CRC-VALID suffix path; on a marginal channel the suffix CRC FAILS (peak_matched 3-5/7,
+// reliability-map wf_97f50b94) while the base pattern still matches — so the intra-tier climb
+// confirm is LOST and the climb stalls at the robust tier / CONFIG_0 (the §19 deadbatch
+// REDESIGN rx-median-0-vs-legacy-5651 gap). The base pattern is DSP-MORE-ROBUST than the
+// suffix, and its match at-or-above ack_match_threshold PROVES the RX transmitted a reverse
+// ACK AFTER demodulating a forward batch sent at the announced config = followed.
+//
+// THE FIX: confirm an EMITTED CLIMB re-tag from the BASE pattern alone (decoupled from the
+// bsi-bearing suffix). The in-band tag still ANNOUNCES (unchanged); ONLY the CONFIRM moves
+// onto the base pattern. Lean reuse: no new RX TX (the RX already sends the ACK), no new
+// control op, no new wire frame, no new session-wide state — the disarm post-state is
+// IDENTICAL to inband_retag_confirm_from_sack.
+//
+// FALSE-CONFIRM GUARD (the base pattern carries NO bsi, so the at-or-after-anchor bsi test
+// cannot be used): require the climb's tag to have been EMITTED at least once
+// (inband_announce_bsi >= 0 — the first emit fills it, arq_common.cc:2769) AND the re-tag to
+// be a CLIMB-UP (the SAME predicate §1.8/D4 use). A pre-announce / DROP / disarmed state
+// returns false. An over-eager confirm (RX hadn't actually followed yet) is RECOVERABLE: it
+// only stops the re-emit; the next FRAME-UP stalls at the unfollowable rung and D4
+// auto-demotes to inband_last_confirmed_config (the existing net, :3361) — never a BREAK,
+// never below the floor (the SAME safety envelope §1.8's optimistic pipeline relies on).
+// `mfsk_matched`/`ack_match_threshold` are supplied by the caller (production passes the live
+// decode's mfsk_matched + telecom_system->ack_mfsk.ack_match_threshold; the test drives them).
+bool cl_arq_controller::inband_retag_confirm_from_base_pattern(int mfsk_matched,
+	int ack_match_threshold)
+{
+#ifdef INBAND_BASEPATTERN_CONFIRM_FAILBEFORE
+	// FAIL-BEFORE arm (the data-coupled redesign): the intra-tier climb confirm rides ONLY
+	// the CRC-valid bsi-bearing suffix (inband_retag_confirm_from_sack); the base pattern
+	// NEVER confirms. Pinning this to false reproduces the suffix-coupled stall; the directed
+	// test + the LIVE-PATH then cap at the robust tier / CONFIG_0 (fails-before).
+	(void)mfsk_matched; (void)ack_match_threshold;
+	return false;
+#else
+	if(!inband_rate_feature_enabled())
+		return false;
+	if(!inband_retag_armed || inband_announce_bsi < 0)
+		return false;   // disarmed OR not-yet-announced -> cannot confirm
+	if(ack_match_threshold <= 0 || mfsk_matched < ack_match_threshold)
+		return false;   // base ACK pattern absent / sub-threshold -> not a confirm
+	// CLIMB-UP only (the SAME predicate §1.8 / D4 use): a target with a HIGHER ladder index
+	// than the pre-announce config. A DROP/lateral does NOT confirm here (the down-ladder
+	// + the continuing re-tag own a drop, design §4.1(a)).
+	int pre_idx    = config_ladder_index(inband_pre_announce_config);
+	int target_idx = config_ladder_index(inband_retag_config);
+	if(!(pre_idx >= 0 && target_idx > pre_idx))
+		return false;
+
+	printf("[INBAND-TX] CONFIRMED followed CONFIG_%d via BASE ACK pattern (mfsk_matched=%d "
+		">= thr=%d; suffix CRC failed -> decoupled confirm) -> re-tag DISARMED\n",
+		inband_retag_config, mfsk_matched, ack_match_threshold);
+	fflush(stdout);
+
+	inband_last_confirmed_config = inband_retag_config;   // the D4 demote floor (provably reached)
+	inband_retag_armed   = false;
+	inband_retag_config  = CONFIG_NONE;
+	inband_announce_bsi  = -1;
+	inband_retag_count   = 0;
+	return true;
+#endif
+}
+
 // D4 ESCALATION (design §4.1(b)/§4.3). Called after an armed re-tag emit. The down-ladder
 // is DOWN-ONLY (it searches FULL_CONFIG_LADDER[cur-D .. cur]) so it CANNOT rescue a lost
 // CLIMB tag — only D1's repeat covers a climb, and if the climb is STILL un-confirmed

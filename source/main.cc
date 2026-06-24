@@ -793,6 +793,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_revpin;
                 failed += test_revpin.test_inband_tier_cross_reverse_pin();
             }
+            // KEYSTONE intra-tier base-pattern confirm regression (data-flow-inband-tier-
+            // crossing.md §6): an intra-tier CLIMB confirm must ride the robust BASE ACK
+            // pattern (decoupled from the marginal bsi-bearing SACK suffix) so the redesign
+            // climbs past CONFIG_0 toward legacy's OFDM rungs. PURE in-process synthetic-fire
+            // — permanent regression gate. Fails-before: -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE.
+            {
+                cl_arq_controller test_baseconfirm;
+                failed += test_baseconfirm.test_inband_basepattern_confirm();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -850,6 +859,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-reverse-pin") == 0) {
             cl_arq_controller ARQ_rp;
             int failed = ARQ_rp.test_inband_tier_cross_reverse_pin();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-basepattern-confirm : run ONLY the KEYSTONE intra-tier base-pattern
+        // climb-confirm regression (an emitted climb confirms from the robust BASE ACK pattern,
+        // decoupled from the bsi-bearing SACK suffix) and exit. Fast + deterministic; see
+        // arq_commander.cc::test_inband_basepattern_confirm. Build with
+        // -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE to reproduce the fails-before (suffix-coupled).
+        if (strcmp(argv[i], "--test-inband-basepattern-confirm") == 0) {
+            cl_arq_controller ARQ_bc;
+            int failed = ARQ_bc.test_inband_basepattern_confirm();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-adopt-preserve : run ONLY the robust->OFDM adopt live-burst PRESERVE

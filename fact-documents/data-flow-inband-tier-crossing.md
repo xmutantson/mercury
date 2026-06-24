@@ -365,3 +365,153 @@ PART B changes WHEN the liveness guard accrues a stall. Audit per CLAUDE.md §5:
   a DATA-phase livelock, not a control handshake) — but that BROADENS the liveness guard's
   exemption to shared state and warrants its own §5 audit + owner ratification, so it is
   deliberately LEFT for a follow-up rather than silently widened here.
+
+---
+
+## §6. THE KEYSTONE — generalize the decoupled-confirm to INTRA-tier promotes
+
+Status: PLAN (2026-06-23, `feat/inband-a3-decouple`, HEAD §19/§20). Owner-approved
+**Design B** (keep the in-band CONFIG_TAG for the ANNOUNCE; decouple ONLY the CONFIRM
+onto the robust base-pattern reverse ACK, NOT a new control op — lean reuse).
+
+### §6.0 Problem (VERIFIED, static reads + the §19 deadbatch A/B baseline)
+
+The §1 hybrid only decoupled the robust↔OFDM **tier-BOUNDARY** confirm (onto the legacy
+SET_CONFIG fast control-ACK). Every **intra-tier rung promote** (robust 100→101→102, the
+CONFIG_0 adoption, intra-OFDM 0→4→…) still confirms via `inband_retag_confirm_from_sack`
+(`arq_common.cc:3325`), which is called from EXACTLY THREE sites, ALL inside data-SACK
+decode handlers that require a CRC-valid bsi-bearing MFSK-ACK-SACK suffix:
+`arq_commander.cc:3758` (MFSK-ACK-SACK clean), `:3783` (partial), `:3953` (OFDM SACK_RSP).
+So the intra-tier confirm rides the **bsi-bearing reverse-MFSK-data-SACK suffix** — the
+GF(16)+CRC-12 coded block that decodes only at higher SNR than the base ACK pattern
+(keystone reliability map wf_97f50b94: peak_matched 3–5/7 sub-threshold on this channel →
+suffix CRC fails → no confirm → climb stalls). The §1.8 pipeline
+(`inband_pipeline_climb_active`, `arq_common.cc:3277`) only relaxes the FRAME-UP *advance*
+gate; it does NOT decouple the *confirm*. So the climb caps at the robust tier / CONFIG_0.
+
+§19 deadbatch A/B (`_msab/deadbatch/aggregate.json`, WGN SNR3k=40, N=3, this HEAD):
+REDESIGN rx median **0** B / max 113 B, final_config ROBUST_2|null (capped, never climbs);
+LEGACY rx median **5651** B / max **7475** B, final_config CONFIG_5|CONFIG_6 (climbs into
+OFDM). The gap is the data-COUPLED intra-tier confirm.
+
+### §6.1 The fix (Design B — lean reuse of the base ACK pattern)
+
+The reverse MFSK ACK the RX already sends per data batch has TWO parts: a robust BASE
+tone-pattern (correlation `mfsk_matched`, threshold `ack_match_threshold=7/16`,
+P(false)=2.4e-5/poll — `mfsk.cc:257/266`) and an APPENDED bsi+bitmap SACK suffix
+(GF(16)+CRC-12). The CMD decodes both in ONE call `decode_ack_sack_from_passband`
+(`arq_commander.cc:3606-3608`), which returns `mfsk_matched` (the base correlation)
+**independently of whether the suffix CRC passed**. Today the confirm fires only on the
+CRC-valid suffix path (`decoded==true`). When the suffix CRC fails (`:3659-3669` →
+`decoded=false`) the climb confirm is LOST even though `mfsk_matched>=threshold` PROVES
+the RX transmitted a reverse ACK *after* demodulating the forward batch at the announced
+config.
+
+**THE FIX:** add a decoupled confirm consumer — when a CLIMB re-tag is armed
+(`inband_retag_armed` && climb-up by ladder index) AND the base ACK pattern matched
+(`mfsk_matched >= ack_match_threshold`), CONFIRM the climb (disarm the re-tag) **even
+when the bsi-bearing suffix CRC failed**. The tag still ANNOUNCES (unchanged); only the
+CONFIRM moves off the suffix-decode onto the base pattern. This is DSP-justified (the base
+pattern is more robust than the suffix) and is a pure REUSE: no new RX TX (the RX already
+sends the ACK), no new control op, no new wire frame, no new session-wide state — just one
+new confirm helper + one hook at the CRC-fail branch.
+
+Because the base pattern carries NO bsi, the confirm cannot use the at-or-after-anchor bsi
+test (`inband_retag_confirm_from_sack`'s safety). Substitute the equivalent ANNOUNCE-EMITTED
+guard: only confirm via the base pattern once the climb's tag has actually been EMITTED at
+least once (`inband_announce_bsi >= 0` — the FIRST emit fills it, `arq_common.cc:2769`), so
+a base ACK for a pre-announce in-flight batch cannot false-confirm. New helper
+`inband_retag_confirm_from_base_pattern(int mfsk_matched, int ack_match_threshold)`
+(`arq_common.cc`, beside `inband_retag_confirm_from_sack`), gated on
+`inband_rate_feature_enabled()` && `inband_retag_armed` && climb-up &&
+`inband_announce_bsi >= 0` && `mfsk_matched >= ack_match_threshold`. Macro
+`INBAND_BASEPATTERN_CONFIRM_FAILBEFORE` pins it to `return false` (the data-coupled
+fails-before) for the directed test.
+
+Hook: `arq_commander.cc:~3669` (the CRC12-fail branch, after `decoded=false`), passing
+`mfsk_matched` and `telecom_system->ack_mfsk.ack_match_threshold`. Strictly additive —
+the existing CRC-valid suffix confirm at `:3758/:3783/:3953` is UNTOUCHED (it still fires
+first whenever the suffix decodes; the base-pattern path only adds a confirm when the
+suffix FAILED).
+
+### §6.2 Files
+- `arq_common.cc` — `inband_retag_confirm_from_base_pattern` (new helper; FAILBEFORE macro).
+- `arq_commander.cc:~3669` — the hook at the CRC12-fail branch.
+- `include/datalink_layer/arq.h` — declaration.
+- `arq_commander.cc::test_inband_basepattern_confirm` (new directed test) + `main.cc`
+  wiring (`--test` + `--test-inband-basepattern-confirm`).
+
+### §6.3 §5 cross-layer audit — `inband_retag_armed` / climb-confirm transport
+
+Shared session-wide state changed: the SET of signals that DISARM `inband_retag_armed`
+(the promote-confirm). Adds the base-pattern path; removes nothing.
+
+1. **Producers (writers) of the confirm/disarm:**
+   - `inband_retag_confirm_from_sack` (`arq_common.cc:3344-3347`) — the existing CRC-valid
+     suffix confirm. UNTOUCHED.
+   - `inband_retag_escalate_if_climb_exhausted` (`:3393-3396`) — the D4 auto-demote disarm
+     (R floor reached, no confirm). UNTOUCHED.
+   - `inband_unilateral_config_change` (`:3105`) — ARMS a fresh re-tag (a NEW climb/drop).
+   - Ctor/session reset (`:772`, `:6477`). UNTOUCHED.
+   - **NEW:** `inband_retag_confirm_from_base_pattern` — disarms on a base-pattern match
+     for an EMITTED climb whose suffix CRC failed.
+2. **Consumers (readers) of `inband_retag_armed`:** the emit gate (re-emit the tag while
+   armed), `inband_pipeline_climb_active` (`:3289`), `inband_retag_escalate_if_climb_exhausted`
+   (`:3365`), the down-ladder. All read "armed?"; the new producer only flips armed→false
+   on a PROVEN follow, identical post-state to the existing confirm (sets
+   `inband_last_confirmed_config`, clears `inband_retag_config/announce_bsi/count`).
+3. **Valid states / false-confirm guard:** before the FIRST emit `inband_announce_bsi==-1`
+   → the new helper returns false (cannot confirm a not-yet-announced climb). After emit,
+   `mfsk_matched>=7/16` proves a reverse ACK followed a forward batch at the announced
+   config. A base ACK for a STALE/pre-announce batch: the climb re-anchors `announce_bsi`
+   to the newest rung on each emit (`:3104-3108`/`:2769`), and a base match only proves
+   "an ACK came back," so the residual risk is confirming the climb one batch early — but
+   the climb is OPTIMISTIC by design (§1.8) and a too-early confirm only DISARMS the
+   re-emit; if the RX did NOT actually follow, the next batch's FRAME-UP stalls at the
+   unfollowable rung and D4 auto-demotes to `inband_last_confirmed_config` (the existing
+   net, `:3361`). So an over-eager base confirm is RECOVERABLE, never a BREAK, never below
+   the floor — same safety envelope §1.8 relies on.
+4. **(a) Tier-BOUNDARY confirm intact:** the boundary still routes via SET_CONFIG
+   (`arq_commander.cc:858`, §1) — it never reaches the intra-tier in-band confirm path, so
+   the base-pattern consumer cannot perturb it. The boundary's fast control-ACK is a
+   SEPARATE transport (`messages_control.status==ACKED`). UNCHANGED.
+5. **(b) Reverse-pin holds during an intra-OFDM climb:** an intra-OFDM promote is NOT a
+   tier crossing → `inband_tier_cross_reverse_config` returns CONFIG_NONE (`:3199-3200`) →
+   `reverse_configuration` is untouched by the pin and holds whatever the last cross/legacy
+   seed set (a robust rung after the robust→OFDM cross). The base-pattern confirm does NOT
+   write `reverse_configuration`. So the reverse stays robust while the forward climbs —
+   verified-by-construction (the pin is crossing-only; the new path touches neither).
+6. **(c) A REAL failed promote still demotes:** if the RX genuinely cannot follow the
+   climbed-to rung, NO reverse ACK comes back (`mfsk_matched < threshold`) → the new helper
+   returns false → no false confirm → the re-tag stays armed → D4 escalation
+   (`inband_retag_escalate_if_climb_exhausted`) reaches R and AUTO-DEMOTES to
+   last-confirmed (§4.1). The §20 CMD-side genuine block-failure demote (reverse-ACK decode
+   failure 13s apart) is on a DIFFERENT producer (the data-block-failure path) and is
+   UNTOUCHED. The down-ladder is intra-tier and UNTOUCHED.
+7. **(d) Legacy byte-identical:** the helper early-returns false when
+   `!inband_rate_feature_enabled()`; the hook is reached only after the existing inband
+   gates. Flag-off, the CRC12-fail branch runs verbatim (no confirm). The
+   `INBAND_BASEPATTERN_CONFIRM_FAILBEFORE` macro reproduces the data-coupled pre-fix.
+
+### §6.4 Tests
+- **Directed unit** `test_inband_basepattern_confirm` (`--test` +
+  `--test-inband-basepattern-confirm`): drives `inband_retag_confirm_from_base_pattern`
+  across the matrix — (armed climb, emitted, mfsk_matched>=7) → CONFIRM; (mfsk_matched<7)
+  → no confirm; (not emitted, announce_bsi<0) → no confirm; (armed DROP not climb) → no
+  confirm; (feature OFF) → no confirm. FAILS-BEFORE
+  (`-DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE`): the CONFIRM assertion FLIPS to FAIL.
+- **LIVE-PATH (realtime-sim) fail-before/pass-after:** WGN SNR3k=40 from start-cfg 100,
+  `MERCURY_INBAND_RATE=1`, `tools/sim/sim_arq_channel.py`. Fail-before
+  (`mercury_fb.exe`, `-DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE`): the intra-tier confirm
+  rides the suffix and STALLS (caps at robust/CONFIG_0). Pass-after (`mercury.exe`): the
+  confirm rides the base pattern → the climb proceeds past CONFIG_0 toward the OFDM rungs.
+- **A/B:** N=5 both arms, `_msab/keystone`, vs LEGACY's CONFIG_6/7475B (§19 baseline) /
+  the 7647B target — does REDESIGN now climb past CONFIG_0?
+
+### §6.5 Scope (NOT this change — the B/C/D follow-ons)
+This keystone is (A) of a 3–4 fix path. EXPECTED outcome: the climb UNBLOCKS but throughput
+may still trail legacy if forward frames drop (M1 SACK over-fire / SKIP-VAR poison; M2 ~73%
+coarse-acq miss). Those are B (coalesce the redesign SACK cadence + suppress
+prev-delivered-during-fresh-batch) and C (seat the CONFIG_0 forward capture ring at natural
+`load_configuration` geometry on in-band adoption), sequenced AFTER measuring how far (A)
+gets. One-change-one-test (§3) — B/C are NOT folded in here.

@@ -3669,6 +3669,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							}
 						}
 
+						// KEYSTONE (data-flow-inband-tier-crossing.md §6) — DATA-DECOUPLED
+						// intra-tier CLIMB confirm. The bsi-bearing SACK suffix decode just
+						// FAILED (decoded==false: CRC12 mismatch above, or the suffix never
+						// decoded), but the robust BASE ACK pattern (mfsk_matched) may still be
+						// present — and a base match at-or-above ack_match_threshold PROVES the
+						// RX ACKed a forward batch at the announced config = followed. So an
+						// EMITTED CLIMB re-tag is CONFIRMED here, DECOUPLED from the marginal
+						// suffix. STRICTLY ADDITIVE: the CRC-valid suffix confirm at :3758/:3783/
+						// :3953 is untouched and fires whenever the suffix decodes; this only adds
+						// a confirm on the suffix-FAILED path. No-op when inband off / not armed /
+						// not yet announced / sub-threshold / a DROP (helper self-gates).
+						if(!decoded)
+							inband_retag_confirm_from_base_pattern(mfsk_matched,
+								telecom_system->ack_mfsk.ack_match_threshold);
+
 						// STAGE 4e (D2 NACK first-class, INV-E3 mutual exclusion): the
 						// ACK/SACK decode MISSED (decoded==false). Try a NACK decode of the
 						// SAME reverse tail (type=MFSK_CTRL_NACK) ONLY now -- try ACK/SACK
@@ -9484,6 +9499,107 @@ int cl_arq_controller::test_inband_tier_cross_reverse_pin()
 	current_configuration = saved_rp_cfg;   // restore
 
 	printf("[TEST-REVPIN] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
+// DATA-DECOUPLED intra-tier CLIMB confirm. Drives inband_retag_confirm_from_base_pattern
+// across the matrix: an EMITTED CLIMB re-tag + base ACK pattern at-or-above threshold ->
+// CONFIRM (disarm), DECOUPLED from the bsi-bearing suffix; sub-threshold / not-yet-announced
+// / a DROP / feature-OFF -> NO confirm. Under -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE the
+// helper is pinned false (the data-coupled redesign) -> the CONFIRM assertion FLIPS to FAIL.
+int cl_arq_controller::test_inband_basepattern_confirm()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-BASECONFIRM] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-BASECONFIRM] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Force the feature ON (the cached member the gate reads) so the helper's
+	// inband_rate_feature_enabled() guard is satisfied without touching the environment.
+	int saved_inband = inband_rate_enabled;
+	inband_rate_enabled = 1;
+
+	const int THR = 7;   // mirrors ack_match_threshold (mfsk.cc:257/266, WB M>=16)
+
+	// Helper: arm an EMITTED CLIMB re-tag (pre=ROBUST_0 idx, target=ROBUST_2 idx > pre ->
+	// climb-up; announce_bsi>=0 => emitted), then drive the base-pattern confirm.
+	auto arm_emitted_climb = [&]() {
+		inband_retag_armed         = true;
+		inband_pre_announce_config = ROBUST_0;   // ladder idx 0
+		inband_retag_config        = ROBUST_2;   // ladder idx 2 (a climb-up)
+		inband_announce_bsi        = 5;          // >=0 => the tag was emitted at least once
+		inband_retag_count         = 1;
+		inband_last_confirmed_config = CONFIG_NONE;
+	};
+
+	// (1) Armed EMITTED climb + base pattern AT threshold -> CONFIRM (disarm). The
+	//     load-bearing case: under -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE this FLIPS to FAIL.
+	arm_emitted_climb();
+	bool c1 = inband_retag_confirm_from_base_pattern(THR, THR);
+	check(c1 == true && inband_retag_armed == false,
+		"emitted climb + base pattern>=thr: CONFIRM (re-tag DISARMED)",
+		(c1 && !inband_retag_armed) ? 1 : 0, 1);
+	check(inband_last_confirmed_config == ROBUST_2,
+		"confirm records last_confirmed_config = the climbed-to rung",
+		inband_last_confirmed_config, ROBUST_2);
+
+	// (2) Base pattern ABOVE threshold also confirms. (Call the side-effecting helper ONCE
+	//     and store — it DISARMS on confirm, so a second call would see the disarmed state.)
+	arm_emitted_climb();
+	bool c2 = inband_retag_confirm_from_base_pattern(THR + 3, THR);
+	check(c2 == true,
+		"emitted climb + base pattern>thr: CONFIRM", c2 ? 1 : 0, 1);
+
+	// (3) Base pattern SUB-threshold -> NO confirm (the genuine no-follow: no reverse ACK).
+	arm_emitted_climb();
+	bool c3 = inband_retag_confirm_from_base_pattern(THR - 1, THR);
+	check(c3 == false && inband_retag_armed == true,
+		"sub-threshold base pattern: NO confirm (re-tag STAYS armed -> D4 owns it)",
+		(!c3 && inband_retag_armed) ? 1 : 0, 1);
+
+	// (4) NOT yet announced (announce_bsi<0) -> NO confirm (cannot confirm an unemitted climb).
+	arm_emitted_climb();
+	inband_announce_bsi = -1;
+	bool c4 = inband_retag_confirm_from_base_pattern(THR, THR);
+	check(c4 == false, "not-yet-announced (announce_bsi<0): NO confirm", c4 ? 1 : 0, 0);
+
+	// (5) Armed re-tag is a DROP (target BELOW pre) -> NO confirm (the down-ladder owns a drop).
+	inband_retag_armed         = true;
+	inband_pre_announce_config = CONFIG_4;   // higher idx
+	inband_retag_config        = CONFIG_0;   // lower idx -> a DROP
+	inband_announce_bsi        = 5;
+	bool c5 = inband_retag_confirm_from_base_pattern(THR, THR);
+	check(c5 == false, "armed DROP (not a climb): NO confirm", c5 ? 1 : 0, 0);
+
+	// (6) NOT armed -> NO confirm.
+	inband_retag_armed = false;
+	bool c6 = inband_retag_confirm_from_base_pattern(THR, THR);
+	check(c6 == false, "re-tag not armed: NO confirm", c6 ? 1 : 0, 0);
+
+	// (7) Feature OFF -> NO confirm (legacy byte-identical), even for an emitted climb.
+	arm_emitted_climb();
+	inband_rate_enabled = 0;
+	bool c7 = inband_retag_confirm_from_base_pattern(THR, THR);
+	check(c7 == false, "feature OFF: NO confirm (legacy byte-identical)", c7 ? 1 : 0, 0);
+
+	// restore state
+	inband_rate_enabled          = saved_inband;
+	inband_retag_armed           = false;
+	inband_retag_config          = CONFIG_NONE;
+	inband_announce_bsi          = -1;
+	inband_retag_count           = 0;
+	inband_last_confirmed_config = CONFIG_NONE;
+
+	printf("[TEST-BASECONFIRM] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
