@@ -1,0 +1,391 @@
+{
+  "started_utc": "2026-06-24T07:05:21Z",
+  "channel": "SNR3k=40.0dB",
+  "profile": "wgn",
+  "target_bytes": 65536,
+  "secs": 200,
+  "realtime": 1,
+  "n_per_arm": 6,
+  "base_seed": 7000,
+  "bin": "./mercury.exe",
+  "interleaved": true,
+  "ftrt_fair_max": 0.85,
+  "arms": [
+    {
+      "label": "REDESIGN",
+      "env": {
+        "MERCURY_INBAND_RATE": "1"
+      },
+      "n": 6,
+      "deliver_rate": 0.0,
+      "delivered": 0,
+      "partial": 0,
+      "connect_rate": 1.0,
+      "stall_rate": 1.0,
+      "collapse_rate": 0.0,
+      "sustained_high_rate": 0.0,
+      "rx_bytes": {
+        "n": 6,
+        "min": 0,
+        "median": 87.0,
+        "mean": 69.8,
+        "max": 117,
+        "stdev": 46.1
+      },
+      "wire_bps_airtime": {
+        "n": 6,
+        "min": 0.0,
+        "median": 6.8,
+        "mean": 5.3,
+        "max": 8.8,
+        "stdev": 3.5
+      },
+      "final_config_modes": {
+        "CONFIG_0": 4,
+        "ROBUST_0": 1,
+        "null": 1
+      },
+      "bounded_by_modes": {
+        "virtual_secs": 6
+      },
+      "ftrt": {
+        "n": 6,
+        "min": 1.0,
+        "median": 1.0,
+        "mean": 1.0,
+        "max": 1.0,
+        "stdev": 0.0
+      },
+      "n_ftrt_fair": 0,
+      "n_ftrt_starved": 6,
+      "ftrt_fair_rate": 0.0,
+      "rx_bytes_fair": {
+        "n": 0,
+        "min": null,
+        "median": null,
+        "mean": null,
+        "max": null,
+        "stdev": null
+      },
+      "deliver_rate_fair": null,
+      "delivered_fair": 0,
+      "final_config_modes_fair": {}
+    },
+    {
+      "label": "LEGACY",
+      "env": {},
+      "n": 6,
+      "deliver_rate": 0.0,
+      "delivered": 0,
+      "partial": 0,
+      "connect_rate": 1.0,
+      "stall_rate": 0.0,
+      "collapse_rate": 0.0,
+      "sustained_high_rate": 0.5,
+      "rx_bytes": {
+        "n": 6,
+        "min": 101,
+        "median": 101.0,
+        "mean": 101,
+        "max": 101,
+        "stdev": 0.0
+      },
+      "wire_bps_airtime": {
+        "n": 6,
+        "min": 6.8,
+        "median": 7.5,
+        "mean": 7.5,
+        "max": 8.2,
+        "stdev": 0.7
+      },
+      "final_config_modes": {
+        "CONFIG_16": 3,
+        "CONFIG_4": 3
+      },
+      "bounded_by_modes": {
+        "virtual_secs": 6
+      },
+      "ftrt": {
+        "n": 6,
+        "min": 1.0,
+        "median": 1.0,
+        "mean": 1.0,
+        "max": 1.0,
+        "stdev": 0.0
+      },
+      "n_ftrt_fair": 0,
+      "n_ftrt_starved": 6,
+      "ftrt_fair_rate": 0.0,
+      "rx_bytes_fair": {
+        "n": 0,
+        "min": null,
+        "median": null,
+        "mean": null,
+        "max": null,
+        "stdev": null
+      },
+      "deliver_rate_fair": null,
+      "delivered_fair": 0,
+      "final_config_modes_fair": {}
+    }
+  ],
+  "comparisons": [
+    {
+      "arm_a": "REDESIGN",
+      "arm_b": "LEGACY",
+      "n_per_arm": 6,
+      "deliver_rate_a": 0.0,
+      "deliver_rate_b": 0.0,
+      "deliver_rate_gap_pp": 0.0,
+      "deliver_rate_noise_band_pp": 0.0,
+      "deliver_rate_separated": false,
+      "rx_median_a": 87.0,
+      "rx_median_b": 101.0,
+      "rx_median_delta_pct": -13.9,
+      "rx_range_a": [
+        0,
+        117
+      ],
+      "rx_range_b": [
+        101,
+        101
+      ],
+      "rx_ranges_overlap": true,
+      "verdict": "OVERLAP (inconclusive at this N)",
+      "separate": false
+    }
+  ],
+  "comparisons_loadfair": [
+    {
+      "arm_a": "REDESIGN",
+      "arm_b": "LEGACY",
+      "n_fair_pairs": 0,
+      "verdict": "NO_FAIR_PAIRS (machine load-starved; A/B not trustworthy \u2014 need FTRT<=fair-max headroom on BOTH arms)",
+      "trustworthy": false
+    }
+  ],
+  "note": "Realtime-sim CONFIG_0 gearshift is faithfully nondeterministic (2-process concurrency); single samples at a marginal crossing are coin flips. Compare by DISTRIBUTION. OVERLAP=inconclusive. FTRT=wall/virtual: a LOAD-STARVED sample (FTRT>ftrt_fair_max) stalls regardless of feature (A/B run-order confound) and is excluded from the LOAD-FAIR verdict \u2014 the deconfounded comparison.",
+  "per_sample": {
+    "REDESIGN": [
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 97,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 7.5,
+        "final_config": "CONFIG_0",
+        "collapse": false,
+        "stall": true,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.8,
+        "ftrt": 1.0252,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 15,
+        "md5_match": false,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 1.2,
+        "final_config": "ROBUST_0",
+        "collapse": false,
+        "stall": true,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.9,
+        "ftrt": 1.0257,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 117,
+        "md5_match": false,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 8.8,
+        "final_config": "CONFIG_0",
+        "collapse": false,
+        "stall": true,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.9,
+        "ftrt": 1.0257,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 77,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 6.1,
+        "final_config": "CONFIG_0",
+        "collapse": false,
+        "stall": true,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.8,
+        "ftrt": 1.0252,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 0,
+        "md5_match": false,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 0.0,
+        "final_config": null,
+        "collapse": false,
+        "stall": true,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.8,
+        "ftrt": 1.0252,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 113,
+        "md5_match": false,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 8.4,
+        "final_config": "CONFIG_0",
+        "collapse": false,
+        "stall": true,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.9,
+        "ftrt": 1.0257,
+        "ftrt_fair": false
+      }
+    ],
+    "LEGACY": [
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 101,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 8.2,
+        "final_config": "CONFIG_16",
+        "collapse": false,
+        "stall": false,
+        "sustained_high": true,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.8,
+        "ftrt": 1.0252,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 101,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 6.9,
+        "final_config": "CONFIG_4",
+        "collapse": false,
+        "stall": false,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.8,
+        "ftrt": 1.0252,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 101,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 8.1,
+        "final_config": "CONFIG_16",
+        "collapse": false,
+        "stall": false,
+        "sustained_high": true,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.8,
+        "ftrt": 1.0252,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 101,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 8.2,
+        "final_config": "CONFIG_16",
+        "collapse": false,
+        "stall": false,
+        "sustained_high": true,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.9,
+        "ftrt": 1.0257,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 101,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 6.8,
+        "final_config": "CONFIG_4",
+        "collapse": false,
+        "stall": false,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.9,
+        "ftrt": 1.0257,
+        "ftrt_fair": false
+      },
+      {
+        "ok_json": true,
+        "connected": true,
+        "delivered": false,
+        "partial": false,
+        "rx_bytes": 101,
+        "md5_match": true,
+        "bounded_by": "virtual_secs",
+        "wire_bps_airtime": 6.9,
+        "final_config": "CONFIG_4",
+        "collapse": false,
+        "stall": false,
+        "sustained_high": false,
+        "virtual_secs": 202.7,
+        "wall_secs": 207.9,
+        "ftrt": 1.0257,
+        "ftrt_fair": false
+      }
+    ]
+  },
+  "finished_utc": "2026-06-24T07:47:42Z"
+}
