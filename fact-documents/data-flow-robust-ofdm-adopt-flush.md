@@ -739,3 +739,63 @@ the session still accrues `DOWN-LADDER reached SESSION_DEAD_BATCHES=3 -> TERMINA
 acquisition reliability / the re-aired-burst sliding-window miss of the fix-#1c family, or the dead-batch
 streak threshold), NOT the descrambler decode bug this section fixed. [?] Next: characterize why, with
 the descrambler fixed, the CONFIG_0 batch DECODE RATE still trips SESSION_DEAD_BATCHES (the climb layer).
+
+
+## §18 The climb-killer: PARTIAL-batch SACK-turnaround feeds a FALSE dead-batch BREAK (VERIFIED root; clean fix NOT YET found — REPORT+STOP)
+
+§17 fixed the descrambler so CONFIG_0 DECODES; §17.6 flagged the session still BREAKs to ROBUST_2
+before climbing. §18 is the VERIFIED root of that BREAK. A first fix attempt was FALSIFIED (§18.3); the
+clean fix is still open — reported per CLAUDE.md §2 / the coordinator's "stop if the root isn't clean."
+
+### §18.1 The VERIFIED sequence (`_residual/v18.arqlog`, descrambler-fixed redesign, seed 2001)
+
+1. CONFIG_0 batch_seq_id=3 receives **5 of its 6 frames** (id 1–5, seq 1–5; frame 0/seq 0 was missed) —
+   all clean OFDM-OK at ring=217/Nofdm=292, var~0.036 (T+0163.1 … T+0165.5).
+2. T+0165.741 `[ACK-GATE] SACK: received 5/6 (expected 6)` → the RSP dispatches a PARTIAL SACK
+   (`bitmap=0x3e`, frame 0 missing) and TRANSMITS it as an MFSK reverse-ACK (`TX-MFSK-ACK-SACK`, ~1.1 s
+   of audio, T+0165.7 … T+0166.6).
+3. During that partial-SACK TX TURNAROUND the RSP is not capturing the forward CONFIG_0 burst; when it
+   resumes, the down-ladder bank builds (`Loading configuration 100/101/102/0 (was -1)` trial decoders)
+   and the forward read finds the burst INCOMPLETE/absent (mid re-air).
+4. The inband down-ladder fires 3× in ~0.45 s (`DOWN-LADDER: no config in window [0..3] decoded
+   (1 attempts)` → `total-loss batch 1/3 → 2/3 → 3/3`) → `SESSION_DEAD_BATCHES=3 → TERMINAL BREAK →
+   ROBUST_0` (arq_common.cc:4783/4789). The session demotes ROBUST_2/53 B and never climbs.
+
+So the dead-batch streak is fed by the **PARTIAL-batch → reverse-SACK turnaround → cannot-re-acquire**
+window, NOT a clean total-loss. A CONFIG_0 batch is ~12 s; 3 ticks in <0.5 s are turnaround RX-loop
+passes mis-counted as 3 dead BATCHES. Legacy never runs the inband down-ladder, so it never false-ticks
+→ it climbs 0→16 (geomfix2 A/B: legacy reaches CONFIG_16/7647 B; all 5 REDESIGN samples
+peak=CONFIG_0/53–77 B/ROBUST_2, rc=0 bounded=virtual_secs — a STABLE result, not a harness artifact).
+
+### §18.2 §5 / channel / harness notes (VERIFIED)
+
+- geomfix2 ran `--snr 40` (the sim's --snr IS SNR3k); a very clean channel where legacy reaches
+  CONFIG_16. The prior `_abrun/legacy.json` 5645 B baseline was `--snr 12` — a DIFFERENT channel, NOT
+  the comparable. The right comparable for "does the redesign climb" is the SAME --snr 40, both arms.
+- LEGACY-ARM HARNESS NOTE [?]: geomfix2 LEGACY shows `bounded=proc_died` (LEGACY 1: 7647 B/CONFIG_16 —
+  climbed the FULL ladder [0,4,10..16], md5 ok — then a process exited cleanly, which the monitor
+  LABELS proc_died at sim_arq_channel.py:863–866) and one `final=None`/0 B early death. So the legacy
+  "missing from aggregates" is mostly a COSMETIC monitor-labeling issue (a clean CMD exit counted as a
+  death) plus genuine occasional early death — worth a separate harness fix so both-arms aggregates are
+  clean. The legacy CLIMB capability itself is confirmed.
+
+### §18.3 ~~Fix attempt A (frame_data_missing gate) — FALSIFIED~~
+
+~~Clear rx_fresh_window_decoded_this_pass on a receive_stats.frame_data_missing pass.~~ FALSIFIED on the
+live path (`_residual/v18.arqlog`): the validation run STILL ended ROBUST_2/53 B with the same 3-tick →
+BREAK. The gate-firing pass's PRIMARY decode does NOT carry frame_data_missing — during the partial-SACK
+turnaround the staged forward window is empty/noise (a genuine no-frame pass), and the "frame incomplete"
+lines near the tick are the DOWN-LADDER's own CONFIG_0 trial (count=310, the wrong-geometry trial bank),
+not the primary. So gating the primary on frame_data_missing is a no-op for this trigger.
+
+### §18.4 Direction for the real fix (OPEN — needs design, not a point patch)
+
+The down-ladder dead-batch tick must not count turnaround passes that follow a JUST-SENT reverse-SACK on
+a PARTIAL-but-progressing batch. Candidate directions (each needs a live-path fail-before/passes-after):
+(a) suppress the down-ladder / dead-batch tick for a bounded window AFTER the RSP transmits a partial
+SACK (the turnaround is expected, not a loss); (b) only tick the dead-batch streak when the forward batch
+made ZERO progress since the last tick (a 5/6 batch that is awaiting one retransmit is not "dead"); (c)
+require the dead-batch ticks to span ≥1 real batch PERIOD (rate-limit), so 3 sub-second turnaround passes
+cannot reach SESSION_DEAD_BATCHES. (b)/(c) look closest to the true invariant ("dead" = no forward
+progress across real batch periods), but each touches the down-ladder ↔ SACK ↔ dead-batch cross-layer
+state and must be designed + audited, not patched. REPORTED + STOPPED here per §2.
