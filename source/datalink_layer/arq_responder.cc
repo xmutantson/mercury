@@ -1430,6 +1430,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 				}
 				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
 				batch_rx_frame_count++;
+				// §19: session-monotonic forward-progress counter. batch_rx_frame_count RESETS at every
+				// batch boundary, so the dead-batch tick guard (arq_common.cc §19) needs a counter that
+				// only ever INCREASES while the link delivers DATA. Incremented here, at the SAME
+				// confirmed-storage point batch_rx_frame_count advances; reset only at session start/BREAK.
+				inband_total_data_frames_rx++;
 				// R038 (race audit 2026-06-06): promote the v2 EOB ONLY now, inside
 				// the confirmed match-current storage block. For v2, receive()
 				// STAGED the decoded EOB seq on rx_buffer_eob_seq instead of writing
@@ -8762,6 +8767,151 @@ int cl_arq_controller::test_inband_descrambler_survives_ring_shrink()
 		delete rx; delete ts;
 	}
 	set_env("MERCURY_DESCRAMBLER_REGEN_DEFEAT", "");
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// In-band DEAD-BATCH streak ties to REAL batch periods + ZERO-PROGRESS — §19
+// --test-inband-deadbatch-progress
+// ============================================================================
+// VERIFIED ROOT (_residual/v18.arqlog): a 5/6 CONFIG_0 batch + its ~1.1 s partial-SACK TX turnaround
+// produced 3 sub-second down-ladder RX-loop passes (no NEW frame) that false-counted as 3 dead BATCHES
+// -> SESSION_DEAD_BATCHES=3 -> FALSE TERMINAL BREAK -> ROBUST_0, killing the climb. §19 ties the tick to
+// CONSECUTIVE ZERO-PROGRESS REAL BATCH PERIODS (forward-progress reset + TIME rate-limit).
+//
+// Drives the PRODUCTION inband_try_down_ladder_on_decode_fail over a NOISE window (energy >= the 0.05
+// gate, no decodable config -> reaches the tick path). Two cases:
+//   A — FALSE-BREAK SUPPRESSION (the bug): model "5/6 batch just received" (inband_total_data_frames_rx
+//       advanced) then 3 BACK-TO-BACK turnaround passes (no new frame, no time elapsed). FIX: forward
+//       progress resets the streak + the TIME rate-limit blocks re-ticks -> NO BREAK. DEFEAT
+//       (MERCURY_INBAND_DEADBATCH_RATELIMIT_DEFEAT=1): 3 unconditional ticks -> BREAK (the floor).
+//   B — REAL-TOTAL-LOSS BREAK SURVIVES (do NOT regress recovery): ZERO progress across 3 REAL batch
+//       periods (the batch-period timer genuinely elapses between calls) -> the tick STILL fires each
+//       period -> BREAK. Proves the guard suppresses ONLY the false turnaround re-fire, not a true loss.
+int cl_arq_controller::test_inband_deadbatch_progress()
+{
+	const char* TAG = "[TEST-INBAND-DEADBATCH-PROGRESS]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want){
+		if(cond) printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+		else   { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Build a PRODUCTION RX at CONFIG_0, CONNECTED+RECEIVING, inband ON, an in-flight batch. The test
+	// drives the PRODUCTION classifier inband_deadbatch_classify() — the EXACT decision
+	// inband_try_down_ladder_on_decode_fail makes when the window decoded NOTHING — with the EXACT
+	// production state (the forward-progress counter, the batch-period timer, the streak, the env knob).
+	// This is NOT an isolation fake: it is the live code path's decision point, driven through the real
+	// state transitions the partial-SACK-turnaround vs the real-total-loss produce, avoiding the
+	// synthetic-audio fragility of forcing the whole down-ladder decode. A small receiving_timeout floors
+	// to the 3000 ms batch period in the classifier.
+	auto build_rx = [&](cl_telecom_system*& ts_out)->cl_arq_controller*{
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE; ts->narrowband_enabled = NO;
+		rx->telecom_system = ts; rx->narrowband_enabled = NO; rx->role = RESPONDER;
+		rx->robust_enabled = YES; rx->sack_v2_enabled = true; rx->inband_rate_enabled = 1;
+		rx->load_configuration(CONFIG_0, FULL, NO);
+		rx->link_status = CONNECTED; rx->connection_status = RECEIVING; rx->passive_monitor = false;
+		rx->rsp_current_expected_batch_seq_id = 4;
+		rx->set_receiving_timeout(3000);
+		ts_out = ts;
+		return rx;
+	};
+
+	// ---- CASE A: false-BREAK suppression (5/6 batch THEN 3 back-to-back turnaround passes) ----
+	// The classifier is the same in both arms; the env knob is the ONLY difference (the §19 fix vs the
+	// pre-§19 unconditional tick). break_due is what the production caller fires once the streak hits N.
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_INBAND_DEADBATCH_RATELIMIT_DEFEAT", defeat ? "1" : "");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		int limit = rx->inband_session_dead_limit();
+		// model "this CONFIG_0 batch just received 5 of 6 frames" -> forward progress happened.
+		rx->inband_total_data_frames_rx  = 5;
+		rx->inband_dead_tick_frames_snap = 0;
+		// 3 BACK-TO-BACK no-decode turnaround passes (no NEW frame, no virtual time elapsed between them):
+		// the SAME thing the down-ladder caller would do 3x in <0.5 s during the partial-SACK turnaround.
+		int classes[3]; bool would_break = false;
+		for(int p = 0; p < 3; p++) {
+			classes[p] = rx->inband_deadbatch_classify();
+			if(rx->inband_session_dead_batches >= limit) would_break = true;
+		}
+		if(!defeat)
+		{
+			check(classes[0] == cl_arq_controller::INBAND_DB_PROGRESS_RESET,
+				"A-FIX p0: the 5/6-batch forward progress RESETS the streak (no tick)", classes[0], cl_arq_controller::INBAND_DB_PROGRESS_RESET);
+			check(classes[1] != cl_arq_controller::INBAND_DB_TICK && classes[2] != cl_arq_controller::INBAND_DB_TICK,
+				"A-FIX p1/p2: the back-to-back turnaround re-fires do NOT tick", (classes[1]==cl_arq_controller::INBAND_DB_TICK||classes[2]==cl_arq_controller::INBAND_DB_TICK)?1:0, 0);
+			check(!would_break, "A-FIX: NO false TERMINAL BREAK after a 5/6 batch + turnaround", would_break?1:0, 0);
+		}
+		else
+		{
+			check(classes[0]==cl_arq_controller::INBAND_DB_TICK && classes[1]==cl_arq_controller::INBAND_DB_TICK && classes[2]==cl_arq_controller::INBAND_DB_TICK,
+				"A-DEFEAT (FAIL-BEFORE): every pass ticks unconditionally", (classes[0]==2&&classes[1]==2&&classes[2]==2)?1:0, 1);
+			check(would_break, "A-DEFEAT (FAIL-BEFORE): 3 unconditional ticks -> TERMINAL BREAK (the 53B/ROBUST_2 floor)", would_break?1:0, 1);
+		}
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_INBAND_DEADBATCH_RATELIMIT_DEFEAT", "");
+
+	// ---- CASE B: a REAL total loss STILL BREAKs (recovery preserved — the §5 audit case) ----
+	{
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_total_data_frames_rx  = 0;     // ZERO forward progress, ever (a true total loss)
+		rx->inband_dead_tick_frames_snap = 0;
+		int limit = rx->inband_session_dead_limit();
+		int ticks = 0;
+		// `limit` REAL batch periods. The first period exercises the LIVE timer (spin past the 3000 ms
+		// floor) to prove the time path; the rest model the elapsed period (timer disarmed = the exact
+		// state the guard sees once the cl_timer crosses the floor). Zero progress every period -> each
+		// MUST tick -> the streak reaches the BREAK floor.
+		bool first_was_live_timer = false;
+		for(int period = 0; period < limit; period++)
+		{
+			int c = rx->inband_deadbatch_classify();
+			if(c == cl_arq_controller::INBAND_DB_TICK) ticks++;
+			if(period == 0)
+			{
+				// re-enter once WITHOUT advancing the timer: must be RATE_LIMITED (proves the live timer
+				// blocks a sub-second re-fire even on a true loss), then age the real timer past the floor.
+				int c2 = rx->inband_deadbatch_classify();
+				check(c2 == cl_arq_controller::INBAND_DB_RATE_LIMITED,
+					"B: a sub-second re-fire within the SAME period is rate-limited (even on a true loss)", c2, cl_arq_controller::INBAND_DB_RATE_LIMITED);
+				cl_timer w; w.start(); while(w.get_elapsed_time_ms() < 3050) { /* age the live batch-period timer */ }
+				first_was_live_timer = true;
+			}
+			else
+				rx->inband_dead_tick_timer_armed = false;   // model the next real batch period elapsed
+		}
+		check(first_was_live_timer, "B: the live cl_timer batch-period path was exercised", first_was_live_timer?1:0, 1);
+		check(ticks >= limit, "B: a REAL zero-progress total loss ticks once per real batch period -> reaches BREAK floor (recovery NOT regressed)", ticks, limit);
+		delete rx; delete ts;
+	}
+
 #if defined(_WIN32)
 	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
 #endif

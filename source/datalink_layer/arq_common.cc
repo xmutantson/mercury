@@ -4275,6 +4275,9 @@ int cl_arq_controller::inband_down_ladder_resync(const double* audio, int audio_
 			// A successful decode means the link is ALIVE -> reset the terminal-BREAK
 			// dead-batch streak (design §7: BREAK is the rare true-loss backstop only).
 			inband_session_dead_batches = 0;
+			// §19: re-baseline the progress tracking on a resync success too.
+			inband_dead_tick_frames_snap = inband_total_data_frames_rx;
+			inband_dead_tick_timer_armed = false;
 			return cfg;
 		}
 	}
@@ -4645,6 +4648,79 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 // the link is CONNECTED+RECEIVING, NO data frame decoded this pass, and the current
 // config is OFDM (the lost-tag precondition). Pulls the captured first-frame
 // snapshot, energy-gates it (no decode attempts during silence), runs the bounded
+// §19 dead-batch tick CLASSIFIER (data-flow-robust-ofdm-adopt-flush.md §19). Called by
+// inband_try_down_ladder_on_decode_fail when the down-ladder window decoded NOTHING. Decides whether
+// this no-decode pass is a benign turnaround re-fire / a progressing batch, or a GENUINE zero-progress
+// real-batch-period dead batch, and applies the streak side-effects. Returns:
+//   INBAND_DB_PROGRESS_RESET — a forward DATA frame decoded since the last tick -> link alive -> streak
+//                              reset (the 5/6-batch + awaiting-retransmit case). No tick.
+//   INBAND_DB_RATE_LIMITED   — zero progress BUT < one REAL BATCH PERIOD of VIRTUAL time since the last
+//                              tick -> a sub-second partial-SACK-turnaround re-fire. No tick.
+//   INBAND_DB_TICK           — zero progress AND >= one batch period -> a genuine dead batch; the streak
+//                              is advanced (the caller checks the SESSION_DEAD_BATCHES limit -> BREAK).
+// A real total loss decodes NO frame, so its bsi never advances — the rate-limit is TIME-based (a
+// cl_timer advancing regardless of decode), so a true loss STILL ticks once per period -> BREAK survives
+// (§5). FAIL-BEFORE knob MERCURY_INBAND_DEADBATCH_RATELIMIT_DEFEAT=1 forces INBAND_DB_TICK every pass
+// (the unconditional pre-§19 behavior -> reproduces the false BREAK). Production never sets it.
+int cl_arq_controller::inband_deadbatch_classify()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_INBAND_DEADBATCH_RATELIMIT_DEFEAT");
+	  if(e && *e && atoi(e) != 0) defeat = true; }
+
+	if(!defeat)
+	{
+		if(inband_total_data_frames_rx > inband_dead_tick_frames_snap)
+		{
+			// (1) forward progress since the last classify -> the link is ALIVE -> NOT a dead batch.
+			// RESET the streak and ARM the batch-period clock: the immediately-following turnaround
+			// re-fires (the partial-SACK TX window) are within this same period and must be rate-limited
+			// below, NOT ticked — otherwise the first post-reset zero-progress pass would tick at streak 0.
+			if(inband_session_dead_batches != 0)
+			{
+				printf("[INBAND-RX] DOWN-LADDER: forward progress (%ld frames) -> dead-batch streak "
+					"RESET (was %d)\n",
+					inband_total_data_frames_rx - inband_dead_tick_frames_snap,
+					inband_session_dead_batches);
+				fflush(stdout);
+			}
+			inband_session_dead_batches  = 0;
+			inband_dead_tick_frames_snap = inband_total_data_frames_rx;
+			inband_dead_tick_timer.start();          // start the period clock from the last progress
+			inband_dead_tick_timer_armed = true;
+			return INBAND_DB_PROGRESS_RESET;
+		}
+		// One REAL BATCH PERIOD of VIRTUAL time: the per-batch RX window (receiving_timeout), floored so
+		// a tiny/zeroed timeout can't defeat the rate-limit and capped so it can't stall BREAK forever.
+		// The partial-SACK turnaround re-fires are ~0.2-0.5 s apart, far inside one period.
+		int batch_period_ms = receiving_timeout;
+		if(batch_period_ms < 3000)  batch_period_ms = 3000;
+		if(batch_period_ms > 20000) batch_period_ms = 20000;
+		if(inband_dead_tick_timer_armed
+		   && inband_dead_tick_timer.get_elapsed_time_ms() < batch_period_ms)
+		{
+			// (2) zero progress but still inside the CURRENT real batch period (since the last tick OR
+			// the last forward-progress reset) -> a turnaround re-fire. Do NOT tick. The streak>0
+			// condition is intentionally DROPPED: a zero-progress pass that lands right after a
+			// progress-reset (streak just zeroed, mid-turnaround) must also be suppressed.
+			printf("[INBAND-RX] DOWN-LADDER: no decode but only %dms < batch-period %dms since last "
+				"progress/tick -> rate-limited (no false tick; streak held at %d)\n",
+				(int)inband_dead_tick_timer.get_elapsed_time_ms(), batch_period_ms,
+				inband_session_dead_batches);
+			fflush(stdout);
+			return INBAND_DB_RATE_LIMITED;
+		}
+		// (3) zero progress AND >= one batch period elapsed (or first ever pass) -> a genuine dead batch.
+	}
+
+	// TICK: advance the streak, snapshot progress, (re)start the batch-period clock.
+	inband_session_dead_batches++;
+	inband_dead_tick_frames_snap = inband_total_data_frames_rx;
+	inband_dead_tick_timer.start();
+	inband_dead_tick_timer_armed = true;
+	return INBAND_DB_TICK;
+}
+
 // down-ladder, and on none-pass advances the terminal-BREAK dead-batch streak. The
 // dead-batch streak reaching SESSION_DEAD_BATCHES is the ONLY remaining BREAK
 // trigger on the inband path; this routine sets inband_terminal_break_due so the
@@ -4776,14 +4852,33 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 			inband_nack_emitted_for_dead_streak = true;
 	}
 
-	// None of the D+1 window configs decoded -> a total-loss batch. Advance the
-	// terminal-BREAK dead-batch streak (design §4.3 terminate-failure). Only when it
-	// reaches SESSION_DEAD_BATCHES consecutive total-losses do we fall through to
-	// BREAK — the ONLY remaining BREAK path on the inband path.
-	inband_session_dead_batches++;
+	// None of the D+1 window configs decoded -> a candidate total-loss batch.
+	//
+	// §19 ZERO-PROGRESS + REAL-BATCH-PERIOD GUARD (data-flow-robust-ofdm-adopt-flush.md §19,
+	// VERIFIED root _residual/v18.arqlog). The PRE-§19 code incremented unconditionally here, so a
+	// 5/6 CONFIG_0 batch followed by its ~1.1 s partial-SACK TX turnaround produced 3 sub-second
+	// down-ladder RX-loop passes (NO new forward frame) that false-counted as 3 dead BATCHES ->
+	// SESSION_DEAD_BATCHES=3 -> FALSE TERMINAL BREAK -> ROBUST_0, killing the climb right after a
+	// fully-progressing batch. The streak must count CONSECUTIVE ZERO-PROGRESS REAL BATCH PERIODS,
+	// not RX-loop passes:
+	//   (1) FORWARD PROGRESS since the last tick (a DATA frame decoded -> inband_total_data_frames_rx
+	//       advanced) => the link is ALIVE -> RESET the streak and do NOT tick. A 5/6 batch awaiting
+	//       one retransmit made progress; the SACK round-trip recovers it.
+	//   (2) TIME RATE-LIMIT: zero progress BUT < one REAL BATCH PERIOD of VIRTUAL time has elapsed
+	//       since the last tick => a sub-second turnaround re-fire -> do NOT re-tick. The period is
+	//       TIME-based, NOT bsi-based: in a REAL total loss NO frame decodes so the bsi never
+	//       advances — a bsi rate-limit would suppress the LEGITIMATE BREAK (the §5 audit catch). A
+	//       cl_timer advances regardless of decode, so a true loss STILL ticks once per period -> BREAK.
+	//   (3) ZERO progress AND >= one batch period since the last tick => a GENUINE dead batch -> tick.
+	// §19: classify this no-decode pass (PROGRESS_RESET / RATE_LIMITED / TICK) and apply the streak
+	// side-effects. The classifier is the SAME production decision the directed test drives directly.
+	int db_class = inband_deadbatch_classify();
+	if(db_class != INBAND_DB_TICK)
+		return;   // forward progress (link alive) or a sub-second turnaround re-fire -> no tick.
+
 	int limit = inband_session_dead_limit();
-	printf("[INBAND-RX] DOWN-LADDER total-loss batch %d/%d (even the window floor "
-		"failed to decode)\n", inband_session_dead_batches, limit);
+	printf("[INBAND-RX] DOWN-LADDER total-loss batch %d/%d (zero-progress, real batch period; even "
+		"the window floor failed to decode)\n", inband_session_dead_batches, limit);
 	fflush(stdout);
 
 	if(inband_session_dead_batches >= limit)
@@ -4797,6 +4892,9 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 		fflush(stdout);
 		inband_terminal_break_due = true;
 		inband_session_dead_batches = 0;   // armed once; reset so BREAK isn't re-fired
+		// §19: re-baseline the progress tracking so the post-BREAK session starts a fresh streak.
+		inband_dead_tick_frames_snap = inband_total_data_frames_rx;
+		inband_dead_tick_timer_armed = false;
 	}
 }
 
@@ -6354,6 +6452,10 @@ void cl_arq_controller::reset_session_state()
 	// here (it is bandwidth-keyed, not session-keyed — kept across reconnects on the
 	// same NB/WB; freed in inband_free_down_decoders on a NB/WB switch / dtor).
 	inband_session_dead_batches = 0;
+	// §19: a fresh session starts the dead-batch progress tracking from zero.
+	inband_total_data_frames_rx = 0;
+	inband_dead_tick_frames_snap = 0;
+	inband_dead_tick_timer_armed = false;
 	// STAGE 4c: the commander-side true-session-loss floor — a fresh session is never
 	// one batch from the BREAK floor (mirrors the RX-side reset above + the ctor init).
 	cmd_inband_session_dead_batches = 0;

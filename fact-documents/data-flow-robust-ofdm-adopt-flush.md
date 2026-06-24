@@ -799,3 +799,63 @@ require the dead-batch ticks to span ≥1 real batch PERIOD (rate-limit), so 3 s
 cannot reach SESSION_DEAD_BATCHES. (b)/(c) look closest to the true invariant ("dead" = no forward
 progress across real batch periods), but each touches the down-ladder ↔ SACK ↔ dead-batch cross-layer
 state and must be designed + audited, not patched. REPORTED + STOPPED here per §2.
+
+## §19 DESIGNED FIX — tie SESSION_DEAD_BATCHES to REAL batch periods + ZERO-PROGRESS (the climb-killer fix)
+
+§18 VERIFIED the climb-killer (a 5/6 batch + partial-SACK turnaround false-counts 3 sub-second RX-loop
+passes as 3 dead batches → BREAK) and FALSIFIED the frame_data_missing point-patch. §19 is the designed
+cross-layer fix.
+
+### §19.1 The fix — a production CLASSIFIER (`cl_arq_controller::inband_deadbatch_classify`)
+
+The unconditional `inband_session_dead_batches++` at the down-ladder no-decode site is replaced by a
+classifier that decides PROGRESS_RESET / RATE_LIMITED / TICK and applies the streak side-effects:
+- **(1) FORWARD PROGRESS** — a forward DATA frame decoded since the last classify
+  (`inband_total_data_frames_rx`, a NEW session-monotonic counter ++'d at the same confirmed-storage
+  point `batch_rx_frame_count` advances, arq_responder.cc) → the link is ALIVE → RESET the streak +
+  arm the batch-period clock (so the immediately-following turnaround re-fires are rate-limited, not
+  ticked at streak 0). The 5/6-batch-awaiting-one-retransmit case.
+- **(2) TIME RATE-LIMIT** — zero progress but `< one REAL BATCH PERIOD` of VIRTUAL time
+  (`receiving_timeout`, floored 3000 ms / capped 20000 ms) elapsed since the last classify → a
+  sub-second partial-SACK-turnaround re-fire → do NOT tick. The rate-limit is TIME-based, NOT bsi-based:
+  a real total loss decodes NO frame so the bsi never advances; a bsi rate-limit would suppress the
+  LEGITIMATE BREAK (the §5 audit catch). A `cl_timer` advances regardless of decode.
+- **(3) TICK** — zero progress AND ≥ one batch period (or the first ever pass) → a genuine dead batch;
+  advance the streak (the caller checks SESSION_DEAD_BATCHES → BREAK, mechanism unchanged).
+Net: the streak counts CONSECUTIVE ZERO-PROGRESS REAL BATCH PERIODS, not RX-loop passes. FAIL-BEFORE
+knob MERCURY_INBAND_DEADBATCH_RATELIMIT_DEFEAT=1 forces TICK every pass (the pre-§19 false BREAK).
+
+### §19.2 §5 CROSS-LAYER AUDIT — session-level BREAK state (recovery MUST survive)
+
+Producer: the down-ladder no-decode classify (→ tick). Consumer: TERMINAL BREAK (arq_common.cc:4789).
+New state (`inband_total_data_frames_rx`, `inband_dead_tick_frames_snap`, `inband_dead_tick_timer`,
+`inband_dead_tick_timer_armed`) reset at: session start, terminal BREAK, resync success. Walk:
+- (a) REAL deep-SNR total loss (zero progress over successive real periods): first pass TICKs, re-fires
+  rate-limited, after each real batch period a fresh TICK → reaches SESSION_DEAD_BATCHES → BREAK.
+  **Recovery PRESERVED** (regression test CASE B asserts ticks==limit → BREAK).
+- (b) partial-then-recovering 5/6 batch: progress → RESET, no false BREAK; the retransmit completes it.
+- (c) partial-SACK turnaround sub-second passes: rate-limited (time) and/or progress-reset → no tick.
+
+### §19.3 LIVE-PATH test (fail-before/passes-after + recovery-preserved)
+
+`test_inband_deadbatch_progress` (`--test-inband-deadbatch-progress`, in master `--test`) drives the
+PRODUCTION classifier `inband_deadbatch_classify()` (the EXACT decision the down-ladder caller makes)
+with the EXACT production state — NOT a fake, and not the synthetic-audio-fragile full down-ladder.
+CASE A (5/6 batch + 3 back-to-back turnaround passes): FIX → progress resets + re-fires rate-limited →
+NO false BREAK; DEFEAT → 3 unconditional ticks → BREAK (the 53 B floor). CASE B (true total loss): a
+sub-second re-fire is rate-limited (live cl_timer exercised), and zero progress across `limit` real
+batch periods STILL ticks once per period → BREAK (recovery NOT regressed). Master `--test` exit 0.
+
+### §19.4 END-TO-END (VERIFIED, _residual/v19.arqlog, seed 2001 --snr 40)
+
+The §19 fix WORKS for its target: **ZERO RX-side TERMINAL BREAK** (was the climb-killer), CONFIG_0 now
+SUSTAINS, rx **189 B** (was 53 B), with 125 rate-limited turnaround re-fires and 0 false total-loss ticks.
+BUT a SEPARATE **CMD-side** demote still blocks the climb: the CMD accrues `[CMD] [BREAK] Block failure
+#1/#2/#3 at config 0 (threshold=3)` and `INBAND-NOBREAK Class-A degradation: demoting 0 -> 102` (CONFIG_0
+-> ROBUST_2 via the CONFIG_TAG). So the redesign reaches final ROBUST_2 / peak CONFIG_0 still — but via a
+DIFFERENT, CMD-side path (the reverse-SACK round-trips not confirming clean batches), NOT the RX dead-batch
+BREAK §19 fixed. This is the SYMMETRIC SIBLING of §18/§19 on the COMMANDER side (the same partial-batch +
+turnaround pattern counted as `cmd_inband_session_dead_batches` / block-failures). §19 is a correct, tested
+improvement (RX climb-killer removed, 189 vs 53 B); the CMD-side block-failure demote is the NEXT layer.
+[?] Next: the CMD-side block-failure / `cmd_inband_session_dead_batches` analog of the §19 zero-progress
+rate-limit (arq_commander.cc:3186, `[CMD] [BREAK] Block failure ... at config 0`).

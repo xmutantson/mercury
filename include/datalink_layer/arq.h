@@ -2205,6 +2205,15 @@ public:
   // CONFIG_0 clean-lock CRC-fail ROOT: descrambler survives the inband ring-shrink
   // (set_size realloc wiped bit_energy_dispersal_sequence). data-flow-robust-ofdm-adopt-flush.md §17.
   int test_inband_descrambler_survives_ring_shrink();
+  // Dead-batch streak ties to REAL batch periods + ZERO-PROGRESS (the climb-killer fix); a real
+  // total loss STILL BREAKs. data-flow-robust-ofdm-adopt-flush.md §19.
+  int test_inband_deadbatch_progress();
+  // §19 dead-batch tick classifier (the PRODUCTION decision, called by
+  // inband_try_down_ladder_on_decode_fail and driven directly by the test). Applies the streak
+  // side-effects and returns: 0=PROGRESS_RESET (link alive), 1=RATE_LIMITED (same batch period),
+  // 2=TICK (a genuine zero-progress real-batch-period dead batch).
+  enum { INBAND_DB_PROGRESS_RESET = 0, INBAND_DB_RATE_LIMITED = 1, INBAND_DB_TICK = 2 };
+  int inband_deadbatch_classify();
 
   // IN-BAND FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER REGRESSION (CLI
   // --test-inband-deliver). The 785-frame decode-but-0-deliver rework: a forward-healthy
@@ -3573,8 +3582,18 @@ public:
   bool inband_down_decoders_built = false;    // any slot allocated yet?
   int  inband_down_buffer_nsymb = 0;          // common buffer_Nsymb for the bank (largest window cfg)
   int  inband_down_d = -1;                    // cached MERCURY_INBAND_DOWN_D (-1=unresolved)
-  int  inband_session_dead_batches = 0;       // consecutive total-loss batches -> terminal BREAK
+  int  inband_session_dead_batches = 0;       // consecutive ZERO-PROGRESS REAL-batch-period total losses -> terminal BREAK
   int  inband_dead_batches_limit = -1;        // cached MERCURY_INBAND_DEAD_BATCHES (-1=unresolved)
+  // §19 dead-batch tick guard: a session-monotonic forward-DATA-frame counter + the snapshot at the
+  // last tick + a TIME rate-limit, so the tick counts CONSECUTIVE ZERO-PROGRESS REAL BATCH PERIODS
+  // (not sub-second partial-SACK-turnaround RX-loop passes). A real total loss decodes NO frame, so
+  // the bsi (rsp_current_expected_batch_seq_id) does NOT advance — the rate-limit MUST be TIME-based
+  // (a cl_timer that advances regardless of decode) or it would suppress the LEGITIMATE total-loss
+  // BREAK. data-flow-robust-ofdm-adopt-flush.md §19.
+  long      inband_total_data_frames_rx = 0;  // monotonic per session; ++ on every forward DATA frame decoded
+  long      inband_dead_tick_frames_snap = 0; // inband_total_data_frames_rx at the last dead-batch tick
+  bool      inband_dead_tick_timer_armed = false; // false until the first tick arms inband_dead_tick_timer
+  cl_timer  inband_dead_tick_timer;           // VIRTUAL-time since the last tick (real-batch-period rate-limit)
   bool inband_terminal_break_due = false;     // set when the dead-batch streak hit the limit (caller fires BREAK)
   int  inband_test_forced_down_delay = -1;    // TEST-ONLY: forced preamble delay for scoped decoders (-1=real acquisition)
   // TEST-ONLY: when true, emit_config_tag_passband runs its firing-decision state

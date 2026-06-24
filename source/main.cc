@@ -739,6 +739,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_descrambler_survives_ring_shrink();
             }
+            // §19: dead-batch streak ties to REAL batch periods + zero-progress (climb-killer fix);
+            // a real total loss STILL BREAKs (recovery preserved).
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_deadbatch_progress();
+            }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
             // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.
@@ -867,6 +873,13 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-descrambler-survives-shrink") == 0) {
             cl_arq_controller ARQ_descr;
             int failed = ARQ_descr.test_inband_descrambler_survives_ring_shrink();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-deadbatch-progress : run ONLY the §19 dead-batch real-period/zero-progress
+        // regression (the climb-killer fix; real total loss still BREAKs) and exit.
+        if (strcmp(argv[i], "--test-inband-deadbatch-progress") == 0) {
+            cl_arq_controller ARQ_db;
+            int failed = ARQ_db.test_inband_deadbatch_progress();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock
