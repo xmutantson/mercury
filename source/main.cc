@@ -813,6 +813,18 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_f0p;
                 failed += test_f0p.test_inband_frame0_partial();
             }
+            // IN-BAND ROLLING-PARTIAL climb DEFER-WHILE-HOLE-OUTSTANDING regression
+            // (data-flow-inband-frame0-rolling-partial.md §10): the 2801d7c sibling — the
+            // lead-frame-only partial enqueues frame-0 for retx (retransmit_count > 0), and the
+            // anchor-raise + FRAME-UP config-change fire WHILE that hole is outstanding; the config
+            // change clears the retx queue -> abandons frame-0 -> bsi gap -> GAP-ABORT wedge. The
+            // fix DEFERS the anchor-raise + the fire while the hole is outstanding but KEEPS the
+            // 2801d7c streak credit. PURE in-process synthetic-fire — permanent regression gate.
+            // Fails-before: -DINBAND_CLIMB_DEFER_FAILBEFORE.
+            {
+                cl_arq_controller test_cd;
+                failed += test_cd.test_inband_climb_defer_on_retx();
+            }
             // IN-BAND +1 CLIMB regression (data-flow-inband-frame0-rolling-partial.md §7.2
             // option A): under MERCURY_INBAND_RATE the FRAME-UP climb must step EXACTLY +1
             // (suppress the SNR elevator that jumped CONFIG_0->3 and stranded the reverse
@@ -900,6 +912,18 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-frame0-partial") == 0) {
             cl_arq_controller ARQ_f0p;
             int failed = ARQ_f0p.test_inband_frame0_partial();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-climb-defer : run ONLY the ROLLING-PARTIAL climb DEFER-WHILE-HOLE-OUTSTANDING
+        // regression (the 2801d7c sibling — the anchor-raise + FRAME-UP config-change must NOT fire
+        // while a lead-frame-only partial's frame-0 is still outstanding for retx, or clear_retx_queue
+        // abandons it -> GAP-ABORT wedge; the streak credit is still retained) and exit. Fast +
+        // deterministic; see arq_commander.cc::test_inband_climb_defer_on_retx +
+        // data-flow-inband-frame0-rolling-partial.md §10. Build with -DINBAND_CLIMB_DEFER_FAILBEFORE
+        // to reproduce the fails-before (the climb fires while the hole is outstanding — the orphan).
+        if (strcmp(argv[i], "--test-inband-climb-defer") == 0) {
+            cl_arq_controller ARQ_cd;
+            int failed = ARQ_cd.test_inband_climb_defer_on_retx();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-plus1-climb : run ONLY the in-band +1 climb regression (the FRAME-UP

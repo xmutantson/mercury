@@ -5480,7 +5480,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// for a genuinely marginal rung is untouched). The +1 clamp still bounds the climb to
 			// one rung above proven ground, and the gearshift's decode-failure demote re-pins if
 			// the next rung fails — restoring re-climb without over-climb. Inband + OFDM only.
-			else if(inband_lead_frame_only_partial())
+			//
+			// DEFER-WHILE-HOLE-OUTSTANDING (data-flow-inband-frame0-rolling-partial.md §10): the
+			// lead-frame-only partial just ENQUEUED the missing frame-0 for retx
+			// (retransmit_count > 0; arq_commander.cc:4106 / the MFSK big block). Raising the anchor
+			// here lets the FRAME-UP +1 clamp permit the next-rung probe, and the resulting
+			// config-change calls clear_retx_queue() (:5708) which would ABANDON that outstanding
+			// frame-0 → bsi gap → RSP-V2-GAP-ABORT wedge (the 2801d7c sibling). So DEFER the anchor
+			// raise while the hole is outstanding; the mixbatch drains the retx within one batch
+			// (:1919), and the NEXT (whole) batch — retransmit_count==0 — raises the anchor then.
+			// inband_lead_frame_only_partial() still recorded the rung viability; only the
+			// orphaning anchor-raise is held. A genuinely whole batch never has an outstanding hole,
+			// so the clean-batch anchor-raise above is unaffected (byte-identical when off).
+			else if(inband_lead_frame_only_partial() && !inband_climb_hole_outstanding())
 			{
 				if(current_configuration != clean_batches_config)
 				{
@@ -5626,7 +5638,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			int eff_frame_shift_threshold = effective_frame_shift_threshold(
 				frame_shift_threshold, current_configuration,
 				clean_batches_at_current_config);
-			if(consecutive_data_acks >= eff_frame_shift_threshold)
+			// DEFER-WHILE-HOLE-OUTSTANDING (data-flow-inband-frame0-rolling-partial.md §10):
+			// the streak CREDIT (consecutive_data_acks++) above is UNCONDITIONAL — 2801d7c's
+			// purpose (the lead-frame-only partial still builds the climb streak) is preserved.
+			// But the config-change FIRE below calls clear_retx_queue() (:5708), which ABANDONS
+			// the frame-0 the rolling partial just enqueued for retx (retransmit_count > 0) ->
+			// bsi gap -> RSP-V2-GAP-ABORT wedge (the 2801d7c sibling). So when the in-band path
+			// still has an OUTSTANDING retx hole, HOLD the fire: the already-built streak waits
+			// while the mixbatch drains the retx (:1919, within one batch); the NEXT whole batch
+			// (retransmit_count==0) lets the same streak fire the climb promptly. A CLEAN/WHOLE
+			// batch has no outstanding hole -> inband_climb_hole_outstanding() is false -> the
+			// climb fires immediately (2801d7c forward-climb-on-clean preserved). Legacy/flag-off:
+			// the predicate is false -> byte-identical (this AND-term is always true off-flag).
+			if(consecutive_data_acks >= eff_frame_shift_threshold &&
+			   !inband_climb_hole_outstanding())
 			{
 				// CONTROLLED ELEVATOR from the data-anchored FRAME-UP path
 				// (REAL FAST-PROBE piece B, gearshift-climb-engine.md §14). The
@@ -8947,6 +8972,153 @@ int cl_arq_controller::test_inband_frame0_partial()
 	last_partial_lead_frame_only = false;
 
 	printf("[TEST-FRAME0-PARTIAL] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// IN-BAND ROLLING-PARTIAL climb DEFER-WHILE-HOLE-OUTSTANDING regression
+// (CLI --test-inband-climb-defer; data-flow-inband-frame0-rolling-partial.md §10). Captures the
+// 2801d7c SIBLING: 2801d7c credited the lead-frame-only partial to the FRAME-UP streak (correct,
+// to unblock the forward climb) AND raised the anchor on it — but the rolling partial just
+// ENQUEUED the missing frame-0 for retx (retransmit_count > 0). The anchor-raise + the resulting
+// FRAME-UP config-change fire WHILE that hole is outstanding; the config change calls
+// clear_retx_queue() (arq_commander.cc:5708) which ABANDONS frame-0 under the new epoch -> the RSP
+// never receives it -> bsi gap -> RSP-V2-GAP-ABORT wedge (~77 B). The fix DEFERS the two orphaning
+// side-effects (anchor-raise + config-change FIRE) while retransmit_count > 0, but KEEPS the streak
+// CREDIT (so 2801d7c's forward-climb-streak still builds). The mixbatch drains the retx within one
+// batch (:1919); the NEXT whole batch (retransmit_count==0) fires the already-built streak.
+//
+// This drives the EXACT two production decisions:
+//   FIRE  = (consecutive_data_acks >= eff_thresh) && !inband_climb_hole_outstanding()  (:5653)
+//   RAISE = inband_lead_frame_only_partial()      && !inband_climb_hole_outstanding()  (:5495)
+// across retransmit_count = {0 (whole), >0 (hole outstanding)} at CONFIG_0, plus the streak CREDIT
+// invariant (consecutive_data_acks++ is NOT gated). Fails-before: -DINBAND_CLIMB_DEFER_FAILBEFORE
+// pins inband_climb_hole_outstanding() false -> the climb FIRES while the hole is outstanding (the
+// orphan reproduced). Returns 0 pass / 1 fail.
+int cl_arq_controller::test_inband_climb_defer_on_retx()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-CLIMB-DEFER] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-CLIMB-DEFER] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	const char* prev = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev ? prev : "";
+	bool had_prev = (prev != NULL);
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	inband_rate_enabled = -1;
+
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	data_batch_size = 6;
+	inband_retag_armed = false;   // CONFIG_0 tier-cross leaves the re-tag disarmed (lead-only path)
+	current_configuration = CONFIG_0;
+
+	// Replays the production FIRE decision: set the lead-frame-only partial + the retx queue depth
+	// exactly as the partial SACK sites leave them, then read the EXACT FRAME-UP fire AND-term and
+	// the anchor-raise AND-term. `streak`/`thresh` model the consecutive_data_acks gate.
+	bool fire = false, raise = false, credit = false;
+	auto eval = [&](int streak, int thresh, int retx) {
+		uint32_t bitmap = 0x3eu;                  // lead-frame-only partial (frame-0 missing)
+		uint32_t all_ones = (1u << data_batch_size) - 1u;
+		int n_miss = data_batch_size - __builtin_popcount(bitmap & all_ones);
+		last_partial_lead_frame_only =
+			((bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
+		last_batch_fully_acked = false;
+		consecutive_data_acks = streak;
+		retransmit_count = retx;                  // the outstanding hole the partial enqueued
+		// EXACT production FRAME-UP fire AND-term (arq_commander.cc:5653-5654):
+		fire  = (consecutive_data_acks >= thresh) && !inband_climb_hole_outstanding();
+		// EXACT production ROLLING-PARTIAL anchor-raise AND-term (arq_commander.cc:5495):
+		raise = inband_lead_frame_only_partial() && !inband_climb_hole_outstanding();
+		// The streak CREDIT (consecutive_data_acks++) is UNCONDITIONAL in production — it lives
+		// OUTSIDE both gated blocks, so it must NOT depend on the hole. Model it directly: the
+		// lead-only partial is still promotable (the credit path), independent of retx depth.
+		credit = (inband_pipeline_climb_active() || inband_lead_frame_only_partial());
+	};
+
+	const int THR = 1;   // the eff threshold the lead-only partial reaches in one credited streak
+
+	// ---- HOLE OUTSTANDING (retransmit_count=1): a streak AT threshold must NOT fire/raise ----
+	{
+		eval(/*streak=*/THR, THR, /*retx=*/1);
+#ifdef INBAND_CLIMB_DEFER_FAILBEFORE
+		check(fire == true,  "FAIL-BEFORE: climb FIRES while hole outstanding (orphan reproduced)",
+			fire ? 1 : 0, 1);
+		check(raise == true, "FAIL-BEFORE: anchor RAISES while hole outstanding (orphan reproduced)",
+			raise ? 1 : 0, 1);
+#else
+		check(fire == false,  "hole outstanding: FRAME-UP fire DEFERRED (retx not abandoned)",
+			fire ? 1 : 0, 0);
+		check(raise == false, "hole outstanding: anchor-raise DEFERRED (retx not abandoned)",
+			raise ? 1 : 0, 0);
+#endif
+		// The streak credit is ALWAYS retained (2801d7c preserved) regardless of the hole.
+		check(credit == true, "hole outstanding: streak CREDIT retained (2801d7c preserved)",
+			credit ? 1 : 0, 1);
+	}
+
+	// ---- HOLE DRAINED (retransmit_count=0): the SAME at-threshold streak fires + raises promptly.
+	// This is the post-mixbatch whole batch — and equally the 2801d7c clean/whole forward-climb that
+	// must NOT be re-broken (a clean batch never has an outstanding hole). ----
+	{
+		eval(/*streak=*/THR, THR, /*retx=*/0);
+		check(fire == true,  "hole drained (retx=0): FRAME-UP fires promptly (2801d7c NOT re-broken)",
+			fire ? 1 : 0, 1);
+		check(raise == true, "hole drained (retx=0): anchor raises promptly",
+			raise ? 1 : 0, 1);
+		check(credit == true, "hole drained (retx=0): streak CREDIT retained",
+			credit ? 1 : 0, 1);
+	}
+
+	// ---- CLEAN/WHOLE forward climb at retx=0 with a sub-threshold streak still credits but waits
+	// for the threshold — proves the defer never fires EARLY (anti over-conservative on the credit).
+	{
+		eval(/*streak=*/0, THR, /*retx=*/0);
+		check(fire == false, "retx=0 sub-threshold streak: fire HELD by threshold (not the defer)",
+			fire ? 1 : 0, 0);
+		check(credit == true, "retx=0 sub-threshold streak: CREDIT still accrues toward threshold",
+			credit ? 1 : 0, 1);
+	}
+
+	// ---- flag-off byte-identity: inband_climb_hole_outstanding() is false (the AND-term is a
+	// no-op), so the legacy fire/raise decisions are unchanged by this gate. ----
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "");
+#else
+	unsetenv("MERCURY_INBAND_RATE");
+#endif
+	inband_rate_enabled = -1;
+	retransmit_count = 5;   // even with a deep retx queue, off-flag the gate must be a no-op
+	check(inband_climb_hole_outstanding() == false,
+		"flag-off: defer gate is a no-op (legacy byte-identical)",
+		inband_climb_hole_outstanding() ? 1 : 0, 0);
+
+	// restore env + cache + members
+	if(had_prev) {
+#ifdef _WIN32
+		_putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+#else
+		setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+#endif
+	}
+	inband_rate_enabled = -1;
+	last_partial_lead_frame_only = false;
+	consecutive_data_acks = 0;
+	retransmit_count = 0;
+
+	printf("[TEST-CLIMB-DEFER] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

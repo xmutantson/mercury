@@ -393,3 +393,103 @@ not a same-session speculative chain (CLAUDE.md §5).
 This is an **architecture-shaped** boundary: the in-band unilateral climb tends to carry the prior
 rung's batch geometry across a rung change, where legacy's SET_CONFIG handshake re-seats a 1-frame
 batch at the new rung. Whether to re-seat the in-band batch geometry per rung is an OWNER decision.
+
+## §10 FIX-1 IMPLEMENTED — DEFER the climb while a lead-frame-only partial's hole is OUTSTANDING (2026-06-24, this session)
+
+### §10.1 Root RE-CONFIRMED (4-agent adversarial convergence; source+log cited)
+The redesign wedge at ~77B is an **ARQ/DELIVERY CONTIGUITY** orphan, the SIBLING that commit `2801d7c`
+EXPOSED — NOT the §8/§9 batch-sizing framing (which is a downstream symptom of the same orphan). Chain
+(each step source-verified on this HEAD):
+1. A CONFIG_0 batch loses frame-0 (Schmidl-Cox acquisition seam) → the SACK comes back PARTIAL
+   (`[CMD-MFSK-ACK-SACK] PARTIAL ... bitmap=0x0000001e`, seq0 missing, n_miss≤2).
+2. The partial SACK ENQUEUES the missing frame-0 for retx: `retransmit_count++` at
+   `arq_commander.cc:4106` (SACK_RSP path) / the shared `if(sack_detected)` big block (MFSK suffix).
+   So immediately after a lead-frame-only partial, **`retransmit_count > 0` — the hole is outstanding.**
+3. `last_partial_lead_frame_only` is set TRUE (`arq_commander.cc:4145` SACK_RSP / `:3806` MFSK), so
+   `inband_lead_frame_only_partial()` (the 2801d7c predicate) returns TRUE.
+4. The ROLLING-PARTIAL anchor-raise (`arq_commander.cc:5483`, log `[GEARSHIFT] ROLLING-PARTIAL anchor
+   raise ... FRAME UP config 0 -> 3`) raises `last_data_viable_config` so the FRAME-UP +1 clamp permits
+   the next rung, then the FRAME-UP gate (`:5606`) advances `consecutive_data_acks` to threshold and
+   FIRES the config-change — **all while `retransmit_count > 0`.**
+5. The config-change fire calls `clear_retx_queue()` (`arq_commander.cc:5708`, log `[RETX-CLEAR]
+   dropping N stale retransmit frame(s)`), which ABANDONS frame-0 under the new epoch (`arq_common.cc:1165`).
+6. The orphaned hole → the RSP never receives frame-0 → decoded `bsi` runs ahead of `last_delivered`
+   → `RSP-V2-GAP-ABORT ... refusing silent concatenation` → wedge. (This integrity guard is CORRECT;
+   we fix the CAUSE — the abandoned hole — not the guard.)
+
+The mixbatch DRAINS the retx within one batch (`arq_commander.cc:1919`, `retransmit_count = leftover`);
+the bug is purely that the climb FIRES (and `clear_retx_queue`s) *before* that drain, in the same poll.
+
+### §10.2 The fix (gate the two ORPHANING side-effects on `retransmit_count`, KEEP the streak credit)
+New pure predicate `inband_climb_hole_outstanding()` (`arq_common.cc`): `inband_rate_feature_enabled()
+&& retransmit_count > 0`. Two AND-terms added:
+- **Anchor-raise** (`arq_commander.cc:5495`): `else if(inband_lead_frame_only_partial() &&
+  !inband_climb_hole_outstanding())` — defer the anchor-raise while the hole is outstanding.
+- **FRAME-UP fire** (`arq_commander.cc:5653-5654`): `if(consecutive_data_acks >= eff_frame_shift_threshold
+  && !inband_climb_hole_outstanding())` — defer the config-change fire (the `clear_retx_queue()` site)
+  while the hole is outstanding.
+
+**2801d7c RECONCILIATION (the needle — NOT re-broken):** the streak CREDIT (`consecutive_data_acks++`
+at `arq_commander.cc:5625`) lives OUTSIDE both gated blocks and is UNGATED — the lead-frame-only partial
+still BUILDS the climb streak (2801d7c's whole purpose). Only the two side-effects that orphan the hole
+are deferred. The mixbatch drains the retx within one batch; the NEXT whole batch has
+`retransmit_count == 0`, the gate opens, and the ALREADY-BUILT streak fires the climb PROMPTLY — no
+re-serialization, no re-block of the forward climb. A genuinely CLEAN/WHOLE batch never has an
+outstanding hole (`retransmit_count == 0`), so the gate is a no-op there → the 2801d7c
+forward-climb-on-clean fires immediately (proven in the test, "hole drained (retx=0): FRAME-UP fires
+promptly (2801d7c NOT re-broken)").
+
+### §10.3 §5 CROSS-LAYER AUDIT (shared state: the climb/anchor/batch-completion gate vs `retransmit_count`)
+Producers of `retransmit_count` (the hole signal): set >0 at the partial-SACK capture
+(`arq_commander.cc:4057-4106`); drained to `leftover` when the mixbatch is built+sent (`:1919`); zeroed
+by `clear_retx_queue()` (`arq_common.cc:1174`) and the ctor/reset sites. Consumer added: the two gate
+AND-terms above (read-only). The fix changes ONE assumption — "the climb may fire/raise the moment the
+lead-frame-only partial is credited" → "...only once the partial's retx hole has drained
+(`retransmit_count==0`)". The 6 consumers the task flagged MUST NOT regress, verified:
+1. **GAP-ABORT integrity guard** (`RSP-V2-GAP-ABORT ... refusing silent concatenation`): UNCHANGED and
+   now NO LONGER TRIGGERED — the fix removes its CAUSE (the abandoned hole). We did not touch or weaken
+   the guard. VERIFIED (the guard is the symptom the orphan produced; the fix is upstream).
+2. **102→0 robust→OFDM HINGE re-init**: the tier-cross uses the legacy SET_CONFIG handshake
+   (`arq_commander.cc:857`), a DIFFERENT producer path than the FRAME-UP gate. `retransmit_count` is 0
+   at a fresh tier-cross (no partial enqueued yet), so the gate is a no-op there. UNTOUCHED. VERIFIED.
+3. **Steady-state OFDM data decode / retx machinery**: the fix touches only the gearshift FRAME-UP
+   gate + the anchor-raise; the retx capture (`:4057-4106`), mixbatch build (`:1919`), and SACK apply
+   are byte-unchanged — frame-0 is still queued, mixed, and recovered exactly as before. The fix only
+   stops the climb from RACING the drain. VERIFIED (test: streak CREDIT retained; `--test` 58/0).
+4. **Legacy SET_CONFIG path (flag off)**: `inband_climb_hole_outstanding()` returns false off-flag
+   (`!inband_rate_feature_enabled()`), so both AND-terms are `&& true` → byte-identical. The
+   anchor-raise branch is `else if(inband_lead_frame_only_partial() && ...)` and
+   `inband_lead_frame_only_partial()` is itself feature-gated off → the whole branch never enters
+   off-flag (as before 2801d7c). VERIFIED (test E: "flag-off: defer gate is a no-op").
+5. **2801d7c forward-climb-streak crediting** (must STILL climb on a clean/whole batch): the
+   `consecutive_data_acks++` credit is ungated; a clean/whole batch has `retransmit_count==0` → fire
+   is immediate. VERIFIED (test: "hole drained (retx=0): FRAME-UP fires promptly (2801d7c NOT
+   re-broken)"; the sub-threshold case proves the defer never fires EARLY — only the threshold holds it).
+6. **RETX-CLEAR generic config-change recovery** (`clear_retx_queue` at the gearshift-down `:5802/:5896`,
+   the watchdog `:5714`, and the FRAME-UP fire `:5708`): the fix only DELAYS the FRAME-UP-fire site
+   (`:5708`) until the hole drains; it does NOT alter the down/watchdog RETX-CLEAR sites (those are
+   recovery paths that legitimately drop stale retx on a DEMOTE/watchdog, a different intent). The
+   generic config-change recovery semantics are preserved — the fix only stops a forward CLIMB from
+   firing it on a not-yet-drained hole. VERIFIED.
+
+Generic coverage: the gate keys on `retransmit_count`, not on CONFIG_0 — so it covers EVERY climb
+(0→1, 1→3, 3→6, …→16) whose trailing batch carries an outstanding lead-frame-only hole, not just 0→3.
+
+### §10.4 Tests (fail-before / pass-after, VERIFIED; new `--test-inband-climb-defer`)
+Drives the EXACT production decisions — the FRAME-UP fire AND-term (`:5653`) and the anchor-raise
+AND-term (`:5495`) — across `retransmit_count = {1 (hole), 0 (drained)}` at CONFIG_0:
+- **PASS-AFTER** (default): hole outstanding (`retx=1`) → fire DEFERRED, anchor-raise DEFERRED, but the
+  streak CREDIT is RETAINED; hole drained (`retx=0`) → fire + raise fire PROMPTLY (2801d7c not re-broken);
+  a sub-threshold streak at `retx=0` is held by the THRESHOLD (not the defer) and still accrues; flag-off
+  → the gate is a no-op. ALL PASS.
+- **FAIL-BEFORE** (`-DINBAND_CLIMB_DEFER_FAILBEFORE`, clean build): the gate is pinned false → the climb
+  FIRES and the anchor RAISES *while the hole is outstanding* (`got=1`) — the orphan reproduced (the
+  `clear_retx_queue()`-abandons-frame-0 racing the drain). MEASURED: same input, opposite fire/raise
+  verdict vs the fixed build → the gate is load-bearing.
+- Full `mercury.exe --test`: **58 passed, 0 failed** (+ Winlink dict 12/0), `[TEST-FRAME0-PARTIAL] ALL
+  PASS`, `[TEST-CLIMB-DEFER] ALL PASS`. Production byte-identical off the flag. EXIT 0.
+
+STATUS: FIX-1 implemented + tested. The next step (a long realtime A/B, redesign ON vs legacy OFF) is
+OWNER-driven, NOT run here. If the A/B shows the climb is now too SLOW (deferred too long) or the
+batch-sizing root (§9.2) still binds after the orphan is removed, that is a SEPARATE, owner-ratifiable
+lever — not a same-session speculative chain (CLAUDE.md §5).

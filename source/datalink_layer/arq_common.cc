@@ -3377,6 +3377,33 @@ bool cl_arq_controller::inband_lead_frame_only_partial()
 #endif
 }
 
+// IN-BAND ROLLING-PARTIAL climb DEFER-while-hole-outstanding
+// (fact-documents/data-flow-inband-frame0-rolling-partial.md §10). PURE predicate. See the
+// header for the full rationale. true iff: the in-band feature is on AND the retransmit queue is
+// non-empty (retransmit_count > 0) — i.e. a lead-frame-only partial enqueued the missing frame-0
+// for retx (arq_commander.cc:4106 / the MFSK-suffix big block) and the mixbatch has NOT yet
+// drained it (arq_commander.cc:1919). Used ONLY to DEFER the ROLLING-PARTIAL anchor-raise and the
+// FRAME-UP config-change-FIRE while the hole is outstanding — the config-change calls
+// clear_retx_queue() (arq_commander.cc:5708) which would ABANDON the outstanding frame-0 → bsi gap
+// → RSP-V2-GAP-ABORT wedge. The 2801d7c streak CREDIT (consecutive_data_acks++) is NOT gated by
+// this — only the two orphaning side-effects are. A CLEAN/WHOLE batch leaves retransmit_count==0
+// → false → the climb fires promptly (2801d7c forward-climb preserved). Flag-off → false
+// (byte-identical: legacy never reaches the inband anchor-raise/streak-optimistic paths anyway).
+bool cl_arq_controller::inband_climb_hole_outstanding()
+{
+#ifdef INBAND_CLIMB_DEFER_FAILBEFORE
+	// FAIL-BEFORE arm (the pre-defer redesign): the climb is NEVER deferred — the anchor-raise +
+	// config-change fire WHILE the retx hole is still outstanding, so clear_retx_queue() abandons
+	// frame-0 and the directed test's pass-after assert (the climb is deferred until the hole
+	// drains) FAILS, proving the defer gate is load-bearing.
+	return false;
+#else
+	if(!inband_rate_feature_enabled())
+		return false;
+	return retransmit_count > 0;
+#endif
+}
+
 // Resolve+cache the R floor (the give-up-and-escalate count). MERCURY_INBAND_RETAG_MIN,
 // default 3, clamped to >=1 (design §1.2). A confirm STOPS the re-tag early regardless
 // of R (design §1.7 ruling: confirm dominates; R is only the no-confirm escalation gate).

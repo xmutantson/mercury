@@ -1586,6 +1586,17 @@ public:
   // See fact-documents/data-flow-inband-frame0-rolling-partial.md.
   int test_inband_frame0_partial();
 
+  // IN-BAND ROLLING-PARTIAL climb DEFER-WHILE-HOLE-OUTSTANDING regression
+  // (CLI --test-inband-climb-defer). The 2801d7c sibling: the lead-frame-only partial enqueues
+  // frame-0 for retx (retransmit_count > 0), and the anchor-raise + FRAME-UP config-change fire
+  // WHILE that hole is outstanding; the config change clears the retx queue and abandons frame-0
+  // -> bsi gap -> GAP-ABORT wedge. The fix DEFERS the anchor-raise + the fire while the hole is
+  // outstanding but KEEPS the 2801d7c streak credit; the next whole batch (retransmit_count==0)
+  // fires the built streak. Returns 0 pass / 1 fail. Default builds never call this.
+  // Fails-before: -DINBAND_CLIMB_DEFER_FAILBEFORE.
+  // See fact-documents/data-flow-inband-frame0-rolling-partial.md §10.
+  int test_inband_climb_defer_on_retx();
+
   // climb-engine integrated regression (CLI --test-climb-engine). Parts A-H,
   // each fail-before / pass-after its fix:
   // (a) Bug 1: sack_clean_confirmation_accepted() split-dedupe — an all-ones
@@ -3506,6 +3517,21 @@ public:
   // leaves last_partial_lead_frame_only false → this returns false → strict-clean gate stands.
   // Flag-off / legacy → false (byte-identical). Replayed by --test-inband-frame0-partial.
   bool inband_lead_frame_only_partial();
+  // IN-BAND ROLLING-PARTIAL climb DEFER-while-hole-outstanding
+  // (fact-documents/data-flow-inband-frame0-rolling-partial.md §10). PURE predicate (no I/O):
+  // returns true iff the in-band feature is on AND the retransmit queue is non-empty
+  // (retransmit_count > 0) — i.e. the current/prev batch still has an UNFILLED HOLE that the
+  // lead-frame-only partial enqueued for retx (arq_commander.cc:4106 / the MFSK-suffix big block)
+  // but which has NOT yet been re-delivered (the mixbatch drains it at arq_commander.cc:1919).
+  // The ROLLING-PARTIAL anchor-raise + the FRAME-UP config-change must NOT fire while this is true
+  // — firing the config-change calls clear_retx_queue() (arq_commander.cc:5708), which ABANDONS the
+  // outstanding frame-0 under the new epoch → the RSP never receives it → bsi gap → GAP-ABORT wedge.
+  // 2801d7c's streak CREDIT (consecutive_data_acks++) is preserved; only the anchor-raise + the
+  // config-change-FIRE are DEFERRED until the hole drains (retransmit_count==0), at which point the
+  // already-built streak fires the climb on the next whole batch. A genuinely CLEAN/WHOLE batch
+  // leaves retransmit_count==0 → this is false → the climb fires promptly (2801d7c forward-climb
+  // preserved). Flag-off / legacy → false (byte-identical). Replayed by --test-inband-frame0-partial.
+  bool inband_climb_hole_outstanding();
   // D1 implicit-confirm consumer: a returning SACK acked bsi `rx_bsi`. If the re-tag is
   // armed and rx_bsi is at-or-after inband_announce_bsi (mod-256 forward distance), the
   // announced config is CONFIRMED FOLLOWED: DISARM the re-tag, record
