@@ -728,9 +728,14 @@ callers in telecom_system.cc — 2 in init() (regen follows), 2 in force_resize_
 728, RX descramble, turbo scoring, ZF-SNR re-encode) all read the now-valid sequence. Legacy path never
 calls the helpers → byte-identical.
 
-### §17.6 RESIDUAL (honest)
+### §17.6 RESIDUAL (honest) — a SEPARATE climb/reliability layer remains
 
-The descrambler fix makes CONFIG_0 DECODE + DELIVER (OFDM-OK + RX-BATCH-SEQ). The seed-2001 realtime run
-still showed final ROBUST_2/53 B because CONFIG_0 was reached LATE (~T+167 of a 240 s run) with no climb
-runway; this is a SEPARATE climb-latency/timing layer, not the decode bug. A WGN:40 A/B with adequate
-runway is needed to confirm climb-to-legacy. [?] Next: the climb behaviour now that the forward decode works.
+The descrambler fix makes CONFIG_0 DECODE + DELIVER (VERIFIED: OFDM-OK cfg0=5 vs 0, OFDM-FAIL=0 vs 198,
+RXSEQ=3D6BD0.., RX-BATCH-SEQ DATA_LONG frames). It is NECESSARY but NOT SUFFICIENT for the climb. A
+WGN:40 redesign run WITH full runway (secs=400) STILL ended ROBUST_2/53 B: with the decode now working,
+the session still accrues `DOWN-LADDER reached SESSION_DEAD_BATCHES=3 -> TERMINAL BREAK -> ROBUST_0`
+(arq_responder/down-ladder). So CONFIG_0 decodes SOME batches but not reliably enough to avoid the
+3-consecutive-total-loss dead-streak -> terminal BREAK -> demote. This is a DISTINCT layer (forward
+acquisition reliability / the re-aired-burst sliding-window miss of the fix-#1c family, or the dead-batch
+streak threshold), NOT the descrambler decode bug this section fixed. [?] Next: characterize why, with
+the descrambler fixed, the CONFIG_0 batch DECODE RATE still trips SESSION_DEAD_BATCHES (the climb layer).
