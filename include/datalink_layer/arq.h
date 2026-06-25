@@ -2937,6 +2937,38 @@ public:
     int     replays;     // duplicate re-airs this session (bounded, see §3.2)
   } connect_ack_cache;
 
+  // CONNECT-REACK FTR-STARVATION FIX (connect-testack-handshake.md §3.3,
+  // 8e62722e regression: OFDM data-frame acquisition starved to 0). The
+  // duplicate-TEST_CONNECTION probe needs frames_to_read to drain to 0 to
+  // sample the MFSK suffix (arq_common.cc:7648), but the OFDM data consumer
+  // (this->receive()) needs frames_to_read = frame_symb+10 to capture a full
+  // data frame. They share ONE frames_to_read and receive() runs the very next
+  // line. The original block re-clamped ftr=2 EVERY pre-data iteration, so the
+  // data frame never decoded, batch_rx_frame_count never advanced, and the
+  // pre-data window never closed (the INV-B self-terminate was a dead
+  // invariant). FIX = WINDOW-BOUNDED OWNERSHIP: the probe owns ftr only for a
+  // short turnaround sub-window after entering the CONNECTED pre-data RECEIVING
+  // window (the lost-ACK duplicate arrives within ~1 CMD retransmit cycle).
+  // After the window elapses we hand ftr back to the OFDM data path ONCE (a
+  // one-shot, so the capture thread's drain is not fought every tick) and the
+  // probe never clamps again -> OFDM delivery restored, heal preserved.
+  cl_timer connect_reack_timer;          // started on entry to CONNECTED pre-data RECEIVING
+  bool     connect_reack_window_armed;   // timer started for this pre-data window
+  bool     connect_reack_ftr_handed_back;// one-shot: data-RX ftr restored after the window
+  // Turnaround bound for the probe window (ms). One duplicate-TEST_CONNECTION
+  // arrival + PTT margin; after this the OFDM data path owns frames_to_read.
+  inline int connect_reack_window_ms() const {
+    return 2 * message_transmission_time_ms + ptt_on_delay_ms;
+  }
+  // True iff the probe is allowed to clamp/sample THIS iteration: the pre-data
+  // window predicate AND we are still inside the bounded turnaround window.
+  // (Non-const: reads the live timer via get_elapsed_time_ms()'s update().)
+  bool connect_reack_probe_window_open();
+  // FTR-STARVATION regression unit (--test-reack-ftr-starvation, also in
+  // master --test): drives the ftr-arbitration across the turnaround window and
+  // asserts the OFDM data-RX ftr is NOT pinned at 2 across the data phase.
+  int test_connect_reack_ftr_starvation();
+
   int gearshift_timeout;
   int connection_timeout;
 
