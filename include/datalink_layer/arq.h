@@ -73,15 +73,25 @@ void drain_playback_wait();
 // stepper (arq_commander.cc test_sim_inproc), so this is the authoritative
 // "are we the single-thread in-process stepper?" query.
 //
-// pumped_settle_wait(wait_ms) — virtual-clock-ify a wall settle-wait. When the
-// pump is NOT installed it is byte-identical to msleep(wait_ms) (production +
-// paced sim). When the pump IS installed it runs a cl_timer + step-pump loop
-// with the SAME exit predicate (elapsed >= wait_ms), advancing the shared
-// virtual clock through the pump so a peer instance sees time pass. The exit
-// SEMANTICS are unchanged — only the clock-advance mechanism differs. Used for
-// the B1-B4 / B7 turnaround + HAIL-race settle guards. For B7 the CALLER keeps
-// the delay FORMULA verbatim (Bug #55 HAIL reliability); this helper only
-// routes the already-computed wait_ms through the pump.
+// pumped_settle_wait(wait_ms) — clock-faithful settle-wait, THREE paths, all
+// sharing the SAME exit predicate (elapsed >= wait_ms); only the clock-advance
+// MECHANISM differs:
+//   (1) Production / HW (sim_clock_enabled()==0): verbatim msleep(wait_ms) —
+//       BYTE-IDENTICAL to the stock wall settle-wait.
+//   (2) Two-process paced sim (-x sim, no pump, sim_clock_enabled()==1): a
+//       cl_timer loop on the VIRTUAL clock (sim_spin_sleep() yields to the
+//       concurrent capture/RX-bridge thread that advances the shared
+//       sample-counter clock). The handshake DEADLINES this wait pairs with are
+//       virtual cl_timer reads; the OLD code wall-slept here, which desynced
+//       the wait from its deadline under host CPU load and dropped the RSP
+//       reply outside the CMD window (the connect-under-load race —
+//       fix/sim-connect-virtual-clock).
+//   (3) SIM_INPROC (pump installed): a cl_timer + step-pump loop, the pump
+//       advancing the shared clock so a peer instance sees time pass.
+// The exit SEMANTICS are unchanged on all three. Used for the B1-B4 / B7/B8
+// turnaround + HAIL-race settle guards. For B7 the CALLER keeps the delay
+// FORMULA verbatim (Bug #55 HAIL reliability); this helper only routes the
+// already-computed wait_ms through the correct clock.
 //
 // sim_inproc_rx_mute_settle(wait_ms) — gate-off the RX_MUTE drain guard (B5 /
 // ADD-ON1). The msleep there waits for ASYNC AUDIO CALLBACKS to drain before

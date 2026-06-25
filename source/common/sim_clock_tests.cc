@@ -15,11 +15,13 @@
 #include "common/sim_clock_tests.h"
 #include "common/sim_clock.h"
 #include "datalink_layer/timer.h"
+#include "datalink_layer/arq.h"   // pumped_settle_wait
 
 #include <cstdio>
 #include <cstdint>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 namespace {
 
@@ -132,6 +134,111 @@ void test_disabled_uses_wall_clock()
              "of virtual time that must be ignored)", elapsed_ms);
 }
 
+// ---------------------------------------------------------------------------
+// (a.7) CONNECT-UNDER-LOAD ROOT-CAUSE TEST (fix/sim-connect-virtual-clock).
+//
+// In the two-process `-x sim` paced sim, the handshake DEADLINES are virtual
+// (cl_timer reads of the sample-driven clock), but the paired SETTLE/POLL waits
+// (pumped_settle_wait: the RSP turnaround arq_responder.cc:174, the CMD 50ms
+// HAIL poll arq_commander.cc:585) FELL TO A VERBATIM WALL msleep. Under host CPU
+// load the relay's RT pacer re-anchors and the shared virtual clock advances
+// SLOWER than wall, so a wall msleep(N) overshoots its virtual budget — the
+// settle desyncs from the deadline it pairs with and the RSP reply lands outside
+// the CMD window (connect misses). The FIX routes pumped_settle_wait's
+// two-process path through the SAME virtual clock the deadlines use.
+//
+// This test reproduces the desync DETERMINISTICALLY (no host load needed): a
+// background thread advances the virtual clock at HALF wall-speed (48 samples
+// per real ms = 1 virtual ms per 2 real ms), mimicking the relay falling behind
+// wall under load. We then call pumped_settle_wait(WAIT_MS) and measure how much
+// VIRTUAL time elapsed across the call (delta of cl_timer virtual reads taken
+// before/after).
+//
+//   FAIL-BEFORE (pre-fix wall msleep): the call sleeps WAIT_MS of WALL time, and
+//     at half-speed only ~WAIT_MS/2 virtual ms accrue -> virtual delta ~= 50.
+//   PASS-AFTER (virtual-clock spin): the call waits for WAIT_MS of VIRTUAL time
+//     -> virtual delta ~= WAIT_MS (100), measured on the SAME clock the deadline
+//     uses, immune to the wall-vs-virtual rate mismatch.
+//
+// The assertion (virtual delta >= 90) PASSES only when the wait is governed by
+// the virtual clock (the fix); the pre-fix wall msleep yields ~50 and FAILS it.
+// Pump is null here (no SIM_INPROC stepper) so this exercises EXACTLY the
+// two-process `-x sim` path the fix changes.
+void test_pumped_settle_wait_is_virtual_clock_faithful()
+{
+    SimEnableGuard g;                 // sim_clock_enabled() == 1; pump stays null
+
+    const int WAIT_MS = 100;          // virtual ms requested of pumped_settle_wait
+    // Half-speed virtual clock: 48 samples == 1 virtual ms; emit every ~2 real
+    // ms => virtual advances at HALF wall rate (the relay-behind-wall condition).
+    std::atomic<bool> stop_pacer{false};
+    std::thread pacer([&]() {
+        while (!stop_pacer.load())
+        {
+            sim_clock_add_samples(48);   // +1 virtual ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));  // 2 real ms
+        }
+    });
+
+    // Measure VIRTUAL time consumed across the call (same clock the deadlines use).
+    cl_timer vt;
+    vt.start();
+    pumped_settle_wait(WAIT_MS);
+    int virtual_delta_ms = vt.get_elapsed_time_ms();
+
+    stop_pacer.store(true);
+    pacer.join();
+
+    // Virtual-clock-faithful => the wait spans ~WAIT_MS of VIRTUAL time. The
+    // pre-fix wall msleep spans WAIT_MS of WALL time, during which only
+    // ~WAIT_MS/2 virtual ms accrue (half-speed pacer) -> ~50, which FAILS this.
+    SC_CHECK(virtual_delta_ms >= WAIT_MS - 10,
+             "a7_pumped_settle_wait_virtual_clock_faithful",
+             "pumped_settle_wait(%d) advanced only %d VIRTUAL ms (want >= %d). "
+             "A wall msleep (pre-fix) returns after %d WALL ms, accruing only "
+             "~%d virtual ms at half-speed -> desyncs from the virtual deadline",
+             WAIT_MS, virtual_delta_ms, WAIT_MS - 10, WAIT_MS, WAIT_MS / 2);
+}
+
+// (a.8) PRODUCTION GUARD: with sim DISABLED, pumped_settle_wait is the verbatim
+// wall msleep (byte-identical to stock / HW). A real WAIT_MS sleep must elapse
+// in WALL time, and the virtual clock (which we spin fast in the background)
+// must have NO bearing on when it returns. This proves the fix did not touch the
+// production/HW path.
+void test_pumped_settle_wait_production_is_wall()
+{
+    sim_clock_set_enabled(0);         // production / HW mode
+
+    const int WAIT_MS = 60;
+    // Spin the virtual clock FAST in the background; production must ignore it.
+    std::atomic<bool> stop_pacer{false};
+    std::thread pacer([&]() {
+        while (!stop_pacer.load())
+        {
+            sim_clock_add_samples(48000);  // +1000 virtual ms per tick — ignored
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    auto t0 = std::chrono::steady_clock::now();
+    pumped_settle_wait(WAIT_MS);
+    auto t1 = std::chrono::steady_clock::now();
+    int wall_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+        t1 - t0).count();
+
+    stop_pacer.store(true);
+    pacer.join();
+
+    // Production msleep(60): real-time-bounded (>= ~50, < 5000), NOT short-
+    // circuited to ~0 by the fast virtual clock and NOT inflated to the seconds
+    // of virtual time we injected.
+    SC_CHECK(wall_ms >= WAIT_MS - 15 && wall_ms < 5000,
+             "a8_pumped_settle_wait_production_is_wall",
+             "production pumped_settle_wait(%d) took %d ms wall (want ~%d, "
+             "wall-bounded). The fix must not touch the sim-disabled path.",
+             WAIT_MS, wall_ms, WAIT_MS);
+}
+
 // (a.6) enabled()/set_enabled() flag round-trips and leaves FALSE at the end.
 void test_flag_roundtrip()
 {
@@ -156,6 +263,8 @@ int run_sim_clock_tests()
     test_timer_additive_monotonic();
     test_now_ns_mapping_exact();
     test_disabled_uses_wall_clock();
+    test_pumped_settle_wait_is_virtual_clock_faithful();
+    test_pumped_settle_wait_production_is_wall();
     test_flag_roundtrip();
     // Safety: leave production default no matter what.
     sim_clock_set_enabled(0);
