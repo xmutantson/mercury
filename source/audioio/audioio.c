@@ -1661,6 +1661,32 @@ static int sim_connect_once(void)
 // to the relay in fixed-size chunks. When idle, send silence so the relay's
 // per-direction sample clock keeps advancing (the channel must add noise even
 // during TX gaps, exactly like RF — a silent peer still hears the channel).
+//
+// CAPTURE-DETERMINISM (data-flow-sim-tx-turnaround-phase.md, sim-arq-channel.md
+// §15/§16): the IDLE silence-emission RATE used to be wall-clock-paced
+// (sim_paced_wait: Sleep(1)=1 ms on Windows vs nanosleep(200 us) on POSIX), so
+// during a half-duplex turnaround POSIX minted ~5x more silence chunks per unit
+// of wall time than Windows. The relay forwards those chunks 1:1 and stamps a
+// per-direction END-sample index, so the OS-dependent silence COUNT lands the
+// reverse HAIL/control burst at an OS-dependent ABSOLUTE sample position in the
+// receiver's capture window -> the fixed-geometry frame extraction / correlator
+// captures a misaligned window on one OS but not the other (Linux 0/8 vs
+// Windows 8/8 connect, OS-deterministic). The free 48 kHz capture DMA on real
+// radios has no such artifact: the turnaround is a fixed PHYSICAL number of
+// channel samples on any host. To restore that invariant in the 2-process sim
+// WITHOUT touching the decode/correlator numerics, PACE THE IDLE SILENCE
+// EMISSION TO THE SHARED VIRTUAL CLOCK: ship a silence chunk only when this
+// peer's own TX sample count is BEHIND virtual time, so the number of silence
+// chunks minted in a turnaround is a deterministic function of VIRTUAL elapsed
+// samples — identical on every OS because under --wire-stamp BOTH peers read the
+// SAME relay timeline (sim_clock_set_samples on RX arrival). Real signal is
+// NEVER throttled (it always advances the wire + the other peer's clock), so
+// the throttle cannot deadlock: whenever a peer is "ahead" of virtual time it
+// has already put chunks on the wire that advance the shared clock, which then
+// releases the throttle. Gated on sim_clock_wire_stamp() (the 2-process
+// phase-lock path the harness drives); every other path keeps the legacy
+// emit-one-per-wall-tick behavior byte-identically (HW never enters this thread
+// at all — the SIM branch is the only producer of -x sim TX).
 void *sim_tx_bridge_thread(void *unused)
 {
 	(void)unused;
@@ -1668,6 +1694,12 @@ void *sim_tx_bridge_thread(void *unused)
 
 	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
 	double *chunk = (double *)malloc(chunk_bytes);
+
+	// Clock-paced idle-silence throttle: engaged only on the wire-stamped
+	// 2-process phase-lock path. tx_samples = this peer's TX direction sample
+	// count (chunks shipped * SIM_CHUNK_SAMPLES).
+	const int clock_paced_idle = sim_clock_wire_stamp();
+	uint64_t  tx_samples = 0;
 
 	while (!shutdown_) {
 		size_t avail = size_buffer(playback_buffer);
@@ -1686,15 +1718,45 @@ void *sim_tx_bridge_thread(void *unused)
 			memset(chunk, 0, chunk_bytes);
 			read_buffer(playback_buffer, (uint8_t *)chunk, (int)avail);
 		} else {
-			// No TX queued: send a silence chunk so the relay clock advances
+			// No TX queued: emit a silence chunk so the relay clock advances
 			// and the RX side still receives a noise floor (RF realism).
-			memset(chunk, 0, chunk_bytes);
-			sim_paced_wait(5);
+			if (clock_paced_idle) {
+				// Pace silence to the SHARED virtual clock so the per-turnaround
+				// silence COUNT is OS-invariant. Only mint silence when this
+				// peer's TX sample count is BEHIND virtual time; otherwise wait
+				// and re-poll WITHOUT sending (do NOT advance tx_samples). The
+				// clock advances on RX arrival (the other peer's chunks, relay-
+				// driven), so this peer always catches up and never spins
+				// unbounded. Bootstrap: before any chunk flows the shared clock
+				// is 0; vnow==0 < tx_samples is false only at the very first
+				// iteration (tx_samples==0), so the first silence chunk is sent
+				// immediately to kick the handshake, after which both peers track
+				// the same relay timeline.
+				uint64_t vnow = sim_clock_now_samples();
+				if (tx_samples > vnow) {
+					// Ahead of channel time — yield the core and re-poll. No send,
+					// no counter advance. The 5 ms arg is a wall-pace floor only;
+					// the DECISION (whether to send) is on virtual time, so the
+					// emitted COUNT is wall-rate-independent and OS-invariant.
+					sim_paced_wait(5);
+					continue;
+				}
+				memset(chunk, 0, chunk_bytes);
+			} else {
+				// Legacy (non-wire-stamp / bootstrap) path: one silence chunk per
+				// wall tick — byte-identical to the pre-fix behavior.
+				memset(chunk, 0, chunk_bytes);
+				sim_paced_wait(5);
+			}
 		}
 		if (sim_send_all(sim_sock, (const uint8_t *)chunk, chunk_bytes) != 0) {
 			printf("[SIM] TX bridge send failed (relay closed?)\n");
 			break;
 		}
+		// Count every chunk actually shipped (signal, partial, or paced silence)
+		// so the idle throttle measures THIS peer's TX-direction sample position
+		// against the shared virtual clock.
+		tx_samples += SIM_CHUNK_SAMPLES;
 	}
 	free(chunk);
 	return NULL;
