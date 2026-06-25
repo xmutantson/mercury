@@ -710,6 +710,12 @@ void cl_arq_controller::process_messages_commander()
 				       current_configuration, target);
 				fflush(stdout);
 				negotiated_configuration = target;
+				// CLIMB-UP bsi rollback (data-flow-inband-frame0-rolling-partial.md §13): the
+				// optimizer is the FOURTH SET_CONFIG climb-up producer (governs configs >=6).
+				// Capture+roll BEFORE cleanup() so any un-ACKed in-flight batch re-presents
+				// CONTIGUOUSLY at the new config (no >=2 gap-gate HOLD). No-op off the v2 in-order
+				// path / when nothing is in flight (gated inside the helper).
+				roll_back_cmd_bsi_to_inflight("OPT");
 				cleanup();
 				add_message_control(SET_CONFIG);
 				opt_reset_window();
@@ -3176,6 +3182,320 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	add_message_control(SET_CONFIG);
 	this->connection_status = TRANSMITTING_CONTROL;
 	return true;
+}
+
+// CLIMB-UP cmd_batch_seq_id rollback (data-flow-inband-frame0-rolling-partial.md §13).
+// The CLIMB-UP counterpart of the demote/BREAK lossless rollback. The demote paths
+// (inband_route_failure_demote :3086-3134, CFG16-HOLD :5037, M6 BREAK :5242) roll
+// cmd_batch_seq_id back to the EARLIEST (mod-256) in-flight batch_seq_id before freeing
+// messages_tx[] so the re-sent batch is CONTIGUOUS with the RSP delivery high-water; the
+// CLIMB-UP SET_CONFIG emits (FRAME-UP gearshift, optimizer, turbo settle) did NOT — a
+// SYMMETRY GAP. On a rapid mid-transfer climb the in-flight (already-RSP-delivered,
+// not-yet-CMD-ACKed) batch is re-presented under whatever ADVANCED epoch the climb
+// reached, so sack_v2_readopt_has_gap()/delivery_step_is_gap() see a >=2 jump from the
+// RSP's preserved high-water -> [RSP-V2-GAP-ABORT] and delivery HOLDS (bytes ARQ-ACKed
+// but never FIFO-pushed). The bytes are correct; only the bsi-epoch LABEL is wrong.
+//
+// This is DISTINCT from (and orthogonal to) the FIX-1 hole-defer
+// (inband_climb_hole_outstanding, :5654): that defers the climb while a partial-SACK
+// retx hole is outstanding (retransmit_count > 0); this corrects the epoch LABEL of the
+// in-flight messages_tx[] frames a CLEAN climb re-presents (retransmit_count may be 0).
+//
+// Capture loop is VERBATIM-identical to the demote rollback (:3086-3104). All non-FREE
+// frames of an in-flight block share ONE batch_seq_id (one batch in flight on the
+// per-frame path), so the EARLIEST mod-256 non-FREE bsi IS the in-flight batch's bsi.
+// Gated IDENTICALLY to the demote rollback (sack_v2_enabled && !compression_enabled — the
+// compression path's restore_tx_from_compressed() owns its own re-stage; v1 sessions
+// never read the v2 gap-gate). MUST run BEFORE the caller frees messages_tx[]. Returns
+// the rolled-to bsi, or -1 (gated off / nothing in flight). The RSP gap-gate is NOT
+// loosened (the no-silent-wrong-bytes backstop is untouched) — the producer is corrected
+// so the gate never fires on a legitimate climb while still catching a genuine hole.
+int cl_arq_controller::roll_back_cmd_bsi_to_inflight(const char* tag)
+{
+#ifdef INBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE
+	// FAIL-BEFORE arm (the pre-rollback redesign): the climb-UP re-present stays at the
+	// ADVANCED epoch -> the directed test's pass-after assert (the re-present is contiguous
+	// with the RSP high-water) FAILS, proving the rollback is load-bearing.
+	(void)tag;
+	return -1;
+#else
+	if(!(sack_v2_enabled && !compression_enabled))
+		return -1;
+
+	int min_inflight_bsi = -1;
+	for(int i=0; i<nMessages; i++)
+	{
+		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+		{
+			int b = messages_tx[i].batch_seq_id & 0xFF;
+			if(min_inflight_bsi < 0)
+				min_inflight_bsi = b;
+			else
+			{
+				// keep the mod-256-EARLIER bsi (forward distance b->min in
+				// [1,128] means min is later, so b is earlier).
+				unsigned fwd = ((unsigned)(min_inflight_bsi - b)) & 0xFFu;
+				if(fwd >= 1u && fwd <= 128u)
+					min_inflight_bsi = b;
+			}
+		}
+	}
+
+	if(min_inflight_bsi >= 0)
+	{
+		printf("[%s] CLIMB-UP LOSSLESS PROMOTE: rolling cmd_batch_seq_id %d -> %d "
+			"so the re-sent batch carries the in-flight (contiguous) bsi "
+			"(no RSP-V2-GAP-ABORT hold)\n",
+			tag ? tag : "CLIMB", cmd_batch_seq_id & 0xFF, min_inflight_bsi);
+		fflush(stdout);
+		cmd_batch_seq_id = min_inflight_bsi;
+	}
+	return min_inflight_bsi;
+#endif
+}
+
+// CLI: --test-climb-bsi-rollback  (data-flow-inband-frame0-rolling-partial.md §13)
+//
+// Drives the REAL producer (roll_back_cmd_bsi_to_inflight) AND the REAL RSP-side predicate
+// (sack_v2_readopt_has_gap) — no PHY/audio. The climb-UP promote SET_CONFIG emits re-present
+// an in-flight (already-RSP-delivered, not-yet-CMD-ACKed) batch under whatever cmd_batch_seq_id
+// epoch a rapid climb advanced to. If that epoch outran the in-flight bsi, the RSP's
+// sack_v2_readopt_has_gap() sees a >=2 jump from its preserved delivery high-water and HOLDS
+// delivery (bytes ARQ-ACKed but never FIFO-pushed). The fix rolls cmd_batch_seq_id back to the
+// in-flight bsi so the re-present is CONTIGUOUS. FAIL-BEFORE arm: build with
+// -DINBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE (the helper is neutered to a no-op) — the re-present
+// stays at the advanced epoch -> still a gap -> the pass-after assert FAILS. Returns 0 pass /
+// 1 fail. Default builds never call this except via the --test battery.
+int cl_arq_controller::test_climb_bsi_rollback()
+{
+#ifdef INBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE
+	const bool failbefore = true;
+#else
+	const bool failbefore = false;
+#endif
+	printf("[TEST-CLIMB-BSI] start (failbefore=%d)\n", failbefore ? 1 : 0);
+	fflush(stdout);
+
+	// Buffers (mirror the other directed in-process tests' Step-0 alloc).
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-CLIMB-BSI] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	int fails = 0;
+
+	// Helper: seed an in-flight batch in messages_tx[]: `nframes` non-FREE frames all
+	// sharing batch_seq_id=`bsi`. Everything else FREE.
+	auto seed_inflight = [&](int bsi, int nframes)
+	{
+		for(int i=0;i<nMessages;i++)
+		{
+			messages_tx[i].status        = FREE;
+			messages_tx[i].length        = 0;
+			messages_tx[i].batch_seq_id  = 0;
+		}
+		for(int i=0;i<nframes && i<nMessages;i++)
+		{
+			messages_tx[i].status       = PENDING_ACK;
+			messages_tx[i].length       = 32;          // length>0 so it counts
+			messages_tx[i].batch_seq_id = bsi & 0xFF;
+		}
+	};
+
+	// === ARM 1: the climb-up reproduction =================================
+	// RSP delivered up through high-water last_delivered=H. The in-flight batch
+	// (RSP-delivered, not yet CMD-ACKed) is the contiguous successor bsi=H+1. A rapid
+	// mid-transfer climb advanced cmd_batch_seq_id to H+1+K (K>=1) — the epoch outran the
+	// in-flight batch. Drive the REAL producer + predicate.
+	{
+		const int H = 4;                             // RSP delivery high-water
+		const int inflight_bsi = (H + 1) & 0xFF;     // 5
+		const int advanced     = (H + 1 + 3) & 0xFF; // 8 (epoch outran by 3)
+
+		this->sack_v2_enabled     = true;
+		this->compression_enabled = false;
+		this->cmd_batch_seq_id    = advanced;
+		seed_inflight(inflight_bsi, /*nframes=*/6);
+
+		// Pre-check: WITHOUT any rollback the re-present (==cmd_batch_seq_id) is a >=2 gap
+		// from H -> the RSP would HOLD. This is the bug being fixed.
+		if(!sack_v2_readopt_has_gap(this->cmd_batch_seq_id, H))
+		{
+			printf("[TEST-CLIMB-BSI] FAIL ARM1: precondition — advanced epoch %d is NOT a "
+				"gap vs last_delivered=%d (test setup wrong)\n",
+				this->cmd_batch_seq_id & 0xFF, H);
+			fails++;
+		}
+
+		// Apply the production rollback (a no-op in the FAILBEFORE build).
+		roll_back_cmd_bsi_to_inflight("TEST-CLIMB-BSI");
+		bool has_gap = sack_v2_readopt_has_gap(this->cmd_batch_seq_id, H);
+
+		if(failbefore)
+		{
+			// fail-before: epoch stays advanced -> still a gap -> RSP HOLDS (bug reproduced).
+			if(this->cmd_batch_seq_id != advanced || !has_gap)
+			{
+				printf("[TEST-CLIMB-BSI] ARM1(failbefore) unexpected: cmd=%d gap=%d "
+					"(want cmd=%d gap=1)\n",
+					this->cmd_batch_seq_id & 0xFF, has_gap?1:0, advanced);
+				fails++;
+			}
+			else
+				printf("[TEST-CLIMB-BSI] ARM1(failbefore) OK: no rollback -> re-present %d "
+					"is a gap vs last_delivered %d -> RSP would HOLD (bug reproduced)\n",
+					this->cmd_batch_seq_id & 0xFF, H);
+		}
+		else
+		{
+			// pass-after: rollback put cmd_batch_seq_id at the in-flight bsi (==H+1, the
+			// contiguous successor) -> NO gap -> delivery proceeds.
+			if(this->cmd_batch_seq_id != inflight_bsi)
+			{
+				printf("[TEST-CLIMB-BSI] FAIL ARM1: rollback did not land on the in-flight "
+					"bsi (=%d, want %d)\n", this->cmd_batch_seq_id & 0xFF, inflight_bsi);
+				fails++;
+			}
+			if(has_gap)
+			{
+				printf("[TEST-CLIMB-BSI] FAIL ARM1: after rollback re-present %d is STILL a "
+					"gap vs last_delivered %d (RSP would HOLD)\n",
+					this->cmd_batch_seq_id & 0xFF, H);
+				fails++;
+			}
+			if(this->cmd_batch_seq_id == inflight_bsi && !has_gap)
+				printf("[TEST-CLIMB-BSI] ARM1 OK: rollback -> re-present %d is contiguous "
+					"successor of last_delivered %d -> delivery proceeds\n",
+					this->cmd_batch_seq_id & 0xFF, H);
+		}
+	}
+
+	// === ARM 2: multi-frame same-batch + EARLIEST mod-256 + FREE hole ======
+	// Only the pass-after (rollback) arm is meaningful; the FAILBEFORE no-op leaves the
+	// epoch advanced (already proven in ARM1), so assert the roll only when !failbefore.
+	{
+		const int H = 200;                       // near the wrap to exercise mod-256
+		const int inflight_bsi = (H + 1) & 0xFF; // 201
+		const int advanced     = (H + 1 + 5) & 0xFF;
+
+		this->sack_v2_enabled     = true;
+		this->compression_enabled = false;
+		this->cmd_batch_seq_id    = advanced;
+		seed_inflight(inflight_bsi, /*nframes=*/4);
+		messages_tx[2].status = FREE;   // FREE hole the status!=FREE check must skip
+		messages_tx[2].length = 0;
+
+		roll_back_cmd_bsi_to_inflight("TEST-CLIMB-BSI-A2");
+		if(!failbefore)
+		{
+			if(this->cmd_batch_seq_id != inflight_bsi)
+			{
+				printf("[TEST-CLIMB-BSI] FAIL ARM2: rolled to %d, want in-flight %d\n",
+					this->cmd_batch_seq_id & 0xFF, inflight_bsi);
+				fails++;
+			}
+			if(sack_v2_readopt_has_gap(this->cmd_batch_seq_id, H))
+			{
+				printf("[TEST-CLIMB-BSI] FAIL ARM2: re-present %d still a gap vs %d\n",
+					this->cmd_batch_seq_id & 0xFF, H);
+				fails++;
+			}
+		}
+	}
+
+	// === ARM 3: mod-256 WRAP ==============================================
+	// last_delivered=255, in-flight batch bsi=0, epoch advanced to 3. Rollback ->
+	// cmd_batch_seq_id=0 -> readopt_has_gap(0,255)=false (mod-256 successor).
+	{
+		const int H = 255;
+		const int inflight_bsi = 0;
+		const int advanced     = 3;
+
+		this->sack_v2_enabled     = true;
+		this->compression_enabled = false;
+		this->cmd_batch_seq_id    = advanced;
+		seed_inflight(inflight_bsi, /*nframes=*/3);
+
+		if(!sack_v2_readopt_has_gap(advanced, H))
+		{
+			printf("[TEST-CLIMB-BSI] FAIL ARM3: precondition gap not seen (epoch %d vs %d)\n",
+				advanced, H);
+			fails++;
+		}
+		roll_back_cmd_bsi_to_inflight("TEST-CLIMB-BSI-A3");
+		if(!failbefore)
+		{
+			if(this->cmd_batch_seq_id != inflight_bsi)
+			{
+				printf("[TEST-CLIMB-BSI] FAIL ARM3: rolled to %d, want %d (wrap)\n",
+					this->cmd_batch_seq_id & 0xFF, inflight_bsi);
+				fails++;
+			}
+			if(sack_v2_readopt_has_gap(this->cmd_batch_seq_id, H))
+			{
+				printf("[TEST-CLIMB-BSI] FAIL ARM3: re-present %d still a gap vs %d (wrap)\n",
+					this->cmd_batch_seq_id & 0xFF, H);
+				fails++;
+			}
+		}
+	}
+
+	// === ARM 4: GATED NO-OP — compression on, v2 off, no in-flight =========
+	// The helper must NOT touch cmd_batch_seq_id in any of these (byte-identical to the
+	// legacy non-rolled emit). Independent of the FAILBEFORE arm (the helper returns -1
+	// for these reasons in BOTH builds).
+	{
+		// (a) compression_enabled = true -> no-op
+		this->sack_v2_enabled     = true;
+		this->compression_enabled = true;
+		this->cmd_batch_seq_id    = 42;
+		seed_inflight(/*bsi=*/10, /*nframes=*/5);
+		int rc_a = roll_back_cmd_bsi_to_inflight("TEST-CLIMB-BSI-A4a");
+		if(rc_a != -1 || this->cmd_batch_seq_id != 42)
+		{
+			printf("[TEST-CLIMB-BSI] FAIL ARM4a: compression-on rolled (rc=%d cmd=%d)\n",
+				rc_a, this->cmd_batch_seq_id & 0xFF);
+			fails++;
+		}
+
+		// (b) sack_v2_enabled = false -> no-op
+		this->sack_v2_enabled     = false;
+		this->compression_enabled = false;
+		this->cmd_batch_seq_id    = 43;
+		seed_inflight(/*bsi=*/10, /*nframes=*/5);
+		int rc_b = roll_back_cmd_bsi_to_inflight("TEST-CLIMB-BSI-A4b");
+		if(rc_b != -1 || this->cmd_batch_seq_id != 43)
+		{
+			printf("[TEST-CLIMB-BSI] FAIL ARM4b: v2-off rolled (rc=%d cmd=%d)\n",
+				rc_b, this->cmd_batch_seq_id & 0xFF);
+			fails++;
+		}
+
+		// (c) v2 on, no compression, but NOTHING in flight -> no-op
+		this->sack_v2_enabled     = true;
+		this->compression_enabled = false;
+		this->cmd_batch_seq_id    = 44;
+		for(int i=0;i<nMessages;i++){ messages_tx[i].status=FREE; messages_tx[i].length=0; }
+		int rc_c = roll_back_cmd_bsi_to_inflight("TEST-CLIMB-BSI-A4c");
+		if(rc_c != -1 || this->cmd_batch_seq_id != 44)
+		{
+			printf("[TEST-CLIMB-BSI] FAIL ARM4c: no-inflight rolled (rc=%d cmd=%d)\n",
+				rc_c, this->cmd_batch_seq_id & 0xFF);
+			fails++;
+		}
+	}
+
+	printf("[TEST-CLIMB-BSI] %s (fails=%d, failbefore=%d)\n",
+		fails==0 ? "PASS" : "FAIL", fails, failbefore ? 1 : 0);
+	fflush(stdout);
+	return fails==0 ? 0 : 1;
 }
 
 // STAGE 4c — the commander-side true-session-loss floor (the ONLY commander BREAK
@@ -5716,6 +6036,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				fflush(stdout);
 				consecutive_data_acks = 0;
 
+				// CLIMB-UP bsi rollback (data-flow-inband-frame0-rolling-partial.md §13):
+				// capture the in-flight batch's bsi BEFORE the FIFO-restore loop below frees
+				// messages_tx[], then roll cmd_batch_seq_id back to it so the re-encoded batch
+				// re-presents CONTIGUOUSLY with the RSP delivery high-water (no >=2 gap-gate HOLD
+				// on a rapid mid-transfer climb). The PRIMARY in-band climb-up site. No-op off the
+				// v2 in-order path / when nothing is in flight (gated inside the helper). DISTINCT
+				// from the FIX-1 hole-defer above (that gates retx holes; this gates the in-flight
+				// epoch LABEL — orthogonal). Mirrors the demote rollback (inband_route_failure_demote
+				// :3134) EXACTLY against the same two consumers (:1948 new-data stamp, :3953 SACK
+				// in-window).
+				roll_back_cmd_bsi_to_inflight("GEARSHIFT");
+
 				// Put all pending data back into TX FIFO for re-encoding at new config
 				if(compression_enabled)
 				{
@@ -5849,6 +6181,15 @@ void cl_arq_controller::finish_turbo_direction()
 		// underruns + LDPC iter=101 max-out on RSP (gearshift_v7 finding).
 		// See SUPERSHIFT path at line ~1444-1460 for the correct pattern
 		// (sets neg cfg, queues SET_CONFIG, never load_configuration locally).
+		//
+		// CLIMB-UP bsi rollback (data-flow-inband-frame0-rolling-partial.md §13): this is
+		// the turbo OVER-CLIMB settle emitter (settles to start_config, which can be UP from
+		// the probe-failed rung). cleanup() below frees ACKED/FAILED frames; any un-ACKed
+		// in-flight batch SURVIVES into the re-present at the settle config. Capture+roll
+		// BEFORE cleanup() so that re-present is CONTIGUOUS with the RSP high-water (no >=2
+		// gap-gate HOLD). No-op when no batch is in flight (single-frame turbo probe) or off
+		// the v2 in-order path (gated inside the helper).
+		roll_back_cmd_bsi_to_inflight("TURBO");
 		cleanup();
 		add_message_control(SET_CONFIG);
 		connection_status = TRANSMITTING_CONTROL;

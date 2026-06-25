@@ -1597,6 +1597,18 @@ public:
   // See fact-documents/data-flow-inband-frame0-rolling-partial.md §10.
   int test_inband_climb_defer_on_retx();
 
+  // CLIMB-UP cmd_batch_seq_id rollback regression (CLI --test-climb-bsi-rollback). The
+  // SYMMETRY GAP to the FIX-1 defer: the climb-UP SET_CONFIG emits re-present an in-flight
+  // (already-RSP-delivered, not-yet-CMD-ACKed) batch under whatever ADVANCED epoch a rapid
+  // mid-transfer climb reached; without the rollback the re-present is a >=2 bsi jump from
+  // the RSP's preserved delivery high-water -> sack_v2_readopt_has_gap()=true -> the RSP
+  // HOLDS delivery ([RSP-V2-GAP-ABORT]). Drives the REAL producer
+  // (roll_back_cmd_bsi_to_inflight) + the REAL RSP predicate (sack_v2_readopt_has_gap) — no
+  // PHY/audio. Returns 0 pass / 1 fail. Default builds never call this. Fails-before:
+  // -DINBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE (the helper is neutered to a no-op).
+  // See fact-documents/data-flow-inband-frame0-rolling-partial.md §13.
+  int test_climb_bsi_rollback();
+
   // climb-engine integrated regression (CLI --test-climb-engine). Parts A-H,
   // each fail-before / pass-after its fix:
   // (a) Bug 1: sack_clean_confirmation_accepted() split-dedupe — an all-ones
@@ -3872,6 +3884,25 @@ public:
   // demote (caller must `return` — the demote owns the next transition). MUST be
   // called only with a valid lower rung (caller checks !config_is_at_bottom).
   bool inband_route_failure_demote(int demote_target, const char* reason);
+  // roll_back_cmd_bsi_to_inflight: the CLIMB-UP counterpart of the demote bsi rollback
+  // (data-flow-inband-frame0-rolling-partial.md §13). The demote/BREAK paths
+  // (inband_route_failure_demote :3134, CFG16-HOLD :5037, M6 BREAK :5242) roll
+  // cmd_batch_seq_id back to the earliest in-flight batch_seq_id before freeing
+  // messages_tx[]; the CLIMB-UP SET_CONFIG emits (FRAME-UP gearshift, optimizer, turbo
+  // settle) did NOT — a SYMMETRY GAP. On a rapid mid-transfer climb the in-flight
+  // (already-RSP-delivered, not-yet-CMD-ACKed) batch is re-presented under whatever
+  // ADVANCED epoch the climb reached, so sack_v2_readopt_has_gap()/delivery_step_is_gap()
+  // see a >=2 jump from the RSP's preserved delivery high-water -> [RSP-V2-GAP-ABORT].
+  // This helper scans messages_tx[] for the EARLIEST (mod-256) in-flight (non-FREE,
+  // length>0) batch_seq_id and rolls cmd_batch_seq_id back to it so the climb-UP
+  // re-present is CONTIGUOUS. Gated IDENTICALLY to the demote rollback
+  // (sack_v2_enabled && !compression_enabled — the compression path's
+  // restore_tx_from_compressed() owns its own re-stage; v1 never reads the v2 gap-gate).
+  // MUST be called BEFORE the caller frees messages_tx[]. Returns the rolled-to bsi, or
+  // -1 (no-op: gated off / nothing in flight). DISTINCT from the FIX-1 hole-defer
+  // (inband_climb_hole_outstanding gates retransmit_count>0 retx holes; this gates the
+  // in-flight epoch LABEL — the two are orthogonal).
+  int roll_back_cmd_bsi_to_inflight(const char* tag);
   // Commander-side true-session-loss floor (the ONLY commander BREAK permitted under
   // inband). Counts consecutive Class-A total-loss batches that occur WHILE already
   // at the ladder bottom (nowhere left to demote). Reset to 0 on any data-ACK

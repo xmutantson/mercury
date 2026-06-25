@@ -835,6 +835,19 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_p1;
                 failed += test_p1.test_inband_plus1_climb();
             }
+            // CLIMB-UP cmd_batch_seq_id ROLLBACK regression
+            // (data-flow-inband-frame0-rolling-partial.md §13): the SYMMETRY GAP to the demote
+            // rollback — the climb-UP SET_CONFIG emits (FRAME-UP, optimizer, turbo settle)
+            // re-present an in-flight (RSP-delivered, not-yet-CMD-ACKed) batch under whatever
+            // ADVANCED epoch a rapid climb reached, so the RSP sees a >=2 bsi jump from its
+            // preserved delivery high-water -> sack_v2_readopt_has_gap()=true -> [RSP-V2-GAP-ABORT]
+            // HOLD. The fix rolls cmd_batch_seq_id back to the in-flight bsi (mirroring the demote
+            // paths). Drives the REAL producer + REAL RSP predicate. PURE in-process synthetic-fire
+            // — permanent regression gate. Fails-before: -DINBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE.
+            {
+                cl_arq_controller test_cbr;
+                failed += test_cbr.test_climb_bsi_rollback();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -924,6 +937,19 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-climb-defer") == 0) {
             cl_arq_controller ARQ_cd;
             int failed = ARQ_cd.test_inband_climb_defer_on_retx();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-climb-bsi-rollback : run ONLY the climb-UP cmd_batch_seq_id rollback regression
+        // (the SYMMETRY GAP to the demote rollback — the climb-UP SET_CONFIG emits must roll
+        // cmd_batch_seq_id back to the in-flight bsi before re-presenting an already-RSP-delivered
+        // batch, else the re-present is a >=2 bsi jump from the RSP high-water -> GAP-ABORT HOLD)
+        // and exit. Fast + deterministic; drives the REAL producer + REAL sack_v2_readopt_has_gap;
+        // see arq_commander.cc::test_climb_bsi_rollback + data-flow-inband-frame0-rolling-partial.md
+        // §13. Build with -DINBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE to reproduce the fails-before
+        // (the re-present stays at the advanced epoch -> gap -> RSP HOLD).
+        if (strcmp(argv[i], "--test-climb-bsi-rollback") == 0) {
+            cl_arq_controller ARQ_cbr;
+            int failed = ARQ_cbr.test_climb_bsi_rollback();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-plus1-climb : run ONLY the in-band +1 climb regression (the FRAME-UP

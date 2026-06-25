@@ -607,3 +607,103 @@ orphan; the real residual is the DELIVERY-loop / climb-speed root §9.2/§2 alre
 STATUS: NO FIX-3 code implemented. FIX (i) is safety-falsified (re-opens the orphan); FIX (ii) is real but
 prompt-gated on FIX (i) and is an owner decision testable by an env flag first. The next lever remains the
 DELIVERY-loop / climb-speed root (§2/§9.2), not the FIX-1 hole-gate.
+
+## §13 FIX IMPLEMENTED — climb-UP `cmd_batch_seq_id` rollback (the demote-symmetry gap) (2026-06-24, this session, HEAD 2eff90a)
+
+### §13.1 Root (VERIFIED on this HEAD, firsthand source read — NOT inherited)
+A SECOND, DISTINCT bsi-renumber co-exists at the climb-up emit, orthogonal to the FIX-1 hole-defer (§10).
+The DEMOTE/BREAK recovery paths roll `cmd_batch_seq_id` back to the earliest in-flight `batch_seq_id`
+BEFORE freeing `messages_tx[]`, so a re-presented batch stays CONTIGUOUS with the RSP's preserved delivery
+high-water (VERIFIED on a3): `inband_route_failure_demote` (arq_commander.cc:3086-3134), CFG16-HOLD FIX-9
+demote (:5037), M6 BREAK (:5242). The CLIMB-UP SET_CONFIG emits did **NOT** roll back — a SYMMETRY GAP:
+- FRAME-UP gearshift climb (arq_commander.cc:~5730, after `consecutive_data_acks=0`, before the FIFO-restore
+  + `clear_retx_queue()`): re-presents in-flight `messages_tx[]` data, frees it, emits SET_CONFIG — NO bsi
+  roll. PRIMARY in-band site. (V)
+- Optimizer climb (arq_commander.cc:~712, before `cleanup()`): the FOURTH SET_CONFIG producer (governs
+  configs >=6). NO bsi roll. (V)
+- Turbo over-climb settle `finish_turbo_direction()` (arq_commander.cc:~5852, before `cleanup()`): settles
+  to `start_config` (can be UP). NO bsi roll. (V — turbo is INACTIVE on the in-band climb per §8.4, but the
+  helper is a safe no-op when nothing is in flight, and the gap is real on the legacy/turbo path.)
+
+On a rapid mid-transfer climb the in-flight (already-RSP-delivered, not-yet-CMD-ACKed) batch is re-encoded
+(arq_commander.cc:1948 stamps `messages_tx[i].batch_seq_id = cmd_batch_seq_id & 0xFF`) under whatever
+epoch the climb ADVANCED to, so `sack_v2_readopt_has_gap(adopted_bsi, last_delivered)` (arq.h:1480) /
+`delivery_step_is_gap` see a >=2 jump from the RSP high-water -> `[RSP-V2-GAP-ABORT]` -> delivery HOLDS
+(bytes ARQ-ACKed, never FIFO-pushed). The bytes are correct; only the bsi-epoch LABEL is wrong. (V)
+
+**ORTHOGONAL to FIX-1 (§10):** `inband_climb_hole_outstanding()` (arq_common.cc:3392) gates ONLY on
+`retransmit_count > 0` (a partial-SACK retx hole). The climb-up bsi-renumber strands in-flight
+`messages_tx[]` frames whose ACK simply hasn't returned (`retransmit_count` may be 0) — a CLEAN climb still
+re-stamps them under the advanced epoch. FIX-1's defer does NOT cover this; this fix does. (V)
+
+### §13.2 The fix
+New shared helper `roll_back_cmd_bsi_to_inflight(tag)` (arq_commander.cc:~3181, decl arq.h:~3875): scans
+`messages_tx[]` for the EARLIEST (mod-256) in-flight (status!=FREE && length>0) `batch_seq_id`, rolls
+`cmd_batch_seq_id` back to it. Capture loop VERBATIM-identical to the demote rollback (:3086-3104). Gated
+IDENTICALLY: `sack_v2_enabled && !compression_enabled` (no-op otherwise; the compression path's
+`restore_tx_from_compressed()` owns its re-stage; v1 never reads the v2 gap-gate). MUST run BEFORE the
+caller frees `messages_tx[]`. Wired into the three climb-up emit sites BEFORE any free/cleanup: FRAME-UP
+("GEARSHIFT"), optimizer ("OPT"), turbo settle ("TURBO"). Does NOT loosen the RSP gap-gate (the
+no-silent-wrong-bytes backstop is untouched — the producer is corrected so the gate never fires on a
+legitimate climb while still catching a genuine hole). FAIL-BEFORE neuter:
+`-DINBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE` makes the helper a no-op. (This is the verbatim port of the
+monitor-line `fix/climb-churn-bsi-rollback` commit 1fd4a73 helper, hand-placed at a3's emit sites; the
+a3 FRAME-UP path differs from monitor's so it is a HAND-PORT, not a clean cherry-pick — but the helper
+body + gate are byte-identical to both 1fd4a73 and a3's own demote rollback.)
+
+### §13.3 §5 CROSS-LAYER AUDIT (shared state: `cmd_batch_seq_id` — the CMD-side batch epoch)
+1. **Producers (writes)** (V — full sweep): arq_common.cc:641 init to 0; arq_commander.cc:2196 `+1 & 0xFF`
+   after each new-data `send_batch()` (the normal advance); :3134 (demote rollback, DOWNWARD); :5037
+   (CFG16-HOLD demote, DOWNWARD); :5242 (M6 BREAK, DOWNWARD); **NEW** the climb-up rollback helper at the
+   three climb-up emits (UPWARD-correcting, i.e. rolls the advanced epoch DOWN to the in-flight bsi).
+2. **Consumers (reads)** (V): arq_commander.cc:1948 new-data fill stamps `messages_tx[i].batch_seq_id =
+   (cmd_batch_seq_id & 0xFF)` — after the roll the re-encoded batch is stamped CONTIGUOUSLY with the RSP
+   high-water (the intended effect); arq_commander.cc:3953 `sack_v2_bsi_in_window(rx_bsi, cmd_batch_seq_id)`
+   SACK_RSP window gate — after the roll the window re-centers on the in-flight batch being re-transmitted
+   (correct). The RSP does NOT read `cmd_batch_seq_id` (it runs its own `rsp_*` window).
+3. **Valid states / default-init:** starts 0; before any new-data batch it is the bsi the NEXT batch will
+   carry. The roll fires only when >=1 in-flight non-FREE frame exists; else NO-OP (returns -1, counter
+   untouched) — session-start / no-traffic / between-batch states are byte-identical to pre-fix.
+4. **Invariants the consumers assume — preserved?** (V):
+   - INV-1: all non-FREE frames of an in-flight block share ONE `batch_seq_id` (one batch in flight on the
+     per-frame path) -> "earliest mod-256" == the in-flight bsi. SAME assumption the demote rollbacks rely
+     on; unchanged.
+   - INV-2: the re-presented batch must be `==last_delivered` (dedup) or `==last_delivered+1` (contiguous
+     successor) for the RSP to accept. The in-flight batch is by construction un-ACKed-but-delivered (==hw)
+     or un-ACKed-undelivered (==hw+1) -> the roll lands EXACTLY in the accept set.
+   - INV-3: mutual exclusivity — a single poll climbs OR demotes OR breaks, each with an immediate
+     `return`. No double-roll across the up + down rollbacks.
+   - INV-4 (the FIX-1/§10 interaction): the climb-up bsi roll and the FIX-1 hole-defer are ORTHOGONAL. When
+     a retx hole IS outstanding, FIX-1 holds the FRAME-UP fire entirely (the roll site is not reached); when
+     the hole has drained / a clean climb, the fire proceeds and the roll corrects the in-flight epoch
+     label. Neither weakens the other; both leave the RSP gap-gate intact. New-data batch advance (:2196)
+     and SACK bitmap indexing (:3953) re-verified — the roll only moves the epoch onto the in-flight batch,
+     which is exactly where those consumers expect the active batch.
+   - INV-5: compression path untouched (gate excludes it); v1 sessions never read the v2 gap-gate.
+5. **What the fix changes:** only the bsi LABEL of the re-presented climb-up batch (advanced epoch -> the
+   in-flight bsi). Behaviorally identical to the proven default-on demote rollbacks against the SAME two
+   consumers (:1948, :3953). No PHY/OFDM-config flow change; the lossless-requeue byte path (FIFO push-back
+   / `restore_tx_from_*`) is untouched — only bookkeeping is corrected. Legacy/v1/compression byte-identical.
+
+### §13.4 Test (CLAUDE.md §3) — in-process, no PHY/audio
+`test_climb_bsi_rollback()` (arq_commander.cc, decl arq.h, CLI `--test-climb-bsi-rollback`, also in the
+master `--test` battery). Drives the REAL producer (`roll_back_cmd_bsi_to_inflight`) + the REAL RSP
+predicate (`sack_v2_readopt_has_gap`). Arms: ARM1 reproduction (hw=4, in-flight=5, epoch outran to 8);
+ARM2 multi-frame same-batch + FREE-hole + near-wrap (hw=200); ARM3 mod-256 WRAP (hw=255, in-flight=0,
+epoch=3); ARM4 gated NO-OPs (compression-on, v2-off, no-in-flight).
+Evidence (V):
+- PASS-AFTER (default build): rolls 8->5 / 206->201 / 3->0, all contiguous (`sack_v2_readopt_has_gap`
+  false), PASS rc=0; the GAP-ABORT does NOT fire.
+- FAIL-BEFORE (`-DINBAND_CLIMB_BSI_ROLLBACK_FAILBEFORE`, forced rebuild): the helper is neutered ->
+  re-present stays at the advanced epoch 8 -> `sack_v2_readopt_has_gap(8, 4)` TRUE -> "RSP would HOLD (bug
+  reproduced)". The SAME input yields opposite roll/gap verdicts vs the fixed build -> the rollback is
+  load-bearing.
+- Master `mercury.exe --test`: **58 passed, 0 failed** (+ Winlink dict 12/0), `[TEST-CLIMB-BSI] PASS`
+  included, EXIT 0. Production byte-identical off the v2/compression gates.
+
+### §13.5 HONESTY — what this does and does NOT resolve
+This fix resolves the climb-up bsi-LABEL renumber -> GAP-ABORT SPECIFICALLY (the demote-symmetry gap,
+real + unfixed on this HEAD). It does **NOT** resolve the ~77B throughput stall: §7-§9/§9.2 isolate a
+SEPARATE binding root — the reverse data-SACK delivery loop / giant-batch turnaround at the climbed rung.
+Whether the bsi rollback was the binding wedge or that delivery-loop root still binds is for a realtime
+A/B (NOT run here) to determine. No throughput claim is made.
