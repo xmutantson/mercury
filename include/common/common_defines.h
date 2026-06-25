@@ -81,6 +81,7 @@ extern int g_verbose;
 #define MONITOR_MODE 9
 #define TX_WAV 10  // ULTRA audio render: one frame -> S16LE WAV, no audio device (sim instrument)
 #define SIM_INPROC 11  // single-process in-process self-loopback feasibility prototype (no device/TCP/threads)
+#define DECODE_RXCTRL 12  // PROBE X: offline replay of a dumped control-frame passband buffer through receive_byte (no device/relay/threads) — cross-platform decode arbiter
 
 // NUMBER_OF_CONFIGS = 18 to make CONFIG_17 (shaped-64-QAM gear, default-NOT-
 // selected) REACHABLE via -s 17 / the SFO-GRID harness. This is the table-size /

@@ -842,6 +842,7 @@ int main(int argc, char *argv[])
     int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
     int skip_var_gate_cli = -1;       // --skip-var-gate=on|off: -1=default(on), 0=off, 1=on
     int wire_stamp_cli = 0;           // --wire-stamp: 0=off(default, bare wire + demod-ADD clock), 1=on (relay-stamped phase-lock; -x sim harness only)
+    static char decode_rxctrl_path[1024] = ""; // PROBE X: --decode-rxctrl <file> offline control-frame decode buffer
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
     int rx_normalize_cli = -1;         // --rx-normalize=on|off: -1=default(on), 0=off, 1=on
     int csi_llr_cli = -1;              // --csi-llr=on|off: -1=default(on), 0=off, 1=on
@@ -1186,6 +1187,20 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - consumed; j++)
                 argv[j] = argv[j + consumed];
             argc -= consumed;
+            i--;
+        }
+        else if (strcmp(argv[i], "--decode-rxctrl") == 0 && i + 1 < argc)
+        {
+            // PROBE X: offline replay of a dumped control-frame passband buffer
+            // through receive_byte() with NO relay/threads/device — the
+            // cross-platform decode arbiter. Sets operation_mode=DECODE_RXCTRL
+            // (handled before audio init). Use with -s 100 (ROBUST_0 MFSK
+            // control config). See sim-arq-channel.md §15.
+            strncpy(decode_rxctrl_path, argv[i + 1], sizeof(decode_rxctrl_path) - 1);
+            operation_mode = DECODE_RXCTRL;
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         }
         else if (strncmp(argv[i], "--skip-var-gate=", 16) == 0)
@@ -2711,6 +2726,91 @@ start_modem:
         telecom_system.tx_gain[TX_SIG_BREAK][1][1] = boost_override;
         printf("[TX-GAIN] Override: NB MFSK_1S=%.4f  MFSK_2S=%.4f  ACK/BREAK=%.4f\n",
                boost_override, boost_override * ratio_2s, boost_override);
+    }
+
+    // PROBE X — DECODE_RXCTRL: offline cross-platform control-frame decode arbiter.
+    // Reads a raw little-endian float64 passband buffer (dumped by the live
+    // receive_byte() instrumentation under MERCURY_DUMP_RXCTRL) and replays it
+    // through the SAME receive_byte() math with NO relay/threads/device/timing.
+    // Reports message_decoded + crc + decoded-byte md5. Run with -s 100 (ROBUST_0
+    // MFSK control config). The 2x2 (Windows-buffer x {Win,Linux decoder};
+    // Linux-buffer x {Win,Linux decoder}) decisively separates ACQUISITION/POSITION
+    // (decode succeeds on the SAME good samples on both OSes) from PLATFORM-DECODE
+    // (the SAME bytes decode differently). See sim-arq-channel.md §15.
+    if (telecom_system.operation_mode == DECODE_RXCTRL)
+    {
+        printf("Mode selected: DECODE_RXCTRL (offline control-frame decode arbiter)\n");
+        // Read the self-describing RXC2 header (16 int32) carrying the COMPLETE
+        // capture geometry so we reproduce the EXACT decoder state with no guessing.
+        FILE* df = fopen(decode_rxctrl_path, "rb");
+        if(!df) { fprintf(stderr, "[DRX] FATAL: cannot open %s\n", decode_rxctrl_path); return 2; }
+        int32_t hdr[16] = {0};
+        size_t hgot = fread(hdr, sizeof(int32_t), 16, df);
+        if(hgot != 16 || hdr[0] != (int32_t)0x32435852) {
+            fprintf(stderr, "[DRX] FATAL: bad/absent RXC2 header (magic=0x%08x)\n", (unsigned)hdr[0]);
+            fclose(df); return 2;
+        }
+        int file_Nofdm=hdr[1], file_Nsymb=hdr[2], file_interp=hdr[3];
+        int file_nb=hdr[4], file_cfg=hdr[5], file_dlen=hdr[6];
+        int file_Nfft=hdr[7], file_Ngi=hdr[8], file_Nc=hdr[9];
+        int file_pre=hdr[10], file_frmNsymb=hdr[11];
+        int file_mM=hdr[12], file_mStreams=hdr[13];
+        printf("[DRX] header: Nofdm=%d buffer_Nsymb=%d interp=%d nb=%d cfg=%d dlen=%d "
+               "Nfft=%d Ngi=%d Nc=%d pre=%d Nsymb=%d mfsk_M=%d nStreams=%d\n",
+               file_Nofdm, file_Nsymb, file_interp, file_nb, file_cfg, file_dlen,
+               file_Nfft, file_Ngi, file_Nc, file_pre, file_frmNsymb, file_mM, file_mStreams);
+        // Reproduce the EXACT capture geometry. The live RSP's ROBUST_0 MFSK uses
+        // gi=Ngi/Nfft (e.g. 36/256) which differs from the standalone default
+        // (54/256). Force the default ofdm geometry to the captured values BEFORE
+        // load_configuration, match narrowband, and enlarge the allocation, so
+        // set_size() produces a byte-identical decoder layout.
+        telecom_system.narrowband_enabled = file_nb ? YES : NO;
+        telecom_system.default_configurations_telecom_system.ofdm_Nfft = file_Nfft;
+        telecom_system.default_configurations_telecom_system.ofdm_gi   = (float)file_Ngi/(float)file_Nfft;
+        telecom_system.data_container.buffer_Nsymb_min = file_Nsymb + 8;
+        // Force a real (non-no-op) reload: load_configuration early-returns when the
+        // requested config == current_configuration. current starts at CONFIG_NONE.
+        telecom_system.load_configuration(mod_config);
+        int dc_buffer_Nsymb = telecom_system.data_container.buffer_Nsymb.load();
+        // Pin the EXACT captured symbol count so receive_byte's scan span matches.
+        telecom_system.data_container.buffer_Nsymb.store(file_Nsymb);
+        printf("[DRX] config=%d M=%.0f Nofdm=%d buffer_Nsymb=%d(was %d) interp=%d Nfft=%d Ngi=%d Nc=%d narrowband=%d\n",
+               mod_config, telecom_system.M,
+               telecom_system.data_container.Nofdm,
+               file_Nsymb, dc_buffer_Nsymb,
+               telecom_system.frequency_interpolation_rate,
+               telecom_system.data_container.Nfft, telecom_system.data_container.Ngi,
+               telecom_system.data_container.Nc,
+               (int)telecom_system.narrowband_enabled);
+        if(telecom_system.data_container.Nofdm != file_Nofdm) {
+            fprintf(stderr, "[DRX] WARNING: live Nofdm %d != captured %d — geometry mismatch; "
+                    "results may be invalid.\n", telecom_system.data_container.Nofdm, file_Nofdm);
+        }
+        int use_len = file_dlen;
+        printf("[DRX] file=%s decode_len=%d\n", decode_rxctrl_path, use_len);
+        double* buf = (double*)calloc((size_t)(use_len > 0 ? use_len : 1), sizeof(double));
+        size_t got = fread(buf, sizeof(double), (size_t)(use_len > 0 ? use_len : 0), df);
+        fclose(df);
+        // input checksum (independent of platform — same file => same numbers)
+        double in_e = 0, in_pk = 0;
+        for(int i=0;i<use_len;i++){ double v=buf[i]; in_e+=v*v; if(fabs(v)>in_pk)in_pk=fabs(v); }
+        printf("[DRX] read_doubles=%zu in_rms=%.12f in_peak=%.12f\n",
+               got, sqrt(in_e/(use_len>0?use_len:1)), in_pk);
+        // The decode oracle — ONE receive_byte() call, identical math to the live path.
+        int* out_bits = (int*)calloc(N_MAX, sizeof(int));
+        st_receive_stats rs = telecom_system.receive_byte(buf, out_bits);
+        // checksum of decoded info bytes (so a same-bytes/same-result check is byte-exact)
+        unsigned int byte_sum = 0; int nbytes = 0;
+        for(int i=0;i<N_MAX/8;i++){ int b = telecom_system.data_container.hd_decoded_data_byte[i];
+            byte_sum = byte_sum*131 + (unsigned)(b & 0xFF); }
+        (void)nbytes;
+        printf("[DRX-RESULT] message_decoded=%d crc=%d SNR=%.3f coarse_metric=%.6f "
+               "iterations=%d delay=%d sync_trials=%d byte_hash=%u\n",
+               (rs.message_decoded==YES)?1:0, rs.crc, rs.SNR, rs.coarse_metric,
+               rs.iterations_done, rs.delay, rs.sync_trials, byte_sum);
+        fflush(stdout);
+        free(buf); free(out_bits);
+        return (rs.message_decoded==YES) ? 0 : 1;
     }
 
     // SIM_INPROC: single-process in-process self-loopback feasibility prototype.

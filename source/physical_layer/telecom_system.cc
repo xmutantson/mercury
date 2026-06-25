@@ -1047,6 +1047,72 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		return receive_bigblock(data, out);
 	}
 
+	// PROBE X (cross-platform decode arbiter, env-gated, default OFF).
+	// When MERCURY_DUMP_RXCTRL=<dir> is set AND this is an MFSK robust-tier
+	// control config (M==MOD_MFSK, current_configuration>=100 = ROBUST_0/1/2),
+	// dump the EXACT input passband buffer this call feeds to the control-frame demod to
+	// <dir>/rxctrl_<pid>_<seq>.bin (raw little-endian float64, length =
+	// Nofdm*buffer_Nsymb*frequency_interpolation_rate doubles), and append one
+	// manifest line. The offline decode harness (--decode-rxctrl) replays a
+	// dumped buffer through THIS SAME receive_byte() with no relay/threads, so
+	// the SAME samples can be decoded on Windows vs Linux. Pure diagnostic:
+	// gated on the env var being present, so every production / HW path is
+	// byte-identical (the env is never set there). See sim-arq-channel.md §15.
+	{
+		static const char* dump_dir = std::getenv("MERCURY_DUMP_RXCTRL");
+		// Optional cap on dumped frames (default 60) — each ROBUST_0 buffer is
+		// ~8 MB, and the RSP polls receive_byte() hundreds of times while
+		// LISTENING. MERCURY_DUMP_RXCTRL_MAX bounds disk use; the handshake's
+		// HAIL/control frames all land within the first few dozen calls.
+		static const char* dump_max_env = std::getenv("MERCURY_DUMP_RXCTRL_MAX");
+		static int dump_max = (dump_max_env && *dump_max_env) ? atoi(dump_max_env) : 60;
+		static int dump_seq = 0;
+		if(dump_dir && *dump_dir && M == MOD_MFSK && current_configuration >= 100
+		   && dump_seq < dump_max)
+		{
+			// per-process tag: role env if present (A/B in the 2-process sim), else "X"
+			static const char* role_env = std::getenv("MERCURY_SIM_ROLE");
+			char tag = (role_env && *role_env) ? role_env[0] : 'X';
+			int nofdm_v = data_container.Nofdm;
+			int bns_v   = data_container.buffer_Nsymb.load();
+			int interp_v= frequency_interpolation_rate;
+			int dlen = nofdm_v * bns_v * interp_v;
+			// running checksum of the raw bytes for a quick same-buffer check
+			double e_total = 0, pk = 0;
+			for(int i=0;i<dlen;i++){ double v=((double*)data)[i]; e_total+=v*v; if(fabs(v)>pk)pk=fabs(v); }
+			char path[1024];
+			snprintf(path, sizeof(path), "%s/rxctrl_%c_%04d.bin", dump_dir, tag, dump_seq);
+			FILE* f = fopen(path, "wb");
+			if(f){
+				// Self-describing header RXC2 (16 int32) carrying the COMPLETE demod
+				// geometry so the offline --decode-rxctrl harness reproduces the EXACT
+				// capture state (no config-init guessing). Payload = dlen doubles after.
+				int32_t hdr[16] = {
+					(int32_t)0x32435852 /*'RXC2' LE*/,
+					nofdm_v, bns_v, interp_v,
+					narrowband_enabled, current_configuration, dlen,
+					data_container.Nfft, data_container.Ngi, data_container.Nc,
+					data_container.preamble_nSymb, data_container.Nsymb,
+					mfsk.M, mfsk.nStreams, mfsk.Nc,
+					0 };
+				fwrite(hdr, sizeof(int32_t), 16, f);
+				fwrite(data, sizeof(double), (size_t)dlen, f);
+				fclose(f);
+			}
+			char mpath[1024];
+			snprintf(mpath, sizeof(mpath), "%s/rxctrl_%c_manifest.txt", dump_dir, tag);
+			FILE* mf = fopen(mpath, "ab");
+			if(mf){ fprintf(mf, "seq=%d file=rxctrl_%c_%04d.bin Nofdm=%d buffer_Nsymb=%d interp=%d nb=%d Nfft=%d Ngi=%d Nc=%d pre=%d Nsymb=%d mM=%d mS=%d len=%d rms=%.9f peak=%.9f cfg=%d M=%.0f\n",
+				dump_seq, tag, dump_seq, nofdm_v, bns_v, interp_v, narrowband_enabled,
+				data_container.Nfft, data_container.Ngi, data_container.Nc,
+				data_container.preamble_nSymb, data_container.Nsymb,
+				mfsk.M, mfsk.nStreams,
+				dlen, sqrt(e_total/(dlen>0?dlen:1)), pk,
+				current_configuration, M); fclose(mf); }
+			dump_seq++;
+		}
+	}
+
 	float variance = 1.0f;
 	int nVirtual_data=ldpc.N-data_container.nBits;
 	int nReal_data=data_container.nBits-ldpc.P;
