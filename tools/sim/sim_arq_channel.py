@@ -126,6 +126,11 @@ SIM_FS = 48000.0              # passband wire sample rate (sim_channel_relay.py 
 # Relay stats line (sim_channel_relay.py:998-1002), emitted every 500 chunks:
 #   [HH:MM:SS] a2b: 1500 chunks (32.0s) vstamp=1536000 split=+0 P_sig=...
 RELAY_VSTAMP_RE = re.compile(r"\b(a2b|b2a):\s+\d+\s+chunks\s+\([\d.]+s\)\s+vstamp=(\d+)")
+# Modem-side --wire-stamp canary (audioio.c sim_rx_bridge_thread), printed once
+# per peer the first time it parses a relay stamp:
+#   [SIM] RX bridge first vstamp=1024
+# Presence on BOTH peers proves the stamped wire format was agreed end-to-end.
+MODEM_VSTAMP_RE = re.compile(r"RX bridge first vstamp=(\d+)")
 # Generous real-time watchdog: a healthy climb runs MUCH faster than real time
 # (FTRT), so a real run never legitimately exceeds this multiple of the virtual
 # budget. It ONLY fires on a true wedge (relay not forwarding / a process hung).
@@ -364,6 +369,11 @@ class State:
         self.sack_retx_frames = 0     # sum of "queued for retransmit" counts
         self.nresent_data_max = 0     # max stats.nReSent_data= seen
         self.n_chase_fire = 0         # count of [CHASE] markers (0 on monitor)
+        # --wire-stamp canary: each peer prints "[SIM] RX bridge first vstamp=N"
+        # the first time it parses a relay stamp. Records the FIRST vstamp each
+        # peer adopted; both must be set (and near 0) under --wire-stamp 1, else
+        # the modem never parsed a stamp (stale/non-stamp binary vs stamped relay).
+        self.first_vstamp = {"CMD": None, "RSP": None}
 
 
 def log_output(proc, label, logfile, t0, st):
@@ -380,6 +390,14 @@ def log_output(proc, label, logfile, t0, st):
                 st.connected = True
             if "link_status:Disconnected" in text or "DISCONNECTED" in text:
                 st.disconnected = True
+            # --wire-stamp canary: "[SIM] RX bridge first vstamp=N" proves this
+            # peer parsed an 8-byte relay stamp (wire format agreed). Record the
+            # first per peer so the harness can FAIL a --wire-stamp cell whose
+            # modem never saw a stamp (stale binary vs stamped relay framing).
+            mv = MODEM_VSTAMP_RE.search(text)
+            if mv and st.first_vstamp.get(label) is None:
+                with st.lock:
+                    st.first_vstamp[label] = int(mv.group(1))
             # Only the COMMANDER drives config selection + retransmits; track its
             # SET_CONFIG and retx/chase markers.
             if label == "CMD":
@@ -751,6 +769,15 @@ def main():
     def base_cmd(port, role):
         c = [args.bin, "-m", "ARQ", "-s", str(args.start_cfg), "-W",
              "-p", str(port), "-x", "sim", "-n", "-F", args.compress]
+        if args.wire_stamp:
+            # Relay-stamped virtual-clock phase-lock (sim-arq-channel.md
+            # §10.5b/§11.2). The modem MUST agree with the relay's wire format:
+            # the relay (passed --wire-stamp below) prepends an 8-byte LE
+            # per-direction END-sample stamp to every chunk, and the modem reads
+            # it + SETs its clock. A mismatch silently corrupts the 8-byte
+            # framing -> garbage (sim_channel_relay.py wire-format note). Both
+            # ends are flipped together here so they cannot diverge.
+            c += ["--wire-stamp", "1"]
         if not args.no_gearshift:
             c += ["-g"]          # gearshift ON by default; --no-gearshift PINS start-cfg
         else:
@@ -1114,7 +1141,28 @@ def main():
     except (OSError, ValueError, KeyError):
         pass
 
+    # ---- --wire-stamp canary verdict ---------------------------------------
+    # Under --wire-stamp 1 BOTH peers must print "[SIM] RX bridge first vstamp=N"
+    # (they parsed the relay's 8-byte stamp). If either is missing, the modem
+    # never saw a stamp -> either a stale/non-stamp binary running against a
+    # stamped relay (silent 8-byte framing corruption), or the modem flag did
+    # not reach the peer. That is a HARD FAIL of the cell: the phase-lock is not
+    # actually engaged, so a "connected" verdict would be meaningless.
+    wire_stamp_canary_ok = None
+    if args.wire_stamp:
+        cmd_vs = st.first_vstamp.get("CMD")
+        rsp_vs = st.first_vstamp.get("RSP")
+        wire_stamp_canary_ok = (cmd_vs is not None and rsp_vs is not None)
+
     print("\n========== SUMMARY ==========")
+    if args.wire_stamp:
+        print(f"wire_stamp        : ON  canary_ok={wire_stamp_canary_ok} "
+              f"(CMD first_vstamp={st.first_vstamp.get('CMD')}, "
+              f"RSP first_vstamp={st.first_vstamp.get('RSP')})")
+        if not wire_stamp_canary_ok:
+            print("  [WIRE-STAMP FAIL] a peer never parsed a relay stamp under "
+                  "--wire-stamp 1 -> stale/non-stamp binary or framing mismatch. "
+                  "The phase-lock is NOT engaged; treat this cell as FAILED.")
     print(f"connected         : {st.connected}")
     print(f"config switch_seq : {names}")
     print(f"peak_config       : {cfg_name(peak) if peak is not None else None}")
@@ -1178,6 +1226,14 @@ def main():
                 "ptt_latency_ms": args.ptt_latency_ms,
                 "ptt_latency_jitter_ms": args.ptt_latency_jitter_ms,
                 "connected": st.connected,
+                # --wire-stamp phase-lock instrumentation (fix/sim-clock-phaselock):
+                # the per-peer first adopted vstamp + the canary verdict (both
+                # peers parsed a stamp). The "wire_stamp" gate itself is emitted
+                # below near barrier_k. Lets a sweep assert the phase-lock actually
+                # engaged before trusting a connect result.
+                "wire_stamp_canary_ok": wire_stamp_canary_ok,
+                "first_vstamp_cmd": st.first_vstamp.get("CMD"),
+                "first_vstamp_rsp": st.first_vstamp.get("RSP"),
                 "switch_seq": names,
                 "peak_config": cfg_name(peak) if peak is not None else None,
                 "steady_config": cfg_name(steady) if steady is not None else None,

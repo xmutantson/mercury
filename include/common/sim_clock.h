@@ -62,8 +62,18 @@ extern "C" {
  *
  * sim_clock_enabled()      : non-zero when -x sim virtual time is active.
  * sim_clock_set_enabled(e) : flip the flag (called once from main.cc).
- * sim_clock_add_samples(n) : producer hook — advance virtual time by n
- *                            samples (called from rx_transfer per RX chunk).
+ * sim_clock_wire_stamp()   : non-zero when --wire-stamp relay-stamped clock is
+ *                            active (2-process -x sim only). Selects the stamped
+ *                            RX wire format + the SET clock. SIM_INPROC / --test
+ *                            leave it 0 (bare wire + ADD clock).
+ * sim_clock_set_wire_stamp(on) : flip the wire-stamp gate (once, from main.cc).
+ * sim_clock_add_samples(n) : ADDITIVE producer hook — advance virtual time by
+ *                            n samples (rx_transfer per RX chunk on the
+ *                            non-wire-stamp / SIM_INPROC / --test paths).
+ * sim_clock_set_samples(n) : RELAY-STAMPED producer hook (--wire-stamp) —
+ *                            adopt the relay's authoritative per-direction
+ *                            END-sample stamp. CAS-max: virtual time only ever
+ *                            moves FORWARD (never rewinds). See sim_clock.cc.
  * sim_clock_now_samples()  : current virtual sample count.
  * sim_clock_now_ns()       : current time in nanoseconds. Virtual when
  *                            enabled, else CLOCK_MONOTONIC_RAW. The single
@@ -73,7 +83,10 @@ extern "C" {
  *                            monotonic timespec (the cl_timer call shape). */
 int      sim_clock_enabled(void);
 void     sim_clock_set_enabled(int enabled);
+int      sim_clock_wire_stamp(void);
+void     sim_clock_set_wire_stamp(int on);
 void     sim_clock_add_samples(uint64_t n);
+void     sim_clock_set_samples(uint64_t n);
 uint64_t sim_clock_now_samples(void);
 uint64_t sim_clock_now_ns(void);
 void     sim_clock_fill_timespec(struct timespec *ts);

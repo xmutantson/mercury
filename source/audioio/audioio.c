@@ -1714,12 +1714,57 @@ void *sim_rx_bridge_thread(void *unused)
 	if (shutdown_) return NULL;
 
 	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
-	double *chunk = (double *)malloc(chunk_bytes);
+	double  *chunk = (double *)malloc(chunk_bytes);
+	uint8_t  stamp_buf[8];
+	// --wire-stamp mode (sim-arq-channel.md §10.5b/§11.2): the relay prepends an
+	// 8-byte LE per-direction END-sample stamp ahead of each chunk and BOTH peers
+	// adopt that ONE relay timeline (drift-immune phase-lock). Latched ONCE here
+	// (set at startup before this thread exists) so the wire format is fixed for
+	// the whole run — a mid-run flip would desync the 8-byte framing.
+	const int wire_stamp = sim_clock_wire_stamp();
+	int       first_chunk = 1;
 
 	while (!shutdown_) {
+		uint64_t stamp = 0;
+		if (wire_stamp) {
+			// Read the 8-byte stamp FIRST, then the CHUNK_BYTES payload. Both
+			// ends change in one commit so the framing cannot drift. A non-stamp
+			// modem (g_sim_wire_stamp==0) against a --wire-stamp relay would
+			// silently mis-frame — the harness GUARD + first-vstamp canary below
+			// catch a stale-binary mismatch.
+			if (sim_recv_all(sim_sock, stamp_buf, 8) != 0) {
+				printf("[SIM] RX bridge stamp recv failed (relay closed?)\n");
+				break;
+			}
+		}
 		if (sim_recv_all(sim_sock, (uint8_t *)chunk, chunk_bytes) != 0) {
 			printf("[SIM] RX bridge recv failed (relay closed?)\n");
 			break;
+		}
+		if (wire_stamp) {
+			stamp = (uint64_t)stamp_buf[0]        | ((uint64_t)stamp_buf[1] << 8)
+			      | ((uint64_t)stamp_buf[2] << 16) | ((uint64_t)stamp_buf[3] << 24)
+			      | ((uint64_t)stamp_buf[4] << 32) | ((uint64_t)stamp_buf[5] << 40)
+			      | ((uint64_t)stamp_buf[6] << 48) | ((uint64_t)stamp_buf[7] << 56);
+			if (first_chunk) {
+				// One-time canary: a stale relay/binary wire mismatch shows up as
+				// a wild first stamp. The harness greps for this line to confirm
+				// the modem actually parsed a stamp under --wire-stamp 1.
+				printf("[SIM] RX bridge first vstamp=%llu\n",
+				       (unsigned long long)stamp);
+				fflush(stdout);
+				first_chunk = 0;
+			}
+			// Adopt the shared channel clock the instant the chunk ARRIVES (not
+			// when the prep thread later demods it via rx_transfer). This couples
+			// THIS peer's virtual time to relay-chunk arrival in THIS direction,
+			// so the commander's ACK-timeout window and the responder's reply
+			// share one timeline regardless of host (wall) speed. CAS-max in
+			// sim_clock_set_samples keeps it monotonic — a silence flood cannot
+			// multiply virtual time because we SET to the relay's count, and a
+			// reordered chunk cannot rewind it.
+			if (sim_clock_enabled())
+				sim_clock_set_samples(stamp);
 		}
 		// Backpressure: if the prep thread is behind, spin briefly rather
 		// than overflow capture_buffer (mirrors the device-full guard).
@@ -1768,13 +1813,21 @@ int rx_transfer(double *buffer, size_t len)
 	read_buffer(capture_buffer, buffer_internal, buffer_size_bytes);
 
 	// SIM virtual clock: every double the modem pulls off the RX boundary is
-	// one sample of channel time. Advancing here (and ONLY here) makes virtual
-	// time track the modem's demod cadence — the RX bridge feeds capture_buffer
-	// as fast as the relay delivers, so the modem reads it as fast as it can
-	// decode, and the control-loop timers advance with it. No-op (one branch +
-	// relaxed load) when sim is disabled, so production rx_transfer is
-	// unaffected. See include/common/sim_clock.h.
-	if (sim_clock_enabled())
+	// one sample of channel time. Advancing here makes virtual time track the
+	// modem's demod cadence — used on the SIM_INPROC pump path and the
+	// 2-process -x sim path WITHOUT --wire-stamp.
+	//
+	// UNDER --wire-stamp the clock is instead SET by sim_rx_bridge_thread on
+	// chunk ARRIVAL from the relay's authoritative stamp. Advancing HERE too
+	// would DOUBLE-count virtual time (once on arrival, once on demod) and
+	// re-introduce the idle-silence warp — so the add is suppressed in that mode
+	// (sim_clock_wire_stamp()==1). SIM_INPROC NEVER sets g_sim_wire_stamp, so its
+	// pump-driven rx_transfer keeps the ADD clock untouched (the 12 SIM_INPROC /
+	// --test add-producers are unaffected — §5 cross-layer audit).
+	//
+	// No-op (two relaxed loads) when sim is disabled, so production -x
+	// wasapi/alsa rx_transfer is byte-identical. See include/common/sim_clock.h.
+	if (sim_clock_enabled() && !sim_clock_wire_stamp())
 		sim_clock_add_samples((uint64_t) len);
 
     return 0;

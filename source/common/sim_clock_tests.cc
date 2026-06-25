@@ -239,6 +239,51 @@ void test_pumped_settle_wait_production_is_wall()
              WAIT_MS, wall_ms, WAIT_MS);
 }
 
+// (a.9) RELAY-STAMPED setter (--wire-stamp): sim_clock_set_samples is CAS-max,
+// so virtual time can ONLY move FORWARD. This is the load-bearing monotonicity
+// guard for the phase-lock: cl_timer deltas MUST stay non-negative, so a
+// reordered / duplicate / late relay stamp can never rewind the clock (a rewind
+// would make a window never expire -> a hang replacing the connect-timeout).
+//
+// We can only observe DELTAS (the global atomic is shared and not zeroable), so
+// we drive it from its current value:
+//   - SET to cur + BIG advances the clock by BIG (forward stamp adopted).
+//   - SET to cur - SMALL (a "late"/reordered lower stamp) is IGNORED: the clock
+//     does not move, and a running cl_timer therefore never goes backward.
+void test_set_samples_monotonic_cas_max()
+{
+    SimEnableGuard g;                 // sim_clock_enabled() == 1
+    cl_timer t;
+    t.start();
+
+    uint64_t base = sim_clock_now_samples();
+    // Forward stamp: +96000 samples == +2000 ms of virtual time.
+    sim_clock_set_samples(base + 96000);
+    uint64_t after_fwd = sim_clock_now_samples();
+    int elapsed_fwd = t.get_elapsed_time_ms();
+
+    // A LOWER stamp (reordered/duplicate/late) must be ignored — no rewind.
+    sim_clock_set_samples(after_fwd - 48000);   // would be -1000 ms if it took
+    uint64_t after_low = sim_clock_now_samples();
+    int elapsed_low = t.get_elapsed_time_ms();
+
+    // An EQUAL stamp is a no-op too.
+    sim_clock_set_samples(after_low);
+    uint64_t after_eq = sim_clock_now_samples();
+
+    SC_CHECK(after_fwd == base + 96000 &&
+             after_low == after_fwd &&            // lower stamp ignored
+             after_eq  == after_fwd &&            // equal stamp ignored
+             elapsed_fwd == 2000 &&               // forward advance measured
+             elapsed_low == 2000,                 // NO rewind on the timer
+             "a9_set_samples_monotonic_cas_max",
+             "after_fwd=%llu (want %llu) after_low=%llu (want %llu) "
+             "elapsed_fwd=%d (want 2000) elapsed_low=%d (want 2000 — no rewind)",
+             (unsigned long long)after_fwd, (unsigned long long)(base + 96000),
+             (unsigned long long)after_low, (unsigned long long)after_fwd,
+             elapsed_fwd, elapsed_low);
+}
+
 // (a.6) enabled()/set_enabled() flag round-trips and leaves FALSE at the end.
 void test_flag_roundtrip()
 {
@@ -250,6 +295,23 @@ void test_flag_roundtrip()
     bool off2 = (sim_clock_enabled() == 0);
     SC_CHECK(off && on && off2, "a6_flag_roundtrip",
              "flag did not round-trip: off=%d on=%d off2=%d", off, on, off2);
+}
+
+// (a.10) --wire-stamp gate round-trips and DEFAULTS OFF. The gate is keyed
+// SEPARATELY from sim_clock_enabled() so SIM_INPROC / --test (which enable the
+// sim clock but have no relay) keep the bare wire + ADD clock. This proves the
+// default (production AND SIM_INPROC) is wire_stamp==0.
+void test_wire_stamp_flag_roundtrip()
+{
+    sim_clock_set_wire_stamp(0);
+    bool off = (sim_clock_wire_stamp() == 0);
+    sim_clock_set_wire_stamp(1);
+    bool on = (sim_clock_wire_stamp() != 0);
+    sim_clock_set_wire_stamp(0);
+    bool off2 = (sim_clock_wire_stamp() == 0);
+    SC_CHECK(off && on && off2, "a10_wire_stamp_flag_roundtrip",
+             "wire-stamp gate did not round-trip: off=%d on=%d off2=%d",
+             off, on, off2);
 }
 
 } // namespace
@@ -265,9 +327,12 @@ int run_sim_clock_tests()
     test_disabled_uses_wall_clock();
     test_pumped_settle_wait_is_virtual_clock_faithful();
     test_pumped_settle_wait_production_is_wall();
+    test_set_samples_monotonic_cas_max();
     test_flag_roundtrip();
+    test_wire_stamp_flag_roundtrip();
     // Safety: leave production default no matter what.
     sim_clock_set_enabled(0);
+    sim_clock_set_wire_stamp(0);
     printf("=== sim_clock tests: %d failed ===\n", g_failed);
     return g_failed;
 }

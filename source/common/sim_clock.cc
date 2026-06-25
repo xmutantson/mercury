@@ -15,6 +15,15 @@
 static std::atomic<int>      g_sim_time_enabled{0};
 static std::atomic<uint64_t> g_sim_samples{0};
 
+// --wire-stamp gate. Defaults to FALSE. Set true ONLY by the modem's
+// --wire-stamp CLI flag (main.cc), which ONLY the 2-process -x sim harness
+// passes. It selects (1) the stamped RX-bridge wire format (read 8-byte LE
+// stamp ahead of each chunk) and (2) the relay-stamped SET clock instead of
+// the demod-consumption ADD clock. Keyed SEPARATELY from sim_clock_enabled()
+// because SIM_INPROC and --test-sim-clock ALSO enable the sim clock but have
+// NO relay / NO stamps — they must keep the bare-chunk wire + ADD clock.
+static std::atomic<int>      g_sim_wire_stamp{0};
+
 extern "C" int sim_clock_enabled(void)
 {
     // Relaxed: the flag is set ONCE at startup (main.cc, before the bridge
@@ -28,11 +37,58 @@ extern "C" void sim_clock_set_enabled(int enabled)
     g_sim_time_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
+extern "C" int sim_clock_wire_stamp(void)
+{
+    return g_sim_wire_stamp.load(std::memory_order_relaxed);
+}
+
+extern "C" void sim_clock_set_wire_stamp(int on)
+{
+    // Set ONCE at startup from main.cc's --wire-stamp arg, BEFORE the bridge
+    // threads exist. Read by the RX bridge (wire format) and rx_transfer (add
+    // gate). Relaxed: same single-set-then-read discipline as g_sim_time_enabled.
+    g_sim_wire_stamp.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
 extern "C" void sim_clock_add_samples(uint64_t n)
 {
-    // Single producer (the RX bridge via rx_transfer). fetch_add keeps it
-    // correct even if a future caller adds a second producer.
+    // ADDITIVE producer. On the LIVE two-process -x sim path WITHOUT
+    // --wire-stamp this is the clock (rx_transfer demod-consumption count).
+    // It is ALSO the clock for SIM_INPROC (-m SIM_INPROC pump) and the
+    // --test-sim-clock additive unit cases, both of which set
+    // sim_clock_enabled() but NEVER set g_sim_wire_stamp / attach a relay.
+    // Under --wire-stamp the live path swaps to sim_clock_set_samples below;
+    // this fetch_add then no longer runs on the 2-process path (audioio.c
+    // guards the rx_transfer add on !g_sim_wire_stamp), so the two clocks
+    // never double-count. fetch_add keeps it correct under any producer count.
     g_sim_samples.fetch_add(n, std::memory_order_relaxed);
+}
+
+extern "C" void sim_clock_set_samples(uint64_t n)
+{
+    // Relay-stamped shared clock (sim-arq-channel.md §10.5b / §11.2): adopt the
+    // relay's authoritative monotonic per-direction END-sample index, delivered
+    // as an 8-byte wire stamp ahead of each RX chunk (audioio.c sim_rx_bridge,
+    // --wire-stamp mode). Both peers SET their virtual clock to this ONE relay
+    // timeline, so the CMD ACK-timeout window and the RSP reply share a single
+    // clock regardless of host (wall) speed — the Linux FTRT drift that
+    // desynced CONNECT is eliminated.
+    //
+    // CAS-max so virtual time can ONLY move FORWARD: a stamp that races in
+    // slightly out of order, duplicates, or arrives late can never rewind the
+    // clock. cl_timer deltas (timer.cc) MUST stay non-negative — a rewind would
+    // make get_elapsed_time_ms() return a negative/huge value and a window would
+    // never expire (a hang replacing the connect-timeout). In the 2-process
+    // path there is a single live producer per process (this peer's RX bridge),
+    // but max() is correct under any ordering and any future second producer.
+    uint64_t cur = g_sim_samples.load(std::memory_order_relaxed);
+    while (n > cur &&
+           !g_sim_samples.compare_exchange_weak(cur, n,
+               std::memory_order_relaxed, std::memory_order_relaxed))
+    {
+        // cur is reloaded by compare_exchange_weak on failure; loop until we
+        // either win the CAS or observe n <= cur (a newer/equal stamp landed).
+    }
 }
 
 extern "C" uint64_t sim_clock_now_samples(void)

@@ -841,6 +841,7 @@ int main(int argc, char *argv[])
     int radio_batch_cli = -1;         // --radio-batch: total frames per radio TX (SACK)
     int retransmit_headroom_cli = -1; // --retransmit-headroom: max retransmit frames per batch
     int skip_var_gate_cli = -1;       // --skip-var-gate=on|off: -1=default(on), 0=off, 1=on
+    int wire_stamp_cli = 0;           // --wire-stamp: 0=off(default, bare wire + demod-ADD clock), 1=on (relay-stamped phase-lock; -x sim harness only)
     int phy_reinit_settle_ms_cli = -1; // --phy-reinit-settle-ms=N: -1=default(300), 0+=override
     int rx_normalize_cli = -1;         // --rx-normalize=on|off: -1=default(on), 0=off, 1=on
     int csi_llr_cli = -1;              // --csi-llr=on|off: -1=default(on), 0=off, 1=on
@@ -1163,6 +1164,28 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 2; j++)
                 argv[j] = argv[j + 2];
             argc -= 2;
+            i--;
+        }
+        else if (strcmp(argv[i], "--wire-stamp") == 0)
+        {
+            // --wire-stamp [0|1]: relay-stamped virtual-clock phase-lock for the
+            // 2-process -x sim connect path (sim-arq-channel.md §10.5b/§11.2).
+            // Selects the stamped RX wire format + the relay-SET clock instead of
+            // the demod-ADD clock, so both peers phase-lock to ONE relay timeline
+            // and the Linux FTRT drift no longer desyncs CONNECT. A bare flag
+            // means ON; "--wire-stamp 0|1" sets it explicitly (matches the relay
+            // / harness arg shape). Inert unless -x sim is also selected.
+            int consumed = 1;
+            if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 ||
+                                 strcmp(argv[i + 1], "1") == 0)) {
+                wire_stamp_cli = (argv[i + 1][0] == '1') ? 1 : 0;
+                consumed = 2;
+            } else {
+                wire_stamp_cli = 1;
+            }
+            for (int j = i; j < argc - consumed; j++)
+                argv[j] = argv[j + consumed];
+            argc -= consumed;
             i--;
         }
         else if (strncmp(argv[i], "--skip-var-gate=", 16) == 0)
@@ -2516,9 +2539,21 @@ start_modem:
         // the ONLY place g_sim_time_enabled is ever set true; every other -x
         // mode leaves it false -> byte-identical to pre-change.
         sim_clock_set_enabled(1);
+        // --wire-stamp phase-lock (sim-arq-channel.md §10.5b/§11.2): adopt the
+        // relay's authoritative per-direction END-sample stamp as the shared
+        // virtual clock instead of locally counting demod-consumed samples, so
+        // both peers phase-lock to ONE relay timeline (drift-immune CONNECT on
+        // Linux FTRT boxes). Set HERE, inside the -x sim branch ONLY — every
+        // other -x mode (wasapi/alsa) leaves it 0, so HW is byte-identical. The
+        // gate is read by the RX bridge (wire format) and rx_transfer (add gate),
+        // both started AFTER this point by audioio_init.
+        if (wire_stamp_cli)
+            sim_clock_set_wire_stamp(1);
         printf("SIM software channel (device-free ARQ loopback via relay)\n");
         printf("[SIM] virtual clock ENABLED — control-loop timers run on "
-               "channel-sample time, not wall-clock\n");
+               "channel-sample time, not wall-clock%s\n",
+               wire_stamp_cli ? " (relay-stamped phase-lock: --wire-stamp ON)"
+                              : "");
         break;
     default:
         printf("No supported audio system selected. Trying to continue.\n");

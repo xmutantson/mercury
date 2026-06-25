@@ -1080,6 +1080,20 @@ def main():
                  "combined with --idle-bigstep > 1 (coalescing drops/merges chunks "
                  "and breaks the continuous drift stream + onset-edge detection)")
 
+    # --wire-stamp phase-lock vs --idle-bigstep (sim-arq-channel.md §11.2 / fix
+    # decision item D). The big-step COALESCES a run of silent chunks and forwards
+    # only the LAST one's stamp. Under --wire-stamp both peers SET their clock to
+    # that stamp, so a coalesced run produces a multi-hundred-ms FORWARD lurch in
+    # virtual time across the handshake — which can overshoot a connect window and
+    # silently break the very thing the phase-lock fixes. Refuse the combination
+    # so a future sweep cell cannot enable both at once. Default --idle-bigstep 1
+    # is OFF, so the failing connect path is already safe.
+    if args.wire_stamp and args.idle_bigstep > 1:
+        ap.error("--wire-stamp 1 cannot be combined with --idle-bigstep > 1: the "
+                 "big-step coalesces silent chunks and forwards only the last "
+                 "stamp, lurching the relay-stamped virtual clock forward across "
+                 "the handshake (overshoots connect windows). Use --idle-bigstep 1.")
+
     if args.cell:
         args.snr = parse_cell(args.cell)
 
