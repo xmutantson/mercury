@@ -795,14 +795,6 @@ int main(int argc, char *argv[])
             int failed = run_break_fh_gate_tests();
             return (failed == 0) ? 0 : 1;
         }
-        // --test-revack-geometry : feat/revack-geometry §24 coordinated recovery-ACK
-        // geometry suite (INV-G both peers compute the SAME deterministic config-derived
-        // key offset + the CMD scored snapshot is CENTERED on the deterministic ACK block).
-        // Fast + deterministic, pure geometry. Also included in the full --test suite.
-        if (strcmp(argv[i], "--test-revack-geometry") == 0) {
-            int failed = run_revack_geometry_tests();
-            return (failed == 0) ? 0 : 1;
-        }
     }
 
     int cpu_nr = -1;
