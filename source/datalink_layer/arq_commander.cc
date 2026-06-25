@@ -572,16 +572,20 @@ void cl_arq_controller::process_messages_commander()
 					hail_detected = YES;
 					break;
 				}
-				// §5.7-B8: pump-arm the poll body. On production this is the
-				// verbatim msleep(50) poll cadence. Under SIM_INPROC msleep(50)
-				// is a WALL pause that would BOTH freeze the shared virtual clock
-				// (so this loop's get_elapsed_time_ms() deadline could never
-				// advance) AND starve the peer's HAIL reply from flowing into RX
-				// before the next receive_hail_pattern() check. pumped_settle_wait
-				// instead pumps for 50ms of VIRTUAL time per poll: the shared clock
-				// advances toward the deadline and the peer's reply is consumed
-				// through rx_transfer. The outer hail_listen deadline + the
-				// receive_hail_pattern() early-exit are UNCHANGED.
+				// §5.7-B8 + CLOCK-FIDELITY FIX (fix/sim-connect-virtual-clock):
+				// the poll cadence MUST run on the same clock as this loop's
+				// hail_listen deadline (get_elapsed_time_ms(), a virtual cl_timer
+				// read under -x sim / SIM_INPROC). pumped_settle_wait gives that on
+				// ALL three paths: production -> verbatim wall msleep(50); two-
+				// process -x sim -> a 50ms VIRTUAL-clock spin (the concurrent RX
+				// bridge advances the shared sample clock, so the deadline advances
+				// toward listen_ms and the peer's HAIL reply flows into RX before
+				// the next receive_hail_pattern() check — immune to host CPU load,
+				// closing the connect-under-load race); SIM_INPROC -> a 50ms
+				// step-pumped virtual wait. A bare wall msleep(50) here desynced
+				// the wall poll from the virtual deadline under load and dropped
+				// the RSP beacon outside the window. The outer hail_listen deadline
+				// + the receive_hail_pattern() early-exit are UNCHANGED.
 				pumped_settle_wait(50);
 			}
 

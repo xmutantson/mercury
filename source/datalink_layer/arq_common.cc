@@ -451,16 +451,26 @@ bool arq_sim_inproc_active()
 	return g_sim_inproc_pump != nullptr;
 }
 
-// pumped_settle_wait(): virtual-clock-ify a wall settle-wait WITHOUT changing
-// its exit semantics. On EVERY non-SIM_INPROC path (pump null) this is the
-// verbatim wall-clock body — msleep(wait_ms) — so production + the paced sim
-// are byte-identical. Under SIM_INPROC the wall msleep would freeze the single
-// shared sample-counter virtual clock (a peer instance's view of time stops),
-// so instead we run a cl_timer + step-pump loop: the SAME EXIT PREDICATE
-// (elapsed >= wait_ms, identical to ptt_busy_wait) with the pump advancing the
-// shared clock through the SAME rx_transfer -> sim_clock_add_samples accounting
-// as the two-process RX bridge. No early exit, no threshold change — only the
-// clock-advance mechanism differs.
+// pumped_settle_wait(): virtual-clock-ify a settle-wait WITHOUT changing its
+// exit semantics. THREE clock-faithful paths, all sharing the SAME exit
+// predicate (elapsed >= wait_ms, identical to ptt_busy_wait) — only the
+// clock-advance MECHANISM differs:
+//   (1) Production / HW (sim_clock_enabled()==0): verbatim wall msleep(wait_ms)
+//       — BYTE-IDENTICAL to the stock settle-wait. This is the only resting
+//       state on hardware; nothing else is reachable when sim is disabled.
+//   (2) Two-process paced sim (-x sim, pump null, sim_clock_enabled()==1):
+//       spin a cl_timer loop on the VIRTUAL clock (sim_spin_sleep() yields to
+//       the concurrent capture-prep / RX-bridge thread, which advances the
+//       shared sample-counter clock via rx_transfer -> sim_clock_add_samples,
+//       audioio.c:1778). The handshake DEADLINES this wait pairs with are
+//       cl_timer virtual reads (timer.cc:112); measuring the wait on WALL time
+//       instead (the old code) desynced the two under host CPU load and dropped
+//       the RSP reply outside the CMD window (the connect-under-load race this
+//       fix closes). Same mechanism ptt_busy_wait's paced-sim path already uses.
+//   (3) SIM_INPROC single-thread stepper (pump installed): a cl_timer +
+//       step-pump loop — there is no sibling thread, so the pump advances the
+//       shared clock through the SAME rx_transfer accounting.
+// No early exit, no threshold change on any path.
 void pumped_settle_wait(int wait_ms)
 {
 	if (wait_ms <= 0)
@@ -481,7 +491,34 @@ void pumped_settle_wait(int wait_ms)
 	// paced sim keep the verbatim body (byte-identical).
 	if (g_sim_inproc_pump == nullptr)
 	{
-		msleep(wait_ms);            // production + two-process paced sim: verbatim
+		// CLOCK-FIDELITY FIX (fix/sim-connect-virtual-clock): the two-process
+		// paced sim (-x sim) ALSO runs on the virtual clock — its handshake
+		// DEADLINES (the HAIL listen loop arq_commander.cc:566, the CMD/RSP
+		// ack/turnaround timers) are cl_timer reads that map to sim_clock_now_ns
+		// (timer.cc:112). A verbatim wall msleep(wait_ms) here advances WALL time
+		// while those deadlines advance VIRTUAL time, so under host CPU load the
+		// settle wait and the deadline it pairs with DESYNC: the capture-prep /
+		// RX-bridge thread that advances the shared sample-counter clock
+		// (rx_transfer -> sim_clock_add_samples, audioio.c:1778) gets starved
+		// relative to wall, so a wall msleep can overshoot or undershoot its
+		// virtual budget. The CMD window then misses the RSP's reply beacon (the
+		// 9/9-unloaded vs ~1/3-fail-under-24-worker-load race). FIX: in -x sim,
+		// spin the SAME virtual-clock cl_timer loop ptt_busy_wait's paced-sim
+		// path already uses (lines 342-352) — the concurrent capture thread
+		// advances the clock toward the deadline while sim_spin_sleep() hands it
+		// the core. Identical exit predicate (elapsed >= wait_ms); the only
+		// change is the clock the wait is measured against now MATCHES the
+		// deadline's clock, immune to host load. Production / HW
+		// (sim_clock_enabled()==0) keep the verbatim wall msleep -> BYTE-IDENTICAL.
+		if (sim_clock_enabled())
+		{
+			cl_timer t;
+			t.start();
+			while (t.get_elapsed_time_ms() < wait_ms)
+				sim_spin_sleep();   // yield to the sibling RX bridge advancing the virtual clock
+			return;
+		}
+		msleep(wait_ms);            // production / HW: verbatim wall sleep
 		return;
 	}
 	// SIM_INPROC: step-pumped wait, same exit predicate as ptt_busy_wait.

@@ -167,10 +167,15 @@ void cl_arq_controller::process_messages_rx_data_control()
 				int delay_ms = remaining_syms * sym_ms + 200;
 				printf("[HAIL] Waiting %d ms for commander TX to finish\n", delay_ms);
 				fflush(stdout);
-				// §5.7-B7: virtual-clock-ify ONLY (Bug #55 delay FORMULA above is
-				// verbatim) — route the pause through the pump so the shared clock
-				// advances and the commander's trailing TX is consumed at the right
-				// sample boundary. Same exit predicate; verbatim msleep on production.
+				// §5.7-B7 + CLOCK-FIDELITY FIX (fix/sim-connect-virtual-clock):
+				// virtual-clock-ify ONLY (Bug #55 delay FORMULA above is verbatim).
+				// This turnaround pause (RSP waits for the CMD's trailing HAIL TX to
+				// finish before replying) must advance on the SAME virtual clock as
+				// the CMD's hail_listen deadline, or under host CPU load the RSP
+				// reply beacon lands outside the CMD window. pumped_settle_wait runs
+				// a VIRTUAL-clock spin under -x sim (concurrent RX bridge advances
+				// the shared sample clock), a step-pumped wait under SIM_INPROC, and
+				// a verbatim wall msleep on production / HW (byte-identical).
 				pumped_settle_wait(delay_ms);
 			}
 			// Respond with our own HAIL (suppressed in monitor mode)
