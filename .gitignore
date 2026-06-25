@@ -115,6 +115,5 @@ tools/*.sh
 !tools/test_monitor_data.sh
 !tools/throughput_test.py
 !tools/timesync_trace_validate.py
-!tools/turnaround_timing_extract.py
 !tools/validate_ldpc_matrices.py
 !tools/wb_sweep_clean.py

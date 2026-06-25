@@ -497,14 +497,6 @@ void cl_arq_controller::process_messages_rx_data_control()
 			printf("[BREAK] %s, dropping to ROBUST_0\n",
 				passive_monitor ? "Observed" : "Responding with ACK");
 			fflush(stdout);
-			// Recovery-turnaround timing (env-gated): the RSP has decoded the
-			// CMD's BREAK pattern (forward batch RX/decode end) and is about to
-			// GENERATE the recovery ACK. T_rsp_keys_ack (generation start). The
-			// actual on-air ACK interval is bracketed by the always-on rsp_ack_*
-			// events inside send_ack_pattern(); these high-res [TT] events put
-			// the RSP recovery turnaround on the same us/UTC timeline as the CMD.
-			mtl::log_turn_kv(this->role, "rsp_break_rx_decoded",
-				"cfg=%d", current_configuration);
 			break_detected = NO;
 
 			// Bug fix (POST_BREAK_STUCK_INVESTIGATION.md §5.1 / §8.1,
@@ -544,19 +536,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 				gui_push_monitor_event("[BREAK -> ROBUST_0]", false);
 #endif
 
-			// Recovery-turnaround timing (env-gated): RSP keys the recovery ACK
-			// NOW. send_ack_pattern() applies its OFDM/MFSK turnaround guard wait
-			// (ptt_off+ptt_on + remaining forward audio) BEFORE keying PTT-on, so
-			// the on-air start is rsp_ack_send_start's audio-start, NOT this line.
-			// This event marks the RSP's keying DECISION instant. T_rsp_keys_ack.
-			mtl::log_turn(this->role, "rsp_break_ack_key");
 			// Send ACK to confirm BREAK received (suppressed in monitor mode)
 			send_ack_pattern();
-			// Recovery-turnaround timing (env-gated): the recovery ACK has been
-			// fully transmitted + drained (audio on-air interval closed). The
-			// CMD's capture window must overlap [rsp_ack_send_start audio-start,
-			// here]. T_ack_on_air[end].
-			mtl::log_turn(this->role, "rsp_break_ack_done");
 
 			// Drop to ROBUST_0 (commander will send SET_CONFIG at ROBUST_0)
 			int target = robust_enabled ? ROBUST_0 : CONFIG_0;
