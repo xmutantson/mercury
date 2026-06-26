@@ -909,3 +909,72 @@ growing to 8 s without a batch completing is a dwell/liveness signature). The ri
 DESIGNED investigation of the CONFIG_0 forward-batch-completion + reverse-ACK reliability (why a batch
 intermittently fails to complete at the RSP / the reverse MFSK ACK matches only 4-5/7), NOT another
 counter-guard. [?]
+
+## §21 CONFIG_0-START robust-floor over-seat — the uncovered sibling of FIX #1e (oversized OFDM ring, 0 forward DATA decode)
+
+VERIFIED ROOT (false-break hunt, localized — all adopt-path siblings #1a–#1e exonerated): on a session that
+STARTS at CONFIG_0 (already OFDM-locked, no prior robust→OFDM adopt), the responder's
+`inband_seat_robust_ring_floor()` (arq_common.cc:4205) grows the CONFIG_0 OFDM capture ring from its NATURAL
+217 symbols to the ROBUST_0 floor (~804). The suppression guard at arq_common.cc:4216
+(`if(inband_ofdm_acq_ring_shrunk && is_ofdm_config(current_configuration)) return;`) never fires because its
+flag `inband_ofdm_acq_ring_shrunk` has a SINGLE setter — arq_common.cc:4803, inside
+`inband_finalize_ofdm_adopt_ring` (the robust→OFDM ADOPT branch). A CONFIG_0-start session never runs an
+adopt, never latches the flag → the floor seat oversizes the ring → every CONFIG_0 OFDM preamble lands at
+the ring TAIL beyond `upper_bound = buffer_Nsymb - frame_symb` → `[RX-TIMING] OFDM beyond-bounds` → 0 forward
+DATA decode. Evidence: redesign (MERCURY_INBAND_RATE=1) rx_bytes=0 / nReceived_data=0; legacy (unset) ring
+stays 217 and delivers 42–54 CONFIG_0 OFDM frames. This is the EXACT failure FIX #1e fixed — but only on the
+adopt path; the flag-latch was the adopt path's, so the CONFIG_0-start path was uncovered.
+
+### §21.1 The fix — a NARROW geometry guard scoped to the LOWEST OFDM config (CONFIG_0)
+
+Principle (per CLAUDE.md §5 "constrain the producer"): only ENLARGE the ring when actually below OFDM
+geometry that NEEDS the larger physical window. Add a guard at arq_common.cc (the seat, §4216) that SKIPS
+the floor seat when `current_configuration == CONFIG_0` AND `buffer_Nsymb_min == 0` AND the live ring
+`buffer_Nsymb` is at/below the natural OFDM size for CONFIG_0 (a small +8-symbol slack absorbs the documented
+212-vs-217 throwaway-vs-live skew, §14; gating primarily on `buffer_Nsymb_min == 0` makes it skew-immune).
+
+CRITICAL SCOPE NARROWING (corrected during implementation — an initial `is_ofdm_config(current_configuration)`
+guard was TOO BROAD and regressed the sibling ADOPT-PRESERVE/DELIVER tests that seat the floor at CONFIG_1/
+CONFIG_10): the floor grow EXISTS so the OFDM-tier down-ladder can read a frame from a LOWER (more-robust,
+larger-frame) rung whose decode needs more PHYSICAL ring than `current_configuration`'s natural ring — the
+down-ladder copies the primary snapshot into each trial decoder and ZERO-PADS only the LENGTH
+(arq_common.cc:4503), it cannot reconstruct samples a too-small primary ring never captured. So:
+- At a HIGH OFDM config (e.g. CONFIG_10, natural ~128) reaching DOWN to CONFIG_0 (natural ~217), the grow is
+  GENUINELY needed → KEEP it.
+- CONFIG_0 is the LOWEST OFDM config (FULL_CONFIG_LADDER idx 3; below it are only ROBUST rungs). A fresh OFDM
+  lock SKIPS robust trials entirely (FIX #1d, arq_common.cc:4481), so at CONFIG_0 the grow serves NO
+  down-ladder purpose and only breaks CONFIG_0's own continuously-re-aired acquisition (the CMD re-airs
+  CONFIG_0, pinning the freshest preamble at the oversized-ring tail beyond upper_bound — §10).
+Hence the skip is scoped to `current_configuration == CONFIG_0` only. The adopt-path `inband_ofdm_acq_ring_
+shrunk` flag-guard above is unchanged and complementary (it suppresses the per-pass re-seat at ANY OFDM rung
+once the adopt has shrunk the ring); the new guard covers the CONFIG_0-START case the flag never latched.
+
+### §21.2 §5 CROSS-LAYER AUDIT — capture ring buffer_Nsymb / buffer_Nsymb_min (the shared state)
+
+1. PRODUCERS of buffer_Nsymb / buffer_Nsymb_min:
+   - `inband_seat_robust_ring_floor()` (arq_common.cc:4237 set min; :4256 force_resize_capture_ring) — THE seat being constrained.
+   - `inband_finalize_ofdm_adopt_ring()` (arq_common.cc:4769 force_set_capture_ring_natural -> min=0; :4803 flag set) — adopt-path shrink (#1c/#1e).
+   - `init_monitor_decoders()` (arq_common.cc:1825/1873) — passive-monitor primary seat (passive_monitor only; the responder seat is gated !passive_monitor at arq_responder.cc:570).
+   - `load_configuration` -> `data_container::set_size` (data_container.cc:147-163) — natural sizing, honors buffer_Nsymb_min.
+2. CONSUMERS of the ring geometry:
+   - OFDM preamble anchor search upper_bound (telecom_system.cc; `upper = buffer_Nsymb - frame_symb`) — the BROKEN consumer (oversized ring -> tail preamble beyond upper -> 0 decode).
+   - OFDM-tier down-ladder `inband_try_down_ladder_on_decode_fail` (arq_common.cc:4974): reads the STAGED buffer for `signal_period = Nofdm*buffer_Nsymb*interp`, and `inband_down_ladder_resync` ZERO-PADS each trial decoder up to the robust-rung buffer (:5003 comment). FIRED ONLY when `is_ofdm_config(current_configuration)` (arq_responder.cc:649). => does NOT need the ring physically grown to 804; natural 217 + zero-pad is correct.
+   - ROBUST-tier follow `inband_detect_follow_from_capture` (arq_common.cc:3755): reads the CAPTURED robust-frame tail. FIRED ONLY when `!is_ofdm_config(current_configuration)` (arq_responder.cc:608). => DOES need the ring grown to hold a full slow MFSK frame (can't be zero-pad-reconstructed; the samples must be physically captured). This is the LEGITIMATE consumer of the grow.
+3. VALID STATES of buffer_Nsymb_min: 0 (natural OFDM sizing, the CONFIG_0-start default) | >0 (robust floor seated). Default-init on a CONFIG_0-start session = 0 (load_configuration(CONFIG_0) sizes 217, never raises min).
+4. INVARIANT consumers assume: at an OFDM config the ring is the NATURAL OFDM size so the preamble search upper_bound contains a tail preamble. The robust-floor seat VIOLATED it on the CONFIG_0-start path.
+5. WHAT THE FIX CHANGES (NARROWED to current==CONFIG_0): the seat is a NO-OP only when current==CONFIG_0 AND min==0 AND ring<=natural+slack — the CONFIG_0-START state the adopt flag never latched. Walk each consumer:
+   - preamble search (at CONFIG_0): ring stays 217 -> the continuously-re-aired CONFIG_0 tail preamble fits below upper -> LOCKS (the fix's intent). OK.
+   - OFDM-tier down-ladder AT CONFIG_0: window below CONFIG_0 is ROBUST-only, SKIPPED while holding a shrunk OFDM lock (FIX #1d) -> the grow served no purpose there -> natural ring sufficient. OK.
+   - OFDM-tier down-ladder AT A HIGHER OFDM config (CONFIG_1..16): the fix does NOT skip (current!=CONFIG_0) -> ring still grows to reach LOWER OFDM rungs whose natural ring exceeds current's -> physical samples present. OK (UNCHANGED — this is why the scope had to narrow to CONFIG_0).
+   - ROBUST-tier follow: fires only at `!is_ofdm_config` where the fix does NOT skip -> ring still grows for robust capture. OK (unchanged).
+   - passive-monitor primary seat: gated !passive_monitor on the seat caller; unaffected. OK.
+   The fix removes ONLY the spurious grow at CONFIG_0 (the lowest OFDM rung, where the grow has no consumer); every path that needs the grow (higher-OFDM down-ladder reach + robust-tier follow) is left untouched. No consumer invariant is broken. VERIFIED: the sibling ADOPT-PRESERVE (seats at CONFIG_1) + DELIVER (seats at CONFIG_10) tests PASS unchanged after the narrowing.
+
+### §21.3 LIVE-PATH test (fail-before / passes-after) — `--test-inband-config0-start-ring`
+
+Drives a RESPONDER built directly at CONFIG_0 (no adopt) under MERCURY_INBAND_RATE=1, then calls the
+PRODUCTION `inband_seat_robust_ring_floor()` on the receive path (the exact arq_responder.cc:573 caller),
+and asserts the ring `buffer_Nsymb` stays at the natural OFDM size (<= natural+slack) AND that a painted
+CONFIG_0 preamble still lands within `upper_bound` (the consumer the oversize broke). FAIL-BEFORE arm:
+`MERCURY_CONFIG0_RING_GUARD_DEFEAT=1` restores the pre-fix unconditional grow on the SAME binary, so the ring
+balloons 217->804 and the preamble lands beyond upper_bound (reproduces the 0-forward-decode geometry).

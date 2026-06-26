@@ -8781,6 +8781,189 @@ int cl_arq_controller::test_inband_adopt_nofdm_invariant()
 }
 
 // ============================================================================
+// §21: CONFIG_0-START robust-floor OVER-SEAT — the uncovered sibling of FIX #1e
+// (data-flow-robust-ofdm-adopt-flush.md §21).  --test-inband-config0-start-ring
+// ============================================================================
+// VERIFIED ROOT (false-break hunt, localized): on a session that STARTS at CONFIG_0 (already
+// OFDM-locked, NO prior robust->OFDM adopt) the responder's inband_seat_robust_ring_floor()
+// grows the natural CONFIG_0 OFDM ring (217 sym) to the ROBUST floor (~804). The suppression
+// guard (arq_common.cc:4216) never fires because its flag inband_ofdm_acq_ring_shrunk has a
+// SINGLE setter inside the ADOPT branch (inband_finalize_ofdm_adopt_ring) — a CONFIG_0-start
+// session never adopts, never latches it. The oversized ring puts every CONFIG_0 OFDM preamble
+// at the tail beyond upper_bound = buffer_Nsymb-(Nsymb+preamble_nSymb) -> 0 forward DATA decode.
+//
+// This DRIVES THE PRODUCTION PATH: a RESPONDER built directly at CONFIG_0 under MERCURY_INBAND_RATE=1,
+// then the EXACT arq_responder.cc:573 caller inband_seat_robust_ring_floor(). Asserts the ring stays
+// at the natural OFDM size (the §21 fix) AND that a tail-landing CONFIG_0 preamble still fits within
+// upper_bound (the consumer the over-seat broke). FAIL-BEFORE arm (MERCURY_CONFIG0_RING_GUARD_DEFEAT=1
+// on the SAME binary): the guard is bypassed, the ring balloons 217->~804, and a tail preamble lands
+// beyond upper_bound (reproduces the 0-forward-decode geometry).
+int cl_arq_controller::test_inband_config0_start_ring()
+{
+	const char* TAG = "[TEST-INBAND-CONFIG0-START-RING]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+		else   { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Production 3.0 ms GI -> Ngi = 36 -> CONFIG_0 Nofdm = 256+36 = 292 (main.cc startup install).
+	const float PROD_GI = (float)((int)(3.0 * 12.0 + 0.5)) / 256.0f;   // 36/256
+
+	auto build_rx_config0 = [&]() -> std::pair<cl_arq_controller*, cl_telecom_system*> {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode    = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI;
+		rx->telecom_system       = ts_rx;
+		rx->narrowband_enabled   = NO;
+		rx->role                 = RESPONDER;
+		rx->robust_enabled       = YES;
+		rx->sack_v2_enabled      = true;
+		rx->inband_rate_enabled  = 1;
+		// Bring the standalone telecom_system to a FULLY-INITIALIZED state via a FULL ROBUST_0 load
+		// (the SAME first step the sibling adopt test uses — a bare CONFIG_NONE->OFDM FULL load in the
+		// --test process leaves the PHY uninitialized: Nofdm=0, M=garbage, no capture ring). Then load
+		// CONFIG_0 with PHYSICAL_LAYER_ONLY (the production data-config switch) so the OFDM geometry
+		// installs (Nofdm = Nfft+Ngi36 = 292).
+		rx->load_configuration(ROBUST_0, FULL, NO);
+		rx->load_configuration(CONFIG_0, PHYSICAL_LAYER_ONLY, YES);
+		// THE CONFIG_0-START CONDITION: we adopt CONFIG_0 WITHOUT calling inband_finalize_ofdm_adopt_ring
+		// — exactly a session that reached the OFDM lock by its OWN acquisition, never via the
+		// robust->OFDM adopt finalizer. So inband_ofdm_acq_ring_shrunk is NEVER latched (the bug's
+		// precondition). Materialize the LIVE capture ring at the natural OFDM geometry the production
+		// CONFIG_0-start OFDM lock holds (buffer_Nsymb=~217, buffer_Nsymb_min=0) via the production
+		// allocator force_set_capture_ring_natural() (set_size with buffer_Nsymb_min=0 -> natural size).
+		ts_rx->force_set_capture_ring_natural();
+		rx->link_status          = CONNECTED;
+		rx->connection_status    = RECEIVING;
+		rx->passive_monitor      = false;
+		rx->rsp_current_expected_batch_seq_id = 4;
+		// Assert the precondition the whole test depends on: the adopt-only shrink flag is UNLATCHED
+		// (this is what makes the existing arq_common.cc:4216 guard miss a CONFIG_0-start session).
+		rx->inband_ofdm_acq_ring_shrunk = false;
+		return {rx, ts_rx};
+	};
+
+	// The natural CONFIG_0 OFDM ring size (the LIVE force_set_capture_ring_natural geometry, ~217)
+	// and the ROBUST_0 floor (~804). Probe both via the production helpers on a built RX so the test
+	// pins to the actual installed geometry, not hard-coded numbers.
+	int natural_nsymb = 0, robust_floor = 0;
+	{
+		auto pr0 = build_rx_config0();
+		natural_nsymb = pr0.second->data_container.buffer_Nsymb.load();
+		robust_floor  = pr0.first->inband_robust_floor_buffer_nsymb();
+		delete pr0.first; delete pr0.second;
+	}
+	check(natural_nsymb > 0 && natural_nsymb < 400,
+		"P0 CONFIG_0 starts at the natural OFDM ring size (no robust-floor seat yet)",
+		natural_nsymb, 0);
+	check(robust_floor > natural_nsymb + 100,
+		"P1 the ROBUST_0 floor is far LARGER than the natural OFDM ring (the over-seat that breaks acq)",
+		robust_floor, natural_nsymb);
+
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_CONFIG0_RING_GUARD_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx_config0();
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+
+		int ring_before = ts->data_container.buffer_Nsymb.load();
+		int min_before  = ts->data_container.buffer_Nsymb_min;
+		check(min_before == 0,
+			"P2 buffer_Nsymb_min == 0 at a CONFIG_0-start session (robust floor un-seated)",
+			min_before, 0);
+
+		// THE EXACT PRODUCTION CALLER (arq_responder.cc:573): the responder's between-frames
+		// receive-path seat. Call it a few times (the steady-state RX pumps it every pass).
+		for(int p = 0; p < 3; p++) rx->inband_seat_robust_ring_floor();
+		int ring_after = ts->data_container.buffer_Nsymb.load();
+
+		// The consumer the over-seat broke: the OFDM coarse-search bounds gate (telecom_system.cc:1766)
+		//   upper_bound = buffer_Nsymb - (Nsymb + preamble_nSymb); PASS iff lower < pream <= upper.
+		// The CMD re-airs CONFIG_0 continuously so the freshest preamble lands at the ring TAIL ~one
+		// signal_period from the write head. The DECISIVE, deterministic, ring-size discriminator
+		// (data-flow-robust-ofdm-adopt-flush.md §10): how many OFDM frame-periods the ring SPANS. The
+		// NATURAL ring spans ~ONE frame, so the search window is tight and the single freshest re-aired
+		// preamble settles within [lower,upper] (LEGACY's 217-ring locks 43x). The OVER-SEATED ring
+		// spans MANY frame-periods, so the continuously re-aired freshest preamble is pinned in the
+		// final-frame tail BEYOND upper_bound and the slide never lets it settle below -> SKIP -> 0
+		// forward decode. frames_spanned = round(buffer_Nsymb / frame_symb) is the load-bearing,
+		// statically-true geometry — natural ~ a handful; the robust floor is several-x larger.
+		int frame_symb     = ts->data_container.Nsymb + ts->data_container.preamble_nSymb;
+		int lower_bound    = ts->data_container.preamble_nSymb;
+		int upper_bound    = ring_after - frame_symb;
+		int frames_spanned = (frame_symb > 0) ? (ring_after + frame_symb/2) / frame_symb : 0;
+		int natural_frames = (frame_symb > 0) ? (natural_nsymb + frame_symb/2) / frame_symb : 0;
+		bool search_window_valid = (upper_bound > lower_bound);
+
+		if(!defeat)
+		{
+			check(ring_after <= natural_nsymb + 8,
+				"FIX the CONFIG_0-start ring STAYS at the natural OFDM size (robust floor NOT over-seated)",
+				ring_after, natural_nsymb);
+			check(ts->data_container.buffer_Nsymb_min == 0,
+				"FIX buffer_Nsymb_min stays 0 (the seat was correctly skipped, not applied)",
+				ts->data_container.buffer_Nsymb_min, 0);
+			// nReceived_data proxy: the consumer is OFDM acquisition. The natural ring keeps the OFDM
+			// search window VALID (upper_bound > lower_bound) AND spans only the natural ~1-frame extent,
+			// so a freshest re-aired CONFIG_0 preamble settles in-bounds -> the coarse gate PASSES -> the
+			// frame decodes (nReceived_data > 0). LEGACY uses exactly this geometry.
+			check(search_window_valid,
+				"FIX the OFDM coarse-search window is VALID (upper_bound > lower_bound) at the natural ring",
+				(long)upper_bound, (long)lower_bound);
+			check(frames_spanned <= natural_frames + 1,
+				"FIX the ring spans only the natural ~1-frame OFDM extent (freshest preamble settles in-bounds -> acq locks)",
+				(long)frames_spanned, (long)natural_frames);
+		}
+		else
+		{
+			check(ring_after >= robust_floor - 8,
+				"DEFEAT (FAIL-BEFORE) the ring is OVER-SEATED to the ROBUST floor (217->~804, the bug geometry)",
+				ring_after, robust_floor);
+			// The over-seat balloons the captured window to MANY frame-periods: the continuously re-aired
+			// freshest preamble is pinned in the final-frame tail beyond upper_bound and never settles
+			// below it -> SKIP -> 0 forward decode (the CONFIG_0-start 0-byte signature).
+			check(frames_spanned >= natural_frames * 2,
+				"DEFEAT (FAIL-BEFORE) the ring spans MANY frame-periods (freshest preamble pinned in the tail beyond upper -> 0 decode)",
+				(long)frames_spanned, (long)natural_frames);
+		}
+		(void)ring_before; (void)search_window_valid;
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_CONFIG0_RING_GUARD_DEFEAT", "");
+
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band CONFIG_0 clean-lock CRC-fail ROOT — descrambler survives the ring-shrink
 // (data-flow-robust-ofdm-adopt-flush.md §17).  --test-inband-descrambler-survives-shrink
 // ============================================================================

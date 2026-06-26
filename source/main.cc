@@ -734,6 +734,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_adopt_nofdm_invariant();
             }
+            // §21: CONFIG_0-START robust-floor OVER-SEAT (the uncovered sibling of FIX #1e). A session
+            // that starts at CONFIG_0 (no robust->OFDM adopt) never latches inband_ofdm_acq_ring_shrunk,
+            // so inband_seat_robust_ring_floor over-grows the natural OFDM ring (217->~804) -> every
+            // preamble at the tail beyond upper_bound -> 0 forward decode. Member test on a throwaway
+            // controller (builds its own telecom_system). data-flow-robust-ofdm-adopt-flush.md §21.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_config0_start_ring();
+            }
             // §17: descrambler survives the inband ring-shrink (the CONFIG_0 clean-lock CRC-fail root).
             {
                 cl_arq_controller test_arq;
@@ -976,6 +985,14 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-adopt-nofdm-invariant") == 0) {
             cl_arq_controller ARQ_nofdm;
             int failed = ARQ_nofdm.test_inband_adopt_nofdm_invariant();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-config0-start-ring : run ONLY the §21 CONFIG_0-START robust-floor over-seat
+        // regression (the uncovered sibling of FIX #1e) and exit. Fast + deterministic; see
+        // arq_responder.cc::test_inband_config0_start_ring + data-flow-robust-ofdm-adopt-flush.md §21.
+        if (strcmp(argv[i], "--test-inband-config0-start-ring") == 0) {
+            cl_arq_controller ARQ_c0ring;
+            int failed = ARQ_c0ring.test_inband_config0_start_ring();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-descrambler-survives-shrink : run ONLY the §17 descrambler-survives-

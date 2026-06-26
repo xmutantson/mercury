@@ -2232,6 +2232,14 @@ public:
   // (MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1, same binary): Nofdm drifts 292->310.
   // data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc.
   int test_inband_adopt_nofdm_invariant();
+  // §21 CONFIG_0-START robust-floor OVER-SEAT (CLI --test-inband-config0-start-ring): the uncovered
+  // sibling of FIX #1e. A session that STARTS at CONFIG_0 (no robust->OFDM adopt) never latches
+  // inband_ofdm_acq_ring_shrunk, so inband_seat_robust_ring_floor over-grows the natural OFDM ring
+  // (217->~804) -> every preamble at the tail beyond upper_bound -> 0 forward decode. PASS-AFTER: ring
+  // stays natural + tail preamble in-bounds. FAIL-BEFORE (MERCURY_CONFIG0_RING_GUARD_DEFEAT=1, same
+  // binary): ring balloons to the robust floor + tail preamble beyond upper_bound.
+  // data-flow-robust-ofdm-adopt-flush.md §21.
+  int test_inband_config0_start_ring();
   // CONFIG_0 clean-lock CRC-fail ROOT: descrambler survives the inband ring-shrink
   // (set_size realloc wiped bit_energy_dispersal_sequence). data-flow-robust-ofdm-adopt-flush.md §17.
   int test_inband_descrambler_survives_ring_shrink();
