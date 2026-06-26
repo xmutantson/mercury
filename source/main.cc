@@ -815,6 +815,13 @@ int main(int argc, char *argv[])
             int failed = run_break_fh_gate_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-recovery-ack : recovery-ack-robustness.md suite (marginal-ACK
+        // combining + listen-window ms-mirror + DELTA-1 reps-agnostic BREAK +
+        // DELTA-2 CFO-refine decision gate). Fast + deterministic. Also in --test.
+        if (strcmp(argv[i], "--test-recovery-ack") == 0) {
+            int failed = run_recovery_ack_tests();
+            return (failed == 0) ? 0 : 1;
+        }
     }
 
     int cpu_nr = -1;

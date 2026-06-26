@@ -250,6 +250,11 @@ void cl_arq_controller::process_messages_commander()
 		}
 		else
 		{
+		// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): the BREAK-ACK
+		// (RSP confirming it heard the BREAK, arq_responder.cc:486) is a recovery
+		// control-ACK turnaround — combine the SAME R base reps the RSP emits.
+		// Gated MERCURY_RECOVERY_ACK_ROBUST; default-off → reps=1 → byte-identical.
+		set_recovery_ack_reps_for_wait(/*control_ack=*/true);
 		if(receiving_timer.get_elapsed_time_ms() < receiving_timeout)
 		{
 			if(receive_ack_pattern())
@@ -1253,6 +1258,15 @@ void cl_arq_controller::process_messages_tx_control()
 		}
 		connection_status=RECEIVING_ACKS_CONTROL;
 
+		// RECOVERY-ACK robustness (recovery-ack-robustness.md §4/§6.2): the control-
+		// ACK wait (the BREAK-recovery SET_CONFIG turnaround) combines the SAME R
+		// base reps the RSP control-code arm emits (arq_responder.cc:1500), so a
+		// turnaround-straddled clean ACK clears the 7/16 bar. Gated
+		// MERCURY_RECOVERY_ACK_ROBUST + ack_pattern_time_ms>0 (pattern-ACK path);
+		// default-off → reps stay 1 → BYTE-IDENTICAL. Data-ACK waits clear it back
+		// to 1 (set_recovery_ack_reps(1)) so the data turnaround stays single-block.
+		set_recovery_ack_reps_for_wait(/*control_ack=*/true);
+
 		// Recalculate timeout: guard delays from prior ACK detection can leave
 		// receiving_timeout stale (e.g. 900ms), too short for the control round-trip.
 		calculate_receiving_timeout();
@@ -2034,6 +2048,11 @@ void cl_arq_controller::process_messages_tx_data()
 		last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — per-batch reset
 		clear_snr_arm_for_data_ack_wait(); // §18: arm MUST be false on every data-ACK wait
 		connection_status=RECEIVING_ACKS_DATA;
+		// RECOVERY-ACK robustness (§6.2): the DATA-ACK turnaround stays single-block
+		// (the RSP data-ACK arm does not repeat). Clear any rep count left set by a
+		// prior control-ACK wait so the data turnaround correlates combine_reps=1.
+		// No-op when robust is off (reps already 1) → byte-identical.
+		set_recovery_ack_reps_for_wait(/*control_ack=*/false);
 		ack_diag_peak_matched = 0;
 		ack_diag_peak_metric = 0.0;
 		ack_diag_poll_count = 0;

@@ -3715,13 +3715,18 @@ int cl_telecom_system::generate_ack_pattern_passband(double* out)
 
 	if(ack_pattern_passband_samples <= 0) return 0;
 
-	int nsymb = ack_mfsk.ack_pattern_nsymb;
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): emit
+	// recovery_ack_reps copies of the 16-symbol base block (R×16 symbols, R≤4 →
+	// ≤64 ≤ alloc_Nsymb 128). recovery_ack_reps=1 (default) → nsymb=16 → the
+	// single-block path, BYTE-IDENTICAL. ack_pattern_passband_samples is kept in
+	// step by set_recovery_ack_reps().
+	int nsymb = ack_mfsk.ack_base_total_nsymb();
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	// Generate subcarrier-domain ACK pattern (nsymb * Nc complex values)
-	// Reuse ofdm_framed_data buffer (allocated for Nsymb * Nc, nsymb=16 fits easily)
+	// Reuse ofdm_framed_data buffer (allocated for alloc_Nsymb * Nc, R×16 fits)
 	// Always use dedicated ack_mfsk (M=16, nStreams=1) — config-independent
-	ack_mfsk.generate_ack_pattern(data_container.ofdm_framed_data);
+	ack_mfsk.generate_ack_pattern_reps(data_container.ofdm_framed_data);
 
 
 	// IFFT each symbol to time domain
@@ -3752,6 +3757,25 @@ int cl_telecom_system::generate_ack_pattern_passband(double* out)
 	return ack_pattern_passband_samples;
 }
 
+// RECOVERY-ACK robustness PHASE-1 diagnostic gate (recovery-ack-robustness.md §6.7).
+// MERCURY_RECOVERY_ACK_DIAG=1 enables the per-poll miss-mask + CFO-grid sweep log in
+// detect_ack_pattern_from_passband — the load-bearing discriminator between a CONSTANT
+// CFO bias (a single de-rotation freq peaks `matched`, mask uniform → DELTA-2 is the
+// right fix) and TIME-VARYING DRIFT (clustered mask, no single grid peak → a single
+// 16-sym CFO estimate cannot track it, R=4 aggravates). DEFAULT-OFF + diagnostic-only:
+// never alters the returned metric/matched (it only prints), so it cannot perturb the
+// production ACK path. Cached — no getenv() in the poll hot loop.
+static inline bool recovery_ack_diag_enabled()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_DIAG");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 // RX: Detect ACK pattern in passband audio buffer
 // Returns detection metric (0.0 = noise, up to ack_pattern_nsymb = perfect)
 double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int size, int* out_matched, uint32_t* out_match_mask)
@@ -3768,7 +3792,14 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 		sampling_frequency, effective_carrier, carrier_amplitude,
 		M, &ofdm.FIR_rx_data);
 
-	// Run matched-filter ACK detector — always use dedicated ack_mfsk (config-independent)
+	// Run matched-filter ACK detector — always use dedicated ack_mfsk (config-independent).
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): combine_reps =
+	// recovery_ack_reps noncoherently sums per-symbol FFT energy across the R
+	// aligned base reps BEFORE the argmax/count, lifting a turnaround-straddled
+	// symbol's true-tone bin back over the peak (root cause §3). reps=1 (default)
+	// → the single-block path, BYTE-IDENTICAL. ack_pattern_nsymb stays the BASE
+	// block length (16); detect_ack_pattern strides R base blocks internally.
+	int best_offset = -1;
 	double metric = ofdm.detect_ack_pattern(
 		data_container.baseband_data_interpolated, size / M,
 		1,
@@ -3776,7 +3807,138 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
-		out_matched, 0, nullptr, nullptr, 0, out_match_mask);
+		out_matched, 0, nullptr, &best_offset, 0, out_match_mask,
+		/*always_fine=*/false, /*combine_reps=*/ack_mfsk.recovery_ack_reps);
+
+	// RECOVERY-ACK robustness DELTA-2 (recovery-ack-robustness.md §6.7): wire the
+	// turbo-arm's CFO refine onto the COMBINING arm. Noncoherent rep-combining is
+	// BLIND to a CONSTANT carrier-frequency-offset bias — a residual CFO rotates
+	// every rep IDENTICALLY, so summing |FFT|² across reps cannot recover the
+	// straddled bins (the §3 straddle that combining DOES fix is per-rep NOISE, a
+	// different mechanism). On the clean WGN:40 recovery turnaround the dominant
+	// miss is exactly this CFO straddle (Phase-1 diagnostic discriminates), so R=4
+	// alone does NOT clear the 7/16 coin flip. Refine the residual CFO from the
+	// 16-symbol base pattern at the detected offset (the SAME mini-Moose v2 the
+	// turbo SNR arm proved: detect_ack_snr_from_passband, telecom_system.cc:3867),
+	// re-mix with the SIGN-CORRECTED `effective_carrier - ctrl_residual` (the
+	// shipped v2 '-' sign, §23.11.1), and re-run the combining detect on the
+	// corrected baseband. GATED on combine_reps>1: reps=1 (MERCURY_RECOVERY_ACK_ROBUST
+	// off) → this whole block is skipped → BYTE-IDENTICAL to the pre-DELTA-2 path.
+	// Refine BOOTSTRAP floor (recovery-ack-robustness.md §6.7): the refine must engage on
+	// a PRESENT-but-marginal ACK — NOT only when matched already clears the 7/16 accept
+	// bar. The MFSK matched-count detector tolerates a wide ±~21 Hz CFO plateau then falls
+	// off a RAZOR cliff (sim: works→0 over ~1.5 Hz); at the cliff matched crashes below 7
+	// BEFORE the refine could fire if it gated at the accept bar (sim: refine moved the
+	// cliff 0 Hz when gated at 7). The half-symbol cross-correlation estimator only needs
+	// a ROUGH lock to recover the residual, so bootstrapping from a low floor (3, well
+	// below the 7 bar, above the ~2/16 pure-noise random-match mean §3.1) lets refine pull
+	// the cliff back: sim 23.5 Hz 0.75→0.99, 24.0 Hz 0.14→0.57. FAR-SAFE: the FINAL accept
+	// is still the unchanged 7/16 count + 0.5 metric gate (the re-detect must EARN the
+	// bar), and we keep the original result unless the refined re-detect matches MORE
+	// (rematched >= *out_matched) — refine can only help, never manufacture a false accept.
+	// Floor = 5: a refine gives noise a SECOND independent draw at the 7/16 gate, so a
+	// too-low floor inflates FAR (sim floor=3: FAR ~2x; floor=5: ~1.4x; floor=6: ~1.1x).
+	// 5 is the FAR-conservative choice (above the ~2/16 pure-noise random-match mean §3.1,
+	// below the 7 accept bar). NOTE (recovery-ack-robustness.md §6.7 STOP verdict): the
+	// sim showed CFO is NOT the binding clean-recovery marginality mechanism on this
+	// detector (it tolerates a wide ±~21 Hz CFO plateau then a razor cliff, no marginal
+	// coin-flip band), so DELTA-2 is HELD default-off and not relied on. This floor is the
+	// FAR-safe setting for the held mechanism.
+	const int RECOVERY_REFINE_BOOTSTRAP_MIN = 5;
+	if (ack_mfsk.recovery_ack_reps > 1 &&
+	    *out_matched >= RECOVERY_REFINE_BOOTSTRAP_MIN && best_offset >= 0)
+	{
+		double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+			data_container.baseband_data_interpolated,
+			bandwidth / (double)data_container.Nc,
+			ack_mfsk.ack_pattern_nsymb,
+			best_offset,
+			ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+		if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+		{
+			// Re-mix at the SIGN-CORRECTED LO (cancel, not double, the residual —
+			// v1 '+' regressed -40% on HW, §23.11.1). Identical buffer math to the
+			// initial mix; only the mix-frequency argument changes.
+			ofdm.passband_to_baseband_decimated(data, size,
+				data_container.baseband_data_interpolated,
+				sampling_frequency,
+				effective_carrier - ctrl_residual,
+				carrier_amplitude,
+				M, &ofdm.FIR_rx_data);
+
+			// Re-run the COMBINING detect on the CFO-corrected baseband. Keep the
+			// result only if it still clears the bar (the corrected mix is at least
+			// as well-aligned as the uncorrected one; on a constant-CFO straddle the
+			// matched count rises). On any drop, fall back to the original metric/
+			// matched (the corrected re-detect cannot make a present ACK worse than
+			// the uncorrected combine at the same offset).
+			int rematched = 0;
+			uint32_t remask = 0;
+			double remetric = ofdm.detect_ack_pattern(
+				data_container.baseband_data_interpolated, size / M,
+				1,
+				ack_mfsk.ack_pattern_nsymb,
+				ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+				ack_mfsk.tone_hop_step, ack_mfsk.M,
+				ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+				&rematched, 0, nullptr, nullptr, 0, &remask,
+				/*always_fine=*/false, /*combine_reps=*/ack_mfsk.recovery_ack_reps);
+			if (rematched >= *out_matched)
+			{
+				*out_matched = rematched;
+				metric = remetric;
+				if (out_match_mask) *out_match_mask = remask;
+			}
+		}
+	}
+
+	// PHASE-1 diagnostic (recovery-ack-robustness.md §6.7) — DEFAULT-OFF, log-only.
+	// Discriminate CONSTANT-CFO vs TIME-VARYING-DRIFT on a marginal recovery poll:
+	//   (a) print the per-symbol miss MASK (which of the base-block symbols missed);
+	//   (b) sweep a de-rotation CFO grid (-30..+30 Hz) by re-mixing the passband at
+	//       effective_carrier - f and re-detecting (same combine_reps), and report at
+	//       which f `matched` peaks. A single sharp grid peak + a near-uniform miss
+	//       mask ⇒ a CONSTANT CFO bias (combining is blind to it; DELTA-2's single
+	//       16-sym refine is the right fix). A clustered mask (e.g. 3 consecutive
+	//       matches then breakdown) with NO single grid peak ⇒ TIME-VARYING DRIFT that
+	//       a single CFO estimate cannot track. Only fires on a poll that found SOME
+	//       energy (matched>0) so it doesn't spam pure-silence polls.
+	if (recovery_ack_diag_enabled() && out_matched && *out_matched > 0)
+	{
+		const int   GRID_HALF_HZ = 30;
+		const int   GRID_STEP_HZ = 3;
+		double best_f = 0.0; int best_grid_matched = -1;
+		printf("[RECOVERY-ACK-DIAG] poll: matched=%d/%d metric=%.3f reps=%d mask=0x%04x | CFO grid:",
+			*out_matched, ack_mfsk.ack_pattern_nsymb, metric,
+			ack_mfsk.recovery_ack_reps, out_match_mask ? (*out_match_mask & 0xFFFFu) : 0u);
+		for (int f = -GRID_HALF_HZ; f <= GRID_HALF_HZ; f += GRID_STEP_HZ)
+		{
+			ofdm.passband_to_baseband_decimated(data, size,
+				data_container.baseband_data_interpolated,
+				sampling_frequency, effective_carrier - (double)f, carrier_amplitude,
+				M, &ofdm.FIR_rx_data);
+			int gm = 0;
+			ofdm.detect_ack_pattern(
+				data_container.baseband_data_interpolated, size / M, 1,
+				ack_mfsk.ack_pattern_nsymb, ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+				ack_mfsk.tone_hop_step, ack_mfsk.M, ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+				&gm, 0, nullptr, nullptr, 0, nullptr,
+				/*always_fine=*/false, /*combine_reps=*/ack_mfsk.recovery_ack_reps);
+			printf(" %+d:%d", f, gm);
+			if (gm > best_grid_matched) { best_grid_matched = gm; best_f = (double)f; }
+		}
+		printf(" | peak matched=%d @ %+.0f Hz\n", best_grid_matched, best_f);
+		fflush(stdout);
+		// The grid sweep overwrote baseband_data_interpolated. Nothing downstream on
+		// the ACK path reads it after this point, but re-mix at the uncorrected
+		// carrier for strict no-side-effect cleanliness.
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency, effective_carrier, carrier_amplitude, M, &ofdm.FIR_rx_data);
+	}
 
 	// Cache correlator metric (normalized to dB) as the §3.1 SNR proxy for the
 	// 2D channel-state lookup (fact-doc channel-state-2d-lookup.md). detect_ack_pattern
@@ -4126,6 +4288,25 @@ int cl_telecom_system::set_connect_preamble_reps(int reps)
 		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
 		* data_container.Nofdm * frequency_interpolation_rate;
 	return ack_mfsk.connect_base_total_nsymb();
+}
+
+// RECOVERY-ACK robustness (recovery-ack-robustness.md §4). Set the number of
+// noncoherent base-block reps for the bare ACK pattern (the recovery / control-
+// ACK turnaround). Recomputes ack_pattern_passband_samples for the R×16-symbol
+// block so the TX sizing and every consumer derived from it stay consistent.
+// reps=1 (default) → R*16=16 → ack_pattern_passband_samples is identical to the
+// load_configuration value → BYTE-IDENTICAL. Must be called AFTER
+// load_configuration. Returns the total base symbols on the wire.
+int cl_telecom_system::set_recovery_ack_reps(int reps)
+{
+	if (reps < 1) reps = 1;
+	if (reps > cl_mfsk::MAX_RECOVERY_ACK_REPS)
+		reps = cl_mfsk::MAX_RECOVERY_ACK_REPS;
+	ack_mfsk.recovery_ack_reps = reps;
+	ack_pattern_passband_samples =
+		ack_mfsk.ack_base_total_nsymb()
+		* data_container.Nofdm * frequency_interpolation_rate;
+	return ack_mfsk.ack_base_total_nsymb();
 }
 
 // =============================================================================
@@ -4603,7 +4784,28 @@ int cl_telecom_system::generate_break_pattern_passband(double* out)
 {
 	if(ack_pattern_passband_samples <= 0) return 0;
 
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §6.6, DELTA-1): the BREAK
+	// is ALWAYS a single 16-symbol base block (generate_break_pattern modulates only
+	// ack_pattern_nsymb symbols; BREAK reps were never part of the §4 robust-ACK
+	// design). But ack_pattern_passband_samples is the SHARED ACK-sizing member that
+	// set_recovery_ack_reps() inflates to R*16=74752 whenever the robust recovery ACK
+	// is armed (telecom_system.cc:4083). The BREAK→ROBUST_0 demote sites call
+	// send_break_pattern() WITHOUT a reps reset (arq_commander.cc:2237/2284/2495/2563/
+	// 2625/2672 etc), so on the FIX arm the generator would peak_clip / return the
+	// R=4 size while modulating only 16 symbols → ~56k trailing memset-zero samples →
+	// ~1.17 s of dead-air PTT hold on EVERY recovery-thrash BREAK. Compute the base
+	// size LOCALLY (reps-agnostic), mirroring how generate_ack_pattern_passband sizes
+	// from ack_base_total_nsymb() (telecom_system.cc:3650). With reps=1 (default-off)
+	// break_samples == ack_pattern_passband_samples EXACTLY → byte-identical.
 	int nsymb = ack_mfsk.ack_pattern_nsymb;
+#ifdef RECOVERY_BREAK_REPS_FAILBEFORE
+	// Fail-before harness ONLY (test_recovery_break_reps_agnostic): restore the
+	// pre-DELTA-1 behavior that sized peak_clip + return from the SHARED, reps-inflated
+	// ack_pattern_passband_samples. Demonstrates the bug; never compiled in production.
+	int break_samples = ack_pattern_passband_samples;
+#else
+	int break_samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
+#endif
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	ack_mfsk.generate_break_pattern(data_container.ofdm_framed_data);
@@ -4627,9 +4829,9 @@ int cl_telecom_system::generate_break_pattern_passband(double* out)
 		data_container.Nofdm * nsymb, out,
 		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
 
-	ofdm.peak_clip(out, ack_pattern_passband_samples, ofdm.data_papr_cut);
+	ofdm.peak_clip(out, break_samples, ofdm.data_papr_cut);
 
-	return ack_pattern_passband_samples;
+	return break_samples;
 }
 
 // RX: Detect BREAK pattern in passband audio buffer (uses break_tones instead of ack_tones)

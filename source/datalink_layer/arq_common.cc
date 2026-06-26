@@ -84,6 +84,28 @@ static inline bool turnaround_rephase_enabled_common()
 	return cached != 0;
 }
 
+// RECOVERY-ACK robustness gate (recovery-ack-robustness.md). DEFAULT-OFF: with
+// MERCURY_RECOVERY_ACK_ROBUST unset the TX emits the single 16-symbol ACK base
+// block and the RX correlates combine_reps=1 — BYTE-IDENTICAL to monitor e2cd1c5.
+// Set MERCURY_RECOVERY_ACK_ROBUST=1 to make the BREAK-recovery reverse control-
+// ACK reliable: TX repeats the ACK base block RECOVERY_ACK_REPS times and the RX
+// noncoherently combines them (the §4 lever), lifting a turnaround-straddled
+// clean ACK from the marginal 6-7/16 back over the 7/16 bar WITHOUT lowering the
+// bar (FAR unchanged). Cached once — no getenv() in the ACK poll hot loop.
+static inline bool recovery_ack_robust_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_ROBUST");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+// Rep count when the robust recovery ACK is enabled (§4: R=4 ≈ +3-5 dB on the
+// matched-count → ample to clear the 7/16 bar from a straddled 6-7).
+static const int RECOVERY_ACK_REPS = 4;
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -4799,6 +4821,10 @@ bool cl_arq_controller::bigblock_carve_suspended()
 // break_fh_gate_test_override: UNIT-TEST seam only (-1 = honor env, 0/1 = force). It lets
 // run_break_fh_gate_tests() exercise BOTH gate states in one process despite the cached env read.
 int cl_arq_controller::break_fh_gate_test_override = -1;
+// recovery_ack_robust_test_override: UNIT-TEST seam only (-1 = honor env, 0/1 = force),
+// mirroring break_fh_gate_test_override. Production NEVER sets it, so set_recovery_ack_reps_for_wait
+// honors the cached env -> default-off byte-identical.
+int cl_arq_controller::recovery_ack_robust_test_override = -1;
 bool cl_arq_controller::break_fh_gate_enabled()
 {
 	if(break_fh_gate_test_override >= 0) return break_fh_gate_test_override != 0;
@@ -6299,11 +6325,29 @@ void cl_arq_controller::send_batch()
 }
 
 // Transmit short ACK tone pattern instead of LDPC-encoded ACK frame
-void cl_arq_controller::send_ack_pattern()
+void cl_arq_controller::send_ack_pattern(bool control_ack)
 {
 	if(passive_monitor) return;
 	cl_timer ack_turnaround_timer;
 	ack_turnaround_timer.start();
+
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): for a BREAK-recovery
+	// / control-ACK turnaround, emit the ACK base block RECOVERY_ACK_REPS times so
+	// the CMD can noncoherently combine it past the marginal 6-7/16 clean cliff.
+	// Gated MERCURY_RECOVERY_ACK_ROBUST + control_ack; data-ACK callers and the
+	// default-off path keep reps=1 → single block, byte-identical airtime. Restored
+	// before return so no other ACK send is affected. set_recovery_ack_reps()
+	// recomputes ack_pattern_passband_samples so the sizing below is consistent.
+	const bool recovery_robust = control_ack && recovery_ack_robust_enabled_common();
+	const int saved_recovery_reps = telecom_system->ack_mfsk.recovery_ack_reps;
+	if(recovery_robust)
+	{
+		telecom_system->set_recovery_ack_reps(RECOVERY_ACK_REPS);
+		printf("[TX-ACK-PAT] RECOVERY-ROBUST: emitting %d ACK base reps (%d symbols)\n",
+			RECOVERY_ACK_REPS, telecom_system->ack_mfsk.ack_base_total_nsymb());
+		fflush(stdout);
+	}
+
 	printf("[TX-ACK-PAT] Sending ACK pattern on CONFIG_%d at t=%dms\n", current_configuration, (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
 	mtl::log_event("rsp_ack_send_start");
 
@@ -6482,7 +6526,60 @@ void cl_arq_controller::send_ack_pattern()
 	ptt_off_delay_timer.start();
 	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
+	// Restore the single-block ACK sizing so no subsequent ACK send (data-ACK or
+	// a non-robust path) is affected by this turnaround's rep count.
+	if(recovery_robust)
+		telecom_system->set_recovery_ack_reps(saved_recovery_reps);
+
 	ptt_off();
+}
+
+// RECOVERY-ACK robustness (recovery-ack-robustness.md §4/§6.2). CMD-side: set the
+// combine_reps the NEXT ACK-pattern wait correlates with. The control-ACK
+// (BREAK-recovery / SET_CONFIG) turnaround combines RECOVERY_ACK_REPS reps —
+// matching the RSP control-code/BREAK arms that now emit R reps — so a clean
+// straddled ACK clears 7/16. The data-ACK turnaround stays single-block (the RSP
+// data arm does not repeat). No-op / byte-identical when MERCURY_RECOVERY_ACK_ROBUST
+// is off or NB (ack_pattern_time_ms<=0): reps stay 1.
+void cl_arq_controller::set_recovery_ack_reps_for_wait(bool control_ack)
+{
+	// Gate: env (cached) unless the unit-test seam forces it. Production leaves the
+	// override at -1 -> honors the env -> default-off byte-identical.
+	const bool robust = (recovery_ack_robust_test_override >= 0)
+		? (recovery_ack_robust_test_override != 0)
+		: recovery_ack_robust_enabled_common();
+	if(!robust) return;                                  // default-off: leave reps at 1
+	if(ack_pattern_time_ms <= 0) return;                 // pattern-ACK path only
+	int reps = (control_ack ? RECOVERY_ACK_REPS : 1);
+	if(telecom_system->ack_mfsk.recovery_ack_reps != reps)
+		telecom_system->set_recovery_ack_reps(reps);
+	// recovery-window coupling (recovery-ack-robustness.md §6.3): set_recovery_ack_reps
+	// updates ack_pattern_passband_samples but NOT its ms-mirror ack_pattern_time_ms,
+	// which calculate_receiving_timeout's recovery/CMD listen-window geometry reads.
+	// Refresh the mirror so the window auto-tracks the on-air ACK airtime (R=4 → 1557 ms;
+	// data arm reps=1 → back to 390 ms). Unconditional here so BOTH the bump and the
+	// reset re-sync; refreshing to an unchanged value is a no-op (byte-identical).
+#ifndef RECOVERY_WINDOW_FAILBEFORE
+	recompute_ack_pattern_time_ms();
+#endif
+}
+
+// RECOVERY-ACK robustness (recovery-ack-robustness.md §6.3): re-derive the ms-mirror
+// ack_pattern_time_ms from the current telecom ack_pattern_passband_samples, using the
+// SAME ceil formula as load_configuration (arq_common.cc:2206). Keeps the listen-window
+// geometry term (calculate_receiving_timeout) in step with the on-air ACK length after a
+// recovery-ack rep change. reps=1 → passband==load_configuration value → recomputes the
+// identical 390 → byte-identical when MERCURY_RECOVERY_ACK_ROBUST is off.
+void cl_arq_controller::recompute_ack_pattern_time_ms()
+{
+	if(telecom_system->ack_pattern_passband_samples > 0)
+	{
+		ack_pattern_time_ms = (int)ceil(1000.0 * telecom_system->ack_pattern_passband_samples / telecom_system->sampling_frequency);
+	}
+	else
+	{
+		ack_pattern_time_ms = 0;
+	}
 }
 
 // Transmit ACK + SNR suffix pattern (turboshift only)
@@ -7309,10 +7406,25 @@ void cl_arq_controller::send_break_pattern()
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
 	ptt_on_delay_timer.start();
 
-	int pattern_samples = telecom_system->ack_pattern_passband_samples;
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §6.6, DELTA-1): the BREAK
+	// burst is ALWAYS one 16-symbol base block. ack_pattern_passband_samples is the
+	// SHARED ACK-sizing member that set_recovery_ack_reps() inflates to R*16 while the
+	// robust recovery ACK is armed; the BREAK demote sites do NOT reset reps first, so
+	// reading ack_pattern_passband_samples here over-sizes the alloc, the trailing-edge
+	// ramp memcpy, and (load-bearing) the tx_transfer length below → ~1.17 s of
+	// memset-zero dead-air on the PTT for every recovery-thrash BREAK. Size from the
+	// generator's own return (the authoritative BREAK base length, reps-agnostic).
+	// With reps=1 (default-off) the generator returns ack_pattern_passband_samples
+	// EXACTLY → pattern_samples unchanged → byte-identical.
 	int symbol_period = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
 
-	int padded_size = pattern_samples + 2 * symbol_period;
+	// Pre-size the work buffers to the MAX possible base length so the generator's
+	// write never overflows, independent of any transient reps state. The BREAK base
+	// is ack_pattern_nsymb symbols regardless of recovery_ack_reps.
+	int break_alloc_samples = telecom_system->ack_mfsk.ack_pattern_nsymb
+		* telecom_system->data_container.Nofdm * telecom_system->frequency_interpolation_rate;
+
+	int padded_size = break_alloc_samples + 2 * symbol_period;
 	double *raw_output = new double[padded_size];
 	double *filtered1 = new double[padded_size];
 	double *filtered2 = new double[padded_size];
@@ -7321,8 +7433,11 @@ void cl_arq_controller::send_break_pattern()
 
 	memset(raw_output, 0, padded_size * sizeof(double));
 
-	// Generate BREAK pattern passband (different tones from ACK)
-	telecom_system->generate_break_pattern_passband(&raw_output[symbol_period]);
+	// Generate BREAK pattern passband (different tones from ACK). Returns the actual
+	// base-block sample count it wrote — the authoritative TX length.
+	int pattern_samples = telecom_system->generate_break_pattern_passband(&raw_output[symbol_period]);
+	if(pattern_samples <= 0 || pattern_samples > break_alloc_samples)
+		pattern_samples = break_alloc_samples;  // defensive: never read past the alloc
 
 	memcpy(&raw_output[0], &raw_output[symbol_period], symbol_period * sizeof(double));
 	memcpy(&raw_output[symbol_period + pattern_samples], &raw_output[pattern_samples], symbol_period * sizeof(double));
@@ -8280,10 +8395,20 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 	// full pattern (with suffix) + margin.
 	// WB: 16+20+16=52. NB M=8: 32+40+16=88. NB M=4: 48+56+16=120.
 	int ack_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	// RECOVERY-ACK robustness (recovery-ack-robustness.md §6.2, INVARIANT): when the
+	// robust recovery ACK is active the TX emits ack_base_total_nsymb()=R×16 base
+	// symbols and detect_ack_pattern combines combine_reps=R reps — which REQUIRES
+	// R×16 symbols in the tail (it returns 0.0 if buffer_nsymb < R×16). The tail
+	// MUST therefore span the full R-rep base, not just one block, or the combined
+	// recovery ACK is never detected. recovery_ack_reps=1 (default) → R×16=16 →
+	// ack_base_total_nsymb() == ack_pattern_nsymb → tail unchanged → byte-identical.
+	int ack_base_total = turbo_snr_ack_enabled ?
+		ack_nsymb :
+		telecom_system->ack_mfsk.ack_base_total_nsymb();
 	int pattern_len = turbo_snr_ack_enabled ?
 		telecom_system->ack_mfsk.ack_snr_pattern_nsymb() :
-		ack_nsymb;
-	const int tail_nsymb = ack_nsymb + pattern_len + 16;
+		ack_base_total;
+	const int tail_nsymb = ack_base_total + pattern_len + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
 	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;

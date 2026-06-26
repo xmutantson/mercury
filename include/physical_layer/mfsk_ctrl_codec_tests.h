@@ -47,4 +47,10 @@ int run_preamble_sched_tests();
 // number of failed tests (0 = all pass). Wired via main.cc --test-break-fh.
 int run_break_fh_gate_tests();
 
+// recovery-ack-robustness.md: run ONLY the recovery-ACK robustness suite (marginal-ACK
+// combining, listen-window ms-mirror, DELTA-1 reps-agnostic BREAK, DELTA-2 CFO-refine
+// decision gate). Fast iteration. Returns failed count. Wired via main.cc
+// --test-recovery-ack.
+int run_recovery_ack_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_
