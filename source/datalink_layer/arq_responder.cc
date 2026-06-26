@@ -8064,8 +8064,20 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
 	bool had_prev = (prev_env != NULL);
 	set_env("MERCURY_INBAND_RATE", "1");
+	// RING-FLOOR-OVERSEAT FIX (data-flow-inband-ring-floor-overseat.md): the generalized OFDM
+	// natural-ring guard now SUPPRESSES inband_seat_robust_ring_floor() at EVERY healthy OFDM rung
+	// (was CONFIG_0 only). This test deliberately SEATS the robust floor at an OFDM config (CONFIG_1)
+	// to MODEL the pre-fix oversized-ring state it then proves the adopt SHRINKS — so it must disable
+	// the new guard to construct that setup. The behavior under test (adopt-shrink + the
+	// inband_ofdm_acq_ring_shrunk re-seat suppression, which is checked at :4347 BEFORE this guard) is
+	// UNCHANGED by the defeat. Restored in restore_env.
+	const char* prev_gd = std::getenv("MERCURY_CONFIG0_RING_GUARD_DEFEAT");
+	std::string prev_gd_saved = prev_gd ? std::string(prev_gd) : std::string();
+	bool had_gd = (prev_gd != NULL);
+	set_env("MERCURY_CONFIG0_RING_GUARD_DEFEAT", "1");
 	auto restore_env = [&]() {
 		set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+		set_env("MERCURY_CONFIG0_RING_GUARD_DEFEAT", had_gd ? prev_gd_saved.c_str() : "");
 		set_env("MERCURY_ADOPT_FLUSH_DEFEAT", "");
 		set_env("MERCURY_ADOPT_FTR_REARM_DEFEAT", "");
 		set_env("MERCURY_ADOPT_RING_SHRINK_DEFEAT", "");
