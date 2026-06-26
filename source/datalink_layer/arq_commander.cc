@@ -3991,17 +3991,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							}
 						}
 
-						// KEYSTONE (data-flow-inband-tier-crossing.md §6) — DATA-DECOUPLED
-						// intra-tier CLIMB confirm. The bsi-bearing SACK suffix decode just
-						// FAILED (decoded==false: CRC12 mismatch above, or the suffix never
-						// decoded), but the robust BASE ACK pattern (mfsk_matched) may still be
-						// present — and a base match at-or-above ack_match_threshold PROVES the
-						// RX ACKed a forward batch at the announced config = followed. So an
-						// EMITTED CLIMB re-tag is CONFIRMED here, DECOUPLED from the marginal
-						// suffix. STRICTLY ADDITIVE: the CRC-valid suffix confirm at :3758/:3783/
-						// :3953 is untouched and fires whenever the suffix decodes; this only adds
-						// a confirm on the suffix-FAILED path. No-op when inband off / not armed /
-						// not yet announced / sub-threshold / a DROP (helper self-gates).
+						// RETIRED §6 base-pattern climb-confirm (data-flow-inband-basepattern-
+						// confirm-falseconfirm.md). The §6 KEYSTONE confirmed a CLIMB re-tag here
+						// on the robust BASE ACK pattern when the bsi-bearing SACK suffix decode
+						// FAILED. That was a FALSE-CONFIRM: the base ACK tone pattern is config-
+						// INVARIANT, so a match proves "an ACK came back," NOT "the RX followed to
+						// the announced config." It disarmed the re-tag before the RX actually
+						// followed, killing D1 repeat-until-followed + pipeline-the-climb, capping
+						// the climb at the ROBUST floor (the tier-cross was never reached; MEASURED
+						// rx 15 B vs 424 B with it OFF, WGN:40). inband_retag_confirm_from_base_
+						// pattern now ALWAYS returns false (a no-op) — the climb CONFIRM rides the
+						// config-DISCRIMINATING suffix bsi (inband_retag_confirm_from_sack, the
+						// CRC-valid confirm at :3758/:3783/:3953, untouched) + the D4 auto-demote
+						// net. The call is retained so -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE can
+						// reproduce the BUG (the fails-before arm). Flag-off byte-identical.
 						if(!decoded)
 							inband_retag_confirm_from_base_pattern(mfsk_matched,
 								telecom_system->ack_mfsk.ack_match_threshold);
@@ -10261,12 +10264,14 @@ int cl_arq_controller::test_inband_tier_cross_reverse_pin()
 	return failed == 0 ? 0 : 1;
 }
 
-// KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
-// DATA-DECOUPLED intra-tier CLIMB confirm. Drives inband_retag_confirm_from_base_pattern
-// across the matrix: an EMITTED CLIMB re-tag + base ACK pattern at-or-above threshold ->
-// CONFIRM (disarm), DECOUPLED from the bsi-bearing suffix; sub-threshold / not-yet-announced
-// / a DROP / feature-OFF -> NO confirm. Under -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE the
-// helper is pinned false (the data-coupled redesign) -> the CONFIRM assertion FLIPS to FAIL.
+// RETIRED-§6 regression (data-flow-inband-basepattern-confirm-falseconfirm.md) — drives
+// inband_retag_confirm_from_base_pattern across the matrix. PASS-AFTER (default): an EMITTED
+// CLIMB re-tag + base ACK pattern at-or-above threshold does NOT confirm (the base ACK tone
+// pattern is config-INVARIANT, so it is not follow-evidence; the re-tag STAYS armed so D1
+// repeat + pipeline-climb keep running and the config-discriminating suffix bsi / D4 net own
+// the confirm). FAIL-BEFORE (-DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE): the §6 false-confirm is
+// reproduced -> the at/above-threshold NO-CONFIRM assertions FLIP to FAIL. Sub-threshold /
+// not-yet-announced / a DROP / feature-OFF -> NO confirm in BOTH arms.
 int cl_arq_controller::test_inband_basepattern_confirm()
 {
 	int failed = 0;
@@ -10298,38 +10303,50 @@ int cl_arq_controller::test_inband_basepattern_confirm()
 		inband_last_confirmed_config = CONFIG_NONE;
 	};
 
-	// (1) Armed EMITTED climb + base pattern AT threshold -> CONFIRM (disarm). The
-	//     load-bearing case: under -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE this FLIPS to FAIL.
+#ifdef INBAND_BASEPATTERN_CONFIRM_FAILBEFORE
+	const bool basepattern_retired = false;   // BUG arm: the base pattern false-confirms
+#else
+	const bool basepattern_retired = true;    // FIX: the base pattern NEVER confirms a climb
+#endif
+	printf("[TEST-BASECONFIRM] base-pattern climb-confirm = %s\n",
+		basepattern_retired ? "RETIRED (never confirms; config-invariant != follow-evidence)"
+		                    : "FAIL-BEFORE (the §6 false-confirm)");
+	fflush(stdout);
+
+	// (1) THE LOAD-BEARING ASSERTION: an armed EMITTED climb with a base pattern AT-or-above
+	//     threshold must NOT confirm (the base ACK tone pattern is config-INVARIANT, so a
+	//     match is not follow-evidence; data-flow-inband-basepattern-confirm-falseconfirm.md).
+	//     The re-tag STAYS ARMED so D1 repeat-until-followed + pipeline-climb keep running and
+	//     the config-DISCRIMINATING suffix confirm / D4 net own the climb. Under
+	//     -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE this FLIPS to FAIL (the §6 false-confirm).
 	arm_emitted_climb();
 	bool c1 = inband_retag_confirm_from_base_pattern(THR, THR);
-	check(c1 == true && inband_retag_armed == false,
-		"emitted climb + base pattern>=thr: CONFIRM (re-tag DISARMED)",
-		(c1 && !inband_retag_armed) ? 1 : 0, 1);
-	check(inband_last_confirmed_config == ROBUST_2,
-		"confirm records last_confirmed_config = the climbed-to rung",
-		inband_last_confirmed_config, ROBUST_2);
+	check(c1 == false && inband_retag_armed == true,
+		"emitted climb + base pattern>=thr: NO confirm (config-invariant base != follow); re-tag STAYS armed",
+		(!c1 && inband_retag_armed) ? 1 : 0, 1);
 
-	// (2) Base pattern ABOVE threshold also confirms. (Call the side-effecting helper ONCE
-	//     and store — it DISARMS on confirm, so a second call would see the disarmed state.)
+	// (2) Base pattern ABOVE threshold also does NOT confirm (still config-invariant).
 	arm_emitted_climb();
 	bool c2 = inband_retag_confirm_from_base_pattern(THR + 3, THR);
-	check(c2 == true,
-		"emitted climb + base pattern>thr: CONFIRM", c2 ? 1 : 0, 1);
+	check(c2 == false && inband_retag_armed == true,
+		"emitted climb + base pattern>thr: NO confirm (re-tag STAYS armed)",
+		(!c2 && inband_retag_armed) ? 1 : 0, 1);
 
-	// (3) Base pattern SUB-threshold -> NO confirm (the genuine no-follow: no reverse ACK).
+	// (3) Base pattern SUB-threshold -> NO confirm (holds in BOTH arms; the macro only flips
+	//     the at/above-threshold cases above). re-tag stays armed.
 	arm_emitted_climb();
 	bool c3 = inband_retag_confirm_from_base_pattern(THR - 1, THR);
 	check(c3 == false && inband_retag_armed == true,
-		"sub-threshold base pattern: NO confirm (re-tag STAYS armed -> D4 owns it)",
+		"sub-threshold base pattern: NO confirm (re-tag STAYS armed)",
 		(!c3 && inband_retag_armed) ? 1 : 0, 1);
 
-	// (4) NOT yet announced (announce_bsi<0) -> NO confirm (cannot confirm an unemitted climb).
+	// (4) NOT yet announced (announce_bsi<0) -> NO confirm (holds in both arms).
 	arm_emitted_climb();
 	inband_announce_bsi = -1;
 	bool c4 = inband_retag_confirm_from_base_pattern(THR, THR);
 	check(c4 == false, "not-yet-announced (announce_bsi<0): NO confirm", c4 ? 1 : 0, 0);
 
-	// (5) Armed re-tag is a DROP (target BELOW pre) -> NO confirm (the down-ladder owns a drop).
+	// (5) Armed re-tag is a DROP (target BELOW pre) -> NO confirm (holds in both arms).
 	inband_retag_armed         = true;
 	inband_pre_announce_config = CONFIG_4;   // higher idx
 	inband_retag_config        = CONFIG_0;   // lower idx -> a DROP

@@ -3491,39 +3491,69 @@ bool cl_arq_controller::inband_retag_confirm_from_sack(int rx_bsi)
 bool cl_arq_controller::inband_retag_confirm_from_base_pattern(int mfsk_matched,
 	int ack_match_threshold)
 {
+	// RETIRED — the §6 base-pattern climb-confirm is a FALSE-CONFIRM and is permanently
+	// disabled (data-flow-inband-basepattern-confirm-falseconfirm.md). DO NOT re-enable.
+	//
+	// ROOT (CONFIRMED, one-variable sim A/B at WGN:40): this helper confirmed (DISARMED) a
+	// CLIMB re-tag on the robust BASE ACK tone pattern (mfsk_matched >= ack_match_threshold).
+	// But the base ACK pattern is config-INVARIANT — the RX emits the identical M=16 base
+	// tones whether it FOLLOWED to the climbed-to config OR is still ACKing from the OLD
+	// config. So a base match proves only "an ACK came back," NOT "the RX is now at the new
+	// config." It is not follow-evidence. The premise §6 relied on ("a base match PROVES the
+	// RX ACKed a forward batch AT the announced config") is FALSE.
+	//
+	// The false-confirm was FATAL, not benign: disarming inband_retag_armed early kills BOTH
+	// config-discriminating recovery mechanisms — D1 repeat-until-followed (emit_config_tag_
+	// passband re-emits WHILE armed) and pipeline-the-climb (inband_pipeline_climb_active,
+	// which requires inband_retag_armed). The RX then never gets a second chance to follow,
+	// the CMD seats the new rung unilaterally, sends undecodable forward data, and demotes —
+	// capping the climb at the ROBUST floor so the ROBUST->OFDM tier-cross is NEVER reached.
+	// §6.3.3 bet the over-eager confirm was "RECOVERABLE" via the D4 net; it is not — the
+	// false-confirm disarms BEFORE the R-floor count D4 waits for, so D4 never fires.
+	//
+	// MEASURED (tools/sim/sim_arq_channel.py --cell WGN:40 --start-cfg 100 --robust, this
+	// HEAD): confirm LIVE -> rx 15 B, caps ROBUST_0; confirm OFF -> rx 424 B, climbs
+	// 100->101->102->CONFIG_0 (the tier-cross fires). §6 is also OBSOLETE: it predates the
+	// reverse-ACK robust PIN (data-flow-inband-tier-crossing.md §3), after which the config-
+	// DISCRIMINATING suffix bsi confirm (inband_retag_confirm_from_sack) decodes — and §6's
+	// latency goal is already served by pipeline-climb + D1 + the stateless per-batch RSP
+	// tag-follow, none of which need (or want) a content-free correlator confirm.
+	//
+	// The climb CONFIRM now rides config-DISCRIMINATING evidence ONLY: the bsi-bearing suffix
+	// (inband_retag_confirm_from_sack, accepts a SACK bsi >= announce anchor) + the D4
+	// auto-demote net for a genuinely unfollowable climb. This function NEVER confirms.
 #ifdef INBAND_BASEPATTERN_CONFIRM_FAILBEFORE
-	// FAIL-BEFORE arm (the data-coupled redesign): the intra-tier climb confirm rides ONLY
-	// the CRC-valid bsi-bearing suffix (inband_retag_confirm_from_sack); the base pattern
-	// NEVER confirms. Pinning this to false reproduces the suffix-coupled stall; the directed
-	// test + the LIVE-PATH then cap at the robust tier / CONFIG_0 (fails-before).
-	(void)mfsk_matched; (void)ack_match_threshold;
-	return false;
-#else
+	// FAIL-BEFORE arm: reproduce the RETIRED §6 false-confirm (confirm a climb on the
+	// config-invariant base pattern) so the directed test's pass-after ("base pattern NEVER
+	// confirms") FLIPS to FAIL, and the E2E caps at the ROBUST floor (rx≈15 B). This macro
+	// is the BUG; the default build is the fix.
 	if(!inband_rate_feature_enabled())
 		return false;
 	if(!inband_retag_armed || inband_announce_bsi < 0)
-		return false;   // disarmed OR not-yet-announced -> cannot confirm
-	if(ack_match_threshold <= 0 || mfsk_matched < ack_match_threshold)
-		return false;   // base ACK pattern absent / sub-threshold -> not a confirm
-	// CLIMB-UP only (the SAME predicate §1.8 / D4 use): a target with a HIGHER ladder index
-	// than the pre-announce config. A DROP/lateral does NOT confirm here (the down-ladder
-	// + the continuing re-tag own a drop, design §4.1(a)).
-	int pre_idx    = config_ladder_index(inband_pre_announce_config);
-	int target_idx = config_ladder_index(inband_retag_config);
-	if(!(pre_idx >= 0 && target_idx > pre_idx))
 		return false;
-
-	printf("[INBAND-TX] CONFIRMED followed CONFIG_%d via BASE ACK pattern (mfsk_matched=%d "
-		">= thr=%d; suffix CRC failed -> decoupled confirm) -> re-tag DISARMED\n",
+	if(ack_match_threshold <= 0 || mfsk_matched < ack_match_threshold)
+		return false;
+	{
+		int pre_idx    = config_ladder_index(inband_pre_announce_config);
+		int target_idx = config_ladder_index(inband_retag_config);
+		if(!(pre_idx >= 0 && target_idx > pre_idx))
+			return false;
+	}
+	printf("[INBAND-TX] (FAILBEFORE) FALSE-CONFIRM CONFIG_%d via BASE ACK pattern "
+		"(mfsk_matched=%d >= thr=%d) -> re-tag DISARMED\n",
 		inband_retag_config, mfsk_matched, ack_match_threshold);
 	fflush(stdout);
-
-	inband_last_confirmed_config = inband_retag_config;   // the D4 demote floor (provably reached)
+	inband_last_confirmed_config = inband_retag_config;
 	inband_retag_armed   = false;
 	inband_retag_config  = CONFIG_NONE;
 	inband_announce_bsi  = -1;
 	inband_retag_count   = 0;
 	return true;
+#else
+	// RETIRED (default): the base pattern is config-invariant -> never follow-evidence ->
+	// never confirms. The suffix-bsi confirm + D4 net own the climb-confirm.
+	(void)mfsk_matched; (void)ack_match_threshold;
+	return false;
 #endif
 }
 
