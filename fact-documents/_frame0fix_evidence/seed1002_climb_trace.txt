@@ -1,0 +1,14 @@
+[T+0100.852] [CMD] [GEARSHIFT] FRAME UP: 1 consecutive ACKs (eff_thresh 1, base 3, clean-streak 1), config 100 -> 101
+[T+0100.853] [CMD] [INBAND-TX] UNILATERAL CONFIG 100 -> 101 (no SET_CONFIG; next batch tags the new config on the passband)
+[T+0120.563] [CMD] [BREAK] Block failure #1 at config 101 (threshold=3, batch=1)
+[T+0131.445] [CMD] [GEARSHIFT] FRAME UP: 1 consecutive ACKs (eff_thresh 1, base 3, clean-streak 1), config 101 -> 102
+[T+0131.445] [CMD] [INBAND-TX] UNILATERAL CONFIG 101 -> 102 (no SET_CONFIG; next batch tags the new config on the passband)
+[T+0151.191] [CMD] [BREAK] Block failure #1 at config 102 (threshold=3, batch=1)
+[T+0161.971] [CMD] [GEARSHIFT] FRAME UP: 1 consecutive ACKs (eff_thresh 1, base 3, clean-streak 1), config 102 -> 0
+[T+0161.972] [CMD] [INBAND-TX] TIER-CROSS reverse-ACK pin: reverse_configuration -1 -> 102 (hold the robust rung across the cross so the reverse SACK decodes on MFSK, mirroring legacy's reverse-robust hold)
+[T+0161.972] [CMD] [GEARSHIFT] SET_CONFIG: forward=0 reverse=102 (SNR down=-99.9 up=0.0) link_status=2
+[T+0169.452] [RSP] [GEARSHIFT] Received SET_CONFIG: forward=0 reverse=102
+[T+0201.166] [CMD] [GEARSHIFT] ROLLING-PARTIAL anchor raise: lead-frame-only batch fully delivered at config 0 -> last_data_viable 102->0 (FRAME-UP +1 clamp now permits the next-rung probe)
+[T+0201.166] [CMD] [GEARSHIFT] FRAME UP: 1 consecutive ACKs (eff_thresh 1, base 3, clean-streak 2), config 0 -> 3
+[T+0201.167] [CMD] [INBAND-TX] UNILATERAL CONFIG 0 -> 3 (no SET_CONFIG; next batch tags the new config on the passband)
+[T+0238.801] [CMD] [BREAK] Block failure #1 at config 3 (threshold=3, batch=24)

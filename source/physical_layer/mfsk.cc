@@ -24,6 +24,7 @@
 #include "physical_layer/ldpc.h"
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // Stage 3c: getenv/atoi for MERCURY_INBAND_TAG_SYNC_REPS
 
 cl_mfsk::cl_mfsk()
 {
@@ -968,6 +969,124 @@ void cl_mfsk::generate_ctrl_suffix_pattern(std::complex<double>* pattern_out,
 		int actual_tone = (payload_tones[s] + abs_s * tone_hop_step) % M;
 		for (int st = 0; st < nStreams; st++)
 			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
+	}
+}
+
+// In-band rate adaptation (Stage 3a): CONNECT base pattern + the CONFIG_TAG
+// GF(16) RA codeword as the suffix. MIRROR of generate_ctrl_suffix_pattern; the
+// ONLY difference is the suffix tones come from `tones[]` (the
+// gf16ra::encode_config_tag codeword the ARQ layer already built) instead of
+// pack_ctrl_suffix. Same base, same one-hot per-symbol tone placement, same hop
+// formula and base_total offset — so the SAME detect_ack_pattern correlator
+// locates it and the SAME decode_suffix_energies extracts the per-tone energy
+// matrix the config_tag_wrap_decode consumes. n_suffix MUST be
+// gf16ra::codeword_len().
+void cl_mfsk::generate_config_tag_mfsk_pattern(std::complex<double>* pattern_out,
+                                               const int* tones, int n_suffix)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+	if (n_suffix <= 0 || tones == NULL) return;
+	if (connect_pattern_nsymb <= 0) return;
+
+	// Stage 3c: the base is the TRIMMED acquisition sync (config_tag_sync_nsymb()
+	// symbols, default a swept minimum < the full 16) — a prefix of the connect
+	// base sequence with NO rep-combining. The deterministic offset (the tag rides
+	// right after frame-0) replaces blind-acquire rep-integration. The same
+	// detect_ack_pattern correlator (on connect_tones, combine_reps=1) finds it.
+	int base_total = config_tag_sync_nsymb();
+	generate_config_tag_base(pattern_out, base_total);
+
+	// The suffix follows the (trimmed) base. abs_s uses base_total so TX and the RX
+	// suffix-decode offset (passed config_tag_sync_nsymb()) stay phase-consistent —
+	// the SAME hop discipline the ctrl-suffix uses, just at a shorter base offset.
+	double amp = sqrt((double)Nc / nStreams);
+	for (int s = 0; s < n_suffix; s++) {
+		int abs_s = base_total + s;  // suffix index after the trimmed base
+		for (int k = 0; k < Nc; k++)
+			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+
+		int tone = tones[s];
+		if (tone < 0 || tone >= M) tone = 0;  // defensive clamp
+		int actual_tone = (tone + abs_s * tone_hop_step) % M;
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
+	}
+}
+
+// Stage 3c: number of base-sync symbols the CONFIG_TAG burst emits/searches.
+// Env MERCURY_INBAND_TAG_SYNC_REPS overrides (cached once); clamped to
+// [1, connect_pattern_nsymb]. Default CFG_TAG_SYNC_NSYMB_DEFAULT (the swept
+// minimum keeping detection >=99% at the op SNR with timing jitter + FAR held).
+int cl_mfsk::config_tag_sync_nsymb() const
+{
+	// Test-only override takes precedence (the Stage-3c sweep varies this per
+	// iteration; the env cache below is process-static so it cannot be re-read).
+	if (tag_sync_nsymb_override > 0) {
+		int v = tag_sync_nsymb_override;
+		int hi = (connect_pattern_nsymb > 0) ? connect_pattern_nsymb : 16;
+		if (v < 1) v = 1;
+		if (v > hi) v = hi;
+		return v;
+	}
+	static int cached = -1;   // -1 = unresolved
+	if (cached < 0) {
+		int v = CFG_TAG_SYNC_NSYMB_DEFAULT;
+		const char* e = std::getenv("MERCURY_INBAND_TAG_SYNC_REPS");
+		if (e != nullptr && *e) {
+			int parsed = atoi(e);
+			if (parsed > 0) v = parsed;
+		}
+		cached = v;
+	}
+	int v = cached;
+	int hi = (connect_pattern_nsymb > 0) ? connect_pattern_nsymb : 16;
+	if (v < 1) v = 1;
+	if (v > hi) v = hi;
+	return v;
+}
+
+// Stage 3c: the matched-count gate for the trimmed tag base. Scale
+// connect_match_threshold by the base-length ratio (ceil) so the detection
+// stringency-per-symbol is preserved, floored at CFG_TAG_SYNC_MATCH_MIN (FAR
+// backstop on very short bases). At the full base this equals
+// connect_match_threshold (byte-identical to the CONNECT gate).
+int cl_mfsk::config_tag_sync_match_threshold() const
+{
+	int n   = config_tag_sync_nsymb();
+	int full = (connect_pattern_nsymb > 0) ? connect_pattern_nsymb : 16;
+	int base_thr = (connect_match_threshold > 0) ? connect_match_threshold : 7;
+	// ceil(base_thr * n / full)
+	int thr = (base_thr * n + full - 1) / full;
+	if (thr < CFG_TAG_SYNC_MATCH_MIN) thr = CFG_TAG_SYNC_MATCH_MIN;
+	if (thr > n) thr = n;   // can't match more symbols than exist
+	return thr;
+}
+
+// Stage 3c: emit `nsymb` base-sync symbols (a prefix of the connect base
+// sequence, NO rep-combining) at the front of pattern_out. The per-symbol-LOCAL
+// hop index is `s` (== detect_ack_pattern's `p`), so the RX correlator searching
+// connect_tones with combine_reps=1 aligns symbol-for-symbol. This is the
+// reps=1 single-block path of generate_connect_pattern, truncated to nsymb
+// symbols — DECOUPLED from connect_preamble_reps (CONNECT keeps its full base).
+void cl_mfsk::generate_config_tag_base(std::complex<double>* pattern_out, int nsymb)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+	if (connect_pattern_nsymb <= 0) return;
+	if (nsymb < 1) nsymb = 1;
+	if (nsymb > connect_pattern_nsymb) nsymb = connect_pattern_nsymb;
+
+	const int base_len = 8;
+	double amp = sqrt((double)Nc / nStreams);
+	for (int s = 0; s < nsymb; s++) {
+		for (int k = 0; k < Nc; k++)
+			pattern_out[s * Nc + k] = std::complex<double>(0.0, 0.0);
+
+		int tone_base = connect_tones[s % base_len];
+		int actual_tone = (tone_base + s * tone_hop_step) % M;
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[s * Nc + stream_offsets[st] + actual_tone] =
 				std::complex<double>(amp, 0.0);
 	}
 }

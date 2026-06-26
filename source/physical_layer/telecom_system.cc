@@ -4360,6 +4360,62 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 	return ctrl_suffix_pattern_passband_samples;
 }
 
+// In-band rate adaptation (Stage 3a): emit the CONFIG_TAG burst as passband
+// audio. MIRROR of generate_ctrl_suffix_pattern_passband — identical IFFT +
+// power-normalization + baseband-to-passband + peak-clip pipeline — but the
+// suffix is keyed from the gf16ra::encode_config_tag codeword `tones[]` (the ARQ
+// layer already built it via emit_config_tag_if_changed) instead of
+// pack_ctrl_suffix. SELF-SIZED: the CONFIG_TAG codeword (configure(2)=N=39)
+// differs from the CONNECT FEC length (configure(3)=N=52), so this does NOT read
+// ctrl_suffix_pattern_passband_samples — it computes its own nsymb/sample count.
+// Returns samples written, or 0 if unsupported (NB / M<16) or n_suffix invalid.
+int cl_telecom_system::generate_config_tag_pattern_passband(double* out,
+	const int* tones, int n_suffix)
+{
+	if(out == NULL || tones == NULL || n_suffix <= 0) return 0;
+	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;       // NB unsupported (M<16)
+	if(ack_mfsk.connect_pattern_nsymb <= 0) return 0;
+
+	// Stage 3c: the base is the TRIMMED acquisition sync (config_tag_sync_nsymb(),
+	// default a swept minimum < the full 16) — the tag rides a deterministic offset
+	// so it does NOT need a full blind-acquire base. The CONFIG_TAG suffix is
+	// n_suffix = RM(1,4)+gf16ra symbols (UNCHANGED — only the sync shrinks).
+	int base_total = ack_mfsk.config_tag_sync_nsymb();
+	int nsymb = base_total + n_suffix;
+	int n_samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	if(n_samples <= 0) return 0;
+
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	// Key the base + the gf16ra config-tag tones into the framed data buffer.
+	ack_mfsk.generate_config_tag_mfsk_pattern(data_container.ofdm_framed_data,
+		tones, n_suffix);
+
+	for(int i = 0; i < nsymb; i++)
+	{
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	}
+
+	// Reuse the ACK gain channel — same MFSK pattern family on the wire as the
+	// ctrl-suffix (so the tag rides the SAME robust layer, design §2.2/§3.1).
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	ofdm.peak_clip(out, n_samples, ofdm.data_papr_cut);
+
+	return n_samples;
+}
+
 // RX: detect CONNECT base + decode the 52-bit ctrl-suffix.
 // Reuses ofdm.detect_ack_pattern parameterized on connect_tones, then
 // ofdm.decode_suffix_tones, then ack_mfsk.unpack_ctrl_suffix. Returns
@@ -4588,6 +4644,183 @@ bool cl_telecom_system::decode_ctrl_suffix_from_passband(double* data, int size,
 	// Consume the capture: caller gets a one-shot view of this match.
 	ack_mfsk.last_connect_capture_valid = false;
 	return ok;
+}
+
+// In-band rate adaptation (Stage 3a): RX-side CONFIG_TAG detect + energy-matrix
+// extraction from the real passband. MIRROR of decode_ctrl_suffix_from_passband's
+// front half (passband→baseband decimate, detect_ack_pattern base correlator,
+// control mini-Moose v2 CFO correction). THE base correlator IS the real always-
+// on presence detector the design §3.1 references — it returns a match count +
+// metric; the SAME gate the ctrl-suffix uses (matched>=connect_match_threshold &&
+// metric>=CTRL_DETECT_METRIC_MIN) cheaply rejects steady-state no-tag frames and
+// does NOT false-trigger on a real noise floor (proved by
+// test_mfsk_connect_no_hail_false_trigger). On a lock, extract the N-symbol per-
+// tone ENERGY matrix (decode_suffix_energies — same de-hop math the gf16ra
+// decoder consumes) + the 16 RM soft chips, and hand them to the ARQ layer's
+// config_tag_wrap_decode for the CRC/FWHT/binding acceptance.
+bool cl_telecom_system::decode_config_tag_from_passband(double* data, int size,
+	double* out_energies, double* out_chips, int* out_n_syms, int* out_matched)
+{
+	if(out_matched) *out_matched = 0;
+	if(out_n_syms) *out_n_syms = 0;
+	if(data == NULL || out_energies == NULL || out_chips == NULL) return false;
+	if(ack_mfsk.ack_sack_suffix_len() <= 0) return false;       // NB (M<16)
+	if(ack_mfsk.connect_pattern_nsymb <= 0) return false;
+
+#ifdef STAGE3A_FAILBEFORE
+	// FAIL-BEFORE arm: the RX IGNORES the passband suffix entirely (no base
+	// correlation, no energy extraction). The Stage-3a test then sees no detect ->
+	// no cfg_index -> FAIL (proves the passband detect+decode is load-bearing).
+	// Rebuild with -DSTAGE3A_FAILBEFORE to take this path.
+	(void)data; (void)size; (void)out_energies; (void)out_chips;
+	return false;
+#endif
+
+	// The CONFIG_TAG rides TWO concatenated suffix blocks (the WRAP detector,
+	// tag-codeword-design.md §1.3 / config_tag_wrap_decode): a 16-symbol RM(1,4)
+	// Walsh/Hadamard codeword block (the FWHT cfg_index detector) FOLLOWED BY the
+	// N=39 GF(16) RA + CRC-12 message block (the binding-bits + corroboration
+	// copy). Total suffix = CFG_TAG_RM_N (16) + gf16ra::codeword_len() (39) = 55.
+	//
+	// Configure the gf16ra graph to N=39 (configure(2)) so codeword_len() is the
+	// tag length (NOT the CONNECT FEC's configure(3)=52). THIS is the RX
+	// gf16ra::configure(2) independence the Stage-2 verify flagged: the RX must NOT
+	// rely on the TX having set the process-global repfact. SAVE/RESTORE the prior
+	// repfact (the legacy CONNECT FEC runs at configure(3)) — this RX only needs the
+	// gf16ra symbol COUNT (N_gf) for the energy-extraction windows, NOT the graph
+	// itself (the BP decode is config_tag_wrap_decode, which self-configures), so we
+	// restore before returning. (CLAUDE.md §5 cross-layer guard.)
+	int saved_repfact = gf16ra::current_repfact();
+	gf16ra::configure(2);
+	gf16ra::init();
+	int N_gf = gf16ra::codeword_len();   // 39
+	auto restore_gf = [&]() {
+		if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	};
+	if(N_gf <= 0 || N_gf > gf16ra::GF16RA_MAX_N) { restore_gf(); return false; }
+	const int N_rm = CFG_TAG_RM_N;       // 16
+	int N = N_rm + N_gf;                  // 55 suffix symbols total
+
+	// --- Polyphase decimated path: mix + FIR + decimate (identical preprocessing
+	// to decode_ctrl_suffix_from_passband). ---
+	int M = data_container.interpolation_rate;
+	int dec_size = size / M;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		M, &ofdm.FIR_rx_data);
+
+	// --- THE PRESENCE DETECTOR: the base-pattern correlator. ---
+	// Stage 3c: search the TRIMMED tag base (config_tag_sync_nsymb() symbols,
+	// combine_reps=1) — the deterministic offset replaces blind-acquire
+	// rep-integration. tag_sync is DECOUPLED from connect_preamble_reps so the
+	// CONNECT handshake's full reps×16 base is untouched. The gate scales with the
+	// base length (config_tag_sync_match_threshold()).
+	int tag_sync_nsymb = ack_mfsk.config_tag_sync_nsymb();
+	int tag_sync_thr   = ack_mfsk.config_tag_sync_match_threshold();
+	int matched = 0;
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		tag_sync_nsymb,
+		ack_mfsk.connect_tones, /*base_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&best_offset, /*reserve_after=*/N,
+		/*out_match_mask=*/nullptr, /*always_fine=*/false,
+		/*combine_reps=*/1);
+
+	if(out_matched) *out_matched = matched;
+
+	// The real gate (telecom_system.cc:4157 — IDENTICAL to the ctrl-suffix). A
+	// no-tag frame on a real noise floor does not reach this — the steady-state
+	// cheap reject (design §3.2 outcome 2 / R2 false-trigger bound). The
+	// count-gate is the trimmed-base-scaled threshold (FAR-floored).
+	if(matched < tag_sync_thr ||
+	   metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
+	{ restore_gf(); return false; }
+
+	// --- Control-frame mini-Moose v2 CFO correction (mirror of the ctrl-suffix
+	// path; same SIGN-CORRECTED apply + re-detect fail-safe). ---
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		tag_sync_nsymb,
+		best_offset,
+		ack_mfsk.connect_tones, /*pattern_len=*/8,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if(fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency,
+			effective_carrier - ctrl_residual,
+			carrier_amplitude,
+			M, &ofdm.FIR_rx_data);
+
+		int rematched = 0;
+		int rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size,
+			1,
+			tag_sync_nsymb,
+			ack_mfsk.connect_tones, /*base_len=*/8,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+			&rebest_offset, /*reserve_after=*/N,
+			/*out_match_mask=*/nullptr, /*always_fine=*/false,
+			/*combine_reps=*/1);
+		if(rematched >= tag_sync_thr &&
+		   remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
+		{
+			matched = rematched;
+			best_offset = rebest_offset;
+			if(out_matched) *out_matched = matched;
+		}
+	}
+
+	// --- BLOCK 1: the RM(1,4) FWHT codeword (16 symbols), at the start of the
+	// suffix (right after the TRIMMED tag base). Extract its 16×16 energy matrix and
+	// fold each symbol's antipodal tone pair into the 16 FWHT soft chips. The chip
+	// for position i = e[i][perm[i]] - e[i][perm[i]^0xF]
+	// (cfg_tag_softchips_from_energies / cfg_tag_energies_from_cfg). ---
+	// Stage 3c: the suffix offset is the TRIMMED tag base (config_tag_sync_nsymb()),
+	// matching the TX keyer's abs_s = config_tag_sync_nsymb() + s.
+	int base_total = ack_mfsk.config_tag_sync_nsymb();
+	double rm_e[CFG_TAG_RM_N * 16];
+	ofdm.decode_suffix_energies(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		best_offset, /*pattern_nsymb=*/base_total,
+		/*suffix_len=*/N_rm,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		rm_e);
+	cfg_tag_softchips_from_energies(rm_e, out_chips);
+
+	// --- BLOCK 2: the GF(16) RA + CRC-12 message (N_gf=39 symbols), immediately
+	// AFTER the RM block. Extract its N_gf×16 energy matrix into out_energies (the
+	// gf16ra::soft_decode_config_tag input). The base offset advances by N_rm so
+	// the hop index abs_s stays phase-consistent with the TX keyer (which keyed
+	// the gf16ra tones at abs_s = base_total + N_rm + s). ---
+	ofdm.decode_suffix_energies(
+		data_container.baseband_data_interpolated, dec_size,
+		1,
+		best_offset, /*pattern_nsymb=*/base_total + N_rm,
+		/*suffix_len=*/N_gf,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		out_energies);
+
+	if(out_n_syms) *out_n_syms = N_gf;   // out_energies holds N_gf gf16ra symbols
+	restore_gf();   // cross-layer guard: leave the global repfact as we found it
+	return true;
 }
 
 // =============================================================================
@@ -5250,12 +5483,10 @@ void cl_telecom_system::init()
 		reinit_subsystems.pre_equalization_channel=NO;
 	}
 
-	ts_srandom (bit_energy_dispersal_seed);   // §10.1: per-instance when opted in
-	bit_energy_dispersal_seed = default_configurations_telecom_system.bit_energy_dispersal_seed;
-	for(int i=0;i<ldpc.N;i++)
-	{
-		data_container.bit_energy_dispersal_sequence[i]=ts_random()%2;
-	}
+	// §10.1: per-instance when opted in. Factored to regenerate_bit_energy_dispersal_sequence()
+	// so the ring-resize helpers (force_resize_capture_ring / force_set_capture_ring_natural),
+	// whose set_size realloc wipes this array, regenerate it IDENTICALLY (§17).
+	regenerate_bit_energy_dispersal_sequence();
 
 	// Print active gain entry for this config (verbose only)
 	if(g_verbose) {
@@ -9998,6 +10229,62 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	return receive_stats;
 }
 
+// IN-BAND ADOPT CLEAN-LOCK GATE — data-flow-inband-adopt-metric-gate.md §2/§3.
+// Compute the NORMALIZED Schmidl-Cox timing metric over a captured passband SNAPSHOT, at
+// the CURRENT loaded OFDM geometry, WITHOUT mutating any RX state. This is a READ-ONLY
+// copy of the coarse-SC acquisition step the production receive_byte runs — it mixes a
+// LOCAL pad copy to a LOCAL baseband vector and never touches passband_delayed_data, the
+// ring cursors, ofdm_search_raw/ofdm_batch_active, or receive_stats (INV-A / INV §3.4).
+// Recipe is VERBATIM from the big-block head acquisition (telecom_system.cc:8276-8302):
+//   pad -> passband_to_baseband(interp=1, FIR_rx_time_sync) -> rational_resampler(DECIMATION)
+//   -> time_sync_preamble_halfsym -> normalized correlation = |P|²/R² in [0,1].
+// Returns the metric in [0,1], or -1.0 when not applicable (MFSK, no snapshot, or not an
+// OFDM config — the caller then SKIPS the gate, never blocking a non-OFDM adopt).
+double cl_telecom_system::inband_snapshot_clean_lock_metric(const double* snapshot, int len,
+                                                            int announced_cfg)
+{
+	(void)announced_cfg;   // advisory/logging only — metric is judged at the CURRENT geometry
+	if(snapshot == NULL || len <= 0) return -1.0;
+	if(M == MOD_MFSK)      return -1.0;   // MFSK has no Schmidl-Cox OFDM preamble
+
+	int Nfft  = ofdm.Nfft;
+	float gi  = ofdm.gi;
+	int Ngi   = (int)round((double)gi * (double)Nfft);
+	int Nofdm = Nfft + Ngi;
+	int interp = frequency_interpolation_rate;
+	if(Nofdm <= 0 || interp <= 0) return -1.0;
+	int sym_samples = Nofdm * interp;
+	if(sym_samples <= 0) return -1.0;
+	int pre_nSymb = data_container.preamble_nSymb;
+	if(pre_nSymb < 1) pre_nSymb = 1;
+
+	// Pad the snapshot to a whole number of symbols (the big-block recipe), mix to baseband
+	// at the carrier (interp=1 keeps the full-rate FIR), then decimate for the coarse search.
+	int need_syms = (len / sym_samples) + 2;
+	if(need_syms < (pre_nSymb + 2)) need_syms = pre_nSymb + 2;
+	int buf_interp = Nofdm * need_syms * interp;
+	if(buf_interp <= 0) return -1.0;
+	std::vector<double> pad(buf_interp, 0.0);
+	int copy_n = (len < buf_interp) ? len : buf_interp;
+	for(int i = 0; i < copy_n; i++) pad[i] = snapshot[i];
+
+	std::vector<std::complex<double>> bb_interp(buf_interp);
+	ofdm.passband_to_baseband(pad.data(), buf_interp, bb_interp.data(),
+	                          sampling_frequency, carrier_frequency, carrier_amplitude, 1,
+	                          &ofdm.FIR_rx_time_sync);
+	std::vector<std::complex<double>> bb_dec(Nofdm * need_syms);
+	ofdm.rational_resampler(bb_interp.data(), buf_interp, bb_dec.data(), interp, DECIMATION);
+
+	// Coarse Schmidl-Cox over the whole decimated window (the SAME call the production
+	// acquisition and the big-block head use). correlation = |P|²/R² normalized to [0,1].
+	TimeSyncResult coarse = ofdm.time_sync_preamble_halfsym(
+		bb_dec.data(), Nofdm * need_syms, 1, 1, 0.0, pre_nSymb);
+	double m = coarse.correlation;
+	if(m < 0.0) m = 0.0;
+	if(m > 1.0) m = 1.0;
+	return m;
+}
+
 void cl_telecom_system::bigblock_livepath_loopback()
 {
 	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
@@ -11087,6 +11374,172 @@ void cl_telecom_system::load_configuration(int configuration)
 		1000.0 * ack_pattern_passband_samples / sampling_frequency,
 		ack_mfsk.ack_match_threshold, ack_mfsk.ack_pattern_nsymb,
 		ack_pattern_detection_threshold);
+}
+
+// Grow the capture ring (passband_delayed_data etc.) to hold at least `min_nsymb` symbols
+// WITHOUT a config change. Both load_configuration paths SKIP a same-config re-apply
+// (telecom_system.cc:10052 / arq_common.cc:1998), so the in-band down-ladder's robust ring
+// floor (data-flow-inband-ondemote-zerobyte.md §7) cannot be seated by re-loading the same
+// config. This re-runs data_container.set_size with the CURRENT geometry + the raised
+// buffer_Nsymb_min, re-allocating passband_delayed_data at the larger size. Holds
+// capture_prep_mutex across the realloc (Bug #42). No-op if already large enough or no
+// config is loaded. Idempotent.
+// Regenerate the descrambler (bit_energy_dispersal) sequence — IDENTICAL to the init() tail
+// (telecom_system.cc, the ts_srandom(seed)+draw loop). init() runs this after its set_size;
+// the ring-resize helpers below call set_size DIRECTLY (without init), and set_size CDELETE+
+// reallocates bit_energy_dispersal_sequence (data_container.cc:243->145) as a fresh ZEROED
+// array — so without this regen the RX descrambles with all-zeros and recovers M XOR S (constant
+// CRC fail). data-flow-robust-ofdm-adopt-flush.md §17.
+void cl_telecom_system::regenerate_bit_energy_dispersal_sequence()
+{
+	if(data_container.bit_energy_dispersal_sequence == NULL) return;
+	if(ldpc.N <= 0 || ldpc.N > N_MAX) return;
+	ts_srandom(bit_energy_dispersal_seed);
+	bit_energy_dispersal_seed = default_configurations_telecom_system.bit_energy_dispersal_seed;
+	for(int i=0;i<ldpc.N;i++)
+		data_container.bit_energy_dispersal_sequence[i]=ts_random()%2;
+}
+
+void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
+{
+	if(min_nsymb <= 0) return;
+	if(current_configuration == CONFIG_NONE) return;
+	if(data_container.Nofdm <= 0) return;
+	if(data_container.buffer_Nsymb >= min_nsymb && data_container.buffer_Nsymb_min >= min_nsymb)
+		return;   // already seated
+
+	MUTEX_LOCK(&capture_prep_mutex);
+	data_container.buffer_Nsymb_min = min_nsymb;
+	// SIBLING of the §15 fix (diagnosis a468b2fc): like force_set_capture_ring_natural, this
+	// re-runs set_size to re-allocate the ring at the raised robust floor. PRESERVE the just-
+	// loaded data_container.Nofdm (the per-symbol OFDM geometry) instead of re-deriving it from
+	// the live `ofdm.gi`, which can be stale at a tier cross (54/256 -> 310 vs the loaded 292)
+	// and would otherwise drift data_container.Nofdm here too. The floor (min_nsymb) dominates
+	// buffer_Nsymb so the GROW is unaffected; only the Nofdm geometry is held invariant. Same
+	// inband scope (sole caller inband_seat_robust_ring_floor) + same FAIL-BEFORE knob.
+	int preserved_Nofdm = data_container.Nofdm;
+	bool nofdm_preserve_defeat = false;
+	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
+	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
+	int nofdm_arg = nofdm_preserve_defeat ? (int)(ofdm.Nfft*(1+ofdm.gi)) : preserved_Nofdm;
+	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),
+	// branching on the live modulation. set_size frees + re-allocates all data_container
+	// buffers honoring buffer_Nsymb_min (data_container.cc:161), so the ring grows.
+	if(M == MOD_MFSK)
+	{
+		int M_eff = 1 << mfsk.bits_per_symbol();
+		data_container.set_size(ofdm.Nsymb, ofdm.Nc, M_eff, ofdm.Nfft,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	else
+	{
+		data_container.set_size(ofdm.pilot_configurator.nData, ofdm.Nc, M, ofdm.Nfft,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	// §17 ROOT FIX: set_size CDELETE+reallocated bit_energy_dispersal_sequence as a fresh ZEROED
+	// array. init() regenerates the descrambler after ITS set_size; this helper must too, else the
+	// RX decodes with an all-zero descrambler -> recovers M XOR S -> constant CRC fail. Inband-scoped.
+	regenerate_bit_energy_dispersal_sequence();
+	data_container.ring_write_index = 0;
+	data_container.data_ready = 0;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+}
+
+// Reset the capture ring to the CURRENT config's NATURAL buffer_Nsymb (un-seat any raised
+// buffer_Nsymb_min floor), WITHOUT a config change. The in-band robust-floor seat
+// (inband_seat_robust_ring_floor, arq_common.cc:3781) grows the primary ring to hold a full
+// slow ROBUST-rung MFSK frame so the blind down-ladder can read it. That floor is correct in
+// the ROBUST tier, but after the RX has ADOPTED a small-frame OFDM config it makes the
+// acquisition ring vastly larger than one OFDM frame (e.g. CONFIG_0: natural 217 sym vs robust
+// floor 1291 sym). With a continuously RE-AIRED OFDM burst the freshest preamble always lands
+// at the TAIL of the oversized snapshot window (pream_symb ~ buffer_Nsymb > upper_bound), so the
+// coarse search reports `OFDM beyond-bounds` forever and never locks — the robust->OFDM crossing
+// blocker (data-flow-robust-ofdm-adopt-flush.md §10). LEGACY never hits this: its CONFIG_0 ring
+// is the NATURAL 217 (no robust-floor seat), so the freshest tail preamble sits at ~upper and
+// FITS — it locks 43x. This restores that natural geometry for OFDM acquisition. The next
+// down-ladder demote re-seats the floor (inband_seat_robust_ring_floor) BEFORE the down-ladder
+// reads, so robust capture is unaffected. Mirrors force_resize_capture_ring but UN-seats instead
+// of growing; holds capture_prep_mutex across the realloc (Bug #42). No-op if no config loaded.
+void cl_telecom_system::force_set_capture_ring_natural()
+{
+	if(current_configuration == CONFIG_NONE) return;
+	if(data_container.Nofdm <= 0) return;
+	MUTEX_LOCK(&capture_prep_mutex);
+	data_container.buffer_Nsymb_min = 0;   // un-seat the raised robust floor
+
+	// FIX (data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc): preserve the
+	// per-symbol OFDM geometry (Nofdm = Nfft+Ngi) that the JUST-COMPLETED load_configuration
+	// installed, instead of RE-DERIVING it from the live `ofdm` object. The shrink runs at the
+	// HINGE-1 robust->OFDM cross (arq_common.cc:4520) immediately after load_configuration set
+	// data_container.Nofdm to the config's correct value (e.g. CONFIG_0 with the startup 3.0 ms
+	// GI -> Ngi=36 -> Nofdm=292; main.cc:4103 writes default_configurations.ofdm_gi=36/256). But
+	// the live `ofdm.gi` is NOT guaranteed in sync with data_container.Nofdm at this instant: a
+	// robust/MFSK dwell + the partial reinit_subsystems gating can leave `ofdm.gi` stale at the
+	// physical_config.cc:37 default (54/256 -> Nofdm=310). Recomputing `ofdm.Nfft*(1+ofdm.gi)`
+	// here then OVERWRITES the correct 292 with 310 (DIAGNOSIS LOG _probe/lwp2001.arqlog:
+	// T+0174.758 load Nofdm=292 -> T+0174.994 shrink Nofdm=310). TX + the legacy demod stay at
+	// 292; the redesign RSP now demods at 310 -> an 18-sample/symbol FFT-window drift accrues
+	// across the 48-sym CONFIG_0 frame -> degenerate LLRs -> LDPC iter=0 -> garbage CRC 0xC7C3 ->
+	// the CONFIG_0 under-decode (~53 B, all OFDM-FAIL with meanH 0.98 + preamble metric 0.999).
+	// Legacy NEVER calls this shrink, so it keeps 292 and climbs 0->16.
+	//
+	// APPROACH A: drive the Nofdm `set_size` argument from the AUTHORITATIVE, already-correct
+	// data_container.Nofdm (the value the load installed) so the GI/Nofdm symbol geometry is
+	// INVARIANT across the ring-shrink. ONLY the ring SIZE (buffer_Nsymb) changes — exactly the
+	// shrink's intent. Nc/Nsymb/preamble_nSymb/nData are taken from the same live `ofdm` the
+	// existing call used (they did not regress; only the gi-derived Nofdm did). Inband-scoped:
+	// this function is reached ONLY from the inband adopt path (arq_common.cc:4520, gated on
+	// inband_rate_feature_enabled()); legacy never calls it -> legacy byte-identical.
+	//
+	// FAIL-BEFORE / A-B knob: MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1 restores the legacy
+	// recompute `ofdm.Nfft*(1+ofdm.gi)` on the SAME binary, reproducing the 292->310 drift the
+	// directed test (test_inband_adopt_nofdm_invariant) asserts against. Production never sets it.
+	int preserved_Nofdm = data_container.Nofdm;   // installed by the load; the correct geometry
+	bool nofdm_preserve_defeat = false;
+	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
+	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
+	int nofdm_arg = nofdm_preserve_defeat ? (int)(ofdm.Nfft*(1+ofdm.gi)) : preserved_Nofdm;
+
+	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),
+	// branching on the live modulation. With buffer_Nsymb_min=0, set_size computes the config's
+	// NATURAL buffer_Nsymb (data_container.cc:147-163), re-allocating the ring at that size. The
+	// Nofdm arg is the PRESERVED value (Approach A) so the symbol geometry never drifts.
+	if(M == MOD_MFSK)
+	{
+		int M_eff = 1 << mfsk.bits_per_symbol();
+		data_container.set_size(ofdm.Nsymb, ofdm.Nc, M_eff, ofdm.Nfft,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	else
+	{
+		data_container.set_size(ofdm.pilot_configurator.nData, ofdm.Nc, M, ofdm.Nfft,
+			nofdm_arg, ofdm.Nsymb, ofdm.preamble_configurator.Nsymb,
+			frequency_interpolation_rate);
+	}
+	// §17 ROOT FIX (the CONFIG_0 clean-lock CRC-fail root, VERIFIED): set_size CDELETE+reallocated
+	// bit_energy_dispersal_sequence as a fresh ZEROED array (data_container.cc:243->145). init()
+	// regenerates the descrambler after ITS set_size (the ts_srandom+draw loop); this HINGE-1 shrink
+	// calls set_size DIRECTLY and previously did NOT, so the RSP decoded CONFIG_0 with an all-zero
+	// descrambler -> recovered M XOR S (constant CRC 0xC7C3, iter=0) -> ~53 B + demote to ROBUST_2.
+	// VERIFIED: RSP live descr_seq dumped 00..00 here vs the CMD's correct 3D6BD0... (seed-0).
+	// Legacy never calls this -> legacy descrambler survives -> decodes + climbs. Regenerate it.
+	// FAIL-BEFORE knob MERCURY_DESCRAMBLER_REGEN_DEFEAT=1: skip the regen AND zero the array, to
+	// DETERMINISTICALLY reproduce the production all-zero symptom (VERIFIED bd5). Without the active
+	// zero, the test's set_size realloc can return the SAME just-freed block (old seq intact) and the
+	// bug self-hides — the heap-reuse the live sim avoided. Production never sets the knob.
+	{ const char* e = std::getenv("MERCURY_DESCRAMBLER_REGEN_DEFEAT");
+	  if(e && *e && atoi(e) != 0) {
+	    if(data_container.bit_energy_dispersal_sequence != NULL && ldpc.N > 0 && ldpc.N <= N_MAX)
+	      for(int i=0;i<ldpc.N;i++) data_container.bit_energy_dispersal_sequence[i]=0;
+	  } else {
+	    regenerate_bit_energy_dispersal_sequence();
+	  } }
+	data_container.ring_write_index = 0;
+	data_container.data_ready = 0;
+	MUTEX_UNLOCK(&capture_prep_mutex);
 }
 
 void cl_telecom_system::return_to_last_configuration()

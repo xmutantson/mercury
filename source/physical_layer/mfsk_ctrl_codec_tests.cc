@@ -210,15 +210,16 @@ static void test_pack_unpack_start_conn_payload() {
 static void test_pack_unpack_test_ack_payload() {
 	const char* name = "pack_unpack_test_ack_payload";
 	std::mt19937 rng(0xC0DE);
-	// Cap fields are the 2 negotiable MFSK-wire bits (CAP_NEGOTIABLE_MASK=0x03:
-	// WB|ENCRYPTION). Cover the full 2-bit echoed_cap × own_cap × representative
-	// SSID. (The former §21 3rd-bit CAP_SUFFIX_FEC widening was removed in
-	// cleanup/drop-suffix-fec-cap; reserved is back to bits 25..0.)
+	// Cap fields are the 3 negotiable MFSK-wire bits (CAP_NEGOTIABLE_MASK=0x07:
+	// WB|ENCRYPTION|CUMULATIVE_ACK). Bit 2 (CAP_CUMULATIVE_ACK, FORGIVING-ACK Tier 2)
+	// reuses a formerly-reserved payload bit (echoed_cap bit 24, own_cap bit 25) — the
+	// §21 precedent, no payload-width change. Cover the full 3-bit echoed_cap × own_cap
+	// × representative SSID; reserved is now bits 23..0.
 	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
-	for (int ec = 0; ec < 4; ec++) {
-		for (int oc = 0; oc < 4; oc++) {
+	for (int ec = 0; ec < 8; ec++) {
+		for (int oc = 0; oc < 8; oc++) {
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();
@@ -227,9 +228,9 @@ static void test_pack_unpack_test_ack_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				// reserved is bits 25..0.
-				if ((p38 & ((1ULL << 26) - 1ULL)) != 0) {
-					test_fail(name, "reserved bits (25..0) not zero on TX");
+				// reserved is bits 23..0 (bits 25/24 now carry own_cap[2]/echoed_cap[2]).
+				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (23..0) not zero on TX");
 					return;
 				}
 				uint8_t out_ec = 0xFF, out_oc = 0xFF, out_ssid = 0;
@@ -247,15 +248,15 @@ static void test_pack_unpack_test_ack_payload() {
 			}
 		}
 	}
-	// A high cap byte (bits above 0x03 set) must be masked off on TX — the MFSK
-	// wire carries only the 2 negotiable bits.
+	// A high cap byte (bits above 0x07 set) must be masked off on TX — the MFSK
+	// wire carries only the 3 negotiable bits.
 	{
 		uint64_t p38 = 0;
 		pack_test_ack_payload(&p38, 0xFF, 0xFF, 42u);
 		uint8_t lec = 0xFF, loc = 0xFF, lss = 0;
 		bool ok = unpack_test_ack_payload(p38, &lec, &loc, &lss);
-		if (!ok || lec != 0x3 || loc != 0x3 || lss != 42u) {
-			test_fail(name, "high cap bits not masked to 0x03 on the wire");
+		if (!ok || lec != 0x7 || loc != 0x7 || lss != 42u) {
+			test_fail(name, "high cap bits not masked to 0x07 on the wire");
 			return;
 		}
 	}
@@ -271,7 +272,7 @@ static void test_pack_unpack_test_conn_payload() {
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
 	for (int snr_q = 0; snr_q < 16; snr_q++) {
-		for (int lc = 0; lc < 4; lc++) {   // local_cap is 2 negotiable MFSK-wire bits
+		for (int lc = 0; lc < 8; lc++) {   // local_cap is 3 negotiable MFSK-wire bits (0x07)
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();  // pre-set garbage
@@ -281,9 +282,9 @@ static void test_pack_unpack_test_conn_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				// reserved is bits 23..0.
-				if ((p38 & ((1ULL << 24) - 1ULL)) != 0) {
-					test_fail(name, "reserved bits (23..0) not zero on TX");
+				// reserved is bits 22..0 (bit 23 now carries local_cap[2]).
+				if ((p38 & ((1ULL << 23) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (22..0) not zero on TX");
 					return;
 				}
 				uint8_t out_snr = 0xFF, out_lc = 0xFF, out_ssid = 0;
@@ -304,14 +305,14 @@ static void test_pack_unpack_test_conn_payload() {
 			}
 		}
 	}
-	// A high cap byte (bits above 0x03 set) must be masked off on TX.
+	// A high cap byte (bits above 0x07 set) must be masked off on TX.
 	{
 		uint64_t p38 = 0;
 		pack_test_conn_payload(&p38, 9u, 0xFF, 55u);
 		uint8_t lsnr = 0xFF, llc = 0xFF, lss = 0;
 		bool ok = unpack_test_conn_payload(p38, &lsnr, &llc, &lss);
-		if (!ok || llc != 0x3 || lsnr != 9u || lss != 55u) {
-			test_fail(name, "high local_cap bits not masked to 0x03 on the wire");
+		if (!ok || llc != 0x7 || lsnr != 9u || lss != 55u) {
+			test_fail(name, "high local_cap bits not masked to 0x07 on the wire");
 			return;
 		}
 	}
@@ -4025,6 +4026,645 @@ static void test_gf16_ra_pure_noise_far() {
 	test_pass(name);
 }
 
+// =============================================================================
+// §24 CONFIG_TAG codec (in-band rate adaptation, Stage-1)
+//   tag-codeword-design.md §5/§8 + fact-documents/data-flow-config-tag-codec.md
+//
+// OFFLINE CODEC + UNIT TESTS ONLY — no ARQ/gearshift wiring. The tag protects
+// cfg_index with an RM(1,4)=(16,5,8) bi-orthogonal Walsh codeword (FWHT-decoded
+// over the per-tone energies), rides the GF(16) RA FEC substrate (OD-2), and is
+// accepted by the WRAP (FWHT peak-margin gate AND CRC-12 AND bsi+parity binding).
+//   T1 config_tag_roundtrip_all_indices : encode->decode all 32 cfg_index exact
+//   T2 config_tag_noise_loaded_decode   : right cfg_index at a representative Es/N0
+//   T3 config_tag_pure_noise_far        : WRAP FAR <= the design ~1e-6..1e-8 band
+//
+// The WRAP peak-ratio gate operating point is now the shared production constant
+// CFG_TAG_PEAK_GATE (mfsk_ctrl_codec.h) — the noise-p99.9 of |peak|/|2nd| for a
+// 16-pt FWHT of i.i.d.-ish chips is modest; 2.0 cleanly separates a clean
+// codeword (ratio -> inf) from noise while admitting the noise-loaded T2 frames.
+
+// Build the GF(16)-RA energy matrix (codeword_len() x 16, one-hot `hi` on the
+// encoded tone, `lo` elsewhere) for a CONFIG_TAG message. Mirrors
+// test_gf16_ra_encode_decode_clean's clean-energy construction.
+static void build_config_tag_gf16_energies(uint8_t cfg_index, uint8_t bsi_lsb,
+	uint8_t parity, cl_arq_controller& arq, double hi, double lo,
+	std::vector<double>& e_out, uint64_t* out_p37, uint16_t* out_crc)
+{
+	gf16ra::configure(2);
+	gf16ra::init();
+	uint64_t p37 = 0;
+	pack_config_tag_payload(&p37, cfg_index, bsi_lsb, parity);
+	uint8_t bytes[5];
+	pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_CONFIG_TAG, p37);
+	uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+	int tones[gf16ra::GF16RA_MAX_N];
+	gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_CONFIG_TAG, p37, crc12, tones);
+	int N = gf16ra::codeword_len();
+	e_out.assign((size_t)N * 16, lo);
+	for (int s = 0; s < N; s++) e_out[(size_t)s * 16 + tones[s]] = hi;
+	if (out_p37) *out_p37 = p37;
+	if (out_crc) *out_crc = crc12;
+}
+
+// (T1) Encode then decode every cfg_index (0..31) and assert exact roundtrip of
+// cfg_index (via BOTH the FWHT correlator AND the CRC-field binding copy), bsi,
+// parity, and the CRC-12 acceptance. Clean energies (no noise).
+static void test_config_tag_roundtrip_all_indices() {
+	const char* name = "config_tag_roundtrip_all_indices";
+	cl_arq_controller arq;
+	for (int cfg = 0; cfg < 32; cfg++) {
+		uint8_t bsi_lsb = (uint8_t)(cfg & 0x7);
+		uint8_t parity  = (uint8_t)((cfg >> 2) & 0x1);
+
+		// --- RM(1,4) Walsh codeword: encode -> clean FWHT decode -> exact index
+		int chips[16];
+		if (!cfg_tag_rm_encode(cfg, chips)) { test_fail(name, "rm_encode rejected a valid cfg"); return; }
+		double e16[256]; cfg_tag_energies_from_cfg(cfg, 1.0, 0.0, e16);
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+		double rpeak = 0.0;
+		int fwht_cfg = cfg_tag_rm_fwht_decode(soft, &rpeak);
+		if (fwht_cfg != cfg) {
+			char b[120]; snprintf(b, sizeof(b), "FWHT cfg=%d -> %d (rpeak=%.2f)", cfg, fwht_cfg, rpeak);
+			test_fail(name, b); return;
+		}
+
+		// --- GF(16) RA + CRC-12 field: encode -> clean energies -> exact payload
+		std::vector<double> e; uint64_t p37 = 0; uint16_t crc = 0;
+		build_config_tag_gf16_energies((uint8_t)cfg, bsi_lsb, parity, arq, 1.0, 0.0, e, &p37, &crc);
+
+		// --- WRAP decode over BOTH detectors (clean): must accept + exact fields
+		config_tag_decode_result r;
+		bool ok = config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			bsi_lsb, parity, prod_crc12_cb, &arq, &r);
+		if (!ok) {
+			char b[160]; snprintf(b, sizeof(b),
+				"cfg=%d WRAP reject (fwht=%d crc=%d bind=%d rpeak=%.2f)",
+				cfg, r.fwht_passed, r.crc_passed, r.bind_agree, r.fwht_rpeak);
+			test_fail(name, b); return;
+		}
+		if (r.cfg_index != cfg || r.batch_seq_lsb != bsi_lsb || r.epoch_parity != parity) {
+			char b[160]; snprintf(b, sizeof(b),
+				"cfg=%d field mismatch: cfg=%d bsi=%d par=%d",
+				cfg, r.cfg_index, r.batch_seq_lsb, r.epoch_parity);
+			test_fail(name, b); return;
+		}
+		// Cross-check the payload pack/unpack primitive directly.
+		uint8_t uc=0, ub=0, up=0; unpack_config_tag_payload(p37, &uc, &ub, &up);
+		if (uc != cfg || ub != bsi_lsb || up != parity) {
+			test_fail(name, "unpack_config_tag_payload roundtrip mismatch"); return;
+		}
+	}
+	test_pass(name);
+}
+
+// (T2) Soft-decode the tag over a NOISE-LOADED energy/chip frame at a
+// representative Es/N0 and assert the RIGHT cfg_index decodes via the WRAP.
+// Many trials at a moderate noise level; assert a high success rate AND zero
+// WRONG-index accepts (the safety-critical property — a wrong cfg_index is the
+// R2 risk the WRAP closes). The fail-before stub mis-decodes the FWHT index so
+// the corroboration gate (FWHT==CRC) never agrees -> 0 accepts.
+static void test_config_tag_noise_loaded_decode() {
+	const char* name = "config_tag_noise_loaded_decode";
+	cl_arq_controller arq;
+	std::mt19937 rng(0xC0F61A6);
+	std::normal_distribution<double> nd(0.0, 1.0);
+	// Representative operating point: a clean-tone energy of `hi` with additive
+	// energy noise of std `sigma`. sigma=0.55 is a moderate near-cliff load (the
+	// FWHT energy-integration + GF16 BP recover where a single per-symbol argmax
+	// would start to slip).
+	const double hi = 1.0, lo = 0.0, sigma = 0.55;
+	const int trials = 300;
+	int correct = 0, wrong = 0, miss = 0;
+	for (int it = 0; it < trials; it++) {
+		int cfg = (int)(rng() % 32);
+		uint8_t bsi_lsb = (uint8_t)(cfg & 0x7);
+		uint8_t parity  = (uint8_t)((cfg >> 2) & 0x1);
+
+		// GF16 energy matrix + chip energy block from ONE codeword, then load both
+		// with independent AWGN energy perturbations (magnitude-squared >= 0).
+		std::vector<double> e; uint64_t p37 = 0; uint16_t crc = 0;
+		build_config_tag_gf16_energies((uint8_t)cfg, bsi_lsb, parity, arq, hi, lo, e, &p37, &crc);
+		for (size_t i = 0; i < e.size(); i++) { double v = e[i] + sigma * std::fabs(nd(rng)); e[i] = v; }
+
+		double e16[256]; cfg_tag_energies_from_cfg(cfg, hi, lo, e16);
+		for (int i = 0; i < 256; i++) { double v = e16[i] + sigma * std::fabs(nd(rng)); e16[i] = v; }
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+
+		config_tag_decode_result r;
+		bool ok = config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			bsi_lsb, parity, prod_crc12_cb, &arq, &r);
+		if (ok) { if (r.cfg_index == cfg) correct++; else wrong++; }
+		else miss++;
+	}
+	printf("    [T2] noise-loaded WRAP (sigma=%.2f, %d trials): correct=%d wrong=%d miss=%d\n",
+		sigma, trials, correct, wrong, miss);
+	// Safety: a WRONG accepted cfg_index is the R2 catastrophe — must be ZERO.
+	if (wrong != 0) { char b[96]; snprintf(b,sizeof(b),"WRONG cfg_index accepted %d times", wrong); test_fail(name, b); return; }
+	// Recovery: the WRAP must decode the right index on the large majority.
+	if (correct < (int)(0.90 * trials)) {
+		char b[120]; snprintf(b, sizeof(b), "recovery %d/%d < 90%% at Es/N0 op-point", correct, trials);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// (T3) PURE-NOISE FAR (R2): feed pure-noise energy + chip frames to the WRAP and
+// count spurious accepts. Logs the gate-by-gate collapse so the bare-correlation
+// (FWHT-only, no reject region ~0.66) vs WRAPped (~1e-6..1e-8) decision evidence
+// is visible. ASSERT: with all WRAP gates active, FAR <= the CRC-12-dominated
+// bound (0 accepts in the trial budget, or a small threshold). Fail-before: the
+// stubbed FWHT makes the bare-FWHT "accept any nearest codeword" path explicit.
+static void test_config_tag_pure_noise_far() {
+	const char* name = "config_tag_pure_noise_far";
+	cl_arq_controller arq;
+	gf16ra::configure(2); gf16ra::init();
+	const int trials = 20000;
+	const int N = gf16ra::codeword_len();
+	std::mt19937 rng(0xC0F6FA7);
+	std::exponential_distribution<double> ed(1.0);  // |CN|^2 ~ exponential
+
+	// We expect a specific bsi/parity binding (the receiver is adopting a known
+	// batch); a pure-noise frame must satisfy ALL gates to be a false accept.
+	const uint8_t expect_bsi = 3, expect_par = 1;
+
+	int bare_fwht_accept = 0;   // FWHT-only "nearest codeword" (no reject region)
+	int fwht_gate_only   = 0;   // + peak-margin gate
+	int crc_only         = 0;   // GF16 RA + CRC-12 alone
+	int wrap_accept      = 0;   // full WRAP
+
+	for (int it = 0; it < trials; it++) {
+		std::vector<double> e((size_t)N * 16);
+		for (int i = 0; i < N * 16; i++) e[i] = ed(rng);
+		double soft[16];
+		for (int i = 0; i < 16; i++) soft[i] = ed(rng) - ed(rng);  // signed chip noise
+
+		// Bare FWHT always returns SOME index (no reject region).
+		double rp = 0.0; (void)cfg_tag_rm_fwht_decode(soft, &rp);
+		bare_fwht_accept++;                            // every frame "accepts" a cfg
+		if (rp >= CFG_TAG_PEAK_GATE) fwht_gate_only++;
+
+		// CRC-only: GF16 RA + CRC-12 (no FWHT/binding).
+		uint64_t p37 = 0; int iters = -2;
+		if (gf16ra::soft_decode_config_tag(e.data(), GF16RA_BP_MAXITER, GF16RA_ESNO_METRIC,
+			(uint8_t)MFSK_CTRL_CONFIG_TAG, prod_crc12_cb, &arq, &p37, &iters))
+			crc_only++;
+
+		// Full WRAP.
+		config_tag_decode_result r;
+		if (config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			expect_bsi, expect_par, prod_crc12_cb, &arq, &r))
+			wrap_accept++;
+	}
+	double far_bare = (double)bare_fwht_accept / trials;
+	double far_gate = (double)fwht_gate_only / trials;
+	double far_crc  = (double)crc_only / trials;
+	double far_wrap = (double)wrap_accept / trials;
+	printf("    [T3] CONFIG_TAG pure-noise FAR (%d trials):\n", trials);
+	printf("      bare FWHT (no reject region) : %d/%d = %.4f\n", bare_fwht_accept, trials, far_bare);
+	printf("      + peak-margin gate           : %d/%d = %.4f\n", fwht_gate_only, trials, far_gate);
+	printf("      GF16-RA + CRC-12 only        : %d/%d = %.6f\n", crc_only, trials, far_crc);
+	printf("      FULL WRAP (all gates)        : %d/%d = %.6f\n", wrap_accept, trials, far_wrap);
+	// Positive control: the WRAP must ACCEPT a CLEAN tag (proves the detector is
+	// wired — a stubbed/absent FWHT decode rejects here, so this also makes T3
+	// fail-before-sensitive). cfg with a known bsi/parity binding.
+	{
+		int cfg = 11; uint8_t bsi = 3, par = 1;  // bsi/par chosen to match expect_* below
+		std::vector<double> e; uint64_t p37 = 0; uint16_t crc = 0;
+		build_config_tag_gf16_energies((uint8_t)cfg, bsi, par, arq, 1.0, 0.0, e, &p37, &crc);
+		double e16[256]; cfg_tag_energies_from_cfg(cfg, 1.0, 0.0, e16);
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+		config_tag_decode_result r;
+		bool ok = config_tag_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			bsi, par, prod_crc12_cb, &arq, &r);
+		if (!ok || r.cfg_index != (uint8_t)cfg) {
+			char b[160]; snprintf(b, sizeof(b),
+				"clean-tag positive control rejected (fwht=%d crc=%d bind=%d cfg=%d)",
+				r.fwht_passed, r.crc_passed, r.bind_agree, r.cfg_index);
+			test_fail(name, b); return;
+		}
+	}
+	// Bare correlation MUST be the unsafe baseline (every frame accepts a cfg).
+	if (far_bare < 0.99) { test_fail(name, "bare FWHT did not exhibit the no-reject-region baseline"); return; }
+	// WRAP must drive FAR to the CRC-12-dominated floor: 0 accepts in 20k trials
+	// is the ~1e-8-class expectation; allow a tiny slack for the finite budget.
+	if (far_wrap > 5.0e-4) {
+		char b[120]; snprintf(b, sizeof(b), "WRAP FAR %.6f > 5e-4 bound", far_wrap);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// (T4) THE DECISIVE MEASUREMENT — option (a) tone-PERMUTATION vs option (b) fixed
+// 2-tone {0,8} overlay: FWHT cfg_index detection probability vs Es/N0, on AWGN and
+// on a per-tone (frequency-selective) fade. tag-codeword-design.md §1.3/§6.1.
+//
+// The two front-ends share the SAME RM(1,4) codeword and the SAME 16-pt FWHT
+// decoder; ONLY the chip<->tone mapping differs. We build a faithful non-coherent
+// M=16-FSK energy matrix (the transmitted tone is Rician with mean amplitude A,
+// every off-tone is Rayleigh; energy = |CN|^2; Es/N0 = A^2/N0), feed the SAME
+// noise realization to both mappings, and compare P(correct cfg_index) from the
+// FWHT alone (the survival-cap detector inside the WRAP).
+//
+// On AWGN the two should be near-identical (no per-tone selectivity to exploit).
+// On a frequency-selective fade that NULLS a couple of tones, option (b) (every
+// chip on tones {0,8}) FLOORS when a faded tone is 0 or 8 — ALL chips corrupt at
+// once; option (a) (each chip on a distinct tone pair) loses only the few chips on
+// the faded tones and the FWHT integrates the survivors. This is the M=16 gain the
+// note says (b) "throws away," and the reason the FWHT must be the robust correlator.
+namespace {
+// Local reference impl of the REPLACED option (b): every chip on tones {0,8}.
+static const int OPTB_TONE_PLUS = 0, OPTB_TONE_MINUS = 8;
+void optb_energies_from_cfg(int cfg_index, double hi, double lo, double* e16) {
+	int chips[16]; cfg_tag_rm_encode(cfg_index, chips);
+	for (int i = 0; i < 16; i++) {
+		for (int t = 0; t < 16; t++) e16[i*16+t] = lo;
+		e16[i*16 + ((chips[i] > 0) ? OPTB_TONE_PLUS : OPTB_TONE_MINUS)] = hi;
+	}
+}
+void optb_softchips_from_energies(const double* e16, double* out) {
+	for (int i = 0; i < 16; i++) out[i] = e16[i*16+OPTB_TONE_PLUS] - e16[i*16+OPTB_TONE_MINUS];
+}
+// Non-coherent FSK energy of one symbol: the signal tone gets |A+n|^2, off-tones
+// |n|^2, n ~ CN(0, N0=1) (so Es/N0 = A^2). `fade[t]` scales the per-tone amplitude
+// (1.0 = no fade, 0.0 = nulled) to model a frequency-selective channel.
+void fsk_symbol_energies(int sig_tone, double A, const double* fade,
+                         std::mt19937& rng, std::normal_distribution<double>& nd,
+                         double* row16) {
+	for (int t = 0; t < 16; t++) {
+		double mean = (t == sig_tone) ? A * (fade ? fade[t] : 1.0) : 0.0;
+		// CN(mean, 1): I has mean `mean`, Q mean 0, each var 1/2.
+		double xi = mean + nd(rng) * 0.70710678, xq = nd(rng) * 0.70710678;
+		row16[t] = xi*xi + xq*xq;
+	}
+}
+} // namespace
+
+static void test_config_tag_optab_detection_sweep() {
+	const char* name = "config_tag_optab_detection_sweep";
+	std::mt19937 rng(0xA0B0C0D);
+	std::normal_distribution<double> nd(0.0, 1.0);
+	const int trials = 2000;
+	const double esno_db[] = { -4, -2, 0, 2, 4, 6, 8, 10 };
+	const int NE = (int)(sizeof(esno_db)/sizeof(esno_db[0]));
+
+	// Frequency-selective fade: null tones 0 and 8 (the EXACT tones option (b)
+	// rides), plus 50% on tone 4 — a plausible 2-3 tone selective notch. Option (a)
+	// spreads across the alphabet so only a few of its chips touch these tones.
+	double flat[16]; for (int t=0;t<16;t++) flat[t]=1.0;
+	double sel[16];  for (int t=0;t<16;t++) sel[t]=1.0; sel[0]=0.0; sel[8]=0.0; sel[4]=0.5;
+
+	printf("    [T4] FWHT cfg_index detection P(correct) — option (a) tone-perm vs (b) 2-tone{0,8}\n");
+	printf("      %-8s | %-19s | %-19s\n", "Es/N0", "AWGN   a / b", "freq-sel fade  a / b");
+	// Track the lowest Es/N0 at which each reaches P>=0.99 on the fade.
+	double a_floor_awgn=99, b_floor_awgn=99, a_floor_sel=99, b_floor_sel=99;
+	bool any_sel_separation = false;
+
+	for (int ei = 0; ei < NE; ei++) {
+		double A = std::pow(10.0, esno_db[ei]/20.0);  // amplitude; Es/N0=A^2
+		int a_ok_awgn=0, b_ok_awgn=0, a_ok_sel=0, b_ok_sel=0;
+		for (int it = 0; it < trials; it++) {
+			int cfg = (int)(rng() % 32);
+			// Option (a) and (b) place the signal on DIFFERENT tones; build each
+			// from its own clean tone map, then add matched per-tone FSK noise.
+			double ea_clean[256], eb_clean[256];
+			cfg_tag_energies_from_cfg(cfg, 1.0, 0.0, ea_clean);  // marks perm tones
+			optb_energies_from_cfg(cfg, 1.0, 0.0, eb_clean);     // marks {0,8} tones
+			for (const double* fade : { (const double*)flat, (const double*)sel }) {
+				bool is_sel = (fade == sel);
+				double ea[256], eb[256];
+				for (int i = 0; i < 16; i++) {
+					// signal tone = the one marked hi in the clean map for this chip
+					int sig_a=0, sig_b=0;
+					for (int t=0;t<16;t++){ if(ea_clean[i*16+t]>0.5) sig_a=t; if(eb_clean[i*16+t]>0.5) sig_b=t; }
+					fsk_symbol_energies(sig_a, A, fade, rng, nd, &ea[i*16]);
+					fsk_symbol_energies(sig_b, A, fade, rng, nd, &eb[i*16]);
+				}
+				double sa[16], sb[16];
+				cfg_tag_softchips_from_energies(ea, sa);
+				optb_softchips_from_energies(eb, sb);
+				double rp;
+				int ca = cfg_tag_rm_fwht_decode(sa, &rp);
+				// option (b) decode: reuse the FWHT core via a tiny local replicate
+				int cb; { double a[16]; for(int i=0;i<16;i++)a[i]=sb[i];
+					for(int len=1;len<16;len<<=1)for(int i=0;i<16;i+=(len<<1))for(int j=0;j<len;j++){double u=a[i+j],v=a[i+j+len];a[i+j]=u+v;a[i+j+len]=u-v;}
+					int best=0;double bm=-1;for(int r=0;r<16;r++){double m=std::fabs(a[r]);if(m>bm){bm=m;best=r;}}
+					cb=((a[best]<0.0)?1:0)<<4|best; }
+				if (is_sel) { if (ca==cfg) a_ok_sel++; if (cb==cfg) b_ok_sel++; }
+				else        { if (ca==cfg) a_ok_awgn++; if (cb==cfg) b_ok_awgn++; }
+			}
+		}
+		double pa_a=(double)a_ok_awgn/trials, pb_a=(double)b_ok_awgn/trials;
+		double pa_s=(double)a_ok_sel/trials,  pb_s=(double)b_ok_sel/trials;
+		printf("      %+5.0f dB | a=%.3f b=%.3f   | a=%.3f b=%.3f\n",
+			esno_db[ei], pa_a, pb_a, pa_s, pb_s);
+		if (pa_a>=0.99 && a_floor_awgn>90) a_floor_awgn=esno_db[ei];
+		if (pb_a>=0.99 && b_floor_awgn>90) b_floor_awgn=esno_db[ei];
+		if (pa_s>=0.99 && a_floor_sel>90)  a_floor_sel=esno_db[ei];
+		if (pb_s>=0.99 && b_floor_sel>90)  b_floor_sel=esno_db[ei];
+		if (pa_s - pb_s > 0.05) any_sel_separation = true;
+	}
+	printf("      P>=0.99 floor (Es/N0): AWGN a=%.0f b=%.0f | fade a=%.0f b=%.0f\n",
+		a_floor_awgn, b_floor_awgn, a_floor_sel, b_floor_sel);
+
+	// ASSERTIONS (let the numbers arbitrate — these are the design-decision gates):
+	//  1. On AWGN, option (a) must NOT regress vs (b) (no per-tone structure to
+	//     exploit, so they track; allow a small Monte-Carlo slack).
+	//  2. On the frequency-selective fade, option (a) must show a CLEAR advantage
+	//     at >=1 operating point (this is the M=16 frequency-diversity gain that is
+	//     the WHOLE reason to prefer (a); if it does NOT appear, the honest verdict
+	//     is to ratify (b) — this assert makes that decision explicit and tested).
+	if (a_floor_awgn > b_floor_awgn) {
+		test_fail(name, "option (a) regressed vs (b) on AWGN (a's P>=0.99 floor is worse)");
+		return;
+	}
+	if (!any_sel_separation) {
+		test_fail(name, "option (a) showed NO frequency-diversity advantage over (b) on the selective fade");
+		return;
+	}
+	test_pass(name);
+}
+
+// =============================================================================
+// Stage 3c — CONFIG_TAG ACQUISITION-SYNC TRIM SWEEP (the airtime optimization).
+// =============================================================================
+// THE GATE FOR THIS INCREMENT. The CONFIG_TAG burst prepends a base
+// acquisition-sync pattern so the RX base-correlator can LOCATE the burst. A
+// free-standing CONNECT burst is blind-located (full 16-symbol base); but after
+// Stage 3b the tag rides at a DETERMINISTIC OFFSET (right after frame-0), so the
+// RX already knows ~where it is → the acquisition sync can be TRIMMED. Only the
+// SYNC shrinks; the 55-symbol payload suffix (RM(1,4)+GF(16)-RA+CRC) is intact.
+//
+// This sweep drives the ACTUAL production functions at base lengths
+// {16,12,10,8,6,5,4,3,2}:
+//   TX: cl_telecom_system::generate_config_tag_pattern_passband (keys the burst
+//       at tag_sync_nsymb_override base symbols).
+//   RX: cl_telecom_system::decode_config_tag_from_passband (the REAL
+//       base-correlator presence detect + per-tone-energy/FWHT-chip extraction),
+//       then config_tag_wrap_decode (FWHT cfg_index + GF(16) RA + CRC-12 + binding).
+// at the operating Es/N0 (6 dB, the M=16 robust-layer op point the Stage-3a
+// round-trip uses) WITH timing jitter (random ± a fraction of a symbol around the
+// deterministic offset, since that offset is approximate not exact). For each
+// length it reports detection+decode rate, picks the MINIMUM length keeping
+// detection >= 99%, and reports the resulting burst-size reduction. A FAR check
+// on pure noise confirms the trimmed count-gate does not false-trigger.
+static void test_config_tag_sync_trim_sweep() {
+	const char* name = "config_tag_sync_trim_sweep (deterministic-offset acquisition-sync trim)";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_8);   // WB OFDM (M=16 robust ctrl-suffix available)
+	cl_arq_controller arq;
+	arq.telecom_system = &ts;          // build_config_tag_tones reads telecom_system->ack_mfsk
+	if (ts.ack_mfsk.ack_sack_suffix_len() <= 0) {
+		test_fail(name, "WB M>=16 ctrl-suffix not available (CONFIG_8 load failed?)"); return;
+	}
+
+	const int FULL_BASE = ts.ack_mfsk.connect_pattern_nsymb;   // 16 (the un-trimmed base)
+	const double fs = ts.sampling_frequency;
+	const int Nofdm = ts.data_container.Nofdm;
+	const int interp = ts.frequency_interpolation_rate;
+	const int sym_samples = Nofdm * interp;
+
+	// Build the combined CONFIG_TAG suffix tones (RM16 || gf16ra39 = 55). Announce
+	// CONFIG_10 (a different config than the loaded one so the decode target is
+	// unambiguous), bind to bsi/parity exactly as the production emit does.
+	const int ANNOUNCE_CFG = CONFIG_10;
+	const int ann_ladder = config_ladder_index(ANNOUNCE_CFG);
+	const int BSI = 43;
+	const uint8_t PARITY = 1;
+	int tones[gf16ra::GF16RA_MAX_N];
+	int n_tones = 0; uint8_t bsi_lsb = 0;
+	if (!arq.build_config_tag_tones(ANNOUNCE_CFG, BSI, PARITY, tones, &n_tones, &bsi_lsb)) {
+		test_fail(name, "build_config_tag_tones failed"); return;
+	}
+	if (n_tones != CFG_TAG_RM_N + (int)gf16ra::codeword_len()) {
+		test_fail(name, "combined suffix length != RM16+gf39"); return;
+	}
+
+	// Decode a passband buffer of length n; return present + accept(cfg/binding).
+	auto decode_pb = [&](double* buf, int n, int* out_cfg, bool* out_accept) -> bool {
+		std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+		double chips[16] = {0.0};
+		int n_syms = 0, matched = 0;
+		bool present = ts.decode_config_tag_from_passband(buf, n,
+			energies.data(), chips, &n_syms, &matched);
+		if (!present) { if(out_cfg)*out_cfg=-1; if(out_accept)*out_accept=false; return false; }
+		config_tag_decode_result r;
+		bool accept = config_tag_wrap_decode(energies.data(), chips, CFG_TAG_PEAK_GATE,
+			bsi_lsb, PARITY, prod_crc12_cb, &arq, &r);
+		if (out_cfg)    *out_cfg = accept ? (int)r.cfg_index : -1;
+		if (out_accept) *out_accept = accept;
+		return present;
+	};
+
+	// Operating point: Es/N0 = 6 dB (the Stage-3a round-trip op point at the M=16
+	// robust layer). Timing jitter: the deterministic offset is approximate, so the
+	// burst start is randomly shifted +/- JIT_SYM_FRAC of a symbol around its nominal
+	// placement in a padded buffer. The RX correlator must re-acquire from the base.
+	const double EsN0 = 6.0;
+	const int    NT   = 1000;         // trials per length (tight CI on a 0.99 target)
+	const double JIT_SYM_FRAC = 0.5;  // +/- half a symbol of offset jitter
+	const int    jit_max = (int)(JIT_SYM_FRAC * sym_samples);
+
+	// Lengths to sweep, from the full base DOWN (incl. 14/11 near the cliff).
+	const int lens[] = { 16, 14, 12, 11, 10, 8, 6, 5, 4, 3, 2 };
+	const int NL = (int)(sizeof(lens)/sizeof(lens[0]));
+
+	printf("  [MEASURE] CONFIG_TAG acquisition-sync trim — detection vs base length\n");
+	printf("    op Es/N0=%.0f dB, +/-%.0f%% symbol timing jitter, %d trials/len, payload suffix=%d sym (fixed)\n",
+		EsN0, JIT_SYM_FRAC*100.0, NT, n_tones);
+	printf("    %-5s %-7s %-9s %-7s %-9s %-10s %-8s\n",
+		"len", "thr", "burst_sym", "samples", "seconds", "detect%", "accept%");
+
+	int    chosen_len = FULL_BASE;     // the minimum length that holds >=99% detect
+	double full_samples = (double)(FULL_BASE + n_tones) * sym_samples;
+
+	for (int li = 0; li < NL; li++) {
+		int L = lens[li];
+		if (L > FULL_BASE) continue;
+		ts.ack_mfsk.tag_sync_nsymb_override = L;   // drive the TX+RX base length
+		int thr = ts.ack_mfsk.config_tag_sync_match_threshold();
+		int burst_nsymb = L + n_tones;
+		int burst_samples = burst_nsymb * sym_samples;
+
+		// Clean reference burst (for power calibration + jittered placement).
+		const int pad = jit_max + 4096;
+		std::vector<double> clean((size_t)burst_samples + 2*pad, 0.0);
+		int written = ts.generate_config_tag_pattern_passband(clean.data() + pad, tones, n_tones);
+		if (written != burst_samples) {
+			char m[96]; snprintf(m,sizeof(m),"L=%d: generate wrote %d != %d", L, written, burst_samples);
+			ts.ack_mfsk.tag_sync_nsymb_override = -1; test_fail(name, m); return;
+		}
+
+		// Calibrate sigma from the burst passband power (same formula as the
+		// Stage-3a round-trip), so Es/N0 is meaningful on this exact burst.
+		double P_sig = 0.0;
+		for (int i = 0; i < burst_samples; i++) { double s = clean[pad+i]; P_sig += s*s; }
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		double f_nyquist = fs / 2.0;
+		double sigma = std::sqrt(2.0 * P_sig * f_nyquist / (std::pow(10.0, EsN0/10.0) * ts.bandwidth));
+
+		std::mt19937 rng((uint32_t)(0x7A60C0DE + L*977));
+		std::normal_distribution<double> nd(0.0, sigma);
+		std::uniform_int_distribution<int> jit(-jit_max, jit_max);
+		int detect_ok = 0, accept_ok = 0;
+		std::vector<double> noisy((size_t)clean.size(), 0.0);
+		for (int t = 0; t < NT; t++) {
+			// Re-key the clean burst at a JITTERED offset (the deterministic offset is
+			// only approximate), then add AWGN over the whole padded buffer.
+			int shift = jit(rng);
+			std::fill(noisy.begin(), noisy.end(), 0.0);
+			ts.generate_config_tag_pattern_passband(noisy.data() + pad + shift, tones, n_tones);
+			for (size_t i = 0; i < noisy.size(); i++) noisy[i] += nd(rng);
+
+			int cfg = -2; bool accept = false;
+			bool present = decode_pb(noisy.data(), (int)noisy.size(), &cfg, &accept);
+			if (present) detect_ok++;
+			if (accept && cfg == ann_ladder) accept_ok++;
+		}
+		double Pd = (double)detect_ok / NT;
+		double Pa = (double)accept_ok / NT;
+		printf("    %-5d %-7d %-9d %-7d %-9.3f %-10.4f %-8.4f\n",
+			L, thr, burst_nsymb, burst_samples, burst_samples/fs, Pd, Pa);
+
+		// The chosen length is the SMALLEST L with both detect AND accept >= 0.99.
+		if (Pd >= 0.99 && Pa >= 0.99) chosen_len = L;
+	}
+	ts.ack_mfsk.tag_sync_nsymb_override = -1;   // restore (no production leak)
+
+	// Report THE NUMBER for the chosen length + the shipping default.
+	double chosen_samples = (double)(chosen_len + n_tones) * sym_samples;
+	double reduction_pct = 100.0 * (1.0 - chosen_samples / full_samples);
+	printf("    --- swept minimum: len=%d -> %.0f samples (%.3f s) vs full len=%d -> %.0f samples (%.3f s) = %.1f%% reduction ---\n",
+		chosen_len, chosen_samples, chosen_samples/fs, FULL_BASE, full_samples, full_samples/fs, reduction_pct);
+	printf("    --- shipping default CFG_TAG_SYNC_NSYMB_DEFAULT=%d ---\n",
+		cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT);
+
+	// --- FAR: pure-noise must NOT false-trigger at the SHIPPING default length. ---
+	{
+		ts.ack_mfsk.tag_sync_nsymb_override = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT;
+		int burst_nsymb = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT + n_tones;
+		int burst_samples = burst_nsymb * sym_samples;
+		const int pad = 4096;
+		std::vector<double> ref((size_t)burst_samples + 2*pad, 0.0);
+		ts.generate_config_tag_pattern_passband(ref.data() + pad, tones, n_tones);
+		double P_sig = 0.0;
+		for (int i = 0; i < burst_samples; i++) { double s = ref[pad+i]; P_sig += s*s; }
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		double sigma = std::sqrt(P_sig);   // ~0 dB noise floor, NO signal present
+		std::mt19937 rng(0x4FA12B0D);
+		std::normal_distribution<double> nd(0.0, sigma);
+		int false_accepts = 0;
+		const int FT = 2000;
+		std::vector<double> noise((size_t)ref.size(), 0.0);
+		for (int t = 0; t < FT; t++) {
+			for (size_t i = 0; i < noise.size(); i++) noise[i] = nd(rng);
+			int cfg=-2; bool accept=false;
+			decode_pb(noise.data(), (int)noise.size(), &cfg, &accept);
+			if (accept) false_accepts++;
+		}
+		ts.ack_mfsk.tag_sync_nsymb_override = -1;
+		printf("    --- FAR @ default len=%d: %d/%d pure-noise wrap-accepts ---\n",
+			cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT, false_accepts, FT);
+		if (false_accepts > 0) {
+			test_fail(name, "pure-noise FALSE-ACCEPT at the shipping default length (FAR not held)");
+			return;
+		}
+	}
+
+	// --- ASSERTIONS (let the numbers arbitrate the trim) ---
+	// 1. The shipping default must itself hold >=99% detect+accept at the op SNR
+	//    with jitter (re-run it directly so the assertion is on the default, not a
+	//    grid point that happened to pass).
+	{
+		ts.ack_mfsk.tag_sync_nsymb_override = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT;
+		int burst_nsymb = cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT + n_tones;
+		int burst_samples = burst_nsymb * sym_samples;
+		const int pad = jit_max + 4096;
+		std::vector<double> ref((size_t)burst_samples + 2*pad, 0.0);
+		ts.generate_config_tag_pattern_passband(ref.data() + pad, tones, n_tones);
+		double P_sig = 0.0;
+		for (int i = 0; i < burst_samples; i++) { double s = ref[pad+i]; P_sig += s*s; }
+		P_sig /= (burst_samples > 0 ? burst_samples : 1);
+		double f_nyquist = fs / 2.0;
+		double sigma = std::sqrt(2.0 * P_sig * f_nyquist / (std::pow(10.0, EsN0/10.0) * ts.bandwidth));
+		std::mt19937 rng(0x515DEFA1);
+		std::normal_distribution<double> nd(0.0, sigma);
+		std::uniform_int_distribution<int> jit(-jit_max, jit_max);
+		int detect_ok = 0, accept_ok = 0;
+		std::vector<double> noisy((size_t)ref.size(), 0.0);
+		for (int t = 0; t < NT; t++) {
+			int shift = jit(rng);
+			std::fill(noisy.begin(), noisy.end(), 0.0);
+			ts.generate_config_tag_pattern_passband(noisy.data() + pad + shift, tones, n_tones);
+			for (size_t i = 0; i < noisy.size(); i++) noisy[i] += nd(rng);
+			int cfg=-2; bool accept=false;
+			bool present = decode_pb(noisy.data(), (int)noisy.size(), &cfg, &accept);
+			if (present) detect_ok++;
+			if (accept && cfg == ann_ladder) accept_ok++;
+		}
+		ts.ack_mfsk.tag_sync_nsymb_override = -1;
+		double Pd = (double)detect_ok/NT, Pa = (double)accept_ok/NT;
+		printf("    --- default len=%d @ op SNR + jitter: detect=%.4f accept=%.4f (target >=0.99) ---\n",
+			cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT, Pd, Pa);
+		if (Pd < 0.99 || Pa < 0.99) {
+			test_fail(name, "shipping default length does NOT hold >=99% detect+accept at op SNR + jitter");
+			return;
+		}
+	}
+
+	// 2. The default must be a genuine trim (strictly shorter than the full base).
+	if (cl_mfsk::CFG_TAG_SYNC_NSYMB_DEFAULT >= FULL_BASE) {
+		test_fail(name, "default base length is not a trim (>= full base)"); return;
+	}
+
+	test_pass(name);
+}
+
+// §25 — CONFIG_TAG in-band rate adaptation Stage 2: emit/detect/FOLLOW wrapper.
+// The follow logic lives on cl_arq_controller (it drives the production
+// load_configuration coherent ARQ+PHY-twin switch); this wrapper instantiates a
+// throwaway controller, runs the member test, and maps its 0/1 verdict into the
+// file's pass/fail counters. unilateral-config-tag-design.md §11 Stage 2.
+static void test_config_tag_follow_stage2() {
+	const char* name = "config_tag_follow_stage2 (emit/detect/FOLLOW, PHY-twin coherent)";
+	cl_arq_controller* arq = new cl_arq_controller();
+	int rc = arq->test_config_tag_follow();
+	delete arq;
+	if (rc == 0) test_pass(name);
+	else         test_fail(name, "RX did not follow the config FROM THE TAG (see [TEST-INBAND-FOLLOW] log)");
+}
+
+// §26 — CONFIG_TAG in-band rate adaptation Stage 3a: PASSBAND ROUND-TRIP wrapper.
+// Makes the tag ride the REAL OFDM passband: TX keys the combined RM+gf16ra suffix
+// to passband audio, passes it through CLEAN + AWGN, the RX detects it on the
+// passband (real base-correlator presence detector) + decodes the right cfg_index,
+// and proves an OFDM data frame still LDPC-decodes with the suffix appended.
+// unilateral-config-tag-design.md §11 Stage 3.
+static void test_config_tag_passband_stage3a() {
+	const char* name = "config_tag_passband_stage3a (TX->AWGN->RX passband detect+decode, payload uncorrupted)";
+	cl_arq_controller* arq = new cl_arq_controller();
+	int rc = arq->test_config_tag_passband_roundtrip();
+	delete arq;
+	if (rc == 0) test_pass(name);
+	else         test_fail(name, "config-tag passband round-trip failed (see [TEST-INBAND-PB] log)");
+}
+
+// §27 — CONFIG_TAG in-band rate adaptation Stage 3b: LOOPBACK DROP wrapper. The tag
+// is now WIRED into the production send/receive/gearshift flow: a gearshift-driven
+// unilateral drop (W3), the tag keyed onto the real passband (W1), the RX following
+// from the passband tag (W2 + the SET_CONFIG HINGE side-effects), the SACK confirming
+// the bsi, ZERO SET_CONFIG on the wire, both ends config-tracking + PHY-twin coherent,
+// plus the R7 mixed-config gap-gate case. data-flow-perbatch-config.md §12.5.
+static void test_inband_drop_stage3b() {
+	const char* name = "inband_drop_stage3b (gearshift drive + passband tag follow + SACK confirm, 0 SET_CONFIG)";
+	cl_arq_controller* arq = new cl_arq_controller();
+	int rc = arq->test_inband_drop();
+	delete arq;
+	if (rc == 0) test_pass(name);
+	else         test_fail(name, "inband loopback drop failed (see [TEST-INBAND-DROP] log)");
+}
+
 // §10.5 — THE MEASUREMENT: GF(16)-RA acquisition cliff on the SAME SNR3k axis as
 // §9. For each sigma: P(base-detect), P(GF16-RA decode). Reports the cliff
 // (SNR3k at P=0.5), the coding gain vs the §9 HARD suffix, and whether it
@@ -7113,6 +7753,42 @@ int run_mfsk_ctrl_codec_tests() {
 	// §23 BREAK forward-health gate (fix/break-fh-gate): FH-latch suppression of the
 	// held-CFG16 marginal-OFDM alias + K-of-N corroboration + genuine-BREAK survives.
 	test_break_fh_gate();
+
+	// §24 CONFIG_TAG codec (in-band rate adaptation, Stage-1): RM(1,4) Walsh
+	// codeword + FWHT decode + GF(16) RA FEC + WRAP acceptance. Offline codec
+	// only (no ARQ/gearshift wiring). tag-codeword-design.md §5/§8.
+	test_config_tag_roundtrip_all_indices();   // T1 encode->decode all 32 cfg_index
+	test_config_tag_noise_loaded_decode();     // T2 right index at a representative Es/N0
+	test_config_tag_pure_noise_far();          // T3 WRAP FAR <= design bound
+	test_config_tag_optab_detection_sweep();   // T4 option (a) tone-perm vs (b) 2-tone detection-vs-Es/N0
+
+	// §25 CONFIG_TAG in-band rate adaptation Stage 2 — emit/detect/FOLLOW.
+	// Drives the production cl_arq_controller emit_config_tag_if_changed +
+	// detect_and_follow_config_tag through a forced CONFIG_10->CONFIG_8 batch-
+	// boundary switch and asserts the RX follows FROM THE TAG with the PHY twin
+	// switching coherently. unilateral-config-tag-design.md §11 Stage 2.
+	test_config_tag_follow_stage2();
+
+	// §26 CONFIG_TAG in-band rate adaptation Stage 3a — PASSBAND ROUND-TRIP.
+	// Makes the tag ride the REAL OFDM passband (TX key -> CLEAN+AWGN -> RX base-
+	// correlator detect + decode), and proves an OFDM data frame still LDPC-decodes
+	// with the suffix appended. unilateral-config-tag-design.md §11 Stage 3.
+	test_config_tag_passband_stage3a();
+
+	// §27 CONFIG_TAG in-band rate adaptation Stage 3b — LOOPBACK DROP. The tag is
+	// WIRED into the production send/receive/gearshift flow: gearshift-driven
+	// unilateral drop (W3), tag on the real passband (W1), RX follow (W2 + HINGE),
+	// SACK confirm (bsi), ZERO SET_CONFIG on the wire, both ends config-track,
+	// PHY-twin coherent, + the R7 mixed-config gap-gate. data-flow-perbatch-config.md §12.
+	test_inband_drop_stage3b();
+
+	// Stage 3c CONFIG_TAG ACQUISITION-SYNC TRIM. The tag rides a deterministic
+	// offset (right after frame-0), so the RX knows ~where the burst is and the
+	// acquisition sync can be trimmed below the full 16-symbol base. Sweeps the base
+	// length DOWN at the op Es/N0 with timing jitter, picks the swept minimum that
+	// holds >=99% detect+accept, confirms the FAR is held, and asserts the shipping
+	// default is a genuine trim. unilateral-config-tag-design.md §11 Stage 3c.
+	test_config_tag_sync_trim_sweep();
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;

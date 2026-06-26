@@ -249,6 +249,35 @@ public:
 	                                       ctrl_crc12_fn crc12_fn = nullptr,
 	                                       void* crc12_ctx = nullptr);
 
+	// ---- In-band rate adaptation (Stage 3a) — CONFIG_TAG on the real passband ----
+	// TX: emit the CONFIG_TAG MFSK ctrl-suffix burst as passband audio. MIRROR of
+	// generate_ctrl_suffix_pattern_passband: CONNECT base pattern + a one-tone-per-
+	// symbol suffix, but the suffix is the gf16ra::encode_config_tag codeword
+	// (configure(2) = N=39 R=1/3) built by the ARQ layer. The burst is SELF-SIZED
+	// (it computes its own sample count from connect_base_total_nsymb()+N — it does
+	// NOT read ctrl_suffix_pattern_passband_samples, which is sized for the CONNECT
+	// FEC mode, not the tag). `tones` is N=gf16ra::codeword_len() GF(16) tones.
+	// Returns samples written, or 0 if unsupported (NB / M<16). Stage 3a is a self-
+	// contained robust burst; the in-line append into send_batch is Stage 3b.
+	int generate_config_tag_pattern_passband(double* out,
+	                                          const int* tones, int n_suffix);
+
+	// RX: detect the CONFIG_TAG burst on the real passband and extract the per-tone
+	// ENERGY matrix + soft FWHT chips, then hand them to the ARQ wrap-decoder.
+	// MIRROR of decode_ctrl_suffix_from_passband's front half: passband→baseband
+	// decimate, detect_ack_pattern base correlator (THE real always-on presence
+	// detector — gate on matched>=connect_match_threshold && metric>=
+	// CTRL_DETECT_METRIC_MIN, design §3.1), control mini-Moose v2 CFO correction,
+	// then decode_suffix_energies over N symbols. Writes the N*M energy matrix into
+	// out_energies (caller-sized to >= N*M) and the 16 RM soft chips into
+	// out_chips[16]; sets *out_n_syms = N and *out_matched. Returns true iff the
+	// base correlator locked (a burst is present); false = no tag present (the
+	// steady-state no-tag frame on a real noise floor). The CRC/FWHT/binding
+	// acceptance is the ARQ layer's config_tag_wrap_decode, NOT here.
+	bool decode_config_tag_from_passband(double* data, int size,
+	                                      double* out_energies, double* out_chips,
+	                                      int* out_n_syms, int* out_matched);
+
 	// ---- Suffix FEC (connect-suffix-fec-research.md) — MEASURED PROTOTYPE ----
 	// CRC-aided SOFT list decode of the 13-symbol ctrl-suffix. ZERO airtime
 	// (Tier 1): no wire-format change, the suffix bytes are byte-identical to
@@ -698,6 +727,19 @@ public:
 	// at 30 dB (BER 0.43). Called from BOTH receive_byte (extraction is byte-identical
 	// to the inline block — no stock-path drift) and receive_bigblock. No-op for MFSK.
 	void rx_passband_normalize_and_blank(double* pb, int pb_samples);
+	// IN-BAND ADOPT CLEAN-LOCK GATE (data-flow-inband-adopt-metric-gate.md §2) — compute the
+	// NORMALIZED Schmidl-Cox timing metric (|P|²/R² ∈ [0,1], SNR-invariant) over a captured
+	// passband SNAPSHOT, at the geometry the in-band tag ANNOUNCES, WITHOUT mutating any RX
+	// state (a LOCAL pad/baseband copy; never touches passband_delayed_data, the ring cursors,
+	// or receive_stats). Used by the in-band tag-follow adopt to REJECT a contaminated /
+	// overlapping re-air window (metric ~0.5) and only ADOPT a clean single-burst lock
+	// (metric ~0.997) — the "prominent peak" discriminant the codebase already cites
+	// (arq_common.cc:12586). `announced_cfg` is the config the tag announces (the metric is
+	// computed at the CURRENT loaded OFDM geometry — the caller has not yet load_configuration'd
+	// the new cfg, and the base-rung re-air geometry the gate must judge IS the current one;
+	// announced_cfg is advisory/logging only). Returns the metric in [0,1], or -1.0 if it
+	// cannot be computed (MFSK / no snapshot / not an OFDM config).
+	double inband_snapshot_clean_lock_metric(const double* snapshot, int len, int announced_cfg);
 	// #samples one big-block TX writes to `out` (= preamble + K*frame passband
 	// samples at the frozen layout). The ARQ/capture sizing needs this in P2; for
 	// P1 the loopback validator uses it to size buffers. Computed from the frozen
@@ -795,6 +837,23 @@ public:
 
 	void load_configuration();
 	void load_configuration(int configuration);
+	// Grow the capture ring to >= min_nsymb symbols WITHOUT a config change (a same-config
+	// re-load is skipped). Re-runs data_container.set_size with the current geometry + the
+	// raised buffer_Nsymb_min. Used to seat the in-band down-ladder robust ring floor
+	// (data-flow-inband-ondemote-zerobyte.md §7). Mutex-protected; idempotent.
+	void force_resize_capture_ring(int min_nsymb);
+	// Reset the capture ring to the CURRENT config's NATURAL buffer_Nsymb (un-seat any raised
+	// buffer_Nsymb_min). Restores the legacy OFDM-acquisition geometry after a robust->OFDM
+	// in-band adopt so the re-aired burst lands within the coarse-search bounds
+	// (data-flow-robust-ofdm-adopt-flush.md §10). Mutex-protected.
+	void force_set_capture_ring_natural();
+	// Regenerate data_container.bit_energy_dispersal_sequence from bit_energy_dispersal_seed.
+	// init() runs this after its set_size; the ring-resize helpers (force_resize_capture_ring /
+	// force_set_capture_ring_natural) call set_size DIRECTLY (without init), and set_size
+	// CDELETE+reallocates the sequence array (data_container.cc:243->145) as fresh ZEROED pages —
+	// wiping the descrambler. Both helpers must regenerate it or the RX descrambles with all-zeros
+	// (RX_msg = TX_msg XOR descrambler_seq -> constant CRC fail). data-flow-robust-ofdm-adopt-flush.md §17.
+	void regenerate_bit_energy_dispersal_sequence();
 	int last_configuration;
 	int current_configuration;
 	void return_to_last_configuration();

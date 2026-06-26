@@ -143,14 +143,19 @@ bool unpack_start_conn_payload(uint64_t p38, bool* out_nb_flag,
 //   bits 37..36 : echoed_cap[1:0] (2)
 //   bits 35..34 : own_cap[1:0]    (2)
 //   bits 33..26 : ssid            (8)
-//   bits 25..0  : reserved        (26)
+//   bit  25     : own_cap[2]      (1)   FORGIVING-ACK Tier 2 (CAP_CUMULATIVE_ACK)
+//   bit  24     : echoed_cap[2]   (1)   FORGIVING-ACK Tier 2 (echo of bit 2)
+//   bits 23..0  : reserved        (24)
 //
-// The cap fields carry the 2 negotiable MFSK-wire bits (CAP_WB_CAPABLE,
-// CAP_ENCRYPTION). (The former §21 3rd-bit widening that carried CAP_SUFFIX_FEC
-// in bits 25/24 was removed in cleanup/drop-suffix-fec-cap: Mercury shipped no
-// version, so there were no legacy peers to negotiate against — the enhanced
-// ctrl-suffix is the unconditional default at the robust tier, gated on the
-// gearshift config, not on a negotiated bit.)
+// The cap fields carry the 3 negotiable MFSK-wire bits (CAP_WB_CAPABLE 0x01,
+// CAP_ENCRYPTION 0x02, CAP_CUMULATIVE_ACK 0x04 = MASK0x07). Bit 2 of each cap reuses
+// a formerly-RESERVED payload bit ("must be 0 on TX, ignored on RX") — the EXACT §21
+// precedent that carried a 3rd cap bit (CAP_SUFFIX_FEC, since removed). This is a
+// SEMANTICS reuse of reserved bits, NOT a payload-width change: a legacy peer leaves
+// them 0 ⇒ bit 2 reads 0 ⇒ both_support false ⇒ per-batch fallback (interop-safe).
+// The PHY codec stays datalink-independent: it carries the low 3 negotiable bits via
+// the literal 0x7 mask (== datalink_defines.h CAP_NEGOTIABLE_MASK) without knowing
+// the bit meanings.
 
 void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
                             uint8_t own_cap, uint8_t ssid)
@@ -160,7 +165,9 @@ void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
 	v |= ((uint64_t)(echoed_cap & 0x3)) << 36;
 	v |= ((uint64_t)(own_cap    & 0x3)) << 34;
 	v |= ((uint64_t)(ssid       & 0xFF)) << 26;
-	// reserved (bits 25..0) MUST be zero on TX
+	v |= ((uint64_t)((own_cap    >> 2) & 0x1)) << 25;  // own_cap bit 2 (CAP_CUMULATIVE_ACK)
+	v |= ((uint64_t)((echoed_cap >> 2) & 0x1)) << 24;  // echoed_cap bit 2 (echo of bit 2)
+	// reserved (bits 23..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -169,8 +176,8 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 {
 	if (!echoed_cap || !own_cap || !ssid) return false;
 	uint64_t v = p38 & ((1ULL << 38) - 1ULL);
-	*echoed_cap = (uint8_t)((v >> 36) & 0x3);
-	*own_cap    = (uint8_t)((v >> 34) & 0x3);
+	*echoed_cap = (uint8_t)(((v >> 36) & 0x3) | (((v >> 24) & 0x1) << 2));
+	*own_cap    = (uint8_t)(((v >> 34) & 0x3) | (((v >> 25) & 0x1) << 2));
 	*ssid       = (uint8_t)((v >> 26) & 0xFF);
 	return true;
 }
@@ -182,11 +189,13 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 //   bits 37..34 : snr_q          (4)
 //   bits 33..32 : local_cap[1:0] (2)
 //   bits 31..24 : ssid           (8)
-//   bits 23..0  : reserved       (24)
+//   bit  23     : local_cap[2]   (1)   FORGIVING-ACK Tier 2 (CAP_CUMULATIVE_ACK)
+//   bits 22..0  : reserved       (23)
 //
-// The cap field carries the 2 negotiable MFSK-wire bits (CAP_WB_CAPABLE,
-// CAP_ENCRYPTION). (The former §21 3rd-bit widening that carried CAP_SUFFIX_FEC
-// in bit 23 was removed in cleanup/drop-suffix-fec-cap — see pack_test_ack_payload.)
+// The cap field carries the 3 negotiable MFSK-wire bits (CAP_WB_CAPABLE 0x01,
+// CAP_ENCRYPTION 0x02, CAP_CUMULATIVE_ACK 0x04). Bit 2 reuses a formerly-RESERVED
+// payload bit (the §21 precedent; see pack_test_ack_payload) — SEMANTICS reuse, NOT
+// a payload-width change. A legacy peer leaves it 0 ⇒ per-batch fallback (interop-safe).
 
 void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
                              uint8_t local_cap, uint8_t ssid)
@@ -196,7 +205,8 @@ void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
 	v |= ((uint64_t)(snr_q     & 0xF))  << 34;
 	v |= ((uint64_t)(local_cap & 0x3))  << 32;
 	v |= ((uint64_t)(ssid      & 0xFF)) << 24;
-	// reserved (bits 23..0) MUST be zero on TX
+	v |= ((uint64_t)((local_cap >> 2) & 0x1)) << 23;  // local_cap bit 2 (CAP_CUMULATIVE_ACK)
+	// reserved (bits 22..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -206,7 +216,7 @@ bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
 	if (!snr_q || !local_cap || !ssid) return false;
 	uint64_t v = p38 & ((1ULL << 38) - 1ULL);
 	*snr_q     = (uint8_t)((v >> 34) & 0xF);
-	*local_cap = (uint8_t)((v >> 32) & 0x3);
+	*local_cap = (uint8_t)(((v >> 32) & 0x3) | (((v >> 23) & 0x1) << 2));
 	*ssid      = (uint8_t)((v >> 24) & 0xFF);
 	return true;
 }
@@ -438,6 +448,7 @@ int configure(int repfact)
 
 int codeword_len() { return g_N; }
 int parity_len()   { return g_NC; }
+int current_repfact() { return g_repfact; }
 
 bool init()
 {
@@ -568,14 +579,14 @@ static inline double log_i0_approx(double v)
 	return (r > 80.0) ? 80.0 : r;
 }
 
-bool soft_decode(const double* energies, int maxiter, double esno_metric,
-                 uint8_t expected_type,
-                 ctrl_crc12_fn crc12_fn, void* crc12_ctx,
-                 uint64_t* out_payload38, int* out_iters)
+// Shared Q-ary BP core: decode the per-tone ENERGY matrix to the K info symbols.
+// Identical math to the original soft_decode body (extracted verbatim so the
+// legacy decoder stays bit-for-bit unchanged); the ONLY thing the two public
+// entries do differently is the message reassemble + CRC/type gate (2-bit type
+// for soft_decode vs 3-bit type for soft_decode_config_tag).
+static void gf16ra_bp_to_info(const double* energies, int maxiter,
+                              double esno_metric, int* info_out, int* out_iters)
 {
-	if (!energies || !crc12_fn || !out_payload38) return false;
-	init();
-	if (out_iters) *out_iters = -1;
 	const int N = g_N, M = GF16RA_M, K = GF16RA_K, nfac = g_NC;
 
 	// ---- intrinsic (channel) probabilities pix[s][16] (Bessel metric) ----
@@ -680,15 +691,26 @@ bool soft_decode(const double* energies, int maxiter, double esno_metric,
 			double* ap = &app[(size_t)v * M];
 			for (int t = 0; t < M; t++) ap[t] *= m[t];
 		}
-	int info[GF16RA_K];
 	for (int s = 0; s < K; s++) {
 		const double* ap = &app[(size_t)s * M];
 		int best = 0; double bv = -1.0;
 		for (int t = 0; t < M; t++) if (ap[t] > bv) { bv = ap[t]; best = t; }
-		info[s] = best;
+		info_out[s] = best;
 	}
+}
 
-	// ---- reassemble + CRC/type accept gate ----
+bool soft_decode(const double* energies, int maxiter, double esno_metric,
+                 uint8_t expected_type,
+                 ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                 uint64_t* out_payload38, int* out_iters)
+{
+	if (!energies || !crc12_fn || !out_payload38) return false;
+	init();
+	if (out_iters) *out_iters = -1;
+	int info[GF16RA_K];
+	gf16ra_bp_to_info(energies, maxiter, esno_metric, info, out_iters);
+
+	// ---- reassemble + CRC/type accept gate (2-bit legacy type) ----
 	uint8_t type; uint64_t p38; uint16_t dec_crc;
 	info_to_msg(info, &type, &p38, &dec_crc);
 	if (type != expected_type) return false;
@@ -700,4 +722,389 @@ bool soft_decode(const double* energies, int maxiter, double esno_metric,
 	return true;
 }
 
+// -----------------------------------------------------------------------------
+// CONFIG_TAG variant: 3-bit type / 37-bit payload message split (OD-1 widen
+// scoped to the tag). The 40-bit field is [type:3|payload:37]; otherwise the
+// RA codeword, the BP, and the CRC-as-protected-info are IDENTICAL to the legacy
+// pair (encode/soft_decode) above.
+static inline void config_tag_msg_to_info(uint8_t type, uint64_t payload37,
+                                          uint16_t crc12, int* info)
+{
+	uint64_t field40 = ((uint64_t)(type & 0x7) << 37) | (payload37 & ((1ULL << 37) - 1ULL));
+	for (int s = 0; s < GF16RA_K_MSG; s++) info[s] = (int)((field40 >> (40 - 4 * (s + 1))) & 0xF);
+	uint16_t c = (uint16_t)(crc12 & 0x0FFF);
+	for (int s = 0; s < GF16RA_K_CRC; s++) info[GF16RA_K_MSG + s] = (int)((c >> (12 - 4 * (s + 1))) & 0xF);
+}
+
+static inline void config_tag_info_to_msg(const int* info, uint8_t* type,
+                                          uint64_t* payload37, uint16_t* crc12)
+{
+	uint64_t field40 = 0;
+	for (int s = 0; s < GF16RA_K_MSG; s++) field40 = (field40 << 4) | (uint64_t)(info[s] & 0xF);
+	*type = (uint8_t)((field40 >> 37) & 0x7);
+	*payload37 = field40 & ((1ULL << 37) - 1ULL);
+	uint16_t c = 0;
+	for (int s = 0; s < GF16RA_K_CRC; s++) c = (uint16_t)((c << 4) | (info[GF16RA_K_MSG + s] & 0xF));
+	*crc12 = (uint16_t)(c & 0x0FFF);
+}
+
+void encode_config_tag(uint8_t type, uint64_t payload37, uint16_t crc12, int* out_tones)
+{
+	init();
+	int info[GF16RA_K];
+	config_tag_msg_to_info(type, payload37, crc12, info);
+	for (int s = 0; s < GF16RA_K; s++) out_tones[s] = info[s] & 0xF;
+	// RA accumulator chain: one info edge folded per stage (identical to encode()).
+	int prev = 0;
+	for (int j = 0; j < g_NC; j++) {
+		int w = g_gfexp[g_acc_wlog[j]];
+		int acc = prev ^ gf_mul(w, info[g_acc_idx[j]]);
+		out_tones[GF16RA_K + j] = acc & 0xF;
+		prev = acc;
+	}
+}
+
+bool soft_decode_config_tag(const double* energies, int maxiter, double esno_metric,
+                            uint8_t expected_type,
+                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                            uint64_t* out_payload37, int* out_iters)
+{
+	if (!energies || !crc12_fn || !out_payload37) return false;
+	init();
+	if (out_iters) *out_iters = -1;
+	int info[GF16RA_K];
+	gf16ra_bp_to_info(energies, maxiter, esno_metric, info, out_iters);
+
+	// ---- reassemble + CRC/type accept gate (3-bit config-tag type) ----
+	uint8_t type; uint64_t p37; uint16_t dec_crc;
+	config_tag_info_to_msg(info, &type, &p37, &dec_crc);
+	if (type != expected_type) return false;
+	unsigned char typed[5];
+	pack_config_tag_typed40_msb(typed, type, p37);
+	uint16_t calc = crc12_fn(crc12_ctx, typed, 5) & 0x0FFF;
+	if (calc != dec_crc) return false;
+	*out_payload37 = p37;
+	return true;
+}
+
 } // namespace gf16ra
+
+// =============================================================================
+// CONFIG_TAG codec (OD-1/OD-2) — RM(1,4) Walsh codeword + WRAP detector
+// =============================================================================
+//
+// DESIGN DECISION (TRACKED — fact-documents/ is gitignored, so the rationale
+// lives here so it travels with the source). tag-codeword-design.md §1.3.
+//
+// RM-chip <-> M=16-tone front-end = OPTION (a), the tone-PERMUTATION realization
+// (the design note's RECOMMENDED choice), NOT the original Stage-1 option (b)
+// 2-tone {0,8} binary-FSK overlay.
+//
+//   Option (b) (REPLACED): every one of the 16 RM chips rode the SAME two tones
+//   (CFG_TAG_TONE_PLUS=0 / CFG_TAG_TONE_MINUS=8); the soft chip was e[i][0]-e[i][8].
+//   That throws away the M=16 non-coherent gain (note §1.3): a frequency-selective
+//   null or single-tone interferer on tone 0 or 8 corrupts ALL 16 chips at once,
+//   so the FWHT floors exactly where the 32-MFSK robust ACK still decodes. Because
+//   the WRAP requires fwht_passed && crc_passed && bind_agree, a floored FWHT CAPS
+//   the tag's survival SNR below the robust substrate it is supposed to out-live.
+//
+//   Option (a) (THIS IMPL): chip i occupies its own M=16 symbol on an antipodal
+//   tone PAIR { perm[i], perm[i]^0xF } that is UNIQUE to position i (CFG_TAG_TONE_PERM
+//   is a permutation of {0..15}). A clean codeword and its bi-orthogonal complement
+//   together exercise the FULL 16-tone alphabet. A per-tone fade now damages only
+//   the few chips that ride the faded tones; the 16-pt FWHT (d_min=8) integrates the
+//   surviving chips and still recovers cfg_index. The soft chip is the SAME-symbol
+//   antipodal energy difference e[i][perm[i]]-e[i][perm[i]^0xF], read from the
+//   per-tone energy matrix the gf16ra RA decoder also consumes (so the FWHT and the
+//   CRC-field substrate corroborate over the same robust energies). The DECODER is
+//   unchanged: one 16-pt FWHT over the 16 soft chips, argmax|bin| -> row, sign ->
+//   complement. Only the chip<->tone mapping moved from a fixed pair to a permutation.
+//   The §24 sweep (test T4) MEASURES (a) vs (b) detection-vs-Es/N0 on AWGN and on a
+//   per-tone (frequency-selective) fade and is the decisive evidence for this choice.
+//
+// OD-1 SCOPED-WIDEN rationale (unchanged): the 2->3-bit type widen that admits
+// CONFIG_TAG=4 is scoped to this tag's OWN pack/unpack helpers
+// (pack_config_tag_typed40_msb + the gf16ra config-tag layout) rather than globally
+// repartitioning the shared 52-bit suffix [type:2|payload:38]. A global repartition
+// would drop payload bit 37 (load-bearing for every legacy type and asserted by green
+// unit tests) and silently change the production ACK wire. The four legacy types stay
+// byte-identical; the tag is the ONLY codec that reads/writes a 3-bit type. See
+// fact-documents/data-flow-config-tag-codec.md §2 (the cost-of-the-global-repartition
+// measurement). [?] OD-1 owner ratification carries to Stage-2 (the ARQ adopt wiring).
+
+void pack_config_tag_typed40_msb(unsigned char out_bytes[5], uint8_t type,
+                                 uint64_t payload37)
+{
+	uint64_t typed40 = ((uint64_t)(type & 0x7) << 37)
+	                 | (payload37 & ((1ULL << 37) - 1ULL));
+	for (int b = 0; b < 5; b++)
+		out_bytes[b] = (unsigned char)((typed40 >> (8 * (4 - b))) & 0xFF);
+}
+
+void pack_config_tag_payload(uint64_t* p37, uint8_t cfg_index,
+                             uint8_t batch_seq_lsb, uint8_t epoch_parity)
+{
+	if (!p37) return;
+	uint64_t v = 0;
+	v |= ((uint64_t)(cfg_index     & 0x1F)) << 32;  // bits 36..32
+	v |= ((uint64_t)(batch_seq_lsb & 0x07)) << 29;  // bits 31..29
+	v |= ((uint64_t)(epoch_parity  & 0x01)) << 28;  // bit  28
+	// reserved (bits 27..0) MUST be zero on TX
+	*p37 = v & ((1ULL << 37) - 1ULL);
+}
+
+bool unpack_config_tag_payload(uint64_t p37, uint8_t* cfg_index,
+                               uint8_t* batch_seq_lsb, uint8_t* epoch_parity)
+{
+	if (!cfg_index || !batch_seq_lsb || !epoch_parity) return false;
+	uint64_t v = p37 & ((1ULL << 37) - 1ULL);
+	*cfg_index     = (uint8_t)((v >> 32) & 0x1F);
+	*batch_seq_lsb = (uint8_t)((v >> 29) & 0x07);
+	*epoch_parity  = (uint8_t)((v >> 28) & 0x01);
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// RM(1,4) = (16,5,8) bi-orthogonal Walsh/Hadamard codeword for cfg_index.
+//
+// The 16 Sylvester-Hadamard rows are H[r][i] = (-1)^popcount(r & i) (i,r in
+// [0,16)). cfg_index (5 bits) maps to (row:4, complement:1): row = cfg_index&0xF,
+// complement = (cfg_index>>4)&1. The 16 chips are H[row][.] negated iff
+// complement. Decode: a 16-pt FWHT of the soft chips yields, at bin = row, a
+// value whose magnitude is the correlation peak and whose sign is the complement
+// bit (+ for non-complemented, - for complemented). The Sylvester-Hadamard
+// transform IS the FWHT (same butterfly the gf16ra fwht16 uses), so the row that
+// produced the chips lights up exactly one bin.
+// -----------------------------------------------------------------------------
+
+static inline int rm_popcount4(int x) {
+	x &= 0xF; return (x & 1) + ((x >> 1) & 1) + ((x >> 2) & 1) + ((x >> 3) & 1);
+}
+
+bool cfg_tag_rm_encode(int cfg_index, int* out_chips)
+{
+	if (!out_chips || cfg_index < 0 || cfg_index >= 32) return false;
+	int row = cfg_index & 0xF;
+	int comp = (cfg_index >> 4) & 0x1;
+	for (int i = 0; i < 16; i++) {
+		int h = (rm_popcount4(row & i) & 1) ? -1 : +1;  // Hadamard row entry
+		out_chips[i] = comp ? -h : h;
+	}
+	return true;
+}
+
+int cfg_tag_rm_fwht_decode(const double* soft_chips, double* out_rpeak)
+{
+#ifdef STAGE1_FAILBEFORE
+	// FAIL-BEFORE stub: the real FWHT decode does not exist yet. Return a fixed
+	// WRONG cfg_index with a saturated peak ratio (so the peak-margin gate passes
+	// but the index is wrong → T1 roundtrip mismatch, T2 no recovery, and the
+	// WRAP corroboration cannot agree). This is the genuine "decode absent" state
+	// the Stage-1 fail-before must demonstrate.
+	(void)soft_chips;
+	if (out_rpeak) *out_rpeak = 1e9;
+	return 7;  // fixed wrong index
+#else
+	// Walsh-Hadamard transform (natural order) of the 16 soft chips. The
+	// Sylvester-Hadamard rows are the WHT basis, so a clean codeword puts all
+	// energy in bin = row, signed by the complement bit.
+	double a[16];
+	for (int i = 0; i < 16; i++) a[i] = soft_chips ? soft_chips[i] : 0.0;
+	for (int len = 1; len < 16; len <<= 1)
+		for (int i = 0; i < 16; i += (len << 1))
+			for (int j = 0; j < len; j++) {
+				double u = a[i + j], v = a[i + j + len];
+				a[i + j] = u + v; a[i + j + len] = u - v;
+			}
+	int best = 0; double bestmag = -1.0, secondmag = 0.0;
+	for (int r = 0; r < 16; r++) {
+		double m = std::fabs(a[r]);
+		if (m > bestmag) { secondmag = bestmag; bestmag = m; best = r; }
+		else if (m > secondmag) { secondmag = m; }
+	}
+	int comp = (a[best] < 0.0) ? 1 : 0;
+	if (out_rpeak) *out_rpeak = (secondmag > 1e-12) ? (bestmag / secondmag) : 1e9;
+	return (comp << 4) | best;
+#endif
+}
+
+// OPTION (a): each chip's soft value is the antipodal energy difference of THAT
+// symbol's UNIQUE tone pair { perm[i], perm[i]^0xF } (vs option (b)'s fixed {0,8}).
+// Reads the same per-tone energy matrix the gf16ra RA decoder consumes.
+void cfg_tag_softchips_from_energies(const double* energies16x16, double* out_chips)
+{
+	if (!energies16x16 || !out_chips) return;
+	for (int i = 0; i < 16; i++) {
+		int tplus  = CFG_TAG_TONE_PERM[i] & 0xF;
+		int tminus = tplus ^ 0xF;
+		out_chips[i] = energies16x16[i * 16 + tplus]
+		             - energies16x16[i * 16 + tminus];
+	}
+}
+
+// OPTION (a): per-symbol one-hot on the antipodal tone chip i selects
+// (perm[i] for +1, perm[i]^0xF for -1). Across the 16 chips a codeword and its
+// complement span the full 16-tone alphabet (per-tone / frequency diversity).
+void cfg_tag_energies_from_cfg(int cfg_index, double hi, double lo, double* out_e16x16)
+{
+	if (!out_e16x16) return;
+	int chips[16];
+	cfg_tag_rm_encode(cfg_index, chips);
+	for (int i = 0; i < 16; i++) {
+		for (int t = 0; t < 16; t++) out_e16x16[i * 16 + t] = lo;
+		int tplus = CFG_TAG_TONE_PERM[i] & 0xF;
+		int tone  = (chips[i] > 0) ? tplus : (tplus ^ 0xF);
+		out_e16x16[i * 16 + tone] = hi;
+	}
+}
+
+// -----------------------------------------------------------------------------
+// WRAP detector (FWHT primary + GF(16)/CRC-12 secondary + binding gates).
+// -----------------------------------------------------------------------------
+
+// BP iteration cap + assumed Es/No for the Bessel intrinsic (a fixed design
+// point, matching the test-harness constants for the legacy gf16ra path).
+static const int    CFG_TAG_BP_MAXITER = 50;
+static const double CFG_TAG_ESNO_METRIC = 4.0;  // ~6 dB
+
+bool config_tag_wrap_decode(const double* energies,
+                            const double* chip_soft,
+                            double peak_ratio_gate,
+                            uint8_t expect_bsi_lsb, uint8_t expect_parity,
+                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                            config_tag_decode_result* out)
+{
+	config_tag_decode_result r;
+	r.cfg_index = 0; r.batch_seq_lsb = 0; r.epoch_parity = 0;
+	r.fwht_rpeak = 0.0; r.fwht_passed = false; r.crc_passed = false; r.bind_agree = false;
+	if (out) *out = r;
+	if (!energies || !chip_soft || !crc12_fn) return false;
+
+	// Gate-1: FWHT correlator over the 16 soft chips.
+	double rpeak = 0.0;
+	int fwht_cfg = cfg_tag_rm_fwht_decode(chip_soft, &rpeak);
+	r.fwht_rpeak = rpeak;
+	r.fwht_passed = (rpeak >= peak_ratio_gate);
+
+	// Gate-2: GF(16) RA + CRC-12 over the 3-bit-typed field. The CONFIG_TAG rides
+	// the configure(2)=N=39 substrate; ensure the process-global gf16ra graph is at
+	// repfact=2 for THIS decode and restore the prior value (the legacy CONNECT FEC
+	// runs at configure(3)=N=52 — this decode must neither depend on nor corrupt it;
+	// CLAUDE.md §5 cross-layer guard). Self-contained so any caller is safe.
+	int saved_repfact = gf16ra::current_repfact();
+	if(saved_repfact != 2) { gf16ra::configure(2); gf16ra::init(); }
+	uint64_t p37 = 0; int iters = -2;
+	bool gf_ok = gf16ra::soft_decode_config_tag(energies, CFG_TAG_BP_MAXITER,
+		CFG_TAG_ESNO_METRIC, (uint8_t)MFSK_CTRL_CONFIG_TAG,
+		crc12_fn, crc12_ctx, &p37, &iters);
+	if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	r.crc_passed = gf_ok;
+
+	uint8_t crc_cfg = 0, bsi_lsb = 0, parity = 0;
+	if (gf_ok) {
+		unpack_config_tag_payload(p37, &crc_cfg, &bsi_lsb, &parity);
+		r.cfg_index = crc_cfg; r.batch_seq_lsb = bsi_lsb; r.epoch_parity = parity;
+	} else {
+		// Without the CRC field we still surface the FWHT estimate for logging.
+		r.cfg_index = (uint8_t)fwht_cfg;
+	}
+
+	// Gate-3/4/5: cfg_index corroboration (FWHT == CRC field) + bsi + parity.
+	// expect_bsi_lsb == 0xFF and expect_parity == 0xFF are the "do not bind on this
+	// field" sentinels (Stage 3d §15): the PRE-FRAME tag detect runs BEFORE frame 0
+	// decodes, so the RX does not yet know the batch bsi to bind against — it relies on
+	// the FWHT peak + GF(16)+CRC-12 + cfg_index corroboration (the ~1e-8 FAR gates).
+	// No existing caller passes 0xFF for bsi (they pass a real 0..7), so the sentinel is
+	// purely additive (byte-identical for them).
+	bool corroborate = gf_ok && (fwht_cfg == (int)crc_cfg);
+	bool bsi_ok      = gf_ok && (expect_bsi_lsb == 0xFF || bsi_lsb == (uint8_t)(expect_bsi_lsb & 0x7));
+	bool parity_ok   = gf_ok && (expect_parity == 0xFF || parity == (uint8_t)(expect_parity & 0x1));
+	r.bind_agree = corroborate && bsi_ok && parity_ok;
+
+	// WRAP: accept ONLY on ALL gates.
+	bool accept = r.fwht_passed && r.crc_passed && r.bind_agree;
+	if (out) *out = r;
+	return accept;
+}
+
+// =============================================================================
+// Stage 4e (D2 NACK first-class) — NACK payload codec + WRAP decode
+// =============================================================================
+//
+// The NACK rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as the CONFIG_TAG (only the
+// type discriminator [5 vs 4] and the payload field layout differ), so encode/decode
+// reuse gf16ra::encode_config_tag / soft_decode_config_tag verbatim (type-parameterized).
+
+void pack_nack_payload(uint64_t* p37, uint8_t rx_cfg_index,
+                       uint8_t rx_expected_bsi_lsb, uint8_t reason,
+                       uint8_t epoch_parity)
+{
+	if (!p37) return;
+	uint64_t v = 0;
+	v |= ((uint64_t)(rx_cfg_index        & 0x1F)) << 32;  // bits 36..32
+	v |= ((uint64_t)(rx_expected_bsi_lsb & 0x07)) << 29;  // bits 31..29
+	v |= ((uint64_t)(reason              & 0x03)) << 27;  // bits 28..27
+	v |= ((uint64_t)(epoch_parity        & 0x01)) << 26;  // bit  26
+	// reserved (bits 25..0) MUST be zero on TX
+	*p37 = v & ((1ULL << 37) - 1ULL);
+}
+
+bool unpack_nack_payload(uint64_t p37, uint8_t* rx_cfg_index,
+                         uint8_t* rx_expected_bsi_lsb, uint8_t* reason,
+                         uint8_t* epoch_parity)
+{
+	if (!rx_cfg_index || !rx_expected_bsi_lsb || !reason || !epoch_parity) return false;
+	uint64_t v = p37 & ((1ULL << 37) - 1ULL);
+	*rx_cfg_index        = (uint8_t)((v >> 32) & 0x1F);
+	*rx_expected_bsi_lsb = (uint8_t)((v >> 29) & 0x07);
+	*reason              = (uint8_t)((v >> 27) & 0x03);
+	*epoch_parity        = (uint8_t)((v >> 26) & 0x01);
+	return true;
+}
+
+bool nack_wrap_decode(const double* energies,
+                      const double* chip_soft,
+                      double peak_ratio_gate,
+                      ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                      nack_decode_result* out)
+{
+	nack_decode_result r;
+	r.rx_cfg_index = 0; r.rx_expected_bsi_lsb = 0; r.reason = 0; r.epoch_parity = 0;
+	r.fwht_rpeak = 0.0; r.fwht_passed = false; r.crc_passed = false; r.cfg_corroborate = false;
+	if (out) *out = r;
+	if (!energies || !chip_soft || !crc12_fn) return false;
+
+	// Gate-1: FWHT correlator over the 16 RM soft chips (the rx_cfg_index codeword).
+	double rpeak = 0.0;
+	int fwht_cfg = cfg_tag_rm_fwht_decode(chip_soft, &rpeak);
+	r.fwht_rpeak = rpeak;
+	r.fwht_passed = (rpeak >= peak_ratio_gate);
+
+	// Gate-2: GF(16) RA + CRC-12 over the 3-bit-typed field, type=MFSK_CTRL_NACK.
+	// Same configure(2)=N=39 substrate + save/restore as config_tag_wrap_decode.
+	int saved_repfact = gf16ra::current_repfact();
+	if (saved_repfact != 2) { gf16ra::configure(2); gf16ra::init(); }
+	uint64_t p37 = 0; int iters = -2;
+	bool gf_ok = gf16ra::soft_decode_config_tag(energies, CFG_TAG_BP_MAXITER,
+		CFG_TAG_ESNO_METRIC, (uint8_t)MFSK_CTRL_NACK,
+		crc12_fn, crc12_ctx, &p37, &iters);
+	if (saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	r.crc_passed = gf_ok;
+
+	uint8_t crc_cfg = 0, bsi_lsb = 0, reason = 0, parity = 0;
+	if (gf_ok) {
+		unpack_nack_payload(p37, &crc_cfg, &bsi_lsb, &reason, &parity);
+		r.rx_cfg_index = crc_cfg; r.rx_expected_bsi_lsb = bsi_lsb;
+		r.reason = reason; r.epoch_parity = parity;
+	} else {
+		r.rx_cfg_index = (uint8_t)fwht_cfg;   // surface the FWHT estimate for logging
+	}
+
+	// Gate-3: cfg_index corroboration (FWHT == CRC field). The sender applies its own
+	// parity/in-window policy in inband_handle_nack — kept out of the codec.
+	r.cfg_corroborate = gf_ok && (fwht_cfg == (int)crc_cfg);
+
+	bool accept = r.fwht_passed && r.crc_passed && r.cfg_corroborate;
+	if (out) *out = r;
+	return accept;
+}

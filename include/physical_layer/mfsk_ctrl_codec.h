@@ -25,20 +25,43 @@
 
 #include <cstdint>
 
-// MFSK CONTROL frame discriminator (2 bits, MSB-first within the suffix
-// 52-bit field [type:2|payload:38|crc12:12]). See fact-documents/
-// phase-b-mfsk-connect-research.md §11 for the design rationale.
+// MFSK CONTROL frame discriminator. The four LEGACY types (0..3) ride the
+// 2-bit-wide discriminator in the 52-bit suffix field [type:2|payload:38|crc12:12]
+// (MSB-first); see fact-documents/phase-b-mfsk-connect-research.md §11.
 //
 // Wave 1 implements pack/unpack primitives for all four type codes but only
 // START_CONN + TEST_ACK are wired into production code paths in Wave 2.
 // MFSK_CTRL_TEST_CONN is reserved (encode/decode helpers are NOT provided in
 // Wave 1) — callers requesting it from unpack will get out_type=3 and must
 // treat the payload as opaque.
+//
+// OD-1 (in-band rate adaptation, tag-codeword-design.md §8.2): the discriminator
+// is WIDENED 2->3 bits to admit a fifth type, MFSK_CTRL_CONFIG_TAG = 4. To keep
+// the four legacy types' 38-bit payload roundtrip BYTE-IDENTICAL (the legacy
+// pack/unpack sites mask type&0x3 over a 38-bit payload, and the existing unit
+// tests assert full-38-bit roundtrips), the 3-bit widen is SCOPED to the
+// CONFIG_TAG's OWN codec helpers (pack_config_tag_typed40_msb + the gf16ra
+// config-tag layout), which lay out [type:3|payload:37|crc12:12]. Every legacy
+// pack/unpack site is untouched; the config-tag codec is the ONLY one that
+// reads/writes a 3-bit type. See fact-documents/data-flow-config-tag-codec.md §2.
 enum mfsk_ctrl_frame_type : uint8_t {
 	MFSK_CTRL_ACK_SACK   = 0,  // existing ACK+SACK (re-fitted to 30-bit bitmap)
 	MFSK_CTRL_START_CONN = 1,  // CMD → RSP: callsign + NB-flag
 	MFSK_CTRL_TEST_ACK   = 2,  // RSP → CMD: cap echo + own cap + SSID
 	MFSK_CTRL_TEST_CONN  = 3,  // reserved (Wave 2+ — quantized SNR + cap)
+	MFSK_CTRL_CONFIG_TAG = 4,  // OD-1: in-band rate-adaptation config tag (3-bit type)
+	// Stage 4e (D2 NACK first-class, inband-reliability-design.md §2): the RX
+	// FAST-signals "I could not follow / could not decode" on the reverse robust layer.
+	// Rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as CONFIG_TAG, type=5 (the first
+	// free 3-bit code after the 2->3 widen). Codes 6,7 remain free.
+	MFSK_CTRL_NACK       = 5,
+};
+
+// Stage 4e (D2) NACK reason codes (2-bit field in the NACK payload).
+enum mfsk_ctrl_nack_reason : uint8_t {
+	NACK_DECODE_FAIL        = 0,  // the down-ladder could not decode the batch at any window config
+	NACK_UNFOLLOWABLE_CLIMB = 1,  // a tag was heard announcing a config the RX cannot adopt
+	// 2, 3 reserved (e.g. BUFFER_FULL, NB_ONLY)
 };
 
 // =============================================================================
@@ -97,17 +120,19 @@ bool unpack_start_conn_payload(uint64_t p38, bool* out_nb_flag,
 // MFSK_CTRL_TEST_ACK payload (38 bits)
 // =============================================================================
 //
-//   bits 37..36 : echoed_cap[1:0] (2)   peer's cap echoed back
-//   bits 35..34 : own_cap[1:0]    (2)   responder's local_capability
+//   bits 37..36 : echoed_cap[1:0] (2)   peer's cap echoed back (low 2 bits)
+//   bits 35..34 : own_cap[1:0]    (2)   responder's local_capability (low 2 bits)
 //   bits 33..26 : ssid            (8)   0-15 numeric, 16=L, 17=T, 18=R, 19=X,
 //                                        255 = SSID_NONE (matches
 //                                        `arq.h:60 #define SSID_NONE 0xFF`)
-//   bits 25..0  : reserved        (26)  must be 0 on TX, ignored on RX
+//   bit  25     : own_cap[2]      (1)   CAP_CUMULATIVE_ACK (FORGIVING-ACK Tier 2)
+//   bit  24     : echoed_cap[2]   (1)   echo of bit 2
+//   bits 23..0  : reserved        (24)  must be 0 on TX, ignored on RX
 //
-// echoed_cap / own_cap are the 2 negotiable MFSK-wire bits
-// (CAP_NEGOTIABLE_MASK=0x03): CAP_WB_CAPABLE (0x01), CAP_ENCRYPTION (0x02).
-// Bits above 0x03 are masked off. (The former §21 3rd-bit widening that carried
-// CAP_SUFFIX_FEC in bits 25/24 was removed in cleanup/drop-suffix-fec-cap.)
+// echoed_cap / own_cap are the 3 negotiable MFSK-wire bits
+// (CAP_NEGOTIABLE_MASK=0x07): CAP_WB_CAPABLE (0x01), CAP_ENCRYPTION (0x02),
+// CAP_CUMULATIVE_ACK (0x04). Bits above 0x07 are masked off. Bit 2 reuses formerly-
+// reserved payload bits (the §21 precedent) — no payload-width change.
 void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
                             uint8_t own_cap, uint8_t ssid);
 
@@ -127,7 +152,8 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 //                                       255 = SSID_NONE (matches
 //                                       `arq.h:60 #define SSID_NONE 0xFF`).
 //                                       Identical encoding to TEST_ACK.
-//   bits 23..0  : reserved       (24)  must be 0 on TX, ignored on RX
+//   bit  23     : local_cap[2]   (1)   CAP_CUMULATIVE_ACK (FORGIVING-ACK Tier 2)
+//   bits 22..0  : reserved       (23)  must be 0 on TX, ignored on RX
 //
 // Site F (RSP RX) reconstructs the legacy float SNR via
 // cl_mfsk::tone_to_snr(snr_q). 2 dB quantization step is documented in the
@@ -237,6 +263,10 @@ static const int GF16RA_MAX_N   = 64;  // buffer ceiling for out_tones / energie
 int  configure(int repfact);
 int  codeword_len();   // current N (= K + NC); valid after configure()/init()
 int  parity_len();     // current NC (= repfact*K)
+int  current_repfact();// the repfact configure() last set (for save/restore — the
+                       // graph is process-global; a caller that temporarily
+                       // configure()s a different repfact must restore it so a
+                       // concurrent consumer at another repfact is not corrupted).
 
 // One-time construction of the GF(16) field tables and the RA graph for the
 // current repfact (interleaver, accumulator weights). Idempotent until the next
@@ -273,6 +303,209 @@ bool soft_decode(const double* energies, int maxiter, double esno_metric,
                  ctrl_crc12_fn crc12_fn, void* crc12_ctx,
                  uint64_t* out_payload38, int* out_iters);
 
+// -----------------------------------------------------------------------------
+// OD-1/OD-2 CONFIG_TAG variant: same GF(16) RA codeword, but the 40-bit message
+// field is laid out [type:3|payload:37] (3-bit type so CONFIG_TAG=4 survives the
+// CRC field), with the production 12-bit CRC carried as PROTECTED info symbols.
+// Identical RA graph / BP / energy-matrix decode as encode()/soft_decode() — the
+// ONLY difference is the type:3 vs type:2 message split, scoped to this pair so
+// the legacy types stay byte-identical. crc12 is computed by the caller over the
+// 5-byte pack_config_tag_typed40_msb() field.
+void encode_config_tag(uint8_t type, uint64_t payload37, uint16_t crc12,
+                       int* out_tones);
+
+bool soft_decode_config_tag(const double* energies, int maxiter,
+                            double esno_metric, uint8_t expected_type,
+                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                            uint64_t* out_payload37, int* out_iters);
+
 } // namespace gf16ra
+
+// =============================================================================
+// CONFIG_TAG codec (OD-1/OD-2, tag-codeword-design.md §5/§8) — in-band rate adapt
+// =============================================================================
+//
+// The unilateral config TAG announces a config change on the robust M=16 MFSK
+// ctrl-suffix. cfg_index (5 bits) is protected by an RM(1,4)=(16,5,8)
+// bi-orthogonal Walsh/Hadamard codeword decoded by a 16-pt FWHT over the per-tone
+// energy matrix (argmax|bin| -> 4 row bits, sign -> 1 complement bit). The
+// binding bits (batch_seq_lsb:3 + epoch_parity:1) ride as plain CRC-12-protected
+// bits. The whole message rides the GF(16) RA FEC substrate (OD-2 mandatory).
+//
+// All-offline (Stage 1): NO ARQ/gearshift wiring. PHY ctrl-codec layer only.
+
+// Pack the 5-byte MSB-first CRC field for a CONFIG_TAG: [type:3|payload:37] in
+// the 40-bit field (type at bits 39..37). Mirrors pack_ctrl_typed40_msb but with
+// the 3-bit type / 37-bit payload split. CRC-12 is computed by the caller over
+// these 5 bytes (the production CRC12_calc).
+void pack_config_tag_typed40_msb(unsigned char out_bytes[5], uint8_t type,
+                                 uint64_t payload37);
+
+// -----------------------------------------------------------------------------
+// RM(1,4) = (16,5,8) bi-orthogonal Walsh/Hadamard codeword for cfg_index.
+// -----------------------------------------------------------------------------
+//
+// 32 codewords (16 Hadamard rows + their complements), length 16, d_min=8.
+// Encode: cfg_index (0..31) -> {row:4, complement:1} -> 16 chips (+1/-1).
+// Decode: 16-pt FWHT of the 16 soft chip values; argmax|bin| -> 4 row bits,
+// sign(bin) -> complement bit; the peak/2nd-peak magnitude ratio is the WRAP
+// peak-margin gate input.
+static const int CFG_TAG_RM_N = 16;  // codeword length (chips)
+
+// WRAP gate-1 / presence subpeak energy-ratio threshold: the FWHT peak-to-2nd-
+// peak ratio over the 16 RM soft chips must exceed this for a tag to be PRESENT
+// (tag-codeword-design.md §4.2). A real RM(1,4) codeword concentrates FWHT energy
+// in one Walsh bin (rpeak large); a noise floor spreads it (rpeak ~ 1). This is
+// the production presence gate that replaces the Stage-2 energy_sum<=1e-12
+// artifact (which false-passes on any real noise floor). Shared by the codec WRAP
+// decoder, the ARQ detect-and-follow presence check, and the unit tests.
+static const double CFG_TAG_PEAK_GATE = 2.0;
+
+// Build the 16 +/-1 chips of the RM(1,4) codeword for cfg_index (0..31). The
+// chip array is written to out_chips[0..15]. Returns false if cfg_index >= 32.
+bool cfg_tag_rm_encode(int cfg_index, int* out_chips /*[16]*/);
+
+// FWHT-decode 16 soft chip values to a cfg_index, also returning the peak-margin
+// ratio R_peak = |peak| / |2nd peak| (>= 1; large => confident). Returns the
+// decoded cfg_index (0..31); *out_rpeak set when non-null.
+int cfg_tag_rm_fwht_decode(const double* soft_chips /*[16]*/, double* out_rpeak);
+
+// OPTION (a) — M=16 tone-permutation realization (design note §1.3 RECOMMENDED).
+// -----------------------------------------------------------------------------
+// Each of the 16 RM chips occupies its OWN M=16 symbol. The chip sign selects
+// between an ANTIPODAL TONE PAIR { perm[i], perm[i]^0xF } that is UNIQUE to the
+// chip position i (a permutation of the full 16-tone alphabet across the block),
+// so a clean codeword exercises ALL 16 tones — NOT a fixed 2-tone {0,8} overlay.
+//   chip +1 -> tone CFG_TAG_TONE_PERM[i]
+//   chip -1 -> tone CFG_TAG_TONE_PERM[i] ^ 0xF   (full-range antipodal complement)
+// The soft chip for the FWHT is the energy DIFFERENCE of THAT symbol's two
+// antipodal tones, taken from the per-tone energy matrix the gf16ra decoder also
+// consumes:  out_chips[i] = e[i][perm[i]] - e[i][perm[i]^0xF].
+//
+// Why (a) beats the prior option (b) (CFG_TAG_TONE_PLUS/MINUS = {0,8} for EVERY
+// chip): with (b) all 16 chips ride the SAME two tones, so any frequency-selective
+// null / single-tone interferer on tone 0 or 8 corrupts EVERY chip and the FWHT
+// floors. With (a) each chip rides a DIFFERENT tone pair, so a per-tone fade
+// damages only a few chips; the 16-pt FWHT integrates the survivors (d_min=8) and
+// still recovers cfg_index. This is the M=16 non-coherent / frequency-diversity
+// gain the design note says (b) "throws away." Decode is the SAME single FWHT.
+// energies16x16 is a 16-symbol x 16-tone row-major block.
+static const int CFG_TAG_TONE_PERM[16] = {
+	// A permutation of {0..15} spreading the 16 chip positions across the whole
+	// alphabet. Position i lights tone perm[i] (chip +1) or perm[i]^0xF (chip -1);
+	// since perm and perm^0xF together cover all 16 tones, both a codeword and its
+	// bi-orthogonal complement exercise the full M=16 set. (Bit-reversal of i over
+	// the low 3 bits keeps adjacent positions on spectrally-separated tone pairs.)
+	0, 4, 2, 6, 1, 5, 3, 7,   // perm[i] in {0..7}; perm[i]^0xF in {8..15}
+	0, 4, 2, 6, 1, 5, 3, 7,
+};
+void cfg_tag_softchips_from_energies(const double* energies16x16,
+                                     double* out_chips /*[16]*/);
+
+// Write the 16-symbol x 16-tone CLEAN energy block for a cfg_index codeword.
+// Per-symbol one-hot: the antipodal tone selected by chip i (perm[i] or
+// perm[i]^0xF) gets `hi`, the other 15 tones get `lo`. Used by TX-side
+// modulation (Stage 2+) and the unit tests. out_e16x16 must hold 256 doubles.
+void cfg_tag_energies_from_cfg(int cfg_index, double hi, double lo,
+                               double* out_e16x16 /*[256]*/);
+
+// -----------------------------------------------------------------------------
+// CONFIG_TAG payload (37 bits) field layout.
+// -----------------------------------------------------------------------------
+//
+//   bits 36..32 : cfg_index     (5)  binding copy under CRC-12 (the FWHT codeword
+//                                     is the primary detector; this is the WRAP
+//                                     corroboration copy)
+//   bits 31..29 : batch_seq_lsb (3)  cmd_batch_seq_id & 0x7   } plain, CRC-12-protected
+//   bit  28     : epoch_parity  (1)  toggles per config CHANGE } binding bits
+//   bits 27..0  : reserved      (28) TX sends 0, RX ignores
+void pack_config_tag_payload(uint64_t* p37, uint8_t cfg_index,
+                             uint8_t batch_seq_lsb, uint8_t epoch_parity);
+
+bool unpack_config_tag_payload(uint64_t p37, uint8_t* cfg_index,
+                               uint8_t* batch_seq_lsb, uint8_t* epoch_parity);
+
+// -----------------------------------------------------------------------------
+// The WRAP detector result + acceptance.
+// -----------------------------------------------------------------------------
+//
+// Stage-1 entry: given the per-tone ENERGY matrix of a captured suffix
+// (energies[s*16+t], N = gf16ra::codeword_len() symbols) AND the codeword chip
+// energies for the FWHT, run BOTH detectors and accept ONLY IF the WRAP gates
+// pass (FWHT peak-margin >= gate AND GF(16)+CRC-12 accept AND the FWHT cfg_index
+// equals the CRC-field cfg_index AND batch_seq_lsb/epoch_parity match the
+// expected binding). Returns true on accept; writes the decoded fields.
+//
+//   energies      : gf16ra codeword energy matrix (N*16 row-major)
+//   chip_soft      : 16 soft chip values for the RM FWHT (energy difference of the
+//                    two tones of each chip; see cfg_tag_softchips_from_energies)
+//   peak_ratio_gate: WRAP gate-1 threshold (R_peak must be >= this)
+//   expect_bsi_lsb : the bsi&0x7 the receiver is adopting (binding gate-3)
+//   expect_parity  : the epoch_parity the receiver expects (binding gate-4); pass
+//                    0xFF to skip the parity gate (Stage-1 round-trip mode)
+struct config_tag_decode_result {
+	uint8_t cfg_index;
+	uint8_t batch_seq_lsb;
+	uint8_t epoch_parity;
+	double  fwht_rpeak;
+	bool    fwht_passed;   // gate-1
+	bool    crc_passed;    // gate-2 (GF16 RA + CRC-12)
+	bool    bind_agree;    // gate-3/4/5 (cfg_index corroboration + bsi + parity)
+};
+
+bool config_tag_wrap_decode(const double* energies,
+                            const double* chip_soft,
+                            double peak_ratio_gate,
+                            uint8_t expect_bsi_lsb, uint8_t expect_parity,
+                            ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                            config_tag_decode_result* out);
+
+// =============================================================================
+// Stage 4e (D2 NACK first-class, inband-reliability-design.md §2) — NACK codec
+// =============================================================================
+//
+// The NACK rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as the CONFIG_TAG, with
+// type=MFSK_CTRL_NACK=5. The RM(1,4) Walsh prefix carries `rx_cfg_index` (the FWHT
+// cfg corroboration, exactly as the tag's prefix carries cfg_index); the gf16ra/
+// CRC-12 message carries the 37-bit NACK payload below. Decode is the SAME WRAP
+// (FWHT peak + GF(16)+CRC-12 + cfg corroboration), type-discriminated to NACK.
+//
+// NACK payload (37 bits) — MSB-first, the SAME bit-slot discipline as
+// pack_config_tag_payload:
+//   bits 36..32 : rx_cfg_index        (5)  the LADDER INDEX the RX is ACTUALLY running
+//   bits 31..29 : rx_expected_bsi_lsb (3)  rsp_current_expected_batch_seq_id & 0x7
+//   bits 28..27 : reason              (2)  mfsk_ctrl_nack_reason
+//   bit  26     : epoch_parity        (1)  echo of the last-seen tag parity (binding)
+//   bits 25..0  : reserved            (26) TX sends 0, RX ignores
+void pack_nack_payload(uint64_t* p37, uint8_t rx_cfg_index,
+                       uint8_t rx_expected_bsi_lsb, uint8_t reason,
+                       uint8_t epoch_parity);
+
+bool unpack_nack_payload(uint64_t p37, uint8_t* rx_cfg_index,
+                         uint8_t* rx_expected_bsi_lsb, uint8_t* reason,
+                         uint8_t* epoch_parity);
+
+// NACK WRAP decode (mirror of config_tag_wrap_decode, type=MFSK_CTRL_NACK). Accepts
+// ONLY if the FWHT peak-margin passes AND the GF(16)+CRC-12 type-5 decode passes AND
+// the FWHT cfg_index corroborates the CRC-field rx_cfg_index. The binding bits
+// (bsi/reason/parity) are surfaced to the caller (the sender applies its own
+// parity/in-window policy in inband_handle_nack — they are NOT gated here, so the
+// codec stays policy-free). Returns true on accept; writes the decoded fields.
+struct nack_decode_result {
+	uint8_t rx_cfg_index;
+	uint8_t rx_expected_bsi_lsb;
+	uint8_t reason;
+	uint8_t epoch_parity;
+	double  fwht_rpeak;
+	bool    fwht_passed;
+	bool    crc_passed;
+	bool    cfg_corroborate;   // FWHT cfg_index == CRC-field rx_cfg_index
+};
+
+bool nack_wrap_decode(const double* energies,
+                      const double* chip_soft,
+                      double peak_ratio_gate,
+                      ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                      nack_decode_result* out);
 
 #endif // INC_MFSK_CTRL_CODEC_H_
