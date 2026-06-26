@@ -10272,6 +10272,142 @@ int cl_arq_controller::test_inband_tier_cross_reverse_pin()
 // the confirm). FAIL-BEFORE (-DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE): the §6 false-confirm is
 // reproduced -> the at/above-threshold NO-CONFIRM assertions FLIP to FAIL. Sub-threshold /
 // not-yet-announced / a DROP / feature-OFF -> NO confirm in BOTH arms.
+// ============================================================================
+// RESIDUAL FIX REGRESSION -- ROBUST-TIER tag-follow fires on STALE passes too
+// (data-flow-inband-tier-crossing.md section 11)
+// ============================================================================
+// The section-6 false-confirm retirement (851b710) let the robust->OFDM tier-cross FIRE
+// but it was NON-DETERMINISTIC: the ROBUST-TIER tag-follow gate required rx_fresh_window_
+// decoded_this_pass (a term copied from the OFDM blind down-ladder), so the re-emitted
+// CONFIG_TAG was DROPPED on every stale inter-frame pass (frames_to_read != 0).
+// inband_detect_follow_from_capture is content-discriminating and self-gating on a real
+// presence detect, so the fresh-window requirement is unnecessary HERE and is the cause of
+// the climb lottery.
+//
+// This DIRECTED test drives the EXACT production firing predicate (inband_robust_follow_
+// gate_open, the factored gate the responder block calls) under a stale pass (fresh=false)
+// with the in-flight robust RX state, and asserts:
+//   FAIL-BEFORE (MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ=1): gate CLOSED on a stale pass -> the
+//                follow is skipped -> the re-emitted tag is dropped (the non-det miss).
+//   PASS-AFTER  (env unset): gate OPEN on a stale pass -> the follow runs deterministically.
+//   NO-REGRESSION: on a FRESH pass (fresh=true) BOTH variants gate OPEN (the fix only ADDS
+//                firings on stale passes; it never suppresses a previously-firing fresh pass).
+//   NEGATIVE GUARDS: with the feature off, or at an OFDM config, or with no in-flight batch,
+//                or with a frame already decoded, the gate stays CLOSED in BOTH variants.
+int cl_arq_controller::test_inband_robust_follow_freshwin()
+{
+	printf("[TEST-INBAND-ROBUST-FOLLOW] ===== ROBUST-TIER tag-follow must fire on STALE "
+	       "passes (deterministic climb) -- fail-before/pass-after =====\n");
+	fflush(stdout);
+
+	const char* keys[] = { "MERCURY_INBAND_RATE", "MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ" };
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key = keys[i];
+		env_saved[(size_t)i].had = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* nm){
+		printf("[TEST-INBAND-ROBUST-FOLLOW] %s: %s\n", cond?"PASS":"FAIL", nm);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+	// Production-faithful in-flight ROBUST RX state (the climb is mid-batch on a degraded
+	// channel: CMD has up-probed ROBUST_0 -> ROBUST_1 via the CONFIG_TAG; the RX is parked at
+	// ROBUST_0 with an active batch and decoded NO frame this pass).
+	auto seat_inflight_robust = [&](){
+		link_status                       = CONNECTED;
+		connection_status                 = RECEIVING;
+		passive_monitor                   = false;
+		messages_rx_buffer.status         = FREE;          // != RECEIVED (no frame this pass)
+		current_configuration             = ROBUST_0;      // !is_ofdm_config
+		rsp_current_expected_batch_seq_id = 0;             // IN-FLIGHT active batch (>=0)
+	};
+
+	// The caches resolve env ONCE; reset them before each variant so the env flip takes.
+	auto reset_caches = [&](){
+		inband_rate_enabled = -1;
+		inband_robust_follow_freshwin_required_cached = -1;
+	};
+
+	set_env("MERCURY_INBAND_RATE", "1");
+
+	// ---- FAIL-BEFORE: pre-fix gate (fresh-window REQUIRED) ----
+	set_env("MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ", "1");
+	reset_caches(); seat_inflight_robust();
+	bool fb_stale = inband_robust_follow_gate_open(/*fresh=*/false);
+	bool fb_fresh = inband_robust_follow_gate_open(/*fresh=*/true);
+	check(fb_stale == false,
+	      "FAIL-BEFORE: pre-fix gate CLOSED on a stale pass -> re-emitted CONFIG_TAG dropped "
+	      "(the non-deterministic climb miss)");
+	check(fb_fresh == true,
+	      "FAIL-BEFORE: pre-fix gate OPEN on a fresh pass (the only pass it caught the tag)");
+
+	// ---- PASS-AFTER: fixed gate (fresh-window NOT required) ----
+	set_env("MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ", "0");
+	reset_caches(); seat_inflight_robust();
+	bool fx_stale = inband_robust_follow_gate_open(/*fresh=*/false);
+	bool fx_fresh = inband_robust_follow_gate_open(/*fresh=*/true);
+	check(fx_stale == true,
+	      "PASS-AFTER: fixed gate OPEN on a stale pass -> ring-tail tag-follow runs every "
+	      "in-flight robust pass -> deterministic catch of the re-emitted CONFIG_TAG");
+	check(fx_fresh == true,
+	      "NO-REGRESSION: fixed gate still OPEN on a fresh pass (the fix only ADDS stale firings)");
+
+	// ---- NEGATIVE GUARDS (fixed gate stays CLOSED where it must) ----
+	reset_caches(); seat_inflight_robust();
+	current_configuration = CONFIG_8;   // OFDM tier -> the OFDM down-ladder owns this, not us
+	check(inband_robust_follow_gate_open(false) == false,
+	      "GUARD: CLOSED at an OFDM config (the OFDM blind down-ladder's complement)");
+
+	reset_caches(); seat_inflight_robust();
+	rsp_current_expected_batch_seq_id = -1;   // no in-flight batch
+	check(inband_robust_follow_gate_open(false) == false,
+	      "GUARD: CLOSED with no in-flight batch (rsp_current_expected_batch_seq_id < 0)");
+
+	reset_caches(); seat_inflight_robust();
+	messages_rx_buffer.status = RECEIVED;     // a frame decoded this pass
+	check(inband_robust_follow_gate_open(false) == false,
+	      "GUARD: CLOSED when a frame already decoded this pass (status == RECEIVED)");
+
+	// Feature OFF -> the whole block is unreachable (gate CLOSED regardless of state).
+	set_env("MERCURY_INBAND_RATE", "0");
+	reset_caches(); seat_inflight_robust();
+	check(inband_robust_follow_gate_open(false) == false && inband_robust_follow_gate_open(true) == false,
+	      "GUARD: feature OFF -> gate CLOSED (legacy byte-identical: caller block never runs)");
+
+	restore_env();
+	reset_caches();
+	printf("[TEST-INBAND-ROBUST-FOLLOW] %s (%d failure%s)\n",
+	       failed==0?"ALL PASS":"FAILURES", failed, failed==1?"":"s");
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
+}
+
 int cl_arq_controller::test_inband_basepattern_confirm()
 {
 	int failed = 0;

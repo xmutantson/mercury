@@ -4153,6 +4153,44 @@ bool cl_arq_controller::inband_freshwin_gate_defeat()
 	return inband_freshwin_gate_defeat_cached == 1;
 }
 
+// RESIDUAL FIX (data-flow-inband-tier-crossing.md §11). The ROBUST-TIER tag-follow must
+// check the captured ring tail on EVERY in-flight robust pass, not only fresh-window passes
+// -- inband_detect_follow_from_capture is content-discriminating and self-gating on a real
+// base-correlator presence detect, so a stale pass with no fresh tag is a cheap no-op while
+// a stale pass that DOES hold the re-emitted CONFIG_TAG burst follows it deterministically.
+// Default (env unset) -> false (fresh-window NOT required = the fix). The FAIL-BEFORE knob
+// MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ=1 restores the pre-fix gate to reproduce the
+// non-deterministic miss (test_inband_robust_follow_freshwin). Cached on first call.
+bool cl_arq_controller::inband_robust_follow_freshwin_required()
+{
+	if(inband_robust_follow_freshwin_required_cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ");
+		inband_robust_follow_freshwin_required_cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return inband_robust_follow_freshwin_required_cached == 1;
+}
+
+// RESIDUAL FIX: the ROBUST-TIER tag-follow firing predicate (factored from arq_responder.cc
+// ~:669 so the directed test drives the EXACT production gate). The ONLY behavioural change
+// vs the pre-fix gate is the fresh-window term: with the fix (default) the block runs on
+// EVERY in-flight robust pass; the pre-fix gate (MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ=1)
+// additionally requires `fresh` -> drops the re-emitted CONFIG_TAG on stale passes (the
+// non-deterministic miss). inband_detect_follow_from_capture self-gates on presence, so the
+// extra firings on stale passes with no tag are cheap no-ops. Feature-gated: off -> the
+// caller block is itself gated by inband_rate_feature_enabled() so this is unreachable.
+bool cl_arq_controller::inband_robust_follow_gate_open(bool fresh)
+{
+	return inband_rate_feature_enabled()
+	    && link_status == CONNECTED
+	    && connection_status == RECEIVING
+	    && !passive_monitor
+	    && (!inband_robust_follow_freshwin_required() || fresh)
+	    && messages_rx_buffer.status != RECEIVED
+	    && !is_ofdm_config(current_configuration)
+	    && rsp_current_expected_batch_seq_id >= 0;
+}
+
 // FIX #1d FAIL-BEFORE / A-B knob (data-flow-robust-ofdm-adopt-flush.md §11): resolve+cache
 // MERCURY_ADOPT_RING_DURABILITY_DEFEAT. When 1 the down-ladder does NOT skip a robust trial
 // while holding a fresh OFDM lock (the PRE-FIX lock-collapse behavior). Default 0 = the guard

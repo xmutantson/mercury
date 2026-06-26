@@ -811,6 +811,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_baseconfirm;
                 failed += test_baseconfirm.test_inband_basepattern_confirm();
             }
+            // RESIDUAL FIX regression (data-flow-inband-tier-crossing.md s11): the ROBUST-TIER
+            // tag-follow must fire on STALE inter-frame passes too, else the re-emitted CONFIG_TAG
+            // is dropped and the robust->OFDM tier-cross becomes non-deterministic. Drives the
+            // EXACT production gate (inband_robust_follow_gate_open). Fail-before:
+            // MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ=1. PURE in-process -- permanent regression gate.
+            {
+                cl_arq_controller test_rbfollow;
+                failed += test_rbfollow.test_inband_robust_follow_freshwin();
+            }
             // IN-BAND CONFIG_0 ROLLING-PARTIAL climb-unblock regression
             // (data-flow-inband-frame0-rolling-partial.md §4): at the inband OFDM base rung the
             // first OFDM frame of each batch fails the SKIP-VAR gate (acquisition seam) → a
@@ -944,6 +953,15 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-basepattern-confirm") == 0) {
             cl_arq_controller ARQ_bc;
             int failed = ARQ_bc.test_inband_basepattern_confirm();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-robust-follow : run ONLY the ROBUST-TIER tag-follow stale-pass
+        // regression (the residual fix that makes the robust->OFDM tier-cross deterministic)
+        // and exit. Fast + deterministic; drives the production gate inband_robust_follow_
+        // gate_open. Fail-before: MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ=1 (asserted internally).
+        if (strcmp(argv[i], "--test-inband-robust-follow") == 0) {
+            cl_arq_controller ARQ_rf;
+            int failed = ARQ_rf.test_inband_robust_follow_freshwin();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-frame0-partial : run ONLY the CONFIG_0 rolling-partial climb-unblock

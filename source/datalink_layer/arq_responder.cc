@@ -665,15 +665,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 		// On a real CRC/LDPC-bound follow the HINGE re-baselines the window and the next pass
 		// acquires ROBUST_1 + delivers. No tag present in the tail (steady state / genuine
 		// silence) -> a cheap false, no action, no BREAK. Feature-gated -> legacy byte-identical.
-		if(inband_rate_feature_enabled()
-		   && link_status == CONNECTED
-		   && connection_status == RECEIVING
-		   && !passive_monitor
-		   && (rx_fresh_window_decoded_this_pass
-		       || inband_freshwin_gate_defeat())
-		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
-		   && !is_ofdm_config(current_configuration)          // ROBUST tier (the OFDM gate's complement)
-		   && rsp_current_expected_batch_seq_id >= 0)         // IN-FLIGHT active batch only
+		// RESIDUAL FIX: the firing predicate is factored into inband_robust_follow_gate_open()
+		// so the directed regression (test_inband_robust_follow_freshwin) drives the EXACT same
+		// production gate. It DROPS the fresh-window requirement (vs the OFDM blind down-ladder)
+		// unless MERCURY_ROBUST_FOLLOW_FRESHWIN_REQ=1 restores the pre-fix (non-deterministic) gate.
+		if(inband_robust_follow_gate_open(rx_fresh_window_decoded_this_pass))
 		{
 			// bsi binding 0xFF: across a possibly-lost robust tag the RX does not track the
 			// TX bsi (mirrors the Stage-4 OFDM resync, arq_common.cc:4275). The FWHT peak +
