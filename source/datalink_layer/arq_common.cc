@@ -4348,50 +4348,52 @@ void cl_arq_controller::inband_seat_robust_ring_floor()
 		return;
 	if(inband_ofdm_acq_ring_shrunk && !is_ofdm_config(current_configuration))
 		inband_ofdm_acq_ring_shrunk = false;   // left the OFDM tier -> allow the floor to re-seat
-	// §21 FIX: the inband_ofdm_acq_ring_shrunk guard above only latches on the robust->OFDM ADOPT
-	// path (its SINGLE setter is arq_common.cc::inband_finalize_ofdm_adopt_ring). A session that
-	// STARTS at CONFIG_0 (the LOWEST OFDM config, already OFDM-locked, no prior adopt) never latches
-	// it, so the seat below grows the natural CONFIG_0 ring (217) to the ROBUST floor (~804) -> every
-	// CONFIG_0 OFDM preamble (the CMD re-airs CONFIG_0 continuously) lands at the tail beyond
-	// upper_bound -> 0 forward DATA decode (the uncovered sibling of FIX #1e;
-	// data-flow-robust-ofdm-adopt-flush.md §21).
+	// §21 FIX + RING-FLOOR-OVERSEAT GENERALIZATION (data-flow-inband-ring-floor-overseat.md):
+	// the inband_ofdm_acq_ring_shrunk guard above only latches on the robust->OFDM ADOPT path
+	// (its SINGLE setter is inband_finalize_ofdm_adopt_ring). A session that reaches an OFDM rung
+	// by ANY OTHER route — STARTS at CONFIG_0, or CLIMBS ROBUST→…→CONFIG_n via the in-band
+	// CONFIG_TAG + the legacy SET_CONFIG tier-cross — never latches it, so the seat below grows
+	// the natural OFDM ring to the ROBUST floor → every OFDM preamble lands at the tail beyond
+	// upper_bound = buffer_Nsymb−(Nsymb+preamble_nSymb) → SKIP-VAR var=garbage every batch →
+	// frame-0 loss → 24/25 → CMD-ACK-PAT miss → [BREAK] Block failure. §21 fixed ONLY the
+	// CONFIG_0-start case; the CONFIG_8-climb sibling (verified by the -x sim A/B) is the SAME
+	// over-seat at a HIGHER rung.
 	//
-	// SCOPE — why ONLY the lowest OFDM config (CONFIG_0), not every OFDM config: the floor grow EXISTS
-	// to let the OFDM-tier down-ladder read a frame from a LOWER (more-robust, larger-frame) rung that
-	// needs more physical ring than current_configuration's natural ring (the down-ladder copies the
-	// primary snapshot into each trial decoder and ZERO-PADS only the *length*, arq_common.cc:4503 —
-	// it cannot reconstruct samples a too-small primary ring never captured). At a HIGH OFDM config
-	// (e.g. CONFIG_10, natural ~128) reaching DOWN to CONFIG_0 (natural ~217) the grow is GENUINELY
-	// needed -> keep it. But CONFIG_0 is the LOWEST OFDM config: the only rungs BELOW it in the
-	// down-window are ROBUST, and a fresh OFDM lock SKIPS robust trials entirely (FIX #1d,
-	// arq_common.cc:4481). So at CONFIG_0 the grow serves NO down-ladder purpose and only breaks
-	// CONFIG_0's own continuously-re-aired acquisition. Narrowing the skip to current==CONFIG_0
-	// fixes the assigned bug while leaving the legitimate high-OFDM-config down-ladder grow intact
-	// (the sibling ADOPT-PRESERVE/DELIVER tests that seat at CONFIG_1/CONFIG_10 keep growing).
+	// SCOPE — generalize the skip to EVERY OFDM config (not just CONFIG_0). The original §21 SCOPE
+	// argued the floor grow was "genuinely needed" at a high OFDM config so the down-ladder could
+	// read a LOWER (larger-frame) rung's snapshot from the primary ring. The -x sim A/B REFUTES
+	// that: ANY ring grown beyond the CURRENT rung's natural size puts that rung's own preamble at
+	// the tail beyond upper_bound and breaks its acquisition (measured: CONFIG_8 seated to the
+	// down-window 697 STILL stormed SKIP-VAR — the grow itself, not its magnitude, is the fault).
+	// So the down-ladder's deep blind-decode reach (a SECONDARY follow path) cannot coexist with
+	// the CURRENT rung's acquisition (the BINDING need): a healthy OFDM rung MUST keep its natural
+	// ring. This is the SAME tradeoff the robust→OFDM adopt path already ships (it shrinks to
+	// natural + latches inband_ofdm_acq_ring_shrunk to suppress the re-seat); we extend it to every
+	// healthy OFDM rung. A CMD down-demote is still followed via the robust-suffix CONFIG_TAG
+	// (inband_detect_follow_from_capture, :663) — that path does NOT need the oversized primary
+	// ring. On a genuine demote BACK to a ROBUST config, is_ofdm_config() is false → this skip
+	// does NOT fire → the seat runs and grows the ring for the robust-tier down-ladder (unchanged).
 	//
-	// AUTHORITATIVE "natural ring held" signal fix #1e settled on: buffer_Nsymb_min == 0 AND the live
-	// ring at/below the natural OFDM size (a small slack absorbs the documented 212-vs-217 throwaway-
-	// vs-live skew, §14). FAIL-BEFORE A/B: MERCURY_CONFIG0_RING_GUARD_DEFEAT=1 restores the pre-fix
-	// unconditional grow on the SAME binary (reproduces the CONFIG_0-start 217->804 over-seat).
-	// Production never sets it.
+	// AUTHORITATIVE "natural ring held" signal (fix #1e): buffer_Nsymb_min == 0. This is the SOLE
+	// gate — we do NOT additionally size-compare the live ring against inband_natural_ofdm_buffer_
+	// nsymb(), because that probe builds a THROWAWAY cl_telecom_system at the DEFAULT GI, not the
+	// production 3.0ms GI, so its natural size (CONFIG_8 ~158) is FAR below the LIVE production ring
+	// (CONFIG_8 ~467) — the documented throwaway-vs-live geometry skew (§14/§21). The old size check
+	// `buffer_Nsymb <= natural+slack` therefore FALSE-NEGATIVED in production (467 > 166) and let the
+	// over-seat through (MEASURED in the -x sim A/B: the seat fired at CONFIG_8 despite the guard).
+	// buffer_Nsymb_min == 0 ALONE is the correct, skew-immune signal: it is 0 iff the robust floor is
+	// un-seated (the natural OFDM ring is held); force_set_capture_ring_natural() guarantees it
+	// (telecom_system.cc:11470) and a real robust re-seat (a ROBUST config, is_ofdm_config false ->
+	// this skip does not fire) raises it. FAIL-BEFORE A/B: MERCURY_CONFIG0_RING_GUARD_DEFEAT=1
+	// restores the pre-fix unconditional grow on the SAME binary. Production never sets it.
 	{
 		bool guard_defeat = false;
 		{ const char* e = std::getenv("MERCURY_CONFIG0_RING_GUARD_DEFEAT");
 		  if(e && *e && atoi(e) != 0) guard_defeat = true; }
 		if(!guard_defeat
-		   && current_configuration == CONFIG_0          // the LOWEST OFDM config only (see SCOPE above)
+		   && is_ofdm_config(current_configuration)      // EVERY OFDM rung (was: CONFIG_0 only)
 		   && telecom_system->data_container.buffer_Nsymb_min == 0)
-		{
-			int natural_nsymb = inband_natural_ofdm_buffer_nsymb(current_configuration);
-			// +8-symbol slack: the throwaway-instance natural probe (212) is a few symbols below the
-			// live force_set_capture_ring_natural geometry (217); accept the live ring as "natural"
-			// when it does not EXCEED the probe by more than the skew. A robust-floor-oversized ring
-			// (~804) is far above this and is (correctly) NOT treated as natural.
-			const int NATURAL_RING_SLACK = 8;
-			if(natural_nsymb > 0
-			   && telecom_system->data_container.buffer_Nsymb.load() <= natural_nsymb + NATURAL_RING_SLACK)
-				return;   // CONFIG_0-start natural OFDM geometry -> do NOT over-seat the robust floor
-		}
+			return;   // healthy OFDM rung, robust floor un-seated -> do NOT over-seat (keep natural ring)
 	}
 	// IDEMPOTENT FAST-PATH (before ANY probe cost): once the ring is seated to the warm-cached
 	// floor for the CURRENT bandwidth, the steady-state RX pass returns here doing literally

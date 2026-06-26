@@ -2289,6 +2289,14 @@ public:
   // PART C/D PASS (unchanged). Returns 0=PASS, 1=FAIL. data-flow-inband-retx-epoch.md §5.
   int test_inband_deliver();
 
+  // IN-BAND CAPTURE-RING ROBUST-FLOOR OVER-SEAT TEST (CLI --test-inband-ring-floor).
+  // Drives inband_seat_robust_ring_floor() at CONFIG_8 (a climbed OFDM rung holding its natural
+  // ring, no adopt) and ROBUST_0; asserts the seat is SUPPRESSED at the OFDM rung (ring stays
+  // natural) and STILL grows to the robust floor at ROBUST_0. The fail-before A1-FB sub-case
+  // uses MERCURY_CONFIG0_RING_GUARD_DEFEAT=1 (the §21 knob, now disabling the generalized guard)
+  // to reproduce the over-seat. Returns 0=PASS, 1=FAIL. data-flow-inband-ring-floor-overseat.md §5.
+  int test_inband_ring_floor_overseat();
+
   // STAGE 4c D5 BREAK-OBSOLETE TEST (CLI --test-inband-no-break). Synthetic-fire of the
   // COMMANDER Class-A degradation routing: PART A drives inband_route_failure_demote (the
   // body all four Class-A sites call) and asserts the link DEMOTES one rung and stays

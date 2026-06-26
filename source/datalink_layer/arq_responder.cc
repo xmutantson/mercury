@@ -9690,8 +9690,13 @@ int cl_arq_controller::test_inband_deliver()
 	// equals an uncached fresh probe (correctness preserved) and the floor still SEATS the ring
 	// on a genuine event.
 	{
+		// Use a ROBUST config: there the seat LEGITIMATELY fires (is_ofdm_config is false so the
+		// ring-floor-overseat OFDM guard does not suppress it), so the per-pass-leak + genuine-seat
+		// behaviors PART E owns are exercised on the path that actually seats. (At an OFDM rung the
+		// seat is now suppressed — that is the ring-floor-overseat fix, covered by
+		// test_inband_ring_floor_overseat.)
 		cl_telecom_system* ts = nullptr;
-		cl_arq_controller* cmd = make_cmd(CONFIG_10, &ts);   // a high-OFDM rung (small ring)
+		cl_arq_controller* cmd = make_cmd(ROBUST_0, &ts);
 		cmd->connection_status = RECEIVING;
 
 		// (1) CORRECTNESS: an UNCACHED fresh probe of the ROBUST floor Nsymb (independent of the
@@ -9708,13 +9713,13 @@ int cl_arq_controller::test_inband_deliver()
 			"E1 the (cached) ROBUST-floor Nsymb == a fresh uncached probe (value unchanged)",
 			helper_floor, fresh_floor);
 
-		// (2) GENUINE SEAT still works: the small high-OFDM ring is grown to the floor on the
+		// (2) GENUINE SEAT still works at a ROBUST config: the ring is grown to the floor on the
 		// first seat (buffer_Nsymb_min raised). This is the load-bearing behavior the cache must
 		// not break.
 		cmd->telecom_system->data_container.buffer_Nsymb_min = 0;   // un-seated start
 		cmd->inband_seat_robust_ring_floor();
 		check(cmd->telecom_system->data_container.buffer_Nsymb_min == fresh_floor,
-			"E2 the floor STILL SEATS the ring on a genuine first seat (buffer_Nsymb_min raised)",
+			"E2 the floor STILL SEATS the ring on a genuine first seat at ROBUST (buffer_Nsymb_min raised)",
 			cmd->telecom_system->data_container.buffer_Nsymb_min, fresh_floor);
 
 		// (3) THE LEAK: drive the steady-state RX seat path N times and count throwaway PHY
@@ -9937,6 +9942,173 @@ int cl_arq_controller::test_inband_deliver()
 	}
 
 	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// IN-BAND CAPTURE-RING ROBUST-FLOOR OVER-SEAT — in-process unit
+// (data-flow-inband-ring-floor-overseat.md §5)
+// ============================================================================
+//
+// CLI: --test-inband-ring-floor   (also wired into master --test).
+//
+// Reproduces the CONFIG_8-climb 24/25-BREAK root (verified by the -x sim A/B, §1):
+// inband_seat_robust_ring_floor(), called every CONNECTED+RECEIVING pass, GREW the
+// PRIMARY OFDM capture ring beyond the CURRENT rung's natural size at a CLIMBED OFDM rung
+// (CONFIG_8) that never went through the robust->OFDM adopt path (so the
+// inband_ofdm_acq_ring_shrunk latch was never set, and CONFIG_8 != the old CONFIG_0-only
+// guard). The oversized ring put every batch's frame-0 preamble at the tail beyond
+// upper_bound -> SKIP-VAR var=garbage -> frame-0 lost EVERY batch -> RSP 24/25 ->
+// CMD-ACK-PAT miss -> [BREAK] Block failure. Legacy OFF never seats -> ring stays natural.
+//
+// The fix GENERALIZES the §21 CONFIG_0 natural-ring guard to EVERY OFDM rung: at a healthy
+// OFDM config holding its natural ring, the seat is SUPPRESSED (the ring stays natural so
+// acquisition works) — the SAME tradeoff the robust->OFDM adopt path already ships. At a
+// ROBUST config the seat still grows the ring (the robust-tier down-ladder needs it).
+//
+// This drives the EXACT production seat (inband_seat_robust_ring_floor) on a throwaway
+// controller pinned at CONFIG_8 (OFDM, natural ring, no adopt) and at ROBUST_0. PURE
+// in-process, no IONOS/RF/DSP-decode.
+//
+// Asserts:
+//   A1 PASS-AFTER: at CONFIG_8 holding its NATURAL ring the seat is SUPPRESSED —
+//      buffer_Nsymb_min STAYS 0 and the live ring is NOT grown (preamble stays below
+//      upper_bound -> acquisition works). FAIL-BEFORE (MERCURY_CONFIG0_RING_GUARD_DEFEAT=1,
+//      the EXISTING §21 knob, now disabling the GENERALIZED guard): the seat over-grows the
+//      CONFIG_8 ring to the ROBUST floor -> A1 FAILS (the over-seat reproduced).
+//   A2 ROBUST_0: the seat STILL grows the ring to the robust floor (the robust-tier
+//      down-ladder ring is preserved — is_ofdm_config is false there so the OFDM guard does
+//      not fire). PASSES on both arms.
+//   A3 flag-OFF: the seat is a no-op (buffer_Nsymb_min stays 0) — legacy byte-identical.
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_inband_ring_floor_overseat()
+{
+	const char* TAG = "[TEST-INBAND-RING-FLOOR]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	const char* prev_ir = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_ir_s = prev_ir ? std::string(prev_ir) : std::string();
+	bool had_ir = (prev_ir != NULL);
+	const char* prev_gd = std::getenv("MERCURY_CONFIG0_RING_GUARD_DEFEAT");
+	std::string prev_gd_s = prev_gd ? std::string(prev_gd) : std::string();
+	bool had_gd = (prev_gd != NULL);
+	auto putenv_kv = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+
+	auto make_rx = [&](int cfg) -> cl_arq_controller* {
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE;
+		rx->telecom_system = ts;
+		rx->narrowband_enabled = NO;
+		rx->role = RESPONDER;
+		rx->robust_enabled = YES;
+		// A standalone OFDM FULL load in the --test process leaves the PHY half-initialized
+		// (no capture ring). Bring it up via a FULL ROBUST_0 load first (same as the sibling
+		// config0-start test), THEN load the OFDM rung with PHYSICAL_LAYER_ONLY (the production
+		// data-config switch) so the natural OFDM ring materializes (buffer_Nsymb_min=0).
+		rx->load_configuration(ROBUST_0, FULL, NO);
+		if(is_ofdm_config(cfg))
+		{
+			rx->load_configuration(cfg, PHYSICAL_LAYER_ONLY, YES);
+			rx->telecom_system->force_set_capture_ring_natural();   // natural OFDM geometry, min=0
+		}
+		rx->link_status = CONNECTED;
+		rx->connection_status = RECEIVING;
+		rx->inband_rate_enabled = 1;
+		// Climbed-rung signature: NEVER went through the robust->OFDM adopt, so the shrunk
+		// latch is unset (the exact precondition the bug needs).
+		rx->inband_ofdm_acq_ring_shrunk = false;
+		return rx;
+	};
+
+	// ---- feature ON ----
+	putenv_kv("MERCURY_INBAND_RATE", "1");
+
+	// A1 — CONFIG_8 (a climbed OFDM rung holding its natural ring): the seat must be SUPPRESSED.
+	{
+		putenv_kv("MERCURY_CONFIG0_RING_GUARD_DEFEAT", "");   // guard ACTIVE (pass-after)
+		cl_arq_controller* rx = make_rx(CONFIG_8);
+		rx->inband_rate_enabled = 1;   // force-resolve ON for this instance
+		long ring_before = (long)rx->telecom_system->data_container.buffer_Nsymb.load();
+		int robust_floor = rx->inband_robust_floor_buffer_nsymb();
+		check(ring_before > 0 && robust_floor > ring_before,
+			"A0 at CONFIG_8 the natural ring is SMALLER than the ROBUST floor (over-seat would grow it)",
+			ring_before, robust_floor);
+
+		rx->inband_seat_robust_ring_floor();
+		long min_after  = (long)rx->telecom_system->data_container.buffer_Nsymb_min;
+		long ring_after = (long)rx->telecom_system->data_container.buffer_Nsymb.load();
+		check(min_after == 0,
+			"A1 at a healthy CONFIG_8 the seat is SUPPRESSED (buffer_Nsymb_min stays 0, no over-seat)",
+			min_after, 0);
+		check(ring_after == ring_before,
+			"A1b the live CONFIG_8 ring is UNCHANGED (natural, acquisition preserved)",
+			ring_after, ring_before);
+		delete rx->telecom_system; delete rx;
+	}
+
+	// A1-FB — the EXISTING §21 knob now disables the GENERALIZED guard: at CONFIG_8 the seat
+	// over-grows to the ROBUST floor. This is the in-process fail-before (the bug reproduced).
+	{
+		putenv_kv("MERCURY_CONFIG0_RING_GUARD_DEFEAT", "1");   // guard DISABLED (fail-before)
+		cl_arq_controller* rx = make_rx(CONFIG_8);
+		rx->inband_rate_enabled = 1;
+		int robust_floor = rx->inband_robust_floor_buffer_nsymb();
+		rx->inband_seat_robust_ring_floor();
+		long min_after = (long)rx->telecom_system->data_container.buffer_Nsymb_min;
+		check(min_after == robust_floor,
+			"A1-FB GUARD_DEFEAT reproduces the OVER-SEAT (buffer_Nsymb_min == ROBUST floor)",
+			min_after, robust_floor);
+		putenv_kv("MERCURY_CONFIG0_RING_GUARD_DEFEAT", "");   // restore guard ACTIVE
+		delete rx->telecom_system; delete rx;
+	}
+
+	// A2 — ROBUST_0: is_ofdm_config is false -> the OFDM guard does NOT fire -> the seat grows
+	// the ring to the robust floor (the robust-tier down-ladder ring is PRESERVED).
+	{
+		cl_arq_controller* rx = make_rx(ROBUST_0);
+		rx->inband_rate_enabled = 1;
+		int robust_floor = rx->inband_robust_floor_buffer_nsymb();
+		rx->telecom_system->data_container.buffer_Nsymb_min = 0;
+		rx->inband_seat_robust_ring_floor();
+		long min_after = (long)rx->telecom_system->data_container.buffer_Nsymb_min;
+		check(min_after == robust_floor && robust_floor > 0,
+			"A2 at ROBUST_0 the seat STILL grows the ring to the robust floor (down-ladder preserved)",
+			min_after, robust_floor);
+		delete rx->telecom_system; delete rx;
+	}
+
+	// ---- A3: feature OFF -> the seat is a no-op (legacy byte-identical) ----
+	putenv_kv("MERCURY_INBAND_RATE", "");
+	{
+		cl_arq_controller* rx = make_rx(CONFIG_8);
+		rx->inband_rate_enabled = -1;   // force env re-resolve (now OFF)
+		rx->telecom_system->data_container.buffer_Nsymb_min = 0;
+		rx->inband_seat_robust_ring_floor();
+		check(rx->telecom_system->data_container.buffer_Nsymb_min == 0,
+			"A3 feature-OFF: the seat is a NO-OP (buffer_Nsymb_min stays 0, legacy byte-identical)",
+			(long)rx->telecom_system->data_container.buffer_Nsymb_min, 0);
+		delete rx->telecom_system; delete rx;
+	}
+
+	// restore env
+	putenv_kv("MERCURY_INBAND_RATE", had_ir ? prev_ir_s.c_str() : "");
+	putenv_kv("MERCURY_CONFIG0_RING_GUARD_DEFEAT", had_gd ? prev_gd_s.c_str() : "");
+
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

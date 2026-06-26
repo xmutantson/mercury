@@ -769,6 +769,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_deliver();
             }
+            // In-band capture-ring ROBUST-floor OVER-SEAT regression (the CONFIG_8-climb
+            // 24/25-BREAK root): inband_seat_robust_ring_floor over-grew the climbed OFDM
+            // ring to the ROBUST floor -> frame-0 SKIP-VAR every batch. Member test on a
+            // throwaway controller; PURE in-process synthetic-fire.
+            // data-flow-inband-ring-floor-overseat.md §5.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_ring_floor_overseat();
+            }
             // FORGIVING-ACK Tier-2 cumulative-n_r self-heal / gap-invariant / cap-gate
             // regression (the A3 predicate proof). Member test on a throwaway controller;
             // PURE in-process synthetic-fire, no IONOS/RF. data-flow-forgiving-ack.md §T2.6.
@@ -1255,6 +1264,7 @@ int main(int argc, char *argv[])
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_downladder_cli = false;  // --test-inband-downladder: down-ladder BREAK-orphan + silent-snapshot regression.
     bool test_inband_deliver_cli = false;  // --test-inband-deliver: forward-healthy reverse-ACK miss -> NO-BREAK deliver regression.
+    bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
@@ -2068,6 +2078,20 @@ int main(int argc, char *argv[])
             // discriminator is removed -> the forward-healthy miss BREAKs -> 0 deliver).
             // See arq_responder.cc test_inband_deliver + data-flow-inband-retx-epoch.md §5.
             test_inband_deliver_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-ring-floor") == 0)
+        {
+            // In-band capture-ring ROBUST-floor OVER-SEAT regression (one-shot at startup,
+            // exit rc). Drives inband_seat_robust_ring_floor() at CONFIG_8 (a climbed OFDM
+            // rung holding its natural ring, no adopt) + ROBUST_0; asserts the OFDM-rung seat
+            // is SUPPRESSED (ring stays natural) while ROBUST still seats the floor. fail-before
+            // is the in-process A1-FB sub-case via MERCURY_CONFIG0_RING_GUARD_DEFEAT=1 (the
+            // existing §21 knob now disables the generalized guard -> the over-seat reproduces).
+            // See arq_responder.cc test_inband_ring_floor_overseat +
+            // data-flow-inband-ring-floor-overseat.md §5.
+            test_inband_ring_floor_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3860,6 +3884,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_deliver();
             printf("[FLAG] Inband-deliver test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_ring_floor_cli) {
+            // In-band capture-ring ROBUST-floor OVER-SEAT regression (one-shot, exit rc).
+            // Builds its own RESPONDER/telecom_system instances per case internally.
+            printf("[FLAG] --test-inband-ring-floor: invoking in-band capture-ring "
+                   "ROBUST-floor over-seat regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_ring_floor_overseat();
+            printf("[FLAG] Inband-ring-floor test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
