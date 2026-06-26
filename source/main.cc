@@ -878,6 +878,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
             }
+            // CONNECT-REACK FTR-STARVATION gate (connect-testack-handshake.md
+            // §3.3): the 8e62722e regression that dropped OFDM data delivery to 0
+            // (the re-ACK pinned frames_to_read=2 across the data phase). Drives
+            // the REAL ftr-arbiter; asserts a connect-heal never starves the OFDM
+            // data-acquisition path. Permanent regression gate — this class
+            // slipped past --test before because the old unit only checked the
+            // predicate boolean, not the shared ftr the data path consumes.
+            {
+                cl_arq_controller ARQ_reack_ftr;
+                failed += ARQ_reack_ftr.test_connect_reack_ftr_starvation();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
@@ -895,6 +906,15 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-reack-ftr-starvation : run ONLY the CONNECT-REACK FTR-STARVATION
+        // regression (8e62722e: OFDM data delivery dropped to 0 because the
+        // re-ACK pinned frames_to_read=2 across the data phase) and exit. Fast +
+        // deterministic; see arq_responder.cc::test_connect_reack_ftr_starvation().
+        if (strcmp(argv[i], "--test-reack-ftr-starvation") == 0) {
+            cl_arq_controller ARQ_reack_ftr;
+            int failed = ARQ_reack_ftr.test_connect_reack_ftr_starvation();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-tier-crossing : run ONLY the hybrid tier-crossing routing

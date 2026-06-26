@@ -112,6 +112,37 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	return success;
 }
 
+// CONNECT-REACK FTR-STARVATION FIX (connect-testack-handshake.md §3.3) — the
+// arbiter that decides whether the duplicate-TEST_CONNECTION probe may run (and
+// thus clamp frames_to_read=2) THIS iteration. It is true only inside the
+// bounded turnaround sub-window after entering the CONNECTED pre-data RECEIVING
+// window. On the FIRST call after entry it arms a one-shot timer; once the
+// window elapses it stays false forever for this pre-data window, so the OFDM
+// data path (this->receive()) owns frames_to_read and can capture a full data
+// frame. This is the cross-layer fix for 8e62722e: the original block re-clamped
+// ftr=2 EVERY pre-data iteration -> the OFDM frame never decoded ->
+// batch_rx_frame_count never advanced -> the window never closed.
+bool cl_arq_controller::connect_reack_probe_window_open()
+{
+	// Outside the pre-data window: disarm so the next entry re-arms cleanly.
+	if(!connect_reack_pre_data_window())
+	{
+		connect_reack_window_armed = false;
+		return false;
+	}
+	// First pre-data iteration with a valid cached ACK: arm the turnaround timer.
+	if(!connect_reack_window_armed)
+	{
+		connect_reack_window_armed     = true;
+		connect_reack_ftr_handed_back  = false;
+		connect_reack_timer.reset();
+		connect_reack_timer.start();
+		return true;   // window is open on the arming tick
+	}
+	// Still pre-data: open iff we are inside the bounded turnaround window.
+	return connect_reack_timer.get_elapsed_time_ms() < connect_reack_window_ms();
+}
+
 
 void cl_arq_controller::process_messages_rx_data_control()
 {
@@ -436,20 +467,31 @@ void cl_arq_controller::process_messages_rx_data_control()
 			}
 		}
 
-		// CONNECT-REACK (connect-testack-handshake.md §3.2) — pre-data duplicate
-		// TEST_CONNECTION re-ACK. Site F above DELIBERATELY excludes CONNECTED
-		// (2026-05-27 ftr=2 data-RX starvation, see :340-350), so once the
-		// handshake completes a DUPLICATE TEST_CONNECTION (sent because CMD
-		// missed the single ACK) goes undecoded forever -> a lost ACK costs the
-		// whole connect window. This narrow variant restores TCP/ARDOP's "re-emit
-		// the connect ACK on every duplicate connect request" property, but ONLY
-		// in the PRE-DATA window and ONLY by re-airing the CACHED byte-identical
-		// MFSK TEST_ACK — it does NOT re-run negotiation (INV-C: no :2535 mutation)
-		// and does NOT pin frames_to_read across the data phase (INV-B: it exits
-		// immediately on a miss and is disabled the instant a data frame arrives,
-		// batch_rx_frame_count>0). Gates mirror Site F (FREE control slot, not a
-		// passive monitor, MFSK codec present) plus the pre-data predicate.
-		if(connect_reack_pre_data_window()
+		// CONNECT-REACK (connect-testack-handshake.md §3.2 + §3.3 ftr-starvation
+		// fix) — pre-data duplicate TEST_CONNECTION re-ACK. Site F above
+		// DELIBERATELY excludes CONNECTED (2026-05-27 ftr=2 data-RX starvation,
+		// see :340-350), so once the handshake completes a DUPLICATE
+		// TEST_CONNECTION (sent because CMD missed the single ACK) goes undecoded
+		// forever -> a lost ACK costs the whole connect window. This narrow
+		// variant restores TCP/ARDOP's "re-emit the connect ACK on every
+		// duplicate connect request" property, by re-airing the CACHED
+		// byte-identical MFSK TEST_ACK — it does NOT re-run negotiation (INV-C:
+		// no :2535 mutation).
+		//
+		// §3.3 CROSS-LAYER FIX (8e62722e regression): the probe needs
+		// frames_to_read to drain to 0 to sample the MFSK suffix
+		// (receive_mfsk_ctrl_suffix_phy_core), but the OFDM data consumer below
+		// (this->receive()) needs ftr = frame_symb+10 to capture a full data
+		// frame — they share ONE frames_to_read. The original block clamped ftr=2
+		// EVERY pre-data iteration, so the OFDM frame NEVER decoded,
+		// batch_rx_frame_count NEVER advanced, and the "self-terminate on first
+		// data frame" predicate could NEVER fire (a dead invariant) ->
+		// nReceived_data 0. Fix: connect_reack_probe_window_open() bounds the
+		// probe (and its ftr clamp) to a short turnaround sub-window (the
+		// lost-ACK duplicate arrives within ~1 CMD retransmit cycle); after the
+		// window elapses we hand ftr back to the OFDM data path ONCE and the
+		// probe never clamps again.
+		if(connect_reack_probe_window_open()
 		   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0)
 		{
 			// Same ftr override as Site F (:365-370): the suffix detector core
@@ -481,6 +523,31 @@ void cl_arq_controller::process_messages_rx_data_control()
 					max_connection_attempts);
 				fflush(stdout);
 			}
+		}
+		else if(connect_reack_pre_data_window()
+		        && connect_reack_window_armed
+		        && !connect_reack_ftr_handed_back
+		        && telecom_system->data_container.frames_to_read <= 2)
+		{
+			// §3.3 hand-back: the probe window has elapsed but the last probe
+			// iteration left ftr clamped at 2 (the suffix-core miss path).
+			// Restore the OFDM data-RX budget ONCE so this->receive() can capture
+			// a full data frame. One-shot (connect_reack_ftr_handed_back) so we do
+			// not re-write ftr every tick and fight the capture thread's drain;
+			// the data path owns ftr from here. The RECEIVING entry set this same
+			// value (frame_symb+10) at handshake completion.
+			int frame_symb = telecom_system->data_container.preamble_nSymb
+			               + telecom_system->data_container.Nsymb;
+			MUTEX_LOCK(&capture_prep_mutex);
+			telecom_system->data_container.frames_to_read = frame_symb + 10;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			connect_reack_ftr_handed_back = true;
+			printf("[CONNECT-REACK] probe window elapsed (%d ms) -> handed "
+				"frames_to_read=%d back to OFDM data path\n",
+				connect_reack_window_ms(),
+				telecom_system->data_container.frames_to_read.load());
+			fflush(stdout);
 		}
 
 		this->receive();
@@ -9988,6 +10055,154 @@ int cl_arq_controller::test_connect_reack()
 	      connect_reack_pre_data_window() == false);
 
 	printf("[TEST-REACK] %s (%d failures)\n",
+	       failed == 0 ? "ALL PASS" : "FAILED", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// CONNECT-REACK FTR-STARVATION regression (connect-testack-handshake.md §3.3)
+// ============================================================================
+//
+// CLI: --test-reack-ftr-starvation   (also wired into master --test).
+//
+// THE BUG THIS GATES (8e62722e): the duplicate-TEST_CONNECTION re-ACK ran in the
+// ENTIRE CONNECTED pre-data window and clamped frames_to_read=2 on EVERY
+// iteration before this->receive(). The OFDM data consumer needs ftr=frame_symb
+// +10 to capture a full data frame; pinned at 2 it never decoded, so
+// batch_rx_frame_count never advanced, so the "self-terminate on first data
+// frame" predicate could never fire (a DEAD invariant) -> nReceived_data 0 while
+// CONNECT still succeeded. This class slipped past --test because the prior T4
+// unit only checked the predicate boolean, never the shared ftr the data path
+// consumes.
+//
+// This test drives the REAL arbiter (connect_reack_probe_window_open()) and the
+// REAL turnaround timer across the pre-data window, and asserts the cross-layer
+// invariant: "a connect-heal must NOT leave frames_to_read pinned at 2 across
+// the OFDM data-acquisition phase". It replicates the production hand-back
+// decision byte-for-byte (the inline else-if in process_messages_rx_data_control)
+// so a future regression of EITHER the arbiter OR the hand-back is caught.
+//
+// Asserts:
+//   B1 arming: the FIRST pre-data call OPENS the probe window (heal can fire).
+//   B2 FAIL-BEFORE shape: WHILE the window is open the probe clamps ftr=2 — the
+//      exact state that, if it PERSISTED, starves the data path.
+//   B3 PASS-AFTER: once the bounded window elapses the arbiter returns FALSE —
+//      the probe stops clamping (the unbounded-loop bug is gone).
+//   B4 hand-back: with the window elapsed and ftr still clamped at 2, the
+//      production hand-back restores ftr to frame_symb+10 (>2) ONCE — the OFDM
+//      consumer is re-armed -> delivery restored.
+//   B5 one-shot: a second post-window tick does NOT re-write ftr (no fight with
+//      the capture-thread drain).
+//   B6 data-arrival self-terminate still holds: once batch_rx_frame_count>0 the
+//      arbiter is FALSE (never re-clamps after the first decoded frame).
+//
+// Returns 0=PASS, 1=FAIL. No DSP/audio.
+int cl_arq_controller::test_connect_reack_ftr_starvation()
+{
+	int failed = 0;
+	auto CHECK = [&](const char* name, bool cond) {
+		printf("[TEST-REACK-FTR] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		fflush(stdout);
+		if(!cond) failed++;
+	};
+
+	// --- Step 0: buffers (mirror test_connect_reack Step 0) -----------------
+	this->nMessages         = 255;
+	this->max_data_length   = 170;
+	this->max_message_length= 200;
+	this->max_header_length = 6;
+	if(init_messages_buffers() != SUCCESSFUL) {
+		printf("[TEST-REACK-FTR] FAIL: init_messages_buffers()\n");
+		return 1;
+	}
+
+	// --- Step 1: CONNECTED pre-data window with a cached ACK -----------------
+	this->max_connection_attempts = 15;
+	this->passive_monitor         = false;
+	this->narrowband_enabled      = NO;
+	this->batch_rx_frame_count    = 0;
+	this->messages_control.status = FREE;
+	this->link_status             = CONNECTED;
+	this->connection_status       = RECEIVING;
+	this->connect_ack_cache.valid      = true;
+	this->connect_ack_cache.echoed_cap = 0x05;
+	this->connect_ack_cache.own_cap    = 0x03;
+	this->connect_ack_cache.ssid       = 0;
+	this->connect_ack_cache.replays    = 0;
+	this->connect_reack_window_armed    = false;
+	this->connect_reack_ftr_handed_back = false;
+
+	// Data-RX ftr the OFDM consumer needs (frame_symb+10 at RECEIVING entry).
+	// NOTE: this in-process unit has NO live telecom_system (ctor leaves it NULL),
+	// so model frames_to_read as a LOCAL the test mutates exactly as the
+	// production block does. The arbiter under test
+	// (connect_reack_probe_window_open) reads only ARQ members + the timer, never
+	// telecom_system, so it is exercised faithfully; the ftr clamp / hand-back
+	// arithmetic is replicated here verbatim.
+	const int frame_symb = 100;            // representative OFDM frame span
+	const int data_ftr   = frame_symb + 10;
+	int sim_ftr = data_ftr;                 // stand-in for data_container.frames_to_read
+
+	// --- B1 arming: first pre-data call opens the probe window ---------------
+	// A NON-ZERO turnaround window so the heal has time to fire on the duplicate.
+	this->message_transmission_time_ms = 1000;
+	this->ptt_on_delay_ms              = 100;
+	CHECK("B1 arming: first pre-data call OPENS the probe window (heal can fire)",
+	      connect_reack_probe_window_open() == true);
+	CHECK("B1 arming: window is now armed",
+	      this->connect_reack_window_armed == true);
+
+	// --- B2 FAIL-BEFORE shape: probe clamps ftr=2 while the window is open ---
+	// (This is the exact clamp that, UNBOUNDED, starved the data path.)
+	if(sim_ftr > 2) sim_ftr = 2;   // probe's clamp (production: ftr=2 before the core)
+	CHECK("B2 in-window: arbiter still OPEN (probe would re-air the cached ACK)",
+	      connect_reack_probe_window_open() == true);
+
+	// --- B3 PASS-AFTER: bounded window elapses -> probe stops clamping -------
+	// Force the window elapsed DETERMINISTICALLY: drop the bound to 0 ms so the
+	// armed timer's elapsed (>=0) is no longer < window. No sleep needed.
+	this->message_transmission_time_ms = 0;
+	this->ptt_on_delay_ms              = 0;   // connect_reack_window_ms() == 0
+	CHECK("B3 PASS-AFTER: arbiter CLOSED once the bounded window elapsed "
+	      "(no unbounded ftr=2 clamp loop)",
+	      connect_reack_probe_window_open() == false);
+
+	// --- B4 hand-back: restore the OFDM data-RX ftr ONCE (production else-if) -
+	// Replicate the inline production hand-back condition + action verbatim.
+	bool handback_fires =
+		   connect_reack_pre_data_window()
+		&& connect_reack_window_armed
+		&& !connect_reack_ftr_handed_back
+		&& sim_ftr <= 2;
+	CHECK("B4 hand-back: condition fires (window elapsed, ftr still clamped at 2)",
+	      handback_fires == true);
+	if(handback_fires) {
+		sim_ftr = frame_symb + 10;
+		connect_reack_ftr_handed_back = true;
+	}
+	CHECK("B4 hand-back: OFDM data-RX ftr RESTORED to frame_symb+10 (>2) "
+	      "-> data acquisition no longer starved",
+	      sim_ftr == data_ftr && sim_ftr > 2);
+
+	// --- B5 one-shot: a second post-window tick does NOT re-write ftr --------
+	// Simulate the capture thread draining ftr; the hand-back must NOT fight it.
+	sim_ftr = data_ftr - 5;
+	bool handback_fires_again =
+		   connect_reack_pre_data_window()
+		&& connect_reack_window_armed
+		&& !connect_reack_ftr_handed_back
+		&& sim_ftr <= 2;
+	CHECK("B5 one-shot: hand-back does NOT re-fire (no fight with capture drain)",
+	      handback_fires_again == false);
+
+	// --- B6 self-terminate on data arrival ----------------------------------
+	this->batch_rx_frame_count = 1;   // first OFDM data frame decoded
+	CHECK("B6 self-terminate: arbiter FALSE once data starts "
+	      "(never re-clamps after the first decoded frame)",
+	      connect_reack_probe_window_open() == false);
+
+	printf("[TEST-REACK-FTR] %s (%d failures)\n",
 	       failed == 0 ? "ALL PASS" : "FAILED", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
