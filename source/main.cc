@@ -778,6 +778,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_ring_floor_overseat();
             }
+            // Option B compact coded reverse-confirm LIVE RX-PATH regression
+            // (data-flow-compact-confirm.md §9): the self-validating compact confirm
+            // must be accepted via its OWN CRC-gated decode, DECOUPLED from the bare
+            // 7/16 presence gate that under-peaks the shorter 26-sym frame. Drives the
+            // FULL live RX path (passband -> capture ring -> the production accept
+            // predicate cmd_compact_confirm_live_accept), NOT a direct decoder call.
+            // Member test on a throwaway controller; PURE in-process synthetic-fire.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_compact_confirm_live_rx_path();
+            }
             // FORGIVING-ACK Tier-2 cumulative-n_r self-heal / gap-invariant / cap-gate
             // regression (the A3 predicate proof). Member test on a throwaway controller;
             // PURE in-process synthetic-fire, no IONOS/RF. data-flow-forgiving-ack.md §T2.6.
@@ -1242,6 +1253,9 @@ int main(int argc, char *argv[])
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
                                         // must NOT drop popped bytes when the non-blocking app socket back-pressures.
                                         // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
+    bool test_compact_confirm_rx_cli = false; // --test-compact-confirm-rx: Option B compact confirm LIVE RX path.
+                                        // The self-validating compact confirm must accept via its own CRC-gated decode,
+                                        // decoupled from the bare 7/16 gate that under-peaks the 26-sym frame. One-shot, exits rc.
     bool test_gap_abort_cli = false;    // --test-gap-abort: FIX-8 — silent lost-batch GAP on post-reset re-adopt.
                                         // Reproduces bench-4 (deliver 0-4, BREAK reset with 5-7 undelivered, present 8):
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
@@ -1988,6 +2002,16 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // source/datalink_layer/test_rx_drain.cc + fix6/STALL_ROOTCAUSE.md.
             test_rx_drain_backpressure_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-compact-confirm-rx") == 0)
+        {
+            // Option B compact confirm LIVE RX-PATH regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // source/datalink_layer/test_compact_confirm_rx.cc +
+            // fact-documents/data-flow-compact-confirm.md §9.
+            test_compact_confirm_rx_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3797,6 +3821,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_rx_drain_backpressure();
             printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_compact_confirm_rx_cli) {
+            // Option B compact confirm LIVE RX-PATH regression (one-shot, then exit rc).
+            printf("[FLAG] --test-compact-confirm-rx: invoking Option B compact "
+                   "confirm live RX-path regression\n");
+            fflush(stdout);
+            cl_arq_controller test_arq;
+            int rc = test_arq.test_compact_confirm_live_rx_path();
+            printf("[FLAG] compact-confirm-rx test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -898,6 +898,45 @@ public:
   // cross-validate the other.
   bool cmd_compact_confirm_crc_valid();
 
+  // Option B clean DATA-ACK accept arm (the SHARED predicate consumed by the
+  // "Data ACK pattern detected" else-if in process_messages_commander, and driven
+  // directly by test_compact_confirm_live_rx_path). Returns true iff a CLEAN data
+  // ACK is acceptable THIS poll on the bare-arm path (outside the SACK window).
+  //
+  // ROOT-CAUSE FIX (data-flow-compact-confirm.md §9): the compact confirm is a
+  // SELF-VALIDATING frame (its own 16-sym base detect + GF(16) soft-decode + CRC12
+  // over [bsi] + bsi-in-window, all inside cmd_compact_confirm_crc_valid()). It must
+  // be tried DECOUPLED from receive_ack_pattern() — the CRC-less bare 7/16 presence
+  // gate that exists ONLY to protect the legacy bare ACK. The 26-sym compact frame
+  // the bare gate's 8-symbol energy pre-gate misses (the §9 defect) so gating the compact
+  // decode behind it (the old `receive_ack_pattern() && (...compact...)` chain)
+  // missed every confirm. The CRC12 — not the bare count — is the false-confirm
+  // protection for the compact path, so decoupling does NOT re-open false-confirm.
+  // On a compact accept the ring is advanced via commit_ack_pattern_consumed() (the
+  // bare gate's frames_to_read=4 that the compact path now bypasses).
+  //
+  // The legacy bare ACK arm (receive_ack_pattern() + WB CRC content gate
+  // cmd_clean_data_ack_crc_valid()) is UNCHANGED.
+  //   sack_window_open  : the caller's local SACK-window flag (the bare arm is
+  //                       outside the SACK window — passed in, not a member).
+  //   compact_enabled   : ARQ_COMPACT_CONFIRM_ENABLE in production; the test forces
+  //                       true to exercise the wiring with the master gate held off.
+  //   use_legacy_chain  : FAIL-BEFORE only — restore the OLD compact-behind-bare-gate
+  //                       order so the test can reproduce the missed confirm.
+  bool cmd_compact_confirm_live_accept(bool sack_window_open,
+                                       bool compact_enabled,
+                                       bool use_legacy_chain = false);
+
+  // Option B compact coded reverse-confirm LIVE RX-PATH regression (CLI
+  // --test-compact-confirm-rx; also in `--test`). Drives the FULL live RX path
+  // (passband -> commander capture ring -> the production accept predicate
+  // cmd_compact_confirm_live_accept), NOT a direct decoder call. FAIL-BEFORE
+  // (use_legacy_chain via MERCURY_COMPACT_RX_FAILBEFORE=1): the compact frame is
+  // rejected by the bare 7/16 gate. PASS-AFTER: accepted via its own CRC-gated
+  // decode; ACK+SACK still accepts; noise/out-of-window/cross-frame all reject.
+  // source/datalink_layer/test_compact_confirm_rx.cc. Returns 0 PASS / 1 FAIL.
+  int test_compact_confirm_live_rx_path();
+
   // Phantom-ACK content-gate synthetic-fire test (CLI --test-phantom-ack-gate).
   // Drives the PURE acceptance policy (data_ack_bare_pattern_acceptable) across
   // the WB/NB x CRC-valid/CRC-absent matrix AND asserts the cross-layer invariant

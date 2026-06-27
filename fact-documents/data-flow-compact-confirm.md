@@ -150,3 +150,90 @@ C9 audit COMPLETE. Disambiguation resolved (content-gate, base-pattern-first, se
 K=5 state). Build proceeds with the physically-separate-K=5-graph design (§5). Paired
 regression tests: test_compact_confirm_cliff_sweep (BER), byte-identical-when-off,
 FAR-on-noise, and a state-machine clean→compact→accept / partial→SACK→no-false-clean.
+
+## §9 LIVE RX-PATH defect: the bare-pattern gate's 8-symbol pre-gate (2026-06-27)
+
+The codec is sim-proven, but the LIVE commander REJECTED the compact confirm. The
+in-process roundtrip test (test_compact_confirm_passband_roundtrip_clean) PASSED only
+because it called `decode_compact_confirm_from_passband()` DIRECTLY — it bypassed the
+live commander accept gate.
+
+### §9.1 The wiring bug
+The commander accept gate (arq_commander.cc, the "Data ACK pattern detected" else-if)
+gated the compact decode BEHIND the bare-pattern presence gate:
+```
+!sack_window_open && receive_ack_pattern()
+                  && ( ... || (ARQ_COMPACT_CONFIRM_ENABLE && cmd_compact_confirm_crc_valid()) || ...)
+```
+`receive_ack_pattern()` is a CRC-LESS 7/16 base-pattern presence gate whose only job is
+to protect the legacy bare ACK. When it short-circuits FALSE, the self-validating
+`cmd_compact_confirm_crc_valid()` (its OWN 16-sym base detect + GF(16) soft-decode +
+CRC12 over [bsi] + bsi-in-window) is NEVER reached → every confirm missed.
+
+### §9.2 The TRUE mechanism (corrected — bench-claim guard)
+The original hypothesis ("the bare correlator under-PEAKS the shorter 26-sym frame,
+4-5/16") was NOT reproduced. The clean-room sweep (test_compact_confirm_live_rx_path,
+the DIAG lines) shows the in-window correlator peak is **16/16 for BOTH** the 26-sym
+compact AND the 29-sym ACK+SACK frame — the base 16-sym pattern is byte-identical
+(both call `generate_ack_pattern`). The real defect is `receive_ack_pattern()`'s
+**8-symbol ENERGY PRE-GATE** (arq_common.cc, `probe_n = 8*sym_samples` in production):
+it probes ONLY the last 8 symbols of the tail for energy before running the FFT
+correlator. When the reverse confirm lands EARLIER in the tail window — which the live
+capture-prep timing does (inter-Pi clock drift + PTT/turnaround drain scroll
+post-frame idle silence in behind the frame before the frames_to_read==0 snapshot) —
+that 8-symbol probe reads SILENCE and SKIPS the correlator → bare gate returns FALSE
+though the frame is fully present. Measured phase tolerance over a 31-phase sweep
+(post-frame silence 0..30 sym):
+
+| detector | accepts |
+|---|---|
+| bare presence gate (receive_ack_pattern, 8-sym pre-gate) | 8 / 31 phases |
+| self-validating compact decode (cmd_compact_confirm_crc_valid, full-tail correlator) | 17 / 31 phases |
+
+So the bare gate is PHASE-FRAGILE (the 8-sym pre-gate is a production CPU optimization
+that assumes the prep thread leaves a fresh ACK in the newest symbols); the compact
+decode has no pre-gate and finds the frame across >2× the phases. The legacy ACK+SACK
+ACK survives because its acceptance ALSO goes through receive_ack_pattern() — it is the
+SAME pre-gate fragility, just masked because a missed clean ACK falls back to a SACK
+window / timeout-retx; the compact confirm had no such fallback (it was a one-shot).
+
+### §9.3 The fix (root cause, not band-aid)
+Extract the bare/compact arm into ONE shared predicate
+`cl_arq_controller::cmd_compact_confirm_live_accept(sack_window_open, compact_enabled,
+use_legacy_chain=false)` (arq_commander.cc). It tries the SELF-VALIDATING compact
+confirm FIRST, DECOUPLED from receive_ack_pattern(); on accept it advances the ring via
+`commit_ack_pattern_consumed()` (the frames_to_read=4 the bare gate's accept branch
+would have done). The legacy bare ACK arm (receive_ack_pattern() + WB content gate
+cmd_clean_data_ack_crc_valid()) is UNCHANGED. The bare 7/16 presence gate is NOT
+weakened (no threshold band-aid) — the CRC12 over [bsi] is the false-confirm protection
+for the decoupled compact path. compact_enabled = ARQ_COMPACT_CONFIRM_ENABLE (held off)
+⇒ byte-identical to the legacy bare arm when 0.
+
+### §9.4 Invariants re-verified by the fix
+- I3 / I5 (false-confirm): RE-VERIFIED on the live path — noise tail REJECTED;
+  out-of-window bsi REJECTED (bsi-in-window gate); a 13-uncoded ACK+SACK does NOT
+  cross-validate as a compact confirm (different CRC fields). The decoupling moves the
+  protection from the bare 7/16 count to the CRC12 — STRICTER, not weaker.
+- Ring advance: the compact accept now calls commit_ack_pattern_consumed() (it used to
+  ride the bare gate's frames_to_read=4). No un-consumed-ring regression.
+- Legacy ACK+SACK / bare ACK / control-ACK / BREAK paths: receive_ack_pattern()
+  itself is UNTOUCHED → byte-identical.
+
+### §9.5 Test
+`test_compact_confirm_live_rx_path` (source/datalink_layer/test_compact_confirm_rx.cc,
+CLI --test-compact-confirm-rx; runs in `--test`). Drives the FULL live RX path
+(passband → commander capture ring → cmd_compact_confirm_live_accept). FAIL-BEFORE
+(MERCURY_COMPACT_RX_FAILBEFORE=1, same binary): the compact confirm is REJECTED at the
+defect phase (rc=1). PASS-AFTER (default): accepted via the decoupled CRC-gated decode;
+the in-window phase still accepts in both arms; ACK+SACK still accepts; noise +
+out-of-window + cross-frame all reject (rc=0, 9/9). The DIAG lines print the 16/16
+in-window peak and the 8/31-vs-17/31 phase-tolerance evidence.
+
+### §9.6 Follow-up [?]
+The 8-symbol pre-gate phase fragility is GENERAL (it also clips the legacy clean ACK's
+phase tolerance, masked only by the SACK/timeout fallback). A separate, larger fix —
+widening or removing the production 8-symbol pre-gate (it is a CPU optimization, and the
+full-tail correlator already runs) — would harden ALL reverse-ACK detection, not just
+the compact confirm. Tracked here as an open lever, NOT folded into this fix (scope:
+this fix decouples the self-validating confirm; the pre-gate widening touches every
+receive_ack_pattern() caller and needs its own CPU-budget + FAR audit).

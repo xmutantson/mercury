@@ -240,6 +240,92 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid()
 #endif
 }
 
+// Option B clean DATA-ACK accept arm — the SHARED predicate the "Data ACK pattern
+// detected" else-if consumes, extracted so production and the live-RX regression
+// (test_compact_confirm_live_rx_path) drive ONE copy (no comment/code drift).
+//
+// ROOT-CAUSE FIX (data-flow-compact-confirm.md §9). The OLD wiring gated the
+// self-validating compact confirm BEHIND the CRC-less bare-pattern presence gate:
+//   receive_ack_pattern() && (... || (compact_enabled && cmd_compact_confirm_crc_valid()) || ...)
+// receive_ack_pattern() has an 8-SYMBOL ENERGY PRE-GATE (it probes only the last 8
+// symbols of the tail for energy before running the FFT correlator). When the reverse
+// confirm lands EARLIER in the tail window — which the live capture-prep timing does
+// (inter-Pi clock drift + PTT/turnaround drain scroll post-frame idle silence in
+// behind the frame before the frames_to_read==0 snapshot fires) — that probe reads
+// SILENCE, SKIPS the correlator, and returns FALSE even though the frame is fully
+// present. So cmd_compact_confirm_crc_valid() is never reached -> every confirm missed
+// -> BREAK / false-confirm storm. (Verified, NOT assumed: the IN-WINDOW correlator
+// peak is 16/16 for BOTH the 26-sym compact AND the 29-sym ACK+SACK frame — the base
+// 16-sym pattern is byte-identical, both call generate_ack_pattern. Over a 31-phase
+// sweep the bare gate accepts 8 phases, the full-tail compact decode 17 — the bare
+// gate's 8-sym pre-gate is phase-FRAGILE, it is not a correlator peak deficiency on
+// the shorter frame. See test_compact_confirm_live_rx_path DIAG.)
+//
+// FIX: the compact confirm carries CRC12 (over [bsi]) and runs its OWN 16-sym base
+// detect + GF(16) soft-decode + bsi-in-window check inside cmd_compact_confirm_crc_valid().
+// That is the self-validation the bare ACK lacks, so the compact path is tried FIRST,
+// DECOUPLED from receive_ack_pattern(). The CRC12 (not the 7/16 count) is the
+// false-confirm protection, so this does NOT weaken the bare-pattern gate for the
+// legacy bare ACK and does NOT re-open false-confirm (the no-cross-validate invariant
+// holds: the compact CRC12 over [bsi] cannot validate a 13-uncoded [bsi||bitmap] ACK).
+// On a compact accept we advance the ring via commit_ack_pattern_consumed() — the
+// frames_to_read=4 bookkeeping that receive_ack_pattern() would have done and that the
+// decoupled compact path now bypasses.
+//
+// The legacy bare ACK arm (receive_ack_pattern() + the WB CRC content gate
+// cmd_clean_data_ack_crc_valid()) is UNCHANGED — byte-identical when compact_enabled
+// is false (ARQ_COMPACT_CONFIRM_ENABLE==0, the held-off default).
+bool cl_arq_controller::cmd_compact_confirm_live_accept(bool sack_window_open,
+                                                        bool compact_enabled,
+                                                        bool use_legacy_chain)
+{
+#if MFSK_ACK_SACK_ENABLED
+	// The bare-arm path is OUTSIDE the SACK window (inside the window the lenient
+	// bare match false-fires on OFDM SACK_RSP body audio — see the §8 silent-drop
+	// note). Identical guard to the production else-if (sack_window_open is a caller
+	// local, passed in).
+	if(sack_window_open)
+		return false;
+
+	const bool suffix_capable =
+		(telecom_system->ack_mfsk.ack_sack_suffix_len() > 0);
+
+	if(use_legacy_chain)
+	{
+		// FAIL-BEFORE (test/diagnostic only): the OLD compact-behind-bare-gate order.
+		// Reproduces the missed confirm — when the frame sits earlier in the tail,
+		// receive_ack_pattern()'s 8-symbol energy pre-gate reads silence and returns
+		// FALSE, so the compact CRC decode is never reached.
+		return receive_ack_pattern()
+		       && (!suffix_capable
+		           || (compact_enabled && cmd_compact_confirm_crc_valid())
+		           || cmd_clean_data_ack_crc_valid());
+	}
+
+	// PASS-AFTER (production): try the SELF-VALIDATING compact confirm FIRST,
+	// decoupled from the bare-pattern presence gate. cmd_compact_confirm_crc_valid()
+	// does its own tail snapshot + base detect + GF(16) soft-decode + CRC12 +
+	// bsi-in-window, so the bare 7/16 count never gates it.
+	if(compact_enabled && cmd_compact_confirm_crc_valid())
+	{
+		// Advance the ring the same way the bare gate's accept branch would
+		// (frames_to_read=4). The compact peek is read-only (no frames_to_read
+		// mutation), so without this the ring would be left un-consumed.
+		commit_ack_pattern_consumed();
+		return true;
+	}
+
+	// Legacy bare ACK arm — UNCHANGED. The bare-pattern presence gate protects the
+	// CRC-less bare ACK; on WB (suffix-capable) it is content-gated by
+	// cmd_clean_data_ack_crc_valid().
+	return receive_ack_pattern()
+	       && (!suffix_capable || cmd_clean_data_ack_crc_valid());
+#else
+	(void)compact_enabled; (void)use_legacy_chain;
+	return false;
+#endif
+}
+
 // Option B (data-anchored gearshift promotion, 2026-05-29): floor a raw BREAK
 // recovery target at last_data_viable_config so BREAK never drops BELOW the
 // highest rung that has carried data this session. EXCEPTION: the panic-jump
@@ -4349,12 +4435,20 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// other (the false-confirm invariant; test_compact_confirm_no_cross_validate).
 			// Gated OFF until the faithful real-audio re-verify (the predicate compiles
 			// to the unchanged condition when ARQ_COMPACT_CONFIRM_ENABLE==0).
+			// SHARED-PREDICATE FIX (data-flow-compact-confirm.md): the bare/compact data-ACK
+			// arm is now cmd_compact_confirm_live_accept() - it tries the SELF-VALIDATING
+			// compact confirm FIRST, DECOUPLED from receive_ack_pattern()'s CRC-less bare
+			// 7/16 presence gate (whose 8-symbol energy pre-gate misses the confirm when it
+			// the compact CRC decode behind it missed every confirm), then falls back to the
+			// legacy bare-pattern + WB CRC content gate (UNCHANGED). compact_enabled =
+			// ARQ_COMPACT_CONFIRM_ENABLE (held off) => byte-identical to the legacy bare arm
+			// when 0. The v2 pre-detect short-circuit is preserved (evaluated first, no side
+			// effects). The two CRC12s are over different fields so neither cross-validates
+			// the other (false-confirm invariant; test_compact_confirm_live_rx_path).
 			else if(data_ack_received==NO
 			        && (v2_ack_pat_pre_detected
-			            || (!sack_window_open && receive_ack_pattern()
-			                && (telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0
-			                    || (ARQ_COMPACT_CONFIRM_ENABLE && cmd_compact_confirm_crc_valid())
-			                    || cmd_clean_data_ack_crc_valid()))))
+			            || cmd_compact_confirm_live_accept(sack_window_open,
+			                                               ARQ_COMPACT_CONFIRM_ENABLE != 0)))
 			{
 				printf("[CMD-ACK-PAT] Data ACK pattern detected!\n");
 				fflush(stdout);

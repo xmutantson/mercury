@@ -402,6 +402,7 @@ source/datalink_layer/arq_common.cc
 source/datalink_layer/arq_responder.cc
 source/datalink_layer/test_bigblock_arq_unit.cc
 source/datalink_layer/test_rx_drain.cc
+source/datalink_layer/test_compact_confirm_rx.cc
 source/datalink_layer/b2f_handler.cc
 source/datalink_layer/channel_state_lookup.cc
 source/datalink_layer/datalink_config.cc
