@@ -189,7 +189,7 @@ static uint16_t cmd_compact_crc12_cb(void* ctx, const unsigned char* data, int n
 // cmd_clean_data_ack_crc_valid; differences: shorter capture window (16+10 vs
 // 16+max(8,13)), decode via decode_compact_confirm_from_passband, CRC12 over the
 // single [bsi] byte (gated INSIDE soft_decode_compact), CLEAN/all-ones implicit.
-bool cl_arq_controller::cmd_compact_confirm_crc_valid()
+bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 {
 #if MFSK_ACK_SACK_ENABLED
 	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
@@ -234,8 +234,101 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid()
 
 	// CLEAN-batch implicit: a compact confirm MEANS all-ones (the responder only
 	// emits it for a fully-received batch; partial loss uses the SACK path).
+	if(out_bsi)
+		*out_bsi = rx_bsi;
 	return true;
 #else
+	(void)out_bsi;
+	return false;
+#endif
+}
+
+// Option B fix-b (data-flow-compact-confirm.md §10.4/§10.5): the SHARED predicate
+// the Branch-2 SACK-window probe consumes to accept a COMPACT confirm INSIDE the
+// SACK window — extracted so production (process_messages_rx_acks_data) and the
+// live-RX regression (test_compact_confirm_sack_window_rx_path) drive ONE copy (no
+// comment/code drift; the cl_arq_controller §5 precedent of cmd_compact_confirm_live_accept).
+//
+// THE SECOND live-land defect: for a batch>1, SACK-on, clean, WB session the RSP
+// emits the compact confirm (arq_responder.cc:2576), but the Branch-2 probe decoded
+// ONLY the 13-uncoded ACK+SACK (CRC12 over 5-byte [bsi||bitmap]); the compact tail
+// (CRC12 over the single [bsi] byte) FAILS that 5-byte CRC12 and is dropped, and the
+// SACK-closed compact arm (cmd_compact_confirm_live_accept) HARD-BAILS at
+// :sack_window_open. The confirm is lost -> receiving_timeout -> retransmit -> the
+// 4.7x batch>1-WB delivery regression at ENABLE=1.
+//
+// THE FIX (root cause): try the SELF-VALIDATING compact decode FIRST, inside the
+// window, BEFORE the 13-uncoded decode. cmd_compact_confirm_crc_valid() does its OWN
+// tail snapshot + 16-sym base detect + GF(16) K=5 soft-decode + CRC12-over-[bsi] +
+// bsi-in-window — the CRC12 (NOT the SACK window) is the false-confirm guard. On a
+// valid compact CRC we route through the EXACT clean-confirmation state the 13-uncoded
+// CLEAN branch sets (split-dedupe, cmd_last_applied_clean_bsi, inband_retag_confirm_
+// from_sack, v2_ack_pat_pre_detected=true) so the downstream CLEAN funnel is identical.
+// v2_ack_pat_pre_detected routes to the proven CLEAN accept (the "Data ACK pattern
+// detected" else-if) — there is NO commit_ack_pattern_consumed()/frames_to_read
+// mutation here (the v2 clean path does not advance the ring that way; the OFDM dispatch
+// the caller skips owns frames_to_read=0), so NO double-advance vs the Branch-3 arm.
+//
+// Returns true iff a compact confirm was decoded+accepted (or de-duplicated) this poll
+// — the caller sets mfsk_handled_this_poll to suppress BOTH the 13-uncoded decode and
+// the OFDM dispatch for this poll. Returns false (compact MISS / not enabled / not
+// WB-capable / out-of-window bsi) so the caller falls through to the UNCHANGED 13-uncoded
+// decode. Gated on compact_enabled (ARQ_COMPACT_CONFIRM_ENABLE, held off) => returns
+// false immediately when 0, so the caller is byte-identical to the pre-fix path.
+//
+// §5 INVARIANTS: (I3/§6 no-cross-validate) the compact CRC12-over-[bsi] cannot validate
+// a 13-uncoded [bsi||bitmap] suffix and vice-versa -> FAR unchanged, a 13-uncoded clean
+// ACK still takes the existing path; (partial-SACK intact) the compact decode REJECTS a
+// SACK partial frame (different field layout) so the partial branch is untouched and a
+// partial is NEVER routed here; (clean/partial dedupe split) we dedupe vs
+// cmd_last_applied_clean_bsi exactly like the 13-uncoded clean branch -> a repeated
+// compact for the same bsi never double-counts nBatches_fully_acked.
+bool cl_arq_controller::cmd_compact_confirm_sack_window_accept(bool compact_enabled,
+                                                               bool* out_pre_detected)
+{
+#if MFSK_ACK_SACK_ENABLED
+	if(!compact_enabled)
+		return false;   // master gate held off -> byte-identical to the pre-fix path.
+	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
+		return false;   // NB / M<16 — compact confirm is WB-only.
+
+	uint8_t cc_bsi = 0;
+	// Self-validating: own snapshot + base detect + GF(16) soft-decode + CRC12-over-[bsi]
+	// + bsi-in-window. The CRC12 (not the SACK window) is the false-confirm guard.
+	if(!cmd_compact_confirm_crc_valid(&cc_bsi))
+		return false;   // compact MISS -> fall through to the 13-uncoded decode.
+
+	// CLEAN confirmation — mirror the 13-uncoded CLEAN branch state-for-state.
+	// Split-dedupe: a CLEAN supersedes a partial for the same bsi (climb-engine Bug 1)
+	// and a repeated CLEAN for the same bsi is rejected (no double-count).
+	bool duplicate = !sack_clean_confirmation_accepted(
+		(int)cc_bsi, /*is_all_ones=*/true,
+		cmd_last_applied_clean_bsi, cmd_last_applied_sack_bsi);
+	if(!duplicate)
+	{
+		// v2_ack_pat_pre_detected is a CALLER LOCAL (the CLEAN-funnel routing flag),
+		// not a member — set it through the out-param so a fresh CLEAN compact lands in
+		// the proven clean accept (the "Data ACK pattern detected" else-if). A DUPLICATE
+		// must NOT set it (no re-credit) but is still "handled" (return true) so the
+		// doomed 13-uncoded re-decode of the same tail is skipped.
+		if(out_pre_detected)
+			*out_pre_detected = true;
+		cmd_last_applied_clean_bsi = (int)cc_bsi;
+		// STAGE 4d (D1 CONFIRM): a CLEAN confirm at-or-after the announce bsi proves the
+		// RX demodulated the batch at the announced config -> DISARM the re-tag (no-op
+		// when not armed / stale bsi / inband off).
+		inband_retag_confirm_from_sack((int)cc_bsi);
+		int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+		printf("[CMD-COMPACT-CONFIRM] CLEAN (in-SACK-window) batch_seq_id=%u "
+			"(cmd_batch_seq_id=%d) arrival_ms=%d\n",
+			(unsigned)cc_bsi, cmd_batch_seq_id, arrival_ms);
+		fflush(stdout);
+	}
+	// Whether fresh or de-duplicated, the compact tail was consumed this poll — return
+	// true so the caller skips the (doomed) 13-uncoded decode of the same tail.
+	return true;
+#else
+	(void)compact_enabled; (void)out_pre_detected;
 	return false;
 #endif
 }
@@ -3753,6 +3846,63 @@ void cl_arq_controller::process_messages_rx_acks_data()
 #if MFSK_ACK_SACK_ENABLED
 					if(telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 					{
+						// ── Option B fix-b (data-flow-compact-confirm.md §10.4/§10.5):
+						// COMPACT-CONFIRM accept INSIDE the SACK window ──────────────
+						// THE SECOND live-land defect. For a batch>1, SACK-on, clean, WB
+						// session the RSP emits the COMPACT confirm (arq_responder.cc:2576);
+						// but this Branch-2 SACK-window probe historically decoded ONLY the
+						// 13-uncoded ACK+SACK (decode_ack_sack_from_passband below, CRC12
+						// over the 5-byte [bsi||bitmap]). The compact tail (CRC12 over the
+						// single [bsi] byte) FAILS that 5-byte CRC12 (:3841) and is dropped;
+						// the SACK-closed compact arm (cmd_compact_confirm_live_accept) HARD-
+						// BAILS at :287 if(sack_window_open). Result: the confirm is lost,
+						// CMD waits out receiving_timeout and retransmits -> the 4.7x
+						// batch>1-WB delivery regression at ENABLE=1.
+						//
+						// FIX (root cause, not a band-aid): try the SELF-VALIDATING compact
+						// decode FIRST, here, INSIDE the window, BEFORE the 13-uncoded decode.
+						// cmd_compact_confirm_crc_valid() does its OWN tail snapshot + 16-sym
+						// base detect + GF(16) K=5 soft-decode + CRC12-over-[bsi] + bsi-in-
+						// window — the CRC12 (NOT the SACK window) is the false-confirm guard.
+						// On a valid compact CRC we route through the EXACT clean-confirmation
+						// state the 13-uncoded CLEAN branch (:3943-3966) sets: split-dedupe,
+						// cmd_last_applied_clean_bsi, inband_retag_confirm_from_sack,
+						// v2_ack_pat_pre_detected=true, mfsk_handled_this_poll=true. That
+						// flag suppresses the OFDM dispatch AND the 13-uncoded decode for this
+						// poll, and v2_ack_pat_pre_detected routes to the proven CLEAN funnel
+						// (:4448) — NO commit_ack_pattern_consumed()/frames_to_read mutation
+						// here (the v2 clean path does not advance the ring that way; the OFDM
+						// dispatch it skips owns frames_to_read=0), so there is NO double-
+						// advance vs the SACK-closed Branch-3 arm. On a compact MISS we fall
+						// straight through to the UNCHANGED 13-uncoded decode below.
+						//
+						// §5 INVARIANTS re-verified: (1) no-cross-validate (I3/§6) — the
+						// compact CRC12-over-[bsi] cannot validate a 13-uncoded [bsi||bitmap]
+						// suffix and vice-versa, so the FAR is unchanged and a 13-uncoded clean
+						// ACK still takes the existing path. (2) partial-SACK intact — the
+						// compact decode REJECTS the SACK partial frame (different field
+						// layout/length), so the partial branch (:3967) is untouched; a partial
+						// is NEVER routed through here. (3) clean/partial routing + the dedupe
+						// clean-vs-partial split (:3937) preserved: we dedupe vs
+						// cmd_last_applied_clean_bsi exactly like the 13-uncoded clean branch,
+						// so a repeated compact for the same bsi does not double-count
+						// nBatches_fully_acked. Gated on ARQ_COMPACT_CONFIRM_ENABLE (held off)
+						// => byte-identical when 0 (the if() short-circuits on the macro).
+						// Extracted to ONE shared predicate (data-flow §10.5 fix-b) so production
+						// and the live-RX regression (test_compact_confirm_sack_window_rx_path) drive
+						// the SAME copy — no comment/code drift (the cl_arq_controller §5 precedent,
+						// cmd_compact_confirm_live_accept). Returns true iff a compact confirm was
+						// accepted/consumed this poll (v2_ack_pat_pre_detected set inside on a CLEAN).
+						if(cmd_compact_confirm_sack_window_accept(
+							ARQ_COMPACT_CONFIRM_ENABLE != 0,
+							&v2_ack_pat_pre_detected))
+							mfsk_handled_this_poll = true;
+						// On a compact accept we are DONE for this poll; skip the 13-uncoded
+						// ACK+SACK decode + OFDM dispatch entirely (the compact tail is NOT a
+						// valid 5-byte [bsi||bitmap] frame, so decoding it as one only burns
+						// a CRC12 fail). The 13-uncoded path runs verbatim on a compact MISS.
+						if(!mfsk_handled_this_poll)
+						{
 						// Snapshot the passband tail — same window math as
 						// receive_ack_pattern() (arq_common.cc:4966-4983).
 						int ack_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
@@ -4024,6 +4174,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									duplicate ? 1 : 0);
 							}
 						}
+						} // end if(!mfsk_handled_this_poll) — fix-b compact pre-check skips the 13-uncoded decode
 					}
 #endif // MFSK_ACK_SACK_ENABLED
 

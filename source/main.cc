@@ -789,6 +789,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_compact_confirm_live_rx_path();
             }
+            // Option B fix-b — compact confirm accept INSIDE the SACK window (batch>1,
+            // SACK-on, clean, WB; data-flow-compact-confirm.md §10.4/§10.5). The SECOND
+            // live-land defect (4.7x batch>1-WB regression at ENABLE=1). PURE in-process.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_compact_confirm_sack_window_rx_path();
+            }
             // FORGIVING-ACK Tier-2 cumulative-n_r self-heal / gap-invariant / cap-gate
             // regression (the A3 predicate proof). Member test on a throwaway controller;
             // PURE in-process synthetic-fire, no IONOS/RF. data-flow-forgiving-ack.md §T2.6.
@@ -3831,6 +3838,8 @@ start_modem:
             fflush(stdout);
             cl_arq_controller test_arq;
             int rc = test_arq.test_compact_confirm_live_rx_path();
+            cl_arq_controller test_arq2;
+            rc += test_arq2.test_compact_confirm_sack_window_rx_path();
             printf("[FLAG] compact-confirm-rx test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);

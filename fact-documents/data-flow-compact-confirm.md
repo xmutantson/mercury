@@ -237,3 +237,158 @@ full-tail correlator already runs) — would harden ALL reverse-ACK detection, n
 the compact confirm. Tracked here as an open lever, NOT folded into this fix (scope:
 this fix decouples the self-validating confirm; the pre-gate widening touches every
 receive_ack_pattern() caller and needs its own CPU-budget + FAR audit).
+
+## §10 Producer↔consumer MATRIX + the SECOND live-land defect (SACK-window shadow, 2026-06-27)
+
+f1da9cbe (§9) fixed the SACK-CLOSED bare-gate decoupling. A full §5 producer/consumer
+trace (`_research/coded_confirm/{audit_rsp_send.md, audit_cmd_accept.md, audit_SYNTHESIS.md}`)
+found a SECOND, independent live-land defect for batch>1. This section owns the
+producer↔consumer disagreement for the compact suffix.
+
+### §10.1 Producer (RSP) — WHERE compact is emitted
+`arq_responder.cc:2571-2583`, inside the CLEAN funnel. FOUR conditions (all required):
+(a) `ARQ_COMPACT_CONFIRM_ENABLE != 0` (common_defines.h:82-83, DEFAULT 0);
+(b) `!cumulative_ack_enabled` (mutual-exclusion w/ FORGIVING-ACK Tier 2, :2572);
+(c) `compact_confirm_suffix_len() > 0` == `M>=16` == WB only (mfsk.h:278-280);
+(d) `wire_bsi == ack_bsi` (no cumulative n_r reshape, :2574).
+The CLEAN funnel does NOT branch on batch size (`audit_rsp_send.md §1`): b1-clean and
+b>1-clean take the IDENTICAL path. ROBUST/NB (M=8) -> suffix_len==0 -> compact never
+emitted; ROBUST pins data_batch_size=1 (arq_common.cc:1285,1318-1335). The partial path
+(2221-2438) NEVER emits compact (complete-batch / all-ones only).
+
+### §10.2 Consumer (CMD) — WHERE compact is accepted
+`arq_commander.cc:4448-4451` (the data-ACK else-if) -> two routes:
+(i) `v2_ack_pat_pre_detected` (set by the Branch-2 SACK-window probe, :3951); or
+(ii) `cmd_compact_confirm_live_accept(sack_window_open, ENABLE!=0)` (:278).
+The compact decoder `decode_compact_confirm_from_passband` is reachable ONLY via
+`cmd_compact_confirm_crc_valid()` (:222) called from `cmd_compact_confirm_live_accept` (:309),
+which HARD-RETURNS false at `:287 if(sack_window_open) return false;`.
+The Branch-2 SACK-window probe (:3732-4028) decodes ONLY the 13-uncoded ACK+SACK
+(`decode_ack_sack_from_passband`, CRC12 over 5-byte `[bsi||bitmap]`, :3788-3851) — it
+NEVER calls the compact decoder.
+
+### §10.3 The MATRIX (RSP-sends vs CMD-accepts; the one structural MISMATCH)
+ENABLE assumed flipped to 1. SACK default-ON: `disable_sack=false` (arq_common.cc:865),
+`sack_enabled=!disable_sack` (arq_commander.cc:6625), `axis3_sack_mode=SACK_MODE_ON`
+(arq_common.cc:779,7088), `sack_v2_enabled` negotiated true on WB.
+
+| batch | SACK | clean/part | config | RSP sends            | CMD accepts via                         | MATCH |
+|-------|------|------------|--------|----------------------|-----------------------------------------|-------|
+| 1     | n/a  | clean      | ROBUST | bare (M=8, no compact)| Branch3 bare arm (:321)                 | OK (no compact) |
+| 1     | n/a  | clean      | WB     | COMPACT (2576)       | Branch3 :309->:314 (SACK-closed)        | OK — compact LANDS (timing-fragile, §10.4) |
+| >1    | on   | clean(all) | WB     | COMPACT (2576)       | Branch2 13-uncoded CRC FAIL :3841; Branch3 bails :287; Branch5 never | **MISMATCH — DROPPED** |
+| >1    | on   | clean      | NB     | bare (M=8)           | OFDM/bare (suffix gate false)           | OK (no compact) |
+| >1    | on   | partial    | WB     | MFSK-suffix / SACK_RSP| Branch2 partial -> sack_detected :3978  | OK (compact never partial) |
+| >1    | on   | clean      | WB,cum | MFSK-suffix (2572)   | Branch2 clean -> v2_pre_detected :3951   | OK (compact suppressed) |
+
+### §10.4 The structural MISMATCH (batch>1, SACK-on, clean, WB)
+`sack_window_open==true` for any b>1 SACK session once the poll clock passes
+`ack_pattern_time_ms` (:3713). Branch-2 is the ONLY decoder in the window; it reads the
+compact tail AS a 13-uncoded `[bsi||bitmap]` frame -> compact's CRC12 (over `[bsi]` only)
+fails the 5-byte CRC12 at :3841 -> dropped. Branch-3 bails at :287 before its compact
+decode (:309). Branch-5 fires on neither route. CMD waits out `receiving_timeout` and
+retransmits. The non-cross-validation is BY DESIGN (the I3 false-confirm invariant, §6) —
+the same property that blocks false-confirm also means the SACK probe cannot recover a
+compact frame. batch==1 WB (Row 2) inherits this whenever the window opens before the
+compact poll (timing-dependent, not structural).
+
+### §10.5 The fix landscape (do not ship blindly — §5 entanglement)
+- fix-a (LOW): scope RSP compact-send to `data_batch_size==1` WB (add a 5th condition at
+  2571-2574). Removes the Row-3 mismatch; b>1-clean reverts to the proven 13-uncoded
+  suffix. RSP-only, no SACK touch. Ships the codec ON where it lands.
+- fix-b (MED, entangles P2a): give the compact an accept entry point INSIDE the SACK
+  window — either insert `cmd_compact_confirm_crc_valid()` in Branch-2 (~:3754) or relax
+  the :287 bail for the compact arm (the CRC12-over-[bsi] is the false-confirm guard, NOT
+  the SACK window; :287 exists for the CRC-LESS bare arm, :283-288). This rides the
+  SACK-Design-A acceptance surface, which is wrong-sign on noisy (BREAK-spiral,
+  [[faithful_revalidation_overturn_map]] P2a) — co-rework with P2a, and with lever-C
+  (tone-burst) which needs the SAME surface.
+- INVARIANT to re-verify on fix-b (CLAUDE.md §5): Branch-2 clean/partial routing
+  (:3941-4010), `v2_ack_pat_pre_detected` consumer (Branch-5, :4448), the dedupe
+  clean-vs-partial split (:3937-3939), and the ring-advance contract
+  (`commit_ack_pattern_consumed` vs `frames_to_read=0` at :4071) — so a compact accept in
+  the window does not double-advance or collide with the OFDM dispatch bookkeeping.
+
+### §10.6 ROBUST reach [?]
+The compact STRUCTURALLY cannot fire on ROBUST (M=8, mfsk.h:279) — the dominant
+batch==1 / climb-stalled traffic ([[faithful_beat_vara_climb_binding]]). Shortening the
+reverse turnaround there needs a robust-tier (M=8) compact codeword, a SEPARATE lever
+from the WB M=16 compact audited here. The fix-a/fix-b scope does NOT touch the
+climb-binding traffic.
+
+## §11 fix-b SHIPPED — compact accept INSIDE the SACK window (2026-06-27)
+
+fix-b (§10.5) implemented and tested. The Row-C structural MISMATCH (§10.4) is removed:
+the commander now accepts the compact confirm INSIDE the SACK window for batch>1-WB-clean.
+
+### §11.1 The change (root cause, not a band-aid)
+NEW shared predicate `cl_arq_controller::cmd_compact_confirm_sack_window_accept(bool
+compact_enabled, bool* out_pre_detected)` (arq_commander.cc, defined right after
+cmd_compact_confirm_crc_valid). The Branch-2 SACK-window probe
+(`process_messages_rx_acks_data`, inside `if(ack_sack_suffix_len() > 0)`) calls it FIRST,
+BEFORE the 13-uncoded `decode_ack_sack_from_passband`:
+```
+if(cmd_compact_confirm_sack_window_accept(ARQ_COMPACT_CONFIRM_ENABLE != 0,
+                                          &v2_ack_pat_pre_detected))
+    mfsk_handled_this_poll = true;
+if(!mfsk_handled_this_poll) { ...the UNCHANGED 13-uncoded decode + OFDM dispatch... }
+```
+The predicate runs the SELF-VALIDATING compact decode `cmd_compact_confirm_crc_valid()`
+(its own tail snapshot + 16-sym base detect + GF(16) K=5 soft-decode + CRC12-over-[bsi]
++ bsi-in-window). On a valid compact CRC it routes through the EXACT 13-uncoded CLEAN
+branch state (split-dedupe via `sack_clean_confirmation_accepted`, `cmd_last_applied_clean_bsi`,
+`inband_retag_confirm_from_sack`, and sets the caller's `v2_ack_pat_pre_detected` LOCAL
+through the out-param). `v2_ack_pat_pre_detected` routes to the proven CLEAN funnel (the
+"Data ACK pattern detected" else-if) — NO `commit_ack_pattern_consumed()`/frames_to_read
+mutation here (the v2 clean path does not advance the ring that way; the skipped OFDM
+dispatch owns `frames_to_read=0`), so NO double-advance vs the Branch-3 arm.
+
+`cmd_compact_confirm_crc_valid()` gained an optional `uint8_t* out_bsi` (NULL default) so
+the Branch-2 caller dedupes/re-tags on the decoded bsi; the SACK-closed Branch-3 caller is
+byte-identical (passes NULL).
+
+### §11.2 The :287 bail is UNCHANGED (Branch-3 / SACK-closed arm preserved)
+The §10.2 hard-return `cmd_compact_confirm_live_accept: if(sack_window_open) return false`
+is LEFT IN PLACE — it correctly bails the SACK-CLOSED-arm code path (where the lenient bare
+match false-fires on OFDM SACK_RSP body audio). The in-window compact accept now lives in
+its OWN Branch-2 entry point that does NOT use the bare-match arm. The CRC12-over-[bsi] (not
+the SACK window) is the false-confirm guard for both arms — this realizes the §6 I3/I5
+invariant (compact-for-clean, SACK-for-partial) WITHOUT weakening it.
+
+### §11.3 §5 cross-layer audit (the two consumers + the routing/dedupe contract)
+- **Consumer 1: the CLEAN funnel** (`v2_ack_pat_pre_detected` -> the "Data ACK pattern
+  detected" else-if). It expects a CLEAN, all-ones, in-window, deduped batch. The compact
+  confirm IS all-ones by type (RSP emits it only for a fully-received batch), the bsi-in-
+  window gate is inside cmd_compact_confirm_crc_valid, and the dedupe mirrors the 13-uncoded
+  clean branch -> the funnel's preconditions are met identically. VERIFIED: no double-count
+  of `nBatches_fully_acked` on a repeated compact (test §(a)).
+- **Consumer 2: the PARTIAL SACK path** (`sack_detected` -> the retransmit-queue builder).
+  UNTOUCHED. The compact decode REJECTS a SACK partial frame (different field layout/length)
+  so a partial NEVER routes through the compact entry point; on a compact MISS the code falls
+  straight through to the UNCHANGED 13-uncoded decode that feeds both clean and partial. The
+  Branch-2 clean/partial split (:is_clean_confirmation), `v2_ack_pat_pre_detected` consumer
+  (the CLEAN else-if), and the ring-advance contract (`frames_to_read=0` at the OFDM dispatch)
+  are unchanged on every non-compact path.
+- **No-cross-validate (I3):** the compact CRC12-over-[bsi] cannot validate a 13-uncoded
+  [bsi||bitmap] suffix and vice-versa -> the two transports never steal each other's frames
+  (test "no cross-validate"). FAR unchanged.
+
+### §11.4 Tests (FAIL-BEFORE / PASS-AFTER, CLAUDE.md §3)
+`test_compact_confirm_sack_window_rx_path` (test_compact_confirm_rx.cc, in `--test` and
+`--test-compact-confirm-rx`). Drives the SHARED Branch-2 predicate for batch>1 (data_batch_size=8),
+SACK-on, clean, WB.
+- FAIL-BEFORE (`MERCURY_COMPACT_SACK_WINDOW_FAILBEFORE=1`, same binary): replays the pre-fix
+  Branch-2 (only `decode_ack_sack_from_passband` runs on the compact tail) -> 5-byte CRC12
+  fail -> the compact confirm is REJECTED -> rc=1 (the §10.4 dropped-confirm bug).
+- PASS-AFTER (default): the decoupled compact decode ACCEPTS it (returns true, sets
+  v2_ack_pat_pre_detected) -> rc=0. Plus: a duplicate is consumed but NOT re-credited; a
+  corrupted-suffix compact is REJECTED (GF16+CRC12 guard); a 13-uncoded ACK+SACK is NOT
+  cross-accepted as compact (falls to the legacy path, which still decodes it); out-of-window
+  bsi REJECTED; gate-off (compact_enabled=false) returns false (byte-identical pre-fix path).
+Full `--test` suite: 67 passed, 0 failed (sim_clock 0 failed, Winlink dict 12/0).
+
+### §11.5 Status
+fix-b SHIPPED on `staging/short-coded-confirm`. Still gated OFF by ARQ_COMPACT_CONFIRM_ENABLE
+(held off pending the faithful real-audio batch>1-WB re-verify) — byte-identical to the
+pre-fix path when 0. The §10.4 4.7x batch>1-WB regression at ENABLE=1 is the bug this removes;
+faithful-sim ENABLE=1 batch>1-WB A/B is the next gate before flipping the master enable.

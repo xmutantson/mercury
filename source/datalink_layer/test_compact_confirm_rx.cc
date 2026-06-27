@@ -458,11 +458,270 @@ int cl_arq_controller::test_compact_confirm_live_rx_path()
 #endif // MFSK_ACK_SACK_ENABLED
 }
 
+// ============================================================================
+// Option B fix-b — LIVE RX-PATH regression for the SACK-WINDOW-OPEN case
+// ============================================================================
+//
+// CLI: --test-compact-confirm-rx (runs both this and the SACK-closed test above).
+//
+// THE BUG THIS CAPTURES (data-flow-compact-confirm.md §10.4/§10.5, the SECOND
+// live-land defect): for a batch>1, SACK-on, clean, WB session the RSP emits the
+// COMPACT confirm (arq_responder.cc:2576). But the commander's Branch-2 SACK-window
+// probe (process_messages_rx_acks_data) historically decoded ONLY the 13-uncoded
+// ACK+SACK (decode_ack_sack_from_passband, CRC12 over the 5-byte [bsi||bitmap]). The
+// compact tail (CRC12 over the single [bsi] byte) FAILS that 5-byte CRC12 and is
+// dropped; the SACK-closed compact arm (cmd_compact_confirm_live_accept) HARD-BAILS
+// at if(sack_window_open). Result: the confirm is lost, the commander waits out
+// receiving_timeout and retransmits -> the 4.7x batch>1-WB delivery regression at
+// ARQ_COMPACT_CONFIRM_ENABLE=1.
+//
+// THE FIX (root cause): cmd_compact_confirm_sack_window_accept() tries the
+// SELF-VALIDATING compact decode FIRST, inside the window, BEFORE the 13-uncoded
+// decode. The CRC12-over-[bsi] (not the SACK window) is the false-confirm guard.
+//
+// FAIL-BEFORE / PASS-AFTER CONTRACT (CLAUDE.md §3):
+//   PRE-FIX  (MERCURY_COMPACT_SACK_WINDOW_FAILBEFORE=1, same binary): the in-window
+//            accept is the OLD Branch-2 — only decode_ack_sack_from_passband runs on
+//            the compact tail -> NO CRC-valid clean ACK -> the confirm is REJECTED.
+//   POST-FIX (default): the decoupled compact decode accepts it (returns true and
+//            sets v2_ack_pat_pre_detected) -> ACCEPT. A corrupted-suffix compact is
+//            rejected; a 13-uncoded ACK+SACK is NOT cross-accepted as compact;
+//            out-of-window bsi rejected; a duplicate is consumed but not re-credited.
+//
+// Deterministic, no RF, no IONOS. Returns 0 on PASS, 1 on FAIL.
+// (This function lives inside the file-level #if MFSK_ACK_SACK_ENABLED region that
+//  also defines cc_rx_ctx / seat_frame_at_live_tail; the !MFSK_ACK_SACK stub is in
+//  the file-level #else below.)
+// ============================================================================
+int cl_arq_controller::test_compact_confirm_sack_window_rx_path()
+{
+	const char* TAG = "compact_confirm_sack_window_rx_path";
+	printf("[TEST] %s starting\n", TAG);
+	fflush(stdout);
+
+	bool failbefore = false;
+	{
+		const char* e = std::getenv("MERCURY_COMPACT_SACK_WINDOW_FAILBEFORE");
+		failbefore = (e && *e && *e != '0');
+	}
+
+	cc_rx_ctx ctx;
+	const int CFG = CONFIG_0;   // deepest WB rung (compact confirm is WB-only)
+
+	cl_telecom_system* ts  = new cl_telecom_system();
+	cl_arq_controller* cmd = new cl_arq_controller();
+	ts->operation_mode = ARQ_MODE;
+	ts->narrowband_enabled = NO;
+	cmd->telecom_system = ts;
+	cmd->role = COMMANDER;
+	cmd->narrowband_enabled = NO;
+	cmd->current_configuration = CONFIG_NONE;
+	cmd->load_configuration(CFG, FULL, NO);
+	cmd->link_status = CONNECTED;
+	cmd->connection_status = RECEIVING_ACKS_DATA;
+
+	if(ts->ack_mfsk.compact_confirm_suffix_len() <= 0) {
+		printf("  [SKIP] compact confirm unsupported on this WB config\n");
+		delete cmd; delete ts;
+		return 0;
+	}
+
+	int sym = ts->data_container.Nofdm * ts->frequency_interpolation_rate;
+	int max_samples = (ts->ack_mfsk.ack_sack_pattern_nsymb() + 4) * sym;
+	std::vector<double> compact_buf((size_t)max_samples, 0.0);
+	std::vector<double> acksack_buf((size_t)max_samples, 0.0);
+
+	// THE batch>1 scenario: a multi-frame batch the commander is waiting on.
+	const uint8_t bsi = 0x2A;
+	cmd->cmd_batch_seq_id = bsi;
+	cmd->data_batch_size = 8;                 // batch>1 (the regression scope)
+	cmd->cmd_last_applied_clean_bsi = -1;     // nothing applied yet
+	cmd->cmd_last_applied_sack_bsi  = -1;
+	const uint32_t clean_bitmap = (1u << cmd->data_batch_size) - 1u;
+
+	// --- Generate the compact-confirm passband (16 base + 10 suffix) ---
+	int compact_samples = 0;
+	{
+		unsigned char bb[1]; bb[0] = (unsigned char)bsi;
+		uint16_t crc12 = (uint16_t)(cmd->CRC12_calc((const char*)bb, 1) & 0x0FFF);
+		compact_samples = ts->generate_compact_confirm_passband(compact_buf.data(), bsi, crc12);
+	}
+	ctx.check(compact_samples > 0, "compact confirm passband generated");
+
+	// --- Generate a clean 13-uncoded ACK+SACK passband (the no-cross-validate probe) ---
+	int acksack_samples = 0;
+	{
+		uint32_t bitmap = clean_bitmap;
+		char crc_in[5];
+		crc_in[0] = (char)bsi;
+		crc_in[1] = (char)((bitmap >> 24) & 0xFF);
+		crc_in[2] = (char)((bitmap >> 16) & 0xFF);
+		crc_in[3] = (char)((bitmap >>  8) & 0xFF);
+		crc_in[4] = (char)( bitmap        & 0xFF);
+		uint16_t crc12 = (uint16_t)(cmd->CRC12_calc(crc_in, 5) & 0x0FFF);
+		acksack_samples = ts->generate_ack_sack_pattern_passband(
+			acksack_buf.data(), bsi, bitmap, crc12);
+	}
+	ctx.check(acksack_samples > 0, "ACK+SACK passband generated");
+
+	// Helper: simulate the PRE-FIX Branch-2 in-window accept — ONLY the 13-uncoded
+	// decode ran on whatever tail is seated. Returns true iff a CRC-valid, in-window,
+	// CLEAN (all-ones) 13-uncoded ACK was decoded (i.e. the OLD code would have set
+	// v2_ack_pat_pre_detected). On the compact tail this MUST be false (the bug).
+	auto old_branch2_accepts = [&](void)->bool {
+		uint8_t  rx_bsi = 0; uint32_t rx_bitmap = 0; uint16_t rx_crc12 = 0; int m = 0;
+		// Same tail window the production Branch-2 snapshots (16 + max(snr,sack) + 16).
+		int ack_nsymb = ts->ack_mfsk.ack_pattern_nsymb;
+		int pattern_len = ts->ack_mfsk.ack_snr_pattern_nsymb();
+		int sack_suffix_len = ts->ack_mfsk.ack_sack_suffix_len();
+		if(sack_suffix_len > pattern_len - ack_nsymb)
+			pattern_len = ack_nsymb + sack_suffix_len;
+		int tail_n = ack_nsymb + pattern_len + 16;
+		int sp = sym * ts->data_container.buffer_Nsymb;
+		int tail_samples = tail_n * sym; if(tail_samples > sp) tail_samples = sp;
+		int tail_off = sp - tail_samples;
+		memcpy(ts->data_container.ready_to_process_passband_delayed_data,
+			&ts->data_container.passband_delayed_data[
+				ts->data_container.ring_write_index + tail_off],
+			(size_t)tail_samples * sizeof(double));
+		bool dec = ts->decode_ack_sack_from_passband(
+			ts->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &m);
+		if(!dec) return false;
+		char ci[5];
+		ci[0]=(char)rx_bsi;
+		ci[1]=(char)((rx_bitmap>>24)&0xFF); ci[2]=(char)((rx_bitmap>>16)&0xFF);
+		ci[3]=(char)((rx_bitmap>>8)&0xFF);  ci[4]=(char)(rx_bitmap&0xFF);
+		if(rx_crc12 != (uint16_t)(cmd->CRC12_calc(ci,5)&0x0FFF)) return false;
+		unsigned cb=(unsigned)(cmd->cmd_batch_seq_id&0xFF), pb=(cb-1u)&0xFFu;
+		if(!((unsigned)rx_bsi==cb||(unsigned)rx_bsi==pb)) return false;
+		uint32_t all_ones=(cmd->data_batch_size>=32)?0xFFFFFFFFu
+			:((1u<<cmd->data_batch_size)-1u);
+		return rx_bitmap==all_ones;
+	};
+
+	// ====================================================================
+	// PRIMARY ASSERTION — the in-SACK-window compact accept (the live miss).
+	// Both arms assert the SAME thing: the compact confirm MUST be accepted in the
+	// SACK window. PASS-AFTER routes through the decoupled compact decode -> ACCEPT.
+	// FAIL-BEFORE replays the OLD Branch-2 (13-uncoded decode only) -> the compact
+	// tail does NOT yield a CRC-valid clean ACK -> REJECT -> this check FAILS (rc=1).
+	// ====================================================================
+	{
+		seat_frame_at_live_tail(ts, compact_buf.data(), compact_samples);
+		bool pre = false;
+		bool accepted;
+		if(failbefore)
+			accepted = old_branch2_accepts();              // OLD path: 13-uncoded only
+		else
+			accepted = cmd->cmd_compact_confirm_sack_window_accept(
+				/*compact_enabled=*/true, &pre);           // NEW path: decoupled compact
+		ctx.check(accepted,
+		  "compact confirm ACCEPTED inside the SACK window (batch>1, clean, WB)");
+		if(!failbefore)
+			ctx.check(pre,
+			  "fresh CLEAN compact sets v2_ack_pat_pre_detected (routes to clean funnel)");
+		if(failbefore && !accepted)
+			printf("    (expected under FAIL-BEFORE: the pre-fix Branch-2 decoded only the "
+			       "13-uncoded ACK+SACK on the compact tail -> 5-byte CRC12 fail -> dropped)\n");
+	}
+
+	// PASS-AFTER-only invariants (the fix's safety contract).
+	if(!failbefore) {
+		// (a) DEDUPE: a SECOND compact for the SAME bsi is consumed (return true) but
+		//     does NOT re-set the pre-detect flag (no double-credit of nBatches_fully_acked).
+		//     cmd_last_applied_clean_bsi was set to bsi by the accept above.
+		{
+			seat_frame_at_live_tail(ts, compact_buf.data(), compact_samples);
+			bool pre = false;
+			bool accepted = cmd->cmd_compact_confirm_sack_window_accept(true, &pre);
+			ctx.check(accepted && !pre,
+			  "duplicate compact for an already-applied clean bsi: consumed, NOT re-credited");
+		}
+		// Reset the dedupe tracker for the remaining single-shot probes.
+		cmd->cmd_last_applied_clean_bsi = -1;
+
+		// (b) NO-CROSS-VALIDATE: a 13-uncoded clean ACK+SACK frame MUST NOT be accepted
+		//     by the compact path (different CRC fields) — it falls through to the legacy
+		//     13-uncoded decode. cmd_compact_confirm_sack_window_accept returns false.
+		{
+			seat_frame_at_live_tail(ts, acksack_buf.data(), acksack_samples);
+			bool pre = false;
+			bool accepted = cmd->cmd_compact_confirm_sack_window_accept(true, &pre);
+			ctx.check(!accepted && !pre,
+			  "no cross-validate: 13-uncoded ACK+SACK NOT accepted as compact (falls to legacy)");
+			// Sanity: that SAME frame DOES decode via the legacy 13-uncoded path (the
+			// partial-SACK/clean path is intact and would handle it).
+			ctx.check(old_branch2_accepts(),
+			  "legacy 13-uncoded clean ACK still decodes via the unchanged Branch-2 path");
+		}
+
+		// (c) FALSE-CONFIRM #1: a corrupted-suffix compact (valid base, garbled codeword)
+		//     MUST be rejected (the GF(16) soft-decode + CRC12-over-[bsi] guard).
+		{
+			std::vector<double> bad((size_t)max_samples, 0.0);
+			memcpy(bad.data(), compact_buf.data(), (size_t)compact_samples * sizeof(double));
+			// Corrupt the suffix region (everything after the 16-sym base) with noise.
+			int base_samples = ts->ack_mfsk.ack_pattern_nsymb * sym;
+			uint32_t r = 0xC0FFEEu;
+			for(int i = base_samples; i < compact_samples; i++) {
+				r = r * 1664525u + 1013904223u;
+				bad[i] = ((double)(r >> 8) / (double)0xFFFFFF) - 0.5;  // full-scale noise
+			}
+			seat_frame_at_live_tail(ts, bad.data(), compact_samples);
+			bool pre = false;
+			bool accepted = cmd->cmd_compact_confirm_sack_window_accept(true, &pre);
+			ctx.check(!accepted && !pre,
+			  "false-confirm: corrupted-suffix compact REJECTED (GF16+CRC12 guard)");
+		}
+
+		// (d) FALSE-CONFIRM #2: an out-of-window bsi compact (CRC internally valid) MUST
+		//     be rejected (the bsi-in-window gate).
+		{
+			const uint8_t far_bsi = (uint8_t)((bsi + 50) & 0xFF);
+			std::vector<double> far_buf((size_t)max_samples, 0.0);
+			unsigned char bb[1]; bb[0] = (unsigned char)far_bsi;
+			uint16_t crc12 = (uint16_t)(cmd->CRC12_calc((const char*)bb, 1) & 0x0FFF);
+			int far_samples = ts->generate_compact_confirm_passband(far_buf.data(), far_bsi, crc12);
+			seat_frame_at_live_tail(ts, far_buf.data(), far_samples);
+			bool pre = false;
+			bool accepted = cmd->cmd_compact_confirm_sack_window_accept(true, &pre);
+			ctx.check(!accepted && !pre,
+			  "false-confirm: out-of-window bsi compact REJECTED (bsi-in-window gate)");
+		}
+
+		// (e) GATE-OFF byte-identity: with compact_enabled=false the predicate returns
+		//     false immediately even on a perfect compact tail (the held-off default ->
+		//     byte-identical to the pre-fix Branch-2).
+		{
+			seat_frame_at_live_tail(ts, compact_buf.data(), compact_samples);
+			bool pre = false;
+			bool accepted = cmd->cmd_compact_confirm_sack_window_accept(
+				/*compact_enabled=*/false, &pre);
+			ctx.check(!accepted && !pre,
+			  "gate-off: compact_enabled=false returns false (byte-identical pre-fix path)");
+		}
+	}
+
+	delete cmd; delete ts;
+
+	printf("[TEST] %s %s (%d failures)\n", TAG,
+	       ctx.fails == 0 ? "PASS" : "FAIL", ctx.fails);
+	fflush(stdout);
+	return ctx.fails == 0 ? 0 : 1;
+}
+
 #else  // !MFSK_ACK_SACK_ENABLED
 
 int cl_arq_controller::test_compact_confirm_live_rx_path()
 {
 	printf("[TEST] compact_confirm_live_rx_path SKIPPED (MFSK_ACK_SACK disabled)\n");
+	return 0;
+}
+
+int cl_arq_controller::test_compact_confirm_sack_window_rx_path()
+{
+	printf("[TEST] compact_confirm_sack_window_rx_path SKIPPED (MFSK_ACK_SACK disabled)\n");
 	return 0;
 }
 

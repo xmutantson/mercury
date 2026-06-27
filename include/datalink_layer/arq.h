@@ -896,7 +896,39 @@ public:
   // commander tries this FIRST (cheaper/shorter/deeper) then the 13-uncoded
   // clean-data-ACK path; the two CRC12s are over different fields so neither can
   // cross-validate the other.
-  bool cmd_compact_confirm_crc_valid();
+  //
+  // out_bsi (optional): on a TRUE return, the decoded in-window batch_seq_id LSB
+  // is written here so the SACK-window Branch-2 caller (data-flow §10.5 fix-b) can
+  // dedupe (sack_clean_confirmation_accepted) and disarm the climb re-tag
+  // (inband_retag_confirm_from_sack) on the SAME bsi the 13-uncoded clean branch
+  // would. Untouched on a FALSE return. Pass NULL (the default) when the decoded
+  // bsi is not needed (the SACK-closed Branch-3 arm).
+  bool cmd_compact_confirm_crc_valid(uint8_t* out_bsi = nullptr);
+
+  // Option B fix-b (data-flow-compact-confirm.md §10.4/§10.5): the SHARED predicate
+  // the Branch-2 SACK-window probe (process_messages_rx_acks_data) consumes to accept
+  // a COMPACT confirm INSIDE the SACK window — the SECOND live-land defect for a
+  // batch>1, SACK-on, clean, WB session (RSP emits compact, but the window probe
+  // decoded only the 13-uncoded ACK+SACK -> compact's [bsi]-CRC12 fails the 5-byte
+  // CRC12 -> dropped -> 4.7x batch>1-WB regression at ENABLE=1). Tries the
+  // SELF-VALIDATING compact decode FIRST (cmd_compact_confirm_crc_valid: own snapshot
+  // + base detect + GF(16) soft-decode + CRC12-over-[bsi] + bsi-in-window — the CRC12,
+  // not the SACK window, is the false-confirm guard), then routes a valid CLEAN confirm
+  // through the EXACT 13-uncoded CLEAN-branch state (split-dedupe, cmd_last_applied_clean_bsi,
+  // inband_retag_confirm_from_sack, v2_ack_pat_pre_detected=true). Returns true iff a
+  // compact confirm was accepted/de-duplicated this poll (caller sets mfsk_handled_this_poll
+  // to suppress the 13-uncoded decode AND the OFDM dispatch); false on compact MISS / not
+  // enabled / NB / out-of-window bsi (caller falls through to the UNCHANGED 13-uncoded
+  // decode). No commit_ack_pattern_consumed()/frames_to_read mutation (v2 clean path
+  // routes via v2_ack_pat_pre_detected; the skipped OFDM dispatch owns frames_to_read).
+  //   compact_enabled : ARQ_COMPACT_CONFIRM_ENABLE in production (held off => returns
+  //                     false immediately, byte-identical to the pre-fix path); the test
+  //                     forces true. Shared by test_compact_confirm_sack_window_rx_path.
+  //   out_pre_detected: the caller's v2_ack_pat_pre_detected LOCAL (the CLEAN-funnel
+  //                     routing flag) — set true ONLY on a FRESH (non-duplicate) CLEAN
+  //                     compact accept; left untouched on a duplicate / miss. May be NULL.
+  bool cmd_compact_confirm_sack_window_accept(bool compact_enabled,
+                                              bool* out_pre_detected = nullptr);
 
   // Option B clean DATA-ACK accept arm (the SHARED predicate consumed by the
   // "Data ACK pattern detected" else-if in process_messages_commander, and driven
@@ -936,6 +968,18 @@ public:
   // decode; ACK+SACK still accepts; noise/out-of-window/cross-frame all reject.
   // source/datalink_layer/test_compact_confirm_rx.cc. Returns 0 PASS / 1 FAIL.
   int test_compact_confirm_live_rx_path();
+
+  // Option B fix-b LIVE RX-PATH regression for the SACK-window-open case
+  // (data-flow-compact-confirm.md §10.4/§10.5). Drives the SHARED Branch-2 predicate
+  // cmd_compact_confirm_sack_window_accept() exactly as production does, for the
+  // batch>1, SACK-on, clean, WB scenario. FAIL-BEFORE
+  // (MERCURY_COMPACT_SACK_WINDOW_FAILBEFORE=1): simulates the pre-fix Branch-2 (only
+  // the 13-uncoded decode runs in-window) -> the compact tail is REJECTED. PASS-AFTER
+  // (default): the decoupled compact decode accepts it (v2_ack_pat_pre_detected set);
+  // a corrupted-suffix compact is rejected; a 13-uncoded ACK+SACK is NOT cross-accepted
+  // as compact; out-of-window bsi rejected. source/datalink_layer/test_compact_confirm_rx.cc.
+  // Returns 0 PASS / 1 FAIL.
+  int test_compact_confirm_sack_window_rx_path();
 
   // Phantom-ACK content-gate synthetic-fire test (CLI --test-phantom-ack-gate).
   // Drives the PURE acceptance policy (data_ack_bare_pattern_acceptable) across
