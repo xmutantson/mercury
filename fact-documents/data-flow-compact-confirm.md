@@ -425,3 +425,21 @@ PASS. ARQ_COMPACT_CONFIRM_ENABLE=1 is clear to flip default-ON for the WB M=16 r
 (per CLAUDE.md "don't leave a proven fix default-off"). Artifacts: `_research/coded_confirm/
 {reverify_fixb.json, REVERIFY_FIXB.md, reverify_raw_{31,11}.json, partial_only_snr27.json}` +
 fleet `/home/kameron/optBfixb/`. ROBUST/NB M=8 stays out of scope (compact is WB-only, §10.6).
+
+## §13 FLIPPED default-ON + MERGED + PUSHED (2026-06-27)
+All §12 JUDGE conditions YES, so the gate shipped default-ON.
+- `include/common/common_defines.h:91` `#define ARQ_COMPACT_CONFIRM_ENABLE 1` (was 0).
+- Flip commit `ebc3ea84` ("arq: flip compact coded reverse-confirm (Option B) default-ON for WB
+  M=16") on `staging/short-coded-confirm`.
+- Default-ON build verified locally (fleet unreachable this session): `bash build.sh o3` ->
+  installed; `--test` 49/0; `--test-compact-confirm-rx` 9/9 PASS rc=0 on the DEFAULT-ON binary
+  (in-SACK-window accept, fresh-CLEAN->clean-funnel, dup-not-re-credited, no-cross-validate,
+  legacy 13-uncoded still decodes, corrupted-suffix REJECTED, out-of-window REJECTED, gate-off
+  byte-identical).
+- `monitor` fast-forwarded to `ebc3ea84` (origin/monitor `d57c9afb` was a strict ANCESTOR of
+  staging — 75 ahead / 0 behind -> clean FF, no merge commit). The FF was done in the
+  `merge-followgate` worktree (monitor was checked out there) to avoid disrupting any worktree.
+- Pushed: `origin/monitor d57c9afb..ebc3ea84` (verified). Zero attribution.
+- Result file: `_research/coded_confirm/FLIP_RESULT_v4.md`.
+- Out of scope (unchanged): ROBUST/NB M=8 return-path (compact is WB-only); FORGIVING-ACK
+  cumulative path (responder gates compact OFF when cumulative_ack_enabled).
