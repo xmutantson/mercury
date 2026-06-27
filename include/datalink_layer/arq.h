@@ -1426,6 +1426,30 @@ public:
   // See §14.
   int elevator_target_from_snr();
 
+  // CONNECT-SEED of the START config (gearshift-start-and-recovery.md §10.2). PURE
+  // core: from the connect-time control-plane SNR choose a WB OFDM start config
+  // STRICTLY above init_cfg, or CONFIG_NONE when the channel is not clearly clean
+  // (the no-over-seed guard). Takes every input explicitly so the directed test
+  // (--test-connect-snr-seed) drives it with no live telecom_system:
+  //   snr_uplink   = measurements.SNR_uplink (the control-plane MFSK suffix SNR)
+  //   snr_mapped   = get_configuration(snr_uplink - CONNECT_SEED_MARGIN_DB)
+  //                  (caller supplies; the test injects the mapping)
+  //   init_cfg     = init_configuration (the un-seeded start, ROBUST_0 for -R)
+  //   proven_ceil  = supershift_proven_ceiling (-1 = none)
+  //   nb           = narrowband_enabled == YES
+  // Returns CONFIG_NONE unless ALL hold: feature/gearshift on (caller-gated), SNR
+  // valid (> -90), snr_mapped index >= CONNECT_SEED_CONFIG_MIN, and the capped
+  // result (min of snr_mapped, CONNECT_SEED_CONFIG_CAP, proven_ceil, NB ceiling)
+  // is STRICTLY above init_cfg by ladder index. NB sessions never seed past
+  // NB_CONFIG_MAX. PURE (no member writes); replayed directly by the test.
+  static int connect_seed_target_core(double snr_uplink, int snr_mapped,
+                                      int init_cfg, int proven_ceil, bool nb);
+  // Member wrapper: gates on the feature + gear_shift + valid SNR, computes
+  // snr_mapped via get_configuration(), applies the bigblock cooldown cap, and
+  // returns the seed config (or CONFIG_NONE). NON-const (get_configuration is
+  // non-const). Defined in arq_commander.cc next to elevator_target_from_snr().
+  int connect_seed_target();
+
   // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.4): apply the CFG16 big-block carve COOLDOWN
   // as an additional index-cap on a proposed climb target. When the cooldown is armed
   // (bigblock_carve_cooldown_batches > 0) and `proposed` is above the cooldown ceiling
@@ -4014,6 +4038,15 @@ public:
 
   // Directed regression for the in-band +1 climb (suppress the SNR-elevator jump).
   int test_inband_plus1_climb();
+
+  // CLIMB-LATENCY regressions (gearshift-start-and-recovery.md §10.5).
+  // test_connect_snr_seed: guarded SNR-seed of the start config — clean channel
+  // seeds a WB start, marginal channel does NOT over-seed. Fails-before under
+  // -DCONNECT_SEED_FAILBEFORE. test_robust_pipeline: the first ROBUST climb rung
+  // pipelines (no clean-batch serialization). Fails-before under
+  // -DINBAND_ROBUST_PIPELINE_FAILBEFORE.
+  int test_connect_snr_seed();
+  int test_robust_pipeline();
 
   // KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
   // data-decoupled intra-tier climb confirm (inband_retag_confirm_from_base_pattern).

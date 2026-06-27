@@ -871,6 +871,35 @@ CONFIG_16 (5664.7 bps).
 // leaps from a low OFDM anchor) while a pathological jump is bounded.
 #define RETRIGGER_MAX_LEAP 13
 
+// CONNECT-SEED of the START config (gearshift-start-and-recovery.md §10). On a
+// CLEARLY-clean channel, open data near the SNR-appropriate WB OFDM config at
+// connect instead of crawling ROBUST_0->1->2 (the ~102 s dominant climb cost).
+// The connect SNR (measurements.SNR_uplink) at the start transition is the
+// CONTROL-plane MFSK suffix SNR (snr_uplink_from_suffix), which the §15 deep-SNR
+// over-climb guard distrusts: the MFSK suffix decodes at ~1 dB even when OFDM data
+// cannot. So the seed bypasses the §15 anchor clamp (which would force ROBUST_1 at
+// connect) but applies a LARGE margin + a MINIMUM-confidence OFDM floor + a
+// conservative ceiling so a MARGINAL channel still starts ROBUST_0 (no over-seed).
+//
+// CONNECT_SEED_MARGIN_DB: subtracted from the control-plane SNR before mapping
+// through get_configuration(). Chosen LARGER than SUPERSHIFT_MARGIN_DB (6 dB)
+// because the control-vs-data SNR gap is on top of the normal ladder margin —
+// only a channel whose control SNR exceeds the data-viable point by this much
+// gets seeded. With this margin, get_configuration(SNR-margin) maps to CONFIG_0
+// (the no-seed floor, see CONNECT_SEED_CONFIG_MIN) unless the control SNR is
+// clearly high.
+#define CONNECT_SEED_MARGIN_DB 9.0
+// CONNECT_SEED_CONFIG_MIN: the seed fires ONLY if the margin-mapped config is at
+// or above this OFDM rung. Below it, the channel is not clearly clean -> return
+// CONFIG_NONE (start ROBUST_0, byte-identical to today). get_configuration maps
+// SNR>-9 -> CONFIG_1 ... SNR>-2 -> CONFIG_8; requiring CONFIG_4 (SNR-margin>-6,
+// i.e. control SNR > +3 dB) keeps the deep-SNR cliff (control ~1 dB) from seeding.
+#define CONNECT_SEED_CONFIG_MIN CONFIG_4
+// CONNECT_SEED_CONFIG_CAP: even a clearly-clean channel opens at most at this
+// mid-ladder WB rung; the +1 ladder / SNR elevator climbs the rest from a proven
+// start. NOT the top config (a single connect-SNR read must not plant CFG16).
+#define CONNECT_SEED_CONFIG_CAP CONFIG_8
+
 // FIX-B — FLOOR-PROBE BACK-OFF (gearshift-floor-probe-backoff.md). At the
 // robust/OFDM boundary a failed CONFIG_0 up-probe panic-collapses the link to
 // the ROBUST tier; the climb then re-probes that SAME rung on a FIXED cadence,

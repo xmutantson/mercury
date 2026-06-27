@@ -489,6 +489,79 @@ int cl_arq_controller::apply_bigblock_cooldown_cap(int proposed) const
 	return proposed;
 }
 
+// CONNECT-SEED of the START config (gearshift-start-and-recovery.md §10.2) — PURE
+// core. See the arq.h header for the contract. Returns a WB OFDM start config
+// STRICTLY above init_cfg ONLY when the channel is clearly clean, else CONFIG_NONE
+// (the no-over-seed guard -> start ROBUST_0 byte-identical). The caller has already
+// gated feature/gearshift; this enforces the SNR-confidence + cap chain.
+int cl_arq_controller::connect_seed_target_core(double snr_uplink, int snr_mapped,
+	int init_cfg, int proven_ceil, bool nb)
+{
+	// GUARD 0 — SNR sentinel: an un-populated SNR (ctor -99.9) is NOT a clean read.
+	if(snr_uplink <= -90.0)
+		return CONFIG_NONE;
+	// GUARD 1 — minimum confidence: the margin-mapped OFDM config must clear the
+	// CONNECT_SEED_CONFIG_MIN floor. At the deep-SNR cliff the control-plane suffix
+	// SNR (~1 dB) minus CONNECT_SEED_MARGIN_DB maps BELOW this -> no seed (the
+	// control-vs-data over-report cannot plant a WB start on a marginal channel).
+	if(config_ladder_index(snr_mapped) < config_ladder_index(CONNECT_SEED_CONFIG_MIN))
+		return CONFIG_NONE;
+	// Conservative cap chain (never-raise; same family as the elevator's caps):
+	int target = snr_mapped;
+	// (a) the mid-ladder ceiling — one connect read must not plant the top config.
+	if(config_ladder_index(target) > config_ladder_index(CONNECT_SEED_CONFIG_CAP))
+		target = CONNECT_SEED_CONFIG_CAP;
+	// (b) NB ceiling (an NB session cannot exceed NB_CONFIG_MAX).
+	if(nb && config_ladder_index(target) > config_ladder_index(NB_CONFIG_MAX))
+		target = NB_CONFIG_MAX;
+	// (c) proven ceiling from any prior BREAK failures this session.
+	if(proven_ceil >= 0 && config_ladder_index(target) > config_ladder_index(proven_ceil))
+		target = proven_ceil;
+	// GUARD 2 — only a STRICT climb above the un-seeded start is a seed. If the cap
+	// chain pulled the target back to/below init_cfg, there is nothing to seed.
+	if(config_ladder_index(target) <= config_ladder_index(init_cfg))
+		return CONFIG_NONE;
+	return target;
+}
+
+// CONNECT-SEED member wrapper (gearshift-start-and-recovery.md §10.2). Gates on the
+// in-band feature + gearshift + a valid control-plane SNR, maps the SNR through
+// get_configuration() with the large CONNECT_SEED_MARGIN_DB, applies the shared
+// bigblock cooldown cap, then defers the confidence/cap/strict-climb decision to
+// the pure core. Returns the seed config or CONFIG_NONE (no seed -> start ROBUST_0).
+int cl_arq_controller::connect_seed_target()
+{
+#ifdef CONNECT_SEED_FAILBEFORE
+	// FAIL-BEFORE arm: the start is NEVER seeded (the pre-fix crawl-from-ROBUST_0
+	// behaviour). The directed test's pass-after (a clean channel seeds a WB start)
+	// then FAILS, proving the seed is load-bearing.
+	return CONFIG_NONE;
+#else
+	if(!inband_rate_feature_enabled())
+		return CONFIG_NONE;
+	if(gear_shift_on != YES || gear_shift_algorithm != SUCCESS_BASED_LADDER)
+		return CONFIG_NONE;
+	if(measurements.SNR_uplink <= -90.0)
+		return CONFIG_NONE;
+	int snr_mapped = get_configuration(measurements.SNR_uplink - CONNECT_SEED_MARGIN_DB);
+	// Fold the bigblock carve cooldown cap (shared chokepoint) BEFORE the core so a
+	// suspended-CFG16 cooldown also caps the seed (composes order-independently).
+	snr_mapped = apply_bigblock_cooldown_cap(snr_mapped);
+	int seed = connect_seed_target_core(measurements.SNR_uplink, snr_mapped,
+		init_configuration, supershift_proven_ceiling, narrowband_enabled == YES);
+	if(seed != CONFIG_NONE)
+	{
+		printf("[GEARSHIFT] CONNECT-SEED: clean channel (control SNR=%.1f dB, "
+			"mapped@-%.1fdB=%d) -> seed START config %d -> %d (vs crawl-from-%d); "
+			"routes via SET_CONFIG tier-cross\n",
+			measurements.SNR_uplink, CONNECT_SEED_MARGIN_DB, snr_mapped,
+			init_configuration, seed, init_configuration);
+		fflush(stdout);
+	}
+	return seed;
+#endif
+}
+
 
 void cl_arq_controller::process_messages_commander()
 {
@@ -6891,7 +6964,30 @@ void cl_arq_controller::process_control_commander()
 					turboshift_active = false;
 					turbo_supershift_announce_pending = false;
 					turboshift_phase = TURBO_DONE;
-					this->connection_status=TRANSMITTING_DATA;
+					// CONNECT-SEED (gearshift-start-and-recovery.md §10.2): on a
+					// CLEARLY-clean channel skip the ROBUST_0->1->2 crawl (the ~102 s
+					// dominant climb cost) and open data near the SNR-appropriate WB
+					// config. connect_seed_target() returns CONFIG_NONE on anything
+					// not clearly clean (the over-seed guard: a marginal control-plane
+					// SNR maps back to ROBUST_0), so the Option-B no-blind-climb start
+					// is byte-identical for weak channels. A real seed is a robust->OFDM
+					// TIER CROSS: route it through the EXISTING SET_CONFIG builder (the
+					// proven fast cross with the dedicated ACK + the §3 reverse-robust
+					// pin) — NOT a raw data start. The anchor is NOT raised here (the
+					// seed is speculative, like the elevator); a non-viable seed BREAKs
+					// back to the ROBUST floor (§10.4 invariant 2).
+					int seed_cfg = connect_seed_target();
+					if(seed_cfg != CONFIG_NONE)
+					{
+						negotiated_configuration = seed_cfg;
+						cleanup();
+						add_message_control(SET_CONFIG);
+						this->connection_status=TRANSMITTING_CONTROL;
+					}
+					else
+					{
+						this->connection_status=TRANSMITTING_DATA;
+					}
 				}
 			}
 
@@ -10934,6 +11030,208 @@ int cl_arq_controller::test_inband_plus1_climb()
 #endif
 
 	printf("[TEST-PLUS1] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// CONNECT-SEED of the START config regression (gearshift-start-and-recovery.md §10.5).
+// Drives the PURE selector connect_seed_target_core() across SNR cells. A CLEAN channel
+// seeds a WB OFDM start strictly above ROBUST_0 (capped); a MARGINAL channel returns
+// CONFIG_NONE (the over-seed guard). PURE in-process synthetic-fire — permanent
+// regression gate. Fails-before: -DCONNECT_SEED_FAILBEFORE pins the live member
+// connect_seed_target() to CONFIG_NONE (the pre-fix crawl-from-ROBUST_0).
+int cl_arq_controller::test_connect_snr_seed()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-CSEED] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else { printf("[TEST-CSEED] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// ---- PURE CORE (always runs; independent of the FAILBEFORE macro) ----
+	// The core takes snr_mapped (= get_configuration(SNR - margin)) explicitly so the
+	// test injects the mapping without a live telecom_system. init_cfg = ROBUST_0 (the
+	// -R un-seeded start). proven_ceil = -1 (no prior BREAK). nb = false (WB session).
+
+	// A — CLEAN: a clearly-high control SNR maps (after the large margin) to a WB OFDM
+	// config well above ROBUST_0. With snr_mapped = CONFIG_6 (>= MIN=CONFIG_4, <= CAP=
+	// CONFIG_8) the core returns CONFIG_6 (a real seed).
+	int a = connect_seed_target_core(/*snr_uplink=*/15.0, /*snr_mapped=*/CONFIG_6,
+		/*init_cfg=*/ROBUST_0, /*proven_ceil=*/-1, /*nb=*/false);
+	check(a == CONFIG_6, "A clean: snr_mapped CONFIG_6 -> seed CONFIG_6", a, CONFIG_6);
+
+	// B — CLEAN but ABOVE the cap: snr_mapped CONFIG_13 must be clamped to the
+	// conservative ceiling CONNECT_SEED_CONFIG_CAP (CONFIG_8) — one connect read must not
+	// plant the top config.
+	int b = connect_seed_target_core(/*snr_uplink=*/25.0, /*snr_mapped=*/CONFIG_13,
+		/*init_cfg=*/ROBUST_0, /*proven_ceil=*/-1, /*nb=*/false);
+	check(b == CONNECT_SEED_CONFIG_CAP, "B clean-high: snr_mapped CONFIG_13 -> capped at CAP",
+		b, CONNECT_SEED_CONFIG_CAP);
+
+	// C — MARGINAL / deep-SNR cliff: the control-plane suffix SNR (~1 dB) minus the large
+	// margin maps to CONFIG_0 (below MIN=CONFIG_4). The OVER-SEED GUARD returns CONFIG_NONE
+	// -> start ROBUST_0 (no over-seed). This is the load-bearing guard.
+	int c = connect_seed_target_core(/*snr_uplink=*/1.0, /*snr_mapped=*/CONFIG_0,
+		/*init_cfg=*/ROBUST_0, /*proven_ceil=*/-1, /*nb=*/false);
+	check(c == CONFIG_NONE, "C marginal: snr_mapped CONFIG_0 (< MIN) -> NO seed (CONFIG_NONE)",
+		c, CONFIG_NONE);
+
+	// C2 — JUST BELOW MIN: snr_mapped one rung under MIN must still NOT seed.
+	int below_min = config_ladder_down(CONNECT_SEED_CONFIG_MIN, /*robust_enabled=*/false);
+	int c2 = connect_seed_target_core(/*snr_uplink=*/4.0, /*snr_mapped=*/below_min,
+		/*init_cfg=*/ROBUST_0, /*proven_ceil=*/-1, /*nb=*/false);
+	check(c2 == CONFIG_NONE, "C2 below-MIN: snr_mapped < MIN -> NO seed", c2, CONFIG_NONE);
+
+	// D — SNR SENTINEL: an un-populated SNR (-99.9) is never clean -> NO seed even if a
+	// (stale) snr_mapped looks high.
+	int d = connect_seed_target_core(/*snr_uplink=*/-99.9, /*snr_mapped=*/CONFIG_8,
+		/*init_cfg=*/ROBUST_0, /*proven_ceil=*/-1, /*nb=*/false);
+	check(d == CONFIG_NONE, "D sentinel SNR -99.9 -> NO seed", d, CONFIG_NONE);
+
+	// E — PROVEN-CEILING cap: a prior BREAK proved CONFIG_5 the safe ceiling; a clean
+	// snr_mapped CONFIG_8 is capped DOWN to CONFIG_5 (still a real seed above ROBUST_0).
+	int e = connect_seed_target_core(/*snr_uplink=*/15.0, /*snr_mapped=*/CONFIG_8,
+		/*init_cfg=*/ROBUST_0, /*proven_ceil=*/CONFIG_5, /*nb=*/false);
+	check(e == CONFIG_5, "E proven-ceiling CONFIG_5 caps snr_mapped CONFIG_8", e, CONFIG_5);
+
+	// F — NOT STRICTLY ABOVE init: if init_cfg is already CONFIG_8 (== the capped result)
+	// there is nothing to seed -> CONFIG_NONE.
+	int f = connect_seed_target_core(/*snr_uplink=*/15.0, /*snr_mapped=*/CONFIG_6,
+		/*init_cfg=*/CONFIG_8, /*proven_ceil=*/-1, /*nb=*/false);
+	check(f == CONFIG_NONE, "F seed not above init (init==CONFIG_8) -> NO seed", f, CONFIG_NONE);
+
+	// ---- LIVE MEMBER (FAILBEFORE-sensitive) ----
+	// Drive the real connect_seed_target() through the env-cached feature flag forced ON,
+	// a clean live SNR, and a primed telecom_system mapping. The pass-after expects a real
+	// WB seed; the FAIL-BEFORE arm pins it to CONFIG_NONE -> the assert below FAILS.
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+	max_config_override = -1;
+	supershift_proven_ceiling = -1;
+	bigblock_carve_cooldown_batches = 0;     // cooldown disarmed (identity cap)
+	init_configuration = ROBUST_0;
+	inband_rate_enabled = 1;                  // force-resolve the cached feature flag ON
+	measurements.SNR_uplink = 15.0;          // a clean control-plane SNR
+
+	if(telecom_system != NULL)
+	{
+		// get_configuration(15.0 - 9.0 = 6.0) -> CONFIG_13 by the production table; the CAP
+		// clamps it to CONFIG_8. We assert "a real WB seed above ROBUST_0" rather than a
+		// specific rung so the test is robust to the SNR-table tuning.
+		int live = connect_seed_target();
+#ifdef CONNECT_SEED_FAILBEFORE
+		check(live == CONFIG_NONE,
+			"G (fail-before) clean channel NOT seeded -> crawl ROBUST_0 (wedge reproduced)",
+			live, CONFIG_NONE);
+#else
+		bool real_wb_seed = (live != CONFIG_NONE) && is_ofdm_config(live)
+			&& config_ladder_index(live) > config_ladder_index(ROBUST_0)
+			&& config_ladder_index(live) <= config_ladder_index(CONNECT_SEED_CONFIG_CAP);
+		check(real_wb_seed,
+			"G clean channel SEEDS a WB OFDM start above ROBUST_0 (<= CAP)", live, CONFIG_8);
+#endif
+	}
+	else
+	{
+		printf("[TEST-CSEED] SKIP G (live member needs telecom_system); H covers fail-before\n");
+		fflush(stdout);
+	}
+
+	// H — FAILBEFORE-SENSITIVE without a live telecom_system. Models the member
+	// connect_seed_target() decision: under -DCONNECT_SEED_FAILBEFORE the member
+	// short-circuits to CONFIG_NONE (the pre-fix crawl); otherwise it returns the pure
+	// core's seed. snr_mapped CONFIG_6 (clean) -> the pass-after expects a real seed; the
+	// fail-before arm expects CONFIG_NONE. This makes the seed's load-bearing wiring
+	// provable in the in-process suite (the pure-core arms above are NOT macro-guarded, so
+	// only this arm flips under the macro). Mirrors the production macro gate EXACTLY.
+	int h_seed;
+#ifdef CONNECT_SEED_FAILBEFORE
+	h_seed = CONFIG_NONE;   // the member's short-circuit (fail-before)
+	check(h_seed == CONFIG_NONE,
+		"H (fail-before) member NOT seeded on a clean channel (crawl ROBUST_0)",
+		h_seed, CONFIG_NONE);
+#else
+	h_seed = connect_seed_target_core(/*snr_uplink=*/15.0, /*snr_mapped=*/CONFIG_6,
+		/*init_cfg=*/ROBUST_0, /*proven_ceil=*/-1, /*nb=*/false);
+	check(h_seed == CONFIG_6,
+		"H member seeds a clean channel to a WB start above ROBUST_0", h_seed, CONFIG_6);
+#endif
+
+	printf("[TEST-CSEED] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ROBUST-TIER FIRST-RUNG PIPELINE regression (gearshift-start-and-recovery.md §10.5).
+// Drives the REAL production gate inband_pipeline_climb_active() on the robust tier. The
+// FIRST ROBUST rung must pipeline (return true) while climbing, so the ROBUST_0->1->2
+// dwell does not serialize a clean-batch round-trip per rung. Off-feature / OFDM-tier /
+// at-top -> false (legacy). PURE in-process synthetic-fire — permanent regression gate.
+// Fails-before: -DINBAND_ROBUST_PIPELINE_FAILBEFORE pins the robust-tier branch off.
+int cl_arq_controller::test_robust_pipeline()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-RBPIPE] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else { printf("[TEST-RBPIPE] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	gear_shift_on = YES;
+	gear_shift_algorithm = SUCCESS_BASED_LADDER;
+	inband_rate_enabled = 1;                  // force the feature ON
+	inband_retag_armed = false;               // NO climb re-tag armed yet (the first-rung case)
+	inband_retag_config = CONFIG_NONE;
+	inband_pre_announce_config = CONFIG_NONE;
+
+	// A — FIRST ROBUST RUNG, climbing, no retag armed: MUST pipeline (true). Pre-fix this
+	// returned false (inband_retag_armed gate) -> the ROBUST_0 dwell serialized.
+	current_configuration = ROBUST_0;
+	bool a = inband_pipeline_climb_active();
+#ifdef INBAND_ROBUST_PIPELINE_FAILBEFORE
+	check(a == false, "A (fail-before) ROBUST_0 first rung does NOT pipeline (wedge)", a?1:0, 0);
+#else
+	check(a == true, "A ROBUST_0 first rung pipelines (no retag-armed needed)", a?1:0, 1);
+#endif
+
+	// B — OFF-FEATURE: byte-identical legacy (false) regardless of tier.
+	inband_rate_enabled = 0;
+	bool b = inband_pipeline_climb_active();
+	check(b == false, "B off-feature: never pipelines (legacy)", b?1:0, 0);
+	inband_rate_enabled = 1;
+
+	// C — OFDM TIER with NO retag armed: the robust-tier relaxation must NOT fire on OFDM;
+	// the legacy retag-armed gate governs -> false.
+	current_configuration = CONFIG_0;
+	inband_retag_armed = false;
+	bool c = inband_pipeline_climb_active();
+	check(c == false, "C OFDM tier, no retag armed: legacy gate -> false", c?1:0, 0);
+
+	// D — OFDM TIER with a CLIMB retag armed: the legacy OFDM pipeline still works (true).
+	inband_retag_armed = true;
+	inband_pre_announce_config = CONFIG_0;
+	inband_retag_config = CONFIG_2;           // a climb-up
+	bool d = inband_pipeline_climb_active();
+	check(d == true, "D OFDM tier, climb retag armed: legacy pipeline -> true", d?1:0, 1);
+	inband_retag_armed = false;
+	inband_retag_config = CONFIG_NONE;
+	inband_pre_announce_config = CONFIG_NONE;
+
+	// E — GEARSHIFT OFF: a fixed-config robust session must NOT pipeline (no climb).
+	current_configuration = ROBUST_0;
+	gear_shift_on = NO;
+	bool e = inband_pipeline_climb_active();
+	check(e == false, "E gearshift off: robust tier does NOT pipeline", e?1:0, 0);
+	gear_shift_on = YES;
+
+	printf("[TEST-RBPIPE] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
