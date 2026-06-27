@@ -3407,6 +3407,28 @@ bool cl_arq_controller::inband_pipeline_climb_active()
 #else
 	if(!inband_rate_feature_enabled())
 		return false;
+	// ROBUST-TIER FIRST-RUNG PIPELINE (gearshift-start-and-recovery.md §10.3). The OFDM
+	// pipeline below requires inband_retag_armed, which is set only AFTER a climb's first
+	// SET_CONFIG/unilateral fires — so the FIRST ROBUST rung (ROBUST_0, the 68 s DOMINANT
+	// cost) falls under the strict clean-batch gate and is NOT pipelined. Relax it: while
+	// the gearshift is CLIMBING off the ROBUST tier (live config is ROBUST, NOT at the top),
+	// also advance the FRAME-UP streak OPTIMISTICALLY on a forward-healthy data ACK so the
+	// ROBUST_0->1->2 dwell does not serialize a clean-batch round-trip per rung. SAFETY: the
+	// SAME overshoot net inband_retag_escalate_if_climb_exhausted() (:3629) recovers a too-
+	// eager climb to inband_last_confirmed_config (or, at session start where it is
+	// CONFIG_NONE, config_ladder_down(pre_announce) — never craters); NEVER a BREAK, never
+	// below the floor — the SAME envelope §1.8's OFDM pipeline relies on. This relaxes only
+	// the *advance* gate; the climb CONFIRM still rides the config-discriminating suffix bsi
+	// (inband_retag_confirm_from_sack) — it does NOT re-introduce the RETIRED §6 base-pattern
+	// false-confirm. Off-feature / OFDM-tier / at-top -> falls through to the legacy
+	// retag-armed gate (byte-identical).
+#ifndef INBAND_ROBUST_PIPELINE_FAILBEFORE
+	if(gear_shift_on == YES
+	   && gear_shift_algorithm == SUCCESS_BASED_LADDER
+	   && is_robust_config(current_configuration)
+	   && !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES))
+		return true;
+#endif
 	if(!inband_retag_armed)
 		return false;   // no climb in flight -> strict clean-batch gate (legacy semantics)
 	// CLIMB-UP only (the SAME predicate D4 escalation uses, :3253-3257): a re-tag whose
