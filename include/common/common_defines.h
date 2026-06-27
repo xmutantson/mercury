@@ -72,15 +72,23 @@
 // (all-ones) batch, and the commander tries cmd_compact_confirm_crc_valid()
 // first. The CODEC is sim-PROVEN (cliff -4.22 dB deeper, FAR 1e-4, full-path
 // round-trip + no-cross-validate all PASS in --test). This is the temporary,
-// ACTIVELY-DRIVEN A/B gate (NOT a resting default-off): the live-ACK flip awaits
-// the faithful real-audio re-verify of (a) reverse airtime before/after and
-// (b) 0-false-confirm on an asymmetric reverse-WORSE channel — the central
-// invariant. The TX/RX/commander/responder plumbing is wired + tested so the
-// flip to 1 is a one-flag follow-on once the re-verify passes. NOT combinable
-// with the FORGIVING-ACK cumulative path (the compact field carries plain bsi,
-// no n_r reshape) — the responder gates compact OFF when cumulative_ack_enabled.
+// DEFAULT-ON (unconditional, pre-release): the WB M=16 compact coded reverse
+// confirm (Option B). Sim-proven codec (+4.22 dB deeper cliff, ~70 ms shorter on
+// the wire than the MFSK ACK+SACK suffix) and the faithful real-audio re-verify
+// (6bcc3964) cleared both central invariants on a batch>1-WB-SACK channel,
+// replicated on two boxes: (a) reverse airtime SHORTER and the compact confirm is
+// ACCEPTED inside the SACK window (4-7/clean cell, was 0 at f1da9cbe — the 4.7x
+// batch>1-WB delivery regression is GONE, e1>=e0 clean), and (b) 0 false-confirm
+// on an asymmetric reverse-WORSE channel (CRC12-over-[bsi] is the guard) with the
+// partial-SACK retx path intact (the compact decode REJECTS a SACK partial frame,
+// different field layout). The no-cross-validate invariant holds: the compact
+// CRC12-over-[bsi] cannot validate a 13-uncoded [bsi||bitmap] suffix and vice-versa.
+// NOT combinable with the FORGIVING-ACK cumulative path (the compact field carries
+// plain bsi, no n_r reshape) — the responder gates compact OFF when
+// cumulative_ack_enabled. WB-only (M=16); NB / ROBUST M<8 return-path is out of
+// scope (compact_confirm_suffix_len()<=0 => no-op there).
 #ifndef ARQ_COMPACT_CONFIRM_ENABLE
-#define ARQ_COMPACT_CONFIRM_ENABLE 0
+#define ARQ_COMPACT_CONFIRM_ENABLE 1
 #endif
 
 // Verbose debug output (0=quiet, 1=debug prints enabled). Set via -v flag.

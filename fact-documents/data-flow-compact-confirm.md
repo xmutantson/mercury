@@ -392,3 +392,36 @@ fix-b SHIPPED on `staging/short-coded-confirm`. Still gated OFF by ARQ_COMPACT_C
 (held off pending the faithful real-audio batch>1-WB re-verify) — byte-identical to the
 pre-fix path when 0. The §10.4 4.7x batch>1-WB regression at ENABLE=1 is the bug this removes;
 faithful-sim ENABLE=1 batch>1-WB A/B is the next gate before flipping the master enable.
+
+## §12 fix-b FAITHFUL RE-VERIFY — the 4.7x regression is GONE (2026-06-27)
+
+The §11.5 gate is CLEARED. Faithful real-audio A/B at HEAD 6bcc3964 on the EXACT
+batch>1-WB-SACK scenario that regressed 4.7x at f1da9cbe (§10.4).
+
+### §12.1 Builds (both from 6bcc3964)
+- e0 (ENABLE=0, base): md5 `97fc94d4750b2fe6025868d92496bdf7`
+- e1 (ENABLE=1, fix):  md5 `a62ec44ed81facb6692e4b29c07a1756` (via `EXTRA_CFLAGS_ENV=-DARQ_COMPACT_CONFIRM_ENABLE=1`)
+- md5s DIFFER; `.note.gnu.build-id`=6bcc3964 in both; distinct from the prior f1da9cbe pair (9835c9a7/992ff1ce).
+- `--test`: 49 [OK] / 0 FAIL both arms. `--test-compact-confirm-rx`: PASS-AFTER rc=0; FAIL-BEFORE
+  (`MERCURY_COMPACT_SACK_WINDOW_FAILBEFORE=1`) rc=1; `compact_confirm_sack_window_rx_path` PASS (0 fail).
+
+### §12.2 Result (cfg8-PINNED WB, payload 24576 -> batch>1, SACK Design A on; N=3 pairs x 2 boxes + N=4 focused-partial)
+| scenario | e1 rx | e0 rx | e1 breaks | e1 [CMD-COMPACT-CONFIRM] in-SACK-window accepts | false-confirm |
+|---|---|---|---|---|---|
+| clean .31/.11    | 12730/12730 | 12640/12506 | 0/0 | 7.0/7.0 per cell | 0 |
+| revworse .31/.11 | 12640/11970 | 12596/12104 | 0/0 | 6.0/4.0 per cell | 0 |
+| partial snr27 .31| 11708       | 9832        | 0   | 3.0 (+SACK part 4.5) | 0 |
+
+- **compact ACCEPTED inside the SACK window**: `[CMD-COMPACT-CONFIRM] CLEAN (in-SACK-window)` fires
+  4-7/clean cell on BOTH boxes — was **0** at f1da9cbe. `compact_accepted_any=True` (e1), False (e0).
+- **4.7x regression GONE**: e1≈12700 vs e0≈12600 = parity (e1>=e0 on clean), breaks 0 (was 3.0/cell).
+- **partial-SACK intact**: SACK PARTIAL markers both arms; e1 MIXES compact (clean sub-batch) + SACK
+  retx (partial sub-batch) in one session; compact REJECTS partial frames (no cross-validate); e1 rx>=e0.
+- **false-confirm = 0** everywhere. **reverse airtime SHORTER**: compact wire ≈977-992ms vs
+  MFSK-suffix ≈1047-1066ms (~70ms), and now accepted live. **revworse**: parity, breaks 0, still accepted.
+
+### §12.3 Status
+PASS. ARQ_COMPACT_CONFIRM_ENABLE=1 is clear to flip default-ON for the WB M=16 reverse confirm
+(per CLAUDE.md "don't leave a proven fix default-off"). Artifacts: `_research/coded_confirm/
+{reverify_fixb.json, REVERIFY_FIXB.md, reverify_raw_{31,11}.json, partial_only_snr27.json}` +
+fleet `/home/kameron/optBfixb/`. ROBUST/NB M=8 stays out of scope (compact is WB-only, §10.6).
