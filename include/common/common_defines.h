@@ -66,6 +66,23 @@
 #define ARQ_ACK_SUFFIX_FEC_ENABLE 0
 #endif
 
+// Option B — compact coded reverse-confirm (data-flow-compact-confirm.md). When
+// 1, the responder emits the K=5 GF(16)-RA compact confirm (16+10 sym, ~70ms
+// shorter AND ~4 dB more robust than the 13-uncoded ACK suffix) for a CLEAN
+// (all-ones) batch, and the commander tries cmd_compact_confirm_crc_valid()
+// first. The CODEC is sim-PROVEN (cliff -4.22 dB deeper, FAR 1e-4, full-path
+// round-trip + no-cross-validate all PASS in --test). This is the temporary,
+// ACTIVELY-DRIVEN A/B gate (NOT a resting default-off): the live-ACK flip awaits
+// the faithful real-audio re-verify of (a) reverse airtime before/after and
+// (b) 0-false-confirm on an asymmetric reverse-WORSE channel — the central
+// invariant. The TX/RX/commander/responder plumbing is wired + tested so the
+// flip to 1 is a one-flag follow-on once the re-verify passes. NOT combinable
+// with the FORGIVING-ACK cumulative path (the compact field carries plain bsi,
+// no n_r reshape) — the responder gates compact OFF when cumulative_ack_enabled.
+#ifndef ARQ_COMPACT_CONFIRM_ENABLE
+#define ARQ_COMPACT_CONFIRM_ENABLE 0
+#endif
+
 // Verbose debug output (0=quiet, 1=debug prints enabled). Set via -v flag.
 extern int g_verbose;
 

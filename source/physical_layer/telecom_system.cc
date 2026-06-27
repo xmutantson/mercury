@@ -4034,6 +4034,45 @@ int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
 	return ack_sack_pattern_passband_samples;
 }
 
+// Option B (data-flow-compact-confirm.md): TX the compact coded reverse confirm
+// — ACK base (16 sym) + the K=5 GF(16)-RA compact codeword (N=10 sym). Mirrors
+// generate_ack_sack_pattern_passband but emits the SHORTER compact suffix. The
+// shorter total (16+10 < 16+13) fits inside ack_sack_pattern_passband_samples,
+// so no separate sizing member is needed; we return the exact compact sample
+// count. crc12 = caller-supplied CRC12 over [bsi].
+int cl_telecom_system::generate_compact_confirm_passband(double* out,
+	uint8_t bsi, uint16_t crc12)
+{
+	if(ack_mfsk.compact_confirm_suffix_len() <= 0) return 0;  // NB unsupported
+	int nsymb = ack_mfsk.compact_confirm_pattern_nsymb();     // 16 + 10
+	if(nsymb <= 0) return 0;
+	int compact_samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	if(compact_samples <= 0) return 0;
+
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	ack_mfsk.generate_compact_confirm_pattern(data_container.ofdm_framed_data, bsi, crc12);
+
+	for(int i = 0; i < nsymb; i++)
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+
+	double ack_boost = get_tx_gain(TX_SIG_ACK);   // reuse ACK channel — same MFSK family
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	ofdm.peak_clip(out, compact_samples, ofdm.data_papr_cut);
+	return compact_samples;
+}
+
 // RX: Detect ACK pattern and decode SNR suffix tones.
 // Returns decoded SNR (dB). Sets *out_snr_valid = true if suffix decoded reliably.
 float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
@@ -5009,6 +5048,89 @@ bool cl_telecom_system::decode_ack_sack_from_passband_soft(double* data, int siz
 	// payload38 = [bsi:8 | bitmap:30] (mfsk.cc:691 pack_ack_sack_payload).
 	*out_bitmap = (uint32_t)(p38 & 0x3FFFFFFFu);
 	*out_bsi    = (uint8_t)((p38 >> 30) & 0xFFu);
+	return true;
+}
+
+// Option B (data-flow-compact-confirm.md §7): RX the compact coded reverse
+// confirm. Detect the ACK base (same detector + CFO-correct as
+// decode_ack_sack_from_passband_soft), extract the per-tone ENERGY matrix for
+// the first N=10 suffix symbols, and soft-decode the K=5 GF(16)-RA codeword with
+// a CRC12-over-[bsi] accept gate. Returns true iff the codeword decodes AND its
+// recomputed CRC12 matches (gf16ra::soft_decode_compact gates internally).
+bool cl_telecom_system::decode_compact_confirm_from_passband(double* data, int size,
+	ctrl_crc12_fn crc12_fn, void* crc12_ctx, uint8_t* out_bsi, int* out_matched)
+{
+	if (out_bsi) *out_bsi = 0;
+	if (out_matched) *out_matched = 0;
+	if (!out_bsi || !crc12_fn) return false;
+	int suffix_n = ack_mfsk.compact_confirm_suffix_len();
+	if (suffix_n <= 0) return false;                              // NB
+
+	int M = data_container.interpolation_rate;
+	int dec_size = size / M;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		M, &ofdm.FIR_rx_data);
+
+	int matched = 0;
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		ack_mfsk.ack_pattern_nsymb,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&best_offset, /*reserve_after=*/suffix_n, /*out_match_mask=*/nullptr);
+
+	if (out_matched) *out_matched = matched;
+	if (matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
+		return false;
+
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		ack_mfsk.ack_pattern_nsymb, best_offset,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency, effective_carrier - ctrl_residual,
+			carrier_amplitude, M, &ofdm.FIR_rx_data);
+		int rematched = 0, rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			ack_mfsk.ack_pattern_nsymb,
+			ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, 0, nullptr, &rebest_offset, suffix_n, nullptr);
+		if (rematched >= ack_mfsk.ack_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		{
+			matched = rematched; best_offset = rebest_offset;
+			if (out_matched) *out_matched = matched;
+		}
+	}
+
+	// Full per-tone ENERGY matrix for the N compact-codeword symbols.
+	std::vector<double> energies((size_t)suffix_n * ack_mfsk.M);
+	ofdm.decode_suffix_energies(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		best_offset, ack_mfsk.ack_pattern_nsymb, suffix_n,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets, energies.data());
+
+	uint8_t bsi = 0; int iters = -1;
+	bool ok = gf16ra::soft_decode_compact(energies.data(), /*maxiter=*/50,
+		/*esno_metric=*/4.0, crc12_fn, crc12_ctx, &bsi, &iters);
+	if (!ok) return false;
+	*out_bsi = bsi;
 	return true;
 }
 

@@ -2560,11 +2560,36 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				// dominant clean-channel case) -> NOT a retransmit turnaround -> NO robust settle (key
 				// on the tight OFDM turnaround, byte-identical to D2-off / D3-base; recovers the cost).
 				ack_tx_retx_turnaround = false;
-				long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+
+				// Option B (data-flow-compact-confirm.md): for a CLEAN batch, prefer the
+				// COMPACT coded confirm — ~70ms shorter AND ~4 dB more robust than the
+				// 13-uncoded suffix. Gated OFF until the faithful real-audio re-verify
+				// (ARQ_COMPACT_CONFIRM_ENABLE). NOT used when cumulative-ack is negotiated
+				// (the compact field carries plain bsi, no n_r reshape — it would drop the
+				// FORGIVING-ACK self-heal), so the compact path requires wire_bsi == ack_bsi.
+				long long mfsk_ms = 0;
+				if (ARQ_COMPACT_CONFIRM_ENABLE
+					&& !cumulative_ack_enabled
+					&& telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0
+					&& wire_bsi == ack_bsi)
+				{
+					mfsk_ms = send_mfsk_compact_confirm(wire_bsi);
+					if (mfsk_ms > 0)
+					{
+						printf("[TX-ACK-SACK] clean via COMPACT confirm wire_ms=%lld\n", mfsk_ms);
+						fflush(stdout);
+						used_mfsk_path = true;
+					}
+				}
+				if (!used_mfsk_path)
+				{
+					mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+				}
 				if (mfsk_ms > 0)
 				{
-					printf("[TX-ACK-SACK] clean via MFSK suffix wire_ms=%lld\n",
-						mfsk_ms);
+					if (!used_mfsk_path)
+						printf("[TX-ACK-SACK] clean via MFSK suffix wire_ms=%lld\n",
+							mfsk_ms);
 					fflush(stdout);
 					used_mfsk_path = true;
 				}

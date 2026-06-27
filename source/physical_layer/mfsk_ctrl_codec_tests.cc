@@ -4027,6 +4027,261 @@ static void test_gf16_ra_pure_noise_far() {
 }
 
 // =============================================================================
+// COMPACT confirm codec (Option B) — data-flow-compact-confirm.md
+//   test_compact_confirm_encode_decode_clean : K=5 N=10 round-trip on clean
+//       energies (encode -> BP -> CRC gate) for all 256 bsi.
+//   test_compact_confirm_cliff_sweep         : the FALSIFIABLE BER test. K=5
+//       N=10 compact confirm vs the uncoded-13 ACK suffix on ONE noncoherent
+//       M=16 FSK channel (per-tone |received|^2). PASS iff the N=10 P=0.5 cliff
+//       is >= 1.5 dB DEEPER than uncoded-13 (the central invariant: as-robust-
+//       or-more on a worse reverse channel). Replicates the standalone
+//       feasibility result (-4.18 dB) INSIDE the production codec.
+//   test_compact_confirm_pure_noise_far      : compact-codec FAR on pure noise.
+// =============================================================================
+
+// Noncoherent M=16 FSK energy synthesis for ONE codeword symbol: true tone bin
+// gets |A + n|^2, off tones get |n|^2, with n ~ CN(0,sigma^2). Es/N0 = A^2/sigma^2.
+static inline void compact_synth_symbol_energies(int true_tone, double A,
+	double sigma, std::mt19937& rng, std::normal_distribution<double>& nd,
+	double* e16)
+{
+	for (int t = 0; t < 16; t++) {
+		double re = sigma * nd(rng);
+		double im = sigma * nd(rng);
+		if (t == true_tone) re += A;
+		e16[t] = re * re + im * im;
+	}
+}
+
+static void test_compact_confirm_encode_decode_clean() {
+	const char* name = "compact_confirm_encode_decode_clean";
+	cl_arq_controller arq;
+	int N = gf16ra::compact_codeword_len();
+	if (N != 10) { char b[64]; snprintf(b, sizeof(b), "compact N=%d != 10", N); test_fail(name, b); return; }
+	for (int bsi = 0; bsi < 256; bsi++) {
+		unsigned char bb[1]; bb[0] = (unsigned char)bsi;
+		uint16_t crc12 = arq.CRC12_calc((char*)bb, 1) & 0x0FFF;
+		int tones[gf16ra::GF16RA_MAX_N];
+		gf16ra::encode_compact((uint8_t)bsi, crc12, tones);
+		std::vector<double> e((size_t)N * 16, 0.0);
+		for (int s = 0; s < N; s++) e[(size_t)s * 16 + tones[s]] = 1.0;
+		uint8_t rx_bsi = 0; int iters = -2;
+		bool ok = gf16ra::soft_decode_compact(e.data(), GF16RA_BP_MAXITER,
+			GF16RA_ESNO_METRIC, prod_crc12_cb, &arq, &rx_bsi, &iters);
+		if (!ok || rx_bsi != (uint8_t)bsi) {
+			char b[120]; snprintf(b, sizeof(b), "bsi=%d ok=%d rx=%d iters=%d", bsi, ok, rx_bsi, iters);
+			test_fail(name, b); return;
+		}
+	}
+	test_pass(name);
+}
+
+// Decode the uncoded-13 ACK suffix (hard argmax + CRC12 over [bsi]) from a
+// synthesized per-symbol-argmax tone list — the baseline comparand. We model the
+// uncoded suffix as carrying the SAME 20-bit [bsi:8|crc12:12] over 13 hard
+// symbols would be wasteful; the production uncoded-13 carries the FULL 52-bit
+// [type|bsi|bitmap|crc12]. For an APPLES-TO-APPLES robustness comparand on the
+// SAME channel we decode 13 one-hot symbols by per-symbol argmax and require ALL
+// 13 correct (the (1-q)^13 hard-AND cliff GT3 describes) — this is exactly the
+// uncoded suffix's decode-dead behavior. A symbol is "right" iff argmax == tx tone.
+static bool uncoded13_decodes(const int* tx_tones, double A, double sigma,
+	std::mt19937& rng, std::normal_distribution<double>& nd)
+{
+	double e16[16];
+	for (int s = 0; s < 13; s++) {
+		compact_synth_symbol_energies(tx_tones[s], A, sigma, rng, nd, e16);
+		int best = 0; double bv = -1.0;
+		for (int t = 0; t < 16; t++) if (e16[t] > bv) { bv = e16[t]; best = t; }
+		if (best != tx_tones[s]) return false;   // hard-AND: one wrong symbol kills it
+	}
+	return true;
+}
+
+static void test_compact_confirm_cliff_sweep() {
+	const char* name = "compact_confirm_cliff_sweep";
+	cl_arq_controller arq;
+	int N = gf16ra::compact_codeword_len();
+	std::mt19937 rng(0xC0DEC0FFEEULL);
+	std::normal_distribution<double> nd(0.0, 1.0);  // standard normal; scaled by sigma
+	const double A = 1.0;                 // Es = A^2 = 1 (per-symbol, single-sample model)
+	const int T = 1500;
+	// SNR axis in per-symbol Es/N0 dB. The noncoherent M=16 FSK symbol-error q is
+	// high at low per-symbol Es/N0 (q~0.5 at +4 dB), so the uncoded-13 (1-q)^13
+	// hard-AND and the K=5 N=10 RA both cross P=0.5 in the +5..+11 dB region. This
+	// is an HONEST per-symbol axis (no processing-gain calibration); the
+	// comparison is apples-to-apples on the SAME channel, and the RELATIVE gain is
+	// the axis-invariant, load-bearing result (the central invariant). 0.5 dB grid.
+	double esno_grid[] = {12.0,11.5,11.0,10.5,10.0,9.5,9.0,8.5,8.0,7.5,7.0,6.5,
+	                      6.0,5.5,5.0,4.5,4.0,3.5,3.0,2.5,2.0};
+	int ng = (int)(sizeof(esno_grid)/sizeof(esno_grid[0]));
+	double compact_cliff = 99.0, uncoded_cliff = 99.0;
+	double prev_pc = 1.0, prev_pu = 1.0, prev_e = 99.0;
+	printf("    [COMPACT-CLIFF] EsN0(dB)  P(compact N=10)  P(uncoded-13)\n");
+	for (int gi = 0; gi < ng; gi++) {
+		double esno_db = esno_grid[gi];
+		// per-quadrature noise std: n_re,n_im ~ N(0,sigma^2); N0 = E[|n|^2] = 2*sigma^2.
+		// Es = A^2 = 1. Es/N0 = A^2/(2*sigma^2)  =>  sigma = sqrt(A^2 / (2 * 10^(EsN0/10))).
+		double sigma = std::sqrt(A * A / (2.0 * std::pow(10.0, esno_db / 10.0)));
+		int ok_c = 0, ok_u = 0;
+		for (int t = 0; t < T; t++) {
+			uint8_t bsi = (uint8_t)(rng() & 0xFF);
+			unsigned char bb[1]; bb[0] = bsi;
+			uint16_t crc12 = arq.CRC12_calc((char*)bb, 1) & 0x0FFF;
+			int ctones[gf16ra::GF16RA_MAX_N];
+			gf16ra::encode_compact(bsi, crc12, ctones);
+			std::vector<double> e((size_t)N * 16);
+			double e16[16];
+			for (int s = 0; s < N; s++) {
+				compact_synth_symbol_energies(ctones[s], A, sigma, rng, nd, e16);
+				for (int t2 = 0; t2 < 16; t2++) e[(size_t)s * 16 + t2] = e16[t2];
+			}
+			uint8_t rx_bsi = 0; int iters = -2;
+			if (gf16ra::soft_decode_compact(e.data(), GF16RA_BP_MAXITER,
+				GF16RA_ESNO_METRIC, prod_crc12_cb, &arq, &rx_bsi, &iters) && rx_bsi == bsi)
+				ok_c++;
+			// uncoded-13 baseline: 13 random tx tones on the same channel
+			int u_tones[13];
+			for (int s = 0; s < 13; s++) u_tones[s] = (int)(rng() & 0xF);
+			if (uncoded13_decodes(u_tones, A, sigma, rng, nd)) ok_u++;
+		}
+		double pc = (double)ok_c / T, pu = (double)ok_u / T;
+		printf("    [COMPACT-CLIFF]  %6.1f       %.3f            %.3f\n", esno_db, pc, pu);
+		// linear-interpolate the P=0.5 crossing (descending P as SNR drops)
+		if (compact_cliff > 90.0 && prev_pc >= 0.5 && pc < 0.5)
+			compact_cliff = prev_e + (esno_db - prev_e) * (prev_pc - 0.5) / (prev_pc - pc);
+		if (uncoded_cliff > 90.0 && prev_pu >= 0.5 && pu < 0.5)
+			uncoded_cliff = prev_e + (esno_db - prev_e) * (prev_pu - 0.5) / (prev_pu - pu);
+		prev_pc = pc; prev_pu = pu; prev_e = esno_db;
+	}
+	double gain = uncoded_cliff - compact_cliff;  // dB deeper (more negative cliff)
+	printf("    [COMPACT-CLIFF] compact-N10 cliff=%.2f dB  uncoded-13 cliff=%.2f dB  "
+		"DEEPER by %.2f dB\n", compact_cliff, uncoded_cliff, gain);
+	if (compact_cliff > 90.0 || uncoded_cliff > 90.0) {
+		test_fail(name, "a cliff did not cross P=0.5 on the grid"); return;
+	}
+	// Central invariant: compact confirm must be AS-ROBUST-OR-MORE. Require >= +1.5 dB
+	// deeper (the SPEC claim; feasibility measured +4.18). Margin for the 1500-trial
+	// finite-grid: require >= 1.5.
+	if (gain < 1.5) {
+		char b[140]; snprintf(b, sizeof(b),
+			"compact N=10 only %.2f dB deeper than uncoded-13 (need >=1.5) "
+			"[compact=%.2f uncoded=%.2f]", gain, compact_cliff, uncoded_cliff);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+static void test_compact_confirm_pure_noise_far() {
+	const char* name = "compact_confirm_pure_noise_far";
+	cl_arq_controller arq;
+	int N = gf16ra::compact_codeword_len();
+	const int trials = 8000;
+	std::mt19937 rng(0xFA7C0DECULL);
+	std::exponential_distribution<double> ed(1.0);  // |CN|^2 ~ exponential
+	int accepts = 0;
+	for (int it = 0; it < trials; it++) {
+		std::vector<double> e((size_t)N * 16);
+		for (int i = 0; i < N * 16; i++) e[i] = ed(rng);
+		uint8_t bsi = 0; int iters = -2;
+		if (gf16ra::soft_decode_compact(e.data(), GF16RA_BP_MAXITER,
+			GF16RA_ESNO_METRIC, prod_crc12_cb, &arq, &bsi, &iters))
+			accepts++;
+	}
+	double far_rate = (double)accepts / trials;
+	printf("    [COMPACT-FAR] compact-codec pure-noise spurious-accept: %d/%d = %.4f "
+		"(raw CRC12 ceiling ~2.4e-4; system FAR ~5e-11/poll w/ bsi-window+count gates)\n",
+		accepts, trials, far_rate);
+	// Raw-codec FAR ceiling is bare CRC12 (~2.44e-4). Allow margin for the finite
+	// trial count; the as-robust-false-confirm property is restored at the system
+	// level by the upstream bsi-in-window + base-count gates (fact-doc §6 I5).
+	if (far_rate > 0.002) {
+		char b[120]; snprintf(b, sizeof(b), "compact FAR %.4f > 0.002 (codec layer)", far_rate);
+		test_fail(name, b); return;
+	}
+	test_pass(name);
+}
+
+// Build compact-confirm passband audio (ACK base + N=10 compact codeword) with
+// 4096-sample lead-in padding, mirroring build_ack_sack_audio.
+static std::vector<double> build_compact_confirm_audio(cl_telecom_system& ts,
+	uint8_t bsi, int& out_active_samples) {
+	unsigned char bb[1]; bb[0] = bsi;
+	uint16_t crc12 = test_crc12_calc(bb, 1);
+	// active sample count = (16+10) * Nofdm * interp.
+	int nsymb = ts.ack_mfsk.compact_confirm_pattern_nsymb();
+	int n_samples = nsymb * ts.data_container.Nofdm * ts.frequency_interpolation_rate;
+	out_active_samples = n_samples;
+	std::vector<double> audio((size_t)n_samples + 8192, 0.0);
+	ts.generate_compact_confirm_passband(audio.data() + 4096, bsi, crc12);
+	return audio;
+}
+
+// §B.1 — full TX -> passband -> RX -> GF(16) K=5 compact decode on a CLEAN
+// channel. Proves the production DSP chain (generate_compact_confirm_passband +
+// decode_compact_confirm_from_passband) round-trips the bsi for every value.
+static void test_compact_confirm_passband_roundtrip_clean() {
+	const char* name = "compact_confirm_passband_roundtrip_clean";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.compact_confirm_suffix_len() <= 0) { test_fail(name, "compact suffix unsupported on WB CONFIG_0"); return; }
+	const uint8_t bsis[] = {0, 1, 7, 42, 128, 200, 254, 255};
+	for (int bi = 0; bi < 8; bi++) {
+		int active = 0;
+		std::vector<double> audio = build_compact_confirm_audio(ts, bsis[bi], active);
+		uint8_t rx_bsi = 0xAA; int matched = 0;
+		bool ok = ts.decode_compact_confirm_from_passband(audio.data(), (int)audio.size(),
+			prod_crc12_cb, &arq, &rx_bsi, &matched);
+		if (!ok || rx_bsi != bsis[bi]) {
+			char b[140]; snprintf(b, sizeof(b), "bsi=%d ok=%d rx=%d matched=%d", bsis[bi], ok, rx_bsi, matched);
+			test_fail(name, b); return;
+		}
+	}
+	test_pass(name);
+}
+
+// §B.2 — CROSS-VALIDATION SAFETY (the false-confirm invariant): a 13-uncoded
+// ACK+SACK suffix must NOT decode as a compact confirm, and a compact confirm
+// must NOT decode as a 13-uncoded clean-data ACK. The two CRC12s are over
+// different fields ([bsi] vs [bsi||bitmap]) so neither cross-validates the
+// other (data-flow-compact-confirm.md §6 I3). A false cross-accept = silent
+// data loss, the unacceptable case.
+static void test_compact_confirm_no_cross_validate() {
+	const char* name = "compact_confirm_no_cross_validate";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(CONFIG_0);
+	cl_arq_controller arq;
+	if (ts.ack_mfsk.compact_confirm_suffix_len() <= 0) { test_fail(name, "compact unsupported"); return; }
+
+	// (a) A real 13-uncoded ACK+SACK (clean all-ones) must NOT pass the compact decode.
+	{
+		uint8_t bsi = 0x5A; uint32_t bitmap = 0x3FFFFFFFu; // 30-bit all-ones (clean)
+		uint64_t p38 = ((uint64_t)bsi << 30) | bitmap;
+		int active = 0;
+		std::vector<double> audio = build_ack_sack_audio(ts, p38, active);
+		uint8_t rx_bsi = 0; int m = 0;
+		if (ts.decode_compact_confirm_from_passband(audio.data(), (int)audio.size(),
+			prod_crc12_cb, &arq, &rx_bsi, &m)) {
+			test_fail(name, "a 13-uncoded ACK+SACK FALSELY decoded as a compact confirm"); return;
+		}
+	}
+	// (b) A compact confirm must NOT pass the 13-uncoded clean-data-ACK decode.
+	{
+		int active = 0;
+		std::vector<double> audio = build_compact_confirm_audio(ts, 0x5A, active);
+		uint8_t rb = 0; uint32_t bm = 0; uint16_t rc = 0; int m = 0;
+		if (ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(), &rb, &bm, &rc, &m)) {
+			// decode may "detect" the base; the CRC over [bsi||bitmap] must NOT match.
+			char crc_in[5]; crc_in[0]=(char)rb;
+			crc_in[1]=(char)((bm>>24)&0xFF); crc_in[2]=(char)((bm>>16)&0xFF);
+			crc_in[3]=(char)((bm>>8)&0xFF);  crc_in[4]=(char)(bm&0xFF);
+			if ((uint16_t)(arq.CRC12_calc(crc_in,5)&0xFFF) == rc) {
+				test_fail(name, "a compact confirm FALSELY passed the 13-uncoded ACK CRC"); return;
+			}
+		}
+	}
+	test_pass(name);
+}
+
+// =============================================================================
 // §24 CONFIG_TAG codec (in-band rate adaptation, Stage-1)
 //   tag-codeword-design.md §5/§8 + fact-documents/data-flow-config-tag-codec.md
 //
@@ -7685,6 +7940,15 @@ int run_mfsk_ctrl_codec_tests() {
 	if (heavy_sweep) test_gf16_ra_cliff_sweep();      // [MEASURE] GF(16) cliff + gain dB (heavy)
 	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
 	if (heavy_sweep) test_gf16_ra_production_path_cliff_sweep();   // heavy cliff sweep
+
+	// Option B: compact coded reverse-confirm suffix (K=5, N=10).
+	// data-flow-compact-confirm.md. The cliff sweep is the FALSIFIABLE gate (the
+	// central invariant: compact confirm AS-ROBUST-OR-MORE than the uncoded-13).
+	test_compact_confirm_encode_decode_clean();
+	test_compact_confirm_pure_noise_far();
+	test_compact_confirm_cliff_sweep();   // PASS iff N=10 cliff >= +1.5 dB deeper than uncoded-13
+	test_compact_confirm_passband_roundtrip_clean();   // full TX->passband->RX DSP chain
+	test_compact_confirm_no_cross_validate();          // false-confirm invariant: no aliasing
 
 	// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation,
 	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the

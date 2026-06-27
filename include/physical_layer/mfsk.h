@@ -270,6 +270,19 @@ public:
 	void generate_ack_sack_pattern(std::complex<double>* pattern_out,
 	                               uint8_t bsi, uint32_t bitmap,
 	                               uint16_t crc12);
+	// Option B compact confirm: ACK base (ack_pattern_nsymb) + the K=5 GF(16)-RA
+	// compact codeword (gf16ra::compact_codeword_len() = 10 sym) carrying
+	// [bsi:8|crc12:12]. Same tone-hop continuation as generate_ack_sack_pattern
+	// (abs_s = ack_pattern_nsymb + g). crc12 = caller-supplied CRC12 over [bsi].
+	// Length: compact_confirm_pattern_nsymb() = ack_pattern_nsymb + 10.
+	int  compact_confirm_suffix_len() const {
+		return (M >= 16) ? gf16ra::compact_codeword_len() : 0;   // 0 = NB unsupported
+	}
+	int  compact_confirm_pattern_nsymb() const {
+		return ack_pattern_nsymb + compact_confirm_suffix_len();
+	}
+	void generate_compact_confirm_pattern(std::complex<double>* pattern_out,
+	                                      uint8_t bsi, uint16_t crc12);
 	// Generate CONNECT base pattern + 13-symbol ctrl-suffix carrying
 	// (type, payload, crc12). The base pattern uses connect_tones (NOT
 	// ack_tones) so the detector can distinguish CONNECT from ACK+SACK.

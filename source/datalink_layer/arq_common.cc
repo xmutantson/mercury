@@ -10236,6 +10236,162 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 #endif  // MFSK_ACK_SACK_ENABLED
 }
 
+// Option B (data-flow-compact-confirm.md): emit the COMPACT coded reverse
+// confirm. STRUCTURAL CLONE of send_mfsk_ack_sack — the ONLY differences are:
+// (1) CRC12 over the single [bsi] byte (not [bsi||bitmap]); (2) the compact
+// generate (generate_compact_confirm_passband, 16+10 sym); (3) the compact
+// passband sample count. The PTT / FIR / pilot / drain / capture-flush
+// scaffolding is identical so turnaround behaviour matches the ACK path. CLEAN
+// batch only.
+long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_id)
+{
+	if(passive_monitor) return 0;
+
+#if !MFSK_ACK_SACK_ENABLED
+	(void)batch_seq_id;
+	return 0;
+#else
+	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
+		return 0;  // NB / unsupported
+
+	int nsymb = telecom_system->ack_mfsk.compact_confirm_pattern_nsymb();
+	int compact_samples = nsymb * telecom_system->data_container.Nofdm
+	                    * telecom_system->frequency_interpolation_rate;
+	if(nsymb <= 0 || compact_samples <= 0)
+		return 0;
+
+	auto t_start = std::chrono::steady_clock::now();
+
+	// CRC12 over the single [bsi] byte (production CRC12_calc).
+	char crc_input[1];
+	crc_input[0] = (char)batch_seq_id;
+	uint16_t crc12 = CRC12_calc(crc_input, 1);
+
+	printf("[TX-MFSK-COMPACT] batch_seq_id=%u crc12=0x%03x nsymb=%d on CONFIG_%d\n",
+		(unsigned)batch_seq_id, (unsigned)crc12, nsymb, current_configuration);
+	fflush(stdout);
+
+	// Read+clear the per-call retx-turnaround flag (clean confirm -> FALSE; same
+	// §21.1 discipline as send_mfsk_ack_sack). Compact confirm is CLEAN-batch only
+	// so this is normally FALSE.
+	bool this_ack_is_retx_turnaround = ack_tx_retx_turnaround;
+	ack_tx_retx_turnaround = false;
+
+	bool ofdm_settle = reverse_ack_uses_robust_geometry(current_configuration)
+#ifndef FIX9_D2REFINE_FAILBEFORE
+		&& this_ack_is_retx_turnaround
+#endif
+		;
+	if(is_robust_config(current_configuration) || ofdm_settle)
+	{
+		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
+		printf("[TX-MFSK-COMPACT] D2 robust-geometry settle=%dms on CONFIG_%d\n",
+			wait_ms, current_configuration);
+		fflush(stdout);
+		pumped_settle_wait(wait_ms);
+	}
+
+	ptt_on();
+
+	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
+	ptt_on_delay_timer.start();
+
+	int symbol_period = telecom_system->data_container.Nofdm
+	                  * telecom_system->data_container.interpolation_rate;
+	int padded_size = compact_samples + 2 * symbol_period;
+	double *raw_output = new double[padded_size];
+	double *filtered1  = new double[padded_size];
+	double *filtered2  = new double[padded_size];
+	if(!raw_output || !filtered1 || !filtered2) exit(-37);
+	memset(raw_output, 0, padded_size * sizeof(double));
+
+	telecom_system->generate_compact_confirm_passband(&raw_output[symbol_period],
+		batch_seq_id, crc12);
+
+	memcpy(&raw_output[0], &raw_output[symbol_period],
+		symbol_period * sizeof(double));
+	memcpy(&raw_output[symbol_period + compact_samples], &raw_output[compact_samples],
+		symbol_period * sizeof(double));
+
+	memset(filtered1, 0, padded_size * sizeof(double));
+	memset(filtered2, 0, padded_size * sizeof(double));
+	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
+	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
+
+	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
+
+	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
+	{
+		const double SAMPLE_RATE = 48000.0;
+		const double PILOT_FREQ  = (double)pilot_tone_hz;
+		const double PI = 3.14159265358979323846;
+		int pilot_samples = (int)(pilot_tone_ms * SAMPLE_RATE / 1000.0);
+		double* pilot_buffer = new double[pilot_samples];
+		for(int i = 0; i < pilot_samples; i++)
+		{
+			double t = (double)i / SAMPLE_RATE;
+			double envelope = 1.0;
+			int ramp_samples = (int)(SAMPLE_RATE * 0.005);
+			if(i < ramp_samples) envelope = (double)i / ramp_samples;
+			else if(i > pilot_samples - ramp_samples)
+				envelope = (double)(pilot_samples - i) / ramp_samples;
+			pilot_buffer[i] = envelope * 0.5 * sin(2.0 * PI * PILOT_FREQ * t);
+		}
+		tx_transfer(pilot_buffer, pilot_samples);
+		delete[] pilot_buffer;
+	}
+
+	printf("[TX-MFSK-COMPACT] Audio start (%d samples)\n", compact_samples);
+	fflush(stdout);
+	tx_transfer(&filtered2[symbol_period], compact_samples);
+
+	drain_playback_wait();
+
+	printf("[TX-MFSK-COMPACT] Audio done\n");
+	fflush(stdout);
+
+	delete[] raw_output;
+	delete[] filtered1;
+	delete[] filtered2;
+
+	// Same flush sequence as send_mfsk_ack_sack.
+	telecom_system->data_container.rx_mute = 1;
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);
+	circular_buf_reset(capture_buffer);
+	{
+		int buf_samples = telecom_system->data_container.Nofdm
+		                * telecom_system->data_container.buffer_Nsymb
+		                * telecom_system->data_container.interpolation_rate;
+		MUTEX_LOCK(&capture_prep_mutex);
+		memset(telecom_system->data_container.passband_delayed_data, 0,
+			2 * buf_samples * sizeof(double));
+		telecom_system->data_container.ring_write_index = 0;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+	telecom_system->data_container.rx_mute = 0;
+	telecom_system->data_container.rx_mute_samples = 0;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	{
+		int rx_frame = telecom_system->data_container.preamble_nSymb
+		             + telecom_system->data_container.Nsymb;
+		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
+	}
+
+	ptt_off_delay_timer.start();
+	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
+	ptt_off();
+
+	auto t_end = std::chrono::steady_clock::now();
+	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		t_end - t_start).count();
+	return elapsed_ms;
+#endif  // MFSK_ACK_SACK_ENABLED
+}
+
 bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
                                              unsigned char* out_batch_seq_id)
 {

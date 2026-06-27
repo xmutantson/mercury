@@ -203,6 +203,21 @@ public:
 	                                   uint8_t* out_bsi, uint32_t* out_bitmap,
 	                                   uint16_t* out_crc12,
 	                                   int* out_matched = nullptr);
+
+	// Option B (data-flow-compact-confirm.md): compact coded reverse-confirm.
+	// TX: ACK base (16 sym) + the K=5 GF(16)-RA compact codeword (N=10 sym)
+	// carrying [bsi:8|crc12:12]. crc12 = production CRC12 over the single [bsi]
+	// byte. Returns samples written, or 0 if unsupported (NB / M<16). CLEAN-batch
+	// confirm only (all-ones bitmap is implicit in the confirm type).
+	int generate_compact_confirm_passband(double* out, uint8_t bsi, uint16_t crc12);
+	// RX: detect the ACK base, extract the per-tone ENERGY matrix for the first
+	// N=10 suffix symbols (decode_suffix_energies), and soft-decode the compact
+	// codeword (gf16ra::soft_decode_compact) with a CRC12 accept gate. Returns
+	// true iff the codeword decodes AND its recomputed CRC12 over [bsi] matches.
+	// *out_matched (optional) gets the base-pattern match count.
+	bool decode_compact_confirm_from_passband(double* data, int size,
+	                                          ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+	                                          uint8_t* out_bsi, int* out_matched = nullptr);
 	void ack_pattern_detection_test();  // SNR sweep + false alarm test
 
 	// BREAK pattern: emergency "drop to ROBUST_0" signal (different tones from ACK)

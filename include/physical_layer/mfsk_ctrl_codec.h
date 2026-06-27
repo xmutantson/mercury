@@ -319,6 +319,42 @@ bool soft_decode_config_tag(const double* energies, int maxiter,
                             ctrl_crc12_fn crc12_fn, void* crc12_ctx,
                             uint64_t* out_payload37, int* out_iters);
 
+// -----------------------------------------------------------------------------
+// COMPACT confirm variant (Option B, data-flow-compact-confirm.md). A SHORT
+// GF(16) RA codeword carrying ONLY [bsi:8 | CRC12:12] = 20 info bits = K=5 info
+// symbols (bsi = 2 symbols, CRC = 3 symbols), with NO in-suffix type field (the
+// ACK base pattern is the type discriminator — C9 §4.1). repfact=1 -> N=10
+// (R=1/2): 3 symbols SHORTER than the uncoded-13 ACK suffix, yet ~+4 dB deeper
+// (feasibility.json: -11.50 dB content cliff vs -7.32). The compact codeword
+// confirms a CLEAN (all-ones) batch only; partial loss uses the SACK path.
+//
+// PHYSICALLY SEPARATE K=5 graph state (g5_*) from the K=13 singleton above, so
+// the CONNECT-suffix FEC (K=13) and the ACK compact confirm (K=5) can coexist
+// in the same RX poll WITHOUT clobbering each other (the §21.1 shared-state
+// hazard; data-flow-compact-confirm.md §5). Reuses ONLY the stateless/shared
+// field+BP math; never mutates g_N/g_NC/g_acc_idx so the K=13 path is
+// byte-identical. Idempotent build on first use.
+static const int GF16RA_C_K_MSG = 2;   // info symbols carrying the 8-bit bsi
+static const int GF16RA_C_K_CRC = 3;   // info symbols carrying the 12-bit CRC
+static const int GF16RA_C_K     = 5;   // total info symbols
+static const int GF16RA_C_REPFACT = 1; // R=1/2 -> N = K + repfact*K = 10
+int  compact_codeword_len();           // N for the compact code (=10)
+
+// Encode: 8-bit bsi + 12-bit crc12 -> N GF(16) compact-codeword tones (0..15).
+// out_tones must hold compact_codeword_len() (<= GF16RA_MAX_N). crc12 is the
+// production CRC-12 over the single [bsi] byte (caller-computed).
+void encode_compact(uint8_t bsi, uint16_t crc12, int* out_tones);
+
+// Soft decode of the compact codeword from the per-tone ENERGY matrix
+// (N*M row-major; same decode_suffix_energies vectors as soft_decode). Decodes
+// the K=5 info symbols by Q-ary BP + MAP argmax, reassembles [bsi|crc12],
+// recomputes CRC12 over [bsi] via crc12_fn, and accepts iff it matches. On
+// success writes *out_bsi and returns true. NO type gate (the ACK base pattern
+// gated type upstream).
+bool soft_decode_compact(const double* energies, int maxiter, double esno_metric,
+                         ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                         uint8_t* out_bsi, int* out_iters);
+
 } // namespace gf16ra
 
 // =============================================================================

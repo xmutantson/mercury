@@ -175,6 +175,71 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 #endif
 }
 
+// Production CRC12 callback for the compact-confirm decode (ctx = this).
+// File-local clone of arq_common.cc's arq_ctrl_crc12_cb (that one is static
+// there). NEVER inline the CRC (v1 bug #1 init mismatch). Matches ctrl_crc12_fn.
+static uint16_t cmd_compact_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
+	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
+// Option B (data-flow-compact-confirm.md §5): peek the passband tail for a
+// CRC12-valid, in-window COMPACT confirm. Structurally cloned from
+// cmd_clean_data_ack_crc_valid; differences: shorter capture window (16+10 vs
+// 16+max(8,13)), decode via decode_compact_confirm_from_passband, CRC12 over the
+// single [bsi] byte (gated INSIDE soft_decode_compact), CLEAN/all-ones implicit.
+bool cl_arq_controller::cmd_compact_confirm_crc_valid()
+{
+#if MFSK_ACK_SACK_ENABLED
+	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
+		return false;  // NB / suffix-incapable.
+
+	// Tail window — same math as cmd_clean_data_ack_crc_valid but sized to the
+	// (shorter) compact confirm. The compact suffix (10) <= the ACK/SACK suffix
+	// (13), so the existing ring is strictly safe (data-flow §6 I1/I4).
+	int ack_nsymb   = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int compact_suffix = telecom_system->ack_mfsk.compact_confirm_suffix_len();
+	const int mfsk_tail_nsymb = ack_nsymb + compact_suffix + 16;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = mfsk_tail_nsymb * sym_samples;
+	if(tail_samples > signal_period)
+		tail_samples = signal_period;
+	int tail_offset = signal_period - tail_samples;
+
+	// Read-only snapshot of the tail (no frames_to_read mutation).
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi_mfsk = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi_mfsk + tail_offset],
+		tail_samples * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+
+	uint8_t rx_bsi = 0;
+	int     mfsk_matched = 0;
+	bool decoded = telecom_system->decode_compact_confirm_from_passband(
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		tail_samples, cmd_compact_crc12_cb, this, &rx_bsi, &mfsk_matched);
+	if(!decoded)
+		return false;  // soft_decode_compact already gated CRC12-over-[bsi].
+
+	// bsi must be the current or just-prior batch (mod 256) — RSP only confirms a
+	// batch whose batch_seq_id matches one of those (identical to the SACK arm).
+	unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+	if(!((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi))
+		return false;
+
+	// CLEAN-batch implicit: a compact confirm MEANS all-ones (the responder only
+	// emits it for a fully-received batch; partial loss uses the SACK path).
+	return true;
+#else
+	return false;
+#endif
+}
+
 // Option B (data-anchored gearshift promotion, 2026-05-29): floor a raw BREAK
 // recovery target at last_data_viable_config so BREAK never drops BELOW the
 // highest rung that has carried data this session. EXCEPTION: the panic-jump
@@ -4278,10 +4343,17 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// runs ONLY on WB (suffix-capable) AND only after a bare pattern match
 			// — NB never pays the FFT cost and its bare-pattern acceptance is byte-
 			// for-byte unchanged.
+			// Option B (data-flow-compact-confirm.md §5): try the COMPACT confirm
+			// FIRST (cheaper/shorter/deeper) then the 13-uncoded clean-data ACK. The
+			// two CRC12s are over different fields so neither cross-validates the
+			// other (the false-confirm invariant; test_compact_confirm_no_cross_validate).
+			// Gated OFF until the faithful real-audio re-verify (the predicate compiles
+			// to the unchanged condition when ARQ_COMPACT_CONFIRM_ENABLE==0).
 			else if(data_ack_received==NO
 			        && (v2_ack_pat_pre_detected
 			            || (!sack_window_open && receive_ack_pattern()
 			                && (telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0
+			                    || (ARQ_COMPACT_CONFIRM_ENABLE && cmd_compact_confirm_crc_valid())
 			                    || cmd_clean_data_ack_crc_valid()))))
 			{
 				printf("[CMD-ACK-PAT] Data ACK pattern detected!\n");

@@ -898,6 +898,39 @@ void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
 	}
 }
 
+// Option B compact confirm: ACK base + the K=5 GF(16)-RA compact codeword
+// (N=10 sym) carrying [bsi:8|crc12:12]. Mirrors generate_ack_sack_pattern's
+// tone-hopping (abs_s = ack_pattern_nsymb + g) so the RX uses the SAME base
+// detector + de-hop math. crc12 = caller-supplied CRC12 over [bsi]. The base
+// pattern is the ACK base (ack_tones) so the detector routes it as an ACK; the
+// commander's CRC12-gated compact decode is what distinguishes it from a 13-sym
+// SACK/clean-data-ACK suffix (data-flow-compact-confirm.md §4).
+void cl_mfsk::generate_compact_confirm_pattern(std::complex<double>* pattern_out,
+                                               uint8_t bsi, uint16_t crc12)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0) return;
+	int suffix_len = compact_confirm_suffix_len();
+	if (suffix_len == 0) return;  // NB unsupported
+
+	// ACK base pattern (16 sym WB) — identical to the ACK+SACK path.
+	generate_ack_pattern(pattern_out);
+
+	// K=5 GF(16)-RA compact codeword tones (N = compact_codeword_len() = 10).
+	int code_tones[MAX_ACK_SACK_SUFFIX];
+	gf16ra::encode_compact(bsi, crc12, code_tones);
+
+	double amp = sqrt((double)Nc / nStreams);
+	for (int s = 0; s < suffix_len; s++) {
+		int abs_s = ack_pattern_nsymb + s;  // absolute symbol index (continues the hop)
+		for (int k = 0; k < Nc; k++)
+			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+		int actual_tone = (code_tones[s] + abs_s * tone_hop_step) % M;
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
+	}
+}
+
 // Generate CONNECT base pattern: 16 symbols (WB) hopping over connect_tones.
 // Mirror of generate_ack_pattern but uses connect_tones instead.
 void cl_mfsk::generate_connect_pattern(std::complex<double>* pattern_out)

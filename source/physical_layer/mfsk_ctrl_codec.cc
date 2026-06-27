@@ -584,10 +584,16 @@ static inline double log_i0_approx(double v)
 // legacy decoder stays bit-for-bit unchanged); the ONLY thing the two public
 // entries do differently is the message reassemble + CRC/type gate (2-bit type
 // for soft_decode vs 3-bit type for soft_decode_config_tag).
-static void gf16ra_bp_to_info(const double* energies, int maxiter,
-                              double esno_metric, int* info_out, int* out_iters)
+// Parameterized BP core: graph (N,K,NC,factor_edges) supplied by the caller so
+// the K=13 singleton path AND the K=5 compact path share ONE decoder body. The
+// K=13 entry (gf16ra_bp_to_info) passes the g_* globals -> bit-for-bit unchanged.
+static void bp_to_info_param(const double* energies, int maxiter,
+                             double esno_metric,
+                             int N, int K, int nfac,
+                             const std::vector<FactorEdge>* factor_edges,
+                             int* info_out, int* out_iters)
 {
-	const int N = g_N, M = GF16RA_M, K = GF16RA_K, nfac = g_NC;
+	const int M = GF16RA_M;
 
 	// ---- intrinsic (channel) probabilities pix[s][16] (Bessel metric) ----
 	std::vector<double> pix((size_t)N * M);
@@ -608,14 +614,14 @@ static void gf16ra_bp_to_info(const double* energies, int maxiter,
 
 	// ---- BP message arrays (per factor-edge) ----
 	std::vector<int> fac_off(nfac + 1, 0);
-	for (int j = 0; j < nfac; j++) fac_off[j + 1] = fac_off[j] + (int)g_factor_edges[j].size();
+	for (int j = 0; j < nfac; j++) fac_off[j + 1] = fac_off[j] + (int)factor_edges[j].size();
 	int total_edges = fac_off[nfac];
 	std::vector<double> v2c((size_t)total_edges * M);
 	std::vector<double> c2v((size_t)total_edges * M);
 
 	for (int j = 0; j < nfac; j++)
-		for (size_t k = 0; k < g_factor_edges[j].size(); k++) {
-			int e = fac_off[j] + (int)k, v = g_factor_edges[j][k].var;
+		for (size_t k = 0; k < factor_edges[j].size(); k++) {
+			int e = fac_off[j] + (int)k, v = factor_edges[j][k].var;
 			for (int t = 0; t < M; t++) v2c[(size_t)e * M + t] = pix[(size_t)v * M + t];
 		}
 
@@ -626,11 +632,11 @@ static void gf16ra_bp_to_info(const double* energies, int maxiter,
 	for (int nit = 0; nit < maxiter; nit++) {
 		// ---- check -> variable ----
 		for (int j = 0; j < nfac; j++) {
-			int deg = (int)g_factor_edges[j].size();
+			int deg = (int)factor_edges[j].size();
 			double wht[3 * 16];   // deg <= 3
 			for (int k = 0; k < deg; k++) {
 				int e = fac_off[j] + k;
-				pd_mul_perm(tmp, &v2c[(size_t)e * M], g_factor_edges[j][k].wlog);
+				pd_mul_perm(tmp, &v2c[(size_t)e * M], factor_edges[j][k].wlog);
 				for (int t = 0; t < M; t++) wht[k * M + t] = tmp[t];
 				fwht16(&wht[k * M]);
 			}
@@ -641,7 +647,7 @@ static void gf16ra_bp_to_info(const double* energies, int maxiter,
 				prod[0] += 1e-12;
 				fwht16(prod);
 				int e = fac_off[j] + k;
-				pd_div_perm(permd, prod, g_factor_edges[j][k].wlog);
+				pd_div_perm(permd, prod, factor_edges[j][k].wlog);
 				pd_normalize(permd);
 				for (int t = 0; t < M; t++) c2v[(size_t)e * M + t] = permd[t];
 			}
@@ -651,15 +657,15 @@ static void gf16ra_bp_to_info(const double* energies, int maxiter,
 		for (int v = 0; v < N; v++)
 			for (int t = 0; t < M; t++) vprod[(size_t)v * M + t] = pix[(size_t)v * M + t];
 		for (int j = 0; j < nfac; j++)
-			for (size_t k = 0; k < g_factor_edges[j].size(); k++) {
-				int e = fac_off[j] + (int)k, v = g_factor_edges[j][k].var;
+			for (size_t k = 0; k < factor_edges[j].size(); k++) {
+				int e = fac_off[j] + (int)k, v = factor_edges[j][k].var;
 				const double* m = &c2v[(size_t)e * M];
 				double* vp = &vprod[(size_t)v * M];
 				for (int t = 0; t < M; t++) vp[t] *= m[t];
 			}
 		for (int j = 0; j < nfac; j++)
-			for (size_t k = 0; k < g_factor_edges[j].size(); k++) {
-				int e = fac_off[j] + (int)k, v = g_factor_edges[j][k].var;
+			for (size_t k = 0; k < factor_edges[j].size(); k++) {
+				int e = fac_off[j] + (int)k, v = factor_edges[j][k].var;
 				const double* vp = &vprod[(size_t)v * M];
 				const double* m  = &c2v[(size_t)e * M];
 				double* out = &v2c[(size_t)e * M];
@@ -685,8 +691,8 @@ static void gf16ra_bp_to_info(const double* energies, int maxiter,
 	for (int v = 0; v < N; v++)
 		for (int t = 0; t < M; t++) app[(size_t)v * M + t] = pix[(size_t)v * M + t];
 	for (int j = 0; j < nfac; j++)
-		for (size_t k = 0; k < g_factor_edges[j].size(); k++) {
-			int e = fac_off[j] + (int)k, v = g_factor_edges[j][k].var;
+		for (size_t k = 0; k < factor_edges[j].size(); k++) {
+			int e = fac_off[j] + (int)k, v = factor_edges[j][k].var;
 			const double* m = &c2v[(size_t)e * M];
 			double* ap = &app[(size_t)v * M];
 			for (int t = 0; t < M; t++) ap[t] *= m[t];
@@ -697,6 +703,15 @@ static void gf16ra_bp_to_info(const double* energies, int maxiter,
 		for (int t = 0; t < M; t++) if (ap[t] > bv) { bv = ap[t]; best = t; }
 		info_out[s] = best;
 	}
+}
+
+// K=13 singleton wrapper — passes the g_* globals so the legacy decoder stays
+// bit-for-bit unchanged (the two public K=13 entries call this).
+static void gf16ra_bp_to_info(const double* energies, int maxiter,
+                              double esno_metric, int* info_out, int* out_iters)
+{
+	bp_to_info_param(energies, maxiter, esno_metric,
+	                 g_N, GF16RA_K, g_NC, g_factor_edges, info_out, out_iters);
 }
 
 bool soft_decode(const double* energies, int maxiter, double esno_metric,
@@ -784,6 +799,131 @@ bool soft_decode_config_tag(const double* energies, int maxiter, double esno_met
 	uint16_t calc = crc12_fn(crc12_ctx, typed, 5) & 0x0FFF;
 	if (calc != dec_crc) return false;
 	*out_payload37 = p37;
+	return true;
+}
+
+// =============================================================================
+// COMPACT confirm codec (Option B) — PHYSICALLY SEPARATE K=5 graph state.
+// data-flow-compact-confirm.md §5: never touches the K=13 g_* globals, so the
+// CONNECT-suffix FEC (K=13) and the ACK compact confirm (K=5) coexist without
+// the §21.1 shared-state hazard. Reuses ONLY the stateless field+BP math
+// (build_field / fwht16 / pd_* / log_i0_approx / gf_mul / bp_to_info_param).
+// =============================================================================
+static const int GF5_K  = GF16RA_C_K;                       // 5
+static const int GF5_NC = GF16RA_C_REPFACT * GF16RA_C_K;    // 5 (repfact=1)
+static const int GF5_N  = GF16RA_C_K + GF5_NC;              // 10
+static int  g5_acc_idx[GF16RA_MAX_N];
+static int  g5_acc_wlog[GF16RA_MAX_N];
+static std::vector<FactorEdge> g5_factor_edges[GF16RA_MAX_N];
+static bool g5_graph_inited = false;
+
+int compact_codeword_len() { return GF5_N; }
+
+// Build the K=5 RA graph using the SAME interleaver algorithm as init() (verbatim
+// structure, retargeted at g5_*). Idempotent.
+static void compact_init()
+{
+	build_field();
+	if (g5_graph_inited) return;
+
+	const int K = GF5_K, NC = GF5_NC, repfact = GF16RA_C_REPFACT;
+	int stride = 1;
+	for (int s = K; s >= 2; s--) {
+		int a = s, b = NC; while (b) { int t = a % b; a = b; b = t; }
+		if (a == 1) { stride = s; break; }
+	}
+	int order_pos = 0;
+	int tmp_idx[GF16RA_MAX_N];
+	int tmp_info_wlog[GF16RA_MAX_N];
+	for (int j = 0; j < NC; j++) tmp_idx[j] = -1;
+	int info_wvals[GF16RA_MAX_N];
+	int info_count[GF16RA_MAX_N];
+	for (int i = 0; i < K; i++) { info_count[i] = 0; info_wvals[i] = 0; }
+
+	for (int i = 0; i < K; i++) {
+		for (int r = 0; r < repfact; r++) {
+			int stage = (order_pos * stride) % NC;
+			int guard = 0;
+			while (tmp_idx[stage] != -1 && guard < NC) { order_pos++; stage = (order_pos * stride) % NC; guard++; }
+			order_pos++;
+			tmp_idx[stage] = i;
+			int wval;
+			if (r < repfact - 1) {
+				int wlog = 1 + ((i * repfact + r) % 14);
+				wval = g_gfexp[wlog];
+				info_wvals[i] ^= wval;
+			} else {
+				wval = info_wvals[i];
+				if (wval == 0) wval = 1;
+			}
+			tmp_info_wlog[stage] = g_gflog[wval];
+			info_count[i]++;
+		}
+	}
+	for (int j = 0; j < NC; j++) {
+		if (tmp_idx[j] == -1) { tmp_idx[j] = 0; tmp_info_wlog[j] = 0; }
+		g5_acc_idx[j]  = tmp_idx[j];
+		g5_acc_wlog[j] = tmp_info_wlog[j];
+	}
+	for (int j = 0; j < NC; j++) {
+		g5_factor_edges[j].clear();
+		FactorEdge pe; pe.var = K + j; pe.wlog = 0; g5_factor_edges[j].push_back(pe);
+		if (j > 0) { FactorEdge ppe; ppe.var = K + j - 1; ppe.wlog = 0; g5_factor_edges[j].push_back(ppe); }
+		FactorEdge ie; ie.var = g5_acc_idx[j]; ie.wlog = g5_acc_wlog[j]; g5_factor_edges[j].push_back(ie);
+	}
+	g5_graph_inited = true;
+}
+
+// [bsi:8 | crc12:12] = 20 bits -> 5 GF(16) info symbols, MSB-first. bsi occupies
+// the top 8 bits (symbols 0-1), crc12 the bottom 12 (symbols 2-4).
+static inline void compact_msg_to_info(uint8_t bsi, uint16_t crc12, int* info)
+{
+	uint32_t field20 = ((uint32_t)bsi << 12) | (uint32_t)(crc12 & 0x0FFF);
+	for (int s = 0; s < GF5_K; s++)
+		info[s] = (int)((field20 >> (20 - 4 * (s + 1))) & 0xF);
+}
+
+static inline void compact_info_to_msg(const int* info, uint8_t* bsi, uint16_t* crc12)
+{
+	uint32_t field20 = 0;
+	for (int s = 0; s < GF5_K; s++) field20 = (field20 << 4) | (uint32_t)(info[s] & 0xF);
+	*bsi   = (uint8_t)((field20 >> 12) & 0xFF);
+	*crc12 = (uint16_t)(field20 & 0x0FFF);
+}
+
+void encode_compact(uint8_t bsi, uint16_t crc12, int* out_tones)
+{
+	compact_init();
+	int info[GF5_K];
+	compact_msg_to_info(bsi, crc12, info);
+	for (int s = 0; s < GF5_K; s++) out_tones[s] = info[s] & 0xF;
+	int prev = 0;
+	for (int j = 0; j < GF5_NC; j++) {
+		int w = g_gfexp[g5_acc_wlog[j]];
+		int acc = prev ^ gf_mul(w, info[g5_acc_idx[j]]);
+		out_tones[GF5_K + j] = acc & 0xF;
+		prev = acc;
+	}
+}
+
+bool soft_decode_compact(const double* energies, int maxiter, double esno_metric,
+                         ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                         uint8_t* out_bsi, int* out_iters)
+{
+	if (!energies || !crc12_fn || !out_bsi) return false;
+	compact_init();
+	if (out_iters) *out_iters = -1;
+	int info[GF5_K];
+	bp_to_info_param(energies, maxiter, esno_metric,
+	                 GF5_N, GF5_K, GF5_NC, g5_factor_edges, info, out_iters);
+
+	uint8_t bsi; uint16_t dec_crc;
+	compact_info_to_msg(info, &bsi, &dec_crc);
+	// CRC12 over the single [bsi] byte (production callback; NEVER inline).
+	unsigned char bsi_byte[1]; bsi_byte[0] = bsi;
+	uint16_t calc = crc12_fn(crc12_ctx, bsi_byte, 1) & 0x0FFF;
+	if (calc != dec_crc) return false;
+	*out_bsi = bsi;
 	return true;
 }
 

@@ -717,6 +717,14 @@ public:
   // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:32 | crc12:12].
   long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap);
 
+  // Option B (data-flow-compact-confirm.md): emit the COMPACT coded reverse
+  // confirm for a CLEAN (all-ones) batch — ACK base (16) + K=5 GF(16)-RA
+  // codeword (10) carrying [bsi:8|crc12:12]. ~3 symbols (~70ms) shorter than the
+  // 13-uncoded ACK suffix AND ~4 dB more robust (cliff measured -4.2 dB deeper).
+  // Returns wall-clock TX ms, or 0 if unsupported (NB / compiled out). CRC12 is
+  // over the single [bsi] byte. CLEAN-batch only — partial loss uses send_sack.
+  long long send_mfsk_compact_confirm(unsigned char batch_seq_id);
+
   // Phase B Wave 2 v2 — PHY-level helpers for MFSK CONNECT.
   // These are called from inside the legacy state-machine dispatchers
   // (process_messages_tx_control / process_messages_acknowledging_control on
@@ -877,6 +885,18 @@ public:
   // (ack_sack_suffix_len()==0), no decode, CRC mismatch, out-of-window bsi, or a
   // non-clean (partial) bitmap. Used by the bare-pattern data-ACK arm only.
   bool cmd_clean_data_ack_crc_valid();
+
+  // Option B (data-flow-compact-confirm.md §5): peek the passband tail for a
+  // CRC12-valid, in-window COMPACT confirm (K=5 GF(16)-RA, N=10, carrying
+  // [bsi:8|crc12:12]). Structurally cloned from cmd_clean_data_ack_crc_valid but
+  // (a) decodes the compact codeword via decode_compact_confirm_from_passband,
+  // (b) CRC12 is over the single [bsi] byte (CLEAN/all-ones is implicit in the
+  // confirm type — no bitmap), (c) bsi-in-window gate identical. Read-only peek.
+  // Returns false on NB, no decode, CRC mismatch, or out-of-window bsi. The
+  // commander tries this FIRST (cheaper/shorter/deeper) then the 13-uncoded
+  // clean-data-ACK path; the two CRC12s are over different fields so neither can
+  // cross-validate the other.
+  bool cmd_compact_confirm_crc_valid();
 
   // Phantom-ACK content-gate synthetic-fire test (CLI --test-phantom-ack-gate).
   // Drives the PURE acceptance policy (data_ack_bare_pattern_acceptable) across
