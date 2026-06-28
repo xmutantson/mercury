@@ -1545,6 +1545,34 @@ int cl_arq_controller::add_message_control(char code)
 			printf("[CRYPTO] Sending X25519 pubkey (32 bytes)\n");
 			fflush(stdout);
 		}
+		else if(code==KEY_EXCHANGE_2 || code==KEY_EXCHANGE_3)
+		{
+			// Hybrid ML-KEM KX chunk frame (MLKEM_HYBRID_PLAN.md §4). The
+			// current chunk index is kx_tx_next_index; the chunk codec writes
+			// [kind|idx|count|CRC8 | payload] into messages_control.data. The
+			// kx_tx_* state was armed by kx_begin_chunk_send(). The frame is a
+			// normal control frame from here on (LDPC + per-frame control ACK on
+			// the OFDM data_configuration, same transport as KEY_EXCHANGE_1).
+			int cap = kx_tx_chunk_cap;
+			int wrote = cl_cipher_suite::kx_chunk_encode(
+				(uint8_t)kx_tx_kind, kx_tx_src, kx_tx_total,
+				kx_tx_next_index, cap,
+				(uint8_t*)messages_control.data,
+				(N_MAX/8));
+			if(wrote < 0)
+			{
+				printf("[CRYPTO] ERROR: KX chunk encode failed (kind=0x%02x idx=%d cap=%d)\n",
+					kx_tx_kind, kx_tx_next_index, cap);
+				fflush(stdout);
+				messages_control.status = FREE;
+				return ERROR_;
+			}
+			messages_control.length = wrote;
+			messages_control.id = 0;
+			printf("[CRYPTO] Sending KX chunk kind=0x%02x idx=%d/%d (%d bytes)\n",
+				kx_tx_kind, kx_tx_next_index, kx_tx_count, wrote);
+			fflush(stdout);
+		}
 		else if(code==KEY_ACTIVATE)
 		{
 			messages_control.data[0] = code;
@@ -7736,6 +7764,40 @@ void cl_arq_controller::process_control_commander()
 				watchdog_timer.start();
 				link_timer.start();
 			}
+			else if(encryption_mode == ENCRYPT_STRICT)
+			{
+				// HYBRID ML-KEM upgrade (MLKEM_HYBRID_PLAN.md §5, STRICT/SNDL-safe).
+				// X25519 confirm matched; now run KX2/KX3 over the data plane
+				// BEFORE deriving the final hybrid key and activating. Generate the
+				// ML-KEM keypair and start streaming the encaps key (KX2) chunks.
+				// The classical key derived above is NOT activated (STRICT holds
+				// data until the hybrid key is live) — it only seeded the X25519
+				// confirm-tag check just performed. KEY_ACTIVATE is deferred to the
+				// KX3-complete handler.
+				printf("[CRYPTO] X25519 confirmed — beginning ML-KEM hybrid upgrade (KX2)\n");
+				fflush(stdout);
+				messages_control.status = FREE;
+				if(cipher_suite.generate_mlkem_keypair(kx_mlkem_pk) != 0)
+				{
+					printf("[CRYPTO] FATAL: ML-KEM keypair generation failed\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				kx_mlkem_pk_ready = true;
+				cipher_suite.set_kx_phase(KX_MLKEM_PK_SENT);
+				if(kx_begin_chunk_send(KEY_EXCHANGE_2) < 0)
+				{
+					printf("[CRYPTO] FATAL: KX2 send setup failed\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				watchdog_timer.start();
+				link_timer.start();
+			}
 			else
 			{
 				printf("[CRYPTO] Key confirmation matches — sending KEY_ACTIVATE\n");
@@ -7744,6 +7806,73 @@ void cl_arq_controller::process_control_commander()
 				messages_control.status = FREE;
 				add_message_control(KEY_ACTIVATE);
 
+				watchdog_timer.start();
+				link_timer.start();
+			}
+		}
+		else if(this->link_status==CONNECTED
+		        && (messages_control.data[0]==KEY_EXCHANGE_2
+		            || messages_control.data[0]==KEY_EXCHANGE_3))
+		{
+			// HYBRID KX chunk ACK handling (CMD side). Two cases:
+			//  (a) KEY_EXCHANGE_2 ACK: the RSP acknowledged a KX2 chunk we sent.
+			//      Queue the next KX2 chunk; when all are sent, the RSP will
+			//      encapsulate and stream KX3 (ciphertext) back — its ACK frames
+			//      carry the KX3 chunks (data[] holds the 4B-headed chunk).
+			//  (b) The ACK frame ALSO carries a KX3 chunk payload (RSP->CMD
+			//      ciphertext). Feed it to the reassembler; on completion, decap
+			//      + derive the hybrid key + send KEY_ACTIVATE.
+			int code_in = (unsigned char)messages_control.data[0];
+			messages_control.status = FREE;
+			if(code_in == KEY_EXCHANGE_2)
+			{
+				kx_tx_next_index++;
+				int more = kx_send_next_chunk();
+				if(more == 1)
+				{
+					// next KX2 chunk queued
+				}
+				else
+				{
+					// All KX2 chunks sent; await KX3 from RSP. The RSP drives KX3
+					// chunk frames; they arrive as KEY_EXCHANGE_3 control frames.
+					cipher_suite.set_kx_phase(KX_MLKEM_CT_SENT);
+					printf("[CRYPTO] KX2 complete (encaps key sent); awaiting KX3 ciphertext\n");
+					fflush(stdout);
+				}
+				watchdog_timer.start();
+				link_timer.start();
+			}
+			else // KEY_EXCHANGE_3 chunk arriving (RSP -> CMD ciphertext)
+			{
+				int done = kx_receive_chunk((const uint8_t*)messages_control.data,
+				                            messages_control.length, KEY_EXCHANGE_3);
+				if(done == 1)
+				{
+					// Full ciphertext reassembled — decapsulate + derive hybrid key.
+					if(cipher_suite.decapsulate_mlkem(kx_mlkem_ct) != 0)
+					{
+						printf("[CRYPTO] FATAL: ML-KEM decapsulation failed\n");
+						fflush(stdout);
+						this->link_status = DROPPED;
+						reset_session_state();
+						return;
+					}
+					// Hybrid derive with full transcript binding (pk order is
+					// ALWAYS commander-then-responder).
+					const uint8_t* pk_cmd = cipher_suite.get_x25519_pubkey();
+					const uint8_t* pk_rsp = cipher_suite.get_x25519_peer_pubkey();
+					cipher_suite.derive_session_key(
+						my_call_sign.c_str(), destination_call_sign.c_str(),
+						(psk_hex[0] != '\0') ? (const uint8_t*)psk_hex : NULL,
+						(psk_hex[0] != '\0') ? (int)strlen(psk_hex) : 0,
+						true,                 // mlkem_done -> hybrid + pq_active
+						kx_mlkem_ct, kx_mlkem_pk, pk_cmd, pk_rsp);
+					cipher_suite.set_kx_phase(KX_HYBRID_DONE);
+					printf("[CRYPTO] Hybrid session key derived — sending KEY_ACTIVATE (PQ)\n");
+					fflush(stdout);
+					add_message_control(KEY_ACTIVATE);
+				}
 				watchdog_timer.start();
 				link_timer.start();
 			}

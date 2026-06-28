@@ -609,6 +609,25 @@ public:
 
   void process_messages_commander();
   int add_message_control(char code);
+
+  // --- Hybrid ML-KEM KX chunk transport helpers (MLKEM_HYBRID_PLAN.md §4) ----
+  // Per-frame chunk payload capacity = the control-frame data width minus the
+  // 4-byte KX chunk header. Derived from the SAME geometry the X25519 KX uses
+  // (max_data_length + max_header_length - CONTROL_ACK_CONTROL_HEADER_LENGTH).
+  int  kx_chunk_payload_capacity();
+  // Begin a chunked send of kx_mlkem_pk (KEY_EXCHANGE_2) or kx_mlkem_ct
+  // (KEY_EXCHANGE_3). Sets up kx_tx_* state and queues the FIRST chunk frame.
+  // Returns 0 on success, -1 on error (e.g. source not ready).
+  int  kx_begin_chunk_send(int kind);
+  // Queue the next pending KX chunk control frame (kx_tx_next_index). Returns 1
+  // if a frame was queued, 0 if all chunks have been sent, -1 on error.
+  int  kx_send_next_chunk();
+  // Process a received KEY_EXCHANGE_2/3 control frame (data[] holds the 4-byte
+  // header + chunk payload). Validates + reassembles into kx_data_buf. Returns
+  // 1 when the full buffer is now complete (last needed chunk arrived), 0 when
+  // more chunks are still needed, -1 on a rejected chunk (CRC/kind/index/len).
+  int  kx_receive_chunk(const uint8_t* frame, int frame_len, int expect_kind);
+
   void process_messages_tx_control();
   int add_message_tx_data(char type, int length, char* data);
   void process_messages_tx_data();
@@ -5019,8 +5038,45 @@ public:
   int consecutive_auth_failures;      // Auth failures since last success (3 → disconnect)
   uint8_t* kx_data_buf;              // Buffer for ML-KEM key exchange data (1184 or 1088 bytes)
   int kx_data_len;                    // Length of pending key exchange data
+  // --- Hybrid ML-KEM KX chunk transport (MLKEM_HYBRID_PLAN.md §4-§5,
+  //     data-flow-hybrid-kex.md) ----------------------------------------------
+  // The 1184B encaps key (KX2, CMD->RSP) and 1088B ciphertext (KX3, RSP->CMD)
+  // ride a sequence of KEY_EXCHANGE_2/3 control frames over the OFDM data
+  // configuration (each frame = one 4-byte-headed chunk; the existing per-frame
+  // control ACK/retransmit covers loss). State below drives the chunked send and
+  // the receive-side reassembly. All cleared on session reset / KX completion.
+  // The reassembly target is kx_data_buf (MLKEM_PK_SIZE bytes, lazily alloc'd).
+  uint8_t kx_mlkem_pk[1184];          // CMD: generated encaps key (also bind input)
+  uint8_t kx_mlkem_ct[1088];          // RSP: encapsulated ciphertext (also bind input)
+  bool kx_mlkem_pk_ready;             // CMD generated / RSP reassembled the pk
+  bool kx_mlkem_ct_ready;             // RSP encapsulated / CMD reassembled the ct
+  int  kx_tx_kind;                    // KX kind currently being SENT (0x3F/0x40/0=idle)
+  int  kx_tx_total;                   // total bytes of the buffer being sent
+  int  kx_tx_count;                   // chunk count for the send
+  int  kx_tx_next_index;             // next chunk index to transmit
+  int  kx_tx_chunk_cap;              // per-frame chunk payload capacity (sender)
+  const uint8_t* kx_tx_src;          // points at kx_mlkem_pk or kx_mlkem_ct
+  int  kx_rx_kind;                   // KX kind currently being REASSEMBLED (0=idle)
+  int  kx_rx_count;                  // expected chunk count (from first chunk)
+  int  kx_rx_chunk_cap;             // per-frame chunk payload capacity (receiver)
+  int  kx_rx_total;                 // expected total bytes (MLKEM_PK_SIZE/CT_SIZE)
+  int  kx_rx_received;             // distinct chunks received so far
+  bool kx_rx_got[256];            // per-index arrival bitmap
   char psk_hex[129];                  // Pre-shared key (hex string, up to 64 bytes = 128 hex chars)
   bool psk_mismatch_pending;          // Commander detected PSK mismatch, KEY_ACTIVATE sent for responder notification
+
+  // Reset all hybrid-KX chunk state (idle). Defined inline; called from the
+  // session-reset path and at the start/end of each KX2/KX3 phase.
+  void kx_chunk_state_reset()
+  {
+    kx_mlkem_pk_ready = false;
+    kx_mlkem_ct_ready = false;
+    kx_tx_kind = 0; kx_tx_total = 0; kx_tx_count = 0;
+    kx_tx_next_index = 0; kx_tx_chunk_cap = 0; kx_tx_src = nullptr;
+    kx_rx_kind = 0; kx_rx_count = 0; kx_rx_chunk_cap = 0;
+    kx_rx_total = 0; kx_rx_received = 0;
+    for (int i = 0; i < 256; i++) kx_rx_got[i] = false;
+  }
 
   int gear_shift_algorithm;
   double gear_shift_up_success_rate_precentage;

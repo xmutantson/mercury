@@ -1867,13 +1867,20 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		// nUnder is counted (not accumulated LISTENING nUnder).
 		telecom_system->data_container.nUnder_processing_events = 0;
 
-		if(messages_control.data[0] == KEY_EXCHANGE_1)
+		if(messages_control.data[0] == KEY_EXCHANGE_1
+		   || messages_control.data[0] == KEY_EXCHANGE_3)
 		{
-			// KEY_EXCHANGE_1: must use LDPC ACK to carry responder's pubkey.
+			// KEY_EXCHANGE_1: LDPC ACK carries responder's pubkey.
+			// KEY_EXCHANGE_3: LDPC ACK carries a chunk of the ML-KEM ciphertext
+			//   (hybrid upgrade, MLKEM_HYBRID_PLAN.md §4) — same LDPC reply
+			//   transport on the OFDM data_configuration. messages_control was
+			//   populated by kx_send_next_chunk() (RSP role) with the 4B-headed
+			//   chunk. After this frame is ACKed by the CMD, the CMD's KX3 chunk
+			//   handler advances; the RSP queues the next chunk on its next tick.
 			// Send on data_configuration (OFDM) — NOT ack_configuration (MFSK).
 			// Commander will load data_configuration to receive this.
-			printf("[ACK-CTRL] Sending LDPC ACK for KEY_EXCHANGE_1 on config %d\n",
-				data_configuration);
+			printf("[ACK-CTRL] Sending LDPC ACK for code 0x%02X on config %d\n",
+				(unsigned char)messages_control.data[0], data_configuration);
 			fflush(stdout);
 			telecom_system->set_mfsk_ctrl_mode(false);  // full OFDM frame
 			messages_batch_tx[message_batch_counter_tx]=messages_control;
@@ -3691,6 +3698,76 @@ void cl_arq_controller::process_control_responder()
 		link_timer.start();
 
 
+	}
+	else if(link_status==CONNECTED && (code==KEY_EXCHANGE_2 || code==KEY_EXCHANGE_3))
+	{
+		// HYBRID ML-KEM KX chunk RX (RSP side, MLKEM_HYBRID_PLAN.md §5).
+		// KEY_EXCHANGE_2 chunks carry the commander's 1184B encaps key. When the
+		// full key reassembles, RSP encapsulates -> 1088B ciphertext, then streams
+		// it back as KEY_EXCHANGE_3 chunks. (KEY_EXCHANGE_3 inbound is not
+		// expected on the RSP — the RSP is the KX3 sender; treat as a stray.)
+		if(passive_monitor)
+		{
+			messages_control.status = FREE;
+			connection_status = RECEIVING;
+			link_timer.start();
+			watchdog_timer.start();
+		}
+		else if(code==KEY_EXCHANGE_2)
+		{
+			int done = kx_receive_chunk((const uint8_t*)messages_control.data,
+			                            messages_control.length, KEY_EXCHANGE_2);
+			messages_control.status = FREE;
+			if(done == 1)
+			{
+				// Full encaps key reassembled — encapsulate to produce the
+				// ciphertext + ML-KEM shared secret.
+				if(cipher_suite.encapsulate_mlkem(kx_mlkem_pk, kx_mlkem_ct) != 0)
+				{
+					printf("[CRYPTO] FATAL: ML-KEM encapsulation failed (bad encaps key)\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				kx_mlkem_ct_ready = true;
+				cipher_suite.set_kx_phase(KX_MLKEM_CT_SENT);
+				// Derive the hybrid key NOW (RSP holds ct (it encapsulated) + pk
+				// (reassembled) + both X25519 pubs from KX1). pk order is ALWAYS
+				// commander-then-responder; on the RSP, peer = commander.
+				const uint8_t* pk_rsp = cipher_suite.get_x25519_pubkey();
+				const uint8_t* pk_cmd = cipher_suite.get_x25519_peer_pubkey();
+				cipher_suite.derive_session_key(
+					destination_call_sign.c_str(), my_call_sign.c_str(),
+					(psk_hex[0] != '\0') ? (const uint8_t*)psk_hex : NULL,
+					(psk_hex[0] != '\0') ? (int)strlen(psk_hex) : 0,
+					true,                  // mlkem_done -> hybrid + pq_active
+					kx_mlkem_ct, kx_mlkem_pk, pk_cmd, pk_rsp);
+				cipher_suite.set_kx_phase(KX_HYBRID_DONE);
+				printf("[CRYPTO] RSP encapsulated + hybrid key derived; streaming KX3 ciphertext\n");
+				fflush(stdout);
+				// Begin streaming the ciphertext chunks back to the commander.
+				if(kx_begin_chunk_send(KEY_EXCHANGE_3) < 0)
+				{
+					printf("[CRYPTO] FATAL: KX3 send setup failed\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+			}
+			connection_status = ACKNOWLEDGING_CONTROL;
+			link_timer.start();
+			watchdog_timer.start();
+		}
+		else
+		{
+			// Stray KEY_EXCHANGE_3 inbound on the RSP — ignore, free the slot.
+			messages_control.status = FREE;
+			connection_status = RECEIVING;
+			link_timer.start();
+			watchdog_timer.start();
+		}
 	}
 	else if(link_status==CONNECTED && (code==KEY_EXCHANGE_1 || code==KEY_ACTIVATE))
 	{

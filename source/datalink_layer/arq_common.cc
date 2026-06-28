@@ -936,6 +936,7 @@ cl_arq_controller::cl_arq_controller()
 	consecutive_auth_failures=0;
 	kx_data_buf=NULL;
 	kx_data_len=0;
+	kx_chunk_state_reset();
 	memset(psk_hex, 0, sizeof(psk_hex));
 	passive_monitor=false;
 	monitor_stdout=false;
@@ -7884,6 +7885,7 @@ void cl_arq_controller::reset_session_state()
 	consecutive_auth_failures = 0;
 	if (kx_data_buf) { free(kx_data_buf); kx_data_buf = NULL; }
 	kx_data_len = 0;
+	kx_chunk_state_reset();
 
 	// Data exchange
 	// IDLE-SWITCHROLE-RACE per-session flags (idle-switchrole-race.md §2/§3/§5.5):
@@ -8005,6 +8007,173 @@ void cl_arq_controller::reset_session_state()
 	messages_control.status = FREE;
 	messages_control_bu.status = FREE;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid ML-KEM KX chunk transport (MLKEM_HYBRID_PLAN.md §4-§5,
+// fact-documents/data-flow-hybrid-kex.md). KX2 (1184B encaps key, CMD->RSP) and
+// KX3 (1088B ciphertext, RSP->CMD) are chunked across KEY_EXCHANGE_2/3 control
+// frames over the OFDM data_configuration (the same LDPC control transport that
+// carries KEY_EXCHANGE_1's 40-byte payload). Each chunk is independently
+// ACK'd/retransmitted by the existing control machinery; loss/CRC-fail -> resend.
+// ---------------------------------------------------------------------------
+
+int cl_arq_controller::kx_chunk_payload_capacity()
+{
+	// Mirror the X25519 KX read geometry (arq_commander.cc:7046 /
+	// arq_responder.cc:7170): control-frame data width = max_data_length +
+	// max_header_length - CONTROL_ACK_CONTROL_HEADER_LENGTH. Subtract the 4-byte
+	// KX chunk header. Clamp to >= 1 and to the messages_control.data alloc
+	// (N_MAX/8) so a chunk frame can never overrun the buffer.
+	int width = (max_data_length + max_header_length
+	             - CONTROL_ACK_CONTROL_HEADER_LENGTH);
+	int cap = width - cl_cipher_suite::KX_CHUNK_HEADER_LEN;
+	int hard = (N_MAX/8) - cl_cipher_suite::KX_CHUNK_HEADER_LEN;
+	if(cap > hard) cap = hard;
+	if(cap < 1) cap = 1;
+	return cap;
+}
+
+int cl_arq_controller::kx_begin_chunk_send(int kind)
+{
+	const uint8_t* src = nullptr;
+	int total = 0;
+	if(kind == KEY_EXCHANGE_2)
+	{
+		if(!kx_mlkem_pk_ready) { printf("[CRYPTO] ERROR: KX2 send before pk ready\n"); fflush(stdout); return -1; }
+		src = kx_mlkem_pk; total = MLKEM_PK_SIZE;
+	}
+	else if(kind == KEY_EXCHANGE_3)
+	{
+		if(!kx_mlkem_ct_ready) { printf("[CRYPTO] ERROR: KX3 send before ct ready\n"); fflush(stdout); return -1; }
+		src = kx_mlkem_ct; total = MLKEM_CT_SIZE;
+	}
+	else return -1;
+
+	int cap = kx_chunk_payload_capacity();
+	int count = cl_cipher_suite::kx_chunk_count(total, cap);
+	if(count < 1 || count > 255) { printf("[CRYPTO] ERROR: KX chunk count %d out of range (cap=%d)\n", count, cap); fflush(stdout); return -1; }
+
+	kx_tx_kind = kind;
+	kx_tx_src = src;
+	kx_tx_total = total;
+	kx_tx_count = count;
+	kx_tx_chunk_cap = cap;
+	kx_tx_next_index = 0;
+	printf("[CRYPTO] KX begin send kind=0x%02x total=%d cap=%d -> %d chunks\n",
+		kind, total, cap, count);
+	fflush(stdout);
+	return kx_send_next_chunk();
+}
+
+int cl_arq_controller::kx_send_next_chunk()
+{
+	if(kx_tx_kind == 0 || kx_tx_src == nullptr) return -1;
+	if(kx_tx_next_index >= kx_tx_count)
+	{
+		// All chunks queued/acked. Idle the TX state.
+		kx_tx_kind = 0; kx_tx_src = nullptr;
+		return 0;
+	}
+	if(role == COMMANDER)
+	{
+		// Commander streams KX2 via the control-REQUEST path: the
+		// add_message_control KEY_EXCHANGE_2 builder reads kx_tx_* and encodes
+		// the current chunk into messages_control; process_messages_tx_control
+		// then transmits it and awaits the per-frame control ACK.
+		int rc = add_message_control((char)kx_tx_kind);
+		if(rc != SUCCESSFUL) return -1;
+		return 1;
+	}
+	else
+	{
+		// Responder streams KX3 via the control-ACK REPLY path (the same LDPC
+		// ACK transport that carries the KEY_EXCHANGE_1 reply pubkey). Encode
+		// the chunk directly into messages_control; the caller sets
+		// connection_status = ACKNOWLEDGING_CONTROL so the ACK builder
+		// (arq_responder.cc KEY_EXCHANGE_1/KX path) sends messages_control as an
+		// LDPC frame on the data_configuration.
+		if(messages_control.status != FREE && messages_control.status != ADDED_TO_LIST)
+		{
+			// slot busy — caller will retry on the next tick
+		}
+		messages_control.type   = CONTROL;
+		messages_control.id     = 0;
+		messages_control.status = ADDED_TO_LIST;
+		int wrote = cl_cipher_suite::kx_chunk_encode(
+			(uint8_t)kx_tx_kind, kx_tx_src, kx_tx_total,
+			kx_tx_next_index, kx_tx_chunk_cap,
+			(uint8_t*)messages_control.data, (N_MAX/8));
+		if(wrote < 0) { printf("[CRYPTO] ERROR: RSP KX3 chunk encode failed\n"); fflush(stdout); return -1; }
+		messages_control.length = wrote;
+		printf("[CRYPTO] RSP queued KX3 chunk idx=%d/%d (%d bytes)\n",
+			kx_tx_next_index, kx_tx_count, wrote);
+		fflush(stdout);
+		return 1;
+	}
+}
+
+int cl_arq_controller::kx_receive_chunk(const uint8_t* frame, int frame_len,
+                                        int expect_kind)
+{
+	int total = (expect_kind == KEY_EXCHANGE_2) ? MLKEM_PK_SIZE : MLKEM_CT_SIZE;
+
+	// Lazily allocate the reassembly buffer at MLKEM_PK_SIZE (covers both).
+	if(!kx_data_buf)
+	{
+		kx_data_buf = (uint8_t*)malloc(MLKEM_PK_SIZE);
+		if(!kx_data_buf) { printf("[CRYPTO] ERROR: KX reasm alloc failed\n"); fflush(stdout); return -1; }
+	}
+
+	// Begin a new reassembly if the kind changed (new phase) or none active.
+	if(kx_rx_kind != expect_kind)
+	{
+		kx_rx_kind = expect_kind;
+		kx_rx_chunk_cap = kx_chunk_payload_capacity();
+		kx_rx_total = total;
+		kx_rx_count = 0;       // learned from the first valid chunk
+		kx_rx_received = 0;
+		for(int i=0;i<256;i++) kx_rx_got[i] = false;
+	}
+
+	int idx = -1, cnt = -1;
+	int payload = cl_cipher_suite::kx_chunk_decode(
+		(uint8_t)expect_kind, frame, frame_len, kx_rx_chunk_cap,
+		kx_data_buf, MLKEM_PK_SIZE, &idx, &cnt);
+	if(payload < 0)
+	{
+		printf("[CRYPTO] KX chunk rejected (kind=0x%02x len=%d cap=%d) — ARQ will resend\n",
+			expect_kind, frame_len, kx_rx_chunk_cap);
+		fflush(stdout);
+		return -1;
+	}
+
+	if(kx_rx_count == 0) kx_rx_count = cnt;
+	else if(kx_rx_count != cnt) { printf("[CRYPTO] KX chunk count mismatch (%d vs %d)\n", kx_rx_count, cnt); fflush(stdout); return -1; }
+
+	if(!kx_rx_got[idx]) { kx_rx_got[idx] = true; kx_rx_received++; }
+
+	if(kx_rx_received < kx_rx_count) return 0;   // need more
+
+	// All chunks present. Verify the reassembled total length matches.
+	// (Last-chunk length is bounded by the codec; total = (count-1)*cap + last.)
+	kx_data_len = total;
+	if(expect_kind == KEY_EXCHANGE_2)
+	{
+		memcpy(kx_mlkem_pk, kx_data_buf, MLKEM_PK_SIZE);
+		kx_mlkem_pk_ready = true;
+	}
+	else
+	{
+		memcpy(kx_mlkem_ct, kx_data_buf, MLKEM_CT_SIZE);
+		kx_mlkem_ct_ready = true;
+	}
+	printf("[CRYPTO] KX reassembly COMPLETE kind=0x%02x (%d bytes, %d chunks)\n",
+		expect_kind, total, kx_rx_count);
+	fflush(stdout);
+	// Idle the RX reassembly state for the next phase.
+	kx_rx_kind = 0; kx_rx_received = 0; kx_rx_count = 0;
+	return 1;
 }
 
 void cl_arq_controller::opt_load_rate_table()

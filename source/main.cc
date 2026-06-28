@@ -48,6 +48,7 @@
 #include "common/sim_clock_tests.h"
 #include "compression/test_winlink_dict.h"
 #include "crypto/test_aead_nonce.h"   // AEAD bsi-bound nonce regression suite
+#include "crypto/test_mlkem_hybrid.h" // ML-KEM-768 hybrid KEX regression suite
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
@@ -1477,6 +1478,11 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_enc;
                 failed += test_enc.test_encryption_fail_closed();
             }
+            // ML-KEM-768 hybrid KEX regression suite (MLKEM_HYBRID_PLAN.md,
+            // data-flow-hybrid-kex.md): combiner symmetry, ML-KEM-first IKM
+            // order, transcript binding (tamper -> key divergence), and the
+            // KX2/KX3 chunk encode/reassemble + CRC8 round-trip. No IONOS/RF.
+            failed += run_mlkem_hybrid_tests();
             // In-band down-ladder DELIVERY regression (BREAK-orphan + silent-snapshot). A
             // member test on a throwaway controller (its own buffers; PART B builds its own
             // minimal telecom_system). Fast + deterministic, no IONOS/RF. data-flow-inband-
@@ -2661,6 +2667,14 @@ int main(int argc, char *argv[])
         // See source/crypto/test_aead_nonce.cc / data-flow-aead-nonce.md.
         if (strcmp(argv[i], "--test-aead-nonce") == 0) {
             int failed = run_aead_nonce_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-mlkem-hybrid : run ONLY the ML-KEM-768 hybrid KEX suite and
+        // exit. Fast + deterministic, no IONOS/RF. Combiner symmetry, ML-KEM-
+        // first IKM order, transcript binding, KX chunk round-trip + CRC8.
+        // See source/crypto/test_mlkem_hybrid.cc / MLKEM_HYBRID_PLAN.md.
+        if (strcmp(argv[i], "--test-mlkem-hybrid") == 0) {
+            int failed = run_mlkem_hybrid_tests();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sim-clock : run ONLY the sim-clock unit suite and exit. The
