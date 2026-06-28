@@ -859,3 +859,45 @@ the proven SET_CONFIG tier-cross; `connect_seed_target()` returns CONFIG_NONE (s
 ROBUST_0, byte-identical) on anything not clearly clean, so the over-seed guard and
 weak-channel behaviour are unchanged. The anchor is NOT raised (speculative,
 BREAK-recoverable, §10.4 invariant 2). `--test` (incl. CSEED/RBPIPE) stays 0-fail.
+
+### §10.7 OVER-SEED CRATER — the guard is UNSOUND on the MFSK proxy; seed QUARANTINED default-OFF (2026-06-28)
+
+Once §10.6 made the seed FIRE, the faithful real-audio A/B (fix=7e348d5f, mon=monitor
+2ba88d35, canonical scorer) showed a clean-channel WIN but a marginal-channel CRATER:
+
+| channel | arm | seed_fired | crossed | climbed-past-cfg0 | time-to-cross | rx_bytes | verdict |
+|---------|-----|-----------|---------|-------------------|---------------|----------|---------|
+| WGN:40  | fix | 6/6       | 6/6     | **6/6**           | **90.9 s**    | 1675     | WIN |
+| WGN:40  | mon | 0/6       | 6/6     | 0/6               | 126.7 s       | 243      | — |
+| WGN:30  | fix | 6/6       | 6/6     | **6/6**           | **91.0 s**    | 3182     | WIN |
+| WGN:30  | mon | 0/6       | 6/6     | 0/6               | 127.9 s       | 240      | — |
+| WGN:10  | fix | 4/4       | 0/4     | (load only)       | 93 s          | **0**    | **CRATER** |
+| WGN:10  | mon | 0/4       | 4/4     | 0/4               | 120.9 s       | 53–182   | — |
+| WGN:15  | fix | 2/4       | 0/4     | (load only)       | 92 s          | **0**    | **CRATER** |
+| WGN:15  | mon | 0/4       | 4/4     | 0/4               | 121.9 s       | 77–137   | — |
+
+**Root cause — the over-seed guard (§10.2 GUARD 1, CONNECT_SEED_MARGIN_DB=9.0) is
+structurally unsound.** The connect SNR is the MFSK CONTROL-plane suffix SNR, which
+reads ~32 dB at WGN:10 and ~37 dB at WGN:15 vs ~53–60 dB at WGN:30/40 — it tracks the
+channel but is inflated ~20–25 dB above OFDM-viable SNR, and the inflation is NON-LINEAR.
+A fixed 9 dB margin cannot separate a marginal channel from a clean one: WGN:10 (32 dB) →
+`get_configuration(32-9=23)` → high → capped to CONFIG_8, the SAME seed as WGN:40 (60 dB).
+On WGN:10/15 the seeded CONFIG_8 cannot be carried; the RSP briefly loads it (nReceived
+=5 frames, never assembled) then the session thrashes BREAK (8→7→…→ROBUST_0) and delivers
+0 bytes end-to-end vs the monitor baseline's 53–182. TOTAL DATA LOSS on marginal HF.
+
+This is the §3 disease in a new guise: **control-plane success does NOT imply data-plane
+viability**, and a fixed-dB margin on the control SNR is exactly the kind of threshold
+band-aid CLAUDE.md forbids. Raising the margin would just move the cliff (it cannot
+separate WGN:10 from WGN:30 cleanly, and the cap always lands CONFIG_8).
+
+**Disposition — QUARANTINE default-OFF.** `connect_seed_target()` now early-returns
+CONFIG_NONE unless `MERCURY_CONNECT_SEED=1` (production default: crawl from ROBUST_0,
+byte-identical to monitor). The seed-FIRING fix (§10.6) and the latency/reliability win
+on clean channels are PROVEN and preserved for the real fix; this is a do-not-enable
+quarantine, not a revert. The real fix needs a DATA-PLANE viability signal (a probe that
+actually decodes a WB DATA frame before raising the start), not a control-plane SNR guess —
+e.g. a low conservative seed (cfg0–1 only) gated by a data-plane confirm, or fold the seed
+into the existing FRAME-UP/elevator which already promotes only on confirmed data delivery.
+Three serial discoveries (inert → fires-but-bypassed → fires-but-craters) = the
+architectural-stop signal: the proxy itself is the problem. OPEN [?] §10.7.

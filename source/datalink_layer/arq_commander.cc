@@ -537,6 +537,25 @@ int cl_arq_controller::connect_seed_target()
 	// then FAILS, proving the seed is load-bearing.
 	return CONFIG_NONE;
 #else
+	// QUARANTINE (gearshift-start-and-recovery.md §10.7, faithful real-audio A/B
+	// 2026-06-28): the live CONNECT-SEED is DEFAULT-OFF. It is correct that the seed
+	// now FIRES (7e348d5f fixed the NB-start bypass) and it WINS on clean channels
+	// (WGN:40/30: time-to-cross 127s->91s, climb-past-cfg0 0/6->6/6, 7-13x bytes).
+	// BUT the OVER-SEED GUARD IS UNSOUND on the MFSK control-plane SNR proxy: that
+	// SNR reads ~32 dB at WGN:10 and ~37 dB at WGN:15 (vs ~53-60 dB at WGN:30/40),
+	// so the fixed CONNECT_SEED_MARGIN_DB=9.0 cannot separate a marginal channel from
+	// a clean one — both seed (capped) to CONFIG_8. On WGN:10/15 the seeded CONFIG_8
+	// CANNOT be carried: the session thrashes BREAK and delivers 0 bytes vs the
+	// monitor baseline's 53-182 (TOTAL DATA LOSS on marginal HF — unacceptable for
+	// life-critical). A fixed-dB margin on this proxy is a THRESHOLD BAND-AID (CLAUDE.md
+	// "no threshold bandaids"); the real fix needs a data-plane viability signal, not a
+	// control-plane SNR guess. DO NOT default-enable until §10.7 is resolved. Opt-in for
+	// continued investigation only: MERCURY_CONNECT_SEED=1.
+	{
+		const char* cs = getenv("MERCURY_CONNECT_SEED");
+		if(!(cs && cs[0] == '1'))
+			return CONFIG_NONE;
+	}
 	if(!inband_rate_feature_enabled())
 		return CONFIG_NONE;
 	if(gear_shift_on != YES || gear_shift_algorithm != SUCCESS_BASED_LADDER)
@@ -11150,7 +11169,15 @@ int cl_arq_controller::test_connect_snr_seed()
 		// get_configuration(15.0 - 9.0 = 6.0) -> CONFIG_13 by the production table; the CAP
 		// clamps it to CONFIG_8. We assert "a real WB seed above ROBUST_0" rather than a
 		// specific rung so the test is robust to the SNR-table tuning.
+		// The live member is QUARANTINED default-OFF in production (§10.7 over-seed crater);
+		// force the opt-in here so this test exercises the seed LOGIC (the quarantine is a
+		// production-default gate, not a logic change). Restored after the call. putenv is
+		// portable across glibc and the MinGW (Windows) build (setenv is not on MinGW).
+		static char cs_on[]  = "MERCURY_CONNECT_SEED=1";
+		static char cs_off[] = "MERCURY_CONNECT_SEED=";
+		putenv(cs_on);
 		int live = connect_seed_target();
+		putenv(cs_off);
 #ifdef CONNECT_SEED_FAILBEFORE
 		check(live == CONFIG_NONE,
 			"G (fail-before) clean channel NOT seeded -> crawl ROBUST_0 (wedge reproduced)",
