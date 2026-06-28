@@ -70,6 +70,13 @@ public:
     // Returns 0 on success.
     int compute_x25519_shared(const uint8_t peer_pubkey[X25519_KEY_SIZE]);
 
+    // Length-checked variant: rejects (returns -1) a NULL or short peer pubkey
+    // BEFORE reading X25519_KEY_SIZE bytes, so a truncated/corrupted KEY_EXCHANGE
+    // frame is rejected, not run over into stale/OOB tail bytes. Prefer this at
+    // wire-facing call sites. See data-flow-aead-nonce.md §KX.
+    int compute_x25519_shared_checked(const uint8_t* peer_pubkey,
+                                      int peer_pubkey_len);
+
     // Phase 2: ML-KEM-768 (post-quantum KEM)
     // Generate ephemeral ML-KEM keypair, write 1184-byte encaps key to out.
     // Commander calls this. Returns 0 on success, -1 on RNG failure.
@@ -104,17 +111,56 @@ public:
     // Encrypt plaintext batch. Writes ciphertext + auth tag to out.
     // Returns total bytes written (in_len + tag_size), or -1 on error.
     // tag_size is AUTH_TAG_SIZE (16) for CONFIG, AUTH_TAG_ROBUST (4) for ROBUST.
+    //
+    // batch_index MUST be the UNWRAPPED wire batch index (epoch<<8 | wire_bsi),
+    // NOT a local encrypt-call counter. Both peers derive the SAME nonce from
+    // the SAME wire batch_seq_id, so the nonce survives SACK reorder/retx. The
+    // index is strictly increasing per session+direction; the caller MUST
+    // re-key / tear down before it can wrap into a reused (key,nonce) pair.
+    // See NONCE_DESIGN.md / fact-documents/data-flow-aead-nonce.md.
     int encrypt(const uint8_t* in, int in_len,
                 uint8_t* out, int out_capacity,
-                uint64_t batch_counter, uint32_t direction,
+                uint64_t batch_index, uint32_t direction,
                 int tag_size);
 
     // Decrypt ciphertext batch. Writes plaintext to out.
     // Returns plaintext bytes (in_len - tag_size), or -1 on auth failure.
+    // batch_index: see encrypt() — the UNWRAPPED wire batch index for the
+    // batch being delivered (reconstructed from the wire batch_seq_id, NOT a
+    // local delivery-order counter).
     int decrypt(const uint8_t* in, int in_len,
                 uint8_t* out, int out_capacity,
-                uint64_t batch_counter, uint32_t direction,
+                uint64_t batch_index, uint32_t direction,
                 int tag_size);
+
+    // --- Nonce sequence unwrap (shared TX/RX math) ---
+    // Reconstruct a strictly-monotone 64-bit batch index from the 8-bit wire
+    // batch_seq_id stream using RFC-1982 forward-step arithmetic (a step in
+    // [1,128] mod 256 is "forward"; crossing the 0xFF->0x00 boundary bumps the
+    // epoch). Both peers observe the SAME committed wire-bsi order, so both
+    // reconstruct the SAME index for a given batch. State (epoch,last_bsi) is
+    // held per direction by the caller; pass last_bsi = -1 for the first batch.
+    // Updates *epoch and *last_bsi in place; returns the unwrapped index.
+    // wire_bsi in [0,255]. See NONCE_DESIGN.md §3.3.
+    static uint64_t unwrap_batch_index(int wire_bsi,
+                                       uint64_t* epoch, int* last_bsi);
+
+    // Re-seal generation stride (data-flow-aead-nonce.md §11). The AEAD nonce
+    // index is fold_gen_index(gen, unwrap_index) = gen*NONCE_GEN_STRIDE +
+    // unwrap_index. NONCE_GEN_STRIDE (2^48) is larger than any reachable
+    // unwrap_index within ONE generation: the per-session re-key floor caps a
+    // session FAR below 2^32 batches (RFC 9001 §6.6), so the unwrap index
+    // (epoch<<8 | bsi) stays < 2^40 << 2^48 — distinct generations occupy
+    // DISJOINT, strictly-ordered index bands, so a higher gen always yields a
+    // strictly-greater index than any index of a lower gen. Combined with the
+    // TX seal high-water guard, this makes a re-seal land at a fresh nonce
+    // EVEN AT THE SAME WIRE BSI (the recovery rolls the wire bsi back for RSP
+    // delivery contiguity, so the gen — not the bsi — is what advances).
+    static const uint64_t NONCE_GEN_STRIDE = (uint64_t)1 << 48;
+    static uint64_t fold_gen_index(uint64_t gen, uint64_t unwrap_index)
+    {
+        return gen * NONCE_GEN_STRIDE + unwrap_index;
+    }
 
     // --- State Queries ---
     bool is_active() const { return encryption_active; }

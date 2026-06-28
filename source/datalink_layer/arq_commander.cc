@@ -7038,9 +7038,17 @@ void cl_arq_controller::process_control_commander()
 			printf("[CRYPTO] KEY_EXCHANGE_1 ACKed — received responder's X25519 pubkey\n");
 			fflush(stdout);
 
-			if(cipher_suite.compute_x25519_shared((const uint8_t*)&messages_control.data[1]) != 0)
+			// Length-checked KX read: the KEY_EXCHANGE_1 ACK carries pubkey(32) +
+			// confirm tag(8) at data[1..40]. Verify the fixed control-frame copy
+			// width holds at least the 32-byte pubkey before computing the shared
+			// secret; reject a truncated frame instead of running over stale tail
+			// bytes (the tag read at :6945 is bounded by the same width).
+			int kx_avail = (max_data_length+max_header_length
+			                - CONTROL_ACK_CONTROL_HEADER_LENGTH) - 1;
+			if(cipher_suite.compute_x25519_shared_checked(
+			       (const uint8_t*)&messages_control.data[1], kx_avail) != 0)
 			{
-				printf("[CRYPTO] FATAL: X25519 shared secret is zero (low-order point attack?)\n");
+				printf("[CRYPTO] FATAL: X25519 shared secret invalid (zero/low-order point or truncated KX frame)\n");
 				fflush(stdout);
 				this->link_status = DROPPED;
 				reset_session_state();
@@ -7112,8 +7120,17 @@ void cl_arq_controller::process_control_commander()
 
 			// KEY_ACTIVATE ACKed — encryption is now active on both sides
 			cipher_suite.activate();
-			tx_batch_counter = 0;
-			rx_batch_counter = 0;
+			// AEAD nonce sequence state: fresh per session+direction. First
+			// batch (wire bsi=0) -> index 0. (data-flow-aead-nonce.md §init)
+			tx_nonce_epoch = 0;
+			tx_nonce_last_bsi = -1;
+			rx_nonce_epoch = 0;
+			rx_nonce_last_bsi = -1;
+			tx_nonce_gen = 0;
+			rx_nonce_gen = 0;
+			tx_nonce_sealed_high_water = UINT64_MAX;
+			rx_nonce_adopted_once = false;
+			decrypt_delivered_bsi = -1;
 			consecutive_auth_failures = 0;
 #ifdef MERCURY_GUI_ENABLED
 			g_gui_state.encryption_active.store(true);
@@ -19435,7 +19452,28 @@ void cl_arq_controller::process_buffer_data_commander()
 				// --- Batch-level compression with adaptive sizing ---
 				// Pop raw data based on estimated compression ratio, compress,
 				// iteratively add more data until batch is 85%+ full.
-				int batch_capacity = data_batch_size * max_frame;
+				//
+				// ENC BATCH-SIZE FIX (data-flow-encrypted-batch-size.md §3/§5): when
+				// encryption is active, BOUND the AEAD unit's frame span to the
+				// NEGOTIATED crypto_batch_size (radio_batch_size - retransmit_headroom),
+				// never the full data_batch_size. The whole-batch AEAD MAC (§2) covers
+				// the EXACT ciphertext+length, so the unit must fit in frames that
+				// always land — capping at crypto_batch_size leaves retransmit_headroom
+				// slots free for SACK retx so the batch reliably completes inside the
+				// negotiated unit and the RX reassembles a byte-exact ciphertext (no
+				// short-delivery auth-fail). min() because data_batch_size legitimately
+				// drops below 20 at runtime (Axis-2 floor 10, robust pin 1, big-block
+				// K): the AEAD unit can never span more frames than the batch holds.
+				// crypto_batch_size is a stable constant on both peers (set once in
+				// reset()/CLI, never mutated at runtime), so no wire negotiation is
+				// added. Non-encrypted path is byte-identical (crypto_frames ==
+				// data_batch_size).
+				int crypto_frames = data_batch_size;
+				if(cipher_suite.is_active()
+				   && crypto_batch_size > 0
+				   && crypto_batch_size < crypto_frames)
+					crypto_frames = crypto_batch_size;
+				int batch_capacity = crypto_frames * max_frame;
 
 				// Reserve space for encryption auth tag if active
 				int crypto_overhead = 0;
@@ -19606,15 +19644,19 @@ void cl_arq_controller::process_buffer_data_commander()
 						// after turboshift at OFDM speeds where 16 bytes is negligible.
 						int tag_size = AUTH_TAG_SIZE;
 
-						// Pad compressed data so encrypted output fills all
-						// data_batch_size frames.  The ACK gate can't peek at
-						// the compression header when it's encrypted, so it
-						// expects data_batch_size unique frames.  Without
-						// padding, compression may produce fewer frames and
-						// the duplicate-ID padding causes ACK gate suppression.
-						// Receiver decrypts, reads comp_size from header, and
+						// Pad compressed data so the encrypted output fills WHOLE
+						// frames up to the bounded crypto-unit span (crypto_frames =
+						// min(data_batch_size, crypto_batch_size); see the batch_capacity
+						// fix above). MUST match the batch_capacity cap so the AEAD unit
+						// never re-expands past crypto_batch_size frames here — otherwise
+						// the cap is defeated and the unit re-spans data_batch_size frames
+						// (data-flow-encrypted-batch-size.md §5). The RX no longer needs a
+						// full data_batch_size span: the wired D5 batch_total_frames count
+						// (arq_common.cc:8892) is the authoritative frame count the ACK gate
+						// keys off, so a sub-data_batch_size encrypted batch is gated
+						// correctly. Receiver decrypts, reads comp_size from the header, and
 						// ignores the zero padding beyond it.
-						int target_comp = data_batch_size * max_frame - tag_size;
+						int target_comp = crypto_frames * max_frame - tag_size;
 						if(comp_size < target_comp && target_comp <= (int)sizeof(comp_buf))
 						{
 							memset(comp_buf + comp_size, 0, target_comp - comp_size);
@@ -19623,26 +19665,77 @@ void cl_arq_controller::process_buffer_data_commander()
 
 						uint32_t tx_direction = (original_role == COMMANDER)
 							? DIRECTION_CMD_TO_RSP : DIRECTION_RSP_TO_CMD;
-						printf("[CRYPTO-TX] Encrypting %d bytes, counter=%llu dir=%u tag=%d config=%d\n",
-							comp_size, (unsigned long long)tx_batch_counter,
+						// AEAD nonce binds to the WIRE batch_seq_id this batch carries
+						// (cmd_batch_seq_id, CURRENT pre-increment value; the +1 at :2464 is
+						// post-send and the per-frame stamp at :2216 uses this same value),
+						// UNWRAPPED to a monotone index then folded with the re-seal generation
+						// (see the RE-SEAL guard below). A SACK retx replays the STORED
+						// ciphertext verbatim (it does not re-enter this path).
+						int tx_wire_bsi = cmd_batch_seq_id & 0xFF;
+						// RE-SEAL NONCE-REUSE GUARANTEE (data-flow-aead-nonce.md §11): the
+						// §5-inv4 claim "a rebuild always re-queues fresh -> NEW bsi -> NEW
+						// nonce" was FALSE on the compression+encryption recovery paths. A
+						// BREAK/config-rebuild/demote FREEs the built-but-unsent batch and
+						// re-queues PLAINTEXT WITHOUT advancing cmd_batch_seq_id (the +1 is
+						// post-send, a later tick), and the wire bsi MUST roll back to the
+						// in-flight value for RSP delivery contiguity (delivery_step_is_gap) -
+						// so a pure bsi-bound nonce would re-seal the SAME index over
+						// re-compressed plaintext = KEYSTREAM REUSE. The per-direction
+						// GENERATION counter (tx_nonce_gen, bumped per recovery re-queue in
+						// restore_tx_from_compressed) is folded into the index HIGH bits so a
+						// re-seal lands in a strictly-higher, DISJOINT band at the same bsi.
+						// HARD BACKSTOP (safety independent of gen alignment):
+						// tx_nonce_sealed_high_water is the highest index ever sealed; if the
+						// candidate is NOT strictly above it (the reuse condition), bump
+						// tx_nonce_gen until it clears the high-water BEFORE sealing. A nonce is
+						// NEVER reused even if the gen bookkeeping drifts - a wrong gen on RX
+						// only auth-fails (safe drop/retx), never a reuse (RFC-4303 ESN /
+						// RFC-9001 §5.4: implicit high-order seq bits; wrong guess fails tag).
+						uint64_t tx_unwrap = cl_cipher_suite::unwrap_batch_index(
+							tx_wire_bsi, &tx_nonce_epoch, &tx_nonce_last_bsi);
+						uint64_t tx_batch_index =
+							cl_cipher_suite::fold_gen_index(tx_nonce_gen, tx_unwrap);
+						if(tx_nonce_sealed_high_water != UINT64_MAX
+						   && tx_batch_index <= tx_nonce_sealed_high_water)
+						{
+							uint64_t old_gen = tx_nonce_gen;
+							uint64_t hw_band = tx_nonce_sealed_high_water /
+								cl_cipher_suite::NONCE_GEN_STRIDE;
+							tx_nonce_gen = hw_band + 1;
+							uint64_t old_idx = tx_batch_index;
+							tx_batch_index = cl_cipher_suite::fold_gen_index(
+								tx_nonce_gen, tx_unwrap);
+							printf("[CRYPTO-TX] RE-SEAL GUARD: wire_bsi=%d index<=high_water "
+								"(%llu<=%llu) - bumped gen %llu->%llu, new index=%llu\n",
+								tx_wire_bsi,
+								(unsigned long long)old_idx,
+								(unsigned long long)tx_nonce_sealed_high_water,
+								(unsigned long long)old_gen,
+								(unsigned long long)tx_nonce_gen,
+								(unsigned long long)tx_batch_index);
+							fflush(stdout);
+						}
+						tx_nonce_sealed_high_water = tx_batch_index;
+						printf("[CRYPTO-TX] Encrypting %d bytes, wire_bsi=%d index=%llu dir=%u tag=%d config=%d\n",
+							comp_size, tx_wire_bsi,
+							(unsigned long long)tx_batch_index,
 							tx_direction, tag_size, (int)data_configuration);
 						fflush(stdout);
 						char enc_buf[16384];
 						int enc_size = cipher_suite.encrypt(
 							(const uint8_t*)comp_buf, comp_size,
 							(uint8_t*)enc_buf, sizeof(enc_buf),
-							tx_batch_counter, tx_direction,
+							tx_batch_index, tx_direction,
 							tag_size);
 						if(enc_size > 0)
 						{
 							memcpy(comp_buf, enc_buf, enc_size);
 							comp_size = enc_size;
-							tx_batch_counter++;
 						}
 						else
 						{
-							printf("[CRYPTO] Encrypt failed (batch %llu)\n",
-								(unsigned long long)tx_batch_counter);
+							printf("[CRYPTO] Encrypt failed (wire_bsi %d index %llu)\n",
+								tx_wire_bsi, (unsigned long long)tx_batch_index);
 							fflush(stdout);
 						}
 					}

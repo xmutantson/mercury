@@ -148,6 +148,25 @@ int cl_cipher_suite::generate_x25519_keypair(uint8_t pubkey_out[X25519_KEY_SIZE]
     return 0;
 }
 
+int cl_cipher_suite::compute_x25519_shared_checked(const uint8_t* peer_pubkey,
+                                                   int peer_pubkey_len)
+{
+    // Reject a truncated / missing peer pubkey BEFORE reading 32 bytes, so a
+    // corrupted or short KEY_EXCHANGE frame cannot run the X25519 over stale /
+    // out-of-bounds buffer tail bytes. (data-flow-aead-nonce.md §KX.) The buffer
+    // the callers pass is large (alloc_size + canary), so the read was never an
+    // OOB crash — but a short frame would silently produce a wrong shared secret
+    // from garbage; reject it explicitly instead.
+    if (peer_pubkey == NULL || peer_pubkey_len < X25519_KEY_SIZE)
+    {
+        printf("[CRYPTO] ERROR: X25519 peer pubkey too short (%d < %d) — rejecting KX\n",
+               peer_pubkey_len, X25519_KEY_SIZE);
+        fflush(stdout);
+        return -1;
+    }
+    return compute_x25519_shared(peer_pubkey);
+}
+
 int cl_cipher_suite::compute_x25519_shared(const uint8_t peer_pubkey[X25519_KEY_SIZE])
 {
     crypto_x25519(x25519_shared, x25519_sk, peer_pubkey);
@@ -345,24 +364,123 @@ void cl_cipher_suite::compute_key_confirmation(uint8_t tag_out[8])
 // Per-Batch Encrypt/Decrypt — ChaCha20-Poly1305 (IETF)
 // ---------------------------------------------------------------------------
 
-// Build deterministic nonce from direction + batch counter
+// Build deterministic nonce from direction + UNWRAPPED wire batch index.
+//
+// IETF ChaCha20-Poly1305 has only a 96-bit (12-byte) nonce, so the nonce MUST
+// be a deterministic, reconstructible function of wire-agreed state — exactly
+// the regime RFC 7905 (TLS ChaCha20-Poly1305) / RFC 9001 (QUIC) / RFC 7634
+// (IPsec-ESP ChaCha20-Poly1305) target. We adopt the IPsec/DTLS-epoch
+// "concatenation" form: a per-direction discriminator concatenated with a
+// 64-bit monotone sequence number the receiver reconstructs from the wire
+// (never wrapping under one key). See NONCE_DESIGN.md §2-§4.
+//
+// Layout (12 bytes):
+//   nonce[0..1] = 0x0000              reserved (was the high bytes of the
+//                                     direction u32; per-session key freshness
+//                                     already separates sessions — Invariant 2)
+//   nonce[2]    = 0x00               reserved/zero pad
+//   nonce[3]    = direction byte     0x00 = CMD->RSP, 0x01 = RSP->CMD
+//                                     (the two simplex streams occupy DISJOINT
+//                                     nonce subspaces under the shared key,
+//                                     identical to RFC 7905's per-direction IV)
+//   nonce[4..11]= batch_index (BE u64) the UNWRAPPED wire batch index
+//                                     (epoch<<8 | wire_bsi); strictly increasing
+//                                     over new-batch transmission, so distinct
+//                                     batches in a session+direction never share
+//                                     a nonce. WRAP handled by the epoch field;
+//                                     a re-key floor (caller) caps a session far
+//                                     below 2^32 so wrap-into-reuse is structurally
+//                                     impossible. See NONCE_DESIGN.md §4.
+//
+// IMPORTANT (security invariant): batch_index MUST be the wire batch_seq_id
+// (agreed by BOTH peers), NOT a local encrypt-call / delivery-call counter.
+// The old design bound the nonce to local counters that desync under SACK
+// reorder/retx -> auth-fail DROP and a latent same-nonce/different-plaintext
+// reuse hazard. See NONCE_DESIGN.md §1.
 static void build_nonce(uint8_t nonce[NONCE_SIZE],
-                         uint32_t direction, uint64_t batch_counter)
+                         uint32_t direction, uint64_t batch_index)
 {
-    // nonce[0..3] = direction (big-endian)
-    nonce[0] = (uint8_t)((direction >> 24) & 0xFF);
-    nonce[1] = (uint8_t)((direction >> 16) & 0xFF);
-    nonce[2] = (uint8_t)((direction >>  8) & 0xFF);
-    nonce[3] = (uint8_t)((direction      ) & 0xFF);
-    // nonce[4..11] = batch_counter (big-endian)
-    nonce[4]  = (uint8_t)((batch_counter >> 56) & 0xFF);
-    nonce[5]  = (uint8_t)((batch_counter >> 48) & 0xFF);
-    nonce[6]  = (uint8_t)((batch_counter >> 40) & 0xFF);
-    nonce[7]  = (uint8_t)((batch_counter >> 32) & 0xFF);
-    nonce[8]  = (uint8_t)((batch_counter >> 24) & 0xFF);
-    nonce[9]  = (uint8_t)((batch_counter >> 16) & 0xFF);
-    nonce[10] = (uint8_t)((batch_counter >>  8) & 0xFF);
-    nonce[11] = (uint8_t)((batch_counter      ) & 0xFF);
+    // nonce[0..2] = reserved/zero
+    nonce[0] = 0x00;
+    nonce[1] = 0x00;
+    nonce[2] = 0x00;
+    // nonce[3] = direction byte (0 = CMD->RSP, 1 = RSP->CMD). Only the low byte
+    // of the legacy direction u32 was ever non-zero (DIRECTION_* are 0 / 1), so
+    // collapsing it to one byte loses no information and frees room for the
+    // full 64-bit unwrapped index.
+    nonce[3] = (uint8_t)(direction & 0xFF);
+    // nonce[4..11] = unwrapped wire batch index (big-endian)
+    nonce[4]  = (uint8_t)((batch_index >> 56) & 0xFF);
+    nonce[5]  = (uint8_t)((batch_index >> 48) & 0xFF);
+    nonce[6]  = (uint8_t)((batch_index >> 40) & 0xFF);
+    nonce[7]  = (uint8_t)((batch_index >> 32) & 0xFF);
+    nonce[8]  = (uint8_t)((batch_index >> 24) & 0xFF);
+    nonce[9]  = (uint8_t)((batch_index >> 16) & 0xFF);
+    nonce[10] = (uint8_t)((batch_index >>  8) & 0xFF);
+    nonce[11] = (uint8_t)((batch_index      ) & 0xFF);
+}
+
+// ---------------------------------------------------------------------------
+// Nonce sequence unwrap — reconstruct a monotone 64-bit batch index from the
+// 8-bit wire batch_seq_id stream (RFC-1982 forward-step arithmetic).
+// ---------------------------------------------------------------------------
+//
+// Mirrors cl_arq_controller::advance_last_delivered (arq_common.cc): the
+// forward distance from last to bsi is ((bsi - last) & 0xFF); a value in
+// [1,128] is a genuine forward step, [129,255] is a backward / late step, 0 is
+// a re-delivery of the same batch. The epoch (wrap count) increments ONLY when
+// a forward step crosses the 0xFF -> 0x00 boundary (raw bsi <= last on a
+// forward step). Both peers observe the SAME committed wire-bsi order, so both
+// reconstruct the SAME (epoch, index) for a given batch — the property the
+// nonce uniqueness proof relies on (NONCE_DESIGN.md §3.3 / §4).
+//
+// On a backward/late step (an out-of-order PREV recovered after a newer CURRENT
+// already advanced) we DO NOT change the epoch/last_bsi state and we return the
+// index for that bsi at the CURRENT epoch — the bsi was already part of the
+// committed forward sequence, so it re-uses its already-assigned index (and
+// hence its already-used nonce, with the SAME stored ciphertext). A
+// re-delivery of the same bsi (distance 0) is idempotent.
+uint64_t cl_cipher_suite::unwrap_batch_index(int wire_bsi,
+                                             uint64_t* epoch, int* last_bsi)
+{
+    int b = wire_bsi & 0xFF;
+    if (*last_bsi < 0)
+    {
+        // First batch in this session+direction. epoch stays 0.
+        *last_bsi = b;
+        return ((*epoch) << 8) | (uint64_t)b;
+    }
+
+    int prev = (*last_bsi) & 0xFF;
+    int fwd = (b - prev) & 0xFF;   // [1,128] forward, [129,255] backward, 0 same
+
+    if (fwd >= 1 && fwd <= 128)
+    {
+        // Forward step. If the raw 8-bit value did not increase, the step
+        // crossed the mod-256 boundary -> a wrap -> bump the epoch.
+        if (b <= prev)
+            (*epoch)++;
+        *last_bsi = b;
+        return ((*epoch) << 8) | (uint64_t)b;
+    }
+
+    // Backward / late (fwd in [129,255]) or same (fwd==0): do NOT advance state.
+    // This bsi already has an assigned index (it was part of the committed
+    // forward sequence). Reconstruct the SAME index TX used. The only subtlety
+    // is the epoch when the late bsi sits just behind a wrap boundary: if the
+    // raw bsi is numerically GREATER than the high-water raw value, it predates
+    // the most recent wrap and therefore belongs to epoch-1 (e.g. high-water
+    // raw=0x01 at epoch E, a late prev raw=0xFF was encrypted at epoch E-1).
+    // For fwd==0 (same batch re-delivery) or a backward bsi still numerically
+    // <= high-water, the epoch is unchanged. Mercury only ever recovers a PREV
+    // batch exactly one step behind current, so this window is tiny (<128) and
+    // the epoch adjustment is at most 1 — but we handle the general small-
+    // backward case for safety. State is NOT mutated (high-water must not
+    // regress; mirrors advance_last_delivered audit R1).
+    uint64_t e = *epoch;
+    if (b > prev && e > 0)
+        e -= 1;   // late bsi belongs to the epoch before the most recent wrap
+    return (e << 8) | (uint64_t)b;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +526,7 @@ static void aead_compute_mac(uint8_t mac[16],
 
 int cl_cipher_suite::encrypt(const uint8_t* in, int in_len,
                               uint8_t* out, int out_capacity,
-                              uint64_t batch_counter, uint32_t direction,
+                              uint64_t batch_index, uint32_t direction,
                               int tag_size)
 {
     if (!encryption_active || in_len <= 0)
@@ -417,7 +535,17 @@ int cl_cipher_suite::encrypt(const uint8_t* in, int in_len,
         return -1;
 
     uint8_t nonce[NONCE_SIZE];
-    build_nonce(nonce, direction, batch_counter);
+    build_nonce(nonce, direction, batch_index);
+
+    // Verification trace (env-gated, zero-impact when unset): emit the
+    // (dir, unwrapped-index) of every encrypted batch so a faithful-sim run log
+    // can be scanned for the SECURITY INVARIANT — no (dir,index) nonce reused.
+    if (getenv("MERCURY_NONCE_TRACE"))
+    {
+        printf("[NONCE-TRACE] ENC dir=%u idx=%llu len=%d\n",
+               (unsigned)direction, (unsigned long long)batch_index, in_len);
+        fflush(stdout);
+    }
 
     // Always use the streaming AEAD API (computes full 16-byte MAC)
     uint8_t full_mac[16];
@@ -439,7 +567,7 @@ int cl_cipher_suite::encrypt(const uint8_t* in, int in_len,
 
 int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
                               uint8_t* out, int out_capacity,
-                              uint64_t batch_counter, uint32_t direction,
+                              uint64_t batch_index, uint32_t direction,
                               int tag_size)
 {
     if (!encryption_active || in_len <= tag_size)
@@ -450,7 +578,9 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
         return -1;
 
     uint8_t nonce[NONCE_SIZE];
-    build_nonce(nonce, direction, batch_counter);
+    build_nonce(nonce, direction, batch_index);
+
+    const bool nonce_trace = getenv("MERCURY_NONCE_TRACE") != NULL;
 
     const uint8_t* ciphertext = in;
     const uint8_t* received_tag = in + plain_len;
@@ -466,6 +596,11 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
         if (rc != 0)
         {
             crypto_wipe(out, plain_len);
+            if (nonce_trace) {
+                printf("[NONCE-TRACE] DEC-AUTHFAIL dir=%u idx=%llu len=%d\n",
+                       (unsigned)direction, (unsigned long long)batch_index, plain_len);
+                fflush(stdout);
+            }
             return -1;
         }
     }
@@ -498,6 +633,11 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
         if (diff != 0)
         {
             crypto_wipe(out, plain_len);
+            if (nonce_trace) {
+                printf("[NONCE-TRACE] DEC-AUTHFAIL dir=%u idx=%llu len=%d\n",
+                       (unsigned)direction, (unsigned long long)batch_index, plain_len);
+                fflush(stdout);
+            }
             return -1;  // Auth failure
         }
 
@@ -505,6 +645,11 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
         crypto_chacha20_ietf(out, ciphertext, plain_len, session_key, nonce, 1);
     }
 
+    if (nonce_trace) {
+        printf("[NONCE-TRACE] DEC-OK dir=%u idx=%llu len=%d\n",
+               (unsigned)direction, (unsigned long long)batch_index, plain_len);
+        fflush(stdout);
+    }
     return plain_len;
 }
 

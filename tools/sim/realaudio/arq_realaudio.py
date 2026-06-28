@@ -46,6 +46,13 @@ DISC_RE = re.compile(r"link_status:Disconnected|DISCONNECTED")
 NRECV_RE = re.compile(r"stats\.nReceived_data=\s*(\d+)")
 CFG_RE = re.compile(r"load_configuration\((\d+)\)\s+current=(\d+)")
 BREAK_RE = re.compile(r"\[BREAK\] Block failure")
+# AEAD auth-fail markers: the env-gated nonce trace (DEC-AUTHFAIL) AND any
+# generic crypto auth-failure / PSK-mismatch the modem already logs.
+AUTHFAIL_RE = re.compile(r"NONCE-TRACE\] DEC-AUTHFAIL|auth.?fail|PSK mismatch|decrypt.*fail",
+                         re.IGNORECASE)
+NONCE_ENC_RE = re.compile(r"NONCE-TRACE\] ENC dir=(\d+) idx=(\d+)")
+NONCE_DECOK_RE = re.compile(r"NONCE-TRACE\] DEC-OK dir=(\d+) idx=(\d+)")
+ENC_ACT_RE = re.compile(r"\[CRYPTO\] Encryption ACTIVATED")
 
 
 class State:
@@ -58,6 +65,12 @@ class State:
         self.cmd_nreceived = 0
         self.breaks = 0
         self.configs_seen = set()
+        self.authfails = 0
+        self.enc_activated = False
+        # nonce trace: (dir,idx) -> count of ENC emissions; >1 for any key = reuse
+        self.enc_nonces = {}
+        self.dec_ok = 0
+        self.nonce_reuse = 0
         self.lock = threading.Lock()
 
 
@@ -91,6 +104,25 @@ def log_output(proc, label, logfile, t0, st):
             if BREAK_RE.search(text):
                 with st.lock:
                     st.breaks += 1
+            if AUTHFAIL_RE.search(text):
+                with st.lock:
+                    st.authfails += 1
+            if ENC_ACT_RE.search(text):
+                with st.lock:
+                    st.enc_activated = True
+            m = NONCE_ENC_RE.search(text)
+            if m:
+                # (direction, unwrapped index) — per-peer the (key,nonce) pair must
+                # be unique. A second ENC of the same (dir,idx) within one peer's
+                # log = nonce reuse with (potentially) different plaintext.
+                key = (label, int(m.group(1)), int(m.group(2)))
+                with st.lock:
+                    st.enc_nonces[key] = st.enc_nonces.get(key, 0) + 1
+                    if st.enc_nonces[key] > 1:
+                        st.nonce_reuse += 1
+            if NONCE_DECOK_RE.search(text):
+                with st.lock:
+                    st.dec_ok += 1
     except (ValueError, OSError):
         pass
 
@@ -183,6 +215,11 @@ def main():
     ap.add_argument("--cmd-port", type=int, default=7006)
     ap.add_argument("--no-kill", action="store_true",
                     help="do NOT global-pkill mercury/bridge on start (REQUIRED for concurrent runs)")
+    ap.add_argument("--encrypt", default=None,
+                    help="encryption mode passed to BOTH mercury via -E (e.g. 'fast' or 'strict'); "
+                         "omit for plaintext")
+    ap.add_argument("--psk", default=None,
+                    help="pre-shared key hex passed to BOTH mercury via -K (required with --encrypt)")
     args = ap.parse_args()
 
     os.makedirs(args.logdir, exist_ok=True)
@@ -241,6 +278,13 @@ def main():
             c += ["-Q", "0"]      # pin: start direct-WB at start-cfg
         if use_robust:
             c += ["-R"]
+        # Encryption: -E <mode> + matching -K <psk-hex> on BOTH peers. The PSK is
+        # the shared secret both modems use to derive the X25519 session key; it
+        # MUST be identical on commander and responder or KX confirmation fails.
+        if args.encrypt:
+            c += ["-E", args.encrypt]
+            if args.psk:
+                c += ["-K", args.psk]
         return c
 
     def launch(port, in_dev, out_dev, label):
@@ -373,6 +417,12 @@ def main():
         "rsp_nreceived_frames": st.rsp_nreceived,
         "cmd_nreceived_frames": st.cmd_nreceived,
         "breaks": st.breaks,
+        "encrypt": args.encrypt,
+        "enc_activated": st.enc_activated,
+        "aead_authfails": st.authfails,
+        "nonce_enc_count": sum(st.enc_nonces.values()),
+        "nonce_reuse_count": st.nonce_reuse,
+        "dec_ok_count": st.dec_ok,
         "configs_seen": configs_sorted,
         "max_config_reached": max_config,
         "wb_configs_seen": wb_seen,

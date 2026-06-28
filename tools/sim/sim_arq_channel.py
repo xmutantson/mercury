@@ -603,6 +603,15 @@ def main():
                          "reads a per-frame wire for THAT config (not a "
                          "climb-ramp-diluted mix). See GAP1_AIRTIME_WIRE_VERDICT.md.")
     ap.add_argument("--compress", default="off")
+    # ENC BATCH-SIZE FIX verify (data-flow-encrypted-batch-size.md): drive a real
+    # encrypted ARQ session over the lossy -x sim relay so the SACK prev-batch
+    # recovery -> whole-batch AEAD decrypt path is exercised end-to-end. Both peers
+    # get the SAME -E mode + -K PSK (symmetric, required for KX). Encryption forces
+    # compression ON in the modem, so this also flips --compress when set.
+    ap.add_argument("--encrypt", default=None, choices=("strict", "fast"),
+                    help="pass -E <mode> to BOTH peers (encrypted ARQ over -x sim)")
+    ap.add_argument("--psk", default=None,
+                    help="pre-shared key hex (-K) for --encrypt (both peers)")
     ap.add_argument("--payload", default=DEFAULT_PAYLOAD,
                     help="TX payload file (default payload_incompressible_64k.bin, "
                          "a fixed high-entropy file so compression is bypassed and "
@@ -796,6 +805,11 @@ def main():
             c += ["-Q", "0"]
         if use_robust:
             c += ["-R"]
+        # Encrypted ARQ (enc-batchsize verify): same -E/-K on both peers.
+        if args.encrypt:
+            c += ["-E", args.encrypt]
+            if args.psk:
+                c += ["-K", args.psk]
         return c
 
     def launch(port, role):
