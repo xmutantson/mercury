@@ -6923,9 +6923,17 @@ void cl_arq_controller::process_control_commander()
 			printf("[CRYPTO] KEY_EXCHANGE_1 ACKed — received responder's X25519 pubkey\n");
 			fflush(stdout);
 
-			if(cipher_suite.compute_x25519_shared((const uint8_t*)&messages_control.data[1]) != 0)
+			// Length-checked KX read: the KEY_EXCHANGE_1 ACK carries pubkey(32) +
+			// confirm tag(8) at data[1..40]. Verify the fixed control-frame copy
+			// width holds at least the 32-byte pubkey before computing the shared
+			// secret; reject a truncated frame instead of running over stale tail
+			// bytes (the tag read at :6945 is bounded by the same width).
+			int kx_avail = (max_data_length+max_header_length
+			                - CONTROL_ACK_CONTROL_HEADER_LENGTH) - 1;
+			if(cipher_suite.compute_x25519_shared_checked(
+			       (const uint8_t*)&messages_control.data[1], kx_avail) != 0)
 			{
-				printf("[CRYPTO] FATAL: X25519 shared secret is zero (low-order point attack?)\n");
+				printf("[CRYPTO] FATAL: X25519 shared secret invalid (zero/low-order point or truncated KX frame)\n");
 				fflush(stdout);
 				this->link_status = DROPPED;
 				reset_session_state();
@@ -6997,8 +7005,13 @@ void cl_arq_controller::process_control_commander()
 
 			// KEY_ACTIVATE ACKed — encryption is now active on both sides
 			cipher_suite.activate();
-			tx_batch_counter = 0;
-			rx_batch_counter = 0;
+			// AEAD nonce sequence state: fresh per session+direction. First
+			// batch (wire bsi=0) -> index 0. (data-flow-aead-nonce.md §init)
+			tx_nonce_epoch = 0;
+			tx_nonce_last_bsi = -1;
+			rx_nonce_epoch = 0;
+			rx_nonce_last_bsi = -1;
+			decrypt_delivered_bsi = -1;
 			consecutive_auth_failures = 0;
 #ifdef MERCURY_GUI_ENABLED
 			g_gui_state.encryption_active.store(true);
@@ -19270,26 +19283,40 @@ void cl_arq_controller::process_buffer_data_commander()
 
 						uint32_t tx_direction = (original_role == COMMANDER)
 							? DIRECTION_CMD_TO_RSP : DIRECTION_RSP_TO_CMD;
-						printf("[CRYPTO-TX] Encrypting %d bytes, counter=%llu dir=%u tag=%d config=%d\n",
-							comp_size, (unsigned long long)tx_batch_counter,
+						// AEAD nonce binds to the WIRE batch_seq_id this batch will
+						// be stamped with on the wire (cmd_batch_seq_id, the CURRENT
+						// pre-increment value — the increment at :2464 happens AFTER
+						// send_batch, and the per-frame stamp at :2216 uses this same
+						// value). Unwrapped to a strictly-monotone 64-bit index so it
+						// never wraps under one key. A config-change rebuild re-queues
+						// the plaintext as FRESH new-data with a NEW bsi (R029,
+						// arq_common.cc restore_tx_from_compressed), so a re-encrypt
+						// always gets a NEW nonce — never same-nonce/different-plaintext.
+						// A SACK retx replays the STORED ciphertext verbatim (it does
+						// not re-enter this path). See data-flow-aead-nonce.md §TX.
+						int tx_wire_bsi = cmd_batch_seq_id & 0xFF;
+						uint64_t tx_batch_index = cl_cipher_suite::unwrap_batch_index(
+							tx_wire_bsi, &tx_nonce_epoch, &tx_nonce_last_bsi);
+						printf("[CRYPTO-TX] Encrypting %d bytes, wire_bsi=%d index=%llu dir=%u tag=%d config=%d\n",
+							comp_size, tx_wire_bsi,
+							(unsigned long long)tx_batch_index,
 							tx_direction, tag_size, (int)data_configuration);
 						fflush(stdout);
 						char enc_buf[16384];
 						int enc_size = cipher_suite.encrypt(
 							(const uint8_t*)comp_buf, comp_size,
 							(uint8_t*)enc_buf, sizeof(enc_buf),
-							tx_batch_counter, tx_direction,
+							tx_batch_index, tx_direction,
 							tag_size);
 						if(enc_size > 0)
 						{
 							memcpy(comp_buf, enc_buf, enc_size);
 							comp_size = enc_size;
-							tx_batch_counter++;
 						}
 						else
 						{
-							printf("[CRYPTO] Encrypt failed (batch %llu)\n",
-								(unsigned long long)tx_batch_counter);
+							printf("[CRYPTO] Encrypt failed (wire_bsi %d index %llu)\n",
+								tx_wire_bsi, (unsigned long long)tx_batch_index);
 							fflush(stdout);
 						}
 					}

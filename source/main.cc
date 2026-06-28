@@ -46,6 +46,7 @@
 #include "physical_layer/mfsk_ctrl_codec_tests.h"
 #include "common/sim_clock_tests.h"
 #include "compression/test_winlink_dict.h"
+#include "crypto/test_aead_nonce.h"   // AEAD bsi-bound nonce regression suite
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
@@ -706,6 +707,12 @@ int main(int argc, char *argv[])
             int failed = run_mfsk_ctrl_codec_tests();
             failed += run_sim_clock_tests();
             failed += run_winlink_dict_tests();
+            // AEAD bsi-bound nonce regression suite (data-flow-aead-nonce.md):
+            // SECURITY INVARIANT — no (key,nonce) reuse; nonce binds to the wire
+            // batch_seq_id so SACK reorder/retx decrypt correctly. Includes the
+            // >256-batch wrap, reorder+retx round-trip, direction disjointness,
+            // truncated-KX reject, and tamper-reject cases. No IONOS/RF.
+            failed += run_aead_nonce_tests();
             // In-band down-ladder DELIVERY regression (BREAK-orphan + silent-snapshot). A
             // member test on a throwaway controller (its own buffers; PART B builds its own
             // minimal telecom_system). Fast + deterministic, no IONOS/RF. data-flow-inband-
@@ -1076,6 +1083,16 @@ int main(int argc, char *argv[])
         // streaming desync). See source/compression/test_winlink_dict.cc.
         if (strcmp(argv[i], "--test-winlink-dict") == 0) {
             int failed = run_winlink_dict_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-aead-nonce : run ONLY the AEAD bsi-bound nonce regression suite
+        // and exit. Fast + deterministic, no IONOS/RF. SECURITY INVARIANT gate:
+        // no (key,nonce) reuse; nonce binds to the wire batch_seq_id so SACK
+        // reorder/retx decrypt correctly (>256-batch wrap, reorder+retx round-
+        // trip, direction disjointness, truncated-KX reject, tamper-reject).
+        // See source/crypto/test_aead_nonce.cc / data-flow-aead-nonce.md.
+        if (strcmp(argv[i], "--test-aead-nonce") == 0) {
+            int failed = run_aead_nonce_tests();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sim-clock : run ONLY the sim-clock unit suite and exit. The

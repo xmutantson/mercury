@@ -1290,6 +1290,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 								if(messages_rx[i].status == RECEIVED)
 									messages_rx[i].status = ACKED;
 							}
+							// AEAD nonce source (data-flow-aead-nonce.md §5): the
+							// out-of-order PREV completion delivers messages_rx_prev[],
+							// whose wire bsi is rsp_prev_batch_seq_id.
+							decrypt_delivered_bsi = rsp_prev_batch_seq_id;
 							copy_data_to_buffer();
 							// Restore current-batch pointer + delivery state.
 							messages_rx                     = saved_rx;
@@ -2572,6 +2576,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		// point of the gate is to refuse the silent concat).
 		if(!batch_data_delivered && !batch_gap_aborted)
 		{
+			// AEAD nonce source (data-flow-aead-nonce.md §5): the in-order BATCH-
+			// DONE delivery. rsp_current_expected_batch_seq_id was ALREADY advanced
+			// at :2429 before this call, so the DELIVERED batch's wire bsi lives in
+			// rsp_prev_batch_seq_id (set at :2428). Binding to current here would
+			// use the WRONG (next) bsi.
+			decrypt_delivered_bsi = rsp_prev_batch_seq_id;
 			copy_data_to_buffer();
 			batch_data_delivered = true;  // Prevent duplicate delivery on retransmit
 		}
@@ -3098,10 +3108,17 @@ void cl_arq_controller::process_control_responder()
 				return;
 			}
 
-			// Compute shared secret from commander's pubkey
-			if(cipher_suite.compute_x25519_shared((const uint8_t*)&messages_control.data[1]) != 0)
+			// Compute shared secret from commander's pubkey. Length-checked: the
+			// control-frame RX copies a FIXED width into messages_control.data[]
+			// (arq_responder.cc:846-851), so the available pubkey bytes after the
+			// 1-byte type field = that width - 1. Reject a too-short frame rather
+			// than run X25519 over stale tail bytes. (data-flow-aead-nonce.md §KX.)
+			int kx_avail = (max_data_length+max_header_length
+			                - CONTROL_ACK_CONTROL_HEADER_LENGTH) - 1;
+			if(cipher_suite.compute_x25519_shared_checked(
+			       (const uint8_t*)&messages_control.data[1], kx_avail) != 0)
 			{
-				printf("[CRYPTO] FATAL: X25519 shared secret is zero (low-order point attack?)\n");
+				printf("[CRYPTO] FATAL: X25519 shared secret invalid (zero/low-order point or truncated KX frame)\n");
 				fflush(stdout);
 				this->link_status = DROPPED;
 				reset_session_state();
@@ -3148,8 +3165,13 @@ void cl_arq_controller::process_control_responder()
 				printf("[CRYPTO] KEY_ACTIVATE confirmed — key confirmation matches\n");
 				fflush(stdout);
 				cipher_suite.activate();
-				tx_batch_counter = 0;
-				rx_batch_counter = 0;
+				// AEAD nonce sequence state: fresh per session+direction.
+				// (data-flow-aead-nonce.md §init)
+				tx_nonce_epoch = 0;
+				tx_nonce_last_bsi = -1;
+				rx_nonce_epoch = 0;
+				rx_nonce_last_bsi = -1;
+				decrypt_delivered_bsi = -1;
 				consecutive_auth_failures = 0;
 
 				// Report encryption state on control port
@@ -3381,6 +3403,13 @@ void cl_arq_controller::process_control_responder()
 		{
 			connection_status=ACKNOWLEDGING_CONTROL;
 			printf("end of file\n");
+			// AEAD nonce source (data-flow-aead-nonce.md §5): end-of-session flush
+			// of any residual ACKED batch in messages_rx[]. cur is NOT advanced at
+			// this site, so an undelivered residual batch still carries bsi ==
+			// rsp_current_expected_batch_seq_id. (Normally the in-order BATCH-DONE
+			// path already delivered + FREE'd the last batch, so this is a no-op
+			// with assembled_size==0 and decrypt is skipped.)
+			decrypt_delivered_bsi = rsp_current_expected_batch_seq_id;
 			copy_data_to_buffer();
 			batch_data_delivered = false;
 			messages_last_ack_bu.type=NONE;
@@ -3390,6 +3419,9 @@ void cl_arq_controller::process_control_responder()
 		else if(code==SWITCH_ROLE)
 		{
 			printf("switch role\n");
+			// AEAD nonce source (data-flow-aead-nonce.md §5): SWITCH_ROLE flush —
+			// same residual-batch semantics as FILE_END_ (cur not advanced here).
+			decrypt_delivered_bsi = rsp_current_expected_batch_seq_id;
 			copy_data_to_buffer();
 			batch_data_delivered = false;
 
@@ -10493,6 +10525,9 @@ int cl_arq_controller::test_spec_sack()
 	// ACK-GATE-PASS: flip RECEIVED->ACKED (the complete-batch path) then deliver.
 	for(int i = 0; i < this->data_batch_size; i++)
 		if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+	// Mirror production: set the delivered batch's wire bsi for the AEAD nonce
+	// (inert here — this rig does not activate encryption). data-flow-aead-nonce.md §5.
+	decrypt_delivered_bsi = messages_rx[0].batch_seq_id;
 	copy_data_to_buffer();   // PRODUCTION delivery primitive
 
 	// Oracle: pop the whole delivered stream; assert == the K*SUB_LEN TX bytes, in
@@ -12636,6 +12671,9 @@ int cl_arq_controller::test_eob_loss_batch_truncation()
 		messages_rx = messages_rx_prev;
 		for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
 			if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+		// Mirror production PREV delivery: bsi = rsp_prev_batch_seq_id (inert here —
+		// rig does not activate encryption). data-flow-aead-nonce.md §5.
+		decrypt_delivered_bsi = this->rsp_prev_batch_seq_id;
 		copy_data_to_buffer();                 // REAL reassembler → fifo_buffer_rx
 		messages_rx = saved_rx;
 		for(int i=0; i<this->nMessages; i++) messages_rx_prev[i].status = FREE;

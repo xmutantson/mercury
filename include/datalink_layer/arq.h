@@ -4192,8 +4192,20 @@ public:
   // leaves the bit clear → both_support false → per-batch fallback). Computed once at
   // the TEST_CONNECTION / TEST_CONNECTION_ACK negotiation, cleared on session reset.
   bool cumulative_ack_enabled;        // Negotiated: both sides have CAP_CUMULATIVE_ACK
-  uint64_t tx_batch_counter;          // Monotonic counter for encrypt nonces (TX direction)
-  uint64_t rx_batch_counter;          // Monotonic counter for decrypt nonces (RX direction)
+  // AEAD nonce sequence state (data-flow-aead-nonce.md). The nonce binds to the
+  // UNWRAPPED WIRE batch_seq_id (epoch<<8 | wire_bsi), NOT a local encrypt/
+  // delivery-order counter, so it survives SACK reorder/retx (both peers derive
+  // the same nonce from the same wire bsi). These hold the per-direction
+  // epoch/last-seen-bsi used by cl_cipher_suite::unwrap_batch_index(). Reset to
+  // (0, -1) at activate() and on session reset.
+  uint64_t tx_nonce_epoch;            // TX-direction wrap count for encrypt nonce
+  int      tx_nonce_last_bsi;         // TX-direction last wire bsi (-1 = unset)
+  uint64_t rx_nonce_epoch;            // RX-direction wrap count for decrypt nonce
+  int      rx_nonce_last_bsi;         // RX-direction last wire bsi (-1 = unset)
+  int      decrypt_delivered_bsi;     // wire bsi of the batch being delivered in
+                                      // copy_data_to_buffer() (set immediately
+                                      // before each call per the §5 source table;
+                                      // -1 = unknown -> decrypt is skipped/safe)
   int consecutive_auth_failures;      // Auth failures since last success (3 → disconnect)
   uint8_t* kx_data_buf;              // Buffer for ML-KEM key exchange data (1184 or 1088 bytes)
   int kx_data_len;                    // Length of pending key exchange data

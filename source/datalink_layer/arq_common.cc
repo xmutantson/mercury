@@ -873,8 +873,11 @@ cl_arq_controller::cl_arq_controller()
 	encryption_mode=ENCRYPT_OFF;
 	encryption_enabled=false;
 	cumulative_ack_enabled=false;  // FORGIVING-ACK Tier 2: fresh session never inherits a negotiated cap
-	tx_batch_counter=0;
-	rx_batch_counter=0;
+	tx_nonce_epoch=0;
+	tx_nonce_last_bsi=-1;
+	rx_nonce_epoch=0;
+	rx_nonce_last_bsi=-1;
+	decrypt_delivered_bsi=-1;
 	consecutive_auth_failures=0;
 	kx_data_buf=NULL;
 	kx_data_len=0;
@@ -5047,6 +5050,9 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
 		if(messages_rx[i].status == RECEIVED)
 			messages_rx[i].status = ACKED;
+	// AEAD nonce source (data-flow-aead-nonce.md §5): pre-BREAK flush delivers
+	// messages_rx_prev[], whose wire bsi is rsp_prev_batch_seq_id.
+	decrypt_delivered_bsi = rsp_prev_batch_seq_id;
 	copy_data_to_buffer();
 	messages_rx          = saved_rx;
 	batch_data_delivered = saved_data_delivered;
@@ -7049,8 +7055,11 @@ void cl_arq_controller::reset_session_state()
 	// Don't clear psk_mismatch here — let it persist so the GUI shows the error.
 	// It gets cleared on next successful encryption activation.
 #endif
-	tx_batch_counter = 0;
-	rx_batch_counter = 0;
+	tx_nonce_epoch = 0;
+	tx_nonce_last_bsi = -1;
+	rx_nonce_epoch = 0;
+	rx_nonce_last_bsi = -1;
+	decrypt_delivered_bsi = -1;
 	consecutive_auth_failures = 0;
 	if (kx_data_buf) { free(kx_data_buf); kx_data_buf = NULL; }
 	kx_data_len = 0;
@@ -12960,6 +12969,24 @@ void cl_arq_controller::receive()
 						messages_rx_buffer.id=message_TxRx_byte_buffer[3];
 					}
 					int copy_len = max_data_length+max_header_length-eff_hdr;
+					// LOW CLAMP (data-flow-aead-nonce.md §7.1): on a degenerate config
+					// (tiny ROBUST + a wide eff_hdr, e.g. sack_v2 + header_carries_d5)
+					// eff_hdr can exceed max_data_length+max_header_length, making
+					// copy_len NEGATIVE. The for-loop below is benign (skipped) but a
+					// negative length stored in messages_rx_buffer.length propagates to
+					// the reassembler (assembled_size += messages_rx[i].length), which
+					// then corrupts the decrypt ciphertext length -> guaranteed AEAD
+					// auth-fail (false PSK-mismatch disconnect) and a potential OOB in
+					// the assemble memcpy. Clamp low so length is always >= 0. This
+					// fires only on a config/header mismatch, never on normal traffic.
+					if(copy_len < 0)
+					{
+						printf("[RX-COPYLEN-CLAMP] DATA_LONG copy_len<0 (eff_hdr=%d > "
+							"max_data+max_hdr=%d) -> clamped to 0; config/header mismatch\n",
+							eff_hdr, max_data_length+max_header_length);
+						fflush(stdout);
+						copy_len = 0;
+					}
 					if(copy_len > alloc_size) copy_len = alloc_size;
 					messages_rx_buffer.length=copy_len;
 					for(int j=0;j<copy_len;j++)
@@ -13697,20 +13724,29 @@ void cl_arq_controller::copy_data_to_buffer()
 				int tag_size = AUTH_TAG_SIZE;
 				uint32_t rx_direction = (original_role == COMMANDER)
 					? DIRECTION_RSP_TO_CMD : DIRECTION_CMD_TO_RSP;
-				printf("[CRYPTO-RX] Decrypting %d bytes, counter=%llu dir=%u tag=%d config=%d\n",
-					assembled_size, (unsigned long long)rx_batch_counter,
+				// AEAD nonce binds to the WIRE batch_seq_id of the batch being
+				// delivered, reconstructed identically on both peers. The bsi is
+				// passed in via decrypt_delivered_bsi (set immediately before each
+				// copy_data_to_buffer() call per the §5 source table — NOT
+				// rsp_current_expected_batch_seq_id, which is already advanced at
+				// the in-order delivery site). data-flow-aead-nonce.md §RX.
+				int rx_wire_bsi = decrypt_delivered_bsi & 0xFF;
+				uint64_t rx_batch_index = cl_cipher_suite::unwrap_batch_index(
+					rx_wire_bsi, &rx_nonce_epoch, &rx_nonce_last_bsi);
+				printf("[CRYPTO-RX] Decrypting %d bytes, wire_bsi=%d index=%llu dir=%u tag=%d config=%d\n",
+					assembled_size, rx_wire_bsi,
+					(unsigned long long)rx_batch_index,
 					rx_direction, tag_size, (int)data_configuration);
 				fflush(stdout);
 				int plain_size = cipher_suite.decrypt(
 					(const uint8_t*)assembled, assembled_size,
 					(uint8_t*)decrypt_buf, sizeof(decrypt_buf),
-					rx_batch_counter, rx_direction,
+					rx_batch_index, rx_direction,
 					tag_size);
 				if(plain_size > 0)
 				{
 					comp_data = decrypt_buf;
 					comp_len = plain_size;
-					rx_batch_counter++;
 					printf("[CRYPTO-RX] Decrypted: %d -> %d bytes OK\n",
 						assembled_size, plain_size);
 					fflush(stdout);
@@ -13718,8 +13754,9 @@ void cl_arq_controller::copy_data_to_buffer()
 				else
 				{
 					consecutive_auth_failures++;
-					printf("[CRYPTO] Decrypt FAILED (batch %llu, fails=%d) — PSK MISMATCH\n",
-						(unsigned long long)rx_batch_counter, consecutive_auth_failures);
+					printf("[CRYPTO] Decrypt FAILED (wire_bsi %d index %llu, fails=%d) — PSK MISMATCH\n",
+						rx_wire_bsi, (unsigned long long)rx_batch_index,
+						consecutive_auth_failures);
 					fflush(stdout);
 
 					// Report error on control port
@@ -13878,17 +13915,21 @@ void cl_arq_controller::restore_tx_from_compressed()
 	}
 
 	// When encryption is active, messages_tx contains encrypted+compressed data.
-	// Decrypting requires the exact batch counter that was used, which is fragile.
-	// The backup buffer always has raw plaintext, so use it directly.
+	// The backup buffer always has raw plaintext, so use it directly: the data is
+	// re-queued and re-sent as FRESH new-data under the new config, which assigns
+	// it a NEW wire batch_seq_id (R029). The AEAD nonce binds to that wire bsi
+	// (data-flow-aead-nonce.md §TX), so a re-encrypt naturally gets a NEW nonce —
+	// no counter rewind needed (the old local-counter `tx_batch_counter--` hack
+	// is obsolete and was REMOVED: it paired the same nonce with potentially
+	// re-compressed/different plaintext, the latent reuse hazard NONCE_DESIGN.md
+	// §1/§4(e) flagged). The forward-only nonce epoch never regresses.
 	if(cipher_suite.is_active())
 	{
-		printf("[RESTORE_TX] Encryption active — restoring from backup buffer\n");
+		printf("[RESTORE_TX] Encryption active — restoring from backup buffer (fresh-bsi re-send)\n");
 		fflush(stdout);
 		for(int i=0; i<nMessages; i++)
 			messages_tx[i].status = FREE;
 		restore_backup_buffer_data();
-		// Rewind TX counter so re-encrypted batch gets same counter
-		if(tx_batch_counter > 0) tx_batch_counter--;
 		return;
 	}
 
