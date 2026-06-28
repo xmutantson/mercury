@@ -8136,9 +8136,37 @@ int cl_arq_controller::kx_receive_chunk(const uint8_t* frame, int frame_len,
 		for(int i=0;i<256;i++) kx_rx_got[i] = false;
 	}
 
+	// RECONSTRUCT THE TRUE ON-WIRE CHUNK LENGTH (data-flow-control-slot-lifecycle.md).
+	// The RX control-slot producer (arq_responder.cc:830) hardcodes
+	// messages_control.length=1 and copies a FIXED slot width into data[] (:846),
+	// DESTROYING the variable per-chunk length the TX sent (kx_chunk_encode's
+	// `wrote` = header + payload, SHORT on the final chunk). The call sites
+	// therefore pass `frame_len` = the fixed slot width (an UPPER BOUND on the
+	// available bytes), not the true frame length. kx_chunk_decode requires the
+	// EXACT length: a non-final chunk MUST be full-capacity and a padded final
+	// chunk would over-extend past reasm_cap. So derive the exact length here from
+	// the chunk's own header index + the known total — both of which we hold —
+	// rather than trusting the (lost) wire length. The header (index/count/CRC8)
+	// is itself integrity-checked inside kx_chunk_decode, so a corrupt index can
+	// only shorten/reject, never overflow (kx_chunk_decode still bounds reasm).
+	int eff_frame_len = frame_len;
+	if(frame_len >= cl_cipher_suite::KX_CHUNK_HEADER_LEN && kx_rx_chunk_cap > 0)
+	{
+		int hdr_index = (unsigned char)frame[1];          // chunk index (header)
+		if(hdr_index >= 0)
+		{
+			int off = hdr_index * kx_rx_chunk_cap;        // payload start in `total`
+			int want = total - off;                       // bytes still owed at this index
+			if(want > kx_rx_chunk_cap) want = kx_rx_chunk_cap;   // non-final: full cap
+			if(want < 0) want = 0;                        // out-of-range index -> decode rejects
+			int exact = cl_cipher_suite::KX_CHUNK_HEADER_LEN + want;
+			if(exact <= frame_len) eff_frame_len = exact; // never read past the slot
+		}
+	}
+
 	int idx = -1, cnt = -1;
 	int payload = cl_cipher_suite::kx_chunk_decode(
-		(uint8_t)expect_kind, frame, frame_len, kx_rx_chunk_cap,
+		(uint8_t)expect_kind, frame, eff_frame_len, kx_rx_chunk_cap,
 		kx_data_buf, MLKEM_PK_SIZE, &idx, &cnt);
 	if(payload < 0)
 	{

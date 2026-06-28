@@ -7845,8 +7845,16 @@ void cl_arq_controller::process_control_commander()
 			}
 			else // KEY_EXCHANGE_3 chunk arriving (RSP -> CMD ciphertext)
 			{
+				// FIX (data-flow-control-slot-lifecycle.md): the RX control-slot
+				// producer (arq_responder.cc:830) hardcodes messages_control.length=1
+				// while copying the FULL fixed slot width into data[] (:846). Pass the
+				// REAL slot width — the same geometry the codec uses for capacity
+				// (kx_chunk_payload_capacity() + the 4-byte chunk header) — NOT the
+				// length=1 sentinel, which made kx_chunk_decode reject every chunk.
+				int kx_frame_len = kx_chunk_payload_capacity()
+				                   + cl_cipher_suite::KX_CHUNK_HEADER_LEN;
 				int done = kx_receive_chunk((const uint8_t*)messages_control.data,
-				                            messages_control.length, KEY_EXCHANGE_3);
+				                            kx_frame_len, KEY_EXCHANGE_3);
 				if(done == 1)
 				{
 					// Full ciphertext reassembled — decapsulate + derive hybrid key.

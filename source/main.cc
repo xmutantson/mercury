@@ -1759,6 +1759,19 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_rxctrl;
                 failed += ARQ_rxctrl.test_rx_ctrl_drop();
             }
+            // ML-KEM KX MULTI-CHUNK LIVE-RX gate (MLKEM_HYBRID_PLAN.md §5 /
+            // data-flow-control-slot-lifecycle.md): the RX control-slot producer
+            // hardcodes messages_control.length=1 while copying a FIXED slot width
+            // into data[]; the KX2/KX3 chunk receivers fed length=1 into
+            // kx_receive_chunk -> kx_chunk_decode rejected EVERY chunk -> the PQ
+            // hybrid handshake could never complete on the live wire. This gate
+            // drives multi-chunk KX2 (RSP consumer) + KX3 (CMD consumer) through the
+            // REAL process_control_responder/commander call sites and asserts full
+            // reassembly + live encapsulate/decapsulate. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxlive;
+                failed += ARQ_kxlive.test_kx_chunk_live_rx();
+            }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
             // pre-data re-ACK pinned the shared frames_to_read=2 across the first
@@ -2675,6 +2688,17 @@ int main(int argc, char *argv[])
         // See source/crypto/test_mlkem_hybrid.cc / MLKEM_HYBRID_PLAN.md.
         if (strcmp(argv[i], "--test-mlkem-hybrid") == 0) {
             int failed = run_mlkem_hybrid_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-mlkem-live-rx : ML-KEM KX MULTI-CHUNK reassembly through the LIVE
+        // control-RX consumer path (process_control_responder KX2 +
+        // process_control_commander KX3). Reproduces the messages_control.length=1
+        // producer/consumer bug: fails-before (chunks rejected), passes-after (real
+        // slot width passed). Member test on a throwaway controller. Fast +
+        // deterministic, no IONOS/RF. MLKEM_HYBRID_PLAN.md §5.
+        if (strcmp(argv[i], "--test-mlkem-live-rx") == 0) {
+            cl_arq_controller ARQ_kx;
+            int failed = ARQ_kx.test_kx_chunk_live_rx();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sim-clock : run ONLY the sim-clock unit suite and exit. The

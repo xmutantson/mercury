@@ -2149,6 +2149,18 @@ public:
   // stuck and the later control frame is dropped). 0 PASS / 1 FAIL.
   int test_rx_ctrl_drop();
 
+  // ML-KEM KX MULTI-CHUNK LIVE-RX REASSEMBLY regression
+  // (MLKEM_HYBRID_PLAN.md §5 / data-flow-control-slot-lifecycle.md). Drives a
+  // multi-chunk KX2 (encaps key, RSP consumer) and KX3 (ciphertext, CMD consumer)
+  // through the REAL live control-RX consumer functions (process_control_responder
+  // / process_control_commander) after staging each chunk through the REAL slot
+  // producer that hardcodes messages_control.length = 1. FAILS-BEFORE: the call
+  // sites fed length=1 into kx_receive_chunk -> kx_chunk_decode rejected every
+  // chunk -> reassembly never completed. PASSES-AFTER: the call sites pass the real
+  // slot width -> full reassembly + live encapsulate/decapsulate. In-process
+  // synthetic-fire, no IONOS/RF/telecom_system. 0 PASS / N = failure count.
+  int test_kx_chunk_live_rx();
+
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,
   // and proves the TX-path spin-loops (ptt_busy_wait + drain_playback_wait)

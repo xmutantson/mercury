@@ -3715,8 +3715,16 @@ void cl_arq_controller::process_control_responder()
 		}
 		else if(code==KEY_EXCHANGE_2)
 		{
+			// FIX (data-flow-control-slot-lifecycle.md): the RX control-slot
+			// producer (arq_responder.cc:830) hardcodes messages_control.length=1
+			// while copying the FULL fixed slot width into data[] (:846). Pass the
+			// REAL slot width — the same geometry the codec uses for capacity
+			// (kx_chunk_payload_capacity() + the 4-byte chunk header) — NOT the
+			// length=1 sentinel, which made kx_chunk_decode reject every chunk.
+			int kx_frame_len = kx_chunk_payload_capacity()
+			                   + cl_cipher_suite::KX_CHUNK_HEADER_LEN;
 			int done = kx_receive_chunk((const uint8_t*)messages_control.data,
-			                            messages_control.length, KEY_EXCHANGE_2);
+			                            kx_frame_len, KEY_EXCHANGE_2);
 			messages_control.status = FREE;
 			if(done == 1)
 			{
@@ -15454,4 +15462,193 @@ int cl_arq_controller::test_batchsize_desync_delivery()
 		pass2 ? "PASS" : "FAIL", fails, defeat ? 1 : 0);
 	fflush(stdout);
 	return pass2 ? 0 : 1;
+}
+
+// ============================================================================
+// ML-KEM KX MULTI-CHUNK LIVE-RX REASSEMBLY regression
+// (data-flow-control-slot-lifecycle.md / MLKEM_HYBRID_PLAN.md §5).
+//
+// ROOT CAUSE this gate locks down: the RX control-slot producer
+// (process_messages_rx_data_control, arq_responder.cc:830) HARDCODES
+// messages_control.length = 1 while copying the FULL fixed-width control frame
+// into messages_control.data[] (:846, width = max_data_length + max_header_length
+// - CONTROL_ACK_CONTROL_HEADER_LENGTH, clamped to N_MAX/8). The ML-KEM chunk
+// RECEIVERS — process_control_responder() KX2 (arq_responder.cc) and
+// process_control_commander() KX3 (arq_commander.cc) — fed that length=1 into
+// kx_receive_chunk() -> kx_chunk_decode() saw in_len=1 < KX_CHUNK_HEADER_LEN(4)
+// and REJECTED *every* chunk. PQ KX (KX2=1184B encaps key, KX3=1088B ciphertext)
+// is always multi-chunk, so the hybrid handshake could NEVER complete on the
+// live wire path (the codec-direct unit test in test_mlkem_hybrid.cc passed
+// because it never went through the length=1 producer slot).
+//
+// FAITHFULNESS: this drives the REAL live consumer functions
+// process_control_responder() and process_control_commander() — the exact call
+// sites that pass the slot width into kx_receive_chunk — after staging each
+// chunk through the REAL producer write (status=RECEIVED, .length=1, fixed-width
+// .data[] copy). FAILS-BEFORE: every chunk is rejected, reassembly never
+// completes, kx_*_ready stays false. PASSES-AFTER: the call sites pass the real
+// slot width, all chunks reassemble, the live encapsulate/decapsulate succeed.
+//
+// In-process synthetic-fire: no IONOS / RF / telecom_system. Fast + deterministic.
+// ============================================================================
+int cl_arq_controller::test_kx_chunk_live_rx()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		if(cond) { printf("[TEST-KX-LIVERX] PASS: %s\n", name); }
+		else     { printf("[TEST-KX-LIVERX] FAIL: %s\n", name); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Shared buffer allocation (mirror test_partial_bsi_advance §0). We set
+	// only the fields init_messages_buffers() + kx_chunk_payload_capacity() read,
+	// avoiding load_configuration()'s telecom_system dependency. max_data_length
+	// (170) + max_header_length (6) - CONTROL_ACK_CONTROL_HEADER_LENGTH (3) = 173
+	// < N_MAX/8 (200): the realistic per-frame control width on a mid OFDM config,
+	// so the slot width clamp is the (173) form, exactly as on the live wire. ---
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	if(init_messages_buffers() != SUCCESSFUL) {
+		printf("[TEST-KX-LIVERX] ERROR: init_messages_buffers() failed\n");
+		fflush(stdout);
+		return 1;
+	}
+
+	// The real producer copy width (arq_responder.cc:846) and the codec capacity.
+	int slot_width = max_data_length + max_header_length
+	                 - CONTROL_ACK_CONTROL_HEADER_LENGTH;     // 173
+	if(slot_width > N_MAX/8) slot_width = N_MAX/8;
+	const int cap = kx_chunk_payload_capacity();             // slot_width - 4
+
+	// Stage one KX chunk into messages_control EXACTLY as the live RX producer
+	// does (arq_responder.cc:818-851): the slot is FREE -> copy a FIXED slot_width
+	// of bytes from the decoded frame, set status=RECEIVED, length=1. We zero the
+	// whole slot first (deterministic "stale tail" beyond the on-wire chunk) and
+	// write the chunk at the front, mirroring how the LDPC decode lands a short
+	// final chunk at the head of the fixed-width buffer.
+	auto stage_chunk_via_producer = [&](const uint8_t* chunk, int chunk_len) {
+		memset(messages_control.data, 0, slot_width);
+		int n = (chunk_len < slot_width) ? chunk_len : slot_width;
+		memcpy(messages_control.data, chunk, n);
+		messages_control.status = RECEIVED;     // producer: RECEIVED
+		messages_control.length = 1;            // producer: HARDCODED 1 (the bug seed)
+		messages_control.type   = CONTROL;
+		messages_control.id     = 0;
+	};
+
+	// ===================================================================
+	// PART A — KX2 (encaps key, 1184B) through the RESPONDER live consumer
+	// (process_control_responder, the KX2 call site). Multi-chunk by construction.
+	// ===================================================================
+	{
+		// Reset KX + crypto state for a clean RSP role.
+		kx_chunk_state_reset();
+		cipher_suite.set_kx_phase(KX_IDLE);
+		this->role               = RESPONDER;
+		this->link_status        = CONNECTED;     // KX2 branch guard
+		this->connection_status  = RECEIVING;
+		this->passive_monitor    = false;
+		this->psk_hex[0]         = '\0';          // no PSK (derive uses NULL)
+		this->my_call_sign       = "TST1";
+		this->destination_call_sign = "TST2";
+		// A real ML-KEM encaps key so the post-reassembly encapsulate_mlkem()
+		// in the live consumer succeeds (would DROP the link on a bogus key).
+		uint8_t src_pk[MLKEM_PK_SIZE];
+		cl_cipher_suite kg;                       // standalone keygen (CMD proxy)
+		bool kg_ok = (kg.generate_mlkem_keypair(src_pk) == 0);
+		check(kg_ok, "A0 ML-KEM keypair generated (test fixture)");
+
+		int count = cl_cipher_suite::kx_chunk_count(MLKEM_PK_SIZE, cap);
+		check(count > 1, "A1 KX2 is MULTI-CHUNK (count>1)");
+
+		uint8_t frame[N_MAX/8];
+		for(int idx = 0; idx < count; idx++) {
+			int wrote = cl_cipher_suite::kx_chunk_encode(
+				cl_cipher_suite::KX_KIND_PK, src_pk, MLKEM_PK_SIZE,
+				idx, cap, frame, sizeof(frame));
+			if(wrote < 0) { check(false, "A2 KX2 chunk encode"); break; }
+			stage_chunk_via_producer(frame, wrote);   // REAL producer (length=1)
+			process_control_responder();              // REAL live consumer (call site)
+			if(this->link_status == DROPPED) {
+				check(false, "A3 link not DROPPED during KX2 reassembly");
+				break;
+			}
+		}
+		// PASS-AFTER: the encaps key reassembled (kx_mlkem_pk_ready + bytes match)
+		// AND the live consumer encapsulated (kx_mlkem_ct_ready). FAILS-BEFORE:
+		// every chunk rejected -> kx_mlkem_pk_ready stays false.
+		check(kx_mlkem_pk_ready,
+			"A4 KX2 encaps key REASSEMBLED via live RX (FAILS-BEFORE: rejected)");
+		check(kx_mlkem_pk_ready && memcmp(kx_mlkem_pk, src_pk, MLKEM_PK_SIZE) == 0,
+			"A5 reassembled encaps key is BYTE-IDENTICAL to source");
+		check(kx_mlkem_ct_ready,
+			"A6 live consumer ENCAPSULATED after reassembly (ct ready)");
+		check(this->link_status == CONNECTED,
+			"A7 link still CONNECTED (no DROP on a clean KX2)");
+	}
+
+	// ===================================================================
+	// PART B — KX3 (ciphertext, 1088B) through the COMMANDER live consumer
+	// (process_control_commander, the KX3 call site). Multi-chunk by construction.
+	// ===================================================================
+	{
+		kx_chunk_state_reset();
+		cipher_suite.set_kx_phase(KX_IDLE);
+		this->role               = COMMANDER;
+		this->link_status        = CONNECTED;                 // KX3 branch guard
+		this->connection_status  = RECEIVING_ACKS_CONTROL;    // KX3 outer guard
+		this->passive_monitor    = false;
+		this->psk_hex[0]         = '\0';
+		this->my_call_sign       = "TST1";
+		this->destination_call_sign = "TST2";
+
+		// The CMD holds the ML-KEM SECRET (it generated the keypair). Replicate the
+		// live STRICT branch (arq_commander.cc:7138): generate into THIS controller's
+		// cipher_suite + kx_mlkem_pk so the post-reassembly decapsulate_mlkem()
+		// recovers the matching shared secret.
+		bool kg_ok = (cipher_suite.generate_mlkem_keypair(kx_mlkem_pk) == 0);
+		kx_mlkem_pk_ready = true;
+		check(kg_ok, "B0 CMD ML-KEM keypair generated into controller cipher_suite");
+		// A standalone RSP proxy encapsulates against our pk -> the ciphertext the
+		// RSP would stream back as KX3.
+		uint8_t src_ct[MLKEM_CT_SIZE];
+		cl_cipher_suite enc;
+		bool enc_ok = (enc.encapsulate_mlkem(kx_mlkem_pk, src_ct) == 0);
+		check(enc_ok, "B1 ciphertext produced by RSP-proxy encapsulate");
+
+		int count = cl_cipher_suite::kx_chunk_count(MLKEM_CT_SIZE, cap);
+		check(count > 1, "B2 KX3 is MULTI-CHUNK (count>1)");
+
+		uint8_t frame[N_MAX/8];
+		for(int idx = 0; idx < count; idx++) {
+			int wrote = cl_cipher_suite::kx_chunk_encode(
+				cl_cipher_suite::KX_KIND_CT, src_ct, MLKEM_CT_SIZE,
+				idx, cap, frame, sizeof(frame));
+			if(wrote < 0) { check(false, "B3 KX3 chunk encode"); break; }
+			stage_chunk_via_producer(frame, wrote);   // REAL producer (length=1)
+			process_control_commander();              // REAL live consumer (call site)
+			if(this->link_status == DROPPED) {
+				check(false, "B4 link not DROPPED during KX3 reassembly");
+				break;
+			}
+		}
+		// PASS-AFTER: ciphertext reassembled (kx_mlkem_ct_ready + bytes match) and
+		// the live consumer decapsulated + derived the hybrid key (kx_phase ==
+		// KX_HYBRID_DONE). FAILS-BEFORE: every chunk rejected -> ct stays unready.
+		check(kx_mlkem_ct_ready,
+			"B5 KX3 ciphertext REASSEMBLED via live RX (FAILS-BEFORE: rejected)");
+		check(kx_mlkem_ct_ready && memcmp(kx_mlkem_ct, src_ct, MLKEM_CT_SIZE) == 0,
+			"B6 reassembled ciphertext is BYTE-IDENTICAL to source");
+		check(cipher_suite.get_kx_phase() == KX_HYBRID_DONE,
+			"B7 live consumer DECAPSULATED + derived hybrid key (KX_HYBRID_DONE)");
+		check(this->link_status == CONNECTED,
+			"B8 link still CONNECTED (no DROP on a clean KX3)");
+	}
+
+	printf("[TEST-KX-LIVERX] %s: %d failure(s)\n",
+		failed == 0 ? "PASS" : "FAIL", failed);
+	fflush(stdout);
+	return failed;
 }
