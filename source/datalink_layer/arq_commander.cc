@@ -19095,7 +19095,28 @@ void cl_arq_controller::process_buffer_data_commander()
 				// --- Batch-level compression with adaptive sizing ---
 				// Pop raw data based on estimated compression ratio, compress,
 				// iteratively add more data until batch is 85%+ full.
-				int batch_capacity = data_batch_size * max_frame;
+				//
+				// ENC BATCH-SIZE FIX (data-flow-encrypted-batch-size.md §3/§5): when
+				// encryption is active, BOUND the AEAD unit's frame span to the
+				// NEGOTIATED crypto_batch_size (radio_batch_size - retransmit_headroom),
+				// never the full data_batch_size. The whole-batch AEAD MAC (§2) covers
+				// the EXACT ciphertext+length, so the unit must fit in frames that
+				// always land — capping at crypto_batch_size leaves retransmit_headroom
+				// slots free for SACK retx so the batch reliably completes inside the
+				// negotiated unit and the RX reassembles a byte-exact ciphertext (no
+				// short-delivery auth-fail). min() because data_batch_size legitimately
+				// drops below 20 at runtime (Axis-2 floor 10, robust pin 1, big-block
+				// K): the AEAD unit can never span more frames than the batch holds.
+				// crypto_batch_size is a stable constant on both peers (set once in
+				// reset()/CLI, never mutated at runtime), so no wire negotiation is
+				// added. Non-encrypted path is byte-identical (crypto_frames ==
+				// data_batch_size).
+				int crypto_frames = data_batch_size;
+				if(cipher_suite.is_active()
+				   && crypto_batch_size > 0
+				   && crypto_batch_size < crypto_frames)
+					crypto_frames = crypto_batch_size;
+				int batch_capacity = crypto_frames * max_frame;
 
 				// Reserve space for encryption auth tag if active
 				int crypto_overhead = 0;
@@ -19266,15 +19287,19 @@ void cl_arq_controller::process_buffer_data_commander()
 						// after turboshift at OFDM speeds where 16 bytes is negligible.
 						int tag_size = AUTH_TAG_SIZE;
 
-						// Pad compressed data so encrypted output fills all
-						// data_batch_size frames.  The ACK gate can't peek at
-						// the compression header when it's encrypted, so it
-						// expects data_batch_size unique frames.  Without
-						// padding, compression may produce fewer frames and
-						// the duplicate-ID padding causes ACK gate suppression.
-						// Receiver decrypts, reads comp_size from header, and
+						// Pad compressed data so the encrypted output fills WHOLE
+						// frames up to the bounded crypto-unit span (crypto_frames =
+						// min(data_batch_size, crypto_batch_size); see the batch_capacity
+						// fix above). MUST match the batch_capacity cap so the AEAD unit
+						// never re-expands past crypto_batch_size frames here — otherwise
+						// the cap is defeated and the unit re-spans data_batch_size frames
+						// (data-flow-encrypted-batch-size.md §5). The RX no longer needs a
+						// full data_batch_size span: the wired D5 batch_total_frames count
+						// (arq_common.cc:8892) is the authoritative frame count the ACK gate
+						// keys off, so a sub-data_batch_size encrypted batch is gated
+						// correctly. Receiver decrypts, reads comp_size from the header, and
 						// ignores the zero padding beyond it.
-						int target_comp = data_batch_size * max_frame - tag_size;
+						int target_comp = crypto_frames * max_frame - tag_size;
 						if(comp_size < target_comp && target_comp <= (int)sizeof(comp_buf))
 						{
 							memset(comp_buf + comp_size, 0, target_comp - comp_size);

@@ -341,6 +341,95 @@ int test_backward_across_wrap()
     return 0;
 }
 
+// --- Case 8: encrypted-batch frame-span truncation -> auth-fail ---------------
+// Guards the 2nd encryption bug (data-flow-encrypted-batch-size.md §2/§4): the
+// whole-batch AEAD MAC covers the EXACT ciphertext + its LENGTH (RFC 8439). The
+// RX reassembles per-frame DATA chunks into one ciphertext, then decrypts it as
+// ONE atomic unit. If the batch completion gate ever delivers ONE FRAME SHORT
+// (e.g. a lost-EOB prev batch whose expected count collapsed by 1), the
+// reassembled ciphertext is truncated -> MAC over a shorter buffer -> auth-fail
+// -> false PSK-mismatch disconnect.
+//
+// This case reproduces the mechanism at the crypto layer: encrypt a multi-frame
+// AEAD unit, split the ciphertext into per-frame chunks exactly as the TX frame-
+// split does, then
+//   (a) reassemble ALL chunks -> decrypt MUST succeed (the post-fix steady
+//       state: the unit is bounded to crypto_batch_size frames with
+//       retransmit_headroom free, so the full set ALWAYS lands and reassembles
+//       byte-exact);
+//   (b) reassemble all-but-the-last chunk -> decrypt MUST auth-FAIL (the
+//       FAIL-BEFORE short-delivery the fix prevents from ever reaching here).
+// The TX fix is what guarantees (a) on the wire (the batch reliably completes
+// inside the negotiated unit); this case proves the crypto contract both arms
+// depend on.
+int test_batch_span_truncation_authfail()
+{
+    cl_cipher_suite tx, rx;
+    make_paired_suites(tx, rx);   // SHARED key so only TRUNCATION fails, not key
+
+    const uint32_t DIR = DIRECTION_CMD_TO_RSP;
+    // Model a CFG-class encrypted batch: crypto_batch_size(20) frames at a
+    // representative WB max_frame payload. Use 20 frames so the unit matches the
+    // negotiated crypto_batch_size the TX fix bounds to.
+    const int max_frame   = 140;          // representative OFDM DATA_LONG payload
+    const int n_frames    = 20;           // == crypto_batch_size (the bounded span)
+    const int plain_len   = n_frames * max_frame - AUTH_TAG_SIZE;  // pad-to-frames
+
+    std::vector<uint8_t> pt(plain_len);
+    for (int i = 0; i < plain_len; i++) pt[i] = (uint8_t)((i * 31 + 7) & 0xFF);
+
+    uint64_t e = 0; int l = -1;
+    uint64_t idx = cl_cipher_suite::unwrap_batch_index(7, &e, &l);
+
+    std::vector<uint8_t> ct(plain_len + AUTH_TAG_SIZE);
+    int enc = tx.encrypt(pt.data(), plain_len, ct.data(), (int)ct.size(),
+                         idx, DIR, AUTH_TAG_SIZE);
+    if (enc != plain_len + AUTH_TAG_SIZE)
+        return fail("batch-span encrypt returned wrong size");
+
+    // The sealed ciphertext spans exactly n_frames frames (the last carries the
+    // 16-byte tag). The frame-split is just chunking ct into <=max_frame pieces;
+    // reassembly is the concatenation back. Total length is what the MAC binds.
+    const int ct_len = enc;
+    const int last_frame_len =
+        ct_len - (ct_len / max_frame) * max_frame; // bytes in the final chunk
+    (void)last_frame_len;
+
+    // (a) FULL reassembly -> decrypt OK + correct plaintext.
+    {
+        uint64_t re = 0; int rl = -1;
+        uint64_t ridx = cl_cipher_suite::unwrap_batch_index(7, &re, &rl);
+        std::vector<uint8_t> out(plain_len);
+        int n = rx.decrypt(ct.data(), ct_len, out.data(), (int)out.size(),
+                           ridx, DIR, AUTH_TAG_SIZE);
+        if (n != plain_len)
+            return fail("FULL-batch reassembly FAILED to decrypt (auth-fail on the byte-exact unit)");
+        if (memcmp(out.data(), pt.data(), plain_len) != 0)
+            return fail("FULL-batch reassembly decrypted to WRONG plaintext");
+    }
+
+    // (b) ONE-FRAME-SHORT reassembly -> decrypt MUST auth-FAIL.
+    // Drop the final frame's worth of ciphertext (the lost-EOB tail). The MAC
+    // input length + bytes change -> crypto_aead_read must reject.
+    {
+        int short_len = ct_len - max_frame;       // drop the last full frame
+        if (short_len <= AUTH_TAG_SIZE)           // keep the test meaningful
+            short_len = ct_len - 1;
+        uint64_t re = 0; int rl = -1;
+        uint64_t ridx = cl_cipher_suite::unwrap_batch_index(7, &re, &rl);
+        std::vector<uint8_t> out(plain_len);
+        int n = rx.decrypt(ct.data(), short_len, out.data(), (int)out.size(),
+                           ridx, DIR, AUTH_TAG_SIZE);
+        if (n > 0)
+            return fail("ONE-FRAME-SHORT reassembly DECRYPTED (truncation not rejected — the bug)");
+    }
+
+    printf("[TEST-AEAD-NONCE] OK: full %d-frame AEAD unit decrypts; one-frame-short reassembly auth-fails (batch-span fix contract)\n",
+           n_frames);
+    fflush(stdout);
+    return 0;
+}
+
 } // namespace
 
 int run_aead_nonce_tests()
@@ -355,6 +444,7 @@ int run_aead_nonce_tests()
     failed += test_kx_truncated_reject();
     failed += test_tamper_rejected();
     failed += test_backward_across_wrap();
+    failed += test_batch_span_truncation_authfail();
     if (failed == 0)
         printf("[TEST-AEAD-NONCE] === ALL PASS ===\n");
     else
