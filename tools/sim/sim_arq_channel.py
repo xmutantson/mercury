@@ -2,6 +2,14 @@
 """
 sim_arq_channel.py — device-free ARQ-loop channel simulator harness.
 
+SCORER-METRIC WARNING (BUG-B, 2026-06-27 audit): the "[T+..] CONFIG -> X" timeline
+this harness emits (SETCFG_RE on the COMMANDER's SET_CONFIG: forward=N) is a CMD
+ANNOUNCEMENT, NOT a durable RSP WB-OFDM DATA decode. Downstream parsers (e.g.
+_revack_ab_parse.py) read this timeline for "reached CFGn" and INHERIT the
+announcement keying. For any ROBUST->WB climb / crossing verdict use the canonical
+scorer mercury/tools/sim/realaudio/score_climb_canonical.py (target-keyed
+load_configuration(N) + RSP RX-DATA on a WB id + bytes), NOT the CONFIG-> timeline.
+
 Drives a REAL two-process Mercury ARQ session through the SIM software channel
 backend (`-x sim` + tools/sim/sim_channel_relay.py) at a FIXED, configurable SNR
 and sample-loss, with NO audio hardware. This reproduces, in MINUTES, the HW

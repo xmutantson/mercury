@@ -44,8 +44,22 @@ from ra_cleanup import scoped_cleanup  # concurrency-safe per-run cleanup
 CONNECT_RE = re.compile(r"link_status:Connected to")
 DISC_RE = re.compile(r"link_status:Disconnected|DISCONNECTED")
 NRECV_RE = re.compile(r"stats\.nReceived_data=\s*(\d+)")
-CFG_RE = re.compile(r"load_configuration\((\d+)\)\s+current=(\d+)")
+# load_configuration(N) current=M : N (group 1) = TARGET config being LOADED
+# (becomes active at arq_common.cc:2129); M (group 2) = OUTGOING/previous config,
+# printed BEFORE the assignment. The crossing scorer MUST key on the TARGET N, NOT
+# on current=M -- keying on M recorded the pre-load config (e.g.
+# load_configuration(0) current=102 scored as "102/still-ROBUST"), the BUG-A parse
+# bug that produced the all-session no-cross flip-flops and the lying
+# wb_configs_seen=[]. See score_climb_canonical.py + CROSSING_GROUNDTRUTH.md (1).
+CFG_RE = re.compile(r"load_configuration\((\d+)\)\s+current=(-?\d+)")
 BREAK_RE = re.compile(r"\[BREAK\] Block failure")
+# Durable cross signal: an RSP-side WB-OFDM DATA frame decoded (batch or arq path).
+RXDATA_RE = re.compile(r"\[RX-BATCH-SEQ\]\s+type=DATA|\[RX-DATA\]\s+type=")
+
+
+def is_wb_config(cfg):
+    # WB OFDM = ids 0..16; ROBUST MFSK = 100/101/102 (common_defines.h:122-155).
+    return cfg is not None and 0 <= cfg <= 16
 
 
 class State:
@@ -57,7 +71,18 @@ class State:
         self.rsp_nreceived = 0
         self.cmd_nreceived = 0
         self.breaks = 0
+        # Per-side TARGET configs (keyed on N in load_configuration(N), not current=M).
+        # configs_seen kept for backward compat = union of both sides.
         self.configs_seen = set()
+        self.rsp_configs_seen = set()
+        self.cmd_configs_seen = set()
+        self.rsp_cur_cfg = None
+        self.cmd_cur_cfg = None
+        # Durable cross (RSP side): WB id loaded + WB DATA frames decoded there.
+        self.rsp_wb_data_frames = 0      # RX-DATA/BATCH-SEQ DATA while RSP on a WB id
+        self.rsp_loaded_wb_id = None     # first WB id (0..16) the RSP load_configuration'd
+        self.rsp_max_wb_cfg_with_data = None  # highest WB id an RSP DATA frame decoded on
+        self.time_to_cross_s = None      # T+ of first RSP WB DATA decode (durable cross)
         self.lock = threading.Lock()
 
 
@@ -86,8 +111,27 @@ def log_output(proc, label, logfile, t0, st):
                         st.cmd_nreceived = max(st.cmd_nreceived, v)
             m = CFG_RE.search(text)
             if m:
+                target = int(m.group(1))   # the config being LOADED (becomes active)
                 with st.lock:
-                    st.configs_seen.add(int(m.group(2)))
+                    st.configs_seen.add(target)
+                    if label == "RSP":
+                        st.rsp_configs_seen.add(target)
+                        st.rsp_cur_cfg = target
+                        if is_wb_config(target) and st.rsp_loaded_wb_id is None:
+                            st.rsp_loaded_wb_id = target
+                    else:
+                        st.cmd_configs_seen.add(target)
+                        st.cmd_cur_cfg = target
+            # Durable cross: an RSP DATA frame decoded while RSP active on a WB id.
+            if label == "RSP" and RXDATA_RE.search(text):
+                with st.lock:
+                    if is_wb_config(st.rsp_cur_cfg):
+                        st.rsp_wb_data_frames += 1
+                        if st.time_to_cross_s is None:
+                            st.time_to_cross_s = round(time.time() - t0, 3)
+                        if (st.rsp_max_wb_cfg_with_data is None
+                                or st.rsp_cur_cfg > st.rsp_max_wb_cfg_with_data):
+                            st.rsp_max_wb_cfg_with_data = st.rsp_cur_cfg
             if BREAK_RE.search(text):
                 with st.lock:
                     st.breaks += 1
@@ -348,14 +392,26 @@ def main():
 
     dwell = max(1.0, time.time() - t0)
     configs_sorted = sorted(st.configs_seen)
-    # max_config_reached = the highest config the gearshift CLIMBED to. ROBUST
-    # IDs (100/101/102) are the MFSK floor; WB OFDM IDs are 0..16. A climb past
-    # the ROBUST floor (any id < 100 appearing, or id>100 within ROBUST) is THE
-    # signal. We report both the raw set and the max, plus a climbed-past-floor
-    # boolean for quick A/B reading.
-    wb_seen = [c for c in configs_sorted if c < 100]
+    rsp_configs_sorted = sorted(st.rsp_configs_seen)
+    cmd_configs_sorted = sorted(st.cmd_configs_seen)
+    # wb_configs_seen is keyed on the TARGET config of load_configuration(N) and is
+    # RSP-SIDE ONLY. The CMD adopts WB unilaterally on a (false) bare ACK
+    # (arq_commander.cc:2569/7196-7208) and would false-positive a cross; the
+    # durable cross is an RSP that actually LOADS + DECODES WB. WB OFDM = ids 0..16.
+    wb_seen = [c for c in rsp_configs_sorted if is_wb_config(c)]
     max_config = max(configs_sorted) if configs_sorted else None
-    climbed_past_robust0 = bool(wb_seen) or any(c > 100 for c in configs_sorted)
+    # DURABLE CROSS = RSP loaded a WB id AND decoded >= 1 WB-OFDM DATA frame there
+    # AND bytes were delivered. This is the only crossing signal not fooled by the
+    # INDIRECT V2-PREV-DELIVERED ROBUST drain or the CMD's unilateral adoption.
+    crossed = ((st.rsp_loaded_wb_id is not None)
+               and (st.rsp_wb_data_frames >= 1)
+               and (res["rx"] > 0))
+    # climbed_past_cfg0: the BINDING-CONSTRAINT metric -- did the RSP decode a DATA
+    # frame on a WB id >= 1 (i.e. climb THROUGH cfg0)? cfg0 is the lowest WB rung.
+    climbed_past_cfg0 = (st.rsp_max_wb_cfg_with_data is not None
+                         and st.rsp_max_wb_cfg_with_data >= 1)
+    # legacy compat boolean (kept; now derived from the corrected RSP-side WB set).
+    climbed_past_robust0 = bool(wb_seen) or any(c > 100 for c in rsp_configs_sorted)
     result = {
         "tag": args.tag, "arm": args.arm, "env": args.env,
         "passthrough": args.passthrough,
@@ -374,9 +430,18 @@ def main():
         "cmd_nreceived_frames": st.cmd_nreceived,
         "breaks": st.breaks,
         "configs_seen": configs_sorted,
+        "rsp_configs_seen": rsp_configs_sorted,
+        "cmd_configs_seen": cmd_configs_sorted,
         "max_config_reached": max_config,
         "wb_configs_seen": wb_seen,
         "climbed_past_robust0": climbed_past_robust0,
+        # --- durable ROBUST->WB crossing metrics (RSP-side, target-keyed) ---
+        "rsp_loaded_wb_id": st.rsp_loaded_wb_id,
+        "rsp_wb_data_frames": st.rsp_wb_data_frames,
+        "max_wb_cfg_with_data": st.rsp_max_wb_cfg_with_data,
+        "time_to_cross_s": st.time_to_cross_s,
+        "crossed": crossed,
+        "climbed_past_cfg0": climbed_past_cfg0,
         "rx_bps_wall": round(res["rx"] * 8 / dwell, 1),
         "wall_secs": round(dwell, 1),
     }
