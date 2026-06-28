@@ -1868,9 +1868,15 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		telecom_system->data_container.nUnder_processing_events = 0;
 
 		if(messages_control.data[0] == KEY_EXCHANGE_1
+		   || messages_control.data[0] == KEY_EXCHANGE_2
 		   || messages_control.data[0] == KEY_EXCHANGE_3)
 		{
 			// KEY_EXCHANGE_1: LDPC ACK carries responder's pubkey.
+			// KEY_EXCHANGE_2: bare LDPC ACK (length=1) confirming one received KX2
+			//   encaps-key chunk so the commander queues the next chunk
+			//   (per-chunk stop-and-wait, arq_commander.cc:7184). No payload back —
+			//   the responder only sends data on KX3. Sent on data_configuration
+			//   (OFDM), the same config the commander listens on for the KX2 ACK.
 			// KEY_EXCHANGE_3: LDPC ACK carries a chunk of the ML-KEM ciphertext
 			//   (hybrid upgrade, MLKEM_HYBRID_PLAN.md §4) — same LDPC reply
 			//   transport on the OFDM data_configuration. messages_control was
@@ -3725,7 +3731,20 @@ void cl_arq_controller::process_control_responder()
 			                   + cl_cipher_suite::KX_CHUNK_HEADER_LEN;
 			int done = kx_receive_chunk((const uint8_t*)messages_control.data,
 			                            kx_frame_len, KEY_EXCHANGE_2);
-			messages_control.status = FREE;
+			// SIBLING-BUG FIX (data-flow-control-slot-lifecycle.md): do NOT FREE
+			// the slot here. Every KX2 chunk MUST be LDPC-ACKed so the commander's
+			// process_control_commander() KX2-advance path (arq_commander.cc:7184)
+			// queues the NEXT chunk — KX2 is per-chunk stop-and-wait, exactly like
+			// KX1/KX3. The ACK builder (process_messages_acknowledging_control)
+			// only fires when messages_control.status==RECEIVED and frees the slot
+			// itself after send_batch() (arq_responder.cc:1895). Freeing here left
+			// status=FREE -> the ACK path spun "[ACK-CTRL] status=0" forever, the
+			// commander never advanced, and only the stray chunk that happened to
+			// align with a retransmit got through (live KX never completed). Stamp
+			// data[0]=KEY_EXCHANGE_2 so the ACK builder routes it onto the OFDM
+			// data_configuration (the config the commander listens on for this ACK).
+			messages_control.data[0] = KEY_EXCHANGE_2;
+			messages_control.length  = 1;     // bare confirmation ACK (no payload back)
 			if(done == 1)
 			{
 				// Full encaps key reassembled — encapsulate to produce the
@@ -15574,6 +15593,26 @@ int cl_arq_controller::test_kx_chunk_live_rx()
 			if(this->link_status == DROPPED) {
 				check(false, "A3 link not DROPPED during KX2 reassembly");
 				break;
+			}
+			// SIBLING-BUG GATE (data-flow-control-slot-lifecycle.md): after a
+			// NON-FINAL KX2 chunk the slot MUST be left ACK-ready so the ACK builder
+			// (process_messages_acknowledging_control, status==RECEIVED) fires and
+			// the commander queues the next chunk. FAILS-BEFORE: the KX2 branch set
+			// status=FREE -> the ACK path spun "[ACK-CTRL] status=0" forever, the
+			// commander never advanced, KX stalled (only ~2/23 chunks ever slipped
+			// through on the live wire). PASSES-AFTER: status==RECEIVED,
+			// connection_status==ACKNOWLEDGING_CONTROL, data[0]==KEY_EXCHANGE_2.
+			if(idx < count - 1) {
+				check(messages_control.status == RECEIVED,
+					"A3b non-final KX2 chunk left slot ACK-ready (status=RECEIVED; FAILS-BEFORE: FREE)");
+				check(connection_status == ACKNOWLEDGING_CONTROL,
+					"A3c non-final KX2 chunk -> ACKNOWLEDGING_CONTROL (ACK will be sent)");
+				check((unsigned char)messages_control.data[0] == KEY_EXCHANGE_2,
+					"A3d KX2 ACK code stamped (data[0]=KEY_EXCHANGE_2)");
+				// Mirror the live ACK path's post-send slot free so the next chunk
+				// stages into a FREE slot exactly as the producer requires.
+				messages_control.status = FREE;
+				connection_status = RECEIVING;
 			}
 		}
 		// PASS-AFTER: the encaps key reassembled (kx_mlkem_pk_ready + bytes match)
