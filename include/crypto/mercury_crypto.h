@@ -168,6 +168,13 @@ public:
     int  get_kx_phase() const { return kx_phase; }
     int  get_tag_size(bool is_robust) const { return is_robust ? AUTH_TAG_ROBUST : AUTH_TAG_SIZE; }
 
+    // Display-only: write a short hex session fingerprint (the same Blake2b-keyed
+    // derivation logged in derive_session_key) into out for out-of-band voice
+    // verification. Writes at most cap-1 chars + NUL. Does NOT mutate cipher
+    // state and never exposes raw key bytes. Safe to call only after a session
+    // key has been derived; no-op (out="") otherwise.
+    void get_fingerprint_hex(char* out, int cap) const;
+
     // --- Key Confirmation ---
     // Compute 8-byte confirmation tag from session key.
     // Both sides compute this; mismatch = PSK wrong.

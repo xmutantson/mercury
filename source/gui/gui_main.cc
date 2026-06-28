@@ -294,6 +294,23 @@ static const char* GetLinkStatusString(int status) {
     }
 }
 
+// Key-exchange phase -> label. Values mirror the KX_* macros in
+// include/crypto/mercury_crypto.h:43-49 (KX_IDLE=0 .. KX_ACTIVE=6). Kept as
+// literal cases (like GetLinkStatusString above) so the GUI translation unit
+// need not include the crypto/ARQ headers.
+static const char* GetKxPhaseString(int phase) {
+    switch (phase) {
+        case 0: return "idle";
+        case 1: return "X25519 sent";
+        case 2: return "X25519 done";
+        case 3: return "ML-KEM key sent";
+        case 4: return "ML-KEM ciphertext sent";
+        case 5: return "deriving session key";
+        case 6: return "activating";
+        default: return "...";
+    }
+}
+
 /**
  * @brief Draw constellation (IQ scatter) diagram
  */
@@ -684,12 +701,37 @@ static void RenderGUI() {
                 bool enc_active = g_gui_state.encryption_active.load();
                 bool psk_mismatch = g_gui_state.encryption_psk_mismatch.load();
                 int enc_mode = g_gui_state.encryption_mode.load();
+                bool pq_active = g_gui_state.encryption_pq_active.load();
                 if (psk_mismatch)
                     ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "PSK MISMATCH");
-                else if (enc_active)
-                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "ENCRYPTED");
-                else if (enc_mode > 0 && link_status == 2)
-                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "KEY EXCHANGE...");
+                else if (enc_active) {
+                    // PQ hybrid vs classical — read live so it auto-flips when ML-KEM merges.
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f),
+                                       pq_active ? "ENCRYPTED (PQ hybrid)"
+                                                 : "ENCRYPTED (classical)");
+                    // Short session fingerprint for out-of-band voice verification.
+                    if (g_gui_state.enc_fingerprint_valid.load()) {
+                        char fp[24];
+                        {
+                            GuiLockGuard lk(g_gui_state.enc_fingerprint_mutex);
+                            snprintf(fp, sizeof(fp), "%s", g_gui_state.enc_fingerprint);
+                        }
+                        ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.65f, 1.0f), "FP %s", fp);
+                    }
+                }
+                else if (enc_mode > 0 && link_status == 2) {
+                    // Show the live KX phase so STRICT does not look hung.
+                    int kxp = g_gui_state.kx_phase.load();
+                    int cdone = g_gui_state.kx_chunk_done.load();
+                    int ctot = g_gui_state.kx_chunk_total.load();
+                    const char* kx_str = GetKxPhaseString(kxp);
+                    if (ctot > 0)
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                                           "KEY EXCHANGE: %s (%d/%d)", kx_str, cdone, ctot);
+                    else
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                                           "KEY EXCHANGE: %s", kx_str);
+                }
                 else if (enc_mode > 0)
                     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.7f, 1.0f), "E2E Enabled");
             }

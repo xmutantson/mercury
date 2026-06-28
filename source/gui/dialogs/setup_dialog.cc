@@ -33,6 +33,21 @@ static const char* GI_LABELS[] = {
 static const int GI_COUNT = sizeof(GI_VALUES_MS) / sizeof(GI_VALUES_MS[0]);
 static const int GI_DEFAULT_IDX = 3;  // 3.0ms
 
+// Key-exchange phase -> label. Values mirror KX_* in
+// include/crypto/mercury_crypto.h:43-49 (KX_IDLE=0 .. KX_ACTIVE=6). Kept local
+// (literal cases) so this TU need not include the crypto header.
+static const char* GetKxPhaseStringSetup(int phase) {
+    switch (phase) {
+        case 1: return "X25519 sent";
+        case 2: return "X25519 done";
+        case 3: return "ML-KEM key sent";
+        case 4: return "ML-KEM ciphertext sent";
+        case 5: return "deriving session key";
+        case 6: return "activating";
+        default: return "in progress";
+    }
+}
+
 static int gi_ms_to_index(double ms) {
     int best = GI_DEFAULT_IDX;
     double best_diff = 999.0;
@@ -660,9 +675,31 @@ void SetupDialog::renderSecurityTab() {
     int active_mode = g_gui_state.encryption_mode.load();
     bool enc_active = g_gui_state.encryption_active.load();
     if (active_mode > 0 && enc_active) {
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "Encryption ACTIVE");
+        bool pq_active = g_gui_state.encryption_pq_active.load();
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f),
+                           pq_active ? "Encryption ACTIVE (PQ hybrid: X25519 + ML-KEM-768)"
+                                     : "Encryption ACTIVE (classical: X25519)");
+        // Session fingerprint for out-of-band voice verification — both stations
+        // should read the same value aloud to confirm there is no MITM.
+        if (g_gui_state.enc_fingerprint_valid.load()) {
+            char fp[24];
+            {
+                GuiLockGuard lk(g_gui_state.enc_fingerprint_mutex);
+                snprintf(fp, sizeof(fp), "%s", g_gui_state.enc_fingerprint);
+            }
+            ImGui::Spacing();
+            ImGui::Text("Session fingerprint (verify out-of-band):");
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.65f, 1.0f), "  %s", fp);
+        }
     } else if (active_mode > 0) {
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Encryption enabled (waiting for connection)");
+        // During the handshake, show the live KX phase so STRICT is not opaque.
+        int kxp = g_gui_state.kx_phase.load();
+        if (kxp > 0 && kxp < 6)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                               "Key exchange: %s", GetKxPhaseStringSetup(kxp));
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                               "Encryption enabled (waiting for connection)");
     } else {
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Encryption disabled");
     }

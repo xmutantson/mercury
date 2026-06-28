@@ -3187,6 +3187,11 @@ void cl_arq_controller::process_control_responder()
 				(psk_hex[0] != '\0') ? (int)strlen(psk_hex) : 0,
 				false);  // mlkem_done=false (X25519-only for now)
 
+#ifdef MERCURY_GUI_ENABLED
+			// Display-only: X25519 shared computed -> advance the KX phase line.
+			gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
+#endif
+
 			// Put our pubkey + confirmation tag in the ACK data
 			messages_control.data[0] = KEY_EXCHANGE_1;
 			memcpy(&messages_control.data[1], our_pubkey, X25519_KEY_SIZE);
@@ -3246,6 +3251,14 @@ void cl_arq_controller::process_control_responder()
 
 #ifdef MERCURY_GUI_ENABLED
 				g_gui_state.encryption_active.store(true);
+				// Display-only: PQ status, KX phase, and session fingerprint.
+				g_gui_state.encryption_pq_active.store(cipher_suite.is_pq_upgraded());
+				gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
+				{
+					char fp_hex[24];
+					cipher_suite.get_fingerprint_hex(fp_hex, sizeof(fp_hex));
+					gui_set_enc_fingerprint(fp_hex);
+				}
 				gui_push_monitor_event("[ENCRYPTION ACTIVE: X25519 + ChaCha20-Poly1305]", false);
 #endif
 

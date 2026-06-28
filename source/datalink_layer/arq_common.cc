@@ -7078,8 +7078,12 @@ void cl_arq_controller::reset_session_state()
 	cumulative_ack_enabled = false;
 #ifdef MERCURY_GUI_ENABLED
 	g_gui_state.encryption_active.store(false);
-	// Don't clear psk_mismatch here — let it persist so the GUI shows the error.
-	// It gets cleared on next successful encryption activation.
+	// Display-only: clear PQ status, KX progress, and the session fingerprint so a
+	// new session never shows stale values. (Don't clear psk_mismatch here — let it
+	// persist so the GUI shows the error; it clears on next successful activation.)
+	g_gui_state.encryption_pq_active.store(false);
+	gui_set_kx_progress(KX_IDLE, 0, 0);
+	gui_set_enc_fingerprint(nullptr);
 #endif
 	tx_nonce_epoch = 0;
 	tx_nonce_last_bsi = -1;
