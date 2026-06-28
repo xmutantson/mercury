@@ -7140,7 +7140,35 @@ void cl_arq_controller::process_control_commander()
 			turboshift_active = false;
 			turbo_supershift_announce_pending = false;
 			turboshift_phase = TURBO_DONE;
-			this->connection_status=TRANSMITTING_DATA;
+
+			// CONNECT-SEED on the NB-start -> WB-upgrade path (gearshift-start-and-
+			// recovery.md §10.5). The §10.2 seed lives only in the NO-BW-upgrade
+			// fall-through (the `else` at the post-connect data-start, ~:6979). But
+			// the COMMON live path STARTS NARROWBAND and takes the SWITCH_BANDWIDTH
+			// upgrade above, so that seed was structurally bypassed (currently_nb was
+			// true -> the BW-upgrade branch won; the seed `else` never ran). After
+			// switch_narrowband_mode(NO) the CMD is WB and pinned at the ROBUST floor
+			// (init_configuration, narrowband_enabled==NO) — the IDENTICAL seed
+			// preconditions as :6979. So apply the SAME guarded seed here: a clearly-
+			// clean connect SNR opens data near the SNR-appropriate WB config via the
+			// proven SET_CONFIG tier-cross; connect_seed_target() returns CONFIG_NONE
+			// (start ROBUST_0, byte-identical) on anything not clearly clean, so the
+			// over-seed guard and weak-channel behaviour are unchanged. The anchor is
+			// NOT raised (speculative, BREAK-recoverable, §10.4 invariant 2).
+			{
+				int seed_cfg = connect_seed_target();
+				if(seed_cfg != CONFIG_NONE)
+				{
+					negotiated_configuration = seed_cfg;
+					cleanup();
+					add_message_control(SET_CONFIG);
+					this->connection_status=TRANSMITTING_CONTROL;
+				}
+				else
+				{
+					this->connection_status=TRANSMITTING_DATA;
+				}
+			}
 		}
 		else if(this->link_status==CONNECTED)
 		{
