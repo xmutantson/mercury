@@ -117,6 +117,18 @@ struct st_receive_stats{
 	double ofdm_drift_per_frame = 0.0;  // IIR-filtered prediction error (interp samples) for BATCH verify
 	double mean_H = -1.0;  // mean(|estimated_channel|) over MEASURED subcarriers for the last OFDM trial; -1 if not computed (default matches the per-receive reset at telecom_system.cc:1052). Test-observability for the SKIP-H gate (write-once per receive, read by unit tests only). See fact-documents/ofdm-fine-timing-magnitude.md §3.5.
 	int last_eff_preamble_nsymb = 0;  // LEVER P: actual preamble-symbol count of the most recently extracted OFDM frame (FULL anchor vs MINI tail). Read by the ARQ position-advance (rx_frame = last_eff_preamble_nsymb + Nsymb). Defaults to preamble_nSymb when amortization is off.
+	// EESM-SEED (staging/eesm-seed, DESIGN.md Option B): per-subcarrier post-EQ
+	// effective SNR (gamma_eff, dB) folded by Exponential Effective SNR Mapping
+	// over the live OFDM channel estimate H + noise_variance_estimate. UNLIKE the
+	// flat-average measure_SNR (.SNR above), gamma_eff is NOTCH-DOMINATED: a faded
+	// subcarrier pulls the AWGN-equivalent SNR DOWN, so a frequency-selective channel
+	// reports a LOWER gamma_eff than its flat average — the missing signal the climb
+	// seed needs to avoid over-electing a config a notched channel cannot carry.
+	// Written ONLY in receive_byte's OFDM decode-SUCCESS branch (after pilots
+	// populate estimated_channel + noise_variance_estimate); -99.9 sentinel on every
+	// other path (MFSK, decode-fail, pre-first-frame) so a consumer treats it as
+	// "no measurement" -> fall back to ROBUST (pre-CSI fallback, audit H1).
+	double effective_SNR = -99.9;
 };
 
 
@@ -618,6 +630,22 @@ public:
 	// NOT a new config). DEFAULT OFF so stock CFG15/16 per-frame paths are
 	// byte-identical to the pre-P1 baseline. See P1 plan / bigblock-hw-wav-derisk.md.
 	bool bigblock_framing_enabled = false;
+
+	// ===== EESM-SEED (staging/eesm-seed, DESIGN.md Option B) =====
+	// When set, receive_byte computes receive_stats.effective_SNR (gamma_eff) on
+	// every OFDM decode success and the ARQ climb seed prefers that data-plane,
+	// notch-aware AWGN-equivalent SNR over the legacy control-plane/flat-average
+	// SNR (see arq_commander.cc seed sites). DEFAULT OFF (owner-gated): default-on
+	// is BLOCKED on H3 (cliff-table/beta re-calibration vs gamma_eff) per the audit.
+	// Constructor reads env MERCURY_EESM_SEED; OFF => effective_SNR stays at its
+	// -99.9 sentinel and every seed path is byte-identical to before.
+	bool eesm_seed_enabled = false;
+	// EESM combining factor beta (linear SNR units, NOT dB). Lower beta -> the
+	// exponential mean weights the deepest notches more heavily (more pessimistic).
+	// Default 2.0 is a generic OFDM/LDPC starting point; the per-config beta_m + T_m
+	// re-calibration from the PLOT_PASSBAND BER harness is H3 (required before
+	// default-on). Constructor reads env MERCURY_EESM_BETA.
+	double eesm_beta = 2.0;
 
 	// ===== HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13) =====
 	// The CFG16 big-block writes a K-codeword concatenated waveform (~45552 doubles)

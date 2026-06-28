@@ -2615,6 +2615,88 @@ double cl_ofdm::measure_SNR(std::complex <double>*in_s, std::complex <double>*in
 	return SNR;
 }
 
+// EESM-SEED (DESIGN.md Option B). Fold the live per-subcarrier channel estimate
+// into ONE AWGN-equivalent effective SNR (gamma_eff, dB) via Exponential Effective
+// SNR Mapping. See the ofdm.h declaration for the formula + citations.
+//
+// Why this beats the flat-average measure_SNR for the climb seed: measure_SNR
+// averages the post-EQ EVM over ALL data cells, so two deep notches that erase a
+// handful of subcarriers barely move the average — yet those erased cells are
+// exactly what the LDPC code must overcome, and they sink the BLER. EESM weights
+// the deepest carriers exponentially, so a frequency-selective channel reports a
+// LOWER gamma_eff than its flat average, matching the AWGN SNR that would give the
+// SAME coded BLER. That is the signal the per-config cliff table expects.
+double cl_ofdm::measure_effective_SNR(double beta)
+{
+	// Guard: no valid channel estimate yet (pre-first-frame / null / degenerate).
+	// Caller treats -99.9 as "no measurement" -> ROBUST fallback (audit H1).
+	if(Nc <= 0 || Nsymb <= 0 || estimated_channel == NULL)
+		return -99.9;
+	if(!(noise_variance_estimate > 0.0))
+		return -99.9;
+	if(!(beta > 0.0))
+		beta = 2.0;  // defensive: a non-positive beta is meaningless; use the default
+
+#ifdef EESM_NOTCH_FAILBEFORE
+	// FAIL-BEFORE arm (--test-eesm-notch). Compile a DEGENERATE estimator that
+	// returns the FLAT LINEAR-AVERAGE SNR (no exponential fold) — i.e. the
+	// notch-blind behaviour the flat-average measure_SNR already had. Under this
+	// build a notched channel reports the SAME effective SNR as its flat average, so
+	// the notch-awareness assertion FAILS — proving the EESM fold below is the
+	// load-bearing fix. Production NEVER defines this macro.
+	{
+		double sum_lin = 0.0; long Nfb = 0;
+		for(int i=0;i<Nsymb;i++)
+			for(int j=0;j<Nc;j++)
+			{
+				std::complex<double> H = (estimated_channel + i*Nc + j)->value;
+				double H_mag_sq = H.real()*H.real() + H.imag()*H.imag();
+				sum_lin += H_mag_sq / noise_variance_estimate;
+				Nfb++;
+			}
+		if(Nfb == 0) return -99.9;
+		double mean_lin = sum_lin / (double)Nfb;
+		if(mean_lin < 1e-12) return -99.9;
+		return 10.0 * log10(mean_lin);
+	}
+#endif
+
+	// Accumulate the exponential mean exp(-gamma_j/beta) over every measured
+	// subcarrier of every OFDM symbol in the frame's channel estimate. gamma_j is
+	// the per-carrier post-EQ SNR |H_j|^2 / sigma_n^2 (the MMSE/ZF SNR the equalizer
+	// itself uses at ofdm.cc channel_equalizer alpha = |H|^2/(|H|^2+sigma_n^2)).
+	double sum_exp = 0.0;
+	long   N = 0;
+	for(int i=0;i<Nsymb;i++)
+	{
+		for(int j=0;j<Nc;j++)
+		{
+			std::complex<double> H = (estimated_channel + i*Nc + j)->value;
+			double H_mag_sq = H.real()*H.real() + H.imag()*H.imag();
+			double gamma_j = H_mag_sq / noise_variance_estimate;  // linear per-carrier SNR
+			// exp(-gamma_j/beta): a deep notch (gamma_j -> 0) contributes ~1 (the
+			// worst case), a strong carrier (gamma_j large) contributes ~0. The mean
+			// is therefore pulled UP (worse) by notches -> gamma_eff pulled DOWN.
+			sum_exp += exp(-gamma_j / beta);
+			N++;
+		}
+	}
+	if(N == 0)
+		return -99.9;
+
+	double mean_exp = sum_exp / (double)N;
+	// gamma_eff = -beta * ln(mean_exp). Clamp mean_exp away from 0 (all carriers
+	// extremely strong -> ln(0) = -inf) and 1 (all carriers dead -> ln(1)=0 ->
+	// gamma_eff=0). Both extremes are well outside the operating range; the clamp
+	// only bounds the returned dB to a sane window.
+	if(mean_exp < 1e-30) mean_exp = 1e-30;
+	if(mean_exp > 1.0)   mean_exp = 1.0;
+	double gamma_eff_lin = -beta * log(mean_exp);
+	if(gamma_eff_lin < 1e-12)
+		return -99.9;  // effectively dead channel -> no usable measurement
+	return 10.0 * log10(gamma_eff_lin);
+}
+
 void cl_ofdm::smooth_channel_estimate_dft()
 {
 	// DFT-based channel estimation noise suppression.

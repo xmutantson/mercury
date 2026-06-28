@@ -212,6 +212,21 @@ public:
 	void peak_clip(double *in, int nItems, double papr);
 	void peak_clip(std::complex <double> *in, int nItems, double papr);
 	double measure_SNR(std::complex <double>*in_s, std::complex <double>*in_n, int nItems);
+	// EESM-SEED (DESIGN.md Option B): per-subcarrier post-EQ effective SNR via
+	// Exponential Effective SNR Mapping. Reads the live per-subcarrier channel
+	// estimate (estimated_channel, ofdm.cc:2641/2675) + noise_variance_estimate
+	// (pilot-residual EVM, ofdm.cc) and folds the Nc*Nsymb per-carrier SNRs into
+	// ONE AWGN-equivalent gamma_eff (dB):
+	//   gamma_j   = |H_j|^2 / noise_variance_estimate            (linear, per carrier)
+	//   gamma_eff = -beta * ln( (1/N) * sum_j exp(-gamma_j/beta) )  (linear)
+	//   return 10*log10(gamma_eff)                                (dB)
+	// The exponential mean is dominated by the DEEPEST notches, so a frequency-
+	// selective channel returns a LOWER value than the flat-average measure_SNR —
+	// the notch-awareness the climb seed needs. Returns -99.9 sentinel if there is
+	// no valid channel estimate (Nc<=0 / null estimated_channel / nv<=0). Refs:
+	// Brueninghaus et al., "Link Performance Models for System Level Simulations of
+	// Broadband Radio Access Systems," IEEE PIMRC 2005 (EESM); 3GPP TR 25.892 §A.2.
+	double measure_effective_SNR(double beta);
 	int time_sync(std::complex <double>*in, int size, int interpolation_rate, int location_to_return);
 	int time_sync_preamble(std::complex <double>*in, int size, int interpolation_rate, int location_to_return, int step, int nTrials_max);
 	// nsym_override: LEVER P. Correlate the fine-timing template over

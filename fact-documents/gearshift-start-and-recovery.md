@@ -901,3 +901,78 @@ e.g. a low conservative seed (cfg0–1 only) gated by a data-plane confirm, or f
 into the existing FRAME-UP/elevator which already promotes only on confirmed data delivery.
 Three serial discoveries (inert → fires-but-bypassed → fires-but-craters) = the
 architectural-stop signal: the proxy itself is the problem. OPEN [?] §10.7.
+
+## §11 EESM-SEED — the DATA-PLANE viability signal §10.7 asked for (IMPLEMENTED 2026-06-28, staging/eesm-seed, flag default-OFF)
+
+§10.7 ended on the architectural-stop verdict: the CONNECT-SEED crater is not a margin
+to tune, it is the WRONG SIGNAL. The MFSK control-plane SNR proxy reads ~32 dB at WGN:10
+and ~37 dB at WGN:15 vs ~53–60 dB at WGN:30/40 — control-plane success does NOT imply
+data-plane viability, and no fixed-dB margin separates a marginal channel from a clean one.
+The OPEN [?] §10.7 explicitly named the fix: *"a DATA-PLANE viability signal (a probe that
+actually decodes a WB DATA frame before raising the start), not a control-plane SNR guess."*
+
+§11 is that signal: **EESM (Exponential Effective SNR Mapping) over the live OFDM channel
+estimate.** Design = `_research/climbdp/DESIGN.md` Option B (researched + cited: Brueninghaus
+et al. PIMRC 2005; 3GPP TR 25.892 §A.2).
+
+### §11.1 Mechanism
+
+`cl_ofdm::measure_effective_SNR(beta)` (ofdm.cc, next to `measure_SNR`) folds the
+per-subcarrier post-EQ SNR into one AWGN-equivalent `gamma_eff` (dB):
+- `gamma_j   = |H_j|^2 / noise_variance_estimate`  (linear, per carrier; the SAME
+  quantities the MMSE/ZF equalizer already uses — H at ofdm.cc:2641/2675, nv =
+  pilot-residual EVM)
+- `gamma_eff = -beta * ln( (1/N) * sum_j exp(-gamma_j/beta) )`  (linear) → `10*log10`.
+
+The exponential mean is **dominated by the deepest notches**, so a frequency-selective
+channel reports a LOWER `gamma_eff` than its flat average — the notch-awareness the
+flat-average `measure_SNR` structurally lacks. This is precisely the property the §3
+"control success ≠ data viability" disease needed: a faded subcarrier (which the LDPC must
+overcome and which sinks the BLER) drags the seed DOWN.
+
+### §11.2 Wiring (ZERO wire change — only swaps the seed INPUT)
+
+1. `st_receive_stats::effective_SNR` (telecom_system.h) — NEW field, -99.9 sentinel default.
+2. `receive_byte` OFDM decode-SUCCESS branch (telecom_system.cc, after `receive_stats.SNR`
+   is set) computes `effective_SNR = ofdm.measure_effective_SNR(eesm_beta)` ONLY here,
+   AFTER pilots populate H + nv. Reset to -99.9 at every receive entry (stale-read guard).
+   MFSK / decode-fail / pre-first-frame all leave it at the sentinel → pre-CSI fallback =
+   ROBUST (audit H1). Gated on `eesm_seed_enabled` so OFF is byte-identical.
+3. `cl_arq_controller::forward_gamma_eff` (arq.h) — stored from
+   `received_message_stats.effective_SNR` at the SAME site that refreshes
+   `measurements.SNR_uplink` (arq_common.cc). Forward RX-local; reverse never reads it.
+4. Seed sites (arq_commander.cc): the load-bearing turbo SNR-SUPERSHIFT site and
+   `finish_turbo_direction` prefer `forward_gamma_eff` over the control-plane/flat SNR
+   when `eesm_seed_active()` (flag on AND valid gamma_eff AND NOT TURBO_REVERSE), and feed
+   it to `get_configuration(gamma_eff)` with **NO uniform SUPERSHIFT_MARGIN_DB** — selecting
+   the highest config whose gamma_eff ≥ its OWN AWGN BLER cliff (DESIGN §3). Every existing
+   sentinel/ceiling/strict-up/cooldown guard is preserved; the fix only changes WHAT value
+   feeds the existing climb machine. The legacy margin path is unchanged when the flag is off.
+
+### §11.3 Flag + calibration gate
+
+Behind `MERCURY_EESM_SEED` (env; default OFF, owner-gated) + `MERCURY_EESM_BETA` (default
+2.0). Default-on is BLOCKED on audit H3: the per-config `beta_m`/`T_m` and whether to keep
+any residual margin must be re-derived from the PLOT_PASSBAND BER harness, paired with a
+failing→passing 2-notch + WGN:10/15 anti-crater regression — the exact discipline the
+QUARANTINED CONNECT-SEED crater (§10.7) skipped. Do NOT flip the default until that lands.
+
+### §11.4 Fail-before / pass-after test (`--test-eesm-notch`)
+
+`run_eesm_notch_selftest` (main.cc) builds a synthetic flat channel (all |H|=1) and a
+2-notch channel (two of 50 carriers at |H|=0.03) at fixed nv, then asserts:
+(1) the notched channel's `gamma_eff` is ≥3 dB BELOW its own flat-average SNR (the
+    notch-awareness the flat-avg lacks); (2) the flat channel degenerates to the AWGN SNR
+    (±0.5 dB); (3) notch < flat; (4) no-CSI → -99.9 sentinel.
+FAIL-BEFORE: `-DEESM_NOTCH_FAILBEFORE` compiles a degenerate flat-linear-average estimator
+(no exponential fold) → assertion (1) FAILS (notch == flat), proving the EESM fold is
+load-bearing. Shipped build PASSES.
+
+### §11.5 §5 cross-layer audit pointer
+
+Full producer/consumer/valid-state/invariant audit (supershift_proven_ceiling,
+negotiated_configuration, turbo SNR-seed loop, cliff table) in `_research/eesm/audit.json`
+(+ Pi mirror `/home/kameron/eesm/audit.json`): hazards H1 (pre-CSI, mitigated by
+success-branch-only compute + sentinel), H2 (stale reverse γ_eff, mitigated by
+receive-entry reset + reverse force-probe), H3 (cliff/beta re-cal, GATING for default-on),
+H4 (SACK-trust, low). safe-to-implement=Y, safe-to-default-on=N.

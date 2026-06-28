@@ -12857,6 +12857,15 @@ void cl_arq_controller::receive()
 			// With pattern ACK, the commander never decodes LDPC during ACK detection,
 			// so SNR_uplink only refreshes during SWITCH_ROLE when we receive data.
 			measurements.SNR_uplink = received_message_stats.SNR;
+			// EESM-SEED (DESIGN.md Option B): mirror the data-plane gamma_eff store
+			// onto the FORWARD SNR refresh. receive_byte sets effective_SNR only on an
+			// OFDM decode SUCCESS (and only when the EESM flag is on; -99.9 sentinel
+			// otherwise), so this writes a valid forward gamma_eff exactly when a
+			// forward OFDM frame just decoded — the same condition under which
+			// SNR_uplink is trustworthy. Forward RX-local; the reverse probe never
+			// reads it (audit H2). EESM off => effective_SNR stays at the sentinel ->
+			// forward_gamma_eff stays sentinel -> seed input is byte-identical.
+			forward_gamma_eff = received_message_stats.effective_SNR;
 			if(this->role == RESPONDER)
 			{
 				measurements.SNR_downlink = received_message_stats.SNR;

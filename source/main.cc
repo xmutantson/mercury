@@ -501,6 +501,120 @@ static int run_pas_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-eesm-notch: EESM-SEED notch-awareness self-test (staging/eesm-seed,
+// DESIGN.md Option B). The FLAT-AVERAGE measure_SNR cannot see a frequency-selective
+// notch: two deeply-faded subcarriers among many strong ones barely move the average.
+// EESM (measure_effective_SNR) folds the per-carrier SNRs with an exponential mean
+// that is DOMINATED by the deepest notches, so a notched channel reports a LOWER
+// gamma_eff than the same channel's flat average — the exact notch-awareness the
+// climb seed needs to avoid over-electing a config a notched channel cannot carry.
+//
+// FAIL-BEFORE / PASS-AFTER: build with -DEESM_NOTCH_FAILBEFORE to compile a
+// degenerate measure_effective_SNR that returns the FLAT linear-average SNR (no
+// exponential fold). Under the fail-before build the notched and flat channels
+// report the SAME effective SNR, so assertion (1) — notch < flat by a clear margin
+// — FAILS, proving the EESM fold is load-bearing. The shipped (no-macro) build folds
+// correctly and PASSES. Pure cl_ofdm check; no ARQ/audio/telecom state. Returns 0 on
+// full pass, 1 on any failure.
+static double eesm_run_for_profile(int Nc, int Nsymb, double nv, double beta,
+                                   const double* H_mag /* per-carrier magnitude, length Nc */)
+{
+    cl_ofdm o;                 // default ctor: estimated_channel=NULL, Nc/Nsymb=0
+    o.Nc = Nc;
+    o.Nsymb = Nsymb;
+    o.noise_variance_estimate = nv;
+    o.estimated_channel = new st_channel_complex[(size_t)Nc * Nsymb];
+    for (int i = 0; i < Nsymb; i++)
+        for (int j = 0; j < Nc; j++)
+        {
+            // Real-valued H of the given per-carrier magnitude (phase is irrelevant
+            // to |H|^2, which is all gamma_j depends on). Same profile every symbol.
+            (o.estimated_channel + i*Nc + j)->value = std::complex<double>(H_mag[j], 0.0);
+            (o.estimated_channel + i*Nc + j)->status = 0;
+        }
+    double g = o.measure_effective_SNR(beta);
+    delete[] o.estimated_channel;
+    o.estimated_channel = nullptr;   // ctor-state restore so the dtor (if any) is safe
+    o.Nc = 0; o.Nsymb = 0;
+    return g;
+}
+
+static int run_eesm_notch_selftest()
+{
+    printf("[TEST-EESM-NOTCH] EESM-SEED notch-awareness self-test (DESIGN.md Option B)\n");
+    const int Nc = 50;          // WB OFDM Nc
+    const int Nsymb = 8;
+    const double nv = 0.01;      // ~20 dB nominal per strong carrier
+    const double beta = 2.0;     // default combining factor
+    int fails = 0;
+
+    // FLAT channel: every carrier |H|=1.0 -> gamma_j = 1/nv = 100 (=20 dB) uniformly.
+    std::vector<double> H_flat(Nc, 1.0);
+
+    // NOTCHED channel: SAME strong carriers, but two subcarriers are deeply faded
+    // (|H|=0.03 -> gamma_j ~= 0.09 linear, ~ -10.5 dB). Only 2 of 50 carriers fade,
+    // so the FLAT mean barely moves; EESM must drop materially.
+    std::vector<double> H_notch(Nc, 1.0);
+    H_notch[12] = 0.03;
+    H_notch[37] = 0.03;
+
+    double g_flat  = eesm_run_for_profile(Nc, Nsymb, nv, beta, H_flat.data());
+    double g_notch = eesm_run_for_profile(Nc, Nsymb, nv, beta, H_notch.data());
+
+    // The flat-average SNR over the SAME notched magnitudes (what measure_SNR would
+    // report on the channel estimate): 10*log10(mean_j |H_j|^2 / nv). Two tiny
+    // carriers among 48 unit carriers -> ~ 10*log10((48*1 + 2*0.0009)/50 / 0.01)
+    // = ~19.8 dB, i.e. essentially the flat 20 dB. This is the value EESM must beat
+    // (report LOWER than) to prove notch-awareness.
+    double sum_mag_sq = 0.0;
+    for (int j = 0; j < Nc; j++) sum_mag_sq += H_notch[j]*H_notch[j];
+    double flat_avg_db = 10.0 * log10((sum_mag_sq / Nc) / nv);
+
+    printf("[TEST-EESM-NOTCH]   flat-channel   gamma_eff = %.2f dB\n", g_flat);
+    printf("[TEST-EESM-NOTCH]   notch-channel  gamma_eff = %.2f dB\n", g_notch);
+    printf("[TEST-EESM-NOTCH]   notch flat-AVG (measure_SNR-equiv) = %.2f dB (the value EESM must beat)\n", flat_avg_db);
+
+    // (1) NOTCH AWARENESS — the load-bearing assertion. A notched channel must report
+    //     a CLEARLY lower gamma_eff than its own flat-average SNR. >= 3 dB separation
+    //     is a comfortable cliff (one OFDM config rung is ~1-3 dB in the table). Under
+    //     -DEESM_NOTCH_FAILBEFORE g_notch == flat_avg_db -> this FAILS (fail-before).
+    double notch_drop = flat_avg_db - g_notch;
+    bool a1 = (notch_drop >= 3.0);
+    printf("[TEST-EESM-NOTCH]   (1) notch drop below flat-avg = %.2f dB (need >= 3.0) -> %s\n",
+           notch_drop, a1 ? "PASS" : "FAIL");
+    if (!a1) fails++;
+
+    // (2) FLAT DEGENERACY — on a truly flat channel EESM must reduce to the AWGN SNR
+    //     (no spurious penalty). All carriers identical -> gamma_eff == per-carrier
+    //     SNR == 20 dB. Tolerance 0.5 dB.
+    bool a2 = (fabs(g_flat - 20.0) <= 0.5);
+    printf("[TEST-EESM-NOTCH]   (2) flat gamma_eff == AWGN 20 dB (|err| <= 0.5) -> %s\n",
+           a2 ? "PASS" : "FAIL");
+    if (!a2) fails++;
+
+    // (3) ORDERING — notch strictly below flat (a weaker corollary of (1), kept as an
+    //     explicit invariant the seed relies on: more selectivity => lower seed).
+    bool a3 = (g_notch < g_flat - 1.0);
+    printf("[TEST-EESM-NOTCH]   (3) notch gamma_eff < flat gamma_eff (by > 1 dB) -> %s\n",
+           a3 ? "PASS" : "FAIL");
+    if (!a3) fails++;
+
+    // (4) PRE-CSI SENTINEL — no valid estimate => -99.9 sentinel (audit H1 fallback).
+    {
+        cl_ofdm o; o.Nc = 0; o.Nsymb = 0; o.estimated_channel = nullptr;
+        o.noise_variance_estimate = 0.01;
+        double g_none = o.measure_effective_SNR(beta);
+        bool a4 = (g_none <= -90.0);
+        printf("[TEST-EESM-NOTCH]   (4) no-CSI -> sentinel %.1f (<= -90) -> %s\n",
+               g_none, a4 ? "PASS" : "FAIL");
+        if (!a4) fails++;
+    }
+
+    printf("[TEST-EESM-NOTCH] %s (%d assertion failure%s)\n",
+           fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 // --test-cfg17: CFG17 shaped-64-QAM COMPOSITION self-test (failing-test-first).
 // Drives the SFO-GRID harness in-process for three decisive cells and asserts the
 // COMPOSED stack decodes where a BARE arm fails — proving each of the three deep
@@ -1530,6 +1644,7 @@ int main(int argc, char *argv[])
     bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
     bool test_a3_decouple_safety_cli = false; // --test-a3-decouple-safety: the §2 CHECKPOINT — single-miss non-load-bearing (anti-0-bytes, byte-faithful) + genuine-death net intact, demote IN PLACE (data-flow-forgiving-ack.md §T2.2/§6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
+    bool test_eesm_notch_cli = false;   // --test-eesm-notch: EESM-SEED notch-awareness self-test (staging/eesm-seed, DESIGN.md Option B). Fail-before -DEESM_NOTCH_FAILBEFORE.
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
@@ -2391,6 +2506,16 @@ int main(int argc, char *argv[])
             // Pure cl_dist_matcher check, no Mercury/ARQ state needed. See
             // fact-documents/data-flow-pas-shaping.md §6 + tools/test_pas_shaping.py.
             test_pas_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-eesm-notch") == 0)
+        {
+            // EESM-SEED notch-awareness self-test (staging/eesm-seed, DESIGN.md
+            // Option B). Pure cl_ofdm check (synthetic flat vs 2-notch channel
+            // estimate), no Mercury/ARQ/audio state. Fail-before with the compile
+            // macro -DEESM_NOTCH_FAILBEFORE. See main.cc run_eesm_notch_selftest.
+            test_eesm_notch_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3982,6 +4107,17 @@ start_modem:
             fflush(stdout);
             int rc = run_pas_selftest();
             printf("[FLAG] PAS self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_eesm_notch_cli) {
+            // EESM-SEED notch-awareness self-test (one-shot, then exit rc). Pure
+            // cl_ofdm check (synthetic flat vs 2-notch channel estimate).
+            printf("[FLAG] --test-eesm-notch: invoking EESM-SEED notch-awareness "
+                   "self-test (DESIGN.md Option B)\n");
+            fflush(stdout);
+            int rc = run_eesm_notch_selftest();
+            printf("[FLAG] EESM-notch self-test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -88,6 +88,15 @@ cl_telecom_system::cl_telecom_system()
 	// gearshift wiring + the CFG16-acq fix before it can ship. Keep default-off.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_FRAMING");
 	  if(e && *e && atoi(e) != 0) bigblock_framing_enabled = true; }
+	// EESM-SEED (staging/eesm-seed, DESIGN.md Option B). DEFAULT OFF (owner-gated;
+	// default-on blocked on the H3 cliff/beta re-calibration). When set, receive_byte
+	// computes receive_stats.effective_SNR on OFDM decode success and the climb seed
+	// prefers it. OFF => effective_SNR never computed -> stays at -99.9 sentinel ->
+	// every seed path byte-identical.
+	{ const char* e = std::getenv("MERCURY_EESM_SEED");
+	  if(e && *e && atoi(e) != 0) eesm_seed_enabled = true; }
+	{ const char* e = std::getenv("MERCURY_EESM_BETA");
+	  if(e && *e){ double b = atof(e); if(b > 0.0) eesm_beta = b; } }
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -1125,6 +1134,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.iterations_done = -1;
 	receive_stats.crc = 0;
 	receive_stats.SNR = -99.9;
+	// EESM-SEED: reset the data-plane gamma_eff to the sentinel on EVERY receive
+	// entry so a stale OFDM gamma_eff from a prior frame CANNOT leak onto this
+	// receive's MFSK/decode-fail/pre-CSI path (audit H2 stale-read guard). Only the
+	// OFDM decode-SUCCESS branch this call overwrites it.
+	receive_stats.effective_SNR = -99.9;
 	receive_stats.all_zeros = NO;
 	receive_stats.coarse_metric = 0.0;
 	receive_stats.mean_H = -1.0;
@@ -3395,6 +3409,18 @@ skip_h_retry_point:
 					{
 						receive_stats.SNR=ofdm.measure_SNR(data_container.ofdm_deframed_data,data_container.ofdm_time_freq_interleaved_data,data_container.nData);
 					}
+
+					// EESM-SEED (DESIGN.md Option B): compute the notch-aware
+					// data-plane gamma_eff ONLY here — in the OFDM decode-SUCCESS
+					// branch, AFTER pilots have populated ofdm.estimated_channel +
+					// ofdm.noise_variance_estimate this frame. On any failure / MFSK /
+					// pre-first-frame path effective_SNR stays at its -99.9 sentinel
+					// (st_receive_stats default), so the climb seed falls back to
+					// ROBUST (audit H1 pre-CSI fallback). Gated on the flag => OFF is
+					// byte-identical (field left at sentinel). M==MFSK never reaches
+					// this OFDM branch.
+					if(eesm_seed_enabled)
+						receive_stats.effective_SNR = ofdm.measure_effective_SNR(eesm_beta);
 
 				}
 

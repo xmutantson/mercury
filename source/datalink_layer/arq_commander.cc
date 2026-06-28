@@ -524,6 +524,19 @@ int cl_arq_controller::connect_seed_target_core(double snr_uplink, int snr_mappe
 	return target;
 }
 
+// EESM-SEED (staging/eesm-seed, DESIGN.md Option B). True iff the flag is on AND a
+// valid forward data-plane gamma_eff exists. While true the climb seed prefers the
+// notch-aware gamma_eff and selects the highest config whose gamma_eff >= its OWN
+// AWGN cliff (no uniform SUPERSHIFT_MARGIN_DB). Flag OFF (the default) or no valid
+// gamma_eff yet (pre-first-WB-frame) => false => the legacy control-plane/flat-avg +
+// margin path is byte-identical (audit safe_to_implement=Y; default-on gated on H3).
+bool cl_arq_controller::eesm_seed_active() const
+{
+	return telecom_system != NULL
+		&& telecom_system->eesm_seed_enabled
+		&& forward_gamma_eff > -90.0;
+}
+
 // CONNECT-SEED member wrapper (gearshift-start-and-recovery.md §10.2). Gates on the
 // in-band feature + gearshift + a valid control-plane SNR, maps the SNR through
 // get_configuration() with the large CONNECT_SEED_MARGIN_DB, applies the shared
@@ -6540,9 +6553,18 @@ void cl_arq_controller::finish_turbo_direction()
 		// (via SNR supershift) leaving gaps in the tested range. Use the SNR
 		// measurement as the primary guidance for both ceiling and start config.
 		float effective_snr = (turbo_best_snr > -90) ? turbo_best_snr : measurements.SNR_uplink;
+		// EESM-SEED (DESIGN.md Option B): this is the FORWARD-complete summary, so the
+		// forward data-plane gamma_eff (when valid + flagged on) is the right ceiling
+		// guidance — and it feeds the OWN-cliff get_configuration with NO uniform
+		// margin (gamma_eff is AWGN-equivalent). Off the flag / pre-CSI: unchanged.
+		bool eesm_here = eesm_seed_active();
+		if(eesm_here)
+			effective_snr = (float)forward_gamma_eff;
 		int snr_config = -1;
 		if(effective_snr > -90)
-			snr_config = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
+			snr_config = eesm_here
+				? get_configuration(effective_snr)
+				: get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
 
 		// Start at the SUPERSHIFT-verified config (turboshift_last_good).
 		// Rationale: the verification probe at line ~2483 just confirmed this
@@ -7495,10 +7517,28 @@ void cl_arq_controller::process_control_commander()
 							effective_snr = measurements.SNR_uplink;
 						else
 							effective_snr = -99.0;  // Force incremental probing
+						// EESM-SEED (DESIGN.md Option B): on the FORWARD direction, prefer
+						// the notch-aware data-plane gamma_eff over the control-plane/flat
+						// SNR. NEVER substitute during TURBO_REVERSE — gamma_eff is forward
+						// RX-local and the reverse probe must keep its force-probe (-99.0)
+						// rule (audit INV-TL3). eesm_seed_active()==false off the flag or
+						// pre-CSI -> effective_snr unchanged (byte-identical legacy path).
+						bool eesm_here = (turboshift_phase != TURBO_REVERSE) && eesm_seed_active();
+						if(eesm_here)
+							effective_snr = forward_gamma_eff;
 						int snr_target = -1;
 						if(is_ofdm_config(current_configuration) && effective_snr > -90)
 						{
-							snr_target = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
+							// EESM picks the highest config whose gamma_eff >= its OWN
+							// AWGN BLER cliff — gamma_eff is already AWGN-equivalent, so it
+							// feeds get_configuration DIRECTLY with NO uniform margin. The
+							// legacy control-plane/flat SNR still carries the stacked
+							// SUPERSHIFT_MARGIN_DB it was calibrated with. (H3: whether the
+							// margin should be fully dropped vs partially kept is the
+							// gating re-calibration; the flag is default-off until then.)
+							snr_target = eesm_here
+								? get_configuration(effective_snr)
+								: get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
 							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 							if(snr_target > cfg_ceiling)
 								snr_target = cfg_ceiling;

@@ -4436,6 +4436,19 @@ public:
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
   float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
   float turbo_best_snr;            // Best SNR seen across entire turbo phase (-99 = none)
+  // EESM-SEED (staging/eesm-seed, DESIGN.md Option B): the most recent FORWARD-path
+  // data-plane effective SNR (gamma_eff, dB) the FORWARD OFDM decode produced. Stored
+  // from received_message_stats.effective_SNR at the SAME site that refreshes
+  // measurements.SNR_uplink (arq_common.cc). -99.9 = no valid forward gamma_eff yet
+  // (pre-first-WB-frame / EESM flag off / MFSK-only so far) -> the seed falls back to
+  // the legacy SNR input -> ROBUST start. Forward RX-local only; NEVER reused for the
+  // REVERSE probe direction (audit H2/INV-TL3; reverse keeps its force-probe rule).
+  double forward_gamma_eff = -99.9;
+  // True when EESM-seed is flagged on (telecom_system->eesm_seed_enabled) AND a
+  // valid forward gamma_eff exists. When true the seed selects the highest config
+  // whose gamma_eff >= its OWN AWGN cliff (get_configuration WITHOUT the legacy
+  // uniform SUPERSHIFT_MARGIN_DB); when false the legacy margin path is unchanged.
+  bool eesm_seed_active() const;
   cl_timer turbo_snr_defer_timer;  // defer ACK return until suffix arrives
   int turbo_switch_role_retries;   // consecutive SWITCH_ROLE failures during turbo (Bug #60)
 
