@@ -3312,9 +3312,18 @@ skip_h_retry_point:
 			{
 				if(M == MOD_MFSK)
 				{
-					// MFSK: no channel estimation, skip variance-based SNR
-					// TODO: estimate SNR from peak tone energy vs noise energy
-					receive_stats.SNR = 0.0;
+					// MFSK has no OFDM channel estimate, so the variance-based
+					// SNR (LS/ZF) below does not apply. Instead use the
+					// noncoherent-FSK "peak tone energy vs noise energy" estimate
+					// mfsk.demod() now produces (mfsk.cc, last_demod_snr_db) — the
+					// long-standing TODO here. Before this, the hardcoded 0.0
+					// meant the connect handshake (all-MFSK) and the ROBUST-tier
+					// climb relayed a sentinel SNR (the faithful real-audio sim
+					// reported measurements.SNR_uplink = 0.00). last_demod_snr_db
+					// is -99.0 (the consumer "no measurement" sentinel) only if
+					// the codeword carried no measurable symbol. See
+					// fact-documents/data-flow-snr-measurements.md §9.
+					receive_stats.SNR = mfsk.last_demod_snr_db;
 				}
 				else if(ofdm.channel_estimator==LEAST_SQUARE)
 				{

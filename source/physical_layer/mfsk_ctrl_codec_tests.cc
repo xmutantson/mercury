@@ -801,6 +801,115 @@ static void test_v3_test_conn_snr_quantization_roundtrip() {
 	test_pass(name);
 }
 
+// §2.x — MFSK codeword SNR estimator (the connect-plane SNR fix).
+//
+// FAIL-BEFORE: the MFSK SNR site (telecom_system.cc) hardcoded
+// receive_stats.SNR = 0.0 for every MFSK decode. Because the WB connect
+// handshake is ALL-MFSK (HAIL/START_CONN/TEST_ACK/TEST_CONN), the connect-plane
+// SNR was never measured — measurements.SNR_uplink relayed the 0.0 sentinel
+// (the faithful real-audio sim reported SNR_uplink = 0.00). This test drives
+// cl_mfsk::demod() directly with FREQUENCY-DOMAIN codewords at controlled SNR
+// (one signal tone per symbol/stream + complex AWGN in every band bin) and
+// asserts last_demod_snr_db (a) starts at the -99.0 "no measurement" sentinel,
+// (b) reads a HIGH value on a clean codeword, (c) reads a LOWER value on a
+// degraded one (monotone in channel SNR), and (d) tracks the injected SNR
+// within tolerance. All four assertions FAIL against the old 0.0 placeholder.
+// See fact-documents/data-flow-snr-measurements.md §9.
+static void test_mfsk_demod_snr_estimate() {
+	const char* name = "mfsk_demod_snr_estimate";
+	const int M = 16, Nc = 50, nStreams = 1;
+	cl_mfsk m;
+	m.init(M, Nc, nStreams);
+
+	// (a) sentinel before any demod() call.
+	if (m.last_demod_snr_db > -90.0) {
+		test_fail(name, "last_demod_snr_db not at -99.0 sentinel before demod()");
+		return;
+	}
+
+	const int nBitsPerSym = m.nBits;                 // log2(M) = 4
+	const int nSym = 240;                            // pooled like a ROBUST codeword
+	const int total_bits = nSym * nBitsPerSym * nStreams;
+
+	// Build one FFT-domain codeword at a target SNR. signal_amp^2 is the per-bin
+	// signal power; noise_sigma is the per-real-dim AWGN std (so one complex bin's
+	// noise power = 2*noise_sigma^2 in expectation). Injected SNR (dB) =
+	// 10*log10(signal_amp^2 / (2*noise_sigma^2)). The estimator should recover
+	// approximately this (peak energy ~ signal_amp^2 + noise; noise_var from the
+	// guard bins ~ 2*noise_sigma^2).
+	auto run_at = [&](double inj_snr_db, unsigned seed) -> double {
+		std::mt19937 rng(seed);
+		std::normal_distribution<double> g(0.0, 1.0);
+		const double noise_sigma = 1.0;
+		// signal_amp^2 = 2*noise_sigma^2 * 10^(snr/10)
+		double sig_pow = 2.0 * noise_sigma * noise_sigma * std::pow(10.0, inj_snr_db / 10.0);
+		double signal_amp = std::sqrt(sig_pow);
+
+		std::vector<std::complex<double> > fft_in((size_t)nSym * Nc,
+		                                          std::complex<double>(0.0, 0.0));
+		std::uniform_int_distribution<int> tone_pick(0, M - 1);
+		for (int s = 0; s < nSym; s++) {
+			// AWGN in EVERY subcarrier bin (signal band + guard bins).
+			for (int k = 0; k < Nc; k++)
+				fft_in[(size_t)s * Nc + k] =
+					std::complex<double>(noise_sigma * g(rng), noise_sigma * g(rng));
+			// Add the transmitted tone (account for demod's tone-hop de-rotation:
+			// data tone d is sent on actual bin (d + s*hop)%M within the stream).
+			for (int st = 0; st < nStreams; st++) {
+				int d = tone_pick(rng);
+				int hop = (s * m.tone_hop_step) % M;
+				int actual = (d + hop) % M;
+				int bin = m.stream_offsets[st] + actual;
+				fft_in[(size_t)s * Nc + bin] += std::complex<double>(signal_amp, 0.0);
+			}
+		}
+
+		std::vector<float> llr((size_t)total_bits, 0.0f);
+		m.demod(fft_in.data(), total_bits, llr.data());
+		return m.last_demod_snr_db;
+	};
+
+	double snr_hi = run_at(18.0, 0xA11CE001u);   // clean channel
+	double snr_lo = run_at(3.0,  0xB0B0B0B0u);    // degraded channel
+
+	// (b) clean codeword reports a genuinely HIGH SNR (the old 0.0 fails this).
+	if (!(snr_hi > 12.0)) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"clean (inj 18 dB) reported %.2f dB, expected > 12 (was 0.0 placeholder)",
+			snr_hi);
+		test_fail(name, buf);
+		return;
+	}
+	// (c) degraded codeword reads strictly LOWER (monotone in channel SNR;
+	//     the old constant 0.0 has no ordering → fails).
+	if (!(snr_lo < snr_hi)) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"monotonicity: degraded %.2f dB not < clean %.2f dB", snr_lo, snr_hi);
+		test_fail(name, buf);
+		return;
+	}
+	// (d) both track the injected SNR within a generous tolerance (the
+	//     estimator is unbiased to within ~3 dB at these levels).
+	if (std::fabs(snr_hi - 18.0) > 4.0) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"clean estimate %.2f dB off injected 18 dB by > 4 dB", snr_hi);
+		test_fail(name, buf);
+		return;
+	}
+	if (std::fabs(snr_lo - 3.0) > 4.0) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+			"degraded estimate %.2f dB off injected 3 dB by > 4 dB", snr_lo);
+		test_fail(name, buf);
+		return;
+	}
+
+	test_pass(name);
+}
+
 // =============================================================================
 // §3 Wave 2 v2 cross-layer regression tests
 //
@@ -7890,6 +7999,7 @@ int run_mfsk_ctrl_codec_tests() {
 	// §4 Wave 3 (§14) TEST_CONN integration tests
 	test_v3_test_conn_passband_roundtrip_clean();
 	test_v3_test_conn_snr_quantization_roundtrip();
+	test_mfsk_demod_snr_estimate();   // connect-plane MFSK SNR (was hardcoded 0.0)
 
 	// §5 MFSK WB data-preamble 4 -> 16 cross-layer regression
 	// (data-flow-preamble_nSymb.md, 2026-05-27).

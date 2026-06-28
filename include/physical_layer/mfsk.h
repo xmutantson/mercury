@@ -381,6 +381,24 @@ public:
 	int  last_connect_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_connect_capture_valid;
 
+	// Codeword SNR estimate (dB) from the most recent demod() call —
+	// noncoherent-FSK "peak tone energy vs noise energy" measurement (the
+	// long-standing TODO at telecom_system.cc MFSK-decode SNR site). demod()
+	// already pools the guard-bin noise variance across the whole codeword
+	// (mfsk.cc, `noise_var`) to scale its LLRs; this member additionally
+	// accumulates the per-symbol-per-stream PEAK tone energy and reports
+	//   SNR_dB = 10*log10( max(mean(E_peak) - noise_var, eps) / noise_var ).
+	// The peak bin carries (signal + noise), so subtracting one noise-bin's
+	// energy de-biases the signal estimate (Proakis 5th ed §4.5.4 noncoherent
+	// FSK; matches the LSE metric demod() already uses). Init -99.0 (the
+	// "no measurement" sentinel the ARQ SNR consumers treat as `<= -90`);
+	// set to a real value on every MFSK codeword decode. Read by
+	// cl_telecom_system::receive_byte's MFSK branch into receive_stats.SNR,
+	// which flows up to measurements.SNR_uplink/_downlink (the connect-plane
+	// SNR + the SUPERSHIFT elevator input). See
+	// fact-documents/data-flow-snr-measurements.md §9.
+	double last_demod_snr_db;
+
 	// Decode the most-recent CONNECT-suffix capture into (type, payload,
 	// crc12). Returns true on success — requires WB (M>=16) and a prior
 	// CONNECT-pattern hit that populated last_connect_suffix_tones[].

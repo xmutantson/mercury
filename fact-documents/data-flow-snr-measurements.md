@@ -1,6 +1,8 @@
 # Data-Flow Audit: `measurements.SNR_uplink` / `measurements.SNR_downlink`
 
-**Status**: Authoritative as of 2026-05-31. §1–§6 cover the SUPERSHIFT
+**Status**: Authoritative as of 2026-06-27. **§9 (2026-06-27) is the SHIPPED ROOT FIX
+for the connect-plane `SNR_uplink = 0.00` — the MFSK SNR estimator that answers the
+long-standing `telecom_system.cc` TODO §8.1 named.** §1–§6 cover the SUPERSHIFT
 SNR-sentinel PRODUCER fix (climb follow-up #1, "Option A", shipped on
 `fix/climb-engine` @ `446887c`). **§1.7 + §7 cover the ENABLEMENT fix
 (climb follow-up #1b, "Option 1") that lands ON TOP of `446887c`** — it
@@ -843,3 +845,92 @@ caveat is acceptable (the "one rung then jump" ordering). The parent must wire-t
   `arq.h:740-741`), §18 / Part N (the data-ACK SNR-leak bug — why Plan B is rejected).
 - This doc §1.5/§1.7/§7 (the existing CMD-side §1.5 producer + §1.7 enablement the fix builds
   on; the fix changes only the VALUE that arrives at `arq_common.cc:5576`, not the site).
+
+---
+
+## §9 MFSK SNR ESTIMATOR — the connect-plane SNR=0.00 ROOT FIX (2026-06-27, SHIPPED `staging/sim-connect-snr`)
+
+**Driving work item (TRACK A)**: the faithful real-audio sim reported the connect-time
+control-plane SNR `measurements.SNR_uplink = 0.00 dB`, which disabled the SNR-seed
+verification and blocked sim-reproduction of the CFG16-hold. This section is the ROOT
+fix for the `0.00`.
+
+### §9.1 ROOT CAUSE — confirmed (extends §8.1)
+
+§8.1 already named it: **`telecom_system.cc` MFSK-decode SNR site (was line 2730, now
+~3317) hardcoded `if(M == MOD_MFSK) receive_stats.SNR = 0.0;`** with the comment
+`// TODO: estimate SNR from peak tone energy vs noise energy`. **MFSK had NO real SNR
+estimator.** Because the WB connect handshake is ENTIRELY MFSK (HAIL → START_CONN →
+TEST_ACK → TEST_CONN, all via `receive_mfsk_ctrl_suffix_phy_core` /
+`mfsk.demod`), every connect-path decode wrote `receive_stats.SNR = 0.0` →
+`measurements.SNR_uplink = 0.0` (canonical producer `arq_common.cc:12757`). The CMD
+then quantized that `0.0` into the TEST_CONNECTION suffix (`arq_commander.cc:1022`,
+`snr_to_tone(0.0)` → tone 3 → round-trips to ~1.0 on the relayed climb path; the RSP's
+direct connect report is the raw `0.0`). **It was a FIELD NEVER WRITTEN with a real
+value, not a sim-only artifact** — the sim merely surfaced it because the connect-plane
+SNR is one of the values it logs. Production had the identical gap.
+
+### §9.2 THE FIX — noncoherent-FSK peak-tone-vs-noise estimator (answers the TODO)
+
+`cl_mfsk::demod` (`mfsk.cc`) ALREADY pools the guard-bin noise variance across the whole
+codeword (`noise_var`, the average non-band-bin energy over all symbols) to scale its
+LLRs. The fix adds, in the SAME symbol/stream loop, a **peak-tone energy accumulator**
+(`E_peak` = max over the M raw bins per symbol-stream — the de-hopped winning tone) and,
+after the loop, computes:
+
+  `SNR_dB = 10*log10( max(mean(E_peak) - noise_var, eps) / noise_var )`
+
+stored in a new member **`cl_mfsk::last_demod_snr_db`** (init `-99.0`, the consumer
+"no measurement" sentinel; clamped to [-30, +60] dB, `-99.0` if the codeword carried no
+symbol). The peak bin holds (signal + noise); subtracting one noise bin's energy
+de-biases the signal estimate (Proakis 5th ed §4.5.4, noncoherent orthogonal FSK —
+the same model `demod`'s LSE metric already assumes). The telecom site reads
+`receive_stats.SNR = mfsk.last_demod_snr_db;` instead of `0.0`. `demod()` runs at
+`telecom_system.cc:2760` (demodulation), BEFORE the SNR site, so the value is fresh.
+
+**Files**: `include/physical_layer/mfsk.h` (member + doc), `source/physical_layer/mfsk.cc`
+(ctor init + accumulator + post-loop SNR), `source/physical_layer/telecom_system.cc`
+(read the member at the MFSK-decode SNR site).
+
+### §9.3 §5 cross-layer audit — this is a NEW PRODUCER VALUE, not a new site
+
+The fix does NOT add a producer of `measurements.SNR_uplink`; it corrects the VALUE the
+canonical producer (§1.2, `arq_common.cc:12757`, `= received_message_stats.SNR`)
+receives when the decoded frame was MFSK. Walk the consumers (§2):
+
+- **§1.2 canonical producer** (all roles): now writes a REAL MFSK SNR instead of 0.0 on
+  every MFSK decode. This is the intended correction.
+- **§1.3 RESPONDER TEST_CONNECTION decode** / **§2.5 CMD TEST_CONNECTION pack**: the
+  connect-plane SNR is now real — the TRACK-A goal.
+- **§2.1 SUPERSHIFT elevator** (the §8.3 hazard): a real MFSK SNR at a ROBUST anchor
+  CANNOT reopen the §15 over-climb — `high_confidence_jump` is gated on
+  `is_ofdm_config(anchor)` (`arq.h:842-844`), which is FALSE at ROBUST **regardless of
+  the SNR value**. §8.3 proved exactly this (JJ1: a high suffix at a ROBUST_2 anchor
+  still clamps to +1). The estimator only fires on MFSK frames; at OFDM configs the
+  real `ofdm.measure_SNR` path (LS/ZF) runs as before — UNCHANGED. So the four high-SNR
+  bounds (`is_ofdm_config(anchor)`, `RETRIGGER_MAX_LEAP`, `supershift_proven_ceiling`,
+  the §16 ROOT-2 clamp) all remain.
+- All other consumers (§2.2-§2.8): improve (real value beats sentinel) or are
+  RSP/telemetry/dead-branch → no harmful change. NO threshold/margin touched
+  (CLAUDE.md §2).
+
+**Production vs sim**: the fix changes production AND sim identically — both had the
+same `0.0` gap. It is NOT "sim-path only"; it is the genuine missing estimator. The sim
+now populates a real connect-plane SNR because the modem now MEASURES one.
+
+### §9.4 Regression test (paired)
+
+`--test` → `test_mfsk_demod_snr_estimate()` (`mfsk_ctrl_codec_tests.cc`) drives
+`cl_mfsk::demod` directly with frequency-domain codewords at controlled injected SNR
+(one signal tone per symbol/stream + complex AWGN in every band bin) and asserts:
+(a) `last_demod_snr_db` is at the `-99.0` sentinel before any `demod()`;
+(b) a clean (inj 18 dB) codeword reads > 12 dB;
+(c) a degraded (inj 3 dB) codeword reads strictly LOWER (monotone in channel SNR);
+(d) both track the injected SNR within ±4 dB.
+**FAIL-BEFORE**: all four fail against the constant `0.0` (0.0 is not > 12, has no
+ordering, and is 18/3 dB off the injected values). VERIFIED PASS in `--test`
+(full suite 0 FAILs) on 2026-06-27.
+
+### §9.5 Related
+- §8.1 (the root-cause naming), §8.3 (the anchor-gated over-climb proof this fix relies
+  on for safety), §1.2 (the canonical producer whose VALUE this corrects).
