@@ -1545,38 +1545,36 @@ void cl_arq_controller::process_messages_rx_data_control()
 							effective_batch = hdr_expected;
 					}
 
-					if(batch_rx_frame_count >= effective_batch)
-					{
-						// All expected frames decoded -- ACK immediately.
-						rx_timeout = ptt_on_delay_ms;
-					}
-					else if(sack_enabled && last_received_end_of_batch_seq >= 0)
-					{
-						// Fix B (SACK turnaround, SACK_TURNAROUND_FIX_PLAN.md §8.3):
-						// EOB-frame fast path. The commander marks its LAST DATA
-						// frame with bit 7 of sequence_number; decoding it sets
-						// last_received_end_of_batch_seq >= 0. That is POSITIVE
-						// PROOF the commander has finished transmitting this batch
-						// -- so RSP must NOT wait out the full remaining-batch
-						// estimate before SACKing. Use a short turnaround
-						// (ptt_on + ptt_off, ~300 ms) so the receiving timer
-						// expires just after the EOB frame and RSP SACKs the gaps
-						// immediately. send_sack_v2_frame()'s own TX path supplies
-						// the precise CMD-drain margin. Only correct paired with Fix A:
-						// if the EOB frame itself is lost this branch never runs
-						// and Fix A's per-frame rx_timeout is the fallback.
-						rx_timeout = ptt_on_delay_ms + ptt_off_delay_ms;
-					}
-					else
-					{
-						// More frames expected.  Add one msg_time margin for
-						// FAIL recovery (false peaks in old frame body).
-						int remaining = effective_batch - messages_rx_buffer.sequence_number - 1;
-						if(remaining < 0) remaining = 0;
-						rx_timeout = remaining * message_transmission_time_ms
-							+ time_left_to_send_last_frame + ptt_on_delay_ms
-							+ message_transmission_time_ms;
-					}
+					// EOB-FAST-PATH COLLISION FIX (data-flow-robust-ofdm-adopt-flush.md §22).
+					// The complete-batch / incomplete-batch decision is now a SINGLE pure
+					// helper (rsp_incomplete_batch_rx_timeout_ms) so production and the
+					// directed test (--test-rsp-eobfast) drive the EXACT same arithmetic.
+					//
+					// PRE-FIX this was: complete -> ptt_on (fast); EOB-seen-incomplete ->
+					// ptt_on+ptt_off (~300 ms "fast path", Fix B §8.3); else -> seq-anchored
+					// remaining. The EOB-fast branch fired whenever the EOB-marked frame
+					// decoded EVEN with interior/lead frames still missing — and under the
+					// mixbatch re-air loop (CMD interleaves the partial batch's retx with the
+					// next new batch in ONE forward TX) that 300 ms turnaround keyed the RSP
+					// up to SACK WHILE the CMD was still transmitting forward frames -> the
+					// re-aired lead frames are never captured -> self-reinforcing partial
+					// wedge -> block_success never 100% -> cfg0 climb never fires (fleet
+					// arq_inbandR1.log: RSP TX-MFSK-ACK-SACK at T+148.0 inside the CMD bsi=6
+					// TX window T+144.5..152.5). The seq-anchored `else` ALSO under-waited
+					// (remaining anchored to the EOB = highest seq -> 0 -> ~1 frame-time).
+					//
+					// The helper: an INCOMPLETE batch (n_miss>0, holes the CMD WILL re-air)
+					// waits n_miss*msg_time + one msg_time margin so the per-frame re-arm
+					// (Fix A, below) only expires after the channel has gone IDLE for ~the
+					// re-air duration — out of the collision window. A COMPLETE batch keeps
+					// the ptt_on fast ACK (unchanged). Legacy/clean batches are complete ->
+					// byte-identical fast path; this only changes the partial-batch WHEN.
+					rx_timeout = rsp_incomplete_batch_rx_timeout_ms(
+						effective_batch, batch_rx_frame_count,
+						messages_rx_buffer.sequence_number,
+						(sack_enabled && last_received_end_of_batch_seq >= 0),
+						message_transmission_time_ms, ptt_on_delay_ms, ptt_off_delay_ms,
+						time_left_to_send_last_frame);
 				}
 				// Fix A (SACK turnaround, SACK_TURNAROUND_FIX_PLAN.md §8.2):
 				// re-arm the receiving timer on EVERY decoded DATA frame with the
@@ -10939,6 +10937,116 @@ int cl_arq_controller::test_spec_sack()
 		"flood gated by near-completeness)\n", FRAME_K);
 	fflush(stdout);
 	return 0;
+}
+
+// ============================================================================
+// RSP EOB-FAST-PATH HALF-DUPLEX COLLISION fix — directed regression (test-only)
+// data-flow-robust-ofdm-adopt-flush.md §22.
+// ============================================================================
+//
+// Drives the REAL pure helper rsp_incomplete_batch_rx_timeout_ms (the EXACT per-frame
+// re-arm decision the production timer block makes, arq_responder.cc) with the EXACT
+// wedge state captured on the fleet (real-audio R1 arq_inbandR1.log, cfg0 epoch):
+//   effective_batch = 6, batch_rx_frame_count = 2 (only the MIDDLE frames 2,3 landed;
+//   the re-aired LEAD frames 0,1 and the tail 4,5 are still missing), the EOB frame
+//   was decoded (last_received_end_of_batch_seq >= 0), msg_time = 1266 ms.
+//
+// PRE-FIX (MERCURY_RSP_EOBFAST_FAILBEFORE): EOB-seen-incomplete -> rx_timeout =
+// ptt_on+ptt_off (~300 ms). The RSP keys up to SACK ~300 ms after the last decoded
+// frame -> collides with the CMD's still-active mixbatch forward TX -> the re-aired
+// lead frames are never captured -> self-reinforcing partial wedge -> no cfg0 climb.
+//
+// PASS-AFTER: the incomplete-batch re-arm is sized by the MISSING-frame count
+// (n_miss * msg_time + msg_time margin + time_left + ptt_on), so the per-frame re-arm
+// only expires after the channel has been IDLE long enough for the CMD's forward TX
+// to drain — out of the collision window. ASSERTS:
+//   1. INCOMPLETE wedge: pre-fix == 300 ms (collision); post-fix >> 300 ms and equals
+//      the exact n_miss formula; post-fix covers >= 2 forward frame-times (a clean
+//      separation from the bug, so the RSP cannot key up mid-CMD-batch).
+//   2. COMPLETE batch (n_miss <= 0): both arms return ptt_on (the fast ACK preserved).
+//   3. NON-SACK in-order incomplete (received contiguous 0..last_seq, eob not seen):
+//      post-fix == the legacy seq-anchored remaining EXACTLY (n_miss == remaining) —
+//      proving the --enable-sack-OFF path stays byte-identical.
+//
+// PURE state-machine: no telecom_system, no audio, no IONOS. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_rsp_eobfast_collision()
+{
+#ifdef MERCURY_RSP_EOBFAST_FAILBEFORE
+	const bool failbefore = true;
+#else
+	const bool failbefore = false;
+#endif
+	printf("[TEST-RSP-EOBFAST] start (failbefore=%d)\n", failbefore ? 1 : 0);
+	fflush(stdout);
+
+	int failed = 0;
+
+	// Channel geometry (cfg0, from the fleet log).
+	const int msg_time = 1266;   // cfg0 message_transmission_time_ms
+	const int ptt_on   = 100;
+	const int ptt_off  = 200;
+	const int time_left = 0;
+
+	// --- CASE 1: the cfg0 wedge — interior+lead holes, EOB decoded ----------
+	// effective_batch=6, only frames {2,3} received (n_miss=4), last decoded seq=3
+	// (or the EOB seq 5 — the helper ignores last_seq when incomplete), eob_seen=true.
+	{
+		const int eff = 6, rx = 2, last_seq = 5;  // EOB (seq 5) was the last decoded
+		int t = rsp_incomplete_batch_rx_timeout_ms(
+			eff, rx, last_seq, /*eob_seen=*/true, msg_time, ptt_on, ptt_off, time_left);
+		int n_miss = eff - rx;                                   // 4
+		int expect_fix  = n_miss * msg_time + msg_time + time_left + ptt_on;  // 6430
+		int expect_fb   = ptt_on + ptt_off;                     // 300 (the bug)
+		printf("[TEST-RSP-EOBFAST] CASE1 wedge eff=%d rx=%d eob=1 -> t=%d (fix_expect=%d fb_expect=%d)\n",
+			eff, rx, t, expect_fix, expect_fb);
+		fflush(stdout);
+		if(failbefore)
+		{
+			if(t != expect_fb) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: failbefore t=%d != %d\n", t, expect_fb); failed++; }
+		}
+		else
+		{
+			if(t != expect_fix) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: fix t=%d != %d\n", t, expect_fix); failed++; }
+			// Collision guard: the post-fix wait MUST exceed the pre-fix 300 ms AND
+			// cover >= 2 forward frame-times so the RSP cannot key up mid-CMD-batch.
+			if(t <= ptt_on + ptt_off) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: fix t=%d <= 300ms (still collides)\n", t); failed++; }
+			if(t < 2 * msg_time) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: fix t=%d < 2 frame-times (%d)\n", t, 2*msg_time); failed++; }
+		}
+	}
+
+	// --- CASE 2: COMPLETE batch -> fast ACK in BOTH arms (preserved) --------
+	{
+		const int eff = 6, rx = 6, last_seq = 5;
+		int t = rsp_incomplete_batch_rx_timeout_ms(
+			eff, rx, last_seq, /*eob_seen=*/true, msg_time, ptt_on, ptt_off, time_left);
+		printf("[TEST-RSP-EOBFAST] CASE2 complete eff=%d rx=%d -> t=%d (expect ptt_on=%d)\n",
+			eff, rx, t, ptt_on);
+		fflush(stdout);
+		if(t != ptt_on) { printf("[TEST-RSP-EOBFAST] CASE2 FAIL: complete t=%d != ptt_on %d\n", t, ptt_on); failed++; }
+	}
+
+	// --- CASE 3: NON-SACK in-order incomplete -> byte-identical to legacy ----
+	// In the non-SACK path frames arrive in order, so received == contiguous
+	// 0..last_seq and n_miss == legacy `remaining` = eff - last_seq - 1. eob_seen
+	// is false (no SACK). The post-fix value must EQUAL the legacy formula.
+	{
+		const int eff = 6, last_seq = 3, rx = last_seq + 1;   // received 0..3 in order
+		int t = rsp_incomplete_batch_rx_timeout_ms(
+			eff, rx, last_seq, /*eob_seen=*/false, msg_time, ptt_on, ptt_off, time_left);
+		int legacy_remaining = eff - last_seq - 1;             // 2
+		int legacy_t = legacy_remaining * msg_time + time_left + ptt_on + msg_time;
+		printf("[TEST-RSP-EOBFAST] CASE3 inorder eff=%d rx=%d last=%d -> t=%d (legacy=%d)\n",
+			eff, rx, last_seq, t, legacy_t);
+		fflush(stdout);
+		// Both the fix and the failbefore arm reduce to the legacy formula here
+		// (eob_seen=false -> failbefore takes its seq-anchored branch too).
+		if(t != legacy_t) { printf("[TEST-RSP-EOBFAST] CASE3 FAIL: t=%d != legacy %d (non-SACK NOT byte-identical)\n", t, legacy_t); failed++; }
+	}
+
+	printf("[TEST-RSP-EOBFAST] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return (failed == 0) ? 0 : 1;
 }
 
 // ============================================================================

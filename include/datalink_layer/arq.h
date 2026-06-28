@@ -3716,6 +3716,33 @@ public:
   // leaves retransmit_count==0 → this is false → the climb fires promptly (2801d7c forward-climb
   // preserved). Flag-off / legacy → false (byte-identical). Replayed by --test-inband-frame0-partial.
   bool inband_climb_hole_outstanding();
+  // RSP per-frame receive-timer re-arm for an INCOMPLETE batch (the half-duplex
+  // collision fix, data-flow-robust-ofdm-adopt-flush.md §22). PURE helper (no I/O,
+  // no member reads beyond the args). Replaces the EOB-frame "fast path"
+  // (rx_timeout = ptt_on+ptt_off ≈ 300 ms) that fired whenever the EOB-marked frame
+  // decoded — EVEN with interior/lead frames still missing. Under the mixbatch
+  // re-air loop (the CMD interleaves retx of the partial batch with the next new
+  // batch in ONE forward TX) that fast turnaround keyed the RSP up to SACK WHILE the
+  // CMD was still transmitting forward frames → half-duplex collision → the re-aired
+  // lead frames are never captured → self-reinforcing partial wedge → block_success
+  // never reaches 100% → the climb never fires (cfg0 stalls). The corrected rule:
+  // an incomplete batch (holes the CMD WILL re-air) must keep the RSP LISTENING long
+  // enough for the CMD's forward TX to drain — size the re-arm by the MISSING-frame
+  // count (n_miss * msg_time + one msg_time margin), NOT by the EOB flag or the
+  // last-received seq position. Each newly-decoded frame re-arms this, so the timer
+  // only expires once the channel has been genuinely IDLE for ~the re-air duration —
+  // the structurally-correct idle timer (Fix A) extended to cover re-air, matching
+  // legacy (whose clean batches hit the complete-batch fast path and never collide).
+  // n_miss = effective_batch - batch_rx_frame_count. complete (n_miss<=0) -> ptt_on
+  // (unchanged fast ACK). FAIL-BEFORE (MERCURY_RSP_EOBFAST_FAILBEFORE=1) restores the
+  // pre-fix EOB-fast 300 ms path so the directed test measures the load-bearing change.
+  int rsp_incomplete_batch_rx_timeout_ms(int effective_batch, int batch_rx_frame_count,
+                                         int last_received_seq, bool eob_seen,
+                                         int msg_time_ms, int ptt_on_ms, int ptt_off_ms,
+                                         int time_left_ms) const;
+  // Directed regression for rsp_incomplete_batch_rx_timeout_ms (the EOB-fast-path
+  // half-duplex collision fix). In-process, no PHY/audio. CLI --test-rsp-eobfast.
+  int test_rsp_eobfast_collision();
   // D1 implicit-confirm consumer: a returning SACK acked bsi `rx_bsi`. If the re-tag is
   // armed and rx_bsi is at-or-after inband_announce_bsi (mod-256 forward distance), the
   // announced config is CONFIRMED FOLLOWED: DISARM the re-tag, record

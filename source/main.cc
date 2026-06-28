@@ -1127,6 +1127,20 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_cd;
                 failed += test_cd.test_inband_climb_defer_on_retx();
             }
+            // RSP EOB-FAST-PATH HALF-DUPLEX COLLISION regression
+            // (data-flow-robust-ofdm-adopt-flush.md §22): once a cfg0 batch goes partial the
+            // CMD re-airs the missing frames mixed with the next new batch in ONE forward TX;
+            // pre-fix, decoding the OLD batch's EOB frame among that re-air armed a ~300 ms
+            // "fast path" so the RSP keyed up to SACK WHILE the CMD was still transmitting ->
+            // half-duplex collision -> the re-aired lead frames are never captured ->
+            // self-reinforcing partial wedge -> block_success never 100% -> cfg0 climb never
+            // fires. The fix sizes the incomplete-batch re-arm by the missing-frame count so
+            // the RSP listens through the CMD's forward-TX drain before turning around. PURE
+            // in-process — permanent regression gate. Fails-before: -DMERCURY_RSP_EOBFAST_FAILBEFORE.
+            {
+                cl_arq_controller test_eob;
+                failed += test_eob.test_rsp_eobfast_collision();
+            }
             // IN-BAND +1 CLIMB regression (data-flow-inband-frame0-rolling-partial.md §7.2
             // option A): under MERCURY_INBAND_RATE the FRAME-UP climb must step EXACTLY +1
             // (suppress the SNR elevator that jumped CONFIG_0->3 and stranded the reverse
@@ -1300,6 +1314,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-climb-defer") == 0) {
             cl_arq_controller ARQ_cd;
             int failed = ARQ_cd.test_inband_climb_defer_on_retx();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-rsp-eobfast : run ONLY the RSP EOB-fast-path half-duplex collision regression
+        // (data-flow-robust-ofdm-adopt-flush.md §22 — the cfg0 climb-killer: the EOB-fast 300 ms
+        // turnaround on an interior-hole partial collides with the CMD's mixbatch re-air -> wedge).
+        // Drives the REAL pure helper rsp_incomplete_batch_rx_timeout_ms. Build with
+        // -DMERCURY_RSP_EOBFAST_FAILBEFORE to reproduce the fails-before (the 300 ms collision).
+        if (strcmp(argv[i], "--test-rsp-eobfast") == 0) {
+            cl_arq_controller ARQ_eob;
+            int failed = ARQ_eob.test_rsp_eobfast_collision();
             return (failed == 0) ? 0 : 1;
         }
         // --test-climb-bsi-rollback : run ONLY the climb-UP cmd_batch_seq_id rollback regression

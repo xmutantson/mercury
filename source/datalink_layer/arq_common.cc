@@ -3498,6 +3498,67 @@ bool cl_arq_controller::inband_climb_hole_outstanding()
 #endif
 }
 
+// RSP per-frame receive-timer re-arm for an INCOMPLETE batch — the half-duplex
+// EOB-fast-path COLLISION fix (data-flow-robust-ofdm-adopt-flush.md §22). PURE
+// helper: production (arq_responder.cc per-frame timer block) AND the directed test
+// (test_rsp_eobfast_collision) call THIS, so the test drives the exact decision.
+//
+// ROOT (VERIFIED, fleet real-audio R1 arq_inbandR1.log, cfg0 epoch): once a cfg0
+// batch goes partial (frame-0 lost at the robust→OFDM cross acquisition seam), the
+// CMD re-airs the missing frames MIXED with the next new batch in ONE forward TX
+// (CMD-V2-MIXBATCH: "2 retx bsi=N + 4 new bsi=N+1"). The RSP decodes the EOB-marked
+// frame of the OLD batch among that re-air, which set last_received_end_of_batch_seq
+// >= 0, so the pre-fix EOB-"fast path" armed rx_timeout = ptt_on+ptt_off (~300 ms)
+// and the RSP keyed up to SACK ~300 ms later — WHILE the CMD was still transmitting
+// the new frames (RSP TX-MFSK-ACK-SACK Audio start at T+148.0 sits INSIDE the CMD's
+// bsi=6 TX window T+144.5..152.5). Half-duplex: the RSP cannot capture forward
+// frames while it transmits its ACK, so frames 0,1 (start) and 4,5 (end) are missed
+// every batch → bitmap degrades 0x3e→0x1c→0x0c (n_miss 1→3→4), block_success stays
+// 0%, the climb never fires. Legacy never hits this: its cfg0 batches arrive COMPLETE
+// (no re-air), so it takes the complete-batch fast path and its whole-batch COMPACT
+// confirm lands AFTER capture, never overlapping forward TX.
+//
+// FIX: an incomplete batch (n_miss > 0 — holes the CMD WILL re-air) must keep the
+// RSP LISTENING long enough for the CMD's forward TX to DRAIN before it turns around.
+// Size the re-arm by the MISSING-frame count, not the EOB flag nor the last-received
+// seq position: t = n_miss*msg_time + msg_time (margin) + time_left + ptt_on. Each
+// newly-decoded frame re-arms (Fix A), so the timer expires only after the channel
+// has been genuinely IDLE ~the re-air duration — i.e. the CMD has stopped TXing. A
+// COMPLETE batch (n_miss <= 0) keeps the existing fast ACK (ptt_on). This subsumes
+// BOTH pre-fix incomplete branches (EOB-fast 300 ms AND the seq-anchored remaining),
+// each of which under-waited when the EOB/last frame was the highest seq but interior
+// holes remained. NO new wire frame, NO new session state; the SACK/retx machinery is
+// byte-unchanged — only the WHEN of the turnaround moves out of the collision window.
+int cl_arq_controller::rsp_incomplete_batch_rx_timeout_ms(
+	int effective_batch, int batch_rx_frame_count, int last_received_seq, bool eob_seen,
+	int msg_time_ms, int ptt_on_ms, int ptt_off_ms, int time_left_ms) const
+{
+#ifdef MERCURY_RSP_EOBFAST_FAILBEFORE
+	// FAIL-BEFORE arm: restore the pre-fix EOB-"fast path" (~300 ms) on an incomplete
+	// batch whose EOB frame decoded, and the seq-anchored remaining otherwise. The
+	// directed test's pass-after assert (the RSP waits past the CMD's forward-TX drain,
+	// NOT 300 ms) then FAILS, proving the re-air-sized wait is load-bearing.
+	int n_miss_fb = effective_batch - batch_rx_frame_count;
+	if(n_miss_fb <= 0) return ptt_on_ms;                  // complete -> fast (unchanged)
+	if(eob_seen) return ptt_on_ms + ptt_off_ms;           // pre-fix EOB-fast 300 ms (the bug)
+	int remaining_fb = effective_batch - last_received_seq - 1;
+	if(remaining_fb < 0) remaining_fb = 0;
+	return remaining_fb * msg_time_ms + time_left_ms + ptt_on_ms + msg_time_ms;
+#else
+	(void)last_received_seq;
+	(void)eob_seen;
+	(void)ptt_off_ms;
+	int n_miss = effective_batch - batch_rx_frame_count;
+	if(n_miss <= 0)
+		return ptt_on_ms;   // COMPLETE batch: fast ACK (the existing complete path)
+	// INCOMPLETE: wait the time the CMD needs to RE-AIR the missing frames, anchored to
+	// n_miss (not the EOB flag / last-seq). Each decoded frame re-arms this, so the timer
+	// fires only after the channel has gone IDLE for ~the re-air window -> no collision.
+	if(n_miss > effective_batch) n_miss = effective_batch;   // defensive clamp
+	return n_miss * msg_time_ms + msg_time_ms + time_left_ms + ptt_on_ms;
+#endif
+}
+
 // Resolve+cache the R floor (the give-up-and-escalate count). MERCURY_INBAND_RETAG_MIN,
 // default 3, clamped to >=1 (design §1.2). A confirm STOPS the re-tag early regardless
 // of R (design §1.7 ruling: confirm dominates; R is only the no-confirm escalation gate).
