@@ -858,6 +858,18 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_f0p;
                 failed += test_f0p.test_inband_frame0_partial();
             }
+            // IN-BAND RECOVERY-CLOSED-PARTIAL climb-unblock regression
+            // (data-flow-inband-recovery-promote.md): the SIGNATURE-INDEPENDENT FRAME-UP net — a
+            // BOUNDED-LOSS partial (n_miss <= batch/2) that retransmit-CLOSES to whole, REPEATED for
+            // K=2 batches, advances the climb streak EVEN when the lost-frame bitmap VARIES batch to
+            // batch (the cfg0 seam the structural fingerprint can not cover). A non-closing marginal
+            // batch (loss > batch/2, or never closes) does NOT promote and resets the streak. PURE
+            // in-process synthetic-fire — permanent regression gate.
+            // Fails-before: -DINBAND_RECOVERY_PROMOTE_FAILBEFORE.
+            {
+                cl_arq_controller test_rcp;
+                failed += test_rcp.test_inband_recovery_promote();
+            }
             // IN-BAND ROLLING-PARTIAL climb DEFER-WHILE-HOLE-OUTSTANDING regression
             // (data-flow-inband-frame0-rolling-partial.md §10): the 2801d7c sibling — the
             // lead-frame-only partial enqueues frame-0 for retx (retransmit_count > 0), and the
@@ -1020,6 +1032,17 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-frame0-partial") == 0) {
             cl_arq_controller ARQ_f0p;
             int failed = ARQ_f0p.test_inband_frame0_partial();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-recovery-promote : run ONLY the RECOVERY-CLOSED-PARTIAL climb-unblock
+        // regression (a BOUNDED-LOSS partial that retransmit-CLOSES to whole, repeated K batches,
+        // advances the FRAME-UP climb streak EVEN with a VARYING loss bitmap; a non-closing marginal
+        // batch stays vetoed and resets the streak) and exit. Fast + deterministic; see
+        // arq_commander.cc::test_inband_recovery_promote + data-flow-inband-recovery-promote.md.
+        // Build with -DINBAND_RECOVERY_PROMOTE_FAILBEFORE to reproduce the fails-before (the wedge).
+        if (strcmp(argv[i], "--test-inband-recovery-promote") == 0) {
+            cl_arq_controller ARQ_rcp;
+            int failed = ARQ_rcp.test_inband_recovery_promote();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-climb-defer : run ONLY the ROLLING-PARTIAL climb DEFER-WHILE-HOLE-OUTSTANDING

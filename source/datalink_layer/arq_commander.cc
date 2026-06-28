@@ -4220,6 +4220,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										// so a STRUCTURAL multi-drop unblocks the climb while a noise rung
 										// (varying losses) stays vetoed. Mask off any bits above the batch.
 										inband_update_structural_acq_fingerprint(rx_bitmap & all_ones, n_miss);
+										// RECOVERY-CLOSED-PARTIAL unblock (data-flow-inband-recovery-promote.md
+										// §3): note whether THIS partial's loss is BOUNDED (<= half the batch).
+										// SIGNATURE-INDEPENDENT — reads ONLY n_miss. Mirrors the OFDM SACK_RSP
+										// site so BOTH transports feed the recovery-close streak.
+										inband_recovery_note_partial(n_miss, data_batch_size);
 									}
 									// STAGE 4d (D1 CONFIRM): a PARTIAL SACK still PROVES the RX demodulated the
 									// batch at the announced config (it decoded SOME frames of it), so a PARTIAL
@@ -4574,6 +4579,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						structural_acq_partial_streak = 0;
 						last_structural_acq_bitmap = 0;
 					}
+					// RECOVERY-CLOSED-PARTIAL unblock (data-flow-inband-recovery-promote.md §3): note
+					// whether THIS partial's first-pass loss is BOUNDED (<= half the batch). A bounded
+					// partial arms the recovery-pending flag (the retx-close will credit the streak);
+					// an unbounded partial resets the streak (marginal rung). SIGNATURE-INDEPENDENT —
+					// it reads ONLY n_miss, never the bitmap, so the varying cfg0 seam still builds it.
+					inband_recovery_note_partial(n_miss, data_batch_size);
 				}
 				last_batch_fully_acked = false;
 				stats.nBatches_acked++;
@@ -4716,6 +4727,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				last_batch_fully_acked = true;
 				last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch is not a lead-only partial
 				structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;  // FIX B: clean batch breaks the structural acq-seam streak
+				// RECOVERY-CLOSED-PARTIAL unblock (data-flow-inband-recovery-promote.md §3): this whole
+				// batch closed; if a bounded recovery partial was pending it was CLOSED via retx ->
+				// credit the recovery-close streak. A clean batch with no pending partial is a no-op.
+				inband_recovery_note_close();
 				stats.nBatches_acked++;
 				stats.nBatches_fully_acked++;
 				last_transmission_block_stats.nBatches_acked++;
@@ -4820,6 +4835,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					last_batch_fully_acked = true;
 					last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch
 					structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;  // FIX B: clean batch breaks the structural acq-seam streak
+					inband_recovery_note_close();  // RECOVERY-CLOSED-PARTIAL: credit a pending bounded recovery close
 					stats.nBatches_acked++;
 					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
@@ -4847,6 +4863,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					last_batch_fully_acked = true;
 					last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch
 					structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;  // FIX B: clean batch breaks the structural acq-seam streak
+					inband_recovery_note_close();  // RECOVERY-CLOSED-PARTIAL: credit a pending bounded recovery close
 					stats.nBatches_acked++;
 					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
@@ -6084,7 +6101,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// 6/6. The +1 anchor clamp + the DEFER-WHILE-HOLE-OUTSTANDING guard below still bound it, and
 		// the overshoot net (inband_retag_escalate_if_climb_exhausted) recovers a too-eager climb.
 		bool inband_structural_acq = inband_structural_acq_partial();
-		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial || inband_structural_acq)
+		// RECOVERY-CLOSED-PARTIAL unblock (data-flow-inband-recovery-promote.md §2): admit a cfg0/rung
+		// batch whose BOUNDED first-pass loss (<= half the batch) retransmit-CLOSED to whole, REPEATED
+		// for K=2 batches, to the optimistic FRAME-UP path. This is the SIGNATURE-INDEPENDENT net the
+		// other two predicates miss: inband_lead_frame_only_partial vetoes any n_miss>2 loss, and
+		// inband_structural_acq_partial vetoes a VARYING bitmap (its updater re-seeds to 1 on any
+		// different masked bitmap). The observed cfg0 seam loses a DIFFERENT bounded set each batch yet
+		// the retx CLOSES each one -> a viable rung the strict gate wedges at 0. Keying on the CLOSE
+		// (not the bitmap) survives the varying loss. The marginal-rung exclusion is preserved: an
+		// UNBOUNDED partial (loss > half the batch) or a batch that never closes resets the streak in
+		// inband_recovery_note_partial -> it stays vetoed (§9 anti-thrash). The predicate fires AT the
+		// close (hole-cleared), so the DEFER-WHILE-HOLE guard below is naturally satisfied. Flag-off /
+		// non-OFDM -> false (byte-identical: this OR-term is always false off-flag).
+		bool inband_recovery_closed = inband_recovery_closed_partial();
+		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial || inband_structural_acq
+			|| inband_recovery_closed)
 			? (data_ack_received==YES)
 			: promotion_allowed_on_batch(last_batch_fully_acked);
 		if(data_ack_received==YES && batch_promotable &&
@@ -9880,6 +9911,170 @@ int cl_arq_controller::test_inband_frame0_partial()
 	structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;
 
 	printf("[TEST-FRAME0-PARTIAL] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// IN-BAND RECOVERY-CLOSED-PARTIAL climb-unblock regression (CLI --test-inband-recovery-promote;
+// data-flow-inband-recovery-promote.md). The SIGNATURE-INDEPENDENT net the other two FRAME-UP
+// predicates miss: inband_lead_frame_only_partial() vetoes any n_miss>2 loss, and
+// inband_structural_acq_partial() vetoes a VARYING bitmap (its fingerprint updater re-seeds to 1 on
+// any different masked bitmap). The observed cfg0 acq seam loses a DIFFERENT bounded set each batch
+// yet the retx CLOSES each one — a VIABLE rung the strict clean-batch gate wedges at streak 0. This
+// predicate keys on the CLOSE (bounded first-pass loss that retransmit-CLOSES to whole), NOT on the
+// bitmap, so it survives the varying loss; a REPEAT of K=2 closes anti-thrash-gates it. The
+// marginal-rung exclusion is preserved: an UNBOUNDED partial (loss > half the batch) or a batch that
+// never closes does NOT promote and RESETS the streak.
+//
+// This drives the EXACT production producer→consumer chain: inband_recovery_note_partial(n_miss,
+// batch) at the partial sites, inband_recovery_note_close() at the clean/full-ACK close, and the
+// FRAME-UP gate's inband_recovery_closed_partial() OR-term. Fails-before:
+// -DINBAND_RECOVERY_PROMOTE_FAILBEFORE pins the predicate false -> the close-after-K asserts FAIL
+// (the wedge reproduced). Returns 0 pass / 1 fail. Default builds never call this.
+int cl_arq_controller::test_inband_recovery_promote()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-RECOVERY-PROMOTE] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-RECOVERY-PROMOTE] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// Force the in-band feature ON (the predicate is feature-gated).
+	const char* prev = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev ? prev : "";
+	bool had_prev = (prev != NULL);
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	inband_rate_enabled = -1;
+
+	robust_enabled = YES;
+	narrowband_enabled = NO;
+	data_batch_size = 6;          // batch/2 == 3 -> bounded = 1..3 missing
+	inband_retag_armed = false;   // CONFIG_0 tier-cross leaves the re-tag disarmed (recovery path)
+
+	// reset all recovery + sibling-predicate state so each scenario starts clean.
+	auto reset_all = [&]() {
+		recovery_partial_pending = false;
+		recovery_close_streak = 0;
+		last_partial_lead_frame_only = false;
+		structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;
+	};
+
+	// Drive a PARTIAL exactly as the production partial sites do (compute n_miss from a bitmap,
+	// call the producer), then read the FRAME-UP gate's recovery OR-term. `bitmap` lets each batch
+	// carry a DIFFERENT loss to prove signature-independence; n_miss is what the producer reads.
+	auto note_partial = [&](int cfg, uint32_t bitmap) {
+		current_configuration = cfg;
+		last_batch_fully_acked = false;
+		uint32_t all_ones = (1u << data_batch_size) - 1u;
+		uint32_t masked = bitmap & all_ones;
+		int n_miss = data_batch_size - __builtin_popcount(masked);
+		inband_recovery_note_partial(n_miss, data_batch_size);
+	};
+	// Drive a CLOSE (the batch went whole via retx) exactly as the production clean/full-ACK sites do.
+	auto note_close = [&](int cfg) {
+		current_configuration = cfg;
+		last_batch_fully_acked = true;
+		inband_recovery_note_close();
+	};
+	// Read the EXACT production FRAME-UP recovery OR-term at the live config.
+	auto promotable = [&](int cfg) -> bool {
+		current_configuration = cfg;
+		bool inband_recovery_closed = inband_recovery_closed_partial();
+		// the other two OR-terms are independent and false in these scenarios (we never set their
+		// state); promotion via the recovery net is what we assert.
+		bool batch_promotable = inband_recovery_closed
+			? true /* data_ack_received==YES on any delivery */
+			: promotion_allowed_on_batch(last_batch_fully_acked);
+		return batch_promotable && inband_recovery_closed;  // isolate the recovery contribution
+	};
+
+	// ---- A: VARYING-loss bounded partials that CLOSE, repeated K batches at CONFIG_0 -> PROMOTABLE.
+	// Each batch loses a DIFFERENT bounded set (0x3e=1 miss, 0x1e=2 miss, 0x0e=3 miss — all <= 3 =
+	// batch/2) yet each retx-CLOSES. The structural fingerprint would re-seed to 1 on each different
+	// bitmap; the recovery net survives because it keys on the CLOSE. After K closes -> promotable. ----
+	reset_all();
+	note_partial(CONFIG_0, 0x3eu); note_close(CONFIG_0);          // close #1: streak=1
+	bool a1 = promotable(CONFIG_0);                               // streak=1 < K -> NOT yet
+	note_partial(CONFIG_0, 0x1eu); note_close(CONFIG_0);          // close #2 (DIFFERENT loss): streak=2
+	bool aK = promotable(CONFIG_0);                               // streak>=K -> promotable
+#ifdef INBAND_RECOVERY_PROMOTE_FAILBEFORE
+	check(aK == false, "A (fail-before) varying-loss bounded closes VETOED (wedge reproduced)", aK ? 1 : 0, 0);
+#else
+	check(a1 == false, "A1 single bounded close (streak=1<K) NOT promotable (anti-thrash)", a1 ? 1 : 0, 0);
+	check(aK == true,  "A varying-loss bounded closes x K PROMOTABLE (signature-independent climb unblocked)", aK ? 1 : 0, 1);
+#endif
+
+	// ---- B: a NON-CLOSING MARGINAL batch (UNBOUNDED loss > batch/2) does NOT promote AND RESETS the
+	// streak. First build a streak to K, then a single unbounded partial (4 missing of 6) drops it. ----
+	reset_all();
+	note_partial(CONFIG_0, 0x3eu); note_close(CONFIG_0);          // streak=1
+	note_partial(CONFIG_0, 0x1eu); note_close(CONFIG_0);          // streak=2 (would be promotable)
+	note_partial(CONFIG_0, 0x03u);                               // 4 missing (>3=batch/2): UNBOUNDED -> RESET
+	bool b = promotable(CONFIG_0);
+	check(b == false, "B unbounded marginal partial NOT promotable AND resets the streak (§9 anti-thrash)",
+		b ? 1 : 0, 0);
+	check(recovery_close_streak == 0, "B2 unbounded partial dropped the recovery streak to 0",
+		recovery_close_streak, 0);
+
+	// ---- C: a bounded partial that NEVER CLOSES (no note_close — retransmit_count never returns to 0)
+	// does NOT promote. The pending arms but the streak never builds without a close. ----
+	reset_all();
+	note_partial(CONFIG_0, 0x3eu);                               // bounded, pending armed, NO close
+	note_partial(CONFIG_0, 0x1eu);                               // another bounded partial, still NO close
+	bool c = promotable(CONFIG_0);
+	check(c == false, "C bounded partials that never close NOT promotable (no close credit)", c ? 1 : 0, 0);
+
+	// ---- D: an interleaved CLEAN batch (no pending partial) does NOT break a genuine recovery streak.
+	// close #1, then a pure clean batch (note_close with nothing pending = no-op), then close #2 -> K. ----
+	reset_all();
+	note_partial(CONFIG_0, 0x3eu); note_close(CONFIG_0);          // close #1: streak=1
+	note_close(CONFIG_0);                                        // pure clean batch, nothing pending -> no-op
+	note_partial(CONFIG_0, 0x1eu); note_close(CONFIG_0);          // close #2: streak=2
+	bool d = promotable(CONFIG_0);
+	check(d == true, "D interleaved clean batch does not break the recovery streak (reaches K)", d ? 1 : 0, 1);
+
+	// ---- E: recovery closes at a ROBUST rung -> NOT promotable (OFDM-only gate). ----
+	reset_all();
+	note_partial(ROBUST_0, 0x3eu); note_close(ROBUST_0);
+	note_partial(ROBUST_0, 0x1eu); note_close(ROBUST_0);
+	bool e = promotable(ROBUST_0);
+	check(e == false, "E recovery closes at ROBUST rung NOT promotable (OFDM-only)", e ? 1 : 0, 0);
+
+	// ---- F: flag-off byte-identity — feature off, K recovery closes are NOT promotable. ----
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "");
+#else
+	unsetenv("MERCURY_INBAND_RATE");
+#endif
+	inband_rate_enabled = -1;
+	reset_all();
+	note_partial(CONFIG_0, 0x3eu); note_close(CONFIG_0);
+	note_partial(CONFIG_0, 0x1eu); note_close(CONFIG_0);
+	bool f = promotable(CONFIG_0);
+	check(f == false, "F feature-off: recovery closes NOT promotable (legacy byte-identical)", f ? 1 : 0, 0);
+
+	// restore env + cache + members
+	if(had_prev) {
+#ifdef _WIN32
+		_putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+#else
+		setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+#endif
+	}
+	inband_rate_enabled = -1;
+	reset_all();
+
+	printf("[TEST-RECOVERY-PROMOTE] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

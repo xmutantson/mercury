@@ -3515,6 +3515,74 @@ void cl_arq_controller::inband_update_structural_acq_fingerprint(uint32_t masked
 	}
 }
 
+// IN-BAND RECOVERY-CLOSED-PARTIAL climb unblock (data-flow-inband-recovery-promote.md §2). PURE
+// predicate. true iff: the in-band feature is on, the live config is an OFDM-tier config, and the
+// rung has demonstrated a STREAK of >= INBAND_RECOVERY_CLOSE_K consecutive BOUNDED-LOSS partials
+// that retransmit-CLOSED to a whole batch (recovery_close_streak >= K). SIGNATURE-INDEPENDENT: it
+// keys on the CLOSE EVENT, never on the bitmap pattern, so it survives the varying cfg0 seam loss
+// that re-seeds the structural fingerprint to 1 every batch. The marginal-rung exclusion lives in
+// the producer (inband_recovery_note_partial resets the streak when loss exceeds the bound / the
+// batch can not close). Used ONLY to relax the FRAME-UP clean-streak gate. Flag-off / non-OFDM ->
+// false (byte-identical).
+bool cl_arq_controller::inband_recovery_closed_partial()
+{
+#ifdef INBAND_RECOVERY_PROMOTE_FAILBEFORE
+	// FAIL-BEFORE arm: a bounded recovery-closed partial NEVER unblocks the climb (the pre-fix
+	// strict-clean gate). The directed test's pass-after assert (a varying-loss bounded partial
+	// that closes, repeated K times, advances the streak) then FAILS, proving the relaxation is
+	// load-bearing.
+	return false;
+#else
+	if(!inband_rate_feature_enabled())
+		return false;
+	if(!is_ofdm_config(current_configuration))
+		return false;
+	return recovery_close_streak >= INBAND_RECOVERY_CLOSE_K;
+#endif
+}
+
+// Producer-side: a partial SACK arrived (data-flow-inband-recovery-promote.md §3). SIGNATURE-
+// INDEPENDENT — it inspects ONLY the missing-frame COUNT, never which frames. A partial is
+// RECOVERABLE-BOUNDED iff at least one frame missing AND at most half the batch missing
+// (n_miss <= batch_size/2). A bounded partial enqueues the missing frames for retx and so is
+// AWAITING a close -> arm recovery_partial_pending (the close, when it lands, credits the streak in
+// inband_recovery_note_close). An UNBOUNDED partial (loss > half the batch) is a marginal rung that
+// can not be allowed to promote -> RESET the streak + clear pending. A batch_size <= 1 has no
+// bounded-partial concept (a robust 1-frame batch is all-or-nothing) -> treat as not bounded.
+void cl_arq_controller::inband_recovery_note_partial(int n_miss, int batch_size)
+{
+	bool bounded = (batch_size > 1) && (n_miss >= 1) && (n_miss <= batch_size / 2);
+	if(bounded)
+	{
+		// A bounded partial is awaiting its retx-close; do NOT touch the streak yet (the close is
+		// what builds it). Arm pending so the next whole batch credits this recovery.
+		recovery_partial_pending = true;
+	}
+	else
+	{
+		// Unbounded loss (or a degenerate batch): the rung can not reliably close its seam loss ->
+		// it must NOT promote. Drop the streak and clear any pending recovery.
+		recovery_close_streak = 0;
+		recovery_partial_pending = false;
+	}
+}
+
+// Producer-side: a batch went WHOLE (clean / full ACK; data-flow-inband-recovery-promote.md §3).
+// If a BOUNDED recovery partial was pending, the batch CLOSED via retx within the window -> CREDIT
+// the close: ++recovery_close_streak, clear pending. A clean batch with NO pending recovery partial
+// is the ordinary clean path (promotion is already allowed via promotion_allowed_on_batch) and
+// leaves the streak UNTOUCHED -> an interleaved clean batch neither builds nor breaks a genuine
+// recovery streak (the streak is about the rung's ability to CLOSE bounded loss, not about an
+// uninterrupted run of recoveries).
+void cl_arq_controller::inband_recovery_note_close()
+{
+	if(recovery_partial_pending)
+	{
+		recovery_close_streak++;
+		recovery_partial_pending = false;
+	}
+}
+
 // IN-BAND ROLLING-PARTIAL climb DEFER-while-hole-outstanding
 // (fact-documents/data-flow-inband-frame0-rolling-partial.md §10). PURE predicate. See the
 // header for the full rationale. true iff: the in-band feature is on AND the retransmit queue is
@@ -7094,6 +7162,11 @@ void cl_arq_controller::reset_session_state()
 	frame_gearshift_just_applied = false;
 	data_ack_received = NO;
 	last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — clear per session
+	// RECOVERY-CLOSED-PARTIAL climb unblock (data-flow-inband-recovery-promote.md §1) — the
+	// recovery streak spans the partial->close window across batches, so a NEW session must start
+	// it clean (do not carry a stale recovery from a prior session into a fresh climb).
+	recovery_partial_pending = false;
+	recovery_close_streak = 0;
 	repeating_last_ack = NO;
 
 	// Message tracking

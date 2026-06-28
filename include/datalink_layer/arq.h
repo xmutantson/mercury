@@ -1757,6 +1757,15 @@ public:
   // See fact-documents/data-flow-inband-frame0-rolling-partial.md §10.
   int test_inband_climb_defer_on_retx();
 
+  // IN-BAND RECOVERY-CLOSED-PARTIAL climb-unblock regression (CLI --test-inband-recovery-promote).
+  // A BOUNDED-LOSS partial (n_miss <= batch/2) that retransmit-CLOSES to whole, REPEATED for K
+  // batches, ADVANCES the FRAME-UP climb streak — even when the lost-frame bitmap VARIES batch to
+  // batch (the cfg0 seam case the structural fingerprint can NOT cover). A NON-closing marginal
+  // batch (loss exceeds the bound, or never closes) does NOT promote and RESETS the streak. Returns
+  // 0 pass / 1 fail. Default builds never call this. Fails-before: -DINBAND_RECOVERY_PROMOTE_FAILBEFORE.
+  // See fact-documents/data-flow-inband-recovery-promote.md.
+  int test_inband_recovery_promote();
+
 
   // climb-engine integrated regression (CLI --test-climb-engine). Parts A-H,
   // each fail-before / pass-after its fix:
@@ -3756,6 +3765,34 @@ public:
   // clear, n_miss>2) repeats; resets it otherwise. A lead-frame-only partial or a clean batch is
   // NOT a structural multi-drop → it resets the streak (call with reset semantics). CMD-only.
   void inband_update_structural_acq_fingerprint(uint32_t masked_bitmap, int n_miss);
+  // IN-BAND RECOVERY-CLOSED-PARTIAL climb unblock (data-flow-inband-recovery-promote.md §2).
+  // PURE predicate (no I/O): returns true iff the in-band feature is on, the live config is an
+  // OFDM-tier config, and the rung has demonstrated a STREAK of >= INBAND_RECOVERY_CLOSE_K
+  // consecutive BOUNDED-LOSS partials that retransmit-CLOSED to a whole batch within the batch
+  // window (recovery_close_streak >= K). The KEY difference from inband_structural_acq_partial():
+  // it is SIGNATURE-INDEPENDENT — it never inspects WHICH frames were lost, only (a) was the
+  // first-pass loss <= half the batch, and (b) did the batch close to whole via retx. So the
+  // varying cfg0 seam loss (different bitmap every batch, which RE-SEEDS the structural streak to
+  // 1) still builds this streak, because the CLOSE is what is keyed. A marginal rung whose loss
+  // EXCEEDS the bound, or that NEVER closes (retransmit_count never returns to 0), does NOT build
+  // the streak (inband_recovery_note_partial resets it) -> stays vetoed (§9 anti-thrash preserved).
+  // Fires at hole-cleared (the close), so the DEFER-WHILE-HOLE guard is naturally satisfied.
+  // Flag-off / legacy / non-OFDM -> false (byte-identical). Replayed by --test-inband-recovery-promote.
+  bool inband_recovery_closed_partial();
+  // Producer-side: a partial SACK arrived. Records whether its FIRST-PASS loss is BOUNDED
+  // (n_miss <= data_batch_size/2) and whether the batch is awaiting retx-close (it enqueued frames
+  // for retx). A BOUNDED partial that goes to retx arms recovery_partial_pending (the close will be
+  // credited when the batch goes whole). An UNBOUNDED partial (loss exceeds the bound) is a marginal
+  // rung -> RESET the recovery streak + clear pending (it can NOT be allowed to promote). CMD-only;
+  // called at BOTH partial producers (MFSK-ACK-SACK + OFDM SACK_RSP). SIGNATURE-INDEPENDENT.
+  void inband_recovery_note_partial(int n_miss, int batch_size);
+  // Producer-side: a batch went WHOLE (clean / full ACK). If a BOUNDED recovery partial was pending
+  // (the batch closed via retx within the window), CREDIT the close: ++recovery_close_streak, clear
+  // pending. A clean batch with NO pending recovery partial is the ordinary clean path (promotion is
+  // already allowed via promotion_allowed_on_batch) and leaves the streak UNTOUCHED — it neither
+  // builds nor resets it, so an interleaved clean batch does not break a genuine recovery streak.
+  // CMD-only; called at every clean/full-ACK site. SIGNATURE-INDEPENDENT.
+  void inband_recovery_note_close();
   // IN-BAND ROLLING-PARTIAL climb DEFER-while-hole-outstanding
   // (fact-documents/data-flow-inband-frame0-rolling-partial.md §10). PURE predicate (no I/O):
   // returns true iff the in-band feature is on AND the retransmit queue is non-empty
@@ -4207,6 +4244,14 @@ public:
   // REPEATED identical loss — the structural acq-seam fingerprint — unblocks. This is the §9
   // anti-thrash discriminator (repetition, not magnitude).
   #define INBAND_STRUCTURAL_ACQ_K 2
+  // RECOVERY-CLOSED-PARTIAL climb unblock (data-flow-inband-recovery-promote.md §1): minimum
+  // consecutive BOUNDED-LOSS partials that retransmit-CLOSE to a whole batch (retransmit_count
+  // returns to 0 / batch fully acked via retx) before inband_recovery_closed_partial() admits the
+  // climb. K=2: a single recovery is NEVER admitted (anti-thrash); only a REPEATED close — proof the
+  // rung reliably recovers its bounded seam loss — unblocks. UNLIKE the structural fingerprint, this
+  // is SIGNATURE-INDEPENDENT (it keys on the CLOSE, not on WHICH frames were lost), so it survives
+  // the varying cfg0 seam loss that re-seeds the structural streak to 1 every batch.
+  #define INBAND_RECOVERY_CLOSE_K 2
   int  inband_liveness_stall_polls_count();   // MERCURY_INBAND_LIVENESS_POLLS, default 200
   bool inband_connect_liveness_guard();       // once-per-poll commander watchdog (gated ON);
                                               // returns true if it fired a recovery (caller returns)
@@ -4339,6 +4384,17 @@ public:
   // CMD-only.
   uint32_t last_structural_acq_bitmap = 0;
   int structural_acq_partial_streak = 0;
+  // IN-BAND RECOVERY-CLOSED-PARTIAL climb unblock (data-flow-inband-recovery-promote.md §1).
+  // SIGNATURE-INDEPENDENT companion to the structural fingerprint above: where the structural streak
+  // keys on the EXACT repeated bitmap (and so re-seeds to 1 under varying cfg0 seam loss), this
+  // streak keys on the CLOSE EVENT — a partial whose first-pass loss was BOUNDED (<= half the batch)
+  // and which retransmit-CLOSED to a whole batch (retransmit_count returned to 0) within the batch
+  // window. recovery_partial_pending = true while a bounded partial is awaiting its retx-close;
+  // recovery_close_streak counts consecutive such closes. A partial whose loss EXCEEDS the bound, or
+  // a batch that never closes, resets the streak (the marginal-rung exclusion). Read ONLY by
+  // inband_recovery_closed_partial() at the FRAME-UP gate. CMD-only.
+  bool recovery_partial_pending = false;
+  int  recovery_close_streak = 0;
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
   int  frame_gearshift_retry_count;   // §7.13.33: retries on PHY-switched first batch before BREAK (rx_mute timing race)
