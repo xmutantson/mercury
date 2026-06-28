@@ -3787,6 +3787,38 @@ void cl_arq_controller::process_control_responder()
 			link_timer.start();
 			watchdog_timer.start();
 		}
+		else if(kx_tx_kind == KEY_EXCHANGE_3)
+		{
+			// KX3 REVERSE-PUMP ADVANCE (data-flow-control-slot-lifecycle.md §8.2(3)).
+			// The CMD ACKed the KX3 chunk we just sent by sending this bare
+			// KEY_EXCHANGE_3 control request. Advance to the next ciphertext chunk
+			// and queue it — the exact mirror of the CMD KX2-advance
+			// (arq_commander.cc:7184: kx_tx_next_index++; kx_send_next_chunk()) that
+			// drives the RSP KX2 ACK. kx_send_next_chunk() (RESPONDER branch) encodes
+			// the chunk into messages_control with status=RECEIVED (§8.2(1));
+			// ACKNOWLEDGING_CONTROL then runs the ACK builder, which transmits it on
+			// data_configuration and FREEs the slot. The CMD never sends a
+			// KEY_EXCHANGE_3 for the FINAL chunk (it sends KEY_ACTIVATE instead), so
+			// the all-sent (rc==0) arm is a defensive idle, not the normal terminator.
+			kx_tx_next_index++;
+			int more = kx_send_next_chunk();
+			if(more == 1)
+			{
+				printf("[CRYPTO] RSP advancing KX3 -> chunk idx=%d/%d queued\n",
+					kx_tx_next_index, kx_tx_count);
+				fflush(stdout);
+				connection_status = ACKNOWLEDGING_CONTROL;
+			}
+			else
+			{
+				// All KX3 chunks sent (rc==0) or encode error (rc<0). Nothing more
+				// to ACK back — idle the slot and await KEY_ACTIVATE.
+				messages_control.status = FREE;
+				connection_status = RECEIVING;
+			}
+			link_timer.start();
+			watchdog_timer.start();
+		}
 		else
 		{
 			// Stray KEY_EXCHANGE_3 inbound on the RSP — ignore, free the slot.
@@ -15629,10 +15661,29 @@ int cl_arq_controller::test_kx_chunk_live_rx()
 	}
 
 	// ===================================================================
-	// PART B — KX3 (ciphertext, 1088B) through the COMMANDER live consumer
-	// (process_control_commander, the KX3 call site). Multi-chunk by construction.
+	// PART B — KX3 (ciphertext, 1088B) REVERSE PUMP, BIDIRECTIONAL, end-to-end
+	// through the REAL consumers (data-flow-control-slot-lifecycle.md §8.4):
+	//   RSP sender:  kx_send_next_chunk() (RESPONDER branch) + the responder
+	//                KX3-inbound advance in process_control_responder().
+	//   CMD receiver: process_control_commander() KX3 case (reassemble + the
+	//                bare-KEY_EXCHANGE_3 per-chunk ACK).
+	// Two controllers (this=CMD, rsp=RSP) keep their kx_tx_*/kx_rx_*/kx_mlkem_ct
+	// state separate (a single instance would alias the shared kx_mlkem_ct between
+	// the RSP source and the CMD reassembly target). The "wire" is a byte buffer
+	// shuttled through the REAL producer staging. No telecom_system: we run the
+	// ACK-builder slot-free CONTRACT inline (status=FREE; RECEIVING) exactly where
+	// process_messages_acknowledging_control() would after send_batch() — the same
+	// substitution PART A makes for KX2.
+	//
+	// FAILS-BEFORE (each of the three §8.1 defects fails a distinct assert):
+	//   (1) RSP queues chunk with status=ADDED_TO_LIST -> B3b asserts RECEIVED.
+	//   (2) CMD sends nothing on a non-final chunk -> B4b asserts data[0]==
+	//       KEY_EXCHANGE_3 + TRANSMITTING_CONTROL.
+	//   (3) RSP frees the inbound KEY_EXCHANGE_3 without advancing -> the next
+	//       chunk never queues -> reassembly stalls -> B5/B6/B7 fail.
 	// ===================================================================
 	{
+		// ---- CMD = this controller (holds the ML-KEM secret). ----
 		kx_chunk_state_reset();
 		cipher_suite.set_kx_phase(KX_IDLE);
 		this->role               = COMMANDER;
@@ -15642,48 +15693,166 @@ int cl_arq_controller::test_kx_chunk_live_rx()
 		this->psk_hex[0]         = '\0';
 		this->my_call_sign       = "TST1";
 		this->destination_call_sign = "TST2";
-
-		// The CMD holds the ML-KEM SECRET (it generated the keypair). Replicate the
-		// live STRICT branch (arq_commander.cc:7138): generate into THIS controller's
-		// cipher_suite + kx_mlkem_pk so the post-reassembly decapsulate_mlkem()
-		// recovers the matching shared secret.
+		// Replicate the live STRICT branch (arq_commander.cc:7137): generate the
+		// ML-KEM keypair into THIS controller so the post-reassembly
+		// decapsulate_mlkem() recovers the matching shared secret.
 		bool kg_ok = (cipher_suite.generate_mlkem_keypair(kx_mlkem_pk) == 0);
 		kx_mlkem_pk_ready = true;
 		check(kg_ok, "B0 CMD ML-KEM keypair generated into controller cipher_suite");
-		// A standalone RSP proxy encapsulates against our pk -> the ciphertext the
-		// RSP would stream back as KX3.
+
+		// ---- RSP = a second bare controller (PART A allocation pattern). It is the
+		// KX3 chunk SENDER: it encapsulates the CMD's pk and streams the ct. ----
+		cl_arq_controller rsp;
+		rsp.nMessages          = this->nMessages;
+		rsp.max_data_length    = this->max_data_length;
+		rsp.max_message_length = this->max_message_length;
+		rsp.max_header_length  = this->max_header_length;
+		bool rsp_alloc = (rsp.init_messages_buffers() == SUCCESSFUL);
+		check(rsp_alloc, "B0b RSP controller buffers allocated");
+		rsp.kx_chunk_state_reset();
+		rsp.cipher_suite.set_kx_phase(KX_IDLE);
+		rsp.role               = RESPONDER;
+		rsp.link_status        = CONNECTED;
+		rsp.connection_status  = RECEIVING;
+		rsp.passive_monitor    = false;
+		rsp.psk_hex[0]         = '\0';
+		rsp.my_call_sign       = "TST2";
+		rsp.destination_call_sign = "TST1";
+
+		// Full X25519 setup on BOTH peers (the KX1 step that precedes KX2/KX3 on the
+		// live wire) so each side can derive the SAME hybrid key with full transcript
+		// binding. CMD = this, RSP = rsp; pk order is ALWAYS commander-then-responder.
+		uint8_t pk_cmd_x[X25519_KEY_SIZE], pk_rsp_x[X25519_KEY_SIZE];
+		bool x_ok = (cipher_suite.generate_x25519_keypair(pk_cmd_x) == 0)
+		         && (rsp.cipher_suite.generate_x25519_keypair(pk_rsp_x) == 0)
+		         && (cipher_suite.compute_x25519_shared(pk_rsp_x) == 0)     // CMD: peer=RSP
+		         && (rsp.cipher_suite.compute_x25519_shared(pk_cmd_x) == 0); // RSP: peer=CMD
+		check(x_ok, "B0c X25519 established on both peers (KX1 precondition)");
+
+		// RSP encapsulates against the CMD's pk -> ct + ML-KEM ss; derives the HYBRID
+		// key + sets KX_HYBRID_DONE NOW (mirror of the live KX2-final handler at
+		// arq_responder.cc:3187-3208), then arms KX3 send.
+		bool rsp_enc = (rsp.cipher_suite.encapsulate_mlkem(kx_mlkem_pk, rsp.kx_mlkem_ct) == 0);
+		rsp.kx_mlkem_ct_ready = true;
+		check(rsp_enc, "B1 RSP encapsulated ciphertext (KX3 source)");
 		uint8_t src_ct[MLKEM_CT_SIZE];
-		cl_cipher_suite enc;
-		bool enc_ok = (enc.encapsulate_mlkem(kx_mlkem_pk, src_ct) == 0);
-		check(enc_ok, "B1 ciphertext produced by RSP-proxy encapsulate");
+		memcpy(src_ct, rsp.kx_mlkem_ct, MLKEM_CT_SIZE);   // golden copy for the byte check
+		{
+			const uint8_t* rpk_rsp = rsp.cipher_suite.get_x25519_pubkey();
+			const uint8_t* rpk_cmd = rsp.cipher_suite.get_x25519_peer_pubkey();
+			rsp.cipher_suite.derive_session_key(
+				rsp.destination_call_sign.c_str(), rsp.my_call_sign.c_str(),
+				nullptr, 0, /*mlkem_done=*/true,
+				rsp.kx_mlkem_ct, kx_mlkem_pk, rpk_cmd, rpk_rsp);
+			rsp.cipher_suite.set_kx_phase(KX_HYBRID_DONE);
+		}
 
 		int count = cl_cipher_suite::kx_chunk_count(MLKEM_CT_SIZE, cap);
 		check(count > 1, "B2 KX3 is MULTI-CHUNK (count>1)");
 
-		uint8_t frame[N_MAX/8];
+		// RSP queues KX3 chunk 0 (mirror of the live KX2-final handler at
+		// arq_responder.cc:3212). kx_begin_chunk_send() -> kx_send_next_chunk()
+		// encodes the chunk into rsp.messages_control with status=RECEIVED (§8.2(1)).
+		int begin_rc = rsp.kx_begin_chunk_send(KEY_EXCHANGE_3);
+		check(begin_rc == 1, "B3 RSP armed KX3 send (chunk 0 queued)");
+		check(rsp.messages_control.status == RECEIVED,
+			"B3b RSP KX3 chunk left slot ACK-ready (status=RECEIVED; FAILS-BEFORE: ADDED_TO_LIST)");
+		check((unsigned char)rsp.messages_control.data[0] == KEY_EXCHANGE_3,
+			"B3c RSP KX3 chunk stamped data[0]=KEY_EXCHANGE_3 (ACK builder routes it)");
+
+		// Bidirectional pump. Each iteration: shuttle the RSP's queued chunk to the
+		// CMD, run the CMD consumer (reassemble + maybe ACK), and on a non-final
+		// chunk shuttle the CMD's bare KEY_EXCHANGE_3 ACK back to the RSP and run the
+		// RSP advance. The RSP's "ACK builder send" is modeled by reading the queued
+		// chunk out of rsp.messages_control then applying the post-send slot-free.
+		bool stalled = false;
 		for(int idx = 0; idx < count; idx++) {
-			int wrote = cl_cipher_suite::kx_chunk_encode(
-				cl_cipher_suite::KX_KIND_CT, src_ct, MLKEM_CT_SIZE,
-				idx, cap, frame, sizeof(frame));
-			if(wrote < 0) { check(false, "B3 KX3 chunk encode"); break; }
-			stage_chunk_via_producer(frame, wrote);   // REAL producer (length=1)
-			process_control_commander();              // REAL live consumer (call site)
+			// --- WIRE: RSP -> CMD. The RSP ACK builder would send
+			// rsp.messages_control (the chunk) on data_configuration; capture it. ---
+			check(rsp.messages_control.status == RECEIVED,
+				"B-tx KX3 chunk is ACK-ready before send (status=RECEIVED)");
+			uint8_t wire[N_MAX/8];
+			memcpy(wire, rsp.messages_control.data, slot_width);
+			// RSP ACK builder post-send contract (process_messages_acknowledging_control
+			// frees the slot at arq_responder.cc:1901 and returns to RECEIVING).
+			rsp.messages_control.status = FREE;
+			rsp.connection_status = RECEIVING;
+
+			// --- CMD consumes the chunk via the REAL producer staging + consumer. ---
+			stage_chunk_via_producer(wire, slot_width);
+			process_control_commander();
 			if(this->link_status == DROPPED) {
 				check(false, "B4 link not DROPPED during KX3 reassembly");
-				break;
+				stalled = true; break;
+			}
+
+			bool is_final = (idx == count - 1);
+			if(!is_final) {
+				// CMD must have emitted a BARE KEY_EXCHANGE_3 per-chunk ACK (§8.2(2)):
+				// data[0]==KEY_EXCHANGE_3, length==1, queued for TX.
+				check((unsigned char)messages_control.data[0] == KEY_EXCHANGE_3,
+					"B4b CMD emitted bare KEY_EXCHANGE_3 per-chunk ACK (FAILS-BEFORE: nothing)");
+				check(messages_control.length == 1,
+					"B4c CMD KX3 ACK is bare (length=1, no chunk payload back)");
+				check(connection_status == TRANSMITTING_CONTROL,
+					"B4d CMD entered TRANSMITTING_CONTROL to send the KX3 ACK");
+
+				// --- WIRE: CMD -> RSP. The CMD TX path would send this control frame;
+				// stage it into the RSP slot via the REAL producer, then run the RSP
+				// advance consumer. Reset CMD slot to RECEIVING_ACKS_CONTROL for the
+				// next inbound chunk (the live CMD re-enters that wait). ---
+				char ack_code = messages_control.data[0];
+				messages_control.status = FREE;             // CMD TX path frees after send
+				this->connection_status = RECEIVING_ACKS_CONTROL;
+
+				// RSP producer stages the inbound bare ACK (status=RECEIVED, length=1).
+				memset(rsp.messages_control.data, 0, slot_width);
+				rsp.messages_control.data[0] = ack_code;
+				rsp.messages_control.status  = RECEIVED;
+				rsp.messages_control.length  = 1;
+				rsp.messages_control.type    = CONTROL;
+				rsp.messages_control.id      = 0;
+				int adv_before = rsp.kx_tx_next_index;
+				rsp.process_control_responder();            // REAL live consumer (advance)
+				if(rsp.link_status == DROPPED) {
+					check(false, "B4e RSP not DROPPED during KX3 advance");
+					stalled = true; break;
+				}
+				check(rsp.kx_tx_next_index == adv_before + 1,
+					"B4f RSP advanced kx_tx_next_index on the KX3 ACK (FAILS-BEFORE: stray-free, no advance)");
+				check(rsp.connection_status == ACKNOWLEDGING_CONTROL,
+					"B4g RSP queued next KX3 chunk -> ACKNOWLEDGING_CONTROL");
+				check(rsp.messages_control.status == RECEIVED,
+					"B4h RSP next KX3 chunk is ACK-ready (status=RECEIVED)");
 			}
 		}
+
 		// PASS-AFTER: ciphertext reassembled (kx_mlkem_ct_ready + bytes match) and
-		// the live consumer decapsulated + derived the hybrid key (kx_phase ==
-		// KX_HYBRID_DONE). FAILS-BEFORE: every chunk rejected -> ct stays unready.
+		// the CMD consumer decapsulated + derived the hybrid key. FAILS-BEFORE: the
+		// pump stalls after chunk 0 -> ct never completes.
+		check(!stalled, "B4z pump ran to completion (no stall mid-stream)");
 		check(kx_mlkem_ct_ready,
-			"B5 KX3 ciphertext REASSEMBLED via live RX (FAILS-BEFORE: rejected)");
+			"B5 KX3 ciphertext REASSEMBLED via live bidirectional pump (FAILS-BEFORE: stalls)");
 		check(kx_mlkem_ct_ready && memcmp(kx_mlkem_ct, src_ct, MLKEM_CT_SIZE) == 0,
 			"B6 reassembled ciphertext is BYTE-IDENTICAL to source");
 		check(cipher_suite.get_kx_phase() == KX_HYBRID_DONE,
-			"B7 live consumer DECAPSULATED + derived hybrid key (KX_HYBRID_DONE)");
+			"B7 CMD DECAPSULATED + derived hybrid key (KX_HYBRID_DONE)");
+		check(rsp.cipher_suite.get_kx_phase() == KX_HYBRID_DONE,
+			"B7b RSP reached KX_HYBRID_DONE (both sides; bidirectional handshake)");
+		// END-TO-END: both peers derived the SAME hybrid session key. This is the
+		// ultimate proof the reverse pump delivered the correct ciphertext (a wrong
+		// ct -> implicit-rejection pseudorandom ss -> divergent keys).
+		{
+			uint8_t k_cmd[SESSION_KEY_SIZE], k_rsp[SESSION_KEY_SIZE];
+			cipher_suite.copy_session_key_for_test(k_cmd);
+			rsp.cipher_suite.copy_session_key_for_test(k_rsp);
+			check(memcmp(k_cmd, k_rsp, SESSION_KEY_SIZE) == 0,
+				"B7c CMD and RSP derived the IDENTICAL hybrid session key");
+		}
 		check(this->link_status == CONNECTED,
-			"B8 link still CONNECTED (no DROP on a clean KX3)");
+			"B8 CMD link still CONNECTED (no DROP on a clean KX3)");
+		check(rsp.link_status == CONNECTED,
+			"B8b RSP link still CONNECTED (no DROP on a clean KX3)");
 	}
 
 	printf("[TEST-KX-LIVERX] %s: %d failure(s)\n",

@@ -1545,7 +1545,7 @@ int cl_arq_controller::add_message_control(char code)
 			printf("[CRYPTO] Sending X25519 pubkey (32 bytes)\n");
 			fflush(stdout);
 		}
-		else if(code==KEY_EXCHANGE_2 || code==KEY_EXCHANGE_3)
+		else if(code==KEY_EXCHANGE_2)
 		{
 			// Hybrid ML-KEM KX chunk frame (MLKEM_HYBRID_PLAN.md §4). The
 			// current chunk index is kx_tx_next_index; the chunk codec writes
@@ -1553,6 +1553,12 @@ int cl_arq_controller::add_message_control(char code)
 			// kx_tx_* state was armed by kx_begin_chunk_send(). The frame is a
 			// normal control frame from here on (LDPC + per-frame control ACK on
 			// the OFDM data_configuration, same transport as KEY_EXCHANGE_1).
+			// NOTE: only KEY_EXCHANGE_2 chunk-encodes here. The CMD NEVER sends
+			// KX3 CHUNKS (the RSP does, via its ACK transport); a CMD-built
+			// KEY_EXCHANGE_3 is the BARE per-chunk KX3 ACK
+			// (data-flow-control-slot-lifecycle.md §8.2(2)) which falls into the
+			// length=1 `else` builder below (kx_send_next_chunk's COMMANDER branch
+			// only ever calls this with KEY_EXCHANGE_2).
 			int cap = kx_tx_chunk_cap;
 			int wrote = cl_cipher_suite::kx_chunk_encode(
 				(uint8_t)kx_tx_kind, kx_tx_src, kx_tx_total,
@@ -7880,6 +7886,21 @@ void cl_arq_controller::process_control_commander()
 					printf("[CRYPTO] Hybrid session key derived — sending KEY_ACTIVATE (PQ)\n");
 					fflush(stdout);
 					add_message_control(KEY_ACTIVATE);
+				}
+				else if(done == 0)
+				{
+					// KX3 PER-CHUNK ACK (data-flow-control-slot-lifecycle.md §8.2(2)):
+					// a NON-FINAL ciphertext chunk reassembled. Send a BARE
+					// KEY_EXCHANGE_3 control request (length=1) back to the RSP — the
+					// trigger for the RSP to advance kx_tx_next_index and queue the
+					// next KX3 chunk (mirror of the CMD KX2-advance at :7184 driving
+					// the RSP KX2 ACK). The slot is FREE here (set at :7183), so
+					// add_message_control queues + enters TRANSMITTING_CONTROL. Only
+					// the FINAL chunk path (done==1, above) sends KEY_ACTIVATE — the
+					// CMD never KX3-ACKs the last chunk (mirror of the RSP not
+					// bare-ACKing KX2-final). done<0 (chunk rejected) -> no ACK; the
+					// RSP's pending chunk times out and retransmits via existing ARQ.
+					add_message_control(KEY_EXCHANGE_3);
 				}
 				watchdog_timer.start();
 				link_timer.start();

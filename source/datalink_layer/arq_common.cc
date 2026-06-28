@@ -8093,13 +8093,23 @@ int cl_arq_controller::kx_send_next_chunk()
 		// connection_status = ACKNOWLEDGING_CONTROL so the ACK builder
 		// (arq_responder.cc KEY_EXCHANGE_1/KX path) sends messages_control as an
 		// LDPC frame on the data_configuration.
-		if(messages_control.status != FREE && messages_control.status != ADDED_TO_LIST)
+		if(messages_control.status != FREE && messages_control.status != ADDED_TO_LIST
+		   && messages_control.status != RECEIVED)
 		{
 			// slot busy — caller will retry on the next tick
 		}
 		messages_control.type   = CONTROL;
 		messages_control.id     = 0;
-		messages_control.status = ADDED_TO_LIST;
+		// KX3 REVERSE-PUMP STATUS (data-flow-control-slot-lifecycle.md §8.2(1)):
+		// the RSP sends KX3 chunks via the control-ACK transport; the ACK builder
+		// process_messages_acknowledging_control() (arq_responder.cc:1672) ONLY
+		// fires when status==RECEIVED. Setting ADDED_TO_LIST here left the queued
+		// chunk un-sent (ACK builder spun "[ACK-CTRL] status=1") so only chunk 0
+		// (queued by kx_begin_chunk_send from the KX2-final handler) ever left the
+		// RSP. RECEIVED mirrors exactly the §7 KX2 inbound slot the ACK builder
+		// already drives. (The CMD branch above keeps ADDED_TO_LIST — it goes out
+		// via the control-REQUEST TX path, not the ACK builder.)
+		messages_control.status = RECEIVED;
 		int wrote = cl_cipher_suite::kx_chunk_encode(
 			(uint8_t)kx_tx_kind, kx_tx_src, kx_tx_total,
 			kx_tx_next_index, kx_tx_chunk_cap,
