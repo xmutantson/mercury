@@ -65,6 +65,7 @@ cl_mfsk::cl_mfsk()
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
+	last_demod_snr_db = -99.0;  // "no measurement" sentinel until first demod()
 	suffix_fec_coded = false;  // Tier-2 FEC off by default (§19) — CONNECT suffix
 	ack_suffix_fec_coded = false; // §21: ACK-suffix FEC off by default (separate
 	                              // from the CONNECT flag; held off this increment)
@@ -1244,6 +1245,16 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 	if (noise_var < 1e-30) noise_var = 1e-30;
 	double llr_scale = 1.0 / noise_var;
 
+	// Codeword SNR estimate (the long-standing MFSK SNR TODO): accumulate the
+	// PEAK tone energy per symbol-stream below. The peak bin holds the
+	// transmitted tone (signal + noise); pooled `noise_var` is one noise bin's
+	// energy. After the loop:
+	//   SNR_dB = 10*log10( max(mean(E_peak) - noise_var, eps) / noise_var ).
+	// Pooled over ~nSymbols*nStreams peaks → the same low-variance estimate the
+	// LLR scale relies on. Noncoherent FSK, Proakis 5th ed §4.5.4.
+	double peak_sum_all = 0.0;
+	int    peak_count_all = 0;
+
 	for (int s = 0; s < nSymbols; s++)
 	{
 		// Process each stream independently
@@ -1251,12 +1262,18 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 		{
 			// Measure energy in this stream's tone bins
 			double E_raw[64]; // M <= 64
+			double E_peak = 0.0;
 			for (int m = 0; m < M; m++)
 			{
 				std::complex<double> val = fft_in[s * Nc + stream_offsets[st] + m];
 				E_raw[m] = val.real() * val.real() + val.imag() * val.imag();
 				if (!std::isfinite(E_raw[m])) { E_raw[m] = 0.0; }
+				if (E_raw[m] > E_peak) E_peak = E_raw[m];
 			}
+			// The de-hopped winning tone is the per-symbol signal observation;
+			// its energy == max over the M raw bins (hopping only permutes them).
+			peak_sum_all += E_peak;
+			peak_count_all++;
 
 			// Reverse tone hopping: E[data_tone] = E_raw[actual_tone]
 			double E[64];
@@ -1341,5 +1358,24 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 				llr_out[llr_offset + k] = (float)llr;
 			}
 		}
+	}
+
+	// Codeword SNR estimate (replaces the hardcoded MFSK SNR=0.0 placeholder at
+	// the telecom-layer MFSK-decode SNR site). mean(E_peak) ≈ S + noise_var, so
+	// the de-biased signal power is mean(E_peak) - noise_var; SNR = that / one
+	// noise bin's energy. Clamp the post-subtraction signal to a small positive
+	// floor so deep-noise (peak ≈ noise) reports a low — not NaN/-inf — SNR, and
+	// clamp the final dB to a sane reporting range. Leaves the -99.0 sentinel
+	// when the codeword carried no measurable symbol (peak_count_all==0).
+	if (peak_count_all > 0)
+	{
+		double mean_peak = peak_sum_all / peak_count_all;
+		double sig = mean_peak - noise_var;
+		if (sig < 1e-30) sig = 1e-30;             // deep noise → very low SNR, not NaN
+		double snr_db = 10.0 * std::log10(sig / noise_var);
+		if (!std::isfinite(snr_db)) snr_db = -99.0;
+		if (snr_db < -30.0) snr_db = -30.0;       // reporting floor
+		if (snr_db >  60.0) snr_db =  60.0;       // reporting ceiling
+		last_demod_snr_db = snr_db;
 	}
 }
