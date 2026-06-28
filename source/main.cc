@@ -907,6 +907,15 @@ int main(int argc, char *argv[])
                 failed += ARQ_isr.test_idle_switch_role_race();
                 failed += ARQ_isr.test_break_noprogress_teardown();
             }
+            // RX-CTRL-DROP regression (data-flow-control-slot-lifecycle.md §6): the
+            // messages_control one-deep mailbox had no timeout escape out of RECEIVED,
+            // so a stranded slot silently dropped every later control frame and killed
+            // the reverse control plane (demote-amplifier feeder). In-process
+            // synthetic-fire (no PHY/audio) — a permanent regression gate.
+            {
+                cl_arq_controller ARQ_rxctrl;
+                failed += ARQ_rxctrl.test_rx_ctrl_drop();
+            }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
             // pre-data re-ACK pinned the shared frames_to_read=2 across the first
@@ -1343,6 +1352,10 @@ int main(int argc, char *argv[])
                                         // (idle-switchrole-race.md §3/§4 Part C). Replays the shared break_noprogress_step
                                         // kernel: teardown fires at exactly K dead cycles; progress on a live BREAK resets
                                         // the streak (negative control). FAILS-BEFORE with -DBREAK_NOPROGRESS_FAILBEFORE.
+    bool test_rx_ctrl_drop_cli = false; // --test-rx-ctrl-drop: RECEIVED-stuck control-slot regression
+                                        // (data-flow-control-slot-lifecycle.md §6). Drives the shared RECEIVED-state
+                                        // watchdog predicate + the produce-gate replication: a stranded RECEIVED slot is
+                                        // freed and a later control frame lands. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE.
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
                                         // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
@@ -2376,6 +2389,18 @@ int main(int argc, char *argv[])
             // cycles instead of re-arming the watchdog forever. FAILS-BEFORE with
             // -DBREAK_NOPROGRESS_FAILBEFORE (the kernel never escalates).
             test_break_noprogress_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rx-ctrl-drop") == 0)
+        {
+            // RX-CTRL-DROP regression — one-shot at startup, then exit with the
+            // test's rc. The messages_control one-deep mailbox had no escape out of
+            // RECEIVED, so a stranded slot silently dropped every later control
+            // frame and killed the reverse control plane. FAILS-BEFORE with
+            // -DRX_CTRL_DROP_FAILBEFORE (the watchdog never fires). See
+            // fact-documents/data-flow-control-slot-lifecycle.md.
+            test_rx_ctrl_drop_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4178,6 +4203,21 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_break_noprogress_teardown();
             printf("[FLAG] Break-noprogress-teardown test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_rx_ctrl_drop_cli) {
+            // RX-CTRL-DROP regression (one-shot, then exit rc). Drives the shared
+            // RECEIVED-state watchdog predicate + produce-gate replication: a
+            // stranded RECEIVED control slot is freed and a later control frame
+            // lands. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE (watchdog never
+            // fires -> slot stays stuck -> later frame dropped). See
+            // fact-documents/data-flow-control-slot-lifecycle.md.
+            printf("[FLAG] --test-rx-ctrl-drop: invoking RECEIVED control-slot "
+                   "watchdog regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rx_ctrl_drop();
+            printf("[FLAG] Rx-ctrl-drop test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

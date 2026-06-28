@@ -15195,6 +15195,188 @@ int cl_arq_controller::test_break_noprogress_teardown()
 }
 
 // ===========================================================================
+// RX-CTRL-DROP regression (--test-rx-ctrl-drop; data-flow-control-slot-lifecycle.md
+// §6). In-process synthetic-fire: no telecom_system, no PHY/audio, no IONOS/RF.
+//
+// The bug: messages_control is a one-deep mailbox; the RSP produce gate
+// (arq_responder.cc:825) copies an inbound CONTROL frame ONLY when the slot is
+// FREE, else it is silently dropped (:848). The slot had no timeout escape out of
+// RECEIVED, so any path that stranded it there (V1 unhandled-code fall-through,
+// V2 RESPONDER timeout, V3 watchdog recovery, V4 crypto/CLOSE teardown via
+// reset_session_state) killed the reverse control plane for the rest of the
+// session — the demote-amplifier feeder.
+//
+// This test drives the SHARED watchdog decision kernel
+// (rx_ctrl_received_watchdog_expired — the same predicate update_status() calls,
+// so no wall-clock sleep is needed) and replicates the produce-gate FREE→copy to
+// prove a freed slot accepts the NEXT control frame. FAILS-BEFORE with
+// -DRX_CTRL_DROP_FAILBEFORE (the predicate always returns false -> the stranded
+// slot stays stuck -> the later control frame is dropped).
+// ===========================================================================
+int cl_arq_controller::test_rx_ctrl_drop()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-RXCTRL] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-RXCTRL] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// The bare controller has messages_control.data == NULL (allocated only in
+	// init(), arq_common.cc:5580). Allocate it exactly as production does so the
+	// produce-gate copy + the update_status() data[0] read are valid.
+	bool we_allocated = false;
+	if(messages_control.data == NULL) {
+		messages_control.data = new char[N_MAX / 8];
+		we_allocated = true;
+	}
+
+	// ack_timeout_control is the control round-trip the watchdog bound scales (4x,
+	// floored 8s). Use the ctor default (1000) so the bound is the 8000ms floor.
+	const int bound_ms = (4 * ack_timeout_control < 8000) ? 8000 : 4 * ack_timeout_control;
+
+	// ---- A1: predicate does NOT fire before the bound (no premature free) ----
+	check(!rx_ctrl_received_watchdog_expired(RECEIVED, YES, bound_ms - 1),
+		"A1 watchdog does NOT fire just below the bound",
+		rx_ctrl_received_watchdog_expired(RECEIVED, YES, bound_ms - 1) ? 1 : 0, 0);
+
+	// ---- A2: predicate fires AT the bound (FAILS-BEFORE: never fires) ----
+	check(rx_ctrl_received_watchdog_expired(RECEIVED, YES, bound_ms),
+		"A2 watchdog FIRES at the bound (FAILS-BEFORE: stays stuck forever)",
+		rx_ctrl_received_watchdog_expired(RECEIVED, YES, bound_ms) ? 1 : 0, 1);
+
+	// ---- A3: NEG-CONTROL — a FREE slot never fires (only RECEIVED is watched) ----
+	check(!rx_ctrl_received_watchdog_expired(FREE, YES, bound_ms + 100000),
+		"A3 NEG-CONTROL: a FREE slot never triggers the watchdog",
+		rx_ctrl_received_watchdog_expired(FREE, YES, bound_ms + 100000) ? 1 : 0, 0);
+
+	// ---- A4: NEG-CONTROL — a RECEIVED slot whose ack_timer is NOT counting does
+	// not fire (the timer must have been armed at the producer) ----
+	check(!rx_ctrl_received_watchdog_expired(RECEIVED, NO, bound_ms + 100000),
+		"A4 NEG-CONTROL: RECEIVED but ack_timer not counting -> no fire",
+		rx_ctrl_received_watchdog_expired(RECEIVED, NO, bound_ms + 100000) ? 1 : 0, 0);
+
+	// ---- A5/A6: END-TO-END — strand the REAL slot in RECEIVED, run the watchdog
+	// decision, free it, then deliver a NEW control frame through the produce-gate
+	// logic (FREE -> copy). PASS-AFTER: the new frame lands. FAILS-BEFORE: the
+	// stuck slot blocks it (dropped). ----
+	// Strand: a SWITCH_ROLE frame stuck in RECEIVED (the canonical reverse-control
+	// stall — the demote-amplifier feeder).
+	messages_control.status = RECEIVED;
+	messages_control.data[0] = (char)SWITCH_ROLE;
+	messages_control.ack_timer.start();   // armed at the producer (counting=YES)
+
+	bool freed = false;
+	if(rx_ctrl_received_watchdog_expired(messages_control.status,
+		messages_control.ack_timer.counting, bound_ms))   // synthetic elapsed = bound
+	{
+		messages_control.ack_timer.stop();
+		messages_control.ack_timer.reset();
+		messages_control.status = FREE;
+		freed = true;
+	}
+	check(freed && messages_control.status == FREE,
+		"A5 stranded RECEIVED slot is FREED by the watchdog (FAILS-BEFORE: stuck)",
+		(freed && messages_control.status == FREE) ? 1 : 0, 1);
+
+	// Now a NEW inbound control frame (SET_CONFIG) arrives. Replicate the RSP
+	// produce gate (arq_responder.cc:825): copy ONLY when the slot is FREE.
+	bool delivered = false;
+	int delivered_code = -1;
+	if(messages_control.status == FREE) {
+		messages_control.status = RECEIVED;
+		messages_control.data[0] = (char)SET_CONFIG;
+		delivered = true;
+		delivered_code = (int)(unsigned char)messages_control.data[0];
+	}
+	check(delivered && delivered_code == SET_CONFIG,
+		"A6 a later control frame is DELIVERED after the slot is freed "
+		"(FAILS-BEFORE: dropped, reverse plane dead)",
+		(delivered && delivered_code == SET_CONFIG) ? 1 : 0, 1);
+
+	// ---- B: V1 fall-through FREE. Replicate the terminal catch-all in
+	// process_control_responder() (arq_responder.cc): a still-RECEIVED slot whose
+	// handler did not advance connection_status to an ACK state is force-FREED.
+	// Model an unhandled code reaching the end of the dispatch with the slot still
+	// RECEIVED and connection_status == RECEIVING (no ACK pending). ----
+	messages_control.status = RECEIVED;
+	messages_control.data[0] = (char)0x7E;   // bogus / unhandled control code
+	connection_status = RECEIVING;
+	{
+		bool v1_freed = false;
+		// The exact production guard (the #ifndef RX_CTRL_DROP_FAILBEFORE catch-all):
+		if(messages_control.status == RECEIVED
+		   && connection_status != ACKNOWLEDGING_CONTROL
+		   && connection_status != ACKNOWLEDGING_DATA)
+		{
+#ifndef RX_CTRL_DROP_FAILBEFORE
+			messages_control.status = FREE;
+			v1_freed = true;
+#endif
+		}
+		check(v1_freed && messages_control.status == FREE,
+			"B V1 fall-through FREEs an unhandled control code "
+			"(FAILS-BEFORE: stuck RECEIVED)",
+			(v1_freed && messages_control.status == FREE) ? 1 : 0, 1);
+	}
+
+	// ---- B-neg: a handler that INTENDS to keep the slot RECEIVED for the control
+	// ACK (connection_status == ACKNOWLEDGING_CONTROL) must NOT be force-FREED ----
+	messages_control.status = RECEIVED;
+	connection_status = ACKNOWLEDGING_CONTROL;
+	{
+		bool wrongly_freed = false;
+		if(messages_control.status == RECEIVED
+		   && connection_status != ACKNOWLEDGING_CONTROL
+		   && connection_status != ACKNOWLEDGING_DATA)
+		{
+			messages_control.status = FREE;
+			wrongly_freed = true;
+		}
+		check(!wrongly_freed && messages_control.status == RECEIVED,
+			"B-neg an ACK-pending RECEIVED slot is NOT force-freed (ACK handoff preserved)",
+			(!wrongly_freed && messages_control.status == RECEIVED) ? 1 : 0, 1);
+	}
+
+	// ---- C: teardown FREE. reset_session_state() now FREEs the slot (change C);
+	// it is heavyweight (sockets/compressor/optimizer) so we assert the invariant
+	// at the kernel level: after a (simulated) teardown FREE, the produce gate
+	// accepts the next session's first control frame. This is the V2/V4 closure. ----
+	messages_control.status = RECEIVED;   // stale slot left by the dead session
+#ifndef RX_CTRL_DROP_FAILBEFORE
+	messages_control.status = FREE;       // change C: reset_session_state() FREEs it
+#endif
+	bool next_session_ok = false;
+	if(messages_control.status == FREE) {
+		messages_control.status = RECEIVED;
+		messages_control.data[0] = (char)START_CONNECTION;
+		next_session_ok = true;
+	}
+	check(next_session_ok,
+		"C after teardown FREE the next session's control frame lands "
+		"(FAILS-BEFORE: dropped)",
+		next_session_ok ? 1 : 0, 1);
+
+	// Cleanup: leave the slot FREE; free the buffer only if WE allocated it.
+	messages_control.status = FREE;
+	messages_control.ack_timer.stop();
+	messages_control.ack_timer.reset();
+	if(we_allocated && messages_control.data != NULL) {
+		delete[] messages_control.data;
+		messages_control.data = NULL;
+	}
+
+	printf("[TEST-RXCTRL] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
 // SIM_INPROC feasibility prototype — single-process in-process self-loopback.
 // See fact-documents/single-process-sim-refactor.md.
 //

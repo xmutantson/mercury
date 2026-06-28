@@ -829,6 +829,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 					messages_control.status=RECEIVED;
 					messages_control.length=1;
 					messages_control.sequence_number=messages_rx_buffer.sequence_number;
+					// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change A):
+					// arm the per-slot ack_timer as a RECEIVED-state watchdog. The slot
+					// is a one-deep mailbox; if a consume path strands it in RECEIVED
+					// (V1 fall-through / V2 RESPONDER-timeout / V3 watchdog / V4 crypto
+					// teardown) every later control frame is silently dropped (:848) and
+					// the reverse control plane dies. update_status() force-FREEs a slot
+					// whose ack_timer exceeds the watchdog bound — mirroring the CMD
+					// PENDING_ACK escape (arq_common.cc:5718). ack_timer is otherwise
+					// idle in the RSP RECEIVED state (it only arms for the CMD PENDING_ACK
+					// use), so reusing it here is safe.
+					messages_control.ack_timer.stop();
+					messages_control.ack_timer.reset();
+					messages_control.ack_timer.start();
 					{
 					int copy_len = max_data_length+max_header_length-CONTROL_ACK_CONTROL_HEADER_LENGTH;
 					if(copy_len > N_MAX/8) copy_len = N_MAX/8;
@@ -3655,8 +3668,51 @@ void cl_arq_controller::process_control_responder()
 			}
 			tcp_socket_control.transmit();
 		}
+		else
+		{
+			// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change B,
+			// vector V1): the terminal outer `else` previously handled ONLY
+			// CLOSE_CONNECTION, so any OTHER code that reached here (an unknown /
+			// corrupted code byte, or a code whose handler guard above did not
+			// match the current link_status) returned with the slot LEFT in
+			// RECEIVED forever — wedging the one-deep mailbox so every later
+			// control frame is dropped at the produce gate (:825 / :848). FREE it
+			// now: the frame was not actionable in this state, so discarding it is
+			// safe (the CMD will retransmit if it needed an ACK — identical to a
+			// control frame lost on the air).
+			printf("[RX-CTRL-DROP] FREE: unhandled control code=%d in link_status=%d "
+				"(no handler matched; freeing stuck slot)\n",
+				(int)code, link_status);
+			fflush(stdout);
+#ifndef RX_CTRL_DROP_FAILBEFORE
+			messages_control.status = FREE;
+#endif
+		}
 	}
 
+	// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change B, terminal
+	// catch-all): a control code can also fall through EVERY outer guard above
+	// (e.g. a valid code arriving in a link_status none of the outer `if`s match —
+	// START_CONNECTION while CONNECTED, SET_CONFIG while not CONNECTED) and never
+	// reach the terminal `else` (its CLOSE_CONNECTION branch). Such a path leaves
+	// the slot RECEIVED with connection_status untouched (still RECEIVING). Any
+	// handler that INTENDS to keep the slot RECEIVED for the control-ACK handoff
+	// set connection_status to ACKNOWLEDGING_CONTROL / ACKNOWLEDGING_DATA, so we
+	// only force-FREE a still-RECEIVED slot that is NOT heading into an ACK. This
+	// preserves the normal RECEIVED→ACKED→FREE consume while closing the stuck-slot
+	// leak deterministically (no need to wait for the update_status() watchdog).
+	if(messages_control.status == RECEIVED
+	   && connection_status != ACKNOWLEDGING_CONTROL
+	   && connection_status != ACKNOWLEDGING_DATA)
+	{
+		printf("[RX-CTRL-DROP] FREE: control code=%d fell through all guards in "
+			"link_status=%d connection_status=%d (freeing stuck slot)\n",
+			(int)code, link_status, connection_status);
+		fflush(stdout);
+#ifndef RX_CTRL_DROP_FAILBEFORE
+		messages_control.status = FREE;
+#endif
+	}
 }
 
 // FIX-6 (the deterministic 61,621-byte stall): send `length` bytes from `src` to

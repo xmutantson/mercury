@@ -5704,6 +5704,36 @@ int cl_arq_controller::deinit_messages_buffers()
 	return success;
 }
 
+// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change A). PURE
+// predicate for the RECEIVED-state watchdog on the one-deep messages_control
+// mailbox. The slot MUST return to FREE within one control round-trip (the
+// produce gate at arq_responder.cc:279/:382/:825 only copies a new control frame
+// when the slot is FREE; a slot stuck in RECEIVED silently drops every later
+// control frame and kills the reverse control plane). This is the catch-all
+// escape — the exact mirror of the CMD PENDING_ACK timeout — for any teardown /
+// fall-through path that strands the slot. Bound: 4x the control round-trip
+// (ack_timeout_control, recalculated per config) floored at 8s so the 1000ms init
+// default before the first recalculation cannot make it fire prematurely, and the
+// multiplier guarantees the watchdog never pre-empts a legitimate same-tick
+// consume. Shared with --test-rx-ctrl-drop (synthetic elapsed, no wall sleep).
+bool cl_arq_controller::rx_ctrl_received_watchdog_expired(int status, int counting,
+	int elapsed_ms) const
+{
+#ifdef RX_CTRL_DROP_FAILBEFORE
+	// FAIL-BEFORE arm: the watchdog never fires -> a stranded RECEIVED slot stays
+	// stuck forever (the pre-fix behaviour), so the regression's pass-after assert
+	// (a later control frame is delivered) FAILS, proving the escape is load-bearing.
+	(void)status; (void)counting; (void)elapsed_ms;
+	return false;
+#else
+	if(status != RECEIVED) return false;
+	if(counting != YES)    return false;   // ack_timer not armed (not a RECEIVED slot)
+	int bound_ms = 4 * ack_timeout_control;
+	if(bound_ms < 8000) bound_ms = 8000;
+	return elapsed_ms >= bound_ms;
+#endif
+}
+
 void cl_arq_controller::update_status()
 {
 	for(int i=0;i<nMessages;i++)
@@ -5718,6 +5748,37 @@ void cl_arq_controller::update_status()
 	if(messages_control.status==PENDING_ACK && messages_control.ack_timer.get_elapsed_time_ms()>=messages_control.ack_timeout)
 	{
 		messages_control.status=ACK_TIMED_OUT;
+		stats.nNAcked_control++;
+	}
+
+	// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change A): RECEIVED-state
+	// watchdog force-FREE. The one-deep messages_control mailbox MUST return to FREE
+	// within one control round-trip (the consumers at arq_responder.cc:279/:382/:825
+	// only copy a new control frame when the slot is FREE — a slot stuck in RECEIVED
+	// silently DROPS every subsequent control frame and kills the reverse control
+	// plane). Several teardown / fall-through paths (V1 unhandled-code, V2 RESPONDER
+	// link/connection timeout, V3 watchdog recovery, V4 crypto/CLOSE teardown via
+	// reset_session_state) could strand the slot in RECEIVED with no consumer. This is
+	// the catch-all escape — the exact mirror of the CMD PENDING_ACK timeout above
+	// (the CMD has always had an escape out of its waiting state; the RSP RECEIVED
+	// state had none). The per-slot ack_timer is armed at the RECEIVED producer
+	// (arq_responder.cc:825 block) and is otherwise idle in this state. Bound: a
+	// generous multiple of ack_timeout_control (the control round-trip) with a fixed
+	// floor, so the watchdog NEVER pre-empts a legitimate same-tick consume.
+	if(rx_ctrl_received_watchdog_expired(messages_control.status,
+		messages_control.ack_timer.counting,
+		messages_control.ack_timer.get_elapsed_time_ms()))
+	{
+		printf("[RX-CTRL-DROP] WATCHDOG FREE: messages_control stuck in RECEIVED for "
+			"%d ms code=%d link_status=%d connection_status=%d — forcing FREE "
+			"(reverse control plane was wedged)\n",
+			messages_control.ack_timer.get_elapsed_time_ms(),
+			(messages_control.data != NULL) ? (int)messages_control.data[0] : -1,
+			link_status, connection_status);
+		fflush(stdout);
+		messages_control.ack_timer.stop();
+		messages_control.ack_timer.reset();
+		messages_control.status = FREE;
 		stats.nNAcked_control++;
 	}
 
@@ -7095,6 +7156,25 @@ void cl_arq_controller::reset_session_state()
 	// dead session's crypto epoch + bsi window — discard them so they cannot be
 	// prepended to the first batch of the next session.
 	clear_retx_queue();
+
+	// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change C): centralize
+	// the control-slot teardown FREE here. reset_session_state() previously NEVER
+	// touched messages_control, so every teardown caller that relied on it
+	// (V2 RESPONDER link/connection timeout arms, V4 crypto KEY_ACTIVATE-mismatch
+	// and CLOSE_CONNECTION non-monitor teardown) could leave the slot stuck in
+	// RECEIVED across the session boundary, wedging the reverse control plane for the
+	// NEXT session. Freeing it here makes the invariant ("a torn-down session has a
+	// FREE control mailbox") hold for ALL callers at once. The several callers that
+	// already set messages_control.status = FREE after reset_session_state()
+	// (arq_common.cc:5749/:5785/:5833/:5889, arq_responder.cc CLOSE-monitor) become
+	// redundant-but-idempotent. No consumer reads the slot between reset and the next
+	// produce gate, so this cannot strip a still-needed RECEIVED frame.
+#ifndef RX_CTRL_DROP_FAILBEFORE
+	messages_control.ack_timer.stop();
+	messages_control.ack_timer.reset();
+	messages_control.status = FREE;
+	messages_control_bu.status = FREE;
+#endif
 }
 
 void cl_arq_controller::opt_load_rate_table()
