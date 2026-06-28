@@ -121,3 +121,77 @@ keystone cleanly separates the originally-committed single-P magnitude form (dri
 - [ ] Adversarial review of the per-lag combining math.
 - [ ] DIRECTION-validate in the (now-fast) sim.
 - [ ] Hardware magnitude check at wgn0 on the IONOS testbed.
+
+## §6 FIX A — matched-template fine timing at site-8 (2026-06-27, branch staging/wb-acq-matched)
+
+The self-autocorrelation fine timer (`time_sync_preamble_with_metric`) is MEAN-limited (Schmidl-Cox:
+metric mean is SNR-only, length buys variance not floor). For the lead/tail frames of a forward
+CONFIG_0 batch it ties ~equally on the WRONG adjacent-symbol boundary → mistimed FFT window →
+inflated pilot-residual nv → SKIP-VAR pre-LDPC reject (the steady `0x0c` drop; SNR-invariant
+WGN:40==WGN:35). Root cause + sim validation: `ofdm-data-acquisition-fix-plan.md` §13 (matched
+resolves 66-91% of the self-autocorr failures at the wgn0 operating point, sub-sample median |err|).
+
+### §6.1 The change
+- **Template build re-enabled**: `telecom_system.cc` OFDM `ofdm_corr_template` build was `#if 0`
+  (comment "using Schmidl-Cox autocorrelation"); now LIVE in the non-MFSK config branch. Builds the
+  FIR-round-tripped, pre-equalized preamble template at each config load. The `[TMPL-PREEQ]` /
+  `[TMPL-INIT]` diagnostics are `g_verbose`-gated; the one-line `[PHY] OFDM corr template` summary
+  stays (mirrors the MFSK template log).
+- **Wired at site-8 fine stage**: after the self-autocorr `time_sync_preamble_with_metric` call,
+  for OFDM-tier configs with the template built, run `time_sync_preamble_matched` over the SAME
+  already-narrow fine slice (`baseband_data_fine_slice[s8_interior]`, length `s8_search_len`). The
+  slice is seeded near the coarse position (`(pream_symb_loc-1)*Nofdm*M`), so matched is implicitly
+  seeded — the codec2 narrow-re-est pattern, avoiding the deep-cell wrong-frame outliers a
+  full-buffer matched search showed (§13.2). PREFER the matched delay when its metric clears the
+  CONFIDENCE FLOOR `0.5·matched_nsymb`; else KEEP the self-autocorr (the fallback / N-th-peak retry
+  source on `receive_stats.sync_trials`).
+
+### §6.2 §5 / §3 cross-layer audit (`receive_stats.delay` shared site)
+- **coarse_metric [0,1] ARQ contract** (consumers `arq_common.cc:6453/6574/6615`): UNTOUCHED. The
+  matched delay feeds `receive_stats.delay` ONLY. `coarse_metric` is fed exclusively by the coarse
+  detectors (the fine metric is documented as consumed by NO caller, `ofdm.cc` fine-fn header). NO
+  threshold / mean_H / SKIP-VAR retune — matched is amplitude-independent (Cauchy-Schwarz).
+- **Trial loop / subpeak recovery / SKIP-H retry**: all read `receive_stats.delay`. Matched is an
+  IN-PLACE refinement of the same delay the with_metric call produced; when matched is low-confidence
+  the delay is byte-identical to the self-autocorr (fallthrough), so the N-th-peak retry semantics
+  (`location_to_return=sync_trials`) and the subpeak recovery are preserved unchanged.
+- **ofdm_batch_active predict/verify drift IIR** (`ofdm_drift_per_frame`): consumes the chosen delay;
+  matched only refines it within the already-bounded slice, so the IIR converges on the same scale.
+- **CONFIDENCE GATE protects the deep cells**: §12 proved the wall at the deep cells is DECODE, not
+  timing. There matched's metric is unmet → the gate keeps the self-autocorr → no regression of a
+  decode-walled cell. The win is at the decode-CAPABLE wgn0 cell (decode proven by seq 2,3).
+
+### §6.3 Fail-before / pass-after (`--test`, `test_ofdm_matched_template_fine_timing`)
+`test_ofdm_matched_template_fine_timing` (in the `--test-ofdm-fine-timing` group): (1) FAIL-BEFORE /
+PASS-AFTER on the template BUILD — asserts `ofdm_corr_template != NULL` + energy>0 after
+`load_configuration(CONFIG_0)`; FAILS with the `#if 0` build disabled (template NULL → matched dead).
+(2) FIDELITY PROBE (diagnostic): correlates the template against the REAL pre-equalized TX preamble
+(`transmit_byte` path) at the known frame start and reports per-symbol Cauchy-Schwarz.
+
+### §6.5 STATUS — template fidelity PROVEN; production override PARKED on a slice-coordinate blocker
+The fidelity probe reports **per_sym_cs = 0.998 (total_cs 3.992 / 4 symbols)** against the real
+pre-equalized TX preamble → the re-enabled `#if 0` template build is CORRECT and byte-faithful to the
+TX (it ships, default-on; it also powers the existing `arq_common.cc` TX-SELFTEST). HOWEVER the
+PRODUCTION matched-fine OVERRIDE at site-8 is **DEFAULT-OFF** behind `MERCURY_WB_MATCHED_FINE`:
+- With the override ON, `test_ofdm_fine_timing_magnitude_clean_no_regression` (the REAL TX roundtrip,
+  clean SNR3k=20) REGRESSES — `delay_err=1240` (exactly 1 symbol), `mean_H 0.998→0.302`, CRC fail.
+- Trace: the self-autocorr returns the CORRECT slice offset (`self=1240`); but the matched detector,
+  scanning the production `baseband_data_fine_slice`, finds its coarse global-max at slice-offset **0**
+  with metric ~2.965, NOT at 1240 (which scores LESS). With per-symbol fidelity 0.998 proven, this is
+  NOT a template-fidelity failure — it is a SLICE-COORDINATE / search-geometry mislocation: the
+  production slice (mixed at `carrier_frequency + coarse_freq_offset`, guard-margin-padded, preamble
+  starting ~1 symbol into the searched region) presents a 1-symbol-early plateau the matched coarse
+  global-max picks, distinct from the clean isolated-buffer geometry the §13.2 SHADOW validator used.
+  Seeding matched ±1 symbol around `self` did not help because `self` sits exactly 1 symbol into the
+  slice → `seed = self - 1sym = 0` → the window still spans the early plateau.
+- DISPOSITION (CLAUDE.md §2/§3: 3-fail STOP, no untested fix default-on): the override is a temporary,
+  actively-driven A/B gate. FOLLOW-UP = align the matched search anchor to the slice's true preamble
+  region (use `s8_win_start`/`pream_symb_loc` as the absolute anchor, not the relative `self`, and
+  bound the coarse search to ±Ngi around the coarse-derived expected symbol so the early plateau is
+  outside the search), then re-run the clean no-regression + the cfo cliff + the bench post-cross.
+  The DURABLE win (template build) is landed; only the override wiring remains.
+
+### §6.4 NOT resolved here / bench confirmation owed
+Per the MEMORY bench-claim guard: the structural fix is sim/static-validated; HW confirmation (md5
+the deployed binary FIRST) must measure the post-cross full-decode rate (2/6→6/6 or ≥5/6) and the
+SKIP-VAR aborts/cell collapsing, with the steady `0x0c` bitmap filling toward `0x3f`. NOT run here.

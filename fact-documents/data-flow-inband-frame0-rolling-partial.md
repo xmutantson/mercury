@@ -707,3 +707,55 @@ real + unfixed on this HEAD). It does **NOT** resolve the ~77B throughput stall:
 SEPARATE binding root — the reverse data-SACK delivery loop / giant-batch turnaround at the climbed rung.
 Whether the bsi rollback was the binding wedge or that delivery-loop root still binds is for a realtime
 A/B (NOT run here) to determine. No throughput claim is made.
+
+## §14 FIX B — STRUCTURAL-ACQ-SEAM climb unblock (2026-06-27, branch staging/wb-acq-matched)
+
+The forward CONFIG_0 acquisition seam drops the SAME multi-frame set EVERY batch — observed
+bitmap `0x0000000c` (seq 2,3 received, seq 0,1,4,5 missing; n_miss=4, bit0 clear), SNR-independent
+(WGN:40==WGN:35) → STRUCTURAL, not a noise-marginal rung (raw RSP logs, `WB_FORWARD_ACQ_PLAN.md`).
+The existing lead-frame-only predicate (`inband_lead_frame_only_partial()`, §2) admits only
+`bit0 clear && n_miss∈[1,2]`, so the n_miss=4 multi-drop falls to the strict clean-batch gate and
+the climb WEDGES at CONFIG_0. FIX B admits the STRUCTURAL multi-drop using REPETITION as the
+SNR-independent §9 discriminator (a noise rung loses DIFFERENT frames batch-to-batch → never builds
+the streak). This is a CRAWL net paired with FIX A (matched-template fine timing, the durable cure
+that lands the lead/tail windows so the rung completes 6/6).
+
+### §14.1 New shared state (CMD-only)
+- `last_structural_acq_bitmap` (uint32) — the masked received bitmap currently accumulating.
+- `structural_acq_partial_streak` (int) — consecutive batches with bit0 clear, n_miss>2, SAME masked
+  bitmap. Declared `include/datalink_layer/arq.h`.
+- `#define INBAND_STRUCTURAL_ACQ_K 2` — min repeats before admission (a single multi-drop is never
+  admitted; it could be transient).
+
+### §14.2 §5 Cross-layer audit
+1. **Producers** of the fingerprint:
+   - `arq_commander.cc` MFSK-ACK-SACK partial site (`inband_update_structural_acq_fingerprint(rx_bitmap & all_ones, n_miss)`).
+   - `arq_commander.cc` OFDM SACK_RSP partial site (same helper, masked from `sack_bitmap[]`).
+   - RESET to 0 at: every CLEAN batch site (MFSK clean, the canonical clean site, the LDPC range/multi
+     clean sites), and inside the helper on any non-(bit0-clear,n_miss>2) batch (lead-only / tail-only
+     / frame-0-present). NOT reset at per-batch TX start (`:2008/:2558`) — the streak must persist
+     across batches to accumulate; only an ACK outcome moves it.
+2. **Consumers**: `inband_structural_acq_partial()` (PURE; feature+OFDM-gated; streak≥K), read at
+   (a) the FRAME-UP `batch_promotable` gate and (b) the ROLLING-PARTIAL ANCHOR-RAISE `else if`. Both
+   were extended from `lead_frame_only` to `(lead_frame_only || structural_acq)`.
+3. **Valid states / default-init**: streak=0, bitmap=0 (ctor default-member-init). Before any partial,
+   the predicate returns false (legacy byte-identical).
+4. **Invariants the consumers assume & how the producer maintains them**:
+   - The DEFER-WHILE-HOLE-OUTSTANDING guard (`!inband_climb_hole_outstanding()`, = retransmit_count>0)
+     gates the actual config-change FIRE and the anchor-raise, so the structural multi-drop's 4 retx
+     holes drain (mixbatch `:1919`) BEFORE the climb fires → no `clear_retx_queue()` orphan →
+     no RSP-V2-GAP-ABORT. The structural path rides the IDENTICAL safety net as the lead-frame path;
+     no new guard needed.
+   - The +1 anchor clamp (`:5510`) still bounds the climb to one rung above proven ground; the
+     overshoot net (`inband_retag_escalate_if_climb_exhausted`) recovers a too-eager climb.
+   - `coarse_metric` / SKIP-VAR are untouched (FIX B is pure ARQ predicate).
+5. **What the fix changes**: it RELAXES the §9 anti-thrash veto for the SPECIFIC case of a REPEATED
+   identical multi-drop (the structural fingerprint). A genuinely-marginal rung loses varying frames
+   → streak re-seeds to 1 each batch → never reaches K → still vetoed. Verified by directed test
+   verdicts G (varying multi-drops NOT promotable) and F1 (single 0x0c NOT promotable).
+
+### §14.3 Regression (`--test-inband-frame0-partial`, `test_inband_frame0_partial()`)
+Added verdicts F (structural 0x0c repeated K batches → PROMOTABLE; fails-before with
+`-DINBAND_STRUCTURAL_ACQ_FAILBEFORE`), F1 (single 0x0c → NOT promotable), G (varying multi-drops →
+NOT, §9 preserved), H (clean mid-run resets the streak), I (structural at ROBUST rung → NOT,
+OFDM-only), J (flag-off byte-identical). The lambda mirrors the production producer→consumer chain.

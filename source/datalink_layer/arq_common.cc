@@ -3462,6 +3462,59 @@ bool cl_arq_controller::inband_lead_frame_only_partial()
 #endif
 }
 
+// IN-BAND CONFIG_0 STRUCTURAL-ACQ-SEAM climb unblock (FIX B; WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1;
+// fact-documents/data-flow-inband-frame0-rolling-partial.md §11). PURE predicate. true iff: the
+// in-band feature is on, the live config is an OFDM-tier config, and a STRUCTURAL acquisition-seam
+// multi-drop has been observed — the SAME masked bitmap (bit0 clear, n_miss>2) repeated across
+// ≥ INBAND_STRUCTURAL_ACQ_K consecutive batches. The repetition (not the magnitude) is the
+// SNR-independent discriminator: a noise-marginal rung loses DIFFERENT frames batch-to-batch so the
+// streak never reaches K → this returns false → the §9 anti-thrash veto stands. Used ONLY to relax
+// the FRAME-UP clean-streak gate so the forward CONFIG_0 acq seam crawls instead of wedging while
+// FIX A (matched-template fine timing) lands the lead/tail windows. Flag-off / legacy → false.
+bool cl_arq_controller::inband_structural_acq_partial()
+{
+#ifdef INBAND_STRUCTURAL_ACQ_FAILBEFORE
+	// FAIL-BEFORE arm: the structural acq-seam multi-drop NEVER unblocks the climb (the pre-fix
+	// strict-clean gate). The directed test's pass-after assert (a repeated 0x0c structural partial
+	// advances the streak) then FAILS, proving the relaxation is load-bearing.
+	return false;
+#else
+	if(!inband_rate_feature_enabled())
+		return false;
+	if(!is_ofdm_config(current_configuration))
+		return false;
+	return structural_acq_partial_streak >= INBAND_STRUCTURAL_ACQ_K;
+#endif
+}
+
+// Producer-side updater for the structural-acq-seam fingerprint (FIX B). Maintains
+// structural_acq_partial_streak / last_structural_acq_bitmap. A batch counts toward the structural
+// streak ONLY when it is a multi-drop with frame-0 missing (masked_bitmap bit0 clear, n_miss>2) AND
+// its masked bitmap EQUALS the one already accumulating. A different multi-drop bitmap re-seeds the
+// streak to 1 (a new candidate fingerprint, not yet trusted). Anything else (lead-frame-only
+// partial, tail-only partial, clean batch, frame-0 present) RESETS the streak — those are not the
+// structural acq-seam case. The repetition requirement is the SNR-independent §9 discriminator.
+void cl_arq_controller::inband_update_structural_acq_fingerprint(uint32_t masked_bitmap, int n_miss)
+{
+	bool is_multidrop_lead = ((masked_bitmap & 1u) == 0u) && (n_miss > 2);
+	if(!is_multidrop_lead)
+	{
+		structural_acq_partial_streak = 0;
+		last_structural_acq_bitmap = 0;
+		return;
+	}
+	if(structural_acq_partial_streak > 0 && masked_bitmap == last_structural_acq_bitmap)
+	{
+		structural_acq_partial_streak++;
+	}
+	else
+	{
+		// New (or first) multi-drop fingerprint: seed the streak at 1. It must REPEAT to reach K.
+		structural_acq_partial_streak = 1;
+		last_structural_acq_bitmap = masked_bitmap;
+	}
+}
+
 // IN-BAND ROLLING-PARTIAL climb DEFER-while-hole-outstanding
 // (fact-documents/data-flow-inband-frame0-rolling-partial.md §10). PURE predicate. See the
 // header for the full rationale. true iff: the in-band feature is on AND the retransmit queue is

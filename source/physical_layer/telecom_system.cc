@@ -2470,7 +2470,91 @@ skip_h_retry_point:
 					s8_search_len,
 					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max,
 					(preamble_amortization_enabled && M != MOD_MFSK) ? rx_eff_preamble : -1);
-				receive_stats.delay = s8_win_start + fine_result.delay;
+				int s8_fine_delay = fine_result.delay;
+				// FIX A (WB_FORWARD_ACQ_PLAN.md §3 FIX-A; ofdm-data-acquisition-fix-plan.md §13.5):
+				// for OFDM-tier configs, PREFER the matched-template fine timing over the self-
+				// autocorrelation when it is CONFIDENT. The self-autocorr (with_metric) is mean-limited:
+				// its metric ties ~equally on the WRONG adjacent-symbol boundary for the lead/tail
+				// frames of a batch (§13.1), so they land a mistimed FFT window → inflated pilot nv →
+				// SKIP-VAR reject (the steady forward CONFIG_0 0x0c drop). The matched-template cross-
+				// correlation against the KNOWN preamble (time_sync_preamble_matched) resolves the tie
+				// (sub-sample median |err|; §13.2 measured 66-91% of the self-autocorr failures resolved
+				// at the wgn0 operating point). It runs over the SAME already-narrow slice (the codec2
+				// narrow-re-est pattern) so it is implicitly SEEDED near the coarse position, avoiding
+				// the low-SNR wrong-frame outliers §13.2 saw on a full-buffer search.
+				//
+				// CONFIDENCE GATE: matched degrades sharply BELOW the wgn0 operating point (it grabs
+				// wrong frames / noise peaks at deep SNR; §13.2/§13.5). Its metric is a sum of per-symbol
+				// Cauchy-Schwarz values (~nSymb at a clean preamble, ~0 at data/noise). Only prefer
+				// matched when its metric clears half the matched symbols — at the deep cells (where §12
+				// proved the wall is DECODE, not timing) the gate is unmet and we KEEP the self-autocorr,
+				// so this never regresses a decode-walled cell. The self-autocorr remains the fallback /
+				// N-th-peak retry source (receive_stats.sync_trials), and matched feeds receive_stats.
+				// delay ONLY — coarse_metric stays on the separate coarse-detector [0,1] path (the
+				// load-bearing ARQ contract; ofdm.cc:2909-2911), so NO threshold/mean_H retune.
+				//
+				// GATE STATE (2026-06-27): DEFAULT-OFF, actively-driven A/B (MERCURY_WB_MATCHED_FINE=1).
+				// The re-enabled #if 0 template build (telecom_system.cc OFDM branch) does NOT yet match
+				// the RX preamble at ~1.0/symbol: on the REAL pre-eq'd TX roundtrip the matched metric at
+				// the TRUE position is ~0.74/symbol (2.96/4), so with the K IDENTICAL Zadoff-Chu preamble
+				// symbols a 1-symbol-early position scores EQUALLY and matched mislocates by 1 symbol →
+				// regresses the clean fine stage. The §13.2 win was measured with the in-process SHADOW
+				// template (build_ofdm_corr_template_shadow), which is NOT byte-equivalent to this build —
+				// reconciling them is the open prerequisite (see ofdm-fine-timing-magnitude.md §6.5).
+				// The build is LEFT ENABLED (harmless; it powers TX-SELFTEST fidelity reporting), and the
+				// override is parked behind the flag until the per-symbol fidelity is fixed. CLAUDE.md:
+				// no untested fix ships default-on; this is the temporary, actively-driven A/B gate.
+				static int s_wb_matched_fine = -1;
+				if(s_wb_matched_fine < 0) {
+					const char* e = getenv("MERCURY_WB_MATCHED_FINE");
+					s_wb_matched_fine = (e && e[0] && e[0] != '0') ? 1 : 0;
+				}
+				if(s_wb_matched_fine && M != MOD_MFSK
+				   && ofdm.ofdm_corr_template != NULL && ofdm.ofdm_corr_template_len > 0)
+				{
+					int matched_nsymb =
+						(preamble_amortization_enabled ? rx_eff_preamble : data_container.preamble_nSymb);
+					if(matched_nsymb > ofdm.ofdm_corr_template_nsymb)
+						matched_nsymb = ofdm.ofdm_corr_template_nsymb;
+					// SEED matched at the self-autocorr position (§13.5 step 2). The preamble is K IDENTICAL
+					// Zadoff-Chu symbols (ofdm.cc:1391), so over the WHOLE slice the matched coarse global-max
+					// can tie on a 1-symbol-early plateau (K-1 of K symbols overlap) — the SAME adjacent-symbol
+					// trap the self-autocorr hits. Constraining the search to a NARROW window (±1 symbol) around
+					// the self-autocorr delay removes the early-plateau tie: matched then resolves the SUB-symbol
+					// offset INSIDE the window (the codec2 narrow-re-est pattern) and cannot slide a full symbol.
+					// Window is in slice coords; matched returns a delay relative to the sub-window start.
+					int matched_sym = data_container.Nofdm * data_container.interpolation_rate;
+					int matched_seed = fine_result.delay - matched_sym;     // 1 symbol before self
+					if(matched_seed < 0) matched_seed = 0;
+					int matched_win = (matched_nsymb + 2) * matched_sym;     // preamble + ±1 sym slack
+					if(matched_seed + matched_win > s8_search_len)
+						matched_win = s8_search_len - matched_seed;
+					TimeSyncResult matched_result;
+					matched_result.delay = 0; matched_result.correlation = -1.0;
+					if(matched_win >= matched_nsymb * matched_sym)
+						matched_result = ofdm.time_sync_preamble_matched(
+							&data_container.baseband_data_fine_slice[s8_interior + matched_seed],
+							matched_win,
+							data_container.interpolation_rate, matched_nsymb);
+					double matched_conf_floor = 0.5 * (double)matched_nsymb;
+					if(matched_result.correlation >= matched_conf_floor)
+					{
+						s8_fine_delay = matched_seed + matched_result.delay;
+						if(g_verbose)
+							printf("[OFDM-SYNC] matched-fine: delay self=%d -> matched=%d "
+								"(seed=%d win=%d metric=%.3f >= floor=%.3f, nsymb=%d)\n",
+								fine_result.delay, s8_fine_delay, matched_seed, matched_win,
+								matched_result.correlation, matched_conf_floor, matched_nsymb);
+					}
+					else if(g_verbose)
+					{
+						printf("[OFDM-SYNC] matched-fine: KEEP self=%d (matched metric=%.3f < floor=%.3f) "
+							"matched_delay=%d seed=%d\n",
+							fine_result.delay, matched_result.correlation,
+							matched_conf_floor, matched_seed + matched_result.delay, matched_seed);
+					}
+				}
+				receive_stats.delay = s8_win_start + s8_fine_delay;
 			}
 
 			if(receive_stats.delay<0){receive_stats.delay=0;}
@@ -11216,7 +11300,16 @@ void cl_telecom_system::load_configuration(int configuration)
 		for(int s = 0; s < 16; s++) ofdm.mfsk_preamble_tones[s] = 0;
 		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
 
-#if 0 // Template generation disabled: using Schmidl-Cox autocorrelation
+		// FIX A (WB_FORWARD_ACQ_PLAN.md §3 FIX-A; ofdm-data-acquisition-fix-plan.md §13.5
+		// GO_BUILD_MATCHED_SWAP): the OFDM matched-filter template build was disabled (#if 0) when
+		// the receiver used Schmidl-Cox self-autocorrelation for fine timing. The forward CONFIG_0
+		// acq seam (lead/tail frames tie on the WRONG adjacent-symbol boundary → mistimed FFT window
+		// → inflated pilot-residual nv → SKIP-VAR reject) is a self-autocorr MEAN-limited failure
+		// (SNR-invariant). The matched-template cross-correlation against the KNOWN preamble resolves
+		// the wrong-symbol tie (sub-sample median |err| at the wgn0 operating point; §13.2), so we
+		// re-enable the build and route the data-frame fine timing through time_sync_preamble_matched
+		// at the site-8 fine stage below. Amplitude-independent (Cauchy-Schwarz) → no SKIP-VAR /
+		// mean_H / coarse_metric threshold retune (the [0,1] ARQ contract is untouched).
 		// Generate OFDM matched-filter template for preamble detection.
 		// Must replicate the full TX→RX chain so the template matches what
 		// receive_byte actually sees:
@@ -11242,15 +11335,17 @@ void cl_telecom_system::load_configuration(int configuration)
 			ofdm.symbol_mod(preamble_sc, &bb_template[i * Nofdm]);
 		}
 
-		// === DIAG: pre_eq at template generation (remove after debug) ===
-		printf("[TMPL-PREEQ] CONFIG_%d preamble_nSymb=%d pre_eq[0..4]=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)\n",
-			current_configuration, template_nsymb,
-			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
-			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag(),
-			pre_equalization_channel[2].value.real(), pre_equalization_channel[2].value.imag(),
-			pre_equalization_channel[3].value.real(), pre_equalization_channel[3].value.imag(),
-			pre_equalization_channel[4].value.real(), pre_equalization_channel[4].value.imag());
-		fflush(stdout);
+		// DIAG: pre_eq at template generation (verbose-gated).
+		if(g_verbose) {
+			printf("[TMPL-PREEQ] CONFIG_%d preamble_nSymb=%d pre_eq[0..4]=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)\n",
+				current_configuration, template_nsymb,
+				pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
+				pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag(),
+				pre_equalization_channel[2].value.real(), pre_equalization_channel[2].value.imag(),
+				pre_equalization_channel[3].value.real(), pre_equalization_channel[3].value.imag(),
+				pre_equalization_channel[4].value.real(), pre_equalization_channel[4].value.imag());
+			fflush(stdout);
+		}
 
 		// Apply power normalization + output power + preamble boost (same as transmit_bit lines 601-602).
 		// sqrt(output_power_Watt) MUST be included so peak_clip applies at the same
@@ -11326,21 +11421,22 @@ void cl_telecom_system::load_configuration(int configuration)
 
 		printf("[PHY] OFDM corr template: %d symbols, %d samples, energy=%.3f (matched filter, FIR round-tripped)\n",
 			template_nsymb, bb_len, ofdm.ofdm_corr_template_energy);
-		printf("[TMPL-INIT] t[0]=(%.6f,%.6f) t[1]=(%.6f,%.6f) t[2]=(%.6f,%.6f)\n",
-			ofdm.ofdm_corr_template[0].real(), ofdm.ofdm_corr_template[0].imag(),
-			ofdm.ofdm_corr_template[1].real(), ofdm.ofdm_corr_template[1].imag(),
-			ofdm.ofdm_corr_template[2].real(), ofdm.ofdm_corr_template[2].imag());
-		printf("[TMPL-INIT] FIR_ts: nTaps=%d cut=%.1f trans=%.1f\n",
-			ofdm.FIR_rx_time_sync.filter_nTaps,
-			ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency,
-			ofdm.FIR_rx_time_sync.filter_transition_bandwidth);
-		printf("[TMPL-INIT] carrier_freq=%.1f output_power=%.3f pre_eq[0]=(%.4f,%.4f) pre_eq[1]=(%.4f,%.4f)\n",
-			carrier_frequency, output_power_Watt,
-			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
-			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag());
 		fflush(stdout);
-	}
-#endif
+		if(g_verbose) {
+			printf("[TMPL-INIT] t[0]=(%.6f,%.6f) t[1]=(%.6f,%.6f) t[2]=(%.6f,%.6f)\n",
+				ofdm.ofdm_corr_template[0].real(), ofdm.ofdm_corr_template[0].imag(),
+				ofdm.ofdm_corr_template[1].real(), ofdm.ofdm_corr_template[1].imag(),
+				ofdm.ofdm_corr_template[2].real(), ofdm.ofdm_corr_template[2].imag());
+			printf("[TMPL-INIT] FIR_ts: nTaps=%d cut=%.1f trans=%.1f\n",
+				ofdm.FIR_rx_time_sync.filter_nTaps,
+				ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency,
+				ofdm.FIR_rx_time_sync.filter_transition_bandwidth);
+			printf("[TMPL-INIT] carrier_freq=%.1f output_power=%.3f pre_eq[0]=(%.4f,%.4f) pre_eq[1]=(%.4f,%.4f)\n",
+				carrier_frequency, output_power_Watt,
+				pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
+				pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag());
+			fflush(stdout);
+		}
 	}
 
 	bit_interleaver_block_size=data_container.nBits/10;

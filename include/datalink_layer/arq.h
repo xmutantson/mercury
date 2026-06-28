@@ -3740,6 +3740,22 @@ public:
   // leaves last_partial_lead_frame_only false → this returns false → strict-clean gate stands.
   // Flag-off / legacy → false (byte-identical). Replayed by --test-inband-frame0-partial.
   bool inband_lead_frame_only_partial();
+  // IN-BAND CONFIG_0 STRUCTURAL-ACQ-SEAM climb unblock (FIX B; WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1).
+  // PURE predicate (no I/O): returns true iff the in-band feature is on, the live config is an
+  // OFDM-tier config, and the last partials show a STRUCTURAL acquisition-seam multi-drop — the
+  // SAME masked bitmap (bit0 clear, n_miss>2) repeated across ≥INBAND_STRUCTURAL_ACQ_K consecutive
+  // batches (structural_acq_partial_streak ≥ K). SNR-independent by construction: a noise-marginal
+  // rung loses DIFFERENT frames batch-to-batch so the streak never reaches K → stays vetoed (§9
+  // anti-thrash preserved). Used ONLY to relax the FRAME-UP clean-streak gate for the rolling
+  // forward CONFIG_0 acq-seam multi-drop (the steady 0x0c bitmap) so the climb crawls instead of
+  // wedging while FIX A lands the lead/tail windows. Flag-off / legacy → false (byte-identical).
+  bool inband_structural_acq_partial();
+  // Producer-side updater for the structural-acq-seam fingerprint (FIX B). Called at BOTH partial
+  // sites (MFSK-ACK-SACK + OFDM SACK_RSP) with the masked received bitmap and the missing-frame
+  // count for the batch. Builds structural_acq_partial_streak when the SAME masked bitmap (bit0
+  // clear, n_miss>2) repeats; resets it otherwise. A lead-frame-only partial or a clean batch is
+  // NOT a structural multi-drop → it resets the streak (call with reset semantics). CMD-only.
+  void inband_update_structural_acq_fingerprint(uint32_t masked_bitmap, int n_miss);
   // IN-BAND ROLLING-PARTIAL climb DEFER-while-hole-outstanding
   // (fact-documents/data-flow-inband-frame0-rolling-partial.md §10). PURE predicate (no I/O):
   // returns true iff the in-band feature is on AND the retransmit queue is non-empty
@@ -4185,6 +4201,12 @@ public:
   // liveness-BREAKs per session before a hard session reset (shared by the guard +
   // its regression test in arq_responder.cc).
   #define INBAND_LIVENESS_MAX_BREAKS 3
+  // STRUCTURAL-ACQ-SEAM climb unblock (FIX B): minimum consecutive batches that must lose the SAME
+  // multi-frame set (bit0 clear, n_miss>2) before inband_structural_acq_partial() admits the climb.
+  // K=2: a single multi-drop is NEVER admitted (it could be a transient noise event); only a
+  // REPEATED identical loss — the structural acq-seam fingerprint — unblocks. This is the §9
+  // anti-thrash discriminator (repetition, not magnitude).
+  #define INBAND_STRUCTURAL_ACQ_K 2
   int  inband_liveness_stall_polls_count();   // MERCURY_INBAND_LIVENESS_POLLS, default 200
   bool inband_connect_liveness_guard();       // once-per-poll commander watchdog (gated ON);
                                               // returns true if it fired a recovery (caller returns)
@@ -4303,6 +4325,20 @@ public:
   // partial advances the climb streak instead of vetoing it. A MULTI-frame-drop partial leaves
   // this false (the §9 anti-thrash veto is preserved). CMD-only.
   bool last_partial_lead_frame_only = false;
+  // IN-BAND CONFIG_0 STRUCTURAL-ACQ-SEAM climb unblock (FIX B, WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1;
+  // fact-documents/data-flow-inband-frame0-rolling-partial.md §11). Distinct from the lead-frame-
+  // only partial above: the OBSERVED forward CONFIG_0 acquisition seam drops the SAME multi-frame
+  // set (bit0 clear, n_miss>2 — e.g. bitmap 0x0c, seq 0,1,4,5 lost) EVERY batch, SNR-independent
+  // (WGN:40==WGN:35). That is a STRUCTURAL acq-seam loss, not a noise-marginal rung. The
+  // discriminator vs a marginal rung is REPETITION OF THE EXACT SAME LOSS: a noise rung loses
+  // DIFFERENT frames batch-to-batch → the streak never builds → stays vetoed (§9 anti-thrash
+  // preserved). last_structural_acq_bitmap holds the masked bitmap that has been repeating;
+  // structural_acq_partial_streak counts consecutive batches with bit0 clear, n_miss>2, and the
+  // SAME masked bitmap. Read ONLY by inband_structural_acq_partial() at the FRAME-UP gate. Cleared
+  // on every clean/full ACK and on a lead-frame-only partial (those are NOT the structural case).
+  // CMD-only.
+  uint32_t last_structural_acq_bitmap = 0;
+  int structural_acq_partial_streak = 0;
   int frame_shift_threshold;       // Shift up after this many consecutive ACKs (default 3)
   bool frame_gearshift_just_applied;  // true after frame upshift ACKed — BREAK on first data failure
   int  frame_gearshift_retry_count;   // §7.13.33: retries on PHY-switched first batch before BREAK (rx_mute timing race)

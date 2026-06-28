@@ -4175,6 +4175,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// climb-engine Bug 1: record this clean batch bsi so a REPEATED clean for
 									// the same bsi is deduped (no double-count of nBatches_fully_acked).
 									cmd_last_applied_clean_bsi = (int)rx_bsi;
+									// FIX B (WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1): a CLEAN MFSK-ACK-SACK batch proves the rung is
+									// fully viable now -> break the structural acq-seam streak (the structural unblock is only
+									// for the wedge where the rung CANNOT produce a clean batch).
+									structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;
 									// STAGE 4d (D1 CONFIRM): a CLEAN SACK at-or-after the announce bsi proves the
 									// RX demodulated a batch sent at the announced config -> DISARM the re-tag
 									// (design §1.1/§1.3 consumer 1). No-op when not armed / stale bsi / inband off.
@@ -4211,6 +4215,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										int n_miss = data_batch_size - __builtin_popcount(rx_bitmap & all_ones);
 										last_partial_lead_frame_only =
 											((rx_bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
+										// FIX B (WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1): track the structural
+										// acq-seam fingerprint (same bit0-clear, n_miss>2 bitmap repeated)
+										// so a STRUCTURAL multi-drop unblocks the climb while a noise rung
+										// (varying losses) stays vetoed. Mask off any bits above the batch.
+										inband_update_structural_acq_fingerprint(rx_bitmap & all_ones, n_miss);
 									}
 									// STAGE 4d (D1 CONFIRM): a PARTIAL SACK still PROVES the RX demodulated the
 									// batch at the announced config (it decoded SOME frames of it), so a PARTIAL
@@ -4547,10 +4556,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// frame-0 missing AND at most 2 frames missing total (lead acquisition-seam
 					// frame + at most the tail). Mirrors the MFSK-site signature.
 					int n_miss = 0;
+					uint32_t masked_bitmap = 0;
 					for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
+					{
 						if(!sack_bitmap[i]) n_miss++;
+						else masked_bitmap |= (1u << i);
+					}
 					last_partial_lead_frame_only =
 						(data_batch_size > 1) && !sack_bitmap[0] && (n_miss >= 1) && (n_miss <= 2);
+					// FIX B (WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1): track the structural acq-seam
+					// fingerprint from the same sack_bitmap. Mirrors the MFSK partial site so BOTH
+					// transports feed the same structural-multidrop FRAME-UP unblock predicate.
+					if(data_batch_size > 1)
+						inband_update_structural_acq_fingerprint(masked_bitmap, n_miss);
+					else
+					{
+						structural_acq_partial_streak = 0;
+						last_structural_acq_bitmap = 0;
+					}
 				}
 				last_batch_fully_acked = false;
 				stats.nBatches_acked++;
@@ -4692,6 +4715,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// so this batch MAY drive the four gearshift promotion consumers.
 				last_batch_fully_acked = true;
 				last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch is not a lead-only partial
+				structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;  // FIX B: clean batch breaks the structural acq-seam streak
 				stats.nBatches_acked++;
 				stats.nBatches_fully_acked++;
 				last_transmission_block_stats.nBatches_acked++;
@@ -4795,6 +4819,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// (no SACK cycle), so this batch may drive promotion.
 					last_batch_fully_acked = true;
 					last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch
+					structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;  // FIX B: clean batch breaks the structural acq-seam streak
 					stats.nBatches_acked++;
 					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
@@ -4821,6 +4846,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// (no SACK cycle), so this batch may drive promotion.
 					last_batch_fully_acked = true;
 					last_partial_lead_frame_only = false;  // ROLLING-PARTIAL: clean batch
+					structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;  // FIX B: clean batch breaks the structural acq-seam streak
 					stats.nBatches_acked++;
 					stats.nBatches_fully_acked++;
 					last_transmission_block_stats.nBatches_acked++;
@@ -5914,8 +5940,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// inband_lead_frame_only_partial() still recorded the rung viability; only the
 			// orphaning anchor-raise is held. A genuinely whole batch never has an outstanding hole,
 			// so the clean-batch anchor-raise above is unaffected (byte-identical when off).
-			else if(inband_lead_frame_only_partial() && !inband_climb_hole_outstanding())
+			// FIX B (WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1): the STRUCTURAL forward-CONFIG_0 acq-seam
+			// multi-drop (the steady 0x0c partial, SAME loss repeated ≥K batches) ALSO needs the
+			// anchor raised — the streak credit alone cannot climb because the +1 anchor clamp (:5510)
+			// pins the anchor at the ROBUST tier (the multi-drop is not a true clean batch). Like the
+			// lead-frame-only case, a structural acq-seam batch IS eventually FULLY delivered (the retx
+			// recovers the dropped lead/tail frames within one batch via the mixbatch :1919), so the
+			// rung carries full data and is a valid anchor. The !inband_climb_hole_outstanding() guard
+			// fires the raise ONLY once those holes have drained (retransmit_count==0) — proof the rung
+			// delivered the whole batch. The repetition gate (inband_structural_acq_partial requires
+			// the SAME loss ≥K batches) keeps a noise-marginal rung (varying losses) OUT (§9
+			// anti-thrash). Legacy/flag-off: both predicates return false → byte-identical.
+			else if((inband_lead_frame_only_partial() || inband_structural_acq_partial())
+				&& !inband_climb_hole_outstanding())
 			{
+				bool structural_only = !inband_lead_frame_only_partial();
 				if(current_configuration != clean_batches_config)
 				{
 					clean_batches_config = current_configuration;
@@ -5932,9 +5971,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					clean_batches_config, clean_batches_at_current_config);
 				if(last_data_viable_config != prev_anchor)
 				{
-					printf("[GEARSHIFT] ROLLING-PARTIAL anchor raise: lead-frame-only batch fully "
+					printf("[GEARSHIFT] ROLLING-PARTIAL anchor raise: %s batch fully "
 						"delivered at config %d -> last_data_viable %d->%d (FRAME-UP +1 clamp now "
 						"permits the next-rung probe)\n",
+						structural_only ? "structural-acq-seam" : "lead-frame-only",
 						current_configuration, prev_anchor, last_data_viable_config);
 					fflush(stdout);
 				}
@@ -6034,7 +6074,17 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// byte-identical (the predicate returns false). The retx still recovers frame-0 (the
 		// SACK machinery is UNCHANGED), and the +1 anchor clamp below still bounds the climb.
 		bool inband_lead_frame_partial = inband_lead_frame_only_partial();
-		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial)
+		// FIX B (WB_FORWARD_ACQ_PLAN.md §3 FIX-B/B1): admit the STRUCTURAL forward-CONFIG_0 acq-seam
+		// multi-drop (the steady 0x0c bitmap: bit0 clear, n_miss>2, SAME loss repeated ≥K batches) to
+		// the optimistic FRAME-UP path so the climb crawls off CONFIG_0 instead of WEDGING at the rung
+		// whose lead/tail frames the acq seam drops every batch. The repetition requirement makes this
+		// SNR-independent — a noise-marginal rung loses DIFFERENT frames so its streak never reaches K
+		// → it stays on the strict clean-streak gate (§9 anti-thrash preserved). This is a CRAWL net,
+		// not the cure: FIX A (matched-template fine timing) lands the windows so the rung completes
+		// 6/6. The +1 anchor clamp + the DEFER-WHILE-HOLE-OUTSTANDING guard below still bound it, and
+		// the overshoot net (inband_retag_escalate_if_climb_exhausted) recovers a too-eager climb.
+		bool inband_structural_acq = inband_structural_acq_partial();
+		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial || inband_structural_acq)
 			? (data_ack_received==YES)
 			: promotion_allowed_on_batch(last_batch_fully_acked);
 		if(data_ack_received==YES && batch_promotable &&
@@ -9666,23 +9716,33 @@ int cl_arq_controller::test_inband_frame0_partial()
 		current_configuration = cfg;
 		if(clean) {
 			last_partial_lead_frame_only = false;   // a clean batch clears it (production sites)
+			structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;  // clean breaks the structural streak
 			last_batch_fully_acked = true;
 		} else {
 			last_batch_fully_acked = false;
 			// production lead-frame-recoverable computation (mirror of the partial sites):
 			// frame-0 missing AND at most 2 frames missing total.
 			uint32_t all_ones = (1u << data_batch_size) - 1u;
-			int n_miss = data_batch_size - __builtin_popcount(bitmap & all_ones);
+			uint32_t masked = bitmap & all_ones;
+			int n_miss = data_batch_size - __builtin_popcount(masked);
 			last_partial_lead_frame_only =
 				((bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
+			// FIX B (structural acq-seam fingerprint): mirror the production partial-site call.
+			inband_update_structural_acq_fingerprint(masked, n_miss);
 		}
 		// EXACT production FRAME-UP gate input (arq_commander.cc):
 		bool inband_climb_pipeline = inband_pipeline_climb_active();
 		bool inband_lead_frame_partial = inband_lead_frame_only_partial();
-		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial)
+		bool inband_structural_acq = inband_structural_acq_partial();
+		bool batch_promotable = (inband_climb_pipeline || inband_lead_frame_partial || inband_structural_acq)
 			? true /* data_ack_received==YES on any delivery */
 			: promotion_allowed_on_batch(last_batch_fully_acked);
 		return batch_promotable;
+	};
+	// Reset the structural streak before each independent verdict (so the lead-frame/clean
+	// verdicts are not contaminated by a prior verdict's structural fingerprint).
+	auto reset_structural = [&]() {
+		structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;
 	};
 
 	// Ensure no re-tag is armed (the CONFIG_0 tier-cross entry leaves it false), so the
@@ -9690,6 +9750,7 @@ int cl_arq_controller::test_inband_frame0_partial()
 	inband_retag_armed = false;
 
 	// ---- A: lead-frame-only partial (0x3e, frame-0 missing) at CONFIG_0 -> PROMOTABLE ----
+	reset_structural();
 	bool a = promotable_for(CONFIG_0, 0x3eu, /*clean=*/false);
 #ifdef INBAND_FRAME0_PARTIAL_FAILBEFORE
 	check(a == false, "A (fail-before) lead-only partial VETOED (wedge reproduced)", a ? 1 : 0, 0);
@@ -9699,6 +9760,7 @@ int cl_arq_controller::test_inband_frame0_partial()
 
 	// ---- A2: frame-0 + tail partial (0x1e, frames 0 AND 5 missing) at CONFIG_0 -> PROMOTABLE.
 	// The observed rolling MIXBATCH partial: frame-0 (acquisition seam) + the EOB tail frame.
+	reset_structural();
 	bool a2 = promotable_for(CONFIG_0, 0x1eu, /*clean=*/false);
 #ifdef INBAND_FRAME0_PARTIAL_FAILBEFORE
 	check(a2 == false, "A2 (fail-before) frame0+tail partial VETOED", a2 ? 1 : 0, 0);
@@ -9707,20 +9769,24 @@ int cl_arq_controller::test_inband_frame0_partial()
 #endif
 
 	// ---- B: multi-frame-drop partial (3 missing) at CONFIG_0 -> NOT promotable (anti-thrash) ----
+	reset_structural();
 	bool b = promotable_for(CONFIG_0, 0x1cu, /*clean=*/false);   // frames 0,1,5 missing (3)
 	check(b == false, "B multi-drop partial (3 missing) NOT promotable (§9 anti-thrash preserved)",
 		b ? 1 : 0, 0);
 
 	// ---- B2: a partial WITH frame-0 PRESENT (only tail missing) -> NOT promotable (not a
 	// lead-frame loss; the lead frame decoded, so the rung is not the acquisition-seam case). ----
+	reset_structural();
 	bool b2 = promotable_for(CONFIG_0, 0x1fu, /*clean=*/false);   // frame 5 missing, frame-0 present
 	check(b2 == false, "B2 tail-only partial (frame-0 present) NOT promotable", b2 ? 1 : 0, 0);
 
 	// ---- C: clean batch at CONFIG_0 -> promotable (unchanged clean path) ----
+	reset_structural();
 	bool c = promotable_for(CONFIG_0, 0x3fu, /*clean=*/true);
 	check(c == true, "C clean batch promotable (unchanged)", c ? 1 : 0, 1);
 
 	// ---- D: lead-frame-only partial at a ROBUST rung -> NOT promotable (OFDM-only gate) ----
+	reset_structural();
 	bool d = promotable_for(ROBUST_0, 0x3eu, /*clean=*/false);
 	check(d == false, "D lead-only partial at ROBUST rung NOT promotable (OFDM-only)",
 		d ? 1 : 0, 0);
@@ -9732,9 +9798,74 @@ int cl_arq_controller::test_inband_frame0_partial()
 	unsetenv("MERCURY_INBAND_RATE");
 #endif
 	inband_rate_enabled = -1;
+	reset_structural();
 	bool e = promotable_for(CONFIG_0, 0x3eu, /*clean=*/false);
 	check(e == false, "E feature-off: lead-only partial NOT promotable (legacy byte-identical)",
 		e ? 1 : 0, 0);
+
+
+	// ---- F: STRUCTURAL acq-seam multi-drop (0x0c: seq 0,1,4,5 missing, bit0 clear, n_miss=4)
+	// REPEATED across K batches at CONFIG_0 -> PROMOTABLE (FIX B). The observed forward CONFIG_0
+	// wedge: the SAME 4 frames drop every batch, SNR-independent (WGN:40==WGN:35); repetition (not
+	// magnitude) is the discriminator. Re-enable the feature (E turned it off). Fails-before:
+	// -DINBAND_STRUCTURAL_ACQ_FAILBEFORE pins the predicate false -> F FAILS (wedge reproduced).
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "1");
+#else
+	setenv("MERCURY_INBAND_RATE", "1", 1);
+#endif
+	inband_rate_enabled = -1;
+	reset_structural();
+	bool f1 = promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);   // batch 1: streak=1 -> NOT yet
+	bool fK = false;
+	for(int rep = 1; rep < INBAND_STRUCTURAL_ACQ_K; rep++)
+		fK = promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);       // batch K: streak>=K -> promotable
+#ifdef INBAND_STRUCTURAL_ACQ_FAILBEFORE
+	check(fK == false, "F (fail-before) structural 0x0c repeated VETOED (wedge reproduced)", fK ? 1 : 0, 0);
+#else
+	check(f1 == false, "F1 single structural 0x0c (streak=1<K) NOT promotable (transient guard)", f1 ? 1 : 0, 0);
+	check(fK == true,  "F structural 0x0c repeated K batches PROMOTABLE (acq-seam climb unblocked)", fK ? 1 : 0, 1);
+#endif
+
+	// ---- G: VARYING multi-drops batch-to-batch (0x1c, 0x0c, 0x2c — all bit0 clear, n_miss>2 but
+	// DIFFERENT frames each batch) -> NOT promotable. A noise-marginal rung loses different frames,
+	// so the streak re-seeds to 1 every batch and never reaches K (§9 anti-thrash preserved). ----
+	reset_structural();
+	(void)promotable_for(CONFIG_0, 0x1cu, /*clean=*/false);
+	(void)promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);
+	bool g = promotable_for(CONFIG_0, 0x2cu, /*clean=*/false);
+	check(g == false, "G varying multi-drops NOT promotable (noise rung; streak never reaches K)",
+		g ? 1 : 0, 0);
+
+	// ---- H: a CLEAN batch mid-run RESETS the streak -> the next single 0x0c is back to streak=1
+	// -> NOT promotable (clean proves the rung viable; the structural unblock is only for the wedge
+	// where the rung CANNOT produce a clean batch). ----
+	reset_structural();
+	(void)promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);   // streak=1
+	(void)promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);   // streak>=K
+	(void)promotable_for(CONFIG_0, 0x3fu, /*clean=*/true);    // CLEAN -> streak reset to 0
+	bool h = promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);   // streak=1 again -> NOT promotable
+	check(h == false, "H clean batch resets structural streak (next single 0x0c NOT promotable)",
+		h ? 1 : 0, 0);
+
+	// ---- I: structural 0x0c repeated at a ROBUST rung -> NOT promotable (OFDM-only gate; robust
+	// MFSK has no Schmidl-Cox acquisition seam). ----
+	reset_structural();
+	(void)promotable_for(ROBUST_0, 0x0cu, /*clean=*/false);
+	bool ii = promotable_for(ROBUST_0, 0x0cu, /*clean=*/false);
+	check(ii == false, "I structural 0x0c at ROBUST rung NOT promotable (OFDM-only)", ii ? 1 : 0, 0);
+
+	// ---- J: flag-off byte-identity — feature off, structural 0x0c repeated is NOT promotable. ----
+#ifdef _WIN32
+	_putenv_s("MERCURY_INBAND_RATE", "");
+#else
+	unsetenv("MERCURY_INBAND_RATE");
+#endif
+	inband_rate_enabled = -1;
+	reset_structural();
+	(void)promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);
+	bool j = promotable_for(CONFIG_0, 0x0cu, /*clean=*/false);
+	check(j == false, "J feature-off: structural 0x0c NOT promotable (legacy byte-identical)", j ? 1 : 0, 0);
 
 	// restore env + cache + members
 	if(had_prev) {
@@ -9746,6 +9877,7 @@ int cl_arq_controller::test_inband_frame0_partial()
 	}
 	inband_rate_enabled = -1;
 	last_partial_lead_frame_only = false;
+	structural_acq_partial_streak = 0; last_structural_acq_bitmap = 0;
 
 	printf("[TEST-FRAME0-PARTIAL] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

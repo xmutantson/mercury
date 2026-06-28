@@ -7436,6 +7436,86 @@ static void test_ofdm_fine_timing_magnitude_direct_cfo() {
 	}
 }
 
+// §22.A FIX A (WB_FORWARD_ACQ_PLAN.md §3 FIX-A; ofdm-data-acquisition-fix-plan.md §13.5
+// GO_BUILD_MATCHED_SWAP) — the OFDM matched-template BUILD prerequisite + a per-symbol FIDELITY
+// probe. FAIL-BEFORE / PASS-AFTER is on the BUILD: with the #if 0 build disabled the template is
+// NULL (matched fine timing is dead, early-returns delay=0); re-enabling it builds a non-trivial
+// FIR-round-tripped template. The probe additionally REPORTS the per-symbol Cauchy-Schwarz the
+// template achieves against the REAL pre-equalized TX preamble (transmit_byte path) at the known frame
+// start — this is the fidelity that governs whether the production matched-fine override
+// (MERCURY_WB_MATCHED_FINE, default-OFF) can discriminate the true position from a 1-symbol shift.
+// As of 2026-06-27 that per-symbol CS is ~0.74 (NOT ~1.0), which is why the override is parked
+// behind the flag (see ofdm-fine-timing-magnitude.md §6.5). The test PASSES on the build being
+// live + a sane template; it does NOT gate on the (still-deficient) per-symbol fidelity.
+static void test_ofdm_matched_template_fine_timing() {
+	const char* name = "ofdm_matched_template_fine_timing";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_0);
+	if (ts.current_configuration != CONFIG_0) {
+		test_fail(name, "load_configuration(CONFIG_0) did not take");
+		return;
+	}
+
+	// FAIL-BEFORE / PASS-AFTER: the matched-template build is LIVE (the #if 0 prerequisite re-enabled).
+	if (ts.ofdm.ofdm_corr_template == NULL || ts.ofdm.ofdm_corr_template_len <= 0
+	    || ts.ofdm.ofdm_corr_template_energy <= 0.0) {
+		char b[200];
+		snprintf(b, sizeof(b),
+			"OFDM matched-template NOT built (template=%p len=%d energy=%.3f) — the #if 0 build is "
+			"still disabled; matched fine timing is dead (returns delay=0)",
+			(void*)ts.ofdm.ofdm_corr_template, ts.ofdm.ofdm_corr_template_len,
+			ts.ofdm.ofdm_corr_template_energy);
+		test_fail(name, b);
+		return;
+	}
+
+	// FIDELITY PROBE (diagnostic, not gated): correlate the template against the REAL pre-equalized TX
+	// preamble (transmit_byte) at the known frame start and report per-symbol CS. Mirrors the
+	// arq_common.cc TX-SELFTEST. The frame begins at sample 0 of passband_data; preamble is at the
+	// start. Round-trip through FIR_rx_time_sync to match the template build domain.
+	int interp     = ts.frequency_interpolation_rate;
+	int Nofdm      = ts.data_container.Nofdm;
+	int preamble_n = ts.data_container.preamble_nSymb;
+	int Nsymb      = ts.data_container.Nsymb;
+	int nReal_data = ts.data_container.nBits - ts.ldpc.P;
+	int frame_bits = nReal_data - ts.outer_code_reserved_bits;
+	int frame_bytes = frame_bits / 8;
+	for (int i = 0; i < frame_bytes; i++)
+		ts.data_container.data_byte[i] = (i * 37 + 11) & 0xFF;
+	ts.transmit_byte(ts.data_container.data_byte, frame_bytes,
+		ts.data_container.passband_data, SINGLE_MESSAGE);
+	int frame_samples = Nofdm * (Nsymb + preamble_n) * interp;
+	std::vector<std::complex<double> > tx_bb((size_t)frame_samples,
+		std::complex<double>(0.0, 0.0));
+	ts.ofdm.passband_to_baseband(ts.data_container.passband_data, frame_samples, tx_bb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+		1, &ts.ofdm.FIR_rx_time_sync);
+	int sym_interp = Nofdm * interp;
+	double total_cs = 0.0;
+	for (int k = 0; k < preamble_n && k < ts.ofdm.ofdm_corr_template_nsymb; k++) {
+		int toff = k * Nofdm, roff = k * sym_interp;
+		double cr=0, ci=0, et=0, er=0;
+		for (int n = 0; n < Nofdm; n++) {
+			int ridx = roff + n * interp;
+			if (ridx >= frame_samples) break;
+			std::complex<double> rx = tx_bb[(size_t)ridx];
+			double tre = ts.ofdm.ofdm_corr_template[toff + n].real();
+			double tim = ts.ofdm.ofdm_corr_template[toff + n].imag();
+			et += tre*tre + tim*tim; er += rx.real()*rx.real() + rx.imag()*rx.imag();
+			cr += tre*rx.real() + tim*rx.imag(); ci += tim*rx.real() - tre*rx.imag();
+		}
+		double cs = (et*er > 1e-30) ? (cr*cr + ci*ci)/(et*er) : 0.0;
+		total_cs += cs;
+	}
+	double per_sym = (preamble_n > 0) ? total_cs / preamble_n : 0.0;
+	printf("    [MF-FIDELITY] tmpl_energy=%.3f nsymb=%d total_cs=%.3f per_sym_cs=%.3f "
+		"(want ~1.0/sym; <0.85 -> matched override parked, MERCURY_WB_MATCHED_FINE)\n",
+		ts.ofdm.ofdm_corr_template_energy, ts.ofdm.ofdm_corr_template_nsymb,
+		total_cs, per_sym);
+	test_pass(name);
+}
+
 // §22.1 FAIL-BEFORE / PASS-AFTER: residual CFO + a reliable SNR. The SNR
 // (+8 dB SNR3k) is chosen high enough that the COARSE Schmidl-Cox detector
 // reliably acquires on every seed, so the FINE timer (the function under test)
@@ -8011,6 +8091,7 @@ int run_mfsk_ctrl_codec_tests() {
 	// (fix/ofdm-fine-timing-magnitude, ofdm-fine-timing-magnitude.md §4).
 	test_ofdm_fine_timing_magnitude_direct_clean();         // direct, non-regression
 	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (the keystone)
+	test_ofdm_matched_template_fine_timing();               // FIX A matched-template FAIL-before/PASS-after
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
 
@@ -8067,6 +8148,7 @@ int run_ofdm_fine_timing_tests() {
 	printf("=== OFDM fine-timing magnitude metric tests (§22) ===\n");
 	test_ofdm_fine_timing_magnitude_direct_clean();         // direct, non-regression
 	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (keystone)
+	test_ofdm_matched_template_fine_timing();               // FIX A matched-template FAIL-before/PASS-after
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
 	printf("=== §22 done: %d passed, %d failed ===\n", g_passes, g_failures);
