@@ -1824,28 +1824,14 @@ public:
   // happens. One-shot, exits rc.
   int test_break_noprogress_teardown();
 
-  // CONNECT-REACK (connect-testack-handshake.md §3.2) — the pre-data-window
-  // state-machine predicate that gates the duplicate-TEST_CONNECTION re-ACK.
-  // Single-sourced so the production block (arq_responder.cc Site-F sibling)
-  // and the T4 unit test cannot drift. Excludes the DSP-availability term
-  // (telecom_system->ack_mfsk.connect_pattern_nsymb > 0), which the production
-  // caller ANDs separately (the unit test has no live codec). Returns true iff
-  // CONNECTED + RECEIVING + no data yet + a cached ACK exists + replay budget
-  // remains + a FREE control slot + not a passive monitor + not narrowband.
-  inline bool connect_reack_pre_data_window() const {
-    return link_status == CONNECTED
-        && connection_status == RECEIVING
-        && batch_rx_frame_count == 0
-        && connect_ack_cache.valid
-        && connect_ack_cache.replays < max_connection_attempts
-        && messages_control.status == FREE
-        && !passive_monitor
-        && narrowband_enabled != YES;
-  }
-  // T4 in-process unit (--test-connect-reack): drives RSP to the CONNECTED
-  // pre-data window with a cached ACK, asserts the re-ACK predicate fires for a
-  // duplicate, is byte-identical (INV-A/C), and self-disables once data starts
-  // (INV-B/E) / at the replay bound. 0 PASS / 1 FAIL.
+  // CONNECT-REACK EXCISE regression (--test-connect-reack, also in master
+  // --test; connect-testack-handshake.md §9). Guards the removal of 8e62722e:
+  // drives a REAL OFDM-config RX in the CONNECTED pre-data RECEIVING window and
+  // asserts the SHARED frames_to_read the OFDM data path consumes is NOT pinned
+  // to 2 (PASS-AFTER), while a defeat arm (MERCURY_REACK_CLAMP_DEFEAT) that
+  // re-introduces the removed clamp DOES pin it to 2 (FAIL-BEFORE). The removed
+  // pre-data re-ACK clamped frames_to_read=2 across the first WB batch, starving
+  // OFDM data RX so the gearshift never climbed off config100. 0 PASS / 1 FAIL.
   int test_connect_reack();
 
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
@@ -3547,54 +3533,6 @@ public:
   // delivery commit (arq_responder.cc:101, beside nReceived_data++); RESET with
   // the other session flags.
   bool session_data_frame_received;
-
-  // CONNECT-REACK (connect-testack-handshake.md §3.2) — cached
-  // TEST_CONNECTION_ACK triple captured at the FIRST TEST_CONNECTION so the
-  // responder can re-air the byte-identical MFSK TEST_ACK on a DUPLICATE
-  // TEST_CONNECTION it decodes while already CONNECTED (pre-data window only),
-  // healing a single lost ACK in one round trip WITHOUT re-running negotiation
-  // (INV-C) and WITHOUT pinning frames_to_read across the data phase (INV-B).
-  // valid stays false until the first handshake builds the ACK (so the replay
-  // is inert before any genuine TEST_CONNECTION). RESET with the session flags.
-  struct {
-    bool    valid;       // a first-handshake ACK has been built this session
-    uint8_t echoed_cap;  // == peer_capability (echo of CMD's caps)
-    uint8_t own_cap;     // == local_capability (RSP's own caps)
-    uint8_t ssid;        // == callsign_get_ssid(my_call_sign)
-    int     replays;     // duplicate re-airs this session (bounded, see §3.2)
-  } connect_ack_cache;
-
-  // CONNECT-REACK FTR-STARVATION FIX (connect-testack-handshake.md §3.3,
-  // 8e62722e regression: OFDM data-frame acquisition starved to 0). The
-  // duplicate-TEST_CONNECTION probe needs frames_to_read to drain to 0 to
-  // sample the MFSK suffix (arq_common.cc:7648), but the OFDM data consumer
-  // (this->receive()) needs frames_to_read = frame_symb+10 to capture a full
-  // data frame. They share ONE frames_to_read and receive() runs the very next
-  // line. The original block re-clamped ftr=2 EVERY pre-data iteration, so the
-  // data frame never decoded, batch_rx_frame_count never advanced, and the
-  // pre-data window never closed (the INV-B self-terminate was a dead
-  // invariant). FIX = WINDOW-BOUNDED OWNERSHIP: the probe owns ftr only for a
-  // short turnaround sub-window after entering the CONNECTED pre-data RECEIVING
-  // window (the lost-ACK duplicate arrives within ~1 CMD retransmit cycle).
-  // After the window elapses we hand ftr back to the OFDM data path ONCE (a
-  // one-shot, so the capture thread's drain is not fought every tick) and the
-  // probe never clamps again -> OFDM delivery restored, heal preserved.
-  cl_timer connect_reack_timer;          // started on entry to CONNECTED pre-data RECEIVING
-  bool     connect_reack_window_armed;   // timer started for this pre-data window
-  bool     connect_reack_ftr_handed_back;// one-shot: data-RX ftr restored after the window
-  // Turnaround bound for the probe window (ms). One duplicate-TEST_CONNECTION
-  // arrival + PTT margin; after this the OFDM data path owns frames_to_read.
-  inline int connect_reack_window_ms() const {
-    return 2 * message_transmission_time_ms + ptt_on_delay_ms;
-  }
-  // True iff the probe is allowed to clamp/sample THIS iteration: the pre-data
-  // window predicate AND we are still inside the bounded turnaround window.
-  // (Non-const: reads the live timer via get_elapsed_time_ms()'s update().)
-  bool connect_reack_probe_window_open();
-  // FTR-STARVATION regression unit (--test-reack-ftr-starvation, also in
-  // master --test): drives the ftr-arbitration across the turnaround window and
-  // asserts the OFDM data-RX ftr is NOT pinned at 2 across the data phase.
-  int test_connect_reack_ftr_starvation();
 
   int gearshift_timeout;
   int connection_timeout;

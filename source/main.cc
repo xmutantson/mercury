@@ -907,23 +907,15 @@ int main(int argc, char *argv[])
                 failed += ARQ_isr.test_idle_switch_role_race();
                 failed += ARQ_isr.test_break_noprogress_teardown();
             }
-            // CONNECT-REACK T4 (connect-testack-handshake.md §5): in-process
-            // synthetic-fire unit for the duplicate-TEST_CONNECTION re-ACK
-            // pre-data window. No PHY/audio -> permanent regression gate.
+            // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
+            // 8e62722e regression that dropped OFDM data delivery to 0 because the
+            // pre-data re-ACK pinned the shared frames_to_read=2 across the first
+            // WB batch (so the gearshift never climbed off config100). The re-ACK
+            // is REMOVED; this gate drives a REAL OFDM-config RX in the CONNECTED
+            // pre-data window and asserts frames_to_read is NOT pinned to 2.
             {
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
-            }
-            // CONNECT-REACK FTR-STARVATION gate (connect-testack-handshake.md
-            // §3.3): the 8e62722e regression that dropped OFDM data delivery to 0
-            // (the re-ACK pinned frames_to_read=2 across the data phase). Drives
-            // the REAL ftr-arbiter; asserts a connect-heal never starves the OFDM
-            // data-acquisition path. Permanent regression gate — this class
-            // slipped past --test before because the old unit only checked the
-            // predicate boolean, not the shared ftr the data path consumes.
-            {
-                cl_arq_controller ARQ_reack_ftr;
-                failed += ARQ_reack_ftr.test_connect_reack_ftr_starvation();
             }
             return (failed == 0) ? 0 : 1;
         }
@@ -936,23 +928,17 @@ int main(int argc, char *argv[])
             int failed = test_sigterm_handler();
             return (failed == 0) ? 0 : 1;
         }
-        // --test-connect-reack : run ONLY the CONNECT-REACK T4 in-process unit
-        // (duplicate-TEST_CONNECTION pre-data re-ACK) and exit. Fast +
-        // deterministic; see arq_responder.cc::test_connect_reack().
+        // --test-connect-reack : run ONLY the CONNECT-REACK EXCISE regression
+        // (8e62722e removed: the pre-data window must NOT pin frames_to_read=2)
+        // and exit. Fast + deterministic; see arq_responder.cc::test_connect_reack().
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();
             return (failed == 0) ? 0 : 1;
         }
-        // --test-reack-ftr-starvation : run ONLY the CONNECT-REACK FTR-STARVATION
-        // regression (8e62722e: OFDM data delivery dropped to 0 because the
-        // re-ACK pinned frames_to_read=2 across the data phase) and exit. Fast +
-        // deterministic; see arq_responder.cc::test_connect_reack_ftr_starvation().
-        if (strcmp(argv[i], "--test-reack-ftr-starvation") == 0) {
-            cl_arq_controller ARQ_reack_ftr;
-            int failed = ARQ_reack_ftr.test_connect_reack_ftr_starvation();
-            return (failed == 0) ? 0 : 1;
-        }
+        // (--test-reack-ftr-starvation REMOVED with the excise of 8e62722e,
+        // connect-testack-handshake.md §9; --test-connect-reack now guards the
+        // removal — the pre-data window must NOT pin frames_to_read=2.)
         // --test-inband-tier-crossing : run ONLY the hybrid tier-crossing routing
         // regression (robust<->OFDM crossing -> legacy SET_CONFIG; intra-tier ->
         // in-band tag) and exit. Fast + deterministic; see

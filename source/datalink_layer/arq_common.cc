@@ -607,12 +607,8 @@ cl_arq_controller::cl_arq_controller()
 	// Commander connect-accept (CONNECT skips reset_session_state).
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
-	// CONNECT-REACK (connect-testack-handshake.md §3): init the ACK cache empty.
-	connect_ack_cache.valid = false;
-	// CONNECT-REACK FTR-STARVATION FIX (§3.3): disarm the turnaround probe window
-	// so the FIRST pre-data entry arms it cleanly (8e62722e regression guard).
-	connect_reack_window_armed    = false;
-	connect_reack_ftr_handed_back = false;
+	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):
+	// the ACK cache + turnaround probe state no longer exist.
 	break_noprogress_cycles = 0;
 	stats.nSent_data=0;
 	stats.nAcked_data=0;
@@ -7006,13 +7002,8 @@ void cl_arq_controller::reset_session_state()
 	// reset_session_state, arq_common.cc:801.)
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
-	// CONNECT-REACK (connect-testack-handshake.md §3/§4.3): clear the cached
-	// TEST_CONNECTION_ACK so a new session never replays a stale ACK.
-	connect_ack_cache.valid = false;
-	// CONNECT-REACK FTR-STARVATION FIX (§3.3): disarm the turnaround probe window
-	// per session so the next CONNECTED pre-data entry re-arms it (8e62722e).
-	connect_reack_window_armed    = false;
-	connect_reack_ftr_handed_back = false;
+	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):
+	// no cached ACK / probe state to clear per session.
 	block_under_tx = NO;
 	consecutive_data_acks = 0;
 	success_rate_data_clean = 100.0;  // CLEAN-BATCH VIABILITY (§9) — neutral per session
