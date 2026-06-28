@@ -1008,6 +1008,27 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_p1;
                 failed += test_p1.test_inband_plus1_climb();
             }
+            // CLIMB-LATENCY — guarded SNR-seed of the START config
+            // (gearshift-start-and-recovery.md §10): a CLEARLY-clean channel opens
+            // data near the SNR-appropriate WB OFDM config at connect instead of
+            // crawling ROBUST_0->1->2 (the ~102 s dominant climb cost), while a
+            // MARGINAL channel still starts ROBUST_0 (the over-seed guard). PURE
+            // in-process synthetic-fire — permanent regression gate. Fails-before:
+            // -DCONNECT_SEED_FAILBEFORE.
+            {
+                cl_arq_controller test_cs;
+                failed += test_cs.test_connect_snr_seed();
+            }
+            // CLIMB-LATENCY — first ROBUST climb rung pipelines
+            // (gearshift-start-and-recovery.md §10.3): the ROBUST_0 dwell must NOT
+            // serialize a clean-batch round-trip per rung (the un-pipelined first-rung
+            // gap). Drives the REAL gate inband_pipeline_climb_active() on the robust
+            // tier. PURE in-process synthetic-fire — permanent regression gate.
+            // Fails-before: -DINBAND_ROBUST_PIPELINE_FAILBEFORE.
+            {
+                cl_arq_controller test_rp;
+                failed += test_rp.test_robust_pipeline();
+            }
             // CLIMB-UP cmd_batch_seq_id ROLLBACK regression
             // (data-flow-inband-frame0-rolling-partial.md §13): the SYMMETRY GAP to the demote
             // rollback — the climb-UP SET_CONFIG emits (FRAME-UP, optimizer, turbo settle)
