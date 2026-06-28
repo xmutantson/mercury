@@ -1863,6 +1863,7 @@ void cl_arq_controller::init_monitor_decoders()
 	{
 		cl_telecom_system tmp;
 		tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+		inband_inherit_phy_defaults(&tmp);   // §22: probe CONFIG_0 size at the primary's gi (Nofdm=292)
 		tmp.load_configuration(CONFIG_0);
 		monitor_primary_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
 		printf("[MONITOR] CONFIG_0 buffer_Nsymb = %d (used as minimum for all decoders)\n",
@@ -1874,6 +1875,9 @@ void cl_arq_controller::init_monitor_decoders()
 	{
 		monitor_decoders[cfg] = new cl_telecom_system();
 		monitor_decoders[cfg]->narrowband_enabled = telecom_system->narrowband_enabled;
+		// §22: inherit the primary's startup-patched PHY defaults (gi etc.) so each monitor
+		// decoder builds its config at the production geometry, not the ctor 54/256 gi.
+		inband_inherit_phy_defaults(monitor_decoders[cfg]);
 		// Force all decoders to use the largest buffer size so they can all
 		// process the same audio snapshot (CONFIG_0 has the most symbols).
 		monitor_decoders[cfg]->data_container.buffer_Nsymb_min = monitor_primary_buffer_nsymb;
@@ -1918,6 +1922,7 @@ void cl_arq_controller::reinit_monitor_decoders()
 	{
 		cl_telecom_system tmp;
 		tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+		inband_inherit_phy_defaults(&tmp);   // §22: probe CONFIG_0 size at the primary's gi (Nofdm=292)
 		tmp.load_configuration(CONFIG_0);
 		monitor_primary_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
 		printf("[MONITOR] CONFIG_0 buffer_Nsymb = %d (new bandwidth)\n",
@@ -1929,6 +1934,7 @@ void cl_arq_controller::reinit_monitor_decoders()
 	{
 		monitor_decoders[cfg] = new cl_telecom_system();
 		monitor_decoders[cfg]->narrowband_enabled = telecom_system->narrowband_enabled;
+		inband_inherit_phy_defaults(monitor_decoders[cfg]);  // §22: production gi, not ctor 54/256
 		monitor_decoders[cfg]->data_container.buffer_Nsymb_min = monitor_primary_buffer_nsymb;
 		monitor_decoders[cfg]->load_configuration(cfg);
 		printf("[MONITOR] Decoder CONFIG_%d ready (Nsymb=%d buffer_Nsymb=%d)\n",
@@ -4147,6 +4153,7 @@ int cl_arq_controller::inband_down_window_buffer_nsymb()
 	inband_floor_probe_count++;              // TEST diagnostic: a real throwaway PHY probe ran
 	cl_telecom_system tmp;
 	tmp.narrowband_enabled = nb;
+	inband_inherit_phy_defaults(&tmp);       // §22: size the window at the primary's gi (Nofdm=292)
 	tmp.load_configuration(low_cfg);
 	int n = tmp.data_container.buffer_Nsymb.load();
 	inband_down_window_nsymb_cached    = n;  // memo (constant for this lo_idx + bandwidth)
@@ -4181,6 +4188,7 @@ int cl_arq_controller::inband_robust_floor_buffer_nsymb()
 	inband_floor_probe_count++;              // TEST diagnostic: a real throwaway PHY probe ran
 	cl_telecom_system tmp;
 	tmp.narrowband_enabled = nb;
+	inband_inherit_phy_defaults(&tmp);       // §22: size the robust floor at the primary's gi
 	tmp.load_configuration(floor_cfg);
 	int n = tmp.data_container.buffer_Nsymb.load();
 	inband_robust_floor_nsymb_cached   = n;  // memo (constant for this bandwidth)
@@ -4201,6 +4209,7 @@ int cl_arq_controller::inband_natural_ofdm_buffer_nsymb(int ofdm_cfg)
 	if(!is_ofdm_config(ofdm_cfg)) return 0;
 	cl_telecom_system tmp;                    // buffer_Nsymb_min defaults to 0 -> natural sizing
 	tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+	inband_inherit_phy_defaults(&tmp);        // §22: natural OFDM size at the primary's gi (Nofdm=292)
 	tmp.load_configuration(ofdm_cfg);
 	return tmp.data_container.buffer_Nsymb.load();   // tmp destructs here
 }
@@ -4475,6 +4484,36 @@ void cl_arq_controller::inband_free_down_decoders()
 	inband_down_buffer_nsymb = 0;
 }
 
+// ROOT-CAUSE FIX (data-flow-robust-ofdm-adopt-flush.md §22): inherit the PRIMARY's
+// startup-patched PHY defaults into a freshly-constructed cl_telecom_system BEFORE its
+// load_configuration. main.cc patches the PRIMARY telecom_system's
+// default_configurations_telecom_system at startup (ofdm_gi at :4896 = Ngi/256 e.g. 36/256
+// for the production 3.0 ms GI; also ofdm_Nfft/FIR/ldpc_nIteration_max/carrier_frequency).
+// A fresh `new cl_telecom_system()` / stack `cl_telecom_system tmp` instead carries the
+// physical_config.cc:37 CTOR default ofdm_gi=54/256. load_configuration reads ofdm.gi
+// straight from this struct (telecom_system.cc:11037) and init() computes
+// Nofdm = Nfft + round(gi*Nfft) (telecom_system.cc:7206-7208), so an un-inherited CONFIG_0
+// decoder builds at Nofdm=310 instead of 292 -> an 18-sample/symbol FFT-window stride error
+// across the frame -> post-EQ variance blows past the SKIP-VAR threshold -> LDPC skipped
+// (iter=-1) -> 0% block_success at WB CONFIG_0 -> the in-band robust->OFDM cross never
+// sustains and the link never climbs past the ROBUST floor. Copying the whole struct (a
+// trivially-copyable POD aside from one std::string) captures every startup patch in one
+// place so no future fresh-instance site can silently drift. No-op when no primary exists
+// (the standalone --test path that constructs its own telecom_system pre-sets gi itself).
+void cl_arq_controller::inband_inherit_phy_defaults(cl_telecom_system* fresh)
+{
+	if(fresh == NULL || telecom_system == NULL) return;
+	// FAIL-BEFORE / A-B knob (§22 regression): MERCURY_INBAND_GI_INHERIT_DEFEAT=1 makes
+	// this a no-op on the SAME binary, restoring the pre-fix behavior where a fresh decoder
+	// keeps the physical_config.cc:37 ctor gi=54/256 -> CONFIG_0 Nofdm=310. The directed
+	// test (test_inband_down_decoder_gi_inherit) asserts the 310 reproduces under it and 292
+	// without it. Production never sets it -> default = the fix is active.
+	const char* defeat = std::getenv("MERCURY_INBAND_GI_INHERIT_DEFEAT");
+	if(defeat && atoi(defeat) != 0) return;
+	fresh->default_configurations_telecom_system =
+		telecom_system->default_configurations_telecom_system;
+}
+
 // Lazily (re)build the scoped down-window decoder bank for FULL_CONFIG_LADDER[lo..hi].
 // AT MOST INBAND_DOWN_D_MAX+1 decoders — never the full NUMBER_OF_CONFIGS bank
 // (the RPi bound, INV-S4-2). Slot i holds FULL_CONFIG_LADDER[lo+i]; rebuilt only
@@ -4519,6 +4558,7 @@ int cl_arq_controller::inband_ensure_down_decoders(int lo_idx, int hi_idx)
 		inband_floor_probe_count++;          // TEST diagnostic: a real throwaway PHY probe ran
 		cl_telecom_system tmp;
 		tmp.narrowband_enabled = nb;
+		inband_inherit_phy_defaults(&tmp);   // §22: probe the bank size at the primary's gi
 		tmp.load_configuration(low_cfg);
 		want_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
 		inband_ensure_bank_nsymb_cached    = want_buffer_nsymb;  // memo (constant for lo_idx + nb)
@@ -4545,6 +4585,9 @@ int cl_arq_controller::inband_ensure_down_decoders(int lo_idx, int hi_idx)
 		}
 		inband_down_decoders[i] = new cl_telecom_system();
 		inband_down_decoders[i]->narrowband_enabled = telecom_system->narrowband_enabled;
+		// ROOT-CAUSE FIX (§22): inherit the primary's startup-patched PHY defaults (gi etc.)
+		// so this decoder builds CONFIG_0 at the production Nofdm=292, not the ctor 310.
+		inband_inherit_phy_defaults(inband_down_decoders[i]);
 		// Force the common (largest-in-window) buffer so every decoder can process the
 		// same snapshot, exactly as the monitor bank does (arq_common.cc:1762).
 		inband_down_decoders[i]->data_container.buffer_Nsymb_min = inband_down_buffer_nsymb;

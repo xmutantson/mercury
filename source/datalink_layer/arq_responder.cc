@@ -9128,6 +9128,163 @@ int cl_arq_controller::test_inband_config0_start_ring()
 }
 
 // ============================================================================
+// §22: in-band down-ladder decoders inherit the PRIMARY's startup-patched GI
+// (data-flow-robust-ofdm-adopt-flush.md §22).  --test-inband-down-decoder-gi-inherit
+// ============================================================================
+// VERIFIED ROOT (instrumented real-audio A/B, diagnosis in _research/inband_cfg0/): the
+// SCOPED down-ladder decoder bank (inband_ensure_down_decoders, arq_common.cc:4579) builds
+// each rung with `new cl_telecom_system()` and previously set ONLY narrowband_enabled +
+// buffer_Nsymb_min before load_configuration — it never inherited the PRIMARY's
+// startup-patched default_configurations_telecom_system.ofdm_gi (main.cc:4896 = 36/256 for
+// the production 3.0 ms GI). A fresh instance keeps the physical_config.cc:37 ctor gi=54/256,
+// so load_configuration (telecom_system.cc:11037 ofdm.gi <- default) + init()
+// (telecom_system.cc:7206-7208 Nofdm = Nfft + round(gi*Nfft)) build CONFIG_0 at Nofdm=310
+// instead of the production 292 — an 18-sample/symbol FFT-window stride error -> post-EQ
+// variance blows past SKIP-VAR -> LDPC skipped (iter=-1) -> 0% block_success at WB CONFIG_0
+// -> the robust->OFDM cross never sustains and the link never climbs past the ROBUST floor.
+//
+// WHY THE EXISTING 56 inband units MISSED IT: every one PRE-SETS
+// ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI on the throwaway instances
+// it builds (e.g. arq_responder.cc:8843/8999/9180), masking the un-inherited default. This
+// test DRIVES THE PRODUCTION BUILDER inband_ensure_down_decoders directly and reads the
+// CONFIG_0 rung's installed geometry WITHOUT pre-patching the decoder's gi — only the
+// PRIMARY is patched, exactly as main.cc does at startup.
+//   - PASS-AFTER (arm 0, the fix): the CONFIG_0 down-decoder inherits the primary gi and
+//     builds at Nofdm=292 (== the primary), with gi == PROD_GI.
+//   - FAIL-BEFORE (arm 1, MERCURY_INBAND_GI_INHERIT_DEFEAT=1 on the SAME binary): the inherit
+//     is a no-op, the decoder keeps the ctor gi=54/256 and builds at Nofdm=310 (reproduces the
+//     stride-error geometry that skips LDPC).
+int cl_arq_controller::test_inband_down_decoder_gi_inherit()
+{
+	const char* TAG = "[TEST-INBAND-DOWN-DECODER-GI-INHERIT]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+		else   { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Production 3.0 ms GI -> Ngi = 36 -> CONFIG_0 Nofdm = 256+36 = 292 (main.cc:4896 startup).
+	const int   PROD_NGI     = (int)(3.0 * 12.0 + 0.5);   // 36
+	const float PROD_GI      = (float)PROD_NGI / 256.0f;  // 36/256
+	const int   EXPECT_NOFDM = 256 + PROD_NGI;            // 292
+	const int   STALE_NOFDM  = 256 + 54;                  // 310 (physical_config.cc:37 ctor gi)
+
+	// CONFIG_0 sits at FULL_CONFIG_LADDER index 3 (ROBUST_0/1/2 = 0/1/2). Build a 1-wide
+	// down-window over it so the bank holds exactly the CONFIG_0 rung.
+	const int CONFIG0_LADDER_IDX = config_ladder_index(CONFIG_0);
+
+	// Build the PRIMARY exactly as production does: patch ITS default gi to PROD_GI, then a
+	// FULL ROBUST_0 init (fully initializes the standalone PHY) — but DO NOT touch the
+	// down-decoders' gi (the production builder must inherit it). Mirrors build_rx_config0.
+	auto build_rx = [&]() -> std::pair<cl_arq_controller*, cl_telecom_system*> {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode     = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI;  // PRIMARY only
+		rx->telecom_system        = ts_rx;
+		rx->narrowband_enabled    = NO;
+		rx->role                  = RESPONDER;
+		rx->robust_enabled        = YES;
+		rx->sack_v2_enabled       = true;
+		rx->inband_rate_enabled   = 1;
+		rx->load_configuration(ROBUST_0, FULL, NO);
+		rx->link_status           = CONNECTED;
+		rx->connection_status     = RECEIVING;
+		rx->passive_monitor       = false;
+		rx->rsp_current_expected_batch_seq_id = 4;
+		return {rx, ts_rx};
+	};
+
+	// Pin the primary's CONFIG_0 geometry as the reference target (292). Loading CONFIG_0 on a
+	// throwaway COPY of the primary defaults yields the value the inherited decoder must match.
+	{
+		auto pr = build_rx();
+		// The primary, when loaded to CONFIG_0, builds at EXPECT_NOFDM — the ground truth.
+		pr.second->load_configuration(CONFIG_0);
+		check(pr.second->data_container.Nofdm == EXPECT_NOFDM,
+			"P0 the PRIMARY builds CONFIG_0 at the production geometry (Nofdm = Nfft+Ngi36)",
+			pr.second->data_container.Nofdm, EXPECT_NOFDM);
+		delete pr.first; delete pr.second;
+	}
+
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_INBAND_GI_INHERIT_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx();
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+
+		// THE PRODUCTION BUILDER, VERBATIM: build the scoped down-ladder bank over the CONFIG_0
+		// rung. This is the SAME inband_ensure_down_decoders the RX down-ladder resync calls
+		// (arq_common.cc:4485). It constructs `new cl_telecom_system()` per rung and (with the
+		// fix) inherits the primary gi before load_configuration. NO manual gi pre-set here.
+		int built = rx->inband_ensure_down_decoders(CONFIG0_LADDER_IDX, CONFIG0_LADDER_IDX);
+		check(built >= 1, "P1 the down-ladder bank built the CONFIG_0 rung", built, 1);
+
+		// Locate the slot holding CONFIG_0 and read its INSTALLED geometry.
+		cl_telecom_system* dec = NULL;
+		for(int i = 0; i <= INBAND_DOWN_D_MAX; i++)
+			if(rx->inband_down_decoders[i] != NULL && rx->inband_down_decoder_cfg[i] == CONFIG_0)
+			{ dec = rx->inband_down_decoders[i]; break; }
+		check(dec != NULL, "P2 a CONFIG_0 decoder slot exists in the bank", dec ? 1 : 0, 1);
+
+		if(dec != NULL)
+		{
+			int dec_nofdm = dec->data_container.Nofdm;
+			int dec_ngi   = (int)((double)dec->ofdm.gi * (double)dec->ofdm.Nfft + 0.5);
+			if(!defeat)
+			{
+				check(dec_nofdm == EXPECT_NOFDM,
+					"FIX the CONFIG_0 down-decoder inherits the primary GI -> builds at Nofdm=292 "
+					"(correct per-symbol stride -> LDPC runs -> the WB cross sustains)",
+					dec_nofdm, EXPECT_NOFDM);
+				check(dec_ngi == PROD_NGI,
+					"FIX the down-decoder's live ofdm.gi == the primary's production GI (Ngi=36)",
+					dec_ngi, PROD_NGI);
+			}
+			else
+			{
+				check(dec_nofdm == STALE_NOFDM,
+					"DEFEAT (FAIL-BEFORE) the un-inherited decoder keeps the ctor GI -> Nofdm=310 "
+					"(18-sample/symbol stride error -> SKIP-VAR -> LDPC skipped -> 0% block at cfg0)",
+					dec_nofdm, STALE_NOFDM);
+			}
+		}
+		rx->inband_free_down_decoders();
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_INBAND_GI_INHERIT_DEFEAT", "");
+
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band CONFIG_0 clean-lock CRC-fail ROOT — descrambler survives the ring-shrink
 // (data-flow-robust-ofdm-adopt-flush.md §17).  --test-inband-descrambler-survives-shrink
 // ============================================================================

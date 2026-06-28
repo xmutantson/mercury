@@ -978,3 +978,95 @@ and asserts the ring `buffer_Nsymb` stays at the natural OFDM size (<= natural+s
 CONFIG_0 preamble still lands within `upper_bound` (the consumer the oversize broke). FAIL-BEFORE arm:
 `MERCURY_CONFIG0_RING_GUARD_DEFEAT=1` restores the pre-fix unconditional grow on the SAME binary, so the ring
 balloons 217->804 and the preamble lands beyond upper_bound (reproduces the 0-forward-decode geometry).
+
+
+## §22 — ROOT CAUSE of the WB-cfg0 under-decode under MERCURY_INBAND_RATE: fresh in-band decoder instances never inherit the primary's startup-patched ofdm_gi
+
+### §22.0 The symptom and why §15/§17 did not fix it
+With `MERCURY_INBAND_RATE=1` (the trio) a real-audio session at WGN:40 stays stuck at the ROBUST floor:
+configs ever seen = {100,101,102}, ~189-253 B delivered, `block_success` 0% at WB CONFIG_0; legacy (flags OFF,
+eac0c876) on the SAME audio climbs past cfg0 (configs {0,13,14,...}, ~28 KB). The §15 NOFDM-preserve
+(`force_set_capture_ring_natural`) and §17 descrambler-regen fixes are CORRECT and engage on the **primary**
+telecom_system (instrumented: `[GIDIAG-PRIMARY] default_gi=0.14062 preserved_Nofdm=292`), but they target a
+STALE-LIVE-gi disagreement inside the primary's ring-shrink. They never touch a **second instance class** — the
+freshly-constructed in-band decoder objects — which is where the real corruption lives.
+
+### §22.1 ROOT CAUSE (verified)
+The primary's PHY geometry comes from `default_configurations_telecom_system`, which `main.cc` patches at
+startup: `ofdm_gi` <- `Ngi/256` (main.cc:4896; production 3.0 ms GI => Ngi=36 => gi=36/256=0.14062), plus
+`ofdm_Nfft` (3651), `ldpc_nIteration_max` (4825), FIR cutoffs (3547). `load_configuration` copies
+`ofdm.gi = default_configurations_telecom_system.ofdm_gi` (telecom_system.cc:11037) and `init()` derives
+`Nofdm = Nfft + round(gi*Nfft)` (telecom_system.cc:7206-7208). A fresh `new cl_telecom_system()` /
+stack `cl_telecom_system tmp` carries the **constructor default** `ofdm_gi = 54/256 = 0.21094`
+(physical_config.cc:37). So an un-inherited CONFIG_0 decoder builds at `Nofdm = 256 + 54 = 310`, not the
+production `256 + 36 = 292`. The 18-sample/symbol FFT-window stride error accrues across the frame => post-EQ
+variance 4..65 (SKIP-VAR threshold 1.60, telecom_system.cc) => LDPC skipped (`iter=-1`) => 0% block_success at
+WB CONFIG_0 => the robust->OFDM cross never sustains => no climb past the ROBUST floor.
+
+Instrumented A/B proof: `[GIDIAG] init() default_gi=0.21094 -> Nofdm=310 (cfg=0)` (fresh in-band instance)
+vs the clean primary `Nofdm=292`. Legacy never spawns these in-band decoders, so its decode always runs on the
+gi-patched primary => 292 => var=0.0357, iter=0, climbs.
+
+### §22.2 The six (eight call-site) fresh-instance sites — all the same bug class
+1. `inband_ensure_down_decoders` — the LOAD-BEARING decode bank: `new cl_telecom_system()` (arq_common.cc:4579)
+   + the bank-size probe `cl_telecom_system tmp` (arq_common.cc:4552).
+2. `inband_down_window_buffer_nsymb` — window-size probe `tmp` (arq_common.cc:4154).
+3. `inband_robust_floor_buffer_nsymb` — robust-floor-size probe `tmp` (arq_common.cc:4189).
+4. `inband_natural_ofdm_buffer_nsymb` — natural-OFDM-size probe `tmp` (arq_common.cc:4210).
+5. `init_monitor_decoders` — passive-monitor bank: size probe `tmp` (1864) + per-cfg `new` (1876).
+6. `reinit_monitor_decoders` — NB/WB-switch rebuild: size probe `tmp` (1923) + per-cfg `new` (1935).
+The probes (2-4, and the size probes in 1/5/6) read `buffer_Nsymb`, which itself depends on Nofdm — so a wrong
+gi mis-sizes the bank buffer too. The decode sites (1 `new`, 5/6 `new`) demod at the wrong stride. Monitor
+decoders are a passive-monitor-only role (a separate code path), but they share the identical root and are
+fixed for completeness.
+
+### §22.3 THE FIX — single chokepoint
+`cl_arq_controller::inband_inherit_phy_defaults(cl_telecom_system* fresh)` (arq_common.cc:4503) copies the
+PRIMARY's whole `default_configurations_telecom_system` struct into the fresh instance BEFORE its
+`load_configuration`. Copying the whole struct (trivially copyable aside from one std::string) captures every
+startup patch (gi, Nfft, FIR, ldpc iters, carrier_freq) in one place so no future fresh-instance site can
+silently drift to the ctor default. Called at all eight sites above. No-op when `telecom_system==NULL` (the
+standalone --test path that builds its own primary already pre-sets gi). The next `load_configuration`
+re-derives the per-config modulation/rate from the inherited defaults.
+FAIL-BEFORE knob: `MERCURY_INBAND_GI_INHERIT_DEFEAT=1` makes the helper a no-op on the same binary (restores
+the ctor gi => Nofdm=310). Production never sets it.
+
+### §22.4 §5 CROSS-LAYER AUDIT — `default_configurations_telecom_system` on fresh decoder instances
+1. PRODUCERS (writes to a fresh instance's `default_configurations_telecom_system`):
+   - ctor `cl_configuration_telecom_system::cl_configuration_telecom_system()` (physical_config.cc:33-121) —
+     installs the raw defaults incl. `ofdm_gi=54/256`. This is the value the bug rode in on.
+   - `inband_inherit_phy_defaults` (arq_common.cc:4503) — THE NEW producer; overwrites with the primary's
+     patched struct. Runs once per fresh instance, immediately before load_configuration.
+   - (no other writer touches a fresh in-band instance's default struct before its load.)
+2. CONSUMERS (reads of `default_configurations_telecom_system` on these instances):
+   - `load_configuration(int)` (telecom_system.cc:11035-11068) copies the OFDM/pilot/FIR/preamble geometry
+     into the live `ofdm`/filter objects; `init()` then derives Nofdm/buffer_Nsymb from `ofdm.gi`,`ofdm.Nfft`.
+     This is the ONLY consumer on the in-band path; everything downstream reads the DERIVED live geometry.
+3. VALID STATES: ctor-default struct (gi=54/256) — the state BEFORE any producer on a fresh instance; or
+   primary-inherited struct (gi=36/256 in production) — after the fix's producer. The bug was the consumer
+   running on the ctor-default state.
+4. INVARIANT consumers assume: a decoder that must demod the SAME OTA frames the primary TX/RX produced uses
+   the SAME per-symbol geometry (Nofdm) as the primary. Violated by the ctor-default gi => 310 vs 292.
+5. WHAT THE FIX CHANGES: it makes every fresh in-band instance's default struct EQUAL the primary's before
+   load_configuration. Walk each consumer:
+   - load_configuration/init on the down-ladder decode bank (the load-bearing path): now builds CONFIG_0 at
+     292 => correct stride => LDPC runs => the WB cross sustains. FIXED.
+   - the size probes (window/floor/natural/bank): now compute buffer_Nsymb at the production geometry, so the
+     bank buffer the decoders share matches the real frames. Consistent with the decode sites. OK.
+   - monitor decoders (passive-monitor role): now build at the production geometry too; passive-monitor was
+     a separate role and not on the trio's failing path, but the change is strictly geometry-correcting. OK.
+   No consumer outside load_configuration/init reads the default struct on these instances, so no other
+   invariant is touched. The PRIMARY's struct is never modified (the helper writes only the fresh copy), so
+   the §15/§17 primary-path fixes are untouched and legacy (feature OFF) is byte-identical (the in-band
+   sites are reached only under MERCURY_INBAND_RATE / passive_monitor).
+
+### §22.5 LIVE-PATH test (fail-before / passes-after) — `--test-inband-down-decoder-gi-inherit`
+Builds a RESPONDER whose PRIMARY is patched to PROD_GI (36/256) exactly as main.cc does, then drives the
+PRODUCTION builder `inband_ensure_down_decoders(idx(CONFIG_0), idx(CONFIG_0))` and reads the CONFIG_0 rung's
+installed `data_container.Nofdm` and live `ofdm.gi` — WITHOUT pre-patching the decoder's gi (only the primary
+is patched). PASS-AFTER: the rung inherits => Nofdm=292, Ngi=36. FAIL-BEFORE
+(`MERCURY_INBAND_GI_INHERIT_DEFEAT=1`, same binary): ctor gi => Nofdm=310. This is the first test that exercises
+the un-inherited default; the existing 56 inband units all PRE-SET
+`ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI` on their throwaway instances (e.g.
+arq_responder.cc:8843/8999/9180), which MASKED the production bug. Verified: both arms PASS; full --test
+suite reports 68 passed, 0 failed, exit 0.

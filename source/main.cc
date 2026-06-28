@@ -990,6 +990,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_config0_start_ring();
             }
+            // §22: the scoped down-ladder decoder bank inherits the PRIMARY's startup-patched ofdm_gi.
+            // A fresh `new cl_telecom_system()` rung otherwise keeps the ctor gi=54/256 -> CONFIG_0
+            // Nofdm=310 (not the production 292), an 18-sample/symbol FFT-window stride error that
+            // skips LDPC at WB CONFIG_0 -> the robust->OFDM cross never sustains. PASS-AFTER: 292.
+            // FAIL-BEFORE (MERCURY_INBAND_GI_INHERIT_DEFEAT=1, same binary): 310.
+            // data-flow-robust-ofdm-adopt-flush.md §22.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_down_decoder_gi_inherit();
+            }
             // §17: descrambler survives the inband ring-shrink (the CONFIG_0 clean-lock CRC-fail root).
             {
                 cl_arq_controller test_arq;
