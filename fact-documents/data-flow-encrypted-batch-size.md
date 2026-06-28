@@ -140,6 +140,40 @@ State changed: the AEAD unit size (frame span of the encrypted batch).
   config-change rebuild re-queues as fresh new-data with a NEW bsi. No
   same-nonce/different-plaintext path is introduced.
 
+## §5.1 Residual found in sim → fix (2) added (consumer fix)
+
+The TX bound (fix 1) alone left a residual: on a lossy encrypted batch whose
+EVERY D5-bearing frame was lost, `rx_batch_total_frames` stays -1, so the
+completion gate / receiving-window timer fell back to the EOB inference
+(`last_received_end_of_batch_seq + 1`), which collapses `expected` BELOW the
+true (bounded) span. Sim (WGN:24/26 over -x sim, -E): prev bsi=3 sealed at
+20 frames but `expected`=16 → gate fired at 16/16 → decrypt of 16 frames
+(2672 B) of a 20-frame (3324 B) AEAD unit → 1 auth-fail + disconnect per run
+(link recovered, but the disconnect is the bug).
+
+Fix (2) — constrain the consumer (CLAUDE.md §5 "fix the consumer OR the
+producer"; here BOTH, because the EOB inference is structurally unsafe for an
+encrypted unit): when `cipher_suite.is_active()` AND the wired D5 count is
+unavailable, size `expected` / `effective_batch` / `prev_expected` to the
+DETERMINISTIC crypto span `min(data_batch_size, crypto_batch_size)` (the exact
+TX seal bound, computed identically on both peers from shared constants) —
+NEVER the short EOB inference. The gate then HOLDS (received < expected) and
+SACK recovers the missing tail until the full decryptable set lands. Three
+sites, all guarded `cipher_suite.is_active()`, all keeping the non-encrypted
+path byte-identical:
+- arq_common.cc bump_bsi_and_transfer_prev() — `prev_expected`.
+- arq_responder.cc process_messages_acknowledging_data() — pattern-ACK gate
+  `expected`.
+- arq_responder.cc receiving-window timer — `effective_batch` (must not be
+  LOWERED by EOB for an encrypted batch).
+(The default-off MERCURY_SPEC_SACK speculative gate at arq_responder.cc:708
+already pins to data_batch_size on missing EOB; untouched.)
+
+Sim result after fix (2): 8/8 harsh-SACK encrypted runs (WGN:24/26 × 4 seeds)
+deliver byte-exact (md5_match=True), 0 AEAD auth-fail, 0 disconnect; clean -E
+(WGN:38) no-regress (md5_match=True); NONCE-TRACE shows all ENC (dir,idx)
+unique under SACK retx + out-of-order prev recovery (no reuse).
+
 ## §6 Regression test
 
 `test_enc_batch_size.cc` (crypto layer): drives `encrypt()` over a 24-frame-

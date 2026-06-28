@@ -1482,6 +1482,22 @@ void cl_arq_controller::process_messages_rx_data_control()
 						if(wired < effective_batch)
 							effective_batch = wired;
 					}
+					// ENC BATCH-SIZE FIX (data-flow-encrypted-batch-size.md §4/§5): for an
+					// ENCRYPTED batch with no wired count, do NOT let the EOB inference LOWER
+					// effective_batch — a short effective_batch makes the receiving-window timer
+					// ACK-GATE the batch early with the tail missing, reassembling a TRUNCATED
+					// ciphertext -> whole-batch AEAD auth-fail -> false PSK-mismatch disconnect.
+					// Hold effective_batch at the deterministic crypto span (min(data_batch_size,
+					// crypto_batch_size), the TX seal bound) so the timer waits for the full
+					// (decryptable) set; SACK then recovers the missing tail.
+					else if(cipher_suite.is_active())
+					{
+						int crypto_span = data_batch_size;
+						if(crypto_batch_size > 0 && crypto_batch_size < crypto_span)
+							crypto_span = crypto_batch_size;
+						if(crypto_span < effective_batch)
+							effective_batch = crypto_span;
+					}
 					// End-of-batch flag: commander marks last frame with bit 7
 					else if(last_received_end_of_batch_seq >= 0)
 					{
@@ -2112,6 +2128,23 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			{
 				expected = rx_batch_total_frames;
 				if(expected > data_batch_size) expected = data_batch_size;
+			}
+			else if(cipher_suite.is_active())
+			{
+				// ENC BATCH-SIZE FIX (data-flow-encrypted-batch-size.md §4/§5): the
+				// EOB inference is UNSAFE for an encrypted batch — a short `expected`
+				// makes the gate ACK/deliver before the full ciphertext arrives, and
+				// the whole-batch AEAD MAC over the truncated buffer auth-FAILS ->
+				// false PSK-mismatch DISCONNECT. The TX seals each encrypted batch to
+				// EXACTLY crypto_frames = min(data_batch_size, crypto_batch_size)
+				// frames (the batch_capacity cap), a deterministic span both peers
+				// compute from shared constants. Hold `expected` at that span so the
+				// gate keeps SACKing the missing tail until the full (decryptable) set
+				// lands — NEVER deliver short. (Symmetric with the prev-expected
+				// derivation in arq_common.cc bump_bsi_and_transfer_prev.)
+				expected = data_batch_size;
+				if(crypto_batch_size > 0 && crypto_batch_size < expected)
+					expected = crypto_batch_size;
 			}
 			else if(last_received_end_of_batch_seq >= 0)
 			{

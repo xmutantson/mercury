@@ -9796,6 +9796,26 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 		prev_expected = rx_batch_total_frames;
 		if(prev_expected > data_batch_size) prev_expected = data_batch_size;
 	}
+	else if(cipher_suite.is_active())
+	{
+		// ENC BATCH-SIZE FIX (data-flow-encrypted-batch-size.md §4/§5): when the
+		// batch is ENCRYPTED and the wired D5 count is unavailable (every
+		// D5-bearing frame of this batch was lost), the EOB inference is UNSAFE —
+		// it latches the highest OTHER seq seen, collapsing prev_expected below the
+		// true span. Delivering short then reassembles a TRUNCATED ciphertext, and
+		// the whole-batch AEAD MAC (§2) auth-FAILS unconditionally -> false
+		// PSK-mismatch DISCONNECT. The TX seals every encrypted batch to EXACTLY
+		// crypto_frames = min(data_batch_size, crypto_batch_size) frames (the
+		// batch_capacity cap), a deterministic value both peers compute from the
+		// same shared constants (no wire negotiation). So size the encrypted prev
+		// to that bound and HOLD (received < expected) until SACK recovers the full
+		// set — NEVER deliver a short (un-decryptable) ciphertext. Non-encrypted
+		// batches keep the EOB inference (gap-gate + stale-discard cover them).
+		int crypto_span = data_batch_size;
+		if(crypto_batch_size > 0 && crypto_batch_size < crypto_span)
+			crypto_span = crypto_batch_size;
+		prev_expected = crypto_span;
+	}
 	else if(last_received_end_of_batch_seq >= 0)
 	{
 		int eob = last_received_end_of_batch_seq + 1;
