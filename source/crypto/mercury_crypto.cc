@@ -537,6 +537,16 @@ int cl_cipher_suite::encrypt(const uint8_t* in, int in_len,
     uint8_t nonce[NONCE_SIZE];
     build_nonce(nonce, direction, batch_index);
 
+    // Verification trace (env-gated, zero-impact when unset): emit the
+    // (dir, unwrapped-index) of every encrypted batch so a faithful-sim run log
+    // can be scanned for the SECURITY INVARIANT — no (dir,index) nonce reused.
+    if (getenv("MERCURY_NONCE_TRACE"))
+    {
+        printf("[NONCE-TRACE] ENC dir=%u idx=%llu len=%d\n",
+               (unsigned)direction, (unsigned long long)batch_index, in_len);
+        fflush(stdout);
+    }
+
     // Always use the streaming AEAD API (computes full 16-byte MAC)
     uint8_t full_mac[16];
     crypto_aead_ctx ctx;
@@ -570,6 +580,8 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
     uint8_t nonce[NONCE_SIZE];
     build_nonce(nonce, direction, batch_index);
 
+    const bool nonce_trace = getenv("MERCURY_NONCE_TRACE") != NULL;
+
     const uint8_t* ciphertext = in;
     const uint8_t* received_tag = in + plain_len;
 
@@ -584,6 +596,11 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
         if (rc != 0)
         {
             crypto_wipe(out, plain_len);
+            if (nonce_trace) {
+                printf("[NONCE-TRACE] DEC-AUTHFAIL dir=%u idx=%llu len=%d\n",
+                       (unsigned)direction, (unsigned long long)batch_index, plain_len);
+                fflush(stdout);
+            }
             return -1;
         }
     }
@@ -616,6 +633,11 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
         if (diff != 0)
         {
             crypto_wipe(out, plain_len);
+            if (nonce_trace) {
+                printf("[NONCE-TRACE] DEC-AUTHFAIL dir=%u idx=%llu len=%d\n",
+                       (unsigned)direction, (unsigned long long)batch_index, plain_len);
+                fflush(stdout);
+            }
             return -1;  // Auth failure
         }
 
@@ -623,6 +645,11 @@ int cl_cipher_suite::decrypt(const uint8_t* in, int in_len,
         crypto_chacha20_ietf(out, ciphertext, plain_len, session_key, nonce, 1);
     }
 
+    if (nonce_trace) {
+        printf("[NONCE-TRACE] DEC-OK dir=%u idx=%llu len=%d\n",
+               (unsigned)direction, (unsigned long long)batch_index, plain_len);
+        fflush(stdout);
+    }
     return plain_len;
 }
 
