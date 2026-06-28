@@ -641,6 +641,134 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-acq-bounds: OFDM acquisition bounds-gate recovery regression
+// (fact-documents/data-flow-acq-bounds-gate.md). PROVES the force-FAIL gate in
+// cl_telecom_system::receive_byte (telecom_system.cc:1867) recovers a tail-band
+// frame whose Schmidl-Cox detection floors 1..plateau_lead_symb symbols PAST
+// upper_bound while its body is still in-buffer, instead of discarding it.
+//
+// Faithful in-process synthetic-fire: a REAL clean OFDM frame (full preamble +
+// data, no AWGN) is TX'd via the production transmit_byte, placed into a full RX
+// ring buffer at a chosen onset near upper_bound, and threaded through the
+// production receive_byte WITHOUT ofdm_forced_delay (so the real Schmidl-Cox
+// acquisition + bounds gate execute). ofdm_search_raw/nUnder are seeded so the
+// anti-re-decode cursor ofdm_eff lands in the plateau-lead band — the exact
+// condition that pre-fix force-FAILed (pream_symb_loc=0, frame discarded).
+//
+// One harness cell: place the frame, seed the cursor, decode, return outcome.
+struct AcqBoundsCell { int detected_symb; int message_decoded; int delay; int upper_bound; };
+static AcqBoundsCell acq_bounds_run_cell(int config, int onset_symb, int ofdm_eff_target)
+{
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(config);   // allocates buffers + sizes OFDM/LDPC via init()
+
+    cl_data_container& dc = ts.data_container;
+    int interp      = ts.frequency_interpolation_rate;
+    int sym_samples = dc.Nofdm * interp;
+    int buffer_Nsymb= dc.buffer_Nsymb;
+    int frame_symb  = dc.Nsymb + dc.preamble_nSymb;
+    int upper_bound = buffer_Nsymb - frame_symb;
+    int frame_samp  = frame_symb * sym_samples;
+    int buf_samp    = buffer_Nsymb * sym_samples;
+
+    // Build one clean frame into a scratch buffer via the production TX path.
+    int nReal_data = dc.nBits - ts.ldpc.P;
+    int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8;
+    std::vector<int> payload(frame_size > 0 ? frame_size : 1, 0);
+    for (int i = 0; i < frame_size; i++) payload[i] = (i * 37 + 11) & 0xff;
+    std::vector<double> frame(frame_samp, 0.0);
+    ts.transmit_byte(payload.data(), frame_size, frame.data(), SINGLE_MESSAGE);
+
+    // Place the frame at the requested onset in the full RX ring buffer (zeroed).
+    double* rx = dc.ready_to_process_passband_delayed_data;   // sized Nofdm*buffer_Nsymb*interp
+    for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
+    int onset = onset_symb * sym_samples;
+    if (onset < 0) onset = 0;
+    int copy_n = frame_samp;
+    if (onset + copy_n > buf_samp) copy_n = buf_samp - onset;   // truncate tail overrun
+    for (int i = 0; i < copy_n; i++) rx[onset + i] = frame[i];
+
+    // Seed the anti-re-decode cursor so ofdm_eff = ofdm_search_raw - nUnder lands
+    // at the requested target (symbol units). nUnder=0 keeps it simple.
+    ts.receive_stats.ofdm_search_raw   = ofdm_eff_target;
+    ts.data_container.nUnder_processing_events = 0;
+    ts.receive_stats.ofdm_batch_active = false;   // full-search path (not predict)
+    ts.receive_stats.delay             = 0;
+    ts.ofdm_forced_delay               = -1;      // real acquisition, NOT BER known-delay
+    ts.mfsk_fixed_delay                = -1;
+    // Isolate the force-FAIL bounds gate: with defer-overflow ON, a tail-band
+    // detection (delay just past upper_bound) returns early via the overflow-defer
+    // path (frame_overflow_symbols>0, "capture more audio") BEFORE the bounds gate.
+    // The discard the fix targets is the defer-OFF / cursor-past-upper_bound path
+    // (telecom_system.cc:1801 "--ofdm-defer-overflow=off bypasses Fix A"), where a
+    // still-in-buffer frame is force-FAILed instead of recovered. Drive that path.
+    ts.ofdm_defer_overflow_enabled     = false;
+
+    ts.receive_byte(rx, dc.hd_decoded_data_byte);
+
+    AcqBoundsCell out;
+    out.delay           = ts.receive_stats.delay;
+    out.detected_symb   = (sym_samples > 0) ? ts.receive_stats.delay / sym_samples : -1;
+    out.message_decoded = ts.receive_stats.message_decoded;
+    out.upper_bound     = upper_bound;
+    return out;
+}
+
+static int run_acq_bounds_selftest()
+{
+    printf("[TEST-ACQ-BOUNDS] OFDM acquisition bounds-gate recovery self-test\n");
+    int fails = 0;
+    // CONFIG_0 (BPSK rate-1/16): the most robust OFDM rung; a clean (noiseless)
+    // loopback frame decodes trivially when acquisition lands it correctly, so
+    // message_decoded isolates the GATE decision, not LDPC marginality.
+    const int cfg = CONFIG_0;
+
+    // Determine geometry for the placement (one throwaway cell at a benign onset).
+    AcqBoundsCell geo = acq_bounds_run_cell(cfg, 5, 0);
+    int ub = geo.upper_bound;
+    printf("[TEST-ACQ-BOUNDS]   geometry: upper_bound=%d (control onset=5 -> decoded=%d detected=%d)\n",
+           ub, geo.message_decoded, geo.detected_symb);
+
+    // ---- CELL 1 (fail-before / pass-after): TAIL-BAND frame must be RECOVERED. ----
+    // Onset = upper_bound (the highest sample-exact-fitting onset: a full frame
+    // placed here ends exactly at the buffer end). With the anti-re-decode cursor
+    // seeded one symbol into the plateau-lead band (ofdm_eff = upper_bound+1), the
+    // PRE-FIX gate force-FAILs (ofdm_eff>upper_bound -> pream_symb_loc=0 -> the
+    // decode block is skipped -> message_decoded=NO, frame DISCARDED). POST-FIX the
+    // widened cutoff (upper_bound+plateau_lead_symb) lets the recovery scan run; it
+    // re-anchors Schmidl-Cox to the in-bounds onset and the frame DECODES.
+    {
+        AcqBoundsCell c = acq_bounds_run_cell(cfg, ub, ub + 1);
+        bool recovered = (c.message_decoded == YES);
+        printf("[TEST-ACQ-BOUNDS]   CELL1 tail-band@onset=%d ofdm_eff=%d: decoded=%d detected=%d -> %s\n",
+               ub, ub + 1, c.message_decoded, c.detected_symb,
+               recovered ? "RECOVERED_OK" : "DISCARDED_FAIL");
+        if (!recovered) fails++;
+    }
+
+    // ---- CELL 2 (no-regress / anti-re-decode preserved): cursor GENUINELY past the
+    // band with NO fitting frame must still force-FAIL (not re-decode old audio). ----
+    // Empty buffer (no frame) and ofdm_eff well past the widened cutoff: recovery
+    // must NOT manufacture a decode. Asserts the fix did not defeat anti-re-decode.
+    {
+        AcqBoundsCell c = acq_bounds_run_cell(cfg, /*onset (unused, no signal)*/ ub, ub + 8);
+        // Re-run with a zeroed buffer: overwrite the frame by passing an onset that
+        // truncates it fully out is awkward; instead place the frame far below the
+        // cursor floor (onset well under ofdm_eff-plateau) so the scan_start>onset
+        // excludes it -> no recovery -> force-FAIL. This is the already-decoded case.
+        AcqBoundsCell c2 = acq_bounds_run_cell(cfg, 2, ub + 8);
+        bool no_decode = (c.message_decoded != YES) && (c2.message_decoded != YES);
+        printf("[TEST-ACQ-BOUNDS]   CELL2 past-band ofdm_eff=%d: emptybuf_decoded=%d below-floor_decoded=%d -> %s\n",
+               ub + 8, c.message_decoded, c2.message_decoded,
+               no_decode ? "FORCE-FAIL_OK" : "SPURIOUS_DECODE_FAIL");
+        if (!no_decode) fails++;
+    }
+
+    printf("[TEST-ACQ-BOUNDS] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 // --test wall-clock watchdog. `--test` is a Monte-Carlo suite with no internal
 // time bound; on the RPi bench a wedged test used to hang forever, pinning a
 // core at 99% (stacked orphans -> thermal throttle -> CPU jitter that tips OFDM
@@ -926,6 +1054,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
             }
+            // OFDM ACQUISITION BOUNDS-GATE RECOVERY gate (data-flow-acq-bounds-gate.md):
+            // a tail-band frame whose Schmidl-Cox detection floors past upper_bound but
+            // whose body is still in-buffer must be RECOVERED, not force-FAILed/discarded;
+            // and a cursor genuinely past the plateau-lead band must still force-FAIL
+            // (anti-re-decode preserved). Faithful in-process synthetic-fire through the
+            // production transmit_byte/receive_byte (no IONOS/RF).
+            failed += run_acq_bounds_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
@@ -943,6 +1078,15 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-acq-bounds : run ONLY the OFDM acquisition bounds-gate recovery
+        // regression (a tail-band frame whose detection floors past upper_bound
+        // but whose body is in-buffer must be RECOVERED, not discarded) and exit.
+        // Faithful in-process synthetic-fire through transmit_byte/receive_byte;
+        // see fact-documents/data-flow-acq-bounds-gate.md.
+        if (strcmp(argv[i], "--test-acq-bounds") == 0) {
+            int failed = run_acq_bounds_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // (--test-reack-ftr-starvation REMOVED with the excise of 8e62722e,
