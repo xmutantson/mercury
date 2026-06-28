@@ -53,11 +53,16 @@ def card_name(idx):
     return "Loopback" if idx == 0 else f"Loopback_{idx}"
 
 
-def run_plan(n, port_base):
-    """Return list of per-run dicts: card, subs, rsp_port, cmd_port, seed, tag."""
+def run_plan(n, port_base, card_base=0, tag_prefix="par"):
+    """Return list of per-run dicts: card, subs, rsp_port, cmd_port, seed, tag.
+
+    card_base offsets the starting snd-aloop card index so multiple concurrent
+    cohorts (e.g. two A/B arms, or two SNR points) can own DISJOINT cards. Each
+    cohort must also use a disjoint port_base. tag_prefix keeps result/log
+    filenames unique per cohort."""
     plan = []
     for i in range(n):
-        card_idx = i // 2
+        card_idx = card_base + i // 2
         slot = i % 2                       # 0 -> subs 0..3, 1 -> subs 4..7
         subs = [slot * 4 + j for j in range(4)]
         rsp_port = port_base + 10 * i
@@ -70,7 +75,7 @@ def run_plan(n, port_base):
             "rsp_port": rsp_port,
             "cmd_port": cmd_port,
             "seed": i + 1,                 # deterministic per-run seed = run index+1
-            "tag": f"par{i:02d}",
+            "tag": f"{tag_prefix}{i:02d}",
         })
     return plan
 
@@ -106,10 +111,21 @@ def main():
     ap.add_argument("--play-periods", type=int, default=4)
     ap.add_argument("--prime-periods", type=int, default=2)
     ap.add_argument("--port-base", type=int, default=7100)
+    ap.add_argument("--card-base", type=int, default=0,
+                    help="starting snd-aloop card index (disjoint cohorts use disjoint bases)")
+    ap.add_argument("--tag-prefix", default="par",
+                    help="prefix for per-cell tag/result filenames (unique per cohort)")
     ap.add_argument("--logdir", default="/tmp/raspeed/logs")
     ap.add_argument("--out", default="/tmp/raspeed/PARALLEL_RESULT.json")
     ap.add_argument("--launch-stagger", type=float, default=0.0,
                     help="seconds between launching successive runs (0 = true simultaneous)")
+    ap.add_argument("--encrypt", default=None,
+                    help="pass -E <mode> to BOTH mercury in every cell (e.g. 'fast')")
+    ap.add_argument("--psk", default=None,
+                    help="pass -K <hex> to BOTH mercury in every cell (with --encrypt)")
+    ap.add_argument("--arm", default="legacy", help="A/B arm label recorded per cell")
+    ap.add_argument("--env", action="append", default=[],
+                    help="KEY=VAL env injected into BOTH mercury per cell (repeatable)")
     ap.add_argument("--print-setup", action="store_true",
                     help="print the modprobe command to provision snd-aloop and exit")
     args = ap.parse_args()
@@ -119,7 +135,7 @@ def main():
         return 0
 
     os.makedirs(args.logdir, exist_ok=True)
-    plan = run_plan(args.n, args.port_base)
+    plan = run_plan(args.n, args.port_base, args.card_base, args.tag_prefix)
 
     # CONCURRENCY-SAFE cohort cleanup: clear ONLY stale leftovers for the
     # cells THIS spawner is about to launch (its own plan: each cell's card +
@@ -159,6 +175,14 @@ def main():
             cmd += ["--phase-noise-deg", str(args.phase_noise_deg)]
         if args.fade_depth_db:
             cmd += ["--fade-depth-db", str(args.fade_depth_db)]
+        if args.encrypt:
+            cmd += ["--encrypt", args.encrypt]
+        if args.psk:
+            cmd += ["--psk", args.psk]
+        if args.arm:
+            cmd += ["--arm", args.arm]
+        for kv in args.env:
+            cmd += ["--env", kv]
         outlog = open(os.path.join(args.logdir, f"spawn_{p['tag']}.out"), "wb")
         proc = subprocess.Popen(cmd, stdout=outlog, stderr=subprocess.STDOUT)
         procs.append((p, proc, jpath, outlog))
@@ -194,21 +218,37 @@ def main():
 
     n_conn = sum(1 for r in results if r.get("connected"))
     n_deliv = sum(1 for r in results if r.get("rx_bytes"))
+    n_full = sum(1 for r in results if r.get("delivered_full"))
+    tot_authfails = sum((r.get("aead_authfails") or 0) for r in results)
+    tot_nonce_reuse = sum((r.get("nonce_reuse_count") or 0) for r in results)
     summary = {
         "n": args.n,
+        "arm": args.arm,
+        "encrypt": args.encrypt,
         "cohort_wall_secs": round(cohort_wall, 1),
         "passthrough": args.passthrough,
         "cell": args.cell,
         "start_cfg": args.start_cfg,
         "n_connected": n_conn,
         "n_delivered_any": n_deliv,
+        "n_delivered_full": n_full,
         "all_connected": n_conn == args.n,
+        "total_aead_authfails": tot_authfails,
+        "total_nonce_reuse": tot_nonce_reuse,
         "per_run": [
             {"tag": r.get("tag"), "card": r.get("plan_card"),
              "subs": r.get("plan_subs"), "seed": r.get("seed"),
              "connected": r.get("connected"),
              "connected_at_s": r.get("connected_at_s"),
              "rx_bytes": r.get("rx_bytes"),
+             "delivered_full": r.get("delivered_full"),
+             "payload_target": r.get("payload_target"),
+             "encrypt": r.get("encrypt"),
+             "enc_activated": r.get("enc_activated"),
+             "aead_authfails": r.get("aead_authfails"),
+             "nonce_enc_count": r.get("nonce_enc_count"),
+             "nonce_reuse_count": r.get("nonce_reuse_count"),
+             "dec_ok_count": r.get("dec_ok_count"),
              "rsp_nreceived_frames": r.get("rsp_nreceived_frames"),
              "configs_seen": r.get("configs_seen"),
              "wall_secs": r.get("wall_secs")}
