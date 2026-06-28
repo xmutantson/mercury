@@ -4202,6 +4202,37 @@ public:
   int      tx_nonce_last_bsi;         // TX-direction last wire bsi (-1 = unset)
   uint64_t rx_nonce_epoch;            // RX-direction wrap count for decrypt nonce
   int      rx_nonce_last_bsi;         // RX-direction last wire bsi (-1 = unset)
+  // --- Re-seal nonce-reuse guarantee (data-flow-aead-nonce.md §11) ----------
+  // The OLD bsi-bound nonce was UNSAFE on the compression+encryption recovery
+  // paths (BREAK-rebuild / config-rebuild / demote): a recovery FREEs the built-
+  // but-unsent batch and re-queues PLAINTEXT *without* advancing cmd_batch_seq_id
+  // (the +1 only runs after a COMPLETED send_batch, a later tick), so the next
+  // build RE-SEALS the SAME wire bsi over RE-COMPRESSED (different) plaintext ->
+  // unwrap returns the SAME index -> SAME (key,nonce), DIFFERENT plaintext ->
+  // KEYSTREAM REUSE (catastrophic). The wire bsi MUST roll back to the in-flight
+  // value for RSP delivery contiguity (delivery_step_is_gap), so the nonce index
+  // can NOT be a pure function of the wire bsi. Fix = a per-direction GENERATION
+  // counter, orthogonal to unwrap's wrap-epoch, folded into the nonce index high
+  // bits: TX bumps tx_nonce_gen on every recovery that re-queues plaintext for a
+  // re-seal; RX bumps rx_nonce_gen on the matching config-transition re-adopt it
+  // processes BEFORE decrypting the re-sent batch (the two peers stay aligned
+  // through the ONE wire-observable transition that separates seal from re-seal).
+  // SAFETY DOES NOT DEPEND ON THAT ALIGNMENT: tx_nonce_sealed_high_water records
+  // the highest index ever sealed; the encrypt site refuses to seal at or below
+  // it, bumping the gen until the index clears the high-water. So a nonce is
+  // NEVER reused even if the gen counters ever drift — a drift only makes RX
+  // reconstruct a wrong index, which AUTH-FAILS (a safe drop/retx), never a
+  // reuse. RFC-4303-ESN / RFC-9001-§5.4 regime: implicit high-order sequence
+  // bits the receiver reconstructs; a wrong guess fails the tag, never weakens it.
+  uint64_t tx_nonce_gen;              // TX re-seal generation (bumped per recovery)
+  uint64_t rx_nonce_gen;             // RX re-seal generation (bumped per transition)
+  uint64_t tx_nonce_sealed_high_water;// highest unwrapped+gen index ever sealed (TX);
+                                      // UINT64_MAX = unset (nothing sealed yet)
+  bool     rx_nonce_adopted_once;    // RX has adopted an expected-bsi at least once
+                                      // this session — so the NEXT adopt-from -1 is a
+                                      // genuine config-transition RE-adopt (bump
+                                      // rx_nonce_gen) rather than the first-ever adopt
+                                      // (gen 0). 1:1 with each TX recovery re-queue.
   int      decrypt_delivered_bsi;     // wire bsi of the batch being delivered in
                                       // copy_data_to_buffer() (set immediately
                                       // before each call per the §5 source table;

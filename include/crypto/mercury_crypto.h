@@ -145,6 +145,23 @@ public:
     static uint64_t unwrap_batch_index(int wire_bsi,
                                        uint64_t* epoch, int* last_bsi);
 
+    // Re-seal generation stride (data-flow-aead-nonce.md §11). The AEAD nonce
+    // index is fold_gen_index(gen, unwrap_index) = gen*NONCE_GEN_STRIDE +
+    // unwrap_index. NONCE_GEN_STRIDE (2^48) is larger than any reachable
+    // unwrap_index within ONE generation: the per-session re-key floor caps a
+    // session FAR below 2^32 batches (RFC 9001 §6.6), so the unwrap index
+    // (epoch<<8 | bsi) stays < 2^40 << 2^48 — distinct generations occupy
+    // DISJOINT, strictly-ordered index bands, so a higher gen always yields a
+    // strictly-greater index than any index of a lower gen. Combined with the
+    // TX seal high-water guard, this makes a re-seal land at a fresh nonce
+    // EVEN AT THE SAME WIRE BSI (the recovery rolls the wire bsi back for RSP
+    // delivery contiguity, so the gen — not the bsi — is what advances).
+    static const uint64_t NONCE_GEN_STRIDE = (uint64_t)1 << 48;
+    static uint64_t fold_gen_index(uint64_t gen, uint64_t unwrap_index)
+    {
+        return gen * NONCE_GEN_STRIDE + unwrap_index;
+    }
+
     // --- State Queries ---
     bool is_active() const { return encryption_active; }
     bool is_pq_upgraded() const { return pq_active; }

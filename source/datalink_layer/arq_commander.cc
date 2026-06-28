@@ -7011,6 +7011,10 @@ void cl_arq_controller::process_control_commander()
 			tx_nonce_last_bsi = -1;
 			rx_nonce_epoch = 0;
 			rx_nonce_last_bsi = -1;
+			tx_nonce_gen = 0;
+			rx_nonce_gen = 0;
+			tx_nonce_sealed_high_water = UINT64_MAX;
+			rx_nonce_adopted_once = false;
 			decrypt_delivered_bsi = -1;
 			consecutive_auth_failures = 0;
 #ifdef MERCURY_GUI_ENABLED
@@ -19308,20 +19312,57 @@ void cl_arq_controller::process_buffer_data_commander()
 
 						uint32_t tx_direction = (original_role == COMMANDER)
 							? DIRECTION_CMD_TO_RSP : DIRECTION_RSP_TO_CMD;
-						// AEAD nonce binds to the WIRE batch_seq_id this batch will
-						// be stamped with on the wire (cmd_batch_seq_id, the CURRENT
-						// pre-increment value — the increment at :2464 happens AFTER
-						// send_batch, and the per-frame stamp at :2216 uses this same
-						// value). Unwrapped to a strictly-monotone 64-bit index so it
-						// never wraps under one key. A config-change rebuild re-queues
-						// the plaintext as FRESH new-data with a NEW bsi (R029,
-						// arq_common.cc restore_tx_from_compressed), so a re-encrypt
-						// always gets a NEW nonce — never same-nonce/different-plaintext.
-						// A SACK retx replays the STORED ciphertext verbatim (it does
-						// not re-enter this path). See data-flow-aead-nonce.md §TX.
+						// AEAD nonce binds to the WIRE batch_seq_id this batch carries
+						// (cmd_batch_seq_id, CURRENT pre-increment value; the +1 at :2464 is
+						// post-send and the per-frame stamp at :2216 uses this same value),
+						// UNWRAPPED to a monotone index then folded with the re-seal generation
+						// (see the RE-SEAL guard below). A SACK retx replays the STORED
+						// ciphertext verbatim (it does not re-enter this path).
 						int tx_wire_bsi = cmd_batch_seq_id & 0xFF;
-						uint64_t tx_batch_index = cl_cipher_suite::unwrap_batch_index(
+						// RE-SEAL NONCE-REUSE GUARANTEE (data-flow-aead-nonce.md §11): the
+						// §5-inv4 claim "a rebuild always re-queues fresh -> NEW bsi -> NEW
+						// nonce" was FALSE on the compression+encryption recovery paths. A
+						// BREAK/config-rebuild/demote FREEs the built-but-unsent batch and
+						// re-queues PLAINTEXT WITHOUT advancing cmd_batch_seq_id (the +1 is
+						// post-send, a later tick), and the wire bsi MUST roll back to the
+						// in-flight value for RSP delivery contiguity (delivery_step_is_gap) -
+						// so a pure bsi-bound nonce would re-seal the SAME index over
+						// re-compressed plaintext = KEYSTREAM REUSE. The per-direction
+						// GENERATION counter (tx_nonce_gen, bumped per recovery re-queue in
+						// restore_tx_from_compressed) is folded into the index HIGH bits so a
+						// re-seal lands in a strictly-higher, DISJOINT band at the same bsi.
+						// HARD BACKSTOP (safety independent of gen alignment):
+						// tx_nonce_sealed_high_water is the highest index ever sealed; if the
+						// candidate is NOT strictly above it (the reuse condition), bump
+						// tx_nonce_gen until it clears the high-water BEFORE sealing. A nonce is
+						// NEVER reused even if the gen bookkeeping drifts - a wrong gen on RX
+						// only auth-fails (safe drop/retx), never a reuse (RFC-4303 ESN /
+						// RFC-9001 §5.4: implicit high-order seq bits; wrong guess fails tag).
+						uint64_t tx_unwrap = cl_cipher_suite::unwrap_batch_index(
 							tx_wire_bsi, &tx_nonce_epoch, &tx_nonce_last_bsi);
+						uint64_t tx_batch_index =
+							cl_cipher_suite::fold_gen_index(tx_nonce_gen, tx_unwrap);
+						if(tx_nonce_sealed_high_water != UINT64_MAX
+						   && tx_batch_index <= tx_nonce_sealed_high_water)
+						{
+							uint64_t old_gen = tx_nonce_gen;
+							uint64_t hw_band = tx_nonce_sealed_high_water /
+								cl_cipher_suite::NONCE_GEN_STRIDE;
+							tx_nonce_gen = hw_band + 1;
+							uint64_t old_idx = tx_batch_index;
+							tx_batch_index = cl_cipher_suite::fold_gen_index(
+								tx_nonce_gen, tx_unwrap);
+							printf("[CRYPTO-TX] RE-SEAL GUARD: wire_bsi=%d index<=high_water "
+								"(%llu<=%llu) - bumped gen %llu->%llu, new index=%llu\n",
+								tx_wire_bsi,
+								(unsigned long long)old_idx,
+								(unsigned long long)tx_nonce_sealed_high_water,
+								(unsigned long long)old_gen,
+								(unsigned long long)tx_nonce_gen,
+								(unsigned long long)tx_batch_index);
+							fflush(stdout);
+						}
+						tx_nonce_sealed_high_water = tx_batch_index;
 						printf("[CRYPTO-TX] Encrypting %d bytes, wire_bsi=%d index=%llu dir=%u tag=%d config=%d\n",
 							comp_size, tx_wire_bsi,
 							(unsigned long long)tx_batch_index,

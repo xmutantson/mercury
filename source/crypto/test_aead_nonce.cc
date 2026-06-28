@@ -430,6 +430,289 @@ int test_batch_span_truncation_authfail()
     return 0;
 }
 
+// ============================================================================
+// §11 RE-SEAL NONCE-REUSE GUARANTEE — BREAK-rebuild / SACK-reorder / wrap
+// (data-flow-aead-nonce.md §11). These model the PRODUCTION re-seal logic at the
+// crypto layer: a TX "seal" that bumps the GENERATION on every recovery re-queue
+// (restore_tx_from_compressed) and applies the encrypt-site HIGH-WATER guard; a
+// RX "decrypt" that bumps the generation on every config-transition re-adopt it
+// processes. The folded index = fold_gen_index(gen, unwrap_index). The
+// SECURITY INVARIANT asserted: across BREAK-rebuild (bsi re-stamp), SACK
+// reorder/retx, and >255 batch wrap, NO (dir,index)/nonce is EVER reused with
+// two different plaintexts, and every batch RX needs decrypts.
+// ============================================================================
+
+// A tiny TX-side seal model mirroring arq_commander.cc encrypt site + the
+// restore_tx_from_compressed gen bump. Tracks (epoch,last_bsi,gen,high_water).
+struct tx_seal_model {
+    cl_cipher_suite cs;
+    uint64_t epoch = 0; int last_bsi = -1;
+    uint64_t gen = 0;
+    uint64_t high_water = UINT64_MAX;     // unset
+
+    // Seal one batch at wire bsi over plaintext pt; returns ciphertext.
+    // Mirrors the production: unwrap -> fold gen -> high-water guard -> encrypt.
+    std::vector<uint8_t> seal(int wire_bsi, const std::vector<uint8_t>& pt,
+                              uint64_t* out_idx)
+    {
+        uint64_t uw = cl_cipher_suite::unwrap_batch_index(wire_bsi, &epoch, &last_bsi);
+        uint64_t idx = cl_cipher_suite::fold_gen_index(gen, uw);
+        if (high_water != UINT64_MAX && idx <= high_water) {
+            uint64_t band = high_water / cl_cipher_suite::NONCE_GEN_STRIDE;
+            gen = band + 1;
+            idx = cl_cipher_suite::fold_gen_index(gen, uw);
+        }
+        high_water = idx;
+        std::vector<uint8_t> ct(pt.size() + AUTH_TAG_SIZE);
+        int n = cs.encrypt(pt.data(), (int)pt.size(), ct.data(), (int)ct.size(),
+                           idx, DIRECTION_CMD_TO_RSP, AUTH_TAG_SIZE);
+        ct.resize(n > 0 ? n : 0);
+        if (out_idx) *out_idx = idx;
+        return ct;
+    }
+    // restore_tx_from_compressed recovery: bump the generation.
+    void recovery() { gen++; }
+};
+
+// RX-side decrypt model mirroring arq_common.cc copy_data_to_buffer + the
+// arq_responder.cc re-adopt gen bump.
+struct rx_decrypt_model {
+    cl_cipher_suite cs;
+    uint64_t epoch = 0; int last_bsi = -1;
+    uint64_t gen = 0;
+    bool adopted_once = false;
+
+    // A config-transition re-adopt: bump gen iff already adopted once.
+    void transition_readopt() { if (adopted_once) gen++; adopted_once = true; }
+
+    int decrypt(int wire_bsi, const std::vector<uint8_t>& ct,
+                std::vector<uint8_t>& out)
+    {
+        uint64_t uw = cl_cipher_suite::unwrap_batch_index(wire_bsi, &epoch, &last_bsi);
+        uint64_t idx = cl_cipher_suite::fold_gen_index(gen, uw);
+        out.assign(ct.size() > AUTH_TAG_SIZE ? ct.size() - AUTH_TAG_SIZE : 0, 0);
+        return cs.decrypt(ct.data(), (int)ct.size(), out.data(), (int)out.size(),
+                          idx, DIRECTION_CMD_TO_RSP, AUTH_TAG_SIZE);
+    }
+};
+
+std::vector<uint8_t> mk_pt(int seed, int len)
+{
+    std::vector<uint8_t> v(len);
+    for (int i = 0; i < len; i++) v[i] = (uint8_t)((seed * 131 + i * 7 + 1) & 0xFF);
+    return v;
+}
+
+// --- Case 9: BREAK-rebuild bsi RE-STAMP -> NO nonce reuse, RX decrypts --------
+// The ROOT bug (§10.3 P3): TX seals bsi=7, then a BREAK FREEs+re-queues the
+// plaintext WITHOUT advancing the bsi and re-seals the SAME bsi=7 over DIFFERENT
+// (re-compressed) plaintext. Old design: same (key,nonce), 2 plaintexts = REUSE.
+// New design: the recovery bumps the gen, so the re-seal lands at a strictly-
+// higher index; the high-water guard backstops it. RX observed the transition
+// (re-adopt) so it decrypts the re-seal. We assert: (1) the two seals used
+// DISTINCT indices; (2) NO index emitted twice; (3) RX decrypts the re-seal to
+// the NEW plaintext.
+int test_break_rebuild_no_reuse()
+{
+    tx_seal_model tx; rx_decrypt_model rx;
+    make_paired_suites(tx.cs, rx.cs);
+
+    std::set<uint64_t> emitted;
+
+    // Steady-state: TX seals bsi 0..6 and RX delivers them (RX adopts at bsi 0).
+    rx.transition_readopt();   // first-ever adopt (gen stays 0)
+    for (int b = 0; b <= 6; b++) {
+        uint64_t idx; auto pt = mk_pt(b, 80);
+        auto ct = tx.seal(b, pt, &idx);
+        if (!emitted.insert(idx).second) return fail("pre-BREAK index reused");
+        std::vector<uint8_t> out;
+        if (rx.decrypt(b, ct, out) != (int)pt.size() || out != pt)
+            return fail("pre-BREAK batch failed to decrypt");
+    }
+
+    // TX seals bsi=7 (aborted batch — never delivered to RX).
+    uint64_t idx_a; auto pt_a = mk_pt(700, 90);
+    auto ct_a = tx.seal(7, pt_a, &idx_a);
+    if (!emitted.insert(idx_a).second) return fail("aborted seal index reused");
+    // (RX never sees ct_a — the batch was freed mid-flight by the BREAK.)
+
+    // BREAK: recovery re-queues plaintext; TX bumps gen. RX processes the
+    // transition (SET_CONFIG/CONFIG_TAG re-adopt) and bumps its gen too.
+    tx.recovery();
+    rx.transition_readopt();
+
+    // The re-build re-stamps the SAME wire bsi=7 (rolled back for delivery
+    // contiguity) over DIFFERENT plaintext (re-compressed at the demoted cfg).
+    uint64_t idx_b; auto pt_b = mk_pt(701, 50);   // different content + length
+    auto ct_b = tx.seal(7, pt_b, &idx_b);
+
+    // (1) the two seals at bsi=7 MUST have used DISTINCT indices.
+    if (idx_a == idx_b)
+        return fail("BREAK re-stamp at bsi=7 reused the SAME nonce index (KEYSTREAM REUSE)");
+    // (2) no index emitted twice across the whole run.
+    if (!emitted.insert(idx_b).second)
+        return fail("BREAK re-seal index collides with an earlier emitted index (REUSE)");
+    // (3) RX decrypts the re-seal to the NEW plaintext (gen aligned via re-adopt).
+    std::vector<uint8_t> out_b;
+    if (rx.decrypt(7, ct_b, out_b) != (int)pt_b.size() || out_b != pt_b)
+        return fail("BREAK re-sealed batch failed to decrypt on RX (gen desync)");
+
+    printf("[TEST-AEAD-NONCE] OK: BREAK-rebuild bsi=7 re-stamp -> distinct nonces "
+           "(idx %llu vs %llu), 0 reuse, RX decrypts re-seal\n",
+           (unsigned long long)idx_a, (unsigned long long)idx_b);
+    fflush(stdout);
+    return 0;
+}
+
+// --- Case 10: harsh SACK reorder/retx WITHIN a generation -> no reuse ---------
+// No config transition (gen fixed): TX seals 20..29, RX delivers OUT OF ORDER
+// with a retransmit replaying STORED ciphertext (verbatim, same nonce+plaintext).
+// Assert every nonce distinct across new seals, retx is a verbatim replay (NOT a
+// re-encrypt), and every delivery (incl. reorder + retx) decrypts correctly.
+int test_sack_reorder_retx_no_reuse()
+{
+    tx_seal_model tx; rx_decrypt_model rx;
+    make_paired_suites(tx.cs, rx.cs);
+
+    const int BASE = 20, N = 10;
+    std::set<uint64_t> emitted;
+    std::vector<std::vector<uint8_t>> ct(N), pt(N);
+    std::vector<uint64_t> idx(N);
+    for (int k = 0; k < N; k++) {
+        pt[k] = mk_pt(2000 + k, 70 + k);
+        ct[k] = tx.seal(BASE + k, pt[k], &idx[k]);
+        if (!emitted.insert(idx[k]).second)
+            return fail("SACK new-seal nonce reused");
+    }
+    // RX delivers reordered: 22,20,29,21,25,...,then RETX 22 (verbatim replay).
+    int order[] = {2, 0, 9, 1, 5, 3, 4, 6, 7, 8, 2 /*retx*/};
+    rx.transition_readopt();   // first adopt at bsi=22 (gen 0)
+    for (int o = 0; o < (int)(sizeof(order)/sizeof(order[0])); o++) {
+        int k = order[o];
+        std::vector<uint8_t> out;
+        if (rx.decrypt(BASE + k, ct[k], out) != (int)pt[k].size() || out != pt[k])
+            return fail("SACK reorder/retx batch failed to decrypt");
+    }
+    // Retx is a VERBATIM replay: same nonce index, same ciphertext -> SAFE by
+    // construction (never a second different plaintext under that nonce).
+    printf("[TEST-AEAD-NONCE] OK: SACK reorder(10 batches)+retx all decrypt; "
+           "%zu distinct nonces, 0 reuse\n", emitted.size());
+    fflush(stdout);
+    return 0;
+}
+
+// --- Case 11: batch-wrap >255 WITH interleaved BREAK recoveries -> no reuse ----
+// Drive >255 batches (so the 8-bit wire bsi recurs) AND inject a BREAK recovery
+// (bsi re-stamp) at a few points. Assert NO folded index is ever emitted twice
+// and a sampled re-seal still decrypts. This is the union of the wrap-epoch and
+// the gen mechanisms — the two must not collide (disjoint index bands).
+int test_wrap_with_recoveries_no_reuse()
+{
+    tx_seal_model tx; rx_decrypt_model rx;
+    make_paired_suites(tx.cs, rx.cs);
+
+    std::set<uint64_t> emitted;
+    rx.transition_readopt();   // first adopt
+    int wire = 0;
+    int last_restamp_wire = -1;
+    std::vector<uint8_t> last_pt; std::vector<uint8_t> last_ct;
+    uint64_t last_idx = 0; bool have_restamp = false;
+
+    for (int n = 0; n < 700; n++) {
+        // Every 137 batches, simulate a BREAK: recovery + RE-STAMP the SAME wire
+        // bsi over different plaintext (the §11 hazard), then resume forward.
+        if (n > 0 && n % 137 == 0) {
+            tx.recovery();
+            rx.transition_readopt();
+            // re-stamp the SAME wire bsi (no forward advance) over new plaintext
+            auto rpt = mk_pt(90000 + n, 60);
+            uint64_t ridx; auto rct = tx.seal(wire, rpt, &ridx);
+            if (!emitted.insert(ridx).second)
+                return fail("wrap+recovery: re-stamp folded index REUSED (NONCE REUSE)");
+            last_restamp_wire = wire; last_pt = rpt; last_ct = rct;
+            last_idx = ridx; have_restamp = true;
+            // RX decrypts the re-stamp (it observed the transition)
+            std::vector<uint8_t> rout;
+            if (rx.decrypt(wire, rct, rout) != (int)rpt.size() || rout != rpt)
+                return fail("wrap+recovery: re-stamp failed to decrypt");
+            // The re-stamped batch consumed wire bsi W; the NEXT new-data batch
+            // advances to W+1 (production: cmd_batch_seq_id +1 after the completed
+            // re-sent batch). Both peers keep the bumped generation for the rest of
+            // this generation, so subsequent forward batches stay gen-aligned.
+            wire = (wire + 1) & 0xFF;
+            continue;
+        }
+        auto pt = mk_pt(n, 64);
+        uint64_t idx; auto ct = tx.seal(wire, pt, &idx);
+        if (!emitted.insert(idx).second)
+            return fail("wrap+recovery: forward folded index REUSED across wrap");
+        std::vector<uint8_t> out;
+        if (rx.decrypt(wire, ct, out) != (int)pt.size() || out != pt)
+            return fail("wrap+recovery: forward batch failed to decrypt across wrap");
+        wire = (wire + 1) & 0xFF;
+    }
+    if (!have_restamp) return fail("wrap+recovery test never exercised a re-stamp (vacuous)");
+    (void)last_restamp_wire; (void)last_pt; (void)last_ct; (void)last_idx;
+    printf("[TEST-AEAD-NONCE] OK: 700 batches across >2 wraps + 5 BREAK re-stamps, "
+           "%zu folded indices ALL UNIQUE (0 reuse), re-stamps decrypt\n", emitted.size());
+    fflush(stdout);
+    return 0;
+}
+
+// --- Case 12: HIGH-WATER GUARD backstop (gen bookkeeping DELIBERATELY broken) --
+// Safety must NOT depend on the gen counters being correct (data-flow-aead-nonce.md
+// §11.3). Re-seal the SAME wire bsi over DIFFERENT plaintext WITHOUT calling
+// recovery() (i.e. tx_nonce_gen is NOT bumped — modelling a gen-bookkeeping bug).
+// The encrypt-site high-water guard MUST still force a distinct, strictly-higher
+// index so no (key,nonce) is reused. (RX would then auth-fail on the un-bumped
+// gen — a SAFE drop, asserted — never a reuse.)
+int test_high_water_guard_backstop()
+{
+    tx_seal_model tx; rx_decrypt_model rx;
+    make_paired_suites(tx.cs, rx.cs);
+
+    // Seal bsi=3 (gen 0).
+    uint64_t idx0; auto pt0 = mk_pt(300, 64);
+    auto ct0 = tx.seal(3, pt0, &idx0);
+
+    // Re-seal the SAME bsi=3 over DIFFERENT plaintext WITHOUT bumping the gen
+    // (tx.recovery() intentionally NOT called). unwrap(3) with last_bsi already 3
+    // returns the SAME unwrap index; gen is still 0 -> candidate index == idx0
+    // <= high_water -> the GUARD must fire and bump the gen internally.
+    uint64_t idx1; auto pt1 = mk_pt(301, 40);
+    auto ct1 = tx.seal(3, pt1, &idx1);
+
+    if (idx1 == idx0)
+        return fail("high-water guard did NOT prevent reuse (same index, diff plaintext)");
+    if (idx1 <= idx0)
+        return fail("high-water guard produced a non-increasing index");
+    if (ct0 == ct1)
+        return fail("two seals of the same bsi produced identical ciphertext (reuse)");
+
+    // The guard kept TX safe even though the gen was never bumped. RX (gen 0,
+    // no re-adopt — modelling the SAME broken bookkeeping) reconstructs the OLD
+    // index for bsi=3: it decrypts the FIRST seal fine, but the guarded re-seal
+    // (a higher gen band on TX) auth-FAILS on RX — a SAFE drop, NOT a reuse.
+    {
+        std::vector<uint8_t> o0;
+        if (rx.decrypt(3, ct0, o0) != (int)pt0.size() || o0 != pt0)
+            return fail("guard test: original seal must still decrypt on aligned gen");
+    }
+    {
+        // NOTE: rx is at gen 0 (transition_readopt never called) — decrypting the
+        // guarded re-seal at the wrong gen MUST auth-fail, never reuse/leak.
+        std::vector<uint8_t> o1;
+        if (rx.decrypt(3, ct1, o1) > 0)
+            return fail("guarded re-seal decrypted at the WRONG gen (should auth-fail safely)");
+    }
+
+    printf("[TEST-AEAD-NONCE] OK: high-water guard backstops a BROKEN gen "
+           "(idx %llu -> %llu, no reuse; wrong-gen RX safely auth-fails)\n",
+           (unsigned long long)idx0, (unsigned long long)idx1);
+    fflush(stdout);
+    return 0;
+}
+
 } // namespace
 
 int run_aead_nonce_tests()
@@ -445,6 +728,10 @@ int run_aead_nonce_tests()
     failed += test_tamper_rejected();
     failed += test_backward_across_wrap();
     failed += test_batch_span_truncation_authfail();
+    failed += test_break_rebuild_no_reuse();
+    failed += test_sack_reorder_retx_no_reuse();
+    failed += test_wrap_with_recoveries_no_reuse();
+    failed += test_high_water_guard_backstop();
     if (failed == 0)
         printf("[TEST-AEAD-NONCE] === ALL PASS ===\n");
     else

@@ -1003,6 +1003,27 @@ void cl_arq_controller::process_messages_rx_data_control()
 						}
 						else
 						{
+							// RE-SEAL NONCE GENERATION (data-flow-aead-nonce.md §11):
+							// expected was wiped to -1 by a config transition (BREAK /
+							// SET_CONFIG / CONFIG_TAG follow). If this peer had ALREADY
+							// adopted earlier this session, this is a genuine RE-adopt =
+							// the same transition that drove the TX restore_tx_from_compressed
+							// (one recovery -> one SET_CONFIG that lands -> one re-adopt,
+							// 1:1 across BREAK retries). Bump rx_nonce_gen so the decrypt of
+							// the re-sealed batch (folded gen, copy_data_to_buffer) matches
+							// the TX seal's bumped gen — at the SAME wire bsi. The first-ever
+							// adopt (adopted_once==false) is gen 0 (no transition yet). On a
+							// gen drift the decrypt simply auth-fails (safe); the TX
+							// high-water guard owns no-reuse.
+							if(cipher_suite.is_active() && rx_nonce_adopted_once)
+							{
+								rx_nonce_gen++;
+								printf("[RSP-V2-ADOPT] re-adopt after transition: "
+									"rx_nonce_gen -> %llu\n",
+									(unsigned long long)rx_nonce_gen);
+								fflush(stdout);
+							}
+							rx_nonce_adopted_once = true;
 							rsp_current_expected_batch_seq_id = bsi;
 							printf("[RSP-V2-ADOPT] current_expected_batch_seq_id=%d "
 								"(first v2 DATA frame this session)\n", bsi);
@@ -3204,6 +3225,10 @@ void cl_arq_controller::process_control_responder()
 				tx_nonce_last_bsi = -1;
 				rx_nonce_epoch = 0;
 				rx_nonce_last_bsi = -1;
+				tx_nonce_gen = 0;
+				rx_nonce_gen = 0;
+				tx_nonce_sealed_high_water = UINT64_MAX;
+				rx_nonce_adopted_once = false;
 				decrypt_delivered_bsi = -1;
 				consecutive_auth_failures = 0;
 

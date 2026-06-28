@@ -877,6 +877,10 @@ cl_arq_controller::cl_arq_controller()
 	tx_nonce_last_bsi=-1;
 	rx_nonce_epoch=0;
 	rx_nonce_last_bsi=-1;
+	tx_nonce_gen=0;
+	rx_nonce_gen=0;
+	tx_nonce_sealed_high_water=UINT64_MAX;
+	rx_nonce_adopted_once=false;
 	decrypt_delivered_bsi=-1;
 	consecutive_auth_failures=0;
 	kx_data_buf=NULL;
@@ -7059,6 +7063,10 @@ void cl_arq_controller::reset_session_state()
 	tx_nonce_last_bsi = -1;
 	rx_nonce_epoch = 0;
 	rx_nonce_last_bsi = -1;
+	tx_nonce_gen = 0;
+	rx_nonce_gen = 0;
+	tx_nonce_sealed_high_water = UINT64_MAX;
+	rx_nonce_adopted_once = false;
 	decrypt_delivered_bsi = -1;
 	consecutive_auth_failures = 0;
 	if (kx_data_buf) { free(kx_data_buf); kx_data_buf = NULL; }
@@ -13751,8 +13759,19 @@ void cl_arq_controller::copy_data_to_buffer()
 				// rsp_current_expected_batch_seq_id, which is already advanced at
 				// the in-order delivery site). data-flow-aead-nonce.md §RX.
 				int rx_wire_bsi = decrypt_delivered_bsi & 0xFF;
-				uint64_t rx_batch_index = cl_cipher_suite::unwrap_batch_index(
+				// Fold the RX re-seal generation (rx_nonce_gen, bumped on each config-
+				// transition re-adopt this peer processed BEFORE this decrypt) into the
+				// index high bits, mirroring the TX seal (arq_commander.cc encrypt site,
+				// data-flow-aead-nonce.md §11). A re-sealed batch carries the SAME wire
+				// bsi (rolled back for delivery contiguity) but a HIGHER generation; the
+				// transition that triggered the TX re-seal is the SAME one this peer
+				// observed (re-adopt-from -1), so the generations stay aligned. If they
+				// ever drift, the folded index simply mismatches -> AEAD auth-fail (a
+				// safe drop), never a reuse (the TX high-water guard owns no-reuse).
+				uint64_t rx_unwrap = cl_cipher_suite::unwrap_batch_index(
 					rx_wire_bsi, &rx_nonce_epoch, &rx_nonce_last_bsi);
+				uint64_t rx_batch_index =
+					cl_cipher_suite::fold_gen_index(rx_nonce_gen, rx_unwrap);
 				printf("[CRYPTO-RX] Decrypting %d bytes, wire_bsi=%d index=%llu dir=%u tag=%d config=%d\n",
 					assembled_size, rx_wire_bsi,
 					(unsigned long long)rx_batch_index,
@@ -13926,6 +13945,11 @@ void cl_arq_controller::restore_tx_from_compressed()
 	{
 		printf("[RESTORE_TX] Streaming active — resetting context, restoring from backup\n");
 		fflush(stdout);
+		// RE-SEAL NONCE-REUSE GUARANTEE (data-flow-aead-nonce.md §11): if encryption
+		// is ALSO active on this streaming recovery, the re-queued plaintext is
+		// re-sealed at a re-stamped bsi — bump the generation so the re-seal lands in
+		// a fresh nonce-index band (same rule as the non-streaming enc branch below).
+		if(cipher_suite.is_active()) tx_nonce_gen++;
 		compressor.streaming_reset();
 		compressor.clear_pending();
 		for(int i=0; i<nMessages; i++)
@@ -13935,17 +13959,23 @@ void cl_arq_controller::restore_tx_from_compressed()
 	}
 
 	// When encryption is active, messages_tx contains encrypted+compressed data.
-	// The backup buffer always has raw plaintext, so use it directly: the data is
-	// re-queued and re-sent as FRESH new-data under the new config, which assigns
-	// it a NEW wire batch_seq_id (R029). The AEAD nonce binds to that wire bsi
-	// (data-flow-aead-nonce.md §TX), so a re-encrypt naturally gets a NEW nonce —
-	// no counter rewind needed (the old local-counter `tx_batch_counter--` hack
-	// is obsolete and was REMOVED: it paired the same nonce with potentially
-	// re-compressed/different plaintext, the latent reuse hazard NONCE_DESIGN.md
-	// §1/§4(e) flagged). The forward-only nonce epoch never regresses.
+	// The backup buffer always has raw plaintext, so use it directly: re-queued
+	// and re-sent as a FRESH SEAL under the new config.
+	//
+	// RE-SEAL NONCE-REUSE GUARANTEE (data-flow-aead-nonce.md §11): the OLD comment
+	// here claimed the re-send "assigns a NEW wire batch_seq_id (R029) so a
+	// re-encrypt naturally gets a NEW nonce" — that is FALSE. cmd_batch_seq_id
+	// advances only after a COMPLETED send_batch (arq_commander.cc:2464); THIS
+	// recovery pre-empts the send, so the next build re-seals the SAME bsi, and
+	// the wire bsi must roll back to the in-flight value anyway for RSP delivery
+	// contiguity. Nonce uniqueness therefore comes from the re-seal GENERATION,
+	// not a fresh bsi: bump tx_nonce_gen so the next seal lands in a strictly-
+	// higher, disjoint nonce-index band even at the same wire bsi. The encrypt-
+	// site high-water guard is the hard backstop enforcing no-reuse regardless.
 	if(cipher_suite.is_active())
 	{
-		printf("[RESTORE_TX] Encryption active — restoring from backup buffer (fresh-bsi re-send)\n");
+		tx_nonce_gen++;
+		printf("[RESTORE_TX] Encryption active — restoring from backup buffer (re-seal under bumped gen=%llu)\n", (unsigned long long)tx_nonce_gen);
 		fflush(stdout);
 		for(int i=0; i<nMessages; i++)
 			messages_tx[i].status = FREE;
