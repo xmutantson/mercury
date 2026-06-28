@@ -1864,9 +1864,29 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		// un-decoded frames left in the buffer. Skip recovery → FAIL → buffer shift.
 		int ofdm_eff = receive_stats.ofdm_search_raw - data_container.nUnder_processing_events;
 		if(ofdm_eff < 0) ofdm_eff = 0;
-		if(ofdm_eff > upper_bound)
+		// ACQ-BOUNDS FIX (data-flow-acq-bounds-gate.md): the force-FAIL gate must
+		// center on the EXTRACTABLE-BODY predicate, not the symbol-floored cursor.
+		// `upper_bound` is symbol-floored (buffer_Nsymb-(Nsymb+rx_eff_preamble))
+		// while the EXTRACTION fit test is sample-exact (delay <= buf-frame_size,
+		// :2556-2562). Two effects push a RECOVERABLE frame's cursor just past
+		// upper_bound: (1) the symbol-floor granularity leaves a 1-symbol band the
+		// floored gate rejects but the sample test accepts; (2) the Schmidl-Cox
+		// Phase-1 GI-stride coarse peak rides the ~2.8-symbol preamble PLATEAU
+		// (ofdm.cc:3238-3240), reporting a position up to ~3 symbols AHEAD of the
+		// true (in-bounds) preamble onset. In both, the real un-decoded frame body
+		// is still entirely in-buffer; force-FAILing here DISCARDS it.
+		// Fix: widen the recovery-entry cutoff by the plateau lead so a tail-band
+		// frame that still fits is RECOVERED (the recovery scan re-anchors
+		// Schmidl-Cox to the in-bounds onset; its scan_start floors at
+		// ofdm_eff-plateau_lead_symb [never below lower_bound+1] and the retry
+		// accept-gate retry_symb<=upper_bound keeps the anti-re-decode invariant
+		// intact). A cursor genuinely PAST the band (no fitting frame)
+		// still force-FAILs. ofdm_eff==0 on every re-anchor / amortization-off
+		// path → byte-identical when the feature is dormant.
+		const int plateau_lead_symb = 3;  // ceil(~2.8-sym CFG16 plateau, ofdm.cc:3239)
+		if(ofdm_eff > upper_bound + plateau_lead_symb)
 		{
-			// No room for new frames — force FAIL
+			// No room for new frames even allowing the plateau lead — force FAIL
 			pream_symb_loc = 0;
 		}
 		else
@@ -1886,9 +1906,19 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		if (g_verbose) printf("[OFDM-SYNC] bounds-failed: pream_symb=%d, scanning full buffer for signal\n", pream_symb_loc);
 		fflush(stdout);
 
-		// Start scan from anti-re-decode position to avoid re-finding old preambles
+		// Start scan from anti-re-decode position to avoid re-finding old preambles.
+		// ACQ-BOUNDS FIX: when the floored cursor rode the Schmidl-Cox plateau
+		// (ofdm_eff just past upper_bound), the genuine un-decoded onset sits up
+		// to plateau_lead_symb symbols BEHIND the cursor — and still in-bounds.
+		// Floor the scan_start by the plateau lead so the energy scan can reach
+		// that in-bounds onset; clamp to upper_bound so the loop is never empty.
+		// This stays >= lower_bound+1 (the original anti-re-decode floor) and the
+		// retry accept-gate (retry_symb<=upper_bound) below still rejects any
+		// already-decoded frame, so the anti-re-decode invariant holds.
+		int re_decode_floor = ofdm_eff - plateau_lead_symb;
 		int scan_start = lower_bound + 1;
-		if(ofdm_eff > scan_start) scan_start = ofdm_eff;
+		if(re_decode_floor > scan_start) scan_start = re_decode_floor;
+		if(scan_start > upper_bound) scan_start = upper_bound;
 		int signal_start_symb = -1;
 		for(int s = scan_start; s <= upper_bound; s++)
 		{
