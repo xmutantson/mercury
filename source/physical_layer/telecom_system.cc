@@ -2287,6 +2287,31 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			return (e && *e) ? atoi(e) : 0;
 		}();
 		double subpeak_arm_mean_H = -1.0;  // mean_H captured when the goto was armed
+		
+		// TINTERP-SEED production activation (fact-documents/data-flow-noise_variance_
+		// estimate.md; trackC_deepdsp.json TINTERP_SEED). MERCURY_TINTERP_SEED (DEFAULT-ON)
+		// arms a MONOTONE BEST-OF fade rescue: when the LS-primary OFDM decode FAILS CRC on
+		// a WB LEAST_SQUARE config, re-run estimate->equalize->demod->decode with the
+		// per-carrier time-interpolation estimator (TIME_INTERP, ofdm.cc LS_channel_
+		// estimator_tinterp) - the sim-proven it=0 seed swap that crosses the GOOD/MOD
+		// Watterson fade where the held LS window averages it as noise (test_fade_tinterp.py:
+		// LS 0/5 -> TINTERP 5/5 on MPG/GOOD). The rescue is reached ONLY after an LS CRC
+		// failure, so a CLEAN frame (which decodes on LS pass-1) NEVER reaches it =>
+		// byte-identical clean by construction (the standalone-TINTERP clean regression the
+		// FADE-tier comment warns about cannot fire). This is the fade-tier SELECTOR the
+		// FADE_TINTERP gate lacked: the fade is detected by LS failing CRC. One attempt per
+		// acquired frame; the goto-back never increments sync_trials (a re-decode, not a new
+		// trial). The estimator is restored to the config value on every exit so the next
+		// frame in this buffer starts LS-primary again. All shared channel-estimate consumers
+		// (MMSE erasure, psk LLR, mean_H/SKIP-H, selectivity, SKIP-VAR) are audited (sec.5) in
+		// data-flow-noise_variance_estimate.md (I1-I5 preserved; cross-pilot nv-floor).
+		static const int tinterp_seed_enabled = []{
+			const char* e = std::getenv("MERCURY_TINTERP_SEED");
+			return (e && *e) ? atoi(e) : 1;   // DEFAULT-ON
+		}();
+		int tinterp_rescue_phase = 0;          // 0=not tried on this frame, 1=tried
+		int tinterp_saved_estimator = ofdm.channel_estimator;  // restore target (LS/ZF)
+		bool tinterp_rescue_in_flight = false; // true between goto-back and next verdict
 		// §7.13.29 (Proposal B) — SACK_RSP cross-check pays more trials so the
 		// search escapes Schmidl-Cox sub-peak false locks. Default 2 stays for
 		// normal data RX where extra trials waste CPU on real LDPC failures.
@@ -2573,6 +2598,17 @@ skip_h_retry_point:
 			}
 
 		ofdm_subpeak_retry_point:
+			// TINTERP-SEED: a FRESH frame re-arms the rescue (one attempt per acquired
+			// frame). A rescue re-decode (tinterp_rescue_in_flight) keeps the phase so the
+			// goto-back is not re-armed into an infinite loop, and leaves channel_estimator
+			// at TIME_INTERP for this pass. Every other entry (new trial, subpeak probe)
+			// resets to LS-primary with the rescue re-armed.
+			if(!tinterp_rescue_in_flight)
+			{
+				tinterp_rescue_phase = 0;
+				if(ofdm.channel_estimator == TIME_INTERP)
+					ofdm.channel_estimator = tinterp_saved_estimator;
+			}
 			// Use corrected carrier frequency if coarse sync applied
 			double effective_carrier_freq = carrier_frequency + coarse_freq_offset;
 
@@ -3286,6 +3322,41 @@ skip_h_retry_point:
 						mean_H, coarse_freq_offset, receive_stats.crc);
 					fflush(stdout);
 				}
+				
+				// ---- TINTERP-SEED fade rescue (MONOTONE best-of, DEFAULT-ON) --------
+				// The LS-primary decode just FAILED on what looks like a real frame
+				// (good timing: mean_H healthy, coarse metric saturated). On a GOOD/MOD
+				// Watterson fade the held LS window AVERAGES the time-varying H and reads
+				// the fade as noise (test_fade_tinterp.py: LS nv=0.35, 0/5) where the
+				// per-carrier TIME-INTERPOLATION estimator tracks it (nv=0.0065, 5/5).
+				// Re-run the WHOLE production decode (re-extract -> TIME_INTERP estimate
+				// -> equalize -> CSI/demod -> LDPC -> CRC) ONCE with the interpolation
+				// estimator. The retry goto re-enters at the same delay (no sync_trials
+				// bump). If it passes CRC the frame flows into the success path below; if
+				// it still fails, the retry-label reset restores LEAST_SQUARE and we fall
+				// through to normal failure handling. Reached ONLY on an LS CRC failure,
+				// so a clean frame (LS-decoded on pass-1) never enters here =>
+				// byte-identical clean. Audit (sec.5): data-flow-noise_variance_estimate.md.
+				if(tinterp_seed_enabled
+					&& M != MOD_MFSK
+					&& ofdm.channel_estimator == LEAST_SQUARE
+					&& tinterp_rescue_phase == 0
+					&& receive_stats.all_zeros == NO
+					&& mean_H >= 0.5)
+				{
+					tinterp_rescue_phase = 1;
+					tinterp_rescue_in_flight = true;
+					ofdm.channel_estimator = TIME_INTERP;
+					printf("[TINTERP-SEED] cfg=%d delay=%d meanH=%.3f coarse=%.3f crc=0x%04X - LS failed, retry with TIME_INTERP fade estimator\n",
+						current_configuration, receive_stats.delay, mean_H,
+						receive_stats.coarse_metric, receive_stats.crc);
+					fflush(stdout);
+					// Re-decode the SAME frame at the SAME delay with TIME_INTERP. Do NOT
+					// increment sync_trials (a re-do of this trial, not a new search).
+					goto ofdm_subpeak_retry_point;
+				}
+				tinterp_rescue_in_flight = false;
+				
 				// v2 OFDM sub-peak recovery: LDPC failed at the iteration cap
 				// despite coarse_metric saturating (sub-peak fingerprint) and
 				// mean_H surviving the v1 reject (≥ 0.5). Sub-peaks on Schmidl-
@@ -3355,8 +3426,11 @@ skip_h_retry_point:
 					// fact-documents/data-flow-snr-measurements.md §9.
 					receive_stats.SNR = mfsk.last_demod_snr_db;
 				}
-				else if(ofdm.channel_estimator==LEAST_SQUARE)
+				else if(ofdm.channel_estimator==LEAST_SQUARE || ofdm.channel_estimator==TIME_INTERP)
 				{
+					// TIME_INTERP shares the LS SNR estimate (it is the promoted WB-LS
+					// estimator; a TINTERP-SEED-rescued frame lands here with
+					// channel_estimator==TIME_INTERP). Same variance-based SNR formula.
 					if(ofdm.channel_estimator_amplitude_restoration==YES)
 					{
 						variance=ofdm.measure_variance(data_container.equalized_data_without_amplitude_restoration);
@@ -3455,9 +3529,18 @@ skip_h_retry_point:
 				}
 
 				receive_stats.delay_of_last_decoded_message=receive_stats.delay;
+				// TINTERP-SEED: restore the config estimator (LS/ZF) before leaving the
+				// trial loop so the NEXT receive_byte call starts LS-primary again. A
+				// TINTERP-rescued success lands here with channel_estimator==TIME_INTERP.
+				ofdm.channel_estimator = tinterp_saved_estimator;
 				break;
 			}
 		}
+		// TINTERP-SEED: belt-and-suspenders restore for any loop-exit path (trial
+		// budget exhausted on a failed TINTERP rescue, etc.). Idempotent when the
+		// estimator is already the config value.
+		if(ofdm.channel_estimator == TIME_INTERP)
+			ofdm.channel_estimator = tinterp_saved_estimator;
 
 		// SKIP-H recovery: if all trials failed with low channel estimate,
 		// the detected preamble was likely a false peak (e.g. residual MFSK

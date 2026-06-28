@@ -642,6 +642,118 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-tinterp-seed: TINTERP-SEED production estimator self-test (failing-test-first).
+// Drives the SFO-GRID CODED harness in-process (the SAME production estimator +
+// equalizer + CSI + demod + LDPC path the receive_byte rescue activates) on the ITU-R
+// "GOOD" Watterson fade (MPG: CHAN=3 depth=10dB fd=0.1Hz dly=24), proving the it=0
+// estimator seed-swap: the held LS window decodes 0/K (it averages the time-varying H
+// and reads the fade as noise) while the per-carrier TIME-INTERPOLATION estimator
+// (LS_channel_estimator_tinterp, the estimator the MERCURY_TINTERP_SEED rescue selects)
+// decodes K/K. A CLEAN-channel cell asserts TINTERP is a decode NO-OP (LS K/K == TINTERP
+// K/K), the byte-identical-clean guarantee the rescue relies on. Mirrors test_fade_
+// tinterp.py at the built-in --test level. See fact-documents/
+// data-flow-noise_variance_estimate.md.
+static void tinterp_set_env(const char* k, const char* v)
+{
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+// Run ONE SFO-GRID CODED cell with the given Watterson params + estimator selector,
+// returning decoded/total codewords. tinterp_prod!=0 selects the TIME_INTERP estimator
+// (MERCURY_SFO_GRID_TINTERP_PROD); 0 = the production LS else-branch. Env is saved/
+// restored so the harness default-off paths are not perturbed for later in-process work.
+static void tinterp_run_cell(const char* esn0, const char* chan, const char* depth,
+                             const char* fd, const char* dly, int tinterp_prod,
+                             int& cw_ok, int& cw_tot)
+{
+    const char* keys[] = {
+        "MERCURY_SFO_GRID", "MERCURY_SFO_GRID_CODED", "MERCURY_SFO_GRID_ESN0",
+        "MERCURY_SFO_GRID_CHAN", "MERCURY_SFO_GRID_WATT_DEPTH_DB",
+        "MERCURY_SFO_GRID_WATT_FD_HZ", "MERCURY_SFO_GRID_WATT_DLY",
+        "MERCURY_SFO_GRID_TINTERP_PROD"
+    };
+    const int nk = (int)(sizeof(keys)/sizeof(keys[0]));
+    struct Saved { const char* key; bool had; std::string val; } sv[16];
+    for (int i = 0; i < nk; i++) {
+        const char* g = std::getenv(keys[i]);
+        sv[i].key = keys[i]; sv[i].had = (g != nullptr);
+        sv[i].val = g ? std::string(g) : std::string();
+    }
+    tinterp_set_env("MERCURY_SFO_GRID", "1");
+    tinterp_set_env("MERCURY_SFO_GRID_CODED", "1");
+    tinterp_set_env("MERCURY_SFO_GRID_ESN0", esn0);
+    tinterp_set_env("MERCURY_SFO_GRID_CHAN", chan);
+    tinterp_set_env("MERCURY_SFO_GRID_WATT_DEPTH_DB", depth);
+    tinterp_set_env("MERCURY_SFO_GRID_WATT_FD_HZ", fd);
+    tinterp_set_env("MERCURY_SFO_GRID_WATT_DLY", dly);
+    tinterp_set_env("MERCURY_SFO_GRID_TINTERP_PROD", tinterp_prod ? "1" : "0");
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_15);   // CFG15 dense Dx=1/Dy=3 lattice (the MPG cell)
+    ts.sfo_grid_test();
+    cw_ok  = ts.sfo_grid_last_cw_ok;
+    cw_tot = ts.sfo_grid_last_cw_tot;
+
+    for (int i = 0; i < nk; i++) {
+#if defined(_WIN32)
+        _putenv_s(sv[i].key, sv[i].had ? sv[i].val.c_str() : "");
+#else
+        if (sv[i].had) setenv(sv[i].key, sv[i].val.c_str(), 1); else unsetenv(sv[i].key);
+#endif
+    }
+}
+
+static int run_tinterp_seed_selftest()
+{
+    printf("[TEST-TINTERP-SEED] TINTERP-SEED production estimator self-test (it=0 seed swap)\n");
+    int fails = 0;
+
+    // ---- Cell A: GOOD Watterson fade (MPG). LS FLOORS 0/K, TINTERP CROSSES K/K. ----
+    // CHAN=3 depth=10dB fd=0.1Hz dly=24 @ EsN0=24 (test_fade_tinterp.py MPG). The held LS
+    // window averages the slow Doppler fade (nv reads ~0.35, the fade looks like noise) and
+    // decodes 0/K; the per-carrier TIME-INTERPOLATION estimator tracks the fade (nv ~0.0065)
+    // and decodes K/K. This is the failing-before/passing-after: same channel, same FEC,
+    // only the it=0 estimator seed differs (the exact swap the receive_byte rescue performs).
+    {
+        int ls_ok=-1, ls_tot=-1, ti_ok=-1, ti_tot=-1;
+        tinterp_run_cell("24","3","10","0.1","24", 0, ls_ok, ls_tot);   // LS-only (before)
+        tinterp_run_cell("24","3","10","0.1","24", 1, ti_ok, ti_tot);   // TINTERP (after)
+        bool before_floors = (ls_tot > 0 && ls_ok == 0);
+        bool after_crosses = (ti_tot > 0 && ti_ok == ti_tot);
+        bool ok = before_floors && after_crosses;
+        printf("[TEST-TINTERP-SEED]   CELL-A GOOD-fade@24dB: LS-seed=%d/%d (%s) TINTERP-seed=%d/%d (%s) -> %s\n",
+               ls_ok, ls_tot, before_floors?"FLOORS_OK":"DECODED_unexpected",
+               ti_ok, ti_tot, after_crosses?"CROSSES_OK":"FAILED",
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell B: CLEAN AWGN no-op. LS K/K == TINTERP K/K (the byte-identical-clean basis). ----
+    // CHAN=0 (flat AWGN) @ EsN0=24: both estimators decode the full block. The rescue never
+    // changes a clean decode (clean frames decode on LS pass-1 and never reach TINTERP), and
+    // on the rare clean frame the estimator IS run (e.g. via FADE_TINTERP) it must not regress.
+    // Asserting equal decode counts on clean is the standalone no-op proof.
+    {
+        int ls_ok=-1, ls_tot=-1, ti_ok=-1, ti_tot=-1;
+        tinterp_run_cell("24","0","0","0.5","24", 0, ls_ok, ls_tot);    // LS-only clean
+        tinterp_run_cell("24","0","0","0.5","24", 1, ti_ok, ti_tot);    // TINTERP clean
+        bool ls_full = (ls_tot > 0 && ls_ok == ls_tot);
+        bool ti_noop = (ti_tot == ls_tot && ti_ok == ls_ok);
+        bool ok = ls_full && ti_noop;
+        printf("[TEST-TINTERP-SEED]   CELL-B CLEAN@24dB no-op: LS=%d/%d TINTERP=%d/%d -> %s\n",
+               ls_ok, ls_tot, ti_ok, ti_tot,
+               ok?"PASS(no-op)":"FAIL(regression)");
+        if(!ok) fails++;
+    }
+
+    printf("[TEST-TINTERP-SEED] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 // --test-acq-bounds: OFDM acquisition bounds-gate recovery regression
 // (fact-documents/data-flow-acq-bounds-gate.md). PROVES the force-FAIL gate in
 // cl_telecom_system::receive_byte (telecom_system.cc:1867) recovers a tail-band
@@ -1548,6 +1660,7 @@ int main(int argc, char *argv[])
     bool test_a3_decouple_safety_cli = false; // --test-a3-decouple-safety: the §2 CHECKPOINT — single-miss non-load-bearing (anti-0-bytes, byte-faithful) + genuine-death net intact, demote IN PLACE (data-flow-forgiving-ack.md §T2.2/§6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
+    bool test_tinterp_seed_cli = false; // --test-tinterp-seed: TINTERP-SEED production it=0 estimator seed-swap failing-first (staging/tinterp-seed).
     bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
@@ -2408,6 +2521,17 @@ int main(int argc, char *argv[])
             // Pure cl_dist_matcher check, no Mercury/ARQ state needed. See
             // fact-documents/data-flow-pas-shaping.md §6 + tools/test_pas_shaping.py.
             test_pas_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-tinterp-seed") == 0)
+        {
+            // TINTERP-SEED production estimator self-test (staging/tinterp-seed,
+            // failing-first): drives the SFO-GRID CODED harness in-process on the
+            // GOOD Watterson fade and asserts LS-seed floors 0/K while the it=0
+            // TIME_INTERP seed crosses K/K, plus a clean-channel no-op. The exact
+            // estimator the MERCURY_TINTERP_SEED receive_byte rescue selects.
+            test_tinterp_seed_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -3999,6 +4123,16 @@ start_modem:
             fflush(stdout);
             int rc = run_pas_selftest();
             printf("[FLAG] PAS self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_tinterp_seed_cli) {
+            // TINTERP-SEED production estimator self-test (one-shot, then exit rc).
+            printf("[FLAG] --test-tinterp-seed: invoking TINTERP-SEED production "
+                   "it=0 estimator seed-swap self-test\n");
+            fflush(stdout);
+            int rc = run_tinterp_seed_selftest();
+            printf("[FLAG] TINTERP-SEED self-test complete (rc=%d) - exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
