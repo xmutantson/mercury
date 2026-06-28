@@ -361,6 +361,31 @@ void cl_cipher_suite::compute_key_confirmation(uint8_t tag_out[8])
 }
 
 // ---------------------------------------------------------------------------
+// Display-only session fingerprint (out-of-band verification)
+// ---------------------------------------------------------------------------
+//
+// Recomputes the SAME Blake2b-keyed fingerprint that derive_session_key() logs
+// (mercury_crypto.cc, "mercury-fingerprint" label) and formats the first 6 bytes
+// as grouped hex ("1a2b 3c4d 5e6f"). 48 bits is ample to detect a key mismatch
+// over voice while staying short enough to read aloud. Pure read of session_key;
+// no cipher state is mutated and no raw key byte is exposed.
+void cl_cipher_suite::get_fingerprint_hex(char* out, int cap) const
+{
+    if (out == nullptr || cap <= 0) return;
+    out[0] = '\0';
+    if (!encryption_active && kx_phase < KX_HYBRID_DONE) return;  // no key yet
+
+    uint8_t fp[32];
+    const char* fp_label = "mercury-fingerprint";
+    crypto_blake2b_keyed(fp, 32, session_key, SESSION_KEY_SIZE,
+                         (const uint8_t*)fp_label, (size_t)strlen(fp_label));
+    // 6 bytes -> "xx xx  xx xx  xx xx" style: group as 3 pairs of 2 bytes.
+    snprintf(out, (size_t)cap, "%02x%02x %02x%02x %02x%02x",
+             fp[0], fp[1], fp[2], fp[3], fp[4], fp[5]);
+    crypto_wipe(fp, sizeof(fp));
+}
+
+// ---------------------------------------------------------------------------
 // Per-Batch Encrypt/Decrypt — ChaCha20-Poly1305 (IETF)
 // ---------------------------------------------------------------------------
 

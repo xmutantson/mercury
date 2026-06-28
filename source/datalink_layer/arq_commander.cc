@@ -1010,6 +1010,10 @@ void cl_arq_controller::process_messages_commander()
 			printf("[CRYPTO] Turboshift done, initiating key exchange\n");
 			fflush(stdout);
 			add_message_control(KEY_EXCHANGE_1);
+#ifdef MERCURY_GUI_ENABLED
+			// Display-only: surface KX start so STRICT does not look hung.
+			gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
+#endif
 			// connection_status set to TRANSMITTING_CONTROL by add_message_control
 			return;
 		}
@@ -7062,6 +7066,11 @@ void cl_arq_controller::process_control_commander()
 				(psk_hex[0] != '\0') ? (int)strlen(psk_hex) : 0,
 				false);  // mlkem_done=false (X25519-only for now)
 
+#ifdef MERCURY_GUI_ENABLED
+			// Display-only: X25519 shared computed -> advance the KX phase line.
+			gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
+#endif
+
 			// Verify responder's key confirmation tag (PSK mismatch detection)
 			uint8_t our_tag[8];
 			cipher_suite.compute_key_confirmation(our_tag);
@@ -7135,6 +7144,15 @@ void cl_arq_controller::process_control_commander()
 #ifdef MERCURY_GUI_ENABLED
 			g_gui_state.encryption_active.store(true);
 			g_gui_state.encryption_psk_mismatch.store(false);
+			// Display-only: PQ status, KX phase, and session fingerprint. Read
+			// live so PQ auto-flips once ML-KEM transport merges.
+			g_gui_state.encryption_pq_active.store(cipher_suite.is_pq_upgraded());
+			gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
+			{
+				char fp_hex[24];
+				cipher_suite.get_fingerprint_hex(fp_hex, sizeof(fp_hex));
+				gui_set_enc_fingerprint(fp_hex);
+			}
 #endif
 			printf("[CRYPTO] KEY_ACTIVATE ACKed — encryption active (X25519 + ChaCha20-Poly1305)\n");
 			fflush(stdout);

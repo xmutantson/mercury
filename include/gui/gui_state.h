@@ -162,6 +162,25 @@ struct st_gui_state {
     std::atomic<int> encryption_mode{0};              // ENCRYPT_OFF=0, STRICT=1, FAST=2
     std::atomic<bool> encryption_active{false};       // True when cipher suite is active
     std::atomic<bool> encryption_psk_mismatch{false}; // True on auth failure (PSK mismatch)
+    // PQ status: true once the session key is hybrid (X25519 + ML-KEM). Read live
+    // from cipher_suite.is_pq_upgraded() at activation, so it auto-flips to PQ when
+    // ML-KEM transport merges (mlkem_done becomes true). Display-only.
+    std::atomic<bool> encryption_pq_active{false};
+    // Key-exchange progress (display-only). Mirrors cipher_suite.get_kx_phase()
+    // (KX_IDLE=0 .. KX_ACTIVE=6) so STRICT does not look hung during the handshake.
+    std::atomic<int> kx_phase{0};
+    // ML-KEM chunk progress for the large KX2 (1184 B) / KX3 (1088 B) transfers.
+    // Both 0 until chunked ML-KEM transport exists; renderer shows the line only
+    // when total>0, so this is harmless/future-proof now.
+    std::atomic<int> kx_chunk_done{0};
+    std::atomic<int> kx_chunk_total{0};
+    // Session fingerprint (Blake2b of session key) for out-of-band voice
+    // verification. A string cannot be a raw atomic, so we use the established
+    // fixed-buffer + GuiMutex + valid-flag pattern (same as callsign_mutex). The
+    // ARQ thread writes at key-up; the GUI thread reads under the lock.
+    GuiMutex enc_fingerprint_mutex;
+    char enc_fingerprint[24]{0};                       // short hex (e.g. "1a2b 3c4d 5e6f")
+    std::atomic<bool> enc_fingerprint_valid{false};
 
     // ========== Monitor Panel ==========
     std::atomic<bool> monitor_enabled{false};
@@ -459,6 +478,39 @@ inline void gui_set_monitor_callsigns(const char* my_call, const char* dest_call
     GuiLockGuard lock(g_gui_state.monitor_mutex);
     g_gui_state.monitor_callsign_a = my_call ? my_call : "";
     g_gui_state.monitor_callsign_b = dest_call ? dest_call : "";
+}
+
+/**
+ * @brief Store the session fingerprint for GUI display (out-of-band verification).
+ * Called from the ARQ thread at encryption activation. Copies into the fixed
+ * buffer under the dedicated mutex and sets the valid flag last, so the GUI
+ * thread never reads a torn string. Pass NULL/empty to invalidate.
+ */
+inline void gui_set_enc_fingerprint(const char* hex) {
+    if (hex == nullptr || hex[0] == '\0') {
+        g_gui_state.enc_fingerprint_valid.store(false);
+        GuiLockGuard lock(g_gui_state.enc_fingerprint_mutex);
+        g_gui_state.enc_fingerprint[0] = '\0';
+        return;
+    }
+    {
+        GuiLockGuard lock(g_gui_state.enc_fingerprint_mutex);
+        snprintf(g_gui_state.enc_fingerprint,
+                 sizeof(g_gui_state.enc_fingerprint), "%s", hex);
+    }
+    g_gui_state.enc_fingerprint_valid.store(true);
+}
+
+/**
+ * @brief Update key-exchange progress for the GUI (display-only).
+ * @param phase  KX_IDLE..KX_ACTIVE (mirrors cipher_suite.get_kx_phase())
+ * @param chunk_done   ML-KEM chunks transferred so far (0 if N/A)
+ * @param chunk_total  total ML-KEM chunks for this phase (0 if N/A)
+ */
+inline void gui_set_kx_progress(int phase, int chunk_done, int chunk_total) {
+    g_gui_state.kx_phase.store(phase);
+    g_gui_state.kx_chunk_done.store(chunk_done);
+    g_gui_state.kx_chunk_total.store(chunk_total);
 }
 
 #endif // GUI_STATE_H_
