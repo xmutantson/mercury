@@ -143,6 +143,54 @@ void test_combiner()
               "B: hybrid key differs from classical-only key (ML-KEM ss entered)");
     }
 
+    // (B2) TRUE IKM-ORDER regression (the prompt's "regression vs the old
+    // backwards order"). The B check above only proves hybrid != classical — it
+    // would NOT catch a revert to the legacy x25519||mlkem order, because both
+    // orders still differ from the classical-only key. Here we derive from the
+    // SAME two shared secrets twice: production (mlkem||x25519, via the normal
+    // derive captured by copy_session_key_for_test) and the legacy order (via
+    // derive_session_key_legacy_order_for_test) with byte-identical salt/bind.
+    // If they ever match, the order swap has been reverted / is a no-op.
+    {
+        cl_cipher_suite cmd, rsp;
+        // Inline a hybrid exchange so we keep the exact transcript bytes.
+        uint8_t cmd_pub[X25519_KEY_SIZE], rsp_pub[X25519_KEY_SIZE];
+        cmd.generate_x25519_keypair(cmd_pub);
+        rsp.generate_x25519_keypair(rsp_pub);
+        cmd.compute_x25519_shared(rsp_pub);
+        rsp.compute_x25519_shared(cmd_pub);
+        uint8_t mlkem_pk[MLKEM_PK_SIZE];
+        cmd.generate_mlkem_keypair(mlkem_pk);
+        uint8_t mlkem_ct[MLKEM_CT_SIZE];
+        rsp.encapsulate_mlkem(mlkem_pk, mlkem_ct);
+        cmd.decapsulate_mlkem(mlkem_ct);
+
+        // Production order (mlkem||x25519) on cmd:
+        cmd.derive_session_key("CMDCALL", "RSPCALL", nullptr, 0, /*mlkem_done=*/true,
+                               mlkem_ct, mlkem_pk, cmd_pub, rsp_pub);
+        uint8_t prod_key[SESSION_KEY_SIZE];
+        cmd.copy_session_key_for_test(prod_key);
+
+        // Legacy order (x25519||mlkem) on the SAME cmd suite (same two ss,
+        // same salt/bind) — overwrites session_key:
+        cmd.derive_session_key_legacy_order_for_test("CMDCALL", "RSPCALL", nullptr, 0,
+                                                     mlkem_ct, mlkem_pk, cmd_pub, rsp_pub);
+        uint8_t legacy_key[SESSION_KEY_SIZE];
+        cmd.copy_session_key_for_test(legacy_key);
+
+        check(memcmp(prod_key, legacy_key, SESSION_KEY_SIZE) != 0,
+              "B2: mlkem-first IKM differs from legacy x25519-first (order regression)");
+
+        // Re-derive production order and confirm it reproduces prod_key exactly
+        // (the legacy call above must not have perturbed any shared-secret state).
+        cmd.derive_session_key("CMDCALL", "RSPCALL", nullptr, 0, /*mlkem_done=*/true,
+                               mlkem_ct, mlkem_pk, cmd_pub, rsp_pub);
+        uint8_t prod_key2[SESSION_KEY_SIZE];
+        cmd.copy_session_key_for_test(prod_key2);
+        check(memcmp(prod_key, prod_key2, SESSION_KEY_SIZE) == 0,
+              "B2: production derive is deterministic (mlkem-first reproduces)");
+    }
+
     // (C) Transcript binding: each tamper position must break key agreement.
     const char* names[4] = {
         "C: flip mlkem_ct byte -> keys diverge (bind covers ct)",
@@ -202,6 +250,79 @@ void test_chunking()
 
         ok = ok && (got_count == count) && (memcmp(reasm, src, c.total) == 0);
         check(ok, c.label);
+    }
+
+    // (D2) REORDER + DROP-then-RETRANSMIT reassembly (the prompt's "incl a
+    // dropped/reordered chunk -> retransmit"). The decode API explicitly does
+    // NOT assume contiguous arrival; the receiver tracks a bitmap and is done
+    // only when every index has arrived. We deliver chunks out of order, DROP
+    // one mid-stream (as ARQ loss would), keep going, then RETRANSMIT the
+    // dropped chunk last — and assert byte-identical reassembly. A duplicate
+    // re-delivery (ARQ can resend an already-acked chunk) must be idempotent.
+    {
+        const uint8_t kind = cl_cipher_suite::KX_KIND_CT;
+        const int total = MLKEM_CT_SIZE;   // 1088B (KX3)
+        const int cap   = 100;             // -> 11 chunks
+        uint8_t src[MLKEM_CT_SIZE];
+        for (int i = 0; i < total; i++) src[i] = (uint8_t)((i * 17 + 3) & 0xFF);
+
+        int count = cl_cipher_suite::kx_chunk_count(total, cap);
+
+        // Pre-encode every chunk frame (the sender's output). static to keep
+        // this ~70KB buffer off the stack.
+        static uint8_t frames[64][4 + MLKEM_CT_SIZE];
+        int flens[64];
+        bool enc_ok = (count >= 1 && count <= 64);
+        for (int idx = 0; enc_ok && idx < count; idx++)
+        {
+            flens[idx] = cl_cipher_suite::kx_chunk_encode(
+                kind, src, total, idx, cap, frames[idx], sizeof(frames[idx]));
+            if (flens[idx] < 0) enc_ok = false;
+        }
+
+        // Receiver state.
+        uint8_t reasm[MLKEM_CT_SIZE];
+        memset(reasm, 0, sizeof(reasm));
+        bool got[64] = { false };
+        int got_count = 0;
+        bool decode_ok = enc_ok;
+
+        // A scrambled delivery order that (a) is non-contiguous, (b) omits the
+        // last index initially (the "dropped" chunk), and (c) repeats an index
+        // (a duplicate ARQ resend). Indices >= count are simply skipped.
+        // Delivery list for count==11: out-of-order, drops index 4, dups 2.
+        const int order[] = { 3, 0, 7, 2, 9, 2, 8, 1, 6, 10, 5 /* idx 4 dropped */ };
+        for (size_t k = 0; decode_ok && k < sizeof(order)/sizeof(order[0]); k++)
+        {
+            int idx = order[k];
+            if (idx >= count) continue;
+            int oi = -1, oc = -1;
+            int p = cl_cipher_suite::kx_chunk_decode(
+                kind, frames[idx], flens[idx], cap, reasm, total, &oi, &oc);
+            if (p < 0 || oi != idx || oc != count) { decode_ok = false; break; }
+            if (!got[idx]) { got[idx] = true; got_count++; }   // dup is idempotent
+        }
+
+        // Mid-stream we are NOT done — the dropped index 4 (and any tail index
+        // not in `order`) is still missing.
+        bool incomplete_midstream = decode_ok && (got_count < count);
+
+        // RETRANSMIT every still-missing index (ARQ resend), out of order.
+        for (int idx = count - 1; decode_ok && idx >= 0; idx--)
+        {
+            if (got[idx]) continue;
+            int oi = -1, oc = -1;
+            int p = cl_cipher_suite::kx_chunk_decode(
+                kind, frames[idx], flens[idx], cap, reasm, total, &oi, &oc);
+            if (p < 0 || oi != idx) { decode_ok = false; break; }
+            got[idx] = true; got_count++;
+        }
+
+        bool reorder_ok = decode_ok && incomplete_midstream &&
+                          (got_count == count) &&
+                          (memcmp(reasm, src, total) == 0);
+        check(reorder_ok,
+              "D2: reorder + drop-then-retransmit (+dup) reassembles byte-identical");
     }
 
     // CRC8 / kind / index rejection on a single KX2 chunk.

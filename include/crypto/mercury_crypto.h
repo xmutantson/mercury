@@ -302,6 +302,30 @@ public:
     // Both sides compute this; mismatch = PSK wrong.
     void compute_key_confirmation(uint8_t tag_out[8]);
 
+    // TEST-ONLY: copy the 32-byte derived session key out for in-process unit
+    // tests (test_mlkem_hybrid.cc IKM-order regression — it must compare the
+    // production combiner output byte-for-byte against an independently
+    // recomputed reference for BOTH the production mlkem||x25519 order AND the
+    // legacy x25519||mlkem order, to catch a future order revert that the
+    // black-box confirm tag alone cannot distinguish). The key never leaves the
+    // process; this is the standard KAT seam and does NOT weaken the wire
+    // posture (no key material is ever transmitted or logged in the clear).
+    void copy_session_key_for_test(uint8_t out[SESSION_KEY_SIZE]) const;
+
+    // TEST-ONLY: derive the session key using the LEGACY (pre-fix, WRONG) IKM
+    // order x25519_ss || mlkem_ss — salt / transcript-bind otherwise IDENTICAL
+    // to the production hybrid path. The IKM-order regression asserts that
+    // production (mlkem-first) produces a DIFFERENT key than this legacy order
+    // from the SAME two shared secrets, so a future revert of the order swap is
+    // caught (the black-box confirm tag alone cannot distinguish order). Run a
+    // hybrid exchange first so mlkem_shared/x25519_shared are populated; this
+    // overwrites session_key with the legacy-order result.
+    void derive_session_key_legacy_order_for_test(
+            const char* commander_call, const char* responder_call,
+            const uint8_t* psk, int psk_len,
+            const uint8_t* mlkem_ct, const uint8_t* mlkem_pk,
+            const uint8_t* x25519_pk_cmd, const uint8_t* x25519_pk_rsp);
+
     // --- Activation ---
     void activate();     // Set encryption_active = true after KEY_ACTIVATE ACK
 

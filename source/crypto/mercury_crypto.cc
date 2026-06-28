@@ -400,6 +400,88 @@ void cl_cipher_suite::compute_key_confirmation(uint8_t tag_out[8])
     crypto_wipe(full_hash, sizeof(full_hash));
 }
 
+// TEST-ONLY: see header. In-process unit-test seam; never wired to any path
+// that transmits or logs the raw key.
+void cl_cipher_suite::copy_session_key_for_test(uint8_t out[SESSION_KEY_SIZE]) const
+{
+    memcpy(out, session_key, SESSION_KEY_SIZE);
+}
+
+// TEST-ONLY: mirror of derive_session_key's HYBRID branch but with the LEGACY
+// (pre-fix, WRONG) IKM order x25519_ss || mlkem_ss. Salt + transcript-bind are
+// byte-identical to production — ONLY the IKM byte order differs — so a diff in
+// the resulting session_key proves the order itself is load-bearing (catches a
+// revert of the §4.3 ML-KEM-first swap). Not built into any production path.
+void cl_cipher_suite::derive_session_key_legacy_order_for_test(
+        const char* commander_call, const char* responder_call,
+        const uint8_t* psk, int psk_len,
+        const uint8_t* mlkem_ct, const uint8_t* mlkem_pk,
+        const uint8_t* x25519_pk_cmd, const uint8_t* x25519_pk_rsp)
+{
+    // LEGACY order: x25519_ss FIRST, then mlkem_ss (the bug the fix corrected).
+    uint8_t ikm[64];
+    memcpy(ikm,      x25519_shared, 32);
+    memcpy(ikm + 32, mlkem_shared,  32);
+    int ikm_len = 64;
+
+    // Salt — identical construction to production derive_session_key (hybrid).
+    uint8_t salt[256];
+    int salt_len = 0;
+    const char* prefix = "mercury-v1";
+    int prefix_len = (int)strlen(prefix);
+    memcpy(salt, prefix, prefix_len);
+    salt_len += prefix_len;
+
+    if (psk && psk_len > 0)
+    {
+        uint8_t psk_hash[32];
+        crypto_blake2b(psk_hash, 32, psk, psk_len);
+        memcpy(salt + salt_len, psk_hash, 32);
+        salt_len += 32;
+        crypto_wipe(psk_hash, 32);
+    }
+
+    if (mlkem_ct && mlkem_pk && x25519_pk_cmd && x25519_pk_rsp)
+    {
+        crypto_blake2b_ctx bctx;
+        crypto_blake2b_init(&bctx, 32);
+        const char* dom = "mercury-hybrid-v1";
+        crypto_blake2b_update(&bctx, (const uint8_t*)dom, strlen(dom));
+        crypto_blake2b_update(&bctx, mlkem_ct,      MLKEM_CT_SIZE);
+        crypto_blake2b_update(&bctx, mlkem_pk,      MLKEM_PK_SIZE);
+        crypto_blake2b_update(&bctx, x25519_pk_cmd, X25519_KEY_SIZE);
+        crypto_blake2b_update(&bctx, x25519_pk_rsp, X25519_KEY_SIZE);
+        uint8_t bind[32];
+        crypto_blake2b_final(&bctx, bind);
+        crypto_wipe(&bctx, sizeof(bctx));
+        memcpy(salt + salt_len, bind, 32);
+        salt_len += 32;
+        crypto_wipe(bind, sizeof(bind));
+    }
+
+    if (commander_call)
+    {
+        int cl = (int)strlen(commander_call);
+        memcpy(salt + salt_len, commander_call, cl);
+        salt_len += cl;
+    }
+    if (responder_call)
+    {
+        int cl = (int)strlen(responder_call);
+        memcpy(salt + salt_len, responder_call, cl);
+        salt_len += cl;
+    }
+
+    uint8_t prk[32];
+    hkdf_extract(salt, salt_len, ikm, ikm_len, prk);
+    const char* info = "data-encryption";
+    hkdf_expand(prk, (const uint8_t*)info, strlen(info), session_key);
+
+    crypto_wipe(ikm, sizeof(ikm));
+    crypto_wipe(prk, sizeof(prk));
+    crypto_wipe(salt, sizeof(salt));
+}
+
 // ---------------------------------------------------------------------------
 // Display-only session fingerprint (out-of-band verification)
 // ---------------------------------------------------------------------------
