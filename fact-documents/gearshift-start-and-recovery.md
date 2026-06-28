@@ -821,3 +821,41 @@ config); the BREAK/anchor machinery (`last_data_viable_config`,
 **Over-seed guard present:** the conservative `CONNECT_SEED_MARGIN_DB` +
 `CONNECT_SEED_CONFIG_CAP` + the strictly-above-ROBUST_0 gate; verified by the
 MARGINAL test cell returning CONFIG_NONE.
+
+### §10.6 LIVE BYPASS — the §10.2 seed never fired on the common NB-start path (fix 7e348d5f, 2026-06-28)
+
+**Symptom (faithful real-audio A/B, monitor 2ba88d35 base + real MFSK connect-SNR
+eaf7680f).** A two-binary paired A/B over snd-aloop (fix = the §10.2/§10.3 seed
+de10852a, mon = monitor 2ba88d35), WGN:40 and WGN:30, N=6 paired each, trio-ON,
+ROBUST start (`--start-cfg 100 -R`), canonical scorer `score_climb_canonical.py`:
+
+| arm  | WGN:40 crossed | past-cfg0 | time-to-cross | seed_fired | WGN:30 crossed | past-cfg0 | ttc |
+|------|----------------|-----------|---------------|------------|----------------|-----------|-----|
+| fix  | 6/6            | 0/6       | ~123 s        | **0/6**    | 6/6            | 0/6       | ~120 s |
+| mon  | 6/6            | 0/6       | ~124 s        | 0/6        | 6/6            | 0/6       | ~120 s |
+
+fix == monitor on every metric: the seed was **structurally INERT**, not just
+SNR-gated. (Contrast the original inert cause — connect SNR read 0.00, fixed by
+eaf7680f, which DID populate a real SNR: the logs show `[CMD] measurements.SNR_uplink
+= 59.51` at the BW-ACK instant. So the SNR was live; the seed still never fired.)
+
+**Root cause — branch ordering, not the SNR read.** The §10.2 seed call lives ONLY
+in the NO-BW-upgrade fall-through (`arq_commander.cc` post-connect data-start `else`,
+~:6979). But the common live path STARTS NARROWBAND: at CONNECTED with `we_want_wb
+&& currently_nb` (:6944) the CMD queues `SWITCH_BANDWIDTH` and that `else` is never
+reached. The session upgrades NB->WB, lands at config 100 (WB-MFSK ROBUST floor),
+and crawls 100->101->102->0 via FRAME-UP — crossing to cfg0 only at ~104-120 s. The
+§10.1 unit test (`--test-connect-snr-seed`) calls `connect_seed_target_core()`
+DIRECTLY, bypassing this branch, so it passed while the live path was dead. (CLAUDE.md
+"no untested fixes" gap: a unit test on the selector is necessary but NOT sufficient
+when a branch decides whether the selector is ever invoked.)
+
+**Fix (7e348d5f).** Add the SAME guarded `connect_seed_target()` call at the
+`SWITCH_BANDWIDTH accepted` success path (:7126, after `switch_narrowband_mode(NO)`):
+there the CMD is WB and pinned at the ROBUST floor (`init_configuration`,
+`narrowband_enabled==NO`) — the IDENTICAL seed preconditions as :6979, and
+`measurements.SNR_uplink` is already populated. A clean connect SNR routes through
+the proven SET_CONFIG tier-cross; `connect_seed_target()` returns CONFIG_NONE (start
+ROBUST_0, byte-identical) on anything not clearly clean, so the over-seed guard and
+weak-channel behaviour are unchanged. The anchor is NOT raised (speculative,
+BREAK-recoverable, §10.4 invariant 2). `--test` (incl. CSEED/RBPIPE) stays 0-fail.
