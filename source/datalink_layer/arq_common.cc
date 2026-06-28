@@ -1491,6 +1491,50 @@ void cl_arq_controller::calculate_receiving_timeout()
 				timeout += turnaround_rephase_adder;
 			}
 #endif
+			// IN-BAND CMD/RSP REVERSE-ACK LOCKSTEP (data-flow-robust-ofdm-adopt-flush.md §23;
+			// _research/inband_lockstep/SECTION5_AUDIT.md). The 104aad04 EOB-fast collision fix made
+			// the RSP DELAY its turnaround on an INCOMPLETE batch by
+			// rsp_incomplete_batch_rx_timeout_ms = n_miss*msg_time + msg_time (+ time_left + ptt_on),
+			// so it only keys up its SACK after the CMD's forward re-air has drained (no half-duplex
+			// collision). But the CMD listen window above has NO term proportional to that n_miss-scaled
+			// RSP wait — so at the marginal cfg0 rung under MERCURY_INBAND_RATE, as n_miss grows
+			// (bitmap 0x3e->0x1c->0x0c, n_miss 1->3->4) the now-correctly-delayed reverse SACK lands
+			// LATER than the CMD window (~5422ms) closes -> [CMD-ACK-PAT] Timeout -> BREAK Block failure
+			// #1/#2/#3 at config 0 -> Class-A degradation demote 0 -> 102 (the cfg0<->ROBUST_2
+			// oscillation, ADOPT_FIXVERIFY.md §3). INV-1 lockstep (CMD window ⊇ RSP-keyed ACK window)
+			// is violated for incomplete in-band batches.
+			//
+			// FIX: mirror the RSP helper's re-air-drain CORE on the CMD side. The CMD KNOWS the RSP's
+			// n_miss for the batch this TX completes — it is the retx prefix it JUST prepended
+			// (v2_retx_prefix_count = R, set at arq_commander.cc:2261; the retx frames ARE the holes the
+			// RSP is waiting to fill before turning around). Add n_miss*msg_time + msg_time so the CMD
+			// stays FORWARD-SILENT in RECEIVING_ACKS_DATA long enough for the RSP's delayed key-up to
+			// land INSIDE the window (the connection_status state machine already enforces one-
+			// outstanding-batch, so a window ⊇ the RSP turnaround IS the "wait the reverse turnaround
+			// before re-airing" discipline). This kills BOTH the half-duplex collision AND the out-of-
+			// window block-failure demote — they are the SAME mis-sized-window root.
+			//
+			// The RSP helper's `time_left + ptt_on` tail is already covered by the CMD window's existing
+			// frame_drain + sack_arrival(ptt_on) terms; only the n_miss*msg_time + msg_time re-air-drain
+			// core is missing on the CMD side, so we add exactly that. GATED inband + OFDM
+			// (reverse_ack_uses_robust_geometry) + v2_retx_prefix_count>0: a clean / new-data-only batch
+			// (v2_retx_prefix_count==0) adds 0 (no over-wait, INV-3); legacy (flag OFF) never adds it
+			// (byte-identical, INV-2); robust/NB add 0. FAIL-BEFORE (-DINBAND_LOCKSTEP_FAILBEFORE):
+			// drop the term -> the cfg0 incomplete-batch SACK lands outside the narrow window -> the
+			// directed test's out-of-window demote assert FAILS.
+			int inband_lockstep_adder = 0;
+#ifndef INBAND_LOCKSTEP_FAILBEFORE
+			if(inband_rate_feature_enabled()
+			   && reverse_ack_uses_robust_geometry(current_configuration)
+			   && v2_retx_prefix_count > 0)
+			{
+				int n_miss = v2_retx_prefix_count;             // RSP n_miss for the completing batch
+				if(n_miss > data_batch_size) n_miss = data_batch_size;  // mirror the RSP helper clamp
+				inband_lockstep_adder =
+					n_miss * message_transmission_time_ms + message_transmission_time_ms;
+				timeout += inband_lockstep_adder;
+			}
+#endif
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -1500,7 +1544,7 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
-			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) + turn_rephase=%d batch=%d sack=%d\n",
+			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) + turn_rephase=%d + inband_lockstep=%d (retx_prefix=%d) batch=%d sack=%d\n",
 				timeout, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
 				margin, sack_enabled ? sack_timeout_extra_ms : 0,
@@ -1508,6 +1552,7 @@ void cl_arq_controller::calculate_receiving_timeout()
 					? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0,
 				(int)data_ack_retx_turnaround,
 				turnaround_rephase_adder,
+				inband_lockstep_adder, v2_retx_prefix_count,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			set_receiving_timeout(timeout);

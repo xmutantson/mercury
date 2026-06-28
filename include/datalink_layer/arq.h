@@ -3743,6 +3743,13 @@ public:
   // Directed regression for rsp_incomplete_batch_rx_timeout_ms (the EOB-fast-path
   // half-duplex collision fix). In-process, no PHY/audio. CLI --test-rsp-eobfast.
   int test_rsp_eobfast_collision();
+  // Directed regression for the CMD listen-window half of the in-band CMD/RSP reverse-ACK
+  // lockstep (data-flow-robust-ofdm-adopt-flush.md §23). Drives the REAL producer
+  // calculate_receiving_timeout() at the cfg0 incomplete-batch state and asserts the CMD window
+  // ⊇ rsp_incomplete_batch_rx_timeout_ms (so the delayed reverse SACK lands in-window -> no
+  // out-of-window block-failure demote / no half-duplex collision). In-process, no PHY/audio.
+  // CLI --test-inband-lockstep. Fails-before: -DINBAND_LOCKSTEP_FAILBEFORE.
+  int test_inband_lockstep_revwindow();
   // D1 implicit-confirm consumer: a returning SACK acked bsi `rx_bsi`. If the re-tag is
   // armed and rx_bsi is at-or-after inband_announce_bsi (mod-256 forward distance), the
   // announced config is CONFIRMED FOLLOWED: DISARM the re-tag, record

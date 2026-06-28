@@ -11011,6 +11011,184 @@ int cl_arq_controller::test_inband_basepattern_confirm()
 	return failed == 0 ? 0 : 1;
 }
 
+// IN-BAND CMD/RSP REVERSE-ACK LOCKSTEP (data-flow-robust-ofdm-adopt-flush.md §23;
+// _research/inband_lockstep/SECTION5_AUDIT.md) — directed regression for the CMD listen-window
+// half of the half-duplex lockstep. Drives the REAL production window producer
+// calculate_receiving_timeout() at the EXACT cfg0 incomplete-batch state from the fleet wedge
+// (ADOPT_FIXVERIFY.md §3): a partial cfg0 batch (n_miss frames) being re-aired as a v2-mixbatch
+// retx prefix, and asserts the CMD window ⊇ the RSP's rsp_incomplete_batch_rx_timeout_ms
+// turnaround — i.e. the now-correctly-DELAYED reverse SACK lands INSIDE the window (no
+// [CMD-ACK-PAT] Timeout -> no block-failure -> no out-of-window 0->102 demote, AND, because the
+// CMD stays forward-silent in RECEIVING_ACKS_DATA for that window, no half-duplex collision).
+//
+// PURE in-process: calculate_receiving_timeout()'s COMMANDER ack-pattern branch reads only scalar
+// members (no telecom_system / audio / IONOS) and writes receiving_timeout via set_receiving_timeout.
+// Returns 0=PASS, 1=FAIL.
+//
+// FAILS-BEFORE (-DINBAND_LOCKSTEP_FAILBEFORE): the n_miss re-air-drain term is dropped from the
+// producer, so the CMD window is SHORTER than the RSP turnaround -> the "window covers the RSP
+// incomplete-batch SACK" assert FAILS (the out-of-window demote is reproduced).
+int cl_arq_controller::test_inband_lockstep_revwindow()
+{
+#ifdef INBAND_LOCKSTEP_FAILBEFORE
+	const bool failbefore = true;
+#else
+	const bool failbefore = false;
+#endif
+	printf("[TEST-LOCKSTEP] start (failbefore=%d)\n", failbefore ? 1 : 0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto fail = [&](const char* msg, int got, int want) {
+		printf("[TEST-LOCKSTEP] FAIL: %s (got=%d want=%d)\n", msg, got, want);
+		fflush(stdout);
+		failed++;
+	};
+	auto pass = [&](const char* msg, int got) {
+		printf("[TEST-LOCKSTEP] PASS: %s (got=%d)\n", msg, got);
+		fflush(stdout);
+	};
+
+	// --- cfg0 channel geometry (fleet real-audio, arq_inbandR1.log) -------------
+	const int msg_time = 1266;   // cfg0 message_transmission_time_ms
+	const int ptt_on   = 100;
+	const int ptt_off  = 200;
+	const int eff      = 6;      // data_batch_size at cfg0
+	const int time_left = 0;
+
+	// Drive the REAL producer. Set the COMMANDER ack-pattern scalar inputs it reads. We do NOT
+	// touch the env — write inband_rate_enabled directly (the cached value inband_rate_feature_enabled
+	// returns), exactly the production gate, so the test is hermetic.
+	role                        = COMMANDER;
+	ack_pattern_time_ms         = 300;   // > 0 -> the geometry-derived branch (the path under test)
+	message_transmission_time_ms = msg_time;
+	ptt_on_delay_ms             = ptt_on;
+	ptt_off_delay_ms            = ptt_off;
+	data_batch_size             = eff;
+	current_configuration       = CONFIG_0;   // is_ofdm && !is_robust -> reverse_ack_uses_robust_geometry
+	sack_enabled                = true;
+	sack_timeout_extra_ms       = 0;
+	gear_shift_on               = NO;          // avoid the turboshift +2000 extension
+	turboshift_phase            = TURBO_DONE;
+	time_left_to_send_last_frame = time_left;
+	data_ack_retx_turnaround    = true;        // a retx turnaround (the D2 widen also fires here)
+
+	// Helper: drive the producer for a given (inband_on, retx_prefix) and read back the window.
+	auto window_for = [&](int inband_on, int retx_prefix) -> int {
+		inband_rate_enabled = inband_on;       // 0/1 -> the production feature gate value
+		v2_retx_prefix_count = retx_prefix;    // the partial's n_miss the CMD is re-airing
+		receiving_timeout = 0;                  // set_receiving_timeout only writes if >0
+		calculate_receiving_timeout();
+		return receiving_timeout;
+	};
+
+	// ---- CASE 1: the cfg0 wedge — n_miss=4 partial re-aired under in-band -------
+	// The RSP (104aad04 EOB-fast fix) waits rsp_incomplete_batch_rx_timeout_ms for this batch.
+	// The CMD window MUST cover it, else the SACK lands out-of-window -> the 0->102 demote.
+	{
+		const int n_miss = 4;
+		const int rx     = eff - n_miss;   // 2 frames landed
+		int rsp_turnaround = rsp_incomplete_batch_rx_timeout_ms(
+			eff, rx, /*last_received_seq=*/5, /*eob_seen=*/true,
+			msg_time, ptt_on, ptt_off, time_left);   // == n_miss*msg_time + msg_time + 0 + ptt_on
+
+		int win_inband = window_for(/*inband_on=*/1, /*retx_prefix=*/n_miss);
+		int win_legacy = window_for(/*inband_on=*/0, /*retx_prefix=*/n_miss);
+
+		printf("[TEST-LOCKSTEP] CASE1 n_miss=%d rsp_turnaround=%d win_inband=%d win_legacy=%d\n",
+			n_miss, rsp_turnaround, win_inband, win_legacy);
+		fflush(stdout);
+
+		// THE load-bearing lockstep assert (INV-1): the in-band CMD window must CONTAIN the RSP's
+		// incomplete-batch turnaround, so the delayed reverse SACK arrives inside -> no out-of-window
+		// block-failure demote. FAIL-BEFORE: the term is dropped -> win_inband < rsp_turnaround.
+		if(failbefore)
+		{
+			if(win_inband >= rsp_turnaround)
+				fail("CASE1 failbefore: window should NOT cover RSP turnaround (term present?)",
+					win_inband, rsp_turnaround);
+			else
+				pass("CASE1 failbefore: window < RSP turnaround (out-of-window demote reproduced)",
+					win_inband);
+		}
+		else
+		{
+			if(win_inband < rsp_turnaround)
+				fail("CASE1: CMD window must cover RSP incomplete-batch turnaround (lockstep INV-1)",
+					win_inband, rsp_turnaround);
+			else
+				pass("CASE1: CMD window >= RSP turnaround (SACK lands in-window, no demote)",
+					win_inband);
+
+			// The widen is exactly the n_miss re-air-drain core over the legacy window.
+			int expect_adder = n_miss * msg_time + msg_time;
+			if(win_inband - win_legacy != expect_adder)
+				fail("CASE1: inband widen != n_miss re-air-drain core (n_miss*msg+msg)",
+					win_inband - win_legacy, expect_adder);
+			else
+				pass("CASE1: inband widen == n_miss*msg+msg over legacy", win_inband - win_legacy);
+		}
+	}
+
+	// ---- CASE 2: legacy (inband OFF) is BYTE-IDENTICAL regardless of retx prefix --
+	// The term is gated on inband_rate_feature_enabled(); with it off, a retx prefix must add 0.
+	{
+		int win_legacy_prefix = window_for(/*inband_on=*/0, /*retx_prefix=*/4);
+		int win_legacy_clean  = window_for(/*inband_on=*/0, /*retx_prefix=*/0);
+		printf("[TEST-LOCKSTEP] CASE2 legacy: prefix4=%d clean=%d\n",
+			win_legacy_prefix, win_legacy_clean);
+		fflush(stdout);
+		if(win_legacy_prefix != win_legacy_clean)
+			fail("CASE2: legacy window must be byte-identical with/without retx prefix (INV-2)",
+				win_legacy_prefix, win_legacy_clean);
+		else
+			pass("CASE2: legacy byte-identical (term inband-gated)", win_legacy_prefix);
+	}
+
+	// ---- CASE 3: in-band CLEAN/new-data-only batch (retx_prefix==0) adds NOTHING --
+	// No over-wait on a clean batch (INV-3): the in-band window with prefix=0 must equal legacy.
+	{
+		int win_inband_clean = window_for(/*inband_on=*/1, /*retx_prefix=*/0);
+		int win_legacy_clean = window_for(/*inband_on=*/0, /*retx_prefix=*/0);
+		printf("[TEST-LOCKSTEP] CASE3 inband_clean=%d legacy_clean=%d\n",
+			win_inband_clean, win_legacy_clean);
+		fflush(stdout);
+		if(win_inband_clean != win_legacy_clean)
+			fail("CASE3: in-band clean batch must NOT widen (no over-wait, INV-3)",
+				win_inband_clean, win_legacy_clean);
+		else
+			pass("CASE3: in-band clean batch == legacy (no over-wait)", win_inband_clean);
+	}
+
+	// ---- CASE 4: growing n_miss keeps the window ahead of the growing RSP wait ----
+	// The wedge AMPLIFIED batch-over-batch (n_miss 1->3->4). At every step the window must still
+	// cover the RSP turnaround (this is what kills the loss-growth -> demote spiral).
+	if(!failbefore)
+	{
+		for(int n_miss = 1; n_miss <= eff; n_miss++)
+		{
+			int rx = eff - n_miss;
+			int rsp_t = rsp_incomplete_batch_rx_timeout_ms(
+				eff, rx, /*last_received_seq=*/5, /*eob_seen=*/true,
+				msg_time, ptt_on, ptt_off, time_left);
+			int win = window_for(/*inband_on=*/1, /*retx_prefix=*/n_miss);
+			if(win < rsp_t)
+				fail("CASE4: window must cover RSP turnaround at every n_miss step", win, rsp_t);
+		}
+		if(failed == 0)
+			pass("CASE4: window covers RSP turnaround for n_miss 1..batch (spiral broken)", eff);
+	}
+
+	// Restore the cache to unresolved so a later test re-reads the real env (hygiene).
+	inband_rate_enabled = -1;
+	v2_retx_prefix_count = 0;
+
+	printf("[TEST-LOCKSTEP] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return (failed == 0) ? 0 : 1;
+}
+
 // IN-BAND +1 CLIMB (data-flow-inband-frame0-rolling-partial.md §7.2 option A) — directed
 // regression for the FRAME-UP climb-target selector inband_climb_target(). Drives the EXACT
 // production decision: in-band -> strict +1 (suppress the SNR elevator that jumped CONFIG_0->3

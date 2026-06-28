@@ -1141,6 +1141,19 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_eob;
                 failed += test_eob.test_rsp_eobfast_collision();
             }
+            // IN-BAND CMD/RSP REVERSE-ACK LOCKSTEP regression
+            // (data-flow-robust-ofdm-adopt-flush.md §23). The EOB-fast fix (above) made the RSP
+            // DELAY its turnaround on an incomplete batch; this gate proves the CMD listen window
+            // (calculate_receiving_timeout) WIDENS in lockstep to ⊇ that delayed RSP turnaround at
+            // the marginal cfg0 rung under MERCURY_INBAND_RATE — so the reverse SACK lands in-window
+            // (no [CMD-ACK-PAT] Timeout -> no block-failure -> no out-of-window 0->102 demote) and
+            // the CMD stays forward-silent in RECEIVING_ACKS_DATA (no half-duplex collision). Both
+            // failure modes share the mis-sized-window root; one term fixes both. PURE in-process —
+            // permanent regression gate. Fails-before: -DINBAND_LOCKSTEP_FAILBEFORE.
+            {
+                cl_arq_controller test_lockstep;
+                failed += test_lockstep.test_inband_lockstep_revwindow();
+            }
             // IN-BAND +1 CLIMB regression (data-flow-inband-frame0-rolling-partial.md §7.2
             // option A): under MERCURY_INBAND_RATE the FRAME-UP climb must step EXACTLY +1
             // (suppress the SNR elevator that jumped CONFIG_0->3 and stranded the reverse
@@ -1324,6 +1337,17 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-rsp-eobfast") == 0) {
             cl_arq_controller ARQ_eob;
             int failed = ARQ_eob.test_rsp_eobfast_collision();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-lockstep : run ONLY the CMD/RSP reverse-ACK lockstep regression
+        // (data-flow-robust-ofdm-adopt-flush.md §23 — the CMD-side sibling of --test-rsp-eobfast).
+        // After the EOB-fast fix delayed the RSP turnaround, the CMD window must WIDEN in lockstep
+        // to ⊇ that turnaround, else the delayed cfg0 SACK lands out-of-window -> the 0->102 demote.
+        // Drives the REAL producer calculate_receiving_timeout(). Build with
+        // -DINBAND_LOCKSTEP_FAILBEFORE to reproduce the fails-before (window < RSP turnaround).
+        if (strcmp(argv[i], "--test-inband-lockstep") == 0) {
+            cl_arq_controller ARQ_ls;
+            int failed = ARQ_ls.test_inband_lockstep_revwindow();
             return (failed == 0) ? 0 : 1;
         }
         // --test-climb-bsi-rollback : run ONLY the climb-UP cmd_batch_seq_id rollback regression
