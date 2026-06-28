@@ -1834,6 +1834,24 @@ public:
   // OFDM data RX so the gearshift never climbed off config100. 0 PASS / 1 FAIL.
   int test_connect_reack();
 
+  // RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md). PURE predicate: the
+  // RECEIVED-state watchdog decision for the one-deep messages_control mailbox.
+  // Returns true iff the slot is RECEIVED, its ack_timer is counting, and elapsed
+  // has met the bound (a generous multiple of ack_timeout_control, floored). Shared
+  // by update_status() (real elapsed) and --test-rx-ctrl-drop (synthetic elapsed),
+  // so the watchdog is testable with no wall-clock sleep. Honours
+  // RX_CTRL_DROP_FAILBEFORE (returns false when defined).
+  bool rx_ctrl_received_watchdog_expired(int status, int counting, int elapsed_ms) const;
+
+  // RX-CTRL-DROP regression (--test-rx-ctrl-drop, also in master --test;
+  // data-flow-control-slot-lifecycle.md §6). In-process synthetic-fire (no PHY /
+  // IONOS / RF). Asserts: (A) the RECEIVED-state watchdog predicate frees a stranded
+  // slot at the bound and a subsequent control frame then lands at the produce gate;
+  // (B) the V1 fall-through frees an unhandled control code; (C) reset_session_state()
+  // frees a RECEIVED slot. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE (the slot stays
+  // stuck and the later control frame is dropped). 0 PASS / 1 FAIL.
+  int test_rx_ctrl_drop();
+
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,
   // and proves the TX-path spin-loops (ptt_busy_wait + drain_playback_wait)
