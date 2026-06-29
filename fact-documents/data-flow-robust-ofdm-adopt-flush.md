@@ -1070,3 +1070,56 @@ the un-inherited default; the existing 56 inband units all PRE-SET
 `ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI` on their throwaway instances (e.g.
 arq_responder.cc:8843/8999/9180), which MASKED the production bug. Verified: both arms PASS; full --test
 suite reports 68 passed, 0 failed, exit 0.
+
+---
+
+## §VAR-FIX — cfg0 SKIP-VAR storm at the in-band turnaround (investigation 2026-06-28)
+
+### Symptom (faithful real-audio, snd-aloop, WGN:40 seed2001, card0, native ELF)
+- **Legacy (inband-off):** rx_bytes=**8192 (delivered_full)**, configs_seen=[0,100,101,102], wb=[0],
+  **SKIP-VAR=8**, cfg0 coarse metric 0.998×72 / 0.556×2 → clean cross + full delivery.
+- **Redesign (inband-on, +demote-safety):** rx_bytes=**193**, configs_seen=[100,101,102], wb=[],
+  **SKIP-VAR=607** vs **OFDM-OK=56**, cfg0 coarse 0.500-plateau ×many interleaved with 0.998 reals.
+  Replicated across obsB(161B), dbg(129B), Rc0(193B); identical with the demote-safety DEFEATED (no diff).
+
+### Root: the storm is SPECIFIC to the in-band RX path, NOT inherent to cfg0
+The in-band RX runs the full-buffer forward-preamble search DURING the reverse-ACK turnaround gap (when the
+CMD is NOT airing a forward burst). The GI/data self-correlation of the idle/echo region peaks at the
+Schmidl-Cox half-correlation **metric≈0.500-0.504** (telecom_system.cc s5_coarse early-exit=0.5 lands
+exactly here; final accept threshold 0.15 WB admits it). The FFT/pilot window then anchors on a data region →
+`noise_variance_estimate`=63-81 (a few 6-7) → SKIP-VAR (ceiling 1.60). The protect-the-lock guard
+(arq_common.cc:4797) holds the shrunk-ring cfg0 pin and SKIPS every ROBUST down-ladder trial (129-147 skips),
+so the storm cannot escape and the real forward bursts (nv≈0.033, OFDM-OK) are starved/zeroed-advanced.
+Legacy avoids ALL of this via the lockstep SET_CONFIG handshake: its RX only searches inside forward-burst
+windows, so it sees 0.998 reals and ~zero plateau.
+
+### REFUTED: a coarse-metric structural floor (the obvious Fix A)
+Hypothesis: reject the 0.50 plateau with a WB-OFDM coarse floor (~0.55), since "real preamble≈0.99, plateau≈0.50".
+**Refuted by deterministic --test evidence** (test_ofdm_fine_timing_magnitude_cfo_cliff, FTR_DEBUG): valid WB
+CONFIG_0 preambles at SNR3k=8 dB with residual CFO=30 Hz produce coarse metric **0.426-0.609** WITH CORRECT
+TIMING (delay err ≤2) and survivable mean_H (0.307-0.335). A real CFO-degraded preamble is INDISTINGUISHABLE
+from a GI-plateau by coarse metric alone — a 0.55 floor dropped coarse_ok from 10/10 to 2/10 (a genuine
+weak-signal regression). The metric is NOT cleanly bimodal once CFO is present; the SKIP-VAR/mean_H gates
+downstream ALREADY (correctly) reject the plateau (nv 63-81) while admitting reals (nv 0.033). The problem is
+the storm's COST + the pin starving the real bursts, NOT a missing coarse gate. **Do NOT ship a coarse floor.**
+
+### The real next layer (NOT a localized variance fix)
+Gate the in-band RX forward-preamble search to forward-burst windows (the lockstep discipline legacy has) so it
+never searches the RSP's own turnaround gap. This crosses RX/turnaround/PHY layers (the in-band data-plane), is
+the known ROBUST→WB climb binding constraint (memory faithful_beat_vara_climb_binding), and needs the full §5
+cross-layer audit before coding — it is NOT the cfg0 "live-decode variance" the original diagnosis framed.
+
+### §VAR-FIX-DEMOTE — the shipped no-regress backstop (demote-safety watchdog)
+`inband_deliver_stall_watchdog()` (arq_common.cc): on each down-ladder decode-fail pass, evaluated ONCE per
+real batch period BEFORE the no-attempt guard. While holding a shrunk OFDM pin, if the DELIVERED batch id
+(rsp_last_delivered_batch_seq_id) does not advance across `limit` (default 3) consecutive batch periods, it
+RELEASES `inband_ofdm_acq_ring_shrunk` so the down-ladder can demote a config that cannot DELIVER.
+- **Producers of the pin:** inband_finalize_ofdm_adopt_ring (set); inband_seat_robust_ring_floor (clear on
+  leaving OFDM tier); BREAK→ROBUST_0; **this watchdog (clear on sustained no-delivery)**.
+- **Consumers:** the protect-the-lock guard (arq_common.cc:4797) + inband_seat_robust_ring_floor (:4487).
+- **Invariant preserved:** the down-ladder still requires a real CRC/LDPC pass to ADOPT (INV-S4-1) — releasing
+  the pin cannot adopt a guess; it only stops the guard SKIPPING robust trials.
+- **Why it does NOT fire on the WGN:40 storm:** the storm is a slow TRICKLE, not a hard stall — the delivered
+  id keeps advancing (2→3→4→5), so the watchdog correctly re-arms and never releases. It is the backstop for a
+  TRUE hard pin (zero delivery ≥3 periods), proven by test_inband_deliver_stall_releases_pin (FIX/DEFEAT/
+  PRODUCTIVE arms). Additive, inband-scoped, legacy byte-identical. Full --test 68/0.
