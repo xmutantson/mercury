@@ -339,6 +339,27 @@ public:
 	// the turbo loop, so default has zero production effect.
 	bool dd_seed_floor;
 
+	// wip/cfg0-eq-settling (data-flow-cfg0-freshrung-eq-settling.md §3): fresh-rung
+	// per-symbol EQ-settling for the in-band CONFIG_0 SKIP-VAR seam. When true:
+	//   (A) CPE_correction_persymbol() removes the PER-SYMBOL residual CFO/SFO phase
+	//       the global CPE_correction leaves on a cold one-shot-Moose frame
+	//       (OpenOFDM Eq.9-10), so the seam frame actually decodes; and
+	//   (C) the LS pilot-residual + cross-pilot noise estimators de-rotate the
+	//       common per-pair/per-symbol phase before squaring, so they stop booking
+	//       coherent residual-CFO rotation as noise (the gate INPUT, not the
+	//       threshold). Default FALSE ⇒ every estimator path is byte-identical to
+	//       the legacy behavior. Forced ON by the in-band path (cfg0 is the rung it
+	//       climbs through). Cross-layer audit: data-flow-noise_variance_estimate.md
+	//       consumers (MMSE/LLR/SKIP-VAR) all improve or are untouched — the fix
+	//       removes a coherent term only, it never floors nv below the AWGN σ².
+	bool cfg0_freshrung_settle_enabled;
+	// Option A TIME-DOMAIN second-pass CFO refine (the corrected mechanism after the
+	// ICI diagnosis): re-mix the time-domain frame by the residual CFO measured from
+	// the demodulated pilots and RE-DEMOD, killing the inter-carrier interference that
+	// a freq-domain phase correction cannot. See ofdm.cc for the full rationale.
+	bool freshrung_cfo_refine(std::complex<double>* demod_out,
+	                          std::complex<double>* baseband_frame);
+
 	// Pre-allocated buffers for passband_to_baseband (avoids new/delete per call)
 	std::complex<double>* p2b_l_data;
 	std::complex<double>* p2b_data_filtered;

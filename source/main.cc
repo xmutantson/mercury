@@ -754,6 +754,146 @@ static int run_tinterp_seed_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-cfg0-eq-settle: fresh-rung CONFIG_0 SKIP-VAR seam settling self-test
+// (failing-test-first). data-flow-cfg0-freshrung-eq-settling.md §6.
+//
+// Builds a synthetic CONFIG_0 (WB BPSK, LS estimator) demodulated frame on a FLAT
+// unit channel (H=1) with a small AWGN floor, then injects a per-symbol RESIDUAL CFO
+// (a deterministic phase ramp e^{j·omega·n}) — exactly the leftover the one-shot Moose
+// estimate leaves on a cold fresh-batch frame-0. It then runs the SAME CPE_correction
+// + LS_channel_estimator path receive_byte uses and reads ofdm.noise_variance_estimate
+// (the SKIP-VAR gate input):
+//   FAIL-before (gate OFF): the global CPE_correction cannot remove the per-symbol
+//     residual, so the LS pilot-residual nv inflates ABOVE the CONFIG_0 ceiling 1.60.
+//   PASS-after  (gate ON): CPE_correction_persymbol (Option A) removes the per-symbol
+//     residual, so the honest nv drops BELOW 1.60 → the gate would pass the frame.
+//   NO-OP      (clean, no injected CFO): gate-ON nv ~= gate-OFF nv (settled frames
+//     theta_n~=0 → byte-identical), the legacy-untouched guarantee.
+// No IONOS/RF; pure in-process synthetic-fire through the production estimator.
+static double cfg0_eq_run(int settle_on, double inject_omega)
+{
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_0);   // WB BPSK 1/16, channel_estimator == LEAST_SQUARE
+
+    int Nc = ts.ofdm.Nc;
+    int Nsymb = ts.ofdm.Nsymb;
+    int Nofdm = ts.data_container.Nofdm;
+    int Nfft = ts.ofdm.Nfft;
+    double power_normalization = sqrt((double)Nfft);
+
+    // FAITHFUL chain (mirrors the BER_PLOT_passband path, telecom_system.cc:316-340):
+    // framer (places pilots from pilot_configurator.sequence[] + BPSK +1 data) ->
+    // symbol_mod (IFFT+GI per symbol) -> inject a TIME-DOMAIN residual CFO across the
+    // whole frame (this produces the REAL per-symbol phase ramp + inter-carrier
+    // interference a cold one-shot Moose leaves, not an analytic shortcut) + AWGN ->
+    // symbol_demod (GI+FFT per symbol) -> CPE + estimator. This reproduces exactly
+    // what receive_byte sees on a fresh cold frame-0.
+    int nData = ts.ofdm.pilot_configurator.nData;
+    for (int d = 0; d < nData; d++)
+        ts.data_container.ofdm_time_freq_interleaved_data[d] = std::complex<double>(1.0, 0.0); // BPSK +1
+    ts.ofdm.framer(ts.data_container.ofdm_time_freq_interleaved_data, ts.data_container.ofdm_framed_data);
+    for (int i = 0; i < Nsymb; i++)
+        ts.ofdm.symbol_mod(&ts.data_container.ofdm_framed_data[i*Nc],
+                           &ts.data_container.ofdm_symbol_modulated_data[i*Nofdm]);
+
+    // Time-domain residual CFO (radians/sample) = inject_omega normalized over Nfft so
+    // inject_omega ~= the per-symbol phase advance, plus the natural ICI from a true CFO.
+    // The recoverable regime is phase_per_symbol < π/Dy (the pilot-pair unambiguous
+    // range); within it the refine drives nv to the AWGN floor (sweep-proven cliff at
+    // omega≈0.85 for Dy=3). A realistic settled-frame AWGN floor (~0.035, the symptom's
+    // settled var) is used so the inflated nv is a meaningful multiple of the floor.
+    double dphi = inject_omega / (double)Nfft;           // rad per time sample
+    unsigned int rng = 0x1234abcdu;                       // deterministic LCG
+    int Ntot = Nofdm * Nsymb;
+    for (int t = 0; t < Ntot; t++)
+    {
+        std::complex<double> s = ts.data_container.ofdm_symbol_modulated_data[t] / power_normalization;
+        std::complex<double> rot = std::exp(std::complex<double>(0, dphi * (double)t));   // CFO
+        rng = rng*1664525u + 1013904223u; double n1 = ((rng>>9)/(double)(1u<<23)) - 0.5;
+        rng = rng*1664525u + 1013904223u; double n2 = ((rng>>9)/(double)(1u<<23)) - 0.5;
+        std::complex<double> noise(n1*0.13, n2*0.13);     // AWGN → settled floor ~0.035
+        ts.data_container.baseband_data[t] = (s * rot + noise) * power_normalization;
+    }
+    for (int i = 0; i < Nsymb; i++)
+        ts.ofdm.symbol_demod(&ts.data_container.baseband_data[i*Nofdm],
+                             &ts.data_container.ofdm_symbol_demodulated_data[i*Nc]);
+
+    std::complex<double>* in = ts.data_container.ofdm_symbol_demodulated_data;
+    ts.ofdm.cfg0_freshrung_settle_enabled = (settle_on != 0);
+    // Mirror the production receive_byte order (telecom_system.cc:2876-2900):
+    // Option A TIME-DOMAIN CFO refine runs FIRST (re-mix + re-demod baseband), then AGC
+    // + CPE + estimator on the refined demod.
+    if (ts.ofdm.cfg0_freshrung_settle_enabled)
+        ts.ofdm.freshrung_cfo_refine(in, ts.data_container.baseband_data);
+    ts.ofdm.automatic_gain_control(in);
+    ts.ofdm.CPE_correction(in);                       // global linear ramp (always)
+    if (ts.ofdm.channel_estimator == ZERO_FORCE)
+        ts.ofdm.ZF_channel_estimator(in);
+    else
+        ts.ofdm.LS_channel_estimator(in);             // CONFIG_0 path
+    return ts.ofdm.noise_variance_estimate;
+}
+
+static int run_cfg0_eq_settle_selftest()
+{
+    printf("[TEST-CFG0-EQ-SETTLE] fresh-rung CONFIG_0 SKIP-VAR seam settling self-test\n");
+    int fails = 0;
+    // Residual CFO in the RECOVERABLE regime (phase_per_symbol < π/Dy, the pilot-pair
+    // unambiguous range). The --test-cfg0-eq-settle sweep (MERCURY_CFG0EQ_SWEEP=1)
+    // characterizes the full curve incl. the wrap cliff at omega≈0.85; here OMEGA is
+    // chosen inside the recoverable regime so the TIME-DOMAIN refine drives nv to the
+    // AWGN floor. A residual BEYOND the cliff is physically unrecoverable from
+    // Dy-spaced pilots alone (acquisition must own the coarse CFO) — documented in
+    // data-flow-cfg0-freshrung-eq-settling.md + EQ_VERIFY.md.
+    const double OMEGA = 0.7;            // recoverable residual CFO (phase/sym ≈ 0.85 rad < π/3)
+
+    if (std::getenv("MERCURY_CFG0EQ_SWEEP")) {
+        for (double w = 0.0; w <= 2.0; w += 0.1) {
+            double off = cfg0_eq_run(0, w);
+            double on  = cfg0_eq_run(1, w);
+            printf("[CFG0EQ-SWEEP] omega=%5.2f  gate-OFF nv=%.4f  gate-ON nv=%.4f  (ratio off/on=%.2f)\n",
+                   w, off, on, on>1e-9?off/on:-1.0);
+        }
+    }
+
+    // ---- Cell A: cold recoverable-CFO frame. The residual-CFO INTER-CARRIER
+    // INTERFERENCE inflates nv well above the settled AWGN floor (FAIL-before); the
+    // TIME-DOMAIN re-mix + re-demod (Option A) collapses the ICI so nv returns to the
+    // floor (PASS-after). The discriminator is the ICI inflation, not a fixed absolute:
+    // gate-OFF nv must be a clear multiple of the gate-ON (settled) nv. ----
+    {
+        double nv_off = cfg0_eq_run(0, OMEGA);
+        double nv_on  = cfg0_eq_run(1, OMEGA);
+        double nv_floor = cfg0_eq_run(1, 0.0);   // the settled AWGN floor reference
+        bool before_inflated = (nv_off > 4.0 * nv_floor);          // ICI present (FAIL-before)
+        bool after_settled   = (nv_on  < 1.5 * nv_floor + 1e-6);   // refine drove it to the floor
+        bool ok = before_inflated && after_settled;
+        printf("[TEST-CFG0-EQ-SETTLE]   CELL-A cold-CFO: gate-OFF nv=%.4f (%s) gate-ON nv=%.4f (%s, floor=%.4f) -> %s\n",
+               nv_off, before_inflated?"ICI-INFLATED":"NOT-INFLATED_unexpected",
+               nv_on,  after_settled?"SETTLED":"STILL-INFLATED", nv_floor,
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell B: clean settled frame (no injected CFO). gate ON ~= gate OFF (no-op),
+    // and both below the CONFIG_0 ceiling 1.60 (a clean frame always passes). ----
+    {
+        double nv_off = cfg0_eq_run(0, 0.0);
+        double nv_on  = cfg0_eq_run(1, 0.0);
+        bool off_below = (nv_off < 1.60);   // skip_var_nv_ceiling(CONFIG_0)
+        bool noop = (std::abs(nv_on - nv_off) < 1e-9 ||
+                     (nv_off > 0 && std::abs(nv_on - nv_off)/nv_off < 0.02));
+        bool ok = off_below && noop;
+        printf("[TEST-CFG0-EQ-SETTLE]   CELL-B clean no-op: gate-OFF nv=%.4f gate-ON nv=%.4f -> %s\n",
+               nv_off, nv_on, ok?"PASS(no-op)":"FAIL(regression)");
+        if(!ok) fails++;
+    }
+
+    printf("[TEST-CFG0-EQ-SETTLE] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 // --test-acq-bounds: OFDM acquisition bounds-gate recovery regression
 // (fact-documents/data-flow-acq-bounds-gate.md). PROVES the force-FAIL gate in
 // cl_telecom_system::receive_byte (telecom_system.cc:1867) recovers a tail-band
@@ -1261,6 +1401,21 @@ int main(int argc, char *argv[])
             // (anti-re-decode preserved). Faithful in-process synthetic-fire through the
             // production transmit_byte/receive_byte (no IONOS/RF).
             failed += run_acq_bounds_selftest();
+            // FRESH-RUNG CONFIG_0 SKIP-VAR SEAM SETTLING gate
+            // (data-flow-cfg0-freshrung-eq-settling.md): a cold residual-CFO frame-0
+            // inflates the LS pilot-residual nv above the CONFIG_0 ceiling 1.60 (the
+            // SKIP-VAR drop) with the settle gate OFF, and the per-symbol CPE refine
+            // (Option A) brings the honest nv below 1.60 with the gate ON, while a
+            // clean settled frame is a no-op (legacy byte-identical). Pure in-process
+            // synthetic-fire through the production CPE/LS estimator (no IONOS/RF).
+            failed += run_cfg0_eq_settle_selftest();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-cfg0-eq-settle : run ONLY the fresh-rung CONFIG_0 SKIP-VAR seam
+        // settling regression (cold residual-CFO nv > 1.60 gate-OFF, < 1.60 gate-ON;
+        // clean no-op) and exit. See data-flow-cfg0-freshrung-eq-settling.md §6.
+        if (strcmp(argv[i], "--test-cfg0-eq-settle") == 0) {
+            int failed = run_cfg0_eq_settle_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler

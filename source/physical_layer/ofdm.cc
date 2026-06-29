@@ -154,6 +154,7 @@ cl_ofdm::cl_ofdm()
 	tinterp_smooth_halfwin=0; // feat/fade-tinterp: TIME_INTERP pilot pre-smooth off by default
 	dd_data_conf_thresh=0.30; // Turbo-EQ: data-aided improve-only confidence threshold (read only inside the turbo loop)
 	dd_seed_floor=false; // Turbo-EQ TINTERP-seed: false = pilots-only floor (byte-identical default); true = keep the it=0 (TINTERP) H as the low-confidence floor
+	cfg0_freshrung_settle_enabled=false; // wip/cfg0-eq-settling: default OFF = byte-identical; in-band path forces ON for the CONFIG_0 fresh-rung SKIP-VAR seam
 	// Optimized FFT tables
 	fft_twiddle=NULL;
 	fft_scratch=NULL;
@@ -1566,6 +1567,53 @@ double cl_ofdm::estimate_noise_from_pilot_pairs(std::complex<double>* in)
 	int Dy = pilot_configurator.Dy;
 	if (Dy <= 0) return 0.01;
 
+	// wip/cfg0-eq-settling Option C (data-flow-cfg0-freshrung-eq-settling.md §3.2):
+	// when the fresh-rung settle gate is ON, make this estimator residual-CFO/SFO-
+	// ROBUST. A residual carrier/sampling-frequency offset rotates H_raw by a COMMON
+	// per-pair phase increment across pilot columns; |H_raw(i) - H_raw(i-Dy)|² then
+	// books that COHERENT rotation as noise (the gate INPUT is wrong, not the
+	// threshold). Pass 1 estimates the common per-pair phase exactly as
+	// CPE_correction's dH_sum does; pass 2 de-rotates prev_H by that phase before
+	// differencing, so `delta` carries only the INCOHERENT noise. This removes a
+	// coherent term only — it can never floor nv below the true AWGN σ²/|X|² (the
+	// cfg16-nv-collapse class is structurally impossible). Gate OFF ⇒ the exact
+	// legacy walk below (byte-identical). Reference: OpenOFDM Eq.9-10 + CPE_correction.
+	std::complex<double> pair_derotate(1.0, 0.0);
+	if (cfg0_freshrung_settle_enabled)
+	{
+		int prev_row1[Nc];
+		std::complex<double> prev_H1[Nc];
+		for (int j = 0; j < Nc; j++) prev_row1[j] = -1;
+		std::complex<double> dH_sum(0, 0);
+		int dH_count = 0;
+		int pi1 = 0;
+		for (int i = 0; i < Nsymb; i++)
+		{
+			for (int j = 0; j < Nc; j++)
+			{
+				if ((ofdm_frame + i*Nc + j)->type == PILOT)
+				{
+					std::complex<double> X = pilot_configurator.sequence[pi1];
+					std::complex<double> H_raw = *(in + i*Nc + j) / X;
+					if (prev_row1[j] >= 0 && (i - prev_row1[j]) == Dy)
+					{
+						dH_sum += H_raw * std::conj(prev_H1[j]);   // common per-pair rotation
+						dH_count++;
+					}
+					prev_row1[j] = i;
+					prev_H1[j] = H_raw;
+					pi1++;
+				}
+			}
+		}
+		if (dH_count >= 2)
+		{
+			double phase_per_Dy = std::arg(dH_sum);
+			// Rotation applied to prev_H so prev_H*e^{j·phase} aligns with H_raw before diff.
+			pair_derotate = std::exp(std::complex<double>(0, phase_per_Dy));
+		}
+	}
+
 	// Per-column state: last pilot row and raw H = Y/X for that pilot.
 	int prev_row[Nc];                       // VLA, Nc <= 50
 	std::complex<double> prev_H[Nc];        // VLA
@@ -1586,7 +1634,9 @@ double cl_ofdm::estimate_noise_from_pilot_pairs(std::complex<double>* in)
 
 				if (prev_row[j] >= 0 && (i - prev_row[j]) == Dy)
 				{
-					std::complex<double> delta = H_raw - prev_H[j];
+					// Option C: de-rotate the prior pilot by the common per-pair phase
+					// (identity when gate OFF, pair_derotate=1) so `delta` is noise-only.
+					std::complex<double> delta = H_raw - prev_H[j] * pair_derotate;
 					double mag2 = delta.real()*delta.real() + delta.imag()*delta.imag();
 					noise_sum += mag2 * 0.5;   // /2 accounts for noise on both pilots
 					noise_count++;
@@ -2433,6 +2483,93 @@ void cl_ofdm::CPE_correction(std::complex<double>* in)
 			*(in + i * Nc + j) *= correction;
 		}
 	}
+}
+
+// wip/cfg0-eq-settling (data-flow-cfg0-freshrung-eq-settling.md §3.1) — Option A
+// (TIME-DOMAIN second-pass CFO refine, the corrected mechanism after the ICI
+// diagnosis, EQ_VERIFY.md §root-correction):
+//
+// ROOT (measured, sweep in --test-cfg0-eq-settle): the fresh-rung CONFIG_0 var spike
+// (nv 1.9-3.4) is INTER-CARRIER INTERFERENCE from a residual CARRIER frequency offset.
+// A residual CFO present in the TIME-DOMAIN samples before the FFT smears subcarrier
+// energy (the FFT bins leak into each other). That ICI is GENUINE in-band distortion:
+// NO frequency-domain phase correction (CPE_correction's global ramp, a per-symbol
+// common phase theta_n, OR a per-pilot-pair de-rotation) can remove it — the energy is
+// already mislocated across bins. The sweep proved a freq-domain per-symbol/per-pair
+// fix leaves nv unchanged (ratio off/on = 1.00). The ONLY cure is to remove the CFO in
+// the TIME domain and RE-FFT (iterative re-demod, the STANAG/US6996194 second pass).
+//
+// Method: from the just-demodulated pilots, measure the residual per-symbol common
+// phase rate (the SAME dH_sum aggregate CPE_correction uses), convert it to a per-time-
+// sample frequency (phase_per_symbol / Nofdm), RE-MIX the time-domain frame by
+// e^{-j*dphi*t}, and RE-DEMOD (symbol_demod) into `demod_out`. The re-FFT now sees the
+// CFO removed → the ICI collapses → the honest nv drops to the AWGN floor → the seam
+// frame both PASSES the SKIP-VAR gate AND actually decodes (the data bins are no longer
+// ICI-corrupted). Measured BEFORE the global CPE_correction so the full residual is
+// captured. ONE bounded pass, gated to cfg0_freshrung_settle_enabled; on a settled
+// frame (frames 1+, pre-de-rotated) phase_rate≈0 → re-mix≈identity → byte-identical.
+//
+// Cross-layer (data-flow-noise_variance_estimate.md §4): re-mix is unit-modulus in
+// time, so the re-demod's |H| band is the channel's true magnitude (mean_H/CSI/
+// selectivity preserved); nv drops to the true floor (cannot collapse — the floor is
+// the AWGN the re-demod still carries). Reference: OpenOFDM eq.html; STANAG-4539
+// periodic re-train; US 6996194 (re-estimate CFO from data, re-equalize).
+//
+// Args: demod_out = the Nsymb*Nc demodulated frame (read to measure phase_rate, then
+//   OVERWRITTEN with the refined re-demod). baseband_frame = the Nofdm*Nsymb time-
+//   domain samples for THIS frame (the same region symbol_demod read). Returns true if
+//   a re-demod was performed (phase_rate non-negligible), false if it was a no-op.
+bool cl_ofdm::freshrung_cfo_refine(std::complex<double>* demod_out,
+                                   std::complex<double>* baseband_frame)
+{
+	if (Nsymb <= 0 || Nc <= 0) return false;
+	int Dy = pilot_configurator.Dy;
+	if (Dy <= 0) return false;
+	int Nofdm = Nfft + Ngi;
+	if (Nofdm <= 0) return false;
+
+	// Measure the residual per-symbol common phase from the demodulated pilots —
+	// the SAME cross-column aggregate CPE_correction computes (ofdm.cc:dH_sum).
+	int prev_row[Nc];
+	std::complex<double> prev_H[Nc];
+	for (int j = 0; j < Nc; j++) prev_row[j] = -1;
+	std::complex<double> dH_sum(0, 0);
+	int dH_count = 0;
+	int pidx = 0;
+	for (int i = 0; i < Nsymb; i++)
+	{
+		for (int j = 0; j < Nc; j++)
+		{
+			if ((ofdm_frame + i*Nc + j)->type == PILOT)
+			{
+				std::complex<double> X = pilot_configurator.sequence[pidx];
+				std::complex<double> H_raw = *(demod_out + i*Nc + j) / X;
+				if (prev_row[j] >= 0 && (i - prev_row[j]) == Dy)
+				{
+					dH_sum += H_raw * std::conj(prev_H[j]);
+					dH_count++;
+				}
+				prev_row[j] = i;
+				prev_H[j] = H_raw;
+				pidx++;
+			}
+		}
+	}
+	if (dH_count < 2) return false;
+
+	double phase_per_Dy = std::arg(dH_sum);
+	double phase_per_symbol = phase_per_Dy / (double)Dy;        // rad / OFDM symbol
+	// Negligible residual → no-op (settled frame is byte-identical).
+	if (std::abs(phase_per_symbol) < 0.0005) return false;
+	double dphi = phase_per_symbol / (double)Nofdm;            // rad / time sample
+
+	// Re-mix the time-domain frame by -CFO and re-demod each symbol. The time origin
+	// matches symbol_demod's read (symbol i starts at baseband_frame[i*Nofdm]).
+	for (int t = 0; t < Nofdm * Nsymb; t++)
+		baseband_frame[t] *= std::exp(std::complex<double>(0, -dphi * (double)t));
+	for (int i = 0; i < Nsymb; i++)
+		symbol_demod(&baseband_frame[i*Nofdm], &demod_out[i*Nc]);
+	return true;
 }
 
 void cl_ofdm::restore_channel_amplitude()

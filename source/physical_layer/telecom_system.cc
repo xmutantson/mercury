@@ -2874,6 +2874,26 @@ skip_h_retry_point:
 			}
 			else
 			{
+				// wip/cfg0-eq-settling Option A (data-flow-cfg0-freshrung-eq-settling.md
+				// §3.1): TIME-DOMAIN second-pass CFO refine for the fresh-rung CONFIG_0
+				// SKIP-VAR seam. A cold one-shot-Moose frame-0 carries a residual CARRIER
+				// frequency offset whose INTER-CARRIER INTERFERENCE inflates the LS
+				// pilot-residual nv to 1.9-3.4 → SKIP-VAR drops a decodable frame. ICI is
+				// time-domain energy leakage the FFT already mislocated; NO freq-domain
+				// phase correction removes it (measured: --test-cfg0-eq-settle sweep,
+				// freq-domain ratio off/on=1.00). This re-mixes the time-domain frame by
+				// the residual CFO measured from the just-demodulated pilots and RE-DEMODs
+				// — killing the ICI so the honest nv drops to the AWGN floor AND the data
+				// bins decode. Gated default-OFF (the in-band path forces it ON for
+				// CONFIG_0..6); on a settled frame phase_rate≈0 → byte-identical no-op.
+				if(ofdm.cfg0_freshrung_settle_enabled)
+				{
+					int Nofdm = data_container.Nofdm;
+					ofdm.freshrung_cfo_refine(
+						data_container.ofdm_symbol_demodulated_data,
+						&data_container.baseband_data[Nofdm*rx_eff_preamble]);
+				}
+
 				ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
 				// CPE correction: remove residual freq offset before channel estimation.
 				// Previously NB-only, but WB also benefits (reduces pilot residuals).
@@ -11004,6 +11024,22 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_channel_estimator = ZERO_FORCE;
 	}
 	ofdm.channel_estimator=ofdm_channel_estimator;
+
+	// wip/cfg0-eq-settling (data-flow-cfg0-freshrung-eq-settling.md §3): enable the
+	// fresh-rung per-symbol EQ-settling (Option A persymbol-CPE refine + Option C
+	// residual-robust noise estimator) for the in-band CONFIG_0 SKIP-VAR seam. Gated
+	// on MERCURY_INBAND_RATE (the same env cl_arq_controller::inband_rate_feature_enabled
+	// reads) so the in-band path drives it; unset ⇒ flag stays false ⇒ every estimator
+	// path is byte-identical to legacy. Scoped to the WB low-rate BPSK climb ladder
+	// (CONFIG_0..6) — the rungs the fresh-rung seam occurs on — so high-QAM rungs
+	// (CONFIG_7..16, incl. the cfg16-nv-restore LS residual path) are never touched.
+	// On a settled frame the per-symbol theta_n≈0 ⇒ no-op even when ON.
+	{
+		const char* _ib = std::getenv("MERCURY_INBAND_RATE");
+		bool inband_on = (_ib && *_ib && atoi(_ib) != 0);
+		ofdm.cfg0_freshrung_settle_enabled =
+			inband_on && (configuration >= CONFIG_0 && configuration <= CONFIG_6);
+	}
 
 	// feat/fade-tinterp FADE TIER GATE (default-OFF, byte-identical when unset).
 	// When MERCURY_FADE_TINTERP is set non-zero, promote the WB LS estimator to the
