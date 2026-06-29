@@ -222,3 +222,37 @@ the fix:
 - Faithful real-audio: the in-band cfg0 path crosses (clean BATCH-DONE,
   wb_configs_seen=[0], bytes approaching legacy) with the gate ON; the fresh cfg0
   lock metric rises (0.197 → high) and frame-0 var drops below 1.60.
+
+## §7 IONOS REAL-RF VERDICT (2026-06-29) — BENCH-INERT, NEXT-ROOT (the §6 unit test models a flow that does NOT occur)
+
+~~PASS-after on real RF~~ — REFUTED on the IONOS bed. The fix is BENCH-INERT: it never
+engages on the real link. Decisive A/B (FIX 619195f8 vs BASE 3c293e1c, both
+`MERCURY_INBAND_RATE=1`, IONOS `WGN:40 + OFFSET:18 Hz`, ROBUST-start climb, aarch64
+md5 fix=cbe6d18b base=cbe9cdfb):
+
+| | FIX (seed) | BASE (no seed) |
+|---|---|---|
+| robust DATA decodes (OFDM-OK cfg 100/101/102) | **0** | **0** |
+| CFO-SEED LATCH / APPLY | **0 / 0** | 0 / 0 |
+| bytes delivered | **0 / 16000** | **0 / 16000** |
+| cfg0 SKIP-VAR storm | 397 @ nv 4.21 | 510 @ nv 13.23 |
+
+**ROOT (source-verified):** the PRODUCER latch (§3.1, telecom_system.cc:3572-3586) sits in
+the robust-config **DATA** decode success path (`is_robust_config` + `message_decoded=YES`
+@:3541 + `freq_offset_measured!=0` from the mini-Moose @:2774). On the real link the robust
+phase is **CONNECT control-codec ONLY** (`RX-MFSK-CTRL-CONNECT`, a SEPARATE decode path that
+never reaches :3541); the link then jumps straight to **cfg0 DATA**. Measured on BOTH arms:
+**0 OFDM-OK at configs 100/101/102** — only RX-MFSK-CTRL-CONNECT. So the latch never fires
+→ `cfo_acq_seed_hz` stays 0 → APPLY (§3.3, :1184-1199) skipped → `coarse_freq_offset` stays
+cold → FIX byte-identical to BASE. The §6 unit test (main.cc:921) synthesizes a robust DATA
+decode + a pre-set seed the real flow never produces — that is why it is GREEN while the
+bench is INERT. (Classic sim-recoverable / bench-inert; bench-claim guard vindicated.)
+
+**NEXT-ROOT (the corrected fix):** the settled carrier DOES exist at robust CONNECT, in the
+MFSK control-codec carrier estimate (`carrier_frequency_sync_wb_ctrl` → `ctrl_residual`,
+:4087/4096 — currently captured only for an ACK recovery re-mix, gated `recovery_ack_reps>1`).
+Move/add the latch THERE (in the RX-MFSK-CTRL-CONNECT decode the forward-data receiver runs
+BEFORE the cfg0 cross), not in the robust DATA path that never executes. Re-validate on IONOS
+with the ready harness `tools/cfo_seed_ionos_ab.py --cfo-hz 18 --arms FIX,BASE --health-once`.
+NO REGRESSION from the current fix (off-flag inert; FIX==BASE on the bench → harmless even
+default-on, just ineffective; --test M=0 = 0 fails). NOT merged to monitor.
