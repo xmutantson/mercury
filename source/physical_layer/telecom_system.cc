@@ -1171,13 +1171,24 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// wrong seed costs nothing (trial-1 re-acquires exactly as today): the seed only
 	// WARM-STARTS, it never removes acquisition reach (INV-A). 0/invalid seed ->
 	// untouched cold path (byte-identical).
+	// APPLY-FLOOR (the no-regression guard, bench-verified): apply the seed ONLY when
+	// it is large enough to MATTER — |seed| above the modem's existing freq-ignore
+	// convention (ofdm.freq_offset_ignore_limit = 0.1 Hz, the same threshold the demod
+	// re-mix at :2791 uses to skip a negligible correction). On a substrate with no real
+	// carrier offset the latched seed is noise-level (~0.005-0.017 Hz); applying THAT
+	// perturbs the (already-strong) cold cfg0 lock and was MEASURED to add breaks
+	// (cfo=0 A/B: fix worse than baseline). Flooring the apply at the ignore-limit makes
+	// the fix a TRUE no-op when there is nothing to correct (coarse stays 0 = cold =
+	// byte-identical) and engages ONLY when a genuine, resolvable carrier offset is
+	// present — which is exactly the cold-lock seam this fix targets.
 	if(ofdm.cfg0_freshrung_settle_enabled &&
 	   M != MOD_MFSK && !narrowband_enabled &&
 	   mfsk_fixed_delay < 0 && ofdm_forced_delay < 0 &&
 	   cfo_acq_seed_hz != 0.0)
 	{
 		double seed_bound = bandwidth / (double)data_container.Nc; // 1 subcarrier (~47 Hz WB)
-		if(fabs(cfo_acq_seed_hz) <= seed_bound)
+		if(fabs(cfo_acq_seed_hz) > ofdm.freq_offset_ignore_limit &&
+		   fabs(cfo_acq_seed_hz) <= seed_bound)
 		{
 			coarse_freq_offset = cfo_acq_seed_hz;
 			static const int cfoseed_dbg = []{ const char* e=std::getenv("MERCURY_CFOSEED_DBG"); return (e&&*e)?atoi(e):0; }();
