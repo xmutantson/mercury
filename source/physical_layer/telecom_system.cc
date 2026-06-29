@@ -5857,8 +5857,15 @@ void cl_telecom_system::init()
 	receive_stats.SNR=-99.9;
 	receive_stats.signal_stregth_dbm=-999;
 	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
-	cfo_acq_seed_hz=0.0;  // CFO acq seed (data-flow-cfg0-cfo-acq-seed.md): a full init() is a fresh session — no carrier known yet. (NOT reset in load_configuration: the seed survives a config change, §3.2.)
-	inband_cfo_seed_active=false;  // re-set per-config in load_configuration
+	// CFO ACQUISITION SEED (data-flow-cfg0-cfo-acq-seed.md §3.2 ordering note):
+	// init() is NOT a fresh-session reset — load_configuration calls it on a config
+	// REINIT (telecom_system.cc:11319, gated reinit_subsystems.telecom_system), AFTER
+	// it has already set inband_cfo_seed_active (:11120). So resetting cfo_acq_seed_hz
+	// or inband_cfo_seed_active HERE would (a) wipe the settled carrier on the
+	// ROBUST->cfg0 cross (defeating the whole carry) and (b) clobber the just-set
+	// in-band flag. Both are owned by the ctor (cold default) + load_configuration
+	// (per-config flag) + the poison-CFO scrub (sustained-fail seed drop). Deliberately
+	// NOT reset here.
 
 }
 

@@ -146,6 +146,19 @@ wb_mfsk confidence) leave it 0 → cold path. No NaN/Inf: the bound check
 - INV-D (config-change timing reset, :11549): `delay_of_last_decoded_message=-1` is
   UNCHANGED — timing is still correctly reset per config. Only the CFO seed survives.
   PRESERVED.
+- INV-D2 (ORDERING — load_configuration calls init() on a config REINIT, :11319):
+  CORRECTION to the first draft. `init()` is NOT a fresh-session-only reset — it is
+  called by `load_configuration` (gated `reinit_subsystems.telecom_system`) on a
+  config change, AFTER the gate block sets `inband_cfo_seed_active` (:11120). So
+  resetting `cfo_acq_seed_hz`/`inband_cfo_seed_active` in `init()` would (a) WIPE the
+  settled carrier on the ROBUST->cfg0 cross (defeating the carry) and (b) clobber the
+  just-set in-band flag. Both are therefore reset ONLY in the ctor (cold default) +
+  re-set per-config by `load_configuration` (the flag) + dropped by the poison-CFO
+  scrub (:3726). The producer must latch at the ROBUST rung (config 100..102), which
+  is OUTSIDE the cfg0..6 `cfg0_freshrung_settle_enabled` scope, so the producer is
+  gated on the config-INDEPENDENT `inband_cfo_seed_active`, not `cfg0_freshrung_settle_
+  enabled`. (Bench-verified: with the producer gated on the cfg0..6 flag, the ROBUST
+  seed never latched — MERCURY_CFOSEED_DBG showed every LATCH at cfg=0, never robust.)
 - INV-E (legacy / gate-off byte-identical): every producer + consumer is behind
   `ofdm.cfg0_freshrung_settle_enabled`; off-flag the seed is never written and never
   read → `coarse_freq_offset` stays 0 on trial 0 exactly as today, and the CFO scrub
