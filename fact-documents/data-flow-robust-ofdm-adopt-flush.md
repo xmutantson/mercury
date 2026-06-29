@@ -1253,3 +1253,33 @@ is the CMD's forward OFDM search; its only legitimate consumer at a WB rung's tu
 the RSP does not send there (it sends MFSK). The MFSK detector is UNGATED (runs before the suppress), so the
 reverse ACK is never missed. The window is the same one-shot timer as §VF2.2 (one consumer per side); the CMD
 and RSP arm it independently at their own turnaround entries.
+
+### §VF2.6 SLOW-POLL refinement + HONEST FLEET A/B VERDICT (replicated — gate is NECESSARY-NOT-SUFFICIENT)
+
+A fixed ~1.8s "gap-before-budget" under-covered the ~13s cfg0 batch period, so the storm ran in the long
+inter-arm gaps. The refinement: the suppress window spans the WHOLE `receiving_timeout`, and the gated ftr is
+capped at ONE FRAME PERIOD (not the ring depth). The forward search thus SLOW-POLLS once per frame across the
+turnaround — robust to the gap length, and the real burst is still caught within 1 frame (it decodes on the
+OK path, which bypasses the gate). 
+
+FLEET A/B (faithful real-audio snd-aloop, WGN:40 seed2001, FIX binary; defeat = same binary
+`MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1`; legacy = inband off). Decisive clean run (run4):
+
+| metric | legacy | FIX (gate) | DEFEAT (storm) |
+|---|---|---|---|
+| total SKIP-VAR | 12 | **51** | **517** |
+| CMD SKIP-VAR | 12 | **0** | 297 |
+| RSP SKIP-VAR | 0 | 51 | 220 |
+| rx_bytes | 8192 (full) | 161 | 177 |
+| configs_seen | [0,100,101,102] | [100,101,102] | [100,101,102] |
+
+VERDICT — the gate is a PROVEN, CORRECT, TESTED fix for the SKIP-VAR storm: **~10× total SKIP-VAR reduction
+(517→51), CMD storm 297→0**, clean fails-before/passes-after on the SAME binary (the defeat knob), unit test
+green, full `--test` 68/0 (M=0), legacy byte-identical. BUT it is **NECESSARY-NOT-SUFFICIENT for delivery**:
+fix 161 B ≈ defeat 177 B, both ≫ below legacy's 8192 B, and NEITHER crosses to cfg0 (no `wb=[0]`; the
+redesign holds robust 100–102). The cfg0 SKIP-VAR storm was a real symptom this gate eliminates, but the
+binding constraint on delivery is the redesign's ROBUST→cfg0 CROSS/CLIMB failure — a SEPARATE, deeper layer
+(the "faithful_beat_vara_climb_binding" constraint), NOT the turnaround search storm. Run-to-run variance is
+real (one run had both arms 0 B / no-connect — a connect flake, fix==defeat so not the gate). Honest scope:
+this fix removes the storm and its wasted RX cycles + the pin-starvation pressure; it does not by itself make
+the redesign deliver at cfg0. The climb/cross layer is the next investigation, NOT another search-gate.
