@@ -1826,6 +1826,15 @@ public:
   // (-DINBAND_CHEAPMISS_FAILBEFORE) pins the no-env path OFF -> assertion A flips. rc 0/1.
   int test_inband_cheapmiss_default_on();
 
+  // REVSACK Part B (revsack/design.json) — DATA-SACK cheap-miss decouple discriminator
+  // regression. Drives the EXACT :5278 intercept gate (inband_a3_decouple_enabled &&
+  // cmd_has_inflight_data_batch && !config_is_at_bottom) across the truth table: spine-live
+  // + in-flight + not-bottom -> RE-AIR (forward-healthy miss is cheap); no-in-flight /
+  // cumulative-off / at-bottom -> NO re-air (D0 genuine-loss demote/BREAK still fires).
+  // PURE in-process synthetic-fire (no PHY/audio/IONOS/RF). FAIL-BEFORE
+  // (-DREVSACK_CHEAPMISS_FAILBEFORE): the intercept is compiled out -> assertion A flips. rc 0/1.
+  int test_revsack_data_sack_cheapmiss();
+
   // ROBUST_0 + streaming-compression deadlock regression
   // (data-flow-compress-frame-fill.md). Drives the REAL
   // process_buffer_data_commander() data-fill path at ROBUST_0 frame
@@ -2135,6 +2144,17 @@ public:
   // explicit_env = literal MERCURY_<KEY> string (NULL/empty = unset); inband_on = the
   // in-band feature state. Returns 1 (on) / 0 (off).
   int inband_cheapmiss_default_on(const char* explicit_env, bool inband_on);
+
+  // REVSACK Part A (revsack/design.json): the DATA-ACK suffix FEC MASTER enable. ON iff
+  // the compile-time ARQ_ACK_SUFFIX_FEC_ENABLE is non-zero OR the runtime in-band default-
+  // on resolves true. The in-band default-on follows the SAME cheap-miss policy the A3
+  // decouple / cumulative-ack advertise use (inband_cheapmiss_resolve): (1) explicit
+  // MERCURY_ACK_SUFFIX_FEC env wins (the A/B escape-hatch); (2) else DEFAULT-ON when the
+  // in-band stack is engaged (the proven-fix-ships-default-on rule — the coded reverse
+  // data-SACK is what makes cfg0 durably hold); (3) else off (legacy byte-identical). The
+  // per-rung GATE is ack_suffix_fec_eligible(); this is the master on/off. Cached half is
+  // the env; re-read live is inband_rate_feature_enabled(). Returns true/false.
+  bool ack_suffix_fec_master_enabled();
 
   // TX EMIT (design §6). Decide whether the batch about to be sent at config
   // `batch_cfg` differs from the last-announced config and, if so, build the
@@ -3677,6 +3697,10 @@ public:
   //   once + ctor-cached, NOT reset per-session — same discipline as inband_rate_enabled).
   //   The live gate ALSO requires cumulative_ack_enabled (the negotiated A3 self-heal spine).
   int     inband_a3_decouple_env;       // -1 = unresolved, 0 = off, 1 = on
+  // REVSACK Part A: the DATA-ACK suffix FEC master-enable env cache (the env half of
+  //   ack_suffix_fec_master_enabled()). -1 = unresolved, 0 = off, 1 = on. Same env-keyed
+  //   ctor-cached discipline as inband_a3_decouple_env.
+  int     ack_suffix_fec_env;           // -1 = unresolved, 0 = off, 1 = on
 
   // ── STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (inband-reliability-
   //    design.md §1/§4) ──
@@ -4314,8 +4338,22 @@ public:
   // datalink_defines.h). NOTE: this is the GATE PREDICATE; the enhanced-ACK TX
   // ENABLE is held off (ARQ_ACK_SUFFIX_FEC_ENABLE=0, §21.3) so the ACK is
   // byte-identical in 100% of cases — flip the enable behind its own HW test.
-  bool ack_suffix_fec_eligible() const {
-    return is_robust_config(current_configuration);
+  // REVSACK Part A (revsack/design.json): WIDENED from robust-tier-only to ALSO the
+  // climbed OFDM rungs UNDER THE IN-BAND STACK. The reverse data-SACK CRC-fail-on-slow-
+  // turnaround lives at the CLIMBED rungs (cfg0+), not at the robust tier — so scoping
+  // the FEC to robust-only NEVER covered the failure. At an OFDM rung, with inband
+  // engaged, the uncoded suffix's CRC-fail is NOT throughput-neutral, it is throughput-
+  // FATAL (CMD-ACK-PAT-timeout → emergency_nack → BREAK → ROBUST_0 cascade, kills the
+  // whole climb), so the +26-symbol coded suffix is the correct trade. Legacy / non-in-
+  // band keeps the EXACT robust-tier-only predicate (the throughput-neutral default) so
+  // it is byte-identical. NB (M<16) returns 0 from ack_sack_suffix_len() so the suffix
+  // is unsupported either way; the enable hook also gates on M>=16. inband_rate_feature_
+  // enabled() is the in-band engagement test (the same gate every in-band lever uses).
+  // NOTE: this is the GATE PREDICATE; the master enable (ARQ_ACK_SUFFIX_FEC_ENABLE OR
+  // the runtime in-band default-on, ack_suffix_fec_master_enabled()) still has to be on.
+  bool ack_suffix_fec_eligible() {
+    if (is_robust_config(current_configuration)) return true;
+    return inband_rate_feature_enabled();   // climbed OFDM rungs under the in-band stack
   }
 
   // v9 handshake echo state. handshake_confirmed gates CMD's

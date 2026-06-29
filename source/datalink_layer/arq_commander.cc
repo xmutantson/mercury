@@ -105,9 +105,13 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 
 	// Tail window — identical math to the v2 MFSK pre-detect (arq_commander.cc
 	// ~2351-2364). Suffix capture needs the longer of SNR vs SACK suffix tail.
+	// REVSACK Part A: use the CODED suffix length (coded N=52 when the ACK FEC is on,
+	// 13 uncoded) so the snapshot window holds the WHOLE GF(16) codeword — sizing for
+	// only 13 would truncate the coded suffix and fail the BP. FEC-off: == 13,
+	// byte-identical.
 	int ack_nsymb   = telecom_system->ack_mfsk.ack_pattern_nsymb;
 	int pattern_len = telecom_system->ack_mfsk.ack_snr_pattern_nsymb();
-	int sack_suffix_len = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	int sack_suffix_len = telecom_system->ack_mfsk.ack_sack_coded_suffix_len();
 	if(sack_suffix_len > pattern_len - ack_nsymb)
 		pattern_len = ack_nsymb + sack_suffix_len;
 	const int mfsk_tail_nsymb = ack_nsymb + pattern_len + 16;
@@ -1253,10 +1257,39 @@ int cl_arq_controller::add_message_control(char code)
 					success = SUCCESSFUL;
 					return success;
 				}
-				// No-op drop (same config / invalid target) OR a tier-crossing with the
-				// spine not live: fall through to the legacy builder so behaviour matches
-				// the flag-off path for the crossing (fast SET_CONFIG ACK) and the
-				// degenerate case.
+				// REVSACK P2 — SET_CONFIG PURGE (revsack/design.json, full spec-conformance:
+				// zero reachable in-band SET_CONFIG for a NON-crossing change). We reach here
+				// when NOT (tier_crossing && !cross_via_tag) AND inband_unilateral_config_change
+				// returned false — i.e. the in-band target is a NO-OP / off-ladder / invalid
+				// (same config, or a target the unilateral path rejects), and it is NOT a
+				// legacy-routed tier crossing. Under in-band, an intra-tier no-op must NOT put a
+				// legacy SET_CONFIG control frame on the wire — the in-band stack announces every
+				// committed rate change via the forward CONFIG_TAG (unilateral), so a SET_CONFIG
+				// for a no-op is a spurious, off-spec control frame (it would also force a
+				// reverse-ACK turnaround for nothing — the very reverse-path fragility this
+				// campaign removes). EARLY-RETURN: drop the slot, arm the data-phase re-route
+				// (inband_unilateral_armed, consumed in process_messages_tx_control to restore
+				// TRANSMITTING_DATA), and emit nothing. The legacy fall-through is RETAINED ONLY
+				// for the genuine tier-crossing edge (tier_crossing true here = cross_via_tag was
+				// true but the unilateral path raced/rejected — a real cross still must happen, so
+				// keep the proven fast legacy SET_CONFIG). Strictly gated on inband_rate_feature_
+				// enabled() -> flag-off byte-identical (legacy always builds the frame).
+				if(!tier_crossing)
+				{
+					printf("[INBAND-TX] SET_CONFIG PURGE: no-op/off-ladder in-band target "
+						"(%d -> %d, current %d) — dropping the slot, NO legacy SET_CONFIG on "
+						"the wire (the in-band CONFIG_TAG owns every committed change)\n",
+						current_configuration, inband_target, current_configuration);
+					fflush(stdout);
+					messages_control.status = FREE;
+					messages_control.type   = NONE;
+					inband_unilateral_armed = true;   // restore TRANSMITTING_DATA (no control TX)
+					success = SUCCESSFUL;
+					return success;
+				}
+				// Tier-crossing degenerate edge (cross_via_tag set but unilateral rejected):
+				// fall through to the legacy SET_CONFIG builder so a real cross still completes
+				// via the proven fast dedicated ACK.
 			}
 
 			messages_control.data[0]=code;
@@ -4029,7 +4062,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						int ack_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
 						int pattern_len = telecom_system->ack_mfsk.ack_snr_pattern_nsymb();
 						// Suffix capture needs the longer of SNR vs SACK suffix tail.
-						int sack_suffix_len = telecom_system->ack_mfsk.ack_sack_suffix_len();
+						// REVSACK Part A: CODED suffix length so the snapshot holds the whole
+						// GF(16) codeword (N=52 when ACK FEC on); 13 uncoded → byte-identical.
+						int sack_suffix_len = telecom_system->ack_mfsk.ack_sack_coded_suffix_len();
 						if(sack_suffix_len > pattern_len - ack_nsymb)
 							pattern_len = ack_nsymb + sack_suffix_len;
 						const int mfsk_tail_nsymb = ack_nsymb + pattern_len + 16;
@@ -5267,6 +5302,68 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				receiving_timer.start();
 				return;
 			}
+
+			// ── REVSACK Part B — DATA-SACK CHEAP-MISS DECOUPLE (revsack/design.json) ──────────
+			// The data-ACK timed out (data_ack_received==NO), the path that escalates via
+			// emergency_nack_count++ -> the BREAK-gate demote at :5596 (the SEPARATE escalation
+			// the existing A3 cheap-miss at :3829 does NOT cover — it intercepts only the
+			// connect-liveness stall). When (a) the cheap-miss spine is live (inband_a3_decouple_
+			// enabled() — DEFAULT-ON in-band AND cumulative_ack negotiated, the load-bearing self-
+			// heal interlock) AND (b) a forward DATA batch is STILL in flight (cmd_has_inflight_
+			// data_batch() — the forward-HEALTHY proof: the RX is decoding our DATA, only its
+			// reverse SACK missed the listen window) AND (c) a lower rung exists (not at bottom),
+			// a reverse-only miss is NOT a reason to bump the BREAK streak. RE-AIR THE SAME
+			// CONFIG: leave current_configuration / cmd_batch_seq_id / messages_tx[] / retx queue
+			// UNTOUCHED (the normal per-frame retx machinery re-presents the in-flight batch on
+			// the next send), re-arm the receiving window, do NOT bump emergency_nack_count, do
+			// NOT tick cfg16_revack_starve_fails. The missed bitmap is SUPERSEDED by the next
+			// turn's cumulative n_r (STANAG-5066 acknowledged-through) — which Part A makes
+			// actually DECODE again (the suffix FEC). Composition: Part A makes n_r arrive; Part B
+			// makes the residual gaps non-load-bearing instead of accruing toward the 3-block
+			// demote that craters the climb to ROBUST_0.
+			//
+			// D0 NO-SILENT-LOSS (the genuine-death nets stay intact):
+			//   - cmd_has_inflight_data_batch() false (connect/negotiate livelock, zero forward
+			//     DATA) -> NOT taken -> the real BREAK still fires.
+			//   - cumulative_ack_enabled false (inside inband_a3_decouple_enabled) -> NOT taken:
+			//     a truly dead reverse channel never advances n_r, so INV-T2-CONTIG keeps the
+			//     in-flight batch UNCOVERED and the genuine-loss demote/BREAK fires.
+			//   - A forward DATA DECODE failure is a SEPARATE path (frame_gearshift_data_failed_*
+			//     above) that still demotes — Part B only suppresses the FORWARD-HEALTHY reverse-
+			//     only miss.
+			//   - The re-air does NOT advance cmd_batch_seq_id (would orphan the batch into a gap
+			//     -> GAP-ABORT) and touches NEITHER the epoch NOR the config.
+			//   - SUPERSEDES FIX-4/FIX-9 for the forward-healthy case (a re-air is cheaper than a
+			//     CFG16->CFG15 demote): by returning before the ++ those deadlines never reach
+			//     their streak threshold on a forward-healthy miss — CORRECT, they were band-aids
+			//     for exactly this miss at CFG16. They STILL fire for the genuine-CFG16-starvation
+			//     case (no in-flight batch / cumulative_ack off / truly silent) where Part B bails.
+			// FAIL-BEFORE (-DREVSACK_CHEAPMISS_FAILBEFORE): the discriminator is pinned off so a
+			// forward-healthy data-SACK miss falls through to the ++ -> reaches threshold -> BREAK
+			// -> demote (the current bug the test reproduces).
+#ifndef REVSACK_CHEAPMISS_FAILBEFORE
+			if(inband_a3_decouple_enabled()
+			   && cmd_has_inflight_data_batch()
+			   && !config_is_at_bottom(current_configuration, robust_enabled))
+			{
+				printf("[REVSACK-CHEAPMISS] forward-healthy DATA-SACK miss at config %d — RE-AIRING "
+					"the SAME config (NOT bumping emergency_nack / demoting): the missed SACK self-"
+					"heals via the next cumulative n_r (cheap-miss spine live). emergency_nack_count=%d "
+					"UNCHANGED, in-flight batch preserved for the normal retx re-air.\n",
+					current_configuration, emergency_nack_count);
+				fflush(stdout);
+				// Re-arm the receiving window so the re-aired batch's ACK is awaited; leave
+				// current_configuration / cmd_batch_seq_id / messages_tx[] / retx queue untouched
+				// (the in-flight batch is re-presented by the normal per-frame send path). Do NOT
+				// bump emergency_nack_count (no demote accrual) and do NOT tick the CFG16 starve
+				// streak (a re-air is not a starvation). The next forward send owns the transition.
+				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+				telecom_system->data_container.frames_to_read = 4;
+				calculate_receiving_timeout();
+				receiving_timer.start();
+				return;
+			}
+#endif // REVSACK_CHEAPMISS_FAILBEFORE
 
 			// Count toward emergency BREAK. Batch halving doesn't bypass this.
 			emergency_nack_count++;
@@ -10678,6 +10775,128 @@ int cl_arq_controller::test_inband_cheapmiss_default_on()
 		inband_cheapmiss_default_on(NULL, false), 0);
 
 	printf("[TEST-INBAND-CHEAPMISS] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// REVSACK Part B (revsack/design.json) — DATA-SACK CHEAP-MISS DECOUPLE discriminator
+// regression. The intercept at the data_ack_received==NO branch (arq_commander.cc :5278,
+// right before emergency_nack_count++) re-airs the SAME config — instead of bumping the
+// BREAK streak — IFF (a) the cheap-miss spine is live (inband_a3_decouple_enabled() ==
+// inband default-on AND cumulative_ack_enabled negotiated), (b) a forward DATA batch is
+// still in flight (cmd_has_inflight_data_batch()), AND (c) a lower rung exists
+// (!config_is_at_bottom). This PURE in-process test drives those EXACT production
+// predicates across the truth table and asserts the re-air-vs-demote decision — the same
+// synthetic-fire style as test_inband_tier_crossing_routing (no PHY/audio/IONOS/RF).
+// D0 (no silent loss): the genuine-death cases (no in-flight batch / spine off / at bottom)
+// MUST NOT re-air -> they fall through to the real demote/BREAK. FAIL-BEFORE
+// (-DREVSACK_CHEAPMISS_FAILBEFORE): the production intercept is compiled out so a forward-
+// healthy miss demotes — this test additionally asserts the macro gate matches the
+// production #ifndef so the fail-before arm is real.
+int cl_arq_controller::test_revsack_data_sack_cheapmiss()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-REVSACK-CHEAPMISS] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-REVSACK-CHEAPMISS] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// The production intercept condition, evaluated from the CURRENT controller state —
+	// BYTE-FOR-BYTE the :5278 gate (inband_a3_decouple_enabled && cmd_has_inflight_data_batch
+	// && !config_is_at_bottom). We also fold in the compile-time macro so the predicate this
+	// test evaluates is exactly the production reachability (FAIL-BEFORE compiles the
+	// intercept out -> the re-air is never reached regardless of the runtime gate).
+	auto reair_fires = [&]() -> bool {
+#ifdef REVSACK_CHEAPMISS_FAILBEFORE
+		return false;   // intercept compiled out -> always demote (the reproduced bug)
+#else
+		return inband_a3_decouple_enabled()
+		    && cmd_has_inflight_data_batch()
+		    && !config_is_at_bottom(current_configuration, robust_enabled);
+#endif
+	};
+
+#ifdef REVSACK_CHEAPMISS_FAILBEFORE
+	const int want_healthy_miss = 0;   // fail-before: even a forward-healthy miss demotes
+#else
+	const int want_healthy_miss = 1;   // pass-after: the forward-healthy miss re-airs
+#endif
+
+	// Save state we mutate so we never leak into a live session.
+	int  saved_cfg      = current_configuration;
+	int  saved_robust   = robust_enabled;
+	bool saved_cumul    = cumulative_ack_enabled;
+	int  saved_a3env    = inband_a3_decouple_env;
+	int  saved_ibrate   = inband_rate_enabled;
+	int  saved_nMessages = nMessages;
+	struct st_message* saved_messages_tx = messages_tx;
+
+	// Allocate a throwaway 1-slot messages_tx[] so cmd_has_inflight_data_batch() can be
+	// toggled (a default controller has nMessages=0 / messages_tx=NULL). Restored below.
+	nMessages   = 1;
+	messages_tx = new st_message[1];
+	messages_tx[0].status = FREE;
+	messages_tx[0].length = 0;
+	messages_tx[0].data   = NULL;
+
+	// In-band engaged + cumulative-ack negotiated -> the spine is live (default-on).
+	inband_rate_enabled     = 1;     // pin in-band ON (cache, no env read)
+	inband_a3_decouple_env  = -1;    // force re-resolve -> default-on in-band
+	cumulative_ack_enabled  = true;  // the negotiated self-heal spine
+	// robust_enabled = YES so the robust tier (ROBUST_0/1/2) sits BELOW CONFIG_0 ->
+	// config_is_at_bottom(CONFIG_0, YES) is FALSE (a lower rung exists), exactly the
+	// PRODUCTION session geometry (the climb runs ROBUST_0 -> cfg0 -> cfg16, robust on).
+	robust_enabled          = YES;
+	current_configuration   = CONFIG_0;   // a CLIMBED OFDM rung, NOT the bottom
+
+	// Make a forward DATA batch in-flight (cmd_has_inflight_data_batch() true).
+	messages_tx[0].status = PENDING_ACK; messages_tx[0].length = 100;
+
+	// (1) THE KEYSTONE — spine live + in-flight batch + not at bottom -> RE-AIR (no demote).
+	check((int)reair_fires() == want_healthy_miss,
+		"A spine-live + in-flight batch + not-at-bottom -> RE-AIR (forward-healthy miss is cheap)",
+		(int)reair_fires(), want_healthy_miss);
+
+	// (2) D0 NO-SILENT-LOSS — NO in-flight DATA batch (connect/negotiate livelock) -> the
+	//     re-air must NOT fire (falls through to the genuine BREAK). ABSOLUTE (both builds).
+	messages_tx[0].status = FREE; messages_tx[0].length = 0;
+	check(reair_fires() == false,
+		"B no in-flight DATA batch -> NO re-air (genuine livelock still BREAKs) [D0]",
+		(int)reair_fires(), 0);
+	messages_tx[0].status = PENDING_ACK; messages_tx[0].length = 100;
+
+	// (3) D0 NO-SILENT-LOSS — cumulative_ack OFF (dead reverse channel, n_r never advances)
+	//     -> spine not live -> NO re-air (the genuine-loss demote/BREAK fires). ABSOLUTE.
+	cumulative_ack_enabled = false;
+	check(reair_fires() == false,
+		"C cumulative_ack OFF -> spine not live -> NO re-air (INV-T2-CONTIG genuine-loss demote) [D0]",
+		(int)reair_fires(), 0);
+	cumulative_ack_enabled = true;
+
+	// (4) D0 — at the ladder BOTTOM (no lower rung) -> NO re-air (the real BREAK owns it).
+	//     ABSOLUTE (both builds): there is nowhere to demote, the re-air would loop.
+	current_configuration = ROBUST_0; robust_enabled = YES;   // bottom of the robust ladder
+	check(reair_fires() == false,
+		"D at ladder bottom -> NO re-air (genuine BREAK owns the bottom)",
+		(int)reair_fires(), 0);
+
+	// Restore everything (free the throwaway slot, restore the original pointer/count).
+	delete[] messages_tx;
+	messages_tx            = saved_messages_tx;
+	nMessages              = saved_nMessages;
+	current_configuration  = saved_cfg;
+	robust_enabled         = saved_robust;
+	cumulative_ack_enabled = saved_cumul;
+	inband_a3_decouple_env = saved_a3env;
+	inband_rate_enabled    = saved_ibrate;
+
+	printf("[TEST-REVSACK-CHEAPMISS] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
@@ -17174,13 +17393,17 @@ void sim2_activate(MercuryInstance* m)
 	// pace OFDM data per-symbol but keep the legacy co-routine pump for the MFSK
 	// handshake (arq_common.cc §10.4). No-op outside the outer stepper.
 	arq_set_sim2_active_is_ofdm(is_ofdm_config(m->arq.current_configuration));
-	// gf16ra reconcile: only meaningful if the suffix-FEC path is enabled; both
+	// gf16ra reconcile: only meaningful if a suffix-FEC path is enabled; both
 	// peers run the same repfact under the no-negotiation invariant, so this is
 	// a no-op idempotent re-apply in the common case (FEC off → not configured).
-	if (m->ts.ack_mfsk.suffix_fec_coded) {
+	// REVSACK Part A: ALSO reconcile when the DATA-ACK suffix FEC is on (the climbed-
+	// OFDM-rung enable) — both CONNECT and ACK use repfact 3, so a single reconcile
+	// covers both. The ACK TX/RX additionally save/restore the global per-call, so this
+	// is belt-and-suspenders for the in-process sim's shared codec between instances.
+	if (m->ts.ack_mfsk.suffix_fec_coded || m->ts.ack_mfsk.ack_suffix_fec_coded) {
 		// Both peers run the same repfact under the no-negotiation invariant;
-		// repfact 3 is the only production value set_suffix_fec uses. Re-applying
-		// it is idempotent (gf16ra::init short-circuits when unchanged).
+		// repfact 3 is the only production value set_suffix_fec / set_ack_suffix_fec use.
+		// Re-applying it is idempotent (gf16ra::init short-circuits when unchanged).
 		gf16ra::configure(3);
 		gf16ra::init();
 	}

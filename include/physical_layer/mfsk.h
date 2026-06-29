@@ -212,7 +212,37 @@ public:
 	// → 13 symbols for 52 bits. Total ACK pattern wall-clock: 16 base +
 	// 13 suffix = 29 symbols ≈ 705 ms (WB).
 	int ack_sack_suffix_len() const { return (M >= 16) ? 13 : 0; }  // 0 = unsupported
-	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
+	// REVSACK Part A (revsack/design.json): the data-ACK+SACK suffix CODED length.
+	// MIRROR of ctrl_suffix_len() for the CONNECT path — when ack_suffix_fec_coded
+	// is set (the climbed-OFDM-rung ACK FEC enable, §A) the suffix is the GF(16) RA
+	// codeword (gf16ra::codeword_len() = N) instead of the uncoded 13-symbol pack,
+	// so pack_ack_sack_payload(...) emits N tones and the wire/RX sizing must match.
+	// ack_suffix_fec_coded=false (the default / legacy / non-eligible rung) returns
+	// the uncoded 13 → byte-identical-when-off. NB (M<16) returns 0 either way. The
+	// gf16ra global owns the active N (configured at the ACK FEC enable hook); this
+	// accessor never configures (same contract as ctrl_suffix_len()).
+	// REVSACK Part A: the ACK coded codeword length CAPTURED at the FEC enable hook
+	// (set_ack_suffix_fec), NOT read live from gf16ra::codeword_len(). gf16ra is a
+	// PROCESS-GLOBAL whose repfact a CONFIG_TAG(2)/CONNECT(3) consumer freely save/restores
+	// — reading codeword_len() live here would return the WRONG N (e.g. 39) whenever the
+	// global is momentarily at another repfact, breaking the ACK wire/RX sizing AND
+	// corrupting the CONFIG_TAG length the moment THIS enable leaves the global at 3. By
+	// capturing N once (at the enable, repfact 3 = 52) we (a) keep the ACK length stable
+	// regardless of the live global, and (b) let set_ack_suffix_fec RESTORE the global so
+	// no other consumer is polluted. 0 when ACK FEC off. (The TX/RX still pin the global to
+	// 3 around the actual encode/BP via their own save/restore.)
+	int ack_suffix_fec_N;   // default 0 (set in init()); captured = gf16ra::codeword_len() at enable
+	int ack_sack_coded_suffix_len() const {
+		if (ack_sack_suffix_len() <= 0) return 0;            // NB: unsupported
+		return (ack_suffix_fec_coded && ack_suffix_fec_N > 0)
+		       ? ack_suffix_fec_N : ack_sack_suffix_len();
+	}
+	// REVSACK Part A: the on-wire ACK+SACK pattern length is base + the CODED suffix
+	// (coded N when FEC on, 13 when off). Was ack_pattern_nsymb + ack_sack_suffix_len()
+	// (always 13) — that NEVER accounted for the coded codeword, which is why
+	// ARQ_ACK_SUFFIX_FEC_ENABLE was held off "pending the ACK coded-window sizing work"
+	// (tier2-suffix-fec-design.md §21.3/§21.4 C7). FEC-off path is byte-identical.
+	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_coded_suffix_len(); }
 
 	// Tier-2 suffix FEC (tier2-suffix-fec-design.md §19, INCREMENT 1). When
 	// suffix_fec_coded is set (by the telecom layer after gf16ra::configure(3)+

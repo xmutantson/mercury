@@ -1099,6 +1099,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_cheapmiss_default_on();
             }
+            // REVSACK Part B (revsack/design.json): the DATA-SACK cheap-miss decouple
+            // discriminator (the :5278 intercept). Re-air a forward-healthy reverse-ACK
+            // miss instead of emergency_nack++->BREAK->demote; D0 genuine-loss cases still
+            // demote. PURE in-process synthetic-fire on a throwaway controller.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_revsack_data_sack_cheapmiss();
+            }
             // HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §3):
             // a robust<->OFDM crossing routes to the legacy SET_CONFIG handshake
             // (fast dedicated ACK); intra-tier rate adapts keep the in-band tag.

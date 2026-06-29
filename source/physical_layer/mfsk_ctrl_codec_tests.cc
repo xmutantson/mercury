@@ -3422,6 +3422,27 @@ static uint16_t prod_crc12_cb(void* ctx, const unsigned char* data, int n) {
 	return arq->CRC12_calc((const char*)data, n) & 0x0FFF;
 }
 
+// REVSACK Part A: WIRE-form ACK CRC callback for the coded data-ACK gate test. MIRROR of
+// the production arq_ack_sack_crc12_cb (arq_common.cc): gf16ra hands it the typed40 bytes
+// [type:2|payload38]; for ACK_SACK (type=0) that is [00|bsi:8|bitmap:30]. Reassemble the
+// WIRE form [bsi||bitmap32] (the form send_mfsk_ack_sack embeds) and CRC over THAT.
+static uint16_t test_ack_sack_wire_crc12_cb(void* ctx, const unsigned char* data, int n) {
+	cl_arq_controller* arq = static_cast<cl_arq_controller*>(ctx);
+	if (n != 5 || !data) return (uint16_t)0xFFFFu;
+	uint64_t typed40 = 0;
+	for (int b = 0; b < 5; b++) typed40 = (typed40 << 8) | (uint64_t)data[b];
+	uint64_t p38 = typed40 & ((1ULL << 38) - 1ULL);
+	uint8_t  bsi = (uint8_t)((p38 >> 30) & 0xFFu);
+	uint32_t bm  = (uint32_t)(p38 & 0x3FFFFFFFu);
+	char wire[5];
+	wire[0] = (char)bsi;
+	wire[1] = (char)((bm >> 24) & 0xFF);
+	wire[2] = (char)((bm >> 16) & 0xFF);
+	wire[3] = (char)((bm >>  8) & 0xFF);
+	wire[4] = (char)( bm        & 0xFF);
+	return arq->CRC12_calc(wire, 5) & 0x0FFF;
+}
+
 // Build CONNECT-base suffix passband for a given (type, p38). CONNECT base
 // pattern (g=3) + 13-symbol ctrl-suffix. Suffix placed at offset 4096.
 static std::vector<double> build_ctrl_suffix_audio(cl_telecom_system& ts,
@@ -7131,6 +7152,143 @@ static void test_recovery_ack_cfo_gate() {
 // are no legacy peers — the enhanced ctrl-suffix is the unconditional default at
 // the robust tier, gated on the gearshift config, not a negotiated bit.)
 
+// REVSACK Part A (revsack/design.json) — the GF(16) RA coded data-ACK suffix at a
+// CLIMBED OFDM rung DECODES under the turnaround symbol-error signature that fails the
+// uncoded CRC. This is the FAIL-BEFORE / PASS-AFTER on the SAME binary: with the ACK FEC
+// OFF (uncoded 13-tone) a few injected per-symbol argmax errors fail CRC12 (no ACK
+// arrives -> nAcked stuck -> the demote cascade the campaign targets); with the ACK FEC ON
+// (set_ack_suffix_fec, coded N=52) the GF(16) BP absorbs them and the wire-form CRC accept
+// gate passes -> the bsi/bitmap (and the n_r riding the bsi field) survive. We inject the
+// errors at the TONE level (deterministic, the exact turnaround signature) by re-modulating
+// the suffix with a few flipped argmax tones, then run the PRODUCTION decode path
+// (decode_ack_sack_from_passband, which internally try-boths uncoded->coded when FEC on).
+static void test_revsack_suffix_fec_coded_decode() {
+	const char* name = "revsack_suffix_fec_coded_decode";
+	cl_arq_controller arq;
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE;
+	// A CLIMBED OFDM rung (cfg0) — where the reverse data-SACK CRC-fail lives. (The old
+	// gate scoped FEC to robust-tier-only, which never covered this rung.)
+	ts.load_configuration(CONFIG_0);
+	if (ts.ack_mfsk.ack_sack_suffix_len() <= 0) { test_fail(name, "need WB M>=16"); return; }
+
+	const uint8_t  bsi    = 0x37;
+	const uint32_t bitmap = 0x0AB12345u & 0x3FFFFFFFu;   // 30-bit
+	// WIRE-form CRC (production send_mfsk_ack_sack convention).
+	char wire[5];
+	wire[0]=(char)bsi; wire[1]=(char)((bitmap>>24)&0xFF); wire[2]=(char)((bitmap>>16)&0xFF);
+	wire[3]=(char)((bitmap>>8)&0xFF); wire[4]=(char)(bitmap&0xFF);
+	const uint16_t crc12 = arq.CRC12_calc(wire, 5) & 0x0FFF;
+
+	const int lead = 4096;
+
+	// ---- (FAIL-BEFORE) ACK FEC OFF: uncoded 13-tone suffix + injected symbol errors ----
+	// Build the uncoded passband, then corrupt 3 suffix symbols (the turnaround argmax
+	// errors). The uncoded CRC12 has NO correction -> decode must FAIL.
+	{
+		ts.set_ack_suffix_fec(false);
+		if (ts.ack_mfsk.ack_suffix_fec_coded) { test_fail(name, "FEC-off flag not cleared"); return; }
+		if (ts.ack_mfsk.ack_sack_coded_suffix_len() != 13) { test_fail(name, "off coded-len != 13"); return; }
+		int nsamp = ts.ack_sack_pattern_passband_samples;
+		std::vector<double> audio((size_t)nsamp + 2*lead, 0.0);
+		int w = ts.generate_ack_sack_pattern_passband(audio.data()+lead, bsi, bitmap, crc12);
+		if (w != nsamp) { test_fail(name, "off generate size mismatch"); return; }
+		// Corrupt 3 suffix symbols: zero a span of samples in the suffix region so the
+		// per-symbol argmax lands on a wrong/empty bin (a deterministic decode error).
+		int sym_samp = ts.data_container.Nofdm * ts.data_container.interpolation_rate;
+		int base_samp = ts.ack_mfsk.ack_pattern_nsymb * sym_samp;   // suffix starts here
+		for (int s = 2; s <= 4; s++) {                              // symbols 2,3,4 of the suffix
+			int off = lead + base_samp + s * sym_samp;
+			for (int i = 0; i < sym_samp && (off+i) < (int)audio.size(); i++)
+				audio[(size_t)(off+i)] = 0.0;
+		}
+		uint8_t rb=0; uint32_t rbm=0; uint16_t rc=0; int rm=0;
+		bool decoded = ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(),
+			&rb, &rbm, &rc, &rm);
+		// The uncoded path may "decode" garbage; the production caller then re-checks CRC.
+		bool crc_ok = false;
+		if (decoded) {
+			char w2[5]; w2[0]=(char)rb; w2[1]=(char)((rbm>>24)&0xFF); w2[2]=(char)((rbm>>16)&0xFF);
+			w2[3]=(char)((rbm>>8)&0xFF); w2[4]=(char)(rbm&0xFF);
+			crc_ok = (rc == (arq.CRC12_calc(w2,5)&0x0FFF)) && rb==bsi && rbm==bitmap;
+		}
+		if (crc_ok) { test_fail(name, "FAIL-BEFORE arm UNEXPECTEDLY decoded the corrupted uncoded ACK (the bug is not reproduced)"); return; }
+		printf("    [FAIL-BEFORE] uncoded ACK + 3 symbol errors -> CRC fail / no valid ACK (matched=%d) — the demote-trigger\n", rm);
+	}
+
+	// ---- (PASS-AFTER) ACK FEC ON: coded N=52 suffix decodes CLEAN, and under symbol errors ----
+	{
+		ts.set_ack_suffix_fec(true, test_ack_sack_wire_crc12_cb, &arq);
+		if (!ts.ack_mfsk.ack_suffix_fec_coded) { test_fail(name, "FEC-on flag not set"); return; }
+		int codedN = ts.ack_mfsk.ack_sack_coded_suffix_len();
+		if (codedN <= 13) { test_fail(name, "coded suffix len not > 13 (FEC not active)"); return; }
+		int sym_samp = ts.data_container.Nofdm * ts.data_container.interpolation_rate;
+		int base_samp = ts.ack_mfsk.ack_pattern_nsymb * sym_samp;
+
+		// (PA-0) CLEAN coded round-trip MUST decode (validates the TX coded-window sizing +
+		// the RX coded try-both wiring, independent of FEC correction).
+		{
+			int nsamp = ts.ack_sack_pattern_passband_samples;
+			std::vector<double> audio((size_t)nsamp + 2*lead, 0.0);
+			int w = ts.generate_ack_sack_pattern_passband(audio.data()+lead, bsi, bitmap, crc12);
+			if (w != nsamp) { test_fail(name, "on generate size mismatch (coded sizing not wired)"); return; }
+			uint8_t rb=0; uint32_t rbm=0; uint16_t rc=0; int rm=0;
+			bool decoded = ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(),
+				&rb, &rbm, &rc, &rm);
+			printf("    [PA-0 clean] coded N=%d decoded=%d bsi=0x%02x(want 0x%02x) bitmap=0x%08x(want 0x%08x) matched=%d\n",
+				codedN, (int)decoded, rb, bsi, rbm, bitmap, rm);
+			if (!decoded || rb != bsi || rbm != bitmap) {
+				test_fail(name, "PASS-AFTER PA-0: CLEAN coded ACK did NOT round-trip (TX/RX coded wiring broken)");
+				return;
+			}
+		}
+
+		// (PA-1) Coded + 3 symbol errors (the turnaround signature; GF(16) RA corrects 2-8,
+		// tier2 §8.2). Rebuild fresh, corrupt 3 coded info symbols, decode.
+		{
+			int nsamp = ts.ack_sack_pattern_passband_samples;
+			std::vector<double> audio((size_t)nsamp + 2*lead, 0.0);
+			ts.generate_ack_sack_pattern_passband(audio.data()+lead, bsi, bitmap, crc12);
+			for (int s = 2; s <= 4; s++) {
+				int off = lead + base_samp + s * sym_samp;
+				for (int i = 0; i < sym_samp && (off+i) < (int)audio.size(); i++)
+					audio[(size_t)(off+i)] = 0.0;
+			}
+			uint8_t rb=0; uint32_t rbm=0; uint16_t rc=0; int rm=0;
+			bool decoded = ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(),
+				&rb, &rbm, &rc, &rm);
+			bool crc_ok = false;
+			if (decoded) {
+				char w2[5]; w2[0]=(char)rb; w2[1]=(char)((rbm>>24)&0xFF); w2[2]=(char)((rbm>>16)&0xFF);
+				w2[3]=(char)((rbm>>8)&0xFF); w2[4]=(char)(rbm&0xFF);
+				crc_ok = (rc == (arq.CRC12_calc(w2,5)&0x0FFF));
+			}
+			printf("    [PA-1 errored] coded N=%d decoded=%d crc_ok=%d bsi=0x%02x bitmap=0x%08x matched=%d\n",
+				codedN, (int)decoded, (int)crc_ok, rb, rbm, rm);
+			if (!decoded || !crc_ok || rb != bsi || rbm != bitmap) {
+				test_fail(name, "PASS-AFTER PA-1: coded ACK did NOT recover bsi/bitmap under 3 symbol errors (FEC not correcting)");
+				return;
+			}
+			printf("    [PASS-AFTER] coded ACK (N=%d) + 3 symbol errors -> bsi=0x%02x bitmap=0x%08x CRC OK — confirm survives the turnaround\n",
+				codedN, rb, rbm);
+		}
+		ts.set_ack_suffix_fec(false);   // restore
+	}
+
+	// ---- D0 byte-identical-when-off: coded-len == 13 + same passband sizing as the
+	//      original uncoded path (the throughput-neutral default off the climbed rung). ----
+	{
+		ts.set_ack_suffix_fec(false);
+		int off_len = ts.ack_mfsk.ack_sack_coded_suffix_len();
+		int off_nsamp = ts.ack_sack_pattern_passband_samples;
+		ts.load_configuration(CONFIG_0);   // recompute the stock uncoded sizing
+		if (off_len != 13 || ts.ack_sack_pattern_passband_samples != off_nsamp) {
+			test_fail(name, "FEC-off not byte-identical (len/sizing drift)"); return;
+		}
+	}
+
+	test_pass(name);
+}
+
 // §21.1 — the per-batch ACK enhanced-suffix gate is a THROUGHPUT gate keyed on the
 // robust tier alone (no capability negotiation): eligible at ROBUST_0, ineligible
 // at the OFDM configs (the byte-identical / throughput-neutral constraint).
@@ -8116,6 +8274,10 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ack_suffix_throughput_neutral();
 	test_connect_suffix_byte_identical_when_off();
 	test_production_enhanced_connect_decodes();
+	// REVSACK Part A: coded data-ACK suffix at a climbed OFDM rung decodes under the
+	// turnaround symbol-error signature that fails the uncoded CRC (FAIL-BEFORE/PASS-AFTER
+	// on the same binary via set_ack_suffix_fec). The D0-robust reverse data-SACK.
+	test_revsack_suffix_fec_coded_decode();
 
 	// §22 OFDM FINE-timing phase-invariant magnitude metric regression
 	// (fix/ofdm-fine-timing-magnitude, ofdm-fine-timing-magnitude.md §4).

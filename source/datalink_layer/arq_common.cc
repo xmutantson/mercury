@@ -166,6 +166,11 @@ static inline uint8_t cumulative_ack_advertise_bit()
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
+// REVSACK Part A: forward decl — the WIRE-form CRC-12 callback for the GF(16) RA
+// DATA-ACK suffix accept gate (defined below near arq_ctrl_crc12_cb). Used by
+// load_configuration's ACK FEC enable hook above its definition.
+static uint16_t arq_ack_sack_crc12_cb(void* ctx, const unsigned char* data, int n);
+
 // ---------------------------------------------------------------------------
 // SIM virtual-clock spin helpers (sim-arq-channel.md §Inc2).
 //
@@ -863,6 +868,7 @@ cl_arq_controller::cl_arq_controller()
 	inband_tx_epoch_parity=0;
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
 	inband_a3_decouple_env=-1;  // unresolved; inband_a3_decouple_enabled() caches the env half
+	ack_suffix_fec_env=-1;  // REVSACK Part A: unresolved; ack_suffix_fec_master_enabled() caches the env half
 	inband_unilateral_armed=false;  // Stage 3b: set by the SET_CONFIG builder unilateral path
 	// STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (design §1/§4). A fresh
 	// session has nothing announced, so the re-tag is disarmed and no config is confirmed.
@@ -2564,6 +2570,27 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		telecom_system->set_connect_preamble_reps(reps);
 	}
 
+	// REVSACK Part A (revsack/design.json) — DATA-ACK+SACK suffix FEC enable. SEPARATE
+	// from the CONNECT enable above (the §21.1 isolation; the ACK never inherits the
+	// CONNECT FEC state). Enabled when (a) the per-batch ACK gate is eligible
+	// (ack_suffix_fec_eligible() — robust tier OR, NEW, the climbed OFDM rungs under the
+	// in-band stack) AND (b) the master enable is on (the compile-time
+	// ARQ_ACK_SUFFIX_FEC_ENABLE OR the runtime in-band default-on). The hook configures
+	// the gf16ra graph (repfact 3, N=52 — the SAME value CONNECT uses), sets the ACK FEC
+	// flag, stores the WIRE-form CRC callback (arq_ack_sack_crc12_cb) for the internal
+	// coded RX try-both decode, and re-derives ack_sack_pattern_passband_samples for the
+	// coded length. Re-applied on EVERY config switch so a demote to a non-eligible rung
+	// disables it and a climb re-enables it. Legacy / non-in-band: master enable off →
+	// set_ack_suffix_fec(false) → byte-identical uncoded 13-tone ACK suffix. WB-only (NB
+	// has ack_sack_suffix_len()==0 so the hook leaves the bare base length). The CRC ctx
+	// is `this` (the ARQ controller; arq_ack_sack_crc12_cb calls this->CRC12_calc).
+	{
+		bool ack_fec_on = ack_suffix_fec_master_enabled() && ack_suffix_fec_eligible();
+		telecom_system->set_ack_suffix_fec(ack_fec_on,
+			ack_fec_on ? arq_ack_sack_crc12_cb : nullptr,
+			ack_fec_on ? (void*)this : nullptr);
+	}
+
 	// BIG-BLOCK RUNG ELECTION ON THE GEARSHIFT TRANSITION (P4 — the "not wired into
 	// the gearshift" gap, fact-doc data-flow-bigblock-arq-unit.md §16). The big-block
 	// TX switch (bigblock_send_one_block, arq_common.cc:3648) and RX carve
@@ -2686,6 +2713,30 @@ bool cl_arq_controller::inband_a3_decouple_enabled()
 			std::getenv("MERCURY_INBAND_A3_DECOUPLE"), inband_rate_feature_enabled());
 	}
 	return inband_a3_decouple_env == 1 && cumulative_ack_enabled;
+}
+
+// REVSACK Part A (revsack/design.json): the DATA-ACK suffix FEC MASTER enable. ON iff the
+// compile-time ARQ_ACK_SUFFIX_FEC_ENABLE is non-zero OR the runtime in-band default-on
+// resolves true. The in-band default-on follows the SAME cheap-miss policy the A3 decouple
+// uses (inband_cheapmiss_resolve): explicit MERCURY_ACK_SUFFIX_FEC env wins (A/B escape-
+// hatch); else DEFAULT-ON when the in-band stack is engaged (the proven-fix-ships-default-
+// on rule — coded reverse data-SACK is what holds cfg0); else off (legacy byte-identical).
+// The compile-time macro stays as a hard override path (set =1 to force on everywhere, for
+// a pinned-config A/B). The per-rung GATE is ack_suffix_fec_eligible(); this is master.
+bool cl_arq_controller::ack_suffix_fec_master_enabled()
+{
+#if ARQ_ACK_SUFFIX_FEC_ENABLE
+	return true;   // compile-time hard-on override (pinned A/B / sim force)
+#else
+	if(ack_suffix_fec_env < 0)
+	{
+		// Cache the env half once (same discipline as inband_a3_decouple_env). The
+		// negotiated/runtime half (inband engagement) is re-read live below.
+		ack_suffix_fec_env = inband_cheapmiss_resolve(
+			std::getenv("MERCURY_ACK_SUFFIX_FEC"), inband_rate_feature_enabled());
+	}
+	return ack_suffix_fec_env == 1;
+#endif
 }
 
 // Member wrapper over the pure cheap-miss DEFAULT-ON policy (the file-static
@@ -10722,34 +10773,30 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
 		return 0;
 
-	// §21.3 per-batch ACK gate: the enhanced (GF(16) FEC) ACK suffix is eligible
-	// ONLY at the robust tier — CONFIG_6+ → uncoded → byte-identical (the hard
-	// throughput-neutrality constraint). This is a THROUGHPUT gate, not a
-	// capability negotiation (the enhanced ctrl-suffix is the unconditional
-	// default at the robust tier; the CAP_SUFFIX_FEC negotiation was removed in
-	// cleanup/drop-suffix-fec-cap). The ENABLE is held off (ARQ_ACK_SUFFIX_FEC_
-	// ENABLE=0, §21.3) pending the ACK coded-window sizing work, so this stays
-	// false in 100% of cases — the predicate is wired + observable so flipping the
-	// master enable is a one-line follow-on. We set the per-call flag from the gate
-	// and clear it after TX so it can never leak to a later non-eligible ACK (the
-	// §21.1-class shared-state discipline).
+	// REVSACK Part A (revsack/design.json): the per-batch ACK FEC state is now OWNED by
+	// the config-switch enable hook (load_configuration -> set_ack_suffix_fec), which sets
+	// ack_mfsk.ack_suffix_fec_coded AND the matching ack_sack_pattern_passband_samples
+	// sizing TOGETHER (and the RX try-both gate + the gf16ra repfact). send_mfsk_ack_sack
+	// must NOT independently set/clear the flag here — doing so would desync the flag from
+	// the passband sizing the hook computed (a coded codeword TX'd into an uncoded-sized
+	// window, the exact §21.3 hazard) and would clear a flag the RX needs persistent to
+	// route the coded decode. So we only OBSERVE the hook-owned flag for the log; the flag
+	// stays as the hook set it across the whole config epoch (re-applied on every switch).
+	// Was: per-call set from (ARQ_ACK_SUFFIX_FEC_ENABLE && eligible) + clear-after-TX — the
+	// held-off scaffolding before the coded-window sizing work landed (this commit).
 	bool ack_fec_eligible = ack_suffix_fec_eligible();
-	telecom_system->ack_mfsk.ack_suffix_fec_coded =
-		(ARQ_ACK_SUFFIX_FEC_ENABLE != 0) && ack_fec_eligible;
+	bool ack_coded_now    = telecom_system->ack_mfsk.ack_suffix_fec_coded;
 	if(g_verbose && ack_fec_eligible)
 	{
-		printf("[TX-MFSK-ACK-SACK] enhanced-ACK eligible (robust tier); "
-			"enable=%d coded=%d\n", (int)(ARQ_ACK_SUFFIX_FEC_ENABLE != 0),
-			(int)telecom_system->ack_mfsk.ack_suffix_fec_coded);
+		printf("[TX-MFSK-ACK-SACK] enhanced-ACK eligible (cfg %d); master=%d coded=%d\n",
+			current_configuration, (int)ack_suffix_fec_master_enabled(),
+			(int)ack_coded_now);
 		fflush(stdout);
 	}
 
 	int nsymb = telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
 	if(nsymb <= 0 || telecom_system->ack_sack_pattern_passband_samples <= 0)
-	{
-		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 		return 0;
-	}
 
 	auto t_start = std::chrono::steady_clock::now();
 
@@ -10923,10 +10970,16 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	ptt_off();
 
-	// §21.3: clear the per-call ACK FEC flag so it can NEVER leak to a later,
-	// non-eligible ACK (e.g. after a turboshift to an OFDM config). The CONNECT
-	// suffix_fec_coded is untouched — this is the ACK-only flag.
-	telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
+	// REVSACK Part A: do NOT clear ack_suffix_fec_coded here. It is now OWNED by the
+	// config-switch enable hook (load_configuration -> set_ack_suffix_fec) and must stay
+	// CONSISTENT with the passband sizing across the whole config epoch — both TX (this
+	// path) and RX (decode_ack_sack_from_passband's coded try-both gate) read it for the
+	// rest of the epoch. A turboshift/demote to a non-eligible rung re-runs the hook,
+	// which sets the flag false + re-derives the uncoded sizing TOGETHER (no leak). The
+	// §21.3 per-call clear was correct ONLY while the flag was a per-call scaffold (enable
+	// held off); now that the coded path is live + sizing is hook-owned, clearing here
+	// would desync the RX gate from the wire for the very next ACK. (CONNECT's separate
+	// suffix_fec_coded is untouched either way.)
 
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -11338,6 +11391,42 @@ static uint16_t arq_ctrl_crc12_cb(void* ctx, const unsigned char* data, int n)
 {
 	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
 	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
+// REVSACK Part A (revsack/design.json): CRC-12 callback for the GF(16) RA DATA-ACK
+// suffix accept gate. The data-ACK's CRC convention is the WIRE form CRC12 over the
+// 5-byte [bsi || bitmap32] (send_mfsk_ack_sack:crc_input, the SAME form the uncoded RX
+// re-checks at arq_commander.cc:4105-4111) — NOT the [type:2|payload38] typed40 form
+// the generic ctrl-suffix uses. gf16ra::soft_decode hands this callback the typed40
+// bytes it built internally (pack_ctrl_typed40_msb(type=ACK_SACK=0, payload38)); for
+// ACK_SACK that is [00 | bsi:8 | bitmap:30]. We convert it back to the wire form
+// [bsi, bitmap>>24, bitmap>>16, bitmap>>8, bitmap] and compute CRC12 over THAT, so the
+// GF(16) gate validates the EXACT CRC the TX embedded (keeping the systematic-prefix
+// legacy-uncoded-decodable AND the caller's outer wire-form re-check passing by
+// construction). n must be 5; any other length is rejected (returns ~0 so the compare
+// fails). The 2-bit type is asserted == 0 (ACK_SACK) implicitly: a non-zero type would
+// shift bsi/bitmap and yield a different CRC than the TX's, so it fails the gate (the
+// type discriminator is enforced by soft_decode's expected_type arg upstream too).
+static uint16_t arq_ack_sack_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
+	if(n != 5 || data == nullptr) return (uint16_t)0xFFFFu;   // never a valid 12-bit CRC
+	// Reassemble the 40-bit typed field [type:2|payload38:38] MSB-first.
+	uint64_t typed40 = 0;
+	for(int b = 0; b < 5; b++)
+		typed40 = (typed40 << 8) | (uint64_t)data[b];
+	uint64_t payload38 = typed40 & ((1ULL << 38) - 1ULL);
+	uint8_t  bsi    = (uint8_t)((payload38 >> 30) & 0xFFu);     // [37:30]
+	uint32_t bitmap = (uint32_t)(payload38 & 0x3FFFFFFFu);      // [29:0] (30-bit)
+	// WIRE-form 5-byte [bsi || bitmap32] — byte-identical to send_mfsk_ack_sack's
+	// crc_input and the uncoded RX re-check (bits 30/31 of bitmap are 0 by the cap).
+	char wire[5];
+	wire[0] = (char)bsi;
+	wire[1] = (char)((bitmap >> 24) & 0xFF);
+	wire[2] = (char)((bitmap >> 16) & 0xFF);
+	wire[3] = (char)((bitmap >>  8) & 0xFF);
+	wire[4] = (char)( bitmap        & 0xFF);
+	return self->CRC12_calc(wire, 5) & 0x0FFF;
 }
 
 // Shared TX core: emit CONNECT base + 13-symbol ctrl-suffix for `type` with

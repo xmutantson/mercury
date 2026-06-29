@@ -69,6 +69,7 @@ cl_mfsk::cl_mfsk()
 	suffix_fec_coded = false;  // Tier-2 FEC off by default (§19) — CONNECT suffix
 	ack_suffix_fec_coded = false; // §21: ACK-suffix FEC off by default (separate
 	                              // from the CONNECT flag; held off this increment)
+	ack_suffix_fec_N = 0;         // REVSACK Part A: captured coded N (0 = off / uncoded 13)
 	connect_preamble_reps = 1; // Tier-2 base-pattern combining off by default (§20)
 	recovery_ack_reps = 1;     // RECOVERY-ACK robustness off by default
 	                           // (recovery-ack-robustness.md §4) → byte-identical
@@ -875,13 +876,20 @@ void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
                                         uint16_t crc12)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
-	int suffix_len = ack_sack_suffix_len();
+	// REVSACK Part A: loop over the CODED suffix length (coded N when ack_suffix_fec_
+	// coded, 13 uncoded) so the GF(16) RA codeword is fully laid down. Was
+	// ack_sack_suffix_len() (always 13) — with FEC on that emitted only the first 13
+	// of N tones (the systematic prefix), the wire bug §21.3 flags as the missing
+	// "coded-window sizing work". FEC-off path is byte-identical (coded len == 13).
+	int suffix_len = ack_sack_coded_suffix_len();
 	if (suffix_len == 0) return;  // NB unsupported for now
 
 	// First: generate the standard ACK base pattern (16 symbols WB)
 	generate_ack_pattern(pattern_out);
 
 	// Pack [type:2|bsi:8|bitmap:30|crc12:12] = 52 bits into per-symbol tones.
+	// pack_ack_sack_payload emits the GF(16) RA codeword (N tones) when
+	// ack_suffix_fec_coded is set, else the 13-symbol hard pack — matching suffix_len.
 	int payload_tones[MAX_ACK_SACK_SUFFIX];
 	pack_ack_sack_payload(bsi, bitmap, crc12, payload_tones);
 
