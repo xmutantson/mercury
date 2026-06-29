@@ -2404,6 +2404,10 @@ public:
   // Dead-batch streak ties to REAL batch periods + ZERO-PROGRESS (the climb-killer fix); a real
   // total loss STILL BREAKs. data-flow-robust-ofdm-adopt-flush.md §19.
   int test_inband_deadbatch_progress();
+  // VAR-FIX DEMOTE-SAFETY: a pinned OFDM lock that trickles frames but never DELIVERS a batch must
+  // become demotable (the §19 frame-keyed streak misses this). data-flow-robust-ofdm-adopt-flush.md
+  // §VAR-FIX-DEMOTE. FIX/DEFEAT/PRODUCTIVE arms on a throwaway controller; no IONOS/RF.
+  int test_inband_deliver_stall_releases_pin();
   // §19 dead-batch tick classifier (the PRODUCTION decision, called by
   // inband_try_down_ladder_on_decode_fail and driven directly by the test). Applies the streak
   // side-effects and returns: 0=PROGRESS_RESET (link alive), 1=RATE_LIMITED (same batch period),
@@ -3865,6 +3869,25 @@ public:
   bool      inband_dead_tick_timer_armed = false; // false until the first tick arms inband_dead_tick_timer
   cl_timer  inband_dead_tick_timer;           // VIRTUAL-time since the last tick (real-batch-period rate-limit)
   bool inband_terminal_break_due = false;     // set when the dead-batch streak hit the limit (caller fires BREAK)
+  // VAR-FIX DEMOTE-SAFETY (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-DEMOTE): the §19
+  // dead-batch streak RESETS on any forward DATA-FRAME progress (inband_total_data_frames_rx).
+  // A held cfg0 lock that TRICKLES some frames but can NEVER COMPLETE/DELIVER a batch (e.g. a
+  // residual SKIP-VAR / block-fail loss that drops 1+ frames per batch) keeps resetting that
+  // streak, so the terminal BREAK never fires AND the protect-the-lock guard (arq_common.cc:4797)
+  // keeps refusing demote -> the link deadlocks at partial delivery forever (the "209B then stuck"
+  // signature). This watchdog is DELIVERY-keyed (not frame-keyed): it counts consecutive dead-batch
+  // TICKS during which the DELIVERED batch id (rsp_last_delivered_batch_seq_id) did NOT advance while
+  // holding a shrunk OFDM lock. After the limit it RELEASES inband_ofdm_acq_ring_shrunk so the
+  // down-ladder can adopt a more-robust rung (a demote that DELIVERS beats a pin that can't). This
+  // is additive (it never suppresses a legitimate BREAK; it can only make a stuck pin demotable) and
+  // inband-scoped. Default limit 3; MERCURY_INBAND_DELIVER_STALL_LIMIT overrides; =0 disables.
+  int  inband_deliver_stall_count = 0;          // consecutive batch-periods (pinned) with NO delivered-batch advance
+  int  inband_deliver_stall_last_delivered = -2;// rsp_last_delivered_batch_seq_id snapshot at the last period eval (-2=unarmed)
+  int  inband_deliver_stall_limit = -1;         // cached MERCURY_INBAND_DELIVER_STALL_LIMIT (-1=unresolved)
+  bool inband_deliver_stall_timer_armed = false;// false until the first eval arms inband_deliver_stall_timer
+  cl_timer inband_deliver_stall_timer;          // one delivery-stall evaluation per real batch period
+  int  inband_deliver_stall_limit_resolve();    // resolve+cache the limit (default 3, >=0; 0=disabled)
+  void inband_deliver_stall_watchdog();          // per-batch-period: releases the pin on sustained no-delivery (incl. frame-trickle)
   int  inband_test_forced_down_delay = -1;    // TEST-ONLY: forced preamble delay for scoped decoders (-1=real acquisition)
   // TEST-ONLY: when true, emit_config_tag_passband runs its firing-decision state
   // machine (parity/latch/R-counter advance as if announced) but DOES NOT key the

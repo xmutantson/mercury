@@ -1011,6 +1011,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_deadbatch_progress();
             }
+            // VAR-FIX DEMOTE-SAFETY: a pinned OFDM lock that trickles frames but cannot DELIVER a
+            // batch must become demotable so it can never deadlock+BREAK forever on an undecodable
+            // pin. Member test on a throwaway controller. data-flow-robust-ofdm-adopt-flush.md
+            // §VAR-FIX-DEMOTE. Fast + deterministic, no IONOS/RF.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_deliver_stall_releases_pin();
+            }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
             // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.

@@ -4876,6 +4876,11 @@ int cl_arq_controller::inband_down_ladder_resync(const double* audio, int audio_
 			// §19: re-baseline the progress tracking on a resync success too.
 			inband_dead_tick_frames_snap = inband_total_data_frames_rx;
 			inband_dead_tick_timer_armed = false;
+			// VAR-FIX DEMOTE-SAFETY: a resync adopted a new config -> re-arm the delivery-stall
+			// watchdog fresh at the new rung (the adopt path re-manages the pin).
+			inband_deliver_stall_count = 0;
+			inband_deliver_stall_last_delivered = -2;
+			inband_deliver_stall_timer_armed = false;
 			return cfg;
 		}
 	}
@@ -5322,6 +5327,102 @@ int cl_arq_controller::inband_deadbatch_classify()
 	return INBAND_DB_TICK;
 }
 
+// VAR-FIX DEMOTE-SAFETY (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-DEMOTE): resolve+cache the
+// DELIVERY-stall limit. Default 3 consecutive dead-batch ticks with NO delivered-batch advance while
+// pinned -> release the OFDM-lock pin so the down-ladder can demote. 0 disables. See arq.h.
+int cl_arq_controller::inband_deliver_stall_limit_resolve()
+{
+	if(inband_deliver_stall_limit < 0)
+	{
+		int v = 3;
+		const char* e = std::getenv("MERCURY_INBAND_DELIVER_STALL_LIMIT");
+		if(e && *e) { int p = atoi(e); if(p >= 0) v = p; }
+		inband_deliver_stall_limit = v;
+	}
+	return inband_deliver_stall_limit;
+}
+
+// VAR-FIX DEMOTE-SAFETY. Called on every down-ladder decode-FAIL pass (the RX could not decode the
+// current pass at the held config). Evaluated ONCE PER REAL BATCH PERIOD (its own cl_timer): if we
+// hold a shrunk OFDM lock and the DELIVERED batch id has NOT advanced across `limit` consecutive
+// batch periods, RELEASE the pin so the protect-the-lock guard (arq_common.cc:4797) stops skipping
+// ROBUST trials and the down-ladder can demote.
+//
+// WHY DELIVERY-keyed and INDEPENDENT of the §19 dead-batch streak: the streak resets on any forward
+// DATA-FRAME progress (inband_total_data_frames_rx). The deadlock the diagnosis pins has FRAME
+// TRICKLE (the 0.997 real-preamble passes decode a few frames) but NO DELIVERY (a residual per-batch
+// loss means a batch never completes), so the streak stays 0, the terminal BREAK never fires, and the
+// pin is held forever -> infinite partial delivery ("209B then stuck"). A frame-keyed gate cannot see
+// this; a delivery-keyed one can. This is ADDITIVE: it can only make a stuck pin DEMOTABLE — it never
+// suppresses a legitimate BREAK (that path is untouched) and the down-ladder still requires a real
+// CRC/LDPC pass to ADOPT (INV-S4-1), so releasing the pin cannot adopt a guess. No-op when not pinned
+// / feature off / limit 0; legacy never sets the pin so this never fires off-path.
+void cl_arq_controller::inband_deliver_stall_watchdog()
+{
+	if(!inband_rate_feature_enabled()) return;
+	int limit = inband_deliver_stall_limit_resolve();
+	if(limit <= 0) return;                                  // disabled
+
+	// Only meaningful while we actually HOLD a shrunk OFDM lock that the guard would protect.
+	if(!(inband_ofdm_acq_ring_shrunk && is_ofdm_config(current_configuration)))
+	{
+		inband_deliver_stall_count = 0;                    // not pinned -> nothing to break out of
+		inband_deliver_stall_last_delivered = rsp_last_delivered_batch_seq_id;
+		inband_deliver_stall_timer_armed = false;
+		return;
+	}
+
+	// Arm on the first pinned eval; snapshot the delivered id and start the per-period clock.
+	if(!inband_deliver_stall_timer_armed)
+	{
+		inband_deliver_stall_last_delivered = rsp_last_delivered_batch_seq_id;
+		inband_deliver_stall_timer.start();
+		inband_deliver_stall_timer_armed = true;
+		return;
+	}
+
+	// A real DELIVERY since the last eval -> the pin is PRODUCTIVE -> reset the stall + re-arm.
+	if(rsp_last_delivered_batch_seq_id != inband_deliver_stall_last_delivered)
+	{
+		inband_deliver_stall_count = 0;
+		inband_deliver_stall_last_delivered = rsp_last_delivered_batch_seq_id;
+		inband_deliver_stall_timer.start();
+		return;
+	}
+
+	// One REAL BATCH PERIOD (same TIME basis the §19 classifier uses) — rate-limit so a burst of
+	// sub-second down-ladder-fail passes counts as ONE stall period, not many.
+	int batch_period_ms = receiving_timeout;
+	if(batch_period_ms < 3000)  batch_period_ms = 3000;
+	if(batch_period_ms > 20000) batch_period_ms = 20000;
+	if(inband_deliver_stall_timer.get_elapsed_time_ms() < batch_period_ms)
+		return;   // still inside the current period -> do not advance the stall
+
+	// A full batch period elapsed with the pin held and NO delivered-batch advance -> a stall period.
+	inband_deliver_stall_count++;
+	inband_deliver_stall_timer.start();
+	printf("[INBAND-RX] DELIVER-STALL %d/%d: held OFDM CONFIG_%d — a full batch period with NO "
+		"delivered-batch advance (last_delivered=%d, frames_rx=%ld)\n",
+		inband_deliver_stall_count, limit, current_configuration,
+		rsp_last_delivered_batch_seq_id, inband_total_data_frames_rx);
+	fflush(stdout);
+
+	if(inband_deliver_stall_count >= limit)
+	{
+		// The held config cannot DELIVER. Release the pin so the protect-the-lock guard
+		// (arq_common.cc:4797) stops skipping ROBUST trials -> the down-ladder can adopt a
+		// more-robust rung. A demote that delivers beats a pin that deadlocks (no-regress).
+		printf("[INBAND-RX] DELIVER-STALL limit reached -> RELEASE OFDM-lock pin "
+			"(inband_ofdm_acq_ring_shrunk=false) so the down-ladder may demote CONFIG_%d\n",
+			current_configuration);
+		fflush(stdout);
+		inband_ofdm_acq_ring_shrunk = false;
+		inband_deliver_stall_count = 0;
+		inband_deliver_stall_last_delivered = rsp_last_delivered_batch_seq_id;
+		inband_deliver_stall_timer_armed = false;
+	}
+}
+
 // down-ladder, and on none-pass advances the terminal-BREAK dead-batch streak. The
 // dead-batch streak reaching SESSION_DEAD_BATCHES is the ONLY remaining BREAK
 // trigger on the inband path; this routine sets inband_terminal_break_due so the
@@ -5473,6 +5574,14 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 	//   (3) ZERO progress AND >= one batch period since the last tick => a GENUINE dead batch -> tick.
 	// §19: classify this no-decode pass (PROGRESS_RESET / RATE_LIMITED / TICK) and apply the streak
 	// side-effects. The classifier is the SAME production decision the directed test drives directly.
+	// VAR-FIX DEMOTE-SAFETY: this pass reached the down-ladder with REAL signal that the window
+	// FLOOR could not decode at the held config (a genuine cannot-follow). Evaluate the
+	// delivery-stall watchdog HERE — BEFORE the §19 frame-keyed classifier — so a held cfg0 that
+	// TRICKLES frames (classifier -> PROGRESS_RESET, streak never ticks) but cannot COMPLETE a batch
+	// is still caught. The watchdog is rate-limited to one decision per real batch period and only
+	// releases the pin after `limit` consecutive periods with no delivered-batch advance.
+	inband_deliver_stall_watchdog();
+
 	int db_class = inband_deadbatch_classify();
 	if(db_class != INBAND_DB_TICK)
 		return;   // forward progress (link alive) or a sub-second turnaround re-fire -> no tick.
@@ -5496,6 +5605,10 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 		// §19: re-baseline the progress tracking so the post-BREAK session starts a fresh streak.
 		inband_dead_tick_frames_snap = inband_total_data_frames_rx;
 		inband_dead_tick_timer_armed = false;
+		// VAR-FIX DEMOTE-SAFETY: BREAK -> ROBUST_0 clears the pin downstream; re-arm fresh.
+		inband_deliver_stall_count = 0;
+		inband_deliver_stall_last_delivered = -2;
+		inband_deliver_stall_timer_armed = false;
 	}
 }
 
@@ -7118,6 +7231,10 @@ void cl_arq_controller::reset_session_state()
 	inband_total_data_frames_rx = 0;
 	inband_dead_tick_frames_snap = 0;
 	inband_dead_tick_timer_armed = false;
+	// VAR-FIX DEMOTE-SAFETY: a fresh session has delivered nothing and holds no pin to break out of.
+	inband_deliver_stall_count = 0;
+	inband_deliver_stall_last_delivered = -2;
+	inband_deliver_stall_timer_armed = false;
 	// STAGE 4c: the commander-side true-session-loss floor — a fresh session is never
 	// one batch from the BREAK floor (mirrors the RX-side reset above + the ctor init).
 	cmd_inband_session_dead_batches = 0;

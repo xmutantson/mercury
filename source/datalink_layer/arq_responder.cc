@@ -9542,6 +9542,131 @@ int cl_arq_controller::test_inband_deadbatch_progress()
 }
 
 // ============================================================================
+// VAR-FIX DEMOTE-SAFETY — --test (run-all). Directed regression for
+// inband_deliver_stall_watchdog (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-DEMOTE).
+//
+// The deadlock the diagnosis pins: a held shrunk OFDM lock that TRICKLES forward DATA frames
+// (so the §19 frame-keyed dead-batch streak keeps RESETTING and never reaches the terminal BREAK)
+// but can NEVER COMPLETE/DELIVER a batch (rsp_last_delivered_batch_seq_id frozen) -> the
+// protect-the-lock guard (arq_common.cc:4797) refuses to demote forever -> infinite partial
+// delivery. This drives the PRODUCTION watchdog through that exact state.
+//
+//   FIX arm   (limit=3): after 3 batch periods pinned with NO delivered advance (despite frame
+//                        trickle), the watchdog RELEASES inband_ofdm_acq_ring_shrunk -> demotable.
+//   DEFEAT arm (limit=0): the watchdog is disabled -> the pin is NEVER released -> the deadlock
+//                        reproduces (fail-before on the SAME binary).
+//   PRODUCTIVE: a pin that DOES deliver (delivered id advances) must NOT release (no-regress).
+// ============================================================================
+int cl_arq_controller::test_inband_deliver_stall_releases_pin()
+{
+	const char* TAG = "[TEST-INBAND-DELIVER-STALL]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what){
+		if(cond) printf("%s PASS: %s\n", TAG, what);
+		else   { printf("%s FAIL: %s\n", TAG, what); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_rate = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_rate_saved = prev_rate ? std::string(prev_rate) : std::string();
+	bool had_prev_rate = (prev_rate != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	auto build_rx = [&](cl_telecom_system*& ts_out)->cl_arq_controller*{
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE; ts->narrowband_enabled = NO;
+		rx->telecom_system = ts; rx->narrowband_enabled = NO; rx->role = RESPONDER;
+		rx->robust_enabled = YES; rx->sack_v2_enabled = true; rx->inband_rate_enabled = 1;
+		rx->load_configuration(CONFIG_0, FULL, NO);   // an OFDM config (is_ofdm_config true)
+		rx->link_status = CONNECTED; rx->connection_status = RECEIVING; rx->passive_monitor = false;
+		rx->set_receiving_timeout(3000);              // floors to the 3000 ms batch period
+		rx->inband_ofdm_acq_ring_shrunk = true;       // HOLD the pin the guard protects
+		rx->rsp_last_delivered_batch_seq_id = 7;      // some baseline delivered id
+		ts_out = ts;
+		return rx;
+	};
+
+	// Helper: spin a real cl_timer past one batch period so the watchdog's TIME gate opens.
+	auto age_one_period = [&](){ cl_timer w; w.start(); while(w.get_elapsed_time_ms() < 3050) {} };
+
+	// ---- FIX arm: frame-trickle, NO delivery -> pin released after `limit` periods ----
+	{
+		set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "3");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		// arm
+		rx->inband_deliver_stall_watchdog();
+		check(rx->inband_ofdm_acq_ring_shrunk, "FIX: pin still held immediately after arm");
+		bool released = false;
+		for(int period = 0; period < 4 && !released; period++)
+		{
+			age_one_period();
+			// frame trickle WITHOUT delivery: the §19 streak would reset, but delivered id is FROZEN
+			rx->inband_total_data_frames_rx += 2;     // some frames decoded this period
+			// rsp_last_delivered_batch_seq_id intentionally UNCHANGED (batch never completes)
+			rx->inband_deliver_stall_watchdog();
+			if(!rx->inband_ofdm_acq_ring_shrunk) released = true;
+		}
+		check(released, "FIX: pin RELEASED after sustained frame-trickle-but-no-delivery (demotable)");
+		delete rx; delete ts;
+	}
+
+	// ---- DEFEAT arm (FAIL-BEFORE): watchdog disabled -> pin NEVER released ----
+	{
+		set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "0");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_deliver_stall_watchdog();
+		bool released = false;
+		for(int period = 0; period < 6 && !released; period++)
+		{
+			age_one_period();
+			rx->inband_total_data_frames_rx += 2;
+			rx->inband_deliver_stall_watchdog();
+			if(!rx->inband_ofdm_acq_ring_shrunk) released = true;
+		}
+		check(!released, "DEFEAT (FAIL-BEFORE): disabled watchdog NEVER releases the pin (deadlock reproduces)");
+		delete rx; delete ts;
+	}
+
+	// ---- PRODUCTIVE (no-regress): a pin that DELIVERS must NOT be released ----
+	{
+		set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "3");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_deliver_stall_watchdog();
+		bool released = false;
+		for(int period = 0; period < 6 && !released; period++)
+		{
+			age_one_period();
+			rx->inband_total_data_frames_rx += 6;
+			rx->rsp_last_delivered_batch_seq_id += 1;  // a batch COMPLETES+DELIVERS each period
+			rx->inband_deliver_stall_watchdog();
+			if(!rx->inband_ofdm_acq_ring_shrunk) released = true;
+		}
+		check(!released, "PRODUCTIVE: a delivering pin is NEVER released (no-regress)");
+		delete rx; delete ts;
+	}
+
+	set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "");
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev_rate ? prev_rate_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK DELIVER — --test-inband-deliver
 // data-flow-inband-retx-epoch.md §5.  (the 785-frame decode-but-0-deliver rework)
 // ============================================================================
