@@ -1462,3 +1462,47 @@ behind (re-baseline current_expected to the freshest seen bsi) rather than perpe
 prev; (c) make the first cfg0 batch's frame-0 acquisition robust (a longer settle / a re-aired frame-0).
 (b) looks closest to the true invariant. VERDICT for §CROSS: the NACK fix SHIPS (proven necessary,
 eliminates a real amplifier, no-regress, --test green); the bsi-lag is the NEXT root, NOT this one.
+
+### §CROSS.7 CORRECTION — the §CROSS.6 "bsi-advance one-batch-lag DEADLOCK" is FALSIFIED on the stack; the binding root is the PHY ROLLING FRAME-0 ACQUISITION SEAM (VERIFIED 2026-06-29, §5 audit + firsthand cx11 trail, HEAD 7c468e6d)
+
+§CROSS.6 candidate (b) ("re-baseline current_expected to the freshest seen bsi when it falls >1 behind")
+is **NOT the binding root** and re-baseline would be INERT. A full §5 data-flow audit of
+`rsp_current_expected_batch_seq_id` + `rsp_prev_batch_seq_id` against the cx11 inband RSP trail
+(crossfix = fa8b8e92+trio) shows the bsi state machine is CORRECT at the cfg0 cross:
+
+- `current` tracks the CMD batch-for-batch: ADOPT cfg0 bsi=3, then BATCH/PREV-BUMP 3→4→5→…→12, strictly
+  +1 (INV-1 holds). It is NEVER stranded >1 behind (INV-2 holds). The §CROSS.6 reading of
+  "current store==0 / 0 delivery / permanent one-batch-lag" was from the EARLIER pre-stack run.
+- Post-stack, EVERY cfg0 batch DELIVERS (the `[RSP-V2-PREV-DELIVERED]` trail advances `last_delivered`
+  3→4→…→12 monotonically). The forward frames are correctly routed: the new mixbatch frames (bsi=N+1)
+  hit `match_current`; the retx-prefix frames (bsi=N) hit `match_prev`→PREV-RX (INV-4 holds). The
+  CMD log proves the mixbatch geometry: `[CMD-V2-MIXBATCH] TX batch: R retx bsi=N + (6-R) new bsi=N+1`.
+- So `current` is ALREADY == the freshest forward bsi every cycle. The candidate-(b) trigger
+  (`bsi ∉ {cur,prev}` AND forward-of-cur) is NEVER reached — forward frames are always in {cur,prev}.
+  A re-baseline AND-term would evaluate but never fire. NOT IMPLEMENTED (bench-claim guard: a fix for a
+  non-existent deadlock is a no-op dressed as a fix).
+
+THE ACTUAL BINDING ROOT (VERIFIED, log+source): the FIRST 1–2 OFDM data frames (seq 0, sometimes seq 1)
+of EVERY cfg0 batch are LOST to the pre-LDPC SKIP-VAR gate (telecom_system.cc, ceiling 1.60 @ cfg=0):
+- FIRST cfg0 batch (bsi=3, no prior reverse-turnaround): the RSP's first decode is **seq=1** — frame
+  seq=0 is never received; seqs 1–5 decode CLEAN (var 0.033–0.098). `rx=5/6 seqs: 1 2 3 4 5`. This is the
+  Schmidl-Cox acquisition burden on the FRESH cfg0 lock (FTR≈0.08–0.12, the doc §1 PHY note).
+- SUBSEQUENT cfg0 batches: seqs 2,3,4 decode CLEAN; seqs 0,1 hit a var spike 1.9–3.4 (>1.60) on the
+  frames arriving right after the RSP's OWN reverse-ACK turnaround (EQ/timing not re-settled). `rx=3/6
+  seqs: 2 3 4`.
+Each lost lead frame is recovered ONE BATCH LATE via the next mixbatch's retx-prefix → prev-storage →
+`[RSP-V2-PREV-DELIVERED]`. CONSEQUENCE: NO clean BATCH-DONE ever fires at cfg0 → the durable WB-cross /
+climb-confirm signal never latches (`wb_configs_seen=[]`) → throughput is capped at ONE slow
+prev-recovery cycle per batch (~14 s) → 211 B vs legacy 11339 B (cx11 WGN:40). This is the rolling
+frame-0 seam this codebase's `data-flow-inband-frame0-rolling-partial.md` (§1, §7–§13, a dozen prior
+attempts) and the tier-crossing keystone §6.5 residual "C" (seat the cfg0 forward capture ring) name.
+NOTE: the capture-ring IS already seated on adopt (`inband_finalize_ofdm_adopt_ring` runs on BOTH the
+tag-follow `arq_common.cc:4947` AND the hybrid SET_CONFIG cross `arq_responder.cc:1807/1824`), so the
+residual is the ACQUISITION marginality itself, not ring mis-seating.
+
+NEXT-ROOT (precise): make the cfg0 lead frame survive — EITHER the fresh-rung acquisition (longer
+settle / re-aired frame-0, candidate (c)) OR pace like legacy (legacy airs `frames=1` at fresh OFDM
+rungs so the seam frame IS the whole batch and completes clean; the naive `set_data_batch_size(1)`
+re-seat was falsified in frame0-doc §11 — needs a delivery-loop-aware re-frame). BOTH are a PHY /
+turnaround-settle layer, RESEARCH-GATED (CLAUDE.md §1), NOT a same-session speculative chain (§5).
+The bsi state machine is EXONERATED; this section closes the §CROSS.6 bsi-lag thread.
