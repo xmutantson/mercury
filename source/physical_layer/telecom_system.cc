@@ -118,6 +118,7 @@ cl_telecom_system::cl_telecom_system()
 	last_coarse_freq_offset=0.0;
 	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 	cfo_acq_seed_hz=0.0;  // CFO acquisition seed (data-flow-cfg0-cfo-acq-seed.md): no-seed default
+	inband_cfo_seed_active=false;  // set per-config from MERCURY_INBAND_RATE in load_configuration
 	ctrl_nBits=0;
 	ctrl_nsymb=0;
 	mfsk_ctrl_mode=false;
@@ -1179,8 +1180,9 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		if(fabs(cfo_acq_seed_hz) <= seed_bound)
 		{
 			coarse_freq_offset = cfo_acq_seed_hz;
-			if(g_verbose)
-				printf("[CFO-SEED] fresh WB-OFDM acq cfg=%d warm-started coarse=%.4f Hz from settled CFO\n",
+			static const int cfoseed_dbg = []{ const char* e=std::getenv("MERCURY_CFOSEED_DBG"); return (e&&*e)?atoi(e):0; }();
+			if(g_verbose || cfoseed_dbg)
+				printf("[CFO-SEED] APPLY cfg=%d warm-start coarse=%.4f Hz from settled CFO\n",
 					current_configuration, coarse_freq_offset);
 		}
 	}
@@ -3531,23 +3533,34 @@ skip_h_retry_point:
 				// Latch the settled NET carrier offset this frame demodulated at
 				// (coarse_freq_offset - freq_offset_measured, matching the re-mix sign at
 				// :2803) so the NEXT fresh WB-OFDM acquisition can WARM-START instead of
-				// locking COLD. The carrier offset is config-independent, so a ROBUST/MFSK
-				// success is the seed that crosses ROBUST->cfg0 (the binding next-root the
-				// EQ-refine §3.1 names). GATED behind the in-band cfg0-freshrung gate, so
-				// legacy/gate-off NEVER writes it (byte-identical). For MFSK we latch ONLY a
+				// locking COLD. The carrier offset is config-independent, so we latch it on
+				// BOTH a ROBUST/MFSK success (config 100..102 — the rung that PRECEDES the
+				// cross; this is the seed that crosses ROBUST->cfg0, the binding next-root
+				// the EQ-refine §3.1 names) AND a WB-OFDM success (refines it once on cfg0+).
+				// GATED behind the config-independent in-band flag (inband_cfo_seed_active),
+				// so legacy/off-flag NEVER writes it (byte-identical). NB is excluded
+				// (different preamble geometry, Moose skipped). For MFSK we latch ONLY a
 				// CONFIDENT wb_mfsk residual: freq_offset_measured==0 means either the
-				// estimator returned low |C|/E (no estimate) OR NB-MFSK (always 0, different
-				// geometry) — in both cases keep the prior seed rather than poison it with 0.
-				// Bound to +-1 subcarrier (the Moose clamp at :2764); a wild value cannot be
-				// a real crystal offset and must not seed the next lock.
-				if(ofdm.cfg0_freshrung_settle_enabled)
+				// estimator returned low |C|/E (no estimate) OR NB-MFSK (always 0) — in both
+				// cases keep the prior seed rather than poison it with 0. Bound to +-1
+				// subcarrier (the Moose clamp at :2764); a wild value cannot be a real
+				// crystal offset and must not seed the next lock.
+				if(inband_cfo_seed_active && !narrowband_enabled &&
+				   (is_robust_config(current_configuration) ||
+				    (is_ofdm_config(current_configuration) && current_configuration <= CONFIG_6)))
 				{
 					double seed_candidate = coarse_freq_offset - freq_offset_measured;
 					double seed_bound = bandwidth / (double)data_container.Nc; // 1 subcarrier (~47 Hz WB)
 					bool seed_ok = (fabs(seed_candidate) <= seed_bound);
 					bool mfsk_confident = (M != MOD_MFSK) || (freq_offset_measured != 0.0);
 					if(seed_ok && mfsk_confident)
+					{
 						cfo_acq_seed_hz = seed_candidate;
+						static const int cfoseed_dbg = []{ const char* e=std::getenv("MERCURY_CFOSEED_DBG"); return (e&&*e)?atoi(e):0; }();
+						if(cfoseed_dbg)
+							printf("[CFO-SEED] LATCH cfg=%d seed=%.4f Hz (coarse=%.4f freq_meas=%.4f M=%.0f)\n",
+								current_configuration, cfo_acq_seed_hz, coarse_freq_offset, freq_offset_measured, M);
+					}
 				}
 
 				if(M != MOD_MFSK)
@@ -5845,6 +5858,7 @@ void cl_telecom_system::init()
 	receive_stats.signal_stregth_dbm=-999;
 	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 	cfo_acq_seed_hz=0.0;  // CFO acq seed (data-flow-cfg0-cfo-acq-seed.md): a full init() is a fresh session — no carrier known yet. (NOT reset in load_configuration: the seed survives a config change, §3.2.)
+	inband_cfo_seed_active=false;  // re-set per-config in load_configuration
 
 }
 
@@ -11098,6 +11112,12 @@ void cl_telecom_system::load_configuration(int configuration)
 		bool inband_on = (_ib && *_ib && atoi(_ib) != 0);
 		ofdm.cfg0_freshrung_settle_enabled =
 			inband_on && (configuration >= CONFIG_0 && configuration <= CONFIG_6);
+		// CFO ACQUISITION SEED (data-flow-cfg0-cfo-acq-seed.md): a CONFIG-INDEPENDENT
+		// in-band flag — the seed must LATCH at the ROBUST rung (config 100..102, OUTSIDE
+		// the cfg0..6 freshrung gate above) so the settled carrier crosses ROBUST->cfg0.
+		// Off-flag (legacy) this stays false => the seed producer/consumer never run =>
+		// byte-identical.
+		inband_cfo_seed_active = inband_on;
 	}
 
 	// feat/fade-tinterp FADE TIER GATE (default-OFF, byte-identical when unset).

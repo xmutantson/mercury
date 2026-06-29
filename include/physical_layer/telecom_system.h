@@ -183,9 +183,17 @@ public:
 	// acquisition can WARM-START coarse_freq_offset from it. Written on a confident
 	// OFDM or ROBUST/MFSK success (the MFSK wb_mfsk mini-Moose is the cross seed);
 	// read only to seed the cold fresh-OFDM trial-0; scrubbed with the poison-CFO
-	// reset. GATED behind ofdm.cfg0_freshrung_settle_enabled (in-band CONFIG_0..6)
-	// so legacy/gate-off is byte-identical. Reset in init()/ctor only.
+	// reset. The PRODUCER is gated on inband_cfo_seed_active (config-independent, so it
+	// latches at the ROBUST rung that precedes the cross); the CONSUMER is gated on
+	// ofdm.cfg0_freshrung_settle_enabled (CONFIG_0..6 only — where the cold seam is).
+	// legacy/off-flag is byte-identical. Reset in init()/ctor only.
 	double cfo_acq_seed_hz;
+
+	// CFO ACQUISITION SEED — config-INDEPENDENT in-band flag (set = MERCURY_INBAND_RATE
+	// in load_configuration). Gates the seed PRODUCER so the settled carrier is latched
+	// at the ROBUST rung (config 100..102, outside the cfg0..6 freshrung gate) and
+	// crosses ROBUST->cfg0. Off-flag (legacy) false => producer never runs.
+	bool inband_cfo_seed_active;
 
 	// MFSK short control frames: punctured LDPC for ACK/control messages
 	int ctrl_nBits;    // interleaved bits to transmit for ctrl frames (0 = no puncturing)
