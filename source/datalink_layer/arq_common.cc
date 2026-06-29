@@ -5524,6 +5524,19 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 		return;
 	}
 
+	// VAR-FIX DEMOTE-SAFETY (evaluated HERE, before the no-attempt guard below): we passed the
+	// energy gate (real signal, peak>=0.05) and did NOT resync (winner<0). This INCLUDES the
+	// deadlock case where the protect-the-lock guard (arq_common.cc:4797) SKIPPED every ROBUST
+	// trial while holding a shrunk OFDM lock -> inband_down_decode_attempts==0 -> the
+	// no-attempt guard below would return EARLY, never reaching the §19 classifier or a watchdog
+	// placed after it. That early return is exactly what makes the held cfg0 pin undemotable forever
+	// (observed live: 129 'skip ROBUST trial' passes, 0 demotes, partial delivery, no BREAK). The
+	// delivery-stall watchdog is rate-limited to ONE decision per real batch period and only releases
+	// the pin after `limit` consecutive periods with NO delivered-batch advance, so evaluating it on
+	// every real-signal down-ladder-fail pass is safe (a productive pin re-arms; a non-pinned RX is a
+	// no-op). This is the no-regress backstop the frame-keyed §19 streak structurally cannot provide.
+	inband_deliver_stall_watchdog();
+
 	// NO-REAL-ATTEMPT GUARD (data-flow-inband-downladder.md §1/§5.1/§5.2): if EVERY trial
 	// decoder's per-decoder prescan found silence, inband_down_ladder_resync made ZERO real
 	// decode attempts (inband_down_decode_attempts==0). That is a no-signal inter-frame pass,
@@ -5574,14 +5587,8 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 	//   (3) ZERO progress AND >= one batch period since the last tick => a GENUINE dead batch -> tick.
 	// §19: classify this no-decode pass (PROGRESS_RESET / RATE_LIMITED / TICK) and apply the streak
 	// side-effects. The classifier is the SAME production decision the directed test drives directly.
-	// VAR-FIX DEMOTE-SAFETY: this pass reached the down-ladder with REAL signal that the window
-	// FLOOR could not decode at the held config (a genuine cannot-follow). Evaluate the
-	// delivery-stall watchdog HERE — BEFORE the §19 frame-keyed classifier — so a held cfg0 that
-	// TRICKLES frames (classifier -> PROGRESS_RESET, streak never ticks) but cannot COMPLETE a batch
-	// is still caught. The watchdog is rate-limited to one decision per real batch period and only
-	// releases the pin after `limit` consecutive periods with no delivered-batch advance.
-	inband_deliver_stall_watchdog();
-
+	// (VAR-FIX DEMOTE-SAFETY watchdog already evaluated above, before the no-attempt guard, so the
+	// guard-skip deadlock path — which returns before this point — is still covered.)
 	int db_class = inband_deadbatch_classify();
 	if(db_class != INBAND_DB_TICK)
 		return;   // forward progress (link alive) or a sub-second turnaround re-fire -> no tick.
