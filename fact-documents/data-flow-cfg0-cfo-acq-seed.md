@@ -182,6 +182,37 @@ change can ripple, we still re-run cfg16 clean BER and confirm no regression vs
 legacy (expect byte-identical — the gate is OFF for cfg16, and the seed member is
 never read there).
 
+## §6.1 BENCH-DRIVEN CORRECTIONS (faithful real-audio snd-aloop A/B)
+
+The snd-aloop substrate is a clean DIGITAL loopback + Channel.process() — it has
+NO native carrier offset (crystal/clock mismatch). Three bench findings reshaped
+the fix:
+
+1. At WGN:40 the cfg0 fresh lock is NOT marginal (frame-0 var ≈ 0.033, well below
+   1.60) — the cold-lock seam (FTR≈0.2, var 1.9-3.4) does NOT manifest without a
+   real carrier offset. The substrate cannot reproduce the seam; injected static
+   --cfo-hz ≥ 6 breaks the ROBUST connect/climb UPSTREAM of cfg0 instead of
+   isolating the seam. So the bench CONFIRMS mechanism + no-harm; the BYTE win for
+   this PHY acquisition fix must be confirmed on real RF/IONOS (genuine ~11-24 Hz
+   per-frame residual after coarse sync), where the FTR≈0.2 symptom was observed.
+
+2. The PRODUCER must latch at the ROBUST rung (config 100..102) — the original
+   gate on cfg0_freshrung_settle_enabled (cfg0..6) never fired at robust, so the
+   CROSS seed (the whole point) was a no-op (MERCURY_CFOSEED_DBG: all LATCH at
+   cfg=0). Fixed with the config-independent inband_cfo_seed_active flag. ALSO:
+   init() is the per-config REINIT (not a fresh-session reset) and was wiping the
+   seed/flag on the cross — fixed by not resetting them in init().
+
+3. A cfg0+ OFDM RE-LATCH is SELF-REFERENTIAL (seed = coarse(=prior seed) -
+   freq_meas) and RANDOM-WALKS on the cfg0 Moose noise, drifting past the apply
+   floor and ADDING BREAKS on a clean substrate (MEASURED: fix worse than baseline,
+   rx 97 vs 209, brk 3.5 vs 0, paired). FIX: latch ONLY at robust (stable,
+   confidence-gated, one-shot per cross); never re-latch from cfg0's noisy estimate.
+   Combined with the apply-floor (|seed| > ofdm.freq_offset_ignore_limit = 0.1 Hz),
+   the fix is a TRUE no-op on a no-CFO substrate (robust seed ~0.01 Hz < floor ⇒
+   never applied ⇒ coarse stays 0 = cold = byte-identical) and engages only on a
+   genuine carrier offset.
+
 ## §6 FAIL-BEFORE / PASS-AFTER
 
 - Unit (`--test`, M=0): a synthetic fresh cfg0 acquisition with an injected carrier

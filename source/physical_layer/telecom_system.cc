@@ -3556,14 +3556,26 @@ skip_h_retry_point:
 				// cases keep the prior seed rather than poison it with 0. Bound to +-1
 				// subcarrier (the Moose clamp at :2764); a wild value cannot be a real
 				// crystal offset and must not seed the next lock.
+				// LATCH ONLY at the ROBUST rung (config 100..102) — NOT at cfg0+ OFDM.
+				// CORRECTION (bench-verified, data-flow-cfg0-cfo-acq-seed.md §6.1): a cfg0
+				// OFDM re-latch is SELF-REFERENTIAL — it computes seed = coarse(=the prior
+				// seed) - freq_meas, and the cfg0 Moose freq_meas carries noise, so the seed
+				// RANDOM-WALKS frame-to-frame and on a clean substrate (no real CFO) DRIFTS
+				// past the 0.1 Hz apply-floor → it then perturbs the (already-strong) lock
+				// and ADDS BREAKS (MEASURED: fix worse than baseline at cfo=0 until this was
+				// restricted to robust-only). The ROBUST mini-Moose (carrier_frequency_sync_
+				// wb_mfsk) is confidence-gated and measured against a KNOWN preamble, so it is
+				// a STABLE absolute carrier estimate. The seed's job is purely the COLD CROSS
+				// warm-start (one-shot at ROBUST->cfg0), not ongoing intra-cfg0 tracking —
+				// that is owned by the per-frame Moose + freq_offset_of_last_decoded_message.
+				// So latch once, stably, at robust; never re-latch from cfg0's own noisy estimate.
 				if(inband_cfo_seed_active && !narrowband_enabled &&
-				   (is_robust_config(current_configuration) ||
-				    (is_ofdm_config(current_configuration) && current_configuration <= CONFIG_6)))
+				   is_robust_config(current_configuration))
 				{
 					double seed_candidate = coarse_freq_offset - freq_offset_measured;
 					double seed_bound = bandwidth / (double)data_container.Nc; // 1 subcarrier (~47 Hz WB)
 					bool seed_ok = (fabs(seed_candidate) <= seed_bound);
-					bool mfsk_confident = (M != MOD_MFSK) || (freq_offset_measured != 0.0);
+					bool mfsk_confident = (freq_offset_measured != 0.0); // robust path is MFSK; 0 = low-confidence wb_mfsk OR NB
 					if(seed_ok && mfsk_confident)
 					{
 						cfo_acq_seed_hz = seed_candidate;
