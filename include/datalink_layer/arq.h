@@ -3888,6 +3888,31 @@ public:
   cl_timer inband_deliver_stall_timer;          // one delivery-stall evaluation per real batch period
   int  inband_deliver_stall_limit_resolve();    // resolve+cache the limit (default 3, >=0; 0=disabled)
   void inband_deliver_stall_watchdog();          // per-batch-period: releases the pin on sustained no-delivery (incl. frame-trickle)
+  // §VAR-FIX-2 RX FORWARD-SEARCH GATE (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2). The in-band RX
+  // storms the forward-preamble coarse search during the RSP's OWN reverse-ACK turnaround gap (no forward
+  // burst is airing), false-locking the GI plateau at coarse metric ~0.50 -> SKIP-VAR (the measured 607
+  // SKIP-VAR / 56 OFDM-OK at WGN:40). Legacy avoids it via the lockstep SET_CONFIG handshake (its RX only
+  // searches inside forward-burst windows). These two members latch a "we just keyed a reverse ACK; no
+  // forward burst is expected for ~the CMD turnaround" suppress window. SET by the three reverse-ACK send
+  // sites (send_ack_pattern / send_mfsk_ack_sack / send_mfsk_compact_confirm) under
+  // inband_rate_feature_enabled(); the OFDM FAIL anti-spin (arq_common.cc:13846) consults
+  // inband_revack_rxgate_ftr() to RAISE frames_to_read across the gap (search suppressed) instead of the
+  // 8/2-sym quick-retry (the storm cadence). One-shot: the timer simply ages out of the budget. Budget 0
+  // (never set) when the feature is off -> the gate is INACTIVE -> legacy byte-identical.
+  cl_timer inband_revack_turnaround_timer;       // VIRTUAL/wall time since the last in-band reverse ACK key-up
+  int  inband_revack_turnaround_budget_ms = 0;   // CMD-turnaround suppress budget (0 = inactive/never-set)
+  // Arm the suppress window after an in-band reverse ACK/SACK TX. Budget = the CMD turnaround estimate
+  // (CMD decode + process + PTT before its next forward preamble can land). No-op when the feature is off.
+  void inband_arm_revack_turnaround_window();
+  // The §VAR-FIX-2 gate decision (the EXACT logic the OFDM FAIL anti-spin calls, also driven by the
+  // directed regression). Given the default anti-spin ftr (8/2), the per-symbol period, the ring depth, and
+  // whether THIS pass decoded a real forward frame, return the ftr to actually arm: the default UNLESS the
+  // suppress window is active AND no real frame decoded, in which case the remaining gap in symbols (capped
+  // at buffer_Nsymb - frame_symb so the real burst cannot scroll off the ring). Returns the input default
+  // when the feature is off / the window has aged out -> legacy/inband-steady byte-identical.
+  int  inband_revack_rxgate_ftr(int default_ftr, bool frame_decoded_this_pass);
+  bool inband_revack_rxgate_defeat();            // A/B FAIL-BEFORE: MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1
+  int  test_inband_revack_rxgate();              // directed regression (--test-inband-revack-rxgate)
   int  inband_test_forced_down_delay = -1;    // TEST-ONLY: forced preamble delay for scoped decoders (-1=real acquisition)
   // TEST-ONLY: when true, emit_config_tag_passband runs its firing-decision state
   // machine (parity/latch/R-counter advance as if announced) but DOES NOT key the

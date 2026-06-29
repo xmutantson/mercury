@@ -5423,6 +5423,81 @@ void cl_arq_controller::inband_deliver_stall_watchdog()
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// §VAR-FIX-2 — RX FORWARD-SEARCH GATE (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2)
+//
+// The in-band RX storms the forward-preamble coarse search during the RSP's OWN reverse-ACK turnaround gap
+// (the CMD is NOT airing a forward burst — it is detecting/processing/keying its next TX). The GI/data
+// self-correlation of the idle/echo region peaks at coarse metric ~0.50 -> the FFT/pilot window anchors a
+// data region -> noise_variance_estimate 63-81 -> SKIP-VAR. The OFDM FAIL anti-spin re-arms frames_to_read
+// to the 8/2-sym quick-retry on EVERY such plateau fail, so a fresh coarse search fires every ~8 sym across
+// the whole multi-second gap (the measured 607 SKIP-VAR / 56 OFDM-OK at WGN:40). Legacy never hits this: its
+// coordinated SET_CONFIG handshake re-acquires in LOCKSTEP, so its RX only searches inside forward-burst
+// windows. This gate gives the in-band RX the SAME discipline: after a reverse ACK we know no forward burst
+// is expected for ~the CMD turnaround, so we SUPPRESS the search (raise frames_to_read to span the gap) and
+// re-open it at the forward-burst window. Purely TIMING-gated — NOT coarse-metric (the refuted §VAR-FIX Fix A,
+// a real CFO-degraded preamble shares the 0.43-0.61 band). Inband-scoped; off -> never armed -> byte-identical.
+// ─────────────────────────────────────────────────────────────────────────────
+bool cl_arq_controller::inband_revack_rxgate_defeat()
+{
+	const char* e = std::getenv("MERCURY_INBAND_REVACK_RXGATE_DEFEAT");
+	return (e && *e && atoi(e) != 0);
+}
+
+void cl_arq_controller::inband_arm_revack_turnaround_window()
+{
+	if(!inband_rate_feature_enabled()) { inband_revack_turnaround_budget_ms = 0; return; }
+	// CMD turnaround estimate (RSP ACK done -> CMD's next forward preamble can land): the CMD must decode
+	// the ACK (RSP_DECODE_MARGIN_MS), process/encode (~one msg_time), and key up (ptt_on+ptt_off). This is a
+	// CONSERVATIVE gap-before-burst — NOT the whole receiving_timeout, which also covers the burst airtime.
+	// The forward burst, when it lands, DECODES on the OK path (which bypasses this gate), so over-estimating
+	// the gap only delays a doomed plateau retry, never a real frame. Capped on consumption by the ring depth.
+	int budget = RSP_DECODE_MARGIN_MS + ptt_on_delay_ms + ptt_off_delay_ms + message_transmission_time_ms;
+	if(budget < 0) budget = 0;
+	inband_revack_turnaround_budget_ms = budget;
+	inband_revack_turnaround_timer.start();
+	printf("[INBAND-RX] REVACK-RXGATE: armed turnaround suppress window budget=%dms (CONFIG_%d) — forward "
+		"coarse search suppressed until the forward-burst window opens\n",
+		budget, current_configuration);
+	fflush(stdout);
+}
+
+int cl_arq_controller::inband_revack_rxgate_ftr(int default_ftr, bool frame_decoded_this_pass)
+{
+	// Inactive: feature off, never-armed (budget 0), A/B defeat, or a real frame decoded this pass (the OK
+	// path owns its own re-arm). Steady forward-burst RX takes this branch -> byte-identical anti-spin.
+	if(!inband_rate_feature_enabled()) return default_ftr;
+	if(inband_revack_rxgate_defeat())  return default_ftr;
+	if(inband_revack_turnaround_budget_ms <= 0) return default_ftr;
+	if(frame_decoded_this_pass) return default_ftr;
+	if(telecom_system == NULL) return default_ftr;
+
+	int elapsed = inband_revack_turnaround_timer.get_elapsed_time_ms();
+	int remaining_ms = inband_revack_turnaround_budget_ms - elapsed;
+	if(remaining_ms <= 0) return default_ftr;   // window aged out -> resume normal search cadence
+
+	int sym = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
+	if(sym <= 0) return default_ftr;
+	// remaining gap in symbols (the capture thread decrements frames_to_read once per symbol_period of audio,
+	// so this many symbols of suppression == remaining_ms of real/virtual channel time).
+	long remaining_syms = ((long)remaining_ms * 48000L) / 1000L / (long)sym;
+	if(remaining_syms < default_ftr) return default_ftr;   // nearly closed: don't shorten below the anti-spin
+
+	// CAP so the real forward burst (preamble + frame) cannot scroll off the ring during the wait: the
+	// snapshot is the most-recent signal_period samples, so as long as we re-open within (buffer_Nsymb -
+	// frame_symb) symbols the freshest preamble + its frame are still in-window.
+	int frame_symb = telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+	long cap = (long)telecom_system->data_container.buffer_Nsymb.load() - (long)frame_symb;
+	if(cap < (long)default_ftr) cap = default_ftr;   // degenerate geometry: fall back to the anti-spin
+	if(remaining_syms > cap) remaining_syms = cap;
+
+	printf("[INBAND-RX] REVACK-RXGATE: SUPPRESS forward search — gap remaining=%dms -> ftr %d->%ld sym "
+		"(CONFIG_%d, cap=%ld); resume at the forward-burst window\n",
+		remaining_ms, default_ftr, remaining_syms, current_configuration, cap);
+	fflush(stdout);
+	return (int)remaining_syms;
+}
+
 // down-ladder, and on none-pass advances the terminal-BREAK dead-batch streak. The
 // dead-batch streak reaching SESSION_DEAD_BATCHES is the ONLY remaining BREAK
 // trigger on the inband path; this routine sets inband_terminal_break_due so the
@@ -9827,6 +9902,10 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
+	// §VAR-FIX-2: arm the reverse-ACK turnaround suppress window so the in-band RX does not storm the
+	// forward-preamble coarse search across the CMD turnaround gap that follows this ACK (no-op when off).
+	inband_arm_revack_turnaround_window();
+
 	printf("[TX-ACK-PAT] Done at t=%dms, flushed capture buffer, nUnder reset, ftr=%d\n", (int)ack_turnaround_timer.get_elapsed_time_ms(), telecom_system->data_container.frames_to_read.load());
 	mtl::log_event_kv("rsp_post_ack_flush_done", "ftr=%d", telecom_system->data_container.frames_to_read.load());
 	fflush(stdout);
@@ -9991,6 +10070,9 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 		// MULTI-CW WINDOW FIX (fact-doc §17): block-span the window at the bigblock rung.
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
+
+	// §VAR-FIX-2: arm the reverse-ACK turnaround suppress window (no-op when the feature is off).
+	inband_arm_revack_turnaround_window();
 
 	printf("[TX-ACK-SNR] Done, flushed capture buffer, ftr=%d\n", telecom_system->data_container.frames_to_read.load());
 	fflush(stdout);
@@ -10618,6 +10700,9 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
 
+	// §VAR-FIX-2: arm the reverse-ACK turnaround suppress window (no-op when the feature is off).
+	inband_arm_revack_turnaround_window();
+
 	printf("[TX-MFSK-ACK-SACK] Done, flushed capture buffer, ftr=%d\n",
 		telecom_system->data_container.frames_to_read.load());
 	fflush(stdout);
@@ -10783,6 +10868,9 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_i
 		             + telecom_system->data_container.Nsymb;
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
+
+	// §VAR-FIX-2: arm the reverse-ACK turnaround suppress window (no-op when the feature is off).
+	inband_arm_revack_turnaround_window();
 
 	ptt_off_delay_timer.start();
 	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
@@ -13844,6 +13932,13 @@ void cl_arq_controller::receive()
 				// Skip when ftr==0 (the same-mod opportunistic-scan immediate-rescan path,
 				// passive_monitor only) so that fast-scan semantics are unchanged.
 				if(ftr > 0) ftr = bigblock_block_ftr_or(ftr);
+				// §VAR-FIX-2 RX FORWARD-SEARCH GATE: if we are inside the in-band reverse-ACK turnaround
+				// gap (no forward burst expected) and this pass decoded NO real frame, SUPPRESS the search
+				// by spanning the remaining gap instead of the 8/2-sym quick-retry (the storm cadence).
+				// inband-only + active-window + no-frame-fail gated; off/steady -> returns ftr unchanged.
+				if(ftr > 0)
+					ftr = inband_revack_rxgate_ftr(ftr,
+						received_message_stats.message_decoded == YES);
 				telecom_system->data_container.frames_to_read = ftr;
 				telecom_system->data_container.nUnder_processing_events = 0;
 				// === DIAG: OFDM anti-spin ftr trace ===

@@ -9667,6 +9667,140 @@ int cl_arq_controller::test_inband_deliver_stall_releases_pin()
 }
 
 // ============================================================================
+// §VAR-FIX-2 RX FORWARD-SEARCH GATE — --test-inband-revack-rxgate
+// data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2 / §VF2.4
+// ============================================================================
+//
+// The in-band RX stormed the forward-preamble coarse search during the RSP's OWN reverse-ACK turnaround
+// gap (the 0.50 GI plateau -> SKIP-VAR; 607 SKIP-VAR / 56 OFDM-OK at WGN:40). The fix arms a turnaround
+// suppress window on each reverse-ACK key-up and, in the OFDM FAIL anti-spin, RAISES frames_to_read to span
+// the gap (search suppressed) instead of the 8-sym quick-retry, capped so the real burst stays in-ring.
+//
+// This drives the PRODUCTION gate decision inband_revack_rxgate_ftr() — the EXACT helper the anti-spin
+// calls — with production state. It counts the simulated forward SEARCHES (= the number of times ftr fell
+// back to the 8-sym storm cadence) over the gap and asserts:
+//   FIX (gate active):   N back-to-back PLATEAU fails -> ftr raised each time -> ~0 searches over the gap.
+//   DEFEAT (FAIL-BEFORE, MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1, same binary): ftr stays 8 -> N searches.
+//   ACQUIRE (no-regress): a pass that DECODES a real frame bypasses the gate (the OK path owns ftr) ->
+//                         the real forward burst is NEVER starved.
+//   COLD (legacy/inband-off): no window armed -> ftr stays 8 -> byte-identical anti-spin.
+int cl_arq_controller::test_inband_revack_rxgate()
+{
+	const char* TAG = "[TEST-INBAND-REVACK-RXGATE]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what){
+		if(cond) printf("%s PASS: %s\n", TAG, what);
+		else   { printf("%s FAIL: %s\n", TAG, what); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_rate = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_rate_saved = prev_rate ? std::string(prev_rate) : std::string();
+	bool had_prev_rate = (prev_rate != NULL);
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	auto build_rx = [&](cl_telecom_system*& ts_out)->cl_arq_controller*{
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE; ts->narrowband_enabled = NO;
+		rx->telecom_system = ts; rx->narrowband_enabled = NO; rx->role = RESPONDER;
+		rx->robust_enabled = YES; rx->sack_v2_enabled = true; rx->inband_rate_enabled = 1;
+		// load CONFIG_1 (a real OFDM rung) so the PHY geometry (Nofdm/buffer_Nsymb) is actually
+		// populated: load_configuration is a NO-OP when the requested config == the ctor-default
+		// current_configuration (CONFIG_0), which would leave the geometry zeroed. The gate is
+		// config-agnostic (any OFDM rung), so CONFIG_1 exercises it identically to a cfg0 turnaround.
+		rx->load_configuration(CONFIG_1, FULL, NO);   // an OFDM config with real geometry
+		rx->link_status = CONNECTED; rx->connection_status = RECEIVING; rx->passive_monitor = false;
+		// production-ish turnaround geometry so the budget is a few hundred ms (> several frame periods)
+		rx->message_transmission_time_ms = 1200;   // a long frame
+		rx->ptt_on_delay_ms = 100; rx->ptt_off_delay_ms = 200;
+		ts_out = ts;
+		return rx;
+	};
+
+	// The default anti-spin ftr the storm uses (WB OFDM): 8.
+	const int DEFAULT_FTR = 8;
+
+	// ---- FIX arm: armed window + plateau fails -> ftr raised every pass (search suppressed) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 1;
+		rx->inband_arm_revack_turnaround_window();
+		check(rx->inband_revack_turnaround_budget_ms > 0, "FIX: turnaround suppress window armed (budget>0)");
+		int searches = 0;
+		for(int pass = 0; pass < 40; pass++)
+		{
+			int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, /*frame_decoded_this_pass=*/false);
+			if(ftr <= DEFAULT_FTR) searches++;   // fell back to the storm cadence = a forward search fired
+		}
+		check(searches <= 1, "FIX: forward search SUPPRESSED across the gap (storm count ~0)");
+		delete rx; delete ts;
+	}
+
+	// ---- DEFEAT arm (FAIL-BEFORE): gate disabled -> ftr stays 8 -> a search every pass (the storm) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "1");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 1;
+		rx->inband_arm_revack_turnaround_window();
+		int searches = 0;
+		for(int pass = 0; pass < 40; pass++)
+		{
+			int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, false);
+			if(ftr <= DEFAULT_FTR) searches++;
+		}
+		check(searches >= 35, "DEFEAT (FAIL-BEFORE): ftr stays 8 -> a forward search every pass (storm reproduced)");
+		delete rx; delete ts;
+	}
+
+	// ---- ACQUIRE (no-regress): a real decoded frame mid-gap bypasses the gate (burst not starved) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 1;
+		rx->inband_arm_revack_turnaround_window();
+		int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, /*frame_decoded_this_pass=*/true);
+		check(ftr == DEFAULT_FTR, "ACQUIRE: a real forward frame bypasses the gate (OK path owns ftr) — burst not starved");
+		delete rx; delete ts;
+	}
+
+	// ---- COLD (legacy/inband-off): no window -> ftr stays 8 (byte-identical anti-spin) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 0;                       // feature OFF
+		rx->inband_arm_revack_turnaround_window();         // no-op when off (budget stays 0)
+		int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, false);
+		check(ftr == DEFAULT_FTR && rx->inband_revack_turnaround_budget_ms == 0,
+			"COLD: feature off -> no suppress window, ftr unchanged (legacy byte-identical)");
+		delete rx; delete ts;
+	}
+
+	set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev_rate ? prev_rate_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK DELIVER — --test-inband-deliver
 // data-flow-inband-retx-epoch.md §5.  (the 785-frame decode-but-0-deliver rework)
 // ============================================================================

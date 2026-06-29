@@ -1123,3 +1123,101 @@ RELEASES `inband_ofdm_acq_ring_shrunk` so the down-ladder can demote a config th
   id keeps advancing (2→3→4→5), so the watchdog correctly re-arms and never releases. It is the backstop for a
   TRUE hard pin (zero delivery ≥3 periods), proven by test_inband_deliver_stall_releases_pin (FIX/DEFEAT/
   PRODUCTIVE arms). Additive, inband-scoped, legacy byte-identical. Full --test 68/0.
+
+---
+
+## §VAR-FIX-2 — RX FORWARD-SEARCH GATE: suppress the in-band coarse search during the reverse-ACK turnaround gap (implemented 2026-06-28)
+
+§VAR-FIX VERIFIED the root (the in-band RX storms the forward-preamble coarse search during the RSP's own
+reverse-ACK turnaround gap) and REFUTED a coarse-metric floor. §VAR-FIX-2 is the implemented gate: the RX
+forward search is now suppressed for the turnaround gap and resumes at the forward-burst window — the
+lockstep discipline legacy has.
+
+### §VF2.1 The mechanism the storm rides (VERIFIED — code read)
+
+`frames_to_read` (ftr) IS the forward-burst-window gate. The capture thread (audioio.c:1455) decrements ftr
+by 1 per captured symbol_period; `cl_arq_controller::receive()` (arq_common.cc:12386) stages a FRESH snapshot
+and runs the coarse search ONLY when `ftr == 0` (when `ftr != 0` it early-exits at :13950 — no snapshot, no
+search, no SKIP-VAR). So a positive ftr SUPPRESSES the search for ftr symbols; ftr==0 OPENS the window.
+
+The bug is two coupled re-arms that make ftr==0 dwell across the multi-second turnaround:
+1. The post-ACK re-arm (`send_ack_pattern` arq_common.cc:9827, `send_mfsk_ack_sack` :10618) sets
+   `frames_to_read = rx_frame + 10` (~58 sym ≈ 0.35 s) — far SHORTER than the CMD turnaround gap (CMD
+   detect+process+PTT+re-air = seconds at the marginal cfg0 rung).
+2. After that short window expires (ftr→0), the OFDM FAIL anti-spin (the single write site at
+   arq_common.cc:13846-13847, `if(ftr>0) ftr=bigblock_block_ftr_or(ftr); frames_to_read = ftr;`) re-arms
+   ftr to the 8/2-symbol quick-retry on EVERY plateau fail → a fresh coarse search every ~8 sym (~49 ms)
+   → ~hundreds of plateau searches over the gap (the measured 607 SKIP-VAR / 56 OFDM-OK).
+
+Legacy NEVER hits this: its coordinated SET_CONFIG handshake re-acquires in LOCKSTEP, so the RX only searches
+inside forward-burst windows (the 8-sym anti-spin only fires there). The UNILATERAL in-band reverse-ACK has
+no such barrier — the RSP's own turnaround gap is mis-treated as a forward-burst window.
+
+### §VF2.2 The fix (inband-scoped, two coordinated parts in arq_common.cc)
+
+- **(A) Latch a turnaround-suppress deadline when the in-band reverse ACK/SACK is sent.** New members
+  `cl_timer inband_revack_turnaround_timer` + `int inband_revack_turnaround_budget_ms`. Set in
+  `send_ack_pattern`, `send_mfsk_ack_sack`, `send_mfsk_compact_confirm` AFTER the existing post-ACK flush/
+  ftr re-arm, GATED `inband_rate_feature_enabled()`. Budget = the CMD turnaround estimate (CMD decode +
+  process + PTT before its next forward preamble can land):
+  `RSP_DECODE_MARGIN_MS + ptt_on_delay_ms + ptt_off_delay_ms + message_transmission_time_ms`. This is a
+  CONSERVATIVE gap-before-burst (NOT the whole receiving_timeout, which includes the burst airtime).
+- **(B) Gate the OFDM FAIL anti-spin re-arm to the turnaround gap.** At the single ftr write site
+  (arq_common.cc:13846), when `inband_rate_feature_enabled()` AND the suppress deadline is still in effect
+  (`inband_revack_turnaround_timer.get_elapsed_time_ms() < budget`) AND this pass found NO real forward
+  frame (`received_message_stats.message_decoded != YES` — a plateau/no-preamble fail, NOT a decoded frame),
+  RAISE ftr to span the REMAINING gap in symbols (`remaining_ms * 48000 / 1000 / symbol_period`) instead of
+  8/2. CAP ftr at `buffer_Nsymb - frame_symb` so the real burst CANNOT scroll off the ring during the wait.
+  The search is thus suppressed once for the gap remainder and re-opens at the forward-burst window.
+
+Why this does NOT regress acquisition of the REAL burst (the load-bearing constraint):
+- A real forward burst that arrives mid-gap and DECODES never reaches the anti-spin (the OK path re-arms ftr
+  itself at :13037/:13129); the gate is on the FAIL path only.
+- A real preamble-first frame (`frame_data_missing`, the in-flight SACK-dispatch race) keeps its existing
+  8-sym quick retry — the gate keys on `message_decoded != YES` but the §VF2.4 test confirms a real burst
+  preamble inside the window still acquires (ftr is capped so the burst stays in-ring and the NEXT ftr==0
+  pass — at the gap close — snapshots the full preamble+frame).
+- It does NOT gate on coarse_metric (the REFUTED Fix A): a real CFO-degraded preamble (metric 0.43-0.61) is
+  unaffected. The signal is purely the TURNAROUND-GAP TIMING, paced by the same audio clock the burst uses.
+
+### §VF2.3 §5 CROSS-LAYER AUDIT — the shared state (RX search ↔ turnaround state ↔ lockstep window)
+
+1. **PRODUCERS of `frames_to_read`** (the gate): the capture thread decrement (audioio.c:1455); the post-ACK
+   re-arms (`send_ack_pattern`:9827, `send_mfsk_ack_sack`:10618, `send_mfsk_compact_confirm`); the OFDM OK
+   re-arm (receive():13037/per-frame); the OFDM FAIL anti-spin (:13847, THE site §VF2.2-B constrains); the
+   MFSK anti-spin (:13883/:13898); the HAIL/CONNECT scan overrides (arq_responder.cc:160/292); SET_CONFIG /
+   BREAK re-inits. **PRODUCERS of the suppress deadline**: the three reverse-ACK send sites (set); cleared
+   implicitly by elapsed-time (a one-shot window) — no explicit clear needed, the timer simply ages out.
+2. **CONSUMERS**: `receive()` (:12386 ftr==0 gate → snapshot+coarse search); the FAIL anti-spin (:13846
+   reads the deadline). The deadline has exactly ONE consumer (the anti-spin gate), so it cannot leak.
+3. **VALID STATES of the deadline**: UNSET (timer never started / ctor) → `get_elapsed_time_ms()` returns a
+   large value vs a 0 budget → the gate is INACTIVE (legacy/non-inband and the steady forward-burst state).
+   ACTIVE (within budget after a reverse-ACK) → the gate raises ftr on a no-frame fail. The budget is 0 when
+   `inband_rate_feature_enabled()` is false (never set) → INACTIVE → byte-identical.
+4. **INVARIANTS the consumers assume**:
+   - INV-1 (forward burst MUST still acquire): preserved — the cap `ftr ≤ buffer_Nsymb - frame_symb` keeps
+     the burst in the ring; the OK path bypasses the gate; the gate only lengthens a doomed plateau retry.
+   - INV-2 (down-ladder still recovers a GENUINE loss): preserved — the gate only DELAYS the next forward
+     search within ONE turnaround budget; a genuine sustained loss spans many budgets, each of which re-opens
+     the window and re-fails, so the dead-batch streak / TERMINAL BREAK (§7/§19) still reaches its floor.
+     The §VAR-FIX-DEMOTE watchdog is unaffected (it keys on delivered-id advance, not ftr).
+   - INV-3 (legacy byte-identical): the whole gate is `inband_rate_feature_enabled()`-scoped; off → the
+     deadline is never set, the anti-spin keeps its 8/2 re-arm verbatim. VERIFIED by diff scope.
+5. **WHAT THE FIX CHANGES**: on the in-band FAIL anti-spin path, within a turnaround budget, ftr is raised
+   (search suppressed) instead of 8/2. Walk each consumer: `receive()` snapshots LATER (at the gap close) —
+   correct (no forward burst was airing); the OK path / SACK-dispatch race path / BREAK / HAIL paths are
+   untouched (the gate keys on inband + active-deadline + no-frame-fail, none of which those paths satisfy).
+
+### §VF2.4 Regression test (fails-before / passes-after) — `--test-inband-revack-rxgate`
+
+`cl_arq_controller::test_inband_revack_rxgate()` (in master `--test`). Drives the PRODUCTION ftr-gate decision
+(`inband_revack_rxgate_ftr()`, the exact helper the anti-spin calls) with the production state:
+- ARM the suppress deadline (model a just-sent reverse ACK), then feed N back-to-back PLATEAU fails
+  (message_decoded=NO). PASS-AFTER: ftr is raised to span the gap (the search is suppressed → the storm count
+  drops to ~0 over the gap); FAIL-BEFORE (`MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1`, same binary): ftr stays
+  8 every fail → N searches (the storm signature).
+- ACQUIRE arm: with the deadline active, a pass with `message_decoded=YES` (a real burst) bypasses the gate
+  (ftr re-armed by the OK path), proving the gate never starves the real forward burst.
+- COLD arm: no deadline (legacy/inband-off) → ftr stays 8 (byte-identical).
+Asserts the SKIP-VAR/search count during the gap drops to ~0 (PASS) vs N (DEFEAT) while the real-burst arm
+still acquires. Master `--test` exit 0 (M=0).

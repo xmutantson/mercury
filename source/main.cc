@@ -1019,6 +1019,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_deliver_stall_releases_pin();
             }
+            // §VAR-FIX-2 RX FORWARD-SEARCH GATE regression: the in-band RX must NOT storm the
+            // forward-preamble coarse search during the reverse-ACK turnaround gap (the 0.50 GI
+            // plateau SKIP-VAR storm). Drives the production gate inband_revack_rxgate_ftr().
+            // data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2 / §VF2.4. Fast, no IONOS/RF.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_revack_rxgate();
+            }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
             // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.
@@ -1356,6 +1364,15 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-lockstep") == 0) {
             cl_arq_controller ARQ_ls;
             int failed = ARQ_ls.test_inband_lockstep_revwindow();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-revack-rxgate : run ONLY the §VAR-FIX-2 RX forward-search gate regression
+        // (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2 / §VF2.4 — the RSP must NOT storm the
+        // forward-preamble coarse search during its own reverse-ACK turnaround gap). Drives the REAL
+        // gate inband_revack_rxgate_ftr(). MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1 reproduces the storm.
+        if (strcmp(argv[i], "--test-inband-revack-rxgate") == 0) {
+            cl_arq_controller ARQ_rg;
+            int failed = ARQ_rg.test_inband_revack_rxgate();
             return (failed == 0) ? 0 : 1;
         }
         // --test-climb-bsi-rollback : run ONLY the climb-UP cmd_batch_seq_id rollback regression
