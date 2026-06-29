@@ -3692,6 +3692,20 @@ public:
   int     inband_last_announced_config; // CONFIG_NONE until the first tag
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
+  // REVSACK Part B (revsack/design.json) — BOUNDED data-SACK cheap-miss re-air. The
+  // re-air must be CHEAP for OCCASIONAL misses, NOT an infinite crawl: a PERSISTENTLY-
+  // missing reverse ACK (e.g. the base-pattern correlator stuck below threshold from a
+  // turnaround-window misalignment, NOT a suffix-CRC fail Part A can fix) must still
+  // ESCALATE to the genuine demote/BREAK rather than re-airing the same rung forever
+  // (the "Part B without A crawls" failure the design §design_part_B names). Count
+  // CONSECUTIVE re-airs with NO forward-ACK progress; reset to 0 the moment nAcked_data
+  // advances (a decode = the reverse channel recovered, the re-air worked). At the cap
+  // (REVSACK_CHEAPMISS_MAX_REAIRS) Part B BAILS to the normal emergency_nack path so a
+  // genuinely-stuck rung demotes. cmd_revsack_reair_last_acked snapshots nAcked_data to
+  // detect the advance (same liveness pattern as cmd_inband_liveness_last_acked).
+  int     cmd_revsack_reairs;           // consecutive no-progress data-SACK re-airs
+  int     cmd_revsack_reair_last_acked; // nAcked_data at the last re-air (progress probe)
+  static const int REVSACK_CHEAPMISS_MAX_REAIRS = 3;  // bail to demote after N stuck re-airs
   // A3 demote-decouple env cache (data-flow-inband-a3-decouple.md): the env half of
   //   inband_a3_decouple_enabled(). -1 = unresolved, 0 = off, 1 = on. Env-keyed (resolved
   //   once + ctor-cached, NOT reset per-session — same discipline as inband_rate_enabled).

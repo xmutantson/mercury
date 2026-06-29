@@ -869,6 +869,8 @@ cl_arq_controller::cl_arq_controller()
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
 	inband_a3_decouple_env=-1;  // unresolved; inband_a3_decouple_enabled() caches the env half
 	ack_suffix_fec_env=-1;  // REVSACK Part A: unresolved; ack_suffix_fec_master_enabled() caches the env half
+	cmd_revsack_reairs=0;            // REVSACK Part B: bounded data-SACK re-air counter
+	cmd_revsack_reair_last_acked=0;  // REVSACK Part B: nAcked_data progress probe
 	inband_unilateral_armed=false;  // Stage 3b: set by the SET_CONFIG builder unilateral path
 	// STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (design §1/§4). A fresh
 	// session has nothing announced, so the re-tag is disarmed and no config is confirmed.

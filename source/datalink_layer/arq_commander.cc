@@ -5346,22 +5346,49 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			   && cmd_has_inflight_data_batch()
 			   && !config_is_at_bottom(current_configuration, robust_enabled))
 			{
-				printf("[REVSACK-CHEAPMISS] forward-healthy DATA-SACK miss at config %d — RE-AIRING "
-					"the SAME config (NOT bumping emergency_nack / demoting): the missed SACK self-"
-					"heals via the next cumulative n_r (cheap-miss spine live). emergency_nack_count=%d "
-					"UNCHANGED, in-flight batch preserved for the normal retx re-air.\n",
-					current_configuration, emergency_nack_count);
+				// BOUNDED re-air: a re-air is cheap for an OCCASIONAL miss, but a
+				// PERSISTENTLY-missing reverse ACK (e.g. the base-pattern correlator stuck
+				// sub-threshold from a turnaround-window misalignment — NOT a suffix-CRC fail
+				// Part A's FEC can fix) must ESCALATE, not crawl the same rung forever (the
+				// "Part B without A crawls" failure). Reset the streak the moment nAcked_data
+				// ADVANCES (a decode = the reverse channel recovered, the re-air worked); else
+				// count consecutive no-progress re-airs and BAIL to the demote path at the cap.
+				if(stats.nAcked_data != cmd_revsack_reair_last_acked)
+					cmd_revsack_reairs = 0;             // forward-ACK progress -> re-air is working
+				cmd_revsack_reair_last_acked = stats.nAcked_data;
+
+				if(cmd_revsack_reairs < REVSACK_CHEAPMISS_MAX_REAIRS)
+				{
+					cmd_revsack_reairs++;
+					printf("[REVSACK-CHEAPMISS] forward-healthy DATA-SACK miss at config %d — RE-AIRING "
+						"the SAME config (%d/%d, NOT bumping emergency_nack / demoting): the missed SACK "
+						"self-heals via the next cumulative n_r (cheap-miss spine live). emergency_nack_count=%d "
+						"UNCHANGED, in-flight batch preserved for the normal retx re-air.\n",
+						current_configuration, cmd_revsack_reairs, REVSACK_CHEAPMISS_MAX_REAIRS,
+						emergency_nack_count);
+					fflush(stdout);
+					// Re-arm the receiving window so the re-aired batch's ACK is awaited; leave
+					// current_configuration / cmd_batch_seq_id / messages_tx[] / retx queue untouched
+					// (the in-flight batch is re-presented by the normal per-frame send path). Do NOT
+					// bump emergency_nack_count (no demote accrual) and do NOT tick the CFG16 starve
+					// streak (a re-air is not a starvation). The next forward send owns the transition.
+					load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+					telecom_system->data_container.frames_to_read = 4;
+					calculate_receiving_timeout();
+					receiving_timer.start();
+					return;
+				}
+				// Cap reached: the reverse ACK is PERSISTENTLY missing at this rung with NO
+				// forward-ACK progress -> NOT a cheap occasional miss. Reset the re-air streak
+				// and FALL THROUGH to the normal emergency_nack path (which demotes/BREAKs) —
+				// the genuine-stuck-rung escalation (the D0 net for a base-pattern misalignment
+				// the suffix FEC cannot rescue).
+				printf("[REVSACK-CHEAPMISS] data-SACK miss at config %d — re-air cap %d reached with "
+					"NO forward-ACK progress; ESCALATING to the demote/BREAK path (the rung is genuinely "
+					"stuck, not an occasional miss)\n",
+					current_configuration, REVSACK_CHEAPMISS_MAX_REAIRS);
 				fflush(stdout);
-				// Re-arm the receiving window so the re-aired batch's ACK is awaited; leave
-				// current_configuration / cmd_batch_seq_id / messages_tx[] / retx queue untouched
-				// (the in-flight batch is re-presented by the normal per-frame send path). Do NOT
-				// bump emergency_nack_count (no demote accrual) and do NOT tick the CFG16 starve
-				// streak (a re-air is not a starvation). The next forward send owns the transition.
-				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
-				telecom_system->data_container.frames_to_read = 4;
-				calculate_receiving_timeout();
-				receiving_timer.start();
-				return;
+				cmd_revsack_reairs = 0;   // consumed; the demote owns the next transition
 			}
 #endif // REVSACK_CHEAPMISS_FAILBEFORE
 
