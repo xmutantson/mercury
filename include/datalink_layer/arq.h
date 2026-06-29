@@ -1818,6 +1818,14 @@ public:
   // REAL cumulative_ack_covers consumer apply. Returns 0 (gate GREEN) / 1 (RED).
   int test_a3_decouple_safety();
 
+  // CHEAP-MISS DEFAULT-ON regression (--test-inband-cheapmiss; data-flow-inband-a3-
+  // decouple.md; tier-cross KEYSTONE). Drives the production policy resolver
+  // (inband_cheapmiss_default_on) the two default-on gates use. Asserts in-band+no-env
+  // -> ON (the keystone flip), explicit '0' -> OFF (A/B escape-hatch), explicit '1' ->
+  // ON off-feature, legacy+no-env -> OFF (byte-identical). FAIL-BEFORE
+  // (-DINBAND_CHEAPMISS_FAILBEFORE) pins the no-env path OFF -> assertion A flips. rc 0/1.
+  int test_inband_cheapmiss_default_on();
+
   // ROBUST_0 + streaming-compression deadlock regression
   // (data-flow-compress-frame-fill.md). Drives the REAL
   // process_buffer_data_commander() data-fill path at ROBUST_0 frame
@@ -2119,6 +2127,14 @@ public:
   // refuse to decouple (remove the demote) unless the self-heal spine is present, else
   // the link would crawl/dead. Default-off ≡ byte-identical (the demote stays in place).
   bool inband_a3_decouple_enabled();
+
+  // CHEAP-MISS DEFAULT-ON resolver wrapper (data-flow-inband-a3-decouple.md; tier-cross
+  // KEYSTONE). PURE policy: (1) explicit env wins; (2) else DEFAULT-ON when in-band; (3)
+  // else off. Drives BOTH default-on gates (cumulative-ack advertise + the A3 decouple
+  // env half) AND --test-inband-cheapmiss identically (no env reads / no caching here).
+  // explicit_env = literal MERCURY_<KEY> string (NULL/empty = unset); inband_on = the
+  // in-band feature state. Returns 1 (on) / 0 (off).
+  int inband_cheapmiss_default_on(const char* explicit_env, bool inband_on);
 
   // TX EMIT (design §6). Decide whether the batch about to be sent at config
   // `batch_cfg` differs from the last-announced config and, if so, build the
@@ -4125,8 +4141,22 @@ public:
   // regression (test_inband_tier_crossing_routing) identically.
   bool inband_config_change_is_tier_crossing(int target_cfg);
 
+  // CONFIG_TAG TIER-CROSS ROUTING (tier-cross-hold synthesis, approach A). PURE predicate:
+  // should a robust<->OFDM tier-cross route via the in-band unilateral CONFIG_TAG (forward
+  // self-identify, NO SET_CONFIG reverse-ACK dependency) instead of the legacy SET_CONFIG
+  // handshake? True iff feature on AND it IS a tier-cross AND the cheap-miss spine
+  // (inband_a3_decouple_enabled, which requires cumulative_ack_enabled) is live — the
+  // data-phase cross needs B to cover a data-phase reverse-ACK miss. Else false -> the cross
+  // keeps the legacy SET_CONFIG transport verbatim. FAIL-BEFORE -DINBAND_TAG_CROSS_FAILBEFORE.
+  bool inband_tier_cross_via_tag(int target_cfg);
+
   // Directed regression for the hybrid tier-crossing routing (fails-before/passes-after).
   int test_inband_tier_crossing_routing();
+
+  // Directed regression for the CONFIG_TAG tier-cross routing (approach A). Drives
+  // inband_tier_cross_via_tag(): spine-live cross -> via tag (the keystone); spine-off ->
+  // SET_CONFIG; intra-tier/feature-off -> false. FAIL-BEFORE -DINBAND_TAG_CROSS_FAILBEFORE.
+  int test_inband_tag_cross_routing();
 
   // IN-BAND TIER-CROSSING REVERSE-ACK PIN (data-flow-inband-tier-crossing.md §3). PURE:
   // on an in-band robust<->OFDM tier-cross, return the ROBUST rung the reverse SACK must

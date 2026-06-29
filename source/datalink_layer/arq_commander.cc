@@ -1206,11 +1206,24 @@ int cl_arq_controller::add_message_control(char code)
 				// The predicate is factored into inband_config_change_is_tier_crossing
 				// so the directed regression drives the EXACT production decision.
 				bool tier_crossing = inband_config_change_is_tier_crossing(inband_target);
-				if(tier_crossing)
+				// CONFIG_TAG TIER-CROSS (tier-cross-hold synthesis, approach A):
+				// when the cheap-miss spine (B) is live, route the robust<->OFDM cross
+				// through the in-band unilateral CONFIG_TAG (forward self-identify, NO
+				// SET_CONFIG reverse-ACK dependency at the cross) — the RX adopts the new
+				// config from the robust RM(1,4)+CRC-12 tag on the forward batch with no
+				// confirm-turnaround. A data-phase reverse-ACK miss during the cross is then
+				// covered by the demote-decouple (re-air + cumulative-n_r self-heal), so the
+				// SET_CONFIG cross's reverse-ACK fragility (the 102<->0 demote limit cycle)
+				// is removed at its source. inband_tier_cross_via_tag() returns true ONLY
+				// when the spine is negotiated; otherwise (legacy/non-T2 peer, escape-hatch,
+				// pre-negotiation) it returns false and the cross keeps the proven legacy
+				// SET_CONFIG transport (reverse-pin + liveness-exemption) byte-identical.
+				bool cross_via_tag = tier_crossing && inband_tier_cross_via_tag(inband_target);
+				if(tier_crossing && !cross_via_tag)
 				{
 					printf("[INBAND-TX] TIER-CROSSING %d -> %d (robust<->OFDM): routing "
 						"via legacy SET_CONFIG control handshake (fast dedicated ACK), "
-						"NOT the in-band tag (which serializes behind the data-SACK)\n",
+						"NOT the in-band tag (cheap-miss spine not live)\n",
 						current_configuration, inband_target);
 					fflush(stdout);
 					// Fall through to the legacy SET_CONFIG builder below. Mirror the
@@ -1222,16 +1235,28 @@ int cl_arq_controller::add_message_control(char code)
 				}
 				else if(inband_unilateral_config_change(inband_target))
 				{
-					// Unilateral path took it: NO control frame on the wire.
+					// Unilateral path took it (intra-tier OR a spine-live tier-cross):
+					// NO control frame on the wire — the next forward batch tags the
+					// new config. A spine-live tier-cross arms the re-tag exactly like an
+					// intra-tier change (detect_and_follow_config_tag adopts it forward).
+					if(cross_via_tag)
+					{
+						printf("[INBAND-TX] TIER-CROSS-VIA-TAG %d -> %d: forward CONFIG_TAG "
+							"self-identify (NO SET_CONFIG, NO reverse-ACK dependency at the "
+							"cross); a data-phase miss is covered by the cheap-miss decouple\n",
+							current_configuration, inband_target);
+						fflush(stdout);
+					}
 					messages_control.status = FREE;
 					messages_control.type   = NONE;
 					inband_unilateral_armed = true;   // consumed in process_messages_tx_control
 					success = SUCCESSFUL;
 					return success;
 				}
-				// No-op drop (same config / invalid target) OR tier-crossing: fall
-				// through to the legacy builder so behaviour matches the flag-off path
-				// for the crossing (fast SET_CONFIG ACK) and the degenerate case.
+				// No-op drop (same config / invalid target) OR a tier-crossing with the
+				// spine not live: fall through to the legacy builder so behaviour matches
+				// the flag-off path for the crossing (fast SET_CONFIG ACK) and the
+				// degenerate case.
 			}
 
 			messages_control.data[0]=code;
@@ -10596,6 +10621,68 @@ int cl_arq_controller::test_a3_decouple_safety()
 	return failed == 0 ? 0 : 1;
 }
 
+// CHEAP-MISS DEFAULT-ON regression (--test-inband-cheapmiss; data-flow-inband-a3-decouple.md;
+// tier-cross-hold KEYSTONE). Drives the EXACT production policy resolver
+// (inband_cheapmiss_default_on -> inband_cheapmiss_resolve) the two default-on gates use
+// (cumulative-ack advertise + the A3 demote-decouple env half). The KEYSTONE flips a PROVEN
+// fix (cumulative-n_r self-heal + demote-decouple) from DEFAULT-OFF to DEFAULT-ON for the
+// in-band stack (CLAUDE.md: don't park a working fix default-off). This test asserts:
+//   (1) in-band + NO explicit env  -> ON  (the default-on flip — the load-bearing assertion);
+//   (2) explicit "0" even in-band   -> OFF (the A/B escape-hatch, force per-batch baseline);
+//   (3) explicit "1" even legacy    -> ON  (explicit opt-in honoured off-feature);
+//   (4) legacy + NO explicit env    -> OFF (byte-identical legacy / interop-safe).
+// FAIL-BEFORE (-DINBAND_CHEAPMISS_FAILBEFORE): the resolver's no-env path is pinned OFF
+// (the pre-keystone default-off) so assertion (1) FLIPS to FAIL (got=0 want=1) — the
+// demote-spine-OFF regression frame0-rolling-partial §12.2 measured. PASS-AFTER: all PASS.
+int cl_arq_controller::test_inband_cheapmiss_default_on()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-INBAND-CHEAPMISS] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-INBAND-CHEAPMISS] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+#ifdef INBAND_CHEAPMISS_FAILBEFORE
+	const int want_default_inband = 0;   // fail-before: the no-env path is pinned OFF
+#else
+	const int want_default_inband = 1;   // pass-after: DEFAULT-ON in-band
+#endif
+
+	// (1) THE KEYSTONE — in-band engaged, no explicit env -> DEFAULT-ON.
+	check(inband_cheapmiss_default_on(NULL, /*inband_on=*/true) == want_default_inband,
+		"A in-band + no explicit env -> DEFAULT-ON (the keystone flip; FAIL-BEFORE pins OFF)",
+		inband_cheapmiss_default_on(NULL, true), want_default_inband);
+	check(inband_cheapmiss_default_on("", /*inband_on=*/true) == want_default_inband,
+		"A' in-band + empty env string -> DEFAULT-ON (empty == unset)",
+		inband_cheapmiss_default_on("", true), want_default_inband);
+
+	// (2) ESCAPE-HATCH — explicit "0" forces OFF even in-band (the A/B baseline arm).
+	//     ABSOLUTE (not fail-before-toggled): explicit env wins in BOTH builds.
+	check(inband_cheapmiss_default_on("0", /*inband_on=*/true) == 0,
+		"B in-band + explicit '0' -> OFF (A/B escape-hatch forces per-batch baseline)",
+		inband_cheapmiss_default_on("0", true), 0);
+
+	// (3) EXPLICIT OPT-IN honoured off-feature (explicit "1" -> ON even legacy). ABSOLUTE.
+	check(inband_cheapmiss_default_on("1", /*inband_on=*/false) == 1,
+		"C legacy + explicit '1' -> ON (explicit opt-in honoured off-feature)",
+		inband_cheapmiss_default_on("1", false), 1);
+
+	// (4) LEGACY byte-identical — off-feature, no explicit env -> OFF (interop-safe). ABSOLUTE.
+	check(inband_cheapmiss_default_on(NULL, /*inband_on=*/false) == 0,
+		"D legacy + no explicit env -> OFF (byte-identical / interop-safe)",
+		inband_cheapmiss_default_on(NULL, false), 0);
+
+	printf("[TEST-INBAND-CHEAPMISS] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // HYBRID TIER-CROSSING ROUTING regression (data-flow-inband-tier-crossing.md §3).
 // The chokepoint add_message_control(SET_CONFIG) routing decision: a robust<->OFDM
 // TIER CROSSING must route via the legacy SET_CONFIG control handshake (fast dedicated
@@ -10680,6 +10767,103 @@ int cl_arq_controller::test_inband_tier_crossing_routing()
 	current_configuration = saved_cfg;   // restore (no live-session leak)
 
 	printf("[TEST-TIER-CROSS] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// CONFIG_TAG TIER-CROSS ROUTING regression (--test-inband-tag-cross; tier-cross-hold
+// synthesis approach A). Drives the EXACT production predicate inband_tier_cross_via_tag()
+// — the chokepoint's NEW decision: route a robust<->OFDM cross via the in-band CONFIG_TAG
+// (NO SET_CONFIG reverse-ACK dependency) WHEN the cheap-miss spine (B) is live; else keep
+// the legacy SET_CONFIG cross. PURE in-process: drives the member fields the predicate
+// reads (inband_rate_enabled, inband_a3_decouple_env, cumulative_ack_enabled) — no PHY/RF.
+//
+// THE LOAD-BEARING ASSERTION: a robust->OFDM cross WITH the spine live routes VIA TAG (the
+// reverse-ACK dependency is removed at the cross). FAIL-BEFORE (-DINBAND_TAG_CROSS_FAILBEFORE):
+// the predicate is pinned false -> the cross keeps SET_CONFIG (the pre-synthesis routing, the
+// reverse-ACK-dependent cross) -> that assertion FLIPS to FAIL. Also asserts the gate:
+// spine-OFF cross -> SET_CONFIG (B-not-live fallback), intra-tier -> not-our-decision (false),
+// feature-off -> false.
+int cl_arq_controller::test_inband_tag_cross_routing()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) {
+			printf("[TEST-TAG-CROSS] PASS: %s (got=%d want=%d)\n", name, got, want);
+		} else {
+			printf("[TEST-TAG-CROSS] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+#ifdef INBAND_TAG_CROSS_FAILBEFORE
+	const int want_cross_via_tag = 0;   // fail-before: cross keeps SET_CONFIG (no tag-cross)
+#else
+	const int want_cross_via_tag = 1;   // pass-after: spine-live cross routes via the tag
+#endif
+
+	// Save + drive the member state the predicate reads.
+	int saved_cfg   = current_configuration;
+	int saved_ibr   = inband_rate_enabled;
+	int saved_a3env = inband_a3_decouple_env;
+	bool saved_cum  = cumulative_ack_enabled;
+
+	inband_rate_enabled = 1;            // feature ON (inband_rate_feature_enabled() -> true)
+
+	// ── (1) SPINE LIVE: a robust->OFDM cross routes VIA TAG (the keystone) ──────
+	// Spine = a3-decouple env ON (default-on) AND cumulative-ack negotiated.
+	inband_a3_decouple_env = 1;
+	cumulative_ack_enabled = true;
+	current_configuration  = ROBUST_2;
+	check(inband_tier_cross_via_tag(CONFIG_0) == want_cross_via_tag,
+		"A robust->OFDM cross (ROBUST_2->CONFIG_0) + spine live -> route VIA TAG "
+		"(FAIL-BEFORE keeps SET_CONFIG)",
+		inband_tier_cross_via_tag(CONFIG_0), want_cross_via_tag);
+	// The reverse cross (OFDM->robust demote) with the spine live also tags.
+	current_configuration = CONFIG_0;
+	check(inband_tier_cross_via_tag(ROBUST_2) == want_cross_via_tag,
+		"A' OFDM->robust cross (CONFIG_0->ROBUST_2) + spine live -> route VIA TAG",
+		inband_tier_cross_via_tag(ROBUST_2), want_cross_via_tag);
+
+	// ── (2) SPINE NOT LIVE: a cross keeps SET_CONFIG (B-not-live fallback). ABSOLUTE ──
+	// cumulative-ack NOT negotiated -> inband_a3_decouple_enabled() false -> via_tag false.
+	cumulative_ack_enabled = false;
+	current_configuration  = ROBUST_2;
+	check(inband_tier_cross_via_tag(CONFIG_0) == 0,
+		"B cross + cumulative-ack NOT negotiated -> keep SET_CONFIG (legacy cross fallback)",
+		inband_tier_cross_via_tag(CONFIG_0), 0);
+	// a3-decouple explicitly disabled (escape-hatch) even with cumulative-ack on -> SET_CONFIG.
+	inband_a3_decouple_env = 0;
+	cumulative_ack_enabled = true;
+	check(inband_tier_cross_via_tag(CONFIG_0) == 0,
+		"B' cross + a3-decouple escape-hatch OFF -> keep SET_CONFIG",
+		inband_tier_cross_via_tag(CONFIG_0), 0);
+
+	// ── (3) INTRA-TIER is NOT this predicate's decision (returns false; the chokepoint
+	//        already routes intra-tier via the tag through the other branch). ABSOLUTE ──
+	inband_a3_decouple_env = 1;
+	cumulative_ack_enabled = true;
+	current_configuration  = CONFIG_0;
+	check(inband_tier_cross_via_tag(CONFIG_4) == 0,
+		"C intra-OFDM (CONFIG_0->CONFIG_4) -> via_tag false (not a cross; chokepoint tags it anyway)",
+		inband_tier_cross_via_tag(CONFIG_4), 0);
+
+	// ── (4) FEATURE OFF -> false (legacy byte-identical). ABSOLUTE ──────────────
+	inband_rate_enabled    = 0;
+	current_configuration  = ROBUST_2;
+	check(inband_tier_cross_via_tag(CONFIG_0) == 0,
+		"D feature OFF -> via_tag false (legacy SET_CONFIG cross byte-identical)",
+		inband_tier_cross_via_tag(CONFIG_0), 0);
+
+	// restore (no live-session leak)
+	current_configuration  = saved_cfg;
+	inband_rate_enabled    = saved_ibr;
+	inband_a3_decouple_env = saved_a3env;
+	cumulative_ack_enabled = saved_cum;
+
+	printf("[TEST-TAG-CROSS] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

@@ -1091,6 +1091,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_a3_decouple_safety();
             }
+            // CHEAP-MISS DEFAULT-ON (data-flow-inband-a3-decouple.md; tier-cross KEYSTONE):
+            // the cumulative-ack advertise + A3 demote-decouple env gates ship DEFAULT-ON for
+            // the in-band stack (explicit env escape-hatch retained). Member test on a
+            // throwaway controller; PURE in-process — drives the production resolver.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_cheapmiss_default_on();
+            }
             // HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §3):
             // a robust<->OFDM crossing routes to the legacy SET_CONFIG handshake
             // (fast dedicated ACK); intra-tier rate adapts keep the in-band tag.
@@ -1099,6 +1107,14 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_tier_crossing_routing();
+            }
+            // CONFIG_TAG TIER-CROSS ROUTING (tier-cross-hold synthesis approach A):
+            // when the cheap-miss spine is live, a robust<->OFDM cross routes via the
+            // in-band CONFIG_TAG (NO SET_CONFIG reverse-ACK dependency at the cross);
+            // spine-off keeps the legacy SET_CONFIG cross. PURE in-process gate.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_tag_cross_routing();
             }
             // IN-BAND TIER-CROSS REVERSE-ACK PIN regression (data-flow-inband-tier-
             // crossing.md §3): a robust<->OFDM cross must pin reverse_configuration to
@@ -1299,6 +1315,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-tier-crossing") == 0) {
             cl_arq_controller ARQ_tc;
             int failed = ARQ_tc.test_inband_tier_crossing_routing();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-tag-cross : run ONLY the CONFIG_TAG tier-cross routing regression
+        // (tier-cross-hold synthesis approach A) and exit. Spine-live robust<->OFDM cross
+        // -> route via the in-band tag (NO SET_CONFIG reverse-ACK dependency); spine-off ->
+        // legacy SET_CONFIG cross. Build with -DINBAND_TAG_CROSS_FAILBEFORE to reproduce the
+        // fails-before (cross keeps SET_CONFIG). See test_inband_tag_cross_routing.
+        if (strcmp(argv[i], "--test-inband-tag-cross") == 0) {
+            cl_arq_controller ARQ_tgx;
+            int failed = ARQ_tgx.test_inband_tag_cross_routing();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-reverse-pin : run ONLY the tier-cross reverse-ACK pin regression
@@ -1758,6 +1784,7 @@ int main(int argc, char *argv[])
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
     bool test_a3_decouple_safety_cli = false; // --test-a3-decouple-safety: the §2 CHECKPOINT — single-miss non-load-bearing (anti-0-bytes, byte-faithful) + genuine-death net intact, demote IN PLACE (data-flow-forgiving-ack.md §T2.2/§6).
+    bool test_inband_cheapmiss_cli = false; // --test-inband-cheapmiss: cheap-miss DEFAULT-ON policy resolver (cumulative-ack advertise + A3 decouple ship default-on in-band; explicit env escape-hatch). FAIL-BEFORE -DINBAND_CHEAPMISS_FAILBEFORE (data-flow-inband-a3-decouple.md; tier-cross KEYSTONE).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_tinterp_seed_cli = false; // --test-tinterp-seed: TINTERP-SEED production it=0 estimator seed-swap failing-first (staging/tinterp-seed).
@@ -2612,6 +2639,18 @@ int main(int argc, char *argv[])
             // (the genuine-death net is intact). Gate that MUST be GREEN before the
             // Phase-2 demote-decouple. See data-flow-forgiving-ack.md §T2.2/§6.
             test_a3_decouple_safety_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-cheapmiss") == 0)
+        {
+            // CHEAP-MISS DEFAULT-ON policy resolver (tier-cross KEYSTONE). Asserts the
+            // cumulative-ack advertise + A3 demote-decouple env gates ship DEFAULT-ON for
+            // the in-band stack (CLAUDE.md don't-park-proven-fix), with the explicit env
+            // escape-hatch retained both directions. FAIL-BEFORE -DINBAND_CHEAPMISS_FAILBEFORE
+            // pins the no-env path OFF (the demote-spine-OFF regression frame0-rolling-partial
+            // §12.2). data-flow-inband-a3-decouple.md.
+            test_inband_cheapmiss_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4212,6 +4251,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_a3_decouple_safety();
             printf("[FLAG] A3 decouple-safety checkpoint complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_cheapmiss_cli) {
+            // CHEAP-MISS DEFAULT-ON policy resolver (one-shot, then exit rc). Asserts the
+            // tier-cross KEYSTONE: cumulative-ack advertise + A3 demote-decouple ship
+            // DEFAULT-ON for the in-band stack (explicit env escape-hatch retained).
+            printf("[FLAG] --test-inband-cheapmiss: invoking the cheap-miss DEFAULT-ON "
+                   "policy resolver regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_cheapmiss_default_on();
+            printf("[FLAG] Cheap-miss default-on test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

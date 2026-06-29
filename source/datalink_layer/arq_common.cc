@@ -108,19 +108,57 @@ static inline bool recovery_ack_robust_enabled_common()
 // matched-count → ample to clear the 7/16 bar from a straddled 6-7).
 static const int RECOVERY_ACK_REPS = 4;
 
+// CHEAP-MISS DEFAULT-ON resolver (data-flow-inband-a3-decouple.md; tier-cross-hold
+// KEYSTONE). PURE policy shared by BOTH default-on gates (cumulative-ack advertise +
+// the A3 demote-decouple env half) AND their directed regression, so production and the
+// test drive the EXACT same decision. Encodes "(1) explicit env wins; (2) else DEFAULT-ON
+// when the in-band stack is engaged; (3) else off (legacy byte-identical)":
+//   explicit_env: the literal MERCURY_<KEY> string (NULL/empty = no explicit setting);
+//                 a non-"0" value forces ON, "0" forces OFF (the A/B escape-hatch).
+//   inband_on:    inband_rate_feature_enabled() (or the equivalent env for the free fn).
+// Returns 1 (on) / 0 (off). No env reads, no caching — deterministically testable.
+// cl_arq_controller::inband_cheapmiss_default_on() is the member wrapper; the free
+// advertise fn replays the same policy inline (it cannot reach the member).
+static inline int inband_cheapmiss_resolve(const char* explicit_env, bool inband_on)
+{
+	if(explicit_env && *explicit_env)
+		return (atoi(explicit_env) != 0) ? 1 : 0;   // (1) explicit opt-in/out wins
+#ifdef INBAND_CHEAPMISS_FAILBEFORE
+	// FAIL-BEFORE arm (the pre-keystone default-OFF): the cheap-miss spine was parked
+	// default-off (only the explicit env opted in). Pinning the no-env path to OFF
+	// reproduces the demote limit-cycle (the A/B that ran the redesign with the
+	// cumulative-ack/A3 spine OFF, never holding cfg0 — frame0-rolling-partial §12.2).
+	(void)inband_on;
+	return 0;
+#else
+	return inband_on ? 1 : 0;                        // (2) default-on in-band / (3) off
+#endif
+}
+
 // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1): the LOCAL
-// advertise gate. We ONLY set CAP_CUMULATIVE_ACK in local_capability when the env
-// opt-in MERCURY_CUMULATIVE_ACK is present. Default-off ⇒ the bit is never set ⇒
-// both_support is false on BOTH ends ⇒ the reshape never engages ⇒ byte-identical to
-// the Tier-1 base + interop-safe with any non-Tier-2 peer. Returns the cap bit to OR
-// into local_capability (0 when the env is unset). Cached like SACK_TRACE.
+// advertise gate. CAP_CUMULATIVE_ACK is the self-heal spine the in-band stack's
+// cheap-miss demote-decouple (data-flow-inband-a3-decouple.md) depends on, so for the
+// in-band stack it ships DEFAULT-ON (CLAUDE.md: don't park a proven fix default-off —
+// the cumulative-n_r reshape was tested green via --test-cumulative-ack /
+// --test-a3-decouple-safety and is the keystone that makes a reverse-ACK miss
+// non-load-bearing). RESOLUTION ORDER (inband_cheapmiss_resolve):
+//   (1) explicit MERCURY_CUMULATIVE_ACK env present  -> honour it verbatim (1/0),
+//       the A/B ESCAPE-HATCH (set =0 to force the per-batch baseline even in-band).
+//   (2) else if MERCURY_INBAND_RATE is on             -> advertise (DEFAULT-ON in-band).
+//   (3) else (legacy / non-inband, no env)            -> 0 (byte-identical Tier-1 base).
+// Both_support is still negotiated at BOTH ends (arq_responder.cc / arq_commander.cc),
+// so a legacy/non-inband peer leaves the bit clear ⇒ cumulative_ack_enabled false ⇒
+// per-batch fallback ⇒ interop-safe. Reads MERCURY_INBAND_RATE directly (this is a free
+// function, not a member, so it cannot call inband_rate_feature_enabled()); the env key
+// is the same one inband_rate_feature_enabled() resolves. Cached like SACK_TRACE.
 static inline uint8_t cumulative_ack_advertise_bit()
 {
 	static int cached = -1;
 	if(cached < 0)
 	{
-		const char* e = std::getenv("MERCURY_CUMULATIVE_ACK");
-		cached = (e && *e && *e != '0') ? 1 : 0;
+		const char* ib = std::getenv("MERCURY_INBAND_RATE");
+		bool inband_on = (ib && *ib && atoi(ib) != 0);
+		cached = inband_cheapmiss_resolve(std::getenv("MERCURY_CUMULATIVE_ACK"), inband_on);
 	}
 	return cached ? (uint8_t)CAP_CUMULATIVE_ACK : (uint8_t)0;
 }
@@ -2618,21 +2656,44 @@ bool cl_arq_controller::inband_rate_feature_enabled()
 }
 
 // A3 demote-decouple gate (data-flow-inband-a3-decouple.md §1.2). STRICT-SEQUENCED:
-// the env opt-in MERCURY_INBAND_A3_DECOUPLE arms it, but it ONLY engages once the A3
-// cumulative-ACK capability is NEGOTIATED for this session (cumulative_ack_enabled) —
-// the self-heal spine must be present before the demote is removed, otherwise a missed
-// reverse-ACK never retires and the link crawls/dead. With cumulative_ack_enabled false
-// (no A3 negotiated, or session not yet up) this returns false ⇒ the existing demote
-// stays in place ⇒ byte-identical. The env half is cached; the negotiated half is
-// re-read live (it flips at the TEST_CONNECTION negotiation / clears on session reset).
+// it ONLY engages once the A3 cumulative-ACK capability is NEGOTIATED for this session
+// (cumulative_ack_enabled) — the self-heal spine must be present before the demote is
+// removed, otherwise a missed reverse-ACK never retires and the link crawls/dead. With
+// cumulative_ack_enabled false (no A3 negotiated, or session not yet up) this returns
+// false ⇒ the existing demote stays in place ⇒ byte-identical / interop-safe.
+//
+// CHEAP-MISS DEFAULT-ON (the tier-cross-hold KEYSTONE, CLAUDE.md don't-park-a-proven-fix):
+// the demote-decouple makes a forward-healthy reverse-ACK MISS non-load-bearing (re-air the
+// SAME config, no BREAK/demote, self-heal via the next cumulative n_r), which is what stops
+// the 102<->0 demote limit cycle from forming at the tier-cross. It was proven green
+// (--test-a3-decouple-safety, the PART F/G config-walk reproduction) and SHIPS DEFAULT-ON
+// for the in-band stack. The cumulative_ack_enabled conjunct is the load-bearing safety
+// interlock and is RETAINED (never removed). Env RESOLUTION (cached half):
+//   (1) explicit MERCURY_INBAND_A3_DECOUPLE present -> honour 1/0 (the A/B escape-hatch).
+//   (2) else DEFAULT-ON whenever the in-band stack is engaged (inband_rate_feature_enabled).
+//   (3) else (legacy / non-inband) -> off (byte-identical).
+// The env half is cached; the negotiated half (cumulative_ack_enabled) is re-read live
+// (it flips at the TEST_CONNECTION negotiation / clears on session reset).
 bool cl_arq_controller::inband_a3_decouple_enabled()
 {
 	if(inband_a3_decouple_env < 0)
 	{
-		const char* e = std::getenv("MERCURY_INBAND_A3_DECOUPLE");
-		inband_a3_decouple_env = (e && *e && atoi(e) != 0) ? 1 : 0;
+		// Shared cheap-miss DEFAULT-ON policy (inband_cheapmiss_resolve): explicit
+		// MERCURY_INBAND_A3_DECOUPLE wins; else DEFAULT-ON when the in-band stack is
+		// engaged; else off. The cumulative_ack_enabled conjunct below is the retained
+		// load-bearing safety interlock (never decouple without the self-heal spine).
+		inband_a3_decouple_env = inband_cheapmiss_resolve(
+			std::getenv("MERCURY_INBAND_A3_DECOUPLE"), inband_rate_feature_enabled());
 	}
 	return inband_a3_decouple_env == 1 && cumulative_ack_enabled;
+}
+
+// Member wrapper over the pure cheap-miss DEFAULT-ON policy (the file-static
+// inband_cheapmiss_resolve above). Lets the directed regression (--test-inband-cheapmiss,
+// a member of arq_commander.cc) drive the EXACT same decision the two production gates use.
+int cl_arq_controller::inband_cheapmiss_default_on(const char* explicit_env, bool inband_on)
+{
+	return inband_cheapmiss_resolve(explicit_env, inband_on);
 }
 
 // In-band rate adaptation (Stage 3a): build the combined CONFIG_TAG suffix tones.
@@ -3325,6 +3386,47 @@ bool cl_arq_controller::inband_config_change_is_tier_crossing(int target_cfg)
 	if(target_cfg == CONFIG_NONE)
 		return false;
 	return is_robust_config(current_configuration) != is_robust_config(target_cfg);
+#endif
+}
+
+// CONFIG_TAG TIER-CROSS ROUTING (data-flow-inband-tier-crossing.md §6/the tier-cross-hold
+// synthesis, approach A). PURE predicate: should a robust<->OFDM tier-cross be routed
+// through the in-band unilateral CONFIG_TAG (self-identify on the forward batch, NO
+// SET_CONFIG control handshake, NO reverse-ACK dependency at the cross) instead of the
+// legacy SET_CONFIG control handshake?
+//
+// WHY: the original §1 hybrid routed the cross via SET_CONFIG because the per-rung in-band
+// confirm SERIALIZED behind the slow data-SACK turnaround (~12.4s/rung). That speed argument
+// is now OBSOLETE — the §1.8 pipeline-climb + the §6 keystone decoupled-confirm + the +1
+// pacing already collapse the per-rung serialization, while the SET_CONFIG cross's REVERSE-ACK
+// FRAGILITY persists (its dedicated control-ACK and the post-cross data-SACK both ride a tight
+// turnaround that times out -> the 102<->0 demote limit cycle, frame0-rolling-partial §7/§8).
+// Routing the cross via the forward-self-identifying CONFIG_TAG removes that reverse-ACK
+// dependency at the cross entirely (the RX adopts cfg from the robust RM(1,4)+CRC-12 tag it
+// decodes on the forward batch; no confirm-turnaround required for the cross to take effect).
+//
+// STRICT INTERLOCK: the tag-cross is DATA-PHASE, so a reverse-ACK miss in the data phase is
+// covered NOT by the control-phase tier-cross liveness exemption (which never engages for a
+// data-phase cross) but by the cheap-miss demote-decouple (approach B). Therefore the tag-cross
+// is gated on inband_a3_decouple_enabled() (which itself requires cumulative_ack_enabled
+// negotiated) — i.e. B MUST be live before A engages. When the cheap-miss spine is NOT active
+// (legacy/non-T2 peer, escape-hatch, or pre-negotiation), this returns false and the cross
+// keeps the legacy SET_CONFIG transport (with its reverse-pin + liveness-exemption) verbatim.
+// Off-feature it is unreachable (the chokepoint guards on inband_rate_feature_enabled()).
+// FAIL-BEFORE (-DINBAND_TAG_CROSS_FAILBEFORE): pinned false -> the cross keeps SET_CONFIG (the
+// pre-synthesis routing) so the directed test reproduces the reverse-ACK-dependent cross.
+bool cl_arq_controller::inband_tier_cross_via_tag(int target_cfg)
+{
+#ifdef INBAND_TAG_CROSS_FAILBEFORE
+	(void)target_cfg;
+	return false;
+#else
+	if(!inband_rate_feature_enabled())
+		return false;
+	if(!inband_config_change_is_tier_crossing(target_cfg))
+		return false;                 // intra-tier already uses the tag; not our decision
+	// The data-phase cross requires the cheap-miss spine (B) to cover a data-phase miss.
+	return inband_a3_decouple_enabled();
 #endif
 }
 

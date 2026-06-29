@@ -10480,12 +10480,16 @@ int cl_arq_controller::test_inband_deliver()
 		const int AHEAD    = 0;           // epoch == in-flight bsi (the re-air must not move it)
 
 		// ---- ARM 1: DECOUPLE OFF (fail-before) — reproduce the config-walk. ----
-		putenv_kv("MERCURY_INBAND_A3_DECOUPLE", "");   // gate OFF
+		// CHEAP-MISS DEFAULT-ON (tier-cross KEYSTONE): the demote-decouple now ships
+		// DEFAULT-ON for the in-band stack, so an UNSET MERCURY_INBAND_A3_DECOUPLE resolves
+		// ON (not off) whenever MERCURY_INBAND_RATE is on. To get the genuine OFF (legacy
+		// demote-per-stall) baseline this arm needs, set the EXPLICIT escape-hatch "0".
+		putenv_kv("MERCURY_INBAND_A3_DECOUPLE", "0");  // gate OFF via the explicit escape-hatch
 		{
 			cl_telecom_system* ts = nullptr;
 			cl_arq_controller* cmd = make_cmd(CFG_FROM, &ts);
 			cmd->cumulative_ack_enabled = true;            // A3 negotiated (irrelevant when gate off)
-			cmd->inband_a3_decouple_env = -1;              // force env re-resolve (-> 0, off)
+			cmd->inband_a3_decouple_env = -1;              // force env re-resolve (-> 0, escape-hatch off)
 
 			int demotes = 0;
 			for(int m = 0; m < MISSES; m++)
