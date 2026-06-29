@@ -171,6 +171,22 @@ public:
 	// healthy link (where the counter stays at 0). Reset in init()/load_configuration.
 	int consecutive_ofdm_decode_fails;
 
+	// CFO ACQUISITION SEED (wip/cfg0-eq-settling; data-flow-cfg0-cfo-acq-seed.md).
+	// The settled NET carrier offset (coarse_freq_offset - freq_offset_measured, Hz)
+	// the last CONFIDENT decode demodulated at. The carrier offset (crystal/clock
+	// mismatch + sound-card drift) is a CONFIG-INDEPENDENT physical property of the
+	// link, but load_configuration scrubs freq_offset_of_last_decoded_message at
+	// EVERY config change (bundled with the legit timing reset), forcing the
+	// ROBUST->cfg0 cross to re-acquire COLD -> marginal Moose lock (FTR~0.2) ->
+	// residual CFO -> frame-0 nv spike -> SKIP-VAR drop. This member SURVIVES the
+	// config change (it is NOT zeroed at :11550) so the next fresh WB-OFDM
+	// acquisition can WARM-START coarse_freq_offset from it. Written on a confident
+	// OFDM or ROBUST/MFSK success (the MFSK wb_mfsk mini-Moose is the cross seed);
+	// read only to seed the cold fresh-OFDM trial-0; scrubbed with the poison-CFO
+	// reset. GATED behind ofdm.cfg0_freshrung_settle_enabled (in-band CONFIG_0..6)
+	// so legacy/gate-off is byte-identical. Reset in init()/ctor only.
+	double cfo_acq_seed_hz;
+
 	// MFSK short control frames: punctured LDPC for ACK/control messages
 	int ctrl_nBits;    // interleaved bits to transmit for ctrl frames (0 = no puncturing)
 	int ctrl_nsymb;    // MFSK symbols for ctrl frames

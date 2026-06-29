@@ -894,6 +894,157 @@ static int run_cfg0_eq_settle_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-cfg0-cfo-seed: fresh-acquisition CFO SEED self-test (failing-test-first).
+// data-flow-cfg0-cfo-acq-seed.md §6.
+//
+// The COMPLEMENTARY upstream fix to --test-cfg0-eq-settle. The EQ-refine recovers a
+// residual CFO only within the pilot-pair unambiguous range; a LARGER residual (the
+// FTR~0.2 marginal COLD lock at the ROBUST->cfg0 cross) wraps and is unrecoverable
+// from Dy-spaced pilots — "acquisition must own the coarse CFO". This test proves the
+// seed lets the cold acquisition own it.
+//
+// Builds the SAME synthetic CONFIG_0 frame as cfg0_eq_run, but injects a CARRIER
+// frequency offset large enough that the per-symbol residual is BEYOND the EQ-refine
+// recoverable range (the cold-lock regime). It then measures noise_variance_estimate
+// through the production CPE+LS path for two acquisitions:
+//   COLD  (no seed): the frame is demodulated as-is (coarse_freq_offset would be 0 on
+//     a cold fresh trial-0) -> the carrier offset's ICI inflates nv ABOVE 1.60 -> the
+//     SKIP-VAR drop. (FAIL-before: this is the wedge.)
+//   SEEDED (warm-start): the extraction mix pre-corrects the carrier by the settled
+//     seed (coarse_freq_offset = settled CFO) -> the demod sees a carrier-corrected
+//     frame -> nv drops BELOW 1.60 -> the seam frame passes the gate. (PASS-after.)
+// The seed correction is modeled exactly as the production extraction mix does it
+// (telecom_system.cc:2613/2652: mix at carrier_frequency + coarse_freq_offset), i.e.
+// a time-domain de-rotation of the baseband by the seed before symbol_demod — the
+// faithful equivalent of warm-starting coarse_freq_offset.
+// No IONOS/RF; pure in-process synthetic-fire through the production estimator.
+static double cfg0_cfo_seed_run(int seed_applied, double inject_omega)
+{
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_0);   // WB BPSK 1/16, channel_estimator == LEAST_SQUARE
+
+    int Nc = ts.ofdm.Nc;
+    int Nsymb = ts.ofdm.Nsymb;
+    int Nofdm = ts.data_container.Nofdm;
+    int Nfft = ts.ofdm.Nfft;
+    double power_normalization = sqrt((double)Nfft);
+
+    int nData = ts.ofdm.pilot_configurator.nData;
+    for (int d = 0; d < nData; d++)
+        ts.data_container.ofdm_time_freq_interleaved_data[d] = std::complex<double>(1.0, 0.0); // BPSK +1
+    ts.ofdm.framer(ts.data_container.ofdm_time_freq_interleaved_data, ts.data_container.ofdm_framed_data);
+    for (int i = 0; i < Nsymb; i++)
+        ts.ofdm.symbol_mod(&ts.data_container.ofdm_framed_data[i*Nc],
+                           &ts.data_container.ofdm_symbol_modulated_data[i*Nofdm]);
+
+    // Inject a TIME-DOMAIN carrier frequency offset (radians/sample) across the whole
+    // frame. dphi*t is the carrier phase ramp a real CFO produces at baseband; the seed
+    // is the settled estimate of that CFO. Choose inject_omega BEYOND the EQ-refine
+    // recoverable range so the COLD path cannot recover it (the cold-lock regime), and
+    // verify the SEED pre-correction does.
+    double dphi = inject_omega / (double)Nfft;           // rad per time sample (the carrier offset)
+    unsigned int rng = 0x1234abcdu;                       // deterministic LCG
+    int Ntot = Nofdm * Nsymb;
+    for (int t = 0; t < Ntot; t++)
+    {
+        std::complex<double> s = ts.data_container.ofdm_symbol_modulated_data[t] / power_normalization;
+        std::complex<double> rot = std::exp(std::complex<double>(0, dphi * (double)t));   // CFO
+        rng = rng*1664525u + 1013904223u; double n1 = ((rng>>9)/(double)(1u<<23)) - 0.5;
+        rng = rng*1664525u + 1013904223u; double n2 = ((rng>>9)/(double)(1u<<23)) - 0.5;
+        std::complex<double> noise(n1*0.13, n2*0.13);     // AWGN -> settled floor ~0.035
+        ts.data_container.baseband_data[t] = (s * rot + noise) * power_normalization;
+    }
+
+    // SEED warm-start: model the production extraction mix (telecom_system.cc:2613/2652
+    // mixes the frame at carrier_frequency + coarse_freq_offset). With the seed,
+    // coarse_freq_offset == the settled CFO == the injected offset, so the extraction
+    // pre-de-rotates the baseband by exactly dphi*t before symbol_demod. COLD path
+    // leaves the carrier offset in (coarse_freq_offset == 0).
+    if (seed_applied)
+    {
+        for (int t = 0; t < Ntot; t++)
+        {
+            std::complex<double> derot = std::exp(std::complex<double>(0, -dphi * (double)t));
+            ts.data_container.baseband_data[t] *= derot;
+        }
+    }
+
+    for (int i = 0; i < Nsymb; i++)
+        ts.ofdm.symbol_demod(&ts.data_container.baseband_data[i*Nofdm],
+                             &ts.data_container.ofdm_symbol_demodulated_data[i*Nc]);
+
+    std::complex<double>* in = ts.data_container.ofdm_symbol_demodulated_data;
+    // EQ-refine + per-symbol settle are DISABLED here (gate OFF) so the test isolates
+    // the ACQUISITION SEED's contribution alone (not the downstream EQ-refine). The
+    // production path runs BOTH (seed first, then refine on the small remaining
+    // residual); this test proves the seed's standalone effect on a cold-lock residual.
+    ts.ofdm.cfg0_freshrung_settle_enabled = false;
+    ts.ofdm.automatic_gain_control(in);
+    ts.ofdm.CPE_correction(in);
+    if (ts.ofdm.channel_estimator == ZERO_FORCE)
+        ts.ofdm.ZF_channel_estimator(in);
+    else
+        ts.ofdm.LS_channel_estimator(in);
+    return ts.ofdm.noise_variance_estimate;
+}
+
+static int run_cfg0_cfo_seed_selftest()
+{
+    printf("[TEST-CFG0-CFO-SEED] fresh-acquisition CFO seed self-test\n");
+    int fails = 0;
+    // A cold-lock residual: BEYOND the EQ-refine pilot-pair recoverable cliff
+    // (omega ~ 0.85 for Dy=3). The cold path cannot recover it; only owning the coarse
+    // CFO at acquisition (the seed) can. This is the FTR~0.2 marginal-lock regime the
+    // EQ-settling doc §3.1 names as the binding next-root.
+    const double OMEGA = 1.4;            // beyond the refine cliff -> acquisition must own it
+
+    if (std::getenv("MERCURY_CFOSEED_SWEEP")) {
+        for (double w = 0.0; w <= 2.5; w += 0.1) {
+            double cold = cfg0_cfo_seed_run(0, w);
+            double seed = cfg0_cfo_seed_run(1, w);
+            printf("[CFOSEED-SWEEP] omega=%5.2f  COLD nv=%.4f  SEEDED nv=%.4f  (ratio cold/seed=%.2f)\n",
+                   w, cold, seed, seed>1e-9?cold/seed:-1.0);
+        }
+    }
+
+    // ---- Cell A: cold-lock CFO frame. COLD (no seed) -> the carrier offset inflates
+    // nv ABOVE the CONFIG_0 ceiling 1.60 (FAIL-before, the SKIP-VAR drop). SEEDED ->
+    // the extraction pre-corrects the carrier -> nv BELOW 1.60 (PASS-after). ----
+    {
+        double nv_cold = cfg0_cfo_seed_run(0, OMEGA);
+        double nv_seed = cfg0_cfo_seed_run(1, OMEGA);
+        double nv_floor = cfg0_cfo_seed_run(1, 0.0);   // settled AWGN floor reference
+        const double CEIL = 1.60;                      // skip_var_nv_ceiling(CONFIG_0)
+        bool cold_drops  = (nv_cold > CEIL);                 // SKIP-VAR would drop it (FAIL-before)
+        bool seed_passes = (nv_seed < CEIL);                 // seed warm-start passes the gate
+        bool seed_floor  = (nv_seed < 1.5 * nv_floor + 1e-6);// seed drove it to the AWGN floor
+        bool ok = cold_drops && seed_passes && seed_floor;
+        printf("[TEST-CFG0-CFO-SEED]   CELL-A cold-lock CFO: COLD nv=%.4f (%s) SEEDED nv=%.4f (%s, floor=%.4f) -> %s\n",
+               nv_cold, cold_drops?"DROPS>1.60":"passes_unexpected",
+               nv_seed, (seed_passes&&seed_floor)?"PASSES<1.60@floor":"still-high", nv_floor,
+               ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell B: clean settled frame (no injected CFO). SEEDED ~= COLD (no-op): with
+    // no carrier offset the seed de-rotation is identity, and both are below 1.60. ----
+    {
+        double nv_cold = cfg0_cfo_seed_run(0, 0.0);
+        double nv_seed = cfg0_cfo_seed_run(1, 0.0);
+        bool cold_below = (nv_cold < 1.60);
+        bool noop = (std::abs(nv_seed - nv_cold) < 1e-9 ||
+                     (nv_cold > 0 && std::abs(nv_seed - nv_cold)/nv_cold < 0.02));
+        bool ok = cold_below && noop;
+        printf("[TEST-CFG0-CFO-SEED]   CELL-B clean no-op: COLD nv=%.4f SEEDED nv=%.4f -> %s\n",
+               nv_cold, nv_seed, ok?"PASS(no-op)":"FAIL(regression)");
+        if(!ok) fails++;
+    }
+
+    printf("[TEST-CFG0-CFO-SEED] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 // --test-acq-bounds: OFDM acquisition bounds-gate recovery regression
 // (fact-documents/data-flow-acq-bounds-gate.md). PROVES the force-FAIL gate in
 // cl_telecom_system::receive_byte (telecom_system.cc:1867) recovers a tail-band
@@ -1409,6 +1560,20 @@ int main(int argc, char *argv[])
             // clean settled frame is a no-op (legacy byte-identical). Pure in-process
             // synthetic-fire through the production CPE/LS estimator (no IONOS/RF).
             failed += run_cfg0_eq_settle_selftest();
+            // FRESH-ACQUISITION CFO SEED gate (data-flow-cfg0-cfo-acq-seed.md): the
+            // COMPLEMENTARY upstream fix — a cold-lock CFO residual BEYOND the
+            // EQ-refine recoverable range inflates nv > 1.60 (the SKIP-VAR drop) when
+            // the acquisition locks COLD, and falls below 1.60 when the acquisition is
+            // WARM-STARTED from the settled ROBUST/last-decoded CFO seed; a clean frame
+            // is a no-op (legacy byte-identical). Pure in-process synthetic-fire.
+            failed += run_cfg0_cfo_seed_selftest();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-cfg0-cfo-seed : run ONLY the fresh-acquisition CFO seed regression
+        // (cold-lock CFO nv > 1.60, seeded nv < 1.60; clean no-op) and exit.
+        // See data-flow-cfg0-cfo-acq-seed.md §6.
+        if (strcmp(argv[i], "--test-cfg0-cfo-seed") == 0) {
+            int failed = run_cfg0_cfo_seed_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // --test-cfg0-eq-settle : run ONLY the fresh-rung CONFIG_0 SKIP-VAR seam

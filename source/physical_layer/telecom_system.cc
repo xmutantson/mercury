@@ -117,6 +117,7 @@ cl_telecom_system::cl_telecom_system()
 	test_puncture_nBits=0;
 	last_coarse_freq_offset=0.0;
 	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
+	cfo_acq_seed_hz=0.0;  // CFO acquisition seed (data-flow-cfg0-cfo-acq-seed.md): no-seed default
 	ctrl_nBits=0;
 	ctrl_nsymb=0;
 	mfsk_ctrl_mode=false;
@@ -1151,6 +1152,38 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 	// Coarse frequency offset - starts at 0, only searched on trial 1 if trial 0 fails
 	double coarse_freq_offset = 0.0;
+
+	// CFO ACQUISITION SEED — CONSUMER (data-flow-cfg0-cfo-acq-seed.md §3.3).
+	// WARM-START the cold trial-0 of a FRESH WB-OFDM acquisition from the settled
+	// carrier offset the prior CONFIDENT decode (incl. the ROBUST/MFSK rung that
+	// precedes cfg0) demodulated at. Without this the fresh cfg0 frame-0 locks COLD
+	// (coarse_freq_offset==0) -> the fine Moose (:2704) measures the FULL offset from
+	// a marginal preamble (FTR~0.2) -> residual CFO -> frame-0 nv spike -> SKIP-VAR
+	// drop. Seeding coarse_freq_offset means the extraction mix (:2613/:2652) is
+	// carrier-corrected, so Moose measures only the SMALL residual -> strong lock ->
+	// low nv -> the seam frame passes the gate AND decodes. The EQ-refine (df844683)
+	// is complementary: it cleans whatever residual remains.
+	//
+	// Scope: GATED (in-band CONFIG_0..6), WB OFDM only (not NB — different geometry,
+	// Moose skipped there; not MFSK/robust — they own the wb_mfsk path; not BER-
+	// forced). The per-call coarse search (:2353) + later trials are UNCHANGED, so a
+	// wrong seed costs nothing (trial-1 re-acquires exactly as today): the seed only
+	// WARM-STARTS, it never removes acquisition reach (INV-A). 0/invalid seed ->
+	// untouched cold path (byte-identical).
+	if(ofdm.cfg0_freshrung_settle_enabled &&
+	   M != MOD_MFSK && !narrowband_enabled &&
+	   mfsk_fixed_delay < 0 && ofdm_forced_delay < 0 &&
+	   cfo_acq_seed_hz != 0.0)
+	{
+		double seed_bound = bandwidth / (double)data_container.Nc; // 1 subcarrier (~47 Hz WB)
+		if(fabs(cfo_acq_seed_hz) <= seed_bound)
+		{
+			coarse_freq_offset = cfo_acq_seed_hz;
+			if(g_verbose)
+				printf("[CFO-SEED] fresh WB-OFDM acq cfg=%d warm-started coarse=%.4f Hz from settled CFO\n",
+					current_configuration, coarse_freq_offset);
+		}
+	}
 
 	if(mfsk_fixed_delay >= 0)
 	{
@@ -3493,6 +3526,30 @@ skip_h_retry_point:
 				}
 
 				receive_stats.message_decoded=YES;
+
+				// CFO ACQUISITION SEED — PRODUCER (data-flow-cfg0-cfo-acq-seed.md §3.1).
+				// Latch the settled NET carrier offset this frame demodulated at
+				// (coarse_freq_offset - freq_offset_measured, matching the re-mix sign at
+				// :2803) so the NEXT fresh WB-OFDM acquisition can WARM-START instead of
+				// locking COLD. The carrier offset is config-independent, so a ROBUST/MFSK
+				// success is the seed that crosses ROBUST->cfg0 (the binding next-root the
+				// EQ-refine §3.1 names). GATED behind the in-band cfg0-freshrung gate, so
+				// legacy/gate-off NEVER writes it (byte-identical). For MFSK we latch ONLY a
+				// CONFIDENT wb_mfsk residual: freq_offset_measured==0 means either the
+				// estimator returned low |C|/E (no estimate) OR NB-MFSK (always 0, different
+				// geometry) — in both cases keep the prior seed rather than poison it with 0.
+				// Bound to +-1 subcarrier (the Moose clamp at :2764); a wild value cannot be
+				// a real crystal offset and must not seed the next lock.
+				if(ofdm.cfg0_freshrung_settle_enabled)
+				{
+					double seed_candidate = coarse_freq_offset - freq_offset_measured;
+					double seed_bound = bandwidth / (double)data_container.Nc; // 1 subcarrier (~47 Hz WB)
+					bool seed_ok = (fabs(seed_candidate) <= seed_bound);
+					bool mfsk_confident = (M != MOD_MFSK) || (freq_offset_measured != 0.0);
+					if(seed_ok && mfsk_confident)
+						cfo_acq_seed_hz = seed_candidate;
+				}
+
 				if(M != MOD_MFSK)
 				{
 					printf("[OFDM-OK] t%d cfg=%d delay=%d iter=%d freq=%.1f var=%.4f meanH=%.3f SNR=%.1f coarse=%.1f\n",
@@ -3725,6 +3782,7 @@ skip_h_retry_point:
 				fflush(stdout);
 				receive_stats.freq_offset_of_last_decoded_message = 0;
 				last_coarse_freq_offset = 0.0;
+				cfo_acq_seed_hz = 0.0;  // CFO acq seed (data-flow-cfg0-cfo-acq-seed.md INV-C): a sustained-fail run means the seed is provably poison too — drop it so the next acquisition re-measures cold rather than re-seeding a dead carrier.
 				consecutive_ofdm_decode_fails = 0;  // armed again; one scrub per run
 			}
 		}
@@ -5786,6 +5844,7 @@ void cl_telecom_system::init()
 	receive_stats.SNR=-99.9;
 	receive_stats.signal_stregth_dbm=-999;
 	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
+	cfo_acq_seed_hz=0.0;  // CFO acq seed (data-flow-cfg0-cfo-acq-seed.md): a full init() is a fresh session — no carrier known yet. (NOT reset in load_configuration: the seed survives a config change, §3.2.)
 
 }
 
@@ -11545,7 +11604,14 @@ void cl_telecom_system::load_configuration(int configuration)
 
 	// Invalidate cached sync state from previous config - frame timing differs
 	// between configs (preamble_nSymb varies 4 OFDM / 8 NB MFSK / 16 WB MFSK),
-	// so old values would be wrong
+	// so old values would be wrong.
+	// CFO-SEED CARRY (data-flow-cfg0-cfo-acq-seed.md §3.2): the TIMING reset below is
+	// legit (delay depends on preamble length, which is config-dependent), but the
+	// CARRIER offset is config-INDEPENDENT (crystal/clock mismatch). cfo_acq_seed_hz
+	// is deliberately NOT scrubbed here so the settled carrier survives the
+	// ROBUST->cfg0 cross and warm-starts the fresh cfg0 acquisition. (The legacy
+	// freq_offset_of_last_decoded_message scrub stays as-is; the seed is a distinct,
+	// gated, carry-forward member.)
 	receive_stats.delay_of_last_decoded_message = -1;
 	receive_stats.freq_offset_of_last_decoded_message = 0;
 	consecutive_ofdm_decode_fails = 0;  // STALE-CFO scoped reset: config change re-acquires fresh
