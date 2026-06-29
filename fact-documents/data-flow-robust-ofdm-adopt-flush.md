@@ -1221,3 +1221,35 @@ Why this does NOT regress acquisition of the REAL burst (the load-bearing constr
 - COLD arm: no deadline (legacy/inband-off) → ftr stays 8 (byte-identical).
 Asserts the SKIP-VAR/search count during the gap drops to ~0 (PASS) vs N (DEFEAT) while the real-burst arm
 still acquires. Master `--test` exit 0 (M=0).
+
+### §VF2.5 CMD-SIDE sibling — the DOMINANT storm (VERIFIED by the fleet A/B, the RSP gate alone was insufficient)
+
+The first faithful real-audio A/B (fleet .11, WGN:40 seed2001, FIX binary, redesign env) showed the RSP-side
+gate (§VF2.2) FIRED (armed 20×, suppressed) yet rx_bytes stayed 177 B and the storm persisted at **408
+[CMD] FTR-FAIL CONFIG_0** — and the DEFEAT arm (same binary) was identical (456 SKIP-VAR / 177 B). The storm
+log lines were ALL `[CMD]` (commander), not `[RSP]`. ROOT (VERIFIED by the log + code read): the storm is on
+the COMMANDER, not the responder. After a forward batch TX the CMD waits in RECEIVING_ACKS_DATA for the
+reverse ACK. The MFSK detector runs first each poll; when it does NOT fire (the whole turnaround gap before
+the MFSK SACK arrives), the CMD's v2 SACK dispatch (arq_commander.cc, `if(!mfsk_handled_this_poll)`) FORCES
+`frames_to_read = 0` and runs a fresh OFDM forward-preamble `receive()` EVERY poll — looking for an OFDM
+SACK_RSP that, at a WB rung (reverse ACK is MFSK), the RSP never sends. That OFDM search false-locks the
+~0.50 GI plateau → SKIP-VAR every poll. The RSP-side ftr gate is irrelevant here because this site
+re-forces `ftr=0` each poll, bypassing the anti-spin.
+
+FIX: arm the SAME turnaround suppress window on the CMD at its data-ACK wait entry
+(`calculate_receiving_timeout` COMMANDER `ack_pattern_time_ms>0` branch — every RECEIVING_ACKS_DATA
+transition routes through it, in lockstep t0 with `receiving_timer`), and SKIP the forced-ftr0 OFDM dispatch
+while `inband_cmd_suppress_ofdm_ack_dispatch()` is true (window active AND
+`reverse_ack_uses_robust_geometry(current_configuration)` — the reverse ACK is MFSK/robust-geometry, true
+for every non-robust OFDM config). The MFSK detector (which runs FIRST each poll) carries the wait; the OFDM
+dispatch resumes when the window ages out (a late OFDM SACK_RSP, if any, lands then), so a NB session (OFDM
+SACK_RSP, reverse_ack_uses_robust_geometry handles NB via the suffix early-return) and a genuine loss are
+preserved (window ages out → dispatch resumes → timeout → demote). Inband + window + reverse-MFSK gated; off
+→ the dispatch runs verbatim → legacy byte-identical. FAIL-BEFORE: the same
+`MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1` knob disables both the RSP and CMD gates.
+
+§5 audit delta (CMD turnaround state ↔ CMD OFDM SACK dispatch ↔ MFSK ACK detector): the suppressed dispatch
+is the CMD's forward OFDM search; its only legitimate consumer at a WB rung's turnaround is an OFDM SACK_RSP
+the RSP does not send there (it sends MFSK). The MFSK detector is UNGATED (runs before the suppress), so the
+reverse ACK is never missed. The window is the same one-shot timer as §VF2.2 (one consumer per side); the CMD
+and RSP arm it independently at their own turnaround entries.

@@ -4270,6 +4270,23 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					}
 #endif // MFSK_ACK_SACK_ENABLED
 
+					// §VAR-FIX-2 CMD-SIDE GATE (data-flow-robust-ofdm-adopt-flush.md §VF2.5): while the
+					// CMD reverse-ACK turnaround window is active AND the reverse ACK is MFSK/robust-geometry
+					// (e.g. CONFIG_0), the MFSK detector above carries the wait and the RSP never sends an OFDM
+					// SACK_RSP at this rung — so the forced-ftr0 OFDM forward search below would only storm the
+					// ~0.50 GI plateau (the 408 [CMD] FTR-FAIL CONFIG_0 SKIP-VAR storm). SKIP the OFDM dispatch
+					// this poll; it resumes when the window ages out (a late OFDM SACK_RSP, if any, lands then).
+					// Inband + window + reverse-MFSK gated; off -> false -> the dispatch runs verbatim.
+					if(!mfsk_handled_this_poll && inband_cmd_suppress_ofdm_ack_dispatch())
+					{
+						static int rxgate_cmd_logn = 0;
+						if(rxgate_cmd_logn < 32) { rxgate_cmd_logn++;
+							printf("[CMD] [INBAND-RX] REVACK-RXGATE: skip forced OFDM SACK dispatch during the "
+								"MFSK reverse-ACK turnaround (CONFIG_%d) — MFSK detector carries the wait\n",
+								current_configuration);
+							fflush(stdout); }
+						mfsk_handled_this_poll = true;   // consume the poll without an OFDM forward search
+					}
 					if(!mfsk_handled_this_poll)
 					{
 					// §7.13.30 — pure OFDM dispatch. v2 sessions never send

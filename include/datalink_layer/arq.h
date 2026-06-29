@@ -3912,6 +3912,11 @@ public:
   // when the feature is off / the window has aged out -> legacy/inband-steady byte-identical.
   int  inband_revack_rxgate_ftr(int default_ftr, bool frame_decoded_this_pass);
   bool inband_revack_rxgate_defeat();            // A/B FAIL-BEFORE: MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1
+  // §VAR-FIX-2 CMD-side: TRUE while the commander reverse-ACK turnaround window is active AND the reverse
+  // ACK is MFSK/robust-geometry (e.g. CONFIG_0) -> SKIP the forced-ftr0 OFDM SACK dispatch this poll so the
+  // CMD does not storm the forward OFDM search during the MFSK-ACK wait. Off/aged-out -> false (dispatch
+  // runs verbatim). See arq_commander.cc the v2 OFDM dispatch site.
+  bool inband_cmd_suppress_ofdm_ack_dispatch();
   int  test_inband_revack_rxgate();              // directed regression (--test-inband-revack-rxgate)
   int  inband_test_forced_down_delay = -1;    // TEST-ONLY: forced preamble delay for scoped decoders (-1=real acquisition)
   // TEST-ONLY: when true, emit_config_tag_passband runs its firing-decision state

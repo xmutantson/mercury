@@ -1556,6 +1556,11 @@ void cl_arq_controller::calculate_receiving_timeout()
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			set_receiving_timeout(timeout);
+			// §VAR-FIX-2 CMD-SIDE: this is the commander's post-forward-TX data-ACK wait entry (every
+			// RECEIVING_ACKS_DATA transition routes through here). Arm the reverse-ACK turnaround suppress
+			// window so the CMD does not storm the forced-ftr0 OFDM SACK dispatch during the MFSK reverse-ACK
+			// wait (inband_cmd_suppress_ofdm_ack_dispatch consults this). No-op when the feature is off.
+			inband_arm_revack_turnaround_window();
 		}
 		else
 		{
@@ -5496,6 +5501,31 @@ int cl_arq_controller::inband_revack_rxgate_ftr(int default_ftr, bool frame_deco
 		remaining_ms, default_ftr, remaining_syms, current_configuration, cap);
 	fflush(stdout);
 	return (int)remaining_syms;
+}
+
+// §VAR-FIX-2 CMD-SIDE gate (the SYMMETRIC sibling — VERIFIED the dominant storm by the fleet A/B).
+// After a forward batch TX the COMMANDER waits in RECEIVING_ACKS_DATA for the reverse ACK. At an OFDM
+// rung whose reverse ACK is keyed on the MFSK/robust geometry (reverse_ack_uses_robust_geometry — true for
+// every non-robust OFDM config, e.g. CONFIG_0), the reverse ACK arrives as an MFSK SACK that the CMD's
+// MFSK detector handles. But when the MFSK detector does NOT fire on a poll, the CMD's v2 SACK dispatch
+// FORCES frames_to_read=0 and runs a fresh OFDM forward-preamble search every poll (arq_commander.cc) —
+// looking for an OFDM SACK_RSP that, at this rung, the RSP never sends. That OFDM search false-locks the
+// ~0.50 GI plateau -> SKIP-VAR, EVERY poll across the turnaround gap (the measured 408 [CMD] FTR-FAIL
+// CONFIG_0 storm; the RSP-side gate alone left fix==defeat at 177 B). This predicate SUPPRESSES that forced
+// OFDM dispatch while the CMD reverse-ACK turnaround window is active AND the reverse ACK is MFSK-geometry,
+// so the MFSK detector (which still runs FIRST each poll) carries the gap; the OFDM dispatch resumes once
+// the window ages out (when a late OFDM SACK_RSP, if any, would actually be due). Inband-scoped + window-
+// gated + A/B-defeatable -> off/aged-out -> the dispatch runs verbatim (legacy byte-identical).
+bool cl_arq_controller::inband_cmd_suppress_ofdm_ack_dispatch()
+{
+	if(!inband_rate_feature_enabled()) return false;
+	if(inband_revack_rxgate_defeat()) return false;
+	if(inband_revack_turnaround_budget_ms <= 0) return false;
+	// only at an OFDM rung whose reverse ACK is MFSK/robust-geometry (CONFIG_0..15 non-robust); at a rung
+	// where the RSP keys an OFDM SACK_RSP we must keep polling OFDM, so do NOT suppress there.
+	if(!reverse_ack_uses_robust_geometry(current_configuration)) return false;
+	int elapsed = inband_revack_turnaround_timer.get_elapsed_time_ms();
+	return elapsed < inband_revack_turnaround_budget_ms;   // window still active -> suppress the OFDM poll
 }
 
 // down-ladder, and on none-pass advances the terminal-BREAK dead-batch streak. The
