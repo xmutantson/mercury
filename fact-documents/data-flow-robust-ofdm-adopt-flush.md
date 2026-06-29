@@ -1283,3 +1283,48 @@ binding constraint on delivery is the redesign's ROBUST→cfg0 CROSS/CLIMB failu
 real (one run had both arms 0 B / no-connect — a connect flake, fix==defeat so not the gate). Honest scope:
 this fix removes the storm and its wasted RX cycles + the pin-starvation pressure; it does not by itself make
 the redesign deliver at cfg0. The climb/cross layer is the next investigation, NOT another search-gate.
+
+### §VF2.7 CONNECT-PHASE EXCLUSION — fix the rxgate CONNECT regression (the §VF2.6 "connect flake" was the gate)
+
+ROOT (code-verified): `inband_arm_revack_turnaround_window()` (arq_common.cc — the SINGLE producer of
+`inband_revack_turnaround_budget_ms` / `inband_revack_turnaround_timer`) is reached from 5 sites. TWO fire
+during the pre-link CONNECT / CONTROL-ACK turnaround, not a data-batch turnaround:
+- RSP `process_messages_acknowledging_control()` (connection_status==ACKNOWLEDGING_CONTROL, dispatched at
+  arq_responder.cc:35) → `send_ack_pattern_with_snr()` (arq_responder.cc:1785) and
+  `send_ack_pattern(control_ack=true)` (arq_responder.cc:1795). This is the TEST_CONNECTION_ACK handshake
+  echo + the SET_CONFIG / KEY_EXCHANGE control ACKs. NOTE: `link_status` is already CONNECTED here
+  (set at arq_responder.cc:3069 BEFORE the echo is queued), so a link-state guard ALONE is insufficient.
+- CMD `calculate_receiving_timeout()` COMMANDER `ack_pattern_time_ms>0` branch (arq_common.cc:1563) is also
+  reached from the `RECEIVING_ACKS_CONTROL` control-ACK wait (connection_status set at arq_commander.cc:1730,
+  arm at calculate_receiving_timeout:1743).
+
+CONSEQUENCE (the §VF2.6 "connect flake", now explained): after the control ACK the side's NEXT RX is a
+forward burst it must ACQUIRE at full search cadence (the commander's TEST_CONNECTION, or the first forward
+DATA batch at the new config). The armed window instead SLOW-POLLS / suppresses that forward search →
+acquisition is starved → CONNECT fails. Measured: conn 6/12 (FIX) vs 11/12 (legacy). The gate's suppress
+window — meant for the inter-BATCH turnaround gap — was bleeding into link establishment.
+
+FIX (single choke point at the producer): arm ONLY in the DATA phase — `link_status==CONNECTED` AND
+`connection_status` NOT a control-ACK state (`!= ACKNOWLEDGING_CONTROL && != RECEIVING_ACKS_CONTROL`). This
+excludes EVERY pre-link state (LISTENING/CONNECTION_RECEIVED/CONNECTING/NEGOTIATING/CONNECTION_ACCEPTED →
+not CONNECTED) AND the CONNECTED-but-control turnarounds (handshake echo, SET_CONFIG/KEY_EXCHANGE ACK, CMD
+control-ACK wait). Data turnarounds STILL arm: RSP `ACKNOWLEDGING_DATA` (process_messages_acknowledging_data,
+sites 2334/2558/2568/2587/2594), CMD `RECEIVING_ACKS_DATA` (calculate_receiving_timeout data branch), and the
+RSP `RECEIVING` prev-batch redelivery ACK (process_messages_rx_data_control sites 532/1410/1393). connection_
+status is authoritative at every arm site (the responder dispatcher keys the RSP sites on it; the CMD wait
+sites set it before calculate_receiving_timeout). Inband-gated already; pre-link/control → budget stays 0 →
+the consumers (inband_revack_rxgate_ftr, inband_cmd_suppress_ofdm_ack_dispatch) fall back to the stock
+anti-spin / verbatim OFDM dispatch → CONNECT byte-identical to legacy. Same RXGATE_DEFEAT A/B knob.
+
+§5 audit delta (producer/consumer of the turnaround window vs the CONNECT/control state machine):
+- Producer: `inband_arm_revack_turnaround_window()` (the only writer). Now reads link_status +
+  connection_status and refuses to arm outside the data phase. Setting budget=0 on a control turnaround
+  cannot clobber a live data window — control turnarounds only occur at link setup / SET_CONFIG, between
+  data batches, never mid-data-turnaround.
+- Consumers UNCHANGED: both already treat budget<=0 as "inactive" → legacy fallback. No consumer assumption
+  altered; the fix only narrows WHEN the producer arms.
+- Test: `test_inband_revack_rxgate()` (arq_responder.cc) gains CONNECT (a)..(d): (a) pre-link
+  CONNECTION_RECEIVED → budget==0; (b) CONNECTED+ACKNOWLEDGING_CONTROL (handshake echo) → budget==0;
+  (c) CONNECTED+RECEIVING_ACKS_CONTROL (CMD control wait) → budget==0; (d) NEGATIVE: CONNECTED+
+  ACKNOWLEDGING_DATA → budget>0 (data turnaround NOT over-excluded). FAIL-BEFORE: drop the guard → (a)(b)(c)
+  arm → starve the CONNECT/forward search.

@@ -5452,6 +5452,30 @@ bool cl_arq_controller::inband_revack_rxgate_defeat()
 void cl_arq_controller::inband_arm_revack_turnaround_window()
 {
 	if(!inband_rate_feature_enabled()) { inband_revack_turnaround_budget_ms = 0; return; }
+	// §VF2.7 CONNECT-PHASE EXCLUSION (data-flow-robust-ofdm-adopt-flush.md §VF2.7): the suppress window is a
+	// DATA-PHASE turnaround discipline only — it slow-polls the forward search across the inter-BATCH gap. It
+	// MUST NOT arm during the pre-link CONNECT handshake / any CONTROL-ACK turnaround. The 5 arm sites include
+	// process_messages_acknowledging_control() (send_ack_pattern(control_ack=true)/send_ack_pattern_with_snr:
+	// the TEST_CONNECTION_ACK handshake echo + SET_CONFIG/KEY_EXCHANGE control ACKs) and the CMD
+	// RECEIVING_ACKS_CONTROL calculate_receiving_timeout() pattern-ACK branch. Arming there slow-polls the
+	// forward search the side needs to ACQUIRE the next handshake/forward burst -> CONNECT is starved
+	// (fleet A/B: rxgate arm fired pre-link, conn 6/12 vs legacy 11/12). EXCLUDE the pre-link CONNECT phase:
+	// arm ONLY when link is established (link_status==CONNECTED) AND this is NOT a control-ACK turnaround
+	// (connection_status != ACKNOWLEDGING_CONTROL/RECEIVING_ACKS_CONTROL). Data turnarounds (ACKNOWLEDGING_DATA
+	// on the RSP, RECEIVING_ACKS_DATA on the CMD, RECEIVING prev-batch redelivery) still arm. The dispatcher
+	// process_messages_responder() (arq_responder.cc:35-48) keys the RSP arm sites on these exact states, and
+	// the CMD wait sites set connection_status before calculate_receiving_timeout(), so connection_status is
+	// the authoritative discriminator at every arm site. Off/pre-link -> budget stays 0 -> the consumers
+	// (inband_revack_rxgate_ftr / inband_cmd_suppress_ofdm_ack_dispatch) fall back to the stock anti-spin /
+	// verbatim OFDM dispatch (CONNECT byte-identical to legacy). A/B-defeatable via the same RXGATE_DEFEAT knob
+	// (which already returns the consumers to legacy regardless of the window).
+	if(link_status != CONNECTED
+	   || connection_status == ACKNOWLEDGING_CONTROL
+	   || connection_status == RECEIVING_ACKS_CONTROL)
+	{
+		inband_revack_turnaround_budget_ms = 0;   // pre-link / control turnaround -> do NOT suppress the search
+		return;
+	}
 	// The suppress window spans the WHOLE inter-batch turnaround the receiving_timeout already bounds (CMD
 	// detect+process+re-air, RSP partial-batch re-air-drain). A fixed "gap-before-burst" guess (the prior
 	// RSP_DECODE+ptt+msg_time ~1.8s) UNDER-covered the ~13s cfg0 batch period, so the storm ran in the long

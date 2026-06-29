@@ -9790,6 +9790,66 @@ int cl_arq_controller::test_inband_revack_rxgate()
 		delete rx; delete ts;
 	}
 
+	// ---- CONNECT-PHASE EXCLUSION (§VF2.7 connectfix; FAIL-BEFORE: drop the link/control guard in
+	//      inband_arm_revack_turnaround_window -> these arm -> the CONNECT/forward search is slow-polled and
+	//      starved). The window is a DATA-PHASE turnaround discipline; it MUST NOT arm during the pre-link
+	//      CONNECT handshake or any CONTROL-ACK turnaround. Each sub-case is a state the arm fires in on the
+	//      live path; ALL must leave budget==0 so the next forward acquisition runs at full search cadence.
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+
+		// (a) pre-link CONNECT handshake: the RSP just decoded START_CONNECTION / is awaiting TEST_CONNECTION.
+		//     link_status is a pre-CONNECTED state — arming here slow-polls the forward search the responder
+		//     needs to ACQUIRE the commander's TEST_CONNECTION (the measured 6/12-vs-11/12 connect regression).
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1;
+			rx->link_status = CONNECTION_RECEIVED; rx->connection_status = RECEIVING;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms == 0,
+				"CONNECT (a): pre-link (link_status!=CONNECTED) -> window NOT armed -> forward search at full cadence");
+			delete rx; delete ts;
+		}
+
+		// (b) handshake echo / SET_CONFIG / KEY_EXCHANGE control-ACK turnaround on the RSP: link_status flips
+		//     to CONNECTED before the TEST_CONNECTION_ACK echo is sent (arq_responder.cc:3069), so the link-
+		//     state guard alone is insufficient — connection_status==ACKNOWLEDGING_CONTROL is the discriminator.
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1;
+			rx->link_status = CONNECTED; rx->connection_status = ACKNOWLEDGING_CONTROL;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms == 0,
+				"CONNECT (b): CONNECTED but ACKNOWLEDGING_CONTROL (handshake echo / SET_CONFIG ACK) -> window NOT armed");
+			delete rx; delete ts;
+		}
+
+		// (c) CMD control-ACK wait (RECEIVING_ACKS_CONTROL): the commander's pattern-ACK control wait routes
+		//     through calculate_receiving_timeout()'s arm; the next RX is a forward burst, not a turnaround gap.
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1; rx->role = COMMANDER;
+			rx->link_status = CONNECTED; rx->connection_status = RECEIVING_ACKS_CONTROL;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms == 0,
+				"CONNECT (c): CONNECTED but RECEIVING_ACKS_CONTROL (CMD control-ACK wait) -> window NOT armed");
+			delete rx; delete ts;
+		}
+
+		// (d) NEGATIVE CONTROL — the data turnaround (CONNECTED + a data-ACK state) STILL arms (the gate did
+		//     not over-exclude). RECEIVING here = the RSP data-phase / prev-batch redelivery turnaround.
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1;
+			rx->link_status = CONNECTED; rx->connection_status = ACKNOWLEDGING_DATA;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms > 0,
+				"CONNECT (d) NEGATIVE: CONNECTED + ACKNOWLEDGING_DATA (data turnaround) -> window STILL armed (not over-excluded)");
+			delete rx; delete ts;
+		}
+	}
+
 	set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
 #if defined(_WIN32)
 	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
