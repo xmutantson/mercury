@@ -9861,6 +9861,76 @@ int cl_arq_controller::test_inband_revack_rxgate()
 }
 
 // ============================================================================
+// §CROSS — PROGRESSING-BATCH FUTILE-NACK SUPPRESSION — --test-inband-progressing-nack
+// data-flow-robust-ofdm-adopt-flush.md §CROSS.4
+// ============================================================================
+//
+// The down-ladder cannot-follow NACK_DECODE_FAIL must NOT fire while the current batch is
+// PROGRESSING (batch_rx_frame_count >= 1): the RSP has already stored >=1 DATA frame of this
+// batch at the current config, so the CONFIG_TAG is provably present and the missing frames are
+// a PARTIAL batch the SACK/retx path owns — a NACK there is futile AND harmful (its ~1.5 s
+// reverse burst starves forward capture -> the cfg0-cross death-spiral). This drives the EXACT
+// production predicate inband_progressing_batch_suppresses_nack():
+//   FIX (gate active): batch_rx_frame_count>=1 -> SUPPRESS (true).
+//   ZERO-FRAME (genuine lost-tag / total-loss): batch_rx_frame_count==0 -> NACK ALLOWED (false).
+//   DEFEAT (FAIL-BEFORE, MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1, same binary): even a
+//          progressing batch is NOT suppressed -> the futile NACK fires (reproduces the bug).
+int cl_arq_controller::test_inband_progressing_nack()
+{
+	const char* TAG = "[TEST-INBAND-PROGRESSING-NACK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what){
+		if(cond) printf("%s PASS: %s\n", TAG, what);
+		else   { printf("%s FAIL: %s\n", TAG, what); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_rate = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_rate_saved = prev_rate ? std::string(prev_rate) : std::string();
+	bool had_prev_rate = (prev_rate != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+	set_env("MERCURY_INBAND_PROGRESSING_NACK_DEFEAT", "");   // start in the FIXED state
+
+	cl_arq_controller* rx = new cl_arq_controller();
+	rx->inband_rate_enabled = 1;
+	rx->inband_progressing_nack_defeat_cached = -1;          // force a fresh env read
+
+	// PROGRESSING batch (>=1 frame stored at current config) -> SUPPRESS the futile NACK.
+	rx->batch_rx_frame_count = 5;
+	check(rx->inband_progressing_batch_suppresses_nack(),
+		"FIX: a progressing batch (batch_rx_frame_count=5) SUPPRESSES the futile NACK");
+
+	rx->batch_rx_frame_count = 1;
+	check(rx->inband_progressing_batch_suppresses_nack(),
+		"FIX: even a single stored frame (batch_rx_frame_count=1) SUPPRESSES the NACK");
+
+	// ZERO-frame batch (genuine lost-tag / total-loss) -> NACK MUST be allowed (no-regress).
+	rx->batch_rx_frame_count = 0;
+	check(!rx->inband_progressing_batch_suppresses_nack(),
+		"NO-REGRESS: a zero-frame batch (batch_rx_frame_count=0) ALLOWS the genuine lost-tag NACK");
+
+	// FAIL-BEFORE: the defeat knob restores the futile NACK even on a progressing batch.
+	set_env("MERCURY_INBAND_PROGRESSING_NACK_DEFEAT", "1");
+	rx->inband_progressing_nack_defeat_cached = -1;          // re-read the env
+	rx->batch_rx_frame_count = 5;
+	check(!rx->inband_progressing_batch_suppresses_nack(),
+		"DEFEAT (fail-before): a progressing batch is NOT suppressed -> the futile NACK fires");
+	set_env("MERCURY_INBAND_PROGRESSING_NACK_DEFEAT", "");
+
+	delete rx;
+	set_env("MERCURY_INBAND_RATE", had_prev_rate ? prev_rate_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band FORWARD-HEALTHY REVERSE-ACK MISS → NO-BREAK DELIVER — --test-inband-deliver
 // data-flow-inband-retx-epoch.md §5.  (the 785-frame decode-but-0-deliver rework)
 // ============================================================================

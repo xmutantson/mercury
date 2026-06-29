@@ -1328,3 +1328,137 @@ anti-spin / verbatim OFDM dispatch → CONNECT byte-identical to legacy. Same RX
   (c) CONNECTED+RECEIVING_ACKS_CONTROL (CMD control wait) → budget==0; (d) NEGATIVE: CONNECTED+
   ACKNOWLEDGING_DATA → budget>0 (data turnaround NOT over-excluded). FAIL-BEFORE: drop the guard → (a)(b)(c)
   arm → starve the CONNECT/forward search.
+
+---
+
+## §CROSS — the ROBUST→cfg0 CROSS death-spiral: a FUTILE NACK_DECODE_FAIL on an ACTIVELY-PROGRESSING batch starves forward capture (VERIFIED root; fix implemented 2026-06-28)
+
+§VAR-FIX-2 left the binding constraint as "the redesign's ROBUST→cfg0 CROSS/CLIMB failure." §CROSS is the
+VERIFIED root of that failure (instrumented real-audio A/B, mercury_crossbase @ fa8b8e92, WGN:40 seed2001,
+snd-aloop native ELF, .31).
+
+### §CROSS.1 The cross DECODES — the collapse is NOT a decode/variance bug (VERIFIED)
+At the cfg0 cross the RSP decodes cfg0 cleanly: **38 [OFDM-OK] cfg=0, 0 [OFDM-FAIL]**, var 0.0357, meanH
+0.979, iter=0. The §17 descrambler + §22 gi-inherit + §VAR-FIX rxgate fixes ALL engage (SKIP-VAR down 607→56;
+the storm is gated). The original task framing ("cfg0 DATA frames SKIP-VAR after a clean lock = bad
+equalizer/channel state") is FALSIFIED for the residual: clean cfg0 frames decode byte-correct. Legacy on the
+SAME audio crosses + delivers 11339 B (configs_seen [0,100,101,102], wb=[0]); redesign delivers 147 B,
+wb=[], breaks=1.
+
+### §CROSS.2 The death-spiral (VERIFIED — the per-batch SACK bitmaps DEGRADE)
+The forward batch never COMPLETES, and progressively LOSES frames each period (ACK-GATE-DIAG):
+
+| batch_seq_id | received seqs | bitmap | rx/exp |
+|---|---|---|---|
+| 3 | 1 2 3 4 5 | 0x3e | 5/6 |
+| 4 | 2 3 4 | 0x1c | 3/6 |
+| 5..8 | 2 3 | 0x0c | 2/6 |
+
+Frame **seq 0 is ALWAYS lost** (the acquisition-seam frame that bears the fresh OFDM anchor + the CONFIG_TAG
+burst, main.cc:1117); then frames 1 and 5 also drop, converging on only the middle seqs 2,3. The session
+delivers ~147 B and never sustains the climb.
+
+### §CROSS.3 ROOT — the down-ladder fires + emits a FUTILE NACK_DECODE_FAIL on a HEALTHY progressing batch
+During the inter-frame gaps of an actively-receiving cfg0 batch (frame 6 not yet arrived, or seq-0 retransmit
+pending), the RSP firing gate (arq_responder.cc:626-634: fresh-window-decoded + status!=RECEIVED + OFDM +
+bsi>=0) fires `inband_try_down_ladder_on_decode_fail`. The down-ladder correctly skips all ROBUST trials
+(holding the cfg0 lock) → "no config in window decoded" → and on the first such pass per dead-streak segment
+**emits a NACK_DECODE_FAIL** (arq_common.cc:5674-5679). That NACK is:
+- **Semantically FALSE**: it tells the CMD "I cannot follow / I am stuck below your announced config" — but the
+  RSP has decoded 1..5 frames of THIS batch at cfg0 (`batch_rx_frame_count >= 1`), PROVING the CONFIG_TAG
+  arrived and the RSP IS at cfg0. The CMD correctly reads it as "not a climb-miss (announced idx=-1) → no
+  accelerated demote" (arq_common.cc:3932-3941) — i.e. the NACK accomplishes NOTHING.
+- **Actively HARMFUL**: each NACK is a ~75920-sample (~1.5 s) reverse passband burst (arq_common.cc:2821
+  tx_transfer). While the RSP keys that reverse burst it CANNOT capture the forward cfg0 burst → it misses the
+  seq-0 retransmit AND the early frames of the NEXT batch → the bitmap degrades 5/6→3/6→2/6. A 1-frame
+  acquisition-seam miss is amplified into a death spiral. (This is the campaign reverse-ACK-transmit-time
+  binding constraint, memory feedback_reverse_ack_transmit_time_first: a reverse-ACK MISS must be CHEAP.)
+- **Re-decode storm on the CMD**: the NACK burst sits in the CMD capture ring for the whole turnaround; the CMD
+  re-decodes the SAME NACK (bsi_lsb=3 parity=0) ~12× in 0.2 s (arq_commander.cc:4124, no dedup, unlike the
+  SACK dedup at :4179) → 69 [CMD-NACK] in the run → burns the CMD forward-TX RX-loop passes.
+
+§19 (dead-batch classifier) correctly suppresses the false BREAK (PROGRESS_RESET / RATE_LIMITED → breaks=1,
+not many) — but §19 runs AFTER the NACK emit (line 5703 vs 5674) and does NOT touch the NACK. So the climb-
+killer that REMAINS after §17/§19/§20/§21/§22/§VAR-FIX is this futile-NACK reverse-airtime starvation.
+
+### §CROSS.4 THE FIX — never assert "cannot-follow" on a progressing batch (chokepoint at the NACK emit)
+The down-ladder lost-tag NACK_DECODE_FAIL is suppressed when `batch_rx_frame_count >= 1`. Discriminator
+rationale: a lost CONFIG_TAG can only strand a batch whose FIRST frame at the current config failed (a config
+change starts a NEW batch / NEW bsi, so its batch_rx_frame_count is 0 — arq_responder.cc:542/682 reset). Once
+≥1 DATA frame of the current batch has decoded at the current config (batch_rx_frame_count++ at
+arq_responder.cc:1454, the confirmed-storage point), the tag is PROVABLY present and any missing frames are a
+PARTIAL batch the SACK/retx path already owns — never a cannot-follow. The blind down-ladder DECODE, the §19
+classifier, and the §VAR-FIX-DEMOTE watchdog all STILL run (no-regress: the genuine-stall demote/BREAK paths
+are untouched) — only the harmful reverse-airtime NACK is gated. FAIL-BEFORE knob
+`MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1` restores the futile NACK on the same binary.
+Defense-in-depth: the CMD dedups a re-decoded NACK by (bsi,reason,parity) so a single genuine NACK is handled
+ONCE per turnaround, not ~12× (arq_commander.cc, mirrors the SACK dedup).
+
+### §CROSS.5 §5 CROSS-LAYER AUDIT — the NACK_DECODE_FAIL emit decision (shared state: down-ladder ↔ SACK/retx ↔ NACK ↔ batch-progress ↔ reverse-turnaround)
+1. PRODUCERS of the cannot-follow NACK: ONLY `inband_try_down_ladder_on_decode_fail` (arq_common.cc:5674) via
+   `inband_emit_nack(NACK_DECODE_FAIL)`; and `inband_emit_nack(NACK_UNFOLLOWABLE_CLIMB)` at arq_common.cc:3145
+   (an un-adoptable tag — a DIFFERENT trigger, NOT gated by this fix). The production firing gate is the single
+   site arq_responder.cc:655.
+2. CONSUMERS of the NACK: the CMD `inband_handle_nack` (arq_common.cc:3899) → accelerated-demote ONLY when the
+   RX is BELOW the announced config (climb-miss) or UNFOLLOWABLE; otherwise a no-op log. So a NACK on a
+   progressing batch was ALREADY a CMD no-op — suppressing its EMISSION changes no CMD decision, only removes
+   the reverse-airtime + the re-decode storm.
+3. VALID STATES of batch_rx_frame_count: 0 (no frame of the current batch stored yet — the lost-tag
+   precondition AND the genuine total-loss precondition) | ≥1 (≥1 frame stored at the current config — the tag
+   is present). Reset to 0 at: session start, batch boundary (542), TERMINAL BREAK (682). Default-init 0.
+4. INVARIANTS consumers assume: (INV-E1) a NACK_DECODE_FAIL means "the RX genuinely could not follow." The
+   futile firing VIOLATED INV-E1 (the RX WAS following — 5/6 frames). The fix restores INV-E1: NACK only when
+   batch_rx_frame_count==0 (no frame followed). (INV-E3 stale-epoch / mutual-exclusion unchanged.)
+5. WHAT THE FIX CHANGES + per-consumer walk:
+   - CMD inband_handle_nack: previously got a NACK it logged as "no accelerated demote." Now gets no NACK on a
+     progressing batch → identical net decision (no demote) but no re-decode storm. A GENUINE lost-tag
+     (batch_rx_frame_count==0) still NACKs → the climb-miss accelerated-demote path is preserved. OK.
+   - SACK/retx (the partial-batch owner): unchanged — the partial SACK (bitmap 0x3e) still goes out and the CMD
+     retransmits the missing seq-0; with the reverse channel no longer congested by the 1.5 s futile NACK the
+     retransmit can actually be captured. OK (this is the intended win).
+   - §19 dead-batch classifier (arq_common.cc:5703) + §VAR-FIX-DEMOTE watchdog (:5649): both still run on every
+     real-signal down-ladder-fail pass → the genuine zero-progress BREAK + the hard-stall pin-release are
+     untouched. A progressing batch hits PROGRESS_RESET anyway, so the suppressed NACK never co-occurs with a
+     genuine demote. OK (no-regress).
+   - down-ladder ADOPT (INV-S4-1, a CRC/LDPC pass required to adopt): unchanged — the fix gates only the NACK,
+     not the decode/adopt. A legit in-OFDM rate-down adopt still works. OK.
+   - reverse-turnaround / rxgate (§VAR-FIX-2): fewer reverse bursts → the RX forward-search gate has fewer
+     turnarounds to span; strictly complementary. OK.
+   Legacy (inband off): inband_emit_nack early-returns (feature gate) → byte-identical. OK.
+
+### §CROSS.6 RESULT + the NEXT root (HONEST — the fix is NECESSARY-NOT-SUFFICIENT)
+The §CROSS NACK fix WORKS for its target (instrumented A/B, mercury_crossfix, WGN:40 .11, N=3 inband):
+- the futile NACK storm is ELIMINATED: **NACK emit 0** on the progressing cells (33 "SUPPRESS futile"
+  per cell), vs the pre-fix 69-NACK / 12×-redecode storm.
+- the RSP now decodes MORE cfg0 frames: **65 [OFDM-OK] cfg=0** (was 38), 0 OFDM-FAIL.
+- delivery improves marginally (inband rx 211/211/1280 B, 1/3 cells load WB) vs the bug arm @fa8b8e92
+  (187 B mean, 0/2 WB-load). Legacy crosses+delivers 11339 B (3/3) on the same audio.
+
+But the cross is STILL NOT restored — the deeper binding root, now PINNED:
+
+**NEXT ROOT — the post-cross RSP prev-batch cross-storage LAGS one batch (VERIFIED, the
+[RSP-V2-PREV-BUMP] / [RSP-V2-PREV-RX] trail, arq_diag_inband / cx11_inband_sd1).**
+At the FIRST multi-frame cfg0 batch (batch_seq_id=3, 6 frames) the batch reaches only 5/6 (the
+acquisition-seam frame-0 / partial), never completes, and when the CMD starts batch 4 the RSP runs
+`[RSP-V2-PREV-BUMP] prev_batch_seq_id=3 next_expected=4 ... received_on_transfer=5/6 (cross-storage
+routing armed)`. From then on EVERY batch is incomplete and PREV-BUMPed; `received_on_transfer` locks at
+**2/4** and stays there for the rest of the session. The smoking gun: after the cross, **every decoded
+forward frame is routed to `[RSP-V2-PREV-RX]` (19 of them) and `current store (RX-DATA) == 0`** — i.e.
+the RSP is PERMANENTLY one batch behind the CMD: the CMD is on batch N+1, the RSP is still trying to
+complete batch N (now "prev"), so frame 0 of every new batch is mis-counted, neither batch ever completes,
+and `rsp_wb_data_frames` stays 0 / wb_configs_seen stays [] / 0 durable delivery. seq=0 IS decoded (13×) —
+this is NOT an acquisition loss but a **bsi-advance / prev-batch cross-storage one-batch-lag deadlock**
+(shared ARQ state: rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id, the V2 prev-bump transfer).
+
+This is a DISTINCT root in the batch-completion / bsi-routing layer (NOT the NACK this section fixed, NOT
+the §17/§19/§21/§22/§VAR-FIX layers). It needs its own §5 audit of the V2 prev-batch cross-storage state
+machine at the ROBUST→cfg0 cross: why the first cfg0 batch never completes (the acquisition-seam frame-0
+that legacy avoids via the SET_CONFIG lockstep handshake — the CMD knows the RSP is ready before airing
+frame 0), and why a single incomplete batch puts the RSP into a permanent one-batch lag instead of
+catching up to the CMD's current bsi. Candidate directions (each needs a live fail-before/passes-after):
+(a) on the cross, the CMD must not advance past a batch the RSP has not started (a lockstep-lite on the
+FIRST cfg0 batch only); (b) the RSP prev-bump must CATCH UP to the CMD's current bsi when it falls >1
+behind (re-baseline current_expected to the freshest seen bsi) rather than perpetually draining a stale
+prev; (c) make the first cfg0 batch's frame-0 acquisition robust (a longer settle / a re-aired frame-0).
+(b) looks closest to the true invariant. VERDICT for §CROSS: the NACK fix SHIPS (proven necessary,
+eliminates a real amplifier, no-regress, --test green); the bsi-lag is the NEXT root, NOT this one.

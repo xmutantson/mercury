@@ -4022,6 +4022,15 @@ public:
   bool inband_adopt_ring_durability_defeat();
   int  inband_adopt_ring_durability_defeat_cached = -1;  // -1=unresolved, 0=off (guarded), 1=defeat
 
+  // §CROSS — A/B FAIL-BEFORE knob for the progressing-batch futile-NACK suppression
+  // (MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1 restores the cfg0-cross death-spiral). Prod off.
+  bool inband_progressing_nack_defeat();
+  int  inband_progressing_nack_defeat_cached = -1;  // -1=unresolved, 0=off (fixed), 1=defeat
+  // §CROSS — production decision (batch_rx_frame_count>=1 && !defeat); the directed test
+  // drives this EXACT predicate so test and production cannot diverge.
+  bool inband_progressing_batch_suppresses_nack();
+  int  test_inband_progressing_nack();  // --test-inband-progressing-nack (fail-before/passes-after)
+
   // IN-BAND ADOPT CLEAN-LOCK METRIC GATE (data-flow-inband-adopt-metric-gate.md §2/§3).
   // Gate the in-band tag-follow adopt on the NORMALIZED Schmidl-Cox metric over the SAME
   // captured snapshot the OFDM acquisition is about to consume: a CRC-valid CONFIG_TAG is
@@ -4609,6 +4618,12 @@ public:
   // still in the ring on a subsequent poll. -1 = no SACK_RSP applied
   // yet this session. Init in init_messages_buffers.
   int cmd_last_applied_sack_bsi;
+
+  // §CROSS — last applied reverse NACK key ((rx_cfg<<24)|(reason<<16)|(bsi<<8)|parity);
+  // dedups the ~12x re-decode of the SAME NACK that sits in the capture ring across a
+  // turnaround. -1 = no NACK applied yet. Cleared on any applied ACK/SACK / batch advance
+  // so a genuinely-new NACK is honored. Init in init_messages_buffers.
+  int cmd_last_applied_nack_key = -1;
 
   // §7.13.30 — v2 OFDM dispatch new-audio throttle. The v2 SACK window
   // no longer calls receive_ack_pattern() (which used to drive ftr

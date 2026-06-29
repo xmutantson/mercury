@@ -947,6 +947,7 @@ cl_arq_controller::cl_arq_controller()
 	v2_ackpat_defer_count_this_window=0;  // Bug A fix (§7.13.1)
 	// §7.13.29 init
 	cmd_last_applied_sack_bsi = -1;
+	cmd_last_applied_nack_key = -1;   // §CROSS — reverse-NACK re-decode dedup
 	// climb-engine Bug 1 (gearshift-climb-engine.md §4): clean-confirm dedupe
 	// tracker, split from the partial tracker above. Same lifecycle (ctor init).
 	cmd_last_applied_clean_bsi = -1;
@@ -4410,6 +4411,29 @@ bool cl_arq_controller::inband_adopt_ring_durability_defeat()
 	return inband_adopt_ring_durability_defeat_cached == 1;
 }
 
+// §CROSS A/B FAIL-BEFORE: MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1 restores the futile
+// NACK_DECODE_FAIL on a PROGRESSING batch (the pre-fix cfg0-cross death-spiral) on the same
+// binary. Production never sets it. data-flow-robust-ofdm-adopt-flush.md §CROSS.4.
+bool cl_arq_controller::inband_progressing_nack_defeat()
+{
+	if(inband_progressing_nack_defeat_cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_INBAND_PROGRESSING_NACK_DEFEAT");
+		inband_progressing_nack_defeat_cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return inband_progressing_nack_defeat_cached == 1;
+}
+
+// §CROSS — the production decision: suppress the down-ladder cannot-follow NACK_DECODE_FAIL
+// when the current batch is PROGRESSING (>=1 DATA frame already stored at the current config
+// => the CONFIG_TAG is provably present => not a cannot-follow). The directed test drives this
+// EXACT predicate so the test and production can never diverge. The defeat knob restores the
+// pre-fix futile NACK. data-flow-robust-ofdm-adopt-flush.md §CROSS.4.
+bool cl_arq_controller::inband_progressing_batch_suppresses_nack()
+{
+	return (batch_rx_frame_count >= 1) && !inband_progressing_nack_defeat();
+}
+
 // IN-BAND ADOPT CLEAN-LOCK METRIC GATE — data-flow-inband-adopt-metric-gate.md §2/§3.
 // Returns true if the in-band tag-follow adopt MAY proceed (the OFDM lock over the captured
 // snapshot is CLEAN, normalized Schmidl-Cox metric >= threshold), false to REJECT (the window
@@ -5695,11 +5719,36 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 	// (current_configuration). Throttle to ONE NACK per dead-batch streak segment
 	// (inband_nack_emitted_for_dead_streak) so a deep fade does not congest the reverse
 	// channel (design §2.2 / §2.7). The NACK lets the sender re-tag/demote one batch sooner.
-	if(!inband_nack_emitted_for_dead_streak)
+	//
+	// §CROSS ROOT FIX (data-flow-robust-ofdm-adopt-flush.md §CROSS, VERIFIED at the cfg0 cross):
+	// a NACK_DECODE_FAIL asserts INV-E1 "the RX genuinely could not follow." That is FALSE while
+	// the current batch is PROGRESSING (batch_rx_frame_count >= 1): the RSP has already stored >=1
+	// DATA frame of THIS batch at the current config, PROVING the CONFIG_TAG arrived and the RSP IS
+	// at the right config. The "missing" frames are then a PARTIAL batch the SACK/retx path owns —
+	// NOT a cannot-follow. The CMD treats such a NACK as "not a climb-miss -> no accelerated demote"
+	// (arq_common.cc:3932), so the NACK accomplishes NOTHING — yet each emit keys a ~1.5 s reverse
+	// passband burst that STARVES the RSP forward capture (it cannot hear the seq-0 retransmit / the
+	// next batch's early frames), degrading the batch 5/6 -> 3/6 -> 2/6 into a death spiral that
+	// kills the climb (the binding constraint, feedback_reverse_ack_transmit_time_first). A lost
+	// CONFIG_TAG can only strand a batch whose FIRST frame at the current config failed; a config
+	// change starts a NEW batch (new bsi) whose batch_rx_frame_count is 0 (reset at
+	// arq_responder.cc:542/682), so this guard preserves the GENUINE lost-tag NACK. Only the NACK is
+	// gated — the blind down-ladder decode/adopt, the §19 dead-batch classifier, and the
+	// §VAR-FIX-DEMOTE watchdog all still run (no-regress). FAIL-BEFORE knob
+	// MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1 restores the futile NACK on the same binary.
+	bool progressing_batch = inband_progressing_batch_suppresses_nack();
+	if(!inband_nack_emitted_for_dead_streak && !progressing_batch)
 	{
 		int nacked = inband_emit_nack((uint8_t)NACK_DECODE_FAIL);
 		if(nacked > 0)
 			inband_nack_emitted_for_dead_streak = true;
+	}
+	else if(progressing_batch)
+	{
+		printf("[INBAND-RX] DOWN-LADDER: batch progressing (batch_rx_frame_count=%d) -> "
+			"SUPPRESS futile NACK_DECODE_FAIL (tag present; partial batch owned by SACK/retx; "
+			"a reverse NACK here would starve forward capture)\n", batch_rx_frame_count);
+		fflush(stdout);
 	}
 
 	// None of the D+1 window configs decoded -> a candidate total-loss batch.

@@ -2554,6 +2554,10 @@ void cl_arq_controller::process_messages_tx_data()
 		if(batch_includes_new_data)
 		{
 			cmd_batch_seq_id = (cmd_batch_seq_id + 1) & 0xFF;
+			// §CROSS — a fresh forward batch went out: forget the last reverse-NACK so a NEW
+			// dead-streak NACK for this batch is honored once (the dedup only collapses the
+			// re-decode of the SAME burst within one turnaround, never across batches).
+			cmd_last_applied_nack_key = -1;
 		}
 		stats.nBatches_sent++;
 		last_transmission_block_stats.nBatches_sent++;
@@ -4125,13 +4129,32 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							if(inband_decode_nack_from_capture(&nack_rx_cfg, &nack_reason,
 								&nack_bsi, &nack_parity) == 1)
 							{
-								printf("[CMD-NACK] decoded NACK rx_cfg_idx=%u reason=%u "
-									"bsi_lsb=%u parity=%u -- applying accelerated-demote policy\n",
-									(unsigned)nack_rx_cfg, (unsigned)nack_reason,
-									(unsigned)nack_bsi, (unsigned)nack_parity);
-								fflush(stdout);
-								if(inband_handle_nack(nack_rx_cfg, nack_reason, nack_parity))
-									mfsk_handled_this_poll = true;
+								// §CROSS dedup (defense-in-depth): the reverse NACK burst sits in
+								// the capture ring for the WHOLE turnaround, so without a dedup the
+								// CMD re-decodes the SAME NACK ~12x per emit (every ~26 ms poll),
+								// burning forward-TX RX-loop passes (the 69 [CMD-NACK] storm,
+								// data-flow-robust-ofdm-adopt-flush.md §CROSS.3). Apply each distinct
+								// (rx_cfg,reason,bsi,parity) NACK ONCE per turnaround; a genuinely
+								// NEW NACK (any field changes) is still honored. Mirrors the SACK
+								// duplicate guard (~:4179). The key is cleared on any applied
+								// ACK/SACK / batch advance below so a later real NACK is not masked.
+								int nack_key = ((int)nack_rx_cfg << 24) | ((int)nack_reason << 16)
+									| ((int)nack_bsi << 8) | (int)(nack_parity & 0xFF);
+								if(nack_key == cmd_last_applied_nack_key)
+								{
+									// identical NACK already handled this turnaround — skip silently
+								}
+								else
+								{
+									cmd_last_applied_nack_key = nack_key;
+									printf("[CMD-NACK] decoded NACK rx_cfg_idx=%u reason=%u "
+										"bsi_lsb=%u parity=%u -- applying accelerated-demote policy\n",
+										(unsigned)nack_rx_cfg, (unsigned)nack_reason,
+										(unsigned)nack_bsi, (unsigned)nack_parity);
+									fflush(stdout);
+									if(inband_handle_nack(nack_rx_cfg, nack_reason, nack_parity))
+										mfsk_handled_this_poll = true;
+								}
 							}
 						}
 #endif

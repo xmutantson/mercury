@@ -1027,6 +1027,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_revack_rxgate();
             }
+            // §CROSS — progressing-batch futile-NACK suppression regression (the cfg0-cross
+            // death-spiral fix). Drives the production predicate
+            // inband_progressing_batch_suppresses_nack(). data-flow-robust-ofdm-adopt-flush.md §CROSS.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_progressing_nack();
+            }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
             // deterministic, no IONOS/RF. data-flow-inband-connect-liveness.md §4.
@@ -1373,6 +1380,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-revack-rxgate") == 0) {
             cl_arq_controller ARQ_rg;
             int failed = ARQ_rg.test_inband_revack_rxgate();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-progressing-nack : run ONLY the §CROSS progressing-batch futile-NACK
+        // suppression regression (data-flow-robust-ofdm-adopt-flush.md §CROSS — the down-ladder
+        // must NOT emit a cannot-follow NACK while the batch is progressing). Drives the REAL
+        // predicate inband_progressing_batch_suppresses_nack(). MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1
+        // reproduces the futile NACK / the cfg0-cross death-spiral.
+        if (strcmp(argv[i], "--test-inband-progressing-nack") == 0) {
+            cl_arq_controller ARQ_pn;
+            int failed = ARQ_pn.test_inband_progressing_nack();
             return (failed == 0) ? 0 : 1;
         }
         // --test-climb-bsi-rollback : run ONLY the climb-UP cmd_batch_seq_id rollback regression
