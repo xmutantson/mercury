@@ -5361,11 +5361,6 @@ void cl_arq_controller::inband_deliver_stall_watchdog()
 {
 	if(!inband_rate_feature_enabled()) return;
 	int limit = inband_deliver_stall_limit_resolve();
-	static const bool dbg = []{ const char* e=std::getenv("MERCURY_DELIVER_STALL_DEBUG"); return e&&*e&&atoi(e)!=0; }();
-	if(dbg) { printf("[DSTALL-DBG] enter limit=%d pin=%d cfg=%d is_ofdm=%d last_del=%d armed=%d elapsed=%ld\n",
-		limit, inband_ofdm_acq_ring_shrunk?1:0, current_configuration, is_ofdm_config(current_configuration)?1:0,
-		rsp_last_delivered_batch_seq_id, inband_deliver_stall_timer_armed?1:0,
-		inband_deliver_stall_timer_armed ? inband_deliver_stall_timer.get_elapsed_time_ms() : -1); fflush(stdout); }
 	if(limit <= 0) return;                                  // disabled
 
 	// Only meaningful while we actually HOLD a shrunk OFDM lock that the guard would protect.
