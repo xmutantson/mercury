@@ -5452,17 +5452,21 @@ bool cl_arq_controller::inband_revack_rxgate_defeat()
 void cl_arq_controller::inband_arm_revack_turnaround_window()
 {
 	if(!inband_rate_feature_enabled()) { inband_revack_turnaround_budget_ms = 0; return; }
-	// CMD turnaround estimate (RSP ACK done -> CMD's next forward preamble can land): the CMD must decode
-	// the ACK (RSP_DECODE_MARGIN_MS), process/encode (~one msg_time), and key up (ptt_on+ptt_off). This is a
-	// CONSERVATIVE gap-before-burst — NOT the whole receiving_timeout, which also covers the burst airtime.
-	// The forward burst, when it lands, DECODES on the OK path (which bypasses this gate), so over-estimating
-	// the gap only delays a doomed plateau retry, never a real frame. Capped on consumption by the ring depth.
-	int budget = RSP_DECODE_MARGIN_MS + ptt_on_delay_ms + ptt_off_delay_ms + message_transmission_time_ms;
+	// The suppress window spans the WHOLE inter-batch turnaround the receiving_timeout already bounds (CMD
+	// detect+process+re-air, RSP partial-batch re-air-drain). A fixed "gap-before-burst" guess (the prior
+	// RSP_DECODE+ptt+msg_time ~1.8s) UNDER-covered the ~13s cfg0 batch period, so the storm ran in the long
+	// inter-arm gaps (fleet A/B §VF2.6). We instead span receiving_timeout and SLOW-POLL across it (see
+	// inband_revack_rxgate_ftr: the cap is ONE FRAME PERIOD, not the ring depth), so the forward search still
+	// fires once per frame and CANNOT miss the real burst (caught within 1 frame on the OK path), while the
+	// 8-sym storm cadence is cut ~7x. Floor a sane minimum so a degenerate timeout still suppresses.
+	int budget = receiving_timeout;
+	int floor_ms = RSP_DECODE_MARGIN_MS + ptt_on_delay_ms + ptt_off_delay_ms + message_transmission_time_ms;
+	if(budget < floor_ms) budget = floor_ms;
 	if(budget < 0) budget = 0;
 	inband_revack_turnaround_budget_ms = budget;
 	inband_revack_turnaround_timer.start();
 	printf("[INBAND-RX] REVACK-RXGATE: armed turnaround suppress window budget=%dms (CONFIG_%d) — forward "
-		"coarse search suppressed until the forward-burst window opens\n",
+		"coarse search SLOW-POLLED (1 frame/poll) across the turnaround\n",
 		budget, current_configuration);
 	fflush(stdout);
 }
@@ -5483,22 +5487,24 @@ int cl_arq_controller::inband_revack_rxgate_ftr(int default_ftr, bool frame_deco
 
 	int sym = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;
 	if(sym <= 0) return default_ftr;
-	// remaining gap in symbols (the capture thread decrements frames_to_read once per symbol_period of audio,
-	// so this many symbols of suppression == remaining_ms of real/virtual channel time).
-	long remaining_syms = ((long)remaining_ms * 48000L) / 1000L / (long)sym;
-	if(remaining_syms < default_ftr) return default_ftr;   // nearly closed: don't shorten below the anti-spin
-
-	// CAP so the real forward burst (preamble + frame) cannot scroll off the ring during the wait: the
-	// snapshot is the most-recent signal_period samples, so as long as we re-open within (buffer_Nsymb -
-	// frame_symb) symbols the freshest preamble + its frame are still in-window.
+	(void)remaining_ms;
+	// SLOW-POLL the forward search at ONE FRAME PERIOD during the turnaround (not the 8-sym storm cadence and
+	// NOT a multi-second block). One frame is the minimum interval at which a NEW forward burst could possibly
+	// complete in the ring, so re-opening the search every frame CANNOT miss the real burst (it decodes on the
+	// OK path within 1 frame), while it cuts the doomed-plateau search rate ~7x (8 -> ~58 sym). This is robust
+	// to the inter-batch gap LENGTH (no fixed-budget-vs-gap mismatch): as long as the window is active we keep
+	// the 1-frame cadence; when it ages out the stock anti-spin resumes.
 	int frame_symb = telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
-	long cap = (long)telecom_system->data_container.buffer_Nsymb.load() - (long)frame_symb;
-	if(cap < (long)default_ftr) cap = default_ftr;   // degenerate geometry: fall back to the anti-spin
-	if(remaining_syms > cap) remaining_syms = cap;
+	long ftr = frame_symb;
+	if(ftr < (long)default_ftr) return default_ftr;   // degenerate geometry: keep the anti-spin
+	// never exceed the ring read-window (the burst must stay in-ring) — frame_symb is always << buffer_Nsymb.
+	long ring_cap = (long)telecom_system->data_container.buffer_Nsymb.load() - (long)frame_symb;
+	if(ring_cap >= (long)default_ftr && ftr > ring_cap) ftr = ring_cap;
+	long remaining_syms = ftr;
 
-	printf("[INBAND-RX] REVACK-RXGATE: SUPPRESS forward search — gap remaining=%dms -> ftr %d->%ld sym "
-		"(CONFIG_%d, cap=%ld); resume at the forward-burst window\n",
-		remaining_ms, default_ftr, remaining_syms, current_configuration, cap);
+	printf("[INBAND-RX] REVACK-RXGATE: SLOW-POLL forward search — window active -> ftr %d->%ld sym "
+		"(CONFIG_%d, 1 frame/poll); real burst still caught within 1 frame\n",
+		default_ftr, remaining_syms, current_configuration);
 	fflush(stdout);
 	return (int)remaining_syms;
 }
