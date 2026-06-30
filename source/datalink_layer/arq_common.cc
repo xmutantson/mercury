@@ -3142,6 +3142,19 @@ bool cl_arq_controller::cmd_classify_route_ternack_variant(double* data, int siz
 		return true;
 	}
 
+	// ONLY the two CLEAN variants credit. A winning RESERVED (or any non-CLEAN/
+	// non-NACK) variant is NOT outcome-evidence -> no-op fall-through (the existing
+	// SACK/timeout owns it). Without this gate a RESERVED win would mis-credit as
+	// parity-0 CLEAN (the smoke-bench bug: variant=3 credited bsi=4).
+	if(winner != cl_telecom_system::TERNACK_CLEAN_PAR0
+	   && winner != cl_telecom_system::TERNACK_CLEAN_PAR1)
+	{
+		printf("[CMD-TERNACK2] winner=%d not a CLEAN/NACK variant (matched=%d "
+			"margin=%d) -> no credit (fall through)\n", winner, winner_matched, margin);
+		fflush(stdout);
+		return false;
+	}
+
 	// CLEAN variant (par0 or par1). Parity check: the variant's parity must match the
 	// LSB of the outstanding/just-completed batch (cmd-side known). A stale CLEAN from
 	// batch N-1 carries the opposite parity ~50% of turnarounds AND is caught by the
