@@ -580,8 +580,21 @@ void cl_mfsk::generate_ack_pattern(std::complex<double>* pattern_out)
 // Mirrors generate_connect_pattern's §20 layout.
 void cl_mfsk::generate_ack_pattern_reps(std::complex<double>* pattern_out)
 {
+	// TERNACK2: the default ACK variant is just generate_ack_pattern_reps_tones
+	// with the ACK (g=5) table — byte-identical to the prior body.
+	generate_ack_pattern_reps_tones(pattern_out, ack_tones);
+}
+
+// TERNACK2 (data-flow-ternack2-variant-confirm.md §2): R-rep base block over a
+// caller-supplied 8-tone table. Layout/hop/streams IDENTICAL to the ACK path so
+// detect_ack_pattern(tones,...) matched-filters each variant verbatim. The ONLY
+// difference from generate_ack_pattern_reps is which 8-tone table feeds tone_base.
+void cl_mfsk::generate_ack_pattern_reps_tones(std::complex<double>* pattern_out,
+                                              const int* tones)
+{
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
 	if (ack_pattern_nsymb <= 0) return;
+	if (tones == nullptr) tones = ack_tones;
 
 	double amp = sqrt((double)Nc / nStreams);
 
@@ -592,7 +605,7 @@ void cl_mfsk::generate_ack_pattern_reps(std::complex<double>* pattern_out)
 		for (int k = 0; k < Nc; k++)
 			pattern_out[abs_b * Nc + k] = std::complex<double>(0.0, 0.0);
 
-		int tone_base = ack_tones[s % ack_pattern_len];
+		int tone_base = tones[s % ack_pattern_len];
 		int actual_tone = (tone_base + s * tone_hop_step) % M;
 
 		for (int st = 0; st < nStreams; st++)

@@ -2594,6 +2594,20 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			send_ack_pattern();
 		}
 
+		// ── TERNACK2 (data-flow-ternack2-variant-confirm.md §emit_site): a
+		//    BYTE-COMPLETE batch (this is the [ACK-GATE] PASS branch). Emit the
+		//    CLEAN parity variant (par0/par1 by the completed batch's bsi LSB) on
+		//    the reverse wire so the CMD can credit + climb by CORRELATION, NOT a
+		//    CRC bitmap (which fails on the cfg0 marginal turnaround). The CRC ACK
+		//    above remains for the multi-frame/high-SNR path. WB-only (no-op on NB);
+		//    feature-gated (byte-identical legacy). rsp_prev_batch_seq_id holds the
+		//    just-delivered batch's bsi (set at the BATCH-DONE bump above).
+		if(!passive_monitor && ternack2_enabled())
+		{
+			int completed_bsi = (rsp_prev_batch_seq_id >= 0) ? rsp_prev_batch_seq_id : 0;
+			rsp_emit_ternack_clean(completed_bsi);
+		}
+
 		if(passive_monitor)
 		{
 			// send_ack_pattern was suppressed — set generous ftr for turnaround.

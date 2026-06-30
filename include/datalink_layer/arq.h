@@ -3886,6 +3886,57 @@ public:
   // true if it routed the accelerated demote. COMMANDER-only (uses the demote helper).
   bool inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason, uint8_t epoch_parity);
 
+  // ════════════════════════════════════════════════════════════════════════
+  // TERNACK2 (fact-documents/data-flow-ternack2-variant-confirm.md): the cfg0
+  // reverse confirm carried by the IDENTITY of which 16-symbol Welch-Costas
+  // base pattern the RSP transmits (CLEAN-par0 / CLEAN-par1 / NACK), decoded by
+  // the CMD via argmax energy-correlation over the variant tables — NOT a CRC
+  // codeword. Default-OFF behind ternack2_enabled() (A/B gate); ships ON once
+  // the faithful real-audio bench confirms climb-past-cfg0.
+  // ════════════════════════════════════════════════════════════════════════
+
+  // Feature gate. Default = inband_rate_feature_enabled() (TERNACK2 is part of
+  // the in-band reverse-confirm). MERCURY_TERNACK2=0 force-OFF / =1 force-ON for
+  // the A/B arms. Cached. -DTERNACK2_FAILBEFORE forces it OFF at compile time
+  // (the fails-before binary: the cfg0 single-frame batch stays SILENT/CRC-only,
+  // reproducing the BENCH-INERT stall).
+  bool ternack2_enabled();
+  int  ternack2_enabled_cached = -1;   // -1 unresolved
+  // Reps (R) for the variant base pattern on the wire. Cached. Default 3 (design
+  // R3+margin2 -> P(NACK->CLEAN)<=8.3e-5). MERCURY_TERNACK2_REPS overrides.
+  int  ternack2_reps();
+  int  ternack2_reps_cached = -1;
+  // Argmax separation margin the CMD requires before crediting a variant.
+  // Default 2 (design point). MERCURY_TERNACK2_MARGIN overrides.
+  int  ternack2_margin();
+  int  ternack2_margin_cached = -1;
+
+  // RSP EMIT (producer): key the chosen TERNACK2 variant's R-rep base pattern
+  // onto the reverse wire (the SAME playback-ring path send_ack_pattern uses).
+  // variant ∈ {TERNACK_CLEAN_PAR0, TERNACK_CLEAN_PAR1, TERNACK_NACK}. SAVES and
+  // RESTORES recovery_ack_reps around the emit so the production recovery-ACK
+  // path is never left at R=3. No-op (returns 0) when feature-off / M<16 / no
+  // playback ring. Returns passband samples emitted.
+  int rsp_emit_ternack_variant(int variant);
+  // Convenience: select the CLEAN parity variant from a bsi and emit it.
+  int rsp_emit_ternack_clean(int completed_bsi);
+
+  // CMD DECODE+ROUTE (consumer): run the argmax-over-variants classifier on the
+  // already-captured reverse tail (data/size = the SAME snapshot the CRC ACK/SACK
+  // decode used). On a CLEAN variant winning by >=margin with matched>=threshold
+  // AND whose parity matches the outstanding batch LSB -> run the EXISTING clean
+  // funnel (sets *out_clean_credit_bsi, the caller mirrors the CRC clean branch).
+  // On a NACK variant winning by >=margin -> stage the immediate full resend
+  // (force in-flight PENDING_ACK->ACK_TIMED_OUT, data_ack_received=YES, shorten
+  // receiving_timeout) and set *out_nack_resend=true. Ambiguous/low-confidence ->
+  // returns false (caller falls through to the existing SACK/timeout, NO false
+  // credit). D0: a partial can never win CLEAN by margin (7-8/8 tone-Hamming);
+  // a wrong-parity CLEAN is rejected as stale. Returns true iff it handled the
+  // poll (clean-credit OR nack-resend). No-op when feature-off / M<16.
+  bool cmd_classify_route_ternack_variant(double* data, int size,
+                                          int* out_clean_credit_bsi,
+                                          bool* out_nack_resend);
+
   // ── STAGE 4e — D3 periodic re-announce backstop (inband-reliability-design.md §3,
   //    OD-3) ── Re-emit the CURRENT-config tag every N DATA batches independent of
   // change, HOLDING the epoch parity (NOT a change), so a desynced/late-joining peer

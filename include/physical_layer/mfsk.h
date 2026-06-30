@@ -483,6 +483,16 @@ public:
 	// (byte-identical). pattern_out: ack_base_total_nsymb() * Nc complex values.
 	void generate_ack_pattern_reps(std::complex<double>* pattern_out);
 
+	// TERNACK2 (data-flow-ternack2-variant-confirm.md §2): the SAME R-rep base
+	// block as generate_ack_pattern_reps, but parameterized on a caller-supplied
+	// 8-tone Welch-Costas table (ack/break/hail/connect). The variant IDENTITY
+	// (which generator) carries the reverse-confirm OUTCOME; decoded by argmax
+	// energy-correlation, NOT a CRC codeword. tones must point to ack_pattern_len
+	// (=8 WB) ints; layout/hop/streams are IDENTICAL to generate_ack_pattern_reps
+	// so the existing detect_ack_pattern matched-filter works verbatim per variant.
+	void generate_ack_pattern_reps_tones(std::complex<double>* pattern_out,
+	                                      const int* tones);
+
 	// Generate BREAK pattern: same structure as ACK but with break_tones
 	void generate_break_pattern(std::complex<double>* pattern_out);
 

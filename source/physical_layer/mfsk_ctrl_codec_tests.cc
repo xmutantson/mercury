@@ -466,6 +466,178 @@ static void test_base_pattern_cross_correlation() {
 	test_pass(name);
 }
 
+// =============================================================================
+// TERNACK2 (data-flow-ternack2-variant-confirm.md): the cfg0 reverse confirm
+// carried by the variant IDENTITY, decoded by argmax energy-correlation. This
+// PHY test is the D0 keystone: a NACK variant can NEVER be argmax-picked as a
+// CLEAN variant by the margin gate (the safety-critical false-clean-credit event).
+// =============================================================================
+
+// Forward decl: defined below (§ helper region). Used by the TERNACK2 D0 test
+// which appears earlier in the file than the helper definition.
+static double measure_preamble_rms_pb(cl_telecom_system& ts);
+
+// Synthesize variant `variant`'s R-rep base pattern into a passband buffer with
+// leading/trailing silence + optional AWGN at noise_sigma_pb. Mirrors the
+// production generate_ternack_variant_passband geometry (R*16 base symbols).
+static bool synth_ternack_variant_passband(
+	cl_telecom_system& ts, int variant, int reps, double noise_sigma_pb,
+	std::mt19937& rng, std::vector<double>& out_pb, int& out_dec_size)
+{
+	if (ts.ack_mfsk.M < 16) return false;
+	ts.set_recovery_ack_reps(reps);
+	const int* tones = ts.ternack_variant_tones(variant);
+	if (tones == nullptr) return false;
+
+	int Nofdm  = ts.data_container.Nofdm;
+	int Nc     = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	int nsymb  = ts.ack_mfsk.ack_base_total_nsymb();   // reps * 16
+
+	std::vector<std::complex<double> > pat_freq((size_t)nsymb * Nc,
+		std::complex<double>(0.0, 0.0));
+	ts.ack_mfsk.generate_ack_pattern_reps_tones(pat_freq.data(), tones);
+
+	std::vector<std::complex<double> > pat_time((size_t)nsymb * Nofdm,
+		std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < nsymb; s++)
+		ts.ofdm.symbol_mod(&pat_freq[(size_t)s * Nc], &pat_time[(size_t)s * Nofdm]);
+
+	const int pattern_pb   = Nofdm * nsymb * interp;
+	const int lead_pb      = 4 * Nofdm * interp;
+	const int trail_pb     = 8 * Nofdm * interp;
+	const int buf_pb       = lead_pb + pattern_pb + trail_pb;
+
+	std::vector<double> ppb((size_t)pattern_pb, 0.0);
+	{
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(
+			pat_time.data(), Nofdm * nsymb, ppb.data(),
+			ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+	}
+
+	out_pb.assign((size_t)buf_pb, 0.0);
+	for (int i = 0; i < pattern_pb && (lead_pb + i) < buf_pb; i++)
+		out_pb[(size_t)(lead_pb + i)] = ppb[(size_t)i];
+
+	if (noise_sigma_pb > 0.0) {
+		std::normal_distribution<double> nd(0.0, noise_sigma_pb);
+		for (int i = 0; i < buf_pb; i++) out_pb[(size_t)i] += nd(rng);
+	}
+	out_dec_size = buf_pb / interp;
+	return true;
+}
+
+static void test_ternack2_variant_confirm() {
+	const char* name = "ternack2_variant_confirm";
+	const int REPS = 3;
+
+	cl_telecom_system ts_meas;
+	ts_meas.operation_mode = ARQ_MODE;
+	ts_meas.load_configuration(ROBUST_0);   // WB ROBUST-class init brings ack_mfsk up
+	if (ts_meas.ack_mfsk.M < 16) { test_pass(name); return; }  // NB: TERNACK2 N/A
+	double rms = measure_preamble_rms_pb(ts_meas);
+	if (!(rms > 0.0)) { test_fail(name, "preamble RMS measurement failed"); return; }
+
+	// (A) CLEAN ROUND-TRIP at a comfortable in-band SNR: each variant must argmax
+	// to itself. sigma 0.45*rms ≈ +7 dB so all four are reliably picked.
+	{
+		double sigma = 0.45 * rms;
+		for (int v = 0; v < cl_telecom_system::TERNACK_NUM_VARIANTS; v++) {
+			cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+			std::mt19937 rng((uint32_t)(0x7E2A0000u + v));
+			std::vector<double> pb; int dec = 0;
+			if (!synth_ternack_variant_passband(ts, v, REPS, sigma, rng, pb, dec)) {
+				test_fail(name, "synth failed"); return; }
+			int matched[4] = {0,0,0,0}; int wm = 0, mg = 0;
+			int win = ts.classify_ternack_variant_from_passband(
+				pb.data(), (int)pb.size(), REPS,
+				ts.ack_mfsk.ack_match_threshold, matched, &wm, &mg);
+			if (win != v) {
+				char b[200]; snprintf(b, sizeof(b),
+					"A: variant %d mis-classified as %d (wm=%d mg=%d; "
+					"m=[%d,%d,%d,%d])", v, win, wm, mg,
+					matched[0],matched[1],matched[2],matched[3]);
+				test_fail(name, b); return;
+			}
+		}
+	}
+
+	// (B) D0 SAFETY — the false-clean-credit event. Over many seeds at the cfg0
+	// reverse regime (sigma ≈ rms, in-band ~0 dB, mean_matched≈6-7/16), a TX'd
+	// NACK variant must NEVER be argmax-picked as a CLEAN variant by margin>=2.
+	// This is the inviolable invariant: a partial/failed batch cannot alias clean.
+	{
+		double sigma = 1.0 * rms;             // the binding cfg0 regime
+		const int TRIALS = 300;
+		int nack_to_clean_m2 = 0;             // the safety violation count
+		int nack_correct = 0;
+		for (int t = 0; t < TRIALS; t++) {
+			cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+			std::mt19937 rng((uint32_t)(0x7E2ABEEFu + t));
+			std::vector<double> pb; int dec = 0;
+			if (!synth_ternack_variant_passband(ts, cl_telecom_system::TERNACK_NACK,
+				REPS, sigma, rng, pb, dec)) { test_fail(name, "B synth failed"); return; }
+			int matched[4] = {0,0,0,0}; int wm = 0, mg = 0;
+			int win = ts.classify_ternack_variant_from_passband(
+				pb.data(), (int)pb.size(), REPS,
+				ts.ack_mfsk.ack_match_threshold, matched, &wm, &mg);
+			if (win == cl_telecom_system::TERNACK_NACK) nack_correct++;
+			bool is_clean = (win == cl_telecom_system::TERNACK_CLEAN_PAR0
+			              || win == cl_telecom_system::TERNACK_CLEAN_PAR1);
+			if (is_clean && mg >= 2) nack_to_clean_m2++;   // a CLEAN won by margin>=2
+		}
+		// D0: ZERO false-clean-credits in 300 cfg0-regime trials (design P<=8.3e-5).
+		if (nack_to_clean_m2 != 0) {
+			char b[220]; snprintf(b, sizeof(b),
+				"B D0 VIOLATION: NACK aliased to CLEAN-by-margin2 %d/%d times "
+				"(MUST be 0 — a partial credited clean is silent data loss)",
+				nack_to_clean_m2, TRIALS);
+			test_fail(name, b); return;
+		}
+		// Sanity: the NACK is at least mostly self-recovered (not pure noise).
+		if (nack_correct < TRIALS / 3) {
+			char b[200]; snprintf(b, sizeof(b),
+				"B: NACK self-recovery only %d/%d (<1/3) — sigma too high, "
+				"test not exercising the intended cfg0 regime", nack_correct, TRIALS);
+			test_fail(name, b); return;
+		}
+	}
+
+	// (C) PARITY DISTINCTNESS: CLEAN_par0 (ACK g=5) and CLEAN_par1 (BREAK g=7) are
+	// 7/8 tone-Hamming apart, so they never alias each other (the parity reject-
+	// stale relies on this). Assert at the moderate SNR each picks its own.
+	{
+		double sigma = 0.45 * rms;
+		for (int p = 0; p <= 1; p++) {
+			int v = p ? cl_telecom_system::TERNACK_CLEAN_PAR1
+			          : cl_telecom_system::TERNACK_CLEAN_PAR0;
+			cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+			std::mt19937 rng((uint32_t)(0x7E2AC0DEu + p));
+			std::vector<double> pb; int dec = 0;
+			if (!synth_ternack_variant_passband(ts, v, REPS, sigma, rng, pb, dec)) {
+				test_fail(name, "C synth failed"); return; }
+			int matched[4] = {0,0,0,0}; int wm = 0, mg = 0;
+			int win = ts.classify_ternack_variant_from_passband(
+				pb.data(), (int)pb.size(), REPS,
+				ts.ack_mfsk.ack_match_threshold, matched, &wm, &mg);
+			int other = p ? cl_telecom_system::TERNACK_CLEAN_PAR0
+			              : cl_telecom_system::TERNACK_CLEAN_PAR1;
+			if (win == other) {
+				char b[200]; snprintf(b, sizeof(b),
+					"C: CLEAN_par%d aliased to the OTHER parity (m=[%d,%d,%d,%d]) "
+					"-- parity reject-stale broken", p,
+					matched[0],matched[1],matched[2],matched[3]);
+				test_fail(name, b); return;
+			}
+		}
+	}
+
+	test_pass(name);
+}
+
 static void test_ack_sack_bitmap_30bit_cap() {
 	const char* name = "ack_sack_bitmap_30bit_cap";
 	cl_mfsk m;
@@ -8362,6 +8534,7 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ctrl_suffix_roundtrip_all_types();
 	test_ctrl_suffix_crc12_corruption();
 	test_base_pattern_cross_correlation();
+	test_ternack2_variant_confirm();   // TERNACK2 PHY separability + D0 keystone
 	test_ack_sack_bitmap_30bit_cap();
 
 	// §2 passband round-trip — require cl_telecom_system::load_configuration

@@ -2944,6 +2944,237 @@ int cl_arq_controller::inband_emit_nack(uint8_t reason)
 #endif
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// TERNACK2 (fact-documents/data-flow-ternack2-variant-confirm.md): the cfg0
+// reverse confirm carried by the IDENTITY of which Welch-Costas base pattern the
+// RSP transmits, decoded by argmax energy-correlation — NOT a CRC codeword.
+// ════════════════════════════════════════════════════════════════════════════
+
+bool cl_arq_controller::ternack2_enabled()
+{
+#ifdef TERNACK2_FAILBEFORE
+	// FAIL-BEFORE arm: the entire TERNACK2 confirm is compiled out -> the cfg0
+	// single-frame batch stays SILENT/CRC-only -> the BENCH-INERT stall the prior
+	// ternack hit. Both producer and consumer gate on this, so the fails-before
+	// binary credits at cfg0 NEVER (climb caps at the ROBUST floor).
+	return false;
+#else
+	if(ternack2_enabled_cached < 0)
+	{
+		// Default: ON whenever the in-band reverse-confirm stack is engaged.
+		// MERCURY_TERNACK2 explicit override wins (A/B escape hatch).
+		const char* e = std::getenv("MERCURY_TERNACK2");
+		if(e && *e)
+			ternack2_enabled_cached = (atoi(e) != 0) ? 1 : 0;
+		else
+			ternack2_enabled_cached = inband_rate_feature_enabled() ? 1 : 0;
+	}
+	return ternack2_enabled_cached == 1;
+#endif
+}
+
+int cl_arq_controller::ternack2_reps()
+{
+	if(ternack2_reps_cached < 0)
+	{
+		int r = 3;  // design point: R3 + margin2 -> P(NACK->CLEAN) <= 8.3e-5
+		const char* e = std::getenv("MERCURY_TERNACK2_REPS");
+		if(e && *e) { int v = atoi(e); if(v >= 1 && v <= 4) r = v; }
+		ternack2_reps_cached = r;
+	}
+	return ternack2_reps_cached;
+}
+
+int cl_arq_controller::ternack2_margin()
+{
+	if(ternack2_margin_cached < 0)
+	{
+		int m = 2;  // design point
+		const char* e = std::getenv("MERCURY_TERNACK2_MARGIN");
+		if(e && *e) { int v = atoi(e); if(v >= 0 && v <= 8) m = v; }
+		ternack2_margin_cached = m;
+	}
+	return ternack2_margin_cached;
+}
+
+// RSP EMIT (producer): key the chosen variant's R-rep base pattern onto the wire.
+// Mirrors send_ack_pattern's generate->FIR->tx_transfer path but uses the variant
+// tone table. SAVES/RESTORES recovery_ack_reps so the production recovery-ACK is
+// never left at R=3. WB-only (M>=16). Returns passband samples emitted, 0 on no-op.
+int cl_arq_controller::rsp_emit_ternack_variant(int variant)
+{
+	if(!ternack2_enabled()) return 0;
+	if(telecom_system == NULL) return 0;
+	if(passive_monitor) return 0;
+	// WB-only: the variant family is M=16. NB keeps the legacy implicit-clean ACK.
+	if(telecom_system->ternack_variant_tones(variant) == nullptr) return 0;
+	if(playback_buffer == NULL) return 0;   // half-init (unit test, no audio) -> no-op
+
+	// Size the R-rep base block. set_recovery_ack_reps recomputes
+	// ack_pattern_passband_samples in step (the §4 sizing invariant).
+	const int saved_reps = telecom_system->ack_mfsk.recovery_ack_reps;
+	telecom_system->set_recovery_ack_reps(ternack2_reps());
+
+	int pattern_samples = telecom_system->ack_pattern_passband_samples;
+	int symbol_period = telecom_system->data_container.Nofdm
+	                  * telecom_system->data_container.interpolation_rate;
+	if(pattern_samples <= 0 || symbol_period <= 0)
+	{
+		telecom_system->set_recovery_ack_reps(saved_reps);
+		return 0;
+	}
+
+	int padded_size = pattern_samples + 2 * symbol_period;
+	double* raw_output = new double[padded_size];
+	double* filtered1  = new double[padded_size];
+	double* filtered2  = new double[padded_size];
+	if(!raw_output || !filtered1 || !filtered2) exit(-34);
+	memset(raw_output, 0, padded_size * sizeof(double));
+
+	int written = telecom_system->generate_ternack_variant_passband(
+		&raw_output[symbol_period], variant);
+	if(written <= 0)
+	{
+		delete[] raw_output; delete[] filtered1; delete[] filtered2;
+		telecom_system->set_recovery_ack_reps(saved_reps);
+		return 0;
+	}
+
+	// FIR boundary padding + the same two-stage TX FIR as send_ack_pattern.
+	memcpy(&raw_output[0], &raw_output[symbol_period], symbol_period * sizeof(double));
+	memcpy(&raw_output[symbol_period + pattern_samples],
+		&raw_output[pattern_samples], symbol_period * sizeof(double));
+	memset(filtered1, 0, padded_size * sizeof(double));
+	memset(filtered2, 0, padded_size * sizeof(double));
+	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
+	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
+
+	ptt_on();
+	cl_timer ptt_on_delay_timer; ptt_on_delay_timer.start();
+	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
+
+	tx_transfer(&filtered2[symbol_period], pattern_samples);
+	drain_playback_wait();
+
+	delete[] raw_output;
+	delete[] filtered1;
+	delete[] filtered2;
+
+	// Restore production reps so no other recovery/control ACK send rides R=3.
+	telecom_system->set_recovery_ack_reps(saved_reps);
+
+	printf("[RSP-TERNACK2] emit variant=%d (R=%d, %d samples) on CONFIG_%d\n",
+		variant, ternack2_reps(), written, current_configuration);
+	fflush(stdout);
+	return written;
+}
+
+// Select the CLEAN parity variant by the completed batch's bsi LSB and emit it.
+int cl_arq_controller::rsp_emit_ternack_clean(int completed_bsi)
+{
+	if(!ternack2_enabled()) return 0;
+	int variant = (completed_bsi & 1)
+		? cl_telecom_system::TERNACK_CLEAN_PAR1
+		: cl_telecom_system::TERNACK_CLEAN_PAR0;
+	return rsp_emit_ternack_variant(variant);
+}
+
+// CMD DECODE+ROUTE (consumer): argmax-over-variants classify the captured reverse
+// tail, then route. CLEAN(parity-matched) -> clean-credit; NACK -> immediate
+// resend; ambiguous -> no-op (caller falls through to SACK/timeout). D0: a partial
+// can NEVER win CLEAN by margin (7-8/8 tone-Hamming); a wrong-parity CLEAN is
+// rejected as stale (the owner's 1-bit parity reject-stale, realized as identity).
+bool cl_arq_controller::cmd_classify_route_ternack_variant(double* data, int size,
+	int* out_clean_credit_bsi, bool* out_nack_resend)
+{
+	if(out_clean_credit_bsi) *out_clean_credit_bsi = -1;
+	if(out_nack_resend) *out_nack_resend = false;
+	if(!ternack2_enabled()) return false;
+	if(telecom_system == NULL) return false;
+
+	int reps = ternack2_reps();
+	int min_match = telecom_system->ack_mfsk.ack_match_threshold;   // 7/16 accept floor
+	int matched[cl_telecom_system::TERNACK_NUM_VARIANTS] = {0,0,0,0};
+	int winner_matched = 0, margin = 0;
+	int winner = telecom_system->classify_ternack_variant_from_passband(
+		data, size, reps, min_match, matched, &winner_matched, &margin);
+
+	if(winner < 0)
+		return false;   // no variant cleared the 7/16 accept floor -> noise / idle
+
+	// Separation gate: the winner must beat the runner-up by >= margin. This is the
+	// D0 keystone — a CLEAN credit requires a CLEAN pattern to STRICTLY out-correlate
+	// every other variant (incl NACK) by margin>=2 (P(NACK->CLEAN) <= 8.3e-5 @ R3/m2).
+	int req_margin = ternack2_margin();
+	if(margin < req_margin)
+	{
+		printf("[CMD-TERNACK2] ambiguous: winner=%d matched=%d margin=%d < req=%d "
+			"(ack=%d brk=%d hail=%d conn=%d) -> fall through (no credit)\n",
+			winner, winner_matched, margin, req_margin,
+			matched[0], matched[1], matched[2], matched[3]);
+		fflush(stdout);
+		return false;
+	}
+
+	if(winner == cl_telecom_system::TERNACK_NACK)
+	{
+		// NACK variant: the RSP could not complete the batch -> resend NOW. Stage the
+		// in-flight data frames PENDING_ACK->ACK_TIMED_OUT (the SAME status the timeout
+		// would set, just earlier), mark the link alive, and shorten receiving_timeout
+		// so the next poll hits the expiry-resend path. D0: this NEVER touches
+		// last_batch_fully_acked (a partial/failed batch can never promote the rung).
+		int staged = 0;
+		for(int i = 0; i < nMessages; i++)
+		{
+			if(messages_tx[i].status == PENDING_ACK)
+			{
+				messages_tx[i].status = ACK_TIMED_OUT;
+				staged++;
+			}
+		}
+		data_ack_received = YES;
+		int guard = ptt_off_delay_ms + 400;
+		receiving_timeout = (int)receiving_timer.get_elapsed_time_ms() + guard;
+		if(out_nack_resend) *out_nack_resend = true;
+		printf("[CMD-TERNACK2] NACK variant (matched=%d margin=%d) -> IMMEDIATE resend "
+			"(%d frames re-armed, no timeout wait)\n", winner_matched, margin, staged);
+		fflush(stdout);
+		return true;
+	}
+
+	// CLEAN variant (par0 or par1). Parity check: the variant's parity must match the
+	// LSB of the outstanding/just-completed batch (cmd-side known). A stale CLEAN from
+	// batch N-1 carries the opposite parity ~50% of turnarounds AND is caught by the
+	// existing bsi-window + clean-dedup; the parity-as-variant is a cheap second filter.
+	int variant_parity = (winner == cl_telecom_system::TERNACK_CLEAN_PAR1) ? 1 : 0;
+	unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+	// The just-completed batch the RSP would CLEAN-ACK is the in-flight one. In Mercury
+	// stop-and-wait the outstanding batch is prev_bsi (cmd_batch_seq_id was already
+	// bumped for the NEXT batch at TX). Accept either prev or current LSB matching.
+	int credit_bsi = -1;
+	if(((unsigned)(prev_bsi & 1)) == (unsigned)variant_parity)
+		credit_bsi = (int)prev_bsi;
+	else if(((unsigned)(cmd_bsi & 1)) == (unsigned)variant_parity)
+		credit_bsi = (int)cmd_bsi;
+
+	if(credit_bsi < 0)
+	{
+		printf("[CMD-TERNACK2] CLEAN variant=%d parity=%d but NO in-window bsi LSB "
+			"matches (cmd_bsi=%u prev=%u) -> stale, reject (no credit)\n",
+			winner, variant_parity, cmd_bsi, prev_bsi);
+		fflush(stdout);
+		return false;
+	}
+
+	if(out_clean_credit_bsi) *out_clean_credit_bsi = credit_bsi;
+	printf("[CMD-TERNACK2] CLEAN variant=%d parity=%d matched=%d margin=%d -> credit "
+		"bsi=%d (byte-complete by correlation, NO CRC)\n",
+		winner, variant_parity, winner_matched, margin, credit_bsi);
+	fflush(stdout);
+	return true;
+}
+
 // In-band rate adaptation (STAGE 4d D1): the FIRING-POLICY DECISION + state machine for
 // the CONFIG_TAG, factored out of emit_config_tag_passband so the directed test can drive
 // the EXACT production decision without the passband side effects. Returns true (emit) /
@@ -5894,8 +6125,18 @@ void cl_arq_controller::inband_try_down_ladder_on_decode_fail()
 	bool progressing_batch = inband_progressing_batch_suppresses_nack();
 	if(!inband_nack_emitted_for_dead_streak && !progressing_batch)
 	{
+		// TERNACK2 (data-flow-ternack2-variant-confirm.md §emit_site): THE cfg0
+		// single-frame path. A failed lone cfg0 frame reaches here (batch_rx_frame_count
+		// ==0, real signal, down-ladder floor failed). The legacy NACK is a CRC CODEWORD
+		// (inband_emit_nack) that fails to decode on the marginal turnaround — the prior
+		// ternack's BENCH-INERT root. Emit the NACK base-pattern VARIANT FIRST: the CMD
+		// argmax-correlates it (6-9/16, works at cfg0) and resends immediately. The
+		// codeword NACK is also emitted (high-SNR/multi-frame corroboration) but is no
+		// longer the cfg0 gate. WB-only; on NB rsp_emit_ternack_variant is a no-op and
+		// the codeword path is the sole signal (byte-identical).
+		int t2 = rsp_emit_ternack_variant(cl_telecom_system::TERNACK_NACK);
 		int nacked = inband_emit_nack((uint8_t)NACK_DECODE_FAIL);
-		if(nacked > 0)
+		if(nacked > 0 || t2 > 0)
 			inband_nack_emitted_for_dead_streak = true;
 	}
 	else if(progressing_batch)

@@ -3883,6 +3883,114 @@ int cl_telecom_system::generate_ack_pattern_passband(double* out)
 	return ack_pattern_passband_samples;
 }
 
+// =============================================================================
+// TERNACK2: variant-identity reverse confirm (argmax energy-correlation, NO CRC)
+// =============================================================================
+
+const int* cl_telecom_system::ternack_variant_tones(int variant) const
+{
+	// WB-only: the cfg0 binding path is the ROBUST->WB cross (M=16). NB keeps the
+	// legacy implicit-clean ACK; ack_sack_suffix_len()<=0 signals NB/unsupported.
+	if (ack_mfsk.M < 16) return nullptr;
+	switch (variant) {
+		case TERNACK_CLEAN_PAR0: return ack_mfsk.ack_tones;     // g=5
+		case TERNACK_CLEAN_PAR1: return ack_mfsk.break_tones;   // g=7
+		case TERNACK_NACK:       return ack_mfsk.hail_tones;    // g=6
+		case TERNACK_RESERVED:   return ack_mfsk.connect_tones; // g=3
+		default: return nullptr;
+	}
+}
+
+// TX: emit the variant's R-rep base pattern. Same IFFT + baseband->passband +
+// gain + clip path as generate_ack_pattern_passband, but the base block uses the
+// variant's 8-tone table. Sized by ack_pattern_passband_samples (= R*16*Nofdm*IR,
+// kept in step by set_recovery_ack_reps). Returns samples written (0 if NB/M<16).
+int cl_telecom_system::generate_ternack_variant_passband(double* out, int variant)
+{
+	if (ack_pattern_passband_samples <= 0) return 0;
+	const int* tones = ternack_variant_tones(variant);
+	if (tones == nullptr) return 0;
+
+	int nsymb = ack_mfsk.ack_base_total_nsymb();
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+
+	// Subcarrier-domain variant pattern (R*16 * Nc complex values) into the shared
+	// ofdm_framed_data scratch (alloc_Nsymb * Nc, R*16<=64 fits).
+	ack_mfsk.generate_ack_pattern_reps_tones(data_container.ofdm_framed_data, tones);
+
+	for (int i = 0; i < nsymb; i++)
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for (int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+
+	double tx_carrier = carrier_frequency;
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
+
+	ofdm.peak_clip(out, ack_pattern_passband_samples, ofdm.data_papr_cut);
+	return ack_pattern_passband_samples;
+}
+
+// RX: argmax-over-variants classifier. Decimate ONCE (same fused mix+FIR+decimate
+// as detect_ack_pattern_from_passband), then run ofdm.detect_ack_pattern with each
+// variant's tone table and combine_reps=reps. Pick the variant with the highest
+// matched count. NO CRC, NO GF16. The margin (winner - runner-up) is returned so
+// the caller can require a separation gate (D0: a partial cannot alias clean).
+int cl_telecom_system::classify_ternack_variant_from_passband(double* data, int size,
+	int reps, int min_match, int* out_matched, int* out_winner_matched, int* out_margin)
+{
+	if (out_winner_matched) *out_winner_matched = 0;
+	if (out_margin) *out_margin = 0;
+	if (ack_mfsk.M < 16) return -1;          // WB-only
+	if (reps < 1) reps = 1;
+
+	// Single decimation shared across all variant correlations (the variants share
+	// M/Nc/Nfft geometry; only the expected-tone table differs).
+	int M = data_container.interpolation_rate;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		M, &ofdm.FIR_rx_data);
+
+	int best_v = -1, best_matched = -1, second_matched = -1;
+	for (int v = 0; v < TERNACK_NUM_VARIANTS; v++)
+	{
+		const int* tones = ternack_variant_tones(v);
+		int matched = 0;
+		int best_offset = -1;
+		ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, size / M,
+			1,
+			ack_mfsk.ack_pattern_nsymb,
+			tones, ack_mfsk.ack_pattern_len,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&matched, 0, nullptr, &best_offset, 0, nullptr,
+			/*always_fine=*/false, /*combine_reps=*/reps);
+		if (out_matched) out_matched[v] = matched;
+		if (matched > best_matched) {
+			second_matched = best_matched;
+			best_matched = matched;
+			best_v = v;
+		} else if (matched > second_matched) {
+			second_matched = matched;
+		}
+	}
+
+	if (out_winner_matched) *out_winner_matched = best_matched;
+	if (out_margin) *out_margin = best_matched - (second_matched < 0 ? 0 : second_matched);
+	if (best_matched < min_match) return -1;
+	return best_v;
+}
+
 // RECOVERY-ACK robustness PHASE-1 diagnostic gate (recovery-ack-robustness.md §6.7).
 // MERCURY_RECOVERY_ACK_DIAG=1 enables the per-poll miss-mask + CFO-grid sweep log in
 // detect_ack_pattern_from_passband — the load-bearing discriminator between a CONSTANT

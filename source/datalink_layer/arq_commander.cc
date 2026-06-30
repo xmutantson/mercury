@@ -4219,6 +4219,46 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						}
 #endif
 
+						// ── TERNACK2 (data-flow-ternack2-variant-confirm.md): argmax-over-
+						//    variants reverse-confirm on the SAME captured tail. This is the
+						//    PRIMARY clean/partial classifier on the cfg0 single-frame regime
+						//    where the CRC bitmap (above) fails though the base correlator
+						//    matches 6-9/16. Runs only when the CRC path did NOT already
+						//    handle the poll (belt-and-suspenders: a CRC-clean decode wins).
+						//    Default-OFF behind ternack2_enabled() (byte-identical legacy).
+						if(!mfsk_handled_this_poll && ternack2_enabled())
+						{
+							int t2_clean_bsi = -1;
+							bool t2_nack_resend = false;
+							bool t2_handled = cmd_classify_route_ternack_variant(
+								telecom_system->data_container.ready_to_process_passband_delayed_data,
+								tail_samples, &t2_clean_bsi, &t2_nack_resend);
+							if(t2_handled)
+							{
+								if(t2_clean_bsi >= 0)
+								{
+									// CLEAN credit by correlation — mirror the CRC clean
+									// funnel EXACTLY (the credit-path facts the prior diag
+									// proved): v2_ack_pat_pre_detected drives the fallthrough
+									// ACK_PAT clean handler (register_ack, opt_record_batch,
+									// promotion via last_batch_fully_acked), the clean-dedup
+									// records this bsi, and inband_retag_confirm_from_sack
+									// disarms the climb re-tag so the anchor raises -> FRAME-UP.
+									v2_ack_pat_pre_detected = true;
+									cmd_last_applied_clean_bsi = t2_clean_bsi;
+									inband_retag_confirm_from_sack(t2_clean_bsi);
+									printf("[CMD-MFSK-ACK-SACK] CLEAN-via-TERNACK2 bsi=%d "
+										"(cmd_batch_seq_id=%d) — correlation credit, NO CRC\n",
+										t2_clean_bsi, cmd_batch_seq_id);
+									fflush(stdout);
+								}
+								// NACK case: cmd_classify_route_ternack_variant already
+								// staged the immediate resend (ACK_TIMED_OUT + data_ack_received
+								// + shortened receiving_timeout). Nothing more here.
+								mfsk_handled_this_poll = true;
+							}
+						}
+
 						if(decoded)
 						{
 							// Sanity 1: the report must cover the batch the CMD is

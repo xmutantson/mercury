@@ -213,6 +213,39 @@ public:
 	                                   uint16_t* out_crc12,
 	                                   int* out_matched = nullptr);
 
+	// =====================================================================
+	// TERNACK2 (data-flow-ternack2-variant-confirm.md): the cfg0 reverse
+	// confirm carried by the IDENTITY of which 16-symbol Welch-Costas base
+	// pattern is on the wire, decoded by argmax energy-correlation over the
+	// shipped {ACK g=5, BREAK g=7, HAIL g=6, CONNECT g=3} tables — NOT a CRC
+	// codeword. The outcome lives in the PATTERN, so it rides the proven
+	// 6-9/16 correlator that works at cfg0 (where the CRC suffix fails).
+	enum ternack_variant_t {
+		TERNACK_CLEAN_PAR0 = 0,   // byte-complete batch, bsi LSB == 0 (ACK g=5)
+		TERNACK_CLEAN_PAR1 = 1,   // byte-complete batch, bsi LSB == 1 (BREAK g=7)
+		TERNACK_NACK       = 2,   // partial/failed batch: resend NOW (HAIL g=6)
+		TERNACK_RESERVED   = 3,   // reserved 4th variant (CONNECT g=3)
+		TERNACK_NUM_VARIANTS = 4
+	};
+	// Map a variant to its 8-tone Welch-Costas table (the shipped families).
+	// Returns nullptr on NB / M<16 (TERNACK2 is WB-only). [no side effects]
+	const int* ternack_variant_tones(int variant) const;
+	// TX: emit the chosen variant's R-rep base pattern as passband audio.
+	// recovery_ack_reps governs R (set via set_recovery_ack_reps before the
+	// call). Returns samples written, or 0 if unsupported (NB / M<16).
+	int generate_ternack_variant_passband(double* out, int variant);
+	// RX: run detect_ack_pattern once per variant on the SAME captured tail
+	// (combine_reps = reps), then argmax the matched-count. Fills
+	// out_matched[TERNACK_NUM_VARIANTS] (each variant's matched count) when
+	// non-null. Returns the winning variant index, or -1 if NB / M<16 / the
+	// winner's matched < min_match. *out_margin (optional) = winner_matched -
+	// second_best_matched (the separation the caller margin-gates). NO CRC.
+	int classify_ternack_variant_from_passband(double* data, int size, int reps,
+	                                            int min_match,
+	                                            int* out_matched,
+	                                            int* out_winner_matched,
+	                                            int* out_margin);
+
 	// Option B (data-flow-compact-confirm.md): compact coded reverse-confirm.
 	// TX: ACK base (16 sym) + the K=5 GF(16)-RA compact codeword (N=10 sym)
 	// carrying [bsi:8|crc12:12]. crc12 = production CRC12 over the single [bsi]
