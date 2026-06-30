@@ -5367,6 +5367,46 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						current_configuration, cmd_revsack_reairs, REVSACK_CHEAPMISS_MAX_REAIRS,
 						emergency_nack_count);
 					fflush(stdout);
+					// WBCROSS-HARDEN (fast CONFIG_TAG re-announce during the cheap-miss re-air loop,
+					// WITHOUT accelerating the climb-unfollowable give-up). ROOT (measured, fleet
+					// real-audio cfg0-cross, N=2 AND N=10): the ROBUST_0->1->2->WB climb crawls at
+					// ~66s/rung and the cfg0 cross only lands at ~T+219s -- so a run that takes one
+					// extra BREAK overruns the session and the cross fails (the marginal/emergent
+					// cross). The ~66s/rung is dominated by the RX CONFIG-FOLLOW latency: the unilateral
+					// climb arms repeat-until-followed, but that REPEAT only re-emits the CONFIG_TAG
+					// inside send_batch's W1 emit -- and the revsack cheap-miss re-air (a separately-
+					// reworked subsystem, CLAUDE.md §5 mismatch) re-presents the in-flight batch via the
+					// per-frame retx path WITHOUT calling send_batch, so it airs NO tag. The RX therefore
+					// stays at the old config (RX-TIMEOUT, no reverse ACK) for the WHOLE re-air loop
+					// (~57s) until the cap-reached BREAK finally drives a fresh send_batch+tag. Re-emit
+					// the armed tag HERE so the RX follows within ~1 re-air (measured: RX followed in
+					// ~1.7s of an actual emit, vs ~58s) -- the proven-correct lever.
+					//
+					// BUT: emit_config_tag_passband's firing decision increments inband_retag_count (the
+					// R-floor give-up counter consumed by inband_retag_escalate_if_climb_exhausted). If a
+					// re-air emit advanced R, the faster re-tag cadence would EXHAUST R (default 3) and
+					// AUTO-DEMOTE the climb before the RX's post-follow reverse ACK has had time to land
+					// -- measured net-negative (the climb demotes 101->100). The R-floor exists to give
+					// up on a GENUINELY unfollowable climb (no RX follow at all); a re-air emit is a
+					// "keep trying / the RX is following" event, NOT give-up evidence. So SAVE/RESTORE
+					// inband_retag_count around the re-air emit: the forward follow accelerates while the
+					// give-up clock advances ONLY on real send_batch re-tags (the original, slower
+					// no-progress cadence) -- preserving the D0 unfollowable-climb auto-demote net
+					// unchanged. emit_config_tag_passband still HOLDS the epoch parity (a repeat, not a
+					// change), is a no-op once a SACK disarmed the re-tag, and only fires while inband +
+					// armed. A/B-defeatable via MERCURY_REVSACK_REAIR_RETAG_DEFEAT=1 (FAIL-BEFORE: the
+					// tag-starved re-air -> the ~57s/rung crawl).
+					{
+						bool reair_retag_defeat = false;
+						const char* e = std::getenv("MERCURY_REVSACK_REAIR_RETAG_DEFEAT");
+						if(e && *e && atoi(e) != 0) reair_retag_defeat = true;
+						if(!reair_retag_defeat && inband_rate_feature_enabled() && inband_retag_armed)
+						{
+							int saved_retag_count = inband_retag_count;
+							emit_config_tag_passband(data_configuration, cmd_batch_seq_id);
+							inband_retag_count = saved_retag_count;   // do NOT advance the give-up R-floor on a re-air
+						}
+					}
 					// Re-arm the receiving window so the re-aired batch's ACK is awaited; leave
 					// current_configuration / cmd_batch_seq_id / messages_tx[] / retx queue untouched
 					// (the in-flight batch is re-presented by the normal per-frame send path). Do NOT
