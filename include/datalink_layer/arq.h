@@ -27,6 +27,7 @@
 #include "common/sim_clock.h"
 #include <unistd.h>
 #include <cstdint>
+#include <cstdlib>   // std::getenv / atoi (ack_suffix_fec_eligible A/B escape-hatch)
 #include <vector>
 #include "tcp_socket.h"
 #include "fifo_buffer.h"
@@ -4352,22 +4353,48 @@ public:
   // datalink_defines.h). NOTE: this is the GATE PREDICATE; the enhanced-ACK TX
   // ENABLE is held off (ARQ_ACK_SUFFIX_FEC_ENABLE=0, §21.3) so the ACK is
   // byte-identical in 100% of cases — flip the enable behind its own HW test.
-  // REVSACK Part A (revsack/design.json): WIDENED from robust-tier-only to ALSO the
-  // climbed OFDM rungs UNDER THE IN-BAND STACK. The reverse data-SACK CRC-fail-on-slow-
-  // turnaround lives at the CLIMBED rungs (cfg0+), not at the robust tier — so scoping
-  // the FEC to robust-only NEVER covered the failure. At an OFDM rung, with inband
-  // engaged, the uncoded suffix's CRC-fail is NOT throughput-neutral, it is throughput-
-  // FATAL (CMD-ACK-PAT-timeout → emergency_nack → BREAK → ROBUST_0 cascade, kills the
-  // whole climb), so the +26-symbol coded suffix is the correct trade. Legacy / non-in-
-  // band keeps the EXACT robust-tier-only predicate (the throughput-neutral default) so
-  // it is byte-identical. NB (M<16) returns 0 from ack_sack_suffix_len() so the suffix
-  // is unsupported either way; the enable hook also gates on M>=16. inband_rate_feature_
-  // enabled() is the in-band engagement test (the same gate every in-band lever uses).
-  // NOTE: this is the GATE PREDICATE; the master enable (ARQ_ACK_SUFFIX_FEC_ENABLE OR
-  // the runtime in-band default-on, ack_suffix_fec_master_enabled()) still has to be on.
+  // REVSACK Part A (revsack/design.json) — ORIGINAL: robust-tier-only (throughput-neutral).
+  // It was then WIDENED to ALSO cover the climbed OFDM rungs under the in-band stack,
+  // because the reverse data-SACK CRC-fail-on-slow-turnaround lives at the CLIMBED rungs
+  // (cfg0+): the GF(16)+CRC12 coded suffix forced the bsi to decode despite a misaligned
+  // ACK so inband_retag_confirm_from_sack could fire and the climb could hold.
+  //
+  // PATACK ROOT-CAUSE NARROWING (_research/patack, fix/revsack-data-sack): the
+  // turnaround suffix CRC-fail at cfg0+ was a SYMPTOM of an RX-side fine-timing miss, NOT
+  // an irreducible channel error. The polled data-ACK arrives at an arbitrary sub-symbol
+  // phase; detect_ack_pattern's base-rate fine re-centering was gated off for it
+  // (ofdm.cc:4624 always_fine||best_matched>=6), so the off-grid suffix FFT windows
+  // straddled the GI boundary and the uncoded CRC12 failed. The PATACK fine-timing fix
+  // (ofdm.cc: arm the fine pass at best_matched>=4) RE-CENTERS the off-grid ACK so the
+  // UNCODED 13-tone suffix decodes — addressing the root cause the +26-symbol FEC was
+  // masking. With the alignment fixed, the coded suffix is +949ms of airtime the climb no
+  // longer needs (feedback_reverse_ack_transmit_time_first: minimize reverse TRANSMIT
+  // time first). So the FEC eligibility on climbed OFDM rungs is RETIRED by DEFAULT: the
+  // OFDM-rung ACK reverts to the byte-identical uncoded 13-tone suffix (~316ms vs ~705ms
+  // coded base+suffix) and rides the fine-timing fix to decode.
+  //
+  // A/B ESCAPE-HATCH (one binary, the brief's pattern-align+FEC-off vs base A/B): the
+  // master enable ack_suffix_fec_master_enabled() still honours an explicit
+  // MERCURY_ACK_SUFFIX_FEC=1, which forces the coded suffix back ON everywhere (incl. the
+  // OFDM rungs) for the "base" arm — so the A/B runs WITHOUT a rebuild. When the explicit
+  // env forces master-on we keep the climbed-OFDM-rung eligibility so the forced FEC
+  // actually applies there; otherwise (default / unset) climbed OFDM rungs are INELIGIBLE.
+  //
+  // The robust tier keeps the EXACT original robust-tier-only eligibility unconditionally
+  // (the throughput-neutral default, where the FEC was first proven; the directed test
+  // test_ack_suffix_eligible_robust_tier_only asserts robust=eligible / OFDM=ineligible on
+  // a fresh non-inband controller, still satisfied). NB (M<16) returns 0 from
+  // ack_sack_suffix_len() so the suffix is unsupported either way; the enable hook also
+  // gates on M>=16. NOTE: this is the GATE PREDICATE; the master enable still has to be on.
   bool ack_suffix_fec_eligible() {
     if (is_robust_config(current_configuration)) return true;
-    return inband_rate_feature_enabled();   // climbed OFDM rungs under the in-band stack
+    // Climbed OFDM rungs: FEC retired by default (fine-timing fix decodes the uncoded
+    // suffix). Re-eligible ONLY when an explicit MERCURY_ACK_SUFFIX_FEC=1 forces the
+    // base-arm A/B (so the forced coded suffix reaches the OFDM rungs it is measuring).
+    const char* e = std::getenv("MERCURY_ACK_SUFFIX_FEC");
+    if (e && *e && atoi(e) != 0)
+      return inband_rate_feature_enabled();   // explicit force-on (A/B base arm) only
+    return false;                             // default: uncoded short ACK on the climb
   }
 
   // v9 handshake echo state. handshake_confirmed gates CMD's
