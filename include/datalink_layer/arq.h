@@ -3758,6 +3758,21 @@ public:
   int  inband_retag_min     = -1;           // cached MERCURY_INBAND_RETAG_MIN (-1=unresolved, default 3)
   int  inband_last_confirmed_config = CONFIG_NONE; // highest config a SACK has CONFIRMED (demote floor)
   int  inband_pre_announce_config   = CONFIG_NONE; // config BEFORE the announced change (climb-up basis)
+  // CLEAN-LOCK ADOPT LATCH (data-flow-inband-tier-crossing.md §7). The config for which the
+  // CMD has the MOST-RECENT positive, config-DISCRIMINATING proof the RSP is operating there:
+  // a returning reverse SACK/ACK whose bsi lands at-or-after that config's announce anchor
+  // (inband_note_config_adopted). While batch_cfg == inband_adopted_config the per-batch
+  // repeat-until-followed re-tag (is_repeat) AND the periodic re-announce (is_reannounce) are
+  // SUPPRESSED in inband_tag_firing_decision — the RSP already followed, so re-airing the
+  // 1.58s MFSK CONFIG_TAG only CONTAMINATES the forward OFDM data window (SKIP-VAR wedge). A
+  // genuine CHANGE (is_change) is NEVER suppressed and INVALIDATES this latch (the new config
+  // is not yet adopted). Fail-safe: the latch advances ONLY on POSITIVE proof, so a missed /
+  // lost / CRC-failed reverse SACK leaves it unchanged -> tags keep re-airing (pre-adoption
+  // reliability preserved). Distinct from inband_last_confirmed_config (the demote FLOOR =
+  // highest ever reached): this is the CURRENT-adopted config (invalidated on every change).
+  int  inband_adopted_config        = CONFIG_NONE; // CURRENT config the RSP provably followed (tag-suppress gate)
+  // Record positive RSP-adoption proof for the current config from a credited reverse SACK bsi.
+  void inband_note_config_adopted(int rx_bsi);
   // Resolve+cache the R floor (>=1). MERCURY_INBAND_RETAG_MIN, default 3.
   int  inband_retag_min_count();
   // PIPELINE-THE-CLIMB predicate (inband-reliability-design.md §1.8 — the climb-latency
