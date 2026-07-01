@@ -1151,6 +1151,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_rbfollow;
                 failed += test_rbfollow.test_inband_robust_follow_freshwin();
             }
+            // SUPER-ACK CMD-LEAP / FAIL-SAFE regression (SUPERACK_DESIGN.md §2.4/§3.3/§4/§5,
+            // data-flow-superack.md §5). Drives the PRODUCTION SUPER-ACK state machine in-process:
+            // CASE 1 FAIL-margin -> NO SUPER-ACK; CASE 2 a mis-decoded SUPER-ACK degrades to a
+            // normal +1 (every D0 gate leaves the config untouched -> NEVER a spurious jump);
+            // CASE 3 an over-leap backs off to turboshift_last_good via the reverse rate-NACK;
+            // CASE 4 a lost/dup ABSOLUTE-target SUPER-ACK does NOT accumulate. PURE in-process —
+            // permanent regression gate.
+            {
+                cl_arq_controller test_superack;
+                failed += test_superack.test_inband_superack();
+            }
             // IN-BAND CONFIG_0 ROLLING-PARTIAL climb-unblock regression
             // (data-flow-inband-frame0-rolling-partial.md §4): at the inband OFDM base rung the
             // first OFDM frame of each batch fails the SKIP-VAR gate (acquisition seam) → a

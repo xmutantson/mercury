@@ -2485,6 +2485,16 @@ public:
   // 1=FAIL. inband-reliability-design.md §5.6, data-flow-perbatch-config.md §S4C.
   int test_inband_no_break();
 
+  // SUPER-ACK CMD-LEAP / FAIL-SAFE regression (CLI --test-inband-superack; also run in the
+  // aggregate --test). Drives the PRODUCTION SUPER-ACK state machine in-process (no cards):
+  // superack_target_from_margin + inband_handle_superack + inband_route_failure_demote.
+  // CASE 1 FAIL-margin -> NO SUPER-ACK; CASE 2 a mis-decoded SUPER-ACK degrades to a normal
+  // +1 (every D0 gate leaves the config untouched); CASE 3 an over-leap backs off to
+  // turboshift_last_good via the reverse rate-NACK; CASE 4 a lost/dup ABSOLUTE-target
+  // SUPER-ACK does NOT accumulate (dedup + absolute-target re-assert). Returns 0=PASS,1=FAIL.
+  // SUPERACK_DESIGN.md §2.4/§3.3/§4/§5, data-flow-superack.md §5.
+  int test_inband_superack();
+
   // STAGE 4d D1+D4 TEST (CLI --test-inband-retag). Drives the PRODUCTION repeat-until-
   // followed + climb/auto-demote functions: PART A a CONFIG_9->CONFIG_11 chokepoint climb
   // the RX FOLLOWS UP (both ends + PHY twin); PART B inband_tag_firing_decision re-emits

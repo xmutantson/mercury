@@ -5985,6 +5985,263 @@ int cl_arq_controller::test_inband_no_break()
 }
 
 // ============================================================================
+// SUPER-ACK CMD LEAP / FAIL-SAFE regression — --test-inband-superack
+// SUPERDACK_DESIGN.md §2.4 (fail-safe) / §3.3 (under-skip) / §4 (leap) / §5 (over-leap).
+// data-flow-superack.md §5 regression-test plan.
+// ============================================================================
+//
+// Drives the PRODUCTION SUPER-ACK state machine directly, in-process (no cards / no PHY):
+// superack_target_from_margin (RSP policy) + inband_handle_superack (CMD leap + D0 gates)
+// + inband_route_failure_demote (the reverse-NACK backoff body, mirrored the same way
+// test_inband_no_break drives it). Asserts, per the task/design:
+//
+//   CASE 1 — FAIL-margin -> NO SUPER-ACK. The margin map returns -1 for every FAIL/pre-
+//     decode sentinel, so the RSP emits NO SUPER-ACK (the emit site is gated on target>=0)
+//     -> the CMD never leaps on a FAIL decode. A qualifying margin DOES map to a WB target.
+//   CASE 2 — a MIS-DECODED SUPER-ACK degrades to a normal +1 (NEVER a spurious jump). Every
+//     D0 fail-safe gate (UP-only, bsi-binding, in-flight-climb/BREAK/disconnected) makes
+//     inband_handle_superack return false AND leave negotiated_configuration / turboshift_*
+//     untouched -> the frame stays a plain ACK.
+//   CASE 3 — an OVER-LEAP triggers a reverse-NACK backoff to turboshift_last_good. After a
+//     clean SUPER-ACK leap CONFIG_0 -> CONFIG_8, turboshift_last_good == the pre-leap rung;
+//     the reverse rate-NACK (NACK_UNFOLLOWABLE_CLIMB, the pinned ROBUST reverse carrier the
+//     reverse-pin guarantees) routes inband_route_failure_demote back to turboshift_last_good.
+//   CASE 4 — a LOST/DUPLICATED ABSOLUTE-target SUPER-ACK does NOT accumulate. Re-applying the
+//     SAME SUPER-ACK is deduped (2nd apply returns false, config unchanged); and because the
+//     target is ABSOLUTE, applying it again after a batch advance lands on the SAME config,
+//     never a second additive jump.
+//
+// PURE in-process synthetic-fire — a permanent regression gate. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_superack()
+{
+	const char* TAG = "[TEST-INBAND-SUPERACK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). ---
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	auto set_inband = [&](bool on){
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_RATE", on ? "1" : "");
+#else
+		if(on) setenv("MERCURY_INBAND_RATE", "1", 1); else unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+
+	// Build a fresh COMMANDER at `cfg` (FULL load so messages_tx[] exists — the leap's
+	// roll_back_cmd_bsi_to_inflight + cleanup + add_message_control iterate them). Same
+	// synthetic-fire construction test_inband_no_break uses.
+	auto make_cmd = [&](int cfg, cl_telecom_system** out_ts) -> cl_arq_controller* {
+		set_inband(true);
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* cmd = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE;
+		cmd->telecom_system = ts;
+		cmd->narrowband_enabled = NO;
+		cmd->role = COMMANDER;
+		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;
+		cmd->load_configuration(cfg, FULL, NO);
+		cmd->link_status = CONNECTED;
+		cmd->connection_status = TRANSMITTING_DATA;
+		cmd->sack_v2_enabled = true;
+		cmd->gear_shift_on = YES;
+		cmd->robust_enabled = NO;
+		cmd->inband_rate_enabled = 1;
+		cmd->send_break_pattern_count = 0;
+		cmd->turboshift_active = false;
+		cmd->emergency_break_active = 0;
+		cmd->supershift_proven_ceiling = -1;
+		cmd->bigblock_carve_cooldown_batches = 0;
+		cmd->cmd_last_applied_superack_key = -1;
+		cmd->cmd_batch_seq_id = 4;               // the batch the CMD "just TX'd"
+		*out_ts = ts;
+		return cmd;
+	};
+
+	// ========================================================================
+	// CASE 1 — FAIL-margin -> NO SUPER-ACK (the RSP policy never advises a skip on a FAIL).
+	// ========================================================================
+	{
+		const int NITER = 200;
+		uint8_t conf = 0xFF;
+		// FAIL / pre-decode sentinels ALL map to -1 (emit-site gate: target<0 -> no emit).
+		check(superack_target_from_margin(NITER,     NITER, &conf) == -1,
+			"C1a FAIL sentinel (iters==niter) -> -1 (NO SUPER-ACK)",
+			superack_target_from_margin(NITER, NITER, &conf), -1);
+		check(superack_target_from_margin(NITER + 5, NITER, &conf) == -1,
+			"C1b over-cap FAIL -> -1 (NO SUPER-ACK)",
+			superack_target_from_margin(NITER + 5, NITER, &conf), -1);
+		check(superack_target_from_margin(-1,        NITER, &conf) == -1,
+			"C1c pre-decode sentinel (iters<0) -> -1 (NO SUPER-ACK)",
+			superack_target_from_margin(-1, NITER, &conf), -1);
+		// A QUALIFYING margin DOES advise a WB target (so the map is not trivially dead).
+		int good = superack_target_from_margin(0, NITER, &conf);
+		check(good >= 0 && is_ofdm_config(good),
+			"C1d a clean decode (iters==0) -> a WB target (SUPER-ACK CAN fire)", good, CONFIG_8);
+		// The CMD side ALSO refuses an off-ladder/-1 target (defense in depth: a FAIL never leaps).
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		bool leaped = cmd->inband_handle_superack(/*skip_target=*/-1, /*bsi*/4, /*conf*/0, /*par*/0);
+		check(!leaped && cmd->current_configuration == CONFIG_0 && !cmd->turboshift_active,
+			"C1e CMD refuses a FAIL/off-ladder target -> no leap (stays CONFIG_0)",
+			cmd->current_configuration, CONFIG_0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// CASE 2 — a MIS-DECODED SUPER-ACK degrades to a normal +1 (NEVER a spurious jump).
+	// Each D0 gate independently makes inband_handle_superack return false with the config
+	// state UNTOUCHED (the frame stays a plain ACK the ordinary gearshift handles as +1).
+	// ========================================================================
+	{
+		// (a) UP-only gate: a target AT or BELOW current is refused (a mis-decode can't demote).
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_8, &ts);
+		bool leap_down = cmd->inband_handle_superack(CONFIG_4, /*bsi=*/4, 3, 0);   // 4 < 8
+		check(!leap_down && cmd->current_configuration == CONFIG_8
+			&& cmd->negotiated_configuration == CONFIG_8 && !cmd->turboshift_active,
+			"C2a UP-only: a target below current -> no leap (config untouched)",
+			cmd->negotiated_configuration, CONFIG_8);
+		delete cmd; delete ts;
+
+		// (b) bsi-binding gate: a SUPER-ACK bound to a STALE batch is discarded.
+		ts = nullptr; cmd = make_cmd(CONFIG_0, &ts);
+		cmd->cmd_batch_seq_id = 4;                                   // current bsi&0x7 = 4 (prev=3)
+		bool leap_stale = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/1, 5, 0);  // 1 != 4/3
+		check(!leap_stale && cmd->current_configuration == CONFIG_0
+			&& cmd->negotiated_configuration == CONFIG_0 && !cmd->turboshift_active,
+			"C2b bsi-binding: a stale-batch SUPER-ACK -> no leap (config untouched)",
+			cmd->negotiated_configuration, CONFIG_0);
+		delete cmd; delete ts;
+
+		// (c) not-during-climb/BREAK gate: an in-flight turboshift blocks a fresh leap.
+		ts = nullptr; cmd = make_cmd(CONFIG_0, &ts);
+		cmd->turboshift_active = true;                              // a climb is already running
+		int neg_before = cmd->negotiated_configuration;
+		bool leap_busy = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, 5, 0);
+		check(!leap_busy && cmd->negotiated_configuration == neg_before,
+			"C2c not-during-climb: an in-flight turboshift blocks the leap (config untouched)",
+			cmd->negotiated_configuration, neg_before);
+		delete cmd; delete ts;
+
+		// (d) disconnected gate: link_status != CONNECTED -> no leap.
+		ts = nullptr; cmd = make_cmd(CONFIG_0, &ts);
+		cmd->link_status = DROPPED;
+		bool leap_down2 = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, 5, 0);
+		check(!leap_down2 && cmd->current_configuration == CONFIG_0 && !cmd->turboshift_active,
+			"C2d disconnected: link not CONNECTED -> no leap (config untouched)",
+			cmd->current_configuration, CONFIG_0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// CASE 3 — an OVER-LEAP triggers a reverse-NACK backoff to turboshift_last_good.
+	// A clean SUPER-ACK leaps CONFIG_0 -> CONFIG_8; turboshift_last_good pins the pre-leap
+	// rung. The forward data at CONFIG_8 is unfollowable; the reverse rate-NACK (on the
+	// reverse-pin's ROBUST carrier) routes the accelerated demote back to turboshift_last_good.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cmd->cmd_batch_seq_id = 4;
+		bool leaped = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, /*conf=*/5, /*par=*/1);
+		check(leaped, "C3a clean SUPER-ACK ACCEPTED -> leap fires", leaped ? 1 : 0, 1);
+		check(cmd->negotiated_configuration == CONFIG_8,
+			"C3b leap target set DIRECTLY from the wire (negotiated=CONFIG_8)",
+			cmd->negotiated_configuration, CONFIG_8);
+		check(cmd->turboshift_active && cmd->turboshift_last_good == CONFIG_0,
+			"C3c turboshift armed with last_good == the pre-leap rung (CONFIG_0, the backoff floor)",
+			cmd->turboshift_last_good, CONFIG_0);
+		int last_good = cmd->turboshift_last_good;
+
+		// Model the CONFIG_TAG announce the leap's add_message_control(SET_CONFIG) fires: the
+		// commander is now announcing CONFIG_8 and awaiting the RSP to follow it.
+		cmd->inband_retag_armed  = true;
+		cmd->inband_retag_config = CONFIG_8;                       // the announced (over-optimistic) rung
+		cmd->current_configuration = CONFIG_8;                     // twin caught up to the leap
+		cmd->turboshift_active = false;                            // leap committed; awaiting reverse
+		cmd->inband_tx_epoch_parity = 0;
+
+		// The RSP cannot follow CONFIG_8 -> it sends a rate-NACK (NACK_UNFOLLOWABLE_CLIMB) on the
+		// pinned ROBUST reverse carrier, reporting it is back at the last_good rung. Echo the
+		// current epoch (INV-E3). rx_cfg_index is the LADDER INDEX of last_good.
+		int rx_idx = config_ladder_index(last_good);
+		bool routed = cmd->inband_handle_nack((uint8_t)rx_idx,
+			(uint8_t)NACK_UNFOLLOWABLE_CLIMB, /*epoch_parity=*/0);
+		check(routed,
+			"C3d the reverse rate-NACK routed the accelerated demote (helper returned true)",
+			routed ? 1 : 0, 1);
+		check(cmd->current_configuration == last_good
+			&& cmd->negotiated_configuration == last_good,
+			"C3e over-leap BACKED OFF to turboshift_last_good (config==CONFIG_0 again)",
+			cmd->current_configuration, last_good);
+		check(cmd->supershift_proven_ceiling == last_good,
+			"C3f proven_ceiling pinned to last_good so the leap is not immediately re-elected",
+			cmd->supershift_proven_ceiling, last_good);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// CASE 4 — a LOST/DUPLICATED ABSOLUTE-target SUPER-ACK does NOT accumulate.
+	// The reverse burst sits in the capture ring for the whole turnaround; a re-aired
+	// identical SUPER-ACK must NOT re-leap. And because skip_target is ABSOLUTE, re-applying
+	// the SAME advice after a batch advance lands on the SAME config — never a 2nd additive jump.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cmd->cmd_batch_seq_id = 4;
+		// First apply: a real leap to CONFIG_8.
+		bool leap1 = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, /*conf=*/5, /*par=*/1);
+		check(leap1 && cmd->negotiated_configuration == CONFIG_8,
+			"C4a first SUPER-ACK leaps CONFIG_0 -> CONFIG_8", cmd->negotiated_configuration, CONFIG_8);
+		int neg_after_first = cmd->negotiated_configuration;
+
+		// DEDUP: the SAME SUPER-ACK re-aired in the ring must be a no-op (returns false, and —
+		// critically — negotiated_configuration is NOT bumped a second time). This is what
+		// prevents the ~12x-per-emit re-leap; the ABSOLUTE target means even a leaked re-apply
+		// could only ever re-assert CONFIG_8, never CONFIG_8+8.
+		cmd->turboshift_active = false;                            // pretend the leap settled
+		bool leap_dup = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, /*conf=*/5, /*par=*/1);
+		check(!leap_dup && cmd->negotiated_configuration == neg_after_first,
+			"C4b a DUPLICATE (same target/bsi/epoch) SUPER-ACK is deduped -> NO accumulation",
+			cmd->negotiated_configuration, neg_after_first);
+
+		// A NEW distinct advice (batch advanced -> dedup key cleared) leaping to the SAME absolute
+		// target lands on the SAME config, proving no additive accumulation even across turnarounds.
+		cmd->current_configuration = CONFIG_4;                    // pretend the elevator refined a bit
+		cmd->negotiated_configuration = CONFIG_4;
+		cmd->cmd_last_applied_superack_key = -1;                  // models the batch-advance clear
+		cmd->cmd_batch_seq_id = 5;                                // a fresh batch
+		bool leap_reassert = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/5, /*conf=*/5, /*par=*/0);
+		check(leap_reassert && cmd->negotiated_configuration == CONFIG_8,
+			"C4c re-asserting the ABSOLUTE target lands on CONFIG_8 (not CONFIG_8+delta) -> no accumulation",
+			cmd->negotiated_configuration, CONFIG_8);
+		delete cmd; delete ts;
+	}
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band CONNECT-LIVENESS GUARD regression — --test-inband-liveness
 // data-flow-inband-connect-liveness.md §4.
 // ============================================================================
