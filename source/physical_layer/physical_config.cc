@@ -61,7 +61,28 @@ cl_configuration_telecom_system::cl_configuration_telecom_system()
 
 	ofdm_channel_estimator=LEAST_SQUARE;
 	ofdm_channel_estimator_amplitude_restoration=NO;
-	ofdm_LS_window_width=2;
+	// LS frequency-window width = 1 (per-subcarrier LS, NO horizontal boxcar).
+	// ROOT FIX (fix/cfg16-dft-leakage): width=2 averaged the LS pilot estimate
+	// over ±1 adjacent subcarrier (a 3-tap frequency boxcar). On a FLAT channel
+	// that harmlessly denoises (all H equal); on a FREQUENCY-SELECTIVE channel it
+	// LOW-PASS-FILTERS H in frequency, smearing the ripple and biasing faded/edge
+	// carriers. 32-QAM (min-distance ~2x tighter than 16-QAM) then slices the
+	// biased H wrong -> an SNR-INDEPENDENT cfg16 error floor on any multipath
+	// (uncoded fsel BER 0.186 vs GENIE 0.0001; measured floor 0.02 @Es/N0=30dB).
+	// Decisive A/B: --ls-window=1x8 collapses the cfg16 fsel floor to EXACTLY 0
+	// (BER waterfalls to 0 from Es/N0>=13dB, matching the flat-AWGN threshold and
+	// the GENIE bound). Per-subcarrier LS is the unbiased estimator; the
+	// coherence-bandwidth-matched frequency denoising is done CORRECTLY (and
+	// leakage-free) by the DFT delay-domain smoother below, which the 3-tap boxcar
+	// was crudely and biasedly approximating. cfg13/15, cfg6/12 (WB climb path)
+	// and NB cfg10 show no threshold regression; the only cost is a sub-1-dB
+	// flat-AWGN softening on cfg15/16 BELOW their operating SNR (does not move the
+	// clean-decode threshold). Ref Y. Li, L. J. Cimini, N. R. Sollenberger,
+	// "Robust channel estimation for OFDM systems with rapid dispersive fading
+	// channels," IEEE Trans. Commun. 46(7):902-915, 1998 (frequency averaging must
+	// match the coherence bandwidth); O. Edfors et al., "On channel estimation in
+	// OFDM systems," IEEE VTC 1995 (DFT delay-domain denoiser).
+	ofdm_LS_window_width=1;
 	ofdm_LS_window_hight=8;
 
 	bit_energy_dispersal_seed=0;
