@@ -257,6 +257,19 @@ def main():
     }
     with open(args.out, "w") as f:
         json.dump(summary, f, indent=1)
+    # Touch an unambiguous DONE marker (next to the summary) AFTER it is fully
+    # written. This cohort already BLOCKED to completion above (proc.wait() on
+    # every child), so DONE's existence means all N cells finished and the summary
+    # is on disk. A coarse waiter can then `sleep 300; test -f <out>.done && echo
+    # READY; cat <summary>` ONCE instead of tight-polling / re-reading the growing
+    # per-cell logs (the "trapped reading output files" pathology). Incremental
+    # per-cell res_*.json / spawn_*.out stay for liveness.
+    done_path = args.out + ".done"
+    with open(done_path, "w") as f:
+        f.write("%d/%d connected, %d/%d delivered_full\n"
+                % (n_conn, args.n, n_full, args.n))
+    sys.stderr.write("[spawner] DONE marker -> %s\n" % done_path)
+    sys.stderr.flush()
     print(json.dumps(summary, indent=1))
     return 0
 
