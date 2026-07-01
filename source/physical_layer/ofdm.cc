@@ -33,6 +33,7 @@
 #include <map>
 #include <vector>  // §20: per-bin power accumulator for base-pattern combining
 #include <cstdlib> // std::getenv for the MERCURY_FFT_FLOAT gate (marathon lever H/I)
+#include <cstring> // std::strcmp for the MERCURY_DFTSMOOTH mode selector (Debian g++12 requires the explicit include; MinGW pulled <cstring> in transitively)
 
 namespace {
 // FFT plan cache. pocketfft's c2c() builds a new plan on every call, allocating
