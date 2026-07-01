@@ -6110,23 +6110,27 @@ int cl_arq_controller::test_inband_superack()
 	// ========================================================================
 	{
 		// (a) UP-only gate: a target AT or BELOW current is refused (a mis-decode can't demote).
+		// The config OWNERS are unchanged (load_configuration only sets current_configuration;
+		// negotiated_configuration keeps its pre-call value) -> snapshot + assert NO CHANGE.
 		cl_telecom_system* ts = nullptr;
 		cl_arq_controller* cmd = make_cmd(CONFIG_8, &ts);
+		int cur0 = cmd->current_configuration, neg0 = cmd->negotiated_configuration;
 		bool leap_down = cmd->inband_handle_superack(CONFIG_4, /*bsi=*/4, 3, 0);   // 4 < 8
-		check(!leap_down && cmd->current_configuration == CONFIG_8
-			&& cmd->negotiated_configuration == CONFIG_8 && !cmd->turboshift_active,
-			"C2a UP-only: a target below current -> no leap (config untouched)",
-			cmd->negotiated_configuration, CONFIG_8);
+		check(!leap_down && cmd->current_configuration == cur0
+			&& cmd->negotiated_configuration == neg0 && !cmd->turboshift_active,
+			"C2a UP-only: a target below current -> no leap (config owners untouched)",
+			cmd->current_configuration, cur0);
 		delete cmd; delete ts;
 
 		// (b) bsi-binding gate: a SUPER-ACK bound to a STALE batch is discarded.
 		ts = nullptr; cmd = make_cmd(CONFIG_0, &ts);
 		cmd->cmd_batch_seq_id = 4;                                   // current bsi&0x7 = 4 (prev=3)
+		int cur1 = cmd->current_configuration, neg1 = cmd->negotiated_configuration;
 		bool leap_stale = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/1, 5, 0);  // 1 != 4/3
-		check(!leap_stale && cmd->current_configuration == CONFIG_0
-			&& cmd->negotiated_configuration == CONFIG_0 && !cmd->turboshift_active,
-			"C2b bsi-binding: a stale-batch SUPER-ACK -> no leap (config untouched)",
-			cmd->negotiated_configuration, CONFIG_0);
+		check(!leap_stale && cmd->current_configuration == cur1
+			&& cmd->negotiated_configuration == neg1 && !cmd->turboshift_active,
+			"C2b bsi-binding: a stale-batch SUPER-ACK -> no leap (config owners untouched)",
+			cmd->current_configuration, cur1);
 		delete cmd; delete ts;
 
 		// (c) not-during-climb/BREAK gate: an in-flight turboshift blocks a fresh leap.
@@ -6186,10 +6190,13 @@ int cl_arq_controller::test_inband_superack()
 		check(routed,
 			"C3d the reverse rate-NACK routed the accelerated demote (helper returned true)",
 			routed ? 1 : 0, 1);
-		check(cmd->current_configuration == last_good
-			&& cmd->negotiated_configuration == last_good,
-			"C3e over-leap BACKED OFF to turboshift_last_good (config==CONFIG_0 again)",
-			cmd->current_configuration, last_good);
+		// The demote lands on the config OWNERS the chokepoint reads (negotiated_configuration /
+		// data_configuration) — the SET_CONFIG it queues reloads current_configuration on the
+		// next poll (not synchronously in this synthetic fire). Assert the owners == last_good.
+		check(cmd->negotiated_configuration == last_good
+			&& cmd->data_configuration == last_good,
+			"C3e over-leap BACKED OFF to turboshift_last_good (config owners==CONFIG_0 again)",
+			cmd->negotiated_configuration, last_good);
 		check(cmd->supershift_proven_ceiling == last_good,
 			"C3f proven_ceiling pinned to last_good so the leap is not immediately re-elected",
 			cmd->supershift_proven_ceiling, last_good);
