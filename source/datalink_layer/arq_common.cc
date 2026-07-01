@@ -868,6 +868,8 @@ cl_arq_controller::cl_arq_controller()
 	inband_tx_epoch_parity=0;
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
 	inband_a3_decouple_env=-1;  // unresolved; inband_a3_decouple_enabled() caches the env half
+	inband_turboshift_env=-1;  // TRIO TURBOSHIFT RE-ENGAGE: unresolved; inband_turboshift_reengage_enabled() caches the env half
+	inband_climb_jump_batch_cap=0;  // TRIO TURBOSHIFT RE-ENGAGE: disarmed (no first-post-jump batch cap)
 	ack_suffix_fec_env=-1;  // REVSACK Part A: unresolved; ack_suffix_fec_master_enabled() caches the env half
 	cmd_revsack_reairs=0;            // REVSACK Part B: bounded data-SACK re-air counter
 	cmd_revsack_reair_last_acked=0;  // REVSACK Part B: nAcked_data progress probe
@@ -2717,6 +2719,34 @@ bool cl_arq_controller::inband_a3_decouple_enabled()
 	return inband_a3_decouple_env == 1 && cumulative_ack_enabled;
 }
 
+// TRIO TURBOSHIFT RE-ENGAGE gate (gearshift-trio-turboshift-reengage.md §3). The in-band
+// redesign REPLACED the SET_CONFIG control handshake with the unilateral CONFIG_TAG and, in
+// doing so, DISENGAGED the SNR->ideal fast jump: (a) the SUPERSHIFT re-trigger fires only in
+// the SET_CONFIG ACK-processing path (arq_commander.cc:~7945) which the trio never enters, and
+// (b) the FRAME-UP SNR-elevator was hard-suppressed to strict +1 (65bb60bf) because a bare
+// multi-rung jump aired a full-backlog batch at the jumped rung whose reverse data-SACK
+// turnaround died. Result: from a CLEAN channel (WGN:40, SNR-ideal = cfg13-16) the trio CRAWLS
+// one rung per FRAME-UP (~220s) instead of leaping, running out of clock before the WB ladder.
+// This gate RE-ENGAGES the SNR->ideal elevator jump on the in-band OFDM ladder (the same
+// elevator_target_from_snr() machinery legacy uses), paired with the small first-post-jump
+// batch cap (inband_climb_jump_batch_cap, arq_commander.cc) that keeps the forward airtime /
+// reverse-SACK turnaround survivable — the ROOT the suppression named ("keep each rung's batch
+// small enough for the reverse SACK to decode") rather than the blanket +1 pacing. It is the
+// RESTORATION of an existing proven mechanism the redesign dropped, so it SHIPS DEFAULT-ON when
+// the in-band stack is engaged (CLAUDE.md don't-park-a-proven-fix), env-defeatable via
+// MERCURY_INBAND_TURBOSHIFT for a clean A/B. Same cheap-miss DEFAULT-ON policy the A3 decouple
+// uses (inband_cheapmiss_resolve): explicit env wins; else DEFAULT-ON when in-band; else off
+// (legacy/flag-off byte-identical). Cached env half (re-read live is inband engagement).
+bool cl_arq_controller::inband_turboshift_reengage_enabled()
+{
+	if(inband_turboshift_env < 0)
+	{
+		inband_turboshift_env = inband_cheapmiss_resolve(
+			std::getenv("MERCURY_INBAND_TURBOSHIFT"), inband_rate_feature_enabled());
+	}
+	return inband_turboshift_env == 1 && inband_rate_feature_enabled();
+}
+
 // REVSACK Part A (revsack/design.json): the DATA-ACK suffix FEC MASTER enable. ON iff the
 // compile-time ARQ_ACK_SUFFIX_FEC_ENABLE is non-zero OR the runtime in-band default-on
 // resolves true. The in-band default-on follows the SAME cheap-miss policy the A3 decouple
@@ -3528,11 +3558,21 @@ int cl_arq_controller::inband_tier_cross_reverse_config(int from_cfg, int to_cfg
 // unmet) -> +1 either way. The selector ONLY ever RAISES toward snr_elevator and never below
 // proposed_frame, so suppressing it cannot drop below the +1 floor (anti-thrash intact).
 int cl_arq_controller::inband_climb_target(int proposed_frame, int snr_elevator,
-	bool inband_plus1_on) const
+	bool inband_plus1_on, bool allow_ofdm_elevator) const
 {
-	if(inband_plus1_on)
+	// TRIO TURBOSHIFT RE-ENGAGE (gearshift-trio-turboshift-reengage.md §4): even under
+	// in-band, ALLOW the multi-rung SNR-ideal elevator jump when the caller licenses it
+	// (allow_ofdm_elevator — set only on an OFDM rung with a live high-confidence SNR and
+	// the turboshift-reengage gate on). This is the RESTORATION of the SNR->ideal jump the
+	// redesign dropped; the caller pairs it with the small first-post-jump batch cap so the
+	// reverse data-SACK turnaround the 65bb60bf suppression protected stays survivable.
+	// snr_elevator is already the ceiling-capped SNR-ideal target (elevator_target_from_snr);
+	// it can only RAISE above the +1 (elevator-OR-+1 max), never below, so the +1 floor /
+	// anti-thrash nets are untouched. Falls through to the strict-+1 suppression whenever the
+	// reengage is NOT licensed (ROBUST rung, no SNR, gate off) — byte-identical to 65bb60bf.
+	if(inband_plus1_on && !allow_ofdm_elevator)
 		return proposed_frame;                    // in-band: strict +1, suppress the elevator
-	// legacy: elevator-OR-+1 max (the pre-fix inline behaviour, byte-identical)
+	// legacy OR reengaged in-band: elevator-OR-+1 max (the pre-fix inline behaviour)
 	if(snr_elevator >= 0 &&
 	   config_ladder_index(snr_elevator) > config_ladder_index(proposed_frame))
 		return snr_elevator;
@@ -7605,6 +7645,10 @@ void cl_arq_controller::reset_session_state()
 	inband_retag_count = 0;
 	inband_last_confirmed_config = CONFIG_NONE;
 	inband_pre_announce_config = CONFIG_NONE;
+	// TRIO TURBOSHIFT RE-ENGAGE (gearshift-trio-turboshift-reengage.md §5): a fresh session
+	// has done no elevator jump, so the first-post-jump batch cap is disarmed (mirrors the
+	// ctor init). The env cache (inband_turboshift_env) is env-keyed, NOT reset here.
+	inband_climb_jump_batch_cap = 0;
 	// STAGE 4e: a fresh session has seen no tag (parity echo 0), no dead-streak NACK
 	// emitted, and the periodic re-announce clock at 0. The N cache is env-keyed (resolved
 	// once + cached), so NOT reset here — same discipline as inband_retag_min.

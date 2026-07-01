@@ -2142,6 +2142,27 @@ void cl_arq_controller::process_messages_tx_data()
 	v2_retx_prefix_count = 0;
 	bool v2_mixed_batch = false;
 
+	// TRIO TURBOSHIFT RE-ENGAGE first-post-jump batch cap (gearshift-trio-turboshift-reengage.md
+	// §5). When the in-band FRAME-UP just fired the multi-rung SNR-ideal elevator jump, cap THIS
+	// batch's frame count (retx prefix + new-data fill) to a small value so the forward airtime /
+	// reverse data-SACK turnaround at the jumped rung stays survivable — the ROOT the 65bb60bf
+	// +1-suppression named, without giving up the multi-rung climb. Consumed + disarmed here so
+	// exactly ONE batch is capped; the batch size grows back via the normal Axis-2 controller.
+	// Does NOT touch data_batch_size (the SACK bitmap / ACK-timeout sizing is unchanged — a
+	// shorter batch just occupies fewer of the padded slots). Off/no-cap => eff == data_batch_size
+	// (byte-identical to the un-capped build).
+	int eff_data_batch_size = data_batch_size;
+	if(inband_climb_jump_batch_cap > 0)
+	{
+		if(eff_data_batch_size > inband_climb_jump_batch_cap)
+			eff_data_batch_size = inband_climb_jump_batch_cap;
+		printf("[GEARSHIFT] TURBOSHIFT batch-cap consumed: this batch <= %d frames "
+			"(data_batch_size=%d) at config %d\n",
+			eff_data_batch_size, data_batch_size, current_configuration);
+		fflush(stdout);
+		inband_climb_jump_batch_cap = 0;   // one-shot: cap exactly the first post-jump batch
+	}
+
 	// §7.13.39 Fix 2 — single source of truth for batch_tx slot identity.
 	// Both the retx prefix loop and the new-data fill loop must agree on the
 	// formula for (sequence_number, id, batch_seq_id) so a future edit to one
@@ -2274,7 +2295,7 @@ void cl_arq_controller::process_messages_tx_data()
 		// from the head of the queue; survivors at [R..count-1] shift down so
 		// the next batch consumes them first.
 		int R = retransmit_count;
-		if(R > data_batch_size) R = data_batch_size;
+		if(R > eff_data_batch_size) R = eff_data_batch_size;  // TRIO TURBOSHIFT: honor the first-post-jump cap
 		message_batch_counter_tx = 0;
 		for(int r = 0; r < R; r++)
 		{
@@ -2360,7 +2381,7 @@ void cl_arq_controller::process_messages_tx_data()
 	{
 		if(messages_tx[i].status==ADDED_TO_LIST)
 		{
-			if(message_batch_counter_tx<data_batch_size)
+			if(message_batch_counter_tx<eff_data_batch_size)  // TRIO TURBOSHIFT: honor the first-post-jump cap
 			{
 				// Assign the current new-data batch's batch_seq_id.
 				messages_tx[i].batch_seq_id = (cmd_batch_seq_id & 0xFF);
@@ -2418,7 +2439,7 @@ void cl_arq_controller::process_messages_tx_data()
 		{
 			if(--messages_tx[i].nResends>0)
 			{
-				if(message_batch_counter_tx<data_batch_size)
+				if(message_batch_counter_tx<eff_data_batch_size)  // TRIO TURBOSHIFT: honor the first-post-jump cap
 				{
 					// Retransmit: keep existing batch_seq_id (original value
 					// from first send). Do not reassign.
@@ -2475,7 +2496,11 @@ void cl_arq_controller::process_messages_tx_data()
 			// frames. v2 uses the EOB bit on the last frame plus
 			// last_received_end_of_batch_seq on the RX side to derive the
 			// real effective batch size, so v2 does not need padding.
-			pad_messages_batch_tx(data_batch_size);
+			// TRIO TURBOSHIFT: honor the first-post-jump cap (eff_data_batch_size) so a
+			// capped batch is not padded back to full size. No-op off-cap (eff==data_batch_size);
+			// the turboshift re-engage is in-band (sack_v2) only, so this v1 branch is unreached
+			// there — kept coherent defensively.
+			pad_messages_batch_tx(eff_data_batch_size);
 		}
 		else
 		{
@@ -6378,8 +6403,42 @@ void cl_arq_controller::process_messages_rx_acks_data()
 #else
 				bool inband_plus1_on = inband_rate_feature_enabled();
 #endif
+				// TRIO TURBOSHIFT RE-ENGAGE (gearshift-trio-turboshift-reengage.md §4):
+				// LICENSE the multi-rung SNR-ideal elevator jump on the in-band OFDM ladder.
+				// The redesign disengaged the SNR->ideal fast jump when it moved off SET_CONFIG
+				// onto the CONFIG_TAG carrier — the SUPERSHIFT re-trigger (:~7945) only fires in
+				// the SET_CONFIG ACK path the trio never enters, and 65bb60bf hard-suppressed the
+				// FRAME-UP elevator to strict +1. From a CLEAN channel (SNR-ideal cfg13-16) that
+				// makes the trio CRAWL one rung per FRAME-UP. Re-engage the SAME elevator legacy
+				// uses (elevator_target_from_snr) ONLY when: the gate is on (DEFAULT-ON in-band),
+				// we're on an OFDM rung (is_ofdm_config — ROBUST stays strict +1, its cross is a
+				// distinct lever), and a real multi-rung jump is available (snr_elevator ranks
+				// ABOVE the +1). The reverse-data-SACK death 65bb60bf named (a full-backlog batch
+				// aired at the jumped rung whose reverse turnaround dies) is defused by arming the
+				// first-post-jump batch cap below — the ROOT fix ("keep each rung's batch small
+				// enough for the reverse SACK to decode"), not the blanket +1 pacing.
+				bool allow_ofdm_elevator =
+					inband_turboshift_reengage_enabled() &&
+					is_ofdm_config(current_configuration) &&
+					snr_elevator >= 0 &&
+					config_ladder_index(snr_elevator) > config_ladder_index(proposed_frame);
 				negotiated_configuration =
-					inband_climb_target(proposed_frame, snr_elevator, inband_plus1_on);
+					inband_climb_target(proposed_frame, snr_elevator, inband_plus1_on,
+						allow_ofdm_elevator);
+				// If the elevator actually took a multi-rung jump (target ranks above the +1),
+				// CAP the first batch at the jumped rung to a small frame count so its forward
+				// airtime stays short and the reverse data-SACK turnaround survives (the 65bb60bf
+				// root). Disarmed for a plain +1 step (byte-identical to the suppressed path).
+				if(allow_ofdm_elevator &&
+				   config_ladder_index(negotiated_configuration) > config_ladder_index(proposed_frame))
+				{
+					inband_climb_jump_batch_cap = INBAND_CLIMB_JUMP_BATCH_CAP;
+					printf("[GEARSHIFT] TURBOSHIFT elevator: SNR-ideal jump %d -> %d (SNR=%.1f), "
+						"capping first batch to %d frames (reverse-SACK survivable)\n",
+						current_configuration, negotiated_configuration,
+						measurements.SNR_uplink, inband_climb_jump_batch_cap);
+					fflush(stdout);
+				}
 				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs (eff_thresh %d, base %d, clean-streak %d), config %d -> %d\n",
 					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
 					clean_batches_at_current_config, current_configuration, negotiated_configuration);
@@ -11780,6 +11839,29 @@ int cl_arq_controller::test_inband_plus1_climb()
 	check(e == proposed_c4, "E intra-OFDM in-band +1: elevator(CONFIG_8) SUPPRESSED",
 		e, proposed_c4);
 #endif
+
+	// ---- TRIO TURBOSHIFT RE-ENGAGE (gearshift-trio-turboshift-reengage.md §4) ----
+	// F: in-band with the reengage LICENSE (allow_ofdm_elevator=true) OVERRIDES the +1
+	//    suppression and fires the multi-rung SNR-ideal jump. At CONFIG_4 with elevator
+	//    CONFIG_8 the in-band climb now RETURNS CONFIG_8 (the restored fast jump). This is
+	//    the pass-after for the reengage; before the reengage (E) the in-band path stays +1.
+	int f = inband_climb_target(proposed_c4, /*snr_elevator=*/CONFIG_8,
+		/*inband_plus1_on=*/true, /*allow_ofdm_elevator=*/true);
+	check(f == CONFIG_8, "F reengage: in-band + license -> SNR-ideal jump CONFIG_8 (restored)",
+		f, CONFIG_8);
+
+	// G: the license only RAISES — a license with an elevator BELOW proposed keeps the +1
+	//    (never lowers below the ladder step); guards the elevator-OR-+1-max invariant.
+	int g = inband_climb_target(proposed_c3, /*snr_elevator=*/CONFIG_1,
+		/*inband_plus1_on=*/true, /*allow_ofdm_elevator=*/true);
+	check(g == proposed_c3, "G reengage: license but elevator below proposed -> +1 (never lowers)",
+		g, proposed_c3);
+
+	// H: license but NO elevator available (snr_elevator<0) -> +1 (the caller only sets the
+	//    license when snr_elevator ranks above proposed, but the selector must be safe anyway).
+	int h = inband_climb_target(proposed_c4, /*snr_elevator=*/-1,
+		/*inband_plus1_on=*/true, /*allow_ofdm_elevator=*/true);
+	check(h == proposed_c4, "H reengage: license but no elevator -> +1 (safe)", h, proposed_c4);
 
 	printf("[TEST-PLUS1] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);

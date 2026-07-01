@@ -3716,6 +3716,17 @@ public:
   //   ack_suffix_fec_master_enabled()). -1 = unresolved, 0 = off, 1 = on. Same env-keyed
   //   ctor-cached discipline as inband_a3_decouple_env.
   int     ack_suffix_fec_env;           // -1 = unresolved, 0 = off, 1 = on
+  // TRIO TURBOSHIFT RE-ENGAGE env cache (gearshift-trio-turboshift-reengage.md §3): the env
+  //   half of inband_turboshift_reengage_enabled(). -1 = unresolved, 0 = off, 1 = on. Same
+  //   env-keyed ctor-cached discipline as inband_a3_decouple_env; the live gate ALSO requires
+  //   inband_rate_feature_enabled().
+  int     inband_turboshift_env;        // -1 = unresolved, 0 = off, 1 = on
+  // TRIO TURBOSHIFT RE-ENGAGE first-post-jump batch cap (gearshift-trio-turboshift-reengage.md
+  //   §5): armed by the FRAME-UP gate on a multi-rung SNR-ideal elevator jump. When > 0, the
+  //   next DATA batch is capped to this many frames so the forward airtime / reverse data-SACK
+  //   turnaround stays survivable at the jumped rung (the ROOT the 65bb60bf suppression named).
+  //   Consumed + cleared by process_messages_tx_data on the first batch after the jump.
+  int     inband_climb_jump_batch_cap;  // <=0 = disarmed (no cap); N = cap next batch to N
 
   // ── STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (inband-reliability-
   //    design.md §1/§4) ──
@@ -4212,8 +4223,20 @@ public:
   // pure FRAME-UP climb-target selector. inband_plus1_on=true -> strict +1 (proposed_frame,
   // suppress the SNR elevator so the reverse data-SACK decodes at the shared rung);
   // inband_plus1_on=false -> legacy elevator-OR-+1 max (byte-identical). snr_elevator<0 means
-  // no elevator this poll. Drives the production decision AND test_inband_plus1_climb.
-  int inband_climb_target(int proposed_frame, int snr_elevator, bool inband_plus1_on) const;
+  // no elevator this poll. allow_ofdm_elevator=true (TRIO TURBOSHIFT RE-ENGAGE,
+  // gearshift-trio-turboshift-reengage.md §4) OVERRIDES the in-band suppression to fire the
+  // multi-rung SNR-ideal jump on an OFDM rung (paired with the caller's first-post-jump batch
+  // cap). Drives the production decision AND test_inband_plus1_climb.
+  int inband_climb_target(int proposed_frame, int snr_elevator, bool inband_plus1_on,
+                          bool allow_ofdm_elevator = false) const;
+
+  // TRIO TURBOSHIFT RE-ENGAGE gate (gearshift-trio-turboshift-reengage.md §3). Returns true
+  // iff the in-band stack is engaged AND the turboshift re-engage is on (DEFAULT-ON in-band;
+  // env-defeatable MERCURY_INBAND_TURBOSHIFT). When true, the FRAME-UP gate re-enables the
+  // SNR->ideal multi-rung elevator jump on OFDM rungs (restoring the fast climb the redesign
+  // dropped when it moved off SET_CONFIG onto the CONFIG_TAG carrier), paired with the small
+  // first-post-jump batch cap. Cached env half (inband_turboshift_env). Off => byte-identical.
+  bool inband_turboshift_reengage_enabled();
 
   // Directed regression for the tier-cross reverse-ACK pin (fails-before/passes-after).
   int test_inband_tier_cross_reverse_pin();
