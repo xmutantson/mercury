@@ -44,7 +44,15 @@ from ra_cleanup import scoped_cleanup  # concurrency-safe per-run cleanup
 CONNECT_RE = re.compile(r"link_status:Connected to")
 DISC_RE = re.compile(r"link_status:Disconnected|DISCONNECTED")
 NRECV_RE = re.compile(r"stats\.nReceived_data=\s*(\d+)")
-CFG_RE = re.compile(r"load_configuration\((\d+)\)\s+current=(\d+)")
+# load_configuration(N) current=M : N (group 1) is the TARGET config being
+# LOADED (it becomes the ACTIVE config at arq_common.cc:2129); M (group 2) is the
+# OUTGOING/previous config, printed BEFORE the assignment. KEY configs_seen ON N
+# (group 1), NEVER on current=M — keying on M is the deprecated "BUG-A current=
+# keying" (see tools/.../score_climb_canonical.py HISTORY): it records where the
+# side WAS, not where it is GOING, so the freshly-adopted WB id (e.g. cfg0/13/16)
+# never appears -> configs_seen under-reports the climb / cfg0 cross. `current=-1`
+# is the default-init (length=0 / first load), so allow a leading sign on M.
+CFG_RE = re.compile(r"load_configuration\((\d+)\)\s+current=(-?\d+)")
 BREAK_RE = re.compile(r"\[BREAK\] Block failure")
 
 
@@ -87,7 +95,9 @@ def log_output(proc, label, logfile, t0, st):
             m = CFG_RE.search(text)
             if m:
                 with st.lock:
-                    st.configs_seen.add(int(m.group(2)))
+                    # group(1) = TARGET config N (the one being loaded / becoming
+                    # active), NOT group(2)=current=M (the OUTGOING/previous one).
+                    st.configs_seen.add(int(m.group(1)))
             if BREAK_RE.search(text):
                 with st.lock:
                     st.breaks += 1

@@ -49,8 +49,16 @@ HARNESS = os.path.join(HERE, "arq_realaudio.py")
 
 
 def card_name(idx):
-    # snd-aloop names successive cards Loopback, Loopback_1, Loopback_2, ...
-    return "Loopback" if idx == 0 else f"Loopback_{idx}"
+    # snd-aloop names the card index in UPPERCASE HEX, not decimal:
+    #   idx 0      -> "Loopback"
+    #   idx 1..9   -> "Loopback_1" .. "Loopback_9"   (hex == decimal here)
+    #   idx 10..15 -> "Loopback_A" .. "Loopback_F"
+    #   idx 16..   -> "Loopback_10", "Loopback_11", ...  ("%X" of the index)
+    # A plain decimal "Loopback_%d" is WRONG for idx >= 10 (it asks for
+    # "Loopback_10" while the kernel card is "Loopback_A") -> ENODEV, cell fails.
+    # Verified on the fleet R730s (24-card pool, 2026-06-29). The kernel `id=`
+    # module param can NOT override this (it strips underscores).
+    return "Loopback" if idx == 0 else "Loopback_%X" % idx
 
 
 def run_plan(n, port_base):
