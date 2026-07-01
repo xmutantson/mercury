@@ -2580,6 +2580,37 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					printf("[RSP-MFSK-SACK] MFSK suffix returned 0 — falling back to legacy MFSK ACK pattern\n");
 					fflush(stdout);
 				}
+				// SUPER-ACK (SUPERACK_DESIGN.md): the RSP just CLEANLY decoded a data
+				// batch on the reverse robust layer. If we are on a ROBUST config (the
+				// ~1000x ROBUST->WB climb-binding tier) AND the LDPC decode margin is
+				// comfortable, EMIT a SUPER-ACK carrying the recommended ABSOLUTE WB
+				// target -- the CMD leaps directly to it (bypassing the dead is_ofdm_config
+				// SNR gate). Rides ON TOP of the clean ACK/SACK just sent (gate-1: a real
+				// ACK truly arrived). ROBUST-only: on a WB config the OFDM turbo elevator
+				// already refines the rate on a real per-subcarrier SNR, so the SUPER-ACK's
+				// job is purely the from-ROBUST unblock. No-op off-feature.
+				if (used_mfsk_path
+				    && inband_rate_feature_enabled()
+				    && is_robust_config(current_configuration))
+				{
+					int niter_max = (telecom_system != NULL)
+						? telecom_system->ldpc.nIteration_max : 200;
+					int iters = (telecom_system != NULL)
+						? telecom_system->receive_stats.iterations_done : -1;
+					uint8_t sa_conf = 0;
+					int sa_target = superack_target_from_margin(iters, niter_max, &sa_conf);
+					if (sa_target >= 0
+					    && config_ladder_index(sa_target)
+					         > config_ladder_index(current_configuration))
+					{
+						printf("[RSP-SUPERACK] clean ROBUST decode (iters=%d/max=%d) -> "
+							"recommend CONFIG_%d (conf=%u) for bsi_lsb=%u\n",
+							iters, niter_max, sa_target, (unsigned)sa_conf,
+							(unsigned)(wire_bsi & 0x7));
+						fflush(stdout);
+						inband_emit_superack(sa_target, (uint8_t)(wire_bsi & 0x7), sa_conf);
+					}
+				}
 			}
 			if (!used_mfsk_path)
 			{

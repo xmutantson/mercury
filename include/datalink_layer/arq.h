@@ -3863,6 +3863,13 @@ public:
   // dead-streak re-emits one NACK). Init false.
   bool inband_nack_emitted_for_dead_streak = false;
 
+  // SUPER-ACK (RSP-side, SUPERACK_DESIGN.md §2.2): the RSP's rate-advice epoch parity,
+  // TOGGLED each time it emits a SUPER-ACK carrying a DIFFERENT skip_target than the last,
+  // so the CMD can dedup a re-aired SUPER-ACK. The last skip_target the RSP recommended
+  // (-1 = none yet) tracks whether the advice actually changed. Init 0 / -1.
+  uint8_t inband_rx_superack_parity = 0;
+  int     inband_rx_last_superack_target = -1;
+
   // Build the NACK suffix tones (RM(1,4) Walsh prefix carrying rx_cfg_index +
   // gf16ra RA + CRC-12 message carrying the NACK payload), type=MFSK_CTRL_NACK.
   // Mirrors build_config_tag_tones. Returns true on success; false if rx_cfg off the
@@ -3896,6 +3903,68 @@ public:
   // Rejects a stale NACK whose echoed parity != inband_tx_epoch_parity (INV-E3). Returns
   // true if it routed the accelerated demote. COMMANDER-only (uses the demote helper).
   bool inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason, uint8_t epoch_parity);
+
+  // ── SUPER-ACK (SUPERACK_DESIGN.md) — RSP-driven rate-UP skip signal ──────────────
+  // The RSP maps its LDPC decode MARGIN (receive_stats.iterations_done) to an ABSOLUTE
+  // recommended target config and signals it on the reverse robust ACK; the CMD leaps
+  // DIRECTLY to skip_target, bypassing the dead is_ofdm_config SNR gate. Rate-UP mirror
+  // of the rate-NACK. All fns gate on inband_rate_feature_enabled() (legacy byte-identical
+  // — never called when off / M<16). See the SUPER-ACK data-flow fact-doc.
+
+  // RSP margin -> ABSOLUTE skip_target config map (SUPERACK_DESIGN.md §3.3, CONSERVATIVE
+  // under-skip). iterations_done is the LDPC iters-to-converge (FAIL sentinel = a value
+  // > nIteration_max). Returns the recommended target config (a raw WB config id
+  // CONFIG_0..WB_CONFIG_MAX) with *out_confidence set, OR -1 to emit NO SUPER-ACK (stay /
+  // rate-NACK path). PURE (no member writes) so the directed test can replay it directly.
+  int  superack_target_from_margin(int iterations_done, int ldpc_niteration_max,
+                                   uint8_t* out_confidence) const;
+
+  // Build the SUPER-ACK suffix tones (RM(1,4) Walsh prefix carrying skip_target_cfg +
+  // gf16ra RA + CRC-12 message carrying the SUPER-ACK payload), type=MFSK_CTRL_SUPERACK.
+  // Mirrors build_nack_tones. skip_target_cfg is a raw WB config id (0..16); the RM prefix
+  // and CRC field both carry config_ladder_index(skip_target_cfg). Returns true on success;
+  // false if skip_target off the ladder / not a WB config / M<16.
+  bool build_superack_tones(int skip_target_cfg, uint8_t ack_bsi_lsb,
+                            uint8_t skip_confidence, uint8_t epoch_parity,
+                            int* out_tones, int* out_n);
+
+  // RX EMIT (producer): key a SUPER-ACK onto the reverse robust passband layer (the SAME
+  // keyer the CONFIG_TAG/NACK use), AFTER the clean data ACK/SACK. skip_target_cfg is the
+  // RSP's recommended ABSOLUTE target (raw WB config id); ack_bsi_lsb binds it to the batch
+  // just ACKed. No-op (returns 0) when the feature is off / M<16 / skip_target off-ladder /
+  // playback ring unallocated. Returns the passband samples emitted (0 if none). Called
+  // ONLY on a clean data-ACK whose decode margin qualifies (superack_target_from_margin>=0).
+  int  inband_emit_superack(int skip_target_cfg, uint8_t ack_bsi_lsb, uint8_t skip_confidence);
+
+  // SENDER decode (consumer): pull the reverse ctrl tail (SAME window math as the MFSK
+  // ACK/SACK decode), run decode_config_tag_from_passband + superack_wrap_decode
+  // (type=MFSK_CTRL_SUPERACK). On a CRC-valid SUPER-ACK writes *out_skip_target_cfg (a raw
+  // WB config id, mapped back from the ladder index) / *out_ack_bsi_lsb / *out_confidence /
+  // *out_parity and returns 1; 0 otherwise. No-op when the feature is off. Called from the
+  // commander reverse-frame poll when the base ACK pattern matched (SUPERACK_DESIGN.md §2.4
+  // gate 1 — the SUPER-ACK rides ON TOP of a real ACK).
+  int  inband_decode_superack_from_capture(int* out_skip_target_cfg, uint8_t* out_ack_bsi_lsb,
+                                           uint8_t* out_confidence, uint8_t* out_parity);
+
+  // SENDER handle (consumer): apply the SUPER-ACK leap. FAIL-SAFE (SUPERACK_DESIGN.md §2.4/§4):
+  // accepts ONLY if skip_target > current_configuration (UP-only) AND ack_bsi_lsb matches the
+  // batch the CMD just TX'd (cmd_batch_seq_id/prev &0x7) AND it is not a dedup of the last-
+  // applied SUPER-ACK (epoch+target+bsi key). On accept it clamps skip_target through the SAME
+  // never-raise clamps the elevator uses (supershift_proven_ceiling / NB cap /
+  // apply_bigblock_cooldown_cap), clones the supershift re-trigger leap block (turboshift_*
+  // + negotiated_configuration + add_message_control(SET_CONFIG) + TRANSMITTING_CONTROL), and
+  // returns true. ANY gate fail -> returns false (the frame stays a NORMAL ACK, +1 via the
+  // ordinary gearshift — NEVER a spurious jump). COMMANDER-only.
+  bool inband_handle_superack(int skip_target_cfg, uint8_t ack_bsi_lsb,
+                              uint8_t skip_confidence, uint8_t epoch_parity);
+
+  // SUPER-ACK dedup key: the (epoch<<16|target<<8|bsi) of the last-applied SUPER-ACK this
+  // turnaround, so a re-aired SUPER-ACK sitting in the capture ring is not re-leaped ~12x
+  // (mirror of cmd_last_applied_nack_key). -1 = none applied. Cleared on any batch advance.
+  int  cmd_last_applied_superack_key = -1;
+  // The CMD's SUPER-ACK rate-advice epoch echo — the parity the RSP last stamped, tracked so
+  // the CMD dedups a re-aired SUPER-ACK across turnarounds. Init 0.
+  uint8_t cmd_superack_seen_parity = 0;
 
   // ── STAGE 4e — D3 periodic re-announce backstop (inband-reliability-design.md §3,
   //    OD-3) ── Re-emit the CURRENT-config tag every N DATA batches independent of

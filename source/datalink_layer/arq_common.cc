@@ -996,6 +996,11 @@ cl_arq_controller::cl_arq_controller()
 	// §7.13.29 init
 	cmd_last_applied_sack_bsi = -1;
 	cmd_last_applied_nack_key = -1;   // §CROSS — reverse-NACK re-decode dedup
+	cmd_last_applied_superack_key = -1;   // SUPER-ACK re-air dedup (mirror of the NACK key)
+	cmd_superack_seen_parity = 0;
+	// SUPER-ACK RSP-side rate-advice epoch state (reset per session).
+	inband_rx_superack_parity = 0;
+	inband_rx_last_superack_target = -1;
 	// climb-engine Bug 1 (gearshift-climb-engine.md §4): clean-confirm dedupe
 	// tracker, split from the partial tracker above. Same lifecycle (ctor init).
 	cmd_last_applied_clean_bsi = -1;
@@ -4191,6 +4196,343 @@ bool cl_arq_controller::inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason,
 	// A no-op demote (already at rx_raw_cfg) returns false and leaves the link there — the
 	// climb simply stops being re-tagged, which is the correct outcome.
 	return inband_route_failure_demote(rx_raw_cfg, "nack_accelerated_demote");
+}
+
+// =============================================================================
+// SUPER-ACK (SUPERACK_DESIGN.md) — RSP-driven rate-UP skip signal
+// =============================================================================
+
+// RSP margin -> ABSOLUTE skip_target map (SUPERACK_DESIGN.md §3.3, CONSERVATIVE under-skip).
+// The metric is the LDPC iters-to-converge (receive_stats.iterations_done). The FAIL
+// sentinel is iterations_done > (nIteration_max-1) OR < 0 (telecom_system.cc:3315/3378).
+// The map is deliberately COARSE + under-skips (every target is >= 1 rung below the
+// MEASURED decodable ceiling): iterations SATURATE at 0, so we cap the top-band jump at
+// cfg8 and let the OFDM turbo elevator refine the last rungs on solid ground (§3.2/§3.3).
+// Returns a raw WB config id (CONFIG_0..WB_CONFIG_MAX), or -1 for NO SUPER-ACK. PURE.
+int cl_arq_controller::superack_target_from_margin(int iterations_done,
+                                                   int ldpc_niteration_max,
+                                                   uint8_t* out_confidence) const
+{
+	if(out_confidence) *out_confidence = 0;
+	int niter_cap = (ldpc_niteration_max > 0) ? ldpc_niteration_max : 200;
+
+	// FAIL sentinel (non-converge / undecodable): stay ROBUST — NO SUPER-ACK. A FAIL
+	// means we are AT or below the ROBUST floor (the rate-NACK rate-DOWN path owns this).
+	if(iterations_done < 0 || iterations_done > (niter_cap - 1))
+		return -1;
+
+	// The margin -> ABSOLUTE-target table (§3.3). Higher iters == thinner margin == smaller
+	// skip. Each target is a raw WB config id (== the config number for the WB tier).
+	int target;
+	uint8_t conf;
+	if(iterations_done >= 10)      { target = CONFIG_0; conf = 0; }  // near-floor: just cross to WB
+	else if(iterations_done >= 3)  { target = CONFIG_2; conf = 2; }  // ceiling ~cfg4 -> under-skip 2
+	else if(iterations_done == 2)  { target = CONFIG_4; conf = 3; }  // ceiling ~cfg6 -> 4
+	else if(iterations_done == 1)  { target = CONFIG_6; conf = 4; }  // ceiling  cfg8 -> 6
+	else /* iterations_done == 0 */{ target = CONFIG_8; conf = 5; }  // iter=0 band (cfg11..16) -> cfg8
+
+	// Never recommend above the WB ceiling (defense-in-depth; the CMD also clamps).
+	if(target > WB_CONFIG_MAX) target = WB_CONFIG_MAX;
+	if(out_confidence) *out_confidence = conf;
+	return target;
+}
+
+// Build the SUPER-ACK suffix tones. IDENTICAL structure to build_nack_tones — the RM(1,4)
+// Walsh prefix carries the skip_target ladder index (the FWHT-hardened PRIMARY detector)
+// and the gf16ra RA + CRC-12 message carries the SUPER-ACK payload — the ONLY differences
+// are the type (MFSK_CTRL_SUPERACK vs NACK) and the payload field layout (pack_superack_
+// payload). Returns the combined RM16||gf39 tone array (the SAME generate_config_tag_
+// pattern_passband keyer + decode_config_tag_from_passband energy-extractor consume it).
+bool cl_arq_controller::build_superack_tones(int skip_target_cfg, uint8_t ack_bsi_lsb,
+                                             uint8_t skip_confidence, uint8_t epoch_parity,
+                                             int* out_tones, int* out_n)
+{
+	if(out_n) *out_n = 0;
+	if(out_tones == NULL) return false;
+
+	// skip_target must be a WB config (0..16, NEVER a ROBUST index) that lives on the ladder.
+	if(!is_ofdm_config(skip_target_cfg)) return false;
+	int ladder_idx = config_ladder_index(skip_target_cfg);
+	if(ladder_idx < 0 || ladder_idx > 31) return false;
+	if(telecom_system == NULL) return false;
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // M<16
+
+	// Configure the gf16ra graph to N=39 R=1/3 (the SAME substrate the tag/NACK use).
+	// SAVE/RESTORE the process-global repfact (cross-layer guard, CLAUDE.md §5).
+	int saved_repfact = gf16ra::current_repfact();
+	gf16ra::configure(2);
+	gf16ra::init();
+	int N_gf = gf16ra::codeword_len();   // 39
+	if(N_gf <= 0 || N_gf > gf16ra::GF16RA_MAX_N) {
+		if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+		return false;
+	}
+
+	// --- RM(1,4) block tones carrying the skip_target ladder index (FWHT corroboration). ---
+	int rm_chips[CFG_TAG_RM_N];
+	if(!cfg_tag_rm_encode(ladder_idx, rm_chips)) {
+		if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+		return false;
+	}
+	for(int i = 0; i < CFG_TAG_RM_N; i++)
+	{
+		int tplus = CFG_TAG_TONE_PERM[i] & 0xF;
+		out_tones[i] = (rm_chips[i] > 0) ? tplus : (tplus ^ 0xF);
+	}
+
+	// --- GF(16) RA + CRC-12 SUPER-ACK message block (type=MFSK_CTRL_SUPERACK). The CRC
+	// field carries the SAME ladder index as the RM prefix (the WRAP corroboration copy). ---
+	uint64_t p37 = 0;
+	pack_superack_payload(&p37, (uint8_t)ladder_idx, ack_bsi_lsb, skip_confidence, epoch_parity);
+	unsigned char bytes[5];
+	pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_SUPERACK, p37);
+	uint16_t crc12 = CRC12_calc((const char*)bytes, 5) & 0x0FFF;
+	gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_SUPERACK, p37, crc12, out_tones + CFG_TAG_RM_N);
+
+	if(out_n) *out_n = CFG_TAG_RM_N + N_gf;   // 55
+
+	if(saved_repfact != 2) { gf16ra::configure(saved_repfact); gf16ra::init(); }
+	return true;
+}
+
+// RX EMIT (producer, mirror of inband_emit_nack): key a SUPER-ACK onto the reverse robust
+// passband layer AFTER the clean data ACK/SACK. skip_target_cfg is the RSP's recommended
+// ABSOLUTE target (raw WB config id); ack_bsi_lsb binds it to the batch just ACKed. The
+// RSP toggles its rate-advice epoch (inband_rx_superack_parity) whenever the recommended
+// target CHANGES, so the CMD can dedup a re-aired SUPER-ACK. No-op (0) when off / M<16 /
+// skip_target off-ladder / playback ring unallocated.
+int cl_arq_controller::inband_emit_superack(int skip_target_cfg, uint8_t ack_bsi_lsb,
+                                            uint8_t skip_confidence)
+{
+	// Feature off -> never emit (zero cost, byte-identical default).
+	if(!inband_rate_feature_enabled())
+		return 0;
+	if(telecom_system == NULL)
+		return 0;
+	// The SUPER-ACK rides the M=16 robust ctrl-suffix layer; unavailable on NB / M<16.
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+	if(!is_ofdm_config(skip_target_cfg))
+		return 0;
+
+	// Toggle the rate-advice epoch ONLY when the recommended target changes (a re-air of
+	// the SAME advice holds the parity — mirror of the CONFIG_TAG epoch discipline, so the
+	// CMD's dedup key stays stable across a re-aired identical SUPER-ACK).
+	if(inband_rx_last_superack_target != skip_target_cfg)
+	{
+		inband_rx_superack_parity = (uint8_t)(inband_rx_superack_parity ^ 0x1);
+		inband_rx_last_superack_target = skip_target_cfg;
+	}
+
+	int tones[gf16ra::GF16RA_MAX_N];
+	int n_tones = 0;
+	if(!build_superack_tones(skip_target_cfg, ack_bsi_lsb, skip_confidence,
+	                         inband_rx_superack_parity, tones, &n_tones))
+		return 0;
+
+	int base_total  = telecom_system->ack_mfsk.config_tag_sync_nsymb();
+	int burst_nsymb = base_total + n_tones;
+	int burst_samples = burst_nsymb * telecom_system->data_container.Nofdm
+		* telecom_system->frequency_interpolation_rate;
+	if(burst_samples <= 0)
+		return 0;
+
+	std::vector<double> burst((size_t)burst_samples, 0.0);
+	int written = telecom_system->generate_config_tag_pattern_passband(
+		burst.data(), tones, n_tones);
+	if(written <= 0)
+		return 0;
+
+	// The keyed burst goes onto the wire via the playback ring (the SAME path ACK/SACK +
+	// NACK emits use). A half-initialized controller (in-process unit test with no audio
+	// pipeline) leaves playback_buffer NULL — guard so the SUPER-ACK is a clean no-op there
+	// rather than asserting (mirror of inband_emit_nack; byte-identical in production).
+	if(playback_buffer == NULL)
+		return 0;
+
+	tx_transfer(burst.data(), (size_t)written);
+
+	printf("[INBAND-RX] SUPER-ACK emit skip_target=CONFIG_%d (ladder_idx=%d) ack_bsi_lsb=%u "
+		"conf=%u parity=%u burst_samples=%d\n",
+		skip_target_cfg, config_ladder_index(skip_target_cfg), (unsigned)ack_bsi_lsb,
+		(unsigned)skip_confidence, (unsigned)inband_rx_superack_parity, written);
+	fflush(stdout);
+	return written;
+}
+
+// SENDER decode (consumer, mirror of inband_decode_nack_from_capture): pull the reverse
+// ctrl tail (SAME window math), run decode_config_tag_from_passband + superack_wrap_decode.
+// On a CRC-valid SUPER-ACK writes the fields (skip_target mapped BACK from ladder index to
+// a raw WB config id) and returns 1; 0 otherwise. No-op when the feature is off.
+int cl_arq_controller::inband_decode_superack_from_capture(int* out_skip_target_cfg,
+                                                           uint8_t* out_ack_bsi_lsb,
+                                                           uint8_t* out_confidence,
+                                                           uint8_t* out_parity)
+{
+	if(!inband_rate_feature_enabled())
+		return 0;
+	if(telecom_system == NULL)
+		return 0;
+	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
+		return 0;
+
+	// Size the capture tail the SAME way the NACK decode does (the burst rides the SAME
+	// RM16+gf39 substrate as CONFIG_TAG/NACK; the tail holds the burst).
+	int base_total = telecom_system->ack_mfsk.config_tag_sync_nsymb();
+	int N_gf;
+	{
+		int saved_rf = gf16ra::current_repfact();
+		gf16ra::configure(2); gf16ra::init();
+		N_gf = gf16ra::codeword_len();   // 39
+		if(saved_rf != 2) { gf16ra::configure(saved_rf); gf16ra::init(); }
+	}
+	if(N_gf <= 0) N_gf = 39;
+	int suffix_nsymb = CFG_TAG_RM_N + N_gf;            // 55
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_nsymb = base_total + suffix_nsymb + 16;   // + margin (same as W2)
+	int tail_samples = tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	if(tail_samples <= 0) return 0;
+	int tail_offset = signal_period - tail_samples;
+
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
+		(size_t)tail_samples * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+
+	std::vector<double> energies((size_t)gf16ra::GF16RA_MAX_N * 16, 0.0);
+	double chips[16] = {0.0};
+	int n_syms = 0, matched = 0;
+	bool present = telecom_system->decode_config_tag_from_passband(
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		tail_samples, energies.data(), chips, &n_syms, &matched);
+	if(!present)
+		return 0;
+
+	superack_decode_result r;
+	bool ok = superack_wrap_decode(energies.data(), chips, /*peak_ratio_gate=*/CFG_TAG_PEAK_GATE,
+		arq_inband_crc12_cb, this, &r);
+	if(!ok)
+		return 0;
+
+	// Map the decoded ladder index back to a raw config id (the SUPER-ACK's skip_target is a
+	// WB config; the RM/CRC fields carry the LADDER INDEX per build_superack_tones).
+	int raw_cfg = (r.skip_target_cfg < FULL_CONFIG_LADDER_SIZE)
+		? FULL_CONFIG_LADDER[r.skip_target_cfg] : -1;
+	if(raw_cfg < 0 || !is_ofdm_config(raw_cfg))
+		return 0;   // a corroborated non-WB target is a mis-decode -> treat as no SUPER-ACK
+
+	if(out_skip_target_cfg) *out_skip_target_cfg = raw_cfg;
+	if(out_ack_bsi_lsb)     *out_ack_bsi_lsb     = r.ack_bsi_lsb;
+	if(out_confidence)      *out_confidence      = r.skip_confidence;
+	if(out_parity)          *out_parity          = r.epoch_parity;
+	return 1;
+}
+
+// SENDER handle (consumer): apply the SUPER-ACK leap with the D0 FAIL-SAFE gates
+// (SUPERACK_DESIGN.md §2.4 / §4). ANY gate fail -> return false (the frame stays a NORMAL
+// ACK, +1 via the ordinary gearshift — NEVER a spurious jump). On accept it clones the
+// supershift re-trigger leap block (arq_commander.cc:8069-8081), routing skip_target
+// through the SAME never-raise clamps the elevator uses. COMMANDER-only.
+bool cl_arq_controller::inband_handle_superack(int skip_target_cfg, uint8_t ack_bsi_lsb,
+                                               uint8_t skip_confidence, uint8_t epoch_parity)
+{
+	if(!inband_rate_feature_enabled())
+		return false;
+
+	// GATE (UP-only): the SUPER-ACK is a rate-UP signal; a target at-or-below the current
+	// config is either a mis-decode or nothing to do. Never leap DOWN off a SUPER-ACK.
+	if(!is_ofdm_config(skip_target_cfg))
+		return false;
+	if(config_ladder_index(skip_target_cfg) <= config_ladder_index(current_configuration))
+		return false;
+
+	// GATE 5 (binding, §2.4): ack_bsi_lsb must match the batch the CMD just TX'd (current or
+	// just-prior, mod 8). A SUPER-ACK bound to a stale batch is discarded (fail toward slow).
+	unsigned cmd_bsi_lsb  = (unsigned)(cmd_batch_seq_id & 0x7);
+	unsigned prev_bsi_lsb = (unsigned)((cmd_batch_seq_id - 1) & 0x7);
+	if((unsigned)(ack_bsi_lsb & 0x7) != cmd_bsi_lsb
+	   && (unsigned)(ack_bsi_lsb & 0x7) != prev_bsi_lsb)
+	{
+		printf("[CMD-SUPERACK] bsi mismatch (ack_bsi_lsb=%u != cmd=%u/prev=%u) -> discard "
+			"(stays a normal ACK)\n",
+			(unsigned)(ack_bsi_lsb & 0x7), cmd_bsi_lsb, prev_bsi_lsb);
+		fflush(stdout);
+		return false;
+	}
+
+	// DEDUP: the reverse burst sits in the capture ring for the whole turnaround; without a
+	// dedup the CMD re-leaps the SAME SUPER-ACK ~12x per emit (mirror of the NACK dedup at
+	// arq_commander.cc:4269). Key on (parity<<16|target<<8|bsi); apply each distinct
+	// SUPER-ACK ONCE. The key is cleared on any batch advance so a genuinely NEW advice
+	// (different target / fresh epoch) is honored.
+	int superack_key = ((int)(epoch_parity & 0x1) << 16)
+		| ((int)(skip_target_cfg & 0xFF) << 8) | (int)(ack_bsi_lsb & 0x7);
+	if(superack_key == cmd_last_applied_superack_key)
+		return false;   // identical SUPER-ACK already leaped this turnaround
+	cmd_last_applied_superack_key = superack_key;
+	cmd_superack_seen_parity = (uint8_t)(epoch_parity & 0x1);
+
+	// Do not fight an in-flight climb / BREAK / disconnected state (mirror of the [OPT]
+	// gate at arq_commander.cc:1033). The SUPER-ACK is a fresh-from-ROBUST unblock; if a
+	// turboshift or BREAK is already running, let it finish.
+	if(turboshift_active || emergency_break_active != 0 || link_status != CONNECTED)
+		return false;
+
+	// NEVER-RAISE CLAMPS (§4.1): the SAME clamps elevator_target_from_snr() applies, as
+	// UPPER bounds only — they can ONLY make the leap MORE conservative, never raise it.
+	int leap = skip_target_cfg;
+	// NB cap.
+	if(narrowband_enabled == YES && leap > NB_CONFIG_MAX)
+		leap = NB_CONFIG_MAX;
+	// Proven-ceiling cap (never leap above a config the link already failed to sustain).
+	if(supershift_proven_ceiling >= 0
+	   && config_ladder_index(leap) > config_ladder_index(supershift_proven_ceiling))
+		leap = supershift_proven_ceiling;
+	// Batch-resize / big-block carve cooldown cap (§5.5 — a SUPER-ACK cannot defeat the
+	// batch-resize cooldown; if the cooldown is active this may clamp the leap to a no-op).
+	leap = apply_bigblock_cooldown_cap(leap);
+
+	// The clamps may have pulled the target down to at-or-below current -> nothing to do
+	// (a SAFE no-op this turn; the SUPER-ACK simply did not raise the config).
+	if(config_ladder_index(leap) <= config_ladder_index(current_configuration))
+	{
+		printf("[CMD-SUPERACK] skip_target=CONFIG_%d clamped to CONFIG_%d (<= current %d) "
+			"-> no leap this turn (safe)\n",
+			skip_target_cfg, leap, current_configuration);
+		fflush(stdout);
+		return false;
+	}
+
+	printf("[CMD-SUPERACK] ACCEPT: RSP recommends CONFIG_%d (conf=%u, epoch=%u), clamped to "
+		"CONFIG_%d (current %d, proven_ceiling=%d) -> DIRECT LEAP (bypassing SNR gate)\n",
+		skip_target_cfg, (unsigned)skip_confidence, (unsigned)(epoch_parity & 0x1),
+		leap, current_configuration, supershift_proven_ceiling);
+	fflush(stdout);
+
+	// LEAP — clone the supershift re-trigger block (arq_commander.cc:8069-8081). The target
+	// comes DIRECTLY from the wire (NOT elevator_target_from_snr()), so the is_ofdm_config &&
+	// SNR_uplink>-90 gate is OFF the code path. The add_message_control(SET_CONFIG) fires the
+	// existing CONFIG_TAG cross to `leap`; the CLIMB-CHURN bsi rollback keeps an in-flight
+	// batch contiguous (mirror of the [OPT] leap at :1067).
+	turboshift_active = true;
+	turboshift_phase = TURBO_FORWARD;
+	turboshift_initiator = true;
+	turbo_snr_ack_enabled = true;
+	turbo_received_snr = -99.0f;
+	turbo_best_snr = -99.0f;
+	turboshift_last_good = current_configuration;   // fallback rung (reverse-pin backoff)
+	turboshift_retries = 1;
+	negotiated_configuration = leap;
+	roll_back_cmd_bsi_to_inflight("SUPERACK");
+	cleanup();
+	add_message_control(SET_CONFIG);
+	connection_status = TRANSMITTING_CONTROL;
+	return true;
 }
 
 // Resolve+cache N (the periodic re-announce period, >=0; 0=disabled).

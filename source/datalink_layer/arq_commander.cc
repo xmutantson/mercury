@@ -2684,6 +2684,10 @@ void cl_arq_controller::process_messages_tx_data()
 			// dead-streak NACK for this batch is honored once (the dedup only collapses the
 			// re-decode of the SAME burst within one turnaround, never across batches).
 			cmd_last_applied_nack_key = -1;
+			// SUPER-ACK dedup (mirror): forget the last-applied SUPER-ACK so a NEW rate
+			// advice bound to this fresh batch is honored once (the dedup only collapses a
+			// re-aired SAME SUPER-ACK within one turnaround, never across batches).
+			cmd_last_applied_superack_key = -1;
 		}
 		stats.nBatches_sent++;
 		last_transmission_block_stats.nBatches_sent++;
@@ -4356,6 +4360,30 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										(unsigned)rx_bitmap, mfsk_matched, arrival_ms);
 									fflush(stdout);
 									mfsk_handled_this_poll = true;
+
+									// SUPER-ACK (SUPERACK_DESIGN.md §2.4): this CLEAN reverse ACK truly arrived
+									// (gate 1). The RSP may have ridden a SUPER-ACK skip recommendation ON TOP of
+									// it (a typed type-6 suffix on the SAME robust carrier). Try the SUPER-ACK arm
+									// ONLY now (a real ACK is confirmed), decode+fail-safe it, and on accept LEAP
+									// DIRECTLY to the recommended WB config (bypassing the dead is_ofdm_config SNR
+									// gate). ANY fail-safe gate miss -> the frame stays this NORMAL clean ACK (+1),
+									// NEVER a spurious jump. No-op when the feature is off.
+									if(inband_rate_feature_enabled())
+									{
+										int sa_skip_target = -1;
+										uint8_t sa_bsi_lsb = 0, sa_conf = 0, sa_parity = 0;
+										if(inband_decode_superack_from_capture(&sa_skip_target, &sa_bsi_lsb,
+											&sa_conf, &sa_parity) == 1)
+										{
+											printf("[CMD-SUPERACK] decoded SUPER-ACK skip_target=CONFIG_%d bsi_lsb=%u "
+												"conf=%u parity=%u -- applying fail-safe leap policy\n",
+												sa_skip_target, (unsigned)sa_bsi_lsb, (unsigned)sa_conf,
+												(unsigned)sa_parity);
+											fflush(stdout);
+											if(inband_handle_superack(sa_skip_target, sa_bsi_lsb, sa_conf, sa_parity))
+												mfsk_handled_this_poll = true;
+										}
+									}
 								}
 								else
 								{

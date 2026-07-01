@@ -4502,6 +4502,119 @@ static void test_config_tag_roundtrip_all_indices() {
 	test_pass(name);
 }
 
+// SUPER-ACK codec (SUPERACK_DESIGN.md §2) round-trip + margin-map + fail-safe.
+// Mirrors the CONFIG_TAG T1 clean round-trip: for a set of WB ladder indices, encode
+// the SUPER-ACK (RM prefix via cfg_tag_energies_from_cfg + GF16-RA message via
+// encode_config_tag type=6), then superack_wrap_decode must ACCEPT with exact fields.
+// Then: (a) pack/unpack payload primitive; (b) a corrupted-chip mis-decode is REJECTED
+// (fail-safe); (c) superack_target_from_margin follows the §3.3 conservative table.
+static void test_superack_codec() {
+	const char* name = "superack_codec (round-trip + margin-map + fail-safe)";
+	cl_arq_controller arq;
+
+	// --- (1) clean WRAP round-trip over representative ladder indices (skip targets). ---
+	// The SUPER-ACK carries the ladder INDEX in both the RM prefix and the CRC field
+	// (build_superack_tones), so drive the codec with ladder indices directly.
+	const int idxs[] = {0, 2, 4, 6, 8, 10, 16};   // WB ladder indices exercised by the map
+	for (unsigned k = 0; k < sizeof(idxs)/sizeof(idxs[0]); k++) {
+		int lidx = idxs[k];
+		uint8_t bsi_lsb = (uint8_t)(lidx & 0x7);
+		uint8_t conf    = (uint8_t)(k & 0x7);
+		uint8_t parity  = (uint8_t)(k & 0x1);
+
+		// RM(1,4) Walsh prefix soft chips (clean).
+		double e16[256]; cfg_tag_energies_from_cfg(lidx, 1.0, 0.0, e16);
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+
+		// GF(16) RA + CRC-12 SUPER-ACK message energies (one-hot clean).
+		gf16ra::configure(2); gf16ra::init();
+		uint64_t p37 = 0;
+		pack_superack_payload(&p37, (uint8_t)lidx, bsi_lsb, conf, parity);
+		uint8_t bytes[5];
+		pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_SUPERACK, p37);
+		uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+		int tones[gf16ra::GF16RA_MAX_N];
+		gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_SUPERACK, p37, crc12, tones);
+		int N = gf16ra::codeword_len();
+		std::vector<double> e((size_t)N * 16, 0.0);
+		for (int s = 0; s < N; s++) e[(size_t)s * 16 + tones[s]] = 1.0;
+
+		superack_decode_result r;
+		bool ok = superack_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			prod_crc12_cb, &arq, &r);
+		if (!ok) {
+			char b[160]; snprintf(b, sizeof(b),
+				"lidx=%d WRAP reject (fwht=%d crc=%d corr=%d rpeak=%.2f)",
+				lidx, r.fwht_passed, r.crc_passed, r.skip_corroborate, r.fwht_rpeak);
+			test_fail(name, b); return;
+		}
+		if (r.skip_target_cfg != lidx || r.ack_bsi_lsb != bsi_lsb
+		    || r.skip_confidence != conf || r.epoch_parity != parity) {
+			char b[160]; snprintf(b, sizeof(b),
+				"lidx=%d field mismatch: skip=%d bsi=%d conf=%d par=%d",
+				lidx, r.skip_target_cfg, r.ack_bsi_lsb, r.skip_confidence, r.epoch_parity);
+			test_fail(name, b); return;
+		}
+
+		// (a) pack/unpack payload primitive round-trip.
+		uint8_t us=0, ub=0, uconf=0, up=0;
+		unpack_superack_payload(p37, &us, &ub, &uconf, &up);
+		if (us != lidx || ub != bsi_lsb || uconf != conf || up != parity) {
+			test_fail(name, "unpack_superack_payload roundtrip mismatch"); return;
+		}
+
+		// (b) FAIL-SAFE: corrupt the RM prefix so the FWHT winner flips — the corroboration
+		// gate (FWHT==CRC) must then DISAGREE and the WRAP must REJECT (no spurious skip).
+		double soft_bad[16];
+		for (int i = 0; i < 16; i++) soft_bad[i] = soft[i];
+		soft_bad[0] = -soft_bad[0] * 8.0;   // slam one chip to flip the Walsh winner
+		soft_bad[1] = -soft_bad[1] * 8.0;
+		superack_decode_result r2;
+		bool ok2 = superack_wrap_decode(e.data(), soft_bad, CFG_TAG_PEAK_GATE,
+			prod_crc12_cb, &arq, &r2);
+		if (ok2 && r2.skip_target_cfg != lidx) {
+			test_fail(name, "corrupted RM prefix ACCEPTED with a WRONG skip_target (fail-safe breach)");
+			return;
+		}
+	}
+
+	// --- (2) margin -> ABSOLUTE-target map (SUPERACK_DESIGN.md §3.3). ---
+	const int NITER = 200;   // representative ROBUST nIteration_max
+	uint8_t c = 0;
+	struct { int iters; int expect; } cases[] = {
+		{ NITER,     -1        },  // FAIL sentinel (> niter-1) -> NO SUPER-ACK
+		{ NITER + 1, -1        },  // over-cap FAIL              -> NO SUPER-ACK
+		{ -1,        -1        },  // pre-decode sentinel        -> NO SUPER-ACK
+		{ 12,        CONFIG_0  },  // near-floor  -> just cross to WB
+		{ 10,        CONFIG_0  },
+		{ 3,         CONFIG_2  },
+		{ 2,         CONFIG_4  },
+		{ 1,         CONFIG_6  },
+		{ 0,         CONFIG_8  },  // iter=0 band -> cfg8 (3 below worst-case cfg11)
+	};
+	for (unsigned k = 0; k < sizeof(cases)/sizeof(cases[0]); k++) {
+		int got = arq.superack_target_from_margin(cases[k].iters, NITER, &c);
+		if (got != cases[k].expect) {
+			char b[128]; snprintf(b, sizeof(b),
+				"margin map iters=%d -> %d (want %d)", cases[k].iters, got, cases[k].expect);
+			test_fail(name, b); return;
+		}
+	}
+
+	// --- (3) UNDER-SKIP invariant: every non-FAIL target is a WB config <= WB_CONFIG_MAX
+	//     and STRICTLY below the top so the OFDM elevator refines the last rungs. ---
+	for (int iters = 0; iters <= 15; iters++) {
+		int got = arq.superack_target_from_margin(iters, NITER, &c);
+		if (got >= 0 && (!is_ofdm_config(got) || got > WB_CONFIG_MAX)) {
+			char b[128]; snprintf(b, sizeof(b),
+				"margin map iters=%d -> non-WB/over-ceiling target %d", iters, got);
+			test_fail(name, b); return;
+		}
+	}
+
+	test_pass(name);
+}
+
 // (T2) Soft-decode the tag over a NOISE-LOADED energy/chip frame at a
 // representative Es/N0 and assert the RIGHT cfg_index decodes via the WRAP.
 // Many trials at a moderate noise level; assert a high success rate AND zero
@@ -8514,6 +8627,7 @@ int run_mfsk_ctrl_codec_tests() {
 	// codeword + FWHT decode + GF(16) RA FEC + WRAP acceptance. Offline codec
 	// only (no ARQ/gearshift wiring). tag-codeword-design.md §5/§8.
 	test_config_tag_roundtrip_all_indices();   // T1 encode->decode all 32 cfg_index
+	test_superack_codec();                     // SUPER-ACK (type-6) round-trip + margin-map + fail-safe
 	test_config_tag_noise_loaded_decode();     // T2 right index at a representative Es/N0
 	test_config_tag_pure_noise_far();          // T3 WRAP FAR <= design bound
 	test_config_tag_optab_detection_sweep();   // T4 option (a) tone-perm vs (b) 2-tone detection-vs-Es/N0
