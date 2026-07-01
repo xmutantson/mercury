@@ -2669,6 +2669,19 @@ void cl_ofdm::smooth_channel_estimate_dft()
 	// variant of EDFTI; it needs no knowledge of the null-band and is exact for a
 	// smooth in-band response.
 	int mode = dftsmooth_mode();
+	// One-shot audit banner: makes the PRE-FIX/POST-FIX estimator arm visible in
+	// the RX log (the MERCURY_DFTSMOOTH env is otherwise silent). Fires once.
+	static bool banner_done = false;
+	if(!banner_done)
+	{
+		banner_done = true;
+		const char* mn = (mode == 0) ? "LEGACY(leaky)"
+		               : (mode == 2) ? "OFF"
+		                             : "EDGEEXT(rootfix)";
+		printf("[EST-MODE] dftsmooth=%s LS_window_width=%d LS_window_hight=%d\n",
+		       mn, LS_window_width, LS_window_hight);
+		fflush(stdout);
+	}
 	if(mode == 2) return;                 // OFF: skip smoother (A/B isolation)
 
 	if(Nc < 4) return;  // Too few subcarriers for meaningful smoothing
