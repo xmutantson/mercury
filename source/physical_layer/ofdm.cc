@@ -33,6 +33,7 @@
 #include <map>
 #include <vector>  // §20: per-bin power accumulator for base-pattern combining
 #include <cstdlib> // std::getenv for the MERCURY_FFT_FLOAT gate (marathon lever H/I)
+#include <cstring> // std::strcmp for the MERCURY_DFTSMOOTH mode selector (Debian g++12 requires the explicit include; MinGW pulled <cstring> in transitively)
 
 namespace {
 // FFT plan cache. pocketfft's c2c() builds a new plan on every call, allocating
@@ -2615,6 +2616,26 @@ double cl_ofdm::measure_SNR(std::complex <double>*in_s, std::complex <double>*in
 	return SNR;
 }
 
+// cfg16 DFT-smoother leakage mode selector (fix/cfg16-dft-leakage).
+// Read ONCE into a function-local static (single-threaded per-frame call,
+// never a hot inner-loop getenv). Controls smooth_channel_estimate_dft():
+//   0 = LEGACY   : rectangular IFFT over active band only (the leaky version)
+//   1 = EDGEEXT  : mirror-extend the band edges before the IFFT to kill the
+//                  virtual-subcarrier boundary discontinuity (default; root fix)
+//   2 = OFF      : skip the smoother entirely (A/B isolation only)
+// Env MERCURY_DFTSMOOTH = legacy|edgeext|off overrides the default at runtime.
+static int dftsmooth_mode()
+{
+	static const int mode = []() -> int {
+		const char* e = std::getenv("MERCURY_DFTSMOOTH");
+		if(e == nullptr) return 1;              // default: root fix ON
+		if(strcmp(e, "off")    == 0 || strcmp(e, "2") == 0) return 2;
+		if(strcmp(e, "legacy") == 0 || strcmp(e, "0") == 0) return 0;
+		return 1;                               // edgeext / "1" / anything else
+	}();
+	return mode;
+}
+
 void cl_ofdm::smooth_channel_estimate_dft()
 {
 	// DFT-based channel estimation noise suppression.
@@ -2622,6 +2643,47 @@ void cl_ofdm::smooth_channel_estimate_dft()
 	// FFT back to frequency domain. Suppresses estimation noise while
 	// preserving real channel structure within the guard interval.
 	// Ref: Edfors et al., "On Channel Estimation in OFDM Systems," VTC 1995.
+	//
+	// ROOT FIX (fix/cfg16-dft-leakage): the naive transform runs the IFFT over
+	// ONLY the Nc=50 ACTIVE subcarriers, which sit embedded (with virtual/null
+	// subcarriers around them) inside the Nfft=256 grid. The active band is a
+	// RECTANGULAR SLICE of the true 256-bin frequency response; on a
+	// frequency-selective channel H[0] != H[Nc-1], so this slice has a hard
+	// discontinuity at its edges (periodic wrap). The IFFT of a discontinuous
+	// sequence LEAKS energy across ALL time taps (Gibbs), and the rectangular
+	// time-window [window_taps, Nc-window_taps) then zeroes taps that carry
+	// GENUINE (leaked) channel energy -> an irreducible, SNR-independent bias
+	// floor in H that GROWS with multipath delay (ripple rate). 32-QAM
+	// (min-distance ~2x tighter than 16-QAM) slices this bias wrong -> the
+	// cfg16 frequency-selective BER floor (uncoded 0.186 vs GENIE 0.0001).
+	// Refs: Dong Li et al., "Enhanced DFT Interpolation-based Channel Estimation
+	// for OFDM Systems with Virtual Subcarriers," IEEE VTC 2006 (the leakage
+	// error floor + edge-processing fix); "A New DFT-Based Channel Estimation
+	// Approach for OFDM with Virtual Subcarriers by Leakage Estimation," IEEE
+	// Trans. (Yonsei) — virtual subcarriers break Fourier orthogonality -> leakage.
+	//
+	// FIX: mirror-extend (even reflection) the band edges before the IFFT. The
+	// reflected sequence is continuous at the wrap boundary, so the leakage
+	// (Gibbs ripple from the edge step) collapses and the true delay-limited CIR
+	// is recovered inside window_taps. This is the low-complexity edge-processing
+	// variant of EDFTI; it needs no knowledge of the null-band and is exact for a
+	// smooth in-band response.
+	int mode = dftsmooth_mode();
+	// One-shot audit banner: makes the PRE-FIX/POST-FIX estimator arm visible in
+	// the RX log (the MERCURY_DFTSMOOTH env is otherwise silent). Fires once.
+	static bool banner_done = false;
+	if(!banner_done)
+	{
+		banner_done = true;
+		const char* mn = (mode == 0) ? "LEGACY(leaky)"
+		               : (mode == 2) ? "OFF"
+		                             : "EDGEEXT(rootfix)";
+		printf("[EST-MODE] dftsmooth=%s LS_window_width=%d LS_window_hight=%d\n",
+		       mn, LS_window_width, LS_window_hight);
+		fflush(stdout);
+	}
+	if(mode == 2) return;                 // OFF: skip smoother (A/B isolation)
+
 	if(Nc < 4) return;  // Too few subcarriers for meaningful smoothing
 
 	// Window width: number of time-domain taps to keep on each side of DC.
@@ -2631,30 +2693,89 @@ void cl_ofdm::smooth_channel_estimate_dft()
 	if(window_taps < 3) window_taps = 3;
 	if(window_taps >= Nc / 2) return;  // Window too wide, smoothing won't help
 
-	std::complex<double>* buf_in = new std::complex<double>[Nc];
-	std::complex<double>* buf_out = new std::complex<double>[Nc];
+	if(mode == 0)
+	{
+		// LEGACY leaky path (A/B baseline): rectangular IFFT over active band.
+		std::complex<double>* buf_in = new std::complex<double>[Nc];
+		std::complex<double>* buf_out = new std::complex<double>[Nc];
+		for(int i = 0; i < Nsymb; i++)
+		{
+			for(int j = 0; j < Nc; j++)
+				buf_in[j] = (estimated_channel + i*Nc + j)->value;
+			ifft(buf_in, buf_out, Nc);
+			for(int t = window_taps; t < Nc - window_taps; t++)
+				buf_out[t] = std::complex<double>(0.0, 0.0);
+			fft(buf_out, buf_in, Nc);
+			for(int j = 0; j < Nc; j++)
+				(estimated_channel + i*Nc + j)->value = buf_in[j];
+		}
+		delete[] buf_in;
+		delete[] buf_out;
+		return;
+	}
+
+	// EDGEEXT (default, root fix): even-reflect the active band on both sides so
+	// the extended sequence is CONTINUOUS across the periodic wrap. Extending by
+	// Next = Nc/2 on each side is ample for the mirror to bridge the edge step
+	// without wrapping the reflected copies into each other. The IFFT is taken on
+	// the length-Ne = Nc + 2*Next sequence; the time-window keeps the delay taps
+	// (scaled to the extended length: the CIR length is fixed in samples, but the
+	// oversampled-by-Ne/Nc grid stretches the tap index proportionally); the FFT
+	// back is cropped to the central Nc bins (the original active band).
+	int Next = Nc / 2;                    // reflection length per side
+	int Ne   = Nc + 2 * Next;             // extended DFT length
+	// The genuine CIR spans window_taps time samples on the ORIGINAL Nc-grid.
+	// On the Ne-grid the same physical delay maps to window_taps*Ne/Nc taps;
+	// round UP and keep the +? margin already folded into window_taps.
+	int window_taps_e = (int)((double)window_taps * Ne / Nc + 0.5);
+	if(window_taps_e < 3) window_taps_e = 3;
+	if(window_taps_e >= Ne / 2)
+	{
+		// Extended window swallows the whole grid — smoothing is a no-op; fall
+		// back to leaving the interpolated estimate untouched (safer than the
+		// leaky rectangular path).
+		return;
+	}
+
+	std::complex<double>* buf_in  = new std::complex<double>[Ne];
+	std::complex<double>* buf_out = new std::complex<double>[Ne];
 
 	for(int i = 0; i < Nsymb; i++)
 	{
-		// Extract H[0..Nc-1] for this OFDM symbol
+		// Center: the Nc active-band estimates.
 		for(int j = 0; j < Nc; j++)
-			buf_in[j] = (estimated_channel + i*Nc + j)->value;
+			buf_in[Next + j] = (estimated_channel + i*Nc + j)->value;
 
-		// IFFT: frequency domain → time-domain impulse response
-		// PocketFFT handles arbitrary sizes (Nc=50 = 2×5²)
-		ifft(buf_in, buf_out, Nc);
+		// Left even reflection about the first sample: buf_in[Next-1-k]=H[k+1].
+		// (Mirror the interior so the value AT the edge is not duplicated — a
+		// half-sample even reflection, which removes the first-difference step
+		// at the boundary.)
+		for(int k = 0; k < Next; k++)
+		{
+			int src = k + 1;                 // 1..Next
+			if(src > Nc - 1) src = Nc - 1;   // clamp for tiny Nc
+			buf_in[Next - 1 - k] = (estimated_channel + i*Nc + src)->value;
+		}
+		// Right even reflection about the last sample: buf_in[Next+Nc+k]=H[Nc-2-k].
+		for(int k = 0; k < Next; k++)
+		{
+			int src = Nc - 2 - k;            // Nc-2 .. Nc-1-Next
+			if(src < 0) src = 0;             // clamp for tiny Nc
+			buf_in[Next + Nc + k] = (estimated_channel + i*Nc + src)->value;
+		}
 
-		// Window: keep first window_taps (causal delay) and last window_taps
-		// (acausal / timing misalignment), zero the rest (noise)
-		for(int t = window_taps; t < Nc - window_taps; t++)
+		// IFFT of the continuous extended sequence -> leakage-free CIR.
+		ifft(buf_in, buf_out, Ne);
+
+		// Keep the delay-limited taps (both causal head and acausal tail), zero
+		// the noise/leakage middle.
+		for(int t = window_taps_e; t < Ne - window_taps_e; t++)
 			buf_out[t] = std::complex<double>(0.0, 0.0);
 
-		// FFT: smoothed time domain → smoothed frequency domain
-		fft(buf_out, buf_in, Nc);
-
-		// Write back smoothed channel estimate
+		// FFT back to the extended frequency grid, then crop the central Nc bins.
+		fft(buf_out, buf_in, Ne);
 		for(int j = 0; j < Nc; j++)
-			(estimated_channel + i*Nc + j)->value = buf_in[j];
+			(estimated_channel + i*Nc + j)->value = buf_in[Next + j];
 	}
 
 	delete[] buf_in;
