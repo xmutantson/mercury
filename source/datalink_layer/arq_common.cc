@@ -883,6 +883,7 @@ cl_arq_controller::cl_arq_controller()
 	inband_retag_min=-1;            // unresolved; inband_retag_min_count() caches it
 	inband_last_confirmed_config=CONFIG_NONE;
 	inband_pre_announce_config=CONFIG_NONE;
+	inband_adopted_config=CONFIG_NONE;   // CLEAN-LOCK: no config adopted yet (tags fire freely)
 
 	// STAGE 4e — D2 NACK first-class + D3 periodic re-announce (design §2/§3). A fresh
 	// session has seen no tag (parity echo 0), no dead-streak NACK emitted, and the
@@ -3007,13 +3008,35 @@ bool cl_arq_controller::inband_tag_firing_decision(int batch_cfg, int batch_seq_
 	bool is_change = (batch_cfg != inband_last_announced_config);
 	bool is_repeat = (inband_retag_armed && batch_cfg == inband_retag_config && !is_change);
 
+	// CLEAN-LOCK ADOPT GATE (data-flow-inband-tier-crossing.md §7). Once the CMD has POSITIVE,
+	// config-DISCRIMINATING proof the RSP is operating at batch_cfg (a returning reverse SACK
+	// bsi at-or-after this config's announce anchor recorded inband_adopted_config), the RSP
+	// has ALREADY followed — re-airing the 1.58s MFSK CONFIG_TAG before frame 0 only prepends
+	// foreign energy that overlaps the OFDM data-cell window, blowing up the cross-pilot noise-
+	// variance estimate -> SKIP-VAR rejects frame 0 -> the batch never completes -> partial-SACK
+	// re-air storm -> MORE tags (self-reinforcing wedge at CONFIG_0; MEASURED /tmp/trio_c0 226
+	// SKIP-VAR / 0 FRAME-UP, /tmp/turbo_trio the ~27s cross crawl). A REPEAT and a PERIODIC
+	// RE-ANNOUNCE for an ALREADY-ADOPTED config are pure contamination, so gate them OFF here.
+	// NEVER gates a CHANGE (is_change stays free — a genuinely new config MUST announce, and it
+	// invalidates the latch below). Fail-safe: inband_adopted_config advances ONLY on positive
+	// proof (inband_note_config_adopted), so a missed/lost reverse SACK leaves it unchanged ->
+	// the re-tag/re-announce KEEP firing (pre-adoption reliability preserved; the gate only ever
+	// turns airings OFF on a positive confirm, never on a guess). Feature-gated via the callers'
+	// inband_rate_feature_enabled() guard + legacy prepends no tag -> flag-off byte-identical.
+	bool adopted = (inband_adopted_config != CONFIG_NONE
+		&& batch_cfg == inband_adopted_config);
+	if(adopted)
+		is_repeat = false;   // RSP already at this config -> stop the repeat-until-followed re-air
+
 	// Clause (c) PERIODIC RE-ANNOUNCE: fires ONLY when neither a change nor a repeat is
 	// already emitting (the OR precedence — change/repeat carry fresh-epoch/armed
 	// semantics; the periodic is the fallback) AND N batches have elapsed with no emit AND
 	// there IS a config to re-announce (inband_last_announced_config set). It re-announces
-	// the CURRENT batch config; it holds parity (not a change).
+	// the CURRENT batch config; it holds parity (not a change). SUPPRESSED once the config is
+	// ADOPTED (the RSP is provably here — no late-joiner/desync backstop is needed while we
+	// have live adoption proof; the CLEAN-LOCK gate above).
 	int N = inband_reannounce_n();
-	bool is_reannounce = (!is_change && !is_repeat
+	bool is_reannounce = (!is_change && !is_repeat && !adopted
 		&& N > 0 && inband_batches_since_announce >= N
 		&& inband_last_announced_config != CONFIG_NONE
 		&& batch_cfg == inband_last_announced_config);
@@ -3028,6 +3051,12 @@ bool cl_arq_controller::inband_tag_firing_decision(int batch_cfg, int batch_seq_
 	{
 		inband_tx_epoch_parity ^= 1;
 		inband_last_announced_config = batch_cfg;
+		// CLEAN-LOCK: a genuinely new config INVALIDATES the adopt latch (the RSP has not yet
+		// followed the NEW config), so the re-tag/re-announce fire freely until a returning
+		// SACK re-confirms adoption for it (inband_note_config_adopted). Without this a fresh
+		// change to a config that HAPPENED to equal a previously-adopted id would be wrongly
+		// suppressed. (data-flow-inband-tier-crossing.md §7 INV-3.)
+		inband_adopted_config = CONFIG_NONE;
 	}
 	if(out_parity) *out_parity = inband_tx_epoch_parity;
 
@@ -3882,11 +3911,80 @@ bool cl_arq_controller::inband_retag_confirm_from_sack(int rx_bsi)
 	fflush(stdout);
 
 	inband_last_confirmed_config = inband_retag_config;   // the D4 demote floor (provably reached)
+	inband_adopted_config = inband_retag_config;          // CLEAN-LOCK: the RSP is provably at this config now
 	inband_retag_armed   = false;
 	inband_retag_config  = CONFIG_NONE;
 	inband_announce_bsi  = -1;
 	inband_retag_count   = 0;
 	return true;
+}
+
+// CLEAN-LOCK ADOPT LATCH SETTER (data-flow-inband-tier-crossing.md §7). Called on EVERY
+// credited reverse SACK/ACK the CMD accepts (the config-DISCRIMINATING evidence), INDEPENDENT
+// of whether a climb re-tag was armed. A SACK is emitted by the RSP AFTER it demodulated a
+// forward batch at whatever config the RSP is currently running; the CMD sends forward batches
+// at current_configuration, so a returning SACK for a bsi at-or-after the CMD's current-config
+// stream PROVES the RSP followed to current_configuration = ADOPTED. This is the piece
+// inband_retag_confirm_from_sack does NOT cover: that helper only fires while a CLIMB re-tag is
+// armed (inband_retag_armed), so an ALREADY-at-config stream (session start at CONFIG_0, or a
+// post-confirm steady state where the periodic re-announce still fires) never records adoption
+// and keeps CONTAMINATING via the is_reannounce clause (MEASURED /tmp/trio_c0: retag never
+// armed -> periodic re-announce every 8 batches -> 153/467 windows contaminated). Recording
+// adoption here latches inband_adopted_config = current_configuration so the CLEAN-LOCK gate in
+// inband_tag_firing_decision suppresses BOTH the repeat and the periodic re-announce for it.
+// Fail-safe: sets ONLY on a POSITIVE credited SACK (the caller already passed the
+// bsi-in-window + bitmap + CRC12 + dedupe checks); never clears on a miss (a lost SACK just
+// leaves the latch where it was). A genuine change RE-invalidates it (is_change path). No-op
+// when inband off. `rx_bsi` is only used for the log line — the credit itself is the proof.
+void cl_arq_controller::inband_note_config_adopted(int rx_bsi)
+{
+	if(!inband_rate_feature_enabled())
+		return;
+	// Only a real OFDM/robust config is a meaningful adopt target. current_configuration is the
+	// stream the RSP just SACKed.
+	int cfg = current_configuration;
+	if(cfg == CONFIG_NONE)
+		return;
+	if(inband_adopted_config == cfg)
+		return;   // already latched -> no state change, no log spam
+
+	// ── STALE-PREV / MID-CROSS GUARD (data-flow-inband-tier-crossing.md §7 INV-2) ──
+	// A credited SACK is accepted for BOTH the current bsi AND the prev in-flight bsi (the
+	// cumulative_ack window). During a CROSS the CMD may have JUST changed config, so a SACK
+	// for the PREVIOUS batch proves the RSP was at the OLD config, NOT current_configuration —
+	// latching adoption here would FALSELY suppress the tag for a config the RSP has not reached.
+	// So only latch when the current stream is provably un-pending:
+	//   (a) a CLIMB re-tag is armed for this config AND this bsi is at-or-after its announce
+	//       anchor (mod-256 fwd<=128) — the SACK is FOR the announced config; OR
+	//   (b) NO re-tag is armed AND current_configuration == inband_last_announced_config — there
+	//       is no un-adopted pending change, so the config the CMD streams IS the last announced
+	//       one and a returning SACK (which the RSP can only produce by decoding the forward
+	//       stream at ITS config) proves the RSP is here. This is the trio_c0 / session-start /
+	//       post-confirm-steady case where inband_retag_confirm_from_sack cannot fire (unarmed).
+	// This mirrors inband_retag_confirm_from_sack's anchor arithmetic; it never latches on a
+	// stale-prev SACK arriving mid-cross.
+	bool proven;
+	if(inband_retag_armed && inband_retag_config == cfg && inband_announce_bsi >= 0)
+	{
+		unsigned fwd = ((unsigned)((rx_bsi & 0xFF) - (inband_announce_bsi & 0xFF))) & 0xFFu;
+		proven = (fwd <= 128u);
+	}
+	else if(!inband_retag_armed && cfg == inband_last_announced_config)
+	{
+		proven = true;
+	}
+	else
+	{
+		proven = false;   // mid-cross / pending change not yet followed -> do NOT latch
+	}
+	if(!proven)
+		return;
+
+	inband_adopted_config = cfg;
+	printf("[INBAND-TX] CLEAN-LOCK: RSP ADOPTED CONFIG_%d (credited reverse SACK bsi=%d) "
+		"-> CONFIG_TAG re-air/re-announce SUPPRESSED for it (forward OFDM goes clean)\n",
+		cfg, rx_bsi & 0xFF);
+	fflush(stdout);
 }
 
 // KEYSTONE (data-flow-inband-tier-crossing.md §6) — the DATA-DECOUPLED intra-tier CLIMB
@@ -7678,6 +7776,7 @@ void cl_arq_controller::reset_session_state()
 	inband_retag_count = 0;
 	inband_last_confirmed_config = CONFIG_NONE;
 	inband_pre_announce_config = CONFIG_NONE;
+	inband_adopted_config = CONFIG_NONE;   // CLEAN-LOCK: fresh session has adopted nothing
 	// TRIO TURBOSHIFT RE-ENGAGE (gearshift-trio-turboshift-reengage.md §5): a fresh session
 	// has done no elevator jump, so the first-post-jump batch cap is disarmed (mirrors the
 	// ctor init). The env cache (inband_turboshift_env) is env-keyed, NOT reset here.

@@ -322,6 +322,9 @@ bool cl_arq_controller::cmd_compact_confirm_sack_window_accept(bool compact_enab
 		// RX demodulated the batch at the announced config -> DISARM the re-tag (no-op
 		// when not armed / stale bsi / inband off).
 		inband_retag_confirm_from_sack((int)cc_bsi);
+		// CLEAN-LOCK ADOPT LATCH (data-flow-inband-tier-crossing.md §7): latch adoption for
+		// the current config (unarmed steady state too) so the tag stops re-airing.
+		inband_note_config_adopted((int)cc_bsi);
 		int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 		printf("[CMD-COMPACT-CONFIRM] CLEAN (in-SACK-window) batch_seq_id=%u "
 			"(cmd_batch_seq_id=%d) arrival_ms=%d\n",
@@ -4349,6 +4352,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// RX demodulated a batch sent at the announced config -> DISARM the re-tag
 									// (design §1.1/§1.3 consumer 1). No-op when not armed / stale bsi / inband off.
 									inband_retag_confirm_from_sack((int)rx_bsi);
+									// CLEAN-LOCK ADOPT LATCH (data-flow-inband-tier-crossing.md §7): record
+									// RSP adoption of the CURRENT config even when NO climb re-tag is armed (the
+									// steady-state / session-start case confirm_from_sack skips) so the periodic
+									// re-announce stops contaminating the forward OFDM.
+									inband_note_config_adopted((int)rx_bsi);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									printf("[CMD-MFSK-ACK-SACK] CLEAN batch_seq_id=%u (cmd_batch_seq_id=%d) "
 										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
@@ -4386,6 +4394,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// batch at the announced config (it decoded SOME frames of it), so a PARTIAL
 									// confirms exactly like a CLEAN (design §1.7 ruling). DISARM the re-tag.
 									inband_retag_confirm_from_sack((int)rx_bsi);
+									// CLEAN-LOCK ADOPT LATCH (data-flow-inband-tier-crossing.md §7): a PARTIAL
+									// SACK is equally config-discriminating proof the RSP followed -> latch
+									// adoption (unarmed steady state too) so the tag re-air/re-announce stops
+									// contaminating the forward OFDM at cfg0.
+									inband_note_config_adopted((int)rx_bsi);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
 									sack_arrival_history_next_idx =
@@ -4574,6 +4587,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// proves the RX demodulated the batch at the announced config -> DISARM
 							// the re-tag (design §1.1/§1.3 consumer 1). No-op when not armed / inband off.
 							inband_retag_confirm_from_sack((int)rx_bsi);
+							// CLEAN-LOCK ADOPT LATCH (data-flow-inband-tier-crossing.md §7): also latch
+							// adoption for the current config on an OFDM SACK_RSP (unarmed steady state)
+							// so the periodic re-announce stops re-airing the tag over the OFDM stream.
+							inband_note_config_adopted((int)rx_bsi);
 							int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 							sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
 							sack_arrival_history_next_idx =
