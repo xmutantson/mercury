@@ -1722,6 +1722,7 @@ int main(int argc, char *argv[])
     bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
+    bool test_inband_superack_cli = false;  // --test-inband-superack: SUPER-ACK CMD-leap / fail-safe regression.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
     bool test_inband_nack_cli = false;  // --test-inband-nack: in-band Stage 4e — D2 NACK first-class.
     bool test_inband_reannounce_cli = false;  // --test-inband-reannounce: in-band Stage 4e — D3 periodic re-announce.
@@ -2587,6 +2588,17 @@ int main(int argc, char *argv[])
             // reaches the SESSION_DEAD_BATCHES BREAK. See arq_responder.cc
             // test_inband_no_break + data-flow-perbatch-config.md §S4C.
             test_inband_no_break_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-superack") == 0)
+        {
+            // SUPER-ACK CMD-LEAP / FAIL-SAFE regression (one-shot at startup, exit rc).
+            // Fast, PURE in-process — no cards / no PHY tail (unlike the aggregate --test).
+            // Drives superack_target_from_margin + inband_handle_superack + the reverse-NACK
+            // backoff (inband_route_failure_demote). See arq_responder.cc test_inband_superack
+            // + SUPERACK_DESIGN.md §2.4/§3.3/§4/§5 + data-flow-superack.md §5.
+            test_inband_superack_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4458,6 +4470,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_no_break();
             printf("[FLAG] Inband-no-break test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_superack_cli) {
+            // SUPER-ACK CMD-LEAP / FAIL-SAFE regression (one-shot, exit rc). Builds its own
+            // CMD/telecom_system instances internally — fast, no PHY tail.
+            printf("[FLAG] --test-inband-superack: invoking the SUPER-ACK CMD-leap / fail-safe "
+                   "regression (SUPERACK_DESIGN.md §2.4/§3.3/§4/§5)\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_superack();
+            printf("[FLAG] Inband-superack test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
