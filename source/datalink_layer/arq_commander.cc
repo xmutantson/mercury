@@ -1223,6 +1223,12 @@ int cl_arq_controller::add_message_control(char code)
 				// pre-negotiation) it returns false and the cross keeps the proven legacy
 				// SET_CONFIG transport (reverse-pin + liveness-exemption) byte-identical.
 				bool cross_via_tag = tier_crossing && inband_tier_cross_via_tag(inband_target);
+				// Capture the PRE-cross live config NOW: the unilateral branch below calls
+				// inband_unilateral_config_change -> load_configuration, which MUTATES
+				// current_configuration to the OFDM target BEFORE the cross_via_tag reverse
+				// pin runs — so reading current_configuration there would see 0->0 (no
+				// crossing) and skip the pin. cross_from_cfg preserves the robust "from" side.
+				int cross_from_cfg = current_configuration;
 				if(tier_crossing && !cross_via_tag)
 				{
 					printf("[INBAND-TX] TIER-CROSSING %d -> %d (robust<->OFDM): routing "
@@ -1250,6 +1256,43 @@ int cl_arq_controller::add_message_control(char code)
 							"cross); a data-phase miss is covered by the cheap-miss decouple\n",
 							current_configuration, inband_target);
 						fflush(stdout);
+						// TRIO TIER-CROSS REVERSE-ACK PIN (data-flow-inband-tier-crossing.md §3'
+						// / gearshift-trio-turboshift-reengage.md §5). The §3 reverse-pin lived
+						// ONLY inside the legacy SET_CONFIG builder (arq_commander.cc:~1328), which
+						// this unilateral CONFIG_TAG cross EARLY-RETURNS past (:~1258) — so on the
+						// trio the robust->OFDM cross left reverse_configuration at its ctor sentinel
+						// CONFIG_NONE and the reverse data-ACK/SACK that credits the clean batch rode
+						// the FORWARD OFDM rung (cfg0). It TIMED OUT on the fragile OFDM turnaround ->
+						// consecutive_data_acks never accrued -> no clean OFDM FRAME-UP -> the climb
+						// (and the e5899443 turboshift elevator) never launched: cfg0 BREAK-thrash.
+						// FIX: pin reverse to the ROBUST side of THIS cross on the tag carrier too,
+						// mirroring legacy's forward=0 reverse=101 hold, so CMD's reverse ACK-wait
+						// rides a rock-solid MFSK rung. REUSES the existing pure selector
+						// inband_tier_cross_reverse_config (arq_common.cc:3530; returns the live
+						// robust rung on a robust->OFDM up-cross — the rung that JUST carried data
+						// reliably) — the IDENTICAL call the RSP makes at its tag-adopt (arq_common.cc
+						// detect_and_follow_config_tag) so both ends compute the same robust rung.
+						// Gated on the same feature flag + real crossing so flag-off / intra-tier
+						// stay byte-identical. INBAND_REVERSE_PIN_FAILBEFORE reverts to the no-pin
+						// (CONFIG_NONE) fails-before, reproducing the cfg0 BREAK-thrash.
+#ifndef INBAND_REVERSE_PIN_FAILBEFORE
+						{
+							int robust_reverse = inband_tier_cross_reverse_config(
+								cross_from_cfg, inband_target,
+								inband_rate_feature_enabled());
+							if(robust_reverse != CONFIG_NONE
+								&& reverse_configuration != robust_reverse)
+							{
+								printf("[INBAND-TX] TIER-CROSS-VIA-TAG reverse-ACK pin: "
+									"reverse_configuration %d -> %d (from %d, hold the robust "
+									"rung across the tag cross so the reverse ACK/SACK decodes "
+									"on MFSK, mirroring legacy's reverse-robust hold)\n",
+									reverse_configuration, robust_reverse, cross_from_cfg);
+								fflush(stdout);
+								reverse_configuration = robust_reverse;
+							}
+						}
+#endif
 					}
 					messages_control.status = FREE;
 					messages_control.type   = NONE;

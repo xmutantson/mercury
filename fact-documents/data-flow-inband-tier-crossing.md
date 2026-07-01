@@ -204,6 +204,88 @@ for a GENUINE deep-SNR demote (the panic-jump bypass `:187` + anchor-DEMOTE esca
 
 ---
 
+## §3''. TRIO extension — reverse pin on the CONFIG_TAG (unilateral) cross (2026-06-30)
+
+The §3 PART A reverse-pin lived ONLY inside the legacy SET_CONFIG builder
+(`arq_commander.cc:~1328`, the SUCCESS_BASED_LADDER seed). On the TRIO line
+(`wip/trio-turboshift-reengage` @ e5899443 = 2cf0c48d cheap-miss + e5899443 turboshift),
+the robust→OFDM tier-cross is routed through the in-band **unilateral CONFIG_TAG**
+(`cross_via_tag = tier_crossing && inband_tier_cross_via_tag()`, `arq_commander.cc:1225`,
+default-ON because `inband_a3_decouple_enabled()` is live: cheap-miss spine + cumulative-ACK).
+That path takes the `else if(inband_unilateral_config_change(...))` branch
+(`arq_commander.cc:1240`) and **EARLY-RETURNS** at `arq_commander.cc:1258`
+(`inband_unilateral_armed=true; return success;`) BEFORE the SET_CONFIG builder — so the
+§3 PART A pin at `:1328`/`:1341` is NEVER reached on the trio. `inband_unilateral_config_change`
+(`arq_common.cc:3378`) advances only the FORWARD owners ("Reverse is left to the other
+direction's owner", `:3444`), never `reverse_configuration`; and the CONFIG_TAG wire carries
+ONLY forward (no `data[2]` reverse field — `detect_and_follow_config_tag` follows forward only).
+
+MEASURED (`/tmp/turbo_trio/arq_trio00.log`, `/tmp/trio_c0/arq_trioc000.log`, WGN:40,
+`MERCURY_INBAND_RATE=1`): the trio prints the whole climb via `[INBAND-TX] UNILATERAL CONFIG`
++ the cross via `[INBAND-TX] TIER-CROSS-VIA-TAG 0 -> 0`, **ZERO** `[GEARSHIFT] SET_CONFIG:`
+lines, **ZERO** `reverse=` lines → `reverse_configuration` sits at ctor sentinel CONFIG_NONE
+across the cross. Legacy (`/tmp/turbo_legacy/arq_leg00.log`) holds `forward=0 reverse=101`
+across the identical cross and delivers the full 16384 B; the trio BREAK-thrashes at cfg0,
+`consecutive_data_acks` never accrues → no clean OFDM FRAME-UP → the e5899443 turboshift
+elevator never launches.
+
+**THE TRIO FIX (this run):** derive the SAME robust-rung pin LOCALLY on the tag-cross,
+reusing the EXISTING pure selector `inband_tier_cross_reverse_config` (`arq_common.cc:3530`,
+already unit-tested), on BOTH ends so they compute the identical rung with NO extra wire bits:
+- **CMD** — inside the `if(cross_via_tag)` block, right after the TIER-CROSS-VIA-TAG print,
+  BEFORE the early-return (`arq_commander.cc`, the `#ifndef INBAND_REVERSE_PIN_FAILBEFORE`
+  block). `from = current_configuration` (the live robust rung), `to = inband_target` (OFDM).
+- **RSP** — inside `detect_and_follow_config_tag` (`arq_common.cc`, right after
+  `inband_adopt_resynced_config(followed_config)`), `from = current_configuration captured
+  BEFORE the switch` (`rev_pin_from_cfg`), `to = followed_config`. This is the ONE production
+  tag-follow method both callers (`inband_detect_follow_from_capture:4253`,
+  `inband_detect_follow_from_snapshot:4337`) route through, so a single edit covers both.
+Both gated on `inband_rate_feature_enabled()` + a real crossing (the selector self-gates
+intra-tier/CONFIG_NONE/flag-off to CONFIG_NONE) → flag-off / intra-tier byte-identical.
+
+### §3''-audit. Cross-layer audit — the trio tag-cross reverse pin (CLAUDE.md §5)
+
+Reuses `reverse_configuration` (the SAME field §5' already audited). Delta vs §5':
+1. **New producers (2)**: CMD `arq_commander.cc` cross_via_tag block; RSP `arq_common.cc`
+   `detect_and_follow_config_tag` post-adopt. Both write a robust rung (100–102) on a
+   crossing, else no-op. All §5' producers UNTOUCHED. The RSP write is the trio's ONLY
+   reverse writer on the tag path (the SET_CONFIG `data[2]` adopt `:3336` is unreachable
+   on the tag cross), so no double-write / ordering hazard: on a given cross exactly one of
+   {SET_CONFIG-builder pin (legacy/non-spine), tag-cross pin (trio/spine)} runs.
+2. **Consumers unchanged** vs §5': the pinned value flows to the monitor decode try-order
+   (`arq_common.cc:2095`), the SWITCH_ROLE swap (CMD `:7552` / RSP `:1968`), and diagnostics.
+   On a role swap the RSP's new forward = old reverse = the pinned ROBUST rung → the RSP
+   returns on robust exactly like legacy's `reverse=101` hold (NOT a regression; the reverse
+   direction promotes on its own later). The reverse CONTROL ACK modulation rides
+   `ack_configuration` (MFSK, static) INDEPENDENT of `reverse_configuration`, so the pin
+   cannot corrupt the ACK PHY; it aligns the reverse-direction DATA rung + decode try-order
+   + role-swap return path with legacy.
+3. **Cheap-miss re-tag (2cf0c48d) intact**: the pin is set INSIDE the cross_via_tag branch
+   AFTER `TIER-CROSS-VIA-TAG` and does NOT touch `inband_unilateral_armed`,
+   `inband_retag_*`, `cmd_revsack_reairs`, or the CONFIG_TAG re-emit path — it only writes
+   `reverse_configuration`. The cheap-miss re-air (`arq_commander.cc:5392`) re-emits the
+   forward tag on a data-SACK miss; unchanged.
+4. **Batch-cap (e5899443 turboshift) intact**: the turboshift elevator
+   (`inband_climb_target` allow_ofdm_elevator + the first-post-jump batch cap) reads
+   forward config + SNR, never `reverse_configuration`; the pin only RAISES the reverse
+   direction onto robust so the forward cross gets credited — it is the PRE-condition the
+   elevator waits on, not a modification of it.
+5. **FAILS-BEFORE**: `-DINBAND_REVERSE_PIN_FAILBEFORE` compiles out BOTH new blocks →
+   `reverse_configuration` stays CONFIG_NONE across the trio tag cross (reproduces the cfg0
+   BREAK-thrash). PASSES-AFTER: reverse pinned to the robust rung on both ends.
+
+### §3''-open. [?] PART-B analog (liveness) on the trio tag path
+The §3 PART B liveness exemption (`inband_tiercross_handshake_exempts_liveness`) keys on
+`in_control_phase` (TRANSMITTING_CONTROL / RECEIVING_ACKS_CONTROL). The trio tag cross does
+NOT enter a control phase (it stays TRANSMITTING_DATA — unilateral, no SET_CONFIG), so that
+exemption does not fire on the trio, but the trio also does not sit in the control-phase
+livelock signature PART B guarded. Whether a DATA-phase liveness/BREAK false-fire persists on
+the trio cross after the reverse pin is settled by the E2E smoke (§3''-tests): if cfg0 still
+BREAK-thrashes with reverse correctly pinned, a trio DATA-phase exemption analog is the next
+lever. [smoke result recorded in the branch commit + worklog]
+
+---
+
 ## §3-tests'. Tests for §3 (reverse-pin + liveness exemption)
 
 - **Directed unit** `test_inband_tier_cross_reverse_pin` (`--test` +

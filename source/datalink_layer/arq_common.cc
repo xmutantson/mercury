@@ -3347,7 +3347,40 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 	// inband_adopt_resynced_config so the tag-follow path (here) AND the Stage-4
 	// down-ladder share ONE implementation — only the trigger differs (passband tag
 	// vs blind down-window decode). See data-flow-perbatch-config.md §13.2(c).
+	// Capture the pre-switch config BEFORE inband_adopt_resynced_config rewrites
+	// current_configuration — it is the "from" side of the tier-cross the RSP-side
+	// reverse pin (below) must key on (the robust rung on a robust->OFDM up-cross).
+	int rev_pin_from_cfg = current_configuration;
 	inband_adopt_resynced_config(followed_config);
+
+	// TRIO TIER-CROSS REVERSE-ACK PIN — RSP (symmetric) SIDE (data-flow-inband-tier-
+	// crossing.md §3' / gearshift-trio-turboshift-reengage.md §5). The CMD pins reverse
+	// to the robust rung on its CONFIG_TAG cross (arq_commander.cc, cross_via_tag block)
+	// so its reverse ACK-WAIT rides MFSK; the RSP must pin the SAME rung so its reverse
+	// ACK/SACK BURST is SENT on that MFSK rung while it decodes forward cfg0 — matching
+	// legacy's `[RSP] Received SET_CONFIG: forward=0 reverse=101`. The CONFIG_TAG wire
+	// carries ONLY forward (no data[2] reverse field — this tag-follow path never touches
+	// reverse_configuration otherwise, unlike the SET_CONFIG handler arq_responder.cc:3336),
+	// so the RSP DERIVES the identical pin LOCALLY from the SAME pure selector + the SAME
+	// (from,to) it just followed. Both ends therefore compute the identical robust rung
+	// with no extra wire bits. Gated on the same feature flag + real crossing -> flag-off
+	// / intra-tier byte-identical. INBAND_REVERSE_PIN_FAILBEFORE reverts to the no-pin.
+#ifndef INBAND_REVERSE_PIN_FAILBEFORE
+	{
+		int robust_reverse = inband_tier_cross_reverse_config(
+			rev_pin_from_cfg, followed_config, inband_rate_feature_enabled());
+		if(robust_reverse != CONFIG_NONE
+			&& reverse_configuration != robust_reverse)
+		{
+			printf("[INBAND-RX] TIER-CROSS-VIA-TAG reverse-ACK pin: reverse_configuration "
+				"%d -> %d (send the reverse ACK/SACK on the robust MFSK rung across the "
+				"tag cross, mirroring legacy's forward=%d reverse=%d)\n",
+				reverse_configuration, robust_reverse, followed_config, robust_reverse);
+			fflush(stdout);
+			reverse_configuration = robust_reverse;
+		}
+	}
+#endif
 
 	if(out_followed_config) *out_followed_config = followed_config;
 	return 1;
