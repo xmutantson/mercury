@@ -333,6 +333,19 @@ static_assert(MAX_SACK_BATCH_SIZE <= 128,
 #define RSP_DECODE_MARGIN_MS   300  // one-frame RSP decode budget
 #define SACK_ARRIVAL_MARGIN_MS 1000 // jitter + LDPC decode tail safety
 
+// DETERMINISTIC SCHEDULED ACK-SLOT constants (T1, feat/tdd-ack-slot; jitter
+// characterization wuhobxaaq / worklog §T1). The open-loop guard above
+// over-budgets the reverse-ACK arrival ~20x (SACK_ARRIVAL_MARGIN_MS 1000 vs
+// measured arrival jitter sd 12 ms) and ~2000x (RSP_DECODE_MARGIN_MS 300 vs
+// sub-ms rsp_decode+PTT sd 0.15 ms). The ACK arrival is DETERMINISTIC:
+//   t_ack_pred = last_frame_drain + ACK_SLOT_RSP_TURN_MS + slip(batch_airtime)
+// and the CMD waits exactly that long plus a bounded window
+//   window = ACK_SLOT_LEAD_MS + ack_pattern_ms + ACK_SLOT_TAIL_MS.
+// See calculate_receiving_timeout (arq_common.cc) — gated MERCURY_ACK_SLOT.
+#define ACK_SLOT_RSP_TURN_MS   401  // measured deterministic RSP turnaround (rx last sym -> ACK keyed)
+#define ACK_SLOT_LEAD_MS        50  // pre-slot pad, > 3*sigma of arrival jitter (sd 12 ms)
+#define ACK_SLOT_TAIL_MS       150  // post-pattern OFDM/LDPC decode-allow tail
+
 struct st_crypto_batch_buffer {
 	int batch_id;           // crypto batch counter mod 8, or -1 if empty
 	int expected_frames;    // from crypto_batch_size or end-of-batch detection
