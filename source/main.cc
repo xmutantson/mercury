@@ -1201,6 +1201,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_bkflush;
                 failed += ARQ_bkflush.test_backup_confirm_flush();
             }
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss
+            // (delivery-integrity-audit-monitor.md §3): the clean ACK precedes delivery and
+            // fifo_push_rx drops the tail when the app FIFO is full. The ACK-GATE now holds
+            // the batch until fifo_buffer_rx has room. Pass-after arm (DEFEAT env = fail-before).
+            {
+                cl_arq_controller ARQ_rxbp;
+                failed += ARQ_rxbp.test_rxfifo_backpressure_hold();
+            }
             // RX-CTRL-DROP regression (data-flow-control-slot-lifecycle.md §6): the
             // messages_control one-deep mailbox had no timeout escape out of RECEIVED,
             // so a stranded slot silently dropped every later control frame and killed
@@ -1577,6 +1585,10 @@ int main(int argc, char *argv[])
                                         // §6.1) — the delivered batch's raw must not survive in fifo_buffer_backup when
                                         // finalize is pre-empted (Root B). Drives register_ack ACK-confirm; asserts the
                                         // re-stage restores NOTHING (no re-delivery) + INV3 un-confirmed never flushed. DEFEAT=fail-before.
+    bool test_rxfifo_backpressure_hold_cli = false; // --test-rxfifo-backpressure-hold: Fix H#3 (delivery-integrity-
+                                        // audit-monitor.md §3) — the clean ACK precedes delivery; on RX-FIFO back-pressure
+                                        // the un-stored tail is lost with a committed ACK. Gate holds the batch until the
+                                        // app FIFO has room; asserts ZERO post-ACK loss + full re-delivery. DEFEAT=fail-before.
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
@@ -2337,6 +2349,14 @@ int main(int argc, char *argv[])
             // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery
             // (data-flow-fifo-backup.md §6.1). One-shot, exit rc.
             test_backup_confirm_flush_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rxfifo-backpressure-hold") == 0)
+        {
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss
+            // (delivery-integrity-audit-monitor.md §3). One-shot, exit rc.
+            test_rxfifo_backpressure_hold_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4161,6 +4181,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_backup_confirm_flush();
             printf("[FLAG] Backup-confirm-flush test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_rxfifo_backpressure_hold_cli) {
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss (one-shot, exit rc).
+            printf("[FLAG] --test-rxfifo-backpressure-hold: invoking Fix H#3 RX-FIFO "
+                   "back-pressure post-ACK loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rxfifo_backpressure_hold();
+            printf("[FLAG] Rxfifo-backpressure-hold test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

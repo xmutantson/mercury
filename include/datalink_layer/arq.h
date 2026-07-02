@@ -3142,6 +3142,16 @@ public:
   // socket to free room, surfaces any residual instead of silently dropping).
   // Returns bytes actually stored (== len on success).
   int fifo_push_rx(const char* buf, int len);
+  // Fix H#3 (delivery-integrity-audit-monitor.md §3): worst-case number of app-FIFO
+  // bytes the CURRENT batch will deliver via copy_data_to_buffer(). Used to GATE the
+  // clean data-ACK + delivery on fifo_buffer_rx having room, so the ACK is never sent
+  // (and the batch never freed) while the un-stored tail would be dropped under app
+  // back-pressure (fifo_push_rx short) = post-ACK silent loss the CMD never retransmits.
+  // Compression leg: the decompressed size is unknown pre-delivery, so the safe bound is
+  // the decompress workspace (COMPRESS_WORKSPACE_SIZE). No-comp leg: exact = sum of the
+  // RECEIVED slot lengths in [0,data_batch_size).
+  int rx_fifo_batch_need();
+  int test_rxfifo_backpressure_hold();  // --test-rxfifo-backpressure-hold: Fix H#3 post-ACK loss regression
   void restore_backup_buffer_data();
   void restore_tx_from_compressed();  // Decompress messages_tx back to raw in fifo_buffer_tx
 

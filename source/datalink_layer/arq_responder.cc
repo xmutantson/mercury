@@ -2434,6 +2434,48 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				rx_received, data_batch_size, expected);
 			fflush(stdout);
 
+			// Fix H#3 (delivery-integrity-audit-monitor.md §3): the clean data-ACK is sent
+			// below BEFORE copy_data_to_buffer() delivers, and fifo_push_rx() DROPS the tail
+			// when fifo_buffer_rx is full under app back-pressure -> those bytes are LOST with
+			// a committed ACK and the CMD never retransmits them (silent post-ACK data loss).
+			// HOLD the whole batch-complete ACK+deliver until the RX app FIFO has room for the
+			// batch's worst-case delivered size: keep messages_rx RECEIVED (do NOT mark ACKED,
+			// do NOT bump the bsi, do NOT ACK, do NOT deliver) and re-arm the receive timer, the
+			// SAME re-arm the partial-batch SACK-suppress path above uses. The CMD's ACK-timeout
+			// retransmits and this handler re-fires once the app drains -> the batch delivers +
+			// ACKs then, with NO byte ever ACKed-but-undelivered (back-pressure correctly stalls
+			// the sender instead of dropping data). passive_monitor never ACKs, so it is exempt.
+			// Env MERCURY_RXFIFO_BACKPRESSURE_DEFEAT=1 reverts on the SAME binary (fail-before:
+			// ACK+deliver regardless -> the short-store loss reproduces).
+			if(!passive_monitor)
+			{
+				bool bp_defeat = false;
+				{ const char* e = std::getenv("MERCURY_RXFIFO_BACKPRESSURE_DEFEAT");
+				  if(e && *e && atoi(e)!=0) bp_defeat = true; }
+				int rx_free = fifo_buffer_rx.get_free_size();
+				int need    = rx_fifo_batch_need();
+				if(!bp_defeat && rx_free < need)
+				{
+					printf("[ACK-GATE-BACKPRESSURE] HOLD: app FIFO free=%d < batch need=%d — "
+						"NOT ACKing/delivering; CMD retransmits, re-deliver when app drains "
+						"(Fix H#3, no post-ACK loss)\n", rx_free, need);
+					fflush(stdout);
+					// Keep messages_rx RECEIVED (do not free), re-arm for the retransmit —
+					// identical discipline to the partial-batch SACK-suppress re-arm above.
+					stats.nNAcked_data++;
+					batch_rx_frame_count = 0;
+					last_received_end_of_batch_seq = -1;
+					telecom_system->data_container.frames_to_read =
+						telecom_system->data_container.preamble_nSymb
+						+ telecom_system->get_active_nsymb();
+					telecom_system->data_container.nUnder_processing_events = 0;
+					calculate_receiving_timeout();
+					receiving_timer.start();
+					connection_status = RECEIVING;
+					return;
+				}
+			}
+
 			// Mark all received messages as ACKED and count for stats
 			for(int i=0; i<this->nMessages; i++)
 			{

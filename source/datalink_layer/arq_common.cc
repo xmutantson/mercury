@@ -13795,6 +13795,139 @@ int cl_arq_controller::fifo_push_rx(const char* buf, int len)
 	return pushed;
 }
 
+// Fix H#3 (delivery-integrity-audit-monitor.md §3). See the arq.h declaration. Returns the
+// worst-case number of bytes the current batch will hand to fifo_push_rx() at delivery,
+// so the ACK-GATE can HOLD the batch (no ACK, no deliver, keep RECEIVED for retransmit)
+// until fifo_buffer_rx has that much room — preventing the post-ACK short-store loss.
+int cl_arq_controller::rx_fifo_batch_need()
+{
+	if(compression_viable_for_batch())
+		return COMPRESS_WORKSPACE_SIZE;   // decompressed size unknown pre-delivery -> safe bound
+	int need = 0;                          // no-comp leg: exact sum of RECEIVED slot payloads
+	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+		if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
+			need += messages_rx[i].length;
+	return need;
+}
+
+// ===========================================================================
+// Fix H#3 — RX-FIFO back-pressure post-ACK DATA LOSS (delivery-integrity-audit-monitor.md §3)
+//
+// CLI: --test-rxfifo-backpressure-hold  (env MERCURY_RXFIFO_BACKPRESSURE_DEFEAT=1 reverts)
+//
+// THE BUG (channel-free, pure RX delivery state): the clean data-ACK is sent BEFORE
+// copy_data_to_buffer() delivers, and fifo_push_rx() returns a SHORT count when
+// fifo_buffer_rx is full under app back-pressure (its "caller must NOT count the un-stored
+// bytes as delivered" contract) — but copy_data_to_buffer frees the slots + counts them
+// anyway, so the un-stored tail is LOST with a committed ACK and the CMD never retransmits.
+//
+// Fix: the ACK-GATE holds the whole batch-complete ACK+deliver until fifo_buffer_rx has
+// room for rx_fifo_batch_need() bytes (keep messages_rx RECEIVED, no ACK, no deliver) so
+// the CMD retransmits and the batch re-delivers once the app drains -> no post-ACK loss.
+//
+// This drives the REAL rx_fifo_batch_need() gate decision and the REAL copy_data_to_buffer()
+// delivery on a fifo_buffer_rx sized SMALLER than the batch (back-pressure). PASS-AFTER: the
+// gate HOLDS (nothing delivered, whole batch preserved), then after the app "drains" the
+// held batch delivers FULLY (zero loss). FAIL-BEFORE (defeat): delivery runs anyway ->
+// copy_data_to_buffer stores part, loses the rest, frees the slots (post-ACK loss).
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_rxfifo_backpressure_hold()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_RXFIFO_BACKPRESSURE_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-RXFIFO-BP] start (MERCURY_RXFIFO_BACKPRESSURE_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-RXFIFO-BP] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-RXFIFO-BP] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	this->nMessages          = 120;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C0 buffers allocated", alloc_rc, SUCCESSFUL);
+	this->compression_enabled   = false;     // no-comp leg -> rx_fifo_batch_need() is exact
+	this->encryption_enabled    = false;
+	this->sack_v2_enabled       = true;
+	this->sack_enabled          = true;
+	this->current_configuration = 0;
+	// COMMANDER so fifo_push_rx() does NOT try to drain a (non-existent in-process) app
+	// socket on the FIFO-full retry — isolates the FIFO-full short-store, no PHY/TCP.
+	this->original_role = COMMANDER;
+	this->role          = COMMANDER;
+
+	const int DBS = 10, L = 100;
+	this->data_batch_size = DBS;
+	const int TOTAL = DBS * L;                // 1000 bytes of app payload
+
+	for(int i=0;i<this->nMessages;i++){ messages_rx[i].status=FREE; messages_rx[i].length=0; }
+	for(int i=0;i<DBS;i++){
+		messages_rx[i].status = RECEIVED;
+		messages_rx[i].length = L;
+		for(int j=0;j<L;j++) messages_rx[i].data[j] = (char)(unsigned char)i;
+	}
+
+	// App FIFO sized to hold only PART of the batch -> genuine back-pressure.
+	const int ROOM = TOTAL/2;                 // 500 < 1000
+	fifo_buffer_rx.set_size(ROOM);
+	fifo_buffer_rx.flush();
+	auto occ_rx = [&]() -> int { return fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size(); };
+
+	int rx_free = fifo_buffer_rx.get_free_size();
+	int need    = rx_fifo_batch_need();
+	check(need == TOTAL, "C1 rx_fifo_batch_need == exact no-comp batch size", need, TOTAL);
+	check(need > rx_free, "C2 vacuity: batch need exceeds app-FIFO room (real back-pressure)", need, rx_free);
+
+	// The production ACK-GATE decision (arq_responder.cc): HOLD iff (!defeat && rx_free < need).
+	bool hold = (!defeat) && (rx_free < need);
+
+	if(hold)
+	{
+		// FIX: the handler returns WITHOUT ACKing/delivering — the batch stays RECEIVED.
+		int held = 0;
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED) held += messages_rx[i].length;
+		int lost = TOTAL - occ_rx() - held;
+		check(occ_rx()==0, "A1 nothing delivered under back-pressure (held, not lost)", occ_rx(), 0);
+		check(held==TOTAL && lost==0, "A2 ZERO bytes lost — whole batch HELD for retransmit", lost, 0);
+		// App drains -> room frees -> the held batch re-delivers FULLY (the handler marks
+		// RECEIVED->ACKED post-gate, then copy_data_to_buffer stores the whole batch).
+		fifo_buffer_rx.set_size(TOTAL*2);
+		fifo_buffer_rx.flush();
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;
+		copy_data_to_buffer();
+		check(occ_rx()==TOTAL, "A3 after app drains, held batch delivers FULLY (no loss)", occ_rx(), TOTAL);
+	}
+	else
+	{
+		// FAIL-BEFORE / DEFEAT: deliver NOW despite no room. copy_data_to_buffer stores part,
+		// LOSES the rest, frees the slots -> the un-stored bytes are unrecoverable (post-ACK loss).
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;
+		copy_data_to_buffer();
+		int delivered = occ_rx();
+		int held = 0;
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
+			held += messages_rx[i].length;
+		int lost = TOTAL - delivered - held;
+		printf("[TEST-RXFIFO-BP] defeat: delivered=%d held=%d lost=%d (TOTAL=%d)\n",
+			delivered, held, lost, TOTAL);
+		fflush(stdout);
+		check(lost > 0,
+			"A1 fail-before LOSES post-ACK bytes on back-pressure (slots freed, un-stored gone)", lost, 1);
+	}
+
+	deinit_messages_buffers();
+	printf("[TEST-RXFIFO-BP] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
+}
+
 void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
