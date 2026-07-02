@@ -1121,6 +1121,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	int nVirtual_data=ldpc.N-data_container.nBits;
 	int nReal_data=data_container.nBits-ldpc.P;
 	double freq_offset_measured=0;
+	// HARQ chase combining (feat/harq-chase-combining): reset the per-reception
+	// failed-frame LLR snapshot and advance the reception clock (age/staleness for
+	// the bounded LLR ring). The snapshot is (re)captured in the OFDM fail branch
+	// (best coarse_metric wins) and consumed exactly once after the trial loop.
+	// Banked entries (harq_buf) persist across calls; this only resets the snapshot.
+	harq_snap_valid  = false;
+	harq_snap_metric = -1.0;
+	harq_rx_counter++;
 	receive_stats.message_decoded=NO;
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.frame_data_missing=false;
@@ -3326,7 +3334,33 @@ skip_h_retry_point:
 						mean_H, coarse_freq_offset, receive_stats.crc);
 					fflush(stdout);
 				}
-				
+
+				// ---- HARQ chase combining: snapshot this FAILED frame's LLRs -------
+				// Capture the channel LLRs (deinterleaved_data[0..N), the exact vector
+				// just fed to the failed ldpc.decode) of the best (highest coarse_metric)
+				// REAL-looking OFDM failure of this reception, for a post-loop combine
+				// attempt / bank. Same "real frame" gate as TINTERP-SEED (mean_H healthy,
+				// not all-zeros) so pure noise / false preambles are never banked. Runs
+				// per fail-branch visit (incl. TINTERP/sub-peak re-decode fails); the
+				// strict-> metric compare keeps the most-confident trial. Guarded by the
+				// feature gate => byte-identical when MERCURY_HARQ_CHASE=0.
+				if(harq_feature_on() && M != MOD_MFSK
+				   && receive_stats.all_zeros == NO
+				   && mean_H >= 0.5 && ldpc.N > 0
+				   && receive_stats.coarse_metric > harq_snap_metric)
+				{
+					if((int)harq_snap_llr.size() < ldpc.N) harq_snap_llr.assign(ldpc.N, 0.0f);
+					for(int i=0;i<ldpc.N;i++)
+						harq_snap_llr[i] = data_container.deinterleaved_data[i];
+					harq_snap_valid    = true;
+					harq_snap_cfg      = current_configuration;
+					harq_snap_N        = ldpc.N;
+					harq_snap_variance = (variance > 1e-9f) ? variance : 1e-9f;
+					harq_snap_freq     = freq_offset_measured;
+					harq_snap_delay    = receive_stats.delay;
+					harq_snap_metric   = receive_stats.coarse_metric;
+				}
+
 				// ---- TINTERP-SEED fade rescue (MONOTONE best-of, DEFAULT-ON) --------
 				// The LS-primary decode just FAILED on what looks like a real frame
 				// (good timing: mean_H healthy, coarse metric saturated). On a GOOD/MOD
@@ -3717,6 +3751,32 @@ skip_h_retry_point:
 
 	}
 
+	// ==== HARQ chase combining: post-reception rescue / bank ===================
+	// The trial loop finished without decoding this OFDM reception. If it carried a
+	// real-looking frame (snapshot captured in the fail branch), try to SOFT-COMBINE
+	// it with a buffered earlier failure of the SAME codeword (config+N match, CRC
+	// arbitrates the pairing). On a clean combine the frame is DELIVERED here —
+	// converting a would-be BREAK/demote into a decode (~3 dB gain). Otherwise bank
+	// this reception's LLRs so a future retransmit of the same frame can combine.
+	// MONOTONE-SAFE: this only ever runs when message_decoded != YES and only
+	// PROMOTES a fail to a CRC-verified success — a clean first-pass decode never
+	// enters here, so the success path is byte-identical. Gated OFF => no-op.
+	if(harq_feature_on() && M != MOD_MFSK
+	   && receive_stats.message_decoded != YES && harq_snap_valid)
+	{
+		if(harq_combine_rescue(out, receive_stats, nReal_data, nVirtual_data))
+		{
+			// A decode succeeded via combining — mirror the success-path CFO reset
+			// (telecom_system.cc success branch) so the STALE-CFO scrub stays armed.
+			consecutive_ofdm_decode_fails = 0;
+		}
+		else
+		{
+			harq_bank_snapshot();
+		}
+	}
+	// ===========================================================================
+
 	if(ldpc.print_nIteration==YES)
 	{
 		std::cout<<"decoded in "<< receive_stats.iterations_done<<" iterations."<<std::endl;
@@ -3748,6 +3808,167 @@ skip_h_retry_point:
 #endif
 
 	return receive_stats;
+}
+
+// ============================================================================
+// HARQ chase combining (feat/harq-chase-combining) — RX-side soft combining.
+// See include/physical_layer/telecom_system.h (st_harq_entry) for the design +
+// the identity-constraint rationale, and fact-documents/data-flow-retx-queue.md
+// for the cross-layer audit.
+// ============================================================================
+
+// Cached env read. Default ON (a proven, monotone-safe fix ships default-on per
+// project standards); MERCURY_HARQ_CHASE=0/off/no/false is the A/B kill switch.
+bool cl_telecom_system::harq_feature_on()
+{
+	if(harq_chase_enabled == -2)
+	{
+		const char* e = std::getenv("MERCURY_HARQ_CHASE");
+		harq_chase_enabled = 1;   // default ON
+		if(e && *e && (e[0]=='0' || e[0]=='n' || e[0]=='N' || e[0]=='f' || e[0]=='F'))
+			harq_chase_enabled = 0;
+	}
+	return harq_chase_enabled == 1;
+}
+
+// Clear all HARQ state. Called on a config change (load_configuration) and any
+// session reset: a buffered codeword from another config can never validly combine
+// (different modulation/interleave/dispersal), so dropping it avoids stale-match
+// waste and frees memory. Idempotent.
+void cl_telecom_system::harq_reset()
+{
+	harq_buf.clear();
+	harq_snap_valid  = false;
+	harq_snap_metric = -1.0;
+}
+
+// The combine primitive: clip-sum two same-codeword LLR vectors and re-decode.
+// Summation is the ML-optimal equal-noise soft combine (Chase 1985). Clip to the
+// same +-40 rail the demod/CSI path uses (telecom_system.cc:3133) so a pathological
+// pair cannot overflow decode_SPA's atanh. Returns iterations_done; hard bits go to
+// out_bits. Kept small + member-only so --test-harq-chase can drive the EXACT
+// production summation without synthesizing passband.
+int cl_telecom_system::harq_sum_and_decode(const float* buffered, const float* fresh,
+                                           int N, int* out_bits)
+{
+	if((int)harq_combine_scratch.size() < N) harq_combine_scratch.assign(N, 0.0f);
+	for(int i=0;i<N;i++)
+	{
+		float s = buffered[i] + fresh[i];
+		if(s > 40.0f) s = 40.0f; else if(s < -40.0f) s = -40.0f;
+		harq_combine_scratch[i] = s;
+	}
+	return ldpc.decode(harq_combine_scratch.data(), out_bits);
+}
+
+// Try to rescue the current failed reception (harq_snap_llr) by combining it with
+// each compatible buffered failure. CRC ARBITRATES the pairing (a wrong combine
+// fails CRC and is skipped). On the first CRC-clean combine, publishes the decoded
+// bytes to `out` and fills `rs` exactly like the loop success path, then drops the
+// consumed buffer entry and returns true. Only reached with message_decoded != YES,
+// so it can only ever PROMOTE a fail to a success (monotone-safe).
+bool cl_telecom_system::harq_combine_rescue(int* out, st_receive_stats& rs,
+                                            int nReal_data, int nVirtual_data)
+{
+	(void)nVirtual_data;   // dispersal fixup already baked into the stored LLR layout
+	if(!harq_snap_valid || harq_snap_N <= 0) return false;
+	const int N = harq_snap_N;
+	if((int)harq_snap_llr.size() < N) return false;
+
+	// CROSS-LAYER (timing) CAP — fact-documents/data-flow-retx-queue.md §5 Q5.
+	// Each compatible candidate costs one FULL ldpc.decode, and a WRONG pair does not
+	// converge => it runs to nIteration_max (the most expensive decode). This runs on
+	// the RX turnaround path; on the Pi that budget is tight, so an unbounded loop over
+	// a full ring of same-(cfg,N) failures could blow the reverse-ACK timing and
+	// manufacture the very DEMOTE cascade HARQ exists to prevent. A full-frame retx
+	// almost always pairs with the MOST-RECENT failure, so cap the number of decode
+	// attempts. Monotone-safe: fewer attempts can only DECLINE a rescue, never fabricate
+	// (CRC still arbitrates every accepted pair). Env-tunable for A/B (default 3).
+	static int harq_max_attempts = -1;
+	if(harq_max_attempts < 0)
+	{
+		harq_max_attempts = 3;
+		const char* a = std::getenv("MERCURY_HARQ_MAX_ATTEMPTS");
+		if(a && *a){ int v = atoi(a); if(v >= 1 && v <= 32) harq_max_attempts = v; }
+	}
+	int attempts = 0;
+	// Most-recent-first: a retransmit most likely pairs with the latest failure.
+	for(int idx=(int)harq_buf.size()-1; idx>=0; --idx)
+	{
+		st_harq_entry& e = harq_buf[(size_t)idx];
+		if(e.cfg != harq_snap_cfg || e.N != N || (int)e.llr.size() != N) continue;
+		if(++attempts > harq_max_attempts) break;   // timing-budget guard
+
+		int iters = harq_sum_and_decode(e.llr.data(), harq_snap_llr.data(), N,
+		                                data_container.hd_decoded_data_bit);
+
+		// Mirror the production post-decode CRC self-check (telecom_system.cc:3279):
+		// undo energy dispersal, pack to bytes, verify CRC16 over [msg || CRC].
+		bit_energy_dispersal(data_container.hd_decoded_data_bit,
+		                     data_container.bit_energy_dispersal_sequence,
+		                     data_container.hd_decoded_data_bit, nReal_data);
+		bit_to_byte(data_container.hd_decoded_data_bit,
+		            data_container.hd_decoded_data_byte, nReal_data);
+
+		int all_zeros = YES;
+		for(int i=0;i<nReal_data/8;i++)
+			if(data_container.hd_decoded_data_byte[i]!=0){ all_zeros=NO; break; }
+		int crc = 0;
+		if(outer_code==CRC16_MODBUS_RTU && all_zeros==NO)
+			crc = (int)CRC16_MODBUS_RTU_calc(data_container.hd_decoded_data_byte, nReal_data/8);
+		bool decoded_ok = (all_zeros==NO) &&
+			((outer_code==CRC16_MODBUS_RTU) ? (crc==0)
+			                                : (iters <= (ldpc.nIteration_max-1)));
+		if(!decoded_ok) continue;   // wrong pairing / insufficient gain — try next
+
+		// COMBINE SUCCEEDED — publish exactly like the loop success path.
+		for(int i=0;i<(nReal_data-outer_code_reserved_bits)/8;i++)
+			*(out+i)=data_container.hd_decoded_data_byte[i];
+		rs.message_decoded = YES;
+		rs.all_zeros       = NO;
+		rs.crc             = 0;
+		rs.iterations_done = iters;
+		// CONSERVATIVE SNR: report the single-frame estimate (not the ~3 dB-higher
+		// combined SNR) so rate adaptation sees the TRUE marginal channel and does
+		// not over-climb on a frame that only decoded because of combining.
+		rs.SNR = 10.0*log10(1.0/(double)harq_snap_variance);
+		rs.delay = harq_snap_delay;
+		rs.delay_of_last_decoded_message = harq_snap_delay;
+		rs.freq_offset = harq_snap_freq;
+		rs.freq_offset_of_last_decoded_message = harq_snap_freq;
+		printf("[HARQ-COMBINE] cfg=%d N=%d iters=%d SNR=%.1f buffered_copies=%d — "
+		       "recovered a failed frame by soft-combining (no BREAK/demote)\n",
+		       harq_snap_cfg, N, iters, rs.SNR, (int)harq_buf.size());
+		fflush(stdout);
+		harq_buf.erase(harq_buf.begin()+idx);   // delivered — drop the buffered copy
+		return true;
+	}
+	return false;
+}
+
+// Bank the current reception's failed-frame LLRs for a future retransmit combine.
+// Bounded ring: evict entries older than the staleness window (a retransmit that
+// never arrived) then drop-oldest if still full. Small cap keeps the extra
+// on-failure LDPC decodes bounded and cheap.
+void cl_telecom_system::harq_bank_snapshot()
+{
+	if(!harq_snap_valid || harq_snap_N <= 0) return;
+	const int HARQ_BUF_MAX = 6;                  // max buffered failed frames
+	const unsigned long long HARQ_MAX_AGE = 24;  // receptions before a stale evict
+	for(size_t i=0;i<harq_buf.size();)
+	{
+		if(harq_rx_counter - harq_buf[i].age > HARQ_MAX_AGE)
+			harq_buf.erase(harq_buf.begin()+i);
+		else ++i;
+	}
+	if((int)harq_buf.size() >= HARQ_BUF_MAX)
+		harq_buf.erase(harq_buf.begin());        // drop oldest
+	st_harq_entry e;
+	e.cfg = harq_snap_cfg;
+	e.N   = harq_snap_N;
+	e.age = harq_rx_counter;
+	e.llr.assign(harq_snap_llr.begin(), harq_snap_llr.begin()+harq_snap_N);
+	harq_buf.push_back(std::move(e));
 }
 
 double cl_telecom_system::measure_signal_only(double *data)
@@ -11038,6 +11259,13 @@ void cl_telecom_system::load_configuration(int configuration)
 	{
 		return;
 	}
+
+	// HARQ chase combining (feat/harq-chase-combining): a real config CHANGE reached
+	// here (same-config re-load returned above). Buffered failed-frame LLRs from the
+	// old config can never validly combine at the new one (different modulation /
+	// interleave / dispersal / codeword length), so drop them. Also covers the
+	// demote (OFDM->ROBUST_0) and session-reset paths that route through here.
+	harq_reset();
 
 	// NB mode: clamp OFDM configs to CONFIG_6 max (QPSK/QAM need more pilots than Nc=10 provides)
 	if(narrowband_enabled == YES && is_ofdm_config(configuration) && configuration > NB_CONFIG_MAX)
