@@ -204,3 +204,63 @@ existing NACK directed test (`arq_responder.cc:6839` / `:6858`).
 
 Status: pure-map + codec round-trip land in `mercury --test`; the full passband
 round-trip test is the follow-on (same harness pattern as the NACK test).
+
+---
+
+## §7. Integration recalibration + leap smoke (combined build, integ/superack-cleanlock)
+
+Combined build = b8076112 + superack(f799a604 + in-process regression tests) + trio
+clean-lock(1804c8c8). Binary md5 `e0995acef8f904107e47e4d6b655ec10` (build.sh o3, box .11).
+The merge touches ONLY the ctrl-suffix codec (mfsk_ctrl_codec.{cc,h}) + ARQ (arq_common /
+arq_responder / arq_commander) + main.cc; **telecom_system.cc and ldpc*.cc are UNCHANGED**
+(git diff b8076112..HEAD), so the ROBUST decode-margin axis is code-identical to base.
+
+### §7.1 Curve A — ROBUST_2 (config 102) iterations_done vs harness SNR (re-measured)
+`-m PLOT_PASSBAND -s 102 --ber-esn0=<E> --ber-frames=25`, reading the per-frame `iter=` :
+| SNR dB | post-FEC BER | iterations_done | vs phase-1 (§3.2) |
+|--------|--------------|-----------------|-------------------|
+| <=-10  | >0 (FAIL)    | 201 (sentinel)  | 201 (match)       |
+| -8     | 0            | 12..17 (near-floor) | 10            |
+| -6     | 0            | 2..5            | 3                 |
+| -4     | 0            | 1..3            | 2                 |
+| -2     | 0            | 1               | 1                 |
+| >=0    | 0            | 0               | 0..1              |
+Strictly monotone, matches phase-1 within Monte-Carlo noise. Floor at -8 dB (first clean).
+
+### §7.2 Curve B — WB decodable ceiling vs Es/N0 (re-measured on combined build)
+`-m PLOT_PASSBAND -s <cfg> --ber-esn0=<E> --ber-frames=40`, ceiling = highest cfg BER==0:
+| Es/N0 | ceiling (combined) | phase-1 (§3.2) |
+|-------|--------------------|----------------|
+| -8    | cfg3               | (—)            |
+| -6    | cfg5               | cfg4           |
+| -4    | cfg6               | (—)            |
+| -2    | cfg9               | cfg8           |
+| 0     | cfg10              | (—)            |
+| +2    | cfg12              | cfg11          |
+| +6    | cfg13              | cfg13 (match)  |
+| +10   | cfg15              | cfg15 (match)  |
+| +14   | cfg16              | cfg16 (match)  |
+Re-measured ceilings are EQUAL-OR-HIGHER than phase-1 at the low/mid band, identical at top.
+
+### §7.3 Join -> conservative skip map: CONFIRMED, no change
+Baked `superack_target_from_margin` (iter>=10->cfg0, 3..9->cfg2, 2->cfg4, 1->cfg6, 0->cfg8)
+vs re-measured ceilings at the matching channel: every target stays <= the re-measured
+ceiling (decodable on arrival), with MORE headroom than phase-1 assumed (iter=0->cfg8 vs
+re-measured ceiling cfg10+ = >=2 rungs). The single at-ceiling edge (iter=1 near -4 ->
+cfg6, ceiling cfg6) is still decodable and reverse-pin-cheap. No map adjustment required.
+
+### §7.4 Leap smoke (real audio, snd-aloop WGN:40, start ROBUST cfg100, MERCURY_INBAND_RATE=1)
+RSP EMIT = YES (reproduced, 2 runs): `[RSP-SUPERACK] clean ROBUST decode (iters=0/max=200)
+-> recommend CONFIG_8 (conf=5)` then `[INBAND-RX] SUPER-ACK emit skip_target=CONFIG_8
+(ladder_idx=11) ... parity=1` — the iter=0->cfg8 map fires end-to-end on the wire.
+CMD LEAP = NOT observed on real audio: the CMD fires its own robust intra-tier `[INBAND-TX]
+UNILATERAL CONFIG 100 -> 101` at the SAME instant the RSP emits, and the config churn then
+yields `[CMD-ACK-PAT] Timeout: no ACK detected` on the reverse path, so the single SUPER-ACK
+suffix is never decoded (no `[CMD-SUPERACK]`). The CMD-leap LOGIC is proven in-process
+(test_inband_superack C3a: `[CMD-SUPERACK] ACCEPT ... DIRECT LEAP`). FOLLOW-ON: the robust
++1 climb races/pre-empts the SUPER-ACK on the trio (the §6.2 "do not run bar=1 and SUPER-ACK
+as competing from-ROBUST climbers" hazard, now observed live) — resolve by gating the robust
+intra-tier +1 when a SUPER-ACK recommendation is pending, so the reverse ACK stays stable
+long enough for the CMD to decode+leap.
+
+Smoke3 full run (240 s): 2 RSP SUPER-ACK emits (T+87, T+154; both iter=0 -> CONFIG_8), 0 CMD decodes; the session crawls the ROBUST tier 100->101->102 and never loads any WB config -- the robust +1 climb, not the SUPER-ACK, is what moves the rate here.
