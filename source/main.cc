@@ -1162,6 +1162,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_superack;
                 failed += test_superack.test_inband_superack();
             }
+            // LEAP-STICK regression (data-flow-config-state-rsp-adopt.md §6): after the
+            // SUPER-ACK ROBUST->WB leap the RSP follows the tag through the shared adopt
+            // helper inband_adopt_resynced_config, which must advance the FORWARD config
+            // triad (current==data==forward) so the post-ACK restore step
+            // (arq_responder.cc:1800) is a no-op and the RSP does NOT snap back to ROBUST.
+            // Drives the production adopt directly, in-process. PURE synthetic-fire —
+            // permanent regression gate. Fail-before: data/forward_configuration stay stale.
+            {
+                cl_arq_controller test_leapstick;
+                failed += test_leapstick.test_inband_leap_stick();
+            }
             // IN-BAND CONFIG_0 ROLLING-PARTIAL climb-unblock regression
             // (data-flow-inband-frame0-rolling-partial.md §4): at the inband OFDM base rung the
             // first OFDM frame of each batch fails the SKIP-VAR gate (acquisition seam) → a
@@ -1723,6 +1734,7 @@ int main(int argc, char *argv[])
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
     bool test_inband_superack_cli = false;  // --test-inband-superack: SUPER-ACK CMD-leap / fail-safe regression.
+    bool test_inband_leap_stick_cli = false;  // --test-inband-leap-stick: RSP adopt advances forward config triad so the leap sticks.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
     bool test_inband_nack_cli = false;  // --test-inband-nack: in-band Stage 4e — D2 NACK first-class.
     bool test_inband_reannounce_cli = false;  // --test-inband-reannounce: in-band Stage 4e — D3 periodic re-announce.
@@ -2599,6 +2611,18 @@ int main(int argc, char *argv[])
             // backoff (inband_route_failure_demote). See arq_responder.cc test_inband_superack
             // + SUPERACK_DESIGN.md §2.4/§3.3/§4/§5 + data-flow-superack.md §5.
             test_inband_superack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-leap-stick") == 0)
+        {
+            // LEAP-STICK regression (one-shot at startup, exit rc). Fast, PURE in-process.
+            // Drives inband_adopt_resynced_config(CONFIG_8) from a ROBUST_0 seat and asserts
+            // the forward config triad (current==data==forward) advances coherently so the
+            // post-ACK restore step (arq_responder.cc:1800) is a no-op and the RSP does NOT
+            // snap back to ROBUST after the SUPER-ACK ROBUST->WB leap. See arq_responder.cc
+            // test_inband_leap_stick + data-flow-config-state-rsp-adopt.md §6.
+            test_inband_leap_stick_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4481,6 +4505,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_superack();
             printf("[FLAG] Inband-superack test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_leap_stick_cli) {
+            // LEAP-STICK regression (one-shot, exit rc). Builds its own RSP/telecom_system
+            // instance internally — fast, no PHY tail.
+            printf("[FLAG] --test-inband-leap-stick: invoking the SUPER-ACK leap-stick "
+                   "regression (data-flow-config-state-rsp-adopt.md §6)\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_leap_stick();
+            printf("[FLAG] Inband-leap-stick test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

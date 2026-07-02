@@ -5641,6 +5641,25 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 
 	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
 
+	// LEAP-STICK FIX (data-flow-config-state-rsp-adopt.md §5): load_configuration writes ONLY
+	// current_configuration (arq_common.cc:2243). The forward-direction config OWNERS
+	// (data_configuration = the rung the post-ACK restore step reloads, arq_responder.cc:1800;
+	// forward_configuration = the CMD->RSP forward rung, also the monitor decode hint at
+	// arq_common.cc:2100) must ALSO advance to the adopted rung — EXACTLY as the CMD's unilateral
+	// change does (arq_common.cc:3478-3479) and as the LEGACY SET_CONFIG RSP handler does
+	// (arq_responder.cc:3367+3385/3440, the path CONFIG_TAG replaced). Without this the RSP's
+	// data_configuration stayed at the robust-start rung (ROBUST_0=100), so the FIRST forward
+	// control frame the RSP ACKs saw data_configuration(100) != current_configuration(8) and
+	// load_configuration(100) SNAPPED the RSP PHY back to ROBUST while the CMD stayed at the
+	// leaped rung -> link diverges -> forward delivery freezes -> BREAK. Advancing the pair here
+	// makes that restore step a coherent no-op so the leap STICKS. Feature-gated adopt path only
+	// (both entry points — tag-follow :3388 and down-ladder :5601 — funnel through this helper);
+	// legacy byte-identical.
+#ifndef LEAP_STICK_FAILBEFORE   // fail-before: -DLEAP_STICK_FAILBEFORE reverts the RSP adopt to the stale-config bug
+	data_configuration    = followed_config;
+	forward_configuration = followed_config;
+#endif
+
 	// OFDM-ENTRY ADOPT SETUP (HINGE-1 flush/preserve + cursor re-anchor + FTR re-init +
 	// natural-ring SHRINK). Factored into a shared helper so the HYBRID legacy SET_CONFIG
 	// cross (arq_responder.cc:1723/1751/1764) runs the SAME setup and can never again strand

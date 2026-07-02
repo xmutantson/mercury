@@ -6365,6 +6365,129 @@ int cl_arq_controller::test_inband_superack()
 }
 
 // ============================================================================
+// LEAP-STICK regression — --test-inband-leap-stick
+// data-flow-config-state-rsp-adopt.md §6 / wb-dwell-post-leap.md.
+// ============================================================================
+//
+// After the SUPER-ACK ROBUST->WB leap the CMD tags the leaped OFDM rung and the RSP FOLLOWS
+// it through the shared adopt helper inband_adopt_resynced_config (arq_common.cc:5631; the
+// tag-follow :3388 AND the down-ladder :5601 both funnel through it). That helper calls
+// load_configuration(followed, PHYSICAL_LAYER_ONLY, NO), which advances ONLY
+// current_configuration (arq_common.cc:2243). Pre-fix it left data_configuration at the
+// robust-start rung (ROBUST_0=100) and forward_configuration unchanged — so the FIRST forward
+// control frame the RSP ACKs ran the post-ACK restore-data-config step (arq_responder.cc:1800),
+// saw data_configuration(100) != current_configuration(8), and load_configuration(100) SNAPPED
+// the RSP PHY back to ROBUST while the CMD stayed at the leaped rung -> link diverges -> forward
+// delivery freezes -> BREAK. The fix advances the forward config triad in the adopt helper
+// (data_configuration + forward_configuration = followed), mirroring the CMD's unilateral
+// change (arq_common.cc:3478-3479) and the legacy SET_CONFIG RSP handler (arq_responder.cc:3367
+// +3385/3440), so the restore step is a coherent no-op and the leap STICKS.
+//
+// This drives the PRODUCTION adopt helper directly, in-process (no cards / no PHY audio):
+//   1. Build an RSP seated at ROBUST_0 with data_configuration=ROBUST_0 (the leap-time state).
+//   2. inband_adopt_resynced_config(CONFIG_8)   (the exact production tag-follow adopt).
+//   3. Assert current_configuration==8 AND data_configuration==8 AND forward_configuration==8.
+//   4. Model the arq_responder.cc:1800 consumer: assert data_configuration==current so the
+//      post-ACK restore is a NO-OP (never reloads ROBUST) — the actual stick guarantee.
+//
+// FAIL-BEFORE: without the fix, step 3 fails (data_configuration/forward_configuration stay at
+// 100/CONFIG_NONE) and step 4's no-op invariant is violated (the restore would reload ROBUST).
+// PURE in-process synthetic-fire — permanent regression gate. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_leap_stick()
+{
+	const char* TAG = "[TEST-INBAND-LEAP-STICK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");            // feature ON (mirrors production adopt)
+	auto restore_env = [&]() {
+		set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	};
+
+	// The adopt takes capture_prep_mutex; create it if NULL (standalone test). On Linux the
+	// mutex is statically initialized and always valid, so this is a _WIN32-only guard.
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Build a production RSP seated at ROBUST_0, then MODEL the leap-time forward-config state:
+	// data_configuration = ROBUST_0 (the robust-start rung, arq_common.cc:1895) and
+	// forward_configuration = CONFIG_NONE (never advanced in-band before the fix). current is
+	// ROBUST_0 too until the adopt drives it to the tagged OFDM rung.
+	const int LEAP_TARGET = CONFIG_8;
+	cl_telecom_system* ts_rx = new cl_telecom_system();
+	cl_arq_controller* rx    = new cl_arq_controller();
+	ts_rx->operation_mode     = ARQ_MODE;
+	ts_rx->narrowband_enabled = NO;
+	rx->telecom_system        = ts_rx;
+	rx->narrowband_enabled    = NO;
+	rx->role                  = RESPONDER;
+	rx->robust_enabled        = YES;
+	rx->sack_v2_enabled       = true;
+	rx->inband_rate_enabled   = 1;                  // feature ON
+	rx->load_configuration(ROBUST_0, FULL, NO);
+	rx->link_status           = CONNECTED;
+	rx->connection_status     = RECEIVING;
+	rx->passive_monitor       = false;
+	rx->rsp_current_expected_batch_seq_id = 4;      // a current batch exists (HINGE-2 re-baseline)
+	rx->data_configuration    = ROBUST_0;           // leap-time state: still the robust-start rung
+	rx->forward_configuration = CONFIG_NONE;
+
+	check(rx->current_configuration == ROBUST_0,
+		"pre-adopt: RSP seated at ROBUST_0", rx->current_configuration, ROBUST_0);
+	check(rx->data_configuration == ROBUST_0,
+		"pre-adopt: data_configuration == ROBUST_0 (the leap-time stale rung)",
+		rx->data_configuration, ROBUST_0);
+
+	// THE PRODUCTION ADOPT — the exact call the tag-follow (arq_common.cc:3388) makes when the
+	// RSP hears the CMD's leaped-rung CONFIG_TAG on the passband.
+	rx->inband_adopt_resynced_config(LEAP_TARGET);
+
+	// The stick guarantee: the FORWARD config triad advances COHERENTLY to the leaped rung.
+	check(rx->current_configuration == LEAP_TARGET,
+		"post-adopt: current_configuration == CONFIG_8 (load_configuration advanced it)",
+		rx->current_configuration, LEAP_TARGET);
+	check(rx->data_configuration == LEAP_TARGET,
+		"post-adopt: data_configuration == CONFIG_8 (FIX: no longer stuck at ROBUST_0)",
+		rx->data_configuration, LEAP_TARGET);
+	check(rx->forward_configuration == LEAP_TARGET,
+		"post-adopt: forward_configuration == CONFIG_8 (FIX: forward owner advanced)",
+		rx->forward_configuration, LEAP_TARGET);
+
+	// Model the arq_responder.cc:1800 consumer: (data_configuration != current_configuration)
+	// is the branch that reloads the data config after an ACK. Post-fix it is FALSE, so the
+	// restore is a NO-OP and the RSP never snaps back to ROBUST -> the leap STICKS.
+	check(rx->data_configuration == rx->current_configuration,
+		"post-ACK restore step (arq_responder.cc:1800) is a NO-OP (never reloads ROBUST)",
+		(rx->data_configuration == rx->current_configuration) ? 1 : 0, 1);
+
+	delete rx; delete ts_rx;
+
+#if defined(_WIN32)
+	if(created_mutex) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band CONNECT-LIVENESS GUARD regression — --test-inband-liveness
 // data-flow-inband-connect-liveness.md §4.
 // ============================================================================

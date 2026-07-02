@@ -2500,6 +2500,15 @@ public:
   // SUPERACK_DESIGN.md §2.4/§3.3/§4/§5, data-flow-superack.md §5.
   int test_inband_superack();
 
+  // LEAP-STICK regression (CLI --test-inband-leap-stick; also run in the aggregate --test).
+  // Drives the PRODUCTION RSP adopt helper inband_adopt_resynced_config(CONFIG_8) from a
+  // ROBUST_0 seat and asserts the forward config triad advances COHERENTLY
+  // (current==data==forward==CONFIG_8) so the post-ACK restore step (arq_responder.cc:1800)
+  // is a no-op and the SUPER-ACK ROBUST->WB leap STICKS. Fail-before: data_configuration /
+  // forward_configuration stay at 100/CONFIG_NONE. Returns 0=PASS,1=FAIL.
+  // data-flow-config-state-rsp-adopt.md §6.
+  int test_inband_leap_stick();
+
   // STAGE 4d D1+D4 TEST (CLI --test-inband-retag). Drives the PRODUCTION repeat-until-
   // followed + climb/auto-demote functions: PART A a CONFIG_9->CONFIG_11 chokepoint climb
   // the RX FOLLOWS UP (both ends + PHY twin); PART B inband_tag_firing_decision re-emits
