@@ -86,6 +86,24 @@ static inline bool turnaround_rephase_enabled_common()
 	return cached != 0;
 }
 
+// DETERMINISTIC SCHEDULED ACK-SLOT gate (T1, feat/tdd-ack-slot). DEFAULT-OFF:
+// with MERCURY_ACK_SLOT unset (or "0") the CMD post-TX listen window is computed
+// by the legacy open-loop formula below — BYTE-IDENTICAL to monitor 720d4bcc.
+// Set MERCURY_ACK_SLOT=1 to replace the open-loop guard (frame_drain + sack_arrival
+// + SACK_ARRIVAL_MARGIN_MS 1000 + RSP_DECODE_MARGIN_MS 300) with the tight
+// scheduled slot t_ack_pred +/- bounded window (see calculate_receiving_timeout,
+// COMMANDER branch). Cached once — no getenv() in the ACK poll hot loop.
+static inline bool ack_slot_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_ACK_SLOT");
+		cached = (e && *e && *e != '0') ? 1 : 0;  // DEFAULT-OFF
+	}
+	return cached != 0;
+}
+
 // RECOVERY-ACK robustness gate (recovery-ack-robustness.md). DEFAULT-OFF: with
 // MERCURY_RECOVERY_ACK_ROBUST unset the TX emits the single 16-symbol ACK base
 // block and the RX correlates combine_reps=1 — BYTE-IDENTICAL to monitor e2cd1c5.
@@ -1472,6 +1490,51 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// window the RSP keys up after deciding clean batch vs SACK_RSP). No
 			// separate pattern_time inflation is needed for v2 SACK.
 			int pattern_time = ack_pattern_time_ms;
+			// DETERMINISTIC SCHEDULED ACK-SLOT (T1, feat/tdd-ack-slot; jitter char
+			// wuhobxaaq). The open-loop guard below over-budgets the reverse-ACK
+			// arrival ~20x (SACK_ARRIVAL_MARGIN_MS 1000 vs measured arrival jitter
+			// sd 12 ms) and ~2000x (RSP_DECODE_MARGIN_MS 300 vs sub-ms rsp_decode).
+			// ACK arrival is DETERMINISTIC, so wait exactly the predicted slot plus a
+			// bounded window instead of a loose margin:
+			//   t_ack_pred = last_frame_drain (CMD's last frame drains the channel)
+			//              + ACK_SLOT_RSP_TURN_MS (measured RSP turnaround const;
+			//                collapses ptt_off + rsp_decode + ptt_on)
+			//              + slip (batch-airtime accrual; generalizes the CFG15-only
+			//                turnaround re-phase to every OFDM config)
+			//   window     = ACK_SLOT_LEAD_MS (>3sigma jitter) + pattern_time
+			//              + ACK_SLOT_TAIL_MS (OFDM/LDPC decode-allow)
+			// GATED MERCURY_ACK_SLOT (default-OFF -> falls through to the open-loop
+			// formula, byte-identical to 720d4bcc; A/B gate for measurement).
+			if(ack_slot_enabled_common())
+			{
+				int last_frame_drain = message_transmission_time_ms; // one last frame in flight (not 2x)
+				int rsp_turn         = ACK_SLOT_RSP_TURN_MS;
+				int slip             = 0;
+				if(is_ofdm_config(current_configuration)
+				   && data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+				{
+					long batch_airtime_ms = (long)data_batch_size * (long)message_transmission_time_ms;
+					slip = (int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
+				}
+				int t_ack_pred   = last_frame_drain + rsp_turn + slip;
+				int slot_window  = ACK_SLOT_LEAD_MS + pattern_time + ACK_SLOT_TAIL_MS;
+				int slot_timeout = t_ack_pred + slot_window;
+				// Turboshift still adds load_configuration() overhead per probe.
+				if(gear_shift_on && turboshift_phase != TURBO_DONE)
+					slot_timeout += 2000;
+				// Runtime override safety net (--sack-timeout-extra-ms=N).
+				if(sack_enabled)
+					slot_timeout += sack_timeout_extra_ms;
+				printf("[CMD-POST-TX-CALIB] timeout=%dms = ack_slot=1 last_frame_drain=%d + rsp_turn=%d + slip=%d + lead=%d + pattern=%d + tail=%d + turbo=%d + extra=%d batch=%d sack=%d\n",
+					slot_timeout, last_frame_drain, rsp_turn, slip,
+					ACK_SLOT_LEAD_MS, pattern_time, ACK_SLOT_TAIL_MS,
+					(gear_shift_on && turboshift_phase != TURBO_DONE) ? 2000 : 0,
+					sack_enabled ? sack_timeout_extra_ms : 0,
+					data_batch_size, sack_enabled ? 1 : 0);
+				fflush(stdout);
+				set_receiving_timeout(slot_timeout);
+				return;
+			}
 			int frame_drain  = 2 * message_transmission_time_ms;
 			int sack_arrival = ptt_off_delay_ms + RSP_DECODE_MARGIN_MS
 			                 + pattern_time + ptt_on_delay_ms;
