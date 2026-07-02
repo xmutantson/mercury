@@ -32,6 +32,7 @@
 #include <atomic>   // R006: std::atomic<bool> shutdown_ (cross-thread termination flag)
 #include <thread>   // R006: --test-shutdown-atomic cross-thread smoke
 #include <type_traits> // R006: static_assert shutdown_ is atomic
+#include "common/engagement_telemetry.h" // Capstone R1 per-lever engagement summary (atexit)
 #include <cstring>  // FIX-C: memset for sigaction struct init (explicit, not transitive)
 #include <csignal>  // FIX-C: SIGTERM/SIGINT graceful-shutdown handler (raise/SIGTERM)
 #ifndef _WIN32
@@ -933,6 +934,14 @@ int main(int argc, char *argv[])
     // --test paths and any pre-mode work; it is a pure disposition change with
     // no effect until a signal actually arrives.
     install_termination_handlers();
+
+    // Capstone R1 engagement telemetry (STEP 4): emit one [ENGAGE-SUMMARY] line at
+    // process teardown with the per-lever fire counts (SUPER-ACK leaps, compact-confirm
+    // ok/fail, HARQ attempted/succeeded, T1 ACK-slot hit/clip, TINTERP activations) so a
+    // capstone run can render engaged / engaged-but-capped / silently-dead per lever. A
+    // zero count where a fire was expected is the Fable R1 silent-kill signal. atexit
+    // fires on normal return AND the --test early-exit paths (one session == one process).
+    atexit(&mercury_engage::print_summary);
 
     // --test : run built-in unit tests and exit. Phase B Wave 1 (this
     // build) wires the MFSK ctrl-suffix codec suite (alphabet, payload

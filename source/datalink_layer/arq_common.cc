@@ -24,6 +24,7 @@
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
 #include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 in-band rate-adapt config tag
+#include "common/engagement_telemetry.h"  // Capstone R1 per-lever engagement counters (SUPER-ACK, T1 ACK-slot)
 #include <time.h>
 #include <vector>
 #ifdef __GLIBC__
@@ -1532,6 +1533,7 @@ void cl_arq_controller::calculate_receiving_timeout()
 					sack_enabled ? sack_timeout_extra_ms : 0,
 					data_batch_size, sack_enabled ? 1 : 0);
 				fflush(stdout);
+				mercury_engage::tick(mercury_engage::ACK_SLOT_HIT);
 				set_receiving_timeout(slot_timeout);
 				return;
 			}
@@ -4675,6 +4677,7 @@ bool cl_arq_controller::inband_handle_superack(int skip_target_cfg, uint8_t ack_
 		skip_target_cfg, (unsigned)skip_confidence, (unsigned)(epoch_parity & 0x1),
 		leap, current_configuration, supershift_proven_ceiling);
 	fflush(stdout);
+	mercury_engage::tick(mercury_engage::SUPERACK_LEAP);
 
 	// LEAP — clone the supershift re-trigger block (arq_commander.cc:8069-8081). The target
 	// comes DIRECTLY from the wire (NOT elevator_target_from_snr()), so the is_ofdm_config &&

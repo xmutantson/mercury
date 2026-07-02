@@ -95,6 +95,13 @@ public:
 	//! untouched (no soft output).
 	int decode(const float* data,  int*  decoded_data, double* app_llr = nullptr);
 
+	// Runtime iteration-cap setter (T4 HARQ chase-combine budget guard). decode()
+	// reads the PRIVATE nIteration_max_val, which init() syncs from nIteration_max;
+	// this sets BOTH so a mid-run cap takes effect on the very next decode WITHOUT a
+	// costly init()/matrix-realloc. Monotone-safe: fewer iterations can only DECLINE
+	// a decode, never fabricate one (the CRC still arbitrates every combine).
+	void set_nIteration_max_runtime(int n) { nIteration_max = n; nIteration_max_val = n; }
+
 	// Abort flag for parallel monitor decode: when another decoder succeeds,
 	// set this to true so remaining decoders exit their LDPC iteration loop early.
 	// NULL means no abort checking (normal operation).

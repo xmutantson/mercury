@@ -26,6 +26,7 @@
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
 #include "physical_layer/dist_matcher.h" // PAS/PCS distribution matcher (lever #2, feat/pcs)
 #include "physical_layer/ldpc_decode_pool.h" // LEVER C: multi-core big-block decode pool (feat/decode-marathon)
+#include "common/engagement_telemetry.h" // Capstone R1 per-lever engagement counters (HARQ, TINTERP)
 #include <thread> // LEVER C: std::thread::hardware_concurrency() for the pool clamp
 #include <chrono>
 #include <algorithm> // std::sort — bigblock pre-FFT AFC-track median smoother (Option C)
@@ -3389,6 +3390,7 @@ skip_h_retry_point:
 						current_configuration, receive_stats.delay, mean_H,
 						receive_stats.coarse_metric, receive_stats.crc);
 					fflush(stdout);
+					mercury_engage::tick(mercury_engage::TINTERP_ACTIVATE);
 					// Re-decode the SAME frame at the SAME delay with TIME_INTERP. Do NOT
 					// increment sync_trials (a re-do of this trial, not a new search).
 					goto ofdm_subpeak_retry_point;
@@ -3891,6 +3893,31 @@ bool cl_telecom_system::harq_combine_rescue(int* out, st_receive_stats& rs,
 		const char* a = std::getenv("MERCURY_HARQ_MAX_ATTEMPTS");
 		if(a && *a){ int v = atoi(a); if(v >= 1 && v <= 32) harq_max_attempts = v; }
 	}
+
+	// ── T4 HARQ ITERATION CAP (reverse-ACK budget guard, STEP 3) ─────────────────
+	// Each combine candidate is a FULL ldpc.decode; a WRONG pairing does NOT converge
+	// and burns the config's whole nIteration_max (100 on OFDM => ~1.5-3.3 s each) on
+	// the RX turnaround. The T4 close-out measured the uncapped fail-path at 8-13x the
+	// ~1.3 s Pi reverse-ACK budget. Cap the HARQ combine decodes ONLY (the forward
+	// decode path is untouched, so the clean knee does not regress) to HARQ_ITERCAP
+	// iterations. A real default (30), env-tunable for A/B, never above the config's
+	// own nIteration_max. Monotone-safe: fewer iterations can only DECLINE a rescue
+	// (the CRC still arbitrates); a non-converging frame is still classified FAIL.
+	// The RAII guard restores the config's nIteration_max on EVERY exit of this fn.
+	static int harq_itercap = -1;
+	if(harq_itercap < 0)
+	{
+		harq_itercap = 30;
+		const char* ic = std::getenv("MERCURY_HARQ_ITERCAP");
+		if(ic && *ic){ int v = atoi(ic); if(v >= 1 && v <= 200) harq_itercap = v; }
+	}
+	struct harq_itercap_guard {
+		cl_ldpc* l; int saved;
+		harq_itercap_guard(cl_ldpc* lp, int cap) : l(lp), saved(lp->nIteration_max)
+		{ if(cap < saved) l->set_nIteration_max_runtime(cap); }
+		~harq_itercap_guard() { l->set_nIteration_max_runtime(saved); }
+	} harq_cap_guard(&ldpc, harq_itercap);
+
 	int attempts = 0;
 	// Most-recent-first: a retransmit most likely pairs with the latest failure.
 	for(int idx=(int)harq_buf.size()-1; idx>=0; --idx)
@@ -3898,6 +3925,12 @@ bool cl_telecom_system::harq_combine_rescue(int* out, st_receive_stats& rs,
 		st_harq_entry& e = harq_buf[(size_t)idx];
 		if(e.cfg != harq_snap_cfg || e.N != N || (int)e.llr.size() != N) continue;
 		if(++attempts > harq_max_attempts) break;   // timing-budget guard
+
+		mercury_engage::tick(mercury_engage::HARQ_ATTEMPT);
+		printf("[HARQ-ATTEMPT] cfg=%d N=%d try=%d/%d — soft-combining a buffered failed "
+		       "copy (iter-cap=%d)\n",
+		       harq_snap_cfg, N, attempts, harq_max_attempts, harq_itercap);
+		fflush(stdout);
 
 		int iters = harq_sum_and_decode(e.llr.data(), harq_snap_llr.data(), N,
 		                                data_container.hd_decoded_data_bit);
@@ -3940,6 +3973,7 @@ bool cl_telecom_system::harq_combine_rescue(int* out, st_receive_stats& rs,
 		       "recovered a failed frame by soft-combining (no BREAK/demote)\n",
 		       harq_snap_cfg, N, iters, rs.SNR, (int)harq_buf.size());
 		fflush(stdout);
+		mercury_engage::tick(mercury_engage::HARQ_SUCCESS);
 		harq_buf.erase(harq_buf.begin()+idx);   // delivered — drop the buffered copy
 		return true;
 	}

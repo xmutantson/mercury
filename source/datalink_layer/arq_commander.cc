@@ -24,6 +24,7 @@
 #include "common/timing_log.h"
 #include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
 #include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
+#include "common/engagement_telemetry.h"  // Capstone R1 per-lever engagement counters (compact-confirm, T1 clip)
 #include <cstdlib>
 #include <cstdint>     // uint32_t/uint8_t (2-instance stepper deterministic payload)
 #include <vector>      // std::vector (2-instance stepper large-payload buffer)
@@ -399,6 +400,7 @@ bool cl_arq_controller::cmd_compact_confirm_sack_window_accept(bool compact_enab
 			"(cmd_batch_seq_id=%d) arrival_ms=%d\n",
 			(unsigned)cc_bsi, cmd_batch_seq_id, arrival_ms);
 		fflush(stdout);
+		mercury_engage::tick(mercury_engage::COMPACT_CONFIRM_OK);
 	}
 	// Whether fresh or de-duplicated, the compact tail was consumed this poll — return
 	// true so the caller skips the (doomed) 13-uncoded decode of the same tail.
@@ -5682,6 +5684,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				/*data_ack_no=*/ true,
 				/*forward_ofdm_healthy=*/ is_ofdm_config(last_data_viable_config),
 				revack_base_miss_consec, REVACK_BASE_MISS_MAX_CONSEC);
+			// T1 ACK-slot CLIP telemetry (STEP 4): reaching this data-ACK-timeout decision
+			// with the deterministic TDD ACK slot engaged (MERCURY_ACK_SLOT=1) means the slot
+			// listen window elapsed WITHOUT a decoded reverse ACK == a missed (clipped) slot.
+			{
+				static const bool ack_slot_on = []{
+					const char* e = std::getenv("MERCURY_ACK_SLOT");
+					return e && *e && atoi(e) != 0;
+				}();
+				if(ack_slot_on) mercury_engage::tick(mercury_engage::ACK_SLOT_CLIP);
+			}
 			if(revack_confirm_miss_reair)
 			{
 				revack_base_miss_consec++;
@@ -5693,6 +5705,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					current_configuration, last_data_viable_config,
 					revack_base_miss_consec, REVACK_BASE_MISS_MAX_CONSEC, cmd_batch_seq_id & 0xFF);
 				fflush(stdout);
+				mercury_engage::tick(mercury_engage::COMPACT_CONFIRM_FAIL);
 			}
 
 			// Count toward emergency BREAK. Batch halving doesn't bypass this.
