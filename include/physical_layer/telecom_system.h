@@ -886,6 +886,67 @@ public:
 	// + unused when turbo is OFF (default) ⇒ zero allocation, byte-identical path.
 	std::vector<double> turbo_app_llr;
 
+	// ==== HARQ chase combining (feat/harq-chase-combining) =====================
+	// RX-side soft-combining ARQ (Chase, "Code Combining", IEEE Trans. Comm. 1985;
+	// = Type-I HARQ with soft combining / packet combining). Mercury retransmits
+	// FULL frames (identical coded bits — retransmit_frames[] carry the original
+	// payload+bsi verbatim, arq_commander.cc:4518 / arq_responder.cc:12379), so a
+	// retransmit's channel LLRs estimate the SAME a-posteriori bit reliabilities as
+	// a previously-FAILED reception's LLRs. Summing them before ldpc.decode is the
+	// ML-optimal equal-noise combine and doubles the effective SNR (~3 dB/combine,
+	// more near the waterfall cliff) — turning a marginal miss into a decode instead
+	// of the BREAK -> ROBUST_0 -> 30 s re-acquire "demote amplifier" cascade.
+	//
+	// IDENTITY CONSTRAINT (why the key is (config,N), not (batch_seq_id,frame-idx)):
+	// the ARQ frame header (type / connection_id / sequence_number / batch_seq_id)
+	// lives INSIDE the LDPC-protected payload (parsed only AFTER a clean decode,
+	// arq_common.cc:12925-12954). On a CRC-FAIL those bytes are corrupt, so the
+	// (batch_seq_id, frame-index) key the intent calls for is UNREADABLE at
+	// fail-time. We therefore key by the PHY identity that IS reliable on a failed
+	// frame — the config and codeword length N, which fix the modulation /
+	// interleave / dispersal geometry that makes LLR summation valid — and let the
+	// CRC ARBITRATE which buffered copy (if any) is the same codeword: sum against
+	// each compatible candidate and accept the first whose combined decode passes
+	// CRC. A wrong pairing simply fails CRC and is discarded (the same wrong-codeword
+	// backstop telecom_system.cc:3302 already relies on), so mis-association can
+	// never deliver corrupt data. This realizes the (batch_seq_id,frame-index)
+	// INTENT via the strongest association available on a corrupt frame.
+	struct st_harq_entry {
+		int cfg = -1;                  // config the codeword was received under
+		int N   = 0;                   // ldpc.N (LLR count) — summation validity guard
+		unsigned long long age = 0;    // harq_rx_counter at bank time (LRU/staleness)
+		std::vector<float> llr;        // channel LLRs [0..N), post-dispersal layout
+	};
+	std::vector<st_harq_entry> harq_buf;      // bounded ring of failed-frame LLRs
+	unsigned long long harq_rx_counter = 0;   // monotonic receive_byte call index
+	std::vector<float> harq_combine_scratch;  // summed-LLR scratch for the re-decode
+	// Per-reception snapshot of the best (highest coarse_metric) real-looking FAILED
+	// OFDM frame's channel LLRs, captured in the receive_byte fail branch and
+	// consumed once post-loop (combine attempt, else bank).
+	std::vector<float> harq_snap_llr;
+	bool   harq_snap_valid    = false;
+	int    harq_snap_cfg      = -1;
+	int    harq_snap_N        = 0;
+	float  harq_snap_variance = 1.0f;   // -> conservative single-frame SNR report
+	double harq_snap_freq     = 0.0;
+	int    harq_snap_delay    = 0;
+	double harq_snap_metric   = -1.0;   // best-trial selector within one reception
+	int    harq_chase_enabled = -2;     // -2 unread; 0 off; 1 on (default). Env gate.
+	bool   harq_feature_on();           // cached MERCURY_HARQ_CHASE read (default ON)
+	void   harq_reset();                // clear buffer + snapshot (config/session change)
+	// Core combine primitive (also the --test-harq-chase entry point): clip-sum
+	// buffered+fresh LLRs into harq_combine_scratch and ldpc.decode; returns
+	// iterations_done, writes hard bits into out_bits.
+	int    harq_sum_and_decode(const float* buffered, const float* fresh, int N,
+	                           int* out_bits);
+	// Post-reception rescue: try combining harq_snap_llr against each compatible
+	// buffered entry; on the first CRC-clean combine, publish it (out + rs) and
+	// return true. RX-side only; only ever overrides a FAILED decode (monotone-safe).
+	bool   harq_combine_rescue(int* out, st_receive_stats& rs,
+	                           int nReal_data, int nVirtual_data);
+	void   harq_bank_snapshot();        // bank harq_snap_llr (bounded, drop oldest, age-evict)
+	// ===========================================================================
+
 	cl_configuration_telecom_system default_configurations_telecom_system;
 
 	int outer_code;

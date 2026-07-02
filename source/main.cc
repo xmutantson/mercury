@@ -1662,6 +1662,7 @@ int main(int argc, char *argv[])
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_tinterp_seed_cli = false; // --test-tinterp-seed: TINTERP-SEED production it=0 estimator seed-swap failing-first (staging/tinterp-seed).
     bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
+    bool test_harq_chase_cli = false;  // --test-harq-chase: HARQ chase-combining fail-before/pass-after (feat/harq-chase-combining).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -2657,6 +2658,17 @@ int main(int argc, char *argv[])
             // with a shared-workspace fail-before. One-shot at startup, then exit rc.
             // See fact-documents/decode-marathon-C.md §8.
             test_decode_marathon_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-harq-chase") == 0)
+        {
+            // HARQ chase-combining (feat/harq-chase-combining) fail-before/pass-after
+            // gate: at a cliff noise level a SINGLE reception fails to decode but
+            // SUMMING it with a second reception of the same codeword succeeds, and a
+            // mismatched-codeword combine does not fabricate the frame. One-shot at
+            // startup, then exit rc. See fact-documents/data-flow-retx-queue.md.
+            test_harq_chase_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4477,6 +4489,20 @@ start_modem:
             fflush(stdout);
             int rc = test_decode_marathon_run();
             printf("[FLAG] Decode-marathon test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_harq_chase_cli) {
+            // HARQ chase-combining (feat/harq-chase-combining): prove the RX-side
+            // soft-combine primitive recovers a frame a single reception cannot
+            // decode (~3 dB), and that a mismatched combine is not fabricated.
+            // One-shot, then exit rc.
+            extern int test_harq_chase_run();
+            printf("[FLAG] --test-harq-chase: invoking HARQ chase-combining "
+                   "fail-before/pass-after gate\n");
+            fflush(stdout);
+            int rc = test_harq_chase_run();
+            printf("[FLAG] HARQ chase-combining test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
