@@ -15324,6 +15324,181 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 }
 
 // ===========================================================================
+// MIXBATCH FILL OVER-POP regression (data-flow-mixbatch-fill.md)
+//
+// CLI: --test-mixbatch-fill-overpop      (env MERCURY_MIXBATCH_OVERPOP_DEFEAT=1
+//                                          reverts the fix on the SAME binary)
+//
+// THE BUG (channel-free, pure ARQ TX state). On a v2 MIXED batch the next TX
+// prepends R = min(retransmit_count, data_batch_size) retx frames as the batch's
+// FIRST slots (process_messages_tx_data v2 retx-prefix loop, arq_commander.cc
+// ~2414-2461), leaving only (data_batch_size - R) slots for NEW data. But the
+// no-compression fill loop (process_buffer_data_commander, arq_commander.cc
+// ~21141) popped the FULL data_batch_size NEW frames regardless. The R surplus
+// frames stayed ADDED_TO_LIST and — because add_message_tx_data() fills the
+// first-FREE slot — landed in HIGH messages_tx slots, while the NEXT batch's
+// fresh frames filled the LOW (freed) slots. The new-data assign loop numbers
+// pos/id by ASCENDING slot, so the OLDER surplus content got a HIGHER seq/id than
+// the newer content -> the batch was delivered OUT OF ORDER (the RSP places by
+// id and drains slots ascending) -> byte-integrity FAIL + rx>tx double-delivery.
+// Live signature (cfg8 WGN40 capstone smoke): good_prefix 3288, 813 corrupt bytes
+// from offset 3288 on the FINAL partial batch.
+//
+// This drives the REAL process_buffer_data_commander() no-compression data-fill
+// across TWO mixbatch cycles, RECONSTRUCTS the delivered byte stream the RSP
+// would produce (batch-1 sent frames, then batch-2 frames in ascending-slot
+// order), and asserts it is a CONTIGUOUS prefix of the fed positional pattern
+// (byte[k]==k&0xFF). No PHY / audio / TCP / compression.
+//
+//   pass-after (defeat off): the fill caps at data_batch_size - R, no surplus is
+//     ever created, slot order == content order, the reconstructed stream is
+//     byte-exact contiguous.
+//   fail-before (MERCURY_MIXBATCH_OVERPOP_DEFEAT=1): the fill over-pops by R, the
+//     surplus lands in high slots, the reconstructed stream is REORDERED (a
+//     mismatch at the surplus junction) AND cycle-1 stages data_batch_size (not
+//     data_batch_size - R).
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_mixbatch_fill_overpop()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_MIXBATCH_OVERPOP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-MIXFILL] start (MERCURY_MIXBATCH_OVERPOP_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-MIXFILL] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-MIXFILL] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Prime cfg8-like OFDM dimensions, compression OFF (no-comp fill leg) ---
+	max_data_length    = 64;
+	max_header_length  = 8;
+	sack_v2_enabled    = true;
+	sack_enabled       = true;
+	header_carries_d5  = false;   // keep max_frame deterministic (no D5 byte)
+	compression_enabled= false;   // route to the byte-exact no-compression fill
+	encryption_enabled = false;
+	robust_enabled     = NO;
+	narrowband_enabled = NO;
+	role               = COMMANDER;
+	original_role      = COMMANDER;
+	link_status        = CONNECTED;
+	connection_status  = TRANSMITTING_DATA;
+	block_under_tx     = NO;
+	message_batch_counter_tx = 0;
+
+	const int DBS = 25;
+	const int R   = 2;    // retx prefix on the mixbatch -> only DBS-R new slots fit
+	nMessages = 120;
+	set_data_batch_size(DBS);
+
+	deinit_messages_buffers();
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C0 message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+
+	int max_frame = max_data_length + max_header_length
+	              - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+	check(max_frame > 0 && max_frame <= max_data_length + max_header_length,
+		"C0b max_frame sane", max_frame, max_frame);
+
+	// Fed positional pattern: byte[k] = k & 0xFF, enough for both cycles.
+	const int NFRAMES_FED = 40;
+	const int FED = NFRAMES_FED * max_frame;
+	{
+		char* fed = new char[FED];
+		for(int k=0;k<FED;k++) fed[k] = (char)(unsigned char)(k & 0xFF);
+		int pushed = fifo_buffer_tx.push(fed, FED);
+		check(pushed == FED, "C0c fed pattern staged", pushed, FED);
+		delete[] fed;
+	}
+	auto pat = [&](int k)->unsigned char { return (unsigned char)(k & 0xFF); };
+
+	// The reconstructed delivered stream (batch-1 sent, then batch-2 by slot).
+	std::vector<unsigned char> delivered;
+	delivered.reserve(FED);
+
+	// ---- CYCLE 1: a MIXED batch (R retx pending) ----
+	retransmit_count = R;
+	process_buffer_data_commander();       // REAL fill
+
+	int staged1 = 0;
+	for(int i=0;i<nMessages;i++) if(messages_tx[i].status==ADDED_TO_LIST) staged1++;
+	printf("[TEST-MIXFILL] cycle1 staged=%d (DBS=%d R=%d expect_fix=%d)\n",
+		staged1, DBS, R, DBS-R);
+	fflush(stdout);
+	if(!defeat)
+		check(staged1 == DBS - R, "C1 fill respects retx prefix (no over-pop)", staged1, DBS-R);
+	else
+		check(staged1 == DBS, "C1 fail-before over-pops the full batch", staged1, DBS);
+
+	// Simulate the assembly: it takes the FIRST (DBS-R) new frames by ASCENDING
+	// slot into the wire batch; the rest (surplus) stay ADDED_TO_LIST. Capture the
+	// sent frames' bytes (== the batch-1 delivered content) and FREE their slots.
+	{
+		int sent = 0;
+		for(int i=0;i<nMessages && sent < DBS - R;i++)
+		{
+			if(messages_tx[i].status==ADDED_TO_LIST)
+			{
+				for(int j=0;j<messages_tx[i].length;j++)
+					delivered.push_back((unsigned char)messages_tx[i].data[j]);
+				messages_tx[i].status = FREE;
+				messages_tx[i].length = 0;
+				sent++;
+			}
+		}
+		check(sent == DBS - R, "C2 batch-1 sent exactly DBS-R new frames", sent, DBS-R);
+	}
+
+	// ---- CYCLE 2: the next batch (no retx now) ----
+	retransmit_count = 0;
+	block_under_tx   = NO;
+	process_buffer_data_commander();       // REAL fill (fresh frames -> low free slots)
+
+	// Reconstruct batch-2's delivered order = messages_tx ADDED_TO_LIST by ASCENDING
+	// slot (the id/pos the assign loop stamps == the RSP delivery order).
+	for(int i=0;i<nMessages;i++)
+		if(messages_tx[i].status==ADDED_TO_LIST)
+			for(int j=0;j<messages_tx[i].length;j++)
+				delivered.push_back((unsigned char)messages_tx[i].data[j]);
+
+	// The delivered stream MUST be a byte-exact CONTIGUOUS prefix of the fed pattern.
+	int first_bad = -1;
+	for(int k=0;k<(int)delivered.size();k++)
+		if(delivered[k] != pat(k)) { first_bad = k; break; }
+
+	printf("[TEST-MIXFILL] reconstructed delivered=%d bytes first_bad=%d (fed=%d)\n",
+		(int)delivered.size(), first_bad, FED);
+	fflush(stdout);
+
+	if(!defeat)
+	{
+		// pass-after: byte-exact, in order, no reorder.
+		check(first_bad == -1, "C3 delivered stream is contiguous (no reorder)", first_bad, -1);
+	}
+	else
+	{
+		// fail-before: the over-pop surplus MUST reorder the stream (vacuity guard —
+		// the scenario has to actually exercise the bug).
+		check(first_bad != -1, "C3 fail-before REORDERS the delivered stream", first_bad, 1);
+	}
+
+	deinit_messages_buffers();
+	printf("[TEST-MIXFILL] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
+}
+
+// ===========================================================================
 // Idle SWITCH_ROLE race regression — FAILS-BEFORE evidence for the
 // connected-but-0-deliver bench bug.
 //
@@ -19861,7 +20036,40 @@ void cl_arq_controller::process_buffer_data_commander()
 				if(compression_enabled && compressor.is_streaming())
 					compressor.clear_pending();
 				int filled = 0;
+				// MIXBATCH FILL FIX (data-flow-mixbatch-fill.md): on a v2 mixed batch the
+				// NEXT TX prepends R = min(retransmit_count, data_batch_size) retx frames
+				// as the batch's FIRST slots (process_messages_tx_data v2 retx-prefix loop,
+				// arq_commander.cc ~2414-2461), leaving only (data_batch_size - R) slots for
+				// new data. Popping the full data_batch_size NEW frames here over-stages by
+				// R: the surplus frames stay ADDED_TO_LIST and, because add_message_tx_data()
+				// fills the first-FREE slot, they land in HIGH messages_tx slots while the
+				// NEXT batch's fresh frames fill the LOW (freed) slots -> the new-data assign
+				// loop (which numbers pos/id by ASCENDING slot) gives the OLDER surplus
+				// content a HIGHER seq/id than the newer content -> the batch is delivered
+				// OUT OF ORDER (byte-integrity FAIL, rx>tx double-delivery). Cap the fill to
+				// the slots the mixbatch can actually carry so NO surplus is ever created
+				// (the 'messages_tx slot order == content order' invariant the assign loop
+				// relies on is preserved). No-retx / v1 path: retransmit_count == 0 ->
+				// fill_limit == data_batch_size (byte-identical to pre-fix). Env DEFEAT
+				// restores the pre-fix over-pop on the SAME binary (the fail-before arm).
 				int fill_limit = data_batch_size;
+				if(sack_v2_enabled)
+				{
+					bool overpop_defeat = false;
+					{ const char* e = std::getenv("MERCURY_MIXBATCH_OVERPOP_DEFEAT");
+					  if(e && *e && atoi(e)!=0) overpop_defeat = true; }
+					if(!overpop_defeat)
+					{
+						int retx_prefix = retransmit_count;
+						if(retx_prefix > data_batch_size) retx_prefix = data_batch_size;
+						if(retx_prefix < 0) retx_prefix = 0;
+						int already_staged = 0;
+						for(int _i=0; _i<nMessages; _i++)
+							if(messages_tx[_i].status==ADDED_TO_LIST) already_staged++;
+						fill_limit = data_batch_size - retx_prefix - already_staged;
+						if(fill_limit < 0) fill_limit = 0;
+					}
+				}
 				batch_uncompressed_size = 0;
 				for(int i=0;i<fill_limit;i++)
 				{

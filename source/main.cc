@@ -1651,6 +1651,7 @@ int main(int argc, char *argv[])
                                         // watchdog predicate + the produce-gate replication: a stranded RECEIVED slot is
                                         // freed and a later control frame lands. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE.
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
+    bool test_mixbatch_fill_overpop_cli = false; // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
                                         // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
                                         // a real compressible payload; asserts >0 application bytes are staged. FAILS on
@@ -2674,6 +2675,14 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-compress-frame-fill.md §5.
             test_robust0_compress_deadlock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-mixbatch-fill-overpop") == 0)
+        {
+            // Mixbatch fill over-pop reorder regression (one-shot, exit rc).
+            // See fact-documents/data-flow-mixbatch-fill.md.
+            test_mixbatch_fill_overpop_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4492,6 +4501,15 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_robust0_compress_deadlock();
             printf("[FLAG] Robust0-compress-deadlock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_mixbatch_fill_overpop_cli) {
+            printf("[FLAG] --test-mixbatch-fill-overpop: invoking mixbatch fill\n"
+                   "       over-pop reorder regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_mixbatch_fill_overpop();
+            printf("[FLAG] Mixbatch-fill-overpop test complete (rc=%d) -- exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
