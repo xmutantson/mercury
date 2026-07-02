@@ -3318,6 +3318,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			decrypt_delivered_bsi = rsp_prev_batch_seq_id;
 			copy_data_to_buffer();
 			batch_data_delivered = true;  // Prevent duplicate delivery on retransmit
+			// silent-corruption-marginal-snr.md §3: the in-order batch just delivered its
+			// full framed span — now apply any data_batch_size shrink that was deferred to
+			// avoid orphaning THIS (current) batch's RECEIVED tail. No-op if none pending or
+			// a prev is still holding (rsp_apply_deferred_batch_shrink self-guards). Mirrors
+			// the prev-deliver apply site (arq_responder.cc:1346).
+			rsp_apply_deferred_batch_shrink();
 		}
 		messages_last_ack_bu.type=NONE;
 
@@ -15015,6 +15021,192 @@ int cl_arq_controller::test_batch_shrink_orphan_defer()
 		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
 	fflush(stdout);
 	return failed==0 ? 0 : 1;
+}
+
+// ============================================================================
+// rx_btf=-1 CURRENT-batch SHRINK tail-drop — the marginal-SNR silent corruption
+// (data-flow-d5-eob-batch-truncation.md §7; silent-corruption-marginal-snr.md).
+// ============================================================================
+//
+// CLI: --test-batch-shrink-orphan-current  (env MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1
+//                                           reverts the fix on the SAME binary)
+//
+// THE BUG (channel-free, pure RX state) — the sibling of test_batch_shrink_orphan_defer
+// that Fix A did NOT cover. A mid-flight data_batch_size SHRINK (Axis-2 down-move /
+// WB->robust demote at a marginal SNR patch) orphans already-RECEIVED CURRENT-batch
+// frames (messages_rx[], not messages_rx_prev[]) in [new,old). defer_shrink_if_would_
+// orphan_prev() scanned ONLY messages_rx_prev[], so with no prev active the shrink
+// APPLIES; the next bump_bsi_and_transfer_prev() then transfers only [0,data_batch_size)
+// = [0,new) into the prev and FREEs the source — slots [new,old), real in-order user
+// bytes, are DROPPED. prev_expected collapses to `new` (rx_btf=-1: no wired D5 count to
+// re-derive the true span at a robust config), the count gate fires, copy_data_to_buffer
+// delivers a SHORT batch, and the delivered app stream is truncated mid-stream with NO
+// [RSP-V2-GAP-ABORT] (the batch delivers contiguously, just short) — the exact
+// "correct thru offset X then corrupted" md5-FALSE signature at WGN:25.
+//
+// Drives the REAL set_data_batch_size() chokepoint, the REAL bump_bsi_and_transfer_prev()
+// producer, the REAL prev-completion count gate + REAL copy_data_to_buffer() reassembler
+// (production pointer-swap), and the REAL fifo_buffer_rx as a byte-exact oracle.
+//   pass-after (fix): the orphaning shrink is DEFERRED (data_batch_size held OLD), the
+//     full OLD-span batch seals + delivers -> zero bytes lost, byte-exact.
+//   fail-before (DEFEAT): the shrink applies, the seal truncates to NEW, the prev delivers
+//     NEW frames -> the [NEW,OLD) tail is SILENTLY dropped (short delivery, md5 FALSE).
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_batch_shrink_orphan_current()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-SHRINK-CUR] start (MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int fails = 0;
+
+	// --- scaffold (mirror test_eob_loss_batch_truncation) -------------------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-SHRINK-CUR] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled       = true;
+	this->sack_enabled          = true;
+	this->current_configuration = 0;      // OFDM branch of set_data_batch_size (Axis-2 down-move)
+	this->header_carries_d5     = false;  // rx_btf=-1 regime (robust/no-D5): NO wired count backstop
+	this->compression_enabled   = false;  // byte-exact no-compression delivery leg
+	this->encryption_enabled    = false;
+	this->passive_monitor       = false;
+	this->link_status           = CONNECTED;
+	this->connection_status     = RECEIVING;
+	this->rsp_deferred_batch_shrink = -1;
+
+	const int OLD_BATCH = 25, NEW_BATCH = 8, CUR_BSI = 7, L = 16;
+	this->data_batch_size = OLD_BATCH;
+
+	// Byte oracle: frame i carries bytes [i*16 + 0 .. i*16 + 15].
+	auto frame_bytes = [&](int i, char* out) {
+		for(int j=0;j<L;j++) out[j] = (char)(unsigned char)(i*16 + j);
+	};
+	char tx_prefix[OLD_BATCH * L];
+	for(int i=0;i<OLD_BATCH;i++) frame_bytes(i, &tx_prefix[i*L]);
+
+	// Seat a COMPLETE current batch (messages_rx[]): slots [0,OLD) all RECEIVED with
+	// the oracle bytes. No prev active. EOB frame (slot OLD-1) received -> true span=OLD.
+	for(int i=0;i<this->nMessages;i++)
+	{
+		messages_rx[i].status = FREE;      messages_rx[i].length = 0;      messages_rx[i].batch_seq_id = -1;
+		messages_rx_prev[i].status = FREE; messages_rx_prev[i].length = 0; messages_rx_prev[i].batch_seq_id = -1;
+	}
+	for(int i=0;i<OLD_BATCH;i++)
+	{
+		char b[L]; frame_bytes(i, b);
+		messages_rx[i].type            = DATA_SHORT;
+		messages_rx[i].id              = (char)(unsigned char)i;
+		messages_rx[i].length          = L;
+		memcpy(messages_rx[i].data, b, L);
+		messages_rx[i].status          = RECEIVED;
+		messages_rx[i].batch_seq_id    = CUR_BSI;
+		messages_rx[i].sequence_number = (char)(unsigned char)i;
+	}
+	this->rsp_current_expected_batch_seq_id = CUR_BSI;
+	this->rsp_last_delivered_batch_seq_id   = (CUR_BSI - 1) & 0xFF;   // contiguous: no D3.1 gap
+	this->rsp_prev_batch_seq_id             = -1;
+	this->rsp_prev_batch_active             = false;
+	this->rsp_prev_batch_received_count     = 0;
+	this->rsp_prev_batch_expected_count     = 0;
+	this->last_received_end_of_batch_seq    = OLD_BATCH - 1;   // EOB decoded -> true span=OLD
+	this->rx_batch_total_frames             = -1;              // rx_btf=-1 (no D5 wired count)
+	this->batch_rx_frame_count              = OLD_BATCH;
+
+	// (1) Fire the REAL shrink chokepoint mid-batch (the demote/down-move).
+	set_data_batch_size(NEW_BATCH);
+	int dbs_after_shrink = this->data_batch_size;
+
+	// (2) Fire the REAL seal producer (a higher-bsi frame arrived -> transfer current->prev).
+	bump_bsi_and_transfer_prev();
+	int got_expected = this->rsp_prev_batch_expected_count;
+	int got_received = this->rsp_prev_batch_received_count;
+
+	// (3) REAL completion gate + REAL delivery (production pointer-swap, arq_responder.cc:1287).
+	bool delivered = false;
+	if(this->rsp_prev_batch_active
+	   && this->rsp_prev_batch_received_count >= this->rsp_prev_batch_expected_count)
+	{
+		struct st_message* saved_rx = messages_rx;
+		messages_rx = messages_rx_prev;
+		for(int i=0;i<this->data_batch_size && i<this->nMessages;i++)
+			if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+		decrypt_delivered_bsi = this->rsp_prev_batch_seq_id;
+		copy_data_to_buffer();                 // REAL reassembler -> fifo_buffer_rx
+		messages_rx = saved_rx;
+		for(int i=0;i<this->nMessages;i++) messages_rx_prev[i].status = FREE;
+		this->rsp_prev_batch_active         = false;
+		this->rsp_prev_batch_received_count = 0;
+		this->rsp_prev_batch_expected_count = 0;
+		advance_last_delivered(this->rsp_prev_batch_seq_id);
+		delivered = true;
+	}
+
+	char drained[OLD_BATCH * L];
+	int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+	bool faithful_full = (popped == OLD_BATCH*L)
+		&& (memcmp(drained, tx_prefix, OLD_BATCH*L) == 0);
+	bool truncated_new = (popped == NEW_BATCH*L)
+		&& (memcmp(drained, tx_prefix, NEW_BATCH*L) == 0);
+
+	printf("[TEST-SHRINK-CUR] dbs %d->%d (shrink %s) bump: prev_expected=%d received=%d; "
+		"delivered=%d popped=%dB faithful_full=%d truncated_new=%d\n",
+		OLD_BATCH, dbs_after_shrink, (dbs_after_shrink==OLD_BATCH)?"DEFERRED":"APPLIED",
+		got_expected, got_received, delivered?1:0, popped, faithful_full?1:0, truncated_new?1:0);
+	fflush(stdout);
+
+	if(defeat)
+	{
+		// fail-before: the orphaning shrink APPLIED -> the seal truncated the batch ->
+		// the [NEW,OLD) tail was silently dropped.
+		if(dbs_after_shrink != NEW_BATCH) {
+			printf("[TEST-SHRINK-CUR] FAIL(defeat): shrink did not apply (dbs=%d want %d)\n",
+				dbs_after_shrink, NEW_BATCH); fails++;
+		}
+		if(faithful_full || !truncated_new) {
+			printf("[TEST-SHRINK-CUR] FAIL(defeat): did not reproduce the silent %d-frame "
+				"tail-drop (popped=%dB)\n", OLD_BATCH-NEW_BATCH, popped); fails++;
+		}
+	}
+	else
+	{
+		// pass-after (fix): the orphaning shrink was DEFERRED (dbs held OLD), the full
+		// OLD-span batch sealed + delivered byte-exact; zero tail bytes lost.
+		if(dbs_after_shrink != OLD_BATCH) {
+			printf("[TEST-SHRINK-CUR] FAIL(fix): orphaning shrink NOT deferred (dbs=%d want %d)\n",
+				dbs_after_shrink, OLD_BATCH); fails++;
+		}
+		if(this->rsp_deferred_batch_shrink != NEW_BATCH) {
+			printf("[TEST-SHRINK-CUR] FAIL(fix): deferred target not recorded (%d want %d)\n",
+				this->rsp_deferred_batch_shrink, NEW_BATCH); fails++;
+		}
+		if(got_expected != OLD_BATCH) {
+			printf("[TEST-SHRINK-CUR] FAIL(fix): prev_expected=%d (want %d — full span)\n",
+				got_expected, OLD_BATCH); fails++;
+		}
+		if(!delivered || !faithful_full) {
+			printf("[TEST-SHRINK-CUR] FAIL(fix): not faithful (delivered=%d popped=%dB want %dB)\n",
+				delivered?1:0, popped, OLD_BATCH*L); fails++;
+		}
+	}
+
+	deinit_messages_buffers();
+	printf("[TEST-SHRINK-CUR] %s: fails=%d (defeat=%d)\n",
+		fails==0 ? "ALL PASS" : "FAILURES", fails, defeat?1:0);
+	fflush(stdout);
+	return fails==0 ? 0 : 1;
 }
 
 // ============================================================================

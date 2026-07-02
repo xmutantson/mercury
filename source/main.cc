@@ -2183,6 +2183,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_shrink;
                 failed += ARQ_shrink.test_batch_shrink_orphan_defer();
             }
+            // rx_btf=-1 CURRENT-batch SHRINK tail-drop (silent-corruption-marginal-snr.md):
+            // the messages_rx[] sibling of the Fix A prev guard above — a mid-flight
+            // data_batch_size shrink orphans RECEIVED current-batch frames the next seal
+            // silently drops (the marginal-SNR WGN:25 mid-stream truncation, md5 FALSE).
+            // Drives the REAL shrink chokepoint + seal + prev gate + copy_data_to_buffer;
+            // asserts byte-exact full delivery. Pass-after arm (DEFEAT env = fail-before).
+            {
+                cl_arq_controller ARQ_shrcur;
+                failed += ARQ_shrcur.test_batch_shrink_orphan_current();
+            }
             // Streaming decompress-failure SILENT-FALSE-ACCEPT (residual-silent-
             // corruption-wgn25.md): the THIRD WGN:25 trigger — a streaming PPMd model
             // desync under out-of-order SACK delivery makes a COMPLETE, CRC-clean batch
@@ -3697,6 +3707,9 @@ int main(int argc, char *argv[])
     bool test_batchsize_desync_cli = false; // --test-batchsize-desync: res_c3100 CMD>RSP batch-size desync
                                         // silent-corruption regression (silent-corruption-residual.md §8).
                                         // fail-before via MERCURY_BATCHSIZE_DESYNC_DEFEAT=1.
+    bool test_batch_shrink_orphan_current_cli = false; // --test-batch-shrink-orphan-current: rx_btf=-1
+                                        // current-batch shrink tail-drop (marginal-SNR silent corruption).
+                                        // fail-before via MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1, pass-after defers.
     bool test_eob_loss_batch_truncation_cli = false; // --test-eob-loss-batch-truncation: D5 — EOB-inference
     bool test_dedup_rebase_cli = false; // --test-dedup-rebase: in-band demote-rebase double-delivery
                                         // (byte-stream corruption) regression. fail-before via
@@ -4878,6 +4891,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_batchsize_desync_delivery
             // + silent-corruption-residual.md §8. fail-before: MERCURY_BATCHSIZE_DESYNC_DEFEAT=1.
             test_batchsize_desync_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batch-shrink-orphan-current") == 0)
+        {
+            // rx_btf=-1 current-batch shrink tail-drop (marginal-SNR silent corruption) —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_batch_shrink_orphan_current
+            // + fact-documents/silent-corruption-marginal-snr.md.
+            test_batch_shrink_orphan_current_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6971,6 +6994,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_batchsize_desync_delivery();
             printf("[FLAG] batchsize-desync test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_batch_shrink_orphan_current_cli) {
+            // rx_btf=-1 current-batch shrink tail-drop (marginal-SNR silent corruption) (one-shot, exit rc).
+            printf("[FLAG] --test-batch-shrink-orphan-current: invoking rx_btf=-1 "
+                   "current-batch shrink tail-drop regression
+");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_orphan_current();
+            printf("[FLAG] batch-shrink-orphan-current test complete (rc=%d) — exiting.
+", rc);
             fflush(stdout);
             exit(rc);
         }

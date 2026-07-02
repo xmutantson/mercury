@@ -3360,6 +3360,14 @@ public:
   //   pass-after (default): the (B) backstop raises [RSP-V2-BATCHSIZE-DESYNC] and
   //     aborts (link DROPPED) -> nothing silently delivered. Returns 0=PASS, 1=FAIL.
   int test_batchsize_desync_delivery();
+  // rx_btf=-1 CURRENT-batch SHRINK tail-drop — the marginal-SNR (WGN:25) silent
+  // corruption. A mid-flight data_batch_size shrink orphans RECEIVED current-batch
+  // (messages_rx[]) frames that the next seal then silently drops (defer_shrink
+  // guarded only messages_rx_prev[]). Drives the REAL set_data_batch_size chokepoint,
+  // bump_bsi_and_transfer_prev producer, prev count gate + copy_data_to_buffer, and
+  // fifo_buffer_rx as a byte oracle. Env MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1 reverts
+  // the fix (fail-before). Returns 0=PASS, 1=FAIL. See silent-corruption-marginal-snr.md.
+  int test_batch_shrink_orphan_current();
 
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------

@@ -1734,19 +1734,38 @@ bool cl_arq_controller::defer_shrink_if_would_orphan_prev(int target)
 	{ const char* e = std::getenv("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT");
 	  if(e && *e && atoi(e)!=0) return false; }   // fail-before: apply the orphaning shrink
 	if(!sack_v2_enabled)         return false;
-	if(!rsp_prev_batch_active)   return false;
-	if(messages_rx_prev == NULL) return false;
 	int old_batch = this->data_batch_size;
 	if(target >= old_batch)      return false;     // not a shrink -> nothing to orphan
+	// Count already-RECEIVED frames the shrink would strand in [new,old). BOTH stores
+	// are checked:
+	//   • messages_rx_prev[] — the sealed prev batch (Fix A, baseline-double-delivery.md):
+	//     it is delivered bounded by the LIVE data_batch_size, so a shrink drops [new,old).
+	//   • messages_rx[]      — the CURRENT batch (silent-corruption-marginal-snr.md §2): the
+	//     rx_btf=-1 sibling Fix A missed. A mid-flight shrink (WB->robust demote / Axis-2
+	//     down-move at a marginal SNR patch) strands RECEIVED current-batch frames in
+	//     [new,old); bump_bsi_and_transfer_prev() then transfers only [0,data_batch_size)
+	//     into the prev and FREEs the source -> the [new,old) tail (real in-order user bytes)
+	//     is silently dropped, prev_expected collapses to `new` (no wired D5 count at a
+	//     robust config to re-derive the true span), the count gate fires, and the delivered
+	//     app stream is truncated mid-stream with NO gap-abort (the WGN:25 md5-FALSE
+	//     signature). DEFER until the current batch delivers/seals at its framed span.
 	int orphaned = 0;
-	for(int i = target; i < old_batch && i < this->nMessages; i++)
-		if(messages_rx_prev[i].status == RECEIVED) orphaned++;
-	if(orphaned <= 0)            return false;      // shrink is safe (no RECEIVED in [new,old))
-	// DEFER: hold data_batch_size at old_batch; remember the requested target.
+	if(rsp_prev_batch_active && messages_rx_prev != NULL)
+		for(int i = target; i < old_batch && i < this->nMessages; i++)
+			if(messages_rx_prev[i].status == RECEIVED) orphaned++;
+	int orphaned_cur = 0;
+	if(messages_rx != NULL)
+		for(int i = target; i < old_batch && i < this->nMessages; i++)
+			if(messages_rx[i].status == RECEIVED) orphaned_cur++;
+	if(orphaned + orphaned_cur <= 0) return false;  // shrink is safe (no RECEIVED in [new,old))
+	// DEFER: hold data_batch_size at old_batch; remember the requested target. Applied at the
+	// prev-deliver completion sites AND the in-order BATCH-DONE delivery, the instant the
+	// held batch clears (rsp_apply_deferred_batch_shrink).
 	rsp_deferred_batch_shrink = target;
-	printf("[RSP-V2-SHRINK-DEFER] deferring data_batch_size %d->%d: prev bsi=%d active would "
-		"orphan %d already-RECEIVED slot(s) in [%d,%d) — held until prev delivers (Fix A)\n",
-		old_batch, target, rsp_prev_batch_seq_id, orphaned, target, old_batch);
+	printf("[RSP-V2-SHRINK-DEFER] deferring data_batch_size %d->%d: would orphan %d prev + "
+		"%d current already-RECEIVED slot(s) in [%d,%d) — held until the batch delivers "
+		"(Fix A + rx_btf=-1 current-batch guard)\n",
+		old_batch, target, orphaned, orphaned_cur, target, old_batch);
 	fflush(stdout);
 	return true;
 }
@@ -13284,6 +13303,30 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	}
 	if(prev_expected < 1) prev_expected = 1;
 	if(prev_expected > this->nMessages) prev_expected = this->nMessages;
+
+	// silent-corruption-marginal-snr.md §3 — LOUD seal-orphan detector (charter:
+	// "a silent-false-accept must become a loud detect"). The transfer below is bounded
+	// by data_batch_size; any RECEIVED current-batch slot in [data_batch_size,nMessages)
+	// is a real in-order frame this seal is about to STRAND (a mid-flight shrink that
+	// slipped past defer_shrink_if_would_orphan_prev). With the current-batch shrink
+	// guard this can no longer happen; this assertion is a regression alarm that turns a
+	// silent tail-drop into a diagnosable [RSP-V2-SEAL-ORPHAN] event. Log-only (delivery
+	// unchanged) so it can never itself regress the data plane.
+	if(messages_rx != NULL)
+	{
+		int stranded = 0, hi = -1;
+		for(int i = this->data_batch_size; i < this->nMessages; i++)
+			if(messages_rx[i].status == RECEIVED) { stranded++; hi = i; }
+		if(stranded > 0)
+		{
+			printf("[RSP-V2-SEAL-ORPHAN] WARNING: sealing bsi=%d with %d RECEIVED "
+				"current-batch slot(s) stranded beyond data_batch_size=%d (highest=%d) — "
+				"a mid-flight shrink orphaned real in-order bytes (would silently truncate "
+				"the delivered stream). Investigate defer_shrink_if_would_orphan_prev.\n",
+				rsp_current_expected_batch_seq_id, stranded, this->data_batch_size, hi);
+			fflush(stdout);
+		}
+	}
 
 	// Transfer (not copy) batch-N content from messages_rx → messages_rx_prev:
 	// memcpy the payload, copy the metadata, then free the source slot.
