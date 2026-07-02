@@ -4369,27 +4369,70 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									fflush(stdout);
 									mfsk_handled_this_poll = true;
 
-									// SUPER-ACK (SUPERACK_DESIGN.md §2.4): this CLEAN reverse ACK truly arrived
-									// (gate 1). The RSP may have ridden a SUPER-ACK skip recommendation ON TOP of
-									// it (a typed type-6 suffix on the SAME robust carrier). Try the SUPER-ACK arm
-									// ONLY now (a real ACK is confirmed), decode+fail-safe it, and on accept LEAP
-									// DIRECTLY to the recommended WB config (bypassing the dead is_ofdm_config SNR
-									// gate). ANY fail-safe gate miss -> the frame stays this NORMAL clean ACK (+1),
-									// NEVER a spurious jump. No-op when the feature is off.
-									if(inband_rate_feature_enabled())
+									// SUPER-ACK inline suffix (data-flow-superack.md sec 9, ROOT 2): the RSP appended a
+									// SHORT skip-target tone group to THIS clean ACK burst; decode it from the SAME
+									// capture the base ACK+SACK was just read from (both decode paths snapshot the
+									// de-hopped tones). superack_decode_tones REJECTS any mis-read (redundancy +
+									// checksum) -> no leap -> ordinary +1 (D0 fail-safe). Bound to THIS clean ACK bsi
+									// (rx_bsi, no wire bsi); leap gates live in inband_handle_superack.
+									if(inband_rate_feature_enabled() && is_robust_config(current_configuration))
 									{
-										int sa_skip_target = -1;
-										uint8_t sa_bsi_lsb = 0, sa_conf = 0, sa_parity = 0;
-										if(inband_decode_superack_from_capture(&sa_skip_target, &sa_bsi_lsb,
-											&sa_conf, &sa_parity) == 1)
+										int sa_last_m = -1;   // last capture-extension re-decode base-match (diag)
+										// Capture extension (data-flow-superack.md sec 9.4): the inline SUPER-ACK tones air
+										// ~SUPERACK_SUFFIX_LEN symbols AFTER the base+coded SACK the CMD just locked CLEAN on,
+										// so on the CLEAN-lock poll they can trail JUST past the capture (capture_valid=0).
+										// Give the reverse ring a BOUNDED extra window to accumulate them (the audio capture
+										// thread keeps filling passband_delayed_data during pumped_settle_wait), then re-decode
+										// from a fresh tail snapshot. Only THIS CMD turnaround is delayed; the base-ACK /
+										// reverse-pin detection already happened (HARD constraint preserved). Bounded (<=240 ms)
+										// so a plain ACK with no SUPER-ACK can never stall.
+										if(!telecom_system->ack_mfsk.last_superack_capture_valid)
 										{
-											printf("[CMD-SUPERACK] decoded SUPER-ACK skip_target=CONFIG_%d bsi_lsb=%u "
-												"conf=%u parity=%u -- applying fail-safe leap policy\n",
-												sa_skip_target, (unsigned)sa_bsi_lsb, (unsigned)sa_conf,
-												(unsigned)sa_parity);
+											const int SA_EXT_TRIES = 24;
+											const int SA_EXT_MS = 35;   // <=840ms bounded
+											for(int sa_try = 0; sa_try < SA_EXT_TRIES
+												&& !telecom_system->ack_mfsk.last_superack_capture_valid; sa_try++)
+											{
+												pumped_settle_wait(SA_EXT_MS);   // let the reverse ring accumulate the trailing tones
+												MUTEX_LOCK(&capture_prep_mutex);
+												int rwi_sa = telecom_system->data_container.ring_write_index;
+												memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+													&telecom_system->data_container.passband_delayed_data[rwi_sa + tail_offset],
+													tail_samples * sizeof(double));
+												MUTEX_UNLOCK(&capture_prep_mutex);
+												uint8_t sa_rb = 0; uint32_t sa_rbm = 0; uint16_t sa_rc = 0; int sa_m = 0;
+												(void)telecom_system->decode_ack_sack_from_passband(
+													telecom_system->data_container.ready_to_process_passband_delayed_data,
+													tail_samples, &sa_rb, &sa_rbm, &sa_rc, &sa_m);
+											sa_last_m = sa_m;
+											}
+											if(telecom_system->ack_mfsk.last_superack_capture_valid) {
+												printf("[CMD-SUPERACK] capture-extended: inline suffix arrived after CLEAN-lock\n");
+												fflush(stdout);
+											}
+										}
+										bool sa_cap = telecom_system->ack_mfsk.last_superack_capture_valid;
+										int sa_ladder = sa_cap
+											? telecom_system->ack_mfsk.superack_decode_tones(
+												telecom_system->ack_mfsk.last_superack_suffix_tones)
+											: -1;
+										telecom_system->ack_mfsk.last_superack_capture_valid = false;  // one-shot
+										int sa_cfg = (sa_ladder >= 0 && sa_ladder < FULL_CONFIG_LADDER_SIZE)
+											? FULL_CONFIG_LADDER[sa_ladder] : -1;
+										if(sa_cfg >= 0 && is_ofdm_config(sa_cfg))
+										{
+											printf("[CMD-SUPERACK] decoded INLINE SUPER-ACK skip_target=CONFIG_%d "
+												"(ladder=%d) bound to clean bsi=%u -- applying fail-safe leap policy\n",
+												sa_cfg, sa_ladder, (unsigned)rx_bsi);
 											fflush(stdout);
-											if(inband_handle_superack(sa_skip_target, sa_bsi_lsb, sa_conf, sa_parity))
+											if(inband_handle_superack(sa_cfg, (uint8_t)(rx_bsi & 0x7), 0, 0))
 												mfsk_handled_this_poll = true;
+										}
+										else
+										{
+											printf("[CMD-SUPERACK] no inline leap this clean ACK "
+												"(capture_valid=%d decoded_ladder=%d ext_matched=%d)\n", sa_cap ? 1 : 0, sa_ladder, sa_last_m);
+											fflush(stdout);
 										}
 									}
 								}

@@ -189,7 +189,12 @@ public:
 	// TX: ACK base + 13-symbol ACK+SACK suffix carrying
 	// [bsi:8 | bitmap:32 | crc12:12]. Returns samples written, or 0 if
 	// unsupported (NB / M<16). Caller supplies the crc12.
-	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12);
+	// superack_ladder_idx (optional): when >=0, a SUPER-ACK inline suffix
+	// (SUPERACK_SUFFIX_LEN tones carrying that config-ladder index) is appended after
+	// the SACK suffix in the SAME burst (data-flow-superack.md §9). Returns the actual
+	// passband sample count written (LONGER than ack_sack_pattern_passband_samples when
+	// a suffix is present) so the caller sizes tx_transfer correctly. -1 -> legacy.
+	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12, int superack_ladder_idx = -1);
 	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr);  // RX: returns metric
 	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	// RX: detect ACK pattern and decode the 40-bit ACK+SACK suffix (WB M>=16

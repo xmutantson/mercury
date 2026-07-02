@@ -2565,7 +2565,39 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				}
 				if (!used_mfsk_path)
 				{
-					mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+					// SUPER-ACK inline suffix (data-flow-superack.md §9, ROOT 2): on a
+					// from-ROBUST clean data ACK with a comfortable LDPC margin, recommend
+					// an ABSOLUTE WB skip-target so the CMD leaps DIRECTLY (bypassing the
+					// dead is_ofdm_config SNR gate). Computed HERE so it rides as a SHORT
+					// tone suffix INLINE on the SAME ACK burst (one PTT) the CMD already
+					// detects+decodes, landing the ~1000x ROBUST->WB leap on THIS turnaround.
+					// (ROOT 2: the old SEPARATE burst aired ~0.77 s AFTER the CMD had already
+					// turned around, so it was never captured.) ROBUST-only (a WB config's
+					// turbo elevator refines rate on real SNR); WB M>=16; no-op off-feature.
+					// Bound to the clean-ACK bsi by the CMD (no bsi on the wire).
+					int superack_ladder_idx = -1;
+					if (inband_rate_feature_enabled()
+					    && is_robust_config(current_configuration)
+					    && telecom_system != NULL
+					    && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
+					{
+						int niter_max = telecom_system->ldpc.nIteration_max;
+						int iters = telecom_system->receive_stats.iterations_done;
+						uint8_t sa_conf = 0;
+						int sa_target = superack_target_from_margin(iters, niter_max, &sa_conf);
+						if (sa_target >= 0
+						    && config_ladder_index(sa_target)
+						         > config_ladder_index(current_configuration))
+						{
+							superack_ladder_idx = config_ladder_index(sa_target);
+							printf("[RSP-SUPERACK] clean ROBUST decode (iters=%d/max=%d) -> "
+								"recommend CONFIG_%d (conf=%u ladder=%d) INLINE on ACK bsi_lsb=%u\n",
+								iters, niter_max, sa_target, (unsigned)sa_conf,
+								superack_ladder_idx, (unsigned)(wire_bsi & 0x7));
+							fflush(stdout);
+						}
+					}
+					mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32, superack_ladder_idx);
 				}
 				if (mfsk_ms > 0)
 				{
@@ -2579,37 +2611,6 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				{
 					printf("[RSP-MFSK-SACK] MFSK suffix returned 0 — falling back to legacy MFSK ACK pattern\n");
 					fflush(stdout);
-				}
-				// SUPER-ACK (SUPERACK_DESIGN.md): the RSP just CLEANLY decoded a data
-				// batch on the reverse robust layer. If we are on a ROBUST config (the
-				// ~1000x ROBUST->WB climb-binding tier) AND the LDPC decode margin is
-				// comfortable, EMIT a SUPER-ACK carrying the recommended ABSOLUTE WB
-				// target -- the CMD leaps directly to it (bypassing the dead is_ofdm_config
-				// SNR gate). Rides ON TOP of the clean ACK/SACK just sent (gate-1: a real
-				// ACK truly arrived). ROBUST-only: on a WB config the OFDM turbo elevator
-				// already refines the rate on a real per-subcarrier SNR, so the SUPER-ACK's
-				// job is purely the from-ROBUST unblock. No-op off-feature.
-				if (used_mfsk_path
-				    && inband_rate_feature_enabled()
-				    && is_robust_config(current_configuration))
-				{
-					int niter_max = (telecom_system != NULL)
-						? telecom_system->ldpc.nIteration_max : 200;
-					int iters = (telecom_system != NULL)
-						? telecom_system->receive_stats.iterations_done : -1;
-					uint8_t sa_conf = 0;
-					int sa_target = superack_target_from_margin(iters, niter_max, &sa_conf);
-					if (sa_target >= 0
-					    && config_ladder_index(sa_target)
-					         > config_ladder_index(current_configuration))
-					{
-						printf("[RSP-SUPERACK] clean ROBUST decode (iters=%d/max=%d) -> "
-							"recommend CONFIG_%d (conf=%u) for bsi_lsb=%u\n",
-							iters, niter_max, sa_target, (unsigned)sa_conf,
-							(unsigned)(wire_bsi & 0x7));
-						fflush(stdout);
-						inband_emit_superack(sa_target, (uint8_t)(wire_bsi & 0x7), sa_conf);
-					}
 				}
 			}
 			if (!used_mfsk_path)
@@ -6300,6 +6301,62 @@ int cl_arq_controller::test_inband_superack()
 
 		delete cmd; delete ts;
 	}
+	// ========================================================================
+	// CASE 6 - the SUPER-ACK INLINE-SUFFIX codec (data-flow-superack.md sec 9, ROOT 2).
+	// superack_encode_tones -> superack_decode_tones must round-trip every valid
+	// config-ladder index, and REJECT (-> -1) a corrupted/absent capture (D0
+	// fail-safe: garbage -> no leap -> the ordinary +1). This is the wire-format
+	// unit test; the full RSP->CMD inline round-trip is the leap-smoke follow-on.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cl_mfsk& mf = ts->ack_mfsk;   // WB session -> M>=16
+		if(mf.M < 16) mf.M = 16;      // defensive: the codec only reads M
+
+		// (a) round-trip every config-ladder index 0..31.
+		bool rt_ok = true;
+		for(int idx = 0; idx <= 31; idx++) {
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			mf.superack_encode_tones(idx, t);
+			if(mf.superack_decode_tones(t) != idx) { rt_ok = false; break; }
+		}
+		check(rt_ok, "C6a superack encode->decode round-trips every ladder index 0..31",
+			rt_ok ? 1 : 0, 1);
+
+		// (b) a SINGLE tone error in a majority-of-3 field still decodes.
+		{
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			mf.superack_encode_tones(11, t);
+			t[3] = (t[3] + 7) & 0xF;   // corrupt ONE of the 3 lo-nibble copies
+			check(mf.superack_decode_tones(t) == 11,
+				"C6b single-tone error in a redundant field still decodes (majority)",
+				mf.superack_decode_tones(t), 11);
+		}
+
+		// (c) corrupt the index (>=2 copies) so the checksum no longer matches -> REJECT.
+		{
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			mf.superack_encode_tones(11, t);
+			int bad = (t[0] + 1) & 0xF;
+			t[0] = bad; t[3] = bad;    // majority lo now wrong; transmitted chk is for 11
+			check(mf.superack_decode_tones(t) < 0,
+				"C6c corrupted index (checksum mismatch) -> REJECT (fail-safe, no leap)",
+				mf.superack_decode_tones(t) < 0 ? 1 : 0, 1);
+		}
+
+		// (d) an absent suffix (all -1: a plain ACK with no SUPER-ACK) -> REJECT.
+		{
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			for(int i = 0; i < cl_mfsk::SUPERACK_SUFFIX_LEN; i++) t[i] = -1;
+			check(mf.superack_decode_tones(t) < 0,
+				"C6d absent suffix (all -1) -> REJECT (plain ACK never spuriously leaps)",
+				mf.superack_decode_tones(t) < 0 ? 1 : 0, 1);
+		}
+
+		delete cmd; delete ts;
+	}
+
 
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);

@@ -4120,10 +4120,22 @@ int cl_telecom_system::generate_ack_snr_pattern_passband(double* out, float snr)
 // of passband samples written, or 0 if unsupported (NB / M<16). See
 // mercury/fact-documents/mfsk-robust-ack.md §3.2.
 int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
-	uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12)
+	uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12, int superack_ladder_idx)
 {
 	if(ack_sack_pattern_passband_samples <= 0) return 0;
 	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;  // NB unsupported
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): when a skip-target ladder
+	// index is supplied, encode it into SUPERACK_SUFFIX_LEN tones that generate_ack_
+	// sack_pattern appends after the SACK suffix, and lengthen nsymb so the SAME burst
+	// carries them (one PTT). -1 -> legacy byte-identical (superack_tones stays null).
+	int superack_tones_buf[cl_mfsk::SUPERACK_SUFFIX_LEN];
+	const int* superack_tones = nullptr;
+	if(superack_ladder_idx >= 0)
+	{
+		ack_mfsk.superack_encode_tones(superack_ladder_idx, superack_tones_buf);
+		superack_tones = superack_tones_buf;
+	}
 
 	// REVSACK Part A: when the ACK suffix is coded, gf16ra is process-global — pin the
 	// repfact to the ACK value (3, N=52) for BOTH ack_sack_pattern_nsymb() (which reads
@@ -4143,13 +4155,16 @@ int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
 		}
 	}
 
-	int nsymb = ack_mfsk.ack_sack_pattern_nsymb();
+	int nsymb = superack_tones ? ack_mfsk.ack_sack_superack_pattern_nsymb()
+	                           : ack_mfsk.ack_sack_pattern_nsymb();
+	int out_samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	// Generate subcarrier-domain ACK+SACK pattern (nsymb * Nc complex values).
-	// ofdm_framed_data is sized for max(Nsymb, 48) symbols × Nc — 29 fits easily.
+	// ofdm_framed_data is sized for max(Nsymb, 48) symbols × Nc — 29 (or 37 with the
+	// SUPER-ACK suffix) fits easily.
 	ack_mfsk.generate_ack_sack_pattern(data_container.ofdm_framed_data,
-		batch_seq_id, bitmap, crc12);
+		batch_seq_id, bitmap, crc12, superack_tones);
 
 	// IFFT each symbol to time domain
 	for(int i = 0; i < nsymb; i++)
@@ -4172,8 +4187,9 @@ int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
 		data_container.Nofdm * nsymb, out,
 		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
 
-	// Peak clipping
-	ofdm.peak_clip(out, ack_sack_pattern_passband_samples, ofdm.data_papr_cut);
+	// Peak clipping (over the ACTUAL length written — longer when the SUPER-ACK
+	// suffix is present).
+	ofdm.peak_clip(out, out_samples, ofdm.data_papr_cut);
 
 	// REVSACK Part A: restore the gf16ra global so a later CONFIG_TAG(2)/CONNECT(3)
 	// consumer is not corrupted (the §5 cross-layer guard).
@@ -4184,7 +4200,7 @@ int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
 		gf16ra::init();
 	}
 
-	return ack_sack_pattern_passband_samples;
+	return out_samples;
 }
 
 // Option B (data-flow-compact-confirm.md): TX the compact coded reverse confirm
@@ -4232,6 +4248,10 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	int* out_matched, bool* out_snr_valid)
 {
 	*out_snr_valid = false;
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): fresh-per-call. Only set
+	// true below when the trailing SUPER-ACK tones are cleanly captured, so a stale
+	// capture can never be re-read by the CMD's CLEAN handler.
+	ack_mfsk.last_superack_capture_valid = false;
 	if(ack_pattern_passband_samples <= 0) return -99.0f;
 
 	// Polyphase decimated path: mix + FIR + decimate fused.
@@ -4334,6 +4354,12 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	int sack_suffix_len = ack_mfsk.ack_sack_suffix_len();
 	int capture_len = cl_mfsk::SNR_SUFFIX_LEN;
 	if (sack_suffix_len > capture_len) capture_len = sack_suffix_len;
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): also capture the
+	// SUPERACK_SUFFIX_LEN tones that follow the SACK suffix so the CMD can decode the
+	// skip-target inline. Absent on a plain ACK (no cost — decode_suffix_tones fills
+	// past-pattern tones with noise/-1, which superack_decode_tones rejects).
+	int superack_end = ack_mfsk.ack_sack_coded_suffix_len() + cl_mfsk::SUPERACK_SUFFIX_LEN;
+	if (superack_end > capture_len) capture_len = superack_end;
 	if (capture_len > cl_mfsk::MAX_ACK_SACK_SUFFIX)
 		capture_len = cl_mfsk::MAX_ACK_SACK_SUFFIX;
 	int suffix_tones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
@@ -4367,6 +4393,25 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 		for (int i = sack_suffix_len; i < cl_mfsk::MAX_ACK_SACK_SUFFIX; i++)
 			ack_mfsk.last_ack_sack_suffix_tones[i] = -1;
 		ack_mfsk.last_ack_sack_capture_valid = clean;
+	}
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): snapshot the
+	// SUPERACK_SUFFIX_LEN de-hopped tones that FOLLOW the SACK suffix (offset =
+	// ack_sack_coded_suffix_len()) so the CMD's CLEAN handler decodes the inline
+	// skip-target from THIS same capture (mirror of the SNR-suffix path). Valid only
+	// when all SUPERACK_SUFFIX_LEN tones decoded cleanly (0..M-1); a plain ACK (no
+	// SUPER-ACK) leaves these as noise/-1 -> last_superack_capture_valid=false OR
+	// superack_decode_tones rejects them (D0 fail-safe).
+	{
+		int sbase = ack_mfsk.ack_sack_coded_suffix_len();
+		bool svalid = (sbase > 0);
+		for (int i = 0; i < cl_mfsk::SUPERACK_SUFFIX_LEN; i++) {
+			int si = sbase + i;
+			int tv = (si >= 0 && si < capture_len) ? suffix_tones[si] : -1;
+			ack_mfsk.last_superack_suffix_tones[i] = tv;
+			if (tv < 0 || tv >= ack_mfsk.M) svalid = false;
+		}
+		ack_mfsk.last_superack_capture_valid = svalid;
 	}
 
 	// Majority vote: find most common tone among the 8 suffix symbols
@@ -4582,6 +4627,32 @@ bool cl_telecom_system::decode_ack_sack_coded_trybooth(double* data, int size,
 		gf16ra::configure(saved_repfact);
 		gf16ra::init();
 	}
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): on a CLEAN coded ACK decode,
+	// snapshot the SUPERACK_SUFFIX_LEN tones that FOLLOW the coded SACK suffix (offset =
+	// ack_pattern_nsymb + ack_sack_coded_suffix_len(), continuing the SAME tone-hop) so the
+	// CMD's CLEAN handler decodes the inline skip-target from THIS capture. The coded
+	// try-both path bypasses detect_ack_snr_from_passband (where the uncoded path
+	// snapshots), so on the CODED ROBUST ACK — which is what a climbed/robust rung uses —
+	// it MUST snapshot here or the SUPER-ACK never lands (ROOT 2 sub-cause). Valid only
+	// when all 8 tones decode cleanly (0..M-1); superack_decode_tones rejects otherwise
+	// (D0 fail-safe). Uses decode_suffix_tones (no gf16ra dependency), so it runs after the
+	// global restore.
+	if (ok) {
+		int sofs = ack_mfsk.ack_pattern_nsymb + ack_mfsk.ack_sack_coded_suffix_len();
+		int satones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+		ofdm.decode_suffix_tones(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			best_offset, sofs, cl_mfsk::SUPERACK_SUFFIX_LEN,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets, satones);
+		bool svalid = true;
+		for (int i = 0; i < cl_mfsk::SUPERACK_SUFFIX_LEN; i++) {
+			ack_mfsk.last_superack_suffix_tones[i] = satones[i];
+			if (satones[i] < 0 || satones[i] >= ack_mfsk.M) svalid = false;
+		}
+		ack_mfsk.last_superack_capture_valid = svalid;
+	}
 	return ok;
 }
 
@@ -4600,6 +4671,14 @@ bool cl_telecom_system::decode_ack_sack_from_passband(double* data, int size,
 	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // NB / unsupported
 	if (out_bsi == nullptr || out_bitmap == nullptr || out_crc12 == nullptr)
 		return false;
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): fresh-per-call. BOTH decode
+	// paths snapshot the trailing SUPER-ACK tones when they capture cleanly — the CODED
+	// try-both path (decode_ack_sack_coded_trybooth, on the coded ROBUST ACK) and the
+	// uncoded path (detect_ack_snr_from_passband, below). Clear it here up front so a
+	// decode that finds no clean suffix never leaves a STALE capture for the CMD's CLEAN
+	// handler to re-read.
+	ack_mfsk.last_superack_capture_valid = false;
 
 	// REVSACK Part A (revsack/design.json): CODED TRY-BOTH data-ACK+SACK decode. When
 	// ack_suffix_fec_coded is set (the climbed-OFDM-rung ACK FEC enable) the reverse

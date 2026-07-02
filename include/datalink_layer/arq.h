@@ -716,7 +716,12 @@ public:
   // (NB session, M < 16, or compile-time gate MFSK_ACK_SACK_ENABLED=0).
   // Computes CRC12 over [bsi || bitmap] internally and emits the 16-symbol
   // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:32 | crc12:12].
-  long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap);
+  // superack_ladder_idx (optional): when >=0, a SUPER-ACK inline suffix carrying
+  // that config-ladder skip-target is appended within the SAME ACK burst (one PTT),
+  // so the from-ROBUST rate-UP leap lands on the SAME turnaround the CMD detects the
+  // clean ACK (data-flow-superack.md §9, ROOT 2). -1 -> legacy ACK+SACK only.
+  long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap,
+                               int superack_ladder_idx = -1);
 
   // Option B (data-flow-compact-confirm.md): emit the COMPACT coded reverse
   // confirm for a CLEAN (all-ones) batch — ACK base (16) + K=5 GF(16)-RA

@@ -365,3 +365,158 @@ rides as a PREFIX ahead of the base ACK so it lands inside the CMD's ACK-detecti
 (risks the shipped base-ACK pattern timing — must be validated). The §8 gate is a NECESSARY
 precondition (it stabilizes the config so a fixed suffix path has clean reverse ACKs to ride) and
 SHIPS; ROOT 2 is the next keystone.
+
+---
+
+## §9. ROOT 2 FIX — SUPER-ACK as a SHORT INLINE suffix on the base-ACK burst (implemented)
+
+ROOT 2 (§8.3): the SUPER-ACK was a SEPARATE ~1.58 s config-tag burst emitted AFTER
+`send_mfsk_ack_sack` had already played the base ACK to completion, so it aired ~0.77 s
+AFTER the CMD had already detected the clean ACK and turned around — never captured.
+The PROVEN transport precedent that DOES ride inline is the turbo SNR suffix
+(`send_ack_pattern_with_snr` -> `generate_ack_snr_pattern_passband`; CMD reads it in the
+SAME `detect_ack_snr_from_passband` call that detected the ACK): a SHORT (8-symbol) tone
+group appended after the ACK base, read by `decode_suffix_tones` at a fixed hop offset.
+
+The FIX mirrors that transport: the recommended WB skip-target rides as a SHORT
+`SUPERACK_SUFFIX_LEN = 8` tone group appended AFTER the SACK suffix in the SAME ACK burst
+(one PTT), decoded by the CMD from the SAME capture it detects the clean ACK from. No
+separate burst, no new PTT, no new FEC substrate. The old 55-tone config-tag transport is
+too long to ride inline (either it pushes the base ACK out of the CMD detect window, or it
+bloats the turnaround); the 8-tone suffix keeps the reverse ACK SHORT (~0.4 s add,
+ROBUST-only, transient until the leap).
+
+### §9.1 Wire format (the short inline suffix)
+- `superack_encode_tones(ladder_idx, out[8])` / `superack_decode_tones(in[8])` — `mfsk.cc`.
+  Carries the 5-bit config-LADDER index of the skip-target as: lo-nibble x3 (majority),
+  hi-bit x2 (agree), 4-bit checksum `chk=(idx*13+5)&0xF` x3 (majority). Decode requires a
+  majority for lo/chk, agreement for hi, in-range idx, AND `chk==checksum(idx)` — any
+  failure returns -1. NO bsi on the wire: the CMD binds to the bsi of the clean ACK the
+  suffix rides on (which it already decoded).
+- The tones continue the SAME tone-hop as the SACK suffix (`abs_s = ack_pattern_nsymb +
+  ack_sack_coded_suffix_len() + j`), so the RX de-hops them with the existing
+  `decode_suffix_tones` machinery.
+
+### §9.2 Changed sites (file:line, all mirror existing ACK/SNR/SACK suffix machinery)
+- `mfsk.h`: `SUPERACK_SUFFIX_LEN=8`; encode/decode decls; `ack_sack_superack_pattern_nsymb()`;
+  `generate_ack_sack_pattern` gains optional `const int* superack_tones`; new capture members
+  `last_superack_suffix_tones[8]` + `last_superack_capture_valid`.
+- `mfsk.cc`: `superack_encode_tones` + `superack_majority3` + `superack_decode_tones`;
+  `generate_ack_sack_pattern` appends the 8 superack tones after the SACK suffix when
+  `superack_tones != nullptr`; init the new members (ctor + `init()`).
+- `telecom_system.h/.cc`: `generate_ack_sack_pattern_passband` gains `int superack_ladder_idx
+  = -1` (encodes tones, lengthens `nsymb` to `ack_sack_superack_pattern_nsymb()`, returns the
+  ACTUAL sample count). `detect_ack_snr_from_passband`: resets `last_superack_capture_valid`
+  fresh-per-call, BUMPS `capture_len` to include the 8 tones, snapshots the de-hopped
+  SUPER-ACK tones after the SACK snapshot. `decode_ack_sack_from_passband`: resets the flag up
+  front (so the coded try-both path, which skips the SNR detector, can't leave a STALE capture).
+- `arq.h`/`arq_common.cc`: `send_mfsk_ack_sack` gains `int superack_ladder_idx = -1` (sizes
+  `nsymb`/`pattern_samples` for the longer burst, threads the idx to the generator, logs it).
+- `arq_responder.cc`: on a from-ROBUST clean data ACK, compute the skip-target BEFORE the ACK
+  TX and pass its ladder index into `send_mfsk_ack_sack` (one PTT). REMOVED the old post-send
+  separate `inband_emit_superack` burst (the ROOT 2 cause).
+- `arq_commander.cc`: the CLEAN-ACK handler decodes the inline suffix
+  (`superack_decode_tones(last_superack_suffix_tones)`), maps ladder index -> raw WB config,
+  and feeds `inband_handle_superack(cfg, rx_bsi, 0, 0)` — the SAME proven fail-safe leap
+  handler. Gated on ROBUST + feature-on + `last_superack_capture_valid`.
+- `arq_responder.cc` `test_inband_superack` CASE 6 (C6a-C6d): codec round-trip over all 32
+  ladder indices + single-error tolerance + checksum-reject + absent-suffix reject.
+- The OLD codec (`build_superack_tones` / `inband_emit_superack` /
+  `inband_decode_superack_from_capture` / `superack_wrap_decode`) is retained (dead for the
+  clean path) so the existing CASE 2/3 round-trip tests keep passing; not called in production.
+
+### §9.3 Cross-layer 5-question audit (base pattern-ACK x SNR suffix x NEW SUPER-ACK suffix — SHARED ACK burst)
+The base MFSK pattern-ACK (reverse-pin carrier), the turbo SNR suffix, and the new SUPER-ACK
+suffix now all ride the ACK burst. Do they collide / mis-decode?
+
+1. **Producers of the ACK burst suffix region**: `generate_ack_sack_pattern` lays down
+   [16 base][13 SACK][8 SUPER-ACK] (SUPER-ACK only when `superack_tones != nullptr`, i.e. a
+   from-ROBUST clean ACK, feature-on). `generate_ack_snr_pattern` lays down [16 base][8 SNR] —
+   a DIFFERENT pattern, sent by `send_ack_pattern_with_snr` during turboshift ONLY. The two are
+   never sent in the same burst (a from-ROBUST clean data ACK is not a turbo SET_CONFIG ACK),
+   so SNR and SUPER-ACK never share one burst — no aliasing.
+2. **Consumers**: the CMD base-ACK detector (`detect_ack_pattern`, 16-symbol correlation) is
+   UNCHANGED — it locks on the base; the 8 extra trailing symbols do not affect the 16-symbol
+   correlation and 37 <= the ~61-symbol detect tail window, so the base ACK stays IN-window
+   (reverse-pin cross preserved). The SACK unpack reads tones [0..12] — UNCHANGED (the
+   SUPER-ACK tones at [13..20] are never touched by `decode_ack_sack_from_last_capture`). The
+   SUPER-ACK read (`superack_decode_tones`) reads [13..20], appended AFTER the SACK, no
+   overlap. The SNR read (majority over the first 8) is on a DIFFERENT pattern/burst.
+3. **Valid states before any producer writes**: `last_superack_capture_valid` is reset false
+   at the top of BOTH `detect_ack_snr_from_passband` and `decode_ack_sack_from_passband`, so a
+   stale capture is never re-read. On a plain ACK (29 symbols, no SUPER-ACK) tones [13..20]
+   read as -1 (past dec_size) or noise -> `superack_decode_tones` rejects (checksum +
+   redundancy) -> no leap. Pre-first-ACK the members are init -1/false.
+4. **Invariants consumers assume — maintained**:
+   - Base-ACK detection timing (the HARD constraint / reverse-pin) is byte-identical: the base
+     pattern and its 16-symbol correlation window are untouched; the suffix only lengthens the
+     trailing tail (still within the detect window and the CMD's capture).
+   - SACK CRC12 unchanged: the 13-tone SACK unpack + CRC12 gate are on tones [0..12] only.
+   - D0 fail-safe (SUPERACK_DESIGN.md §3): a mis-read/absent SUPER-ACK -> `superack_decode_
+     tones` returns -1 -> NO leap -> the ordinary +1; the leap itself still passes
+     `inband_handle_superack`'s is_ofdm_config / UP-only / proven-ceiling / bsi-bind /
+     no-in-flight-climb gates. NEVER a spurious jump.
+   - The §8 robust-+1 HOLD still holds the config STABLE while a SUPER-ACK is pending, so the
+     reverse ACK the suffix rides on is clean (the two fixes compose: §8 makes the ACK clean;
+     §9 makes the recommendation ARRIVE on it).
+5. **What the fix changes**: adds an OPTIONAL trailing tone group to the ACK+SACK burst on the
+   from-ROBUST clean-ACK path, and an inline decode on the CMD CLEAN handler. Walked consumers:
+   base detector (unaffected — first 16 symbols), SACK unpack (unaffected — first 13 suffix
+   tones), SNR decode (different burst), reverse-pin/NACK (unaffected — NACK rides the
+   `!decoded` branch, no clean base ACK to append to). NB / off-feature / OFDM never append the
+   suffix (byte-identical). Feature-off is byte-identical everywhere.
+
+### §9.4 Capture-timing note (the leap-smoke arbiter)
+The CMD decodes the SUPER-ACK at the SAME poll it detects the clean base ACK. For the leap to
+LAND, the 8 trailing tones must be captured by that poll. The observed real-audio delivery
+(§8.3: the CMD had the full 29-symbol base+SACK content by ~0.96 s of a 1.65 s playback)
+suggests the bridge delivers the burst content ahead of the RSP ring-drain, so the +8 tones
+should be present. IF the leap smoke shows the tones are not yet captured at the CLEAN poll
+(superack_decode_tones -> -1 on a real SUPER-ACK), the task-authorised follow-on is a SMALL
+bounded CMD capture-extension on ROBUST+feature-on before turnaround. Validated by: `mercury
+--test` (CASE 6, codec) + the leap smoke (end-to-end `[CMD-SUPERACK]` decode + WB config load).
+
+### §9.5 VERIFIED — the leap LANDS (leap smoke, WGN:40, cfg100, IR=1, pg84, seed1)
+
+Two sub-roots beyond the RSP inline-emit had to be fixed; both confirmed by the diag build:
+
+1. **Coded ACK path bypassed the SUPER-ACK snapshot.** On the ROBUST tier the reverse
+   ACK+SACK suffix is CODED (gf16ra N=52, nsymb=76 = 16 base + 52 coded SACK + 8 SUPER-ACK),
+   so the CMD decodes via `decode_ack_sack_coded_trybooth`, which does NOT run
+   `detect_ack_snr_from_passband` (where the uncoded path snapshots the SUPER-ACK tones).
+   FIX: snapshot the 8 tones (offset = ack_pattern_nsymb + ack_sack_coded_suffix_len()) in
+   the coded path too, on a clean decode. (v2b: `[CMD-SUPERACK] ... capture_valid=0` on every
+   clean ACK — the snapshot ran but the tones weren't there yet → sub-root 2.)
+
+2. **Capture timing — the tones trail the CLEAN-lock.** The CMD locks CLEAN on base+coded
+   SACK (symbols 0-67; it decoded the 52-tone codeword). The 8 SUPER-ACK tones (symbols
+   68-75) are the LAST of the ~1.85 s burst and air ~560 ms AFTER the CLEAN-lock poll (the
+   coded SACK is 52 symbols ≈ 1.6 s). A 240 ms bounded re-capture (v3) was too short
+   (`capture-extended`=0). FIX: BOUNDED capture-extension on ROBUST+feature-on — after
+   CLEAN-lock, `pumped_settle_wait` + re-snapshot + re-decode up to 24×35 ms (<=840 ms),
+   letting the audio capture thread accumulate the trailing tones; the base-ACK / reverse-pin
+   detection already happened, so only THIS CMD's turnaround is delayed (arq_commander.cc).
+
+**Result (build md5 1ad8acac..., 240 s cell):**
+- `[CMD-SUPERACK] capture-extended: inline suffix arrived after CLEAN-lock` (T+87.042)
+- `[CMD-SUPERACK] decoded INLINE SUPER-ACK skip_target=CONFIG_8 (ladder=11) bound to clean bsi=0`
+- `[CMD-SUPERACK] ACCEPT: RSP recommends CONFIG_8 ... DIRECT LEAP (bypassing SNR gate)`
+- `[INBAND-TX] UNILATERAL CONFIG 100 -> 8` — the direct from-ROBUST → WB leap CROSSED.
+- `wb_configs_seen=[8]`, `configs_seen=[8,100]`, **user_bytes_per_min = 1427** (vs 8-63 on the
+  ROBUST crawl, ~170x), rx_bytes 1680 (vs 30-246), on the FIRST clean ROBUST ACK.
+- The old separate SUPER-ACK burst is GONE (`INBAND-RX] SUPER-ACK emit`=0), no config churn
+  (`UNILATERAL CONFIG 100->101`=0 in the pre-leap window; the §8 gate holds the +1). The
+  ~1000x ROBUST→WB bind that the SUPER-ACK design targets is achieved in ONE clean ACK.
+- `mercury --test-inband-superack` ALL PASS (C5a-f gate + C6a-d inline codec, failed=0).
+
+**Follow-ons (NOT blocking; leap lands and is fail-safe):**
+- CONDITIONAL capture-extension: today the ≤840 ms wait fires on any ROBUST clean ACK with
+  capture_valid=0 (a plain ROBUST ACK with NO SUPER-ACK — a marginal-margin channel where
+  the RSP emits none — would wait fruitlessly). At WGN:40 the SUPER-ACK always fires and the
+  leap lands on the FIRST ACK, so the wait is paid once and then the link is on WB (no steady-
+  state cost). To bound the marginal-channel cost, signal "SUPER-ACK following" in a SPARE
+  SACK bit (bitmap bits 30/31 are reserved) that the CMD reads AT clean-lock, and extend only
+  when set. Deferred (needs its own audit of the SACK payload/CRC).
+- WB SUSTAIN: after the leap the session oscillated CONFIG_8 ↔ 100 (breaks=3) — the WB-sustain
+  / demote-amplifier lever (separate from ROOT 2; the reverse-pin backoff + WB dwell). ROOT 2
+  (LANDING the leap) is solved; sustaining CONFIG_8 at WGN:40 is the downstream campaign.

@@ -11314,7 +11314,8 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 // budget for SACK and the receiver implicitly treats any pattern hit
 // as a clean ACK). On WB, returns wall-clock TX time in ms.
 long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
-                                                uint32_t bitmap)
+                                                uint32_t bitmap,
+                                                int superack_ladder_idx)
 {
 	if(passive_monitor) return 0;
 
@@ -11347,7 +11348,15 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		fflush(stdout);
 	}
 
-	int nsymb = telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): when a skip-target ladder
+	// index is supplied, the ACK+SACK burst is LENGTHENED by SUPERACK_SUFFIX_LEN tones
+	// so the from-ROBUST rate-UP recommendation rides INLINE on the SAME PTT/burst the
+	// CMD already detects+decodes (ROOT 2). nsymb/pattern sizing tracks that so the FIR
+	// buffers and tx_transfer cover the longer burst. -1 -> legacy byte-identical.
+	bool superack_inline = (superack_ladder_idx >= 0);
+	int nsymb = superack_inline
+		? telecom_system->ack_mfsk.ack_sack_superack_pattern_nsymb()
+		: telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
 	if(nsymb <= 0 || telecom_system->ack_sack_pattern_passband_samples <= 0)
 		return 0;
 
@@ -11367,6 +11376,12 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	printf("[TX-MFSK-ACK-SACK] batch_seq_id=%u bitmap=0x%08x crc12=0x%03x nsymb=%d on CONFIG_%d\n",
 		(unsigned)batch_seq_id, (unsigned)bitmap, (unsigned)crc12, nsymb, current_configuration);
 	fflush(stdout);
+	if(superack_inline)
+	{
+		printf("[TX-MFSK-ACK-SACK] SUPER-ACK inline suffix riding this ACK: skip_target ladder_idx=%d "
+			"(+%d tones, one PTT)\n", superack_ladder_idx, cl_mfsk::SUPERACK_SUFFIX_LEN);
+		fflush(stdout);
+	}
 
 	// WALL-B FIX-9 D2 REFINE (_fix9/d2refine/D2_REFINE_DESIGN.md §2.1): read+clear the per-call
 	// retx-turnaround flag the caller set (partial/prev paths -> TRUE, clean first-pass -> FALSE).
@@ -11412,9 +11427,15 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
 	ptt_on_delay_timer.start();
 
-	int pattern_samples = telecom_system->ack_sack_pattern_passband_samples;
 	int symbol_period = telecom_system->data_container.Nofdm
 	                  * telecom_system->data_container.interpolation_rate;
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): the burst is nsymb symbols;
+	// with the suffix nsymb == ack_sack_superack_pattern_nsymb() so pattern_samples
+	// covers the appended SUPER-ACK tones (legacy path: nsymb*symbol_period ==
+	// ack_sack_pattern_passband_samples, byte-identical).
+	int pattern_samples = superack_inline
+		? nsymb * symbol_period
+		: telecom_system->ack_sack_pattern_passband_samples;
 
 	// Allocate buffers: pattern + 1 symbol padding at each end for FIR filtering
 	int padded_size = pattern_samples + 2 * symbol_period;
@@ -11426,9 +11447,11 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	memset(raw_output, 0, padded_size * sizeof(double));
 
-	// Generate ACK+SACK pattern passband into the middle section
+	// Generate ACK+SACK pattern passband into the middle section (+ SUPER-ACK inline
+	// suffix when superack_ladder_idx >= 0). The generator returns the actual sample
+	// count; it equals pattern_samples here by construction.
 	telecom_system->generate_ack_sack_pattern_passband(&raw_output[symbol_period],
-		batch_seq_id, bitmap, crc12);
+		batch_seq_id, bitmap, crc12, superack_ladder_idx);
 
 	// Pad start and end with copies of first/last symbol for FIR boundary
 	memcpy(&raw_output[0], &raw_output[symbol_period],
