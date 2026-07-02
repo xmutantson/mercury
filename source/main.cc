@@ -1175,6 +1175,40 @@ int main(int argc, char *argv[])
                 failed += ARQ_isr.test_idle_switch_role_race();
                 failed += ARQ_isr.test_break_noprogress_teardown();
             }
+            // MIXBATCH FILL OVER-POP -- COMPRESSION LEG regression
+            // (data-flow-mixbatch-fill.md ss9): comp-leg sibling of the no-comp
+            // over-pop -- fill-cap respects the v2 retx prefix AND the force-FREE
+            // never destroys a staged-but-unsent frame. In-process synthetic-fire
+            // (no PHY/audio), pass-after arm. DEFEAT env = fail-before.
+            {
+                cl_arq_controller ARQ_mixcmp;
+                failed += ARQ_mixcmp.test_mixbatch_fill_overpop_compressed();
+            }
+            // Fix A — mid-flight data_batch_size SHRINK must not orphan RECEIVED prev
+            // frames (baseline-double-delivery.md): drives the REAL set_data_batch_size
+            // shrink; reconstructs the copy_data_to_buffer prev delivery set; asserts
+            // ZERO delivered bytes lost. Pass-after arm (DEFEAT env = fail-before).
+            {
+                cl_arq_controller ARQ_shrink;
+                failed += ARQ_shrink.test_batch_shrink_orphan_defer();
+            }
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery
+            // (data-flow-fifo-backup.md §6.1): the delivered batch's raw survives in the
+            // backup when finalize is pre-empted (Root B), and the config-change re-stage
+            // re-sends it. ACK-confirm-keyed flush empties the backup at register_ack()
+            // when no un-confirmed data exists. Pass-after arm (DEFEAT env = fail-before).
+            {
+                cl_arq_controller ARQ_bkflush;
+                failed += ARQ_bkflush.test_backup_confirm_flush();
+            }
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss
+            // (delivery-integrity-audit-monitor.md §3): the clean ACK precedes delivery and
+            // fifo_push_rx drops the tail when the app FIFO is full. The ACK-GATE now holds
+            // the batch until fifo_buffer_rx has room. Pass-after arm (DEFEAT env = fail-before).
+            {
+                cl_arq_controller ARQ_rxbp;
+                failed += ARQ_rxbp.test_rxfifo_backpressure_hold();
+            }
             // RX-CTRL-DROP regression (data-flow-control-slot-lifecycle.md §6): the
             // messages_control one-deep mailbox had no timeout escape out of RECEIVED,
             // so a stranded slot silently dropped every later control frame and killed
@@ -1543,6 +1577,18 @@ int main(int argc, char *argv[])
     bool test_batch_shrink_strands_prev_cli = false; // --test-batch-shrink-strands-prev: R035 — data_batch_size
                                         // shrink strands the active prev. Drives the REAL set_data_batch_size chokepoint;
                                         // asserts prev counters re-derived (gate reachable) + streaming defense on orphan. One-shot, exits rc.
+    bool test_batch_shrink_orphan_defer_cli = false; // --test-batch-shrink-orphan-defer: Fix A (baseline-double-
+                                        // delivery.md) — a mid-flight data_batch_size SHRINK must not orphan RECEIVED prev
+                                        // frames. Drives the REAL set_data_batch_size shrink; reconstructs the
+                                        // copy_data_to_buffer prev delivery set; asserts ZERO bytes lost. DEFEAT env = fail-before.
+    bool test_backup_confirm_flush_cli = false; // --test-backup-confirm-flush: Fix C/H#1 (data-flow-fifo-backup.md
+                                        // §6.1) — the delivered batch's raw must not survive in fifo_buffer_backup when
+                                        // finalize is pre-empted (Root B). Drives register_ack ACK-confirm; asserts the
+                                        // re-stage restores NOTHING (no re-delivery) + INV3 un-confirmed never flushed. DEFEAT=fail-before.
+    bool test_rxfifo_backpressure_hold_cli = false; // --test-rxfifo-backpressure-hold: Fix H#3 (delivery-integrity-
+                                        // audit-monitor.md §3) — the clean ACK precedes delivery; on RX-FIFO back-pressure
+                                        // the un-stored tail is lost with a committed ACK. Gate holds the batch until the
+                                        // app FIFO has room; asserts ZERO post-ACK loss + full re-delivery. DEFEAT=fail-before.
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
@@ -1651,6 +1697,8 @@ int main(int argc, char *argv[])
                                         // watchdog predicate + the produce-gate replication: a stranded RECEIVED slot is
                                         // freed and a later control frame lands. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE.
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
+    bool test_mixbatch_fill_overpop_cli = false; // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
+    bool test_mixbatch_fill_overpop_compressed_cli = false; // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
                                         // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
                                         // a real compressible payload; asserts >0 application bytes are staged. FAILS on
@@ -2288,6 +2336,30 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-batch-shrink-orphan-defer") == 0)
+        {
+            // Fix A — mid-flight data_batch_size shrink must not orphan RECEIVED
+            // prev frames (baseline-double-delivery.md). One-shot, exit rc.
+            test_batch_shrink_orphan_defer_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-backup-confirm-flush") == 0)
+        {
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery
+            // (data-flow-fifo-backup.md §6.1). One-shot, exit rc.
+            test_backup_confirm_flush_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rxfifo-backpressure-hold") == 0)
+        {
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss
+            // (delivery-integrity-audit-monitor.md §3). One-shot, exit rc.
+            test_rxfifo_backpressure_hold_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strcmp(argv[i], "--test-retx-clear-on-recovery") == 0)
         {
             // R029 — stale retx queue cleared on recovery regression — one-shot
@@ -2674,6 +2746,22 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-compress-frame-fill.md §5.
             test_robust0_compress_deadlock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-mixbatch-fill-overpop") == 0)
+        {
+            // Mixbatch fill over-pop reorder regression (one-shot, exit rc).
+            // See fact-documents/data-flow-mixbatch-fill.md.
+            test_mixbatch_fill_overpop_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-mixbatch-fill-overpop-compressed") == 0)
+        {
+            // Mixbatch fill COMPRESSION-leg over-pop + force-FREE data-loss
+            // regression (one-shot, exit rc). data-flow-mixbatch-fill.md ss9.
+            test_mixbatch_fill_overpop_compressed_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4076,6 +4164,36 @@ start_modem:
             fflush(stdout);
             exit(rc);
         }
+        if (test_batch_shrink_orphan_defer_cli) {
+            // Fix A — mid-flight shrink orphan-defer (one-shot, then exit rc).
+            printf("[FLAG] --test-batch-shrink-orphan-defer: invoking Fix A "
+                   "batch-shrink orphan zero-loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_orphan_defer();
+            printf("[FLAG] Batch-shrink-orphan-defer test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_backup_confirm_flush_cli) {
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery (one-shot, exit rc).
+            printf("[FLAG] --test-backup-confirm-flush: invoking Fix C/H#1 backup "
+                   "ACK-confirm-flush re-stage double-delivery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_backup_confirm_flush();
+            printf("[FLAG] Backup-confirm-flush test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_rxfifo_backpressure_hold_cli) {
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss (one-shot, exit rc).
+            printf("[FLAG] --test-rxfifo-backpressure-hold: invoking Fix H#3 RX-FIFO "
+                   "back-pressure post-ACK loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rxfifo_backpressure_hold();
+            printf("[FLAG] Rxfifo-backpressure-hold test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
         if (test_retx_clear_on_recovery_cli) {
             // R029 — stale retx queue cleared on recovery (one-shot, then exit rc).
             printf("[FLAG] --test-retx-clear-on-recovery: invoking R029 "
@@ -4492,6 +4610,24 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_robust0_compress_deadlock();
             printf("[FLAG] Robust0-compress-deadlock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_mixbatch_fill_overpop_cli) {
+            printf("[FLAG] --test-mixbatch-fill-overpop: invoking mixbatch fill\n"
+                   "       over-pop reorder regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_mixbatch_fill_overpop();
+            printf("[FLAG] Mixbatch-fill-overpop test complete (rc=%d) -- exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_mixbatch_fill_overpop_compressed_cli) {
+            printf("[FLAG] --test-mixbatch-fill-overpop-compressed: invoking\n"
+                   "       compression-leg over-pop + force-FREE data-loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_mixbatch_fill_overpop_compressed();
+            printf("[FLAG] Mixbatch-fill-overpop-compressed test complete (rc=%d) -- exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -735,6 +735,7 @@ cl_arq_controller::cl_arq_controller()
 	rsp_prev_batch_expected_count=0;
 	rsp_prev_batch_delivered_count=0;
 	rsp_prev_batch_stale_count=0;
+	rsp_deferred_batch_shrink=-1;   // Fix A (baseline-double-delivery.md): no deferred orphan-avoiding shrink pending
 	// SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
 	// All CMD-side; gated on sack_v2_enabled at the call sites. Ring + counters
 	// + cooldown all start at zero. v1 sessions leave these untouched.
@@ -1222,6 +1223,66 @@ void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
 	rsp_prev_batch_expected_count = new_expected;
 }
 
+// Fix A (baseline-double-delivery.md §1/§7): a mid-flight data_batch_size SHRINK
+// must NEVER orphan already-RECEIVED prev-batch frames. The prev batch is delivered
+// bounded by the LIVE data_batch_size (copy_data_to_buffer, arq_common.cc:13746;
+// frame-driven prev-deliver loop, arq_responder.cc:1309), so a shrink from old->new
+// while a prev batch holds RECEIVED slots in [new,old) drops those real, in-order
+// user bytes -> a silent HOLE in the delivered app stream (the "double-delivery"/
+// +301% misnomer). The Axis-2 down-move + robust-dwell revert both hit this via
+// set_data_batch_size(). ROOT FIX: DEFER the shrink while it would orphan RECEIVED
+// prev data — keep data_batch_size at the old (larger) value so the prev delivers
+// its full framed span — and apply the deferred target the instant the prev clears
+// (rsp_apply_deferred_batch_shrink). Keeping data_batch_size larger is strand-safe:
+// bump_bsi_and_transfer_prev freezes prev_expected from the D5 wired per-batch count
+// clamped to data_batch_size (arq_common.cc:9824-9831), so a later prev still expects
+// the TRUE frame count, never the stale-large size. Env MERCURY_BATCHSHRINK_ORPHAN_
+// DEFEAT=1 reverts to the orphaning shrink on the SAME binary (the fail-before arm).
+bool cl_arq_controller::defer_shrink_if_would_orphan_prev(int target)
+{
+	{ const char* e = std::getenv("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return false; }   // fail-before: apply the orphaning shrink
+	if(!sack_v2_enabled)         return false;
+	if(!rsp_prev_batch_active)   return false;
+	if(messages_rx_prev == NULL) return false;
+	int old_batch = this->data_batch_size;
+	if(target >= old_batch)      return false;     // not a shrink -> nothing to orphan
+	int orphaned = 0;
+	for(int i = target; i < old_batch && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) orphaned++;
+	if(orphaned <= 0)            return false;      // shrink is safe (no RECEIVED in [new,old))
+	// DEFER: hold data_batch_size at old_batch; remember the requested target.
+	rsp_deferred_batch_shrink = target;
+	printf("[RSP-V2-SHRINK-DEFER] deferring data_batch_size %d->%d: prev bsi=%d active would "
+		"orphan %d already-RECEIVED slot(s) in [%d,%d) — held until prev delivers (Fix A)\n",
+		old_batch, target, rsp_prev_batch_seq_id, orphaned, target, old_batch);
+	fflush(stdout);
+	return true;
+}
+
+// Fix A: apply a shrink that was deferred by defer_shrink_if_would_orphan_prev(),
+// the instant the prev batch has delivered/cleared (rsp_prev_batch_active==false).
+// Called from the prev-deliver completion sites. Idempotent / no-op when nothing is
+// pending or the prev is still active (keep holding). Re-enters set_data_batch_size()
+// with the prev now inactive, so the defer helper returns false and the shrink applies
+// cleanly through the normal chokepoint (rescan is a no-op with no active prev).
+void cl_arq_controller::rsp_apply_deferred_batch_shrink()
+{
+	if(rsp_deferred_batch_shrink < 0) return;
+	if(rsp_prev_batch_active)         return;   // still active -> keep the deferred target
+	int t = rsp_deferred_batch_shrink;
+	rsp_deferred_batch_shrink = -1;
+	// Stale-guard: a later set_data_batch_size() may have already reduced the size
+	// at/below the deferred target while the prev was still holding. Only apply the
+	// deferred value if it is STILL a genuine shrink; otherwise discard it (never
+	// GROW data_batch_size back up from a stale deferred target).
+	if(t >= this->data_batch_size) return;
+	printf("[RSP-V2-SHRINK-APPLY] applying deferred data_batch_size shrink -> %d "
+		"(prev batch cleared; Fix A)\n", t);
+	fflush(stdout);
+	set_data_batch_size(t);
+}
+
 // R029 (race audit 2026-06-06): the single owner of zeroing the TX retransmit
 // queue. See the arq.h declaration for the full rationale. Called from every
 // messages_tx[]-freeing recovery site; idempotent (count already 0 -> no-op log
@@ -1332,6 +1393,11 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 				current_configuration, data_batch_size, clamped, lo, hi);
 			fflush(stdout);
 		}
+		// Fix A (baseline-double-delivery.md): if this shrink would orphan already-
+		// RECEIVED prev-batch frames, DEFER it (keep the old size so the prev delivers
+		// its full span) — applied once the prev clears. Returns early on defer:
+		// data_batch_size is unchanged so the ACK timeout below stays correct too.
+		if(defer_shrink_if_would_orphan_prev(clamped)) return;
 		// R035: re-derive an active prev-batch's counters against the new (smaller)
 		// batch BEFORE updating data_batch_size (robust-dwell revert 8->1 is a shrink).
 		rescan_prev_on_batch_shrink(clamped);
@@ -1357,6 +1423,11 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 			target = data_batch_size;
 		else
 			target = (max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
+		// Fix A (baseline-double-delivery.md): defer an orphaning shrink (see the
+		// robust branch above) — the Axis-2 down-move 25->20 mid-partial-batch is the
+		// exact repro. Held until the prev delivers, then applied via
+		// rsp_apply_deferred_batch_shrink().
+		if(defer_shrink_if_would_orphan_prev(target)) return;
 		// R035: re-derive an active prev-batch's counters against the new (smaller)
 		// batch BEFORE updating data_batch_size (Axis-2 down-move 15->10 is a shrink).
 		rescan_prev_on_batch_shrink(target);
@@ -5092,6 +5163,8 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 	printf("[RSP-V2-PREBREAK-DELIVERED] prev_batch_seq_id=%d delivered before BREAK "
 		"(last_delivered=%d)\n", rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id);
 	fflush(stdout);
+	// Fix A (baseline-double-delivery.md): prev delivered -> apply any deferred shrink.
+	rsp_apply_deferred_batch_shrink();
 	return 1;
 }
 
@@ -5692,6 +5765,7 @@ int cl_arq_controller::deinit_messages_buffers()
 	rsp_prev_batch_active=false;
 	rsp_prev_batch_received_count=0;
 	rsp_prev_batch_expected_count=0;
+	rsp_deferred_batch_shrink=-1;   // Fix A: drop any pending deferred shrink on re-init
 
 	if(messages_batch_ack!=NULL)
 	{
@@ -13719,6 +13793,139 @@ int cl_arq_controller::fifo_push_rx(const char* buf, int len)
 		pushed, len);
 	fflush(stdout);
 	return pushed;
+}
+
+// Fix H#3 (delivery-integrity-audit-monitor.md §3). See the arq.h declaration. Returns the
+// worst-case number of bytes the current batch will hand to fifo_push_rx() at delivery,
+// so the ACK-GATE can HOLD the batch (no ACK, no deliver, keep RECEIVED for retransmit)
+// until fifo_buffer_rx has that much room — preventing the post-ACK short-store loss.
+int cl_arq_controller::rx_fifo_batch_need()
+{
+	if(compression_viable_for_batch())
+		return COMPRESS_WORKSPACE_SIZE;   // decompressed size unknown pre-delivery -> safe bound
+	int need = 0;                          // no-comp leg: exact sum of RECEIVED slot payloads
+	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+		if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
+			need += messages_rx[i].length;
+	return need;
+}
+
+// ===========================================================================
+// Fix H#3 — RX-FIFO back-pressure post-ACK DATA LOSS (delivery-integrity-audit-monitor.md §3)
+//
+// CLI: --test-rxfifo-backpressure-hold  (env MERCURY_RXFIFO_BACKPRESSURE_DEFEAT=1 reverts)
+//
+// THE BUG (channel-free, pure RX delivery state): the clean data-ACK is sent BEFORE
+// copy_data_to_buffer() delivers, and fifo_push_rx() returns a SHORT count when
+// fifo_buffer_rx is full under app back-pressure (its "caller must NOT count the un-stored
+// bytes as delivered" contract) — but copy_data_to_buffer frees the slots + counts them
+// anyway, so the un-stored tail is LOST with a committed ACK and the CMD never retransmits.
+//
+// Fix: the ACK-GATE holds the whole batch-complete ACK+deliver until fifo_buffer_rx has
+// room for rx_fifo_batch_need() bytes (keep messages_rx RECEIVED, no ACK, no deliver) so
+// the CMD retransmits and the batch re-delivers once the app drains -> no post-ACK loss.
+//
+// This drives the REAL rx_fifo_batch_need() gate decision and the REAL copy_data_to_buffer()
+// delivery on a fifo_buffer_rx sized SMALLER than the batch (back-pressure). PASS-AFTER: the
+// gate HOLDS (nothing delivered, whole batch preserved), then after the app "drains" the
+// held batch delivers FULLY (zero loss). FAIL-BEFORE (defeat): delivery runs anyway ->
+// copy_data_to_buffer stores part, loses the rest, frees the slots (post-ACK loss).
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_rxfifo_backpressure_hold()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_RXFIFO_BACKPRESSURE_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-RXFIFO-BP] start (MERCURY_RXFIFO_BACKPRESSURE_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-RXFIFO-BP] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-RXFIFO-BP] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	this->nMessages          = 120;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C0 buffers allocated", alloc_rc, SUCCESSFUL);
+	this->compression_enabled   = false;     // no-comp leg -> rx_fifo_batch_need() is exact
+	this->encryption_enabled    = false;
+	this->sack_v2_enabled       = true;
+	this->sack_enabled          = true;
+	this->current_configuration = 0;
+	// COMMANDER so fifo_push_rx() does NOT try to drain a (non-existent in-process) app
+	// socket on the FIFO-full retry — isolates the FIFO-full short-store, no PHY/TCP.
+	this->original_role = COMMANDER;
+	this->role          = COMMANDER;
+
+	const int DBS = 10, L = 100;
+	this->data_batch_size = DBS;
+	const int TOTAL = DBS * L;                // 1000 bytes of app payload
+
+	for(int i=0;i<this->nMessages;i++){ messages_rx[i].status=FREE; messages_rx[i].length=0; }
+	for(int i=0;i<DBS;i++){
+		messages_rx[i].status = RECEIVED;
+		messages_rx[i].length = L;
+		for(int j=0;j<L;j++) messages_rx[i].data[j] = (char)(unsigned char)i;
+	}
+
+	// App FIFO sized to hold only PART of the batch -> genuine back-pressure.
+	const int ROOM = TOTAL/2;                 // 500 < 1000
+	fifo_buffer_rx.set_size(ROOM);
+	fifo_buffer_rx.flush();
+	auto occ_rx = [&]() -> int { return fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size(); };
+
+	int rx_free = fifo_buffer_rx.get_free_size();
+	int need    = rx_fifo_batch_need();
+	check(need == TOTAL, "C1 rx_fifo_batch_need == exact no-comp batch size", need, TOTAL);
+	check(need > rx_free, "C2 vacuity: batch need exceeds app-FIFO room (real back-pressure)", need, rx_free);
+
+	// The production ACK-GATE decision (arq_responder.cc): HOLD iff (!defeat && rx_free < need).
+	bool hold = (!defeat) && (rx_free < need);
+
+	if(hold)
+	{
+		// FIX: the handler returns WITHOUT ACKing/delivering — the batch stays RECEIVED.
+		int held = 0;
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED) held += messages_rx[i].length;
+		int lost = TOTAL - occ_rx() - held;
+		check(occ_rx()==0, "A1 nothing delivered under back-pressure (held, not lost)", occ_rx(), 0);
+		check(held==TOTAL && lost==0, "A2 ZERO bytes lost — whole batch HELD for retransmit", lost, 0);
+		// App drains -> room frees -> the held batch re-delivers FULLY (the handler marks
+		// RECEIVED->ACKED post-gate, then copy_data_to_buffer stores the whole batch).
+		fifo_buffer_rx.set_size(TOTAL*2);
+		fifo_buffer_rx.flush();
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;
+		copy_data_to_buffer();
+		check(occ_rx()==TOTAL, "A3 after app drains, held batch delivers FULLY (no loss)", occ_rx(), TOTAL);
+	}
+	else
+	{
+		// FAIL-BEFORE / DEFEAT: deliver NOW despite no room. copy_data_to_buffer stores part,
+		// LOSES the rest, frees the slots -> the un-stored bytes are unrecoverable (post-ACK loss).
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;
+		copy_data_to_buffer();
+		int delivered = occ_rx();
+		int held = 0;
+		for(int i=0;i<DBS;i++) if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
+			held += messages_rx[i].length;
+		int lost = TOTAL - delivered - held;
+		printf("[TEST-RXFIFO-BP] defeat: delivered=%d held=%d lost=%d (TOTAL=%d)\n",
+			delivered, held, lost, TOTAL);
+		fflush(stdout);
+		check(lost > 0,
+			"A1 fail-before LOSES post-ACK bytes on back-pressure (slots freed, un-stored gone)", lost, 1);
+	}
+
+	deinit_messages_buffers();
+	printf("[TEST-RXFIFO-BP] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
 }
 
 void cl_arq_controller::copy_data_to_buffer()

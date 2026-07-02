@@ -422,6 +422,15 @@ public:
   // leg). `new_batch` is the post-clamp value about to be stored. See
   // data-flow-arq-recovery-cluster.md §4.3 / §5.2.
   void rescan_prev_on_batch_shrink(int new_batch);
+  // Fix A (baseline-double-delivery.md): apply a data_batch_size shrink that was
+  // DEFERRED because it would have orphaned already-RECEIVED prev-batch frames.
+  // No-op unless a shrink is pending AND the prev batch is now inactive.
+  void rsp_apply_deferred_batch_shrink();
+  // Fix A: if shrinking data_batch_size to `target` would orphan already-RECEIVED
+  // prev-batch frames in [target,old), record the deferred target and return true
+  // (caller must NOT apply the shrink now). Returns false (apply as normal) when
+  // there is no active prev, no orphan, it is not a shrink, or the env defeat is set.
+  bool defer_shrink_if_would_orphan_prev(int target);
   // R029 (race audit 2026-06-06) — the SINGLE owner of zeroing the TX retransmit
   // queue. The retransmit_frames[] / retransmit_count parallel arrays hold frames
   // captured (and, under encryption, byte-encoded) for the LIVE crypto epoch +
@@ -769,6 +778,20 @@ public:
   void process_control_commander();
   void process_buffer_data_commander();
   void finalize_block_commander();
+  // Fix C / H#1 (data-flow-fifo-backup.md §6.1): ACK-confirm-keyed backup flush.
+  // finalize_block_commander() is the normal backup flush but it is SKIPPED whenever a
+  // control frame is queued (a SUPER-ACK/turboshift SET_CONFIG queued in the SAME poll
+  // the last data frame ACKs — Root B) or new-data is staged, so the delivered batch's
+  // raw survives in fifo_buffer_backup and the config-change re-stage re-sends it
+  // (double-delivery; the backup also ACCUMULATES delivered raw across a lossy run).
+  // This flushes the backup at the TRUE ACK-confirm boundary, but ONLY when there is
+  // ZERO un-confirmed data anywhere (no PENDING_ACK/ACK_TIMED_OUT/ADDED_TO_LIST/
+  // ADDED_TO_BATCH_BUFFER frame and retransmit_count==0) so the backup can hold only
+  // already-delivered raw — INV3 (never drop un-confirmed) is preserved by construction.
+  // Idempotent (finalize's later flush is a no-op). MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT=1
+  // reverts on the SAME binary (the fail-before arm reproduces the re-stage re-delivery).
+  void maybe_backup_confirm_flush();
+  int test_backup_confirm_flush();  // --test-backup-confirm-flush: Fix C/H#1 re-stage double-delivery regression
 
   // SACK Design A Step 9 — Multi-axis policy framework, Axis 1 entry point.
   //
@@ -1607,6 +1630,83 @@ public:
     return rx_bsi != last_applied_sack_bsi;      // partial: dedupe vs partial tracker
   }
 
+  // ── FORGIVING-ACK Tier-2 PARTIAL-SACK DE-DUP KEY ──────────────────────
+  // (data-flow-inband-dataplane-stall-post-leap.md §3/§7). Under the cumulative
+  // cap the reverse-SACK wire bsi carries n_r (the contiguous delivery high-water
+  // rsp_last_delivered_batch_seq_id), FROZEN across successive in-flight PARTIAL
+  // batches until a NEW delivery advances it. The CMD partial de-dup
+  // (cmd_last_applied_sack_bsi) was keyed on that raw wire bsi — written for the
+  // per-batch semantics where each batch's bsi is DISTINCT. Under the cap every
+  // post-first partial repeats the same frozen n_r, so the guard false-collides it
+  // as a "duplicate", the bitmap is never applied, stats.nAcked_data freezes, and the
+  // REVSACK-CHEAPMISS discriminator escalates to BREAK/demote (the post-leap one-
+  // batch/600s stall). ROOT FIX: key the partial de-dup on the IN-FLIGHT BATCH
+  // IDENTITY the bitmap is applied to (cmd_batch_seq_id — the CMD's current batch,
+  // which advances per batch), NOT the frozen wire n_r. Cap OFF: the per-batch wire
+  // bsi IS the identity, so key on rx_bsi UNCHANGED (legacy byte-identical; the whole
+  // non-Tier-2 fleet + every existing test stay bit-for-bit). This decouples the
+  // DE-DUP key ONLY; it does NOT alter the wire encoding NOR cumulative_ack_covers'
+  // backward-window SELF-HEAL — both still read the raw frozen n_r, so the Tier-2
+  // self-heal that RELIES on n_r is fully preserved. The CLEAN tracker keeps using
+  // rx_bsi (the clean wire bsi advances on every delivery, never frozen). PURE +
+  // static so --test-climb-engine drives the exact production decision.
+  // -DCUMULATIVE_ACK_DEDUP_FAILBEFORE pins the frozen-n_r key (reproduces the stall)
+  // so the regression fails-before / passes-after in the SAME binary.
+  static int partial_sack_dedup_key(int rx_bsi, int cmd_batch_seq_id, bool cap_on)
+  {
+#ifdef CUMULATIVE_ACK_DEDUP_FAILBEFORE
+    (void)cmd_batch_seq_id; (void)cap_on;
+    return rx_bsi & 0xFF;                       // FAIL-BEFORE: frozen-n_r key (the stall).
+#else
+    if(cap_on) return cmd_batch_seq_id & 0xFF;  // cap ON: in-flight batch identity (advances per batch)
+    return rx_bsi & 0xFF;                        // cap OFF: legacy per-batch bsi (unchanged)
+#endif
+  }
+
+  // ── FORGIVING-ACK Tier-2 STALE-PARTIAL FALSE-ACK GUARD ────────────────────
+  // (data-flow-inband-dataplane-stall-post-leap.md §8.3). The companion to
+  // partial_sack_dedup_key, closing the latent robustness gap that key OPENED.
+  // A PARTIAL's 30-bit selective bitmap is applied BY SLOT INDEX to the in-flight
+  // batch, so it describes EXACTLY ONE batch: the contiguous successor n_r+1
+  // (cumulative_ack_covers arm b — Mercury is batch-level stop-and-wait, so the
+  // only batch above the delivery high-water n_r is n_r+1). Under the cap the
+  // window gate (bsi_in_window, arq_commander.cc:4384-4392) ADMITS any report
+  // whose frozen n_r merely lands in the bounded backward self-heal window of
+  // cmd_bsi OR prev_bsi — CORRECT for a CLEAN cumulative delivery confirmation
+  // (arm a retires batches <= n_r) but NOT a discriminator of which batch a
+  // PARTIAL bitmap targets. Since the night stall fix keys the partial de-dup on
+  // the in-flight batch identity (cmd_batch_seq_id), a STALE partial for batch k,
+  // LATE-decoded (MW late-window re-decode, arq_commander.cc:4265) AFTER the CMD
+  // advanced to k+1, is NOT a duplicate (cmd-key is k+1, fresh) and its n_r=k-1
+  // still satisfies the backward window — so its batch-k bitmap would be
+  // FALSE-APPLIED by slot index to k+1's PENDING_ACK frames, a FALSE ACK that
+  // suppresses their retransmit (silent data loss; §8.3 latent gap). This is the
+  // missing PARTIAL-ONLY validation: accept the bitmap apply iff the batch it
+  // describes (n_r+1) IS the current in-flight batch (cmd_bsi). A legit current
+  // partial ALWAYS satisfies this (n_r = cmd_bsi-1: the high-water is the batch
+  // just below the in-flight one), INCLUDING the frozen-n_r stall the night fix
+  // targets (there cmd_bsi = n_r+1 too), so the stall fix is fully preserved.
+  // Cap OFF: the wire bsi IS the per-batch identity and the legacy {cmd_bsi,
+  // prev_bsi} window + per-batch de-dup already fence it -> return true
+  // UNCONDITIONALLY (byte-identical; the whole non-Tier-2 fleet + every existing
+  // test stay bit-for-bit). Does NOT touch the wire encoding, the de-dup key, or
+  // cumulative_ack_covers' backward self-heal (CLEAN confirmations still ride it).
+  // PURE + static so --test-climb-engine drives the EXACT production decision.
+  // -DCUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE pins accept (reproduces the false-ACK)
+  // so the regression fails-before / passes-after in the SAME binary.
+  static bool partial_sack_target_is_inflight(int rx_bsi, int cmd_batch_seq_id, bool cap_on)
+  {
+#ifdef CUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE
+    (void)rx_bsi; (void)cmd_batch_seq_id; (void)cap_on;
+    return true;                                 // FAIL-BEFORE: no stale-partial discard (the false-ACK).
+#else
+    if(!cap_on) return true;                     // cap OFF: legacy window+de-dup fence it (byte-identical)
+    unsigned succ    = ((unsigned)(rx_bsi & 0xFF) + 1u) & 0xFFu;  // batch the bitmap describes (n_r+1)
+    unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
+    return succ == cmd_bsi;                       // apply iff that batch IS the in-flight batch
+#endif
+  }
+
   // R039 (race audit 2026-06-06): the SACK-v2 accept "window" check. A decoded
   // SACK_RSP's rx_bsi must be the current or just-prior CMD batch (mod 256),
   // because RSP only ACKs frames whose batch_seq_id is one of those. The OFDM
@@ -1826,6 +1926,8 @@ public:
   // batch carries > 0 application bytes (FAIL-BEFORE on fef293f: every batch
   // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
   int test_robust0_compress_deadlock();
+  int test_mixbatch_fill_overpop();  // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
+  int test_mixbatch_fill_overpop_compressed();  // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
 
   // Idle SWITCH_ROLE race regression (FAILS-BEFORE evidence for the
   // connected-but-0-deliver bench bug). Drives the REAL
@@ -2897,6 +2999,17 @@ public:
   // Returns 0=PASS, 1=FAIL.
   int test_batch_shrink_strands_prev();
 
+  // Fix A (baseline-double-delivery.md) — a mid-flight data_batch_size SHRINK must
+  // never orphan already-RECEIVED prev-batch frames (silent user-byte loss / HOLE).
+  // CLI: --test-batch-shrink-orphan-defer. Drives the REAL set_data_batch_size()
+  // shrink through the chokepoint with a prev batch holding RECEIVED slots in
+  // [new,old), then RECONSTRUCTS the copy_data_to_buffer() delivery set (the exact
+  // [0,data_batch_size) bound) and asserts ZERO delivered bytes lost/reordered.
+  // MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1 reverts the fix on the SAME binary
+  // (fail-before: the shrink applies and the orphaned tail bytes are dropped).
+  // Returns 0=PASS, 1=FAIL.
+  int test_batch_shrink_orphan_defer();
+
   // R029 (race audit 2026-06-06) — stale-retx-queue-cleared-on-recovery test.
   // CLI: --test-retx-clear-on-recovery. Populates retransmit_count>0 with a known
   // OLD bsi, calls the REAL clear_retx_queue() (the single owner every recovery
@@ -3029,6 +3142,16 @@ public:
   // socket to free room, surfaces any residual instead of silently dropping).
   // Returns bytes actually stored (== len on success).
   int fifo_push_rx(const char* buf, int len);
+  // Fix H#3 (delivery-integrity-audit-monitor.md §3): worst-case number of app-FIFO
+  // bytes the CURRENT batch will deliver via copy_data_to_buffer(). Used to GATE the
+  // clean data-ACK + delivery on fifo_buffer_rx having room, so the ACK is never sent
+  // (and the batch never freed) while the un-stored tail would be dropped under app
+  // back-pressure (fifo_push_rx short) = post-ACK silent loss the CMD never retransmits.
+  // Compression leg: the decompressed size is unknown pre-delivery, so the safe bound is
+  // the decompress workspace (COMPRESS_WORKSPACE_SIZE). No-comp leg: exact = sum of the
+  // RECEIVED slot lengths in [0,data_batch_size).
+  int rx_fifo_batch_need();
+  int test_rxfifo_backpressure_hold();  // --test-rxfifo-backpressure-hold: Fix H#3 post-ACK loss regression
   void restore_backup_buffer_data();
   void restore_tx_from_compressed();  // Decompress messages_tx back to raw in fifo_buffer_tx
 
@@ -3335,6 +3458,14 @@ public:
                                          //      same EOB-inference logic
                                          //      `process_messages_acknowledging_data`
                                          //      uses for the *current* batch.
+  int rsp_deferred_batch_shrink;         // RSP: a data_batch_size SHRINK that was
+                                         //      DEFERRED because applying it now
+                                         //      would orphan already-RECEIVED
+                                         //      prev-batch frames in [new,old)
+                                         //      (baseline-double-delivery.md Fix A).
+                                         //      -1 = none pending. Applied by
+                                         //      rsp_apply_deferred_batch_shrink()
+                                         //      once the prev batch delivers/clears.
   long long rsp_prev_batch_delivered_count; // RSP: count of prev batches
                                          //      successfully delivered via
                                          //      the prev path (diagnostic;

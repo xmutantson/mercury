@@ -84,6 +84,47 @@ void cl_arq_controller::register_ack(int message_id)
 		messages_tx[message_id].status=ACKED;
 		stats.nAcked_data++;
 	}
+	// Fix C / H#1: if this ACK completed the block (no un-confirmed data left), flush
+	// the delivered raw from fifo_buffer_backup now, before any config-change re-stage
+	// (finalize may be pre-empted by a queued SET_CONFIG / relaxed-mixbatch staging).
+	maybe_backup_confirm_flush();
+}
+
+// Fix C / H#1 (data-flow-fifo-backup.md §6.1). See the arq.h declaration for the full
+// rationale. Flushes fifo_buffer_backup at the ACK-confirm boundary IFF the backup can
+// hold ONLY already-delivered raw — i.e. there is NO un-confirmed data anywhere:
+//   - retransmit_count == 0 (no frame pending re-transmit), AND
+//   - no messages_tx[] slot is PENDING_ACK / ACK_TIMED_OUT (un-ACKed in-flight) or
+//     ADDED_TO_LIST / ADDED_TO_BATCH_BUFFER (a staged-but-unsent NEXT batch whose raw
+//     is ALSO in the backup — the relaxed-mixbatch accumulation case).
+// Under that predicate every backup byte belongs to a delivered batch, so flushing it
+// cannot lose un-confirmed data (INV3). This fixes Root B (a delivered batch re-staged
+// on a SUPER-ACK/turboshift SET_CONFIG leap) and, whenever a lossy run momentarily
+// fully-confirms, empties the accumulated backup (bounds H#1). NOTE (scoped residual):
+// a SUSTAINED, UNBROKEN loss run keeps retransmit_count>0 so this never fires mid-run;
+// removing an individual delivered batch's raw WHILE other batches are still un-confirmed
+// needs per-batch raw framing (data-flow-fifo-backup.md §6.3) and is a deliberate
+// follow-on — a byte-offset flush there risks dropping interleaved un-confirmed raw
+// (worse than the bug), so it is intentionally not attempted here.
+void cl_arq_controller::maybe_backup_confirm_flush()
+{
+	{ const char* e = std::getenv("MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return; }          // fail-before: leave delivered raw in the backup
+	if(role != COMMANDER)                 return;
+	int backup_occupancy = fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	if(backup_occupancy <= 0)             return;   // nothing staged
+	if(retransmit_count != 0)             return;   // un-confirmed retx pending -> its raw is in the backup
+	for(int i=0; i<this->nMessages; i++)
+	{
+		int s = messages_tx[i].status;
+		if(s==PENDING_ACK || s==ACK_TIMED_OUT || s==ADDED_TO_LIST || s==ADDED_TO_BATCH_BUFFER)
+			return;                                 // un-confirmed data present -> NOT safe to whole-flush
+	}
+	printf("[CMD-BACKUP-CONFIRM-FLUSH] block ACK-confirmed (no unconfirmed frames, retx=0) — "
+		"flushing %d B delivered raw from backup to prevent re-stage double-delivery (Fix C/H#1)\n",
+		backup_occupancy);
+	fflush(stdout);
+	fifo_buffer_backup.flush();
 }
 
 // Phantom-ACK content gate — DSP half (2026-05-29). Peek the current passband
@@ -4180,11 +4221,35 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									? 0xFFFFFFFFu
 									: ((1u << data_batch_size) - 1u);
 								bool is_clean_confirmation = (rx_bitmap == all_ones);
+								// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
+								// §3): under the cap the PARTIAL wire bsi is the FROZEN n_r, NOT a per-batch
+								// identity, so key the PARTIAL de-dup on the in-flight batch the bitmap is
+								// applied to (cmd_batch_seq_id). CLEAN wire bsi advances per delivery -> keep
+								// keying it on rx_bsi. Same key used by the OFDM SACK_RSP path (shared tracker).
+								int dedup_bsi = is_clean_confirmation
+									? (int)rx_bsi
+									: partial_sack_dedup_key((int)rx_bsi, cmd_batch_seq_id, cumulative_ack_enabled);
 								bool duplicate = !sack_clean_confirmation_accepted(
-									(int)rx_bsi, is_clean_confirmation,
+									dedup_bsi, is_clean_confirmation,
 									cmd_last_applied_clean_bsi, cmd_last_applied_sack_bsi);
+								// Sanity 4 (stale-partial FALSE-ACK guard,
+								// data-flow-inband-dataplane-stall-post-leap.md §8.3): a PARTIAL's bitmap
+								// applies BY SLOT INDEX to exactly the batch it describes (the contiguous
+								// successor n_r+1). Under the cap the window gate (Sanity 1) admits a report
+								// whose frozen n_r merely lands in prev_bsi's backward self-heal window, and
+								// the cmd_batch_seq_id de-dup key (Sanity 3) does NOT catch a LATE-decoded
+								// straggler (MW late-window, :4265) from a PRIOR in-flight batch -> a batch-k
+								// partial arriving after the CMD advanced to k+1 would FALSE-APPLY its batch-k
+								// bitmap to k+1's PENDING_ACK frames (they never retransmit -> silent loss).
+								// Accept the PARTIAL apply iff its resolved target (n_r+1) IS the current
+								// in-flight batch (cmd_bsi). CLEAN confirmations ride the cumulative self-heal
+								// (batches <= n_r) and are NEVER subject to this (is_clean short-circuits).
+								// Cap OFF -> partial_sack_target_is_inflight() returns true (byte-identical).
+								bool partial_target_ok = is_clean_confirmation
+									|| partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
+										cumulative_ack_enabled);
 
-							if(bsi_in_window && bitmap_ok && !duplicate)
+							if(bsi_in_window && bitmap_ok && !duplicate && partial_target_ok)
 							{
 								if(is_clean_confirmation)
 								{
@@ -4222,7 +4287,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
 										sack_bitmap[i] = ((rx_bitmap >> i) & 1u) ? true : false;
 									sack_detected = true;
-									cmd_last_applied_sack_bsi = (int)rx_bsi;
+									cmd_last_applied_sack_bsi = dedup_bsi;   // Tier-2 stall fix: key on in-flight batch identity
 									// ROLLING-PARTIAL unblock (data-flow-inband-frame0-rolling-partial.md
 									// §1/§2): record whether THIS partial is a LEAD-FRAME-ONLY loss
 									// (exactly bit0 clear, every other batch frame set). all_ones was
@@ -4262,12 +4327,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								// OFDM path on the same poll.
 								SACK_TRACE("MFSK-ACK-SACK decoded but rejected: "
 									"rx_bsi=%u cmd_bsi=%u prev_bsi=%u bitmap=0x%08x "
-									"in_window=%d bitmap_ok=%d duplicate=%d",
+									"in_window=%d bitmap_ok=%d duplicate=%d target_ok=%d",
 									(unsigned)rx_bsi, cmd_bsi, prev_bsi,
 									(unsigned)rx_bitmap,
 									bsi_in_window ? 1 : 0,
 									bitmap_ok ? 1 : 0,
-									duplicate ? 1 : 0);
+									duplicate ? 1 : 0,
+									partial_target_ok ? 1 : 0);
 							}
 						}
 						} // end if(!mfsk_handled_this_poll) — fix-b compact pre-check skips the 13-uncoded decode
@@ -4394,8 +4460,31 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								decoded = false;
 							}
 						}
+						// Stale-partial FALSE-ACK guard (data-flow-inband-dataplane-stall-post-leap.md
+						// §8.3): the SACK_RSP bitmap applies BY SLOT INDEX to exactly the batch it
+						// describes — the contiguous successor n_r+1. A LATE-decoded straggler from a
+						// PRIOR in-flight batch passes the OOW/backward-window check above (its n_r covers
+						// prev_bsi) and is NOT a de-dup hit (the cmd_batch_seq_id key is fresh), so its
+						// bitmap would FALSE-ACK the current batch's frames by slot index (they never
+						// retransmit -> silent loss). Discard iff its resolved target (n_r+1) is NOT the
+						// current in-flight batch (cmd_bsi). Cap OFF -> always in-flight -> inert
+						// (byte-identical). Same guard as the MFSK partial path (:4424).
+						if(decoded && !partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
+							cumulative_ack_enabled))
+						{
+							printf("[CMD-SACK-V2-STALE] rx_bsi=%u resolves to batch %u != in-flight cmd_bsi=%d "
+								"— discarding stale partial (treat as CRC fail)\n",
+								(unsigned)rx_bsi, ((unsigned)rx_bsi + 1u) & 0xFFu, cmd_batch_seq_id & 0xFF);
+							fflush(stdout);
+							decoded = false;
+						}
+						// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
+						// §3): the OFDM SACK_RSP transport ALSO carries the frozen n_r under the cap and
+						// SHARES cmd_last_applied_sack_bsi with the MFSK path, so key its de-dup on the
+						// SAME in-flight batch identity (cmd_batch_seq_id) to keep the tracker consistent.
+						int sackv2_dedup_bsi = partial_sack_dedup_key((int)rx_bsi, cmd_batch_seq_id, cumulative_ack_enabled);
 						if(decoded
-						   && (int)rx_bsi == cmd_last_applied_sack_bsi)
+						   && sackv2_dedup_bsi == cmd_last_applied_sack_bsi)
 						{
 							printf("[CMD-SACK-V2-DUPLICATE] bsi=%u already applied — ignoring\n",
 								(unsigned)rx_bsi);
@@ -4405,7 +4494,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						if(decoded)
 						{
 							sack_detected = true;
-							cmd_last_applied_sack_bsi = (int)rx_bsi;
+							cmd_last_applied_sack_bsi = sackv2_dedup_bsi;   // Tier-2 stall fix: shared key
 							// STAGE 4d (D1 CONFIRM): an OFDM SACK_RSP at-or-after the announce bsi
 							// proves the RX demodulated the batch at the announced config -> DISARM
 							// the re-tag (design §1.1/§1.3 consumer 1). No-op when not armed / inband off.
@@ -11386,6 +11475,90 @@ int cl_arq_controller::test_climb_engine()
 	check(a4 == true, "A4 clean for a new bsi ACCEPTED", a4 ? 1 : 0, 1);
 
 	// ================================================================
+	// Part A' — FORGIVING-ACK Tier-2 PARTIAL-SACK DE-DUP under a FROZEN n_r
+	// (data-flow-inband-dataplane-stall-post-leap.md §3/§7). The post-leap
+	// data-plane stall: with the cumulative cap negotiated the reverse-SACK wire
+	// bsi carries n_r (the delivery high-water), FROZEN across successive in-flight
+	// PARTIAL batches. Batch 0's partial set the tracker to key(n_r=0,batch=0);
+	// batch 1's partial arrives with the SAME frozen wire bsi=0 but a DISTINCT
+	// in-flight batch (cmd_batch_seq_id=1) and MUST be applied (nAcked_data
+	// advances), not de-duped. partial_sack_dedup_key keys the partial de-dup on
+	// the in-flight batch identity under the cap; -DCUMULATIVE_ACK_DEDUP_FAILBEFORE
+	// pins it to the frozen n_r (reproduces the discard -> AP1/AP2 FAIL).
+	// ================================================================
+	int padk_b0 = partial_sack_dedup_key(/*rx_bsi=n_r*/0, /*cmd_batch_seq_id*/0, /*cap_on*/true);
+	int padk_b1 = partial_sack_dedup_key(/*rx_bsi=n_r*/0, /*cmd_batch_seq_id*/1, /*cap_on*/true);
+	check(padk_b0 != padk_b1,
+		"AP1 cap-ON partial key DISTINCT for batch1 vs batch0 under frozen n_r=0",
+		padk_b1, 1);
+	bool ap_b1_applied = sack_clean_confirmation_accepted(
+		/*rx_bsi(partial key)=*/padk_b1, /*is_all_ones=*/false,
+		/*last_applied_clean_bsi=*/-1, /*last_applied_sack_bsi=*/padk_b0);
+	check(ap_b1_applied == true,
+		"AP2 batch1 PARTIAL under frozen n_r APPLIED not deduped (nAcked_data advances)",
+		ap_b1_applied ? 1 : 0, 1);
+	bool ap_b1_repeat = sack_clean_confirmation_accepted(
+		padk_b1, /*is_all_ones=*/false, /*clean=*/-1, /*sack=*/padk_b1);
+	check(ap_b1_repeat == false,
+		"AP3 repeated batch1 partial (same in-flight batch) still deduped",
+		ap_b1_repeat ? 1 : 0, 0);
+	int padk_l0 = partial_sack_dedup_key(/*rx_bsi*/10, /*cmd_batch_seq_id*/10, /*cap_on*/false);
+	int padk_l1 = partial_sack_dedup_key(/*rx_bsi*/11, /*cmd_batch_seq_id*/11, /*cap_on*/false);
+	check(padk_l0 == 10 && padk_l1 == 11,
+		"AP4 cap-OFF legacy per-batch key unchanged (10,11)",
+		padk_l0 * 100 + padk_l1, 1011);
+
+	// ================================================================
+	// Part A'' — STALE-PARTIAL FALSE-ACK guard (data-flow-inband-dataplane-stall-
+	// post-leap.md §8.3), the sibling the night de-dup key OPENED. A PARTIAL's
+	// bitmap applies BY SLOT INDEX to the batch it describes = the contiguous
+	// successor n_r+1. A batch-k partial LATE-decoded (MW late-window) AFTER the
+	// CMD advanced to k+1 (a) PASSES the window gate (its n_r=k-1 covers prev_bsi
+	// via the overhang-1 arm) and (b) is NOT a de-dup hit (the cmd_batch_seq_id
+	// key = k+1 is fresh) — so partial_sack_target_is_inflight is the SOLE guard
+	// standing between it and a FALSE ACK of k+1's frames (their retransmit is
+	// suppressed -> silent loss). -DCUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE pins
+	// the predicate to accept (reproduces the false-ACK -> AP5 FAILS).
+	// ================================================================
+	const int K = 7;   // stale partial describes batch k=K (its wire n_r = K-1)
+	// AP5a — the CURRENT-batch partial (target n_r+1 == cmd_bsi) is ACCEPTED: the
+	// stall fix ("partials for the CURRENT batch still apply") is PRESERVED. This
+	// also covers the frozen-n_r stall itself (cmd_bsi = n_r+1 there too).
+	bool ap5a = partial_sack_target_is_inflight(/*rx_bsi=n_r*/K-1, /*cmd_batch_seq_id*/K, /*cap_on*/true);
+	check(ap5a == true,
+		"AP5a current-batch PARTIAL (target n_r+1 == cmd_bsi) ACCEPTED (stall fix preserved)",
+		ap5a ? 1 : 0, 1);
+	// AP5b — PROVE the guard is load-bearing: the window gate ADMITS the stale
+	// batch-k partial at cmd=k+1 (its n_r=K-1 covers prev_bsi=K via the succ arm)…
+	bool ap5b_win =
+		cumulative_ack_covers(/*rx_n_r=*/K-1, /*target cmd_bsi=*/K+1, /*cap*/true, /*pb*/false)
+		|| cumulative_ack_covers(/*rx_n_r=*/K-1, /*target prev_bsi=*/K, /*cap*/true, /*pb*/false);
+	check(ap5b_win == true,
+		"AP5b window gate ADMITS the stale partial (guard must be the target check)",
+		ap5b_win ? 1 : 0, 1);
+	// …and the de-dup does NOT catch it (cmd_batch_seq_id key = k+1 is fresh vs a
+	// tracker holding the earlier batch-k key).
+	int  ap5_key = partial_sack_dedup_key(/*rx_bsi*/K-1, /*cmd_batch_seq_id*/K+1, /*cap_on*/true);
+	bool ap5b_notdup = sack_clean_confirmation_accepted(
+		ap5_key, /*is_all_ones=*/false, /*clean=*/-1, /*sack tracker=batch-k key*/K);
+	check(ap5b_notdup == true,
+		"AP5b' de-dup does NOT catch the stale partial (cmd-key fresh)",
+		ap5b_notdup ? 1 : 0, 1);
+	// AP5 (THE assertion) — the stale batch-k partial arriving at cmd=k+1 is
+	// REJECTED by the target guard (n_r+1 = K != cmd_bsi = K+1). FAIL-BEFORE
+	// (pinned accept) would apply it -> false-ACK k+1's frames.
+	bool ap5 = partial_sack_target_is_inflight(/*rx_bsi=n_r*/K-1, /*cmd_batch_seq_id*/K+1, /*cap_on*/true);
+	check(ap5 == false,
+		"AP5 stale batch-k PARTIAL at cmd=k+1 REJECTED (no false-ACK of k+1 frames)",
+		ap5 ? 1 : 0, 0);
+	// AP5c — cap OFF: the guard is INERT (legacy window+de-dup fence it) -> the
+	// same stale-shaped inputs return true (byte-identical, no behavior change).
+	bool ap5c = partial_sack_target_is_inflight(K-1, K+1, /*cap_on*/false);
+	check(ap5c == true,
+		"AP5c cap-OFF stale-partial guard INERT (byte-identical)",
+		ap5c ? 1 : 0, 1);
+
+	// ================================================================
 	// Part B — Bug 2/3: keep batch=1 at robust. Drive the REAL
 	// policy_evaluate_axis2() (the controller that grew robust batch and caused
 	// the CMD/RSP mismatch) at a robust config and at an OFDM config. Robust must
@@ -15274,6 +15447,541 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// MIXBATCH FILL OVER-POP regression (data-flow-mixbatch-fill.md)
+//
+// CLI: --test-mixbatch-fill-overpop      (env MERCURY_MIXBATCH_OVERPOP_DEFEAT=1
+//                                          reverts the fix on the SAME binary)
+//
+// THE BUG (channel-free, pure ARQ TX state). On a v2 MIXED batch the next TX
+// prepends R = min(retransmit_count, data_batch_size) retx frames as the batch's
+// FIRST slots (process_messages_tx_data v2 retx-prefix loop, arq_commander.cc
+// ~2414-2461), leaving only (data_batch_size - R) slots for NEW data. But the
+// no-compression fill loop (process_buffer_data_commander, arq_commander.cc
+// ~21141) popped the FULL data_batch_size NEW frames regardless. The R surplus
+// frames stayed ADDED_TO_LIST and — because add_message_tx_data() fills the
+// first-FREE slot — landed in HIGH messages_tx slots, while the NEXT batch's
+// fresh frames filled the LOW (freed) slots. The new-data assign loop numbers
+// pos/id by ASCENDING slot, so the OLDER surplus content got a HIGHER seq/id than
+// the newer content -> the batch was delivered OUT OF ORDER (the RSP places by
+// id and drains slots ascending) -> byte-integrity FAIL + rx>tx double-delivery.
+// Live signature (cfg8 WGN40 capstone smoke): good_prefix 3288, 813 corrupt bytes
+// from offset 3288 on the FINAL partial batch.
+//
+// This drives the REAL process_buffer_data_commander() no-compression data-fill
+// across TWO mixbatch cycles, RECONSTRUCTS the delivered byte stream the RSP
+// would produce (batch-1 sent frames, then batch-2 frames in ascending-slot
+// order), and asserts it is a CONTIGUOUS prefix of the fed positional pattern
+// (byte[k]==k&0xFF). No PHY / audio / TCP / compression.
+//
+//   pass-after (defeat off): the fill caps at data_batch_size - R, no surplus is
+//     ever created, slot order == content order, the reconstructed stream is
+//     byte-exact contiguous.
+//   fail-before (MERCURY_MIXBATCH_OVERPOP_DEFEAT=1): the fill over-pops by R, the
+//     surplus lands in high slots, the reconstructed stream is REORDERED (a
+//     mismatch at the surplus junction) AND cycle-1 stages data_batch_size (not
+//     data_batch_size - R).
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_mixbatch_fill_overpop()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_MIXBATCH_OVERPOP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-MIXFILL] start (MERCURY_MIXBATCH_OVERPOP_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-MIXFILL] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-MIXFILL] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Prime cfg8-like OFDM dimensions, compression OFF (no-comp fill leg) ---
+	max_data_length    = 64;
+	max_header_length  = 8;
+	sack_v2_enabled    = true;
+	sack_enabled       = true;
+	header_carries_d5  = false;   // keep max_frame deterministic (no D5 byte)
+	compression_enabled= false;   // route to the byte-exact no-compression fill
+	encryption_enabled = false;
+	robust_enabled     = NO;
+	narrowband_enabled = NO;
+	role               = COMMANDER;
+	original_role      = COMMANDER;
+	link_status        = CONNECTED;
+	connection_status  = TRANSMITTING_DATA;
+	block_under_tx     = NO;
+	message_batch_counter_tx = 0;
+
+	const int DBS = 25;
+	const int R   = 2;    // retx prefix on the mixbatch -> only DBS-R new slots fit
+	nMessages = 120;
+	set_data_batch_size(DBS);
+
+	deinit_messages_buffers();
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C0 message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+
+	int max_frame = max_data_length + max_header_length
+	              - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+	check(max_frame > 0 && max_frame <= max_data_length + max_header_length,
+		"C0b max_frame sane", max_frame, max_frame);
+
+	// Fed positional pattern: byte[k] = k & 0xFF, enough for both cycles.
+	const int NFRAMES_FED = 40;
+	const int FED = NFRAMES_FED * max_frame;
+	{
+		char* fed = new char[FED];
+		for(int k=0;k<FED;k++) fed[k] = (char)(unsigned char)(k & 0xFF);
+		int pushed = fifo_buffer_tx.push(fed, FED);
+		check(pushed == FED, "C0c fed pattern staged", pushed, FED);
+		delete[] fed;
+	}
+	auto pat = [&](int k)->unsigned char { return (unsigned char)(k & 0xFF); };
+
+	// The reconstructed delivered stream (batch-1 sent, then batch-2 by slot).
+	std::vector<unsigned char> delivered;
+	delivered.reserve(FED);
+
+	// ---- CYCLE 1: a MIXED batch (R retx pending) ----
+	retransmit_count = R;
+	process_buffer_data_commander();       // REAL fill
+
+	int staged1 = 0;
+	for(int i=0;i<nMessages;i++) if(messages_tx[i].status==ADDED_TO_LIST) staged1++;
+	printf("[TEST-MIXFILL] cycle1 staged=%d (DBS=%d R=%d expect_fix=%d)\n",
+		staged1, DBS, R, DBS-R);
+	fflush(stdout);
+	if(!defeat)
+		check(staged1 == DBS - R, "C1 fill respects retx prefix (no over-pop)", staged1, DBS-R);
+	else
+		check(staged1 == DBS, "C1 fail-before over-pops the full batch", staged1, DBS);
+
+	// Simulate the assembly: it takes the FIRST (DBS-R) new frames by ASCENDING
+	// slot into the wire batch; the rest (surplus) stay ADDED_TO_LIST. Capture the
+	// sent frames' bytes (== the batch-1 delivered content) and FREE their slots.
+	{
+		int sent = 0;
+		for(int i=0;i<nMessages && sent < DBS - R;i++)
+		{
+			if(messages_tx[i].status==ADDED_TO_LIST)
+			{
+				for(int j=0;j<messages_tx[i].length;j++)
+					delivered.push_back((unsigned char)messages_tx[i].data[j]);
+				messages_tx[i].status = FREE;
+				messages_tx[i].length = 0;
+				sent++;
+			}
+		}
+		check(sent == DBS - R, "C2 batch-1 sent exactly DBS-R new frames", sent, DBS-R);
+	}
+
+	// ---- CYCLE 2: the next batch (no retx now) ----
+	retransmit_count = 0;
+	block_under_tx   = NO;
+	process_buffer_data_commander();       // REAL fill (fresh frames -> low free slots)
+
+	// Reconstruct batch-2's delivered order = messages_tx ADDED_TO_LIST by ASCENDING
+	// slot (the id/pos the assign loop stamps == the RSP delivery order).
+	for(int i=0;i<nMessages;i++)
+		if(messages_tx[i].status==ADDED_TO_LIST)
+			for(int j=0;j<messages_tx[i].length;j++)
+				delivered.push_back((unsigned char)messages_tx[i].data[j]);
+
+	// The delivered stream MUST be a byte-exact CONTIGUOUS prefix of the fed pattern.
+	int first_bad = -1;
+	for(int k=0;k<(int)delivered.size();k++)
+		if(delivered[k] != pat(k)) { first_bad = k; break; }
+
+	printf("[TEST-MIXFILL] reconstructed delivered=%d bytes first_bad=%d (fed=%d)\n",
+		(int)delivered.size(), first_bad, FED);
+	fflush(stdout);
+
+	if(!defeat)
+	{
+		// pass-after: byte-exact, in order, no reorder.
+		check(first_bad == -1, "C3 delivered stream is contiguous (no reorder)", first_bad, -1);
+	}
+	else
+	{
+		// fail-before: the over-pop surplus MUST reorder the stream (vacuity guard —
+		// the scenario has to actually exercise the bug).
+		check(first_bad != -1, "C3 fail-before REORDERS the delivered stream", first_bad, 1);
+	}
+
+	deinit_messages_buffers();
+	printf("[TEST-MIXFILL] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
+}
+
+// ===========================================================================
+// MIXBATCH FILL OVER-POP -- COMPRESSION LEG regression (data-flow-mixbatch-fill.md ss9)
+//
+// CLI: --test-mixbatch-fill-overpop-compressed
+//      (env MERCURY_MIXBATCH_OVERPOP_DEFEAT=1 reverts the fix on the SAME binary)
+//
+// THE BUG (channel-free, pure ARQ TX state, COMPRESSION path). Sibling of
+// test_mixbatch_fill_overpop but for process_buffer_data_commander()'s COMPRESSION
+// leg (compression_viable_for_batch()==true). Two roots, both UNFIXED at 5b4ed57:
+//   (i)  the comp leg sized batch_capacity from the FULL data_batch_size
+//        (crypto_frames = data_batch_size), never subtracting the v2 mixbatch retx
+//        prefix R. A compressed unit is ATOMIC (RX decompresses the whole batch's
+//        new-data payload in one shot), so a unit that splits into > (data_batch_size
+//        - R) frames cannot ride ONE batch -> over-pop.
+//   (ii) the force-FREE "Ensure contiguous IDs" loop unconditionally FREEd
+//        messages_tx[0..DBS) before splitting the fresh unit, DESTROYING any
+//        staged-but-unsent (ADDED_TO_LIST) surplus frame whose bytes were already
+//        popped from fifo_buffer_tx = DATA LOSS (not a reorder).
+//
+// PART A drives the REAL comp leg across two mixbatch cycles with NON-streaming
+// compression (each batch decodes independently), reconstructs the delivered stream
+// via the REAL cl_compressor::decompress_block(), and asserts byte-exact no-loss
+// (fix) vs a truncated/lost unit (defeat). PART B is a focused force-FREE data-loss
+// unit: hand-stage a live ADDED_TO_LIST marker frame, drive a mid-batch re-entry, and
+// assert the marker survives (fix) vs is destroyed (defeat).
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this outside the master suite.
+int cl_arq_controller::test_mixbatch_fill_overpop_compressed()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_MIXBATCH_OVERPOP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-MIXFILL-CMP] start (MERCURY_MIXBATCH_OVERPOP_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-MIXFILL-CMP] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-MIXFILL-CMP] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- cfg8-like OFDM dims, NON-streaming compression (independent per-batch decode) ---
+	max_data_length    = 64;
+	max_header_length  = 8;
+	sack_v2_enabled    = true;
+	sack_enabled       = true;
+	header_carries_d5  = false;
+	encryption_enabled = false;
+	robust_enabled     = NO;
+	narrowband_enabled = NO;
+	role               = COMMANDER;
+	original_role      = COMMANDER;
+	link_status        = CONNECTED;
+	connection_status  = TRANSMITTING_DATA;
+	block_under_tx     = NO;
+	message_batch_counter_tx = 0;
+	compress_ratio_estimate  = 20.0f;   // repetitive payload primes a high ratio
+
+	const int DBS = 25;
+	const int R   = 20;                 // large prefix -> only DBS-R=5 new slots fit
+	nMessages = 120;
+	set_data_batch_size(DBS);
+
+	deinit_messages_buffers();
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "A0 message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+
+	compressor.init();
+	compressor.streaming_disable();     // non-streaming: each batch self-contained
+	compression_enabled = true;
+	check(compression_viable_for_batch() ? 1 : 0,
+		"A0b compression viable at cfg8-like dims", compression_viable_for_batch()?1:0, 1);
+
+	int max_frame = max_data_length + max_header_length
+				  - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+
+	// Fed pattern: repetitive text (byte-comparable + highly compressible so the fill
+	// loop reaches a many-frame unit -> the over-pop fires deterministically in defeat).
+	const int FED = 110000;
+	char* fed = new char[FED];
+	// Pseudo-random (incompressible) payload: the compressor stores it (ratio ~1x)
+	// so compress_block cannot fit it in batch_capacity and the RAW fallback fills
+	// comp_size ~= batch_capacity -> the frame count K tracks crypto_frames EXACTLY
+	// (DBS in defeat, DBS-R under the fix), making the over-pop deterministic and
+	// ratio-independent. (Repetitive text compresses so hard the unit is a couple
+	// frames and never over-pops -> a vacuous fail-before.)
+	{ unsigned int st = 0x12345678u;
+	  for(int k=0;k<FED;k++){ st = st*1664525u + 1013904223u; fed[k] = (char)(unsigned char)(st>>24); } }
+	int pushed = fifo_buffer_tx.push(fed, FED);
+	check(pushed == FED, "A0c fed pattern staged", pushed, FED);
+
+	std::vector<unsigned char> delivered;
+	delivered.reserve(FED);
+	char rout[COMPRESS_WORKSPACE_SIZE];
+
+	// Gather a wire batch's new-data frames (ascending slot == id == comp_buf order)
+	// into a buffer, run the REAL decompress_block, append raw. Mark sent frames FREE
+	// (simulates ACK). 'cap' = max new-data frames the wire batch can carry.
+	auto deliver_batch = [&](int cap)->int {
+		std::vector<char> comp;
+		int sent = 0;
+		for(int i=0;i<nMessages && sent<cap;i++){
+			if(messages_tx[i].status==ADDED_TO_LIST){
+				for(int j=0;j<messages_tx[i].length;j++) comp.push_back(messages_tx[i].data[j]);
+				messages_tx[i].status = FREE;
+				messages_tx[i].length = 0;
+				sent++;
+			}
+		}
+		if(!comp.empty()){
+			int d = compressor.decompress_block(comp.data(), (int)comp.size(),
+												rout, (int)sizeof(rout));
+			if(d>0) for(int j=0;j<d;j++) delivered.push_back((unsigned char)rout[j]);
+		}
+		return sent;
+	};
+
+	// ---- CYCLE 1: a fresh MIXED batch (R retx pending) stages compressed unit-1 ----
+	retransmit_count = R;
+	block_under_tx   = NO;
+	batch_uncompressed_size = -1;
+	process_buffer_data_commander();          // REAL comp-leg fill
+	long bus1 = batch_uncompressed_size;      // raw bytes popped for unit-1
+	int staged1 = 0;
+	for(int i=0;i<nMessages;i++) if(messages_tx[i].status==ADDED_TO_LIST) staged1++;
+	printf("[TEST-MIXFILL-CMP] cycle1 staged=%d bus1=%ld (DBS=%d R=%d cap=DBS-R=%d)\n",
+		staged1, bus1, DBS, R, DBS-R);
+	fflush(stdout);
+	if(!defeat)
+		check(staged1 <= DBS - R && staged1 >= 1,
+			"A1 comp unit fits the mixbatch new-data slots (<= DBS-R)", staged1, DBS-R);
+	else
+		check(staged1 > DBS - R,
+			"A1 fail-before over-pops the unit past DBS-R (vacuity guard)", staged1, DBS-R+1);
+
+	int sent1 = deliver_batch(DBS - R);       // wire batch-1: at most DBS-R new frames
+	long surplus1 = 0;
+	for(int i=0;i<nMessages;i++) if(messages_tx[i].status==ADDED_TO_LIST) surplus1++;
+	printf("[TEST-MIXFILL-CMP] batch1 sent=%d surplus=%ld delivered=%d\n",
+		sent1, surplus1, (int)delivered.size());
+	fflush(stdout);
+
+	// ---- CYCLE 2: next batch. In defeat the force-FREE DESTROYS the surplus (unit-1
+	// tail) then stages a fresh unit-2; in the fix no surplus exists -> clean unit-2. ----
+	retransmit_count = 0;
+	block_under_tx   = NO;
+	batch_uncompressed_size = -1;
+	process_buffer_data_commander();
+	long bus2 = batch_uncompressed_size;
+	int sent2 = deliver_batch(DBS);           // no retx now -> full batch of new data
+	long expect = bus1 + bus2;
+	int first_bad = -1;
+	for(int k=0;k<(int)delivered.size();k++)
+		if(delivered[k] != (unsigned char)fed[k]) { first_bad = k; break; }
+	printf("[TEST-MIXFILL-CMP] cycle2 bus2=%ld sent2=%d delivered=%d expect(no-loss)=%ld first_bad=%d\n",
+		bus2, sent2, (int)delivered.size(), expect, first_bad);
+	fflush(stdout);
+
+	if(!defeat){
+		check(first_bad == -1,
+			"A2 delivered stream byte-exact (no reorder/corruption)", first_bad, -1);
+		check((long)delivered.size() == expect && expect > 0,
+			"A3 every popped raw byte delivered (no loss)", (long)delivered.size(), expect);
+	} else {
+		bool loss_or_corrupt = (first_bad != -1) || ((long)delivered.size() != expect);
+		check(loss_or_corrupt,
+			"A2 fail-before LOSES/CORRUPTS the compressed unit (surplus destroyed)",
+			(long)delivered.size(), expect);
+	}
+	delete[] fed;
+
+	// ===================== PART B -- force-FREE data-loss unit =====================
+	// Hand-stage a live, staged-but-unsent ADDED_TO_LIST marker frame (its bytes were
+	// already popped from fifo_buffer_tx), then drive a v2 mixbatch RE-ENTRY of the comp
+	// leg (block_under_tx==YES, retx>0). The pre-fix force-FREE clears the slot = the
+	// marker is DESTROYED (DATA LOSS). The fix's live-newdata guard skips staging so the
+	// marker survives.
+	deinit_messages_buffers();
+	alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "B0 message buffers re-allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+	compressor.init();
+	compressor.streaming_disable();
+	compression_enabled = true;
+	set_data_batch_size(DBS);
+
+	const int H = 5;                 // slot holding the live staged frame
+	const unsigned char MARK = 0xAB;
+	int LM = max_frame;
+	for(int j=0;j<LM;j++) messages_tx[H].data[j] = (char)MARK;
+	messages_tx[H].length = LM;
+	messages_tx[H].type   = DATA_LONG;
+	messages_tx[H].id     = H;
+	messages_tx[H].status = ADDED_TO_LIST;
+
+	// FIFO non-empty so the comp leg outer gate fires; retx>0 + block_under_tx==YES
+	// makes stage_ok true (the mixbatch relaxation) -> the re-entry path.
+	{
+		char filler[4096];
+		for(int k=0;k<4096;k++) filler[k] = (char)('a' + (k % 16));
+		fifo_buffer_tx.push(filler, 4096);
+	}
+	block_under_tx   = YES;
+	retransmit_count = 1;
+	process_buffer_data_commander();      // comp-leg RE-ENTRY
+
+	bool marker_preserved = false;
+	for(int i=0;i<nMessages;i++){
+		if(messages_tx[i].status==ADDED_TO_LIST && messages_tx[i].length==LM){
+			bool all=true;
+			for(int j=0;j<LM;j++) if((unsigned char)messages_tx[i].data[j]!=MARK){all=false;break;}
+			if(all){ marker_preserved = true; break; }
+		}
+	}
+	printf("[TEST-MIXFILL-CMP] PART B marker_preserved=%d (defeat=%d)\n",
+		marker_preserved?1:0, defeat?1:0);
+	fflush(stdout);
+	if(!defeat)
+		check(marker_preserved,
+			"B1 force-FREE preserves the staged-but-unsent frame (no DATA LOSS)",
+			marker_preserved?1:0, 1);
+	else
+		check(!marker_preserved,
+			"B1 fail-before DESTROYS the staged frame (DATA LOSS, vacuity guard)",
+			marker_preserved?1:0, 0);
+
+	deinit_messages_buffers();
+	printf("[TEST-MIXFILL-CMP] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
+}
+
+// ===========================================================================
+// Fix C / H#1 — fifo_buffer_backup re-stage DOUBLE-DELIVERY (data-flow-fifo-backup.md §6.1)
+//
+// CLI: --test-backup-confirm-flush   (env MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT=1 reverts
+//                                     the fix on the SAME binary)
+//
+// THE BUG (channel-free, pure CMD TX state): fifo_buffer_backup holds the raw source of
+// the in-flight batch so a config change (turboshift/SET_CONFIG leap, gearshift-down,
+// watchdog) can re-stage + re-encode it at the new config. Its ONLY steady-state flush is
+// finalize_block_commander(), which is SKIPPED when a control frame is queued in the SAME
+// poll the last data frame ACKs (Root B: a SUPER-ACK/turboshift SET_CONFIG). The DELIVERED
+// batch's raw then survives in the backup and the config-change re-stage (a whole-backup
+// pop -> push to fifo_buffer_tx) re-sends it -> the RSP delivers it a SECOND time
+// (byte_integrity_ok=FALSE, +N phantom tail).
+//
+// Fix: maybe_backup_confirm_flush() at the register_ack() ACK-confirm chokepoint flushes
+// the backup the instant the block is fully confirmed -- but ONLY when NO un-confirmed
+// data exists anywhere (no PENDING_ACK/ACK_TIMED_OUT/ADDED_TO_LIST/ADDED_TO_BATCH_BUFFER
+// frame + retransmit_count==0), so the backup holds only delivered raw and flushing it
+// can never drop un-confirmed data (INV3).
+//
+// PART A drives register_ack() to confirm a delivered 1-frame batch with a control frame
+// queued (finalize pre-empted, Root B), then models the config-change re-stage (whole-
+// backup pop) and asserts it restores NOTHING (fix) vs the delivered raw (defeat = the
+// re-delivery). PART B/C are INV3 guards: with a still-un-confirmed frame (B) or a pending
+// retransmit (C) the backup is NEVER flushed (both arms).
+//
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_backup_confirm_flush()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-BACKUP-FLUSH] start (MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-BACKUP-FLUSH] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-BACKUP-FLUSH] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	role          = COMMANDER;
+	original_role = COMMANDER;
+	nMessages     = 120;
+	int alloc_rc  = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C0 buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+
+	const int RAW = 141;               // one delivered frame's raw payload
+	char raw[RAW];
+	for(int k=0;k<RAW;k++) raw[k] = (char)(unsigned char)(k & 0xFF);
+	// cl_fifo_buffer::get_size() is the CAPACITY; occupancy = get_size()-get_free_size().
+	auto occ = [&]() -> int {
+		return fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	};
+
+	auto stage_one = [&](int slot, int frame_status){
+		for(int i=0;i<nMessages;i++){ messages_tx[i].status=FREE; messages_tx[i].length=0; }
+		fifo_buffer_backup.flush();
+		fifo_buffer_backup.push(raw, RAW);             // the batch's raw source
+		messages_tx[slot].status = frame_status;
+		messages_tx[slot].length = RAW;
+		messages_tx[slot].id     = slot;
+	};
+
+	// ---- PART A: delivered batch, control queued (Root B) -> confirm-flush empties backup ----
+	stage_one(0, PENDING_ACK);
+	retransmit_count        = 0;
+	messages_control.status = PENDING_ACK;   // a queued SET_CONFIG-like control -> finalize would be SKIPPED
+	register_ack(0);                          // last frame ACKs -> maybe_backup_confirm_flush() fires
+	int backup_after = occ();
+	// Model the config-change re-stage: a whole-backup pop into fifo_buffer_tx (the buggy path).
+	char rbuf[4096];
+	int restored = fifo_buffer_backup.pop(rbuf, (int)sizeof(rbuf));
+	printf("[TEST-BACKUP-FLUSH] PART A backup_after_confirm=%d re-stage_restored=%d (RAW=%d)\n",
+		backup_after, restored, RAW);
+	fflush(stdout);
+	if(!defeat){
+		check(backup_after == 0,
+			"A1 backup flushed at ACK-confirm (delivered raw removed)", backup_after, 0);
+		check(restored == 0,
+			"A2 config-change re-stage restores NOTHING (no re-delivery)", restored, 0);
+	} else {
+		check(backup_after == RAW,
+			"A1 fail-before leaves delivered raw in backup (vacuity guard)", backup_after, RAW);
+		check(restored == RAW,
+			"A2 fail-before re-stage RE-DELIVERS the delivered raw (the bug)", restored, RAW);
+	}
+
+	// ---- PART B: INV3 -- a still-un-confirmed frame keeps the backup intact (both arms) ----
+	stage_one(1, PENDING_ACK);
+	messages_tx[2].status = PENDING_ACK;      // a SECOND frame that stays un-confirmed
+	messages_tx[2].length = RAW;
+	retransmit_count        = 0;
+	messages_control.status = FREE;
+	register_ack(1);                          // ACK frame1; frame2 still PENDING -> NO flush
+	int backup_b = occ();
+	check(backup_b == RAW,
+		"B1 INV3: backup NOT flushed while a frame is still un-confirmed", backup_b, RAW);
+
+	// ---- PART C: INV3 -- a pending retransmit keeps the backup intact (both arms) ----
+	stage_one(0, PENDING_ACK);
+	retransmit_count = 1;                      // retx pending -> its raw is (conceptually) in the backup
+	register_ack(0);                           // frame0 ACKs but retx pending -> NO flush
+	int backup_c = occ();
+	check(backup_c == RAW,
+		"C1 INV3: backup NOT flushed while a retransmit is pending", backup_c, RAW);
+	retransmit_count = 0;
+
+	deinit_messages_buffers();
+	printf("[TEST-BACKUP-FLUSH] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
 }
 
 // ===========================================================================
@@ -19486,7 +20194,37 @@ void cl_arq_controller::process_buffer_data_commander()
 				// reset()/CLI, never mutated at runtime), so no wire negotiation is
 				// added. Non-encrypted path is byte-identical (crypto_frames ==
 				// data_batch_size).
-				int crypto_frames = data_batch_size;
+				// MIXBATCH FILL FIX -- compression leg (data-flow-mixbatch-fill.md ss9).
+				// The no-compression leg (:~21333 pre-patch) caps its per-batch fill to
+				// (data_batch_size - R) so the surplus that breaks the "slot order ==
+				// content order" invariant is never created. The compression leg had the
+				// SAME defect UNFIXED: batch_capacity was sized from the FULL data_batch_size
+				// (crypto_frames below), never subtracting the v2 mixbatch retx prefix
+				// R = min(retransmit_count, data_batch_size) that process_messages_tx_data()
+				// prepends into the first R slots. Only the encryption path ACCIDENTALLY
+				// reserved headroom (crypto_batch_size); a compressed + NON-encrypted +
+				// sack_v2 batch with retx pending could split the unit into up to
+				// data_batch_size frames while only (data_batch_size - R) can ride. A
+				// compressed unit is ATOMIC (the RX decompresses the whole batch's new-data
+				// payload as one blob), so a unit that does not fit ONE batch is undecodable
+				// and its surplus tail frames are DESTROYED by the force-FREE loop below
+				// (ss9) = DATA LOSS. Cap the available new-data frame count so the whole unit
+				// always fits the mixbatch. retransmit_count==0 (or !sack_v2) => avail ==
+				// data_batch_size => byte-identical to pre-fix. Env MERCURY_MIXBATCH_OVERPOP_
+				// DEFEAT restores the over-pop (fail-before arm), the no-comp leg's toggle.
+				bool mixfill_overpop_defeat = false;
+				{ const char* e = std::getenv("MERCURY_MIXBATCH_OVERPOP_DEFEAT");
+				  if(e && *e && atoi(e)!=0) mixfill_overpop_defeat = true; }
+				int avail_newdata_frames = data_batch_size;
+				if(sack_v2_enabled && !mixfill_overpop_defeat)
+				{
+					int retx_prefix = retransmit_count;
+					if(retx_prefix > data_batch_size) retx_prefix = data_batch_size;
+					if(retx_prefix < 0) retx_prefix = 0;
+					avail_newdata_frames = data_batch_size - retx_prefix;
+					if(avail_newdata_frames < 0) avail_newdata_frames = 0;
+				}
+				int crypto_frames = avail_newdata_frames;
 				if(cipher_suite.is_active()
 				   && crypto_batch_size > 0
 				   && crypto_batch_size < crypto_frames)
@@ -19510,7 +20248,28 @@ void cl_arq_controller::process_buffer_data_commander()
 					initial_pop = batch_capacity - chdr_size;
 
 				char staging[COMPRESS_WORKSPACE_SIZE];
-				int raw_size = fifo_buffer_tx.pop(staging, initial_pop);
+				// MIXBATCH FILL FIX (ii) -- force-FREE data-loss guard
+				// (data-flow-mixbatch-fill.md ss9). A compressed unit is laid onto
+				// messages_tx starting at slot 0 (add_message_tx_data first-free) and the
+				// force-FREE loop below clears slots 0..data_batch_size-1 to guarantee
+				// contiguous ids. If messages_tx ALREADY holds a staged-but-unsent
+				// (ADDED_TO_LIST) or in-flight (ADDED_TO_BATCH_BUFFER) new-data frame -- the
+				// v2 mixbatch relaxation (stage_ok while block_under_tx==YES with retx
+				// pending) can re-enter this leg mid-batch -- force-FREEing it DESTROYS
+				// content whose bytes were already popped from fifo_buffer_tx =
+				// unrecoverable DATA LOSS, and laying a 2nd atomic unit over the 1st
+				// corrupts both. SKIP staging this tick (no FIFO pop, no free): the batch
+				// clears (ACK -> FREE) and the next fresh batch stages the pending FIFO
+				// data. retx==0 / no-mixbatch never re-enters with live new-data
+				// (block_under_tx==NO => all slots FREE) => byte-identical. Env DEFEAT keeps
+				// the old destructive path (fail-before arm).
+				bool live_newdata_staged = false;
+				if(!mixfill_overpop_defeat)
+					for(int _i=0; _i<nMessages; _i++)
+						if(messages_tx[_i].status==ADDED_TO_LIST
+						   || messages_tx[_i].status==ADDED_TO_BATCH_BUFFER)
+						{ live_newdata_staged = true; break; }
+				int raw_size = live_newdata_staged ? 0 : fifo_buffer_tx.pop(staging, initial_pop);
 				if(raw_size == 0)
 				{
 					last_transmission_block_stats.nSent_data=0;
@@ -19763,11 +20522,25 @@ void cl_arq_controller::process_buffer_data_commander()
 					// Without encryption, pad_messages_batch_tx() fills
 					// remaining batch slots with duplicates.
 
-					// Ensure contiguous IDs 0..data_batch_size-1
+					// Ensure contiguous IDs 0..data_batch_size-1 for the fresh compressed
+					// unit (add_message_tx_data fills the first FREE slot). MIXBATCH FILL
+					// FIX (ii): NEVER FREE a staged-but-unsent (ADDED_TO_LIST) or in-flight
+					// (ADDED_TO_BATCH_BUFFER) new-data frame -- its bytes were already popped
+					// from fifo_buffer_tx, so clearing it is unrecoverable DATA LOSS. The
+					// live-newdata guard above guarantees this leg is only reached with no
+					// such frame present; this is defense-in-depth. Env DEFEAT restores the
+					// unconditional free (fail-before arm) so the regression can exhibit the
+					// destroyed-frame loss.
 					for(int i = 0; i < data_batch_size; i++)
 					{
 						if(messages_tx[i].status != FREE)
+						{
+							if(!mixfill_overpop_defeat
+							   && (messages_tx[i].status==ADDED_TO_LIST
+								   || messages_tx[i].status==ADDED_TO_BATCH_BUFFER))
+								continue;
 							messages_tx[i].status = FREE;
+						}
 					}
 
 					// Split comp_buf into frames
@@ -19814,7 +20587,40 @@ void cl_arq_controller::process_buffer_data_commander()
 				if(compression_enabled && compressor.is_streaming())
 					compressor.clear_pending();
 				int filled = 0;
+				// MIXBATCH FILL FIX (data-flow-mixbatch-fill.md): on a v2 mixed batch the
+				// NEXT TX prepends R = min(retransmit_count, data_batch_size) retx frames
+				// as the batch's FIRST slots (process_messages_tx_data v2 retx-prefix loop,
+				// arq_commander.cc ~2414-2461), leaving only (data_batch_size - R) slots for
+				// new data. Popping the full data_batch_size NEW frames here over-stages by
+				// R: the surplus frames stay ADDED_TO_LIST and, because add_message_tx_data()
+				// fills the first-FREE slot, they land in HIGH messages_tx slots while the
+				// NEXT batch's fresh frames fill the LOW (freed) slots -> the new-data assign
+				// loop (which numbers pos/id by ASCENDING slot) gives the OLDER surplus
+				// content a HIGHER seq/id than the newer content -> the batch is delivered
+				// OUT OF ORDER (byte-integrity FAIL, rx>tx double-delivery). Cap the fill to
+				// the slots the mixbatch can actually carry so NO surplus is ever created
+				// (the 'messages_tx slot order == content order' invariant the assign loop
+				// relies on is preserved). No-retx / v1 path: retransmit_count == 0 ->
+				// fill_limit == data_batch_size (byte-identical to pre-fix). Env DEFEAT
+				// restores the pre-fix over-pop on the SAME binary (the fail-before arm).
 				int fill_limit = data_batch_size;
+				if(sack_v2_enabled)
+				{
+					bool overpop_defeat = false;
+					{ const char* e = std::getenv("MERCURY_MIXBATCH_OVERPOP_DEFEAT");
+					  if(e && *e && atoi(e)!=0) overpop_defeat = true; }
+					if(!overpop_defeat)
+					{
+						int retx_prefix = retransmit_count;
+						if(retx_prefix > data_batch_size) retx_prefix = data_batch_size;
+						if(retx_prefix < 0) retx_prefix = 0;
+						int already_staged = 0;
+						for(int _i=0; _i<nMessages; _i++)
+							if(messages_tx[_i].status==ADDED_TO_LIST) already_staged++;
+						fill_limit = data_batch_size - retx_prefix - already_staged;
+						if(fill_limit < 0) fill_limit = 0;
+					}
+				}
 				batch_uncompressed_size = 0;
 				for(int i=0;i<fill_limit;i++)
 				{
