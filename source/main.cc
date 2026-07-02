@@ -1076,6 +1076,40 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_compact_confirm_sack_window_rx_path();
             }
+            // PHANTOM-ACK content-gate regression (Fable #7 4b; gearshift-start-and-recovery.md
+            // §8): a WB base-pattern match with NO CRC-valid suffix must be REJECTED (leaves
+            // data_ack_received NO, does NOT raise the anchor or reset the BREAK panic counter),
+            // so BREAK can still reach ROBUST_0. PURE in-process synthetic-fire.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_phantom_ack_gate();
+            }
+            // PHANTOM-ACK LIVE reject regression (Fable #7 4b; test_compact_confirm_rx.cc): a
+            // synthesized base-only / base+garbled-suffix phantom (real >=threshold base match,
+            // NO valid content) must NOT be credited by the LIVE acceptance predicate
+            // (cmd_compact_confirm_crc_valid / cmd_clean_data_ack_crc_valid / the full
+            // cmd_compact_confirm_live_accept all reject). PURE in-process synthetic-fire.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_phantom_ack_live_reject();
+            }
+            // REVERSE-CONFIRM-MISS DECOUPLE regression (the SAFE demote-amplifier lever,
+            // data-flow-revack-confirm-miss.md §5): a base-detected + forward-OFDM-healthy
+            // reverse-confirm miss is DECOUPLED from emergency_nack_count++/BREAK (bounded,
+            // reset on any data-ACK); pure silence / non-OFDM anchor NEVER decouple. Fail-before
+            // via -DREVACK_CONFIRM_MISS_FAILBEFORE. PURE in-process synthetic-fire.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_revack_confirm_miss_decouple();
+            }
+            // DELIVERED-PAYLOAD BYTE-INTEGRITY gate (Fable #7 4a; data-flow-revack-confirm-miss.md
+            // §7): a full CMD->RSP single-batch clean WB transfer through the 2-instance in-process
+            // stepper must deliver the RSP payload EXACTLY (no missing/reordered/duplicated byte) —
+            // the system-level catch for a silent false-accept. PURE in-process (no device/TCP/RF).
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_compact_confirm_delivery_integrity();
+            }
             // FORGIVING-ACK Tier-2 cumulative-n_r self-heal / gap-invariant / cap-gate
             // regression (the A3 predicate proof). Member test on a throwaway controller;
             // PURE in-process synthetic-fire, no IONOS/RF. data-flow-forgiving-ack.md §T2.6.
@@ -1790,6 +1824,7 @@ int main(int argc, char *argv[])
                                         // -> promotes), PB2 virtual-clock elapse lifts, PB3 exponential+cap, PB4 reset,
                                         // PB5 INV-2 deep-SNR escape unchanged. One-shot, exits rc.
     bool test_phantom_ack_gate_cli = false; // --test-phantom-ack-gate: phantom-ACK content-gate regression.
+    bool test_revack_confirm_miss_cli = false; // --test-revack-confirm-miss: reverse-confirm-miss decouple regression.
                                         // Drives data_ack_bare_pattern_acceptable() across WB/NB x CRC-valid/CRC-absent
                                         // (the WB-no-CRC phantom cell must be REJECTED) + asserts a rejected phantom leaves
                                         // data_ack_received NO, does not raise last_data_viable_config / reset the BREAK
@@ -2832,6 +2867,15 @@ int main(int argc, char *argv[])
             // exit with the test's rc. See
             // fact-documents/gearshift-start-and-recovery.md §8.
             test_phantom_ack_gate_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-revack-confirm-miss") == 0)
+        {
+            // REVERSE-CONFIRM-MISS DECOUPLE regression — one-shot, exit with rc.
+            // Fail-before via -DREVACK_CONFIRM_MISS_FAILBEFORE. See
+            // fact-documents/data-flow-revack-confirm-miss.md §5.
+            test_revack_confirm_miss_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4661,6 +4705,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_phantom_ack_gate();
             printf("[FLAG] Phantom-ack-gate test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_revack_confirm_miss_cli) {
+            // Reverse-confirm-miss decouple regression (one-shot, then exit rc).
+            // Fail-before via -DREVACK_CONFIRM_MISS_FAILBEFORE. See
+            // fact-documents/data-flow-revack-confirm-miss.md §5.
+            printf("[FLAG] --test-revack-confirm-miss: invoking reverse-confirm-miss "
+                   "decouple regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_revack_confirm_miss_decouple();
+            printf("[FLAG] Revack-confirm-miss test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -87,6 +87,15 @@
 // plain bsi, no n_r reshape) — the responder gates compact OFF when
 // cumulative_ack_enabled. WB-only (M=16); NB / ROBUST M<8 return-path is out of
 // scope (compact_confirm_suffix_len()<=0 => no-op there).
+//
+// DO-NOT-MERGE (Fable wtsu2k647; data-flow-revack-confirm-miss.md §0): the sibling
+// branch `fix/revack-clean-accept` (HEAD df395f29) — "accept a clean batch on a strong
+// base-pattern match WITHOUT the CRC12 content suffix" — is UNSAFE and QUARANTINED. The
+// base pattern carries ZERO clean/partial info (generate_ack_sack_pattern and
+// generate_compact_confirm_pattern both call generate_ack_pattern, mfsk.cc:882/917), so a
+// base-only accept false-accepts a PARTIAL as clean (silent frame loss) and re-opens the
+// phantom. The CORRECT fix keeps the CRC12 content gate REQUIRED (this compact confirm) +
+// the SAFE demote lever (REVACK_BASE_MISS_MAX_CONSEC). DO NOT build on / merge df395f29.
 #ifndef ARQ_COMPACT_CONFIRM_ENABLE
 #define ARQ_COMPACT_CONFIRM_ENABLE 1
 #endif
@@ -570,6 +579,19 @@ inline int cfg16_revack_starve_fallback_target(int current_config, bool ofdm_pro
 // block-failures at CFG16 before the per-frame demote). =2 per the root-cause Q4 D3 spec ("2
 // consecutive ACK-silence block-failures with healthy forward SACK history"). TUNABLE.
 static const int CFG16_REVACK_STARVE_FAILS = 2;
+
+// REVERSE-CONFIRM-MISS DECOUPLE bound (the SAFE demote-amplifier lever, data-flow-
+// revack-confirm-miss.md). When a block times out (data_ack_received==NO) but the base
+// ACK pattern WAS detected this receive window (ack_diag_peak_matched >= ack_match_
+// threshold), the RSP transmitted a reverse confirm (compact OR 13-uncoded) whose CONTENT
+// CRC did not validate — a residual confirm miss, NOT pure forward/reverse silence. The
+// compact coded reverse-confirm (default-ON, +4.22 dB deeper than the uncoded-13 suffix)
+// makes this RARE; the residual miss is DECOUPLED from the emergency_nack_count++/BREAK
+// amplifier (a cheap same-gear re-air, NOT a BREAK->ROBUST cascade). BOUNDED: after this
+// many CONSECUTIVE decoupled misses with NO landed data-ACK the unchanged ++/BREAK fires,
+// so a genuinely stuck reverse-content path (or a spurious base-noise correlation) still
+// demotes. Reset on ANY data-ACK.
+static const int REVACK_BASE_MISS_MAX_CONSEC = 8;
 
 // WALL-B FIX-9 D2 (bigblock_p3_hw/_fix9/FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md): the
 // reverse-data-ACK turnaround-geometry predicate. The reverse MFSK ACK+SACK PHY (the M=16 WB

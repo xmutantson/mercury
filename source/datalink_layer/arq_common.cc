@@ -1035,6 +1035,7 @@ cl_arq_controller::cl_arq_controller()
 	bigblock_carve_cooldown_batches=0;
 	bigblock_carve_cooldown_span=0;
 	cfg16_revack_starve_fails=0;   // WALL-B FIX-9 D3: fresh session never inherits a stale starve count
+	revack_base_miss_consec=0;     // reverse-confirm-miss decouple: fresh session never inherits a stale streak
 	break_recovery_phase=0;
 	break_recovery_retries=0;
 	ceiling_success_count=0;
@@ -8227,6 +8228,7 @@ void cl_arq_controller::reset_session_state()
 	bigblock_carve_cooldown_span = 0;
 	cfg16_revack_starve_fails = 0;   // WALL-B FIX-9 D3 (R3 parity): clear the CFG16 reverse-ACK
 	                                 // starvation streak on session reset / new CONNECT.
+	revack_base_miss_consec = 0;     // reverse-confirm-miss decouple: clear the decouple streak on reset.
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
 	// IDLE-SWITCHROLE-RACE recovery (idle-switchrole-race.md §3): fresh session —

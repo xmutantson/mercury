@@ -47,6 +47,63 @@ static inline bool sack_rx_trace_enabled()
 	return cached != 0;
 }
 
+// ===========================================================================
+// REVERSE-CONFIRM-MISS DECOUPLE — the PURE decision for the MAIN data-ACK-timeout
+// amplifier (data-flow-revack-confirm-miss.md §5; the SAFE demote lever). The compact
+// coded reverse-confirm (default-ON, +4.22 dB deeper cliff than the uncoded-13 ACK+SACK
+// suffix — codec re-verified in mercury --test compact_confirm_cliff_sweep) makes a
+// clean-confirm suffix miss RARE. THIS handles the RESIDUAL miss:
+//
+//   When a block times out (data_ack_received==NO) but the base ACK pattern WAS detected
+//   this receive window (ack_diag_peak_matched >= ack_match_threshold), the RSP DID
+//   transmit a reverse confirm (compact OR 13-uncoded) whose CONTENT CRC did not validate
+//   — a residual confirm miss, NOT pure forward/reverse silence.
+//
+// The base ACK tone pattern is config-invariant AND does NOT distinguish CLEAN from
+// PARTIAL (mfsk.cc:882/917 both call generate_ack_pattern), so the confirmation CANNOT be
+// accepted on the base match alone — that would false-accept a PARTIAL as clean (silent
+// frame loss) and re-open the near-silence phantom the CRC gate closes (Fable wtsu2k647).
+// Instead make the MISS CHEAP: the full-resend already re-queued the batch for a SAME-GEAR
+// re-air (all PENDING_ACK -> ACK_TIMED_OUT at the block-failure head), so we ONLY DECOUPLE
+// the miss from the emergency_nack_count++/cfg16_revack_starve_fails++ amplifier — the
+// BREAK->ROBUST cascade stays dormant this turnaround and the next reverse confirm re-lands.
+// This does NOT credit the batch (data_ack_received stays NO -> NO data loss); it only
+// suppresses the demote. NEITHER config NOR cmd_batch_seq_id is touched (no epoch advance).
+//
+// SAFETY (genuine-death net, all args explicit so the regression --test-revack-confirm-miss
+// replays this EXACT logic):
+//   • base_detected        — the RSP responded (a base >=threshold correlation this window).
+//                            A genuinely dead forward/reverse channel is pure silence
+//                            (matched=0) -> base_detected=false -> BREAK fires unchanged.
+//   • data_ack_no          — data_ack_received==NO (the block-failure branch; the content
+//                            CRC did NOT validate — we are NEVER crediting here).
+//   • forward_ofdm_healthy — is_ofdm_config(last_data_viable_config): the forward link has
+//                            PROVEN OFDM (WB) viability this session (the residual confirm
+//                            miss is a WB/OFDM turnaround phenomenon; the compact confirm is
+//                            WB-only). On a link that only carries ROBUST this is false ->
+//                            the lever disengages and BREAK works normally on genuine fade.
+//   • consec < max_consec  — BOUNDED. A chronically-failing reverse CONTENT path (base always
+//                            detected, CRC never validates) OR a spurious base-noise
+//                            correlation escalates normally after REVACK_BASE_MISS_MAX_CONSEC,
+//                            so a stuck link still demotes. Reset to 0 on ANY data-ACK.
+// -DREVACK_CONFIRM_MISS_FAILBEFORE pins the return false (reproduce the amplifier) for the
+// fail-before/pass-after regression.
+static inline bool revack_confirm_miss_should_decouple(
+	bool base_detected, bool data_ack_no, bool forward_ofdm_healthy,
+	int consec, int max_consec)
+{
+#ifdef REVACK_CONFIRM_MISS_FAILBEFORE
+	(void)base_detected; (void)data_ack_no; (void)forward_ofdm_healthy;
+	(void)consec; (void)max_consec;
+	return false;
+#else
+	return base_detected
+	    && data_ack_no
+	    && forward_ofdm_healthy
+	    && consec < max_consec;
+#endif
+}
+
 // M6 — BREAK-path lossless requeue (data-flow-arq-recovery-cluster.md §5.6).
 // The Anchor-rung emergency BREAK (~:4071-4177) calls send_break_pattern() and
 // returns WITHOUT rolling cmd_batch_seq_id back to the stranded in-flight batch
@@ -226,6 +283,18 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	bool decoded = telecom_system->decode_compact_confirm_from_passband(
 		telecom_system->data_container.ready_to_process_passband_delayed_data,
 		tail_samples, cmd_compact_crc12_cb, this, &rx_bsi, &mfsk_matched);
+	// Register the base-pattern correlation for the REVERSE-CONFIRM-MISS DECOUPLE lever
+	// (data-flow-revack-confirm-miss.md §5): even when the GF(16)+CRC12 content decode
+	// FAILS below, a strong base match means the RSP DID transmit a reverse confirm this
+	// window. ack_diag_peak_matched is the peak-base-match diagnostic the block-failure path
+	// reads to tell a residual confirm miss (base detected) from pure silence (base=0). The
+	// standard receive_ack_pattern() path already maintains it; the compact peek runs its OWN
+	// base detect (decode_compact_confirm_from_passband's out_matched), so mirror the update
+	// here — otherwise a compact confirm whose CRC12 misses on the SACK-window probe path
+	// would not register as base-detected. Read-only peek writing a diagnostic member, exactly
+	// as the detector does (arq_common.cc:12030).
+	if(mfsk_matched > ack_diag_peak_matched)
+		ack_diag_peak_matched = mfsk_matched;
 	if(!decoded)
 		return false;  // soft_decode_compact already gated CRC12-over-[bsi].
 
@@ -5591,9 +5660,44 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				cmd_revsack_reairs = 0;   // consumed; the demote owns the next transition
 			}
 #endif // REVSACK_CHEAPMISS_FAILBEFORE
+			// ── REVERSE-CONFIRM-MISS DECOUPLE (the SAFE demote-amplifier lever,
+			//    data-flow-revack-confirm-miss.md §5) ──────────────────────────────
+			// A block timed out (data_ack_received==NO) — but did the RSP actually respond?
+			// ack_diag_peak_matched is the PEAK base-ACK-pattern correlation this receive window
+			// (maintained by receive_ack_pattern() AND, for the SACK-window compact probe, by
+			// cmd_compact_confirm_crc_valid()). If it reached the accept threshold, the RSP DID
+			// transmit a reverse confirm (compact OR 13-uncoded) whose CONTENT CRC did not
+			// validate — a residual confirm miss, NOT pure silence. On a forward link with PROVEN
+			// OFDM viability (is_ofdm_config(last_data_viable_config)) that is a cheap reverse-
+			// content miss, not a channel death: DECOUPLE it from the emergency_nack_count++ /
+			// cfg16_revack_starve_fails++ / BREAK amplifier (bounded by REVACK_BASE_MISS_MAX_CONSEC,
+			// reset on any data-ACK). The frames were ALREADY re-queued (PENDING_ACK->ACK_TIMED_OUT
+			// at the head of this data_ack_received==NO block) for the normal SAME-GEAR re-air;
+			// we credit NOTHING (data_ack_received stays NO) so there is NO data loss — only the
+			// demote is suppressed, and the next (compact, +4.22 dB) reverse confirm re-lands.
+			// NEITHER config NOR cmd_batch_seq_id is touched.
+			const bool revack_confirm_miss_reair = revack_confirm_miss_should_decouple(
+				/*base_detected=*/ ack_diag_peak_matched
+				                   >= telecom_system->ack_mfsk.ack_match_threshold,
+				/*data_ack_no=*/ true,
+				/*forward_ofdm_healthy=*/ is_ofdm_config(last_data_viable_config),
+				revack_base_miss_consec, REVACK_BASE_MISS_MAX_CONSEC);
+			if(revack_confirm_miss_reair)
+			{
+				revack_base_miss_consec++;
+				printf("[REVACK-CONFIRM-MISS] base ACK pattern detected (peak_matched=%d/%d) but "
+					"content CRC missed at config %d (anchor=%d) — CHEAP SAME-GEAR RE-AIR "
+					"(decouple #%d/%d): NO emergency_nack_count++, NO BREAK; cmd_batch_seq_id=%d "
+					"UNCHANGED.\n",
+					ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold,
+					current_configuration, last_data_viable_config,
+					revack_base_miss_consec, REVACK_BASE_MISS_MAX_CONSEC, cmd_batch_seq_id & 0xFF);
+				fflush(stdout);
+			}
 
 			// Count toward emergency BREAK. Batch halving doesn't bypass this.
-			emergency_nack_count++;
+			if(!revack_confirm_miss_reair)
+				emergency_nack_count++;
 
 			// WALL-B FIX-9 D3 (FIX9_D3_DESIGN.md §3, producer P2): count CONSECUTIVE block-failures
 			// AT CONFIG_16 where the reverse MFSK ACK+SACK correlator FAILED TO DECODE (we are in the
@@ -5606,13 +5710,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// keep this from being a generic ACK-timeout rebrand. On any non-CFG16 rung the streak
 			// resets so a later return to CFG16 starts fresh (P4); the deadline is consumed (reset to
 			// 0) in the D3 demote block below.
-			if(current_configuration == CONFIG_16)
-				cfg16_revack_starve_fails++;
-			else
-				cfg16_revack_starve_fails = 0;
+			// A3-style decouple: a decoupled residual confirm miss is NOT a CFG16 reverse-ACK
+			// STARVATION event (the RSP responded; only its content CRC missed — the turnaround
+			// is not starved to silence), so do NOT advance the FIX-9 D3 streak, leaving D3
+			// dormant this turnaround. The unchanged CFG16/non-CFG16 accounting runs otherwise.
+			if(!revack_confirm_miss_reair)
+			{
+				if(current_configuration == CONFIG_16)
+					cfg16_revack_starve_fails++;
+				else
+					cfg16_revack_starve_fails = 0;
+			}
 
 			// Batch halving disabled (batch size is fixed at negotiated value).
 			// Halving causes CMD/RSP batch size mismatch → ACK-GATE desync.
+			// A decoupled residual confirm miss suppresses the [BREAK] escalation prints (it did
+			// NOT count toward BREAK); it logged its own [REVACK-CONFIRM-MISS] line above.
+			if(!revack_confirm_miss_reair)
+			{
 			printf("[BREAK] Block failure #%d at config %d (threshold=%d, batch=%d)\n",
 				emergency_nack_count, current_configuration, emergency_nack_threshold, data_batch_size);
 			fflush(stdout);
@@ -5624,6 +5739,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					is_ofdm_config(last_data_viable_config) ? 1 : 0, ack_diag_peak_metric,
 					ack_diag_peak_matched, telecom_system->ack_mfsk.ack_match_threshold);
 				fflush(stdout);
+			}
 			}
 
 			// === WALL-B FIX-4 — CARVE-VIABILITY DEADLINE -> per-frame CFG15 fallback ===
@@ -6141,6 +6257,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// (A partial SACK that arrives is itself a reverse-ACK that decoded — the de-alignment
 			// has not yet starved the turnaround to silence.) Symmetric with emergency_nack_count.
 			cfg16_revack_starve_fails = 0;
+
+			// REVERSE-CONFIRM-MISS DECOUPLE (data-flow-revack-confirm-miss.md §5): ANY data-ACK
+			// (clean OR partial) proves the reverse channel LANDED a full confirm, so the
+			// consecutive-decoupled re-air streak resets UNGATED — symmetric with
+			// emergency_nack_count / cfg16_revack_starve_fails. This makes the decouple bound
+			// PER-STALL (not cumulative): a link that lands a confirm between misses is forgiven
+			// fresh; only a run of base-detected-but-CRC-missed turnarounds with NO landed ACK
+			// exhausts REVACK_BASE_MISS_MAX_CONSEC and re-arms the unchanged ++/BREAK.
+			revack_base_miss_consec = 0;
 
 			// WALL-B FIX-5: CLEAR the CFG16 big-block carve cooldown on CARVE SUCCESS. A
 			// data-ACK while current_configuration==CONFIG_16 with big-block framing live
@@ -9957,6 +10082,222 @@ int cl_arq_controller::test_phantom_ack_gate()
 	breaks_since_last_data_success = 0;            // restore
 
 	printf("[TEST-PHANTOM-ACK] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// REVERSE-CONFIRM-MISS DECOUPLE regression (--test-revack-confirm-miss;
+// data-flow-revack-confirm-miss.md §5). Fail-before/pass-after over the PRODUCTION
+// decision revack_confirm_miss_should_decouple() — the EXACT helper the block-failure
+// path (process_messages_rx_acks_data) calls before emergency_nack_count++. We replay the
+// escalation loop it guards: a run of block failures where the base ACK pattern WAS detected
+// this window (the RSP responded) but the content CRC missed, on a forward link with proven
+// OFDM viability.
+//   BEFORE (-DREVACK_CONFIRM_MISS_FAILBEFORE): the helper returns false, so EVERY miss
+//     ++emergency_nack_count -> it reaches the BREAK threshold (3) -> the demote-amplifier
+//     (the bimodal delivery lock the compact confirm keystone exists to break) is reproduced.
+//   AFTER: each forward-OFDM-healthy base-detected miss is DECOUPLED (cheap same-gear re-air):
+//     emergency_nack_count STAYS 0, NO BREAK, up to REVACK_BASE_MISS_MAX_CONSEC, then escalates.
+// Plus the genuine-death safety cases (pure silence / non-OFDM anchor NEVER decouple -> BREAK
+// preserved) and the per-stall reset (a landed data-ACK forgives the streak fresh).
+// PURE in-process synthetic-fire: no telecom_system, no PHY/audio, no IONOS/RF. 0 PASS / 1 FAIL.
+// ===========================================================================
+int cl_arq_controller::test_revack_confirm_miss_decouple()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		printf("[TEST-REVACK-CONFIRM-MISS] %s: %s (got=%d want=%d)\n",
+			cond ? "PASS" : "FAIL", name, got, want);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+
+#ifdef REVACK_CONFIRM_MISS_FAILBEFORE
+	const bool decouple_live = false;
+#else
+	const bool decouple_live = true;
+#endif
+	const int THRESH = 3;   // emergency_nack_threshold default (arq_common.cc)
+	const int CAP    = REVACK_BASE_MISS_MAX_CONSEC;
+	printf("[TEST-REVACK-CONFIRM-MISS] decouple=%s (BREAK threshold=%d, cap=%d)\n",
+		decouple_live ? "LIVE" : "FAIL-BEFORE(amplifier)", THRESH, CAP);
+	fflush(stdout);
+
+	// Replay the production block-failure decision for ONE miss with the given inputs:
+	// mutates (nack, consec) exactly as the wired path does (decouple -> consec++, NO nack++;
+	// else -> nack++).
+	auto one_miss = [](bool base_detected, bool fwd_ofdm, int& nack, int& consec) {
+		bool reair = revack_confirm_miss_should_decouple(
+			base_detected, /*data_ack_no=*/true, fwd_ofdm, consec, REVACK_BASE_MISS_MAX_CONSEC);
+		if(reair) consec++;
+		else      nack++;
+	};
+
+	// ---- SCENARIO A — forward-OFDM-healthy base-detected misses do NOT escalate ----
+	// CAP consecutive misses where the base ACK pattern was detected (RSP responded) on a
+	// forward-OFDM-healthy link.
+	{
+		int nack = 0, consec = 0;
+		for(int i = 0; i < CAP; i++) one_miss(/*base_detected=*/true, /*fwd_ofdm=*/true, nack, consec);
+		bool break_fired = (nack >= THRESH);
+		printf("[TEST-REVACK-CONFIRM-MISS] A DIAG (%s): %d misses -> nack=%d consec=%d BREAK=%d\n",
+			decouple_live ? "LIVE" : "FAIL-BEFORE", CAP, nack, consec, break_fired ? 1 : 0);
+		fflush(stdout);
+		// PASS-AFTER: all decoupled -> nack 0, no BREAK. FAIL-BEFORE: nack==CAP, BREAK fired.
+		check(nack == 0, "A1 base-detected forward-OFDM misses do NOT advance emergency_nack_count", nack, 0);
+		check(!break_fired, "A2 base-detected forward-OFDM misses do NOT trip the BREAK threshold", break_fired ? 1 : 0, 0);
+	}
+
+	// ---- SCENARIO B — BOUNDED: the (CAP+1)th consecutive miss escalates ----
+	// A chronically-failing reverse content path (base always detected, CRC never validates)
+	// must NOT decouple forever: after CAP decoupled re-airs the unchanged ++/BREAK fires.
+	{
+		int nack = 0, consec = 0;
+		for(int i = 0; i < CAP + 1; i++) one_miss(true, true, nack, consec);
+		// PASS-AFTER: exactly ONE miss (the CAP+1'th) escalated -> nack==1, consec==CAP.
+		// FAIL-BEFORE: all CAP+1 escalated -> nack==CAP+1.
+		if(decouple_live) {
+			check(nack == 1, "B1 the (cap+1)th consecutive miss escalates (bound holds)", nack, 1);
+			check(consec == CAP, "B2 decoupled streak saturates at the cap", consec, CAP);
+		} else {
+			check(nack == CAP + 1, "B1 FAIL-BEFORE: every miss escalates (no bound)", nack, CAP + 1);
+		}
+	}
+
+	// ---- SCENARIO C — GENUINE DEATH (pure silence): base NOT detected NEVER decouples ----
+	// A truly dead forward/reverse channel is pure silence (base correlation below threshold);
+	// base_detected=false must ALWAYS escalate so the BREAK cascade runs unchanged.
+	{
+		int nack = 0, consec = 0;
+		for(int i = 0; i < THRESH; i++) one_miss(/*base_detected=*/false, /*fwd_ofdm=*/true, nack, consec);
+		check(nack == THRESH, "C pure-silence (base NOT detected) ALWAYS escalates -> BREAK preserved", nack, THRESH);
+		check(consec == 0, "C pure-silence never advances the decouple streak", consec, 0);
+	}
+
+	// ---- SCENARIO D — GENUINE DEATH (non-OFDM anchor): forward not OFDM-healthy NEVER decouples ----
+	// On a link that only carries ROBUST (last_data_viable_config not OFDM) a block failure is
+	// genuine forward fade, not a WB reverse-content miss: escalate unchanged.
+	{
+		int nack = 0, consec = 0;
+		for(int i = 0; i < THRESH; i++) one_miss(/*base_detected=*/true, /*fwd_ofdm=*/false, nack, consec);
+		check(nack == THRESH, "D non-OFDM anchor ALWAYS escalates -> BREAK preserved on genuine fade", nack, THRESH);
+		check(consec == 0, "D non-OFDM anchor never advances the decouple streak", consec, 0);
+	}
+
+	// ---- SCENARIO E — PER-STALL RESET: a landed data-ACK forgives the streak ----
+	// The success block resets revack_base_miss_consec on ANY data-ACK, so the bound is
+	// per-stall: misses, then a landed ACK, then misses again must NOT prematurely escalate.
+	{
+		int nack = 0, consec = 0;
+		for(int i = 0; i < CAP - 1; i++) one_miss(true, true, nack, consec);   // CAP-1 decoupled
+		consec = 0;   // <- a data-ACK landed (production: revack_base_miss_consec = 0)
+		for(int i = 0; i < CAP - 1; i++) one_miss(true, true, nack, consec);   // CAP-1 more, forgiven fresh
+		check(nack == 0, "E per-stall reset: a landed data-ACK forgives the decouple streak", nack, 0);
+	}
+
+	printf("[TEST-REVACK-CONFIRM-MISS] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
+// DELIVERED-PAYLOAD BYTE-INTEGRITY gate (Fable #7 4a; --test-cc-delivery-integrity;
+// data-flow-revack-confirm-miss.md §7). Drives a FULL CMD->RSP single-batch clean transfer
+// through the 2-instance in-process lockstep stepper (test_sim_inproc_2, PINNED WB CFG15,
+// clean SNR3K=900, deterministic seed) — exercising the reverse-ACK / compact-confirm accept
+// path end-to-end — and asserts the RSP-delivered payload is EXACTLY the CMD-sent payload:
+//   rx_have == payload_len (no short delivery = missing; no over-delivery = duplicate)
+//   AND byte-for-byte identical (memcmp==0 inside test_sim_inproc_2 -> sim2_last_bytes_ok).
+// ANY missing / reordered / duplicated byte => FAIL. This is the SYSTEM-LEVEL catch for a
+// silent false-accept: if the acceptance gate ever credited a batch that was not fully
+// delivered (a partial credited as clean), the delivered stream would be short/wrong and this
+// assert would FAIL. PURE in-process (no device/TCP/threads/IONOS/RF). 0 PASS / 1 FAIL.
+// ===========================================================================
+int cl_arq_controller::test_compact_confirm_delivery_integrity()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-CC-DELIVERY] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+	printf("[TEST-CC-DELIVERY] delivered-payload byte-integrity gate (2-instance CMD->RSP, "
+	       "PINNED WB CFG15 clean, reverse-ACK/compact-confirm accept path)\n");
+	fflush(stdout);
+
+	// Save/restore the env test_sim_inproc_2 reads, so the battery leaves the process env clean.
+	struct EnvSave { const char* key; std::string saved; bool had; };
+	const char* keys[] = {
+		"MERCURY_SIM_2INST", "MERCURY_SIM2_PIN", "MERCURY_SIM2_CFG", "MERCURY_SIM2_ROBUST",
+		"MERCURY_SIM2_SNR3K", "MERCURY_SIM2_SEED", "MERCURY_SIM2_PAYLOAD_BYTES",
+		"MERCURY_SIM2_MAXITERS", "MERCURY_SIM2_STALL_ITERS", "MERCURY_SIM2_OPT"
+	};
+	const int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+	std::vector<EnvSave> env_saved((size_t)nkeys);
+	for(int i=0;i<nkeys;i++){
+		const char* v = std::getenv(keys[i]);
+		env_saved[(size_t)i].key = keys[i];
+		env_saved[(size_t)i].had = (v != nullptr);
+		env_saved[(size_t)i].saved = v ? std::string(v) : std::string();
+	}
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto restore_env = [&](){
+		for(int i=0;i<nkeys;i++){
+#if defined(_WIN32)
+			if(env_saved[(size_t)i].had) _putenv_s(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str());
+			else                         _putenv_s(env_saved[(size_t)i].key, "");
+#else
+			if(env_saved[(size_t)i].had) setenv(env_saved[(size_t)i].key, env_saved[(size_t)i].saved.c_str(), 1);
+			else                         unsetenv(env_saved[(size_t)i].key);
+#endif
+		}
+	};
+
+	// PINNED WB CFG15, clean, fixed seed, single-batch payload (the proven-byte-correct
+	// single-batch delivery — test_sim_inproc_sustain drives the same {600} case). PIN holds
+	// the config so the transfer is deterministic; the RSP data-ACKs the clean WB batch,
+	// exercising the reverse-ACK / compact-confirm accept path the CMD consumes.
+	set_env("MERCURY_SIM_2INST",       "1");
+	set_env("MERCURY_SIM2_PIN",        "1");
+	set_env("MERCURY_SIM2_CFG",        "15");
+	set_env("MERCURY_SIM2_ROBUST",     "0");
+	set_env("MERCURY_SIM2_SNR3K",      "900");
+	set_env("MERCURY_SIM2_SEED",       "777");
+	set_env("MERCURY_SIM2_PAYLOAD_BYTES","600");
+	set_env("MERCURY_SIM2_MAXITERS",   "200000");
+	set_env("MERCURY_SIM2_STALL_ITERS","0");
+	set_env("MERCURY_SIM2_OPT",        "0");
+
+	sim2_last_rx_have = -1; sim2_last_payload_len = -1;
+	sim2_last_bytes_ok = false; sim2_last_stalled = false;
+	int rc = test_sim_inproc_2();
+	restore_env();
+
+	printf("[TEST-CC-DELIVERY] result: rc=%d rx_have=%ld/%ld bytes_ok=%d stalled=%d\n",
+		rc, sim2_last_rx_have, sim2_last_payload_len,
+		(int)sim2_last_bytes_ok, (int)sim2_last_stalled);
+	fflush(stdout);
+
+	// The DELIVERED-PAYLOAD BYTE-INTEGRITY assertion (Fable #7 4a):
+	check(!sim2_last_stalled,
+	      "delivery completed via the genuine delivery break (not stalled/wedged)");
+	check(sim2_last_rx_have == sim2_last_payload_len,
+	      "delivered byte count EXACTLY equals sent (no missing, no duplicate)");
+	check(sim2_last_bytes_ok,
+	      "delivered payload byte-for-byte identical to sent (no reorder/corruption)");
+	check(rc == 0,
+	      "2-instance transfer G-SMOKE asserts all PASS");
+
+	printf("[TEST-CC-DELIVERY] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
