@@ -990,6 +990,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_config0_start_ring();
             }
+            // §22: the scoped down-ladder decoder bank inherits the PRIMARY's startup-patched ofdm_gi.
+            // A fresh `new cl_telecom_system()` rung otherwise keeps the ctor gi=54/256 -> CONFIG_0
+            // Nofdm=310 (not the production 292), an 18-sample/symbol FFT-window stride error that
+            // skips LDPC at WB CONFIG_0 -> the robust->OFDM cross never sustains. PASS-AFTER: 292.
+            // FAIL-BEFORE (MERCURY_INBAND_GI_INHERIT_DEFEAT=1, same binary): 310.
+            // data-flow-robust-ofdm-adopt-flush.md §22.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_down_decoder_gi_inherit();
+            }
             // §17: descrambler survives the inband ring-shrink (the CONFIG_0 clean-lock CRC-fail root).
             {
                 cl_arq_controller test_arq;
@@ -1000,6 +1010,29 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_deadbatch_progress();
+            }
+            // VAR-FIX DEMOTE-SAFETY: a pinned OFDM lock that trickles frames but cannot DELIVER a
+            // batch must become demotable so it can never deadlock+BREAK forever on an undecodable
+            // pin. Member test on a throwaway controller. data-flow-robust-ofdm-adopt-flush.md
+            // §VAR-FIX-DEMOTE. Fast + deterministic, no IONOS/RF.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_deliver_stall_releases_pin();
+            }
+            // §VAR-FIX-2 RX FORWARD-SEARCH GATE regression: the in-band RX must NOT storm the
+            // forward-preamble coarse search during the reverse-ACK turnaround gap (the 0.50 GI
+            // plateau SKIP-VAR storm). Drives the production gate inband_revack_rxgate_ftr().
+            // data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2 / §VF2.4. Fast, no IONOS/RF.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_revack_rxgate();
+            }
+            // §CROSS — progressing-batch futile-NACK suppression regression (the cfg0-cross
+            // death-spiral fix). Drives the production predicate
+            // inband_progressing_batch_suppresses_nack(). data-flow-robust-ofdm-adopt-flush.md §CROSS.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_progressing_nack();
             }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
@@ -1058,6 +1091,22 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_a3_decouple_safety();
             }
+            // CHEAP-MISS DEFAULT-ON (data-flow-inband-a3-decouple.md; tier-cross KEYSTONE):
+            // the cumulative-ack advertise + A3 demote-decouple env gates ship DEFAULT-ON for
+            // the in-band stack (explicit env escape-hatch retained). Member test on a
+            // throwaway controller; PURE in-process — drives the production resolver.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_cheapmiss_default_on();
+            }
+            // REVSACK Part B (revsack/design.json): the DATA-SACK cheap-miss decouple
+            // discriminator (the :5278 intercept). Re-air a forward-healthy reverse-ACK
+            // miss instead of emergency_nack++->BREAK->demote; D0 genuine-loss cases still
+            // demote. PURE in-process synthetic-fire on a throwaway controller.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_revsack_data_sack_cheapmiss();
+            }
             // HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §3):
             // a robust<->OFDM crossing routes to the legacy SET_CONFIG handshake
             // (fast dedicated ACK); intra-tier rate adapts keep the in-band tag.
@@ -1066,6 +1115,14 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_tier_crossing_routing();
+            }
+            // CONFIG_TAG TIER-CROSS ROUTING (tier-cross-hold synthesis approach A):
+            // when the cheap-miss spine is live, a robust<->OFDM cross routes via the
+            // in-band CONFIG_TAG (NO SET_CONFIG reverse-ACK dependency at the cross);
+            // spine-off keeps the legacy SET_CONFIG cross. PURE in-process gate.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_tag_cross_routing();
             }
             // IN-BAND TIER-CROSS REVERSE-ACK PIN regression (data-flow-inband-tier-
             // crossing.md §3): a robust<->OFDM cross must pin reverse_configuration to
@@ -1094,6 +1151,28 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_rbfollow;
                 failed += test_rbfollow.test_inband_robust_follow_freshwin();
             }
+            // SUPER-ACK CMD-LEAP / FAIL-SAFE regression (SUPERACK_DESIGN.md §2.4/§3.3/§4/§5,
+            // data-flow-superack.md §5). Drives the PRODUCTION SUPER-ACK state machine in-process:
+            // CASE 1 FAIL-margin -> NO SUPER-ACK; CASE 2 a mis-decoded SUPER-ACK degrades to a
+            // normal +1 (every D0 gate leaves the config untouched -> NEVER a spurious jump);
+            // CASE 3 an over-leap backs off to turboshift_last_good via the reverse rate-NACK;
+            // CASE 4 a lost/dup ABSOLUTE-target SUPER-ACK does NOT accumulate. PURE in-process —
+            // permanent regression gate.
+            {
+                cl_arq_controller test_superack;
+                failed += test_superack.test_inband_superack();
+            }
+            // LEAP-STICK regression (data-flow-config-state-rsp-adopt.md §6): after the
+            // SUPER-ACK ROBUST->WB leap the RSP follows the tag through the shared adopt
+            // helper inband_adopt_resynced_config, which must advance the FORWARD config
+            // triad (current==data==forward) so the post-ACK restore step
+            // (arq_responder.cc:1800) is a no-op and the RSP does NOT snap back to ROBUST.
+            // Drives the production adopt directly, in-process. PURE synthetic-fire —
+            // permanent regression gate. Fail-before: data/forward_configuration stay stale.
+            {
+                cl_arq_controller test_leapstick;
+                failed += test_leapstick.test_inband_leap_stick();
+            }
             // IN-BAND CONFIG_0 ROLLING-PARTIAL climb-unblock regression
             // (data-flow-inband-frame0-rolling-partial.md §4): at the inband OFDM base rung the
             // first OFDM frame of each batch fails the SKIP-VAR gate (acquisition seam) → a
@@ -1116,6 +1195,33 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_cd;
                 failed += test_cd.test_inband_climb_defer_on_retx();
+            }
+            // RSP EOB-FAST-PATH HALF-DUPLEX COLLISION regression
+            // (data-flow-robust-ofdm-adopt-flush.md §22): once a cfg0 batch goes partial the
+            // CMD re-airs the missing frames mixed with the next new batch in ONE forward TX;
+            // pre-fix, decoding the OLD batch's EOB frame among that re-air armed a ~300 ms
+            // "fast path" so the RSP keyed up to SACK WHILE the CMD was still transmitting ->
+            // half-duplex collision -> the re-aired lead frames are never captured ->
+            // self-reinforcing partial wedge -> block_success never 100% -> cfg0 climb never
+            // fires. The fix sizes the incomplete-batch re-arm by the missing-frame count so
+            // the RSP listens through the CMD's forward-TX drain before turning around. PURE
+            // in-process — permanent regression gate. Fails-before: -DMERCURY_RSP_EOBFAST_FAILBEFORE.
+            {
+                cl_arq_controller test_eob;
+                failed += test_eob.test_rsp_eobfast_collision();
+            }
+            // IN-BAND CMD/RSP REVERSE-ACK LOCKSTEP regression
+            // (data-flow-robust-ofdm-adopt-flush.md §23). The EOB-fast fix (above) made the RSP
+            // DELAY its turnaround on an incomplete batch; this gate proves the CMD listen window
+            // (calculate_receiving_timeout) WIDENS in lockstep to ⊇ that delayed RSP turnaround at
+            // the marginal cfg0 rung under MERCURY_INBAND_RATE — so the reverse SACK lands in-window
+            // (no [CMD-ACK-PAT] Timeout -> no block-failure -> no out-of-window 0->102 demote) and
+            // the CMD stays forward-silent in RECEIVING_ACKS_DATA (no half-duplex collision). Both
+            // failure modes share the mis-sized-window root; one term fixes both. PURE in-process —
+            // permanent regression gate. Fails-before: -DINBAND_LOCKSTEP_FAILBEFORE.
+            {
+                cl_arq_controller test_lockstep;
+                failed += test_lockstep.test_inband_lockstep_revwindow();
             }
             // IN-BAND +1 CLIMB regression (data-flow-inband-frame0-rolling-partial.md §7.2
             // option A): under MERCURY_INBAND_RATE the FRAME-UP climb must step EXACTLY +1
@@ -1241,6 +1347,16 @@ int main(int argc, char *argv[])
             int failed = ARQ_tc.test_inband_tier_crossing_routing();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-inband-tag-cross : run ONLY the CONFIG_TAG tier-cross routing regression
+        // (tier-cross-hold synthesis approach A) and exit. Spine-live robust<->OFDM cross
+        // -> route via the in-band tag (NO SET_CONFIG reverse-ACK dependency); spine-off ->
+        // legacy SET_CONFIG cross. Build with -DINBAND_TAG_CROSS_FAILBEFORE to reproduce the
+        // fails-before (cross keeps SET_CONFIG). See test_inband_tag_cross_routing.
+        if (strcmp(argv[i], "--test-inband-tag-cross") == 0) {
+            cl_arq_controller ARQ_tgx;
+            int failed = ARQ_tgx.test_inband_tag_cross_routing();
+            return (failed == 0) ? 0 : 1;
+        }
         // --test-inband-reverse-pin : run ONLY the tier-cross reverse-ACK pin regression
         // (robust<->OFDM cross -> reverse pinned to the robust rung, not the OFDM forward
         // rung) and exit. Fast + deterministic; see
@@ -1290,6 +1406,46 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-climb-defer") == 0) {
             cl_arq_controller ARQ_cd;
             int failed = ARQ_cd.test_inband_climb_defer_on_retx();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-rsp-eobfast : run ONLY the RSP EOB-fast-path half-duplex collision regression
+        // (data-flow-robust-ofdm-adopt-flush.md §22 — the cfg0 climb-killer: the EOB-fast 300 ms
+        // turnaround on an interior-hole partial collides with the CMD's mixbatch re-air -> wedge).
+        // Drives the REAL pure helper rsp_incomplete_batch_rx_timeout_ms. Build with
+        // -DMERCURY_RSP_EOBFAST_FAILBEFORE to reproduce the fails-before (the 300 ms collision).
+        if (strcmp(argv[i], "--test-rsp-eobfast") == 0) {
+            cl_arq_controller ARQ_eob;
+            int failed = ARQ_eob.test_rsp_eobfast_collision();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-lockstep : run ONLY the CMD/RSP reverse-ACK lockstep regression
+        // (data-flow-robust-ofdm-adopt-flush.md §23 — the CMD-side sibling of --test-rsp-eobfast).
+        // After the EOB-fast fix delayed the RSP turnaround, the CMD window must WIDEN in lockstep
+        // to ⊇ that turnaround, else the delayed cfg0 SACK lands out-of-window -> the 0->102 demote.
+        // Drives the REAL producer calculate_receiving_timeout(). Build with
+        // -DINBAND_LOCKSTEP_FAILBEFORE to reproduce the fails-before (window < RSP turnaround).
+        if (strcmp(argv[i], "--test-inband-lockstep") == 0) {
+            cl_arq_controller ARQ_ls;
+            int failed = ARQ_ls.test_inband_lockstep_revwindow();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-revack-rxgate : run ONLY the §VAR-FIX-2 RX forward-search gate regression
+        // (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2 / §VF2.4 — the RSP must NOT storm the
+        // forward-preamble coarse search during its own reverse-ACK turnaround gap). Drives the REAL
+        // gate inband_revack_rxgate_ftr(). MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1 reproduces the storm.
+        if (strcmp(argv[i], "--test-inband-revack-rxgate") == 0) {
+            cl_arq_controller ARQ_rg;
+            int failed = ARQ_rg.test_inband_revack_rxgate();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-inband-progressing-nack : run ONLY the §CROSS progressing-batch futile-NACK
+        // suppression regression (data-flow-robust-ofdm-adopt-flush.md §CROSS — the down-ladder
+        // must NOT emit a cannot-follow NACK while the batch is progressing). Drives the REAL
+        // predicate inband_progressing_batch_suppresses_nack(). MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1
+        // reproduces the futile NACK / the cfg0-cross death-spiral.
+        if (strcmp(argv[i], "--test-inband-progressing-nack") == 0) {
+            cl_arq_controller ARQ_pn;
+            int failed = ARQ_pn.test_inband_progressing_nack();
             return (failed == 0) ? 0 : 1;
         }
         // --test-climb-bsi-rollback : run ONLY the climb-UP cmd_batch_seq_id rollback regression
@@ -1577,6 +1733,8 @@ int main(int argc, char *argv[])
     bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
+    bool test_inband_superack_cli = false;  // --test-inband-superack: SUPER-ACK CMD-leap / fail-safe regression.
+    bool test_inband_leap_stick_cli = false;  // --test-inband-leap-stick: RSP adopt advances forward config triad so the leap sticks.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
     bool test_inband_nack_cli = false;  // --test-inband-nack: in-band Stage 4e — D2 NACK first-class.
     bool test_inband_reannounce_cli = false;  // --test-inband-reannounce: in-band Stage 4e — D3 periodic re-announce.
@@ -1658,6 +1816,7 @@ int main(int argc, char *argv[])
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
     bool test_a3_decouple_safety_cli = false; // --test-a3-decouple-safety: the §2 CHECKPOINT — single-miss non-load-bearing (anti-0-bytes, byte-faithful) + genuine-death net intact, demote IN PLACE (data-flow-forgiving-ack.md §T2.2/§6).
+    bool test_inband_cheapmiss_cli = false; // --test-inband-cheapmiss: cheap-miss DEFAULT-ON policy resolver (cumulative-ack advertise + A3 decouple ship default-on in-band; explicit env escape-hatch). FAIL-BEFORE -DINBAND_CHEAPMISS_FAILBEFORE (data-flow-inband-a3-decouple.md; tier-cross KEYSTONE).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_tinterp_seed_cli = false; // --test-tinterp-seed: TINTERP-SEED production it=0 estimator seed-swap failing-first (staging/tinterp-seed).
@@ -2444,6 +2603,29 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-inband-superack") == 0)
+        {
+            // SUPER-ACK CMD-LEAP / FAIL-SAFE regression (one-shot at startup, exit rc).
+            // Fast, PURE in-process — no cards / no PHY tail (unlike the aggregate --test).
+            // Drives superack_target_from_margin + inband_handle_superack + the reverse-NACK
+            // backoff (inband_route_failure_demote). See arq_responder.cc test_inband_superack
+            // + SUPERACK_DESIGN.md §2.4/§3.3/§4/§5 + data-flow-superack.md §5.
+            test_inband_superack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-leap-stick") == 0)
+        {
+            // LEAP-STICK regression (one-shot at startup, exit rc). Fast, PURE in-process.
+            // Drives inband_adopt_resynced_config(CONFIG_8) from a ROBUST_0 seat and asserts
+            // the forward config triad (current==data==forward) advances coherently so the
+            // post-ACK restore step (arq_responder.cc:1800) is a no-op and the RSP does NOT
+            // snap back to ROBUST after the SUPER-ACK ROBUST->WB leap. See arq_responder.cc
+            // test_inband_leap_stick + data-flow-config-state-rsp-adopt.md §6.
+            test_inband_leap_stick_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strcmp(argv[i], "--test-inband-retag") == 0)
         {
             // In-band rate adaptation Stage 4d — D1 repeat-until-followed + D4 climb/
@@ -2512,6 +2694,18 @@ int main(int argc, char *argv[])
             // (the genuine-death net is intact). Gate that MUST be GREEN before the
             // Phase-2 demote-decouple. See data-flow-forgiving-ack.md §T2.2/§6.
             test_a3_decouple_safety_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-cheapmiss") == 0)
+        {
+            // CHEAP-MISS DEFAULT-ON policy resolver (tier-cross KEYSTONE). Asserts the
+            // cumulative-ack advertise + A3 demote-decouple env gates ship DEFAULT-ON for
+            // the in-band stack (CLAUDE.md don't-park-proven-fix), with the explicit env
+            // escape-hatch retained both directions. FAIL-BEFORE -DINBAND_CHEAPMISS_FAILBEFORE
+            // pins the no-env path OFF (the demote-spine-OFF regression frame0-rolling-partial
+            // §12.2). data-flow-inband-a3-decouple.md.
+            test_inband_cheapmiss_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4115,6 +4309,18 @@ start_modem:
             fflush(stdout);
             exit(rc);
         }
+        if (test_inband_cheapmiss_cli) {
+            // CHEAP-MISS DEFAULT-ON policy resolver (one-shot, then exit rc). Asserts the
+            // tier-cross KEYSTONE: cumulative-ack advertise + A3 demote-decouple ship
+            // DEFAULT-ON for the in-band stack (explicit env escape-hatch retained).
+            printf("[FLAG] --test-inband-cheapmiss: invoking the cheap-miss DEFAULT-ON "
+                   "policy resolver regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_cheapmiss_default_on();
+            printf("[FLAG] Cheap-miss default-on test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
         if (test_pas_cli) {
             // PAS/PCS distribution-matcher bijection + composition self-test
             // (one-shot, then exit rc). No Mercury/ARQ state needed.
@@ -4288,6 +4494,28 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_no_break();
             printf("[FLAG] Inband-no-break test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_superack_cli) {
+            // SUPER-ACK CMD-LEAP / FAIL-SAFE regression (one-shot, exit rc). Builds its own
+            // CMD/telecom_system instances internally — fast, no PHY tail.
+            printf("[FLAG] --test-inband-superack: invoking the SUPER-ACK CMD-leap / fail-safe "
+                   "regression (SUPERACK_DESIGN.md §2.4/§3.3/§4/§5)\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_superack();
+            printf("[FLAG] Inband-superack test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_inband_leap_stick_cli) {
+            // LEAP-STICK regression (one-shot, exit rc). Builds its own RSP/telecom_system
+            // instance internally — fast, no PHY tail.
+            printf("[FLAG] --test-inband-leap-stick: invoking the SUPER-ACK leap-stick "
+                   "regression (data-flow-config-state-rsp-adopt.md §6)\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_leap_stick();
+            printf("[FLAG] Inband-leap-stick test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

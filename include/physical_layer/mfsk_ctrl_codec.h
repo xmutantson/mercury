@@ -55,6 +55,13 @@ enum mfsk_ctrl_frame_type : uint8_t {
 	// Rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as CONFIG_TAG, type=5 (the first
 	// free 3-bit code after the 2->3 widen). Codes 6,7 remain free.
 	MFSK_CTRL_NACK       = 5,
+	// SUPER-ACK (SUPERACK_DESIGN.md §2, the rate-UP mirror of the rate-NACK): the RX
+	// maps its LDPC decode MARGIN (receive_stats.iterations_done) to a coded SKIP-LEVEL
+	// and sends the ABSOLUTE recommended target config on the reverse ACK. The CMD leaps
+	// DIRECTLY to skip_target (bypassing the dead is_ofdm_config SNR gate). Rides the SAME
+	// RM(1,4)+gf16ra+CRC-12 substrate as CONFIG_TAG/NACK, type=6 (the first free code after
+	// NACK). Code 7 remains free (future 2nd super-code / batch-resize hint).
+	MFSK_CTRL_SUPERACK   = 6,
 };
 
 // Stage 4e (D2) NACK reason codes (2-bit field in the NACK payload).
@@ -543,5 +550,62 @@ bool nack_wrap_decode(const double* energies,
                       double peak_ratio_gate,
                       ctrl_crc12_fn crc12_fn, void* crc12_ctx,
                       nack_decode_result* out);
+
+// =============================================================================
+// SUPER-ACK codec (SUPERACK_DESIGN.md §2, the rate-UP mirror of the rate-NACK)
+// =============================================================================
+//
+// The SUPER-ACK rides the SAME RM(1,4)+gf16ra+CRC-12 substrate as the CONFIG_TAG/NACK,
+// with type=MFSK_CTRL_SUPERACK=6. The RM(1,4) Walsh prefix carries `skip_target_cfg`
+// (the FWHT-hardened PRIMARY detector — the recommended ABSOLUTE target config the RSP's
+// decode margin says the link can sustain); the gf16ra/CRC-12 message carries the 37-bit
+// SUPER-ACK payload below (the binding copy + confidence + ack bsi). Decode is the SAME
+// WRAP (FWHT peak + GF(16)+CRC-12 + skip_target corroboration), type-discriminated to 6.
+//
+// ABSOLUTE (not relative) skip_target: a lost/duplicated SUPER-ACK can never ACCUMULATE
+// into an over-jump — the CMD always leaps to the same wire value (SUPERACK_DESIGN.md §5.1).
+//
+// SUPER-ACK payload (37 bits) — MSB-first, the SAME bit-slot discipline as
+// pack_config_tag_payload / pack_nack_payload:
+//   bits 36..32 : skip_target_cfg (5)  the RSP's recommended ABSOLUTE target config
+//                                        (0..16 WB ladder ONLY; NEVER a ROBUST index).
+//                                        WRAP corroboration copy of the RM(1,4) codeword.
+//   bits 31..29 : ack_bsi_lsb     (3)  the batch_seq being ACKed & 0x7 (binds the
+//                                        SUPER-ACK to the frame — CMD fail-safe gate 5)
+//   bits 28..26 : skip_confidence (3)  RSP self-rated tier 0..7 (from the margin, §3);
+//                                        CMD uses it for under-skip depth / probe-vs-commit
+//   bit  25     : epoch_parity    (1)  toggles per RSP rate-advice epoch; lets the CMD
+//                                        dedup a re-aired SUPER-ACK
+//   bits 24..0  : reserved        (25) TX sends 0, RX ignores
+void pack_superack_payload(uint64_t* p37, uint8_t skip_target_cfg,
+                           uint8_t ack_bsi_lsb, uint8_t skip_confidence,
+                           uint8_t epoch_parity);
+
+bool unpack_superack_payload(uint64_t p37, uint8_t* skip_target_cfg,
+                             uint8_t* ack_bsi_lsb, uint8_t* skip_confidence,
+                             uint8_t* epoch_parity);
+
+// SUPER-ACK WRAP decode (mirror of nack_wrap_decode, type=MFSK_CTRL_SUPERACK). Accepts
+// ONLY if the FWHT peak-margin passes AND the GF(16)+CRC-12 type-6 decode passes AND the
+// FWHT skip_target corroborates the CRC-field skip_target_cfg (SUPERACK_DESIGN.md §2.4
+// gate 4). The binding bits (ack_bsi_lsb/confidence/parity) are surfaced to the caller
+// (the CMD applies its own bsi/epoch fail-safe gates in inband_handle_superack — kept out
+// of the codec so it stays policy-free). Returns true on accept; writes the decoded fields.
+struct superack_decode_result {
+	uint8_t skip_target_cfg;
+	uint8_t ack_bsi_lsb;
+	uint8_t skip_confidence;
+	uint8_t epoch_parity;
+	double  fwht_rpeak;
+	bool    fwht_passed;
+	bool    crc_passed;
+	bool    skip_corroborate;   // FWHT skip_target == CRC-field skip_target_cfg
+};
+
+bool superack_wrap_decode(const double* energies,
+                          const double* chip_soft,
+                          double peak_ratio_gate,
+                          ctrl_crc12_fn crc12_fn, void* crc12_ctx,
+                          superack_decode_result* out);
 
 #endif // INC_MFSK_CTRL_CODEC_H_

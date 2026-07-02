@@ -4740,9 +4740,51 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	// fine pass even when coarse matched < 6, because the asynchronous arrival
 	// phase often lands mid-symbol → FFT windows straddle two transmitted
 	// symbols → coarse_matched collapses → BREAK never refines and never
-	// fires. Polled callers (ACK) don't need this because they slide the
-	// tail-snapshot every 2-3 ms and eventually hit alignment.
-	if ((always_fine || best_matched >= 6) && best_pos >= 0)
+	// fires.
+	//
+	// BASE-PATTERN STRADDLE FIX (_research/patack, fix/revsack-data-sack):
+	// the old comment claimed "polled callers (ACK) don't need this because they
+	// slide the tail-snapshot every 2-3 ms and eventually hit alignment." That is
+	// FALSE for the steady reverse data-ACK on a CLIMBED rung. The ACK burst lands
+	// at an ARBITRARY sub-symbol phase (RSP integer-ms wait rounding + pilot +
+	// half-duplex T/R drain + ±8.16 ppm slip; send_ack_pattern arq_common.cc).
+	// The tail-snapshot slides in TIME but every snapshot reproduces the SAME
+	// modulo-symbol-period remainder, so the burst keeps straddling the GI
+	// boundary and the coarse symbol-grid count plateaus at 4-6/16 — NEVER
+	// reaching the old >=6 fine-search arm. The un-refined 4-6 then trips the
+	// hard suffix gate (detect_ack_snr_from_passband: out_matched < 7/16 → -99),
+	// discarding the WHOLE ACK incl. the config-discriminating bsi suffix →
+	// inband_retag_confirm_from_sack never fires → cfg0 never climbs.
+	//
+	// Fix: lower the fine-search ARM FLOOR from 6 to FINE_REFINE_MATCH_FLOOR (4).
+	// This arms the SAME ±half-symbol base-rate re-centering on a present-but-
+	// straddled candidate so its FFT windows re-align before the UNCHANGED 7/16 +
+	// 0.5-metric accept bar. It is NOT a threshold relaxation: the accept count
+	// and metric gate are untouched; only the FFT-window alignment improves, so a
+	// real ACK's symbols land in their expected bins. The floor (4) sits ABOVE
+	// the ~2/16 pure-noise random-match mean (the recovery-ack path independently
+	// chose a 5-floor for the same FAR tradeoff), so an idle/silent poll (coarse
+	// 0-3) still SKIPS the fine pass and gains no extra noise draw at the 7/16
+	// gate — FAR-safe. The fine pass itself is monotone-safe (below at the
+	// fine-vs-coarse adopt: it only ADOPTS a fine result that matches MORE
+	// symbols, or equal-matched with higher metric; it can never lower
+	// best_matched or manufacture a candidate where coarse found none).
+	// always_fine callers (BREAK) are unaffected — they short-circuit the floor.
+	// The climb stays on the config-discriminating bsi suffix (NOT the
+	// config-invariant bare pattern): this fix only makes that existing suffix
+	// path DECODE on an off-grid turnaround. Zero added wire airtime (RX-side
+	// FFT recompute at finer time steps only).
+	//
+	// FAIL-BEFORE arm (-DACK_OFFGRID_FINE_FAILBEFORE): restore the old >=6 floor so
+	// the directed test test_ofdm_ack_offgrid_fine_recenter reproduces the bug (a
+	// clean off-grid ACK whose coarse count lands in [4,6) is NOT re-centered and
+	// matched stays <7). The default build (macro unset) is the fix (floor 4).
+#ifdef ACK_OFFGRID_FINE_FAILBEFORE
+	const int FINE_REFINE_MATCH_FLOOR = 6;   // pre-fix: misses the off-grid [4,6) ACK
+#else
+	const int FINE_REFINE_MATCH_FLOOR = 4;   // fix: arm the re-center on a present candidate
+#endif
+	if ((always_fine || best_matched >= FINE_REFINE_MATCH_FLOOR) && best_pos >= 0)
 	{
 		int coarse_offset = best_pos * sym_period_interp;
 		int search_half = sym_period_interp / 2;

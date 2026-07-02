@@ -1545,38 +1545,36 @@ void cl_arq_controller::process_messages_rx_data_control()
 							effective_batch = hdr_expected;
 					}
 
-					if(batch_rx_frame_count >= effective_batch)
-					{
-						// All expected frames decoded -- ACK immediately.
-						rx_timeout = ptt_on_delay_ms;
-					}
-					else if(sack_enabled && last_received_end_of_batch_seq >= 0)
-					{
-						// Fix B (SACK turnaround, SACK_TURNAROUND_FIX_PLAN.md §8.3):
-						// EOB-frame fast path. The commander marks its LAST DATA
-						// frame with bit 7 of sequence_number; decoding it sets
-						// last_received_end_of_batch_seq >= 0. That is POSITIVE
-						// PROOF the commander has finished transmitting this batch
-						// -- so RSP must NOT wait out the full remaining-batch
-						// estimate before SACKing. Use a short turnaround
-						// (ptt_on + ptt_off, ~300 ms) so the receiving timer
-						// expires just after the EOB frame and RSP SACKs the gaps
-						// immediately. send_sack_v2_frame()'s own TX path supplies
-						// the precise CMD-drain margin. Only correct paired with Fix A:
-						// if the EOB frame itself is lost this branch never runs
-						// and Fix A's per-frame rx_timeout is the fallback.
-						rx_timeout = ptt_on_delay_ms + ptt_off_delay_ms;
-					}
-					else
-					{
-						// More frames expected.  Add one msg_time margin for
-						// FAIL recovery (false peaks in old frame body).
-						int remaining = effective_batch - messages_rx_buffer.sequence_number - 1;
-						if(remaining < 0) remaining = 0;
-						rx_timeout = remaining * message_transmission_time_ms
-							+ time_left_to_send_last_frame + ptt_on_delay_ms
-							+ message_transmission_time_ms;
-					}
+					// EOB-FAST-PATH COLLISION FIX (data-flow-robust-ofdm-adopt-flush.md §22).
+					// The complete-batch / incomplete-batch decision is now a SINGLE pure
+					// helper (rsp_incomplete_batch_rx_timeout_ms) so production and the
+					// directed test (--test-rsp-eobfast) drive the EXACT same arithmetic.
+					//
+					// PRE-FIX this was: complete -> ptt_on (fast); EOB-seen-incomplete ->
+					// ptt_on+ptt_off (~300 ms "fast path", Fix B §8.3); else -> seq-anchored
+					// remaining. The EOB-fast branch fired whenever the EOB-marked frame
+					// decoded EVEN with interior/lead frames still missing — and under the
+					// mixbatch re-air loop (CMD interleaves the partial batch's retx with the
+					// next new batch in ONE forward TX) that 300 ms turnaround keyed the RSP
+					// up to SACK WHILE the CMD was still transmitting forward frames -> the
+					// re-aired lead frames are never captured -> self-reinforcing partial
+					// wedge -> block_success never 100% -> cfg0 climb never fires (fleet
+					// arq_inbandR1.log: RSP TX-MFSK-ACK-SACK at T+148.0 inside the CMD bsi=6
+					// TX window T+144.5..152.5). The seq-anchored `else` ALSO under-waited
+					// (remaining anchored to the EOB = highest seq -> 0 -> ~1 frame-time).
+					//
+					// The helper: an INCOMPLETE batch (n_miss>0, holes the CMD WILL re-air)
+					// waits n_miss*msg_time + one msg_time margin so the per-frame re-arm
+					// (Fix A, below) only expires after the channel has gone IDLE for ~the
+					// re-air duration — out of the collision window. A COMPLETE batch keeps
+					// the ptt_on fast ACK (unchanged). Legacy/clean batches are complete ->
+					// byte-identical fast path; this only changes the partial-batch WHEN.
+					rx_timeout = rsp_incomplete_batch_rx_timeout_ms(
+						effective_batch, batch_rx_frame_count,
+						messages_rx_buffer.sequence_number,
+						(sack_enabled && last_received_end_of_batch_seq >= 0),
+						message_transmission_time_ms, ptt_on_delay_ms, ptt_off_delay_ms,
+						time_left_to_send_last_frame);
 				}
 				// Fix A (SACK turnaround, SACK_TURNAROUND_FIX_PLAN.md §8.2):
 				// re-arm the receiving timer on EVERY decoded DATA frame with the
@@ -2567,7 +2565,39 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				}
 				if (!used_mfsk_path)
 				{
-					mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+					// SUPER-ACK inline suffix (data-flow-superack.md §9, ROOT 2): on a
+					// from-ROBUST clean data ACK with a comfortable LDPC margin, recommend
+					// an ABSOLUTE WB skip-target so the CMD leaps DIRECTLY (bypassing the
+					// dead is_ofdm_config SNR gate). Computed HERE so it rides as a SHORT
+					// tone suffix INLINE on the SAME ACK burst (one PTT) the CMD already
+					// detects+decodes, landing the ~1000x ROBUST->WB leap on THIS turnaround.
+					// (ROOT 2: the old SEPARATE burst aired ~0.77 s AFTER the CMD had already
+					// turned around, so it was never captured.) ROBUST-only (a WB config's
+					// turbo elevator refines rate on real SNR); WB M>=16; no-op off-feature.
+					// Bound to the clean-ACK bsi by the CMD (no bsi on the wire).
+					int superack_ladder_idx = -1;
+					if (inband_rate_feature_enabled()
+					    && is_robust_config(current_configuration)
+					    && telecom_system != NULL
+					    && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
+					{
+						int niter_max = telecom_system->ldpc.nIteration_max;
+						int iters = telecom_system->receive_stats.iterations_done;
+						uint8_t sa_conf = 0;
+						int sa_target = superack_target_from_margin(iters, niter_max, &sa_conf);
+						if (sa_target >= 0
+						    && config_ladder_index(sa_target)
+						         > config_ladder_index(current_configuration))
+						{
+							superack_ladder_idx = config_ladder_index(sa_target);
+							printf("[RSP-SUPERACK] clean ROBUST decode (iters=%d/max=%d) -> "
+								"recommend CONFIG_%d (conf=%u ladder=%d) INLINE on ACK bsi_lsb=%u\n",
+								iters, niter_max, sa_target, (unsigned)sa_conf,
+								superack_ladder_idx, (unsigned)(wire_bsi & 0x7));
+							fflush(stdout);
+						}
+					}
+					mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32, superack_ladder_idx);
 				}
 				if (mfsk_ms > 0)
 				{
@@ -5969,6 +5999,508 @@ int cl_arq_controller::test_inband_no_break()
 }
 
 // ============================================================================
+// SUPER-ACK CMD LEAP / FAIL-SAFE regression — --test-inband-superack
+// SUPERDACK_DESIGN.md §2.4 (fail-safe) / §3.3 (under-skip) / §4 (leap) / §5 (over-leap).
+// data-flow-superack.md §5 regression-test plan.
+// ============================================================================
+//
+// Drives the PRODUCTION SUPER-ACK state machine directly, in-process (no cards / no PHY):
+// superack_target_from_margin (RSP policy) + inband_handle_superack (CMD leap + D0 gates)
+// + inband_route_failure_demote (the reverse-NACK backoff body, mirrored the same way
+// test_inband_no_break drives it). Asserts, per the task/design:
+//
+//   CASE 1 — FAIL-margin -> NO SUPER-ACK. The margin map returns -1 for every FAIL/pre-
+//     decode sentinel, so the RSP emits NO SUPER-ACK (the emit site is gated on target>=0)
+//     -> the CMD never leaps on a FAIL decode. A qualifying margin DOES map to a WB target.
+//   CASE 2 — a MIS-DECODED SUPER-ACK degrades to a normal +1 (NEVER a spurious jump). Every
+//     D0 fail-safe gate (UP-only, bsi-binding, in-flight-climb/BREAK/disconnected) makes
+//     inband_handle_superack return false AND leave negotiated_configuration / turboshift_*
+//     untouched -> the frame stays a plain ACK.
+//   CASE 3 — an OVER-LEAP triggers a reverse-NACK backoff to turboshift_last_good. After a
+//     clean SUPER-ACK leap CONFIG_0 -> CONFIG_8, turboshift_last_good == the pre-leap rung;
+//     the reverse rate-NACK (NACK_UNFOLLOWABLE_CLIMB, the pinned ROBUST reverse carrier the
+//     reverse-pin guarantees) routes inband_route_failure_demote back to turboshift_last_good.
+//   CASE 4 — a LOST/DUPLICATED ABSOLUTE-target SUPER-ACK does NOT accumulate. Re-applying the
+//     SAME SUPER-ACK is deduped (2nd apply returns false, config unchanged); and because the
+//     target is ABSOLUTE, applying it again after a batch advance lands on the SAME config,
+//     never a second additive jump.
+//
+// PURE in-process synthetic-fire — a permanent regression gate. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_superack()
+{
+	const char* TAG = "[TEST-INBAND-SUPERACK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Force MERCURY_INBAND_RATE on for the duration (save + restore). ---
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	auto set_inband = [&](bool on){
+#if defined(_WIN32)
+		_putenv_s("MERCURY_INBAND_RATE", on ? "1" : "");
+#else
+		if(on) setenv("MERCURY_INBAND_RATE", "1", 1); else unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+	auto restore_env = [&]() {
+#if defined(_WIN32)
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
+#else
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
+#endif
+	};
+
+	// Build a fresh COMMANDER at `cfg` (FULL load so messages_tx[] exists — the leap's
+	// roll_back_cmd_bsi_to_inflight + cleanup + add_message_control iterate them). Same
+	// synthetic-fire construction test_inband_no_break uses.
+	auto make_cmd = [&](int cfg, cl_telecom_system** out_ts) -> cl_arq_controller* {
+		set_inband(true);
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* cmd = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE;
+		cmd->telecom_system = ts;
+		cmd->narrowband_enabled = NO;
+		cmd->role = COMMANDER;
+		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;
+		cmd->load_configuration(cfg, FULL, NO);
+		cmd->link_status = CONNECTED;
+		cmd->connection_status = TRANSMITTING_DATA;
+		cmd->sack_v2_enabled = true;
+		cmd->gear_shift_on = YES;
+		cmd->robust_enabled = NO;
+		cmd->inband_rate_enabled = 1;
+		cmd->send_break_pattern_count = 0;
+		cmd->turboshift_active = false;
+		cmd->emergency_break_active = 0;
+		cmd->supershift_proven_ceiling = -1;
+		cmd->bigblock_carve_cooldown_batches = 0;
+		cmd->cmd_last_applied_superack_key = -1;
+		cmd->cmd_batch_seq_id = 4;               // the batch the CMD "just TX'd"
+		*out_ts = ts;
+		return cmd;
+	};
+
+	// ========================================================================
+	// CASE 1 — FAIL-margin -> NO SUPER-ACK (the RSP policy never advises a skip on a FAIL).
+	// ========================================================================
+	{
+		const int NITER = 200;
+		uint8_t conf = 0xFF;
+		// FAIL / pre-decode sentinels ALL map to -1 (emit-site gate: target<0 -> no emit).
+		check(superack_target_from_margin(NITER,     NITER, &conf) == -1,
+			"C1a FAIL sentinel (iters==niter) -> -1 (NO SUPER-ACK)",
+			superack_target_from_margin(NITER, NITER, &conf), -1);
+		check(superack_target_from_margin(NITER + 5, NITER, &conf) == -1,
+			"C1b over-cap FAIL -> -1 (NO SUPER-ACK)",
+			superack_target_from_margin(NITER + 5, NITER, &conf), -1);
+		check(superack_target_from_margin(-1,        NITER, &conf) == -1,
+			"C1c pre-decode sentinel (iters<0) -> -1 (NO SUPER-ACK)",
+			superack_target_from_margin(-1, NITER, &conf), -1);
+		// A QUALIFYING margin DOES advise a WB target (so the map is not trivially dead).
+		int good = superack_target_from_margin(0, NITER, &conf);
+		check(good >= 0 && is_ofdm_config(good),
+			"C1d a clean decode (iters==0) -> a WB target (SUPER-ACK CAN fire)", good, CONFIG_8);
+		// The CMD side ALSO refuses an off-ladder/-1 target (defense in depth: a FAIL never leaps).
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		bool leaped = cmd->inband_handle_superack(/*skip_target=*/-1, /*bsi*/4, /*conf*/0, /*par*/0);
+		check(!leaped && cmd->current_configuration == CONFIG_0 && !cmd->turboshift_active,
+			"C1e CMD refuses a FAIL/off-ladder target -> no leap (stays CONFIG_0)",
+			cmd->current_configuration, CONFIG_0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// CASE 2 — a MIS-DECODED SUPER-ACK degrades to a normal +1 (NEVER a spurious jump).
+	// Each D0 gate independently makes inband_handle_superack return false with the config
+	// state UNTOUCHED (the frame stays a plain ACK the ordinary gearshift handles as +1).
+	// ========================================================================
+	{
+		// (a) UP-only gate: a target AT or BELOW current is refused (a mis-decode can't demote).
+		// The config OWNERS are unchanged (load_configuration only sets current_configuration;
+		// negotiated_configuration keeps its pre-call value) -> snapshot + assert NO CHANGE.
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_8, &ts);
+		int cur0 = cmd->current_configuration, neg0 = cmd->negotiated_configuration;
+		bool leap_down = cmd->inband_handle_superack(CONFIG_4, /*bsi=*/4, 3, 0);   // 4 < 8
+		check(!leap_down && cmd->current_configuration == cur0
+			&& cmd->negotiated_configuration == neg0 && !cmd->turboshift_active,
+			"C2a UP-only: a target below current -> no leap (config owners untouched)",
+			cmd->current_configuration, cur0);
+		delete cmd; delete ts;
+
+		// (b) bsi-binding gate: a SUPER-ACK bound to a STALE batch is discarded.
+		ts = nullptr; cmd = make_cmd(CONFIG_0, &ts);
+		cmd->cmd_batch_seq_id = 4;                                   // current bsi&0x7 = 4 (prev=3)
+		int cur1 = cmd->current_configuration, neg1 = cmd->negotiated_configuration;
+		bool leap_stale = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/1, 5, 0);  // 1 != 4/3
+		check(!leap_stale && cmd->current_configuration == cur1
+			&& cmd->negotiated_configuration == neg1 && !cmd->turboshift_active,
+			"C2b bsi-binding: a stale-batch SUPER-ACK -> no leap (config owners untouched)",
+			cmd->current_configuration, cur1);
+		delete cmd; delete ts;
+
+		// (c) not-during-climb/BREAK gate: an in-flight turboshift blocks a fresh leap.
+		ts = nullptr; cmd = make_cmd(CONFIG_0, &ts);
+		cmd->turboshift_active = true;                              // a climb is already running
+		int neg_before = cmd->negotiated_configuration;
+		bool leap_busy = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, 5, 0);
+		check(!leap_busy && cmd->negotiated_configuration == neg_before,
+			"C2c not-during-climb: an in-flight turboshift blocks the leap (config untouched)",
+			cmd->negotiated_configuration, neg_before);
+		delete cmd; delete ts;
+
+		// (d) disconnected gate: link_status != CONNECTED -> no leap.
+		ts = nullptr; cmd = make_cmd(CONFIG_0, &ts);
+		cmd->link_status = DROPPED;
+		bool leap_down2 = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, 5, 0);
+		check(!leap_down2 && cmd->current_configuration == CONFIG_0 && !cmd->turboshift_active,
+			"C2d disconnected: link not CONNECTED -> no leap (config untouched)",
+			cmd->current_configuration, CONFIG_0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// CASE 3 — an OVER-LEAP triggers a reverse-NACK backoff to turboshift_last_good.
+	// A clean SUPER-ACK leaps CONFIG_0 -> CONFIG_8; turboshift_last_good pins the pre-leap
+	// rung. The forward data at CONFIG_8 is unfollowable; the reverse rate-NACK (on the
+	// reverse-pin's ROBUST carrier) routes the accelerated demote back to turboshift_last_good.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cmd->cmd_batch_seq_id = 4;
+		bool leaped = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, /*conf=*/5, /*par=*/1);
+		check(leaped, "C3a clean SUPER-ACK ACCEPTED -> leap fires", leaped ? 1 : 0, 1);
+		check(cmd->negotiated_configuration == CONFIG_8,
+			"C3b leap target set DIRECTLY from the wire (negotiated=CONFIG_8)",
+			cmd->negotiated_configuration, CONFIG_8);
+		check(cmd->turboshift_active && cmd->turboshift_last_good == CONFIG_0,
+			"C3c turboshift armed with last_good == the pre-leap rung (CONFIG_0, the backoff floor)",
+			cmd->turboshift_last_good, CONFIG_0);
+		int last_good = cmd->turboshift_last_good;
+
+		// Model the CONFIG_TAG announce the leap's add_message_control(SET_CONFIG) fires: the
+		// commander is now announcing CONFIG_8 and awaiting the RSP to follow it.
+		cmd->inband_retag_armed  = true;
+		cmd->inband_retag_config = CONFIG_8;                       // the announced (over-optimistic) rung
+		cmd->current_configuration = CONFIG_8;                     // twin caught up to the leap
+		cmd->turboshift_active = false;                            // leap committed; awaiting reverse
+		cmd->inband_tx_epoch_parity = 0;
+
+		// The RSP cannot follow CONFIG_8 -> it sends a rate-NACK (NACK_UNFOLLOWABLE_CLIMB) on the
+		// pinned ROBUST reverse carrier, reporting it is back at the last_good rung. Echo the
+		// current epoch (INV-E3). rx_cfg_index is the LADDER INDEX of last_good.
+		int rx_idx = config_ladder_index(last_good);
+		bool routed = cmd->inband_handle_nack((uint8_t)rx_idx,
+			(uint8_t)NACK_UNFOLLOWABLE_CLIMB, /*epoch_parity=*/0);
+		check(routed,
+			"C3d the reverse rate-NACK routed the accelerated demote (helper returned true)",
+			routed ? 1 : 0, 1);
+		// The demote lands on the config OWNERS the chokepoint reads (negotiated_configuration /
+		// data_configuration) — the SET_CONFIG it queues reloads current_configuration on the
+		// next poll (not synchronously in this synthetic fire). Assert the owners == last_good.
+		check(cmd->negotiated_configuration == last_good
+			&& cmd->data_configuration == last_good,
+			"C3e over-leap BACKED OFF to turboshift_last_good (config owners==CONFIG_0 again)",
+			cmd->negotiated_configuration, last_good);
+		check(cmd->supershift_proven_ceiling == last_good,
+			"C3f proven_ceiling pinned to last_good so the leap is not immediately re-elected",
+			cmd->supershift_proven_ceiling, last_good);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// CASE 4 — a LOST/DUPLICATED ABSOLUTE-target SUPER-ACK does NOT accumulate.
+	// The reverse burst sits in the capture ring for the whole turnaround; a re-aired
+	// identical SUPER-ACK must NOT re-leap. And because skip_target is ABSOLUTE, re-applying
+	// the SAME advice after a batch advance lands on the SAME config — never a 2nd additive jump.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cmd->cmd_batch_seq_id = 4;
+		// First apply: a real leap to CONFIG_8.
+		bool leap1 = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, /*conf=*/5, /*par=*/1);
+		check(leap1 && cmd->negotiated_configuration == CONFIG_8,
+			"C4a first SUPER-ACK leaps CONFIG_0 -> CONFIG_8", cmd->negotiated_configuration, CONFIG_8);
+		int neg_after_first = cmd->negotiated_configuration;
+
+		// DEDUP: the SAME SUPER-ACK re-aired in the ring must be a no-op (returns false, and —
+		// critically — negotiated_configuration is NOT bumped a second time). This is what
+		// prevents the ~12x-per-emit re-leap; the ABSOLUTE target means even a leaked re-apply
+		// could only ever re-assert CONFIG_8, never CONFIG_8+8.
+		cmd->turboshift_active = false;                            // pretend the leap settled
+		bool leap_dup = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/4, /*conf=*/5, /*par=*/1);
+		check(!leap_dup && cmd->negotiated_configuration == neg_after_first,
+			"C4b a DUPLICATE (same target/bsi/epoch) SUPER-ACK is deduped -> NO accumulation",
+			cmd->negotiated_configuration, neg_after_first);
+
+		// A NEW distinct advice (batch advanced -> dedup key cleared) leaping to the SAME absolute
+		// target lands on the SAME config, proving no additive accumulation even across turnarounds.
+		cmd->current_configuration = CONFIG_4;                    // pretend the elevator refined a bit
+		cmd->negotiated_configuration = CONFIG_4;
+		cmd->cmd_last_applied_superack_key = -1;                  // models the batch-advance clear
+		cmd->cmd_batch_seq_id = 5;                                // a fresh batch
+		bool leap_reassert = cmd->inband_handle_superack(CONFIG_8, /*bsi=*/5, /*conf=*/5, /*par=*/0);
+		check(leap_reassert && cmd->negotiated_configuration == CONFIG_8,
+			"C4c re-asserting the ABSOLUTE target lands on CONFIG_8 (not CONFIG_8+delta) -> no accumulation",
+			cmd->negotiated_configuration, CONFIG_8);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// CASE 5 — the SUPER-ACK / robust-+1 SEQUENCING GATE (data-flow-superack.md §6.2/§7.4/§8).
+	// superack_plus1_hold_active() HOLDS the ROBUST intra-tier +1 climb while a from-ROBUST
+	// SUPER-ACK is expected, so the +1 does NOT churn the config and time out the reverse ACK
+	// (the §7.4 live blocker: the +1 fired at the instant the RSP emitted -> the type-6 suffix
+	// never decoded). The hold is BOUNDED by the consecutive-clean-ROBUST-ACK streak so a
+	// SUPER-ACK that never arrives can NEVER permanently stall the link (falls back to the +1).
+	// Scoped to ROBUST + WB + in-band; OFDM/NB/off-feature never hold (byte-identical).
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cmd->narrowband_enabled = NO;
+
+		// (a) ROBUST tier + in-band + a fresh streak -> HOLD the +1 (the SUPER-ACK window is open).
+		cmd->current_configuration = ROBUST_0;
+		cmd->consecutive_data_acks = 0;
+		check(cmd->superack_plus1_hold_active() == true,
+			"C5a ROBUST + in-band + fresh streak -> HOLD the robust +1 (SUPER-ACK window open)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 1);
+
+		// (b) still within the budget -> still HOLD.
+		cmd->consecutive_data_acks = SUPERACK_PLUS1_HOLD_ACKS - 1;
+		check(cmd->superack_plus1_hold_active() == true,
+			"C5b within budget (acks<HOLD) -> still HOLD",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 1);
+
+		// (c) BOUNDED FALLBACK (the critical invariant): budget spent -> RELEASE so the ordinary
+		//     +1 crawl resumes -> a SUPER-ACK that never arrives can't stall the link at ROBUST.
+		cmd->consecutive_data_acks = SUPERACK_PLUS1_HOLD_ACKS;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5c budget spent (acks>=HOLD) -> RELEASE (+1 fallback; no permanent ROBUST stall)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+
+		// (d) OFDM tier -> NEVER hold (the OFDM turbo/Q-table climb is a distinct lever).
+		cmd->current_configuration = CONFIG_0;
+		cmd->consecutive_data_acks = 0;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5d OFDM config (CONFIG_0) -> no hold (OFDM-tier climbs untouched)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+
+		// (e) NB -> NEVER hold (no M=16 SUPER-ACK carrier on NB; holding would be a crawl regression).
+		cmd->current_configuration = ROBUST_0;
+		cmd->narrowband_enabled = YES;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5e NB robust -> no hold (SUPER-ACK unavailable on NB / M<16)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+		cmd->narrowband_enabled = NO;
+
+		// (f) feature OFF -> NEVER hold (byte-identical to legacy; the RSP never emits a SUPER-ACK).
+		cmd->inband_rate_enabled = 0;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5f in-band feature OFF -> no hold (legacy byte-identical)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+		cmd->inband_rate_enabled = 1;
+
+		delete cmd; delete ts;
+	}
+	// ========================================================================
+	// CASE 6 - the SUPER-ACK INLINE-SUFFIX codec (data-flow-superack.md sec 9, ROOT 2).
+	// superack_encode_tones -> superack_decode_tones must round-trip every valid
+	// config-ladder index, and REJECT (-> -1) a corrupted/absent capture (D0
+	// fail-safe: garbage -> no leap -> the ordinary +1). This is the wire-format
+	// unit test; the full RSP->CMD inline round-trip is the leap-smoke follow-on.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cl_mfsk& mf = ts->ack_mfsk;   // WB session -> M>=16
+		if(mf.M < 16) mf.M = 16;      // defensive: the codec only reads M
+
+		// (a) round-trip every config-ladder index 0..31.
+		bool rt_ok = true;
+		for(int idx = 0; idx <= 31; idx++) {
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			mf.superack_encode_tones(idx, t);
+			if(mf.superack_decode_tones(t) != idx) { rt_ok = false; break; }
+		}
+		check(rt_ok, "C6a superack encode->decode round-trips every ladder index 0..31",
+			rt_ok ? 1 : 0, 1);
+
+		// (b) a SINGLE tone error in a majority-of-3 field still decodes.
+		{
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			mf.superack_encode_tones(11, t);
+			t[3] = (t[3] + 7) & 0xF;   // corrupt ONE of the 3 lo-nibble copies
+			check(mf.superack_decode_tones(t) == 11,
+				"C6b single-tone error in a redundant field still decodes (majority)",
+				mf.superack_decode_tones(t), 11);
+		}
+
+		// (c) corrupt the index (>=2 copies) so the checksum no longer matches -> REJECT.
+		{
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			mf.superack_encode_tones(11, t);
+			int bad = (t[0] + 1) & 0xF;
+			t[0] = bad; t[3] = bad;    // majority lo now wrong; transmitted chk is for 11
+			check(mf.superack_decode_tones(t) < 0,
+				"C6c corrupted index (checksum mismatch) -> REJECT (fail-safe, no leap)",
+				mf.superack_decode_tones(t) < 0 ? 1 : 0, 1);
+		}
+
+		// (d) an absent suffix (all -1: a plain ACK with no SUPER-ACK) -> REJECT.
+		{
+			int t[cl_mfsk::SUPERACK_SUFFIX_LEN];
+			for(int i = 0; i < cl_mfsk::SUPERACK_SUFFIX_LEN; i++) t[i] = -1;
+			check(mf.superack_decode_tones(t) < 0,
+				"C6d absent suffix (all -1) -> REJECT (plain ACK never spuriously leaps)",
+				mf.superack_decode_tones(t) < 0 ? 1 : 0, 1);
+		}
+
+		delete cmd; delete ts;
+	}
+
+
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// LEAP-STICK regression — --test-inband-leap-stick
+// data-flow-config-state-rsp-adopt.md §6 / wb-dwell-post-leap.md.
+// ============================================================================
+//
+// After the SUPER-ACK ROBUST->WB leap the CMD tags the leaped OFDM rung and the RSP FOLLOWS
+// it through the shared adopt helper inband_adopt_resynced_config (arq_common.cc:5631; the
+// tag-follow :3388 AND the down-ladder :5601 both funnel through it). That helper calls
+// load_configuration(followed, PHYSICAL_LAYER_ONLY, NO), which advances ONLY
+// current_configuration (arq_common.cc:2243). Pre-fix it left data_configuration at the
+// robust-start rung (ROBUST_0=100) and forward_configuration unchanged — so the FIRST forward
+// control frame the RSP ACKs ran the post-ACK restore-data-config step (arq_responder.cc:1800),
+// saw data_configuration(100) != current_configuration(8), and load_configuration(100) SNAPPED
+// the RSP PHY back to ROBUST while the CMD stayed at the leaped rung -> link diverges -> forward
+// delivery freezes -> BREAK. The fix advances the forward config triad in the adopt helper
+// (data_configuration + forward_configuration = followed), mirroring the CMD's unilateral
+// change (arq_common.cc:3478-3479) and the legacy SET_CONFIG RSP handler (arq_responder.cc:3367
+// +3385/3440), so the restore step is a coherent no-op and the leap STICKS.
+//
+// This drives the PRODUCTION adopt helper directly, in-process (no cards / no PHY audio):
+//   1. Build an RSP seated at ROBUST_0 with data_configuration=ROBUST_0 (the leap-time state).
+//   2. inband_adopt_resynced_config(CONFIG_8)   (the exact production tag-follow adopt).
+//   3. Assert current_configuration==8 AND data_configuration==8 AND forward_configuration==8.
+//   4. Model the arq_responder.cc:1800 consumer: assert data_configuration==current so the
+//      post-ACK restore is a NO-OP (never reloads ROBUST) — the actual stick guarantee.
+//
+// FAIL-BEFORE: without the fix, step 3 fails (data_configuration/forward_configuration stay at
+// 100/CONFIG_NONE) and step 4's no-op invariant is violated (the restore would reload ROBUST).
+// PURE in-process synthetic-fire — permanent regression gate. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_inband_leap_stick()
+{
+	const char* TAG = "[TEST-INBAND-LEAP-STICK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");            // feature ON (mirrors production adopt)
+	auto restore_env = [&]() {
+		set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	};
+
+	// The adopt takes capture_prep_mutex; create it if NULL (standalone test). On Linux the
+	// mutex is statically initialized and always valid, so this is a _WIN32-only guard.
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Build a production RSP seated at ROBUST_0, then MODEL the leap-time forward-config state:
+	// data_configuration = ROBUST_0 (the robust-start rung, arq_common.cc:1895) and
+	// forward_configuration = CONFIG_NONE (never advanced in-band before the fix). current is
+	// ROBUST_0 too until the adopt drives it to the tagged OFDM rung.
+	const int LEAP_TARGET = CONFIG_8;
+	cl_telecom_system* ts_rx = new cl_telecom_system();
+	cl_arq_controller* rx    = new cl_arq_controller();
+	ts_rx->operation_mode     = ARQ_MODE;
+	ts_rx->narrowband_enabled = NO;
+	rx->telecom_system        = ts_rx;
+	rx->narrowband_enabled    = NO;
+	rx->role                  = RESPONDER;
+	rx->robust_enabled        = YES;
+	rx->sack_v2_enabled       = true;
+	rx->inband_rate_enabled   = 1;                  // feature ON
+	rx->load_configuration(ROBUST_0, FULL, NO);
+	rx->link_status           = CONNECTED;
+	rx->connection_status     = RECEIVING;
+	rx->passive_monitor       = false;
+	rx->rsp_current_expected_batch_seq_id = 4;      // a current batch exists (HINGE-2 re-baseline)
+	rx->data_configuration    = ROBUST_0;           // leap-time state: still the robust-start rung
+	rx->forward_configuration = CONFIG_NONE;
+
+	check(rx->current_configuration == ROBUST_0,
+		"pre-adopt: RSP seated at ROBUST_0", rx->current_configuration, ROBUST_0);
+	check(rx->data_configuration == ROBUST_0,
+		"pre-adopt: data_configuration == ROBUST_0 (the leap-time stale rung)",
+		rx->data_configuration, ROBUST_0);
+
+	// THE PRODUCTION ADOPT — the exact call the tag-follow (arq_common.cc:3388) makes when the
+	// RSP hears the CMD's leaped-rung CONFIG_TAG on the passband.
+	rx->inband_adopt_resynced_config(LEAP_TARGET);
+
+	// The stick guarantee: the FORWARD config triad advances COHERENTLY to the leaped rung.
+	check(rx->current_configuration == LEAP_TARGET,
+		"post-adopt: current_configuration == CONFIG_8 (load_configuration advanced it)",
+		rx->current_configuration, LEAP_TARGET);
+	check(rx->data_configuration == LEAP_TARGET,
+		"post-adopt: data_configuration == CONFIG_8 (FIX: no longer stuck at ROBUST_0)",
+		rx->data_configuration, LEAP_TARGET);
+	check(rx->forward_configuration == LEAP_TARGET,
+		"post-adopt: forward_configuration == CONFIG_8 (FIX: forward owner advanced)",
+		rx->forward_configuration, LEAP_TARGET);
+
+	// Model the arq_responder.cc:1800 consumer: (data_configuration != current_configuration)
+	// is the branch that reloads the data config after an ACK. Post-fix it is FALSE, so the
+	// restore is a NO-OP and the RSP never snaps back to ROBUST -> the leap STICKS.
+	check(rx->data_configuration == rx->current_configuration,
+		"post-ACK restore step (arq_responder.cc:1800) is a NO-OP (never reloads ROBUST)",
+		(rx->data_configuration == rx->current_configuration) ? 1 : 0, 1);
+
+	delete rx; delete ts_rx;
+
+#if defined(_WIN32)
+	if(created_mutex) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	restore_env();
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band CONNECT-LIVENESS GUARD regression — --test-inband-liveness
 // data-flow-inband-connect-liveness.md §4.
 // ============================================================================
@@ -9141,6 +9673,163 @@ int cl_arq_controller::test_inband_config0_start_ring()
 }
 
 // ============================================================================
+// §22: in-band down-ladder decoders inherit the PRIMARY's startup-patched GI
+// (data-flow-robust-ofdm-adopt-flush.md §22).  --test-inband-down-decoder-gi-inherit
+// ============================================================================
+// VERIFIED ROOT (instrumented real-audio A/B, diagnosis in _research/inband_cfg0/): the
+// SCOPED down-ladder decoder bank (inband_ensure_down_decoders, arq_common.cc:4579) builds
+// each rung with `new cl_telecom_system()` and previously set ONLY narrowband_enabled +
+// buffer_Nsymb_min before load_configuration — it never inherited the PRIMARY's
+// startup-patched default_configurations_telecom_system.ofdm_gi (main.cc:4896 = 36/256 for
+// the production 3.0 ms GI). A fresh instance keeps the physical_config.cc:37 ctor gi=54/256,
+// so load_configuration (telecom_system.cc:11037 ofdm.gi <- default) + init()
+// (telecom_system.cc:7206-7208 Nofdm = Nfft + round(gi*Nfft)) build CONFIG_0 at Nofdm=310
+// instead of the production 292 — an 18-sample/symbol FFT-window stride error -> post-EQ
+// variance blows past SKIP-VAR -> LDPC skipped (iter=-1) -> 0% block_success at WB CONFIG_0
+// -> the robust->OFDM cross never sustains and the link never climbs past the ROBUST floor.
+//
+// WHY THE EXISTING 56 inband units MISSED IT: every one PRE-SETS
+// ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI on the throwaway instances
+// it builds (e.g. arq_responder.cc:8843/8999/9180), masking the un-inherited default. This
+// test DRIVES THE PRODUCTION BUILDER inband_ensure_down_decoders directly and reads the
+// CONFIG_0 rung's installed geometry WITHOUT pre-patching the decoder's gi — only the
+// PRIMARY is patched, exactly as main.cc does at startup.
+//   - PASS-AFTER (arm 0, the fix): the CONFIG_0 down-decoder inherits the primary gi and
+//     builds at Nofdm=292 (== the primary), with gi == PROD_GI.
+//   - FAIL-BEFORE (arm 1, MERCURY_INBAND_GI_INHERIT_DEFEAT=1 on the SAME binary): the inherit
+//     is a no-op, the decoder keeps the ctor gi=54/256 and builds at Nofdm=310 (reproduces the
+//     stride-error geometry that skips LDPC).
+int cl_arq_controller::test_inband_down_decoder_gi_inherit()
+{
+	const char* TAG = "[TEST-INBAND-DOWN-DECODER-GI-INHERIT]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+		else   { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Production 3.0 ms GI -> Ngi = 36 -> CONFIG_0 Nofdm = 256+36 = 292 (main.cc:4896 startup).
+	const int   PROD_NGI     = (int)(3.0 * 12.0 + 0.5);   // 36
+	const float PROD_GI      = (float)PROD_NGI / 256.0f;  // 36/256
+	const int   EXPECT_NOFDM = 256 + PROD_NGI;            // 292
+	const int   STALE_NOFDM  = 256 + 54;                  // 310 (physical_config.cc:37 ctor gi)
+
+	// CONFIG_0 sits at FULL_CONFIG_LADDER index 3 (ROBUST_0/1/2 = 0/1/2). Build a 1-wide
+	// down-window over it so the bank holds exactly the CONFIG_0 rung.
+	const int CONFIG0_LADDER_IDX = config_ladder_index(CONFIG_0);
+
+	// Build the PRIMARY exactly as production does: patch ITS default gi to PROD_GI, then a
+	// FULL ROBUST_0 init (fully initializes the standalone PHY) — but DO NOT touch the
+	// down-decoders' gi (the production builder must inherit it). Mirrors build_rx_config0.
+	auto build_rx = [&]() -> std::pair<cl_arq_controller*, cl_telecom_system*> {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode     = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI;  // PRIMARY only
+		rx->telecom_system        = ts_rx;
+		rx->narrowband_enabled    = NO;
+		rx->role                  = RESPONDER;
+		rx->robust_enabled        = YES;
+		rx->sack_v2_enabled       = true;
+		rx->inband_rate_enabled   = 1;
+		rx->load_configuration(ROBUST_0, FULL, NO);
+		rx->link_status           = CONNECTED;
+		rx->connection_status     = RECEIVING;
+		rx->passive_monitor       = false;
+		rx->rsp_current_expected_batch_seq_id = 4;
+		return {rx, ts_rx};
+	};
+
+	// Pin the primary's CONFIG_0 geometry as the reference target (292). Loading CONFIG_0 on a
+	// throwaway COPY of the primary defaults yields the value the inherited decoder must match.
+	{
+		auto pr = build_rx();
+		// The primary, when loaded to CONFIG_0, builds at EXPECT_NOFDM — the ground truth.
+		pr.second->load_configuration(CONFIG_0);
+		check(pr.second->data_container.Nofdm == EXPECT_NOFDM,
+			"P0 the PRIMARY builds CONFIG_0 at the production geometry (Nofdm = Nfft+Ngi36)",
+			pr.second->data_container.Nofdm, EXPECT_NOFDM);
+		delete pr.first; delete pr.second;
+	}
+
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_INBAND_GI_INHERIT_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx();
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+
+		// THE PRODUCTION BUILDER, VERBATIM: build the scoped down-ladder bank over the CONFIG_0
+		// rung. This is the SAME inband_ensure_down_decoders the RX down-ladder resync calls
+		// (arq_common.cc:4485). It constructs `new cl_telecom_system()` per rung and (with the
+		// fix) inherits the primary gi before load_configuration. NO manual gi pre-set here.
+		int built = rx->inband_ensure_down_decoders(CONFIG0_LADDER_IDX, CONFIG0_LADDER_IDX);
+		check(built >= 1, "P1 the down-ladder bank built the CONFIG_0 rung", built, 1);
+
+		// Locate the slot holding CONFIG_0 and read its INSTALLED geometry.
+		cl_telecom_system* dec = NULL;
+		for(int i = 0; i <= INBAND_DOWN_D_MAX; i++)
+			if(rx->inband_down_decoders[i] != NULL && rx->inband_down_decoder_cfg[i] == CONFIG_0)
+			{ dec = rx->inband_down_decoders[i]; break; }
+		check(dec != NULL, "P2 a CONFIG_0 decoder slot exists in the bank", dec ? 1 : 0, 1);
+
+		if(dec != NULL)
+		{
+			int dec_nofdm = dec->data_container.Nofdm;
+			int dec_ngi   = (int)((double)dec->ofdm.gi * (double)dec->ofdm.Nfft + 0.5);
+			if(!defeat)
+			{
+				check(dec_nofdm == EXPECT_NOFDM,
+					"FIX the CONFIG_0 down-decoder inherits the primary GI -> builds at Nofdm=292 "
+					"(correct per-symbol stride -> LDPC runs -> the WB cross sustains)",
+					dec_nofdm, EXPECT_NOFDM);
+				check(dec_ngi == PROD_NGI,
+					"FIX the down-decoder's live ofdm.gi == the primary's production GI (Ngi=36)",
+					dec_ngi, PROD_NGI);
+			}
+			else
+			{
+				check(dec_nofdm == STALE_NOFDM,
+					"DEFEAT (FAIL-BEFORE) the un-inherited decoder keeps the ctor GI -> Nofdm=310 "
+					"(18-sample/symbol stride error -> SKIP-VAR -> LDPC skipped -> 0% block at cfg0)",
+					dec_nofdm, STALE_NOFDM);
+			}
+		}
+		rx->inband_free_down_decoders();
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_INBAND_GI_INHERIT_DEFEAT", "");
+
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band CONFIG_0 clean-lock CRC-fail ROOT — descrambler survives the ring-shrink
 // (data-flow-robust-ofdm-adopt-flush.md §17).  --test-inband-descrambler-survives-shrink
 // ============================================================================
@@ -9394,6 +10083,395 @@ int cl_arq_controller::test_inband_deadbatch_progress()
 	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
 #endif
 	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// VAR-FIX DEMOTE-SAFETY — --test (run-all). Directed regression for
+// inband_deliver_stall_watchdog (data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-DEMOTE).
+//
+// The deadlock the diagnosis pins: a held shrunk OFDM lock that TRICKLES forward DATA frames
+// (so the §19 frame-keyed dead-batch streak keeps RESETTING and never reaches the terminal BREAK)
+// but can NEVER COMPLETE/DELIVER a batch (rsp_last_delivered_batch_seq_id frozen) -> the
+// protect-the-lock guard (arq_common.cc:4797) refuses to demote forever -> infinite partial
+// delivery. This drives the PRODUCTION watchdog through that exact state.
+//
+//   FIX arm   (limit=3): after 3 batch periods pinned with NO delivered advance (despite frame
+//                        trickle), the watchdog RELEASES inband_ofdm_acq_ring_shrunk -> demotable.
+//   DEFEAT arm (limit=0): the watchdog is disabled -> the pin is NEVER released -> the deadlock
+//                        reproduces (fail-before on the SAME binary).
+//   PRODUCTIVE: a pin that DOES deliver (delivered id advances) must NOT release (no-regress).
+// ============================================================================
+int cl_arq_controller::test_inband_deliver_stall_releases_pin()
+{
+	const char* TAG = "[TEST-INBAND-DELIVER-STALL]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what){
+		if(cond) printf("%s PASS: %s\n", TAG, what);
+		else   { printf("%s FAIL: %s\n", TAG, what); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_rate = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_rate_saved = prev_rate ? std::string(prev_rate) : std::string();
+	bool had_prev_rate = (prev_rate != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	auto build_rx = [&](cl_telecom_system*& ts_out)->cl_arq_controller*{
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE; ts->narrowband_enabled = NO;
+		rx->telecom_system = ts; rx->narrowband_enabled = NO; rx->role = RESPONDER;
+		rx->robust_enabled = YES; rx->sack_v2_enabled = true; rx->inband_rate_enabled = 1;
+		rx->load_configuration(CONFIG_0, FULL, NO);   // an OFDM config (is_ofdm_config true)
+		rx->link_status = CONNECTED; rx->connection_status = RECEIVING; rx->passive_monitor = false;
+		rx->set_receiving_timeout(3000);              // floors to the 3000 ms batch period
+		rx->inband_ofdm_acq_ring_shrunk = true;       // HOLD the pin the guard protects
+		rx->rsp_last_delivered_batch_seq_id = 7;      // some baseline delivered id
+		ts_out = ts;
+		return rx;
+	};
+
+	// Helper: spin a real cl_timer past one batch period so the watchdog's TIME gate opens.
+	auto age_one_period = [&](){ cl_timer w; w.start(); while(w.get_elapsed_time_ms() < 3050) {} };
+
+	// ---- FIX arm: frame-trickle, NO delivery -> pin released after `limit` periods ----
+	{
+		set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "3");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		// arm
+		rx->inband_deliver_stall_watchdog();
+		check(rx->inband_ofdm_acq_ring_shrunk, "FIX: pin still held immediately after arm");
+		bool released = false;
+		for(int period = 0; period < 4 && !released; period++)
+		{
+			age_one_period();
+			// frame trickle WITHOUT delivery: the §19 streak would reset, but delivered id is FROZEN
+			rx->inband_total_data_frames_rx += 2;     // some frames decoded this period
+			// rsp_last_delivered_batch_seq_id intentionally UNCHANGED (batch never completes)
+			rx->inband_deliver_stall_watchdog();
+			if(!rx->inband_ofdm_acq_ring_shrunk) released = true;
+		}
+		check(released, "FIX: pin RELEASED after sustained frame-trickle-but-no-delivery (demotable)");
+		delete rx; delete ts;
+	}
+
+	// ---- DEFEAT arm (FAIL-BEFORE): watchdog disabled -> pin NEVER released ----
+	{
+		set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "0");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_deliver_stall_watchdog();
+		bool released = false;
+		for(int period = 0; period < 6 && !released; period++)
+		{
+			age_one_period();
+			rx->inband_total_data_frames_rx += 2;
+			rx->inband_deliver_stall_watchdog();
+			if(!rx->inband_ofdm_acq_ring_shrunk) released = true;
+		}
+		check(!released, "DEFEAT (FAIL-BEFORE): disabled watchdog NEVER releases the pin (deadlock reproduces)");
+		delete rx; delete ts;
+	}
+
+	// ---- PRODUCTIVE (no-regress): a pin that DELIVERS must NOT be released ----
+	{
+		set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "3");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_deliver_stall_watchdog();
+		bool released = false;
+		for(int period = 0; period < 6 && !released; period++)
+		{
+			age_one_period();
+			rx->inband_total_data_frames_rx += 6;
+			rx->rsp_last_delivered_batch_seq_id += 1;  // a batch COMPLETES+DELIVERS each period
+			rx->inband_deliver_stall_watchdog();
+			if(!rx->inband_ofdm_acq_ring_shrunk) released = true;
+		}
+		check(!released, "PRODUCTIVE: a delivering pin is NEVER released (no-regress)");
+		delete rx; delete ts;
+	}
+
+	set_env("MERCURY_INBAND_DELIVER_STALL_LIMIT", "");
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev_rate ? prev_rate_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// §VAR-FIX-2 RX FORWARD-SEARCH GATE — --test-inband-revack-rxgate
+// data-flow-robust-ofdm-adopt-flush.md §VAR-FIX-2 / §VF2.4
+// ============================================================================
+//
+// The in-band RX stormed the forward-preamble coarse search during the RSP's OWN reverse-ACK turnaround
+// gap (the 0.50 GI plateau -> SKIP-VAR; 607 SKIP-VAR / 56 OFDM-OK at WGN:40). The fix arms a turnaround
+// suppress window on each reverse-ACK key-up and, in the OFDM FAIL anti-spin, RAISES frames_to_read to span
+// the gap (search suppressed) instead of the 8-sym quick-retry, capped so the real burst stays in-ring.
+//
+// This drives the PRODUCTION gate decision inband_revack_rxgate_ftr() — the EXACT helper the anti-spin
+// calls — with production state. It counts the simulated forward SEARCHES (= the number of times ftr fell
+// back to the 8-sym storm cadence) over the gap and asserts:
+//   FIX (gate active):   N back-to-back PLATEAU fails -> ftr raised each time -> ~0 searches over the gap.
+//   DEFEAT (FAIL-BEFORE, MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1, same binary): ftr stays 8 -> N searches.
+//   ACQUIRE (no-regress): a pass that DECODES a real frame bypasses the gate (the OK path owns ftr) ->
+//                         the real forward burst is NEVER starved.
+//   COLD (legacy/inband-off): no window armed -> ftr stays 8 -> byte-identical anti-spin.
+int cl_arq_controller::test_inband_revack_rxgate()
+{
+	const char* TAG = "[TEST-INBAND-REVACK-RXGATE]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what){
+		if(cond) printf("%s PASS: %s\n", TAG, what);
+		else   { printf("%s FAIL: %s\n", TAG, what); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_rate = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_rate_saved = prev_rate ? std::string(prev_rate) : std::string();
+	bool had_prev_rate = (prev_rate != NULL);
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	auto build_rx = [&](cl_telecom_system*& ts_out)->cl_arq_controller*{
+		cl_telecom_system* ts = new cl_telecom_system();
+		cl_arq_controller* rx = new cl_arq_controller();
+		ts->operation_mode = ARQ_MODE; ts->narrowband_enabled = NO;
+		rx->telecom_system = ts; rx->narrowband_enabled = NO; rx->role = RESPONDER;
+		rx->robust_enabled = YES; rx->sack_v2_enabled = true; rx->inband_rate_enabled = 1;
+		// load CONFIG_1 (a real OFDM rung) so the PHY geometry (Nofdm/buffer_Nsymb) is actually
+		// populated: load_configuration is a NO-OP when the requested config == the ctor-default
+		// current_configuration (CONFIG_0), which would leave the geometry zeroed. The gate is
+		// config-agnostic (any OFDM rung), so CONFIG_1 exercises it identically to a cfg0 turnaround.
+		rx->load_configuration(CONFIG_1, FULL, NO);   // an OFDM config with real geometry
+		rx->link_status = CONNECTED; rx->connection_status = RECEIVING; rx->passive_monitor = false;
+		// production-ish turnaround geometry so the budget is a few hundred ms (> several frame periods)
+		rx->message_transmission_time_ms = 1200;   // a long frame
+		rx->ptt_on_delay_ms = 100; rx->ptt_off_delay_ms = 200;
+		ts_out = ts;
+		return rx;
+	};
+
+	// The default anti-spin ftr the storm uses (WB OFDM): 8.
+	const int DEFAULT_FTR = 8;
+
+	// ---- FIX arm: armed window + plateau fails -> ftr raised every pass (search suppressed) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 1;
+		rx->inband_arm_revack_turnaround_window();
+		check(rx->inband_revack_turnaround_budget_ms > 0, "FIX: turnaround suppress window armed (budget>0)");
+		int searches = 0;
+		for(int pass = 0; pass < 40; pass++)
+		{
+			int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, /*frame_decoded_this_pass=*/false);
+			if(ftr <= DEFAULT_FTR) searches++;   // fell back to the storm cadence = a forward search fired
+		}
+		check(searches <= 1, "FIX: forward search SUPPRESSED across the gap (storm count ~0)");
+		delete rx; delete ts;
+	}
+
+	// ---- DEFEAT arm (FAIL-BEFORE): gate disabled -> ftr stays 8 -> a search every pass (the storm) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "1");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 1;
+		rx->inband_arm_revack_turnaround_window();
+		int searches = 0;
+		for(int pass = 0; pass < 40; pass++)
+		{
+			int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, false);
+			if(ftr <= DEFAULT_FTR) searches++;
+		}
+		check(searches >= 35, "DEFEAT (FAIL-BEFORE): ftr stays 8 -> a forward search every pass (storm reproduced)");
+		delete rx; delete ts;
+	}
+
+	// ---- ACQUIRE (no-regress): a real decoded frame mid-gap bypasses the gate (burst not starved) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 1;
+		rx->inband_arm_revack_turnaround_window();
+		int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, /*frame_decoded_this_pass=*/true);
+		check(ftr == DEFAULT_FTR, "ACQUIRE: a real forward frame bypasses the gate (OK path owns ftr) — burst not starved");
+		delete rx; delete ts;
+	}
+
+	// ---- COLD (legacy/inband-off): no window -> ftr stays 8 (byte-identical anti-spin) ----
+	{
+		set_env("MERCURY_INBAND_RATE", "");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+		cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+		rx->inband_rate_enabled = 0;                       // feature OFF
+		rx->inband_arm_revack_turnaround_window();         // no-op when off (budget stays 0)
+		int ftr = rx->inband_revack_rxgate_ftr(DEFAULT_FTR, false);
+		check(ftr == DEFAULT_FTR && rx->inband_revack_turnaround_budget_ms == 0,
+			"COLD: feature off -> no suppress window, ftr unchanged (legacy byte-identical)");
+		delete rx; delete ts;
+	}
+
+	// ---- CONNECT-PHASE EXCLUSION (§VF2.7 connectfix; FAIL-BEFORE: drop the link/control guard in
+	//      inband_arm_revack_turnaround_window -> these arm -> the CONNECT/forward search is slow-polled and
+	//      starved). The window is a DATA-PHASE turnaround discipline; it MUST NOT arm during the pre-link
+	//      CONNECT handshake or any CONTROL-ACK turnaround. Each sub-case is a state the arm fires in on the
+	//      live path; ALL must leave budget==0 so the next forward acquisition runs at full search cadence.
+	{
+		set_env("MERCURY_INBAND_RATE", "1");
+		set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+
+		// (a) pre-link CONNECT handshake: the RSP just decoded START_CONNECTION / is awaiting TEST_CONNECTION.
+		//     link_status is a pre-CONNECTED state — arming here slow-polls the forward search the responder
+		//     needs to ACQUIRE the commander's TEST_CONNECTION (the measured 6/12-vs-11/12 connect regression).
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1;
+			rx->link_status = CONNECTION_RECEIVED; rx->connection_status = RECEIVING;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms == 0,
+				"CONNECT (a): pre-link (link_status!=CONNECTED) -> window NOT armed -> forward search at full cadence");
+			delete rx; delete ts;
+		}
+
+		// (b) handshake echo / SET_CONFIG / KEY_EXCHANGE control-ACK turnaround on the RSP: link_status flips
+		//     to CONNECTED before the TEST_CONNECTION_ACK echo is sent (arq_responder.cc:3069), so the link-
+		//     state guard alone is insufficient — connection_status==ACKNOWLEDGING_CONTROL is the discriminator.
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1;
+			rx->link_status = CONNECTED; rx->connection_status = ACKNOWLEDGING_CONTROL;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms == 0,
+				"CONNECT (b): CONNECTED but ACKNOWLEDGING_CONTROL (handshake echo / SET_CONFIG ACK) -> window NOT armed");
+			delete rx; delete ts;
+		}
+
+		// (c) CMD control-ACK wait (RECEIVING_ACKS_CONTROL): the commander's pattern-ACK control wait routes
+		//     through calculate_receiving_timeout()'s arm; the next RX is a forward burst, not a turnaround gap.
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1; rx->role = COMMANDER;
+			rx->link_status = CONNECTED; rx->connection_status = RECEIVING_ACKS_CONTROL;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms == 0,
+				"CONNECT (c): CONNECTED but RECEIVING_ACKS_CONTROL (CMD control-ACK wait) -> window NOT armed");
+			delete rx; delete ts;
+		}
+
+		// (d) NEGATIVE CONTROL — the data turnaround (CONNECTED + a data-ACK state) STILL arms (the gate did
+		//     not over-exclude). RECEIVING here = the RSP data-phase / prev-batch redelivery turnaround.
+		{
+			cl_telecom_system* ts = NULL; cl_arq_controller* rx = build_rx(ts);
+			rx->inband_rate_enabled = 1;
+			rx->link_status = CONNECTED; rx->connection_status = ACKNOWLEDGING_DATA;
+			rx->inband_arm_revack_turnaround_window();
+			check(rx->inband_revack_turnaround_budget_ms > 0,
+				"CONNECT (d) NEGATIVE: CONNECTED + ACKNOWLEDGING_DATA (data turnaround) -> window STILL armed (not over-excluded)");
+			delete rx; delete ts;
+		}
+	}
+
+	set_env("MERCURY_INBAND_REVACK_RXGATE_DEFEAT", "");
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev_rate ? prev_rate_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// §CROSS — PROGRESSING-BATCH FUTILE-NACK SUPPRESSION — --test-inband-progressing-nack
+// data-flow-robust-ofdm-adopt-flush.md §CROSS.4
+// ============================================================================
+//
+// The down-ladder cannot-follow NACK_DECODE_FAIL must NOT fire while the current batch is
+// PROGRESSING (batch_rx_frame_count >= 1): the RSP has already stored >=1 DATA frame of this
+// batch at the current config, so the CONFIG_TAG is provably present and the missing frames are
+// a PARTIAL batch the SACK/retx path owns — a NACK there is futile AND harmful (its ~1.5 s
+// reverse burst starves forward capture -> the cfg0-cross death-spiral). This drives the EXACT
+// production predicate inband_progressing_batch_suppresses_nack():
+//   FIX (gate active): batch_rx_frame_count>=1 -> SUPPRESS (true).
+//   ZERO-FRAME (genuine lost-tag / total-loss): batch_rx_frame_count==0 -> NACK ALLOWED (false).
+//   DEFEAT (FAIL-BEFORE, MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1, same binary): even a
+//          progressing batch is NOT suppressed -> the futile NACK fires (reproduces the bug).
+int cl_arq_controller::test_inband_progressing_nack()
+{
+	const char* TAG = "[TEST-INBAND-PROGRESSING-NACK]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what){
+		if(cond) printf("%s PASS: %s\n", TAG, what);
+		else   { printf("%s FAIL: %s\n", TAG, what); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_rate = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_rate_saved = prev_rate ? std::string(prev_rate) : std::string();
+	bool had_prev_rate = (prev_rate != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+	set_env("MERCURY_INBAND_PROGRESSING_NACK_DEFEAT", "");   // start in the FIXED state
+
+	cl_arq_controller* rx = new cl_arq_controller();
+	rx->inband_rate_enabled = 1;
+	rx->inband_progressing_nack_defeat_cached = -1;          // force a fresh env read
+
+	// PROGRESSING batch (>=1 frame stored at current config) -> SUPPRESS the futile NACK.
+	rx->batch_rx_frame_count = 5;
+	check(rx->inband_progressing_batch_suppresses_nack(),
+		"FIX: a progressing batch (batch_rx_frame_count=5) SUPPRESSES the futile NACK");
+
+	rx->batch_rx_frame_count = 1;
+	check(rx->inband_progressing_batch_suppresses_nack(),
+		"FIX: even a single stored frame (batch_rx_frame_count=1) SUPPRESSES the NACK");
+
+	// ZERO-frame batch (genuine lost-tag / total-loss) -> NACK MUST be allowed (no-regress).
+	rx->batch_rx_frame_count = 0;
+	check(!rx->inband_progressing_batch_suppresses_nack(),
+		"NO-REGRESS: a zero-frame batch (batch_rx_frame_count=0) ALLOWS the genuine lost-tag NACK");
+
+	// FAIL-BEFORE: the defeat knob restores the futile NACK even on a progressing batch.
+	set_env("MERCURY_INBAND_PROGRESSING_NACK_DEFEAT", "1");
+	rx->inband_progressing_nack_defeat_cached = -1;          // re-read the env
+	rx->batch_rx_frame_count = 5;
+	check(!rx->inband_progressing_batch_suppresses_nack(),
+		"DEFEAT (fail-before): a progressing batch is NOT suppressed -> the futile NACK fires");
+	set_env("MERCURY_INBAND_PROGRESSING_NACK_DEFEAT", "");
+
+	delete rx;
+	set_env("MERCURY_INBAND_RATE", had_prev_rate ? prev_rate_saved.c_str() : "");
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
@@ -9949,12 +11027,16 @@ int cl_arq_controller::test_inband_deliver()
 		const int AHEAD    = 0;           // epoch == in-flight bsi (the re-air must not move it)
 
 		// ---- ARM 1: DECOUPLE OFF (fail-before) — reproduce the config-walk. ----
-		putenv_kv("MERCURY_INBAND_A3_DECOUPLE", "");   // gate OFF
+		// CHEAP-MISS DEFAULT-ON (tier-cross KEYSTONE): the demote-decouple now ships
+		// DEFAULT-ON for the in-band stack, so an UNSET MERCURY_INBAND_A3_DECOUPLE resolves
+		// ON (not off) whenever MERCURY_INBAND_RATE is on. To get the genuine OFF (legacy
+		// demote-per-stall) baseline this arm needs, set the EXPLICIT escape-hatch "0".
+		putenv_kv("MERCURY_INBAND_A3_DECOUPLE", "0");  // gate OFF via the explicit escape-hatch
 		{
 			cl_telecom_system* ts = nullptr;
 			cl_arq_controller* cmd = make_cmd(CFG_FROM, &ts);
 			cmd->cumulative_ack_enabled = true;            // A3 negotiated (irrelevant when gate off)
-			cmd->inband_a3_decouple_env = -1;              // force env re-resolve (-> 0, off)
+			cmd->inband_a3_decouple_env = -1;              // force env re-resolve (-> 0, escape-hatch off)
 
 			int demotes = 0;
 			for(int m = 0; m < MISSES; m++)
@@ -10795,6 +11877,116 @@ int cl_arq_controller::test_spec_sack()
 		"flood gated by near-completeness)\n", FRAME_K);
 	fflush(stdout);
 	return 0;
+}
+
+// ============================================================================
+// RSP EOB-FAST-PATH HALF-DUPLEX COLLISION fix — directed regression (test-only)
+// data-flow-robust-ofdm-adopt-flush.md §22.
+// ============================================================================
+//
+// Drives the REAL pure helper rsp_incomplete_batch_rx_timeout_ms (the EXACT per-frame
+// re-arm decision the production timer block makes, arq_responder.cc) with the EXACT
+// wedge state captured on the fleet (real-audio R1 arq_inbandR1.log, cfg0 epoch):
+//   effective_batch = 6, batch_rx_frame_count = 2 (only the MIDDLE frames 2,3 landed;
+//   the re-aired LEAD frames 0,1 and the tail 4,5 are still missing), the EOB frame
+//   was decoded (last_received_end_of_batch_seq >= 0), msg_time = 1266 ms.
+//
+// PRE-FIX (MERCURY_RSP_EOBFAST_FAILBEFORE): EOB-seen-incomplete -> rx_timeout =
+// ptt_on+ptt_off (~300 ms). The RSP keys up to SACK ~300 ms after the last decoded
+// frame -> collides with the CMD's still-active mixbatch forward TX -> the re-aired
+// lead frames are never captured -> self-reinforcing partial wedge -> no cfg0 climb.
+//
+// PASS-AFTER: the incomplete-batch re-arm is sized by the MISSING-frame count
+// (n_miss * msg_time + msg_time margin + time_left + ptt_on), so the per-frame re-arm
+// only expires after the channel has been IDLE long enough for the CMD's forward TX
+// to drain — out of the collision window. ASSERTS:
+//   1. INCOMPLETE wedge: pre-fix == 300 ms (collision); post-fix >> 300 ms and equals
+//      the exact n_miss formula; post-fix covers >= 2 forward frame-times (a clean
+//      separation from the bug, so the RSP cannot key up mid-CMD-batch).
+//   2. COMPLETE batch (n_miss <= 0): both arms return ptt_on (the fast ACK preserved).
+//   3. NON-SACK in-order incomplete (received contiguous 0..last_seq, eob not seen):
+//      post-fix == the legacy seq-anchored remaining EXACTLY (n_miss == remaining) —
+//      proving the --enable-sack-OFF path stays byte-identical.
+//
+// PURE state-machine: no telecom_system, no audio, no IONOS. Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_rsp_eobfast_collision()
+{
+#ifdef MERCURY_RSP_EOBFAST_FAILBEFORE
+	const bool failbefore = true;
+#else
+	const bool failbefore = false;
+#endif
+	printf("[TEST-RSP-EOBFAST] start (failbefore=%d)\n", failbefore ? 1 : 0);
+	fflush(stdout);
+
+	int failed = 0;
+
+	// Channel geometry (cfg0, from the fleet log).
+	const int msg_time = 1266;   // cfg0 message_transmission_time_ms
+	const int ptt_on   = 100;
+	const int ptt_off  = 200;
+	const int time_left = 0;
+
+	// --- CASE 1: the cfg0 wedge — interior+lead holes, EOB decoded ----------
+	// effective_batch=6, only frames {2,3} received (n_miss=4), last decoded seq=3
+	// (or the EOB seq 5 — the helper ignores last_seq when incomplete), eob_seen=true.
+	{
+		const int eff = 6, rx = 2, last_seq = 5;  // EOB (seq 5) was the last decoded
+		int t = rsp_incomplete_batch_rx_timeout_ms(
+			eff, rx, last_seq, /*eob_seen=*/true, msg_time, ptt_on, ptt_off, time_left);
+		int n_miss = eff - rx;                                   // 4
+		int expect_fix  = n_miss * msg_time + msg_time + time_left + ptt_on;  // 6430
+		int expect_fb   = ptt_on + ptt_off;                     // 300 (the bug)
+		printf("[TEST-RSP-EOBFAST] CASE1 wedge eff=%d rx=%d eob=1 -> t=%d (fix_expect=%d fb_expect=%d)\n",
+			eff, rx, t, expect_fix, expect_fb);
+		fflush(stdout);
+		if(failbefore)
+		{
+			if(t != expect_fb) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: failbefore t=%d != %d\n", t, expect_fb); failed++; }
+		}
+		else
+		{
+			if(t != expect_fix) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: fix t=%d != %d\n", t, expect_fix); failed++; }
+			// Collision guard: the post-fix wait MUST exceed the pre-fix 300 ms AND
+			// cover >= 2 forward frame-times so the RSP cannot key up mid-CMD-batch.
+			if(t <= ptt_on + ptt_off) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: fix t=%d <= 300ms (still collides)\n", t); failed++; }
+			if(t < 2 * msg_time) { printf("[TEST-RSP-EOBFAST] CASE1 FAIL: fix t=%d < 2 frame-times (%d)\n", t, 2*msg_time); failed++; }
+		}
+	}
+
+	// --- CASE 2: COMPLETE batch -> fast ACK in BOTH arms (preserved) --------
+	{
+		const int eff = 6, rx = 6, last_seq = 5;
+		int t = rsp_incomplete_batch_rx_timeout_ms(
+			eff, rx, last_seq, /*eob_seen=*/true, msg_time, ptt_on, ptt_off, time_left);
+		printf("[TEST-RSP-EOBFAST] CASE2 complete eff=%d rx=%d -> t=%d (expect ptt_on=%d)\n",
+			eff, rx, t, ptt_on);
+		fflush(stdout);
+		if(t != ptt_on) { printf("[TEST-RSP-EOBFAST] CASE2 FAIL: complete t=%d != ptt_on %d\n", t, ptt_on); failed++; }
+	}
+
+	// --- CASE 3: NON-SACK in-order incomplete -> byte-identical to legacy ----
+	// In the non-SACK path frames arrive in order, so received == contiguous
+	// 0..last_seq and n_miss == legacy `remaining` = eff - last_seq - 1. eob_seen
+	// is false (no SACK). The post-fix value must EQUAL the legacy formula.
+	{
+		const int eff = 6, last_seq = 3, rx = last_seq + 1;   // received 0..3 in order
+		int t = rsp_incomplete_batch_rx_timeout_ms(
+			eff, rx, last_seq, /*eob_seen=*/false, msg_time, ptt_on, ptt_off, time_left);
+		int legacy_remaining = eff - last_seq - 1;             // 2
+		int legacy_t = legacy_remaining * msg_time + time_left + ptt_on + msg_time;
+		printf("[TEST-RSP-EOBFAST] CASE3 inorder eff=%d rx=%d last=%d -> t=%d (legacy=%d)\n",
+			eff, rx, last_seq, t, legacy_t);
+		fflush(stdout);
+		// Both the fix and the failbefore arm reduce to the legacy formula here
+		// (eob_seen=false -> failbefore takes its seq-anchored branch too).
+		if(t != legacy_t) { printf("[TEST-RSP-EOBFAST] CASE3 FAIL: t=%d != legacy %d (non-SACK NOT byte-identical)\n", t, legacy_t); failed++; }
+	}
+
+	printf("[TEST-RSP-EOBFAST] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return (failed == 0) ? 0 : 1;
 }
 
 // ============================================================================

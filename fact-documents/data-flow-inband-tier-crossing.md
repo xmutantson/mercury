@@ -204,6 +204,88 @@ for a GENUINE deep-SNR demote (the panic-jump bypass `:187` + anchor-DEMOTE esca
 
 ---
 
+## §3''. TRIO extension — reverse pin on the CONFIG_TAG (unilateral) cross (2026-06-30)
+
+The §3 PART A reverse-pin lived ONLY inside the legacy SET_CONFIG builder
+(`arq_commander.cc:~1328`, the SUCCESS_BASED_LADDER seed). On the TRIO line
+(`wip/trio-turboshift-reengage` @ e5899443 = 2cf0c48d cheap-miss + e5899443 turboshift),
+the robust→OFDM tier-cross is routed through the in-band **unilateral CONFIG_TAG**
+(`cross_via_tag = tier_crossing && inband_tier_cross_via_tag()`, `arq_commander.cc:1225`,
+default-ON because `inband_a3_decouple_enabled()` is live: cheap-miss spine + cumulative-ACK).
+That path takes the `else if(inband_unilateral_config_change(...))` branch
+(`arq_commander.cc:1240`) and **EARLY-RETURNS** at `arq_commander.cc:1258`
+(`inband_unilateral_armed=true; return success;`) BEFORE the SET_CONFIG builder — so the
+§3 PART A pin at `:1328`/`:1341` is NEVER reached on the trio. `inband_unilateral_config_change`
+(`arq_common.cc:3378`) advances only the FORWARD owners ("Reverse is left to the other
+direction's owner", `:3444`), never `reverse_configuration`; and the CONFIG_TAG wire carries
+ONLY forward (no `data[2]` reverse field — `detect_and_follow_config_tag` follows forward only).
+
+MEASURED (`/tmp/turbo_trio/arq_trio00.log`, `/tmp/trio_c0/arq_trioc000.log`, WGN:40,
+`MERCURY_INBAND_RATE=1`): the trio prints the whole climb via `[INBAND-TX] UNILATERAL CONFIG`
++ the cross via `[INBAND-TX] TIER-CROSS-VIA-TAG 0 -> 0`, **ZERO** `[GEARSHIFT] SET_CONFIG:`
+lines, **ZERO** `reverse=` lines → `reverse_configuration` sits at ctor sentinel CONFIG_NONE
+across the cross. Legacy (`/tmp/turbo_legacy/arq_leg00.log`) holds `forward=0 reverse=101`
+across the identical cross and delivers the full 16384 B; the trio BREAK-thrashes at cfg0,
+`consecutive_data_acks` never accrues → no clean OFDM FRAME-UP → the e5899443 turboshift
+elevator never launches.
+
+**THE TRIO FIX (this run):** derive the SAME robust-rung pin LOCALLY on the tag-cross,
+reusing the EXISTING pure selector `inband_tier_cross_reverse_config` (`arq_common.cc:3530`,
+already unit-tested), on BOTH ends so they compute the identical rung with NO extra wire bits:
+- **CMD** — inside the `if(cross_via_tag)` block, right after the TIER-CROSS-VIA-TAG print,
+  BEFORE the early-return (`arq_commander.cc`, the `#ifndef INBAND_REVERSE_PIN_FAILBEFORE`
+  block). `from = current_configuration` (the live robust rung), `to = inband_target` (OFDM).
+- **RSP** — inside `detect_and_follow_config_tag` (`arq_common.cc`, right after
+  `inband_adopt_resynced_config(followed_config)`), `from = current_configuration captured
+  BEFORE the switch` (`rev_pin_from_cfg`), `to = followed_config`. This is the ONE production
+  tag-follow method both callers (`inband_detect_follow_from_capture:4253`,
+  `inband_detect_follow_from_snapshot:4337`) route through, so a single edit covers both.
+Both gated on `inband_rate_feature_enabled()` + a real crossing (the selector self-gates
+intra-tier/CONFIG_NONE/flag-off to CONFIG_NONE) → flag-off / intra-tier byte-identical.
+
+### §3''-audit. Cross-layer audit — the trio tag-cross reverse pin (CLAUDE.md §5)
+
+Reuses `reverse_configuration` (the SAME field §5' already audited). Delta vs §5':
+1. **New producers (2)**: CMD `arq_commander.cc` cross_via_tag block; RSP `arq_common.cc`
+   `detect_and_follow_config_tag` post-adopt. Both write a robust rung (100–102) on a
+   crossing, else no-op. All §5' producers UNTOUCHED. The RSP write is the trio's ONLY
+   reverse writer on the tag path (the SET_CONFIG `data[2]` adopt `:3336` is unreachable
+   on the tag cross), so no double-write / ordering hazard: on a given cross exactly one of
+   {SET_CONFIG-builder pin (legacy/non-spine), tag-cross pin (trio/spine)} runs.
+2. **Consumers unchanged** vs §5': the pinned value flows to the monitor decode try-order
+   (`arq_common.cc:2095`), the SWITCH_ROLE swap (CMD `:7552` / RSP `:1968`), and diagnostics.
+   On a role swap the RSP's new forward = old reverse = the pinned ROBUST rung → the RSP
+   returns on robust exactly like legacy's `reverse=101` hold (NOT a regression; the reverse
+   direction promotes on its own later). The reverse CONTROL ACK modulation rides
+   `ack_configuration` (MFSK, static) INDEPENDENT of `reverse_configuration`, so the pin
+   cannot corrupt the ACK PHY; it aligns the reverse-direction DATA rung + decode try-order
+   + role-swap return path with legacy.
+3. **Cheap-miss re-tag (2cf0c48d) intact**: the pin is set INSIDE the cross_via_tag branch
+   AFTER `TIER-CROSS-VIA-TAG` and does NOT touch `inband_unilateral_armed`,
+   `inband_retag_*`, `cmd_revsack_reairs`, or the CONFIG_TAG re-emit path — it only writes
+   `reverse_configuration`. The cheap-miss re-air (`arq_commander.cc:5392`) re-emits the
+   forward tag on a data-SACK miss; unchanged.
+4. **Batch-cap (e5899443 turboshift) intact**: the turboshift elevator
+   (`inband_climb_target` allow_ofdm_elevator + the first-post-jump batch cap) reads
+   forward config + SNR, never `reverse_configuration`; the pin only RAISES the reverse
+   direction onto robust so the forward cross gets credited — it is the PRE-condition the
+   elevator waits on, not a modification of it.
+5. **FAILS-BEFORE**: `-DINBAND_REVERSE_PIN_FAILBEFORE` compiles out BOTH new blocks →
+   `reverse_configuration` stays CONFIG_NONE across the trio tag cross (reproduces the cfg0
+   BREAK-thrash). PASSES-AFTER: reverse pinned to the robust rung on both ends.
+
+### §3''-open. [?] PART-B analog (liveness) on the trio tag path
+The §3 PART B liveness exemption (`inband_tiercross_handshake_exempts_liveness`) keys on
+`in_control_phase` (TRANSMITTING_CONTROL / RECEIVING_ACKS_CONTROL). The trio tag cross does
+NOT enter a control phase (it stays TRANSMITTING_DATA — unilateral, no SET_CONFIG), so that
+exemption does not fire on the trio, but the trio also does not sit in the control-phase
+livelock signature PART B guarded. Whether a DATA-phase liveness/BREAK false-fire persists on
+the trio cross after the reverse pin is settled by the E2E smoke (§3''-tests): if cfg0 still
+BREAK-thrashes with reverse correctly pinned, a trio DATA-phase exemption analog is the next
+lever. [smoke result recorded in the branch commit + worklog]
+
+---
+
 ## §3-tests'. Tests for §3 (reverse-pin + liveness exemption)
 
 - **Directed unit** `test_inband_tier_cross_reverse_pin` (`--test` +
@@ -515,3 +597,175 @@ coarse-acq miss). Those are B (coalesce the redesign SACK cadence + suppress
 prev-delivered-during-fresh-batch) and C (seat the CONFIG_0 forward capture ring at natural
 `load_configuration` geometry on in-band adoption), sequenced AFTER measuring how far (A)
 gets. One-change-one-test (§3) — B/C are NOT folded in here.
+
+---
+
+## §7. CLEAN-LOCK ADOPT GATE — stop the post-cross CONFIG_TAG contamination (2026-06-30)
+
+Branch `wip/trio-cleanlock` off `wip/trio-reverse-pin` @ b8076112 (stacks reverse-pin ->
+turbo e5899443 -> cheap-miss 2cf0c48d -> 144001a4).
+
+### §7.0 Problem (VERIFIED from the real-audio smoke logs on 192.168.2.11)
+
+After the §3'' reverse-pin landed, the ROBUST->OFDM cross is reached but the forward OFDM
+decode at CONFIG_0 walls on **acquisition contamination**: the CMD keeps prepending the
+1.58s M=16 ROBUST CONFIG_TAG (`burst_samples=75920`) BEFORE frame 0 of every batch (wire
+order `[MFSK tag][frame0][frame1]...`, `arq_common.cc:9921` in `send_batch`). That foreign
+non-OFDM energy overlaps the OFDM data-cell window of frame 0, so the cross-pilot
+differential noise-variance estimate (`estimate_noise_from_pilot_pairs`, `ofdm.cc:1563`,
+assigned `:1686`) blows up and the pre-LDPC SKIP-VAR gate (`telecom_system.cc:3043`,
+CONFIG_0 ceiling 1.60 `skip_var_nv_ceiling` `:441`) rejects frame 0.
+
+Two distinct producers of the post-cross tag, keyed by scenario (both route through
+`emit_config_tag_passband` -> `inband_tag_firing_decision`, `arq_common.cc:3000`):
+
+- **PRODUCER-1 `is_repeat`** (D1 repeat-until-followed): fires every batch while
+  `inband_retag_armed && batch_cfg==inband_retag_config`. Dominates the REAL cross
+  (`/tmp/turbo_trio/arq_trio00.log`, start-cfg 100, WGN:40): cross at T+0222
+  (`TIER-CROSS-VIA-TAG 0->0`, :27596), re-tag #1 for CONFIG_0 arms T+0222.328 (:27740,
+  `CONFIG_TAG ... burst_samples=75920`). The first ~5 batches decode CLEAN (`OFDM-OK` var
+  0.0326-0.0368 SNR ~14.3-14.9, tag-free windows) but the 6-frame batch never completes
+  under the accumulating tags -> RSP sends only PARTIAL SACKs (bitmap 0x3e/0x3f) ->
+  `var=20.5705` (:29222) once windows overlap -> 3-consecutive SKIP-VAR -> abort. The
+  climb reached CONFIG_0 (3 `FRAME UP` lines: 100->101->102->0) but the run TIMED OUT
+  (253.9s) at CONFIG_0 with `TURBO=0` — the contamination made cfg0 batches take
+  ~15-27s each. The armed re-tag DID eventually confirm (`CONFIRMED followed CONFIG_0`
+  T+0249.958, :31312) but ~27s late.
+
+- **PRODUCER-2 `is_reannounce`** (D3 periodic re-announce, every N=8 batches, NOT gated on
+  arm state): dominates the START-AT-CFG0 case (`/tmp/trio_c0/arq_trioc000.log`, start-cfg
+  0). Here the re-tag is NEVER armed (`announced idx=-1`, :13598), so
+  `inband_retag_confirm_from_sack` can NEVER fire (early-returns on `!inband_retag_armed`),
+  yet the periodic re-announce still airs a tag every 8 batches
+  (`PERIODIC RE-ANNOUNCE of CONFIG_0 after 8 batches`, T+0190, :24983) -> 153/467
+  ENERGY-DIAG windows contaminated (data-window passband energy >0.3), **226 SKIP-VAR / 62
+  OFDM-OK / 0 FRAME-UP / 0 TURBO / 0 CONFIRMED**, rx 24 B. This is the self-reinforcing
+  wedge: the config IS adopted (cfg0 is the start config; the RSP decodes and PARTIAL-SACKs
+  it, e.g. bitmap 0x3f=6/6 at T+0059) but the CMD has no signal to STOP re-announcing.
+
+**CORRECTION vs the pre-fix audit's SIBLING-A** ("reverse-ACK not credited at the CMD,
+independent of forward contamination"): the reverse SACKs ARE credited — `turbo_trio` fires
+`CONFIRMED followed CONFIG_0`, and `trio_c0` shows `CMD-MFSK-ACK-SACK PARTIAL ... matched=16`.
+`cmd_nreceived_frames=0` is a red herring (this is a one-way transfer; that counter tracks
+reverse DATA payload, which never exists). The binding constraint is the CONTAMINATION
+slowing/blocking cfg0 batch completion — fixing it unblocks the whole chain (no separate
+reverse-reception bug). SIBLING-B (`consecutive_data_acks`/FRAME-UP) is downstream of the
+contamination, not independent: FRAME-UP already fires 3x in `turbo_trio`.
+
+### §7.1 The fix (CLEAN-LOCK ADOPT GATE)
+
+New shared state: `inband_adopted_config` (`arq.h`) — the CURRENT config the CMD has the
+MOST-RECENT positive, config-discriminating proof the RSP is operating at. Distinct from
+`inband_last_confirmed_config` (the demote FLOOR = highest EVER reached, used only for
+auto-demote): `inband_adopted_config` is the CURRENT-adopted config and is INVALIDATED on
+every genuine change.
+
+Two coupled edits:
+1. **Gate** (`inband_tag_firing_decision`, `arq_common.cc`): when
+   `batch_cfg==inband_adopted_config`, force `is_repeat=false` and exclude `is_reannounce`
+   (`&& !adopted`). A CHANGE (`is_change`) is NEVER gated. Invalidate the latch
+   (`inband_adopted_config=CONFIG_NONE`) inside the `is_change` block (a new config is not
+   yet adopted).
+2. **Setter** `inband_note_config_adopted(rx_bsi)` (`arq_common.cc`), called on EVERY
+   credited reverse SACK/ACK (the 4 `inband_retag_confirm_from_sack` sites in
+   `arq_commander.cc`: MFSK CLEAN, MFSK PARTIAL, OFDM SACK_RSP, compact-confirm). It latches
+   `inband_adopted_config=current_configuration` under the STALE-PREV/MID-CROSS GUARD (INV-2):
+   only when either (a) a climb re-tag is armed for this config AND `rx_bsi` is at-or-after
+   its announce anchor (mod-256 fwd<=128), or (b) NO re-tag is armed AND
+   `current_configuration==inband_last_announced_config` (no un-adopted pending change — the
+   trio_c0 / session-start / post-confirm-steady case). `inband_retag_confirm_from_sack` also
+   directly latches `inband_adopted_config` on its armed confirm (belt-and-suspenders).
+
+Effect: once the RSP provably follows CONFIG_0, BOTH tag emitters no-op -> frame 0 goes
+tag-free -> SC lock clean (metric ~0.997, var ~0.036) -> batch completes -> fast credit ->
+FRAME-UP -> the e5899443 turboshift elevator launches.
+
+### §7.2 §5 cross-layer audit — `inband_adopted_config`
+
+1. **Producers** (writes):
+   - `inband_note_config_adopted` (`arq_common.cc`) — sets to `current_configuration` on a
+     credited SACK under the INV-2 guard. Called from the 4 SACK-credit sites
+     (`arq_commander.cc` MFSK CLEAN/PARTIAL, OFDM SACK_RSP, compact).
+   - `inband_retag_confirm_from_sack` (`arq_common.cc`) — sets to `inband_retag_config` on the
+     armed confirm (same value, since armed => streaming the announced config).
+   - `inband_tag_firing_decision` `is_change` block (`arq_common.cc`) — CLEARS to CONFIG_NONE
+     on a genuine change.
+   - Session resets: ctor (`arq_common.cc:~886`) and the session-reset block
+     (`arq_common.cc:~7745`), both alongside `inband_last_confirmed_config`.
+   - In-class init `= CONFIG_NONE` (`arq.h`).
+2. **Consumers** (reads): ONLY `inband_tag_firing_decision` (`adopted` predicate gating
+   `is_repeat`/`is_reannounce`). No other reader — the value never leaves the TX-side tag
+   scheduler; it does NOT touch the PHY, the retx queue, the reverse pin, or the demote floor.
+3. **Valid states**: `CONFIG_NONE` (nothing adopted -> tags fire freely — the fail-safe / pre-
+   confirm default) OR a valid ladder config id (that config adopted -> its tags suppressed).
+   Default-init is `CONFIG_NONE`, so a fresh/pre-init controller re-airs tags (correct).
+4. **Invariants**:
+   - INV-1 (fail-safe): the latch advances ONLY on a POSITIVE credited SACK; a missed / lost /
+     CRC-failed reverse SACK leaves it unchanged -> tags KEEP re-airing (pre-adoption
+     reliability preserved). NEVER cleared on a miss.
+   - INV-2 (no stale-prev false-latch): `inband_note_config_adopted` latches ONLY under the
+     armed-anchor or no-pending-change discriminator, so a prev-in-flight SACK arriving
+     mid-cross cannot falsely mark a not-yet-reached config adopted.
+   - INV-3 (change invalidates): every genuine change clears the latch -> the NEW config
+     re-airs until re-confirmed. A change to an id that happens to equal a prior adopted id is
+     NOT wrongly suppressed.
+   - INV-4 (SKIP-VAR untouched): the CONFIG_0 ceiling 1.60 (`telecom_system.cc:441`) is NOT
+     weakened — the fix removes the contamination, the detector still rejects a genuinely
+     contaminated estimate.
+   - INV-5 (deaf-RSP recovery independent of the periodic backstop): if the RSP LOSES the
+     config, forward frames fail -> `emergency_nack_count` accrues -> `inband_route_failure_
+     demote` (`arq_commander.cc:3569`) routes an `add_message_control(SET_CONFIG)` ->
+     `inband_unilateral_config_change` = an `is_change` -> clears the latch -> the tag re-airs.
+     So the periodic re-announce is a redundant FAST backstop, not the sole recovery; a peer
+     that ADOPTED a config does not need it re-announced, a peer that LOST it triggers the
+     demote (re-announce) path. (Accepted limit: mid-session late-JOIN at an adopted config
+     is not a supported scenario for this point-to-point ARQ.)
+   - INV-6 (flag-off byte-identical): both producers sit inside `inband_rate_feature_enabled()`
+     guards; legacy prepends no MFSK tag. `inband_note_config_adopted` early-returns when the
+     feature is off. Legacy SET_CONFIG path untouched.
+5. **What the fix changes**: the tag SCHEDULER's decision only (whether to re-air a
+   non-change tag). It does NOT change what a tag CONTAINS, the reverse pin, the confirm
+   arithmetic, the demote floor, or the SKIP-VAR gate. Every consumer of the tag wire is
+   unchanged; the RSP-side adopt path already self-gates (`arq_common.cc:3300-3327` SC-metric
+   clean-lock adopt gate + the down-ladder CRC self-gate), so no RSP change is needed.
+
+### §7.3 Files
+- `include/datalink_layer/arq.h` — `inband_adopted_config` member + `inband_note_config_adopted` decl.
+- `source/datalink_layer/arq_common.cc` — the setter, the firing-decision gate, the
+  is_change invalidation, the armed-confirm latch, the 2 session resets.
+- `source/datalink_layer/arq_commander.cc` — the 4 credited-SACK call sites.
+
+### §7.4 Smoke (real-audio, WGN:40) — RESULT + a HONEST residual-root finding
+
+Ran on 192.168.2.11, Loopback_3, my binary md5 `7171dd75f732fecd6ed2030226fedcff`,
+`MERCURY_INBAND_RATE=1 MERCURY_CUMULATIVE_ACK=1 MERCURY_INBAND_A3_DECOUPLE=1`, WGN:40,
+payload 16000, seed 1. Two scenarios vs the pre-fix b8076112 baselines.
+
+**The gate is PROVEN to fire and eliminate its target producers:**
+- start-cfg-100 (`/tmp/cleanlock_smoke/`): `CLEAN-LOCK: RSP ADOPTED CONFIG_100 … SUPPRESSED`
+  (T+0085); climb 100→101→102→0; the armed CONFIG_0 confirm still disarms (T+0249). Post-cross
+  CONFIG_TAG emits = 1 (the required fresh-change announce), cheap-miss re-airs = 0. Delivery
+  IMPROVED: `rsp_nreceived_frames` 11→19, `rx_bytes` 77→145, `rx_bps_wall` 2.4→3.8.
+- start-cfg-0 (`/tmp/cleanlock_smoke_c0/`, the PRODUCER-2 target): `CLEAN-LOCK: RSP ADOPTED
+  CONFIG_0` (T+0057) → **PERIODIC RE-ANNOUNCE = 0** (vs firing pre-fix) and total CONFIG_TAG
+  emits 2→1. The periodic-re-announce contamination source is ELIMINATED.
+
+**HONEST RESIDUAL (the CONFIG_TAG was NOT the dominant cfg0 contaminant):** with the tag
+re-airs gone, cfg0 `var` did NOT drop to ~0.036 and SKIP-VAR did NOT stop (start-cfg-0: 226→210
+SKIP-VAR, 153→134 contaminated windows, and OFDM-OK cfg0 62→0). The dominant residual is a
+COARSE-SYNC FALSE-LOCK, not the tag: a contaminated window shows `coarse … metric=0.501 … PASS`
+(vs a clean OFDM lock ~0.997) — the coarse detector false-locks at ~0.50 on NON-OFDM passband
+content (CONTROL bursts e.g. SWITCH_BANDWIDTH, reverse ACK/SACK MFSK, handshake residue) that
+shares the ~0.50 GI-plateau band, then feeds a garbage pilot-residual var (68.6 at T+0044.846,
+`last_message_received: CONTROL:SWITCH_BANDWIDTH`). This is fact-doc §6.5 item C ("seat the
+CONFIG_0 forward capture ring at natural `load_configuration` geometry on in-band adoption") /
+the M2 ~73% coarse-acq miss — a SEPARATE root that this one-change-one-test does NOT fold in
+(CLAUDE.md: no SKIP-VAR band-aid; one lever per test). The clean-lock gate is a correct,
+necessary producer-elimination that STACKS UNDER the coarse-lock fix; it is default-ON (inside
+the feature guard), tested, and removes real steady-state contamination + zero-overhead once
+adopted. NEXT lever (not this commit): the CONFIG_0 forward capture-ring reseat / coarse-lock
+false-lock reject at the ~0.50 plateau.
+
+`--test M=0`: `=== Tests done: 70 passed, 0 failed ===` + every subsystem suite `0 failed` /
+`ALL PASS` (42 clean-pass summary lines), exit 0. Legacy path byte-identical (both producers +
+the setter are inside `inband_rate_feature_enabled()`; legacy prepends no tag).

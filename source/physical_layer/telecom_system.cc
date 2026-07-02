@@ -138,6 +138,10 @@ cl_telecom_system::cl_telecom_system()
 	// are additional backstops. Captures the dominant cliff regime (1 wrong
 	// symbol). Raise to 2 only if a higher FAR is acceptable for more reach.
 	suffix_fec_max_flips=1;
+	// REVSACK Part A: ACK-suffix FEC CRC callback OFF by default (uncoded ACK path,
+	// byte-identical). set_ack_suffix_fec() installs it at the climbed-OFDM enable.
+	ack_suffix_fec_crc12_fn=nullptr;
+	ack_suffix_fec_crc12_ctx=nullptr;
 	ack_pattern_detection_threshold=0.8;
 	operation_mode=BER_PLOT_baseband;
 	bit_interleaver_block_size=1;
@@ -4116,18 +4120,51 @@ int cl_telecom_system::generate_ack_snr_pattern_passband(double* out, float snr)
 // of passband samples written, or 0 if unsupported (NB / M<16). See
 // mercury/fact-documents/mfsk-robust-ack.md §3.2.
 int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
-	uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12)
+	uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12, int superack_ladder_idx)
 {
 	if(ack_sack_pattern_passband_samples <= 0) return 0;
 	if(ack_mfsk.ack_sack_suffix_len() <= 0) return 0;  // NB unsupported
 
-	int nsymb = ack_mfsk.ack_sack_pattern_nsymb();
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): when a skip-target ladder
+	// index is supplied, encode it into SUPERACK_SUFFIX_LEN tones that generate_ack_
+	// sack_pattern appends after the SACK suffix, and lengthen nsymb so the SAME burst
+	// carries them (one PTT). -1 -> legacy byte-identical (superack_tones stays null).
+	int superack_tones_buf[cl_mfsk::SUPERACK_SUFFIX_LEN];
+	const int* superack_tones = nullptr;
+	if(superack_ladder_idx >= 0)
+	{
+		ack_mfsk.superack_encode_tones(superack_ladder_idx, superack_tones_buf);
+		superack_tones = superack_tones_buf;
+	}
+
+	// REVSACK Part A: when the ACK suffix is coded, gf16ra is process-global — pin the
+	// repfact to the ACK value (3, N=52) for BOTH ack_sack_pattern_nsymb() (which reads
+	// gf16ra::codeword_len()) and the gf16ra::encode inside generate_ack_sack_pattern,
+	// then RESTORE. This is the build_config_tag_tones discipline: it makes the ACK TX
+	// codeword length deterministic regardless of what a prior CONFIG_TAG(2)/CONNECT(3)
+	// consumer left the global at, and guarantees nsymb matches the encode. FEC-off: no
+	// configure (saved==target path is skipped) → byte-identical.
+	int saved_repfact = -1;
+	if(ack_mfsk.ack_suffix_fec_coded)
+	{
+		saved_repfact = gf16ra::current_repfact();
+		if(saved_repfact != cl_telecom_system::ACK_SUFFIX_FEC_REPFACT)
+		{
+			gf16ra::configure(cl_telecom_system::ACK_SUFFIX_FEC_REPFACT);
+			gf16ra::init();
+		}
+	}
+
+	int nsymb = superack_tones ? ack_mfsk.ack_sack_superack_pattern_nsymb()
+	                           : ack_mfsk.ack_sack_pattern_nsymb();
+	int out_samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
 	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
 
 	// Generate subcarrier-domain ACK+SACK pattern (nsymb * Nc complex values).
-	// ofdm_framed_data is sized for max(Nsymb, 48) symbols × Nc — 29 fits easily.
+	// ofdm_framed_data is sized for max(Nsymb, 48) symbols × Nc — 29 (or 37 with the
+	// SUPER-ACK suffix) fits easily.
 	ack_mfsk.generate_ack_sack_pattern(data_container.ofdm_framed_data,
-		batch_seq_id, bitmap, crc12);
+		batch_seq_id, bitmap, crc12, superack_tones);
 
 	// IFFT each symbol to time domain
 	for(int i = 0; i < nsymb; i++)
@@ -4150,10 +4187,20 @@ int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
 		data_container.Nofdm * nsymb, out,
 		sampling_frequency, tx_carrier, carrier_amplitude, frequency_interpolation_rate);
 
-	// Peak clipping
-	ofdm.peak_clip(out, ack_sack_pattern_passband_samples, ofdm.data_papr_cut);
+	// Peak clipping (over the ACTUAL length written — longer when the SUPER-ACK
+	// suffix is present).
+	ofdm.peak_clip(out, out_samples, ofdm.data_papr_cut);
 
-	return ack_sack_pattern_passband_samples;
+	// REVSACK Part A: restore the gf16ra global so a later CONFIG_TAG(2)/CONNECT(3)
+	// consumer is not corrupted (the §5 cross-layer guard).
+	if(saved_repfact > 0
+	   && saved_repfact != cl_telecom_system::ACK_SUFFIX_FEC_REPFACT)
+	{
+		gf16ra::configure(saved_repfact);
+		gf16ra::init();
+	}
+
+	return out_samples;
 }
 
 // Option B (data-flow-compact-confirm.md): TX the compact coded reverse confirm
@@ -4201,6 +4248,10 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	int* out_matched, bool* out_snr_valid)
 {
 	*out_snr_valid = false;
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): fresh-per-call. Only set
+	// true below when the trailing SUPER-ACK tones are cleanly captured, so a stale
+	// capture can never be re-read by the CMD's CLEAN handler.
+	ack_mfsk.last_superack_capture_valid = false;
 	if(ack_pattern_passband_samples <= 0) return -99.0f;
 
 	// Polyphase decimated path: mix + FIR + decimate fused.
@@ -4303,6 +4354,12 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	int sack_suffix_len = ack_mfsk.ack_sack_suffix_len();
 	int capture_len = cl_mfsk::SNR_SUFFIX_LEN;
 	if (sack_suffix_len > capture_len) capture_len = sack_suffix_len;
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): also capture the
+	// SUPERACK_SUFFIX_LEN tones that follow the SACK suffix so the CMD can decode the
+	// skip-target inline. Absent on a plain ACK (no cost — decode_suffix_tones fills
+	// past-pattern tones with noise/-1, which superack_decode_tones rejects).
+	int superack_end = ack_mfsk.ack_sack_coded_suffix_len() + cl_mfsk::SUPERACK_SUFFIX_LEN;
+	if (superack_end > capture_len) capture_len = superack_end;
 	if (capture_len > cl_mfsk::MAX_ACK_SACK_SUFFIX)
 		capture_len = cl_mfsk::MAX_ACK_SACK_SUFFIX;
 	int suffix_tones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
@@ -4336,6 +4393,25 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 		for (int i = sack_suffix_len; i < cl_mfsk::MAX_ACK_SACK_SUFFIX; i++)
 			ack_mfsk.last_ack_sack_suffix_tones[i] = -1;
 		ack_mfsk.last_ack_sack_capture_valid = clean;
+	}
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): snapshot the
+	// SUPERACK_SUFFIX_LEN de-hopped tones that FOLLOW the SACK suffix (offset =
+	// ack_sack_coded_suffix_len()) so the CMD's CLEAN handler decodes the inline
+	// skip-target from THIS same capture (mirror of the SNR-suffix path). Valid only
+	// when all SUPERACK_SUFFIX_LEN tones decoded cleanly (0..M-1); a plain ACK (no
+	// SUPER-ACK) leaves these as noise/-1 -> last_superack_capture_valid=false OR
+	// superack_decode_tones rejects them (D0 fail-safe).
+	{
+		int sbase = ack_mfsk.ack_sack_coded_suffix_len();
+		bool svalid = (sbase > 0);
+		for (int i = 0; i < cl_mfsk::SUPERACK_SUFFIX_LEN; i++) {
+			int si = sbase + i;
+			int tv = (si >= 0 && si < capture_len) ? suffix_tones[si] : -1;
+			ack_mfsk.last_superack_suffix_tones[i] = tv;
+			if (tv < 0 || tv >= ack_mfsk.M) svalid = false;
+		}
+		ack_mfsk.last_superack_capture_valid = svalid;
 	}
 
 	// Majority vote: find most common tone among the 8 suffix symbols
@@ -4380,6 +4456,206 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 	return -99.0f;
 }
 
+// REVSACK Part A (revsack/design.json): the GF(16) RA coded TRY-BOTH data-ACK+SACK
+// decode. Front-half (base detect on the ACK base pattern + control mini-Moose CFO
+// correction) is the SAME as decode_ack_sack_from_passband_soft; the back-half mirrors
+// the proven CONNECT FEC branch (decode_ctrl_suffix_from_passband §21.5) but on the ACK
+// base + MFSK_CTRL_ACK_SACK type. TRY-BOTH:
+//   (1) uncoded 13-tone at the matched offset (the systematic GF(16) prefix == the hard
+//       pack, so a legacy/uncoded sender or a clean coded sender both decode here);
+//   (2) on miss, the full N-tone GF(16) RA BP with its own recompute-CRC12 + type accept
+//       gate (FAR 6.1e-5) — absorbs the 2-8 turnaround symbol errors the uncoded CRC
+//       cannot.
+// The CRC convention is the WIRE form (arq_ack_sack_crc12_cb) so the systematic prefix
+// stays legacy-decodable and the caller's outer wire-form re-check passes by
+// construction. The gf16ra global repfact is SAVED/RESTORED around the BP (the
+// process-global discipline build_config_tag_tones uses) so a concurrent CONFIG_TAG(2) /
+// CONNECT(3) consumer is never corrupted. Returns true on a CRC-valid decode.
+bool cl_telecom_system::decode_ack_sack_coded_trybooth(double* data, int size,
+	uint8_t* out_bsi, uint32_t* out_bitmap, uint16_t* out_crc12, int* out_matched)
+{
+	if (out_matched) *out_matched = 0;
+	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;          // NB
+	if (!out_bsi || !out_bitmap || !out_crc12) return false;
+	if (ack_suffix_fec_crc12_fn == nullptr) return false;           // no CRC gate available
+
+	int Mi = data_container.interpolation_rate;
+	int dec_size = size / Mi;
+	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated,
+		sampling_frequency, effective_carrier, carrier_amplitude,
+		Mi, &ofdm.FIR_rx_data);
+
+	// Reserve the CODED suffix length after the base so the detector leaves room for
+	// the whole N-tone codeword (the §21.4 C6 capture-window invariant).
+	int reserve = ack_mfsk.ack_sack_coded_suffix_len();
+	int matched = 0;
+	int best_offset = -1;
+	double metric = ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		ack_mfsk.ack_pattern_nsymb,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+		&matched, /*suffix_start=*/0, /*out_suffix_matched=*/nullptr,
+		&best_offset, /*reserve_after=*/reserve, /*out_match_mask=*/nullptr);
+
+	if (out_matched) *out_matched = matched;
+	if (matched < ack_mfsk.ack_match_threshold || metric < 3.0 || best_offset < 0)
+		return false;
+
+	// Control mini-Moose v2 CFO correction (mirror of the soft path / CONNECT branch).
+	double ctrl_residual = ofdm.carrier_frequency_sync_wb_ctrl(
+		data_container.baseband_data_interpolated,
+		bandwidth / (double)data_container.Nc,
+		ack_mfsk.ack_pattern_nsymb, best_offset,
+		ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+		ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets);
+
+	if (fabs(ctrl_residual) > ofdm.freq_offset_ignore_limit)
+	{
+		ofdm.passband_to_baseband_decimated(data, size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency, effective_carrier - ctrl_residual,
+			carrier_amplitude, Mi, &ofdm.FIR_rx_data);
+		int rematched = 0, rebest_offset = -1;
+		double remetric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			ack_mfsk.ack_pattern_nsymb,
+			ack_mfsk.ack_tones, ack_mfsk.ack_pattern_len,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets,
+			&rematched, 0, nullptr, &rebest_offset, reserve, nullptr);
+		if (rematched >= ack_mfsk.ack_match_threshold && remetric >= 3.0 && rebest_offset >= 0)
+		{
+			matched = rematched; best_offset = rebest_offset;
+			if (out_matched) *out_matched = matched;
+		}
+	}
+
+	// gf16ra is process-global; save/restore the repfact around the ACK FEC decode so a
+	// concurrent CONFIG_TAG(2)/CONNECT(3) consumer is not corrupted (the build_config_tag_
+	// tones discipline). Pin the ACK repfact (3, N=52) for both the uncoded sub-window
+	// length and the coded BP.
+	int saved_repfact = gf16ra::current_repfact();
+	if (saved_repfact != cl_telecom_system::ACK_SUFFIX_FEC_REPFACT) {
+		gf16ra::configure(cl_telecom_system::ACK_SUFFIX_FEC_REPFACT);
+		gf16ra::init();
+	}
+	int N = gf16ra::codeword_len();   // = 52 at repfact 3
+	bool ok = false;
+
+	// (1) TRY-BOTH uncoded 13-tone FIRST (cheap; the systematic prefix == the hard
+	// pack). Read the 13 de-hopped tones at the matched offset and verify the wire-form
+	// CRC + the bsi/bitmap unpack. The uncoded read is a strict sub-window of the coded
+	// capture (§21.4 C6), always in-bounds.
+	{
+		int ulen = ack_mfsk.ack_sack_suffix_len();   // 13 at M=16
+		if (ulen > 0 && ulen <= cl_mfsk::MAX_ACK_SACK_SUFFIX) {
+			int utones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+			ofdm.decode_suffix_tones(
+				data_container.baseband_data_interpolated, dec_size, 1,
+				best_offset, ack_mfsk.ack_pattern_nsymb, ulen,
+				ack_mfsk.tone_hop_step, ack_mfsk.M,
+				ack_mfsk.nStreams, ack_mfsk.stream_offsets, utones);
+			bool uclean = true;
+			for (int i = 0; i < ulen; i++)
+				if (utones[i] < 0 || utones[i] >= ack_mfsk.M) { uclean = false; break; }
+			if (uclean) {
+				uint8_t ub = 0; uint32_t ubm = 0; uint16_t uc = 0;
+				if (ack_mfsk.unpack_ack_sack_payload(utones, &ub, &ubm, &uc)) {
+					// Recompute the WIRE-form CRC via the stored callback, which expects the
+					// TYPED40 [type:2|payload38] bytes and converts to wire internally — pass
+					// typed40 (type=0 ACK_SACK), NOT pre-built wire (double-convert = wrong CRC).
+					uint64_t up38 = ((uint64_t)ub << 30) | (uint64_t)(ubm & 0x3FFFFFFFu);
+					unsigned char typed[5];
+					for (int b = 0; b < 5; b++)
+						typed[b] = (unsigned char)((up38 >> (8 * (4 - b))) & 0xFF);
+					uint16_t exp = ack_suffix_fec_crc12_fn(ack_suffix_fec_crc12_ctx,
+						typed, 5) & 0x0FFF;
+					if (exp == (uc & 0x0FFF)) {
+						*out_bsi = ub; *out_bitmap = ubm; *out_crc12 = uc;
+						ok = true;
+					}
+				}
+			}
+		}
+	}
+
+	// (2) On uncoded miss, run the full N-tone GF(16) RA BP. Extract the per-tone ENERGY
+	// matrix over the N coded symbols (same de-hop math as the candidate path) and soft-
+	// decode with the WIRE-form CRC accept gate + the ACK_SACK type discriminator.
+	if (!ok && N > 0 && N <= gf16ra::GF16RA_MAX_N) {
+		std::vector<double> energies((size_t)N * ack_mfsk.M, 0.0);
+		ofdm.decode_suffix_energies(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			best_offset, ack_mfsk.ack_pattern_nsymb, N,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets, energies.data());
+
+		uint64_t p38 = 0;
+		int iters = -1;
+		if (gf16ra::soft_decode(energies.data(), /*maxiter=*/50, /*esno_metric=*/4.0,
+			(uint8_t)MFSK_CTRL_ACK_SACK, ack_suffix_fec_crc12_fn,
+			ack_suffix_fec_crc12_ctx, &p38, &iters))
+		{
+			uint8_t  db  = (uint8_t)((p38 >> 30) & 0xFFu);     // payload38 = [bsi:8|bitmap:30]
+			uint32_t dbm = (uint32_t)(p38 & 0x3FFFFFFFu);
+			// Set out_crc12 to the WIRE-form CRC so the caller's outer re-check (which
+			// recomputes CRC12 over the 5-byte [bsi||bitmap] wire form) passes BY
+			// CONSTRUCTION. CRITICAL: ack_suffix_fec_crc12_fn (arq_ack_sack_crc12_cb)
+			// EXPECTS the TYPED40 [type:2|payload38] bytes and converts them to wire form
+			// INTERNALLY — so we MUST pass it the TYPED40 bytes (NOT pre-built wire bytes,
+			// which would double-convert and yield a wrong CRC — the PA-1 crc_ok=0 bug).
+			// For ACK_SACK type=0, typed40 = [00|bsi:8|bitmap:30] MSB-first.
+			uint64_t typed40 = (uint64_t)p38 & ((1ULL << 38) - 1ULL);   // type=0 high bits
+			unsigned char typed[5];
+			for (int b = 0; b < 5; b++)
+				typed[b] = (unsigned char)((typed40 >> (8 * (4 - b))) & 0xFF);
+			*out_crc12 = ack_suffix_fec_crc12_fn(ack_suffix_fec_crc12_ctx, typed, 5) & 0x0FFF;
+			*out_bsi = db; *out_bitmap = dbm;
+			ok = true;
+		}
+	}
+
+	// Restore the gf16ra global so a later CONFIG_TAG(2) / CONNECT(3) consumer is not
+	// corrupted (the §5 cross-layer guard).
+	if (saved_repfact != cl_telecom_system::ACK_SUFFIX_FEC_REPFACT
+	    && saved_repfact > 0) {
+		gf16ra::configure(saved_repfact);
+		gf16ra::init();
+	}
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): on a CLEAN coded ACK decode,
+	// snapshot the SUPERACK_SUFFIX_LEN tones that FOLLOW the coded SACK suffix (offset =
+	// ack_pattern_nsymb + ack_sack_coded_suffix_len(), continuing the SAME tone-hop) so the
+	// CMD's CLEAN handler decodes the inline skip-target from THIS capture. The coded
+	// try-both path bypasses detect_ack_snr_from_passband (where the uncoded path
+	// snapshots), so on the CODED ROBUST ACK — which is what a climbed/robust rung uses —
+	// it MUST snapshot here or the SUPER-ACK never lands (ROOT 2 sub-cause). Valid only
+	// when all 8 tones decode cleanly (0..M-1); superack_decode_tones rejects otherwise
+	// (D0 fail-safe). Uses decode_suffix_tones (no gf16ra dependency), so it runs after the
+	// global restore.
+	if (ok) {
+		int sofs = ack_mfsk.ack_pattern_nsymb + ack_mfsk.ack_sack_coded_suffix_len();
+		int satones[cl_mfsk::MAX_ACK_SACK_SUFFIX];
+		ofdm.decode_suffix_tones(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			best_offset, sofs, cl_mfsk::SUPERACK_SUFFIX_LEN,
+			ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets, satones);
+		bool svalid = true;
+		for (int i = 0; i < cl_mfsk::SUPERACK_SUFFIX_LEN; i++) {
+			ack_mfsk.last_superack_suffix_tones[i] = satones[i];
+			if (satones[i] < 0 || satones[i] >= ack_mfsk.M) svalid = false;
+		}
+		ack_mfsk.last_superack_capture_valid = svalid;
+	}
+	return ok;
+}
+
 // RX: Detect ACK pattern and decode the 52-bit ACK+SACK suffix in one call.
 // Runs the same detector pipeline as detect_ack_snr_from_passband — which
 // writes the de-hopped suffix tones into ack_mfsk.last_ack_sack_suffix_tones[]
@@ -4395,6 +4671,40 @@ bool cl_telecom_system::decode_ack_sack_from_passband(double* data, int size,
 	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // NB / unsupported
 	if (out_bsi == nullptr || out_bitmap == nullptr || out_crc12 == nullptr)
 		return false;
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): fresh-per-call. BOTH decode
+	// paths snapshot the trailing SUPER-ACK tones when they capture cleanly — the CODED
+	// try-both path (decode_ack_sack_coded_trybooth, on the coded ROBUST ACK) and the
+	// uncoded path (detect_ack_snr_from_passband, below). Clear it here up front so a
+	// decode that finds no clean suffix never leaves a STALE capture for the CMD's CLEAN
+	// handler to re-read.
+	ack_mfsk.last_superack_capture_valid = false;
+
+	// REVSACK Part A (revsack/design.json): CODED TRY-BOTH data-ACK+SACK decode. When
+	// ack_suffix_fec_coded is set (the climbed-OFDM-rung ACK FEC enable) the reverse
+	// data-SACK suffix is the GF(16) RA codeword (N=52). On a slow half-duplex turnaround
+	// a single per-symbol argmax error (clock-drift/CFO de-aligning the suffix window)
+	// fails the UNCODED CRC12 while the base correlation still locks 7/7 — the root cause.
+	// The GF(16) RA BP absorbs 2-8 such symbol errors (+3-5 dB, tier2 §8.2/§8.4) so the
+	// confirm (which RIDES the same bsi field) survives → nAcked_data advances → no
+	// CMD-ACK-PAT-timeout→emergency_nack→demote. MIRROR of the proven CONNECT FEC branch
+	// (decode_ctrl_suffix_from_passband §21.5 TRY-BOTH), but on the ACK base pattern +
+	// MFSK_CTRL_ACK_SACK type. TRY-BOTH order: uncoded 13-tone FIRST (cheap; the
+	// systematic GF(16) prefix == the hard pack, so a legacy/uncoded sender still
+	// decodes here), then the full N-tone GF(16) BP on miss. The GF(16) BP carries its
+	// OWN recompute-CRC12 + 2-bit-type accept gate (FAR 6.1e-5) — D0 no-false-confirm.
+	// Needs the production CRC callback (stored at the enable hook); if absent, fall
+	// through to the legacy uncoded path (byte-identical). The gf16ra global repfact is
+	// SAVED/RESTORED around the BP (the process-global discipline build_config_tag_tones
+	// uses) so a concurrent CONFIG_TAG(2)/CONNECT(3) consumer is never corrupted.
+	if (ack_mfsk.ack_suffix_fec_coded && ack_suffix_fec_crc12_fn != nullptr) {
+		bool coded_ok = decode_ack_sack_coded_trybooth(
+			data, size, out_bsi, out_bitmap, out_crc12, out_matched);
+		if (coded_ok) return true;
+		// Coded try-both MISS — fall through to the legacy uncoded detector below as the
+		// final fallback (covers an uncoded peer whose 13 systematic tones the BP front
+		// did not reconstruct, and keeps the capture-buffer side-effects identical).
+	}
 
 	// Reuse the SNR detector pipeline — it already does base-pattern detection
 	// + suffix capture into ack_mfsk.last_ack_sack_suffix_tones[].
@@ -4433,6 +4743,58 @@ int cl_telecom_system::set_suffix_fec(bool on, int repfact)
 		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len())
 		* data_container.Nofdm * frequency_interpolation_rate;
 	return ack_mfsk.ctrl_suffix_len();
+}
+
+// REVSACK Part A (revsack/design.json): enable/disable the GF(16) RA FEC on the
+// DATA-ACK+SACK suffix. MIRROR of set_suffix_fec for the SEPARATE ack_suffix_fec_coded
+// flag (§21.1 isolation — the ACK never inherits the CONNECT FEC state). This is the
+// "ACK coded-window sizing work" §21.3 named as the held-off prerequisite: it
+// (a) configures the gf16ra graph to the ACK repfact (3, N=52 — the SAME value CONNECT
+//     uses, so the process-global codec is consistent across both callers),
+// (b) sets ack_mfsk.ack_suffix_fec_coded so pack_ack_sack_payload emits the coded N
+//     tones and ack_sack_coded_suffix_len()/ack_sack_pattern_nsymb() report N,
+// (c) stores the production CRC-12 callback for the internal coded RX try-both decode
+//     (so NO caller signature changes), and
+// (d) RE-DERIVES ack_sack_pattern_passband_samples for the coded length (load_configuration
+//     computed it at the uncoded 13 — the coded N=52 differs; every TX/RX consumer that
+//     reads this member must see the updated value, the §19.4 C4 invariant).
+// off=true restores the byte-identical uncoded 13-tone ACK suffix. Idempotent. Returns
+// the coded N (or 13 when off).
+int cl_telecom_system::set_ack_suffix_fec(bool on, ctrl_crc12_fn crc12_fn,
+                                          void* crc12_ctx, int repfact)
+{
+	if (on) {
+		// Both peers run repfact 3 for the ACK suffix (the no-negotiation invariant —
+		// the systematic-codeword + try-both RX makes it backward-compatible BY
+		// CONSTRUCTION, tier2 §21.6). gf16ra is PROCESS-GLOBAL: SAVE the prior repfact,
+		// configure(3), CAPTURE the coded N (= codeword_len()), then RESTORE the prior
+		// repfact so NO other consumer (CONFIG_TAG at 2, or the default) is polluted by
+		// this enable (the test config_tag_passband_stage3a reads codeword_len() expecting
+		// 39 — leaving the global at 3 made it 52). The ACK TX/RX re-pin the global to 3
+		// around their actual encode/BP with their OWN save/restore; the LENGTH everywhere
+		// uses the captured ack_suffix_fec_N (not the live global), so the restore is safe.
+		int saved = gf16ra::current_repfact();
+		gf16ra::configure(repfact);
+		gf16ra::init();
+		ack_mfsk.ack_suffix_fec_N     = gf16ra::codeword_len();   // capture N (=52 @ rf3)
+		ack_mfsk.ack_suffix_fec_coded = true;
+		ack_suffix_fec_crc12_fn  = crc12_fn;
+		ack_suffix_fec_crc12_ctx = crc12_ctx;
+		if (saved > 0 && saved != repfact) { gf16ra::configure(saved); gf16ra::init(); }
+	} else {
+		ack_mfsk.ack_suffix_fec_coded = false;
+		ack_mfsk.ack_suffix_fec_N     = 0;
+		ack_suffix_fec_crc12_fn  = nullptr;
+		ack_suffix_fec_crc12_ctx = nullptr;
+	}
+	// Re-derive the ACK+SACK passband sample count for the (now possibly coded) suffix
+	// length. load_configuration computed it at the uncoded length; the coded length
+	// differs (52 vs 13). NB (M<16) has ack_sack_coded_suffix_len()==0 so this stays
+	// the bare base length (downstream callers gate on ack_sack_suffix_len()>0).
+	ack_sack_pattern_passband_samples =
+		ack_mfsk.ack_sack_pattern_nsymb()
+		* data_container.Nofdm * frequency_interpolation_rate;
+	return ack_mfsk.ack_sack_coded_suffix_len();
 }
 
 // §20 (INCREMENT 2): set the CONNECT base-pattern combining factor R. See

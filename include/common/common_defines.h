@@ -871,6 +871,15 @@ CONFIG_16 (5664.7 bps).
 // leaps from a low OFDM anchor) while a pathological jump is bounded.
 #define RETRIGGER_MAX_LEAP 13
 
+// TRIO TURBOSHIFT RE-ENGAGE first-post-jump batch cap (gearshift-trio-turboshift-reengage.md
+// §5). When the in-band FRAME-UP fires the multi-rung SNR-ideal elevator jump on the OFDM
+// ladder (CONFIG_TAG carrier, no SET_CONFIG control probe), the FIRST batch aired at the
+// jumped rung is capped to this many frames so its forward airtime stays short and the reverse
+// data-SACK turnaround survives (the ROOT the 65bb60bf +1-suppression named). 1 frame mirrors
+// what legacy naturally airs when SUPERSHIFT settles at a high rung with little data queued;
+// the cap disarms after that one batch so the batch size grows back for throughput. TUNABLE.
+#define INBAND_CLIMB_JUMP_BATCH_CAP 1
+
 // CONNECT-SEED of the START config (gearshift-start-and-recovery.md §10). On a
 // CLEARLY-clean channel, open data near the SNR-appropriate WB OFDM config at
 // connect instead of crawling ROBUST_0->1->2 (the ~102 s dominant climb cost).

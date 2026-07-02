@@ -65,10 +65,14 @@ cl_mfsk::cl_mfsk()
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
+	for (int i = 0; i < SUPERACK_SUFFIX_LEN; i++)
+		last_superack_suffix_tones[i] = -1;
+	last_superack_capture_valid = false;
 	last_demod_snr_db = -99.0;  // "no measurement" sentinel until first demod()
 	suffix_fec_coded = false;  // Tier-2 FEC off by default (§19) — CONNECT suffix
 	ack_suffix_fec_coded = false; // §21: ACK-suffix FEC off by default (separate
 	                              // from the CONNECT flag; held off this increment)
+	ack_suffix_fec_N = 0;         // REVSACK Part A: captured coded N (0 = off / uncoded 13)
 	connect_preamble_reps = 1; // Tier-2 base-pattern combining off by default (§20)
 	recovery_ack_reps = 1;     // RECOVERY-ACK robustness off by default
 	                           // (recovery-ack-robustness.md §4) → byte-identical
@@ -93,6 +97,9 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_connect_suffix_tones[i] = -1;
 	last_connect_capture_valid = false;
+	for (int i = 0; i < SUPERACK_SUFFIX_LEN; i++)
+		last_superack_suffix_tones[i] = -1;
+	last_superack_capture_valid = false;
 	// NOTE: suffix_fec_coded is NOT reset here — it is owned by the telecom
 	// layer (set after gf16ra::configure(3)+init() when FEC is enabled) and
 	// init() is called once at load_configuration before that. Resetting it
@@ -670,6 +677,56 @@ float cl_mfsk::tone_to_snr(int tone) const
 	return (float)tone * 2.0f - offset;
 }
 
+// SUPER-ACK inline suffix (data-flow-superack.md §9). Encode a 5-bit config-ladder
+// index (0..31) into SUPERACK_SUFFIX_LEN=8 M-ary payload tones (0..M-1) with copy
+// redundancy + a 4-bit checksum, mirroring the SNR suffix's "8 redundant tones,
+// majority-voted" transport. Layout: lo-nibble x3 (idx & 0xF), hi-bit x2
+// (idx>>4), checksum x3. The checksum ties the whole index together so any
+// surviving mis-decode is REJECTED downstream (D0 fail-safe: garbage -> no leap).
+void cl_mfsk::superack_encode_tones(int ladder_idx, int* out_tones) const
+{
+	if (out_tones == nullptr) return;
+	int lo  = ladder_idx & 0xF;
+	int hi  = (ladder_idx >> 4) & 0x1;
+	int chk = ((ladder_idx * 13) + 5) & 0xF;   // 4-bit checksum of the index
+	// positions: lo @0,3,6 ; hi @1,4 ; chk @2,5,7
+	out_tones[0] = lo;  out_tones[1] = hi;  out_tones[2] = chk;
+	out_tones[3] = lo;  out_tones[4] = hi;  out_tones[5] = chk;
+	out_tones[6] = lo;  out_tones[7] = chk;
+}
+
+// Majority of three de-hopped tones (each 0..M-1 or -1). Returns the value shared
+// by >=2 of them, or -1 if all three disagree / are invalid.
+static int superack_majority3(int a, int b, int c)
+{
+	if (a >= 0 && a == b) return a;
+	if (a >= 0 && a == c) return a;
+	if (b >= 0 && b == c) return b;
+	return -1;
+}
+
+// Decode SUPERACK_SUFFIX_LEN de-hopped payload tones back to a config-ladder index
+// (>=0), or -1 when there is no valid SUPER-ACK riding this ACK (undecoded symbol,
+// copy disagreement, out-of-range index, or checksum mismatch). The redundancy +
+// checksum make a spurious accept from noise (a plain ACK with no SUPER-ACK) very
+// unlikely; combined with the CMD's is_ofdm_config/UP-only/proven-ceiling gates the
+// D0 "never a spurious jump" property holds (SUPERACK_DESIGN.md §3).
+int cl_mfsk::superack_decode_tones(const int* in_tones) const
+{
+	if (in_tones == nullptr) return -1;
+	int lo  = superack_majority3(in_tones[0], in_tones[3], in_tones[6]);
+	int chk = superack_majority3(in_tones[2], in_tones[5], in_tones[7]);
+	// hi is a single bit carried in two copies — require agreement (a lone hi
+	// disagreement fails safe rather than guessing the high bit).
+	int hi  = (in_tones[1] >= 0 && in_tones[1] == in_tones[4]) ? in_tones[1] : -1;
+	if (lo < 0 || hi < 0 || chk < 0) return -1;
+	if (hi > 1 || lo > 0xF) return -1;
+	int idx = (hi << 4) | lo;
+	if (idx < 0 || idx > 31) return -1;
+	if (chk != (((idx * 13) + 5) & 0xF)) return -1;   // checksum gate (fail-safe)
+	return idx;
+}
+
 // =============================================================================
 // Generic MFSK control-suffix codec
 // =============================================================================
@@ -872,16 +929,24 @@ void cl_mfsk::test_inject_connect_capture(const int* tones, int count)
 // no access to the ARQ-layer CRC12_calc helper. See fact-doc §11.3.
 void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
                                         uint8_t bsi, uint32_t bitmap,
-                                        uint16_t crc12)
+                                        uint16_t crc12,
+                                        const int* superack_tones)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;
-	int suffix_len = ack_sack_suffix_len();
+	// REVSACK Part A: loop over the CODED suffix length (coded N when ack_suffix_fec_
+	// coded, 13 uncoded) so the GF(16) RA codeword is fully laid down. Was
+	// ack_sack_suffix_len() (always 13) — with FEC on that emitted only the first 13
+	// of N tones (the systematic prefix), the wire bug §21.3 flags as the missing
+	// "coded-window sizing work". FEC-off path is byte-identical (coded len == 13).
+	int suffix_len = ack_sack_coded_suffix_len();
 	if (suffix_len == 0) return;  // NB unsupported for now
 
 	// First: generate the standard ACK base pattern (16 symbols WB)
 	generate_ack_pattern(pattern_out);
 
 	// Pack [type:2|bsi:8|bitmap:30|crc12:12] = 52 bits into per-symbol tones.
+	// pack_ack_sack_payload emits the GF(16) RA codeword (N tones) when
+	// ack_suffix_fec_coded is set, else the 13-symbol hard pack — matching suffix_len.
 	int payload_tones[MAX_ACK_SACK_SUFFIX];
 	pack_ack_sack_payload(bsi, bitmap, crc12, payload_tones);
 
@@ -896,6 +961,23 @@ void cl_mfsk::generate_ack_sack_pattern(std::complex<double>* pattern_out,
 		for (int st = 0; st < nStreams; st++)
 			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
 				std::complex<double>(amp, 0.0);
+	}
+
+	// SUPER-ACK inline suffix (data-flow-superack.md §9): when the caller supplied
+	// superack_tones, lay down SUPERACK_SUFFIX_LEN more tones AFTER the SACK suffix,
+	// continuing the SAME tone-hop (abs_s = ack_pattern_nsymb + suffix_len + j), so
+	// the CMD de-hops them at the offset right after the SACK suffix. Caller has
+	// sized the buffer for ack_sack_superack_pattern_nsymb(). nullptr -> untouched.
+	if (superack_tones != nullptr) {
+		for (int j = 0; j < SUPERACK_SUFFIX_LEN; j++) {
+			int abs_s = ack_pattern_nsymb + suffix_len + j;
+			for (int k = 0; k < Nc; k++)
+				pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+			int actual_tone = ((superack_tones[j] & (M - 1)) + abs_s * tone_hop_step) % M;
+			for (int st = 0; st < nStreams; st++)
+				pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+					std::complex<double>(amp, 0.0);
+		}
 	}
 }
 

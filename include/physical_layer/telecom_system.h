@@ -189,7 +189,12 @@ public:
 	// TX: ACK base + 13-symbol ACK+SACK suffix carrying
 	// [bsi:8 | bitmap:32 | crc12:12]. Returns samples written, or 0 if
 	// unsupported (NB / M<16). Caller supplies the crc12.
-	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12);
+	// superack_ladder_idx (optional): when >=0, a SUPER-ACK inline suffix
+	// (SUPERACK_SUFFIX_LEN tones carrying that config-ladder index) is appended after
+	// the SACK suffix in the SAME burst (data-flow-superack.md §9). Returns the actual
+	// passband sample count written (LONGER than ack_sack_pattern_passband_samples when
+	// a suffix is present) so the caller sizes tx_transfer correctly. -1 -> legacy.
+	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12, int superack_ladder_idx = -1);
 	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr);  // RX: returns metric
 	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	// RX: detect ACK pattern and decode the 40-bit ACK+SACK suffix (WB M>=16
@@ -199,6 +204,15 @@ public:
 	// or unsupported M. *out_matched (optional) gets the base-pattern match
 	// count for diagnostics. Caller verifies crc12 by re-computing CRC12
 	// over [bsi || bitmap] (mismatch → treat as no-ACK).
+	// REVSACK Part A (revsack/design.json): when ack_mfsk.ack_suffix_fec_coded is
+	// set (the climbed-OFDM-rung ACK FEC enable) this internally runs a TRY-BOTH coded
+	// decode — uncoded 13-tone FIRST (so a legacy/uncoded sender still decodes; the
+	// GF(16) RA codeword is SYSTEMATIC so its first 13 tones ARE the hard pack), then
+	// on miss the full N-tone GF(16) RA BP with its own CRC12+type accept gate (FAR
+	// 6.1e-5). The coded path needs the production CRC-12 callback; it is taken from
+	// the stored ack_suffix_fec_crc12_fn/_ctx set at the ACK FEC enable hook so NO
+	// caller signature changes (all 6 existing callers keep working). FEC-off →
+	// byte-identical uncoded 13-tone decode.
 	bool decode_ack_sack_from_passband(double* data, int size,
 	                                   uint8_t* out_bsi, uint32_t* out_bitmap,
 	                                   uint16_t* out_crc12,
@@ -314,6 +328,14 @@ public:
 	int  suffix_fec_max_trials; // CRC-trial cap (bounds runtime; default 4000).
 	int  suffix_fec_max_flips;  // Hamming-ball radius (primary FAR lever; default 3).
 
+	// REVSACK Part A: the production CRC-12 callback stored at set_ack_suffix_fec() so
+	// the internal coded ACK try-both decode (inside decode_ack_sack_from_passband) can
+	// run its GF(16) RA CRC accept gate WITHOUT a caller signature change. NULL when ACK
+	// FEC is off → the uncoded 13-tone path runs (byte-identical). Set/cleared only by
+	// set_ack_suffix_fec(); never inlined (the CRC is the ARQ layer's CRC12_calc).
+	ctrl_crc12_fn ack_suffix_fec_crc12_fn;
+	void*         ack_suffix_fec_crc12_ctx;
+
 	// §19 (INCREMENT 1): enable/disable the Tier-2 GF(16) RA FEC on the CONNECT
 	// ctrl-suffix. on=true → gf16ra::configure(repfact)+init(), set
 	// ack_mfsk.suffix_fec_coded=true, set suffix_fec_mode=3, and RE-DERIVE
@@ -322,6 +344,23 @@ public:
 	// length). repfact 3 = R=1/4 (N=52, the −14.03 reach, §12). Idempotent.
 	// FORCE-on for this increment (no CAP negotiation yet). Returns the coded N.
 	int  set_suffix_fec(bool on, int repfact = 3);
+
+	// REVSACK Part A (revsack/design.json) — enable/disable the GF(16) RA FEC on the
+	// DATA-ACK+SACK suffix (the reverse data-SACK at the climbed OFDM rungs). MIRROR of
+	// set_suffix_fec but for the SEPARATE ack_suffix_fec_coded flag (the §21.1 isolation
+	// — the ACK never inherits the CONNECT FEC state). on=true →
+	// gf16ra::configure(ACK_SUFFIX_FEC_REPFACT)+init(), set ack_mfsk.ack_suffix_fec_coded
+	// =true, store the production CRC-12 callback (for the internal coded RX decode), and
+	// RE-DERIVE ack_sack_pattern_passband_samples for the coded suffix length (the §21.3
+	// "ACK coded-window sizing" that was the held-off prerequisite). MUST be called AFTER
+	// load_configuration. repfact = ACK_SUFFIX_FEC_REPFACT (3, N=52, the −14 reach, the
+	// SAME value CONNECT uses so the shared gf16ra global is consistent). Idempotent.
+	// Returns the coded N (or 13 when off). FEC-off restores the byte-identical 13-tone
+	// ACK suffix (the §21 throughput-neutral default off the climbed rung).
+	static const int ACK_SUFFIX_FEC_REPFACT = 3;   // R=1/4, N=52 (matches CONNECT)
+	int  set_ack_suffix_fec(bool on, ctrl_crc12_fn crc12_fn = nullptr,
+	                        void* crc12_ctx = nullptr,
+	                        int repfact = ACK_SUFFIX_FEC_REPFACT);
 
 	// §20 (INCREMENT 2): set the CONNECT base-pattern noncoherent combining factor
 	// R. R>1 → ack_mfsk.connect_preamble_reps=R (TX emits the base block R times,
@@ -350,6 +389,17 @@ public:
 	                                         uint8_t* out_bsi, uint32_t* out_bitmap,
 	                                         int* out_matched = nullptr,
 	                                         int* out_flips = nullptr);
+
+	// REVSACK Part A: the GF(16) RA coded TRY-BOTH data-ACK decode (uncoded 13-tone
+	// FIRST, then the full N-tone BP) used internally by decode_ack_sack_from_passband
+	// when ack_suffix_fec_coded is set. Base-detect + CFO front-half mirrors
+	// decode_ack_sack_from_passband_soft; the GF(16) BP carries its own CRC12+type gate.
+	// Uses the stored ack_suffix_fec_crc12_fn/_ctx. Returns true on a CRC-valid decode
+	// (out_bsi/out_bitmap/out_crc12 set so the caller's outer CRC re-check passes by
+	// construction). The gf16ra global repfact is saved/restored around the BP.
+	bool decode_ack_sack_coded_trybooth(double* data, int size,
+	                                     uint8_t* out_bsi, uint32_t* out_bitmap,
+	                                     uint16_t* out_crc12, int* out_matched);
 
 	// Step 15: legacy MFSK SACK pattern (sack_pattern_passband_samples,
 	// generate_sack_bitmap_pattern_passband, detect_sack_pattern_from_passband,

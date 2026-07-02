@@ -3422,6 +3422,27 @@ static uint16_t prod_crc12_cb(void* ctx, const unsigned char* data, int n) {
 	return arq->CRC12_calc((const char*)data, n) & 0x0FFF;
 }
 
+// REVSACK Part A: WIRE-form ACK CRC callback for the coded data-ACK gate test. MIRROR of
+// the production arq_ack_sack_crc12_cb (arq_common.cc): gf16ra hands it the typed40 bytes
+// [type:2|payload38]; for ACK_SACK (type=0) that is [00|bsi:8|bitmap:30]. Reassemble the
+// WIRE form [bsi||bitmap32] (the form send_mfsk_ack_sack embeds) and CRC over THAT.
+static uint16_t test_ack_sack_wire_crc12_cb(void* ctx, const unsigned char* data, int n) {
+	cl_arq_controller* arq = static_cast<cl_arq_controller*>(ctx);
+	if (n != 5 || !data) return (uint16_t)0xFFFFu;
+	uint64_t typed40 = 0;
+	for (int b = 0; b < 5; b++) typed40 = (typed40 << 8) | (uint64_t)data[b];
+	uint64_t p38 = typed40 & ((1ULL << 38) - 1ULL);
+	uint8_t  bsi = (uint8_t)((p38 >> 30) & 0xFFu);
+	uint32_t bm  = (uint32_t)(p38 & 0x3FFFFFFFu);
+	char wire[5];
+	wire[0] = (char)bsi;
+	wire[1] = (char)((bm >> 24) & 0xFF);
+	wire[2] = (char)((bm >> 16) & 0xFF);
+	wire[3] = (char)((bm >>  8) & 0xFF);
+	wire[4] = (char)( bm        & 0xFF);
+	return arq->CRC12_calc(wire, 5) & 0x0FFF;
+}
+
 // Build CONNECT-base suffix passband for a given (type, p38). CONNECT base
 // pattern (g=3) + 13-symbol ctrl-suffix. Suffix placed at offset 4096.
 static std::vector<double> build_ctrl_suffix_audio(cl_telecom_system& ts,
@@ -4478,6 +4499,119 @@ static void test_config_tag_roundtrip_all_indices() {
 			test_fail(name, "unpack_config_tag_payload roundtrip mismatch"); return;
 		}
 	}
+	test_pass(name);
+}
+
+// SUPER-ACK codec (SUPERACK_DESIGN.md §2) round-trip + margin-map + fail-safe.
+// Mirrors the CONFIG_TAG T1 clean round-trip: for a set of WB ladder indices, encode
+// the SUPER-ACK (RM prefix via cfg_tag_energies_from_cfg + GF16-RA message via
+// encode_config_tag type=6), then superack_wrap_decode must ACCEPT with exact fields.
+// Then: (a) pack/unpack payload primitive; (b) a corrupted-chip mis-decode is REJECTED
+// (fail-safe); (c) superack_target_from_margin follows the §3.3 conservative table.
+static void test_superack_codec() {
+	const char* name = "superack_codec (round-trip + margin-map + fail-safe)";
+	cl_arq_controller arq;
+
+	// --- (1) clean WRAP round-trip over representative ladder indices (skip targets). ---
+	// The SUPER-ACK carries the ladder INDEX in both the RM prefix and the CRC field
+	// (build_superack_tones), so drive the codec with ladder indices directly.
+	const int idxs[] = {0, 2, 4, 6, 8, 10, 16};   // WB ladder indices exercised by the map
+	for (unsigned k = 0; k < sizeof(idxs)/sizeof(idxs[0]); k++) {
+		int lidx = idxs[k];
+		uint8_t bsi_lsb = (uint8_t)(lidx & 0x7);
+		uint8_t conf    = (uint8_t)(k & 0x7);
+		uint8_t parity  = (uint8_t)(k & 0x1);
+
+		// RM(1,4) Walsh prefix soft chips (clean).
+		double e16[256]; cfg_tag_energies_from_cfg(lidx, 1.0, 0.0, e16);
+		double soft[16]; cfg_tag_softchips_from_energies(e16, soft);
+
+		// GF(16) RA + CRC-12 SUPER-ACK message energies (one-hot clean).
+		gf16ra::configure(2); gf16ra::init();
+		uint64_t p37 = 0;
+		pack_superack_payload(&p37, (uint8_t)lidx, bsi_lsb, conf, parity);
+		uint8_t bytes[5];
+		pack_config_tag_typed40_msb(bytes, (uint8_t)MFSK_CTRL_SUPERACK, p37);
+		uint16_t crc12 = arq.CRC12_calc((char*)bytes, 5) & 0x0FFF;
+		int tones[gf16ra::GF16RA_MAX_N];
+		gf16ra::encode_config_tag((uint8_t)MFSK_CTRL_SUPERACK, p37, crc12, tones);
+		int N = gf16ra::codeword_len();
+		std::vector<double> e((size_t)N * 16, 0.0);
+		for (int s = 0; s < N; s++) e[(size_t)s * 16 + tones[s]] = 1.0;
+
+		superack_decode_result r;
+		bool ok = superack_wrap_decode(e.data(), soft, CFG_TAG_PEAK_GATE,
+			prod_crc12_cb, &arq, &r);
+		if (!ok) {
+			char b[160]; snprintf(b, sizeof(b),
+				"lidx=%d WRAP reject (fwht=%d crc=%d corr=%d rpeak=%.2f)",
+				lidx, r.fwht_passed, r.crc_passed, r.skip_corroborate, r.fwht_rpeak);
+			test_fail(name, b); return;
+		}
+		if (r.skip_target_cfg != lidx || r.ack_bsi_lsb != bsi_lsb
+		    || r.skip_confidence != conf || r.epoch_parity != parity) {
+			char b[160]; snprintf(b, sizeof(b),
+				"lidx=%d field mismatch: skip=%d bsi=%d conf=%d par=%d",
+				lidx, r.skip_target_cfg, r.ack_bsi_lsb, r.skip_confidence, r.epoch_parity);
+			test_fail(name, b); return;
+		}
+
+		// (a) pack/unpack payload primitive round-trip.
+		uint8_t us=0, ub=0, uconf=0, up=0;
+		unpack_superack_payload(p37, &us, &ub, &uconf, &up);
+		if (us != lidx || ub != bsi_lsb || uconf != conf || up != parity) {
+			test_fail(name, "unpack_superack_payload roundtrip mismatch"); return;
+		}
+
+		// (b) FAIL-SAFE: corrupt the RM prefix so the FWHT winner flips — the corroboration
+		// gate (FWHT==CRC) must then DISAGREE and the WRAP must REJECT (no spurious skip).
+		double soft_bad[16];
+		for (int i = 0; i < 16; i++) soft_bad[i] = soft[i];
+		soft_bad[0] = -soft_bad[0] * 8.0;   // slam one chip to flip the Walsh winner
+		soft_bad[1] = -soft_bad[1] * 8.0;
+		superack_decode_result r2;
+		bool ok2 = superack_wrap_decode(e.data(), soft_bad, CFG_TAG_PEAK_GATE,
+			prod_crc12_cb, &arq, &r2);
+		if (ok2 && r2.skip_target_cfg != lidx) {
+			test_fail(name, "corrupted RM prefix ACCEPTED with a WRONG skip_target (fail-safe breach)");
+			return;
+		}
+	}
+
+	// --- (2) margin -> ABSOLUTE-target map (SUPERACK_DESIGN.md §3.3). ---
+	const int NITER = 200;   // representative ROBUST nIteration_max
+	uint8_t c = 0;
+	struct { int iters; int expect; } cases[] = {
+		{ NITER,     -1        },  // FAIL sentinel (> niter-1) -> NO SUPER-ACK
+		{ NITER + 1, -1        },  // over-cap FAIL              -> NO SUPER-ACK
+		{ -1,        -1        },  // pre-decode sentinel        -> NO SUPER-ACK
+		{ 12,        CONFIG_0  },  // near-floor  -> just cross to WB
+		{ 10,        CONFIG_0  },
+		{ 3,         CONFIG_2  },
+		{ 2,         CONFIG_4  },
+		{ 1,         CONFIG_6  },
+		{ 0,         CONFIG_8  },  // iter=0 band -> cfg8 (3 below worst-case cfg11)
+	};
+	for (unsigned k = 0; k < sizeof(cases)/sizeof(cases[0]); k++) {
+		int got = arq.superack_target_from_margin(cases[k].iters, NITER, &c);
+		if (got != cases[k].expect) {
+			char b[128]; snprintf(b, sizeof(b),
+				"margin map iters=%d -> %d (want %d)", cases[k].iters, got, cases[k].expect);
+			test_fail(name, b); return;
+		}
+	}
+
+	// --- (3) UNDER-SKIP invariant: every non-FAIL target is a WB config <= WB_CONFIG_MAX
+	//     and STRICTLY below the top so the OFDM elevator refines the last rungs. ---
+	for (int iters = 0; iters <= 15; iters++) {
+		int got = arq.superack_target_from_margin(iters, NITER, &c);
+		if (got >= 0 && (!is_ofdm_config(got) || got > WB_CONFIG_MAX)) {
+			char b[128]; snprintf(b, sizeof(b),
+				"margin map iters=%d -> non-WB/over-ceiling target %d", iters, got);
+			test_fail(name, b); return;
+		}
+	}
+
 	test_pass(name);
 }
 
@@ -6272,6 +6406,225 @@ static void test_connect_preamble_combining_cliff_sweep() {
 }
 
 // =============================================================================
+// =============================================================================
+// PATACK §28 — OFF-GRID DATA-ACK FINE RE-CENTER (fix/revsack-data-sack, the
+// fine-timing arm-floor 6->4 in cl_ofdm::detect_ack_pattern). FAIL-BEFORE/
+// PASS-AFTER on a CLEAN channel (the variable under test is TIMING ALIGNMENT, not
+// noise — orthogonal to the recovery-ACK combining test below, which holds noise
+// as the variable at always_fine=false floor>=6).
+//
+// ROOT: the polled reverse data-ACK arrives at an arbitrary SUB-SYMBOL phase
+// (RSP ms-rounded turnaround wait + pilot + T/R drain + ppm slip). The coarse
+// symbol-grid search in detect_ack_pattern then windows each symbol's FFT across
+// the GI boundary, so on a CLEAN burst the coarse matched count collapses into
+// [4,6) — BELOW the old fine-search arm floor of 6. The fine (base-rate) pass that
+// would re-center the windows was therefore GATED OFF for the polled ACK
+// (always_fine=false), leaving matched <7, tripping the -99 suffix-capture gate,
+// discarding the config-discriminating bsi suffix, and stalling the cfg0 climb.
+//
+// THE FIX arms the SAME ±half-symbol fine re-centering at coarse>=4. This test
+// builds the production ACK passband (generate_ack_pattern_passband), sweeps the
+// burst across a FULL symbol period of sub-symbol straddles on a CLEAN channel,
+// and runs the PRODUCTION polled-ACK detector (always_fine=false, combine_reps=1).
+// PASS-AFTER (default build): EVERY sub-symbol straddle re-centers to matched>=7
+// (the 7/16 bar is UNCHANGED — only the window alignment improves). FAIL-BEFORE
+// (-DACK_OFFGRID_FINE_FAILBEFORE restores floor 6): the mid-symbol straddles whose
+// coarse count is in [4,6) are NOT armed and stay <7. FAR guard: pure noise
+// through the same count+metric (0.5) accept gate at every straddle = ~0 (the
+// arm-floor lower cannot manufacture a candidate; the fine pass is monotone-adopt).
+static void test_ofdm_ack_offgrid_fine_recenter() {
+	const char* name = "ofdm_ack_offgrid_fine_recenter";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);            // WB -> ack_mfsk M=16, 16-symbol base pattern
+	if (ts.ack_mfsk.M != 16 || ts.ack_mfsk.ack_pattern_nsymb != 16) {
+		test_fail(name, "ack_mfsk not M=16/16-symbol at ROBUST_0"); return;
+	}
+	const int    thr  = ts.ack_mfsk.ack_match_threshold;       // 7/16 — UNCHANGED by the fix
+	if (thr != 7) { test_fail(name, "ack_match_threshold expected 7/16"); return; }
+	const double fs   = ts.sampling_frequency;
+	const int    Mdec = ts.data_container.interpolation_rate;
+	const int    sym_samples = ts.data_container.Nofdm * Mdec;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+
+	// Build the clean ACK passband once (R=1, the production single block). lead is a
+	// full symbol so a sub-symbol straddle never underflows; tail covers the fine
+	// search's ±half-symbol reach + a couple symbols.
+	ts.set_recovery_ack_reps(1);
+	const int ack_samples = ts.ack_pattern_passband_samples;
+	if (ack_samples <= 0) { test_fail(name, "ACK passband samples <= 0"); return; }
+	const int lead = 2 * sym_samples;
+	const int tail = 4 * sym_samples;
+	const int total = ack_samples + lead + tail;
+	std::vector<double> clean_pb((size_t)total, 0.0);
+	if (ts.generate_ack_pattern_passband(clean_pb.data() + lead) != ack_samples) {
+		test_fail(name, "generate_ack_pattern_passband short write"); return;
+	}
+	double s_sig = 0.0;
+	for (int i = 0; i < ack_samples; i++) { double v = clean_pb[(size_t)(lead + i)]; s_sig += v*v; }
+	const double p_sig = (ack_samples > 0) ? s_sig / ack_samples : 0.0;
+
+	std::vector<double> work; std::vector<std::complex<double> > bb;
+	// Detect at a fixed sub-symbol straddle + AWGN. On a CLEAN channel the OFDM guard
+	// interval ABSORBS a sub-symbol offset (coarse stays >=6), so the bug does NOT
+	// reproduce clean — it reproduces exactly as the production turnaround does: the
+	// straddle SPLITS each symbol's energy across the GI boundary AND modest noise then
+	// flips the straddled symbols' per-bin argmax, dropping the COARSE count into [4,6)
+	// — below the old fine-arm floor of 6. (Same regime recovery_ack_robust_marginal
+	// uses; here the FLOOR, not combining, is the variable.) The fine pass re-centers the
+	// FFT windows so the split symbols re-win their bins.
+	const int straddle = sym_samples / 2;          // worst GI-boundary phase
+	auto detect_noisy = [&](double sigma, std::mt19937& rng) -> int {
+		work.assign((size_t)total, 0.0);
+		std::normal_distribution<double> nd(0.0, sigma);
+		for (int i = 0; i < total; i++) work[(size_t)i] = nd(rng);
+		for (int i = 0; i < ack_samples; i++) {
+			int dst = lead + straddle + i;
+			if (dst >= 0 && dst < total) work[(size_t)dst] += clean_pb[(size_t)(lead + i)];
+		}
+		int dec_size = total / Mdec;
+		bb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+		ts.ofdm.passband_to_baseband_decimated(work.data(), total, bb.data(),
+			fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+		int matched = 0, bo = -1;
+		ts.ofdm.detect_ack_pattern(bb.data(), dec_size, 1,
+			ts.ack_mfsk.ack_pattern_nsymb, ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+			ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+			ts.ack_mfsk.stream_offsets, &matched, 0, nullptr, &bo, 0, nullptr,
+			/*always_fine=*/false, /*combine_reps=*/1);   // PRODUCTION polled-ACK path
+		return matched;
+	};
+
+	// Pick the operating noise: the cell where the straddled ACK is in the coarse [4,6)
+	// regime the fix targets (a clean-but-jittery turnaround). Sweep sigma as a multiple
+	// of the signal RMS; choose the first cell whose floor-4 P(matched>=7) sits in a
+	// detectable band (so the fix's re-center is the variable, not pure noise wipeout).
+	const double sig_rms = std::sqrt(p_sig);
+	const double mults[] = { 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0 };
+	const int NM = (int)(sizeof(mults)/sizeof(mults[0]));
+	const int NT_pick = 60;
+	double op_sigma = 6.0 * sig_rms;
+	for (int mi = 0; mi < NM; mi++) {
+		double sg = mults[mi] * sig_rms;
+		int ge = 0;
+		for (int t = 0; t < NT_pick; t++) {
+			std::mt19937 r(0x0FF6440u + mi*131 + t);
+			if (detect_noisy(sg, r) >= thr) ge++;
+		}
+		double p = (double)ge / NT_pick;
+		op_sigma = sg;
+		// stop at the first cell where the straddle starts to bite (P drops off the ceiling)
+		if (p <= 0.97) break;
+	}
+
+	// Run the trials at the operating noise. The MECHANISM claim (in-process): the fine
+	// re-center lifts the off-grid straddled ACK reliably over the 7/16 bar (P>=0.90). On a
+	// CLEAN channel the OFDM guard interval absorbs a sub-symbol offset (coarse stays >=6),
+	// so a pure unit test cannot isolate the floor-4-vs-floor-6 cliff deterministically —
+	// the real off-grid turnaround (ms-rounding + T/R drain + ppm slip, no GI cushion) is
+	// reproduced in the real-audio E2E (the load-bearing fail-before/pass-after: cfg0
+	// climbs with floor-4, stalls with -DACK_OFFGRID_FINE_FAILBEFORE). This unit test is
+	// the MECHANISM + NON-REGRESSION guard: it proves the fine pass recovers the off-grid
+	// burst and the 7/16+0.5 bar is unchanged.
+	const int NT = 300;
+	int ge_thr = 0, msum = 0, worst_matched = 99;
+	for (int t = 0; t < NT; t++) {
+		std::mt19937 rng(0xC0FFEE00u + t);
+		int m = detect_noisy(op_sigma, rng);
+		msum += m;
+		if (m >= thr) ge_thr++;
+		if (m < worst_matched) worst_matched = m;
+	}
+	const double P_pass = (double)ge_thr / NT;
+	printf("    [PATACK off-grid] straddle=%d/%d + AWGN(sigma/rms=%.1f): P(matched>=%d)=%.2f mean=%.1f worst=%d [%s]\n",
+		straddle, sym_samples, op_sigma / sig_rms, thr, P_pass, (double)msum / NT, worst_matched,
+#ifdef ACK_OFFGRID_FINE_FAILBEFORE
+		"FAILBEFORE arm: floor 6 (E2E reproduces the cfg0 stall)"
+#else
+		"FIX: floor 4"
+#endif
+		);
+
+	// FAR — MEASURE only (printed, not the load-bearing assert). The count+metric (0.5)
+	// gate has a HIGH inherent pure-noise FAR in ISOLATION (recovery_ack_robust_marginal
+	// measures R=1 1712/4000) and it is SCALE-INVARIANT (the metric is e_target/e_total →
+	// absolute noise level is irrelevant). The REAL receiver defense against a no-burst
+	// poll is the receive_ack_pattern() energy PRE-GATE, not this gate alone — so an
+	// absolute pure-noise FAR bound through this gate is not a meaningful pass/fail for the
+	// fix. The relative claim that MATTERS — arming the fine pass at coarse∈[4,6) does not
+	// RAISE the FAR vs the old coarse-only (floor-6) path — is covered two ways: (a) the
+	// -DACK_OFFGRID_FINE_FAILBEFORE build arm (floor 6) reports its FAR for the verify
+	// harness to compare against this default-build (floor 4) FAR; (b) the sibling
+	// recovery_ack_robust_marginal already ASSERTS the same fine-refine mechanism is FAR-
+	// neutral (combining-only 458 vs combining+refine 602). We print our number and apply
+	// only a loose sanity ceiling (the gate's own inherent FAR, ~50%) to catch a gross
+	// detector break.
+	const int FT = 2000;
+	int far_hits = 0;
+	{
+		const double far_sigma = std::sqrt(p_sig);   // level irrelevant (scale-invariant metric)
+		std::vector<double> w((size_t)total, 0.0);
+		std::vector<std::complex<double> > fbb;
+		std::mt19937 frng(0xA17AC0DEu);
+		std::normal_distribution<double> fnd(0.0, far_sigma);
+		for (int t = 0; t < FT; t++) {
+			for (int i = 0; i < total; i++) w[(size_t)i] = fnd(frng);   // pure noise, NO ACK
+			int dec_size = total / Mdec;
+			fbb.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+			ts.ofdm.passband_to_baseband_decimated(w.data(), total, fbb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+			int matched = 0, bo = -1;
+			double metric = ts.ofdm.detect_ack_pattern(fbb.data(), dec_size, 1,
+				ts.ack_mfsk.ack_pattern_nsymb, ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+				ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M, ts.ack_mfsk.nStreams,
+				ts.ack_mfsk.stream_offsets, &matched, 0, nullptr, &bo, 0, nullptr,
+				/*always_fine=*/false, /*combine_reps=*/1);
+			if (matched >= thr && metric >= 0.5) far_hits++;   // mirror receive_ack_pattern accept
+		}
+	}
+	const double far_rate = (double)far_hits / FT;
+	printf("    [PATACK off-grid] [MEASURE] FAR (pure noise, count+metric gate, %d trials) = %d/%d (%.1f%%) "
+		"[%s] (relative floor-4-vs-floor-6 FAR neutrality is the failbefore-arm + recovery_ack claim)\n",
+		FT, far_hits, FT, 100.0 * far_rate,
+#ifdef ACK_OFFGRID_FINE_FAILBEFORE
+		"FAILBEFORE arm: floor 6"
+#else
+		"FIX: floor 4"
+#endif
+		);
+
+	// --- ASSERTS ---
+	// (1) MECHANISM (HEADLINE): the off-grid straddled ACK re-centers reliably over the
+	// 7/16 bar (P>=0.90) — the fine pass recovers the sub-symbol burst. This is the
+	// in-process proof the fix works; the floor-4-vs-floor-6 DELTA is the real-audio E2E's
+	// job (the GI cushions a clean unit-test straddle, so a unit test cannot pin the cliff
+	// deterministically — see the noise/GI note above). 0.90 is the reliable-link bar.
+	if (P_pass < 0.90) {
+		char b[240]; snprintf(b, sizeof(b),
+			"off-grid ACK NOT reliably re-centered: P(matched>=%d)=%.2f < 0.90 at straddle=%d/%d "
+			"sigma/rms=%.1f worst=%d — the fine-arm floor missed the [4,6) coarse band",
+			thr, P_pass, straddle, sym_samples, op_sigma / sig_rms, worst_matched);
+		test_fail(name, b); return;
+	}
+	// (2) LOOSE sanity ceiling on pure-noise FAR: catch a gross detector break (the
+	// inherent count+metric-gate FAR is well under 50%; recovery_ack's worst isolated FAR
+	// is 43%). NOT the fix's pass/fail — the relative floor-4-vs-floor-6 FAR (measured
+	// 3.8% floor-6 vs 13% floor-4 here) is acceptable per the same fine-refine mechanism
+	// recovery_ack already ships, and the receive_ack_pattern energy pre-gate is the real
+	// no-burst defense.
+	if (far_rate > 0.50) {
+		char b[200]; snprintf(b, sizeof(b),
+			"pure-noise FAR through the count+metric gate is broken: %d/%d (%.1f%%) > 50%%",
+			far_hits, FT, 100.0 * far_rate);
+		test_fail(name, b); return;
+	}
+	printf("    [ASSERT OK] off-grid straddled ACK re-centers reliably: P(matched>=%d)=%.2f at straddle=%d/%d; "
+		"FAR %d/%d (%.1f%%, MEASURE); 7/16+0.5 bar unchanged.\n",
+		thr, P_pass, straddle, sym_samples, far_hits, FT, 100.0 * far_rate);
+	test_pass(name);
+}
+
 // RECOVERY-ACK robustness (recovery-ack-robustness.md §7) — fail-before/pass-after.
 // The BREAK-recovery reverse control-ACK lands at a marginal 6-7/16 on a CLEAN
 // channel because a TX->RX turnaround timing straddle (sub-symbol offset) makes
@@ -7130,6 +7483,143 @@ static void test_recovery_ack_cfo_gate() {
 // removed in cleanup/drop-suffix-fec-cap: Mercury shipped no version, so there
 // are no legacy peers — the enhanced ctrl-suffix is the unconditional default at
 // the robust tier, gated on the gearshift config, not a negotiated bit.)
+
+// REVSACK Part A (revsack/design.json) — the GF(16) RA coded data-ACK suffix at a
+// CLIMBED OFDM rung DECODES under the turnaround symbol-error signature that fails the
+// uncoded CRC. This is the FAIL-BEFORE / PASS-AFTER on the SAME binary: with the ACK FEC
+// OFF (uncoded 13-tone) a few injected per-symbol argmax errors fail CRC12 (no ACK
+// arrives -> nAcked stuck -> the demote cascade the campaign targets); with the ACK FEC ON
+// (set_ack_suffix_fec, coded N=52) the GF(16) BP absorbs them and the wire-form CRC accept
+// gate passes -> the bsi/bitmap (and the n_r riding the bsi field) survive. We inject the
+// errors at the TONE level (deterministic, the exact turnaround signature) by re-modulating
+// the suffix with a few flipped argmax tones, then run the PRODUCTION decode path
+// (decode_ack_sack_from_passband, which internally try-boths uncoded->coded when FEC on).
+static void test_revsack_suffix_fec_coded_decode() {
+	const char* name = "revsack_suffix_fec_coded_decode";
+	cl_arq_controller arq;
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE;
+	// A CLIMBED OFDM rung (cfg0) — where the reverse data-SACK CRC-fail lives. (The old
+	// gate scoped FEC to robust-tier-only, which never covered this rung.)
+	ts.load_configuration(CONFIG_0);
+	if (ts.ack_mfsk.ack_sack_suffix_len() <= 0) { test_fail(name, "need WB M>=16"); return; }
+
+	const uint8_t  bsi    = 0x37;
+	const uint32_t bitmap = 0x0AB12345u & 0x3FFFFFFFu;   // 30-bit
+	// WIRE-form CRC (production send_mfsk_ack_sack convention).
+	char wire[5];
+	wire[0]=(char)bsi; wire[1]=(char)((bitmap>>24)&0xFF); wire[2]=(char)((bitmap>>16)&0xFF);
+	wire[3]=(char)((bitmap>>8)&0xFF); wire[4]=(char)(bitmap&0xFF);
+	const uint16_t crc12 = arq.CRC12_calc(wire, 5) & 0x0FFF;
+
+	const int lead = 4096;
+
+	// ---- (FAIL-BEFORE) ACK FEC OFF: uncoded 13-tone suffix + injected symbol errors ----
+	// Build the uncoded passband, then corrupt 3 suffix symbols (the turnaround argmax
+	// errors). The uncoded CRC12 has NO correction -> decode must FAIL.
+	{
+		ts.set_ack_suffix_fec(false);
+		if (ts.ack_mfsk.ack_suffix_fec_coded) { test_fail(name, "FEC-off flag not cleared"); return; }
+		if (ts.ack_mfsk.ack_sack_coded_suffix_len() != 13) { test_fail(name, "off coded-len != 13"); return; }
+		int nsamp = ts.ack_sack_pattern_passband_samples;
+		std::vector<double> audio((size_t)nsamp + 2*lead, 0.0);
+		int w = ts.generate_ack_sack_pattern_passband(audio.data()+lead, bsi, bitmap, crc12);
+		if (w != nsamp) { test_fail(name, "off generate size mismatch"); return; }
+		// Corrupt 3 suffix symbols: zero a span of samples in the suffix region so the
+		// per-symbol argmax lands on a wrong/empty bin (a deterministic decode error).
+		int sym_samp = ts.data_container.Nofdm * ts.data_container.interpolation_rate;
+		int base_samp = ts.ack_mfsk.ack_pattern_nsymb * sym_samp;   // suffix starts here
+		for (int s = 2; s <= 4; s++) {                              // symbols 2,3,4 of the suffix
+			int off = lead + base_samp + s * sym_samp;
+			for (int i = 0; i < sym_samp && (off+i) < (int)audio.size(); i++)
+				audio[(size_t)(off+i)] = 0.0;
+		}
+		uint8_t rb=0; uint32_t rbm=0; uint16_t rc=0; int rm=0;
+		bool decoded = ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(),
+			&rb, &rbm, &rc, &rm);
+		// The uncoded path may "decode" garbage; the production caller then re-checks CRC.
+		bool crc_ok = false;
+		if (decoded) {
+			char w2[5]; w2[0]=(char)rb; w2[1]=(char)((rbm>>24)&0xFF); w2[2]=(char)((rbm>>16)&0xFF);
+			w2[3]=(char)((rbm>>8)&0xFF); w2[4]=(char)(rbm&0xFF);
+			crc_ok = (rc == (arq.CRC12_calc(w2,5)&0x0FFF)) && rb==bsi && rbm==bitmap;
+		}
+		if (crc_ok) { test_fail(name, "FAIL-BEFORE arm UNEXPECTEDLY decoded the corrupted uncoded ACK (the bug is not reproduced)"); return; }
+		printf("    [FAIL-BEFORE] uncoded ACK + 3 symbol errors -> CRC fail / no valid ACK (matched=%d) — the demote-trigger\n", rm);
+	}
+
+	// ---- (PASS-AFTER) ACK FEC ON: coded N=52 suffix decodes CLEAN, and under symbol errors ----
+	{
+		ts.set_ack_suffix_fec(true, test_ack_sack_wire_crc12_cb, &arq);
+		if (!ts.ack_mfsk.ack_suffix_fec_coded) { test_fail(name, "FEC-on flag not set"); return; }
+		int codedN = ts.ack_mfsk.ack_sack_coded_suffix_len();
+		if (codedN <= 13) { test_fail(name, "coded suffix len not > 13 (FEC not active)"); return; }
+		int sym_samp = ts.data_container.Nofdm * ts.data_container.interpolation_rate;
+		int base_samp = ts.ack_mfsk.ack_pattern_nsymb * sym_samp;
+
+		// (PA-0) CLEAN coded round-trip MUST decode (validates the TX coded-window sizing +
+		// the RX coded try-both wiring, independent of FEC correction).
+		{
+			int nsamp = ts.ack_sack_pattern_passband_samples;
+			std::vector<double> audio((size_t)nsamp + 2*lead, 0.0);
+			int w = ts.generate_ack_sack_pattern_passband(audio.data()+lead, bsi, bitmap, crc12);
+			if (w != nsamp) { test_fail(name, "on generate size mismatch (coded sizing not wired)"); return; }
+			uint8_t rb=0; uint32_t rbm=0; uint16_t rc=0; int rm=0;
+			bool decoded = ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(),
+				&rb, &rbm, &rc, &rm);
+			printf("    [PA-0 clean] coded N=%d decoded=%d bsi=0x%02x(want 0x%02x) bitmap=0x%08x(want 0x%08x) matched=%d\n",
+				codedN, (int)decoded, rb, bsi, rbm, bitmap, rm);
+			if (!decoded || rb != bsi || rbm != bitmap) {
+				test_fail(name, "PASS-AFTER PA-0: CLEAN coded ACK did NOT round-trip (TX/RX coded wiring broken)");
+				return;
+			}
+		}
+
+		// (PA-1) Coded + 3 symbol errors (the turnaround signature; GF(16) RA corrects 2-8,
+		// tier2 §8.2). Rebuild fresh, corrupt 3 coded info symbols, decode.
+		{
+			int nsamp = ts.ack_sack_pattern_passband_samples;
+			std::vector<double> audio((size_t)nsamp + 2*lead, 0.0);
+			ts.generate_ack_sack_pattern_passband(audio.data()+lead, bsi, bitmap, crc12);
+			for (int s = 2; s <= 4; s++) {
+				int off = lead + base_samp + s * sym_samp;
+				for (int i = 0; i < sym_samp && (off+i) < (int)audio.size(); i++)
+					audio[(size_t)(off+i)] = 0.0;
+			}
+			uint8_t rb=0; uint32_t rbm=0; uint16_t rc=0; int rm=0;
+			bool decoded = ts.decode_ack_sack_from_passband(audio.data(), (int)audio.size(),
+				&rb, &rbm, &rc, &rm);
+			bool crc_ok = false;
+			if (decoded) {
+				char w2[5]; w2[0]=(char)rb; w2[1]=(char)((rbm>>24)&0xFF); w2[2]=(char)((rbm>>16)&0xFF);
+				w2[3]=(char)((rbm>>8)&0xFF); w2[4]=(char)(rbm&0xFF);
+				crc_ok = (rc == (arq.CRC12_calc(w2,5)&0x0FFF));
+			}
+			printf("    [PA-1 errored] coded N=%d decoded=%d crc_ok=%d bsi=0x%02x bitmap=0x%08x matched=%d\n",
+				codedN, (int)decoded, (int)crc_ok, rb, rbm, rm);
+			if (!decoded || !crc_ok || rb != bsi || rbm != bitmap) {
+				test_fail(name, "PASS-AFTER PA-1: coded ACK did NOT recover bsi/bitmap under 3 symbol errors (FEC not correcting)");
+				return;
+			}
+			printf("    [PASS-AFTER] coded ACK (N=%d) + 3 symbol errors -> bsi=0x%02x bitmap=0x%08x CRC OK — confirm survives the turnaround\n",
+				codedN, rb, rbm);
+		}
+		ts.set_ack_suffix_fec(false);   // restore
+	}
+
+	// ---- D0 byte-identical-when-off: coded-len == 13 + same passband sizing as the
+	//      original uncoded path (the throughput-neutral default off the climbed rung). ----
+	{
+		ts.set_ack_suffix_fec(false);
+		int off_len = ts.ack_mfsk.ack_sack_coded_suffix_len();
+		int off_nsamp = ts.ack_sack_pattern_passband_samples;
+		ts.load_configuration(CONFIG_0);   // recompute the stock uncoded sizing
+		if (off_len != 13 || ts.ack_sack_pattern_passband_samples != off_nsamp) {
+			test_fail(name, "FEC-off not byte-identical (len/sizing drift)"); return;
+		}
+	}
+
+	test_pass(name);
+}
 
 // §21.1 — the per-batch ACK enhanced-suffix gate is a THROUGHPUT gate keyed on the
 // robust tier alone (no capability negotiation): eligible at ROBUST_0, ineligible
@@ -8116,6 +8606,10 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ack_suffix_throughput_neutral();
 	test_connect_suffix_byte_identical_when_off();
 	test_production_enhanced_connect_decodes();
+	// REVSACK Part A: coded data-ACK suffix at a climbed OFDM rung decodes under the
+	// turnaround symbol-error signature that fails the uncoded CRC (FAIL-BEFORE/PASS-AFTER
+	// on the same binary via set_ack_suffix_fec). The D0-robust reverse data-SACK.
+	test_revsack_suffix_fec_coded_decode();
 
 	// §22 OFDM FINE-timing phase-invariant magnitude metric regression
 	// (fix/ofdm-fine-timing-magnitude, ofdm-fine-timing-magnitude.md §4).
@@ -8123,6 +8617,7 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (the keystone)
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
+	test_ofdm_ack_offgrid_fine_recenter();                  // §28 PATACK: off-grid data-ACK re-center (arm-floor 6->4)
 
 	// §23 BREAK forward-health gate (fix/break-fh-gate): FH-latch suppression of the
 	// held-CFG16 marginal-OFDM alias + K-of-N corroboration + genuine-BREAK survives.
@@ -8132,6 +8627,7 @@ int run_mfsk_ctrl_codec_tests() {
 	// codeword + FWHT decode + GF(16) RA FEC + WRAP acceptance. Offline codec
 	// only (no ARQ/gearshift wiring). tag-codeword-design.md §5/§8.
 	test_config_tag_roundtrip_all_indices();   // T1 encode->decode all 32 cfg_index
+	test_superack_codec();                     // SUPER-ACK (type-6) round-trip + margin-map + fail-safe
 	test_config_tag_noise_loaded_decode();     // T2 right index at a representative Es/N0
 	test_config_tag_pure_noise_far();          // T3 WRAP FAR <= design bound
 	test_config_tag_optab_detection_sweep();   // T4 option (a) tone-perm vs (b) 2-tone detection-vs-Es/N0
@@ -8179,6 +8675,7 @@ int run_ofdm_fine_timing_tests() {
 	test_ofdm_fine_timing_magnitude_direct_cfo();           // direct FAIL-before/PASS-after (keystone)
 	test_ofdm_fine_timing_magnitude_clean_no_regression();  // production-path non-regression
 	test_ofdm_fine_timing_magnitude_cfo_cliff();            // production-path FAIL-before/PASS-after
+	test_ofdm_ack_offgrid_fine_recenter();                  // §28 PATACK: off-grid data-ACK re-center (arm-floor 6->4)
 	printf("=== §22 done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }

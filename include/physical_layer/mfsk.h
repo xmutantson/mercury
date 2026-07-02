@@ -201,6 +201,29 @@ public:
 	// Total symbols when SNR suffix is active
 	int ack_snr_pattern_nsymb() const { return ack_pattern_nsymb + SNR_SUFFIX_LEN; }
 
+	// SUPER-ACK inline suffix (data-flow-superack.md §9). A SHORT tone group
+	// appended AFTER the ACK+SACK suffix on a from-ROBUST clean data ACK, mirroring
+	// the turbo SNR suffix: it rides INLINE on the SAME ACK burst (one PTT) that the
+	// CMD already detects+decodes, so the recommended WB skip-target lands on the
+	// SAME turnaround (ROOT 2 — the old separate ~1.58 s config-tag burst aired
+	// AFTER the CMD had turned around, so it was never captured). Carries the 5-bit
+	// config-LADDER index of the skip-target, encoded with copy-redundancy + a 4-bit
+	// checksum so any mis-read is REJECTED (D0 fail-safe: garbage -> no leap -> the
+	// ordinary +1). Bound to the clean-ACK bsi by the CMD (no bsi on the wire). 8
+	// tones (= SNR_SUFFIX_LEN) keeps the reverse ACK SHORT (~0.4 s add, ROBUST-only,
+	// transient).
+	static const int SUPERACK_SUFFIX_LEN = 8;
+	// Encode a config-ladder index (0..31) into SUPERACK_SUFFIX_LEN payload tones
+	// (0..M-1): lo-nibble x3 (maj), hi-bit x2, 4-bit checksum x3 (maj).
+	void superack_encode_tones(int ladder_idx, int* out_tones) const;
+	// Decode SUPERACK_SUFFIX_LEN de-hopped payload tones -> ladder index (>=0) or
+	// -1 (no valid SUPER-ACK: undecoded symbol, disagreement, range, or checksum).
+	int  superack_decode_tones(const int* in_tones) const;
+	// On-wire ACK+SACK pattern length WITH the SUPER-ACK suffix appended.
+	int  ack_sack_superack_pattern_nsymb() const {
+		return ack_sack_pattern_nsymb() + SUPERACK_SUFFIX_LEN;
+	}
+
 	// MFSK control suffix: 13-symbol suffix at M=16 carrying
 	//   [type:2 | payload:38 | crc12:12] = 52 bits.
 	// Phase B Wave 1 (fact-doc §11) added the 2-bit type field — flag-day
@@ -212,7 +235,37 @@ public:
 	// → 13 symbols for 52 bits. Total ACK pattern wall-clock: 16 base +
 	// 13 suffix = 29 symbols ≈ 705 ms (WB).
 	int ack_sack_suffix_len() const { return (M >= 16) ? 13 : 0; }  // 0 = unsupported
-	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
+	// REVSACK Part A (revsack/design.json): the data-ACK+SACK suffix CODED length.
+	// MIRROR of ctrl_suffix_len() for the CONNECT path — when ack_suffix_fec_coded
+	// is set (the climbed-OFDM-rung ACK FEC enable, §A) the suffix is the GF(16) RA
+	// codeword (gf16ra::codeword_len() = N) instead of the uncoded 13-symbol pack,
+	// so pack_ack_sack_payload(...) emits N tones and the wire/RX sizing must match.
+	// ack_suffix_fec_coded=false (the default / legacy / non-eligible rung) returns
+	// the uncoded 13 → byte-identical-when-off. NB (M<16) returns 0 either way. The
+	// gf16ra global owns the active N (configured at the ACK FEC enable hook); this
+	// accessor never configures (same contract as ctrl_suffix_len()).
+	// REVSACK Part A: the ACK coded codeword length CAPTURED at the FEC enable hook
+	// (set_ack_suffix_fec), NOT read live from gf16ra::codeword_len(). gf16ra is a
+	// PROCESS-GLOBAL whose repfact a CONFIG_TAG(2)/CONNECT(3) consumer freely save/restores
+	// — reading codeword_len() live here would return the WRONG N (e.g. 39) whenever the
+	// global is momentarily at another repfact, breaking the ACK wire/RX sizing AND
+	// corrupting the CONFIG_TAG length the moment THIS enable leaves the global at 3. By
+	// capturing N once (at the enable, repfact 3 = 52) we (a) keep the ACK length stable
+	// regardless of the live global, and (b) let set_ack_suffix_fec RESTORE the global so
+	// no other consumer is polluted. 0 when ACK FEC off. (The TX/RX still pin the global to
+	// 3 around the actual encode/BP via their own save/restore.)
+	int ack_suffix_fec_N;   // default 0 (set in init()); captured = gf16ra::codeword_len() at enable
+	int ack_sack_coded_suffix_len() const {
+		if (ack_sack_suffix_len() <= 0) return 0;            // NB: unsupported
+		return (ack_suffix_fec_coded && ack_suffix_fec_N > 0)
+		       ? ack_suffix_fec_N : ack_sack_suffix_len();
+	}
+	// REVSACK Part A: the on-wire ACK+SACK pattern length is base + the CODED suffix
+	// (coded N when FEC on, 13 when off). Was ack_pattern_nsymb + ack_sack_suffix_len()
+	// (always 13) — that NEVER accounted for the coded codeword, which is why
+	// ARQ_ACK_SUFFIX_FEC_ENABLE was held off "pending the ACK coded-window sizing work"
+	// (tier2-suffix-fec-design.md §21.3/§21.4 C7). FEC-off path is byte-identical.
+	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_coded_suffix_len(); }
 
 	// Tier-2 suffix FEC (tier2-suffix-fec-design.md §19, INCREMENT 1). When
 	// suffix_fec_coded is set (by the telecom layer after gf16ra::configure(3)+
@@ -267,9 +320,15 @@ public:
 	// big-endian MSB-justified). For compatibility with the existing
 	// Wave-1 ARQ callers (which compute CRC12 over [bsi||bitmap] = 5 bytes),
 	// see mercury/fact-documents/phase-b-mfsk-connect-research.md §11.3.
+	// superack_tones (optional): when non-null, SUPERACK_SUFFIX_LEN extra tones are
+	// laid down AFTER the SACK suffix (same tone-hop continuation, abs_s =
+	// ack_pattern_nsymb + ack_sack_coded_suffix_len() + j), carrying the SUPER-ACK
+	// inline skip-target. Caller must have sized the pattern buffer for
+	// ack_sack_superack_pattern_nsymb() symbols. nullptr -> byte-identical legacy.
 	void generate_ack_sack_pattern(std::complex<double>* pattern_out,
 	                               uint8_t bsi, uint32_t bitmap,
-	                               uint16_t crc12);
+	                               uint16_t crc12,
+	                               const int* superack_tones = nullptr);
 	// Option B compact confirm: ACK base (ack_pattern_nsymb) + the K=5 GF(16)-RA
 	// compact codeword (gf16ra::compact_codeword_len() = 10 sym) carrying
 	// [bsi:8|crc12:12]. Same tone-hop continuation as generate_ack_sack_pattern
@@ -375,6 +434,15 @@ public:
 	static const int MAX_ACK_SACK_SUFFIX = 64;
 	int  last_ack_sack_suffix_tones[MAX_ACK_SACK_SUFFIX];
 	bool last_ack_sack_capture_valid;
+
+	// SUPER-ACK inline-suffix capture (data-flow-superack.md §9). The detector
+	// snapshots the SUPERACK_SUFFIX_LEN de-hopped tones that follow the SACK suffix
+	// here; last_superack_capture_valid is true ONLY when all were cleanly decoded
+	// (0..M-1). The CMD's CLEAN handler reads these via superack_decode_tones and
+	// then clears the flag (one-shot). Separate from last_ack_sack_* so the SACK
+	// unpack is untouched.
+	int  last_superack_suffix_tones[SUPERACK_SUFFIX_LEN];
+	bool last_superack_capture_valid;
 
 	// CONNECT-suffix capture (separate from ACK+SACK so the two detector
 	// windows can coexist without aliasing).

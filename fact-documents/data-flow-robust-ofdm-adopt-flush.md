@@ -978,3 +978,531 @@ and asserts the ring `buffer_Nsymb` stays at the natural OFDM size (<= natural+s
 CONFIG_0 preamble still lands within `upper_bound` (the consumer the oversize broke). FAIL-BEFORE arm:
 `MERCURY_CONFIG0_RING_GUARD_DEFEAT=1` restores the pre-fix unconditional grow on the SAME binary, so the ring
 balloons 217->804 and the preamble lands beyond upper_bound (reproduces the 0-forward-decode geometry).
+
+
+## §22 — ROOT CAUSE of the WB-cfg0 under-decode under MERCURY_INBAND_RATE: fresh in-band decoder instances never inherit the primary's startup-patched ofdm_gi
+
+### §22.0 The symptom and why §15/§17 did not fix it
+With `MERCURY_INBAND_RATE=1` (the trio) a real-audio session at WGN:40 stays stuck at the ROBUST floor:
+configs ever seen = {100,101,102}, ~189-253 B delivered, `block_success` 0% at WB CONFIG_0; legacy (flags OFF,
+eac0c876) on the SAME audio climbs past cfg0 (configs {0,13,14,...}, ~28 KB). The §15 NOFDM-preserve
+(`force_set_capture_ring_natural`) and §17 descrambler-regen fixes are CORRECT and engage on the **primary**
+telecom_system (instrumented: `[GIDIAG-PRIMARY] default_gi=0.14062 preserved_Nofdm=292`), but they target a
+STALE-LIVE-gi disagreement inside the primary's ring-shrink. They never touch a **second instance class** — the
+freshly-constructed in-band decoder objects — which is where the real corruption lives.
+
+### §22.1 ROOT CAUSE (verified)
+The primary's PHY geometry comes from `default_configurations_telecom_system`, which `main.cc` patches at
+startup: `ofdm_gi` <- `Ngi/256` (main.cc:4896; production 3.0 ms GI => Ngi=36 => gi=36/256=0.14062), plus
+`ofdm_Nfft` (3651), `ldpc_nIteration_max` (4825), FIR cutoffs (3547). `load_configuration` copies
+`ofdm.gi = default_configurations_telecom_system.ofdm_gi` (telecom_system.cc:11037) and `init()` derives
+`Nofdm = Nfft + round(gi*Nfft)` (telecom_system.cc:7206-7208). A fresh `new cl_telecom_system()` /
+stack `cl_telecom_system tmp` carries the **constructor default** `ofdm_gi = 54/256 = 0.21094`
+(physical_config.cc:37). So an un-inherited CONFIG_0 decoder builds at `Nofdm = 256 + 54 = 310`, not the
+production `256 + 36 = 292`. The 18-sample/symbol FFT-window stride error accrues across the frame => post-EQ
+variance 4..65 (SKIP-VAR threshold 1.60, telecom_system.cc) => LDPC skipped (`iter=-1`) => 0% block_success at
+WB CONFIG_0 => the robust->OFDM cross never sustains => no climb past the ROBUST floor.
+
+Instrumented A/B proof: `[GIDIAG] init() default_gi=0.21094 -> Nofdm=310 (cfg=0)` (fresh in-band instance)
+vs the clean primary `Nofdm=292`. Legacy never spawns these in-band decoders, so its decode always runs on the
+gi-patched primary => 292 => var=0.0357, iter=0, climbs.
+
+### §22.2 The six (eight call-site) fresh-instance sites — all the same bug class
+1. `inband_ensure_down_decoders` — the LOAD-BEARING decode bank: `new cl_telecom_system()` (arq_common.cc:4579)
+   + the bank-size probe `cl_telecom_system tmp` (arq_common.cc:4552).
+2. `inband_down_window_buffer_nsymb` — window-size probe `tmp` (arq_common.cc:4154).
+3. `inband_robust_floor_buffer_nsymb` — robust-floor-size probe `tmp` (arq_common.cc:4189).
+4. `inband_natural_ofdm_buffer_nsymb` — natural-OFDM-size probe `tmp` (arq_common.cc:4210).
+5. `init_monitor_decoders` — passive-monitor bank: size probe `tmp` (1864) + per-cfg `new` (1876).
+6. `reinit_monitor_decoders` — NB/WB-switch rebuild: size probe `tmp` (1923) + per-cfg `new` (1935).
+The probes (2-4, and the size probes in 1/5/6) read `buffer_Nsymb`, which itself depends on Nofdm — so a wrong
+gi mis-sizes the bank buffer too. The decode sites (1 `new`, 5/6 `new`) demod at the wrong stride. Monitor
+decoders are a passive-monitor-only role (a separate code path), but they share the identical root and are
+fixed for completeness.
+
+### §22.3 THE FIX — single chokepoint
+`cl_arq_controller::inband_inherit_phy_defaults(cl_telecom_system* fresh)` (arq_common.cc:4503) copies the
+PRIMARY's whole `default_configurations_telecom_system` struct into the fresh instance BEFORE its
+`load_configuration`. Copying the whole struct (trivially copyable aside from one std::string) captures every
+startup patch (gi, Nfft, FIR, ldpc iters, carrier_freq) in one place so no future fresh-instance site can
+silently drift to the ctor default. Called at all eight sites above. No-op when `telecom_system==NULL` (the
+standalone --test path that builds its own primary already pre-sets gi). The next `load_configuration`
+re-derives the per-config modulation/rate from the inherited defaults.
+FAIL-BEFORE knob: `MERCURY_INBAND_GI_INHERIT_DEFEAT=1` makes the helper a no-op on the same binary (restores
+the ctor gi => Nofdm=310). Production never sets it.
+
+### §22.4 §5 CROSS-LAYER AUDIT — `default_configurations_telecom_system` on fresh decoder instances
+1. PRODUCERS (writes to a fresh instance's `default_configurations_telecom_system`):
+   - ctor `cl_configuration_telecom_system::cl_configuration_telecom_system()` (physical_config.cc:33-121) —
+     installs the raw defaults incl. `ofdm_gi=54/256`. This is the value the bug rode in on.
+   - `inband_inherit_phy_defaults` (arq_common.cc:4503) — THE NEW producer; overwrites with the primary's
+     patched struct. Runs once per fresh instance, immediately before load_configuration.
+   - (no other writer touches a fresh in-band instance's default struct before its load.)
+2. CONSUMERS (reads of `default_configurations_telecom_system` on these instances):
+   - `load_configuration(int)` (telecom_system.cc:11035-11068) copies the OFDM/pilot/FIR/preamble geometry
+     into the live `ofdm`/filter objects; `init()` then derives Nofdm/buffer_Nsymb from `ofdm.gi`,`ofdm.Nfft`.
+     This is the ONLY consumer on the in-band path; everything downstream reads the DERIVED live geometry.
+3. VALID STATES: ctor-default struct (gi=54/256) — the state BEFORE any producer on a fresh instance; or
+   primary-inherited struct (gi=36/256 in production) — after the fix's producer. The bug was the consumer
+   running on the ctor-default state.
+4. INVARIANT consumers assume: a decoder that must demod the SAME OTA frames the primary TX/RX produced uses
+   the SAME per-symbol geometry (Nofdm) as the primary. Violated by the ctor-default gi => 310 vs 292.
+5. WHAT THE FIX CHANGES: it makes every fresh in-band instance's default struct EQUAL the primary's before
+   load_configuration. Walk each consumer:
+   - load_configuration/init on the down-ladder decode bank (the load-bearing path): now builds CONFIG_0 at
+     292 => correct stride => LDPC runs => the WB cross sustains. FIXED.
+   - the size probes (window/floor/natural/bank): now compute buffer_Nsymb at the production geometry, so the
+     bank buffer the decoders share matches the real frames. Consistent with the decode sites. OK.
+   - monitor decoders (passive-monitor role): now build at the production geometry too; passive-monitor was
+     a separate role and not on the trio's failing path, but the change is strictly geometry-correcting. OK.
+   No consumer outside load_configuration/init reads the default struct on these instances, so no other
+   invariant is touched. The PRIMARY's struct is never modified (the helper writes only the fresh copy), so
+   the §15/§17 primary-path fixes are untouched and legacy (feature OFF) is byte-identical (the in-band
+   sites are reached only under MERCURY_INBAND_RATE / passive_monitor).
+
+### §22.5 LIVE-PATH test (fail-before / passes-after) — `--test-inband-down-decoder-gi-inherit`
+Builds a RESPONDER whose PRIMARY is patched to PROD_GI (36/256) exactly as main.cc does, then drives the
+PRODUCTION builder `inband_ensure_down_decoders(idx(CONFIG_0), idx(CONFIG_0))` and reads the CONFIG_0 rung's
+installed `data_container.Nofdm` and live `ofdm.gi` — WITHOUT pre-patching the decoder's gi (only the primary
+is patched). PASS-AFTER: the rung inherits => Nofdm=292, Ngi=36. FAIL-BEFORE
+(`MERCURY_INBAND_GI_INHERIT_DEFEAT=1`, same binary): ctor gi => Nofdm=310. This is the first test that exercises
+the un-inherited default; the existing 56 inband units all PRE-SET
+`ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI` on their throwaway instances (e.g.
+arq_responder.cc:8843/8999/9180), which MASKED the production bug. Verified: both arms PASS; full --test
+suite reports 68 passed, 0 failed, exit 0.
+
+---
+
+## §VAR-FIX — cfg0 SKIP-VAR storm at the in-band turnaround (investigation 2026-06-28)
+
+### Symptom (faithful real-audio, snd-aloop, WGN:40 seed2001, card0, native ELF)
+- **Legacy (inband-off):** rx_bytes=**8192 (delivered_full)**, configs_seen=[0,100,101,102], wb=[0],
+  **SKIP-VAR=8**, cfg0 coarse metric 0.998×72 / 0.556×2 → clean cross + full delivery.
+- **Redesign (inband-on, +demote-safety):** rx_bytes=**193**, configs_seen=[100,101,102], wb=[],
+  **SKIP-VAR=607** vs **OFDM-OK=56**, cfg0 coarse 0.500-plateau ×many interleaved with 0.998 reals.
+  Replicated across obsB(161B), dbg(129B), Rc0(193B); identical with the demote-safety DEFEATED (no diff).
+
+### Root: the storm is SPECIFIC to the in-band RX path, NOT inherent to cfg0
+The in-band RX runs the full-buffer forward-preamble search DURING the reverse-ACK turnaround gap (when the
+CMD is NOT airing a forward burst). The GI/data self-correlation of the idle/echo region peaks at the
+Schmidl-Cox half-correlation **metric≈0.500-0.504** (telecom_system.cc s5_coarse early-exit=0.5 lands
+exactly here; final accept threshold 0.15 WB admits it). The FFT/pilot window then anchors on a data region →
+`noise_variance_estimate`=63-81 (a few 6-7) → SKIP-VAR (ceiling 1.60). The protect-the-lock guard
+(arq_common.cc:4797) holds the shrunk-ring cfg0 pin and SKIPS every ROBUST down-ladder trial (129-147 skips),
+so the storm cannot escape and the real forward bursts (nv≈0.033, OFDM-OK) are starved/zeroed-advanced.
+Legacy avoids ALL of this via the lockstep SET_CONFIG handshake: its RX only searches inside forward-burst
+windows, so it sees 0.998 reals and ~zero plateau.
+
+### REFUTED: a coarse-metric structural floor (the obvious Fix A)
+Hypothesis: reject the 0.50 plateau with a WB-OFDM coarse floor (~0.55), since "real preamble≈0.99, plateau≈0.50".
+**Refuted by deterministic --test evidence** (test_ofdm_fine_timing_magnitude_cfo_cliff, FTR_DEBUG): valid WB
+CONFIG_0 preambles at SNR3k=8 dB with residual CFO=30 Hz produce coarse metric **0.426-0.609** WITH CORRECT
+TIMING (delay err ≤2) and survivable mean_H (0.307-0.335). A real CFO-degraded preamble is INDISTINGUISHABLE
+from a GI-plateau by coarse metric alone — a 0.55 floor dropped coarse_ok from 10/10 to 2/10 (a genuine
+weak-signal regression). The metric is NOT cleanly bimodal once CFO is present; the SKIP-VAR/mean_H gates
+downstream ALREADY (correctly) reject the plateau (nv 63-81) while admitting reals (nv 0.033). The problem is
+the storm's COST + the pin starving the real bursts, NOT a missing coarse gate. **Do NOT ship a coarse floor.**
+
+### The real next layer (NOT a localized variance fix)
+Gate the in-band RX forward-preamble search to forward-burst windows (the lockstep discipline legacy has) so it
+never searches the RSP's own turnaround gap. This crosses RX/turnaround/PHY layers (the in-band data-plane), is
+the known ROBUST→WB climb binding constraint (memory faithful_beat_vara_climb_binding), and needs the full §5
+cross-layer audit before coding — it is NOT the cfg0 "live-decode variance" the original diagnosis framed.
+
+### §VAR-FIX-DEMOTE — the shipped no-regress backstop (demote-safety watchdog)
+`inband_deliver_stall_watchdog()` (arq_common.cc): on each down-ladder decode-fail pass, evaluated ONCE per
+real batch period BEFORE the no-attempt guard. While holding a shrunk OFDM pin, if the DELIVERED batch id
+(rsp_last_delivered_batch_seq_id) does not advance across `limit` (default 3) consecutive batch periods, it
+RELEASES `inband_ofdm_acq_ring_shrunk` so the down-ladder can demote a config that cannot DELIVER.
+- **Producers of the pin:** inband_finalize_ofdm_adopt_ring (set); inband_seat_robust_ring_floor (clear on
+  leaving OFDM tier); BREAK→ROBUST_0; **this watchdog (clear on sustained no-delivery)**.
+- **Consumers:** the protect-the-lock guard (arq_common.cc:4797) + inband_seat_robust_ring_floor (:4487).
+- **Invariant preserved:** the down-ladder still requires a real CRC/LDPC pass to ADOPT (INV-S4-1) — releasing
+  the pin cannot adopt a guess; it only stops the guard SKIPPING robust trials.
+- **Why it does NOT fire on the WGN:40 storm:** the storm is a slow TRICKLE, not a hard stall — the delivered
+  id keeps advancing (2→3→4→5), so the watchdog correctly re-arms and never releases. It is the backstop for a
+  TRUE hard pin (zero delivery ≥3 periods), proven by test_inband_deliver_stall_releases_pin (FIX/DEFEAT/
+  PRODUCTIVE arms). Additive, inband-scoped, legacy byte-identical. Full --test 68/0.
+
+---
+
+## §VAR-FIX-2 — RX FORWARD-SEARCH GATE: suppress the in-band coarse search during the reverse-ACK turnaround gap (implemented 2026-06-28)
+
+§VAR-FIX VERIFIED the root (the in-band RX storms the forward-preamble coarse search during the RSP's own
+reverse-ACK turnaround gap) and REFUTED a coarse-metric floor. §VAR-FIX-2 is the implemented gate: the RX
+forward search is now suppressed for the turnaround gap and resumes at the forward-burst window — the
+lockstep discipline legacy has.
+
+### §VF2.1 The mechanism the storm rides (VERIFIED — code read)
+
+`frames_to_read` (ftr) IS the forward-burst-window gate. The capture thread (audioio.c:1455) decrements ftr
+by 1 per captured symbol_period; `cl_arq_controller::receive()` (arq_common.cc:12386) stages a FRESH snapshot
+and runs the coarse search ONLY when `ftr == 0` (when `ftr != 0` it early-exits at :13950 — no snapshot, no
+search, no SKIP-VAR). So a positive ftr SUPPRESSES the search for ftr symbols; ftr==0 OPENS the window.
+
+The bug is two coupled re-arms that make ftr==0 dwell across the multi-second turnaround:
+1. The post-ACK re-arm (`send_ack_pattern` arq_common.cc:9827, `send_mfsk_ack_sack` :10618) sets
+   `frames_to_read = rx_frame + 10` (~58 sym ≈ 0.35 s) — far SHORTER than the CMD turnaround gap (CMD
+   detect+process+PTT+re-air = seconds at the marginal cfg0 rung).
+2. After that short window expires (ftr→0), the OFDM FAIL anti-spin (the single write site at
+   arq_common.cc:13846-13847, `if(ftr>0) ftr=bigblock_block_ftr_or(ftr); frames_to_read = ftr;`) re-arms
+   ftr to the 8/2-symbol quick-retry on EVERY plateau fail → a fresh coarse search every ~8 sym (~49 ms)
+   → ~hundreds of plateau searches over the gap (the measured 607 SKIP-VAR / 56 OFDM-OK).
+
+Legacy NEVER hits this: its coordinated SET_CONFIG handshake re-acquires in LOCKSTEP, so the RX only searches
+inside forward-burst windows (the 8-sym anti-spin only fires there). The UNILATERAL in-band reverse-ACK has
+no such barrier — the RSP's own turnaround gap is mis-treated as a forward-burst window.
+
+### §VF2.2 The fix (inband-scoped, two coordinated parts in arq_common.cc)
+
+- **(A) Latch a turnaround-suppress deadline when the in-band reverse ACK/SACK is sent.** New members
+  `cl_timer inband_revack_turnaround_timer` + `int inband_revack_turnaround_budget_ms`. Set in
+  `send_ack_pattern`, `send_mfsk_ack_sack`, `send_mfsk_compact_confirm` AFTER the existing post-ACK flush/
+  ftr re-arm, GATED `inband_rate_feature_enabled()`. Budget = the CMD turnaround estimate (CMD decode +
+  process + PTT before its next forward preamble can land):
+  `RSP_DECODE_MARGIN_MS + ptt_on_delay_ms + ptt_off_delay_ms + message_transmission_time_ms`. This is a
+  CONSERVATIVE gap-before-burst (NOT the whole receiving_timeout, which includes the burst airtime).
+- **(B) Gate the OFDM FAIL anti-spin re-arm to the turnaround gap.** At the single ftr write site
+  (arq_common.cc:13846), when `inband_rate_feature_enabled()` AND the suppress deadline is still in effect
+  (`inband_revack_turnaround_timer.get_elapsed_time_ms() < budget`) AND this pass found NO real forward
+  frame (`received_message_stats.message_decoded != YES` — a plateau/no-preamble fail, NOT a decoded frame),
+  RAISE ftr to span the REMAINING gap in symbols (`remaining_ms * 48000 / 1000 / symbol_period`) instead of
+  8/2. CAP ftr at `buffer_Nsymb - frame_symb` so the real burst CANNOT scroll off the ring during the wait.
+  The search is thus suppressed once for the gap remainder and re-opens at the forward-burst window.
+
+Why this does NOT regress acquisition of the REAL burst (the load-bearing constraint):
+- A real forward burst that arrives mid-gap and DECODES never reaches the anti-spin (the OK path re-arms ftr
+  itself at :13037/:13129); the gate is on the FAIL path only.
+- A real preamble-first frame (`frame_data_missing`, the in-flight SACK-dispatch race) keeps its existing
+  8-sym quick retry — the gate keys on `message_decoded != YES` but the §VF2.4 test confirms a real burst
+  preamble inside the window still acquires (ftr is capped so the burst stays in-ring and the NEXT ftr==0
+  pass — at the gap close — snapshots the full preamble+frame).
+- It does NOT gate on coarse_metric (the REFUTED Fix A): a real CFO-degraded preamble (metric 0.43-0.61) is
+  unaffected. The signal is purely the TURNAROUND-GAP TIMING, paced by the same audio clock the burst uses.
+
+### §VF2.3 §5 CROSS-LAYER AUDIT — the shared state (RX search ↔ turnaround state ↔ lockstep window)
+
+1. **PRODUCERS of `frames_to_read`** (the gate): the capture thread decrement (audioio.c:1455); the post-ACK
+   re-arms (`send_ack_pattern`:9827, `send_mfsk_ack_sack`:10618, `send_mfsk_compact_confirm`); the OFDM OK
+   re-arm (receive():13037/per-frame); the OFDM FAIL anti-spin (:13847, THE site §VF2.2-B constrains); the
+   MFSK anti-spin (:13883/:13898); the HAIL/CONNECT scan overrides (arq_responder.cc:160/292); SET_CONFIG /
+   BREAK re-inits. **PRODUCERS of the suppress deadline**: the three reverse-ACK send sites (set); cleared
+   implicitly by elapsed-time (a one-shot window) — no explicit clear needed, the timer simply ages out.
+2. **CONSUMERS**: `receive()` (:12386 ftr==0 gate → snapshot+coarse search); the FAIL anti-spin (:13846
+   reads the deadline). The deadline has exactly ONE consumer (the anti-spin gate), so it cannot leak.
+3. **VALID STATES of the deadline**: UNSET (timer never started / ctor) → `get_elapsed_time_ms()` returns a
+   large value vs a 0 budget → the gate is INACTIVE (legacy/non-inband and the steady forward-burst state).
+   ACTIVE (within budget after a reverse-ACK) → the gate raises ftr on a no-frame fail. The budget is 0 when
+   `inband_rate_feature_enabled()` is false (never set) → INACTIVE → byte-identical.
+4. **INVARIANTS the consumers assume**:
+   - INV-1 (forward burst MUST still acquire): preserved — the cap `ftr ≤ buffer_Nsymb - frame_symb` keeps
+     the burst in the ring; the OK path bypasses the gate; the gate only lengthens a doomed plateau retry.
+   - INV-2 (down-ladder still recovers a GENUINE loss): preserved — the gate only DELAYS the next forward
+     search within ONE turnaround budget; a genuine sustained loss spans many budgets, each of which re-opens
+     the window and re-fails, so the dead-batch streak / TERMINAL BREAK (§7/§19) still reaches its floor.
+     The §VAR-FIX-DEMOTE watchdog is unaffected (it keys on delivered-id advance, not ftr).
+   - INV-3 (legacy byte-identical): the whole gate is `inband_rate_feature_enabled()`-scoped; off → the
+     deadline is never set, the anti-spin keeps its 8/2 re-arm verbatim. VERIFIED by diff scope.
+5. **WHAT THE FIX CHANGES**: on the in-band FAIL anti-spin path, within a turnaround budget, ftr is raised
+   (search suppressed) instead of 8/2. Walk each consumer: `receive()` snapshots LATER (at the gap close) —
+   correct (no forward burst was airing); the OK path / SACK-dispatch race path / BREAK / HAIL paths are
+   untouched (the gate keys on inband + active-deadline + no-frame-fail, none of which those paths satisfy).
+
+### §VF2.4 Regression test (fails-before / passes-after) — `--test-inband-revack-rxgate`
+
+`cl_arq_controller::test_inband_revack_rxgate()` (in master `--test`). Drives the PRODUCTION ftr-gate decision
+(`inband_revack_rxgate_ftr()`, the exact helper the anti-spin calls) with the production state:
+- ARM the suppress deadline (model a just-sent reverse ACK), then feed N back-to-back PLATEAU fails
+  (message_decoded=NO). PASS-AFTER: ftr is raised to span the gap (the search is suppressed → the storm count
+  drops to ~0 over the gap); FAIL-BEFORE (`MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1`, same binary): ftr stays
+  8 every fail → N searches (the storm signature).
+- ACQUIRE arm: with the deadline active, a pass with `message_decoded=YES` (a real burst) bypasses the gate
+  (ftr re-armed by the OK path), proving the gate never starves the real forward burst.
+- COLD arm: no deadline (legacy/inband-off) → ftr stays 8 (byte-identical).
+Asserts the SKIP-VAR/search count during the gap drops to ~0 (PASS) vs N (DEFEAT) while the real-burst arm
+still acquires. Master `--test` exit 0 (M=0).
+
+### §VF2.5 CMD-SIDE sibling — the DOMINANT storm (VERIFIED by the fleet A/B, the RSP gate alone was insufficient)
+
+The first faithful real-audio A/B (fleet .11, WGN:40 seed2001, FIX binary, redesign env) showed the RSP-side
+gate (§VF2.2) FIRED (armed 20×, suppressed) yet rx_bytes stayed 177 B and the storm persisted at **408
+[CMD] FTR-FAIL CONFIG_0** — and the DEFEAT arm (same binary) was identical (456 SKIP-VAR / 177 B). The storm
+log lines were ALL `[CMD]` (commander), not `[RSP]`. ROOT (VERIFIED by the log + code read): the storm is on
+the COMMANDER, not the responder. After a forward batch TX the CMD waits in RECEIVING_ACKS_DATA for the
+reverse ACK. The MFSK detector runs first each poll; when it does NOT fire (the whole turnaround gap before
+the MFSK SACK arrives), the CMD's v2 SACK dispatch (arq_commander.cc, `if(!mfsk_handled_this_poll)`) FORCES
+`frames_to_read = 0` and runs a fresh OFDM forward-preamble `receive()` EVERY poll — looking for an OFDM
+SACK_RSP that, at a WB rung (reverse ACK is MFSK), the RSP never sends. That OFDM search false-locks the
+~0.50 GI plateau → SKIP-VAR every poll. The RSP-side ftr gate is irrelevant here because this site
+re-forces `ftr=0` each poll, bypassing the anti-spin.
+
+FIX: arm the SAME turnaround suppress window on the CMD at its data-ACK wait entry
+(`calculate_receiving_timeout` COMMANDER `ack_pattern_time_ms>0` branch — every RECEIVING_ACKS_DATA
+transition routes through it, in lockstep t0 with `receiving_timer`), and SKIP the forced-ftr0 OFDM dispatch
+while `inband_cmd_suppress_ofdm_ack_dispatch()` is true (window active AND
+`reverse_ack_uses_robust_geometry(current_configuration)` — the reverse ACK is MFSK/robust-geometry, true
+for every non-robust OFDM config). The MFSK detector (which runs FIRST each poll) carries the wait; the OFDM
+dispatch resumes when the window ages out (a late OFDM SACK_RSP, if any, lands then), so a NB session (OFDM
+SACK_RSP, reverse_ack_uses_robust_geometry handles NB via the suffix early-return) and a genuine loss are
+preserved (window ages out → dispatch resumes → timeout → demote). Inband + window + reverse-MFSK gated; off
+→ the dispatch runs verbatim → legacy byte-identical. FAIL-BEFORE: the same
+`MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1` knob disables both the RSP and CMD gates.
+
+§5 audit delta (CMD turnaround state ↔ CMD OFDM SACK dispatch ↔ MFSK ACK detector): the suppressed dispatch
+is the CMD's forward OFDM search; its only legitimate consumer at a WB rung's turnaround is an OFDM SACK_RSP
+the RSP does not send there (it sends MFSK). The MFSK detector is UNGATED (runs before the suppress), so the
+reverse ACK is never missed. The window is the same one-shot timer as §VF2.2 (one consumer per side); the CMD
+and RSP arm it independently at their own turnaround entries.
+
+### §VF2.6 SLOW-POLL refinement + HONEST FLEET A/B VERDICT (replicated — gate is NECESSARY-NOT-SUFFICIENT)
+
+A fixed ~1.8s "gap-before-budget" under-covered the ~13s cfg0 batch period, so the storm ran in the long
+inter-arm gaps. The refinement: the suppress window spans the WHOLE `receiving_timeout`, and the gated ftr is
+capped at ONE FRAME PERIOD (not the ring depth). The forward search thus SLOW-POLLS once per frame across the
+turnaround — robust to the gap length, and the real burst is still caught within 1 frame (it decodes on the
+OK path, which bypasses the gate). 
+
+FLEET A/B (faithful real-audio snd-aloop, WGN:40 seed2001, FIX binary; defeat = same binary
+`MERCURY_INBAND_REVACK_RXGATE_DEFEAT=1`; legacy = inband off). Decisive clean run (run4):
+
+| metric | legacy | FIX (gate) | DEFEAT (storm) |
+|---|---|---|---|
+| total SKIP-VAR | 12 | **51** | **517** |
+| CMD SKIP-VAR | 12 | **0** | 297 |
+| RSP SKIP-VAR | 0 | 51 | 220 |
+| rx_bytes | 8192 (full) | 161 | 177 |
+| configs_seen | [0,100,101,102] | [100,101,102] | [100,101,102] |
+
+VERDICT — the gate is a PROVEN, CORRECT, TESTED fix for the SKIP-VAR storm: **~10× total SKIP-VAR reduction
+(517→51), CMD storm 297→0**, clean fails-before/passes-after on the SAME binary (the defeat knob), unit test
+green, full `--test` 68/0 (M=0), legacy byte-identical. BUT it is **NECESSARY-NOT-SUFFICIENT for delivery**:
+fix 161 B ≈ defeat 177 B, both ≫ below legacy's 8192 B, and NEITHER crosses to cfg0 (no `wb=[0]`; the
+redesign holds robust 100–102). The cfg0 SKIP-VAR storm was a real symptom this gate eliminates, but the
+binding constraint on delivery is the redesign's ROBUST→cfg0 CROSS/CLIMB failure — a SEPARATE, deeper layer
+(the "faithful_beat_vara_climb_binding" constraint), NOT the turnaround search storm. Run-to-run variance is
+real (one run had both arms 0 B / no-connect — a connect flake, fix==defeat so not the gate). Honest scope:
+this fix removes the storm and its wasted RX cycles + the pin-starvation pressure; it does not by itself make
+the redesign deliver at cfg0. The climb/cross layer is the next investigation, NOT another search-gate.
+
+### §VF2.7 CONNECT-PHASE EXCLUSION — fix the rxgate CONNECT regression (the §VF2.6 "connect flake" was the gate)
+
+ROOT (code-verified): `inband_arm_revack_turnaround_window()` (arq_common.cc — the SINGLE producer of
+`inband_revack_turnaround_budget_ms` / `inband_revack_turnaround_timer`) is reached from 5 sites. TWO fire
+during the pre-link CONNECT / CONTROL-ACK turnaround, not a data-batch turnaround:
+- RSP `process_messages_acknowledging_control()` (connection_status==ACKNOWLEDGING_CONTROL, dispatched at
+  arq_responder.cc:35) → `send_ack_pattern_with_snr()` (arq_responder.cc:1785) and
+  `send_ack_pattern(control_ack=true)` (arq_responder.cc:1795). This is the TEST_CONNECTION_ACK handshake
+  echo + the SET_CONFIG / KEY_EXCHANGE control ACKs. NOTE: `link_status` is already CONNECTED here
+  (set at arq_responder.cc:3069 BEFORE the echo is queued), so a link-state guard ALONE is insufficient.
+- CMD `calculate_receiving_timeout()` COMMANDER `ack_pattern_time_ms>0` branch (arq_common.cc:1563) is also
+  reached from the `RECEIVING_ACKS_CONTROL` control-ACK wait (connection_status set at arq_commander.cc:1730,
+  arm at calculate_receiving_timeout:1743).
+
+CONSEQUENCE (the §VF2.6 "connect flake", now explained): after the control ACK the side's NEXT RX is a
+forward burst it must ACQUIRE at full search cadence (the commander's TEST_CONNECTION, or the first forward
+DATA batch at the new config). The armed window instead SLOW-POLLS / suppresses that forward search →
+acquisition is starved → CONNECT fails. Measured: conn 6/12 (FIX) vs 11/12 (legacy). The gate's suppress
+window — meant for the inter-BATCH turnaround gap — was bleeding into link establishment.
+
+FIX (single choke point at the producer): arm ONLY in the DATA phase — `link_status==CONNECTED` AND
+`connection_status` NOT a control-ACK state (`!= ACKNOWLEDGING_CONTROL && != RECEIVING_ACKS_CONTROL`). This
+excludes EVERY pre-link state (LISTENING/CONNECTION_RECEIVED/CONNECTING/NEGOTIATING/CONNECTION_ACCEPTED →
+not CONNECTED) AND the CONNECTED-but-control turnarounds (handshake echo, SET_CONFIG/KEY_EXCHANGE ACK, CMD
+control-ACK wait). Data turnarounds STILL arm: RSP `ACKNOWLEDGING_DATA` (process_messages_acknowledging_data,
+sites 2334/2558/2568/2587/2594), CMD `RECEIVING_ACKS_DATA` (calculate_receiving_timeout data branch), and the
+RSP `RECEIVING` prev-batch redelivery ACK (process_messages_rx_data_control sites 532/1410/1393). connection_
+status is authoritative at every arm site (the responder dispatcher keys the RSP sites on it; the CMD wait
+sites set it before calculate_receiving_timeout). Inband-gated already; pre-link/control → budget stays 0 →
+the consumers (inband_revack_rxgate_ftr, inband_cmd_suppress_ofdm_ack_dispatch) fall back to the stock
+anti-spin / verbatim OFDM dispatch → CONNECT byte-identical to legacy. Same RXGATE_DEFEAT A/B knob.
+
+§5 audit delta (producer/consumer of the turnaround window vs the CONNECT/control state machine):
+- Producer: `inband_arm_revack_turnaround_window()` (the only writer). Now reads link_status +
+  connection_status and refuses to arm outside the data phase. Setting budget=0 on a control turnaround
+  cannot clobber a live data window — control turnarounds only occur at link setup / SET_CONFIG, between
+  data batches, never mid-data-turnaround.
+- Consumers UNCHANGED: both already treat budget<=0 as "inactive" → legacy fallback. No consumer assumption
+  altered; the fix only narrows WHEN the producer arms.
+- Test: `test_inband_revack_rxgate()` (arq_responder.cc) gains CONNECT (a)..(d): (a) pre-link
+  CONNECTION_RECEIVED → budget==0; (b) CONNECTED+ACKNOWLEDGING_CONTROL (handshake echo) → budget==0;
+  (c) CONNECTED+RECEIVING_ACKS_CONTROL (CMD control wait) → budget==0; (d) NEGATIVE: CONNECTED+
+  ACKNOWLEDGING_DATA → budget>0 (data turnaround NOT over-excluded). FAIL-BEFORE: drop the guard → (a)(b)(c)
+  arm → starve the CONNECT/forward search.
+
+---
+
+## §CROSS — the ROBUST→cfg0 CROSS death-spiral: a FUTILE NACK_DECODE_FAIL on an ACTIVELY-PROGRESSING batch starves forward capture (VERIFIED root; fix implemented 2026-06-28)
+
+§VAR-FIX-2 left the binding constraint as "the redesign's ROBUST→cfg0 CROSS/CLIMB failure." §CROSS is the
+VERIFIED root of that failure (instrumented real-audio A/B, mercury_crossbase @ fa8b8e92, WGN:40 seed2001,
+snd-aloop native ELF, .31).
+
+### §CROSS.1 The cross DECODES — the collapse is NOT a decode/variance bug (VERIFIED)
+At the cfg0 cross the RSP decodes cfg0 cleanly: **38 [OFDM-OK] cfg=0, 0 [OFDM-FAIL]**, var 0.0357, meanH
+0.979, iter=0. The §17 descrambler + §22 gi-inherit + §VAR-FIX rxgate fixes ALL engage (SKIP-VAR down 607→56;
+the storm is gated). The original task framing ("cfg0 DATA frames SKIP-VAR after a clean lock = bad
+equalizer/channel state") is FALSIFIED for the residual: clean cfg0 frames decode byte-correct. Legacy on the
+SAME audio crosses + delivers 11339 B (configs_seen [0,100,101,102], wb=[0]); redesign delivers 147 B,
+wb=[], breaks=1.
+
+### §CROSS.2 The death-spiral (VERIFIED — the per-batch SACK bitmaps DEGRADE)
+The forward batch never COMPLETES, and progressively LOSES frames each period (ACK-GATE-DIAG):
+
+| batch_seq_id | received seqs | bitmap | rx/exp |
+|---|---|---|---|
+| 3 | 1 2 3 4 5 | 0x3e | 5/6 |
+| 4 | 2 3 4 | 0x1c | 3/6 |
+| 5..8 | 2 3 | 0x0c | 2/6 |
+
+Frame **seq 0 is ALWAYS lost** (the acquisition-seam frame that bears the fresh OFDM anchor + the CONFIG_TAG
+burst, main.cc:1117); then frames 1 and 5 also drop, converging on only the middle seqs 2,3. The session
+delivers ~147 B and never sustains the climb.
+
+### §CROSS.3 ROOT — the down-ladder fires + emits a FUTILE NACK_DECODE_FAIL on a HEALTHY progressing batch
+During the inter-frame gaps of an actively-receiving cfg0 batch (frame 6 not yet arrived, or seq-0 retransmit
+pending), the RSP firing gate (arq_responder.cc:626-634: fresh-window-decoded + status!=RECEIVED + OFDM +
+bsi>=0) fires `inband_try_down_ladder_on_decode_fail`. The down-ladder correctly skips all ROBUST trials
+(holding the cfg0 lock) → "no config in window decoded" → and on the first such pass per dead-streak segment
+**emits a NACK_DECODE_FAIL** (arq_common.cc:5674-5679). That NACK is:
+- **Semantically FALSE**: it tells the CMD "I cannot follow / I am stuck below your announced config" — but the
+  RSP has decoded 1..5 frames of THIS batch at cfg0 (`batch_rx_frame_count >= 1`), PROVING the CONFIG_TAG
+  arrived and the RSP IS at cfg0. The CMD correctly reads it as "not a climb-miss (announced idx=-1) → no
+  accelerated demote" (arq_common.cc:3932-3941) — i.e. the NACK accomplishes NOTHING.
+- **Actively HARMFUL**: each NACK is a ~75920-sample (~1.5 s) reverse passband burst (arq_common.cc:2821
+  tx_transfer). While the RSP keys that reverse burst it CANNOT capture the forward cfg0 burst → it misses the
+  seq-0 retransmit AND the early frames of the NEXT batch → the bitmap degrades 5/6→3/6→2/6. A 1-frame
+  acquisition-seam miss is amplified into a death spiral. (This is the campaign reverse-ACK-transmit-time
+  binding constraint, memory feedback_reverse_ack_transmit_time_first: a reverse-ACK MISS must be CHEAP.)
+- **Re-decode storm on the CMD**: the NACK burst sits in the CMD capture ring for the whole turnaround; the CMD
+  re-decodes the SAME NACK (bsi_lsb=3 parity=0) ~12× in 0.2 s (arq_commander.cc:4124, no dedup, unlike the
+  SACK dedup at :4179) → 69 [CMD-NACK] in the run → burns the CMD forward-TX RX-loop passes.
+
+§19 (dead-batch classifier) correctly suppresses the false BREAK (PROGRESS_RESET / RATE_LIMITED → breaks=1,
+not many) — but §19 runs AFTER the NACK emit (line 5703 vs 5674) and does NOT touch the NACK. So the climb-
+killer that REMAINS after §17/§19/§20/§21/§22/§VAR-FIX is this futile-NACK reverse-airtime starvation.
+
+### §CROSS.4 THE FIX — never assert "cannot-follow" on a progressing batch (chokepoint at the NACK emit)
+The down-ladder lost-tag NACK_DECODE_FAIL is suppressed when `batch_rx_frame_count >= 1`. Discriminator
+rationale: a lost CONFIG_TAG can only strand a batch whose FIRST frame at the current config failed (a config
+change starts a NEW batch / NEW bsi, so its batch_rx_frame_count is 0 — arq_responder.cc:542/682 reset). Once
+≥1 DATA frame of the current batch has decoded at the current config (batch_rx_frame_count++ at
+arq_responder.cc:1454, the confirmed-storage point), the tag is PROVABLY present and any missing frames are a
+PARTIAL batch the SACK/retx path already owns — never a cannot-follow. The blind down-ladder DECODE, the §19
+classifier, and the §VAR-FIX-DEMOTE watchdog all STILL run (no-regress: the genuine-stall demote/BREAK paths
+are untouched) — only the harmful reverse-airtime NACK is gated. FAIL-BEFORE knob
+`MERCURY_INBAND_PROGRESSING_NACK_DEFEAT=1` restores the futile NACK on the same binary.
+Defense-in-depth: the CMD dedups a re-decoded NACK by (bsi,reason,parity) so a single genuine NACK is handled
+ONCE per turnaround, not ~12× (arq_commander.cc, mirrors the SACK dedup).
+
+### §CROSS.5 §5 CROSS-LAYER AUDIT — the NACK_DECODE_FAIL emit decision (shared state: down-ladder ↔ SACK/retx ↔ NACK ↔ batch-progress ↔ reverse-turnaround)
+1. PRODUCERS of the cannot-follow NACK: ONLY `inband_try_down_ladder_on_decode_fail` (arq_common.cc:5674) via
+   `inband_emit_nack(NACK_DECODE_FAIL)`; and `inband_emit_nack(NACK_UNFOLLOWABLE_CLIMB)` at arq_common.cc:3145
+   (an un-adoptable tag — a DIFFERENT trigger, NOT gated by this fix). The production firing gate is the single
+   site arq_responder.cc:655.
+2. CONSUMERS of the NACK: the CMD `inband_handle_nack` (arq_common.cc:3899) → accelerated-demote ONLY when the
+   RX is BELOW the announced config (climb-miss) or UNFOLLOWABLE; otherwise a no-op log. So a NACK on a
+   progressing batch was ALREADY a CMD no-op — suppressing its EMISSION changes no CMD decision, only removes
+   the reverse-airtime + the re-decode storm.
+3. VALID STATES of batch_rx_frame_count: 0 (no frame of the current batch stored yet — the lost-tag
+   precondition AND the genuine total-loss precondition) | ≥1 (≥1 frame stored at the current config — the tag
+   is present). Reset to 0 at: session start, batch boundary (542), TERMINAL BREAK (682). Default-init 0.
+4. INVARIANTS consumers assume: (INV-E1) a NACK_DECODE_FAIL means "the RX genuinely could not follow." The
+   futile firing VIOLATED INV-E1 (the RX WAS following — 5/6 frames). The fix restores INV-E1: NACK only when
+   batch_rx_frame_count==0 (no frame followed). (INV-E3 stale-epoch / mutual-exclusion unchanged.)
+5. WHAT THE FIX CHANGES + per-consumer walk:
+   - CMD inband_handle_nack: previously got a NACK it logged as "no accelerated demote." Now gets no NACK on a
+     progressing batch → identical net decision (no demote) but no re-decode storm. A GENUINE lost-tag
+     (batch_rx_frame_count==0) still NACKs → the climb-miss accelerated-demote path is preserved. OK.
+   - SACK/retx (the partial-batch owner): unchanged — the partial SACK (bitmap 0x3e) still goes out and the CMD
+     retransmits the missing seq-0; with the reverse channel no longer congested by the 1.5 s futile NACK the
+     retransmit can actually be captured. OK (this is the intended win).
+   - §19 dead-batch classifier (arq_common.cc:5703) + §VAR-FIX-DEMOTE watchdog (:5649): both still run on every
+     real-signal down-ladder-fail pass → the genuine zero-progress BREAK + the hard-stall pin-release are
+     untouched. A progressing batch hits PROGRESS_RESET anyway, so the suppressed NACK never co-occurs with a
+     genuine demote. OK (no-regress).
+   - down-ladder ADOPT (INV-S4-1, a CRC/LDPC pass required to adopt): unchanged — the fix gates only the NACK,
+     not the decode/adopt. A legit in-OFDM rate-down adopt still works. OK.
+   - reverse-turnaround / rxgate (§VAR-FIX-2): fewer reverse bursts → the RX forward-search gate has fewer
+     turnarounds to span; strictly complementary. OK.
+   Legacy (inband off): inband_emit_nack early-returns (feature gate) → byte-identical. OK.
+
+### §CROSS.6 RESULT + the NEXT root (HONEST — the fix is NECESSARY-NOT-SUFFICIENT)
+The §CROSS NACK fix WORKS for its target (instrumented A/B, mercury_crossfix, WGN:40 .11, N=3 inband):
+- the futile NACK storm is ELIMINATED: **NACK emit 0** on the progressing cells (33 "SUPPRESS futile"
+  per cell), vs the pre-fix 69-NACK / 12×-redecode storm.
+- the RSP now decodes MORE cfg0 frames: **65 [OFDM-OK] cfg=0** (was 38), 0 OFDM-FAIL.
+- delivery improves marginally (inband rx 211/211/1280 B, 1/3 cells load WB) vs the bug arm @fa8b8e92
+  (187 B mean, 0/2 WB-load). Legacy crosses+delivers 11339 B (3/3) on the same audio.
+
+But the cross is STILL NOT restored — the deeper binding root, now PINNED:
+
+**NEXT ROOT — the post-cross RSP prev-batch cross-storage LAGS one batch (VERIFIED, the
+[RSP-V2-PREV-BUMP] / [RSP-V2-PREV-RX] trail, arq_diag_inband / cx11_inband_sd1).**
+At the FIRST multi-frame cfg0 batch (batch_seq_id=3, 6 frames) the batch reaches only 5/6 (the
+acquisition-seam frame-0 / partial), never completes, and when the CMD starts batch 4 the RSP runs
+`[RSP-V2-PREV-BUMP] prev_batch_seq_id=3 next_expected=4 ... received_on_transfer=5/6 (cross-storage
+routing armed)`. From then on EVERY batch is incomplete and PREV-BUMPed; `received_on_transfer` locks at
+**2/4** and stays there for the rest of the session. The smoking gun: after the cross, **every decoded
+forward frame is routed to `[RSP-V2-PREV-RX]` (19 of them) and `current store (RX-DATA) == 0`** — i.e.
+the RSP is PERMANENTLY one batch behind the CMD: the CMD is on batch N+1, the RSP is still trying to
+complete batch N (now "prev"), so frame 0 of every new batch is mis-counted, neither batch ever completes,
+and `rsp_wb_data_frames` stays 0 / wb_configs_seen stays [] / 0 durable delivery. seq=0 IS decoded (13×) —
+this is NOT an acquisition loss but a **bsi-advance / prev-batch cross-storage one-batch-lag deadlock**
+(shared ARQ state: rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id, the V2 prev-bump transfer).
+
+This is a DISTINCT root in the batch-completion / bsi-routing layer (NOT the NACK this section fixed, NOT
+the §17/§19/§21/§22/§VAR-FIX layers). It needs its own §5 audit of the V2 prev-batch cross-storage state
+machine at the ROBUST→cfg0 cross: why the first cfg0 batch never completes (the acquisition-seam frame-0
+that legacy avoids via the SET_CONFIG lockstep handshake — the CMD knows the RSP is ready before airing
+frame 0), and why a single incomplete batch puts the RSP into a permanent one-batch lag instead of
+catching up to the CMD's current bsi. Candidate directions (each needs a live fail-before/passes-after):
+(a) on the cross, the CMD must not advance past a batch the RSP has not started (a lockstep-lite on the
+FIRST cfg0 batch only); (b) the RSP prev-bump must CATCH UP to the CMD's current bsi when it falls >1
+behind (re-baseline current_expected to the freshest seen bsi) rather than perpetually draining a stale
+prev; (c) make the first cfg0 batch's frame-0 acquisition robust (a longer settle / a re-aired frame-0).
+(b) looks closest to the true invariant. VERDICT for §CROSS: the NACK fix SHIPS (proven necessary,
+eliminates a real amplifier, no-regress, --test green); the bsi-lag is the NEXT root, NOT this one.
+
+### §CROSS.7 CORRECTION — the §CROSS.6 "bsi-advance one-batch-lag DEADLOCK" is FALSIFIED on the stack; the binding root is the PHY ROLLING FRAME-0 ACQUISITION SEAM (VERIFIED 2026-06-29, §5 audit + firsthand cx11 trail, HEAD 7c468e6d)
+
+§CROSS.6 candidate (b) ("re-baseline current_expected to the freshest seen bsi when it falls >1 behind")
+is **NOT the binding root** and re-baseline would be INERT. A full §5 data-flow audit of
+`rsp_current_expected_batch_seq_id` + `rsp_prev_batch_seq_id` against the cx11 inband RSP trail
+(crossfix = fa8b8e92+trio) shows the bsi state machine is CORRECT at the cfg0 cross:
+
+- `current` tracks the CMD batch-for-batch: ADOPT cfg0 bsi=3, then BATCH/PREV-BUMP 3→4→5→…→12, strictly
+  +1 (INV-1 holds). It is NEVER stranded >1 behind (INV-2 holds). The §CROSS.6 reading of
+  "current store==0 / 0 delivery / permanent one-batch-lag" was from the EARLIER pre-stack run.
+- Post-stack, EVERY cfg0 batch DELIVERS (the `[RSP-V2-PREV-DELIVERED]` trail advances `last_delivered`
+  3→4→…→12 monotonically). The forward frames are correctly routed: the new mixbatch frames (bsi=N+1)
+  hit `match_current`; the retx-prefix frames (bsi=N) hit `match_prev`→PREV-RX (INV-4 holds). The
+  CMD log proves the mixbatch geometry: `[CMD-V2-MIXBATCH] TX batch: R retx bsi=N + (6-R) new bsi=N+1`.
+- So `current` is ALREADY == the freshest forward bsi every cycle. The candidate-(b) trigger
+  (`bsi ∉ {cur,prev}` AND forward-of-cur) is NEVER reached — forward frames are always in {cur,prev}.
+  A re-baseline AND-term would evaluate but never fire. NOT IMPLEMENTED (bench-claim guard: a fix for a
+  non-existent deadlock is a no-op dressed as a fix).
+
+THE ACTUAL BINDING ROOT (VERIFIED, log+source): the FIRST 1–2 OFDM data frames (seq 0, sometimes seq 1)
+of EVERY cfg0 batch are LOST to the pre-LDPC SKIP-VAR gate (telecom_system.cc, ceiling 1.60 @ cfg=0):
+- FIRST cfg0 batch (bsi=3, no prior reverse-turnaround): the RSP's first decode is **seq=1** — frame
+  seq=0 is never received; seqs 1–5 decode CLEAN (var 0.033–0.098). `rx=5/6 seqs: 1 2 3 4 5`. This is the
+  Schmidl-Cox acquisition burden on the FRESH cfg0 lock (FTR≈0.08–0.12, the doc §1 PHY note).
+- SUBSEQUENT cfg0 batches: seqs 2,3,4 decode CLEAN; seqs 0,1 hit a var spike 1.9–3.4 (>1.60) on the
+  frames arriving right after the RSP's OWN reverse-ACK turnaround (EQ/timing not re-settled). `rx=3/6
+  seqs: 2 3 4`.
+Each lost lead frame is recovered ONE BATCH LATE via the next mixbatch's retx-prefix → prev-storage →
+`[RSP-V2-PREV-DELIVERED]`. CONSEQUENCE: NO clean BATCH-DONE ever fires at cfg0 → the durable WB-cross /
+climb-confirm signal never latches (`wb_configs_seen=[]`) → throughput is capped at ONE slow
+prev-recovery cycle per batch (~14 s) → 211 B vs legacy 11339 B (cx11 WGN:40). This is the rolling
+frame-0 seam this codebase's `data-flow-inband-frame0-rolling-partial.md` (§1, §7–§13, a dozen prior
+attempts) and the tier-crossing keystone §6.5 residual "C" (seat the cfg0 forward capture ring) name.
+NOTE: the capture-ring IS already seated on adopt (`inband_finalize_ofdm_adopt_ring` runs on BOTH the
+tag-follow `arq_common.cc:4947` AND the hybrid SET_CONFIG cross `arq_responder.cc:1807/1824`), so the
+residual is the ACQUISITION marginality itself, not ring mis-seating.
+
+NEXT-ROOT (precise): make the cfg0 lead frame survive — EITHER the fresh-rung acquisition (longer
+settle / re-aired frame-0, candidate (c)) OR pace like legacy (legacy airs `frames=1` at fresh OFDM
+rungs so the seam frame IS the whole batch and completes clean; the naive `set_data_batch_size(1)`
+re-seat was falsified in frame0-doc §11 — needs a delivery-loop-aware re-frame). BOTH are a PHY /
+turnaround-settle layer, RESEARCH-GATED (CLAUDE.md §1), NOT a same-session speculative chain (§5).
+The bsi state machine is EXONERATED; this section closes the §CROSS.6 bsi-lag thread.
