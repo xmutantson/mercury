@@ -1607,6 +1607,39 @@ public:
     return rx_bsi != last_applied_sack_bsi;      // partial: dedupe vs partial tracker
   }
 
+  // ── FORGIVING-ACK Tier-2 PARTIAL-SACK DE-DUP KEY ──────────────────────
+  // (data-flow-inband-dataplane-stall-post-leap.md §3/§7). Under the cumulative
+  // cap the reverse-SACK wire bsi carries n_r (the contiguous delivery high-water
+  // rsp_last_delivered_batch_seq_id), FROZEN across successive in-flight PARTIAL
+  // batches until a NEW delivery advances it. The CMD partial de-dup
+  // (cmd_last_applied_sack_bsi) was keyed on that raw wire bsi — written for the
+  // per-batch semantics where each batch's bsi is DISTINCT. Under the cap every
+  // post-first partial repeats the same frozen n_r, so the guard false-collides it
+  // as a "duplicate", the bitmap is never applied, stats.nAcked_data freezes, and the
+  // REVSACK-CHEAPMISS discriminator escalates to BREAK/demote (the post-leap one-
+  // batch/600s stall). ROOT FIX: key the partial de-dup on the IN-FLIGHT BATCH
+  // IDENTITY the bitmap is applied to (cmd_batch_seq_id — the CMD's current batch,
+  // which advances per batch), NOT the frozen wire n_r. Cap OFF: the per-batch wire
+  // bsi IS the identity, so key on rx_bsi UNCHANGED (legacy byte-identical; the whole
+  // non-Tier-2 fleet + every existing test stay bit-for-bit). This decouples the
+  // DE-DUP key ONLY; it does NOT alter the wire encoding NOR cumulative_ack_covers'
+  // backward-window SELF-HEAL — both still read the raw frozen n_r, so the Tier-2
+  // self-heal that RELIES on n_r is fully preserved. The CLEAN tracker keeps using
+  // rx_bsi (the clean wire bsi advances on every delivery, never frozen). PURE +
+  // static so --test-climb-engine drives the exact production decision.
+  // -DCUMULATIVE_ACK_DEDUP_FAILBEFORE pins the frozen-n_r key (reproduces the stall)
+  // so the regression fails-before / passes-after in the SAME binary.
+  static int partial_sack_dedup_key(int rx_bsi, int cmd_batch_seq_id, bool cap_on)
+  {
+#ifdef CUMULATIVE_ACK_DEDUP_FAILBEFORE
+    (void)cmd_batch_seq_id; (void)cap_on;
+    return rx_bsi & 0xFF;                       // FAIL-BEFORE: frozen-n_r key (the stall).
+#else
+    if(cap_on) return cmd_batch_seq_id & 0xFF;  // cap ON: in-flight batch identity (advances per batch)
+    return rx_bsi & 0xFF;                        // cap OFF: legacy per-batch bsi (unchanged)
+#endif
+  }
+
   // R039 (race audit 2026-06-06): the SACK-v2 accept "window" check. A decoded
   // SACK_RSP's rx_bsi must be the current or just-prior CMD batch (mod 256),
   // because RSP only ACKs frames whose batch_seq_id is one of those. The OFDM

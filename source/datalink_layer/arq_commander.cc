@@ -4180,8 +4180,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									? 0xFFFFFFFFu
 									: ((1u << data_batch_size) - 1u);
 								bool is_clean_confirmation = (rx_bitmap == all_ones);
+								// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
+								// §3): under the cap the PARTIAL wire bsi is the FROZEN n_r, NOT a per-batch
+								// identity, so key the PARTIAL de-dup on the in-flight batch the bitmap is
+								// applied to (cmd_batch_seq_id). CLEAN wire bsi advances per delivery -> keep
+								// keying it on rx_bsi. Same key used by the OFDM SACK_RSP path (shared tracker).
+								int dedup_bsi = is_clean_confirmation
+									? (int)rx_bsi
+									: partial_sack_dedup_key((int)rx_bsi, cmd_batch_seq_id, cumulative_ack_enabled);
 								bool duplicate = !sack_clean_confirmation_accepted(
-									(int)rx_bsi, is_clean_confirmation,
+									dedup_bsi, is_clean_confirmation,
 									cmd_last_applied_clean_bsi, cmd_last_applied_sack_bsi);
 
 							if(bsi_in_window && bitmap_ok && !duplicate)
@@ -4222,7 +4230,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
 										sack_bitmap[i] = ((rx_bitmap >> i) & 1u) ? true : false;
 									sack_detected = true;
-									cmd_last_applied_sack_bsi = (int)rx_bsi;
+									cmd_last_applied_sack_bsi = dedup_bsi;   // Tier-2 stall fix: key on in-flight batch identity
 									// ROLLING-PARTIAL unblock (data-flow-inband-frame0-rolling-partial.md
 									// §1/§2): record whether THIS partial is a LEAD-FRAME-ONLY loss
 									// (exactly bit0 clear, every other batch frame set). all_ones was
@@ -4394,8 +4402,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								decoded = false;
 							}
 						}
+						// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
+						// §3): the OFDM SACK_RSP transport ALSO carries the frozen n_r under the cap and
+						// SHARES cmd_last_applied_sack_bsi with the MFSK path, so key its de-dup on the
+						// SAME in-flight batch identity (cmd_batch_seq_id) to keep the tracker consistent.
+						int sackv2_dedup_bsi = partial_sack_dedup_key((int)rx_bsi, cmd_batch_seq_id, cumulative_ack_enabled);
 						if(decoded
-						   && (int)rx_bsi == cmd_last_applied_sack_bsi)
+						   && sackv2_dedup_bsi == cmd_last_applied_sack_bsi)
 						{
 							printf("[CMD-SACK-V2-DUPLICATE] bsi=%u already applied — ignoring\n",
 								(unsigned)rx_bsi);
@@ -4405,7 +4418,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						if(decoded)
 						{
 							sack_detected = true;
-							cmd_last_applied_sack_bsi = (int)rx_bsi;
+							cmd_last_applied_sack_bsi = sackv2_dedup_bsi;   // Tier-2 stall fix: shared key
 							// STAGE 4d (D1 CONFIRM): an OFDM SACK_RSP at-or-after the announce bsi
 							// proves the RX demodulated the batch at the announced config -> DISARM
 							// the re-tag (design §1.1/§1.3 consumer 1). No-op when not armed / inband off.
@@ -11384,6 +11397,40 @@ int cl_arq_controller::test_climb_engine()
 	bool a4 = sack_clean_confirmation_accepted(/*rx_bsi=*/B+1, true,
 	             /*last_applied_clean_bsi=*/B, /*last_applied_sack_bsi=*/B);
 	check(a4 == true, "A4 clean for a new bsi ACCEPTED", a4 ? 1 : 0, 1);
+
+	// ================================================================
+	// Part A' — FORGIVING-ACK Tier-2 PARTIAL-SACK DE-DUP under a FROZEN n_r
+	// (data-flow-inband-dataplane-stall-post-leap.md §3/§7). The post-leap
+	// data-plane stall: with the cumulative cap negotiated the reverse-SACK wire
+	// bsi carries n_r (the delivery high-water), FROZEN across successive in-flight
+	// PARTIAL batches. Batch 0's partial set the tracker to key(n_r=0,batch=0);
+	// batch 1's partial arrives with the SAME frozen wire bsi=0 but a DISTINCT
+	// in-flight batch (cmd_batch_seq_id=1) and MUST be applied (nAcked_data
+	// advances), not de-duped. partial_sack_dedup_key keys the partial de-dup on
+	// the in-flight batch identity under the cap; -DCUMULATIVE_ACK_DEDUP_FAILBEFORE
+	// pins it to the frozen n_r (reproduces the discard -> AP1/AP2 FAIL).
+	// ================================================================
+	int padk_b0 = partial_sack_dedup_key(/*rx_bsi=n_r*/0, /*cmd_batch_seq_id*/0, /*cap_on*/true);
+	int padk_b1 = partial_sack_dedup_key(/*rx_bsi=n_r*/0, /*cmd_batch_seq_id*/1, /*cap_on*/true);
+	check(padk_b0 != padk_b1,
+		"AP1 cap-ON partial key DISTINCT for batch1 vs batch0 under frozen n_r=0",
+		padk_b1, 1);
+	bool ap_b1_applied = sack_clean_confirmation_accepted(
+		/*rx_bsi(partial key)=*/padk_b1, /*is_all_ones=*/false,
+		/*last_applied_clean_bsi=*/-1, /*last_applied_sack_bsi=*/padk_b0);
+	check(ap_b1_applied == true,
+		"AP2 batch1 PARTIAL under frozen n_r APPLIED not deduped (nAcked_data advances)",
+		ap_b1_applied ? 1 : 0, 1);
+	bool ap_b1_repeat = sack_clean_confirmation_accepted(
+		padk_b1, /*is_all_ones=*/false, /*clean=*/-1, /*sack=*/padk_b1);
+	check(ap_b1_repeat == false,
+		"AP3 repeated batch1 partial (same in-flight batch) still deduped",
+		ap_b1_repeat ? 1 : 0, 0);
+	int padk_l0 = partial_sack_dedup_key(/*rx_bsi*/10, /*cmd_batch_seq_id*/10, /*cap_on*/false);
+	int padk_l1 = partial_sack_dedup_key(/*rx_bsi*/11, /*cmd_batch_seq_id*/11, /*cap_on*/false);
+	check(padk_l0 == 10 && padk_l1 == 11,
+		"AP4 cap-OFF legacy per-batch key unchanged (10,11)",
+		padk_l0 * 100 + padk_l1, 1011);
 
 	// ================================================================
 	// Part B — Bug 2/3: keep batch=1 at robust. Drive the REAL
