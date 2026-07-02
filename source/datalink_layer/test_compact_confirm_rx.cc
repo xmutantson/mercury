@@ -711,11 +711,154 @@ int cl_arq_controller::test_compact_confirm_sack_window_rx_path()
 	return ctx.fails == 0 ? 0 : 1;
 }
 
+// ============================================================================
+// LIVE base-only PHANTOM-ACK reject regression (Fable #7 4b)
+// ============================================================================
+//
+// CLI: --test-phantom-ack-live (also runs inside `mercury.exe --test`).
+//
+// THE INVARIANT THIS GUARDS (the CRC content gate, Fable wtsu2k647): the base ACK
+// tone pattern is config-invariant AND does NOT distinguish CLEAN from PARTIAL from a
+// coincidental self-match — generate_ack_sack_pattern() and generate_compact_confirm_
+// pattern() BOTH call generate_ack_pattern() for the 16-sym base (mfsk.cc:882/917), so
+// the base carries ZERO clean/partial/real-frame info. A "phantom" is a base >=threshold
+// correlation with NO CRC-valid content suffix — either structured OFDM-body/noise audio
+// that self-matches the base (the documented "matched=7/16, metric=0.66, NO RSP TX"
+// phantom) or a base frame whose content suffix is absent/garbled. Accepting a phantom
+// would set data_ack_received=YES on nothing -> credit a batch that never arrived -> the
+// 24-BREAK thrash + silent frame loss. The CRC content gate is what stops it.
+//
+// This test synthesizes a base-only phantom (16-sym base intact, suffix ABSENT) AND a
+// base+garbled-suffix phantom, PROVES the base correlates >= threshold (so it is a genuine
+// base match, not a base-miss), and asserts the LIVE acceptance predicate credits NEITHER:
+//   cmd_compact_confirm_crc_valid()  == false  (compact GF16+CRC12-over-[bsi] gate)
+//   cmd_clean_data_ack_crc_valid()   == false  (13-uncoded [bsi||bitmap] CRC12 gate)
+//   cmd_compact_confirm_live_accept()== false  (the full clean-ACK acceptance predicate)
+// Deterministic, no RF, no IONOS. Returns 0 on PASS, 1 on FAIL.
+// ============================================================================
+int cl_arq_controller::test_phantom_ack_live_reject()
+{
+	const char* TAG = "phantom_ack_live_reject";
+	printf("[TEST] %s starting\n", TAG);
+	fflush(stdout);
+
+	cc_rx_ctx ctx;
+	const int CFG = CONFIG_0;   // deepest WB rung (suffix-capable)
+
+	cl_telecom_system* ts  = new cl_telecom_system();
+	cl_arq_controller* cmd = new cl_arq_controller();
+	ts->operation_mode = ARQ_MODE;
+	ts->narrowband_enabled = NO;
+	cmd->telecom_system = ts;
+	cmd->role = COMMANDER;
+	cmd->narrowband_enabled = NO;
+	cmd->current_configuration = CONFIG_NONE;
+	cmd->load_configuration(CFG, FULL, NO);
+	cmd->link_status = CONNECTED;
+	cmd->connection_status = RECEIVING_ACKS_DATA;
+
+	if(ts->ack_mfsk.compact_confirm_suffix_len() <= 0) {
+		printf("  [SKIP] compact confirm unsupported on this WB config\n");
+		delete cmd; delete ts;
+		return 0;
+	}
+
+	int sym = ts->data_container.Nofdm * ts->frequency_interpolation_rate;
+	int max_samples = (ts->ack_mfsk.ack_sack_pattern_nsymb() + 4) * sym;
+	int base_samples = ts->ack_mfsk.ack_pattern_nsymb * sym;
+
+	const uint8_t bsi = 0x2A;
+	cmd->cmd_batch_seq_id = bsi;
+	cmd->data_batch_size  = 30;
+
+	// Generate a real compact-confirm frame (base + valid suffix) to source a clean 16-sym
+	// base region from. The phantoms below reuse ONLY its base region.
+	std::vector<double> compact_buf((size_t)max_samples, 0.0);
+	int compact_samples = 0;
+	{
+		unsigned char bb[1]; bb[0] = (unsigned char)bsi;
+		uint16_t crc12 = (uint16_t)(cmd->CRC12_calc((const char*)bb, 1) & 0x0FFF);
+		compact_samples = ts->generate_compact_confirm_passband(compact_buf.data(), bsi, crc12);
+	}
+	ctx.check(compact_samples > base_samples, "source compact-confirm frame generated (base+suffix)");
+
+	// A helper: seat a frame, run receive_ack_pattern to establish the base correlation, then
+	// probe the two content gates + the full live-accept predicate. Returns true iff the frame
+	// is correctly REJECTED as a phantom (base detected, NO credit).
+	auto probe_phantom = [&](const double* frame, int nsamp, const char* label)->void {
+		// (a) base correlation — establishes this IS a phantom (real base match), NOT a base-miss.
+		seat_frame_at_live_tail(ts, frame, nsamp);
+		cmd->ack_diag_peak_matched = 0; cmd->ack_diag_peak_metric = 0.0; cmd->ack_diag_poll_count = 0;
+		bool base = cmd->receive_ack_pattern();
+		int  peak = cmd->ack_diag_peak_matched;
+		printf("  [DIAG] %s: base receive_ack_pattern()=%d peak_matched=%d/%d metric=%.2f\n",
+		       label, base ? 1 : 0, peak, ts->ack_mfsk.ack_match_threshold, cmd->ack_diag_peak_metric);
+		fflush(stdout);
+		char msg[160];
+		snprintf(msg, sizeof(msg), "%s: base pattern DID correlate >= threshold (genuine phantom, not a base-miss)", label);
+		ctx.check(peak >= ts->ack_mfsk.ack_match_threshold, msg);
+
+		// (b) compact content gate MUST reject (no CRC-valid GF16 codeword).
+		seat_frame_at_live_tail(ts, frame, nsamp);
+		bool cc = cmd->cmd_compact_confirm_crc_valid();
+		snprintf(msg, sizeof(msg), "%s: cmd_compact_confirm_crc_valid REJECTS (no valid compact content)", label);
+		ctx.check(!cc, msg);
+
+		// (c) 13-uncoded clean-data-ACK content gate MUST reject (no CRC-valid [bsi||bitmap]).
+		seat_frame_at_live_tail(ts, frame, nsamp);
+		bool clean = cmd->cmd_clean_data_ack_crc_valid();
+		snprintf(msg, sizeof(msg), "%s: cmd_clean_data_ack_crc_valid REJECTS (no valid 13-uncoded content)", label);
+		ctx.check(!clean, msg);
+
+		// (d) the FULL live-accept predicate MUST NOT credit the phantom (the bare arm is
+		//     content-gated on WB; the compact arm is CRC-gated). This is the load-bearing assert.
+		seat_frame_at_live_tail(ts, frame, nsamp);
+		bool accepted = cmd->cmd_compact_confirm_live_accept(
+			/*sack_window_open=*/false, /*compact_enabled=*/true, /*use_legacy_chain=*/false);
+		snprintf(msg, sizeof(msg), "%s: live acceptance predicate does NOT credit the phantom (no data_ack)", label);
+		ctx.check(!accepted, msg);
+	};
+
+	// PHANTOM #1 — base intact, suffix ABSENT (zeroed). The base correlates 16/16 in-window;
+	// there is no content suffix at all -> both content gates must reject.
+	{
+		std::vector<double> phantom((size_t)max_samples, 0.0);
+		memcpy(phantom.data(), compact_buf.data(), (size_t)base_samples * sizeof(double));
+		probe_phantom(phantom.data(), base_samples, "PHANTOM(base-only, suffix absent)");
+	}
+
+	// PHANTOM #2 — base intact, suffix GARBLED (full-scale noise). The base correlates; the
+	// content suffix decodes to garbage -> CRC fails -> both content gates must reject.
+	{
+		std::vector<double> phantom((size_t)max_samples, 0.0);
+		memcpy(phantom.data(), compact_buf.data(), (size_t)compact_samples * sizeof(double));
+		uint32_t r = 0xBADC0DEu;
+		for(int i = base_samples; i < compact_samples; i++) {
+			r = r * 1664525u + 1013904223u;
+			phantom[i] = ((double)(r >> 8) / (double)0xFFFFFF) - 0.5;  // full-scale noise
+		}
+		probe_phantom(phantom.data(), compact_samples, "PHANTOM(base + garbled suffix)");
+	}
+
+	delete cmd; delete ts;
+
+	printf("[TEST] %s %s (%d failures)\n", TAG,
+	       ctx.fails == 0 ? "PASS" : "FAIL", ctx.fails);
+	fflush(stdout);
+	return ctx.fails == 0 ? 0 : 1;
+}
+
 #else  // !MFSK_ACK_SACK_ENABLED
 
 int cl_arq_controller::test_compact_confirm_live_rx_path()
 {
 	printf("[TEST] compact_confirm_live_rx_path SKIPPED (MFSK_ACK_SACK disabled)\n");
+	return 0;
+}
+
+int cl_arq_controller::test_phantom_ack_live_reject()
+{
+	printf("[TEST] phantom_ack_live_reject SKIPPED (MFSK_ACK_SACK disabled)\n");
 	return 0;
 }
 

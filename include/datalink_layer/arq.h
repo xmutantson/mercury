@@ -991,6 +991,37 @@ public:
   // See fact-documents/gearshift-start-and-recovery.md §8.
   int test_phantom_ack_gate();
 
+  // REVERSE-CONFIRM-MISS DECOUPLE regression (--test-revack-confirm-miss;
+  // data-flow-revack-confirm-miss.md §5). Fail-before/pass-after over the PRODUCTION
+  // decision revack_confirm_miss_should_decouple() — the EXACT helper the block-failure
+  // path calls before emergency_nack_count++. BEFORE (-DREVACK_CONFIRM_MISS_FAILBEFORE):
+  // every base-detected reverse-confirm miss ++emergency_nack_count -> reaches the BREAK
+  // threshold (the demote-amplifier reproduced). AFTER: base-detected + forward-OFDM-
+  // healthy misses are DECOUPLED (no ++, no BREAK) up to REVACK_BASE_MISS_MAX_CONSEC, then
+  // escalate; a pure-silence miss (base NOT detected) and a non-OFDM-anchor link NEVER
+  // decouple (BREAK preserved); a landed data-ACK resets the streak. PURE in-process
+  // synthetic-fire. Returns 0 PASS / 1 FAIL.
+  int test_revack_confirm_miss_decouple();
+
+  // DELIVERED-PAYLOAD BYTE-INTEGRITY gate (Fable #7 4a; --test-cc-delivery-integrity).
+  // Drives a full CMD->RSP single-batch clean transfer through the 2-instance in-process
+  // stepper (test_sim_inproc_2, PINNED clean WB, deterministic) — exercising the reverse-
+  // ACK / compact-confirm accept path — and asserts the RSP-delivered payload is EXACTLY
+  // the CMD-sent payload (rx_have == payload_len AND byte-for-byte identical): ANY missing/
+  // reordered/duplicated byte = FAIL. This is the system-level catch for a silent false-
+  // accept (a partial credited as clean -> a delivery hole). Returns 0 PASS / 1 FAIL.
+  int test_compact_confirm_delivery_integrity();
+
+  // LIVE base-only PHANTOM-ACK reject regression (Fable #7 4b;
+  // source/datalink_layer/test_compact_confirm_rx.cc). Synthesizes a base ACK pattern with
+  // NO valid content suffix (a real >=threshold base correlation, but no RSP-sent CRC12
+  // suffix — the "matched=7/16, no content" phantom class) and asserts the LIVE acceptance
+  // predicate does NOT credit it: cmd_compact_confirm_crc_valid()==false,
+  // cmd_compact_confirm_live_accept()==false, cmd_clean_data_ack_crc_valid()==false — while
+  // confirming the base DID correlate (so it is content, not base-miss, that gates it).
+  // Returns 0 PASS / 1 FAIL.
+  int test_phantom_ack_live_reject();
+
   // CLEAN-BATCH VIABILITY (§9, 2026-05-29) — PURE policy predicate. A batch may
   // drive the four gearshift promotion consumers (anchor-raise, panic reset,
   // break_drop_step reset, FRAME-UP) ONLY if it was confirmed FULLY delivered
@@ -4632,6 +4663,15 @@ public:
   // across cycles (the field's role generalizes from "carve-dead" to "CFG16-not-viable-on-this-
   // channel"; both arm sites mean the same thing to every cooldown consumer). See FIX9_D3_AUDIT.md.
   int cfg16_revack_starve_fails{0};
+  // REVERSE-CONFIRM-MISS DECOUPLE (the SAFE demote-amplifier lever, data-flow-revack-
+  // confirm-miss.md §5): CONSECUTIVE data-ACK-timeout block failures that were DECOUPLED
+  // from the emergency_nack_count++/BREAK amplifier because the base ACK pattern WAS
+  // detected this window (ack_diag_peak_matched >= ack_match_threshold) but the content
+  // CRC did not validate (a residual reverse-confirm miss, NOT pure silence). Bounded by
+  // REVACK_BASE_MISS_MAX_CONSEC; reset to 0 on ANY data-ACK (success block). INIT 0 in
+  // ctor + session resets. Producer/consumer: the block-failure decision point
+  // (process_messages_rx_acks_data) via revack_confirm_miss_should_decouple().
+  int revack_base_miss_consec{0};
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)
