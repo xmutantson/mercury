@@ -1,7 +1,19 @@
 # Data-Flow Audit: streaming-compression × `batch_capacity` × frame-fill
 
-**Status**: Authoritative as of 2026-06-01 on `fix/robust0-compress-deadlock`
-(off `monitor` @ `fef293f`). Paired regression test:
+**Status**: ~~Authoritative as of 2026-06-01 on `fix/robust0-compress-deadlock`
+(off `monitor` @ `fef293f`).~~ **SHIPPED — the fix is now in mainline.**
+
+> **CORRECTION (2026-07-01):** the `fix/robust0-compress-deadlock` work landed on
+> mainline. `compression_viable_for_batch()` is live and drives BOTH sides:
+> TX at `arq_commander.cc:19089` (data-fill path) and RX at `arq_common.cc:13682`
+> (decompress gate). The paired in-process regression test
+> `test_robust0_compress_deadlock` is wired (referenced from `main.cc`,
+> `arq_commander.cc`, `arq_common.cc`). NOTE: the internal `:87xx` /
+> `process_buffer_data_commander` line anchors throughout this doc predate large
+> file growth and have DRIFTED — re-grep by symbol (`compression_viable_for_batch`,
+> `process_buffer_data_commander`) rather than trusting the line numbers below.
+
+Paired regression test:
 `mercury --test-robust0-compress-deadlock` (in-process, no PHY/audio/TCP).
 Every change to the commander data-fill path
 (`arq_commander.cc::process_buffer_data_commander`), to `compress_block()`'s
@@ -385,5 +397,7 @@ No mis-decompression is possible. ✓
 **Hardware confirmation still required**: this is a SIM/loopback validation. The
 fixed compression path must be confirmed to deliver on the IONOS testbed at
 ROBUST_0 (the original HW symptom from agent aa92936f) and to resume compression
-correctly when the link climbs to OFDM. NOT merged to monitor — committed on
-`fix/robust0-compress-deadlock` for review (production-critical).
+correctly when the link climbs to OFDM. ~~NOT merged to monitor — committed on
+`fix/robust0-compress-deadlock` for review (production-critical).~~
+**CORRECTION (2026-07-01): MERGED — the fix is in mainline** (`compression_viable_for_batch()`
+TX `arq_commander.cc:19089`, RX `arq_common.cc:13682`; `test_robust0_compress_deadlock` wired).

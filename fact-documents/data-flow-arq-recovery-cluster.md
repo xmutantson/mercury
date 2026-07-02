@@ -472,9 +472,17 @@ companion (`data-flow-retx-queue.md`, `data-flow-messages_rx_prev.md`,
 ## §10 As-built (branch `fix/confirmed-races`, 2026-06-06)
 
 All six fixes implemented + tested in worktree `C:/Users/kamer/mercury_wt/race-fixes`
-(off `monitor` @2aff9e6), one commit each, in the §6 SAFE ORDER. NOT merged. Each
+(off `monitor` @2aff9e6), one commit each, in the §6 SAFE ORDER. ~~NOT merged.~~ Each
 ships an in-process synthetic-fire `--test-*` with a fail-before/pass-after assertion;
 full results in `race_audit/race_fix_results.json`.
+
+> **CORRECTION 2026-07-01: ALL SIX MERGED to mainline.** Verified in the current
+> `mercury/source/` tree: `clear_retx_queue()` (R029) is live at its single-owner sites
+> (`arq_commander.cc:585/673/3394/4879/5217/5373/6090` + `reset_session_state`);
+> `sack_v2_bsi_in_window()` (R039, PURE static in `arq.h`) is the live SACK-v2 accept
+> guard; the R038 staging field / R035 `rescan_prev_on_batch_shrink()` / R030 flip
+> resolver / R006 atomic-shutdown are all present. The §10.1 "no sibling bug" outcome
+> held through the merge.
 
 | race | commit | test flag | implementation note |
 |---|---|---|---|
@@ -499,8 +507,15 @@ the fixes added code; the cited symbols/anchors are authoritative, not the numbe
 
 ## §11 M6 — BREAK-path lossless requeue (`cmd_batch_seq_id` rollback)
 
-**Branch** `feat/m6-lossless-requeue` (off `9afe802`). **Default-OFF** behind
-`MERCURY_BREAK_LOSSLESS_REQUEUE`; BYTE-IDENTICAL when unset. HELD (no merge/push/HW).
+**Branch** `feat/m6-lossless-requeue` (off `9afe802`). ~~**Default-OFF** behind
+`MERCURY_BREAK_LOSSLESS_REQUEUE`; BYTE-IDENTICAL when unset. HELD (no merge/push/HW).~~
+
+> **CORRECTION 2026-07-01: M6 LANDED in mainline and is now DEFAULT-ON.** The gate flipped
+> from opt-in to an escape hatch: `break_lossless_requeue_enabled()` (`arq_commander.cc:62`)
+> now returns TRUE unless `MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE` is set to any non-empty
+> value (`arq_commander.cc:60-68`). The rollback fires at the Anchor-rung BREAK behind
+> `break_lossless_requeue_enabled() && sack_v2_enabled && !compression_enabled`
+> (`arq_commander.cc:~5564`). See `data-flow-retx-queue.md` §10 (same fix, its owner doc).
 
 ### §11.1 Root cause (the recovery cascade's terminal bug)
 The Anchor-rung emergency BREAK (`arq_commander.cc`, the

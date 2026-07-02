@@ -1,6 +1,18 @@
 # Data-flow audit — `frames_to_read` across the CONNECT-REACK pre-data window
 
-**Status:** FIX SHIPPED on `feat/inband-a3-decouple`. Cross-layer audit for the
+**Status:** ~~FIX SHIPPED on `feat/inband-a3-decouple`.~~ → **SUPERSEDED /
+EXCISED** (correction 2026-07-01). The whole CONNECT-REACK pre-data re-ACK
+mechanism that this fix *bounded* was later **removed** as part of the 8e62722e
+excise: `arq_responder.cc:463` now reads "CONNECT-REACK pre-data re-ACK REMOVED
+(excise of 8e62722e)", with the gate at `:115` and the cache populate at `:3066`
+likewise "REMOVED" (see connect-testack-handshake.md §9). So producers #4 (probe
+clamp→2) and #5 (hand-back) below **no longer exist** — the bounded-window
+mechanism was overtaken by deleting the re-ACK entirely. The §6 regression test
+was repurposed to guard the EXCISE: `test_connect_reack()` at
+`arq_responder.cc:10180` (comment "CONNECT-REACK EXCISE regression" at `:10148`).
+The `frames_to_read` producer/consumer map for the **surviving** paths (§2 #1-3,#6;
+§3) remains authoritative and is the reason this doc is kept.
+Cross-layer audit for the
 8e62722e-class OFDM-RX-acquisition regression that the redesign branch carried.
 **Scope:** the shared PHY field `telecom_system->data_container.frames_to_read`
 ("ftr") as it is contended between the ARQ connect-heal (duplicate-TEST_CONNECTION
@@ -47,10 +59,11 @@ md5 3902d4b6): `connected=True` but `rsp_nreceived=0` on 4/4 cells. This is the
 2. CONNECTION_RECEIVED Site-F suffix probe clamp → 2 (arq_responder.cc:268, :370).
 3. RECEIVING entry / turnaround → `preamble_nSymb+Nsymb(+10)`
    (arq_responder.cc:254, :1879, :2103, :2720) — the OFDM data budget.
-4. **CONNECT-REACK probe clamp → 2** (arq_responder.cc, inside the re-ACK block) —
-   the producer this fix bounds.
-5. **CONNECT-REACK hand-back → `frame_symb+10`** (NEW, this fix) — restores #3's
-   budget once the bounded probe window elapses.
+4. ~~**CONNECT-REACK probe clamp → 2** (arq_responder.cc, inside the re-ACK block) —
+   the producer this fix bounds.~~ **EXCISED 2026-07-01** — the re-ACK block was
+   removed (arq_responder.cc:463 "REMOVED"), so this producer no longer exists.
+5. ~~**CONNECT-REACK hand-back → `frame_symb+10`** (NEW, this fix) — restores #3's
+   budget once the bounded probe window elapses.~~ **EXCISED 2026-07-01** with #4.
 6. capture thread drains ftr toward 0 as audio is consumed (background).
 
 ## §3 Consumers (VERIFIED)
@@ -92,9 +105,15 @@ handed frames_to_read=62 back to OFDM data path`.
 
 ## §6 Regression test
 
-`test_connect_reack_ftr_starvation()` (arq_responder.cc; CLI
+~~`test_connect_reack_ftr_starvation()` (arq_responder.cc; CLI
 `--test-reack-ftr-starvation`; wired into master `--test`). Drives the REAL
 arbiter + REAL turnaround timer. B1 arm, B2 in-window clamp, B3 arbiter closes
 after the bounded window (PASS-AFTER; fail-before: the old unbounded predicate
 never closes), B4 hand-back restores ftr>2, B5 one-shot, B6 data-arrival
-self-terminate. 8/8 PASS on the fixed binary.
+self-terminate. 8/8 PASS on the fixed binary.~~
+
+**CORRECTION 2026-07-01:** the bounded-window test above was superseded when the
+re-ACK block was excised. The surviving regression is `test_connect_reack()`
+(`arq_responder.cc:10180`, comment "CONNECT-REACK EXCISE regression" `:10148`),
+which now guards that the pre-data re-ACK path stays REMOVED rather than that the
+clamp is bounded.

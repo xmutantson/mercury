@@ -1,9 +1,22 @@
 # data-flow-inband-a3-decouple.md
 
 Owner-gated A3 demote-decouple for the in-band rate-adapt redesign.
-Branch `feat/inband-a3-decouple` off `ab/redesign-v3` (5d9633f). Env gate
-`MERCURY_INBAND_A3_DECOUPLE`, DEFAULT-OFF (OFF = current redesign-v3 behavior,
-byte-identical). NOT enabled, NOT merged — owner-ratification-gated.
+~~Branch `feat/inband-a3-decouple` off `ab/redesign-v3` (5d9633f).~~ Env gate
+`MERCURY_INBAND_A3_DECOUPLE`, DEFAULT-OFF (OFF = current behavior, byte-identical).
+
+> **CORRECTION (2026-07-01):** The A3 decouple code has since LANDED in mainline
+> (no longer on the `feat/inband-a3-decouple` branch). It remains DEFAULT-OFF /
+> owner-gated: the gate `inband_a3_decouple_enabled()` (defined in
+> `arq_common.cc`, declared `arq.h`) and the "A3 DEMOTE-DECOUPLE" re-air block
+> are live in `arq_commander.cc` (see the refreshed anchors below). NOTE: memory
+> `a3_decouple_blocked_on_redesign_dataplane` records the A3 "data-plane FIXED"
+> claim as FALSIFIED — the decouple stays a default-off gated experiment, not a
+> shipped fix. **Anchor drift (verified 2026-07-01):** `inband_connect_liveness_guard()`
+> is now defined at `arq_commander.cc:3528` (was cited :3172) and invoked at
+> :500; the A3 DEMOTE-DECOUPLE block is at :3693-3724 (was cited :3268-3286/:3299),
+> with the gate `inband_a3_decouple_enabled()` at :3708 and the
+> `forward_healthy_revack_miss` demote at :3724. Inline :3172/:3268-3286/:3299
+> refs in §0/§1/§5/§8 below are STALE — map them onto :3528 / :3693-3724 / :3708.
 
 ## §0 The defect (HW-diagnosed, established)
 
@@ -155,4 +168,9 @@ commits (the A3 predicate + decouple-safety proofs).
     (--test-cumulative-ack, --test-a3-decouple-safety §2 CHECKPOINT GREEN), both now wired
     into the `--test` battery (main.cc).
   - Build (bash build.sh o3) clean; `--test` GREEN (229 PASS, 0 fail, exit 0).
-- NOT enabled by default, NOT merged. Owner/me-gated per the task.
+- ~~NOT enabled by default, NOT merged. Owner/me-gated per the task.~~
+  **CORRECTION (2026-07-01):** code MERGED to mainline but still DEFAULT-OFF /
+  owner-gated (gate `inband_a3_decouple_enabled()`; block `arq_commander.cc:3693-3724`,
+  gate call :3708, demote :3724, guard def :3528). A3 "data-plane FIXED" claim is
+  FALSIFIED per memory `a3_decouple_blocked_on_redesign_dataplane` — remains an
+  unratified default-off experiment, NOT a shipped fix. [?] whether to retire.

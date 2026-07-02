@@ -3,6 +3,21 @@
 Branch: `wt/connect-suffix-fec` off `monitor` (01535f2). MEASURED PROTOTYPE —
 do NOT merge. SOFTWARE/SIM ONLY.
 
+> **UPDATE 2026-07-01 (maintenance).** The ship story moved past this prototype's
+> §6.6 verdict. A stronger suffix FEC **shipped to mainline**: a **GF(16)
+> repeat-accumulate (RA)** code selected by `suffix_fec_mode == 3`, wired via
+> `telecom_system->set_suffix_fec(fec_on, /*repfact=*/3)` (`arq_common.cc:2464`;
+> gf16ra is process-global, `arq_common.cc:2603-2604`; RA codec in
+> `mfsk_ctrl_codec.cc` [~:346, verify]; as-built test coverage in
+> `mfsk_ctrl_codec_tests.cc:5026` "GF(16) RA FEC wired in (suffix_fec_mode=3 via
+> set_suffix_fec)"). This **supersedes** §6.6's "Tier-1 soft list-decode @flips=1,
+> ZERO added length" as the shipped mechanism — the deployed path adds real
+> redundancy (repfact=3) rather than relying only on the zero-length CRC-aided
+> soft search. The **cliff structure and soft-energy analysis in §1-§6 remain
+> valid** (they are why an added-redundancy code was worth shipping); only the
+> "flips=1 is the ship point" recommendation is overtaken. See
+> connect-testack-handshake.md / mfsk-robust-ack.md for the as-built suffix.
+
 Goal: add FEC/soft-decode to the **binding acquisition sub-stage** (the
 13-symbol M=16 control suffix) so its decode cliff tracks the base-pattern
 detection floor instead of the uncoded `p^13` cliff. Get hard sim numbers for
@@ -334,6 +349,9 @@ SAME type+CRC accept gate (I2) → no ARQ weakening beyond the bounded, measured
 FAR. SNR-vote path (I1) untouched (reads hard `out_tones`).
 
 ### §6.6. SHIP RECOMMENDATION (decision-grade)
+> **SUPERSEDED 2026-07-01:** what actually shipped is the GF(16)-RA suffix FEC
+> (`suffix_fec_mode==3`, `set_suffix_fec(on,3)`) — see top-of-doc UPDATE. Read
+> item 1 below as the prototype's original recommendation, not the deployed path.
 1. **Tier 1 soft list decode @ flips=1 — SHIP-ready, low risk, FREE.** +1.3-2 dB
    acquisition on BOTH CONNECT and ACK at **0% throughput cost** and 0.25% FAR.
    No wire change, gated, baseline byte-identical. This is a pure win for the

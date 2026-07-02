@@ -10,9 +10,24 @@ producer/consumer registry that audit requires BEFORE the change ships.
 Design dossier: `bigblock_p3_hw/_deepdsp/RESEARCH_turbo-eq.md`.
 Companion audit (the state this one extends): `data-flow-noise_variance_estimate.md`.
 
-All file:line references are against the `feat/turbo-eq` worktree off `monitor`
-(`cb5d519`). Facts are from executing/reading the code, not comments. Built
+All file:line references were originally against the `feat/turbo-eq` worktree off
+`monitor` (`cb5d519`). Facts are from executing/reading the code, not comments. Built
 2026-06-10.
+
+> **CORRECTION (2026-07-01): verdict + location update.**
+> - **Deep-DSP verdict: the turbo-eq CORE (iterative data-aided re-estimation loop,
+>   §2.3/§6) is CUT** — the it≥1 refinement did not add on top of a good seed (memory
+>   `Deep-DSP verdicts: … CUT TURBO-EQ`). What is **RETAINED as a WIN is the §9
+>   TINTERP-SEED lever** (the it=0 seed-swap that breaks the Dy=3 wall, +2.29 dB;
+>   memory `WIN TINTERP-SEED`).
+> - **The code is now MERGED to mainline, default-OFF** (no longer the `feat/turbo-eq`
+>   worktree): `data_aided_channel_estimator` at `ofdm.cc:2157` (decl `ofdm.h:159`;
+>   the §2.2 "added after LS_channel_estimator_tinterp" and §9.1 `ofdm.cc:2072`
+>   anchors are STALE). Gates `MERCURY_TURBO_ITERS` (default 1 = OFF,
+>   `telecom_system.cc:3109`) and `MERCURY_SFO_GRID_TURBO_ITERS` (default 1 = OFF,
+>   `:7937`); `dd_seed_floor`/`turbo_seed_tinterp` at `:7053-7055`. Default-unset =
+>   byte-identical to base, so shipping the CUT core default-off is inert; only the
+>   TINTERP-seed knob is the fade-tier lever.
 
 ---
 

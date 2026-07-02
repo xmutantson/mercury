@@ -3,6 +3,19 @@
 Branch `fix/ldpc-decode-accel` off `fix/break-fh-gate @465956e`.
 Worktree `C:/Users/kamer/mercury_wt/ldpc-accel`.
 
+> **Anchor refresh (2026-07-01, maintenance — substance unchanged).** Line
+> numbers below have drifted; cite by symbol. Current sites:
+> - **A (FWDBACK):** gate `ldpc_fwdback_enabled()` at `ldpc_decoder_SPA.cc:42`;
+>   flag read `const bool fwdback = ldpc_fwdback_enabled()` at `:590`; the
+>   O(dc²) leave-one-out branch `else if(!fwdback)` at `:891`; the O(dc)
+>   forward-backward branch (`fb_pref` prefix products) at `:911-912` / ~`:1010`.
+>   (Doc §1 cites the old `:172-204` / `:206-251` — now the `:590`–`:1010` block.)
+> - **B (ITERCAP):** env read `std::getenv("MERCURY_LDPC_ITERCAP")` at
+>   `telecom_system.cc:10993` (doc §2 cites the old `:10117-10134`); the harness
+>   `iter_cap` / `iter_cap_check` prints are now `:8088` / `:8101` (doc cites the
+>   old `:7278`). The ROBUST `nIteration_max` override still sits just above the
+>   cap site. All findings/measurements below stand.
+
 ## §0 Problem (MEASURED, firsthand HW [TIMING] logs)
 
 Held-CFG16 reverse-ACK turnaround miss is a **DECODE-LATENCY spike**, not a

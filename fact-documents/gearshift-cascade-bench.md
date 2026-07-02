@@ -5,6 +5,16 @@
 **Owner**: gearshift_cascade_bench.py harness
 **Status**: design v1, awaiting hardware run
 
+> **CORRECTION (2026-07-01):** This benchmark is an **announcement-keyed climb
+> scorer** — it grades the cascade by parsing `[GEARSHIFT]`/`[POLICY-MOVE]`
+> log-line *announcements* (§5/§6). Announcement-keyed climb scorers were
+> **DEPRECATED** by commit `fc9153e` ("scoring: deprecate announcement-keyed
+> climb scorers; canonical audit record") in favor of the canonical audit
+> record, because a logged announcement does not prove the RSP followed the
+> config (the CMD-vs-RSP lag flagged in §7 is exactly the blind spot). Prefer the
+> canonical audit record for climb scoring; keep this doc as the log-marker
+> reference. Anchors below have also drifted — see the re-anchor note in §6.
+
 ## §1. Purpose & Thesis
 
 Validate the strategic claim made by the mini-Moose / Phase 0 stack
@@ -124,10 +134,10 @@ All sourced from `mercury/source/datalink_layer/`:
 
 | Regex | Source | Semantic |
 |---|---|---|
-| `\[GEARSHIFT\] SET_CONFIG: forward=(\d+) reverse=(\d+)` | `arq_commander.cc:545` | Authoritative "next config" announcement on commander |
-| `\[TURBO\] (?:SNR-)?SUPERSHIFT[^\n]*config (\d+) -> (\d+)` | `arq_commander.cc:1978,1985,3787,3794,3981,3988,4241,4255` | Fast-jump path (post-HAIL or post-reverse-turbo) |
-| `\[POLICY-MOVE\] axis=1 from=(\d+) to=(\d+) reason=ladder_up` | `arq_commander.cc:4715` | Per-block ACK-rate climb (slower than SUPERSHIFT) |
-| `\[POLICY-MOVE\] axis=1 from=(\d+) to=(\d+) reason=ladder_down` | `arq_commander.cc:4791` | Per-block ACK-rate descent |
+| `\[GEARSHIFT\] SET_CONFIG: forward=(\d+) reverse=(\d+)` | ~~`arq_commander.cc:545`~~ `arq_commander.cc:1201` (re-anchored 2026-07-01) | Authoritative "next config" announcement on commander |
+| `\[TURBO\] (?:SNR-)?SUPERSHIFT[^\n]*config (\d+) -> (\d+)` | `arq_commander.cc:1978,1985,3787,3794,3981,3988,4241,4255` [?] verify (drifted) | Fast-jump path (post-HAIL or post-reverse-turbo) |
+| `\[POLICY-MOVE\] axis=1 from=(\d+) to=(\d+) reason=ladder_up` | ~~`arq_commander.cc:4715`~~ `arq_commander.cc:8057` (re-anchored 2026-07-01) | Per-block ACK-rate climb (slower than SUPERSHIFT) |
+| `\[POLICY-MOVE\] axis=1 from=(\d+) to=(\d+) reason=ladder_down` | ~~`arq_commander.cc:4791`~~ `arq_commander.cc:8135` (re-anchored 2026-07-01) | Per-block ACK-rate descent |
 | `\[GEARSHIFT\] FRAME UP[^\n]*config (\d+)[^\n]*BREAK to (\d+)` | `arq_commander.cc:2210,3011,3181` | Frame failure → BREAK to lower config |
 
 Wall-time anchor: we inject `### CASCADE_MARK t=<epoch>` into both logs

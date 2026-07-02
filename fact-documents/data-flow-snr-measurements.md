@@ -11,6 +11,19 @@ and finds the literal swap INFEASIBLE — see §8 verdict.** Every future change
 that writes or reads either field — OR that touches `turbo_snr_ack_enabled` (the
 decode-branch selector that gates the §1.5 producer) — MUST update this document.
 
+> **ANCHOR REFRESH 2026-07-01 (registry content VALID; only line numbers drifted —
+> verified against HEAD).** The §1-§7 citations are heavily pre-drift; the §8 block
+> (written 2026-05-31) used a fresher-but-also-now-drifted set. Current HEAD sites:
+> | Symbol (doc §) | doc anchor(s) | **current HEAD** |
+> |---|---|---|
+> | §1.2 canonical producer `SNR_uplink = received_message_stats.SNR` | `arq_common.cc:6051` (§8: `:6087`) | **`arq_common.cc:12846`** (SNR_downlink `:12849`) |
+> | §1.5 CMD suffix producer `SNR_uplink = snr_uplink_from_suffix(...)` | `arq_common.cc:5555` (§8: `:5576`) | **`arq_common.cc:11875`** |
+> | §1.5/§7 `if(turbo_snr_ack_enabled)` branch in `receive_ack_pattern()` | `arq_common.cc:5516` (§8: `:5537`) | **`arq_common.cc:11836`** |
+> | §7.0 re-trigger setter `turbo_snr_ack_enabled = true` | `arq_commander.cc:4596` | **`arq_commander.cc:7594`** |
+> | §1.7 enablement `turbo_snr_ack_enabled = turbo_snr_ack_expected_on_control(...)` | `arq_commander.cc:1050` | **`arq_commander.cc:11658`** |
+>
+> Treat every other `file:line` in §1-§8 below as approximate; grep the symbol name to relocate.
+
 **The bootstrap deadlock (follow-up #1b, the §1.5 producer never ran)**: the
 §1.5 producer at `arq_common.cc:5555` runs ONLY inside
 `receive_ack_pattern()`'s `if(turbo_snr_ack_enabled)` branch
