@@ -264,3 +264,104 @@ intra-tier +1 when a SUPER-ACK recommendation is pending, so the reverse ACK sta
 long enough for the CMD to decode+leap.
 
 Smoke3 full run (240 s): 2 RSP SUPER-ACK emits (T+87, T+154; both iter=0 -> CONFIG_8), 0 CMD decodes; the session crawls the ROBUST tier 100->101->102 and never loads any WB config -- the robust +1 climb, not the SUPER-ACK, is what moves the rate here.
+
+---
+
+## §8. Robust-+1 SEQUENCING GATE (the §7.4 keystone follow-on — implemented; exposes a SIBLING)
+
+ROOT 1 (the competing climb) RESOLVED by the gate; the smoke then exposed a DISTINCT ROOT 2
+(see §8.3) so the end-to-end leap still does not land. ROOT 1 (static-trace confirmed): the CMD's OWN robust intra-tier +1
+climb and the from-ROBUST SUPER-ACK are TWO competing from-ROBUST rate levers that both fire on
+the same clean-ROBUST-ACK turnaround. The +1 changes the live config (`inband_climb_target`
+returns `proposed_frame`=`config_ladder_up` on the ROBUST tier because `allow_ofdm_elevator`
+requires `is_ofdm_config`; `arq_common.cc:3640`), which is applied via the unilateral CONFIG_TAG
+chokepoint (`[INBAND-TX] UNILATERAL CONFIG 100 -> 101`, `arq_common.cc:3458`). That config churn
+times out the reverse ACK pattern (`[CMD-ACK-PAT] Timeout`), so the CMD's SUPER-ACK decode
+(`inband_decode_superack_from_capture`, invoked in the CLEAN-ACK handler at `arq_commander.cc:4383`)
+never gets a clean reverse ACK to pull the type-6 suffix from -> no `[CMD-SUPERACK]`, no leap.
+
+### §8.1 The fix (file:line)
+- NEW predicate `superack_plus1_hold_active()` — `arq_common.cc` (after `inband_handle_superack`);
+  declared `arq.h` (after `cmd_superack_seen_parity`) with `#define SUPERACK_PLUS1_HOLD_ACKS 4`.
+  Returns true (HOLD the robust +1) iff `inband_rate_feature_enabled()` AND `narrowband_enabled
+  != YES` AND `is_robust_config(current_configuration)` AND `consecutive_data_acks <
+  SUPERACK_PLUS1_HOLD_ACKS`.
+- GATE the FRAME-UP +1 fire — `arq_commander.cc:~6436`: the climb-fire `if` now ANDs in
+  `!superack_plus1_hold_active()` (via a local `superack_hold_plus1`); a `[GEARSHIFT] robust +1
+  HELD for SUPER-ACK` diag prints when the +1 would have fired but for the hold. When held the
+  streak is NOT reset (`consecutive_data_acks` keeps accruing) so the fallback fires promptly.
+- Regression: `test_inband_superack` CASE 5 (C5a-C5f) — `arq_responder.cc`. Drives the predicate
+  across all four conjuncts + the bounded-fallback boundary (`acks>=HOLD -> RELEASE`).
+
+### §8.2 Cross-layer 5-question audit (robust-climb PRODUCER × SUPER-ACK-pending STATE × reverse-ACK CONSUMER)
+1. **Producers of the robust +1** (the state being gated = `negotiated_configuration`←robust
+   `config_ladder_up`): the FRAME-UP block (`arq_commander.cc:6513` via `inband_climb_target`) is
+   the SOLE robust-tier +1 producer. `[OPT]` optimizer owns CONFIG_6+ (not robust); the SNR
+   supershift re-trigger + turbo elevator are `is_ofdm_config`-gated (dead from ROBUST — the whole
+   SUPER-ACK premise); BREAK is a downward demote, not a +1. Verified: the smoke crawl `100->101->102`
+   is the FRAME-UP path. The unilateral chokepoint (`arq_commander.cc:1249`) merely APPLIES
+   `negotiated_configuration` (`inband_target`, `:1196`), so gating FRAME-UP stops it at source.
+2. **Consumers of the SUPER-ACK-pending window**: the CMD reverse-ACK decode
+   (`inband_decode_superack_from_capture` @ `arq_commander.cc:4383`, inside the CLEAN-ACK handler
+   `:4341`). It runs EARLIER in the poll than the FRAME-UP block (`:6436`), so with the config held
+   STABLE it reads a clean reverse ACK and lands the leap on the first/second clean turnaround.
+3. **Valid states before any producer writes**: `consecutive_data_acks` counts consecutive CLEAN
+   data ACKs at the current config (`arq_commander.cc:6408`), reset to 0 on the +1 fire (`:6534`)
+   and on a failed turnaround. Pre-first-ACK it is 0 -> hold engaged from the first ROBUST poll
+   (correct: give the SUPER-ACK a chance before any +1). The RSP emit gate is the mirror image
+   (`arq_responder.cc:2592`: `used_mfsk_path && inband_rate_feature_enabled() &&
+   is_robust_config(current)`), so the hold is active in EXACTLY the states the RSP emits.
+4. **Invariants the consumers assume** — and the gate maintains:
+   - The leap path (`inband_handle_superack`) is UNCHANGED; the gate only DEFERS a competing
+     producer, it does not touch `negotiated_configuration`/`turboshift_*`/the CONFIG_TAG cross.
+   - No double-fire: after a leap, `add_message_control(SET_CONFIG)` sets `messages_control.status
+     != FREE`, which the FRAME-UP block already requires FREE (`arq_commander.cc:6403`) -> the +1
+     block is skipped that poll anyway; and the leap moves off ROBUST so the hold self-deactivates.
+   - **CRITICAL (bounded fallback)**: a SUPER-ACK that NEVER arrives must not stall at ROBUST. After
+     `SUPERACK_PLUS1_HOLD_ACKS` clean turnarounds the hold RELEASES and the normal +1 crawl resumes
+     (C5c). A failed turnaround resets `consecutive_data_acks` -> restarts the (short) wait, which
+     is correct (a non-clean link isn't emitting a SUPER-ACK anyway).
+   - NB / off-feature / OFDM never hold (conjuncts 1-3) -> legacy + NB + OFDM-tier climbs are
+     byte-identical (no new regression surface).
+5. **What the fix changes**: adds one AND-term to the FRAME-UP fire on the ROBUST tier only. Walked
+   consumers: the OFDM climb ladder (untouched — `is_robust_config` false), the SUPER-ACK decode
+   (now reliably fed a stable reverse ACK), the demote/BREAK paths (downward, never consult the
+   hold). No shared state is mutated by the predicate (pure read of existing members).
+
+### §8.3 Leap smoke re-run (gated build md5 75803db78d8217f1967428b9fce6dbd8, WGN:40, cfg100, IR=1, pg84)
+3 cells on free cards (dltax held Loopback..Loopback_5): FIX seed1/seed2 (gated) + OLD seed1
+(pre-gate baseline e0995acef8f904107e47e4d6b655ec10), 240 s each. `mercury --test` RC=0, CASE 5
+green (0 failures).
+
+**The gate is PROVEN working (ROOT 1 removed):** FIX_s1 held the robust +1 5× (`[GEARSHIFT] robust
++1 HELD for SUPER-ACK`), pinning the config at 100 → **6** RSP SUPER-ACK emits (`[RSP-SUPERACK]
+... recommend CONFIG_8`) + **6** clean CMD ACKs, vs OLD's **3** emits / 3 clean ACKs. FIX crawled
+only 100→101 (hold slowed the +1) vs OLD 100→101→102. So the competing-climb churn is gone.
+
+**BUT the leap still does NOT land — a DISTINCT ROOT 2 (reverse-ACK turnaround / suffix-emit
+TIMING), decisively localized (FIX_s1, bsi 0):**
+- T+85.44 RSP starts the base MFSK ACK/SACK audio (`[TX-MFSK-ACK-SACK] Audio start (79424 samples)`).
+- T+86.398 CMD detects the ACK pattern EARLY (mid-burst, ~1 s before the RSP's ACK audio even
+  finishes) → `[CMD-MFSK-ACK-SACK] CLEAN bsi=0` and runs `inband_decode_superack_from_capture`
+  on its capture — which does NOT yet contain any SUPER-ACK burst (none emitted yet).
+- T+86.603 CMD → `connection_status:Transmitting data` (turns around to send the next batch;
+  STOPS capturing the reverse channel).
+- T+87.099 RSP `[TX-MFSK-ACK-SACK] Audio done`; T+87.370 RSP `[INBAND-RX] SUPER-ACK emit ...
+  burst_samples=75920` — the SUPER-ACK is a SEPARATE ~1.58 s burst emitted ~0.77 s AFTER the CMD
+  already turned around. It plays into a channel the CMD is transmitting into → never captured.
+- Result: **0** `[CMD-SUPERACK]` decodes across all clean ACKs (both FIX and OLD).
+
+ROOT 2 characterization: `inband_emit_superack` (arq_common.cc:4402) is called AFTER
+`send_mfsk_ack_sack` has already PLAYED the base ACK to completion (arq_responder.cc:2568 →
+:2611), so the "type-6 suffix on the SAME robust carrier" (design §1/§2.4 intent) is in reality a
+LATER separate transmission — and, worse, the CMD's base-ACK detector fires mid-burst and turns
+the link around BEFORE even the base ACK audio ends, so appending the suffix to the ACK burst
+alone would still miss the capture window. This is a turnaround/capture-window problem at the
+PHY/ctrl-suffix layer, NOT the ARQ climb layer §8 fixed. FIX DIRECTION (needs its own design +
+cross-layer audit + passband round-trip test, the §5 follow-on): either (a) the CMD, when on
+ROBUST with the feature on, EXTENDS its reverse capture past base-ACK detection to include the
+trailing suffix before turning around (adds bounded turnaround latency), or (b) the SUPER-ACK
+rides as a PREFIX ahead of the base ACK so it lands inside the CMD's ACK-detection window
+(risks the shipped base-ACK pattern timing — must be validated). The §8 gate is a NECESSARY
+precondition (it stabilizes the config so a fixed suffix path has clean reverse ACKs to ride) and
+SHIPS; ROOT 2 is the next keystone.

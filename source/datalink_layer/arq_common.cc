@@ -4633,6 +4633,39 @@ bool cl_arq_controller::inband_handle_superack(int skip_target_cfg, uint8_t ack_
 	return true;
 }
 
+// SUPER-ACK / robust-+1 SEQUENCING GATE (data-flow-superack.md §6.2 / §7.4 / §8) — the CMD-side
+// predicate that HOLDS the ROBUST intra-tier +1 climb while a from-ROBUST SUPER-ACK is expected,
+// so the two do not COMPETE (the §6.2 hazard, observed live §7.4). Returns true iff the FRAME-UP
+// +1 should be suppressed THIS poll. See the arq.h declaration for the full rationale.
+//
+// The four conjuncts define the SUPER-ACK window tightly (a false in ANY -> no hold):
+//   (1) inband_rate_feature_enabled(): the SUPER-ACK rides the in-band stack — off-feature the
+//       RSP never emits one, so holding the +1 would be a pure regression. Legacy byte-identical.
+//   (2) narrowband_enabled != YES: the SUPER-ACK suffix rides the WB M=16 robust ctrl layer
+//       (inband_emit_superack bails on NB / M<16, arq_common.cc:4411) — on NB none ever comes,
+//       so NB must NOT hold (no NB crawl regression).
+//   (3) is_robust_config(current_configuration): ONLY the ROBUST tier's +1 crawl competes with
+//       the SUPER-ACK. OFDM-tier climbs (turbo elevator / Q-table) are a distinct lever the
+//       SUPER-ACK does not touch -> untouched here.
+//   (4) consecutive_data_acks < SUPERACK_PLUS1_HOLD_ACKS: BOUNDED. consecutive_data_acks counts
+//       consecutive CLEAN data ACKs at the current config (arq_commander.cc:6408, reset on the
+//       +1 fire :6534 and on a failed turnaround) — so it is exactly "clean ROBUST turnarounds
+//       elapsed at this rung." Once it reaches the budget the hold RELEASES and the ordinary +1
+//       crawl fires (fallback), so a SUPER-ACK that never arrives can NEVER permanently stall
+//       the link at ROBUST. On a leap the config leaves ROBUST -> conjunct (3) deactivates it.
+bool cl_arq_controller::superack_plus1_hold_active()
+{
+	if(!inband_rate_feature_enabled())
+		return false;                                  // off-feature: byte-identical, no hold
+	if(narrowband_enabled == YES)
+		return false;                                  // NB has no M=16 SUPER-ACK carrier
+	if(!is_robust_config(current_configuration))
+		return false;                                  // OFDM-tier climbs are a distinct lever
+	if(consecutive_data_acks >= SUPERACK_PLUS1_HOLD_ACKS)
+		return false;                                  // BOUNDED: budget spent -> fall back to +1
+	return true;                                       // hold the robust +1 for the SUPER-ACK
+}
+
 // Resolve+cache N (the periodic re-announce period, >=0; 0=disabled).
 // MERCURY_INBAND_REANNOUNCE_N, default 8 (design §3.2). A negative env is treated as the
 // default; 0 disables the periodic backstop.

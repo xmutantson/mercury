@@ -6433,8 +6433,27 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// batch has no outstanding hole -> inband_climb_hole_outstanding() is false -> the
 			// climb fires immediately (2801d7c forward-climb-on-clean preserved). Legacy/flag-off:
 			// the predicate is false -> byte-identical (this AND-term is always true off-flag).
-			if(consecutive_data_acks >= eff_frame_shift_threshold &&
+			// SUPER-ACK / robust-+1 SEQUENCING GATE (data-flow-superack.md §6.2/§7.4/§8): on the
+			// ROBUST tier this +1 crawl COMPETES with the from-ROBUST SUPER-ACK — firing it here
+			// churns the live config (100->101) at the instant the RSP emits the type-6 skip,
+			// timing out the reverse ACK pattern so the suffix never decodes and the direct WB
+			// leap never lands. HOLD the +1 while a SUPER-ACK is expected so the reverse ACK stays
+			// stable long enough for inband_decode_superack_from_capture to land the leap; the hold
+			// is BOUNDED (falls back to the +1 after SUPERACK_PLUS1_HOLD_ACKS clean turnarounds, so
+			// a SUPER-ACK that never arrives can't stall the link). Off ROBUST / off in-band / NB /
+			// budget-spent -> superack_plus1_hold_active() is false and this is byte-identical.
+			bool superack_hold_plus1 = superack_plus1_hold_active();
+			if(superack_hold_plus1 && consecutive_data_acks >= eff_frame_shift_threshold &&
 			   !inband_climb_hole_outstanding())
+			{
+				printf("[GEARSHIFT] robust +1 HELD for SUPER-ACK (consecutive_acks=%d, budget=%d, "
+					"config=%d): keeping the reverse ACK stable so the type-6 skip can land\n",
+					consecutive_data_acks, SUPERACK_PLUS1_HOLD_ACKS, current_configuration);
+				fflush(stdout);
+			}
+			if(consecutive_data_acks >= eff_frame_shift_threshold &&
+			   !inband_climb_hole_outstanding() &&
+			   !superack_hold_plus1)
 			{
 				// CONTROLLED ELEVATOR from the data-anchored FRAME-UP path
 				// (REAL FAST-PROBE piece B, gearshift-climb-engine.md §14). The

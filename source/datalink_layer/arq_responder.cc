@@ -6242,6 +6242,65 @@ int cl_arq_controller::test_inband_superack()
 		delete cmd; delete ts;
 	}
 
+	// ========================================================================
+	// CASE 5 — the SUPER-ACK / robust-+1 SEQUENCING GATE (data-flow-superack.md §6.2/§7.4/§8).
+	// superack_plus1_hold_active() HOLDS the ROBUST intra-tier +1 climb while a from-ROBUST
+	// SUPER-ACK is expected, so the +1 does NOT churn the config and time out the reverse ACK
+	// (the §7.4 live blocker: the +1 fired at the instant the RSP emitted -> the type-6 suffix
+	// never decoded). The hold is BOUNDED by the consecutive-clean-ROBUST-ACK streak so a
+	// SUPER-ACK that never arrives can NEVER permanently stall the link (falls back to the +1).
+	// Scoped to ROBUST + WB + in-band; OFDM/NB/off-feature never hold (byte-identical).
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts);
+		cmd->narrowband_enabled = NO;
+
+		// (a) ROBUST tier + in-band + a fresh streak -> HOLD the +1 (the SUPER-ACK window is open).
+		cmd->current_configuration = ROBUST_0;
+		cmd->consecutive_data_acks = 0;
+		check(cmd->superack_plus1_hold_active() == true,
+			"C5a ROBUST + in-band + fresh streak -> HOLD the robust +1 (SUPER-ACK window open)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 1);
+
+		// (b) still within the budget -> still HOLD.
+		cmd->consecutive_data_acks = SUPERACK_PLUS1_HOLD_ACKS - 1;
+		check(cmd->superack_plus1_hold_active() == true,
+			"C5b within budget (acks<HOLD) -> still HOLD",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 1);
+
+		// (c) BOUNDED FALLBACK (the critical invariant): budget spent -> RELEASE so the ordinary
+		//     +1 crawl resumes -> a SUPER-ACK that never arrives can't stall the link at ROBUST.
+		cmd->consecutive_data_acks = SUPERACK_PLUS1_HOLD_ACKS;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5c budget spent (acks>=HOLD) -> RELEASE (+1 fallback; no permanent ROBUST stall)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+
+		// (d) OFDM tier -> NEVER hold (the OFDM turbo/Q-table climb is a distinct lever).
+		cmd->current_configuration = CONFIG_0;
+		cmd->consecutive_data_acks = 0;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5d OFDM config (CONFIG_0) -> no hold (OFDM-tier climbs untouched)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+
+		// (e) NB -> NEVER hold (no M=16 SUPER-ACK carrier on NB; holding would be a crawl regression).
+		cmd->current_configuration = ROBUST_0;
+		cmd->narrowband_enabled = YES;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5e NB robust -> no hold (SUPER-ACK unavailable on NB / M<16)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+		cmd->narrowband_enabled = NO;
+
+		// (f) feature OFF -> NEVER hold (byte-identical to legacy; the RSP never emits a SUPER-ACK).
+		cmd->inband_rate_enabled = 0;
+		check(cmd->superack_plus1_hold_active() == false,
+			"C5f in-band feature OFF -> no hold (legacy byte-identical)",
+			cmd->superack_plus1_hold_active() ? 1 : 0, 0);
+		cmd->inband_rate_enabled = 1;
+
+		delete cmd; delete ts;
+	}
+
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);

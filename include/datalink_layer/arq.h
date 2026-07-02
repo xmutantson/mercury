@@ -3991,6 +3991,23 @@ public:
   // the CMD dedups a re-aired SUPER-ACK across turnarounds. Init 0.
   uint8_t cmd_superack_seen_parity = 0;
 
+  // SUPER-ACK / robust-+1 SEQUENCING GATE (data-flow-superack.md §6.2 / §7.4 / §8). On the
+  // ROBUST tier the CMD's OWN intra-tier +1 climb (FRAME UP -> inband_climb_target -> the
+  // unilateral CONFIG_TAG at arq_common.cc:3458) COMPETES with the from-ROBUST SUPER-ACK:
+  // firing the +1 churns the live config (100->101) at the SAME instant the RSP emits the
+  // type-6 skip, which times out the reverse ACK pattern ([CMD-ACK-PAT] Timeout) so the
+  // suffix never decodes and the direct WB leap never lands (§7.4, observed live). This
+  // predicate HOLDS the robust +1 while a SUPER-ACK is expected — i.e. exactly when the RSP
+  // emits one (in-band on + ROBUST config + WB M=16 suffix carrier; mirror of the RSP emit
+  // gate at arq_responder.cc:2592) — keeping the config STABLE so the reverse ACK stays clean
+  // long enough for inband_decode_superack_from_capture to land the leap. BOUNDED by the
+  // consecutive-clean-ROBUST-data-ACK streak: after SUPERACK_PLUS1_HOLD_ACKS clean turnarounds
+  // with no leap the hold RELEASES and the normal +1 crawl resumes. INVARIANT: a SUPER-ACK
+  // that never arrives NEVER stalls the link at ROBUST (bounded fallback). Scoped to ROBUST +
+  // WB + in-band -> OFDM-tier climbs, NB, and legacy are byte-identical. COMMANDER-only.
+  #define SUPERACK_PLUS1_HOLD_ACKS 4
+  bool superack_plus1_hold_active();
+
   // ── STAGE 4e — D3 periodic re-announce backstop (inband-reliability-design.md §3,
   //    OD-3) ── Re-emit the CURRENT-config tag every N DATA batches independent of
   // change, HOLDING the epoch parity (NOT a change), so a desynced/late-joining peer
