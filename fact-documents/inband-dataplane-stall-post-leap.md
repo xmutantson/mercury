@@ -310,3 +310,60 @@ Per §5, compact-confirm is DESIGN-GATED off whenever the cumulative cap is nego
 manifest arm-B config (the cap and compact-confirm are mutually exclusive — the cap
 wins). Two reverse-ACK-cheap features that can never co-engage → flag as a
 design-redundancy follow-up for the owner, NOT part of this stall fix.
+
+---
+
+## §8 DATA-PLANE-SUSTAINS SMOKE (fixed binary af13507) — stall RESOLVED, EOB sibling bug EXPOSED
+
+Real-audio smoke on fleet .31 (snd-aloop Loopback_B, bridge WGN SNR3k=40, cfg100 start,
+arm `full_stack` = MERCURY_INBAND_RATE=1 + reverse-pin + tinterp + ack_slot, pg84 4096 B,
+-W WB, gearshift on). Log `logs/arq_sackdedup2_af13507.log`.
+
+### §8.1 The stall is RESOLVED (all STEP-5 sustain criteria met)
+| metric | PRE-FIX (§2 capstone TOP_B) | POST-FIX (smoke2, af13507) |
+|---|---|---|
+| cap negotiated | cap=0x05 ON | cap=0x05 ON (T+43s) — same trigger |
+| leap | ROBUST->cfg8 held | ROBUST->cfg8 held (T+84-86s) |
+| batches delivered | **1** (deliveries_total=1) | **3** (deliveries_total=3); num_batch_deliveries=4 |
+| nAcked_data | **frozen at 25** all run | **0 -> 25 -> 49 -> 62** (advances) |
+| REVSACK-CHEAPMISS escalate | 3 -> BREAK | **0** |
+| BREAKs | **3** (#1/#2/#3) | **0**; demote_events 0 |
+| active_fraction | **0.003** | **0.036** (12x; > legacy 0.042 ballpark) |
+| forward delivery | ~1 batch/600s stall, link collapses | full 4096 B delivered, wall 156.6 s |
+| climbed past ROBUST | (stalled at cfg8) | True (cfg8) |
+
+The de-dup fix does exactly what §1/§3 predicted: the partial SACKs for batches 1,2 are
+now APPLIED (not discarded as frozen-n_r duplicates), so nAcked_data advances, the missing
+frame-0 of each batch is retransmitted, each batch completes, n_r advances, and the
+REVSACK-CHEAPMISS BREAK loop never arms. The first 3288 delivered bytes (batches 0 and 1)
+are byte-PERFECT, confirming the de-dup fix is correct for every batch it governs.
+
+### §8.2 EXPOSED sibling bug — final PARTIAL batch delivered as FULL 25 frames (EOB length)
+The completed transfer HARD-FAILS byte-integrity: `byte_integrity_ok=false`,
+`good_prefix_bytes=3288`, `integrity_mismatch_bytes=813` (3 segments from offset 3288),
+`rx_bytes=4101 > tx_bytes=4096` (double-delivery, `delivered_exceeds_fed=true`).
+ROOT (RSP forward/EOB path, NOT the CMD reverse-SACK de-dup this fix touches): the FINAL
+partial batch is batch 2, which the CMD sent as `[CMD-V2-MIXBATCH] 13 new bsi=2` (13 real
+frames), yet the RSP delivered it as `[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=2 ...
+bitmap=0x01ffffff nframes=25` — a FULL 25-frame batch. The extra ~12 frames are stale
+cross-storage buffer content ("cross-storage path drained; current-batch storage
+untouched") that decompress to garbage -> the 813 corrupted tail bytes + 5-byte overage.
+The delivered frame count is set by the RSP EOB inference / `rx_buffer_batch_total_frames`
+(arq_responder.cc ~:1479) on the FORWARD data path; nothing the CMD reverse-SACK de-dup
+controls can set it. It is PRE-EXISTING, masked by the stall (pre-fix never completed a
+transfer to reach a final partial batch), and EXPOSED for the first time by this fix
+letting the plane run to completion (the exact "fixing one layer exposes a sibling bug"
+pattern, CLAUDE.md §Cross-Layer). It must be fixed BEFORE Tier-2 cumulative-ACK can ship
+default-on. Candidate area: the final-partial-batch EOB length inference + the cross-storage
+prev-delivered drain count (see --test-eob-loss-batch-truncation, [[eob_loss_batch_truncation]]).
+
+### §8.3 Secondary observation — stale prev-batch SACK now APPLIES under the cmd_batch_seq_id key (benign here)
+With the new key, a LATE `[CMD-MFSK-ACK-SACK] PARTIAL batch_seq_id=1 (cmd_batch_seq_id=3)`
+(wire bsi=1 = a stale n_r from batch-2 in-flight) is APPLIED, whereas the old raw-rx_bsi key
+de-duped it (batch 2's own partials also carried wire bsi=1, so the tracker already held 1).
+Benign in this run — batches 0/1 delivered byte-perfect and the affected current batch
+delivered CLEAN — because the bitmap maps by slot index onto an already-satisfied batch. But
+it is a latent robustness gap: a future hardening should reject a partial whose resolved
+target lies at-or-below the delivery high-water (already retired), e.g. combine the
+cmd_batch_seq_id key with a "not below n_r" guard or the (rx_bsi,bitmap) content pair.
+NOT the cause of §8.2.
