@@ -1175,6 +1175,15 @@ int main(int argc, char *argv[])
                 failed += ARQ_isr.test_idle_switch_role_race();
                 failed += ARQ_isr.test_break_noprogress_teardown();
             }
+            // MIXBATCH FILL OVER-POP -- COMPRESSION LEG regression
+            // (data-flow-mixbatch-fill.md ss9): comp-leg sibling of the no-comp
+            // over-pop -- fill-cap respects the v2 retx prefix AND the force-FREE
+            // never destroys a staged-but-unsent frame. In-process synthetic-fire
+            // (no PHY/audio), pass-after arm. DEFEAT env = fail-before.
+            {
+                cl_arq_controller ARQ_mixcmp;
+                failed += ARQ_mixcmp.test_mixbatch_fill_overpop_compressed();
+            }
             // RX-CTRL-DROP regression (data-flow-control-slot-lifecycle.md §6): the
             // messages_control one-deep mailbox had no timeout escape out of RECEIVED,
             // so a stranded slot silently dropped every later control frame and killed
@@ -1652,6 +1661,7 @@ int main(int argc, char *argv[])
                                         // freed and a later control frame lands. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE.
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
     bool test_mixbatch_fill_overpop_cli = false; // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
+    bool test_mixbatch_fill_overpop_compressed_cli = false; // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
                                         // at ROBUST_0 (max_frame==7==COMPRESS_HEADER_SIZE) with streaming compression +
                                         // a real compressible payload; asserts >0 application bytes are staged. FAILS on
@@ -2683,6 +2693,14 @@ int main(int argc, char *argv[])
             // Mixbatch fill over-pop reorder regression (one-shot, exit rc).
             // See fact-documents/data-flow-mixbatch-fill.md.
             test_mixbatch_fill_overpop_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-mixbatch-fill-overpop-compressed") == 0)
+        {
+            // Mixbatch fill COMPRESSION-leg over-pop + force-FREE data-loss
+            // regression (one-shot, exit rc). data-flow-mixbatch-fill.md ss9.
+            test_mixbatch_fill_overpop_compressed_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4510,6 +4528,15 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_mixbatch_fill_overpop();
             printf("[FLAG] Mixbatch-fill-overpop test complete (rc=%d) -- exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_mixbatch_fill_overpop_compressed_cli) {
+            printf("[FLAG] --test-mixbatch-fill-overpop-compressed: invoking\n"
+                   "       compression-leg over-pop + force-FREE data-loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_mixbatch_fill_overpop_compressed();
+            printf("[FLAG] Mixbatch-fill-overpop-compressed test complete (rc=%d) -- exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

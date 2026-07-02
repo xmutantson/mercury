@@ -1860,6 +1860,7 @@ public:
   // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
   int test_robust0_compress_deadlock();
   int test_mixbatch_fill_overpop();  // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
+  int test_mixbatch_fill_overpop_compressed();  // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
 
   // Idle SWITCH_ROLE race regression (FAILS-BEFORE evidence for the
   // connected-but-0-deliver bench bug). Drives the REAL

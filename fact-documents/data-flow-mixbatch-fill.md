@@ -45,9 +45,21 @@ and is NOT fixed here (§7.3).
 
 ## §3 The state: `messages_tx[]` new-data fill
 
-- **Producer P1 (fill)** — `process_buffer_data_commander()` no-compression leg,
-  `arq_commander.cc:~21141-21165`. Pops up to `fill_limit` frames of `max_frame`
-  bytes from `fifo_buffer_tx` and calls `add_message_tx_data()` per frame.
+- **Producer P1 (fill, NO-COMPRESSION leg)** — `process_buffer_data_commander()`
+  no-compression leg, `arq_commander.cc:~21141-21165` (pre-`§9` line refs). Pops up to
+  `fill_limit` frames of `max_frame` bytes from `fifo_buffer_tx` and calls
+  `add_message_tx_data()` per frame. **This leg is the ONLY one §5/§6 covered.**
+- **Producer P1b (fill, COMPRESSION leg)** — `process_buffer_data_commander()`
+  compression leg, entered when `compression_viable_for_batch()==true`
+  (`arq_commander.cc:20964`→`21302`, pre-`§9`). Pops a whole raw chunk from
+  `fifo_buffer_tx` into `staging`, compresses it into ONE atomic unit `comp_buf`
+  (size ≤ `batch_capacity`), then **splits `comp_buf` into `ceil(comp_size/max_frame)`
+  frames** via `add_message_tx_data()`. Unlike P1 (one FIFO frame → one message), the
+  whole batch is a SINGLE compressed unit the RX must reassemble+decompress atomically.
+  P1b was NOT in §3 before `§9`; it carried the SAME over-pop defect (see `§9`), plus a
+  destructive force-FREE loop (`arq_commander.cc:21267-21271`, pre-`§9`) that
+  unconditionally `FREE`s `messages_tx[0..DBS)` before the split — a producer that
+  DESTROYS staged-but-unsent frames (Root-A/ii data loss, `§9`).
 - **Producer P2 (slot alloc)** — `add_message_tx_data()`, `arq_commander.cc:2051-2074`.
   Writes each frame to the FIRST `FREE` `messages_tx[]` slot (ascending), sets
   `status=ADDED_TO_LIST`, `id=i`.
@@ -155,3 +167,77 @@ offset 0-4) is the re-staged delivered robust frame.
 `--test-mixbatch-fill-overpop` (env `MERCURY_MIXBATCH_OVERPOP_DEFEAT` = fail-before).
 In-process, no PHY/audio/TCP. Drives the REAL fill; reconstructs the RSP delivery order;
 asserts byte-exact contiguity. Paired with this doc per CLAUDE.md §Cross-layer regression.
+
+## §9 The COMPRESSION leg had the SAME bug — UNFIXED by §5/§6 (this change)
+
+§5/§6 fixed **only P1 (the no-compression leg)**. The compression leg (P1b, §3) was
+left with the identical over-pop plus a data-destroying force-FREE. Root cause and fix,
+per the CLAUDE.md cross-layer audit.
+
+### §9.1 Root A in the compression leg (fill over-pop, `crypto_frames`)
+`arq_commander.cc:20989` (pre-`§9`) set `int crypto_frames = data_batch_size;` and
+`batch_capacity = crypto_frames * max_frame` — sizing the compressed unit from the FULL
+batch, **never subtracting the v2 retx prefix R**. Only the ENCRYPTION path narrowed it
+(to `crypto_batch_size = radio_batch_size − retransmit_headroom`, a FIXED reservation);
+the non-encrypted path (`crypto_frames == data_batch_size`) reserved nothing. So a
+**compressed + non-encrypted + `sack_v2` batch with retx pending** could compress a unit
+that splits into up to `data_batch_size` frames, while C1 (§3 consumer) can only send
+`data_batch_size − R` new-data frames. Because a compressed unit is **ATOMIC** — the RX
+(`copy_data_to_buffer`) reassembles the whole batch's new-data payload and decompresses
+it in one shot — a unit that does not fit ONE batch is *undecodable* (worse than the
+no-comp reorder): the head frames decode to nothing/garbage and the tail is orphaned.
+
+**Why the no-comp fix (`fill_limit`) did not cover it:** the two legs stage differently.
+P1 pops N independent FIFO frames and its clamp caps N. P1b pops ONE raw chunk, compresses
+to ONE `comp_buf`, and the frame count is an *emergent* `ceil(comp_size/max_frame)` — there
+is no `fill_limit` loop to clamp; the sizing lives one layer up in `batch_capacity`. The
+`fill_limit` edit at `:~21333` is textually and structurally in the ELSE branch and never
+executes for a compressed batch.
+
+### §9.2 Root A/ii — the force-FREE destroys staged-but-unsent frames (DATA LOSS)
+`arq_commander.cc:21267-21271` (pre-`§9`): `for i in [0,DBS): if status!=FREE: status=FREE`.
+Its purpose is to clear `messages_tx` so the fresh unit's frames land at slots `0..K−1`
+contiguously (add_message_tx_data first-free). But it frees **unconditionally**, so any
+`ADDED_TO_LIST` (staged-but-unsent) or `ADDED_TO_BATCH_BUFFER` (in-flight) new-data frame
+— whose bytes were **already popped from `fifo_buffer_tx`** — is destroyed. Those bytes are
+not recoverable from the delivery path: `fifo_buffer_backup` (P3) is a config-change/BREAK
+re-frame net (`arq_commander.cc:8028` restore is reached only on config change), not a
+per-tick redelivery. So this is **DATA LOSS, not reorder**. It is reached whenever the comp
+leg re-enters `messages_tx`-dirty: the v2 mixbatch relaxation (`stage_ok` 2nd arm,
+`arq_commander.cc:20946-20947`) lets the leg run while `block_under_tx==YES` with retx
+pending, and the surplus that Root A creates sits `ADDED_TO_LIST` across that re-entry.
+
+### §9.3 The fix (one change per root; retx==0 byte-identical)
+1. **Fill-cap (Root A).** `arq_commander.cc` comp leg (`§9` `crypto_frames`): compute
+   `avail_newdata_frames = data_batch_size − min(retransmit_count, data_batch_size)` when
+   `sack_v2_enabled` (clamped ≥0), and start `crypto_frames = avail_newdata_frames` (then
+   still clamp to `crypto_batch_size` when encryption is active — strictly tighter, never
+   larger). `batch_capacity` shrinks so the compressed unit can never exceed the mixbatch's
+   new-data slots. `retransmit_count==0` (or `!sack_v2`) ⇒ `avail == data_batch_size` ⇒
+   byte-identical to pre-fix (incl. the encryption clamp order).
+2. **Force-FREE guard + non-destruction (Root A/ii).** A guard before the FIFO pop
+   (`live_newdata_staged`): if any `messages_tx` slot is `ADDED_TO_LIST` /
+   `ADDED_TO_BATCH_BUFFER`, SKIP staging this tick (`raw_size=0` ⇒ the existing no-op
+   branch; no pop, no free) — the batch clears (ACK→FREE) and the next fresh batch stages
+   the pending FIFO data. And the force-FREE loop itself now `continue`s past
+   `ADDED_TO_LIST`/`ADDED_TO_BATCH_BUFFER` (defense-in-depth). Both gated on
+   `!MERCURY_MIXBATCH_OVERPOP_DEFEAT` (the same env the no-comp leg uses ⇒ one fail-before
+   toggle for both legs). No deadlock: C1 always drains `ADDED_TO_LIST` frames, so the guard
+   clears within a batch or two.
+
+**Walk every consumer (§3):** C1 (assemble) now finds a unit sized ≤ `avail`, sends it
+whole, frees the slots each batch → P1b re-stages from slot 0 in order. C2 (RSP) receives
+a complete compressed unit per batch → decompresses byte-exact. `fifo_buffer_backup` (P3)
+push unchanged. Encryption path: for `retx==0` byte-identical; for `retx>0` it now reserves
+the ACTUAL retx prefix instead of only the fixed `retransmit_headroom` (strictly safer).
+
+### §9.4 Regression
+`--test-mixbatch-fill-overpop-compressed` (env `MERCURY_MIXBATCH_OVERPOP_DEFEAT` =
+fail-before), also run in the `mercury --test` master suite (pass-after arm). In-process,
+no PHY/audio/TCP, NON-streaming compression (each batch decodes independently). **PART A**
+drives the REAL comp leg across two mixbatch cycles, reconstructs the delivered stream via
+the REAL `cl_compressor::decompress_block()`, and asserts byte-exact no-loss (fix:
+`delivered == fed`, length `== bus1+bus2`) vs a truncated/lost unit (defeat: over-pops past
+`DBS−R`, unit-1 truncated → decode-fail → `delivered.size() != bus1+bus2`). **PART B** is a
+focused force-FREE unit: hand-stage a live `ADDED_TO_LIST` marker frame, drive a mid-batch
+re-entry, assert the marker survives (fix) vs is destroyed (defeat).
