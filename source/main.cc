@@ -1192,6 +1192,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_shrink;
                 failed += ARQ_shrink.test_batch_shrink_orphan_defer();
             }
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery
+            // (data-flow-fifo-backup.md §6.1): the delivered batch's raw survives in the
+            // backup when finalize is pre-empted (Root B), and the config-change re-stage
+            // re-sends it. ACK-confirm-keyed flush empties the backup at register_ack()
+            // when no un-confirmed data exists. Pass-after arm (DEFEAT env = fail-before).
+            {
+                cl_arq_controller ARQ_bkflush;
+                failed += ARQ_bkflush.test_backup_confirm_flush();
+            }
             // RX-CTRL-DROP regression (data-flow-control-slot-lifecycle.md §6): the
             // messages_control one-deep mailbox had no timeout escape out of RECEIVED,
             // so a stranded slot silently dropped every later control frame and killed
@@ -1564,6 +1573,10 @@ int main(int argc, char *argv[])
                                         // delivery.md) — a mid-flight data_batch_size SHRINK must not orphan RECEIVED prev
                                         // frames. Drives the REAL set_data_batch_size shrink; reconstructs the
                                         // copy_data_to_buffer prev delivery set; asserts ZERO bytes lost. DEFEAT env = fail-before.
+    bool test_backup_confirm_flush_cli = false; // --test-backup-confirm-flush: Fix C/H#1 (data-flow-fifo-backup.md
+                                        // §6.1) — the delivered batch's raw must not survive in fifo_buffer_backup when
+                                        // finalize is pre-empted (Root B). Drives register_ack ACK-confirm; asserts the
+                                        // re-stage restores NOTHING (no re-delivery) + INV3 un-confirmed never flushed. DEFEAT=fail-before.
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
@@ -2316,6 +2329,14 @@ int main(int argc, char *argv[])
             // Fix A — mid-flight data_batch_size shrink must not orphan RECEIVED
             // prev frames (baseline-double-delivery.md). One-shot, exit rc.
             test_batch_shrink_orphan_defer_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-backup-confirm-flush") == 0)
+        {
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery
+            // (data-flow-fifo-backup.md §6.1). One-shot, exit rc.
+            test_backup_confirm_flush_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4130,6 +4151,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_batch_shrink_orphan_defer();
             printf("[FLAG] Batch-shrink-orphan-defer test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_backup_confirm_flush_cli) {
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery (one-shot, exit rc).
+            printf("[FLAG] --test-backup-confirm-flush: invoking Fix C/H#1 backup "
+                   "ACK-confirm-flush re-stage double-delivery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_backup_confirm_flush();
+            printf("[FLAG] Backup-confirm-flush test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

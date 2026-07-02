@@ -84,6 +84,47 @@ void cl_arq_controller::register_ack(int message_id)
 		messages_tx[message_id].status=ACKED;
 		stats.nAcked_data++;
 	}
+	// Fix C / H#1: if this ACK completed the block (no un-confirmed data left), flush
+	// the delivered raw from fifo_buffer_backup now, before any config-change re-stage
+	// (finalize may be pre-empted by a queued SET_CONFIG / relaxed-mixbatch staging).
+	maybe_backup_confirm_flush();
+}
+
+// Fix C / H#1 (data-flow-fifo-backup.md §6.1). See the arq.h declaration for the full
+// rationale. Flushes fifo_buffer_backup at the ACK-confirm boundary IFF the backup can
+// hold ONLY already-delivered raw — i.e. there is NO un-confirmed data anywhere:
+//   - retransmit_count == 0 (no frame pending re-transmit), AND
+//   - no messages_tx[] slot is PENDING_ACK / ACK_TIMED_OUT (un-ACKed in-flight) or
+//     ADDED_TO_LIST / ADDED_TO_BATCH_BUFFER (a staged-but-unsent NEXT batch whose raw
+//     is ALSO in the backup — the relaxed-mixbatch accumulation case).
+// Under that predicate every backup byte belongs to a delivered batch, so flushing it
+// cannot lose un-confirmed data (INV3). This fixes Root B (a delivered batch re-staged
+// on a SUPER-ACK/turboshift SET_CONFIG leap) and, whenever a lossy run momentarily
+// fully-confirms, empties the accumulated backup (bounds H#1). NOTE (scoped residual):
+// a SUSTAINED, UNBROKEN loss run keeps retransmit_count>0 so this never fires mid-run;
+// removing an individual delivered batch's raw WHILE other batches are still un-confirmed
+// needs per-batch raw framing (data-flow-fifo-backup.md §6.3) and is a deliberate
+// follow-on — a byte-offset flush there risks dropping interleaved un-confirmed raw
+// (worse than the bug), so it is intentionally not attempted here.
+void cl_arq_controller::maybe_backup_confirm_flush()
+{
+	{ const char* e = std::getenv("MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return; }          // fail-before: leave delivered raw in the backup
+	if(role != COMMANDER)                 return;
+	int backup_occupancy = fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	if(backup_occupancy <= 0)             return;   // nothing staged
+	if(retransmit_count != 0)             return;   // un-confirmed retx pending -> its raw is in the backup
+	for(int i=0; i<this->nMessages; i++)
+	{
+		int s = messages_tx[i].status;
+		if(s==PENDING_ACK || s==ACK_TIMED_OUT || s==ADDED_TO_LIST || s==ADDED_TO_BATCH_BUFFER)
+			return;                                 // un-confirmed data present -> NOT safe to whole-flush
+	}
+	printf("[CMD-BACKUP-CONFIRM-FLUSH] block ACK-confirmed (no unconfirmed frames, retx=0) — "
+		"flushing %d B delivered raw from backup to prevent re-stage double-delivery (Fix C/H#1)\n",
+		backup_occupancy);
+	fflush(stdout);
+	fifo_buffer_backup.flush();
 }
 
 // Phantom-ACK content gate — DSP half (2026-05-29). Peek the current passband
@@ -15819,6 +15860,125 @@ int cl_arq_controller::test_mixbatch_fill_overpop_compressed()
 
 	deinit_messages_buffers();
 	printf("[TEST-MIXFILL-CMP] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
+}
+
+// ===========================================================================
+// Fix C / H#1 — fifo_buffer_backup re-stage DOUBLE-DELIVERY (data-flow-fifo-backup.md §6.1)
+//
+// CLI: --test-backup-confirm-flush   (env MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT=1 reverts
+//                                     the fix on the SAME binary)
+//
+// THE BUG (channel-free, pure CMD TX state): fifo_buffer_backup holds the raw source of
+// the in-flight batch so a config change (turboshift/SET_CONFIG leap, gearshift-down,
+// watchdog) can re-stage + re-encode it at the new config. Its ONLY steady-state flush is
+// finalize_block_commander(), which is SKIPPED when a control frame is queued in the SAME
+// poll the last data frame ACKs (Root B: a SUPER-ACK/turboshift SET_CONFIG). The DELIVERED
+// batch's raw then survives in the backup and the config-change re-stage (a whole-backup
+// pop -> push to fifo_buffer_tx) re-sends it -> the RSP delivers it a SECOND time
+// (byte_integrity_ok=FALSE, +N phantom tail).
+//
+// Fix: maybe_backup_confirm_flush() at the register_ack() ACK-confirm chokepoint flushes
+// the backup the instant the block is fully confirmed -- but ONLY when NO un-confirmed
+// data exists anywhere (no PENDING_ACK/ACK_TIMED_OUT/ADDED_TO_LIST/ADDED_TO_BATCH_BUFFER
+// frame + retransmit_count==0), so the backup holds only delivered raw and flushing it
+// can never drop un-confirmed data (INV3).
+//
+// PART A drives register_ack() to confirm a delivered 1-frame batch with a control frame
+// queued (finalize pre-empted, Root B), then models the config-change re-stage (whole-
+// backup pop) and asserts it restores NOTHING (fix) vs the delivered raw (defeat = the
+// re-delivery). PART B/C are INV3 guards: with a still-un-confirmed frame (B) or a pending
+// retransmit (C) the backup is NEVER flushed (both arms).
+//
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_backup_confirm_flush()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-BACKUP-FLUSH] start (MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-BACKUP-FLUSH] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-BACKUP-FLUSH] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	role          = COMMANDER;
+	original_role = COMMANDER;
+	nMessages     = 120;
+	int alloc_rc  = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C0 buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+
+	const int RAW = 141;               // one delivered frame's raw payload
+	char raw[RAW];
+	for(int k=0;k<RAW;k++) raw[k] = (char)(unsigned char)(k & 0xFF);
+	// cl_fifo_buffer::get_size() is the CAPACITY; occupancy = get_size()-get_free_size().
+	auto occ = [&]() -> int {
+		return fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	};
+
+	auto stage_one = [&](int slot, int frame_status){
+		for(int i=0;i<nMessages;i++){ messages_tx[i].status=FREE; messages_tx[i].length=0; }
+		fifo_buffer_backup.flush();
+		fifo_buffer_backup.push(raw, RAW);             // the batch's raw source
+		messages_tx[slot].status = frame_status;
+		messages_tx[slot].length = RAW;
+		messages_tx[slot].id     = slot;
+	};
+
+	// ---- PART A: delivered batch, control queued (Root B) -> confirm-flush empties backup ----
+	stage_one(0, PENDING_ACK);
+	retransmit_count        = 0;
+	messages_control.status = PENDING_ACK;   // a queued SET_CONFIG-like control -> finalize would be SKIPPED
+	register_ack(0);                          // last frame ACKs -> maybe_backup_confirm_flush() fires
+	int backup_after = occ();
+	// Model the config-change re-stage: a whole-backup pop into fifo_buffer_tx (the buggy path).
+	char rbuf[4096];
+	int restored = fifo_buffer_backup.pop(rbuf, (int)sizeof(rbuf));
+	printf("[TEST-BACKUP-FLUSH] PART A backup_after_confirm=%d re-stage_restored=%d (RAW=%d)\n",
+		backup_after, restored, RAW);
+	fflush(stdout);
+	if(!defeat){
+		check(backup_after == 0,
+			"A1 backup flushed at ACK-confirm (delivered raw removed)", backup_after, 0);
+		check(restored == 0,
+			"A2 config-change re-stage restores NOTHING (no re-delivery)", restored, 0);
+	} else {
+		check(backup_after == RAW,
+			"A1 fail-before leaves delivered raw in backup (vacuity guard)", backup_after, RAW);
+		check(restored == RAW,
+			"A2 fail-before re-stage RE-DELIVERS the delivered raw (the bug)", restored, RAW);
+	}
+
+	// ---- PART B: INV3 -- a still-un-confirmed frame keeps the backup intact (both arms) ----
+	stage_one(1, PENDING_ACK);
+	messages_tx[2].status = PENDING_ACK;      // a SECOND frame that stays un-confirmed
+	messages_tx[2].length = RAW;
+	retransmit_count        = 0;
+	messages_control.status = FREE;
+	register_ack(1);                          // ACK frame1; frame2 still PENDING -> NO flush
+	int backup_b = occ();
+	check(backup_b == RAW,
+		"B1 INV3: backup NOT flushed while a frame is still un-confirmed", backup_b, RAW);
+
+	// ---- PART C: INV3 -- a pending retransmit keeps the backup intact (both arms) ----
+	stage_one(0, PENDING_ACK);
+	retransmit_count = 1;                      // retx pending -> its raw is (conceptually) in the backup
+	register_ack(0);                           // frame0 ACKs but retx pending -> NO flush
+	int backup_c = occ();
+	check(backup_c == RAW,
+		"C1 INV3: backup NOT flushed while a retransmit is pending", backup_c, RAW);
+	retransmit_count = 0;
+
+	deinit_messages_buffers();
+	printf("[TEST-BACKUP-FLUSH] %s: fails=%d (defeat=%d)\n",
 		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
 	fflush(stdout);
 	return failed==0 ? 0 : 1;

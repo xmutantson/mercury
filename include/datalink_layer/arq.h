@@ -778,6 +778,20 @@ public:
   void process_control_commander();
   void process_buffer_data_commander();
   void finalize_block_commander();
+  // Fix C / H#1 (data-flow-fifo-backup.md §6.1): ACK-confirm-keyed backup flush.
+  // finalize_block_commander() is the normal backup flush but it is SKIPPED whenever a
+  // control frame is queued (a SUPER-ACK/turboshift SET_CONFIG queued in the SAME poll
+  // the last data frame ACKs — Root B) or new-data is staged, so the delivered batch's
+  // raw survives in fifo_buffer_backup and the config-change re-stage re-sends it
+  // (double-delivery; the backup also ACCUMULATES delivered raw across a lossy run).
+  // This flushes the backup at the TRUE ACK-confirm boundary, but ONLY when there is
+  // ZERO un-confirmed data anywhere (no PENDING_ACK/ACK_TIMED_OUT/ADDED_TO_LIST/
+  // ADDED_TO_BATCH_BUFFER frame and retransmit_count==0) so the backup can hold only
+  // already-delivered raw — INV3 (never drop un-confirmed) is preserved by construction.
+  // Idempotent (finalize's later flush is a no-op). MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT=1
+  // reverts on the SAME binary (the fail-before arm reproduces the re-stage re-delivery).
+  void maybe_backup_confirm_flush();
+  int test_backup_confirm_flush();  // --test-backup-confirm-flush: Fix C/H#1 re-stage double-delivery regression
 
   // SACK Design A Step 9 — Multi-axis policy framework, Axis 1 entry point.
   //
