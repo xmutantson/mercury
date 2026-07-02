@@ -4191,8 +4191,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								bool duplicate = !sack_clean_confirmation_accepted(
 									dedup_bsi, is_clean_confirmation,
 									cmd_last_applied_clean_bsi, cmd_last_applied_sack_bsi);
+								// Sanity 4 (stale-partial FALSE-ACK guard,
+								// data-flow-inband-dataplane-stall-post-leap.md §8.3): a PARTIAL's bitmap
+								// applies BY SLOT INDEX to exactly the batch it describes (the contiguous
+								// successor n_r+1). Under the cap the window gate (Sanity 1) admits a report
+								// whose frozen n_r merely lands in prev_bsi's backward self-heal window, and
+								// the cmd_batch_seq_id de-dup key (Sanity 3) does NOT catch a LATE-decoded
+								// straggler (MW late-window, :4265) from a PRIOR in-flight batch -> a batch-k
+								// partial arriving after the CMD advanced to k+1 would FALSE-APPLY its batch-k
+								// bitmap to k+1's PENDING_ACK frames (they never retransmit -> silent loss).
+								// Accept the PARTIAL apply iff its resolved target (n_r+1) IS the current
+								// in-flight batch (cmd_bsi). CLEAN confirmations ride the cumulative self-heal
+								// (batches <= n_r) and are NEVER subject to this (is_clean short-circuits).
+								// Cap OFF -> partial_sack_target_is_inflight() returns true (byte-identical).
+								bool partial_target_ok = is_clean_confirmation
+									|| partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
+										cumulative_ack_enabled);
 
-							if(bsi_in_window && bitmap_ok && !duplicate)
+							if(bsi_in_window && bitmap_ok && !duplicate && partial_target_ok)
 							{
 								if(is_clean_confirmation)
 								{
@@ -4270,12 +4286,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								// OFDM path on the same poll.
 								SACK_TRACE("MFSK-ACK-SACK decoded but rejected: "
 									"rx_bsi=%u cmd_bsi=%u prev_bsi=%u bitmap=0x%08x "
-									"in_window=%d bitmap_ok=%d duplicate=%d",
+									"in_window=%d bitmap_ok=%d duplicate=%d target_ok=%d",
 									(unsigned)rx_bsi, cmd_bsi, prev_bsi,
 									(unsigned)rx_bitmap,
 									bsi_in_window ? 1 : 0,
 									bitmap_ok ? 1 : 0,
-									duplicate ? 1 : 0);
+									duplicate ? 1 : 0,
+									partial_target_ok ? 1 : 0);
 							}
 						}
 						} // end if(!mfsk_handled_this_poll) — fix-b compact pre-check skips the 13-uncoded decode
@@ -4401,6 +4418,24 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								fflush(stdout);
 								decoded = false;
 							}
+						}
+						// Stale-partial FALSE-ACK guard (data-flow-inband-dataplane-stall-post-leap.md
+						// §8.3): the SACK_RSP bitmap applies BY SLOT INDEX to exactly the batch it
+						// describes — the contiguous successor n_r+1. A LATE-decoded straggler from a
+						// PRIOR in-flight batch passes the OOW/backward-window check above (its n_r covers
+						// prev_bsi) and is NOT a de-dup hit (the cmd_batch_seq_id key is fresh), so its
+						// bitmap would FALSE-ACK the current batch's frames by slot index (they never
+						// retransmit -> silent loss). Discard iff its resolved target (n_r+1) is NOT the
+						// current in-flight batch (cmd_bsi). Cap OFF -> always in-flight -> inert
+						// (byte-identical). Same guard as the MFSK partial path (:4424).
+						if(decoded && !partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
+							cumulative_ack_enabled))
+						{
+							printf("[CMD-SACK-V2-STALE] rx_bsi=%u resolves to batch %u != in-flight cmd_bsi=%d "
+								"— discarding stale partial (treat as CRC fail)\n",
+								(unsigned)rx_bsi, ((unsigned)rx_bsi + 1u) & 0xFFu, cmd_batch_seq_id & 0xFF);
+							fflush(stdout);
+							decoded = false;
 						}
 						// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
 						// §3): the OFDM SACK_RSP transport ALSO carries the frozen n_r under the cap and
@@ -11431,6 +11466,56 @@ int cl_arq_controller::test_climb_engine()
 	check(padk_l0 == 10 && padk_l1 == 11,
 		"AP4 cap-OFF legacy per-batch key unchanged (10,11)",
 		padk_l0 * 100 + padk_l1, 1011);
+
+	// ================================================================
+	// Part A'' — STALE-PARTIAL FALSE-ACK guard (data-flow-inband-dataplane-stall-
+	// post-leap.md §8.3), the sibling the night de-dup key OPENED. A PARTIAL's
+	// bitmap applies BY SLOT INDEX to the batch it describes = the contiguous
+	// successor n_r+1. A batch-k partial LATE-decoded (MW late-window) AFTER the
+	// CMD advanced to k+1 (a) PASSES the window gate (its n_r=k-1 covers prev_bsi
+	// via the overhang-1 arm) and (b) is NOT a de-dup hit (the cmd_batch_seq_id
+	// key = k+1 is fresh) — so partial_sack_target_is_inflight is the SOLE guard
+	// standing between it and a FALSE ACK of k+1's frames (their retransmit is
+	// suppressed -> silent loss). -DCUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE pins
+	// the predicate to accept (reproduces the false-ACK -> AP5 FAILS).
+	// ================================================================
+	const int K = 7;   // stale partial describes batch k=K (its wire n_r = K-1)
+	// AP5a — the CURRENT-batch partial (target n_r+1 == cmd_bsi) is ACCEPTED: the
+	// stall fix ("partials for the CURRENT batch still apply") is PRESERVED. This
+	// also covers the frozen-n_r stall itself (cmd_bsi = n_r+1 there too).
+	bool ap5a = partial_sack_target_is_inflight(/*rx_bsi=n_r*/K-1, /*cmd_batch_seq_id*/K, /*cap_on*/true);
+	check(ap5a == true,
+		"AP5a current-batch PARTIAL (target n_r+1 == cmd_bsi) ACCEPTED (stall fix preserved)",
+		ap5a ? 1 : 0, 1);
+	// AP5b — PROVE the guard is load-bearing: the window gate ADMITS the stale
+	// batch-k partial at cmd=k+1 (its n_r=K-1 covers prev_bsi=K via the succ arm)…
+	bool ap5b_win =
+		cumulative_ack_covers(/*rx_n_r=*/K-1, /*target cmd_bsi=*/K+1, /*cap*/true, /*pb*/false)
+		|| cumulative_ack_covers(/*rx_n_r=*/K-1, /*target prev_bsi=*/K, /*cap*/true, /*pb*/false);
+	check(ap5b_win == true,
+		"AP5b window gate ADMITS the stale partial (guard must be the target check)",
+		ap5b_win ? 1 : 0, 1);
+	// …and the de-dup does NOT catch it (cmd_batch_seq_id key = k+1 is fresh vs a
+	// tracker holding the earlier batch-k key).
+	int  ap5_key = partial_sack_dedup_key(/*rx_bsi*/K-1, /*cmd_batch_seq_id*/K+1, /*cap_on*/true);
+	bool ap5b_notdup = sack_clean_confirmation_accepted(
+		ap5_key, /*is_all_ones=*/false, /*clean=*/-1, /*sack tracker=batch-k key*/K);
+	check(ap5b_notdup == true,
+		"AP5b' de-dup does NOT catch the stale partial (cmd-key fresh)",
+		ap5b_notdup ? 1 : 0, 1);
+	// AP5 (THE assertion) — the stale batch-k partial arriving at cmd=k+1 is
+	// REJECTED by the target guard (n_r+1 = K != cmd_bsi = K+1). FAIL-BEFORE
+	// (pinned accept) would apply it -> false-ACK k+1's frames.
+	bool ap5 = partial_sack_target_is_inflight(/*rx_bsi=n_r*/K-1, /*cmd_batch_seq_id*/K+1, /*cap_on*/true);
+	check(ap5 == false,
+		"AP5 stale batch-k PARTIAL at cmd=k+1 REJECTED (no false-ACK of k+1 frames)",
+		ap5 ? 1 : 0, 0);
+	// AP5c — cap OFF: the guard is INERT (legacy window+de-dup fence it) -> the
+	// same stale-shaped inputs return true (byte-identical, no behavior change).
+	bool ap5c = partial_sack_target_is_inflight(K-1, K+1, /*cap_on*/false);
+	check(ap5c == true,
+		"AP5c cap-OFF stale-partial guard INERT (byte-identical)",
+		ap5c ? 1 : 0, 1);
 
 	// ================================================================
 	// Part B — Bug 2/3: keep batch=1 at robust. Drive the REAL

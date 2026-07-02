@@ -1640,6 +1640,50 @@ public:
 #endif
   }
 
+  // ── FORGIVING-ACK Tier-2 STALE-PARTIAL FALSE-ACK GUARD ────────────────────
+  // (data-flow-inband-dataplane-stall-post-leap.md §8.3). The companion to
+  // partial_sack_dedup_key, closing the latent robustness gap that key OPENED.
+  // A PARTIAL's 30-bit selective bitmap is applied BY SLOT INDEX to the in-flight
+  // batch, so it describes EXACTLY ONE batch: the contiguous successor n_r+1
+  // (cumulative_ack_covers arm b — Mercury is batch-level stop-and-wait, so the
+  // only batch above the delivery high-water n_r is n_r+1). Under the cap the
+  // window gate (bsi_in_window, arq_commander.cc:4384-4392) ADMITS any report
+  // whose frozen n_r merely lands in the bounded backward self-heal window of
+  // cmd_bsi OR prev_bsi — CORRECT for a CLEAN cumulative delivery confirmation
+  // (arm a retires batches <= n_r) but NOT a discriminator of which batch a
+  // PARTIAL bitmap targets. Since the night stall fix keys the partial de-dup on
+  // the in-flight batch identity (cmd_batch_seq_id), a STALE partial for batch k,
+  // LATE-decoded (MW late-window re-decode, arq_commander.cc:4265) AFTER the CMD
+  // advanced to k+1, is NOT a duplicate (cmd-key is k+1, fresh) and its n_r=k-1
+  // still satisfies the backward window — so its batch-k bitmap would be
+  // FALSE-APPLIED by slot index to k+1's PENDING_ACK frames, a FALSE ACK that
+  // suppresses their retransmit (silent data loss; §8.3 latent gap). This is the
+  // missing PARTIAL-ONLY validation: accept the bitmap apply iff the batch it
+  // describes (n_r+1) IS the current in-flight batch (cmd_bsi). A legit current
+  // partial ALWAYS satisfies this (n_r = cmd_bsi-1: the high-water is the batch
+  // just below the in-flight one), INCLUDING the frozen-n_r stall the night fix
+  // targets (there cmd_bsi = n_r+1 too), so the stall fix is fully preserved.
+  // Cap OFF: the wire bsi IS the per-batch identity and the legacy {cmd_bsi,
+  // prev_bsi} window + per-batch de-dup already fence it -> return true
+  // UNCONDITIONALLY (byte-identical; the whole non-Tier-2 fleet + every existing
+  // test stay bit-for-bit). Does NOT touch the wire encoding, the de-dup key, or
+  // cumulative_ack_covers' backward self-heal (CLEAN confirmations still ride it).
+  // PURE + static so --test-climb-engine drives the EXACT production decision.
+  // -DCUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE pins accept (reproduces the false-ACK)
+  // so the regression fails-before / passes-after in the SAME binary.
+  static bool partial_sack_target_is_inflight(int rx_bsi, int cmd_batch_seq_id, bool cap_on)
+  {
+#ifdef CUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE
+    (void)rx_bsi; (void)cmd_batch_seq_id; (void)cap_on;
+    return true;                                 // FAIL-BEFORE: no stale-partial discard (the false-ACK).
+#else
+    if(!cap_on) return true;                     // cap OFF: legacy window+de-dup fence it (byte-identical)
+    unsigned succ    = ((unsigned)(rx_bsi & 0xFF) + 1u) & 0xFFu;  // batch the bitmap describes (n_r+1)
+    unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
+    return succ == cmd_bsi;                       // apply iff that batch IS the in-flight batch
+#endif
+  }
+
   // R039 (race audit 2026-06-06): the SACK-v2 accept "window" check. A decoded
   // SACK_RSP's rx_bsi must be the current or just-prior CMD batch (mod 256),
   // because RSP only ACKs frames whose batch_seq_id is one of those. The OFDM
