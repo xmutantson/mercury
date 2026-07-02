@@ -1184,6 +1184,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_mixcmp;
                 failed += ARQ_mixcmp.test_mixbatch_fill_overpop_compressed();
             }
+            // Fix A — mid-flight data_batch_size SHRINK must not orphan RECEIVED prev
+            // frames (baseline-double-delivery.md): drives the REAL set_data_batch_size
+            // shrink; reconstructs the copy_data_to_buffer prev delivery set; asserts
+            // ZERO delivered bytes lost. Pass-after arm (DEFEAT env = fail-before).
+            {
+                cl_arq_controller ARQ_shrink;
+                failed += ARQ_shrink.test_batch_shrink_orphan_defer();
+            }
             // RX-CTRL-DROP regression (data-flow-control-slot-lifecycle.md §6): the
             // messages_control one-deep mailbox had no timeout escape out of RECEIVED,
             // so a stranded slot silently dropped every later control frame and killed
@@ -1552,6 +1560,10 @@ int main(int argc, char *argv[])
     bool test_batch_shrink_strands_prev_cli = false; // --test-batch-shrink-strands-prev: R035 — data_batch_size
                                         // shrink strands the active prev. Drives the REAL set_data_batch_size chokepoint;
                                         // asserts prev counters re-derived (gate reachable) + streaming defense on orphan. One-shot, exits rc.
+    bool test_batch_shrink_orphan_defer_cli = false; // --test-batch-shrink-orphan-defer: Fix A (baseline-double-
+                                        // delivery.md) — a mid-flight data_batch_size SHRINK must not orphan RECEIVED prev
+                                        // frames. Drives the REAL set_data_batch_size shrink; reconstructs the
+                                        // copy_data_to_buffer prev delivery set; asserts ZERO bytes lost. DEFEAT env = fail-before.
     bool test_retx_clear_on_recovery_cli = false; // --test-retx-clear-on-recovery: R029 — stale retx queue
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
@@ -2296,6 +2308,14 @@ int main(int argc, char *argv[])
             // one-shot at startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.3 / §5.2.
             test_batch_shrink_strands_prev_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batch-shrink-orphan-defer") == 0)
+        {
+            // Fix A — mid-flight data_batch_size shrink must not orphan RECEIVED
+            // prev frames (baseline-double-delivery.md). One-shot, exit rc.
+            test_batch_shrink_orphan_defer_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4100,6 +4120,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_batch_shrink_strands_prev();
             printf("[FLAG] Batch-shrink-strands-prev test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_batch_shrink_orphan_defer_cli) {
+            // Fix A — mid-flight shrink orphan-defer (one-shot, then exit rc).
+            printf("[FLAG] --test-batch-shrink-orphan-defer: invoking Fix A "
+                   "batch-shrink orphan zero-loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_orphan_defer();
+            printf("[FLAG] Batch-shrink-orphan-defer test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

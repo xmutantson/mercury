@@ -735,6 +735,7 @@ cl_arq_controller::cl_arq_controller()
 	rsp_prev_batch_expected_count=0;
 	rsp_prev_batch_delivered_count=0;
 	rsp_prev_batch_stale_count=0;
+	rsp_deferred_batch_shrink=-1;   // Fix A (baseline-double-delivery.md): no deferred orphan-avoiding shrink pending
 	// SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
 	// All CMD-side; gated on sack_v2_enabled at the call sites. Ring + counters
 	// + cooldown all start at zero. v1 sessions leave these untouched.
@@ -1222,6 +1223,66 @@ void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
 	rsp_prev_batch_expected_count = new_expected;
 }
 
+// Fix A (baseline-double-delivery.md §1/§7): a mid-flight data_batch_size SHRINK
+// must NEVER orphan already-RECEIVED prev-batch frames. The prev batch is delivered
+// bounded by the LIVE data_batch_size (copy_data_to_buffer, arq_common.cc:13746;
+// frame-driven prev-deliver loop, arq_responder.cc:1309), so a shrink from old->new
+// while a prev batch holds RECEIVED slots in [new,old) drops those real, in-order
+// user bytes -> a silent HOLE in the delivered app stream (the "double-delivery"/
+// +301% misnomer). The Axis-2 down-move + robust-dwell revert both hit this via
+// set_data_batch_size(). ROOT FIX: DEFER the shrink while it would orphan RECEIVED
+// prev data — keep data_batch_size at the old (larger) value so the prev delivers
+// its full framed span — and apply the deferred target the instant the prev clears
+// (rsp_apply_deferred_batch_shrink). Keeping data_batch_size larger is strand-safe:
+// bump_bsi_and_transfer_prev freezes prev_expected from the D5 wired per-batch count
+// clamped to data_batch_size (arq_common.cc:9824-9831), so a later prev still expects
+// the TRUE frame count, never the stale-large size. Env MERCURY_BATCHSHRINK_ORPHAN_
+// DEFEAT=1 reverts to the orphaning shrink on the SAME binary (the fail-before arm).
+bool cl_arq_controller::defer_shrink_if_would_orphan_prev(int target)
+{
+	{ const char* e = std::getenv("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return false; }   // fail-before: apply the orphaning shrink
+	if(!sack_v2_enabled)         return false;
+	if(!rsp_prev_batch_active)   return false;
+	if(messages_rx_prev == NULL) return false;
+	int old_batch = this->data_batch_size;
+	if(target >= old_batch)      return false;     // not a shrink -> nothing to orphan
+	int orphaned = 0;
+	for(int i = target; i < old_batch && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) orphaned++;
+	if(orphaned <= 0)            return false;      // shrink is safe (no RECEIVED in [new,old))
+	// DEFER: hold data_batch_size at old_batch; remember the requested target.
+	rsp_deferred_batch_shrink = target;
+	printf("[RSP-V2-SHRINK-DEFER] deferring data_batch_size %d->%d: prev bsi=%d active would "
+		"orphan %d already-RECEIVED slot(s) in [%d,%d) — held until prev delivers (Fix A)\n",
+		old_batch, target, rsp_prev_batch_seq_id, orphaned, target, old_batch);
+	fflush(stdout);
+	return true;
+}
+
+// Fix A: apply a shrink that was deferred by defer_shrink_if_would_orphan_prev(),
+// the instant the prev batch has delivered/cleared (rsp_prev_batch_active==false).
+// Called from the prev-deliver completion sites. Idempotent / no-op when nothing is
+// pending or the prev is still active (keep holding). Re-enters set_data_batch_size()
+// with the prev now inactive, so the defer helper returns false and the shrink applies
+// cleanly through the normal chokepoint (rescan is a no-op with no active prev).
+void cl_arq_controller::rsp_apply_deferred_batch_shrink()
+{
+	if(rsp_deferred_batch_shrink < 0) return;
+	if(rsp_prev_batch_active)         return;   // still active -> keep the deferred target
+	int t = rsp_deferred_batch_shrink;
+	rsp_deferred_batch_shrink = -1;
+	// Stale-guard: a later set_data_batch_size() may have already reduced the size
+	// at/below the deferred target while the prev was still holding. Only apply the
+	// deferred value if it is STILL a genuine shrink; otherwise discard it (never
+	// GROW data_batch_size back up from a stale deferred target).
+	if(t >= this->data_batch_size) return;
+	printf("[RSP-V2-SHRINK-APPLY] applying deferred data_batch_size shrink -> %d "
+		"(prev batch cleared; Fix A)\n", t);
+	fflush(stdout);
+	set_data_batch_size(t);
+}
+
 // R029 (race audit 2026-06-06): the single owner of zeroing the TX retransmit
 // queue. See the arq.h declaration for the full rationale. Called from every
 // messages_tx[]-freeing recovery site; idempotent (count already 0 -> no-op log
@@ -1332,6 +1393,11 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 				current_configuration, data_batch_size, clamped, lo, hi);
 			fflush(stdout);
 		}
+		// Fix A (baseline-double-delivery.md): if this shrink would orphan already-
+		// RECEIVED prev-batch frames, DEFER it (keep the old size so the prev delivers
+		// its full span) — applied once the prev clears. Returns early on defer:
+		// data_batch_size is unchanged so the ACK timeout below stays correct too.
+		if(defer_shrink_if_would_orphan_prev(clamped)) return;
 		// R035: re-derive an active prev-batch's counters against the new (smaller)
 		// batch BEFORE updating data_batch_size (robust-dwell revert 8->1 is a shrink).
 		rescan_prev_on_batch_shrink(clamped);
@@ -1357,6 +1423,11 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 			target = data_batch_size;
 		else
 			target = (max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
+		// Fix A (baseline-double-delivery.md): defer an orphaning shrink (see the
+		// robust branch above) — the Axis-2 down-move 25->20 mid-partial-batch is the
+		// exact repro. Held until the prev delivers, then applied via
+		// rsp_apply_deferred_batch_shrink().
+		if(defer_shrink_if_would_orphan_prev(target)) return;
 		// R035: re-derive an active prev-batch's counters against the new (smaller)
 		// batch BEFORE updating data_batch_size (Axis-2 down-move 15->10 is a shrink).
 		rescan_prev_on_batch_shrink(target);
@@ -5092,6 +5163,8 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 	printf("[RSP-V2-PREBREAK-DELIVERED] prev_batch_seq_id=%d delivered before BREAK "
 		"(last_delivered=%d)\n", rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id);
 	fflush(stdout);
+	// Fix A (baseline-double-delivery.md): prev delivered -> apply any deferred shrink.
+	rsp_apply_deferred_batch_shrink();
 	return 1;
 }
 
@@ -5692,6 +5765,7 @@ int cl_arq_controller::deinit_messages_buffers()
 	rsp_prev_batch_active=false;
 	rsp_prev_batch_received_count=0;
 	rsp_prev_batch_expected_count=0;
+	rsp_deferred_batch_shrink=-1;   // Fix A: drop any pending deferred shrink on re-init
 
 	if(messages_batch_ack!=NULL)
 	{

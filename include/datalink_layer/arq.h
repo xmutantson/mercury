@@ -422,6 +422,15 @@ public:
   // leg). `new_batch` is the post-clamp value about to be stored. See
   // data-flow-arq-recovery-cluster.md §4.3 / §5.2.
   void rescan_prev_on_batch_shrink(int new_batch);
+  // Fix A (baseline-double-delivery.md): apply a data_batch_size shrink that was
+  // DEFERRED because it would have orphaned already-RECEIVED prev-batch frames.
+  // No-op unless a shrink is pending AND the prev batch is now inactive.
+  void rsp_apply_deferred_batch_shrink();
+  // Fix A: if shrinking data_batch_size to `target` would orphan already-RECEIVED
+  // prev-batch frames in [target,old), record the deferred target and return true
+  // (caller must NOT apply the shrink now). Returns false (apply as normal) when
+  // there is no active prev, no orphan, it is not a shrink, or the env defeat is set.
+  bool defer_shrink_if_would_orphan_prev(int target);
   // R029 (race audit 2026-06-06) — the SINGLE owner of zeroing the TX retransmit
   // queue. The retransmit_frames[] / retransmit_count parallel arrays hold frames
   // captured (and, under encryption, byte-encoded) for the LIVE crypto epoch +
@@ -2976,6 +2985,17 @@ public:
   // Returns 0=PASS, 1=FAIL.
   int test_batch_shrink_strands_prev();
 
+  // Fix A (baseline-double-delivery.md) — a mid-flight data_batch_size SHRINK must
+  // never orphan already-RECEIVED prev-batch frames (silent user-byte loss / HOLE).
+  // CLI: --test-batch-shrink-orphan-defer. Drives the REAL set_data_batch_size()
+  // shrink through the chokepoint with a prev batch holding RECEIVED slots in
+  // [new,old), then RECONSTRUCTS the copy_data_to_buffer() delivery set (the exact
+  // [0,data_batch_size) bound) and asserts ZERO delivered bytes lost/reordered.
+  // MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1 reverts the fix on the SAME binary
+  // (fail-before: the shrink applies and the orphaned tail bytes are dropped).
+  // Returns 0=PASS, 1=FAIL.
+  int test_batch_shrink_orphan_defer();
+
   // R029 (race audit 2026-06-06) — stale-retx-queue-cleared-on-recovery test.
   // CLI: --test-retx-clear-on-recovery. Populates retransmit_count>0 with a known
   // OLD bsi, calls the REAL clear_retx_queue() (the single owner every recovery
@@ -3414,6 +3434,14 @@ public:
                                          //      same EOB-inference logic
                                          //      `process_messages_acknowledging_data`
                                          //      uses for the *current* batch.
+  int rsp_deferred_batch_shrink;         // RSP: a data_batch_size SHRINK that was
+                                         //      DEFERRED because applying it now
+                                         //      would orphan already-RECEIVED
+                                         //      prev-batch frames in [new,old)
+                                         //      (baseline-double-delivery.md Fix A).
+                                         //      -1 = none pending. Applied by
+                                         //      rsp_apply_deferred_batch_shrink()
+                                         //      once the prev batch delivers/clears.
   long long rsp_prev_batch_delivered_count; // RSP: count of prev batches
                                          //      successfully delivered via
                                          //      the prev path (diagnostic;

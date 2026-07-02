@@ -1340,6 +1340,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 								rsp_prev_batch_seq_id, rsp_prev_batch_delivered_count,
 								rsp_last_delivered_batch_seq_id);
 							fflush(stdout);
+							// Fix A (baseline-double-delivery.md): the prev batch just
+							// delivered its full framed span — now apply any data_batch_size
+							// shrink that was deferred to avoid orphaning it.
+							rsp_apply_deferred_batch_shrink();
 
 							// C6 MEASURE-ONLY (block-crc-upgrade-design.md §7 [?], bigblock-integrity.md
 							// §5/§12): if THIS just-delivered prev-batch is a big-block whose cw(K-1) was
@@ -7809,6 +7813,13 @@ int cl_arq_controller::test_inband_downladder()
 	{
 		bool defeat = (arm == 0);
 		set_env("MERCURY_PREBREAK_DELIVER_DEFEAT", defeat ? "1" : "");
+		// Fix A (baseline-double-delivery.md) SUPERSEDES the reshrink orphan: the
+		// set_data_batch_size(1) reseed below would now DEFER (not orphan) the prev,
+		// so the FAIL-BEFORE arm must ALSO defeat Fix A to reproduce defect #3's orphan
+		// (the pre-BREAK-flush's reason to exist). The PASS-AFTER arm leaves Fix A active;
+		// there the pre-BREAK flush already cleared the prev, so the reshrink is a no-op
+		// either way. Cross-layer reconcile: two independent defenses of the same orphan.
+		set_env("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT", defeat ? "1" : "");
 
 		// --- Step 0: buffers (mirror test_spec_sack Step 0) ---
 		this->nMessages          = 255;
@@ -7913,6 +7924,7 @@ int cl_arq_controller::test_inband_downladder()
 		}
 	}
 	set_env("MERCURY_PREBREAK_DELIVER_DEFEAT", "");
+	set_env("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT", "");
 
 	// ========================================================================
 	// PART B — DEFECT #1/#2: a SILENT snapshot must NOT tick the dead-batch streak
@@ -9644,6 +9656,13 @@ int cl_arq_controller::test_inband_deliver()
 		// FAIL-BEFORE: a BREAK was sent -> the RX break_detected handler runs the ROBUST_0
 		// reshrink (deliver_complete_inflight_before_break hard-returns 0 for a PARTIAL prev),
 		// orphaning the 24 RECEIVED frames -> the batch is no longer deliverable -> 0 bytes.
+		// Fix A (baseline-double-delivery.md) SUPERSEDES this orphan too, so defeat it here to
+		// reproduce the historical fail-before (this arm is a compile-time demonstration only).
+#if defined(_WIN32)
+		_putenv_s("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT", "1");
+#else
+		setenv("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT", "1", 1);
+#endif
 		int saved_cfg = this->current_configuration;
 		this->current_configuration = robust_enabled ? ROBUST_0 : CONFIG_0;
 		(void)deliver_complete_inflight_before_break();   // returns 0 (partial — cannot rescue)
@@ -12251,73 +12270,206 @@ int cl_arq_controller::test_batch_shrink_strands_prev()
 	set_data_batch_size(NEW_BATCH);
 
 	// --- Step 3: post-shrink assertions --------------------------------------
+	// SUPERSEDED by Fix A (baseline-double-delivery.md): the R035 rescan "shrink +
+	// drop orphaned RECEIVED + streaming_reset" was a symptom band-aid — it kept the
+	// PPMd model from desyncing but THREW AWAY the already-RECEIVED user bytes in
+	// [new,old) (a silent HOLE). Fix A DEFERS an orphaning shrink at this same
+	// chokepoint so no RECEIVED prev frame is ever dropped, then applies the shrink
+	// once the prev delivers. This test now asserts the DEFER contract (fix arm) and,
+	// with MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1, the old orphaning behavior (defeat arm).
+	bool orphan_defeat = false;
+	{ const char* e = std::getenv("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) orphan_defeat = true; }
 	bool pass = true;
 
 	// (a) Vacuity guard: the pre-fix model MUST show the gate was unreachable
-	//     (else the test proves nothing).
+	//     (else the test proves nothing — the orphan in [NEW,OLD) is what strands).
 	if(prefix_gate_reachable)
 	{
 		printf("[TEST-BATCH-SHRINK] FAIL(vacuous): pre-fix gate was already reachable "
 		       "— scenario does not strand the prev\n");
 		pass = false;
 	}
-
-	// (b) data_batch_size actually shrank to NEW_BATCH (chokepoint stored it).
-	if(this->data_batch_size != NEW_BATCH)
+	// (a') Vacuity guard 2: slot 12 (in [NEW,OLD)) must actually be RECEIVED so the
+	//      shrink genuinely WOULD orphan it (proves the defer path is exercised).
+	if(messages_rx_prev[12].status != RECEIVED)
 	{
-		printf("[TEST-BATCH-SHRINK] FAIL: data_batch_size=%d (expected %d)\n",
-			this->data_batch_size, NEW_BATCH);
+		printf("[TEST-BATCH-SHRINK] FAIL(vacuous): slot 12 not RECEIVED — no orphan to defer\n");
 		pass = false;
 	}
 
-	// (c) expected_count re-derived to min(OLD,NEW)=NEW_BATCH (gate now reachable).
-	if(this->rsp_prev_batch_expected_count != NEW_BATCH)
+	if(!orphan_defeat)
 	{
-		printf("[TEST-BATCH-SHRINK] FAIL: expected_count=%d (expected re-derived to %d)\n",
-			this->rsp_prev_batch_expected_count, NEW_BATCH);
-		pass = false;
+		// FIX ARM — the orphaning shrink was DEFERRED (no data loss):
+		// (b) data_batch_size did NOT shrink; it is HELD at OLD_BATCH so the prev
+		//     delivers its full framed span (slots [0,OLD) all reachable).
+		if(this->data_batch_size != OLD_BATCH)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: data_batch_size=%d (expected HELD at %d — deferred)\n",
+			this->data_batch_size, OLD_BATCH); pass = false; }
+		// (c) the requested target was recorded as the deferred shrink.
+		if(this->rsp_deferred_batch_shrink != NEW_BATCH)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: rsp_deferred_batch_shrink=%d (expected %d)\n",
+			this->rsp_deferred_batch_shrink, NEW_BATCH); pass = false; }
+		// (d) expected_count is UNCHANGED (prev preserved at its full span — no truncation).
+		if(this->rsp_prev_batch_expected_count != OLD_BATCH)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: expected_count=%d (expected HELD at %d)\n",
+			this->rsp_prev_batch_expected_count, OLD_BATCH); pass = false; }
+		// (e) the orphaned RECEIVED slot (12) is STILL RECEIVED (not dropped) and is
+		//     within the held delivery bound [0,data_batch_size) -> it WILL deliver.
+		if(messages_rx_prev[12].status != RECEIVED || 12 >= this->data_batch_size)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: slot 12 orphaned (status=%d bound=%d)\n",
+			messages_rx_prev[12].status, this->data_batch_size); pass = false; }
+		// (f) no streaming_reset was needed (no orphan-drop happened) -> streaming active.
+		if(!compressor.is_streaming())
+		{ printf("[TEST-BATCH-SHRINK] FAIL: streaming disabled unexpectedly under defer\n"); pass = false; }
+		// (g) APPLY-ON-CLEAR: once the prev delivers, the deferred shrink applies.
+		this->rsp_prev_batch_active = false;
+		rsp_apply_deferred_batch_shrink();
+		if(this->data_batch_size != NEW_BATCH)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: deferred shrink not applied after prev cleared "
+			"(data_batch_size=%d expected %d)\n", this->data_batch_size, NEW_BATCH); pass = false; }
+		if(this->rsp_deferred_batch_shrink != -1)
+		{ printf("[TEST-BATCH-SHRINK] FAIL: deferred marker not cleared (=%d)\n",
+			this->rsp_deferred_batch_shrink); pass = false; }
+		printf("[TEST-BATCH-SHRINK] %s(fix): shrink DEFERRED (held@%d, deferred=%d), slot12 RECEIVED "
+		       "in-bound; applied->%d after prev cleared (no orphan, no data loss)\n",
+			pass ? "PASS" : "FAIL", OLD_BATCH, NEW_BATCH, this->data_batch_size);
 	}
-
-	// (d) received_count recomputed to the count within [0,NEW_BATCH) = 9.
-	if(this->rsp_prev_batch_received_count != reachable_received)
+	else
 	{
-		printf("[TEST-BATCH-SHRINK] FAIL: received_count=%d (expected recomputed to %d)\n",
-			this->rsp_prev_batch_received_count, reachable_received);
-		pass = false;
+		// DEFEAT ARM — the old orphaning shrink APPLIED (fail-before signature):
+		// data_batch_size shrank to NEW, expected re-derived to NEW, slot 12 excluded
+		// from the reachable/expected counts (its bytes would be dropped at delivery).
+		bool applied = (this->data_batch_size == NEW_BATCH
+			&& this->rsp_prev_batch_expected_count == NEW_BATCH
+			&& this->rsp_prev_batch_received_count == reachable_received
+			&& 12 >= this->data_batch_size);   // slot 12 now beyond the delivery bound -> orphaned
+		if(!applied)
+		{ printf("[TEST-BATCH-SHRINK] FAIL(defeat): expected the old orphaning shrink to apply "
+			"(data_batch_size=%d expected=%d received=%d)\n",
+			this->data_batch_size, this->rsp_prev_batch_expected_count,
+			this->rsp_prev_batch_received_count); pass = false; }
+		printf("[TEST-BATCH-SHRINK] %s(defeat): old orphaning shrink applied "
+		       "(data_batch_size->%d, slot12 in [%d,%d) ORPHANED = fail-before data loss)\n",
+			pass ? "PASS" : "FAIL", this->data_batch_size, NEW_BATCH, OLD_BATCH);
 	}
-
-	// (e) the gate is now REACHABLE (received can reach expected as the missing
-	//     in-window slot arrives): expected==NEW_BATCH and reachable slots exist.
-	bool postfix_gate_reachable =
-		(this->rsp_prev_batch_expected_count <= NEW_BATCH);
-	if(!postfix_gate_reachable)
-	{
-		printf("[TEST-BATCH-SHRINK] FAIL: post-fix gate still unreachable "
-		       "(expected_count=%d > new_batch=%d)\n",
-			this->rsp_prev_batch_expected_count, NEW_BATCH);
-		pass = false;
-	}
-
-	// (f) the orphaned RECEIVED slot (12) triggered the streaming defense, which
-	//     RESETS (not DISABLES) streaming — streaming must still be active.
-	bool streaming_after = compressor.is_streaming();
-	if(!streaming_after)
-	{
-		printf("[TEST-BATCH-SHRINK] FAIL: streaming was DISABLED by the shrink "
-		       "(expected streaming_reset, which keeps it active)\n");
-		pass = false;
-	}
-
-	printf("[TEST-BATCH-SHRINK] %s: data_batch_size=%d expected=%d received=%d "
-	       "prefix_reachable=%d postfix_reachable=%d streaming %d->%d "
-	       "(orphan in [%d,%d) drove the desync defense)\n",
-		pass ? "PASS" : "FAIL", this->data_batch_size,
-		this->rsp_prev_batch_expected_count, this->rsp_prev_batch_received_count,
-		prefix_gate_reachable ? 1 : 0, postfix_gate_reachable ? 1 : 0,
-		streaming_before ? 1 : 0, streaming_after ? 1 : 0,
-		NEW_BATCH, OLD_BATCH);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// Fix A — mid-flight data_batch_size SHRINK must not orphan RECEIVED prev frames
+// (baseline-double-delivery.md). In-process BYTE-INTEGRITY regression.
+// ============================================================================
+//
+// CLI: --test-batch-shrink-orphan-defer  (env MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1
+//                                         reverts the fix on the SAME binary)
+//
+// THE BUG (channel-free, pure RX prev-batch state): the prev batch is delivered
+// bounded by the LIVE data_batch_size (copy_data_to_buffer iterates
+// messages_rx_prev[0 .. data_batch_size) and clears higher slots to FREE WITHOUT
+// delivery, arq_common.cc:13746/13765). An Axis-2 down-move / robust-dwell revert
+// shrinks data_batch_size via set_data_batch_size() WHILE a prev batch holds
+// already-RECEIVED frames in [new,old) -> those real, in-order user bytes are
+// dropped = a silent HOLE in the delivered app stream (baseline-double-delivery.md).
+//
+// This drives the REAL set_data_batch_size() shrink chokepoint with a prev batch
+// holding a positional byte pattern in EVERY slot [0,OLD), then RECONSTRUCTS the
+// EXACT copy_data_to_buffer() prev-delivery set ([0,data_batch_size), RECEIVED/ACKED
+// slots in order) and asserts the delivered stream is byte-exact with ZERO loss.
+//   pass-after (fix): the orphaning shrink is DEFERRED, data_batch_size stays OLD,
+//     all OLD slots deliver -> zero bytes lost.
+//   fail-before (DEFEAT): the shrink applies, data_batch_size==NEW, slots [NEW,OLD)
+//     fall outside the delivery bound -> their bytes are LOST (short delivery).
+// Returns 0=PASS, 1=FAIL.
+int cl_arq_controller::test_batch_shrink_orphan_defer()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_BATCHSHRINK_ORPHAN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-SHRINK-ORPHAN] start (MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want){
+		if(cond) printf("[TEST-SHRINK-ORPHAN] PASS: %s (got=%ld want=%ld)\n", name, got, want);
+		else { printf("[TEST-SHRINK-ORPHAN] FAIL: %s (got=%ld want=%ld)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// Prime OFDM (non-robust) dims; compression OFF so slot bytes pass through 1:1.
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C0 buffers allocated", alloc_rc, SUCCESSFUL);
+	this->sack_v2_enabled       = true;
+	this->sack_enabled          = true;
+	this->current_configuration = 0;      // OFDM branch of set_data_batch_size
+	this->compression_enabled   = false;
+	this->encryption_enabled    = false;
+	this->rsp_deferred_batch_shrink = -1;
+
+	const int OLD_BATCH = 25, NEW_BATCH = 20, PREV_BSI = 9, L = 16;
+	this->data_batch_size = OLD_BATCH;
+
+	// Arm a COMPLETE prev batch: slots [0,OLD) all RECEIVED, slot i carries the
+	// positional byte value (i) in every byte so the delivered stream is per-slot
+	// checkable. Slots [NEW,OLD) are the orphans the shrink would drop.
+	for(int i=0;i<this->nMessages;i++) messages_rx_prev[i].status = FREE;
+	for(int i=0;i<OLD_BATCH;i++)
+	{
+		messages_rx_prev[i].status       = RECEIVED;
+		messages_rx_prev[i].batch_seq_id = PREV_BSI;
+		messages_rx_prev[i].length       = L;
+		for(int j=0;j<L;j++) messages_rx_prev[i].data[j] = (char)(unsigned char)i;
+	}
+	this->rsp_prev_batch_seq_id         = PREV_BSI;
+	this->rsp_prev_batch_active         = true;
+	this->rsp_prev_batch_received_count = OLD_BATCH;
+	this->rsp_prev_batch_expected_count = OLD_BATCH;
+
+	// Fire the REAL shrink through the chokepoint (the Axis-2 down-move path).
+	set_data_batch_size(NEW_BATCH);
+
+	// Reconstruct EXACTLY what copy_data_to_buffer() delivers for the prev: iterate
+	// messages_rx_prev[0 .. data_batch_size) and take RECEIVED/ACKED slots in order.
+	unsigned char delivered[64*16];
+	int dlen = 0;
+	for(int i=0;i<this->data_batch_size && i<this->nMessages && i<64;i++)
+		if(messages_rx_prev[i].status==RECEIVED || messages_rx_prev[i].status==ACKED)
+			for(int j=0;j<messages_rx_prev[i].length && dlen<(int)sizeof(delivered);j++)
+				delivered[dlen++] = (unsigned char)messages_rx_prev[i].data[j];
+
+	const int EXPECT = OLD_BATCH * L;   // full no-loss delivery = every slot [0,OLD)
+	int first_bad = -1;
+	for(int k=0;k<dlen;k++){ int slot=k/L; if((unsigned char)slot != delivered[k]){ first_bad=k; break; } }
+	printf("[TEST-SHRINK-ORPHAN] data_batch_size %d->%d delivered=%d expected(no-loss)=%d first_bad=%d\n",
+		OLD_BATCH, this->data_batch_size, dlen, EXPECT, first_bad);
+	fflush(stdout);
+
+	if(!defeat)
+	{
+		check(dlen == EXPECT && first_bad == -1,
+			"A1 zero delivered bytes lost/reordered (orphaning shrink deferred)", dlen, EXPECT);
+		check(this->data_batch_size == OLD_BATCH,
+			"A2 data_batch_size HELD at old (deferred)", this->data_batch_size, OLD_BATCH);
+	}
+	else
+	{
+		bool loss = (dlen < EXPECT) || (first_bad != -1);
+		check(loss,
+			"A1 fail-before LOSES orphaned prev bytes (shrink applied, vacuity guard)", dlen, EXPECT);
+		check(this->data_batch_size == NEW_BATCH,
+			"A2 fail-before shrank data_batch_size (orphaning)", this->data_batch_size, NEW_BATCH);
+	}
+
+	deinit_messages_buffers();
+	printf("[TEST-SHRINK-ORPHAN] %s: fails=%d (defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	fflush(stdout);
+	return failed==0 ? 0 : 1;
 }
 
 // ============================================================================
