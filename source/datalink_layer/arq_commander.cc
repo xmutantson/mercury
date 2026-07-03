@@ -2196,12 +2196,7 @@ void cl_arq_controller::process_messages_tx_data()
 				// At the bottom (no lower rung): tick the dead-batch floor; BREAK only at N.
 				if(inband_cmd_dead_batch_floor_reached())
 				{
-					for(int i=0; i<nMessages; i++)
-					{
-						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-							fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-						messages_tx[i].status = FREE;
-					}
+					restage_requeue_tx_messages();   // §12 lossless+ordered re-stage (was forward push()-to-BACK)
 					fifo_buffer_backup.flush();
 					block_under_tx = NO;
 					retransmit_count = 0;
@@ -2227,12 +2222,7 @@ void cl_arq_controller::process_messages_tx_data()
 			int working_config = config_ladder_down(data_configuration, robust_enabled);
 			// Push pending payloads back to the FIFO for resend after BREAK
 			// recovery (parallels the gearshift BREAK path at :2344-2349).
-			for(int i=0; i<nMessages; i++)
-			{
-				if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-					fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-				messages_tx[i].status = FREE;
-			}
+			restage_requeue_tx_messages();   // §12 lossless+ordered re-stage (was forward push()-to-BACK)
 			fifo_buffer_backup.flush();
 			block_under_tx = NO;
 			// Clear the runaway queue — the BREAK path restarts at a working
@@ -3521,12 +3511,7 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	}
 	else
 	{
-		for(int i=0; i<nMessages; i++)
-		{
-			if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-				fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-			messages_tx[i].status = FREE;
-		}
+		restage_requeue_tx_messages();   // §12 lossless+ordered re-stage (was forward push()-to-BACK)
 		fifo_buffer_backup.flush();
 		clear_retx_queue();   // recovery re-queues plaintext; drop stale retx
 	}
@@ -5054,12 +5039,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			}
 			else
 			{
-				for(int i=0; i<nMessages; i++)
-				{
-					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-						fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-					messages_tx[i].status = FREE;
-				}
+				restage_requeue_tx_messages();   // §12 lossless+ordered re-stage (was forward push()-to-BACK)
 				fifo_buffer_backup.flush();
 				clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 			}
@@ -5262,12 +5242,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					data_configuration, working_config, frame_shift_threshold);
 				fflush(stdout);
 
-				for(int i=0; i<nMessages; i++)
-				{
-					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-						fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-					messages_tx[i].status = FREE;
-				}
+				restage_requeue_tx_messages();   // §12 lossless+ordered re-stage (was forward push()-to-BACK)
 				fifo_buffer_backup.flush();
 				block_under_tx = NO;
 
@@ -5392,12 +5367,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					}
 					else
 					{
-						for(int i=0; i<nMessages; i++)
-						{
-							if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-								fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-							messages_tx[i].status = FREE;
-						}
+						restage_requeue_tx_messages();   // §12 lossless+ordered re-stage (was forward push()-to-BACK)
 						fifo_buffer_backup.flush();
 						clear_retx_queue();   // recovery re-queues plaintext; drop stale retx
 					}
@@ -5548,12 +5518,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					}
 					else
 					{
-						for(int i=0; i<nMessages; i++)
-						{
-							if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-								fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
-							messages_tx[i].status = FREE;
-						}
+						restage_requeue_tx_messages();   // §12 lossless+ordered re-stage (was forward push()-to-BACK)
 						fifo_buffer_backup.flush();
 						clear_retx_queue();   // recovery re-queues plaintext; drop stale retx
 					}

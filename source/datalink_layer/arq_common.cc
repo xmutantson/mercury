@@ -6490,7 +6490,34 @@ void cl_arq_controller::process_main()
 		// Otherwise data pulled from the socket would be silently dropped
 		// by push() (returns 0 when full). Leaving data in the TCP socket
 		// buffer creates natural backpressure to the sender.
-		if(fifo_buffer_tx.get_free_size() >= MAX_BUFFER_SIZE)
+		//
+		// §12/§13 RE-STAGE RESERVE (silent-corruption-residual.md, the ROOT fix
+		// for the residual WGN:25 silent byte-corruption): ALSO reserve headroom
+		// equal to the bytes currently IN FLIGHT (non-FREE messages_tx[]). A
+		// demote/BREAK re-stage must re-queue exactly those bytes back into
+		// fifo_buffer_tx (restage_requeue_tx_messages); if the app has refilled
+		// the space the in-flight block vacated when it was popped, push_front
+		// drops them -> the block is ORPHANED -> the delivered stream shifts ->
+		// silent corruption. Gating ingestion on free >= MAX_BUFFER_SIZE +
+		// in_flight provably keeps free >= in_flight at every re-stage (the pop-
+		// to-build step grows free and in_flight equally, so the margin holds),
+		// so the re-queue is ALWAYS lossless. Backpressure to the app is
+		// unchanged in kind, just a few KB earlier. MERCURY_RESTAGE_ORPHAN_DEFEAT=1
+		// restores the pre-fix (unreserved) gate for the fail-before arm.
+		int restage_reserve = 0;
+		{
+			static int s_defeat = -1;
+			if(s_defeat < 0)
+			{
+				const char* e = std::getenv("MERCURY_RESTAGE_ORPHAN_DEFEAT");
+				s_defeat = (e && *e && atoi(e)!=0) ? 1 : 0;
+			}
+			if(s_defeat == 0 && messages_tx != NULL)
+				for(int i=0;i<nMessages;i++)
+					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+						restage_reserve += messages_tx[i].length;
+		}
+		if(fifo_buffer_tx.get_free_size() >= MAX_BUFFER_SIZE + restage_reserve)
 		{
 			int nBytes_received=tcp_socket_data.receive();
 			if(nBytes_received>0)
@@ -13926,6 +13953,68 @@ int cl_arq_controller::test_rxfifo_backpressure_hold()
 		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
 	fflush(stdout);
 	return failed==0 ? 0 : 1;
+}
+
+// ============================================================================
+// RE-STAGE re-queue (silent-corruption-residual.md §12/§13) — ROOT fix for the
+// residual WGN:25 SILENT byte-corruption (a reassembly SHIFT, cohort-2 dominant).
+//
+// On a demote/BREAK/CFG16-HOLD re-stage the CMD must re-queue every in-flight
+// (un-ACKed) messages_tx[] frame back into fifo_buffer_tx to re-frame at the new
+// config. The 7 demote sites open-coded this as a FORWARD-iter fifo_buffer_tx.push()
+// (append to the BACK) with the return IGNORED and messages_tx[i] freed
+// UNCONDITIONALLY. Two defects, each producing a whole-tail positional shift that
+// the period-256 ruler reads as 100% corrupt (mismatch == rx-first_bad):
+//   (1) push() appends BEHIND any newer app data still in the (chronically-full)
+//       fifo; the re-stage then rolls cmd_batch_seq_id back to the in-flight bsi
+//       and the next-built batch pops the FRONT (= newer source) -> shift.
+//   (2) push() SILENTLY drops (returns 0) when the fifo is full and the frame is
+//       freed anyway -> the in-flight bytes are ORPHANED -> hole -> shift.
+// The 3 BREAK sites already did this CORRECTLY (reverse-iter + push_front). This
+// helper is that correct pattern, LOUD on any residual shortfall, used everywhere.
+// ============================================================================
+void cl_arq_controller::restage_requeue_tx_messages()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_RESTAGE_ORPHAN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	if(defeat)
+	{
+		// FAIL-BEFORE arm: the pre-fix buggy behavior — FORWARD-iter push() to the
+		// BACK, return ignored, unconditional FREE (reorders the re-sent block
+		// behind newer app data AND silently drops when full). Test-only.
+		for(int i=0;i<nMessages;i++)
+		{
+			if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+				fifo_buffer_tx.push(messages_tx[i].data, messages_tx[i].length);
+			messages_tx[i].status = FREE;
+		}
+		return;
+	}
+	// FIXED: reverse-iter + push_front so frame slot 0 lands at the FRONT of the
+	// fifo (the in-flight block is CONTIGUOUS ahead of any newer app data, in slot
+	// order). CHECK the return so a would-be drop is surfaced LOUD, never a silent
+	// orphan. (The fifo ingestion reserve at receive_arq() keeps free >= in-flight
+	// so this shortfall path is not reached in production; it is the safety net.)
+	for(int i=nMessages-1;i>=0;i--)
+	{
+		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+		{
+			int want = messages_tx[i].length;
+			int pushed = fifo_buffer_tx.push_front(messages_tx[i].data, want);
+			if(pushed != want)
+			{
+				printf("[RESTAGE-ORPHAN] LOUD: fifo_buffer_tx lacked room to re-queue "
+					"in-flight frame slot=%d id=%d len=%d (pushed=%d free=%d) — reserve "
+					"invariant violated; bytes would ORPHAN (reassembly shift). Surfaced, "
+					"not silent.\n",
+					i, (int)(unsigned char)messages_tx[i].id, want, pushed,
+					fifo_buffer_tx.get_free_size());
+				fflush(stdout);
+			}
+		}
+		messages_tx[i].status = FREE;
+	}
 }
 
 void cl_arq_controller::copy_data_to_buffer()
