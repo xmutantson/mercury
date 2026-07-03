@@ -2888,6 +2888,14 @@ public:
   // test_rx_drain.cc + bigblock_p3_hw/_wallb/fix6/.
   int test_rx_drain_backpressure();
 
+  // silent-corruption-residual.md §12/§13 — RE-STAGE re-queue orphan test.
+  // CLI: --test-restage-requeue-orphan. Fills fifo_buffer_tx with newer app data,
+  // stages an in-flight batch in messages_tx[], invokes restage_requeue_tx_messages(),
+  // and asserts the re-queued in-flight bytes come out CONTIGUOUS and IN-ORDER ahead
+  // of the newer data with NO loss. FAIL-BEFORE (MERCURY_RESTAGE_ORPHAN_DEFEAT=1):
+  // the pre-fix push()-to-BACK reorders (and drops when full) -> shift -> FAIL.
+  int test_restage_requeue_orphan();
+
   // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
   // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
   // messages_tx[] array-index space DIVERGED from the wire positions (holes + a
@@ -3007,6 +3015,16 @@ public:
   int fifo_push_rx(const char* buf, int len);
   void restore_backup_buffer_data();
   void restore_tx_from_compressed();  // Decompress messages_tx back to raw in fifo_buffer_tx
+  // RE-STAGE re-queue (silent-corruption-residual.md §12): re-queue every
+  // in-flight (non-FREE) messages_tx[] frame back into fifo_buffer_tx for
+  // re-framing at the demoted/BREAK config. ORDER-PRESERVING (reverse-iter +
+  // push_front so the re-sent block is CONTIGUOUS ahead of any newer app data)
+  // and LOSSLESS (a would-be drop when the fifo lacks room is surfaced LOUD via
+  // [RESTAGE-ORPHAN], never a silent orphan -> reassembly shift). Replaces the
+  // 10 open-coded re-stage loops. MERCURY_RESTAGE_ORPHAN_DEFEAT=1 restores the
+  // pre-fix buggy behavior (forward-iter push()-to-BACK, unconditional FREE) for
+  // the --test-restage-requeue-orphan fail-before arm.
+  void restage_requeue_tx_messages();
 
 	//! Receives a data or a control message from the other end (via ALSA driver).
 	    /*!
