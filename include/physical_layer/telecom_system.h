@@ -149,6 +149,41 @@ public:
 	int ofdm_forced_delay; // >= 0: override time_sync result (BER test, keeps passband_to_baseband); -1: normal
 	int test_puncture_nBits;  // > 0: zero out LLRs past this position (punctured LDPC BER test); 0: disabled
 
+	// ---- Chase-combining (HARQ Type-I soft-LLR combining) ---------------------
+	// ROOT of the "chase engaged N times, 0 rescues" capstone finding: Mercury had
+	// NO soft-combining code at all -- each received frame's decoder-order LLR
+	// vector (data_container.deinterleaved_data) is consumed ONCE by ldpc.decode()
+	// (telecom_system.cc combine point) and then OVERWRITTEN by the next frame, so
+	// the failed soft info is DISCARDED. A bit-identical (same-config) retransmit's
+	// LLRs were never summed with the prior look. The retx DOES carry the identical
+	// coded bits (systematic QC-LDPC encode is deterministic, ldpc.cc:100; the retx
+	// payload is a verbatim copy of messages_tx[i].data), so summing the two LLR
+	// vectors is VALID and yields ~+3 dB coding gain per combined copy. This buffer
+	// + config-gated sum is that missing soft-combine core.  See
+	// fact-documents/chase-combining-harq.md.
+	//
+	// chase_enabled defaults OFF in production: the SAFE auto-combine TRIGGER needs
+	// the ARQ missing-slot / decoded batch_seq_id identity key (option (c),
+	// data-flow-chase-buffer.md) so two UNRELATED failed frames are never paired.
+	// That ARQ integration is the follow-up; the primitive + its deterministic
+	// proof (--test-chase) land first. MERCURY_CHASE=1 arms the gated receive_byte
+	// hook for A/B once the identity key is wired.
+	bool chase_enabled;                  // gate (read once from MERCURY_CHASE; default OFF)
+	std::vector<float> chase_llr_buffer; // buffered failed-look LLRs, decoder input order (len<=N_MAX)
+	int  chase_buf_config;               // config the buffered vector was captured under (-1 = none)
+	int  chase_buf_len;                  // valid length of the buffered vector (== ldpc.N at capture)
+	bool chase_buf_occupied;             // a candidate is buffered
+	long chase_captures;                 // diagnostic-only (INV-CHASE-5: must NOT feed the optimizer)
+	long chase_combines;                 // diagnostic-only
+	void chase_reset();                                        // void the buffer (config change / BREAK / reset)
+	void chase_capture(const float* llr, int len, int config);// buffer a failed look's LLR vector
+	// If chase_enabled AND a config-compatible candidate is buffered, add it
+	// element-wise into live[] IN PLACE (post-add clamp +/-40) and return true so
+	// the caller re-decodes the summed vector. Returns false and leaves live[]
+	// UNTOUCHED when disabled / empty / config-or-length mismatch (INV-CHASE-2:
+	// only ever combine two looks of the SAME codeword).
+	bool chase_combine(float* live, int len, int config);
+
 	// Last coarse frequency offset from OFDM preamble detection.
 	// Persisted so ACK MFSK detectors use the same corrected carrier as
 	// OFDM data demodulation. Without this, USB audio clock mismatch

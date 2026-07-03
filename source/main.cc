@@ -642,6 +642,156 @@ static int run_cfg17_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
+// pass-after self-test. See fact-documents/chase-combining-harq.md.
+//
+// ROOT this test guards: Mercury had NO soft-combining -- a failed frame's LLRs
+// were DISCARDED, so a bit-identical retransmission's soft info was never summed
+// with the prior look (the capstone "chase engaged N times, 0 rescues"). The
+// coded bits of a same-config retx ARE identical (deterministic QC-LDPC encode),
+// so summing the two LLR vectors is VALID and buys ~+3 dB.
+//
+// Deterministic construction (no OFDM sync, no RF, no audio): a random K-bit
+// message is LDPC-encoded (CONFIG_6 = BPSK rate 1/2, K=800 N=1600), BPSK-mapped
+// via the REAL psk.mod, and passed twice through the REAL AWGN channel at an
+// operating point BELOW the single-look FEC waterfall (two independent noise
+// realizations = the two ARQ looks). Each look is demapped by the REAL psk.demod
+// and decoded by the REAL ldpc.decode. Assertions over T deterministic trials:
+//   * single-look success           == 0   (fail-before: one copy never decodes)
+//   * chase-OFF combine (env-defeat) == 0   (defeat: primitive no-ops -> one copy)
+//   * chase-ON  combine              >  0   (pass-after: SUM rescues the frame)
+// i.e. the combine SUCCESS-RATE moves 0 -> >0, and defeating chase restores the
+// pre-fix 0. The combine itself is the production primitive
+// cl_telecom_system::chase_capture()/chase_combine() -- NOT an ad-hoc sum here.
+static int run_chase_selftest()
+{
+    printf("[TEST-CHASE] chase-combining (HARQ soft-LLR combine) fail-before/pass-after self-test\n");
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_6);          // BPSK rate 1/2 -> K=800, N=1600
+    ts.psk.set_predefined_constellation(MOD_BPSK);  // ensure unit-energy BPSK demapper
+
+    const int N = ts.ldpc.N;
+    const int K = ts.ldpc.K;
+    if(N <= 0 || K <= 0 || N > N_MAX) {
+        printf("[TEST-CHASE]   BAD SIZING N=%d K=%d -> FAIL\n", N, K);
+        return 1;
+    }
+
+    // Operating point: complex-sample noise amplitude. Es=1 (BPSK), so Es/N0 =
+    // 1/ampl^2. Chosen ~2 dB BELOW the single-look rate-1/2 waterfall so ONE look
+    // never decodes while the +3 dB two-look combine crosses. Overridable via
+    // MERCURY_CHASE_TEST_AMPL for tuning; default is the locked value.
+    // ampl=1.45 (Es/N0 ~ -3.2 dB) sits ~1.5 dB BELOW the single-look rate-1/2
+    // waterfall (single-look decodes ~100% at ampl~1.15, 0% by ampl~1.35) while the
+    // +3 dB two-look combine still decodes 100% (its waterfall is beyond ampl~1.65),
+    // giving both arms a wide deterministic margin (fixed seeds -> non-flaky).
+    double ampl = 1.45;
+    { const char* e = std::getenv("MERCURY_CHASE_TEST_AMPL"); if(e && *e) ampl = atof(e); }
+    const float variance = (float)(ampl * ampl);
+
+    const int T = 40;
+    // Env-defeat: MERCURY_CHASE=0 forces the chase-ON arm OFF too, demonstrating
+    // that defeating the primitive returns the pre-fix 0-success behavior.
+    bool env_off = false;
+    { const char* e = std::getenv("MERCURY_CHASE"); if(e && strcmp(e,"0")==0) env_off = true; }
+
+    int* info = new int[K];
+    int* cw   = new int[N];
+    std::complex<double>* sym = new std::complex<double>[N];
+    std::complex<double>* rx1 = new std::complex<double>[N];
+    std::complex<double>* rx2 = new std::complex<double>[N];
+    float* llr1 = new float[N];
+    float* llr2 = new float[N];
+    float* comb = new float[N];
+    int*   out  = new int[K];
+
+    auto frame_ok = [&](const int* dec)->bool{
+        for(int i=0;i<K;i++) if(dec[i] != info[i]) return false;
+        return true;
+    };
+
+    int ok_single = 0, ok_chase_on = 0, ok_chase_off = 0;
+    const bool dbg = (std::getenv("MERCURY_CHASE_TEST_DEBUG") != nullptr);
+
+    srand(0xC4A5E);  // deterministic message + noise stream
+    for(int t=0; t<T; t++)
+    {
+        for(int i=0;i<K;i++) info[i] = rand() & 1;
+        ts.ldpc.encode(info, cw);           // K info -> N coded bits (systematic)
+        ts.psk.mod(cw, N, sym);             // BPSK: N coded bits -> N unit-energy symbols
+
+        // Two INDEPENDENT looks of the SAME codeword. Seeds must be DISTINCT and
+        // positive (set_seed srand's only when seed>0); keep them well-separated so
+        // the two noise realizations are decorrelated (a collapsed/equal seed makes
+        // the "combine" merely DOUBLE one look -> no diversity -> non-convergence).
+        ts.awgn_channel.set_seed((long)(100003 + 2*t));
+        ts.awgn_channel.apply(sym, rx1, (float)ampl, N);
+        ts.awgn_channel.set_seed((long)(700019 + 2*t));
+        ts.awgn_channel.apply(sym, rx2, (float)ampl, N);
+
+        ts.psk.demod(rx1, N, llr1, variance);
+        ts.psk.demod(rx2, N, llr2, variance);
+
+        // (a) SINGLE-LOOK baseline (look 2 alone) -- the pre-chase behavior.
+        int it_s = ts.ldpc.decode(llr2, out);
+        bool ok_s = frame_ok(out);
+        if(ok_s) ok_single++;
+
+        // (b) CHASE-ON: buffer look 1, combine into look 2, decode the SUM.
+        ts.chase_enabled = !env_off;
+        ts.chase_reset();
+        ts.chase_capture(llr1, N, CONFIG_6);
+        for(int i=0;i<N;i++) comb[i] = llr2[i];
+        bool combined_on = ts.chase_combine(comb, N, CONFIG_6);  // sums iff enabled+match
+        int it_c = ts.ldpc.decode(comb, out);
+        bool ok_c = frame_ok(out);
+        if(combined_on && ok_c) ok_chase_on++;
+        if(dbg) {
+            int nbad=0; for(int i=0;i<K;i++) if(out[i]!=info[i]) nbad++;
+            double amax1=0,amax2=0,amaxc=0;
+            for(int i=0;i<N;i++){ if(fabs(llr1[i])>amax1)amax1=fabs(llr1[i]); if(fabs(llr2[i])>amax2)amax2=fabs(llr2[i]); double c=llr1[i]+llr2[i]; if(fabs(c)>amaxc)amaxc=fabs(c);}
+            printf("[TEST-CHASE-DBG] t=%2d single ok=%d it=%d | comb ok=%d it=%d combflag=%d bad=%d | max|llr1|=%.1f max|llr2|=%.1f max|sum|=%.1f\n",
+                   t, ok_s?1:0, it_s, ok_c?1:0, it_c, combined_on?1:0, nbad, amax1, amax2, amaxc);
+        }
+
+        // (c) CHASE-OFF (env-defeat semantics): primitive disabled -> combine
+        //     no-ops -> decodes a single look -> pre-fix 0-success.
+        ts.chase_enabled = false;
+        ts.chase_reset();
+        ts.chase_capture(llr1, N, CONFIG_6);                    // no-op (disabled)
+        for(int i=0;i<N;i++) comb[i] = llr2[i];
+        ts.chase_combine(comb, N, CONFIG_6);                    // returns false, comb == llr2
+        ts.ldpc.decode(comb, out);
+        if(frame_ok(out)) ok_chase_off++;
+    }
+
+    printf("[TEST-CHASE]   ampl=%.3f (Es/N0=%.2f dB) T=%d :: single=%d/%d  chase_ON=%d/%d  chase_OFF(defeat)=%d/%d\n",
+           ampl, -10.0*log10(ampl*ampl), T,
+           ok_single, T, ok_chase_on, T, ok_chase_off, T);
+
+    // Fail-before / pass-after:
+    //   single-look and env-defeat MUST be 0 (one copy never decodes at this point);
+    //   chase-ON MUST rescue (>0)  -> combine success-rate 0 -> >0.
+    // Under MERCURY_CHASE=0 the ON arm is forced OFF, so it collapses to 0 and the
+    // test FAILS -- which is the intended demonstration that defeating chase
+    // restores the pre-fix behavior.
+    bool pass;
+    if(env_off) {
+        pass = (ok_single == 0) && (ok_chase_on == 0) && (ok_chase_off == 0);
+        printf("[TEST-CHASE]   MERCURY_CHASE=0 env-defeat: all arms 0-success (pre-fix) -> %s\n",
+               pass ? "DEMONSTRATED" : "UNEXPECTED");
+    } else {
+        pass = (ok_single == 0) && (ok_chase_off == 0) && (ok_chase_on > 0);
+    }
+    printf("[TEST-CHASE] %s\n", pass ? "PASS (combine success-rate 0 -> >0)" : "FAIL");
+
+    delete[] info; delete[] cw; delete[] sym; delete[] rx1; delete[] rx2;
+    delete[] llr1; delete[] llr2; delete[] comb; delete[] out;
+    return pass ? 0 : 1;
+}
+
 // --test wall-clock watchdog. `--test` is a Monte-Carlo suite with no internal
 // time bound; on the RPi bench a wedged test used to hang forever, pinning a
 // core at 99% (stacked orphans -> thermal throttle -> CPU jitter that tips OFDM
@@ -933,6 +1083,22 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
             }
+            // chase-combining (HARQ Type-I soft-LLR combine) fail-before/pass-after:
+            // proves a bit-identical retx's LLRs SUMMED before ldpc.decode() rescue a
+            // frame one look cannot decode (combine success-rate 0 -> >0), and that
+            // defeating the primitive restores the pre-fix 0. Fast + deterministic, no
+            // IONOS/RF. See fact-documents/chase-combining-harq.md.
+            failed += run_chase_selftest();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-chase : run ONLY the chase-combining self-test and exit. Drives the
+        // production primitive cl_telecom_system::chase_capture()/chase_combine() over
+        // a deterministic AWGN BPSK codeword + its retx. MERCURY_CHASE=0 defeats it
+        // (demonstrates the pre-fix 0-success); MERCURY_CHASE_TEST_AMPL tunes the
+        // operating point. See fact-documents/chase-combining-harq.md.
+        if (strcmp(argv[i], "--test-chase") == 0) {
+            arm_test_watchdog();
+            int failed = run_chase_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler

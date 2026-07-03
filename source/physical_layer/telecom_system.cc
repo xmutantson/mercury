@@ -115,6 +115,17 @@ cl_telecom_system::cl_telecom_system()
 	mfsk_fixed_delay=-1;
 	ofdm_forced_delay=-1;
 	test_puncture_nBits=0;
+	// Chase-combining (HARQ Type-I soft-LLR combine). Default OFF in production
+	// (the safe auto-combine trigger needs the ARQ identity key -- see
+	// fact-documents/chase-combining-harq.md). MERCURY_CHASE=1 arms it.
+	chase_enabled = false;
+	{ const char* e = std::getenv("MERCURY_CHASE");
+	  if(e && *e && atoi(e) != 0) chase_enabled = true; }
+	chase_buf_config = -1;
+	chase_buf_len = 0;
+	chase_buf_occupied = false;
+	chase_captures = 0;
+	chase_combines = 0;
 	last_coarse_freq_offset=0.0;
 	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 	ctrl_nBits=0;
@@ -177,6 +188,51 @@ cl_telecom_system::~cl_telecom_system()
 	// ever lazily constructed (default-off path leaves it nullptr). ~cl_ldpc_decode_pool
 	// joins all worker threads and frees each worker's private R/Q/V_pos.
 	if(ldpc_decode_pool) { delete ldpc_decode_pool; ldpc_decode_pool = nullptr; }
+}
+
+// ---- Chase-combining (HARQ Type-I soft-LLR combining) -----------------------
+// See fact-documents/chase-combining-harq.md. The buffered vector and the live
+// vector are BOTH the decoder-input LLR raster (data_container.deinterleaved_data
+// state handed to ldpc.decode()), so an element-wise sum aligns bit-for-bit IFF
+// the two looks are the SAME codeword -- enforced by the config gate below plus
+// (in production) the ARQ decoded-batch_seq_id identity key (INV-CHASE-2). The
+// +/-40 clamp is applied to the SUM (post-add), not the addends, so two clamped
+// single-look LLRs still yield the full time-diversity gain (fact-doc §0.1).
+void cl_telecom_system::chase_reset()
+{
+	chase_buf_occupied = false;
+	chase_buf_config   = -1;
+	chase_buf_len      = 0;
+}
+
+void cl_telecom_system::chase_capture(const float* llr, int len, int config)
+{
+	if(!chase_enabled) return;
+	if(llr == nullptr || len <= 0 || len > N_MAX) return;
+	if((int)chase_llr_buffer.size() < len) chase_llr_buffer.assign(N_MAX, 0.0f);
+	for(int i=0;i<len;i++) chase_llr_buffer[i] = llr[i];
+	chase_buf_len      = len;
+	chase_buf_config   = config;
+	chase_buf_occupied = true;
+	chase_captures++;
+}
+
+bool cl_telecom_system::chase_combine(float* live, int len, int config)
+{
+	if(!chase_enabled)            return false;
+	if(!chase_buf_occupied)       return false;
+	if(config != chase_buf_config) return false;  // INV-CHASE-2: same code only
+	if(len    != chase_buf_len)    return false;  // length must match exactly
+	if(live == nullptr)           return false;
+	for(int i=0;i<len;i++)
+	{
+		float s = live[i] + chase_llr_buffer[i];
+		if(s >  40.0f) s =  40.0f;
+		else if(s < -40.0f) s = -40.0f;
+		live[i] = s;
+	}
+	chase_combines++;
+	return true;
 }
 
 void cl_telecom_system::init_tx_gain_defaults()
@@ -11391,6 +11447,7 @@ void cl_telecom_system::load_configuration(int configuration)
 	receive_stats.delay_of_last_decoded_message = -1;
 	receive_stats.freq_offset_of_last_decoded_message = 0;
 	consecutive_ofdm_decode_fails = 0;  // STALE-CFO scoped reset: config change re-acquires fresh
+	chase_reset();  // INV-CHASE-2 flush: a buffered LLR vector is over the OLD config's code
 	receive_stats.mfsk_search_raw = 0;
 	receive_stats.ofdm_search_raw = 0;
 	receive_stats.ofdm_batch_active = false;
