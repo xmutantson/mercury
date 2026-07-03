@@ -332,6 +332,18 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 // silent-shift mechanisms all occur at cfg13-16 where max_frame is 100+ bytes.
 #define W_STAMP_MIN_MAXFRAME (W_EOB_RESERVE + 8)
 
+// Option W STEP 3 (data-flow-stream-offset.md §8.6) — the end-to-end EOT exchange.
+// The running stream CRC-32 init (standard reflected IEEE 802.3 register seed). Both
+// peers seed identically and compare the running registers (no final XOR needed).
+#define CRC32_INIT 0xFFFFFFFFu
+// The EOT payload rides the EXISTING CLOSE_CONNECTION (0x33) control frame, appended after
+// data[0]=code (no new handshake): [ committed:u64 LE ][ crc32:u32 LE ][ crc8:u8 ] = 13 B,
+// so messages_control.length = 1 + 13 = 14 (well within control-frame capacity; KEY_EXCHANGE_1
+// carries 33). crc8 (POLY_CRC8) over data[1..12] lets the RX reject a short/legacy/garbled
+// frame as ABSENT-EOT (safe no-op) rather than false-fire. Sent once per graceful disconnect.
+#define W_EOT_PAYLOAD_BYTES 13
+#define W_EOT_FRAME_LENGTH  (1 + W_EOT_PAYLOAD_BYTES)
+
 //Load config level
 #define FULL 0
 #define PHYSICAL_LAYER_ONLY 1

@@ -1521,6 +1521,43 @@ int cl_arq_controller::add_message_control(char code)
 
 			pending_robust_dwell_batch = -1;
 		}
+		else if(code==CLOSE_CONNECTION)
+		{
+			// Option W STEP 3 (data-flow-stream-offset.md §8.6) — EOT (end-of-transfer) stamp.
+			// Ride this SENDER's final total_committed_bytes + running stream CRC-32 on the
+			// EXISTING graceful-disconnect frame (NO new handshake — the §8.6 teardown-race
+			// constraint). By the time this frame is built the CMD has drained the TX FIFO and
+			// every data batch is ACKed (arq_commander.cc:992), so both accumulators are FINAL.
+			// The peer (the CLOSE receiver = the data receiver) reconciles them against its
+			// delivered cursor/CRC, catching a truncated FINAL batch that the per-batch W checks
+			// (inherently one batch behind) cannot see. A pure-receiver / no-data closer emits
+			// committed=0, crc=INIT ⇒ the peer's 0/INIT matches (no false-fire).
+			// Defensive null-guard for the synthetic pre-init test path (mirrors SET_CONFIG).
+			if(messages_control.data == NULL)
+			{
+				messages_control.status = FREE;
+				messages_control.type = NONE;
+				return success;
+			}
+			messages_control.data[0] = code;
+			uint64_t eot_committed = tx_stream_committed;
+			for(int i=0;i<8;i++)
+				messages_control.data[1+i] = (char)((eot_committed >> (8*i)) & 0xFFu);
+			uint32_t eot_crc = tx_stream_crc;
+			for(int i=0;i<4;i++)
+				messages_control.data[9+i] = (char)((eot_crc >> (8*i)) & 0xFFu);
+			// crc8 over the 12 EOT payload bytes (data[1..12]), POLY_CRC8 (matches SET_LINK_PARAMS /
+			// SACK_RSP coverage rule). Lets the RX reject a short/legacy/garbled frame as ABSENT-EOT
+			// (safe no-op) instead of parsing stale bytes into a false teardown.
+			messages_control.data[W_EOT_PAYLOAD_BYTES] =
+				(char)CRC8_calc((char*)&messages_control.data[1], W_EOT_PAYLOAD_BYTES - 1);
+			messages_control.length = W_EOT_FRAME_LENGTH;
+			messages_control.id = 0;
+			printf("[CMD-EOT] CLOSE_CONNECTION+EOT TX: committed=%llu crc=0x%08x crc8=0x%02x\n",
+				(unsigned long long)eot_committed, eot_crc,
+				(unsigned char)messages_control.data[W_EOT_PAYLOAD_BYTES]);
+			fflush(stdout);
+		}
 		else
 		{
 			messages_control.length=1;
@@ -20165,6 +20202,13 @@ void cl_arq_controller::process_buffer_data_commander()
 			// leg, Σ data_read_size in the raw leg). 0 = no new bytes committed (re-entry
 			// with data already staged / fifo dry) → no latch. Latched at the end of this if.
 			int batch_committed_len = 0;
+			// Option W STEP 3 (data-flow-stream-offset.md §8.6): snapshot the running stream
+			// CRC-32 BEFORE this batch's bytes are folded (in the legs below) — this is the
+			// per-bsi rollback ANCHOR, stored into tx_stream_stamp[bsi].crc at the latch, and
+			// restored by stream_tx_rollback_inflight on a re-stage so a rebuild re-folds from
+			// here (INV4 for the CRC). Captured unconditionally; only USED when a batch is
+			// actually latched (batch_committed_len>0).
+			uint32_t batch_crc_anchor = tx_stream_crc;
 			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 			// payload budget. In v1 (default) identical to legacy macro; in v2
 			// loses 1 byte to the batch_seq_id field.
@@ -20594,6 +20638,12 @@ void cl_arq_controller::process_buffer_data_commander()
 					// Option W (§2.1): the compressed leg framed exactly comp_size transported
 					// bytes (post-compress → crypto-pad → encrypt(+tag)) for this new-data batch.
 					batch_committed_len = comp_size;
+					// Option W STEP 3 (§8.6): fold the exact framed transported bytes (comp_buf,
+					// the ciphertext/compressed stream — the SAME domain the RX folds from the
+					// reassembled messages_rx[i].data, INV5) into the running stream CRC-32. Folded
+					// as one blob here; the RX folds per-frame in slot order — CRC-32 is
+					// chunk-independent so the running registers agree byte-for-byte.
+					tx_stream_crc = crc32_update(tx_stream_crc, comp_buf, comp_size);
 					printf("[COMPRESS-TX] %d raw -> %d comp (%d frames), ratio_est=%.2f, fill=%.0f%%\n",
 						raw_size, comp_size, frame_num, compress_ratio_estimate,
 						100.0f * comp_size / batch_capacity);
@@ -20681,6 +20731,12 @@ void cl_arq_controller::process_buffer_data_commander()
 					// Option W (§2.1): raw leg — frame payload IS the transported payload
 					// (headerless, no compression), so accumulate the committed length.
 					batch_committed_len += data_read_size;
+					// Option W STEP 3 (§8.6): fold this frame's raw transported bytes into the
+					// running stream CRC-32, in pop (== stream) order. The RX folds the identical
+					// bytes (messages_rx[i].data) in the same order at copy_data_to_buffer, so the
+					// registers agree. (These are the exact bytes the 4 captured WGN:25 mechanisms
+					// corrupt — compression OFF ⇒ transported == app bytes.)
+					tx_stream_crc = crc32_update(tx_stream_crc, message_TxRx_byte_buffer, data_read_size);
 #ifdef MERCURY_GUI_ENABLED
 					// Monitor tap: plaintext (no compression path)
 					gui_push_monitor_text(message_TxRx_byte_buffer, data_read_size, true);
@@ -20701,7 +20757,14 @@ void cl_arq_controller::process_buffer_data_commander()
 			// re-entry that stages nothing. NEVER keyed off frame/expected counts (false-fire
 			// rule) — only the LATCHED committed byte length.
 			if(batch_committed_len > 0)
+			{
 				stream_tx_latch(cmd_batch_seq_id & 0xFF, (uint32_t)batch_committed_len);
+				// Option W STEP 3 (§8.6): store the TRUE pre-fold CRC anchor (the latch set a
+				// benign default = the post-fold running crc). This is the value a re-stage
+				// rollback restores tx_stream_crc to, so a rebuild re-folds the rebuilt bytes
+				// from the correct origin (INV4 for the CRC) — mirrors .start exactly.
+				tx_stream_stamp[cmd_batch_seq_id & 0xFF].crc = batch_crc_anchor;
+			}
 		}
 		else if(block_under_tx==YES && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{

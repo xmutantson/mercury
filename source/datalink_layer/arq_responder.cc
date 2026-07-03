@@ -3936,6 +3936,56 @@ void cl_arq_controller::process_control_responder()
 	{
 		if(code==CLOSE_CONNECTION)
 		{
+			// Option W STEP 3 (data-flow-stream-offset.md §8.6) — the EOT end-to-end LAST-BATCH
+			// tail-drop / final-content reconciliation. MUST run BEFORE reset_session_state()
+			// zeroes rx_stream_delivered / rx_stream_crc. The CLOSE frame carries the SENDER's
+			// final total_committed_bytes + running stream CRC-32 (add_message_control appended
+			// them; the RX msg-decode populates data[1..] even though length is hardcoded to 1 —
+			// same as the KEY_ACTIVATE tag). A crc8 over the 12 payload bytes distinguishes a real
+			// EOT from a short/legacy/garbled CLOSE ⇒ absent-EOT is a SAFE NO-OP (never a false
+			// teardown). This is the ONLY W check that sees a truncated FINAL batch (the per-batch
+			// stamp gates are one batch behind) — and, unlike them, it covers robust/cfg0 too
+			// (both accumulators fold at config-independent funnels). MERCURY_W_EOT_DEFEAT=1 =
+			// fail-before (the short final delivery is silently declared complete).
+			{
+				unsigned char eot_crc8 = (unsigned char)CRC8_calc(
+					(char*)&messages_control.data[1], W_EOT_PAYLOAD_BYTES - 1);
+				bool eot_present = ((unsigned char)messages_control.data[W_EOT_PAYLOAD_BYTES] == eot_crc8);
+				bool eot_defeat = false;
+				{ const char* e = std::getenv("MERCURY_W_EOT_DEFEAT");
+				  if(e && *e && atoi(e)!=0) eot_defeat = true; }
+				if(eot_present && !eot_defeat)
+				{
+					uint64_t peer_committed = 0;
+					for(int i=0;i<8;i++)
+						peer_committed |= ((uint64_t)(unsigned char)messages_control.data[1+i]) << (8*i);
+					uint32_t peer_crc = 0;
+					for(int i=0;i<4;i++)
+						peer_crc |= ((uint32_t)(unsigned char)messages_control.data[9+i]) << (8*i);
+					if(w_eot_mismatch(peer_committed, peer_crc))
+					{
+						printf("[RSP-V2-EOT-SHORT] LOUD: end-of-transfer shortfall/corruption — "
+							"delivered=%llu committed=%llu (delta=%lld) rx_crc=0x%08x tx_crc=0x%08x. "
+							"The FINAL batch was truncated/corrupted and has NO next-batch backstop; "
+							"the transfer is NOT complete (never a silent short/wrong final delivery).\n",
+							(unsigned long long)rx_stream_delivered,
+							(unsigned long long)peer_committed,
+							(long long)((int64_t)rx_stream_delivered - (int64_t)peer_committed),
+							rx_stream_crc, peer_crc);
+						fflush(stdout);
+#ifdef MERCURY_GUI_ENABLED
+						gui_push_monitor_event("[TRANSFER INCOMPLETE — EOT byte/CRC mismatch]", false);
+#endif
+					}
+					else
+					{
+						printf("[RSP-V2-EOT-OK] end-of-transfer verified: delivered==committed=%llu "
+							"crc=0x%08x (complete, in order, uncorrupted)\n",
+							(unsigned long long)rx_stream_delivered, rx_stream_crc);
+						fflush(stdout);
+					}
+				}
+			}
 #ifdef MERCURY_GUI_ENABLED
 			if(passive_monitor)
 				gui_push_monitor_event("[DISCONNECT]", false);

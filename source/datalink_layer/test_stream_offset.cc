@@ -610,6 +610,121 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
+	// PART U — the EOT end-to-end LAST-BATCH tail-drop check (data-flow-stream-offset.md §8.6).
+	// The per-batch W checks (PRIMARY byte-gate / BACKSTOP) are inherently ONE BATCH BEHIND: a
+	// truncated FINAL batch has no next-batch stamp to backstop it. At a graceful disconnect the
+	// CLOSE_CONNECTION frame carries the SENDER's final total_committed_bytes + running stream
+	// CRC-32; this RECEIVER reconciles them against its rx_stream_delivered + rx_stream_crc. This
+	// drives the PRODUCTION receiver fold (copy_data_to_buffer advances rx_stream_delivered AND
+	// folds rx_stream_crc via crc32_update over the delivered bytes) + the PRODUCTION predicate
+	// w_eot_mismatch() — the exact decision the RSP CLOSE handler makes. The counter catches a
+	// SHORT tail; the running CRC ALSO catches a same-LENGTH final-content corruption the counter
+	// is blind to. Mechanism-1/Fix-A shape: the final batch's tail frame is dropped on delivery.
+	//   PASS-AFTER (default): delivered < committed ⇒ w_eot_mismatch fires ⇒ the RSP raises
+	//     [RSP-V2-EOT-SHORT] and the transfer is NOT declared complete.
+	//   FAIL-BEFORE (MERCURY_W_EOT_DEFEAT=1 — the same env the production handler reads): the
+	//     CLOSE handler SKIPS the check ⇒ the short final delivery is silently declared complete.
+	printf("[TEST-STREAM-OFFSET] Part U — EOT last-batch tail-drop (truncated FINAL batch)\n");
+	{
+		bool eot_defeat = false;
+		{ const char* e = std::getenv("MERCURY_W_EOT_DEFEAT");
+		  if(e && *e && atoi(e)!=0) eot_defeat = true; }
+
+		const int UFLEN   = 100;   // bytes per delivered frame
+		const int UNDELIV = 3;     // frames of the FINAL batch that actually arrive
+		// Keep a copy of the delivered content so we can build a same-length corrupted CRC (U2).
+		char ubuf[UNDELIV][UFLEN];
+		for(int f=0; f<UNDELIV; f++)
+			for(int j=0; j<UFLEN; j++)
+				ubuf[f][j] = (char)((f*100 + j*7 + 3) & 0x7F);
+
+		// Fresh receiver: fold the DELIVERED bytes through the PRODUCTION funnel.
+		rx_stream_delivered = 0;
+		rx_stream_crc       = CRC32_INIT;
+		fifo_buffer_rx.flush();
+		this->data_batch_size = UNDELIV;
+		for(int f=0; f<nMessages; f++) messages_rx[f].status = FREE;
+		for(int f=0; f<UNDELIV; f++)
+		{
+			memcpy(messages_rx[f].data, ubuf[f], UFLEN);
+			messages_rx[f].length = UFLEN;
+			messages_rx[f].id     = (char)f;
+			messages_rx[f].status = ACKED;
+		}
+		decrypt_delivered_bsi = -1;                 // no wire stamp ⇒ BACKSTOP inert (isolate EOT)
+		rx_stream_stamp[255].valid = false;         // (decrypt_delivered_bsi & 0xFF) — keep no-op
+		copy_data_to_buffer();                      // PRODUCTION fold + rx_stream_delivered advance
+		{ char tmp[65536]; (void)fifo_buffer_rx.pop(tmp,(int)sizeof(tmp)); }  // drain the app fifo
+		CHECK(rx_stream_delivered == (uint64_t)(UNDELIV*UFLEN),
+			"U: receiver funnel advanced rx cursor by the delivered bytes",
+			(long long)rx_stream_delivered, (long long)(UNDELIV*UFLEN));
+
+		// The SENDER's committed stream = the UNDELIV delivered frames + ONE dropped TAIL frame
+		// (the final batch was truncated). Build committed count + running CRC over ALL of them.
+		uint64_t U_committed = 0;
+		uint32_t U_txcrc     = CRC32_INIT;
+		for(int f=0; f<UNDELIV; f++)
+		{
+			U_txcrc = crc32_update(U_txcrc, ubuf[f], UFLEN);   // sender folds the delivered frames
+			U_committed += UFLEN;
+		}
+		char utail[UFLEN];
+		for(int j=0; j<UFLEN; j++) utail[j] = (char)((999 + j*5) & 0x7F);
+		U_txcrc = crc32_update(U_txcrc, utail, UFLEN);          // ... and the dropped tail frame
+		U_committed += UFLEN;
+
+		// U0 — NO false-fire: a COMPLETE transfer (peer committed EXACTLY what we delivered) must
+		// NOT trip EOT. rx_stream_crc == the sender's fold of the SAME delivered frames.
+		CHECK(!w_eot_mismatch(rx_stream_delivered, rx_stream_crc),
+			"U0: complete transfer does NOT trip EOT (no false-fire)",
+			(long long)rx_stream_delivered, (long long)rx_stream_delivered);
+		// U0b — a no-data connection (0 committed, 0 delivered, INIT crc) is a safe no-op.
+		{
+			uint64_t sd = rx_stream_delivered; uint32_t sc = rx_stream_crc;
+			rx_stream_delivered = 0; rx_stream_crc = CRC32_INIT;
+			CHECK(!w_eot_mismatch((uint64_t)0, (uint32_t)CRC32_INIT),
+				"U0b: no-data close is a safe no-op (0==0, INIT==INIT)", 0, 0);
+			rx_stream_delivered = sd; rx_stream_crc = sc;
+		}
+
+		// U — the tail-drop trips EOT (delivered 300 < committed 400). Pure predicate: fires in
+		// BOTH modes (the env-defeat lives in the production caller, exercised below).
+		CHECK(w_eot_mismatch(U_committed, U_txcrc),
+			"U: last-batch tail-drop trips EOT (delivered<committed)",
+			(long long)rx_stream_delivered, (long long)U_committed);
+
+		// U2 — a SAME-LENGTH final-content corruption (delivered==committed count) that the byte
+		// counter is BLIND to, caught by the running CRC. Fold the delivered content with one bit
+		// flipped: same count, different CRC ⇒ w_eot_mismatch fires via the CRC leg alone.
+		uint32_t U2crc = CRC32_INIT;
+		for(int f=0; f<UNDELIV; f++)
+		{
+			char tmp[UFLEN]; memcpy(tmp, ubuf[f], UFLEN);
+			if(f==0) tmp[0] ^= 0x01;   // one bit; length unchanged
+			U2crc = crc32_update(U2crc, tmp, UFLEN);
+		}
+		CHECK(rx_stream_delivered == (uint64_t)(UNDELIV*UFLEN) && U2crc != rx_stream_crc &&
+		      w_eot_mismatch(rx_stream_delivered, U2crc),
+			"U2: same-length final-content corruption caught by CRC (counter blind)",
+			(long long)rx_stream_delivered, (long long)rx_stream_delivered);
+
+		// Fail-before / pass-after (mirror Parts R/S — the DEFEAT arm turns this RED). The RSP
+		// CLOSE handler declares the transfer INCOMPLETE iff (!MERCURY_W_EOT_DEFEAT && mismatch)
+		// — the EXACT production predicate (arq_responder.cc CLOSE_CONNECTION handler). A real
+		// last-batch tail-drop MUST be declared incomplete:
+		//   pass-after (default): declared_incomplete == true  → GREEN.
+		//   fail-before (MERCURY_W_EOT_DEFEAT=1): the guard is skipped → declared_incomplete ==
+		//     false → this CHECK goes RED, proving that WITHOUT the EOT guard the short final
+		//     delivery would be SILENTLY declared complete (never a next-batch backstop).
+		bool declared_incomplete = (!eot_defeat && w_eot_mismatch(U_committed, U_txcrc));
+		CHECK(declared_incomplete,
+			"U: real tail-drop declared INCOMPLETE (fail-before: EOT-defeat → RED)",
+			(long long)declared_incomplete, 1);
+		printf("[TEST-STREAM-OFFSET] Part U eot_defeat=%d (0=fix→GREEN, 1=defeat→RED expected)\n",
+			(int)eot_defeat);
+	}
+
+	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);
 	fflush(stdout);
 	if(g_fails == 0)

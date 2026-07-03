@@ -704,6 +704,8 @@ cl_arq_controller::cl_arq_controller()
 	// all per-bsi stamps invalid until a batch is built.
 	tx_stream_committed=0;
 	rx_stream_delivered=0;
+	tx_stream_crc=CRC32_INIT;   // Option W STEP 3 (§8.6): running stream CRC seed
+	rx_stream_crc=CRC32_INIT;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
 	// SACK Design A Step 4 — RSP cross-batch routing state. All gated on
@@ -7069,6 +7071,8 @@ void cl_arq_controller::reset_session_state()
 	// next connection's stream starts at offset 0 with no stale stamp aliasing.
 	tx_stream_committed = 0;
 	rx_stream_delivered = 0;
+	tx_stream_crc = CRC32_INIT;   // Option W STEP 3 (§8.6): fresh running stream CRC per session
+	rx_stream_crc = CRC32_INIT;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
 
@@ -14070,7 +14074,46 @@ void cl_arq_controller::stream_tx_latch(int bsi, uint32_t transported_len)
 	tx_stream_stamp[b].start  = tx_stream_committed;
 	tx_stream_stamp[b].length = transported_len;
 	tx_stream_stamp[b].valid  = true;
+	// Option W STEP 3 (§8.6): benign default CRC anchor = the current running crc. The
+	// PRODUCTION build funnel folds this batch's bytes in the two legs BEFORE calling the
+	// latch, so it OVERWRITES this field immediately after with the true PRE-fold anchor
+	// (arq_commander.cc, the batch_crc_anchor captured before the legs). This default keeps
+	// the field defined for callers that never fold (the deterministic cursor test), so a
+	// subsequent rollback restore reads a defined value (a harmless no-op there).
+	tx_stream_stamp[b].crc    = tx_stream_crc;
 	tx_stream_committed += (uint64_t)transported_len;
+}
+
+uint32_t cl_arq_controller::crc32_update(uint32_t crc, const void* data, int len)
+{
+	// Option W STEP 3 (§8.6): standard reflected CRC-32 (IEEE 802.3, poly 0xEDB88320),
+	// bitwise so there is no static table to initialise (no init-order / thread race). Both
+	// peers fold with this identical routine and compare the running registers directly, so
+	// the running seed (CRC32_INIT) need not be XOR-finalised. Data rates are tiny (HF), so
+	// the per-byte bit loop is negligible.
+	const unsigned char* p = (const unsigned char*)data;
+	for(int i=0;i<len;i++)
+	{
+		crc ^= (uint32_t)p[i];
+		for(int b=0;b<8;b++)
+			crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+	}
+	return crc;
+}
+
+bool cl_arq_controller::w_eot_mismatch(uint64_t peer_committed, uint32_t peer_crc) const
+{
+	// Option W STEP 3 (§8.6): the end-of-transfer reconciliation. The CLOSE-frame carries the
+	// SENDER's final committed byte count + running CRC; this receiver's delivered cursor + CRC
+	// must match. A mismatch is a genuine shortfall/corruption on the FINAL batch (the one blind
+	// spot: a truncated last batch has no next-batch stamp to catch it). Pure decision — the
+	// LOUD teardown + the MERCURY_W_EOT_DEFEAT fail-before arm live in the production caller (the
+	// RSP CLOSE_CONNECTION handler), mirroring the w_bytegate_shortfall / w_stream_shift_detected
+	// pattern (env-defeat in the caller, not the predicate). FALSE-FIRE: 0==0 (no-data close),
+	// INIT==INIT, and a complete/robust-only transfer (config-independent cursors) all return false.
+	if(rx_stream_delivered != peer_committed) return true;
+	if(rx_stream_crc      != peer_crc)        return true;
+	return false;
 }
 
 // The re-stage un-commit (§2.2 / INV3). On a demote / BREAK / CFG16-HOLD re-stage the
@@ -14121,7 +14164,17 @@ void cl_arq_controller::stream_tx_rollback_inflight()
 	}
 	if(!tx_stream_stamp[min_bsi].valid) return;      // never latched (defensive no-op)
 	if(tx_stream_committed > tx_stream_stamp[min_bsi].start)
+	{
 		tx_stream_committed = tx_stream_stamp[min_bsi].start;   // LIFO un-commit (only lowers)
+		// Option W STEP 3 (§8.6): roll the running stream CRC-32 back to this batch's
+		// PRE-fold anchor in LOCKSTEP with the byte cursor. A rebuild then re-folds the
+		// rebuilt batch's bytes from the correct anchor (INV4 for the CRC), so the sender's
+		// final tx_stream_crc reflects exactly the bytes actually delivered — never the
+		// bytes of a rolled-back/failed build. Restored inside the same >-guard so a
+		// redundant (already-rolled) call is an idempotent no-op (nothing folds between
+		// rollback calls). CRC is not monotone, so it is set, not min'd.
+		tx_stream_crc = tx_stream_stamp[min_bsi].crc;
+	}
 }
 
 void cl_arq_controller::rx_stream_invalidate_stamps()
@@ -14353,6 +14406,12 @@ void cl_arq_controller::copy_data_to_buffer()
 			if(messages_rx[i].status==ACKED)
 			{
 				delivered_transported += messages_rx[i].length;   // Option W (§2.3)
+				// Option W STEP 3 (§8.6): fold the delivered transported bytes (this frame's
+				// reassembled ciphertext/compressed payload) into the running RX stream CRC-32,
+				// in slot (== stream) order. The TX folded the identical bytes (comp_buf) in the
+				// same order at build (INV5). Folded from messages_rx[i].data (not the capped
+				// `assembled` buffer) so a >16 KB batch still folds every byte.
+				rx_stream_crc = crc32_update(rx_stream_crc, messages_rx[i].data, messages_rx[i].length);
 				if(assembled_size + messages_rx[i].length <= (int)sizeof(assembled))
 				{
 					memcpy(assembled + assembled_size,
@@ -14528,6 +14587,10 @@ void cl_arq_controller::copy_data_to_buffer()
 			if(messages_rx[i].status==ACKED)
 			{
 				delivered_transported += messages_rx[i].length;   // Option W (§2.3)
+				// Option W STEP 3 (§8.6): raw leg — fold the delivered transported bytes into the
+				// running RX stream CRC-32, in slot (== stream) order. Identical bytes+order to the
+				// TX raw-leg fold (message_TxRx_byte_buffer at build), so the registers agree.
+				rx_stream_crc = crc32_update(rx_stream_crc, messages_rx[i].data, messages_rx[i].length);
 #ifdef MERCURY_GUI_ENABLED
 				gui_push_monitor_text(messages_rx[i].data, messages_rx[i].length, false);
 #endif

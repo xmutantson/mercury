@@ -754,3 +754,51 @@ late stamp-independent GAP-ABORT). Closing the robust/cfg0 short-PREV is a DISTI
 (needs a stamp-independent reference — mechanism-4 shrinks the frame-count reference, so not a
 trivial reuse) and is out of Option W's scope. NET: the PREV-path gap is closed where stamps
 ride; the c11w006 cell is not.
+
+## §19 EOT SHIPPED — the end-to-end last-batch tail-drop + running-CRC check (2026-07-03)
+
+Option W's per-batch checks (PRIMARY byte-gate / BACKSTOP / PREV-gate) are inherently ONE BATCH
+BEHIND: a truncated FINAL batch has no next-batch stamp to backstop it. This clip lands the EOT
+(end-of-transfer) check — the ONLY true end-to-end catch — on branch `feat/eot-turnkey` (off
+`monitor@9f0d50e1`, where Option W CORE + PREV-gate are merged).
+
+**The fix (data-flow-stream-offset.md §8.6 SHIPPED / §10):** at a graceful disconnect the sender's
+CLOSE_CONNECTION frame carries `[ committed:u64 ][ crc32:u32 ][ crc8:u8 ]` (13 B after `data[0]`,
+frame length 14) — wired into the EXISTING CLOSE control code (NO new handshake, honouring the
+teardown-race constraint). The receiver, on RECEIVING CLOSE and BEFORE `reset_session_state()`
+zeroes its cursors, asserts `rx_stream_delivered == committed AND rx_stream_crc == crc32`; mismatch
+→ LOUD `[RSP-V2-EOT-SHORT]` (the transfer is NOT declared complete — never a silent short/wrong
+final delivery). A running stream CRC-32 (`tx_stream_crc` / `rx_stream_crc`) folds every committed /
+delivered transported byte at the config-independent funnels, with a per-bsi rollback anchor
+(`StreamStamp.crc`) restored in lockstep with `.start` at every re-stage — so it survives the
+demote/BREAK re-stage machinery (INV4 for the CRC). The counter catches a SHORT tail; the CRC ALSO
+catches a same-LENGTH final-content corruption the counter is blind to.
+
+**Coverage vs the per-batch gates — EOT covers robust/cfg0.** Both accumulators fold at the ONE build
+funnel / `copy_data_to_buffer`, NOT gated by `w_stamp_rides()`, so — UNLIKE the stamp-based PRIMARY /
+BACKSTOP / PREV gates (structurally inert at robust/cfg0, §18 O5/O6) — the EOT counter + CRC are
+maintained END-TO-END at ALL configs. A robust/cfg0 tail-drop that reaches a graceful disconnect is
+now caught (the c11w006 *shape* at end-of-transfer). NOTE: c11w006 itself GAP-ABORTed mid-stream so
+it never reached a CLOSE — EOT is the graceful-close catch, not a mid-stream one; the mid-stream
+robust/cfg0 short-PREV (§18 O6) remains a distinct residual.
+
+**Deterministic test (`--test-stream-offset` Part U):** drives the PRODUCTION receiver fold
+(`copy_data_to_buffer` advances `rx_stream_delivered` + folds `rx_stream_crc`) + the PRODUCTION
+predicate `w_eot_mismatch()` on the mechanism-1/Fix-A shape (a final batch whose tail frame is
+dropped on delivery). Verified on the o3 binary:
+- **pass-after (default):** U0 complete-transfer no-false-fire; U0b no-data no-op; U tail-drop trips
+  (delivered 300 < committed 400); U2 same-length content corruption caught by the CRC (counter
+  blind); `U: real tail-drop declared INCOMPLETE` GREEN. `--test-stream-offset` EXIT=0.
+- **fail-before (`MERCURY_W_EOT_DEFEAT=1`):** the control-flow CHECK turns RED (EXIT=1) — proving
+  that WITHOUT the EOT guard the short final delivery is SILENTLY declared complete.
+
+**FALSE-FIRE discipline (proven):** legit complete transfer (delivered==committed, crc==crc) →
+no fire (U0); no-data / pure-receiver close (0==0, INIT==INIT) → no fire (U0b); robust-only clean
+transfer matches (config-independent accumulators) → no fire; absent/legacy/garbled CLOSE (crc8
+fails) → absent-EOT safe no-op. SCOPE: EOT fires on the CLOSE-RECEIVER side (covers the standard
+CMD-drains-and-closes → RSP-checks one-directional flow); a receiver-initiated disconnect is not
+checked (O2 role-switch, out of scope). The per-batch same-position-corruption EOB co-stamp (3a)
+that would LOCALISE content corruption mid-stream remains DEFERRED (out of the compression-off cohort).
+
+**Wire cost:** 14 B on the CLOSE_CONNECTION frame, once per graceful disconnect (was 1 B). Zero cost
+on the data path. **Merge:** owner fork (wire change); lands only after its regression-cohort gate.

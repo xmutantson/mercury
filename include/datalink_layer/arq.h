@@ -3216,6 +3216,23 @@ public:
   void stream_tx_latch(int bsi, uint32_t transported_len);
   void stream_tx_rollback_inflight();
 
+  // Option W STEP 3 (data-flow-stream-offset.md §8.6): portable reflected CRC-32 (IEEE
+  // 802.3, poly 0xEDB88320) byte-fold. Pure/static; both peers fold identically so the
+  // running registers compare directly. Used by the TX build-leg folds, the RX delivery
+  // fold, and the deterministic test — one implementation, no table-init race.
+  static uint32_t crc32_update(uint32_t crc, const void* data, int len);
+
+  // Option W STEP 3 — the EOT (end-of-transfer) decision predicate (pure; no side effects;
+  // no socket). At a clean disconnect the CLOSE_CONNECTION frame carries the SENDER's final
+  // total_committed_bytes + running tx_stream_crc; this RECEIVER asserts its rx_stream_delivered
+  // + rx_stream_crc match. true ⇒ a genuine last-batch tail-drop / final-batch content
+  // corruption (the one blind spot the per-batch W checks cannot see — a truncated FINAL batch
+  // has no next-batch backstop). FALSE-FIRE safe: a complete transfer (delivered==committed,
+  // crc==crc) returns false; a no-data close (0==0, INIT==INIT) returns false; a clean
+  // robust-only session matches (both cursors are config-independent). Production (the RSP
+  // CLOSE handler) AND test_stream_offset Part U both call this — same decision on both paths.
+  bool w_eot_mismatch(uint64_t peer_committed, uint32_t peer_crc) const;
+
   // Option W CORE (F4.2, silent-corruption-residual.md §16/§17.5): invalidate every
   // parsed RX wire stamp on a config change. A config change ALWAYS re-stages the
   // sender's in-flight batch, so any rx_stream_stamp[] parsed-but-not-yet-delivered is
@@ -3357,7 +3374,12 @@ public:
   // the FIRST divergent byte, regardless of which producer/layer caused it. Offset
   // domain = TRANSPORTED (post-compression) bytes counted at the pop/push funnels
   // (data-flow-stream-offset.md §0). FOUNDATION = cursors only (no wire, no gate).
-  struct StreamStamp { uint64_t start; uint32_t length; bool valid; };
+  // Option W STEP 3 (data-flow-stream-offset.md §8.6): the `.crc` field is the per-bsi
+  // rollback ANCHOR for the running stream CRC-32 (the CRC value BEFORE this batch's bytes
+  // were folded). Snapshotted at latch, restored on re-stage rollback — mirrors `.start`
+  // EXACTLY so a rebuild re-folds from the correct anchor (INV4 for the CRC). Unused on the
+  // rx_stream_stamp[] (wire-parse) side.
+  struct StreamStamp { uint64_t start; uint32_t length; bool valid; uint32_t crc; };
   uint64_t tx_stream_committed;        // CMD: cumulative transported bytes committed to built
                                        //      batches, in build order (== next new-batch start).
   StreamStamp tx_stream_stamp[256];    // CMD: per-bsi latched {start,length}. Latched at BUILD,
@@ -3365,6 +3387,16 @@ public:
                                        //      on re-stage rollback. Index = batch_seq_id & 0xFF.
   uint64_t rx_stream_delivered;        // RSP: cumulative transported bytes delivered through
                                        //      copy_data_to_buffer(), in delivery order.
+  // Option W STEP 3 — the running stream CRC-32 accumulators (data-flow-stream-offset.md §8.6).
+  // tx_stream_crc folds every committed transported byte at the ONE build funnel (both legs),
+  // with the per-bsi rollback anchor above; rx_stream_crc folds every delivered transported
+  // byte at the ONE receiver funnel (copy_data_to_buffer). Config-INDEPENDENT (folded at the
+  // funnels, not gated by w_stamp_rides), so — unlike the per-batch wire stamp — the running
+  // CRC (and the byte counters) are maintained end-to-end at ALL configs incl. robust/cfg0.
+  // Compared at end-of-transfer by the EOT check (w_eot_mismatch). Reset to CRC32_INIT at
+  // session reset + ctor. Running register (no final XOR); both peers fold identically.
+  uint32_t tx_stream_crc;              // CMD: running CRC-32 over committed transported bytes.
+  uint32_t rx_stream_crc;              // RSP: running CRC-32 over delivered transported bytes.
   // Option W CORE (STEP 2, data-flow-stream-offset.md §8): the per-bsi stamp PARSED
   // from the wire EOB frame on the RSP. .start holds start_lo32 (low 32 bits; high
   // bits 0), .length holds length16, .valid set on parse. The RSP PRIMARY byte-gate
