@@ -301,6 +301,25 @@ inline int effective_data_short_header_length(bool sack_v2, bool with_d5 = true)
 	return with_d5 ? DATA_SHORT_HEADER_LENGTH_V2 : DATA_SHORT_HEADER_LENGTH_V2_NO_D5;
 }
 
+// (B) LOUD BACKSTOP — CMD>RSP batch-size desync detector (silent-corruption-residual.md
+// §7-B, data-flow-batch-size.md §8). `sender_total_frames` is the SENDER-declared per-batch
+// frame count carried on EVERY DATA frame (D5 batch_total_frames = message_batch_counter_tx),
+// as the RSP sees it at the ACK-GATE (rx_batch_total_frames). `local_batch` is the RSP's own
+// data_batch_size. When the load-bearing invariant CMD data_batch_size == RSP data_batch_size
+// holds, the CMD can never pack MORE frames than its own (== the RSP's) batch size, so
+// sender_total_frames > local_batch is a PRECISE, false-positive-free signal that the CMD
+// built a LARGER batch than the RSP applied (the CMD>RSP desync — CMD=30, RSP=25 in res_c3100).
+// Delivering the batch at the smaller local size TRUNCATES it and silently ORPHANS the
+// sender's surplus frames -> a permanent one-batch stream shift. D5 is sack_v2-only (robust /
+// batch=1 configs never carry the byte, so sender_total_frames stays <=0 there and this
+// returns false — the backstop is inert at robust, where the batch is pinned symmetric).
+// true => the RSP must NOT silently deliver; raise [RSP-V2-BATCHSIZE-DESYNC] + abort so the
+// mismatch surfaces LOUD and the link resyncs, never a silent orphan (integrity D0).
+inline bool batchsize_desync_detected(int sender_total_frames, int local_batch, bool sack_v2)
+{
+	return sack_v2 && sender_total_frames > 0 && sender_total_frames > local_batch;
+}
+
 // SACK: Double-buffered crypto batch storage for partial batch handling.
 // Responder stores frames from up to 2 crypto batches (the one being completed
 // via retransmits and the new one arriving in the same radio batch).
@@ -2662,6 +2681,16 @@ public:
   //     the gate fires → the full 30-frame batch delivers in order (faithful).
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_eob_loss_batch_truncation();
+
+  // CMD>RSP batch-size desync SILENT-CORRUPTION regression (res_c3100, silent-
+  // corruption-residual.md §8 / data-flow-batch-size.md §8). Drives the REAL shared
+  // batchsize_desync_detected() decision + REAL copy_data_to_buffer() delivery +
+  // rsp_gap_abort_teardown() abort with fifo_buffer_rx as a byte-exact oracle.
+  //   fail-before (MERCURY_BATCHSIZE_DESYNC_DEFEAT=1): the RSP delivers the 30-frame
+  //     batch truncated to 25 -> the delivered stream is a silent one-batch SHIFT.
+  //   pass-after (default): the (B) backstop raises [RSP-V2-BATCHSIZE-DESYNC] and
+  //     aborts (link DROPPED) -> nothing silently delivered. Returns 0=PASS, 1=FAIL.
+  int test_batchsize_desync_delivery();
 
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------

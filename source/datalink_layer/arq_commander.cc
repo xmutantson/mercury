@@ -11819,6 +11819,26 @@ int cl_arq_controller::test_climb_engine()
 		"D5 OFDM (CONFIG_10) recompute scales batch to SACK floor >=5 (fix is robust-only)",
 		ofdm_batch, 5);
 
+	// D6 (extends Part D — the res_c3100 SILENT-CORRUPTION integrity gate): the four
+	// wire failures Part D guards were STALLS (all-ones target mismatch, no clean credit).
+	// A FIFTH, WORSE consequence of the SAME CMD>RSP data_batch_size desync is SILENT DATA
+	// CORRUPTION: mid-session the CMD steps to 30 while the RSP is stuck at 25 (config-reset
+	// + an unapplied SET_LINK_PARAMS), and the RSP ACK-GATE `expected` clamp collapses the
+	// SENDER-declared count (30) to its own 25 -> the batch DELIVERS TRUNCATED, orphaning
+	// frames 25-29 -> a permanent one-batch stream shift (silent-corruption-residual.md §8).
+	// Drive the FULL RSP delivery path (REAL batchsize_desync_detected() + copy_data_to_buffer()
+	// + rsp_gap_abort_teardown()) on a THROWAWAY controller (its own buffers, no IONOS/RF).
+	// fail-before (MERCURY_BATCHSIZE_DESYNC_DEFEAT=1): the truncated 25-frame delivery
+	// reproduces the shift; pass-after: the (B) LOUD BACKSTOP raises [RSP-V2-BATCHSIZE-DESYNC]
+	// and aborts (link DROPPED) -> nothing silently delivered.
+	{
+		cl_arq_controller bsd_arq;
+		int d6 = bsd_arq.test_batchsize_desync_delivery();
+		check(d6 == 0,
+			"D6 CMD>RSP batch-size desync -> LOUD abort, never silent truncation (res_c3100)",
+			d6, 0);
+	}
+
 	// ================================================================
 	// Part E — DEEP-SNR DOWN-HYSTERESIS, anchor DEMOTION (gearshift-climb-engine.md
 	// §10). THE climb follow-up #2 bug: the WGN:-10 CONFIG_0↔ROBUST_0 thrash. A slow

@@ -1235,6 +1235,17 @@ int main(int argc, char *argv[])
             // (anti-re-decode preserved). Faithful in-process synthetic-fire through the
             // production transmit_byte/receive_byte (no IONOS/RF).
             failed += run_acq_bounds_selftest();
+            // CMD>RSP BATCH-SIZE DESYNC silent-corruption gate (res_c3100, silent-
+            // corruption-residual.md §8): a CMD>RSP data_batch_size desync (CMD built 30,
+            // RSP applied 25) makes the RSP ACK-GATE deliver the batch TRUNCATED to its
+            // smaller size -> a permanent silent stream shift. The (B) LOUD BACKSTOP
+            // detects the sender-declared count exceeding the local batch and aborts
+            // (link DROPPED) instead of silently delivering. In-process synthetic-fire
+            // (no IONOS/RF) — a permanent integrity D0 regression gate.
+            {
+                cl_arq_controller ARQ_bsd;
+                failed += ARQ_bsd.test_batchsize_desync_delivery();
+            }
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
@@ -1650,6 +1661,9 @@ int main(int argc, char *argv[])
                                         // byte-faithful re-receive -> single in-order delivery, no silent loss.
                                         // fail-before via env-off (stall reproduced), pass-after via MERCURY_SPEC_SACK=1.
                                         // One-shot, exits rc. See fact-documents/turnaround-eff.md §8/§9.
+    bool test_batchsize_desync_cli = false; // --test-batchsize-desync: res_c3100 CMD>RSP batch-size desync
+                                        // silent-corruption regression (silent-corruption-residual.md §8).
+                                        // fail-before via MERCURY_BATCHSIZE_DESYNC_DEFEAT=1.
     bool test_eob_loss_batch_truncation_cli = false; // --test-eob-loss-batch-truncation: D5 — EOB-inference
                                         // batch truncation. A 30-frame batch loses its EOB-marked tail; the
                                         // wired batch_total_frames recovers the true length. fail-before via
@@ -2644,6 +2658,16 @@ int main(int argc, char *argv[])
             // (MERCURY_SPEC_SACK=1). See source/datalink_layer/arq_responder.cc
             // test_spec_sack + fact-documents/turnaround-eff.md §8/§9.
             test_spec_sack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batchsize-desync") == 0)
+        {
+            // res_c3100 — CMD>RSP batch-size desync silent-corruption regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_batchsize_desync_delivery
+            // + silent-corruption-residual.md §8. fail-before: MERCURY_BATCHSIZE_DESYNC_DEFEAT=1.
+            test_batchsize_desync_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4479,6 +4503,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_spec_sack();
             printf("[FLAG] Spec-SACK test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_batchsize_desync_cli) {
+            // res_c3100 — CMD>RSP batch-size desync silent-corruption (one-shot, exit rc).
+            printf("[FLAG] --test-batchsize-desync: invoking CMD>RSP batch-size desync "
+                   "silent-corruption regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batchsize_desync_delivery();
+            printf("[FLAG] batchsize-desync test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

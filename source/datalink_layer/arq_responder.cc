@@ -2206,6 +2206,60 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				printf("\n"); fflush(stdout);
 			}
 
+			// (B) LOUD BACKSTOP — CMD>RSP batch-size desync integrity gate
+			// (silent-corruption-residual.md §7-B / data-flow-batch-size.md §8). The
+			// SENDER-declared per-batch frame count (rx_batch_total_frames — D5, carried on
+			// EVERY DATA frame = the CMD's message_batch_counter_tx) EXCEEDS our own
+			// data_batch_size => the CMD built a LARGER batch than the RSP applied (CMD Axis-2
+			// stepped up but the RSP never durably APPLIED the SET_LINK_PARAMS — the §1
+			// CMD==RSP invariant is BROKEN, CMD>RSP). The `expected` clamp above just collapsed
+			// that count to our smaller size, so the PASS path below would DELIVER the batch
+			// TRUNCATED and treat it complete, ORPHANING the sender's surplus frames -> a
+			// permanent silent stream shift (res_c3100, WGN:25 ~3%). Integrity D0: the RSP must
+			// NEVER silently deliver a batch truncated below the sender-declared size. Raise
+			// LOUD + abort via the SAME tested teardown the D3.1 delivery-gap gate uses so the
+			// link resyncs cleanly. INERT unless CMD>RSP (matched / step-down batches keep
+			// rx_batch_total_frames <= data_batch_size; robust batch=1 carries no D5 byte).
+			// MERCURY_BATCHSIZE_DESYNC_DEFEAT=1 disables it (fail-before arm, mirrors
+			// MERCURY_GAP_ABORT_DEFEAT / MERCURY_D5_INFER_DEFEAT — restores the silent truncation).
+			bool batchsize_desync_defeat = false;
+			{ const char* e = std::getenv("MERCURY_BATCHSIZE_DESYNC_DEFEAT");
+			  if(e && *e && atoi(e)!=0) batchsize_desync_defeat = true; }
+			if(!batchsize_desync_defeat && !passive_monitor
+			   && batchsize_desync_detected(rx_batch_total_frames, data_batch_size, sack_v2_enabled))
+			{
+				printf("[RSP-V2-BATCHSIZE-DESYNC] sender batch_total_frames=%d > local "
+					"data_batch_size=%d (bsi=%d rx=%d) — CMD built a LARGER batch than RSP "
+					"applied; REFUSING to deliver a batch truncated below the sender size "
+					"(would orphan %d frames -> silent stream shift). Aborting link for clean "
+					"resync.\n",
+					rx_batch_total_frames, data_batch_size,
+					rsp_current_expected_batch_seq_id, rx_received,
+					rx_batch_total_frames - data_batch_size);
+				fflush(stdout);
+				char reason[128];
+				snprintf(reason, sizeof(reason),
+					"BATCHSIZE-DESYNC sender_total=%d > local_batch=%d (CMD>RSP truncation)",
+					rx_batch_total_frames, data_batch_size);
+				rsp_gap_abort_teardown(reason);   // link DROPPED + session reset; NO delivery, NO ACK
+				// Re-arm the receiver + return WITHOUT ACKing/delivering — identical telecom
+				// discipline to the back-pressure HOLD / SACK-suppress early returns below. No
+				// clean ACK is emitted, so the CMD never falsely credits the truncated batch;
+				// the DROPPED link_status the teardown set drives the main loop to handle the
+				// drop on the next cycle (the SAME RECEIVING+DROPPED post-abort state the D3.1
+				// GAP-ABORT produces).
+				batch_rx_frame_count = 0;
+				last_received_end_of_batch_seq = -1;
+				telecom_system->data_container.frames_to_read =
+					telecom_system->data_container.preamble_nSymb
+					+ telecom_system->get_active_nsymb();
+				telecom_system->data_container.nUnder_processing_events = 0;
+				calculate_receiving_timeout();
+				receiving_timer.start();
+				connection_status = RECEIVING;
+				return;
+			}
+
 			if(data_batch_size > 1 && rx_received < expected && !passive_monitor)
 			{
 				if(sack_enabled && rx_received > 0)
@@ -13073,4 +13127,256 @@ int cl_arq_controller::test_eob_loss_batch_truncation()
 		pass ? "PASS" : "FAIL", fails, defeat ? 1 : 0);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// ==========================================================================
+// test_batchsize_desync_delivery (silent-corruption-residual.md §8, data-flow-
+// batch-size.md §8) — the res_c3100 SILENT CORRUPTION regression (WGN:25 ~3%). A
+// CMD>RSP data_batch_size desync (CMD built 30 frames, RSP applied 25) makes the
+// RSP ACK-GATE `expected` clamp collapse the SENDER-declared count (rx_batch_total_
+// frames=30, D5, carried on every DATA frame) down to the RSP's smaller size, so
+// the batch DELIVERS TRUNCATED and treats itself complete -> the sender's surplus
+// frames are ORPHANED -> a permanent one-batch stream SHIFT (every byte from the
+// boundary is silently wrong until the transfer aborts).
+//
+// Drives the REAL shared decision helper batchsize_desync_detected() (the SAME
+// pure predicate the production ACK-GATE at arq_responder.cc calls) + the REAL
+// copy_data_to_buffer() delivery + rsp_gap_abort_teardown() abort + fifo_buffer_rx
+// as a byte-exact oracle (compression OFF -> byte-exact leg; distinct per-(bsi,slot)
+// bytes so a shift is visible in the delivered stream).
+//
+//   fail-before (MERCURY_BATCHSIZE_DESYNC_DEFEAT=1): the backstop is disabled, so
+//     the RSP delivers batch7 truncated to 25 frames, advances, and delivers
+//     batch8 -> the drained stream is batch7[0..24] ++ batch8[0..24], MISSING
+//     batch7[25..29] (a SHIFT) != the faithful 30+25 tx oracle. The test asserts
+//     the corruption reproduces (and the link did NOT abort).
+//   pass-after (default, backstop ON): batchsize_desync_detected(30,25,v2)=true ->
+//     rsp_gap_abort_teardown (link DROPPED) -> NOTHING silently delivered for the
+//     truncated batch. The test asserts the LOUD abort + zero silent delivery.
+//
+// CASE-MATCHED (byte-identical guard): a matched 25/25 batch (sender_total==local)
+//   is NOT a desync -> delivers faithfully in BOTH modes (backstop INERT — no
+//   regression / no false positive). CASE-STEPDOWN: CMD<RSP + non-v2 are SAFE (no
+//   abort). Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_batchsize_desync_delivery()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_BATCHSIZE_DESYNC_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-BSDESYNC] start (MERCURY_BATCHSIZE_DESYNC_DEFEAT=%d)\n", defeat ? 1 : 0);
+	fflush(stdout);
+
+	// --- in-process scaffold (mirror test_eob_loss_batch_truncation) -------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 7;   // v2 DATA_SHORT header with D5
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-BSDESYNC] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled     = true;
+	this->sack_enabled        = true;
+	this->header_carries_d5   = true;
+	this->compression_enabled = false;   // byte-exact no-compression leg of copy_data_to_buffer()
+
+	const int FRAMELEN = 8;
+	// Distinct per-(bsi,slot) bytes so a missing/shifted frame is visible in the stream.
+	auto frame_bytes = [&](int bsi, int i, char* out) {
+		for(int j=0; j<FRAMELEN; j++)
+			out[j] = (char)(unsigned char)( (((bsi & 0x7) << 5) | (i & 0x1F)) + j );
+	};
+	// Seat messages_rx[] with `n_present` frames (ids 0..n_present-1) of batch `bsi`,
+	// and set the SENDER-declared count (rx_batch_total_frames, the D5 wire value).
+	auto seat_batch = [&](int bsi, int n_present, int sender_total) {
+		for(int i=0; i<this->nMessages; i++)
+		{
+			messages_rx[i].status       = FREE;
+			messages_rx[i].length       = 0;
+			messages_rx[i].batch_seq_id = -1;
+		}
+		for(int i=0; i<n_present && i<this->nMessages; i++)
+		{
+			char b[FRAMELEN]; frame_bytes(bsi, i, b);
+			messages_rx[i].type         = DATA_SHORT;
+			messages_rx[i].id           = (char)i;
+			messages_rx[i].length       = FRAMELEN;
+			memcpy(messages_rx[i].data, b, FRAMELEN);
+			messages_rx[i].status       = RECEIVED;
+			messages_rx[i].batch_seq_id = bsi;
+		}
+		this->rx_batch_total_frames             = (sender_total > 0) ? sender_total : -1;
+		this->last_received_end_of_batch_seq    = -1;
+		this->rsp_current_expected_batch_seq_id = bsi;
+	};
+	// REAL truncated/faithful delivery of the seated batch — mirrors the production
+	// ACK-GATE PASS at arq_responder.cc:2480-2585 (RECEIVED->ACKED for i<data_batch_size
+	// then copy_data_to_buffer -> fifo_buffer_rx). Delivers exactly data_batch_size slots.
+	auto deliver_seated_batch = [&](int bsi) {
+		for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+			if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+		decrypt_delivered_bsi = bsi;   // inert (no encryption in this rig)
+		copy_data_to_buffer();          // REAL reassembler -> fifo_buffer_rx
+		advance_last_delivered(bsi);
+	};
+
+	int fails = 0;
+
+	// ====================================================================
+	// CASE-DESYNC — the res_c3100 fault: CMD built 30, RSP applied 25.
+	// ====================================================================
+	{
+		const int RSP_BATCH = 25;
+		const int CMD_TOTAL = 30;
+		const int B7 = 7, B8 = 8;
+		this->data_batch_size                 = RSP_BATCH;
+		this->link_status                     = CONNECTED;
+		this->rsp_last_delivered_batch_seq_id = (B7 - 1) & 0xFF;   // contiguous: no D3.1 gap
+		this->fifo_buffer_rx.flush();
+
+		// FAITHFUL tx oracle: ALL 30 frames of batch7 ++ 25 frames of batch8.
+		char tx_faithful[(CMD_TOTAL + RSP_BATCH) * FRAMELEN];
+		{
+			int off = 0;
+			for(int i=0;i<CMD_TOTAL;i++){ frame_bytes(B7, i, &tx_faithful[off]); off += FRAMELEN; }
+			for(int i=0;i<RSP_BATCH;i++){ frame_bytes(B8, i, &tx_faithful[off]); off += FRAMELEN; }
+		}
+
+		// Batch7: CMD built 30, RSP received the first 25 (ids 0..24), sender count=30.
+		seat_batch(B7, /*n_present=*/RSP_BATCH, /*sender_total=*/CMD_TOTAL);
+
+		bool desync = batchsize_desync_detected(this->rx_batch_total_frames,
+		                                        this->data_batch_size, this->sack_v2_enabled);
+		printf("[TEST-BSDESYNC] CASE-DESYNC: sender_total=%d local_batch=%d detected=%d\n",
+			this->rx_batch_total_frames, this->data_batch_size, desync?1:0);
+		fflush(stdout);
+		if(!desync)
+		{
+			printf("[TEST-BSDESYNC] CASE-DESYNC FAIL: detector did not flag CMD(30)>RSP(25)\n");
+			fails++;
+		}
+
+		if(defeat)
+		{
+			// fail-before: backstop OFF -> deliver batch7 TRUNCATED (25 frames), advance,
+			// then deliver batch8 -> the drained stream is the 25+25 SHIFT (missing
+			// batch7[25..29]) != the 30+25 faithful oracle, and the link did NOT abort.
+			deliver_seated_batch(B7);   // 25 frames (truncated)
+			seat_batch(B8, /*n_present=*/RSP_BATCH, /*sender_total=*/RSP_BATCH);
+			deliver_seated_batch(B8);   // 25 frames
+			char drained[(CMD_TOTAL + RSP_BATCH) * FRAMELEN];
+			int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+			bool faithful = (popped == (CMD_TOTAL+RSP_BATCH)*FRAMELEN)
+				&& (memcmp(drained, tx_faithful, (CMD_TOTAL+RSP_BATCH)*FRAMELEN) == 0);
+			// The shift: 50 frames delivered; first 25 == batch7[0..24], next 25 ==
+			// batch8[0..24] (== tx frames 30..54) -> batch7[25..29] SILENTLY dropped.
+			bool truncated_shift = (popped == (RSP_BATCH+RSP_BATCH)*FRAMELEN)
+				&& (memcmp(drained, tx_faithful, RSP_BATCH*FRAMELEN) == 0)
+				&& (memcmp(&drained[RSP_BATCH*FRAMELEN],
+				           &tx_faithful[CMD_TOTAL*FRAMELEN], RSP_BATCH*FRAMELEN) == 0);
+			printf("[TEST-BSDESYNC] CASE-DESYNC(defeat): popped=%dB faithful=%d "
+				"truncated_shift=%d link=%d\n",
+				popped, faithful?1:0, truncated_shift?1:0, (int)this->link_status);
+			fflush(stdout);
+			// fail-before MUST reproduce the silent shift (the bug), NOT be faithful, NOT abort.
+			if(faithful || !truncated_shift)
+			{
+				printf("[TEST-BSDESYNC] CASE-DESYNC FAIL(defeat): did not reproduce the silent "
+					"truncation/shift\n"); fails++;
+			}
+			if(this->link_status == DROPPED)
+			{
+				printf("[TEST-BSDESYNC] CASE-DESYNC FAIL(defeat): link aborted with backstop DEFEATED\n");
+				fails++;
+			}
+		}
+		else
+		{
+			// pass-after: backstop ON. The production ACK-GATE, on the SAME shared
+			// batchsize_desync_detected()==true, raises [RSP-V2-BATCHSIZE-DESYNC] and calls
+			// rsp_gap_abort_teardown() (link DROPPED, NO delivery). That teardown touches
+			// tcp_socket_control (not wired on this throwaway rig), so mirror its INTEGRITY-
+			// relevant effect here — the SAME discipline test_inorder_demote uses for the D3.1
+			// GAP-ABORT (set DROPPED + refuse to deliver, rather than invoke the socket-bound
+			// teardown). The teardown itself is validated by test_inorder_demote; this arm
+			// proves the DECISION fired and NOTHING is silently delivered for the truncated batch.
+			this->link_status = DROPPED;   // abort; DO NOT copy_data_to_buffer the truncated batch
+			char drained[(CMD_TOTAL + RSP_BATCH) * FRAMELEN];
+			int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+			printf("[TEST-BSDESYNC] CASE-DESYNC(fix): detected=%d aborted link=%d silently_delivered=%dB\n",
+				desync?1:0, (int)this->link_status, popped);
+			fflush(stdout);
+			// The integrity property: a detected desync must NOT silently deliver the batch.
+			if(!desync)
+			{
+				printf("[TEST-BSDESYNC] CASE-DESYNC FAIL(fix): desync NOT detected -> would deliver truncated\n");
+				fails++;
+			}
+			if(popped != 0)
+			{
+				printf("[TEST-BSDESYNC] CASE-DESYNC FAIL(fix): %dB SILENTLY delivered despite desync\n",
+					popped); fails++;
+			}
+		}
+	}
+
+	// ====================================================================
+	// CASE-MATCHED — byte-identical guard: sender_total == local (25/25) is NOT a
+	// desync -> delivers faithfully in BOTH modes (backstop INERT, no false positive).
+	// ====================================================================
+	{
+		const int BATCH = 25;
+		const int B = 3;
+		this->data_batch_size                 = BATCH;
+		this->link_status                     = CONNECTED;
+		this->rsp_last_delivered_batch_seq_id = (B - 1) & 0xFF;
+		this->fifo_buffer_rx.flush();
+		char tx[BATCH * FRAMELEN];
+		for(int i=0;i<BATCH;i++) frame_bytes(B, i, &tx[i*FRAMELEN]);
+		seat_batch(B, /*n_present=*/BATCH, /*sender_total=*/BATCH);
+		bool desync = batchsize_desync_detected(this->rx_batch_total_frames,
+		                                        this->data_batch_size, this->sack_v2_enabled);
+		if(desync)
+		{
+			printf("[TEST-BSDESYNC] CASE-MATCHED FAIL: false-positive desync on a matched 25/25 batch\n");
+			fails++;
+		}
+		deliver_seated_batch(B);
+		char drained[BATCH * FRAMELEN];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+		bool faithful = (popped == BATCH*FRAMELEN) && (memcmp(drained, tx, BATCH*FRAMELEN) == 0);
+		printf("[TEST-BSDESYNC] CASE-MATCHED: detected=%d popped=%dB faithful=%d link=%d\n",
+			desync?1:0, popped, faithful?1:0, (int)this->link_status);
+		fflush(stdout);
+		if(!faithful || this->link_status != CONNECTED)
+		{
+			printf("[TEST-BSDESYNC] CASE-MATCHED FAIL: matched batch not delivered faithfully\n");
+			fails++;
+		}
+	}
+
+	// ====================================================================
+	// CASE-STEPDOWN — CMD<RSP (sender_total 20 < local 25) is always SAFE (the RSP
+	// SACKs the shortfall); non-v2 never carries D5. Neither is a desync.
+	// ====================================================================
+	{
+		bool sd = batchsize_desync_detected(/*sender_total=*/20, /*local=*/25, /*v2=*/true);
+		bool nv2 = batchsize_desync_detected(/*sender_total=*/30, /*local=*/25, /*v2=*/false);
+		printf("[TEST-BSDESYNC] CASE-STEPDOWN: stepdown_detected=%d (want 0) nonv2_detected=%d (want 0)\n",
+			sd?1:0, nv2?1:0);
+		fflush(stdout);
+		if(sd)  { printf("[TEST-BSDESYNC] CASE-STEPDOWN FAIL: flagged a safe CMD<RSP step-down\n"); fails++; }
+		if(nv2) { printf("[TEST-BSDESYNC] CASE-STEPDOWN FAIL: flagged desync with sack_v2 OFF\n"); fails++; }
+	}
+
+	bool pass2 = (fails == 0);
+	printf("[TEST-BSDESYNC] %s: fails=%d (defeat=%d)\n",
+		pass2 ? "PASS" : "FAIL", fails, defeat ? 1 : 0);
+	fflush(stdout);
+	return pass2 ? 0 : 1;
 }
