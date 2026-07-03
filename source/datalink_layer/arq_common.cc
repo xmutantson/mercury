@@ -700,6 +700,11 @@ cl_arq_controller::cl_arq_controller()
 	cmd_batch_seq_id=0;
 	captured_batch_seq_id_for_retransmit=-1;
 	last_received_batch_seq_id=-1;
+	// Option W (data-flow-stream-offset.md §2.4): stream cursors anchored at 0,
+	// all per-bsi stamps invalid until a batch is built.
+	tx_stream_committed=0;
+	rx_stream_delivered=0;
+	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
 	// SACK Design A Step 4 — RSP cross-batch routing state. All gated on
 	// sack_v2_enabled; v1 path leaves these at their sentinels. Per §4.2.3,
 	// `current_expected` is adopted from the first v2 DATA frame received;
@@ -7052,6 +7057,13 @@ void cl_arq_controller::reset_session_state()
 	// FIX-6: drop any RX-delivery tail buffered behind a back-pressured app socket.
 	// A fresh session must not re-emit bytes from the previous connection's stream.
 	rx_deliver_pending_len = 0;
+
+	// Option W (data-flow-stream-offset.md §2.4): a fresh session re-anchors both
+	// absolute-byte-stream cursors at 0 and invalidates every per-bsi stamp so the
+	// next connection's stream starts at offset 0 with no stale stamp aliasing.
+	tx_stream_committed = 0;
+	rx_stream_delivered = 0;
+	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
 
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;
@@ -13973,8 +13985,72 @@ int cl_arq_controller::test_rxfifo_backpressure_hold()
 // The 3 BREAK sites already did this CORRECTLY (reverse-iter + push_front). This
 // helper is that correct pattern, LOUD on any residual shortfall, used everywhere.
 // ============================================================================
+// ===== Option W — absolute-byte-stream cursor helpers (data-flow-stream-offset.md) =====
+
+// THE build-commit latch (§2.1). Called once per new-data batch from the ONE pop funnel
+// process_buffer_data_commander(). Records the batch's {start,length} in the TRANSPORTED-
+// byte domain and advances the cursor. Idempotent per (bsi, build-generation): the pop
+// funnel's re-entry guards (stage_ok / live_newdata_staged / already_staged) guarantee new
+// bytes are popped ONCE per bsi. On a REBUILD after a re-stage rollback the cursor was reset
+// to stamp[bsi].start, so this recomputes the SAME start (INV4); the length may differ
+// (rebuilt at a new config) — the correct new stamp. On wrap-around bsi reuse (256 batches
+// later) the stale stamp is overwritten with the fresh cumulative start.
+void cl_arq_controller::stream_tx_latch(int bsi, uint32_t transported_len)
+{
+	int b = bsi & 0xFF;
+	tx_stream_stamp[b].start  = tx_stream_committed;
+	tx_stream_stamp[b].length = transported_len;
+	tx_stream_stamp[b].valid  = true;
+	tx_stream_committed += (uint64_t)transported_len;
+}
+
+// The re-stage un-commit (§2.2 / INV3). On a demote / BREAK / CFG16-HOLD re-stage the
+// in-flight batch's bytes are re-queued to fifo_buffer_tx for rebuild; the cursor must roll
+// back to that batch's latched start so the rebuild carries the SAME start offset the
+// receiver anchored delivery at (INV4). The rolled-back batch is always the single in-flight
+// one (Mercury builds one batch at a time; "one batch is in flight on the per-frame path",
+// arq_commander.cc:5488), so the target = the min in-flight batch_seq_id (the SAME mod-256
+// scan the demote sites use, arq_commander.cc:3490-3503). Idempotent + guarded: a no-op when
+// nothing is in flight or the stamp was never latched; safe to call redundantly.
+void cl_arq_controller::stream_tx_rollback_inflight()
+{
+	int  min_bsi    = -1;
+	bool any_staged = false;
+	for(int i=0;i<nMessages;i++)
+	{
+		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+		{
+			any_staged = true;
+			int raw = messages_tx[i].batch_seq_id;
+			if(raw < 0) continue;   // staged-but-not-yet-assigned (bsi set in process_messages_tx_data)
+			int b = raw & 0xFF;
+			if(min_bsi < 0) min_bsi = b;
+			else
+			{
+				unsigned fwd = ((unsigned)(min_bsi - b)) & 0xFFu;
+				if(fwd >= 1u && fwd <= 128u) min_bsi = b;
+			}
+		}
+	}
+	// Frames staged but not yet bsi-assigned (all batch_seq_id == -1) belong to the current
+	// build cmd_batch_seq_id (the value they WILL receive). Roll back to that stamp.
+	if(min_bsi < 0)
+	{
+		if(!any_staged) return;                      // nothing in flight — no un-commit
+		min_bsi = cmd_batch_seq_id & 0xFF;
+	}
+	if(!tx_stream_stamp[min_bsi].valid) return;      // never latched (defensive no-op)
+	if(tx_stream_committed > tx_stream_stamp[min_bsi].start)
+		tx_stream_committed = tx_stream_stamp[min_bsi].start;   // LIFO un-commit (only lowers)
+}
+
 void cl_arq_controller::restage_requeue_tx_messages()
 {
+	// Option W (§2.2): un-commit the in-flight batch's transported bytes BEFORE they are
+	// re-queued, so the rebuild re-anchors at the SAME start offset. Must run while
+	// messages_tx[] still holds the in-flight frames (this funnel frees them below).
+	stream_tx_rollback_inflight();
+
 	bool defeat = false;
 	{ const char* e = std::getenv("MERCURY_RESTAGE_ORPHAN_DEFEAT");
 	  if(e && *e && atoi(e)!=0) defeat = true; }
@@ -14021,6 +14097,13 @@ void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
 	int total_bytes = 0;
+	// Option W (data-flow-stream-offset.md §2.3): total TRANSPORTED bytes this delivery
+	// reassembled + delivered = Σ ACKED messages_rx[i].length for i<data_batch_size. The
+	// SAME quantity the sender committed (INV5). Advances rx_stream_delivered at
+	// copy_data_done (the single receiver funnel — covers in-order, cross-storage PREV,
+	// orphan, and bigblock delivery). Counted independent of the 16 KB `assembled` cap so
+	// it equals the sender's stamp.length even for a >16 KB batch.
+	int delivered_transported = 0;
 
 	// ROBUST_0 compression-deadlock fix (data-flow-compress-frame-fill.md §5/§6).
 	// MUST mirror the TX gate in process_buffer_data_commander(): both sides use
@@ -14043,6 +14126,7 @@ void cl_arq_controller::copy_data_to_buffer()
 		{
 			if(messages_rx[i].status==ACKED)
 			{
+				delivered_transported += messages_rx[i].length;   // Option W (§2.3)
 				if(assembled_size + messages_rx[i].length <= (int)sizeof(assembled))
 				{
 					memcpy(assembled + assembled_size,
@@ -14217,6 +14301,7 @@ void cl_arq_controller::copy_data_to_buffer()
 		{
 			if(messages_rx[i].status==ACKED)
 			{
+				delivered_transported += messages_rx[i].length;   // Option W (§2.3)
 #ifdef MERCURY_GUI_ENABLED
 				gui_push_monitor_text(messages_rx[i].data, messages_rx[i].length, false);
 #endif
@@ -14246,11 +14331,23 @@ copy_data_done:
 	if(total_bytes > 0)
 		gui_add_throughput_bytes_rx(total_bytes);
 #endif
+	// Option W (data-flow-stream-offset.md §2.3): advance the receiver's absolute
+	// transported-byte cursor by exactly what this delivery reassembled. Monotone;
+	// never rolls back (a failed batch is not delivered → delivered_transported==0).
+	// The STEP-2 backstop asserts the batch's wire stamp.start == this cursor BEFORE
+	// the append; FOUNDATION only maintains the cursor (no check, no wire yet).
+	rx_stream_delivered += (uint64_t)delivered_transported;
 	block_ready=1;
 }
 
 void cl_arq_controller::restore_tx_from_compressed()
 {
+	// Option W (§2.2): un-commit the in-flight batch's transported bytes BEFORE this
+	// funnel frees messages_tx[] and re-queues plaintext (the compressed/streaming/
+	// encrypted twin of restage_requeue_tx_messages). Runs while messages_tx[] still
+	// holds the in-flight frames so the mod-256 in-flight scan can find the bsi.
+	stream_tx_rollback_inflight();
+
 	// R029: every caller of this helper is a recovery/config-change path that
 	// frees messages_tx[] and re-queues plaintext to fifo_buffer_tx for re-send
 	// under the new config/epoch (BREAK ACK-recovery, BREAK EXHAUSTED, gearshift

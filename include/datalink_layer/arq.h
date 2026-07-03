@@ -3061,6 +3061,10 @@ public:
   // of the newer data with NO loss. FAIL-BEFORE (MERCURY_RESTAGE_ORPHAN_DEFEAT=1):
   // the pre-fix push()-to-BACK reorders (and drops when full) -> shift -> FAIL.
   int test_restage_requeue_orphan();
+  // Option W FOUNDATION regression (--test-stream-offset): drives the cursor
+  // helpers + the production re-stage funnel through every transition, asserting
+  // the latched per-bsi stamp == the true cumulative transported origin offset.
+  int test_stream_offset();
 
   // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
   // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
@@ -3202,6 +3206,16 @@ public:
   // the --test-restage-requeue-orphan fail-before arm.
   void restage_requeue_tx_messages();
 
+  // Option W cursor helpers (fact-documents/data-flow-stream-offset.md §2).
+  // stream_tx_latch: THE build-commit — latch stamp[bsi] = {tx_stream_committed,
+  //   transported_len} and advance the cursor. Called once per new-data batch build
+  //   from the ONE pop funnel process_buffer_data_commander().
+  // stream_tx_rollback_inflight: the re-stage un-commit — reset tx_stream_committed to
+  //   the in-flight batch's latched start (LIFO, idempotent, guarded). Called at every
+  //   re-stage byte-restore point (the two funnels + the open-coded BREAK legs).
+  void stream_tx_latch(int bsi, uint32_t transported_len);
+  void stream_tx_rollback_inflight();
+
 	//! Receives a data or a control message from the other end (via ALSA driver).
 	    /*!
 	      \return None
@@ -3324,6 +3338,23 @@ public:
                                        //      DATA_LONG/DATA_SHORT wire byte. Diagnostic
                                        //      only; no decision branches on it at Step 3.
                                        //      -1 = never received (v1 session, or no DATA yet).
+
+  // ===== Option W — absolute-byte-stream cursors (fact-documents/data-flow-stream-offset.md) =====
+  // TCP-style end-to-end stream-position invariant: the RSP's cumulative delivered
+  // TRANSPORTED-byte offset at the start of each batch == the CMD's committed offset
+  // at that batch's build. Catches every positional shift/hole/reorder/dup — the 4
+  // silent byte-corruption mechanisms of silent-corruption-residual.md §11-§14 — at
+  // the FIRST divergent byte, regardless of which producer/layer caused it. Offset
+  // domain = TRANSPORTED (post-compression) bytes counted at the pop/push funnels
+  // (data-flow-stream-offset.md §0). FOUNDATION = cursors only (no wire, no gate).
+  struct StreamStamp { uint64_t start; uint32_t length; bool valid; };
+  uint64_t tx_stream_committed;        // CMD: cumulative transported bytes committed to built
+                                       //      batches, in build order (== next new-batch start).
+  StreamStamp tx_stream_stamp[256];    // CMD: per-bsi latched {start,length}. Latched at BUILD,
+                                       //      re-emitted verbatim on retx/mixbatch, start restored
+                                       //      on re-stage rollback. Index = batch_seq_id & 0xFF.
+  uint64_t rx_stream_delivered;        // RSP: cumulative transported bytes delivered through
+                                       //      copy_data_to_buffer(), in delivery order.
 
   // SACK Design A Step 4 — RSP cross-batch routing decision state.
   // All members gated on sack_v2_enabled; v1 path never reads these.

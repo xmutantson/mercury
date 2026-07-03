@@ -1604,6 +1604,7 @@ int main(int argc, char *argv[])
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
     bool test_restage_requeue_orphan_cli = false; // --test-restage-requeue-orphan: §12 re-stage re-queue orphan/reorder
+    bool test_stream_offset_cli = false; // --test-stream-offset: Option W FOUNDATION — absolute-byte-stream cursor ground-truth
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
                                         // must NOT drop popped bytes when the non-blocking app socket back-pressures.
                                         // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
@@ -2391,6 +2392,16 @@ int main(int argc, char *argv[])
             // source/datalink_layer/test_restage_requeue.cc +
             // fact-documents/silent-corruption-residual.md §12/§13.
             test_restage_requeue_orphan_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-stream-offset") == 0)
+        {
+            // Option W FOUNDATION — absolute-byte-stream cursor ground-truth regression.
+            // One-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/test_stream_offset.cc +
+            // fact-documents/data-flow-stream-offset.md.
+            test_stream_offset_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -4308,6 +4319,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_restage_requeue_orphan();
             printf("[FLAG] restage-requeue-orphan test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_stream_offset_cli) {
+            // Option W FOUNDATION — cursor ground-truth (one-shot, then exit rc).
+            printf("[FLAG] --test-stream-offset: invoking Option W FOUNDATION "
+                   "absolute-byte-stream cursor ground-truth regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_stream_offset();
+            printf("[FLAG] stream-offset test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

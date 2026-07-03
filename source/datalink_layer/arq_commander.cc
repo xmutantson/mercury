@@ -708,6 +708,11 @@ void cl_arq_controller::process_messages_commander()
 					}
 					else
 					{
+						// Option W (data-flow-stream-offset.md §2.2, item O1): open-coded BREAK
+						// re-stage (bypasses restage_requeue_tx_messages) — un-commit the in-flight
+						// batch's transported bytes BEFORE re-queuing so the rebuild re-anchors at
+						// the same start offset the receiver delivered to.
+						stream_tx_rollback_inflight();
 						for(int i=nMessages-1; i>=0; i--)
 						{
 							if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
@@ -20140,6 +20145,11 @@ void cl_arq_controller::process_buffer_data_commander()
 		             || (sack_v2_enabled && retransmit_count > 0);
 		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && stage_ok)
 		{
+			// Option W (data-flow-stream-offset.md §2.1): total TRANSPORTED payload bytes
+			// framed for the new-data batch built THIS call (comp_size in the compressed
+			// leg, Σ data_read_size in the raw leg). 0 = no new bytes committed (re-entry
+			// with data already staged / fifo dry) → no latch. Latched at the end of this if.
+			int batch_committed_len = 0;
 			// SACK Design A Step 1 — effective DATA_LONG header drives per-frame
 			// payload budget. In v1 (default) identical to legacy macro; in v2
 			// loses 1 byte to the batch_seq_id field.
@@ -20550,6 +20560,9 @@ void cl_arq_controller::process_buffer_data_commander()
 						pos += chunk;
 						frame_num++;
 					}
+					// Option W (§2.1): the compressed leg framed exactly comp_size transported
+					// bytes (post-compress → crypto-pad → encrypt(+tag)) for this new-data batch.
+					batch_committed_len = comp_size;
 					printf("[COMPRESS-TX] %d raw -> %d comp (%d frames), ratio_est=%.2f, fill=%.0f%%\n",
 						raw_size, comp_size, frame_num, compress_ratio_estimate,
 						100.0f * comp_size / batch_capacity);
@@ -20618,6 +20631,9 @@ void cl_arq_controller::process_buffer_data_commander()
 					}
 					fifo_buffer_backup.push(message_TxRx_byte_buffer, data_read_size);
 					batch_uncompressed_size += data_read_size;
+					// Option W (§2.1): raw leg — frame payload IS the transported payload
+					// (headerless, no compression), so accumulate the committed length.
+					batch_committed_len += data_read_size;
 #ifdef MERCURY_GUI_ENABLED
 					// Monitor tap: plaintext (no compression path)
 					gui_push_monitor_text(message_TxRx_byte_buffer, data_read_size, true);
@@ -20630,6 +20646,15 @@ void cl_arq_controller::process_buffer_data_commander()
 					filled++;
 				}
 			}
+			// Option W (data-flow-stream-offset.md §2.1) — THE build-commit latch. When new
+			// transported bytes were framed this call (either leg), record the batch's
+			// {start,length} under the bsi it will carry on the wire (cmd_batch_seq_id, not yet
+			// advanced — the +1 is post-send at :2591) and advance the cursor. Fires once per
+			// (bsi, build-generation): the re-entry guards keep batch_committed_len==0 on a
+			// re-entry that stages nothing. NEVER keyed off frame/expected counts (false-fire
+			// rule) — only the LATCHED committed byte length.
+			if(batch_committed_len > 0)
+				stream_tx_latch(cmd_batch_seq_id & 0xFF, (uint32_t)batch_committed_len);
 		}
 		else if(block_under_tx==YES && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
