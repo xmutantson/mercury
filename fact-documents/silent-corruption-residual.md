@@ -488,3 +488,218 @@ two check sites, retx re-emit, robust-config handling, the 4-mechanism test plan
 silent fails, the real-channel silent corruption at marginal SNR is STILL OPEN.** Option W is
 NOT complete; the FOUNDATION alone detects nothing on the wire (it is the measurement
 substrate, not the guard).
+
+## §16 OPUS PRE-COHORT FIX PASS — the two blockers + two follow-ups closed (2026-07-03)
+
+Acting on Fable's §17 merge review + a from-scratch re-audit (task-mandated: "do not trust
+the prior audit; enumerate all legs"). All file:line on `fix/stream-offset-w` at the fix HEAD.
+
+### §16.1 From-scratch re-audit — every site that re-queues in-flight `messages_tx[]` to `fifo_buffer_tx`
+The Option-W BACKSTOP false-fires only on a SAME-bsi in-order rebuild whose stamp.start is
+wrong. That class = the legs that free the in-flight `messages_tx[]` and re-queue its bytes for
+a rebuild at the SAME bsi (roll_back_cmd_bsi_to_inflight / BREAK). Enumerated ALL re-queue sites:
+
+| # | site | leg | rolls cmd_bsi to in-flight? | calls `stream_tx_rollback_inflight()`? | verdict |
+|---|------|-----|------------------------------|-----------------------------------------|---------|
+| 1 | arq_commander.cc:715 (loop :719) | BREAK phase-1 raw | via BREAK→ROBUST | **YES** (:715) | OK |
+| 2 | arq_commander.cc:807 | BREAK-EXHAUSTED raw | via BREAK→ROBUST | **NO → FIXED** | **F1/F4.1** |
+| 3 | arq_commander.cc:6241 | GEARSHIFT FRAME-UP raw | YES (:6229) | **NO → FIXED** | **F1/F4.1** |
+| 4 | Funnel 1 `restage_requeue_tx_messages()` (arq_common.cc:14088) | 7 demote/CFG16-HOLD sites (2204,2230,3519,5047,5250,5375,5526) | 4 sites roll | **YES** (:14093) | OK |
+| 5 | Funnel 2 `restore_tx_from_compressed()` (arq_common.cc:14502) | compressed twin (707,800,3515,5043,5371,5522,6234) | — | **YES** (:14508) | OK |
+| 6 | `restore_backup_buffer_data()` (arq_common.cc:14616) | inside Funnel 2 + direct at load_configuration:2185 (FULL) | — | via Funnel 2 (covered); FULL = connect/reset | OK / out-of-scope |
+
+**Distinct class — restore-from-BACKUP legs (FRESH-bsi, do NOT call roll_back_cmd_bsi_to_inflight):**
+
+| site | leg | in cohort? | note |
+|------|-----|-----------|------|
+| arq_common.cc:6106 | watchdog recovery (COMMANDER) | rare (60s+ silence) | residual |
+| arq_common.cc:6194 | SNR_BASED gearshift-down | NO (default=SUCCESS_BASED_LADDER) | residual |
+| arq_common.cc:6288 | SUCCESS_BASED gearshift-down (timer) | reachable | residual |
+| arq_common.cc:7501 | SET_CONFIG ACK-apply refill (forward push) | config-apply | residual |
+| arq_common.cc:3305 | inband_unilateral_config_change refill | in-band path | residual |
+
+These free `messages_tx[]` then restore the in-flight batch's plaintext from `fifo_buffer_backup`
+WITHOUT rolling `cmd_batch_seq_id` back → the rebuild takes a FRESH (advanced) bsi → the RECEIVER
+sees a bsi GAP the pre-existing v2 gap-gate (`sack_v2_readopt_has_gap`) holds on BEFORE
+`copy_data_to_buffer` (where the byte-position BACKSTOP lives) is ever reached. So they are NOT
+the same-bsi in-order false-fire class the BACKSTOP checks; they are a pre-existing (non-Option-W)
+fresh-bsi/gap behavior. Left as a documented **residual hardening candidate** (adding the guarded
+idempotent `stream_tx_rollback_inflight()` before their free-loop is safe and would only help, but
+touches legacy watchdog/timer/inband paths and is out of the named cohort-blocker scope).
+
+**Not re-stage legs (confirmed OUT):** arq_commander.cc:20331/20340/20384 = pre-latch staging
+push-BACK of EXCESS popped bytes (before the latch — cursor not yet advanced); :18152/:18210 =
+in-C `sim2` livepath harness (not production; unused by the real-audio cohort); :15394/15534/
+15710/15825, :17809 = test harness. arq_common.cc:14591/14607/14637 = inside Funnel 2 /
+restore_backup (covered by Funnel 2's rollback).
+
+**Conclusion:** the ONLY same-bsi Option-W re-stage legs missing the rollback are **:807 and
+:6241** — confirming Fable §17.4. `data-flow-stream-offset.md §2.2` misclassified these three raw
+legs (:715/:807/:6241) as `restage_requeue_tx_messages()` funnel pairs; they are OPEN-CODED
+push_front loops. Corrected there.
+
+### §16.2 Fixes applied
+- **F1/F4.1 (blocker):** added `stream_tx_rollback_inflight()` at the two open-coded raw legs
+  (arq_commander.cc:807 BREAK-EXHAUSTED, :6241 GEARSHIFT FRAME-UP), byte-mirroring the correct
+  :715. `stream_tx_rollback_inflight()` gained a `MERCURY_W_RESTAGE_ROLLBACK_DEFEAT` fail-before
+  arm (no-op) so the production funnel the test drives faithfully reproduces the pre-fix leg.
+- **F4.2 (blocker):** new `rx_stream_invalidate_stamps()` (arq_common.cc), called from
+  `load_configuration()` right after the no-change early-return, invalidates every
+  `rx_stream_stamp[]` on a real config change. Kills the demote-to-ROBUST permanent WITHHOLD (a
+  stale OFDM stamp robust frames can never refresh), the config-change stale variant, and the
+  256-wrap stale-start false teardown. Both W predicates already no-op on an invalid stamp
+  (verified: `w_bytegate_shortfall` :14194, `w_stream_shift_detected` :14209), so the gate at
+  arq_responder.cc:2506 does NOT fire on an absent/invalidated stamp. Fail-before:
+  `MERCURY_W_CFG_STAMP_KEEP`.
+- **F2 (follow-up — decided with evidence):** SOFTENED the byte-gate withhold comment
+  (arq_responder.cc) to state the TRUE recovery. Sending a SACK on the shortfall was REJECTED: the
+  batch is frame-count complete (every slot in `[0,data_batch_size)` present), so a SACK bitmap
+  over that window is ALL-ONES → would FALSE-CREDIT the batch (the exact silent accept the gate
+  prevents); the short/surplus bytes live OUTSIDE the RSP window (the CMD>RSP surplus frames have
+  id ≥ data_batch_size; a tail-short frame is still "present"). Recovery is the CMD ACK-timeout
+  full retx → rebuild (fresh EOB stamp; a demote also invalidates via F4.2) → completes, OR escalates
+  to BREAK (LOUD, bounded). Outcome = COMPLETE-or-LOUD, never silent, never a permanent hang.
+  Proven by Part S.
+- **F3 (latent):** the single-frame `send()` DATA path (arq_common.cc:8713) — dead for DATA today
+  (all DATA goes through `send_batch`) — now emits the W stamp on an EOB DATA frame (mirroring
+  send_batch:9132) + relaxed its header guard by `w_stamp_added`, so a FUTURE DATA caller's EOB
+  frame is wire-consistent and the RX's `w_parse_eob_stamp` cannot mis-read payload as a stamp.
+
+### §16.3 Test hole closed (why the blockers slipped past 55/55)
+The deterministic suite drove Funnel 1 directly but NEVER a missing-rollback open-coded leg nor a
+config-change stamp-invalidation. Added to `test_stream_offset.cc`:
+- **Part R** (F1/F4.1): an uncompressed FRAME-UP climb stages an in-flight batch at origin S,
+  drives the PRODUCTION re-stage, rebuilds at a HIGHER config, asserts rebuilt `stamp.start == S`
+  (INV4) AND `w_stream_shift_detected()` FALSE (no BACKSTOP teardown). FAIL-BEFORE via
+  `MERCURY_W_RESTAGE_ROLLBACK_DEFEAT=1` (cursor stays S+L → rebuilt start S+L → shift detected → rc=1).
+- **Part S** (F4.2/F2): a demote-to-ROBUST same-bsi rebuild — a stale OFDM stamp WOULD withhold;
+  drives the PRODUCTION `rx_stream_invalidate_stamps()`; asserts the stamp is invalidated AND the
+  withhold CLEARS (no permanent stall / BREAK spiral). FAIL-BEFORE via `MERCURY_W_CFG_STAMP_KEEP=1`.
+
+Both drive PRODUCTION helpers (not hand-set result stamps). Deferred STEP-3 (EOT + running CRC-32)
+unchanged — §17.2/§17.3 accept it for this merge.
+
+## §17 FABLE-5 MERGE REVIEW of CORE W (2026-07-03, read-only; §16 = the Opus pre-cohort fix pass above)
+
+Reviewed `fix/stream-offset-w` @ `9685f6ad` (diff vs `monitor@bfacbcf6`) against the corrected
+steer (worklog 2026-07-03 07:0x; §14.7). All file:line below are on the branch.
+
+### §17.1 F1 — FIDELITY: faithful, with ONE coverage gap (the gap is the blocker, §17.4)
+- **(a) ACK byte-GATED at the batch-complete boundary — YES.** The PRIMARY check sits
+  immediately after `[ACK-GATE] PASS` (arq_responder.cc:2491-2534), BEFORE the clean ACK is
+  emitted and BEFORE delivery; a shortfall WITHHOLDS (re-arm identical to the partial-batch
+  SACK-suppress hold, `return`) — not next-batch detection. The "one boundary too late"
+  correction is realized. NOTE: the cross-storage PREV completion (arq_responder.cc:1307-1321,
+  mechanism-4's site) is NOT byte-gated — a short PREV delivery passes the start-check
+  (position correct), advances `rx_stream_delivered` short, and the NEXT batch's BACKSTOP
+  refuses the shifted delivery (arq_common.cc:14235-14262) BEFORE any corrupt byte reaches the
+  app. Outcome for mech-4 via PREV = LOUD teardown at the first divergent byte, not withhold-
+  then-SACK recovery. Never silent; acceptable; a PREV-side byte-gate is a worthwhile follow-up.
+- **(b) Stamp from committed pop-funnel bytes ONLY, re-sent latched — YES.** Latch input =
+  `comp_size` (arq_commander.cc:20579) / sum of `data_read_size` (:20668), latched once at the
+  ONE funnel (:20687-20688); `send_batch` emits the LATCHED `tx_stream_stamp[bsi]` verbatim
+  keyed on the frame's ORIGINAL `batch_seq_id` (arq_common.cc:9139-9152 → `w_emit_eob_stamp`
+  :14162), incl. on retx/mixbatch — the stamp on retx is even STRONGER than D5 (D5 emits 0 on
+  `sack_retransmit_active`, arq_common.cc:9041; the stamp re-emits the known latched value).
+  RSP compares only to `stamp.length` / `stamp.start` (arq_common.cc:14186-14212), never to
+  `data_batch_size`/expected-counts. Wire arithmetic verified symmetric: W_EOB_RESERVE 7 =
+  6 stamp + 1 DATA_SHORT-vs-LONG header delta; RX clamp `max_frame-7` (arq_common.cc:13244)
+  == TX reserved payload (arq_commander.cc:20656-20661, 20556-20561).
+- **(c) ONE write site — YES; ONE rollback helper — YES; rollback COVERAGE — NO (2 sites
+  missed).** See §17.4. The audit doc's claim that all 10 re-stage callers route through the
+  two funnels (data-flow-stream-offset.md §2.2) is FALSE for two raw legs, and the worklog
+  claim "rolled back at ... + the 2 BREAK legs" is only true for leg 1.
+
+### §17.2 F2 — the deferred EOT: NOT a merge-blocker; here is the precise residual
+The steer's last-batch worry was against a BACKSTOP-only design (inherently one-batch-behind).
+The corrected PRIMARY fires at the final batch's OWN completion, so CORE W DOES catch a
+truncated final batch **whenever the stamp arrived**: the EOB frame received on any
+(re)transmission carries it (retx re-emits the latched stamp, §17.1b), and with D5 riding
+EVERY data frame (arq_common.cc:9030-9048) the count machinery cannot silently under-expect
+once ANY frame of the batch arrived — an incomplete count never PASSes the gate, so SACK
+re-requests until the EOB (and its stamp) lands. The remaining SILENT final-batch hole
+therefore requires ALL of: the EOB frame lost on every attempt, AND a count-machinery bug
+(a genuine 5th mechanism) that declares complete anyway, AND it being the final batch. That
+is a narrow defense-in-depth residual, and the strong-oracle cohort (delivered-vs-source
+byte compare) measures exactly it. EOT remains the ONLY true end-to-end check (it also
+covers "final batch never seen at all + clean-disconnect-believed-complete", which per-batch
+stamps can never see) — it must land as the scheduled STEP-3 follow-up before the capstone
+integrity claim, but deferring it past THIS merge is sound.
+
+### §17.3 F3 — the deferred CRC-32: accepted residual, not a blocker
+Same-position value corruption must false-pass LDPC AND the per-frame CRC16_MODBUS_RTU
+(telecom_system.cc:674-685, 3300-3304; ~2^-16 per corrupted codeword) at the right offset and
+length; AEAD covers it entirely when encryption is on. All four CAPTURED mechanisms were
+positional (the c31w104 byte-decode ruled value-transform OUT, §14.1); no value-corruption
+mechanism has ever been observed. The CRC-32 co-stamp (and the streaming-decompressor-desync
+class it alone covers, data-flow-stream-offset.md §0) is correct as STEP-3 follow-up.
+
+### §17.4 F4 / MERGE-BLOCKER — TX-cursor rollback misses TWO open-coded raw-leg re-stage sites
+`stream_tx_rollback_inflight()` is called in funnel 1 (arq_common.cc:14093), funnel 2
+(:14508), and inline at the BREAK phase-1 raw leg (arq_commander.cc:715). Two raw
+(non-compressed) re-stage legs re-queue in-flight bytes + free `messages_tx[]` WITHOUT it:
+1. **GEARSHIFT FRAME-UP climb** — arq_commander.cc:6237-6247 (push_front :6241). The audit
+   misclassified this site as a funnel pair ("6229"); its else-leg is open-coded.
+2. **BREAK-EXHAUSTED recovery** — arq_commander.cc:803-812 (push_front :807). The audit's
+   O1 named both BREAK legs; only the first (:715) got the call.
+**Failure scenario (deterministic, healthy transfer):** uncompressed session at a
+stamp-riding config; in-flight batch K {start=S, len=L} latched; FRAME-UP fires with K staged
+(the exact state `roll_back_cmd_bsi_to_inflight("GEARSHIFT")` :6229 exists to handle) → bytes
+re-queued, cursor NOT rolled back (stays S+L) → rebuild latches stamp[K]={S+L, L2} → RSP
+(delivered through S) sees `stamp.start(S+L) != rx_stream_delivered(S)` →
+`[RSP-V2-STREAM-SHIFT]` **FALSE TEARDOWN of a byte-correct session on an ordinary
+mid-transfer climb**. Same shape for BREAK-EXHAUSTED. Loud, not silent — but it kills
+completion-rate on the exact cohort configuration (compression OFF) and would poison the
+cohort before it measures anything. The deterministic suite passes because
+`--test-stream-offset` drives funnel 1 directly, never these two open-coded legs.
+**Fix (small, in-design):** call `stream_tx_rollback_inflight()` at the top of both legs
+(mirror :715) — or better, route both through `restage_requeue_tx_messages()`; correct
+data-flow-stream-offset.md §2.2; extend the test to drive an open-coded-leg re-stage
+(latch → push_front loop → assert cursor == stamp.start).
+
+### §17.5 F4 second finding — RSP stale-stamp on config change (fix before cohort)
+`rx_stream_stamp[bsi]` is consumed only at DELIVERY (arq_common.cc:14497-14498) and reset
+only at session reset. A stamp parsed for a batch that is then RE-STAGED sender-side
+(demote/BREAK) goes STALE while valid:
+- Rebuild at a LOWER OFDM config, same bsi (the 4 demote sites roll `cmd_batch_seq_id`
+  back): rebuilt length L2 < stale L1 → byte-gate withholds until the rebuilt EOB's fresh
+  stamp overwrites → transient, self-healing (retx re-carries the stamp). Acceptable.
+- **Rebuild at ROBUST, same bsi: robust frames carry NO stamp (`w_stamp_rides()` false), so
+  the stale OFDM-sized `stamp[K].length` can NEVER refresh** — the byte-gate runs at robust
+  too (the gate at arq_responder.cc:2506 checks only `sack_v2_enabled`, not
+  `w_stamp_rides()`; process_messages_acknowledging_data serves the MFSK/robust ACK path) →
+  permanent WITHHOLD → ACK-exhaust → BREAK spiral → link failure. A LOUD STALL of the exact
+  demote-to-robust recovery the modem needs at marginal SNR. Precondition (EOB received but
+  batch incomplete, then demote-to-robust) is common at WGN:25.
+- 256-wrap variant: a never-delivered stale stamp re-read at bsi reuse with a lost EOB →
+  stale-start false teardown.
+**Fix (3 lines):** invalidate all `rx_stream_stamp[]` in `load_configuration()` (RSP side, on
+any config change) — every config change re-stages sender-side, so any parsed-undelivered
+stamp is stale by construction. Kills all three variants. Add a targeted check.
+
+### §17.6 Minor residuals (note, don't block)
+- `w_emit_eob_stamp` emits {0,0} if `tx_stream_stamp[bsi]` is somehow unlatched
+  (arq_common.cc:14169-14175): length16=0 keeps the byte-gate inert but a parsed start=0
+  could false-fire the backstop. Judged unreachable (every new-data batch latches at the
+  funnel); documented residual.
+- A `w_stamp_rides()` flip between build (reserve) and send (emit) would overflow C by <=6
+  bytes → PHY-CRC fail → retx; same exposure class as the existing D5/`header_carries_d5`
+  flip, managed by the same re-stage-on-config-change discipline. Pre-existing class.
+- Withhold recover-vs-stall: the withhold re-arm is byte-identical to the proven
+  partial-batch hold; the CMD sees "clean ACK lost", an existing recoverable state; worst
+  case ACK-exhaust → BREAK (loud). Cohort tracks RECOVERED vs STALLED as designed.
+
+### §17.7 VERDICT
+**Option W CORE as implemented is MERGE-BLOCKED by §17.4** (two missing
+`stream_tx_rollback_inflight()` calls ⇒ deterministic false stream-shift teardown on
+mid-transfer climb / BREAK-EXHAUSTED with in-flight bytes, uncompressed sessions), **and
+NEEDS §17.5** (RSP stamp invalidation on config change) **before the cohort** — else the
+cohort burns compute measuring these two false-fire modes instead of the silent-corruption
+rate. Both fixes are a handful of lines INSIDE the shipped design (no wire change, no new
+mechanism). Everything else is faithful to the corrected steer — the invariant, the
+boundary, the latched-verbatim stamp, the funnel discipline, the false-fire rules, and the
+test contract are right. **Deferring STEP 3 is ACCEPTABLE for this merge** (§17.2, §17.3):
+CORE W's PRIMARY covers the final batch whenever the stamp/EOB arrived; EOT + CRC-32 land as
+the scheduled follow-up and EOT must be in before any capstone end-to-end integrity claim.
+After the two fixes + green suite + the strong-oracle WGN:25 cohort (0 silent, no
+false-fire, withholds recover): present the owner merge fork.

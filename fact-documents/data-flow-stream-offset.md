@@ -114,23 +114,30 @@ arq_commander.cc:3490-3503) and calling `stream_tx_rollback_inflight()`:
   :14360, or the reassemble-decompress branch :14308). Rollback added at its top,
   BEFORE any `messages_tx[i].status=FREE` (:14277/14302/…).
 
-**The 10 caller re-stage sites** (all route through Funnel 1 or 2):
-`arq_commander.cc` 707, 795 (BREAK ACK-recovery), 2199, 2225 (D3 demote),
-3510/3514, 5038/5042, 5245, 5366/5370, 5517/5521, 6229. Each is a
-compression-gated `if(compression_enabled) restore_tx_from_compressed(); else
-restage_requeue_tx_messages();` pair (e.g. :3508-3517). Because the rollback is
-in the funnels, it fires for ALL 10 regardless of whether the caller also rolls
-`cmd_batch_seq_id` (only 4 callers do: `cmd_batch_seq_id = min_inflight_bsi` at
-3529, 5536, 5741, 6311) — decoupling the cursor from the caller-side bsi bookkeeping
-removes the site-enumeration fragility that Fable flagged as MOST-LIKELY-TO-BITE.
+**The caller re-stage sites.** The COMPRESSED leg of every recovery/demote site routes through
+Funnel 2 (`restore_tx_from_compressed`), and the DEMOTE / CFG16-HOLD raw legs route through
+Funnel 1 (`restage_requeue_tx_messages`, sites 2204/2230/3519/5047/5250/5375/5526) — both funnels
+roll the cursor back at their top.
 
-- **The 3 BREAK `push_front` sites (arq_commander.cc:581, 669 …)** that §13 left
-  as already-correct do NOT call the funnels; they re-queue directly. Audit: these
-  are inside the BREAK handler whose recovery ALSO routes the compressed leg
-  through `restore_tx_from_compressed` (707/795). VERIFY at implementation whether
-  the raw-leg direct push_front at 581/669 needs its own `stream_tx_rollback_inflight()`
-  call (it re-queues in-flight bytes → the cursor must roll back there too, else a
-  BREAK on a NON-compressed session leaves the cursor high). See §7 open item O1.
+> **CORRECTION (2026-07-03, Opus §16 re-audit — visible per CLAUDE.md):** ~~all 10 caller
+> re-stage sites route through Funnel 1 or 2; each is a compression-gated
+> `if(compression_enabled) restore_tx_from_compressed(); else restage_requeue_tx_messages();`
+> pair.~~ **FALSE for the three raw BREAK/climb legs.** The `else` (non-compressed) leg of the
+> BREAK phase-1 (arq_commander.cc:707→:715 open-coded loop :719), BREAK-EXHAUSTED (:800→:807),
+> and GEARSHIFT FRAME-UP (:6234→:6241) sites is an OPEN-CODED reverse-iter `push_front` loop,
+> NOT a `restage_requeue_tx_messages()` call — so its cursor un-commit is NOT in a funnel and
+> must be called inline. Only :715 originally did (`stream_tx_rollback_inflight()` at :715);
+> **:807 and :6241 OMITTED it → the F1/F4.1 blocker (silent-corruption-residual.md §16/§17.4).**
+> FIXED: `stream_tx_rollback_inflight()` added inline at :807 and :6241, byte-mirroring :715.
+> The 4 raw DEMOTE/CFG16-HOLD legs DO route through Funnel 1 (correct). Only 4 callers roll
+> `cmd_batch_seq_id` back (3529/5536/5741/6311) + the FRAME-UP `roll_back_cmd_bsi_to_inflight`
+> (:6229); the restore-from-BACKUP legs (arq_common.cc:6106/6194/6288/7501/3305) do NOT and are a
+> distinct FRESH-bsi class (gap-gated, not BACKSTOP-checked) — documented residual, §16.1.
+
+- **The 3 raw BREAK/climb `push_front` legs (arq_commander.cc:715/:807/:6241)** re-queue in-flight
+  bytes directly (not via a funnel) and EACH now calls `stream_tx_rollback_inflight()` inline
+  BEFORE freeing `messages_tx[]` — RESOLVED (was O1). The compressed leg of each routes through
+  `restore_tx_from_compressed` (707/800/6234), which rolls back at its top.
 
 ### 2.3 `rx_stream_delivered`
 - **THE ONE ADVANCE SITE:** `copy_data_to_buffer` (arq_common.cc:14020), at
@@ -142,12 +149,21 @@ removes the site-enumeration fragility that Fable flagged as MOST-LIKELY-TO-BITE
   (arq_common.cc:5153), and bigblock (arq_commander.cc:17558). No delivery
   bypasses it → the cursor + STEP-2 backstop cover every path.
 
-### 2.4 Init / reset
+### 2.4 Init / reset / config-change invalidation
 - `reset_session_state()` (arq_common.cc:7050): `tx_stream_committed=0;
-  rx_stream_delivered=0; for all i: tx_stream_stamp[i].valid=false`. A fresh
-  session re-anchors both cursors at 0.
+  rx_stream_delivered=0; for all i: tx_stream_stamp[i].valid=false;
+  rx_stream_stamp[i].valid=false`. A fresh session re-anchors both cursors at 0.
 - Constructor / `init()` in-class default: same (mirrors the `cmd_batch_seq_id=0`
   ctor init, arq_common.cc:700).
+- **`rx_stream_invalidate_stamps()` (F4.2, arq_common.cc) — called from
+  `load_configuration()` right after the no-change early-return:** invalidates every
+  `rx_stream_stamp[]` on ANY real config change. A config change ALWAYS re-stages the sender's
+  in-flight batch, so a parsed-undelivered RX stamp is stale by construction; a demote-to-ROBUST
+  rebuild (robust frames carry NO stamp) would otherwise leave a stale OFDM-sized
+  `stamp[bsi].length` that permanently WITHHOLDs the byte-gate (BREAK spiral). Both W predicates
+  no-op on an invalid stamp, so the rebuilt batch re-parses a fresh stamp on its EOB frame.
+  Also closes the 256-wrap stale-start false teardown. Fail-before: `MERCURY_W_CFG_STAMP_KEEP`.
+  See silent-corruption-residual.md §16.2/§17.5.
 
 ---
 
@@ -289,11 +305,17 @@ Fail-before/pass-after for the 4 mechanisms is added in STEP 2 (env-defeat arms)
 ---
 
 ## §7 OPEN ITEMS
-- **O1** [?] BREAK direct `push_front` at arq_commander.cc:581/669 (non-compressed
-  BREAK leg) — confirm it re-queues in-flight bytes and add
-  `stream_tx_rollback_inflight()` there too if the funnels don't already cover the
-  BREAK path. (If BREAK always routes non-compressed through
-  `restage_requeue_tx_messages`, it is covered.)
+- **O1** **RESOLVED (2026-07-03, Opus §16).** The non-compressed BREAK/climb legs are the
+  OPEN-CODED reverse `push_front` loops at arq_commander.cc:715 (BREAK phase-1), :807
+  (BREAK-EXHAUSTED), :6241 (GEARSHIFT FRAME-UP) — NOT funnel calls (see §2.2 CORRECTION). A
+  from-scratch re-audit confirmed :715 already called `stream_tx_rollback_inflight()` but :807
+  and :6241 did NOT → they left the cursor high → the RSP BACKSTOP false-tore-down a byte-correct
+  session (the F1/F4.1 blocker). FIXED: the call added inline at :807 and :6241. Regression
+  `--test-stream-offset` Part R drives the PRODUCTION re-stage (fail-before via
+  `MERCURY_W_RESTAGE_ROLLBACK_DEFEAT`). The restore-from-BACKUP legs
+  (arq_common.cc:6106/6194/6288/7501/3305) are a DISTINCT fresh-bsi class (no
+  roll_back_cmd_bsi_to_inflight → bsi gap handled by the pre-existing v2 gap-gate BEFORE the
+  BACKSTOP) — documented residual, not a cohort blocker (silent-corruption-residual.md §16.1).
 - **O2** [?] Role-switch (SWITCH_ROLE) mid-stream: cursors are role/session-scoped
   and reset on session reset; a mid-stream role flip on a bidirectional transfer
   is out of scope for the WGN:25 one-directional cohort. Documented, not handled.
