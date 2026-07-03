@@ -3385,6 +3385,12 @@ public:
   // (right after the D5 byte). messages_rx_buffer.batch_seq_id must be set first.
   int w_parse_eob_stamp(int stamp_off);
 
+  // Option W CORE — the TX twin of w_parse_eob_stamp: write the {start_lo32,length16}
+  // stamp for batch `bsi` into message_TxRx_byte_buffer[stamp_off..stamp_off+5] from the
+  // LATCHED tx_stream_stamp[bsi], returning the bytes written (W_EOB_STAMP_BYTES if the
+  // stamp rides at this config, else 0). Called from send_batch on the EOB frame.
+  int w_emit_eob_stamp(int stamp_off, int bsi);
+
   // Option W CORE — the two RSP-check DECISION predicates (pure; no side effects; no
   // socket). Production (ACK-GATE / copy_data_to_buffer) AND the deterministic
   // regression (test_stream_offset) both call these, so the test exercises the SAME

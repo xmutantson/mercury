@@ -9135,29 +9135,14 @@ void cl_arq_controller::send_batch()
 			                   || messages_batch_tx[i].type==DATA_SHORT);
 			bool is_eob = is_data_frame
 			           && ((unsigned char)messages_batch_tx[i].sequence_number & 0x80);
-			if(is_eob && w_stamp_rides())
+			if(is_eob)
 			{
-				int wbsi = messages_batch_tx[i].batch_seq_id;
-				if(wbsi < 0) wbsi = 0;
-				wbsi &= 0xFF;
-				uint32_t s_lo = 0; uint32_t len = 0;
-				if(tx_stream_stamp[wbsi].valid)
-				{
-					s_lo = (uint32_t)(tx_stream_stamp[wbsi].start & 0xFFFFFFFFULL);
-					len  = tx_stream_stamp[wbsi].length;
-				}
-				// length16 sentinel 0 for a >64 KB batch (never on HF): keeps the positional
-				// BACKSTOP (start) live while the byte-gate (length) safely no-ops.
-				uint16_t len16 = (len <= 0xFFFFu) ? (uint16_t)len : 0;
-				int off = header_length;   // immediately after the D5 byte
-				message_TxRx_byte_buffer[off+0]=(char)( s_lo        & 0xFF);
-				message_TxRx_byte_buffer[off+1]=(char)((s_lo >> 8)  & 0xFF);
-				message_TxRx_byte_buffer[off+2]=(char)((s_lo >> 16) & 0xFF);
-				message_TxRx_byte_buffer[off+3]=(char)((s_lo >> 24) & 0xFF);
-				message_TxRx_byte_buffer[off+4]=(char)( len16       & 0xFF);
-				message_TxRx_byte_buffer[off+5]=(char)((len16 >> 8) & 0xFF);
-				header_length += W_EOB_STAMP_BYTES;
-				w_stamp_added = W_EOB_STAMP_BYTES;
+				// Emit the LATCHED stamp for THIS frame's bsi (the ORIGINAL bsi on
+				// retx/mixbatch) at the position right after the D5 byte, growing
+				// header_length so the payload copy below starts past the stamp. Returns 0
+				// (no growth) when the stamp does not ride at this config.
+				w_stamp_added = w_emit_eob_stamp(header_length, messages_batch_tx[i].batch_seq_id);
+				header_length += w_stamp_added;
 			}
 		}
 
@@ -14170,6 +14155,32 @@ int cl_arq_controller::w_parse_eob_stamp(int stamp_off)
 	rx_stream_stamp[rbsi].start  = (uint64_t)s_lo;
 	rx_stream_stamp[rbsi].length = l16;
 	rx_stream_stamp[rbsi].valid  = true;
+	return W_EOB_STAMP_BYTES;
+}
+
+int cl_arq_controller::w_emit_eob_stamp(int stamp_off, int bsi)
+{
+	// Option W CORE — the TX twin of w_parse_eob_stamp. Writes the LATCHED stamp for
+	// batch `bsi` (the frame's batch_seq_id — the ORIGINAL bsi on retx/mixbatch) at
+	// message_TxRx_byte_buffer[stamp_off..stamp_off+5]. Returns 0 if the stamp does not
+	// ride at this config. NEVER recompute — emit the latched value verbatim.
+	if(!w_stamp_rides()) return 0;
+	int b = (bsi < 0) ? 0 : (bsi & 0xFF);
+	uint32_t s_lo = 0; uint32_t len = 0;
+	if(tx_stream_stamp[b].valid)
+	{
+		s_lo = (uint32_t)(tx_stream_stamp[b].start & 0xFFFFFFFFULL);
+		len  = tx_stream_stamp[b].length;
+	}
+	// length16 sentinel 0 for a >64 KB batch (never on HF): keeps the positional
+	// BACKSTOP (start) live while the byte-gate (length) safely no-ops.
+	uint16_t len16 = (len <= 0xFFFFu) ? (uint16_t)len : 0;
+	message_TxRx_byte_buffer[stamp_off+0]=(char)( s_lo        & 0xFF);
+	message_TxRx_byte_buffer[stamp_off+1]=(char)((s_lo >> 8)  & 0xFF);
+	message_TxRx_byte_buffer[stamp_off+2]=(char)((s_lo >> 16) & 0xFF);
+	message_TxRx_byte_buffer[stamp_off+3]=(char)((s_lo >> 24) & 0xFF);
+	message_TxRx_byte_buffer[stamp_off+4]=(char)( len16       & 0xFF);
+	message_TxRx_byte_buffer[stamp_off+5]=(char)((len16 >> 8) & 0xFF);
 	return W_EOB_STAMP_BYTES;
 }
 

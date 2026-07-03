@@ -377,6 +377,56 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
+	// PART W — STAMP WIRE ROUND-TRIP (emit → parse symmetry). Build an EOB DATA_SHORT
+	// frame's header + stamp + payload into message_TxRx_byte_buffer via the PRODUCTION
+	// w_emit_eob_stamp (the same helper send_batch calls), then parse it back via the
+	// PRODUCTION w_parse_eob_stamp (the same helper receive() calls) — asserting the stamp
+	// VALUE round-trips AND the payload lands at the correct offset (no wire off-by-one).
+	// ---------------------------------------------------------------------------
+	printf("[TEST-STREAM-OFFSET] Part W — stamp wire emit/parse round-trip\n");
+	{
+		this->sack_v2_enabled   = true;
+		this->header_carries_d5 = true;
+		CHECK(w_stamp_rides(), "W: stamp rides at the test config (sack_v2+d5, ample max_frame)", w_stamp_rides()?1:0, 1);
+		const int WBSI = 77;
+		const uint64_t WSTART = 0x0123ABCDull;   // fits u32 low word
+		const uint32_t WLEN   = 3850;
+		tx_stream_stamp[WBSI].start  = WSTART;
+		tx_stream_stamp[WBSI].length = WLEN;
+		tx_stream_stamp[WBSI].valid  = true;
+		int eff_short = effective_data_short_header_length(true, true);   // =7 (v2+D5)
+		const int WPAYLEN = 40;
+		// EOB DATA_SHORT header: [0]type [1]conn [2]seq|EOB [3]bsi [4]id [5]len [6]btf.
+		message_TxRx_byte_buffer[0]=(char)DATA_SHORT;
+		message_TxRx_byte_buffer[1]=(char)0x5A;
+		message_TxRx_byte_buffer[2]=(char)(0x03 | 0x80);   // seq 3 + EOB bit
+		message_TxRx_byte_buffer[3]=(char)WBSI;
+		message_TxRx_byte_buffer[4]=(char)0x11;
+		message_TxRx_byte_buffer[5]=(char)WPAYLEN;         // payload length (stamp excluded)
+		message_TxRx_byte_buffer[6]=(char)25;              // D5 batch_total_frames
+		int emitted = w_emit_eob_stamp(eff_short, WBSI);   // PRODUCTION emit
+		CHECK(emitted == W_EOB_STAMP_BYTES, "W: emit wrote W_EOB_STAMP_BYTES", emitted, W_EOB_STAMP_BYTES);
+		int tx_hdr = eff_short + emitted;                  // payload starts here on TX
+		for(int j=0;j<WPAYLEN;j++) message_TxRx_byte_buffer[tx_hdr+j]=(char)((j*7+3)&0x7F);
+		// RX: batch_seq_id is set from wire[3] before w_parse_eob_stamp (mirrors receive()).
+		messages_rx_buffer.batch_seq_id = (unsigned char)message_TxRx_byte_buffer[3];
+		rx_stream_stamp[WBSI].valid = false;
+		int w_shift = w_parse_eob_stamp(eff_short);        // PRODUCTION parse
+		CHECK(w_shift == W_EOB_STAMP_BYTES, "W: parse consumed W_EOB_STAMP_BYTES", w_shift, W_EOB_STAMP_BYTES);
+		CHECK(rx_stream_stamp[WBSI].valid, "W: stamp parsed valid", rx_stream_stamp[WBSI].valid?1:0, 1);
+		CHECK((uint32_t)rx_stream_stamp[WBSI].start == (uint32_t)WSTART, "W: start_lo32 round-trips",
+			(long long)(uint32_t)rx_stream_stamp[WBSI].start, (long long)(uint32_t)WSTART);
+		CHECK(rx_stream_stamp[WBSI].length == WLEN, "W: length16 round-trips",
+			(long long)rx_stream_stamp[WBSI].length, (long long)WLEN);
+		bool payload_ok = true;
+		for(int j=0;j<WPAYLEN;j++)
+			if((unsigned char)message_TxRx_byte_buffer[eff_short + w_shift + j] != (unsigned char)((j*7+3)&0x7F)){ payload_ok=false; break; }
+		CHECK(payload_ok, "W: payload lands at [eff_hdr+stamp] on RX (no off-by-one)", payload_ok?1:0, 1);
+		CHECK((unsigned char)message_TxRx_byte_buffer[5]==WPAYLEN, "W: DATA_SHORT length field excludes the stamp",
+			(unsigned char)message_TxRx_byte_buffer[5], WPAYLEN);
+	}
+
+	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);
 	fflush(stdout);
 	if(g_fails == 0)
