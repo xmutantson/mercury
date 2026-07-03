@@ -427,6 +427,103 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
+	// PART R — the F1/F4.1 REGRESSION the deterministic suite previously MISSED: an
+	// UNCOMPRESSED FRAME-UP climb that stages an in-flight batch and rebuilds it at a HIGHER
+	// config. This drives the PRODUCTION re-stage (restage_requeue_tx_messages → the SAME
+	// stream_tx_rollback_inflight() the open-coded raw legs arq_commander.cc:807/:6241 now
+	// call) — NOT hand-set stamps. The old open-coded legs OMITTED that un-commit, so the
+	// rebuild latched stamp[bsi]={S+L,...} instead of {S,...} and the RSP BACKSTOP false-tore-
+	// down a byte-correct climb. The suite passed anyway because Parts C/D drive the funnel but
+	// nothing reproduced the MISSING-rollback leg.
+	//   PASS-AFTER (default): the un-commit runs → rebuild re-anchors at the TRUE origin S →
+	//     w_stream_shift_detected() FALSE (no teardown).
+	//   FAIL-BEFORE (MERCURY_W_RESTAGE_ROLLBACK_DEFEAT=1 — reproduces the pre-fix open-coded
+	//     leg on the SAME binary): the un-commit no-ops → rebuilt stamp.start==S+L → the
+	//     BACKSTOP sees S+L != rx_delivered(S) → these three CHECKs turn RED (rc=1).
+	// ---------------------------------------------------------------------------
+	printf("[TEST-STREAM-OFFSET] Part R — FRAME-UP climb re-stage: rollback re-anchors, no false teardown (F1/F4.1)\n");
+	{
+		bool rb_defeat = false;
+		{ const char* e = std::getenv("MERCURY_W_RESTAGE_ROLLBACK_DEFEAT");
+		  if(e && *e && atoi(e)!=0) rb_defeat = true; }
+		// Clean mid-session cursor state; a prior batch gives the in-flight one a NON-ZERO origin S.
+		fifo_buffer_tx.flush();
+		tx_stream_committed = 0;
+		for(int i=0;i<256;i++) tx_stream_stamp[i].valid = false;
+		stream_tx_latch(0, 3000);                       // a prior delivered batch
+		const int RKBSI = 15;
+		const uint64_t S = tx_stream_committed;         // the in-flight batch's true origin
+		const int RK = 20, RFLEN = 100;                 // in-flight ~cfg13: 20 frames * 100 B
+		const uint32_t L = (uint32_t)(RK*RFLEN);
+		stream_tx_latch(RKBSI, L);
+		CHECK(tx_stream_stamp[RKBSI].start == S, "R: in-flight batch latched at origin S", (long long)tx_stream_stamp[RKBSI].start, (long long)S);
+		CHECK(tx_stream_committed == S + L, "R: cursor advanced past the in-flight batch", (long long)tx_stream_committed, (long long)(S+L));
+		// Stage the in-flight frames (bsi RKBSI) so the funnel's mod-256 scan finds them.
+		for(int f=0;f<RK;f++){
+			for(int j=0;j<RFLEN;j++) messages_tx[f].data[j]=(char)((f*RFLEN+j)&0x7F);
+			messages_tx[f].length=RFLEN; messages_tx[f].id=(char)f;
+			messages_tx[f].batch_seq_id=RKBSI; messages_tx[f].status=PENDING_ACK;
+		}
+		for(int f=RK;f<nMessages;f++) messages_tx[f].status=FREE;
+		// The receiver delivered THROUGH the in-flight batch's start (the failed batch was never
+		// delivered): rx_stream_delivered == S.
+		rx_stream_delivered = S;
+		// FRAME-UP fires → the PRODUCTION re-stage un-commit (defeatable via the env for fail-before).
+		restage_requeue_tx_messages();
+		// Rebuild the SAME bsi at a HIGHER config (larger transported length L2 — the climb).
+		const uint32_t L2 = 5665;
+		stream_tx_latch(RKBSI, L2);
+		// Mirror the wire round-trip: the RX parses the rebuilt EOB stamp = tx_stream_stamp[RKBSI].
+		rx_stream_stamp[RKBSI].start  = (uint32_t)(tx_stream_stamp[RKBSI].start & 0xFFFFFFFFULL);
+		rx_stream_stamp[RKBSI].length = L2;
+		rx_stream_stamp[RKBSI].valid  = true;
+		decrypt_delivered_bsi = RKBSI;
+		CHECK(tx_stream_committed == S + L2, "R: rebuilt cursor == origin + climbed length", (long long)tx_stream_committed, (long long)(S+L2));
+		CHECK(tx_stream_stamp[RKBSI].start == S, "R: rebuild re-anchored at TRUE origin S (INV4)", (long long)tx_stream_stamp[RKBSI].start, (long long)S);
+		CHECK(!w_stream_shift_detected(RKBSI), "R: no [RSP-V2-STREAM-SHIFT] teardown of byte-correct climb",
+			(long long)(uint32_t)rx_stream_stamp[RKBSI].start, (long long)(uint32_t)rx_stream_delivered);
+		printf("[TEST-STREAM-OFFSET] Part R rb_defeat=%d\n", (int)rb_defeat);
+	}
+
+	// ---------------------------------------------------------------------------
+	// PART S — the F4.2/F2 REGRESSION: a demote-to-ROBUST rebuild at the SAME bsi must NOT be
+	// permanently withheld by a STALE OFDM-sized RX stamp. The RX parsed a full 25-frame cfg16
+	// stamp for bsi K, then the sender demoted to ROBUST and rebuilt K tiny; robust frames carry
+	// NO stamp, so the stale stamp[K].length can never refresh → the PRIMARY byte-gate would
+	// WITHHOLD forever (a LOUD STALL / BREAK spiral, never silent). The fix invalidates every RX
+	// stamp on the config change (the PRODUCTION rx_stream_invalidate_stamps() that
+	// load_configuration() calls). This arm drives that production invalidation — not hand-set
+	// stamps — and proves the withhold CLEARS (recovery), so the outcome is COMPLETE-or-LOUD,
+	// never a silent permanent hang (this is also the F2 withhold recover-vs-stall contract).
+	//   PASS-AFTER (default): invalidation runs → w_bytegate_shortfall() FALSE → no withhold.
+	//   FAIL-BEFORE (MERCURY_W_CFG_STAMP_KEEP=1 — reproduces the pre-fix no-invalidation): the
+	//     stale stamp survives → the withhold PERSISTS → these two CHECKs turn RED (rc=1).
+	// ---------------------------------------------------------------------------
+	printf("[TEST-STREAM-OFFSET] Part S — demote-to-ROBUST: stale RX stamp invalidated on config change (F4.2/F2)\n");
+	{
+		bool cfg_keep = false;
+		{ const char* e = std::getenv("MERCURY_W_CFG_STAMP_KEEP");
+		  if(e && *e && atoi(e)!=0) cfg_keep = true; }
+		const int SKBSI = 60;
+		this->rsp_current_expected_batch_seq_id = SKBSI;
+		rx_stream_delivered = 0;
+		rx_stream_stamp[SKBSI].start  = 0;
+		rx_stream_stamp[SKBSI].length = 25*GFLEN;       // STALE OFDM committed length
+		rx_stream_stamp[SKBSI].valid  = true;
+		int robust_present = seat_rx_batch(3, 3);        // the robust rebuild delivered only 3 frames
+		// BEFORE the config-change invalidation the stale stamp DOES withhold (the loud stall).
+		CHECK(w_bytegate_shortfall(SKBSI), "S: stale OFDM stamp WOULD withhold the robust rebuild (the stall)",
+			(long long)robust_present, (long long)(25*GFLEN));
+		// The PRODUCTION config-apply invalidation (what load_configuration() calls on the demote).
+		rx_stream_invalidate_stamps();
+		CHECK(!rx_stream_stamp[SKBSI].valid, "S: config change invalidated the stale RX stamp",
+			rx_stream_stamp[SKBSI].valid?1:0, 0);
+		CHECK(!w_bytegate_shortfall(SKBSI), "S: no permanent withhold after demote (recovery, not BREAK spiral)",
+			w_bytegate_shortfall(SKBSI)?1:0, 0);
+		printf("[TEST-STREAM-OFFSET] Part S cfg_keep=%d\n", (int)cfg_keep);
+	}
+
+	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);
 	fflush(stdout);
 	if(g_fails == 0)
