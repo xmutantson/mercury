@@ -3412,7 +3412,11 @@ public:
   //   w_stream_shift_detected: BACKSTOP — does batch wbsi's wire stamp.start diverge
   //     from the receiver's absolute delivered cursor (positional shift/hole/dup)?
   //     true ⇒ LOUD teardown. Absent stamp ⇒ false (no-op).
-  bool w_bytegate_shortfall(int wbsi);
+  bool w_bytegate_shortfall(int wbsi);                        // reads messages_rx[] (in-order path)
+  // Array-parameterized twin: the cross-storage PREV completion (arq_responder.cc:1287)
+  // delivers messages_rx_prev[], so its byte-gate must reconcile bytes over THAT array
+  // (not messages_rx[]). Identical logic; reused so the PREV gate matches the primary gate.
+  bool w_bytegate_shortfall(int wbsi, struct st_message* arr);
   bool w_stream_shift_detected(int wbsi);
 
   // SACK Design A Step 4 — RSP cross-batch routing decision state.

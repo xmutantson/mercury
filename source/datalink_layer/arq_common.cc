@@ -14244,15 +14244,32 @@ int cl_arq_controller::w_emit_eob_stamp(int stamp_off, int bsi)
 bool cl_arq_controller::w_bytegate_shortfall(int wbsi)
 {
 	// Option W CORE — RSP PRIMARY decision (data-flow-stream-offset.md §8.2 step 5).
-	// Pure; shared by the production ACK-GATE and test_stream_offset. false on an
-	// absent / zero-length stamp (safe no-op — robust / old peer / lost EOB frame).
-	if(wbsi < 0) return false;
+	// The in-order BATCH-DONE path delivers messages_rx[]; the cross-storage PREV
+	// completion delivers messages_rx_prev[] (arq_responder.cc:1287) via the overload
+	// below. Pure; shared by the production ACK-GATE, the PREV gate, and
+	// test_stream_offset. false on an absent / zero-length stamp (safe no-op —
+	// robust / old peer / lost EOB frame).
+	return w_bytegate_shortfall(wbsi, messages_rx);
+}
+
+bool cl_arq_controller::w_bytegate_shortfall(int wbsi, struct st_message* arr)
+{
+	// Option W CORE — the array-parameterized twin (§8.2 step 5 + the PREV follow-up,
+	// silent-corruption-residual.md §PREV-gate). Counts DELIVERED bytes over the SAME
+	// window copy_data_to_buffer reassembles (RECEIVED|ACKED, i<data_batch_size) from
+	// arr[] and compares to the LATCHED wire stamp.length for wbsi. Reading arr
+	// (messages_rx for the in-order path OR messages_rx_prev for the cross-storage PREV
+	// completion) lets the PREV gate reuse the IDENTICAL byte-reconciliation the in-order
+	// path uses — no parallel logic, no drift. Absent/zero-length stamp OR a NULL array
+	// ⇒ false (safe no-op — robust / cfg0 tiny-frame / old peer / lost EOB / F4.2-
+	// invalidated stamp), so a config with no stamp is NEVER a false shortfall.
+	if(wbsi < 0 || arr == NULL) return false;
 	int b = wbsi & 0xFF;
 	if(!rx_stream_stamp[b].valid || rx_stream_stamp[b].length == 0) return false;
 	int delivered_bytes = 0;
 	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
-		if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
-			delivered_bytes += messages_rx[i].length;
+		if(arr[i].status==RECEIVED || arr[i].status==ACKED)
+			delivered_bytes += arr[i].length;
 	return delivered_bytes < (int)rx_stream_stamp[b].length;
 }
 

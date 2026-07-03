@@ -209,6 +209,19 @@ are on the STEP-2 branch.)
   (invalidated) at copy_data_done after the cursor advance, so a 256-batch wraparound
   reuse with a LOST EOB frame reads invalid (skip), never a stale start.
   `MERCURY_W_STREAM_SHIFT_DEFEAT=1` = fail-before.
+- **RSP PREV byte-gate** (the cross-storage twin of the PRIMARY check;
+  arq_responder.cc:1287-1328, added 2026-07-03 — closes Fable's F1(a) follow-up,
+  silent-corruption-residual.md §18). The cross-storage PREV completion delivers
+  `messages_rx_prev[]` via `copy_data_to_buffer` (:1329-1360) — the in-order path's
+  PRIMARY byte-gate does NOT cover it. BEFORE the swap→deliver body, gate on
+  `w_bytegate_shortfall(rsp_prev_batch_seq_id, messages_rx_prev)` (the array-param twin
+  reads the PREV storage): on a shortfall WITHHOLD — do NOT swap/deliver, do NOT advance,
+  do NOT emit the clean ACK; leave `messages_rx_prev[]` RECEIVED + `rsp_prev_batch_active`
+  so the CMD's ACK-timeout retransmits the short tail (COMPLETE-or-LOUD, never a silent
+  short credit — identical discipline to the primary gate). FALSE-FIRE: absent/invalid
+  stamp (robust / cfg0 tiny-frame / lost EOB / F4.2-invalidated) ⇒ `w_bytegate_shortfall`
+  false ⇒ safe no-op; a legit full PREV (delivered==committed) does not trip it.
+  `MERCURY_W_PREV_BYTEGATE_DEFEAT=1` = fail-before (`--test-stream-offset` Part T).
 
 ---
 
@@ -279,6 +292,16 @@ CORE W (STEP 2) changes two RSP consumers:
   `stamp.start==rx_stream_delivered` first. FALSE-FIRE guard: PREV/mixbatch
   deliveries are contiguous by construction (each carries its own latched start);
   the check only fires on a genuine hole/shift/dup.
+- **CORRECTION (2026-07-03, §9):** the BACKSTOP (start-only) is NOT sufficient for
+  the cross-storage PREV completion. A SHORT PREV (mechanism-4: complete-at-shrunk-
+  count) is POSITION-correct at its first byte (start==cursor → BACKSTOP inert) yet
+  delivers FEWER bytes than committed → its short/shifted tail reaches the app, and
+  the cursor advances short so the NEXT batch's positional guard only refuses the
+  FOLLOWING batch — AFTER the short tail already leaked (c11w006: 12 wrong bytes at
+  offset 289). Fable's §17.1(a) "the next BACKSTOP refuses before any corrupt byte
+  reaches the app; never silent; acceptable" was therefore INCOMPLETE — the PREV
+  delivery itself is the leak. The PREV byte-gate (§3, §9) closes it by reconciling
+  DELIVERED bytes vs committed length at the PREV completion, before delivery.
 
 ---
 
@@ -301,6 +324,15 @@ transported origin` at each:
 5. **rx advance + INV1:** advance `rx_stream_delivered` by each delivered length;
    assert it equals the corresponding `stamp.start` at each boundary.
 Fail-before/pass-after for the 4 mechanisms is added in STEP 2 (env-defeat arms).
+Later parts (all drive PRODUCTION helpers): **Part R** FRAME-UP climb re-stage rollback
+(F1/F4.1, `MERCURY_W_RESTAGE_ROLLBACK_DEFEAT`); **Part S** demote-to-ROBUST stale-stamp
+invalidation (F4.2/F2, `MERCURY_W_CFG_STAMP_KEEP`); **Part T** the cross-storage PREV
+byte-gate (§9, `MERCURY_W_PREV_BYTEGATE_DEFEAT`) — seats a SHORT prev batch into
+`messages_rx_prev[]` with a CONTIGUOUS stamp.start (BACKSTOP inert, isolating the byte-gate)
+and drives `w_bytegate_shortfall(prev_bsi, messages_rx_prev)` + `copy_data_to_buffer`,
+grounded on `res_c11w006` (offset 289 / 12 bytes): fail-before delivers the 12-byte short
+tail; pass-after withholds → 0 leaked bytes. T0 (complete PREV) + T0b (absent stamp) assert
+no false-fire.
 
 ---
 
@@ -329,11 +361,26 @@ Fail-before/pass-after for the 4 mechanisms is added in STEP 2 (env-defeat arms)
   (same-position value corruption / streaming-decompressor desync) + EOT
   total_committed_bytes check (last-batch tail-drop blind spot). Both touch the riskiest
   subsystems (build path / session teardown); out of scope for the correctness-first core.
-- **O5** [?] `w_stamp_rides()` threshold: the stamp is skipped when
-  `max_frame < W_STAMP_MIN_MAXFRAME`(15). Verify cfg0's max_frame (the smallest OFDM
-  config) at cohort time; if cfg0's max_frame ≥ 15 the stamp rides there too (harmless —
-  reservation leaves ≥8 payload). The 4 captured mechanisms are all cfg13-16, so the
-  gate is live where it matters regardless.
+- **O5 — RESOLVED-with-caveat (2026-07-03).** `w_stamp_rides()` threshold: the stamp is
+  skipped when `max_frame < W_STAMP_MIN_MAXFRAME`(15). CONFIRMED from `res_c11w006`/`arq_c11w006.log`:
+  cfg0's per-frame payload is ~4 B (`RSP-V2-PREV-RX ... len=4`), well below 15, so the stamp does
+  NOT ride at cfg0 (and never at robust 100/101/102 — `header_carries_d5 = !is_robust`,
+  arq_common.cc:2258). ALL of Option W (primary gate, BACKSTOP, and the new PREV gate) is therefore
+  STRUCTURALLY INERT at robust/cfg0. The 4 captured mechanisms are all cfg13-16, so the gate is live
+  where it matters — BUT see **O6**: c11w006 itself is a robust/cfg0 session that never climbed past
+  cfg0, so its 12-byte short-PREV leak is OUTSIDE Option W's stamp-based scope.
+- **O6 — the c11w006 residual (2026-07-03, the honest limit of this fix).** `res_c11w006` is a
+  WGN:25 session that stalled at robust/cfg0 (`max_config_reached=102`, `wb_configs_seen=[0]`). Its
+  leaking delivery was bsi=16 at **cfg0**: a 6-frame batch (`seq=1/6`) completed at a SHRUNK count of
+  4 (mechanism-4) via the cross-storage PREV path, delivering a 12-byte short/shifted tail at offset
+  289; the stamp-independent GAP-ABORT caught the *later* hole at bsi=18 — AFTER the 12-byte
+  corruption (`byte_integrity_ok=false, mismatch=12, first_bad=289`). Because the stamp does not ride
+  at cfg0, **the PREV byte-gate (and the primary gate) cannot catch this specific cell.** Closing the
+  robust/cfg0 short-PREV needs a STAMP-INDEPENDENT reference (the sender's true per-batch frame count,
+  which mechanism-4 itself shrinks — so not a trivial reuse) or acceptance of GAP-ABORT's late catch;
+  it is a DISTINCT residual from the PREV-gate this clip ships, and is out of Option W's scope. NET:
+  this fix closes the PREV-path asymmetry for stamp-riding configs (cfg13-16); it does NOT close the
+  c11w006 cell.
 
 ---
 
@@ -463,3 +510,70 @@ Absent EOT (lost frame / abrupt drop) = safe no-op. RISK the follow-up must clea
 path is session-teardown state with a documented SWITCH_ROLE / idle-switchrole-race history
 (MEMORY.md) — wire the field into the EXISTING DISCONNECT control code, do NOT add a new
 handshake, and audit the teardown race before touching it.
+
+---
+
+## §9 CROSS-LAYER AUDIT — the cross-storage PREV completion delivery + its stamp (2026-07-03)
+
+The CLAUDE.md 5-question audit for the state the PREV byte-gate touches: the DELIVERY of
+`messages_rx_prev[]` (ARQ→app) and `rx_stream_stamp[prev_bsi]` / `rx_stream_delivered` (the
+Option-W cursor). Root: Fable's F1(a) follow-up (§17.1a) — the in-order BATCH-DONE path is
+byte-gated (PRIMARY, arq_responder.cc:2533-2565) but the cross-storage PREV completion is not, so a
+SHORT PREV leaks a short/shifted tail before the next-batch positional guard catches it
+(c11w006: 12 wrong bytes @289).
+
+**1. PRODUCERS of the PREV delivery + the stamp/cursor at that site:**
+- `messages_rx_prev[loc].status=RECEIVED` (arq_responder.cc:1151) — the prev-RX routing stores a
+  matching prev-batch frame. `rsp_prev_batch_received_count`++ / `..._expected_count` set/corrected
+  (arq_responder.cc:1150-1188, incl. the "EOB-inference was short" correction :1185).
+- `rx_stream_stamp[prev_bsi]` = {start_lo32,length16,valid} — parsed on the prev batch's EOB frame
+  by `w_parse_eob_stamp` (arq_common.cc:14194-14216) at a `w_stamp_rides()` config. Invalidated on
+  any config change by `rx_stream_invalidate_stamps()` (arq_common.cc:14127, F4.2) and CONSUMED
+  (`.valid=false`) at `copy_data_done` after each delivery (arq_common.cc:14572).
+- `rx_stream_delivered` += delivered_transported — advanced ONCE per delivery in `copy_data_to_buffer`
+  (arq_common.cc:14565), INCLUDING the PREV delivery (the swap routes messages_rx_prev through the
+  same funnel).
+- The PREV DELIVERY itself: the swap `messages_rx = messages_rx_prev` (arq_responder.cc:1341) →
+  mark RECEIVED→ACKED (:1354) → `copy_data_to_buffer()` (:1360) → restore + `advance_last_delivered`
+  (:1378). This is the producer of app-FIFO bytes for the recovered prev batch.
+
+**2. CONSUMERS of that state:**
+- `copy_data_to_buffer` reads `messages_rx[i].status/length` over `[0,data_batch_size)` (now ==
+  messages_rx_prev after the swap) to reassemble+deliver; reads `rx_stream_stamp[decrypt_delivered_bsi]`
+  for the BACKSTOP (start) and advances `rx_stream_delivered`.
+- The NEW PREV byte-gate reads `rx_stream_stamp[prev_bsi].{valid,length}` and the SAME
+  `messages_rx_prev[i].{status,length}` window (via `w_bytegate_shortfall(prev_bsi, messages_rx_prev)`)
+  BEFORE the swap/deliver.
+- Next-batch positional guards read `rx_stream_delivered` (BACKSTOP `w_stream_shift_detected`) /
+  `rsp_last_delivered_batch_seq_id` (GAP-ABORT `delivery_step_is_gap`) — these were the ONLY
+  post-hoc catch of a short PREV before this fix.
+
+**3. VALID STATES (esp. BEFORE any producer writes):** `rx_stream_stamp[b].valid=false` (never
+parsed / post-invalidate / post-deliver / robust / cfg0 tiny-frame). In that state
+`w_bytegate_shortfall` returns false → the PREV gate is a SAFE NO-OP (this is the c11w006 regime —
+O6). `length==0` (>64 KB sentinel / unlatched TX) → also no-op. Prev slots default FREE → not
+counted. The gate never fires without a valid, non-zero, RIDING stamp.
+
+**4. INVARIANTS the consumers assume + how the fix maintains them:**
+- INV5 (transported==transported): the PREV delivery reassembles `Σ messages_rx_prev[i].length`
+  over `[0,data_batch_size)` == the SAME window `copy_data_to_buffer` delivers. The gate measures
+  EXACTLY the bytes that will be delivered (same bound, same array), so `delivered<committed` is the
+  true shortfall — never a phantom mismatch from a different window.
+- The clean MFSK ACK for the prev (arq_responder.cc:1414-1458) rides INSIDE the delivery body, so a
+  WITHHOLD (guarding the body with `!prev_byte_withheld`) also withholds the clean ACK — the CMD's
+  ACK-timeout then retransmits (COMPLETE-or-LOUD). No ACK/deliver split.
+- The bigblock partial-CRC gate (:1234) and the D3.1 gap gate (:1310) run BEFORE the byte-gate and
+  are unchanged; a torn-down (`prev_gap_aborted`) or rejected prev never reaches the byte-gate.
+
+**5. WHAT THE FIX CHANGES (per-consumer walk):** it adds ONE consumer (the PREV byte-gate) reading
+already-produced state (the parsed stamp + the prev storage) and, on shortfall, SKIPS the existing
+producer (the swap→deliver→advance). No new state; no producer's write is altered. The only behavior
+change: a short PREV that used to deliver+advance now withholds+re-arms. Every downstream consumer
+of `rx_stream_delivered` (BACKSTOP, GAP-ABORT, cohort oracle) sees the cursor UNMOVED on a withheld
+prev — strictly safer than the pre-fix short advance (which mis-set the cursor and shifted the next
+batch). FALSE-FIRE proven safe by Part T0/T0b (complete PREV + absent stamp = no withhold) and by
+the O6 no-op at robust/cfg0.
+
+**SCOPE (honest):** this closes the PREV-path asymmetry for STAMP-RIDING configs (cfg13-16). It does
+NOT close the c11w006 cell (robust/cfg0, no stamp — O6): that short-PREV leak is stamp-independent
+and outside Option W's reach.

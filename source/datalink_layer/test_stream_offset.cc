@@ -524,6 +524,92 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
+	// PART T — the cross-storage PREV byte-gate (c11w006). The PRIMARY byte-gate (Part H)
+	// only protects the in-order BATCH-DONE path; the cross-storage PREV completion
+	// (arq_responder.cc:1287 swap→copy_data_to_buffer) delivered messages_rx_prev[] UN-gated.
+	// In c11w006 a 6-frame batch completed at a SHRUNK count of 4 (mechanism-4) and its
+	// 12-byte short/shifted tail was delivered at stream offset 289 before the next-batch
+	// positional guard caught the hole — a silent 12-byte corruption (res_c11w006:
+	// first_bad=289 len=12). This drives the PRODUCTION decision predicate
+	// w_bytegate_shortfall(prev_bsi, messages_rx_prev) (the SAME the wire PREV path now calls)
+	// + the PRODUCTION copy_data_to_buffer reassembler, mirroring the socket-bound swap/
+	// withhold control flow (the test_batchsize_desync_delivery contract). The stamp.start is
+	// set CONTIGUOUS (== rx_delivered) so the positional BACKSTOP is INERT here — proving the
+	// BYTE-gate, not the shift check, is the necessary catch for a short-but-in-position PREV.
+	//   PASS-AFTER (default): the PREV gate fires → the short prev is WITHHELD → 0 bytes leak.
+	//   FAIL-BEFORE (MERCURY_W_PREV_BYTEGATE_DEFEAT=1 — reproduces the pre-fix un-gated PREV
+	//     path on the SAME binary): copy_data_to_buffer delivers the 12-byte short tail → 12
+	//     leaked bytes reach the app fifo (byte-integrity broken).
+	printf("[TEST-STREAM-OFFSET] Part T — cross-storage PREV byte-gate (c11w006 offset 289 / 12 bytes)\n");
+	{
+		bool prev_defeat = false;
+		{ const char* e = std::getenv("MERCURY_W_PREV_BYTEGATE_DEFEAT");
+		  if(e && *e && atoi(e)!=0) prev_defeat = true; }
+		const int      TBSI  = 16;          // c11w006's leaking prev bsi
+		const uint64_t TBASE = 289;         // res_c11w006 first_bad offset (== good_prefix bytes)
+		const int      TLEAK = 12;          // res_c11w006 mismatch bytes (the short tail)
+		// Seat the SHORT prev batch into messages_rx_prev[]: ONE 12-byte frame present (the
+		// shrunk-count completion), all other slots FREE. data_batch_size = 1 = the shrunk
+		// window, so copy_data_to_buffer would deliver exactly those 12 bytes.
+		for(int f=0;f<nMessages;f++){ messages_rx_prev[f].status=FREE; messages_rx_prev[f].length=0; }
+		for(int j=0;j<TLEAK;j++) messages_rx_prev[0].data[j]=(char)((j*13+7)&0x7F);
+		messages_rx_prev[0].length = TLEAK;
+		messages_rx_prev[0].id     = (char)0;
+		messages_rx_prev[0].status = RECEIVED;      // as the prev-RX path stores it (arq_responder.cc:1151)
+		this->data_batch_size = 1;
+		rx_stream_delivered          = TBASE;       // cursor at the good-prefix boundary
+		rx_stream_stamp[TBSI].start  = TBASE;       // CONTIGUOUS ⇒ BACKSTOP inert (isolate the byte-gate)
+		rx_stream_stamp[TBSI].length = TLEAK + 3*GFLEN;  // sender committed MORE than the short tail
+		rx_stream_stamp[TBSI].valid  = true;
+		// T0 — NO false-fire: a COMPLETE prev (delivered == committed) must NOT trip the gate.
+		rx_stream_stamp[TBSI].length = TLEAK;
+		CHECK(!w_bytegate_shortfall(TBSI, messages_rx_prev),
+			"T0: complete PREV does NOT trip the byte-gate (no false-fire)", TLEAK, TLEAK);
+		// T0b — absent/invalid stamp (robust / cfg0 tiny-frame / lost EOB) ⇒ safe no-op.
+		rx_stream_stamp[TBSI].valid = false;
+		CHECK(!w_bytegate_shortfall(TBSI, messages_rx_prev),
+			"T0b: absent PREV stamp is a safe no-op (never a false withhold)", 0, 0);
+		rx_stream_stamp[TBSI].valid  = true;
+		rx_stream_stamp[TBSI].length = TLEAK + 3*GFLEN;   // restore the short scenario
+		// The decision predicate MUST fire (delivered 12 < committed), in BOTH modes.
+		CHECK(w_bytegate_shortfall(TBSI, messages_rx_prev),
+			"T: short PREV trips the byte-gate (delivered<committed)",
+			(long long)TLEAK, (long long)rx_stream_stamp[TBSI].length);
+		decrypt_delivered_bsi = TBSI;
+		fifo_buffer_rx.flush();
+		if(prev_defeat)
+		{
+			// fail-before: the PREV gate is DEFEATED → the production swaps messages_rx →
+			// messages_rx_prev, marks RECEIVED→ACKED, and delivers the short tail (the bug).
+			struct st_message* saved_rx = messages_rx;
+			messages_rx = messages_rx_prev;
+			for(int i=0;i<this->data_batch_size && i<this->nMessages;i++)
+				if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;
+			copy_data_to_buffer();
+			messages_rx = saved_rx;
+			char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+			CHECK(popped==TLEAK, "T(defeat): un-gated short PREV leaked its 12-byte tail (fail-before bug)",
+				popped, TLEAK);
+		}
+		else
+		{
+			// pass-after: mirror the production PREV control flow — the gate fires ⇒ WITHHOLD
+			// (copy_data_to_buffer NOT called), exactly as arq_responder.cc:1287 now guards the
+			// swap→deliver body with `!prev_byte_withheld`. 0 bytes reach the app fifo.
+			if(!w_bytegate_shortfall(TBSI, messages_rx_prev))
+			{
+				struct st_message* saved_rx = messages_rx;    // (unreached in the fix build)
+				messages_rx = messages_rx_prev;
+				copy_data_to_buffer();
+				messages_rx = saved_rx;
+			}
+			char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+			CHECK(popped==0, "T(fix): short PREV withheld → 0 leaked bytes reach the buffer", popped, 0);
+		}
+		printf("[TEST-STREAM-OFFSET] Part T prev_defeat=%d\n", (int)prev_defeat);
+	}
+
+	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);
 	fflush(stdout);
 	if(g_fails == 0)

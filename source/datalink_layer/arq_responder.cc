@@ -1284,7 +1284,49 @@ void cl_arq_controller::process_messages_rx_data_control()
 									prev_gap_aborted = true;
 								}
 							}
-							if(!prev_gap_aborted) {
+							// Option W CORE — RSP PREV byte-gate (the cross-storage twin of the
+							// PRIMARY byte-gate at :2565; data-flow-stream-offset.md §3-PREV / §9 /
+							// silent-corruption-residual.md §PREV-gate). The in-order BATCH-DONE
+							// path byte-gates the clean ACK against the wire stamp.length, but THIS
+							// cross-storage PREV completion delivers messages_rx_prev[] via
+							// copy_data_to_buffer (below) UN-gated — a short PREV (mechanism-4:
+							// complete-at-shrunk-count) pushes a short/shifted tail that the next
+							// batch's positional guard (BACKSTOP / GAP-ABORT) only catches AFTER the
+							// leak (c11w006: 12 wrong bytes at stream offset 289; res_c11w006 was
+							// cfg0-robust so the stamp did NOT ride there — this gate closes the
+							// site for every stamp-riding config cfg13-16 where the 4 mechanisms
+							// occur). Gate on DELIVERED bytes for THIS prev bsi over messages_rx_prev[]
+							// (the array copy_data_to_buffer delivers after the swap) vs the committed
+							// stamp.length; on a shortfall WITHHOLD — do NOT swap/deliver, do NOT
+							// advance, do NOT emit the clean ACK — leaving messages_rx_prev[] RECEIVED
+							// + rsp_prev_batch_active so the CMD's ACK-timeout retransmits the tail
+							// (COMPLETE-or-LOUD, never a silent short credit — the SAME discipline as
+							// the primary gate). FALSE-FIRE: an absent/invalid stamp (robust / cfg0
+							// tiny-frame / lost EOB / F4.2-invalidated) makes w_bytegate_shortfall
+							// return false ⇒ safe no-op; a LEGITIMATE full PREV (delivered==committed)
+							// does not trip it. MERCURY_W_PREV_BYTEGATE_DEFEAT=1 restores the pre-fix
+							// un-gated PREV delivery (the --test-stream-offset Part-T fail-before arm).
+							bool prev_byte_withheld = false;
+							if(!prev_gap_aborted)
+							{
+								bool w_prev_bytegate_defeat = false;
+								{ const char* e = std::getenv("MERCURY_W_PREV_BYTEGATE_DEFEAT");
+								  if(e && *e && atoi(e)!=0) w_prev_bytegate_defeat = true; }
+								if(!w_prev_bytegate_defeat
+								   && w_bytegate_shortfall(rsp_prev_batch_seq_id, messages_rx_prev))
+								{
+									printf("[RSP-V2-PREV-BYTE-SHORTFALL] WITHHOLD prev delivery: "
+										"bsi=%d committed=%u (frame-count complete but byte shortfall "
+										"— short/shrunk PREV); keeping prev pending + RECEIVED, NOT "
+										"delivering, NOT crediting. CMD ACK-timeout retransmits the "
+										"tail (no leaked short tail).\n",
+										rsp_prev_batch_seq_id & 0xFF,
+										rx_stream_stamp[rsp_prev_batch_seq_id & 0xFF].length);
+									fflush(stdout);
+									prev_byte_withheld = true;
+								}
+							}
+							if(!prev_gap_aborted && !prev_byte_withheld) {
 							if(compressor.is_streaming() && batch_data_delivered) {
 								// V1 defense: out-of-order prev-batch delivery would desync the
 								// streaming PPMd model. Current batch already committed; prev-batch

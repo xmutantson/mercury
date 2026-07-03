@@ -703,3 +703,54 @@ CORE W's PRIMARY covers the final batch whenever the stamp/EOB arrived; EOT + CR
 the scheduled follow-up and EOT must be in before any capstone end-to-end integrity claim.
 After the two fixes + green suite + the strong-oracle WGN:25 cohort (0 silent, no
 false-fire, withholds recover): present the owner merge fork.
+
+## §18 PREV-GATE SHIPPED — the F1(a) cross-storage byte-gate follow-up (2026-07-03)
+
+Fable's §17.1(a) flagged the cross-storage PREV completion as NOT byte-gated and named a
+"PREV-side byte-gate = worthwhile follow-up." The pre-cohort capture `res_c11w006` (WGN:25,
+seed 7) is the exemplar: `byte_integrity_ok=false, integrity_mismatch_bytes=12,
+integrity_first_bad_offset=289` — a silent 12-byte corruption (`DELIV c9785fc3…` vs
+`EXPEC da6e7aa9…`). This clip ships that gate.
+
+**The mechanism (from `_research/_c11w006_capture/arq_c11w006.log`):**
+- The session STALLED at robust/cfg0 (`max_config_reached=102`, `wb_configs_seen=[0]`) — it
+  never climbed past cfg0.
+- The leaking delivery = bsi=16 at **cfg0** (`[FRAME-NV] cfg=0`, `[OFDM-OK] t0 cfg=0`): a
+  6-frame batch (`[RSP-V2-PREV-RX] bsi=16 ... seq=1/6`) declared complete at a SHRUNK count of
+  4 (`prev_received=4/4`, SACK `nframes=6`) — mechanism-4 (complete-at-shrunk-count). It
+  delivered a 12-byte short/shifted tail at stream offset 289 via the cross-storage PREV path
+  (`[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=16 ... last_delivered=16`), UN-gated.
+- The stamp-INDEPENDENT GAP-ABORT caught the LATER hole at bsi=18
+  (`[RSP-V2-GAP-ABORT] ... bsi=18 non-contiguous with last_delivered=16`) — AFTER the 12-byte
+  corruption. So Fable's §17.1(a) "the next BACKSTOP refuses before any corrupt byte reaches the
+  app; never silent" was INCOMPLETE: the short PREV delivery ITSELF is the leak, and the
+  next-batch positional guard only stops the FOLLOWING batch.
+
+**The fix (arq_responder.cc:1287-1328):** BEFORE the PREV swap→deliver body, gate on
+`w_bytegate_shortfall(rsp_prev_batch_seq_id, messages_rx_prev)` — a new array-parameterized
+overload of the primary predicate (arq_common.cc:14255) that reconciles DELIVERED bytes over
+the SAME window `copy_data_to_buffer` will deliver from `messages_rx_prev[]`. On a shortfall
+WITHHOLD: no swap/deliver, no cursor advance, no clean ACK; leave `messages_rx_prev[]` RECEIVED
++ `rsp_prev_batch_active` so the CMD's ACK-timeout retransmits the tail (COMPLETE-or-LOUD,
+identical discipline to the primary gate). FALSE-FIRE safe: absent/invalid stamp ⇒ no-op; a
+legit full PREV (delivered==committed) does not trip it. `MERCURY_W_PREV_BYTEGATE_DEFEAT=1` =
+fail-before. Full audit: data-flow-stream-offset.md §9.
+
+**Test (`--test-stream-offset` Part T):** drives the PRODUCTION predicate + the PRODUCTION
+`copy_data_to_buffer` reassembler (the test_batchsize_desync_delivery contract), grounded on
+`res_c11w006` (offset 289 / 12 bytes). Verified on the o3 binary:
+- pass-after (default): `T(fix): short PREV withheld → 0 leaked bytes ... got=0 want=0`.
+- fail-before (`MERCURY_W_PREV_BYTEGATE_DEFEAT=1`): `T(defeat): un-gated short PREV leaked its
+  12-byte tail ... got=12 want=12`.
+- `T0` (complete PREV) + `T0b` (absent stamp) assert no false-fire; the full suite is green.
+
+**HONEST SCOPE — the c11w006 caveat (data-flow-stream-offset.md O5/O6):** the Option-W stamp
+does NOT ride at cfg0 (per-frame payload ~4 B < `W_STAMP_MIN_MAXFRAME`=15) or at robust
+(`header_carries_d5 = !is_robust`, arq_common.cc:2258). So this stamp-based PREV gate — LIKE
+the primary gate and the BACKSTOP — is STRUCTURALLY INERT at robust/cfg0. It closes the
+PREV-path asymmetry for STAMP-RIDING configs (cfg13-16, where all 4 captured mechanisms occur);
+it does **NOT** close the c11w006 cell itself (a robust/cfg0 short-PREV, bounded only by the
+late stamp-independent GAP-ABORT). Closing the robust/cfg0 short-PREV is a DISTINCT residual
+(needs a stamp-independent reference — mechanism-4 shrinks the frame-count reference, so not a
+trivial reuse) and is out of Option W's scope. NET: the PREV-path gap is closed where stamps
+ride; the c11w006 cell is not.
