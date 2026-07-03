@@ -3216,6 +3216,16 @@ public:
   void stream_tx_latch(int bsi, uint32_t transported_len);
   void stream_tx_rollback_inflight();
 
+  // Option W CORE (F4.2, silent-corruption-residual.md §16/§17.5): invalidate every
+  // parsed RX wire stamp on a config change. A config change ALWAYS re-stages the
+  // sender's in-flight batch, so any rx_stream_stamp[] parsed-but-not-yet-delivered is
+  // STALE by construction; a demote-to-ROBUST rebuild is the killer (robust frames carry
+  // NO stamp → a stale OFDM-sized stamp[bsi].length can never refresh → the PRIMARY
+  // byte-gate WITHHOLDs forever → BREAK spiral). Called from load_configuration() on the
+  // RX config-apply. Both W predicates no-op on an invalid stamp. Also kills the 256-wrap
+  // stale-start false teardown. MERCURY_W_CFG_STAMP_KEEP=1 = fail-before (keep the stale).
+  void rx_stream_invalidate_stamps();
+
 	//! Receives a data or a control message from the other end (via ALSA driver).
 	    /*!
 	      \return None

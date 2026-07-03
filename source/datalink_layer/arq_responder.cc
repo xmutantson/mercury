@@ -2496,13 +2496,24 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			// a permanent stream shift. Gate on DELIVERED BYTES vs the wire stamp.length: on a
 			// shortfall WITHHOLD the clean ACK (keep messages_rx RECEIVED, do NOT mark ACKED,
 			// do NOT bump the bsi, do NOT deliver) and re-arm — the SAME discipline as the
-			// partial-batch SACK-suppress / backpressure holds above — so the CMD's ACK-timeout
-			// re-drives and the existing SACK partial-retx re-requests the missing frames. This
-			// makes "declare complete at a shrunk count" IMPOSSIBLE: the byte count, not the
-			// frame count, gates completion. FALSE-FIRE guard: compare ONLY to the LATCHED
-			// stamp.length (never expected/data_batch_size); absent stamp (robust / old peer /
-			// lost EOB frame) = safe no-op. MERCURY_W_BYTEGATE_DEFEAT=1 restores the pre-fix
-			// count-only PASS (the STEP-2c fail-before arm).
+			// partial-batch SACK-suppress / backpressure holds above. This makes "declare
+			// complete at a shrunk count" IMPOSSIBLE: the byte count, not the frame count, gates
+			// completion.
+			// RECOVERY (F2, silent-corruption-residual.md §16/§17.6 — corrected): this path
+			// does NOT emit a SACK. On a byte shortfall the batch is FRAME-COUNT complete (every
+			// slot in [0,data_batch_size) is present), so a SACK bitmap over that window would be
+			// ALL-ONES and would FALSE-CREDIT the batch — the exact silent accept this gate
+			// prevents; the short/surplus bytes live OUTSIDE the RSP's bitmap. Recovery is
+			// therefore the CMD's ACK-timeout (the clean ACK looks lost, an existing recoverable
+			// state) → full-batch retransmit → the sender re-stages+rebuilds (a fresh EOB stamp
+			// re-arrives; a demote/config-change also invalidates the stale stamp, F4.2) → the
+			// shortfall clears and the batch completes; if it persists the retx-storm escalates
+			// to BREAK (LOUD, bounded). So the outcome is COMPLETE or LOUD — never a silent
+			// credit, never a permanent hang (§8.2-arm test_stream_offset Part S drives it).
+			// FALSE-FIRE guard: compare ONLY to the LATCHED stamp.length (never expected/
+			// data_batch_size); absent stamp (robust / old peer / lost EOB frame) = safe no-op.
+			// MERCURY_W_BYTEGATE_DEFEAT=1 restores the pre-fix count-only PASS (the STEP-2c
+			// fail-before arm).
 			if(!passive_monitor && sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
 			{
 				int wbsi = rsp_current_expected_batch_seq_id & 0xFF;

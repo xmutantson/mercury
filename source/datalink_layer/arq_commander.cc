@@ -801,6 +801,13 @@ void cl_arq_controller::process_messages_commander()
 				}
 				else
 				{
+					// Option W (F1/F4.1, silent-corruption-residual.md §16/§17.4): open-coded
+					// BREAK-EXHAUSTED re-stage (bypasses restage_requeue_tx_messages) — un-commit
+					// the in-flight batch's transported bytes BEFORE re-queuing so the rebuild
+					// re-anchors at the same start the receiver delivered to (mirrors the correct
+					// BREAK phase-1 leg :715; the compressed leg above rolls back inside
+					// restore_tx_from_compressed). WITHOUT this the RSP BACKSTOP false-tears-down.
+					stream_tx_rollback_inflight();
 					for(int i=nMessages-1; i>=0; i--)
 					{
 						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
@@ -6235,6 +6242,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				}
 				else
 				{
+					// Option W (F1/F4.1, silent-corruption-residual.md §16/§17.4): open-coded
+					// GEARSHIFT FRAME-UP re-stage (bypasses restage_requeue_tx_messages) — un-commit
+					// the in-flight batch's transported bytes BEFORE re-queuing so the re-encoded
+					// batch (roll_back_cmd_bsi_to_inflight above re-uses the SAME bsi) re-anchors at
+					// the same start the receiver delivered to. WITHOUT this the mid-transfer climb
+					// latches stamp[bsi]={S+L,...} → RSP BACKSTOP false-teardown of a byte-correct
+					// session. Mirrors the correct BREAK phase-1 leg :715.
+					stream_tx_rollback_inflight();
 					for(int i=nMessages-1; i>=0; i--)
 					{
 						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)

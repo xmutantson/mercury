@@ -2174,6 +2174,11 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		printf("[CFG] Already on config %d, skipping\n", configuration);
 		return;
 	}
+	// Option W CORE (F4.2, silent-corruption-residual.md §16/§17.5): a real config change
+	// re-stages the sender's in-flight batch, so every parsed-undelivered RX wire stamp is
+	// stale — invalidate them here (RX-side; a harmless no-op on the CMD). Placed AFTER the
+	// no-change early-return so a redundant same-config load never touches them.
+	rx_stream_invalidate_stamps();
 	if(current_configuration!=CONFIG_NONE)
 	{
 		if(level==FULL)
@@ -8715,6 +8720,7 @@ void cl_arq_controller::send(st_message* message, int message_location)
 	printf("send()\n");
 
 	int header_length=0;
+	int w_stamp_added=0;   // Option W (F3): +W_EOB_STAMP_BYTES if an EOB DATA frame stamps
 	if(message->type==DATA_LONG)
 	{
 		// SACK Design A Steps 1+3 + D5 — DATA_LONG header growth + batch_seq_id +
@@ -8798,12 +8804,34 @@ void cl_arq_controller::send(st_message* message, int message_location)
 		header_length=CONTROL_ACK_CONTROL_HEADER_LENGTH;
 	}
 
+	// Option W CORE (F3, silent-corruption-residual.md §16/§17.6): this single-frame send()
+	// path shares the DATA_LONG/DATA_SHORT wire format with send_batch(). It has NO DATA
+	// callers today (all DATA goes through send_batch), but if a future caller emits an EOB
+	// DATA frame here WITHOUT the byte-stream stamp, the RX's w_parse_eob_stamp — which fires
+	// on ANY EOB DATA frame at a w_stamp_rides() config — would mis-read 6 payload bytes as a
+	// stamp. Emit the LATCHED stamp here too (mirroring send_batch, arq_common.cc:9132) so the
+	// wire stays consistent and the RX parses it correctly. Gated identically (EOB DATA frame,
+	// w_stamp_rides()); a no-op for CONTROL/ACK frames and at non-stamp configs. Grows
+	// header_length so the payload copy below starts past the stamp.
+	{
+		bool is_data_frame = (message->type==DATA_LONG || message->type==DATA_SHORT);
+		bool is_eob = is_data_frame
+		           && ((unsigned char)message->sequence_number & 0x80);
+		if(is_eob)
+		{
+			w_stamp_added = w_emit_eob_stamp(header_length, message->batch_seq_id);
+			header_length += w_stamp_added;
+		}
+	}
+
 	for(int i=0;i<message->length;i++)
 	{
 		message_TxRx_byte_buffer[i+header_length]=message->data[i];
 	}
 
-	if(header_length>max_header_length)
+	// Option W: an EOB-stamped frame legitimately carries an extra W_EOB_STAMP_BYTES of
+	// header (mirrors send_batch's relaxed guard, arq_common.cc:9159).
+	if(header_length>max_header_length + w_stamp_added)
 	{
 		std::cout<<"header size is too big, adjust the configuration parameters"<<std::endl;
 		exit(0);
@@ -14055,6 +14083,17 @@ void cl_arq_controller::stream_tx_latch(int bsi, uint32_t transported_len)
 // nothing is in flight or the stamp was never latched; safe to call redundantly.
 void cl_arq_controller::stream_tx_rollback_inflight()
 {
+	// FAIL-BEFORE arm (F1/F4.1, silent-corruption-residual.md §16/§17.4): the pre-fix
+	// open-coded raw re-stage legs (arq_commander.cc BREAK-EXHAUSTED :807, GEARSHIFT
+	// FRAME-UP :6241) re-queued in-flight messages_tx[] + freed them WITHOUT calling this
+	// un-commit → the rebuilt batch latched at start=S+L instead of S → the RSP BACKSTOP
+	// false-tears-down a byte-correct session. MERCURY_W_RESTAGE_ROLLBACK_DEFEAT=1 makes
+	// this a no-op, faithfully reproducing that missing call on the SAME binary so
+	// --test-stream-offset Part R (which drives the PRODUCTION funnel that calls this) turns
+	// RED. Never set in production.
+	{ const char* e = std::getenv("MERCURY_W_RESTAGE_ROLLBACK_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return; }
+
 	int  min_bsi    = -1;
 	bool any_staged = false;
 	for(int i=0;i<nMessages;i++)
@@ -14083,6 +14122,24 @@ void cl_arq_controller::stream_tx_rollback_inflight()
 	if(!tx_stream_stamp[min_bsi].valid) return;      // never latched (defensive no-op)
 	if(tx_stream_committed > tx_stream_stamp[min_bsi].start)
 		tx_stream_committed = tx_stream_stamp[min_bsi].start;   // LIFO un-commit (only lowers)
+}
+
+void cl_arq_controller::rx_stream_invalidate_stamps()
+{
+	// Option W CORE (F4.2, silent-corruption-residual.md §16/§17.5): drop every parsed RX
+	// wire stamp. Called from load_configuration() on ANY config change (both roles; the
+	// CMD side has no rx stamps so it is a harmless no-op there). A config change ALWAYS
+	// re-stages the sender's in-flight batch, so any parsed-undelivered stamp is stale;
+	// especially a demote-to-ROBUST rebuild whose robust frames carry no stamp and can
+	// therefore NEVER refresh a stale OFDM-sized stamp[bsi].length. Both w_bytegate_shortfall
+	// and w_stream_shift_detected treat an invalid stamp as a SAFE NO-OP, so a rebuilt batch
+	// re-parses a fresh stamp on its EOB frame — no permanent WITHHOLD, no BREAK spiral, and
+	// no 256-wrap stale-start false teardown. FAIL-BEFORE: MERCURY_W_CFG_STAMP_KEEP=1 keeps
+	// the stale stamps (reproduces the pre-fix permanent withhold) so --test-stream-offset
+	// Part S turns RED. Never set in production.
+	{ const char* e = std::getenv("MERCURY_W_CFG_STAMP_KEEP");
+	  if(e && *e && atoi(e)!=0) return; }
+	for(int s=0;s<256;s++) rx_stream_stamp[s].valid = false;
 }
 
 void cl_arq_controller::restage_requeue_tx_messages()
