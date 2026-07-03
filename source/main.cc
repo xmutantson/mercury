@@ -1706,6 +1706,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_shrink;
                 failed += ARQ_shrink.test_batch_shrink_orphan_defer();
             }
+            // Streaming decompress-failure SILENT-FALSE-ACCEPT (residual-silent-
+            // corruption-wgn25.md): the THIRD WGN:25 trigger — a streaming PPMd model
+            // desync under out-of-order SACK delivery makes a COMPLETE, CRC-clean batch
+            // decode to -1, and copy_data_to_buffer's old fallback pushed the raw
+            // compressed blob to the app (silent garbage). Drives a REAL two-compressor
+            // desync + copy_data_to_buffer; asserts zero garbage delivered + loud detect.
+            // Pass-after arm (MERCURY_DECOMPRESS_RAWPUSH_DEFEAT=1 = fail-before).
+            {
+                cl_arq_controller ARQ_decfa;
+                failed += ARQ_decfa.test_decompress_false_accept();
+            }
             // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery
             // (data-flow-fifo-backup.md §6.1): the delivered batch's raw survives in the
             // backup when finalize is pre-empted (Root B), and the config-change re-stage
@@ -2824,6 +2835,10 @@ int main(int argc, char *argv[])
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
                                         // must NOT drop popped bytes when the non-blocking app socket back-pressures.
                                         // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
+    bool test_decompress_false_accept_cli = false; // --test-decompress-false-accept: streaming decompress-failure
+                                        // must NOT push the undecodable raw compressed blob to the app (silent byte-
+                                        // corruption). Drives a REAL two-compressor streaming desync + copy_data_to_buffer;
+                                        // MERCURY_DECOMPRESS_RAWPUSH_DEFEAT=1 = fail-before. One-shot, exits rc.
     bool test_compact_confirm_rx_cli = false; // --test-compact-confirm-rx: Option B compact confirm LIVE RX path.
                                         // The self-validating compact confirm must accept via its own CRC-gated decode,
                                         // decoupled from the bare 7/16 gate that under-peaks the 26-sym frame. One-shot, exits rc.
@@ -3658,6 +3673,16 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // source/datalink_layer/test_rx_drain.cc + fix6/STALL_ROOTCAUSE.md.
             test_rx_drain_backpressure_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-decompress-false-accept") == 0)
+        {
+            // Streaming decompress-failure silent-false-accept regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // source/datalink_layer/test_decompress_false_accept.cc +
+            // fact-documents/residual-silent-corruption-wgn25.md.
+            test_decompress_false_accept_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5665,6 +5690,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_rx_drain_backpressure();
             printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_decompress_false_accept_cli) {
+            // Streaming decompress-failure silent-false-accept (one-shot, then exit rc).
+            printf("[FLAG] --test-decompress-false-accept: invoking streaming decompress-"
+                   "failure silent-false-accept regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_decompress_false_accept();
+            printf("[FLAG] Decompress-false-accept test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

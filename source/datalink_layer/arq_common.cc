@@ -15675,16 +15675,60 @@ void cl_arq_controller::copy_data_to_buffer()
 			}
 			else
 			{
-				// Decompression error — reset streaming and push raw as fallback
+				// ── SILENT-FALSE-ACCEPT ROOT (residual-silent-corruption-wgn25.md) ──
+				// A STREAMING/compressed batch that fails to decompress reaches here
+				// with the RAW COMPRESSED bytes in comp_data. The failure is a PPMd/
+				// zstd streaming-model DESYNC (or a dict-version mismatch) — under the
+				// marginal-SNR (WGN:25) out-of-order SACK / prev cross-storage delivery
+				// regime the RX model falls out of lockstep with the TX, so a later
+				// batch decodes to -1 even though every frame passed its CRC and the
+				// batch reassembled complete. The OLD behavior fifo_push_rx'd comp_data
+				// straight to the app — delivering UNDECODABLE binary garbage as if it
+				// were the plaintext message. That is a life-critical SILENT byte-
+				// corruption (a THIRD trigger, distinct from the Fix A prev-orphan and
+				// the baabacd5 current-orphan reassembly bugs): the frames pass CRC, the
+				// batch "delivers" contiguously, no [RSP-V2-GAP-ABORT] fires, md5 FALSE,
+				// and it cascades garbage to the end of the stream.
+				//
+				// A decompress failure means we DO NOT HAVE valid plaintext — so we must
+				// deliver NOTHING (never the compressed bytes). Convert the silent-false-
+				// accept into a LOUD detect + zero delivery + a streaming reset (resync):
+				// the failed batch contributes a detectable GAP (not corruption) and the
+				// stream recovers on the next fresh/cold batch instead of cascading
+				// garbage. MERCURY_DECOMPRESS_RAWPUSH_DEFEAT=1 restores the old silent
+				// raw-push (the fail-before arm of --test-decompress-false-accept).
+				bool rawpush_defeat = false;
+				{ const char* e = std::getenv("MERCURY_DECOMPRESS_RAWPUSH_DEFEAT");
+				  if(e && *e && atoi(e)!=0) rawpush_defeat = true; }
 				if(compressor.is_streaming())
 					compressor.streaming_reset();
 				const unsigned char* ehdr = (const unsigned char*)comp_data;
-				printf("[DECOMPRESS] Batch error (assembled %d bytes, hdr: algo=%d comp=%d orig=%d), pushing raw\n",
-					comp_len, (int)ehdr[0],
-					(int)(ehdr[1] | (ehdr[2] << 8)),
-					(int)(ehdr[3] | (ehdr[4] << 8)));
-				fflush(stdout);
-				total_bytes += fifo_push_rx(comp_data, comp_len);
+				if(rawpush_defeat)
+				{
+					// FAIL-BEFORE: the OLD silent-false-accept — push the undecodable
+					// compressed blob to the app as if it were delivered plaintext.
+					printf("[DECOMPRESS] Batch error (assembled %d bytes, hdr: algo=%d comp=%d orig=%d), pushing raw\n",
+						comp_len, (int)ehdr[0],
+						(int)(ehdr[1] | (ehdr[2] << 8)),
+						(int)(ehdr[3] | (ehdr[4] << 8)));
+					fflush(stdout);
+					total_bytes += fifo_push_rx(comp_data, comp_len);
+				}
+				else
+				{
+					// FIX: LOUD detect, deliver ZERO bytes (never garbage), stream reset.
+					rsp_decompress_false_accept_blocked++;
+					printf("[RSP-DECOMPRESS-FALSE-ACCEPT-BLOCKED] batch decompress FAILED "
+						"(assembled %d bytes, hdr: algo=%d comp=%d orig=%d) — refusing to "
+						"deliver undecodable compressed bytes to the app (was a silent byte-"
+						"corruption); streaming reset for resync, batch delivers 0 bytes "
+						"(count=%lld)\n",
+						comp_len, (int)ehdr[0],
+						(int)(ehdr[1] | (ehdr[2] << 8)),
+						(int)(ehdr[3] | (ehdr[4] << 8)),
+						rsp_decompress_false_accept_blocked);
+					fflush(stdout);
+				}
 			}
 		}
 		else if(assembled_size > 0)

@@ -3262,6 +3262,17 @@ public:
   // helpers + the production re-stage funnel through every transition, asserting
   // the latched per-bsi stamp == the true cumulative transported origin offset.
   int test_stream_offset();
+  // Streaming decompress-failure SILENT-FALSE-ACCEPT regression
+  // (residual-silent-corruption-wgn25.md). CLI: --test-decompress-false-accept.
+  // Drives two REAL cl_compressor instances into a streaming-model desync (RX
+  // reset out of lockstep with the TX — the WGN:25 out-of-order SACK regime),
+  // routes the resulting undecodable compressed batch through the REAL
+  // copy_data_to_buffer() reassembler with fifo_buffer_rx as a byte oracle.
+  // FAIL-BEFORE (MERCURY_DECOMPRESS_RAWPUSH_DEFEAT=1): the raw compressed blob is
+  // pushed to the app FIFO (silent garbage). PASS-AFTER (default): zero bytes
+  // delivered + [RSP-DECOMPRESS-FALSE-ACCEPT-BLOCKED] loud detect. See
+  // source/datalink_layer/test_decompress_false_accept.cc. Returns 0=PASS,1=FAIL.
+  int test_decompress_false_accept();
 
   // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
   // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
@@ -3991,6 +4002,14 @@ public:
   // undelivered so the CMD re-emits the block. Diagnostic; logged via
   // [RSP-V2-PREV-BLOCKCRC-REJECT]. Initialized to 0 (init_messages_buffers reset path).
   long long rsp_prev_batch_blockcrc_reject_count = 0;
+
+  // RSP: count of batches whose streaming decompress FAILED and whose undecodable
+  // raw compressed bytes were REFUSED delivery to the app (copy_data_to_buffer's
+  // former silent-false-accept raw-push — residual-silent-corruption-wgn25.md).
+  // Each increment is a LOUD [RSP-DECOMPRESS-FALSE-ACCEPT-BLOCKED] detect: a would-be
+  // silent byte-corruption turned into a detectable zero-byte gap + stream resync.
+  // Monotonic diagnostic; the --test-decompress-false-accept oracle reads it.
+  long long rsp_decompress_false_accept_blocked = 0;
 
   // SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
   // ALL CMD-side; gated on `sack_v2_enabled` at the call sites. v1 sessions
