@@ -285,3 +285,102 @@ Fail-before/pass-after for the 4 mechanisms is added in STEP 2 (env-defeat arms)
 - **O4** STEP 3 add-ons: running CRC-32 co-stamp (+4B/batch, content/CRC-escape);
   EOT exchange (total_committed_bytes + final CRC in disconnect, ~8B once) — the
   ONLY true end-to-end tail-drop check (Fix-A shape).
+
+---
+
+## §8 STEP-2 (CORE W) TURN-KEY IMPLEMENTATION SPEC — the wire stamp + 2 RSP checks
+
+FOUNDATION (commit `dd382db8`) landed the cursors + ground-truth test. STEP 2 puts the
+latched stamp on the wire and adds the two RSP checks. It is ATOMIC (both ends rebuild —
+no version bits, `iris_no_version_bits_preship`) and MUST land green+committed or not at
+all (task rule: never a half-applied wire change). This section is the exact plan; it
+MIRRORS the existing D5 `batch_total_frames` per-batch-field plumbing (a proven precedent
+in this exact tree) so a follow-up agent can execute directly.
+
+### §8.1 Wire layout — stamp on the EOB-bearing frame ONLY (once per batch, ~0.2%)
+D5 already appends `batch_total_frames` as the LAST header byte on the EOB frame only.
+Append the W stamp immediately after it, EOB-frame-only, at OFDM configs
+(`header_carries_d5==true`; robust configs carry no D5 byte and no stamp — §8.5):
+- stamp = `{ start_lo32 : uint32 LE (4B), length16 : uint16 LE (2B) }` = 6 B.
+  `start_lo32 = tx_stream_stamp[bsi].start & 0xFFFFFFFF` (wrapping 32-bit; 4 GB window,
+  ample per HF session). `length16 = tx_stream_stamp[bsi].length` (a batch's transported
+  bytes never exceed ~16 KB, fits u16).
+- New header lengths on the EOB frame: DATA_LONG 7→13 B, DATA_SHORT 6→12 B. The
+  NON-EOB frames are UNCHANGED (stamp is EOB-only), so per-frame payload budget is
+  unchanged for them; only the EOB frame loses 6 payload bytes.
+
+### §8.2 The ~8 sites (D5-mirror), file:line on `bfacbcf6`+FOUNDATION
+1. **Header-length fns** `effective_data_long_header_length` / `effective_data_short_header_length`
+   (used for the EOB frame's payload budget): add +6 for the EOB frame when the stamp
+   rides. CAUTION: these fns feed payload budgeting on BOTH ends and MANY call sites — the
+   cleanest surgical approach is a SEPARATE `eob_stamp_len(header_carries_d5)` added only
+   where the EOB frame is built/parsed, NOT folded into the generic header-length fn
+   (avoids rippling the non-EOB budget). Verify the EOB frame's payload is sized down by 6.
+2. **TX write (batched path):** arq_common.cc ~9063 (DATA_SHORT byte[5]) / ~9087
+   (DATA_LONG byte[6]) — right after writing `batch_total_frames_wire`, when this is the
+   EOB frame, append the 6 stamp bytes from `tx_stream_stamp[bsi]` (bsi = the frame's
+   `batch_seq_id`). RETX/MIXBATCH: the retx frames carry a PRIOR bsi; look up
+   `tx_stream_stamp[that_bsi]` and emit its LATCHED stamp (the stamp persists until the
+   batch is credited/rolled-back). Mirror D5's `sack_retransmit_active` handling — but
+   emit the LATCHED stamp, not 0 (W's stamp is KNOWN for a retx'd batch).
+3. **TX single-send path:** arq_common.cc ~8738/8763 — single send() has no batch
+   context; emit a sentinel (all-0 / a `stamp_present=0` flag) so RX does not mis-parse.
+   (Single-send DATA is not a batch-delivery path; RX skips the W check for it.)
+4. **RX parse:** arq_common.cc ~13124 (SHORT) / ~13187 (LONG) — where D5
+   `rx_buffer_batch_total_frames` is staged from the EOB frame, ALSO parse the 6 stamp
+   bytes into `rx_stream_stamp[bsi] = {start_lo32, length16, valid}`.
+5. **RSP PRIMARY check (byte-GATE the clean ACK):** arq_responder.cc near ACK-GATE PASS
+   (:2487) / BATCH-DONE (:2596) — BEFORE emitting the clean bitmap / BATCH-DONE for bsi,
+   assert `delivered_transported_for_this_bsi == rx_stream_stamp[bsi].length16`. On
+   shortfall: WITHHOLD the clean ACK (do NOT bump last_delivered, do NOT credit, do NOT
+   flush backup) → the existing SACK partial-retx re-requests the missing frames. Makes
+   mechanism-4 ("declare complete at a shrunk expected-count") IMPOSSIBLE — the byte
+   count, not the frame count, gates completion. FALSE-FIRE: compare bytes to the LATCHED
+   `length16` only, NEVER to `data_batch_size`/`rx_batch_total_frames`/expected-counts.
+   `delivered_transported_for_this_bsi` = Σ ACKED `messages_rx[i].length` for the bsi
+   (the same quantity `copy_data_to_buffer` accumulates as `delivered_transported`).
+6. **RSP BACKSTOP check:** copy_data_to_buffer (arq_common.cc:14096) — BEFORE the append
+   (before advancing rx_stream_delivered), if `rx_stream_stamp[bsi].valid` assert
+   `rx_stream_stamp[bsi].start_lo32 == (uint32_t)rx_stream_delivered`. Mismatch → LOUD
+   `[RSP-V2-STREAM-SHIFT] stamp.start=%u rx_delivered=%u bsi=%d` + `rsp_gap_abort_teardown`
+   (arq_common.cc:10051) — catches any 5th positional mechanism that bypasses the PRIMARY
+   gate, at the FIRST divergent byte (not 1.6 batches late like GAP-ABORT). The
+   delivered-bsi is `decrypt_delivered_bsi` (already set before each copy_data_to_buffer).
+7. **Header decl:** add `StreamStamp rx_stream_stamp[256];` to arq.h (RSP side) + init in
+   reset_session_state (invalidate all).
+
+### §8.3 Test extension (`test_stream_offset.cc`) — reproduce all 4 mechanisms
+Add env-defeat arms + assert each is GATED (primary) or LOUD (backstop), never silently
+delivered — fail-before(env-defeat)/pass-after (mirror the §13 restage test contract):
+- **Mech-1 (EOB-undercount tail-drop):** deliver a batch with fewer ACKED frames than the
+  stamp.length → PRIMARY withholds the clean ACK (assert no BATCH-DONE, SACK re-requests).
+- **Mech-2 (CMD>RSP batch-size desync):** already loud via (B); assert W PRIMARY ALSO
+  catches it by byte shortfall (defense-in-depth).
+- **Mech-3 (re-stage orphan/reorder):** §13 fixes the CMD side; assert that if a shift is
+  INJECTED (env), the BACKSTOP `start != rx_delivered` fires LOUD.
+- **Mech-4 (c31w104 shrunk-count forward Δ):** deliver bsi with a stamp.start ahead of
+  rx_stream_delivered → BACKSTOP LOUD at the first byte; and a complete-at-shrunk-count →
+  PRIMARY withholds. Reproduce the Δ=+6847 shape from silent-corruption-residual.md §14.1.
+
+### §8.4 Retx/mixbatch re-emit + rollback interplay (the false-fire guard)
+The stamp is re-emitted verbatim on retx (from `tx_stream_stamp[bsi]`, still valid). On a
+re-stage the FOUNDATION rollback resets the cursor to stamp.start and the rebuild
+re-latches the SAME start (INV4) → the re-emitted/rebuilt stamp is consistent with the
+receiver's anchor. No new false-fire is introduced by retx because the stamp VALUE is
+position, not count.
+
+### §8.5 Robust-config handling
+`header_carries_d5==false` at ROBUST_0..2 (arq_common.cc:2252, is_robust_config). Those
+batches carry batch=1 and no D5 byte; the stamp rides ONLY when `header_carries_d5==true`.
+On robust, the RSP skips the W checks (no stamp present) — robust delivery is batch=1 and
+already covered by the batch-relative path; the W gate re-engages at OFDM configs where the
+4 mechanisms actually occur (all 4 captures corrupt at cfg13-16, §11-§14).
+
+### §8.6 STEP 3 (add-ons, if budget)
+- Running CRC-32 co-stamp (+4 B on the EOB frame): CMD maintains a running CRC-32 over the
+  committed transported stream; stamps the running value per batch; RSP verifies its own
+  running CRC at delivery. Closes same-position VALUE corruption / per-frame-CRC escape.
+- EOT exchange (~8 B once): `total_committed_bytes` (u64) + final running CRC-32 in the
+  disconnect/EOT control frame; RSP asserts `rx_stream_delivered == total_committed_bytes`
+  + CRC match. The ONLY true end-to-end tail-drop check (a lost LAST batch leaves no
+  next-batch stamp to catch it — Fix-A shape).

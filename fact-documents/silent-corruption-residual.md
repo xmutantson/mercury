@@ -419,3 +419,46 @@ Build `build.sh o3` EXIT=0; `mercury.exe --test` green (see §13 verify). Determ
 size desync) and stays. This §13 fix targets the DOMINANT real-channel root (the re-stage orphan/
 reorder shift) that (B) never covered. Built/validated on `staging/enc-bsi-nonce@683651fe`;
 the 7 buggy loops are almost certainly identical on `monitor` → cherry-pick there.
+
+## §14 The 4th mechanism + the systemic pivot (recap — full analysis in the main-tree version + worklog)
+
+On the fixed-`monitor@bfacbcf6` binary a 4th DISTINCT silent mechanism survived (`c31w104`,
+WGN:25): a FORWARD positional shift Δ=+6847 where the RSP declared bsi10/bsi11 COMPLETE at
+SHRUNK expected-counts (delivered 21-23 of 25 frames) → silent tail-frame holes → later
+content re-anchored at an earlier stream slot; the loud GAP-ABORT fired ~1.6 batches LATE.
+**The common thread across ALL 4 mechanisms:** each existing guard checks a PROXY invariant
+(re-queue completeness / batch-SIZE equality / bsi-contiguity / EOB frame-count) — NONE checks
+the invariant that actually matters: **delivered app/transported bytes == source bytes by
+ABSOLUTE offset, in order.** Fable-5 (`wuj3xqvod`, worklog 2026-07-03) steered: go straight to
+**Option W** (the TCP-style absolute-byte-stream stamp + delivery check), skip the narrow
+Option N (a proxy-based duplicate of W's weaker half). MERGE = owner fork (wire change).
+
+## §15 Option W — SHIPPED so far (branch `fix/stream-offset-w` off `monitor@bfacbcf6`)
+
+**FOUNDATION landed + committed (`dd382db8`):** the absolute-byte-stream cursors that make the
+Option-W invariant CHECKABLE — Fable's pre-cohort ground-truth gate. See the full
+producer/consumer audit in `data-flow-stream-offset.md`.
+- `tx_stream_committed` + `tx_stream_stamp[256]{start,length,valid}` latched at the ONE pop
+  funnel `process_buffer_data_commander()` (transported-byte domain); rolled back to the
+  in-flight batch's start at every re-stage byte-restore point (`stream_tx_rollback_inflight`
+  in `restage_requeue_tx_messages`, `restore_tx_from_compressed`, + the two open-coded BREAK
+  legs) so a rebuild re-anchors at the SAME start (INV4).
+- `rx_stream_delivered` advanced by the reassembled transported length at the ONE receiver
+  funnel `copy_data_to_buffer()`. Both cursors reset at `reset_session_state()` + ctor.
+- Regression `--test-stream-offset` (`test_stream_offset.cc`): drives the PRODUCTION
+  latch/rollback/receiver funnels through sequential builds, retx re-emit, re-stage rollback
+  + rebuild, BREAK→ROBUST→re-climb, mixbatch, RX delivery — 34/34 checks PASS, asserting
+  `stamp[bsi].start == the true cumulative transported origin` (INV1-INV4).
+- `build.sh o3` EXIT=0; `mercury.exe --test` EXIT=0 (fully green, 403 PASS summaries);
+  `--test-restage-requeue-orphan` still PASS (rollback-in-funnel is a guarded no-op on
+  unlatched stamps → no regression).
+
+**NOT yet shipped (STEP 2 CORE W + STEP 3 add-ons):** the WIRE stamp + the two RSP checks
+(PRIMARY byte-gate the clean ACK; BACKSTOP start==rx_delivered LOUD) + the 4-mechanism test.
+STOPPED CLEAN at the FOUNDATION checkpoint (budget) rather than leave a half-applied wire
+change — per the task rule. The exact turn-key spec (byte layout, the ~8 D5-mirror sites, the
+two check sites, retx re-emit, robust-config handling, the 4-mechanism test plan) is
+`data-flow-stream-offset.md §8`. **Until STEP 2 lands + a strong-oracle WGN:25 cohort shows 0
+silent fails, the real-channel silent corruption at marginal SNR is STILL OPEN.** Option W is
+NOT complete; the FOUNDATION alone detects nothing on the wire (it is the measurement
+substrate, not the guard).
