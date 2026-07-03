@@ -2488,6 +2488,56 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				rx_received, data_batch_size, expected);
 			fflush(stdout);
 
+			// Option W CORE — RSP PRIMARY byte-gate (data-flow-stream-offset.md §8.2 step 5).
+			// The batch is FRAME-COUNT complete (rx_received >= expected), but `expected` is a
+			// PROXY (data_batch_size / rx_batch_total_frames) that mechanisms 1 (EOB-undercount
+			// tail-drop) and 4 (complete-at-shrunk-count) can make wrongly small — the batch
+			// then PASSes with FEWER bytes than the sender committed, orphaning the surplus →
+			// a permanent stream shift. Gate on DELIVERED BYTES vs the wire stamp.length: on a
+			// shortfall WITHHOLD the clean ACK (keep messages_rx RECEIVED, do NOT mark ACKED,
+			// do NOT bump the bsi, do NOT deliver) and re-arm — the SAME discipline as the
+			// partial-batch SACK-suppress / backpressure holds above — so the CMD's ACK-timeout
+			// re-drives and the existing SACK partial-retx re-requests the missing frames. This
+			// makes "declare complete at a shrunk count" IMPOSSIBLE: the byte count, not the
+			// frame count, gates completion. FALSE-FIRE guard: compare ONLY to the LATCHED
+			// stamp.length (never expected/data_batch_size); absent stamp (robust / old peer /
+			// lost EOB frame) = safe no-op. MERCURY_W_BYTEGATE_DEFEAT=1 restores the pre-fix
+			// count-only PASS (the STEP-2c fail-before arm).
+			if(!passive_monitor && sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
+			{
+				int wbsi = rsp_current_expected_batch_seq_id & 0xFF;
+				if(rx_stream_stamp[wbsi].valid && rx_stream_stamp[wbsi].length > 0)
+				{
+					int delivered_bytes = 0;
+					for(int i=0; i<this->data_batch_size; i++)
+						if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
+							delivered_bytes += messages_rx[i].length;
+					bool w_bytegate_defeat = false;
+					{ const char* e = std::getenv("MERCURY_W_BYTEGATE_DEFEAT");
+					  if(e && *e && atoi(e)!=0) w_bytegate_defeat = true; }
+					if(!w_bytegate_defeat && delivered_bytes < (int)rx_stream_stamp[wbsi].length)
+					{
+						printf("[RSP-V2-BYTE-SHORTFALL] WITHHOLD clean ACK: bsi=%d delivered=%d < "
+							"committed=%u (frame-count PASS but byte shortfall — tail-drop / "
+							"shrunk-count); re-arm so SACK re-requests. NOT crediting, NOT flushing.\n",
+							wbsi, delivered_bytes, rx_stream_stamp[wbsi].length);
+						fflush(stdout);
+						// Identical re-arm to the partial-batch SACK-suppress hold above.
+						stats.nNAcked_data++;
+						batch_rx_frame_count = 0;
+						last_received_end_of_batch_seq = -1;
+						telecom_system->data_container.frames_to_read =
+							telecom_system->data_container.preamble_nSymb
+							+ telecom_system->get_active_nsymb();
+						telecom_system->data_container.nUnder_processing_events = 0;
+						calculate_receiving_timeout();
+						receiving_timer.start();
+						connection_status=RECEIVING;
+						return;
+					}
+				}
+			}
+
 			// Fix H#3 (delivery-integrity-audit-monitor.md §3): the clean data-ACK is sent
 			// below BEFORE copy_data_to_buffer() delivers, and fifo_push_rx() DROPS the tail
 			// when fifo_buffer_rx is full under app back-pressure -> those bytes are LOST with

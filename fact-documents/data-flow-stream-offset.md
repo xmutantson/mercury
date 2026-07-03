@@ -158,23 +158,41 @@ removes the site-enumeration fragility that Fable flagged as MOST-LIKELY-TO-BITE
   cursors + stamps to assert the invariant at every transition. No production
   consumer branches on the cursors yet.
 
-### CORE W (STEP 2) — adds the wire stamp + the two RSP checks
-- **Sender emit:** the D5 header build (arq_common.cc `send_batch`/frame serialize,
-  DATA_LONG 7-byte + DATA_SHORT 6-byte headers around :8709/8739) reads
-  `tx_stream_stamp[bsi]` and appends `{start_lo32, length16}` to the batch's
-  EOB-bearing frame. Retx/mixbatch re-emit the LATCHED stamp (mirror D5's
-  `sack_retransmit_active` emit-0 discipline) — NEVER recompute.
-- **Receiver parse + store:** frame parse stores the received stamp per-bsi
-  (`rx_stream_stamp[256]`).
-- **RSP PRIMARY check** (byte-GATE the clean ACK, arq_responder.cc near ACK-GATE
-  PASS :2487 / BATCH-DONE :2596): before emitting a clean bitmap / BATCH-DONE,
-  assert `delivered_transported_for_this_bsi == rx_stream_stamp[bsi].length`; on
-  shortfall WITHHOLD the clean ACK (let existing SACK partial-retx re-request the
-  missing frames) — do NOT credit, do NOT flush backup, do NOT build a new
-  re-request path. Makes mechanism-4 "declare complete at shrunk count" impossible.
-- **RSP BACKSTOP check** (`copy_data_to_buffer` :14020, before appending): assert
-  `rx_stream_stamp[bsi].start == rx_stream_delivered`; on mismatch raise LOUD
-  `[RSP-V2-STREAM-SHIFT]` + `rsp_gap_abort_teardown` (arq_common.cc:10051).
+### CORE W (STEP 2) — adds the wire stamp + the two RSP checks — **SHIPPED**
+(commits: STEP 2a wire = `fc94ad43`, STEP 2b checks = this commit. file:line below
+are on the STEP-2 branch.)
+- **Gate helper** `w_stamp_rides()` (arq.h, inline): `sack_v2_enabled &&
+  header_carries_d5 && max_frame >= W_STAMP_MIN_MAXFRAME`. DETERMINISTIC on both
+  peers (both run load_configuration) → no wire negotiation. Both the TX reserve and
+  the RX parse gate on it, so they always agree.
+- **Sender emit:** `send_batch` (arq_common.cc, after the type dispatch, before the
+  payload copy ~:9124): on any frame with the EOB bit at `w_stamp_rides()` configs,
+  writes `{start_lo32:u32 LE, length16:u16 LE}` = `W_EOB_STAMP_BYTES`(6) from the
+  LATCHED `tx_stream_stamp[bsi]` (bsi = the frame's `batch_seq_id`, the ORIGINAL bsi
+  on retx/mixbatch) AFTER the D5 byte, growing header_length by 6. NEVER recompute,
+  NEVER keyed off counts. The ERR-HDR-OVERFLOW guard (:9167) is relaxed by the stamp
+  width. Build RESERVES `W_EOB_RESERVE`(7) payload bytes on the EOB frame — raw leg
+  (last-frame pop cap, arq_commander.cc :20623) + compressed leg (`batch_capacity -=
+  7` :20233 + last-chunk cap :20544) — so the EOB frame is always a DATA_SHORT whose
+  header+payload+stamp == the codeword C exactly (no overflow).
+- **Receiver parse + store:** `w_parse_eob_stamp(stamp_off)` (arq_common.cc, def
+  before copy_data_to_buffer) called from the DATA_LONG (:13185) and DATA_SHORT
+  (:13251) parses; stores `rx_stream_stamp[bsi] = {start_lo32, length16, valid}` and
+  shifts the payload past the stamp. Absent stamp = safe no-op (returns 0).
+- **RSP PRIMARY check** (byte-GATE the clean ACK, arq_responder.cc right after
+  `[ACK-GATE] PASS` :2487, before the backpressure hold): sum DELIVERED bytes = Σ
+  RECEIVED/ACKED `messages_rx[i].length` for `i<data_batch_size`; if `<
+  rx_stream_stamp[bsi].length` WITHHOLD the clean ACK (re-arm exactly like the
+  partial-batch SACK-suppress hold — do NOT ACK/bump/deliver) so SACK partial-retx
+  re-requests. Compares ONLY to the latched stamp.length (never expected/batch_size).
+  `MERCURY_W_BYTEGATE_DEFEAT=1` = fail-before. Makes mechanism 1/4 impossible.
+- **RSP BACKSTOP check** (`copy_data_to_buffer` top, before delivery): if
+  `rx_stream_stamp[decrypt_delivered_bsi].valid` assert `stamp.start ==
+  (uint32)rx_stream_delivered`; on mismatch raise LOUD `[RSP-V2-STREAM-SHIFT]` +
+  `rsp_gap_abort_teardown()` + return (no shifted delivery). The stamp is CONSUMED
+  (invalidated) at copy_data_done after the cursor advance, so a 256-batch wraparound
+  reuse with a LOST EOB frame reads invalid (skip), never a stale start.
+  `MERCURY_W_STREAM_SHIFT_DEFEAT=1` = fail-before.
 
 ---
 

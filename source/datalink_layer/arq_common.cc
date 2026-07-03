@@ -14185,6 +14185,45 @@ void cl_arq_controller::copy_data_to_buffer()
 	// it equals the sender's stamp.length even for a >16 KB batch.
 	int delivered_transported = 0;
 
+	// Option W CORE — RSP BACKSTOP (data-flow-stream-offset.md §8.2 step 6): the
+	// LOUD-floor positional check. At the FIRST byte of this batch's delivery, the
+	// SENDER's committed start offset for this bsi (the wire stamp) MUST equal the
+	// RECEIVER's absolute delivered cursor. A mismatch is a byte-stream SHIFT (hole /
+	// dup / reorder / forward-Δ) that every PROXY guard (re-queue completeness /
+	// batch-size / bsi-contiguity / EOB count) missed — the 5th-mechanism catch, at
+	// the first divergent byte (not ~1.6 batches late like GAP-ABORT). Keyed by
+	// decrypt_delivered_bsi (set immediately before EVERY copy_data_to_buffer() call —
+	// the AEAD-nonce source table, §2.3). Guarded on stamp.valid so an absent stamp
+	// (robust config / old peer / lost EOB frame) is a SAFE NO-OP, never a false
+	// teardown. MERCURY_W_STREAM_SHIFT_DEFEAT=1 restores the pre-fix silent delivery
+	// (the STEP-2c fail-before arm).
+	if(decrypt_delivered_bsi >= 0)
+	{
+		int wbsi = decrypt_delivered_bsi & 0xFF;
+		if(rx_stream_stamp[wbsi].valid)
+		{
+			uint32_t stamp_start = (uint32_t)(rx_stream_stamp[wbsi].start & 0xFFFFFFFFULL);
+			uint32_t rx_cursor32 = (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL);
+			if(stamp_start != rx_cursor32)
+			{
+				bool w_shift_defeat = false;
+				{ const char* e = std::getenv("MERCURY_W_STREAM_SHIFT_DEFEAT");
+				  if(e && *e && atoi(e)!=0) w_shift_defeat = true; }
+				if(!w_shift_defeat)
+				{
+					printf("[RSP-V2-STREAM-SHIFT] LOUD: bsi=%d stamp.start=%u rx_delivered=%u "
+						"(delta=%lld) — absolute byte-stream shift; a positional guard tripped at "
+						"the FIRST divergent byte. Tearing down (no shifted delivery).\n",
+						wbsi, stamp_start, rx_cursor32,
+						(long long)((int64_t)stamp_start - (int64_t)rx_cursor32));
+					fflush(stdout);
+					rsp_gap_abort_teardown("Option W stream-shift: wire stamp.start != rx_stream_delivered");
+					return;   // do NOT deliver a positionally-shifted batch
+				}
+			}
+		}
+	}
+
 	// ROBUST_0 compression-deadlock fix (data-flow-compress-frame-fill.md §5/§6).
 	// MUST mirror the TX gate in process_buffer_data_commander(): both sides use
 	// compression_viable_for_batch() so a robust batch (where batch_capacity ==
@@ -14414,9 +14453,16 @@ copy_data_done:
 	// Option W (data-flow-stream-offset.md §2.3): advance the receiver's absolute
 	// transported-byte cursor by exactly what this delivery reassembled. Monotone;
 	// never rolls back (a failed batch is not delivered → delivered_transported==0).
-	// The STEP-2 backstop asserts the batch's wire stamp.start == this cursor BEFORE
-	// the append; FOUNDATION only maintains the cursor (no check, no wire yet).
+	// The STEP-2 backstop (above) asserts the batch's wire stamp.start == this cursor
+	// BEFORE the append.
 	rx_stream_delivered += (uint64_t)delivered_transported;
+	// Option W CORE: consume this bsi's parsed stamp on delivery so a later 256-batch
+	// wraparound reuse of the same bsi with a LOST EOB frame reads INVALID (skip),
+	// never a STALE start (which would false-fire the BACKSTOP). A double-delivery of
+	// the same bsi then also reads invalid → the NEXT batch's BACKSTOP catches the
+	// inflated cursor. Guarded (bsi may be -1 on non-bsi paths).
+	if(decrypt_delivered_bsi >= 0)
+		rx_stream_stamp[decrypt_delivered_bsi & 0xFF].valid = false;
 	block_ready=1;
 }
 
