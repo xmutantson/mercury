@@ -705,6 +705,7 @@ cl_arq_controller::cl_arq_controller()
 	tx_stream_committed=0;
 	rx_stream_delivered=0;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
+	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
 	// SACK Design A Step 4 — RSP cross-batch routing state. All gated on
 	// sack_v2_enabled; v1 path leaves these at their sentinels. Per §4.2.3,
 	// `current_expected` is adopted from the first v2 DATA frame received;
@@ -7064,6 +7065,7 @@ void cl_arq_controller::reset_session_state()
 	tx_stream_committed = 0;
 	rx_stream_delivered = 0;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
+	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
 
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;
@@ -9119,18 +9121,63 @@ void cl_arq_controller::send_batch()
 			header_length=CONTROL_ACK_CONTROL_HEADER_LENGTH;
 		}
 
+		// Option W CORE (data-flow-stream-offset.md §8): stamp the EOB-bearing DATA frame
+		// with {start_lo32, length16} from the LATCHED tx_stream_stamp[bsi]. EOB-frame-only
+		// (bit7 of sequence_number), OFDM-only (w_stamp_rides()). Emit the LATCHED value
+		// VERBATIM (bsi = the frame's batch_seq_id, which on retx/mixbatch is the ORIGINAL
+		// bsi) — NEVER recompute, NEVER key off frame/expected counts (false-fire rule).
+		// The build reserved W_EOB_RESERVE payload bytes on this frame so header+payload+
+		// stamp <= C (the LDPC codeword). Written AFTER the D5 byte, growing header_length
+		// by W_EOB_STAMP_BYTES so the payload copy below starts past the stamp.
+		int w_stamp_added = 0;
+		{
+			bool is_data_frame = (messages_batch_tx[i].type==DATA_LONG
+			                   || messages_batch_tx[i].type==DATA_SHORT);
+			bool is_eob = is_data_frame
+			           && ((unsigned char)messages_batch_tx[i].sequence_number & 0x80);
+			if(is_eob && w_stamp_rides())
+			{
+				int wbsi = messages_batch_tx[i].batch_seq_id;
+				if(wbsi < 0) wbsi = 0;
+				wbsi &= 0xFF;
+				uint32_t s_lo = 0; uint32_t len = 0;
+				if(tx_stream_stamp[wbsi].valid)
+				{
+					s_lo = (uint32_t)(tx_stream_stamp[wbsi].start & 0xFFFFFFFFULL);
+					len  = tx_stream_stamp[wbsi].length;
+				}
+				// length16 sentinel 0 for a >64 KB batch (never on HF): keeps the positional
+				// BACKSTOP (start) live while the byte-gate (length) safely no-ops.
+				uint16_t len16 = (len <= 0xFFFFu) ? (uint16_t)len : 0;
+				int off = header_length;   // immediately after the D5 byte
+				message_TxRx_byte_buffer[off+0]=(char)( s_lo        & 0xFF);
+				message_TxRx_byte_buffer[off+1]=(char)((s_lo >> 8)  & 0xFF);
+				message_TxRx_byte_buffer[off+2]=(char)((s_lo >> 16) & 0xFF);
+				message_TxRx_byte_buffer[off+3]=(char)((s_lo >> 24) & 0xFF);
+				message_TxRx_byte_buffer[off+4]=(char)( len16       & 0xFF);
+				message_TxRx_byte_buffer[off+5]=(char)((len16 >> 8) & 0xFF);
+				header_length += W_EOB_STAMP_BYTES;
+				w_stamp_added = W_EOB_STAMP_BYTES;
+			}
+		}
+
 		for(int j=0;j<messages_batch_tx[i].length;j++)
 		{
 			message_TxRx_byte_buffer[j+header_length]=messages_batch_tx[i].data[j];
 		}
 
-		if(header_length>max_header_length)
+		// Option W: the EOB-stamped frame legitimately carries an extra W_EOB_STAMP_BYTES
+		// of header (the byte-stream stamp), so allow header_length up to
+		// max_header_length + w_stamp_added. Its payload was reserved by W_EOB_RESERVE so
+		// the total header_length+length still fits the codeword C (== the size of any
+		// normal full frame — no new buffer pressure).
+		if(header_length>max_header_length + w_stamp_added)
 		{
 			// §7.13.34 — was exit(0). Don't kill the whole modem on an
 			// unexpected header size; log loudly and skip this frame so
 			// the link can survive whatever miscalibrated the buffers.
-			printf("[ERR-HDR-OVERFLOW] header_length=%d > max_header_length=%d (type=%d, sack_v2=%d) — skipping frame\n",
-				header_length, max_header_length,
+			printf("[ERR-HDR-OVERFLOW] header_length=%d > max_header_length=%d (+wstamp=%d) (type=%d, sack_v2=%d) — skipping frame\n",
+				header_length, max_header_length, w_stamp_added,
 				(int)messages_batch_tx[i].type, sack_v2_enabled?1:0);
 			fflush(stdout);
 			continue;
@@ -13135,7 +13182,11 @@ void cl_arq_controller::receive()
 						messages_rx_buffer.batch_seq_id = -1;  // v1: field not on wire
 						messages_rx_buffer.id=message_TxRx_byte_buffer[3];
 					}
-					int copy_len = max_data_length+max_header_length-eff_hdr;
+					// Option W CORE: parse the EOB stamp (returns 0 unless this is an EOB
+					// stamped frame) and shift the payload past it. DATA_LONG stamp bytes
+					// sit at [eff_hdr..eff_hdr+5]; payload follows at [eff_hdr+w_shift].
+					int w_shift = w_parse_eob_stamp(eff_hdr);
+					int copy_len = max_data_length+max_header_length-eff_hdr-w_shift;
 					// LOW CLAMP (data-flow-aead-nonce.md §7.1): on a degenerate config
 					// (tiny ROBUST + a wide eff_hdr, e.g. sack_v2 + header_carries_d5)
 					// eff_hdr can exceed max_data_length+max_header_length, making
@@ -13158,7 +13209,7 @@ void cl_arq_controller::receive()
 					messages_rx_buffer.length=copy_len;
 					for(int j=0;j<copy_len;j++)
 					{
-						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+eff_hdr];
+						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+eff_hdr+w_shift];
 					}
 					if(sack_v2_enabled)
 					{
@@ -13199,16 +13250,21 @@ void cl_arq_controller::receive()
 						messages_rx_buffer.id=message_TxRx_byte_buffer[3];
 						messages_rx_buffer.length=(unsigned char)message_TxRx_byte_buffer[4];
 					}
+					// Option W CORE: parse the EOB stamp and shift the payload past it.
+					// DATA_SHORT length field [5] already holds the payload length (stamp
+					// excluded); the stamp bytes sit at [eff_hdr..eff_hdr+5], payload at
+					// [eff_hdr+w_shift].
+					int w_shift = w_parse_eob_stamp(eff_hdr);
 					// Clamp length to buffer size — corrupted frames (e.g., from
 					// noise) can have garbage length values that overflow the buffer.
-					int max_short_len = max_data_length + max_header_length - eff_hdr;
+					int max_short_len = max_data_length + max_header_length - eff_hdr - w_shift;
 					if(max_short_len < 0) max_short_len = 0;
 					if(max_short_len > alloc_size) max_short_len = alloc_size;
 					if(messages_rx_buffer.length > max_short_len)
 						messages_rx_buffer.length = max_short_len;
 					for(int j=0;j<messages_rx_buffer.length;j++)
 					{
-						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+eff_hdr];
+						messages_rx_buffer.data[j]=message_TxRx_byte_buffer[j+eff_hdr+w_shift];
 					}
 					if(sack_v2_enabled)
 					{
@@ -14091,6 +14147,30 @@ void cl_arq_controller::restage_requeue_tx_messages()
 		}
 		messages_tx[i].status = FREE;
 	}
+}
+
+int cl_arq_controller::w_parse_eob_stamp(int stamp_off)
+{
+	// Option W CORE (data-flow-stream-offset.md §8): parse the EOB byte-stream stamp.
+	// Rides ONLY on the EOB frame (bit7 of sequence_number) at OFDM configs where
+	// w_stamp_rides() (deterministic on both peers). Stores per-bsi; the RSP PRIMARY
+	// byte-gate + BACKSTOP read it at delivery. An absent stamp (robust / old peer /
+	// non-EOB) is a safe no-op (returns 0 → payload offset unchanged).
+	if(!sack_v2_enabled) return 0;
+	bool w_is_eob = ((unsigned char)message_TxRx_byte_buffer[2] & 0x80) != 0;
+	if(!w_is_eob || !w_stamp_rides()) return 0;
+	const unsigned char* b = (const unsigned char*)message_TxRx_byte_buffer;
+	uint32_t s_lo = (uint32_t)b[stamp_off+0]
+	              | ((uint32_t)b[stamp_off+1] << 8)
+	              | ((uint32_t)b[stamp_off+2] << 16)
+	              | ((uint32_t)b[stamp_off+3] << 24);
+	uint16_t l16  = (uint16_t)((uint32_t)b[stamp_off+4]
+	              | ((uint32_t)b[stamp_off+5] << 8));
+	int rbsi = messages_rx_buffer.batch_seq_id & 0xFF;
+	rx_stream_stamp[rbsi].start  = (uint64_t)s_lo;
+	rx_stream_stamp[rbsi].length = l16;
+	rx_stream_stamp[rbsi].valid  = true;
+	return W_EOB_STAMP_BYTES;
 }
 
 void cl_arq_controller::copy_data_to_buffer()

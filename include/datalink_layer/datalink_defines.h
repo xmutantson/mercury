@@ -314,6 +314,24 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 // DATA_LONG_HEADER_LENGTH_V2_NO_D5 — robust / batch=1 keeps the pre-D5 length.
 #define DATA_SHORT_HEADER_LENGTH_V2_NO_D5 6
 
+// Option W (data-flow-stream-offset.md §8) — the absolute-byte-stream stamp carried
+// on the EOB-bearing DATA frame ONLY, at OFDM (header_carries_d5) configs where
+// max_frame is large enough (w_stamp_rides()). Layout appended AFTER the D5
+// batch_total_frames byte on the EOB frame: [ start_lo32 : u32 LE ][ length16 : u16 LE ].
+//   start_lo32 = tx_stream_stamp[bsi].start & 0xFFFFFFFF (wrapping; 4 GB session window)
+//   length16   = tx_stream_stamp[bsi].length (a batch's transported bytes <= ~16 KB)
+#define W_EOB_STAMP_BYTES 6
+// Payload the build MUST reserve on the EOB (last) frame so header+payload+stamp fits
+// the LDPC codeword C (= max_frame + 6): the 6 stamp bytes PLUS 1 for the DATA_SHORT
+// header being one byte wider than DATA_LONG (the reserved frame is always < max_frame
+// => DATA_SHORT). Capping the last frame's payload at (max_frame - W_EOB_RESERVE) makes
+// short_hdr(7) + payload + stamp(6) == C exactly. Derivation: data-flow-stream-offset.md §8.1.
+#define W_EOB_RESERVE 7
+// Minimum max_frame for the stamp to ride. Below this, reserving W_EOB_RESERVE would
+// starve payload, so the stamp is skipped (deterministic on both peers). The 4 captured
+// silent-shift mechanisms all occur at cfg13-16 where max_frame is 100+ bytes.
+#define W_STAMP_MIN_MAXFRAME (W_EOB_RESERVE + 8)
+
 //Load config level
 #define FULL 0
 #define PHYSICAL_LAYER_ONLY 1

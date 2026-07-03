@@ -20232,6 +20232,14 @@ void cl_arq_controller::process_buffer_data_commander()
 					crypto_overhead = AUTH_TAG_SIZE;
 				batch_capacity -= crypto_overhead;
 
+				// Option W CORE (data-flow-stream-offset.md §8.1): reserve W_EOB_RESERVE so
+				// the EOB (last) chunk, capped in the frame-split below, still fits within
+				// crypto_frames frames. Capacity of crypto_frames frames with the last one
+				// reserved = crypto_frames*max_frame - W_EOB_RESERVE, so bounding comp_size
+				// by this guarantees the reserved split never needs an extra frame.
+				if(w_stamp_rides())
+					batch_capacity -= W_EOB_RESERVE;
+
 				// Initial guess based on running ratio estimate.
 				// Staging can be up to COMPRESS_WORKSPACE_SIZE (64KB) because
 				// high-ratio compressors (zstd/PPMd) can shrink 33KB+ to <1.5KB.
@@ -20545,6 +20553,14 @@ void cl_arq_controller::process_buffer_data_commander()
 					{
 						int chunk = comp_size - pos;
 						if(chunk > max_frame) chunk = max_frame;
+						// Option W CORE (§8.1): reserve stamp room on the FINAL (EOB) chunk so
+						// header+payload+stamp fits C. If the natural last chunk is too full,
+						// shrink it (leaving a small remainder that becomes a new, smaller final
+						// chunk — self-correcting). batch_capacity was reduced by W_EOB_RESERVE
+						// above so this never overflows crypto_frames frames.
+						if(w_stamp_rides() && pos + chunk == comp_size
+						   && chunk > max_frame - W_EOB_RESERVE)
+							chunk = max_frame - W_EOB_RESERVE;
 						block_under_tx = YES;
 						int result;
 						if(chunk == max_frame)
@@ -20622,7 +20638,23 @@ void cl_arq_controller::process_buffer_data_commander()
 				batch_uncompressed_size = 0;
 				for(int i=0;i<fill_limit;i++)
 				{
-					data_read_size=fifo_buffer_tx.pop(message_TxRx_byte_buffer, max_frame);
+					// Option W CORE (data-flow-stream-offset.md §8.1): reserve W_EOB_RESERVE
+					// payload bytes on the EOB (last) frame of the batch so its
+					// header+payload+stamp fits the codeword C. The last frame is the one at
+					// the batch-frame cap (i==fill_limit-1) OR the pop that drains the fifo
+					// (used_before<=max_frame). Capping its pop below max_frame forces a
+					// DATA_SHORT with room; any leftover simply rides the next (smaller) final
+					// frame (self-correcting). Non-EOB frames are UNCHANGED (full max_frame).
+					int pop_budget = max_frame;
+					if(w_stamp_rides())
+					{
+						int used_before = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+						bool last_by_cap   = (i == fill_limit - 1);
+						bool last_by_drain = (used_before <= max_frame);
+						if(last_by_cap || last_by_drain)
+							pop_budget = max_frame - W_EOB_RESERVE;   // > 0 (w_stamp_rides ⇒ max_frame ≥ 15)
+					}
+					data_read_size=fifo_buffer_tx.pop(message_TxRx_byte_buffer, pop_budget);
 					if(data_read_size==0)
 					{
 						last_transmission_block_stats.nSent_data=0;

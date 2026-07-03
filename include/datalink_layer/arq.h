@@ -3355,6 +3355,35 @@ public:
                                        //      on re-stage rollback. Index = batch_seq_id & 0xFF.
   uint64_t rx_stream_delivered;        // RSP: cumulative transported bytes delivered through
                                        //      copy_data_to_buffer(), in delivery order.
+  // Option W CORE (STEP 2, data-flow-stream-offset.md §8): the per-bsi stamp PARSED
+  // from the wire EOB frame on the RSP. .start holds start_lo32 (low 32 bits; high
+  // bits 0), .length holds length16, .valid set on parse. The RSP PRIMARY byte-gate
+  // (arq_responder ACK-GATE) and the BACKSTOP (copy_data_to_buffer) read this by
+  // decrypt_delivered_bsi / rsp_current_expected_batch_seq_id. Index = batch_seq_id&0xFF.
+  StreamStamp rx_stream_stamp[256];
+
+  // Option W: does the EOB-frame byte-stream stamp ride at the CURRENT config? Both
+  // peers run load_configuration() on the SET_CONFIG handshake, so max_data_length /
+  // header_carries_d5 / sack_v2_enabled agree — the predicate is DETERMINISTIC on both
+  // ends with NO wire negotiation (mirrors header_carries_d5). Robust / batch=1 configs
+  // (header_carries_d5==false) carry no stamp; tiny-frame OFDM configs where reserving
+  // W_EOB_RESERVE would starve payload are also skipped (the 4 captured mechanisms all
+  // occur at cfg13-16 with ample frame size). max_frame here == the build-side
+  // max_frame at arq_commander.cc:20156 (same operands), so TX reserve == RX parse gate.
+  bool w_stamp_rides() const
+  {
+    if(!sack_v2_enabled || !header_carries_d5) return false;
+    int mf = max_data_length + max_header_length
+             - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+    return mf >= W_STAMP_MIN_MAXFRAME;
+  }
+  // Option W CORE: if the current RX frame (message_TxRx_byte_buffer) is an EOB DATA
+  // frame carrying the byte-stream stamp (w_stamp_rides()), parse {start_lo32,length16}
+  // at [stamp_off..stamp_off+5] into rx_stream_stamp[batch_seq_id] and return the bytes
+  // consumed (W_EOB_STAMP_BYTES); else return 0 (payload offset unchanged). The caller
+  // is receive()'s DATA_LONG/DATA_SHORT parse; stamp_off = the effective header length
+  // (right after the D5 byte). messages_rx_buffer.batch_seq_id must be set first.
+  int w_parse_eob_stamp(int stamp_off);
 
   // SACK Design A Step 4 — RSP cross-batch routing decision state.
   // All members gated on sack_v2_enabled; v1 path never reads these.
