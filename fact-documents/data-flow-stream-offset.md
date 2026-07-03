@@ -297,12 +297,21 @@ Fail-before/pass-after for the 4 mechanisms is added in STEP 2 (env-defeat arms)
 - **O2** [?] Role-switch (SWITCH_ROLE) mid-stream: cursors are role/session-scoped
   and reset on session reset; a mid-stream role flip on a bidirectional transfer
   is out of scope for the WGN:25 one-directional cohort. Documented, not handled.
-- **O3** STEP 2 wire: extend the D5 DATA_LONG(7B)/DATA_SHORT(6B) headers with the
-  {start_lo32,length16} stamp on the EOB frame; both ends rebuild (no version bits,
-  `iris_no_version_bits_preship`).
-- **O4** STEP 3 add-ons: running CRC-32 co-stamp (+4B/batch, content/CRC-escape);
-  EOT exchange (total_committed_bytes + final CRC in disconnect, ~8B once) — the
-  ONLY true end-to-end tail-drop check (Fix-A shape).
+- **O3** STEP 2 wire — **DONE** (2a `fc94ad43`, 2b `0d72b63f`, 2c `996a2f8f`). The
+  stamp rides the EOB DATA_SHORT frame (always DATA_SHORT by the W_EOB_RESERVE build
+  reservation); both RSP checks enforce it; the 4-mechanism gate proves gated/loud.
+  Note vs the original sketch: the stamp is NOT folded into the generic header-length
+  fn (per §8.2 site 1) — it is an EOB-frame-only +6 with the payload reserved down, so
+  non-EOB frames are byte-unchanged and the RX parses the stamp only on the EOB frame.
+- **O4** STEP 3 add-ons — **DEFERRED** (turn-key spec in §8.6): running CRC-32 co-stamp
+  (same-position value corruption / streaming-decompressor desync) + EOT
+  total_committed_bytes check (last-batch tail-drop blind spot). Both touch the riskiest
+  subsystems (build path / session teardown); out of scope for the correctness-first core.
+- **O5** [?] `w_stamp_rides()` threshold: the stamp is skipped when
+  `max_frame < W_STAMP_MIN_MAXFRAME`(15). Verify cfg0's max_frame (the smallest OFDM
+  config) at cohort time; if cfg0's max_frame ≥ 15 the stamp rides there too (harmless —
+  reservation leaves ≥8 payload). The 4 captured mechanisms are all cfg13-16, so the
+  gate is live where it matters regardless.
 
 ---
 
@@ -394,11 +403,41 @@ On robust, the RSP skips the W checks (no stamp present) — robust delivery is 
 already covered by the batch-relative path; the W gate re-engages at OFDM configs where the
 4 mechanisms actually occur (all 4 captures corrupt at cfg13-16, §11-§14).
 
-### §8.6 STEP 3 (add-ons, if budget)
-- Running CRC-32 co-stamp (+4 B on the EOB frame): CMD maintains a running CRC-32 over the
-  committed transported stream; stamps the running value per batch; RSP verifies its own
-  running CRC at delivery. Closes same-position VALUE corruption / per-frame-CRC escape.
-- EOT exchange (~8 B once): `total_committed_bytes` (u64) + final running CRC-32 in the
-  disconnect/EOT control frame; RSP asserts `rx_stream_delivered == total_committed_bytes`
-  + CRC match. The ONLY true end-to-end tail-drop check (a lost LAST batch leaves no
-  next-batch stamp to catch it — Fix-A shape).
+### §8.6 STEP 3 (add-ons) — **DEFERRED to a follow-up clip (turn-key spec below)**
+Rationale (2026-07-03): CORE W (2a/2b/2c) is complete, tested, committed — the clean
+checkpoint and the primary deliverable for a strong-oracle WGN:25 cohort. Both add-ons
+touch the TWO riskiest subsystems (the build path; session teardown), so a rushed/untested
+version would violate the no-untested-fix + don't-ship-half-wired discipline. They are
+enhancements, not part of the 4-mechanism gate (which the two shipped checks already close).
+Scoped here so a follow-up executes directly.
+
+**(3a) Running CRC-32 co-stamp (+4 B on the EOB frame) — closes SAME-POSITION VALUE
+corruption / per-frame-CRC escape / streaming-decompressor desync (§0).** Mirror the cursor's
+snapshot mechanism EXACTLY so re-stage rollback is handled:
+- Add `uint32_t crc` to `StreamStamp` (both tx and rx) + a running `uint32_t tx_stream_crc`
+  (CMD) / `rx_stream_crc` (RSP), reset to the CRC-32 init in reset_session_state().
+- CMD: in BOTH frame-split legs (raw pop loop / compressed comp_buf), fold the batch's
+  committed transported bytes into `tx_stream_crc` incrementally. Snapshot
+  `tx_stream_stamp[bsi].crc = tx_stream_crc_before_this_batch` at the latch (the value BEFORE
+  folding — the anchor, exactly like `.start`). On re-stage rollback restore
+  `tx_stream_crc = tx_stream_stamp[min_bsi].crc`; a rebuild re-folds from that anchor (INV4
+  for the CRC). Emit the POST-batch running CRC on the wire (or emit the anchor + let RX fold
+  — pick one and match ends).
+- RSP: fold delivered transported bytes (the `assembled` ciphertext / raw messages_rx[i].data
+  — the TRANSPORTED domain, NOT decompressed plaintext) into `rx_stream_crc` at
+  copy_data_to_buffer; after each batch compare to the stamped running CRC; mismatch → LOUD
+  `[RSP-V2-STREAM-CRC]` + teardown. Byte-exactness holds by INV5 (TX-committed == RX-delivered
+  transported bytes). Test: a same-position byte-flip (position/length correct → W's positional
+  checks INERT) → CRC mismatch caught; fail-before env defeats the compare.
+- RISK the follow-up must clear: the CRC rollback-anchor must be maintained on EVERY re-stage
+  path the cursor covers (the two funnels + BREAK legs, §2.2) or a healthy re-stage false-fires.
+
+**(3b) EOT exchange (~8-12 B once) — the ONLY true end-to-end LAST-BATCH tail-drop check.** A
+lost FINAL batch leaves no next-batch stamp to catch it (the W per-batch checks are inherently
+one-batch-behind). At clean disconnect, CMD sends `total_committed_bytes` (= tx_stream_committed,
+u64) [+ final tx_stream_crc if 3a shipped] in the DISCONNECT control frame; RSP asserts
+`rx_stream_delivered == total_committed_bytes` [+ CRC] → LOUD `[RSP-V2-EOT-SHORT]` on mismatch.
+Absent EOT (lost frame / abrupt drop) = safe no-op. RISK the follow-up must clear: the disconnect
+path is session-teardown state with a documented SWITCH_ROLE / idle-switchrole-race history
+(MEMORY.md) — wire the field into the EXISTING DISCONNECT control code, do NOT add a new
+handshake, and audit the teardown race before touching it.

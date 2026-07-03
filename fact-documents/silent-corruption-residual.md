@@ -455,6 +455,32 @@ producer/consumer audit in `data-flow-stream-offset.md`.
 
 **NOT yet shipped (STEP 2 CORE W + STEP 3 add-ons):** the WIRE stamp + the two RSP checks
 (PRIMARY byte-gate the clean ACK; BACKSTOP start==rx_delivered LOUD) + the 4-mechanism test.
+
+**CORE W SHIPPED (2026-07-03, branch `fix/stream-offset-w`):** STEP 2 landed + committed +
+green — the 4 silent-corruption mechanisms are now GATED/LOUD, never silently delivered.
+- **STEP 2a `fc94ad43`** — the wire stamp `{start_lo32:u32, length16:u16}` on the EOB frame,
+  mirroring D5 plumbing. Build RESERVES `W_EOB_RESERVE`(7) payload bytes on the EOB frame
+  (raw + compressed legs) so header+payload+stamp == the codeword C exactly (no overflow).
+  Gated by `w_stamp_rides()` (deterministic on both peers). ~0.2% overhead (6 B on 1 of ~25
+  frames/batch). See `data-flow-stream-offset.md §3` (SHIPPED consumers) + §8.
+- **STEP 2b `0d72b63f`** — the two RSP checks: PRIMARY byte-gate (delivered bytes < committed
+  stamp.length → WITHHOLD the clean ACK → SACK re-requests) makes mechanism 1/4 impossible;
+  BACKSTOP (wire stamp.start != rx_stream_delivered → LOUD `[RSP-V2-STREAM-SHIFT]` + teardown)
+  catches any positional shift (mech 3/4) at the FIRST divergent byte. Both no-op on an absent
+  stamp. Fail-before env arms `MERCURY_W_BYTEGATE_DEFEAT` / `MERCURY_W_STREAM_SHIFT_DEFEAT`.
+- **STEP 2c `996a2f8f`** — the 4-mechanism deterministic GATE in `--test-stream-offset`
+  (Parts G/H, 47 checks): each mechanism reproduced in-process via the SHARED production
+  predicates `w_stream_shift_detected()` / `w_bytegate_shortfall()`; pass-after gates all with
+  0 silent bytes; each fail-before env arm SILENTLY delivers the shift (mech-1/4 short 3000/
+  3150 B < 3750; mech-2 3750 < 4500; mech-3/4 positional 3750 B delivered past the hole).
+- Build `build.sh o3` EXIT=0; `mercury.exe --test` EXIT=0 (68/0 + Winlink 12/0);
+  `--test-stream-offset` 47/47; `--test-restage-requeue-orphan` PASS. No false-fire on healthy
+  loopback traffic.
+- **STEP 3 add-ons DEFERRED** (running CRC-32 co-stamp for same-position value corruption; EOT
+  total-committed-bytes check for the last-batch tail-drop blind spot) — turn-key spec in
+  `data-flow-stream-offset.md §8.6`; both touch the riskiest subsystems (build path / session
+  teardown), out of scope for the correctness-first core.
+- MERGE = owner fork (wire change). Ready for a strong-oracle WGN:25 cohort + owner decision.
 STOPPED CLEAN at the FOUNDATION checkpoint (budget) rather than leave a half-applied wire
 change — per the task rule. The exact turn-key spec (byte layout, the ~8 D5-mirror sites, the
 two check sites, retx re-emit, robust-config handling, the 4-mechanism test plan) is
