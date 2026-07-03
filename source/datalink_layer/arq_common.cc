@@ -14173,6 +14173,34 @@ int cl_arq_controller::w_parse_eob_stamp(int stamp_off)
 	return W_EOB_STAMP_BYTES;
 }
 
+bool cl_arq_controller::w_bytegate_shortfall(int wbsi)
+{
+	// Option W CORE — RSP PRIMARY decision (data-flow-stream-offset.md §8.2 step 5).
+	// Pure; shared by the production ACK-GATE and test_stream_offset. false on an
+	// absent / zero-length stamp (safe no-op — robust / old peer / lost EOB frame).
+	if(wbsi < 0) return false;
+	int b = wbsi & 0xFF;
+	if(!rx_stream_stamp[b].valid || rx_stream_stamp[b].length == 0) return false;
+	int delivered_bytes = 0;
+	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+		if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
+			delivered_bytes += messages_rx[i].length;
+	return delivered_bytes < (int)rx_stream_stamp[b].length;
+}
+
+bool cl_arq_controller::w_stream_shift_detected(int wbsi)
+{
+	// Option W CORE — RSP BACKSTOP decision (data-flow-stream-offset.md §8.2 step 6).
+	// Pure; shared by the production copy_data_to_buffer and test_stream_offset. false
+	// on an absent stamp (safe no-op).
+	if(wbsi < 0) return false;
+	int b = wbsi & 0xFF;
+	if(!rx_stream_stamp[b].valid) return false;
+	uint32_t stamp_start = (uint32_t)(rx_stream_stamp[b].start & 0xFFFFFFFFULL);
+	uint32_t rx_cursor32 = (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL);
+	return stamp_start != rx_cursor32;
+}
+
 void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
@@ -14197,30 +14225,24 @@ void cl_arq_controller::copy_data_to_buffer()
 	// (robust config / old peer / lost EOB frame) is a SAFE NO-OP, never a false
 	// teardown. MERCURY_W_STREAM_SHIFT_DEFEAT=1 restores the pre-fix silent delivery
 	// (the STEP-2c fail-before arm).
-	if(decrypt_delivered_bsi >= 0)
+	if(w_stream_shift_detected(decrypt_delivered_bsi))
 	{
-		int wbsi = decrypt_delivered_bsi & 0xFF;
-		if(rx_stream_stamp[wbsi].valid)
+		bool w_shift_defeat = false;
+		{ const char* e = std::getenv("MERCURY_W_STREAM_SHIFT_DEFEAT");
+		  if(e && *e && atoi(e)!=0) w_shift_defeat = true; }
+		if(!w_shift_defeat)
 		{
+			int wbsi = decrypt_delivered_bsi & 0xFF;
 			uint32_t stamp_start = (uint32_t)(rx_stream_stamp[wbsi].start & 0xFFFFFFFFULL);
 			uint32_t rx_cursor32 = (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL);
-			if(stamp_start != rx_cursor32)
-			{
-				bool w_shift_defeat = false;
-				{ const char* e = std::getenv("MERCURY_W_STREAM_SHIFT_DEFEAT");
-				  if(e && *e && atoi(e)!=0) w_shift_defeat = true; }
-				if(!w_shift_defeat)
-				{
-					printf("[RSP-V2-STREAM-SHIFT] LOUD: bsi=%d stamp.start=%u rx_delivered=%u "
-						"(delta=%lld) — absolute byte-stream shift; a positional guard tripped at "
-						"the FIRST divergent byte. Tearing down (no shifted delivery).\n",
-						wbsi, stamp_start, rx_cursor32,
-						(long long)((int64_t)stamp_start - (int64_t)rx_cursor32));
-					fflush(stdout);
-					rsp_gap_abort_teardown("Option W stream-shift: wire stamp.start != rx_stream_delivered");
-					return;   // do NOT deliver a positionally-shifted batch
-				}
-			}
+			printf("[RSP-V2-STREAM-SHIFT] LOUD: bsi=%d stamp.start=%u rx_delivered=%u "
+				"(delta=%lld) — absolute byte-stream shift; a positional guard tripped at "
+				"the FIRST divergent byte. Tearing down (no shifted delivery).\n",
+				wbsi, stamp_start, rx_cursor32,
+				(long long)((int64_t)stamp_start - (int64_t)rx_cursor32));
+			fflush(stdout);
+			rsp_gap_abort_teardown("Option W stream-shift: wire stamp.start != rx_stream_delivered");
+			return;   // do NOT deliver a positionally-shifted batch
 		}
 	}
 

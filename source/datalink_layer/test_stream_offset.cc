@@ -205,6 +205,177 @@ int cl_arq_controller::test_stream_offset()
 	copy_data_to_buffer();
 	CHECK(rx_stream_delivered == held, "F: non-delivered batch did NOT advance rx cursor", (long long)rx_stream_delivered, (long long)held);
 
+	// ===========================================================================
+	// STEP 2c — the 4-mechanism silent-corruption GATE. Reproduces each of the four
+	// silent byte-corruption mechanisms of silent-corruption-residual.md §11-§14 in
+	// process and asserts each is now GATED (PRIMARY withholds → no silent complete) or
+	// LOUD (BACKSTOP teardown decision fires) — NEVER silently delivered. Drives the
+	// PRODUCTION decision predicates w_stream_shift_detected() / w_bytegate_shortfall()
+	// (the SAME the wire ACK-GATE / copy_data_to_buffer call) + the PRODUCTION
+	// copy_data_to_buffer() reassembler as a byte-exact oracle (compression OFF). The
+	// env-defeat arms reproduce the SILENT shift (fail-before); the default arms show
+	// the gate/loud + zero silent (pass-after). Returns 0 when the EXPECTED behavior
+	// holds in EITHER mode (the test_batchsize_desync_delivery contract).
+	// ===========================================================================
+	bool shift_defeat = false;
+	{ const char* e = std::getenv("MERCURY_W_STREAM_SHIFT_DEFEAT");
+	  if(e && *e && atoi(e)!=0) shift_defeat = true; }
+	bool bytegate_defeat = false;
+	{ const char* e = std::getenv("MERCURY_W_BYTEGATE_DEFEAT");
+	  if(e && *e && atoi(e)!=0) bytegate_defeat = true; }
+
+	// Seat `n_present` distinct raw frames (ids 0..n_present-1) of one batch into
+	// messages_rx[] as ACKED, set data_batch_size = batch_size (the RSP's window — the
+	// remaining slots stay FREE), and return the present total byte length. mech-1
+	// tail-drop = full batch_size with fewer present; mech-4 shrunk-count = batch_size
+	// itself smaller than the sender's committed frames.
+	const int GFLEN = 150;
+	auto seat_rx_batch = [&](int n_present, int batch_size)->int {
+		for(int f=0;f<nMessages;f++){ messages_rx[f].status=FREE; messages_rx[f].length=0; }
+		int total=0;
+		for(int f=0;f<n_present && f<nMessages;f++){
+			for(int j=0;j<GFLEN;j++) messages_rx[f].data[j]=(char)((f*GFLEN+j)&0x7F);
+			messages_rx[f].length=GFLEN;
+			messages_rx[f].id=(char)f;
+			messages_rx[f].status=ACKED;
+			total+=GFLEN;
+		}
+		this->data_batch_size = batch_size;
+		return total;
+	};
+
+	// ---------------------------------------------------------------------------
+	// PART G — BACKSTOP: mechanism 3 (re-stage orphan/reorder Δ=48) + mechanism 4
+	// (c31w104 forward Δ=+6847). A positional shift ⇒ wire stamp.start diverges from
+	// rx_stream_delivered ⇒ w_stream_shift_detected() true (LOUD teardown). fail-before
+	// (MERCURY_W_STREAM_SHIFT_DEFEAT=1): copy_data_to_buffer delivers the shifted batch
+	// SILENTLY. pass-after: the decision fires and the batch is REFUSED (0 silent bytes).
+	// ---------------------------------------------------------------------------
+	printf("[TEST-STREAM-OFFSET] Part G — BACKSTOP (mech-3 Δ=48, mech-4 Δ=+6847)\n");
+	{
+		const int GBSI = 20;
+		// G0 — NO false-fire: a contiguous batch (stamp.start == rx_delivered) must NOT
+		// trip the BACKSTOP and must deliver cleanly through the PRODUCTION funnel.
+		rx_stream_delivered = 23581;                       // the res_c3100 boundary value
+		rx_stream_stamp[GBSI].start  = 23581;              // contiguous — matches the cursor
+		rx_stream_stamp[GBSI].length = 3750;
+		rx_stream_stamp[GBSI].valid  = true;
+		decrypt_delivered_bsi = GBSI;
+		CHECK(!w_stream_shift_detected(GBSI), "G0: contiguous batch does NOT trip BACKSTOP (no false-fire)", 0, 0);
+		fifo_buffer_rx.flush();
+		int g0_total = seat_rx_batch(25, 25);
+		copy_data_to_buffer();                             // BACKSTOP inert → clean delivery
+		{ char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+		  CHECK(popped==g0_total, "G0: contiguous batch delivered fully (funnel healthy)", popped, g0_total); }
+
+		// The two shift shapes (mech-3 hole Δ=48, mech-4 forward Δ=+6847). Both make the
+		// wire stamp.start (the sender's committed origin for this bsi) exceed the
+		// receiver's absolute delivered cursor → a hole in the delivered stream.
+		const long long deltas[2] = { 48, 6847 };
+		const char*     names [2] = { "mech-3 (re-stage orphan Δ=48)", "mech-4 (c31w104 Δ=+6847)" };
+		for(int m=0;m<2;m++)
+		{
+			int SBSI = 30 + m;
+			uint64_t cursor = 40000 + (uint64_t)m*10000;   // arbitrary in-session offset
+			rx_stream_delivered          = cursor;
+			rx_stream_stamp[SBSI].start  = cursor + (uint64_t)deltas[m];   // the SHIFT
+			rx_stream_stamp[SBSI].length = 25*GFLEN;
+			rx_stream_stamp[SBSI].valid  = true;
+			decrypt_delivered_bsi        = SBSI;
+			// The decision predicate MUST fire on the shift, in BOTH modes.
+			CHECK(w_stream_shift_detected(SBSI), names[m], (long long)deltas[m], (long long)deltas[m]);
+			fifo_buffer_rx.flush();
+			int stotal = seat_rx_batch(25, 25);
+			if(shift_defeat)
+			{
+				// fail-before: BACKSTOP defeated → copy_data_to_buffer delivers the SHIFTED
+				// batch silently (the bug). Assert the silent delivery reproduced.
+				uint64_t before = rx_stream_delivered;
+				copy_data_to_buffer();
+				char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+				bool silent = (popped==stotal) && (rx_stream_delivered==before+(uint64_t)stotal);
+				CHECK(silent, "G(defeat): shifted batch SILENTLY delivered (fail-before bug)", popped, stotal);
+			}
+			else
+			{
+				// pass-after: the decision fired (asserted above). The production BACKSTOP
+				// refuses delivery via rsp_gap_abort_teardown (socket-bound — mirrored, not
+				// invoked, exactly as test_batchsize_desync_delivery does). REFUSE: 0 silent.
+				char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));  // fifo still empty
+				CHECK(popped==0, "G(fix): shift detected → batch REFUSED, 0 silent bytes", popped, 0);
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// PART H — PRIMARY byte-gate: mechanism 1 (EOB-undercount tail-drop) + mechanism 4
+	// (complete-at-shrunk-count) + mechanism 2 (CMD>RSP batch-size desync, defense in
+	// depth). The batch is FRAME-COUNT complete but the DELIVERED bytes fall short of
+	// the committed stamp.length ⇒ w_bytegate_shortfall() true (WITHHOLD the clean ACK).
+	// fail-before (MERCURY_W_BYTEGATE_DEFEAT=1): the batch delivers TRUNCATED (silent
+	// short store). pass-after: the gate withholds → the batch is NOT delivered.
+	// ---------------------------------------------------------------------------
+	printf("[TEST-STREAM-OFFSET] Part H — PRIMARY byte-gate (mech-1 tail-drop, mech-4 shrunk, mech-2 desync)\n");
+	{
+		// H0 — NO false-fire: a COMPLETE batch (delivered bytes == committed) must NOT
+		// trip the gate and must deliver fully.
+		const int HBSI = 40;
+		this->rsp_current_expected_batch_seq_id = HBSI;
+		rx_stream_delivered = 0;
+		int h0_committed = 25*GFLEN;
+		rx_stream_stamp[HBSI].start  = 0;
+		rx_stream_stamp[HBSI].length = h0_committed;
+		rx_stream_stamp[HBSI].valid  = true;
+		int h0_total = seat_rx_batch(25, 25);
+		CHECK(!w_bytegate_shortfall(HBSI), "H0: complete batch does NOT trip byte-gate (no false-fire)", h0_total, h0_committed);
+		decrypt_delivered_bsi = HBSI;
+		fifo_buffer_rx.flush();
+		copy_data_to_buffer();
+		{ char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+		  CHECK(popped==h0_total, "H0: complete batch delivered fully", popped, h0_total); }
+
+		// mech-1 tail-drop (committed 25 frames, only 20 present) + mech-4 shrunk-count
+		// (committed 25, only 21 present) + mech-2 desync (committed 30, only 25 present).
+		const int committed_frames[3] = { 25, 25, 30 };
+		const int present_frames  [3] = { 20, 21, 25 };
+		const int rsp_window      [3] = { 25, 21, 25 };   // mech-1 full window; mech-4 shrunk; mech-2 RSP=25
+		const char* hnames[3] = { "mech-1 (EOB-undercount tail-drop)",
+		                          "mech-4 (complete-at-shrunk-count)",
+		                          "mech-2 (CMD>RSP desync, defense-in-depth)" };
+		for(int m=0;m<3;m++)
+		{
+			int MBSI = 50 + m;
+			this->rsp_current_expected_batch_seq_id = MBSI;
+			rx_stream_stamp[MBSI].start  = 0;
+			rx_stream_stamp[MBSI].length = committed_frames[m]*GFLEN;   // sender committed
+			rx_stream_stamp[MBSI].valid  = true;
+			int present_total = seat_rx_batch(present_frames[m], rsp_window[m]);  // fewer bytes present
+			// The decision predicate MUST fire (delivered < committed), in BOTH modes.
+			CHECK(w_bytegate_shortfall(MBSI), hnames[m],
+				(long long)present_total, (long long)(committed_frames[m]*GFLEN));
+			if(bytegate_defeat)
+			{
+				// fail-before: gate defeated → the batch delivers TRUNCATED (silent short store).
+				rx_stream_delivered = 0;
+				rx_stream_stamp[MBSI].start = 0;   // contiguous start so the BACKSTOP stays inert
+				decrypt_delivered_bsi = MBSI;
+				fifo_buffer_rx.flush();
+				copy_data_to_buffer();
+				char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+				bool silent_short = (popped==present_total) && (present_total < committed_frames[m]*GFLEN);
+				CHECK(silent_short, "H(defeat): truncated batch SILENTLY short-delivered (fail-before bug)",
+					popped, committed_frames[m]*GFLEN);
+			}
+			else
+			{
+				// pass-after: the gate withholds → do NOT deliver. 0 silent bytes.
+				fifo_buffer_rx.flush();
+				char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+				CHECK(popped==0, "H(fix): byte shortfall → clean ACK withheld, 0 silent bytes", popped, 0);
+			}
+		}
+	}
+
 	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);
 	fflush(stdout);

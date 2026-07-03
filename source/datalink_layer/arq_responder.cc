@@ -2506,21 +2506,16 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			if(!passive_monitor && sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
 			{
 				int wbsi = rsp_current_expected_batch_seq_id & 0xFF;
-				if(rx_stream_stamp[wbsi].valid && rx_stream_stamp[wbsi].length > 0)
+				bool w_bytegate_defeat = false;
+				{ const char* e = std::getenv("MERCURY_W_BYTEGATE_DEFEAT");
+				  if(e && *e && atoi(e)!=0) w_bytegate_defeat = true; }
+				if(!w_bytegate_defeat && w_bytegate_shortfall(wbsi))
 				{
-					int delivered_bytes = 0;
-					for(int i=0; i<this->data_batch_size; i++)
-						if(messages_rx[i].status==RECEIVED || messages_rx[i].status==ACKED)
-							delivered_bytes += messages_rx[i].length;
-					bool w_bytegate_defeat = false;
-					{ const char* e = std::getenv("MERCURY_W_BYTEGATE_DEFEAT");
-					  if(e && *e && atoi(e)!=0) w_bytegate_defeat = true; }
-					if(!w_bytegate_defeat && delivered_bytes < (int)rx_stream_stamp[wbsi].length)
 					{
-						printf("[RSP-V2-BYTE-SHORTFALL] WITHHOLD clean ACK: bsi=%d delivered=%d < "
-							"committed=%u (frame-count PASS but byte shortfall — tail-drop / "
-							"shrunk-count); re-arm so SACK re-requests. NOT crediting, NOT flushing.\n",
-							wbsi, delivered_bytes, rx_stream_stamp[wbsi].length);
+						printf("[RSP-V2-BYTE-SHORTFALL] WITHHOLD clean ACK: bsi=%d committed=%u "
+							"(frame-count PASS but byte shortfall — tail-drop / shrunk-count); "
+							"re-arm so SACK re-requests. NOT crediting, NOT flushing.\n",
+							wbsi, rx_stream_stamp[wbsi].length);
 						fflush(stdout);
 						// Identical re-arm to the partial-batch SACK-suppress hold above.
 						stats.nNAcked_data++;

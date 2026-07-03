@@ -3385,6 +3385,20 @@ public:
   // (right after the D5 byte). messages_rx_buffer.batch_seq_id must be set first.
   int w_parse_eob_stamp(int stamp_off);
 
+  // Option W CORE — the two RSP-check DECISION predicates (pure; no side effects; no
+  // socket). Production (ACK-GATE / copy_data_to_buffer) AND the deterministic
+  // regression (test_stream_offset) both call these, so the test exercises the SAME
+  // decision the wire path uses (the batchsize_desync_detected() pattern).
+  //   w_bytegate_shortfall: PRIMARY — do the DELIVERED bytes for batch wbsi (Σ
+  //     RECEIVED/ACKED messages_rx[i].length, i<data_batch_size) fall SHORT of the
+  //     committed wire stamp.length? true ⇒ WITHHOLD the clean ACK. Absent/zero-length
+  //     stamp ⇒ false (no-op).
+  //   w_stream_shift_detected: BACKSTOP — does batch wbsi's wire stamp.start diverge
+  //     from the receiver's absolute delivered cursor (positional shift/hole/dup)?
+  //     true ⇒ LOUD teardown. Absent stamp ⇒ false (no-op).
+  bool w_bytegate_shortfall(int wbsi);
+  bool w_stream_shift_detected(int wbsi);
+
   // SACK Design A Step 4 — RSP cross-batch routing decision state.
   // All members gated on sack_v2_enabled; v1 path never reads these.
   // Per §4.2.3 + §4.3.4 invariant #3: RSP routes DATA frames using
