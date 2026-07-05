@@ -532,6 +532,18 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 	int nDataPlot = (M == MOD_MFSK) ? 0 : ofdm.pilot_configurator.nData;
 	float contellation[nDataPlot*constellation_plot_nFrames+1][2]={};
 
+	// BW-RECLAIM PROBE: per-subcarrier mean |estimated_channel| accumulation
+	// (default-off). On a clean channel |H[j]| is the composite TX*RX FIR shaping
+	// (+ LS-estimator edge behavior) — the modem-intrinsic per-carrier gain profile.
+	// Only valid at stock Nc (framing intact); the probe runs it at Nc=50.
+	const char* _hd = std::getenv("MERCURY_HDUMP");
+	bool hdump_on = (_hd && atoi(_hd) != 0 && M != MOD_MFSK);
+	double hsum[512]={0}; long hcnt[512]={0};
+	// pre-equalization per-carrier received |symbol| (DATA cells only): on a clean
+	// channel mean|in[j]| ∝ composite TX*RX filter magnitude at carrier j — the
+	// SNR-penalty driver the equalizer normalization hides.
+	double psum[512]={0}; long pcnt[512]={0};
+
 	while(lerror_rate.Frames_total<max_frame_no)
 	{
 		for(int i=0;i<nReal_data-outer_code_reserved_bits;i++)
@@ -589,6 +601,29 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 		this->receive_byte(data_container.passband_delayed_data,data_container.hd_decoded_data_byte);
 		mfsk_fixed_delay = -1;
 		ofdm_forced_delay = -1;
+
+		if(hdump_on && ofdm.Nc>0 && ofdm.Nc<=512 && ofdm.estimated_channel!=NULL)
+		{
+			for(int i=0;i<ofdm.Nsymb;i++)
+				for(int j=0;j<ofdm.Nc;j++)
+				{
+					hsum[j]+=std::abs((ofdm.estimated_channel+i*ofdm.Nc+j)->value);
+					hcnt[j]++;
+				}
+		}
+		if(hdump_on && ofdm.Nc>0 && ofdm.Nc<=512 && ofdm.ofdm_frame!=NULL
+		   && data_container.ofdm_symbol_demodulated_data!=NULL)
+		{
+			for(int i=0;i<ofdm.Nsymb;i++)
+				for(int j=0;j<ofdm.Nc;j++)
+				{
+					if((ofdm.ofdm_frame+i*ofdm.Nc+j)->type==DATA)
+					{
+						psum[j]+=std::abs(data_container.ofdm_symbol_demodulated_data[i*ofdm.Nc+j]);
+						pcnt[j]++;
+					}
+				}
+		}
 		byte_to_bit(data_container.hd_decoded_data_byte,data_container.hd_decoded_data_bit,(nReal_data-outer_code_reserved_bits)/8);
 
 		if(nDataPlot > 0)
@@ -610,6 +645,23 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 		}
 
 		lerror_rate.check(data_container.data_bit,data_container.hd_decoded_data_bit,nReal_data-outer_code_reserved_bits);
+	}
+	if(hdump_on)
+	{
+		double ref = (ofdm.Nc>2 && hcnt[ofdm.Nc/2]>0) ? hsum[ofdm.Nc/2]/hcnt[ofdm.Nc/2] : 1.0;
+		if(ref<=0) ref=1.0;
+		double pref = (ofdm.Nc>2 && pcnt[ofdm.Nc/2]>0) ? psum[ofdm.Nc/2]/pcnt[ofdm.Nc/2] : 1.0;
+		if(pref<=0) pref=1.0;
+		for(int j=0;j<ofdm.Nc;j++)
+		{
+			double m = hcnt[j]>0 ? hsum[j]/hcnt[j] : 0.0;
+			double p = pcnt[j]>0 ? psum[j]/pcnt[j] : 0.0;
+			// HCARR: estimated |H| (equalizer-normalized). PRXCARR: pre-eq received
+			// |symbol| ∝ composite filter magnitude (SNR shape); normalized to center.
+			printf("HCARR %d estH=%.6f estH_norm=%.6f preEq=%.6f preEq_norm=%.6f\n",
+				j, m, m/ref, p, p/pref);
+		}
+		fflush(stdout);
 	}
 	return lerror_rate;
 }
@@ -5447,6 +5499,19 @@ void cl_telecom_system::init()
 	if(ofdm.Nc==AUTO_SELLECT)
 	{
 		ofdm.Nc = narrowband_enabled ? 10 : 50;
+		// BW-RECLAIM PROBE (default-off; unset => byte-identical). Override the WB
+		// active-subcarrier count to characterize wider-Nc FIR/estimator behavior.
+		// Only the bandwidth/FIR/estimator path is exercised (LDPC framing is
+		// Nc-coupled: nBits=nData*log2M must equal the fixed codeword length, so a
+		// wide-Nc *decode* is invalid). The probe dumps FIR geometry + per-carrier
+		// |H| and does NOT rely on a wide-Nc BER. See fact-documents/bandwidth-reclaim-wb2.md.
+		{
+			const char* _ncov = std::getenv("MERCURY_NC_OVERRIDE");
+			if(!narrowband_enabled && _ncov && atoi(_ncov) > 0)
+			{
+				ofdm.Nc = atoi(_ncov);
+			}
+		}
 	}
 
 	// Recompute bandwidth-dependent parameters from actual Nc
@@ -5518,7 +5583,10 @@ void cl_telecom_system::init()
 	}
 
 	// Nsymb scales with Nc: narrowband (Nc=10) needs 5× more symbols than wideband (Nc=50)
-	int nc_scale = 50 / ofdm.Nc;
+	// ceil(50/Nc) so the BW-reclaim probe (Nc>50) keeps nc_scale=1 (never 0 → Nsymb=0);
+	// preserves stock behavior exactly: Nc=50→1, Nc=10→5.
+	int nc_scale = (50 + ofdm.Nc - 1) / ofdm.Nc;
+	if(nc_scale < 1) nc_scale = 1;
 
 	if(ofdm.Nsymb==AUTO_SELLECT)
 	{
@@ -5636,6 +5704,47 @@ void cl_telecom_system::init()
 		ofdm.FIR_tx2.sampling_frequency=this->sampling_frequency;
 		ofdm.FIR_tx2.design();
 		reinit_subsystems.ofdm_FIR_tx2=NO;
+	}
+
+	// BW-RECLAIM PROBE: dump FIR geometry + carrier layout (default-off; unset =>
+	// byte-identical). filter_coefficients is private, so we emit the public design
+	// params (nTaps/cuts/transition/window/type/fs) — the windowed-sinc response is
+	// deterministic from these, replicated 1:1 in the Python analyzer. With
+	// MERCURY_FIR_DUMP_EXIT set we exit BEFORE the Nc-coupled decode path, so wide-Nc
+	// runs never touch invalid LDPC framing.
+	{
+		const char* _fd = std::getenv("MERCURY_FIR_DUMP");
+		if(_fd && atoi(_fd) != 0)
+		{
+			printf("FIRGEOM Nc=%d Nfft=%d bw=%.6f cf=%.6f fs=%.1f spacing=%.6f interp=%d\n",
+				ofdm.Nc, ofdm.Nfft, bandwidth, carrier_frequency, sampling_frequency,
+				bandwidth/(double)ofdm.Nc, frequency_interpolation_rate);
+			// carrier absolute-frequency layout: passband band spans cf +/- bw/2,
+			// Nc carriers at spacing bw/Nc; carrier j center = cf - bw/2 + (j+0.5)*spacing.
+			printf("FIRCARR");
+			for(int j=0;j<ofdm.Nc;j++)
+				printf(" %.4f", carrier_frequency - bandwidth/2.0 + (j+0.5)*(bandwidth/(double)ofdm.Nc));
+			printf("\n");
+			printf("FIRPARM tx1 nTaps=%d win=%d type=%d lpf=%.4f hpf=%.4f trans=%.4f fs=%.1f\n",
+				ofdm.FIR_tx1.filter_nTaps, ofdm.FIR_tx1.filter_window, ofdm.FIR_tx1.type,
+				ofdm.FIR_tx1.lpf_filter_cut_frequency, ofdm.FIR_tx1.hpf_filter_cut_frequency,
+				ofdm.FIR_tx1.filter_transition_bandwidth, ofdm.FIR_tx1.sampling_frequency);
+			printf("FIRPARM tx2 nTaps=%d win=%d type=%d lpf=%.4f hpf=%.4f trans=%.4f fs=%.1f\n",
+				ofdm.FIR_tx2.filter_nTaps, ofdm.FIR_tx2.filter_window, ofdm.FIR_tx2.type,
+				ofdm.FIR_tx2.lpf_filter_cut_frequency, ofdm.FIR_tx2.hpf_filter_cut_frequency,
+				ofdm.FIR_tx2.filter_transition_bandwidth, ofdm.FIR_tx2.sampling_frequency);
+			printf("FIRPARM rxdata nTaps=%d win=%d type=%d lpf=%.4f hpf=%.4f trans=%.4f fs=%.1f\n",
+				ofdm.FIR_rx_data.filter_nTaps, ofdm.FIR_rx_data.filter_window, ofdm.FIR_rx_data.type,
+				ofdm.FIR_rx_data.lpf_filter_cut_frequency, ofdm.FIR_rx_data.hpf_filter_cut_frequency,
+				ofdm.FIR_rx_data.filter_transition_bandwidth, ofdm.FIR_rx_data.sampling_frequency);
+			printf("FIRPARM rxtsync nTaps=%d win=%d type=%d lpf=%.4f hpf=%.4f trans=%.4f fs=%.1f\n",
+				ofdm.FIR_rx_time_sync.filter_nTaps, ofdm.FIR_rx_time_sync.filter_window, ofdm.FIR_rx_time_sync.type,
+				ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency, ofdm.FIR_rx_time_sync.hpf_filter_cut_frequency,
+				ofdm.FIR_rx_time_sync.filter_transition_bandwidth, ofdm.FIR_rx_time_sync.sampling_frequency);
+			fflush(stdout);
+			const char* _fde = std::getenv("MERCURY_FIR_DUMP_EXIT");
+			if(_fde && atoi(_fde) != 0) { exit(0); }
+		}
 	}
 
 	if(reinit_subsystems.data_container==YES)
