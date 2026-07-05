@@ -2058,11 +2058,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// False alarm: preamble energy ≈ buffer mean (noise floor throughout).
 			// Absolute floor 1e-12: below any real ADC noise floor.
 			bool is_silence = (buf_mean_energy < energy_gate_floor) && (mean_energy < energy_gate_floor);
-			printf("[OFDM-ENERGY] pream=%.4e buf=%.4e count=%d delay=%d symb=%d metric=%.3f %s\n",
-				mean_energy, buf_mean_energy, count, receive_stats.delay, pream_symb_loc,
-				receive_stats.coarse_metric,
-				is_silence ? "REJECT" : "PASS");
-			fflush(stdout);
+			if(g_verbose)
+			{
+				printf("[OFDM-ENERGY] pream=%.4e buf=%.4e count=%d delay=%d symb=%d metric=%.3f %s\n",
+					mean_energy, buf_mean_energy, count, receive_stats.delay, pream_symb_loc,
+					receive_stats.coarse_metric,
+					is_silence ? "REJECT" : "PASS");
+				fflush(stdout);
+			}
 			if(is_silence)
 			{
 				energy_ok = false;
@@ -2073,9 +2076,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// Threshold 0.10 blocks data peaks while allowing degraded preambles.
 			if(energy_ok && receive_stats.coarse_metric < 0.10)
 			{
-				printf("[OFDM-ENERGY] metric=%.3f at delay=%d — weak peak, skipping decode\n",
-					receive_stats.coarse_metric, receive_stats.delay);
-				fflush(stdout);
+				if(g_verbose)
+				{
+					printf("[OFDM-ENERGY] metric=%.3f at delay=%d — weak peak, skipping decode\n",
+						receive_stats.coarse_metric, receive_stats.delay);
+					fflush(stdout);
+				}
 				energy_ok = false;
 			}
 
