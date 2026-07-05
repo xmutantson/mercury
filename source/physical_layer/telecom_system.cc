@@ -1840,7 +1840,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		? (narrowband_enabled ? 0.75 : 0.65)
 		: (narrowband_enabled ? 0.30 : 0.15);
 
-	if(M != MOD_MFSK)
+	if(M != MOD_MFSK && g_verbose)
 	{
 		printf("[OFDM-SYNC] coarse: pream_symb=%d delay=%d bounds=[%d,%d] metric=%.3f bufNsymb=%d Nsymb=%d preamNsymb=%d %s\n",
 			pream_symb_loc, receive_stats.delay, lower_bound, upper_bound,
