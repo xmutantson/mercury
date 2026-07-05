@@ -5749,7 +5749,24 @@ void cl_telecom_system::init()
 
 	if(reinit_subsystems.data_container==YES)
 	{
-		if(M == MOD_MFSK)
+		// PRECOOK: when the shared ring is pinned, install ONLY the per-config geometry scalars
+		// (set_active_geometry) — no new[]/deinit. init() runs OUTSIDE capture_prep_mutex on the
+		// precook path (load_configuration), so this must NOT publish the C1-visible atomic
+		// buffer_Nsymb; set_active_geometry STAGES it and load_configuration publishes it under
+		// the leaf lock. Legacy (unpinned): set_size allocates + publishes as before.
+		if(data_container.precook_ring_pinned)
+		{
+			if(M == MOD_MFSK)
+			{
+				int M_eff = 1 << mfsk.bits_per_symbol();
+				data_container.set_active_geometry(ofdm.Nsymb, ofdm.Nc, M_eff, ofdm.Nfft, ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb, frequency_interpolation_rate);
+			}
+			else
+			{
+				data_container.set_active_geometry(ofdm.pilot_configurator.nData, ofdm.Nc, M, ofdm.Nfft, ofdm.Nfft*(1+ofdm.gi), ofdm.Nsymb, ofdm.preamble_configurator.Nsymb, frequency_interpolation_rate);
+			}
+		}
+		else if(M == MOD_MFSK)
 		{
 			// MFSK: nData = Nsymb (no pilots)
 			// Effective M = 2^(nBits*nStreams) so that nData*log2(M_eff) = N_MAX
@@ -5819,8 +5836,12 @@ void cl_telecom_system::deinit()
 	canary_check_all();
 	canary_clear();
 
-	if(reinit_subsystems.data_container==YES)
+	if(reinit_subsystems.data_container==YES && !data_container.precook_ring_pinned)
 	{
+		// PRECOOK: never free the pinned shared ring (that reopens the Bug #42 UAF window and the
+		// audio-deaf stall). The geometry subsystems below (ofdm/ldpc/FIR/pre_eq) ARE still
+		// freed+rebuilt per switch — they are ARQ-thread-only and touch nothing C1 reads, so their
+		// deinit→init runs outside the lock and the cfg≤16 decode stays byte-identical.
 		data_container.deinit();
 	}
 	if(reinit_subsystems.ofdm_FIR_rx_data==YES)
@@ -11000,7 +11021,14 @@ void cl_telecom_system::load_configuration(int configuration)
 		// The mutex is held through deinit, parameter updates, and init, so the
 		// capture thread always sees either the old consistent state or the new
 		// consistent state — never an intermediate mix.
-		if(reinit_subsystems.data_container==YES)
+		// PRECOOK: the wide lock existed ONLY because the ring was FREED inside this cycle
+		// (Bug #42 UAF). With the ring pinned it is never freed, so the precook path takes NO
+		// lock here and does NOT zero Nofdm/buffer_Nsymb — the audio thread keeps reading the OLD
+		// consistent geometry and filling the (still-valid) ring throughout the ~100 ms init(),
+		// so no samples are lost (the deaf window dissolves). The geometry rebuild
+		// (deinit→init of ofdm/ldpc/FIR) runs OUTSIDE any lock; the only critical section is the
+		// scalar publish at the end (leaf). Legacy path keeps the exact Bug #42 wide lock.
+		if(reinit_subsystems.data_container==YES && !data_container.precook_ring_pinned)
 		{
 			printf("[PHY-SWITCH] Taking capture_prep_mutex, zeroing Nofdm/buffer_Nsymb\n");
 			fflush(stdout);
@@ -11662,6 +11690,103 @@ void cl_telecom_system::load_configuration(int configuration)
 		1000.0 * ack_pattern_passband_samples / sampling_frequency,
 		ack_mfsk.ack_match_threshold, ack_mfsk.ack_pattern_nsymb,
 		ack_pattern_detection_threshold);
+
+	// PRECOOK: publish the C1-visible ring geometry ATOMICALLY. This is the ONLY critical
+	// section on the precook path — the legacy path published under the wide Bug #42 lock held
+	// across deinit()+init() (~100-200 ms, the audio-deaf window); with the ring pinned that lock
+	// was skipped (see Spot A), so publish here under a sub-µs LEAF lock: publish_active_ring()
+	// is a pure leaf (scalar stores + one bounded memset, NO call-out that could re-take the
+	// mutex → INV-8 non-recursive-Linux self-deadlock is structurally impossible).
+	if(data_container.precook_ring_pinned)
+	{
+		// Reentrancy tripwire: catch a SAME-THREAD recursive load_configuration — the only way
+		// the leaf publish below could self-deadlock on the non-recursive Linux capture_prep_mutex
+		// (a caller that already holds the mutex re-enters load_configuration). thread_local so it
+		// never false-positives on normal cross-thread C1 contention (unlike a trylock check). No
+		// production caller holds the mutex across load_configuration (audited: the ARQ control
+		// loop and the force_* ring helpers all release before/never call it).
+		static thread_local bool in_precook_publish = false;
+		if(in_precook_publish)
+		{
+			fprintf(stderr, "[PRECOOK] FATAL: reentrant load_configuration publish on one thread "
+				"(capture_prep_mutex would self-deadlock)\n");
+			fflush(stderr);
+			abort();
+		}
+		in_precook_publish = true;
+		MUTEX_LOCK(&capture_prep_mutex);
+		data_container.publish_active_ring();   // LEAF: no call-out
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		in_precook_publish = false;
+	}
+}
+
+// PRECOOK (Stage 1): size + allocate the ONE persistent shared capture ring and pin it. Called
+// ONCE at startup from main.cc, AFTER ARQ.init's first load_configuration and BEFORE the capture
+// thread spawns (S0 — no C1 exists, so the sizing-pass legacy loads race nothing). No-op if
+// MERCURY_PRECOOK_DEFEAT is set (the fail-before: leaves the legacy deinit→init-under-lock path).
+void cl_telecom_system::precook_pin_shared_ring()
+{
+	{ const char* d = std::getenv("MERCURY_PRECOOK_DEFEAT");
+	  if(d && *d && atoi(d) != 0) {
+	    printf("[PRECOOK] MERCURY_PRECOOK_DEFEAT set — ring NOT pinned (legacy deinit→init path)\n");
+	    fflush(stdout); return; } }
+	if(data_container.precook_ring_pinned) return;   // idempotent
+	if(data_container.Nofdm <= 0)
+	{
+		// No config loaded yet — nothing to size against. Leave the legacy path active.
+		printf("[PRECOOK] no config loaded at pin time; ring stays legacy (unpinned)\n");
+		fflush(stdout);
+		return;
+	}
+
+	int saved_cfg = current_configuration;
+
+	// Seed the maxima from the currently-loaded (startup) config, then walk the full ladder in the
+	// CURRENT bandwidth. buffer_Nsymb is the ring modulus / acquisition window; Nsymb/preamble/
+	// nData/Nc size the scratch + tx buffers. ROBUST_0 (FULL_CONFIG_LADDER[0]) carries the largest
+	// (robust-floor) buffer, so the in-band seat (force_resize_capture_ring, min_nsymb =
+	// ROBUST_0's buffer_Nsymb) never exceeds this max → no runtime realloc.
+	int max_bn    = data_container.buffer_Nsymb.load();
+	int max_Nsymb = data_container.Nsymb;
+	int max_pre   = data_container.preamble_nSymb;
+	int max_nData = data_container.nData;
+	int max_Nc    = data_container.Nc;
+	int ref_Nofdm = data_container.Nofdm;   // Q2: invariant across configs (gi=54/256 → 310)
+
+	for(int i=0;i<FULL_CONFIG_LADDER_SIZE;i++)
+	{
+		int cfg = FULL_CONFIG_LADDER[i];
+		current_configuration = CONFIG_NONE;   // defeat the no-op early-return → force a full load
+		load_configuration(cfg);
+		int bn = data_container.buffer_Nsymb.load();
+		if(bn > max_bn) max_bn = bn;
+		if(data_container.Nsymb > max_Nsymb) max_Nsymb = data_container.Nsymb;
+		if(data_container.preamble_nSymb > max_pre) max_pre = data_container.preamble_nSymb;
+		if(data_container.nData > max_nData) max_nData = data_container.nData;
+		if(data_container.Nc > max_Nc) max_Nc = data_container.Nc;
+		if((int)data_container.Nofdm != ref_Nofdm)
+			fprintf(stderr, "[PRECOOK] WARN Nofdm variance: cfg=%d Nofdm=%d ref=%d "
+				"(ring sized on ref; C1 re-reads under lock)\n",
+				cfg, (int)data_container.Nofdm, ref_Nofdm);
+	}
+
+	// Restore the live startup config (force past the no-op guard).
+	current_configuration = CONFIG_NONE;
+	load_configuration(saved_cfg);
+
+	// Allocate the ONE shared ring at the max; pin it. Every subsequent switch is now a scalar
+	// publish (no free/realloc). ref_Nofdm/interpolation_rate are geometry-invariant across configs.
+	data_container.alloc_shared_buffers(max_nData, max_Nc, (int)M, ofdm.Nfft,
+		ref_Nofdm, max_Nsymb, max_pre, frequency_interpolation_rate, max_bn);
+
+	printf("[PRECOOK] shared capture ring PINNED: Nofdm=%d interp=%d max_buffer_Nsymb=%d "
+		"max_Nsymb=%d max_pre=%d max_nData=%d max_Nc=%d (ring=%.1f MB, never freed hereafter; "
+		"active cfg=%d buffer_Nsymb=%d)\n",
+		ref_Nofdm, frequency_interpolation_rate, max_bn, max_Nsymb, max_pre, max_nData, max_Nc,
+		2.0*ref_Nofdm*max_bn*frequency_interpolation_rate*(double)sizeof(double)/1e6,
+		current_configuration, (int)data_container.buffer_Nsymb);
+	fflush(stdout);
 }
 
 // Grow the capture ring (passband_delayed_data etc.) to hold at least `min_nsymb` symbols

@@ -1089,6 +1089,60 @@ int main(int argc, char *argv[])
             // defeating the primitive restores the pre-fix 0. Fast + deterministic, no
             // IONOS/RF. See fact-documents/chase-combining-harq.md.
             failed += run_chase_selftest();
+
+            // PRECOOK (Stage 1) shared-ring PIN invariant regression. Pins the persistent
+            // capture ring (precook_pin_shared_ring), then drives a representative gearshift
+            // sequence and asserts: (a) passband_delayed_data is the SAME address after every
+            // switch (ring never freed → the Bug #42 UAF window is structurally gone); (b) each
+            // config's ACTIVE buffer_Nsymb is its per-config natural, NEVER pinned to the max
+            // (the S4 oversize-ring acquisition wall the "pin to max" landmine would create, and
+            // never exceeds the pinned capacity). In-process, no IONOS/RF. See PRECOOK plan §6.
+            {
+                const char* defeat = std::getenv("MERCURY_PRECOOK_DEFEAT");
+                bool defeated = (defeat && *defeat && atoi(defeat) != 0);
+                cl_telecom_system ts;
+                ts.narrowband_enabled = NO;
+                ts.load_configuration(CONFIG_0);
+                int nat_cfg0 = ts.data_container.buffer_Nsymb;
+                ts.precook_pin_shared_ring();
+                int pfail = 0;
+                if(defeated) {
+                    if(ts.data_container.precook_ring_pinned) { printf("[TEST-PRECOOK] FAIL: DEFEAT set but ring pinned\n"); pfail++; }
+                    else printf("[TEST-PRECOOK] SKIP (MERCURY_PRECOOK_DEFEAT=1 → legacy path)\n");
+                } else {
+                    double* ring0 = ts.data_container.passband_delayed_data;
+                    int cap = ts.data_container.pinned_capacity_buffer_Nsymb;
+                    if(!ts.data_container.precook_ring_pinned) { printf("[TEST-PRECOOK] FAIL: ring not pinned after precook\n"); pfail++; }
+                    if(ring0 == NULL) { printf("[TEST-PRECOOK] FAIL: ring NULL after pin\n"); pfail++; }
+                    int seq[] = { CONFIG_16, ROBUST_0, CONFIG_8, CONFIG_0, ROBUST_2, CONFIG_15, CONFIG_16, ROBUST_1 };
+                    for(unsigned s=0; s<sizeof(seq)/sizeof(seq[0]); s++) {
+                        ts.load_configuration(seq[s]);
+                        if(ts.data_container.passband_delayed_data != ring0) {
+                            printf("[TEST-PRECOOK] FAIL: ring pointer moved on switch to %d (%p != %p) — ring was freed/realloc'd\n",
+                                seq[s], (void*)ts.data_container.passband_delayed_data, (void*)ring0);
+                            pfail++;
+                        }
+                        int bn = ts.data_container.buffer_Nsymb;
+                        if(bn > cap) { printf("[TEST-PRECOOK] FAIL: cfg %d buffer_Nsymb=%d exceeds pinned capacity=%d\n", seq[s], bn, cap); pfail++; }
+                    }
+                    // Per-config window preserved (no S4 wall): CONFIG_0 active window == its natural,
+                    // NOT the pinned max (cap), even after dwelling on a large-window ROBUST config.
+                    ts.load_configuration(ROBUST_0);
+                    ts.load_configuration(CONFIG_0);
+                    if((int)ts.data_container.buffer_Nsymb != nat_cfg0) {
+                        printf("[TEST-PRECOOK] FAIL: CONFIG_0 window=%d != natural %d (S4 oversize-ring wall)\n",
+                            (int)ts.data_container.buffer_Nsymb, nat_cfg0);
+                        pfail++;
+                    }
+                    if(ts.data_container.passband_delayed_data != ring0) { printf("[TEST-PRECOOK] FAIL: ring pointer moved (final)\n"); pfail++; }
+                    if(pfail == 0)
+                        printf("[TEST-PRECOOK] ALL PASS: ring pinned+stable across 10 switches (addr=%p, cap=%d), "
+                            "per-config window preserved (CONFIG_0 natural=%d, not clamped to max)\n",
+                            (void*)ring0, cap, nat_cfg0);
+                }
+                failed += pfail;
+            }
+
             return (failed == 0) ? 0 : 1;
         }
         // --test-chase : run ONLY the chase-combining self-test and exit. Drives the
@@ -4950,6 +5004,13 @@ start_modem:
         }
 
         ARQ.print_stats();
+
+		// PRECOOK (Stage 1): pin the persistent shared capture ring at the MAX geometry across
+		// the config ladder BEFORE the capture thread spawns (audioio_init_internal below).
+		// After this, a gearshift/adopt config switch is a sub-µs scalar publish under a leaf
+		// lock instead of a ~100-200 ms deinit→init held under capture_prep_mutex — which was
+		// freezing the audio capture thread (demod deaf). No-op under MERCURY_PRECOOK_DEFEAT.
+		telecom_system.precook_pin_shared_ring();
 
 		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
 							  &radio_playback, &radio_capture_prep, &telecom_system);

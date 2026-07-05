@@ -887,6 +887,15 @@ public:
 
 	void load_configuration();
 	void load_configuration(int configuration);
+	// PRECOOK (Stage 1): allocate the persistent shared capture ring ONCE at the MAX geometry
+	// across every FULL_CONFIG_LADDER config in BOTH bandwidths, then pin it
+	// (data_container.precook_ring_pinned=true) so load_configuration never frees/reallocs it —
+	// the switch becomes a scalar publish under a sub-µs leaf lock instead of a ~100-200 ms
+	// deinit→init held under capture_prep_mutex (the audio-deaf window). Call ONCE at startup,
+	// AFTER ARQ.init's first load_configuration and BEFORE the capture thread spawns
+	// (main.cc, between ARQ.init and audioio_init_internal). No-op if MERCURY_PRECOOK_DEFEAT is
+	// set (leaves the legacy deinit→init-under-lock path = the fail-before). Idempotent.
+	void precook_pin_shared_ring();
 	// Grow the capture ring to >= min_nsymb symbols WITHOUT a config change (a same-config
 	// re-load is skipped). Re-runs data_container.set_size with the current geometry + the
 	// raised buffer_Nsymb_min. Used to seat the in-band down-ladder robust ring floor
