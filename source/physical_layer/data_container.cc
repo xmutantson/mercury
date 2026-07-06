@@ -115,6 +115,42 @@ void cl_data_container::set_active_geometry(int nData, int Nc, int M, int Nfft, 
 	// Plan-B Step 5: full-rate fine-slice scratch logical size (physical array ≥ this).
 	this->baseband_data_fine_slice_size=(3*preamble_nSymb+4)*Nofdm*frequency_interpolation_rate;
 
+	// PRECOOK V2 (Step C) — LOUD CLOSURE. The pinned scratch/TX buffers (alloc_shared_buffers) were
+	// sized at the ABSOLUTE max over the CLOSED domain (Step A: both bandwidths × full ladder × thin
+	// grid × startup). Every REACHABLE geometry therefore fits — a value that EXCEEDS a pinned
+	// capacity is a config outside the domain the precook was built for. Publishing it would drive
+	// the demod/TX scratch reads (Nsymb·Nc planes, nData, total_frame_size) out of the fixed
+	// allocation = silent heap corruption on a life-critical PHY. Refuse it LOUDLY and abort rather
+	// than corrupt: this converts any future unhandled state into a named startup-class abort, not a
+	// live 0-connect. In-domain (the live gate) this NEVER fires. (publish_active_ring separately
+	// clamps the C1-visible ring sp/buffer_Nsymb; this guards the ARQ-thread scratch dims.)
+	if(this->precook_ring_pinned)
+	{
+		const char* over = nullptr; int need = 0, cap = 0;
+		if(this->pinned_capacity_Nc > 0 && Nc > this->pinned_capacity_Nc)
+			{ over="Nc"; need=Nc; cap=this->pinned_capacity_Nc; }
+		else if(this->pinned_capacity_nsymb_nc > 0 && Nsymb*Nc > this->pinned_capacity_nsymb_nc)
+			{ over="Nsymb*Nc"; need=Nsymb*Nc; cap=this->pinned_capacity_nsymb_nc; }
+		else if(this->pinned_capacity_nData > 0 && nData > this->pinned_capacity_nData)
+			{ over="nData"; need=nData; cap=this->pinned_capacity_nData; }
+		else if(this->pinned_capacity_total_frame_size > 0 && this->total_frame_size > this->pinned_capacity_total_frame_size)
+			{ over="total_frame_size"; need=this->total_frame_size; cap=this->pinned_capacity_total_frame_size; }
+		else if(this->pinned_capacity_preamble > 0 && preamble_nSymb > this->pinned_capacity_preamble)
+			{ over="preamble_nSymb"; need=preamble_nSymb; cap=this->pinned_capacity_preamble; }
+		else if(this->pinned_capacity_fine_slice > 0 && this->baseband_data_fine_slice_size > this->pinned_capacity_fine_slice)
+			{ over="fine_slice"; need=this->baseband_data_fine_slice_size; cap=this->pinned_capacity_fine_slice; }
+		if(over != nullptr)
+		{
+			fprintf(stderr, "[PRECOOK-REFUSE] geometry exceeds pinned capacity: dim=%s need=%d cap=%d "
+				"(Nc=%d Nsymb=%d nData=%d Nofdm=%d) — config OUTSIDE the closed precook domain; "
+				"aborting rather than corrupt the pinned PHY scratch. This is a domain-closure bug: "
+				"extend precook_pin_shared_ring's walk to cover this geometry.\n",
+				over, need, cap, Nc, Nsymb, nData, Nofdm);
+			fflush(stderr);
+			abort();
+		}
+	}
+
 	// Buffer: frame + turnaround + frame + tail margin.
 	// Tail margin gives headroom for preambles that land close to buffer end.
 	double sym_time_ms = 1000.0 * Nofdm * frequency_interpolation_rate / 48000.0;
@@ -259,6 +295,16 @@ void cl_data_container::alloc_shared_buffers(int max_nData, int max_Nc, int max_
 	(void)max_M; (void)max_Nfft;
 	this->pinned_capacity_buffer_Nsymb = max_buffer_Nsymb;
 	this->pinned_capacity_samples = max_sp;   // physical per-mirror sample capacity (Nofdm·bn·interp)
+	// PRECOOK V2 (Step A): record the remaining per-dimension capacities the scratch/TX buffers were
+	// sized to, so Step B's build asserts and Step C's set_active_geometry refuse can compare against
+	// the exact allocation. alloc_Nsymb (≥ max_Nsymb, ≥128 ctrl-suffix floor) is what the scratch
+	// planes were actually allocated at; use max_Nsymb for the logical demod-plane capacity check.
+	this->pinned_capacity_Nc               = max_Nc;
+	this->pinned_capacity_nsymb_nc         = alloc_Nsymb * max_Nc;   // scratch planes sized alloc_Nsymb·Nc
+	this->pinned_capacity_nData            = max_nData;
+	this->pinned_capacity_total_frame_size = max_total_frame_size;
+	this->pinned_capacity_preamble         = max_preamble_nSymb;
+	this->pinned_capacity_fine_slice       = max_fine;
 	this->precook_ring_pinned = true;   // from here on, set_size()/init() take the no-free path
 }
 

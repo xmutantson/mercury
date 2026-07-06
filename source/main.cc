@@ -1217,7 +1217,7 @@ int main(int argc, char *argv[])
                         printf("[TEST-PRECOOK-BUNDLE] FAIL cfg %d: bundle_index returned -1 (not built)\n", cfg);
                         continue;
                     }
-                    const st_config_bundle* b = bts.config_bundles[idx].get();
+                    const st_config_bundle* b = bts.bundle_set(NO)[idx].get();
 
                     cl_telecom_system ref;
                     ref.narrowband_enabled = NO;
@@ -1376,7 +1376,7 @@ int main(int argc, char *argv[])
                         int live_cfg = ts.current_configuration;
                         int idx = ts.bundle_index(live_cfg, nb);
                         if(idx < 0){ printf("[TEST-PRECOOK-SWAP] %s FAIL: cfg %d (live %d) no bundle\n", bwn, cfg, live_cfg); sfail++; continue; }
-                        const st_config_bundle* b = ts.config_bundles[idx].get();
+                        const st_config_bundle* b = ts.bundle_set(nb)[idx].get();
 
                         // (a) decoded==framed geometry.
                         if(ts.ofdm.Nc != b->ofdm.Nc || ts.ofdm.Nsymb != b->ofdm.Nsymb ||
@@ -1432,9 +1432,9 @@ int main(int argc, char *argv[])
                     // The STAGE-1 pin-to-max bug would make bns == cap (!= natural); the strict
                     // "== natural" check below is the catcher (bns==natural==cap is legitimate for
                     // the window-defining config, so a bare ">= cap" would false-positive on NB).
-                    if(idxs >= 0 && bns != ts.config_bundles[idxs]->buffer_Nsymb){
+                    if(idxs >= 0 && bns != ts.bundle_set(nb)[idxs]->buffer_Nsymb){
                         printf("[TEST-PRECOOK-SWAP] %s FAIL: cfg %d window=%d != natural %d after ROBUST dwell (S4 pin-to-max wall)\n",
-                            bwn, ts.current_configuration, bns, ts.config_bundles[idxs]->buffer_Nsymb);
+                            bwn, ts.current_configuration, bns, ts.bundle_set(nb)[idxs]->buffer_Nsymb);
                         sfail++;
                     }
                     if(ts.data_container.passband_delayed_data != ring0){ printf("[TEST-PRECOOK-SWAP] %s FAIL: ring moved (final)\n", bwn); sfail++; }
@@ -1506,7 +1506,7 @@ int main(int argc, char *argv[])
 
                     int sidx = ts.bundle_index(live_stock, nb);
                     if(sidx < 0){ printf("[TEST-PRECOOK-COLLAPSE] %s FAIL: no bundle for stock cfg %d\n", bwn, live_stock); c4fail++; continue; }
-                    const st_config_bundle* sb = ts.config_bundles[sidx].get();
+                    const st_config_bundle* sb = ts.bundle_set(nb)[sidx].get();
                     int natural_bn = sb->buffer_Nsymb;
                     int cap = ts.data_container.pinned_capacity_buffer_Nsymb;
 
@@ -1542,7 +1542,7 @@ int main(int argc, char *argv[])
                     //         floor dominates; if the config natural already exceeds it the seat is an
                     //         idempotent no-op (already seated). Either way NO realloc.
                     int ridx = ts.bundle_index(ROBUST_0, nb);
-                    int floor_bn = (ridx >= 0) ? ts.config_bundles[ridx]->buffer_Nsymb : (natural_bn + 500);
+                    int floor_bn = (ridx >= 0) ? ts.bundle_set(nb)[ridx]->buffer_Nsymb : (natural_bn + 500);
                     int expect_seat = (floor_bn > natural_bn) ? floor_bn : natural_bn;
                     ts.force_resize_capture_ring(floor_bn);
                     if(ts.data_container.passband_delayed_data != ring0){
@@ -5456,9 +5456,11 @@ start_modem:
 		if(telecom_system.data_container.precook_ring_pinned)
 		{
 			telecom_system.precook_config_bundles();
-			printf("[PRECOOK] config bundles built for %s: %d slots (gearshift switches are now M3 swaps)\n",
+			printf("[PRECOOK] config bundles built (DUAL-BAND, live=%s): WB=%d slots, NB=%d slots "
+				"(gearshift + NB↔WB adopt switches are now M3 swaps)\n",
 				(telecom_system.narrowband_enabled == YES) ? "NB" : "WB",
-				(int)telecom_system.config_bundles.size());
+				(int)telecom_system.config_bundles_wb.size(),
+				(int)telecom_system.config_bundles_nb.size());
 			fflush(stdout);
 		}
 

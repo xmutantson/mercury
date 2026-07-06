@@ -107,6 +107,18 @@ class cl_data_container
 	//   whose Nofdm differs from the pin's ref_Nofdm can never drive C1's 2·sp mirror write / the
 	//   demod read out of the allocation. 0 until the ring is pinned. See data-flow-precook-ring.md.
 	int pinned_capacity_samples{0};
+	// PRECOOK V2 (Step A/C) — per-dimension pinned capacities recorded at pin time (the ABSOLUTE
+	//   max over the CLOSED geometry-input domain: {NB,WB} × FULL_CONFIG_LADDER × thin-grid Ngrid ×
+	//   the startup config, all under the live gi/geometry). Every bundle build (Step B) asserts its
+	//   dimension ≤ the matching capacity; set_active_geometry() (Step C) refuses+aborts loudly if a
+	//   live geometry ever exceeds one (a closed-domain violation = a named startup-class abort, not
+	//   a silent live 0-connect / heap overrun). 0 until the ring is pinned.
+	int pinned_capacity_Nc{0};              // max Nc (WB=50): pre_eq + per-symbol subcarrier count
+	int pinned_capacity_nsymb_nc{0};        // max (Nsymb·Nc): the demod/equalizer scratch planes
+	int pinned_capacity_nData{0};           // max nData: modulated_data
+	int pinned_capacity_total_frame_size{0};// max Nofdm·(Nsymb+preamble)·interp: TX passband buffers
+	int pinned_capacity_preamble{0};        // max preamble_nSymb: preamble/fine-slice sizing
+	int pinned_capacity_fine_slice{0};      // max (3·preamble+4)·Nofdm·interp: baseband_data_fine_slice
 
 	// Allocate EVERY variable-size buffer ONCE at the given MAX geometry and pin the ring
 	// (precook_ring_pinned=true). Called once at startup (main.cc, before the capture thread

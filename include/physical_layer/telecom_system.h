@@ -969,8 +969,21 @@ public:
 	// non-movable — see its declaration). active_bundle_idx tracks the last swapped
 	// slot (-1 = none). STEP 2 only BUILDS + gates these; the load_configuration swap
 	// that consumes them is STEP 3 (production path stays byte-identical here).
-	std::vector<std::unique_ptr<st_config_bundle>> config_bundles;
+	// PRECOOK V2 (Step B) — DUAL bundle sets. One bandwidth per session was the attempt-3 killer
+	// (an -R NB hail adopts WB mid-session → no WB bundle → legacy rebuild under the NB-sized pinned
+	// ring → Nc=50 overruns the Nc=10 scratch → 0/3 climb). Both sets are built at startup
+	// (reachable slots only per band) so bundle_index(cfg, narrowband) stops returning -1 at the
+	// NB→WB adopt. Each is indexed by FULL_CONFIG_LADDER order; unreachable slots (NB CONFIG_15/16)
+	// stay nullptr. bundle_set(narrowband) selects the right vector.
+	std::vector<std::unique_ptr<st_config_bundle>> config_bundles_wb;
+	std::vector<std::unique_ptr<st_config_bundle>> config_bundles_nb;
+	bool precook_bundles_built = false;   // true once precook_config_bundles() built BOTH sets
+	long precook_miss_count = 0;          // Step C: # of under-pin legacy fallbacks (live gate needs 0)
 	int active_bundle_idx = -1;
+	std::vector<std::unique_ptr<st_config_bundle>>& bundle_set(int narrowband)
+		{ return (narrowband != NO) ? config_bundles_nb : config_bundles_wb; }
+	const std::vector<std::unique_ptr<st_config_bundle>>& bundle_set(int narrowband) const
+		{ return (narrowband != NO) ? config_bundles_nb : config_bundles_wb; }
 	// Build the bundle set for the current narrowband_enabled bandwidth. Reuses the
 	// init_monitor_decoders pattern (arq_common.cc:1849): for each ladder config,
 	// construct a fresh scratch cl_telecom_system, load_configuration(cfg) (runs the

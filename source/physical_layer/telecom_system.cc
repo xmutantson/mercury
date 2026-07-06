@@ -5782,12 +5782,24 @@ void cl_telecom_system::init()
 
 	if(reinit_subsystems.pre_equalization_channel==YES && M != MOD_MFSK)
 	{
-		pre_equalization_channel=CNEW(struct st_channel_complex, data_container.Nc, "ts.pre_eq_channel");
-		// PRECOOK determinism: zero the st_channel_complex trailing padding (see cl_ofdm::init
-		// note) so the cached bundle copy is byte-identical to an independent init() build under
-		// memcmp. get_pre_equalization_channel writes only .value; on-wire byte-identical.
-		memset(pre_equalization_channel, 0, sizeof(struct st_channel_complex) * (size_t)data_container.Nc);
-		get_pre_equalization_channel();
+		// PRECOOK V2 (§5.1): once the ring is pinned, pre_equalization_channel is PINNED at max_Nc
+		// (precook_pin_shared_ring). A legacy load under pin (out-of-domain MISS) must NOT free/realloc
+		// it at this config's smaller Nc (a later WB swap would then overrun) — reuse the fixed max_Nc
+		// allocation, refilling only the first data_container.Nc entries for this config.
+		if(data_container.precook_ring_pinned && pre_equalization_channel != NULL)
+		{
+			memset(pre_equalization_channel, 0, sizeof(struct st_channel_complex) * (size_t)data_container.Nc);
+			get_pre_equalization_channel();
+		}
+		else
+		{
+			pre_equalization_channel=CNEW(struct st_channel_complex, data_container.Nc, "ts.pre_eq_channel");
+			// PRECOOK determinism: zero the st_channel_complex trailing padding (see cl_ofdm::init
+			// note) so the cached bundle copy is byte-identical to an independent init() build under
+			// memcmp. get_pre_equalization_channel writes only .value; on-wire byte-identical.
+			memset(pre_equalization_channel, 0, sizeof(struct st_channel_complex) * (size_t)data_container.Nc);
+			get_pre_equalization_channel();
+		}
 		reinit_subsystems.pre_equalization_channel=NO;
 	}
 
@@ -5872,8 +5884,11 @@ void cl_telecom_system::deinit()
 	{
 		ofdm.deinit();
 	}
-	if(reinit_subsystems.pre_equalization_channel==YES)
+	if(reinit_subsystems.pre_equalization_channel==YES && !data_container.precook_ring_pinned)
 	{
+		// PRECOOK V2 (§5.1): never free the pinned max_Nc pre_equalization_channel on a per-config
+		// deinit (parallels the pinned ring — it must survive every switch so a WB swap's memcpy of
+		// 50 entries always has a 50-wide destination). Only the legacy/DEFEAT path frees it here.
 		CDELETE(pre_equalization_channel);
 	}
 
@@ -10216,7 +10231,7 @@ void cl_telecom_system::bigblock_restore_stock_config()
 	// current_configuration here), so route through load_configuration_swap directly — the
 	// GEOMETRY changed (thin grid), not the config id. The swap's publish_active_ring() is the
 	// same single LEAF critical section every switch uses (no nested capture_prep_mutex, §5.2).
-	if(data_container.precook_ring_pinned && !config_bundles.empty())
+	if(data_container.precook_ring_pinned && precook_bundles_built)
 	{
 		int idx = bundle_index(stock, narrowband_enabled);
 		if(idx >= 0) { load_configuration_swap(stock, idx); return; }
@@ -10730,7 +10745,7 @@ void cl_telecom_system::load_configuration(int configuration)
 	// loads (config_bundles still empty during precook_pin_shared_ring) fall through to the
 	// legacy body below (which, with the ring pinned, runs init() OUTSIDE the lock + publishes
 	// via the Stage-1 leaf lock — still correct, just not a bundle swap).
-	if(data_container.precook_ring_pinned && !config_bundles.empty())
+	if(data_container.precook_ring_pinned && precook_bundles_built)
 	{
 		int _swap_idx = bundle_index(configuration, narrowband_enabled);
 		if(_swap_idx >= 0)
@@ -10738,6 +10753,19 @@ void cl_telecom_system::load_configuration(int configuration)
 			load_configuration_swap(configuration, _swap_idx);
 			return;
 		}
+		// PRECOOK V2 (Step C) — LOUD CLOSURE. Reaching the legacy body under a pinned ring with the
+		// bundles built means NO bundle matched (cfg, bandwidth): an out-of-ladder config (CONFIG_17)
+		// or — the failure we're closing — a state this table missed. With BOTH bandwidth sets built,
+		// every reachable state has a bundle, so a MISS is either the explicit S-K experimental config
+		// or a genuine gap. Count + log it: the live gate REQUIRES misses=0 (this empirically closes
+		// the attempt-2 "168 legacy inits vs 6 swaps" path without a full ARQ-wrapper trace). The
+		// legacy body below runs init() under the pinned ring (set_active_geometry's Step-C capacity
+		// guard aborts if the geometry doesn't fit — degraded-but-never-corrupt, always loud).
+		precook_miss_count++;
+		fprintf(stderr, "[PRECOOK-MISS] cfg=%d nb=%d — no matching bundle; legacy rebuild under pinned "
+			"ring (miss #%ld). In-domain this is 0; a nonzero live count is a domain gap to close.\n",
+			configuration, narrowband_enabled, precook_miss_count);
+		fflush(stderr);
 	}
 
 	printf("[PHY] Loading configuration %d (was %d)\n", configuration, current_configuration);
@@ -11725,7 +11753,10 @@ void cl_telecom_system::load_configuration(int configuration)
 // NB-clamped. The no-op / range / NB-clamp guards ran in the caller.
 void cl_telecom_system::load_configuration_swap(int configuration, int idx)
 {
-	const st_config_bundle& b = *config_bundles[idx];
+	// PRECOOK V2 (Step B) — select the bundle from the LIVE bandwidth's set. The caller looked up
+	// idx via bundle_index(configuration, narrowband_enabled), which keys on the same bandwidth, so
+	// bundle_set(narrowband_enabled)[idx] is the exact bundle that matched (WB or NB).
+	const st_config_bundle& b = *bundle_set(narrowband_enabled)[idx];
 
 	// ======================================================================================
 	// (A) GEOMETRY + SCALAR INSTALL — ARQ thread, OUTSIDE capture_prep_mutex.
@@ -11745,14 +11776,21 @@ void cl_telecom_system::load_configuration_swap(int configuration, int idx)
 
 	// pre_equalization_channel (LANDMINE-3: CACHED, never regenerated). OFDM only; NULL in the
 	// bundle for MFSK configs → leave the live array untouched (MFSK never reads it: the TX/RX
-	// pre-eq multiply is gated on M!=MOD_MFSK, telecom_system.cc:8719/8792). Nc is bandwidth-
-	// invariant (WB=50 / NB=10), so once allocated the live array always matches b.Nc; alloc on
-	// the first OFDM swap of a session that started MFSK (live ptr still NULL). Alloc is OUTSIDE
-	// the lock and one-time (not the C1-critical section).
+	// pre-eq multiply is gated on M!=MOD_MFSK, telecom_system.cc:8719/8792).
+	// ★ PRECOOK V2 (§5.1 fix): the live array is PINNED at max_Nc (=data_container.pinned_capacity_Nc,
+	// WB=50) by precook_pin_shared_ring — NEVER lazily alloc'd at this bundle's b.Nc. The old lazy
+	// alloc (at the FIRST swap's b.Nc) meant an NB-first session (b.Nc=10) then a WB adopt (memcpy 50)
+	// overran the 10-entry array → the S-D heap corruption. Now we only memcpy b.Nc ≤ max_Nc entries
+	// into the fixed max_Nc allocation. A NULL here (pin somehow didn't alloc it, e.g. legacy path
+	// under DEFEAT) is a defensive fallback allocated at the pinned max.
 	if(b.pre_equalization_channel != NULL && b.Nc > 0)
 	{
 		if(pre_equalization_channel == NULL)
-			pre_equalization_channel = CNEW(struct st_channel_complex, b.Nc, "ts.pre_eq_channel");
+		{
+			int cap = (data_container.pinned_capacity_Nc > 0) ? data_container.pinned_capacity_Nc : b.Nc;
+			pre_equalization_channel = CNEW(struct st_channel_complex, cap, "ts.pre_eq_channel");
+			memset(pre_equalization_channel, 0, sizeof(struct st_channel_complex) * (size_t)cap);
+		}
 		memcpy(pre_equalization_channel, b.pre_equalization_channel,
 		       sizeof(struct st_channel_complex) * (size_t)b.Nc);
 	}
@@ -11901,51 +11939,110 @@ void cl_telecom_system::precook_pin_shared_ring()
 	}
 
 	int saved_cfg = current_configuration;
+	int saved_nb  = narrowband_enabled;
 
-	// Seed the maxima from the currently-loaded (startup) config, then walk the full ladder in the
-	// CURRENT bandwidth. buffer_Nsymb is the ring modulus / acquisition window; Nsymb/preamble/
-	// nData/Nc size the scratch + tx buffers. ROBUST_0 (FULL_CONFIG_LADDER[0]) carries the largest
-	// (robust-floor) buffer, so the in-band seat (force_resize_capture_ring, min_nsymb =
-	// ROBUST_0's buffer_Nsymb) never exceeds this max → no runtime realloc.
+	// PRECOOK V2 (Step A) — DUAL-BANDWIDTH ABSOLUTE-MAX PIN over the CLOSED geometry-input domain:
+	// {NB, WB} × FULL_CONFIG_LADDER × the big-block thin-grid Ngrid × the startup config, all under
+	// the LIVE (already CLI/INI-overridden) defaults. The attempt-3 pin walked only the CURRENT
+	// bandwidth → an -R NB hail sized the ring at NB (max_Nc=10) → the mid-session WB adopt's Nc=50
+	// scratch overran → 0/3 climb. Walking BOTH bands takes the true absolute max (buffer_Nsymb from
+	// NB ROBUST's 4000 ms turnaround; Nc from WB's 50; Nsymb from NB's low configs), so every
+	// reachable geometry in EITHER bandwidth fits the one pinned allocation. This is S0 (no C1 thread
+	// yet), so mutating narrowband_enabled + the live config around the walk races nothing.
+	//
+	// Seed the maxima from the currently-loaded (startup) config.
 	int max_bn    = data_container.buffer_Nsymb.load();
 	int max_Nsymb = data_container.Nsymb;
 	int max_pre   = data_container.preamble_nSymb;
 	int max_nData = data_container.nData;
 	int max_Nc    = data_container.Nc;
-	int ref_Nofdm = data_container.Nofdm;   // Q2: invariant across configs (gi=54/256 → 310)
+	int ref_Nofdm = data_container.Nofdm;   // per-RUN invariant (gi is process-global); asserted below
+	int ref_interp = frequency_interpolation_rate;
 
-	for(int i=0;i<FULL_CONFIG_LADDER_SIZE;i++)
+	const int walk_bands[2] = { NO, YES };   // WB then NB
+	for(int bi=0; bi<2; bi++)
 	{
-		int cfg = FULL_CONFIG_LADDER[i];
-		current_configuration = CONFIG_NONE;   // defeat the no-op early-return → force a full load
-		load_configuration(cfg);
-		int bn = data_container.buffer_Nsymb.load();
-		if(bn > max_bn) max_bn = bn;
-		if(data_container.Nsymb > max_Nsymb) max_Nsymb = data_container.Nsymb;
-		if(data_container.preamble_nSymb > max_pre) max_pre = data_container.preamble_nSymb;
-		if(data_container.nData > max_nData) max_nData = data_container.nData;
-		if(data_container.Nc > max_Nc) max_Nc = data_container.Nc;
-		if((int)data_container.Nofdm != ref_Nofdm)
-			fprintf(stderr, "[PRECOOK] WARN Nofdm variance: cfg=%d Nofdm=%d ref=%d "
-				"(ring sized on ref; C1 re-reads under lock)\n",
-				cfg, (int)data_container.Nofdm, ref_Nofdm);
+		narrowband_enabled = walk_bands[bi];
+		for(int i=0;i<FULL_CONFIG_LADDER_SIZE;i++)
+		{
+			int cfg = FULL_CONFIG_LADDER[i];
+			current_configuration = CONFIG_NONE;   // defeat the no-op early-return → force a full load
+			load_configuration(cfg);
+			int bn = data_container.buffer_Nsymb.load();
+			if(bn > max_bn) max_bn = bn;
+			if(data_container.Nsymb > max_Nsymb) max_Nsymb = data_container.Nsymb;
+			if(data_container.preamble_nSymb > max_pre) max_pre = data_container.preamble_nSymb;
+			if(data_container.nData > max_nData) max_nData = data_container.nData;
+			if(data_container.Nc > max_Nc) max_Nc = data_container.Nc;
+			// WALK-TIME ASSERT (plan §1.1 #1/#6): Nofdm and interp are per-run invariant (gi/interp
+			// are process-global). A divergence here is a real geometry regression that would size
+			// the ring wrong for some config → CAP-STALE → 0-connect. Abort LOUDLY at startup rather
+			// than ship a mis-sized ring that fails to acquire live after hours of bench time.
+			if((int)data_container.Nofdm != ref_Nofdm)
+			{
+				fprintf(stderr, "[PRECOOK] FATAL: Nofdm variance during pin walk — cfg=%d nb=%d "
+					"Nofdm=%d ref=%d. Nofdm must be per-run invariant (gi is process-global); a "
+					"divergence means the ring cannot be pinned safely. Aborting at startup.\n",
+					cfg, narrowband_enabled, (int)data_container.Nofdm, ref_Nofdm);
+				fflush(stderr); abort();
+			}
+			if(frequency_interpolation_rate != ref_interp)
+			{
+				fprintf(stderr, "[PRECOOK] FATAL: interp variance during pin walk — cfg=%d nb=%d "
+					"interp=%d ref=%d. Aborting at startup.\n",
+					cfg, narrowband_enabled, frequency_interpolation_rate, ref_interp);
+				fflush(stderr); abort();
+			}
+		}
 	}
 
-	// Restore the live startup config (force past the no-op guard).
+	// Fold in the big-block thin-grid Ngrid (bigblock_rebuild_thin_grid re-inits the live ofdm to
+	// Ngrid symbols at Nc; the demod/TX scratch it drives is sized Ngrid·Nc / Nofdm·(Ngrid+pre)·interp).
+	// Ngrid comes from MERCURY_BIGBLOCK_NSYMB (default 60, K-sweeps set it larger). Ensure max_Nsymb
+	// covers it so the pinned scratch planes hold the thin grid (§3 rule 2). Ngrid ≤ NB's max_Nsymb
+	// already for the default, but include it unconditionally — cost is one comparison.
+	{
+		const char* e = std::getenv("MERCURY_BIGBLOCK_NSYMB");
+		int Ngrid = (e && *e) ? atoi(e) : 60;
+		if(Ngrid > max_Nsymb) max_Nsymb = Ngrid;
+	}
+
+	// Restore the live startup bandwidth + config (force past the no-op guard) so the LIVE PHY is
+	// left exactly as the startup config, built under the original bandwidth.
+	narrowband_enabled = saved_nb;
 	current_configuration = CONFIG_NONE;
 	load_configuration(saved_cfg);
 
-	// Allocate the ONE shared ring at the max; pin it. Every subsequent switch is now a scalar
-	// publish (no free/realloc). ref_Nofdm/interpolation_rate are geometry-invariant across configs.
+	// Allocate the ONE shared ring at the ABSOLUTE max over both bands; pin it. Every subsequent
+	// switch is now a scalar publish (no free/realloc). ref_Nofdm/interp are per-run invariant.
 	data_container.alloc_shared_buffers(max_nData, max_Nc, (int)M, ofdm.Nfft,
-		ref_Nofdm, max_Nsymb, max_pre, frequency_interpolation_rate, max_bn);
+		ref_Nofdm, max_Nsymb, max_pre, ref_interp, max_bn);
 
-	printf("[PRECOOK] shared capture ring PINNED: Nofdm=%d interp=%d max_buffer_Nsymb=%d "
-		"max_Nsymb=%d max_pre=%d max_nData=%d max_Nc=%d (ring=%.1f MB, never freed hereafter; "
-		"active cfg=%d buffer_Nsymb=%d)\n",
-		ref_Nofdm, frequency_interpolation_rate, max_bn, max_Nsymb, max_pre, max_nData, max_Nc,
-		2.0*ref_Nofdm*max_bn*frequency_interpolation_rate*(double)sizeof(double)/1e6,
-		current_configuration, (int)data_container.buffer_Nsymb);
+	// PRECOOK V2 (Step B §5.1 fix) — PIN pre_equalization_channel at max_Nc (WB=50). The attempt-3
+	// swap lazily alloc'd it at the FIRST swap's b.Nc; an NB-first session (b.Nc=10) then WB adopt
+	// (memcpy 50 entries) overran the 10-entry array. Alloc once here at the pinned max_Nc and never
+	// realloc on a swap — the swap only memcpy's b.Nc ≤ max_Nc entries. Preserve the startup config's
+	// values (the legacy load above filled it at data_container.Nc); MFSK startup leaves it NULL, so
+	// a zeroed max_Nc array is installed and the first OFDM swap fills it.
+	{
+		struct st_channel_complex* old_preeq = pre_equalization_channel;
+		int old_Nc = data_container.Nc;
+		pre_equalization_channel = CNEW(struct st_channel_complex, max_Nc, "ts.pre_eq_channel_pinned");
+		memset(pre_equalization_channel, 0, sizeof(struct st_channel_complex) * (size_t)max_Nc);
+		if(old_preeq != NULL && old_Nc > 0)
+		{
+			int ncopy = (old_Nc < max_Nc) ? old_Nc : max_Nc;
+			memcpy(pre_equalization_channel, old_preeq, sizeof(struct st_channel_complex) * (size_t)ncopy);
+		}
+		if(old_preeq != NULL) { CDELETE(old_preeq); }
+	}
+
+	printf("[PRECOOK] shared capture ring PINNED (DUAL-BAND): Nofdm=%d interp=%d max_buffer_Nsymb=%d "
+		"max_Nsymb=%d max_pre=%d max_nData=%d max_Nc=%d (ring=%.1f MB, pre_eq pinned@%d, never freed "
+		"hereafter; active cfg=%d nb=%d buffer_Nsymb=%d)\n",
+		ref_Nofdm, ref_interp, max_bn, max_Nsymb, max_pre, max_nData, max_Nc,
+		2.0*ref_Nofdm*max_bn*ref_interp*(double)sizeof(double)/1e6, max_Nc,
+		current_configuration, narrowband_enabled, (int)data_container.buffer_Nsymb);
 	fflush(stdout);
 }
 
@@ -11956,9 +12053,10 @@ void cl_telecom_system::precook_pin_shared_ring()
 int cl_telecom_system::bundle_index(int configuration, int narrowband) const
 {
 	int idx = config_ladder_index(configuration);
-	if(idx < 0 || idx >= (int)config_bundles.size()) return -1;
-	if(config_bundles[idx] == nullptr) return -1;
-	if(config_bundles[idx]->narrowband != (narrowband != NO)) return -1;
+	const std::vector<std::unique_ptr<st_config_bundle>>& set = bundle_set(narrowband);
+	if(idx < 0 || idx >= (int)set.size()) return -1;
+	if(set[idx] == nullptr) return -1;   // slot unreachable in this bandwidth (e.g. NB CONFIG_15/16)
+	if(set[idx]->narrowband != (narrowband != NO)) return -1;
 	return idx;
 }
 
@@ -11982,98 +12080,163 @@ int cl_telecom_system::bundle_index(int configuration, int narrowband) const
 // STEP 3. Production stays byte-identical (nothing reads config_bundles yet).
 void cl_telecom_system::precook_config_bundles()
 {
-	bool nb = (narrowband_enabled != NO);
-
-	config_bundles.clear();
-	config_bundles.resize(FULL_CONFIG_LADDER_SIZE);
-
-	for(int li=0; li<FULL_CONFIG_LADDER_SIZE; li++)
+	// PRECOOK V2 (Step B) — build BOTH bandwidth bundle sets (WB then NB). Each scratch carries its
+	// OWN narrowband_enabled, so building both does NOT touch this->narrowband_enabled (the live
+	// bandwidth is untouched). Reachable slots only per band: WB builds all 20; NB builds ROBUST_*
+	// + CONFIG_0..NB_CONFIG_MAX and leaves higher OFDM slots nullptr (they clamp to NB_CONFIG_MAX →
+	// a bundle there would be a mislabeled CONFIG_14 duplicate the live lookup never consults, a
+	// landmine for a future reader). bundle_index(cfg, band) now finds a matching bundle in EITHER
+	// bandwidth → the NB→WB mid-session adopt lands on the WB set instead of a legacy rebuild.
+	const int build_bands[2] = { NO, YES };   // WB, NB
+	for(int bbi=0; bbi<2; bbi++)
 	{
-		int cfg = FULL_CONFIG_LADDER[li];
+		int band = build_bands[bbi];
+		bool nb  = (band != NO);
+		std::vector<std::unique_ptr<st_config_bundle>>& set = bundle_set(band);
+		set.clear();
+		set.resize(FULL_CONFIG_LADDER_SIZE);
 
-		// Fresh scratch: full production init() via load_configuration. Heap-allocated so
-		// its large data_container ring is freed promptly (delete) before the next config.
-		cl_telecom_system* scratch = new cl_telecom_system();
-		// ★ PRECOOK LIVE-ACQ ROOT FIX (§CAP-STALE sp mismatch): the scratch MUST build under the
-		// SAME default_configurations the LIVE system runs, not the physical_config.cc ctor defaults.
-		// The decisive field is ofdm_gi: the ctor default is 54/256 → Ngi=54 → Nofdm=310 (4.5 ms GI),
-		// but the live system is overridden to 36/256 → Nofdm=292 (3.0 ms GI, main.cc:5270). Without
-		// this copy every bundle was built at Nofdm=310 while precook_pin_shared_ring sized the pinned
-		// ring at the live Nofdm=292 → the swap published sp=310·buffer_Nsymb·interp, which mismatches
-		// (and for ROBUST OVERRUNS) the ring sized for 292 → C1 fill / demod acq window disagree →
-		// permanent [CAP-STALE], SNR −99.90 floor, 0 acquisitions. Copying the whole struct carries
-		// gi AND every other geometry input (carrier_frequency, bandwidth, FIR cutoffs, LS window,
-		// interpolation_rate, …) so the bundle geometry is byte-for-byte the live/legacy geometry.
-		scratch->default_configurations_telecom_system = this->default_configurations_telecom_system;
-		scratch->narrowband_enabled = narrowband_enabled;
-		scratch->load_configuration(cfg);
-
-		std::unique_ptr<st_config_bundle> b(new st_config_bundle());
-		b->configuration = cfg;
-		b->narrowband    = nb;
-
-		// ---- geometry PHY objects (M3 deep-copy; STEP-1 copy_from) ----
-		b->ofdm.copy_from(scratch->ofdm);
-		b->ldpc.copy_from(scratch->ldpc);
-		b->psk.copy_from(scratch->psk);
-		b->mfsk.copy_from(scratch->mfsk);   // trivial memberwise (no owning pointers)
-
-		// ---- pre_equalization_channel[Nc] (LANDMINE-3: CACHE, never regenerate). NULL for
-		//      MFSK configs (M==MOD_MFSK leaves it unbuilt). ----
-		int Nc = scratch->data_container.Nc;
-		if(scratch->pre_equalization_channel != NULL && Nc > 0)
+		for(int li=0; li<FULL_CONFIG_LADDER_SIZE; li++)
 		{
-			b->pre_equalization_channel = new st_channel_complex[Nc];
-			memcpy(b->pre_equalization_channel, scratch->pre_equalization_channel,
-			       sizeof(st_channel_complex) * (size_t)Nc);
+			int cfg = FULL_CONFIG_LADDER[li];
+			// NB reachability (§5.3): skip OFDM configs above NB_CONFIG_MAX — they clamp, so a bundle
+			// would be a mislabeled duplicate. Leave the slot nullptr; bundle_index returns -1 for it
+			// and the live NB clamp maps the request to NB_CONFIG_MAX (which HAS a bundle) first.
+			if(nb && is_ofdm_config(cfg) && cfg > NB_CONFIG_MAX)
+				continue;
+
+			// Fresh scratch: full production init() via load_configuration. Heap-allocated so
+			// its large data_container ring is freed promptly (delete) before the next config.
+			cl_telecom_system* scratch = new cl_telecom_system();
+			// ★ LIVE-ACQ ROOT FIX (Step 0): the scratch MUST build under the SAME default_configurations
+			// the LIVE system runs (carries ofdm_gi=36/256 → Nofdm=292, not the ctor default 54/256 →
+			// 310, plus carrier/bandwidth/FIR cutoffs/LS window/interp) so the bundle geometry is
+			// byte-for-byte the live/legacy geometry and the swap publishes sp against the pinned ring.
+			scratch->default_configurations_telecom_system = this->default_configurations_telecom_system;
+			scratch->narrowband_enabled = band;
+			scratch->load_configuration(cfg);
+
+			// §5.3 assert: catch ANY silent internal remap (the NB clamp, or a future one). We build
+			// only reachable slots, so this must hold; a mismatch = a mislabeled bundle landmine.
+			if(scratch->current_configuration != cfg)
+			{
+				fprintf(stderr, "[PRECOOK] FATAL: bundle build remapped cfg %d → %d (nb=%d) — a "
+					"mislabeled bundle would be swapped in under the wrong label. Aborting.\n",
+					cfg, scratch->current_configuration, band);
+				fflush(stderr); abort();
+			}
+
+			std::unique_ptr<st_config_bundle> b(new st_config_bundle());
+			b->configuration = cfg;
+			b->narrowband    = nb;
+
+			// ---- geometry PHY objects (M3 deep-copy; STEP-1 copy_from) ----
+			b->ofdm.copy_from(scratch->ofdm);
+			b->ldpc.copy_from(scratch->ldpc);
+			b->psk.copy_from(scratch->psk);
+			b->mfsk.copy_from(scratch->mfsk);   // trivial memberwise (no owning pointers)
+
+			// ---- pre_equalization_channel[Nc] (LANDMINE-3: CACHE, never regenerate). NULL for
+			//      MFSK configs (M==MOD_MFSK leaves it unbuilt). ----
+			int Nc = scratch->data_container.Nc;
+			if(scratch->pre_equalization_channel != NULL && Nc > 0)
+			{
+				b->pre_equalization_channel = new st_channel_complex[Nc];
+				memcpy(b->pre_equalization_channel, scratch->pre_equalization_channel,
+				       sizeof(st_channel_complex) * (size_t)Nc);
+			}
+
+			// ---- bit_energy_dispersal_sequence[N_MAX] (INV-6 descrambler draw) ----
+			if(scratch->data_container.bit_energy_dispersal_sequence != NULL)
+			{
+				b->bit_energy_dispersal_sequence = new int[N_MAX];
+				memcpy(b->bit_energy_dispersal_sequence, scratch->data_container.bit_energy_dispersal_sequence,
+				       sizeof(int) * (size_t)N_MAX);
+			}
+
+			// ---- data_container geometry scalar block ----
+			b->Nofdm                         = scratch->data_container.Nofdm;
+			b->Nc                            = scratch->data_container.Nc;
+			b->M                             = scratch->data_container.M;
+			b->Nfft                          = scratch->data_container.Nfft;
+			b->Ngi                           = scratch->data_container.Ngi;
+			b->Nsymb                         = scratch->data_container.Nsymb;
+			b->nData                         = scratch->data_container.nData;
+			b->nBits                         = scratch->data_container.nBits;
+			b->preamble_nSymb                = scratch->data_container.preamble_nSymb;
+			b->interpolation_rate            = scratch->data_container.interpolation_rate;
+			b->total_frame_size              = scratch->data_container.total_frame_size;
+			b->baseband_data_fine_slice_size = scratch->data_container.baseband_data_fine_slice_size;
+			b->buffer_Nsymb                  = scratch->data_container.buffer_Nsymb.load();  // per-config NATURAL
+
+			// ---- telecom_system scalar block ----
+			b->ldpc_rate                 = scratch->ldpc.rate;
+			b->bandwidth                 = scratch->bandwidth;
+			b->carrier_frequency         = scratch->carrier_frequency;
+			b->bit_energy_dispersal_seed = scratch->bit_energy_dispersal_seed;
+			b->M_telecom                 = scratch->M;
+			b->time_sync_trials_max      = scratch->time_sync_trials_max;
+			b->outer_code                = scratch->outer_code;
+			b->outer_code_reserved_bits  = scratch->outer_code_reserved_bits;
+			// calculate_parameters()-derived.
+			b->LDPC_real_CR              = scratch->LDPC_real_CR;
+			b->Tu                        = scratch->Tu;
+			b->Ts                        = scratch->Ts;
+			b->Tf                        = scratch->Tf;
+			b->rb                        = scratch->rb;
+			b->rbc                       = scratch->rbc;
+			b->Shannon_limit             = scratch->Shannon_limit;
+
+			// ★ BUILD-TIME CAPACITY ASSERTS (Step B) — every dimension ≤ its pinned capacity, and
+			// Nofdm == the pinned ref. If a bundle exceeds a capacity, the pin walk (Step A) MISSED
+			// this geometry → the swap would overrun the pinned scratch → a domain-closure bug.
+			// Abort LOUDLY at startup rather than ship a bundle that corrupts the heap live. Only
+			// meaningful when the ring is pinned (production: pin THEN build). The STEP-2 card-free
+			// gate builds bundles on an UNPINNED instance (no ring to fit, dc.Nofdm=0) → skip.
+			if(this->data_container.precook_ring_pinned)
+			{
+				cl_data_container& dc = this->data_container;
+				const char* over = nullptr; long need = 0, cap = 0;
+				long bsamp = (long)b->Nofdm * (long)b->buffer_Nsymb * (long)b->interpolation_rate;
+				if(b->Nofdm != (int)dc.Nofdm)
+					{ over="Nofdm(!=ref)"; need=b->Nofdm; cap=(int)dc.Nofdm; }
+				else if(dc.pinned_capacity_buffer_Nsymb > 0 && b->buffer_Nsymb > dc.pinned_capacity_buffer_Nsymb)
+					{ over="buffer_Nsymb"; need=b->buffer_Nsymb; cap=dc.pinned_capacity_buffer_Nsymb; }
+				else if(dc.pinned_capacity_samples > 0 && bsamp > dc.pinned_capacity_samples)
+					{ over="sp(Nofdm*bn*interp)"; need=bsamp; cap=dc.pinned_capacity_samples; }
+				else if(dc.pinned_capacity_Nc > 0 && b->Nc > dc.pinned_capacity_Nc)
+					{ over="Nc"; need=b->Nc; cap=dc.pinned_capacity_Nc; }
+				else if(dc.pinned_capacity_nsymb_nc > 0 && (long)b->Nsymb*b->Nc > dc.pinned_capacity_nsymb_nc)
+					{ over="Nsymb*Nc"; need=(long)b->Nsymb*b->Nc; cap=dc.pinned_capacity_nsymb_nc; }
+				else if(dc.pinned_capacity_nData > 0 && b->nData > dc.pinned_capacity_nData)
+					{ over="nData"; need=b->nData; cap=dc.pinned_capacity_nData; }
+				else if(dc.pinned_capacity_total_frame_size > 0 && b->total_frame_size > dc.pinned_capacity_total_frame_size)
+					{ over="total_frame_size"; need=b->total_frame_size; cap=dc.pinned_capacity_total_frame_size; }
+				else if(dc.pinned_capacity_preamble > 0 && b->preamble_nSymb > dc.pinned_capacity_preamble)
+					{ over="preamble_nSymb"; need=b->preamble_nSymb; cap=dc.pinned_capacity_preamble; }
+				else if(dc.pinned_capacity_fine_slice > 0 && b->baseband_data_fine_slice_size > dc.pinned_capacity_fine_slice)
+					{ over="fine_slice"; need=b->baseband_data_fine_slice_size; cap=dc.pinned_capacity_fine_slice; }
+				if(over != nullptr)
+				{
+					fprintf(stderr, "[PRECOOK] FATAL: bundle cfg=%d nb=%d exceeds pinned capacity: "
+						"dim=%s need=%ld cap=%ld — the pin walk MISSED this geometry (domain-closure "
+						"bug). Extend precook_pin_shared_ring's walk. Aborting at startup.\n",
+						cfg, band, over, need, cap);
+					fflush(stderr); abort();
+				}
+			}
+
+			set[li] = std::move(b);
+			delete scratch;
 		}
-
-		// ---- bit_energy_dispersal_sequence[N_MAX] (INV-6 descrambler draw) ----
-		if(scratch->data_container.bit_energy_dispersal_sequence != NULL)
-		{
-			b->bit_energy_dispersal_sequence = new int[N_MAX];
-			memcpy(b->bit_energy_dispersal_sequence, scratch->data_container.bit_energy_dispersal_sequence,
-			       sizeof(int) * (size_t)N_MAX);
-		}
-
-		// ---- data_container geometry scalar block ----
-		b->Nofdm                         = scratch->data_container.Nofdm;
-		b->Nc                            = scratch->data_container.Nc;
-		b->M                             = scratch->data_container.M;
-		b->Nfft                          = scratch->data_container.Nfft;
-		b->Ngi                           = scratch->data_container.Ngi;
-		b->Nsymb                         = scratch->data_container.Nsymb;
-		b->nData                         = scratch->data_container.nData;
-		b->nBits                         = scratch->data_container.nBits;
-		b->preamble_nSymb                = scratch->data_container.preamble_nSymb;
-		b->interpolation_rate            = scratch->data_container.interpolation_rate;
-		b->total_frame_size              = scratch->data_container.total_frame_size;
-		b->baseband_data_fine_slice_size = scratch->data_container.baseband_data_fine_slice_size;
-		b->buffer_Nsymb                  = scratch->data_container.buffer_Nsymb.load();  // per-config NATURAL
-
-		// ---- telecom_system scalar block ----
-		b->ldpc_rate                 = scratch->ldpc.rate;
-		b->bandwidth                 = scratch->bandwidth;
-		b->carrier_frequency         = scratch->carrier_frequency;
-		b->bit_energy_dispersal_seed = scratch->bit_energy_dispersal_seed;
-		b->M_telecom                 = scratch->M;
-		b->time_sync_trials_max      = scratch->time_sync_trials_max;
-		b->outer_code                = scratch->outer_code;
-		b->outer_code_reserved_bits  = scratch->outer_code_reserved_bits;
-		// calculate_parameters()-derived.
-		b->LDPC_real_CR              = scratch->LDPC_real_CR;
-		b->Tu                        = scratch->Tu;
-		b->Ts                        = scratch->Ts;
-		b->Tf                        = scratch->Tf;
-		b->rb                        = scratch->rb;
-		b->rbc                       = scratch->rbc;
-		b->Shannon_limit             = scratch->Shannon_limit;
-
-		config_bundles[li] = std::move(b);
-		delete scratch;
 	}
 
 	active_bundle_idx = -1;
+	precook_bundles_built = true;
+	printf("[PRECOOK] dual bundle sets built: WB=%d slots, NB=%d slots (unreachable NB OFDM>%d left "
+		"empty; every bundle fits the pinned ring)\n",
+		(int)config_bundles_wb.size(), (int)config_bundles_nb.size(), NB_CONFIG_MAX);
+	fflush(stdout);
 }
 
 // Grow the capture ring (passband_delayed_data etc.) to hold at least `min_nsymb` symbols
