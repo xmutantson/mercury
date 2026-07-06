@@ -10200,64 +10200,33 @@ void cl_telecom_system::bigblock_restore_stock_config()
 {
 	int stock = current_configuration;
 
-	// RX-RING PRESERVATION (data-flow-sim2-ofdm-delivery-cadence.md §8) — a geometry-
-	// derivation helper must NEVER destroy the live RX accumulation buffer.
+	// PRECOOK STEP 4 (§3.3): bigblock_rebuild_thin_grid() mangled the LIVE ofdm object
+	// (deinit()->init() to Nsymb=Ngrid + a thin pilot lattice) but left current_configuration
+	// == the stock config. "Restore" therefore means RE-INSTALL the stock config's geometry.
 	//
-	// The CONFIG_NONE -> load_configuration(stock) reload below forces a FULL reinit
-	// (telecom_system.cc:8664-8674) -> data_container.set_size(), which deinit()s and
-	// REALLOCS + memset-ZEROES passband_delayed_data + ready_to_process_passband_delayed_data
-	// (data_container.cc:170-173). On the continuous-stream production RX this is harmless
-	// (the helper fires only at quiescent inter-block / TX-turnaround boundaries; CLAUDE.md
-	// data-flow audit §8.3 INV-2). But under the in-process SIM single-symbol pacing the
-	// next block's samples are ALREADY accumulated in the ring when a control-turnaround
-	// restore (arq_responder.cc:1213) fires -> the realloc wipes the in-flight block and the
-	// subsequent decode snapshots rms=0 SILENCE -> cw0-CRC fails -> 0 bytes delivered.
-	//
-	// Restore to the SAME stock config => the data_container ring dimensions
-	// (Nofdm * buffer_Nsymb * interp) are IDENTICAL before and after, so a snapshot+restore
-	// of the ring contents + accumulation bookkeeping across the reload is always valid.
-	// This makes the helper non-destructive to shared RX state on BOTH paths (defense-in-
-	// depth on production: a no-op when the ring was already quiescent, since saved==loaded).
-	int sp_full = 2 * data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-	int sp_rtp  =     data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-	std::vector<double> save_pdd, save_rtp;
-	int  save_rwi = data_container.ring_write_index;
-	int  save_ftr = data_container.frames_to_read.load();
-	int  save_dr  = data_container.data_ready;
-	int  save_nupe= data_container.nUnder_processing_events.load();
-	bool ring_saved = false;
-	if(sp_full > 0 && data_container.passband_delayed_data != NULL
-	   && data_container.ready_to_process_passband_delayed_data != NULL)
+	// Under precook the ring is allocated ONCE and never freed, and the bundle carries EVERY
+	// pilot field the old CONFIG_NONE FULL reinit set (Q5, STEP-2 bundle==init verified), so
+	// restore collapses to the bundle SWAP: load_configuration_swap()'s copy_from(bundle[stock]
+	// .ofdm) overwrites the thin-grid mangle with the pristine stock pilots/preamble/FIRs/
+	// descrambler. This DELETES the three costs the old body carried:
+	//   - the ring rewind (the duplicate re-delivery — the hand save/restore below),
+	//   - the data-race save/restore site itself, and
+	//   - the CONFIG_NONE full-reinit per-poll thrash (the geomcache-commit root 40032895).
+	// load_configuration()'s no-op early-return would SKIP a same-config call (stock ==
+	// current_configuration here), so route through load_configuration_swap directly — the
+	// GEOMETRY changed (thin grid), not the config id. The swap's publish_active_ring() is the
+	// same single LEAF critical section every switch uses (no nested capture_prep_mutex, §5.2).
+	if(data_container.precook_ring_pinned && !config_bundles.empty())
 	{
-		save_pdd.assign(data_container.passband_delayed_data, data_container.passband_delayed_data + sp_full);
-		save_rtp.assign(data_container.ready_to_process_passband_delayed_data,
-		                data_container.ready_to_process_passband_delayed_data + sp_rtp);
-		ring_saved = true;
+		int idx = bundle_index(stock, narrowband_enabled);
+		if(idx >= 0) { load_configuration_swap(stock, idx); return; }
 	}
 
-	// CONFIG_NONE forces load_configuration's full-reinit branch (all pilot fields set
-	// from defaults), avoiding the early-return when configuration==current.
+	// LEGACY fail-before (MERCURY_PRECOOK_DEFEAT: ring unpinned, no bundles): force the full
+	// reinit past the no-op guard as before. The ring realloc-wipe that the deleted save/restore
+	// guarded against is the DEFEAT-path fail-before; the shipping (pinned) path never lands here.
 	current_configuration = CONFIG_NONE;
 	load_configuration(stock);
-
-	// Restore the RX accumulation buffer + bookkeeping the realloc zeroed. Dimensions
-	// are unchanged (same stock config), so the saved extents fit the reallocated buffers.
-	if(ring_saved)
-	{
-		int sp_full2 = 2 * data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-		int sp_rtp2  =     data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
-		if(sp_full2 == sp_full && sp_rtp2 == sp_rtp
-		   && data_container.passband_delayed_data != NULL
-		   && data_container.ready_to_process_passband_delayed_data != NULL)
-		{
-			memcpy(data_container.passband_delayed_data, save_pdd.data(), (size_t)sp_full * sizeof(double));
-			memcpy(data_container.ready_to_process_passband_delayed_data, save_rtp.data(), (size_t)sp_rtp * sizeof(double));
-			data_container.ring_write_index = save_rwi;
-			data_container.frames_to_read   = save_ftr;
-			data_container.data_ready       = save_dr;
-			data_container.nUnder_processing_events = save_nupe;
-		}
-	}
 }
 
 int cl_telecom_system::bigblock_tx_total_samples()
@@ -12135,6 +12104,35 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 	if(data_container.buffer_Nsymb >= min_nsymb && data_container.buffer_Nsymb_min >= min_nsymb)
 		return;   // already seated
 
+	bool nofdm_preserve_defeat = false;
+	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
+	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
+
+	// PRECOOK STEP 4 (§4 robust-floor SEAT): when the ring is pinned (default) and the desync-
+	// defeat knob is clear, "seat" collapses to a pure scalar RE-STAGE + publish — NO realloc
+	// (the ring is pinned at max ≥ the 1291 robust floor), NO descrambler regen (the config is
+	// UNCHANGED, so the live seed-0 draw the swap installed is still correct), NO 292/310 Nofdm
+	// re-derivation (the desync fix is obsolete — the geometry comes from the authoritative
+	// data_container scalars the swap published, never from a possibly-stale ofdm.gi). The ring
+	// pointer stays byte-identical. set_active_geometry re-stages with the raised buffer_Nsymb_min
+	// floor (staged = max(natural, floor) = the 1291 seat); publish_active_ring flips the C1-visible
+	// atomic + resets the cursor. Both are LEAVES → one leaf critical section, no nested
+	// capture_prep_mutex (§5.2), same publish path as load_configuration_swap.
+	if(data_container.precook_ring_pinned && !nofdm_preserve_defeat)
+	{
+		MUTEX_LOCK(&capture_prep_mutex);
+		data_container.buffer_Nsymb_min = min_nsymb;
+		data_container.set_active_geometry(data_container.nData, data_container.Nc,
+			data_container.M, data_container.Nfft, data_container.Nofdm, data_container.Nsymb,
+			data_container.preamble_nSymb, data_container.interpolation_rate);
+		data_container.publish_active_ring();   // LEAF: publishes floored buffer_Nsymb + cursor reset
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		return;
+	}
+
+	// LEGACY / A-B fail-before: MERCURY_PRECOOK_DEFEAT (unpinned) reallocs the ring here;
+	// MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT reproduces the ofdm.gi-derived Nofdm desync. Holds
+	// capture_prep_mutex across set_size (the legacy Bug #42 wide lock).
 	MUTEX_LOCK(&capture_prep_mutex);
 	data_container.buffer_Nsymb_min = min_nsymb;
 	// SIBLING of the §15 fix (diagnosis a468b2fc): like force_set_capture_ring_natural, this
@@ -12145,9 +12143,6 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 	// buffer_Nsymb so the GROW is unaffected; only the Nofdm geometry is held invariant. Same
 	// inband scope (sole caller inband_seat_robust_ring_floor) + same FAIL-BEFORE knob.
 	int preserved_Nofdm = data_container.Nofdm;
-	bool nofdm_preserve_defeat = false;
-	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
-	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
 	int nofdm_arg = nofdm_preserve_defeat ? (int)(ofdm.Nfft*(1+ofdm.gi)) : preserved_Nofdm;
 	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),
 	// branching on the live modulation. set_size frees + re-allocates all data_container
@@ -12193,6 +12188,30 @@ void cl_telecom_system::force_set_capture_ring_natural()
 {
 	if(current_configuration == CONFIG_NONE) return;
 	if(data_container.Nofdm <= 0) return;
+
+	bool nofdm_preserve_defeat = false;
+	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
+	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
+
+	// PRECOOK STEP 4 (§4 robust-floor UN-SEAT): pinned + defeat-clear → collapse to a scalar
+	// re-stage + publish. Clear the robust floor (buffer_Nsymb_min=0) so set_active_geometry
+	// re-stages the config NATURAL window; publish_active_ring installs it. NO realloc (ring
+	// pinned), NO descrambler regen (config unchanged), NO 292/310 Nofdm re-derivation (the
+	// obsolete desync fix — geometry from the authoritative data_container scalars). Ring
+	// pointer byte-identical; single LEAF critical section (§5.2). This is the fix that let the
+	// robust->OFDM cross re-acquire at the natural window without a realloc/desync.
+	if(data_container.precook_ring_pinned && !nofdm_preserve_defeat)
+	{
+		MUTEX_LOCK(&capture_prep_mutex);
+		data_container.buffer_Nsymb_min = 0;
+		data_container.set_active_geometry(data_container.nData, data_container.Nc,
+			data_container.M, data_container.Nfft, data_container.Nofdm, data_container.Nsymb,
+			data_container.preamble_nSymb, data_container.interpolation_rate);
+		data_container.publish_active_ring();   // LEAF: publishes natural buffer_Nsymb + cursor reset
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		return;
+	}
+
 	MUTEX_LOCK(&capture_prep_mutex);
 	data_container.buffer_Nsymb_min = 0;   // un-seat the raised robust floor
 
@@ -12224,9 +12243,6 @@ void cl_telecom_system::force_set_capture_ring_natural()
 	// recompute `ofdm.Nfft*(1+ofdm.gi)` on the SAME binary, reproducing the 292->310 drift the
 	// directed test (test_inband_adopt_nofdm_invariant) asserts against. Production never sets it.
 	int preserved_Nofdm = data_container.Nofdm;   // installed by the load; the correct geometry
-	bool nofdm_preserve_defeat = false;
-	{ const char* e = std::getenv("MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT");
-	  if(e && *e && atoi(e) != 0) nofdm_preserve_defeat = true; }
 	int nofdm_arg = nofdm_preserve_defeat ? (int)(ofdm.Nfft*(1+ofdm.gi)) : preserved_Nofdm;
 
 	// Re-run set_size with the SAME geometry the load path uses (telecom_system.cc:5190-5200),

@@ -1447,6 +1447,134 @@ int main(int argc, char *argv[])
                 failed += sfail;
             }
 
+            // PRECOOK M3 STEP 4 — COLLAPSE regression (plan §3.3/§4). The three CONFIG_NONE-abuser
+            // paths are now bundle SWAPS / scalar re-stages with NO ring realloc:
+            //   (1) bigblock_restore_stock_config()  — after a CFG16 thin-grid big-block context
+            //       (bigblock_rebuild_thin_grid mangles the LIVE ofdm), restore = swap bundle[stock];
+            //   (2) force_resize_capture_ring()       — robust-floor SEAT = re-stage buffer_Nsymb to
+            //       the ROBUST_0 floor (max(natural, floor)), no realloc, no descrambler regen;
+            //   (3) force_set_capture_ring_natural()  — UN-SEAT = re-stage to the config NATURAL.
+            // Asserts per transition: ring pointer BYTE-IDENTICAL (no realloc, INV-2); decoded==framed
+            // geometry (live ofdm == stock bundle); active buffer_Nsymb == expected; descrambler seed-0
+            // (non-zero, INV-6); OFDM => MFSK template len 0. Under MERCURY_PRECOOK_DEFEAT=1 the ring is
+            // UNPINNED → these paths REALLOC → the fail-before (ring moves). In-process, CARD-FREE.
+            {
+                const char* defeat4 = std::getenv("MERCURY_PRECOOK_DEFEAT");
+                bool defeated4 = (defeat4 && *defeat4 && atoi(defeat4) != 0);
+                int c4fail = 0;
+
+                for(int pass = 0; pass < 2; pass++)   // 0 = WB (Nc=50), 1 = NB (Nc=10)
+                {
+                    int nb = (pass == 1) ? YES : NO;
+                    const char* bwn = (pass == 1) ? "NB" : "WB";
+                    cl_telecom_system ts;
+                    ts.narrowband_enabled = nb;
+                    ts.load_configuration(CONFIG_0);
+                    ts.precook_pin_shared_ring();
+                    if(ts.data_container.precook_ring_pinned)
+                        ts.precook_config_bundles();
+
+                    // Stock high rung: CONFIG_16 (WB) / CONFIG_6 (NB clamp ceiling). big-block is a
+                    // WB-CFG16 construct, so the thin-grid restore leg runs on the WB pass only; the
+                    // seat/un-seat legs run on both.
+                    int stock_cfg = (pass == 1) ? CONFIG_6 : CONFIG_16;
+                    ts.load_configuration(stock_cfg);
+                    int live_stock = ts.current_configuration;
+
+                    double* ring0 = ts.data_container.passband_delayed_data;
+
+                    if(!ts.data_container.precook_ring_pinned)
+                    {
+                        // FAIL-BEFORE (DEFEAT / pin failed): the legacy set_size / CONFIG_NONE reinit
+                        // paths realloc the ring — the exact regression STEP-4 removes.
+                        int moved = 0;
+                        if(pass == 0){
+                            int Ng=0,l2=0,nb2=0; ts.bigblock_rebuild_thin_grid(Ng,l2,nb2);
+                            ts.bigblock_restore_stock_config();
+                            if(ts.data_container.passband_delayed_data != ring0){ moved++; ring0 = ts.data_container.passband_delayed_data; }
+                        }
+                        ts.force_resize_capture_ring((int)ts.data_container.buffer_Nsymb + 500);
+                        if(ts.data_container.passband_delayed_data != ring0){ moved++; ring0 = ts.data_container.passband_delayed_data; }
+                        ts.force_set_capture_ring_natural();
+                        if(ts.data_container.passband_delayed_data != ring0){ moved++; ring0 = ts.data_container.passband_delayed_data; }
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL-BEFORE (%s): ring realloc'd %d× across restore+seat+unseat "
+                               "(legacy path; no M3 collapse)\n",
+                               bwn, defeated4 ? "MERCURY_PRECOOK_DEFEAT=1" : "ring-not-pinned", moved);
+                        c4fail += (moved > 0) ? moved : 1;   // ensure RED under DEFEAT
+                        continue;
+                    }
+
+                    int sidx = ts.bundle_index(live_stock, nb);
+                    if(sidx < 0){ printf("[TEST-PRECOOK-COLLAPSE] %s FAIL: no bundle for stock cfg %d\n", bwn, live_stock); c4fail++; continue; }
+                    const st_config_bundle* sb = ts.config_bundles[sidx].get();
+                    int natural_bn = sb->buffer_Nsymb;
+                    int cap = ts.data_container.pinned_capacity_buffer_Nsymb;
+
+                    // --- (1) BIG-BLOCK RESTORE (WB only): mangle the live ofdm to the thin grid, then
+                    //         restore to the stock bundle via the swap.
+                    if(pass == 0)
+                    {
+                        int Ng=0,l2=0,nb2=0;
+                        (void)ts.bigblock_rebuild_thin_grid(Ng,l2,nb2);
+                        bool mangled = (ts.ofdm.Nsymb != sb->ofdm.Nsymb);   // thin grid Nsymb=Ngrid != stock
+                        ts.bigblock_restore_stock_config();
+                        if(ts.data_container.passband_delayed_data != ring0){
+                            printf("[TEST-PRECOOK-COLLAPSE] %s FAIL big-block-restore: ring moved (%p != %p) — realloc\n",
+                                bwn, (void*)ts.data_container.passband_delayed_data, (void*)ring0); c4fail++; }
+                        if(ts.ofdm.Nc != sb->ofdm.Nc || ts.ofdm.Nsymb != sb->ofdm.Nsymb ||
+                           ts.data_container.M != sb->M || ts.ldpc.rate != sb->ldpc_rate){
+                            printf("[TEST-PRECOOK-COLLAPSE] %s FAIL big-block-restore: geometry live(Nc=%d Nsymb=%d M=%d rate=%.4f) != stock(Nc=%d Nsymb=%d M=%d rate=%.4f) (mangled=%d)\n",
+                                bwn, ts.ofdm.Nc, ts.ofdm.Nsymb, ts.data_container.M, ts.ldpc.rate,
+                                sb->ofdm.Nc, sb->ofdm.Nsymb, sb->M, sb->ldpc_rate, (int)mangled); c4fail++; }
+                        if((int)ts.data_container.buffer_Nsymb != natural_bn){
+                            printf("[TEST-PRECOOK-COLLAPSE] %s FAIL big-block-restore: buffer_Nsymb=%d != natural %d\n",
+                                bwn, (int)ts.data_container.buffer_Nsymb, natural_bn); c4fail++; }
+                        { bool nz=false; int ns=(ts.ldpc.N<64)?ts.ldpc.N:64;
+                          for(int k=0;k<ns;k++) if(ts.data_container.bit_energy_dispersal_sequence[k]!=0){ nz=true; break; }
+                          if(!nz){ printf("[TEST-PRECOOK-COLLAPSE] %s FAIL big-block-restore: descrambler all-zero (INV-6)\n", bwn); c4fail++; } }
+                        if(ts.ofdm.mfsk_corr_template_len != 0){
+                            printf("[TEST-PRECOOK-COLLAPSE] %s FAIL big-block-restore: stale MFSK template len=%d (OFDM)\n",
+                                bwn, ts.ofdm.mfsk_corr_template_len); c4fail++; }
+                    }
+
+                    // --- (2) ROBUST-FLOOR SEAT: seat the ring to the ROBUST_0 floor. Expected active
+                    //         window = max(config natural, robust floor) — for a small OFDM config the
+                    //         floor dominates; if the config natural already exceeds it the seat is an
+                    //         idempotent no-op (already seated). Either way NO realloc.
+                    int ridx = ts.bundle_index(ROBUST_0, nb);
+                    int floor_bn = (ridx >= 0) ? ts.config_bundles[ridx]->buffer_Nsymb : (natural_bn + 500);
+                    int expect_seat = (floor_bn > natural_bn) ? floor_bn : natural_bn;
+                    ts.force_resize_capture_ring(floor_bn);
+                    if(ts.data_container.passband_delayed_data != ring0){
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL seat: ring moved — realloc\n", bwn); c4fail++; }
+                    if((int)ts.data_container.buffer_Nsymb != expect_seat){
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL seat: buffer_Nsymb=%d != expected %d (floor %d, natural %d)\n",
+                            bwn, (int)ts.data_container.buffer_Nsymb, expect_seat, floor_bn, natural_bn); c4fail++; }
+                    if((int)ts.data_container.buffer_Nsymb > cap){
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL seat: buffer_Nsymb=%d > pinned cap %d\n",
+                            bwn, (int)ts.data_container.buffer_Nsymb, cap); c4fail++; }
+                    if(ts.ofdm.Nc != sb->ofdm.Nc || ts.data_container.M != sb->M){
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL seat: geometry drifted (seat must change ONLY the window)\n", bwn); c4fail++; }
+
+                    // --- (3) UN-SEAT: restore the config natural window.
+                    ts.force_set_capture_ring_natural();
+                    if(ts.data_container.passband_delayed_data != ring0){
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL un-seat: ring moved — realloc\n", bwn); c4fail++; }
+                    if((int)ts.data_container.buffer_Nsymb != natural_bn){
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL un-seat: buffer_Nsymb=%d != natural %d\n",
+                            bwn, (int)ts.data_container.buffer_Nsymb, natural_bn); c4fail++; }
+                    if(ts.data_container.buffer_Nsymb_min != 0){
+                        printf("[TEST-PRECOOK-COLLAPSE] %s FAIL un-seat: buffer_Nsymb_min=%d != 0 (floor not cleared)\n",
+                            bwn, ts.data_container.buffer_Nsymb_min); c4fail++; }
+
+                    if(c4fail == 0)
+                        printf("[TEST-PRECOOK-COLLAPSE] %s PASS: %sseat->%d un-seat->%d natural, ring stable @%p (cap=%d) — no realloc\n",
+                            bwn, (pass==0)?"big-block-restore(ring stable, geometry restored), ":"",
+                            expect_seat, natural_bn, (void*)ring0, cap);
+                }
+                failed += c4fail;
+            }
+
             return (failed == 0) ? 0 : 1;
         }
         // --test-chase : run ONLY the chase-combining self-test and exit. Drives the
