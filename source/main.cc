@@ -1302,6 +1302,151 @@ int main(int argc, char *argv[])
                 failed += bfail;
             }
 
+            // PRECOOK M3 STEP 3 — config-SWAP regression (plan §6 / TURNKEY STEP 5). Pins the
+            // shared ring, builds the bundle set, then drives load_configuration across gearshift
+            // cross-modulation (BPSK/QPSK/8PSK/16QAM/32QAM + the 15<->16 boundary), ROBUST<->OFDM
+            // reseed, and session-reset/SWITCH_ROLE (re-load the init config) transitions. Asserts,
+            // after EVERY swap: (a) decoded==framed geometry (live ofdm.Nc/Nsymb + data_container.M
+            // + ldpc.rate == the target bundle) [INV-5]; (b) the ACTIVE buffer_Nsymb is the config
+            // NATURAL (== bundle, <= pinned cap) with a consistent sp=Nofdm*buffer_Nsymb*interp>0 —
+            // the STAGE-1 pin-to-max landmine catcher [INV-4]; (c) passband_delayed_data is the SAME
+            // address across every swap (ring never freed/realloc'd — INV-2); (d) C1 never sees
+            // sp==0/NULL; (e) ROBUST<->OFDM reseed leaves the descrambler as the seed-0 draw (NOT
+            // all-zero, INV-6) and the MFSK corr-template state matching the target (OFDM => len 0;
+            // MFSK => len>0, not stale). A second block repeats for NB (Nc=10) bundles. The leaf-lock
+            // reentrancy tripwire in load_configuration_swap aborts on a nested publish. Under
+            // MERCURY_PRECOOK_DEFEAT=1 the ring stays UNPINNED → the legacy deinit->init path
+            // reallocs the ring on each switch → this test FAILS (the fail-before). In-process, no
+            // IONOS/RF; CARD-FREE. See _research/PRECOOK_IMPLEMENTATION_PLAN.md §3.1/§6.
+            {
+                const char* defeat = std::getenv("MERCURY_PRECOOK_DEFEAT");
+                bool defeated = (defeat && *defeat && atoi(defeat) != 0);
+                int sfail = 0;
+
+                for(int pass = 0; pass < 2; pass++)   // pass 0 = WB (Nc=50), pass 1 = NB (Nc=10)
+                {
+                    int nb = (pass == 1) ? YES : NO;
+                    const char* bwn = (pass == 1) ? "NB" : "WB";
+                    cl_telecom_system ts;
+                    ts.narrowband_enabled = nb;
+                    ts.load_configuration(CONFIG_0);
+                    ts.precook_pin_shared_ring();
+                    if(ts.data_container.precook_ring_pinned)
+                        ts.precook_config_bundles();   // mirror the startup gating (only when pinned)
+
+                    // Cross-modulation + ROBUST<->OFDM reseed + session-reset(re-load CONFIG_0).
+                    // NB clamps OFDM > CONFIG_6 to CONFIG_6, so the NB pass drives only <= CONFIG_6.
+                    int seq_wb[] = { CONFIG_6, CONFIG_7, CONFIG_10, CONFIG_15, CONFIG_16, CONFIG_15,
+                                     CONFIG_16, ROBUST_0, CONFIG_0, ROBUST_2, CONFIG_8, ROBUST_1,
+                                     CONFIG_16, CONFIG_0 };
+                    int seq_nb[] = { CONFIG_3, CONFIG_6, ROBUST_0, CONFIG_0, ROBUST_2, CONFIG_5,
+                                     ROBUST_1, CONFIG_0 };
+                    int* seq = (pass == 1) ? seq_nb : seq_wb;
+                    int nseq = (pass == 1) ? (int)(sizeof(seq_nb)/sizeof(seq_nb[0]))
+                                           : (int)(sizeof(seq_wb)/sizeof(seq_wb[0]));
+
+                    if(!ts.data_container.precook_ring_pinned)
+                    {
+                        // fail-before (DEFEAT / pin failed): the legacy deinit->init path reallocs the
+                        // ring on cross-modulation switches — the exact regression STEP-3 removes.
+                        double* ring0 = ts.data_container.passband_delayed_data;
+                        int moved = 0;
+                        for(int s=0; s<nseq; s++){
+                            ts.load_configuration(seq[s]);
+                            if(ts.data_container.passband_delayed_data != ring0){ moved++; ring0 = ts.data_container.passband_delayed_data; }
+                        }
+                        printf("[TEST-PRECOOK-SWAP] %s FAIL-BEFORE (%s): ring realloc'd %d× across %d switches "
+                               "(legacy path; no M3 swap)\n",
+                               bwn, defeated ? "MERCURY_PRECOOK_DEFEAT=1" : "ring-not-pinned", moved, nseq);
+                        sfail += (moved > 0) ? moved : 1;   // ensure RED under DEFEAT (fail-before)
+                        continue;
+                    }
+
+                    double* ring0 = ts.data_container.passband_delayed_data;
+                    int cap = ts.data_container.pinned_capacity_buffer_Nsymb;
+                    int expect_Nc = (pass == 1) ? 10 : 50;
+                    if(ring0 == NULL){ printf("[TEST-PRECOOK-SWAP] %s FAIL: ring NULL after pin\n", bwn); sfail++; }
+
+                    for(int s=0; s<nseq; s++)
+                    {
+                        int cfg = seq[s];
+                        ts.load_configuration(cfg);
+                        // bundle_index re-applies the NB clamp inside load_configuration, so look up
+                        // the ACTUALLY-loaded config via the live current_configuration.
+                        int live_cfg = ts.current_configuration;
+                        int idx = ts.bundle_index(live_cfg, nb);
+                        if(idx < 0){ printf("[TEST-PRECOOK-SWAP] %s FAIL: cfg %d (live %d) no bundle\n", bwn, cfg, live_cfg); sfail++; continue; }
+                        const st_config_bundle* b = ts.config_bundles[idx].get();
+
+                        // (a) decoded==framed geometry.
+                        if(ts.ofdm.Nc != b->ofdm.Nc || ts.ofdm.Nsymb != b->ofdm.Nsymb ||
+                           ts.data_container.M != b->M || ts.ldpc.rate != b->ldpc_rate)
+                        {
+                            printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: geometry live(Nc=%d Nsymb=%d M=%d rate=%.4f) != bundle(Nc=%d Nsymb=%d M=%d rate=%.4f)\n",
+                                bwn, live_cfg, ts.ofdm.Nc, ts.ofdm.Nsymb, ts.data_container.M, ts.ldpc.rate,
+                                b->ofdm.Nc, b->ofdm.Nsymb, b->M, b->ldpc_rate);
+                            sfail++;
+                        }
+                        if(ts.ofdm.Nc != expect_Nc){ printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: Nc=%d != expected %d\n", bwn, live_cfg, ts.ofdm.Nc, expect_Nc); sfail++; }
+
+                        // (b) active buffer_Nsymb == the config NATURAL (bundle), consistent sp, <= cap.
+                        int bn = ts.data_container.buffer_Nsymb;
+                        int interp = ts.data_container.interpolation_rate;
+                        long sp = (long)ts.data_container.Nofdm * bn * interp;
+                        if(bn != b->buffer_Nsymb){
+                            printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: buffer_Nsymb=%d != natural %d (STAGE-1 pin-to-max?)\n", bwn, live_cfg, bn, b->buffer_Nsymb);
+                            sfail++;
+                        }
+                        if(bn > cap){ printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: buffer_Nsymb=%d > pinned cap %d\n", bwn, live_cfg, bn, cap); sfail++; }
+
+                        // (d) C1: sp > 0, ring non-NULL.
+                        if(sp <= 0 || ts.data_container.passband_delayed_data == NULL){
+                            printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: C1 sp=%ld ring=%p (sp==0/NULL)\n", bwn, live_cfg, sp, (void*)ts.data_container.passband_delayed_data);
+                            sfail++;
+                        }
+
+                        // (c) ring pointer stable across the swap (no realloc — INV-2).
+                        if(ts.data_container.passband_delayed_data != ring0){
+                            printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: ring pointer moved (%p != %p) — realloc\n", bwn, live_cfg, (void*)ts.data_container.passband_delayed_data, (void*)ring0);
+                            sfail++;
+                        }
+
+                        // (e) ROBUST<->OFDM reseed correctness.
+                        bool desc_nonzero = false;
+                        int nscan = (ts.ldpc.N < 64) ? ts.ldpc.N : 64;
+                        for(int k=0; k<nscan; k++) if(ts.data_container.bit_energy_dispersal_sequence[k] != 0){ desc_nonzero = true; break; }
+                        if(!desc_nonzero){ printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: descrambler all-zero (INV-6 stale)\n", bwn, live_cfg); sfail++; }
+                        bool is_mfsk = is_robust_config(live_cfg);
+                        if(is_mfsk && ts.ofdm.mfsk_corr_template_len <= 0){ printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: MFSK but corr_template_len=%d\n", bwn, live_cfg, ts.ofdm.mfsk_corr_template_len); sfail++; }
+                        if(!is_mfsk && ts.ofdm.mfsk_corr_template_len != 0){ printf("[TEST-PRECOOK-SWAP] %s FAIL cfg %d: OFDM but stale MFSK corr_template_len=%d\n", bwn, live_cfg, ts.ofdm.mfsk_corr_template_len); sfail++; }
+                    }
+
+                    // STAGE-1 landmine catcher: after a large-window ROBUST dwell, a small-window
+                    // config keeps its NATURAL window (strictly < cap) — not the pinned max (the S4
+                    // oversize-ring acquisition wall the "pin buffer_Nsymb to max" bug would create).
+                    int small_cfg = (pass == 1) ? CONFIG_6 : CONFIG_16;
+                    ts.load_configuration(ROBUST_0);
+                    ts.load_configuration(small_cfg);
+                    int idxs = ts.bundle_index(ts.current_configuration, nb);
+                    int bns = ts.data_container.buffer_Nsymb;
+                    // The STAGE-1 pin-to-max bug would make bns == cap (!= natural); the strict
+                    // "== natural" check below is the catcher (bns==natural==cap is legitimate for
+                    // the window-defining config, so a bare ">= cap" would false-positive on NB).
+                    if(idxs >= 0 && bns != ts.config_bundles[idxs]->buffer_Nsymb){
+                        printf("[TEST-PRECOOK-SWAP] %s FAIL: cfg %d window=%d != natural %d after ROBUST dwell (S4 pin-to-max wall)\n",
+                            bwn, ts.current_configuration, bns, ts.config_bundles[idxs]->buffer_Nsymb);
+                        sfail++;
+                    }
+                    if(ts.data_container.passband_delayed_data != ring0){ printf("[TEST-PRECOOK-SWAP] %s FAIL: ring moved (final)\n", bwn); sfail++; }
+
+                    if(sfail == 0)
+                        printf("[TEST-PRECOOK-SWAP] %s PASS: %d swaps, ring stable @%p (cap=%d), per-config natural "
+                               "buffer_Nsymb, descrambler+MFSK-template reseeded, Nc=%d (small-cfg %d window=%d)\n",
+                               bwn, nseq, (void*)ring0, cap, expect_Nc, small_cfg, bns);
+                }
+                failed += sfail;
+            }
+
             return (failed == 0) ? 0 : 1;
         }
         // --test-chase : run ONLY the chase-combining self-test and exit. Drives the
@@ -5170,6 +5315,24 @@ start_modem:
 		// lock instead of a ~100-200 ms deinit→init held under capture_prep_mutex — which was
 		// freezing the audio capture thread (demod deaf). No-op under MERCURY_PRECOOK_DEFEAT.
 		telecom_system.precook_pin_shared_ring();
+
+		// PRECOOK STEP 3: build the per-config geometry BUNDLES (one deep-copied cl_ofdm/ldpc/
+		// psk/mfsk + pre_eq + descrambler per FULL_CONFIG_LADDER config) for the active bandwidth,
+		// so every subsequent gearshift/adopt load_configuration is an M3 copy_from swap instead
+		// of a deinit→init rebuild. Only when the ring actually pinned (skipped under
+		// MERCURY_PRECOOK_DEFEAT, and when no config was loadable at pin time) — otherwise the
+		// legacy path stays active and the bundles would never be consulted (load_configuration's
+		// swap fast-path is gated on precook_ring_pinned). Built AFTER the pin's ladder walk (which
+		// leaves config_bundles empty, so those sizing loads correctly take the legacy path) and
+		// BEFORE audioio spawns the capture thread (S0 — no C1 race).
+		if(telecom_system.data_container.precook_ring_pinned)
+		{
+			telecom_system.precook_config_bundles();
+			printf("[PRECOOK] config bundles built for %s: %d slots (gearshift switches are now M3 swaps)\n",
+				(telecom_system.narrowband_enabled == YES) ? "NB" : "WB",
+				(int)telecom_system.config_bundles.size());
+			fflush(stdout);
+		}
 
 		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
 							  &radio_playback, &radio_capture_prep, &telecom_system);

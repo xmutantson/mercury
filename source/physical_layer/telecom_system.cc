@@ -10752,6 +10752,25 @@ void cl_telecom_system::load_configuration(int configuration)
 		configuration = NB_CONFIG_MAX;
 	}
 
+	// PRECOOK STEP 3 — M3 bundle swap fast-path. Taken ONLY when the shared ring is pinned
+	// (precook active; MERCURY_PRECOOK_DEFEAT leaves it unpinned → this is skipped, so DEFEAT
+	// keeps the legacy deinit→init-under-wide-lock path = the fail-before) AND a matching-
+	// bandwidth bundle exists for this (NB-clamped) config. The swap is a copy_from + scalar
+	// publish (no free/realloc, sub-µs leaf lock) — see load_configuration_swap. Out-of-ladder
+	// configs (e.g. CONFIG_17, not in FULL_CONFIG_LADDER → idx<0) and the pre-bundle sizing
+	// loads (config_bundles still empty during precook_pin_shared_ring) fall through to the
+	// legacy body below (which, with the ring pinned, runs init() OUTSIDE the lock + publishes
+	// via the Stage-1 leaf lock — still correct, just not a bundle swap).
+	if(data_container.precook_ring_pinned && !config_bundles.empty())
+	{
+		int _swap_idx = bundle_index(configuration, narrowband_enabled);
+		if(_swap_idx >= 0)
+		{
+			load_configuration_swap(configuration, _swap_idx);
+			return;
+		}
+	}
+
 	printf("[PHY] Loading configuration %d (was %d)\n", configuration, current_configuration);
 	fflush(stdout);
 
@@ -11723,6 +11742,174 @@ void cl_telecom_system::load_configuration(int configuration)
 		MUTEX_UNLOCK(&capture_prep_mutex);
 		in_precook_publish = false;
 	}
+}
+
+// PRECOOK (Stage 2) STEP 3 — the M3 config swap. Installs config_bundles[idx] as the LIVE
+// geometry with NO deinit()->init() rebuild: the ~100-200 ms FFT-plan/LDPC-graph/FIR-design
+// work was paid ONCE at startup (precook_config_bundles); a switch is now a deep-copy of the
+// cached geometry (ARQ-thread-local, OUTSIDE capture_prep_mutex — C1 reads none of it) plus a
+// sub-µs scalar publish under a LEAF lock. See _research/PRECOOK_IMPLEMENTATION_PLAN.md §3.1,
+// §5 (Bug #42 / mutex-asymmetry safety) + _research/_precook/PRECOOK_STAGE2_TURNKEY.md STEP 3.
+//
+// Precondition (caller-enforced in load_configuration): data_container.precook_ring_pinned and
+// idx == bundle_index(configuration, narrowband_enabled) >= 0. `configuration` is already
+// NB-clamped. The no-op / range / NB-clamp guards ran in the caller.
+void cl_telecom_system::load_configuration_swap(int configuration, int idx)
+{
+	const st_config_bundle& b = *config_bundles[idx];
+
+	// ======================================================================================
+	// (A) GEOMETRY + SCALAR INSTALL — ARQ thread, OUTSIDE capture_prep_mutex.
+	//     C1 (audio capture) reads ONLY the ring pointer + the ring scalars (Nofdm /
+	//     buffer_Nsymb / interp / ring_write_index / frames_to_read / data_ready). Nofdm and
+	//     interp are geometry-invariant (same value written); buffer_Nsymb is only STAGED here
+	//     (set_active_geometry writes staged_buffer_Nsymb, NOT the atomic) and PUBLISHED under
+	//     the lock in (B). Everything else below (ofdm/ldpc/psk/mfsk/pre_eq/descrambler, Nc/M/
+	//     Nsymb/nData/... , the telecom scalars) is read only by the ARQ thread — the same
+	//     thread running this — so it needs no lock (§5.1). copy_from deep-copies into the
+	//     embedded live objects; the const bundle is untouched (reusable N-cache).
+	// ======================================================================================
+	ofdm.copy_from(b.ofdm);      // pilots, preamble, 4 FIRs, FFT tables, mfsk corr template + mirror
+	ldpc.copy_from(b.ldpc);      // rate, N/K, QC-matrix pointers, decode workspace, nIteration_max
+	psk.copy_from(b.psk);        // constellation (OFDM); harmless default for MFSK slots
+	mfsk.copy_from(b.mfsk);      // trivial memberwise (no owning pointers)
+
+	// pre_equalization_channel (LANDMINE-3: CACHED, never regenerated). OFDM only; NULL in the
+	// bundle for MFSK configs → leave the live array untouched (MFSK never reads it: the TX/RX
+	// pre-eq multiply is gated on M!=MOD_MFSK, telecom_system.cc:8719/8792). Nc is bandwidth-
+	// invariant (WB=50 / NB=10), so once allocated the live array always matches b.Nc; alloc on
+	// the first OFDM swap of a session that started MFSK (live ptr still NULL). Alloc is OUTSIDE
+	// the lock and one-time (not the C1-critical section).
+	if(b.pre_equalization_channel != NULL && b.Nc > 0)
+	{
+		if(pre_equalization_channel == NULL)
+			pre_equalization_channel = CNEW(struct st_channel_complex, b.Nc, "ts.pre_eq_channel");
+		memcpy(pre_equalization_channel, b.pre_equalization_channel,
+		       sizeof(struct st_channel_complex) * (size_t)b.Nc);
+	}
+
+	// bit_energy_dispersal_sequence (INV-6 descrambler draw). The live N_MAX array is allocated
+	// once by alloc_shared_buffers and never freed; restore the seed-derived draw so the RX does
+	// not descramble against all-zeros (constant CRC fail). Bundle carries the post-regen array.
+	if(b.bit_energy_dispersal_sequence != NULL && data_container.bit_energy_dispersal_sequence != NULL)
+		memcpy(data_container.bit_energy_dispersal_sequence, b.bit_energy_dispersal_sequence,
+		       sizeof(int) * (size_t)N_MAX);
+
+	// telecom_system per-config scalars (bundle-captured from the init() build; STEP-2 gate
+	// proved these == a fresh init()). M (the MOD_* branch selector) is NOT a PHY-object member,
+	// so it MUST be published here or transmit/receive would branch on the stale modulation.
+	M                        = b.M_telecom;
+	ldpc.rate                = b.ldpc_rate;            // (ldpc.copy_from already set it; explicit for clarity)
+	bandwidth                = b.bandwidth;
+	carrier_frequency        = b.carrier_frequency;
+	frequency_interpolation_rate = b.interpolation_rate;
+	time_sync_trials_max     = b.time_sync_trials_max; // 5 for MFSK, else default
+	outer_code               = b.outer_code;
+	outer_code_reserved_bits = b.outer_code_reserved_bits;
+	bit_energy_dispersal_seed = b.bit_energy_dispersal_seed;
+	LDPC_real_CR             = b.LDPC_real_CR;
+	Tu                       = b.Tu;
+	Ts                       = b.Ts;
+	Tf                       = b.Tf;
+	rb                       = b.rb;
+	rbc                      = b.rbc;
+	Shannon_limit            = b.Shannon_limit;
+
+	// data_container geometry scalars — STAGE them (set_active_geometry writes Nc/M/Nsymb/nData/
+	// nBits/preamble_nSymb/Nofdm/Nfft/Ngi/interp/total_frame_size/fine_slice_size and computes
+	// staged_buffer_Nsymb from the SAME per-config formula the bundle build used → the active
+	// buffer_Nsymb published in (B) is the config NATURAL, NEVER the pinned max (§2.2 landmine)).
+	// It does NOT publish the C1-visible atomic buffer_Nsymb (that is (B), under the lock).
+	data_container.set_active_geometry(b.nData, b.Nc, b.M, b.Nfft, b.Nofdm, b.Nsymb,
+	                                   b.preamble_nSymb, b.interpolation_rate);
+
+	// current/last configuration bookkeeping (mirror of the legacy body at :10942-10957).
+	if(current_configuration == CONFIG_NONE)
+		last_configuration = configuration;
+	else
+		last_configuration = current_configuration;
+	current_configuration = configuration;
+	active_bundle_idx = idx;
+
+	// ---- telecom-level derived tail (reproduces load_configuration :11543-11696 verbatim; these
+	//      read the just-installed data_container/mfsk state, NOT init() internals) ----
+	bit_interleaver_block_size      = data_container.nBits / 10;
+	time_freq_interleaver_block_size = data_container.nData / 10;
+	if(default_configurations_telecom_system.ofdm_time_sync_Nsymb == AUTO_SELLECT)
+		ofdm.time_sync_Nsymb = ofdm.Nsymb;   // idempotent (ofdm.copy_from already carried it)
+
+	// Invalidate cached sync/decode state from the previous config (frame timing differs).
+	receive_stats.delay_of_last_decoded_message = -1;
+	receive_stats.freq_offset_of_last_decoded_message = 0;
+	consecutive_ofdm_decode_fails = 0;
+	chase_reset();                       // INV-CHASE-2: a buffered LLR vector is over the OLD code
+	receive_stats.mfsk_search_raw = 0;
+	receive_stats.ofdm_search_raw = 0;
+	receive_stats.ofdm_batch_active = false;
+	receive_stats.ofdm_drift_per_frame = 0.0;
+
+	// MFSK short-control-frame parameters (mirror :11613-11641).
+	if(M == MOD_MFSK)
+	{
+		int bps = mfsk.bits_per_symbol();
+		if(current_configuration == ROBUST_0)      { ctrl_nBits = 1200; ctrl_nsymb = (bps>0)?ctrl_nBits/bps:0; }
+		else if(current_configuration == ROBUST_1) { ctrl_nBits = 1400; ctrl_nsymb = (bps>0)?ctrl_nBits/bps:0; }
+		else                                       { ctrl_nBits = 0;    ctrl_nsymb = 0; }
+		mfsk_ctrl_mode = false;
+	}
+	else
+	{
+		ctrl_nBits = 0;
+		ctrl_nsymb = 0;
+		mfsk_ctrl_mode = false;
+	}
+
+	// Universal ACK pattern (config-independent ack_mfsk; mirror :11646-11696).
+	{
+		int ack_M = narrowband_enabled ? 8 : 16;   // M=8 fits Nc=10, M=16 fits Nc=50
+		ack_mfsk.init(ack_M, data_container.Nc, 1);
+		if(narrowband_enabled)
+			ack_mfsk.tone_hop_step = 0;             // NB Sidelnikov: no hopping
+	}
+	ack_pattern_passband_samples      = ack_mfsk.ack_pattern_nsymb        * data_container.Nofdm * frequency_interpolation_rate;
+	ack_snr_pattern_passband_samples  = ack_mfsk.ack_snr_pattern_nsymb()  * data_container.Nofdm * frequency_interpolation_rate;
+	ack_sack_pattern_passband_samples = ack_mfsk.ack_sack_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
+	connect_pattern_passband_samples  = ack_mfsk.connect_pattern_nsymb    * data_container.Nofdm * frequency_interpolation_rate;
+	ctrl_suffix_pattern_passband_samples =
+		(ack_mfsk.connect_base_total_nsymb() + ack_mfsk.ctrl_suffix_len()) * data_container.Nofdm * frequency_interpolation_rate;
+
+	if(current_configuration == ROBUST_0)               ack_pattern_detection_threshold = 0.65;
+	else if(is_robust_config(current_configuration))    ack_pattern_detection_threshold = 1.0;
+	else                                                ack_pattern_detection_threshold = 1.0;
+
+	// ======================================================================================
+	// (B) SCALAR PUBLISH — the ONLY critical section. publish_active_ring() is a pure LEAF
+	//     (scalar stores + one bounded memset of the never-freed ring; NO call-out that could
+	//     re-take the mutex → INV-8 non-recursive-Linux self-deadlock is structurally
+	//     impossible). It flips the C1-visible atomic buffer_Nsymb together with ring_write_
+	//     index=0 / data_ready=0 / frames_to_read under the lock, so a racing C1 sees either
+	//     the fully-old or fully-new geometry (Bug #42 INV-1) — and the ring was NEVER freed,
+	//     so the Bug #42 UAF (INV-2) is structurally gone regardless of lock width.
+	// ======================================================================================
+	static thread_local bool in_precook_swap_publish = false;
+	if(in_precook_swap_publish)
+	{
+		fprintf(stderr, "[PRECOOK] FATAL: reentrant load_configuration_swap publish on one thread "
+			"(capture_prep_mutex would self-deadlock)\n");
+		fflush(stderr);
+		abort();
+	}
+	in_precook_swap_publish = true;
+	MUTEX_LOCK(&capture_prep_mutex);
+	data_container.publish_active_ring();   // LEAF: no call-out
+	MUTEX_UNLOCK(&capture_prep_mutex);
+	in_precook_swap_publish = false;
+
+	printf("[PRECOOK-SWAP] cfg %d (idx %d): M=%.0f rate=%.3f Nc=%d Nsymb=%d nBits=%d "
+		"buffer_Nsymb=%d (natural) ring stable\n",
+		configuration, idx, M, ldpc.rate, data_container.Nc, data_container.Nsymb,
+		data_container.nBits, (int)data_container.buffer_Nsymb);
+	fflush(stdout);
 }
 
 // PRECOOK (Stage 1): size + allocate the ONE persistent shared capture ring and pin it. Called

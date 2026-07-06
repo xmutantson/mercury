@@ -985,6 +985,19 @@ public:
 	// else -1 (config not on the ladder, bundles not built, or bandwidth mismatch).
 	int  bundle_index(int configuration, int narrowband) const;
 
+	// ---- PRECOOK (Stage 2) STEP 3: the M3 config swap ----
+	// Installs config_bundles[idx] as the live geometry WITHOUT a deinit()->init()
+	// rebuild: copy_from the 4 PHY objects + pre_eq + descrambler + the telecom/
+	// data_container scalar block (all OUTSIDE capture_prep_mutex — C1 reads none of
+	// it), reproduce the telecom-level derived tail (interleaver block sizes, MFSK
+	// ctrl-frame params, ack_mfsk + ack-pattern sample counts, receive_stats reset),
+	// then publish the C1-visible ring geometry under a sub-µs LEAF lock
+	// (publish_active_ring). `configuration` is the (already NB-clamped) target;
+	// `idx` == bundle_index(configuration, narrowband_enabled) (caller-verified >=0).
+	// The ONLY caller is load_configuration(int)'s STEP-3 fast-path. See
+	// _research/PRECOOK_IMPLEMENTATION_PLAN.md §3.1 + PRECOOK_STAGE2_TURNKEY.md STEP 3.
+	void load_configuration_swap(int configuration, int idx);
+
 	// Grow the capture ring to >= min_nsymb symbols WITHOUT a config change (a same-config
 	// re-load is skipped). Re-runs data_container.set_size with the current geometry + the
 	// raised buffer_Nsymb_min. Used to seat the in-band down-ladder robust ring floor
