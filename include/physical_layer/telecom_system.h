@@ -44,6 +44,7 @@ class cl_ldpc_decode_pool;
 #include "common/os_interop.h"
 #include <iomanip>
 #include <vector>
+#include <memory>
 
 
 #if defined(_WIN32)
@@ -117,6 +118,70 @@ struct st_receive_stats{
 	double ofdm_drift_per_frame = 0.0;  // IIR-filtered prediction error (interp samples) for BATCH verify
 	double mean_H = -1.0;  // mean(|estimated_channel|) over MEASURED subcarriers for the last OFDM trial; -1 if not computed (default matches the per-receive reset at telecom_system.cc:1052). Test-observability for the SKIP-H gate (write-once per receive, read by unit tests only). See fact-documents/ofdm-fine-timing-magnitude.md §3.5.
 	int last_eff_preamble_nsymb = 0;  // LEVER P: actual preamble-symbol count of the most recently extracted OFDM frame (FULL anchor vs MINI tail). Read by the ARQ position-advance (rx_frame = last_eff_preamble_nsymb + Nsymb). Defaults to preamble_nSymb when amortization is off.
+};
+
+
+// PRECOOK (Stage 2): a fully-built per-config geometry BUNDLE. Holds the expensive
+// init() outputs for ONE FULL_CONFIG_LADDER config so a config switch becomes a
+// copy_from swap (M3) instead of a deinit→init rebuild. The build path (STEP 2,
+// cl_telecom_system::precook_config_bundles) reuses the proven init_monitor_decoders
+// pattern: build a scratch cl_telecom_system per config, init()/load_configuration,
+// then copy_from its geometry into the slot.
+//
+// NON-copyable / NON-movable: it embeds cl_ofdm / cl_ldpc / cl_psk by value, all of
+// which =delete their copy-ctor/assign AND declare no move-ctor, so the whole struct
+// is neither copyable nor movable. It is therefore ONLY ever heap-owned via
+// std::unique_ptr (see cl_telecom_system::config_bundles) — a plain value vector
+// would fail to compile (resize/push_back need a move). See
+// _research/PRECOOK_IMPLEMENTATION_PLAN.md §1.1 and
+// _research/_precook/BUNDLE_FIELD_CHECKLIST.md PART 4/5/6.
+struct st_config_bundle
+{
+	int  configuration = CONFIG_NONE;  // which ladder entry this slot holds
+	bool narrowband    = false;        // NB (Nc=10) vs WB (Nc=50) variant
+
+	// ---- Fully-built per-config geometry (the expensive init() outputs) ----
+	cl_ofdm ofdm;   // pilot layout, preamble, FFT twiddles, 4 FIR designs, mfsk_* mirror + corr template
+	cl_ldpc ldpc;   // parity/generator matrix pointers + decode workspace for this rate
+	cl_psk  psk;    // constellation (OFDM configs)
+	cl_mfsk mfsk;   // alphabet/streams + tone tables (ROBUST configs)
+
+	// ---- Cached per-config arrays (deep-copied here; freed by the dtor) ----
+	// pre_equalization_channel: get_pre_equalization_channel() runs a 1000-draw
+	// NO-RESEED RNG loop (LANDMINE-3) — it MUST be CACHED, never regenerated on a
+	// swap. Sized data_container.Nc; NULL for MFSK configs.
+	struct st_channel_complex* pre_equalization_channel = nullptr;
+	// bit_energy_dispersal_sequence: the seed-derived descrambler draw (INV-6),
+	// N_MAX ints (set_size zeroes the live array, so the swap must restore this).
+	int*  bit_energy_dispersal_sequence = nullptr;
+
+	// ---- data_container geometry SCALARS (C1/C2/acquisition read; the swap
+	// publishes these under capture_prep_mutex in STEP 3) ----
+	int Nofdm = 0, Nc = 0, M = 0, Nfft = 0, Ngi = 0, Nsymb = 0, nData = 0, nBits = 0,
+	    preamble_nSymb = 0, interpolation_rate = 0, total_frame_size = 0,
+	    baseband_data_fine_slice_size = 0;
+	int   buffer_Nsymb = 0;   // the config's NATURAL window (INV-4; always <= the pinned max)
+
+	// ---- telecom_system-level per-config SCALARS ----
+	float  ldpc_rate = 0.0f;
+	double bandwidth = 0.0, carrier_frequency = 0.0;
+	int    bit_energy_dispersal_seed = 0;
+	double M_telecom = 0.0;                          // cl_telecom_system::M (modulation order, double)
+	int    time_sync_trials_max = 0;
+	int    outer_code = 0, outer_code_reserved_bits = 0;
+	// calculate_parameters()-derived per-config scalars (telecom_system.cc:3775-3802).
+	double LDPC_real_CR = 0.0, Tu = 0.0, Ts = 0.0, Tf = 0.0, rb = 0.0, rbc = 0.0, Shannon_limit = 0.0;
+
+	st_config_bundle() {}
+	~st_config_bundle()
+	{
+		if(pre_equalization_channel != nullptr)      { delete[] pre_equalization_channel;      pre_equalization_channel = nullptr; }
+		if(bit_energy_dispersal_sequence != nullptr) { delete[] bit_energy_dispersal_sequence; bit_energy_dispersal_sequence = nullptr; }
+	}
+	// Explicitly non-copyable / non-movable (the embedded geometry classes already
+	// forbid it; stated here so any accidental value-copy is a clear diagnostic).
+	st_config_bundle(const st_config_bundle&) = delete;
+	st_config_bundle& operator=(const st_config_bundle&) = delete;
 };
 
 
@@ -896,6 +961,30 @@ public:
 	// (main.cc, between ARQ.init and audioio_init_internal). No-op if MERCURY_PRECOOK_DEFEAT is
 	// set (leaves the legacy deinit→init-under-lock path = the fail-before). Idempotent.
 	void precook_pin_shared_ring();
+
+	// ---- PRECOOK (Stage 2): pre-built per-config geometry bundles ----
+	// config_bundles is indexed by FULL_CONFIG_LADDER order (20 slots: ROBUST_0/1/2
+	// + CONFIG_0..16) for the ACTIVE bandwidth. Each slot heap-owns a fully-built
+	// st_config_bundle (unique_ptr because st_config_bundle is non-copyable/
+	// non-movable — see its declaration). active_bundle_idx tracks the last swapped
+	// slot (-1 = none). STEP 2 only BUILDS + gates these; the load_configuration swap
+	// that consumes them is STEP 3 (production path stays byte-identical here).
+	std::vector<std::unique_ptr<st_config_bundle>> config_bundles;
+	int active_bundle_idx = -1;
+	// Build the bundle set for the current narrowband_enabled bandwidth. Reuses the
+	// init_monitor_decoders pattern (arq_common.cc:1849): for each ladder config,
+	// construct a fresh scratch cl_telecom_system, load_configuration(cfg) (runs the
+	// full init()), then copy_from its ofdm/ldpc/psk/mfsk + cache pre_equalization_
+	// channel (deep copy — NEVER regenerate, LANDMINE-3) + bit_energy_dispersal_
+	// sequence + the scalar block into config_bundles[ladder_index]. The scratch (and
+	// its ring) is discarded per config. Idempotent (rebuilds the set). Does NOT wire
+	// into the switch (STEP 3). See _research/PRECOOK_IMPLEMENTATION_PLAN.md §1.2.
+	void precook_config_bundles();
+	// Index into config_bundles for (configuration, narrowband). Returns the
+	// FULL_CONFIG_LADDER index if a matching-bandwidth bundle is built at that slot,
+	// else -1 (config not on the ladder, bundles not built, or bandwidth mismatch).
+	int  bundle_index(int configuration, int narrowband) const;
+
 	// Grow the capture ring to >= min_nsymb symbols WITHOUT a config change (a same-config
 	// re-load is skipped). Re-runs data_container.set_size with the current geometry + the
 	// raised buffer_Nsymb_min. Used to seat the in-band down-ladder robust ring floor

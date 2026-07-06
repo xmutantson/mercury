@@ -22,6 +22,7 @@
 
 #include "physical_layer/ldpc.h"
 #include "debug/canary_guard.h"
+#include <cstring>  // memset: zero decode workspace at alloc (PRECOOK memcmp determinism)
 
 cl_ldpc::cl_ldpc()
 {
@@ -269,6 +270,16 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
   			}
   			// Pre-allocate V_pos workspace for SPA decoder (eliminates per-frame heap churn)
   			V_pos=CNEW(int, P*Cwidth, "ldpc.V_pos");
+  			// PRECOOK determinism: R/Q/V_pos are decode SCRATCH — their content is reset at the
+  			// start of every decode (SPA message accumulators / node-position workspace), so `new[]`
+  			// leaves indeterminate heap junk that the modem never reads. That junk made a raw memcmp
+  			// of two INDEPENDENTLY-built ldpc objects diverge, breaking the precook bundle==init
+  			// byte-identical gate (copy_from faithfully propagated the scratch's junk, but the
+  			// reference build had its own). Zeroing here makes the workspace deterministic; decode
+  			// output is unchanged (the first decode step overwrites these before reading them).
+  			memset(R, 0, sizeof(double) * (size_t)N * (size_t)Vwidth);
+  			memset(Q, 0, sizeof(double) * (size_t)N * (size_t)Vwidth);
+  			if(V_pos!=NULL) memset(V_pos, 0, sizeof(int) * (size_t)P * (size_t)Cwidth);
   		}
   		// Step 15: MERCURY_SACK / MERCURY_SACK_LONG branches removed alongside
   		// the legacy MFSK SACK bitmap path (mercury_sack_*_16.cc tables deleted).

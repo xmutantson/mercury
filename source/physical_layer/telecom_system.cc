@@ -5783,6 +5783,10 @@ void cl_telecom_system::init()
 	if(reinit_subsystems.pre_equalization_channel==YES && M != MOD_MFSK)
 	{
 		pre_equalization_channel=CNEW(struct st_channel_complex, data_container.Nc, "ts.pre_eq_channel");
+		// PRECOOK determinism: zero the st_channel_complex trailing padding (see cl_ofdm::init
+		// note) so the cached bundle copy is byte-identical to an independent init() build under
+		// memcmp. get_pre_equalization_channel writes only .value; on-wire byte-identical.
+		memset(pre_equalization_channel, 0, sizeof(struct st_channel_complex) * (size_t)data_container.Nc);
 		get_pre_equalization_channel();
 		reinit_subsystems.pre_equalization_channel=NO;
 	}
@@ -11789,6 +11793,122 @@ void cl_telecom_system::precook_pin_shared_ring()
 	fflush(stdout);
 }
 
+// PRECOOK (Stage 2): index into config_bundles for (configuration, narrowband). The
+// bundle set is built for exactly ONE bandwidth at a time (the active narrowband_enabled),
+// stored in FULL_CONFIG_LADDER order. Returns the ladder index iff a bundle exists at that
+// slot AND its narrowband flag matches the request; -1 otherwise.
+int cl_telecom_system::bundle_index(int configuration, int narrowband) const
+{
+	int idx = config_ladder_index(configuration);
+	if(idx < 0 || idx >= (int)config_bundles.size()) return -1;
+	if(config_bundles[idx] == nullptr) return -1;
+	if(config_bundles[idx]->narrowband != (narrowband != NO)) return -1;
+	return idx;
+}
+
+// PRECOOK (Stage 2): build the pre-cooked geometry bundle set for the CURRENT bandwidth.
+// This is the existence-proof monitor pattern (init_monitor_decoders, arq_common.cc:1849)
+// applied to precooking: for each FULL_CONFIG_LADDER config we stand up a fresh scratch
+// cl_telecom_system, run the full production init() via load_configuration(cfg), then
+// copy_from its built geometry (M3) + cache the per-config arrays/scalars into the slot.
+// The scratch (including its capture ring) is discarded after each config, so peak memory
+// is one scratch + the accumulating (geometry-only) bundles.
+//
+// ★ A FRESH scratch PER CONFIG (not a reused instance walking the ladder) is deliberate:
+// it mirrors how a single-config reference build reaches each config, so the byte-identical
+// gate holds. Per-config determinism is guaranteed because pilot/preamble generation
+// reseeds the RNG to a fixed per-config seed (ofdm.cc:1193 __srandom(seed)) before
+// get_pre_equalization_channel draws, and the descrambler reseeds to bit_energy_dispersal_
+// seed — so the cached pre_eq/descrambler are a deterministic function of the config alone
+// (the same property that lets TX and RX load configs in any order and still agree).
+//
+// STEP 2 only BUILDS + gates the bundles; the load_configuration swap that consumes them is
+// STEP 3. Production stays byte-identical (nothing reads config_bundles yet).
+void cl_telecom_system::precook_config_bundles()
+{
+	bool nb = (narrowband_enabled != NO);
+
+	config_bundles.clear();
+	config_bundles.resize(FULL_CONFIG_LADDER_SIZE);
+
+	for(int li=0; li<FULL_CONFIG_LADDER_SIZE; li++)
+	{
+		int cfg = FULL_CONFIG_LADDER[li];
+
+		// Fresh scratch: full production init() via load_configuration. Heap-allocated so
+		// its large data_container ring is freed promptly (delete) before the next config.
+		cl_telecom_system* scratch = new cl_telecom_system();
+		scratch->narrowband_enabled = narrowband_enabled;
+		scratch->load_configuration(cfg);
+
+		std::unique_ptr<st_config_bundle> b(new st_config_bundle());
+		b->configuration = cfg;
+		b->narrowband    = nb;
+
+		// ---- geometry PHY objects (M3 deep-copy; STEP-1 copy_from) ----
+		b->ofdm.copy_from(scratch->ofdm);
+		b->ldpc.copy_from(scratch->ldpc);
+		b->psk.copy_from(scratch->psk);
+		b->mfsk.copy_from(scratch->mfsk);   // trivial memberwise (no owning pointers)
+
+		// ---- pre_equalization_channel[Nc] (LANDMINE-3: CACHE, never regenerate). NULL for
+		//      MFSK configs (M==MOD_MFSK leaves it unbuilt). ----
+		int Nc = scratch->data_container.Nc;
+		if(scratch->pre_equalization_channel != NULL && Nc > 0)
+		{
+			b->pre_equalization_channel = new st_channel_complex[Nc];
+			memcpy(b->pre_equalization_channel, scratch->pre_equalization_channel,
+			       sizeof(st_channel_complex) * (size_t)Nc);
+		}
+
+		// ---- bit_energy_dispersal_sequence[N_MAX] (INV-6 descrambler draw) ----
+		if(scratch->data_container.bit_energy_dispersal_sequence != NULL)
+		{
+			b->bit_energy_dispersal_sequence = new int[N_MAX];
+			memcpy(b->bit_energy_dispersal_sequence, scratch->data_container.bit_energy_dispersal_sequence,
+			       sizeof(int) * (size_t)N_MAX);
+		}
+
+		// ---- data_container geometry scalar block ----
+		b->Nofdm                         = scratch->data_container.Nofdm;
+		b->Nc                            = scratch->data_container.Nc;
+		b->M                             = scratch->data_container.M;
+		b->Nfft                          = scratch->data_container.Nfft;
+		b->Ngi                           = scratch->data_container.Ngi;
+		b->Nsymb                         = scratch->data_container.Nsymb;
+		b->nData                         = scratch->data_container.nData;
+		b->nBits                         = scratch->data_container.nBits;
+		b->preamble_nSymb                = scratch->data_container.preamble_nSymb;
+		b->interpolation_rate            = scratch->data_container.interpolation_rate;
+		b->total_frame_size              = scratch->data_container.total_frame_size;
+		b->baseband_data_fine_slice_size = scratch->data_container.baseband_data_fine_slice_size;
+		b->buffer_Nsymb                  = scratch->data_container.buffer_Nsymb.load();  // per-config NATURAL
+
+		// ---- telecom_system scalar block ----
+		b->ldpc_rate                 = scratch->ldpc.rate;
+		b->bandwidth                 = scratch->bandwidth;
+		b->carrier_frequency         = scratch->carrier_frequency;
+		b->bit_energy_dispersal_seed = scratch->bit_energy_dispersal_seed;
+		b->M_telecom                 = scratch->M;
+		b->time_sync_trials_max      = scratch->time_sync_trials_max;
+		b->outer_code                = scratch->outer_code;
+		b->outer_code_reserved_bits  = scratch->outer_code_reserved_bits;
+		// calculate_parameters()-derived.
+		b->LDPC_real_CR              = scratch->LDPC_real_CR;
+		b->Tu                        = scratch->Tu;
+		b->Ts                        = scratch->Ts;
+		b->Tf                        = scratch->Tf;
+		b->rb                        = scratch->rb;
+		b->rbc                       = scratch->rbc;
+		b->Shannon_limit             = scratch->Shannon_limit;
+
+		config_bundles[li] = std::move(b);
+		delete scratch;
+	}
+
+	active_bundle_idx = -1;
+}
+
 // Grow the capture ring (passband_delayed_data etc.) to hold at least `min_nsymb` symbols
 // WITHOUT a config change. Both load_configuration paths SKIP a same-config re-apply
 // (telecom_system.cc:10052 / arq_common.cc:1998), so the in-band down-ladder's robust ring
@@ -11811,6 +11931,13 @@ void cl_telecom_system::regenerate_bit_energy_dispersal_sequence()
 	bit_energy_dispersal_seed = default_configurations_telecom_system.bit_energy_dispersal_seed;
 	for(int i=0;i<ldpc.N;i++)
 		data_container.bit_energy_dispersal_sequence[i]=ts_random()%2;
+	// PRECOOK determinism: the descrambler is applied only to the first ldpc.N coded bits; the
+	// tail [ldpc.N, N_MAX) of this array is never read. set_size allocates it via new int[N_MAX]
+	// WITHOUT zeroing, so that tail is indeterminate — which made a full-N_MAX memcmp of two
+	// independent builds diverge (the precook bundle==init gate). Zero the unused tail so the
+	// whole array is deterministic; no functional change (the tail is never descrambled).
+	for(int i=ldpc.N;i<N_MAX;i++)
+		data_container.bit_energy_dispersal_sequence[i]=0;
 }
 
 void cl_telecom_system::force_resize_capture_ring(int min_nsymb)

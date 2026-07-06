@@ -1192,6 +1192,116 @@ int main(int argc, char *argv[])
                 failed += cffail;
             }
 
+            // PRECOOK M3 STEP 2 — config-geometry BUNDLE completeness gate
+            // (BUNDLE_FIELD_CHECKLIST PART 6, the single GATE that proves completeness).
+            // Build the WB bundle set via precook_config_bundles(); then for EVERY ladder
+            // config build a FRESH reference cl_telecom_system (load_configuration runs the
+            // full init()) and assert bundle[cfg] is byte-IDENTICAL to it: ofdm/ldpc/psk via
+            // precook_deep_equal (every owning buffer memcmp), pre_equalization_channel memcmp
+            // (Nc; NULL for MFSK), bit_energy_dispersal_sequence memcmp (N_MAX), and the full
+            // scalar block ==. A FAIL localizes the missed bundle field to a single
+            // buffer/scalar. In-process, no IONOS/RF; CARD-FREE. See
+            // _research/PRECOOK_IMPLEMENTATION_PLAN.md §1.1/§1.2. STEP 2 does NOT wire the swap
+            // into load_configuration (STEP 3) → cfg<=15 production path is unaffected.
+            {
+                cl_telecom_system bts;
+                bts.narrowband_enabled = NO;
+                bts.precook_config_bundles();
+
+                int bpass = 0, bfail = 0;
+                for (int li = 0; li < FULL_CONFIG_LADDER_SIZE; li++) {
+                    int cfg = FULL_CONFIG_LADDER[li];
+                    int idx = bts.bundle_index(cfg, NO);
+                    if (idx < 0) {
+                        bfail++;
+                        printf("[TEST-PRECOOK-BUNDLE] FAIL cfg %d: bundle_index returned -1 (not built)\n", cfg);
+                        continue;
+                    }
+                    const st_config_bundle* b = bts.config_bundles[idx].get();
+
+                    cl_telecom_system ref;
+                    ref.narrowband_enabled = NO;
+                    ref.load_configuration(cfg);
+
+                    const char* mism = NULL;
+
+                    // (1) geometry PHY objects — every owning buffer.
+                    if (mism == NULL) mism = b->ofdm.precook_deep_equal(ref.ofdm);
+                    if (mism == NULL) mism = b->ldpc.precook_deep_equal(ref.ldpc);
+                    if (mism == NULL) mism = b->psk.precook_deep_equal(ref.psk);
+
+                    // (2) pre_equalization_channel (Nc; both NULL for MFSK).
+                    if (mism == NULL) {
+                        int rNc = ref.data_container.Nc;
+                        bool bnull = (b->pre_equalization_channel == NULL);
+                        bool rnull = (ref.pre_equalization_channel == NULL);
+                        if (bnull != rnull) mism = "pre_equalization_channel(null-mismatch)";
+                        else if (!bnull && rNc > 0 &&
+                                 memcmp(b->pre_equalization_channel, ref.pre_equalization_channel,
+                                        sizeof(struct st_channel_complex) * (size_t)rNc) != 0)
+                            mism = "pre_equalization_channel";
+                    }
+
+                    // (3) bit_energy_dispersal_sequence (N_MAX descrambler draw).
+                    if (mism == NULL) {
+                        bool bnull = (b->bit_energy_dispersal_sequence == NULL);
+                        bool rnull = (ref.data_container.bit_energy_dispersal_sequence == NULL);
+                        if (bnull != rnull) mism = "bit_energy_dispersal_sequence(null-mismatch)";
+                        else if (!bnull &&
+                                 memcmp(b->bit_energy_dispersal_sequence, ref.data_container.bit_energy_dispersal_sequence,
+                                        sizeof(int) * (size_t)N_MAX) != 0)
+                            mism = "bit_energy_dispersal_sequence";
+                    }
+
+                    // (4) scalar block — data_container geometry scalars.
+                    if (mism == NULL) {
+                        if      (b->Nofdm                         != ref.data_container.Nofdm)                         mism = "scalar.Nofdm";
+                        else if (b->Nc                            != ref.data_container.Nc)                            mism = "scalar.Nc";
+                        else if (b->M                             != ref.data_container.M)                             mism = "scalar.M";
+                        else if (b->Nfft                          != ref.data_container.Nfft)                          mism = "scalar.Nfft";
+                        else if (b->Ngi                           != ref.data_container.Ngi)                           mism = "scalar.Ngi";
+                        else if (b->Nsymb                         != ref.data_container.Nsymb)                         mism = "scalar.Nsymb";
+                        else if (b->nData                         != ref.data_container.nData)                         mism = "scalar.nData";
+                        else if (b->nBits                         != ref.data_container.nBits)                         mism = "scalar.nBits";
+                        else if (b->preamble_nSymb                != ref.data_container.preamble_nSymb)                mism = "scalar.preamble_nSymb";
+                        else if (b->interpolation_rate            != ref.data_container.interpolation_rate)            mism = "scalar.interpolation_rate";
+                        else if (b->total_frame_size              != ref.data_container.total_frame_size)              mism = "scalar.total_frame_size";
+                        else if (b->baseband_data_fine_slice_size != ref.data_container.baseband_data_fine_slice_size) mism = "scalar.baseband_data_fine_slice_size";
+                        else if (b->buffer_Nsymb                  != (int)ref.data_container.buffer_Nsymb.load())      mism = "scalar.buffer_Nsymb";
+                    }
+                    // (5) scalar block — telecom_system scalars.
+                    if (mism == NULL) {
+                        if      (b->ldpc_rate                 != ref.ldpc.rate)                 mism = "scalar.ldpc_rate";
+                        else if (b->bandwidth                 != ref.bandwidth)                 mism = "scalar.bandwidth";
+                        else if (b->carrier_frequency         != ref.carrier_frequency)         mism = "scalar.carrier_frequency";
+                        else if (b->bit_energy_dispersal_seed != ref.bit_energy_dispersal_seed) mism = "scalar.bit_energy_dispersal_seed";
+                        else if (b->M_telecom                 != ref.M)                         mism = "scalar.M_telecom";
+                        else if (b->time_sync_trials_max      != ref.time_sync_trials_max)      mism = "scalar.time_sync_trials_max";
+                        else if (b->outer_code                != ref.outer_code)                mism = "scalar.outer_code";
+                        else if (b->outer_code_reserved_bits  != ref.outer_code_reserved_bits)  mism = "scalar.outer_code_reserved_bits";
+                        else if (b->LDPC_real_CR              != ref.LDPC_real_CR)              mism = "scalar.LDPC_real_CR";
+                        else if (b->Tu                        != ref.Tu)                        mism = "scalar.Tu";
+                        else if (b->Ts                        != ref.Ts)                        mism = "scalar.Ts";
+                        else if (b->Tf                        != ref.Tf)                        mism = "scalar.Tf";
+                        else if (b->rb                        != ref.rb)                        mism = "scalar.rb";
+                        else if (b->rbc                       != ref.rbc)                       mism = "scalar.rbc";
+                        else if (b->Shannon_limit             != ref.Shannon_limit)             mism = "scalar.Shannon_limit";
+                    }
+
+                    if (mism == NULL) {
+                        bpass++;
+                    } else {
+                        bfail++;
+                        printf("[TEST-PRECOOK-BUNDLE] FAIL cfg %d: field=%s\n", cfg, mism);
+                    }
+                }
+                if (bfail == 0)
+                    printf("[TEST-PRECOOK-BUNDLE] ALL PASS: %d/%d ladder configs bundle==init byte-identical "
+                           "(ofdm/ldpc/psk buffers + pre_eq[Nc] + descrambler[N_MAX] + full scalar block)\n",
+                           bpass, FULL_CONFIG_LADDER_SIZE);
+                failed += bfail;
+            }
+
             return (failed == 0) ? 0 : 1;
         }
         // --test-chase : run ONLY the chase-combining self-test and exit. Drives the

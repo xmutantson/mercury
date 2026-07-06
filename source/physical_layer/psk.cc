@@ -21,6 +21,7 @@
  */
 
 #include "physical_layer/psk.h"
+#include <cstring>  // memset: zero demod workspace at alloc (PRECOOK memcmp determinism)
 
 
 
@@ -238,6 +239,11 @@ void cl_psk::set_constellation(std::complex <double> *_constellation, int size)
 	// Pre-allocate demod workspace buffers (eliminates per-frame heap churn)
 	D_buf=new float[nSymbols];
 	LLR_buf=new float[nBits];
+	// PRECOOK determinism: D_buf/LLR_buf are per-frame demod SCRATCH (written before read each
+	// demod), so `new[]` leaves indeterminate content the modem never reads. Zeroing makes them
+	// deterministic so the precook bundle==init memcmp gate is meaningful; demod output unchanged.
+	if(nSymbols>0) memset(D_buf,   0, sizeof(float) * (size_t)nSymbols);
+	if(nBits>0)    memset(LLR_buf, 0, sizeof(float) * (size_t)nBits);
 
 	for(int i=0;i<size;i++)
 	{
