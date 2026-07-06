@@ -159,6 +159,26 @@ void cl_data_container::publish_active_ring()
 		active_bn = this->pinned_capacity_buffer_Nsymb;
 	}
 	int sp = this->Nofdm * active_bn * this->interpolation_rate;
+	// SAMPLE-BASED OOB tripwire (§CAP-STALE root defense): the buffer_Nsymb clamp above only bounds
+	// the SYMBOL count. The physical ring is sized in SAMPLES (Nofdm·bn·interp), so a config whose
+	// Nofdm exceeds the pin's ref_Nofdm can overrun the allocation even with buffer_Nsymb ≤ capacity
+	// (this was the live-acq failure: bundles built at Nofdm=310 vs a ring pinned at 292). The root
+	// fix (bundles inherit the live gi) keeps Nofdm invariant so this never fires, but enforce the
+	// sp invariant here too: clamp the published window to what physically fits rather than let C1's
+	// 2·sp mirror write / the demod read run OOB. Log loudly — a hit means a geometry regression.
+	if(this->precook_ring_pinned && this->pinned_capacity_samples > 0
+	   && sp > this->pinned_capacity_samples)
+	{
+		int fit_bn = (this->Nofdm > 0 && this->interpolation_rate > 0)
+			? this->pinned_capacity_samples / (this->Nofdm * this->interpolation_rate) : active_bn;
+		fprintf(stderr, "[PRECOOK] FATAL: published sp=%d (Nofdm=%d bn=%d interp=%d) exceeds pinned "
+			"sample capacity=%d — Nofdm/geometry regression vs pin; clamping bn %d→%d to avoid ring OOB\n",
+			sp, this->Nofdm, active_bn, this->interpolation_rate, this->pinned_capacity_samples,
+			active_bn, fit_bn);
+		fflush(stderr);
+		active_bn = (fit_bn > 0) ? fit_bn : 1;
+		sp = this->Nofdm * active_bn * this->interpolation_rate;
+	}
 	this->buffer_Nsymb = active_bn;   // ATOMIC publish — the C1-critical store
 	this->frames_to_read = this->preamble_nSymb + this->Nsymb;
 	this->data_ready = 0;
@@ -238,6 +258,7 @@ void cl_data_container::alloc_shared_buffers(int max_nData, int max_Nc, int max_
 
 	(void)max_M; (void)max_Nfft;
 	this->pinned_capacity_buffer_Nsymb = max_buffer_Nsymb;
+	this->pinned_capacity_samples = max_sp;   // physical per-mirror sample capacity (Nofdm·bn·interp)
 	this->precook_ring_pinned = true;   // from here on, set_size()/init() take the no-free path
 }
 

@@ -101,6 +101,12 @@ class cl_data_container
 	//   (== the max_buffer_Nsymb alloc_shared_buffers was sized for). A per-config natural
 	//   buffer_Nsymb never exceeds it within one bandwidth; only a rare NB↔WB grow can.
 	int pinned_capacity_buffer_Nsymb{0};
+	// pinned_capacity_samples: the physical per-mirror sample capacity of the pinned passband ring
+	//   (== max_Nofdm·max_buffer_Nsymb·interp alloc_shared_buffers sized). publish_active_ring()
+	//   clamps the published sp against THIS (not just the buffer_Nsymb symbol count) so a config
+	//   whose Nofdm differs from the pin's ref_Nofdm can never drive C1's 2·sp mirror write / the
+	//   demod read out of the allocation. 0 until the ring is pinned. See data-flow-precook-ring.md.
+	int pinned_capacity_samples{0};
 
 	// Allocate EVERY variable-size buffer ONCE at the given MAX geometry and pin the ring
 	// (precook_ring_pinned=true). Called once at startup (main.cc, before the capture thread

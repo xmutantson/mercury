@@ -11994,6 +11994,17 @@ void cl_telecom_system::precook_config_bundles()
 		// Fresh scratch: full production init() via load_configuration. Heap-allocated so
 		// its large data_container ring is freed promptly (delete) before the next config.
 		cl_telecom_system* scratch = new cl_telecom_system();
+		// ★ PRECOOK LIVE-ACQ ROOT FIX (§CAP-STALE sp mismatch): the scratch MUST build under the
+		// SAME default_configurations the LIVE system runs, not the physical_config.cc ctor defaults.
+		// The decisive field is ofdm_gi: the ctor default is 54/256 → Ngi=54 → Nofdm=310 (4.5 ms GI),
+		// but the live system is overridden to 36/256 → Nofdm=292 (3.0 ms GI, main.cc:5270). Without
+		// this copy every bundle was built at Nofdm=310 while precook_pin_shared_ring sized the pinned
+		// ring at the live Nofdm=292 → the swap published sp=310·buffer_Nsymb·interp, which mismatches
+		// (and for ROBUST OVERRUNS) the ring sized for 292 → C1 fill / demod acq window disagree →
+		// permanent [CAP-STALE], SNR −99.90 floor, 0 acquisitions. Copying the whole struct carries
+		// gi AND every other geometry input (carrier_frequency, bandwidth, FIR cutoffs, LS window,
+		// interpolation_rate, …) so the bundle geometry is byte-for-byte the live/legacy geometry.
+		scratch->default_configurations_telecom_system = this->default_configurations_telecom_system;
 		scratch->narrowband_enabled = narrowband_enabled;
 		scratch->load_configuration(cfg);
 
