@@ -47,6 +47,18 @@ public:
 	cl_psk();
 	~cl_psk();
 
+	// PRECOOK M3 (BUNDLE_FIELD_CHECKLIST PART 3): deep-copy the owning
+	// constellation[nSymbols] (content IS geometry) + D_buf/LLR_buf workspace +
+	// scalars (nBits,nSymbols,var_floor) from `s`.
+	void copy_from(const cl_psk& s);
+	// PRECOOK gate helper: byte-compare owning buffers (constellation/D_buf/
+	// LLR_buf) + sizing scalars vs `o`. NULL if identical, else first-diff field.
+	const char* precook_deep_equal(const cl_psk& o) const;
+	// Owning-pointer class → block the shallow default copy (double-free of
+	// constellation/D_buf/LLR_buf). copy_from is the only safe path.
+	cl_psk(const cl_psk&) = delete;
+	cl_psk& operator=(const cl_psk&) = delete;
+
 
 	void set_constellation(std::complex <double> *_constellation, int size);
 	void set_predefined_constellation(int M);

@@ -52,6 +52,17 @@ public:
 	cl_FIR();
 	~cl_FIR();
 
+	// PRECOOK M3 (BUNDLE_FIELD_CHECKLIST PART 2.4): deep-copy the owning
+	// filter_coefficients[filter_nTaps] + all scalars from `s`.
+	void copy_from(const cl_FIR& s);
+	// PRECOOK gate helper: byte-compare owning buffer(s)+sizing scalars vs `o`.
+	// Returns NULL if byte-identical, else the name of the first differing field.
+	const char* precook_deep_equal(const cl_FIR& o) const;
+	// Owning-pointer class with no user copy-ctor → block the shallow default
+	// (double-free of filter_coefficients). copy_from is the only safe path.
+	cl_FIR(const cl_FIR&) = delete;
+	cl_FIR& operator=(const cl_FIR&) = delete;
+
 	void design();
 	void apply(std::complex <double>* in, std::complex <double>* out, int nItems);
 	void apply(double* in, double* out, int nItems);

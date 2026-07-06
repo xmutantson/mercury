@@ -1143,6 +1143,55 @@ int main(int argc, char *argv[])
                 failed += pfail;
             }
 
+            // PRECOOK M3 copy_from BYTE-IDENTICAL completeness gate (STEP 1 GATE 2,
+            // BUNDLE_FIELD_CHECKLIST PART 6). For every config in the full gearshift
+            // ladder (ROBUST_0/1/2 + CONFIG_0..16): build a telecom_system via the
+            // production init() path, copy_from telecom.ofdm/ldpc/psk into FRESH local
+            // objects, then memcmp EVERY owning buffer between the init()-built original
+            // and the copy → assert byte-IDENTICAL. Also asserts the L1 landmine: the
+            // COPY's pilot/preamble .carrier back-pointers alias the COPY's own
+            // ofdm_frame/ofdm_preamble (NOT the source's). Any mismatch localizes the
+            // missed field to a single buffer. In-process, no IONOS/RF. See
+            // _research/_precook/PRECOOK_STAGE2_TURNKEY.md STEP 1.
+            {
+                int cfpass = 0, cffail = 0;
+                for (int li = 0; li < FULL_CONFIG_LADDER_SIZE; li++) {
+                    int cfg = FULL_CONFIG_LADDER[li];
+                    cl_telecom_system ts;
+                    ts.narrowband_enabled = NO;
+                    ts.load_configuration(cfg);
+
+                    cl_ofdm ofdm_copy;   ofdm_copy.copy_from(ts.ofdm);
+                    cl_ldpc ldpc_copy;   ldpc_copy.copy_from(ts.ldpc);
+                    cl_psk  psk_copy;    psk_copy.copy_from(ts.psk);
+
+                    const char* m_ofdm = ts.ofdm.precook_deep_equal(ofdm_copy);
+                    const char* m_ldpc = ts.ldpc.precook_deep_equal(ldpc_copy);
+                    const char* m_psk  = ts.psk.precook_deep_equal(psk_copy);
+
+                    // L1 landmine: the COPY's back-pointers must alias the COPY's own frames.
+                    bool land_ok = (ofdm_copy.pilot_configurator.carrier == ofdm_copy.ofdm_frame)
+                                && (ofdm_copy.preamble_configurator.carrier == ofdm_copy.ofdm_preamble);
+
+                    if (m_ofdm == NULL && m_ldpc == NULL && m_psk == NULL && land_ok) {
+                        cfpass++;
+                    } else {
+                        cffail++;
+                        printf("[TEST-PRECOOK-COPYFROM] FAIL cfg %d:", cfg);
+                        if (m_ofdm) printf(" ofdm-buffer=%s", m_ofdm);
+                        if (m_ldpc) printf(" ldpc-buffer=%s", m_ldpc);
+                        if (m_psk)  printf(" psk-buffer=%s", m_psk);
+                        if (!land_ok) printf(" LANDMINE-1(carrier back-pointer not re-pointed to copy)");
+                        printf("\n");
+                    }
+                }
+                if (cffail == 0)
+                    printf("[TEST-PRECOOK-COPYFROM] ALL PASS: %d/%d ladder configs byte-identical after "
+                           "copy_from (every owning buffer memcmp-clean; L1 carrier re-point verified)\n",
+                           cfpass, FULL_CONFIG_LADDER_SIZE);
+                failed += cffail;
+            }
+
             return (failed == 0) ? 0 : 1;
         }
         // --test-chase : run ONLY the chase-combining self-test and exit. Drives the
