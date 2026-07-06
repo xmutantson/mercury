@@ -1143,6 +1143,69 @@ int main(int argc, char *argv[])
                 failed += pfail;
             }
 
+            // PRECOOK descrambler REGEN regression (§17 HINGE — the LIVE NB-ROBUST/MFSK-LDPC
+            // 0-RX-CTRL root, audit wqvdd116h). precook_pin_shared_ring() calls
+            // alloc_shared_buffers() which CDELETE+re-NEW's bit_energy_dispersal_sequence as a
+            // fresh `new int[N_MAX]` GARBAGE array; the restore-startup-config load above no-op-
+            // guards (same-cfg) so nothing regenerates it → the LIVE descrambler is garbage and
+            // the RX outer CRC constant-fails. FIX: regenerate the seed-0 draw immediately after
+            // alloc_shared_buffers. This asserts the SEQUENCE equals the reference ts_srandom(seed)
+            // draw (NOT merely "decode succeeds" — §17 warns a plain realloc self-hides via heap
+            // block reuse), using the SAME MERCURY_DESCRAMBLER_REGEN_DEFEAT poison-pattern as the
+            // HINGE-1 test: DEFEAT=1 zeroes the array → FAIL-BEFORE, default regenerates → PASS-AFTER.
+            {
+                const char* TAG = "[TEST-PRECOOK-DESCRAMBLER]";
+                int dfail = 0;
+                auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+                    _putenv_s(k, v);
+#else
+                    if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+                };
+                // Reference: the seed-0 draw for the startup config (CONFIG_0), from a FRESH
+                // instance that only ran init() (never precook). This is what BOTH ends scramble
+                // with; the pinned live descrambler must match it bit-for-bit.
+                static int ref_seq[N_MAX];
+                int ref_N = 0;
+                set_env("MERCURY_DESCRAMBLER_REGEN_DEFEAT", "");
+                {
+                    cl_telecom_system ref;
+                    ref.narrowband_enabled = NO;
+                    ref.load_configuration(CONFIG_0);
+                    ref_N = ref.ldpc.N;
+                    for(int i=0;i<ref_N && i<N_MAX;i++) ref_seq[i] = ref.data_container.bit_energy_dispersal_sequence[i];
+                }
+                auto dump16 = [&](const int* s)->std::string {
+                    char buf[8]; std::string out;
+                    for(int b=0;b<2;b++){ int v=0; for(int k=0;k<8;k++) v=(v<<1)|(s[b*8+k]&1); snprintf(buf,sizeof(buf),"%02X",v); out+=buf; }
+                    return out;
+                };
+                for(int arm=0; arm<2; arm++)
+                {
+                    bool defeat = (arm==1);
+                    set_env("MERCURY_DESCRAMBLER_REGEN_DEFEAT", defeat ? "1" : "");
+                    cl_telecom_system ts;
+                    ts.narrowband_enabled = NO;
+                    ts.load_configuration(CONFIG_0);
+                    ts.precook_pin_shared_ring();
+                    int N = ts.ldpc.N;
+                    bool matches = (N == ref_N);
+                    for(int i=0;i<N && matches;i++) if(ts.data_container.bit_energy_dispersal_sequence[i]!=ref_seq[i]) matches=false;
+                    std::string live = dump16(ts.data_container.bit_energy_dispersal_sequence);
+                    if(!defeat) {
+                        if(matches) printf("%s PASS-AFTER: pinned live descrambler EQUALS seed-0 ref (dump[0..15]=%s, ref=%s)\n", TAG, live.c_str(), dump16(ref_seq).c_str());
+                        else { printf("%s FAIL: pinned live descrambler != seed-0 ref (dump[0..15]=%s, ref=%s)\n", TAG, live.c_str(), dump16(ref_seq).c_str()); dfail++; }
+                    } else {
+                        if(!matches) printf("%s FAIL-BEFORE ok: DEFEAT descrambler DIVERGES from ref (garbage/zeroed, dump[0..15]=%s)\n", TAG, live.c_str());
+                        else { printf("%s FAIL: DEFEAT descrambler matched ref (poison did not take)\n", TAG); dfail++; }
+                    }
+                }
+                set_env("MERCURY_DESCRAMBLER_REGEN_DEFEAT", "");
+                if(dfail==0) printf("%s ALL PASS\n", TAG);
+                failed += dfail;
+            }
+
             // PRECOOK M3 copy_from BYTE-IDENTICAL completeness gate (STEP 1 GATE 2,
             // BUNDLE_FIELD_CHECKLIST PART 6). For every config in the full gearshift
             // ladder (ROBUST_0/1/2 + CONFIG_0..16): build a telecom_system via the

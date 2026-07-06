@@ -12018,6 +12018,28 @@ void cl_telecom_system::precook_pin_shared_ring()
 	data_container.alloc_shared_buffers(max_nData, max_Nc, (int)M, ofdm.Nfft,
 		ref_Nofdm, max_Nsymb, max_pre, ref_interp, max_bn);
 
+	// §17 ROOT FIX (precook HINGE — the LIVE NB-ROBUST/MFSK-LDPC 0-RX-CTRL root, VERIFIED audit
+	// wqvdd116h): alloc_shared_buffers() just above CDELETE+re-NEW'd bit_energy_dispersal_sequence
+	// as a fresh `new int[N_MAX]` GARBAGE array (data_container.cc). The startup config was restored
+	// via the legacy load_configuration(saved_cfg) above, but that path no-op-guards the same-cfg
+	// swap and the only precook descrambler installer is the bundle memcpy at the FIRST out-of-domain
+	// swap (:11801) — which the startup config never triggers. So without this the LIVE descrambler
+	// stays GARBAGE on BOTH ends → RX descrambles post-LDPC → payload XOR wrong-seq → outer CRC
+	// constant-fails → 0 RX-CTRL for NB-ROBUST/MFSK-LDPC receive (WB START_CONNECTION rides tone-space
+	// CRC12 so it worked; DEFEAT never pins so it never wipes). The live ldpc/seed here are the
+	// just-restored startup config's, so the seed-0 draw is byte-exact for it (every OTHER config gets
+	// its sequence from the bundle memcpy on first swap). No lock: S0, no capture thread yet spawned,
+	// ARQ-thread-only array. FAIL-BEFORE knob MERCURY_DESCRAMBLER_REGEN_DEFEAT=1: zero the array
+	// (deterministic poison, mirrors HINGE-1 §17 — a plain skip can self-hide via heap-block reuse) to
+	// reproduce the production garbage-descrambler symptom. Production never sets the knob.
+	{ const char* e = std::getenv("MERCURY_DESCRAMBLER_REGEN_DEFEAT");
+	  if(e && *e && atoi(e) != 0) {
+	    if(data_container.bit_energy_dispersal_sequence != NULL && ldpc.N > 0 && ldpc.N <= N_MAX)
+	      for(int i=0;i<ldpc.N;i++) data_container.bit_energy_dispersal_sequence[i]=0;
+	  } else {
+	    regenerate_bit_energy_dispersal_sequence();
+	  } }
+
 	// PRECOOK V2 (Step B §5.1 fix) — PIN pre_equalization_channel at max_Nc (WB=50). The attempt-3
 	// swap lazily alloc'd it at the FIRST swap's b.Nc; an NB-first session (b.Nc=10) then WB adopt
 	// (memcpy 50 entries) overran the 10-entry array. Alloc once here at the pinned max_Nc and never
