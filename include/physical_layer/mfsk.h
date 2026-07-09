@@ -430,6 +430,11 @@ public:
 	cl_mfsk();
 	~cl_mfsk();
 
+	// PRECOOK M3 (BUNDLE_FIELD_CHECKLIST PART 3): cl_mfsk has NO owning pointers
+	// (all scalars + fixed arrays), so a memberwise copy is correct. Provided for
+	// M3 uniformity with the other geometry classes.
+	void copy_from(const cl_mfsk& s) { *this = s; }
+
 	void init(int _M, int _Nc, int _nStreams = 1);
 	void deinit();
 

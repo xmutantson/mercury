@@ -802,3 +802,287 @@ that would LOCALISE content corruption mid-stream remains DEFERRED (out of the c
 
 **Wire cost:** 14 B on the CLOSE_CONNECTION frame, once per graceful disconnect (was 1 B). Zero cost
 on the data path. **Merge:** owner fork (wire change); lands only after its regression-cohort gate.
+
+---
+
+## Appendix P — precook-branch forensic + design record (merged 2026-07-09)
+
+The sections below are the fuller forensic decode of the 4th silent mechanism and the
+absolute-byte-stream backstop DESIGN that §14 above recaps ("full analysis in the
+main-tree version + worklog"). Preserved verbatim from the `feat/precook-full` copy of
+this document so no facts are lost across the branch merge. The implementation record
+(§15 Option W … §19 EOT above) is the realization of the §14.5 design proposed here.
+
+### §13.verify — result + honest status (2026-07-03)
+- `build.sh o3` EXIT=0 (clean). `mercury.exe --test` EXIT=0, FULL suite GREEN — incl. the demote/
+  re-stage groups my change touches: `[TEST-INBAND-DELIVER] ALL PASS`, the `LOSSLESS DEMOTE`
+  contiguous-rollback path, `[TEST-A3-DECOUPLE]` byte-faithful ALL PASS, `[TEST-INBAND-DROP/FOLLOW/
+  PB/DOWNLADDER/…]` ALL PASS. (`[CRYPTO] ERROR … rejecting KX` lines are the expected negative-test
+  rejections.)
+- `--test-restage-requeue-orphan`: FAIL-BEFORE (`MERCURY_RESTAGE_ORPHAN_DEFEAT=1`) rc=1 order_ok=0
+  first_bad=0; PASS-AFTER rc=0 order_ok=1 zero-loss.
+- **Commit `d51cf40e`** on `fix/restage-requeue-orphan-shift` (off `staging/enc-bsi-nonce@683651fe`),
+  author xmutantson, zero attribution. The 7 buggy `push(messages_tx[i].data …)` loops exist
+  IDENTICALLY on `monitor` (grep = 7) → clean cherry-pick target.
+- **STATUS — honest:** the DOMINANT root (CMD-side re-stage orphan/reorder → positional shift) is
+  decisively identified (Δ=48 capture, exact-identity on all 4, code + c31w010 FIX-9 log) and the fix
+  is DETERMINISTICALLY PROVEN (fail-before/pass-after) + full `--test` green. **NOT yet
+  cohort-confirmed on the real-channel metric.** The conclusive check is a ~120-cell WGN:25 cohort
+  with the FIXED binary (rate ~3.3% ⇒ a small run is inconclusive), using the STRONGER oracle
+  (`canonical_bytes` 24-bit block-index + `random_slice`, since the period-256 ruler is blind to
+  256-aligned shifts — §11.CORRECTION pt 1). That cohort would also surface any residual RSP-side
+  shift source (cross-storage PREV delivery was NOT exhaustively audited; the CMD re-stage is the
+  strongly-evidenced dominant source). If a fixed-binary cohort still shows silent fails → that is
+  the 2nd failed cross-domain audit → Fable-5 consult gate.
+
+## §14 THE 4th DISTINCT SILENT MECHANISM — c31w104 (fixed-binary cohort-3, 2026-07-03)
+
+**Status:** the §13 restage fix (order-preserving/lossless re-queue + ingestion reserve) DID
+eliminate the DOMINANT CMD-side mechanism (cohort-3 dropped the prior 4→1 silent fail), but a
+**4th, DISTINCT silent corruption survives** — `c31w104`, a fixed-binary (`/dev/shm/build/mfix/
+mercury`) WGN:25 run, box .31 cohort-3 wave-1 cell-04. This is the **campaign's own §13.verify
+pre-registered trigger**: "if a fixed-binary cohort still shows silent fails → that is the 2nd
+failed cross-domain audit → Fable-5 consult gate." The gate is now MET.
+
+**Evidence (durable):** `_research/_c31w104_capture/` — `arq_c31w104.log` (3.1 MB CMD+RSP),
+`capbytes_c31w104.txt` (the byte-dump: DELIV vs EXPEC at the fault), `res_c31w104.json`,
+`bridge_c31w104_stats.json`, `spawn_c31w104.out`, `bsz3_driver.sh`. Fleet source:
+`192.168.2.31:/dev/shm/bsz3_31/logs_w1/`. Oracle = **`random_slice`** (SHA-256 keyed-random,
+key `mercury-capstone-incompressible-v1`, `tools/sim/realaudio/capstone_arms.py:542`) — the
+STRONGEST oracle (NOT the period-256 ruler; §11.CORRECTION pt 1 requirement satisfied).
+
+### §14.1 The DECISIVE byte decode — a FORWARD positional shift of Δ=+6847
+`res_c31w104`: `rx_bytes=27246`, `first_bad=27079`, `mismatch=166`, `segments=2`. The two
+mismatch segments are CONTIGUOUS (27079+25=27104, 27104+142=27246 = the whole 167-byte tail;
+166/167 differ = exactly the strong-oracle 1/256 coincidence rate → whole tail wrong). I
+reproduced `random_slice` and searched the source stream for the DELIVERED bytes:
+
+- `EXPEC` == `random_slice(27079,·)` and `random_slice(27104,·)` — **confirms the prefix
+  `[0,27079)` was delivered CORRECTLY** and pins the oracle.
+- The DELIVERED bytes at `[27079,27246)` are **`random_slice(33926,167)`** — i.e. **source
+  `[33926,34093)`** (both segments identical Δ; seg1@27079→src 33926, seg2@27104→src 33951).
+- **Δ = +6847 (FORWARD).** NOT a value transform (DELIV⊕EXPEC is not constant: 0x66^0x24=0x42,
+  0x40^0x50=0x10). NOT a stale EARLIER slot (Δ is forward). A **positional forward shift**.
+
+### §14.2 bsi map — bsi13-range content delivered in the bsi11 delivery slot
+Per-batch source ranges from the CMD flush/build sizes (RAW ⇒ flush==source bytes; cfg15 batch
+= 25×167 = 4175 B): bsi11 = `[23906,28081)`, bsi12 = `[28081,32256)`, bsi13 = `[32256,36431)`.
+- delivered-at position **27079 → bsi11** (3173 B in, ~frame 19).
+- DELIV origin **33926 → bsi13** (1670 B in, ~frame 10).
+- The RSP delivered `[0,27079)` correctly (through bsi11's first ~19 frames), then **SKIPPED
+  source `[27079,33926)` = 6847 B ≈ 1.64 batches (rest of bsi11 + all bsi12 + head of bsi13)**
+  and appended **bsi13 content** — then aborted. A hole + forward shift.
+
+### §14.3 Control-flow context — the RSP cross-storage PREV path + SHRUNK expected-counts
+The corruption zone is SATURATED with the RSP-side cross-storage PREV delivery
+(`arq_responder.cc:1266-1321`, "swapping messages_rx pointer for delivery") — root-cause-2's
+flagged-but-unaudited path. In `arq_c31w104.log`:
+- bsi9/10/11 ALL delivered via `[RSP-V2-PREV-DELIVERED]` (T+221/235/247).
+- **The PREV batches were declared COMPLETE at SHRUNK expected-counts**: `[RSP-V2-PREV-BUMP]`
+  shows bsi10 `received_on_transfer=19/23` then PREV-DELIVER `received=23/23`; bsi11
+  `17/21` then `received=21/21`. So bsi10/bsi11 were declared done at expected=23 and 21 — but
+  the CMD BUILT them at 25 frames (`[CMD-BATCH-SEQ] new-data batch_seq_id=10/11 (frames in
+  batch=25)`). The RSP delivered a batch it declared "complete" while ≥2-4 tail frames of that
+  batch were NEVER delivered → a silent hole; the stream then re-anchors on later content.
+- `[RSP-V2-GAP-ABORT]` DID fire — but at **bsi13** (T+270.522, `non-contiguous with
+  last_delivered=11`) — i.e. the loud guard fired **~1.6 batches too late**, AFTER the silent
+  bsi13-content shift had already entered the delivered stream.
+
+### §14.4 Why every existing loud guard is INERT/LATE — the ARCHITECTURAL signal
+- `[RESTAGE-ORPHAN]` (§13, CMD-side re-queue guard): NEVER FIRED — `DESYNC_c31.json` n_fired=0.
+  This is NOT the CMD re-stage mechanism; it is a DIFFERENT site (RSP delivery / expected-count).
+- `[RSP-V2-BATCHSIZE-DESYNC]` ((B), `1b99534c`): NEVER FIRED — CMD==RSP batch size (both 25); the
+  desync here is expected-COUNT shrink, not batch-SIZE. Different root.
+- `[RSP-V2-GAP-ABORT]`: fired LATE (bsi13), after the silent shift was already delivered.
+- **The common thread across ALL 4 mechanisms:** each existing guard checks a *PROXY* invariant —
+  re-queue completeness (RESTAGE-ORPHAN), batch-SIZE equality (BATCHSIZE-DESYNC), bsi contiguity
+  (GAP-ABORT), EOB frame-count (Fix A / D5). **NONE checks the invariant that actually matters:
+  the delivered app-byte stream == the source app-byte stream, by ABSOLUTE byte offset, in order.**
+  Mercury sequences the app stream by `(batch_seq_id, frame_id)` — a BATCH-RELATIVE scheme. Every
+  silent-corruption mechanism found (4 now) is a case where the `(bsi,frame)` sequencing stays
+  LOCALLY CONSISTENT while the ABSOLUTE byte-stream position drifts (a dropped tail frame at a
+  shrunk expected-count, a re-packed/orphaned batch, an out-of-order prev delivery). Any producer
+  that keeps its proxy invariant internally consistent corrupts SILENTLY. This is the cross-layer
+  "sibling bug" pattern CLAUDE.md warns about, at its 4th iteration.
+
+### §14.5 THE SYSTEMIC BACKSTOP — a TCP-style absolute-byte-stream sequence check (DESIGN)
+**Prior art:** TCP catches exactly this class (gap / reorder / dup / truncation) with **byte
+sequence numbers + a checksum**, not batch/segment-relative IDs. Mercury's ARQ should enforce the
+same end-to-end invariant at the delivery boundary.
+
+**Invariant to enforce:** the RSP's cumulative delivered-byte offset at the start of each batch's
+delivery == the CMD's cumulative committed-byte offset at the start of that batch. Any divergence
+= a gap/shift/dup → LOUD + retx the missing span, NEVER silent-deliver.
+
+**Hook points (both already exist as single funnels):**
+- SENDER (CMD): the batch-build commit point, `process_buffer_data_commander` (the pop from
+  `fifo_buffer_tx` into `messages_tx`). Maintain an authoritative cursor `tx_stream_committed`
+  = total source bytes committed to batches so far. Stamp each batch with `batch_start_offset =
+  tx_stream_committed` (before adding this batch's payload). The cursor is the SINGLE SOURCE OF
+  TRUTH for stream position — it advances by EXACTLY the payload bytes committed, so any
+  orphan/reorder/re-pack that changes which source bytes a batch carries is reflected as an
+  offset the RSP can check.
+- RECEIVER (RSP): the delivery boundary, `copy_data_to_buffer()` / `fifo_push_rx()`
+  (`arq_common.cc:13944-13970`, the RAW path; :13781 compressed path). Maintain
+  `rx_stream_delivered` = total app bytes pushed to the RX FIFO. Before delivering a batch, assert
+  `batch_start_offset == rx_stream_delivered`. Mismatch → `[STREAM-OFFSET-DESYNC]` LOUD; do NOT
+  deliver; the span `[rx_stream_delivered, batch_start_offset)` is the missing region → drive the
+  existing ARQ retx by the bsi range that covers it, OR abort-and-resync (like GAP-ABORT but keyed
+  on the RIGHT invariant and at the RIGHT time — the FIRST byte of divergence, not 1.6 batches late).
+
+**Wire cost:** the `batch_start_offset` is a per-batch field. A 5-byte (40-bit) absolute offset
+covers ≤1 TB/session; a 4-byte (32-bit, wrapping) offset covers 4 GB and is ample for any HF
+session, at **~4 B / batch** = 4/4175 ≈ **0.10 %** overhead at cfg15 (less at higher configs,
+more only for tiny robust batches where a 1-2 B varint suffices). Carry it in the EOB frame (which
+already terminates each batch) or a dedicated batch-header field. **OPTIONAL add-on:** a per-batch
+CRC-32 of the payload-as-sent (+4 B) catches a per-frame-CRC ESCAPE (a bit error that passes the
+frame CRC) — not needed for the 4 positional mechanisms but closes the value-corruption class too.
+
+**Why it SUPERSEDES per-mechanism whack-a-mole:** it checks the ACTUAL end-to-end invariant at the
+consumer, so it catches EVERY positional shift/drop/reorder/dup — all 4 mechanisms found AND any
+future 5th — LOUDLY at the first divergent byte, regardless of which producer/layer caused it.
+It converts silent-data-loss into loud-recoverable structurally, ending the serial per-root hunt.
+
+**Honest limit:** Mercury's RECEIVER has no independent oracle for the source CONTENT (only the
+harness does), so this backstop verifies stream POSITION/CONTIGUITY (offset) + optionally
+transmission integrity (payload CRC). It CANNOT catch a sender that sends wrong bytes while
+stamping a CONSISTENT offset AND a matching CRC — but that requires the sender's cursor to be
+authoritative-yet-wrong, which the design makes the single source of truth precisely to prevent.
+For all 4 observed mechanisms (positional shifts/holes with the app-stream re-anchoring) the
+offset check is NECESSARY AND SUFFICIENT to catch loudly.
+
+### §14.6 DECISION — Fable-5 gate MET; wire-format change ⇒ owner fork
+- c31w104 does **NOT** have a clean, cheap, ISOLATED per-mechanism fix: the root is entangled with
+  the EOB-inference / D5 / PREV-shrink / SHRINK-DEFER machinery that Fix A + D5 + the shrink-defer
+  already patch. A 4th narrow patch there is precisely the whack-a-mole the 4-mechanism pattern
+  proves is losing (each prior narrow fix exposed a sibling). NOT shipped as a narrow patch.
+- The systemic backstop is the correct structural fix but is a **WIRE-FORMAT change** (new
+  per-batch offset field) — the task's explicit Fable/owner escalation trigger.
+- Both Fable-5 gate conditions are satisfied: (i) the campaign's own §13.verify pre-registered
+  "fixed-binary cohort still shows a silent fail = 2nd failed cross-domain audit"; (ii) the fix is
+  an architectural decision beyond a clean autonomous implementation.
+- **ACTION:** consult Fable-5 with a structured brief (4-mechanism pattern + the c31w104 decode +
+  what each prior fix did + the systemic-vs-whack-a-mole + wire-format question); act on its steer
+  with ONE attempt; then surface the fork to the owner. See §14.7 for the consult brief.
+
+### §14.7 FABLE-5 STRUCTURED BRIEF + OWNER FORK (this agent could not spawn Fable — routed up)
+This agent is a workflow-spawned SUBAGENT with no Agent/Workflow spawn tool available, so it could
+not itself page Fable-5. The gate IS met (§14.6). The complete brief is recorded here for the
+orchestrator/owner to route to Fable-5 (`model:"fable"`), then decide.
+
+**BRIEF — the problem (metric):** at marginal SNR (WGN:25, random-binary, compression+encryption
+OFF) Mercury SILENTLY delivers a positionally-corrupted app byte stream ~a few % of transfers. The
+metric is silent byte-integrity failures per fixed-binary cohort. After THREE root fixes it is
+still 1/14 in cohort-3 (c31w104), and each prior fix revealed a distinct sibling.
+
+**BRIEF — what's been tried (4 distinct roots, each a real fix, each exposed a sibling):**
+1. Fix A (EOB-inference undercount / tail-drop) — wired the true frame count so a lost-EOB batch
+   isn't declared short. Landed. Sibling surfaced ↓.
+2. (B) CMD>RSP `data_batch_size` desync (`1b99534c`) — LOUD `[RSP-V2-BATCHSIZE-DESYNC]` when a
+   received frame's id ≥ RSP batch size. Landed, regression-free. Did NOT cover the next root ↓.
+3. §13 re-stage orphan/reorder (Δ=+48 capture) — 7 CMD demote/CFG16-HOLD re-stage sites re-queued
+   in-flight frames with forward `push()` (reorder) + silent drop on a full fifo; fixed with
+   order-preserving `push_front` + ingestion reserve + LOUD `[RESTAGE-ORPHAN]`. Eliminated the
+   DOMINANT mechanism (cohort silent 4→1). Did NOT cover c31w104 ↓.
+4. c31w104 (THIS) — decode-proven FORWARD shift Δ=+6847: RSP declared bsi10/bsi11 COMPLETE at
+   SHRUNK expected-counts (23,21) though transferred=25 → silent tail-frame holes → bsi13 content
+   re-anchored at the bsi11 stream slot. RESTAGE-ORPHAN + BATCHSIZE-DESYNC INERT; GAP-ABORT fired
+   1.6 batches LATE. Entangled with the EOB/D5/SHRINK-DEFER machinery → no clean isolated patch.
+
+**BRIEF — the evidence (decisive):** `random_slice` decode proves DELIV[27079,27246)==source
+[33926,34093), Δ=+6847, prefix correct; NOT a value transform (DELIV⊕EXPEC non-constant). bsi map
+puts the origin in bsi13 and the slot in bsi11. Full capture `_research/_c31w104_capture/`.
+
+**BRIEF — the specific question:** every existing guard checks a PROXY invariant (re-queue
+completeness / batch-SIZE / bsi-contiguity / EOB-count); the corruption is always an ABSOLUTE
+byte-stream position drift the proxy misses. Is a TCP-style **per-batch absolute-byte-offset stamp
++ delivery-boundary contiguity check** (§14.5; ~4 B/batch ≈ 0.1%; a WIRE-FORMAT change) the right
+structural fix that SUPERSEDES per-mechanism whack-a-mole — or is there a lower-cost consumer-side
+invariant (e.g. RSP refuse to declare a batch complete when delivered/expected < the already-wired
+`transferred` count) that closes the class WITHOUT a wire change, accepting it won't catch a
+future content-shift-with-consistent-counts 5th mechanism? What would you ship?
+
+**OWNER FORK (surface if Fable's one steer doesn't dissolve it):**
+- **Option W (systemic, wire-format):** add the absolute-byte-offset stamp + delivery check
+  (§14.5). Closes the whole silent-shift class loudly + localizes retx. Cost: ~0.1% wire, a
+  wire-format bump (both ends rebuild — acceptable pre-ship per `iris_no_version_bits_preship`
+  discipline), and touching the batch/EOB framing + both delivery funnels. RECOMMENDED as the
+  durable end-state; needs owner sign-off because it changes the wire.
+- **Option N (narrow, no wire change):** RSP-side LOUD guard at the PREV/BATCH-DONE delivery
+  boundary: if a batch is declared complete with delivered/expected < the observed `transferred`
+  count AND the shortfall slots were never delivered → `[RSP-V2-TAILDROP-HOLE]` + refuse
+  silent-complete (abort-resync). Cheaper, reversible, but (i) entangled with the legitimate
+  data_batch_size-shrink / SHRINK-DEFER path (false-fire risk — must distinguish a real resize
+  from a hole), and (ii) whack-a-mole — will not catch a 5th mechanism that keeps counts
+  consistent. A stopgap, not the end-state.
+- **Recommendation:** ship Option W (systemic) as the structural end-state; it is the only fix that
+  makes silent-data-loss STRUCTURALLY impossible for this whole class. Until W lands, real-channel
+  silent corruption at marginal SNR is **STILL OPEN** (~a few % of WGN:25 transfers).
+
+---
+
+## Appendix Q — merge-resolution cross-layer audit: `feat/precook-full` → `integ/precook-merge` (2026-07-09)
+
+This section records the CLAUDE.md-required cross-layer data-flow audit for the ARQ
+shared-state touched by reconciling the precook branch into the monitor line. **Finding
+up front: the resolution introduces ZERO new ARQ state change — monitor's ARQ line is
+taken wholesale and precook's ARQ code is proven byte-identical to what monitor already
+carries — so there is no delta to port and no new invariant to establish.**
+
+### Q.1 The proven equivalence (why "take ours" loses nothing)
+- Precook `d51cf40e` and monitor `bfacbcf6` share an IDENTICAL commit message and are two
+  copies of the SAME root fix. Diffing the CODE hunks of both commits over
+  `arq.h / arq_common.cc / arq_commander.cc / test_restage_requeue.cc / main.cc / build.sh`
+  yields **0 differing +/- content lines** — the two patches' code is byte-identical. The
+  only divergence between the two commits is this fact-document's prose (Appendix P above).
+- On the precook branch, `arq.h` and `arq_common.cc` are touched by `d51cf40e` ONLY.
+  Monitor = base + `bfacbcf6` (identical code) + ~20 hardening commits stacked on top
+  (Option W foundation `dd382db8`/`fc94ad43`/`0d72b63f`/`996a2f8f`/`9685f6ad`/`fdff669e`/
+  `9f0d50e1`/`7860d37a`; Fix A `57684aa1`, Fix C/H#1 `c34259ba`, Fix H#3 `aa1b57e5`, LOUD
+  CMD>RSP backstop `1b99534c`). Therefore monitor ⊇ precook for these two files: the merged
+  `restage_requeue_tx_messages()` (ours) is precook's exact reverse-iter push_front + LOUD
+  `[RESTAGE-ORPHAN]` logic PLUS an added `stream_tx_rollback_inflight()` call at the top
+  (Option W integration). Taking `--ours` for `arq.h` + `arq_common.cc` is complete.
+
+### Q.2 The five audit questions (shared ARQ state — restage funnel + Option W cursors)
+The state at issue: `messages_tx[]` in-flight frames, `fifo_buffer_tx`, `cmd_batch_seq_id`,
+and the Option W cursors `tx_stream_committed` / `rx_stream_delivered` / per-bsi stamps.
+1. **Producers** — unchanged from monitor. The single re-stage funnel
+   `cl_arq_controller::restage_requeue_tx_messages()` (arq_common.cc) is the sole re-queue
+   writer (replaced the 7 open-coded demote loops + is called from the demote/BREAK/CFG16-HOLD
+   sites); `stream_tx_latch()` is the sole cursor-advance (from the one pop funnel
+   `process_buffer_data_commander()`); `stream_tx_rollback_inflight()` the sole un-commit.
+2. **Consumers** — unchanged from monitor. The RSP PRIMARY byte-gate + LOUD BACKSTOP + PREV
+   byte-gate read the per-bsi stamps at delivery; `w_eot_mismatch()` reads the final cursor
+   at CLOSE_CONNECTION. The merge adds no new reader.
+3. **Valid states** — unchanged. Pre-write default: `messages_tx[i].status = FREE`,
+   cursors at INIT sentinel, stamps invalidated on config change
+   (`rx_stream_invalidate_stamps()` from `load_configuration()`).
+4. **Invariants** — unchanged. The fifo ingestion reserve
+   (`free_size >= MAX_BUFFER_SIZE + in_flight_bytes`) keeps a re-stage lossless; the LOUD
+   `[RESTAGE-ORPHAN]` surfaces any residual shortfall. Both are monitor's (== precook's) code.
+5. **What the merge changes** — for the ARQ files: NOTHING relative to monitor. Precook's
+   contribution is the byte-identical `d51cf40e`, already present in monitor via `bfacbcf6`.
+   No consumer assumption is altered by the merge.
+
+### Q.3 What the merge DOES change (non-ARQ), and why it is safe
+- `main.cc`: additive test-harness only — precook's `run_chase_selftest()` + `--test-chase`
+  dispatch + the precook pin-invariant regression (`[TEST-PRECOOK]`), concatenated with
+  monitor's `run_tinterp_seed_selftest()` / `run_acq_bounds_selftest()` / batch-size-desync
+  gate. No production ARQ path touched.
+- `ofdm.cc`: monitor's per-subcarrier LS + leakage-free DFT smoother (`616fcd13`,
+  MERCURY_DFTSMOOTH, cfg16 freq-selective floor fix, default-ON) AND precook's
+  config-geometry bundle hooks (`e18c0ca7`) both preserved; the only textual conflict was a
+  duplicated `#include <cstring>` (monitor: `std::strcmp`; precook: `memset`) collapsed to one.
+- `build.sh`: superset — both test-compile lines (`test_restage_requeue.cc` +
+  `test_stream_offset.cc`); precook's `precook_copy_from.cc` auto-merged into CPP_SOURCES.
+- The precook PHY core (`telecom_system.cc` bundles + `precook_pin_shared_ring`) auto-merged
+  clean. Invariants verified present: descrambler regen after `alloc_shared_buffers` in the pin
+  (`5097fedd`, telecom_system.cc:12168), and the mfsk SNR member `last_demod_snr_db` (mfsk.h:400,
+  init −99.0 at mfsk.cc:68) picked up automatically by `cl_mfsk::copy_from(){ *this = s; }`.
+
+### Q.4 Recorded follow-up (OUT OF SCOPE for this merge)
+`616fcd13`'s DFT smoother does per-frame heap `new`/`delete` of `complex<double>` buffers
+inside the OFDM decode path — heap churn in the hot real-time path, contrary to the precook
+"nothing allocates once engaged" directive. NOT changed in this merge; flagged for a
+follow-up (move the scratch buffers into the pinned bundle).

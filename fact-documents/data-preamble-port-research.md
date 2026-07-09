@@ -1,7 +1,14 @@
 # Data Preamble Detector Port — Research / Planning
 
-**Status:** PLAN ONLY (no code edits). Hand-off doc for the next implementation
-agent.
+**Status:** ~~PLAN ONLY (no code edits). Hand-off doc for the next implementation
+agent.~~ → **Option A EXECUTED / SHIPPED** (correction 2026-07-01, maintenance).
+The discrete-tone-match port landed in mainline: the tunable
+`mfsk_preamble_match_threshold` is live and gates data-preamble acceptance
+(`ofdm.cc:190` init; compare sites `ofdm.cc:4091`, `:4410`; also referenced in
+`mfsk.cc` and `telecom_system.cc`), with regression coverage in
+`mfsk_ctrl_codec_tests.cc` (8 `preamble_match_threshold` assertion sites). This
+doc is KEPT as the sole record of the discrete-match detection math (§2) and the
+Bug #44 anti-data-false-trigger rationale (§6).
 
 **Origin:** `data-frame-cliff-audit-2026-05-27.md` §13.9 — the planned ~3-line
 SUM-form fix to `time_sync_mfsk_corr` proved mathematically equivalent to the

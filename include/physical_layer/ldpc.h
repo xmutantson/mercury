@@ -74,6 +74,20 @@ public:
 	void init();
 	void deinit();
 
+	// PRECOOK M3 (BUNDLE_FIELD_CHECKLIST PART 3): copy all scalars + the
+	// QCmatrix* POINTERS (into const static tables — shared, no ownership/alloc)
+	// from `s`, and free+alloc the owned R/Q/V_pos workspace to src size (content
+	// reset per decode). Runtime state (decode_abort/early_term_speculative/
+	// last_early_term_iter) is NOT copied — reset to defaults.
+	void copy_from(const cl_ldpc& s);
+	// PRECOOK gate helper: compare owned workspace (R/Q/V_pos) + the QCmatrix*
+	// pointers + sizing scalars vs `o`. NULL if identical, else first-diff field.
+	const char* precook_deep_equal(const cl_ldpc& o) const;
+	// Block the shallow default copy (would alias/double-free R/Q/V_pos). The
+	// pool uses clone_config_into (scalars + init()); copy_from is the deep path.
+	cl_ldpc(const cl_ldpc&) = delete;
+	cl_ldpc& operator=(const cl_ldpc&) = delete;
+
 	//! The LDPC encoding function, calculates and annex the parity bits to the original data.
 	    /*!
 	      \param data is the data to be protected by the LDPC code.

@@ -1,9 +1,20 @@
 # OFDM fine-timing: phase-fragile real-dot-product → phase-invariant magnitude metric
 
-**Status:** FIX SHIPPED on branch `fix/ofdm-fine-timing-magnitude` (base `f6e9631`).
+**Status:** ~~FIX SHIPPED on branch `fix/ofdm-fine-timing-magnitude` (base `f6e9631`).
 SIM-validated (fail-before / pass-after, §4). NOT pushed, NOT merged, NO hardware run
-yet (the next steps — adversarial review → DIRECTION-validate in sim → HW magnitude at
-wgn0 — are separate and not done here).
+yet~~ **MERGED TO MAINLINE (re-grounded against HEAD 2026-07-01).** The per-lag `Pg`/`Pr`
+noncoherent-combining fine timer is in the checked-out source:
+`cl_ofdm::time_sync_preamble_with_metric()` now at **`ofdm.cc:2897`** (old anchor `:2406`),
+with the two-per-lag magnitude-coefficient combining documented/implemented at
+**`ofdm.cc:2903-3067`** (the "average of two per-lag magnitude coefficients |P|²/(A²·R)"
+header at `:2903`, the noncoherent-combining form at `:2994-3003`). **[?]** The §5 next
+steps (adversarial review, DIRECTION-validate in sim, HW magnitude at wgn0) were not
+re-verified in this pass — status of those remains as recorded in §5.
+
+> **ANCHOR DRIFT (verified HEAD):** function `:2406` → **`:2897`**; per-lag fix body
+> `:~2484-2565` → **`:~3004-3067`**; coarse detector `time_sync_preamble_halfsym`
+> `:2568-2664` and the `telecom_system.cc` consumer/`mean_H` anchors (`:2078-2082`,
+> `:2420`) below are pre-drift — verify before trusting.
 
 **Date:** 2026-06-04. **Worktree:** `x:/Storage/Documents/hermes and mercury/mercury-ftr-wt`.
 Build `bash build.sh o3`. Targeted test: `mercury.exe --test-ofdm-fine-timing` (fast,

@@ -438,6 +438,7 @@ source/physical_layer/mercury_normal_10_16.cc
 source/physical_layer/mercury_normal_12_16.cc
 source/physical_layer/misc.cc
 source/physical_layer/ofdm.cc
+source/physical_layer/precook_copy_from.cc
 source/physical_layer/physical_config.cc
 source/physical_layer/plot.cc
 source/physical_layer/psk.cc

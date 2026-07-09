@@ -1,7 +1,15 @@
 # Data-Flow Audit: MFSK / OFDM Data Preamble Length (`preamble_nSymb`)
 
-**Status**: Authoritative as of 2026-05-27, written BEFORE the WB-MFSK
-4 → 16 preamble extension lands on `fix/preamble-extend`. Every future
+**Status**: ~~Authoritative as of 2026-05-27, written BEFORE the WB-MFSK
+4 → 16 preamble extension lands on `fix/preamble-extend`.~~ → **LANDED**
+(correction 2026-07-01). The 4 → 16 extension shipped to mainline:
+`MAX_PREAMBLE_SYMB = 16` is now the live value (`include/physical_layer/mfsk.h:56`,
+with `preamble_tones[MAX_PREAMBLE_SYMB]` at `:57` and `mfsk_preamble_tones[16]`
+at `ofdm.h:388`), and the correlation template is sized 16 (`ofdm.cc:185`,`:312`
+init `mfsk_corr_template_sym_energy[16]`). The config-table write region
+(`telecom_system.cc:4481-4620`) and `ofdm.preamble_configurator.Nsymb`
+(`telecom_system.cc:4749`) still exist; treat those line anchors as drifted
+starting points. Every future
 change to `preamble_nSymb` or its consumers MUST update this document.
 
 **Driving work item**: `data-frame-cliff-audit-2026-05-27.md` §H1 — extend

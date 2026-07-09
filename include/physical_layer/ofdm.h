@@ -47,6 +47,18 @@ class cl_pilot_configurator
 public:
 	cl_pilot_configurator();
 	~cl_pilot_configurator();
+	// PRECOOK M3 (PRECOOK_STAGE2_TURNKEY STEP 1): deep-copy every owning buffer
+	// (sequence, virtual_carrier) + all scalars from `s`. ★ LANDMINE-1: does NOT
+	// copy s.carrier (a back-pointer alias into the PARENT cl_ofdm's ofdm_frame);
+	// the parent's cl_ofdm::copy_from re-points it after the sub-object copy.
+	void copy_from(const cl_pilot_configurator& s);
+	// PRECOOK gate helper: compare virtual_carrier/sequence + sizing scalars.
+	const char* precook_deep_equal(const cl_pilot_configurator& o) const;
+	// Block accidental shallow value-copies of an owning-pointer class (would
+	// double-free virtual_carrier/sequence + alias carrier). copy_from is the
+	// only safe deep-copy path. Verified: nothing currently value-copies this.
+	cl_pilot_configurator(const cl_pilot_configurator&) = delete;
+	cl_pilot_configurator& operator=(const cl_pilot_configurator&) = delete;
 	void configure();
 	void init(int Nfft, int Nc, int Nsymb, struct st_carrier* _carrier, int start_shift);
 	void deinit();
@@ -77,6 +89,14 @@ class cl_preamble_configurator
 public:
 	cl_preamble_configurator();
 	~cl_preamble_configurator();
+	// PRECOOK M3: deep-copy the owning `sequence` + all scalars from `s`. ★ does
+	// NOT copy s.carrier (back-pointer alias into the PARENT's ofdm_preamble);
+	// the parent's cl_ofdm::copy_from re-points it.
+	void copy_from(const cl_preamble_configurator& s);
+	// PRECOOK gate helper: compare the owning `sequence` + sizing scalars.
+	const char* precook_deep_equal(const cl_preamble_configurator& o) const;
+	cl_preamble_configurator(const cl_preamble_configurator&) = delete;
+	cl_preamble_configurator& operator=(const cl_preamble_configurator&) = delete;
 	void configure();
 	void init(int Nfft, int Nc, struct st_carrier* _carrier, int start_shift);
 	void deinit();
@@ -128,6 +148,29 @@ private:
 public:
 	cl_ofdm();
 	~cl_ofdm();
+	// PRECOOK M3 (PRECOOK_STAGE2_TURNKEY STEP 1, BUNDLE_FIELD_CHECKLIST PART 2):
+	// deep-copy EVERY owning buffer + nested sub-object (pilot/preamble
+	// configurators, 4 FIRs) + all scalars from `s`, so a fully-built cl_ofdm can
+	// be swapped in without re-running init(). ★ 3 landmines handled inside:
+	//   (1) back-pointer aliases: after copying, pilot_configurator.carrier is
+	//       re-pointed at THIS->ofdm_frame and preamble_configurator.carrier at
+	//       THIS->ofdm_preamble (never the source's).
+	//   (2) grow-as-needed scratch (p2b_*/tsync_*/b2p_*) is set NULL + size 0
+	//       (regrows under the new geometry) — the src's throwaway scratch is NOT
+	//       copied.
+	//   (3) (pre_equalization_channel is a telecom-level field, not in cl_ofdm.)
+	void copy_from(const cl_ofdm& s);
+	// PRECOOK gate helper (BUNDLE_FIELD_CHECKLIST PART 6): byte-compare EVERY
+	// owning buffer (ofdm_frame, ofdm_preamble, estimated_channel[_noamp],
+	// fft tables, the corr templates) + recurse into pilot/preamble/4-FIR
+	// sub-objects vs `o`. Returns NULL if every buffer is byte-identical, else
+	// the name of the first differing buffer (localizes a missed field).
+	const char* precook_deep_equal(const cl_ofdm& o) const;
+	// cl_ofdm owns raw pointers with no user copy-ctor → the default copy would
+	// shallow-alias every buffer (double-free + cross-config corruption). Block it;
+	// copy_from is the only safe path. Verified: nothing value-copies cl_ofdm.
+	cl_ofdm(const cl_ofdm&) = delete;
+	cl_ofdm& operator=(const cl_ofdm&) = delete;
 	void init();
 	void init(int Nfft, int Nc, int Nsymb, float gi);
 	void deinit();

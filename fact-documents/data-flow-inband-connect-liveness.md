@@ -41,8 +41,11 @@ byte-identical when OFF). Once per `process_messages_commander()` poll, BEFORE t
   session init arq_common.cc:530) **while NOT in a data-bearing phase** (connection_status is
   neither TRANSMITTING_DATA nor RECEIVING_ACKS_DATA). On any advance OR any data-bearing poll the
   no-progress streak resets to 0. This is the exact HW signature: control-TX/Idle + nAcked_data flat.
-- **Threshold N**: `INBAND_LIVENESS_STALL_POLLS = 200` consecutive no-progress control-plane polls
-  (env override `MERCURY_INBAND_LIVENESS_POLLS`). Rationale: a normal connect+negotiate completes in
+- **Threshold N**: ~~`INBAND_LIVENESS_STALL_POLLS = 200`~~ **[CORRECTED 2026-07-01: the
+  compile-time constant is now the lazily-resolved accessor
+  `inband_liveness_stall_polls_count()` (`arq_commander.cc:3514`), which returns 200 by
+  default and honors the env override `MERCURY_INBAND_LIVENESS_POLLS`]** consecutive
+  no-progress control-plane polls. Rationale: a normal connect+negotiate completes in
   a few control round-trips (low tens of polls at worst); 200 control-plane polls with ZERO data
   delivered is unambiguously a livelock, not a slow handshake. A normal data batch keeps
   connection_status in the DATA phases (streak reset every batch) so a slow batch cannot trip it.
@@ -115,7 +118,15 @@ and climbs to CONFIG_16. SIM PROOF (`_a3proof/`): OLD ON `on_ftrt.modem.log` sho
 `[T+0052.043] [CMD] SWITCH_BANDWIDTH accepted, switching to WB`, then data flows (nAcked_data 0->3,
 delivered 0->15B) and the guard fires only at T+124 AFTER data flowed (the preserved backstop).
 
-### §5.2 The fix (arq_commander.cc:3231-3253, gate block ~3219-3253)
+### §5.2 The fix (~~arq_commander.cc:3231-3253, gate block ~3219-3253~~ → CORRECTED 2026-07-01)
+
+**[Anchors refreshed 2026-07-01: the whole guard now lives in the dedicated method
+`cl_arq_controller::inband_connect_liveness_guard()` (`arq_commander.cc:3528`), not inline
+at the top of `process_messages_commander()`. The `data_ever_flowed` connect/negotiate
+exemption is the `#ifndef INBAND_NEGOTIATE_FAILBEFORE` block at `arq_commander.cc:3598-3608`;
+the `link_status != CONNECTED` exemption is at :3569-3573; the stall accrual + fire test is
+at :3642-3644. A sibling in-band TIER-CROSSING exemption was added below it
+(`inband_tiercross_handshake_exempts_liveness()`, :3632-3639).]**
 
 Immediately after the `link_status != CONNECTED` exemption, hold the streak at 0 and early-out when
 the link is in a CONTROL handshake AND a DATA session has NOT yet been established:
@@ -136,9 +147,11 @@ so the regression can reproduce the pre-fix false-fire.
 ### §5.3 §5 cross-layer audit — BACKSTOP PRESERVED: **YES**
 
 - **Producers of `cmd_inband_liveness_last_acked`**: the guard, set to `stats.nAcked_data` on every
-  data-ACK advance (arq_commander.cc:3207) and on the hard-reset (arq_commander.cc:3345); init 0 at
-  ctor (arq.h:3556) + reset_session_state (arq_common.cc:5916). **Consumers**: only the guard
-  (the advance test :3205, and now the `data_ever_flowed` predicate :3251).
+  data-ACK advance (~~arq_commander.cc:3207~~ → **:3550**) and on the hard-reset
+  (~~arq_commander.cc:3345~~ → **:3754**); init 0 at ctor (arq.h [line drifted [?]]) +
+  reset_session_state (~~arq_common.cc:5916~~ → **arq_common.cc:6955**). **Consumers**: only the
+  guard (the advance test ~~:3205~~ → **:3548**, and now the `data_ever_flowed` predicate
+  ~~:3251~~ → **:3599**). *[anchors refreshed 2026-07-01]*
 - **Producers/consumers of the streak / breaks counters**: unchanged from §3 — only the guard
   writes/reads them.
 - **Invariant the exemption must NOT break**: a POST-DATA control-plane livelock (stuck in

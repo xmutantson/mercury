@@ -33,7 +33,7 @@
 #include <map>
 #include <vector>  // §20: per-bin power accumulator for base-pattern combining
 #include <cstdlib> // std::getenv for the MERCURY_FFT_FLOAT gate (marathon lever H/I)
-#include <cstring> // std::strcmp for the MERCURY_DFTSMOOTH mode selector (Debian g++12 requires the explicit include; MinGW pulled <cstring> in transitively)
+#include <cstring> // std::strcmp for the MERCURY_DFTSMOOTH mode selector + memset zeroing of st_carrier/st_channel_complex padding at alloc (PRECOOK determinism); Debian g++12 requires the explicit include (MinGW pulled it in transitively)
 
 namespace {
 // FFT plan cache. pocketfft's c2c() builds a new plan on every call, allocating
@@ -236,6 +236,19 @@ void cl_ofdm::init()
 	estimated_channel=CNEW(struct st_channel_complex, this->Nsymb*this->Nc, "ofdm.estimated_channel");
 	estimated_channel_without_amplitude_restoration=CNEW(struct st_channel_complex, this->Nsymb*this->Nc, "ofdm.est_channel_noamp");
 	ofdm_preamble = CNEW(struct st_carrier, this->preamble_configurator.Nsymb*this->Nc, "ofdm.ofdm_preamble");
+	// PRECOOK determinism: st_carrier / st_channel_complex carry 4 bytes of indeterminate
+	// trailing PADDING after their int member (24-byte struct = complex<double>[16] + int[4] +
+	// pad[4]). init() writes every .value/.type/.status but NEVER the padding, so `new[]` leaves
+	// it as heap junk. That is harmless functionally (the DSP never reads padding), but it makes
+	// a raw memcmp of two INDEPENDENTLY-allocated arrays non-deterministic — which broke the
+	// precook bundle==init byte-identical gate (and would make any future memcmp-based geometry
+	// verification unreliable). Zeroing the padding here makes these arrays fully deterministic;
+	// the on-wire signal is byte-identical (padding is never modulated). copy_from's memcpy then
+	// propagates the zero padding into every bundle copy.
+	memset(ofdm_frame, 0, sizeof(struct st_carrier) * (size_t)this->Nsymb * (size_t)this->Nc);
+	memset(estimated_channel, 0, sizeof(struct st_channel_complex) * (size_t)this->Nsymb * (size_t)this->Nc);
+	memset(estimated_channel_without_amplitude_restoration, 0, sizeof(struct st_channel_complex) * (size_t)this->Nsymb * (size_t)this->Nc);
+	memset(ofdm_preamble, 0, sizeof(struct st_carrier) * (size_t)this->preamble_configurator.Nsymb * (size_t)this->Nc);
 	passband_start_sample=0;
 
 	preamble_configurator.init(this->Nfft, this->Nc,this->ofdm_preamble, this->start_shift);
@@ -351,8 +364,12 @@ void cl_ofdm::init_fft_tables(int n)
 		fft_twiddle[k] = std::complex<double>(cos(angle), sin(angle));
 	}
 
-	// Allocate scratch buffer
+	// Allocate scratch buffer. PRECOOK determinism: fft_scratch is pure per-FFT working
+	// storage (written each transform before read), so `new[]` leaves indeterminate content
+	// the modem never reads at rest — zero it so the precook bundle==init memcmp gate is
+	// meaningful (FFT output unchanged; the transform overwrites it before reading).
 	fft_scratch = CNEW(std::complex<double>, n, "ofdm.fft_scratch");
+	memset(fft_scratch, 0, sizeof(std::complex<double>) * (size_t)n);
 
 	// Build bit-reversal permutation table
 	fft_bit_rev = CNEW(int, n, "ofdm.fft_bit_rev");
@@ -1172,6 +1189,10 @@ void cl_pilot_configurator::init(int Nfft, int Nc, int Nsymb,struct st_carrier* 
 	}
 	nData=Nc*Nsymb;
 	virtual_carrier = CNEW(struct st_carrier, this->Nc_max*this->Nc_max, "pilot.virtual_carrier");
+	// PRECOOK determinism: zero the st_carrier padding (see cl_ofdm::init note). virtual_carrier
+	// cells set only .type below; without this the trailing pad bytes are heap junk and a memcmp
+	// of two independent builds diverges. On-wire byte-identical (padding never modulated).
+	memset(virtual_carrier, 0, sizeof(struct st_carrier) * (size_t)this->Nc_max * (size_t)this->Nc_max);
 
 	for(int j=0;j<this->Nc_max;j++)
 	{
@@ -1381,6 +1402,11 @@ void cl_preamble_configurator::init(int Nfft, int Nc, struct st_carrier* _carrie
 	this->configure();
 
 	sequence = CNEW(std::complex<double>, this->Nsymb*this->Nc, "preamble.sequence");
+	// PRECOOK determinism: only PREAMBLE-type carrier cells write into sequence[] below (seq_idx
+	// advances per PREAMBLE cell), leaving the trailing entries as indeterminate `new[]` content
+	// the modem never reads. Zero the whole buffer so two independent builds are memcmp-identical
+	// (the precook bundle==init gate); on-wire byte-identical (unwritten entries are never read).
+	memset(sequence, 0, sizeof(std::complex<double>) * (size_t)this->Nsymb * (size_t)this->Nc);
 
 	if(print_on==YES)
 	{

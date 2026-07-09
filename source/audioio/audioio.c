@@ -1357,6 +1357,15 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 
 	double *buffer_temp = (double *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(double) * 2);
 
+	// [C1-LOCKWAIT] benchmark-probe accumulators (function-scope so the exit
+	// summary can report the true running max even when it never crossed the
+	// per-event log threshold — proves Stage-1 sub-us, not merely "< thresh").
+	int    c1_lw_probe = getenv("MERCURY_C1_LOCKWAIT") ? 1 : 0;
+	double c1_lw_max_us = 0.0;
+	double c1_lw_sum_us = 0.0;
+	long   c1_lw_samples = 0;
+	long   c1_lw_n_over  = 0;
+
 	while (!shutdown_)
     {
 		cl_data_container *data_container_ptr = &telecom_ptr->data_container;
@@ -1396,7 +1405,40 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 			data_container_ptr->rx_mute_samples += symbol_period;
 		}
 
+		// [C1-LOCKWAIT] benchmark probe (default OFF, byte-identical when off).
+		// Measures how long THIS capture-prep thread (C1) blocks acquiring
+		// capture_prep_mutex. During a config switch the RSP's load_configuration
+		// holds this mutex; the DEFEAT (legacy) path holds it across the whole
+		// deinit/init rebuild (~100-200 ms) => C1 goes deaf; the Stage-1 leaf
+		// publish holds it for a bounded scalar-store+memset (~sub-us). The wait
+		// window == the deaf window (C1 not draining capture_buffer => RX ring is
+		// not being fed). We log every wait over C1_LW_THRESH_US and print the
+		// true running max + mean at thread exit. Enabled by MERCURY_C1_LOCKWAIT=1.
+#ifdef FF_LINUX
+		struct timespec _c1lw0, _c1lw1;
+		if(c1_lw_probe)
+			clock_gettime(CLOCK_MONOTONIC, &_c1lw0);
+#endif
+
 		MUTEX_LOCK(&capture_prep_mutex);
+
+#ifdef FF_LINUX
+		if(c1_lw_probe) {
+			clock_gettime(CLOCK_MONOTONIC, &_c1lw1);
+			double _wait_us = (_c1lw1.tv_sec - _c1lw0.tv_sec) * 1e6
+				+ (_c1lw1.tv_nsec - _c1lw0.tv_nsec) / 1e3;
+			const double C1_LW_THRESH_US = 200.0; // ignore normal uncontended jitter
+			if(_wait_us > c1_lw_max_us) c1_lw_max_us = _wait_us;
+			c1_lw_sum_us += _wait_us;
+			c1_lw_samples++;
+			if(_wait_us > C1_LW_THRESH_US) {
+				c1_lw_n_over++;
+				printf("[C1-LOCKWAIT] wait_us=%.1f wait_ms=%.3f max_us=%.1f n_over=%ld\n",
+					_wait_us, _wait_us / 1000.0, c1_lw_max_us, c1_lw_n_over);
+				fflush(stdout);
+			}
+		}
+#endif
 
 		// Re-read buffer parameters inside mutex to prevent use-after-free
 		// during config switches that deinit/reinit passband_delayed_data.
@@ -1463,6 +1505,12 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 
 
 	printf("radio_capture_prep_thread exit\n");
+	if(c1_lw_probe) {
+		double _mean = c1_lw_samples ? (c1_lw_sum_us / (double)c1_lw_samples) : 0.0;
+		printf("[C1-LOCKWAIT-SUMMARY] samples=%ld max_us=%.2f max_ms=%.4f mean_us=%.3f n_over_200us=%ld\n",
+			c1_lw_samples, c1_lw_max_us, c1_lw_max_us / 1000.0, _mean, c1_lw_n_over);
+		fflush(stdout);
+	}
 	shutdown_ = true;
 
 	free(buffer_temp);

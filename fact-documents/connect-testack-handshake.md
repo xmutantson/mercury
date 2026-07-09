@@ -1,6 +1,9 @@
 # Connect TEST_CONNECTION / TEST_ACK handshake — single-missed-ack stall
 
-**Status:** DESIGN / pre-implementation (plan for owner approval; NO code yet).
+**Status:** ~~DESIGN / pre-implementation (plan for owner approval; NO code yet).~~
+**IMPLEMENTED (§7) → REGRESSED+FIXED (§8) → connect-reack heal EXCISED (§9, commit
+8e62722e).** (status corrected 2026-07-01 — the design shipped, its connect-reack
+pre-data heal was later fully removed; see §9.)
 **Owner:** ARQ-architect session 2026-06-21, branch `fix/testbed-reliability`.
 **Scope:** the CMD↔RSP connect handshake (START_CONNECTION → TEST_CONNECTION →
 TEST_CONNECTION_ACK). A single un-detected TEST_CONNECTION_ACK costs the WHOLE
@@ -465,3 +468,50 @@ the bounded window (the unbounded-loop bug is gone), B4 hand-back restores ftr>2
 B5 one-shot, B6 data-arrival self-terminate. 8/8 PASS. FAIL-BEFORE: the old code
 called `connect_reack_pre_data_window()` directly (never closes) with no
 hand-back, so B3/B4 would FAIL.
+
+## §9 CONNECT-REACK EXCISE (2026-07-01 record; commit 8e62722e)
+
+**Outcome:** the connect-reack pre-data re-ACK mechanism described in §7/§8 — the
+`connect_reack_probe_window_open()` arbiter, its `frames_to_read` clamp, and the
+one-shot hand-back — was **fully REMOVED** by commit `8e62722e`. This §9 exists
+because live source cites `connect-testack-handshake.md §9` from five sites and
+the section was missing (dangling citations, verified 2026-07-01):
+`arq_common.cc:610`, `arq_responder.cc:115`, `:463`, `:3066`, `:10148`.
+
+### §9.1 Why the §8 bound was not enough (root)
+Even after §8 bounded the probe window to `2*mtt+ptt`, that window still
+**overlapped the first WB OFDM data batch**. The probe clamped the SHARED PHY
+`frames_to_read=2` across the CONNECTED pre-data RECEIVING window; with ftr pinned
+at 2 the OFDM data consumer (`this->receive()`) could not stage a full data frame,
+so the FIRST WB batch was never captured and the gearshift stayed stuck at
+`config100` (never climbed off ROBUST). This is the same shared-PHY starvation the
+§8 fix tried to bound rather than remove.
+
+### §9.2 The fix = REMOVAL (excise 8e62722e)
+In the CONNECTED pre-data window the responder no longer touches
+`frames_to_read` at all — it stays owned by the RECEIVING-entry set
+(`frame_symb+10`, `arq_responder.cc:1913`) that the OFDM data path needs. Excise
+sites (comments read 2026-07-01): the probe/arbiter is gone at
+`arq_common.cc:610` ("CONNECT-REACK REMOVED"); the pre-data re-ACK block at
+`arq_responder.cc:463`; and the cache-populate at `arq_responder.cc:3066`. The
+handshake ACK is still built and sent on the handshake path — only the *pre-data
+re-ACK probe* was removed.
+
+### §9.3 Regression guard (guards the excise, not the feature)
+`cl_arq_controller::test_connect_reack()` (`arq_responder.cc:10180`; CLI
+`--test-connect-reack`; wired into master `--test`) GUARDS THE EXCISE:
+- **C0** — real OFDM-config RX, CONNECTED + RECEIVING + pre-data
+  (`batch_rx_frame_count==0`), `frames_to_read` seeded to the data value
+  (`frame_symb+10`).
+- **C1 PASS-AFTER** (production binary): after the pre-data control path runs, the
+  shared `frames_to_read` is NOT pinned to 2 — the first WB batch is capturable and
+  the climb is unblocked.
+- **C2 FAIL-BEFORE** (`MERCURY_REACK_CLAMP_DEFEAT=1`, same binary): re-introduces
+  the 8e62722e clamp (ftr=2) → `frames_to_read` drops to 2, proving the test
+  catches a regression of the removed clamp.
+
+### §9.4 Status arc
+DESIGN (§3) → IMPLEMENTED (§7, 2026-06-22) → REGRESSED + bounded (§8, 2026-06-25)
+→ **EXCISED (§9, commit 8e62722e)**. The connect-reack re-ACK is retired; the
+integrity concern §1 raised is now handled without a shared-PHY clamp. §7/§8
+remain as the historical implementation record.

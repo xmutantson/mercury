@@ -15,6 +15,18 @@ impairment stages added to `cl_sim_awgn` and for the SOF-jitter term at the
 wire→capture site. Every claim below is cited `file:line`. Open questions
 are marked **[?]**. Wrong facts get struck through, not deleted.
 
+> **MAINTENANCE NOTE 2026-07-01 (anchor re-ground; findings unchanged):** the
+> §1/§2 findings hold, but the `arq_commander.cc` line anchors drifted heavily —
+> the file grew from ~9.7k lines (this doc's `win/sim-faithful` base) to ~19.4k in
+> mainline. The flagged primary anchor is corrected inline below: the SIM_INPROC
+> stepper `sim2_drain_to_wire` (the whole-symbol integer `sp`-sample move + the
+> single shared clock `sim_clock_add_samples`) is now `arq_commander.cc:15928-15960`
+> (was cited `:9700-9732`); the SINGLE-SYMBOL PACING / `sim2_deliver_from_wire`
+> region (the SOF-jitter site, cited `:9790-9805`) now begins ~`arq_commander.cc:15966`.
+> Other in-neighborhood `arq_commander.cc` cites (~`:9660`–`:9900`) shifted by
+> roughly +6200 lines; treat any un-refreshed line number as a starting point to
+> re-verify (README §6), not a permanent address.
+
 ---
 
 ## §0. Why this exists (the user's ask)
@@ -35,7 +47,7 @@ The in-process wire is a **perfect shared clock**: three impairments that exist
 on real hardware are all ZERO in the sim.
 
 1. **SFO = 0.** `sim2_drain_to_wire` moves whole integer `sp`-sample symbols and
-   ticks ONE shared clock (`arq_commander.cc:9700-9732`); there is no
+   ticks ONE shared clock (`arq_commander.cc:15928-15960`); there is no
    `rational_resampler` in the wire. The two instances share a sample clock.
 2. **CFO = 0.** `cl_sim_awgn::process` applies only the deterministic floor +
    per-symbol common-phase phase-noise + AWGN — NO carrier ramp
@@ -134,7 +146,7 @@ so the function stays PURE (TX and RX derive bit-identical schedules). Default 1
 - Default-off short-circuits to a NO-OP: no rng draw, no state change ⇒
   `MERCURY_SIM_2INST` with no extra env stays byte-identical. Re-run the GATE-2
   same-seed-twice check + the legacy 19-byte ROBUST_0 smoke.
-- Integer-symbol clock tick (`arq_commander.cc:9700-9732`) UNCHANGED.
+- Integer-symbol clock tick (`arq_commander.cc:15928-15960`) UNCHANGED.
 - PRODUCTION (`-m ARQ`) byte-identical: `cl_sim_awgn` has NO production callers;
   `g_sim_inproc_pump` is null-default (`arq_common.cc:130`) so the pump is inert
   in `-m ARQ` / `-x sim`. Confirm with a `-m ARQ` before/after byte-compare.
@@ -174,7 +186,7 @@ is changed to run a real per-frame coarse search.
 GATE-2 sample-accounting invariant (owned by the companion cadence doc): the wire
 delivers whole-integer `sp`-sample symbols and ticks the shared clock by exactly
 `sp`. The jitter perturbs CONTENT alignment, not symbol COUNT — verify this holds
-at `arq_commander.cc:9700-9732` and `:9790-9805`.
+at `arq_commander.cc:15928-15960` and `:9790-9805`.
 
 ## §5. Acceptance test (falsifiable, two-sided, anti-tuning)
 
