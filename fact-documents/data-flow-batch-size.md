@@ -128,6 +128,20 @@ production path uses direct assignment.
 confirmation → no promotion credit.** This is the mechanism of all four wire
 failures.
 
+> **★ 2026-07-03 — a FIFTH, WORSE consequence of the same desync: SILENT DATA
+> CORRUPTION (not just a stall).** When the mismatch is CMD>RSP (CMD=30, RSP=25 — CMD
+> Axis-2 stepped up but the RSP never durably APPLIED it; see §2.4/§2.6 + the unreliable
+> SET_LINK_PARAMS round-trip), the RSP ACK-GATE (§3.3) does NOT stall — it DELIVERS the
+> batch TRUNCATED to its own smaller size and treats it complete, ORPHANING the sender's
+> surplus frames (their source bytes are delivered by NEITHER batch) → a permanent
+> one-batch stream SHIFT → the whole tail is silently wrong. Captured as `res_c3100`
+> (WGN:25, ~3%); full root-cause + fix design (confirmed-before-use step-up + an RSP
+> loud desync-abort) in `fact-documents/silent-corruption-residual.md`. The §1 invariant
+> is even more load-bearing than the stall framing implied: a CMD>RSP mismatch is a
+> life-critical integrity fault, so the step-UP handshake must be RSP-confirmed-applied
+> before the CMD builds at the new size (the round-trip ACK at `arq_commander.cc:7333`
+> does NOT currently guarantee this).
+
 ### 3.2 CMD block-build / TX
 `process_messages_tx_data()` (`arq_commander.cc:1138`) and the data-frame
 producer iterate `i<data_batch_size` (e.g. `arq_common.cc:6654`, `:6805`).
@@ -272,7 +286,85 @@ assumptions are in `gearshift-climb-engine.md` §8.
 
 ---
 
+## §8 Silent-corruption backstop (B) + step-up confirm (A) — audit + fix (2026-07-03)
+
+Root-cause + full narrative in `silent-corruption-residual.md` (capture `res_c3100`,
+CMD=30 / RSP=25 at bsi 11). This section is the SHARED-STATE audit for the NEW state the
+fix touches: `rx_batch_total_frames` (the SENDER-declared per-batch frame count, D5) as
+seen at the RSP ACK-GATE. Per CLAUDE.md §"Cross-Layer Data-Flow Audits":
+
+### §8.1 The sender-declared count `rx_batch_total_frames` — producers
+D5 (`TRACK_C_D2D3D5_DESIGN.md`) carries the TX-authoritative batch frame count on EVERY
+data frame so a lost EOB frame cannot erase it. This IS the sender's `data_batch_size`
+signal available to the RSP at the gate.
+1. **TX (CMD)** `arq_common.cc:8892-8898,8916,8940`: `batch_total_frames_wire =
+   message_batch_counter_tx` (frames the CMD packed into THIS radio batch = min(CMD
+   `data_batch_size`, frames available)) written to DATA_LONG byte[5] / DATA_SHORT byte[6]
+   when `header_carries_d5`. **Emits 0 (unknown) on `sack_retransmit_active`** (the retx
+   queue is not the original batch) so the RX keeps the count already latched.
+2. **RX decode (RSP)** `arq_common.cc:12960-12964` (DATA_LONG), `:13023-13027`
+   (DATA_SHORT): `rx_buffer_batch_total_frames = (btf>0)?btf:-1` (staged per-frame).
+3. **RX promote (RSP)** `arq_responder.cc:1458-1459`: `if(sack_v2_enabled &&
+   rx_buffer_batch_total_frames>0) rx_batch_total_frames = rx_buffer_batch_total_frames;`
+   — a NON-ZERO count on ANY surviving frame of the batch promotes the authoritative count.
+4. **RX reset (RSP)** `arq_responder.cc:2441` (clean BATCH-DONE), `arq_common.cc:9856,9927`
+   (session reset), `rsp_gap_abort_teardown` `arq_common.cc:9927` → `-1` so the next batch
+   re-baselines. Robust configs do NOT carry the D5 byte (`arq_commander.cc:14805`,
+   `arq_common.cc:2164`) → `rx_batch_total_frames` stays −1 there (the backstop is inert at
+   robust, which is correct — robust batch is pinned symmetric by §1/§5).
+
+### §8.2 Consumers of `rx_batch_total_frames` at delivery (the clamp = the truncation)
+- **ACK-GATE expected-count** `arq_responder.cc:2111-2115`:
+  `expected = rx_batch_total_frames; if(expected > data_batch_size) expected = data_batch_size;`
+  **THE clamp is the silent-truncation point.** When the sender declared MORE frames than
+  the RSP's `data_batch_size`, the clamp collapses `expected` to the RSP's smaller size, so
+  `rx_received (25) >= expected (25)` → ACK-GATE PASS → `copy_data_to_buffer()` delivers 25
+  frames and treats the 30-frame batch COMPLETE → orphans frames 25-29 → permanent shift.
+- Twin clamps: current-batch gate `arq_responder.cc:1479-1483`, prev-batch
+  `arq_common.cc:9791-9796` (both `min(rx_batch_total_frames, data_batch_size)`).
+
+### §8.3 Valid states + the MISMATCH invariant the consumers assume
+- **Invariant (the load-bearing one, §1):** CMD `data_batch_size` == RSP `data_batch_size`.
+  When it holds, `rx_batch_total_frames <= data_batch_size` ALWAYS (the CMD cannot pack
+  more frames than its own batch size, and its size == the RSP's). So
+  `rx_batch_total_frames > data_batch_size` is a PRECISE, SUFFICIENT, false-positive-free
+  detector of the CMD>RSP desync — the exact `res_c3100` fault. (Compression packs FEWER
+  frames ⇒ count ≤ size; retx emits 0 ⇒ keeps latched; never a benign over-count.)
+- MISMATCH states: **CMD>RSP** (`res_c3100`: CMD Axis-2 stepped up, RSP config-reset to 25
+  and never applied 30) → silent truncation. **CMD<RSP** → RSP over-waits, SACKs the
+  shortfall, safe (no corruption). **mid-batch change** → whichever side is larger at the
+  gate governs; CMD>RSP is the dangerous one.
+
+### §8.4 FIX (B) — LOUD BACKSTOP (SHIPPED, `arq_responder.cc` ACK-GATE)
+New pure helper `batchsize_desync_detected(sender_total_frames, local_batch, sack_v2)` →
+true iff `sack_v2 && sender_total_frames>0 && sender_total_frames>local_batch`. The ACK-GATE
+(pattern-ACK branch, after `expected` derivation) calls it; on a detected desync (and
+`!passive_monitor`, backstop not env-defeated) it prints `[RSP-V2-BATCHSIZE-DESYNC]` and
+calls `rsp_gap_abort_teardown()` (link DROPPED, state cleared, no delivery) — the SAME
+tested integrity teardown the D3.1 GAP-ABORT uses. Converts the silent stream-shift into a
+LOUD, recoverable abort. `MERCURY_BATCHSIZE_DESYNC_DEFEAT=1` disables it (the fail-before
+arm, mirrors `MERCURY_GAP_ABORT_DEFEAT` / `MERCURY_D5_INFER_DEFEAT`). Integrity D0: the RSP
+NEVER silently delivers a batch truncated below the sender-declared size.
+
+### §8.5 FIX (A) — confirmed-before-use step-up (see silent-corruption-residual.md §7-A)
+The CMD must not BUILD at a stepped-UP `data_batch_size` until the RSP has verifiably
+applied it (the round-trip at `arq_commander.cc:7069-7080` is unreliable — false-positive
+control-ACK match OR lost SET_LINK_PARAMS). Step-DOWN is always safe (no wait). Status
+recorded in this doc + silent-corruption-residual.md §10 as SHIPPED / designed-not-merged.
+
+### §8.6 What each fix changes + consumer walk (uncommon paths)
+- (B) adds ONE new consumer read of `rx_batch_total_frames` at the gate. It does NOT change
+  any producer, so the clamp consumers (§8.2), the SACK bitmap, the climb credit, and every
+  matched-batch path are BYTE-IDENTICAL when `rx_batch_total_frames <= data_batch_size`
+  (the normal case) — the backstop is INERT unless CMD>RSP. BREAK / config-switch / session
+  reset: `rx_batch_total_frames` is reset to −1 on all of them (§8.1.4) so a stale count
+  cannot spuriously fire the backstop on the next batch. Robust (batch symmetric, no D5
+  byte): inert. Monitor: `!passive_monitor` guard keeps monitors lenient (they legitimately
+  accept partials). 1-lost-control-frame case (the capture): the CMD is at 30, RSP at 25 →
+  the backstop fires LOUD instead of silent truncation — exactly the intended recovery.
+
 ## §7 Related fact documents
 - `gearshift-climb-engine.md` — the climb promotion gates (anchor, +1 clamp,
   FRAME-UP/LADDER-UP) and Bugs 1/2/3. §3/§6.1 corrected by §4.1 above.
 - `data-flow-messages_rx_prev.md` — the prev-storage state (dead at batch=1).
+- `silent-corruption-residual.md` — the `res_c3100` root-cause + (A)/(B)/(C) design + test.

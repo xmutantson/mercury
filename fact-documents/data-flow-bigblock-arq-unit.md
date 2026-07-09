@@ -1806,3 +1806,227 @@ A SEPARATE CMD-side field the turbo state machine does NOT touch (so it survives
 - Part T (arq_commander.cc test_climb_engine, mirrors Parts R/S): T0 arms BASE; T1 AARF doubling capped at MAX (24→48→…→384, no overflow); T2 ceiling=CFG15 armed / −1 off; T3 `apply_bigblock_cooldown_cap` refuses CFG16→CFG15 armed, identity off; T4 FIX-4 target == FIX-5 ceiling; T5 INV-B3 clear-gate (CFG16-carve clears, CFG15-ACK / framing-off do NOT); T6 post-expiry fresh fade resets span to BASE; T7 the cooldown SURVIVES the `supershift_proven_ceiling=CFG16` reset and STILL caps at CFG15 (the limit-cycle break).
 - `--test-bigblock-climb-election` adds an 8-check FIX-5 section on a REAL pair (load_configuration / framing real): re-election REFUSED while armed, per-frame CFG15 delivery rung selected, turbo-reset survival, INV-B3, clear-on-CFG16-carve, exponential growth capped.
 - FAIL-BEFORE via `-DWALLB_FIX5_FAILBEFORE` (the helpers compile to 0/−1 = no cooldown): Part T fails 9 checks, the election section fails 5; PASS-AFTER all green. `--test-bigblock-carve-suspend-unit` (FIX-3), `--test-bigblock-arq-unit`, `--test-bigblock-fullpath` (carve-success unaffected), `--test-probe-backoff`, `--test-data-anchored-promote` all stay green. CMD-only, no RSP/wire/DSP change. NO monitor merge, NO push, NO attribution.
+
+## §21. RSP-FORWARD BIG-BLOCK ACQUISITION — the D3 DETECT→LATCH→EXTRACT fires on the WRONG SIDE (the CMD emitter's phantom), the RSP forward receiver never engages it, and the real forward block fails cw0 on a WINDOW-FITTING (not overrun) capture (2026-07-04, static audit on `feat/bigblock-d3-acq`@`524bf965`, worktree read-only; smoke `w4w3vt8no` → `_research/_d3_smoke/`)
+
+Proactive cross-layer audit (CLAUDE.md §5) BEFORE coding, triggered by the smoke verdict: the D3
+counter-fix WORKS as designed (EXTRACT=3, `abs_start` survives the reinit) but big-block delivers 0
+byte-faithful. This section resolves WHY and gives the single combined fix. All file:line are
+`@524bf965` (`mercury/source/...`).
+
+### §21.0 The ground truth (smoke markers, `_research/_d3_smoke/D3_SMOKE_MARKERS.txt` + `cohort2/res_Cs1.json`)
+Cs1 (CMD emits a K=8 block at T+199.331, `block_samples=74752` = 64 sym = 1.557 s; ring
+`cap=155344` = 133 sym = 3.236 s):
+- `[RSP] [BBTX-GATE] failed cw0 wire-CRC` at T+200.756 and T+202.645, then `[RSP]
+  [BB-CARVE-SUSPEND] after 3 consecutive cw0-CRC rejects` at T+206.439. **The RSP NEVER logs a
+  `[BBTX-D3-*]` line.**
+- `[CMD] [BBTX-D3-LATCH] abs_start=109820 (head=125004)` → DEFER×2 → `[CMD] [BBTX-D3-EXTRACT]` at
+  T+205.317, then `[CMD] [BBTX-GATE] failed cw0 wire-CRC`. Same for the 2nd emit (`head=124768`)
+  and Cs2 (`head=125744`). **D3 LATCH/EXTRACT fire ONLY on the CMD.**
+- `res_Cs1.json`: `cmd_nreceived_frames=0`, `rsp_nreceived_frames=95`, `rx_bytes=11360`
+  (`byte_integrity_ok=true`) — the payload prefix is delivered by the **stock per-frame fallback**,
+  `carve=0`, `byte-faithful blocks=0/6`. Big-block adds ZERO throughput today.
+
+### §21.1 Q-A — WHICH SIDE D3 engages on, and WHY (the wrong-side root)
+`cl_arq_controller::receive()` is a SINGLE shared method called by BOTH roles — CMD at
+`arq_commander.cc:2810/4394/4885`, RSP at `arq_responder.cc:471`. The D3 machine
+(`arq_common.cc:12855-13001`) lives in it with **NO `connection_status` gate** (grep of 12480-13120
+for `connection_status` = empty). Its fresh-latch entry is:
+
+    bb_d3_engaged = bb_absacq_live && !acqguard_defeat && framing && M!=MFSK
+                  && current_configuration==CONFIG_16 && !bigblock_carve_suspended()
+                  && ( bigblock_acq_state==1
+                       || (bigblock_rx_candidate && !bigblock_acq_window_fits()) );   // 12875-12884
+
+- `bigblock_framing_enabled` is TRUE on BOTH peers: the smoke sets `MERCURY_BIGBLOCK_FRAMING=1`
+  (forced at `telecom_system.cc:89`, unconditional), and both are at CFG16 (`[BIGBLOCK-ELECT]
+  role=RSP` T+196.590, `role=CMD` T+196.705 — the batch-size election `arq_common.cc:2617-2639`,
+  gated only on `framing && CFG16`, NOT `MERCURY_BIGBLOCK_ELECT`). So `framing && M!=MFSK && CFG16`
+  holds on BOTH.
+- `total_samples_written` (the D3 counter) has **no role gate** — advanced by the capture-prep
+  thread `audioio.c:1456` for both peers, so `bb_absacq_live` (`bb_abs_written>0`,
+  `arq_common.cc:12873-12874`) is TRUE on BOTH.
+- **The ONLY discriminator is `!bigblock_acq_window_fits()`** (`arq_common.cc:8208-8224`; `block_end
+  = head + block_nsymb*sym_samples`; returns `block_end <= cap`, and TRUE when `head<0` or
+  `cap<=0`). D3's fresh entry is **OVERRUN-ONLY**.
+  - **CMD (`RECEIVING_ACKS_DATA`, the emitter listening for the reverse SACK):** it is NOT receiving
+    a forward block. Its capture holds reverse-ACK / self / ambient audio, which the LOOSE big-block
+    acquisition (`bigblock_rx_passband`, `telecom_system.cc:8824` — Schmidl-Cox ALWAYS returns some
+    peak, then demods K codewords regardless of validity → `Kout=8`, `head_delay` set) classifies as
+    a K=8 "block" landing LATE: `head≈125004` = 107 sym → `block_end = 107+64 = 171 sym > 133 = cap`
+    → **OVERRUN → `!window_fits` TRUE → D3 LATCHES.** It is a PHANTOM (`cmd_nreceived_frames=0`; cw0
+    always rejects it, `[CMD] [BBTX-GATE]`).
+  - **RSP (`RECEIVING`, the real forward receiver):** it arms `frames_to_read` to a full block span
+    (`bigblock_block_ftr_or`, `arq_common.cc:8037-8058`, at the RECEIVING-entry `arq_responder.cc
+    ~1913` + `arq_common.cc:9922/10087/10713/10879`), so it snapshots after the 64-sym block has
+    fully landed inside the 133-sym ring → `head ≤ 69 sym` → `block_end ≤ 133 = cap` → **`window_fits`
+    TRUE → D3's overrun-only entry NEVER triggers.** (Airtight: with `bigblock_rx_candidate` TRUE at
+    the gate — the `[RSP] [BBTX-GATE]` prints `K=8` from `arq_common.cc:13090`, inside `if(candidate
+    && !cw0_valid)` at 13071 — and `bb_absacq_live` TRUE, the ONLY way NO `[BBTX-D3-*]` AND NO
+    §22-legacy-defer `arq_common.cc:13008`, also `!window_fits`-gated appear is
+    `bigblock_acq_window_fits()==true` on the RSP.)
+
+**Where it SHOULD engage:** the RSP forward-receive path (`connection_status==RECEIVING`), for EVERY
+detected big-block candidate at CFG16 — NOT only on overrun. The whole big-block RX carve + D3
+machine must be CONFINED to `RECEIVING` so it does NOT fire on the emitter's
+`RECEIVING_ACKS_DATA`/`RECEIVING_ACKS_CONTROL` states (arq_commander.cc:1896/2086/2626 set
+`RECEIVING_ACKS_DATA`).
+
+### §21.2 Q-B — the RSP forward cw0/PHY decode (fitting-but-failing, not overrun)
+Order inside `receive()` (frames_to_read==0 branch): snapshot `bigblock_acq_snapshot_abs_written`
+(`12494`) → primary `receive_byte` (`12766`) → `receive_bigblock` (`telecom_system.cc:10439`) sets
+`bigblock_last_rx_K=Kout` (`10556`) + `bigblock_last_rx_head_delay_samples` (`8935`) +
+`bigblock_last_rx_capture_nsamples` (`10459`) → **D3 machine (`12855`)** → cw0 gate (`13071`,
+`bigblock_rx_cw0_header_valid` `arq_common.cc:8312-8368`: de-whitens cw0's `sub_len` bytes, CRC-8
+over `crc_span`, compares to the wire byte) → carve or force-stock re-decode.
+
+So on the RSP the D3 EXTRACT runs BEFORE cw0 **only if it engages** — and it doesn't (§21.1). The
+RSP therefore hands cw0 the **raw, window-fitting-but-POLLUTED** snapshot: the 133-sym ring holds
+the 64-sym block PLUS ~69 sym of the previous burst / reverse-ACK / (when the CMD re-emits on a
+missed SACK) a co-resident 2nd copy. The earliest-preamble SC (`telecom_system.cc:8879-8882`,
+`MERCURY_BIGBLOCK_EARLIEST`) can lock a residual/2nd preamble, and even on a correct head the
+block-wide DD-CE estimate is contaminated by the co-resident energy → cw0 decodes garbage →
+wire-CRC fails. **This is NOT the tail-truncation D3 was built for (that is the overrun/CMD case) —
+it is a POLLUTED-WINDOW decode failure that D3's single-burst reconstruct (`bigblock_acq_reconstruct`
+`arq_common.cc:8261-8281` zeroes everything outside `[abs_start-lead, abs_start+block+trail]`) is
+EXACTLY suited to clean — but only if it engages.** `[BB-CARVE-SUSPEND]` fires because 3 such raw cw0
+rejects accumulate (`bigblock_note_carve_reject` `13089`; predicate `arq_common.cc:8070-8075`) with
+D3 never getting first crack. It is NOT a separate decode bug; it is the same no-D3-capture root.
+
+The CMD-side EXTRACT proves the RECONSTRUCT MECHANISM completes (latch→wait-tail→abs-index extract),
+but its cw0-fail is uninformative (phantom input). There is **NO live datapoint yet of a
+cleanly-extracted REAL forward block's cw0 result** — the fix's pass-after gate must produce one.
+
+### §21.3 Q-C — EMIT / CFG16-HOLD reliability (why 20/24 then 0/3; the deterministic pin)
+NOT flaky HW (bench-claim guard) — a Mercury/harness config condition. The smoke ran the gearshift
+ON: S16 cells `--start-cfg 16` with NO `--no-gearshift` (`smoke_cohort2.sh`), so all 4 DEMOTED to
+cfg14 (the reverse-ACK-miss **DEMOTE-AMPLIFIER**, this doc §20 / MEMORY `turnaround_solution_design`
+/ `cfg15_stall_root_cause`); the Cs climb cells (`--start-cfg 100`) needed the slow ROBUST→WB climb
+to reach 16 before the payload drained. The K-sweep 2.5 h earlier reached 16 ~20/24 only because the
+climb happened to hold that run — the emit precondition RIDES the flaky climb/demote, independent of
+the D3 fix (the base binary reproduces 0/3 now).
+**Deterministic pinned-CFG16 emit EXISTS:** `arq_realaudio.py:410-413` — `--no-gearshift` emits
+`-Q 0` which PINS the modem at `--start-cfg` (no climb, no demote). `--start-cfg 16 --no-gearshift`
+holds CFG16 and emits a big-block every batch, decoupling the forward-path test from the
+climb/demote confound. (Production still wants the demote-amplifier fix — separate, already-tracked
+campaign — but the D3 forward-path fix must be validated on the PINNED path first.)
+
+### §21.4 Q-D — downstream gates that will bite once cw0 passes (so the fix is complete)
+1. **Carve-suspend lock-out (chicken-and-egg, PRIMARY interaction):** `bb_d3_engaged` AND
+   `bigblock_rx_candidate` BOTH require `!bigblock_carve_suspended()` (`12880`, `12814`). Today the
+   RSP hits 3 raw cw0 rejects and SUSPENDS (`8070`) BEFORE D3 ever engages → once suspended, D3 can
+   NEVER engage. The fix MUST make D3 engage on the FIRST acquisition so a clean-extract cw0 result
+   (not a raw-window reject) is what feeds the streak. Ordering after fix: D3 EXTRACT re-decode
+   (`12957`) → recompute candidate (`12960`) → cw0 gate (`13071`); only a POST-extract cw0 fail
+   should count toward suspend.
+2. **Whole-block CRC-32 (`arq_common.cc:8567-8597`):** fires when `n_clean==K`; on mismatch clears
+   all `cw_ok`→PARTIAL/SACK re-send. A cleanly-extracted block that decodes 8/8 must also pass this
+   32-bit gate to DELIVER (it will, if the K sub-units are byte-correct — the unit test proves it).
+3. **Per-codeword CRC-8 / SACK granularity (`cw_ok[]`, carve `8422-8425`):** <K clean → PARTIAL →
+   SACK gap re-send + the FIX-2 partial-completion stash (`8687-8719`). Works today for a real
+   block; only reachable once cw0 passes.
+4. **bsi advance (`rsp_current_expected_batch_seq_id`):** the carve reads the WIRE bsi
+   (`use_wire_header=true`, header parse `8600/8618`, `block_bsi=payload[0]`) — authoritative /
+   drift-proof, so a correct cw0 → correct bsi mapping. No extra fix needed, but the pass-after test
+   must confirm the carved bsi matches the emitted `bsi=8`.
+5. **Block-span re-arm revert under suspend (`bigblock_block_ftr_or` `8051`):** while suspended it
+   returns stock ftr (per-frame cadence) — once D3 keeps the carve alive, the block-span arm stays,
+   which is required for the next block's window. Consistent with the fix.
+
+### §21.5 Producer/consumer map — the RSP-forward path (new/changed shared state)
+- **`total_samples_written`** (monotone abs counter): PRODUCER `audioio.c:1456` (both peers, no role
+  gate); reset `data_container.cc:77/194/267`, preserved across the receive_bigblock rebuild by the
+  counter-fix (`telecom_system.cc:10239/10281`). CONSUMER `arq_common.cc:12494` (snapshot) + `12943`
+  (reconstruct). VALID: 0 before first write / after a real config change; grows.
+- **`bigblock_acq_state`/`_abs_start`/`_block_samples`/`_defers`** (D3 latch): PRODUCERS the D3
+  machine `12906-12996`; reset on config change `2225-2232`. CONSUMER the same machine. **BUG: no
+  `connection_status` producer-guard → the CMD emitter latches phantoms.**
+- **`bigblock_last_rx_K`/`_head_delay_samples`/`_capture_nsamples`** (PHY detect): PRODUCER
+  `bigblock_rx_passband`/`receive_bigblock` (`telecom_system.cc:8833/8935/10459/10556`). CONSUMERS
+  `bigblock_acq_window_fits` (`8211-8212`), D3 LATCH (`12908`), `bigblock_rx_candidate` (`12809`),
+  cw0 gate (`8315`), carve (`8414`). INVARIANT the consumers assume: a locatable REAL forward block.
+  Violated by the loose acquisition on non-forward audio (the CMD phantom) and by co-resident
+  pollution (the RSP fit-but-fail).
+- **`bigblock_rx_carve_fail_streak`** (suspend): PRODUCER `bigblock_note_carve_reject` (`13089`) /
+  reset on accept + config change; CONSUMER `bigblock_carve_suspended` (`8072`), which gates D3 +
+  candidate. INTERACTION: §21.4-1.
+
+### §21.6 THE SINGLE COMBINED FIX (which-side-D3 + RSP cw0-capture + emit + downstream, together)
+All four land together (a partial fix re-exposes a sibling — the §17/§20 serial-discovery pattern):
+
+**F1 — Confine the big-block RX carve + D3 machine to the forward-data-receive state.** Add
+`connection_status==RECEIVING` to `bigblock_rx_candidate` (`arq_common.cc:12805`) and to
+`bb_d3_engaged` (`12875`) — equivalently gate the whole 12805-13160 carve/D3 region on `RECEIVING`.
+KILLS the CMD phantom (the emitter is in `RECEIVING_ACKS_DATA`/`_CONTROL`) so D3 only ever acts on a
+real forward block. Off-`RECEIVING` the emitter falls to the stock per-frame path (byte-identical).
+
+**F2 — Relax the D3 fresh-latch entry from OVERRUN-ONLY to CANDIDATE-DETECTED.** Change `12883-12884`
+from `(state==1 || (candidate && !window_fits))` to `(state==1 || candidate)`. The RSP then latches
+the earliest located copy's `abs_start` on the FIRST detected block whether it "fits" or overruns;
+`bigblock_acq_window_fits()` now only decides whether a tail-DEFER is needed (fits → tail already
+in-ring → EXTRACT immediately; overrun → DEFER as today). The abs-index single-burst reconstruct
+(`8261-8281`) strips the co-resident/residual pollution → clean re-decode → cw0. (The §22 legacy
+`!window_fits` path at `13008` stays for `MERCURY_BIGBLOCK_D3_ABSACQ=0` A/B.)
+
+**F3 — Give D3 first crack before the suspend streak.** Ensure the carve-fail streak
+(`bigblock_note_carve_reject`, `13089`) only accrues on a POST-EXTRACT cw0 reject, never on the raw
+pre-D3 window (F2 makes D3 engage on acquisition #1, so this holds structurally; verify no path
+increments the streak between the snapshot and the D3 EXTRACT re-decode).
+
+**F4 — Validate on the DETERMINISTIC pinned-CFG16 emit** (`--start-cfg 16 --no-gearshift`,
+`arq_realaudio.py:413` `-Q 0`) so the forward-path result is not masked by the climb/demote flake.
+
+**Fail-before / pass-after gate (the missing live datapoint, smoke recommendation #2):**
+1. RSP forward block currently `[RSP] [BBTX-GATE]` cw0-fail on the fitting window, carve=0,
+   `byte-faithful=0`, → `[BB-CARVE-SUSPEND]`. (fail-before, already observed.)
+2. After F1+F2: RSP logs `[BBTX-D3-LATCH]`/`[BBTX-D3-EXTRACT]` (never CMD), the extracted window DUMP
+   == the emitted `block_samples` (confirm real forward block, not a phantom), cw0 PASSES, carve 8/8,
+   block-CRC-32 passes, carved bsi==emitted bsi, `rx_bytes` climbs at the big-block rate.
+   (pass-after.) Only THEN run the K-sweep (its metric = delivered throughput, still 0 today).
+
+DO NOT run the 4-arm K-sweep until #2 holds. NO monitor merge / push / attribution until the
+pass-after byte-faithful forward delivery is proven on the pinned path.
+
+### §21.7 F1+F2 IMPLEMENTED + LIVE SMOKE — the acquisition IS fixed (RSP captures), but a DEEPER cw0-DECODE wall is now the binding constraint (VERDICT: STILL-0) (2026-07-04, `feat/bigblock-d3-acq`@`5f997410`, 6 pinned-CFG16 cells on .11 WGN:40; artifacts `_research/_bb_fwd/`)
+
+**Implemented** (all default-ON, CFG16-big-block-gated; extracted so the acqwindow unit test drives
+the SAME production predicate; `MERCURY_BIGBLOCK_DEFEAT_D3ENTRY` restores the pre-fix gate for A/B):
+- **F1** `bigblock_rx_role_ok()` (`arq_common.cc`): gate `bigblock_rx_candidate` (12805) + the D3
+  engagement on `connection_status==RECEIVING`. Kills the CMD emitter phantom (RECEIVING_ACKS_*).
+- **F2** `bigblock_d3_should_engage()`: entry relaxed from overrun-only `(candidate && !window_fits)`
+  to `(state==1 || candidate)`. A window-FITTING RSP forward block now engages D3.
+- **F3** structural (F2 engages on acq #1 → only post-EXTRACT rejects feed the streak). **F4** pinned
+  `--start-cfg 16 --no-gearshift` (`-Q 0`). Unit: `--test-bigblock-acqwindow` ALL PASS (new F1/F2/RSP
+  arms); `--test-bigblock-chanest` PASS (base==mine); cfg<=15 TX PLOT_PASSBAND fingerprint IDENTICAL
+  (cfg 5,10). `--test-bigblock-multicw/fullpath` crash PRE-EXISTINGLY on base 524bf965 (SIM_INPROC
+  PHY-SWITCH deinit double-free, before any assertion) → not a gate on this branch, not my regression.
+
+**Live smoke (6 cells, seeds 1-6):** RSP D3-**LATCH=18, EXTRACT=12** (audit fail-before = 0 — the RSP
+NEVER latched); CMD phantom LATCH=0/EXTRACT=0 (F1 killed it — before, ALL latches were CMD). **So
+§21.1 is FIXED: the DETECT→LATCH→EXTRACT has moved to the RSP forward receiver and engages the
+FITTING block.** BUT RSP carve=0, cw0-reject=18, **cw0-accept=0.0%**, byte-faithful=0/6, 6×
+[BB-CARVE-SUSPEND], rx_bytes=0. Rep. lifecycle (P16s3): 3 real fitting blocks (head 58-75k,
+block_samples=74752=64 sym K=8) each LATCH→EXTRACT("clean single-burst window")→re-decode **fails
+cw0 wire-CRC**→SUSPEND.
+
+**The wall (mechanism, corrects §21.2's assumption that reconstruct⇒cw0-pass):** the D3-extracted
+window is correctly located (`bigblock_rx_passband` returns K=8) and correctly placed — the
+reconstruct addressing `(rw_now+(a-aw_now)) mod cap` is ALGEBRAICALLY IDENTICAL to the working
+snapshot memcpy `(rwi+a-aw) mod sp` (§21.5), so NOT a location/addressing bug; and the
+receive_bigblock input is snapshot-guarded (`telecom_system.cc:10487`), so NOT the UAF. **The BIG-BLOCK
+K=8 DD-CE / whitening / cw0 decode of the extracted REAL-CHANNEL window fails** — even though the STOCK
+per-frame CFG16 path delivers on this SAME WGN:40 channel (§21.0 baseline 11360 B), so NOT a
+channel-margin wall. Candidate roots for the fork: (a) `rx_passband_normalize_and_blank` RMS-normalizes
+over the ~52%-ZERO reconstructed window → block mis-scaled → LLR/LDPC fails on the real (non-loopback)
+channel; (b) block-wide DD-CE loses the surrounding-symbol context the zeroing removed. The in-process
+acqwindow unit decodes the reconstruct 8/8 ONLY because its input is a clean loopback TX passband (no
+channel) — it CANNOT reproduce this real-channel wall. This is the SAME cw0-decode wall the D3
+counter-fix VERDICT saw on the CMD phantom, now confirmed on the REAL RSP forward block.
+
+**FORK (owner):** acquisition fixed; big-block decode of the extracted window is the wall.
+(A) fix the sparse-window decode — first probe: normalize over the BLOCK EXTENT (not the zero-padded
+window) and/or fill lead/trail with real ring samples (keep DD-CE context); a live normalize-over-block
+vs over-window A/B localizes root (a) vs (b) — keeps bank-DD-CE. (B) if per-acquisition single-burst
+DD-CE can't decode robustly on the real channel, pivot the acquisition/decode architecture (decode at
+the located head in the LIVE ring without zero-carving a sparse window). DO NOT run the K-sweep; DO NOT
+tune to pass. F1+F2 are correct+necessary, committed (5f997410), NOT merged/pushed.
