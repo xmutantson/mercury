@@ -2708,7 +2708,20 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		// no SACK payload — NB doesn't have the symbol-rate budget for
 		// SACK and the receiver implicitly treats any pattern hit as a
 		// clean ACK. See mercury/fact-documents/mfsk-robust-ack.md §3.4.
-		if(sack_v2_enabled)
+		//
+		// D3.1 (data-integrity): if the delivery-time gap gate just tore the
+		// session down (batch_gap_aborted), the RSP is in a reset/DROPPED state
+		// whose bsi window no longer describes a live batch. Emitting a clean
+		// ACK/SACK from here would be a ZOMBIE confirm — rsp_prev_batch_seq_id was
+		// cleared to -1 by the teardown, so ack_bsi falls back to 0 and the RSP
+		// would tell the CMD "batch 0 received cleanly" for a transfer it just
+		// aborted. Never confirm from a torn-down state; the aborted link stays
+		// silent and the peer times out.
+		if(batch_gap_aborted)
+		{
+			// no confirm emitted — see the gap-abort rationale above.
+		}
+		else if(sack_v2_enabled)
 		{
 			unsigned char ack_bsi = (unsigned char)(
 				rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);

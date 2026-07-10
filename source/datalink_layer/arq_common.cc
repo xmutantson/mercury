@@ -10159,8 +10159,35 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 	last_received_end_of_batch_seq    = -1;
 	for(int i=0; i<this->nMessages; i++)
 		messages_rx_prev[i].status = FREE;
+
+	// D3.1 (data-integrity, the ruler-survival keystone): a gap-abort is a
+	// MID-TRANSFER event, NOT a true session boundary. The peer is never told
+	// (this teardown puts no frame on the wire), so it keeps driving the SAME
+	// stream and the next batch re-adopts at the cur<0 site. The contiguity
+	// high-water mark (rsp_last_delivered_batch_seq_id) is the ONLY state that
+	// lets that re-adopt detect the dropped-batch hole: with it preserved,
+	// sack_v2_readopt_has_gap(next_bsi, high_water) fires and the hole aborts
+	// LOUDLY again; cleared to -1 it reads as "no constraint" and the RSP
+	// silently concatenates non-contiguous bytes across the hole — the exact
+	// corruption this teardown exists to refuse. reset_session_state() clears
+	// the ruler (correct for the genuine session boundary it was built for), so
+	// SAVE it across the reset and RESTORE it after — mirroring the DEMOTE-REBASE
+	// discipline at arq_responder.cc:3656 (wipe cur/prev, PRESERVE the ruler so
+	// the next frame re-adopts through the gap-gate). The high-water still
+	// advances normally once the CMD legitimately resends the abandoned bytes
+	// under a contiguous bsi.
+	//
+	// Fail-before harness knob (test-only, do-not-enable in production):
+	// MERCURY_GAP_RULER_BLIND=1 restores the pre-fix behavior (clear the ruler)
+	// so the regression test can prove it exercises THIS state-discipline fix,
+	// not the weather. =1 re-opens the silent non-contiguous delivery.
+	bool ruler_blind = false;
+	{ const char* e = std::getenv("MERCURY_GAP_RULER_BLIND");
+	  if(e && *e && atoi(e)!=0) ruler_blind = true; }
+	int preserved_last_delivered = rsp_last_delivered_batch_seq_id;
 	reset_session_state();
-	// reset_session_state() set rsp_last_delivered = -1 too.
+	if(!ruler_blind)
+		rsp_last_delivered_batch_seq_id = preserved_last_delivered;
 }
 
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
