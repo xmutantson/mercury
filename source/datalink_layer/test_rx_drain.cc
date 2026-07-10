@@ -25,7 +25,7 @@
 // would-blocks) and collects every byte the socket "accepted" so the test can
 // reconstruct the delivered stream and assert byte-exact, in-order, no-loss.
 //
-// FAIL-BEFORE / PASS-AFTER CONTRACT (CLAUDE.md §3):
+// FAIL-BEFORE / PASS-AFTER CONTRACT:
 //   PRE-FIX  (HEAD 62cb3dc): the drain discards the popped bytes on every
 //            would-block -> the reconstructed stream is SHORT (a gap) -> FAIL.
 //   POST-FIX (FIX-6):        the unsent tail is stashed in rx_deliver_pending and

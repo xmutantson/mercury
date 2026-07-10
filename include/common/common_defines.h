@@ -183,7 +183,7 @@ inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 //   dwell (the operating point inside [1..MAX]).
 // ROBUST_DWELL_PROOF_BATCHES — consecutive clean batches AT THE ROBUST RUNG
 //   required before the raise fires (proves PARKED, not transient).
-// All three are SWEPT in the FTRT sim, not magic-numbered (CLAUDE.md §1 / OR-5).
+// All three are SWEPT in the FTRT sim: measured, not magic-numbered (OR-5).
 // Starting values below; the sweep result is recorded in the fact doc §8.
 #define ROBUST_DWELL_BATCH_MAX     8
 #define ROBUST_DWELL_BATCH         4
@@ -911,7 +911,7 @@ CONFIG_16 (5664.7 bps).
 // repeat fail up to PROBE_BACKOFF_MS_CAP, and the whole back-off is reset the
 // instant ANY clean OFDM batch is delivered (the channel proved it recovered).
 // OR-5 / [Q1]: these are STARTING values, to be SWEPT in the FTRT sim / HW
-// floor-stack A/B (NOT magic-numbered final constants — see CLAUDE.md §1 and the
+// floor-stack A/B (measured, NOT magic-numbered final constants — see the
 // fact-doc §6 sweep note). INIT ~8 s ≈ one robust-tier dwell cycle (long enough
 // to do real floor work between probes, short enough that a recovering channel
 // re-probes promptly); CAP ~120 s bounds the worst-case re-probe latency on a

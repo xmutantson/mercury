@@ -18,7 +18,7 @@
 // MISSING (and what P2.4/2.5/2.6 add) is the ARQ-layer translation:
 //   cw_ok  ->  messages_rx[] population  ->  one ACK / partial SACK / bsi-once.
 //
-// THE FAIL-BEFORE / PASS-AFTER CONTRACT (CLAUDE.md §3, fact-doc §6):
+// THE FAIL-BEFORE / PASS-AFTER CONTRACT (fact-doc §6):
 //   The test calls the PRODUCTION block->ARQ entry
 //   cl_arq_controller::bigblock_block_to_arq(). At P2.0 that entry is a one-line
 //   STUB returning BIGBLOCK_ARQ_NOT_WIRED (it populates NOTHING — no ARQ logic).

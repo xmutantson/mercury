@@ -1366,7 +1366,7 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 	// successive wire failures of the climb-fix family were all this same class
 	// (CMD/RSP robust-batch mismatch via a different producer each time:
 	// SACK-recompute predicate skew, Axis-2 growth, SET_LINK_PARAMS clamp). Per
-	// the data-flow-batch-size.md audit (CLAUDE.md §5) we stop guarding each
+	// the data-flow-batch-size.md cross-layer audit we stop guarding each
 	// producer in isolation and enforce the invariant HERE, at the sole setter,
 	// so no current OR future producer can bypass it.
 	//
@@ -2690,7 +2690,7 @@ bool cl_arq_controller::build_config_tag_tones(int batch_cfg, int batch_seq_id,
 	// — the builder no longer relies on a process-global side effect. SAVE/RESTORE
 	// the prior repfact: gf16ra is process-global and the legacy CONNECT FEC path
 	// runs at configure(3) (set_suffix_fec, N=52) — leaving the global at 2 would
-	// mis-size a subsequent CONNECT-FEC capture (CLAUDE.md §5 cross-layer guard).
+	// mis-size a subsequent CONNECT-FEC capture (cross-layer guard).
 	int saved_repfact = gf16ra::current_repfact();
 	gf16ra::configure(2);
 	gf16ra::init();
@@ -2750,7 +2750,7 @@ bool cl_arq_controller::build_nack_tones(int rx_cfg, uint8_t rx_expected_bsi_lsb
 	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0) return false;  // M<16
 
 	// Configure the gf16ra graph to N=39 R=1/3 (the SAME substrate the tag uses).
-	// SAVE/RESTORE the process-global repfact (cross-layer guard, CLAUDE.md §5).
+	// SAVE/RESTORE the process-global repfact (cross-layer guard).
 	int saved_repfact = gf16ra::current_repfact();
 	gf16ra::configure(2);
 	gf16ra::init();
@@ -7783,7 +7783,7 @@ bool cl_arq_controller::bigblock_send_one_block()
 	// estimate is unchanged -> decode stays 8/8, while the wire level matches a regular
 	// frame (the +2.3 dB HW overdrive closes), with ZERO pilot/geometry/throughput change.
 	//
-	// The cancel factor is MEASURED, not hardcoded (CLAUDE.md §1): it is the SAME level
+	// The cancel factor is MEASURED, not hardcoded: it is the SAME level
 	// reduction the FIR cascade would impose on THIS block. Apply FIR_tx1->FIR_tx2 to a
 	// scratch copy (the band-limit reference), measure the FIR'd-vs-raw data-region RMS
 	// ratio, and scale the raw (un-FIR'd, shape-preserving) block by that ratio. This makes
@@ -13882,7 +13882,7 @@ void cl_arq_controller::receive()
 // accounting for un-stored bytes. Returns the number of bytes actually stored
 // (== len on success). The bench3 stall is fixed by Mouth A alone (the FIFO was
 // drained empty by the lossy pop); Mouth B exists so the fix cannot reintroduce
-// a sibling silent-drop under a faster burst (CLAUDE.md §5).
+// a sibling silent-drop under a faster burst (cross-layer guard).
 int cl_arq_controller::fifo_push_rx(const char* buf, int len)
 {
 	if(len <= 0) return 0;

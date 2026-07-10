@@ -5,7 +5,7 @@ BP scheduling for the SPA decoder (env MERCURY_LDPC_LAYERED, default off).
 
 Drives the coded SFO-GRID harness — the same 27-cell fleet vehicle the sibling
 levers (ldpc-decode-accel.md §1, turnaround-eff.md §6) use. Fail-before /
-pass-after per CLAUDE.md §3.
+pass-after contract.
 
 Layered BP processes the P parity-check rows ONE AT A TIME, immediately folding
 each updated check->var message into a running a-posteriori sum so a LATER row in

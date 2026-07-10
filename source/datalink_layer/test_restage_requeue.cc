@@ -22,7 +22,7 @@
 // comes out CONTIGUOUS + IN-ORDER at the FRONT (ahead of the newer data), byte-exact,
 // zero loss.
 //
-// FAIL-BEFORE / PASS-AFTER CONTRACT (CLAUDE.md §3):
+// FAIL-BEFORE / PASS-AFTER CONTRACT:
 //   PRE-FIX  (MERCURY_RESTAGE_ORPHAN_DEFEAT=1): forward-iter push()-to-BACK -> the
 //            in-flight block lands BEHIND the newer data -> out-of-order -> FAIL
 //            (the observed positional shift).

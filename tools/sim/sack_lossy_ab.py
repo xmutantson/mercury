@@ -12,7 +12,7 @@ no-SACK pays a full-batch-retransmit penalty per loss, while SACK retransmits
 only the missing frames. This sweep measures whether that theoretical win is
 real and where the clean<->lossy crossover sits.
 
-Design (CLAUDE.md validation methodology):
+Design (validation methodology):
   * Fixed config (default WB_CFG15), no gearshift — apples-to-apples.
   * Channel sweep: a clean baseline + progressively lossier points. Each
     point is a list of documented-valid IONOS serial commands (WGN:N,

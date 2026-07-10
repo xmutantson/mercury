@@ -4,7 +4,7 @@ feat/turnaround-eff regression: sub-peak/trial-multiplier kill (#1) +
 syndrome-weight non-convergence early-term (#3), with the SHARED detector.
 
 Drives the coded SFO-GRID harness (the same vehicle ldpc-decode-accel.md §1
-used). Fail-before / pass-after, per CLAUDE.md §3. See
+used). Fail-before / pass-after contract. See
 fact-documents/turnaround-eff.md §6.
 
 Checks

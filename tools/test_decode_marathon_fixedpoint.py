@@ -19,7 +19,7 @@ Standard result: a well-scaled int16 (even int8) min-sum is within ~0.1 dB of
 float min-sum.
 
 Same 27-cell coded SFO-GRID fleet vehicle as the sibling levers
-(decode-marathon-E.md §6). Fail-before / pass-after per CLAUDE.md §3.
+(decode-marathon-E.md §6). Fail-before / pass-after contract.
 
 Checks
 ------

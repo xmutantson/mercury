@@ -2486,7 +2486,7 @@ static void test_mfsk_data_preamble_mini_moose_zero_cfo_no_op() {
 // confidence gate `|C|/energy_total < 0.05` should fire on noise →
 // returns 0. Tested across 50 seeds to catch tail behaviors.
 //
-// This is the cross-layer regression guard required by CLAUDE.md §5: the
+// This is the cross-layer regression guard: the
 // estimator MUST NOT produce wild values that would corrupt the
 // freq_offset_measured downstream consumers (sanity reject, re-mix,
 // cache). Returning 0 (no-op) on noise is the safe default.
@@ -6790,7 +6790,7 @@ static void test_recovery_break_reps_agnostic() {
 //        the mechanism reads CONSTANT-CFO (single grid peak).
 //   STOP if combining+refine ALSO fails to clear >0.95, OR the mechanism reads
 //        TIME-VARYING DRIFT.
-// This test FAILS loudly on the STOP condition so CLAUDE.md §2 is honored (do not ship
+// This test FAILS loudly on the STOP condition so the stop gate is honored (do not ship
 // DELTA-2 if it doesn't clear the constant-CFO miss).
 static void test_recovery_ack_cfo_gate() {
 	const char* name = "recovery_ack_cfo_gate";
@@ -7062,7 +7062,7 @@ static void test_recovery_ack_cfo_gate() {
 	printf("    FAR (pure noise, count+metric gate, %d trials): combining-only %d/%d, combining+refine %d/%d (bar %d/16 UNCHANGED)\n",
 		FT, far_comb, FT, far_ref, FT, thr);
 
-	// --- GATE VERDICT (decision gate, CLAUDE.md §2) ---
+	// --- GATE VERDICT (decision gate) ---
 	// This is a DIAGNOSTIC decision gate, not a fix-validator: it RUNS the {combining-only
 	// vs combining+refine} x CFO measurement and the Phase-1 mechanism read, then records
 	// GO or STOP. A clean STOP is a SUCCESSFUL gate run (it correctly told us DELTA-2 is
@@ -7094,7 +7094,7 @@ static void test_recovery_ack_cfo_gate() {
 			"DELTA-2 validated in sim; HW A/B warranted.\n",
 			P_comb, P_ref, P_ref - P_comb, grid_peak_f, far_ref, far_comb, FT);
 	} else {
-		printf("    [GATE VERDICT] STOP (CLAUDE.md §2): DELTA-2 (CFO refine) is NOT the clean-recovery fix.\n");
+		printf("    [GATE VERDICT] STOP: DELTA-2 (CFO refine) is NOT the clean-recovery fix.\n");
 		printf("      reasons: %s%s%s%s%s\n",
 			drift ? "[TIME-VARYING DRIFT: no single de-rotation recovers the count] " : "",
 			!refine_clears ? "[refine P_ref < 0.95: cannot reliably clear the 7/16 bar at the cliff] " : "",

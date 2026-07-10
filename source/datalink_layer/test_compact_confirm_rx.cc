@@ -34,7 +34,7 @@
 // tail and a wrong-bsi frame are both REJECTED, and a 13-uncoded ACK+SACK frame
 // is NOT cross-accepted as a compact confirm).
 //
-// FAIL-BEFORE / PASS-AFTER CONTRACT (CLAUDE.md §3):
+// FAIL-BEFORE / PASS-AFTER CONTRACT:
 //   PRE-FIX  (MERCURY_COMPACT_RX_FAILBEFORE=1, same binary): the accept path is
 //            the OLD `receive_ack_pattern() && ...` chain -> the compact frame is
 //            REJECTED (bare gate peaks < 7/16 on the 26-sym frame) -> FAIL.
@@ -479,7 +479,7 @@ int cl_arq_controller::test_compact_confirm_live_rx_path()
 // SELF-VALIDATING compact decode FIRST, inside the window, BEFORE the 13-uncoded
 // decode. The CRC12-over-[bsi] (not the SACK window) is the false-confirm guard.
 //
-// FAIL-BEFORE / PASS-AFTER CONTRACT (CLAUDE.md §3):
+// FAIL-BEFORE / PASS-AFTER CONTRACT:
 //   PRE-FIX  (MERCURY_COMPACT_SACK_WINDOW_FAILBEFORE=1, same binary): the in-window
 //            accept is the OLD Branch-2 — only decode_ack_sack_from_passband runs on
 //            the compact tail -> NO CRC-valid clean ACK -> the confirm is REJECTED.

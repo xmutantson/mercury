@@ -588,8 +588,8 @@ int cl_arq_controller::connect_seed_target()
 	// a clean one — both seed (capped) to CONFIG_8. On WGN:10/15 the seeded CONFIG_8
 	// CANNOT be carried: the session thrashes BREAK and delivers 0 bytes vs the
 	// monitor baseline's 53-182 (TOTAL DATA LOSS on marginal HF — unacceptable for
-	// life-critical). A fixed-dB margin on this proxy is a THRESHOLD BAND-AID (CLAUDE.md
-	// "no threshold bandaids"); the real fix needs a data-plane viability signal, not a
+	// life-critical). A fixed-dB margin on this proxy is a THRESHOLD BAND-AID (a
+	// symptom-mask, not a root fix); the real fix needs a data-plane viability signal, not a
 	// control-plane SNR guess. DO NOT default-enable until §10.7 is resolved. Opt-in for
 	// continued investigation only: MERCURY_CONNECT_SEED=1.
 	{
@@ -1928,7 +1928,7 @@ void cl_arq_controller::process_messages_tx_control()
 			// process_messages_tx_data() (the data-TX setups at :~1317/:~1813 clear
 			// the arm for every TRANSMITTING_DATA→data-wait route). Clear here too so
 			// the arm is provably false on EVERY data-ACK wait without any transitive
-			// "a data-TX always preceded this" assumption (CLAUDE.md §5).
+			// "a data-TX always preceded this" assumption (cross-layer data-flow audit).
 			clear_snr_arm_for_data_ack_wait();
 			connection_status=RECEIVING_ACKS_DATA;
 		}
@@ -3592,7 +3592,7 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	emergency_nack_count = 0;
 
 	// (5) Optimizer Axis-1 supremacy hook (a config MOVE; mirrors the BREAK paths + D3).
-	// CROSS-LAYER NOTE (CLAUDE.md §5): when Axis-3 was ON/OFF this hook transitions it to
+	// CROSS-LAYER NOTE (data-flow audit): when Axis-3 was ON/OFF this hook transitions it to
 	// PROBE and tries to queue a SET_LINK_PARAMS (axis3_send_set_link_params, :14834), which
 	// would OCCUPY messages_control and block the SET_CONFIG demote below. The SET_LINK_PARAMS
 	// is best-effort (the helper's own busy-check + the EOB-self-correct safety net cover a
@@ -18870,7 +18870,7 @@ int cl_arq_controller::test_sim_inproc_bigblock_fullpath()
 }
 
 // STEPPER-CORE REWRITE Phase b durable regression (--test-sim-sustain). The cross-layer test
-// CLAUDE.md requires for the stepper-core rewrite. It drives the OUTER-loop stepper
+// the stepper-core rewrite requires. It drives the OUTER-loop stepper
 // (MERCURY_SIM2_STEPPER=outer) through a LIVE CONNECT-at-ROBUST_0 -> SET_CONFIG -> CFG16 OFDM
 // big-block transfer and asserts the Phase-b headline: the (iii) nested-drain DATA-path wedge
 // (root-cause §9.3) is GONE. FAIL-BEFORE (the legacy stepper / Phase a, MERCURY_SIM2_STEPPER

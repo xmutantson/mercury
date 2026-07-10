@@ -5,7 +5,7 @@ Turbo-EQ regression test (RESEARCH_turbo-eq.md, fact-documents/data-flow-turbo-e
 Drives the SFO-GRID coded harness (-m PLOT_PASSBAND -s 16, MERCURY_SFO_GRID +
 _CODED + _CHAN + _GENIE + _TURBO_ITERS) and asserts the turbo lever's behavior.
 
-THE FAILING-FIRST TEST (CLAUDE.md Principle 3 / Phase-4): on the channel-estimation-
+THE FAILING-FIRST TEST (fail-before / pass-after contract): on the channel-estimation-
 limited cell the production LS estimator FAILS to decode (high post_FEC_info_BER)
 while GENIE (perfect CSI) PASSES (post_FEC_info_BER == 0). That is the documented
 "Mercury is channel-estimation-limited" compass — the test that fails before the

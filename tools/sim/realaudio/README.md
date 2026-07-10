@@ -24,7 +24,7 @@ not by the contended CPU. Pinned ROBUST_0 idle vs `stress-ng --cpu 24` gave
   that limitation was specific to the decode-consumption-driven virtual clock
   of the TCP relay, NOT this real-audio path.
 - Parallelize by default. A 36-commit linear hunt is ~6 min concurrent, not ~24
-  serial. (See workspace `CLAUDE.md` "Parallelize by default".)
+  serial.
 
 ## Files (this directory)
 

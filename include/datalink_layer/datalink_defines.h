@@ -229,7 +229,7 @@ enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
 // dependency. Checked at RX in bigblock_receive_carve BEFORE bigblock_block_to_arq, ONLY
 // when the per-cw layer reports the block fully clean (n_clean==K); on mismatch ALL cw_ok
 // are cleared -> the block routes to the EXISTING PARTIAL/SACK gap path (re-send) and is
-// NEVER delivered. Does NOT weaken the per-cw CRC-8 (CLAUDE.md §2): both run, the CRC-8
+// NEVER delivered. Does NOT weaken the per-cw CRC-8 (both are kept): both run, the CRC-8
 // still picks the per-codeword SACK granularity when the block is partial.
 #define BIGBLOCK_BLOCK_CRC_BYTES 4                            // 1 CRC-32 byte-quad / block
 // byte offset of the block CRC-32 within the K*sub_len payload: the 4 bytes just before

@@ -2,7 +2,7 @@
 """
 test_fade_tinterp.py -- regression for the FADE-tier TIME_INTERP estimator
 (feat/fade-tinterp). Pairs the data-flow audit fact-documents/
-data-flow-noise_variance_estimate.md (CLAUDE.md cross-layer regression rule).
+data-flow-noise_variance_estimate.md (cross-layer regression rule).
 
 Drives the in-process MERCURY_SFO_GRID harness (-m PLOT_PASSBAND), no IONOS / no RF.
 Asserts, on the ITU-R Watterson profiles the 900-cell sim verdict used

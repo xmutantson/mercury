@@ -246,7 +246,7 @@ def main():
         coupling_verdict['gate_explanation'] = (
             'AEAD MAC failures observed AFTER batch-size moves — the streaming'
             ' compression/encryption context corrupted by the batch resize.'
-            ' STOP per CLAUDE.md.')
+            ' STOP.')
     elif coupling_verdict['crypto_rx_ok'] == 0:
         coupling_verdict['gate_verdict'] = 'INCONCLUSIVE'
         coupling_verdict['gate_explanation'] = (

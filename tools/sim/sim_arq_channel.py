@@ -799,7 +799,7 @@ def main():
             # --start-cfg (main.cc:2858-2859: nb_probe_max==0 && BW_AUTO => start
             # WB, no NB->WB negotiation). Without -Q 0 the session starts NB CFG14
             # and waits for the (now-absent) gearshift probe to upgrade, so CONNECT
-            # never reaches the pinned WB tier. Matches the CLAUDE.md -Q 0 recipe.
+            # never reaches the pinned WB tier. Matches the -Q 0 recipe.
             # PINs the config so the airtime wire reads a SINGLE-config per-frame
             # rate (GAP #1 / GAP1_AIRTIME_WIRE_VERDICT.md §"climb-run caveat").
             c += ["-Q", "0"]

@@ -18,7 +18,7 @@
 // (copy_data_to_buffer, which advances rx_stream_delivered). No wire, no RF, no sockets;
 // deterministic; well under 1 s. 0 = PASS, 1 = FAIL.
 //
-// This is Fable's PRE-COHORT GATE: the cursor MUST be ground truth before the STEP-2
+// Pre-cohort gate: the cursor MUST be ground truth before the STEP-2
 // wire stamp/check is meaningful.
 // ============================================================================
 

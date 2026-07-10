@@ -215,8 +215,6 @@ only affect logging or table-load behavior.
 - `B2F_UNROLL_REROLL.md` (workspace root) — Winlink B2F integration policy.
 - `IONOS_BUTLER.md` (workspace root) — IONOS fading-channel testbed access
   protocol. All hardware access goes through the butler on `localhost:7700`.
-- `CLAUDE.md` (workspace root) — engineering standards for contributors
-  (research-before-implement, root-cause-not-symptom, fact-document discipline).
 
 ## Compatible Clients
 

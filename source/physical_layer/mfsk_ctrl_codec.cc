@@ -1130,7 +1130,7 @@ bool config_tag_wrap_decode(const double* energies,
 	// the configure(2)=N=39 substrate; ensure the process-global gf16ra graph is at
 	// repfact=2 for THIS decode and restore the prior value (the legacy CONNECT FEC
 	// runs at configure(3)=N=52 — this decode must neither depend on nor corrupt it;
-	// CLAUDE.md §5 cross-layer guard). Self-contained so any caller is safe.
+	// cross-layer guard). Self-contained so any caller is safe.
 	int saved_repfact = gf16ra::current_repfact();
 	if(saved_repfact != 2) { gf16ra::configure(2); gf16ra::init(); }
 	uint64_t p37 = 0; int iters = -2;

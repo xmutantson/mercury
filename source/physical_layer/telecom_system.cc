@@ -84,7 +84,7 @@ cl_telecom_system::cl_telecom_system()
 	// byte-identical per-frame path. Not wired into the gearshift (that is P4).
 	// HELD 2026-06-17: cannot be a simple default-flip — the big-block path is NOT wired
 	// into the gearshift/optimizer (no climb can reach it) and the whole family is gated
-	// behind the unresolved CFG16-acquisition D1->D5 chain (CLAUDE.md STOP-gate). Needs
+	// behind the unresolved CFG16-acquisition D1->D5 chain (the stop gate). Needs
 	// gearshift wiring + the CFG16-acq fix before it can ship. Keep default-off.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_FRAMING");
 	  if(e && *e && atoi(e) != 0) bigblock_framing_enabled = true; }
@@ -4964,7 +4964,7 @@ bool cl_telecom_system::decode_config_tag_from_passband(double* data, int size,
 	// repfact (the legacy CONNECT FEC runs at configure(3)) — this RX only needs the
 	// gf16ra symbol COUNT (N_gf) for the energy-extraction windows, NOT the graph
 	// itself (the BP decode is config_tag_wrap_decode, which self-configures), so we
-	// restore before returning. (CLAUDE.md §5 cross-layer guard.)
+	// restore before returning. (cross-layer guard.)
 	int saved_repfact = gf16ra::current_repfact();
 	gf16ra::configure(2);
 	gf16ra::init();
@@ -8760,7 +8760,7 @@ static int bigblock_tf_block_size(int nData)
 	// REAL HW channel (HW §3.1: localized fades / impulse noise) IS bursty, so the interleaver is
 	// the correct mechanism THERE and is kept fully implemented + TX/RX-symmetric, gated by
 	// MERCURY_BIGBLOCK_TFILV for the HW bench A/B (set =8 or =K to enable). Shipping it ON by
-	// default would mask the off-bench gate (CLAUDE.md §2 / What-NOT) and is unvalidated on HW.
+	// default would mask the off-bench gate (a symptom band-aid) and is unvalidated on HW.
 	int B = env_i("MERCURY_BIGBLOCK_TFILV", 1);
 	if(B < 1) B = 1;
 	if(B > nData) B = nData;

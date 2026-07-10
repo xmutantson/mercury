@@ -12,7 +12,7 @@ Fossorier TCOM 2002 + Comm.Lett. 2002 (NMS/OMS, alpha~0.8); Savin ISIT 2008
 (SCMS, erase sign-flipping var->check messages).
 
 Same 27-cell coded SFO-GRID fleet vehicle as the sibling levers (decode-marathon.md
-§3 lever D, decode-marathon-C.md). Fail-before / pass-after per CLAUDE.md §3.
+§3 lever D, decode-marathon-C.md). Fail-before / pass-after contract.
 
 Checks
 ------

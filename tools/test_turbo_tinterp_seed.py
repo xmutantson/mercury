@@ -18,7 +18,7 @@ the TINTERP H as the low-confidence FLOOR inside data_aided_channel_estimator (i
 does not blow nv up and revert the seed (item 4). Driven by ONE env:
 MERCURY_SFO_GRID_TURBO_SEED=tinterp. Default-off (unset) is byte-identical to plain LS.
 
-FAILING-FIRST (CLAUDE.md Principle 3 / Phase-4): on the BASE binary (feat/turbo-eq,
+FAILING-FIRST (fail-before / pass-after contract): on the BASE binary (feat/turbo-eq,
 no TINTERP-seed wiring) MERCURY_SFO_GRID_TURBO_SEED is an UNKNOWN env, so TINTERP-seed
 == LS-seed and the crossing assertion A3 FAILS. On the seed-swapped binary the warm
 TINTERP it=0 seed breaks the Dy=3 wall and A3 PASSES.

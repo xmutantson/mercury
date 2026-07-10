@@ -43,7 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MERCURY_ROOT = os.path.dirname(os.path.dirname(HERE))
 HARNESS = os.path.join(HERE, "sim_arq_channel.py")
 # The harness requires a GUARD-1-marked -x sim binary. Default to the canonical
-# build (CLAUDE.md: bash build.sh o3 -> C:\Program Files\Mercury\mercury.exe);
+# build (bash build.sh o3 -> C:\Program Files\Mercury\mercury.exe);
 # fall back to a mercury.exe alongside the repo root. Override with --bin.
 DEFAULT_BIN = os.environ.get(
     "MERCURY_BIN",

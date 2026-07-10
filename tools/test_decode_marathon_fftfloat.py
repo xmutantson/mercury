@@ -19,7 +19,7 @@ unaffected — TEST-2 asserts exactly that.
 
 Drives the coded SFO-GRID harness — the same 27-cell fleet vehicle the sibling
 levers (decode-marathon.md TEST-1, ldpc-decode-accel.md §1) use. Fail-before /
-pass-after per CLAUDE.md §3.
+pass-after contract.
 
 Checks
 ------

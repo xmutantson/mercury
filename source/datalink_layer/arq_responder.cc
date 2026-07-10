@@ -4667,7 +4667,7 @@ int cl_arq_controller::test_config_tag_follow()
 	check(rx->telecom_system->current_configuration == CFG_TO,
 		"RX PHY twin current_configuration == CONFIG_8 (coherent switch)",
 		rx->telecom_system->current_configuration, CFG_TO);
-	// And the two copies AGREE (the silent-desync guard CLAUDE.md §5 exists for).
+	// And the two copies AGREE (the silent-desync guard exists for).
 	check(rx->current_configuration == rx->telecom_system->current_configuration,
 		"RX ARQ config == PHY-twin config (no cross-layer desync)",
 		rx->current_configuration, rx->telecom_system->current_configuration);
