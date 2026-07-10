@@ -2616,6 +2616,20 @@ public:
   // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
   int test_gap_abort_on_readopt();
 
+  // GAP-ABORT ruler-blinding regression (CLI --test-gap-abort-blind; also in
+  // --test). fact-documents/data-flow-rsp-contiguity-ruler.md. Drives the REAL
+  // rsp_gap_abort_teardown() (not a modeled abort), the REAL delivery-time /
+  // re-adopt gap predicates, and the REAL fifo_buffer_rx app stream. Delivers a
+  // contiguous prefix, drops a batch, fires the delivery-time gate through the
+  // real teardown, keeps the transmitter driving the SAME stream, and asserts NO
+  // byte is delivered at the post-hole stream offset. The teardown routes through
+  // reset_session_state(), which clears rsp_last_delivered_batch_seq_id to -1 and
+  // blinds the contiguity ruler, so the next re-adopt sees last=-1 -> no-gap ->
+  // silent concatenation across the dropped batch. Self-contained (builds its own
+  // telecom_system for the reset). Returns 0=PASS, 1=FAIL. Default builds never
+  // call this.
+  int test_gap_abort_readopt_blind();
+
   // Multi-window DATA-ACK/SACK correlator regression (Track A, mwcorr;
   // CLI --test-data-ack-multiwindow). Self-contained, in-process, no IONOS/RF.
   // Loads a WB config, synthesizes a real ACK+SACK passband burst via

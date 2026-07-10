@@ -1396,6 +1396,18 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_bsd;
                 failed += ARQ_bsd.test_batchsize_desync_delivery();
             }
+            // GAP-ABORT ruler-blinding silent-corruption gate (data-flow-rsp-contiguity-
+            // ruler.md): the REAL rsp_gap_abort_teardown() routes through
+            // reset_session_state(), which clears rsp_last_delivered_batch_seq_id to -1 and
+            // blinds its own re-adopt gate; the teardown emits no OTA abort, so the CMD
+            // re-drives the same stream and the next batch is silently concatenated across
+            // the dropped batch. Drives the REAL teardown + the REAL gap predicates + the
+            // REAL fifo_buffer_rx app stream. In-process synthetic-fire (no IONOS/RF) — a
+            // permanent integrity D0 regression gate.
+            {
+                cl_arq_controller ARQ_gab;
+                failed += ARQ_gab.test_gap_abort_readopt_blind();
+            }
             // chase-combining (HARQ Type-I soft-LLR combine) fail-before/pass-after:
             // proves a bit-identical retx's LLRs SUMMED before ldpc.decode() rescue a
             // frame one look cannot decode (combine success-rate 0 -> >0), and that
@@ -2330,6 +2342,10 @@ int main(int argc, char *argv[])
                                         // Reproduces bench-4 (deliver 0-4, BREAK reset with 5-7 undelivered, present 8):
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
+    bool test_gap_abort_blind_cli = false; // --test-gap-abort-blind: GAP-ABORT ruler-blinding — the REAL
+                                        // rsp_gap_abort_teardown() resets the contiguity ruler to -1, blinding its own
+                                        // re-adopt gate, and the CMD (never told) re-drives the same stream -> silent
+                                        // concatenation across a dropped batch. Fails on the current tree. One-shot, exits rc.
     bool test_config_tag_passband_cli = false; // --test-config-tag-passband: in-band rate-adapt Stage 3a —
                                         // PASSBAND ROUND-TRIP. TX keys the combined RM+gf16ra suffix to real passband
                                         // audio, passes it through CLEAN and AWGN, RX detects it on the passband (real
@@ -3146,6 +3162,15 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
             // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
             test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-abort-blind") == 0)
+        {
+            // GAP-ABORT ruler-blinding regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_responder.cc test_gap_abort_readopt_blind
+            // + fact-documents/data-flow-rsp-contiguity-ruler.md.
+            test_gap_abort_blind_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5077,6 +5102,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_gap_abort_on_readopt();
             printf("[FLAG] Gap-abort test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_gap_abort_blind_cli) {
+            // GAP-ABORT ruler-blinding — the REAL teardown blinds its own contiguity
+            // ruler and the CMD re-drives the same stream (one-shot, exit rc).
+            printf("[FLAG] --test-gap-abort-blind: invoking gap-abort ruler-blinding "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_gab;
+            int rc = ARQ_gab.test_gap_abort_readopt_blind();
+            printf("[FLAG] Gap-abort-blind test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

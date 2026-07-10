@@ -11334,6 +11334,248 @@ int cl_arq_controller::test_gap_abort_on_readopt()
 }
 
 // ============================================================================
+// GAP-ABORT ruler-blinding regression (in-process, test-only)
+// ============================================================================
+//
+// CLI: --test-gap-abort-blind  (also runs inside --test)
+//
+// fact-documents/data-flow-rsp-contiguity-ruler.md. The sibling of
+// test_gap_abort_on_readopt, but it drives the REAL rsp_gap_abort_teardown()
+// instead of a modeled abort. That is the whole point: the modeled abort in
+// test_gap_abort_on_readopt only sets link_status=DROPPED and leaves the
+// contiguity ruler (rsp_last_delivered_batch_seq_id) intact, so it cannot reach
+// the defect. The REAL teardown routes through reset_session_state(), which
+// clears the ruler to -1 (arq_common.cc:7319) — blinding the very gate that
+// exists to refuse the hole. Because the teardown puts NO frame on the wire, the
+// CMD keeps driving the SAME stream; the next batch re-adopts at the cur<0 site
+// (arq_responder.cc:957), reads the blinded ruler through
+// sack_v2_readopt_has_gap(bsi, -1) = false (arq.h:1761), and its bytes are
+// silently concatenated onto the app FIFO across the dropped batch.
+//
+// The chain (mirrors _research/precook_ab_v2 cell A_C2_s1):
+//   1. deliver a contiguous prefix (batches 0..10) -> high-water=10, PREFIX bytes
+//      in fifo_buffer_rx.
+//   2. batch 11 LOST (high-water stays 10).
+//   3. present batch 12 at the REAL delivery-time gate: delivery_step_is_gap(12,10)
+//      = true -> call the REAL rsp_gap_abort_teardown(). The gate fired correctly.
+//   4. the teardown BLINDS the ruler to -1 and drops the link but emits no OTA
+//      abort. (This test asserts the blinding directly.)
+//   5. the CMD re-drives the same stream: present batch 14 at the cur<0 re-adopt.
+//      The REAL sack_v2_readopt_has_gap(14, ruler) is consulted. Had the ruler
+//      survived (=10) it would be true (a hole, refuse); blinded (=-1) it is
+//      false, so the batch is adopted and delivered.
+//
+// ORACLE — the hard invariant: NO byte may be delivered at the post-hole stream
+// offset (= PREFIX_BYTES). On the current tree the byte IS delivered (silent
+// concatenation) -> this test FAILS. The fix (ruler survives the gap-abort, OR the
+// teardown is terminal for the stream) makes it PASS. This is a pure state-
+// discipline test: no MERCURY_GAP_ABORT_DEFEAT env, no wire change — it exercises
+// the plain production binary and must fail on it today.
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_gap_abort_readopt_blind()
+{
+	printf("[TEST-GAP-ABORT-BLIND] start\n");
+	fflush(stdout);
+
+	// --- Step 0: buffers (mirror test_gap_abort_on_readopt Step-0) ----------
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-GAP-ABORT-BLIND] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	// Real app-stream sink (init() normally does this at arq_common.cc:1483).
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled = true;
+	this->sack_enabled    = true;
+	this->data_batch_size = 25;
+
+	// The REAL teardown routes through reset_session_state(), which dereferences
+	// telecom_system unconditionally (arq_common.cc:7264/7270) and writes a
+	// control-port error via tcp_socket_control.transmit(). Provide a throwaway
+	// telecom_system and a no-op transmit hook (the FIX-6 test seam) so the real
+	// teardown runs without a live socket. Save + restore both so a caller that
+	// already has them wired is left untouched.
+	cl_telecom_system* saved_ts = this->telecom_system;
+	cl_telecom_system* ts       = new cl_telecom_system();
+	ts->narrowband_enabled      = NO;
+	this->telecom_system        = ts;
+	this->narrowband_enabled    = NO;
+	int (*saved_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+	cl_tcp_socket::g_test_transmit_hook = [](const char*, int len)->int { return len; };
+
+	int fails = 0;
+	const int BATCH_BYTES = 32;
+	auto batch_payload = [&](int bsi, char* out) {
+		for(int j=0; j<BATCH_BYTES; j++)
+			out[j] = (char)(unsigned char)((bsi & 0xFF) * BATCH_BYTES + j);
+	};
+
+	// --- Step 1: deliver a contiguous prefix, batches 0..10 -----------------
+	// Each batch is a BATCH-DONE commit: advance the reset-surviving high-water
+	// with the PRE-bump bsi, push the batch bytes to the app FIFO, bump cur.
+	const int PREFIX_BATCHES = 11;                     // bsi 0..10
+	const int PREFIX_BYTES    = PREFIX_BATCHES * BATCH_BYTES;
+	char src_prefix[PREFIX_BATCHES * BATCH_BYTES];
+	this->fifo_buffer_rx.flush();
+	this->rsp_current_expected_batch_seq_id = 0;
+	this->rsp_prev_batch_seq_id             = -1;
+	this->rsp_prev_batch_active             = false;
+	this->rsp_last_delivered_batch_seq_id   = -1;
+	this->link_status                       = CONNECTED;
+	for(int b=0; b<PREFIX_BATCHES; b++)
+	{
+		char p[BATCH_BYTES]; batch_payload(b, p);
+		memcpy(&src_prefix[b*BATCH_BYTES], p, BATCH_BYTES);
+		advance_last_delivered(this->rsp_current_expected_batch_seq_id);   // REAL producer
+		this->fifo_buffer_rx.push(p, BATCH_BYTES);                         // REAL app delivery
+		this->rsp_prev_batch_seq_id = this->rsp_current_expected_batch_seq_id;
+		this->rsp_current_expected_batch_seq_id =
+			(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+	}
+	printf("[TEST-GAP-ABORT-BLIND] delivered contiguous prefix bsi 0..%d "
+		"(%d bytes), last_delivered=%d cur=%d\n",
+		PREFIX_BATCHES-1, PREFIX_BYTES,
+		this->rsp_last_delivered_batch_seq_id, this->rsp_current_expected_batch_seq_id);
+	fflush(stdout);
+	if(this->rsp_last_delivered_batch_seq_id != PREFIX_BATCHES-1)
+	{
+		printf("[TEST-GAP-ABORT-BLIND] FAIL: prefix high-water=%d, want %d\n",
+			this->rsp_last_delivered_batch_seq_id, PREFIX_BATCHES-1);
+		fails++;
+	}
+
+	// --- Step 2: batch 11 is LOST. cur is at 11; batch 12 completes and reaches
+	// the delivery-time commit. Confirm the REAL delivery-time gate fires. -----
+	const int LOST_BSI     = PREFIX_BATCHES;           // 11
+	const int GAP_TRIP_BSI = LOST_BSI + 1;             // 12 — the batch that trips the gate
+	(void)LOST_BSI;
+	this->rsp_current_expected_batch_seq_id = GAP_TRIP_BSI;
+	bool dt_gap = delivery_step_is_gap(GAP_TRIP_BSI, this->rsp_last_delivered_batch_seq_id);
+	if(!dt_gap)
+	{
+		printf("[TEST-GAP-ABORT-BLIND] FAIL: delivery_step_is_gap(%d, %d) = false; "
+			"the dropped-batch hole was not detected\n",
+			GAP_TRIP_BSI, this->rsp_last_delivered_batch_seq_id);
+		fails++;
+	}
+	else
+	{
+		printf("[TEST-GAP-ABORT-BLIND] delivery-time gate detected the hole: "
+			"delivery_step_is_gap(%d, last=%d)=true -> firing the REAL teardown\n",
+			GAP_TRIP_BSI, this->rsp_last_delivered_batch_seq_id);
+		fflush(stdout);
+		// The EXACT production action at the BATCH-DONE gate (arq_responder.cc:2673).
+		rsp_gap_abort_teardown("delivery-time BATCH-DONE non-contiguous (dropped-batch hole)");
+	}
+
+	// --- Step 3: the self-defeat — the teardown blinded the ruler ------------
+	// This documents the mechanism: the gate detected the hole, then the teardown
+	// erased the evidence it needs to keep detecting it.
+	if(this->rsp_last_delivered_batch_seq_id != -1)
+	{
+		printf("[TEST-GAP-ABORT-BLIND] NOTE: ruler NOT blinded by teardown "
+			"(last_delivered=%d) — the self-defeat may already be fixed\n",
+			this->rsp_last_delivered_batch_seq_id);
+	}
+	else
+	{
+		printf("[TEST-GAP-ABORT-BLIND] self-defeat: teardown reset the contiguity "
+			"ruler to -1 (reset_session_state) — the re-adopt gate is now blind\n");
+	}
+	if(this->link_status != DROPPED)
+	{
+		printf("[TEST-GAP-ABORT-BLIND] FAIL: teardown did not DROP the link (status=%d)\n",
+			this->link_status);
+		fails++;
+	}
+	fflush(stdout);
+
+	// --- Step 4: the CMD was never told (no OTA abort), so it keeps driving the
+	// SAME stream. The next batch re-adopts at the cur<0 site. Consult the REAL
+	// re-adopt gate against the (now blinded) ruler, exactly as production does at
+	// arq_responder.cc:985-986. -----------------------------------------------
+	const int READOPT_BSI = 14;                        // matches the recovered log
+	// What the gate WOULD say if the ruler had survived (INV-B): a genuine hole.
+	bool gap_if_preserved = sack_v2_readopt_has_gap(READOPT_BSI, PREFIX_BATCHES-1);
+	// What the gate ACTUALLY says now, against the blinded ruler: no constraint.
+	bool gap_now = sack_v2_readopt_has_gap(READOPT_BSI, this->rsp_last_delivered_batch_seq_id);
+	printf("[TEST-GAP-ABORT-BLIND] re-adopt bsi=%d: gap_if_ruler_preserved(last=%d)=%d, "
+		"gap_now(last=%d)=%d\n",
+		READOPT_BSI, PREFIX_BATCHES-1, gap_if_preserved ? 1 : 0,
+		this->rsp_last_delivered_batch_seq_id, gap_now ? 1 : 0);
+	fflush(stdout);
+	if(!gap_if_preserved)
+	{
+		printf("[TEST-GAP-ABORT-BLIND] FAIL: bsi=%d over a surviving high-water=%d "
+			"should be a hole but the predicate says no-gap\n",
+			READOPT_BSI, PREFIX_BATCHES-1);
+		fails++;
+	}
+	if(!gap_now)
+	{
+		// Production would take the else-branch at arq_responder.cc:1004 and DELIVER.
+		// Model that delivery through the REAL producer + REAL app FIFO.
+		this->rsp_current_expected_batch_seq_id = READOPT_BSI;
+		char p[BATCH_BYTES]; batch_payload(READOPT_BSI, p);
+		advance_last_delivered(READOPT_BSI);
+		this->fifo_buffer_rx.push(p, BATCH_BYTES);
+		printf("[TEST-GAP-ABORT-BLIND] blinded re-adopt DELIVERED batch %d after the hole\n",
+			READOPT_BSI);
+		fflush(stdout);
+	}
+
+	// --- Step 5: ORACLE — no byte may sit at the post-hole stream offset -----
+	char drained[(PREFIX_BATCHES + 4) * BATCH_BYTES];
+	int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+	bool prefix_ok = (popped >= PREFIX_BYTES)
+		&& (memcmp(drained, src_prefix, PREFIX_BYTES) == 0);
+	bool exactly_prefix = (popped == PREFIX_BYTES);
+	if(!prefix_ok)
+	{
+		printf("[TEST-GAP-ABORT-BLIND] FAIL: contiguous prefix corrupted before the seam\n");
+		fails++;
+	}
+	if(!exactly_prefix)
+	{
+		unsigned char seam = (popped > PREFIX_BYTES)
+			? (unsigned char)drained[PREFIX_BYTES] : 0;
+		unsigned char b14_first = (unsigned char)(READOPT_BSI * BATCH_BYTES + 0);
+		printf("[TEST-GAP-ABORT-BLIND] FAIL: SILENT CONCATENATION — %d bytes delivered "
+			"(prefix is %d); byte at post-hole offset %d = 0x%02x (batch-%d first byte "
+			"= 0x%02x). A non-contiguous batch was delivered as if contiguous across "
+			"the dropped batch %d.\n",
+			popped, PREFIX_BYTES, PREFIX_BYTES, (unsigned)seam,
+			READOPT_BSI, (unsigned)b14_first, LOST_BSI);
+		fails++;
+	}
+	else
+	{
+		printf("[TEST-GAP-ABORT-BLIND] PASS: delivered EXACTLY the contiguous prefix "
+			"(%d bytes), no byte at the post-hole offset — silent concatenation refused\n",
+			popped);
+	}
+	fflush(stdout);
+
+	// Restore the seams we borrowed.
+	cl_tcp_socket::g_test_transmit_hook = saved_hook;
+	this->telecom_system = saved_ts;
+	delete ts;
+
+	bool pass = (fails == 0);
+	printf("[TEST-GAP-ABORT-BLIND] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
 // Track A — multi-window DATA-ACK/SACK correlator (in-process, test-only)
 // ============================================================================
 //
