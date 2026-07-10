@@ -982,8 +982,14 @@ void cl_arq_controller::process_messages_rx_data_control()
 						bool gap_defeat = false;
 						{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 						  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+						// rsp_stream_aborted: once a gap-abort has latched the session as
+						// torn down, refuse EVERY re-adopt unconditionally — even one at
+						// last+1 that looks contiguous to the ruler — until a genuine new
+						// session (START_CONNECTION) clears the latch. The unsafe re-drive
+						// into a DROPPED stream is thereby unrepresentable.
 						if(!gap_defeat
-						   && sack_v2_readopt_has_gap(bsi, rsp_last_delivered_batch_seq_id))
+						   && (rsp_stream_aborted
+						       || sack_v2_readopt_has_gap(bsi, rsp_last_delivered_batch_seq_id)))
 						{
 							// D3.1: shared loud-abort teardown (was inlined here;
 							// now the IDENTICAL action the delivery-time gate uses).
@@ -1269,9 +1275,12 @@ void cl_arq_controller::process_messages_rx_data_control()
 								bool gap_defeat = false;
 								{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 								  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+								// rsp_stream_aborted: refuse the PREV delivery unconditionally
+								// once the session is latched torn-down (see the re-adopt gate).
 								if(!gap_defeat
-								   && delivery_step_is_gap(rsp_prev_batch_seq_id,
-								                           rsp_last_delivered_batch_seq_id))
+								   && (rsp_stream_aborted
+								       || delivery_step_is_gap(rsp_prev_batch_seq_id,
+								                               rsp_last_delivered_batch_seq_id)))
 								{
 									char reason[112];
 									snprintf(reason, sizeof(reason),
@@ -2662,9 +2671,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				bool gap_defeat = false;
 				{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 				  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+				// rsp_stream_aborted: refuse the BATCH-DONE delivery unconditionally once
+				// the session is latched torn-down (see the re-adopt gate).
 				if(!gap_defeat
-				   && delivery_step_is_gap(rsp_current_expected_batch_seq_id,
-				                           rsp_last_delivered_batch_seq_id))
+				   && (rsp_stream_aborted
+				       || delivery_step_is_gap(rsp_current_expected_batch_seq_id,
+				                               rsp_last_delivered_batch_seq_id)))
 				{
 					char reason[112];
 					snprintf(reason, sizeof(reason),
@@ -3043,6 +3055,11 @@ void cl_arq_controller::process_control_responder()
 			session_narrowband = peer_narrowband || (narrowband_enabled == YES);
 			compression_enabled = true;  // Assume compression (almost always on)
 
+			// Genuine new session: clear the gap-abort data-integrity latch (the SOLE
+			// clear point). A prior mid-transfer abort latched rsp_stream_aborted so no
+			// delivery could ride the torn-down stream; a fresh CONNECT re-authorises delivery.
+			rsp_stream_aborted = false;
+
 			link_status = CONNECTED;
 			connection_status = RECEIVING;
 			messages_control.status = FREE;  // Critical: free so next control frame can be received
@@ -3093,6 +3110,12 @@ void cl_arq_controller::process_control_responder()
 				tcp_socket_control.message->buffer[i]=pending_str[i];
 			}
 			tcp_socket_control.transmit();
+
+			// Genuine new session: clear the gap-abort data-integrity latch (the SOLE
+			// clear point, mirroring the passive-monitor accept above). A prior
+			// mid-transfer abort latched rsp_stream_aborted so no delivery could ride the
+			// torn-down stream; a fresh CONNECT re-authorises delivery for this new session.
+			rsp_stream_aborted = false;
 
 			link_status=CONNECTION_RECEIVED;
 			connection_status=ACKNOWLEDGING_CONTROL;
@@ -11584,6 +11607,189 @@ int cl_arq_controller::test_gap_abort_readopt_blind()
 
 	bool pass = (fails == 0);
 	printf("[TEST-GAP-ABORT-BLIND] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// GAP-ABORT stream-BACKSTOP-blinding regression (in-process, test-only)
+// ============================================================================
+//
+// CLI: --test-gap-abort-stream-blind  (also runs inside --test)
+//
+// Cross-layer data-flow audit for the RSP delivery contiguity ruler, §7 (the latch
+// extension). The companion of test_gap_abort_readopt_blind: that test proves the bsi
+// CONTIGUITY RULER survives the real teardown; THIS test proves the Option W byte-level
+// BACKSTOP survives it, and that the rsp_stream_aborted latch is set and reset-surviving.
+//
+// The defect: rsp_gap_abort_teardown() routed through reset_session_state(), which zeroes
+// rx_stream_delivered (arq_common.cc) and invalidates every rx_stream_stamp[].valid. The
+// Option W stream-shift detector (w_stream_shift_detected -> LOUD teardown in
+// copy_data_to_buffer) is ITSELF a caller of that teardown (arq_common.cc:14409): so the
+// byte-level backstop, the mechanism that exists to catch a positional shift the bsi proxy
+// misses, is blinded by the very abort it triggers. After the teardown a stamp that WAS
+// valid reads invalid, so the detector short-circuits to false at its stamp.valid guard —
+// a post-abort positional shift would deliver silently.
+//
+// The chain:
+//   1. deliver a contiguous prefix -> rx_stream_delivered = PREFIX_BYTES; latch a wire
+//      stamp for a to-be-shifted bsi (valid=true) whose .start DIVERGES from the cursor.
+//   2. fire the REAL rsp_gap_abort_teardown() (the exact production action).
+//   3. ORACLE-A (latch): rsp_stream_aborted must be true and must SURVIVE a further
+//      direct reset_session_state() (a mid-transfer abort is not a session boundary).
+//   4. ORACLE-B (backstop survives): w_stream_shift_detected(SHIFT_BSI) must FIRE (true).
+//      Before the fix (or under MERCURY_GAP_STREAM_BLIND=1) the teardown invalidated the
+//      stamp and zeroed the cursor, so the detector returns false -> this test FAILS.
+//
+// Pure state-discipline test: no wire change. Returns 0=PASS, 1=FAIL. Default builds never
+// call this.
+int cl_arq_controller::test_gap_abort_stream_backstop_blind()
+{
+	printf("[TEST-GAP-ABORT-STREAM] start\n");
+	fflush(stdout);
+
+	// --- Step 0: buffers + reset seams (mirror test_gap_abort_readopt_blind) ---
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-GAP-ABORT-STREAM] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled = true;
+	this->sack_enabled    = true;
+	this->data_batch_size = 25;
+
+	// The REAL teardown routes through reset_session_state(), which dereferences
+	// telecom_system and transmits a control-port error; provide a throwaway
+	// telecom_system + a no-op transmit hook (the FIX-6 seam), saving/restoring both.
+	cl_telecom_system* saved_ts = this->telecom_system;
+	cl_telecom_system* ts       = new cl_telecom_system();
+	ts->narrowband_enabled      = NO;
+	this->telecom_system        = ts;
+	this->narrowband_enabled    = NO;
+	int (*saved_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+	cl_tcp_socket::g_test_transmit_hook = [](const char*, int len)->int { return len; };
+
+	int fails = 0;
+
+	// --- Step 1: deliver a contiguous prefix; advance the byte cursor; latch a stamp
+	// for the bsi that will be positionally shifted after the abort. --------------
+	const int PREFIX_BATCHES = 11;                 // bsi 0..10
+	const int BATCH_BYTES    = 32;
+	const uint64_t PREFIX_BYTES = (uint64_t)PREFIX_BATCHES * BATCH_BYTES;
+	this->rsp_current_expected_batch_seq_id = 0;
+	this->rsp_prev_batch_seq_id             = -1;
+	this->rsp_last_delivered_batch_seq_id   = -1;
+	this->rsp_stream_aborted                = false;
+	this->link_status                       = CONNECTED;
+	for(int b=0; b<PREFIX_BATCHES; b++)
+	{
+		advance_last_delivered(this->rsp_current_expected_batch_seq_id);
+		this->rsp_current_expected_batch_seq_id =
+			(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
+	}
+	// Option W byte-stream state as a live mid-transfer session would hold it.
+	this->rx_stream_delivered = PREFIX_BYTES;      // absolute delivered cursor
+	this->rx_stream_crc       = 0x1234ABCDu;       // a non-INIT running CRC
+	for(int _s=0;_s<256;_s++) this->rx_stream_stamp[_s].valid = false;
+	// The batch whose positional shift the backstop must catch. Its wire stamp was
+	// parsed (valid) and its .start DIVERGES from the delivered cursor => a real shift.
+	const int SHIFT_BSI = 12;
+	const uint64_t SHIFTED_START = PREFIX_BYTES + 640;   // != cursor -> positional shift
+	this->rx_stream_stamp[SHIFT_BSI].valid  = true;
+	this->rx_stream_stamp[SHIFT_BSI].start  = SHIFTED_START;
+	this->rx_stream_stamp[SHIFT_BSI].length = BATCH_BYTES;
+
+	// Pre-abort sanity: the detector already sees the shift (cursor & stamp both live).
+	if(!w_stream_shift_detected(SHIFT_BSI))
+	{
+		printf("[TEST-GAP-ABORT-STREAM] FAIL: pre-abort w_stream_shift_detected(%d) false "
+			"(stamp.start=%llu cursor=%llu) — test setup wrong\n",
+			SHIFT_BSI, (unsigned long long)SHIFTED_START, (unsigned long long)PREFIX_BYTES);
+		fails++;
+	}
+
+	// --- Step 2: fire the REAL teardown (the exact production action). -----------
+	printf("[TEST-GAP-ABORT-STREAM] pre-abort: rx_stream_delivered=%llu stamp[%d].valid=%d "
+		"latch=%d — firing the REAL teardown\n",
+		(unsigned long long)this->rx_stream_delivered, SHIFT_BSI,
+		this->rx_stream_stamp[SHIFT_BSI].valid ? 1 : 0, this->rsp_stream_aborted ? 1 : 0);
+	fflush(stdout);
+	rsp_gap_abort_teardown("stream-backstop test: mid-transfer gap-abort");
+
+	// --- Step 3: ORACLE-A (part 1) — the teardown set the latch and dropped the link.
+	// (The latch already survived the teardown's OWN internal reset_session_state();
+	// that it is still set here is the first proof of survival.) ------------------
+	if(!this->rsp_stream_aborted)
+	{
+		printf("[TEST-GAP-ABORT-STREAM] FAIL: teardown did NOT set rsp_stream_aborted latch\n");
+		fails++;
+	}
+	if(this->link_status != DROPPED)
+	{
+		printf("[TEST-GAP-ABORT-STREAM] FAIL: teardown did not DROP the link (status=%d)\n",
+			this->link_status);
+		fails++;
+	}
+
+	// --- Step 4: ORACLE-B — the byte-level backstop survived the abort. ---------
+	// Re-present the SAME positionally-shifted stamp the wire would carry for the
+	// re-driven batch. On the fixed tree the teardown PRESERVED rx_stream_delivered
+	// and rx_stream_stamp[].valid, so the detector fires; under MERCURY_GAP_STREAM_BLIND=1
+	// the teardown zeroed the cursor and invalidated the stamp, so it stays silent.
+	// (Checked BEFORE the explicit reset below, which would re-clear the stream state.)
+	bool detector_fires = w_stream_shift_detected(SHIFT_BSI);
+	printf("[TEST-GAP-ABORT-STREAM] post-abort: rx_stream_delivered=%llu stamp[%d].valid=%d "
+		"-> w_stream_shift_detected=%d\n",
+		(unsigned long long)this->rx_stream_delivered, SHIFT_BSI,
+		this->rx_stream_stamp[SHIFT_BSI].valid ? 1 : 0, detector_fires ? 1 : 0);
+	fflush(stdout);
+	if(!detector_fires)
+	{
+		printf("[TEST-GAP-ABORT-STREAM] FAIL: BACKSTOP BLINDED — the Option W stream-shift "
+			"detector cannot fire after the gap-abort (rx_stream_delivered / stamp validity "
+			"were cleared by the teardown). A post-abort positional shift would deliver "
+			"silently.\n");
+		fails++;
+	}
+	else
+	{
+		printf("[TEST-GAP-ABORT-STREAM] backstop survived the abort — a post-abort "
+			"positional shift still fires the loud floor\n");
+	}
+	fflush(stdout);
+
+	// --- Step 5: ORACLE-A (part 2) — the latch survives an EXPLICIT reset_session_state()
+	// (an independent proof: a mid-transfer abort is not a session boundary; only a
+	// genuine CONNECT clears the latch). This reset re-clears the stream state, so it
+	// runs AFTER ORACLE-B. ---------------------------------------------------------
+	reset_session_state();
+	if(!this->rsp_stream_aborted)
+	{
+		printf("[TEST-GAP-ABORT-STREAM] FAIL: rsp_stream_aborted did NOT survive an explicit "
+			"reset_session_state() — it must be cleared only by CONNECT\n");
+		fails++;
+	}
+	else
+	{
+		printf("[TEST-GAP-ABORT-STREAM] latch survives explicit reset_session_state() (still set)\n");
+	}
+	fflush(stdout);
+
+	// Restore borrowed seams.
+	cl_tcp_socket::g_test_transmit_hook = saved_hook;
+	this->telecom_system = saved_ts;
+	delete ts;
+
+	bool pass = (fails == 0);
+	printf("[TEST-GAP-ABORT-STREAM] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }

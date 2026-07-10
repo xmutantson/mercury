@@ -2630,6 +2630,20 @@ public:
   // call this.
   int test_gap_abort_readopt_blind();
 
+  // GAP-ABORT stream-backstop-blinding regression (CLI --test-gap-abort-stream-blind;
+  // also runs inside --test). The companion to test_gap_abort_readopt_blind: that one
+  // proves the bsi contiguity ruler survives the teardown; THIS one proves the Option W
+  // byte-level BACKSTOP survives it. It delivers a stamped prefix (advancing
+  // rx_stream_delivered + latching rx_stream_stamp[].valid), fires the REAL
+  // rsp_gap_abort_teardown(), then presents a wire stamp whose start diverges from the
+  // preserved rx_stream_delivered and asserts w_stream_shift_detected() FIRES. Before the
+  // fix the teardown zeroed rx_stream_delivered and invalidated every stamp, so the
+  // detector could not fire (the detector blinds itself via its own teardown call at
+  // arq_common.cc). Also asserts the rsp_stream_aborted latch is set by the teardown and
+  // survives reset_session_state(). MERCURY_GAP_STREAM_BLIND=1 restores the pre-fix clear
+  // (fail-before arm). Self-contained. Returns 0=PASS, 1=FAIL. Default builds never call this.
+  int test_gap_abort_stream_backstop_blind();
+
   // Multi-window DATA-ACK/SACK correlator regression (Track A, mwcorr;
   // CLI --test-data-ack-multiwindow). Self-contained, in-process, no IONOS/RF.
   // Loads a WB config, synthesizes a real ACK+SACK passband burst via
@@ -3497,6 +3511,24 @@ public:
   // delivered yet this LINK. v2-scoped (sack_v2_enabled). See
   // bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
   int rsp_last_delivered_batch_seq_id;
+  // Data-integrity latch (the gap-abort "unrepresentable unsafe state" keystone).
+  // A gap-abort teardown (rsp_gap_abort_teardown) is a MID-TRANSFER abort of a
+  // stream the peer keeps driving (no OTA abort frame is sent), so the CMD re-drives
+  // into a torn-down RSP. Preserving the contiguity ruler catches a NON-contiguous
+  // re-adopt, but a re-adopt at exactly last+1 looks contiguous to the ruler and
+  // would be delivered onto a DROPPED transfer — a residual hole the ruler alone
+  // cannot close. This sticky flag makes ALL delivery decisions refuse
+  // UNCONDITIONALLY after an abort, independent of any ruler/cursor/stamp value:
+  //   set    true  inside rsp_gap_abort_teardown() (BEFORE reset_session_state()).
+  //   SURVIVES reset_session_state() (that function never touches this field — a
+  //            mid-transfer abort is NOT a session boundary).
+  //   cleared false in EXACTLY ONE place: the RSP START_CONNECTION accept
+  //            (arq_responder.cc) — a genuine NEW session. Nowhere else.
+  // Consumers (OR this in ahead of the ruler predicate): the cur<0 re-adopt gate
+  // (arq_responder.cc), the BATCH-DONE + PREV delivery-time gates, and the pre-BREAK
+  // prev flush (arq_common.cc). ctor-init false. See the cross-layer data-flow audit
+  // for the delivery contiguity ruler.
+  bool rsp_stream_aborted;
   long long rsp_v2_drop_count;           // RSP: counter of [RSP-V2-DROP] events
                                          //      (frames discarded for unknown
                                          //      batch_seq_id). Validates the Step 4

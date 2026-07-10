@@ -1408,6 +1408,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_gab;
                 failed += ARQ_gab.test_gap_abort_readopt_blind();
             }
+            // GAP-ABORT stream-backstop companion (data-flow-rsp-contiguity-ruler.md §7):
+            // the REAL teardown must ALSO preserve the Option W byte cursor + stamp validity
+            // (so w_stream_shift_detected can still fire post-abort) and set the sticky
+            // rsp_stream_aborted latch (which survives reset_session_state and refuses every
+            // subsequent delivery until a genuine CONNECT). In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_gas;
+                failed += ARQ_gas.test_gap_abort_stream_backstop_blind();
+            }
             // chase-combining (HARQ Type-I soft-LLR combine) fail-before/pass-after:
             // proves a bit-identical retx's LLRs SUMMED before ldpc.decode() rescue a
             // frame one look cannot decode (combine success-rate 0 -> >0), and that
@@ -2346,6 +2355,10 @@ int main(int argc, char *argv[])
                                         // rsp_gap_abort_teardown() resets the contiguity ruler to -1, blinding its own
                                         // re-adopt gate, and the CMD (never told) re-drives the same stream -> silent
                                         // concatenation across a dropped batch. Fails on the current tree. One-shot, exits rc.
+    bool test_gap_abort_stream_blind_cli = false; // --test-gap-abort-stream-blind: GAP-ABORT stream-BACKSTOP
+                                        // companion — the REAL teardown must preserve the Option W byte cursor +
+                                        // stamp validity (so w_stream_shift_detected still fires post-abort) and set the
+                                        // sticky rsp_stream_aborted latch. MERCURY_GAP_STREAM_BLIND=1 = fail-before arm.
     bool test_config_tag_passband_cli = false; // --test-config-tag-passband: in-band rate-adapt Stage 3a —
                                         // PASSBAND ROUND-TRIP. TX keys the combined RM+gf16ra suffix to real passband
                                         // audio, passes it through CLEAN and AWGN, RX detects it on the passband (real
@@ -3171,6 +3184,15 @@ int main(int argc, char *argv[])
             // See source/datalink_layer/arq_responder.cc test_gap_abort_readopt_blind
             // + fact-documents/data-flow-rsp-contiguity-ruler.md.
             test_gap_abort_blind_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-abort-stream-blind") == 0)
+        {
+            // GAP-ABORT stream-backstop-blinding regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_responder.cc test_gap_abort_stream_backstop_blind
+            // + fact-documents/data-flow-rsp-contiguity-ruler.md §7.
+            test_gap_abort_stream_blind_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5114,6 +5136,19 @@ start_modem:
             cl_arq_controller ARQ_gab;
             int rc = ARQ_gab.test_gap_abort_readopt_blind();
             printf("[FLAG] Gap-abort-blind test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_gap_abort_stream_blind_cli) {
+            // GAP-ABORT stream-BACKSTOP-blinding — the REAL teardown must preserve the
+            // Option W byte cursor + stamp validity + set the sticky abort latch
+            // (one-shot, exit rc).
+            printf("[FLAG] --test-gap-abort-stream-blind: invoking gap-abort stream-backstop "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_gas;
+            int rc = ARQ_gas.test_gap_abort_stream_backstop_blind();
+            printf("[FLAG] Gap-abort-stream-blind test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

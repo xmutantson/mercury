@@ -720,6 +720,11 @@ cl_arq_controller::cl_arq_controller()
 	// reset + FULL load_configuration so the post-reset adopt gate can detect a
 	// dropped-batch hole. See bigblock_p3_hw/_fix8/FIX8_DESIGN.md §4.2-§4.3.
 	rsp_last_delivered_batch_seq_id=-1;
+	// Data-integrity latch: cleared here (ctor) and at the RSP START_CONNECTION accept
+	// ONLY. Set by rsp_gap_abort_teardown(); must SURVIVE reset_session_state() so a
+	// mid-transfer abort makes every subsequent delivery refuse until a genuine new
+	// session. See the cross-layer data-flow audit for the delivery contiguity ruler.
+	rsp_stream_aborted=false;
 	rsp_v2_drop_count=0;
 	test_rsp_bsi_corrupt_at=0;
 	test_rsp_bsi_v2_frame_counter=0;
@@ -5138,8 +5143,11 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 		bool gap_defeat = false;
 		{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
 		  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+		// rsp_stream_aborted: a prior gap-abort latched this session as torn down;
+		// refuse the flush unconditionally (do not push into a DROPPED stream).
 		if(!gap_defeat
-		   && delivery_step_is_gap(rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id))
+		   && (rsp_stream_aborted
+		       || delivery_step_is_gap(rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id)))
 			return 0;
 	}
 
@@ -10181,13 +10189,55 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 	// MERCURY_GAP_RULER_BLIND=1 restores the pre-fix behavior (clear the ruler)
 	// so the regression test can prove it exercises THIS state-discipline fix,
 	// not the weather. =1 re-opens the silent non-contiguous delivery.
+	// Data-integrity latch (the "unrepresentable unsafe state" keystone): a gap-abort
+	// is a mid-transfer abort of a stream the peer keeps driving. Preserving the ruler
+	// (below) catches a NON-contiguous re-drive, but a re-drive at exactly last+1 looks
+	// contiguous and would land on the torn-down transfer. Latch here so EVERY delivery
+	// decision (the cur<0 re-adopt gate, the BATCH-DONE + PREV delivery-time gates, the
+	// pre-BREAK prev flush) refuses UNCONDITIONALLY until the next genuine session
+	// (RSP START_CONNECTION accept, the sole clear point). The latch is NOT one of the
+	// fields reset_session_state() touches, so it SURVIVES the reset it is set before.
+	rsp_stream_aborted = true;
+
 	bool ruler_blind = false;
 	{ const char* e = std::getenv("MERCURY_GAP_RULER_BLIND");
 	  if(e && *e && atoi(e)!=0) ruler_blind = true; }
-	int preserved_last_delivered = rsp_last_delivered_batch_seq_id;
+
+	// Additionally preserve the Option W absolute-byte RX cursor + running stream CRC +
+	// parsed per-bsi wire stamps across the reset. reset_session_state() re-anchors them
+	// at 0 / CRC32_INIT / invalid (correct for a genuine session boundary), but a
+	// mid-transfer abort must not make a live session lie about its own cursors: the RSP
+	// BACKSTOP (w_stream_shift_detected in copy_data_to_buffer) compares the next wire
+	// stamp.start against rx_stream_delivered, and this teardown is ITSELF that backstop's
+	// caller (arq_common.cc:14409). If the teardown zeroes the cursor and invalidates the
+	// stamps, the backstop is blinded by the very abort it triggers, so a post-abort
+	// positional shift would be delivered silently instead of firing the loud floor.
+	// Preserve so the byte-level backstop keeps working across the abort. (reset only
+	// flips rx_stream_stamp[].valid; .start/.length are left intact, so restoring .valid
+	// re-arms the stamps.) Mirrors the ruler-survival keystone.
+	// Fail-before knob (test-only, do-not-enable in production): MERCURY_GAP_STREAM_BLIND=1
+	// restores the pre-fix clear so the backstop-after-abort regression proves it exercises
+	// THIS state-discipline fix.
+	bool stream_blind = false;
+	{ const char* e = std::getenv("MERCURY_GAP_STREAM_BLIND");
+	  if(e && *e && atoi(e)!=0) stream_blind = true; }
+
+	int      preserved_last_delivered      = rsp_last_delivered_batch_seq_id;
+	uint64_t preserved_rx_stream_delivered = rx_stream_delivered;
+	uint32_t preserved_rx_stream_crc       = rx_stream_crc;
+	bool     preserved_stamp_valid[256];
+	for(int _s=0; _s<256; _s++) preserved_stamp_valid[_s] = rx_stream_stamp[_s].valid;
+
 	reset_session_state();
+
 	if(!ruler_blind)
 		rsp_last_delivered_batch_seq_id = preserved_last_delivered;
+	if(!stream_blind)
+	{
+		rx_stream_delivered = preserved_rx_stream_delivered;
+		rx_stream_crc       = preserved_rx_stream_crc;
+		for(int _s=0; _s<256; _s++) rx_stream_stamp[_s].valid = preserved_stamp_valid[_s];
+	}
 }
 
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
