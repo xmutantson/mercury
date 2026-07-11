@@ -1413,6 +1413,18 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_tg;
                 failed += ARQ_tg.test_turnaround_guard();
             }
+            // R6 measured turnaround (arq_common.cc): the SRTT/RTTVAR estimator
+            // (RFC 6298 / Jacobson RTO; Karn & Partridge) replaces the calibrated
+            // SACK margin, the robust-geometry widen, and the CONFIG_15-only
+            // re-phase adder with a self-tracking window. Drives update_turnaround_
+            // estimate + calculate_receiving_timeout directly; the landmine arm
+            // proves a non-CFG15 drifty long batch tracks (fail-before misses the
+            // 4500 ms arrival, pass-after contains it) and re-asserts the
+            // ack_timeout_data >= receiving_timeout invariant on the per-batch path.
+            {
+                cl_arq_controller ARQ_mt;
+                failed += ARQ_mt.test_measured_timers();
+            }
             // R4 LINK-PARAMS quiesce gate (arq_commander.cc): an Axis-2 batch-size
             // renegotiation must not fire while the boundary is unclean (retx pending / last
             // batch partial), which would mix old-bsi retransmits into the first batch of the
@@ -2402,6 +2414,8 @@ int main(int argc, char *argv[])
                                         // (R2a hold + R2c CMD retention). fail-before via
                                         // MERCURY_GAP_RECOVER_DEFEAT=1 (terminal abort, high-water frozen);
                                         // pass-after = HOLD + refill + in-order 6->7->8. One-shot, exits rc.
+    bool test_measured_timers_cli = false; // --test-measured-timers: R6 SRTT/RTTVAR turnaround estimator +
+                                        // ack_timeout_data >= receiving_timeout invariant regression (one-shot, exit rc).
     bool test_turnaround_guard_cli = false; // --test-turnaround-guard: R1 turnaround-clearance guard —
                                         // stamp-then-key drives assert the guard waits out the peer's TX->RX
                                         // mute/flush window (default-on) and adds ~0 when already clear / never armed.
@@ -3245,6 +3259,15 @@ int main(int argc, char *argv[])
             // R1 turnaround-clearance guard regression — one-shot at startup, exit rc.
             // See source/datalink_layer/arq_common.cc test_turnaround_guard.
             test_turnaround_guard_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-measured-timers") == 0)
+        {
+            // R6 measured-turnaround (SRTT/RTTVAR) estimator + ack-timeout invariant
+            // regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_common.cc test_measured_timers.
+            test_measured_timers_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5232,6 +5255,18 @@ start_modem:
             cl_arq_controller ARQ_tg;
             int rc = ARQ_tg.test_turnaround_guard();
             printf("[FLAG] Turnaround-guard test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_measured_timers_cli) {
+            // R6 measured turnaround (SRTT/RTTVAR) estimator + ack-timeout invariant
+            // (one-shot, exit rc).
+            printf("[FLAG] --test-measured-timers: invoking measured-turnaround estimator "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_mt;
+            int rc = ARQ_mt.test_measured_timers();
+            printf("[FLAG] Measured-timers test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

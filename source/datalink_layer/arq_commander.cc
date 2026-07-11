@@ -488,6 +488,13 @@ bool cl_arq_controller::cmd_compact_confirm_sack_window_accept(bool compact_enab
 		// when not armed / stale bsi / inband off).
 		inband_retag_confirm_from_sack((int)cc_bsi);
 		int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+		// R6: fold this reverse-ACK arrival into the measured-turnaround estimator,
+		// Karn-gated (RFC 6298 §3): skip retransmit rounds (ambiguous turnaround).
+		// arrival_ms is in the receiving_timer frame = the receiving_timeout deadline
+		// frame, so it is a direct RTO sample. See data-flow-turnaround-timers.md.
+		if(tt_karn_sample_ok())
+			update_turnaround_estimate(current_configuration,
+				data_batch_size * message_transmission_time_ms, arrival_ms);
 		printf("[CMD-COMPACT-CONFIRM] CLEAN (in-SACK-window) batch_seq_id=%u "
 			"(cmd_batch_seq_id=%d) arrival_ms=%d\n",
 			(unsigned)cc_bsi, cmd_batch_seq_id, arrival_ms);
@@ -4518,6 +4525,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// (design §1.1/§1.3 consumer 1). No-op when not armed / stale bsi / inband off.
 									inband_retag_confirm_from_sack((int)rx_bsi);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+									// R6: fold this reverse-ACK arrival into the measured-turnaround estimator,
+									// Karn-gated (RFC 6298 §3): skip retransmit rounds (ambiguous turnaround).
+									// arrival_ms is in the receiving_timer frame = the receiving_timeout deadline
+									// frame, so it is a direct RTO sample. See data-flow-turnaround-timers.md.
+									if(tt_karn_sample_ok())
+										update_turnaround_estimate(current_configuration,
+											data_batch_size * message_transmission_time_ms, arrival_ms);
 									printf("[CMD-MFSK-ACK-SACK] CLEAN batch_seq_id=%u (cmd_batch_seq_id=%d) "
 										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
 										(unsigned)rx_bsi, cmd_batch_seq_id,
@@ -4555,6 +4569,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// confirms exactly like a CLEAN (design §1.7 ruling). DISARM the re-tag.
 									inband_retag_confirm_from_sack((int)rx_bsi);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+									// R6: fold this reverse-ACK arrival into the measured-turnaround estimator,
+									// Karn-gated (RFC 6298 §3): skip retransmit rounds (ambiguous turnaround).
+									// arrival_ms is in the receiving_timer frame = the receiving_timeout deadline
+									// frame, so it is a direct RTO sample. See data-flow-turnaround-timers.md.
+									if(tt_karn_sample_ok())
+										update_turnaround_estimate(current_configuration,
+											data_batch_size * message_transmission_time_ms, arrival_ms);
 									sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
 									sack_arrival_history_next_idx =
 										(sack_arrival_history_next_idx + 1) % SACK_ARRIVAL_HISTORY;
@@ -4789,6 +4810,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// the re-tag (design §1.1/§1.3 consumer 1). No-op when not armed / inband off.
 							inband_retag_confirm_from_sack((int)rx_bsi);
 							int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
+							// R6: fold this reverse-ACK arrival into the measured-turnaround estimator,
+							// Karn-gated (RFC 6298 §3): skip retransmit rounds (ambiguous turnaround).
+							// arrival_ms is in the receiving_timer frame = the receiving_timeout deadline
+							// frame, so it is a direct RTO sample. See data-flow-turnaround-timers.md.
+							if(tt_karn_sample_ok())
+								update_turnaround_estimate(current_configuration,
+									data_batch_size * message_transmission_time_ms, arrival_ms);
 							sack_arrival_history_ms[sack_arrival_history_next_idx] = arrival_ms;
 							sack_arrival_history_next_idx =
 								(sack_arrival_history_next_idx + 1) % SACK_ARRIVAL_HISTORY;

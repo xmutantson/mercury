@@ -360,6 +360,12 @@ static_assert(MAX_SACK_BATCH_SIZE <= 128,
 // margin (see SACK_FIX_PLAN.md §2.7 / §11.1).
 #define RSP_DECODE_MARGIN_MS   300  // one-frame RSP decode budget
 #define SACK_ARRIVAL_MARGIN_MS 1000 // jitter + LDPC decode tail safety
+// R6 measured-turnaround estimator (RFC 6298 / Jacobson RTO). TT_WINDOW_FLOOR_MS
+// is a small fixed guard added to SRTT + K*RTTVAR; TT_CLOCK_G_MS is the RFC 6298
+// §4 clock granularity G so the variance term never rounds below it. See
+// fact-documents/data-flow-turnaround-timers.md.
+#define TT_WINDOW_FLOOR_MS     300  // fixed guard on the measured RTO window
+#define TT_CLOCK_G_MS          20   // RFC 6298 §4 clock granularity G
 
 struct st_crypto_batch_buffer {
 	int batch_id;           // crypto batch counter mod 8, or -1 if empty
@@ -491,6 +497,14 @@ public:
   void set_control_batch_size(int control_batch_size);
   void set_role(int role);
   void calculate_receiving_timeout();
+  // R6 measured-turnaround estimator (RFC 6298 §2; Karn & Partridge 1987): map
+  // the live config + forward-batch airtime to an SRTT/RTTVAR bucket and fold a
+  // clean reverse-ACK arrival sample. See fact-documents/
+  // data-flow-turnaround-timers.md.
+  int  tt_class_of(int cfg) const;
+  int  tt_batchbk_of(int batch_airtime_ms) const;
+  bool tt_karn_sample_ok() const;
+  void update_turnaround_estimate(int cfg, int batch_airtime_ms, int rtt_ms);
   void recalculate_ack_timeout_for_batch();
   // SACK-negotiation batch recompute, shared by the CMD (TEST_CONNECTION_ACK)
   // and RSP (TEST_CONNECTION) handlers so the two sides run IDENTICAL code and
@@ -613,6 +627,7 @@ public:
   // ACKed op renegotiated the link geometry (batch size / config).
   void arm_control_turnaround_guard();
   int  test_turnaround_guard();
+  int  test_measured_timers();  // R6 SRTT/RTTVAR estimator + ack-timeout invariant regression
   // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
   // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
   // opts into the robust noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST
@@ -5066,6 +5081,21 @@ public:
   int sack_arrival_history_ms[SACK_ARRIVAL_HISTORY];
   int sack_arrival_history_count;     // 0..SACK_ARRIVAL_HISTORY
   int sack_arrival_history_next_idx;  // 0..SACK_ARRIVAL_HISTORY-1 (ring)
+
+  // R6 measured-turnaround estimator (RFC 6298 §2; Karn & Partridge 1987).
+  // Supersedes the recording-only sack_arrival_history_ms[] ring above with a
+  // per-{turnaround-geometry class x forward-batch-airtime bucket} SRTT/RTTVAR
+  // window. All integer ms (no float on the ARQ poll path). n==0 => COLD (the
+  // consumer falls back to geometric_floor + calibrated margin, byte-identical
+  // to the pre-R6 window). Reset with the ring, in the ctor.
+  static const int TT_NUM_CLASS   = 3;   // turnaround-geometry classes
+  static const int TT_NUM_BATCHBK = 4;   // forward-batch-airtime buckets
+  struct turnaround_rtt_est {
+    int srtt_ms;      // smoothed RTT, ms
+    int rttvar_ms;    // RTT mean deviation, ms
+    int n;            // samples folded (0 => cold)
+  };
+  turnaround_rtt_est tt_rtt[TT_NUM_CLASS][TT_NUM_BATCHBK];
 
   // Step 15: legacy SACK pattern detection diagnostics (sack_diag_*) removed —
   // the MFSK SACK correlator they tracked is gone.

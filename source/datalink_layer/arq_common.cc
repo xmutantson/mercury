@@ -972,6 +972,10 @@ cl_arq_controller::cl_arq_controller()
 	sack_arrival_history_count = 0;
 	sack_arrival_history_next_idx = 0;
 	for(int i=0; i<SACK_ARRIVAL_HISTORY; i++) sack_arrival_history_ms[i] = 0;
+	// R6: reset the measured-turnaround estimator with the ring it supersedes.
+	for(int c=0; c<TT_NUM_CLASS; c++)
+		for(int b=0; b<TT_NUM_BATCHBK; b++)
+			{ tt_rtt[c][b].srtt_ms = 0; tt_rtt[c][b].rttvar_ms = 0; tt_rtt[c][b].n = 0; }
 	v2_dispatch_last_rwi = -1;
 	v2_dispatch_min_advance_syms = 1;
 
@@ -1483,6 +1487,60 @@ void cl_arq_controller::set_role(int role)
 	calculate_receiving_timeout();
 }
 
+// R6 measured-turnaround estimator (RFC 6298 §2; Karn & Partridge 1987).
+// tt_class_of / tt_batchbk_of are pure functions of the live config + forward
+// batch airtime; they key the 2-D SRTT/RTTVAR table. See fact-documents/
+// data-flow-turnaround-timers.md.
+int cl_arq_controller::tt_class_of(int cfg) const
+{
+	if(is_robust_config(cfg))                 return 0; // ROBUST (MFSK reverse geometry)
+	if(reverse_ack_uses_robust_geometry(cfg)) return 1; // OFDM fwd, robust-geometry reverse ACK
+	return 2;                                            // OFDM fwd + OFDM-geometry reverse
+}
+
+int cl_arq_controller::tt_batchbk_of(int batch_airtime_ms) const
+{
+	if(batch_airtime_ms < 1500) return 0;
+	if(batch_airtime_ms < 3000) return 1;
+	if(batch_airtime_ms < 5000) return 2;
+	return 3;
+}
+
+// Karn's rule (RFC 6298 §3): never fold an RTT sample from a round that carried
+// retransmitted frames — the returning ACK's turnaround composition is ambiguous.
+// data_ack_retx_turnaround is the member the robust-geometry widen already used;
+// it ORs the v2 mixed-batch and CFG16 reverse-ACK-starve conditions and persists
+// through the receive/accept window. cfg16_revack_starve_fails is belt-and-braces.
+bool cl_arq_controller::tt_karn_sample_ok() const
+{
+	return !data_ack_retx_turnaround && cfg16_revack_starve_fails == 0;
+}
+
+// RFC 6298 §2.2 (first sample) / §2.3 (subsequent) in integer fixed-point:
+// alpha = 1/8 (>>3), beta = 1/4 (>>2); RTTVAR is updated BEFORE SRTT, using the
+// pre-update SRTT. Called only through the Karn gate at the reverse-ACK accept
+// sites (arq_commander.cc).
+void cl_arq_controller::update_turnaround_estimate(int cfg, int batch_airtime_ms, int rtt_ms)
+{
+	if(rtt_ms <= 0) return;   // a zero/degenerate sample is not a turnaround
+	turnaround_rtt_est &e = tt_rtt[tt_class_of(cfg)][tt_batchbk_of(batch_airtime_ms)];
+	if(e.n == 0)
+	{
+		e.srtt_ms   = rtt_ms;          // §2.2 first measurement: SRTT=R, RTTVAR=R/2
+		e.rttvar_ms = rtt_ms / 2;
+	}
+	else
+	{
+		int err = e.srtt_ms - rtt_ms; if(err < 0) err = -err;          // |SRTT - R'|
+		e.rttvar_ms = e.rttvar_ms - (e.rttvar_ms >> 2) + (err   >> 2); // (1-1/4)var + 1/4|err|
+		e.srtt_ms   = e.srtt_ms   - (e.srtt_ms   >> 3) + (rtt_ms >> 3); // (1-1/8)srtt + 1/8 R'
+	}
+	if(e.n < 1000000) e.n++;
+	printf("[TT-RTT-UPDATE] cls=%d bk=%d n=%d srtt=%d rttvar=%d sample=%d\n",
+		tt_class_of(cfg), tt_batchbk_of(batch_airtime_ms), e.n, e.srtt_ms, e.rttvar_ms, rtt_ms);
+	fflush(stdout);
+}
+
 void cl_arq_controller::calculate_receiving_timeout()
 {
 	if(this->role==COMMANDER)
@@ -1517,78 +1575,59 @@ void cl_arq_controller::calculate_receiving_timeout()
 			int frame_drain  = 2 * message_transmission_time_ms;
 			int sack_arrival = ptt_off_delay_ms + RSP_DECODE_MARGIN_MS
 			                 + pattern_time + ptt_on_delay_ms;
-			int margin       = SACK_ARRIVAL_MARGIN_MS;
-			int timeout = frame_drain + sack_arrival + margin;
-			// WALL-B FIX-9 D2 (FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md §3.3): when the data-ACK
-			// the CMD is waiting for will be keyed on the robust turnaround geometry (the forward
-			// data config is OFDM — reverse_ack_uses_robust_geometry), WIDEN the listen window IN
-			// LOCKSTEP with the RSP's matching pre-TX settle (send_mfsk_ack_sack:6581). The two
-			// (ptt_off+ptt_on) terms mirror the RSP's new pre-key settle EXACTLY; the drift margin
-			// covers the accumulated per-batch clock-slip the stock per-frame frame_drain did not
-			// absorb. Without this the CMD window stays narrow and the slipped robust-geometry ACK
-			// STILL arrives late -> the FIX9_ROOTCAUSE §5 window-mismatch. Robust forward config:
-			// the predicate is FALSE -> adder=0 -> byte-identical.
-			//
-			// WALL-B FIX-9 D2 REFINE (_fix9/d2refine/D2_REFINE_DESIGN.md §2): gate the widen ALSO on
-			// data_ack_retx_turnaround so it fires ONLY on a RETRANSMIT turnaround (the batch carried
-			// retx frames OR a recent CFG16 reverse-ACK was lost), NOT on a clean first-pass batch —
-			// the clean first-pass ACK decodes WITHOUT the robust geometry (the control proves 0
-			// ACK-timeouts), so the +(ptt+drift) widen there is pure cost (~15% clean, recovered
-			// here). The CMD-widen condition is a SUPERSET of the RSP-settle condition (a CMD retx
-			// batch only exists after an RSP PARTIAL SACK, which set the RSP settle), so the
-			// FIX9_ROOTCAUSE §5 lockstep INV-1 (CMD window ⊇ RSP-keyed ACK window) is PRESERVED — see
-			// §2.2. FAIL-BEFORE (-DFIX9_D2REFINE_FAILBEFORE): drop the gate -> D2's unconditional
-			// widen -> the clean window widens (Part W2a fails).
-			bool d2_geometry_fires =
-				reverse_ack_uses_robust_geometry(current_configuration)
-#ifndef FIX9_D2REFINE_FAILBEFORE
-				&& data_ack_retx_turnaround
-#endif
-				;
-			if(d2_geometry_fires)
-				timeout += ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS;
-			// TURNAROUND BATCH-AIRTIME RE-PHASE (bench-9; common_defines.h
-			// TURNAROUND_ACCRUAL_MS_PER_S; TURNAROUND_FIX_DESIGN.md §5.1). The CMD window above is
-			// built from PER-FRAME terms (frame_drain = 2*message_transmission_time_ms) + fixed
-			// margins — it has NO term proportional to forward batch airtime, yet the reverse SACK
-			// arrives systematically LATE in proportion to that airtime (the half-duplex channel is
-			// held longer on a long batch, so keyer/AGC/capture-flush/scheduling latency + ±8.16ppm
-			// slip accumulate WITHIN the batch). On a held-CFG16 ~28-frame batch (~4.78s) the SACK
-			// is ~143ms late > the ~90ms window half-width -> matched=0/7 -> 81% stall (bench-9).
-			// Re-CENTER the window LATER by the accrued amount (+ a small variance guard) so the
-			// SACK lands back in the middle. The accrual mirrors the relay sim EXACTLY:
-			// late_offset_ms = TURNAROUND_ACCRUAL_MS_PER_S * (batch_airtime_ms/1000) (8606389,
-			// TurnaroundDrift.accrual_ms_per_s default 30.0) so HW and the calibrated sim share ONE
-			// number. GATED: only on OFDM multi-frame batches (is_ofdm_config && data_batch_size >=
-			// BATCH_MAY_BE_PARTIAL_THRESHOLD) — CFG15-short / robust / NB / single-frame degenerate
-			// to ~0 accrual (short batch airtime), preserving the W2a clean-cost-recovery invariant.
-			// DEFAULT-OFF (turnaround_rephase_enabled_common); UNSET => BYTE-IDENTICAL to 627c370.
-			// WHY this beats H1: H1 added a FIXED 600ms widen symmetric about the WRONG (too-early)
-			// center; this re-centers by exactly the batch-proportional accrual, paid only where it
-			// bites. FAIL-BEFORE (-DTURNAROUND_ACCRUAL_FAILBEFORE): drop the adder -> the long-CFG16
-			// window stays mis-centered -> Part W7a fails (window center < SACK arrival).
-			// CFG15-ONLY SCOPE (HW A/B PHASE1_VERDICT.md): A1 is a PROVEN WIN on CFG15
-			// (whole-window 3.4x) but NET-NEGATIVE on held-CFG16 (ww 606 vs 907, D3
-			// starvation 32 vs 17) because the held-CFG16 stall is ACQUISITION-dominated,
-			// NOT a reverse-ACK miss — so re-phasing CFG16's window just adds idle latency.
-			// Restrict the re-phase to current_configuration == CONFIG_15 (the only config
-			// the HW A/B proved a win); CFG16 and any config above CFG15 are UNTESTED here
-			// and default-safe (adder=0, the pre-A1 byte-identical window). The is_ofdm /
-			// batch-threshold conjuncts remain belt-and-suspenders (a CONFIG_15-only check
-			// already implies OFDM and a multi-frame batch on the live path).
-			int turnaround_rephase_adder = 0;
-#ifndef TURNAROUND_ACCRUAL_FAILBEFORE
-			if(turnaround_rephase_enabled_common()
-			   && current_configuration == CONFIG_15
-			   && is_ofdm_config(current_configuration)
-			   && data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
+			// R6 MEASURED TURNAROUND (RFC 6298 / Jacobson 1988 RTO; Karn & Partridge
+			// 1987). geometric_floor is the physical-minimum turnaround (CMD last-frame
+			// drain + RSP decode/key/settle) — the cold-start base and the lower bound.
+			// It REPLACES the three stacked static patches that used to sit on top of it
+			// (the calibrated SACK_ARRIVAL_MARGIN_MS, the robust-geometry reverse-ACK
+			// widen, and the CONFIG_15-only batch-airtime re-phase adder) with a self-
+			// tracking SRTT/RTTVAR window kept per {turnaround-geometry class x forward-
+			// batch-airtime bucket}. The reverse SACK/ACK arrival is sampled in the SAME
+			// clock frame as this deadline (the receiving_timer origin — see the cross-
+			// layer data-flow audit), so receiving_timeout = SRTT + K*RTTVAR is the RTO
+			// with no unit translation. The batch-airtime bucket makes the batch-
+			// proportional drift the CONFIG_15 adder hand-patched appear in the per-bucket
+			// SRTT automatically, for EVERY config, ungated and self-correcting. AX.25
+			// v2.2 §6.7.1.1 derives its T1 the same way on this class of half-duplex link.
+			// See fact-documents/data-flow-turnaround-timers.md.
+			int geometric_floor = frame_drain + sack_arrival;
+
+			bool tt_defeat = false;
+			{ const char* ev = std::getenv("MERCURY_MEASURED_TIMERS_DEFEAT");
+			  if(ev && ev[0]=='1') tt_defeat = true; }
+			int tt_K = 4;                                   // Jacobson K (RFC 6298 §2.2)
+			{ const char* ev = std::getenv("MERCURY_MEASURED_TIMERS_K");
+			  if(ev && ev[0]!='\0'){ int v=atoi(ev); if(v>=1 && v<=8) tt_K=v; } }
+			int tt_floor = TT_WINDOW_FLOOR_MS;
+			{ const char* ev = std::getenv("MERCURY_MEASURED_TIMERS_FLOOR_MS");
+			  if(ev && ev[0]!='\0'){ int v=atoi(ev); if(v>=0) tt_floor=v; } }
+
+			int tt_cls = tt_class_of(current_configuration);
+			int tt_bk  = tt_batchbk_of(data_batch_size * message_transmission_time_ms);
+			const turnaround_rtt_est &tt_e = tt_rtt[tt_cls][tt_bk];
+
+			int timeout;
+			if(!tt_defeat && tt_e.n > 0)
 			{
-				long batch_airtime_ms = (long)data_batch_size * (long)message_transmission_time_ms;
-				int accrual_late_ms   = (int)((long)TURNAROUND_ACCRUAL_MS_PER_S * batch_airtime_ms / 1000);
-				turnaround_rephase_adder = accrual_late_ms + ACCRUAL_PHASE_GUARD_MS;
-				timeout += turnaround_rephase_adder;
+				// RFC 6298 §2.4/§4: the variance term never rounds below the clock
+				// granularity G (so a converged RTTVAR->0 bucket still keeps a guard).
+				int var_term = tt_K * tt_e.rttvar_ms;
+				if(var_term < TT_CLOCK_G_MS) var_term = TT_CLOCK_G_MS;
+				timeout = tt_e.srtt_ms + var_term + tt_floor;
+				if(timeout < geometric_floor) timeout = geometric_floor; // never < physical min
 			}
-#endif
+			else
+			{
+				// COLD (RFC 6298 §2.1) or DEFEAT: byte-identical to the pre-R6 cold
+				// window on the first batch of each geometry — geometric base plus the
+				// calibrated margin. (On the common clean, non-retx, non-CFG15 path the
+				// two deleted adders were already 0, so this equals the pre-R6 value.)
+				timeout = geometric_floor + SACK_ARRIVAL_MARGIN_MS;
+			}
+			// RFC 6298 §2.5: a MAX bound (>= 60 s) MAY be placed. Per-config turnarounds
+			// are single-digit seconds; this is defensive against a runaway estimate.
+			if(timeout > 60000) timeout = 60000;
+
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -1598,14 +1637,11 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
-			printf("[CMD-POST-TX-CALIB] timeout=%dms = frame_drain=%d + sack_arrival=%d (ptt_off=%d + rsp_decode=%d + pattern=%d + ptt_on=%d) + margin=%d + extra=%d + d2_robust_ack=%d (retx_turn=%d) + turn_rephase=%d batch=%d sack=%d\n",
-				timeout, frame_drain, sack_arrival,
+			printf("[CMD-POST-TX-CALIB] timeout=%dms geom_floor=%d (frame_drain=%d + sack_arrival=%d: ptt_off=%d rsp_decode=%d pattern=%d ptt_on=%d) est(cls=%d bk=%d n=%d srtt=%d rttvar=%d K=%d floor=%d) defeat=%d extra=%d batch=%d sack=%d\n",
+				timeout, geometric_floor, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
-				margin, sack_enabled ? sack_timeout_extra_ms : 0,
-				d2_geometry_fires
-					? (ptt_off_delay_ms + ptt_on_delay_ms + ROBUST_ACK_DRIFT_MARGIN_MS) : 0,
-				(int)data_ack_retx_turnaround,
-				turnaround_rephase_adder,
+				tt_cls, tt_bk, tt_e.n, tt_e.srtt_ms, tt_e.rttvar_ms, tt_K, tt_floor,
+				(int)tt_defeat, sack_enabled ? sack_timeout_extra_ms : 0,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			set_receiving_timeout(timeout);
@@ -1613,6 +1649,32 @@ void cl_arq_controller::calculate_receiving_timeout()
 		else
 		{
 			set_receiving_timeout((ack_batch_size+1)*ctrl_transmission_time_ms+time_left_to_send_last_frame+ptt_on_delay_ms);
+		}
+		// R6 INVARIANT (I2): ack_timeout_data/control must cover the (possibly R6-
+		// raised) receiving_timeout on EVERY recompute — not only at config load. The
+		// load-time floor (load_configuration) is SKIPPED on the per-batch recompute
+		// path (the post-TX arm sites in arq_commander.cc call calculate_receiving_
+		// timeout without re-running it), so a measured window that grows past a stale
+		// ack_timeout would let the ACK deadline pre-empt the receive window — the ACK
+		// timer fires while the CMD is still legitimately listening for the reverse
+		// SACK. Re-assert the same floor here so it holds on every path. Raise-only: it
+		// can never shorten a timeout. This is a pre-existing latent bug (the window
+		// could already exceed a stale ack_timeout on a drifty long batch even pre-R6);
+		// R6 makes it reachable by design, so it is fixed here as one keystone. See the
+		// cross-layer data-flow audit (fact-documents/data-flow-turnaround-timers.md §I2).
+		// MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT=1 reproduces the pre-fix (skipped-floor)
+		// behaviour for the fail-before A/B arm.
+		{
+			bool floor_defeat = false;
+			{ const char* ev = std::getenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT");
+			  if(ev && ev[0]=='1') floor_defeat = true; }
+			if(!floor_defeat)
+			{
+				int min_ack = message_transmission_time_ms + ptt_off_delay_ms
+				            + receiving_timeout + 500;
+				if(ack_timeout_control < min_ack) set_ack_timeout_control(min_ack);
+				if(ack_timeout_data    < min_ack) set_ack_timeout_data(min_ack);
+			}
 		}
 	}
 	else
@@ -9282,6 +9344,125 @@ int cl_arq_controller::test_turnaround_guard()
 	unsetenv("MERCURY_TURNAROUND_GUARD_DEFEAT");
 	bool pass = (fails == 0);
 	printf("[TEST-TURNGUARD] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// R6 measured-turnaround estimator regression (RFC 6298 §2; Karn & Partridge 1987)
+// + the ack_timeout_data >= receiving_timeout invariant (I2). Drives the REAL
+// update_turnaround_estimate() + calculate_receiving_timeout() on a throwaway
+// controller — no IONOS/RF/telecom_system. The load-bearing arm is C: it fires the
+// CONFIG_15-only landmine's mechanism on a NON-CFG15 config (CONFIG_13), proving the
+// measured window tracks a drifty long batch where the pre-R6 formula (defeated) misses.
+int cl_arq_controller::test_measured_timers()
+{
+	printf("[TEST-MEASTIMERS] start\n");
+	fflush(stdout);
+	int fails = 0;
+
+	// Deterministic geometry for the throwaway controller. geometric_floor =
+	// frame_drain(2*mtt=400) + sack_arrival(ptt_off 200 + RSP_DECODE_MARGIN_MS 300 +
+	// pattern 500 + ptt_on 100 = 1100) = 1500; cold window = 1500 + SACK_ARRIVAL_MARGIN_MS.
+	this->role                        = COMMANDER;
+	this->ack_pattern_time_ms         = 500;   // > 0 => CMD data branch
+	this->message_transmission_time_ms= 200;
+	this->ptt_off_delay_ms            = 200;
+	this->ptt_on_delay_ms             = 100;
+	this->gear_shift_on               = NO;     // no turboshift +2000
+	this->sack_enabled                = false;  // no sack_timeout_extra_ms
+	this->sack_timeout_extra_ms       = 0;
+	this->current_configuration       = CONFIG_13;   // OFDM, NON-CFG15 => class 1
+	this->data_ack_retx_turnaround    = false;
+	this->cfg16_revack_starve_fails   = 0;
+	unsetenv("MERCURY_MEASURED_TIMERS_DEFEAT");
+	unsetenv("MERCURY_MEASURED_TIMERS_K");
+	unsetenv("MERCURY_MEASURED_TIMERS_FLOOR_MS");
+	unsetenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT");
+
+	const int GEOM_FLOOR = 1500;
+	const int cls2 = tt_class_of(CONFIG_13);              // expect 1
+	const int bk2  = tt_batchbk_of(20 * 200);            // airtime 4000 => bucket 2
+	const int bk3  = tt_batchbk_of(28 * 200);            // airtime 5600 => bucket 3
+	if(cls2 != 1) { printf("[TEST-MEASTIMERS] class map FAIL (cls=%d want 1)\n", cls2); fails++; }
+	if(bk2 != 2)  { printf("[TEST-MEASTIMERS] bucket map FAIL (bk=%d want 2)\n", bk2); fails++; }
+	if(bk3 != 3)  { printf("[TEST-MEASTIMERS] bucket map FAIL (bk=%d want 3)\n", bk3); fails++; }
+
+	// Arm E (COLD byte-identity): fresh table, n==0 => geometric_floor + margin.
+	this->data_batch_size = 20;   // bucket 2
+	this->calculate_receiving_timeout();
+	printf("[TEST-MEASTIMERS] Arm E (cold): rx_to=%d (want %d)\n",
+		this->receiving_timeout, GEOM_FLOOR + SACK_ARRIVAL_MARGIN_MS);
+	if(this->receiving_timeout != GEOM_FLOOR + SACK_ARRIVAL_MARGIN_MS) { printf("[TEST-MEASTIMERS] Arm E FAIL\n"); fails++; }
+
+	// Arm A (RFC 6298 §2.2 first sample): feed R=2000 into class1/bucket2.
+	this->update_turnaround_estimate(CONFIG_13, 20 * 200, 2000);
+	turnaround_rtt_est &eA = this->tt_rtt[cls2][bk2];
+	printf("[TEST-MEASTIMERS] Arm A: n=%d srtt=%d rttvar=%d (want 1/2000/1000)\n", eA.n, eA.srtt_ms, eA.rttvar_ms);
+	if(!(eA.n == 1 && eA.srtt_ms == 2000 && eA.rttvar_ms == 1000)) { printf("[TEST-MEASTIMERS] Arm A (est) FAIL\n"); fails++; }
+	this->calculate_receiving_timeout();   // warm: 2000 + max(20,4*1000)=4000 + floor 300 = 6300
+	printf("[TEST-MEASTIMERS] Arm A: rx_to=%d (want 6300)\n", this->receiving_timeout);
+	if(this->receiving_timeout != 6300) { printf("[TEST-MEASTIMERS] Arm A (window) FAIL\n"); fails++; }
+
+	// Arm B (RFC 6298 §2.3 convergence): 40 more R'=2000 => srtt stays 2000, rttvar->3.
+	for(int i=0;i<40;i++) this->update_turnaround_estimate(CONFIG_13, 20 * 200, 2000);
+	printf("[TEST-MEASTIMERS] Arm B: srtt=%d rttvar=%d (want 2000/3)\n", eA.srtt_ms, eA.rttvar_ms);
+	if(!(eA.srtt_ms == 2000 && eA.rttvar_ms == 3)) { printf("[TEST-MEASTIMERS] Arm B (est) FAIL\n"); fails++; }
+	this->calculate_receiving_timeout();   // 2000 + max(20,4*3=12)=20 + 300 = 2320
+	printf("[TEST-MEASTIMERS] Arm B: rx_to=%d (want 2320)\n", this->receiving_timeout);
+	if(this->receiving_timeout != 2320) { printf("[TEST-MEASTIMERS] Arm B (window) FAIL\n"); fails++; }
+
+	// Arm C (THE LANDMINE FIX): a drifty long batch on NON-CFG15 CONFIG_13, reverse SACK
+	// arriving at 4500 ms. fail-before (defeat) MISSES; pass-after (warm) CONTAINS.
+	this->data_batch_size = 28;   // airtime 5600 => bucket 3
+	setenv("MERCURY_MEASURED_TIMERS_DEFEAT", "1", 1);
+	this->calculate_receiving_timeout();   // defeat => geometric_floor + margin = 2500
+	int rx_defeat = this->receiving_timeout;
+	printf("[TEST-MEASTIMERS] Arm C fail-before (defeat): rx_to=%d vs arrival 4500 (want MISS <4500)\n", rx_defeat);
+	if(!(rx_defeat < 4500)) { printf("[TEST-MEASTIMERS] Arm C fail-before FAIL\n"); fails++; }
+	unsetenv("MERCURY_MEASURED_TIMERS_DEFEAT");
+	for(int i=0;i<5;i++) this->update_turnaround_estimate(CONFIG_13, 28 * 200, 4500);  // warm bucket 3
+	this->calculate_receiving_timeout();
+	int rx_warm = this->receiving_timeout;
+	printf("[TEST-MEASTIMERS] Arm C pass-after (warm): rx_to=%d vs arrival 4500 (want CONTAINS >=4500)\n", rx_warm);
+	if(!(rx_warm >= 4500)) { printf("[TEST-MEASTIMERS] Arm C pass-after FAIL\n"); fails++; }
+
+	// Arm D (Karn's rule): a retx-round sample must NOT move SRTT.
+	int srtt_before = this->tt_rtt[cls2][bk2].srtt_ms;
+	this->data_ack_retx_turnaround = true;                 // retx turnaround
+	if(this->tt_karn_sample_ok())                          // production gate (must be false)
+		this->update_turnaround_estimate(CONFIG_13, 20 * 200, 9999);
+	int srtt_after = this->tt_rtt[cls2][bk2].srtt_ms;
+	printf("[TEST-MEASTIMERS] Arm D (Karn): srtt %d -> %d (want unchanged)\n", srtt_before, srtt_after);
+	if(srtt_after != srtt_before) { printf("[TEST-MEASTIMERS] Arm D FAIL\n"); fails++; }
+	this->data_ack_retx_turnaround = false;
+
+	// Arm G (INVARIANT I2 fail-before/pass-after): a warm long-batch window that exceeds a
+	// stale ack_timeout_data. fail-before (floor defeated) leaves the invariant VIOLATED;
+	// pass-after (floor on) re-asserts ack_timeout_data >= receiving_timeout.
+	this->data_batch_size = 28;   // bucket 3, warm at 4500 above
+	// fail-before: reproduce the skipped per-batch floor.
+	this->ack_timeout_data    = 3000;   // stale (as if set at load for a small batch)
+	this->ack_timeout_control = 3000;
+	setenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT", "1", 1);
+	this->calculate_receiving_timeout();
+	printf("[TEST-MEASTIMERS] Arm G fail-before: ack_to_data=%d rx_to=%d (want ack < rx, VIOLATED)\n",
+		this->ack_timeout_data, this->receiving_timeout);
+	if(!(this->ack_timeout_data < this->receiving_timeout)) { printf("[TEST-MEASTIMERS] Arm G fail-before FAIL\n"); fails++; }
+	// pass-after: floor on, invariant restored.
+	this->ack_timeout_data    = 3000;
+	this->ack_timeout_control = 3000;
+	unsetenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT");
+	this->calculate_receiving_timeout();
+	printf("[TEST-MEASTIMERS] Arm G pass-after: ack_to_data=%d rx_to=%d (want ack >= rx, HOLDS)\n",
+		this->ack_timeout_data, this->receiving_timeout);
+	if(!(this->ack_timeout_data >= this->receiving_timeout)) { printf("[TEST-MEASTIMERS] Arm G pass-after FAIL\n"); fails++; }
+
+	unsetenv("MERCURY_MEASURED_TIMERS_DEFEAT");
+	unsetenv("MERCURY_MEASURED_TIMERS_K");
+	unsetenv("MERCURY_MEASURED_TIMERS_FLOOR_MS");
+	unsetenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT");
+	bool pass = (fails == 0);
+	printf("[TEST-MEASTIMERS] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
