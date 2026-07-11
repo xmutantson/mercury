@@ -333,6 +333,15 @@ inline bool batchsize_desync_detected(int sender_total_frames, int local_batch, 
 // batch worth of slots during loss episodes.
 #define MAX_RETRANSMIT_HEADROOM (2 * MAX_SACK_BATCH_SIZE) // Was 8; see §7.13.39 Fix 1
 
+// R2a/R2c — bounded recovery depth for a recoverable one-frame prev-batch hole.
+// RSP holds the completed current batch and re-requests the prev hole this many
+// times before falling through to the terminal gap-abort; the CMD retains the
+// prev-batch frame bytes for the same number of re-drive rounds. Small: HF loses
+// the same frame 3× in a row rarely, and a larger bound just delays the loud
+// abort on a genuinely dead peer. See data-flow-recoverable-gap-abort.md.
+#define RSP_GAP_RECOVER_MAX  3
+#define CMD_PREV_RETAIN_MAX  8   // retention-shadow slots (>= one batch's worst-case holes)
+
 // §7.13.39 Fix 2 — sequence_number is a uint8 on the wire (low 7 bits = slot,
 // bit 7 = EOB). The collision check masks with 0x7F; batches larger than 128
 // would alias slots. Belt-and-braces compile-time guard.
@@ -718,6 +727,16 @@ public:
   // (sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0); safe to call
   // unconditionally.
   void bump_bsi_and_transfer_prev();
+
+  // R2a — re-send the PARTIAL SACK for the already-sealed prev batch
+  // (rsp_prev_batch_seq_id) so the CMD re-drives the missing frame that is
+  // holding the current batch. Rebuilds the hole bitmap from messages_rx_prev[]
+  // RECEIVED status and emits it on the same MFSK/OFDM SACK transport the live
+  // partial path uses, but for the PREV bsi. Unlike the normal partial-SACK
+  // path it does NOT call bump_bsi_and_transfer_prev() (the prev is already
+  // sealed) and does NOT touch the current batch. No new wire format. Returns
+  // true if a SACK was emitted. See data-flow-recoverable-gap-abort.md §5.
+  bool rsp_resend_prev_partial_sack();
 
   // FIX-8 (data-integrity): advance rsp_last_delivered_batch_seq_id to `bsi`
   // ONLY if `bsi` is a forward step (mod-256 forward distance in [1,128]) from
@@ -1815,6 +1834,31 @@ public:
     return (fwd >= 2u && fwd <= 128u);
   }
 
+  // R2a — the RECOVERABLE-hole predicate. Distinguishes the ONE gap topology
+  // that a bounded hold can heal (the completed current batch is exactly the
+  // +2 successor of last_delivered, and the single missing batch between them
+  // is the armed, partially-received prev) from a genuine multi-batch desync
+  // (which must still abort). PURE + static so the SIM_INPROC test drives the
+  // EXACT production decision. It is a STRICT SUBSET of delivery_step_is_gap:
+  // it can only be true where delivery_step_is_gap(cur,last) is already true
+  // with fwd==2, so it never widens the abort surface — it only diverts the
+  // fwd==2/armed-prev case to the hold. See
+  // fact-documents/data-flow-recoverable-gap-abort.md §5.
+  static bool gap_is_recoverable_prev_hole(int cur_bsi, int last_delivered_bsi,
+                                           bool prev_active, int prev_bsi,
+                                           int prev_received_count)
+  {
+    if(last_delivered_bsi < 0) return false;
+    if(!prev_active) return false;
+    if(prev_received_count <= 0) return false;
+    unsigned last = (unsigned)(last_delivered_bsi & 0xFF);
+    unsigned cur  = (unsigned)(cur_bsi & 0xFF);
+    unsigned fwd  = (cur - last) & 0xFFu;
+    if(fwd != 2u) return false;                 // exactly one missing batch
+    unsigned want_prev = (last + 1u) & 0xFFu;   // the missing batch == prev
+    return ((unsigned)(prev_bsi & 0xFF) == want_prev);
+  }
+
   // TURBO step-1 SNR-capability pre-truncation gate (gearshift-climb-engine.md
   // §20 — the CFG15->CFG16 under-climb on clean). PURE so --test-climb-engine can
   // drive it with no live telecom_system / channel.
@@ -2683,6 +2727,15 @@ public:
   // (fail-before arm). Self-contained. Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_gap_abort_stream_backstop_blind();
 
+  // RECOVERABLE delivery-time GAP-ABORT regression (CLI --test-gap-recover; also
+  // runs inside --test). Drives the REAL gap_is_recoverable_prev_hole +
+  // delivery_step_is_gap predicates, the REAL CMD retention-shadow helpers, and
+  // the REAL advance_last_delivered producer. fail-before (MERCURY_GAP_RECOVER_
+  // DEFEAT=1) = terminal abort, high-water frozen; pass-after = HOLD + refill +
+  // in-order 6->7->8, high-water never advances while the hole exists. Returns
+  // 0=PASS, 1=FAIL. See fact-documents/data-flow-recoverable-gap-abort.md.
+  int test_recoverable_gap_abort();
+
   // Multi-window DATA-ACK/SACK correlator regression (Track A, mwcorr;
   // CLI --test-data-ack-multiwindow). Self-contained, in-process, no IONOS/RF.
   // Loads a WB config, synthesizes a real ACK+SACK passband burst via
@@ -3426,6 +3479,41 @@ public:
   // slot in the prev batch, bit 7 = EOB on that original transmission.
   unsigned char retransmit_frame_seq_with_eob[MAX_RETRANSMIT_HEADROOM];
 
+  // R2c — PREV-BATCH RETENTION SHADOW. The mixbatch builder REMOVES a retx frame
+  // from retransmit_frames[] the instant it is SENT (arq_commander.cc:2360-2370,
+  // shift-down + count-=R). If that retx is then LOST, its bytes are gone and a
+  // later prev-bsi re-SACK cannot refill the hole (the verified inert-root:
+  // the SACK apply reads messages_tx[i] BY SLOT INDEX, which now holds the NEXT
+  // batch). This shadow RETAINS a copy of each retx frame's original bytes,
+  // keyed by its ORIGINAL batch_seq_id, until that bsi is confirmed delivered.
+  // On a prev-bsi re-SACK whose bsi is NOT the in-flight batch (the case the
+  // OOW/STALE guards currently DROP), the retained bytes are re-queued into
+  // retransmit_frames[] so the next mixbatch re-drives the frame. Bounded to
+  // CMD_PREV_RETAIN_MAX slots and RSP_GAP_RECOVER_MAX re-drive rounds per bsi.
+  // ADDITIVE: the existing OOW/STALE/DUP guards keep their exact behavior on the
+  // in-flight batch; this only adds a recovery branch on the dropped path — no
+  // bitmap is applied to messages_tx[] by index, so no false-ACK surface is
+  // added. Knob MERCURY_CMD_PREV_RETAIN_DEFEAT disables capture + re-queue.
+  // See data-flow-recoverable-gap-abort.md §5 (R2c).
+  int           cmd_prev_retain_count;                               // live shadow entries
+  int           cmd_prev_retain_bsi[CMD_PREV_RETAIN_MAX];            // original batch_seq_id
+  int           cmd_prev_retain_slot[CMD_PREV_RETAIN_MAX];           // original slot in that batch
+  int           cmd_prev_retain_len[CMD_PREV_RETAIN_MAX];            // payload length
+  int           cmd_prev_retain_type[CMD_PREV_RETAIN_MAX];           // DATA_LONG / DATA_SHORT
+  unsigned char cmd_prev_retain_seq_eob[CMD_PREV_RETAIN_MAX];        // original seq byte (bit7=EOB)
+  int           cmd_prev_retain_rounds[CMD_PREV_RETAIN_MAX];         // re-drive rounds used
+  unsigned char cmd_prev_retain_bytes[CMD_PREV_RETAIN_MAX][MAX_SACK_FRAME_SIZE];
+
+  // R2c helpers (arq_commander.cc). capture: stash a just-SENT retx frame keyed
+  // by its original bsi (dedup by bsi+slot). evict: drop all shadow entries for
+  // a bsi once it is confirmed delivered. requeue: on a prev-bsi re-SACK, push
+  // the still-missing retained frames for that bsi back into retransmit_frames[]
+  // (bounded); returns the number re-queued.
+  void cmd_prev_retain_capture(int bsi, int slot, int len, int type,
+                               unsigned char seq_eob, const unsigned char* bytes);
+  void cmd_prev_retain_evict(int bsi);
+  int  cmd_prev_retain_requeue(int bsi, const bool* got_bitmap, int nframes);
+
   // SACK Design A Step 3 — batch_seq_id plumbing (TX side: CMD-only counter;
   // RX side: diagnostic store; no decision branches on this value yet).
   // §4.1 + §4.3.4 invariant 2: increments by 1 mod 256 per NEW-DATA batch.
@@ -3730,6 +3818,21 @@ public:
                                          //      same EOB-inference logic
                                          //      `process_messages_acknowledging_data`
                                          //      uses for the *current* batch.
+  // R2a — RECOVERABLE delivery-time GAP-ABORT. When the BATCH-DONE / PREV gate
+  // would fire on a RECOVERABLE one-frame hole (the completed current batch is
+  // exactly +2 past last_delivered AND the single missing batch is the armed,
+  // partially-received prev), HOLD the current batch (revert its slots
+  // ACKED->RECEIVED, do NOT deliver / clean-ACK / advance the high-water) and
+  // re-send the prev-bsi partial SACK so the CMD re-drives the missing frame.
+  // Bounded: after RSP_GAP_RECOVER_MAX unanswered rounds fall through to the
+  // UNCHANGED terminal rsp_gap_abort_teardown. Reset to 0 on any forward
+  // delivery (BATCH-DONE / PREV commit), teardown, and ctor/session reset.
+  // The delivery-time contiguity ruler (delivery_step_is_gap) stays the
+  // inviolable assert BENEATH the hold — the hold is strictly UPSTREAM and
+  // delivers/advances nothing while the hole exists. See
+  // fact-documents/data-flow-recoverable-gap-abort.md.
+  int rsp_gap_recover_rounds;            // RSP: consecutive recoverable-HOLD rounds
+                                         //      for the current prev-batch hole.
   int rsp_deferred_batch_shrink;         // RSP: a data_batch_size SHRINK that was
                                          //      DEFERRED because applying it now
                                          //      would orphan already-RECEIVED

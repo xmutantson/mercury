@@ -77,6 +77,134 @@ static inline bool break_lossless_requeue_enabled()
 	} \
 } while(0)
 
+// ============================================================================
+// R2c — PREV-BATCH RETENTION SHADOW (data-flow-recoverable-gap-abort.md §5)
+//
+// The mixbatch builder REMOVES a retx frame from retransmit_frames[] the instant
+// it is SENT (arq_commander.cc mixbatch loop: shift-down + count-=R). If that
+// retx is then LOST, its bytes are gone and a later prev-bsi re-SACK cannot
+// refill the hole — the SACK apply reads messages_tx[i] BY SLOT INDEX, which by
+// then holds the NEXT batch (the verified inert-root). These helpers keep
+// a bounded, bsi-keyed copy of each just-SENT retx frame so a prev-bsi re-SACK
+// (the case the OOW/STALE guards drop) can re-queue the ORIGINAL bytes into
+// retransmit_frames[] for the next mixbatch. ADDITIVE: no bitmap is applied to
+// messages_tx[] by index, so no false-ACK surface is added; the existing guards
+// keep their exact behavior on the in-flight batch.
+// ----------------------------------------------------------------------------
+
+// Stash a just-SENT retx frame keyed by its ORIGINAL batch_seq_id + slot. Dedup:
+// updates an existing (bsi,slot) entry in place. On overflow, evicts an
+// exhausted (rounds>=RSP_GAP_RECOVER_MAX) entry, else the oldest (index 0).
+void cl_arq_controller::cmd_prev_retain_capture(int bsi, int slot, int len,
+	int type, unsigned char seq_eob, const unsigned char* bytes)
+{
+	{ const char* e = std::getenv("MERCURY_CMD_PREV_RETAIN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return; }
+	if(!sack_v2_enabled) return;
+	if(bytes == NULL || len <= 0 || len > MAX_SACK_FRAME_SIZE) return;
+	if(bsi < 0) return;
+
+	// Dedup by (bsi, slot).
+	for(int k=0; k<cmd_prev_retain_count; k++)
+	{
+		if(cmd_prev_retain_bsi[k]==(bsi&0xFF) && cmd_prev_retain_slot[k]==slot)
+		{
+			cmd_prev_retain_len[k]     = len;
+			cmd_prev_retain_type[k]    = type;
+			cmd_prev_retain_seq_eob[k] = seq_eob;
+			memcpy(cmd_prev_retain_bytes[k], bytes, len);
+			return;
+		}
+	}
+
+	int idx;
+	if(cmd_prev_retain_count < CMD_PREV_RETAIN_MAX)
+	{
+		idx = cmd_prev_retain_count++;
+	}
+	else
+	{
+		// Full — prefer evicting an exhausted entry; else the oldest (0).
+		idx = 0;
+		for(int k=0; k<cmd_prev_retain_count; k++)
+			if(cmd_prev_retain_rounds[k] >= RSP_GAP_RECOVER_MAX) { idx=k; break; }
+	}
+	cmd_prev_retain_bsi[idx]     = (bsi & 0xFF);
+	cmd_prev_retain_slot[idx]    = slot;
+	cmd_prev_retain_len[idx]     = len;
+	cmd_prev_retain_type[idx]    = type;
+	cmd_prev_retain_seq_eob[idx] = seq_eob;
+	cmd_prev_retain_rounds[idx]  = 0;
+	memcpy(cmd_prev_retain_bytes[idx], bytes, len);
+}
+
+// Drop every retained entry for `bsi` (called when that batch is confirmed
+// delivered, so its frames can never be a recoverable hole again).
+void cl_arq_controller::cmd_prev_retain_evict(int bsi)
+{
+	int w = 0;
+	for(int k=0; k<cmd_prev_retain_count; k++)
+	{
+		if(cmd_prev_retain_bsi[k] == (bsi & 0xFF)) continue;   // drop
+		if(w != k)
+		{
+			cmd_prev_retain_bsi[w]     = cmd_prev_retain_bsi[k];
+			cmd_prev_retain_slot[w]    = cmd_prev_retain_slot[k];
+			cmd_prev_retain_len[w]     = cmd_prev_retain_len[k];
+			cmd_prev_retain_type[w]    = cmd_prev_retain_type[k];
+			cmd_prev_retain_seq_eob[w] = cmd_prev_retain_seq_eob[k];
+			cmd_prev_retain_rounds[w]  = cmd_prev_retain_rounds[k];
+			memcpy(cmd_prev_retain_bytes[w], cmd_prev_retain_bytes[k],
+				cmd_prev_retain_len[k] > 0 && cmd_prev_retain_len[k] <= MAX_SACK_FRAME_SIZE
+					? cmd_prev_retain_len[k] : 0);
+		}
+		w++;
+	}
+	cmd_prev_retain_count = w;
+}
+
+// On a prev-bsi re-SACK (rx_bsi is a retained batch, NOT the in-flight one),
+// re-queue the retained frames of that bsi that the SACK still reports MISSING
+// (got_bitmap[slot]==false) into retransmit_frames[]. Skips a frame already
+// queued for the same (bsi,slot) so a repeated re-SACK does not bloat the queue,
+// and caps each entry at RSP_GAP_RECOVER_MAX re-drive rounds. Returns the count
+// re-queued. No new wire format — it reuses the existing retx queue + mixbatch.
+int cl_arq_controller::cmd_prev_retain_requeue(int bsi, const bool* got_bitmap,
+	int nframes)
+{
+	{ const char* e = std::getenv("MERCURY_CMD_PREV_RETAIN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return 0; }
+	if(!sack_v2_enabled || got_bitmap == NULL) return 0;
+	int requeued = 0;
+	for(int k=0; k<cmd_prev_retain_count; k++)
+	{
+		if(cmd_prev_retain_bsi[k] != (bsi & 0xFF)) continue;
+		int slot = cmd_prev_retain_slot[k];
+		if(slot < 0 || slot >= nframes) continue;
+		if(got_bitmap[slot]) continue;                         // RX has it — nothing to send
+		if(cmd_prev_retain_rounds[k] >= RSP_GAP_RECOVER_MAX) continue;   // bound
+		// Already queued for this (bsi,slot)? Skip (append-mode dedup).
+		bool already = false;
+		for(int q=0; q<retransmit_count; q++)
+			if(retransmit_frame_batch_seq_ids[q] == (bsi & 0xFF)
+			   && retransmit_frame_positions[q] == slot) { already = true; break; }
+		if(already) continue;
+		if(retransmit_count >= MAX_RETRANSMIT_HEADROOM) break;
+		int len = cmd_prev_retain_len[k];
+		if(len <= 0 || len > MAX_SACK_FRAME_SIZE) continue;
+		memcpy(retransmit_frames[retransmit_count], cmd_prev_retain_bytes[k], len);
+		retransmit_frame_lengths[retransmit_count]      = len;
+		retransmit_frame_positions[retransmit_count]    = slot;
+		retransmit_frame_types[retransmit_count]        = cmd_prev_retain_type[k];
+		retransmit_frame_batch_seq_ids[retransmit_count]= (bsi & 0xFF);
+		retransmit_frame_seq_with_eob[retransmit_count] = cmd_prev_retain_seq_eob[k];
+		retransmit_count++;
+		cmd_prev_retain_rounds[k]++;
+		requeued++;
+	}
+	return requeued;
+}
+
 void cl_arq_controller::register_ack(int message_id)
 {
 	if(message_id>=0 && message_id<this->nMessages && messages_tx[message_id].status==PENDING_ACK)
@@ -2341,6 +2469,13 @@ void cl_arq_controller::process_messages_tx_data()
 				/*original_seq_eob=*/retransmit_frame_seq_with_eob[r],
 				/*slot_in_new_batch=*/0,  // unused for retx
 				/*bsi=*/retransmit_frame_batch_seq_ids[r]);
+			// R2c — stash this just-SENT retx frame in the retention shadow, keyed
+			// by its ORIGINAL bsi + slot, so a later prev-bsi re-SACK can re-drive
+			// it if it is lost again (the retx queue slot is consumed on send).
+			cmd_prev_retain_capture(retransmit_frame_batch_seq_ids[r],
+				retransmit_frame_positions[r], retransmit_frame_lengths[r],
+				retransmit_frame_types[r], retransmit_frame_seq_with_eob[r],
+				retransmit_frames[r]);
 			message_batch_counter_tx++;
 			stats.nReSent_data++;
 			last_transmission_block_stats.nReSent_data++;
@@ -4540,6 +4675,45 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							sack_bitmap, data_batch_size, &rx_bsi);
 						SACK_TRACE("decode_sack_v2: ok=%d rx_bsi=%u cmd_bsi=%d",
 							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
+						// R2c — RECOVERABLE PREV-BATCH re-SACK (data-flow-recoverable-gap-abort.md
+						// §5). If the decoded SACK's bsi is NOT the in-flight batch (the case the
+						// OOW/STALE guards below DROP) but IS a retained prev batch still reporting
+						// a missing frame, the RSP is HOLDING a downstream batch behind this bsi's
+						// hole. Re-queue the RETAINED original bytes for the next mixbatch. This
+						// does NOT apply the bitmap to messages_tx[] by index (no false-ACK) and
+						// does NOT touch the in-flight ack state — the re-queued frame rides the
+						// in-flight batch's next retransmit turnaround. Consume the SACK
+						// (decoded=false) so the in-flight guards stay inert.
+						bool prev_retain_consumed = false;
+						if(decoded)
+						{
+							unsigned cmd_bsi_u  = (unsigned)(cmd_batch_seq_id & 0xFF);
+							unsigned prev_bsi_u = (cmd_bsi_u - 1u) & 0xFFu;
+							bool inflight = ((unsigned)rx_bsi == cmd_bsi_u
+							                 || (unsigned)rx_bsi == prev_bsi_u);
+							if(!inflight)
+							{
+								int rq = cmd_prev_retain_requeue((int)rx_bsi,
+									sack_bitmap, data_batch_size);
+								if(rq > 0)
+								{
+									printf("[CMD-PREV-RETAIN-REQUEUE] rx_bsi=%u not in-flight "
+										"{cmd=%u,prev=%u} — re-queued %d retained frame(s) "
+										"(retx queue=%d); next retransmit re-drives the hole\n",
+										(unsigned)rx_bsi, cmd_bsi_u, prev_bsi_u, rq,
+										retransmit_count);
+									fflush(stdout);
+									// Peer is alive + re-requesting: keep the link/watchdog
+									// timers fresh so a bounded recovery does not trip a
+									// spurious BREAK/reconnect.
+									link_timer.start();
+									watchdog_timer.start();
+									policy_evaluate_axis3(true);   // a valid reverse SACK decoded
+									decoded = false;               // handled — skip in-flight apply + the else axis3(false)
+									prev_retain_consumed = true;
+								}
+							}
+						}
 						// R039 (race audit 2026-06-06): bsi-in-window guard.
 						// decode_sack_v2_frame() is CRC8-only and never validates
 						// rx_bsi. The MFSK arms reject rx_bsi outside the
@@ -4625,8 +4799,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							fflush(stdout);
 							policy_evaluate_axis3(true);
 						}
-						else
+						else if(!prev_retain_consumed)
 						{
+							// R2c consumed a valid recovery re-SACK already (axis3(true) fired
+							// there); only signal a reverse-SACK MISS on a genuine decode fail.
 							policy_evaluate_axis3(false);
 						}
 						messages_rx_buffer.status = FREE;

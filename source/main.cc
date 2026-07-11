@@ -1444,6 +1444,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_gas;
                 failed += ARQ_gas.test_gap_abort_stream_backstop_blind();
             }
+            // RECOVERABLE delivery-time GAP-ABORT (R2a hold + R2c CMD retention):
+            // the terminal abort on a RECOVERABLE one-frame prev-batch hole is
+            // converted into a bounded HOLD + re-request; the held batch delivers
+            // in-order only after the hole fills, and the high-water NEVER advances
+            // while the hole exists. Drives the REAL predicates + retention helpers
+            // + advance_last_delivered. See data-flow-recoverable-gap-abort.md.
+            {
+                cl_arq_controller ARQ_grc;
+                failed += ARQ_grc.test_recoverable_gap_abort();
+            }
             // chase-combining (HARQ Type-I soft-LLR combine) fail-before/pass-after:
             // proves a bit-identical retx's LLRs SUMMED before ldpc.decode() rescue a
             // frame one look cannot decode (combine success-rate 0 -> >0), and that
@@ -2388,6 +2398,10 @@ int main(int argc, char *argv[])
                                         // Reproduces bench-4 (deliver 0-4, BREAK reset with 5-7 undelivered, present 8):
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
+    bool test_gap_recover_cli = false;  // --test-gap-recover: RECOVERABLE delivery-time GAP-ABORT
+                                        // (R2a hold + R2c CMD retention). fail-before via
+                                        // MERCURY_GAP_RECOVER_DEFEAT=1 (terminal abort, high-water frozen);
+                                        // pass-after = HOLD + refill + in-order 6->7->8. One-shot, exits rc.
     bool test_turnaround_guard_cli = false; // --test-turnaround-guard: R1 turnaround-clearance guard —
                                         // stamp-then-key drives assert the guard waits out the peer's TX->RX
                                         // mute/flush window (default-on) and adds ~0 when already clear / never armed.
@@ -3257,6 +3271,15 @@ int main(int argc, char *argv[])
             // See source/datalink_layer/arq_responder.cc test_gap_abort_stream_backstop_blind
             // + fact-documents/data-flow-rsp-contiguity-ruler.md §7.
             test_gap_abort_stream_blind_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-recover") == 0)
+        {
+            // RECOVERABLE delivery-time GAP-ABORT regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_responder.cc test_recoverable_gap_abort
+            // + fact-documents/data-flow-recoverable-gap-abort.md.
+            test_gap_recover_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5246,6 +5269,20 @@ start_modem:
             cl_arq_controller ARQ_gas;
             int rc = ARQ_gas.test_gap_abort_stream_backstop_blind();
             printf("[FLAG] Gap-abort-stream-blind test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_gap_recover_cli) {
+            // RECOVERABLE delivery-time GAP-ABORT — HOLD + re-request converts the
+            // terminal abort on a recoverable one-frame prev hole into an in-order
+            // recovery; the high-water never advances while the hole exists
+            // (one-shot, exit rc).
+            printf("[FLAG] --test-gap-recover: invoking recoverable gap-abort "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_grc;
+            int rc = ARQ_grc.test_recoverable_gap_abort();
+            printf("[FLAG] Gap-recover test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -1394,6 +1394,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 							// late older prev cannot regress it below a newer current
 							// already delivered (audit R1).
 							advance_last_delivered(rsp_prev_batch_seq_id);
+							rsp_gap_recover_rounds = 0;   // R2a: the prev hole just filled — clear the recoverable-hold counter
 							printf("[RSP-V2-PREV-DELIVERED] prev_batch_seq_id=%d "
 								"deliveries_total=%lld last_delivered=%d (cross-storage "
 								"path drained; current-batch storage untouched)\n",
@@ -2687,6 +2688,73 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				       || delivery_step_is_gap(rsp_current_expected_batch_seq_id,
 				                               rsp_last_delivered_batch_seq_id)))
 				{
+					// R2a — RECOVERABLE HOLD (data-flow-recoverable-gap-abort.md).
+					// Before the terminal abort, check whether this is the ONE healable
+					// topology: the completed current batch is exactly +2 past
+					// last_delivered AND the single missing batch is the armed,
+					// partially-received prev. If so — and the session is NOT P0-latched
+					// (rsp_stream_aborted forces the abort), and we are within the round
+					// bound — HOLD the current batch instead of aborting: revert its
+					// slots ACKED->RECEIVED (so it is NOT a deliverable ACKED batch),
+					// deliver NOTHING, clean-ACK NOTHING, advance the high-water NOTHING,
+					// and re-advertise the prev hole so the CMD re-drives the missing
+					// frame (R2c re-queues the retained bytes). The contiguity ruler
+					// (delivery_step_is_gap) stays the inviolable assert BELOW — the hold
+					// is strictly UPSTREAM and never lets a byte pass the hole; the held
+					// batch delivers ONLY after the prev hole fills and the ruler shows
+					// contiguity (deliver-held-cur at the PREV-completion commit).
+					// MERCURY_GAP_RECOVER_DEFEAT=1 forces the pre-fix terminal abort.
+					bool recover_defeat = false;
+					{ const char* e = std::getenv("MERCURY_GAP_RECOVER_DEFEAT");
+					  if(e && *e && atoi(e)!=0) recover_defeat = true; }
+					if(!recover_defeat
+					   && !rsp_stream_aborted
+					   && rsp_gap_recover_rounds < RSP_GAP_RECOVER_MAX
+					   && gap_is_recoverable_prev_hole(
+							rsp_current_expected_batch_seq_id,
+							rsp_last_delivered_batch_seq_id,
+							rsp_prev_batch_active, rsp_prev_batch_seq_id,
+							rsp_prev_batch_received_count))
+					{
+						// Revert the just-marked ACKED current-batch slots back to
+						// RECEIVED so this batch is HELD (survives for delivery once the
+						// hole fills) and is NOT mistaken for a deliverable ACKED batch.
+						int reverted = 0;
+						for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+						{
+							if(messages_rx[i].status==ACKED)
+							{ messages_rx[i].status=RECEIVED; reverted++; }
+						}
+						nAck_messages = 0;
+						rsp_gap_recover_rounds++;
+						printf("[RSP-V2-GAP-HOLD] recoverable prev hole: HOLD cur bsi=%d "
+							"(reverted %d ACKED->RECEIVED) prev bsi=%d %d/%d "
+							"last_delivered=%d round=%d/%d — re-advertising prev hole, "
+							"NOT delivering/advancing\n",
+							rsp_current_expected_batch_seq_id, reverted,
+							rsp_prev_batch_seq_id, rsp_prev_batch_received_count,
+							rsp_prev_batch_expected_count,
+							rsp_last_delivered_batch_seq_id,
+							rsp_gap_recover_rounds, RSP_GAP_RECOVER_MAX);
+						fflush(stdout);
+						rsp_resend_prev_partial_sack();
+						// Re-arm for the CMD's re-driven retx — mirror the partial-SACK
+						// re-arm below (:2481-2502). Do NOT override frames_to_read (the
+						// SACK TX already set the turnaround window); keep messages_rx
+						// RECEIVED (do NOT free — the retx fills the prev hole).
+						repeating_last_ack       = NO;
+						messages_control.status  = FREE;
+						stats.nNAcked_data++;
+						batch_rx_frame_count           = 0;
+						last_received_end_of_batch_seq = -1;
+						telecom_system->set_mfsk_ctrl_mode(false);
+						telecom_system->data_container.nUnder_processing_events = 0;
+						calculate_receiving_timeout();
+						receiving_timeout = receiving_timeout * 3 / 2;
+						receiving_timer.start();
+						connection_status = RECEIVING;
+						return;
+					}
 					char reason[112];
 					snprintf(reason, sizeof(reason),
 						"delivery-time BATCH-DONE bsi=%d non-contiguous with last_delivered=%d (dropped-batch hole)",
@@ -2702,6 +2770,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					// delivered batch (monotonic-with-wrap) so a later post-reset
 					// re-adopt can detect a hole.
 					advance_last_delivered(rsp_current_expected_batch_seq_id);
+					rsp_gap_recover_rounds = 0;   // R2a: a forward delivery clears any recoverable-hold state
 					rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
 					rsp_current_expected_batch_seq_id =
 						(rsp_current_expected_batch_seq_id + 1) & 0xFF;
@@ -11824,6 +11893,221 @@ int cl_arq_controller::test_gap_abort_stream_backstop_blind()
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
+
+// ============================================================================
+// RECOVERABLE delivery-time GAP-ABORT regression (CLI --test-gap-recover; also
+// runs inside --test). Drives the REAL pure predicates (gap_is_recoverable_prev_
+// hole + delivery_step_is_gap), the REAL CMD retention-shadow helpers
+// (cmd_prev_retain_capture / _requeue / _evict), and the REAL delivery high-water
+// producer (advance_last_delivered) as the in-order oracle. In-process, no IONOS/
+// RF/telecom DSP. See fact-documents/data-flow-recoverable-gap-abort.md.
+//
+// The storm topology: last_delivered=6, prev batch 7 partially received (hole),
+// current batch 8 fully received. delivery_step_is_gap(8,6)=fwd2=TRUE.
+//   fail-before (MERCURY_GAP_RECOVER_DEFEAT=1): the gate takes the TERMINAL abort
+//     — the high-water stays 6, batch 8 is never delivered (no recovery).
+//   pass-after (defeat off): the gate DIVERTS to the recoverable HOLD — high-water
+//     STAYS 6 during the hold (no byte passes the hole), the prev hole is re-
+//     advertised, the CMD re-drives the retained frame, prev 7 fills and delivers
+//     (last->7), then the held batch 8 re-completes contiguously and delivers
+//     (last->8) — IN ORDER 6->7->8, NO abort. The cardinal invariant (never
+//     advance the high-water while a hole exists) is asserted at every step.
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_recoverable_gap_abort()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_GAP_RECOVER_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("[TEST-GAP-RECOVER] start (MERCURY_GAP_RECOVER_DEFEAT=%d)\n", defeat ? 1 : 0);
+	fflush(stdout);
+	int fails = 0;
+
+	// --- ARM P: the pure recoverable-hole predicate --------------------------
+	// Recoverable: cur exactly +2 past last, missing batch == armed partial prev.
+	if(!gap_is_recoverable_prev_hole(8, 6, true, 7, 24))
+	{ printf("[TEST-GAP-RECOVER] FAIL P1: storm topology not recognized recoverable\n"); fails++; }
+	// Every recoverable hole is a STRICT SUBSET of delivery_step_is_gap.
+	if(gap_is_recoverable_prev_hole(8, 6, true, 7, 24)
+	   && !delivery_step_is_gap(8, 6))
+	{ printf("[TEST-GAP-RECOVER] FAIL P2: recoverable but not a gap (subset violated)\n"); fails++; }
+	// NOT recoverable: fwd=3 (two batches missing).
+	if(gap_is_recoverable_prev_hole(9, 6, true, 7, 24))
+	{ printf("[TEST-GAP-RECOVER] FAIL P3: fwd=3 wrongly recoverable\n"); fails++; }
+	// NOT recoverable: prev inactive.
+	if(gap_is_recoverable_prev_hole(8, 6, false, 7, 24))
+	{ printf("[TEST-GAP-RECOVER] FAIL P4: inactive prev wrongly recoverable\n"); fails++; }
+	// NOT recoverable: prev bsi != last+1 (the missing batch is NOT the prev).
+	if(gap_is_recoverable_prev_hole(8, 6, true, 5, 24))
+	{ printf("[TEST-GAP-RECOVER] FAIL P5: mismatched prev bsi wrongly recoverable\n"); fails++; }
+	// NOT recoverable: prev received nothing (no partial to complete).
+	if(gap_is_recoverable_prev_hole(8, 6, true, 7, 0))
+	{ printf("[TEST-GAP-RECOVER] FAIL P6: empty prev wrongly recoverable\n"); fails++; }
+	// NOT recoverable: session start (last<0).
+	if(gap_is_recoverable_prev_hole(8, -1, true, 7, 24))
+	{ printf("[TEST-GAP-RECOVER] FAIL P7: session-start wrongly recoverable\n"); fails++; }
+	// WRAP: last=255, cur=1, prev=0 -> recoverable (mod-256).
+	if(!gap_is_recoverable_prev_hole(1, 255, true, 0, 10))
+	{ printf("[TEST-GAP-RECOVER] FAIL P8: wrap topology not recognized recoverable\n"); fails++; }
+
+	// --- ARM R: the CMD retention-shadow helpers -----------------------------
+	this->nMessages         = 255;
+	this->max_data_length   = 170;
+	this->max_message_length= 200;
+	this->max_header_length = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{ printf("[TEST-GAP-RECOVER] ERROR: init_messages_buffers rc=%d\n", alloc_rc); return 1; }
+	this->sack_v2_enabled = true;
+	this->data_batch_size = 25;
+
+	cmd_prev_retain_count = 0;
+	retransmit_count      = 0;
+	unsigned char frameA[10]; for(int i=0;i<10;i++) frameA[i]=(unsigned char)(0xA0+i);
+	unsigned char frameB[8];  for(int i=0;i<8;i++)  frameB[i]=(unsigned char)(0xB0+i);
+	// Retain two frames of batch 7 (slot 0 + slot 5).
+	cmd_prev_retain_capture(7, 0, 10, DATA_LONG, 0x00, frameA);
+	cmd_prev_retain_capture(7, 5,  8, DATA_LONG, 0x85, frameB);
+	if(cmd_prev_retain_count != 2)
+	{ printf("[TEST-GAP-RECOVER] FAIL R1: retain count=%d want 2\n", cmd_prev_retain_count); fails++; }
+	// Dedup: re-capture (7,0) updates in place, does not grow.
+	cmd_prev_retain_capture(7, 0, 10, DATA_LONG, 0x00, frameA);
+	if(cmd_prev_retain_count != 2)
+	{ printf("[TEST-GAP-RECOVER] FAIL R2: dedup grew count=%d\n", cmd_prev_retain_count); fails++; }
+
+	// Re-SACK for batch 7 reporting slot 0 MISSING, slot 5 GOT: only slot 0 re-queues.
+	bool got[MAX_SACK_BATCH_SIZE];
+	for(int i=0;i<MAX_SACK_BATCH_SIZE;i++) got[i]=true;
+	got[0]=false;   // slot 0 still missing
+	int rq = cmd_prev_retain_requeue(7, got, this->data_batch_size);
+	if(rq != 1 || retransmit_count != 1)
+	{ printf("[TEST-GAP-RECOVER] FAIL R3: requeue rq=%d retx=%d want 1/1\n", rq, retransmit_count); fails++; }
+	else
+	{
+		if(retransmit_frame_batch_seq_ids[0] != 7
+		   || retransmit_frame_positions[0]   != 0
+		   || retransmit_frame_lengths[0]     != 10
+		   || memcmp(retransmit_frames[0], frameA, 10) != 0)
+		{ printf("[TEST-GAP-RECOVER] FAIL R4: re-queued frame identity/bytes wrong "
+			"(bsi=%d slot=%d len=%d)\n", retransmit_frame_batch_seq_ids[0],
+			retransmit_frame_positions[0], retransmit_frame_lengths[0]); fails++; }
+	}
+	// Repeat re-SACK: already queued for (7,0) -> no duplicate.
+	if(cmd_prev_retain_requeue(7, got, this->data_batch_size) != 0
+	   || retransmit_count != 1)
+	{ printf("[TEST-GAP-RECOVER] FAIL R5: duplicate re-queue not suppressed (retx=%d)\n", retransmit_count); fails++; }
+	// Bound: drain the queue and re-request until the per-entry round cap stops it.
+	int rounds_seen = 1;   // one re-drive already used above
+	for(int r=0; r<6; r++)
+	{
+		retransmit_count = 0;   // simulate the mixbatch consuming the queue
+		int got_n = cmd_prev_retain_requeue(7, got, this->data_batch_size);
+		if(got_n > 0) rounds_seen += got_n; else break;
+	}
+	if(rounds_seen > RSP_GAP_RECOVER_MAX)
+	{ printf("[TEST-GAP-RECOVER] FAIL R6: re-drive exceeded bound (%d > %d)\n",
+		rounds_seen, RSP_GAP_RECOVER_MAX); fails++; }
+	// Evict batch 7 -> shadow empty.
+	cmd_prev_retain_evict(7);
+	if(cmd_prev_retain_count != 0)
+	{ printf("[TEST-GAP-RECOVER] FAIL R7: evict left count=%d\n", cmd_prev_retain_count); fails++; }
+
+	// --- ARM D: the decisive gate decision + in-order delivery oracle --------
+	// Replicate the EXACT production gate decision (mirrors test_gap_abort_on_
+	// readopt's inline-gate methodology), respecting MERCURY_GAP_RECOVER_DEFEAT,
+	// and drive the REAL advance_last_delivered producer as the high-water oracle.
+	this->rsp_last_delivered_batch_seq_id   = 6;    // batches 0..6 delivered
+	this->rsp_current_expected_batch_seq_id = 8;    // current batch (completed)
+	this->rsp_prev_batch_seq_id             = 7;    // the armed partial prev
+	this->rsp_prev_batch_active             = true;
+	this->rsp_prev_batch_received_count     = 24;   // 24/25 — one-frame hole
+	this->rsp_prev_batch_expected_count     = 25;
+	this->rsp_stream_aborted                = false;
+	this->rsp_gap_recover_rounds            = 0;
+	this->link_status                       = CONNECTED;
+	// Current batch 8 is fully received + (as at the BATCH-DONE gate) marked ACKED.
+	for(int i=0;i<this->data_batch_size;i++) messages_rx[i].status = ACKED;
+
+	bool is_gap = delivery_step_is_gap(this->rsp_current_expected_batch_seq_id,
+	                                   this->rsp_last_delivered_batch_seq_id);
+	bool recoverable = gap_is_recoverable_prev_hole(
+		this->rsp_current_expected_batch_seq_id, this->rsp_last_delivered_batch_seq_id,
+		this->rsp_prev_batch_active, this->rsp_prev_batch_seq_id,
+		this->rsp_prev_batch_received_count);
+	if(!is_gap)
+	{ printf("[TEST-GAP-RECOVER] FAIL D0: storm is not a gap (setup wrong)\n"); fails++; }
+
+	bool aborted = false;
+	if(!defeat && recoverable && !this->rsp_stream_aborted
+	   && this->rsp_gap_recover_rounds < RSP_GAP_RECOVER_MAX)
+	{
+		// HOLD (pass-after): revert cur ACKED->RECEIVED, deliver/advance NOTHING.
+		for(int i=0;i<this->data_batch_size;i++)
+			if(messages_rx[i].status==ACKED) messages_rx[i].status=RECEIVED;
+		this->rsp_gap_recover_rounds++;
+		// CARDINAL: the high-water must NOT have advanced during the hold.
+		if(this->rsp_last_delivered_batch_seq_id != 6)
+		{ printf("[TEST-GAP-RECOVER] FAIL D1: high-water advanced during HOLD (=%d, want 6)\n",
+			this->rsp_last_delivered_batch_seq_id); fails++; }
+		// The held cur must be RECEIVED (not a deliverable ACKED batch).
+		bool any_acked=false;
+		for(int i=0;i<this->data_batch_size;i++) if(messages_rx[i].status==ACKED) any_acked=true;
+		if(any_acked)
+		{ printf("[TEST-GAP-RECOVER] FAIL D2: held cur left ACKED (would deliver past the hole)\n"); fails++; }
+		printf("[TEST-GAP-RECOVER] HOLD: high-water held at %d, cur reverted RECEIVED, round=%d\n",
+			this->rsp_last_delivered_batch_seq_id, this->rsp_gap_recover_rounds);
+		fflush(stdout);
+
+		// Refill: the CMD re-drove batch 7 frame 0 -> prev completes -> PREV
+		// commit delivers batch 7 via the REAL producer.
+		this->rsp_prev_batch_received_count = 25;
+		advance_last_delivered(this->rsp_prev_batch_seq_id);   // -> last=7
+		this->rsp_gap_recover_rounds = 0;
+		this->rsp_prev_batch_active  = false;
+		if(this->rsp_last_delivered_batch_seq_id != 7)
+		{ printf("[TEST-GAP-RECOVER] FAIL D3: prev delivery did not advance high-water to 7 (=%d)\n",
+			this->rsp_last_delivered_batch_seq_id); fails++; }
+		// Held cur 8 now re-completes contiguously: gate must NOT fire.
+		if(delivery_step_is_gap(this->rsp_current_expected_batch_seq_id,
+		                        this->rsp_last_delivered_batch_seq_id))
+		{ printf("[TEST-GAP-RECOVER] FAIL D4: held cur still reads as a gap after refill\n"); fails++; }
+		advance_last_delivered(this->rsp_current_expected_batch_seq_id);   // -> last=8
+		if(this->rsp_last_delivered_batch_seq_id != 8)
+		{ printf("[TEST-GAP-RECOVER] FAIL D5: held cur delivery did not advance high-water to 8 (=%d)\n",
+			this->rsp_last_delivered_batch_seq_id); fails++; }
+		printf("[TEST-GAP-RECOVER] RECOVERED: in-order high-water 6 -> 7 -> 8, NO abort\n");
+		fflush(stdout);
+	}
+	else
+	{
+		// TERMINAL abort (fail-before, or a genuinely unrecoverable gap): the
+		// high-water stays 6, batch 8 is never delivered.
+		aborted = true;
+		this->link_status = DROPPED;
+		printf("[TEST-GAP-RECOVER] ABORT: high-water stays %d, cur NOT delivered\n",
+			this->rsp_last_delivered_batch_seq_id);
+		fflush(stdout);
+	}
+
+	if(defeat)
+	{
+		// fail-before oracle: must have aborted, high-water frozen at 6.
+		if(!aborted || this->rsp_last_delivered_batch_seq_id != 6)
+		{ printf("[TEST-GAP-RECOVER] FAIL DF: defeat arm did not abort/freeze (aborted=%d hw=%d)\n",
+			aborted?1:0, this->rsp_last_delivered_batch_seq_id); fails++; }
+	}
+	else
+	{
+		// pass-after oracle: recovered in order to 8, never aborted.
+		if(aborted || this->rsp_last_delivered_batch_seq_id != 8)
+		{ printf("[TEST-GAP-RECOVER] FAIL DP: recovery arm aborted/short (aborted=%d hw=%d)\n",
+			aborted?1:0, this->rsp_last_delivered_batch_seq_id); fails++; }
+	}
+
+	printf("[TEST-GAP-RECOVER] %s (fails=%d)\n", fails==0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails==0 ? 0 : 1;
+}
+
 
 // ============================================================================
 // Track A — multi-window DATA-ACK/SACK correlator (in-process, test-only)

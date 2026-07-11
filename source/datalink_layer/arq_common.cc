@@ -749,7 +749,10 @@ cl_arq_controller::cl_arq_controller()
 	rsp_prev_batch_expected_count=0;
 	rsp_prev_batch_delivered_count=0;
 	rsp_prev_batch_stale_count=0;
+	rsp_gap_recover_rounds=0;       // R2a: recoverable-hold round counter
 	rsp_deferred_batch_shrink=-1;   // Fix A (baseline-double-delivery.md): no deferred orphan-avoiding shrink pending
+	// R2c — CMD prev-batch retention shadow (all sentinels; gated on sack_v2 at use).
+	cmd_prev_retain_count=0;
 	// SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
 	// All CMD-side; gated on sack_v2_enabled at the call sites. Ring + counters
 	// + cooldown all start at zero. v1 sessions leave these untouched.
@@ -7293,6 +7296,13 @@ void cl_arq_controller::reset_session_state()
 	// A fresh session must not re-emit bytes from the previous connection's stream.
 	rx_deliver_pending_len = 0;
 
+	// R2a/R2c: a fresh session (and the teardown, which routes through here) starts
+	// with no recoverable-hold in progress and an empty CMD retention shadow. The
+	// teardown saves/restores the ruler around this call; these two are NOT ruler
+	// state, so clearing them here is correct on every session boundary.
+	rsp_gap_recover_rounds = 0;
+	cmd_prev_retain_count  = 0;
+
 	// Option W (data-flow-stream-offset.md §2.4): a fresh session re-anchors both
 	// absolute-byte-stream cursors at 0 and invalidates every per-bsi stamp so the
 	// next connection's stream starts at offset 0 with no stale stamp aliasing.
@@ -10497,6 +10507,57 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 		rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
 		xferred, rsp_prev_batch_received_count, rsp_prev_batch_expected_count);
 	fflush(stdout);
+}
+
+// R2a — re-send the PARTIAL SACK for the ALREADY-SEALED prev batch. Called from
+// the recoverable-hold branch at the BATCH-DONE delivery gate: the current batch
+// completed but a one-frame hole in the armed prev batch is holding it, so we
+// re-advertise that hole (RFC 2018: re-advertise the hole in every ACK until it
+// fills) to make the CMD re-drive the missing frame. Rebuilds the bitmap from
+// messages_rx_prev[] RECEIVED status and emits it for rsp_prev_batch_seq_id on
+// the SAME MFSK/OFDM SACK transport the live partial path uses. Does NOT call
+// bump_bsi_and_transfer_prev() (the prev is already sealed) and does NOT touch
+// the current batch. Emits the plain prev bsi in the wire field (not the
+// cumulative n_r reshape) so the CMD's R2c re-queue can key on the exact bsi.
+// No new wire format. Returns true if a SACK was emitted.
+bool cl_arq_controller::rsp_resend_prev_partial_sack()
+{
+	if(!(sack_v2_enabled && rsp_prev_batch_active && rsp_prev_batch_seq_id >= 0))
+		return false;
+
+	bool sack_bitmap[MAX_SACK_BATCH_SIZE];
+	for(int i=0; i<MAX_SACK_BATCH_SIZE; i++)
+		sack_bitmap[i] = (i < this->data_batch_size
+		                  && messages_rx_prev[i].status == RECEIVED);
+
+	unsigned char prev_bsi = (unsigned char)(rsp_prev_batch_seq_id & 0xFF);
+	printf("[RSP-V2-GAP-RESACK] re-advertising prev hole batch_seq_id=%u "
+		"received=%d/%d (recoverable HOLD round=%d)\n",
+		(unsigned)prev_bsi, rsp_prev_batch_received_count,
+		rsp_prev_batch_expected_count, rsp_gap_recover_rounds);
+	fflush(stdout);
+
+	// partial = a retransmit turnaround (mirrors arq_responder.cc:2453).
+	ack_tx_retx_turnaround = true;
+
+	bool sent = false;
+	if(MFSK_ACK_SACK_ENABLED
+	   && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
+	{
+		uint32_t bitmap_u32 = 0;
+		int nbits = this->data_batch_size;
+		if(nbits > 30) nbits = 30;
+		for(int i=0; i<nbits; i++)
+			if(sack_bitmap[i]) bitmap_u32 |= (1u << i);
+		long long mfsk_ms = send_mfsk_ack_sack(prev_bsi, bitmap_u32);
+		if(mfsk_ms > 0) sent = true;
+	}
+	if(!sent)
+	{
+		send_sack_v2_frame(sack_bitmap, this->data_batch_size, prev_bsi);
+		sent = true;
+	}
+	return sent;
 }
 
 // FIX-8 (data-integrity): advance the reset-surviving delivery high-water mark
