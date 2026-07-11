@@ -1427,6 +1427,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_gab;
                 failed += ARQ_gab.test_gap_abort_readopt_blind();
             }
+            // zombie/amplifier layer (data-flow-zombie-amplifier.md): R2b BREAK-accept-
+            // while-DROPPED, the ROBUST_DWELL keep-alive gate, and the watchdog
+            // peer-liveness probe gate — each pure decision helper's truth table under
+            // the defeat knob (fail-before) vs unset (pass-after). Deterministic; no RF.
+            {
+                cl_arq_controller ARQ_za;
+                failed += ARQ_za.test_zombie_amp();
+            }
             // GAP-ABORT stream-backstop companion (data-flow-rsp-contiguity-ruler.md §7):
             // the REAL teardown must ALSO preserve the Option W byte cursor + stamp validity
             // (so w_stream_shift_detected can still fire post-abort) and set the sticky
@@ -2018,6 +2026,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-zombie-amp : run ONLY the zombie/amplifier layer fail-before/
+        // pass-after self-test (R2b BREAK-accept-while-DROPPED, the ROBUST_DWELL
+        // keep-alive gate, and the watchdog peer-liveness probe gate) and exit.
+        // Asserts each pure decision helper's truth table under defeat / no-defeat.
+        // See fact-documents/data-flow-zombie-amplifier.md.
+        if (strcmp(argv[i], "--test-zombie-amp") == 0) {
+            cl_arq_controller ARQ_za;
+            int failed = ARQ_za.test_zombie_amp();
             return (failed == 0) ? 0 : 1;
         }
         // --test-acq-bounds : run ONLY the OFDM acquisition bounds-gate recovery

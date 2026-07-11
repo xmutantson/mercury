@@ -6102,8 +6102,94 @@ void cl_arq_controller::update_status()
 
 	if(watchdog_timer.get_elapsed_time_ms()>= watchdog_timeout)
 	{
+		// FIX 3 (data-flow-zombie-amplifier.md §3): gate the CMD resurrection on a
+		// peer-liveness probe — NO unconditional teleport to CONNECTED against a
+		// possibly-dead/desynced peer (H4: state resurrection with a stale bsi/nonce
+		// epoch). The RESPONDER branch is unchanged (WD_TELEPORT).
+		int wd_decision = (original_role==COMMANDER)
+			? watchdog_resurrect_decision(watchdog_resurrect_probe_pending,
+				rx_receive_frame_index != watchdog_probe_rx_index_snap)
+			: WD_TELEPORT;
+
+		if(wd_decision == WD_PROBE)
+		{
+			// First fire: probe with the EXISTING REPEAT_LAST_ACK pattern (no OTA
+			// format change), snapshot the monotonic rx frame index, defer one cycle.
+			// Leave messages_tx / retx / session state INTACT so a live peer resumes.
+			watchdog_resurrect_probe_pending = true;
+			watchdog_probe_rx_index_snap = rx_receive_frame_index;
+			set_role(COMMANDER);
+			cleanup();
+			add_message_control(REPEAT_LAST_ACK);
+			connection_status = TRANSMITTING_CONTROL;
+			printf("[WATCHDOG-PROBE] watchdog fired — probing peer liveness "
+				"(REPEAT_LAST_ACK) before resurrecting; deferring one cycle\n");
+			fflush(stdout);
+			watchdog_timer.stop(); watchdog_timer.reset(); watchdog_timer.start();
+			gear_shift_timer.stop(); gear_shift_timer.reset();
+			receiving_timer.stop(); receiving_timer.reset();
+		}
+		else if(wd_decision == WD_RESUME)
+		{
+			// Peer showed reverse activity since the probe -> alive. Re-arm; the
+			// normal receive path owns the resumed session. No teleport.
+			watchdog_resurrect_probe_pending = false;
+			printf("[WATCHDOG-PROBE] peer alive (rx index advanced) — no teleport; "
+				"re-arming watchdog\n");
+			fflush(stdout);
+			watchdog_timer.stop(); watchdog_timer.reset(); watchdog_timer.start();
+			gear_shift_timer.stop(); gear_shift_timer.reset();
+			receiving_timer.stop(); receiving_timer.reset();
+		}
+		else if(wd_decision == WD_RECONNECT)
+		{
+			// Probe unanswered, pure silence -> peer confirmed dead. CLEAN reconnect
+			// (crypto/bsi re-baseline via a real session boundary), NOT an in-place
+			// teleport with a stale epoch. Preserve pending TX via the same backup
+			// re-stage the teleport used; mirror the link_timeout COMMANDER path.
+			watchdog_resurrect_probe_pending = false;
+			printf("[WATCHDOG-PROBE] peer unresponsive to liveness probe — dropping link "
+				"+ reconnecting at init config (no in-place teleport)\n");
+			fflush(stdout);
+
+			char wd_restore_buf[N_MAX/8 * 20];
+			int wd_total_restore = 0;
+			int wd_data_read_size;
+			for(int i=0;i<get_nTotal_messages();i++)
+			{
+				wd_data_read_size=fifo_buffer_backup.pop(wd_restore_buf + wd_total_restore,max_data_length+max_header_length);
+				if(wd_data_read_size!=0) wd_total_restore += wd_data_read_size; else break;
+			}
+			reset_session_state();   // safe: a real session boundary; crypto re-handshakes on reconnect
+			if(wd_total_restore > 0)
+				fifo_buffer_tx.push_front(wd_restore_buf, wd_total_restore);   // reset_session_state does not flush tx
+			fifo_buffer_backup.flush();
+
+			commander_configured_nb = narrowband_enabled;
+			load_configuration(init_configuration, FULL, YES);
+			link_status=CONNECTING;
+			connection_status=TRANSMITTING_CONTROL;
+			turboshift_active = true;
+			turboshift_phase = TURBO_DONE;
+			turboshift_last_good = -1;
+			turbo_settle_pending = false;
+			turbo_supershift_announce_pending = false;
+			supershift_proven_ceiling = -1;
+			turbo_snr_ack_enabled = false;
+			turbo_received_snr = -99.0f;
+			messages_control.status = FREE;
+			connection_attempts = 0;
+			connection_attempt_timer.reset();
+			connection_attempt_timer.start();
+			watchdog_timer.stop(); watchdog_timer.reset();
+			gear_shift_timer.stop(); gear_shift_timer.reset();
+			receiving_timer.stop(); receiving_timer.reset();
+		}
+		else  // WD_TELEPORT — the pre-fix unconditional resurrection (defeat knob, or RESPONDER)
+		{
 		if(original_role==COMMANDER)
 		{
+			watchdog_resurrect_probe_pending = false;
 			set_role(COMMANDER);
 			link_status=CONNECTED;
 			connection_status=TRANSMITTING_DATA;
@@ -6158,6 +6244,7 @@ void cl_arq_controller::update_status()
 		receiving_timer.stop();
 		receiving_timer.reset();
 
+		}   // end WD_TELEPORT (else)
 	}
 
 	// Fallback: if we're in COMMANDER mode and haven't received anything for 60+ seconds
@@ -7077,6 +7164,127 @@ void cl_arq_controller::reset_all_timers()
 	receiving_timer.reset();
 	switch_role_timer.stop();
 	switch_role_timer.reset();
+}
+
+// ============================================================================
+// zombie/amplifier layer decision helpers (data-flow-zombie-amplifier.md).
+// Pure predicates shared by the production paths and the --test-zombie-amp
+// self-test; each reads its own defeat knob so the test exercises real code.
+// ============================================================================
+// Portable env set/unset for the self-test only (production never writes env).
+static void setenv_portable(const char* name, const char* val)
+{
+#ifdef _WIN32
+	char buf[256]; snprintf(buf, sizeof(buf), "%s=%s", name, val); _putenv(buf);
+#else
+	setenv(name, val, 1);
+#endif
+}
+static void unsetenv_portable(const char* name)
+{
+#ifdef _WIN32
+	char buf[256]; snprintf(buf, sizeof(buf), "%s=", name); _putenv(buf);
+#else
+	unsetenv(name);
+#endif
+}
+
+// FIX 1 (R2b, §1): a decoded BREAK is actionable when CONNECTED (always) or DROPPED
+// (unless defeated) — so the silent-teardown zombie can accept the CMD's BREAK and
+// run the existing reset-to-ROBUST_0 + ACK. Every other link_status (LISTENING,
+// CONNECTING, ...) still discards: "don't ACK someone else's BREAK".
+bool cl_arq_controller::break_frame_actionable(int ls) const
+{
+	if(ls == CONNECTED) return true;
+	if(ls == DROPPED)
+	{
+		const char* e = std::getenv("MERCURY_BREAK_DROPPED_DEFEAT");
+		bool defeat = (e && *e && atoi(e) != 0);
+		return !defeat;
+	}
+	return false;
+}
+
+// FIX 4 (§4): the ROBUST_DWELL_BATCH_OP handler always MIRRORS the batch value
+// (4-wire symmetry, data-flow-robust-tier-arq-batch.md §5.2), but it may restart
+// the link/watchdog keep-alive timers only when CONNECTED — a DROPPED link must be
+// allowed to reach link_timeout and die. The defeat knob restores the pre-fix
+// unconditional restart.
+bool cl_arq_controller::robust_dwell_keepalive_ok(int ls) const
+{
+	const char* e = std::getenv("MERCURY_ROBUST_DWELL_KEEPALIVE_DEFEAT");
+	if(e && *e && atoi(e) != 0) return true;   // defeat: unconditional keep-alive
+	return (ls == CONNECTED);
+}
+
+// FIX 3 (§3): the CMD watchdog resurrection selector. Under the defeat knob the
+// pre-fix unconditional teleport is chosen. Otherwise: probe on the first fire;
+// on the second fire RESUME if the peer showed reverse activity (rx advanced) or
+// RECONNECT (clean session boundary) if it stayed pure-silent.
+int cl_arq_controller::watchdog_resurrect_decision(bool probe_pending, bool rx_advanced) const
+{
+	const char* e = std::getenv("MERCURY_WATCHDOG_PROBE_DEFEAT");
+	if(e && *e && atoi(e) != 0) return WD_TELEPORT;   // defeat: pre-fix unconditional teleport
+	if(!probe_pending) return WD_PROBE;
+	if(rx_advanced)    return WD_RESUME;
+	return WD_RECONNECT;
+}
+
+// Consolidated fail-before/pass-after self-test for the three implemented fixes.
+// Asserts each pure predicate's truth table with the defeat knob unset (pass-after)
+// and set (fail-before). No IONOS/RF; deterministic. Returns #failures.
+int cl_arq_controller::test_zombie_amp()
+{
+	int fails = 0;
+	auto CHECK = [&](bool cond, const char* what) {
+		if(!cond) { printf("[TEST-ZOMBIE-AMP] FAIL: %s\n", what); fflush(stdout); fails++; }
+	};
+
+	// Make the environment deterministic regardless of caller state.
+	unsetenv_portable("MERCURY_BREAK_DROPPED_DEFEAT");
+	unsetenv_portable("MERCURY_ROBUST_DWELL_KEEPALIVE_DEFEAT");
+	unsetenv_portable("MERCURY_WATCHDOG_PROBE_DEFEAT");
+
+	printf("[TEST-ZOMBIE-AMP] start\n"); fflush(stdout);
+
+	// --- FIX 1 (R2b): BREAK actionable-by-link_status ---------------------
+	// pass-after (no defeat): CONNECTED + DROPPED actionable; LISTENING/CONNECTING not.
+	CHECK( break_frame_actionable(CONNECTED),  "R2b: CONNECTED must accept BREAK");
+	CHECK( break_frame_actionable(DROPPED),    "R2b: DROPPED must accept BREAK (the zombie fix)");
+	CHECK(!break_frame_actionable(LISTENING),  "R2b: LISTENING must discard BREAK");
+	CHECK(!break_frame_actionable(CONNECTING), "R2b: CONNECTING must discard BREAK");
+	// fail-before (defeat): DROPPED reverts to discard, CONNECTED still accepts.
+	setenv_portable("MERCURY_BREAK_DROPPED_DEFEAT", "1");
+	CHECK(!break_frame_actionable(DROPPED),    "R2b fail-before: DROPPED discards under DEFEAT");
+	CHECK( break_frame_actionable(CONNECTED),  "R2b fail-before: CONNECTED still accepts under DEFEAT");
+	unsetenv_portable("MERCURY_BREAK_DROPPED_DEFEAT");
+
+	// --- FIX 4 (ROBUST_DWELL keep-alive) ----------------------------------
+	CHECK( robust_dwell_keepalive_ok(CONNECTED), "FIX4: CONNECTED keeps the keep-alive");
+	CHECK(!robust_dwell_keepalive_ok(DROPPED),   "FIX4: DROPPED suppresses the keep-alive (zombie must expire)");
+	setenv_portable("MERCURY_ROBUST_DWELL_KEEPALIVE_DEFEAT", "1");
+	CHECK( robust_dwell_keepalive_ok(DROPPED),   "FIX4 fail-before: DROPPED keeps keep-alive under DEFEAT");
+	unsetenv_portable("MERCURY_ROBUST_DWELL_KEEPALIVE_DEFEAT");
+
+	// --- FIX 3 (watchdog probe gate) --------------------------------------
+	// pass-after: first fire probes; second fire resumes if rx advanced else reconnects.
+	CHECK(watchdog_resurrect_decision(/*pending=*/false, /*rx_adv=*/false) == WD_PROBE,
+		"FIX3: first fire must PROBE (no unconditional teleport)");
+	CHECK(watchdog_resurrect_decision(/*pending=*/true,  /*rx_adv=*/true ) == WD_RESUME,
+		"FIX3: peer answered (rx advanced) must RESUME (no teleport)");
+	CHECK(watchdog_resurrect_decision(/*pending=*/true,  /*rx_adv=*/false) == WD_RECONNECT,
+		"FIX3: pure-silence must RECONNECT (clean boundary, no teleport)");
+	// fail-before: defeat restores the unconditional teleport on every branch.
+	setenv_portable("MERCURY_WATCHDOG_PROBE_DEFEAT", "1");
+	CHECK(watchdog_resurrect_decision(false, false) == WD_TELEPORT,
+		"FIX3 fail-before: DEFEAT restores unconditional TELEPORT");
+	CHECK(watchdog_resurrect_decision(true,  false) == WD_TELEPORT,
+		"FIX3 fail-before: DEFEAT teleports even on pure silence");
+	unsetenv_portable("MERCURY_WATCHDOG_PROBE_DEFEAT");
+
+	printf("[TEST-ZOMBIE-AMP] %s (%d failures)\n", fails == 0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails;
 }
 
 void cl_arq_controller::reset_session_state()

@@ -2636,6 +2636,25 @@ public:
   // See bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
   int test_gap_abort_on_readopt();
 
+  // ---- zombie/amplifier layer decision helpers (data-flow-zombie-amplifier.md) ----
+  // Pure predicates, shared by production + the --test-zombie-amp self-test. Each
+  // reads its own MERCURY_*_DEFEAT knob so the test's fail-before arm exercises the
+  // SAME code the production path runs.
+  // FIX 1 (R2b, §1): should a decoded BREAK be acted on given link_status? CONNECTED
+  // always; DROPPED unless MERCURY_BREAK_DROPPED_DEFEAT; every other state never.
+  bool break_frame_actionable(int ls) const;
+  // FIX 4 (§4): may the ROBUST_DWELL_BATCH_OP restart link/watchdog timers? Only when
+  // CONNECTED (a DROPPED link must not prolong itself) unless
+  // MERCURY_ROBUST_DWELL_KEEPALIVE_DEFEAT restores the unconditional restart.
+  bool robust_dwell_keepalive_ok(int ls) const;
+  // FIX 3 (§3): the CMD watchdog resurrection branch selector.
+  enum { WD_TELEPORT = 0, WD_PROBE = 1, WD_RESUME = 2, WD_RECONNECT = 3 };
+  int  watchdog_resurrect_decision(bool probe_pending, bool rx_advanced) const;
+  // The consolidated fail-before/pass-after self-test for the three implemented
+  // fixes (asserts each helper's truth table under defeat / no-defeat). CLI
+  // --test-zombie-amp; also run inside --test. Returns 0=PASS, else #failures.
+  int test_zombie_amp();
+
   // GAP-ABORT ruler-blinding regression (CLI --test-gap-abort-blind; also in
   // --test). fact-documents/data-flow-rsp-contiguity-ruler.md. Drives the REAL
   // rsp_gap_abort_teardown() (not a modeled abort), the REAL delivery-time /
@@ -5047,6 +5066,14 @@ public:
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)
   int break_detected;             // YES if BREAK pattern detected by responder
+
+  // ---- zombie/amplifier layer (data-flow-zombie-amplifier.md) -------------
+  // FIX 3 (watchdog probe gate, §3): defer the CMD watchdog teleport behind a
+  // peer-liveness probe. probe_pending latches across one watchdog cycle; the
+  // rx-index snapshot distinguishes "peer answered" (rx advanced) from
+  // "pure silence" (confirmed dead -> clean reconnect, never an in-place teleport).
+  bool watchdog_resurrect_probe_pending{false};
+  long long watchdog_probe_rx_index_snap{0};
 
   // ---- BREAK forward-health gate (fix/break-fh-gate) ---------------------
   // ROOT CAUSE (workflow w2ee37gd6): the responder BREAK probe

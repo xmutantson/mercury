@@ -471,14 +471,23 @@ void cl_arq_controller::process_messages_rx_data_control()
 		this->receive();
 
 		// Emergency BREAK: commander signals "drop to ROBUST_0"
-		// Only respond if we're actually connected — prevents all radios on a
-		// frequency from ACKing someone else's BREAK.
-		if(break_detected == YES && link_status != CONNECTED)
+		// Only act on a BREAK aimed at THIS session — prevents idle radios on a
+		// frequency from ACKing someone else's BREAK. R2b (zombie/amplifier layer,
+		// data-flow-zombie-amplifier.md §1): a DROPPED responder (silent gap-abort
+		// teardown zombie) is now ACTIONABLE so it can accept the CMD's BREAK and run
+		// the existing reset-to-ROBUST_0 + ACK below — the wire notice the CMD's
+		// recovery arsenal already understands — instead of the CMD grinding its
+		// demote ladder against a peer that discards the BREAK. LISTENING / CONNECTING
+		// and every other non-session state still discard. MERCURY_BREAK_DROPPED_DEFEAT=1
+		// restores the CONNECTED-only accept (fail-before). The handler leaves
+		// link_status unchanged (DROPPED stays DROPPED at ROBUST_0/RECEIVING); the CMD
+		// re-establishes via the existing post-BREAK SET_CONFIG / reconnect flow.
+		if(break_detected == YES && !break_frame_actionable(link_status))
 			break_detected = NO;
-		if(break_detected == YES && link_status == CONNECTED)
+		if(break_detected == YES && break_frame_actionable(link_status))
 		{
-			printf("[BREAK] %s, dropping to ROBUST_0\n",
-				passive_monitor ? "Observed" : "Responding with ACK");
+			printf("[BREAK] %s (link_status=%d), dropping to ROBUST_0\n",
+				passive_monitor ? "Observed" : "Responding with ACK", link_status);
 			fflush(stdout);
 			break_detected = NO;
 
@@ -3960,10 +3969,26 @@ void cl_arq_controller::process_control_responder()
 					old_batch, data_batch_size, new_batch_u8, rx_crc,
 					current_configuration);
 				fflush(stdout);
-				// ACK the control frame via the normal control-ACK path.
+				// ACK the control frame via the normal control-ACK path. FIX 4
+				// (data-flow-zombie-amplifier.md §4): the batch value was MIRRORED
+				// above via set_data_batch_size (4-wire symmetry, data-flow-robust-
+				// tier-arq-batch.md §5.2) — that must always run. But on a DROPPED read
+				// do NOT restart the link/watchdog keep-alive: a dead link must be
+				// allowed to reach link_timeout (arq_common.cc:6043) and die, not
+				// prolong the zombie. The control-ACK still airs; only the timer restart
+				// is gated. MERCURY_ROBUST_DWELL_KEEPALIVE_DEFEAT=1 = fail-before.
 				connection_status = ACKNOWLEDGING_CONTROL;
-				link_timer.start();
-				watchdog_timer.start();
+				if(robust_dwell_keepalive_ok(link_status))
+				{
+					link_timer.start();
+					watchdog_timer.start();
+				}
+				else
+				{
+					printf("[RSP-ROBUST-DWELL] link DROPPED: batch mirrored + ACKed, "
+						"keep-alive SUPPRESSED (zombie must expire at link_timeout)\n");
+					fflush(stdout);
+				}
 			}
 		}
 		else
