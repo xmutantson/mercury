@@ -1447,6 +1447,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_za;
                 failed += ARQ_za.test_zombie_amp();
             }
+            // R5 demote-split (data-flow-zombie-amplifier.md): the pure-silence classifier truth
+            // table, the counter evolution via the shared step, the reroute predicate + guards, the
+            // DEFEAT knob, and the +LOW watchdog probe-latch hygiene. Deterministic; no RF.
+            {
+                cl_arq_controller ARQ_dsil;
+                failed += ARQ_dsil.test_demote_silence();
+            }
             // GAP-ABORT stream-backstop companion (data-flow-rsp-contiguity-ruler.md §7):
             // the REAL teardown must ALSO preserve the Option W byte cursor + stamp validity
             // (so w_stream_shift_detected can still fire post-abort) and set the sticky
@@ -2058,6 +2065,15 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-zombie-amp") == 0) {
             cl_arq_controller ARQ_za;
             int failed = ARQ_za.test_zombie_amp();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-demote-silence : run ONLY the R5 demote-split fail-before/pass-after self-test
+        // (pure-silence classifier truth table, the shared counter-step, the reroute predicate +
+        // guards, the DEFEAT knob, and the +LOW watchdog probe-latch hygiene) and exit.
+        // See fact-documents/data-flow-zombie-amplifier.md.
+        if (strcmp(argv[i], "--test-demote-silence") == 0) {
+            cl_arq_controller ARQ_dsil;
+            int failed = ARQ_dsil.test_demote_silence();
             return (failed == 0) ? 0 : 1;
         }
         // --test-acq-bounds : run ONLY the OFDM acquisition bounds-gate recovery

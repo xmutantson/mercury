@@ -3123,6 +3123,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 		if(messages_control.status==ACKED)
 		{
 			emergency_nack_count = 0;  // Channel working — reset BREAK counter
+			consec_pure_silent_rounds = 0;   // R5: a credited control-ACK is a live peer -- reset the silent streak
+			watchdog_probe_clear_on_liveness();   // +LOW: clear any stale WD_PROBE latch on a genuine liveness credit
 			process_control_commander();
 		}
 		else
@@ -4963,6 +4965,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				SACK_TRACE("dar=YES via SACK_RSP path rx_count=%d batch=%d retx=%d",
 					rx_count, data_batch_size, retransmit_count);
 				data_ack_received = YES;
+				consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 				// CLEAN-BATCH VIABILITY (§9): a PARTIAL SACK keeps the link alive and
 				// drives retransmit of the missing frames (above), but the batch was
 				// NOT fully delivered — it must NOT promote the rung. Leave the
@@ -5116,6 +5119,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				SACK_TRACE("dar=YES via MFSK ACK_PAT path pre_detected=%d",
 					v2_ack_pat_pre_detected ? 1 : 0);
 				data_ack_received=YES;
+				consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 				// CLEAN-BATCH VIABILITY (§9): this is the CLEAN (all-ones) ACK funnel
 				// — the MFSK all-ones suffix (v2_ack_pat_pre_detected, set at the
 				// rx_bitmap==all_ones branch ~:2521) and the bare-pattern data-ACK arm
@@ -5222,6 +5226,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				if(messages_rx_buffer.type==ACK_RANGE)
 				{
 					data_ack_received=YES;
+					consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 					// CLEAN-BATCH VIABILITY (§9): LDPC full-batch range ACK — clean
 					// (no SACK cycle), so this batch may drive promotion.
 					last_batch_fully_acked = true;
@@ -5248,6 +5253,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				else if(messages_rx_buffer.type==ACK_MULTI)
 				{
 					data_ack_received=YES;
+					consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 					// CLEAN-BATCH VIABILITY (§9): LDPC full-batch multi ACK — clean
 					// (no SACK cycle), so this batch may drive promotion.
 					last_batch_fully_acked = true;
@@ -5311,6 +5317,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// at :3390 is downstream of this and the :3276 sibling, so the demotion
 		// path also sees a reset clean-streak.)
 		clean_batches_at_current_config = 0;
+		// R5: count this failed round for the pure-silence classifier. This branch guarantees
+		// ack_pattern_time_ms<=0, so the classifier splits SILENT vs a sub-threshold LATE_ACK via
+		// ack_diag_peak_matched. Read-only on existing state + one counter; byte-identical on its own.
+		ackfail_classifier_step(ack_pattern_time_ms, ack_diag_peak_metric, ack_diag_peak_matched, /*sack_this_round=*/false);
 
 		// Frame gearshift just applied but data failed — BREAK immediately, no retry
 		if(frame_gearshift_just_applied)
@@ -5485,6 +5495,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// of the BREAK trigger (:3390) — so when a BREAK fires, the clean-streak
 			// is already 0 and the next clean re-accumulates from 1.
 			clean_batches_at_current_config = 0;
+			// R5: count this failed round for the pure-silence classifier (after-probe / late path). Any
+			// reverse activity (late pattern, sub-threshold correlator, partial SACK) resets the streak
+			// here, so the forward-loss and window-problem demote paths stay byte-identical.
+			ackfail_classifier_step(ack_pattern_time_ms, ack_diag_peak_metric, ack_diag_peak_matched, /*sack_this_round=*/false);
 
 			// Phase 3a — record this batch as failed (no ACK received before
 			// receiving_timeout). Whether or not BREAK fires below, the batch
@@ -5919,6 +5933,25 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				}
 			}
 
+			// R5 -- pure-silence reroute. If EVERY counted round to this point had ZERO reverse correlator
+			// activity (peer unreachable at every attempted config), grinding the demote ladder to ROBUST is
+			// useless. Probe-then-clean-reconnect instead. Evidence-bearing paths (partial SACK -> data_ack_
+			// received=YES upstream; sub-threshold/late correlator -> counter already reset) never satisfy this,
+			// so they stay byte-identical. Guards match the BREAK gate own guards (emergency_break_active /
+			// turboshift_phase). See the cross-layer data-flow audit (data-flow-zombie-amplifier.md).
+			if(demote_silence_reroute_enabled()
+			   && silence_reroute_should_fire(consec_pure_silent_rounds, DEMOTE_SILENCE_MAX_ROUNDS,
+			                                  emergency_break_active, turboshift_phase))
+			{
+				printf("[DEMOTE-SILENCE] %d consecutive pure-silent rounds at config %d -- peer unreachable "
+				       "at every attempted config; clean reconnect instead of grinding the demote ladder\n",
+				       consec_pure_silent_rounds, current_configuration);
+				fflush(stdout);
+				consec_pure_silent_rounds = 0;
+				commander_clean_reconnect("demote_silence_peer_unreachable");
+				return;
+			}
+			
 			// Trigger BREAK when threshold reached and not already at bottom
 			if(emergency_nack_count >= emergency_nack_threshold
 			   && !config_is_at_bottom(current_configuration, robust_enabled)
@@ -10047,6 +10080,7 @@ int cl_arq_controller::test_phantom_ack_gate()
 		// block would have raised the anchor + reset the panic counter. Mirror
 		// that corruption so the assertions below FAIL on pre-fix code.
 		data_ack_received = YES;
+		consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 		if(config_ladder_index(current_configuration) >
 		   config_ladder_index(last_data_viable_config))
 			last_data_viable_config = current_configuration;
@@ -10138,6 +10172,7 @@ int cl_arq_controller::test_clean_batch_viability()
 		last_batch_fully_acked = fully_acked;
 		// data_ack_received==YES on BOTH clean and partial (liveness) — unchanged.
 		data_ack_received = YES;
+		consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 		// emergency_nack_count resets UNGATED on any delivery (§9.7) — not asserted
 		// here (it's not a promotion consumer); set it so we can confirm it's left
 		// alone implicitly.
@@ -12135,6 +12170,7 @@ int cl_arq_controller::test_climb_engine()
 		// --- REAL anchor-advance gate (arq_commander.cc:3427-3439) ---
 		last_batch_fully_acked = clean;
 		data_ack_received = YES;
+		consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 		if(promotion_allowed_on_batch(last_batch_fully_acked))
 		{
 			break_drop_step = 2;

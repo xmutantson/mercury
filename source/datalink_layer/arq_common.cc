@@ -6244,38 +6244,7 @@ void cl_arq_controller::update_status()
 				"+ reconnecting at init config (no in-place teleport)\n");
 			fflush(stdout);
 
-			char wd_restore_buf[N_MAX/8 * 20];
-			int wd_total_restore = 0;
-			int wd_data_read_size;
-			for(int i=0;i<get_nTotal_messages();i++)
-			{
-				wd_data_read_size=fifo_buffer_backup.pop(wd_restore_buf + wd_total_restore,max_data_length+max_header_length);
-				if(wd_data_read_size!=0) wd_total_restore += wd_data_read_size; else break;
-			}
-			reset_session_state();   // safe: a real session boundary; crypto re-handshakes on reconnect
-			if(wd_total_restore > 0)
-				fifo_buffer_tx.push_front(wd_restore_buf, wd_total_restore);   // reset_session_state does not flush tx
-			fifo_buffer_backup.flush();
-
-			commander_configured_nb = narrowband_enabled;
-			load_configuration(init_configuration, FULL, YES);
-			link_status=CONNECTING;
-			connection_status=TRANSMITTING_CONTROL;
-			turboshift_active = true;
-			turboshift_phase = TURBO_DONE;
-			turboshift_last_good = -1;
-			turbo_settle_pending = false;
-			turbo_supershift_announce_pending = false;
-			supershift_proven_ceiling = -1;
-			turbo_snr_ack_enabled = false;
-			turbo_received_snr = -99.0f;
-			messages_control.status = FREE;
-			connection_attempts = 0;
-			connection_attempt_timer.reset();
-			connection_attempt_timer.start();
-			watchdog_timer.stop(); watchdog_timer.reset();
-			gear_shift_timer.stop(); gear_shift_timer.reset();
-			receiving_timer.stop(); receiving_timer.reset();
+			commander_clean_reconnect("watchdog_peer_unresponsive");
 		}
 		else  // WD_TELEPORT — the pre-fix unconditional resurrection (defeat knob, or RESPONDER)
 		{
@@ -7322,6 +7291,106 @@ int cl_arq_controller::watchdog_resurrect_decision(bool probe_pending, bool rx_a
 	return WD_RECONNECT;
 }
 
+// R5 -- pure classifier of an ACK-window expiry (called only on data_ack_received==NO).
+// Deterministic, no getenv (mirrors watchdog_resurrect_decision testability). SILENT = zero
+// reverse activity; any correlator hit / late pattern / partial SACK is evidence the peer is alive.
+int cl_arq_controller::classify_ack_failure(int ack_pattern_ms, double peak_metric,
+                                            int peak_matched, bool sack_this_round) const
+{
+	if(sack_this_round)                   return ACKFAIL_FORWARD_LOSS; // evidence-bearing (unreachable at trigger)
+	if(ack_pattern_ms > 0)                return ACKFAIL_LATE_ACK;     // a pattern WAS heard = window problem
+	if(peak_matched > 0
+	   || peak_metric >= ACK_SILENCE_EPS) return ACKFAIL_LATE_ACK;     // sub-threshold correlator hit = peer alive
+	return ACKFAIL_SILENT;                                             // zero reverse activity
+}
+
+// One shared counter-step: production AND the fail-before test drive the SAME code. Updates
+// consec_pure_silent_rounds for one failed ACK round and returns the class. ANY reverse activity
+// resets the streak, so the forward-loss / window-problem demote paths stay byte-identical.
+int cl_arq_controller::ackfail_classifier_step(int ack_pattern_ms, double peak_metric,
+                                               int peak_matched, bool sack_this_round)
+{
+	int cls = classify_ack_failure(ack_pattern_ms, peak_metric, peak_matched, sack_this_round);
+	if(cls == ACKFAIL_SILENT) consec_pure_silent_rounds++;
+	else                      consec_pure_silent_rounds = 0;
+	return cls;
+}
+
+// Should the pure-silent reroute fire at the generic BREAK gate? Pure predicate; the DEFEAT knob
+// lives in demote_silence_reroute_enabled(). Guards mirror the BREAK gate own guards so R5 never
+// fires in a state the BREAK gate itself would decline.
+bool cl_arq_controller::silence_reroute_should_fire(int consec_pure_silent, int max_rounds,
+                                                    bool emergency_break_active_flag, int turbo_phase)
+{
+	return consec_pure_silent >= max_rounds
+	    && !emergency_break_active_flag
+	    && turbo_phase == TURBO_DONE;
+}
+
+// Default-ON (proven-fix policy). MERCURY_DEMOTE_SILENCE_DEFEAT=1 => fail-before: the demote
+// ladder walks on pure silence exactly as before.
+bool cl_arq_controller::demote_silence_reroute_enabled() const
+{
+	const char* e = std::getenv("MERCURY_DEMOTE_SILENCE_DEFEAT");
+	if(e && *e && atoi(e) != 0) return false;   // fail-before: legacy ladder-walk on silence
+	return true;
+}
+
+// +LOW watchdog hygiene: a genuine reverse ACK confirms peer liveness, so clear any stale WD_PROBE
+// latch and re-snap the rx index. Without this a WD_PROBE that latched true, then saw normal traffic
+// resume, would leave the latch set with a STALE snapshot -- so a LATER independent watchdog fire
+// would read rx-advanced and RESUME, skipping the WD_PROBE it should have done.
+void cl_arq_controller::watchdog_probe_clear_on_liveness()
+{
+	watchdog_resurrect_probe_pending = false;
+	watchdog_probe_rx_index_snap     = rx_receive_frame_index;
+}
+
+// Clean COMMANDER reconnect at the init config, factored VERBATIM from the watchdog WD_RECONNECT
+// body so the watchdog dead-peer path and the R5 pure-silence reroute share ONE proven implementation
+// (crypto/bsi re-baseline via a real session boundary; pending TX preserved through the backup
+// re-stage; reset_session_state does not flush fifo_buffer_tx). Cross-layer data-flow audit: the
+// producers/consumers of fifo_buffer_tx / fifo_buffer_backup / the turbo state are unchanged -- this
+// only relocates the shipped mechanics behind one entry point.
+void cl_arq_controller::commander_clean_reconnect(const char* reason)
+{
+	printf("[CLEAN-RECONNECT] %s -- dropping link + reconnecting at init config (no in-place teleport)\n", reason);
+	fflush(stdout);
+
+	char wd_restore_buf[N_MAX/8 * 20];
+	int wd_total_restore = 0;
+	int wd_data_read_size;
+	for(int i=0;i<get_nTotal_messages();i++)
+	{
+		wd_data_read_size=fifo_buffer_backup.pop(wd_restore_buf + wd_total_restore,max_data_length+max_header_length);
+		if(wd_data_read_size!=0) wd_total_restore += wd_data_read_size; else break;
+	}
+	reset_session_state();   // safe: a real session boundary; crypto re-handshakes on reconnect
+	if(wd_total_restore > 0)
+		fifo_buffer_tx.push_front(wd_restore_buf, wd_total_restore);   // reset_session_state does not flush tx
+	fifo_buffer_backup.flush();
+
+	commander_configured_nb = narrowband_enabled;
+	load_configuration(init_configuration, FULL, YES);
+	link_status=CONNECTING;
+	connection_status=TRANSMITTING_CONTROL;
+	turboshift_active = true;
+	turboshift_phase = TURBO_DONE;
+	turboshift_last_good = -1;
+	turbo_settle_pending = false;
+	turbo_supershift_announce_pending = false;
+	supershift_proven_ceiling = -1;
+	turbo_snr_ack_enabled = false;
+	turbo_received_snr = -99.0f;
+	messages_control.status = FREE;
+	connection_attempts = 0;
+	connection_attempt_timer.reset();
+	connection_attempt_timer.start();
+	watchdog_timer.stop(); watchdog_timer.reset();
+	gear_shift_timer.stop(); gear_shift_timer.reset();
+	receiving_timer.stop(); receiving_timer.reset();
+}
+
 // Consolidated fail-before/pass-after self-test for the three implemented fixes.
 // Asserts each pure predicate's truth table with the defeat knob unset (pass-after)
 // and set (fail-before). No IONOS/RF; deterministic. Returns #failures.
@@ -7379,11 +7448,84 @@ int cl_arq_controller::test_zombie_amp()
 	return fails;
 }
 
+// R5 fail-before/pass-after self-test: the pure classifier truth table, the counter evolution via
+// the SAME production step helper, the reroute predicate + its guards, the DEFEAT knob, and the
+// +LOW watchdog probe-latch hygiene. No IONOS/RF; deterministic. Returns #failures.
+int cl_arq_controller::test_demote_silence()
+{
+	int fails = 0;
+	auto CHECK = [&](bool c, const char* w){ if(!c){ printf("[TEST-DEMOTE-SILENCE] FAIL: %s\n", w); fflush(stdout); fails++; } };
+	unsetenv_portable("MERCURY_DEMOTE_SILENCE_DEFEAT");
+	printf("[TEST-DEMOTE-SILENCE] start\n"); fflush(stdout);
+
+	// (a) classifier truth table
+	CHECK(classify_ack_failure(0, 0.0, 0, false) == ACKFAIL_SILENT,
+	      "pure silence (pat<=0, matched=0, metric~0) => SILENT");
+	CHECK(classify_ack_failure(0, 0.62, 5, false) == ACKFAIL_LATE_ACK,
+	      "sub-threshold correlator hit (matched=5) => LATE_ACK (peer alive)");
+	CHECK(classify_ack_failure(389, 0.0, 0, false) == ACKFAIL_LATE_ACK,
+	      "ack pattern was heard (pat>0) => LATE_ACK (window problem)");
+	CHECK(classify_ack_failure(0, 0.0, 0, true) == ACKFAIL_FORWARD_LOSS,
+	      "partial SACK => FORWARD_LOSS (evidence-bearing demote)");
+	CHECK(classify_ack_failure(0, 0.10, 0, false) == ACKFAIL_LATE_ACK,
+	      "metric exactly at ACK_SILENCE_EPS => LATE_ACK (not silence)");
+
+	// (b) counter evolution via the SAME production step helper (parser-nonzero: print the count)
+	consec_pure_silent_rounds = 0;
+	int stepped = 0;
+	for(int i=0;i<DEMOTE_SILENCE_MAX_ROUNDS;i++) { ackfail_classifier_step(0, 0.0, 0, false); stepped++; }
+	printf("[TEST-DEMOTE-SILENCE] drove %d silent step rows, consec=%d\n", stepped, consec_pure_silent_rounds);
+	CHECK(stepped == DEMOTE_SILENCE_MAX_ROUNDS, "drove M step rows (parser-nonzero)");
+	CHECK(consec_pure_silent_rounds == DEMOTE_SILENCE_MAX_ROUNDS, "M silent rounds accumulate");
+	CHECK(silence_reroute_should_fire(consec_pure_silent_rounds, DEMOTE_SILENCE_MAX_ROUNDS,
+	      /*emergency_break_active=*/false, TURBO_DONE), "reroute fires at M silent (pass-after)");
+
+	// one sub-threshold (LATE_ACK) round RESETS -> reroute must NOT fire (byte-identical BREAK)
+	ackfail_classifier_step(0, 0.62, 5, false);
+	CHECK(consec_pure_silent_rounds == 0, "one LATE_ACK round resets the silent streak");
+	CHECK(!silence_reroute_should_fire(consec_pure_silent_rounds, DEMOTE_SILENCE_MAX_ROUNDS,
+	      false, TURBO_DONE), "reroute suppressed after reverse activity (forward-loss path stays legacy)");
+
+	// a partial-SACK (FORWARD_LOSS) round mid-sequence also resets
+	ackfail_classifier_step(0, 0.0, 0, false);
+	ackfail_classifier_step(0, 0.0, 0, true);
+	CHECK(consec_pure_silent_rounds == 0, "FORWARD_LOSS round resets (demote path byte-identical)");
+
+	// guards: emergency_break_active or non-TURBO_DONE suppress even at M
+	consec_pure_silent_rounds = DEMOTE_SILENCE_MAX_ROUNDS;
+	CHECK(!silence_reroute_should_fire(consec_pure_silent_rounds, DEMOTE_SILENCE_MAX_ROUNDS,
+	      /*emergency_break_active=*/true, TURBO_DONE), "no reroute while a BREAK is already active");
+	CHECK(!silence_reroute_should_fire(consec_pure_silent_rounds, DEMOTE_SILENCE_MAX_ROUNDS,
+	      false, TURBO_DONE + 1), "no reroute unless turboshift is DONE");
+
+	// (c) DEFEAT knob = fail-before (ladder walks on silence)
+	setenv_portable("MERCURY_DEMOTE_SILENCE_DEFEAT", "1");
+	CHECK(!demote_silence_reroute_enabled(), "fail-before: DEFEAT disables the reroute (legacy ladder-walk)");
+	unsetenv_portable("MERCURY_DEMOTE_SILENCE_DEFEAT");
+	CHECK(demote_silence_reroute_enabled(), "pass-after: reroute enabled by default");
+
+	// (d) +LOW watchdog probe-latch hygiene: a liveness credit clears a stale WD_PROBE latch and
+	// re-snaps the rx index (so a later independent watchdog fire starts fresh at WD_PROBE).
+	watchdog_resurrect_probe_pending = true;
+	watchdog_probe_rx_index_snap     = 999999;
+	rx_receive_frame_index           = 42;
+	watchdog_probe_clear_on_liveness();
+	CHECK(watchdog_resurrect_probe_pending == false, "liveness credit clears the probe latch");
+	CHECK(watchdog_probe_rx_index_snap == rx_receive_frame_index, "liveness credit re-snaps the rx index");
+
+	printf("[TEST-DEMOTE-SILENCE] %s (%d failures)\n", fails==0?"PASS":"FAIL", fails);
+	fflush(stdout);
+	return fails;
+}
+
 void cl_arq_controller::reset_session_state()
 {
 	// FIX-6: drop any RX-delivery tail buffered behind a back-pressured app socket.
 	// A fresh session must not re-emit bytes from the previous connection's stream.
 	rx_deliver_pending_len = 0;
+	// +LOW watchdog hygiene: a fresh session boundary clears any stale WD_PROBE latch + re-snaps
+	// the rx index (so a later independent watchdog fire starts fresh at WD_PROBE).
+	watchdog_probe_clear_on_liveness();
 
 	// R2a/R2c: a fresh session (and the teardown, which routes through here) starts
 	// with no recoverable-hold in progress and an empty CMD retention shadow. The

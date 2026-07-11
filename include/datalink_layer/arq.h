@@ -2709,6 +2709,20 @@ public:
   // FIX 3 (§3): the CMD watchdog resurrection branch selector.
   enum { WD_TELEPORT = 0, WD_PROBE = 1, WD_RESUME = 2, WD_RECONNECT = 3 };
   int  watchdog_resurrect_decision(bool probe_pending, bool rx_advanced) const;
+
+  // R5 -- split the demote trigger ("no ACK" is not "bad channel"). Pure classifier of an
+  // ACK-window expiry + the one shared counter-step + the reroute predicate/gate/reconnect.
+  enum { ACKFAIL_SILENT = 0, ACKFAIL_FORWARD_LOSS = 1, ACKFAIL_LATE_ACK = 2 };
+  int  classify_ack_failure(int ack_pattern_ms, double peak_metric,
+                            int peak_matched, bool sack_this_round) const;
+  int  ackfail_classifier_step(int ack_pattern_ms, double peak_metric,
+                               int peak_matched, bool sack_this_round);
+  static bool silence_reroute_should_fire(int consec_pure_silent, int max_rounds,
+                                          bool emergency_break_active_flag, int turbo_phase);
+  bool demote_silence_reroute_enabled() const;
+  void commander_clean_reconnect(const char* reason);
+  void watchdog_probe_clear_on_liveness();
+  int  test_demote_silence();
   // The consolidated fail-before/pass-after self-test for the three implemented
   // fixes (asserts each helper's truth table under defeat / no-defeat). CLI
   // --test-zombie-amp; also run inside --test. Returns 0=PASS, else #failures.
@@ -5207,6 +5221,14 @@ public:
   // "pure silence" (confirmed dead -> clean reconnect, never an in-place teleport).
   bool watchdog_resurrect_probe_pending{false};
   long long watchdog_probe_rx_index_snap{0};
+  // R5 -- consecutive pure-silent ACK rounds (zero reverse correlator activity). Only the
+  // all-silent-to-threshold case (peer unreachable at every attempted config) is rerouted to a
+  // clean reconnect; any reverse activity (partial SACK / sub-threshold correlator / late pattern)
+  // resets it, so the forward-loss and window-problem demote paths stay byte-identical. Reset on
+  // every credited ACK and inside ackfail_classifier_step.
+  int  consec_pure_silent_rounds{0};
+  static const int DEMOTE_SILENCE_MAX_ROUNDS = 3;   // == emergency_nack_threshold default
+  static constexpr double ACK_SILENCE_EPS   = 0.10; // metric below this AND matched==0 => silence
 
   // ---- BREAK forward-health gate (fix/break-fh-gate) ---------------------
   // ROOT CAUSE (workflow w2ee37gd6): the responder BREAK probe
