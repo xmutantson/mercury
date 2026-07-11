@@ -2419,6 +2419,9 @@ int main(int argc, char *argv[])
     bool test_v2_pendingack_flip_alias_cli = false; // --test-v2-pendingack-flip-alias: R030 — v2 PENDING_ACK
                                         // flip aliasing. Diverged index/wire space; drives the REAL v2_flip_resolve_slot();
                                         // asserts retx skipped + new-data -> correct slot + no FREE/foreign PENDING_ACK. One-shot, exits rc.
+    bool test_retx_slot_order_cli = false; // --test-retx-slot-order: timing redesign — retx never rides wire slot 0.
+                                        // Drives the REAL v2_rotate_retx_behind_lead()+v2_flip_resolve_slot(); asserts slot0=new-data,
+                                        // EOB wire-final, retx bytes verbatim, flip -1 for retx only, ND==1 byte-identical. One-shot, exits rc.
     bool test_bigblock_livepath_cli = false; // --test-bigblock-livepath: GAP-2 — real CONNECT + real SET_CONFIG
                                         // handshake robust->CFG16 (NO pin), then a 1374B K=8 transfer through the
                                         // REAL send_batch->bigblock_send_one_block emit + receive_byte cw0-CRC gate
@@ -3471,6 +3474,15 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-arq-recovery-cluster.md §4.2 / §5.5.
             test_v2_pendingack_flip_alias_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-retx-slot-order") == 0)
+        {
+            // Timing redesign — retx never rides wire slot 0 regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_commander.cc test_retx_slot_order.
+            test_retx_slot_order_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5362,6 +5374,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_v2_pendingack_flip_alias();
             printf("[FLAG] V2-pendingack-flip-alias test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_retx_slot_order_cli) {
+            // Timing redesign — retx never rides wire slot 0 (one-shot, then exit rc).
+            printf("[FLAG] --test-retx-slot-order: invoking retx-slot-order "
+                   "(retx never rides wire slot 0) regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_retx_slot_order();
+            printf("[FLAG] Retx-slot-order test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

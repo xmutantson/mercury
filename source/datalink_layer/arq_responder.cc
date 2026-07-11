@@ -13362,7 +13362,11 @@ int cl_arq_controller::test_v2_pendingack_flip_alias()
 	}
 
 	// --- Build messages_batch_tx[]: [0..R) retx prefix, [R..R+3) new-data ---
-	this->v2_retx_prefix_count = R;
+	// Timing redesign — this test keeps the LEGACY leading-prefix layout
+	// (block_start=0); the rotated layout ([1..R]) is exercised by
+	// --test-retx-slot-order, which drives v2_flip_resolve_slot() on it directly.
+	this->v2_retx_block_start = 0;
+	this->v2_retx_block_count = R;
 	this->message_batch_counter_tx = R + 3;
 	// retx prefix: wire ids = ORIGINAL wire slots {5,6} (FREE in messages_tx) +
 	// OLD_BSI. These have NO live messages_tx slot — the flip must SKIP them.

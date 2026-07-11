@@ -2170,12 +2170,15 @@ void cl_arq_controller::process_messages_tx_data()
 	//      Step 8a's match-prev path; new-data routes to messages_rx[]
 	//      via match-current. Different physical buffers — no cross-batch
 	//      slot collisions (§7.8.3's hazard structurally eliminated).
-	// R030 (race audit 2026-06-06): v2_retx_prefix_count is now a MEMBER (was a
-	// local) so the post-TX PENDING_ACK flip in send_batch() can see how many
-	// leading messages_batch_tx[] entries are the retx prefix. Reset to 0 here at
-	// the start of every batch build; set to R below only on a v2 mixed batch.
+	// R030 (race audit 2026-06-06): the retx-block descriptor is a MEMBER (was a
+	// local) so the post-TX PENDING_ACK flip in send_batch() can see which
+	// messages_batch_tx[] entries are the retx block. Reset here at the start of
+	// every batch build; set below only on a v2 mixed batch.
 	// (v2_mixed_batch stays local — only this function needs it.)
-	v2_retx_prefix_count = 0;
+	// Timing redesign — the block is described by (start,count) rather than a bare
+	// leading count, because v2_rotate_retx_behind_lead() may move it to start=1.
+	v2_retx_block_start = 0;
+	v2_retx_block_count = 0;
 	bool v2_mixed_batch = false;
 
 	// §7.13.39 Fix 2 — single source of truth for batch_tx slot identity.
@@ -2342,7 +2345,11 @@ void cl_arq_controller::process_messages_tx_data()
 			stats.nReSent_data++;
 			last_transmission_block_stats.nReSent_data++;
 		}
-		v2_retx_prefix_count = R;
+		// Retx block occupies the LEADING R slots at fill time. If the batch also
+		// carries >=2 new-data frames, v2_rotate_retx_behind_lead() (after the
+		// new-data fill) shifts start to 1 so wire slot 0 is a new-data frame.
+		v2_retx_block_start = 0;
+		v2_retx_block_count = R;
 
 		// §7.13.39 Fix 1 — shift survivors down. memmove on each parallel
 		// array. Leftover = retransmit_count - R; these stay at [0..leftover-1]
@@ -2396,12 +2403,17 @@ void cl_arq_controller::process_messages_tx_data()
 				// through the single helper so the formula matches the retx
 				// prefix loop above. The collision validation pass below
 				// send_batch() catches any drift. For v2 non-mixed batches
-				// (retransmit_count was 0), v2_retx_prefix_count == 0, so the
+				// (retransmit_count was 0), v2_retx_block_count == 0, so the
 				// helper assigns the same value the struct-copy already
 				// provided (id = messages_tx slot index = message_batch_counter_tx).
 				if(v2_mixed_batch)
 				{
-					int pos_in_new_batch = message_batch_counter_tx - v2_retx_prefix_count;
+					// pos_in_new_batch is 0..ND-1 in ARRIVAL order; the retx block
+					// is contiguous at [0..R-1] here (pre-rotation), so subtracting
+					// the count yields the correct new-data ordinal. The subsequent
+					// rotation permutes physical slots only — these sequence bytes
+					// (which travel with the struct) stay position-independent.
+					int pos_in_new_batch = message_batch_counter_tx - v2_retx_block_count;
 					set_batch_tx_slot(message_batch_counter_tx,
 						/*is_retx=*/false,
 						/*original_seq_eob=*/0,  // unused for new-data
@@ -2470,6 +2482,20 @@ void cl_arq_controller::process_messages_tx_data()
 	}
 	if(message_batch_counter_tx<=data_batch_size && message_batch_counter_tx!=0)
 	{
+		// Timing redesign — retx never rides wire slot 0. The fill loops leave the
+		// retx block at the LEADING slots [0..R-1]; slot 0 is the only slot exposed
+		// to the peer's post-turnaround mute/flush window (a width-sweep observed
+		// slot-0 loss with slots 1+ clean). Rotate the sub-array [0..R] right by one
+		// so wire slot 0 becomes the first new-data frame and the retx block moves
+		// to [1..R]. The EOB-marked final new-data frame is at
+		// message_batch_counter_tx-1 (>= R+1 when ND>=2) which the rotation never
+		// touches, so it stays wire-final (the RSP treats an EOB decode as proof the
+		// batch ended and shortens its receive window — a retx tail after it would
+		// collide with the RSP keying its SACK). No-op (legacy layout) for non-mixed
+		// v2, v1, robust batch=1, pure-retx (ND==0), and ND==1 (its single new-data
+		// frame IS the EOB frame and must stay wire-final). Runs BEFORE the EOB
+		// assignment below so v2_slot_is_retx() reflects the rotated layout.
+		v2_rotate_retx_behind_lead();
 		telecom_system->set_mfsk_ctrl_mode(false);  // data TX (full-length frames)
 		// SACK Design A Step 8b — for v2 mixed batches, set EOB bit on the
 		// last new-data frame manually (since we use sack_retransmit_active=true
@@ -2481,7 +2507,12 @@ void cl_arq_controller::process_messages_tx_data()
 		if(v2_mixed_batch)
 		{
 			int last_idx = message_batch_counter_tx - 1;
-			if(last_idx >= v2_retx_prefix_count
+			// Migrated to the position-independent predicate: after the rotation
+			// the retx block is at [1..R], so a bare "last_idx >= R" would be wrong.
+			// The final slot is always the last new-data frame (the rotation permutes
+			// only slots [0..R]), so !v2_slot_is_retx(last_idx) holds and the EOB bit
+			// lands on it — wire-final in every batch shape.
+			if(!v2_slot_is_retx(last_idx)
 			   && (messages_batch_tx[last_idx].type == DATA_LONG
 			       || messages_batch_tx[last_idx].type == DATA_SHORT))
 			{
@@ -2558,11 +2589,13 @@ void cl_arq_controller::process_messages_tx_data()
 		// entered when retransmit_count == 0).
 		if(v2_mixed_batch)
 		{
-			int new_data_count = message_batch_counter_tx - v2_retx_prefix_count;
-			int retx_bsi = (v2_retx_prefix_count > 0) ? messages_batch_tx[0].batch_seq_id : -1;
+			int new_data_count = message_batch_counter_tx - v2_retx_block_count;
+			// After a rotate the retx block starts at v2_retx_block_start (1), not 0,
+			// so read the block head, not the fixed slot 0 (which is now new-data).
+			int retx_bsi = (v2_retx_block_count > 0) ? messages_batch_tx[v2_retx_block_start].batch_seq_id : -1;
 			printf("[CMD-V2-MIXBATCH] TX batch: %d retx bsi=%d + %d new bsi=%d = %d total "
 				"(data_batch_size=%d)\n",
-				v2_retx_prefix_count, retx_bsi,
+				v2_retx_block_count, retx_bsi,
 				new_data_count, cmd_batch_seq_id & 0xFF,
 				message_batch_counter_tx, data_batch_size);
 			fflush(stdout);
@@ -2611,9 +2644,9 @@ void cl_arq_controller::process_messages_tx_data()
 				sack_retransmit_active = false;
 				// Roll back stats counters bumped during slot population so
 				// the bug doesn't masquerade as successful sends.
-				stats.nReSent_data -= v2_retx_prefix_count;
-				last_transmission_block_stats.nReSent_data -= v2_retx_prefix_count;
-				int new_data_in_batch = message_batch_counter_tx - v2_retx_prefix_count;
+				stats.nReSent_data -= v2_retx_block_count;
+				last_transmission_block_stats.nReSent_data -= v2_retx_block_count;
+				int new_data_in_batch = message_batch_counter_tx - v2_retx_block_count;
 				stats.nSent_data -= new_data_in_batch;
 				last_transmission_block_stats.nSent_data -= new_data_in_batch;
 				// Note: messages_tx[i].status entries flipped to
@@ -2710,6 +2743,54 @@ void cl_arq_controller::process_messages_tx_data()
 		fflush(stdout);
 		receiving_timer.start();
 	}
+}
+
+// Timing redesign — retx never rides wire slot 0 (cross-layer data-flow audit,
+// retx-queue cluster). At call time the v2 mixed-batch fill has left the retx
+// block contiguous at the LEADING slots [0 .. R-1] (R = v2_retx_block_count) and
+// the ND new-data frames at [R .. R+ND-1], with the EOB bit on the final
+// new-data slot (message_batch_counter_tx-1). Rotate the sub-array [0 .. R]
+// right by one so the wire order becomes:
+//     [new0] [retx0 .. retxR-1] [new1 .. newND-1 (EOB)]
+// Only wire slot 0's leading preamble is inside the peer's ~200-400 ms
+// post-turnaround mute/flush window (a width-sweep observed slot-0 loss 9/9 with
+// slots 1+ clean; frames are >= hundreds of ms), so parking one new-data frame
+// there — and the retx block one slot behind it — keeps every retransmit out of
+// the exposed slot while the EOB-marked frame stays wire-final (the RSP shortens
+// its receive window on an EOB decode; a retx tail after it would collide with
+// the RSP keying its SACK). The struct copy moves each frame's .data pointer with
+// it, so retx payloads (in retx_scratch[]) and the new-data payloads follow their
+// slots; the pre-assigned sequence bytes are position-independent, so no wire
+// byte other than frame ORDER changes.
+//
+// No-op (legacy start=0 layout, byte-identical wire) unless this is a v2 mixed
+// batch (v2_retx_block_count > 0) with at least two new-data frames (ND >= 2).
+// ND==1 keeps the legacy prefix because its single new-data frame IS the EOB
+// frame and must stay wire-final; ND==0 (pure retx) has no leading new-data
+// frame to promote. Returns true iff the rotation was applied.
+bool cl_arq_controller::v2_rotate_retx_behind_lead()
+{
+	int R = v2_retx_block_count;
+	if(R <= 0)
+		return false;                        // not a v2 mixed batch
+	int ND = message_batch_counter_tx - R;
+	if(ND < 2)
+		return false;                        // ND in {0,1}: keep legacy layout
+	// Fail-before / pass-after toggle (off by default; production never sets it).
+	// With the rotation defeated the layout stays legacy (retx at wire slot 0),
+	// which is what --test-retx-slot-order asserts against for its fail-before arm.
+	static const bool rotate_defeat =
+		(std::getenv("MERCURY_RETX_SLOT0_ROTATE_DEFEAT") != nullptr);
+	if(rotate_defeat)
+		return false;
+	// Rotate [0..R] right by one: save new0 (slot R), shift the R retx frames up
+	// by one into [1..R], drop new0 into slot 0.
+	st_message tmp = messages_batch_tx[R];
+	memmove(&messages_batch_tx[1], &messages_batch_tx[0],
+		(size_t)R * sizeof(messages_batch_tx[0]));
+	messages_batch_tx[0] = tmp;
+	v2_retx_block_start = 1;
+	return true;
 }
 
 void cl_arq_controller::process_messages_rx_acks_control()
@@ -20806,4 +20887,227 @@ void cl_arq_controller::process_buffer_data_commander()
 			}
 		}
 	}
+}
+
+
+// ============================================================================
+// Timing redesign — retx never rides wire slot 0 (--test-retx-slot-order)
+// ============================================================================
+//
+// Cross-layer data-flow audit (retx-queue cluster). Reconstructs the v2 mixed-
+// batch messages_batch_tx[] layout exactly as the fill loops leave it —
+//   retx block [0..R-1]: original batch_seq_id + original sequence byte verbatim
+//                        (low7 = original slot, bit7 = the original EOB marker);
+//   new-data  [R..R+ND-1]: sequence_number = pos_in_new_batch, EOB bit7 on the
+//                          final new-data slot; owning messages_tx[] slots at
+//                          DIVERGED array indices (holes) so the (bsi,low7-seq)
+//                          resolution is exercised, not the wire .id —
+// then drives the REAL v2_rotate_retx_behind_lead() and v2_flip_resolve_slot().
+//
+// A1 (fail-before): after the rotate, wire slot 0 carries a CURRENT-bsi new-data
+//   frame. With MERCURY_RETX_SLOT0_ROTATE_DEFEAT set the rotate no-ops -> slot 0
+//   is the retx bsi -> A1 FAILS (rc=1). Default (rotate active) -> A1 PASSES.
+// A2: among the current-bsi (new-data) slots, the EOB bit is set on the FINAL
+//   slot only. (A retx frame legitimately carries bit7 in its ORIGINAL byte; A2
+//   is scoped to new-data so the two EOB semantics are proven not to collide.)
+// A3: the retx block (post-rotate at [1..R]) carries the original bsi + original
+//   sequence bytes VERBATIM, including the bit7 one.
+// A4: v2_flip_resolve_slot() == -1 for EXACTLY the retx-block slots, and a UNIQUE
+//   valid owning messages_tx[] index for each new-data slot (the diverged index,
+//   not the wire id).
+// A5: re-seeded with ND==1, v2_rotate_retx_behind_lead() no-ops (its single
+//   new-data frame IS the EOB frame) -> layout byte-identical to the legacy
+//   leading prefix (block_start==0, slot 0 = retx).
+//
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_retx_slot_order()
+{
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-RETX-SLOT] ERROR: init_messages_buffers() failed (rc=%d)\n", alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+	this->sack_v2_enabled  = true;
+	this->data_batch_size  = 5;
+	const int CMD_BSI = 8;    // current new-data batch bsi
+	const int OLD_BSI = 7;    // retx block bsi (a prior batch)
+	const int R       = 2;    // retx block length
+	const int ND      = 3;    // new-data frames
+	// Retx original sequence bytes: slot 3, and slot 29 WITH its original EOB bit7.
+	const unsigned char retx_seq[R] = { 3, (unsigned char)(29 | 0x80) };
+	// Diverged owning messages_tx[] indices for the ND new-data frames (holes).
+	const int newdata_idx[ND] = { 0, 3, 7 };
+
+	bool pass = true;
+
+	// ---- helper: build the pre-rotation layout into messages_batch_tx[] -------
+	// legacy: retx block leading at [0..R-1], new-data at [R..R+nd-1].
+	auto build_layout = [&](int nd)
+	{
+		for(int i = 0; i < this->nMessages; i++)
+		{
+			messages_tx[i].status       = FREE;
+			messages_tx[i].length       = 0;
+			messages_tx[i].batch_seq_id = -1;
+		}
+		// retx block [0..R-1]
+		for(int r = 0; r < R; r++)
+		{
+			messages_batch_tx[r].type            = DATA_LONG;
+			messages_batch_tx[r].length          = 16;
+			messages_batch_tx[r].status          = ADDED_TO_BATCH_BUFFER;
+			messages_batch_tx[r].batch_seq_id    = OLD_BSI;
+			messages_batch_tx[r].sequence_number = (int)retx_seq[r];       // verbatim, incl bit7
+			messages_batch_tx[r].id              = (int)(retx_seq[r] & 0x7F);
+		}
+		// new-data [R..R+nd-1], owning messages_tx[] at diverged indices
+		for(int p = 0; p < nd; p++)
+		{
+			int idx = newdata_idx[p];
+			messages_tx[idx].type            = DATA_LONG;
+			messages_tx[idx].length          = 16;
+			messages_tx[idx].status          = ADDED_TO_BATCH_BUFFER;
+			messages_tx[idx].batch_seq_id    = CMD_BSI;
+			messages_tx[idx].sequence_number = p;      // pos_in_new_batch (low7)
+			messages_tx[idx].id              = p;
+
+			messages_batch_tx[R + p].type            = DATA_LONG;
+			messages_batch_tx[R + p].length          = 16;
+			messages_batch_tx[R + p].status          = ADDED_TO_BATCH_BUFFER;
+			messages_batch_tx[R + p].batch_seq_id    = CMD_BSI;
+			messages_batch_tx[R + p].sequence_number = p;
+			messages_batch_tx[R + p].id              = p;
+		}
+		// EOB bit on the final new-data slot (as the builder sets it at fill).
+		messages_batch_tx[R + nd - 1].sequence_number |= 0x80;
+		this->message_batch_counter_tx = R + nd;
+		this->v2_retx_block_start = 0;
+		this->v2_retx_block_count = R;
+	};
+
+	// ======================= ND>=2 arm (the rotation) =========================
+	build_layout(ND);
+	bool rotated = v2_rotate_retx_behind_lead();
+	int slot0_bsi_nd2 = messages_batch_tx[0].batch_seq_id;  // capture before the ND==1 re-seed
+
+	// A1 — wire slot 0 carries a CURRENT-bsi new-data frame.
+	if(messages_batch_tx[0].batch_seq_id != CMD_BSI)
+	{
+		printf("[TEST-RETX-SLOT] FAIL A1: wire slot 0 bsi=%d (expected current bsi=%d) "
+		       "- a retransmit is riding slot 0 (rotated=%d)\n",
+			messages_batch_tx[0].batch_seq_id, CMD_BSI, rotated ? 1 : 0);
+		pass = false;
+	}
+
+	// A2 — among current-bsi (new-data) slots, EOB bit7 on the FINAL slot only.
+	{
+		int last_slot = this->message_batch_counter_tx - 1;
+		int newdata_with_eob = 0, newdata_seen = 0;
+		bool final_has_eob = false;
+		for(int i = 0; i < this->message_batch_counter_tx; i++)
+		{
+			if(messages_batch_tx[i].batch_seq_id != CMD_BSI) continue;   // skip retx
+			newdata_seen++;
+			bool eob = ((unsigned char)messages_batch_tx[i].sequence_number & 0x80) != 0;
+			if(eob) newdata_with_eob++;
+			if(i == last_slot && eob) final_has_eob = true;
+		}
+		if(newdata_seen != ND || newdata_with_eob != 1 || !final_has_eob)
+		{
+			printf("[TEST-RETX-SLOT] FAIL A2: new-data slots=%d eob_count=%d final_eob=%d "
+			       "(expected %d,1,1) - EOB not uniquely wire-final\n",
+				newdata_seen, newdata_with_eob, final_has_eob ? 1 : 0, ND);
+			pass = false;
+		}
+	}
+
+	// A3 — retx block (post-rotate at [start..start+R-1]) verbatim bsi + seq byte.
+	for(int r = 0; r < R; r++)
+	{
+		int slot = this->v2_retx_block_start + r;
+		if(messages_batch_tx[slot].batch_seq_id != OLD_BSI
+		   || (unsigned char)messages_batch_tx[slot].sequence_number != retx_seq[r])
+		{
+			printf("[TEST-RETX-SLOT] FAIL A3: retx slot %d bsi=%d seq=0x%02X "
+			       "(expected bsi=%d seq=0x%02X) - original bytes not preserved\n",
+				slot, messages_batch_tx[slot].batch_seq_id,
+				(unsigned char)messages_batch_tx[slot].sequence_number,
+				OLD_BSI, retx_seq[r]);
+			pass = false;
+		}
+	}
+
+	// A4 — v2_flip_resolve_slot: -1 exactly for retx slots; unique owning index
+	//      for each new-data slot.
+	{
+		int resolved[8];
+		for(int i = 0; i < this->message_batch_counter_tx; i++)
+			resolved[i] = v2_flip_resolve_slot(i);
+		// retx slots -> -1
+		for(int r = 0; r < R; r++)
+		{
+			int slot = this->v2_retx_block_start + r;
+			if(resolved[slot] != -1)
+			{
+				printf("[TEST-RETX-SLOT] FAIL A4: retx slot %d resolved to %d (expected -1)\n",
+					slot, resolved[slot]);
+				pass = false;
+			}
+		}
+		// new-data slots -> a valid, distinct owning index (== the diverged index).
+		// Wire order after rotate: [new0][retx..][new1..newND-1]; new-data ordinal p
+		// is at slot 0 for p==0 else at slot (R + p).
+		bool seen_owner[8] = { false };
+		for(int p = 0; p < ND; p++)
+		{
+			int slot = (p == 0) ? 0 : (R + p);
+			int got  = resolved[slot];
+			if(got != newdata_idx[p])
+			{
+				printf("[TEST-RETX-SLOT] FAIL A4: new-data ord %d (slot %d) resolved to %d "
+				       "(expected owning idx %d, NOT the wire id)\n",
+					p, slot, got, newdata_idx[p]);
+				pass = false;
+			}
+			if(got >= 0 && got < 8)
+			{
+				if(seen_owner[got])
+				{
+					printf("[TEST-RETX-SLOT] FAIL A4: owning index %d resolved twice "
+					       "(new-data slots not unique)\n", got);
+					pass = false;
+				}
+				seen_owner[got] = true;
+			}
+		}
+	}
+
+	// ======================= ND==1 arm (byte-identical) =======================
+	build_layout(1);
+	bool rotated1 = v2_rotate_retx_behind_lead();
+	if(rotated1 || this->v2_retx_block_start != 0
+	   || messages_batch_tx[0].batch_seq_id != OLD_BSI
+	   || (unsigned char)messages_batch_tx[0].sequence_number != retx_seq[0])
+	{
+		printf("[TEST-RETX-SLOT] FAIL A5: ND==1 rotated=%d block_start=%d slot0 bsi=%d "
+		       "seq=0x%02X (expected no-rotate, start=0, slot0=retx bsi=%d seq=0x%02X)\n",
+			rotated1 ? 1 : 0, this->v2_retx_block_start,
+			messages_batch_tx[0].batch_seq_id,
+			(unsigned char)messages_batch_tx[0].sequence_number,
+			OLD_BSI, retx_seq[0]);
+		pass = false;
+	}
+
+	printf("[TEST-RETX-SLOT] %s: ND>=2 rotated=%d (slot0 bsi=%d), retx block @ [%d..%d], "
+	       "ND==1 no-rotate=%d\n",
+		pass ? "PASS" : "FAIL", rotated ? 1 : 0, slot0_bsi_nd2,
+		1, R, rotated1 ? 0 : 1);
+	fflush(stdout);
+	return pass ? 0 : 1;
 }

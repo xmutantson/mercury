@@ -469,6 +469,16 @@ public:
   // Shared by send_batch()'s flip and the --test-v2-pendingack-flip-alias test.
   // See data-flow-arq-recovery-cluster.md §4.2 / §5.5.
   int v2_flip_resolve_slot(int batch_idx);
+  // Timing redesign (cross-layer data-flow audit, retx-queue cluster) — after
+  // the v2 mixed-batch fill leaves the retx block at slots [0..R-1] and the
+  // new-data frames at [R..R+ND-1], rotate the sub-array [0..R] right by one so
+  // the wire order becomes [new0][retx0..retxR-1][new1..newND-1(EOB)]. This keeps
+  // a retransmit frame off wire slot 0 (the only slot exposed to the peer's
+  // post-turnaround mute/flush window) while the EOB-marked frame stays
+  // wire-final. No-op (legacy layout) unless it is a v2 mixed batch with >=2
+  // new-data frames. Returns true iff the rotation was applied. Shared by the
+  // production builder and the --test-retx-slot-order regression.
+  bool v2_rotate_retx_behind_lead();
   void set_control_batch_size(int control_batch_size);
   void set_role(int role);
   void calculate_receiving_timeout();
@@ -3104,6 +3114,20 @@ public:
   // slot. Returns 0=PASS, 1=FAIL.
   int test_v2_pendingack_flip_alias();
 
+  // Timing redesign — retx-never-rides-wire-slot-0 regression.
+  // CLI: --test-retx-slot-order. Reconstructs the v2 mixed-batch layout exactly
+  // as the fill loops leave it (retx block at [0..R-1] carrying original bsi +
+  // original sequence bytes incl. the EOB bit7; new-data at [R..R+ND-1] with
+  // pos_in_new_batch sequence numbers, EOB on the last new-data slot), then
+  // drives the REAL v2_rotate_retx_behind_lead() and v2_flip_resolve_slot().
+  // Asserts A1 slot 0 carries current-bsi new-data (fail-before: with the rotate
+  // defeated via MERCURY_RETX_SLOT0_ROTATE_DEFEAT, slot 0 is the retx bsi ->
+  // FAIL), A2 EOB set only on the final slot, A3 retx block bytes verbatim, A4
+  // v2_flip_resolve_slot == -1 exactly for the retx slots + a unique valid slot
+  // per new-data slot, A5 ND==1 layout byte-identical to the legacy prefix.
+  // Returns 0=PASS, 1=FAIL.
+  int test_retx_slot_order();
+
   // SACK Design A Step 11 — Axis 3 controller (SACK mode ON↔PROBE↔OFF).
   //
   // policy_evaluate_axis3() implements the per-SACK-event §4.3.2 controller.
@@ -3891,7 +3915,22 @@ public:
   // reads it to (a) SKIP retx-prefix frames (no messages_tx slot to flip) and
   // (b) for new-data frames route by (batch_seq_id, low7-seq) instead of the
   // overwritten wire .id. See data-flow-arq-recovery-cluster.md §4.2 / §5.5.
-  int v2_retx_prefix_count;
+  //
+  // Timing redesign — the retx block is no longer necessarily a LEADING prefix.
+  // v2_retx_block_start is the first slot of the contiguous retx block (0 =
+  // legacy leading prefix; 1 after v2_rotate_retx_behind_lead() moves it behind
+  // one leading new-data frame). v2_retx_block_count == the old v2_retx_prefix_count
+  // (number of retx-block slots). v2_slot_is_retx(idx) is the single predicate
+  // every consumer uses to test "is this batch slot a retx-block frame" — it is
+  // position-independent, so it is correct both before and after the rotation.
+  int v2_retx_block_start;
+  int v2_retx_block_count;
+  inline bool v2_slot_is_retx(int idx) const
+  {
+    return v2_retx_block_count > 0
+        && idx >= v2_retx_block_start
+        && idx <  v2_retx_block_start + v2_retx_block_count;
+  }
 
   char* message_TxRx_byte_buffer;
   struct st_message messages_rx_buffer;

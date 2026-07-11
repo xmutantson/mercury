@@ -591,7 +591,8 @@ cl_arq_controller::cl_arq_controller()
 	message_TxRx_byte_buffer=NULL;
 
 	message_batch_counter_tx=0;
-	v2_retx_prefix_count=0;  // R030: reset every batch build; set to R on v2 mixed
+	v2_retx_block_start=0;   // R030 / timing redesign: reset every batch build;
+	v2_retx_block_count=0;   // set to (start,count) on a v2 mixed batch
 	ack_timeout_data=1000;
 	ack_timeout_control=1000;
 	link_timeout=10000;
@@ -1322,23 +1323,26 @@ void cl_arq_controller::clear_retx_queue()
 // exact production predicate. See the flip comment in send_batch() and
 // data-flow-arq-recovery-cluster.md §4.2 / §5.5.
 //
-//   - v2 MIXED batch (v2_retx_prefix_count > 0):
-//       * batch_idx < v2_retx_prefix_count  -> retx prefix: payload lives in
+//   - v2 MIXED batch (v2_retx_block_count > 0):
+//       * v2_slot_is_retx(batch_idx)  -> retx block: payload lives in
 //         retx_scratch[], original messages_tx[] slot was freed to ACKED at SACK
 //         capture (arq_commander.cc:2983). NO live slot -> return -1 (skip).
+//         (Position-independent: correct whether the block is the leading prefix
+//         [0..R-1] or, after v2_rotate_retx_behind_lead(), [1..R].)
 //       * else (new-data): messages_batch_tx[batch_idx].id is the OVERWRITTEN
 //         wire id (pos_in_new_batch), NOT the array index. Find the owning slot
 //         by (batch_seq_id, low7-seq) -- the duplicate-(bsi,seq) validation at
 //         arq_commander.cc:1797 guarantees that tuple is UNIQUE among populated
-//         slots, so the match is unambiguous.
-//   - v2 NON-mixed batch (v2_retx_prefix_count == 0) and v1: wire .id ==
+//         slots, so the match is unambiguous (also position-independent, so the
+//         rotated new0 at slot 0 resolves correctly).
+//   - v2 NON-mixed batch (v2_retx_block_count == 0) and v1: wire .id ==
 //     messages_tx[] array index -> return it directly (legacy behaviour).
 int cl_arq_controller::v2_flip_resolve_slot(int batch_idx)
 {
-	if(v2_retx_prefix_count > 0)
+	if(v2_retx_block_count > 0)
 	{
-		if(batch_idx < v2_retx_prefix_count)
-			return -1;  // retx prefix: no messages_tx[] slot to flip
+		if(v2_slot_is_retx(batch_idx))
+			return -1;  // retx block: no messages_tx[] slot to flip
 		int want_bsi = (int)(unsigned char)messages_batch_tx[batch_idx].batch_seq_id;
 		int want_seq = (int)((unsigned char)messages_batch_tx[batch_idx].sequence_number & 0x7F);
 		for(int s = 0; s < this->nMessages; s++)
@@ -9494,21 +9498,22 @@ void cl_arq_controller::send_batch()
 			// R030 (race audit 2026-06-06): resolve the messages_tx[] slot to flip
 			// PENDING_ACK. messages_batch_tx[i].id is the WIRE id, which on a v2
 			// MIXED batch is NOT the messages_tx[] array index:
-			//   - retx-prefix frames (i < v2_retx_prefix_count): .id = the ORIGINAL
+			//   - retx-block frames (v2_slot_is_retx(i)): .id = the ORIGINAL
 			//     wire slot of a PRIOR batch; their payload is in retx_scratch[] and
 			//     their original messages_tx[] slot was freed to ACKED at SACK
 			//     capture (arq_commander.cc:2983). They have NO live messages_tx[]
 			//     slot in THIS batch — their delivery is tracked via the SACK
 			//     bitmap / retx queue, NOT via a messages_tx[] PENDING_ACK. Flipping
 			//     messages_tx[orig_wire_slot] aliased a FREE/foreign slot (the R030
-			//     bug). SKIP them.
-			//   - new-data frames (i >= v2_retx_prefix_count): .id = pos_in_new_batch
+			//     bug). SKIP them. (Position-independent: after the timing-redesign
+			//     rotate the block is at [1..R], but v2_slot_is_retx() tracks it.)
+			//   - new-data frames (!v2_slot_is_retx(i)): .id = pos_in_new_batch
 			//     (overwritten at arq_commander.cc:1645), NOT the array index. Find
 			//     the owning slot by (batch_seq_id, low7-seq) — both were written to
 			//     messages_tx[idx] at fill time (arq_commander.cc:1616/1644) and to
 			//     messages_batch_tx[i] (send_batch's renumber is suppressed on mixed
 			//     batches via sack_retransmit_active), so the tuple matches exactly.
-			// On a v2 NON-mixed batch (v2_retx_prefix_count==0) and on v1, the wire
+			// On a v2 NON-mixed batch (v2_retx_block_count==0) and on v1, the wire
 			// .id == messages_tx[] array index, so the legacy direct path is correct.
 			int id = v2_flip_resolve_slot(i);
 			if(id < 0)
