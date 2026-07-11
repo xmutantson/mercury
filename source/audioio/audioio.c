@@ -1366,6 +1366,25 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 	long   c1_lw_samples = 0;
 	long   c1_lw_n_over  = 0;
 
+	// [CBC-METER] construction meter (Step-0 prevention needle). Reads the gate
+	// once and resets the process-lifetime accumulators so the summary is clean
+	// regardless of struct init order. When off, the eat site below is
+	// byte-identical to the pre-meter code.
+	int          cbc_meter       = getenv("MERCURY_CBC_METER") ? 1 : 0;
+	const double CBC_SILENCE_RMS  = 1e-4;   // ~-80 dBFS: below = true silence, ignore
+	double       cbc_signal_rms   = 0.05;   // above = a real peer frame (not WGN channel noise)
+	{ const char* e = getenv("MERCURY_CBC_SIGNAL_RMS"); if(e && *e) cbc_signal_rms = atof(e); }
+	if (cbc_meter) {
+		telecom_ptr->data_container.cbc_muted_total_samples  = 0;
+		telecom_ptr->data_container.cbc_muted_noise_events   = 0;
+		telecom_ptr->data_container.cbc_muted_signal_samples = 0;
+		telecom_ptr->data_container.cbc_muted_signal_events  = 0;
+		telecom_ptr->data_container.cbc_muted_peak           = 0.0;
+		printf("[CBC-METER] enabled (silence_rms_floor=%.1e signal_rms_floor=%.4f)\n",
+		       CBC_SILENCE_RMS, cbc_signal_rms);
+		fflush(stdout);
+	}
+
 	while (!shutdown_)
     {
 		cl_data_container *data_container_ptr = &telecom_ptr->data_container;
@@ -1401,6 +1420,39 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 		}
 
 		if(data_container_ptr->rx_mute) {
+			// [CBC-METER] Measure the energy about to be discarded. In the
+			// device-free two-process relay there is no self-echo, so any
+			// above-floor energy captured here is incoming PEER signal being
+			// eaten by the mute/flush blind window — the structural loss the
+			// F1b sample-anchored re-arm must drive to zero.
+			if(cbc_meter) {
+				double e2 = 0.0, pk = 0.0;
+				for(int ci = 0; ci < symbol_period; ci++) {
+					double s = buffer_temp[ci];
+					e2 += s * s;
+					double a = fabs(s);
+					if(a > pk) pk = a;
+				}
+				double rms = (symbol_period > 0) ? sqrt(e2 / symbol_period) : 0.0;
+				data_container_ptr->cbc_muted_total_samples += symbol_period;
+				if(rms > cbc_signal_rms) {
+					// A full-amplitude peer FRAME landed inside the blind window
+					// and is being zeroed = the structural loss (the needle).
+					data_container_ptr->cbc_muted_signal_samples += symbol_period;
+					data_container_ptr->cbc_muted_signal_events  += 1;
+					if(pk > data_container_ptr->cbc_muted_peak)
+						data_container_ptr->cbc_muted_peak = pk;
+					printf("[CBC-METER-EAT] peer FRAME eaten while muted: rms=%.6f pk=%.6f sp=%d cum_signal_samp=%ld cum_signal_events=%ld\n",
+						rms, pk, symbol_period,
+						(long)data_container_ptr->cbc_muted_signal_samples,
+						(long)data_container_ptr->cbc_muted_signal_events);
+					fflush(stdout);
+				} else if(rms > CBC_SILENCE_RMS) {
+					// Channel noise captured while muted — not the loss, but
+					// tracked so the needle is read against a visible denominator.
+					data_container_ptr->cbc_muted_noise_events += 1;
+				}
+			}
 			memset(buffer_temp, 0, symbol_period * sizeof(double));
 			data_container_ptr->rx_mute_samples += symbol_period;
 		}
@@ -1509,6 +1561,16 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 		double _mean = c1_lw_samples ? (c1_lw_sum_us / (double)c1_lw_samples) : 0.0;
 		printf("[C1-LOCKWAIT-SUMMARY] samples=%ld max_us=%.2f max_ms=%.4f mean_us=%.3f n_over_200us=%ld\n",
 			c1_lw_samples, c1_lw_max_us, c1_lw_max_us / 1000.0, _mean, c1_lw_n_over);
+		fflush(stdout);
+	}
+	if(cbc_meter) {
+		long ss = telecom_ptr->data_container.cbc_muted_signal_samples;
+		long se = telecom_ptr->data_container.cbc_muted_signal_events;
+		long ne = telecom_ptr->data_container.cbc_muted_noise_events;
+		long ts = telecom_ptr->data_container.cbc_muted_total_samples;
+		double pk = telecom_ptr->data_container.cbc_muted_peak;
+		printf("[CBC-METER-SUMMARY] signal_eaten_samples=%ld signal_eaten_events=%ld noise_muted_events=%ld total_muted_samples=%ld peak=%.6f\n",
+			ss, se, ne, ts, pk);
 		fflush(stdout);
 	}
 	shutdown_ = true;

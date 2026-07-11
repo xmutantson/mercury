@@ -149,6 +149,27 @@ class cl_data_container
 	_Atomic(int) rx_mute_samples;  // samples zeroed by rx_mute since last MF search
 	_Atomic(int) ring_write_index;  // current write position in double-mapped ring buffer
 
+	// Construction-meter accumulators: the prevention needle for the
+	// turnaround blind-window loss. When rx_mute=1 the capture-prep zero-writer
+	// (audioio.c) discards the just-captured ring samples; the meter measures
+	// the RMS of each discarded buffer BEFORE it is zeroed and classes it:
+	//   rms <= silence floor          -> ignored (true silence)
+	//   silence < rms <= signal floor -> channel noise (counted, not the needle)
+	//   rms > signal floor            -> a real PEER FRAME eaten (the needle)
+	// On these device-free cables (snd-aloop / VB-Cable / the two-process relay)
+	// each peer hears only the OTHER peer's TX, so a full-amplitude frame in the
+	// mute window is incoming peer signal being discarded — the structural loss
+	// the sample-anchored F1b re-arm must drive to zero. The signal floor
+	// separates the frame (rms ~0.3) from the WGN channel floor (rms <~0.02 at
+	// the clean vehicle SNR); it is SNR-dependent and tunable via
+	// MERCURY_CBC_SIGNAL_RMS. Gated by MERCURY_CBC_METER (read once in the
+	// capture thread); untouched and byte-identical when the meter is off.
+	_Atomic(long) cbc_muted_total_samples;   // ALL samples zeroed while muted (denominator)
+	_Atomic(long) cbc_muted_noise_events;    // muted buffers whose rms is channel-noise level (silence<rms<=signal)
+	_Atomic(long) cbc_muted_signal_samples;  // samples zeroed while muted with rms>signal floor = peer FRAME eaten
+	_Atomic(long) cbc_muted_signal_events;   // count of muted buffers carrying peer-frame energy (the needle)
+	double        cbc_muted_peak;            // peak |sample| eaten (writer: capture thread only)
+
 	int total_frame_size;
 
 	double* passband_data_tx;
