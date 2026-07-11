@@ -1131,6 +1131,77 @@ st_receive_stats cl_telecom_system::receive_bit(double *data, int* out)
 	return tmp;
 }
 
+// F1b Part B (true-boundary rescue selector): re-estimate the OFDM channel at a
+// CANDIDATE full-rate delay and return mean(|H|) over the MEASURED (pilot)
+// subcarriers, WITHOUT re-running frequency sync and WITHOUT touching
+// receive_stats. Reuses the exact production extraction+demod+estimate primitives
+// (passband_to_baseband_decimated → symbol_demod → AGC → CPE → LS/ZF estimator)
+// that the SUBPEAK-REJECT trial computed the collapsed mean_H with, so the returned
+// value is directly comparable to the trial's mean_H. It is ONLY a SELECTOR: the
+// actual decode always re-runs the trusted main path at the chosen delay via the
+// ofdm_subpeak_retry_point goto, so a small estimate imperfection can only change
+// which candidate is ranked best, never the decode itself. Scratch buffers
+// (baseband_data_interpolated / baseband_data / ofdm_symbol_demodulated_data /
+// ofdm.estimated_channel) are re-populated by that main-path re-run afterward.
+// eff_carrier_freq = the SAME effective carrier the trial's last extraction used
+// (coarse ± applied Moose). OFDM (non-MFSK) only. Returns -1.0 on a degenerate
+// window. See fact-documents/data-flow-rx-ring-rearm.md §Part-B and _research/F1B_DESIGN.md §2.
+double cl_telecom_system::ofdm_meanH_at_delay(double *data, int cand_delay,
+                                              double eff_carrier_freq, int rx_eff_preamble)
+{
+	int buf_size_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+	int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+rx_eff_preamble))*frequency_interpolation_rate;
+	if(cand_delay < 0) cand_delay = 0;
+	if(cand_delay > buf_size_interp - frame_size_interp)
+		cand_delay = buf_size_interp - frame_size_interp;
+	if(cand_delay < 0) return -1.0;
+
+	// Scoped data FIR + fused polyphase extraction (mirror of the main-path
+	// extraction at the SUBPEAK trial: telecom_system.cc data-FIR block).
+	int fir_margin = ofdm.FIR_rx_data.filter_nTaps * frequency_interpolation_rate;
+	int pb_start = cand_delay - fir_margin;
+	if(pb_start < 0) pb_start = 0;
+	int pb_end = cand_delay + frame_size_interp + fir_margin;
+	if(pb_end > buf_size_interp) pb_end = buf_size_interp;
+	int pb_size = pb_end - pb_start;
+	{
+		int Mdec = data_container.interpolation_rate;
+		int margin_dec = (cand_delay - pb_start) / Mdec;
+		int frame_dec = frame_size_interp / Mdec;
+		ofdm.passband_to_baseband_decimated(&data[pb_start], pb_size,
+			data_container.baseband_data_interpolated,
+			sampling_frequency, eff_carrier_freq, carrier_amplitude,
+			Mdec, &ofdm.FIR_rx_data, pb_start);
+		for(int i = 0; i < frame_dec; i++)
+			data_container.baseband_data[i] = data_container.baseband_data_interpolated[margin_dec + i];
+	}
+
+	// Demod the data symbols (offset past the — possibly MINI — preamble), then
+	// AGC + CPE + channel estimate, exactly as the main path does before mean_H.
+	{
+		int rx_nsymb = get_active_nsymb();
+		for(int i=0;i<rx_nsymb;i++)
+			ofdm.symbol_demod(&data_container.baseband_data[i*data_container.Nofdm+data_container.Nofdm*rx_eff_preamble],&data_container.ofdm_symbol_demodulated_data[i*data_container.Nc]);
+	}
+	ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
+	ofdm.CPE_correction(data_container.ofdm_symbol_demodulated_data);
+	if(ofdm.channel_estimator==ZERO_FORCE)
+		ofdm.ZF_channel_estimator(data_container.ofdm_symbol_demodulated_data);
+	else
+		ofdm.LS_channel_estimator(data_container.ofdm_symbol_demodulated_data);
+
+	double h_sum = 0; int h_count = 0;
+	for(int ci = 0; ci < ofdm.Nsymb * ofdm.Nc; ci++)
+	{
+		if(ofdm.estimated_channel[ci].status == MEASURED)
+		{
+			h_sum += std::abs(ofdm.estimated_channel[ci].value);
+			h_count++;
+		}
+	}
+	return (h_count > 0) ? (h_sum / h_count) : -1.0;
+}
+
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 {
 	// P1: big-block framing branch (gated; default OFF). When set, receive_byte
@@ -2432,6 +2503,30 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		const int effective_trials_max = sack_cross_check_mode
 			? (time_sync_trials_max > 5 ? time_sync_trials_max : 5)
 			: time_sync_trials_max;
+
+		// F1b Part B — sample-anchored true-boundary rescue at the SUBPEAK-REJECT
+		// site. After a config-turnaround flush, the first frame is preceded by a
+		// memset-zero + near-silent run-up; Schmidl-Cox P(d)/R(d) saturates into a
+		// plateau and fine sync locks a CONTENT-stable WRONG timing point (metric
+		// ~0.998 but pilots misaligned → mean|H| collapses to ~0.375). The reject
+		// loop below has no exclusion/refine, so every trial+dispatch re-locks the
+		// SAME wrong point until seq=1's data-preceded sharp peak wins → seq=0 is
+		// detected but never read. When the reject fires, re-derive the timing
+		// sample-exactly by argmax of mean|H| over [delay−2sym, delay+2sym] using the
+		// live LS estimator, accept at the ~0.74 good-timing floor, and re-decode ONCE
+		// at the refined delay (goto ofdm_subpeak_retry_point). One rescue per
+		// receive_byte, OFDM only. MERCURY_SUBPEAK_RESCUE_DEFEAT=1 → byte-identical
+		// (the whole block lives inside the reject branch, which today always
+		// continues). See _research/F1B_DESIGN.md §2 (Part B).
+		static const int subpeak_rescue_defeat = []{
+			const char* e = std::getenv("MERCURY_SUBPEAK_RESCUE_DEFEAT");
+			return (e && *e) ? atoi(e) : 0;
+		}();
+		static const double subpeak_rescue_floor = []{
+			const char* e = std::getenv("MERCURY_SUBPEAK_RESCUE_FLOOR");
+			return (e && *e) ? atof(e) : 0.74;  // good-timing mean|H| floor (comment near the mean_H_threshold gate)
+		}();
+		bool xcorr_rescue_attempted = false;  // one rescue per receive_byte (persists across trials)
 skip_h_retry_point:
 		while (receive_stats.sync_trials<=effective_trials_max)
 		{
@@ -3084,6 +3179,49 @@ skip_h_retry_point:
 				// budget is spent.
 				if(receive_stats.coarse_metric >= 0.97 && mean_H < 0.5)
 				{
+					// F1b Part B: sample-anchored true-boundary rescue (see the
+					// block-comment before skip_h_retry_point). Argmax of mean|H|
+					// over a ±2-symbol sample window around the rejected lock, using
+					// the live LS/ZF estimator (selector only — the real decode
+					// re-runs the trusted main path at the refined delay). One rescue
+					// per receive_byte; OFDM only; disabled on the forced-delay BER
+					// path. MERCURY_SUBPEAK_RESCUE_DEFEAT=1 → this block is skipped
+					// and the reject below is byte-identical to baseline.
+					if(!subpeak_rescue_defeat && M != MOD_MFSK && !xcorr_rescue_attempted
+					   && ofdm_forced_delay < 0 && mfsk_fixed_delay < 0)
+					{
+						xcorr_rescue_attempted = true;
+						int sym_full = data_container.Nofdm * frequency_interpolation_rate;
+						int buf_size_x = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+						int frame_size_x = (data_container.Nofdm*(data_container.Nsymb+rx_eff_preamble))*frequency_interpolation_rate;
+						int max_delay_x = buf_size_x - frame_size_x;
+						int orig_delay = receive_stats.delay;
+						double rescue_eff_cf = effective_carrier_freq;
+						if(fabs(freq_offset_measured) > ofdm.freq_offset_ignore_limit)
+							rescue_eff_cf -= freq_offset_measured;
+						double best_mH = mean_H; int best_delay = orig_delay;
+						int step = sym_full / 4; if(step < 1) step = 1;
+						for(int off = -2*sym_full; off <= 2*sym_full; off += step)
+						{
+							int cand = orig_delay + off;
+							if(cand < 0 || cand > max_delay_x) continue;
+							double mH = ofdm_meanH_at_delay(data, cand, rescue_eff_cf, rx_eff_preamble);
+							if(mH > best_mH) { best_mH = mH; best_delay = cand; }
+						}
+						if(best_mH >= subpeak_rescue_floor && best_delay != orig_delay)
+						{
+							printf("[XCORR-RESCUE-OK] trial %d old=%d new=%d meanH %.3f->%.3f delta_sym=%.2f floor=%.2f\n",
+								receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH,
+								(double)(best_delay - orig_delay) / (double)sym_full, subpeak_rescue_floor);
+							fflush(stdout);
+							receive_stats.delay = best_delay;
+							goto ofdm_subpeak_retry_point;  // ONE re-decode at the refined delay
+						}
+						printf("[XCORR-RESCUE-FAIL] trial %d old=%d best=%d meanH %.3f->%.3f (below floor %.2f)\n",
+							receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, subpeak_rescue_floor);
+						fflush(stdout);
+						receive_stats.delay = orig_delay;  // restore; fall through to the reject
+					}
 					printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
 						receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
 					fflush(stdout);

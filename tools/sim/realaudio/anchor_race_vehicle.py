@@ -75,8 +75,14 @@ RE_CBC_SUMM   = re.compile(
     r"\[CBC-METER-SUMMARY\] signal_eaten_samples=(\d+) signal_eaten_events=(\d+) "
     r"noise_muted_events=(\d+) total_muted_samples=(\d+) peak=([0-9.]+)")
 RE_FTRFAIL    = re.compile(r"\[FTR-FAIL\].*metric=([0-9.]+)")
+# Tightened needle-2 tokens (config-scoped FTR-FAIL, sub-peak reject, turnaround flush).
+RE_FTRFAIL_CFG = re.compile(r"\[FTR-FAIL\] CONFIG_(\d+) .*metric=([0-9.]+)")
+RE_SUBPEAK     = re.compile(r"\[SUBPEAK-REJECT\] trial \d+ metric=([0-9.]+) mean_H=([0-9.]+)")
+RE_FLUSH       = re.compile(r"rsp_post_ack_flush_done")
 
 FTR_HIGH_METRIC = 0.9   # a preamble this well-correlated is a real frame, not search noise
+TARGET_CFG      = 16    # post-transition operating config (the SET_LINK_PARAMS climb reaches CONFIG_16)
+SUBPEAK_MEANH   = 0.5   # mean|H| below which a high-metric lock is a Schmidl-Cox sub-peak (the collapse fingerprint)
 
 
 def _t(line):
@@ -107,9 +113,15 @@ def parse_cell(logpath):
         "cbc_eat_rsp": 0, "cbc_eat_cmd": 0, "cbc_eat_max_rms": 0.0,
         "cbc_summary": None,
         "ftrfail_total": 0, "ftrfail_highmetric": 0,
-        "ftrfail_highmetric_after_up": 0,   # needle 2, scoped to the turnaround window
+        "ftrfail_highmetric_after_up": 0,   # needle 2 (LOOSE), scoped to a flat 4 s window
         "cbc_eat_after_up": 0,              # needle 1, scoped to the turnaround window
         "ackgate_short": 0, "ackgate_rows": 0,
+        # --- tightened needle-2 (F1B_DESIGN §3 step-1): config-scoped, flush->first-
+        # decode window, SUBPEAK corroborator, per-transition CONJUNCTION with the
+        # frame-0 loss. Every count is reported next to its matched-row denominator.
+        "flush_rows": 0, "subpeak_rows": 0, "ftrfail_cfg_rows": 0,
+        "needle2_tight_events": 0,          # transitions whose CONJUNCTION fired
+        "needle2_tight_detail": [],
     }
     if not os.path.isfile(logpath):
         res["reason"] = "log missing"
@@ -119,10 +131,27 @@ def parse_cell(logpath):
     up_events = []     # (t, frm, to)
     ftr_hi = []        # timestamps of high-metric FTR-FAILs
     eat_ts = []        # timestamps of CBC-METER-EAT frame eats
+    flush_ts = []      # timestamps of rsp_post_ack_flush_done (turnaround flush)
+    subpeak_ev = []    # (t, mean_H) for [SUBPEAK-REJECT]
+    ftrfail_cfg = []   # (t, cfg, metric) for config-scoped [FTR-FAIL]
     with open(logpath, "r", errors="replace") as f:
         for line in f:
             if RE_CONNECTED.search(line):
                 res["connected"] = True
+            if RE_FLUSH.search(line):
+                ft = _t(line)
+                if ft is not None:
+                    flush_ts.append(ft)
+            m = RE_SUBPEAK.search(line)
+            if m:
+                st = _t(line)
+                if st is not None:
+                    subpeak_ev.append((st, float(m.group(2))))
+            m = RE_FTRFAIL_CFG.search(line)
+            if m:
+                ct = _t(line)
+                if ct is not None:
+                    ftrfail_cfg.append((ct, int(m.group(1)), float(m.group(2))))
             m = RE_LINKPARAMS.search(line)
             if m:
                 res["linkparams_all"] += 1
@@ -194,6 +223,44 @@ def parse_cell(logpath):
         res["ftrfail_highmetric_after_up"] += sum(1 for t in ftr_hi if ut <= t <= ut + WIN)
         res["cbc_eat_after_up"] += sum(1 for t in eat_ts if ut <= t <= ut + WIN)
 
+    # ---- Tightened needle-2 (the HONEST prevention needle, F1B_DESIGN §3 step-1) ----
+    # Per up-transition CONJUNCTION: window = [first rsp_post_ack_flush_done at/after
+    # the up-transition -> arrival (first RX-BATCH-SEQ) of the first decoded batch in
+    # that window]; the event fires iff a mechanism token is present IN that window
+    # (a high-metric CONFIG_16 [FTR-FAIL] OR a [SUBPEAK-REJECT] mean_H<0.5 cluster)
+    # AND that batch's first decoded seq != 0 (frame-0 actually lost). This couples
+    # the mechanism to the loss instead of tallying them independently, and scopes the
+    # window to the true turnaround (not a blanket 4 s), so a rescue that makes frame-0
+    # READ drives it to 0 by construction.
+    res["flush_rows"] = len(flush_ts)
+    res["subpeak_rows"] = len(subpeak_ev)
+    res["ftrfail_cfg_rows"] = len(ftrfail_cfg)
+    for (ut, frm, to) in up_events:
+        if ut is None:
+            continue
+        fl = [t for t in flush_ts if t is not None and t >= ut]
+        win_start = min(fl) if fl else ut
+        after = sorted((t, seq, bsi) for bsi, (t, seq) in first_seq.items()
+                       if t is not None and t >= win_start)
+        if not after:
+            continue
+        t_first, seq_first, bsi_first = after[0]
+        win_end = t_first
+        ftr_hi_cfg = sum(1 for (t, cfg, mt) in ftrfail_cfg
+                         if cfg == TARGET_CFG and mt > FTR_HIGH_METRIC and win_start <= t <= win_end)
+        subpeak_in = sum(1 for (t, mh) in subpeak_ev
+                         if mh < SUBPEAK_MEANH and win_start <= t <= win_end)
+        mech = (ftr_hi_cfg > 0) or (subpeak_in > 0)
+        lost = (seq_first != 0)
+        ev = bool(mech and lost)
+        if ev:
+            res["needle2_tight_events"] += 1
+        res["needle2_tight_detail"].append({
+            "ut": ut, "win_start": win_start, "win_end": win_end,
+            "bsi": bsi_first, "seq_first": seq_first,
+            "ftrfail_hi_cfg16_inwin": ftr_hi_cfg, "subpeak_inwin": subpeak_in,
+            "event": ev})
+
     # anchor-row assertion: a real, connected cell decodes many batches.
     if not res["connected"]:
         res["reason"] = "cell never connected"
@@ -206,7 +273,8 @@ def parse_cell(logpath):
     # Fail-before verdict for this cell.
     res["eat_reproduced"] = bool(res["slot0_loss_after_up"] > 0)
     res["needle1_mute_eat_fired"] = bool((res["cbc_eat_rsp"] + res["cbc_eat_cmd"]) > 0)
-    res["needle2_rearm_ftrfail_fired"] = bool(res["ftrfail_highmetric_after_up"] > 0)
+    res["needle2_rearm_ftrfail_fired"] = bool(res["ftrfail_highmetric_after_up"] > 0)  # LOOSE
+    res["needle2_tight_fired"] = bool(res["needle2_tight_events"] > 0)                 # TIGHT (graded needle)
     return res
 
 
@@ -289,6 +357,8 @@ def main():
         "cells_eat_reproduced": sum(1 for c in parsed if c.get("eat_reproduced")),
         "cells_needle1_mute_eat": sum(1 for c in parsed if c.get("needle1_mute_eat_fired")),
         "cells_needle2_rearm_ftrfail": sum(1 for c in parsed if c.get("needle2_rearm_ftrfail_fired")),
+        "cells_needle2_tight": sum(1 for c in parsed if c.get("needle2_tight_fired")),
+        "needle2_tight_events_total": sum(c.get("needle2_tight_events", 0) for c in parsed),
         "cells": cells,
     }
     # denominators printed next to every rate (a matched-nothing parser fabricates a pass).
@@ -302,7 +372,10 @@ def main():
     print(f"needle1 mute-eat fired: {agg['cells_needle1_mute_eat']}/{agg['cells_parsed']}"
           "  ([CBC-METER-EAT] peer frame zeroed while muted)")
     print(f"needle2 re-arm FTRFAIL: {agg['cells_needle2_rearm_ftrfail']}/{agg['cells_parsed']}"
-          "  (high-metric [FTR-FAIL] = frame preamble seen, read fails at re-arm)")
+          "  (LOOSE: high-metric [FTR-FAIL] in a flat 4 s window)")
+    print(f"needle2 TIGHT (graded) : {agg['cells_needle2_tight']}/{agg['cells_parsed']}"
+          f"  (flush->first-decode window, CFG16 FTR-FAIL/SUBPEAK ∧ seq0-lost; "
+          f"{agg['needle2_tight_events_total']} transition-events)")
     for c in cells:
         tag = os.path.basename(c["log"])
         if not c.get("parsed"):
@@ -310,9 +383,11 @@ def main():
             continue
         print(f"  {tag:22s} conn={c['connected']} up={len(c['linkparams_up'])} "
               f"batches={c['batches_seen']} slot0_loss_after_up={c['slot0_loss_after_up']} "
+              f"needle2_TIGHT={c['needle2_tight_events']} "
               f"cbc_eat(rsp/cmd)={c['cbc_eat_rsp']}/{c['cbc_eat_cmd']} "
               f"ftrfail_hi_after_up={c['ftrfail_highmetric_after_up']} "
-              f"(cbc_eat_after_up={c['cbc_eat_after_up']} ftrfail_hi_total={c['ftrfail_highmetric']}/{c['ftrfail_total']}) "
+              f"(rows: flush={c['flush_rows']} subpeak={c['subpeak_rows']} ftrfail_cfg={c['ftrfail_cfg_rows']} "
+              f"ftrfail_hi_total={c['ftrfail_highmetric']}/{c['ftrfail_total']}) "
               f"ackgate_short={c['ackgate_short']}/{c['ackgate_rows']}")
 
     outjson = os.path.join(args.outdir, "anchor_race_result.json")

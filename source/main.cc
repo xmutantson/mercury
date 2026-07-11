@@ -882,6 +882,127 @@ static int run_acq_bounds_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-subpeak-rescue: F1b Part B sample-anchored true-boundary rescue mechanism
+// self-test (fact-documents/data-flow-rx-ring-rearm.md, _research/F1B_DESIGN.md §2/§3).
+// PROVES the SUBPEAK-REJECT rescue's two production primitives on a deterministic,
+// noiseless, in-process synthetic-fire (no IONOS/RF):
+//   (1) the SELECTOR cl_telecom_system::ofdm_meanH_at_delay reads a HIGH mean|H| at the
+//       true frame onset and a COLLAPSED mean|H| at a ~1.5-symbol-early wrong lock (the
+//       field sub-peak fingerprint: metric saturates but pilots misalign, mean|H| ~0.37);
+//   (2) the argmax scan over [orig-2sym, orig+2sym] (the exact loop receive_byte runs in
+//       the reject branch) RECOVERS the true onset to within ±¼ symbol;
+//   (3) the production decode path (receive_byte) DECODES at the true / refined delay and
+//       FAILS at the wrong lock — the fail-before (wrong lock never reads) / pass-after
+//       (refined delay reads) proof through the real decoder.
+// The in-process path structurally cannot make the live Schmidl-Cox mislock (the drain is
+// a no-op under -x sim), so the PRODUCTION rescue-branch FIRING is proven separately by the
+// real-audio needle-2 cohort (anchor_race_vehicle.py: [XCORR-RESCUE-OK] tokens + needle2 -> 0).
+// This test isolates the mechanism the cohort then confirms fires end-to-end.
+static int run_subpeak_rescue_selftest()
+{
+    printf("[TEST-SUBPEAK-RESCUE] F1b Part B true-boundary rescue mechanism self-test\n");
+    int fails = 0;
+    const int cfg = CONFIG_16;   // the operating config where the post-turnaround loss occurs
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(cfg);
+
+    cl_data_container& dc = ts.data_container;
+    int interp       = ts.frequency_interpolation_rate;
+    int sym_samples  = dc.Nofdm * interp;
+    int frame_symb   = dc.Nsymb + dc.preamble_nSymb;
+    int frame_samp   = frame_symb * sym_samples;
+    int buf_samp     = dc.buffer_Nsymb * sym_samples;
+    int max_delay    = buf_samp - frame_samp;
+    double carrier   = ts.carrier_frequency;
+
+    // Build one clean CONFIG_16 frame via the production TX path.
+    int nReal_data = dc.nBits - ts.ldpc.P;
+    int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8;
+    if (frame_size < 1) frame_size = 1;
+    std::vector<int> payload(frame_size, 0);
+    for (int i = 0; i < frame_size; i++) payload[i] = (i * 53 + 7) & 0xff;
+    std::vector<double> frame(frame_samp, 0.0);
+    ts.transmit_byte(payload.data(), frame_size, frame.data(), SINGLE_MESSAGE);
+
+    // Place at a true onset preceded by a zero run-up (the flush-memset silence that
+    // seeds the Schmidl-Cox plateau in the field). onset=8 symbols in; full frame fits.
+    double* rx = dc.ready_to_process_passband_delayed_data;
+    for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
+    int onset_symb = 8;
+    int D = onset_symb * sym_samples;
+    if (D > max_delay) D = max_delay;
+    int copy_n = frame_samp;
+    if (D + copy_n > buf_samp) copy_n = buf_samp - D;
+    for (int i = 0; i < copy_n; i++) rx[D + i] = frame[i];
+
+    // The field wrong lock sits ~1.5 symbols early (−1787 samp = −1.53 sym in c4).
+    int wrong = D - (sym_samples + sym_samples / 2);
+    if (wrong < 0) wrong = 0;
+
+    // ---- (1) SELECTOR discrimination via the production helper ----
+    double mH_true  = ts.ofdm_meanH_at_delay(rx, D,     carrier, dc.preamble_nSymb);
+    double mH_wrong = ts.ofdm_meanH_at_delay(rx, wrong, carrier, dc.preamble_nSymb);
+    const double FLOOR = 0.74;
+    // Discrimination, not an absolute magnitude: the wrong lock must fall BELOW the
+    // good-timing acceptance floor (so the rescue never accepts it) AND clearly below
+    // the true onset. (A noiseless synthetic frame collapses less deeply than the field
+    // −1787-sample lock with its long silence run-up + real channel, ~0.56 vs ~0.37, but
+    // the selector still ranks it well below FLOOR — which is all the accept gate needs.)
+    bool sel_true_ok  = (mH_true  >= FLOOR);
+    bool sel_wrong_ok = (mH_wrong <  FLOOR) && (mH_true - mH_wrong >= 0.20);
+    printf("[TEST-SUBPEAK-RESCUE]   selector: meanH(true=%d)=%.3f (>=%.2f? %s)  meanH(wrong=%d)=%.3f (<%.2f & margin>=0.20? %s)\n",
+           D, mH_true, FLOOR, sel_true_ok?"YES":"NO", wrong, mH_wrong, FLOOR, sel_wrong_ok?"YES":"NO");
+    if (!sel_true_ok)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: true-onset mean|H| below good-timing floor\n"); }
+    if (!sel_wrong_ok) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: wrong-lock mean|H| not clearly below the good-timing floor\n"); }
+
+    // ---- (2) argmax scan (identical to the receive_byte reject-branch loop) ----
+    int step = sym_samples / 4; if (step < 1) step = 1;
+    double best_mH = mH_wrong; int best_delay = wrong;
+    for (int off = -2*sym_samples; off <= 2*sym_samples; off += step) {
+        int cand = wrong + off;
+        if (cand < 0 || cand > max_delay) continue;
+        double mH = ts.ofdm_meanH_at_delay(rx, cand, carrier, dc.preamble_nSymb);
+        if (mH > best_mH) { best_mH = mH; best_delay = cand; }
+    }
+    bool scan_ok = (best_mH >= FLOOR) && (std::abs(best_delay - D) <= step);
+    printf("[TEST-SUBPEAK-RESCUE]   argmax scan: best_delay=%d (true=%d, err=%d samp, <=%d? %s) best_meanH=%.3f (>=%.2f? %s)\n",
+           best_delay, D, best_delay - D, step, (std::abs(best_delay - D) <= step)?"YES":"NO",
+           best_mH, FLOOR, (best_mH>=FLOOR)?"YES":"NO");
+    if (!scan_ok) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: argmax did not recover the true onset\n"); }
+
+    // ---- (3) production decode legs: truth decodes, wrong lock fails, refined decodes ----
+    auto decode_at = [&](int forced_delay)->int {
+        for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
+        for (int i = 0; i < copy_n; i++) rx[D + i] = frame[i];
+        ts.receive_stats.ofdm_search_raw = 0;
+        ts.data_container.nUnder_processing_events = 0;
+        ts.receive_stats.ofdm_batch_active = false;
+        ts.receive_stats.delay = 0;
+        ts.mfsk_fixed_delay = -1;
+        ts.ofdm_forced_delay = forced_delay;   // decode at exactly this delay (no rescue on this path)
+        ts.receive_byte(rx, dc.hd_decoded_data_byte);
+        int ok = (ts.receive_stats.message_decoded == YES) ? 1 : 0;
+        if (ok) {   // confirm byte-correctness, not just the decoded flag
+            for (int i = 0; i < frame_size; i++)
+                if ((dc.hd_decoded_data_byte[i] & 0xff) != (payload[i] & 0xff)) { ok = 0; break; }
+        }
+        return ok;
+    };
+    int dec_true  = decode_at(D);
+    int dec_wrong = decode_at(wrong);
+    int dec_best  = decode_at(best_delay);
+    printf("[TEST-SUBPEAK-RESCUE]   decode: true=%s wrong=%s refined=%s\n",
+           dec_true?"DECODED":"FAILED", dec_wrong?"DECODED":"FAILED", dec_best?"DECODED":"FAILED");
+    if (!dec_true)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: clean frame did not decode at the true onset\n"); }
+    if ( dec_wrong) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: wrong lock decoded (fail-before did not reproduce)\n"); }
+    if (!dec_best)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: refined delay did not decode (pass-after)\n"); }
+
+    printf("[TEST-SUBPEAK-RESCUE] %s (%d failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
 // --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
 // pass-after self-test. See fact-documents/chase-combining-harq.md.
 //
@@ -1385,6 +1506,13 @@ int main(int argc, char *argv[])
             // (anti-re-decode preserved). Faithful in-process synthetic-fire through the
             // production transmit_byte/receive_byte (no IONOS/RF).
             failed += run_acq_bounds_selftest();
+            // F1b Part B SAMPLE-ANCHORED SUB-PEAK RESCUE gate (data-flow-rx-ring-rearm.md):
+            // after a turnaround flush the first frame can lock a Schmidl-Cox sub-peak
+            // (metric saturates, pilots misalign, mean|H| collapses) and never read; the
+            // rescue re-derives the timing by argmax of mean|H| and re-decodes. Proves the
+            // selector + argmax + decode mechanism deterministically (the live mislock is
+            // reproduced only by the real-audio needle-2 cohort, not in-process).
+            failed += run_subpeak_rescue_selftest();
             // CMD>RSP BATCH-SIZE DESYNC silent-corruption gate (res_c3100, silent-
             // corruption-residual.md §8): a CMD>RSP data_batch_size desync (CMD built 30,
             // RSP applied 25) makes the RSP ACK-GATE deliver the batch TRUNCATED to its
@@ -2053,6 +2181,13 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-chase") == 0) {
             arm_test_watchdog();
             int failed = run_chase_selftest();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-subpeak-rescue : run ONLY the F1b Part B true-boundary rescue
+        // mechanism self-test and exit. Deterministic, noiseless, in-process.
+        if (strcmp(argv[i], "--test-subpeak-rescue") == 0) {
+            arm_test_watchdog();
+            int failed = run_subpeak_rescue_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler
