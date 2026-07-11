@@ -1479,6 +1479,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_rf;
                 failed += ARQ_rf.test_recover_fire();
             }
+            // R2b — DELIVER-HELD-CUR fire proof: the RSP commits the held current
+            // batch's BYTES to the app FIFO via the production copy_data_to_buffer
+            // once the prev hole refills, and the CMD credits the recovery round.
+            // fail-before via MERCURY_HELD_CUR_DELIVER_DEFEAT / MERCURY_GAP_RECOVER_
+            // TURNAROUND_DEFEAT. See data-flow-recoverable-gap-abort.md §5.5.
+            {
+                cl_arq_controller ARQ_hcf;
+                failed += ARQ_hcf.test_held_cur_deliver_fire();
+            }
             // chase-combining (HARQ Type-I soft-LLR combine) fail-before/pass-after:
             // proves a bit-identical retx's LLRs SUMMED before ldpc.decode() rescue a
             // frame one look cannot decode (combine success-rate 0 -> >0), and that
@@ -2437,6 +2446,11 @@ int main(int argc, char *argv[])
                                         // (R2a hold + R2c CMD retention). fail-before via
                                         // MERCURY_GAP_RECOVER_DEFEAT=1 (terminal abort, high-water frozen);
                                         // pass-after = HOLD + refill + in-order 6->7->8. One-shot, exits rc.
+    bool test_held_cur_fire_cli = false; // --test-held-cur-deliver-fire: R2b RSP deliver-held-cur
+                                        // (bytes reach the app FIFO via copy_data_to_buffer) + CMD
+                                        // recovery-turnaround credit. fail-before via
+                                        // MERCURY_HELD_CUR_DELIVER_DEFEAT / MERCURY_GAP_RECOVER_
+                                        // TURNAROUND_DEFEAT. One-shot, exits rc.
     bool test_measured_timers_cli = false; // --test-measured-timers: R6 SRTT/RTTVAR turnaround estimator +
                                         // ack_timeout_data >= receiving_timeout invariant regression (one-shot, exit rc).
     bool test_turnaround_guard_cli = false; // --test-turnaround-guard: R1 turnaround-clearance guard —
@@ -3335,6 +3349,15 @@ int main(int argc, char *argv[])
             // See source/datalink_layer/arq_responder.cc test_recover_fire
             // + fact-documents/data-flow-recoverable-gap-abort.md 5.1.
             test_recover_fire_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-held-cur-deliver-fire") == 0)
+        {
+            // R2b — RSP deliver-held-cur + CMD recovery-turnaround credit fire proof
+            // (one-shot, exit rc). See source/datalink_layer/arq_responder.cc
+            // test_held_cur_deliver_fire + fact-documents/data-flow-recoverable-gap-abort.md §5.5.
+            test_held_cur_fire_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5362,6 +5385,18 @@ start_modem:
             cl_arq_controller ARQ_rf;
             int rc = ARQ_rf.test_recover_fire();
             printf("[FLAG] Recover-fire test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_held_cur_fire_cli) {
+            // R2b — RSP deliver-held-cur (bytes to the app FIFO via the production
+            // copy_data_to_buffer) + CMD recovery-turnaround credit (one-shot, exit rc).
+            printf("[FLAG] --test-held-cur-deliver-fire: invoking R2b deliver-held-cur "
+                   "fire proof\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_hcf;
+            int rc = ARQ_hcf.test_held_cur_deliver_fire();
+            printf("[FLAG] Held-cur-deliver-fire test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

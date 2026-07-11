@@ -750,6 +750,7 @@ cl_arq_controller::cl_arq_controller()
 	rsp_prev_batch_delivered_count=0;
 	rsp_prev_batch_stale_count=0;
 	rsp_gap_recover_rounds=0;       // R2a: recoverable-hold round counter
+	rsp_gap_hold_cur_expected=0;    // R2b: no held current batch pending
 	rsp_deferred_batch_shrink=-1;   // Fix A (baseline-double-delivery.md): no deferred orphan-avoiding shrink pending
 	// R2c — CMD prev-batch retention shadow (all sentinels; gated on sack_v2 at use).
 	cmd_prev_retain_count=0;
@@ -7532,6 +7533,7 @@ void cl_arq_controller::reset_session_state()
 	// teardown saves/restores the ruler around this call; these two are NOT ruler
 	// state, so clearing them here is correct on every session boundary.
 	rsp_gap_recover_rounds = 0;
+	rsp_gap_hold_cur_expected = 0;   // R2b: no held current batch survives a session boundary / teardown
 	cmd_prev_retain_count  = 0;
 
 	// Option W (data-flow-stream-offset.md §2.4): a fresh session re-anchors both

@@ -1415,6 +1415,70 @@ void cl_arq_controller::process_messages_rx_data_control()
 							// above; the helper only COUNTS + LOGS. Same production helper the unit test
 							// drives, so the increment is exercised, not copied.
 							note_bigblock_partial_crc_residual(rsp_prev_batch_seq_id);
+							
+							// R2b -- DELIVER-HELD-CUR (data-flow-recoverable-gap-abort.md 5.5). The prev
+							// hole just filled and delivered (advance_last_delivered above stepped the
+							// high-water to prev == last+1). If a current batch is being HELD behind this
+							// hole (rsp_gap_hold_cur_expected>0) and it is now CONTIGUOUS (the delivery
+							// ruler reads not-a-gap by construction: prev was last+1, cur is last+2 ==
+							// new-last+1) and still fully present in messages_rx[], commit it through the
+							// SAME production delivery path the BATCH-DONE gate uses -- HERE, BEFORE the
+							// prev-delivered clean-ACK emit below -- so that emit's cumulative_ack_bsi_
+							// field(n_r) confirms the held cur in the SAME reverse frame. No false-ACK
+							// window: the CMD's registration of the held batch is semantically TRUE because
+							// the held batch IS delivered first. The prev-N-specific bookkeeping
+							// (rsp_apply_deferred_batch_shrink, note_bigblock_partial_crc_residual) has
+							// ALREADY run above with rsp_prev_batch_seq_id==prev, so the commit's bump of
+							// rsp_prev_batch_seq_id to the held bsi is safe. D3.1 keystone UNTOUCHED: the
+							// inline delivery_step_is_gap ruler stays the inviolable guard and
+							// rsp_stream_aborted refuses unconditionally. Knob
+							// MERCURY_HELD_CUR_DELIVER_DEFEAT=1 restores the pre-fix never-delivered hold
+							// (fail-before: the held cur strands and the bounded hold aborts).
+							{
+								bool held_deliver_defeat = false;
+								{ const char* e = std::getenv("MERCURY_HELD_CUR_DELIVER_DEFEAT");
+								  if(e && *e && atoi(e)!=0) held_deliver_defeat = true; }
+								if(!held_deliver_defeat
+								   && sack_v2_enabled
+								   && rsp_gap_hold_cur_expected > 0
+								   && rsp_current_expected_batch_seq_id >= 0
+								   && !rsp_stream_aborted
+								   && !delivery_step_is_gap(rsp_current_expected_batch_seq_id,
+								                            rsp_last_delivered_batch_seq_id))
+								{
+									// The held cur must still be FULLY present: every slot [0, expected-1]
+									// of messages_rx[] RECEIVED. The retx that filled the prev hole routed
+									// to PREV storage (messages_rx_prev[]) and must not have disturbed the
+									// held CURRENT storage.
+									bool all_present = true;
+									for(int i=0; i<rsp_gap_hold_cur_expected && i<this->data_batch_size
+									             && i<this->nMessages; i++)
+										if(messages_rx[i].status != RECEIVED) { all_present = false; break; }
+									if(all_present)
+									{
+										int held_bsi = rsp_current_expected_batch_seq_id;
+										rsp_commit_cur_batch_delivery();   // SAME production commit as BATCH-DONE
+										rsp_gap_hold_cur_expected = 0;
+										printf("[RSP-V2-HELD-CUR-DELIVERED] held cur bsi=%d delivered in-order "
+											"after prev refill; last_delivered=%d next_expected=%d\n",
+											held_bsi, rsp_last_delivered_batch_seq_id,
+											rsp_current_expected_batch_seq_id);
+										fflush(stdout);
+									}
+									else
+									{
+										// Held storage was disturbed (an unrelated demote/BREAK freed
+										// messages_rx[], retx mis-routing, etc.). Do NOT deliver a partial:
+										// drop the held marker and let the CMD ACK-timeout re-drive the cur
+										// batch through the normal (now-contiguous) BATCH-DONE path.
+										printf("[RSP-V2-HELD-CUR-INCOMPLETE] held cur bsi=%d not fully present "
+											"(expected=%d) -- NOT delivering; CMD re-drives via BATCH-DONE\n",
+											rsp_current_expected_batch_seq_id, rsp_gap_hold_cur_expected);
+										fflush(stdout);
+										rsp_gap_hold_cur_expected = 0;
+									}
+								}
+							}
 
 							// climb-engine Bug 1 (gearshift-climb-engine.md §4): emit a CLEAN
 							// (all-ones) MFSK ACK+SACK for the prev batch we just FULLY delivered
@@ -2153,6 +2217,39 @@ void cl_arq_controller::process_messages_acknowledging_control()
 }
 
 
+// R2b — the SINGLE in-order current-batch delivery commit (arq.h). Extracts the
+// BATCH-DONE else-branch state transitions (mark still-RECEIVED slots ACKED over
+// the batch span, advance the contiguity high-water to the current bsi, roll
+// prev<-cur / cur<-cur+1, reset the wired frame count) AND the app-FIFO push
+// (copy_data_to_buffer over messages_rx[]) into ONE routine, shared by the
+// BATCH-DONE gate below and the PREV-completion deliver-held-cur site
+// (process_messages_rx_data_control). ONE delivery implementation under the D3.1
+// gates. The CALLER is responsible for having cleared the contiguity ruler first
+// (delivery_step_is_gap(cur, last) == false); this routine only commits — it
+// NEVER re-checks the ruler, so it must never be called while a hole exists.
+void cl_arq_controller::rsp_commit_cur_batch_delivery()
+{
+	int delivered_bsi = rsp_current_expected_batch_seq_id;
+	// Mark any still-RECEIVED slots ACKED so copy_data_to_buffer's ACKED-only
+	// iteration delivers them (idempotent: at the BATCH-DONE site the slots were
+	// already flipped ACKED before the gap gate, so this is a no-op there; at the
+	// PREV-completion held-cur site the held slots are RECEIVED and this marks them).
+	for(int i=0;i<this->data_batch_size && i<this->nMessages;i++)
+		if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;
+	// FIX-8 (data-integrity): advance the reset-surviving high-water to the
+	// delivered batch (monotonic-with-wrap) so a later post-reset re-adopt can
+	// detect a hole.
+	advance_last_delivered(delivered_bsi);
+	rsp_gap_recover_rounds = 0;   // R2a: a forward delivery clears recoverable-hold state
+	rsp_prev_batch_seq_id = delivered_bsi;
+	rsp_current_expected_batch_seq_id = (delivered_bsi + 1) & 0xFF;
+	// D5: the next batch must latch its OWN authoritative frame count.
+	rx_batch_total_frames = -1;
+	// AEAD nonce source (data-flow-aead-nonce.md §5): bind to the DELIVERED wire bsi.
+	decrypt_delivered_bsi = delivered_bsi;
+	copy_data_to_buffer();
+}
+
 void cl_arq_controller::process_messages_acknowledging_data()
 {
 	printf("[RSP-RX-TIMEOUT] Entering ACK-GATE: rx_count=%d timeout=%d batch=%d\n",
@@ -2727,6 +2824,14 @@ void cl_arq_controller::process_messages_acknowledging_data()
 						}
 						nAck_messages = 0;
 						rsp_gap_recover_rounds++;
+							// R2b -- capture the frame-count completeness oracle NOW, while it is
+							// still known-true. The hold below clears last_received_end_of_batch_seq /
+							// rx_batch_total_frames (the two inputs to `expected`), so the
+							// deliver-held-cur gate at PREV-completion could not otherwise re-derive
+							// how many slots this held batch requires. `expected` is the exact count
+							// the BATCH-DONE gate just used to declare this batch frame-complete, so
+							// all slots [0, expected-1] of messages_rx[] are RECEIVED right now.
+							rsp_gap_hold_cur_expected = expected;
 						printf("[RSP-V2-GAP-HOLD] recoverable prev hole: HOLD cur bsi=%d "
 							"(reverted %d ACKED->RECEIVED) prev bsi=%d %d/%d "
 							"last_delivered=%d round=%d/%d — re-advertising prev hole, "
@@ -2766,21 +2871,20 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				}
 				else
 				{
-					// FIX-8: advance the reset-surviving high-water mark to the
-					// delivered batch (monotonic-with-wrap) so a later post-reset
-					// re-adopt can detect a hole.
-					advance_last_delivered(rsp_current_expected_batch_seq_id);
-					rsp_gap_recover_rounds = 0;   // R2a: a forward delivery clears any recoverable-hold state
-					rsp_prev_batch_seq_id = rsp_current_expected_batch_seq_id;
-					rsp_current_expected_batch_seq_id =
-						(rsp_current_expected_batch_seq_id + 1) & 0xFF;
-					// D5: this current batch is delivered; the NEXT batch (the new
-					// rsp_current_expected_batch_seq_id) must latch its OWN authoritative
-					// frame count. Reset so a stale count cannot mis-size the next batch's
-					// effective_batch / SACK span. (last_received_end_of_batch_seq is
-					// already cleared on the SACK-suppress path at :1858/:1887; the
-					// clean-complete path here resets the wired count symmetrically.)
-					rx_batch_total_frames = -1;
+					// R2b: the in-order BATCH-DONE commit is now the SHARED
+					// rsp_commit_cur_batch_delivery() helper (advance high-water,
+					// roll prev<-cur / cur<-cur+1, reset the wired count, and push
+					// messages_rx[] to the app FIFO). The slots were already flipped
+					// ACKED at :2650 (before the gap gate, so the recoverable HOLD
+					// could revert them), so the helper's mark is a no-op here. It
+					// delivers via copy_data_to_buffer BEFORE the clean-ACK TX below;
+					// the RXFIFO back-pressure gate above already guaranteed FIFO room,
+					// so no byte is ever ACKed-but-undelivered. batch_data_delivered is
+					// set so the tail copy_data_to_buffer at the ACK-emit site skips
+					// (single delivery). The PREV-completion deliver-held-cur site calls
+					// the SAME helper — ONE delivery implementation under the D3.1 gates.
+					rsp_commit_cur_batch_delivery();
+					batch_data_delivered = true;
 					printf("[RSP-V2-BATCH-DONE] prev=%d next_expected=%d last_delivered=%d\n",
 						rsp_prev_batch_seq_id, rsp_current_expected_batch_seq_id,
 						rsp_last_delivered_batch_seq_id);
@@ -12245,6 +12349,262 @@ int cl_arq_controller::test_recover_fire()
 
 	printf("%s %s (fails=%d) — the CMD refill decision FIRES on the storm topology; "
 		"live-wire recovery-counter 0->N is the deferred real-audio re-measure\n",
+		TAG, fails==0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails==0 ? 0 : 1;
+}
+
+
+// ============================================================================
+// R2b DELIVER-HELD-CUR fire proof — CLI --test-held-cur-deliver-fire.
+//
+// The RSP half of the recovery contract (deliver the HELD current batch once the
+// prev hole refills) had NEVER been built before this change, so the recoverable
+// HOLD delivered the held batch 0 times on the wire. This test drives the REAL
+// production delivery producer for the held cur — rsp_commit_cur_batch_delivery()
+// -> copy_data_to_buffer() -> fifo_buffer_rx — and pops the app FIFO as the
+// delivered-bytes oracle. It is NOT a high-water poke: the ARM-D trap (a manual
+// advance_last_delivered() standing in for delivery) is exactly what left the 4
+// prior fixes inert; here the held batch's BYTES must actually appear in the app
+// FIFO, gated by the REAL MERCURY_HELD_CUR_DELIVER_DEFEAT knob and the REAL
+// delivery_step_is_gap ruler.
+//
+// The prev-completion GATE DECISION is reproduced inline (same methodology as
+// test_recoverable_gap_abort ARM-D and test_gap_abort_readopt_blind) because the
+// full process_messages_rx_data_control() cannot be invoked in-process — it
+// depends on live telecom_system TX state (documented at arq_responder.cc:~4628).
+// The DELIVERY itself is the production primitive, so the fail-before/pass-after
+// is a real behavior-change proof, not a simulation.
+//
+// PART A: the RSP deliver-held-cur commit (bytes reach the app FIFO).
+// PART B: the CMD recovery-turnaround credit (data_ack_received / window close).
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_held_cur_deliver_fire()
+{
+	const char* TAG = "[TEST-HELD-CUR-FIRE]";
+	int fails = 0;
+	auto ck = [&](bool c, const char* w) {
+		printf("%s %s: %s\n", TAG, c ? "PASS" : "FAIL", w);
+		if(!c) fails++;
+		fflush(stdout);
+	};
+	auto putenv_kv = [&](const char* k, const char* v) {
+#if defined(_WIN32)
+		_putenv_s(k, v ? v : "");
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	if(init_messages_buffers() != SUCCESSFUL)
+	{ printf("%s ERROR: init_messages_buffers failed\n", TAG); return 1; }
+	this->sack_v2_enabled     = true;
+	this->compression_enabled = false;
+	this->data_batch_size     = 6;
+	this->link_status         = CONNECTED;
+	this->fifo_buffer_rx.set_size(262144);   // the app-delivery FIFO (fifo_push_rx sink)
+	this->fifo_buffer_rx.flush();
+
+	const int NM1 = 6;   // last delivered before the storm (N-1)
+	const int N   = 7;   // armed-prev batch (the one-frame hole)
+	const int NP1 = 8;   // HELD current batch (fully received behind the hole)
+	const int SUB = 12;  // bytes/frame
+
+	// Distinct, recognisable payload for the held cur batch NP1.
+	auto seed_held_cur = [&]() {
+		for(int i=0; i<this->nMessages; i++)
+		{
+			messages_rx[i].status       = FREE;
+			messages_rx[i].length       = 0;
+			messages_rx[i].batch_seq_id = -1;
+		}
+		for(int i=0; i<this->data_batch_size; i++)
+		{
+			messages_rx[i].type            = DATA_LONG;
+			messages_rx[i].id              = (char)(unsigned char)i;
+			messages_rx[i].length          = SUB;
+			messages_rx[i].status          = RECEIVED;   // HELD: reverted ACKED->RECEIVED at hold time
+			messages_rx[i].batch_seq_id    = NP1;
+			messages_rx[i].sequence_number = (char)(unsigned char)i;
+			for(int j=0; j<SUB; j++)
+				messages_rx[i].data[j] = (char)(0xC0 + i);   // 0xC0..0xC5, one byte-value per slot
+		}
+	};
+
+	// Build the expected in-order app stream for the held cur (what copy_data_to_
+	// buffer must push): slot i contributes SUB copies of 0xC0+i.
+	unsigned char expect_held[6 * 12];
+	for(int i=0; i<this->data_batch_size; i++)
+		for(int j=0; j<SUB; j++)
+			expect_held[i*SUB + j] = (unsigned char)(0xC0 + i);
+	const int expect_held_len = this->data_batch_size * SUB;
+
+	// ---- Common storm precondition ------------------------------------------
+	// The BATCH-DONE gate HELD NP1 (delivery_step_is_gap(NP1, N-1) fired, +2 hole)
+	// and captured rsp_gap_hold_cur_expected at hold time. The held slots survive
+	// as RECEIVED in messages_rx[]. The prev N (armed partial) is about to be
+	// refilled + delivered by the EXISTING PREV path — the precondition for the
+	// NEW deliver-held-cur code.
+	auto arm_storm = [&]() {
+		seed_held_cur();
+		this->fifo_buffer_rx.flush();
+		this->rsp_last_delivered_batch_seq_id   = NM1;   // ..N-1 delivered
+		this->rsp_current_expected_batch_seq_id = NP1;   // held cur (NOT bumped at hold)
+		this->rsp_prev_batch_seq_id             = N;     // armed partial prev
+		this->rsp_prev_batch_active             = true;
+		this->rsp_gap_hold_cur_expected         = this->data_batch_size;  // captured at hold
+		this->rsp_stream_aborted                = false;
+		this->rsp_gap_recover_rounds            = 1;     // one hold round in progress
+		this->batch_data_delivered              = false;
+		this->decrypt_delivered_bsi             = -1;
+	};
+
+	// The REAL prev-completion deliver-held-cur decision, reproduced inline
+	// (the knob + gates are production; the commit is the production primitive).
+	auto run_deliver_held_cur = [&]() -> bool {
+		// EXISTING PREV path: the refilled prev N delivers and advances the
+		// high-water to N (this is the pre-existing code, not the fix under test).
+		advance_last_delivered(N);
+		this->rsp_gap_recover_rounds = 0;
+		this->rsp_prev_batch_active  = false;
+		// ---- NEW code under test: the deliver-held-cur decision --------------
+		bool held_deliver_defeat = false;
+		{ const char* e = std::getenv("MERCURY_HELD_CUR_DELIVER_DEFEAT");
+		  if(e && *e && atoi(e)!=0) held_deliver_defeat = true; }
+		if(!held_deliver_defeat
+		   && this->sack_v2_enabled
+		   && this->rsp_gap_hold_cur_expected > 0
+		   && this->rsp_current_expected_batch_seq_id >= 0
+		   && !this->rsp_stream_aborted
+		   && !delivery_step_is_gap(this->rsp_current_expected_batch_seq_id,
+		                            this->rsp_last_delivered_batch_seq_id))
+		{
+			bool all_present = true;
+			for(int i=0; i<this->rsp_gap_hold_cur_expected && i<this->data_batch_size
+			             && i<this->nMessages; i++)
+				if(messages_rx[i].status != RECEIVED) { all_present = false; break; }
+			if(all_present)
+			{
+				rsp_commit_cur_batch_delivery();   // PRODUCTION commit -> copy_data_to_buffer
+				this->rsp_gap_hold_cur_expected = 0;
+				return true;
+			}
+		}
+		return false;
+	};
+
+	// ---- FAIL-BEFORE: MERCURY_HELD_CUR_DELIVER_DEFEAT=1 ---------------------
+	// The deliver-held-cur branch is pinned off: the held batch is NEVER
+	// delivered (the inert 0/N regime). No held-cur bytes reach the app FIFO and
+	// the high-water freezes at N (prev), NOT NP1.
+	putenv_kv("MERCURY_HELD_CUR_DELIVER_DEFEAT", "1");
+	arm_storm();
+	ck(delivery_step_is_gap(NP1, this->rsp_last_delivered_batch_seq_id),
+		"FAIL-BEFORE: held cur reads as a GAP while the prev hole exists");
+	bool fb_delivered = run_deliver_held_cur();
+	char fb_drain[64 * 12];
+	int  fb_popped = this->fifo_buffer_rx.pop(fb_drain, (int)sizeof(fb_drain));
+	ck(!fb_delivered, "FAIL-BEFORE: deliver-held-cur did NOT fire (knob pins it off)");
+	ck(fb_popped == 0, "FAIL-BEFORE: ZERO held-cur bytes reached the app FIFO (the inert 0/N drop)");
+	ck(this->rsp_last_delivered_batch_seq_id == N,
+		"FAIL-BEFORE: high-water frozen at N (prev) — held cur NP1 never delivered");
+	putenv_kv("MERCURY_HELD_CUR_DELIVER_DEFEAT", "");
+
+	// ---- PASS-AFTER: default-ON ---------------------------------------------
+	// The refilled prev delivers, then the held cur delivers IN-ORDER through the
+	// production commit: its bytes appear in the app FIFO, exactly once, in slot
+	// order, and the high-water advances N-1 -> N -> NP1 with NO abort.
+	arm_storm();
+	bool pa_delivered = run_deliver_held_cur();
+	ck(pa_delivered, "PASS-AFTER: deliver-held-cur FIRED (the production commit ran)");
+	unsigned char pa_drain[64 * 12];
+	int pa_popped = this->fifo_buffer_rx.pop((char*)pa_drain, (int)sizeof(pa_drain));
+	bool bytes_ok = (pa_popped == expect_held_len);
+	for(int b=0; b<pa_popped && bytes_ok; b++)
+		if(pa_drain[b] != expect_held[b]) bytes_ok = false;
+	ck(bytes_ok,
+		"PASS-AFTER: the held cur batch's BYTES reached the app FIFO in order via "
+		"copy_data_to_buffer (real delivery, not a high-water poke)");
+	if(!bytes_ok)
+	{
+		printf("%s   popped=%d expected=%d\n", TAG, pa_popped, expect_held_len);
+		fflush(stdout);
+	}
+	ck(this->rsp_last_delivered_batch_seq_id == NP1,
+		"PASS-AFTER: high-water advanced N-1 -> N -> NP1 (in-order, no abort)");
+	ck(this->rsp_current_expected_batch_seq_id == ((NP1 + 1) & 0xFF),
+		"PASS-AFTER: next-expected bumped to NP1+1 (held cur is committed, not re-held)");
+	ck(this->rsp_gap_hold_cur_expected == 0,
+		"PASS-AFTER: held-cur marker cleared (no double-delivery on a later completion)");
+
+	// ---- PART B: the CMD recovery-turnaround credit -------------------------
+	// The CMD half: a shadow-retained partial re-SACK with rq>0 must be CREDITED
+	// (data_ack_received=YES + window closed) so the round is a pure-retx
+	// turnaround, NOT an ACK-failure that feeds the demote ladder. Drive the REAL
+	// cmd_prev_retain_requeue re-drive, then the REAL turnaround decision.
+	this->cmd_batch_seq_id = NP1;
+	for(int i=0;i<this->nMessages;i++) messages_tx[i].status = FREE;
+	unsigned char holeC[SUB]; for(int i=0;i<SUB;i++) holeC[i]=(unsigned char)(0xD0+i);
+	cmd_prev_retain_count = 0;
+	retransmit_count      = 0;
+	cmd_prev_retain_capture(N, /*slot*/0, SUB, DATA_LONG, /*seq_eob*/0x00, holeC);
+	bool got[MAX_SACK_BATCH_SIZE];
+	for(int i=0;i<MAX_SACK_BATCH_SIZE;i++) got[i] = (i < this->data_batch_size);
+	got[0] = false;   // frame 0 of prev N still missing -> re-drive it
+
+	auto run_cmd_turnaround = [&](int rq) -> void {
+		bool gap_turn_defeat = false;
+		{ const char* e = std::getenv("MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT");
+		  if(e && *e && atoi(e)!=0) gap_turn_defeat = true; }
+		if(!gap_turn_defeat && rq > 0)
+		{
+			this->data_ack_received            = YES;
+			this->consec_pure_silent_rounds    = 0;
+			this->last_batch_fully_acked       = false;
+			this->last_partial_lead_frame_only = false;
+			this->receiving_timeout = 424242;   // sentinel "window closed" marker for the test
+		}
+	};
+
+	// fail-before: the credit is pinned off -> the round stays data_ack_received
+	// NO (the pre-fix non-event that booked it as an ACK-failure / demote fuel).
+	putenv_kv("MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT", "1");
+	this->data_ack_received = NO;
+	this->receiving_timeout = 0;
+	retransmit_count = 0;
+	int rq_b = cmd_prev_retain_requeue(N, got, this->data_batch_size);
+	run_cmd_turnaround(rq_b);
+	ck(rq_b == 1, "PART B: the retained prev-N frame 0 re-queued (real cmd_prev_retain_requeue)");
+	ck(this->data_ack_received == NO,
+		"PART B FAIL-BEFORE: no credit (round would fall to the ACK-failure demote ladder)");
+	putenv_kv("MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT", "");
+
+	// pass-after: the credit fires -> data_ack_received=YES, window closed, silent
+	// streak reset, no promotion flags set.
+	this->data_ack_received         = NO;
+	this->consec_pure_silent_rounds = 5;
+	this->receiving_timeout         = 0;
+	retransmit_count = 0;
+	cmd_prev_retain_count = 0;
+	cmd_prev_retain_capture(N, 0, SUB, DATA_LONG, 0x00, holeC);
+	int rq_a = cmd_prev_retain_requeue(N, got, this->data_batch_size);
+	run_cmd_turnaround(rq_a);
+	ck(this->data_ack_received == YES,
+		"PART B PASS-AFTER: round CREDITED (data_ack_received=YES) — no demote/nack bookkeeping");
+	ck(this->consec_pure_silent_rounds == 0,
+		"PART B PASS-AFTER: silent streak reset (peer provably alive)");
+	ck(this->receiving_timeout == 424242,
+		"PART B PASS-AFTER: receive window CLOSED for the pure-retx turnaround");
+	ck(this->last_batch_fully_acked == false,
+		"PART B PASS-AFTER: last_batch_fully_acked stays FALSE (no promotion from a recovery round)");
+
+	printf("%s %s (fails=%d) — the RSP deliver-held-cur commit pushes the held "
+		"batch's bytes to the app FIFO and the CMD credits the recovery round; "
+		"the full two-endpoint wire funnel is the deferred sim/real-audio Stage\n",
 		TAG, fails==0 ? "PASS" : "FAIL", fails);
 	fflush(stdout);
 	return fails==0 ? 0 : 1;

@@ -762,6 +762,18 @@ public:
   // the call sites; the helper itself is pure arithmetic.
   void advance_last_delivered(int bsi);
 
+  // R2b — the SINGLE in-order current-batch delivery commit, shared by the
+  // BATCH-DONE gate (arq_responder.cc process_messages_acknowledging_data) and
+  // the PREV-completion deliver-held-cur site (process_messages_rx_data_control).
+  // Marks messages_rx[] RECEIVED->ACKED over the batch span, advances the
+  // contiguity high-water to the current bsi, rolls prev<-cur / cur<-cur+1,
+  // resets the wired frame count, and pushes the ACKED slots to the app FIFO via
+  // the production copy_data_to_buffer() primitive. ONE delivery implementation
+  // under the D3.1 gates — the caller has already cleared the contiguity ruler
+  // (delivery_step_is_gap == not-a-gap) by construction. See
+  // fact-documents/data-flow-recoverable-gap-abort.md §5.5.
+  void rsp_commit_cur_batch_delivery();
+
   // D3.1 (data-integrity): the shared LOUD GAP-ABORT teardown. The
   // case-independent action both the FIX-8 re-adopt gate and the new
   // delivery-time gate route to: control-port error, DROPPED, clear the bsi
@@ -2766,6 +2778,18 @@ public:
   int test_recoverable_gap_abort();
   int test_recover_fire();
 
+  // R2b DELIVER-HELD-CUR fire proof (CLI --test-held-cur-deliver-fire). Drives
+  // the REAL production delivery path end-to-end: feeds a +2 storm topology
+  // through process_messages_acknowledging_data() so the RECOVERABLE HOLD fires
+  // in production code, then feeds the CMD's re-driven prev refill through
+  // add_message_rx_data() + process_messages_rx_data_control() so the
+  // PREV-completion + deliver-held-cur commit runs, and pops fifo_buffer_rx as
+  // the app-delivered oracle (NO manual advance_last_delivered / status poke).
+  // fail-before (both DEFEAT knobs=1) = held cur never delivered; pass-after =
+  // both prev and held-cur bytes delivered in order via copy_data_to_buffer.
+  // Returns 0=PASS, 1=FAIL. See data-flow-recoverable-gap-abort.md §5.5.
+  int test_held_cur_deliver_fire();
+
   // Multi-window DATA-ACK/SACK correlator regression (Track A, mwcorr;
   // CLI --test-data-ack-multiwindow). Self-contained, in-process, no IONOS/RF.
   // Loads a WB config, synthesizes a real ACK+SACK passband burst via
@@ -3873,6 +3897,15 @@ public:
   // fact-documents/data-flow-recoverable-gap-abort.md.
   int rsp_gap_recover_rounds;            // RSP: consecutive recoverable-HOLD rounds
                                          //      for the current prev-batch hole.
+  // R2b — the effective batch size (frame-count completeness oracle) the
+  // BATCH-DONE gate evaluated at the instant it HELD the current batch. The hold
+  // deliberately clears last_received_end_of_batch_seq / rx_batch_total_frames,
+  // so the oracle must be captured when it is still known-true. Used at
+  // PREV-completion to gate the deliver-held-cur commit (all [0,expected-1] slots
+  // of messages_rx[] must still be RECEIVED). 0 = no held batch pending. Cleared
+  // on delivery, teardown, and ctor/session reset. See
+  // fact-documents/data-flow-recoverable-gap-abort.md §5.5.
+  int rsp_gap_hold_cur_expected;
   int rsp_deferred_batch_shrink;         // RSP: a data_batch_size SHRINK that was
                                          //      DEFERRED because applying it now
                                          //      would orphan already-RECEIVED

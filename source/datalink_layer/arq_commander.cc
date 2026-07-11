@@ -4515,6 +4515,39 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									policy_evaluate_axis3(true);
 									mfsk_handled_this_poll = true;
 									w1_shadow_consumed = true;
+									// R2b — RECOVERY TURNAROUND (data-flow-recoverable-gap-abort.md 5.5). A
+									// shadow-retained partial re-SACK with rq>0 is a CREDITED retransmit REQUEST,
+									// not a block failure: the peer is provably alive AND re-requesting the exact
+									// retained bytes. Give it the SAME turnaround the normal SACK path takes
+									// (mirror :5022-5023 + :5093-5095) -- credit the round + reset the silent
+									// streak so the ACK-FAILURE bookkeeping (emergency_nack_count /
+									// cfg16_revack_starve_fails / the FIX-9-D3 demote / the clear_retx_queue flush
+									// of the refill) NEVER runs, and CLOSE the receive window so the end-of-round
+									// transition (:6693) sends the requeued refill as a 1-frame pure-retx batch in
+									// one guard interval instead of burning the full receiving_timeout as dead
+									// air. rq==0 (shadow evicted) -> consume only, no credit: the bounded hold
+									// exhausts into today's safe terminal abort. last_batch_fully_acked /
+									// last_partial_lead_frame_only are FORCED false so a credited recovery round is
+									// never mistaken for a promotable / climb-forward batch (5.5 consumer audit).
+									// MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT=1 restores the pre-fix turnaround-less
+									// non-event (the fail-before arm).
+									bool gap_turn_defeat = false;
+									{ const char* e = std::getenv("MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT");
+									  if(e && *e && atoi(e)!=0) gap_turn_defeat = true; }
+									if(!gap_turn_defeat && rq > 0)
+									{
+										data_ack_received            = YES;
+										consec_pure_silent_rounds    = 0;
+										last_batch_fully_acked       = false;
+										last_partial_lead_frame_only = false;
+										receiving_timeout = (int)receiving_timer.get_elapsed_time_ms()
+										                  + ptt_off_delay_ms + 400;
+										printf("[CMD-GAP-RECOVERY-TURNAROUND] rq=%d elapsed=%d receiving_timeout=%d "
+											"-- credited retransmit request; window closed for pure-retx turnaround "
+											"(no demote/nack bookkeeping)\n",
+											rq, (int)receiving_timer.get_elapsed_time_ms(), receiving_timeout);
+										fflush(stdout);
+									}
 								}
 							}
 							bool per_batch_in_window =
@@ -4791,6 +4824,39 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							policy_evaluate_axis3(true);   // a valid reverse SACK decoded
 							decoded = false;               // skip the by-slot apply (would false-ACK cmd_bsi)
 							prev_retain_consumed = true;
+							// R2b — RECOVERY TURNAROUND (data-flow-recoverable-gap-abort.md 5.5). A
+							// shadow-retained partial re-SACK with rq>0 is a CREDITED retransmit REQUEST,
+							// not a block failure: the peer is provably alive AND re-requesting the exact
+							// retained bytes. Give it the SAME turnaround the normal SACK path takes
+							// (mirror :5022-5023 + :5093-5095) -- credit the round + reset the silent
+							// streak so the ACK-FAILURE bookkeeping (emergency_nack_count /
+							// cfg16_revack_starve_fails / the FIX-9-D3 demote / the clear_retx_queue flush
+							// of the refill) NEVER runs, and CLOSE the receive window so the end-of-round
+							// transition (:6693) sends the requeued refill as a 1-frame pure-retx batch in
+							// one guard interval instead of burning the full receiving_timeout as dead
+							// air. rq==0 (shadow evicted) -> consume only, no credit: the bounded hold
+							// exhausts into today's safe terminal abort. last_batch_fully_acked /
+							// last_partial_lead_frame_only are FORCED false so a credited recovery round is
+							// never mistaken for a promotable / climb-forward batch (5.5 consumer audit).
+							// MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT=1 restores the pre-fix turnaround-less
+							// non-event (the fail-before arm).
+							bool gap_turn_defeat = false;
+							{ const char* e = std::getenv("MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT");
+							  if(e && *e && atoi(e)!=0) gap_turn_defeat = true; }
+							if(!gap_turn_defeat && rq > 0)
+							{
+								data_ack_received            = YES;
+								consec_pure_silent_rounds    = 0;
+								last_batch_fully_acked       = false;
+								last_partial_lead_frame_only = false;
+								receiving_timeout = (int)receiving_timer.get_elapsed_time_ms()
+								                  + ptt_off_delay_ms + 400;
+								printf("[CMD-GAP-RECOVERY-TURNAROUND] rq=%d elapsed=%d receiving_timeout=%d "
+									"-- credited retransmit request; window closed for pure-retx turnaround "
+									"(no demote/nack bookkeeping)\n",
+									rq, (int)receiving_timer.get_elapsed_time_ms(), receiving_timeout);
+								fflush(stdout);
+							}
 						}
 						// R039 (race audit 2026-06-06): bsi-in-window guard.
 						// decode_sack_v2_frame() is CRC8-only and never validates
