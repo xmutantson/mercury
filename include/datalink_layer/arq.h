@@ -599,6 +599,10 @@ public:
   // R1 turnaround-clearance guard consumer (called at send_batch() top before keying)
   // and its in-process regression driver (--test-turnaround-guard; also runs in --test).
   void turnaround_clearance_wait();
+  // R1-rescope arming (producer, CMD-side): stamp the clearance timer + mark the next data
+  // batch as post-control-turnaround. Called at a control-ACK -> data transition when the
+  // ACKed op renegotiated the link geometry (batch size / config).
+  void arm_control_turnaround_guard();
   int  test_turnaround_guard();
   // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
   // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
@@ -2196,6 +2200,8 @@ public:
   // SET_LINK_PARAMS TX path on a single one-shot fire. direction: 1=up,
   // 2=down. No-op for any other value. Default builds never call this.
   void test_fire_policy_axis2(int direction);
+  // R4 LINK-PARAMS quiesce-gate regression (--test-axis2-quiesce-gate; also in --test).
+  int  test_axis2_quiesce_gate();
 
   // SACK Design A Step 10 — Axis-2 cooldown helper. Decrement the cooldown
   // counter by one (clamped at 0) and return the post-decrement value. Used
@@ -3782,6 +3788,14 @@ public:
   // without an explicit recovery interval. The ceiling RESETS on any
   // Axis-1 move (channel changed, prior ceiling stale).
   static const int AXIS2_CEILING_RECOVERY_BATCHES = 20;
+  // R4 (LINK-PARAMS quiesce gate): defer an Axis-2 move whose batch boundary is UNCLEAN
+  // (retransmit_count > 0 || !last_batch_fully_acked) so a renegotiation is not queued
+  // mid-transfer — which would mix old-bsi retransmits into the first, riskiest batch of
+  // the new geometry (RFC 1191/8201: new params apply to fresh data; AX.25 v2.2 XID
+  // renegotiates only outside active recovery). Bounded so a sustained-loss link that never
+  // reaches a clean boundary cannot stall the move forever: after this many consecutive
+  // deferrals the move is FORCED (and logged).
+  static const int AXIS2_MAX_MOVE_DEFER = 3;
 
   float axis2_partial_rate_ring[AXIS2_RING_DEPTH];
   int   axis2_partial_rate_count;        // [0..AXIS2_RING_DEPTH]; pre-fill before mean
@@ -3803,6 +3817,10 @@ public:
   long long axis2_move_up_count;         // count of step-up moves
   long long axis2_move_down_count;       // count of step-down moves
   long long axis2_skipped_in_cooldown;   // count of evaluations skipped due to cooldown
+  // R4 quiesce gate: consecutive deferrals of a pending Axis-2 move because the batch
+  // boundary was unclean (retx pending / last batch not fully ACKed). Reset to 0 when a
+  // move fires (clean or forced) or when no move is pending. Bounded by AXIS2_MAX_MOVE_DEFER.
+  int   axis2_deferred_moves;
   // Test-scaffold for synthetic Axis-2 fire (CLI --test-policy-axis2-fire=up|down).
   // 0 = off; 1 = up; 2 = down. One-shot — cleared after firing.
   int   test_policy_axis2_fire_armed;
@@ -5102,13 +5120,25 @@ public:
   int ptt_on_delay_ms;
   int ptt_off_delay_ms;
   // Turnaround-clearance guard (cross-layer data-flow audit: TX-start vs the peer's
-  // TX->RX mute/flush window). receive() stamps turnaround_clearance_timer whenever a
-  // reverse reception completes (any decoded frame handed to the ARQ layer, incl. the
-  // ACK/SACK reply); send_batch() consults it at the top and, if too little time has
-  // elapsed since the peer's audio ended, busy-waits the remainder BEFORE keying so the
-  // first data frame never lands inside the peer's capture-flush/demod re-arm window.
+  // TX->RX mute/flush window). send_batch() consults turnaround_clearance_timer at the top
+  // and, if too little time has elapsed since the peer's audio ended, busy-waits the
+  // remainder BEFORE keying so the first data frame never lands inside the peer's
+  // capture-flush/demod re-arm window.
+  // R1-rescope: the WAIT fires ONLY before a data batch that follows a CONTROL turnaround
+  // (a control-ACK preceding a renegotiated / new-geometry data batch — SET_LINK_PARAMS /
+  // ROBUST_DWELL_BATCH_OP batch-size change, SET_CONFIG config change), armed by
+  // arm_control_turnaround_guard(). A routine data-SACK turnaround leaves
+  // turnaround_clearance_from_control==false and is BYTE-IDENTICAL (no wait): those
+  // turnarounds already deliver slot 0 cleanly, so the original arm-on-every-reception R1
+  // only taxed throughput and risked the RSP's post-SACK reverse window. receive() still
+  // stamps the timer on every decoded reverse frame (routine arm) so the
+  // MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 A/B arm can restore the broad behaviour.
   cl_timer turnaround_clearance_timer;
   bool     turnaround_clearance_armed = false;
+  // R1-rescope discriminant: set true ONLY at a CONTROL-ACK -> data transition
+  // (arm_control_turnaround_guard); a routine reverse reception leaves it false. Consumed
+  // one-shot by turnaround_clearance_wait() when it keys the guarded batch.
+  bool     turnaround_clearance_from_control = false;
   // Test-visible instrumentation for --test-turnaround-guard (set by
   // turnaround_clearance_wait): the ms the guard busy-waited this call (-1 = guard not
   // entered, i.e. never armed), and the clearance elapsed captured at the key point.

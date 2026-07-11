@@ -7433,6 +7433,10 @@ void cl_arq_controller::process_control_commander()
 				printf("[CMD-LINK-PARAMS-ACKED] SET_LINK_PARAMS round-trip complete "
 					"(local batch=%d) — resuming data TX\n", data_batch_size);
 				fflush(stdout);
+				// R1-rescope: this is THE control turnaround the guard is for — a new-
+				// geometry (renegotiated batch-size) data batch about to key inside the
+				// peer's TX->RX mute/flush window. Arm the post-control-turnaround wait.
+				arm_control_turnaround_guard();
 				this->connection_status=TRANSMITTING_DATA;
 			}
 			else if (messages_control.data[0]==ROBUST_DWELL_BATCH_OP)
@@ -7458,6 +7462,9 @@ void cl_arq_controller::process_control_commander()
 				printf("[CMD-ROBUST-DWELL-ACKED] ROBUST_DWELL_BATCH_OP round-trip "
 					"complete (local batch=%d) — resuming data TX\n", data_batch_size);
 				fflush(stdout);
+				// R1-rescope: same new-geometry (renegotiated batch-size) control
+				// turnaround as SET_LINK_PARAMS — arm the post-control-turnaround wait.
+				arm_control_turnaround_guard();
 				this->connection_status=TRANSMITTING_DATA;
 				watchdog_timer.start();
 				link_timer.start();
@@ -7577,6 +7584,14 @@ void cl_arq_controller::process_control_commander()
 					messages_control_restore();
 					printf("[GEARSHIFT] SET_CONFIG ACKed, loaded config %d\n", data_configuration);
 					fflush(stdout);
+					// R1-rescope: a SET_CONFIG that CHANGED the geometry is a control
+					// turnaround preceding a new-geometry data batch — arm the post-control-
+					// turnaround wait so the first frame does not key inside the peer's
+					// mute/PHY-reinit window (belt-and-suspenders with phy_reinit_settle_us,
+					// and covers configs where that settle is 0). Consumed one-shot by the
+					// next data keying; a downstream TRANSMITTING_CONTROL probe just defers it
+					// to the eventual data batch.
+					arm_control_turnaround_guard();
 					// CFG16 CONTROL-ACK HOLD (cfg16-controlack-hold): mark the moment the
 					// climb SET_CONFIG to the big-block rung is CONFIRMED (RSP ACKed on the
 					// old PHY, both peers now loaded CFG16). After this the CMD must HOLD
@@ -8801,6 +8816,49 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 
 	if(want_up || want_down)
 	{
+		// R4 — LINK-PARAMS quiesce gate (cross-layer data-flow audit: Axis-2 vs the retx
+		// queue / partial last batch). Renegotiating batch size mid-transfer applies the new
+		// geometry to the FIRST batch of the new size while old-bsi retransmits are still in
+		// flight, mixing them into the riskiest (post-turnaround) batch of the new geometry.
+		// Standard contract: parameter changes apply to FRESH data only (RFC 1191/8201 PMTUD;
+		// AX.25 v2.2 XID renegotiates only outside active recovery; TCP never re-frames
+		// in-flight segments after an MSS change). So defer the move until the boundary is
+		// CLEAN — no retransmits pending AND the last batch fully ACKed — re-evaluating on the
+		// next batch (the ring/counters are retained by the early return, so a still-valid
+		// move re-triggers). BOUNDED: a sustained-loss link that never reaches a clean
+		// boundary forces the move after AXIS2_MAX_MOVE_DEFER deferrals so it cannot stall.
+		{
+			// MERCURY_AXIS2_QUIESCE_DEFEAT=1 bypasses the gate (the A/B / fail-before arm;
+			// same house pattern as MERCURY_GAP_ABORT_DEFEAT — read on this production path
+			// => LIVE). Ships default-ON (gate active). With the gate defeated a move fires
+			// even with retx pending, reproducing the pre-R4 mixed old-bsi / new-size batch.
+			bool quiesce_defeat = false;
+			{ const char* e = std::getenv("MERCURY_AXIS2_QUIESCE_DEFEAT"); if(e && e[0]=='1') quiesce_defeat = true; }
+			bool clean_boundary = (retransmit_count == 0) && last_batch_fully_acked;
+			if(!quiesce_defeat && !clean_boundary)
+			{
+				if(axis2_deferred_moves < AXIS2_MAX_MOVE_DEFER)
+				{
+					axis2_deferred_moves++;
+					printf("[POLICY-AXIS2-DEFER] want_%s move but boundary UNCLEAN "
+						"(retransmit_count=%d last_batch_fully_acked=%d) — deferring %d/%d, "
+						"re-evaluate next batch (ring retained)\n",
+						want_up ? "up" : "down", retransmit_count,
+						(int)last_batch_fully_acked, axis2_deferred_moves,
+						AXIS2_MAX_MOVE_DEFER);
+					fflush(stdout);
+					return;   // ring + hysteresis counters retained; move re-triggers
+				}
+				printf("[POLICY-AXIS2-DEFER] defer budget exhausted (%d/%d) — FORCING want_%s "
+					"move despite unclean boundary (retransmit_count=%d "
+					"last_batch_fully_acked=%d)\n",
+					axis2_deferred_moves, AXIS2_MAX_MOVE_DEFER, want_up ? "up" : "down",
+					retransmit_count, (int)last_batch_fully_acked);
+				fflush(stdout);
+			}
+			axis2_deferred_moves = 0;   // move proceeds (clean boundary, forced, or defeated)
+		}
+
 		int from = data_batch_size;
 		int to = want_up ? (from + AXIS2_STEP) : (from - AXIS2_STEP);
 		const char* reason = want_up ? "ring_clean" : "ring_lossy";
@@ -8895,6 +8953,9 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	}
 	else
 	{
+		// R4: no move is pending this evaluation — clear any stale deferral count so a
+		// LATER move starts its defer budget fresh.
+		axis2_deferred_moves = 0;
 		printf("[POLICY-AXIS2] eval rx=%d/%d partial=%.3f mean=%.3f "
 			"good=%d/%d bad=%d/%d batch=%d (no move)\n",
 			rx_count, batch_size_observed, partial_rate, mean_partial,
@@ -9070,6 +9131,107 @@ void cl_arq_controller::test_fire_policy_axis2(int direction)
 			direction);
 		fflush(stdout);
 	}
+}
+
+// R4 — LINK-PARAMS quiesce-gate regression (--test-axis2-quiesce-gate; also runs in --test).
+// In-process, no telecom_system. Primes a DOWN move (ring lossy, bad-run one short) then drives
+// policy_evaluate_axis2() across batch boundaries + the defeat knob:
+//   Arm A (fail-before, MERCURY_AXIS2_QUIESCE_DEFEAT=1, retx pending): move FIRES despite retx —
+//          the pre-R4 mixed old-bsi / new-size batch the gate is meant to prevent.
+//   Arm B (pass-after, default, retx pending): move DEFERRED — batch unchanged, no wire op.
+//   Arm C (default, CLEAN boundary): move FIRES — proves the gate is selective, not a block.
+//   Arm D (default, retx stays pending): DEFERS AXIS2_MAX_MOVE_DEFER times then FORCES the move —
+//          proves the bound so a sustained-loss link cannot stall the move forever.
+// 0=PASS, 1=FAIL. Default builds never enter this.
+int cl_arq_controller::test_axis2_quiesce_gate()
+{
+	printf("[TEST-AXIS2-QUIESCE] start\n");
+	fflush(stdout);
+	int fails = 0;
+	const int START = 25;   // in [AXIS2_BATCH_FLOOR,AXIS2_BATCH_CEIL]; down-step to 20 is valid
+
+	// Prime a DOWN move: OFDM (non-robust) config so policy_evaluate_axis2 runs; ring lossy,
+	// bad-run one short of the threshold so ONE evaluate call wants a down move. Caller sets
+	// the boundary state (retransmit_count / last_batch_fully_acked) + knob per arm.
+	auto prime_down = [&]() {
+		sack_v2_enabled = true;
+		current_configuration = CONFIG_0;   // OFDM, non-robust, not the CFG16 bigblock rung
+		telecom_system = NULL;              // synthetic — bigblock guard is NULL-skipped
+		for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.4f;
+		axis2_partial_rate_count       = AXIS2_RING_DEPTH;
+		axis2_partial_rate_pos         = 0;
+		axis2_consecutive_good_batches = 0;
+		axis2_consecutive_bad_batches  = AXIS2_DOWN_BAD_RUN - 1;  // one more bad -> want_down
+		axis2_cooldown_batches         = 0;
+		batch_size_proven_ceiling      = -1;
+		batch_size_ceiling_recovery_batches = 0;
+		axis2_deferred_moves           = 0;
+		axis2_move_down_count          = 0;
+		axis2_move_up_count            = 0;
+		messages_control.status        = FREE;
+		data_batch_size                = START;
+	};
+	const int synth_rx = (int)(START * 0.6f);   // partial_rate = 0.4 (a "bad" observation)
+
+	// Arm A — FAIL-BEFORE via the defeat knob: retx pending, gate defeated => move FIRES
+	// (data_batch_size moves off START while retx is queued = the mixed-batch hazard).
+	prime_down();
+	setenv("MERCURY_AXIS2_QUIESCE_DEFEAT", "1", 1);
+	retransmit_count        = 5;      // old-bsi frames still queued (unclean)
+	last_batch_fully_acked  = false;
+	policy_evaluate_axis2(synth_rx, START);
+	printf("[TEST-AXIS2-QUIESCE] Arm A (defeat=1, retx=5): move_down=%lld batch=%d deferred=%d "
+		"(want move_down==1, batch!=%d)\n",
+		axis2_move_down_count, data_batch_size, axis2_deferred_moves, START);
+	if(!(axis2_move_down_count == 1 && data_batch_size != START)) { printf("[TEST-AXIS2-QUIESCE] Arm A FAIL\n"); fails++; }
+	unsetenv("MERCURY_AXIS2_QUIESCE_DEFEAT");
+
+	// Arm B — PASS-AFTER (default, retx pending): move DEFERRED, batch UNCHANGED, no move.
+	prime_down();
+	retransmit_count        = 5;
+	last_batch_fully_acked  = false;
+	policy_evaluate_axis2(synth_rx, START);
+	printf("[TEST-AXIS2-QUIESCE] Arm B (default, retx=5): move_down=%lld batch=%d deferred=%d "
+		"(want move_down==0, batch==%d, deferred==1)\n",
+		axis2_move_down_count, data_batch_size, axis2_deferred_moves, START);
+	if(!(axis2_move_down_count == 0 && data_batch_size == START && axis2_deferred_moves == 1)) { printf("[TEST-AXIS2-QUIESCE] Arm B FAIL\n"); fails++; }
+
+	// Arm C — default, CLEAN boundary (no retx, last batch fully acked): move FIRES.
+	prime_down();
+	retransmit_count        = 0;
+	last_batch_fully_acked  = true;
+	policy_evaluate_axis2(synth_rx, START);
+	printf("[TEST-AXIS2-QUIESCE] Arm C (default, clean): move_down=%lld batch=%d deferred=%d "
+		"(want move_down==1, batch!=%d, deferred==0)\n",
+		axis2_move_down_count, data_batch_size, axis2_deferred_moves, START);
+	if(!(axis2_move_down_count == 1 && data_batch_size != START && axis2_deferred_moves == 0)) { printf("[TEST-AXIS2-QUIESCE] Arm C FAIL\n"); fails++; }
+
+	// Arm D — default, retx stays pending: defer AXIS2_MAX_MOVE_DEFER times, then FORCE.
+	prime_down();
+	retransmit_count        = 5;
+	last_batch_fully_acked  = false;
+	for(int c = 1; c <= AXIS2_MAX_MOVE_DEFER; c++)
+	{
+		policy_evaluate_axis2(synth_rx, START);   // want_down persists (ring stays lossy)
+		if(!(axis2_move_down_count == 0 && data_batch_size == START && axis2_deferred_moves == c))
+		{
+			printf("[TEST-AXIS2-QUIESCE] Arm D defer %d/%d UNEXPECTED: move_down=%lld batch=%d deferred=%d\n",
+				c, AXIS2_MAX_MOVE_DEFER, axis2_move_down_count, data_batch_size, axis2_deferred_moves);
+			fails++;
+		}
+	}
+	// One more evaluation: budget exhausted => the move is FORCED despite the unclean boundary.
+	policy_evaluate_axis2(synth_rx, START);
+	printf("[TEST-AXIS2-QUIESCE] Arm D (after %d defers): move_down=%lld batch=%d deferred=%d "
+		"(want move_down==1, batch!=%d, deferred==0)\n",
+		AXIS2_MAX_MOVE_DEFER, axis2_move_down_count, data_batch_size, axis2_deferred_moves, START);
+	if(!(axis2_move_down_count == 1 && data_batch_size != START && axis2_deferred_moves == 0)) { printf("[TEST-AXIS2-QUIESCE] Arm D FAIL\n"); fails++; }
+
+	unsetenv("MERCURY_AXIS2_QUIESCE_DEFEAT");
+	bool pass = (fails == 0);
+	printf("[TEST-AXIS2-QUIESCE] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
 }
 
 // SACK Design A Step 12 — synthetic Axis-2 proven-ceiling fire (test-only).

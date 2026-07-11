@@ -769,6 +769,7 @@ cl_arq_controller::cl_arq_controller()
 	axis2_move_up_count=0;
 	axis2_move_down_count=0;
 	axis2_skipped_in_cooldown=0;
+	axis2_deferred_moves=0;   // R4 quiesce gate: no pending deferred Axis-2 move
 	test_policy_axis2_fire_armed=0;
 	test_cmd_axis2_suppressed_after_axis1=0;
 	rsp_set_link_params_rx_count=0;
@@ -1010,6 +1011,7 @@ cl_arq_controller::cl_arq_controller()
 	// turnaround-clearance guard is only ARMED after a reverse reception (mid-session),
 	// by which point the real delays are in place — so the guard never reads these zeros.
 	turnaround_clearance_armed=false;   // fresh session never inherits a stale armed stamp
+	turnaround_clearance_from_control=false;  // R1-rescope: no post-control-turnaround pending
 	time_left_to_send_last_frame=0;
 
 	last_message_sent_type=NONE;
@@ -8895,17 +8897,35 @@ void cl_arq_controller::send(st_message* message, int message_location)
 
 }
 
+// R1-rescope arming (producer, CMD-side). Called at a control-ACK -> data transition when
+// the ACKed control op renegotiated the link geometry (SET_LINK_PARAMS / ROBUST_DWELL_BATCH_OP
+// batch-size change, SET_CONFIG config change). Stamps the clearance timer FRESH — the control
+// ACK is a short-tone pattern in an OFDM session, so it never reaches the receive() LDPC stamp;
+// without a fresh stamp here elapsed would still read from the last SACK_RSP (seconds ago) and
+// the guard would add 0 — and marks the NEXT data batch as post-control-turnaround so
+// turnaround_clearance_wait() waits the peer's mute/flush window out before keying it.
+void cl_arq_controller::arm_control_turnaround_guard()
+{
+	turnaround_clearance_timer.start();
+	turnaround_clearance_armed        = true;
+	turnaround_clearance_from_control = true;
+}
+
 // R1 turnaround-clearance guard (consumer). Called at the top of send_batch() before
-// rx_mute/ptt_on. If a reverse reception has been stamped (armed) and too little time has
-// elapsed since it, busy-wait the remainder so the first data frame never keys inside the
-// peer's TX->RX mute/flush + demod re-arm window.
+// rx_mute/ptt_on. If the batch about to be keyed follows a CONTROL turnaround (armed by
+// arm_control_turnaround_guard) and too little time has elapsed since the peer's audio ended,
+// busy-wait the remainder so the first data frame never keys inside the peer's TX->RX
+// mute/flush + demod re-arm window.
 //   guard_ms = ptt_off_delay_ms (proxy for the peer's PTT tail; both sides share config)
 //            + margin (capture-flush + demod re-arm settle, default 150)
 //            - ptt_on_delay_ms (our own spin-up already covers this much of the wait)
 // Clamped to [0, 2000]. Env: MERCURY_TURNAROUND_GUARD_MARGIN_MS overrides the margin;
 // MERCURY_TURNAROUND_GUARD_DEFEAT=1 disables the wait (the A/B / fail-before arm; same
-// house pattern as MERCURY_GAP_ABORT_DEFEAT, read on this production path => LIVE). Ships
-// default-ON. Invariant: elapsed >= guard at call time => ZERO added wait => byte-identical.
+// house pattern as MERCURY_GAP_ABORT_DEFEAT, read on this production path => LIVE);
+// MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 restores the pre-rescope broad behaviour (wait before
+// EVERY armed turnaround, incl. routine data-SACK) for A/B — the rescope fail-before arm.
+// Ships default-ON. Invariants: (a) a ROUTINE data-SACK turnaround (from_control==false) adds
+// ZERO wait => byte-identical; (b) elapsed >= guard at call time => ZERO added wait.
 void cl_arq_controller::turnaround_clearance_wait()
 {
 	if(!turnaround_clearance_armed)
@@ -8913,6 +8933,19 @@ void cl_arq_controller::turnaround_clearance_wait()
 		// First TX after connect (never stamped) — nothing to clear.
 		tg_test_waited_ms         = -1;
 		tg_test_elapsed_at_key_ms = -1;
+		return;
+	}
+
+	bool scope_all = false;
+	{ const char* e = std::getenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL"); if(e && e[0]=='1') scope_all = true; }
+
+	if(!turnaround_clearance_from_control && !scope_all)
+	{
+		// R1-rescope: a routine data-SACK turnaround. These deliver slot 0 cleanly, so
+		// the guard does NOT wait — byte-identical to the unguarded modem. (Distinct from
+		// never-armed: report 0, not -1, so the regression can tell the two apart.)
+		tg_test_waited_ms         = 0;
+		tg_test_elapsed_at_key_ms = turnaround_clearance_timer.get_elapsed_time_ms();
 		return;
 	}
 
@@ -8944,6 +8977,10 @@ void cl_arq_controller::turnaround_clearance_wait()
 	}
 	tg_test_waited_ms         = applied;
 	tg_test_elapsed_at_key_ms = turnaround_clearance_timer.get_elapsed_time_ms();
+	// R1-rescope one-shot: the post-control-turnaround arm is consumed by this keying. The
+	// next batch is routine again unless another control turnaround re-arms it. (Under
+	// SCOPE_ALL the routine path was taken above, so this only clears the control arm.)
+	turnaround_clearance_from_control = false;
 }
 
 // In-process regression for the turnaround-clearance guard (--test-turnaround-guard; also
@@ -8960,44 +8997,69 @@ int cl_arq_controller::test_turnaround_guard()
 	this->ptt_on_delay_ms  = 100;
 	this->ptt_off_delay_ms = 200;
 	unsetenv("MERCURY_TURNAROUND_GUARD_MARGIN_MS");
+	unsetenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL");
 
-	// Arm A — fail-before via the defeat knob (reproduces the unguarded modem): stamp the
-	// clearance timer, then run the guard with the wait defeated. The key point is reached
-	// with < 50 ms elapsed (no wait applied).
+	// Arm A — fail-before via the defeat knob (reproduces the unguarded modem): arm the
+	// CONTROL turnaround, then run the guard with the wait defeated. The key point is
+	// reached with < 50 ms elapsed (no wait applied).
 	setenv("MERCURY_TURNAROUND_GUARD_DEFEAT", "1", 1);
-	this->turnaround_clearance_armed = true;
-	this->turnaround_clearance_timer.start();
+	this->arm_control_turnaround_guard();
 	this->turnaround_clearance_wait();
-	printf("[TEST-TURNGUARD] Arm A (defeat=1): waited=%lld elapsed_at_key=%lld (want elapsed<50)\n",
+	printf("[TEST-TURNGUARD] Arm A (control, defeat=1): waited=%lld elapsed_at_key=%lld (want elapsed<50)\n",
 		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
 	if(!(this->tg_test_waited_ms == 0 && this->tg_test_elapsed_at_key_ms < 50)) { printf("[TEST-TURNGUARD] Arm A FAIL\n"); fails++; }
 
-	// Arm B — the fix: defeat unset, stamp, run. The guard busy-waits so the key point is
-	// reached at >= 250 ms.
+	// Arm B — the fix: defeat unset, CONTROL-arm, run. The guard busy-waits so the key
+	// point is reached at >= 250 ms.
 	unsetenv("MERCURY_TURNAROUND_GUARD_DEFEAT");
-	this->turnaround_clearance_armed = true;
-	this->turnaround_clearance_timer.start();
+	this->arm_control_turnaround_guard();
 	this->turnaround_clearance_wait();
-	printf("[TEST-TURNGUARD] Arm B (default-on): waited=%lld elapsed_at_key=%lld (want both>=250)\n",
+	printf("[TEST-TURNGUARD] Arm B (control, default-on): waited=%lld elapsed_at_key=%lld (want both>=250)\n",
 		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
 	if(!(this->tg_test_waited_ms >= 250 && this->tg_test_elapsed_at_key_ms >= 250)) { printf("[TEST-TURNGUARD] Arm B FAIL\n"); fails++; }
 
-	// Arm C — invariant 1: enough real time has already elapsed since the stamp (300 ms),
-	// so the guard adds ~0.
-	this->turnaround_clearance_armed = true;
-	this->turnaround_clearance_timer.start();
+	// Arm C — invariant (b): enough real time has already elapsed since the control arm
+	// (300 ms), so the guard adds ~0.
+	this->arm_control_turnaround_guard();
 	{ cl_timer settle; settle.start(); while(settle.get_elapsed_time_ms() < 300) msleep(1); }
 	this->turnaround_clearance_wait();
-	printf("[TEST-TURNGUARD] Arm C (prior>=guard): waited=%lld elapsed_at_key=%lld (want waited==0)\n",
+	printf("[TEST-TURNGUARD] Arm C (control, prior>=guard): waited=%lld elapsed_at_key=%lld (want waited==0)\n",
 		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
 	if(!(this->tg_test_waited_ms == 0 && this->tg_test_elapsed_at_key_ms >= 250)) { printf("[TEST-TURNGUARD] Arm C FAIL\n"); fails++; }
 
-	// Arm D — invariant 2: never stamped (never armed) => no wait at all.
-	this->turnaround_clearance_armed = false;
+	// Arm D — never stamped (never armed) => no wait at all (report -1).
+	this->turnaround_clearance_armed        = false;
+	this->turnaround_clearance_from_control = false;
 	this->turnaround_clearance_wait();
 	printf("[TEST-TURNGUARD] Arm D (never armed): waited=%lld (want -1, no wait)\n",
 		this->tg_test_waited_ms);
 	if(this->tg_test_waited_ms != -1) { printf("[TEST-TURNGUARD] Arm D FAIL\n"); fails++; }
+
+	// Arm E — R1-RESCOPE PASS-AFTER: a ROUTINE data-SACK turnaround. The timer is armed
+	// (a reverse frame decoded, as receive() does) but from_control is FALSE, so the guard
+	// adds ZERO wait — byte-identical to the unguarded modem on the turnarounds that were
+	// never the problem. This is the whole point of the rescope.
+	this->turnaround_clearance_timer.start();       // routine arm (mirrors receive())
+	this->turnaround_clearance_armed        = true;
+	this->turnaround_clearance_from_control = false;
+	this->turnaround_clearance_wait();
+	printf("[TEST-TURNGUARD] Arm E (routine, scoped): waited=%lld (want 0, no wait)\n",
+		this->tg_test_waited_ms);
+	if(this->tg_test_waited_ms != 0) { printf("[TEST-TURNGUARD] Arm E FAIL\n"); fails++; }
+
+	// Arm F — R1-RESCOPE FAIL-BEFORE via the scope knob: the SAME routine arm as E, but
+	// MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 restores the pre-rescope broad behaviour, so the
+	// guard DOES wait >= 250 ms before a routine batch. Proves the scope discriminant is
+	// LIVE and is what suppresses the wait in E.
+	setenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL", "1", 1);
+	this->turnaround_clearance_timer.start();
+	this->turnaround_clearance_armed        = true;
+	this->turnaround_clearance_from_control = false;
+	this->turnaround_clearance_wait();
+	printf("[TEST-TURNGUARD] Arm F (routine, SCOPE_ALL=1): waited=%lld elapsed_at_key=%lld (want both>=250)\n",
+		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
+	if(!(this->tg_test_waited_ms >= 250 && this->tg_test_elapsed_at_key_ms >= 250)) { printf("[TEST-TURNGUARD] Arm F FAIL\n"); fails++; }
+	unsetenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL");
 
 	unsetenv("MERCURY_TURNAROUND_GUARD_DEFEAT");
 	bool pass = (fails == 0);
@@ -13136,13 +13198,19 @@ void cl_arq_controller::receive()
 
 		if (received_message_stats.message_decoded==YES)
 		{
-			// Turnaround-clearance stamp (producer): a reverse reception just COMPLETED
-			// — a peer frame was decoded and handed to the ARQ layer (DATA / CONTROL /
-			// ACK_* / SACK_RSP all reach this gate). Restart the clearance timer so the
-			// next send_batch() measures elapsed since the peer's audio ended. The decode
-			// completes AFTER the peer stops transmitting, so this stamp is conservatively
-			// LATE (elapsed under-reads → the guard only ever waits LONGER, never shorter).
-			// Self-echo cannot stamp here: rx_mute=1 for the whole of our own send_batch TX.
+			// Turnaround-clearance stamp (ROUTINE producer): a reverse reception just
+			// COMPLETED — a peer frame was decoded and handed to the ARQ layer (DATA /
+			// CONTROL / ACK_* / SACK_RSP all reach this gate). Restart the clearance timer
+			// so the next send_batch() measures elapsed since the peer's audio ended. The
+			// decode completes AFTER the peer stops transmitting, so this stamp is
+			// conservatively LATE. Self-echo cannot stamp here: rx_mute=1 for the whole of
+			// our own send_batch TX.
+			// R1-rescope: this arms the ROUTINE timer only (from_control is NOT set here);
+			// turnaround_clearance_wait() waits before a routine batch ONLY under the
+			// MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 A/B arm. The post-control-turnaround wait
+			// is armed separately, with its own fresh stamp, by arm_control_turnaround_guard()
+			// (a control ACK is a short-tone pattern in an OFDM session and never reaches
+			// this LDPC decode gate).
 			turnaround_clearance_timer.start();
 			turnaround_clearance_armed = true;
 			int rx_nsymb = telecom_system->get_active_nsymb();

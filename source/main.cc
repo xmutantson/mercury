@@ -1413,6 +1413,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_tg;
                 failed += ARQ_tg.test_turnaround_guard();
             }
+            // R4 LINK-PARAMS quiesce gate (arq_commander.cc): an Axis-2 batch-size
+            // renegotiation must not fire while the boundary is unclean (retx pending / last
+            // batch partial), which would mix old-bsi retransmits into the first batch of the
+            // new geometry. Drives the REAL policy_evaluate_axis2 across clean/unclean
+            // boundaries + the defeat knob; asserts DEFER while unclean, FIRE when clean,
+            // FORCE after the bound, and the pre-R4 mixed-batch move under the defeat knob.
+            {
+                cl_arq_controller ARQ_q2;
+                failed += ARQ_q2.test_axis2_quiesce_gate();
+            }
             {
                 cl_arq_controller ARQ_gab;
                 failed += ARQ_gab.test_gap_abort_readopt_blind();
@@ -2364,6 +2374,10 @@ int main(int argc, char *argv[])
                                         // stamp-then-key drives assert the guard waits out the peer's TX->RX
                                         // mute/flush window (default-on) and adds ~0 when already clear / never armed.
                                         // One-shot, exits rc.
+    bool test_axis2_quiesce_gate_cli = false; // --test-axis2-quiesce-gate: R4 LINK-PARAMS quiesce gate —
+                                        // an Axis-2 move DEFERS while the batch boundary is unclean (retx pending /
+                                        // last batch partial) and FIRES when clean; FORCED after AXIS2_MAX_MOVE_DEFER;
+                                        // fail-before via MERCURY_AXIS2_QUIESCE_DEFEAT=1 (mixed old-bsi batch). One-shot, exits rc.
     bool test_gap_abort_blind_cli = false; // --test-gap-abort-blind: GAP-ABORT ruler-blinding — the REAL
                                         // rsp_gap_abort_teardown() resets the contiguity ruler to -1, blinding its own
                                         // re-adopt gate, and the CMD (never told) re-drives the same stream -> silent
@@ -3199,6 +3213,14 @@ int main(int argc, char *argv[])
             // R1 turnaround-clearance guard regression — one-shot at startup, exit rc.
             // See source/datalink_layer/arq_common.cc test_turnaround_guard.
             test_turnaround_guard_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-axis2-quiesce-gate") == 0)
+        {
+            // R4 LINK-PARAMS quiesce-gate regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_commander.cc test_axis2_quiesce_gate.
+            test_axis2_quiesce_gate_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5169,6 +5191,18 @@ start_modem:
             cl_arq_controller ARQ_tg;
             int rc = ARQ_tg.test_turnaround_guard();
             printf("[FLAG] Turnaround-guard test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_axis2_quiesce_gate_cli) {
+            // R4 LINK-PARAMS quiesce gate — an Axis-2 move defers while the batch boundary
+            // is unclean and fires when clean (one-shot, exit rc).
+            printf("[FLAG] --test-axis2-quiesce-gate: invoking R4 LINK-PARAMS quiesce-gate "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_q2;
+            int rc = ARQ_q2.test_axis2_quiesce_gate();
+            printf("[FLAG] Axis-2 quiesce-gate test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

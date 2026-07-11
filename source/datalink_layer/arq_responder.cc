@@ -3804,14 +3804,20 @@ void cl_arq_controller::process_control_responder()
 			connection_status=ACKNOWLEDGING_DATA;
 		}
 	}
-	else if((link_status==CONNECTED || link_status==DROPPED) && code==SET_LINK_PARAMS)
+	else if(link_status==CONNECTED && code==SET_LINK_PARAMS)
 	{
 		// SACK Design A Step 10 — RSP-side SET_LINK_PARAMS handler.
-		// Note: link_status DROPPED accepted too because the lossy paths that
-		// motivate Axis-2 (channel just dropped batches → CMD is shrinking
-		// batch_size) often coincide with the RSP transiently reading the
-		// link as DROPPED. The CMD's intent is to push the new batch size
-		// regardless — accepting in DROPPED gives the link a faster recovery.
+		// R4 (LINK-PARAMS quiesce gate): DROPPED is NO LONGER accepted here. A dead link
+		// must not HALF-ABSORB new geometry: accepting SET_LINK_PARAMS while DROPPED let a
+		// zombie session adopt a new batch size instead of forcing reconnection, and the
+		// stated "faster recovery" rationale was the zombie's accomplice (a dropped responder
+		// that half-applies params keeps grinding rather than resetting). The CMD-side R4
+		// quiesce gate now only renegotiates at a CLEAN boundary — when the link is delivering
+		// and the RSP reads CONNECTED — so a DROPPED read at SET_LINK_PARAMS time means the
+		// link is genuinely down; ignoring the op (CMD times out + retransmits, exactly as if
+		// the OFDM control frame had been lost) is the correct, non-corrupting response.
+		//
+		// Wire format UNCHANGED — this only narrows the STATE in which the RSP applies the op.
 		//
 		// Wire format (§4.4): [code, batch_size_u8, sack_mode_u8, CRC8]
 		// CRC8 covers data[1..2] only (the standard 3-byte msg header has its
