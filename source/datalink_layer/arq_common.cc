@@ -1676,6 +1676,33 @@ void cl_arq_controller::calculate_receiving_timeout()
 				if(ack_timeout_data    < min_ack) set_ack_timeout_data(min_ack);
 			}
 		}
+		// R6 INVARIANT (I3): watchdog_timeout and gearshift_timeout are the heavy-
+		// session-recovery deadline and the spurious-demote deadline; both are set ONCE at
+		// config load as (nResends/3)*ack_timeout_data (the set-at-load site) and are NEVER
+		// recomputed on the per-batch recompute path that the post-TX arm sites take. When
+		// the measured window (receiving_timeout, above) grows on a warm high-variance
+		// turnaround bucket it can exceed that stale static watchdog_timeout, so the watchdog
+		// fires session recovery (and the gearshift a spurious demote) BEFORE the widened
+		// receive window can pay off — the exact pre-emption I2 closes for the ACK deadline,
+		// on a forgotten sibling timer. Re-floor both to cover the (possibly raised)
+		// receiving_timeout on every recompute, preserving the load-time
+		// (nResends/3)*ack_timeout_data multiple where it is already larger. Raise-only: it
+		// can never shorten a timeout, so no path fires sooner than before. See the cross-
+		// layer data-flow audit (fact-documents/data-flow-turnaround-timers.md §I3).
+		// MERCURY_WATCHDOG_FLOOR_DEFEAT=1 reproduces the pre-fix (skipped-floor) behaviour
+		// for the fail-before A/B arm.
+		{
+			bool wd_floor_defeat = false;
+			{ const char* ev = std::getenv("MERCURY_WATCHDOG_FLOOR_DEFEAT");
+			  if(ev && ev[0]=='1') wd_floor_defeat = true; }
+			if(!wd_floor_defeat)
+			{
+				int wd_gs_floor = (nResends/3) * ack_timeout_data;
+				if(wd_gs_floor < receiving_timeout) wd_gs_floor = receiving_timeout;
+				if(watchdog_timeout  < wd_gs_floor) watchdog_timeout  = wd_gs_floor;
+				if(gearshift_timeout < wd_gs_floor) gearshift_timeout = wd_gs_floor;
+			}
+		}
 	}
 	else
 	{
@@ -9457,10 +9484,34 @@ int cl_arq_controller::test_measured_timers()
 		this->ack_timeout_data, this->receiving_timeout);
 	if(!(this->ack_timeout_data >= this->receiving_timeout)) { printf("[TEST-MEASTIMERS] Arm G pass-after FAIL\n"); fails++; }
 
+	// Arm H (INVARIANT I3 fail-before/pass-after): the same warm long-batch window that
+	// exceeds a stale watchdog_timeout / gearshift_timeout (set ONCE at load, never per-
+	// batch). fail-before (MERCURY_WATCHDOG_FLOOR_DEFEAT=1) leaves both < receiving_timeout
+	// (the watchdog would pre-empt the widened receive window); pass-after (floor on) re-
+	// asserts watchdog_timeout >= receiving_timeout AND gearshift_timeout >= receiving_timeout.
+	// data_batch_size==28 is warm bucket 3 from Arm C/G, so receiving_timeout is large.
+	this->watchdog_timeout  = 1000;
+	this->gearshift_timeout = 1000;
+	setenv("MERCURY_WATCHDOG_FLOOR_DEFEAT", "1", 1);
+	this->calculate_receiving_timeout();
+	printf("[TEST-MEASTIMERS] Arm H fail-before: wd=%d gs=%d rx_to=%d (want wd<rx AND gs<rx, VIOLATED)\n",
+		this->watchdog_timeout, this->gearshift_timeout, this->receiving_timeout);
+	if(!(this->watchdog_timeout < this->receiving_timeout && this->gearshift_timeout < this->receiving_timeout))
+		{ printf("[TEST-MEASTIMERS] Arm H fail-before FAIL\n"); fails++; }
+	this->watchdog_timeout  = 1000;
+	this->gearshift_timeout = 1000;
+	unsetenv("MERCURY_WATCHDOG_FLOOR_DEFEAT");
+	this->calculate_receiving_timeout();
+	printf("[TEST-MEASTIMERS] Arm H pass-after: wd=%d gs=%d rx_to=%d (want wd>=rx AND gs>=rx, HOLDS)\n",
+		this->watchdog_timeout, this->gearshift_timeout, this->receiving_timeout);
+	if(!(this->watchdog_timeout >= this->receiving_timeout && this->gearshift_timeout >= this->receiving_timeout))
+		{ printf("[TEST-MEASTIMERS] Arm H pass-after FAIL\n"); fails++; }
+
 	unsetenv("MERCURY_MEASURED_TIMERS_DEFEAT");
 	unsetenv("MERCURY_MEASURED_TIMERS_K");
 	unsetenv("MERCURY_MEASURED_TIMERS_FLOOR_MS");
 	unsetenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT");
+	unsetenv("MERCURY_WATCHDOG_FLOOR_DEFEAT");
 	bool pass = (fails == 0);
 	printf("[TEST-MEASTIMERS] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
 	fflush(stdout);
