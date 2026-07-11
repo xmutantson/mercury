@@ -1473,6 +1473,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_grc;
                 failed += ARQ_grc.test_recoverable_gap_abort();
             }
+            // W1 — CMD refill decision fire proof (routes the storm re-SACK to the
+            // retention re-drive; fail-before via MERCURY_CMD_PREV_RETAIN_DEFEAT).
+            {
+                cl_arq_controller ARQ_rf;
+                failed += ARQ_rf.test_recover_fire();
+            }
             // chase-combining (HARQ Type-I soft-LLR combine) fail-before/pass-after:
             // proves a bit-identical retx's LLRs SUMMED before ldpc.decode() rescue a
             // frame one look cannot decode (combine success-rate 0 -> >0), and that
@@ -2427,6 +2433,7 @@ int main(int argc, char *argv[])
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
     bool test_gap_recover_cli = false;  // --test-gap-recover: RECOVERABLE delivery-time GAP-ABORT
+    bool test_recover_fire_cli = false; // --test-gap-recover-fire: W1 CMD refill fire proof
                                         // (R2a hold + R2c CMD retention). fail-before via
                                         // MERCURY_GAP_RECOVER_DEFEAT=1 (terminal abort, high-water frozen);
                                         // pass-after = HOLD + refill + in-order 6->7->8. One-shot, exits rc.
@@ -3319,6 +3326,15 @@ int main(int argc, char *argv[])
             // See source/datalink_layer/arq_responder.cc test_recoverable_gap_abort
             // + fact-documents/data-flow-recoverable-gap-abort.md.
             test_gap_recover_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-recover-fire") == 0)
+        {
+            // W1 — CMD refill fire proof for the recoverable HOLD (one-shot, exit rc).
+            // See source/datalink_layer/arq_responder.cc test_recover_fire
+            // + fact-documents/data-flow-recoverable-gap-abort.md 5.1.
+            test_recover_fire_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5334,6 +5350,18 @@ start_modem:
             cl_arq_controller ARQ_grc;
             int rc = ARQ_grc.test_recoverable_gap_abort();
             printf("[FLAG] Gap-recover test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_recover_fire_cli) {
+            // W1 — the CMD-side refill decision that makes the recoverable HOLD
+            // actually re-drive the armed-prev hole (one-shot, exit rc).
+            printf("[FLAG] --test-gap-recover-fire: invoking W1 CMD refill "
+                   "fire proof\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_rf;
+            int rc = ARQ_rf.test_recover_fire();
+            printf("[FLAG] Recover-fire test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

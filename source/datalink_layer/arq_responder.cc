@@ -12108,6 +12108,148 @@ int cl_arq_controller::test_recoverable_gap_abort()
 	return fails==0 ? 0 : 1;
 }
 
+// ============================================================================
+// W1 FIRE PROOF — the CMD-side refill decision that lets the recoverable HOLD
+// actually re-drive the armed-prev hole (data-flow-recoverable-gap-abort.md 5.1).
+// CLI: --test-gap-recover-fire
+//
+// Root (audit 5.1): in a WB session the recoverable HOLD re-advertises the prev
+// hole via the MFSK ACK+SACK suffix (rsp_resend_prev_partial_sack prefers it); on
+// the CMD that re-SACK carries rx_bsi == prev_bsi, because the mixbatch left the
+// CMD exactly ONE batch past the hole (cmd_batch_seq_id = N+1). The original R2c
+// requeue fired ONLY on `!inflight` (rx_bsi neither cmd_bsi nor prev_bsi), so it
+// SKIPPED the storm; and the by-slot SACK apply would FALSE-ACK the held current
+// batch N+1's frames by index (they then never retransmit), so the held batch
+// never re-completed -> 0/39 recovered. The fix routes any shadow-retained
+// NON-current bsi to the retention re-drive and CONSUMES the SACK (no by-slot
+// apply). Both SACK arms (OFDM SACK_RSP and the WB MFSK suffix) now carry it.
+//
+// This drives the REAL production decision (cmd_prev_resack_is_shadow_target) and
+// the REAL re-drive (cmd_prev_retain_requeue) — the exact functions that were
+// inert — plus the REAL delivery producer (advance_last_delivered) and REAL ruler
+// (delivery_step_is_gap). Fail-before pins the drop via MERCURY_CMD_PREV_RETAIN_
+// DEFEAT. The live-wire [RSP-V2-GAP-HOLD]->[RSP-V2-PREV-DELIVERED] recovery
+// counter 0->N is the DEFERRED real-audio re-measure (see the fact doc).
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_recover_fire()
+{
+	const char* TAG = "[TEST-RECOVER-FIRE]";
+	int fails = 0;
+	auto ck = [&](bool c, const char* w) {
+		printf("%s %s: %s\n", TAG, c ? "PASS" : "FAIL", w);
+		if(!c) fails++;
+		fflush(stdout);
+	};
+	auto putenv_kv = [&](const char* k, const char* v) {
+#if defined(_WIN32)
+		_putenv_s(k, v ? v : "");
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	if(init_messages_buffers() != SUCCESSFUL)
+	{ printf("%s ERROR: init_messages_buffers failed\n", TAG); return 1; }
+	this->sack_v2_enabled = true;
+	this->data_batch_size = 25;
+
+	const int N   = 7;    // armed-prev batch (holds the one-frame hole)
+	const int NP1 = 8;    // held current batch (fully received; PENDING_ACK on the CMD)
+
+	// --- CMD storm state: cmd on N+1, all N+1 frames PENDING_ACK (held, unacked) ---
+	this->cmd_batch_seq_id = NP1;
+	for(int i=0; i<this->nMessages; i++) messages_tx[i].status = FREE;
+	for(int i=0; i<this->data_batch_size; i++)
+	{
+		messages_tx[i].status       = PENDING_ACK;
+		messages_tx[i].length       = 16;
+		messages_tx[i].batch_seq_id = NP1;
+		for(int j=0; j<16; j++) messages_tx[i].data[j] = (char)(0x40 + i);
+	}
+
+	// Arm the retention shadow with batch-N frame 0 (the lost hole frame) via the
+	// REAL capture helper — exactly as the mixbatch retx SEND does in production.
+	unsigned char holeA[12]; for(int i=0;i<12;i++) holeA[i]=(unsigned char)(0xC0+i);
+	cmd_prev_retain_count = 0;
+	retransmit_count      = 0;
+	cmd_prev_retain_capture(N, /*slot*/0, 12, DATA_LONG, /*seq_eob*/0x00, holeA);
+	ck(cmd_prev_retain_has(N), "shadow retains batch-N frame 0 (captured on its retx send)");
+
+	// Document the ROOT inline: the OLD `!inflight` gate = (rx_bsi != cmd_bsi &&
+	// rx_bsi != prev_bsi). For the storm rx_bsi == prev_bsi, so !inflight is FALSE
+	// -> the pre-fix requeue was SKIPPED (and the by-slot apply then false-ACKed N+1).
+	{
+		unsigned cmd_u  = (unsigned)(NP1 & 0xFF);
+		unsigned prev_u = (cmd_u - 1u) & 0xFFu;
+		bool old_inflight = ((unsigned)N == cmd_u || (unsigned)N == prev_u);
+		ck(old_inflight,
+			"ROOT: the OLD !inflight gate saw the storm re-SACK as in-flight "
+			"(rx_bsi==prev_bsi) -> it SKIPPED the re-drive");
+	}
+
+	// The recoverable HOLD re-advertises prev N: frame 0 MISSING, 1..24 present.
+	bool got[MAX_SACK_BATCH_SIZE];
+	for(int i=0;i<MAX_SACK_BATCH_SIZE;i++) got[i] = (i < this->data_batch_size);
+	got[0] = false;
+
+	// ---- FAIL-BEFORE: pin the drop with MERCURY_CMD_PREV_RETAIN_DEFEAT=1 --------
+	putenv_kv("MERCURY_CMD_PREV_RETAIN_DEFEAT", "1");
+	bool routed_fb = cmd_prev_resack_is_shadow_target(N);
+	int  rq_fb     = cmd_prev_retain_requeue(N, got, this->data_batch_size);
+	ck(!routed_fb, "FAIL-BEFORE: storm re-SACK NOT routed to the shadow re-drive (the 0/39 drop)");
+	ck(rq_fb == 0, "FAIL-BEFORE: nothing re-driven -> the prev hole never refills");
+	putenv_kv("MERCURY_CMD_PREV_RETAIN_DEFEAT", "");
+
+	// ---- PASS-AFTER: the REAL gate routes it; the REAL requeue re-drives --------
+	retransmit_count = 0;
+	ck(cmd_prev_resack_is_shadow_target(N),
+		"PASS-AFTER: storm re-SACK (rx_bsi==prev_bsi, shadow-retained) IS routed to the re-drive");
+	ck(!cmd_prev_resack_is_shadow_target(NP1),
+		"the current batch (cmd_bsi) is NOT routed -> its by-slot apply is preserved");
+	int rq = cmd_prev_retain_requeue(N, got, this->data_batch_size);
+	ck(rq == 1, "PASS-AFTER: exactly the missing frame 0 of batch N re-queued");
+	ck(retransmit_count == 1
+	   && retransmit_frame_batch_seq_ids[0] == N
+	   && retransmit_frame_positions[0]     == 0
+	   && retransmit_frame_lengths[0]       == 12
+	   && memcmp(retransmit_frames[0], holeA, 12) == 0,
+		"PASS-AFTER: re-queued the RETAINED batch-N bytes (NOT batch-N+1's frame by slot)");
+
+	// The consume-and-skip must NOT touch the held current batch: every N+1 frame
+	// stays PENDING_ACK, so the CMD's ACK-timeout full-batch retransmit re-completes
+	// them at the RSP -> the EXISTING BATCH-DONE gate delivers the held batch.
+	bool all_pending = true;
+	for(int i=0;i<this->data_batch_size;i++)
+		if(messages_tx[i].status != PENDING_ACK) all_pending = false;
+	ck(all_pending,
+		"PASS-AFTER: held batch N+1 frames stay PENDING_ACK (no by-slot FALSE-ACK)");
+
+	// ---- REAL delivery producer + ruler: once the refill lands, the held cur is
+	//      contiguous and delivers via the existing gate; the high-water NEVER
+	//      advanced while the hole existed. ------------------------------------
+	this->rsp_last_delivered_batch_seq_id = N - 1;   // batches ..N-1 delivered
+	ck(delivery_step_is_gap(NP1, this->rsp_last_delivered_batch_seq_id),
+		"held cur reads as a GAP while the hole exists (high-water held at N-1)");
+	advance_last_delivered(N);                        // REAL: the refilled prev N delivers
+	ck(this->rsp_last_delivered_batch_seq_id == N,
+		"prev N delivery advanced the high-water to N");
+	ck(!delivery_step_is_gap(NP1, this->rsp_last_delivered_batch_seq_id),
+		"held cur N+1 is now CONTIGUOUS -> the existing BATCH-DONE gate delivers it");
+	advance_last_delivered(NP1);
+	ck(this->rsp_last_delivered_batch_seq_id == NP1,
+		"held cur delivered -> high-water N+1 (in-order N-1 -> N -> N+1, no abort)");
+
+	printf("%s %s (fails=%d) — the CMD refill decision FIRES on the storm topology; "
+		"live-wire recovery-counter 0->N is the deferred real-audio re-measure\n",
+		TAG, fails==0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails==0 ? 0 : 1;
+}
+
 
 // ============================================================================
 // Track A — multi-window DATA-ACK/SACK correlator (in-process, test-only)

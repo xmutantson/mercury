@@ -205,6 +205,39 @@ int cl_arq_controller::cmd_prev_retain_requeue(int bsi, const bool* got_bitmap,
 	return requeued;
 }
 
+// R2c-W1 (data-flow-recoverable-gap-abort.md 5.1): is any live shadow entry
+// keyed by `bsi`? A live entry means the CMD sent that bsi frame(s) as retx and
+// they are NOT yet confirmed (eviction clears the shadow on confirm), so the
+// frame bytes exist ONLY here, never in messages_tx[] (which now describes the
+// current new-data batch).
+bool cl_arq_controller::cmd_prev_retain_has(int bsi)
+{
+	for(int k=0; k<cmd_prev_retain_count; k++)
+		if(cmd_prev_retain_bsi[k] == (bsi & 0xFF)) return true;
+	return false;
+}
+
+// R2c-W1: route a decoded PARTIAL re-SACK to the retention-shadow re-drive
+// (skipping the by-slot-index apply) iff rx_bsi is NOT the current new-data batch
+// AND its frames are shadow-retained. The original R2c requeue only fired when
+// rx_bsi was NEITHER cmd_bsi NOR prev_bsi (!inflight), but the recoverable-hold
+// storm leaves the CMD exactly ONE batch past the armed-prev hole: cmd_bsi=N+1,
+// the re-advertised hole is prev_bsi=N. That rx_bsi is in the {cmd,prev} window,
+// so it is NOT OOW/STALE-dropped and the by-slot apply would FALSE-ACK batch N+1
+// PENDING_ACK frames by index (they never retransmit -> the held batch never
+// re-completes). N real frames are gone from messages_tx[] (consumed on their
+// retx send); they survive ONLY in the shadow. So: shadow-retained AND not the
+// current batch => re-drive the retained bytes and CONSUME the SACK. Gated by
+// MERCURY_CMD_PREV_RETAIN_DEFEAT (fail-before restores the drop/mis-apply = 0/39).
+bool cl_arq_controller::cmd_prev_resack_is_shadow_target(int rx_bsi)
+{
+	{ const char* e = std::getenv("MERCURY_CMD_PREV_RETAIN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) return false; }
+	if(!sack_v2_enabled) return false;
+	if((rx_bsi & 0xFF) == (cmd_batch_seq_id & 0xFF)) return false;  // current batch -> by-slot apply
+	return cmd_prev_retain_has(rx_bsi);
+}
+
 void cl_arq_controller::register_ack(int message_id)
 {
 	if(message_id>=0 && message_id<this->nMessages && messages_tx[message_id].status==PENDING_ACK)
@@ -4454,6 +4487,36 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// stale n_r can never ACK a future/unsent batch (§T2.4).
 							unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
 							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+							// R2c-W1 (data-flow-recoverable-gap-abort.md 5.1): a PARTIAL re-SACK (has a
+							// hole) whose bsi is a shadow-retained NON-current batch -- the armed-prev
+							// hole re-advertised by the recoverable HOLD, delivered here via the MFSK
+							// ACK+SACK suffix (the WB transport rsp_resend_prev_partial_sack() prefers).
+							// Re-drive the RETAINED bytes and CONSUME it: skip the by-slot apply (which
+							// would FALSE-ACK the current batch) AND the OFDM dispatch. Clean cumulative
+							// confirmations (all-ones) are NEVER routed here (they ride the self-heal).
+							bool w1_shadow_consumed = false;
+							{
+								uint32_t all_ones_w1 = (data_batch_size >= 32)
+									? 0xFFFFFFFFu : ((1u << data_batch_size) - 1u);
+								if((rx_bitmap & all_ones_w1) != all_ones_w1
+								   && cmd_prev_resack_is_shadow_target((int)rx_bsi))
+								{
+									bool sackbm_w1[MAX_SACK_BATCH_SIZE];
+									for(int i=0; i<data_batch_size && i<MAX_SACK_BATCH_SIZE; i++)
+										sackbm_w1[i] = ((rx_bitmap >> i) & 1u) ? true : false;
+									int rq = cmd_prev_retain_requeue((int)rx_bsi, sackbm_w1, data_batch_size);
+									printf("[CMD-PREV-RETAIN-REQUEUE] (mfsk) rx_bsi=%u not current batch "
+										"cmd=%u -- re-queued %d retained frame(s) (retx queue=%d); consuming "
+										"SACK (skip by-slot apply; next retransmit re-drives the hole)\n",
+										(unsigned)rx_bsi, cmd_bsi, rq, retransmit_count);
+									fflush(stdout);
+									link_timer.start();
+									watchdog_timer.start();
+									policy_evaluate_axis3(true);
+									mfsk_handled_this_poll = true;
+									w1_shadow_consumed = true;
+								}
+							}
 							bool per_batch_in_window =
 								((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
 							bool bsi_in_window =
@@ -4508,7 +4571,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									|| partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
 										cumulative_ack_enabled);
 
-							if(bsi_in_window && bitmap_ok && !duplicate && partial_target_ok)
+							if(!w1_shadow_consumed && bsi_in_window && bitmap_ok && !duplicate && partial_target_ok)
 							{
 								if(is_clean_confirmation)
 								{
@@ -4708,34 +4771,26 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// in-flight batch's next retransmit turnaround. Consume the SACK
 						// (decoded=false) so the in-flight guards stay inert.
 						bool prev_retain_consumed = false;
-						if(decoded)
+						if(decoded && cmd_prev_resack_is_shadow_target((int)rx_bsi))
 						{
-							unsigned cmd_bsi_u  = (unsigned)(cmd_batch_seq_id & 0xFF);
-							unsigned prev_bsi_u = (cmd_bsi_u - 1u) & 0xFFu;
-							bool inflight = ((unsigned)rx_bsi == cmd_bsi_u
-							                 || (unsigned)rx_bsi == prev_bsi_u);
-							if(!inflight)
-							{
-								int rq = cmd_prev_retain_requeue((int)rx_bsi,
-									sack_bitmap, data_batch_size);
-								if(rq > 0)
-								{
-									printf("[CMD-PREV-RETAIN-REQUEUE] rx_bsi=%u not in-flight "
-										"{cmd=%u,prev=%u} — re-queued %d retained frame(s) "
-										"(retx queue=%d); next retransmit re-drives the hole\n",
-										(unsigned)rx_bsi, cmd_bsi_u, prev_bsi_u, rq,
-										retransmit_count);
-									fflush(stdout);
-									// Peer is alive + re-requesting: keep the link/watchdog
-									// timers fresh so a bounded recovery does not trip a
-									// spurious BREAK/reconnect.
-									link_timer.start();
-									watchdog_timer.start();
-									policy_evaluate_axis3(true);   // a valid reverse SACK decoded
-									decoded = false;               // handled — skip in-flight apply + the else axis3(false)
-									prev_retain_consumed = true;
-								}
-							}
+							// R2c-W1: rx_bsi is a shadow-retained NON-current batch (the armed-prev
+							// hole re-advertised by the recoverable HOLD, or a batch 2+ behind). Its
+							// frames are gone from messages_tx[], so re-drive the RETAINED bytes and
+							// CONSUME the SACK -- the by-slot apply below would FALSE-ACK the current
+							// batch frames by index (they would never retransmit).
+							int rq = cmd_prev_retain_requeue((int)rx_bsi, sack_bitmap, data_batch_size);
+							printf("[CMD-PREV-RETAIN-REQUEUE] rx_bsi=%u not current batch cmd=%u -- "
+								"re-queued %d retained frame(s) (retx queue=%d); consuming SACK "
+								"(skip by-slot apply; next retransmit re-drives the hole)\n",
+								(unsigned)rx_bsi, (unsigned)(cmd_batch_seq_id & 0xFF), rq, retransmit_count);
+							fflush(stdout);
+							// Peer is alive + re-requesting: keep the link/watchdog timers fresh so a
+							// bounded recovery does not trip a spurious BREAK/reconnect.
+							link_timer.start();
+							watchdog_timer.start();
+							policy_evaluate_axis3(true);   // a valid reverse SACK decoded
+							decoded = false;               // skip the by-slot apply (would false-ACK cmd_bsi)
+							prev_retain_consumed = true;
 						}
 						// R039 (race audit 2026-06-06): bsi-in-window guard.
 						// decode_sack_v2_frame() is CRC8-only and never validates

@@ -2764,6 +2764,7 @@ public:
   // in-order 6->7->8, high-water never advances while the hole exists. Returns
   // 0=PASS, 1=FAIL. See fact-documents/data-flow-recoverable-gap-abort.md.
   int test_recoverable_gap_abort();
+  int test_recover_fire();
 
   // Multi-window DATA-ACK/SACK correlator regression (Track A, mwcorr;
   // CLI --test-data-ack-multiwindow). Self-contained, in-process, no IONOS/RF.
@@ -3542,6 +3543,16 @@ public:
                                unsigned char seq_eob, const unsigned char* bytes);
   void cmd_prev_retain_evict(int bsi);
   int  cmd_prev_retain_requeue(int bsi, const bool* got_bitmap, int nframes);
+  // R2c-W1 (data-flow-recoverable-gap-abort.md 5.1). has: is any shadow entry
+  // keyed by this bsi still live? is_shadow_target: route a decoded PARTIAL
+  // re-SACK to the shadow re-drive (instead of the by-slot-index apply) iff its
+  // bsi is NOT the current new-data batch AND its frames are shadow-retained --
+  // covers the storm the !inflight gate MISSED (rx_bsi == prev_bsi, one batch
+  // past the armed-prev hole: in the {cmd,prev} window so NOT OOW/STALE-dropped,
+  // yet its frames left messages_tx[] on their retx send so a by-slot apply would
+  // false-ACK the current batch). Gated by MERCURY_CMD_PREV_RETAIN_DEFEAT.
+  bool cmd_prev_retain_has(int bsi);
+  bool cmd_prev_resack_is_shadow_target(int rx_bsi);
 
   // SACK Design A Step 3 — batch_seq_id plumbing (TX side: CMD-only counter;
   // RX side: diagnostic store; no decision branches on this value yet).
