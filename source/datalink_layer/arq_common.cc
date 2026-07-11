@@ -1005,6 +1005,11 @@ cl_arq_controller::cl_arq_controller()
 
 	ptt_on_delay_ms=0;
 	ptt_off_delay_ms=0;
+	// This init path zeroes the PTT delays; the live values (100/200 from the ini
+	// defaults) are loaded at init_ARQ (:2442-2443) before any session traffic. The
+	// turnaround-clearance guard is only ARMED after a reverse reception (mid-session),
+	// by which point the real delays are in place — so the guard never reads these zeros.
+	turnaround_clearance_armed=false;   // fresh session never inherits a stale armed stamp
 	time_left_to_send_last_frame=0;
 
 	last_message_sent_type=NONE;
@@ -8890,6 +8895,117 @@ void cl_arq_controller::send(st_message* message, int message_location)
 
 }
 
+// R1 turnaround-clearance guard (consumer). Called at the top of send_batch() before
+// rx_mute/ptt_on. If a reverse reception has been stamped (armed) and too little time has
+// elapsed since it, busy-wait the remainder so the first data frame never keys inside the
+// peer's TX->RX mute/flush + demod re-arm window.
+//   guard_ms = ptt_off_delay_ms (proxy for the peer's PTT tail; both sides share config)
+//            + margin (capture-flush + demod re-arm settle, default 150)
+//            - ptt_on_delay_ms (our own spin-up already covers this much of the wait)
+// Clamped to [0, 2000]. Env: MERCURY_TURNAROUND_GUARD_MARGIN_MS overrides the margin;
+// MERCURY_TURNAROUND_GUARD_DEFEAT=1 disables the wait (the A/B / fail-before arm; same
+// house pattern as MERCURY_GAP_ABORT_DEFEAT, read on this production path => LIVE). Ships
+// default-ON. Invariant: elapsed >= guard at call time => ZERO added wait => byte-identical.
+void cl_arq_controller::turnaround_clearance_wait()
+{
+	if(!turnaround_clearance_armed)
+	{
+		// First TX after connect (never stamped) — nothing to clear.
+		tg_test_waited_ms         = -1;
+		tg_test_elapsed_at_key_ms = -1;
+		return;
+	}
+
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_TURNAROUND_GUARD_DEFEAT"); if(e && e[0]=='1') defeat = true; }
+
+	int margin_ms = 150;
+	{ const char* e = std::getenv("MERCURY_TURNAROUND_GUARD_MARGIN_MS");
+	  if(e && e[0]!='\0') { int v = atoi(e); if(v >= 0) margin_ms = v; } }
+
+	long long guard_ms = (long long)ptt_off_delay_ms + (long long)margin_ms - (long long)ptt_on_delay_ms;
+	if(guard_ms < 0)    guard_ms = 0;
+	if(guard_ms > 2000) guard_ms = 2000;
+
+	long long elapsed = turnaround_clearance_timer.get_elapsed_time_ms();
+	long long applied = 0;
+	if(!defeat && elapsed < guard_ms)
+	{
+		applied = guard_ms - elapsed;
+		// Reuse the ptt_busy_wait primitive on a FRESH timer so we wait exactly the
+		// REMAINDER (get the outer-stepper clock-advance semantics right: it would
+		// otherwise add the whole guard_ms). Production/real-audio => wall spin.
+		cl_timer guard_timer;
+		guard_timer.start();
+		ptt_busy_wait(guard_timer, (int)applied);
+		printf("[TX-TURNGUARD] waited %lld ms (guard=%lld prior_elapsed=%lld off=%d on=%d margin=%d)\n",
+			applied, guard_ms, elapsed, ptt_off_delay_ms, ptt_on_delay_ms, margin_ms);
+		fflush(stdout);
+	}
+	tg_test_waited_ms         = applied;
+	tg_test_elapsed_at_key_ms = turnaround_clearance_timer.get_elapsed_time_ms();
+}
+
+// In-process regression for the turnaround-clearance guard (--test-turnaround-guard; also
+// runs inside --test). No IONOS/RF, no telecom_system: drives turnaround_clearance_wait()
+// directly with the stock delays (ptt_on=100/ptt_off=200/margin=150 => guard=250 ms).
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_turnaround_guard()
+{
+	printf("[TEST-TURNGUARD] start\n");
+	fflush(stdout);
+	int fails = 0;
+
+	// Stock delays: guard = 200 + 150 - 100 = 250 ms.
+	this->ptt_on_delay_ms  = 100;
+	this->ptt_off_delay_ms = 200;
+	unsetenv("MERCURY_TURNAROUND_GUARD_MARGIN_MS");
+
+	// Arm A — fail-before via the defeat knob (reproduces the unguarded modem): stamp the
+	// clearance timer, then run the guard with the wait defeated. The key point is reached
+	// with < 50 ms elapsed (no wait applied).
+	setenv("MERCURY_TURNAROUND_GUARD_DEFEAT", "1", 1);
+	this->turnaround_clearance_armed = true;
+	this->turnaround_clearance_timer.start();
+	this->turnaround_clearance_wait();
+	printf("[TEST-TURNGUARD] Arm A (defeat=1): waited=%lld elapsed_at_key=%lld (want elapsed<50)\n",
+		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
+	if(!(this->tg_test_waited_ms == 0 && this->tg_test_elapsed_at_key_ms < 50)) { printf("[TEST-TURNGUARD] Arm A FAIL\n"); fails++; }
+
+	// Arm B — the fix: defeat unset, stamp, run. The guard busy-waits so the key point is
+	// reached at >= 250 ms.
+	unsetenv("MERCURY_TURNAROUND_GUARD_DEFEAT");
+	this->turnaround_clearance_armed = true;
+	this->turnaround_clearance_timer.start();
+	this->turnaround_clearance_wait();
+	printf("[TEST-TURNGUARD] Arm B (default-on): waited=%lld elapsed_at_key=%lld (want both>=250)\n",
+		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
+	if(!(this->tg_test_waited_ms >= 250 && this->tg_test_elapsed_at_key_ms >= 250)) { printf("[TEST-TURNGUARD] Arm B FAIL\n"); fails++; }
+
+	// Arm C — invariant 1: enough real time has already elapsed since the stamp (300 ms),
+	// so the guard adds ~0.
+	this->turnaround_clearance_armed = true;
+	this->turnaround_clearance_timer.start();
+	{ cl_timer settle; settle.start(); while(settle.get_elapsed_time_ms() < 300) msleep(1); }
+	this->turnaround_clearance_wait();
+	printf("[TEST-TURNGUARD] Arm C (prior>=guard): waited=%lld elapsed_at_key=%lld (want waited==0)\n",
+		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
+	if(!(this->tg_test_waited_ms == 0 && this->tg_test_elapsed_at_key_ms >= 250)) { printf("[TEST-TURNGUARD] Arm C FAIL\n"); fails++; }
+
+	// Arm D — invariant 2: never stamped (never armed) => no wait at all.
+	this->turnaround_clearance_armed = false;
+	this->turnaround_clearance_wait();
+	printf("[TEST-TURNGUARD] Arm D (never armed): waited=%lld (want -1, no wait)\n",
+		this->tg_test_waited_ms);
+	if(this->tg_test_waited_ms != -1) { printf("[TEST-TURNGUARD] Arm D FAIL\n"); fails++; }
+
+	unsetenv("MERCURY_TURNAROUND_GUARD_DEFEAT");
+	bool pass = (fails == 0);
+	printf("[TEST-TURNGUARD] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
 void cl_arq_controller::send_batch()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
@@ -8935,6 +9051,13 @@ void cl_arq_controller::send_batch()
 	telecom_system->receive_stats.mfsk_search_raw = 0;
 	telecom_system->receive_stats.ofdm_search_raw = 0;
 	telecom_system->receive_stats.ofdm_batch_active = false;
+
+	// Turnaround-clearance guard (consumer): before muting RX / keying PTT, make sure
+	// enough time has elapsed since the peer's last transmission that its TX->RX
+	// mute/flush + demod re-arm window has closed. Otherwise this batch's preamble lands
+	// inside that window and the first frame is lost (the observed post-LINK-PARAMS
+	// slot-0 killer). Preventive wait only — zero wire change; no-op when already clear.
+	turnaround_clearance_wait();
 
 	// rx_mute during TX: capture_prep_thread writes zeros to ring buffer,
 	// so self-echo never enters. After playback drain, we unmute and flush
@@ -13013,6 +13136,15 @@ void cl_arq_controller::receive()
 
 		if (received_message_stats.message_decoded==YES)
 		{
+			// Turnaround-clearance stamp (producer): a reverse reception just COMPLETED
+			// — a peer frame was decoded and handed to the ARQ layer (DATA / CONTROL /
+			// ACK_* / SACK_RSP all reach this gate). Restart the clearance timer so the
+			// next send_batch() measures elapsed since the peer's audio ended. The decode
+			// completes AFTER the peer stops transmitting, so this stamp is conservatively
+			// LATE (elapsed under-reads → the guard only ever waits LONGER, never shorter).
+			// Self-echo cannot stamp here: rx_mute=1 for the whole of our own send_batch TX.
+			turnaround_clearance_timer.start();
+			turnaround_clearance_armed = true;
 			int rx_nsymb = telecom_system->get_active_nsymb();
 			// LEVER P: this frame's actual length is (eff preamble + data). For a
 			// MINI tail frame eff=1, so rx_frame is shorter; the next preamble in

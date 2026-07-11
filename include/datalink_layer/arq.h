@@ -596,6 +596,10 @@ public:
 	   */
   void send(st_message* message, int message_location);
   void send_batch();
+  // R1 turnaround-clearance guard consumer (called at send_batch() top before keying)
+  // and its in-process regression driver (--test-turnaround-guard; also runs in --test).
+  void turnaround_clearance_wait();
+  int  test_turnaround_guard();
   // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
   // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
   // opts into the robust noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST
@@ -5097,6 +5101,19 @@ public:
 
   int ptt_on_delay_ms;
   int ptt_off_delay_ms;
+  // Turnaround-clearance guard (cross-layer data-flow audit: TX-start vs the peer's
+  // TX->RX mute/flush window). receive() stamps turnaround_clearance_timer whenever a
+  // reverse reception completes (any decoded frame handed to the ARQ layer, incl. the
+  // ACK/SACK reply); send_batch() consults it at the top and, if too little time has
+  // elapsed since the peer's audio ended, busy-waits the remainder BEFORE keying so the
+  // first data frame never lands inside the peer's capture-flush/demod re-arm window.
+  cl_timer turnaround_clearance_timer;
+  bool     turnaround_clearance_armed = false;
+  // Test-visible instrumentation for --test-turnaround-guard (set by
+  // turnaround_clearance_wait): the ms the guard busy-waited this call (-1 = guard not
+  // entered, i.e. never armed), and the clearance elapsed captured at the key point.
+  long long tg_test_waited_ms        = -1;
+  long long tg_test_elapsed_at_key_ms = -1;
   int pilot_tone_ms;   // Duration of pilot tone before OFDM (0=disabled)
   int pilot_tone_hz;   // Frequency of pilot tone (250=out of band, 1500=in band)
   double time_left_to_send_last_frame;

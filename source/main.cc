@@ -1404,6 +1404,15 @@ int main(int argc, char *argv[])
             // the dropped batch. Drives the REAL teardown + the REAL gap predicates + the
             // REAL fifo_buffer_rx app stream. In-process synthetic-fire (no IONOS/RF) — a
             // permanent integrity D0 regression gate.
+            // R1 turnaround-clearance guard (arq_common.cc): the guard busy-waits the
+            // remainder of the peer's TX->RX mute/flush + demod re-arm window before keying
+            // a data batch, so the first frame never lands inside it (the post-LINK-PARAMS
+            // slot-0 loss). Drives the REAL guard with stock delays; asserts default-on waits
+            // >=250 ms, defeated waits ~0, already-clear adds ~0, never-armed no-ops.
+            {
+                cl_arq_controller ARQ_tg;
+                failed += ARQ_tg.test_turnaround_guard();
+            }
             {
                 cl_arq_controller ARQ_gab;
                 failed += ARQ_gab.test_gap_abort_readopt_blind();
@@ -2351,6 +2360,10 @@ int main(int argc, char *argv[])
                                         // Reproduces bench-4 (deliver 0-4, BREAK reset with 5-7 undelivered, present 8):
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
+    bool test_turnaround_guard_cli = false; // --test-turnaround-guard: R1 turnaround-clearance guard —
+                                        // stamp-then-key drives assert the guard waits out the peer's TX->RX
+                                        // mute/flush window (default-on) and adds ~0 when already clear / never armed.
+                                        // One-shot, exits rc.
     bool test_gap_abort_blind_cli = false; // --test-gap-abort-blind: GAP-ABORT ruler-blinding — the REAL
                                         // rsp_gap_abort_teardown() resets the contiguity ruler to -1, blinding its own
                                         // re-adopt gate, and the CMD (never told) re-drives the same stream -> silent
@@ -3178,6 +3191,14 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
             // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
             test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-turnaround-guard") == 0)
+        {
+            // R1 turnaround-clearance guard regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_common.cc test_turnaround_guard.
+            test_turnaround_guard_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5136,6 +5157,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_gap_abort_on_readopt();
             printf("[FLAG] Gap-abort test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_turnaround_guard_cli) {
+            // R1 turnaround-clearance guard — the guard waits out the peer's TX->RX
+            // mute/flush window before keying a data batch (one-shot, exit rc).
+            printf("[FLAG] --test-turnaround-guard: invoking turnaround-clearance guard "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_tg;
+            int rc = ARQ_tg.test_turnaround_guard();
+            printf("[FLAG] Turnaround-guard test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
