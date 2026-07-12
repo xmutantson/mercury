@@ -774,6 +774,20 @@ public:
   // fact-documents/data-flow-recoverable-gap-abort.md §5.5.
   void rsp_commit_cur_batch_delivery();
 
+  // Option B' (data-flow-batch-size.md §9): the RX ACCEPTANCE WINDOW. Trusts the
+  // CRC-protected per-batch sender-declared frame count (D5, rx_batch_total_frames
+  // / rx_buffer_batch_total_frames) when it EXCEEDS the stale command-synced
+  // data_batch_size, so a lost/late SET_LINK_PARAMS can no longer truncate a batch
+  // the sender built LARGER (the res_c3100 CMD>RSP silent-shift fault). Returns
+  // max(data_batch_size, min(sender_total_frames, MAX_SACK_BATCH_SIZE)) — it NEVER
+  // narrows below data_batch_size, so every non-desync batch (matched, step-down,
+  // compression, encryption, robust, all-retx, D5-absent) is BYTE-IDENTICAL to the
+  // pre-B' behavior. MERCURY_BPRIME_DEFEAT restores the pre-B' window (==
+  // data_batch_size) AND the pre-B' (B)-backstop trigger (fire on > data_batch_size).
+  int  rx_effective_window(int sender_total_frames) const;
+  // MERCURY_BPRIME_DEFEAT env gate (byte-identical-to-pre-B' when set).
+  static bool bprime_defeat_active();
+
   // D3.1 (data-integrity): the shared LOUD GAP-ABORT teardown. The
   // case-independent action both the FIX-8 re-adopt gate and the new
   // delivery-time gate route to: control-port error, DROPPED, clear the bsi
@@ -3682,6 +3696,14 @@ public:
   // delivers messages_rx_prev[], so its byte-gate must reconcile bytes over THAT array
   // (not messages_rx[]). Identical logic; reused so the PREV gate matches the primary gate.
   bool w_bytegate_shortfall(int wbsi, struct st_message* arr);
+  // Option B' completeness (data-flow-batch-size.md §9): window-parameterized worker.
+  // The delivered-byte sum must span the EFFECTIVE window (rx_effective_window), not the
+  // stale data_batch_size, or a genuine CMD>RSP over-count (res_c3100 widen) drops the
+  // tail frames [data_batch_size, D5) from the sum -> a deterministic FALSE byte-shortfall
+  // -> permanent WITHHOLD. Production passes the eff_window explicitly (current-batch
+  // ACK-GATE and cross-storage PREV completion); the two thin overloads above default to
+  // data_batch_size (byte-identical for every non-desync caller and the regression test).
+  bool w_bytegate_shortfall(int wbsi, struct st_message* arr, int win);
   bool w_stream_shift_detected(int wbsi);
 
   // SACK Design A Step 4 — RSP cross-batch routing decision state.
@@ -5609,6 +5631,13 @@ private:
   // (the fail-before arm). Reset to -1 at session init + on every bsi bump/teardown.
   int rx_buffer_batch_total_frames;    // staged batch_total_frames for current v2 frame, or -1
   int rx_batch_total_frames;           // promoted authoritative per-batch frame count, or -1
+  // Option B' (data-flow-batch-size.md §9): per-call DELIVERY window override for
+  // copy_data_to_buffer(). -1 (default) => copy_data_to_buffer bounds delivery by
+  // data_batch_size (byte-identical). The current-batch commit path sets this to the
+  // eff_window (== rx_effective_window()) immediately before delivering a batch the
+  // sender built LARGER than data_batch_size, then resets it to -1. Set/consumed like
+  // decrypt_delivered_bsi (one delivery at a time; no reentrancy).
+  int rx_copy_window;                  // per-call copy_data_to_buffer delivery bound, or -1
   char last_message_sent_type;
   char last_message_sent_code;
 
