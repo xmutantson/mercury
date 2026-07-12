@@ -10773,6 +10773,16 @@ void cl_telecom_system::transmit_bigblock(int* data, int nBytes, double* out)
 
 st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 {
+	// USE-AFTER-FREE ROOT-CAUSE FIX (sibling of the data snapshot below): on the live ARQ
+	// path the caller passes data_container.data_byte as out. The big-block decode below
+	// (bigblock_rx_passband + the K-derivation rebuild) calls load_configuration, which
+	// DEINITS+REINITS the data_container, FREEING+REALLOCATING data_container.data_byte. That
+	// leaves the out PARAMETER dangling at the freed old buffer; the legacy copy-out below
+	// then wrote through the stale pointer -> heap-buffer-overflow into the freed region,
+	// aborting the next config-switch free() (free(): invalid next size). Record the aliasing
+	// at entry so the copy-out targets the LIVE data_byte, not the stale pointer. A caller-
+	// owned out (loopback validators) is not a data_byte alias and is never reallocated.
+	bool out_aliases_data_byte = (out == data_container.data_byte);
 	// initialize stats (mirror the receive_byte defaults that downstream reads)
 	receive_stats.message_decoded = NO;
 	receive_stats.iterations_done = -1;
@@ -10884,7 +10894,11 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	// UNBOUNDED copy-out so CASE C can show the data_byte[N_MAX] forward overrun fail-before.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_OLDGATE");
 	  if(e && *e && atoi(e)!=0) out_copy = copy_bits; }
-	for(int i=0;i<out_copy;i++) out[i] = info_bits[i];
+	// Write to the LIVE data_byte if out aliased it at entry (the decode reallocated it);
+	// otherwise the caller-owned out is stable. data_container.data_byte is a fresh
+	// int[N_MAX] after the reload and out_copy is bounded by N_MAX, so this is in-bounds.
+	int* out_dst = out_aliases_data_byte ? data_container.data_byte : out;
+	if(out_dst != NULL) { for(int i=0;i<out_copy;i++) out_dst[i] = info_bits[i]; }
 
 	// stash per-codeword result for the loopback validator / P2 SACK bitmap.
 	bigblock_last_rx_cw_ok = cw_ok;
