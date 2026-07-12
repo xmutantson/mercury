@@ -3696,6 +3696,14 @@ public:
   // delivers messages_rx_prev[], so its byte-gate must reconcile bytes over THAT array
   // (not messages_rx[]). Identical logic; reused so the PREV gate matches the primary gate.
   bool w_bytegate_shortfall(int wbsi, struct st_message* arr);
+  // Option B' completeness (data-flow-batch-size.md §9): window-parameterized worker.
+  // The delivered-byte sum must span the EFFECTIVE window (rx_effective_window), not the
+  // stale data_batch_size, or a genuine CMD>RSP over-count (res_c3100 widen) drops the
+  // tail frames [data_batch_size, D5) from the sum -> a deterministic FALSE byte-shortfall
+  // -> permanent WITHHOLD. Production passes the eff_window explicitly (current-batch
+  // ACK-GATE and cross-storage PREV completion); the two thin overloads above default to
+  // data_batch_size (byte-identical for every non-desync caller and the regression test).
+  bool w_bytegate_shortfall(int wbsi, struct st_message* arr, int win);
   bool w_stream_shift_detected(int wbsi);
 
   // SACK Design A Step 4 — RSP cross-batch routing decision state.

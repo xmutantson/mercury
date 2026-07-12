@@ -1348,6 +1348,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 							// return false ⇒ safe no-op; a LEGITIMATE full PREV (delivered==committed)
 							// does not trip it. MERCURY_W_PREV_BYTEGATE_DEFEAT=1 restores the pre-fix
 							// un-gated PREV delivery (the --test-stream-offset Part-T fail-before arm).
+							// Option B' completeness (data-flow-batch-size.md §9): the EFFECTIVE
+							// window for THIS cross-storage PREV batch. == data_batch_size in every
+							// non-desync / non-v2 case and under MERCURY_BPRIME_DEFEAT; only a
+							// genuine CMD>RSP over-count (res_c3100) widens it (<= 32). Derived from
+							// the prev batch's authoritative frame count (rsp_prev_batch_expected_
+							// count, widened to the wired D5 at :1224 / arq_common.cc:10914). Threaded
+							// into the PREV byte-gate, the RECEIVED->ACKED mark loop, the copy_data_
+							// to_buffer delivery bound (rx_copy_window), and the clean-ACK bitmap
+							// width below, so a widened PREV delivers + credits in FULL instead of
+							// truncating at the stale data_batch_size (the on-air withhold, run
+							// weioyt1zk: the byte-gate summed over data_batch_size and dropped the
+							// widened tail -> permanent [RSP-V2-PREV-BYTE-SHORTFALL]).
+							int prev_eff_window = rx_effective_window(rsp_prev_batch_expected_count);
 							bool prev_byte_withheld = false;
 							if(!prev_gap_aborted)
 							{
@@ -1355,7 +1368,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 								{ const char* e = std::getenv("MERCURY_W_PREV_BYTEGATE_DEFEAT");
 								  if(e && *e && atoi(e)!=0) w_prev_bytegate_defeat = true; }
 								if(!w_prev_bytegate_defeat
-								   && w_bytegate_shortfall(rsp_prev_batch_seq_id, messages_rx_prev))
+								   && w_bytegate_shortfall(rsp_prev_batch_seq_id, messages_rx_prev, prev_eff_window))
 								{
 									printf("[RSP-V2-PREV-BYTE-SHORTFALL] WITHHOLD prev delivery: "
 										"bsi=%d committed=%u (frame-count complete but byte shortfall "
@@ -1389,8 +1402,14 @@ void cl_arq_controller::process_messages_rx_data_control()
 								rsp_prev_batch_expected_count);
 							fflush(stdout);
 							// Mark RECEIVED slots as ACKED so copy_data_to_buffer's
-							// ACKED-only iteration picks them up.
-							for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+							// ACKED-only iteration picks them up. Option B' (§9): iterate the
+							// EFFECTIVE (possibly widened) window, NOT the stale data_batch_size —
+							// a res_c3100 widened PREV holds frames in slots [data_batch_size, D5)
+							// and those slots must be flipped ACKED or the reassembler (which
+							// delivers ACKED-only) silently drops the widened tail. == data_batch_
+							// size when not widened (byte-identical). (messages_rx has just been
+							// swapped to point at messages_rx_prev.)
+							for(int i=0; i<prev_eff_window && i<this->nMessages; i++)
 							{
 								if(messages_rx[i].status == RECEIVED)
 									messages_rx[i].status = ACKED;
@@ -1399,7 +1418,15 @@ void cl_arq_controller::process_messages_rx_data_control()
 							// out-of-order PREV completion delivers messages_rx_prev[],
 							// whose wire bsi is rsp_prev_batch_seq_id.
 							decrypt_delivered_bsi = rsp_prev_batch_seq_id;
+							// Option B' (§9): bound the reassembler at the EFFECTIVE (possibly
+							// widened) window so a res_c3100 widened PREV delivers ALL declared
+							// frames instead of truncating at data_batch_size (the missing
+							// consumer that made the widen INERT: delivery stopped at 25 of 30,
+							// short-advanced rx_stream_delivered, and the NEXT batch's positional
+							// BACKSTOP then correctly caught the shift). Restored to -1 after.
+							this->rx_copy_window = prev_eff_window;
 							copy_data_to_buffer();
+							this->rx_copy_window = -1;
 							// Restore current-batch pointer + delivery state.
 							messages_rx                     = saved_rx;
 							batch_data_delivered            = saved_data_delivered;
@@ -1526,10 +1553,18 @@ void cl_arq_controller::process_messages_rx_data_control()
 									&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 								{
 									// Phase B Wave 1 flag-day (fact-doc §11.2): bitmap is 30 bits (was 32).
+									// Option B' (§9): the clean (all-ones) bitmap must be prev_eff_window
+									// wide, NOT data_batch_size wide — a res_c3100 widened PREV (30 frames)
+									// delivered in full above must be CREDITED CLEAN across all 30 slots or
+									// the CMD (which built the larger batch, all_ones = (1<<30)-1) sees a
+									// too-narrow bitmap, never registers the batch as fully acked, and
+									// retransmits/desyncs the tail. == data_batch_size when not widened.
+									int clean_bits = prev_eff_window;
+									if (clean_bits > 30) clean_bits = 30;
 									uint32_t bitmap_u32;
-									if (data_batch_size >= 30)      bitmap_u32 = 0x3FFFFFFFu;
-									else if (data_batch_size <= 0)  bitmap_u32 = 0u;
-									else                            bitmap_u32 = (1u << data_batch_size) - 1u;
+									if (clean_bits >= 30)      bitmap_u32 = 0x3FFFFFFFu;
+									else if (clean_bits <= 0)  bitmap_u32 = 0u;
+									else                       bitmap_u32 = (1u << clean_bits) - 1u;
 									// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): n_r in the bsi field when
 									// negotiated (the prev-deliver high-water was just advanced at :911).
 									unsigned char wire_bsi = cumulative_ack_bsi_field(
@@ -15003,6 +15038,127 @@ int cl_arq_controller::test_batchsize_desync_delivery()
 			if(!desync)
 			{ printf("[TEST-BSDESYNC] CASE-WIDEN FAIL(defeat): (B) backstop did NOT fire under BPRIME_DEFEAT\n"); fails++; }
 		}
+	}
+
+	// ====================================================================
+	// CASE-WIDEN-PREV (Option B' COMPLETENESS, data-flow-batch-size.md §9) — the on-air
+	// withhold (run weioyt1zk) the ORIGINAL CASE-WIDEN unit test SKIPPED. A res_c3100
+	// widened batch completes via the cross-storage PREV path (messages_rx_prev[]), where
+	// the Option-W byte-gate + delivery consumers were NOT threaded through eff_window: the
+	// PREV byte-gate summed DELIVERED bytes over data_batch_size(25) and DROPPED the widened
+	// tail frames [25,30) -> a deterministic FALSE byte-shortfall -> permanent
+	// [RSP-V2-PREV-BYTE-SHORTFALL] WITHHOLD (rx stuck; SAFE, not working). Drives the REAL
+	// production w_bytegate_shortfall() over messages_rx_prev AND the REAL copy_data_to_
+	// buffer() prev delivery bounded by rx_copy_window — the path the old test bypassed.
+	//   pass-after (default): prev_eff_window widens 25->30, the byte-gate PASSES (all 30
+	//     counted), the swap+mark-ACKED+copy delivers all 30 frames BYTE-FAITHFUL.
+	//   fail-before (MERCURY_BPRIME_DEFEAT=1): prev_eff_window collapses to 25, the byte-gate
+	//     WITHHOLDS (sums 25 of 30 < committed length), and a forced 25-slot delivery is SHORT.
+	{
+		const int RSP_BATCH = 25, CMD_TOTAL = 30, P = 11;
+		bool bprime_defeat = bprime_defeat_active();
+		this->data_batch_size = RSP_BATCH;
+		this->link_status     = CONNECTED;
+		this->compression_enabled = false;   // byte-exact no-compression leg
+		this->fifo_buffer_rx.flush();
+
+		// Arm a COMPLETE widened prev batch: 30 frames RECEIVED in messages_rx_prev[].
+		char tx_prev[CMD_TOTAL * FRAMELEN];
+		for(int i=0;i<this->nMessages;i++)
+		{
+			messages_rx_prev[i].status = FREE;
+			messages_rx_prev[i].length = 0;
+			messages_rx_prev[i].batch_seq_id = -1;
+		}
+		for(int i=0;i<CMD_TOTAL;i++)
+		{
+			char b[FRAMELEN]; frame_bytes(P, i, b);
+			memcpy(&tx_prev[i*FRAMELEN], b, FRAMELEN);
+			messages_rx_prev[i].type         = DATA_SHORT;
+			messages_rx_prev[i].id           = (char)i;
+			messages_rx_prev[i].length       = FRAMELEN;
+			memcpy(messages_rx_prev[i].data, b, FRAMELEN);
+			messages_rx_prev[i].status       = RECEIVED;
+			messages_rx_prev[i].batch_seq_id = P;
+		}
+		this->rsp_prev_batch_seq_id         = P;
+		this->rsp_prev_batch_active         = true;
+		this->rsp_prev_batch_received_count = CMD_TOTAL;
+		this->rsp_prev_batch_expected_count = CMD_TOTAL;   // widened count (via :1224 / :10914)
+
+		// Committed wire stamp for the prev bsi: start aligned to the delivered cursor
+		// (no positional shift), length = the FULL 30-frame transported byte total.
+		this->rx_stream_delivered            = 0;
+		this->rx_stream_crc                  = 0;
+		this->rx_stream_stamp[P & 0xFF].valid  = true;
+		this->rx_stream_stamp[P & 0xFF].start  = 0;
+		this->rx_stream_stamp[P & 0xFF].length = (uint32_t)(CMD_TOTAL * FRAMELEN);
+
+		// REAL production predicate over messages_rx_prev[] with the REAL window.
+		int prev_eff_window = rx_effective_window(this->rsp_prev_batch_expected_count);
+		bool bg = w_bytegate_shortfall(P, messages_rx_prev, prev_eff_window);
+		printf("[TEST-BSDESYNC] CASE-WIDEN-PREV(bprime_defeat=%d): prev_eff_window=%d "
+			"byte_shortfall=%d (want %d)\n",
+			bprime_defeat?1:0, prev_eff_window, bg?1:0, bprime_defeat?1:0);
+		fflush(stdout);
+
+		if(!bprime_defeat)
+		{
+			if(prev_eff_window != CMD_TOTAL)
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN-PREV FAIL(fix): prev_eff_window=%d expected %d\n", prev_eff_window, CMD_TOTAL); fails++; }
+			if(bg)
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN-PREV FAIL(fix): byte-gate WITHHELD a full widened prev (all 30 present)\n"); fails++; }
+			// REAL prev delivery: swap, mark ACKED over prev_eff_window, copy bounded by rx_copy_window.
+			struct st_message* saved_rx = messages_rx;
+			messages_rx = messages_rx_prev;
+			for(int i=0;i<prev_eff_window && i<this->nMessages;i++)
+				if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+			decrypt_delivered_bsi = P;
+			this->rx_copy_window  = prev_eff_window;
+			copy_data_to_buffer();
+			this->rx_copy_window  = -1;
+			messages_rx = saved_rx;
+			char drained[CMD_TOTAL * FRAMELEN];
+			int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+			bool faithful = (popped == CMD_TOTAL*FRAMELEN)
+				&& (memcmp(drained, tx_prev, CMD_TOTAL*FRAMELEN) == 0);
+			printf("[TEST-BSDESYNC] CASE-WIDEN-PREV(fix): popped=%dB faithful=%d link=%d\n",
+				popped, faithful?1:0, (int)this->link_status);
+			fflush(stdout);
+			if(!faithful)
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN-PREV FAIL(fix): widened prev NOT delivered faithfully (all 30)\n"); fails++; }
+			if(this->link_status != CONNECTED)
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN-PREV FAIL(fix): link torn down (false stream-shift?) despite full delivery\n"); fails++; }
+		}
+		else
+		{
+			// fail-before: eff_window collapses to 25, the byte-gate WITHHOLDS the prev.
+			if(prev_eff_window != RSP_BATCH)
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN-PREV FAIL(defeat): prev_eff_window=%d expected %d (should collapse)\n", prev_eff_window, RSP_BATCH); fails++; }
+			if(!bg)
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN-PREV FAIL(defeat): byte-gate did NOT withhold the truncated prev (the inert-B' bug)\n"); fails++; }
+			// A forced 25-slot delivery (the pre-fix consumer) is SHORT -> the res_c3100 tail loss.
+			struct st_message* saved_rx = messages_rx;
+			messages_rx = messages_rx_prev;
+			for(int i=0;i<prev_eff_window && i<this->nMessages;i++)
+				if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+			decrypt_delivered_bsi = P;
+			this->rx_copy_window  = prev_eff_window;
+			copy_data_to_buffer();
+			this->rx_copy_window  = -1;
+			messages_rx = saved_rx;
+			char drained[CMD_TOTAL * FRAMELEN];
+			int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+			bool short_delivery = (popped == RSP_BATCH*FRAMELEN)
+				&& (memcmp(drained, tx_prev, RSP_BATCH*FRAMELEN) == 0);
+			printf("[TEST-BSDESYNC] CASE-WIDEN-PREV(defeat): popped=%dB short_delivery=%d\n",
+				popped, short_delivery?1:0);
+			fflush(stdout);
+			if(!short_delivery)
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN-PREV FAIL(defeat): did not reproduce the truncated prev delivery\n"); fails++; }
+		}
+		this->rx_stream_stamp[P & 0xFF].valid = false;
+		this->rsp_prev_batch_active = false;
 	}
 
 	bool pass2 = (fails == 0);

@@ -10878,7 +10878,16 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	int xferred = 0;
 	int xferred_received = 0;
 	const int alloc_size = N_MAX / 8;
-	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+	// Option B' completeness (data-flow-batch-size.md §9): seal the EFFECTIVE (possibly
+	// widened) current window into prev, NOT the stale data_batch_size. If a res_c3100
+	// widened current batch (D5 > data_batch_size) is fully present in messages_rx[] when
+	// the bump seals it, transferring only data_batch_size slots would ORPHAN the tail
+	// [data_batch_size, D5) at the seal (they land in neither storage). == data_batch_size
+	// when not widened (byte-identical); rx_batch_total_frames is still the current D5
+	// here (reset below). prev_expected already tracks this widened span (via :10839).
+	int xfer_win = rx_effective_window(rx_batch_total_frames);
+	if(xfer_win > this->nMessages) xfer_win = this->nMessages;
+	for(int i=0; i<xfer_win; i++)
 	{
 		messages_rx_prev[i].type   = messages_rx[i].type;
 		messages_rx_prev[i].id     = messages_rx[i].id;
@@ -10898,9 +10907,11 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 		messages_rx[i].length = 0;
 		messages_rx[i].batch_seq_id = -1;
 	}
-	// Make sure prev slots beyond data_batch_size are FREE (defensive —
-	// they should already be).
-	for(int i=this->data_batch_size; i<this->nMessages; i++)
+	// Make sure prev slots beyond the effective (possibly widened) window are FREE
+	// (defensive — they should already be). Option B' (§9): start at xfer_win, not
+	// data_batch_size, so a widened seal's tail slots [data_batch_size, D5) just
+	// transferred above are not immediately re-cleared.
+	for(int i=xfer_win; i<this->nMessages; i++)
 	{
 		if(messages_rx_prev[i].status != FREE)
 			messages_rx_prev[i].status = FREE;
@@ -10941,9 +10952,17 @@ bool cl_arq_controller::rsp_resend_prev_partial_sack()
 	if(!(sack_v2_enabled && rsp_prev_batch_active && rsp_prev_batch_seq_id >= 0))
 		return false;
 
+	// Option B' completeness (data-flow-batch-size.md §9): span the SACK bitmap over the
+	// EFFECTIVE (possibly widened) prev window, NOT the stale data_batch_size — a res_c3100
+	// widened prev that is still PARTIAL must re-request its tail slots [data_batch_size, D5)
+	// or the CMD never re-drives them and the widened prev can never complete (LOSS-CLASS
+	// prevention: the lossy-channel sibling of the on-air withhold). == data_batch_size when
+	// not widened (byte-identical). rsp_prev_batch_expected_count carries the widened count.
+	int sack_win = rx_effective_window(rsp_prev_batch_expected_count);
+	if(sack_win > MAX_SACK_BATCH_SIZE) sack_win = MAX_SACK_BATCH_SIZE;
 	bool sack_bitmap[MAX_SACK_BATCH_SIZE];
 	for(int i=0; i<MAX_SACK_BATCH_SIZE; i++)
-		sack_bitmap[i] = (i < this->data_batch_size
+		sack_bitmap[i] = (i < sack_win
 		                  && messages_rx_prev[i].status == RECEIVED);
 
 	unsigned char prev_bsi = (unsigned char)(rsp_prev_batch_seq_id & 0xFF);
@@ -10961,7 +10980,7 @@ bool cl_arq_controller::rsp_resend_prev_partial_sack()
 	   && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 	{
 		uint32_t bitmap_u32 = 0;
-		int nbits = this->data_batch_size;
+		int nbits = sack_win;   // Option B' (§9): eff-window wide, not data_batch_size
 		if(nbits > 30) nbits = 30;
 		for(int i=0; i<nbits; i++)
 			if(sack_bitmap[i]) bitmap_u32 |= (1u << i);
@@ -10970,7 +10989,7 @@ bool cl_arq_controller::rsp_resend_prev_partial_sack()
 	}
 	if(!sent)
 	{
-		send_sack_v2_frame(sack_bitmap, this->data_batch_size, prev_bsi);
+		send_sack_v2_frame(sack_bitmap, sack_win, prev_bsi);   // Option B' (§9): eff-window wide
 		sent = true;
 	}
 	return sent;
@@ -15265,29 +15284,50 @@ bool cl_arq_controller::w_bytegate_shortfall(int wbsi)
 {
 	// Option W CORE — RSP PRIMARY decision (data-flow-stream-offset.md §8.2 step 5).
 	// The in-order BATCH-DONE path delivers messages_rx[]; the cross-storage PREV
-	// completion delivers messages_rx_prev[] (arq_responder.cc:1287) via the overload
+	// completion delivers messages_rx_prev[] (arq_responder.cc:1287) via the overloads
 	// below. Pure; shared by the production ACK-GATE, the PREV gate, and
 	// test_stream_offset. false on an absent / zero-length stamp (safe no-op —
-	// robust / old peer / lost EOB frame).
-	return w_bytegate_shortfall(wbsi, messages_rx);
+	// robust / old peer / lost EOB frame). This thin entry defaults the delivered-byte
+	// sum window to data_batch_size (byte-identical for every non-desync caller and the
+	// deterministic regression). The production current-batch ACK-GATE passes its
+	// captured eff_window explicitly (arq_responder.cc:2747) so a res_c3100 widened
+	// current batch is byte-reconciled over its full declared span.
+	return w_bytegate_shortfall(wbsi, messages_rx, data_batch_size);
 }
 
 bool cl_arq_controller::w_bytegate_shortfall(int wbsi, struct st_message* arr)
 {
-	// Option W CORE — the array-parameterized twin (§8.2 step 5 + the PREV follow-up,
-	// silent-corruption-residual.md §PREV-gate). Counts DELIVERED bytes over the SAME
-	// window copy_data_to_buffer reassembles (RECEIVED|ACKED, i<data_batch_size) from
-	// arr[] and compares to the LATCHED wire stamp.length for wbsi. Reading arr
-	// (messages_rx for the in-order path OR messages_rx_prev for the cross-storage PREV
-	// completion) lets the PREV gate reuse the IDENTICAL byte-reconciliation the in-order
-	// path uses — no parallel logic, no drift. Absent/zero-length stamp OR a NULL array
-	// ⇒ false (safe no-op — robust / cfg0 tiny-frame / old peer / lost EOB / F4.2-
-	// invalidated stamp), so a config with no stamp is NEVER a false shortfall.
+	// Array-parameterized entry (default window). Kept for the deterministic
+	// test_stream_offset PREV callers (Part T) which set up no widen, so
+	// data_batch_size is the correct span. The PRODUCTION cross-storage PREV
+	// completion passes prev_eff_window explicitly (arq_responder.cc:1358) via the
+	// 3-arg worker below, so a widened PREV batch is summed over its full span.
+	return w_bytegate_shortfall(wbsi, arr, data_batch_size);
+}
+
+bool cl_arq_controller::w_bytegate_shortfall(int wbsi, struct st_message* arr, int win)
+{
+	// Option W CORE — the array + window-parameterized worker (§8.2 step 5 + the PREV
+	// follow-up, silent-corruption-residual.md §PREV-gate). Counts DELIVERED bytes over
+	// the SAME window copy_data_to_buffer reassembles (RECEIVED|ACKED, i<win) from arr[]
+	// and compares to the LATCHED wire stamp.length for wbsi. Reading arr (messages_rx
+	// for the in-order path OR messages_rx_prev for the cross-storage PREV completion)
+	// with the caller's EFFECTIVE window (rx_effective_window, == data_batch_size unless
+	// the sender over-declared) lets the byte-gate span the full res_c3100-widened batch
+	// — the delivered-byte sum previously stopped at data_batch_size and DROPPED the
+	// widened tail frames [data_batch_size, D5), producing a deterministic false
+	// byte-shortfall -> permanent WITHHOLD (the B' completeness gap, on-air run
+	// weioyt1zk). Absent/zero-length stamp OR a NULL array ⇒ false (safe no-op — robust /
+	// cfg0 tiny-frame / old peer / lost EOB / F4.2-invalidated stamp). Hard-bounded by
+	// nMessages (the arr[] allocation).
 	if(wbsi < 0 || arr == NULL) return false;
 	int b = wbsi & 0xFF;
 	if(!rx_stream_stamp[b].valid || rx_stream_stamp[b].length == 0) return false;
+	int w = win;
+	if(w < this->data_batch_size) w = this->data_batch_size;   // never narrow below the stale size
+	if(w > this->nMessages)       w = this->nMessages;
 	int delivered_bytes = 0;
-	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+	for(int i=0; i<w; i++)
 		if(arr[i].status==RECEIVED || arr[i].status==ACKED)
 			delivered_bytes += arr[i].length;
 	return delivered_bytes < (int)rx_stream_stamp[b].length;
