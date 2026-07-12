@@ -1936,6 +1936,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 				receive_stats.delay = matched.delay;
 				receive_stats.coarse_metric = matched.correlation;
+				{ static const int f0v_tr = []{ const char* e=std::getenv("MERCURY_F0V_TRACE"); return (e&&*e)?atoi(e):0; }();
+				  if(f0v_tr){ int sy=data_container.Nofdm*frequency_interpolation_rate;
+				    printf("[F0V-TRACE] stage=coarse delay=%d metric=%.4f (~%.2f sym)\n",
+				      (int)matched.delay, matched.correlation, sy>0?(double)matched.delay/sy:0.0); fflush(stdout);} }
 
 				if(matched.correlation < preamble_detect_threshold)
 				{
@@ -2729,12 +2733,25 @@ skip_h_retry_point:
 				int s8_search_len = s8_win_len;
 				if(s8_interior + s8_search_len > s8_ext_len)
 					s8_search_len = s8_ext_len - s8_interior;
+				int f0v_coarse_anchor = receive_stats.delay;   // coarse (pre-fine) lock
 				TimeSyncResult fine_result = ofdm.time_sync_preamble_with_metric(
 					&data_container.baseband_data_fine_slice[s8_interior],
 					s8_search_len,
 					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max,
 					(preamble_amortization_enabled && M != MOD_MFSK) ? rx_eff_preamble : -1);
 				receive_stats.delay = s8_win_start + fine_result.delay;
+				// P1 candidate (d): the site-8 with_metric fine stage ties across the ~4-symbol
+				// silence-cancellation plateau and (bare metric) undershoots to the earliest tie
+				// (the k-symbol-early post-turnaround wrong-lock). The COARSE energy-weighted
+				// argmax already lands at the true onset; constrain the fine refinement to +/- 1/2
+				// symbol of the coarse so it cannot wander into the plateau. Env-gated for A/B.
+				{ static const int coarse_clamp = []{ const char* e=std::getenv("MERCURY_MF_PLATEAU_COARSE_CLAMP"); return (e&&*e)?atoi(e):0; }();
+				  if(coarse_clamp){ int half=(data_container.Nofdm*frequency_interpolation_rate)/2;
+				    if(std::abs((int)receive_stats.delay - f0v_coarse_anchor) > half) receive_stats.delay = f0v_coarse_anchor; } }
+				{ static const int f0v_tr = []{ const char* e=std::getenv("MERCURY_F0V_TRACE"); return (e&&*e)?atoi(e):0; }();
+				  if(f0v_tr){ int sy=data_container.Nofdm*frequency_interpolation_rate;
+				    printf("[F0V-TRACE] stage=fine  s8_win_start=%d fine_delay=%d final_delay=%d (~%.2f sym)\n",
+				      s8_win_start, fine_result.delay, (int)receive_stats.delay, sy>0?(double)receive_stats.delay/sy:0.0); fflush(stdout);} }
 			}
 
 			if(receive_stats.delay<0){receive_stats.delay=0;}
@@ -11695,7 +11712,8 @@ void cl_telecom_system::load_configuration(int configuration)
 		for(int s = 0; s < 16; s++) ofdm.mfsk_preamble_tones[s] = 0;
 		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
 
-#if 0 // Template generation disabled: using Schmidl-Cox autocorrelation
+#if 1 // P1: template REVIVED for MF plateau-tiebreak VIABILITY MEASUREMENT (inert: time_sync_preamble_matched has 0 production callers)
+		if(std::getenv("MERCURY_F0V_MF_TEMPLATE") && atoi(std::getenv("MERCURY_F0V_MF_TEMPLATE"))!=0){
 		// Generate OFDM matched-filter template for preamble detection.
 		// Must replicate the full TX→RX chain so the template matches what
 		// receive_byte actually sees:
@@ -11818,7 +11836,7 @@ void cl_telecom_system::load_configuration(int configuration)
 			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
 			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag());
 		fflush(stdout);
-	}
+		}
 #endif
 	}
 

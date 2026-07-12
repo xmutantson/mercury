@@ -3230,7 +3230,22 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 			else if(mr >= 0.0)              corss_corr = mr;
 			else                            corss_corr = 0.0;
 		}
-		corss_corr_vals[i]=corss_corr;
+		// P1 energy-weighted plateau tie-break (default ON). The bare normalized
+		// metric ties ~1.0 across the silence-cancellation plateau; the earliest tie
+		// member (a k-symbol-early lock into a near-silent run-up) wins the strict->
+		// selection sort below, pulling the fine lock into the run-up (mean|H|
+		// collapse: the post-turnaround frame-0 wrong-lock). Weight the SELECTION
+		// score by window energy (norm_a+norm_b), exactly as the coarse halfsym
+		// detector does (weighted = metric*(A2+R)), so a mostly-silence candidate
+		// loses to the full-energy true onset. result.correlation (unused by callers,
+		// see the fn header) is unaffected. Default ON; MERCURY_MF_PLATEAU_TIEBREAK_
+		// DEFEAT=1 restores the bare-metric baseline (byte-identical selection).
+		// REFUTED EXPERIMENT (kept env-gated, DEFAULT OFF = byte-identical baseline):
+		// energy-weighting the fine selection overshoots to the LATE/loud plateau edge
+		// (+3 symbols on the vehicle, 0/60 decode). MERCURY_F0V_SITE8_ENERGY=1 re-enables
+		// it for A/B reproduction only. Do NOT default-ON (it regressed the fine-timing lock).
+		static const int site8_energy_weight = []{ const char* e=std::getenv("MERCURY_F0V_SITE8_ENERGY"); return (e&&*e)?atoi(e):0; }();
+		corss_corr_vals[i]= site8_energy_weight ? corss_corr * (norm_a + norm_b) : corss_corr;
 		corss_corr_loc[i]=i;
 	}
 

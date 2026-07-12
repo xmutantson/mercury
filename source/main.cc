@@ -32,6 +32,7 @@
 #include <atomic>   // R006: std::atomic<bool> shutdown_ (cross-thread termination flag)
 #include <thread>   // R006: --test-shutdown-atomic cross-thread smoke
 #include <type_traits> // R006: static_assert shutdown_ is atomic
+#include <random>   // P1 frame-0 vehicle: deterministic AWGN run-up synthesis
 #include <cstring>  // FIX-C: memset for sigaction struct init (explicit, not transitive)
 #include <csignal>  // FIX-C: SIGTERM/SIGINT graceful-shutdown handler (raise/SIGTERM)
 #ifndef _WIN32
@@ -1001,6 +1002,207 @@ static int run_subpeak_rescue_selftest()
 
     printf("[TEST-SUBPEAK-RESCUE] %s (%d failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
     return fails==0 ? 0 : 1;
+}
+
+// --test-frame0-vehicle: deterministic IN-PROCESS reproduction of the
+// post-turnaround FIRST-FRAME wrong-lock (the anchor-race structural loss).
+// Synthesizes a passband RX buffer = [near-silent AWGN run-up] + [a REAL preamble
+// + data frame for the loaded config, built via the production transmit_byte] and
+// threads it through the PRODUCTION acquisition (receive_byte, ofdm_forced_delay=-1
+// => real Schmidl-Cox coarse + Phase-2 argmax + site-8 with_metric fine +
+// SUBPEAK-REJECT). Recovery is defeated via MERCURY_SUBPEAK_RESCUE_DEFEAT=1 so the
+// RAW lock is measured (prevention meter, not the recovery counter).
+//
+// Per cell it reports: true onset D, the final locked delay, the SIGNED offset
+// delta = final - D in symbols (the DIRECTION the field docs disagree on: EARLY /
+// undershoot vs LATE / overshoot), coarse metric, mean_H, decoded. Faithfulness
+// fingerprint = the field signature (coarse_metric>=0.97 && mean_H<0.5 &&
+// |delta|>=~1 symbol && !decoded). This is the missing deterministic fire-proof.
+struct F0VCell {
+    int onset_symb; double snr_db; unsigned seed;
+    int true_onset; int final_delay; int delta; double delta_sym;
+    double coarse_metric; double mean_H; int decoded; int sync_trials; int edge;
+    double frame_rms; double sigma;
+};
+
+static F0VCell f0v_run_cell(int config, int onset_symb, double snr_db, unsigned seed)
+{
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(config);
+
+    cl_data_container& dc = ts.data_container;
+    int interp       = ts.frequency_interpolation_rate;
+    int sym_samples  = dc.Nofdm * interp;
+    int frame_symb   = dc.Nsymb + dc.preamble_nSymb;
+    int frame_samp   = frame_symb * sym_samples;
+    int buf_samp     = dc.buffer_Nsymb * sym_samples;
+    int max_delay    = buf_samp - frame_samp;
+
+    // Build one clean frame via the production TX path.
+    int nReal_data = dc.nBits - ts.ldpc.P;
+    int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8;
+    if (frame_size < 1) frame_size = 1;
+    std::vector<int> payload(frame_size, 0);
+    for (int i = 0; i < frame_size; i++) payload[i] = (i * 53 + 7) & 0xff;
+    std::vector<double> frame(frame_samp, 0.0);
+    ts.transmit_byte(payload.data(), frame_size, frame.data(), SINGLE_MESSAGE);
+
+    // RMS over the frame region -> calibrate the AWGN floor to the requested SNR.
+    double e = 0.0; for (double v : frame) e += v * v;
+    double frame_rms = (frame.size() > 0) ? sqrt(e / (double)frame.size()) : 0.0;
+
+    int D = onset_symb * sym_samples; if (D > max_delay) D = max_delay; if (D < 0) D = 0;
+
+    // Whole-buffer AWGN floor (the near-silent RUN-UP the field flush leaves before
+    // frame-0; noise-only outside the frame region, signal+noise inside).
+    double* rx = dc.ready_to_process_passband_delayed_data;
+    std::mt19937 rng(seed);
+    double sigma = (snr_db < 200.0) ? frame_rms / pow(10.0, snr_db / 20.0) : 0.0;
+    std::normal_distribution<double> nd(0.0, sigma);
+    for (int i = 0; i < buf_samp; i++) rx[i] = (sigma > 0.0) ? nd(rng) : 0.0;
+    int copy_n = frame_samp; if (D + copy_n > buf_samp) copy_n = buf_samp - D;
+    for (int i = 0; i < copy_n; i++) rx[D + i] += frame[i];
+
+    // Real acquisition, INIT full-search (no BATCH predict, no forced/known delay).
+    ts.receive_stats.ofdm_search_raw           = 0;
+    ts.data_container.nUnder_processing_events = 0;
+    ts.receive_stats.ofdm_batch_active         = false;
+    ts.receive_stats.delay                     = 0;
+    ts.ofdm_forced_delay                       = -1;
+    ts.mfsk_fixed_delay                        = -1;
+
+    ts.receive_byte(rx, dc.hd_decoded_data_byte);
+
+    F0VCell c;
+    c.onset_symb = onset_symb; c.snr_db = snr_db; c.seed = seed;
+    c.true_onset = D;
+    c.final_delay = ts.receive_stats.delay;
+    c.delta = c.final_delay - D;
+    c.delta_sym = (sym_samples > 0) ? (double)c.delta / (double)sym_samples : 0.0;
+    c.coarse_metric = ts.receive_stats.coarse_metric;
+    c.mean_H = ts.receive_stats.mean_H;
+    c.decoded = (ts.receive_stats.message_decoded == YES) ? 1 : 0;
+    // byte-check the decode so a spurious message_decoded flag cannot read as TRUE.
+    if (c.decoded) {
+        for (int i = 0; i < frame_size; i++)
+            if ((dc.hd_decoded_data_byte[i] & 0xff) != (payload[i] & 0xff)) { c.decoded = 0; break; }
+    }
+    c.sync_trials = ts.receive_stats.sync_trials;
+    int half = sym_samples / 2;
+    c.edge = (c.delta < -half) ? -1 : (c.delta > half ? +1 : 0);
+    c.frame_rms = frame_rms; c.sigma = sigma;
+    return c;
+}
+
+static int run_frame0_vehicle_selftest()
+{
+    // Ensure the RAW lock is measured (defeat the F1b rescue). setenv before the
+    // first receive_byte so the read-once static in telecom_system sees it.
+    setenv("MERCURY_SUBPEAK_RESCUE_DEFEAT", "1", 1);
+
+    printf("[TEST-FRAME0-VEHICLE] deterministic in-process post-turnaround wrong-lock reproduction\n");
+    const char* cfg_env = std::getenv("MERCURY_F0V_CONFIG");
+    int cfg = cfg_env ? atoi(cfg_env) : CONFIG_16;
+    printf("[TEST-FRAME0-VEHICLE] config=%d  (fingerprint: coarse_metric>=0.97 && mean_H<0.5 && |delta|>=1sym && !decoded)\n", cfg);
+    printf("[TEST-FRAME0-VEHICLE] %-6s %-8s %-6s %-11s %-9s %-8s %-8s %-4s %-6s %-6s\n",
+           "onset", "snr_dB", "seed", "final_delay", "delta_smp", "delta_sy", "metric", "dec", "meanH", "edge");
+
+    // Sweep: run-up SNR (inf = pure zeros control) x a few onsets x a few seeds.
+    // The field wrong lock is k~1-3.5 symbols off with metric~0.998, mean_H~0.37.
+    double snrs[] = {200.0, 30.0, 25.0, 20.0, 15.0};
+    int onsets[]  = {8, 20, 60, 100};
+    unsigned seeds[] = {1u, 2u, 3u};
+    int n_wronglock = 0, n_total = 0, n_early = 0, n_late = 0, n_decoded = 0;
+    for (double snr : snrs) {
+        for (int onset : onsets) {
+            for (unsigned sd : seeds) {
+                F0VCell c = f0v_run_cell(cfg, onset, snr, sd);
+                n_total++;
+                const char* edge_s = (c.edge < 0) ? "EARLY" : (c.edge > 0 ? "LATE" : "TRUE");
+                bool wrong = (c.coarse_metric >= 0.97) && (c.mean_H >= 0.0) && (c.mean_H < 0.5)
+                             && (c.edge != 0) && (!c.decoded);
+                if (wrong) { n_wronglock++; if (c.edge < 0) n_early++; else n_late++; }
+                if (c.decoded) n_decoded++;
+                printf("[TEST-FRAME0-VEHICLE] %-6d %-8.0f %-6u %-11d %-9d %-+8.2f %-8.4f %-4d %-6.3f %-6s%s\n",
+                       onset, c.snr_db, c.seed, c.final_delay, c.delta, c.delta_sym,
+                       c.coarse_metric, c.decoded, c.mean_H, edge_s,
+                       wrong ? "  <== WRONG-LOCK" : "");
+            }
+        }
+    }
+    printf("[TEST-FRAME0-VEHICLE] SUMMARY cells=%d wrong_lock=%d (early=%d late=%d) decoded=%d\n",
+           n_total, n_wronglock, n_early, n_late, n_decoded);
+    printf("[TEST-FRAME0-VEHICLE] FAITHFUL=%s (need >=1 wrong-lock with the field fingerprint)\n",
+           n_wronglock > 0 ? "YES" : "NO");
+    // This is a diagnostic vehicle, not a pass/fail gate: always return 0.
+    return 0;
+}
+
+// --test-frame0-mf: candidate (c) MATCHED-FILTER viability measurement. Revives the
+// #if0'd OFDM correlation template (env MERCURY_F0V_MF_TEMPLATE=1, set below) and runs
+// the production time_sync_preamble_matched on the SAME synthesized wrong-lock buffer.
+// Reports the MF peak delay + correlation. Decision rule (per the task):
+//   - MF peak lands at TRUE (|mf_delay - D| < 1/2 symbol) AND corr clearly above the
+//     2.0 detect floor / above the plateau-edge values -> MF DISCRIMINATES the plateau
+//     -> candidate (c) is a viable winner.
+//   - MF corr stays ~0.15 / peak not at TRUE -> MF is DEAD (cannot beat the plateau) ->
+//     drop it, do NOT wire a dead detector into the shared path.
+static int run_frame0_mf_selftest()
+{
+    setenv("MERCURY_F0V_MF_TEMPLATE", "1", 1);   // build the MF template during load
+    printf("[TEST-FRAME0-MF] matched-filter plateau-tiebreak VIABILITY measurement\n");
+    const char* cfg_env = std::getenv("MERCURY_F0V_CONFIG");
+    int cfg = cfg_env ? atoi(cfg_env) : CONFIG_16;
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(cfg);
+    cl_data_container& dc = ts.data_container;
+    int interp       = ts.frequency_interpolation_rate;
+    int sym_samples  = dc.Nofdm * interp;
+    int frame_symb   = dc.Nsymb + dc.preamble_nSymb;
+    int frame_samp   = frame_symb * sym_samples;
+    int buf_samp     = dc.buffer_Nsymb * sym_samples;
+    int max_delay    = buf_samp - frame_samp;
+
+    printf("[TEST-FRAME0-MF] config=%d template_len=%d energy=%.4f nsymb=%d sym_samples=%d (len=0 => revive FAILED)\n",
+           cfg, ts.ofdm.ofdm_corr_template_len, ts.ofdm.ofdm_corr_template_energy,
+           ts.ofdm.ofdm_corr_template_nsymb, sym_samples);
+
+    int nReal_data = dc.nBits - ts.ldpc.P;
+    int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8; if (frame_size < 1) frame_size = 1;
+    std::vector<int> payload(frame_size, 0); for (int i=0;i<frame_size;i++) payload[i]=(i*53+7)&0xff;
+    std::vector<double> frame(frame_samp, 0.0);
+    ts.transmit_byte(payload.data(), frame_size, frame.data(), SINGLE_MESSAGE);
+    double e=0; for(double v:frame) e+=v*v; double frame_rms=(frame.size()>0)?sqrt(e/(double)frame.size()):0.0;
+
+    std::vector<std::complex<double>> bb(buf_samp);
+    printf("[TEST-FRAME0-MF] %-6s %-8s %-6s %-11s %-11s %-11s %-9s\n",
+           "onset","snr_dB","seed","true_D","mf_delay","mf-D(sym)","mf_corr");
+    double snrs[]={200.0,30.0}; int onsets[]={60,100}; unsigned seeds[]={1u,2u};
+    int n_true=0,n_total=0;
+    for (double snr:snrs) for (int onset:onsets) for (unsigned sd:seeds) {
+        int D=onset*sym_samples; if(D>max_delay)D=max_delay; if(D<0)D=0;
+        std::mt19937 rng(sd);
+        double sigma=(snr<200.0)?frame_rms/pow(10.0,snr/20.0):0.0;
+        std::normal_distribution<double> nd(0.0,sigma);
+        std::vector<double> rx(buf_samp);
+        for(int i=0;i<buf_samp;i++) rx[i]=(sigma>0.0)?nd(rng):0.0;
+        int cn=frame_samp; if(D+cn>buf_samp)cn=buf_samp-D;
+        for(int i=0;i<cn;i++) rx[D+i]+=frame[i];
+        ts.ofdm.passband_to_baseband(rx.data(), buf_samp, bb.data(),
+            ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, 1, &ts.ofdm.FIR_rx_time_sync);
+        TimeSyncResult mf = ts.ofdm.time_sync_preamble_matched(bb.data(), buf_samp, interp, dc.preamble_nSymb);
+        double mfdsym=(sym_samples>0)?(double)(mf.delay-D)/sym_samples:0.0;
+        bool at_true = (sym_samples>0) && (std::abs(mf.delay-D) < sym_samples/2);
+        n_total++; if(at_true) n_true++;
+        printf("[TEST-FRAME0-MF] %-6d %-8.0f %-6u %-11d %-11d %-+11.2f %-9.4f%s\n",
+            onset, snr, sd, D, mf.delay, mfdsym, mf.correlation, at_true?"  TRUE":"  OFF");
+    }
+    printf("[TEST-FRAME0-MF] SUMMARY cells=%d mf_at_true=%d  VIABLE=%s\n",
+        n_total, n_true, (n_true==n_total && n_total>0)?"YES":"NO");
+    return 0;
 }
 
 // --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
@@ -2231,6 +2433,14 @@ int main(int argc, char *argv[])
         // but whose body is in-buffer must be RECOVERED, not discarded) and exit.
         // Faithful in-process synthetic-fire through transmit_byte/receive_byte;
         // see fact-documents/data-flow-acq-bounds-gate.md.
+        if (strcmp(argv[i], "--test-frame0-vehicle") == 0) {
+            int failed = run_frame0_vehicle_selftest();
+            return failed;
+        }
+        if (strcmp(argv[i], "--test-frame0-mf") == 0) {
+            int failed = run_frame0_mf_selftest();
+            return failed;
+        }
         if (strcmp(argv[i], "--test-acq-bounds") == 0) {
             int failed = run_acq_bounds_selftest();
             return (failed == 0) ? 0 : 1;
