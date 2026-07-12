@@ -2795,7 +2795,7 @@ skip_h_retry_point:
 				int fe_buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;
 				int delay_dec = receive_stats.delay / fe_M;
 
-				// F-A (MERCURY_FINE_ENERGY_REL, default OFF = byte-identical): the absolute
+				// F-A (MERCURY_FINE_ENERGY_REL, default ON (proven: rescue-displacement 19-26->0 x3 seeds); MERCURY_FINE_ENERGY_REL=0 to defeat): the absolute
 				// floor below only catches a DEAD-silent lock. A lock whose window straddles
 				// the near-silent run-up (the post-turnaround frame-0 wrong-lock) has run-up
 				// energy ABOVE the floor and sails through unadvanced. The silence-cancellation
@@ -2806,7 +2806,7 @@ skip_h_retry_point:
 				// (preserving sub-symbol phase) until the preamble window is energy-consistent.
 				// At the true onset the per-symbol profile is flat, so the gate is quiescent and
 				// cannot advance into data. See the cross-layer acquisition audit (frame-0 wrong-lock).
-				static const int fine_energy_rel = []{ const char* e=std::getenv("MERCURY_FINE_ENERGY_REL"); return (e&&*e)?atoi(e):0; }();
+				static const int fine_energy_rel = []{ const char* e=std::getenv("MERCURY_FINE_ENERGY_REL"); return (e&&*e)?atoi(e):1; }();
 				if(fine_energy_rel)
 				{
 					const double REL_ALPHA = 0.25;
