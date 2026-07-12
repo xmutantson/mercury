@@ -1205,6 +1205,47 @@ static int run_frame0_mf_selftest()
     return 0;
 }
 
+// --test-frame0-replay <capture>: feed a raw passband ring captured at the
+// field SUBPEAK-REJECT (MERCURY_F0_RINGDUMP) through the PRODUCTION acquisition
+// exactly as the synth vehicle does. Faithful by construction (it IS the field
+// waveform, deep collapse included). With MERCURY_FINE_ENERGY_REL=1 the F-A gate
+// should advance the lock off the run-up and decode. Returns 0 if decoded.
+static int run_frame0_replay_selftest(const char* path)
+{
+    FILE* fp = fopen(path, "rb");
+    if(!fp){ printf("[TEST-FRAME0-REPLAY] cannot open %s\n", path); return 1; }
+    int hdr[6]; double meta[2]; long long ns = 0;
+    if(fread(hdr,sizeof(int),6,fp)!=6 || fread(meta,sizeof(double),2,fp)!=2 || fread(&ns,sizeof(long long),1,fp)!=1)
+    { fclose(fp); printf("[TEST-FRAME0-REPLAY] bad header %s\n", path); return 1; }
+    if(hdr[0]!=(int)0xF0CAB1 || ns<=0 || ns>500000000LL)
+    { fclose(fp); printf("[TEST-FRAME0-REPLAY] bad magic/size %s\n", path); return 1; }
+    int config = hdr[1];
+    std::vector<double> rx((size_t)ns);
+    size_t got = fread(rx.data(), sizeof(double), (size_t)ns, fp);
+    fclose(fp);
+    if((long long)got != ns){ printf("[TEST-FRAME0-REPLAY] short read %s\n", path); return 1; }
+
+    setenv("MERCURY_SUBPEAK_RESCUE_DEFEAT", "1", 1);   // measure the RAW lock
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(config);
+    cl_data_container& dc = ts.data_container;
+    ts.receive_stats.ofdm_search_raw           = 0;
+    ts.data_container.nUnder_processing_events = 0;
+    ts.receive_stats.ofdm_batch_active         = false;
+    ts.receive_stats.delay                     = 0;
+    ts.ofdm_forced_delay                       = -1;
+    ts.mfsk_fixed_delay                        = -1;
+    ts.receive_byte(rx.data(), dc.hd_decoded_data_byte);
+    int decoded = (ts.receive_stats.message_decoded == YES) ? 1 : 0;
+    int sym_samples = dc.Nofdm * ts.frequency_interpolation_rate;
+    double dsym = (sym_samples>0) ? (double)((int)ts.receive_stats.delay - hdr[5]) / sym_samples : 0.0;
+    printf("[TEST-FRAME0-REPLAY] file=%s config=%d cap_delay=%d cap_metric=%.3f cap_meanH=%.3f => final_delay=%d d(sym)=%+.2f meanH=%.3f decoded=%d\n",
+        path, config, hdr[5], meta[0], meta[1], (int)ts.receive_stats.delay, dsym,
+        ts.receive_stats.mean_H, decoded);
+    return decoded ? 0 : 1;
+}
+
 // --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
 // pass-after self-test. See fact-documents/chase-combining-harq.md.
 //
@@ -2440,6 +2481,10 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-frame0-mf") == 0) {
             int failed = run_frame0_mf_selftest();
             return failed;
+        }
+        if (strcmp(argv[i], "--test-frame0-replay") == 0) {
+            const char* cap = (i+1 < argc) ? argv[i+1] : "";
+            return run_frame0_replay_selftest(cap);
         }
         if (strcmp(argv[i], "--test-acq-bounds") == 0) {
             int failed = run_acq_bounds_selftest();

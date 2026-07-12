@@ -292,6 +292,8 @@ def run_cohort(args):
         for k, v in DEFEAT_ENV.items():
             envs += ["--env", f"{k}={v}"]
         envs += ["--env", "MERCURY_CBC_METER=1"]
+        for kv in args.extra_env:
+            envs += ["--env", kv]
         if args.signal_rms is not None:
             envs += ["--env", f"MERCURY_CBC_SIGNAL_RMS={args.signal_rms}"]
         cmd = [sys.executable, ARQ_REALAUDIO,
@@ -330,6 +332,8 @@ def main():
     ap.add_argument("--signal-rms", default=None,
                     help="override MERCURY_CBC_SIGNAL_RMS (frame/noise split)")
     ap.add_argument("--stagger", type=float, default=3.0)
+    ap.add_argument("--extra-env", action="append", default=[],
+                    help="KEY=VAL env passed to the mercury child (repeatable)")
     ap.add_argument("--outdir", default="/dev/shm/anchor_race")
     ap.add_argument("--parse-only", action="store_true",
                     help="re-score arq_*.log already in --outdir; do not launch")

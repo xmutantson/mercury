@@ -33,6 +33,7 @@
 #include <cstdlib> // std::getenv / atoi for MERCURY_SIM2_MINI_NSYM (LEVER P MINI knob)
 #include <cstdint> // bigblock WAV I/O: uint32_t/int16_t
 #include <cstdio>  // bigblock WAV I/O: FILE/fopen/fread/fwrite
+#include <unistd.h> // getpid() for the F0-RINGDUMP capture-replay fixture filename
 #include <cmath>   // bigblock: round/log2/sqrt/fabs
 #include <cassert> // fact-doc §13: deterministic bounds assert on the big-block TX/RX write
 #ifdef MERCURY_GUI_ENABLED
@@ -2793,31 +2794,94 @@ skip_h_retry_point:
 				int fe_sym_dec = data_container.Nofdm;
 				int fe_buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;
 				int delay_dec = receive_stats.delay / fe_M;
-				double fine_energy = 0.0;
-				for(int i = 0; i < fe_sym_dec && (delay_dec + i) < fe_buf_dec; i++)
-					fine_energy += std::norm(data_container.baseband_data_decimated[delay_dec + i]);
-				fine_energy /= fe_sym_dec;
-				if(fine_energy < energy_gate_floor)
+
+				// F-A (MERCURY_FINE_ENERGY_REL, default OFF = byte-identical): the absolute
+				// floor below only catches a DEAD-silent lock. A lock whose window straddles
+				// the near-silent run-up (the post-turnaround frame-0 wrong-lock) has run-up
+				// energy ABOVE the floor and sails through unadvanced. The silence-cancellation
+				// tie set that produces that wrong-lock EXISTS only when a presumed-preamble
+				// symbol slot is near-silent relative to its siblings, so gate on RELATIVE
+				// per-symbol consistency across the rx_eff_preamble slots: if E_min <
+				// REL_ALPHA*E_max some slot straddles the run-up => advance whole symbols
+				// (preserving sub-symbol phase) until the preamble window is energy-consistent.
+				// At the true onset the per-symbol profile is flat, so the gate is quiescent and
+				// cannot advance into data. See the cross-layer acquisition audit (frame-0 wrong-lock).
+				static const int fine_energy_rel = []{ const char* e=std::getenv("MERCURY_FINE_ENERGY_REL"); return (e&&*e)?atoi(e):0; }();
+				if(fine_energy_rel)
 				{
-					int orig_delay = receive_stats.delay;
-					int orig_delay_dec = orig_delay / fe_M;
-					for(int fwd = sym_samples; fwd <= 3*sym_samples; fwd += sym_samples)
+					const double REL_ALPHA = 0.25;
+					int npre = rx_eff_preamble; if(npre < 1) npre = 1;
+					// per-symbol mean energy Emin/Emax across npre presumed-preamble slots at a
+					// decimated start index; false if the window runs off the buffer.
+					auto fe_profile = [&](int start_dec, double& emin, double& emax)->bool {
+						emin = 0.0; emax = 0.0; bool first = true;
+						for(int s = 0; s < npre; s++) {
+							int off = start_dec + s*fe_sym_dec;
+							if(off + fe_sym_dec > fe_buf_dec) return false;
+							double se = 0.0;
+							for(int i = 0; i < fe_sym_dec; i++)
+								se += std::norm(data_container.baseband_data_decimated[off + i]);
+							se /= fe_sym_dec;
+							if(first) { emin = emax = se; first = false; }
+							else { if(se < emin) emin = se; if(se > emax) emax = se; }
+						}
+						return !first;
+					};
+					double emin0 = 0.0, emax0 = 0.0;
+					bool have0 = fe_profile(delay_dec, emin0, emax0);
+					bool inconsistent = have0 && (emin0 < REL_ALPHA * emax0);
+					bool degenerate  = (!have0) || (emax0 < energy_gate_floor);
+					if(inconsistent || degenerate)
 					{
-						int candidate = orig_delay + fwd;
-						int candidate_dec = orig_delay_dec + fwd / fe_M;
-						if(candidate_dec + fe_sym_dec > fe_buf_dec) break;
-						double e = 0.0;
-						for(int i = 0; i < fe_sym_dec; i++)
-							e += std::norm(data_container.baseband_data_decimated[candidate_dec + i]);
-						e /= fe_sym_dec;
-						if(e > energy_gate_floor)
+						int orig_delay = receive_stats.delay;
+						int orig_delay_dec = delay_dec;
+						for(int fwd = sym_samples; fwd <= 3*sym_samples; fwd += sym_samples)
 						{
-							if (g_verbose)
-								printf("[OFDM-SYNC] fine-energy-fix: delay %d->%d (fwd %d sym)\n",
-									orig_delay, candidate, fwd / sym_samples);
-							fflush(stdout);
-							receive_stats.delay = candidate;
-							break;
+							int candidate = orig_delay + fwd;
+							int candidate_dec = orig_delay_dec + fwd / fe_M;
+							double eminC = 0.0, emaxC = 0.0;
+							if(!fe_profile(candidate_dec, eminC, emaxC)) break;
+							// accept the first candidate whose preamble window is energy-consistent
+							if(emaxC > energy_gate_floor && eminC >= REL_ALPHA * emaxC)
+							{
+								printf("[FINE-ENERGY-REL] delay %d->%d (fwd %d sym, Emin/Emax=%.3f)\n",
+									orig_delay, candidate, fwd / sym_samples,
+									(emaxC > 0.0 ? eminC/emaxC : 0.0));
+								fflush(stdout);
+								receive_stats.delay = candidate;
+								break;
+							}
+						}
+					}
+				}
+				else
+				{
+					double fine_energy = 0.0;
+					for(int i = 0; i < fe_sym_dec && (delay_dec + i) < fe_buf_dec; i++)
+						fine_energy += std::norm(data_container.baseband_data_decimated[delay_dec + i]);
+					fine_energy /= fe_sym_dec;
+					if(fine_energy < energy_gate_floor)
+					{
+						int orig_delay = receive_stats.delay;
+						int orig_delay_dec = orig_delay / fe_M;
+						for(int fwd = sym_samples; fwd <= 3*sym_samples; fwd += sym_samples)
+						{
+							int candidate = orig_delay + fwd;
+							int candidate_dec = orig_delay_dec + fwd / fe_M;
+							if(candidate_dec + fe_sym_dec > fe_buf_dec) break;
+							double e = 0.0;
+							for(int i = 0; i < fe_sym_dec; i++)
+								e += std::norm(data_container.baseband_data_decimated[candidate_dec + i]);
+							e /= fe_sym_dec;
+							if(e > energy_gate_floor)
+							{
+								if (g_verbose)
+									printf("[OFDM-SYNC] fine-energy-fix: delay %d->%d (fwd %d sym)\n",
+										orig_delay, candidate, fwd / sym_samples);
+								fflush(stdout);
+								receive_stats.delay = candidate;
+								break;
+							}
 						}
 					}
 				}
@@ -3196,6 +3260,37 @@ skip_h_retry_point:
 				// budget is spent.
 				if(receive_stats.coarse_metric >= 0.97 && mean_H < 0.5)
 				{
+					// F0-RINGDUMP (capture-replay fixture): at the SUBPEAK-REJECT trigger dump the
+					// raw passband ring + wrong-lock metadata for --test-frame0-replay. Faithful by
+					// construction (it IS the field waveform). Gated by MERCURY_F0_RINGDUMP=<dir>;
+					// a read-only side effect, byte-identical when unset.
+					{
+						static const char* f0_ringdir = std::getenv("MERCURY_F0_RINGDUMP");
+						static int f0_ringn = 0;
+						if(f0_ringdir && *f0_ringdir && f0_ringn < 16 && M != MOD_MFSK)
+						{
+							long long ns = (long long)data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+							char f0_path[512];
+							snprintf(f0_path, sizeof(f0_path), "%s/f0cap_%d_%d.bin", f0_ringdir, (int)getpid(), f0_ringn);
+							FILE* f0_fp = fopen(f0_path, "wb");
+							if(f0_fp)
+							{
+								int f0_hdr[6] = { (int)0xF0CAB1, current_configuration,
+									data_container.buffer_Nsymb, data_container.Nofdm,
+									frequency_interpolation_rate, (int)receive_stats.delay };
+								double f0_meta[2] = { receive_stats.coarse_metric, mean_H };
+								fwrite(f0_hdr, sizeof(int), 6, f0_fp);
+								fwrite(f0_meta, sizeof(double), 2, f0_fp);
+								fwrite(&ns, sizeof(long long), 1, f0_fp);
+								fwrite(data, sizeof(double), (size_t)ns, f0_fp);
+								fclose(f0_fp);
+								f0_ringn++;
+								printf("[F0-RINGDUMP] wrote %s ns=%lld delay=%d metric=%.3f mean_H=%.3f\n",
+									f0_path, ns, (int)receive_stats.delay, receive_stats.coarse_metric, mean_H);
+								fflush(stdout);
+							}
+						}
+					}
 					// F1b Part B: sample-anchored true-boundary rescue (see the
 					// block-comment before skip_h_retry_point). Argmax of mean|H|
 					// over a ±2-symbol sample window around the rejected lock, using
