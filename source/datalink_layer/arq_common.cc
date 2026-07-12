@@ -658,6 +658,7 @@ cl_arq_controller::cl_arq_controller()
 	measurements.frequency_offset=-99.9;
 
 	data_batch_size=1;
+	rx_copy_window=-1;          // Option B' (data-flow-batch-size.md §9): per-call copy_data_to_buffer bound override
 	nominal_batch_size=1;
 	batch_consec_acks=0;
 	control_batch_size=1;
@@ -1033,6 +1034,7 @@ cl_arq_controller::cl_arq_controller()
 	rx_buffer_eob_seq=-1;  // R038: per-frame v2 EOB staging (set in receive())
 	rx_buffer_batch_total_frames=-1;  // D5: per-frame batch_total_frames staging (set in receive())
 	rx_batch_total_frames=-1;          // D5: promoted authoritative per-batch frame count, or -1
+	rx_copy_window=-1;                  // Option B' (data-flow-batch-size.md §9): clear stale per-call delivery bound
 	data_ack_received=NO;
 	repeating_last_ack=NO;
 	disconnect_requested=NO;
@@ -1376,6 +1378,39 @@ int cl_arq_controller::v2_flip_resolve_slot(int batch_idx)
 		return -1;
 	}
 	return (int)(unsigned char)messages_batch_tx[batch_idx].id;
+}
+
+// Option B' (data-flow-batch-size.md §9): the MERCURY_BPRIME_DEFEAT env gate.
+// When set, the RX acceptance window collapses to data_batch_size and the (B)
+// backstop fires on the pre-B' > data_batch_size condition — byte-identical to the
+// pre-B' modem. Mirrors MERCURY_BATCHSIZE_DESYNC_DEFEAT / MERCURY_D5_INFER_DEFEAT.
+bool cl_arq_controller::bprime_defeat_active()
+{
+	const char* e = std::getenv("MERCURY_BPRIME_DEFEAT");
+	return (e && *e && atoi(e) != 0);
+}
+
+// Option B' (data-flow-batch-size.md §9): the effective RX ACCEPTANCE WINDOW.
+// The RX TRUSTS the CRC-protected per-batch sender-declared frame count (D5) when
+// it exceeds the stale command-synced data_batch_size, so a lost/late
+// SET_LINK_PARAMS can no longer truncate a batch the CMD built LARGER (res_c3100).
+// max(data_batch_size, min(D5,32)): NEVER narrows below data_batch_size, so every
+// non-desync batch (matched / step-down / compression / encryption / robust /
+// all-retx / D5-absent, and any sack_v2-off session) is BYTE-IDENTICAL. Only a
+// genuine CMD>RSP over-count (D5 > data_batch_size) widens the window, and only up
+// to MAX_SACK_BATCH_SIZE (the messages_rx[] SACK-bitmap ceiling, also == AXIS2
+// batch ceil, so a legitimate non-crypto OFDM batch never exceeds it).
+int cl_arq_controller::rx_effective_window(int sender_total_frames) const
+{
+	if(!sack_v2_enabled)         return data_batch_size;   // D5 is sack_v2-only
+	if(bprime_defeat_active())   return data_batch_size;   // pre-B' behavior
+	if(sender_total_frames > data_batch_size)
+	{
+		int w = sender_total_frames;
+		if(w > MAX_SACK_BATCH_SIZE) w = MAX_SACK_BATCH_SIZE;
+		return w;
+	}
+	return data_batch_size;
 }
 
 void cl_arq_controller::set_data_batch_size(int data_batch_size)
@@ -10793,11 +10828,16 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	int prev_expected = data_batch_size;
 	if(rx_batch_total_frames > 0 && !d5_infer_defeat)
 	{
-		// Wired, authoritative count. Clamp to [1, data_batch_size]: the
-		// crypto batch never exceeds data_batch_size frames, and the
-		// transfer/delivery loops iterate [0, data_batch_size).
+		// Wired, authoritative count. Option B' (data-flow-batch-size.md §9):
+		// clamp to [1, eff_window] rather than [1, data_batch_size] so a current
+		// batch the sender built LARGER than the stale data_batch_size freezes its
+		// TRUE span into the prev — matching the widened current-batch acceptance
+		// window (rx_effective_window). Byte-identical when D5 <= data_batch_size
+		// (eff_window == data_batch_size); only a genuine CMD>RSP over-count widens,
+		// bounded by MAX_SACK_BATCH_SIZE (and the nMessages hard bound below).
 		prev_expected = rx_batch_total_frames;
-		if(prev_expected > data_batch_size) prev_expected = data_batch_size;
+		int prev_ceiling = rx_effective_window(rx_batch_total_frames);
+		if(prev_expected > prev_ceiling) prev_expected = prev_ceiling;
 	}
 	else if(cipher_suite.is_active())
 	{
@@ -15270,6 +15310,19 @@ void cl_arq_controller::copy_data_to_buffer()
 {
 	int copied = 0;
 	int total_bytes = 0;
+	// Option B' (data-flow-batch-size.md §9): the DELIVERY window. Defaults to
+	// data_batch_size (byte-identical, every existing caller leaves rx_copy_window
+	// at -1). The current-batch commit path sets rx_copy_window = eff_window
+	// (rx_effective_window()) right before delivering a batch the sender built
+	// LARGER than data_batch_size, so the reassembler delivers ALL declared frames
+	// instead of truncating at the stale data_batch_size (the res_c3100 shift).
+	// Hard-bounded by nMessages (the messages_rx[] allocation).
+	int cw = this->data_batch_size;
+	if(this->rx_copy_window > 0)
+	{
+		cw = this->rx_copy_window;
+		if(cw > this->nMessages) cw = this->nMessages;
+	}
 	// Option W (data-flow-stream-offset.md §2.3): total TRANSPORTED bytes this delivery
 	// reassembled + delivered = Σ ACKED messages_rx[i].length for i<data_batch_size. The
 	// SAME quantity the sender committed (INV5). Advances rx_stream_delivered at
@@ -15328,7 +15381,7 @@ void cl_arq_controller::copy_data_to_buffer()
 		char assembled[16384];
 		int assembled_size = 0;
 
-		for(int i=0;i<this->data_batch_size;i++)
+		for(int i=0;i<cw;i++)   // Option B' (§9): cw == eff_window (== data_batch_size unless the sender over-declared)
 		{
 			if(messages_rx[i].status==ACKED)
 			{
@@ -15354,7 +15407,7 @@ void cl_arq_controller::copy_data_to_buffer()
 			}
 		}
 		// Clear any stale slots beyond batch boundary
-		for(int i=this->data_batch_size;i<this->nMessages;i++)
+		for(int i=cw;i<this->nMessages;i++)   // Option B' (§9): clear beyond the effective (possibly widened) window
 			messages_rx[i].status=FREE;
 
 		if(assembled_size >= compressor.get_header_size())
@@ -15508,8 +15561,8 @@ void cl_arq_controller::copy_data_to_buffer()
 	else
 	{
 		// --- No compression: original per-message push ---
-		// Only iterate data_batch_size slots for current batch
-		for(int i=0;i<this->data_batch_size;i++)
+		// Only iterate eff_window (== data_batch_size unless the sender over-declared) slots
+		for(int i=0;i<cw;i++)   // Option B' (§9)
 		{
 			if(messages_rx[i].status==ACKED)
 			{
@@ -15536,7 +15589,7 @@ void cl_arq_controller::copy_data_to_buffer()
 			}
 		}
 		// Clear stale slots beyond batch boundary
-		for(int i=this->data_batch_size;i<this->nMessages;i++)
+		for(int i=cw;i<this->nMessages;i++)   // Option B' (§9): clear beyond the effective (possibly widened) window
 		{
 			if(messages_rx[i].status!=FREE)
 				messages_rx[i].status=FREE;

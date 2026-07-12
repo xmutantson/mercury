@@ -6536,6 +6536,33 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			batch_consec_acks = 0;
 		}
 
+		// TEST-ONLY, default-off (silent-corruption-residual.md §7 / data-flow-batch-size.md
+		// §9 LIVE fire proof): reproduce the res_c3100 CMD>RSP batch-size desync on the wire.
+		// After the first clean OFDM batch (so the RSP has settled at its config default), force
+		// the CMD to build MERCURY_BATCHSIZE_DESYNC frames per batch WITHOUT sending a
+		// SET_LINK_PARAMS — i.e. exactly the observed state of a lost/unapplied Axis-2 step-up
+		// (CMD=30, RSP=25). The RSP (no knob) stays at its default, so its wire D5 count exceeds
+		// its own data_batch_size and Option B' must WIDEN to deliver the batch in full. Fires
+		// ONCE (the grow makes the guard false thereafter). Grow-only (never shrinks), OFDM-only.
+		{
+			const char* e = std::getenv("MERCURY_BATCHSIZE_DESYNC");
+			if(e && *e && atoi(e) > 0
+			   && !is_robust_config(current_configuration)
+			   && batch_consec_acks >= 1
+			   && data_batch_size >= 20          // only at a settled WB batch (~cfg16, batch 25) — not mid-climb
+			   && data_batch_size < atoi(e))
+			{
+				int forced = atoi(e);
+				if(forced > MAX_SACK_BATCH_SIZE) forced = MAX_SACK_BATCH_SIZE;
+				printf("[TEST-BATCHSIZE-DESYNC-FORCE] CMD data_batch_size %d -> %d "
+					"(no SET_LINK_PARAMS emitted; RSP stays at its config default = the res_c3100 desync)\n",
+					data_batch_size, forced);
+				fflush(stdout);
+				set_data_batch_size(forced);
+				recalculate_ack_timeout_for_batch();
+			}
+		}
+
 		// Frame-level gearshift: after N consecutive successful data ACKs, shift up immediately
 		// Respect proven ceiling — don't re-try configs above what turboshift/BREAK verified.
 		{
