@@ -3020,16 +3020,34 @@ int cl_ofdm::time_sync_preamble(std::complex <double>*in, int size, int interpol
 	if(location_to_return >= nTrials_max)
 		location_to_return = nTrials_max - 1;
 
-	for(int j=0;j<nTrials_max;j++)
+	// Partial selection sort: after iteration j, slot j holds the (j+1)-th
+	// largest metric and corss_corr_loc[j] its sample position, so trial N
+	// (location_to_return=N) returns the TRUE N-th-best peak. The previous form
+	// copied vals[i] into slot j WITHOUT swapping the displaced value out of the
+	// remaining range, so every trial whose index was <= the global-argmax index
+	// re-found the SAME global maximum — the multi-trial SUBPEAK/SKIP-H retry
+	// ladder could never reach a distinct sub-peak. Swap BOTH value and location
+	// so each selected slot is removed from later scans. location_to_return=0 is
+	// byte-identical to the old form (slot 0 still receives the global argmax);
+	// corss_corr_loc[i] already equals i for every scanned position and unscanned
+	// positions carry vals=0 so they never win.
+	int nsort = (nTrials_max < size) ? nTrials_max : size;
+	for(int j=0;j<nsort;j++)
 	{
-		corss_corr_loc[j]=j;
+		int best_i = j;
 		for(int i=j+1;i<size;i++)
 		{
-			if (corss_corr_vals[i]>corss_corr_vals[j])
-			{
-				corss_corr_vals[j]=corss_corr_vals[i];
-				corss_corr_loc[j]=i;
-			}
+			if (corss_corr_vals[i] > corss_corr_vals[best_i])
+				best_i = i;
+		}
+		if(best_i != j)
+		{
+			double tv = corss_corr_vals[j];
+			corss_corr_vals[j] = corss_corr_vals[best_i];
+			corss_corr_vals[best_i] = tv;
+			int tl = corss_corr_loc[j];
+			corss_corr_loc[j] = corss_corr_loc[best_i];
+			corss_corr_loc[best_i] = tl;
 		}
 	}
 
@@ -3220,16 +3238,34 @@ TimeSyncResult cl_ofdm::time_sync_preamble_with_metric(std::complex <double>*in,
 	if(location_to_return >= nTrials_max)
 		location_to_return = nTrials_max - 1;
 
-	for(int j=0;j<nTrials_max;j++)
+	// Partial selection sort: after iteration j, slot j holds the (j+1)-th
+	// largest metric and corss_corr_loc[j] its sample position, so trial N
+	// (location_to_return=N) returns the TRUE N-th-best peak. The previous form
+	// copied vals[i] into slot j WITHOUT swapping the displaced value out of the
+	// remaining range, so every trial whose index was <= the global-argmax index
+	// re-found the SAME global maximum — the multi-trial SUBPEAK/SKIP-H retry
+	// ladder could never reach a distinct sub-peak. Swap BOTH value and location
+	// so each selected slot is removed from later scans. location_to_return=0 is
+	// byte-identical to the old form (slot 0 still receives the global argmax);
+	// corss_corr_loc[i] already equals i for every scanned position and unscanned
+	// positions carry vals=0 so they never win.
+	int nsort = (nTrials_max < size) ? nTrials_max : size;
+	for(int j=0;j<nsort;j++)
 	{
-		corss_corr_loc[j]=j;
+		int best_i = j;
 		for(int i=j+1;i<size;i++)
 		{
-			if (corss_corr_vals[i]>corss_corr_vals[j])
-			{
-				corss_corr_vals[j]=corss_corr_vals[i];
-				corss_corr_loc[j]=i;
-			}
+			if (corss_corr_vals[i] > corss_corr_vals[best_i])
+				best_i = i;
+		}
+		if(best_i != j)
+		{
+			double tv = corss_corr_vals[j];
+			corss_corr_vals[j] = corss_corr_vals[best_i];
+			corss_corr_vals[best_i] = tv;
+			int tl = corss_corr_loc[j];
+			corss_corr_loc[j] = corss_corr_loc[best_i];
+			corss_corr_loc[best_i] = tl;
 		}
 	}
 

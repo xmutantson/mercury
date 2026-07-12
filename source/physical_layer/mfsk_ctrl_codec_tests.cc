@@ -1483,6 +1483,63 @@ static double measure_preamble_rms_pb(cl_telecom_system& ts) {
 
 // §6.1 — High-SNR clean: assert detector returns delay≥0 AND matched
 // count near maximum at sigma=0. Sanity baseline.
+// P0 fire proof (Nth-best fine-timing sort). The sole live caller of
+// cl_ofdm::time_sync_preamble_with_metric (telecom_system.cc site-8) passes
+// location_to_return=sync_trials, so a broken selection sort makes every
+// SUBPEAK-REJECT / SKIP-H retry re-lock the IDENTICAL sample. Fail-before:
+// trials 0/1/2 return the same delay. Pass-after (swap sort): 3 distinct peaks.
+static void test_ofdm_fine_nthbest_sort_distinct_trials() {
+	const char* name = "ofdm_fine_nthbest_sort_distinct_trials";
+	cl_telecom_system ts;
+	std::mt19937 rng(0x5EED0001u);
+	std::vector<std::complex<double> > bb;
+	int expected_delay = 0, sym_samples = 0;
+	if (!synth_preamble_buffer(ts, /*noise_sigma_pb=*/0.0, /*synthesize_preamble=*/true,
+	                            rng, bb, expected_delay, sym_samples)) {
+		test_fail(name, "synth_preamble_buffer failed (load_configuration?)");
+		return;
+	}
+	int interp = ts.data_container.interpolation_rate;
+
+	// Prepend >=4 symbols of silence so the preamble (hence the global metric
+	// argmax) sits at a LARGE sample index — the exact condition under which the
+	// broken sort re-returns the same global argmax for every trial.
+	int lead = 4 * sym_samples;
+	std::vector<std::complex<double> > buf((size_t)lead, std::complex<double>(0.0, 0.0));
+	buf.insert(buf.end(), bb.begin(), bb.end());
+
+	int loc[3];
+	for (int t = 0; t < 3; t++) {
+		auto r = ts.ofdm.time_sync_preamble_with_metric(
+			buf.data(), (int)buf.size(), interp,
+			/*location_to_return=*/t, /*step=*/1, /*nTrials_max=*/3, /*nsym_override=*/-1);
+		loc[t] = r.delay;
+	}
+
+	// Sanity: trial 0 (global best) must land on the preamble region (near lead),
+	// proving the metric peak really is at a large index (else the test is vacuous).
+	int pream_span = ts.data_container.preamble_nSymb * sym_samples;
+	if (std::abs(loc[0] - lead) > pream_span) {
+		char b[220];
+		snprintf(b, sizeof(b),
+			"trial0 delay=%d not near preamble start lead=%d (span=%d) - buffer invalid",
+			loc[0], lead, pream_span);
+		test_fail(name, b);
+		return;
+	}
+
+	// Fire proof: all three trials must be pairwise DISTINCT sample positions.
+	if (loc[0] == loc[1] || loc[0] == loc[2] || loc[1] == loc[2]) {
+		char b[220];
+		snprintf(b, sizeof(b),
+			"trials NOT distinct: loc0=%d loc1=%d loc2=%d (Nth-best sort re-returns same peak)",
+			loc[0], loc[1], loc[2]);
+		test_fail(name, b);
+		return;
+	}
+	test_pass(name);
+}
+
 static void test_mfsk_data_preamble_argmax_clean() {
 	const char* name = "mfsk_data_preamble_argmax_clean";
 	cl_telecom_system ts;
@@ -8013,6 +8070,7 @@ int run_mfsk_ctrl_codec_tests() {
 	test_mfsk_data_preamble_argmax_pure_noise();
 	test_mfsk_data_preamble_argmax_data_content();
 	test_mfsk_data_preamble_argmax_high_snr_no_regression();
+	test_ofdm_fine_nthbest_sort_distinct_trials();   // P0 Nth-best sort fire proof
 
 	// §7 Mini-Moose CFO refinement regression suite
 	// (data-preamble-port-research.md §20, 2026-05-28).
