@@ -6714,9 +6714,33 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// The decision is the pure inband_climb_target() — production and the
 				// directed regression (test_inband_plus1_climb) drive the EXACT same logic.
 				int snr_elevator = -1;
+				// The OFDM elevator may consume the relayed SNR_uplink only from an OFDM config
+				// with a valid estimate (the tip triad). NOTE: the P0-gate SNR-provenance latch
+				// was DROPPED in v2 -- it was an unsatisfiable bootstrap deadlock (no OFDM-
+				// provenance SNR source exists at cfg0 on the forward climb, so the gate pinned
+				// the climb at cfg2, a 12x regression). The anchor tier gate is_ofdm_config(anchor)
+				// (arq.h:1441-1443) + the ceiling ratchet are the real over-climb safety. See
+				// data-flow-gearshift-climb.md.
 				if(gear_shift_on==YES && is_ofdm_config(current_configuration) &&
 				   measurements.SNR_uplink > -90)
 					snr_elevator = elevator_target_from_snr();
+				// C1 (data-flow-gearshift-climb.md): ROBUST tier-cross probe. At a robust config
+				// NO OFDM-calibrated SNR exists (the MFSK proxy is the known over-reader), so no
+				// SNR may direct the target -- but visiting ROBUST_1/2 yields NO OFDM evidence
+				// (same MFSK family) and is pure delay. robust_climb_probe_target() PROPOSES
+				// CONFIG_0 directly (the only OFDM question a robust climb can ask is "does
+				// CONFIG_0 decode?"). Raise it through the SAME snr_elevator slot so proposed_frame
+				// stays the robust +1 and the +1 anchor clamp (:6578, keyed on proposed_frame)
+				// still passes -- the raise happens INSIDE the block exactly as the OFDM
+				// elevator's does (no clamp bypass). A wrong probe costs one batch + one BREAK,
+				// once per session (break_target_with_anchor floors + the proven-ceiling ratchet
+				// disables the re-probe).
+				{
+					int tier_cross = robust_climb_probe_target();
+					if(tier_cross >= 0 &&
+					   config_ladder_index(tier_cross) > config_ladder_index(snr_elevator))
+						snr_elevator = tier_cross;
+				}
 #ifdef INBAND_PLUS1_CLIMB_FAILBEFORE
 				bool inband_plus1_on = false;  // fails-before: elevator jump NOT suppressed
 #else
@@ -6727,6 +6751,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs (eff_thresh %d, base %d, clean-streak %d), config %d -> %d\n",
 					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
 					clean_batches_at_current_config, current_configuration, negotiated_configuration);
+				fflush(stdout);
+				// Fire-proof diagnostic (data-flow-gearshift-climb.md): a greppable positive signal
+				// that the FRAME-UP elevator/tier-cross produced a MULTI-RUNG leap (the negotiated
+				// target outran the conservative +1 proposed_frame). The first attempt's gate failed
+				// SILENTLY; this line makes the leap visible on the wire for the fire-proof.
+				if(config_ladder_index(negotiated_configuration) > config_ladder_index(proposed_frame))
+					printf("[GEARSHIFT] ELEVATOR leap: config %d -> %d (snr=%.1f, anchor=%d, elevator=%d)\n",
+						current_configuration, negotiated_configuration, measurements.SNR_uplink,
+						last_data_viable_config, snr_elevator);
 				fflush(stdout);
 				consecutive_data_acks = 0;
 
@@ -8324,7 +8357,7 @@ void cl_arq_controller::process_control_commander()
 					// re-enter turboshift to jump ahead (rise fast, fall slow).
 					bool retriggered = false;
 					if(turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
-						is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
+					   is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
 						// CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13/14):
 						// the SNR-driven re-trigger MAY jump multiple rungs toward the SNR-ideal
@@ -13589,57 +13622,54 @@ int cl_arq_controller::test_climb_engine()
 				(t_after != t_before) ? 1 : 0, 1);
 		}
 
-		// JJ2 — HIGH-SNR OFDM-anchor (jump PRESERVED, MAX_LEAP cap BINDS). anchor=CONFIG_0
-		// (an OFDM rung — #2's sustained gate raised it after clean OFDM batches),
-		// SNR_uplink = snr_uplink_from_suffix(20.0) -> get_configuration(14)=CONFIG_16
-		// (idx19), proposed_frame=CONFIG_1, proven=-1. leap_cap =
-		// config_ladder_up_n(CONFIG_0,13)=CONFIG_13 (idx16). robust_en=true (unpinned).
+		// JJ2 — C2 leap-cap raise (13 -> 16), driving the REAL supershift_retrigger_target via the
+		// defeat member. HIGH-SNR OFDM anchor CONFIG_0, SNR 20 -> get_configuration(14)=CONFIG_16
+		// (idx19), proposed_frame=CONFIG_1, proven=-1. The pre-accel cap (defeat=13) lands CONFIG_13
+		// (the crawl); the accel cap (16 = full CONFIG_0->CONFIG_16 span) lands CONFIG_16.
 		{
 			double snr = snr_uplink_from_suffix(20.0f);
 			int proposed_frame = config_ladder_up(CONFIG_0, true, false);  // CONFIG_1
 			int snr_ideal_raw  = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
-			int leap_cap       = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
-			int t_after  = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
-			int t_before = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/false);
-			// premise: the SNR-ideal (CONFIG_16) is ABOVE the MAX_LEAP cap (CONFIG_13)
-			// from a CONFIG_0 anchor — the cap has something to bind.
-			check(snr_ideal_raw == CONFIG_16 && leap_cap == CONFIG_13 &&
-			      config_ladder_index(snr_ideal_raw) > config_ladder_index(leap_cap),
-				"JJ2a premise: SNR-ideal CONFIG_16 exceeds the anchor+MAX_LEAP cap (CONFIG_13)",
-				config_ladder_index(snr_ideal_raw), config_ladder_index(leap_cap));
-			// PASS-AFTER: OFDM anchor -> jump LICENSED, but BOUNDED to leap_cap (CONFIG_13)
-			// — still a multi-rung jump above the +1 (CONFIG_1).
-			check(t_after == CONFIG_13,
-				"JJ2b PASS-AFTER: §15 OFDM-anchor jump PRESERVED but bounded to anchor+MAX_LEAP (CONFIG_13)",
-				t_after, CONFIG_13);
-			check(config_ladder_index(t_after) > config_ladder_index(proposed_frame) &&
-			      config_ladder_index(t_after) <= config_ladder_index(leap_cap),
-				"JJ2c PASS-AFTER: §15 target is a multi-rung jump (> +1) AND <= the MAX_LEAP cap",
-				config_ladder_index(t_after), config_ladder_index(leap_cap));
-			// FAIL-BEFORE: also jumps (so §15 did NOT break the high-SNR jump) but UNCAPPED
-			// to CONFIG_16 — the §15 cap is the ONLY difference here.
-			check(t_before == CONFIG_16,
-				"JJ2d FAIL-BEFORE: pre-§15 OFDM-anchor jump is UNCAPPED (CONFIG_16) — §15 only bounds it",
-				t_before, CONFIG_16);
-			check(config_ladder_index(t_after) > config_ladder_index(proposed_frame),
-				"JJ2e PASS-AFTER: the high-SNR multi-rung jump is NOT broken by §15 (still > +1)",
-				config_ladder_index(t_after), config_ladder_index(proposed_frame));
+			bool saved_defeat = climb_accel_defeat;
+			// FAIL-BEFORE (C2 defeat: legacy cap 13): the real helper bounds the leap to CONFIG_13.
+			climb_accel_defeat = true;
+			int t_defeat = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
+			// PASS-AFTER (C2 accel: cap 16): the real helper lets the CONFIG_0 anchor reach the top.
+			climb_accel_defeat = false;
+			int t_accel  = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
+			climb_accel_defeat = saved_defeat;
+			check(snr_ideal_raw == CONFIG_16 && config_ladder_index(snr_ideal_raw) > config_ladder_index(proposed_frame),
+				"JJ2a premise: SNR 20 -> SNR-ideal CONFIG_16, multi-rung above the +1 (CONFIG_1)",
+				config_ladder_index(snr_ideal_raw), config_ladder_index(proposed_frame));
+			check(t_defeat == CONFIG_13,
+				"JJ2b FAIL-BEFORE (C2 defeat): legacy leap cap 13 bounds the CONFIG_0 anchor to CONFIG_13 (the crawl)",
+				t_defeat, CONFIG_13);
+			check(t_accel == CONFIG_16,
+				"JJ2c PASS-AFTER (C2): leap cap 16 lets the proven CONFIG_0 anchor leap the FULL span to CONFIG_16",
+				t_accel, CONFIG_16);
+			check(t_accel != t_defeat && config_ladder_index(t_accel) > config_ladder_index(t_defeat),
+				"JJ2d C2 bites: the accel leap outranks the legacy-capped leap (CONFIG_16 > CONFIG_13)",
+				(t_accel != t_defeat) ? 1 : 0, 1);
+			check(config_ladder_index(t_accel) > config_ladder_index(proposed_frame),
+				"JJ2e both remain multi-rung jumps above the +1 (the high-SNR climb is not broken)",
+				config_ladder_index(t_accel), config_ladder_index(proposed_frame));
 		}
 
-		// JJ3 — sanity: a CONFIG_0 OFDM anchor at a gap == MAX_LEAP is UNCAPPED (the
-		// WGN:30 fast climb is materially unchanged at gaps <= 13). SNR_uplink =
-		// snr_uplink_from_suffix(14.6) -> get_configuration(8.6)=CONFIG_13 (idx16);
-		// leap_cap=CONFIG_13 -> NOT capped (identical to FP-J2b's un-capped target).
+		// JJ3 — sanity: at this SNR the estimate (not the cap) sets the target. anchor CONFIG_0,
+		// SNR 14.6 -> get_configuration(8.6)=CONFIG_13 (idx16); the accel cap
+		// (config_ladder_up_n(CONFIG_0,16)=CONFIG_16) sits ABOVE it, so the SNR-ideal CONFIG_13
+		// passes through uncapped -> WGN:30-class fast climb unchanged.
 		{
 			double snr = snr_uplink_from_suffix(14.6f);
 			int snr_ideal_raw = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
 			int leap_cap      = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);
 			int t_after = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
-			check(snr_ideal_raw == CONFIG_13 && leap_cap == CONFIG_13,
-				"JJ3a premise: SNR-ideal (CONFIG_13) sits exactly AT the anchor+MAX_LEAP cap (gap==13)",
+			check(snr_ideal_raw == CONFIG_13 && leap_cap == CONFIG_16 &&
+			      config_ladder_index(snr_ideal_raw) < config_ladder_index(leap_cap),
+				"JJ3a premise: SNR-ideal CONFIG_13 is BELOW the anchor+MAX_LEAP=16 cap (CONFIG_16)",
 				config_ladder_index(snr_ideal_raw), config_ladder_index(leap_cap));
 			check(t_after == CONFIG_13,
-				"JJ3b PASS-AFTER: gap==MAX_LEAP is UNCAPPED (CONFIG_13) — WGN:30 fast climb unchanged at gaps<=13",
+				"JJ3b PASS-AFTER: the SNR (CONFIG_13) sets the target, uncapped -- fast climb unchanged at this SNR",
 				t_after, CONFIG_13);
 		}
 
@@ -13791,15 +13821,17 @@ int cl_arq_controller::test_climb_engine()
 			}
 
 			// K'2 — OFDM anchor (WGN:30 legit): a turbo from a CONFIG_0 anchor at high
-			// SNR is PRESERVED but bounded to anchor + MAX_LEAP (CONFIG_13), not lobotomized.
+			// SNR is PRESERVED and reaches anchor + MAX_LEAP — with C2 the cap is 16, the full
+			// CONFIG_0->CONFIG_16 span, so the top rung is reached (not lobotomized). Expected
+			// value tracks the live RETRIGGER_MAX_LEAP #define (leap_cap), not a literal.
 			{
 				int raw_target = CONFIG_16;   // SNR-SUPERSHIFT wants the top
 				double snr = snr_uplink_from_suffix(20.0f);
-				int leap_cap = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);  // CONFIG_13
+				int leap_cap = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);  // CONFIG_16 (C2)
 				int t_after = turbo_clamp_v16(raw_target, snr, CONFIG_0, true, false, /*adaptive=*/true);
-				check(t_after == CONFIG_13,
-					"K'2a PASS-AFTER: OFDM-anchor turbo PRESERVED but bounded to anchor+MAX_LEAP (CONFIG_13)",
-					t_after, CONFIG_13);
+				check(t_after == leap_cap,
+					"K'2a PASS-AFTER: OFDM-anchor turbo PRESERVED, bounded to anchor+MAX_LEAP (CONFIG_16 span under C2)",
+					t_after, leap_cap);
 				check(config_ladder_index(t_after) > config_ladder_index(CONFIG_0),
 					"K'2b PASS-AFTER: the high-SNR turbo climb is NOT broken (still a multi-rung jump above the anchor)",
 					config_ladder_index(t_after), config_ladder_index(CONFIG_0));
@@ -13848,7 +13880,7 @@ int cl_arq_controller::test_climb_engine()
 				"K''3 from the OFDM anchor the elevator jump STILL fires (multi-rung, WGN:30 climb preserved)",
 				config_ladder_index(t), config_ladder_index(CONFIG_0));
 			check(t == config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false),
-				"K''4 the preserved jump is bounded to anchor+MAX_LEAP (CONFIG_13)",
+				"K''4 the preserved jump is bounded to anchor+MAX_LEAP (CONFIG_16 span under C2)",
 				t, config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false));
 		}
 
@@ -15971,6 +16003,122 @@ int cl_arq_controller::test_climb_engine()
 		supershift_proven_ceiling = -1;
 		clean_batches_at_current_config = 0;
 	}
+
+		// ================================================================
+		// KK -- CLIMB-ACCELERATION fix v2 (data-flow-gearshift-climb.md): C1 robust tier-cross +
+		// C2 leap cap 13->16 + C3 handoff demote-only. The P0-gate SNR-provenance latch was DROPPED
+		// (an unsatisfiable bootstrap deadlock -- it pinned the forward climb at cfg2, a 12x
+		// regression). This test drives the REAL production leap functions (elevator_target_from_snr
+		// + inband_climb_target) from a REAL cfg0 residence with NO latch poke -- the fix for the
+		// earlier test flaw (it SIMULATED a licensed latch instead of EXERCISING the path). The
+		// FAIL-BEFORE arms come from the defeat knobs (ACCEL_DEFEAT=incumbent, TIER2_DEFEAT=Tier-1),
+		// PASS-AFTER is the default; ALL on this ONE binary. The WIRE fire-proof (the [GEARSHIFT]
+		// ELEVATOR leap trace on a live real-audio run through process_messages_rx_acks_data) is the
+		// full production-path exercise; this is the fail-before/pass-after unit gate on the leap.
+		// ================================================================
+		{
+			bool  kk_saved_defeat = climb_accel_defeat;
+			bool  kk_saved_tier2  = climb_tier2_defeat;
+			int   kk_saved_cfg    = current_configuration;
+			int   kk_saved_anchor = last_data_viable_config;
+			int   kk_saved_ceil   = supershift_proven_ceiling;
+			bool  kk_saved_optdis = optimizer_disabled;
+			int   kk_saved_robust = robust_enabled;
+			int   kk_saved_nb     = narrowband_enabled;
+			int   kk_saved_over   = max_config_override;
+			double kk_saved_snr   = measurements.SNR_uplink;
+			gear_shift_on         = YES;
+			robust_enabled        = YES;
+			narrowband_enabled    = NO;
+			optimizer_disabled    = true;   // optimizer_is_in_control()==false (gearshift owns the band)
+			max_config_override   = -1;
+
+			// KK1 -- THE LEAP FIRES from a REAL cfg0 residence (the deadlock fix). Build the exact
+			// production state the FRAME-UP elevator sees at cfg0 with a proven OFDM anchor. NO provenance
+			// flag is set (the latch is GONE); the leap must fire off the tip triad + anchor gate alone.
+			current_configuration     = CONFIG_0;             // an OFDM rung (is_ofdm_config -> true)
+			last_data_viable_config   = CONFIG_0;             // a PROVEN OFDM anchor (is_ofdm_config)
+			supershift_proven_ceiling = -1;
+			measurements.SNR_uplink   = 21.0;                 // a clean high SNR (tip triad: > -90)
+			int kk_plus1        = config_ladder_up(CONFIG_0, /*robust_en=*/true, false);  // CONFIG_1 (the conservative +1)
+			int kk_expect_ideal = get_configuration(21.0 - SUPERSHIFT_MARGIN_DB);         // CONFIG_16
+			climb_accel_defeat = false; climb_tier2_defeat = false;
+			int kk_leap_fix = elevator_target_from_snr();     // PASS-AFTER (C1+C2+C3 default)
+			check(kk_expect_ideal == CONFIG_16,
+				"KK1a premise: 21 dB - 6 dB margin maps to CONFIG_16 (the clean-channel ceiling)",
+				kk_expect_ideal, CONFIG_16);
+			check(kk_leap_fix == CONFIG_16,
+				"KK1b PASS-AFTER: at a real cfg0 residence the elevator LEAPS to CONFIG_16 in ONE shot -- no latch poke, the leap FIRES",
+				kk_leap_fix, CONFIG_16);
+			check(config_ladder_index(kk_leap_fix) > config_ladder_index(kk_plus1),
+				"KK1c the leap is MULTI-RUNG (outranks the conservative +1 CONFIG_1) -- the [GEARSHIFT] ELEVATOR leap diagnostic fires",
+				config_ladder_index(kk_leap_fix), config_ladder_index(kk_plus1));
+
+			// KK2 -- FAIL-BEFORE (incumbent, MERCURY_CLIMB_ACCEL_DEFEAT): the SAME real function on the
+			// SAME state lands only CONFIG_13 (the legacy-capped leap the incumbent leaps to). C2 lifts 13->16.
+			climb_accel_defeat = true; climb_tier2_defeat = false;
+			int kk_leap_incumbent = elevator_target_from_snr();
+			climb_accel_defeat = false;
+			check(kk_leap_incumbent == CONFIG_13,
+				"KK2 FAIL-BEFORE (incumbent, ACCEL_DEFEAT): the same cfg0 residence lands CONFIG_13 (legacy cap) -- C2 lifts 13->16",
+				kk_leap_incumbent, CONFIG_13);
+
+			// KK3 -- TIER-1 arm (MERCURY_CLIMB_TIER2_DEFEAT): C2+C3 OFF restores the CONFIG_13 elevator
+			// cap, but C1 (the robust tier-cross) STAYS LIVE -- proving Tier-2 defeat keeps C1 (the ~29s win).
+			climb_accel_defeat = false; climb_tier2_defeat = true;
+			int kk_leap_tier1 = elevator_target_from_snr();   // cap restored to 13 (C2 off)
+			current_configuration = ROBUST_0;
+			supershift_proven_ceiling = -1;
+			int kk_c1_under_tier2 = robust_climb_probe_target();   // CONFIG_0 -- C1 UNAFFECTED by tier2 defeat
+			current_configuration = CONFIG_0;
+			climb_tier2_defeat = false;
+			check(kk_leap_tier1 == CONFIG_13,
+				"KK3a TIER-1 (TIER2_DEFEAT): C2/C3 off restores the CONFIG_13 elevator cap (the incumbent leap)",
+				kk_leap_tier1, CONFIG_13);
+			check(kk_c1_under_tier2 == CONFIG_0,
+				"KK3b TIER-1: C1 (robust tier-cross) STAYS LIVE under TIER2_DEFEAT (proposes CONFIG_0) -- Tier-1 keeps C1",
+				kk_c1_under_tier2, CONFIG_0);
+
+			// KK4 -- C1 robust tier-cross through the REAL compose. At ROBUST_0 the pure helper proposes
+			// CONFIG_0; inband_climb_target RAISES the robust +1 (ROBUST_1) to the CONFIG_0 tier-cross.
+			// The proven-ceiling ratchet + the ACCEL_DEFEAT knob are the fail-before arms.
+			climb_accel_defeat = false; climb_tier2_defeat = false;
+			supershift_proven_ceiling = -1;
+			current_configuration = ROBUST_0;
+			int kk_c1        = robust_climb_probe_target();                          // CONFIG_0
+			int kk_proposed  = config_ladder_up(ROBUST_0, /*robust_en=*/true, false); // ROBUST_1 (+1)
+			int kk_neg_c1    = inband_climb_target(kk_proposed, kk_c1, /*inband_plus1_on=*/false);
+			supershift_proven_ceiling = ROBUST_2;   // a prior FAILED tier-cross floored the ceiling below CONFIG_0
+			int kk_c1_ceiled = robust_climb_probe_target();                          // -1 (ratchet disables the re-probe)
+			supershift_proven_ceiling = -1;
+			climb_accel_defeat = true;
+			int kk_c1_defeat = robust_climb_probe_target();                          // -1 (incumbent crawl)
+			climb_accel_defeat = false;
+			check(kk_c1 == CONFIG_0,
+				"KK4a PASS-AFTER (C1): a robust config PROPOSES CONFIG_0 directly (skips ROBUST_1/2)",
+				kk_c1, CONFIG_0);
+			check(kk_neg_c1 == CONFIG_0 && config_ladder_index(kk_neg_c1) > config_ladder_index(kk_proposed),
+				"KK4b PASS-AFTER (C1): inband_climb_target raises the robust +1 to the CONFIG_0 tier-cross",
+				kk_neg_c1, CONFIG_0);
+			check(kk_c1_ceiled == -1,
+				"KK4c C1: a proven ceiling below CONFIG_0 disables the re-probe (existing ratchet)",
+				kk_c1_ceiled, -1);
+			check(kk_c1_defeat == -1,
+				"KK4d FAIL-BEFORE (C1 defeat, ACCEL_DEFEAT): no tier-cross, restores the robust crawl",
+				kk_c1_defeat, -1);
+
+			// restore members touched above
+			climb_accel_defeat       = kk_saved_defeat;
+			climb_tier2_defeat       = kk_saved_tier2;
+			current_configuration    = kk_saved_cfg;
+			last_data_viable_config  = kk_saved_anchor;
+			supershift_proven_ceiling= kk_saved_ceil;
+			optimizer_disabled       = kk_saved_optdis;
+			robust_enabled           = kk_saved_robust;
+			narrowband_enabled       = kk_saved_nb;
+			max_config_override      = kk_saved_over;
+			measurements.SNR_uplink  = kk_saved_snr;
+		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

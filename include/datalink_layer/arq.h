@@ -1450,7 +1450,12 @@ public:
       // proven-ceiling cap (applied by the caller) + the §10 anchor-demotion backstop
       // any residual overshoot. NEVER lowers snr_ideal below anchor_cap (it is still
       // at least a +1 move). TUNABLE via RETRIGGER_MAX_LEAP (common_defines.h).
-      int leap_cap = config_ladder_up_n(anchor, RETRIGGER_MAX_LEAP, robust_en, narrowband);
+      // C2 (data-flow-gearshift-climb.md): RETRIGGER_MAX_LEAP is 16 (the full
+      // CONFIG_0->CONFIG_16 span) so a proven-cfg0 anchor may reach the top rung in ONE leap.
+      // Either defeat knob restores 13 (the pre-accel edb86009 value): ACCEL_DEFEAT reverts the
+      // WHOLE fix to the incumbent, TIER2_DEFEAT reverts only C2+C3 (Tier-1: C1 stays live).
+      int max_leap = (climb_accel_defeat || climb_tier2_defeat) ? 13 : RETRIGGER_MAX_LEAP;
+      int leap_cap = config_ladder_up_n(anchor, max_leap, robust_en, narrowband);
       if(config_ladder_index(snr_ideal) > config_ladder_index(leap_cap))
         snr_ideal = leap_cap;
     }
@@ -5097,6 +5102,14 @@ public:
     if (optimizer_disabled || !rate_opt.is_enabled()) return;
     int handoff = rate_opt.min_calibrated_cfg(narrowband_enabled == YES);
     if (handoff <= 0) return;
+    // C3 (data-flow-gearshift-climb.md): the handoff cap is DEMOTE-DIRECTION-ONLY. Turbo may
+    // DELIVER the SNR-indicated rung UP in one shot; the Q-table optimizer still owns
+    // steady-state / demote. Skip the cap when the (already ceiling-bounded) target is a CLIMB
+    // above the current rung. Either defeat knob restores the unconditional cap for the A/B arm
+    // (ACCEL_DEFEAT -> incumbent, TIER2_DEFEAT -> Tier-1 C2+C3 off).
+    if (!climb_accel_defeat && !climb_tier2_defeat &&
+        config_ladder_index(*snr_target) > config_ladder_index(current_configuration))
+      return;
     if (*snr_target > handoff) {
       printf("[TURBO] SNR target %d capped at handoff config %d (Q-table takes over)\n",
         *snr_target, handoff);
@@ -5107,6 +5120,30 @@ public:
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
   float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
   float turbo_best_snr;            // Best SNR seen across entire turbo phase (-99 = none)
+  // Climb-acceleration (data-flow-gearshift-climb.md).
+  // A/B defeat knob (MERCURY_CLIMB_ACCEL_DEFEAT=1): restores the pre-accel INCUMBENT crawl —
+  // legacy leap cap 13, unconditional handoff cap, no robust tier-cross. Env-latched in the
+  // ctor so the fire-proof runs FIX vs DEFEAT(incumbent) on the SAME binary.
+  bool climb_accel_defeat;
+  // TIER-2 defeat knob (MERCURY_CLIMB_TIER2_DEFEAT=1): disables C2+C3 ONLY (leap cap back to 13,
+  // unconditional handoff cap) while C1 (the robust tier-cross probe) stays LIVE. This is the
+  // Tier-1 (C1-only) fire-proof arm — proves C1 is a safe win even if C2/C3 defer to phase-2.
+  // (The P0-gate SNR-provenance latch was DROPPED in v2: it was an unsatisfiable bootstrap
+  // deadlock; the anchor tier gate is_ofdm_config(anchor) at arq.h:1441-1443 is the real safety.)
+  bool climb_tier2_defeat;
+  // C1 (data-flow-gearshift-climb.md) — the ROBUST tier-cross probe target. Returns CONFIG_0
+  // when a robust climb should PROPOSE the OFDM tier directly (skip ROBUST_1/2 — they carry no
+  // OFDM evidence, pure delay), or -1 to keep the +1 robust ladder. -1 when: defeated, not at a
+  // robust config, or a prior failed tier-cross floored the proven ceiling below CONFIG_0. Pure:
+  // production (the FRAME-UP elevator compose) and the directed test drive the SAME logic.
+  int robust_climb_probe_target() const {
+    if(climb_accel_defeat) return -1;
+    if(!is_robust_config(current_configuration)) return -1;
+    if(supershift_proven_ceiling >= 0 &&
+       config_ladder_index(supershift_proven_ceiling) < config_ladder_index(CONFIG_0))
+      return -1;
+    return CONFIG_0;
+  }
   cl_timer turbo_snr_defer_timer;  // defer ACK return until suffix arrives
   int turbo_switch_role_retries;   // consecutive SWITCH_ROLE failures during turbo (Bug #60)
 
