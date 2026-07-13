@@ -7583,13 +7583,20 @@ void cl_arq_controller::reset_session_state()
 	// RSP app-delivered high-water into the reset-SURVIVING prev field BEFORE the Option-W
 	// re-anchor below zeroes rx_stream_delivered. This is the ONLY producer of prev-delivered,
 	// and it is a REAL reset (every genuine teardown routes here) — not a cursor poke. Guards:
-	//   - only capture a positive high-water (a no-data session leaves prev untouched at 0, so a
-	//     fresh transfer never arms the seam);
-	//   - skip when a gap-abort already latched (rsp_stream_aborted set BEFORE its internal reset,
-	//     arq_common.cc): a mid-transfer abort PRESERVES/RESTORES rx_stream_delivered around this
-	//     call and is NOT a cross-session boundary, so it must not re-capture the prior high-water.
-	// The fresh START_CONNECTION accept consumes prev to arm the seam; a taken refusal clears it.
-	if(rx_stream_delivered > 0 && !rsp_stream_aborted)
+	//   - a no-data session (rx_stream_delivered stays 0) leaves prev untouched, so a first-ever
+	//     transfer never arms the seam;
+	//   - the capture is an UNCONDITIONAL MONOTONIC MAX, independent of the abort latch. The prior
+	//     abort-gated guard skipped on exactly the gap-abort then reconnect sequence this seam
+	//     exists to catch: rsp_gap_abort_teardown() latches rsp_stream_aborted BEFORE its internal
+	//     reset routes here, and the latch survives to the later bare link-timeout reset, so prev
+	//     was never written on the wire and the accept never saw prev>0. Max-capture keeps the
+	//     high-water across every teardown ordering (the gap-abort's own restore leaves
+	//     rx_stream_delivered intact; the later link-timeout reset re-captures the same max, then
+	//     zeroes the cursor) so the fresh accept arms with prev>0.
+	// A proven-clean EOT clears prev (arq_responder.cc CLOSE path -> rsp_seam_clear_on_clean_eot) so
+	// a legitimate back-to-back transfer on a persistent socket is byte-identical; a taken refusal
+	// clears it. This is the ONLY high-water producer; the fresh accept consumes it to arm the seam.
+	if(rx_stream_delivered > rsp_prev_session_app_delivered)
 		rsp_prev_session_app_delivered = rx_stream_delivered;
 	// Disarm any stale cross-session seam at the session boundary; the fresh accept re-arms it.
 	rsp_cross_session_seam_armed = false;
@@ -11186,6 +11193,16 @@ void cl_arq_controller::rsp_reconnect_seam_arm_on_accept()
 	                                && rsp_prev_session_app_delivered > 0
 	                                && !reconnect_resume_proven);
 
+	// Unconditional decision log at EVERY accept: an inert (non-arming) accept was previously
+	// invisible, which is how a guard that never armed on the wire read as "working" until a wire
+	// consult. Emit the full arm evidence and the decision so a fire proof reads ARM 0->N directly.
+	printf("[SEAM-EVAL] accept: prev=%llu persistent=%d defeat=%d resume_proven=%d -> decision=%s\n",
+		(unsigned long long)rsp_prev_session_app_delivered,
+		app_data_persistent ? 1 : 0, failclosed_defeat ? 1 : 0,
+		reconnect_resume_proven ? 1 : 0,
+		rsp_cross_session_seam_armed ? "ARM" : "PASS");
+	fflush(stdout);
+
 	if(rsp_cross_session_seam_armed)
 	{
 		printf("[RSP-V2-SEAM/FAILCLOSED-ARM] cross-session reconnect on a persistent app data "
@@ -11194,6 +11211,19 @@ void cl_arq_controller::rsp_reconnect_seam_arm_on_accept()
 			(unsigned long long)rsp_prev_session_app_delivered);
 		fflush(stdout);
 	}
+}
+
+void cl_arq_controller::rsp_seam_clear_on_clean_eot()
+{
+	// Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b). Called ONLY from
+	// the CLOSE_CONNECTION handler's PROVEN-CLEAN EOT branch, AFTER reset_session_state() has
+	// re-snapshotted the app-delivered high-water (the monotonic-max above). A clean end-of-transfer
+	// makes the persistent app socket a legitimate message boundary, so clear the high-water and any
+	// stale arm: a legitimate back-to-back NEW transfer on the same socket must be byte-identical,
+	// never refused. An abort / short / absent-EOT close does NOT call this (it deliberately leaves
+	// the high-water set so the cross-session seam arms on the reconnect -- fail-closed default).
+	rsp_prev_session_app_delivered = 0;
+	rsp_cross_session_seam_armed   = false;
 }
 
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,

@@ -887,6 +887,164 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
+	// PART X2 -- the WIRE path Part X could not reach: the teardown routes through
+	// rsp_gap_abort_teardown() (which latches rsp_stream_aborted BEFORE its internal reset), THEN a
+	// bare link-timeout reset_session_state(), THEN the fresh accept. On the wire EVERY relevant
+	// reset is gated by that latch, so the abort-gated snapshot (the pre-fix guard) skipped the
+	// high-water on exactly this sequence: prev stayed 0, the accept never armed, the fresh session
+	// spliced. This part crosses the ACTUAL production teardown chain, not a bare reset.
+	//   PASS-AFTER (fix): the snapshot is an unconditional monotonic-max, so prev survives the
+	//     latched teardown; the accept ARMS (prev>0); copy_data_to_buffer REFUSES (0 spliced).
+	//   FAIL-BEFORE (@ae8a236, F1 absent): the abort-gated snapshot skips -> prev==0 -> the accept
+	//     does NOT arm -> the fresh-session bytes SPLICE onto the persistent socket (popped>0).
+	printf("[TEST-STREAM-OFFSET] Part X2 -- reconnect splice through the REAL gap-abort teardown\n");
+	{
+		this->compression_enabled = false;
+		fifo_buffer_rx.flush();
+		rx_stream_delivered            = 0;
+		rx_stream_crc                  = CRC32_INIT;
+		for(int i=0;i<256;i++) rx_stream_stamp[i].valid = false;
+		rsp_stream_aborted             = false;
+		rsp_cross_session_seam_armed   = false;
+		rsp_prev_session_app_delivered = 0;
+		rsp_test_force_app_persistent  = true;     // a client stays attached across the reconnect
+
+		// (1) Session 1 delivers 185 app bytes through the PRODUCTION funnel while the sender's
+		// committed cursor raced far ahead (the low-SNR thrash).
+		this->tx_stream_committed = 129024;
+		decrypt_delivered_bsi = 205;               // invalid stamp => within-session backstop inert
+		this->data_batch_size = 1;
+		for(int f=0;f<nMessages;f++){ messages_rx[f].status=FREE; messages_rx[f].length=0; }
+		for(int j=0;j<185;j++) messages_rx[0].data[j]=(char)((j*5+2)&0x7F);
+		messages_rx[0].length=185; messages_rx[0].id=(char)0; messages_rx[0].status=ACKED;
+		copy_data_to_buffer();
+		CHECK(rx_stream_delivered == 185, "X2: session 1 delivered 185 app bytes (real funnel)",
+			(long long)rx_stream_delivered, 185);
+		{ char tmp[65536]; (void)fifo_buffer_rx.pop(tmp,(int)sizeof(tmp)); }   // app drained the 185
+
+		// (2) The stream strands -> the PRODUCTION gap-abort teardown fires: it latches
+		// rsp_stream_aborted, runs its internal reset, and restores the RX cursor.
+		rsp_gap_abort_teardown("test: mid-transfer strand (X2)");
+		CHECK(rsp_stream_aborted, "X2: gap-abort teardown latched rsp_stream_aborted",
+			rsp_stream_aborted?1:0, 1);
+
+		// (3) The link then times out -> a bare reset_session_state() runs WITH the latch still set
+		// (the accept has not happened yet). Pre-fix this second latched reset also skipped the
+		// snapshot and zeroed the cursor, so prev never captured. The fix's monotonic-max keeps it.
+		reset_session_state();
+		CHECK(rx_stream_delivered == 0, "X2: link-timeout reset re-anchored the RX cursor at 0",
+			(long long)rx_stream_delivered, 0);
+		// THE FIRE: prev must have survived the latched teardown chain. @ae8a236 this reads 0 (skip).
+		CHECK(rsp_prev_session_app_delivered == 185,
+			"X2: high-water SURVIVED the latched gap-abort+timeout teardown (F1 fire; ae8a236=0)",
+			(long long)rsp_prev_session_app_delivered, 185);
+
+		// (4) Fresh START_CONNECTION accept -> the accept clears the abort latch, then the PRODUCTION
+		// arm decision runs.
+		rsp_stream_aborted = false;
+		rsp_reconnect_seam_arm_on_accept();
+		CHECK(rsp_cross_session_seam_armed,
+			"X2: seam ARMED at the fresh accept after the REAL teardown (F1 fire; ae8a236=disarmed)",
+			rsp_cross_session_seam_armed?1:0, 1);
+
+		// (5) The fresh session's first delivery re-anchored at 0, so its stamp.start==cursor==0 and
+		// the within-session backstop is inert -- the splice is invisible to every per-session guard.
+		const int X2BSI = 92;
+		rx_stream_stamp[X2BSI].start  = 0;
+		rx_stream_stamp[X2BSI].length = 150;
+		rx_stream_stamp[X2BSI].valid  = true;
+		decrypt_delivered_bsi = X2BSI;
+		this->data_batch_size = 1;
+		for(int f=0;f<nMessages;f++){ messages_rx[f].status=FREE; messages_rx[f].length=0; }
+		for(int j=0;j<150;j++) messages_rx[0].data[j]=(char)((j*7+9)&0x7F);
+		messages_rx[0].length=150; messages_rx[0].id=(char)0; messages_rx[0].status=ACKED;
+		CHECK(!w_stream_shift_detected(X2BSI),
+			"X2: within-session backstop INERT at the seam (stamp.start==cursor==0)",
+			(long long)(uint32_t)rx_stream_stamp[X2BSI].start, (long long)(uint32_t)rx_stream_delivered);
+		fifo_buffer_rx.flush();
+		copy_data_to_buffer();
+		char x2tmp[65536]; int x2popped = fifo_buffer_rx.pop(x2tmp,(int)sizeof(x2tmp));
+		if(x2popped>0)
+			printf("[TEST-STREAM-OFFSET]   (ae8a236) splice reproduced: popped=%d landed at app position 185\n", x2popped);
+		// THE INTEGRITY ASSERTION: the fix REFUSES (0 spliced); @ae8a236 the bytes SPLICE (>0).
+		CHECK(x2popped==0,
+			"X2: cross-session splice REFUSED -- 0 spliced bytes (ae8a236 SPLICES: popped>0)", x2popped, 0);
+		CHECK(rsp_stream_aborted,
+			"X2: refusal latched rsp_stream_aborted (loud drop via gap-abort contract)",
+			rsp_stream_aborted?1:0, 1);
+		CHECK(rsp_prev_session_app_delivered==0,
+			"X2: prev-delivered cleared post-refusal (next transfer fresh -- no livelock)",
+			(long long)rsp_prev_session_app_delivered, 0);
+		rsp_test_force_app_persistent = false;
+	}
+
+	// ---------------------------------------------------------------------------
+	// PART X3 -- F2 no-false-refuse: a PROVEN-CLEAN end-of-transfer clears the app-delivered high-
+	// water so a legitimate back-to-back NEW transfer on the SAME persistent socket is byte-
+	// identical (never refused). Without F2, F1's monotonic-max keeps prev>0 across a clean
+	// completion and the next accept would FALSELY arm. This exercises the SAME clear the CLOSE
+	// handler calls (rsp_seam_clear_on_clean_eot), after a REAL reset_session_state().
+	printf("[TEST-STREAM-OFFSET] Part X3 -- F2 clean-EOT clear (no false-refuse on back-to-back)\n");
+	{
+		fifo_buffer_rx.flush();
+		rx_stream_delivered            = 0;
+		rx_stream_crc                  = CRC32_INIT;
+		for(int i=0;i<256;i++) rx_stream_stamp[i].valid = false;
+		rsp_stream_aborted             = false;
+		rsp_cross_session_seam_armed   = false;
+		rsp_prev_session_app_delivered = 0;
+		rsp_test_force_app_persistent  = true;
+
+		// (1) A transfer delivers 240 app bytes and completes CLEANLY (peer CLOSE / EOT verified).
+		decrypt_delivered_bsi = 210;
+		this->data_batch_size = 1;
+		for(int f=0;f<nMessages;f++){ messages_rx[f].status=FREE; messages_rx[f].length=0; }
+		for(int j=0;j<240;j++) messages_rx[0].data[j]=(char)((j*3+7)&0x7F);
+		messages_rx[0].length=240; messages_rx[0].id=(char)0; messages_rx[0].status=ACKED;
+		copy_data_to_buffer();
+		{ char tmp[65536]; (void)fifo_buffer_rx.pop(tmp,(int)sizeof(tmp)); }
+		CHECK(rx_stream_delivered==240, "X3: transfer delivered 240 app bytes", (long long)rx_stream_delivered, 240);
+
+		// (2) The CLOSE handler runs reset_session_state() (F1 re-snapshots prev=240). WITHOUT the
+		// F2 clear this alone would leave the next accept armed -- prove that first.
+		reset_session_state();
+		CHECK(rsp_prev_session_app_delivered==240,
+			"X3: clean completion's reset re-snapshotted the high-water (F1)",
+			(long long)rsp_prev_session_app_delivered, 240);
+		rsp_stream_aborted = false;
+		rsp_reconnect_seam_arm_on_accept();
+		CHECK(rsp_cross_session_seam_armed,
+			"X3: WITHOUT the clean-EOT clear the seam would FALSELY arm (prev survived)",
+			rsp_cross_session_seam_armed?1:0, 1);
+		rsp_cross_session_seam_armed = false;   // undo the exploratory arm
+
+		// (3) Apply the PROVEN-CLEAN EOT clear the CLOSE handler calls, then re-accept: no arm.
+		rsp_seam_clear_on_clean_eot();
+		CHECK(rsp_prev_session_app_delivered==0,
+			"X3: F2 clean-EOT clear zeroed the high-water", (long long)rsp_prev_session_app_delivered, 0);
+		rsp_stream_aborted = false;
+		rsp_reconnect_seam_arm_on_accept();
+		CHECK(!rsp_cross_session_seam_armed,
+			"X3: after F2 clear the back-to-back transfer does NOT arm (no false-refuse)",
+			rsp_cross_session_seam_armed?1:0, 0);
+
+		// (4) The legitimate back-to-back transfer delivers fully (byte-identical).
+		const int X3BSI = 93;
+		rx_stream_stamp[X3BSI].start=0; rx_stream_stamp[X3BSI].length=200; rx_stream_stamp[X3BSI].valid=true;
+		decrypt_delivered_bsi = X3BSI;
+		this->data_batch_size = 1;
+		for(int f=0;f<nMessages;f++){ messages_rx[f].status=FREE; messages_rx[f].length=0; }
+		for(int j=0;j<200;j++) messages_rx[0].data[j]=(char)((j*13+5)&0x7F);
+		messages_rx[0].length=200; messages_rx[0].id=(char)0; messages_rx[0].status=ACKED;
+		fifo_buffer_rx.flush();
+		copy_data_to_buffer();
+		char x3tmp[65536]; int x3popped=fifo_buffer_rx.pop(x3tmp,(int)sizeof(x3tmp));
+		CHECK(x3popped==200,
+			"X3: back-to-back transfer after a clean EOT delivers fully (byte-identical)", x3popped, 200);
+		rsp_test_force_app_persistent = false;
+	}
+
+	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);
 	fflush(stdout);
 	if(g_fails == 0)

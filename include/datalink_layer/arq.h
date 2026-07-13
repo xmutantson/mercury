@@ -807,6 +807,13 @@ public:
   // continuous session (prev-delivered 0 -> stays disarmed).
   void rsp_reconnect_seam_arm_on_accept();
 
+  // Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b). Called ONLY on a
+  // PROVEN-CLEAN end-of-transfer (the CLOSE_CONNECTION EOT-verified branch), AFTER reset_session_
+  // state() has re-snapshotted the app-delivered high-water. Clears rsp_prev_session_app_delivered
+  // (and any stale arm) so a legitimate back-to-back transfer on the SAME persistent app socket is
+  // byte-identical. An abort / short / absent-EOT close does NOT call this (fail-closed default).
+  void rsp_seam_clear_on_clean_eot();
+
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
   // receive() landed a frame with messages_rx_buffer.type == SACK_RSP. The
   // function:
