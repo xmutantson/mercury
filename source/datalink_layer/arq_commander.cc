@@ -13631,13 +13631,14 @@ int cl_arq_controller::test_climb_engine()
 			int proposed_frame = config_ladder_up(CONFIG_0, true, false);  // CONFIG_1
 			int snr_ideal_raw  = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
 			bool saved_defeat = climb_accel_defeat;
+			bool saved_tier2  = climb_tier2;
 			// FAIL-BEFORE (C2 defeat: legacy cap 13): the real helper bounds the leap to CONFIG_13.
-			climb_accel_defeat = true;
+			climb_accel_defeat = true; climb_tier2 = false;
 			int t_defeat = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
 			// PASS-AFTER (C2 accel: cap 16): the real helper lets the CONFIG_0 anchor reach the top.
-			climb_accel_defeat = false;
+			climb_accel_defeat = false; climb_tier2 = true;
 			int t_accel  = retrigger_target_v15(snr, CONFIG_0, -1, /*robust_en=*/true, /*nb=*/false, /*adaptive=*/true);
-			climb_accel_defeat = saved_defeat;
+			climb_accel_defeat = saved_defeat; climb_tier2 = saved_tier2;
 			check(snr_ideal_raw == CONFIG_16 && config_ladder_index(snr_ideal_raw) > config_ladder_index(proposed_frame),
 				"JJ2a premise: SNR 20 -> SNR-ideal CONFIG_16, multi-rung above the +1 (CONFIG_1)",
 				config_ladder_index(snr_ideal_raw), config_ladder_index(proposed_frame));
@@ -13828,7 +13829,10 @@ int cl_arq_controller::test_climb_engine()
 				int raw_target = CONFIG_16;   // SNR-SUPERSHIFT wants the top
 				double snr = snr_uplink_from_suffix(20.0f);
 				int leap_cap = config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false);  // CONFIG_16 (C2)
+				bool kp2_saved_tier2 = climb_tier2;
+				climb_tier2 = true;   // C2 is opt-in (MERCURY_CLIMB_TIER2); enable it to test the 16-cap leap
 				int t_after = turbo_clamp_v16(raw_target, snr, CONFIG_0, true, false, /*adaptive=*/true);
+				climb_tier2 = kp2_saved_tier2;
 				check(t_after == leap_cap,
 					"K'2a PASS-AFTER: OFDM-anchor turbo PRESERVED, bounded to anchor+MAX_LEAP (CONFIG_16 span under C2)",
 					t_after, leap_cap);
@@ -13873,6 +13877,8 @@ int cl_arq_controller::test_climb_engine()
 				anchor, CONFIG_0);
 			// (2) from the now-OFDM anchor (CONFIG_0) at high SNR, the elevator jump fires
 			// (bounded to anchor+MAX_LEAP) — the fast climb is preserved, not blocked.
+			bool kpp_saved_tier2 = climb_tier2;
+			climb_tier2 = true;   // C2 is opt-in (MERCURY_CLIMB_TIER2); enable it to test the 16-cap leap
 			int t = supershift_retrigger_target(/*snr_ideal=*/CONFIG_16,
 				/*snr_uplink=*/snr_uplink_from_suffix(20.0f), /*anchor=*/anchor,
 				/*optimizer_owns=*/false, /*robust_en=*/true, /*nb=*/false);
@@ -13882,6 +13888,7 @@ int cl_arq_controller::test_climb_engine()
 			check(t == config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false),
 				"K''4 the preserved jump is bounded to anchor+MAX_LEAP (CONFIG_16 span under C2)",
 				t, config_ladder_up_n(CONFIG_0, RETRIGGER_MAX_LEAP, true, false));
+			climb_tier2 = kpp_saved_tier2;
 		}
 
 		// ================================================================
@@ -16011,14 +16018,14 @@ int cl_arq_controller::test_climb_engine()
 		// regression). This test drives the REAL production leap functions (elevator_target_from_snr
 		// + inband_climb_target) from a REAL cfg0 residence with NO latch poke -- the fix for the
 		// earlier test flaw (it SIMULATED a licensed latch instead of EXERCISING the path). The
-		// FAIL-BEFORE arms come from the defeat knobs (ACCEL_DEFEAT=incumbent, TIER2_DEFEAT=Tier-1),
-		// PASS-AFTER is the default; ALL on this ONE binary. The WIRE fire-proof (the [GEARSHIFT]
+		// The DEFAULT arm (no env) is Tier-1 (C1 on, C2/C3 off); ACCEL_DEFEAT=incumbent (C1 off);
+		// MERCURY_CLIMB_TIER2 opts IN to the C2 top-rung leap. ALL on ONE binary. The WIRE fire-proof (the [GEARSHIFT]
 		// ELEVATOR leap trace on a live real-audio run through process_messages_rx_acks_data) is the
 		// full production-path exercise; this is the fail-before/pass-after unit gate on the leap.
 		// ================================================================
 		{
 			bool  kk_saved_defeat = climb_accel_defeat;
-			bool  kk_saved_tier2  = climb_tier2_defeat;
+			bool  kk_saved_tier2  = climb_tier2;
 			int   kk_saved_cfg    = current_configuration;
 			int   kk_saved_anchor = last_data_viable_config;
 			int   kk_saved_ceil   = supershift_proven_ceiling;
@@ -16042,13 +16049,13 @@ int cl_arq_controller::test_climb_engine()
 			measurements.SNR_uplink   = 21.0;                 // a clean high SNR (tip triad: > -90)
 			int kk_plus1        = config_ladder_up(CONFIG_0, /*robust_en=*/true, false);  // CONFIG_1 (the conservative +1)
 			int kk_expect_ideal = get_configuration(21.0 - SUPERSHIFT_MARGIN_DB);         // CONFIG_16
-			climb_accel_defeat = false; climb_tier2_defeat = false;
-			int kk_leap_fix = elevator_target_from_snr();     // PASS-AFTER (C1+C2+C3 default)
+			climb_accel_defeat = false; climb_tier2 = true;   // opt-in C2 (MERCURY_CLIMB_TIER2)
+			int kk_leap_fix = elevator_target_from_snr();     // PASS-AFTER (C2 opt-in: the top-rung leap)
 			check(kk_expect_ideal == CONFIG_16,
 				"KK1a premise: 21 dB - 6 dB margin maps to CONFIG_16 (the clean-channel ceiling)",
 				kk_expect_ideal, CONFIG_16);
 			check(kk_leap_fix == CONFIG_16,
-				"KK1b PASS-AFTER: at a real cfg0 residence the elevator LEAPS to CONFIG_16 in ONE shot -- no latch poke, the leap FIRES",
+				"KK1b PASS-AFTER (C2 opt-in): at a real cfg0 residence the elevator LEAPS to CONFIG_16 in ONE shot -- no latch poke, the leap FIRES",
 				kk_leap_fix, CONFIG_16);
 			check(config_ladder_index(kk_leap_fix) > config_ladder_index(kk_plus1),
 				"KK1c the leap is MULTI-RUNG (outranks the conservative +1 CONFIG_1) -- the [GEARSHIFT] ELEVATOR leap diagnostic fires",
@@ -16056,33 +16063,36 @@ int cl_arq_controller::test_climb_engine()
 
 			// KK2 -- FAIL-BEFORE (incumbent, MERCURY_CLIMB_ACCEL_DEFEAT): the SAME real function on the
 			// SAME state lands only CONFIG_13 (the legacy-capped leap the incumbent leaps to). C2 lifts 13->16.
-			climb_accel_defeat = true; climb_tier2_defeat = false;
+			climb_accel_defeat = true; climb_tier2 = false;
 			int kk_leap_incumbent = elevator_target_from_snr();
 			climb_accel_defeat = false;
 			check(kk_leap_incumbent == CONFIG_13,
 				"KK2 FAIL-BEFORE (incumbent, ACCEL_DEFEAT): the same cfg0 residence lands CONFIG_13 (legacy cap) -- C2 lifts 13->16",
 				kk_leap_incumbent, CONFIG_13);
 
-			// KK3 -- TIER-1 arm (MERCURY_CLIMB_TIER2_DEFEAT): C2+C3 OFF restores the CONFIG_13 elevator
-			// cap, but C1 (the robust tier-cross) STAYS LIVE -- proving Tier-2 defeat keeps C1 (the ~29s win).
-			climb_accel_defeat = false; climb_tier2_defeat = true;
-			int kk_leap_tier1 = elevator_target_from_snr();   // cap restored to 13 (C2 off)
+			// KK3 -- TIER-1 arm = the DEFAULT (no MERCURY_CLIMB_TIER2): C2+C3 OFF caps the elevator at CONFIG_13,
+			// but C1 (the robust tier-cross) STAYS LIVE -- proving the shipping default keeps C1 (the ~29s win).
+			climb_accel_defeat = false; climb_tier2 = false;
+			int kk_leap_tier1 = elevator_target_from_snr();   // default cap 13 (C2 off)
 			current_configuration = ROBUST_0;
 			supershift_proven_ceiling = -1;
-			int kk_c1_under_tier2 = robust_climb_probe_target();   // CONFIG_0 -- C1 UNAFFECTED by tier2 defeat
+			int kk_c1_under_tier2 = robust_climb_probe_target();   // CONFIG_0 -- C1 UNAFFECTED by the C2/C3 opt-in
 			current_configuration = CONFIG_0;
-			climb_tier2_defeat = false;
+			climb_tier2 = false;
 			check(kk_leap_tier1 == CONFIG_13,
-				"KK3a TIER-1 (TIER2_DEFEAT): C2/C3 off restores the CONFIG_13 elevator cap (the incumbent leap)",
+				"KK3a TIER-1 (DEFAULT): C2/C3 off caps the elevator at CONFIG_13 (the shipping default)",
 				kk_leap_tier1, CONFIG_13);
 			check(kk_c1_under_tier2 == CONFIG_0,
-				"KK3b TIER-1: C1 (robust tier-cross) STAYS LIVE under TIER2_DEFEAT (proposes CONFIG_0) -- Tier-1 keeps C1",
+				"KK3b TIER-1: C1 (robust tier-cross) STAYS LIVE in the DEFAULT (proposes CONFIG_0) -- Tier-1 keeps C1",
 				kk_c1_under_tier2, CONFIG_0);
+			check(config_ladder_index(kk_leap_tier1) > config_ladder_index(kk_plus1),
+				"KK3c TIER-1 DEFAULT: the C1 elevator still LEAPS multi-rung (outranks the +1) -- default climb not lobotomized",
+				config_ladder_index(kk_leap_tier1), config_ladder_index(kk_plus1));
 
 			// KK4 -- C1 robust tier-cross through the REAL compose. At ROBUST_0 the pure helper proposes
 			// CONFIG_0; inband_climb_target RAISES the robust +1 (ROBUST_1) to the CONFIG_0 tier-cross.
 			// The proven-ceiling ratchet + the ACCEL_DEFEAT knob are the fail-before arms.
-			climb_accel_defeat = false; climb_tier2_defeat = false;
+			climb_accel_defeat = false; climb_tier2 = false;
 			supershift_proven_ceiling = -1;
 			current_configuration = ROBUST_0;
 			int kk_c1        = robust_climb_probe_target();                          // CONFIG_0
@@ -16109,7 +16119,7 @@ int cl_arq_controller::test_climb_engine()
 
 			// restore members touched above
 			climb_accel_defeat       = kk_saved_defeat;
-			climb_tier2_defeat       = kk_saved_tier2;
+			climb_tier2 = kk_saved_tier2;
 			current_configuration    = kk_saved_cfg;
 			last_data_viable_config  = kk_saved_anchor;
 			supershift_proven_ceiling= kk_saved_ceil;

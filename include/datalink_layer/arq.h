@@ -1452,9 +1452,9 @@ public:
       // at least a +1 move). TUNABLE via RETRIGGER_MAX_LEAP (common_defines.h).
       // C2 (data-flow-gearshift-climb.md): RETRIGGER_MAX_LEAP is 16 (the full
       // CONFIG_0->CONFIG_16 span) so a proven-cfg0 anchor may reach the top rung in ONE leap.
-      // Either defeat knob restores 13 (the pre-accel edb86009 value): ACCEL_DEFEAT reverts the
-      // WHOLE fix to the incumbent, TIER2_DEFEAT reverts only C2+C3 (Tier-1: C1 stays live).
-      int max_leap = (climb_accel_defeat || climb_tier2_defeat) ? 13 : RETRIGGER_MAX_LEAP;
+      // C2 is OPT-IN (default OFF): MERCURY_CLIMB_TIER2=1 raises the cap to 16. The default ships
+      // Tier-1 (C1 only, cap 13); ACCEL_DEFEAT=1 reverts C1 too. C2/C3 deferred pending a decode-margin gate.
+      int max_leap = (!climb_accel_defeat && climb_tier2) ? RETRIGGER_MAX_LEAP : 13;
       int leap_cap = config_ladder_up_n(anchor, max_leap, robust_en, narrowband);
       if(config_ladder_index(snr_ideal) > config_ladder_index(leap_cap))
         snr_ideal = leap_cap;
@@ -5105,9 +5105,9 @@ public:
     // C3 (data-flow-gearshift-climb.md): the handoff cap is DEMOTE-DIRECTION-ONLY. Turbo may
     // DELIVER the SNR-indicated rung UP in one shot; the Q-table optimizer still owns
     // steady-state / demote. Skip the cap when the (already ceiling-bounded) target is a CLIMB
-    // above the current rung. Either defeat knob restores the unconditional cap for the A/B arm
-    // (ACCEL_DEFEAT -> incumbent, TIER2_DEFEAT -> Tier-1 C2+C3 off).
-    if (!climb_accel_defeat && !climb_tier2_defeat &&
+    // above the current rung. C2/C3 are OPT-IN (MERCURY_CLIMB_TIER2=1); the default keeps the cap
+    // (deferred pending a decode-margin gate). ACCEL_DEFEAT=1 also keeps the cap (full incumbent).
+    if (!climb_accel_defeat && climb_tier2 &&
         config_ladder_index(*snr_target) > config_ladder_index(current_configuration))
       return;
     if (*snr_target > handoff) {
@@ -5125,12 +5125,12 @@ public:
   // legacy leap cap 13, unconditional handoff cap, no robust tier-cross. Env-latched in the
   // ctor so the fire-proof runs FIX vs DEFEAT(incumbent) on the SAME binary.
   bool climb_accel_defeat;
-  // TIER-2 defeat knob (MERCURY_CLIMB_TIER2_DEFEAT=1): disables C2+C3 ONLY (leap cap back to 13,
-  // unconditional handoff cap) while C1 (the robust tier-cross probe) stays LIVE. This is the
-  // Tier-1 (C1-only) fire-proof arm — proves C1 is a safe win even if C2/C3 defer to phase-2.
+  // TIER-2 ENABLE knob (MERCURY_CLIMB_TIER2=1, default 0/OFF): opts IN to C2+C3 (leap cap 13->16,
+  // handoff cap demote-only). The DEFAULT ships Tier-1 (C1 only); C2/C3 DEFERRED pending a decode-margin
+  // gate (they over-climb the marginal boundary). C1 stays LIVE in the default and under Tier-2.
   // (The P0-gate SNR-provenance latch was DROPPED in v2: it was an unsatisfiable bootstrap
   // deadlock; the anchor tier gate is_ofdm_config(anchor) at arq.h:1441-1443 is the real safety.)
-  bool climb_tier2_defeat;
+  bool climb_tier2;
   // C1 (data-flow-gearshift-climb.md) — the ROBUST tier-cross probe target. Returns CONFIG_0
   // when a robust climb should PROPOSE the OFDM tier directly (skip ROBUST_1/2 — they carry no
   // OFDM evidence, pure delay), or -1 to keep the +1 robust ladder. -1 when: defeated, not at a

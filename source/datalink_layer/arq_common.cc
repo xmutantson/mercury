@@ -605,13 +605,13 @@ cl_arq_controller::cl_arq_controller()
 	nResends=3;
 	// Climb-acceleration (data-flow-gearshift-climb.md): the A/B defeat knobs are env-latched
 	// ONCE here so a real-audio run reads them on the production path and the fire-proof runs
-	// FIX vs DEFEAT(incumbent) vs TIER1(C1-only) on ONE binary. ACCEL_DEFEAT reverts the whole
-	// fix (C1+C2+C3 -> incumbent); TIER2_DEFEAT reverts C2+C3 only (C1 stays live -> Tier-1).
+	// the A/B on ONE binary. The DEFAULT (no env) = Tier-1: C1 ON, C2/C3 OFF. ACCEL_DEFEAT reverts the whole
+	// fix (C1+C2+C3 -> incumbent); MERCURY_CLIMB_TIER2=1 opts IN to C2+C3 (deferred pending a decode-margin gate).
 	{
 		const char* e = std::getenv("MERCURY_CLIMB_ACCEL_DEFEAT");
 		climb_accel_defeat = (e && *e && atoi(e) != 0);
-		const char* e2 = std::getenv("MERCURY_CLIMB_TIER2_DEFEAT");
-		climb_tier2_defeat = (e2 && *e2 && atoi(e2) != 0);
+		const char* e2 = std::getenv("MERCURY_CLIMB_TIER2");
+		climb_tier2 = (e2 && *e2 && atoi(e2) != 0);
 	}
 	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
 	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at
