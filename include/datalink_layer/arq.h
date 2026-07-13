@@ -5192,6 +5192,15 @@ public:
   // (The P0-gate SNR-provenance latch was DROPPED in v2: it was an unsatisfiable bootstrap
   // deadlock; the anchor tier gate is_ofdm_config(anchor) at arq.h:1441-1443 is the real safety.)
   bool climb_tier2;
+  // LOW-SNR CEILING PIN (data-flow-gearshift-climb.md) — the partial-pattern up-probe data-fail
+  // twin (arq_commander.cc pat path) was MISSING the decode-learned ceiling pin its pure-silence
+  // sibling has, so a partial (e.g. 0.22) batch at an over-leaped rung never pinned
+  // supershift_proven_ceiling and the elevator re-leaped into the dead rung (WGN:15 collapse).
+  // The pin is DEFAULT-ON. A/B defeat knob (MERCURY_CEILING_PIN_DEFEAT=1): restores the old
+  // missing-pin behavior so the fire-proof runs FIX vs DEFEAT on the SAME binary. Env-latched in
+  // the ctor. Independent of climb_accel_defeat (this fix is on the WITHIN-ladder failure path,
+  // not the leap itself).
+  bool ceiling_pin_defeat;
   // C1 (data-flow-gearshift-climb.md) — the ROBUST tier-cross probe target. Returns CONFIG_0
   // when a robust climb should PROPOSE the OFDM tier directly (skip ROBUST_1/2 — they carry no
   // OFDM evidence, pure delay), or -1 to keep the +1 robust ladder. -1 when: defeated, not at a

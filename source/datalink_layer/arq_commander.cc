@@ -5707,6 +5707,26 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					return;
 				}
 
+				// LOW-SNR CEILING PIN (data-flow-gearshift-climb.md): a partial-pattern up-probe
+				// data-fail is a FAILED rung EXACTLY like the pure-silence twin (:5493-5494) — a
+				// partial (e.g. 0.22-decode) batch is NOT a viable rung. Pin the decode-learned
+				// ceiling to the retreat rung so the elevator cannot re-leap above the last
+				// decode-supported config. WITHOUT this pin the ceiling stayed -1 → cfg13 (pat) fail
+				// → cfg12 anchor-raise → the elevator recomputed a high target bounded only by the
+				// leap cap → re-leap cfg12→cfg16 (dead at low SNR) → BREAK → collapse. This is the
+				// SHARED-INVARIANT restore the cross-layer audit found missing on ONLY this twin (the
+				// SET_CONFIG-ACK NAck path :3602 is a distinct control-handshake class with its own
+				// probe_backoff and is intentionally left unchanged). DEFAULT-ON;
+				// MERCURY_CEILING_PIN_DEFEAT=1 restores the missing-pin behavior for the A/B.
+				if(!ceiling_pin_defeat)
+				{
+					if(supershift_proven_ceiling < 0 || working_config < supershift_proven_ceiling)
+						supershift_proven_ceiling = working_config;
+					printf("[GEARSHIFT] CEILING PIN (pat): config %d failed -> ceiling %d\n",
+						data_configuration, working_config);
+					fflush(stdout);
+				}
+
 				printf("[GEARSHIFT] FRAME UP DATA FAILED (pat): config %d -> BREAK to %d (threshold %d)\n",
 					data_configuration, working_config, frame_shift_threshold);
 				fflush(stdout);
@@ -16128,6 +16148,116 @@ int cl_arq_controller::test_climb_engine()
 			narrowband_enabled       = kk_saved_nb;
 			max_config_override      = kk_saved_over;
 			measurements.SNR_uplink  = kk_saved_snr;
+		}
+
+		// ================================================================
+		// Part LSP — LOW-SNR CEILING PIN (data-flow-gearshift-climb.md). The
+		// partial-pattern up-probe data-fail twin (process_messages_rx_acks_data
+		// pat path) must pin the decode-learned ceiling EXACTLY like its
+		// pure-silence sibling, so a leap-rung that only PARTIALLY decoded cannot
+		// be re-leaped into. FAIL-BEFORE = DEFEAT (missing pin -> the WGN:15
+		// collapse); PASS-AFTER = FIX (default). The pin arithmetic is the EXACT
+		// production expression (the pat twin), driven by the REAL ceiling_pin_defeat
+		// member (NOT a hand-set of the ceiling); the DOWNSTREAM consequence is
+		// proven by driving the REAL production function elevator_target_from_snr()
+		// -> DEFEAT re-leaps to CFG16 (the dead rung), FIX HOLDS at CFG12. The live
+		// production fire (the [GEARSHIFT] CEILING PIN (pat) trace on a real WGN:15
+		// run) is the production-path exercise this in-process gate cannot do
+		// (process_messages_rx_acks_data needs telecom_system) — see the fire-proof.
+		// ================================================================
+		{
+			int    lsp_saved_defeat = ceiling_pin_defeat;
+			int    lsp_saved_ceil   = supershift_proven_ceiling;
+			int    lsp_saved_cur    = current_configuration;
+			int    lsp_saved_anchor = last_data_viable_config;
+			int    lsp_saved_over   = max_config_override;
+			int    lsp_saved_robust = robust_enabled;
+			int    lsp_saved_nb     = narrowband_enabled;
+			bool   lsp_saved_optdis = optimizer_disabled;
+			bool   lsp_saved_accel  = climb_accel_defeat;
+			bool   lsp_saved_tier2  = climb_tier2;
+			int    lsp_saved_cool   = bigblock_carve_cooldown_batches;
+			double lsp_saved_snr    = measurements.SNR_uplink;
+
+			// The WGN:15 regime, DEFAULT arm (Tier-1: C1 on, C2/C3 off — the shipped default).
+			robust_enabled          = YES;
+			narrowband_enabled      = NO;
+			optimizer_disabled      = true;   // optimizer_is_in_control()==false (gearshift owns the band)
+			max_config_override     = -1;
+			climb_accel_defeat      = false;
+			climb_tier2             = false;
+			bigblock_carve_cooldown_batches = 0;   // no CFG16 carve cooldown active (identity cap)
+			measurements.SNR_uplink = 21.0;   // clean-high proxy -> get_configuration(21-6)=CFG16 (KK1a premise)
+			current_configuration   = CONFIG_12;   // recovered to CFG12 after the leap-overshoot BREAK
+			last_data_viable_config = CONFIG_12;   // CFG12 proven OFDM (2 clean batches raise the anchor)
+
+			// The elevator leaped to CFG13; its data batch FAILED with partial reverse
+			// activity (0.22 decode -> the pat twin). working_config = the retreat rung.
+			const int lsp_failed_rung = CONFIG_13;
+			int lsp_wc = config_ladder_down(lsp_failed_rung, robust_enabled);
+			check(lsp_wc == CONFIG_12,
+				"LSP0 pat-twin retreat rung == config_ladder_down(CFG13) == CFG12",
+				lsp_wc, CONFIG_12);
+
+			// pat-twin ceiling pin — the EXACT production expression, gated by the REAL member.
+			auto lsp_pat_pin = [&](int wc){
+				if(!ceiling_pin_defeat)
+				{
+					if(supershift_proven_ceiling < 0 || wc < supershift_proven_ceiling)
+						supershift_proven_ceiling = wc;
+				}
+			};
+
+			// ---- FAIL-BEFORE: DEFEAT (missing pin) reproduces the collapse ----
+			ceiling_pin_defeat        = true;
+			supershift_proven_ceiling = -1;
+			lsp_pat_pin(lsp_wc);
+			check(supershift_proven_ceiling == -1,
+				"LSP1 FAIL-BEFORE (DEFEAT): the pat twin does NOT pin -> ceiling stays -1",
+				supershift_proven_ceiling, -1);
+			int lsp_def_elev = elevator_target_from_snr();   // REAL production function
+			check(lsp_def_elev == CONFIG_16,
+				"LSP2 FAIL-BEFORE (DEFEAT): the elevator RE-LEAPS CFG12->CFG16 (the dead rung -> collapse)",
+				lsp_def_elev, CONFIG_16);
+
+			// ---- PASS-AFTER: FIX (default, pin ON) ----
+			ceiling_pin_defeat        = false;
+			supershift_proven_ceiling = -1;
+			lsp_pat_pin(lsp_wc);
+			check(supershift_proven_ceiling == CONFIG_12
+				&& supershift_proven_ceiling == config_ladder_down(lsp_failed_rung, robust_enabled),
+				"LSP3 PASS-AFTER (FIX): the pat twin PINS ceiling to config_ladder_down(CFG13)==CFG12",
+				supershift_proven_ceiling, CONFIG_12);
+			int lsp_fix_elev = elevator_target_from_snr();   // REAL production function
+			check(lsp_fix_elev == CONFIG_12,
+				"LSP4 PASS-AFTER (FIX): the pinned ceiling HOLDS the elevator at CFG12 (NO re-leap above the last decode-supported rung)",
+				lsp_fix_elev, CONFIG_12);
+			check(config_ladder_index(lsp_fix_elev) < config_ladder_index(lsp_def_elev),
+				"LSP5 the pin STRICTLY lowers the elevator target vs the missing-pin collapse (CFG12 < CFG16)",
+				config_ladder_index(lsp_fix_elev), config_ladder_index(lsp_def_elev));
+
+			// min-guard: the pin only ever LOWERS — an already-lower ceiling is NOT raised
+			// by a higher failed rung (CEILING RECOVERY, untouched, owns raising).
+			ceiling_pin_defeat        = false;
+			supershift_proven_ceiling = CONFIG_10;
+			lsp_pat_pin(lsp_wc);   // wc = CFG12 (> CFG10)
+			check(supershift_proven_ceiling == CONFIG_10,
+				"LSP6 min-guard: a CFG13 fail does NOT RAISE an already-lower CFG10 ceiling (the pin only lowers)",
+				supershift_proven_ceiling, CONFIG_10);
+
+			// restore members touched above
+			ceiling_pin_defeat              = lsp_saved_defeat;
+			supershift_proven_ceiling       = lsp_saved_ceil;
+			current_configuration           = lsp_saved_cur;
+			last_data_viable_config         = lsp_saved_anchor;
+			max_config_override             = lsp_saved_over;
+			robust_enabled                  = lsp_saved_robust;
+			narrowband_enabled              = lsp_saved_nb;
+			optimizer_disabled              = lsp_saved_optdis;
+			climb_accel_defeat              = lsp_saved_accel;
+			climb_tier2                     = lsp_saved_tier2;
+			bigblock_carve_cooldown_batches = lsp_saved_cool;
+			measurements.SNR_uplink         = lsp_saved_snr;
 		}
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",

@@ -612,6 +612,11 @@ cl_arq_controller::cl_arq_controller()
 		climb_accel_defeat = (e && *e && atoi(e) != 0);
 		const char* e2 = std::getenv("MERCURY_CLIMB_TIER2");
 		climb_tier2 = (e2 && *e2 && atoi(e2) != 0);
+		// LOW-SNR CEILING PIN (data-flow-gearshift-climb.md): the pat-twin ceiling pin ships
+		// DEFAULT-ON. MERCURY_CEILING_PIN_DEFEAT=1 restores the missing-pin behavior (the WGN:15
+		// collapse) so the fire-proof runs FIX vs DEFEAT on ONE binary.
+		const char* e3 = std::getenv("MERCURY_CEILING_PIN_DEFEAT");
+		ceiling_pin_defeat = (e3 && *e3 && atoi(e3) != 0);
 	}
 	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
 	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at
