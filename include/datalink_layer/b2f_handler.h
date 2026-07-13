@@ -89,6 +89,14 @@ public:
 	bool is_b2f_session() const { return b2f_detected; }
 	bool is_initialized() const { return initialized; }
 
+	// C3 reroll-divergence diagnostics. reroll_divergence counts RX rerolls whose
+	// re-encoded LZHUF length did not match the sender's declared comp_size (proof
+	// of encoder non-identity); is_reroll_poisoned() is true once the fail-closed
+	// guard has tripped and filter_rx refuses to ship any further bytes this
+	// session. Both are cleared by reset().
+	long long get_reroll_divergence() const { return reroll_divergence; }
+	bool is_reroll_poisoned() const { return reroll_poisoned; }
+
 	// Enable/disable unrolling (default: true).
 	// When disabled, the handler still parses B2F for logging but passes
 	// all data through unchanged.
@@ -133,6 +141,10 @@ private:
 	int tx_line_pos;
 	char rx_line_buf[B2F_LINE_BUF_SIZE];
 	int rx_line_pos;
+
+	// C3 reroll-divergence guard state (cleared by reset()).
+	long long reroll_divergence;   // count of size-mismatched (divergent) rerolls
+	bool reroll_poisoned;          // fail-closed: refuse all further RX transform
 
 	// Payload capture buffer (for LZHUF decompression on TX side)
 	uint8_t* payload_buf;

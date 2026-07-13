@@ -77,6 +77,8 @@ void cl_b2f_handler::reset()
 	tx_line_pos = 0;
 	rx_line_pos = 0;
 	payload_buf_pos = 0;
+	reroll_divergence = 0;
+	reroll_poisoned = false;
 }
 
 // ---- B2F Line Parsers ----
@@ -582,19 +584,58 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 						printf("[B2F-RX] Rerolled %s: %d plaintext -> %zu LZHUF (match)\n",
 							proposals[current_payload_idx].mid,
 							payload_buf_pos, lzhuf_len);
+						fflush(stdout);
+
+						if (out_pos + (int)lzhuf_len <= out_cap)
+						{
+							memcpy(out + out_pos, plain_buf, lzhuf_len);
+							out_pos += (int)lzhuf_len;
+						}
 					}
 					else
 					{
-						printf("[B2F-RX] WARNING: Rerolled %zu != declared %u for %s\n",
-							lzhuf_len, proposals[current_payload_idx].comp_size,
-							proposals[current_payload_idx].mid);
-					}
-					fflush(stdout);
-
-					if (out_pos + (int)lzhuf_len <= out_cap)
-					{
-						memcpy(out + out_pos, plain_buf, lzhuf_len);
-						out_pos += (int)lzhuf_len;
+						// FATAL reroll DIVERGENCE: the re-encoded LZHUF length does not
+						// match the sender's declared comp_size, which PROVES this encoder's
+						// output is not byte-identical to the sending client's. A resumed
+						// splice (the client-saved reroll prefix ++ the sender-resent
+						// original suffix) is correct ONLY if the two encoders are byte-
+						// identical, so a divergent reroll must NEVER go on the wire. On the
+						// RX side we hold only the unrolled plaintext, not the sender's
+						// original LZHUF, so there is no safe substitute stream to ship.
+						// Fail closed: drop the divergent body and POISON the B2F transform
+						// for the rest of this session (filter_rx then ships nothing) so
+						// neither divergent nor framing-desynced bytes reach the client. The
+						// client re-requests from offset 0 on the fresh reconnect. A test-only
+						// defeat knob (MERCURY_B2F_REROLL_MISMATCH_SHIP=1) restores the old
+						// warn-and-ship for the fail-before arm of the reroll-mismatch test.
+						reroll_divergence++;
+						bool ship_divergent = false;
+						{ const char* e = std::getenv("MERCURY_B2F_REROLL_MISMATCH_SHIP");
+						  if (e && *e && atoi(e) != 0) ship_divergent = true; }
+						if (ship_divergent)
+						{
+							printf("[B2F-RX] WARNING(defeat): Rerolled %zu != declared %u for %s "
+								"— shipping divergent LZHUF (MERCURY_B2F_REROLL_MISMATCH_SHIP)\n",
+								lzhuf_len, proposals[current_payload_idx].comp_size,
+								proposals[current_payload_idx].mid);
+							fflush(stdout);
+							if (out_pos + (int)lzhuf_len <= out_cap)
+							{
+								memcpy(out + out_pos, plain_buf, lzhuf_len);
+								out_pos += (int)lzhuf_len;
+							}
+						}
+						else
+						{
+							reroll_poisoned = true;
+							printf("[B2F-RX] FATAL: reroll size mismatch for %s (rerolled %zu != "
+								"declared %u) — refusing to ship divergent LZHUF; poisoning B2F "
+								"transform (fail-closed; client re-requests from offset 0) "
+								"(divergence count=%lld)\n",
+								proposals[current_payload_idx].mid, lzhuf_len,
+								proposals[current_payload_idx].comp_size, reroll_divergence);
+							fflush(stdout);
+						}
 					}
 				}
 				else
@@ -763,6 +804,12 @@ int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap
 		memcpy(out, in, copy);
 		return copy;
 	}
+
+	// Fail-closed (C3): a prior reroll DIVERGED from the sender's LZHUF encoding.
+	// Ship NOTHING further this session so no divergent or framing-desynced bytes
+	// reach the client; -1 is treated by the RX drain as "send 0 bytes this tick".
+	if (reroll_poisoned)
+		return -1;
 
 	int out_pos = 0;
 	int in_pos = 0;
