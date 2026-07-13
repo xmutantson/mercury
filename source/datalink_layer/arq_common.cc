@@ -11076,6 +11076,22 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 #endif
 	this->link_status = DROPPED;
 
+	// Winlink DISCONNECTED signalling (data-flow-reconnect-continuity.md plumbing): a gap-abort
+	// is a session-killing teardown, so the application resume layer (B2F) must see a CLEAN DROP
+	// to re-propose from its own saved offset. Emit DISCONNECTED to the control socket on EVERY
+	// gap-abort (not only the reconnect-seam refuse path, which used to emit it inline). Mirrors
+	// the link-timeout teardown DISCONNECTED surface (arq_common.cc ~6035). Guarded on an ACCEPTED
+	// control socket so the in-process test harness (no real socket) is unaffected; idempotent on
+	// an already-dropping channel.
+	if(tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
+	{
+		std::string disc_str="DISCONNECTED\r";
+		tcp_socket_control.message->length=disc_str.length();
+		for(int di=0; di<(int)tcp_socket_control.message->length; di++)
+			tcp_socket_control.message->buffer[di]=disc_str[di];
+		tcp_socket_control.transmit();
+	}
+
 	// Clear the bsi family + in-flight prev-buffer + carve-arm so a stale prev /
 	// cur cannot misroute the next session's first frame (FIX8_AUDIT §7 R8).
 	rsp_current_expected_batch_seq_id = -1;
@@ -15483,16 +15499,9 @@ void cl_arq_controller::copy_data_to_buffer()
 			(unsigned long long)rsp_prev_session_app_delivered);
 		fflush(stdout);
 		// Loud clean drop to the app so Winlink B2F sees a disconnect and re-proposes from its own
-		// offset. Mirrors the link-timeout teardown DISCONNECTED surface (arq_common.cc ~6182).
-		if(tcp_socket_control.get_status() == TCP_STATUS_ACCEPTED)
-		{
-			std::string str = "DISCONNECTED\r";
-			tcp_socket_control.message->length = str.length();
-			for(int i=0; i<(int)tcp_socket_control.message->length; i++)
-				tcp_socket_control.message->buffer[i] = str[i];
-			tcp_socket_control.transmit();
-		}
-		// Route the DROP through the shared gap-abort contract (latch + session reset + ruler
+		// offset: the DISCONNECTED signal is now emitted by rsp_gap_abort_teardown() itself (the
+		// shared gap-abort DISCONNECTED surface added in the C1 plumbing pass), so EVERY gap-abort --
+		// not only this seam refuse -- tells the client cleanly. Route the DROP through the shared gap-abort contract (latch + session reset + ruler
 		// preserve), then re-anchor the byte cursor and clear the prev high-water: the app has been
 		// told to discard its partial, so the NEXT transfer is fresh from offset 0 and must NOT be
 		// re-refused (no livelock) and must NOT false-trip the within-session positional backstop
