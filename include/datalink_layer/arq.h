@@ -798,6 +798,15 @@ public:
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md §2.
   void rsp_gap_abort_teardown(const char* reason);
 
+  // Reconnect-continuity fail-closed arm (data-flow-reconnect-continuity.md §5b). Called at the
+  // fresh RSP START_CONNECTION accept (both the callsign-matched and passive-monitor sites). Arms
+  // rsp_cross_session_seam_armed iff the app DATA socket is persistent (tcp_socket_data ACCEPTED,
+  // or the test-forced signal), the prior session delivered app bytes (rsp_prev_session_app_
+  // delivered > 0), and no negotiated resume proved byte-continuity. MERCURY_RECONNECT_FAILCLOSED_
+  // DEFEAT=1 leaves it disarmed (the pre-fix silent splice). No effect on a fresh transfer / a
+  // continuous session (prev-delivered 0 -> stays disarmed).
+  void rsp_reconnect_seam_arm_on_accept();
+
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
   // receive() landed a frame with messages_rx_buffer.type == SACK_RSP. The
   // function:
@@ -3756,6 +3765,32 @@ public:
   // prev flush (arq_common.cc). ctor-init false. See the cross-layer data-flow audit
   // for the delivery contiguity ruler.
   bool rsp_stream_aborted;
+  // Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b). A fresh
+  // START_CONNECTION re-anchors both absolute-byte cursors at 0 (reset_session_state), but
+  // the RSP app DATA socket is PERSISTENT across the modem-link reconnect (the FIX-6 note at
+  // reset_session_state: "A fresh session must not re-emit bytes from the previous
+  // connection's stream"). So if the prior session delivered N>0 app bytes to that socket and
+  // a fresh session then streams the sender's CURRENT position onto it, those bytes land at
+  // app position N with NO proof they equal corpus[N] — a SILENT cross-session skip that every
+  // per-session guard misses (each session's cursor is self-consistent). Two fields close it:
+  //   rsp_prev_session_app_delivered — the app-delivered high-water of the PRIOR session.
+  //     Snapshotted from rx_stream_delivered inside reset_session_state() BEFORE it zeroes the
+  //     cursor, and SURVIVES that reset (never re-zeroed there). ctor-init 0.
+  //   rsp_cross_session_seam_armed — set at the fresh START_CONNECTION accept (the sole arm
+  //     point) when the app socket is persistent AND prev-delivered>0 AND no negotiated resume
+  //     proved continuity; consumed (and cleared) at the first delivery in copy_data_to_buffer,
+  //     which REFUSES it (loud clean drop via rsp_gap_abort_teardown + DISCONNECTED) rather
+  //     than splice. Disarmed at every session boundary (reset_session_state). ctor-init false.
+  // Byte-identical when not armed: a continuous session never crosses reset (prev stays 0); a
+  // fresh transfer has prev 0. MERCURY_RECONNECT_FAILCLOSED_DEFEAT=1 keeps it disarmed (the
+  // pre-fix silent splice — the fail-before A/B arm). See the cross-layer data-flow audit.
+  uint64_t rsp_prev_session_app_delivered;
+  bool     rsp_cross_session_seam_armed;
+  // Test-only harness input (in-process --test-stream-offset has no real TCP socket): forces the
+  // "app DATA socket is persistent" signal the production arm reads from tcp_socket_data status,
+  // so the test can drive the REAL reset-snapshot -> arm -> refuse path. ctor-init false; never
+  // set on any production path.
+  bool     rsp_test_force_app_persistent;
   long long rsp_v2_drop_count;           // RSP: counter of [RSP-V2-DROP] events
                                          //      (frames discarded for unknown
                                          //      batch_seq_id). Validates the Step 4

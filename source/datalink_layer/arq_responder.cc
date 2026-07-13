@@ -3342,6 +3342,11 @@ void cl_arq_controller::process_control_responder()
 			// clear point). A prior mid-transfer abort latched rsp_stream_aborted so no
 			// delivery could ride the torn-down stream; a fresh CONNECT re-authorises delivery.
 			rsp_stream_aborted = false;
+			// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): the sole
+			// arm point, co-located with the sole clear of the abort latch. A fresh session on a
+			// persistent app data socket with a prior-session delivered high-water must fail-closed
+			// its first (byte-unprovable) delivery rather than splice.
+			rsp_reconnect_seam_arm_on_accept();
 
 			link_status = CONNECTED;
 			connection_status = RECEIVING;
@@ -3399,6 +3404,11 @@ void cl_arq_controller::process_control_responder()
 			// mid-transfer abort latched rsp_stream_aborted so no delivery could ride the
 			// torn-down stream; a fresh CONNECT re-authorises delivery for this new session.
 			rsp_stream_aborted = false;
+			// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): the sole
+			// arm point, co-located with the sole clear of the abort latch. A fresh session on a
+			// persistent app data socket with a prior-session delivered high-water must fail-closed
+			// its first (byte-unprovable) delivery rather than splice.
+			rsp_reconnect_seam_arm_on_accept();
 
 			link_status=CONNECTION_RECEIVED;
 			connection_status=ACKNOWLEDGING_CONTROL;

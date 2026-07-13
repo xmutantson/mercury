@@ -727,6 +727,14 @@ cl_arq_controller::cl_arq_controller()
 	// mid-transfer abort makes every subsequent delivery refuse until a genuine new
 	// session. See the cross-layer data-flow audit for the delivery contiguity ruler.
 	rsp_stream_aborted=false;
+	// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): the prior-session
+	// app-delivered high-water and the cross-session seam arm. prev-delivered SURVIVES
+	// reset_session_state() (snapshotted there before the cursor is zeroed); the arm is a per-
+	// session flag re-derived at each fresh START_CONNECTION accept. Test-force flag is never set
+	// on a production path.
+	rsp_prev_session_app_delivered=0;
+	rsp_cross_session_seam_armed=false;
+	rsp_test_force_app_persistent=false;
 	rsp_v2_drop_count=0;
 	test_rsp_bsi_corrupt_at=0;
 	test_rsp_bsi_v2_frame_counter=0;
@@ -7571,6 +7579,21 @@ void cl_arq_controller::reset_session_state()
 	rsp_gap_hold_cur_expected = 0;   // R2b: no held current batch survives a session boundary / teardown
 	cmd_prev_retain_count  = 0;
 
+	// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): SNAPSHOT the
+	// RSP app-delivered high-water into the reset-SURVIVING prev field BEFORE the Option-W
+	// re-anchor below zeroes rx_stream_delivered. This is the ONLY producer of prev-delivered,
+	// and it is a REAL reset (every genuine teardown routes here) — not a cursor poke. Guards:
+	//   - only capture a positive high-water (a no-data session leaves prev untouched at 0, so a
+	//     fresh transfer never arms the seam);
+	//   - skip when a gap-abort already latched (rsp_stream_aborted set BEFORE its internal reset,
+	//     arq_common.cc): a mid-transfer abort PRESERVES/RESTORES rx_stream_delivered around this
+	//     call and is NOT a cross-session boundary, so it must not re-capture the prior high-water.
+	// The fresh START_CONNECTION accept consumes prev to arm the seam; a taken refusal clears it.
+	if(rx_stream_delivered > 0 && !rsp_stream_aborted)
+		rsp_prev_session_app_delivered = rx_stream_delivered;
+	// Disarm any stale cross-session seam at the session boundary; the fresh accept re-arms it.
+	rsp_cross_session_seam_armed = false;
+
 	// Option W (data-flow-stream-offset.md §2.4): a fresh session re-anchors both
 	// absolute-byte-stream cursors at 0 and invalidates every per-bsi stamp so the
 	// next connection's stream starts at offset 0 with no stale stamp aliasing.
@@ -11131,6 +11154,45 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 		rx_stream_delivered = preserved_rx_stream_delivered;
 		rx_stream_crc       = preserved_rx_stream_crc;
 		for(int _s=0; _s<256; _s++) rx_stream_stamp[_s].valid = preserved_stamp_valid[_s];
+	}
+}
+
+void cl_arq_controller::rsp_reconnect_seam_arm_on_accept()
+{
+	// Reconnect-continuity fail-closed ARM (data-flow-reconnect-continuity.md §5b). Runs at the
+	// fresh RSP START_CONNECTION accept — the sole arm point, co-located with the sole clear of
+	// rsp_stream_aborted. A fresh session has re-anchored rx_stream_delivered at 0, but the app
+	// DATA socket persisted across the reconnect. If the PRIOR session delivered N>0 app bytes to
+	// that persistent socket, this session's first delivery would land at app position N with no
+	// proof it is corpus[N] (the silent cross-session skip). Arm so copy_data_to_buffer refuses
+	// that first delivery — UNLESS a negotiated resume proved byte-continuity (a separate, not-yet-
+	// implemented application-resume capability; continuity is therefore never proven here today).
+	bool failclosed_defeat = false;
+	{ const char* e = std::getenv("MERCURY_RECONNECT_FAILCLOSED_DEFEAT");
+	  if(e && *e && atoi(e)!=0) failclosed_defeat = true; }
+
+	// App DATA socket persistence: the socket the RSP drains delivered bytes into is still
+	// ACCEPTED (a client is attached across the modem reconnect). The in-process test has no real
+	// socket, so it forces this signal; no production path sets rsp_test_force_app_persistent.
+	bool app_data_persistent = (tcp_socket_data.get_status() == TCP_STATUS_ACCEPTED)
+	                           || rsp_test_force_app_persistent;
+
+	// Half A (lossless modem resume) is a separately-scoped project; no capability negotiates a
+	// byte-continuity proof today, so a resume is never proven and the seam is fail-closed.
+	bool reconnect_resume_proven = false;
+
+	rsp_cross_session_seam_armed = (!failclosed_defeat
+	                                && app_data_persistent
+	                                && rsp_prev_session_app_delivered > 0
+	                                && !reconnect_resume_proven);
+
+	if(rsp_cross_session_seam_armed)
+	{
+		printf("[RSP-V2-SEAM/FAILCLOSED-ARM] cross-session reconnect on a persistent app data "
+			"socket; prev_session_app_delivered=%llu. The first delivery of this session must "
+			"prove app-byte continuity or be refused (loud drop, never a silent splice).\n",
+			(unsigned long long)rsp_prev_session_app_delivered);
+		fflush(stdout);
 	}
 }
 
@@ -15370,6 +15432,47 @@ void cl_arq_controller::copy_data_to_buffer()
 	// orphan, and bigblock delivery). Counted independent of the 16 KB `assembled` cap so
 	// it equals the sender's stamp.length even for a >16 KB batch.
 	int delivered_transported = 0;
+
+	// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b) — the CROSS-SESSION
+	// backstop, one layer above the within-session positional backstop below. The within-session
+	// Option-W check compares this session's wire stamp.start against this session's re-anchored
+	// rx_stream_delivered, so a fresh reconnect (stamp.start==0, cursor==0) looks perfectly
+	// contiguous and the splice is invisible to it. The seam arm carries the fact that the PRIOR
+	// session already delivered N>0 bytes onto the persistent app data socket: this first delivery
+	// would land at app position N with no proof it equals corpus[N]. Refuse it LOUDLY — a clean
+	// drop through the shared rsp_gap_abort_teardown contract (which latches rsp_stream_aborted so
+	// every later delivery this session also refuses) PLUS the Winlink DISCONNECTED signal so the
+	// application resume layer (B2F) sees the drop and re-proposes from its own offset. Never a
+	// silent skip. Byte-identical when not armed (the guard is false on every normal delivery).
+	if(rsp_cross_session_seam_armed)
+	{
+		printf("[RSP-V2-SEAM/FAILCLOSED-REFUSE] cross-session reconnect splice refused: "
+			"prev_session_app_delivered=%llu; this fresh-session delivery would land at app "
+			"position N with no continuity proof. Loud drop (DISCONNECTED emitted); 0 spliced "
+			"bytes. Recovery is owned by the application resume layer.\n",
+			(unsigned long long)rsp_prev_session_app_delivered);
+		fflush(stdout);
+		// Loud clean drop to the app so Winlink B2F sees a disconnect and re-proposes from its own
+		// offset. Mirrors the link-timeout teardown DISCONNECTED surface (arq_common.cc ~6182).
+		if(tcp_socket_control.get_status() == TCP_STATUS_ACCEPTED)
+		{
+			std::string str = "DISCONNECTED\r";
+			tcp_socket_control.message->length = str.length();
+			for(int i=0; i<(int)tcp_socket_control.message->length; i++)
+				tcp_socket_control.message->buffer[i] = str[i];
+			tcp_socket_control.transmit();
+		}
+		// Route the DROP through the shared gap-abort contract (latch + session reset + ruler
+		// preserve), then re-anchor the byte cursor and clear the prev high-water: the app has been
+		// told to discard its partial, so the NEXT transfer is fresh from offset 0 and must NOT be
+		// re-refused (no livelock) and must NOT false-trip the within-session positional backstop
+		// (a stale nonzero cursor vs a fresh stamp.start==0). The seam is disarmed by the reset.
+		rsp_gap_abort_teardown("reconnect-continuity fail-closed: cross-session splice refused");
+		rx_stream_delivered            = 0;
+		rsp_prev_session_app_delivered = 0;
+		rsp_cross_session_seam_armed   = false;
+		return;   // do NOT deliver the positionally-unprovable cross-session batch
+	}
 
 	// Option W CORE — RSP BACKSTOP (data-flow-stream-offset.md §8.2 step 6): the
 	// LOUD-floor positional check. At the FIRST byte of this batch's delivery, the
