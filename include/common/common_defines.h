@@ -869,7 +869,14 @@ CONFIG_16 (5664.7 bps).
 // anchor still reaches CONFIG_16 in one leap = gap 12; a CONFIG_0 anchor still reaches
 // CONFIG_13 = gap 13), so the WGN:30 fast climb is materially unchanged (≤2 bounded
 // leaps from a low OFDM anchor) while a pathological jump is bounded.
-#define RETRIGGER_MAX_LEAP 13
+//
+// CLIMB-ACCEL (data-flow-gearshift-climb.md C2, 5c379e5a): raised 13 -> 16 = the FULL
+// CONFIG_0(idx3)->CONFIG_16(idx19) span, so a proven-cfg0 anchor reaches the top rung in ONE
+// leap instead of landing at cfg13 then crawling. SAFE because the load-bearing edb86009 guard
+// (the anchor tier gate is_ofdm_config(anchor), arq.h) is KEPT and hardened by the
+// SNR-provenance P0-gate: at deep SNR the anchor never reaches OFDM, so the leap stays barred.
+// Still the tunable belt. The A/B defeat knob restores 13 in supershift_retrigger_target.
+#define RETRIGGER_MAX_LEAP 16
 
 // CONNECT-SEED of the START config (gearshift-start-and-recovery.md §10). On a
 // CLEARLY-clean channel, open data near the SNR-appropriate WB OFDM config at
