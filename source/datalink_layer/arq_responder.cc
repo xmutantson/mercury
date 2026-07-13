@@ -3342,6 +3342,11 @@ void cl_arq_controller::process_control_responder()
 			// clear point). A prior mid-transfer abort latched rsp_stream_aborted so no
 			// delivery could ride the torn-down stream; a fresh CONNECT re-authorises delivery.
 			rsp_stream_aborted = false;
+			// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): the sole
+			// arm point, co-located with the sole clear of the abort latch. A fresh session on a
+			// persistent app data socket with a prior-session delivered high-water must fail-closed
+			// its first (byte-unprovable) delivery rather than splice.
+			rsp_reconnect_seam_arm_on_accept();
 
 			link_status = CONNECTED;
 			connection_status = RECEIVING;
@@ -3399,6 +3404,11 @@ void cl_arq_controller::process_control_responder()
 			// mid-transfer abort latched rsp_stream_aborted so no delivery could ride the
 			// torn-down stream; a fresh CONNECT re-authorises delivery for this new session.
 			rsp_stream_aborted = false;
+			// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): the sole
+			// arm point, co-located with the sole clear of the abort latch. A fresh session on a
+			// persistent app data socket with a prior-session delivered high-water must fail-closed
+			// its first (byte-unprovable) delivery rather than splice.
+			rsp_reconnect_seam_arm_on_accept();
 
 			link_status=CONNECTION_RECEIVED;
 			connection_status=ACKNOWLEDGING_CONTROL;
@@ -4277,6 +4287,12 @@ void cl_arq_controller::process_control_responder()
 	{
 		if(code==CLOSE_CONNECTION)
 		{
+			// Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b): a PROVEN-CLEAN
+			// end-of-transfer makes the persistent app socket a legitimate message boundary. Track it
+			// here and clear the app-delivered high-water AFTER reset_session_state() re-snapshots it
+			// (below), so a back-to-back new transfer on the same socket is byte-identical. An aborted /
+			// short / absent-EOT close leaves the high-water set (fail-closed default).
+			bool clean_eot_verified = false;
 			// Option W STEP 3 (data-flow-stream-offset.md §8.6) — the EOT end-to-end LAST-BATCH
 			// tail-drop / final-content reconciliation. MUST run BEFORE reset_session_state()
 			// zeroes rx_stream_delivered / rx_stream_crc. The CLOSE frame carries the SENDER's
@@ -4324,6 +4340,7 @@ void cl_arq_controller::process_control_responder()
 							"crc=0x%08x (complete, in order, uncorrupted)\n",
 							(unsigned long long)rx_stream_delivered, rx_stream_crc);
 						fflush(stdout);
+						clean_eot_verified = true;   // reconnect-seam F2: proven-clean boundary
 					}
 				}
 			}
@@ -4332,6 +4349,11 @@ void cl_arq_controller::process_control_responder()
 				gui_push_monitor_event("[DISCONNECT]", false);
 #endif
 			reset_session_state();
+			// Reconnect-continuity fail-closed F2: on a PROVEN-CLEAN EOT only, clear the app-delivered
+			// high-water that reset_session_state() just re-snapshotted (monotonic-max), so the next
+			// transfer on this persistent socket starts a fresh un-armed byte boundary (no false refuse).
+			if(clean_eot_verified)
+				rsp_seam_clear_on_clean_eot();
 			if(passive_monitor)
 			{
 				// Monitor: go back to LISTENING for next session

@@ -798,6 +798,22 @@ public:
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md §2.
   void rsp_gap_abort_teardown(const char* reason);
 
+  // Reconnect-continuity fail-closed arm (data-flow-reconnect-continuity.md §5b). Called at the
+  // fresh RSP START_CONNECTION accept (both the callsign-matched and passive-monitor sites). Arms
+  // rsp_cross_session_seam_armed iff the app DATA socket is persistent (tcp_socket_data ACCEPTED,
+  // or the test-forced signal), the prior session delivered app bytes (rsp_prev_session_app_
+  // delivered > 0), and no negotiated resume proved byte-continuity. MERCURY_RECONNECT_FAILCLOSED_
+  // DEFEAT=1 leaves it disarmed (the pre-fix silent splice). No effect on a fresh transfer / a
+  // continuous session (prev-delivered 0 -> stays disarmed).
+  void rsp_reconnect_seam_arm_on_accept();
+
+  // Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b). Called ONLY on a
+  // PROVEN-CLEAN end-of-transfer (the CLOSE_CONNECTION EOT-verified branch), AFTER reset_session_
+  // state() has re-snapshotted the app-delivered high-water. Clears rsp_prev_session_app_delivered
+  // (and any stale arm) so a legitimate back-to-back transfer on the SAME persistent app socket is
+  // byte-identical. An abort / short / absent-EOT close does NOT call this (fail-closed default).
+  void rsp_seam_clear_on_clean_eot();
+
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
   // receive() landed a frame with messages_rx_buffer.type == SACK_RSP. The
   // function:
@@ -3253,6 +3269,17 @@ public:
   // helpers + the production re-stage funnel through every transition, asserting
   // the latched per-bsi stamp == the true cumulative transported origin offset.
   int test_stream_offset();
+  // Streaming decompress-failure SILENT-FALSE-ACCEPT regression
+  // (residual-silent-corruption-wgn25.md). CLI: --test-decompress-false-accept.
+  // Drives two REAL cl_compressor instances into a streaming-model desync (RX
+  // reset out of lockstep with the TX — the WGN:25 out-of-order SACK regime),
+  // routes the resulting undecodable compressed batch through the REAL
+  // copy_data_to_buffer() reassembler with fifo_buffer_rx as a byte oracle.
+  // FAIL-BEFORE (MERCURY_DECOMPRESS_RAWPUSH_DEFEAT=1): the raw compressed blob is
+  // pushed to the app FIFO (silent garbage). PASS-AFTER (default): zero bytes
+  // delivered + [RSP-DECOMPRESS-FALSE-ACCEPT-BLOCKED] loud detect. See
+  // source/datalink_layer/test_decompress_false_accept.cc. Returns 0=PASS,1=FAIL.
+  int test_decompress_false_accept();
 
   // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
   // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the
@@ -3756,6 +3783,32 @@ public:
   // prev flush (arq_common.cc). ctor-init false. See the cross-layer data-flow audit
   // for the delivery contiguity ruler.
   bool rsp_stream_aborted;
+  // Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b). A fresh
+  // START_CONNECTION re-anchors both absolute-byte cursors at 0 (reset_session_state), but
+  // the RSP app DATA socket is PERSISTENT across the modem-link reconnect (the FIX-6 note at
+  // reset_session_state: "A fresh session must not re-emit bytes from the previous
+  // connection's stream"). So if the prior session delivered N>0 app bytes to that socket and
+  // a fresh session then streams the sender's CURRENT position onto it, those bytes land at
+  // app position N with NO proof they equal corpus[N] — a SILENT cross-session skip that every
+  // per-session guard misses (each session's cursor is self-consistent). Two fields close it:
+  //   rsp_prev_session_app_delivered — the app-delivered high-water of the PRIOR session.
+  //     Snapshotted from rx_stream_delivered inside reset_session_state() BEFORE it zeroes the
+  //     cursor, and SURVIVES that reset (never re-zeroed there). ctor-init 0.
+  //   rsp_cross_session_seam_armed — set at the fresh START_CONNECTION accept (the sole arm
+  //     point) when the app socket is persistent AND prev-delivered>0 AND no negotiated resume
+  //     proved continuity; consumed (and cleared) at the first delivery in copy_data_to_buffer,
+  //     which REFUSES it (loud clean drop via rsp_gap_abort_teardown + DISCONNECTED) rather
+  //     than splice. Disarmed at every session boundary (reset_session_state). ctor-init false.
+  // Byte-identical when not armed: a continuous session never crosses reset (prev stays 0); a
+  // fresh transfer has prev 0. MERCURY_RECONNECT_FAILCLOSED_DEFEAT=1 keeps it disarmed (the
+  // pre-fix silent splice — the fail-before A/B arm). See the cross-layer data-flow audit.
+  uint64_t rsp_prev_session_app_delivered;
+  bool     rsp_cross_session_seam_armed;
+  // Test-only harness input (in-process --test-stream-offset has no real TCP socket): forces the
+  // "app DATA socket is persistent" signal the production arm reads from tcp_socket_data status,
+  // so the test can drive the REAL reset-snapshot -> arm -> refuse path. ctor-init false; never
+  // set on any production path.
+  bool     rsp_test_force_app_persistent;
   long long rsp_v2_drop_count;           // RSP: counter of [RSP-V2-DROP] events
                                          //      (frames discarded for unknown
                                          //      batch_seq_id). Validates the Step 4
@@ -3956,6 +4009,14 @@ public:
   // undelivered so the CMD re-emits the block. Diagnostic; logged via
   // [RSP-V2-PREV-BLOCKCRC-REJECT]. Initialized to 0 (init_messages_buffers reset path).
   long long rsp_prev_batch_blockcrc_reject_count = 0;
+
+  // RSP: count of batches whose streaming decompress FAILED and whose undecodable
+  // raw compressed bytes were REFUSED delivery to the app (copy_data_to_buffer's
+  // former silent-false-accept raw-push — residual-silent-corruption-wgn25.md).
+  // Each increment is a LOUD [RSP-DECOMPRESS-FALSE-ACCEPT-BLOCKED] detect: a would-be
+  // silent byte-corruption turned into a detectable zero-byte gap + stream resync.
+  // Monotonic diagnostic; the --test-decompress-false-accept oracle reads it.
+  long long rsp_decompress_false_accept_blocked = 0;
 
   // SACK Design A Step 10 — Axis 2 controller state (adaptive batch size).
   // ALL CMD-side; gated on `sack_v2_enabled` at the call sites. v1 sessions

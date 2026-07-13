@@ -509,6 +509,136 @@ void test_multiple_proposals()
 	PASS("Multiple proposals with mixed accept/reject");
 }
 
+// ---- Test 9: reroll size-mismatch is FATAL (C3 safety half) ----
+// A reroll whose re-encoded LZHUF length != the sender's declared comp_size PROVES
+// this encoder is not byte-identical to the sender's; a resumed splice of that
+// divergent stream would corrupt, so it must NEVER go on the wire.
+//   PASS-AFTER (default): 0 bytes shipped for the divergent body, divergence
+//     counted, transform poisoned (fail-closed) so nothing further ships this session.
+//   FAIL-BEFORE (MERCURY_B2F_REROLL_MISMATCH_SHIP=1): the old warn-and-ship path
+//     emits the divergent LZHUF.
+void test_b2f_reroll_mismatch_fatal()
+{
+	printf("\n--- Test 9: reroll size-mismatch is FATAL (C3) ---\n");
+
+	bool ship_divergent = false;
+	{ const char* e = getenv("MERCURY_B2F_REROLL_MISMATCH_SHIP");
+	  if (e && *e && atoi(e) != 0) ship_divergent = true; }
+
+	int plaintext_len = (int)strlen(test_plaintext);
+
+	cl_b2f_handler handler;
+	handler.init();
+	handler.unroll_enabled = true;
+
+	char out[65536];
+	int out_len;
+
+	// SID exchange
+	std::string s = cr("[PAT-12.18.0-B2FHQEHX$]");
+	handler.filter_tx(s.c_str(), (int)s.size(), out, sizeof(out));
+	s = cr("[CMS-5.0.0-B2FHQEHX$]");
+	handler.filter_rx(s.c_str(), (int)s.size(), out, sizeof(out));
+
+	// RX: remote proposes FC with a DELIBERATELY WRONG comp_size. The real reroll
+	// length is lzhuf_compressed_len; declare +100 so the size-match check must fail.
+	// uncomp_size is correct so the plaintext byte-accounting (which uses uncomp_size
+	// on the offset-0 unroll path) is unaffected — only the final size check diverges.
+	uint32_t wrong_comp = (uint32_t)lzhuf_compressed_len + 100;
+	char fc[256];
+	snprintf(fc, sizeof(fc), "FC EM MISMATCH1 %d %u\rF>\r", plaintext_len, wrong_comp);
+	out_len = handler.filter_rx(fc, (int)strlen(fc), out, sizeof(out));
+	CHECK(out_len > 0, "RX FC+F> output");
+
+	// TX: local accepts
+	s = cr("FS +");
+	handler.filter_tx(s.c_str(), (int)s.size(), out, sizeof(out));
+
+	// RX: plaintext payload -> reroll produces lzhuf_compressed_len != wrong_comp.
+	out_len = handler.filter_rx(test_plaintext, plaintext_len, out, sizeof(out));
+
+	// Vacuity guard: the mismatch branch MUST have fired exactly once.
+	CHECK(handler.get_reroll_divergence() == 1,
+		"divergence must be detected exactly once (proves the mismatch branch fired)");
+
+	if (ship_divergent)
+	{
+		// FAIL-BEFORE: the old warn-and-ship emits the divergent LZHUF.
+		CHECK(out_len == (int)lzhuf_compressed_len,
+			"defeat: divergent LZHUF shipped (fail-before)");
+		CHECK(!handler.is_reroll_poisoned(), "defeat: transform not poisoned");
+		printf("  FAIL-BEFORE arm: shipped %d divergent LZHUF bytes (divergence=%lld)\n",
+			out_len, handler.get_reroll_divergence());
+		handler.deinit();
+		PASS("reroll mismatch (fail-before/defeat: divergent LZHUF shipped)");
+	}
+	else
+	{
+		// PASS-AFTER: a divergent stream must NEVER go on the wire.
+		CHECK(out_len == 0, "divergent reroll must ship 0 bytes");
+		CHECK(handler.is_reroll_poisoned(), "transform must be poisoned (fail-closed)");
+		// The poison holds for the rest of the session: nothing further ships.
+		s = cr("FF");
+		int after = handler.filter_rx(s.c_str(), (int)s.size(), out, sizeof(out));
+		CHECK(after <= 0, "poisoned transform ships nothing further this session");
+		printf("  PASS-AFTER arm: 0 divergent bytes shipped, poisoned=%d, next-call=%d (divergence=%lld)\n",
+			handler.is_reroll_poisoned() ? 1 : 0, after, handler.get_reroll_divergence());
+		handler.deinit();
+		PASS("reroll mismatch FATAL (pass-after: 0 bytes on the wire, transform poisoned)");
+	}
+}
+
+// ---- Test 10: LZHUF byte-identity vs an INDEPENDENT reference (C3) ----
+// The RX reroll splice is correct only if Mercury's LZHUF encoder is byte-identical
+// to the sending Winlink client's. Reference vectors are taken from Pat / wl2k-go's
+// INDEPENDENT Go LZHUF implementation (github.com/la5nta/wl2k-go, lzhuf/lzhuf_test.go,
+// MIT-licensed, by LA5NTA), which interoperates with live Winlink CMS. Byte-identity
+// of Mercury's C encoder to these vectors (full B2F frame:
+// [CRC16:2][uncomp_size:4 LE][LZHUF bitstream]) is the independent proof that a
+// rerolled prefix can be spliced onto an original suffix without corruption.
+void test_b2f_lzhuf_reference_vector()
+{
+	printf("\n--- Test 10: LZHUF byte-identity vs Pat/wl2k-go reference vectors (C3) ---\n");
+
+	struct RefVec { const char* name; const char* plain; int plen; const uint8_t* ref; int rlen; };
+	// Vectors verbatim from wl2k-go lzhuf/lzhuf_test.go `samples` (independent encoder).
+	static const uint8_t r_nl[]  = {0x0e,0x8f,0x01,0x00,0x00,0x00,0xcb,0x00};
+	static const uint8_t r_foo[] = {0xb6,0x47,0x03,0x00,0x00,0x00,0xf9,0x7e,0xf1,0x00};
+	static const uint8_t r_fox[] = {0x76,0x25,0x58,0x00,0x00,0x00,0xf0,0x7d,0x3e,0x3a,
+		0xcf,0xe8,0x0f,0xd7,0xdf,0xf7,0xc2,0xf7,0x7f,0xbf,0x60,0x7f,0xab,0x7f,0x2b,0xa0,
+		0x4b,0x7f,0x6c,0x0f,0xcf,0xf3,0xff,0x55,0x60,0x2c,0x3b,0xba,0x80,0x23,0x03,0xdf,
+		0x8f,0x68,0x30,0x2d,0x3f,0x0a,0xff,0x3c,0xce,0x5b,0xf2,0x2c};
+	static const uint8_t r_bar[] = {0xc7,0xef,0x03,0x00,0x00,0x00,0xf7,0x7b,0x7f,0xc0};
+	static const char* fox =
+		"The quick brown fox jumps over the lazy dog\r\n"
+		"The quick brown fox jumps over the lazy dog";
+
+	RefVec vs[] = {
+		{"newline", "\n",  1,  r_nl,  (int)sizeof(r_nl)},
+		{"foo",     "foo", 3,  r_foo, (int)sizeof(r_foo)},
+		{"fox",     fox,   88, r_fox, (int)sizeof(r_fox)},
+		{"bar",     "bar", 3,  r_bar, (int)sizeof(r_bar)},
+	};
+
+	int checked = 0;
+	for (auto& v : vs)
+	{
+		uint8_t enc[4096];
+		size_t enc_len = 0;
+		int rc = lzhuf_encode_buffer((const uint8_t*)v.plain, v.plen, enc, sizeof(enc), &enc_len);
+		CHECK(rc == 0, "reference-vector encode should succeed");
+		CHECK((int)enc_len == v.rlen, "encoded length must equal the reference length");
+		CHECK(memcmp(enc, v.ref, v.rlen) == 0,
+			"Mercury LZHUF must be byte-identical to the Pat/wl2k-go reference");
+		printf("  %-8s %d plaintext -> %zu LZHUF == reference (byte-identical)\n",
+			v.name, v.plen, enc_len);
+		checked++;
+	}
+	// Nonzero-denominator guard: a loop that checked nothing would falsely pass.
+	CHECK(checked == 4, "all 4 reference vectors must have been checked");
+	PASS("LZHUF byte-identity vs INDEPENDENT Pat/wl2k-go reference (4/4 vectors)");
+}
+
 int main()
 {
 	printf("=== B2F Handler E2E Test Suite ===\n");
@@ -529,6 +659,8 @@ int main()
 	test_non_b2f_passthrough();
 	test_payload_control_same_chunk();
 	test_multiple_proposals();
+	test_b2f_reroll_mismatch_fatal();
+	test_b2f_lzhuf_reference_vector();
 
 	printf("\n========================================\n");
 	printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
