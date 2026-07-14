@@ -7441,11 +7441,14 @@ void cl_arq_controller::process_control_commander()
 			b2f_handler.init();
 			b2f_handler.unroll_enabled = true;
 
-			// Encryption negotiation
+			// Encryption negotiation (FAIL-CLOSED; single source of truth in
+			// decide_encryption_negotiation()). DEFAULT-OFF is preserved: when the
+			// operator did not opt in the decision is PLAINTEXT_OK and this block is
+			// a no-op, so legal Part-97 plaintext operation is unchanged.
 			{
-				bool both_support = (local_capability & CAP_ENCRYPTION) &&
-				                    (peer_capability & CAP_ENCRYPTION);
-				if (encryption_mode != ENCRYPT_OFF && both_support)
+				enc_negotiation_outcome_t enc_dec = decide_encryption_negotiation(
+					encryption_mode, local_capability, peer_capability);
+				if (enc_dec == ENC_NEG_ENABLED)
 				{
 					encryption_enabled = true;
 					// Encryption requires batch-level assembly (compression path)
@@ -7457,25 +7460,26 @@ void cl_arq_controller::process_control_commander()
 					printf("[CRYPTO] Encryption negotiated (%s mode), key exchange after turboshift\n",
 						encryption_mode == ENCRYPT_STRICT ? "SNDL-safe" : "classical-first");
 				}
-				else if (encryption_mode != ENCRYPT_OFF && !both_support)
+				else if (enc_dec == ENC_NEG_REFUSE)
 				{
-					if (encryption_mode == ENCRYPT_STRICT)
-					{
-						printf("[CRYPTO] STRICT mode: peer lacks encryption — refusing connection\n");
-						fflush(stdout);
-						const char* err_msg = "ENCRYPTION FAILURE PEER UNSUPPORTED\r";
-						int elen = (int)strlen(err_msg);
-						for(int e=0; e<elen; e++)
-							tcp_socket_control.message->buffer[e] = err_msg[e];
-						tcp_socket_control.message->length = elen;
-						tcp_socket_control.transmit();
-						this->link_status = DROPPED;
-						reset_session_state();
-						return;
-					}
-					printf("[CRYPTO] WARNING: Peer does not support encryption (peer_cap=0x%02X)\n",
-						peer_capability);
+					// Operator opted into -E but the peer does not advertise
+					// CAP_ENCRYPTION (unsupported, or a MITM stripped the cap bit to
+					// force a plaintext downgrade). Fail closed for BOTH strict and
+					// fast: refuse rather than deliver plaintext under an -E opt-in.
+					printf("[CRYPTO] %s mode: peer lacks encryption — refusing connection (fail-closed, no plaintext downgrade)\n",
+						encryption_mode == ENCRYPT_STRICT ? "STRICT" : "FAST");
+					fflush(stdout);
+					const char* err_msg = "ENCRYPTION FAILURE PEER UNSUPPORTED\r";
+					int elen = (int)strlen(err_msg);
+					for(int e=0; e<elen; e++)
+						tcp_socket_control.message->buffer[e] = err_msg[e];
+					tcp_socket_control.message->length = elen;
+					tcp_socket_control.transmit();
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
 				}
+				// ENC_NEG_PLAINTEXT_OK: operator did not opt in — plaintext ops (legal default-off).
 			}
 
 			// FORGIVING-ACK Tier 2 negotiation (fact-documents/data-flow-forgiving-ack.md

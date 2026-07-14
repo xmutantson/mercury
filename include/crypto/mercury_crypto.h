@@ -39,6 +39,25 @@
 #define ENCRYPT_STRICT    1    // SNDL-safe: hold data until full PQ key exchange
 #define ENCRYPT_FAST      2    // Classical-first: X25519 immediate, PQ upgrade later
 
+// Encryption negotiation outcome — computed identically by the commander and the
+// responder from (encryption_mode, local_capability, peer_capability) so the
+// fail-closed policy has ONE source of truth (decide_encryption_negotiation()).
+//
+// FAIL-CLOSED (mandatory): once the operator has OPTED IN (-E, encryption_mode !=
+// ENCRYPT_OFF), a peer that does not advertise CAP_ENCRYPTION — whether it truly
+// lacks the capability OR a MITM stripped the cap bit pre-KX to force a plaintext
+// downgrade — yields ENC_NEG_REFUSE for BOTH STRICT and FAST. Encryption must
+// never opportunistically fall back to plaintext under an -E opt-in.
+//
+// DEFAULT-OFF (Part-97, non-negotiable): PLAINTEXT_OK is returned ONLY when the
+// operator did NOT opt in (encryption_mode == ENCRYPT_OFF). Legal default-off
+// plaintext operation is unchanged.
+enum enc_negotiation_outcome_t {
+    ENC_NEG_PLAINTEXT_OK = 0,  // encryption_mode == ENCRYPT_OFF: legal default-off plaintext, unchanged
+    ENC_NEG_ENABLED      = 1,  // opted in AND peer advertises CAP_ENCRYPTION: encrypt
+    ENC_NEG_REFUSE       = 2   // opted in but peer lacks CAP_ENCRYPTION (unsupported or MITM-stripped): fail-closed drop
+};
+
 // Key exchange phases
 #define KX_IDLE           0    // No key exchange in progress
 #define KX_X25519_SENT    1    // X25519 pubkey sent, awaiting peer's

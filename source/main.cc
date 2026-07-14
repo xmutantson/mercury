@@ -1467,6 +1467,16 @@ int main(int argc, char *argv[])
             // >256-batch wrap, reorder+retx round-trip, direction disjointness,
             // truncated-KX reject, and tamper-reject cases. No IONOS/RF.
             failed += run_aead_nonce_tests();
+            // Encryption negotiation FAIL-CLOSED regression: once the operator has
+            // opted into -E, a peer without CAP_ENCRYPTION (unsupported, or a MITM
+            // that stripped the cap bit) is REFUSED for BOTH strict and fast — never
+            // a plaintext downgrade — while default-off (ENCRYPT_OFF) stays plaintext.
+            // Drives the REAL shared predicate decide_encryption_negotiation() that
+            // both endpoints call. Fails-before: -DENC_FAILOPEN_FAILBEFORE. No IONOS/RF.
+            {
+                cl_arq_controller test_enc;
+                failed += test_enc.test_encryption_fail_closed();
+            }
             // In-band down-ladder DELIVERY regression (BREAK-orphan + silent-snapshot). A
             // member test on a throwaway controller (its own buffers; PART B builds its own
             // minimal telecom_system). Fast + deterministic, no IONOS/RF. data-flow-inband-

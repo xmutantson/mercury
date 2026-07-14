@@ -1100,6 +1100,108 @@ cl_arq_controller::cl_arq_controller()
 }
 
 
+// ============================================================================
+// Encryption negotiation — FAIL-CLOSED policy (single source of truth)
+// ============================================================================
+// Both the commander (arq_commander.cc) and the responder (arq_responder.cc)
+// decide whether to encrypt, refuse, or run legal default-off plaintext by
+// calling THIS function, so the fail-closed rule cannot drift between the two
+// endpoints.
+//
+// Threat handled: `-E fast` historically DOWNGRADED to plaintext whenever the
+// peer did not advertise CAP_ENCRYPTION. A man-in-the-middle could strip the
+// cap bit from the peer's advertised capability pre-KX to silently force that
+// plaintext downgrade. Fail-closed: once the operator has OPTED IN, a peer
+// without CAP_ENCRYPTION is REFUSED for BOTH strict AND fast — never plaintext.
+//
+// DEFAULT-OFF (FCC Part-97, non-negotiable): when the operator did NOT opt in
+// (encryption_mode == ENCRYPT_OFF) this returns ENC_NEG_PLAINTEXT_OK and the
+// caller proceeds with plaintext exactly as before. The opt-in gate is the
+// FIRST test here, so a default-off session never reaches the refuse path.
+enc_negotiation_outcome_t cl_arq_controller::decide_encryption_negotiation(
+		int encryption_mode, uint8_t local_capability, uint8_t peer_capability)
+{
+	// Operator did not opt in -> legal default-off plaintext, unchanged.
+	if(encryption_mode == ENCRYPT_OFF)
+		return ENC_NEG_PLAINTEXT_OK;
+
+	// Operator opted in. Encrypt only if BOTH ends advertise CAP_ENCRYPTION.
+	bool both_support = (local_capability & CAP_ENCRYPTION) &&
+	                    (peer_capability  & CAP_ENCRYPTION);
+	if(both_support)
+		return ENC_NEG_ENABLED;
+
+#ifdef ENC_FAILOPEN_FAILBEFORE
+	// FAIL-BEFORE ARM ONLY (compiled solely for test_encryption_fail_closed's
+	// fail-before build; NEVER defined in a shipped binary). Reproduces the old
+	// opportunistic-plaintext downgrade: strict refused, fast fell through to
+	// plaintext. The regression test asserts REFUSE here and so FAILS under this
+	// macro, proving the guard is load-bearing.
+	return (encryption_mode == ENCRYPT_STRICT) ? ENC_NEG_REFUSE : ENC_NEG_PLAINTEXT_OK;
+#else
+	// FAIL-CLOSED: opted in but the peer lacks CAP_ENCRYPTION (unsupported, or a
+	// MITM stripped the bit). Refuse for BOTH strict and fast — no plaintext.
+	return ENC_NEG_REFUSE;
+#endif
+}
+
+
+// In-process regression for the fail-closed negotiation policy. Drives the REAL
+// production predicate decide_encryption_negotiation() (the same function both
+// endpoints call), across the operator/peer capability matrix. Returns 0=PASS,
+// else the number of failed assertions. Fails-before under -DENC_FAILOPEN_FAILBEFORE.
+int cl_arq_controller::test_encryption_fail_closed()
+{
+	int fails = 0;
+	const uint8_t ENC = CAP_ENCRYPTION;            // 0x02
+	const uint8_t WB  = CAP_WB_CAPABLE;            // 0x01 (a non-encryption cap bit)
+
+	auto check = [&](const char* name, enc_negotiation_outcome_t got,
+	                 enc_negotiation_outcome_t want)
+	{
+		const char* names[] = {"PLAINTEXT_OK","ENABLED","REFUSE"};
+		bool ok = (got == want);
+		if(!ok) fails++;
+		printf("[TEST-ENC-FAILCLOSED] %-46s got=%s want=%s -> %s\n",
+			name, names[(int)got], names[(int)want], ok ? "PASS" : "FAIL");
+	};
+
+	printf("[TEST-ENC-FAILCLOSED] start (single source of truth: decide_encryption_negotiation)\n");
+	fflush(stdout);
+
+	// --- DEFAULT-OFF: operator did NOT opt in -> plaintext ops legal + unchanged ---
+	// (Peer cap is irrelevant; the opt-in gate is checked first.)
+	check("OFF, peer no-cap        -> plaintext (legal default-off)",
+	      decide_encryption_negotiation(ENCRYPT_OFF, ENC, 0),   ENC_NEG_PLAINTEXT_OK);
+	check("OFF, peer has-cap       -> plaintext (legal default-off)",
+	      decide_encryption_negotiation(ENCRYPT_OFF, ENC, ENC), ENC_NEG_PLAINTEXT_OK);
+	check("OFF, neither cap        -> plaintext (legal default-off)",
+	      decide_encryption_negotiation(ENCRYPT_OFF, 0, 0),     ENC_NEG_PLAINTEXT_OK);
+
+	// --- OPTED IN + peer supports -> encrypt ---
+	check("FAST, both support      -> encrypt",
+	      decide_encryption_negotiation(ENCRYPT_FAST,   ENC, ENC), ENC_NEG_ENABLED);
+	check("STRICT, both support    -> encrypt",
+	      decide_encryption_negotiation(ENCRYPT_STRICT, ENC, ENC), ENC_NEG_ENABLED);
+
+	// --- FAIL-CLOSED: opted in, peer lacks CAP_ENCRYPTION -> REFUSE (0 plaintext) ---
+	// The core of the fix: FAST must refuse exactly like STRICT.
+	check("FAST, peer no-cap       -> REFUSE (was plaintext downgrade)",
+	      decide_encryption_negotiation(ENCRYPT_FAST,   ENC, 0),  ENC_NEG_REFUSE);
+	check("STRICT, peer no-cap     -> REFUSE",
+	      decide_encryption_negotiation(ENCRYPT_STRICT, ENC, 0),  ENC_NEG_REFUSE);
+	// MITM cap-strip: peer advertised WB but the ENCRYPTION bit was cleared.
+	check("FAST, MITM stripped cap -> REFUSE",
+	      decide_encryption_negotiation(ENCRYPT_FAST,   ENC, WB), ENC_NEG_REFUSE);
+	check("STRICT, MITM stripped   -> REFUSE",
+	      decide_encryption_negotiation(ENCRYPT_STRICT, ENC, WB), ENC_NEG_REFUSE);
+
+	printf("[TEST-ENC-FAILCLOSED] %s (%d failure(s))\n",
+		fails == 0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails;
+}
+
 
 cl_arq_controller::~cl_arq_controller()
 {

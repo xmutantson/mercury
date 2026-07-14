@@ -4949,6 +4949,19 @@ public:
   cl_cipher_suite cipher_suite;       // Per-connection cipher state (ephemeral keys, session key)
   int encryption_mode;                // ENCRYPT_OFF, ENCRYPT_STRICT, ENCRYPT_FAST
   bool encryption_enabled;            // Negotiated: both sides have CAP_ENCRYPTION and mode != OFF
+  // Encryption-negotiation policy (single source of truth for the commander AND
+  // responder). FAIL-CLOSED: an -E opt-in against a peer that does not advertise
+  // CAP_ENCRYPTION (unsupported, or a MITM stripped the bit) REFUSES — it never
+  // downgrades to plaintext. DEFAULT-OFF is preserved: with encryption_mode ==
+  // ENCRYPT_OFF the outcome is PLAINTEXT_OK, so an operator who did not opt in is
+  // unaffected. Defined in arq_common.cc.
+  enc_negotiation_outcome_t decide_encryption_negotiation(int encryption_mode,
+                                                          uint8_t local_capability,
+                                                          uint8_t peer_capability);
+  // In-process regression for the fail-closed policy (runs in --test). Returns
+  // 0=PASS, else the fail count. Fails-before: -DENC_FAILOPEN_FAILBEFORE (which
+  // compiles the historical opportunistic-plaintext FAST downgrade back in).
+  int test_encryption_fail_closed();
   // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1):
   // negotiated session flag — both ends advertised CAP_CUMULATIVE_ACK (which is itself
   // gated by the env opt-in MERCURY_CUMULATIVE_ACK on the local advertise). When true,
