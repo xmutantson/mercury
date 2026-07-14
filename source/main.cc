@@ -3005,6 +3005,7 @@ int main(int argc, char *argv[])
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
+    bool test_enc_failclosed_cli = false; // --test-enc-failclosed: encryption negotiation fail-closed regression (opt-in + peer-no-cap -> REFUSE; default-off -> plaintext). Fails-before under -DENC_FAILOPEN_FAILBEFORE.
     bool test_a3_decouple_safety_cli = false; // --test-a3-decouple-safety: the §2 CHECKPOINT — single-miss non-load-bearing (anti-0-bytes, byte-faithful) + genuine-death net intact, demote IN PLACE (data-flow-forgiving-ack.md §T2.2/§6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
@@ -3970,6 +3971,20 @@ int main(int argc, char *argv[])
             // per-batch fallback), and COMPOSITION with Tier-1. See
             // fact-documents/data-flow-forgiving-ack.md §T2.6.
             test_cumulative_ack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-enc-failclosed") == 0)
+        {
+            // Encryption negotiation FAIL-CLOSED regression (one-shot, then exit rc).
+            // Opt-in (-E) against a peer without CAP_ENCRYPTION (unsupported, or a
+            // MITM that stripped the cap bit) -> REFUSE for BOTH strict AND fast;
+            // default-off (ENCRYPT_OFF) -> legal plaintext. Drives the shared
+            // production predicate decide_encryption_negotiation(). Fails-before
+            // under -DENC_FAILOPEN_FAILBEFORE (which recompiles the historical
+            // opportunistic-plaintext fast downgrade). Isolated one-shot so it does
+            // not depend on the full --test suite's wall-clock watchdog.
+            test_enc_failclosed_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5629,6 +5644,20 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_retx_clear_on_recovery();
             printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_enc_failclosed_cli) {
+            // Encryption negotiation FAIL-CLOSED regression (one-shot, then exit rc).
+            // Drives the shared production predicate decide_encryption_negotiation()
+            // across the operator/peer capability matrix: default-off -> plaintext,
+            // opted-in + both-cap -> encrypt, opted-in + peer-no-cap (or MITM strip)
+            // -> REFUSE for both strict and fast. Fails-before: -DENC_FAILOPEN_FAILBEFORE.
+            printf("[FLAG] --test-enc-failclosed: invoking the encryption fail-closed "
+                   "negotiation regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_encryption_fail_closed();
+            printf("[FLAG] Encryption fail-closed test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
