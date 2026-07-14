@@ -737,6 +737,13 @@ cl_arq_controller::cl_arq_controller()
 	// reset + FULL load_configuration so the post-reset adopt gate can detect a
 	// dropped-batch hole. See bigblock_p3_hw/_fix8/FIX8_DESIGN.md §4.2-§4.3.
 	rsp_last_delivered_batch_seq_id=-1;
+	// INV-DEDUP emit high-water (data-flow-stream-offset.md -- demote-rebase double-
+	// delivery): -1 = nothing appended to fifo_buffer_rx yet this LINK. Init here
+	// (ctor) and re-anchored ONLY where rx_stream_delivered re-anchors to 0 (a true
+	// session boundary: reset_session_state + KEY_ACTIVATE + the C1' cross-session
+	// re-anchor) " it SURVIVES the in-band demote-rebase so a re-adopted already-
+	// emitted batch is de-duped at the delivery funnel.
+	rx_stream_emitted_bsi_hw=-1;
 	// Data-integrity latch: cleared here (ctor) and at the RSP START_CONNECTION accept
 	// ONLY. Set by rsp_gap_abort_teardown(); must SURVIVE reset_session_state() so a
 	// mid-transfer abort makes every subsequent delivery refuse until a genuine new
@@ -7621,6 +7628,10 @@ void cl_arq_controller::reset_session_state()
 	// next connection's stream starts at offset 0 with no stale stamp aliasing.
 	tx_stream_committed = 0;
 	rx_stream_delivered = 0;
+	// INV-DEDUP: a genuine session teardown re-anchors the byte cursor -> the emit
+	// high-water must reset too, so the next session's first batch is never falsely
+	// de-duped against a stale emitted bsi (grep-mirror of rx_stream_delivered=0).
+	rx_stream_emitted_bsi_hw = -1;
 	tx_stream_crc = CRC32_INIT;   // Option W STEP 3 (§8.6): fresh running stream CRC per session
 	rx_stream_crc = CRC32_INIT;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
@@ -15471,6 +15482,59 @@ bool cl_arq_controller::w_stream_shift_detected(int wbsi)
 
 void cl_arq_controller::copy_data_to_buffer()
 {
+	// """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+	// INV-DEDUP -- RSP byte-stream EMIT DE-DUP (data-flow-stream-offset.md, the
+	// demote-rebase double-delivery). copy_data_to_buffer() is the SINGLE receiver
+	// byte-delivery funnel (all six production emit routes reach it), so one gate
+	// here enforces "a batch's transported bytes are folded into fifo_buffer_rx
+	// EXACTLY ONCE". A batch whose wire bsi equals the last ACTUALLY-EMITTED bsi
+	// (mod-256 forward distance fwd==0 against rx_stream_emitted_bsi_hw) has already
+	// contributed its bytes; re-emitting it appends a DUPLICATE segment and inflates
+	// rx_stream_delivered (the witnessed corruption: an in-band demote-rebase
+	// re-adopts an already-delivered batch, and a lost-ACK retransmit re-drives it "
+	// both re-reach this funnel with fwd==0). Refuse the re-emit: a benign duplicate
+	// is already delivered, so this LOSES nothing and never CORRUPTS the stream (the
+	// RSP still emits its clean ACK downstream, so the CMD confirms and stops
+	// re-sending). Keyed on decrypt_delivered_bsi (the wire bsi, set immediately
+	// before EVERY copy_data_to_buffer() call " the SAME invariant the Option-W
+	// backstop trusts), NOT rsp_last_delivered_batch_seq_id (already advanced by the
+	// commit helpers before the funnel, so it would false-drop the FIRST emit).
+	// Placed ABOVE the cross-session seam + Option-W backstop: at a fresh session
+	// rx_stream_emitted_bsi_hw==-1, so this is inert and those guards run unchanged.
+	// The forward-hole (fwd>=2) and backward/older cases are already refused by
+	// delivery_step_is_gap / sack_v2_readopt_has_gap BEFORE this funnel; the ONLY
+	// residue reaching here is fwd==0 (the exact duplicate) " no false-drop is
+	// possible (a 256-batch wrap reuse is fwd==1 vs the batch before it, and
+	// rx_stream_emitted_bsi_hw wrapped too). Composes with C1' / Option-W / D3.1 /
+	// the abort latch on disjoint triggers (see the cross-layer guard-composition
+	// audit). MERCURY_STREAM_DEDUP_DEFEAT=1 restores the pre-fix re-emit (the
+	// fail-before arm on the SAME binary; reproduces the splice deterministically).
+	if(decrypt_delivered_bsi >= 0 && rx_stream_emitted_bsi_hw >= 0
+	   && (((decrypt_delivered_bsi - rx_stream_emitted_bsi_hw) & 0xFF) == 0))
+	{
+		bool dedup_defeat = false;
+		{ const char* e = std::getenv("MERCURY_STREAM_DEDUP_DEFEAT");
+		  if(e && *e && atoi(e)!=0) dedup_defeat = true; }
+		if(!dedup_defeat)
+		{
+			printf("[RSP-V2-DEDUP-DROP] bsi=%d already emitted (emit_hw=%d) -- skipping "
+				"re-emit (no double-delivery); rx_stream_delivered held at %llu\n",
+				decrypt_delivered_bsi & 0xFF, rx_stream_emitted_bsi_hw,
+				(unsigned long long)rx_stream_delivered);
+			fflush(stdout);
+			// Refinement A (slot hygiene): FREE this batch's messages_rx[] slots
+			// exactly as a normal delivery would (it FREEs [0..cw) and [cw..nMessages)),
+			// so no stale ACKED slot is left for the completeness / ACK-count readers.
+			// SKIP the append + cursor advance + CRC fold + stamp-consume (copy_data_done):
+			// the bytes are NOT re-delivered and rx_stream_delivered does NOT move. This
+			// is a clean refuse-to-re-emit (mirrors the seam / stream-shift early returns).
+			for(int i=0;i<this->nMessages;i++)
+				if(messages_rx[i].status!=FREE) messages_rx[i].status=FREE;
+			return;
+		}
+		// dedup_defeat: fall through to the pre-fix re-emit (reproduces the splice).
+	}
+
 	int copied = 0;
 	int total_bytes = 0;
 	// Option B' (data-flow-batch-size.md §9): the DELIVERY window. Defaults to
@@ -15523,6 +15587,7 @@ void cl_arq_controller::copy_data_to_buffer()
 		// (a stale nonzero cursor vs a fresh stamp.start==0). The seam is disarmed by the reset.
 		rsp_gap_abort_teardown("reconnect-continuity fail-closed: cross-session splice refused");
 		rx_stream_delivered            = 0;
+		rx_stream_emitted_bsi_hw       = -1;   // INV-DEDUP: byte cursor re-anchors here, so does the emit high-water
 		rsp_prev_session_app_delivered = 0;
 		rsp_cross_session_seam_armed   = false;
 		return;   // do NOT deliver the positionally-unprovable cross-session batch
@@ -15847,6 +15912,12 @@ copy_data_done:
 	// The STEP-2 backstop (above) asserts the batch's wire stamp.start == this cursor
 	// BEFORE the append.
 	rx_stream_delivered += (uint64_t)delivered_transported;
+	// INV-DEDUP: advance the emit high-water to the batch just APPENDED (reached only
+	// on a real, non-dropped emit -- the de-dup gate above returns early). Keyed to
+	// decrypt_delivered_bsi (the wire bsi, the same source the cursor + stamp use), so
+	// a subsequent re-delivery of this bsi (fwd==0) is de-duped at the funnel top.
+	if(decrypt_delivered_bsi >= 0)
+		rx_stream_emitted_bsi_hw = decrypt_delivered_bsi & 0xFF;
 	// Option W CORE: consume this bsi's parsed stamp on delivery so a later 256-batch
 	// wraparound reuse of the same bsi with a LOST EOB frame reads INVALID (skip),
 	// never a STALE start (which would false-fire the BACKSTOP). A double-delivery of

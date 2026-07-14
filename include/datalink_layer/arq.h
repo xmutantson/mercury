@@ -774,6 +774,15 @@ public:
   // fact-documents/data-flow-recoverable-gap-abort.md §5.5.
   void rsp_commit_cur_batch_delivery();
 
+  // In-band unilateral DEMOTE-REBASE (arq_responder.cc SET_CONFIG handler): a real
+  // mid-transfer config change re-baselines the RSP bsi window (cur=prev=-1, drop
+  // the in-flight prev partial storage) so the next data frame re-adopts through
+  // the gap-gate, while DELIBERATELY preserving rsp_last_delivered_batch_seq_id and
+  // rx_stream_emitted_bsi_hw. Extracted so the directed regression (test_dedup_rebase)
+  // drives the EXACT production rebase, not a state poke. Guard-internal: a no-op
+  // when sack_v2 is off or the window is already re-baselined.
+  void rsp_inband_demote_rebase();
+
   // Option B' (data-flow-batch-size.md §9): the RX ACCEPTANCE WINDOW. Trusts the
   // CRC-protected per-batch sender-declared frame count (D5, rx_batch_total_frames
   // / rx_buffer_batch_total_frames) when it EXCEEDS the stale command-synced
@@ -2891,6 +2900,22 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_eob_loss_batch_truncation();
 
+  // In-band demote-rebase DOUBLE-DELIVERY (byte-stream CORRUPTION) regression
+  // (data-flow-stream-offset.md -- demote-rebase double-delivery). CLI:
+  // --test-dedup-rebase. Drives the REAL rsp_commit_cur_batch_delivery() delivery
+  // funnel, the REAL rsp_inband_demote_rebase(), the REAL re-adopt/delivery-time
+  // gap predicates, and fifo_buffer_rx as a byte-exact oracle. A batch B is
+  // delivered once; a mid-transfer demote-rebase wipes cur/prev (preserving the
+  // delivered high-water); the CMD retransmits B (a legitimate un-ACKed re-send)
+  // and B re-adopts + re-completes -> the funnel is re-reached with fwd==0.
+  //   fail-before (MERCURY_STREAM_DEDUP_DEFEAT=1): the funnel re-appends B's bytes
+  //     -> fifo_buffer_rx = S1 ++ B (a duplicate segment), rx_stream_delivered
+  //     inflates (the witnessed corruption).
+  //   pass-after (defeat off): the emit de-dup drops the re-emit ([RSP-V2-DEDUP-
+  //     DROP]); fifo_buffer_rx == S1, rx_stream_delivered held. Byte-identical.
+  // Returns 0=PASS, 1=FAIL. Default builds never call this.
+  int test_dedup_rebase();
+
   // CMD>RSP batch-size desync SILENT-CORRUPTION regression (res_c3100, silent-
   // corruption-residual.md §8 / data-flow-batch-size.md §8). Drives the REAL shared
   // batchsize_desync_detected() decision + REAL copy_data_to_buffer() delivery +
@@ -3770,6 +3795,20 @@ public:
   // delivered yet this LINK. v2-scoped (sack_v2_enabled). See
   // bigblock_p3_hw/_fix8/FIX8_DESIGN.md + FIX8_AUDIT.md.
   int rsp_last_delivered_batch_seq_id;
+  // INV-DEDUP (data-flow-stream-offset.md -- demote-rebase double-delivery): the
+  // mod-256 batch_seq_id of the batch whose bytes were LAST ACTUALLY APPENDED to
+  // fifo_buffer_rx (advanced at copy_data_done, AFTER the append). DISTINCT from
+  // rsp_last_delivered_batch_seq_id, which the commit helpers advance BEFORE they
+  // call copy_data_to_buffer() (so it cannot be the de-dup key without a bootstrap
+  // error). The single byte-delivery funnel copy_data_to_buffer() refuses to
+  // re-emit a batch whose wire bsi (decrypt_delivered_bsi) equals this high-water
+  // (fwd==0) " the demote-rebase re-adopt + lost-ACK retransmit both re-reach the
+  // funnel with fwd==0 and would otherwise double-append. Like
+  // rsp_last_delivered_batch_seq_id it SURVIVES the in-band demote-rebase
+  // (arq_responder.cc) and the BREAK reset; it is cleared ONLY at a true session
+  // boundary (ctor + reset_session_state + KEY_ACTIVATE), mirrored wherever
+  // rx_stream_delivered re-anchors to 0. -1 = nothing emitted yet this LINK.
+  int rx_stream_emitted_bsi_hw;
   // Data-integrity latch (the gap-abort "unrepresentable unsafe state" keystone).
   // A gap-abort teardown (rsp_gap_abort_teardown) is a MID-TRANSFER abort of a
   // stream the peer keeps driving (no OTA abort frame is sent), so the CMD re-drives

@@ -2319,6 +2319,40 @@ void cl_arq_controller::rsp_commit_cur_batch_delivery()
 	this->rx_copy_window = -1;
 }
 
+// In-band unilateral DEMOTE-REBASE (data-flow-stream-offset.md - demote-rebase
+// double-delivery / D31_INORDER_DESIGN.md ?3). Extracted from the SET_CONFIG
+// responder so the directed regression (test_dedup_rebase) drives the EXACT
+// production rebase, not a state poke. A REAL mid-transfer config change
+// re-baselines the RSP bsi window (cur=prev=-1 + drop the in-flight prev partial
+// storage) so the next data frame re-adopts through the gap-gate, DELIBERATELY
+// preserving rsp_last_delivered_batch_seq_id AND rx_stream_emitted_bsi_hw (the
+// reset-surviving high-waters the re-adopt gate and the funnel de-dup read).
+// Guard-internal: a no-op when sack_v2 is off or the window is already
+// re-baselined, so no-op/same-config SET_CONFIGs never perturb the window.
+void cl_arq_controller::rsp_inband_demote_rebase()
+{
+	if(!(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0))
+		return;
+	printf("[RSP-V2-DEMOTE-REBASE] config change %d->%d mid-transfer: "
+		"re-baselining bsi window (cur=%d prev=%d -> -1) so the next frame "
+		"re-adopts through the gap-gate (last_delivered=%d preserved)\n",
+		current_configuration, forward_configuration,
+		rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id,
+		rsp_last_delivered_batch_seq_id);
+	fflush(stdout);
+	rsp_current_expected_batch_seq_id = -1;
+	rsp_prev_batch_seq_id             = -1;
+	rsp_prev_batch_active             = false;
+	rsp_prev_batch_received_count     = 0;
+	rsp_prev_batch_expected_count     = 0;
+	bigblock_partial_armed            = false;
+	for(int i=0; i<this->nMessages; i++)
+		messages_rx_prev[i].status = FREE;
+	// NOTE: rsp_last_delivered_batch_seq_id AND rx_stream_emitted_bsi_hw are
+	// DELIBERATELY preserved (the reset-surviving high-waters the re-adopt gate
+	// and the funnel de-dup read).
+}
+
 void cl_arq_controller::process_messages_acknowledging_data()
 {
 	printf("[RSP-RX-TIMEOUT] Entering ACK-GATE: rx_count=%d timeout=%d batch=%d\n",
@@ -3762,6 +3796,7 @@ void cl_arq_controller::process_control_responder()
 				tx_nonce_sealed_high_water = UINT64_MAX;
 				rx_nonce_adopted_once = false;
 				decrypt_delivered_bsi = -1;
+				rx_stream_emitted_bsi_hw = -1;   // INV-DEDUP: KEY_ACTIVATE re-establishes the session; reset the emit high-water
 				consecutive_auth_failures = 0;
 
 				// Report encryption state on control port
@@ -3965,26 +4000,7 @@ void cl_arq_controller::process_control_responder()
 				// SET_CONFIGs do not perturb the window. The delivery-time gate (#1) is
 				// the inviolable backstop if any frame still slips past this re-baseline.
 				// See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md section 3.
-				if(sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0)
-				{
-					printf("[RSP-V2-DEMOTE-REBASE] config change %d->%d mid-transfer: "
-						"re-baselining bsi window (cur=%d prev=%d -> -1) so the next frame "
-						"re-adopts through the gap-gate (last_delivered=%d preserved)\n",
-						current_configuration, forward_configuration,
-						rsp_current_expected_batch_seq_id, rsp_prev_batch_seq_id,
-						rsp_last_delivered_batch_seq_id);
-					fflush(stdout);
-					rsp_current_expected_batch_seq_id = -1;
-					rsp_prev_batch_seq_id             = -1;
-					rsp_prev_batch_active             = false;
-					rsp_prev_batch_received_count     = 0;
-					rsp_prev_batch_expected_count     = 0;
-					bigblock_partial_armed            = false;
-					for(int i=0; i<this->nMessages; i++)
-						messages_rx_prev[i].status = FREE;
-					// NOTE: rsp_last_delivered_batch_seq_id is DELIBERATELY preserved
-					// (it is the reset-surviving high-water the re-adopt gate reads).
-				}
+				rsp_inband_demote_rebase();   // INV-DEDUP: REAL production rebase (preserves last_delivered + emit high-water)
 			}
 
 			if(!passive_monitor)
@@ -12584,6 +12600,7 @@ int cl_arq_controller::test_held_cur_deliver_fire()
 		this->rsp_gap_recover_rounds            = 1;     // one hold round in progress
 		this->batch_data_delivered              = false;
 		this->decrypt_delivered_bsi             = -1;
+		this->rx_stream_emitted_bsi_hw          = -1;   // INV-DEDUP: test-rig session-reset mirror
 	};
 
 	// The REAL prev-completion deliver-held-cur decision, reproduced inline
@@ -14683,6 +14700,173 @@ int cl_arq_controller::test_eob_loss_batch_truncation()
 }
 
 // ==========================================================================
+// test_dedup_rebase (data-flow-stream-offset.md -- the in-band demote-rebase
+// DOUBLE-DELIVERY corruption). Drives the REAL rsp_commit_cur_batch_delivery()
+// delivery funnel, the REAL rsp_inband_demote_rebase(), the REAL re-adopt /
+// delivery-time gap predicates (sack_v2_readopt_has_gap / delivery_step_is_gap),
+// and fifo_buffer_rx as a byte-exact oracle (compression OFF -> byte-exact leg,
+// distinct per-frame bytes i*16+j so a re-appended segment is detectable).
+//
+// A batch B is delivered in-order once (emit high-water -> B). A REAL mid-transfer
+// demote-rebase wipes cur/prev but preserves last_delivered AND the emit high-water.
+// The CMD retransmits B (a legitimate un-ACKed re-send); B re-adopts + re-completes
+// and re-reaches the funnel with fwd==0 (bsi == emit_hw).
+//   fail-before (MERCURY_STREAM_DEDUP_DEFEAT=1): the funnel re-appends B -> a 2nd
+//     copy of B on the app FIFO + rx_stream_delivered inflates (the splice).
+//   pass-after (defeat off): the emit de-dup drops the re-emit ([RSP-V2-DEDUP-DROP]);
+//     0 bytes re-appended, cursor held -> byte-identical.
+// CASE B repeats with the 1st emit via the PREV route + the 2nd via in-order, proving
+// the SINGLE-FUNNEL fix covers cross-route duplicates (a per-helper guard would not).
+// Returns 0=PASS, 1=FAIL. Runs inside --test (defeat off).
+int cl_arq_controller::test_dedup_rebase()
+{
+	bool defeat=false;
+	{ const char* e=std::getenv("MERCURY_STREAM_DEDUP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat=true; }
+	printf("[TEST-DEDUP-REBASE] start (MERCURY_STREAM_DEDUP_DEFEAT=%d)\n", defeat?1:0);
+	fflush(stdout);
+
+	// --- in-process scaffold (mirror test_eob_loss_batch_truncation) ---
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 7;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL){ printf("[TEST-DEDUP-REBASE] ERROR init rc=%d\n", alloc_rc); fflush(stdout); return 1; }
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled     = true;
+	this->sack_enabled        = true;
+	this->header_carries_d5   = true;
+	this->compression_enabled = false;   // byte-exact no-compression leg of copy_data_to_buffer()
+	this->data_batch_size     = 3;
+	this->link_status         = CONNECTED;
+
+	const int NFR=3, FLEN=16, B=6;   // B=6 is the witnessed duplicate bsi
+	auto frame_bytes=[&](int i,char* out){ for(int j=0;j<FLEN;j++) out[j]=(char)(unsigned char)(i*16+j); };
+	char oracle[NFR*FLEN];
+	for(int i=0;i<NFR;i++) frame_bytes(i,&oracle[i*FLEN]);
+
+	auto seat_batchB=[&](){
+		for(int i=0;i<this->nMessages;i++){ messages_rx[i].status=FREE; messages_rx[i].length=0; messages_rx[i].batch_seq_id=-1; }
+		for(int i=0;i<NFR;i++){
+			char b[FLEN]; frame_bytes(i,b);
+			messages_rx[i].type=DATA_SHORT; messages_rx[i].id=(char)i; messages_rx[i].length=FLEN;
+			memcpy(messages_rx[i].data,b,FLEN);
+			messages_rx[i].status=RECEIVED; messages_rx[i].batch_seq_id=B;
+		}
+		this->rx_batch_total_frames=NFR;
+	};
+
+	int fails=0;
+
+	// ================= CASE A -- the witness (in-order both emits) =================
+	{
+		this->rsp_current_expected_batch_seq_id=B;
+		this->rsp_prev_batch_seq_id           =(B-1)&0xFF;
+		this->rsp_last_delivered_batch_seq_id =(B-1)&0xFF;
+		this->rx_stream_emitted_bsi_hw        =-1;
+		this->rx_stream_delivered             =0;
+		this->rx_stream_crc                   =0;
+		this->rsp_stream_aborted              =false;
+		this->rsp_cross_session_seam_armed    =false;
+		this->fifo_buffer_rx.flush();
+
+		// ---- 1st delivery: REAL delivery-time gate + REAL commit funnel ----
+		seat_batchB();
+		if(delivery_step_is_gap(this->rsp_current_expected_batch_seq_id, this->rsp_last_delivered_batch_seq_id)){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: 1st delivery falsely gapped\n"); fails++; }
+		rsp_commit_cur_batch_delivery();
+		char s1[NFR*FLEN]; int p1=this->fifo_buffer_rx.pop(s1,(int)sizeof(s1));
+		uint64_t cur1=this->rx_stream_delivered;
+		bool s1_ok=(p1==NFR*FLEN)&&(memcmp(s1,oracle,NFR*FLEN)==0);
+		printf("[TEST-DEDUP-REBASE] CASE-A 1st: popped=%dB s1_ok=%d emit_hw=%d last_delivered=%d cursor=%llu\n", p1, s1_ok?1:0, this->rx_stream_emitted_bsi_hw, this->rsp_last_delivered_batch_seq_id, (unsigned long long)cur1);
+		fflush(stdout);
+		if(!s1_ok){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: 1st delivery not faithful\n"); fails++; }
+		if(this->rx_stream_emitted_bsi_hw!=B){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: emit_hw=%d want %d\n", this->rx_stream_emitted_bsi_hw, B); fails++; }
+		if(((this->rsp_last_delivered_batch_seq_id)&0xFF)!=B){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: last_delivered!=%d\n", B); fails++; }
+
+		// ---- REAL demote-rebase (config 102 -> 0) ----
+		this->current_configuration=102; this->forward_configuration=0;
+		rsp_inband_demote_rebase();
+		if(this->rsp_current_expected_batch_seq_id!=-1 || this->rsp_prev_batch_seq_id!=-1){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: rebase did not wipe cur/prev (cur=%d prev=%d)\n", this->rsp_current_expected_batch_seq_id, this->rsp_prev_batch_seq_id); fails++; }
+		if(((this->rsp_last_delivered_batch_seq_id)&0xFF)!=B){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: rebase clobbered last_delivered\n"); fails++; }
+		if(this->rx_stream_emitted_bsi_hw!=B){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: rebase clobbered emit_hw (=%d want %d)\n", this->rx_stream_emitted_bsi_hw, B); fails++; }
+
+		// ---- CMD re-sends B (lost-ACK retransmit): REAL re-adopt + REAL in-order re-commit ----
+		if(sack_v2_readopt_has_gap(B, this->rsp_last_delivered_batch_seq_id)){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL: re-adopt of B falsely gapped\n"); fails++; }
+		this->rsp_current_expected_batch_seq_id=B;   // re-adopt ELSE branch result
+		printf("[RSP-V2-ADOPT] current_expected_batch_seq_id=%d (test re-adopt)\n", this->rsp_current_expected_batch_seq_id);
+		fflush(stdout);
+		seat_batchB();
+		(void)delivery_step_is_gap(this->rsp_current_expected_batch_seq_id, this->rsp_last_delivered_batch_seq_id); // fwd==0 -> not a gap: waves the duplicate through (the root)
+		rsp_commit_cur_batch_delivery();   // 2nd copy_data_to_buffer -> the DEDUP GATE fires here
+		char s2[2*NFR*FLEN]; int p2=this->fifo_buffer_rx.pop(s2,(int)sizeof(s2));
+		uint64_t cur2=this->rx_stream_delivered;
+		printf("[TEST-DEDUP-REBASE] CASE-A 2nd: popped=%dB cursor %llu->%llu\n", p2, (unsigned long long)cur1, (unsigned long long)cur2);
+		fflush(stdout);
+		if(defeat){
+			bool reproduced=(p2==NFR*FLEN)&&(memcmp(s2,oracle,NFR*FLEN)==0)&&(cur2==cur1+(uint64_t)(NFR*FLEN));
+			if(!reproduced){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL(defeat): did NOT reproduce the double-delivery splice (popped=%dB cursor=%llu)\n", p2, (unsigned long long)cur2); fails++; }
+			else printf("[TEST-DEDUP-REBASE] CASE-A(defeat): reproduced the %dB double-delivery splice (control valid)\n", p2);
+		} else {
+			bool clean=(p2==0)&&(cur2==cur1);
+			if(!clean){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL(fix): double-delivery NOT prevented (re-appended=%dB cursor %llu->%llu)\n", p2, (unsigned long long)cur1, (unsigned long long)cur2); fails++; }
+			else printf("[TEST-DEDUP-REBASE] CASE-A(fix): byte-identical -- 0B re-appended, cursor held at %llu\n", (unsigned long long)cur2);
+		}
+	}
+
+	// ================= CASE B -- cross-route single-funnel proof =================
+	{
+		this->rsp_current_expected_batch_seq_id=(B+1)&0xFF;
+		this->rsp_prev_batch_seq_id           =B;
+		this->rsp_last_delivered_batch_seq_id =(B-1)&0xFF;
+		this->rx_stream_emitted_bsi_hw        =-1;
+		this->rx_stream_delivered             =0;
+		this->rx_stream_crc                   =0;
+		this->rsp_stream_aborted              =false;
+		this->rsp_cross_session_seam_armed    =false;
+		this->fifo_buffer_rx.flush();
+
+		// 1st delivery via the PREV-route funnel (mirror the arq_responder.cc PREV emit)
+		seat_batchB();
+		this->decrypt_delivered_bsi=B;
+		advance_last_delivered(B);
+		for(int i=0;i<NFR;i++) if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;   // PREV route flips RECEIVED->ACKED before the funnel
+		this->rx_copy_window=NFR;
+		copy_data_to_buffer();
+		this->rx_copy_window=-1;
+		char s1b[NFR*FLEN]; int p1b=this->fifo_buffer_rx.pop(s1b,(int)sizeof(s1b));
+		uint64_t c1b=this->rx_stream_delivered;
+		bool s1b_ok=(p1b==NFR*FLEN)&&(memcmp(s1b,oracle,NFR*FLEN)==0);
+		if(!s1b_ok){ printf("[TEST-DEDUP-REBASE] CASE-B FAIL: PREV 1st delivery not faithful (popped=%d)\n", p1b); fails++; }
+		if(this->rx_stream_emitted_bsi_hw!=B){ printf("[TEST-DEDUP-REBASE] CASE-B FAIL: emit_hw=%d want %d after PREV emit\n", this->rx_stream_emitted_bsi_hw, B); fails++; }
+
+		// rebase, then in-order re-commit of B (2nd emit via the OTHER route)
+		this->current_configuration=102; this->forward_configuration=0;
+		rsp_inband_demote_rebase();
+		this->rsp_current_expected_batch_seq_id=B;
+		seat_batchB();
+		rsp_commit_cur_batch_delivery();
+		char s2b[2*NFR*FLEN]; int p2b=this->fifo_buffer_rx.pop(s2b,(int)sizeof(s2b));
+		uint64_t c2b=this->rx_stream_delivered;
+		printf("[TEST-DEDUP-REBASE] CASE-B (PREV 1st, in-order 2nd): popped2=%dB cursor %llu->%llu\n", p2b, (unsigned long long)c1b, (unsigned long long)c2b);
+		fflush(stdout);
+		if(defeat){
+			bool reproduced=(p2b==NFR*FLEN)&&(c2b==c1b+(uint64_t)(NFR*FLEN));
+			if(!reproduced){ printf("[TEST-DEDUP-REBASE] CASE-B FAIL(defeat): cross-route double-delivery not reproduced\n"); fails++; }
+		} else {
+			bool clean=(p2b==0)&&(c2b==c1b);
+			if(!clean){ printf("[TEST-DEDUP-REBASE] CASE-B FAIL(fix): cross-route double-delivery not prevented (re-appended=%dB)\n", p2b); fails++; }
+		}
+	}
+
+	bool pass=(fails==0);
+	printf("[TEST-DEDUP-REBASE] %s: fails=%d (defeat=%d)\n", pass?"PASS":"FAIL", fails, defeat?1:0);
+	fflush(stdout);
+	return pass?0:1;
+}
+
+// ==========================================================================
 // test_batchsize_desync_delivery (silent-corruption-residual.md §8, data-flow-
 // batch-size.md §8) — the res_c3100 SILENT CORRUPTION regression (WGN:25 ~3%). A
 // CMD>RSP data_batch_size desync (CMD built 30 frames, RSP applied 25) makes the
@@ -15111,6 +15295,7 @@ int cl_arq_controller::test_batchsize_desync_delivery()
 		// Committed wire stamp for the prev bsi: start aligned to the delivered cursor
 		// (no positional shift), length = the FULL 30-frame transported byte total.
 		this->rx_stream_delivered            = 0;
+		this->rx_stream_emitted_bsi_hw       = -1;   // INV-DEDUP: test-rig byte-cursor re-anchor mirror
 		this->rx_stream_crc                  = 0;
 		this->rx_stream_stamp[P & 0xFF].valid  = true;
 		this->rx_stream_stamp[P & 0xFF].start  = 0;

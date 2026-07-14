@@ -1876,6 +1876,15 @@ int main(int argc, char *argv[])
             // defeating the primitive restores the pre-fix 0. Fast + deterministic, no
             // IONOS/RF. See fact-documents/chase-combining-harq.md.
             failed += run_chase_selftest();
+            // In-band demote-rebase DOUBLE-DELIVERY (byte-stream corruption): the RSP
+            // re-delivers an already-delivered batch across an in-band demote-rebase
+            // (re-adopt + lost-ACK retransmit re-reach the delivery funnel with fwd==0).
+            // Drives the REAL commit funnel + REAL rebase + REAL gap predicates with
+            // fifo_buffer_rx as a byte-exact oracle. fail-before MERCURY_STREAM_DEDUP_DEFEAT=1.
+            {
+                cl_arq_controller ARQ_dd;
+                failed += ARQ_dd.test_dedup_rebase();
+            }
 
             // PRECOOK (Stage 1) shared-ring PIN invariant regression. Pins the persistent
             // capture ring (precook_pin_shared_ring), then drives a representative gearshift
@@ -2926,6 +2935,9 @@ int main(int argc, char *argv[])
                                         // silent-corruption regression (silent-corruption-residual.md §8).
                                         // fail-before via MERCURY_BATCHSIZE_DESYNC_DEFEAT=1.
     bool test_eob_loss_batch_truncation_cli = false; // --test-eob-loss-batch-truncation: D5 — EOB-inference
+    bool test_dedup_rebase_cli = false; // --test-dedup-rebase: in-band demote-rebase double-delivery
+                                        // (byte-stream corruption) regression. fail-before via
+                                        // MERCURY_STREAM_DEDUP_DEFEAT=1. One-shot exits rc; also runs in --test.
                                         // batch truncation. A 30-frame batch loses its EOB-marked tail; the
                                         // wired batch_total_frames recovers the true length. fail-before via
                                         // MERCURY_D5_INFER_DEFEAT=1 (silent 29-frame skip), pass-after holds
@@ -4042,6 +4054,15 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_eob_loss_batch_truncation
             // + TRACK_C_D2D3D5_DESIGN.md §5.3.
             test_eob_loss_batch_truncation_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-dedup-rebase") == 0)
+        {
+            // In-band demote-rebase double-delivery (byte-stream corruption) regression
+            // -- one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_dedup_rebase.
+            test_dedup_rebase_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6025,6 +6046,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_eob_loss_batch_truncation();
             printf("[FLAG] EOB-loss-batch-truncation test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_dedup_rebase_cli) {
+            // In-band demote-rebase double-delivery corruption fix (one-shot, exit rc).
+            printf("[FLAG] --test-dedup-rebase: invoking in-band demote-rebase "
+                   "double-delivery de-dup regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_dedup_rebase();
+            printf("[FLAG] dedup-rebase test complete (rc=%d) -- exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
