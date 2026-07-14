@@ -306,8 +306,12 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
  		//   mode 2 (#1(c) eager)  when this is a SPECULATIVE wrong-position
  		//                         decode (early_term_speculative set by the
  		//                         sub-peak / extra-trial caller);
- 		//   mode 1 (#3 standard)  when MERCURY_SYND_EARLYTERM is set;
- 		//   mode 0 (OFF)          otherwise => byte-identical (loop to the cap).
+ 		//   mode 1 (#3 standard)  DEFAULT-ON: MERCURY_SYND_EARLYTERM defaults to 1
+ 		//                         (env-absent => 1; see the getenv below), so a
+ 		//                         non-speculative decode runs mode 1 UNLESS the env
+ 		//                         is explicitly set to 0;
+ 		//   mode 0 (OFF)          only when MERCURY_SYND_EARLYTERM=0 is set explicitly
+ 		//                         => byte-identical (loop to the cap).
  		// Speculative TAKES PRECEDENCE (a wrong-position decode is doomed; bail
  		// eagerly even if #3's env is unset).
  		static const int synd_earlyterm_env = []{

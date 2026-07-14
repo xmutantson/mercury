@@ -36,9 +36,10 @@
 // floating-point product RE-ASSOCIATION in the last ULP (proven via the coded
 // SFO-GRID BER diff — see FACTS / the branch verdict).
 //
-// Gate: MERCURY_LDPC_FWDBACK unset/0 => the ORIGINAL O(dc^2) loop runs
-// bit-for-bit (default-off byte-identical). The env is read once per process
-// (static cache) so the gate adds nothing to the hot path.
+// Gate: MERCURY_LDPC_FWDBACK is DEFAULT-ON (env-absent => 1). Unset => the O(dc)
+// forward-backward recurrence runs; set MERCURY_LDPC_FWDBACK=0 to restore the
+// ORIGINAL O(dc^2) loop bit-for-bit (the byte-identical revert arm). The env is
+// read once per process (static cache) so the gate adds nothing to the hot path.
 static inline bool ldpc_fwdback_enabled()
 {
 	static const int v = []{
