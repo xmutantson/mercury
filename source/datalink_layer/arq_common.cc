@@ -617,6 +617,18 @@ cl_arq_controller::cl_arq_controller()
 		// collapse) so the fire-proof runs FIX vs DEFEAT on ONE binary.
 		const char* e3 = std::getenv("MERCURY_CEILING_PIN_DEFEAT");
 		ceiling_pin_defeat = (e3 && *e3 && atoi(e3) != 0);
+		// DUTY FAST-START lever R (climb-duty) — connect-evidenced robust exit. The
+		// completed MFSK CONNECT handshake IS the robust-tier confirmation, so at connect
+		// the CONFIG_0 tier-cross fires immediately instead of after a full robust DATA
+		// batch (~38 s). Meter-INDEPENDENT (CONFIG_0 floor, not the floor-pinned SNR
+		// proxy). Ships DEFAULT-ON. MERCURY_DUTY_R_DEFEAT=1 (or the master
+		// MERCURY_DUTY_FASTSTART_DEFEAT=1) restores the incumbent robust dwell so the
+		// fire-proof runs FIX vs DEFEAT on ONE binary. Env-latched ONCE here (production
+		// path) exactly like the climb knobs above.
+		const char* dm = std::getenv("MERCURY_DUTY_FASTSTART_DEFEAT");
+		bool duty_master_defeat = (dm && *dm && atoi(dm) != 0);
+		const char* dr = std::getenv("MERCURY_DUTY_R_DEFEAT");
+		duty_r_defeat = duty_master_defeat || (dr && *dr && atoi(dr) != 0);
 	}
 	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
 	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at

@@ -4781,6 +4781,16 @@ public:
   int test_connect_snr_seed();
   int test_robust_pipeline();
 
+  // DUTY FAST-START lever R — connect-evidenced robust exit. Drives the REAL
+  // production predicate robust_connect_exit_target() (the SAME method the connect-seed
+  // hook calls) across the fire/guard matrix. PASS-AFTER (default): at a robust config
+  // it returns the CONFIG_0 floor (the ~38 s robust dwell is skipped). FAIL-BEFORE
+  // (duty_r_defeat=1, the MERCURY_DUTY_R_DEFEAT / master-defeat production gate): it
+  // returns CONFIG_NONE (the incumbent robust dwell). Guards: not-robust config,
+  // proven-ceiling floored below CONFIG_0 -> CONFIG_NONE even with R live. PURE
+  // in-process synthetic-fire — permanent regression gate.
+  int test_robust_connect_exit();
+
   // KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
   // data-decoupled intra-tier climb confirm (inband_retag_confirm_from_base_pattern).
   // Fails-before under -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE.
@@ -5240,6 +5250,35 @@ public:
   // the ctor. Independent of climb_accel_defeat (this fix is on the WITHIN-ladder failure path,
   // not the leap itself).
   bool ceiling_pin_defeat;
+  // DUTY FAST-START — lever R (connect-evidenced robust exit). Meter-independent
+  // startup accelerator, env-latched in the ctor. When OFF (default), the completed
+  // MFSK CONNECT handshake is treated as the robust-tier confirmation so the CONFIG_0
+  // tier-cross fires at connect instead of after a full robust DATA batch (~38 s).
+  // duty_r_defeat=1 (MERCURY_DUTY_R_DEFEAT, or the master MERCURY_DUTY_FASTSTART_DEFEAT)
+  // restores the incumbent robust dwell so the fire-proof runs FIX vs DEFEAT on ONE
+  // binary. Independent of climb_accel_defeat (R is on the CONNECT path, not the leap).
+  bool duty_r_defeat;
+  // R (DUTY fast-start) — the CONNECT-EVIDENCED robust exit target. The completed MFSK
+  // CONNECT handshake decoded the robust tier end-to-end — the SAME confirmation the
+  // incumbent otherwise spends ~38 s of robust DATA airtime to earn before the C1
+  // tier-cross. So at connect, at a robust config, PROPOSE the CONFIG_0 OFDM floor
+  // directly (identical to the lowest-OFDM probe robust_climb_probe_target makes;
+  // meter-INDEPENDENT — no SNR read) instead of dwelling. Returns CONFIG_0 when
+  // eligible, else CONFIG_NONE. CONFIG_NONE when: defeated, not at a robust config, or a
+  // prior failed tier-cross floored the proven ceiling below CONFIG_0 (the SAME guard as
+  // robust_climb_probe_target). A wrong seed costs one batch + one BREAK, once per
+  // session (break_target_with_anchor floors to ROBUST_0; the proven-ceiling ratchet
+  // disables the re-probe) — and it removes NO CONFIG_0 evidence, because the incumbent's
+  // robust dwell proves only ROBUST_0, not CONFIG_0. Pure: production (the connect-seed
+  // hook) and the directed test drive the SAME logic.
+  int robust_connect_exit_target() const {
+    if(duty_r_defeat) return CONFIG_NONE;
+    if(!is_robust_config(current_configuration)) return CONFIG_NONE;
+    if(supershift_proven_ceiling >= 0 &&
+       config_ladder_index(supershift_proven_ceiling) < config_ladder_index(CONFIG_0))
+      return CONFIG_NONE;
+    return CONFIG_0;
+  }
   // C1 (data-flow-gearshift-climb.md) — the ROBUST tier-cross probe target. Returns CONFIG_0
   // when a robust climb should PROPOSE the OFDM tier directly (skip ROBUST_1/2 — they carry no
   // OFDM evidence, pure delay), or -1 to keep the +1 robust ladder. -1 when: defeated, not at a

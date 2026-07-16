@@ -1662,6 +1662,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_rp;
                 failed += test_rp.test_robust_pipeline();
             }
+            // DUTY FAST-START lever R — connect-evidenced robust exit (climb-duty):
+            // the CONFIG_0 OFDM tier-cross fires at connect instead of after a full
+            // robust DATA batch (~38 s). Drives the REAL predicate
+            // robust_connect_exit_target(). PASS-AFTER seeds CONFIG_0; FAIL-BEFORE
+            // (duty_r_defeat, the MERCURY_DUTY_R_DEFEAT / master-defeat production gate)
+            // returns CONFIG_NONE. PURE in-process synthetic-fire — permanent gate.
+            {
+                cl_arq_controller test_dr;
+                failed += test_dr.test_robust_connect_exit();
+            }
             // CLIMB-UP cmd_batch_seq_id ROLLBACK regression
             // (data-flow-inband-frame0-rolling-partial.md §13): the SYMMETRY GAP to the demote
             // rollback — the climb-UP SET_CONFIG emits (FRAME-UP, optimizer, turbo settle)

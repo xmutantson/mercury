@@ -7630,6 +7630,26 @@ void cl_arq_controller::process_control_commander()
 					// seed is speculative, like the elevator); a non-viable seed BREAKs
 					// back to the ROBUST floor (§10.4 invariant 2).
 					int seed_cfg = connect_seed_target();
+					// R (DUTY fast-start, climb-duty): connect-evidenced robust exit. When
+					// connect_seed left us at the ROBUST floor (the common case -- connect_seed
+					// rides the floor-pinned SNR proxy and is quarantined default-OFF), the
+					// completed MFSK CONNECT handshake still proves the robust tier end-to-end.
+					// So cross to the CONFIG_0 OFDM floor NOW via the SAME proven SET_CONFIG
+					// tier-cross instead of airing a full robust DATA batch (~38 s) to earn the
+					// identical CONFIG_0 probe. Meter-independent; guarded by the BREAK floor +
+					// proven-ceiling ratchet; never lowers a (higher) connect_seed pick.
+					if(is_robust_config(current_configuration))
+					{
+						int rce = robust_connect_exit_target();
+						if(rce != CONFIG_NONE &&
+						   (seed_cfg == CONFIG_NONE ||
+						    config_ladder_index(rce) > config_ladder_index(seed_cfg)))
+						{
+							printf("[DUTY-R] connect-evidenced robust exit: seeding CONFIG_0 (skip robust dwell), config %d -> %d\n", current_configuration, rce);
+							fflush(stdout);
+							seed_cfg = rce;
+						}
+					}
 					if(seed_cfg != CONFIG_NONE)
 					{
 						negotiated_configuration = seed_cfg;
@@ -7841,6 +7861,26 @@ void cl_arq_controller::process_control_commander()
 			// NOT raised (speculative, BREAK-recoverable, §10.4 invariant 2).
 			{
 				int seed_cfg = connect_seed_target();
+				// R (DUTY fast-start, climb-duty): connect-evidenced robust exit. When
+				// connect_seed left us at the ROBUST floor (the common case -- connect_seed
+				// rides the floor-pinned SNR proxy and is quarantined default-OFF), the
+				// completed MFSK CONNECT handshake still proves the robust tier end-to-end.
+				// So cross to the CONFIG_0 OFDM floor NOW via the SAME proven SET_CONFIG
+				// tier-cross instead of airing a full robust DATA batch (~38 s) to earn the
+				// identical CONFIG_0 probe. Meter-independent; guarded by the BREAK floor +
+				// proven-ceiling ratchet; never lowers a (higher) connect_seed pick.
+				if(is_robust_config(current_configuration))
+				{
+					int rce = robust_connect_exit_target();
+					if(rce != CONFIG_NONE &&
+					   (seed_cfg == CONFIG_NONE ||
+					    config_ladder_index(rce) > config_ladder_index(seed_cfg)))
+					{
+						printf("[DUTY-R] connect-evidenced robust exit: seeding CONFIG_0 (skip robust dwell), config %d -> %d\n", current_configuration, rce);
+						fflush(stdout);
+						seed_cfg = rce;
+					}
+				}
 				if(seed_cfg != CONFIG_NONE)
 				{
 					negotiated_configuration = seed_cfg;
@@ -12057,6 +12097,65 @@ int cl_arq_controller::test_connect_snr_seed()
 // dwell does not serialize a clean-batch round-trip per rung. Off-feature / OFDM-tier /
 // at-top -> false (legacy). PURE in-process synthetic-fire — permanent regression gate.
 // Fails-before: -DINBAND_ROBUST_PIPELINE_FAILBEFORE pins the robust-tier branch off.
+int cl_arq_controller::test_robust_connect_exit()
+{
+	// DUTY FAST-START lever R — drives the REAL production predicate
+	// robust_connect_exit_target() (the SAME method the connect-seed hook calls).
+	// PASS-AFTER (R live): at a robust config it seeds the CONFIG_0 floor -> the ~38 s
+	// robust dwell is skipped. FAIL-BEFORE (duty_r_defeat, the production defeat gate):
+	// CONFIG_NONE -> incumbent robust dwell. Guards: not-robust config / proven-ceiling
+	// floored below CONFIG_0 -> CONFIG_NONE even with R live.
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-DUTY-R] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else { printf("[TEST-DUTY-R] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	int saved_cfg    = current_configuration;
+	int saved_ceil   = supershift_proven_ceiling;
+	bool saved_def   = duty_r_defeat;
+
+	// --- FAIL-BEFORE: R defeated (MERCURY_DUTY_R_DEFEAT / master-defeat) ---
+	duty_r_defeat = true;
+	current_configuration = ROBUST_0;          // at the robust floor
+	supershift_proven_ceiling = -1;            // no prior BREAK
+	int fb = robust_connect_exit_target();
+	check(fb == CONFIG_NONE,
+		"FAIL-BEFORE: R defeated at ROBUST_0 -> NO seed (incumbent dwell)", fb, CONFIG_NONE);
+
+	// --- PASS-AFTER: R live at the robust floor -> seed CONFIG_0 ---
+	duty_r_defeat = false;
+	current_configuration = ROBUST_0;
+	supershift_proven_ceiling = -1;
+	int pa = robust_connect_exit_target();
+	check(pa == CONFIG_0,
+		"PASS-AFTER: R live at ROBUST_0 -> seed CONFIG_0 (skip robust dwell)", pa, CONFIG_0);
+
+	// --- GUARD 1: not a robust config (already OFDM) -> NO seed even with R live ---
+	current_configuration = CONFIG_0;
+	int g1 = robust_connect_exit_target();
+	check(g1 == CONFIG_NONE,
+		"GUARD not-robust (CONFIG_0) -> NO seed", g1, CONFIG_NONE);
+
+	// --- GUARD 2: a prior failed tier-cross floored the proven ceiling below CONFIG_0
+	//     (proven_ceiling is a robust rung) -> NO re-probe even with R live ---
+	current_configuration = ROBUST_0;
+	supershift_proven_ceiling = ROBUST_0;      // ceiling floored to robust (< CONFIG_0)
+	int g2 = robust_connect_exit_target();
+	check(g2 == CONFIG_NONE,
+		"GUARD proven-ceiling floored below CONFIG_0 -> NO re-probe", g2, CONFIG_NONE);
+
+	current_configuration     = saved_cfg;
+	supershift_proven_ceiling = saved_ceil;
+	duty_r_defeat             = saved_def;
+
+	printf("[TEST-DUTY-R] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 int cl_arq_controller::test_robust_pipeline()
 {
 	int failed = 0;
