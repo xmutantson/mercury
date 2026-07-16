@@ -8342,7 +8342,17 @@ void cl_arq_controller::kx_stream_reanchor()
 	rx_stream_crc = CRC32_INIT;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid = false;
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid = false;
-	printf("[CRYPTO] KX-as-data re-anchor: Option-W cursors/stamps/CRC reset to fresh bsi=0 baseline\n");
+	// Wire batch_seq_id counter coordination (the delicate half — validated live,
+	// G1). The KX streams consumed wire bsi 0..N across BOTH R1 SWITCH_ROLE swaps;
+	// reset the counters to the fresh-session baseline (reset_session_state():714-734)
+	// on BOTH peers so the FIRST user-data batch goes out at wire bsi 0 (the sender's
+	// cmd_batch_seq_id) and the receiver re-adopts (current_expected=-1). Combined with
+	// the Option-W cursor reset above and the AEAD nonce-epoch reset in the KEY_ACTIVATE
+	// handler, the post-activation data path is byte-identical to a normal session start.
+	cmd_batch_seq_id                  = 0;
+	rsp_current_expected_batch_seq_id = -1;
+	rsp_prev_batch_seq_id             = -1;
+	printf("[CRYPTO] KX-as-data re-anchor: Option-W cursors/stamps/CRC + wire bsi reset to fresh bsi=0 baseline\n");
 	fflush(stdout);
 }
 
@@ -8389,6 +8399,126 @@ int cl_arq_controller::kx_stage_forward_stream()
 	kx_stream_tx_active = true;
 	printf("[CRYPTO] KX-as-data forward stream staged (%d bytes: x25519_pk_cmd + mlkem_pk) — feeding as DATA\n",
 		kx_stream_tx_len);
+	fflush(stdout);
+	return 0;
+}
+
+// KX-AS-DATA reverse TX stage (data-flow-hybrid-kex.md §7). Twin of
+// kx_stage_forward_stream, but for the RSP->CMD ciphertext: assemble
+//   MAGIC | KX_STREAM_REV | total_len(LE) | x25519_pk_rsp(32) | mlkem_ct(1088)
+// into the dedicated kx_stream_tx_buf (NOT fifo_buffer_tx) and arm kx_stream_tx_active
+// so the RSP streams it once it becomes the data-commander via R1 SWITCH_ROLE — the
+// SAME proven role-agnostic process_buffer_data_commander() source-switch. kx_mlkem_ct
+// must already hold the encapsulated ciphertext (set by kx_on_forward_complete()).
+// Fail-secure: ct not ready -> -1 (caller tears down, never plaintext).
+int cl_arq_controller::kx_stage_reverse_stream(const uint8_t* x25519_pk_rsp)
+{
+	if(!kx_mlkem_ct_ready || x25519_pk_rsp == nullptr)
+	{
+		printf("[CRYPTO] ERROR: KX-as-data reverse stage — ciphertext/pubkey not ready\n");
+		fflush(stdout);
+		return -1;
+	}
+	int p = 0;
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_MAGIC >> 24) & 0xFF);
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_MAGIC >> 16) & 0xFF);
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_MAGIC >>  8) & 0xFF);
+	kx_stream_tx_buf[p++] = (uint8_t)( KX_STREAM_MAGIC        & 0xFF);
+	kx_stream_tx_buf[p++] = KX_STREAM_REV;
+	kx_stream_tx_buf[p++] = (uint8_t)( KX_STREAM_REV_LEN       & 0xFF);   // LE low
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_REV_LEN >> 8) & 0xFF);   // LE high
+	memcpy(kx_stream_tx_buf + p, x25519_pk_rsp, X25519_KEY_SIZE);   p += X25519_KEY_SIZE;
+	memcpy(kx_stream_tx_buf + p, kx_mlkem_ct, MLKEM_CT_SIZE);       p += MLKEM_CT_SIZE;
+
+	kx_stream_tx_len    = p;                 // KX_STREAM_HDR + KX_STREAM_REV_LEN == 1127
+	kx_stream_tx_sent   = 0;
+	kx_stream_tx_active = true;
+	printf("[CRYPTO] KX-as-data reverse stream staged (%d bytes: x25519_pk_rsp + mlkem_ct) — awaiting role handback\n",
+		kx_stream_tx_len);
+	fflush(stdout);
+	return 0;
+}
+
+// RSP side: the full FORWARD stream (x25519_pk_cmd + mlkem_pk) has reassembled via
+// kx_ingest(). Generate this peer's X25519 keypair, compute the classical shared
+// secret against the folded CMD pubkey, encapsulate against the CMD's ML-KEM pk to
+// produce the ciphertext + ML-KEM shared secret, derive the transcript-bound hybrid
+// key (transcript order ct||pk||pk_cmd||pk_rsp — the SAME on both peers), and stage
+// the reverse ct for the R1 SWITCH_ROLE reverse transfer. TRANSPORT-ONLY: the crypto
+// core is fed the identical bytes the pump fed; only the transport changed. Fail-
+// secure: any RNG/encaps/shared failure -> -1 (caller tears the link down).
+int cl_arq_controller::kx_on_forward_complete()
+{
+	uint8_t rsp_x25519_pub[X25519_KEY_SIZE];
+	if(cipher_suite.generate_x25519_keypair(rsp_x25519_pub) != 0)
+	{
+		printf("[CRYPTO] FATAL: KX-as-data RSP X25519 keypair failed (RNG)\n");
+		fflush(stdout);
+		return -1;
+	}
+	if(cipher_suite.compute_x25519_shared_checked(kx_stream_peer_x25519, X25519_KEY_SIZE) != 0)
+	{
+		printf("[CRYPTO] FATAL: KX-as-data RSP X25519 shared invalid (folded CMD pubkey)\n");
+		fflush(stdout);
+		return -1;
+	}
+	if(cipher_suite.encapsulate_mlkem(kx_mlkem_pk, kx_mlkem_ct) != 0)
+	{
+		printf("[CRYPTO] FATAL: KX-as-data RSP ML-KEM encapsulation failed (bad encaps key)\n");
+		fflush(stdout);
+		return -1;
+	}
+	kx_mlkem_ct_ready = true;
+	// pk order is ALWAYS commander-then-responder; on the RSP peer=commander.
+	const uint8_t* pk_rsp = cipher_suite.get_x25519_pubkey();       // own
+	const uint8_t* pk_cmd = cipher_suite.get_x25519_peer_pubkey();  // peer = commander
+	cipher_suite.derive_session_key(
+		destination_call_sign.c_str(), my_call_sign.c_str(),
+		(psk_hex[0] != '\0') ? (const uint8_t*)psk_hex : NULL,
+		(psk_hex[0] != '\0') ? (int)strlen(psk_hex) : 0,
+		true,                  // mlkem_done -> hybrid + pq_active
+		kx_mlkem_ct, kx_mlkem_pk, pk_cmd, pk_rsp);
+	cipher_suite.set_kx_phase(KX_HYBRID_DONE);
+	if(kx_stage_reverse_stream(rsp_x25519_pub) != 0)
+		return -1;
+	printf("[CRYPTO] KX-as-data RSP: encapsulated + hybrid key derived; reverse ct staged for SWITCH_ROLE\n");
+	fflush(stdout);
+	return 0;
+}
+
+// CMD side: the full REVERSE stream (x25519_pk_rsp + mlkem_ct) has reassembled via
+// kx_ingest() after the R1 SWITCH_ROLE reverse transfer. Compute the classical shared
+// secret against the folded RSP pubkey, decapsulate the ML-KEM ct with our secret key
+// (from kx_stage_forward_stream's keypair), derive the IDENTICAL transcript-bound
+// hybrid key, and mark kx_reverse_consumed. KEY_ACTIVATE is queued afterwards by
+// process_buffer_data_commander() once the role hands back to the CMD (swap #2). Fail-
+// secure: any decap/shared failure -> -1 (caller tears the link down, never plaintext).
+int cl_arq_controller::kx_on_reverse_complete()
+{
+	if(cipher_suite.compute_x25519_shared_checked(kx_stream_peer_x25519, X25519_KEY_SIZE) != 0)
+	{
+		printf("[CRYPTO] FATAL: KX-as-data CMD X25519 shared invalid (folded RSP pubkey)\n");
+		fflush(stdout);
+		return -1;
+	}
+	if(cipher_suite.decapsulate_mlkem(kx_mlkem_ct) != 0)
+	{
+		printf("[CRYPTO] FATAL: KX-as-data CMD ML-KEM decapsulation failed\n");
+		fflush(stdout);
+		return -1;
+	}
+	// pk order is ALWAYS commander-then-responder; on the CMD peer=responder.
+	const uint8_t* pk_cmd = cipher_suite.get_x25519_pubkey();       // own
+	const uint8_t* pk_rsp = cipher_suite.get_x25519_peer_pubkey();  // peer = responder
+	cipher_suite.derive_session_key(
+		my_call_sign.c_str(), destination_call_sign.c_str(),
+		(psk_hex[0] != '\0') ? (const uint8_t*)psk_hex : NULL,
+		(psk_hex[0] != '\0') ? (int)strlen(psk_hex) : 0,
+		true,                  // mlkem_done -> hybrid + pq_active
+		kx_mlkem_ct, kx_mlkem_pk, pk_cmd, pk_rsp);
+	cipher_suite.set_kx_phase(KX_HYBRID_DONE);
+	kx_reverse_consumed = true;
+	printf("[CRYPTO] KX-as-data CMD: decapsulated + hybrid key derived; awaiting role handback to KEY_ACTIVATE\n");
 	fflush(stdout);
 	return 0;
 }
@@ -8646,6 +8776,129 @@ int cl_arq_controller::test_kx_tx_stream()
 	return failures;
 }
 
+// KX-AS-DATA FULL crypto round-trip fire proof (data-flow-hybrid-kex.md §7 / T6).
+// Drives the REAL production reverse-ct + activation crypto path on two controllers:
+//   CMD kx_stage_forward_stream() -> RSP kx_ingest() -> RSP kx_on_forward_complete()
+//   (encapsulate + derive + stage reverse) -> CMD kx_ingest() -> CMD
+//   kx_on_reverse_complete() (decapsulate + derive)
+// and asserts BOTH peers derive the IDENTICAL hybrid session key (the KEY_ACTIVATE
+// premise), the confirm tags match, both are PQ-upgraded, and a TAMPERED reverse ct
+// diverges the CMD key so the confirm tag MISMATCHES (KEY_ACTIVATE would REFUSE — the
+// AEAD/tamper fail-secure). NO message buffers / telecom_system needed (the crypto +
+// kx_stream_* transport buffers are self-contained). The SWITCH_ROLE transport itself
+// is proven on the LIVE wire (G1/G2); this is the crypto-identity half.
+int cl_arq_controller::test_kx_roundtrip_derive()
+{
+	int failures = 0;
+	auto check = [&](bool cond, const char* name){
+		if(!cond){ failures++; printf("[TEST-KX-ROUNDTRIP] FAIL: %s\n", name); }
+		else      { printf("[TEST-KX-ROUNDTRIP] ok: %s\n", name); }
+		fflush(stdout);
+	};
+
+	cl_arq_controller& cmd = *this;      // this peer = CMD (ML-KEM keypair holder)
+	cl_arq_controller  rsp;              // peer = RSP (encapsulator)
+
+	// Consistent callsigns so derive_session_key(commander_call, responder_call) is
+	// assembled identically on both peers (the transcript salt is call-order bound).
+	cmd.my_call_sign = "AAAAAA"; cmd.destination_call_sign = "BBBBBB"; cmd.psk_hex[0] = '\0';
+	rsp.my_call_sign = "BBBBBB"; rsp.destination_call_sign = "AAAAAA"; rsp.psk_hex[0] = '\0';
+	cmd.encryption_enabled = true; rsp.encryption_enabled = true;
+	cmd.cipher_suite.set_kx_phase(KX_IDLE); rsp.cipher_suite.set_kx_phase(KX_IDLE);
+	cmd.kx_chunk_state_reset(); rsp.kx_chunk_state_reset();
+
+	// --- Forward: CMD stages the forward stream (REAL production stage) --------------
+	check(cmd.kx_stage_forward_stream() == 0, "CMD staged forward stream (x25519_pk_cmd + mlkem_pk)");
+	check(cmd.kx_stream_tx_len == KX_STREAM_HDR + KX_STREAM_FWD_LEN, "forward stream len == 1223");
+	// Deliver the forward bytes to the RSP via the REAL kx_ingest in irregular fragments
+	// (header split across a fragment boundary — the data plane hands contiguous bytes).
+	{
+		const uint8_t* fwd = cmd.kx_stream_tx_buf; int total = cmd.kx_stream_tx_len; int off = 0;
+		bool frag_ok = true;
+		while(off < total){ int n = (total - off < 137) ? (total - off) : 137;
+			if(rsp.kx_ingest(fwd + off, n) < 0) frag_ok = false; off += n; }
+		check(frag_ok, "RSP kx_ingest consumed every forward fragment (no REFUSE)");
+	}
+	check(rsp.kx_stream_rx_done_kind == KX_STREAM_FWD, "RSP completed forward reassembly (done_kind==FWD)");
+	check(rsp.kx_mlkem_pk_ready && memcmp(rsp.kx_mlkem_pk, cmd.kx_mlkem_pk, MLKEM_PK_SIZE) == 0,
+		"RSP reassembled the ML-KEM pk BYTE-IDENTICAL");
+	check(memcmp(rsp.kx_stream_peer_x25519, cmd.kx_stream_tx_buf + KX_STREAM_HDR, X25519_KEY_SIZE) == 0,
+		"RSP reassembled the folded x25519_pk_cmd BYTE-IDENTICAL");
+
+	// --- RSP: REAL production forward-consume (encapsulate + derive + stage reverse) --
+	check(rsp.kx_on_forward_complete() == 0, "RSP kx_on_forward_complete (encapsulate + derive + stage reverse)");
+	check(rsp.cipher_suite.get_kx_phase() == KX_HYBRID_DONE, "RSP reached KX_HYBRID_DONE");
+	check(rsp.kx_stream_tx_active && rsp.kx_stream_tx_len == KX_STREAM_HDR + KX_STREAM_REV_LEN,
+		"RSP staged the reverse stream (len == 1127) — armed for SWITCH_ROLE");
+
+	// --- Reverse: deliver the RSP's reverse bytes to the CMD via REAL kx_ingest -------
+	uint8_t rev_saved[KX_STREAM_BUFSZ]; int rev_len = rsp.kx_stream_tx_len;
+	memcpy(rev_saved, rsp.kx_stream_tx_buf, rev_len);   // save for the tamper sub-test
+	{
+		const uint8_t* rev = rsp.kx_stream_tx_buf; int total = rsp.kx_stream_tx_len; int off = 0;
+		bool frag_ok = true;
+		while(off < total){ int n = (total - off < 91) ? (total - off) : 91;
+			if(cmd.kx_ingest(rev + off, n) < 0) frag_ok = false; off += n; }
+		check(frag_ok, "CMD kx_ingest consumed every reverse fragment (no REFUSE)");
+	}
+	check(cmd.kx_stream_rx_done_kind == KX_STREAM_REV, "CMD completed reverse reassembly (done_kind==REV)");
+	check(cmd.kx_mlkem_ct_ready && memcmp(cmd.kx_mlkem_ct, rsp.kx_mlkem_ct, MLKEM_CT_SIZE) == 0,
+		"CMD reassembled the ML-KEM ct BYTE-IDENTICAL");
+
+	// --- CMD: REAL production reverse-consume (decapsulate + derive) ------------------
+	check(cmd.kx_on_reverse_complete() == 0, "CMD kx_on_reverse_complete (decapsulate + derive)");
+	check(cmd.cipher_suite.get_kx_phase() == KX_HYBRID_DONE, "CMD reached KX_HYBRID_DONE");
+	check(cmd.kx_reverse_consumed, "CMD kx_reverse_consumed latched (gates KEY_ACTIVATE)");
+
+	// --- THE round-trip assertion: BOTH peers derived the IDENTICAL hybrid key -------
+	uint8_t key_cmd[SESSION_KEY_SIZE], key_rsp[SESSION_KEY_SIZE];
+	cmd.cipher_suite.copy_session_key_for_test(key_cmd);
+	rsp.cipher_suite.copy_session_key_for_test(key_rsp);
+	check(memcmp(key_cmd, key_rsp, SESSION_KEY_SIZE) == 0,
+		"BOTH peers derived the IDENTICAL hybrid session key");
+	uint8_t tag_cmd[8], tag_rsp[8];
+	cmd.cipher_suite.compute_key_confirmation(tag_cmd);
+	rsp.cipher_suite.compute_key_confirmation(tag_rsp);
+	check(memcmp(tag_cmd, tag_rsp, 8) == 0, "key confirmation tags match (KEY_ACTIVATE would confirm)");
+	check(cmd.cipher_suite.is_pq_upgraded() && rsp.cipher_suite.is_pq_upgraded(),
+		"both peers PQ-upgraded (hybrid combiner, not classical fallback)");
+
+	// --- Fail-secure (AEAD/tamper, T3/G3 in-vitro): a tampered reverse ct diverges the
+	// CMD's derived key, so its confirm tag MISMATCHES the RSP's -> KEY_ACTIVATE REFUSE.
+	{
+		cl_arq_controller cmd2;
+		cmd2.my_call_sign = "AAAAAA"; cmd2.destination_call_sign = "BBBBBB"; cmd2.psk_hex[0] = '\0';
+		cmd2.encryption_enabled = true;
+		cmd2.cipher_suite.set_kx_phase(KX_IDLE); cmd2.kx_chunk_state_reset();
+		// cmd2 must be the SAME keypair holder as cmd for a fair tamper test: re-run its
+		// forward stage would make a DIFFERENT keypair, so instead copy cmd's keypair
+		// state by re-deriving on cmd's cipher after a ct flip is not possible; simplest
+		// faithful check: flip a ct byte in the reverse stream and feed cmd itself a
+		// fresh REV, then re-derive — cmd's mlkem_sk + x25519 are still valid, so decap of
+		// a tampered ct yields a DIFFERENT ML-KEM shared (implicit rejection) + the
+		// transcript bind sees the tampered ct -> a divergent key.
+		uint8_t tampered[KX_STREAM_BUFSZ]; memcpy(tampered, rev_saved, rev_len);
+		tampered[KX_STREAM_HDR + X25519_KEY_SIZE + 10] ^= 0x40;   // flip a ct byte
+		cmd.kx_chunk_state_reset();               // reset only the stream RX reassembly
+		cmd.cipher_suite.set_kx_phase(KX_MLKEM_PK_SENT);
+		cmd.kx_reverse_consumed = false;
+		int off = 0; bool frag_ok = true;
+		while(off < rev_len){ int n = (rev_len - off < 91) ? (rev_len - off) : 91;
+			if(cmd.kx_ingest(tampered + off, n) < 0) frag_ok = false; off += n; }
+		check(frag_ok && cmd.kx_stream_rx_done_kind == KX_STREAM_REV, "tampered reverse ct reassembled (transport is content-agnostic)");
+		check(cmd.kx_on_reverse_complete() == 0, "CMD decapsulated the tampered ct (ML-KEM implicit rejection never errors)");
+		uint8_t key_bad[SESSION_KEY_SIZE], tag_bad[8];
+		cmd.cipher_suite.copy_session_key_for_test(key_bad);
+		cmd.cipher_suite.compute_key_confirmation(tag_bad);
+		check(memcmp(key_bad, key_rsp, SESSION_KEY_SIZE) != 0, "tampered ct -> DIVERGENT session key (transcript bind)");
+		check(memcmp(tag_bad, tag_rsp, 8) != 0, "tampered ct -> confirm-tag MISMATCH (KEY_ACTIVATE REFUSE, fail-secure)");
+	}
+
+	printf("[TEST-KX-ROUNDTRIP] %s (failures=%d)\n", failures ? "FAIL" : "ALL PASS", failures);
+	fflush(stdout);
+	return failures;
+}
+
 // KX-AS-DATA RX ROUTING fire proof (data-flow-hybrid-kex.md §2.3). Drives the REAL
 // copy_data_to_buffer() delivery funnel — the SAME production path the RSP data
 // receiver runs — with a forward KX stream staged across messages_rx[] ACKED slots
@@ -8706,7 +8959,11 @@ int cl_arq_controller::test_kx_rx_routing()
 	uint8_t x25519_ref[X25519_KEY_SIZE];
 	for(int i=0;i<X25519_KEY_SIZE;i++) x25519_ref[i] = (uint8_t)(0x5A + i);
 	uint8_t pk_ref[MLKEM_PK_SIZE];
-	for(int i=0;i<MLKEM_PK_SIZE;i++)   pk_ref[i]     = (uint8_t)((i*11 + 5) & 0xFF);
+	// A REAL ML-KEM encaps key (not a synthetic pattern): the completed forward stream
+		// now fires the production RSP forward-consume hook (kx_on_forward_complete ->
+		// encapsulate_mlkem), which REFUSES a bogus key. A real keypair keeps this a
+		// happy-path routing proof (no fail-secure teardown -> no telecom_system deref).
+		{ cl_cipher_suite kg_rr; kg_rr.generate_mlkem_keypair(pk_ref); }
 	int fwd_payload = X25519_KEY_SIZE + MLKEM_PK_SIZE;          // 1216
 	uint8_t stream[KX_STREAM_HDR + X25519_KEY_SIZE + MLKEM_PK_SIZE];
 	stream[0]=(uint8_t)((KX_STREAM_MAGIC>>24)&0xFF); stream[1]=(uint8_t)((KX_STREAM_MAGIC>>16)&0xFF);
@@ -16753,6 +17010,32 @@ void cl_arq_controller::copy_data_to_buffer()
 						messages_rx[i].status=FREE;
 						rsp_gap_abort_teardown("KX-as-data stream integrity: kx_ingest REFUSE");
 						return;   // never deliver KX/plaintext on a refused stream
+					}
+					// Crypto-consume hook on transfer completion (data-flow-hybrid-kex.md §7).
+					// FORWARD stream (RSP receives): encapsulate + derive the hybrid key +
+					// stage the reverse ct for the R1 SWITCH_ROLE reverse transfer. REVERSE
+					// stream (CMD receives): decapsulate + derive the IDENTICAL hybrid key.
+					// kx_stream_rx_done_kind is set by kx_ingest() on the completing byte and
+					// reset to 0 on its next call, so reading it here reflects THIS transfer.
+					// Fail-secure: a crypto/RNG failure tears the link down through the shared
+					// gap-abort contract — 0 plaintext, never a key from bad material.
+					if(kx_stream_rx_done_kind == KX_STREAM_FWD)
+					{
+						if(kx_on_forward_complete() != 0)
+						{
+							messages_rx[i].status=FREE;
+							rsp_gap_abort_teardown("KX-as-data forward-consume crypto failure");
+							return;
+						}
+					}
+					else if(kx_stream_rx_done_kind == KX_STREAM_REV)
+					{
+						if(kx_on_reverse_complete() != 0)
+						{
+							messages_rx[i].status=FREE;
+							rsp_gap_abort_teardown("KX-as-data reverse-consume crypto failure");
+							return;
+						}
 					}
 					messages_rx[i].status=FREE;
 					copied++;

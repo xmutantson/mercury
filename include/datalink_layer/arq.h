@@ -5153,6 +5153,16 @@ public:
   uint8_t kx_stream_rx_kind;     // 0 / KX_STREAM_FWD / KX_STREAM_REV currently reassembling
   bool    kx_stream_rx_is_kx;    // the current RX transfer is the reserved KX stream
   uint8_t kx_stream_peer_x25519[X25519_KEY_SIZE]; // folded classical pubkey from the last completed KX stream
+  // Reverse-ct / activation handshake state (R1 SWITCH_ROLE, data-flow-hybrid-kex.md
+  // §7). kx_role_swap_sent: this peer has queued its ONE KX SWITCH_ROLE handoff (the
+  // CMD after the forward pk is delivered; the RSP after the reverse ct is delivered).
+  // kx_reverse_consumed: this peer (the CMD / keypair holder) decapsulated the reverse
+  // ct — gates KEY_ACTIVATE so the RSP (which only encapsulates) never sends it.
+  // kx_key_activate_sent: the CMD has queued KEY_ACTIVATE once. Cleared in
+  // kx_chunk_state_reset(); env-gated OFF -> never set.
+  bool kx_role_swap_sent;
+  bool kx_reverse_consumed;
+  bool kx_key_activate_sent;
 
   // RX ingest of the reserved KX stream: parse+validate the header on the first
   // bytes, accumulate payload, and on completion hand the pk/ct to the crypto
@@ -5193,6 +5203,30 @@ public:
   // fail-secure, never plaintext. TRANSPORT-ONLY: the pk/pubkey bytes are the identical
   // material the crypto core consumes; only the transport that carries them changed.
   int  kx_stage_forward_stream();
+  // KX-as-data reverse TX stage (data-flow-hybrid-kex.md §7). Assemble the reserved
+  // reverse stream MAGIC | KX_STREAM_REV | total_len(LE) | x25519_pk_rsp(32) |
+  // mlkem_ct(1088) into kx_stream_tx_buf and arm kx_stream_tx_active. The RSP streams
+  // it once it becomes the data-commander via R1 SWITCH_ROLE (the SAME proven
+  // role-agnostic source-switch). kx_mlkem_ct must already hold the encapsulated
+  // ciphertext. Returns 0, or -1 fail-secure (ct not ready) -> caller tears down.
+  int  kx_stage_reverse_stream(const uint8_t* x25519_pk_rsp);
+  // On full FORWARD stream receipt (RSP side): compute the classical shared secret
+  // against the folded CMD pubkey, encapsulate against the CMD's ML-KEM pk, derive the
+  // transcript-bound hybrid key, and stage the reverse ct. Returns 0, or -1 on any
+  // crypto/RNG failure -> caller tears the link down (never plaintext).
+  int  kx_on_forward_complete();
+  // On full REVERSE stream receipt (CMD side): compute the classical shared secret
+  // against the folded RSP pubkey, decapsulate the ML-KEM ct, derive the identical
+  // hybrid key, and mark kx_reverse_consumed (KEY_ACTIVATE fires after the role hands
+  // back). Returns 0, or -1 on any crypto failure -> caller tears the link down.
+  int  kx_on_reverse_complete();
+  // In-process FULL crypto round-trip fire proof (data-flow-hybrid-kex.md §7 / T6):
+  // two controllers drive the REAL production functions kx_stage_forward_stream ->
+  // kx_ingest -> kx_on_forward_complete -> kx_ingest -> kx_on_reverse_complete and
+  // assert BOTH peers derive the IDENTICAL hybrid key + matching confirm tag +
+  // PQ-upgraded, and that a tampered reverse ct diverges the key (confirm mismatch =
+  // KEY_ACTIVATE REFUSE). Returns 0 = pass / N = failure count.
+  int  test_kx_roundtrip_derive();
 
   char psk_hex[129];                  // Pre-shared key (hex string, up to 64 bytes = 128 hex chars)
   bool psk_mismatch_pending;          // Commander detected PSK mismatch, KEY_ACTIVATE sent for responder notification
@@ -5212,6 +5246,7 @@ public:
     kx_stream_tx_len = 0; kx_stream_tx_sent = 0; kx_stream_tx_active = false;
     kx_stream_rx_have = 0; kx_stream_rx_expected = 0;
     kx_stream_rx_kind = 0; kx_stream_rx_is_kx = false; kx_stream_rx_done_kind = 0;
+    kx_role_swap_sent = false; kx_reverse_consumed = false; kx_key_activate_sent = false;
   }
 
   int gear_shift_algorithm;

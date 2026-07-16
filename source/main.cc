@@ -1802,6 +1802,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_kxt;
                 failed += ARQ_kxt.test_kx_tx_stream();
             }
+            // KX-as-data FULL crypto round-trip (data-flow-hybrid-kex.md Â§7 / T6): two
+            // controllers drive the REAL kx_stage_forward_stream -> kx_ingest ->
+            // kx_on_forward_complete -> kx_ingest -> kx_on_reverse_complete path and assert
+            // BOTH peers derive the IDENTICAL hybrid key + matching confirm tag + PQ-upgrade,
+            // and that a tampered reverse ct diverges the key (confirm mismatch = KEY_ACTIVATE
+            // REFUSE). In-process synthetic-fire; the SWITCH_ROLE transport is proven live.
+            {
+                cl_arq_controller ARQ_kxrt;
+                failed += ARQ_kxrt.test_kx_roundtrip_derive();
+            }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
             // pre-data re-ACK pinned the shared frames_to_read=2 across the first

@@ -3939,6 +3939,12 @@ void cl_arq_controller::process_control_responder()
 				rx_stream_emitted_bsi_hw = -1;   // INV-DEDUP: KEY_ACTIVATE re-establishes the session; reset the emit high-water
 				consecutive_auth_failures = 0;
 
+				// KX-as-data (data-flow-hybrid-kex.md Â§3.4/Â§7): re-anchor the Option-W cursors +
+				// de-dup high-water + wire batch_seq_id to a fresh bsi=0 baseline (mirror of the
+				// commander) so this receiver re-adopts the first USER batch at wire bsi 0.
+				// Env-gated OFF -> never called on the legacy pump path.
+				if(kx_as_data_path()) kx_stream_reanchor();
+
 				// Report encryption state on control port
 				{
 					std::string str = "ENCRYPTION CLASSICAL\r";

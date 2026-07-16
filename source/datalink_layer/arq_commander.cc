@@ -7946,6 +7946,12 @@ void cl_arq_controller::process_control_commander()
 			rx_nonce_adopted_once = false;
 			decrypt_delivered_bsi = -1;
 			consecutive_auth_failures = 0;
+			// KX-as-data (data-flow-hybrid-kex.md Â§3.4/Â§7): the KX streams consumed wire
+			// bsi 0..N across the two R1 SWITCH_ROLE swaps; re-anchor the Option-W cursors +
+			// de-dup high-water + wire batch_seq_id to a fresh bsi=0 baseline so the first
+			// USER batch (this peer is now the commander) is byte-identical to a normal
+			// session start. Env-gated OFF -> never called on the legacy pump path.
+			if(kx_as_data_path()) kx_stream_reanchor();
 #ifdef MERCURY_GUI_ENABLED
 			g_gui_state.encryption_active.store(true);
 			g_gui_state.encryption_psk_mismatch.store(false);
@@ -21392,7 +21398,50 @@ void cl_arq_controller::process_buffer_data_commander()
 					cipher_suite.set_kx_phase(KX_MLKEM_PK_SENT);  // KX started; don't re-init
 				}
 				if(!kx_stream_tx_active)
-					return;   // forward stream drained (awaiting reverse ct) -> hold
+				{
+					// The TX stream (forward on the CMD, reverse on the RSP) has drained.
+					// Drive the R1 SWITCH_ROLE reverse-ct + activation handshake (data-flow-
+					// hybrid-kex.md Â§7), but ONLY once the drained stream is FULLY delivered +
+					// ACKed (the exact idle-handoff precondition below at :22053) so we never
+					// hand off / activate with frames still in flight. Three mutually-exclusive
+					// states keyed on kx_phase + kx_reverse_consumed:
+					//   KX_MLKEM_PK_SENT (only the CMD)            -> SWITCH_ROLE (swap #1: RSP streams ct)
+					//   KX_HYBRID_DONE & !consumed (only the RSP)  -> SWITCH_ROLE (swap #2: hand back)
+					//   KX_HYBRID_DONE &  consumed (only the CMD)  -> KEY_ACTIVATE (activate)
+					// The idle-switchrole race is cleared by set_role()'s session_data_frame_sent
+					// reset (arq_common.cc:1669) so neither swap fires an empty handoff.
+					bool kx_tx_idle = (block_under_tx == NO
+					                   && message_batch_counter_tx == 0
+					                   && get_nOccupied_messages() == 0
+					                   && messages_control.status == FREE
+					                   && retransmit_count == 0);
+					if(kx_tx_idle)
+					{
+						int ph = cipher_suite.get_kx_phase();
+						if(ph == KX_MLKEM_PK_SENT && !kx_role_swap_sent)
+						{
+							kx_role_swap_sent = true;
+							printf("[CRYPTO] KX-as-data: forward pk delivered -> SWITCH_ROLE (RSP streams reverse ct)\n");
+							fflush(stdout);
+							add_message_control(SWITCH_ROLE);
+						}
+						else if(ph == KX_HYBRID_DONE && !kx_reverse_consumed && !kx_role_swap_sent)
+						{
+							kx_role_swap_sent = true;
+							printf("[CRYPTO] KX-as-data: reverse ct delivered -> SWITCH_ROLE (hand role back to CMD)\n");
+							fflush(stdout);
+							add_message_control(SWITCH_ROLE);
+						}
+						else if(ph == KX_HYBRID_DONE && kx_reverse_consumed && !kx_key_activate_sent)
+						{
+							kx_key_activate_sent = true;
+							printf("[CRYPTO] KX-as-data: reverse ct decapsulated -> sending KEY_ACTIVATE\n");
+							fflush(stdout);
+							add_message_control(KEY_ACTIVATE);
+						}
+					}
+					return;   // hold (nothing to stream from this side)
+				}
 				// else fall through: the raw-leg source-switch feeds kx_stream_tx_buf.
 			}
 			else
