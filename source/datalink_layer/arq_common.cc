@@ -8439,6 +8439,118 @@ int cl_arq_controller::test_kx_ingest()
 	return failures;
 }
 
+// KX-AS-DATA RX ROUTING fire proof (data-flow-hybrid-kex.md §2.3). Drives the REAL
+// copy_data_to_buffer() delivery funnel — the SAME production path the RSP data
+// receiver runs — with a forward KX stream staged across messages_rx[] ACKED slots
+// while the receiver is in the reserved pre-activation KX epoch (kx_as_data_path()
+// via MERCURY_KX_AS_DATA + encryption negotiated, not yet active). Proves the
+// production routing branch FIRES: the KX bytes reassemble through kx_ingest()
+// BYTE-IDENTICAL, are NEVER pushed to the app FIFO (fifo_buffer_rx untouched), the
+// Option-W absolute byte cursor does NOT advance (rx_stream_delivered stays 0), and
+// no false [RSP-V2-STREAM-SHIFT] positional teardown fires on the stampless KX
+// batch. (The fail-secure REFUSE branch routes kx_ingest()==-1 into
+// rsp_gap_abort_teardown(); its teardown dereferences telecom_system, so it is
+// exercised on the LIVE path only — the -1 itself is proven in test_kx_ingest.
+// This test is happy-path only by construction.) 0 = pass / N = failure count.
+int cl_arq_controller::test_kx_rx_routing()
+{
+	int failures = 0;
+	auto check = [&](bool cond, const char* name){
+		if(!cond){ failures++; printf("[TEST-KX-RXROUTE] FAIL: %s\n", name); }
+		else      { printf("[TEST-KX-RXROUTE] ok: %s\n", name); }
+		fflush(stdout);
+	};
+
+	// --- Controller setup (mirror test_rxfifo_backpressure_hold §0) ---
+	this->nMessages          = 120;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	if(init_messages_buffers() != SUCCESSFUL){
+		printf("[TEST-KX-RXROUTE] ERROR: init_messages_buffers() failed\n");
+		fflush(stdout); return 1;
+	}
+	this->compression_enabled   = false;
+	this->sack_v2_enabled       = true;
+	this->sack_enabled          = true;
+	this->current_configuration = 0;
+	this->original_role = COMMANDER;    // fifo_push_rx would push to fifo_buffer_rx if reached
+	this->role          = COMMANDER;
+
+	// Enter the KX-as-data pre-activation epoch: env-gate ON + encryption negotiated,
+	// cipher NOT active -> kx_stream_epoch() TRUE. (setenv is undone at the end so no
+	// sibling --test block sees the gate.)
+	setenv("MERCURY_KX_AS_DATA", "1", 1);
+	this->encryption_enabled = true;
+	cipher_suite.set_kx_phase(KX_IDLE);
+	kx_chunk_state_reset();
+	check(kx_stream_epoch(), "receiver is in the KX-as-data pre-activation epoch");
+	check(!cipher_suite.is_active(), "cipher not yet active (pre-activation)");
+
+	// Fresh delivery state so the top-of-funnel guards (INV-DEDUP / seam / Option-W
+	// shift backstop) are inert on this first batch.
+	rx_stream_emitted_bsi_hw     = -1;
+	rx_stream_delivered          = 0;
+	rsp_cross_session_seam_armed = false;
+	for(int s=0;s<256;s++) rx_stream_stamp[s].valid = false;
+	decrypt_delivered_bsi = 0;
+
+	// --- Build the forward KX stream MAGIC|FWD|len | x25519(32) | mlkem_pk(1184) ---
+	uint8_t x25519_ref[X25519_KEY_SIZE];
+	for(int i=0;i<X25519_KEY_SIZE;i++) x25519_ref[i] = (uint8_t)(0x5A + i);
+	uint8_t pk_ref[MLKEM_PK_SIZE];
+	for(int i=0;i<MLKEM_PK_SIZE;i++)   pk_ref[i]     = (uint8_t)((i*11 + 5) & 0xFF);
+	int fwd_payload = X25519_KEY_SIZE + MLKEM_PK_SIZE;          // 1216
+	uint8_t stream[KX_STREAM_HDR + X25519_KEY_SIZE + MLKEM_PK_SIZE];
+	stream[0]=(uint8_t)((KX_STREAM_MAGIC>>24)&0xFF); stream[1]=(uint8_t)((KX_STREAM_MAGIC>>16)&0xFF);
+	stream[2]=(uint8_t)((KX_STREAM_MAGIC>>8)&0xFF);  stream[3]=(uint8_t)(KX_STREAM_MAGIC&0xFF);
+	stream[4]=KX_STREAM_FWD;
+	stream[5]=(uint8_t)(fwd_payload & 0xFF); stream[6]=(uint8_t)((fwd_payload>>8)&0xFF);   // LE
+	memcpy(stream+KX_STREAM_HDR, x25519_ref, X25519_KEY_SIZE);
+	memcpy(stream+KX_STREAM_HDR+X25519_KEY_SIZE, pk_ref, MLKEM_PK_SIZE);
+	int stream_total = KX_STREAM_HDR + fwd_payload;            // 1223
+
+	// Lay the stream across DBS ACKED messages_rx[] slots (<= max_data_length each) —
+	// exactly how the data plane reassembles a batch, split so the header spans slot 0.
+	const int DBS = 8;
+	this->data_batch_size = DBS;
+	for(int i=0;i<this->nMessages;i++){ messages_rx[i].status=FREE; messages_rx[i].length=0; }
+	int per = (stream_total + DBS - 1) / DBS;                  // ~153; <= 170
+	int off = 0;
+	for(int i=0;i<DBS && off<stream_total;i++){
+		int n = stream_total - off; if(n > per) n = per;
+		memcpy(messages_rx[i].data, stream+off, n);
+		messages_rx[i].length = n;
+		messages_rx[i].status = ACKED;
+		off += n;
+	}
+
+	// App FIFO with room — so if a KX byte LEAKED to the app it would be visible.
+	fifo_buffer_rx.set_size(4096);
+	fifo_buffer_rx.flush();
+	auto occ_rx = [&]() -> int { return fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size(); };
+
+	// --- Drive the REAL delivery funnel ---
+	copy_data_to_buffer();
+
+	check(kx_mlkem_pk_ready, "KX forward stream reassembled via copy_data_to_buffer->kx_ingest");
+	check(kx_mlkem_pk_ready && memcmp(kx_mlkem_pk, pk_ref, MLKEM_PK_SIZE)==0,
+		"reassembled ML-KEM pk is BYTE-IDENTICAL (routed through the real funnel)");
+	check(memcmp(kx_stream_peer_x25519, x25519_ref, X25519_KEY_SIZE)==0,
+		"folded x25519 pubkey BYTE-IDENTICAL");
+	check(occ_rx()==0, "app FIFO UNTOUCHED — KX never delivered to the app (fifo_buffer_rx==0)");
+	check(rx_stream_delivered==0, "Option-W byte cursor NOT advanced by KX bytes (stays 0)");
+	check(this->link_status != DROPPED, "no false teardown on the stampless KX batch");
+
+	// Undo the env gate so no sibling --test block inherits the KX-as-data path.
+	unsetenv("MERCURY_KX_AS_DATA");
+	this->encryption_enabled = false;
+
+	printf("[TEST-KX-RXROUTE] %s (failures=%d)\n", failures? "FAIL":"ALL PASS", failures);
+	fflush(stdout);
+	return failures;
+}
+
 void cl_arq_controller::opt_load_rate_table()
 {
 	// --no-optimizer: skip table load entirely. opt_evaluate_batch_end()
@@ -16406,6 +16518,39 @@ void cl_arq_controller::copy_data_to_buffer()
 		{
 			if(messages_rx[i].status==ACKED)
 			{
+				// KX-AS-DATA RX ROUTING (data-flow-hybrid-kex.md §2.3). While the
+				// receiver is in the reserved pre-activation KX epoch, this batch's
+				// bytes are the KX stream riding the DATA engine (compression is
+				// bypassed on both peers, so a KX batch always lands on THIS raw leg).
+				// Route them to the crypto reassembler kx_ingest(), NEVER the app FIFO
+				// (fifo_push_rx), and do NOT advance the Option-W absolute byte cursor /
+				// stream CRC: KX batches carry no wire stamp and KEY_ACTIVATE re-anchors
+				// the delivery state to a fresh bsi=0, so the first USER batch sees
+				// rx_stream_delivered==0. Fail-secure: a header/kind/length/overflow
+				// inconsistency or a KX byte after activation returns -1 -> tear the link
+				// down through the shared gap-abort contract (never fall through to
+				// plaintext). Gated on kx_stream_epoch() (kx_as_data_path()+pre-active),
+				// which is env-gated OFF by default, so every non-KX session is
+				// byte-identical (this branch is never taken).
+				if(kx_stream_epoch())
+				{
+					int kc = kx_ingest((const uint8_t*)messages_rx[i].data,
+					                   messages_rx[i].length);
+					if(kc < 0)
+					{
+						printf("[CRYPTO] KX-as-data ingest REFUSE (fail-secure): bad "
+							"header/kind/length/overflow or byte-after-activation on bsi=%d "
+							"slot=%d — tearing down, 0 plaintext delivered\n",
+							decrypt_delivered_bsi & 0xFF, i);
+						fflush(stdout);
+						messages_rx[i].status=FREE;
+						rsp_gap_abort_teardown("KX-as-data stream integrity: kx_ingest REFUSE");
+						return;   // never deliver KX/plaintext on a refused stream
+					}
+					messages_rx[i].status=FREE;
+					copied++;
+					continue;   // consumed as KX; no app delivery, no cursor/CRC advance
+				}
 				delivered_transported += messages_rx[i].length;   // Option W (§2.3)
 				// Option W STEP 3 (§8.6): raw leg — fold the delivered transported bytes into the
 				// running RX stream CRC-32, in slot (== stream) order. Identical bytes+order to the

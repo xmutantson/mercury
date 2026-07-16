@@ -2171,6 +2171,12 @@ public:
   // reassembles a fragmented forward/reverse stream BYTE-IDENTICAL + the fail-secure
   // REFUSE fires on bad magic/kind/length and on a post-activation byte.
   int test_kx_ingest();
+  // KX-as-data RX ROUTING fire proof (data-flow-hybrid-kex.md §2.3): drives the REAL
+  // copy_data_to_buffer() delivery funnel with a forward KX stream staged across ACKED
+  // messages_rx[] slots in the pre-activation KX epoch, and proves the production
+  // routing branch reassembles via kx_ingest(), never delivers to the app FIFO, does
+  // not advance the Option-W cursor, and raises no false stream-shift teardown.
+  int test_kx_rx_routing();
 
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,

@@ -1782,6 +1782,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_kxi;
                 failed += ARQ_kxi.test_kx_ingest();
             }
+            // KX-as-data RX ROUTING (data-flow-hybrid-kex.md §2.3): drive the REAL
+            // copy_data_to_buffer() delivery funnel with a forward KX stream staged
+            // across ACKED messages_rx[] slots in the pre-activation KX epoch and
+            // assert the production routing branch reassembles via kx_ingest, never
+            // reaches the app FIFO, does not advance the Option-W cursor, and raises
+            // no false stream-shift teardown. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxr;
+                failed += ARQ_kxr.test_kx_rx_routing();
+            }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
             // pre-data re-ACK pinned the shared frames_to_read=2 across the first
