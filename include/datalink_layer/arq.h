@@ -4802,6 +4802,8 @@ public:
   // MERCURY_DUTY_PALT_DEFEAT / master defeat): FALSE -> incumbent full climb batch.
   // PURE in-process synthetic-fire — permanent regression gate.
   int test_climb_confirm_batch();
+  int test_connect_fuse();
+  void apply_connect_seed_cross(int seed_cfg);
 
   // KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
   // data-decoupled intra-tier climb confirm (inband_retag_confirm_from_base_pattern).
@@ -5274,6 +5276,14 @@ public:
   // env-latched in the ctor (MERCURY_DUTY_PALT_DEFEAT / master MERCURY_DUTY_FASTSTART_DEFEAT).
   // When OFF (default) the confirm batch is capped small while climbing a non-top OFDM rung.
   bool duty_palt_defeat;
+  // CONNECT-SEED FUSION (climb-duty, connect floor) - fold the connect-evidenced seed
+  // (DUTY-R robust exit) into the SWITCH_BANDWIDTH frame so the RSP loads it on the WB
+  // switch and the CMD on the ACK, collapsing the separate ~10 s robust SET_CONFIG cross.
+  // Ships DEFAULT-ON. MERCURY_CONNECT_FUSE_DEFEAT=1 (or master MERCURY_DUTY_FASTSTART_DEFEAT=1)
+  // restores the two-frame cross so the fire-proof runs FIX vs DEFEAT on ONE binary.
+  bool connect_fuse_defeat;
+  int connect_fuse_seed_tx;   // CMD: seed embedded in the SWITCH_BANDWIDTH we sent (CONFIG_NONE=none)
+  int connect_fuse_seed_rx;   // RSP: seed carried by the SWITCH_BANDWIDTH we received (CONFIG_NONE=none)
   // R (DUTY fast-start) — the CONNECT-EVIDENCED robust exit target. The completed MFSK
   // CONNECT handshake decoded the robust tier end-to-end — the SAME confirmation the
   // incumbent otherwise spends ~38 s of robust DATA airtime to earn before the C1
@@ -5287,6 +5297,21 @@ public:
   // disables the re-probe) — and it removes NO CONFIG_0 evidence, because the incumbent's
   // robust dwell proves only ROBUST_0, not CONFIG_0. Pure: production (the connect-seed
   // hook) and the directed test drive the SAME logic.
+  // CONNECT-SEED FUSION gate + pure seed selector. connect_fuse_active(): the fusion is
+  // live unless defeated. connect_fuse_seed_select(connect_seed): the seed the
+  // SWITCH_BANDWIDTH carries - the max (by ladder index) of the caller's connect_seed and
+  // the connect-evidenced robust exit target. CONFIG_NONE when defeated or no seed applies.
+  // Pure: production (the WB-upgrade queue) and the directed test drive the SAME logic.
+  bool connect_fuse_active() const { return !connect_fuse_defeat; }
+  int connect_fuse_seed_select(int connect_seed) const {
+    if(!connect_fuse_active()) return CONFIG_NONE;
+    int fs = connect_seed;
+    int rce = robust_connect_exit_target();
+    if(rce != CONFIG_NONE &&
+       (fs == CONFIG_NONE || config_ladder_index(rce) > config_ladder_index(fs)))
+      fs = rce;
+    return fs;
+  }
   int robust_connect_exit_target() const {
     if(duty_r_defeat) return CONFIG_NONE;
     if(!is_robust_config(current_configuration)) return CONFIG_NONE;

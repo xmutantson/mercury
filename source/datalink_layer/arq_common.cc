@@ -635,6 +635,14 @@ cl_arq_controller::cl_arq_controller()
 		// on ONE binary. Env-latched ONCE here (production path) like the R knob above.
 		const char* dp = std::getenv("MERCURY_DUTY_PALT_DEFEAT");
 		duty_palt_defeat = duty_master_defeat || (dp && *dp && atoi(dp) != 0);
+		// CONNECT-SEED FUSION (climb-duty, connect floor) - ships DEFAULT-ON.
+		// MERCURY_CONNECT_FUSE_DEFEAT=1 (or master MERCURY_DUTY_FASTSTART_DEFEAT=1) restores the
+		// two-frame SWITCH_BANDWIDTH+SET_CONFIG cross so the fire-proof runs FIX vs DEFEAT on ONE
+		// binary. Env-latched ONCE here (production path) like the R / P-alt knobs above.
+		const char* cf = std::getenv("MERCURY_CONNECT_FUSE_DEFEAT");
+		connect_fuse_defeat = duty_master_defeat || (cf && *cf && atoi(cf) != 0);
+		connect_fuse_seed_tx = CONFIG_NONE;
+		connect_fuse_seed_rx = CONFIG_NONE;
 	}
 	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
 	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at

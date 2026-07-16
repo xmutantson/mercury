@@ -1681,6 +1681,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_pa;
                 failed += test_pa.test_climb_confirm_batch();
             }
+            // CONNECT-SEED FUSION (climb-duty, connect floor) - the connect-evidenced seed
+            // is folded into the SWITCH_BANDWIDTH frame so the RSP loads it on the WB switch
+            // and the CMD on the ACK, collapsing the separate robust SET_CONFIG cross. Drives
+            // the REAL selector connect_fuse_seed_select(). PASS-AFTER carries CONFIG_0;
+            // FAIL-BEFORE (connect_fuse_defeat / MERCURY_CONNECT_FUSE_DEFEAT) CONFIG_NONE.
+            {
+                cl_arq_controller test_cf;
+                failed += test_cf.test_connect_fuse();
+            }
             // CLIMB-UP cmd_batch_seq_id ROLLBACK regression
             // (data-flow-inband-frame0-rolling-partial.md §13): the SYMMETRY GAP to the demote
             // rollback — the climb-UP SET_CONFIG emits (FRAME-UP, optimizer, turbo settle)

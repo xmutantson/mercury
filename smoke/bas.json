@@ -1,0 +1,499 @@
+{
+ "n": 1,
+ "arm": "legacy",
+ "arm_name": "all_off",
+ "arm_spec": {
+  "ack_slot": false,
+  "compact_confirm": false,
+  "harq_chase": false,
+  "inband_rate": false,
+  "reverse_pin": false,
+  "tinterp_seed": false
+ },
+ "arm_env_injected": [],
+ "arm_lever_warnings": [],
+ "arm_inert_levers": [],
+ "bin_lever_probe": {
+  "ack_slot": false,
+  "compact_confirm": null,
+  "harq_chase": false,
+  "inband_rate": true,
+  "reverse_pin": false,
+  "tinterp_seed": true
+ },
+ "encrypt": null,
+ "cohort_wall_secs": 289.0,
+ "passthrough": false,
+ "cell": "WGN:40",
+ "traffic": "random-binary",
+ "snr3k": 42.4,
+ "start_cfg": 100,
+ "mode": "wb",
+ "n_connected": 1,
+ "n_delivered_any": 1,
+ "n_delivered_full": 0,
+ "all_connected": true,
+ "n_valid": 1,
+ "byte_integrity": {
+  "all_ok": true,
+  "n_ok": 1,
+  "n_fail": 0,
+  "failed_tags": [],
+  "total_bad_bytes": 0
+ },
+ "uniqueness": {
+  "all_ok": true,
+  "n_ok": 1,
+  "n_fail": 0,
+  "failed_tags": []
+ },
+ "void_tags": [],
+ "INTEGRITY_FAILURES": null,
+ "UNIQUENESS_FAILURES": null,
+ "anatomy_median_spread": {
+  "listen_guard_ms_total": {
+   "median": 77169,
+   "min": 77169,
+   "max": 77169,
+   "n": 1
+  },
+  "listen_guard_ms_mean": {
+   "median": 4539.4,
+   "min": 4539.4,
+   "max": 4539.4,
+   "n": 1
+  },
+  "retx_rounds": {
+   "median": 0,
+   "min": 0,
+   "max": 0,
+   "n": 1
+  },
+  "retx_frames_requeued": {
+   "median": 0,
+   "min": 0,
+   "max": 0,
+   "n": 1
+  },
+  "real_demotes": {
+   "median": 0,
+   "min": 0,
+   "max": 0,
+   "n": 1
+  },
+  "break_events": {
+   "median": 0,
+   "min": 0,
+   "max": 0,
+   "n": 1
+  },
+  "set_config_events": {
+   "median": 3,
+   "min": 3,
+   "max": 3,
+   "n": 1
+  },
+  "rx_timeout_events": {
+   "median": 0,
+   "min": 0,
+   "max": 0,
+   "n": 1
+  },
+  "inband_tag_events": {
+   "median": 0,
+   "min": 0,
+   "max": 0,
+   "n": 1
+  },
+  "active_fraction_CADENCE_NOT_DUTY": {
+   "median": 0.1,
+   "min": 0.1,
+   "max": 0.1,
+   "n": 1
+  },
+  "delivered_user_Bmin": {
+   "median": 11466.0,
+   "min": 11466.0,
+   "max": 11466.0,
+   "n": 1
+  },
+  "user_content_Bmin": {
+   "median": 11466.0,
+   "min": 11466.0,
+   "max": 11466.0,
+   "n": 1
+  },
+  "true_wire_keyed_Bmin": {
+   "median": 11889.9,
+   "min": 11889.9,
+   "max": 11889.9,
+   "n": 1
+  }
+ },
+ "anatomy_mean_std": {
+  "listen_guard_ms_total": {
+   "mean": 77169,
+   "std": 0.0,
+   "min": 77169,
+   "max": 77169,
+   "median": 77169,
+   "n": 1
+  },
+  "listen_guard_ms_mean": {
+   "mean": 4539.4,
+   "std": 0.0,
+   "min": 4539.4,
+   "max": 4539.4,
+   "median": 4539.4,
+   "n": 1
+  },
+  "retx_rounds": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0,
+   "n": 1
+  },
+  "retx_frames_requeued": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0,
+   "n": 1
+  },
+  "real_demotes": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0,
+   "n": 1
+  },
+  "break_events": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0,
+   "n": 1
+  },
+  "set_config_events": {
+   "mean": 3,
+   "std": 0.0,
+   "min": 3,
+   "max": 3,
+   "median": 3,
+   "n": 1
+  },
+  "rx_timeout_events": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0,
+   "n": 1
+  },
+  "inband_tag_events": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0,
+   "n": 1
+  },
+  "active_fraction_CADENCE_NOT_DUTY": {
+   "mean": 0.08,
+   "std": 0.0,
+   "min": 0.08,
+   "max": 0.08,
+   "median": 0.08,
+   "n": 1
+  },
+  "delivered_user_Bmin": {
+   "mean": 11466.0,
+   "std": 0.0,
+   "min": 11466.0,
+   "max": 11466.0,
+   "median": 11466.0,
+   "n": 1
+  },
+  "user_content_Bmin": {
+   "mean": 11466.0,
+   "std": 0.0,
+   "min": 11466.0,
+   "max": 11466.0,
+   "median": 11466.0,
+   "n": 1
+  },
+  "true_wire_keyed_Bmin": {
+   "mean": 11889.9,
+   "std": 0.0,
+   "min": 11889.9,
+   "max": 11889.9,
+   "median": 11889.9,
+   "n": 1
+  }
+ },
+ "bimodal": {
+  "af_threshold": 0.5,
+  "n_classified": 1,
+  "n_fast": 0,
+  "n_slow": 1,
+  "p_fast": 0.0,
+  "fast": {
+   "delivered_user_Bmin": null,
+   "active_fraction": null
+  },
+  "slow": {
+   "delivered_user_Bmin": {
+    "mean": 11466.0,
+    "std": 0.0,
+    "min": 11466.0,
+    "max": 11466.0,
+    "median": 11466.0,
+    "n": 1
+   },
+   "active_fraction": {
+    "mean": 0.08,
+    "std": 0.0,
+    "min": 0.08,
+    "max": 0.08,
+    "median": 0.08,
+    "n": 1
+   }
+  },
+  "active_fraction_all": [
+   0.077
+  ]
+ },
+ "engagement_total": {
+  "superack_leaps_landed": 0,
+  "compact_confirm_ok": 0,
+  "compact_confirm_fail": 0,
+  "harq_attempted": 0,
+  "harq_succeeded": 0,
+  "ack_slot_hit": 0,
+  "ack_slot_clip": 0,
+  "tinterp_activations": 0
+ },
+ "engagement_cells_fired": {
+  "superack_leaps_landed": 0,
+  "compact_confirm_ok": 0,
+  "compact_confirm_fail": 0,
+  "harq_attempted": 0,
+  "harq_succeeded": 0,
+  "ack_slot_hit": 0,
+  "ack_slot_clip": 0,
+  "tinterp_activations": 0
+ },
+ "n_engage_emitted": 0,
+ "traffic_compressible": false,
+ "vara_bar_Bmin": 46809,
+ "vara_bar_kind": "wire",
+ "corpus_lzhuf_ratio": 1.0,
+ "vara_wire_Bmin": 46809,
+ "vara_client_Bmin": 97864,
+ "cohort_user_Bmin_median": 11466.0,
+ "cohort_user_Bmin_mean": 11466.0,
+ "cohort_vs_vara_median": 0.245,
+ "cohort_vs_vara_mean": 0.245,
+ "cohort_true_wire_Bmin_median": 11889.9,
+ "cohort_true_wire_Bmin_mean": 11889.9,
+ "cohort_true_wire_vs_vara_wire_median": 0.254,
+ "cohort_true_wire_vs_vara_wire_mean": 0.254,
+ "rate_impossible": {
+  "any": false,
+  "n": 0,
+  "tags": []
+ },
+ "IMPOSSIBLE_RATE": null,
+ "config_held_summary": null,
+ "vara_source": "Muething 2025-11-17 Winlink worksheet x LZHUF 2.0907; _research/capstone/setup.json vara_client_bar; MEMORY vara_bar_methodology / reference_vara_benchmark_data",
+ "total_aead_authfails": 0,
+ "total_nonce_reuse": 0,
+ "per_run": [
+  {
+   "tag": "smkbas00",
+   "card": "Loopback_9",
+   "subs": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "seed": 1,
+   "connected": true,
+   "connected_at_s": 68.21,
+   "rx_bytes": 55130,
+   "delivered_full": false,
+   "payload_target": 2000000,
+   "verdict": "OK",
+   "byte_integrity_ok": true,
+   "integrity_mismatch_bytes": 0,
+   "integrity_first_bad_offset": null,
+   "uniqueness_ok": true,
+   "delivered_exceeds_fed": false,
+   "engagement": {
+    "superack_leaps_landed": 0,
+    "compact_confirm_ok": 0,
+    "compact_confirm_fail": 0,
+    "harq_attempted": 0,
+    "harq_succeeded": 0,
+    "ack_slot_hit": 0,
+    "ack_slot_clip": 0,
+    "tinterp_activations": 0
+   },
+   "engage_emitted_by": [],
+   "tx_bytes": 1966080,
+   "climbed_past_robust0": true,
+   "max_config_reached": 100,
+   "max_wb_config_reached": 16,
+   "real_demotes": null,
+   "config_climbs": null,
+   "target_config": null,
+   "config_held": null,
+   "demoted_to": null,
+   "decode_at_target": false,
+   "measure_variance": {
+    "measure_variance": {
+     "median": 0.000702,
+     "mean": 0.00077,
+     "last": 0.0007538308,
+     "min": 0.0004408295,
+     "max": 0.00333592,
+     "n": 382
+    },
+    "recovered_snr_db": {
+     "median": 31.2,
+     "mean": 35.644444,
+     "last": 25.0,
+     "min": 25.0,
+     "max": 60.0,
+     "n": 9
+    },
+    "source": "nv"
+   },
+   "anatomy": {
+    "ptt_duty": 0.664,
+    "ptt_duty_steady": 0.744,
+    "ptt_fwd_airtime_s": 191.6,
+    "ptt_n_tx_bursts": 23,
+    "ptt_duty_msgtx": 0.025,
+    "ptt_rev_ack_sends": 3,
+    "ptt_configs_tx": [
+     0,
+     13,
+     16,
+     100
+    ],
+    "ack_arrival_ms": {
+     "median": 1104.5,
+     "mean": 1124.4,
+     "p10": 1048.5,
+     "p90": 1192.5,
+     "min": 1029,
+     "max": 1256,
+     "n": 16
+    },
+    "ack_arrival_median_ms": 1104.5,
+    "ack_arrival_p90_ms": 1192.5,
+    "ack_arrival_n": 16,
+    "ack_arrivals_sorted_ms": [
+     1029,
+     1031,
+     1066,
+     1090,
+     1092,
+     1095,
+     1097,
+     1099,
+     1110,
+     1142,
+     1146,
+     1168,
+     1185,
+     1192,
+     1193,
+     1256
+    ],
+    "listen_guard_ms_actual_mean": 1124.4,
+    "listen_guard_ms_actual_median": 1104.5,
+    "real_reverse_ack_misses": 0,
+    "listen_guard_ms_budget_mean": 4539.4,
+    "listen_guard_ms_total": 77169,
+    "listen_guard_ms_mean": 4539.4,
+    "listen_guard_events": 17,
+    "listen_guard_ms_est_from_idle": 192927,
+    "listen_guard_frac_est": 0.923,
+    "retx_rounds": 0,
+    "retx_frames_requeued": 0,
+    "real_demotes": 0,
+    "config_climbs": 2,
+    "robust_drops": 0,
+    "demote_events_UNRELIABLE": 0,
+    "lossless_rolls": 0,
+    "break_events": 0,
+    "break_any": 0,
+    "set_config_events": 3,
+    "rx_timeout_events": 0,
+    "rsp_rx_timeout_events": 40,
+    "rx_timeout_budget_lines_BROKEN": 17,
+    "inband_tag_events": 0,
+    "inband_nobreak_events": 0,
+    "datalink_eff_delivered": null,
+    "datalink_eff_steady": null,
+    "eff_net_bps": null,
+    "active_fraction_BROKEN": 0.077,
+    "active_fraction_CADENCE_NOT_DUTY": 0.077,
+    "active_polls": 16,
+    "total_polls": 209,
+    "in_burst_wire_bps": 27562.1,
+    "num_batch_deliveries": 16,
+    "delivered_user_Bmin": 11466.0,
+    "user_content_Bmin": 11466.0,
+    "true_wire_keyed_Bmin": 11889.9,
+    "keyed_wire_bytes": 57167.9,
+    "keyed_wire_by_config": {
+     "0": 136.6,
+     "13": 3179.8,
+     "16": 53851.5
+    },
+    "wire_cap_Bmin": 28674.9,
+    "rate_impossible": false,
+    "wire_Bmin": 11466.0,
+    "geometry_is_stock": true,
+    "net_bps_geometry_blind": false,
+    "runtime_ngi": [
+     36
+    ],
+    "se_env_injected": false,
+    "bytes_per_fwd_airtime": 287.73
+   },
+   "snr3k": 42.4,
+   "vara_client_Bmin": 97864,
+   "delivered_user_Bmin": 11466.0,
+   "true_wire_keyed_Bmin": 11889.9,
+   "wire_cap_Bmin": 28674.9,
+   "rate_impossible": false,
+   "vs_vara": 0.245,
+   "vs_vara_wire": 0.254,
+   "arm_inert_levers": [],
+   "encrypt": null,
+   "enc_activated": false,
+   "aead_authfails": 0,
+   "nonce_enc_count": 0,
+   "nonce_reuse_count": 0,
+   "dec_ok_count": 0,
+   "rsp_nreceived_frames": 378,
+   "configs_seen": [
+    0,
+    13,
+    16,
+    100
+   ],
+   "wall_secs": 288.5
+  }
+ ]
+}

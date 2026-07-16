@@ -1,0 +1,681 @@
+{
+ "n": 2,
+ "arm": "legacy",
+ "arm_name": "all_off",
+ "arm_spec": {
+  "ack_slot": false,
+  "compact_confirm": false,
+  "harq_chase": false,
+  "inband_rate": false,
+  "reverse_pin": false,
+  "tinterp_seed": false
+ },
+ "arm_env_injected": [],
+ "arm_lever_warnings": [],
+ "arm_inert_levers": [],
+ "bin_lever_probe": {
+  "ack_slot": false,
+  "compact_confirm": null,
+  "harq_chase": false,
+  "inband_rate": true,
+  "reverse_pin": false,
+  "tinterp_seed": true
+ },
+ "encrypt": null,
+ "cohort_wall_secs": 278.0,
+ "passthrough": false,
+ "cell": "WGN:40",
+ "traffic": "random-binary",
+ "snr3k": 42.4,
+ "start_cfg": 100,
+ "mode": "wb",
+ "n_connected": 2,
+ "n_delivered_any": 2,
+ "n_delivered_full": 0,
+ "all_connected": true,
+ "n_valid": 2,
+ "byte_integrity": {
+  "all_ok": true,
+  "n_ok": 2,
+  "n_fail": 0,
+  "failed_tags": [],
+  "total_bad_bytes": 0
+ },
+ "uniqueness": {
+  "all_ok": true,
+  "n_ok": 2,
+  "n_fail": 0,
+  "failed_tags": []
+ },
+ "void_tags": [],
+ "INTEGRITY_FAILURES": null,
+ "UNIQUENESS_FAILURES": null,
+ "anatomy_median_spread": {
+  "listen_guard_ms_total": {
+   "median": 77169.0,
+   "min": 77169,
+   "max": 77169,
+   "n": 2
+  },
+  "listen_guard_ms_mean": {
+   "median": 4539.4,
+   "min": 4539.4,
+   "max": 4539.4,
+   "n": 2
+  },
+  "retx_rounds": {
+   "median": 0.0,
+   "min": 0,
+   "max": 0,
+   "n": 2
+  },
+  "retx_frames_requeued": {
+   "median": 0.0,
+   "min": 0,
+   "max": 0,
+   "n": 2
+  },
+  "real_demotes": {
+   "median": 0.0,
+   "min": 0,
+   "max": 0,
+   "n": 2
+  },
+  "break_events": {
+   "median": 0.0,
+   "min": 0,
+   "max": 0,
+   "n": 2
+  },
+  "set_config_events": {
+   "median": 2.0,
+   "min": 2,
+   "max": 2,
+   "n": 2
+  },
+  "rx_timeout_events": {
+   "median": 0.0,
+   "min": 0,
+   "max": 0,
+   "n": 2
+  },
+  "inband_tag_events": {
+   "median": 0.0,
+   "min": 0,
+   "max": 0,
+   "n": 2
+  },
+  "active_fraction_CADENCE_NOT_DUTY": {
+   "median": 0.1,
+   "min": 0.1,
+   "max": 0.1,
+   "n": 2
+  },
+  "delivered_user_Bmin": {
+   "median": 11922.9,
+   "min": 11922.0,
+   "max": 11923.7,
+   "n": 2
+  },
+  "user_content_Bmin": {
+   "median": 11922.9,
+   "min": 11922.0,
+   "max": 11923.7,
+   "n": 2
+  },
+  "true_wire_keyed_Bmin": {
+   "median": 12353.0,
+   "min": 12348.8,
+   "max": 12357.3,
+   "n": 2
+  }
+ },
+ "anatomy_mean_std": {
+  "listen_guard_ms_total": {
+   "mean": 77169,
+   "std": 0.0,
+   "min": 77169,
+   "max": 77169,
+   "median": 77169.0,
+   "n": 2
+  },
+  "listen_guard_ms_mean": {
+   "mean": 4539.4,
+   "std": 0.0,
+   "min": 4539.4,
+   "max": 4539.4,
+   "median": 4539.4,
+   "n": 2
+  },
+  "retx_rounds": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0.0,
+   "n": 2
+  },
+  "retx_frames_requeued": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0.0,
+   "n": 2
+  },
+  "real_demotes": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0.0,
+   "n": 2
+  },
+  "break_events": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0.0,
+   "n": 2
+  },
+  "set_config_events": {
+   "mean": 2,
+   "std": 0.0,
+   "min": 2,
+   "max": 2,
+   "median": 2.0,
+   "n": 2
+  },
+  "rx_timeout_events": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0.0,
+   "n": 2
+  },
+  "inband_tag_events": {
+   "mean": 0,
+   "std": 0.0,
+   "min": 0,
+   "max": 0,
+   "median": 0.0,
+   "n": 2
+  },
+  "active_fraction_CADENCE_NOT_DUTY": {
+   "mean": 0.08,
+   "std": 0.0,
+   "min": 0.08,
+   "max": 0.08,
+   "median": 0.08,
+   "n": 2
+  },
+  "delivered_user_Bmin": {
+   "mean": 11922.85,
+   "std": 1.2,
+   "min": 11922.0,
+   "max": 11923.7,
+   "median": 11922.85,
+   "n": 2
+  },
+  "user_content_Bmin": {
+   "mean": 11922.85,
+   "std": 1.2,
+   "min": 11922.0,
+   "max": 11923.7,
+   "median": 11922.85,
+   "n": 2
+  },
+  "true_wire_keyed_Bmin": {
+   "mean": 12353.05,
+   "std": 6.01,
+   "min": 12348.8,
+   "max": 12357.3,
+   "median": 12353.05,
+   "n": 2
+  }
+ },
+ "bimodal": {
+  "af_threshold": 0.5,
+  "n_classified": 2,
+  "n_fast": 0,
+  "n_slow": 2,
+  "p_fast": 0.0,
+  "fast": {
+   "delivered_user_Bmin": null,
+   "active_fraction": null
+  },
+  "slow": {
+   "delivered_user_Bmin": {
+    "mean": 11922.85,
+    "std": 1.2,
+    "min": 11922.0,
+    "max": 11923.7,
+    "median": 11922.85,
+    "n": 2
+   },
+   "active_fraction": {
+    "mean": 0.08,
+    "std": 0.0,
+    "min": 0.08,
+    "max": 0.08,
+    "median": 0.08,
+    "n": 2
+   }
+  },
+  "active_fraction_all": [
+   0.08,
+   0.08
+  ]
+ },
+ "engagement_total": {
+  "superack_leaps_landed": 0,
+  "compact_confirm_ok": 0,
+  "compact_confirm_fail": 0,
+  "harq_attempted": 0,
+  "harq_succeeded": 0,
+  "ack_slot_hit": 0,
+  "ack_slot_clip": 0,
+  "tinterp_activations": 0
+ },
+ "engagement_cells_fired": {
+  "superack_leaps_landed": 0,
+  "compact_confirm_ok": 0,
+  "compact_confirm_fail": 0,
+  "harq_attempted": 0,
+  "harq_succeeded": 0,
+  "ack_slot_hit": 0,
+  "ack_slot_clip": 0,
+  "tinterp_activations": 0
+ },
+ "n_engage_emitted": 0,
+ "traffic_compressible": false,
+ "vara_bar_Bmin": 46809,
+ "vara_bar_kind": "wire",
+ "corpus_lzhuf_ratio": 1.0,
+ "vara_wire_Bmin": 46809,
+ "vara_client_Bmin": 97864,
+ "cohort_user_Bmin_median": 11922.9,
+ "cohort_user_Bmin_mean": 11922.85,
+ "cohort_vs_vara_median": 0.2547,
+ "cohort_vs_vara_mean": 0.2547,
+ "cohort_true_wire_Bmin_median": 12353.0,
+ "cohort_true_wire_Bmin_mean": 12353.05,
+ "cohort_true_wire_vs_vara_wire_median": 0.2639,
+ "cohort_true_wire_vs_vara_wire_mean": 0.2639,
+ "rate_impossible": {
+  "any": false,
+  "n": 0,
+  "tags": []
+ },
+ "IMPOSSIBLE_RATE": null,
+ "config_held_summary": null,
+ "vara_source": "Muething 2025-11-17 Winlink worksheet x LZHUF 2.0907; _research/capstone/setup.json vara_client_bar; MEMORY vara_bar_methodology / reference_vara_benchmark_data",
+ "total_aead_authfails": 0,
+ "total_nonce_reuse": 0,
+ "per_run": [
+  {
+   "tag": "vfix00",
+   "card": "Loopback",
+   "subs": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "seed": 1,
+   "connected": true,
+   "connected_at_s": 66.71,
+   "rx_bytes": 55130,
+   "delivered_full": false,
+   "payload_target": 2000000,
+   "verdict": "OK",
+   "byte_integrity_ok": true,
+   "integrity_mismatch_bytes": 0,
+   "integrity_first_bad_offset": null,
+   "uniqueness_ok": true,
+   "delivered_exceeds_fed": false,
+   "engagement": {
+    "superack_leaps_landed": 0,
+    "compact_confirm_ok": 0,
+    "compact_confirm_fail": 0,
+    "harq_attempted": 0,
+    "harq_succeeded": 0,
+    "ack_slot_hit": 0,
+    "ack_slot_clip": 0,
+    "tinterp_activations": 0
+   },
+   "engage_emitted_by": [],
+   "tx_bytes": 1966080,
+   "climbed_past_robust0": true,
+   "max_config_reached": 100,
+   "max_wb_config_reached": 16,
+   "real_demotes": null,
+   "config_climbs": null,
+   "target_config": null,
+   "config_held": null,
+   "demoted_to": null,
+   "decode_at_target": false,
+   "measure_variance": {
+    "measure_variance": {
+     "median": 0.000422,
+     "mean": 0.000504,
+     "last": 0.0004132752,
+     "min": 0.0002215697,
+     "max": 0.004032096,
+     "n": 383
+    },
+    "recovered_snr_db": {
+     "median": 33.2,
+     "mean": 30.466667,
+     "last": 25.0,
+     "min": 25.0,
+     "max": 33.2,
+     "n": 6
+    },
+    "source": "nv"
+   },
+   "anatomy": {
+    "ptt_duty": 0.659,
+    "ptt_duty_steady": 0.736,
+    "ptt_fwd_airtime_s": 182.7,
+    "ptt_n_tx_bursts": 22,
+    "ptt_duty_msgtx": 0.026,
+    "ptt_rev_ack_sends": 3,
+    "ptt_configs_tx": [
+     0,
+     13,
+     16,
+     100
+    ],
+    "ack_arrival_ms": {
+     "median": 1120.5,
+     "mean": 1129.9,
+     "p10": 1046.0,
+     "p90": 1219.0,
+     "min": 1030,
+     "max": 1264,
+     "n": 16
+    },
+    "ack_arrival_median_ms": 1120.5,
+    "ack_arrival_p90_ms": 1219.0,
+    "ack_arrival_n": 16,
+    "ack_arrivals_sorted_ms": [
+     1030,
+     1044,
+     1048,
+     1059,
+     1067,
+     1083,
+     1108,
+     1113,
+     1128,
+     1156,
+     1173,
+     1182,
+     1185,
+     1186,
+     1252,
+     1264
+    ],
+    "listen_guard_ms_actual_mean": 1129.9,
+    "listen_guard_ms_actual_median": 1120.5,
+    "real_reverse_ack_misses": 0,
+    "listen_guard_ms_budget_mean": 4539.4,
+    "listen_guard_ms_total": 77169,
+    "listen_guard_ms_mean": 4539.4,
+    "listen_guard_events": 17,
+    "listen_guard_ms_est_from_idle": 183099,
+    "listen_guard_frac_est": 0.92,
+    "retx_rounds": 0,
+    "retx_frames_requeued": 0,
+    "real_demotes": 0,
+    "config_climbs": 1,
+    "robust_drops": 0,
+    "demote_events_UNRELIABLE": 0,
+    "lossless_rolls": 0,
+    "break_events": 0,
+    "break_any": 0,
+    "set_config_events": 2,
+    "rx_timeout_events": 0,
+    "rsp_rx_timeout_events": 40,
+    "rx_timeout_budget_lines_BROKEN": 17,
+    "inband_tag_events": 0,
+    "inband_nobreak_events": 0,
+    "datalink_eff_delivered": null,
+    "datalink_eff_steady": null,
+    "eff_net_bps": null,
+    "active_fraction_BROKEN": 0.08,
+    "active_fraction_CADENCE_NOT_DUTY": 0.08,
+    "active_polls": 16,
+    "total_polls": 199,
+    "in_burst_wire_bps": 27562.0,
+    "num_batch_deliveries": 16,
+    "delivered_user_Bmin": 11922.0,
+    "user_content_Bmin": 11922.0,
+    "true_wire_keyed_Bmin": 12357.3,
+    "keyed_wire_bytes": 57143.1,
+    "keyed_wire_by_config": {
+     "0": 136.6,
+     "13": 3188.4,
+     "16": 53818.1
+    },
+    "wire_cap_Bmin": 28674.9,
+    "rate_impossible": false,
+    "wire_Bmin": 11922.0,
+    "geometry_is_stock": true,
+    "net_bps_geometry_blind": false,
+    "runtime_ngi": [
+     36
+    ],
+    "se_env_injected": false,
+    "bytes_per_fwd_airtime": 301.75
+   },
+   "snr3k": 42.4,
+   "vara_client_Bmin": 97864,
+   "delivered_user_Bmin": 11922.0,
+   "true_wire_keyed_Bmin": 12357.3,
+   "wire_cap_Bmin": 28674.9,
+   "rate_impossible": false,
+   "vs_vara": 0.2547,
+   "vs_vara_wire": 0.264,
+   "arm_inert_levers": [],
+   "encrypt": null,
+   "enc_activated": false,
+   "aead_authfails": 0,
+   "nonce_enc_count": 0,
+   "nonce_reuse_count": 0,
+   "dec_ok_count": 0,
+   "rsp_nreceived_frames": 380,
+   "configs_seen": [
+    0,
+    13,
+    16,
+    100
+   ],
+   "wall_secs": 277.5
+  },
+  {
+   "tag": "vfix01",
+   "card": "Loopback",
+   "subs": [
+    4,
+    5,
+    6,
+    7
+   ],
+   "seed": 2,
+   "connected": true,
+   "connected_at_s": 66.71,
+   "rx_bytes": 55130,
+   "delivered_full": false,
+   "payload_target": 2000000,
+   "verdict": "OK",
+   "byte_integrity_ok": true,
+   "integrity_mismatch_bytes": 0,
+   "integrity_first_bad_offset": null,
+   "uniqueness_ok": true,
+   "delivered_exceeds_fed": false,
+   "engagement": {
+    "superack_leaps_landed": 0,
+    "compact_confirm_ok": 0,
+    "compact_confirm_fail": 0,
+    "harq_attempted": 0,
+    "harq_succeeded": 0,
+    "ack_slot_hit": 0,
+    "ack_slot_clip": 0,
+    "tinterp_activations": 0
+   },
+   "engage_emitted_by": [],
+   "tx_bytes": 1964032,
+   "climbed_past_robust0": true,
+   "max_config_reached": 100,
+   "max_wb_config_reached": 16,
+   "real_demotes": null,
+   "config_climbs": null,
+   "target_config": null,
+   "config_held": null,
+   "demoted_to": null,
+   "decode_at_target": false,
+   "measure_variance": {
+    "measure_variance": {
+     "median": 0.000431,
+     "mean": 0.000506,
+     "last": 0.0004748602,
+     "min": 0.0002550381,
+     "max": 0.003073789,
+     "n": 386
+    },
+    "recovered_snr_db": {
+     "median": 33.3,
+     "mean": 30.566667,
+     "last": 25.0,
+     "min": 25.0,
+     "max": 33.4,
+     "n": 6
+    },
+    "source": "nv"
+   },
+   "anatomy": {
+    "ptt_duty": 0.658,
+    "ptt_duty_steady": 0.735,
+    "ptt_fwd_airtime_s": 182.6,
+    "ptt_n_tx_bursts": 22,
+    "ptt_duty_msgtx": 0.026,
+    "ptt_rev_ack_sends": 3,
+    "ptt_configs_tx": [
+     0,
+     13,
+     16,
+     100
+    ],
+    "ack_arrival_ms": {
+     "median": 1107.0,
+     "mean": 1116.4,
+     "p10": 1058.5,
+     "p90": 1182.0,
+     "min": 1031,
+     "max": 1254,
+     "n": 16
+    },
+    "ack_arrival_median_ms": 1107.0,
+    "ack_arrival_p90_ms": 1182.0,
+    "ack_arrival_n": 16,
+    "ack_arrivals_sorted_ms": [
+     1031,
+     1035,
+     1082,
+     1085,
+     1098,
+     1098,
+     1101,
+     1107,
+     1107,
+     1109,
+     1109,
+     1111,
+     1172,
+     1178,
+     1186,
+     1254
+    ],
+    "listen_guard_ms_actual_mean": 1116.4,
+    "listen_guard_ms_actual_median": 1107.0,
+    "real_reverse_ack_misses": 0,
+    "listen_guard_ms_budget_mean": 4539.4,
+    "listen_guard_ms_total": 77169,
+    "listen_guard_ms_mean": 4539.4,
+    "listen_guard_events": 17,
+    "listen_guard_ms_est_from_idle": 183102,
+    "listen_guard_frac_est": 0.92,
+    "retx_rounds": 0,
+    "retx_frames_requeued": 0,
+    "real_demotes": 0,
+    "config_climbs": 1,
+    "robust_drops": 0,
+    "demote_events_UNRELIABLE": 0,
+    "lossless_rolls": 0,
+    "break_events": 0,
+    "break_any": 0,
+    "set_config_events": 2,
+    "rx_timeout_events": 0,
+    "rsp_rx_timeout_events": 40,
+    "rx_timeout_budget_lines_BROKEN": 17,
+    "inband_tag_events": 0,
+    "inband_nobreak_events": 0,
+    "datalink_eff_delivered": null,
+    "datalink_eff_steady": null,
+    "eff_net_bps": null,
+    "active_fraction_BROKEN": 0.08,
+    "active_fraction_CADENCE_NOT_DUTY": 0.08,
+    "active_polls": 16,
+    "total_polls": 199,
+    "in_burst_wire_bps": 27560.9,
+    "num_batch_deliveries": 16,
+    "delivered_user_Bmin": 11923.7,
+    "user_content_Bmin": 11923.7,
+    "true_wire_keyed_Bmin": 12348.8,
+    "keyed_wire_bytes": 57095.3,
+    "keyed_wire_by_config": {
+     "0": 136.6,
+     "13": 3188.4,
+     "16": 53770.3
+    },
+    "wire_cap_Bmin": 28674.9,
+    "rate_impossible": false,
+    "wire_Bmin": 11923.7,
+    "geometry_is_stock": true,
+    "net_bps_geometry_blind": false,
+    "runtime_ngi": [
+     36
+    ],
+    "se_env_injected": false,
+    "bytes_per_fwd_airtime": 301.92
+   },
+   "snr3k": 42.4,
+   "vara_client_Bmin": 97864,
+   "delivered_user_Bmin": 11923.7,
+   "true_wire_keyed_Bmin": 12348.8,
+   "wire_cap_Bmin": 28674.9,
+   "rate_impossible": false,
+   "vs_vara": 0.2547,
+   "vs_vara_wire": 0.2638,
+   "arm_inert_levers": [],
+   "encrypt": null,
+   "enc_activated": false,
+   "aead_authfails": 0,
+   "nonce_enc_count": 0,
+   "nonce_reuse_count": 0,
+   "dec_ok_count": 0,
+   "rsp_nreceived_frames": 382,
+   "configs_seen": [
+    0,
+    13,
+    16,
+    100
+   ],
+   "wall_secs": 277.4
+  }
+ ]
+}

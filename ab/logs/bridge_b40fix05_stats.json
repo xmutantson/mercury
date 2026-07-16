@@ -1,0 +1,23 @@
+{
+  "rev": {
+    "frames": 11964416,
+    "sig_frames": 1267712,
+    "sig_sumsq": 86784.49029214482,
+    "underruns": 0
+  },
+  "fwd": {
+    "frames": 11964416,
+    "sig_frames": 7563264,
+    "sig_sumsq": 156836.34256124886,
+    "underruns": 0
+  },
+  "channel_attestation": {
+    "cell": "WGN:40",
+    "profile": "WGN",
+    "commanded_snr": 40,
+    "realized_snr_offset_db": 2.4,
+    "seed": 6,
+    "passthrough": false,
+    "realized_p_sig": 0.020736595015227403
+  }
+}

@@ -2102,6 +2102,24 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			fflush(stdout);
 			wb_upgrade_pending = false;
 			switch_narrowband_mode(NO);
+			// CONNECT-SEED FUSION: load the seed config carried by the SWITCH_BANDWIDTH frame
+			// now (after the WB switch), collapsing the separate SET_CONFIG cross. Same
+			// load_configuration() + ring setup the SET_CONFIG cross runs; the ftr reset below
+			// then reflects the loaded config geometry.
+			if(connect_fuse_seed_rx != CONFIG_NONE)
+			{
+				data_configuration = connect_fuse_seed_rx;
+				connect_fuse_seed_rx = CONFIG_NONE;
+				if(data_configuration != current_configuration &&
+				   (is_ofdm_config(data_configuration) || is_robust_config(data_configuration)))
+				{
+					load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+					if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
+						inband_finalize_ofdm_adopt_ring(data_configuration);
+					printf("[BW-NEG] FUSE: loaded connect-seed config %d on WB switch (SET_CONFIG cross collapsed)\n", data_configuration);
+					fflush(stdout);
+				}
+			}
 			// After WB config loads, the NB ftr=264 is still active but the
 			// WB buffer is only 223 symbols. The leftover NB ftr causes the
 			// Ring buffer: preamble stays put, no scroll-out. Small margin.
@@ -3898,6 +3916,22 @@ void cl_arq_controller::process_control_responder()
 			{
 				// Accept: standard ACK → deferred WB switch after ACK sent
 				wb_upgrade_pending = true;
+				// CONNECT-SEED FUSION: a length>=3 SWITCH_BANDWIDTH carries a seed config in data[2].
+				// Stage it so the deferred WB switch (after this ACK) loads it directly, collapsing
+				// the separate SET_CONFIG cross. Defeated peers send length 2 -> no seed (BASE).
+				connect_fuse_seed_rx = CONFIG_NONE;
+				// data[2] is buffer-copied on RX regardless of the recovered length field (SET_CONFIG
+				// reads data[2] the same way). A FIX-arm CMD always sets data[2] (seed or 0xFF sentinel).
+				if(!connect_fuse_defeat)
+				{
+					int s_seed = (int)(unsigned char)messages_control.data[2];
+					if(is_ofdm_config(s_seed) || is_robust_config(s_seed))
+					{
+						connect_fuse_seed_rx = s_seed;
+						printf("[BW-NEG] FUSE: SWITCH_BANDWIDTH carries connect-seed config %d\n", s_seed);
+						fflush(stdout);
+					}
+				}
 				connection_status = ACKNOWLEDGING_CONTROL;
 				link_timer.start();
 				watchdog_timer.start();

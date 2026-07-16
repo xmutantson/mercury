@@ -7601,6 +7601,27 @@ void cl_arq_controller::process_control_commander()
 					wb_upgrade_pending = true;
 					cleanup();
 					add_message_control(SWITCH_BANDWIDTH);
+					// CONNECT-SEED FUSION: the connect-evidenced seed is deterministic here, so
+					// embed it in the SWITCH_BANDWIDTH frame (data[2]) - the RSP loads it on the
+					// deferred WB switch and the CMD on the ACK, collapsing the separate robust
+					// SET_CONFIG cross (~10 s at CONFIG_100 WB). Defeated -> length stays 2 (BASE).
+					connect_fuse_seed_tx = CONFIG_NONE;
+					if(connect_fuse_active() && messages_control.status != FREE &&
+					   messages_control.data[0] == SWITCH_BANDWIDTH)
+					{
+						int fs = connect_fuse_seed_select(connect_seed_target());
+						// Always occupy data[2] on the FIX path so the RSP never reads a stale byte: a valid
+						// config = the fused seed; 0xFF = no seed (fall back to the two-frame cross). length=3
+						// matches SET_CONFIG so data[2] is buffer-delivered to the RSP (its length field is not).
+						messages_control.data[2] = (char)(fs != CONFIG_NONE ? fs : 0xFF);
+						messages_control.length = 3;
+						if(fs != CONFIG_NONE)
+						{
+							connect_fuse_seed_tx = fs;
+							printf("[BW-NEG] FUSE: embedding connect-seed config %d in SWITCH_BANDWIDTH (collapse SET_CONFIG cross)\n", fs);
+							fflush(stdout);
+						}
+					}
 					this->connection_status=TRANSMITTING_CONTROL;
 				}
 				// Option B (data-anchored promotion, 2026-05-29): the control-only
@@ -7859,6 +7880,16 @@ void cl_arq_controller::process_control_commander()
 			// (start ROBUST_0, byte-identical) on anything not clearly clean, so the
 			// over-seed guard and weak-channel behaviour are unchanged. The anchor is
 			// NOT raised (speculative, BREAK-recoverable, §10.4 invariant 2).
+			if(connect_fuse_seed_tx != CONFIG_NONE)
+			{
+				// CONNECT-SEED FUSION apply (CMD): the RSP loaded this seed as part of the WB
+				// switch (carried in the SWITCH_BANDWIDTH frame), so apply it here too via the
+				// SAME cross steps - the separate SET_CONFIG frame airtime is eliminated.
+				int seed = connect_fuse_seed_tx;
+				connect_fuse_seed_tx = CONFIG_NONE;
+				apply_connect_seed_cross(seed);
+			}
+			else
 			{
 				int seed_cfg = connect_seed_target();
 				// R (DUTY fast-start, climb-duty): connect-evidenced robust exit. When
@@ -12103,6 +12134,51 @@ int cl_arq_controller::test_connect_snr_seed()
 // dwell does not serialize a clean-batch round-trip per rung. Off-feature / OFDM-tier /
 // at-top -> false (legacy). PURE in-process synthetic-fire — permanent regression gate.
 // Fails-before: -DINBAND_ROBUST_PIPELINE_FAILBEFORE pins the robust-tier branch off.
+void cl_arq_controller::apply_connect_seed_cross(int seed_cfg)
+{
+	// CONNECT-SEED FUSION apply (CMD). Load the seed config the RSP already loaded as part
+	// of the fused SWITCH_BANDWIDTH switch, running the SAME apply steps the SET_CONFIG-ACK
+	// cross runs (gearshift-timer reset, geometry load, control-turnaround guard, per-config
+	// TX re-chunk) MINUS the eliminated SET_CONFIG frame airtime. Mirrors the proven
+	// SET_CONFIG-ACK apply body; the original branch is left untouched.
+	gear_shift_timer.stop();
+	gear_shift_timer.reset();
+	negotiated_configuration = seed_cfg;
+	data_configuration = seed_cfg;
+	if(data_configuration != current_configuration)
+	{
+		messages_control_backup();
+		load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+		messages_control_restore();
+		printf("[GEARSHIFT] FUSED connect-seed loaded config %d (SET_CONFIG cross collapsed)\n", data_configuration);
+		fflush(stdout);
+		// R1-rescope: arm the post-control-turnaround wait so the first data frame does not
+		// key inside the peer's PHY-reinit window (same as the SET_CONFIG cross).
+		arm_control_turnaround_guard();
+		if(phy_reinit_settle_us > 0)
+		{
+			if(arq_sim_inproc_active())
+				pumped_settle_wait(phy_reinit_settle_us / 1000);
+			else
+				usleep(phy_reinit_settle_us);
+		}
+		// Re-fill TX messages for the new config's message sizes (per-config re-chunk).
+		for(int i=0;i<nMessages;i++)
+			messages_tx[i].status=FREE;
+		int data_read_size;
+		for(int i=0;i<get_nTotal_messages();i++)
+		{
+			data_read_size=fifo_buffer_backup.pop(message_TxRx_byte_buffer,max_data_length+max_header_length);
+			if(data_read_size!=0)
+				fifo_buffer_tx.push(message_TxRx_byte_buffer,data_read_size);
+			else
+				break;
+		}
+		fifo_buffer_backup.flush();
+	}
+	this->connection_status=TRANSMITTING_DATA;
+}
+
 int cl_arq_controller::test_robust_connect_exit()
 {
 	// DUTY FAST-START lever R — drives the REAL production predicate
@@ -12158,6 +12234,58 @@ int cl_arq_controller::test_robust_connect_exit()
 
 	printf("[TEST-DUTY-R] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+int cl_arq_controller::test_connect_fuse()
+{
+	// CONNECT-SEED FUSION - drives the REAL pure selector connect_fuse_seed_select() (the
+	// SAME method the WB-upgrade queue calls to embed the seed in SWITCH_BANDWIDTH).
+	// PASS-AFTER (fusion live): at the robust connect floor it returns CONFIG_0 -> the seed
+	// is carried by the switch frame and the separate SET_CONFIG cross is collapsed.
+	// FAIL-BEFORE (connect_fuse_defeat / MERCURY_CONNECT_FUSE_DEFEAT): CONFIG_NONE -> the
+	// two-frame cross is retained (BASE). GUARDS: R defeated / already-OFDM -> CONFIG_NONE.
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-CONNECT-FUSE] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else { printf("[TEST-CONNECT-FUSE] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+	int saved_cfg  = current_configuration;
+	int saved_ceil = supershift_proven_ceiling;
+	bool saved_fd  = connect_fuse_defeat;
+	bool saved_rd  = duty_r_defeat;
+
+	// FAIL-BEFORE: fusion defeated at the robust floor -> NO seed carried (two-frame cross)
+	connect_fuse_defeat = true;  duty_r_defeat = false;
+	current_configuration = ROBUST_0;  supershift_proven_ceiling = -1;
+	int fb = connect_fuse_seed_select(CONFIG_NONE);
+	check(fb == CONFIG_NONE, "FAIL-BEFORE: fusion defeated at ROBUST_0 -> NO seed (SET_CONFIG cross retained)", fb, CONFIG_NONE);
+
+	// PASS-AFTER: fusion live at the robust floor -> carry CONFIG_0 in the switch frame
+	connect_fuse_defeat = false;  duty_r_defeat = false;
+	current_configuration = ROBUST_0;  supershift_proven_ceiling = -1;
+	int pa = connect_fuse_seed_select(CONFIG_NONE);
+	check(pa == CONFIG_0, "PASS-AFTER: fusion live at ROBUST_0 -> carry CONFIG_0 (collapse cross)", pa, CONFIG_0);
+
+	// GUARD: R defeated -> no robust-exit seed even with fusion live -> CONFIG_NONE
+	connect_fuse_defeat = false;  duty_r_defeat = true;
+	current_configuration = ROBUST_0;  supershift_proven_ceiling = -1;
+	int g1 = connect_fuse_seed_select(CONFIG_NONE);
+	check(g1 == CONFIG_NONE, "GUARD R defeated -> no seed to fuse", g1, CONFIG_NONE);
+
+	// GUARD: already OFDM (not robust) -> robust exit NONE -> CONFIG_NONE
+	connect_fuse_defeat = false;  duty_r_defeat = false;
+	current_configuration = CONFIG_0;  supershift_proven_ceiling = -1;
+	int g2 = connect_fuse_seed_select(CONFIG_NONE);
+	check(g2 == CONFIG_NONE, "GUARD already-OFDM (CONFIG_0) -> nothing to fuse", g2, CONFIG_NONE);
+
+	current_configuration     = saved_cfg;
+	supershift_proven_ceiling = saved_ceil;
+	connect_fuse_defeat       = saved_fd;
+	duty_r_defeat             = saved_rd;
+	printf("[TEST-CONNECT-FUSE] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }
