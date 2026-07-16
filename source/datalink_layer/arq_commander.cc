@@ -17292,6 +17292,133 @@ int cl_arq_controller::test_idle_switch_role_race()
 }
 
 // ===========================================================================
+// SWITCH_ROLE re-ride race regression (idle-switchrole-race.md §6; cross-layer
+// data-flow audit of session_data_frame_sent) — the R1 reverse-transfer gate.
+//
+// THE BUG (channel-free, pure ARQ state): the idle SWITCH_ROLE end-of-data
+// handoff is trigger-gated on session_data_frame_sent (Part B) — a Commander
+// must SEND a data frame this stint before it may hand its role away. That flag
+// is reset at construction, in reset_session_state(), and at Commander connect-
+// accept (arq_commander.cc:7313), but was NOT reset on a RESPONDER->COMMANDER
+// role SWAP (SWITCH_ROLE swap-in arq_responder.cc:2122). So a peer that streams
+// as Commander (sdfs=true), hands off, and RE-ACQUIRES the role to receive
+// inherits a STALE-true flag: its empty tx FIFO fires a PREMATURE handoff back
+// to an empty peer -> the connected-but-0-deliver race, on the SECOND ride —
+// exactly the reverse-ct double swap R1 must be safe to ride twice.
+//
+// This test drives the REAL role-acquisition primitive set_role(COMMANDER) (the
+// identical call arq_responder.cc:2122 makes on a SWITCH_ROLE swap-in) with a
+// stale sdfs=true, then the REAL idle branch process_buffer_data_commander().
+// Correct-by-construction fix: set_role(COMMANDER) clears sdfs on the transition,
+// so the re-acquired empty-tx Commander cannot arm the handoff. FAILS-BEFORE with
+// -DSWITCHROLE_RERIDE_FAILBEFORE (the reset is compiled out); PASSES-AFTER in the
+// production build. One-shot, exits rc.
+int cl_arq_controller::test_switch_role_reride_race()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-RERIDE] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else     { printf("[TEST-RERIDE] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Dimensions + buffers (same harness as test_idle_switch_role_race) ---
+	max_data_length   = 6;
+	max_header_length = 6;
+	nMessages         = 32;
+	set_data_batch_size(1);
+	deinit_messages_buffers();                       // idempotent
+	int alloc_rc = init_messages_buffers();          // allocs messages_tx[].data + messages_control.data
+	check(alloc_rc == SUCCESSFUL, "S0 message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+
+	// === Stint-1 aftermath: this peer WAS Commander, SENT data (sdfs=true), then
+	//     handed its role away (SWITCH_ROLE) and is now RESPONDER — the exact
+	//     post-first-swap state of R1's reverse-ct sequence. ===
+	role                    = RESPONDER;
+	original_role           = COMMANDER;             // it was the original data commander
+	session_data_frame_sent = true;                  // STALE from stint 1
+
+	// === The SWITCH_ROLE swap-in: drive the REAL role-acquisition primitive.
+	//     arq_responder.cc:2122 calls exactly set_role(COMMANDER) here. ===
+	set_role(COMMANDER);
+
+	// R1' RE-RIDE RESET: acquiring COMMANDER cleared the stale flag so the
+	// re-acquired Commander re-earns its handoff. FAILS-BEFORE: still true.
+	check(session_data_frame_sent == false,
+		"R1' RE-RIDE RESET: SWITCH_ROLE swap-in clears stale session_data_frame_sent "
+		"(FAILS-BEFORE with -DSWITCHROLE_RERIDE_FAILBEFORE)",
+		session_data_frame_sent ? 1 : 0, 0);
+
+	// === The re-acquired Commander is now idle with an EMPTY tx FIFO. Drive the
+	//     REAL idle branch: with sdfs cleared, the Part-B gate must SUPPRESS the
+	//     premature handoff. ===
+	link_status              = CONNECTED;
+	connection_status        = TRANSMITTING_DATA;    // gates the function body
+	block_under_tx           = NO;                   // gates the idle branch
+	retransmit_count         = 0;
+	message_batch_counter_tx = 0;
+	sack_enabled             = false;
+	sack_v2_enabled          = true;
+	encryption_enabled       = false;                // skip the key-exchange gate
+	compression_enabled      = false;
+	messages_control.status  = FREE;
+
+	int fifo_occupied = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	check(fifo_occupied == 0, "S1 tx FIFO is EMPTY (no data written yet)", fifo_occupied, 0);
+	check(get_nOccupied_messages() == 0, "S2 no DATA frames occupied", get_nOccupied_messages(), 0);
+
+	switch_role_timeout = 0;                          // any elapsed>0 fires if armed
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+
+	process_buffer_data_commander();                 // call1: PRE-FIX arms; POST-FIX gate-suppressed
+	usleep(5000);                                     // let wall-clock pass the (0ms) threshold
+	process_buffer_data_commander();                 // call2: elapsed>0 -> fires iff armed
+
+	int control_code = (messages_control.status != FREE && messages_control.data != NULL)
+	                 ? (int)(unsigned char)messages_control.data[0] : -1;
+	bool reride_fired = (control_code == (int)SWITCH_ROLE);
+	printf("[TEST-RERIDE] after re-ride idle calls: control_code=%d (SWITCH_ROLE=%d) reride_fired=%d\n",
+		control_code, (int)SWITCH_ROLE, reride_fired ? 1 : 0);
+	fflush(stdout);
+	check(!reride_fired,
+		"R1 GATE: re-acquired empty-tx Commander must NOT give its role back "
+		"(FAILS-BEFORE; PASSES-AFTER the swap-in reset)",
+		reride_fired ? 1 : 0, 0);
+
+	// === POSITIVE CONTROL: once the re-acquired Commander actually SENDS its
+	//     reverse stream (sdfs set true, as the batch build does at
+	//     arq_commander.cc:2627), the LEGITIMATE end-of-data handback (the SECOND
+	//     SWITCH_ROLE in R1) STILL fires. Guards against over-suppression. ===
+	messages_control.status = FREE;
+	session_data_frame_sent = true;                  // reverse stream WAS sent
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+	switch_role_timeout = 0;
+	process_buffer_data_commander();                 // call1: arm
+	usleep(5000);
+	process_buffer_data_commander();                 // call2: fire
+	int hb_code = (messages_control.status != FREE && messages_control.data != NULL)
+	            ? (int)(unsigned char)messages_control.data[0] : -1;
+	bool handback_fired = (hb_code == (int)SWITCH_ROLE);
+	printf("[TEST-RERIDE] handback control: code=%d fired=%d (SWITCH_ROLE=%d)\n",
+		hb_code, handback_fired ? 1 : 0, (int)SWITCH_ROLE);
+	fflush(stdout);
+	check(handback_fired,
+		"R1 HANDBACK: after the reverse stream WAS sent, the Commander STILL hands "
+		"back (second SWITCH_ROLE preserved)",
+		handback_fired ? 1 : 0, 1);
+
+	deinit_messages_buffers();
+	printf("[TEST-RERIDE] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
 // BREAK no-progress teardown regression (idle-switchrole-race.md §3/§4 Part C).
 //
 // THE BUG (channel-free, pure ARQ state): the watchdog never disconnects

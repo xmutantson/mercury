@@ -1703,6 +1703,7 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller ARQ_isr;
                 failed += ARQ_isr.test_idle_switch_role_race();
+                failed += ARQ_isr.test_switch_role_reride_race();
                 failed += ARQ_isr.test_break_noprogress_teardown();
             }
             // MIXBATCH FILL OVER-POP -- COMPRESSION LEG regression
@@ -2489,6 +2490,17 @@ int main(int argc, char *argv[])
         // would terminate the process (signal-killed exit) = the fail-before.
         if (strcmp(argv[i], "--test-sigterm-handler") == 0) {
             int failed = test_sigterm_handler();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-switchrole-reride : run ONLY the SWITCH_ROLE re-ride race
+        // regression (idle-switchrole-race.md §6; the R1 reverse-transfer
+        // double-swap gate) and exit. Fast + deterministic; drives the REAL
+        // set_role(COMMANDER) swap-in primitive + the REAL idle branch. FAILS-
+        // BEFORE with -DSWITCHROLE_RERIDE_FAILBEFORE. See
+        // arq_commander.cc::test_switch_role_reride_race().
+        if (strcmp(argv[i], "--test-switchrole-reride") == 0) {
+            cl_arq_controller ARQ_reride;
+            int failed = ARQ_reride.test_switch_role_reride_race();
             return (failed == 0) ? 0 : 1;
         }
         // --test-connect-reack : run ONLY the CONNECT-REACK EXCISE regression

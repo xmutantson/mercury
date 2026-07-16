@@ -2111,6 +2111,12 @@ public:
   // One-shot, exits rc.
   int test_idle_switch_role_race();
 
+  // SWITCH_ROLE re-ride race (idle-switchrole-race.md §6) — a peer re-acquiring
+  // COMMANDER via SWITCH_ROLE must not inherit a stale session_data_frame_sent
+  // from its previous commander stint (the R1 reverse-transfer double-swap gate).
+  // FAILS-BEFORE with -DSWITCHROLE_RERIDE_FAILBEFORE. One-shot, exits rc.
+  int test_switch_role_reride_race();
+
   // IDLE-SWITCHROLE-RACE recovery path (idle-switchrole-race.md §3/§4 Part C).
   // Drives the REAL BREAK-EXHAUSTED re-arm site (arq_commander.cc:~410) on a
   // never-fed Commander (no RX data, empty tx FIFO, zero-byte re-queue) K+1 times.

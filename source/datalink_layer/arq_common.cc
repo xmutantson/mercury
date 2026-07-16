@@ -1647,6 +1647,31 @@ void cl_arq_controller::set_role(int role)
 {
 	if(role==COMMANDER)
 	{
+		// IDLE-SWITCHROLE-RACE re-ride fix (idle-switchrole-race.md §6;
+		// cross-layer data-flow audit of session_data_frame_sent). Acquiring the
+		// COMMANDER role begins a FRESH data stint. The idle SWITCH_ROLE end-of-
+		// data handoff (process_buffer_data_commander idle branch) is trigger-
+		// gated on session_data_frame_sent (Part B) — a Commander must actually
+		// SEND a data frame this stint before it may hand its role away. That flag
+		// is reset at construction, in reset_session_state(), and at Commander
+		// connect-accept (arq_commander.cc:7313) — but a RESPONDER->COMMANDER role
+		// SWAP (SWITCH_ROLE swap-in arq_responder.cc:2122, or a watchdog
+		// resurrection arq_common.cc:6320) starts a new stint WITHOUT any of those
+		// resets, so it could inherit a STALE-true flag from THIS peer's PREVIOUS
+		// commander stint. That is exactly the reverse-transfer double swap (a peer
+		// streams as Commander, hands off, then RE-ACQUIRES the role to receive):
+		// with a stale flag an empty tx FIFO would fire a PREMATURE handoff back to
+		// an empty peer -> the connected-but-0-deliver race, on the SECOND ride.
+		// Clear it on the transition INTO commander so every acquisition (connect,
+		// swap, resume) uniformly re-earns the handoff — correct-by-construction:
+		// the race cannot arm. Scoped to the actual RESPONDER->COMMANDER transition
+		// so a redundant same-role call never clobbers an in-progress stint.
+		if(this->role != COMMANDER)
+		{
+#ifndef SWITCHROLE_RERIDE_FAILBEFORE
+			session_data_frame_sent = false;
+#endif
+		}
 		this->role=COMMANDER;
 	}
 	else
