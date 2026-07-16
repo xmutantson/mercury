@@ -1254,7 +1254,19 @@ void cl_arq_controller::process_messages_commander()
 		// before activation. Env-gated OFF (kx_stream_tx_active never set) -> unchanged.
 		if(encryption_enabled && !cipher_suite.is_active() && !kx_stream_tx_active)
 		{
-			return;
+			// KX-as-data: the source-switch fills the WHOLE forward/reverse stream into
+			// messages_tx[] in ONE pass, clearing kx_stream_tx_active BEFORE the batch is
+			// even sent. Do NOT re-engage the hold while a KX batch is staged / in flight /
+			// awaiting retransmit -> let process_messages_tx_data() drain it to the wire and
+			// collect ACKs (otherwise the staged forward stream never reaches the RSP and
+			// the handshake stalls). During the KX epoch messages_tx[] holds ONLY KX frames
+			// (user data stays in fifo_buffer_tx; process_buffer_data_commander's KX branch
+			// never pops it), so this is safe. Env off -> kx_as_data_path() false -> the hold
+			// is byte-identical.
+			bool kx_batch_in_flight = kx_as_data_path()
+				&& (block_under_tx == YES || get_nOccupied_messages() > 0 || retransmit_count > 0);
+			if(!kx_batch_in_flight)
+				return;
 		}
 
 		// Phase 3c — consume any pending optimizer-recommended config
@@ -8093,8 +8105,13 @@ void cl_arq_controller::process_control_commander()
 			else if (messages_control.data[0]==SWITCH_ROLE)
 			{
 				turbo_switch_role_retries = 0;  // Reset on success
-				// Asymmetric gearshift: swap forward/reverse for the return path
-				if(forward_configuration != CONFIG_NONE && reverse_configuration != CONFIG_NONE)
+				// Asymmetric gearshift: swap forward/reverse for the return path.
+				// KX-as-data: SKIP the swap in the pre-activation epoch — the reverse ct rides
+				// the CURRENT settled config on BOTH peers (the RSP transmits it there too,
+				// arq_responder.cc SWITCH_ROLE KX guard), so a swap here would desync the
+				// receive config from the RSP's transmit config. data-flow-hybrid-kex.md §7.
+				bool kx_epoch_swapback = (encryption_enabled && !cipher_suite.is_active() && kx_as_data_path());
+				if(!kx_epoch_swapback && forward_configuration != CONFIG_NONE && reverse_configuration != CONFIG_NONE)
 				{
 					int tmp = forward_configuration;
 					forward_configuration = reverse_configuration;
@@ -21397,52 +21414,11 @@ void cl_arq_controller::process_buffer_data_commander()
 						return;   // stage (RNG) failure -> hold, fail-secure (no plaintext)
 					cipher_suite.set_kx_phase(KX_MLKEM_PK_SENT);  // KX started; don't re-init
 				}
-				if(!kx_stream_tx_active)
-				{
-					// The TX stream (forward on the CMD, reverse on the RSP) has drained.
-					// Drive the R1 SWITCH_ROLE reverse-ct + activation handshake (data-flow-
-					// hybrid-kex.md Â§7), but ONLY once the drained stream is FULLY delivered +
-					// ACKed (the exact idle-handoff precondition below at :22053) so we never
-					// hand off / activate with frames still in flight. Three mutually-exclusive
-					// states keyed on kx_phase + kx_reverse_consumed:
-					//   KX_MLKEM_PK_SENT (only the CMD)            -> SWITCH_ROLE (swap #1: RSP streams ct)
-					//   KX_HYBRID_DONE & !consumed (only the RSP)  -> SWITCH_ROLE (swap #2: hand back)
-					//   KX_HYBRID_DONE &  consumed (only the CMD)  -> KEY_ACTIVATE (activate)
-					// The idle-switchrole race is cleared by set_role()'s session_data_frame_sent
-					// reset (arq_common.cc:1669) so neither swap fires an empty handoff.
-					bool kx_tx_idle = (block_under_tx == NO
-					                   && message_batch_counter_tx == 0
-					                   && get_nOccupied_messages() == 0
-					                   && messages_control.status == FREE
-					                   && retransmit_count == 0);
-					if(kx_tx_idle)
-					{
-						int ph = cipher_suite.get_kx_phase();
-						if(ph == KX_MLKEM_PK_SENT && !kx_role_swap_sent)
-						{
-							kx_role_swap_sent = true;
-							printf("[CRYPTO] KX-as-data: forward pk delivered -> SWITCH_ROLE (RSP streams reverse ct)\n");
-							fflush(stdout);
-							add_message_control(SWITCH_ROLE);
-						}
-						else if(ph == KX_HYBRID_DONE && !kx_reverse_consumed && !kx_role_swap_sent)
-						{
-							kx_role_swap_sent = true;
-							printf("[CRYPTO] KX-as-data: reverse ct delivered -> SWITCH_ROLE (hand role back to CMD)\n");
-							fflush(stdout);
-							add_message_control(SWITCH_ROLE);
-						}
-						else if(ph == KX_HYBRID_DONE && kx_reverse_consumed && !kx_key_activate_sent)
-						{
-							kx_key_activate_sent = true;
-							printf("[CRYPTO] KX-as-data: reverse ct decapsulated -> sending KEY_ACTIVATE\n");
-							fflush(stdout);
-							add_message_control(KEY_ACTIVATE);
-						}
-					}
-					return;   // hold (nothing to stream from this side)
-				}
-				// else fall through: the raw-leg source-switch feeds kx_stream_tx_buf.
+				// Once the KX stream drains, FALL THROUGH (do NOT return): have_new_tx below
+				// excludes the held user FIFO in the KX epoch, so the fill loop only feeds the
+				// KX stream when active; when it is drained control reaches the normal finalize
+				// branch (clears block_under_tx) and the idle branch (which hosts the R1
+				// SWITCH_ROLE reverse-ct + KEY_ACTIVATE handshake). data-flow-hybrid-kex.md Â§7.
 			}
 			else
 				return;
@@ -21488,7 +21464,14 @@ void cl_arq_controller::process_buffer_data_commander()
 		// KX-as-data: the reserved forward stream lives in kx_stream_tx_buf (not
 		// fifo_buffer_tx), which may be empty during the KX epoch — allow the fill when
 		// the KX stream is active too. Env-gated OFF -> kx_stream_tx_active never set.
-		bool have_new_tx = (fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size())
+		// In the KX-as-data pre-activation epoch the user FIFO is HELD: exclude it here so
+		// the fill loop only ever feeds the KX stream (kx_stream_tx_active) and NEVER pops
+		// user data before activation. Once the stream drains this is false, so control
+		// reaches the finalize/idle branches for the role-swap handshake. Env off / post-
+		// activation: byte-identical (the user-FIFO term is restored).
+		bool kx_hold_user = (encryption_enabled && !cipher_suite.is_active() && kx_as_data_path());
+		bool have_new_tx = ((!kx_hold_user)
+		                    && (fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size()))
 		                   || kx_stream_tx_active;
 		if( have_new_tx && stage_ok)
 		{
@@ -22101,6 +22084,45 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
+			// KX-as-data role-swap / activation handshake (data-flow-hybrid-kex.md §7). The
+			// forward/reverse KX batch is fully delivered + ACKed and nothing is in flight
+			// (this branch's exact precondition), so drive the two R1 SWITCH_ROLE swaps +
+			// KEY_ACTIVATE. Three mutually-exclusive states keyed on kx_phase +
+			// kx_reverse_consumed:
+			//   KX_MLKEM_PK_SENT (only the CMD)            -> SWITCH_ROLE (swap #1: RSP streams ct)
+			//   KX_HYBRID_DONE & !consumed (only the RSP)  -> SWITCH_ROLE (swap #2: hand role back)
+			//   KX_HYBRID_DONE &  consumed (only the CMD)  -> KEY_ACTIVATE (activate)
+			// The idle-switchrole re-ride race is cleared by set_role()'s
+			// session_data_frame_sent reset (arq_common.cc:1669) so neither earned swap fires
+			// an empty handoff; an "awaiting the peer" phase simply holds. Env off ->
+			// kx_as_data_path() false -> the generic handoff below is byte-identical.
+			if(encryption_enabled && !cipher_suite.is_active() && kx_as_data_path())
+			{
+				int ph = cipher_suite.get_kx_phase();
+				if(ph == KX_MLKEM_PK_SENT && !kx_role_swap_sent)
+				{
+					kx_role_swap_sent = true;
+					printf("[CRYPTO] KX-as-data: forward pk delivered -> SWITCH_ROLE (RSP streams reverse ct)\n");
+					fflush(stdout);
+					add_message_control(SWITCH_ROLE);
+				}
+				else if(ph == KX_HYBRID_DONE && !kx_reverse_consumed && !kx_role_swap_sent)
+				{
+					kx_role_swap_sent = true;
+					printf("[CRYPTO] KX-as-data: reverse ct delivered -> SWITCH_ROLE (hand role back to CMD)\n");
+					fflush(stdout);
+					add_message_control(SWITCH_ROLE);
+				}
+				else if(ph == KX_HYBRID_DONE && kx_reverse_consumed && !kx_key_activate_sent)
+				{
+					kx_key_activate_sent = true;
+					printf("[CRYPTO] KX-as-data: reverse ct decapsulated -> sending KEY_ACTIVATE\n");
+					fflush(stdout);
+					add_message_control(KEY_ACTIVATE);
+				}
+			}
+			else
+			{
 			// IDLE-SWITCHROLE-RACE TRIGGER-GATE (Part B, idle-switchrole-race.md
 			// §2/§5.2): only arm/fire the idle SWITCH_ROLE handoff if this session
 			// has actually SENT a data frame. A freshly-connected Commander that
@@ -22128,6 +22150,7 @@ void cl_arq_controller::process_buffer_data_commander()
 					switch_role_timer.reset();
 					add_message_control(SWITCH_ROLE);
 				}
+			}
 			}
 		}
 	}

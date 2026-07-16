@@ -2155,6 +2155,19 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			// the single-thread stepper, it does not alter the live link.
 			ptt_busy_wait(ptt_off_wait, ptt_off_delay_ms);
 
+			// KX-as-data reverse ct: the config already settled during the forward stream,
+			// so stream the staged reverse ct at the CURRENT config immediately and SKIP the
+			// turboshift/gearshift probe below (it consumes the reverse transfer window and
+			// the switch_role_test_timer would force the role back to RESPONDER before the ct
+			// is sent, so the reverse ct never reaches the CMD). The two peers are symmetric
+			// in the KX epoch (no asymmetric config negotiation). Env off / post-activation:
+			// the full turbo path runs unchanged. data-flow-hybrid-kex.md §7.
+			if(encryption_enabled && !cipher_suite.is_active() && kx_as_data_path())
+			{
+				this->connection_status = TRANSMITTING_DATA;
+			}
+			else
+			{
 			bool has_asymmetric = (forward_configuration != CONFIG_NONE &&
 				reverse_configuration != CONFIG_NONE);
 
@@ -2261,6 +2274,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			{
 				switch_role_test_timer.reset();
 				switch_role_test_timer.start();
+			}
 			}
 			last_message_received_type=NONE;
 			last_message_sent_type=NONE;
