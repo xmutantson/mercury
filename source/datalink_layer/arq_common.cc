@@ -629,6 +629,12 @@ cl_arq_controller::cl_arq_controller()
 		bool duty_master_defeat = (dm && *dm && atoi(dm) != 0);
 		const char* dr = std::getenv("MERCURY_DUTY_R_DEFEAT");
 		duty_r_defeat = duty_master_defeat || (dr && *dr && atoi(dr) != 0);
+		// P-alt (climb-duty) — climb-confirm batch shrink. Ships DEFAULT-ON.
+		// MERCURY_DUTY_PALT_DEFEAT=1 (or the master MERCURY_DUTY_FASTSTART_DEFEAT=1)
+		// restores the incumbent full climb batch so the fire-proof runs FIX vs DEFEAT
+		// on ONE binary. Env-latched ONCE here (production path) like the R knob above.
+		const char* dp = std::getenv("MERCURY_DUTY_PALT_DEFEAT");
+		duty_palt_defeat = duty_master_defeat || (dp && *dp && atoi(dp) != 0);
 	}
 	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
 	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at
@@ -1532,6 +1538,18 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 			target = data_batch_size;
 		else
 			target = (max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
+		// P-alt (DUTY fast-start, climb-duty): while CLIMBING a non-top OFDM rung, cap the
+		// confirm batch to CLIMB_CONFIRM_BATCH HERE at the SOLE setter (mirrors the robust
+		// batch=1 clamp above), so EVERY producer is caught — load_configuration's per-config
+		// OFDM batch scaling (the actual climb path), the SACK election, an AXIS-2
+		// SET_LINK_PARAMS apply. SYMMETRIC: both peers load the same config and evaluate the
+		// same predicate. Floored at CLIMB_CONFIRM_BATCH (== AXIS2_BATCH_FLOOR) so a capped
+		// confirm batch never falls below the CMD/RSP-agreed [10,32] floor (no bug-#9 mismatch).
+		// The 2-clean anchor count / elevator are untouched (smaller/faster batches); reverts
+		// to full batch at the ladder top for steady-state throughput. Clamped into `target`
+		// BEFORE the defer/rescan below so they see the value that will actually be stored.
+		if(climb_confirm_batch_active() && target > CLIMB_CONFIRM_BATCH)
+			target = CLIMB_CONFIRM_BATCH;
 		// Fix A (baseline-double-delivery.md): defer an orphaning shrink (see the
 		// robust branch above) — the Axis-2 down-move 25->20 mid-partial-batch is the
 		// exact repro. Held until the prev delivers, then applied via

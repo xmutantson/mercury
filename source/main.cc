@@ -1672,6 +1672,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_dr;
                 failed += test_dr.test_robust_connect_exit();
             }
+            // DUTY FAST-START lever P-alt — climb-confirm batch shrink (climb-duty):
+            // the OFDM confirm batch is capped small while climbing a non-top rung so
+            // the 2-clean anchor bar is reached in less forward airtime. Drives the REAL
+            // predicate climb_confirm_batch_active(). PASS-AFTER active; FAIL-BEFORE
+            // (duty_palt_defeat, MERCURY_DUTY_PALT_DEFEAT / master defeat) inactive.
+            {
+                cl_arq_controller test_pa;
+                failed += test_pa.test_climb_confirm_batch();
+            }
             // CLIMB-UP cmd_batch_seq_id ROLLBACK regression
             // (data-flow-inband-frame0-rolling-partial.md §13): the SYMMETRY GAP to the demote
             // rollback — the climb-UP SET_CONFIG emits (FRAME-UP, optimizer, turbo settle)

@@ -4081,6 +4081,10 @@ public:
   // AXIS2_BATCH_CEIL provide a single source of truth for clamping.
   static const int AXIS2_BATCH_FLOOR = 10;
   static const int AXIS2_BATCH_CEIL  = 32;  // capped by MAX_SACK_BATCH_SIZE
+  // P-alt (DUTY fast-start) — the CLIMB-CONFIRM batch cap (see climb_confirm_batch_active()).
+  // == AXIS2_BATCH_FLOOR so a capped confirm batch never falls below the CMD/RSP-agreed
+  // SET_LINK_PARAMS floor [10,32] (no bug-#9 clamp mismatch).
+  static const int CLIMB_CONFIRM_BATCH = AXIS2_BATCH_FLOOR;
   static const int AXIS2_STEP        = 5;
   static const int AXIS2_RING_DEPTH  = 5;
   static const int AXIS2_UP_GOOD_RUN = 4;  // §4.3.2 hysteresis: up after N good
@@ -4791,6 +4795,14 @@ public:
   // in-process synthetic-fire — permanent regression gate.
   int test_robust_connect_exit();
 
+  // DUTY FAST-START lever P-alt — climb-confirm batch shrink. Drives the REAL
+  // production predicate climb_confirm_batch_active() (the SAME method the shared batch
+  // election consults) across the config matrix. PASS-AFTER (default): TRUE at a non-top
+  // OFDM rung -> the election caps the confirm batch. FAIL-BEFORE (duty_palt_defeat,
+  // MERCURY_DUTY_PALT_DEFEAT / master defeat): FALSE -> incumbent full climb batch.
+  // PURE in-process synthetic-fire — permanent regression gate.
+  int test_climb_confirm_batch();
+
   // KEYSTONE (data-flow-inband-tier-crossing.md §6) — directed regression for the
   // data-decoupled intra-tier climb confirm (inband_retag_confirm_from_base_pattern).
   // Fails-before under -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE.
@@ -5258,6 +5270,10 @@ public:
   // restores the incumbent robust dwell so the fire-proof runs FIX vs DEFEAT on ONE
   // binary. Independent of climb_accel_defeat (R is on the CONNECT path, not the leap).
   bool duty_r_defeat;
+  // P-alt (DUTY fast-start, climb-duty) — climb-confirm batch shrink defeat gate.
+  // env-latched in the ctor (MERCURY_DUTY_PALT_DEFEAT / master MERCURY_DUTY_FASTSTART_DEFEAT).
+  // When OFF (default) the confirm batch is capped small while climbing a non-top OFDM rung.
+  bool duty_palt_defeat;
   // R (DUTY fast-start) — the CONNECT-EVIDENCED robust exit target. The completed MFSK
   // CONNECT handshake decoded the robust tier end-to-end — the SAME confirmation the
   // incumbent otherwise spends ~38 s of robust DATA airtime to earn before the C1
@@ -5278,6 +5294,24 @@ public:
        config_ladder_index(supershift_proven_ceiling) < config_ladder_index(CONFIG_0))
       return CONFIG_NONE;
     return CONFIG_0;
+  }
+  // P-alt (DUTY fast-start, climb-duty) — CLIMB-CONFIRM BATCH SHRINK. While CLIMBING an
+  // OFDM rung BELOW the ladder ceiling, the per-rung dwell is forward-airtime-dominated
+  // (a full ~25-frame confirm batch is ~13 s at CONFIG_13; 2-3 of them per rung). Cap the
+  // confirm batch to CLIMB_CONFIRM_BATCH so the 2-clean anchor bar is reached in far less
+  // forward airtime -> reach the OFDM ceiling sooner. SYMMETRIC by construction: both peers
+  // re-elect the batch from current_configuration (the SET_CONFIG both loaded) in the SHARED
+  // election sack_negotiated_recompute_batch() with NO SET_LINK_PARAMS (verified on the wire:
+  // CONFIG_0->13 re-elected 6->25 on BOTH peers, no link-param round-trip). Floored at
+  // AXIS2_BATCH_FLOOR (== CLIMB_CONFIRM_BATCH) so no CMD/RSP [10,32] clamp mismatch (bug #9).
+  // The ELEVATOR / N_OFDM=2 count is UNTOUCHED (same 2 clean batches, just smaller/faster)
+  // -> the TIER-1 leap is preserved. At the ladder TOP (steady-state) the cap lifts -> full
+  // batch for throughput. duty_palt_defeat / master-defeat restores the incumbent full climb
+  // batch so the A/B runs on ONE binary.
+  bool climb_confirm_batch_active() const {
+    if(duty_palt_defeat) return false;
+    if(!is_ofdm_config(current_configuration)) return false;
+    return !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES);
   }
   // C1 (data-flow-gearshift-climb.md) — the ROBUST tier-cross probe target. Returns CONFIG_0
   // when a robust climb should PROPOSE the OFDM tier directly (skip ROBUST_1/2 — they carry no

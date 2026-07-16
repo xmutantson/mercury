@@ -9174,6 +9174,12 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	if(telecom_system != NULL
 		&& telecom_system->bigblock_framing_enabled
 		&& current_configuration == CONFIG_16) return;
+	// P-alt (DUTY fast-start): while climbing an OFDM rung below the ceiling the batch is
+	// PINNED small (the shared election cap). Skip the adaptive controller so it does NOT
+	// SET_LINK_PARAMS-grow the confirm batch back up mid-climb (which would re-inflate the
+	// per-rung dwell AND pay a ~2 s round-trip pause). Same shape as the robust / bigblock
+	// guards above. At the ladder TOP (steady-state) Axis-2 runs -> full batch for throughput.
+	if(climb_confirm_batch_active()) return;
 	axis2_evaluations++;
 	if(batch_size_observed <= 0) return;  // defensive — no observation
 	if(rx_count < 0) rx_count = 0;
@@ -12152,6 +12158,61 @@ int cl_arq_controller::test_robust_connect_exit()
 
 	printf("[TEST-DUTY-R] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+int cl_arq_controller::test_climb_confirm_batch()
+{
+	// DUTY FAST-START lever P-alt — climb-confirm batch shrink. Drives the REAL production
+	// predicate climb_confirm_batch_active() (the SAME method the shared batch election
+	// consults). PASS-AFTER (P-alt live): TRUE at a non-top OFDM rung -> the election caps
+	// the confirm batch to CLIMB_CONFIRM_BATCH. FAIL-BEFORE (duty_palt_defeat, the
+	// MERCURY_DUTY_PALT_DEFEAT / master defeat gate): FALSE -> incumbent full climb batch.
+	// GUARDS: at the ladder TOP (CONFIG_16) FALSE (full batch, steady-state); at a ROBUST
+	// config FALSE (robust pins batch=1 separately).
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-DUTY-PALT] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else { printf("[TEST-DUTY-PALT] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+	int saved_cfg  = current_configuration;
+	bool saved_def = duty_palt_defeat;
+	int  saved_rob = robust_enabled;
+	int  saved_nb  = narrowband_enabled;
+	robust_enabled = YES; narrowband_enabled = NO;   // WB session, robust tier present
+
+	// FAIL-BEFORE: P-alt defeated at a non-top OFDM rung -> NOT active (full batch)
+	duty_palt_defeat = true; current_configuration = CONFIG_0;
+	int fb = climb_confirm_batch_active() ? 1 : 0;
+	check(fb == 0, "FAIL-BEFORE: P-alt defeated at CONFIG_0 -> NOT active (full climb batch)", fb, 0);
+
+	// PASS-AFTER: P-alt live at a non-top OFDM rung -> active (batch capped)
+	duty_palt_defeat = false; current_configuration = CONFIG_0;
+	int pa = climb_confirm_batch_active() ? 1 : 0;
+	check(pa == 1, "PASS-AFTER: P-alt live at CONFIG_0 (non-top OFDM) -> active (cap to CLIMB_CONFIRM_BATCH)", pa, 1);
+
+	// PASS-AFTER also at the multi-rung elevator target CONFIG_13 (non-top OFDM)
+	current_configuration = 13;
+	int pa2 = climb_confirm_batch_active() ? 1 : 0;
+	check(pa2 == 1, "PASS-AFTER: P-alt live at CONFIG_13 (non-top OFDM) -> active", pa2, 1);
+
+	// GUARD: at the ladder TOP (CONFIG_16) -> NOT active (full batch, steady-state throughput)
+	current_configuration = CONFIG_16;
+	int g1 = climb_confirm_batch_active() ? 1 : 0;
+	check(g1 == 0, "GUARD top (CONFIG_16) -> NOT active (full batch)", g1, 0);
+
+	// GUARD: at a ROBUST config -> NOT active (robust pins batch=1 separately)
+	current_configuration = ROBUST_0;
+	int g2 = climb_confirm_batch_active() ? 1 : 0;
+	check(g2 == 0, "GUARD robust (ROBUST_0) -> NOT active", g2, 0);
+
+	current_configuration = saved_cfg;
+	duty_palt_defeat = saved_def;
+	robust_enabled = saved_rob;
+	narrowband_enabled = saved_nb;
+	printf("[TEST-DUTY-PALT] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }
