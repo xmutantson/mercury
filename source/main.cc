@@ -1773,6 +1773,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_kxlive;
                 failed += ARQ_kxlive.test_kx_chunk_live_rx();
             }
+            // KX-AS-DATA reserved-stream RX ingest fire proof (data-flow-hybrid-kex.md
+            // T1/T3): the new decoded-transport reassembler kx_ingest() reassembles a
+            // FRAGMENTED forward (x25519+pk) and reverse (x25519+ct) stream BYTE-IDENTICAL
+            // and NEVER routes to the app FIFO, and the fail-secure REFUSE FIRES (-1) on
+            // bad magic/kind/length + a post-activation byte. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxi;
+                failed += ARQ_kxi.test_kx_ingest();
+            }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
             // pre-data re-ACK pinned the shared frames_to_read=2 across the first

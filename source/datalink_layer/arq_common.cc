@@ -8239,6 +8239,206 @@ int cl_arq_controller::kx_receive_chunk(const uint8_t* frame, int frame_len,
 	return 1;
 }
 
+// ---------------------------------------------------------------------------
+// KX-AS-DATA reserved pre-activation stream transport (data-flow-hybrid-kex.md).
+// kx_ingest() reassembles the reserved KX stream that rides the DATA engine
+// (decoded frames + real SACK + in-order de-dup), NEVER routing to the app FIFO.
+// The data plane hands us in-order, contiguous, de-duplicated, gap-checked bytes
+// (its whole job), so this layer needs no per-chunk header / arrival bitmap /
+// chunk-count reconciliation — only the transfer-level header + total length
+// (the entire simplification vs. the control-plane chunk pump). Fail-secure: any
+// header/length/overflow inconsistency, or a KX byte arriving AFTER activation,
+// returns -1 (the caller MUST tear the link down — NEVER fall through to
+// plaintext). TRANSPORT-ONLY: it fills kx_mlkem_pk/ct + stashes the folded
+// x25519 peer pubkey; the crypto orchestration (compute shared / generate
+// keypair / encapsulate / decapsulate / derive) stays at the existing crypto
+// call sites, fed the identical bytes.
+// ---------------------------------------------------------------------------
+int cl_arq_controller::kx_ingest(const uint8_t* buf, int len)
+{
+	if(len <= 0) return 0;
+	kx_stream_rx_done_kind = 0;
+
+	// Fail-secure cross-check: KX bytes must NEVER be interpreted once encryption
+	// is active (that is the app-data phase) — a routing contradiction => REFUSE.
+	if(cipher_suite.is_active()) return -1;
+
+	int consumed = 0;
+	while(consumed < len)
+	{
+		if(kx_stream_rx_have >= KX_STREAM_BUFSZ) return -1;   // overflow => REFUSE
+		int room = KX_STREAM_BUFSZ - kx_stream_rx_have;
+		int take = len - consumed;
+		if(take > room) take = room;
+		memcpy(kx_stream_rx_buf + kx_stream_rx_have, buf + consumed, take);
+		kx_stream_rx_have += take;
+		consumed          += take;
+
+		// Validate the 7-byte transfer header exactly once, when it first lands.
+		if(!kx_stream_rx_is_kx && kx_stream_rx_have >= KX_STREAM_HDR)
+		{
+			uint32_t magic = ((uint32_t)kx_stream_rx_buf[0] << 24)
+			               | ((uint32_t)kx_stream_rx_buf[1] << 16)
+			               | ((uint32_t)kx_stream_rx_buf[2] <<  8)
+			               |  (uint32_t)kx_stream_rx_buf[3];
+			if(magic != KX_STREAM_MAGIC) return -1;           // bad magic => REFUSE
+			uint8_t kind  = kx_stream_rx_buf[4];
+			int total_len = (int)kx_stream_rx_buf[5] | ((int)kx_stream_rx_buf[6] << 8); // LE
+			int want_len;
+			if(kind == KX_STREAM_FWD)      want_len = KX_STREAM_FWD_LEN;
+			else if(kind == KX_STREAM_REV) want_len = KX_STREAM_REV_LEN;
+			else return -1;                                    // bad kind => REFUSE
+			if(total_len != want_len) return -1;               // length mismatch => REFUSE
+			kx_stream_rx_kind     = kind;
+			kx_stream_rx_expected = KX_STREAM_HDR + total_len;
+			kx_stream_rx_is_kx    = true;
+		}
+
+		// Transfer complete => hand the payload to the crypto transport buffers.
+		if(kx_stream_rx_is_kx && kx_stream_rx_have >= kx_stream_rx_expected)
+		{
+			const uint8_t* payload = kx_stream_rx_buf + KX_STREAM_HDR;
+			memcpy(kx_stream_peer_x25519, payload, X25519_KEY_SIZE); // folded classical pubkey
+			if(kx_stream_rx_kind == KX_STREAM_FWD)
+			{
+				memcpy(kx_mlkem_pk, payload + X25519_KEY_SIZE, MLKEM_PK_SIZE);
+				kx_mlkem_pk_ready = true;
+			}
+			else // KX_STREAM_REV
+			{
+				memcpy(kx_mlkem_ct, payload + X25519_KEY_SIZE, MLKEM_CT_SIZE);
+				kx_mlkem_ct_ready = true;
+			}
+			kx_stream_rx_done_kind = kx_stream_rx_kind;
+			printf("[CRYPTO] KX-as-data stream reassembled kind=0x%02x (%d payload bytes)\n",
+				kx_stream_rx_kind, kx_stream_rx_expected - KX_STREAM_HDR);
+			fflush(stdout);
+			// Idle the reassembly for a possible next transfer in the same session.
+			kx_stream_rx_have = 0; kx_stream_rx_expected = 0;
+			kx_stream_rx_kind = 0; kx_stream_rx_is_kx = false;
+		}
+	}
+	return consumed;
+}
+
+// KEY_ACTIVATE delivery-state re-anchor (data-flow-stream-offset.md §2.4 /
+// data-flow-hybrid-kex.md §3.1/§3.4). After the KX stream consumed wire bsi
+// 0..N in the pre-activation epoch, re-anchor the Option-W absolute byte cursors
+// + running stream CRC + per-bsi wire stamps + the de-dup high-water on BOTH
+// peers so the FIRST user-data batch (sender stamp.start=0) sees
+// rx_stream_delivered==0 (no false [RSP-V2-STREAM-SHIFT] positional teardown) and
+// the receiver de-dup ruler starts fresh — byte-identical to a normal session
+// start. Mirrors the Option-W subset of reset_session_state() WITHOUT tearing the
+// crypto/link down. The AEAD nonce epoch is reset alongside this call by the
+// KEY_ACTIVATE handler (the existing tx_nonce_*/rx_nonce_* reset there); that
+// handler also owns the wire batch_seq_id counter coordination.
+void cl_arq_controller::kx_stream_reanchor()
+{
+	tx_stream_committed      = 0;
+	rx_stream_delivered      = 0;
+	rx_stream_emitted_bsi_hw = -1;
+	rsp_last_delivered_batch_seq_id = -1;
+	tx_stream_crc = CRC32_INIT;
+	rx_stream_crc = CRC32_INIT;
+	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid = false;
+	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid = false;
+	printf("[CRYPTO] KX-as-data re-anchor: Option-W cursors/stamps/CRC reset to fresh bsi=0 baseline\n");
+	fflush(stdout);
+}
+
+// KX-AS-DATA reserved-stream RX ingest fire proof (data-flow-hybrid-kex.md T1/T3).
+// Drives the REAL kx_ingest() reassembler on a throwaway controller (no channel /
+// no IONOS / no RF): (a) a well-formed FORWARD stream delivered in IRREGULAR
+// FRAGMENTS (header split across a fragment) reassembles the 1184B ML-KEM pk +
+// the folded 32B x25519 pubkey BYTE-IDENTICAL and is NEVER routed to the app; (b)
+// the REVERSE stream reassembles the 1088B ct byte-identical; (c) the fail-secure
+// REFUSE FIRES (returns -1) on bad magic / bad kind / wrong length / a byte after
+// activation. Returns the failure count (0 = pass), summed into the --test suite.
+int cl_arq_controller::test_kx_ingest()
+{
+	int failures = 0;
+	auto check = [&](bool cond, const char* name){
+		if(!cond){ failures++; printf("[TEST-KX-INGEST] FAIL: %s\n", name); }
+		else      { printf("[TEST-KX-INGEST] ok: %s\n", name); }
+		fflush(stdout);
+	};
+
+	kx_chunk_state_reset();
+
+	// --- FORWARD: MAGIC|kind|len | x25519(32) | mlkem_pk(1184) -------------------
+	uint8_t x25519_ref[X25519_KEY_SIZE];
+	for(int i=0;i<X25519_KEY_SIZE;i++) x25519_ref[i] = (uint8_t)(0xA0 + i);
+	uint8_t pk_ref[MLKEM_PK_SIZE];
+	for(int i=0;i<MLKEM_PK_SIZE;i++)   pk_ref[i]     = (uint8_t)((i*7 + 3) & 0xFF);
+	int fwd_payload = X25519_KEY_SIZE + MLKEM_PK_SIZE;   // 1216
+	uint8_t fwd[KX_STREAM_HDR + X25519_KEY_SIZE + MLKEM_PK_SIZE];
+	fwd[0]=(uint8_t)((KX_STREAM_MAGIC>>24)&0xFF); fwd[1]=(uint8_t)((KX_STREAM_MAGIC>>16)&0xFF);
+	fwd[2]=(uint8_t)((KX_STREAM_MAGIC>>8)&0xFF);  fwd[3]=(uint8_t)(KX_STREAM_MAGIC&0xFF);
+	fwd[4]=KX_STREAM_FWD;
+	fwd[5]=(uint8_t)(fwd_payload & 0xFF); fwd[6]=(uint8_t)((fwd_payload>>8)&0xFF);   // LE
+	memcpy(fwd+KX_STREAM_HDR, x25519_ref, X25519_KEY_SIZE);
+	memcpy(fwd+KX_STREAM_HDR+X25519_KEY_SIZE, pk_ref, MLKEM_PK_SIZE);
+	int fwd_total = KX_STREAM_HDR + fwd_payload;
+
+	int off = 0, rc_sum = 0; bool refused_mid = false;
+	const int frags[] = {3, 5, 200, 500, 1000000};   // last = "the rest"
+	for(int f=0; off < fwd_total; f++)
+	{
+		int n = (f < 4) ? frags[f] : (fwd_total - off);
+		if(off + n > fwd_total) n = fwd_total - off;
+		int rc = kx_ingest(fwd+off, n);
+		if(rc < 0){ refused_mid = true; break; }
+		rc_sum += rc; off += n;
+	}
+	check(!refused_mid, "forward stream not falsely refused");
+	check(rc_sum == fwd_total, "forward stream fully consumed as KX");
+	check(kx_stream_rx_done_kind == KX_STREAM_FWD, "forward transfer completed (done_kind==FWD)");
+	check(kx_mlkem_pk_ready, "kx_mlkem_pk_ready set on completion");
+	check(memcmp(kx_mlkem_pk, pk_ref, MLKEM_PK_SIZE)==0, "ML-KEM pk reassembled BYTE-IDENTICAL");
+	check(memcmp(kx_stream_peer_x25519, x25519_ref, X25519_KEY_SIZE)==0, "folded x25519 pubkey BYTE-IDENTICAL");
+
+	// --- REVERSE: MAGIC|kind|len | x25519(32) | mlkem_ct(1088) ------------------
+	kx_chunk_state_reset();
+	uint8_t ct_ref[MLKEM_CT_SIZE];
+	for(int i=0;i<MLKEM_CT_SIZE;i++) ct_ref[i] = (uint8_t)((i*5 + 11) & 0xFF);
+	int rev_payload = X25519_KEY_SIZE + MLKEM_CT_SIZE;   // 1120
+	uint8_t rev[KX_STREAM_HDR + X25519_KEY_SIZE + MLKEM_CT_SIZE];
+	rev[0]=(uint8_t)((KX_STREAM_MAGIC>>24)&0xFF); rev[1]=(uint8_t)((KX_STREAM_MAGIC>>16)&0xFF);
+	rev[2]=(uint8_t)((KX_STREAM_MAGIC>>8)&0xFF);  rev[3]=(uint8_t)(KX_STREAM_MAGIC&0xFF);
+	rev[4]=KX_STREAM_REV;
+	rev[5]=(uint8_t)(rev_payload & 0xFF); rev[6]=(uint8_t)((rev_payload>>8)&0xFF);
+	memcpy(rev+KX_STREAM_HDR, x25519_ref, X25519_KEY_SIZE);
+	memcpy(rev+KX_STREAM_HDR+X25519_KEY_SIZE, ct_ref, MLKEM_CT_SIZE);
+	int rev_total = KX_STREAM_HDR + rev_payload;
+	int rc_rev = kx_ingest(rev, rev_total);
+	check(rc_rev == rev_total, "reverse stream fully consumed as KX");
+	check(kx_stream_rx_done_kind == KX_STREAM_REV, "reverse transfer completed (done_kind==REV)");
+	check(kx_mlkem_ct_ready, "kx_mlkem_ct_ready set on completion");
+	check(memcmp(kx_mlkem_ct, ct_ref, MLKEM_CT_SIZE)==0, "ML-KEM ct reassembled BYTE-IDENTICAL");
+
+	// --- FAIL-SECURE REFUSE (the gate FIRES on the production path) --------------
+	kx_chunk_state_reset();
+	uint8_t hdr4[KX_STREAM_HDR + 4]; memcpy(hdr4, fwd, KX_STREAM_HDR+4);
+	uint8_t badm[KX_STREAM_HDR + 4]; memcpy(badm, hdr4, KX_STREAM_HDR+4); badm[0]^=0xFF;
+	check(kx_ingest(badm, KX_STREAM_HDR+4) < 0, "bad magic -> REFUSE (-1)");
+	kx_chunk_state_reset();
+	uint8_t badk[KX_STREAM_HDR + 4]; memcpy(badk, hdr4, KX_STREAM_HDR+4); badk[4]=0x7F;
+	check(kx_ingest(badk, KX_STREAM_HDR+4) < 0, "bad kind -> REFUSE (-1)");
+	kx_chunk_state_reset();
+	uint8_t badl[KX_STREAM_HDR + 4]; memcpy(badl, hdr4, KX_STREAM_HDR+4); badl[5]^=0x01;
+	check(kx_ingest(badl, KX_STREAM_HDR+4) < 0, "wrong total_len -> REFUSE (-1)");
+
+	// --- FAIL-SECURE: a KX byte after activation is a routing contradiction ------
+	// (done LAST — activate() is sticky on this throwaway controller.)
+	kx_chunk_state_reset();
+	cipher_suite.activate();
+	check(kx_ingest(fwd, KX_STREAM_HDR) < 0, "KX byte after activation -> REFUSE (-1)");
+
+	printf("[TEST-KX-INGEST] %s (failures=%d)\n", failures? "FAIL":"ALL PASS", failures);
+	fflush(stdout);
+	return failures;
+}
+
 void cl_arq_controller::opt_load_rate_table()
 {
 	// --no-optimizer: skip table load entirely. opt_evaluate_batch_end()

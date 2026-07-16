@@ -27,6 +27,7 @@
 #include "common/sim_clock.h"
 #include <unistd.h>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include "tcp_socket.h"
 #include "fifo_buffer.h"
@@ -2166,6 +2167,10 @@ public:
   // slot width -> full reassembly + live encapsulate/decapsulate. In-process
   // synthetic-fire, no IONOS/RF/telecom_system. 0 PASS / N = failure count.
   int test_kx_chunk_live_rx();
+  // KX-as-data reserved-stream RX ingest fire proof (data-flow-hybrid-kex.md T1/T3):
+  // reassembles a fragmented forward/reverse stream BYTE-IDENTICAL + the fail-secure
+  // REFUSE fires on bad magic/kind/length and on a post-activation byte.
+  int test_kx_ingest();
 
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,
@@ -4974,6 +4979,14 @@ public:
   // batch invariant (data-flow-batch-size.md §1) — no wire negotiation needed.
   bool compression_viable_for_batch() const
   {
+    // KX-as-data bypass: the reserved pre-activation KX stream carries
+    // ciphertext-random public key material — compressing it wins nothing and
+    // would desync the streaming compressor context that must stay pristine for
+    // the first user byte. Both peers compute kx_stream_epoch() deterministically
+    // from the shared pre-activation state, so they bypass on the SAME batches
+    // (no headerless-vs-header mis-parse). Inert (false-returning branch never
+    // taken) on every non-encrypted session.
+    if(kx_stream_epoch()) return false;
     if(!compression_enabled) return false;
     int eff_long = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
     int max_frame = max_data_length + max_header_length - eff_long;
@@ -5080,6 +5093,74 @@ public:
   int  kx_rx_total;                 // expected total bytes (MLKEM_PK_SIZE/CT_SIZE)
   int  kx_rx_received;             // distinct chunks received so far
   bool kx_rx_got[256];            // per-index arrival bitmap
+
+  // ---- KX-as-data reserved pre-activation stream (data-flow-hybrid-kex.md) ----
+  // The classical X25519 pubkey + the large ML-KEM artifact ride the DATA engine
+  // as a reserved, self-identifying stream (decoded frames + real SACK sequence +
+  // in-order + selective retransmit), consumed by the crypto state machine and
+  // NEVER delivered to the app. Dissolves the control-plane pattern-ACK wall (the
+  // per-chunk control ACK carries no decoded index, so a lost chunk cannot be
+  // selectively re-requested). On the wire the transfer's first bytes are:
+  //   [0..3] KX_STREAM_MAGIC (BE)  [4] kind (KX_STREAM_FWD/REV)  [5..6] total_len (LE u16)
+  // total_len counts the PAYLOAD bytes that follow the 7-byte header. The stream is
+  // interpreted as KX iff the receiver is PRE-ACTIVATION (encryption_enabled &&
+  // !cipher_suite.is_active()), where user data is held, so routing is unambiguous;
+  // the magic is the belt-and-suspenders wire distinguisher cross-checked for
+  // fail-secure. KX bytes are public key material -> plaintext (encryption not yet
+  // active), ciphertext-random -> compression bypassed, and carry NO Option-W wire
+  // stamp (so the positional backstop is a safe no-op) so KEY_ACTIVATE can re-anchor
+  // the delivery/bsi/nonce state to a fresh bsi=0 for the first user batch.
+  static const uint32_t KX_STREAM_MAGIC = 0x4B585331u; // "KXS1"
+  static const uint8_t  KX_STREAM_FWD   = 0x01;        // CMD->RSP: x25519_pk_cmd(32)+mlkem_pk(1184)
+  static const uint8_t  KX_STREAM_REV   = 0x02;        // RSP->CMD: x25519_pk_rsp(32)+mlkem_ct(1088)
+  static const int      KX_STREAM_HDR   = 7;           // magic(4)+kind(1)+total_len(2)
+  static const int      KX_STREAM_PAYLOAD_MAX = X25519_KEY_SIZE + MLKEM_PK_SIZE; // 32+1184=1216
+  static const int      KX_STREAM_BUFSZ = KX_STREAM_HDR + KX_STREAM_PAYLOAD_MAX; // 1223
+  static const int      KX_STREAM_FWD_LEN = X25519_KEY_SIZE + MLKEM_PK_SIZE;     // 1216 payload
+  static const int      KX_STREAM_REV_LEN = X25519_KEY_SIZE + MLKEM_CT_SIZE;     // 1120 payload
+  // TX staging (dedicated buffer, NOT fifo_buffer_tx — user data stays untouched)
+  uint8_t kx_stream_tx_buf[KX_STREAM_BUFSZ];
+  int     kx_stream_tx_len;      // bytes staged (header + payload), 0 = none
+  int     kx_stream_tx_sent;     // bytes already fed into the data engine
+  bool    kx_stream_tx_active;   // this session is streaming KX-as-data (feed past the hold)
+  // RX reassembly of the reserved KX stream
+  uint8_t kx_stream_rx_buf[KX_STREAM_BUFSZ];
+  int     kx_stream_rx_have;     // bytes accumulated so far (incl the 7-byte header)
+  int     kx_stream_rx_expected; // KX_STREAM_HDR + total_len (known once the header lands)
+  uint8_t kx_stream_rx_kind;     // 0 / KX_STREAM_FWD / KX_STREAM_REV currently reassembling
+  bool    kx_stream_rx_is_kx;    // the current RX transfer is the reserved KX stream
+  uint8_t kx_stream_peer_x25519[X25519_KEY_SIZE]; // folded classical pubkey from the last completed KX stream
+
+  // RX ingest of the reserved KX stream: parse+validate the header on the first
+  // bytes, accumulate payload, and on completion hand the pk/ct to the crypto
+  // buffers (kx_mlkem_pk/kx_mlkem_ct + the folded x25519 pubkey). NEVER routes to
+  // fifo_buffer_rx (the app socket). Returns the number of bytes CONSUMED as KX
+  // (== len on the happy path), or -1 on a fail-secure REFUSE (bad magic/kind/len /
+  // marker-present-while-active / overflow) — the caller must tear the link down,
+  // never fall through to plaintext. On completion sets kx_stream_rx_done_kind.
+  int  kx_ingest(const uint8_t* buf, int len);
+  int  kx_stream_rx_done_kind;   // set to KX_STREAM_FWD/REV when a transfer completes; 0 otherwise
+  bool kx_as_data_path() const   // runtime A/B gate for the new transport (opt-in while unproven)
+  {
+    if(!encryption_enabled) return false;
+    const char* e = std::getenv("MERCURY_KX_AS_DATA");
+    return e && *e && atoi(e) != 0;
+  }
+  // TRUE while this session is in the KX-as-data pre-activation epoch on EITHER
+  // side (TX staging active, or RX reassembling a KX stream, or simply
+  // pre-activation under the new path). Consulted by the compression-bypass and
+  // Option-W stamp/cursor suppression so both peers act deterministically from the
+  // shared pre-activation state.
+  bool kx_stream_epoch() const
+  {
+    return kx_stream_tx_active || kx_stream_rx_is_kx
+        || (kx_as_data_path() && !cipher_suite.is_active());
+  }
+  // Re-anchor the delivery/bsi/nonce/Option-W state to a fresh bsi=0 baseline at
+  // KEY_ACTIVATE on BOTH peers, so the first user-data batch begins byte-identical
+  // to a normal (unencrypted) session start after KX consumed wire bsi 0..N.
+  void kx_stream_reanchor();
+
   char psk_hex[129];                  // Pre-shared key (hex string, up to 64 bytes = 128 hex chars)
   bool psk_mismatch_pending;          // Commander detected PSK mismatch, KEY_ACTIVATE sent for responder notification
 
@@ -5094,6 +5175,10 @@ public:
     kx_rx_kind = 0; kx_rx_count = 0; kx_rx_chunk_cap = 0;
     kx_rx_total = 0; kx_rx_received = 0;
     for (int i = 0; i < 256; i++) kx_rx_got[i] = false;
+    // KX-as-data reserved-stream transport state (idle).
+    kx_stream_tx_len = 0; kx_stream_tx_sent = 0; kx_stream_tx_active = false;
+    kx_stream_rx_have = 0; kx_stream_rx_expected = 0;
+    kx_stream_rx_kind = 0; kx_stream_rx_is_kx = false; kx_stream_rx_done_kind = 0;
   }
 
   int gear_shift_algorithm;
