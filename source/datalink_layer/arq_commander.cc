@@ -7223,7 +7223,18 @@ void cl_arq_controller::finish_turbo_direction()
 	// unlike turbo_received_snr which is reset after each probe step.
 	turbo_received_snr = -99.0f;
 
-	if(turboshift_phase == TURBO_FORWARD && skip_turbo_reverse)
+	// KX-as-data (data-flow-hybrid-kex.md Â§7): in the pre-activation KX epoch the
+	// turboshift MUST NOT run its bidirectional REVERSE-direction probe. That probe fires
+	// its OWN SWITCH_ROLE (below) which collides with the KX reverse-ct role-swap handshake:
+	// it hands the commander role to the peer BEFORE that peer has finished the forward-pk
+	// receipt + reverse-ct staging, so the peer (now commander, kx_stream_tx_len==0) stages a
+	// SECOND fresh forward stream and desyncs the crypto transcript -- activation then never
+	// lands (a cross-layer data-flow audit measured fwd_staged==2, KEY_ACTIVATE==0 on 8/8
+	// robust-start cells). Route the KX-epoch forward-complete into the SAME proven settle
+	// path as --skip-turbo-reverse so the climbed config SETTLES and the KX handshake owns the
+	// role swaps; the forward stream still DROVE the climb off robust (that win is preserved).
+	// Env off / post-activation -> kx_stream_epoch() false -> byte-identical.
+	if(turboshift_phase == TURBO_FORWARD && (skip_turbo_reverse || kx_stream_epoch()))
 	{
 		// Forward direction probed. Skip REVERSE probe (--skip-turbo-reverse).
 		// Reverse path only needs MFSK ACKs on asymmetric channels.
