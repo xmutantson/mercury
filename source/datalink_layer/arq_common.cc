@@ -635,6 +635,11 @@ cl_arq_controller::cl_arq_controller()
 		// on ONE binary. Env-latched ONCE here (production path) like the R knob above.
 		const char* dp = std::getenv("MERCURY_DUTY_PALT_DEFEAT");
 		duty_palt_defeat = duty_master_defeat || (dp && *dp && atoi(dp) != 0);
+		// ELEVATOR FAST-CONFIRM (climb-duty). Ships DEFAULT-ON. MERCURY_DUTY_ELEV_DEFEAT=1 (or the
+		// master MERCURY_DUTY_FASTSTART_DEFEAT=1) restores the incumbent N=2 confirm so the fire-proof
+		// runs FIX vs DEFEAT on ONE binary. Env-latched ONCE here like the R / P-alt knobs above.
+		const char* de = std::getenv("MERCURY_DUTY_ELEV_DEFEAT");
+		duty_elev_defeat = duty_master_defeat || (de && *de && atoi(de) != 0);
 		// CONNECT-SEED FUSION (climb-duty, connect floor) - ships DEFAULT-ON.
 		// MERCURY_CONNECT_FUSE_DEFEAT=1 (or master MERCURY_DUTY_FASTSTART_DEFEAT=1) restores the
 		// two-frame SWITCH_BANDWIDTH+SET_CONFIG cross so the fire-proof runs FIX vs DEFEAT on ONE

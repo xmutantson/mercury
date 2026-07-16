@@ -1320,6 +1320,67 @@ public:
   static int fast_probe_clean_streak(int config)
   { return sustained_anchor_threshold(config); }
 
+  // ELEVATOR FAST-CONFIRM (climb-duty, gearshift-elevator-dwell.md) — PURE policy: is ONE
+  // whole-clean OFDM batch enough to fire the FRAME-UP elevator (N=1) instead of the
+  // SUSTAINED_ANCHOR_N_OFDM=2 bar? ROOT of the ~37 s cfg0->cfg16 dwell: the shipped elevator
+  // already LEAPS multiple rungs on SNR (cfg0->cfg13->cfg16), so the dwell is 2 clean confirm
+  // batches PER rung — NOT rung count. CONJUNCTS (all hold):
+  //   (a) is_ofdm      — robust already fires at N=1.
+  //   (b) whole_clean  — the batch was CONFIRMED fully delivered (§9); a partial never fast-confirms.
+  //   (c) no_outstanding_retx — retransmit_count==0: not mid-rescue (the exact SACK-rescue the
+  //                      N=2 bar guards, §11).
+  //   (d) snr_cap_idx > current_idx — the ANCHOR-INDEPENDENT raw SNR capacity (get_configuration
+  //                      (SNR - SUPERSHIFT_MARGIN_DB) with the NB + proven-ceiling caps, but NOT
+  //                      the supershift_retrigger_target anchor gate) clears a HIGHER rung. This
+  //                      is TRUE on the 1st clean even while the anchor is still robust, so it is
+  //                      the signal that lets us raise the anchor early. On a marginal / deep-SNR
+  //                      channel get_configuration lands at/below the live rung -> N=2 preserved
+  //                      -> WGN:-10 anti-thrash (e3d818d / §11) intact. No new magic threshold.
+  // The consumers (anchor-raise boost + FRAME-UP eff) reach the SAME anchor progression the
+  // incumbent reaches at N=2, just 1 batch sooner per rung; a wrong leap is bounded by the
+  // SNR-capped elevator target + the decode-failure demote re-pin (reverse-pin). PURE.
+  static bool elevator_fast_confirm_eligible_core(bool is_ofdm, bool whole_clean,
+      bool no_outstanding_retx, int snr_cap_idx, int current_idx, bool defeat)
+  {
+    if(defeat) return false;
+    if(!is_ofdm) return false;               // (a)
+    if(!whole_clean) return false;           // (b)
+    if(!no_outstanding_retx) return false;   // (c) mid-rescue is the N=2 fear
+    return snr_cap_idx > current_idx;        // (d) SNR capacity clears a higher rung
+  }
+
+  // ANCHOR-INDEPENDENT channel capacity (climb-duty). The raw SNR->config mapping with the
+  // SAME NB + proven-ceiling caps as elevator_target_from_snr, but WITHOUT the
+  // supershift_retrigger_target anchor gate — that gate returns anchor+1 (a ROBUST config while
+  // the anchor is still robust on the 1st clean), which HIDES the true headroom. get_configuration
+  // returns CONFIG_0..16 only, so this is a pure capacity read. NON-const (get_configuration is).
+  int snr_capacity_config() {
+    int cap = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+    if(narrowband_enabled == YES && config_ladder_index(cap) > config_ladder_index(NB_CONFIG_MAX))
+      cap = NB_CONFIG_MAX;
+    if(supershift_proven_ceiling >= 0 &&
+       config_ladder_index(cap) > config_ladder_index(supershift_proven_ceiling))
+      cap = supershift_proven_ceiling;
+    return cap;
+  }
+
+  // Member wrapper — live climb + SNR state. CMD-only decision (RSP follows the SET_CONFIG;
+  // symmetric by construction, like P-alt / Axis-2). Same elevator preconditions (gear_shift_on,
+  // OFDM, SNR_uplink>-90) so the N=1 arm and the leap it enables agree. NON-const.
+  bool elevator_fast_confirm_eligible() {
+    if(duty_elev_defeat) return false;
+    if(!(gear_shift_on==YES && is_ofdm_config(current_configuration)
+         && measurements.SNR_uplink > -90))
+      return false;
+    return elevator_fast_confirm_eligible_core(
+      is_ofdm_config(current_configuration),
+      promotion_allowed_on_batch(last_batch_fully_acked),
+      (retransmit_count == 0),
+      config_ladder_index(snr_capacity_config()),
+      config_ladder_index(current_configuration),
+      duty_elev_defeat);
+  }
+
   // FIX-A — ROBUST-tier dwell-batch eligibility (data-flow-robust-tier-arq-batch.md
   // §5.1). TRUE iff a ROBUST dwell may SAFELY run batch > 1 (the FIX-A relaxation).
   // The robust batch is pinned to 1 by default because at the MFSK cliff
@@ -4802,6 +4863,12 @@ public:
   // MERCURY_DUTY_PALT_DEFEAT / master defeat): FALSE -> incumbent full climb batch.
   // PURE in-process synthetic-fire — permanent regression gate.
   int test_climb_confirm_batch();
+
+  // DUTY FAST-START lever ELEVATOR FAST-CONFIRM — margin-gated N=1 OFDM climb confirm. Drives
+  // the PURE core elevator_fast_confirm_eligible_core(). PASS-AFTER: whole-clean OFDM + SNR
+  // capacity headroom -> N=1. FAIL-BEFORE (duty_elev_defeat) -> N=2. GUARDS: partial / mid-retx
+  // / no-headroom / robust -> N=2.
+  int test_elevator_fast_confirm();
   int test_connect_fuse();
   void apply_connect_seed_cross(int seed_cfg);
 
@@ -5276,6 +5343,12 @@ public:
   // env-latched in the ctor (MERCURY_DUTY_PALT_DEFEAT / master MERCURY_DUTY_FASTSTART_DEFEAT).
   // When OFF (default) the confirm batch is capped small while climbing a non-top OFDM rung.
   bool duty_palt_defeat;
+  // ELEVATOR FAST-CONFIRM (DUTY fast-start, climb-duty) — margin-gated N=1 OFDM climb confirm
+  // defeat gate. env-latched in the ctor (MERCURY_DUTY_ELEV_DEFEAT / master
+  // MERCURY_DUTY_FASTSTART_DEFEAT). OFF (default): a WHOLE-clean OFDM batch whose RAW SNR
+  // capacity clears a higher rung raises the anchor to THIS rung on the FIRST clean and fires
+  // the FRAME-UP elevator then, instead of waiting for the 2nd clean.
+  bool duty_elev_defeat;
   // CONNECT-SEED FUSION (climb-duty, connect floor) - fold the connect-evidenced seed
   // (DUTY-R robust exit) into the SWITCH_BANDWIDTH frame so the RSP loads it on the WB
   // switch and the CMD on the ACK, collapsing the separate ~10 s robust SET_CONFIG cross.

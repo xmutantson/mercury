@@ -6437,9 +6437,22 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// that updated the streak just above, so on the steady-state data path it
 				// equals current_configuration — the change BITES only when the live
 				// config has advanced ahead of the streak (the corruption scenario).
+				// ELEVATOR FAST-CONFIRM (climb-duty, gearshift-elevator-dwell.md): on a whole-clean
+				// OFDM batch whose RAW SNR capacity clears a higher rung, raise the anchor to THIS
+				// rung on the FIRST clean (boost the anchor-raise streak to the N=2 bar). The
+				// elevator leap needs an OFDM anchor (supershift_retrigger_target's is_ofdm_config
+				// (anchor) gate) and the +1 clamp needs the anchor at this rung; both are satisfied
+				// 1 batch sooner. This reaches the SAME anchor progression the incumbent reaches at
+				// N=2 (the incumbent also seats the anchor at each rung before leaping) — just
+				// sooner — so BREAK-recovery behaviour is unchanged. The §16 TIER GATE inside
+				// data_anchor_raise_target still applies (only an OFDM streak_config crosses).
+				// Off / marginal (no raw-SNR headroom, or retx>0) -> streak unchanged -> incumbent N=2.
+				int eff_anchor_streak = clean_batches_at_current_config;
+				if(elevator_fast_confirm_eligible() && eff_anchor_streak < SUSTAINED_ANCHOR_N_OFDM)
+					eff_anchor_streak = SUSTAINED_ANCHOR_N_OFDM;
 				last_data_viable_config = data_anchor_raise_target(
 					clean_batches_config, current_configuration,
-					last_data_viable_config, clean_batches_at_current_config);
+					last_data_viable_config, eff_anchor_streak);
 				// INBAND CEILING RE-RAISE (data-flow-inband-ceiling-reraise.md §3,
 				// option (b)): under the no-BREAK inband redesign the demote
 				// (inband_route_failure_demote, :3073) PINS supershift_proven_ceiling
@@ -6672,6 +6685,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			int eff_frame_shift_threshold = effective_frame_shift_threshold(
 				frame_shift_threshold, current_configuration,
 				clean_batches_at_current_config);
+			// ELEVATOR FAST-CONFIRM (climb-duty): the anchor-raise above already seated this rung
+			// as the OFDM anchor on the FIRST clean margin batch (clearing the +1 clamp and
+			// un-capping the elevator target). Fire the FRAME-UP elevator on THIS first clean by
+			// arming the fast threshold, instead of waiting for the 2nd clean (the N=2 fast-probe
+			// bar). Off / marginal / defeated -> byte-identical N=2.
+			if(elevator_fast_confirm_eligible())
+			{
+				eff_frame_shift_threshold = FRAME_SHIFT_FAST;
+				printf("[GEARSHIFT] ELEVATOR FAST-CONFIRM: 1-batch climb armed at config %d "
+					"(whole-clean retx=0, SNR capacity clears a higher rung) -> firing FRAME-UP on "
+					"the first clean batch (skip the 2nd confirm)\n", current_configuration);
+				fflush(stdout);
+			}
 			// DEFER-WHILE-HOLE-OUTSTANDING (data-flow-inband-frame0-rolling-partial.md §10):
 			// the streak CREDIT (consecutive_data_acks++) above is UNCONDITIONAL — 2801d7c's
 			// purpose (the lead-frame-only partial still builds the climb streak) is preserved.
@@ -12341,6 +12367,37 @@ int cl_arq_controller::test_climb_confirm_batch()
 	robust_enabled = saved_rob;
 	narrowband_enabled = saved_nb;
 	printf("[TEST-DUTY-PALT] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+int cl_arq_controller::test_elevator_fast_confirm()
+{
+	// Drives the REAL core elevator_fast_confirm_eligible_core() (the policy the anchor-raise
+	// boost + FRAME-UP eff both consult through elevator_fast_confirm_eligible()). PASS-AFTER:
+	// whole-clean OFDM, retx=0, raw SNR capacity above the live rung -> eligible (N=1).
+	// FAIL-BEFORE (duty_elev_defeat) -> N=2. GUARDS: partial / mid-retx / no-headroom / robust.
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-DUTY-ELEV] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else { printf("[TEST-DUTY-ELEV] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+	int cur_idx  = config_ladder_index(CONFIG_0);
+	int high_idx = config_ladder_index(13);
+	int fb = elevator_fast_confirm_eligible_core(true, true, true, high_idx, cur_idx, /*defeat=*/true) ? 1 : 0;
+	check(fb == 0, "FAIL-BEFORE: defeated -> NOT eligible (incumbent N=2)", fb, 0);
+	int pa = elevator_fast_confirm_eligible_core(true, true, true, high_idx, cur_idx, /*defeat=*/false) ? 1 : 0;
+	check(pa == 1, "PASS-AFTER: OFDM whole-clean retx=0 + SNR capacity headroom -> eligible (N=1)", pa, 1);
+	int g1 = elevator_fast_confirm_eligible_core(true, false, true, high_idx, cur_idx, false) ? 1 : 0;
+	check(g1 == 0, "GUARD partial batch -> NOT eligible", g1, 0);
+	int g2 = elevator_fast_confirm_eligible_core(true, true, false, high_idx, cur_idx, false) ? 1 : 0;
+	check(g2 == 0, "GUARD outstanding retx -> NOT eligible", g2, 0);
+	int g3 = elevator_fast_confirm_eligible_core(true, true, true, cur_idx, cur_idx, false) ? 1 : 0;
+	check(g3 == 0, "GUARD no SNR-capacity headroom -> NOT eligible (N=2 anti-thrash)", g3, 0);
+	int g4 = elevator_fast_confirm_eligible_core(false, true, true, high_idx, cur_idx, false) ? 1 : 0;
+	check(g4 == 0, "GUARD robust config -> NOT eligible", g4, 0);
+	printf("[TEST-DUTY-ELEV] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }

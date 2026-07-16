@@ -1681,6 +1681,14 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_pa;
                 failed += test_pa.test_climb_confirm_batch();
             }
+            // DUTY FAST-START lever ELEVATOR FAST-CONFIRM — margin-gated N=1 OFDM climb confirm:
+            // on a whole-clean OFDM batch whose raw SNR capacity clears a higher rung, the anchor
+            // is seated + the FRAME-UP elevator fires on the FIRST clean (skip the 2nd confirm),
+            // collapsing the 2nd per-rung airtime of the cfg0->cfg16 dwell. Drives the REAL core.
+            {
+                cl_arq_controller test_ef;
+                failed += test_ef.test_elevator_fast_confirm();
+            }
             // CONNECT-SEED FUSION (climb-duty, connect floor) - the connect-evidenced seed
             // is folded into the SWITCH_BANDWIDTH frame so the RSP loads it on the WB switch
             // and the CMD on the ACK, collapsing the separate robust SET_CONFIG cross. Drives
