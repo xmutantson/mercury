@@ -463,7 +463,6 @@ source/compression/test_winlink_dict.cc
 source/compression/lzhuf_buffer.cc
 source/crypto/mercury_crypto.cc
 source/crypto/test_aead_nonce.cc
-source/crypto/test_mlkem_hybrid.cc
 "
 
 # Compression library C sources (PPMd8 from LZMA SDK, zstd amalgamated, LZHUF for B2F)
