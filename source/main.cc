@@ -1792,6 +1792,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_kxr;
                 failed += ARQ_kxr.test_kx_rx_routing();
             }
+            // KX-as-data forward TX stage/feed (data-flow-hybrid-kex.md §2.2): drive the
+            // REAL process_buffer_data_commander() source-switch — stage the reserved
+            // forward stream (x25519_pk_cmd + mlkem_pk) and frame it as DATA batches —
+            // then deliver those frames through the REAL copy_data_to_buffer()->kx_ingest()
+            // funnel and assert the pk + folded x25519 pubkey reassemble BYTE-IDENTICAL
+            // end to end, never reaching the app FIFO. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxt;
+                failed += ARQ_kxt.test_kx_tx_stream();
+            }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
             // pre-data re-ACK pinned the shared frames_to_read=2 across the first

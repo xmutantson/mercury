@@ -2177,6 +2177,15 @@ public:
   // routing branch reassembles via kx_ingest(), never delivers to the app FIFO, does
   // not advance the Option-W cursor, and raises no false stream-shift teardown.
   int test_kx_rx_routing();
+  // KX-as-data forward TX stage/feed fire proof (data-flow-hybrid-kex.md §2.2):
+  // drives the REAL process_buffer_data_commander() source-switch — stages the
+  // reserved forward stream (x25519_pk_cmd + mlkem_pk) via kx_stage_forward_stream()
+  // and lets the production data-fill loop frame it as DATA batches — then feeds the
+  // framed frames through the REAL copy_data_to_buffer()->kx_ingest() RX funnel and
+  // asserts the ML-KEM pk + folded x25519 pubkey reassemble BYTE-IDENTICAL end to end,
+  // never reaching the app FIFO. End-to-end forward transport through both production
+  // functions (no PHY / no channel). 0 = pass / N = failure count.
+  int test_kx_tx_stream();
 
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,
@@ -3766,6 +3775,14 @@ public:
   // max_frame at arq_commander.cc:20156 (same operands), so TX reserve == RX parse gate.
   bool w_stamp_rides() const
   {
+    // KX-as-data: reserved pre-activation KX batches carry NO Option-W wire stamp.
+    // The RX routes a KX batch to kx_ingest() (and `continue`s) BEFORE any stamp
+    // parse, and KEY_ACTIVATE re-anchors the cursor to a fresh bsi=0, so suppressing
+    // the EOB stamp keeps the KX frame payload byte-exact for kx_ingest reassembly
+    // (a trailing stamp would corrupt the key material). Deterministic on both peers
+    // (kx_stream_epoch() from shared pre-activation state); inert on every non-KX
+    // session (env-gated OFF, cipher not active) -> byte-identical.
+    if(kx_stream_epoch()) return false;
     if(!sack_v2_enabled || !header_carries_d5) return false;
     int mf = max_data_length + max_header_length
              - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
@@ -5166,6 +5183,16 @@ public:
   // KEY_ACTIVATE on BOTH peers, so the first user-data batch begins byte-identical
   // to a normal (unencrypted) session start after KX consumed wire bsi 0..N.
   void kx_stream_reanchor();
+  // KX-as-data forward TX stage (data-flow-hybrid-kex.md §2.2): generate this peer's
+  // X25519 + ML-KEM keypairs and assemble the reserved forward stream
+  //   MAGIC | KX_STREAM_FWD | total_len(LE) | x25519_pk_cmd(32) | mlkem_pk(1184)
+  // into kx_stream_tx_buf (a dedicated buffer, NOT fifo_buffer_tx — user data stays
+  // untouched + held). Arms kx_stream_tx_active so the process_buffer_data_commander()
+  // source-switch feeds it as DATA batches from ROBUST (driving the gearshift climb).
+  // Returns 0 on success, -1 on keypair-generation (RNG) failure -> caller holds
+  // fail-secure, never plaintext. TRANSPORT-ONLY: the pk/pubkey bytes are the identical
+  // material the crypto core consumes; only the transport that carries them changed.
+  int  kx_stage_forward_stream();
 
   char psk_hex[129];                  // Pre-shared key (hex string, up to 64 bytes = 128 hex chars)
   bool psk_mismatch_pending;          // Commander detected PSK mismatch, KEY_ACTIVATE sent for responder notification

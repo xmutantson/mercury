@@ -1228,18 +1228,31 @@ void cl_arq_controller::process_messages_commander()
 		// Key exchange gate: if encryption negotiated but not active, run key exchange first
 		if(encryption_enabled && !cipher_suite.is_active() && cipher_suite.get_kx_phase() == KX_IDLE)
 		{
-			printf("[CRYPTO] Turboshift done, initiating key exchange\n");
-			fflush(stdout);
-			add_message_control(KEY_EXCHANGE_1);
+			if(!kx_as_data_path())
+			{
+				printf("[CRYPTO] Turboshift done, initiating key exchange\n");
+				fflush(stdout);
+				add_message_control(KEY_EXCHANGE_1);
 #ifdef MERCURY_GUI_ENABLED
-			// Display-only: surface KX start so STRICT does not look hung.
-			gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
+				// Display-only: surface KX start so STRICT does not look hung.
+				gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
 #endif
-			// connection_status set to TRANSMITTING_CONTROL by add_message_control
-			return;
+				// connection_status set to TRANSMITTING_CONTROL by add_message_control
+				return;
+			}
+			// KX-AS-DATA (data-flow-hybrid-kex.md §2.2): the reserved forward stream
+			// (x25519_pk_cmd + mlkem_pk) is staged + fed as DATA batches by
+			// process_buffer_data_commander() — NOT the legacy one-shot KEY_EXCHANGE_1
+			// control frame (which deadlocks at ROBUST's tiny geometry). Fall through to
+			// the hold below; only the KX stream flows before activation, user data held.
 		}
-		// Hold data until key exchange completes (encryption negotiated but not yet active)
-		if(encryption_enabled && !cipher_suite.is_active())
+		// Hold user data until key exchange completes (encryption negotiated but not yet
+		// active). EXCEPTION (KX-as-data): while the reserved forward KX stream is active,
+		// allow the data-send path (process_messages_tx_data) to run so the staged KX
+		// batches reach the wire and drive the gearshift climb. User data is still held —
+		// only the KX stream (staged in kx_stream_tx_buf, never fifo_buffer_tx) flows
+		// before activation. Env-gated OFF (kx_stream_tx_active never set) -> unchanged.
+		if(encryption_enabled && !cipher_suite.is_active() && !kx_stream_tx_active)
 		{
 			return;
 		}
@@ -21364,7 +21377,27 @@ void cl_arq_controller::process_buffer_data_commander()
 		// process_commander() gates process_messages_tx_data(), but this function
 		// is called separately from process_messages() and needs its own gate.
 		if(encryption_enabled && !cipher_suite.is_active())
-			return;
+		{
+			// KX-AS-DATA forward source-switch (data-flow-hybrid-kex.md §2.2). Under the
+			// opt-in KX-as-data path, stage the reserved forward stream on first entry and
+			// let the raw-leg fill below feed it as DATA batches (driving the climb).
+			// Legacy pump path (env off): hold exactly as before.
+			if(kx_as_data_path())
+			{
+				if(!kx_stream_tx_active && kx_stream_tx_len == 0
+				   && cipher_suite.get_kx_phase() == KX_IDLE)
+				{
+					if(kx_stage_forward_stream() != 0)
+						return;   // stage (RNG) failure -> hold, fail-secure (no plaintext)
+					cipher_suite.set_kx_phase(KX_MLKEM_PK_SENT);  // KX started; don't re-init
+				}
+				if(!kx_stream_tx_active)
+					return;   // forward stream drained (awaiting reverse ct) -> hold
+				// else fall through: the raw-leg source-switch feeds kx_stream_tx_buf.
+			}
+			else
+				return;
+		}
 
 		// SACK retransmit pending: don't create new crypto batch from FIFO.
 		// process_messages_tx_data() will send retransmit-only batch.
@@ -21403,7 +21436,12 @@ void cl_arq_controller::process_buffer_data_commander()
 		// (block_under_tx==NO requirement preserved).
 		bool stage_ok = (block_under_tx == NO)
 		             || (sack_v2_enabled && retransmit_count > 0);
-		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && stage_ok)
+		// KX-as-data: the reserved forward stream lives in kx_stream_tx_buf (not
+		// fifo_buffer_tx), which may be empty during the KX epoch — allow the fill when
+		// the KX stream is active too. Env-gated OFF -> kx_stream_tx_active never set.
+		bool have_new_tx = (fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size())
+		                   || kx_stream_tx_active;
+		if( have_new_tx && stage_ok)
 		{
 			// Option W (data-flow-stream-offset.md §2.1): total TRANSPORTED payload bytes
 			// framed for the new-data batch built THIS call (comp_size in the compressed
@@ -21911,6 +21949,36 @@ void cl_arq_controller::process_buffer_data_commander()
 				batch_uncompressed_size = 0;
 				for(int i=0;i<fill_limit;i++)
 				{
+					// KX-AS-DATA forward source-switch (data-flow-hybrid-kex.md §2.2).
+					// Feed the reserved forward KX stream from its dedicated buffer, NOT
+					// fifo_buffer_tx (user data stays untouched + held). KX batches carry
+					// NO Option-W wire stamp (w_stamp_rides() is false in the KX epoch) and
+					// do NOT advance the Option-W cursor / stream CRC / backup FIFO —
+					// KEY_ACTIVATE re-anchors delivery to a fresh bsi=0, and the RX routes
+					// these frames to kx_ingest() before any stamp/cursor logic. They are
+					// otherwise ordinary DATA frames, so the whole windowing / SACK /
+					// retransmit engine carries them (dissolving the pattern-ACK wall).
+					if(kx_stream_tx_active)
+					{
+						int kx_remain = kx_stream_tx_len - kx_stream_tx_sent;
+						if(kx_remain <= 0){ kx_stream_tx_active = false; break; }
+						data_read_size = (kx_remain < max_frame) ? kx_remain : max_frame;
+						memcpy(message_TxRx_byte_buffer,
+						       kx_stream_tx_buf + kx_stream_tx_sent, data_read_size);
+						kx_stream_tx_sent += data_read_size;
+						block_under_tx = YES;
+						if(data_read_size==max_frame)
+							add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
+						else
+							add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
+						filled++;
+						if(kx_stream_tx_sent >= kx_stream_tx_len)
+						{
+							kx_stream_tx_active = false;   // whole forward stream staged
+							break;
+						}
+						continue;
+					}
 					// Option W CORE (data-flow-stream-offset.md §8.1): reserve W_EOB_RESERVE
 					// payload bytes on the EOB (last) frame of the batch so its
 					// header+payload+stamp fits the codeword C. The last frame is the one at

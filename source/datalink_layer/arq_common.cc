@@ -8346,6 +8346,53 @@ void cl_arq_controller::kx_stream_reanchor()
 	fflush(stdout);
 }
 
+// KX-AS-DATA forward TX stage (data-flow-hybrid-kex.md §2.2). Generate this peer's
+// X25519 + ML-KEM keypairs and assemble the reserved forward stream into the dedicated
+// kx_stream_tx_buf, then arm kx_stream_tx_active so the process_buffer_data_commander()
+// raw-leg source-switch feeds it as DATA batches (compression is bypassed in the KX
+// epoch, so a KX batch always lands on the headerless raw leg; the frames carry NO
+// Option-W wire stamp). Fail-secure: a keypair-generation (RNG) failure returns -1
+// WITHOUT arming, so the caller holds — never plaintext. TRANSPORT-ONLY: the crypto
+// core later consumes the identical kx_mlkem_pk + x25519 pubkey bytes; only the
+// transport that carries them changed.
+int cl_arq_controller::kx_stage_forward_stream()
+{
+	uint8_t x25519_pub[X25519_KEY_SIZE];
+	if(cipher_suite.generate_x25519_keypair(x25519_pub) != 0)
+	{
+		printf("[CRYPTO] ERROR: KX-as-data forward stage — X25519 keypair failed (RNG)\n");
+		fflush(stdout);
+		return -1;
+	}
+	if(cipher_suite.generate_mlkem_keypair(kx_mlkem_pk) != 0)
+	{
+		printf("[CRYPTO] ERROR: KX-as-data forward stage — ML-KEM keypair failed (RNG)\n");
+		fflush(stdout);
+		return -1;
+	}
+	kx_mlkem_pk_ready = true;
+
+	// MAGIC(4 BE) | kind(1) | total_len(2 LE) | x25519_pk_cmd(32) | mlkem_pk(1184)
+	int p = 0;
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_MAGIC >> 24) & 0xFF);
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_MAGIC >> 16) & 0xFF);
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_MAGIC >>  8) & 0xFF);
+	kx_stream_tx_buf[p++] = (uint8_t)( KX_STREAM_MAGIC        & 0xFF);
+	kx_stream_tx_buf[p++] = KX_STREAM_FWD;
+	kx_stream_tx_buf[p++] = (uint8_t)( KX_STREAM_FWD_LEN       & 0xFF);   // LE low
+	kx_stream_tx_buf[p++] = (uint8_t)((KX_STREAM_FWD_LEN >> 8) & 0xFF);   // LE high
+	memcpy(kx_stream_tx_buf + p, x25519_pub, X25519_KEY_SIZE);   p += X25519_KEY_SIZE;
+	memcpy(kx_stream_tx_buf + p, kx_mlkem_pk, MLKEM_PK_SIZE);    p += MLKEM_PK_SIZE;
+
+	kx_stream_tx_len    = p;                 // KX_STREAM_HDR + KX_STREAM_FWD_LEN == 1223
+	kx_stream_tx_sent   = 0;
+	kx_stream_tx_active = true;
+	printf("[CRYPTO] KX-as-data forward stream staged (%d bytes: x25519_pk_cmd + mlkem_pk) — feeding as DATA\n",
+		kx_stream_tx_len);
+	fflush(stdout);
+	return 0;
+}
+
 // KX-AS-DATA reserved-stream RX ingest fire proof (data-flow-hybrid-kex.md T1/T3).
 // Drives the REAL kx_ingest() reassembler on a throwaway controller (no channel /
 // no IONOS / no RF): (a) a well-formed FORWARD stream delivered in IRREGULAR
@@ -8435,6 +8482,166 @@ int cl_arq_controller::test_kx_ingest()
 	check(kx_ingest(fwd, KX_STREAM_HDR) < 0, "KX byte after activation -> REFUSE (-1)");
 
 	printf("[TEST-KX-INGEST] %s (failures=%d)\n", failures? "FAIL":"ALL PASS", failures);
+	fflush(stdout);
+	return failures;
+}
+
+// KX-AS-DATA forward TX stage/feed fire proof (data-flow-hybrid-kex.md §2.2). Drives the
+// REAL process_buffer_data_commander() source-switch end to end: the production hold path
+// stages the reserved forward stream (x25519_pk_cmd + mlkem_pk) via kx_stage_forward_stream()
+// and the raw-leg fill frames it as ordinary DATA batches (NO Option-W wire stamp, fed from
+// kx_stream_tx_buf, never fifo_buffer_tx). The framed bytes are then delivered through the
+// REAL copy_data_to_buffer()->kx_ingest() RX funnel; the ML-KEM pk + folded x25519 pubkey
+// MUST reassemble BYTE-IDENTICAL and NEVER reach the app FIFO. Both production functions,
+// no PHY / no channel / no telecom_system. 0 = pass / N = failure count.
+int cl_arq_controller::test_kx_tx_stream()
+{
+	int failures = 0;
+	auto check = [&](bool cond, const char* name){
+		if(!cond){ failures++; printf("[TEST-KX-TXSTREAM] FAIL: %s\n", name); }
+		else      { printf("[TEST-KX-TXSTREAM] ok: %s\n", name); }
+		fflush(stdout);
+	};
+
+	// --- Controller setup (no-compression raw-leg template; mirrors test_kx_rx_routing) ---
+	this->max_data_length    = 170;
+	this->max_header_length  = 6;
+	this->max_message_length = 200;
+	this->nMessages          = 120;
+	this->sack_v2_enabled    = true;
+	this->sack_enabled       = true;
+	this->header_carries_d5  = false;    // deterministic max_frame (no D5 byte)
+	this->compression_enabled= false;
+	this->robust_enabled     = NO;
+	this->narrowband_enabled = NO;
+	this->current_configuration = 0;
+	this->role               = COMMANDER;
+	this->original_role      = COMMANDER;
+	this->link_status        = CONNECTED;
+	this->connection_status  = TRANSMITTING_DATA;
+	this->block_under_tx     = NO;
+	this->message_batch_counter_tx = 0;
+	this->retransmit_count   = 0;
+	const int DBS = 8;
+	this->set_data_batch_size(DBS);
+	deinit_messages_buffers();
+	if(init_messages_buffers() != SUCCESSFUL){
+		printf("[TEST-KX-TXSTREAM] ERROR: init_messages_buffers() failed\n");
+		fflush(stdout); return 1;
+	}
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.flush();        // NO user data staged -> only the KX stream flows
+	fifo_buffer_backup.flush();
+
+	// Enter the KX-as-data pre-activation epoch (env gate ON + encryption negotiated,
+	// cipher NOT active, phase IDLE so the production hold path stages on first entry).
+	setenv("MERCURY_KX_AS_DATA", "1", 1);
+	this->encryption_enabled = true;
+	cipher_suite.set_kx_phase(KX_IDLE);
+	kx_chunk_state_reset();
+	check(kx_stream_epoch(), "commander is in the KX-as-data pre-activation epoch");
+	check(!cipher_suite.is_active(), "cipher not yet active (pre-activation)");
+
+	// --- PHASE 1: REAL production staging + raw-leg source-switch framing ---------------
+	std::vector<unsigned char> collected;   // all framed KX bytes, in slot/stream order
+	collected.reserve(KX_STREAM_BUFSZ);
+	bool drained = false;
+	for(int cycle=0; cycle<64 && !drained; cycle++)
+	{
+		process_buffer_data_commander();    // REAL: stage (cycle 0) + fill from kx_stream_tx_buf
+		int staged_now = 0;
+		for(int i=0;i<nMessages;i++)
+		{
+			if(messages_tx[i].status==ADDED_TO_LIST)
+			{
+				for(int j=0;j<messages_tx[i].length;j++)
+					collected.push_back((unsigned char)messages_tx[i].data[j]);
+				messages_tx[i].status = FREE;
+				messages_tx[i].length = 0;
+				staged_now++;
+			}
+		}
+		if(staged_now == 0) drained = true;
+		this->block_under_tx = NO;          // allow the next batch to stage
+	}
+
+	int want_len = KX_STREAM_HDR + KX_STREAM_FWD_LEN;   // 1223
+	check(kx_stream_tx_len == want_len, "production staged the forward stream (len==1223)");
+	check(kx_mlkem_pk_ready, "kx_mlkem_pk_ready set by the forward stage");
+	check((int)collected.size() == want_len,
+		"raw-leg source-switch framed the WHOLE forward stream (bytes==1223)");
+	check(!kx_stream_tx_active, "forward stream fully drained (kx_stream_tx_active cleared)");
+
+	// Reference = the staged stream (keypairs are random per run).
+	unsigned char saved_stream[KX_STREAM_BUFSZ];
+	int saved_len = (kx_stream_tx_len <= KX_STREAM_BUFSZ) ? kx_stream_tx_len : KX_STREAM_BUFSZ;
+	memcpy(saved_stream, kx_stream_tx_buf, saved_len);
+	bool concat_ok = ((int)collected.size() == saved_len);
+	if(concat_ok)
+		for(int i=0;i<saved_len;i++) if(collected[i] != saved_stream[i]){ concat_ok=false; break; }
+	check(concat_ok, "framed bytes BYTE-IDENTICAL to the staged forward stream, in order");
+	bool hdr_ok = saved_len >= KX_STREAM_HDR
+		&& collected[0]==(unsigned char)((KX_STREAM_MAGIC>>24)&0xFF)
+		&& collected[1]==(unsigned char)((KX_STREAM_MAGIC>>16)&0xFF)
+		&& collected[2]==(unsigned char)((KX_STREAM_MAGIC>>8)&0xFF)
+		&& collected[3]==(unsigned char)(KX_STREAM_MAGIC&0xFF)
+		&& collected[4]==KX_STREAM_FWD;
+	check(hdr_ok, "framed stream carries the KX magic + FWD kind on the wire");
+
+	// --- PHASE 2: deliver the framed bytes through the REAL RX funnel --------------------
+	unsigned char x_ref[X25519_KEY_SIZE];
+	unsigned char pk_ref[MLKEM_PK_SIZE];
+	memcpy(x_ref,  saved_stream + KX_STREAM_HDR,                   X25519_KEY_SIZE);
+	memcpy(pk_ref, saved_stream + KX_STREAM_HDR + X25519_KEY_SIZE, MLKEM_PK_SIZE);
+
+	// Zero the crypto buffers + reset RX state so the reassembly is proven FRESH — the RX
+	// must rebuild the pk from the received frames, it cannot "keep" the TX pk.
+	kx_chunk_state_reset();                 // clears kx_mlkem_pk_ready + kx_stream_rx_*
+	memset(kx_mlkem_pk, 0, MLKEM_PK_SIZE);
+	memset(kx_stream_peer_x25519, 0, X25519_KEY_SIZE);
+	rx_stream_emitted_bsi_hw     = -1;
+	rx_stream_delivered          = 0;
+	rsp_cross_session_seam_armed = false;
+	for(int s=0;s<256;s++) rx_stream_stamp[s].valid = false;
+	decrypt_delivered_bsi = 0;
+	for(int i=0;i<nMessages;i++){ messages_rx[i].status=FREE; messages_rx[i].length=0; }
+
+	// Lay the framed bytes across ACKED messages_rx[] slots (<= max_data_length each),
+	// exactly as the RSP data receiver hands a delivered batch to the funnel.
+	int total = (int)collected.size();
+	int per = (total + DBS - 1) / DBS;
+	if(per > max_data_length) per = max_data_length;
+	int off = 0, nslots = 0;
+	for(int i=0;i<nMessages && off<total;i++){
+		int n = total - off; if(n > per) n = per;
+		memcpy(messages_rx[i].data, &collected[off], n);
+		messages_rx[i].length = n;
+		messages_rx[i].status = ACKED;
+		off += n; nslots++;
+	}
+	check(off == total, "framed bytes fully laid across RX slots for the funnel");
+
+	fifo_buffer_rx.set_size(4096);
+	fifo_buffer_rx.flush();
+	int occ_before = fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size();
+
+	copy_data_to_buffer();      // REAL RX funnel -> kx_ingest routing
+
+	int occ_after = fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size();
+	check(kx_mlkem_pk_ready, "RX funnel reassembled the forward stream via kx_ingest");
+	check(kx_mlkem_pk_ready && memcmp(kx_mlkem_pk, pk_ref, MLKEM_PK_SIZE)==0,
+		"end-to-end: ML-KEM pk BYTE-IDENTICAL (TX source-switch -> RX kx_ingest)");
+	check(memcmp(kx_stream_peer_x25519, x_ref, X25519_KEY_SIZE)==0,
+		"end-to-end: folded x25519 pubkey BYTE-IDENTICAL");
+	check(occ_after == occ_before, "app FIFO UNTOUCHED — KX never delivered to the app");
+	check(this->link_status != DROPPED, "no false teardown on the KX batches");
+
+	// Undo the env gate so no sibling --test block inherits the KX-as-data path.
+	unsetenv("MERCURY_KX_AS_DATA");
+	this->encryption_enabled = false;
+
+	printf("[TEST-KX-TXSTREAM] %s (failures=%d)\n", failures? "FAIL":"ALL PASS", failures);
 	fflush(stdout);
 	return failures;
 }
