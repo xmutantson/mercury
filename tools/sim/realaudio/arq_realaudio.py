@@ -53,6 +53,12 @@ AUTHFAIL_RE = re.compile(r"NONCE-TRACE\] DEC-AUTHFAIL|auth.?fail|PSK mismatch|de
 NONCE_ENC_RE = re.compile(r"NONCE-TRACE\] ENC dir=(\d+) idx=(\d+)")
 NONCE_DECOK_RE = re.compile(r"NONCE-TRACE\] DEC-OK dir=(\d+) idx=(\d+)")
 ENC_ACT_RE = re.compile(r"\[CRYPTO\] Encryption ACTIVATED")
+# PRODUCTION crypto emissions — the lines the modem ACTUALLY logs on the live
+# path (the NONCE-TRACE lines above are env-gated debug and are never emitted,
+# so the durable counters read all-0 without these). [CRYPTO-TX] is the AEAD
+# seal, [CRYPTO-RX] "Decrypted: N -> M bytes OK" is a successful open.
+CRYPTO_TX_RE = re.compile(r"\[CRYPTO-TX\] Encrypting \d+ bytes, wire_bsi=\d+ index=(\d+) dir=(\d+)")
+CRYPTO_RX_OK_RE = re.compile(r"\[CRYPTO-RX\] Decrypted: \d+ -> \d+ bytes OK")
 
 
 class State:
@@ -121,6 +127,22 @@ def log_output(proc, label, logfile, t0, st):
                     if st.enc_nonces[key] > 1:
                         st.nonce_reuse += 1
             if NONCE_DECOK_RE.search(text):
+                with st.lock:
+                    st.dec_ok += 1
+            m = CRYPTO_TX_RE.search(text)
+            if m:
+                # Production AEAD seal: (peer, direction, unwrapped index). A
+                # second [CRYPTO-TX] of the same (dir,idx) within ONE peer's log
+                # is a nonce reuse (same key+nonce). The re-seal generation fold
+                # keeps a legitimate config-transition re-seal at a DISTINCT index,
+                # so a healthy run never double-counts a (dir,idx).
+                enc_idx = int(m.group(1)); enc_dir = int(m.group(2))
+                key = (label, enc_dir, enc_idx)
+                with st.lock:
+                    st.enc_nonces[key] = st.enc_nonces.get(key, 0) + 1
+                    if st.enc_nonces[key] > 1:
+                        st.nonce_reuse += 1
+            if CRYPTO_RX_OK_RE.search(text):
                 with st.lock:
                     st.dec_ok += 1
     except (ValueError, OSError):
