@@ -27,6 +27,7 @@
 #include "common/sim_clock.h"
 #include <unistd.h>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include "tcp_socket.h"
 #include "fifo_buffer.h"
@@ -609,6 +610,25 @@ public:
 
   void process_messages_commander();
   int add_message_control(char code);
+
+  // --- Hybrid ML-KEM KX chunk transport helpers (MLKEM_HYBRID_PLAN.md §4) ----
+  // Per-frame chunk payload capacity = the control-frame data width minus the
+  // 4-byte KX chunk header. Derived from the SAME geometry the X25519 KX uses
+  // (max_data_length + max_header_length - CONTROL_ACK_CONTROL_HEADER_LENGTH).
+  int  kx_chunk_payload_capacity();
+  // Begin a chunked send of kx_mlkem_pk (KEY_EXCHANGE_2) or kx_mlkem_ct
+  // (KEY_EXCHANGE_3). Sets up kx_tx_* state and queues the FIRST chunk frame.
+  // Returns 0 on success, -1 on error (e.g. source not ready).
+  int  kx_begin_chunk_send(int kind);
+  // Queue the next pending KX chunk control frame (kx_tx_next_index). Returns 1
+  // if a frame was queued, 0 if all chunks have been sent, -1 on error.
+  int  kx_send_next_chunk();
+  // Process a received KEY_EXCHANGE_2/3 control frame (data[] holds the 4-byte
+  // header + chunk payload). Validates + reassembles into kx_data_buf. Returns
+  // 1 when the full buffer is now complete (last needed chunk arrived), 0 when
+  // more chunks are still needed, -1 on a rejected chunk (CRC/kind/index/len).
+  int  kx_receive_chunk(const uint8_t* frame, int frame_len, int expect_kind);
+
   void process_messages_tx_control();
   int add_message_tx_data(char type, int length, char* data);
   void process_messages_tx_data();
@@ -2153,6 +2173,12 @@ public:
   // One-shot, exits rc.
   int test_idle_switch_role_race();
 
+  // SWITCH_ROLE re-ride race (idle-switchrole-race.md §6) — a peer re-acquiring
+  // COMMANDER via SWITCH_ROLE must not inherit a stale session_data_frame_sent
+  // from its previous commander stint (the R1 reverse-transfer double-swap gate).
+  // FAILS-BEFORE with -DSWITCHROLE_RERIDE_FAILBEFORE. One-shot, exits rc.
+  int test_switch_role_reride_race();
+
   // IDLE-SWITCHROLE-RACE recovery path (idle-switchrole-race.md §3/§4 Part C).
   // Drives the REAL BREAK-EXHAUSTED re-arm site (arq_commander.cc:~410) on a
   // never-fed Commander (no RX data, empty tx FIFO, zero-byte re-queue) K+1 times.
@@ -2190,6 +2216,37 @@ public:
   // frees a RECEIVED slot. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE (the slot stays
   // stuck and the later control frame is dropped). 0 PASS / 1 FAIL.
   int test_rx_ctrl_drop();
+
+  // ML-KEM KX MULTI-CHUNK LIVE-RX REASSEMBLY regression
+  // (MLKEM_HYBRID_PLAN.md §5 / data-flow-control-slot-lifecycle.md). Drives a
+  // multi-chunk KX2 (encaps key, RSP consumer) and KX3 (ciphertext, CMD consumer)
+  // through the REAL live control-RX consumer functions (process_control_responder
+  // / process_control_commander) after staging each chunk through the REAL slot
+  // producer that hardcodes messages_control.length = 1. FAILS-BEFORE: the call
+  // sites fed length=1 into kx_receive_chunk -> kx_chunk_decode rejected every
+  // chunk -> reassembly never completed. PASSES-AFTER: the call sites pass the real
+  // slot width -> full reassembly + live encapsulate/decapsulate. In-process
+  // synthetic-fire, no IONOS/RF/telecom_system. 0 PASS / N = failure count.
+  int test_kx_chunk_live_rx();
+  // KX-as-data reserved-stream RX ingest fire proof (data-flow-hybrid-kex.md T1/T3):
+  // reassembles a fragmented forward/reverse stream BYTE-IDENTICAL + the fail-secure
+  // REFUSE fires on bad magic/kind/length and on a post-activation byte.
+  int test_kx_ingest();
+  // KX-as-data RX ROUTING fire proof (data-flow-hybrid-kex.md §2.3): drives the REAL
+  // copy_data_to_buffer() delivery funnel with a forward KX stream staged across ACKED
+  // messages_rx[] slots in the pre-activation KX epoch, and proves the production
+  // routing branch reassembles via kx_ingest(), never delivers to the app FIFO, does
+  // not advance the Option-W cursor, and raises no false stream-shift teardown.
+  int test_kx_rx_routing();
+  // KX-as-data forward TX stage/feed fire proof (data-flow-hybrid-kex.md §2.2):
+  // drives the REAL process_buffer_data_commander() source-switch — stages the
+  // reserved forward stream (x25519_pk_cmd + mlkem_pk) via kx_stage_forward_stream()
+  // and lets the production data-fill loop frame it as DATA batches — then feeds the
+  // framed frames through the REAL copy_data_to_buffer()->kx_ingest() RX funnel and
+  // asserts the ML-KEM pk + folded x25519 pubkey reassemble BYTE-IDENTICAL end to end,
+  // never reaching the app FIFO. End-to-end forward transport through both production
+  // functions (no PHY / no channel). 0 = pass / N = failure count.
+  int test_kx_tx_stream();
 
   // SIM_INPROC feasibility prototype (single-process-sim-refactor.md).
   // Single-instance in-process self-loopback: keys PTT, emits a real frame,
@@ -3779,6 +3836,14 @@ public:
   // max_frame at arq_commander.cc:20156 (same operands), so TX reserve == RX parse gate.
   bool w_stamp_rides() const
   {
+    // KX-as-data: reserved pre-activation KX batches carry NO Option-W wire stamp.
+    // The RX routes a KX batch to kx_ingest() (and `continue`s) BEFORE any stamp
+    // parse, and KEY_ACTIVATE re-anchors the cursor to a fresh bsi=0, so suppressing
+    // the EOB stamp keeps the KX frame payload byte-exact for kx_ingest reassembly
+    // (a trailing stamp would corrupt the key material). Deterministic on both peers
+    // (kx_stream_epoch() from shared pre-activation state); inert on every non-KX
+    // session (env-gated OFF, cipher not active) -> byte-identical.
+    if(kx_stream_epoch()) return false;
     if(!sack_v2_enabled || !header_carries_d5) return false;
     int mf = max_data_length + max_header_length
              - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
@@ -5028,6 +5093,14 @@ public:
   // batch invariant (data-flow-batch-size.md §1) — no wire negotiation needed.
   bool compression_viable_for_batch() const
   {
+    // KX-as-data bypass: the reserved pre-activation KX stream carries
+    // ciphertext-random public key material — compressing it wins nothing and
+    // would desync the streaming compressor context that must stay pristine for
+    // the first user byte. Both peers compute kx_stream_epoch() deterministically
+    // from the shared pre-activation state, so they bypass on the SAME batches
+    // (no headerless-vs-header mis-parse). Inert (false-returning branch never
+    // taken) on every non-encrypted session.
+    if(kx_stream_epoch()) return false;
     if(!compression_enabled) return false;
     int eff_long = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
     int max_frame = max_data_length + max_header_length - eff_long;
@@ -5040,6 +5113,19 @@ public:
   cl_cipher_suite cipher_suite;       // Per-connection cipher state (ephemeral keys, session key)
   int encryption_mode;                // ENCRYPT_OFF, ENCRYPT_STRICT, ENCRYPT_FAST
   bool encryption_enabled;            // Negotiated: both sides have CAP_ENCRYPTION and mode != OFF
+  // Encryption-negotiation policy (single source of truth for the commander AND
+  // responder). FAIL-CLOSED: an -E opt-in against a peer that does not advertise
+  // CAP_ENCRYPTION (unsupported, or a MITM stripped the bit) REFUSES — it never
+  // downgrades to plaintext. DEFAULT-OFF is preserved: with encryption_mode ==
+  // ENCRYPT_OFF the outcome is PLAINTEXT_OK, so an operator who did not opt in is
+  // unaffected. Defined in arq_common.cc.
+  enc_negotiation_outcome_t decide_encryption_negotiation(int encryption_mode,
+                                                          uint8_t local_capability,
+                                                          uint8_t peer_capability);
+  // In-process regression for the fail-closed policy (runs in --test). Returns
+  // 0=PASS, else the fail count. Fails-before: -DENC_FAILOPEN_FAILBEFORE (which
+  // compiles the historical opportunistic-plaintext FAST downgrade back in).
+  int test_encryption_fail_closed();
   // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1):
   // negotiated session flag — both ends advertised CAP_CUMULATIVE_ACK (which is itself
   // gated by the env opt-in MERCURY_CUMULATIVE_ACK on the local advertise). When true,
@@ -5097,8 +5183,169 @@ public:
   int consecutive_auth_failures;      // Auth failures since last success (3 → disconnect)
   uint8_t* kx_data_buf;              // Buffer for ML-KEM key exchange data (1184 or 1088 bytes)
   int kx_data_len;                    // Length of pending key exchange data
+  // --- Hybrid ML-KEM KX chunk transport (MLKEM_HYBRID_PLAN.md §4-§5,
+  //     data-flow-hybrid-kex.md) ----------------------------------------------
+  // The 1184B encaps key (KX2, CMD->RSP) and 1088B ciphertext (KX3, RSP->CMD)
+  // ride a sequence of KEY_EXCHANGE_2/3 control frames over the OFDM data
+  // configuration (each frame = one 4-byte-headed chunk; the existing per-frame
+  // control ACK/retransmit covers loss). State below drives the chunked send and
+  // the receive-side reassembly. All cleared on session reset / KX completion.
+  // The reassembly target is kx_data_buf (MLKEM_PK_SIZE bytes, lazily alloc'd).
+  uint8_t kx_mlkem_pk[1184];          // CMD: generated encaps key (also bind input)
+  uint8_t kx_mlkem_ct[1088];          // RSP: encapsulated ciphertext (also bind input)
+  bool kx_mlkem_pk_ready;             // CMD generated / RSP reassembled the pk
+  bool kx_mlkem_ct_ready;             // RSP encapsulated / CMD reassembled the ct
+  int  kx_tx_kind;                    // KX kind currently being SENT (0x3F/0x40/0=idle)
+  int  kx_tx_total;                   // total bytes of the buffer being sent
+  int  kx_tx_count;                   // chunk count for the send
+  int  kx_tx_next_index;             // next chunk index to transmit
+  int  kx_tx_chunk_cap;              // per-frame chunk payload capacity (sender)
+  const uint8_t* kx_tx_src;          // points at kx_mlkem_pk or kx_mlkem_ct
+  int  kx_rx_kind;                   // KX kind currently being REASSEMBLED (0=idle)
+  int  kx_rx_count;                  // expected chunk count (from first chunk)
+  int  kx_rx_chunk_cap;             // per-frame chunk payload capacity (receiver)
+  int  kx_rx_total;                 // expected total bytes (MLKEM_PK_SIZE/CT_SIZE)
+  int  kx_rx_received;             // distinct chunks received so far
+  bool kx_rx_got[256];            // per-index arrival bitmap
+
+  // ---- KX-as-data reserved pre-activation stream (data-flow-hybrid-kex.md) ----
+  // The classical X25519 pubkey + the large ML-KEM artifact ride the DATA engine
+  // as a reserved, self-identifying stream (decoded frames + real SACK sequence +
+  // in-order + selective retransmit), consumed by the crypto state machine and
+  // NEVER delivered to the app. Dissolves the control-plane pattern-ACK wall (the
+  // per-chunk control ACK carries no decoded index, so a lost chunk cannot be
+  // selectively re-requested). On the wire the transfer's first bytes are:
+  //   [0..3] KX_STREAM_MAGIC (BE)  [4] kind (KX_STREAM_FWD/REV)  [5..6] total_len (LE u16)
+  // total_len counts the PAYLOAD bytes that follow the 7-byte header. The stream is
+  // interpreted as KX iff the receiver is PRE-ACTIVATION (encryption_enabled &&
+  // !cipher_suite.is_active()), where user data is held, so routing is unambiguous;
+  // the magic is the belt-and-suspenders wire distinguisher cross-checked for
+  // fail-secure. KX bytes are public key material -> plaintext (encryption not yet
+  // active), ciphertext-random -> compression bypassed, and carry NO Option-W wire
+  // stamp (so the positional backstop is a safe no-op) so KEY_ACTIVATE can re-anchor
+  // the delivery/bsi/nonce state to a fresh bsi=0 for the first user batch.
+  static const uint32_t KX_STREAM_MAGIC = 0x4B585331u; // "KXS1"
+  static const uint8_t  KX_STREAM_FWD   = 0x01;        // CMD->RSP: x25519_pk_cmd(32)+mlkem_pk(1184)
+  static const uint8_t  KX_STREAM_REV   = 0x02;        // RSP->CMD: x25519_pk_rsp(32)+mlkem_ct(1088)
+  static const int      KX_STREAM_HDR   = 7;           // magic(4)+kind(1)+total_len(2)
+  static const int      KX_STREAM_PAYLOAD_MAX = X25519_KEY_SIZE + MLKEM_PK_SIZE; // 32+1184=1216
+  static const int      KX_STREAM_BUFSZ = KX_STREAM_HDR + KX_STREAM_PAYLOAD_MAX; // 1223
+  static const int      KX_STREAM_FWD_LEN = X25519_KEY_SIZE + MLKEM_PK_SIZE;     // 1216 payload
+  static const int      KX_STREAM_REV_LEN = X25519_KEY_SIZE + MLKEM_CT_SIZE;     // 1120 payload
+  // TX staging (dedicated buffer, NOT fifo_buffer_tx — user data stays untouched)
+  uint8_t kx_stream_tx_buf[KX_STREAM_BUFSZ];
+  int     kx_stream_tx_len;      // bytes staged (header + payload), 0 = none
+  int     kx_stream_tx_sent;     // bytes already fed into the data engine
+  bool    kx_stream_tx_active;   // this session is streaming KX-as-data (feed past the hold)
+  // RX reassembly of the reserved KX stream
+  uint8_t kx_stream_rx_buf[KX_STREAM_BUFSZ];
+  int     kx_stream_rx_have;     // bytes accumulated so far (incl the 7-byte header)
+  int     kx_stream_rx_expected; // KX_STREAM_HDR + total_len (known once the header lands)
+  uint8_t kx_stream_rx_kind;     // 0 / KX_STREAM_FWD / KX_STREAM_REV currently reassembling
+  bool    kx_stream_rx_is_kx;    // the current RX transfer is the reserved KX stream
+  uint8_t kx_stream_peer_x25519[X25519_KEY_SIZE]; // folded classical pubkey from the last completed KX stream
+  // Reverse-ct / activation handshake state (R1 SWITCH_ROLE, data-flow-hybrid-kex.md
+  // §7). kx_role_swap_sent: this peer has queued its ONE KX SWITCH_ROLE handoff (the
+  // CMD after the forward pk is delivered; the RSP after the reverse ct is delivered).
+  // kx_reverse_consumed: this peer (the CMD / keypair holder) decapsulated the reverse
+  // ct — gates KEY_ACTIVATE so the RSP (which only encapsulates) never sends it.
+  // kx_key_activate_sent: the CMD has queued KEY_ACTIVATE once. Cleared in
+  // kx_chunk_state_reset(); env-gated OFF -> never set.
+  bool kx_role_swap_sent;
+  bool kx_reverse_consumed;
+  bool kx_key_activate_sent;
+
+  // RX ingest of the reserved KX stream: parse+validate the header on the first
+  // bytes, accumulate payload, and on completion hand the pk/ct to the crypto
+  // buffers (kx_mlkem_pk/kx_mlkem_ct + the folded x25519 pubkey). NEVER routes to
+  // fifo_buffer_rx (the app socket). Returns the number of bytes CONSUMED as KX
+  // (== len on the happy path), or -1 on a fail-secure REFUSE (bad magic/kind/len /
+  // marker-present-while-active / overflow) — the caller must tear the link down,
+  // never fall through to plaintext. On completion sets kx_stream_rx_done_kind.
+  int  kx_ingest(const uint8_t* buf, int len);
+  int  kx_stream_rx_done_kind;   // set to KX_STREAM_FWD/REV when a transfer completes; 0 otherwise
+  bool kx_as_data_path() const   // runtime A/B gate for the new transport (opt-in while unproven)
+  {
+    if(!encryption_enabled) return false;
+    const char* e = std::getenv("MERCURY_KX_AS_DATA");
+    return e && *e && atoi(e) != 0;
+  }
+  // TRUE while this session is in the KX-as-data pre-activation epoch on EITHER
+  // side (TX staging active, or RX reassembling a KX stream, or simply
+  // pre-activation under the new path). Consulted by the compression-bypass and
+  // Option-W stamp/cursor suppression so both peers act deterministically from the
+  // shared pre-activation state.
+  bool kx_stream_epoch() const
+  {
+    return kx_stream_tx_active || kx_stream_rx_is_kx
+        || (kx_as_data_path() && !cipher_suite.is_active());
+  }
+  // Re-anchor the delivery/bsi/nonce/Option-W state to a fresh bsi=0 baseline at
+  // KEY_ACTIVATE on BOTH peers, so the first user-data batch begins byte-identical
+  // to a normal (unencrypted) session start after KX consumed wire bsi 0..N.
+  void kx_stream_reanchor();
+  // KX-as-data forward TX stage (data-flow-hybrid-kex.md §2.2): generate this peer's
+  // X25519 + ML-KEM keypairs and assemble the reserved forward stream
+  //   MAGIC | KX_STREAM_FWD | total_len(LE) | x25519_pk_cmd(32) | mlkem_pk(1184)
+  // into kx_stream_tx_buf (a dedicated buffer, NOT fifo_buffer_tx — user data stays
+  // untouched + held). Arms kx_stream_tx_active so the process_buffer_data_commander()
+  // source-switch feeds it as DATA batches from ROBUST (driving the gearshift climb).
+  // Returns 0 on success, -1 on keypair-generation (RNG) failure -> caller holds
+  // fail-secure, never plaintext. TRANSPORT-ONLY: the pk/pubkey bytes are the identical
+  // material the crypto core consumes; only the transport that carries them changed.
+  int  kx_stage_forward_stream();
+  // KX-as-data reverse TX stage (data-flow-hybrid-kex.md §7). Assemble the reserved
+  // reverse stream MAGIC | KX_STREAM_REV | total_len(LE) | x25519_pk_rsp(32) |
+  // mlkem_ct(1088) into kx_stream_tx_buf and arm kx_stream_tx_active. The RSP streams
+  // it once it becomes the data-commander via R1 SWITCH_ROLE (the SAME proven
+  // role-agnostic source-switch). kx_mlkem_ct must already hold the encapsulated
+  // ciphertext. Returns 0, or -1 fail-secure (ct not ready) -> caller tears down.
+  int  kx_stage_reverse_stream(const uint8_t* x25519_pk_rsp);
+  // On full FORWARD stream receipt (RSP side): compute the classical shared secret
+  // against the folded CMD pubkey, encapsulate against the CMD's ML-KEM pk, derive the
+  // transcript-bound hybrid key, and stage the reverse ct. Returns 0, or -1 on any
+  // crypto/RNG failure -> caller tears the link down (never plaintext).
+  int  kx_on_forward_complete();
+  // On full REVERSE stream receipt (CMD side): compute the classical shared secret
+  // against the folded RSP pubkey, decapsulate the ML-KEM ct, derive the identical
+  // hybrid key, and mark kx_reverse_consumed (KEY_ACTIVATE fires after the role hands
+  // back). Returns 0, or -1 on any crypto failure -> caller tears the link down.
+  int  kx_on_reverse_complete();
+  // In-process FULL crypto round-trip fire proof (data-flow-hybrid-kex.md §7 / T6):
+  // two controllers drive the REAL production functions kx_stage_forward_stream ->
+  // kx_ingest -> kx_on_forward_complete -> kx_ingest -> kx_on_reverse_complete and
+  // assert BOTH peers derive the IDENTICAL hybrid key + matching confirm tag +
+  // PQ-upgraded, and that a tampered reverse ct diverges the key (confirm mismatch =
+  // KEY_ACTIVATE REFUSE). Returns 0 = pass / N = failure count.
+  int  test_kx_roundtrip_derive();
+
+  // KX mid-stream AEAD payload TAMPER fire proof (data-flow-hybrid-kex.md live
+  // G3): flip ciphertext bytes on the post-activation data stream and prove the
+  // receiver REJECTS — AEAD auth-fail -> the copy_data_to_buffer() funnel tears
+  // the link, 0 corrupted bytes reach the app, never a plaintext fallback; clean
+  // control delivers. Returns 0 = pass / N = failure count.
+  int  test_kx_data_tamper();
+
   char psk_hex[129];                  // Pre-shared key (hex string, up to 64 bytes = 128 hex chars)
   bool psk_mismatch_pending;          // Commander detected PSK mismatch, KEY_ACTIVATE sent for responder notification
+
+  // Reset all hybrid-KX chunk state (idle). Defined inline; called from the
+  // session-reset path and at the start/end of each KX2/KX3 phase.
+  void kx_chunk_state_reset()
+  {
+    kx_mlkem_pk_ready = false;
+    kx_mlkem_ct_ready = false;
+    kx_tx_kind = 0; kx_tx_total = 0; kx_tx_count = 0;
+    kx_tx_next_index = 0; kx_tx_chunk_cap = 0; kx_tx_src = nullptr;
+    kx_rx_kind = 0; kx_rx_count = 0; kx_rx_chunk_cap = 0;
+    kx_rx_total = 0; kx_rx_received = 0;
+    for (int i = 0; i < 256; i++) kx_rx_got[i] = false;
+    // KX-as-data reserved-stream transport state (idle).
+    kx_stream_tx_len = 0; kx_stream_tx_sent = 0; kx_stream_tx_active = false;
+    kx_stream_rx_have = 0; kx_stream_rx_expected = 0;
+    kx_stream_rx_kind = 0; kx_stream_rx_is_kx = false; kx_stream_rx_done_kind = 0;
+    kx_role_swap_sent = false; kx_reverse_consumed = false; kx_key_activate_sent = false;
+  }
 
   int gear_shift_algorithm;
   double gear_shift_up_success_rate_precentage;

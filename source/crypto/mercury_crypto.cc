@@ -81,6 +81,7 @@ cl_cipher_suite::cl_cipher_suite()
 {
     memset(x25519_sk, 0, sizeof(x25519_sk));
     memset(x25519_pk, 0, sizeof(x25519_pk));
+    memset(x25519_peer_pk, 0, sizeof(x25519_peer_pk));
     memset(x25519_shared, 0, sizeof(x25519_shared));
     x25519_ready = false;
 
@@ -107,6 +108,7 @@ void cl_cipher_suite::wipe()
 {
     crypto_wipe(x25519_sk, sizeof(x25519_sk));
     crypto_wipe(x25519_pk, sizeof(x25519_pk));
+    crypto_wipe(x25519_peer_pk, sizeof(x25519_peer_pk));
     crypto_wipe(x25519_shared, sizeof(x25519_shared));
     x25519_ready = false;
 
@@ -180,6 +182,10 @@ int cl_cipher_suite::compute_x25519_shared(const uint8_t peer_pubkey[X25519_KEY_
         crypto_wipe(x25519_shared, 32);
         return -1;
     }
+
+    // Cache the peer's pubkey for transcript binding (derive_session_key's
+    // `bind` digest needs both X25519 pubs; MLKEM_HYBRID_PLAN.md §3).
+    memcpy(x25519_peer_pk, peer_pubkey, 32);
 
     x25519_ready = true;
     printf("[CRYPTO] X25519 shared secret computed\n");
@@ -267,15 +273,22 @@ int cl_cipher_suite::decapsulate_mlkem(const uint8_t ciphertext[MLKEM_CT_SIZE])
 void cl_cipher_suite::derive_session_key(const char* commander_call,
                                           const char* responder_call,
                                           const uint8_t* psk, int psk_len,
-                                          bool mlkem_done)
+                                          bool mlkem_done,
+                                          const uint8_t* mlkem_ct,
+                                          const uint8_t* mlkem_pk,
+                                          const uint8_t* x25519_pk_cmd,
+                                          const uint8_t* x25519_pk_rsp)
 {
-    // IKM = x25519_shared || mlkem_shared (or just x25519_shared if classical-only)
+    // IKM (the "two shared secrets"). X25519MLKEM768 §4.3: ML-KEM ss FIRST,
+    // then X25519 ss (the FIPS-approved KEM leads, SP 800-56Cr2). Classical-only
+    // fallback keeps ikm = x25519_ss (byte-identical to the pre-hybrid build).
     uint8_t ikm[64];
     int ikm_len;
-    if (mlkem_done && mlkem_ready)
+    bool hybrid = (mlkem_done && mlkem_ready);
+    if (hybrid)
     {
-        memcpy(ikm, x25519_shared, 32);
-        memcpy(ikm + 32, mlkem_shared, 32);
+        memcpy(ikm,      mlkem_shared,  32);   // ML-KEM ss FIRST (§4.3)
+        memcpy(ikm + 32, x25519_shared, 32);
         ikm_len = 64;
         pq_active = true;
     }
@@ -286,8 +299,8 @@ void cl_cipher_suite::derive_session_key(const char* commander_call,
         pq_active = false;
     }
 
-    // Salt = "mercury-v1" || [psk_hash] || commander_call || responder_call
-    // If PSK is provided, hash it first (don't put raw PSK in salt)
+    // Salt = "mercury-v1" || [psk_hash] || [bind(32) if hybrid] || calls
+    // If PSK is provided, hash it first (don't put raw PSK in salt).
     uint8_t salt[256];
     int salt_len = 0;
     const char* prefix = "mercury-v1";
@@ -302,6 +315,33 @@ void cl_cipher_suite::derive_session_key(const char* commander_call,
         memcpy(salt + salt_len, psk_hash, 32);
         salt_len += 32;
         crypto_wipe(psk_hash, 32);
+    }
+
+    // TRANSCRIPT BINDING (the single most important hybrid correctness point —
+    // Mercury has no TLS transcript, draft §6). On the hybrid path, pre-hash the
+    // KEM ciphertext + public keys into a 32-byte `bind` digest and fold it into
+    // the salt (X-Wing template ss||ss||ct||pk||epk, adapted to HKDF-Blake2b;
+    // SS stay raw in IKM, only the PUBLIC transcript material is pre-digested so
+    // the 2.2KB of ct+pk stays out of the bounded salt[256] / Blake2b key slot).
+    // Skipped on the classical fallback (salt byte-identical to pre-hybrid). Both
+    // peers absorb ct||pk||pk_cmd||pk_rsp in the SAME order, so a tamper/bit-error
+    // that slips past CRC yields divergent keys -> confirm-tag mismatch.
+    if (hybrid && mlkem_ct && mlkem_pk && x25519_pk_cmd && x25519_pk_rsp)
+    {
+        crypto_blake2b_ctx bctx;
+        crypto_blake2b_init(&bctx, 32);
+        const char* dom = "mercury-hybrid-v1";
+        crypto_blake2b_update(&bctx, (const uint8_t*)dom, strlen(dom));
+        crypto_blake2b_update(&bctx, mlkem_ct,      MLKEM_CT_SIZE);   // 1088
+        crypto_blake2b_update(&bctx, mlkem_pk,      MLKEM_PK_SIZE);   // 1184
+        crypto_blake2b_update(&bctx, x25519_pk_cmd, X25519_KEY_SIZE); // 32
+        crypto_blake2b_update(&bctx, x25519_pk_rsp, X25519_KEY_SIZE); // 32
+        uint8_t bind[32];
+        crypto_blake2b_final(&bctx, bind);
+        crypto_wipe(&bctx, sizeof(bctx));
+        memcpy(salt + salt_len, bind, 32);
+        salt_len += 32;
+        crypto_wipe(bind, sizeof(bind));
     }
 
     if (commander_call)
@@ -358,6 +398,88 @@ void cl_cipher_suite::compute_key_confirmation(uint8_t tag_out[8])
                          (const uint8_t*)msg, strlen(msg));
     memcpy(tag_out, full_hash, 8);
     crypto_wipe(full_hash, sizeof(full_hash));
+}
+
+// TEST-ONLY: see header. In-process unit-test seam; never wired to any path
+// that transmits or logs the raw key.
+void cl_cipher_suite::copy_session_key_for_test(uint8_t out[SESSION_KEY_SIZE]) const
+{
+    memcpy(out, session_key, SESSION_KEY_SIZE);
+}
+
+// TEST-ONLY: mirror of derive_session_key's HYBRID branch but with the LEGACY
+// (pre-fix, WRONG) IKM order x25519_ss || mlkem_ss. Salt + transcript-bind are
+// byte-identical to production — ONLY the IKM byte order differs — so a diff in
+// the resulting session_key proves the order itself is load-bearing (catches a
+// revert of the §4.3 ML-KEM-first swap). Not built into any production path.
+void cl_cipher_suite::derive_session_key_legacy_order_for_test(
+        const char* commander_call, const char* responder_call,
+        const uint8_t* psk, int psk_len,
+        const uint8_t* mlkem_ct, const uint8_t* mlkem_pk,
+        const uint8_t* x25519_pk_cmd, const uint8_t* x25519_pk_rsp)
+{
+    // LEGACY order: x25519_ss FIRST, then mlkem_ss (the bug the fix corrected).
+    uint8_t ikm[64];
+    memcpy(ikm,      x25519_shared, 32);
+    memcpy(ikm + 32, mlkem_shared,  32);
+    int ikm_len = 64;
+
+    // Salt — identical construction to production derive_session_key (hybrid).
+    uint8_t salt[256];
+    int salt_len = 0;
+    const char* prefix = "mercury-v1";
+    int prefix_len = (int)strlen(prefix);
+    memcpy(salt, prefix, prefix_len);
+    salt_len += prefix_len;
+
+    if (psk && psk_len > 0)
+    {
+        uint8_t psk_hash[32];
+        crypto_blake2b(psk_hash, 32, psk, psk_len);
+        memcpy(salt + salt_len, psk_hash, 32);
+        salt_len += 32;
+        crypto_wipe(psk_hash, 32);
+    }
+
+    if (mlkem_ct && mlkem_pk && x25519_pk_cmd && x25519_pk_rsp)
+    {
+        crypto_blake2b_ctx bctx;
+        crypto_blake2b_init(&bctx, 32);
+        const char* dom = "mercury-hybrid-v1";
+        crypto_blake2b_update(&bctx, (const uint8_t*)dom, strlen(dom));
+        crypto_blake2b_update(&bctx, mlkem_ct,      MLKEM_CT_SIZE);
+        crypto_blake2b_update(&bctx, mlkem_pk,      MLKEM_PK_SIZE);
+        crypto_blake2b_update(&bctx, x25519_pk_cmd, X25519_KEY_SIZE);
+        crypto_blake2b_update(&bctx, x25519_pk_rsp, X25519_KEY_SIZE);
+        uint8_t bind[32];
+        crypto_blake2b_final(&bctx, bind);
+        crypto_wipe(&bctx, sizeof(bctx));
+        memcpy(salt + salt_len, bind, 32);
+        salt_len += 32;
+        crypto_wipe(bind, sizeof(bind));
+    }
+
+    if (commander_call)
+    {
+        int cl = (int)strlen(commander_call);
+        memcpy(salt + salt_len, commander_call, cl);
+        salt_len += cl;
+    }
+    if (responder_call)
+    {
+        int cl = (int)strlen(responder_call);
+        memcpy(salt + salt_len, responder_call, cl);
+        salt_len += cl;
+    }
+
+    uint8_t prk[32];
+    hkdf_extract(salt, salt_len, ikm, ikm_len, prk);
+    const char* info = "data-encryption";
+    hkdf_expand(prk, (const uint8_t*)info, strlen(info), session_key);
+
+    crypto_wipe(ikm, sizeof(ikm));
+    crypto_wipe(prk, sizeof(prk));
+    crypto_wipe(salt, sizeof(salt));
 }
 
 // ---------------------------------------------------------------------------
@@ -689,4 +811,91 @@ void cl_cipher_suite::activate()
     printf("[CRYPTO] Encryption ACTIVATED (%s)\n",
            pq_active ? "hybrid PQ" : "classical X25519");
     fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
+// KX chunk transport — encode / decode (MLKEM_HYBRID_PLAN.md §4)
+// ---------------------------------------------------------------------------
+
+// CRC8 — identical algorithm to cl_arq_controller::CRC8_calc (arq_common.cc):
+// init 0xFF, reflected, POLY_CRC8 = 0xF4, right-shift (MODBUS-style). Mirrored
+// here so the KX codec is self-contained / unit-testable without a controller.
+uint8_t cl_cipher_suite::kx_crc8(const uint8_t* data, int n)
+{
+    uint8_t crc = 0xff;
+    for (int j = 0; j < n; j++)
+    {
+        crc ^= data[j];
+        for (int i = 0; i < 8; i++)
+        {
+            if ((crc & 0x01) == 0x01) { crc >>= 1; crc ^= 0xF4; }
+            else                      { crc >>= 1; }
+        }
+    }
+    return crc;
+}
+
+int cl_cipher_suite::kx_chunk_encode(uint8_t kind, const uint8_t* src,
+                                     int src_len, int index,
+                                     int chunk_payload_capacity,
+                                     uint8_t* out, int out_cap)
+{
+    if (!src || !out || src_len <= 0 || chunk_payload_capacity < 1)
+        return -1;
+    if (kind != KX_KIND_PK && kind != KX_KIND_CT)
+        return -1;
+
+    int count = kx_chunk_count(src_len, chunk_payload_capacity);
+    if (count < 1 || count > 255) return -1;
+    if (index < 0 || index >= count) return -1;
+
+    int offset = index * chunk_payload_capacity;
+    int payload = src_len - offset;
+    if (payload > chunk_payload_capacity) payload = chunk_payload_capacity;
+    if (payload <= 0) return -1;
+
+    if (out_cap < KX_CHUNK_HEADER_LEN + payload) return -1;
+
+    out[0] = kind;
+    out[1] = (uint8_t)index;
+    out[2] = (uint8_t)count;
+    out[3] = kx_crc8(out, 3);   // CRC8 over bytes 0..2
+    memcpy(out + KX_CHUNK_HEADER_LEN, src + offset, payload);
+    return KX_CHUNK_HEADER_LEN + payload;
+}
+
+int cl_cipher_suite::kx_chunk_decode(uint8_t expect_kind,
+                                     const uint8_t* in, int in_len,
+                                     int chunk_payload_capacity,
+                                     uint8_t* reasm, int reasm_cap,
+                                     int* out_index, int* out_count)
+{
+    if (!in || !reasm || in_len < KX_CHUNK_HEADER_LEN
+        || chunk_payload_capacity < 1)
+        return -1;
+
+    uint8_t kind  = in[0];
+    int     index = in[1];
+    int     count = in[2];
+    uint8_t crc   = in[3];
+
+    if (kind != expect_kind) return -1;
+    if (kx_crc8(in, 3) != crc) return -1;           // header integrity
+    if (count < 1 || count > 255) return -1;
+    if (index < 0 || index >= count) return -1;
+
+    int payload = in_len - KX_CHUNK_HEADER_LEN;
+    if (payload <= 0 || payload > chunk_payload_capacity) return -1;
+    // A non-final chunk MUST carry a full capacity payload; only the last chunk
+    // may be short. This makes the reassembled total length unambiguous from
+    // (count, chunk_payload_capacity, last-chunk length).
+    if (index < count - 1 && payload != chunk_payload_capacity) return -1;
+
+    int offset = index * chunk_payload_capacity;
+    if (offset + payload > reasm_cap) return -1;     // never overflow reasm
+
+    memcpy(reasm + offset, in + KX_CHUNK_HEADER_LEN, payload);
+    if (out_index) *out_index = index;
+    if (out_count) *out_count = count;
+    return payload;
 }

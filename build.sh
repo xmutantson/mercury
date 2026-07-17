@@ -405,6 +405,7 @@ source/datalink_layer/test_rx_drain.cc
 source/datalink_layer/test_restage_requeue.cc
 source/datalink_layer/test_stream_offset.cc
 source/datalink_layer/test_decompress_false_accept.cc
+source/datalink_layer/test_kx_data_tamper.cc
 source/datalink_layer/test_compact_confirm_rx.cc
 source/datalink_layer/b2f_handler.cc
 source/datalink_layer/channel_state_lookup.cc
@@ -463,6 +464,7 @@ source/compression/test_winlink_dict.cc
 source/compression/lzhuf_buffer.cc
 source/crypto/mercury_crypto.cc
 source/crypto/test_aead_nonce.cc
+source/crypto/test_mlkem_hybrid.cc
 "
 
 # Compression library C sources (PPMd8 from LZMA SDK, zstd amalgamated, LZHUF for B2F)

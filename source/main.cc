@@ -48,6 +48,7 @@
 #include "common/sim_clock_tests.h"
 #include "compression/test_winlink_dict.h"
 #include "crypto/test_aead_nonce.h"   // AEAD bsi-bound nonce regression suite
+#include "crypto/test_mlkem_hybrid.h" // ML-KEM-768 hybrid KEX regression suite
 #include "datalink_layer/arq.h"
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
@@ -1467,6 +1468,21 @@ int main(int argc, char *argv[])
             // >256-batch wrap, reorder+retx round-trip, direction disjointness,
             // truncated-KX reject, and tamper-reject cases. No IONOS/RF.
             failed += run_aead_nonce_tests();
+            // Encryption negotiation FAIL-CLOSED regression: once the operator has
+            // opted into -E, a peer without CAP_ENCRYPTION (unsupported, or a MITM
+            // that stripped the cap bit) is REFUSED for BOTH strict and fast — never
+            // a plaintext downgrade — while default-off (ENCRYPT_OFF) stays plaintext.
+            // Drives the REAL shared predicate decide_encryption_negotiation() that
+            // both endpoints call. Fails-before: -DENC_FAILOPEN_FAILBEFORE. No IONOS/RF.
+            {
+                cl_arq_controller test_enc;
+                failed += test_enc.test_encryption_fail_closed();
+            }
+            // ML-KEM-768 hybrid KEX regression suite (MLKEM_HYBRID_PLAN.md,
+            // data-flow-hybrid-kex.md): combiner symmetry, ML-KEM-first IKM
+            // order, transcript binding (tamper -> key divergence), and the
+            // KX2/KX3 chunk encode/reassemble + CRC8 round-trip. No IONOS/RF.
+            failed += run_mlkem_hybrid_tests();
             // In-band down-ladder DELIVERY regression (BREAK-orphan + silent-snapshot). A
             // member test on a throwaway controller (its own buffers; PART B builds its own
             // minimal telecom_system). Fast + deterministic, no IONOS/RF. data-flow-inband-
@@ -1723,6 +1739,7 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller ARQ_isr;
                 failed += ARQ_isr.test_idle_switch_role_race();
+                failed += ARQ_isr.test_switch_role_reride_race();
                 failed += ARQ_isr.test_break_noprogress_teardown();
             }
             // MIXBATCH FILL OVER-POP -- COMPRESSION LEG regression
@@ -1778,6 +1795,68 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller ARQ_rxctrl;
                 failed += ARQ_rxctrl.test_rx_ctrl_drop();
+            }
+            // ML-KEM KX MULTI-CHUNK LIVE-RX gate (MLKEM_HYBRID_PLAN.md §5 /
+            // data-flow-control-slot-lifecycle.md): the RX control-slot producer
+            // hardcodes messages_control.length=1 while copying a FIXED slot width
+            // into data[]; the KX2/KX3 chunk receivers fed length=1 into
+            // kx_receive_chunk -> kx_chunk_decode rejected EVERY chunk -> the PQ
+            // hybrid handshake could never complete on the live wire. This gate
+            // drives multi-chunk KX2 (RSP consumer) + KX3 (CMD consumer) through the
+            // REAL process_control_responder/commander call sites and asserts full
+            // reassembly + live encapsulate/decapsulate. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxlive;
+                failed += ARQ_kxlive.test_kx_chunk_live_rx();
+            }
+            // KX-AS-DATA reserved-stream RX ingest fire proof (data-flow-hybrid-kex.md
+            // T1/T3): the new decoded-transport reassembler kx_ingest() reassembles a
+            // FRAGMENTED forward (x25519+pk) and reverse (x25519+ct) stream BYTE-IDENTICAL
+            // and NEVER routes to the app FIFO, and the fail-secure REFUSE FIRES (-1) on
+            // bad magic/kind/length + a post-activation byte. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxi;
+                failed += ARQ_kxi.test_kx_ingest();
+            }
+            // KX-as-data RX ROUTING (data-flow-hybrid-kex.md §2.3): drive the REAL
+            // copy_data_to_buffer() delivery funnel with a forward KX stream staged
+            // across ACKED messages_rx[] slots in the pre-activation KX epoch and
+            // assert the production routing branch reassembles via kx_ingest, never
+            // reaches the app FIFO, does not advance the Option-W cursor, and raises
+            // no false stream-shift teardown. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxr;
+                failed += ARQ_kxr.test_kx_rx_routing();
+            }
+            // KX-as-data forward TX stage/feed (data-flow-hybrid-kex.md §2.2): drive the
+            // REAL process_buffer_data_commander() source-switch — stage the reserved
+            // forward stream (x25519_pk_cmd + mlkem_pk) and frame it as DATA batches —
+            // then deliver those frames through the REAL copy_data_to_buffer()->kx_ingest()
+            // funnel and assert the pk + folded x25519 pubkey reassemble BYTE-IDENTICAL
+            // end to end, never reaching the app FIFO. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxt;
+                failed += ARQ_kxt.test_kx_tx_stream();
+            }
+            // KX-as-data FULL crypto round-trip (data-flow-hybrid-kex.md Â§7 / T6): two
+            // controllers drive the REAL kx_stage_forward_stream -> kx_ingest ->
+            // kx_on_forward_complete -> kx_ingest -> kx_on_reverse_complete path and assert
+            // BOTH peers derive the IDENTICAL hybrid key + matching confirm tag + PQ-upgrade,
+            // and that a tampered reverse ct diverges the key (confirm mismatch = KEY_ACTIVATE
+            // REFUSE). In-process synthetic-fire; the SWITCH_ROLE transport is proven live.
+            {
+                cl_arq_controller ARQ_kxrt;
+                failed += ARQ_kxrt.test_kx_roundtrip_derive();
+            }
+            // KX-as-data MID-STREAM AEAD payload TAMPER fire proof (the live channel-
+            // MITM gate, data-flow-hybrid-kex.md G3): flip ciphertext bytes on the post-
+            // activation data stream and prove the receiver REJECTS — the AEAD auth-fail
+            // fires, the production copy_data_to_buffer() funnel tears the link, 0 corrupted
+            // bytes reach the app, and it never falls back to plaintext. Clean control
+            // delivers. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxdt;
+                failed += ARQ_kxdt.test_kx_data_tamper();
             }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
@@ -2498,6 +2577,17 @@ int main(int argc, char *argv[])
             int failed = test_sigterm_handler();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-switchrole-reride : run ONLY the SWITCH_ROLE re-ride race
+        // regression (idle-switchrole-race.md §6; the R1 reverse-transfer
+        // double-swap gate) and exit. Fast + deterministic; drives the REAL
+        // set_role(COMMANDER) swap-in primitive + the REAL idle branch. FAILS-
+        // BEFORE with -DSWITCHROLE_RERIDE_FAILBEFORE. See
+        // arq_commander.cc::test_switch_role_reride_race().
+        if (strcmp(argv[i], "--test-switchrole-reride") == 0) {
+            cl_arq_controller ARQ_reride;
+            int failed = ARQ_reride.test_switch_role_reride_race();
+            return (failed == 0) ? 0 : 1;
+        }
         // --test-connect-reack : run ONLY the CONNECT-REACK EXCISE regression
         // (8e62722e removed: the pre-data window must NOT pin frames_to_read=2)
         // and exit. Fast + deterministic; see arq_responder.cc::test_connect_reack().
@@ -2687,6 +2777,25 @@ int main(int argc, char *argv[])
         // See source/crypto/test_aead_nonce.cc / data-flow-aead-nonce.md.
         if (strcmp(argv[i], "--test-aead-nonce") == 0) {
             int failed = run_aead_nonce_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-mlkem-hybrid : run ONLY the ML-KEM-768 hybrid KEX suite and
+        // exit. Fast + deterministic, no IONOS/RF. Combiner symmetry, ML-KEM-
+        // first IKM order, transcript binding, KX chunk round-trip + CRC8.
+        // See source/crypto/test_mlkem_hybrid.cc / MLKEM_HYBRID_PLAN.md.
+        if (strcmp(argv[i], "--test-mlkem-hybrid") == 0) {
+            int failed = run_mlkem_hybrid_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-mlkem-live-rx : ML-KEM KX MULTI-CHUNK reassembly through the LIVE
+        // control-RX consumer path (process_control_responder KX2 +
+        // process_control_commander KX3). Reproduces the messages_control.length=1
+        // producer/consumer bug: fails-before (chunks rejected), passes-after (real
+        // slot width passed). Member test on a throwaway controller. Fast +
+        // deterministic, no IONOS/RF. MLKEM_HYBRID_PLAN.md §5.
+        if (strcmp(argv[i], "--test-mlkem-live-rx") == 0) {
+            cl_arq_controller ARQ_kx;
+            int failed = ARQ_kx.test_kx_chunk_live_rx();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sim-clock : run ONLY the sim-clock unit suite and exit. The
@@ -2880,6 +2989,7 @@ int main(int argc, char *argv[])
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
                                         // must NOT drop popped bytes when the non-blocking app socket back-pressures.
                                         // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
+    bool test_kx_data_tamper_cli = false; // --test-kx-data-tamper: mid-stream AEAD ciphertext tamper fail-secure fire proof
     bool test_decompress_false_accept_cli = false; // --test-decompress-false-accept: streaming decompress-failure
                                         // must NOT push the undecodable raw compressed blob to the app (silent byte-
                                         // corruption). Drives a REAL two-compressor streaming desync + copy_data_to_buffer;
@@ -3031,6 +3141,7 @@ int main(int argc, char *argv[])
                                         // fef293f (every batch stages 0 payload → 0 throughput). See
                                         // fact-documents/data-flow-compress-frame-fill.md §5.
     bool test_cumulative_ack_cli = false; // --test-cumulative-ack: Tier-2 cumulative-n_r self-heal/gap-invariant/cap-gate regression (data-flow-forgiving-ack.md §T2.6).
+    bool test_enc_failclosed_cli = false; // --test-enc-failclosed: encryption negotiation fail-closed regression (opt-in + peer-no-cap -> REFUSE; default-off -> plaintext). Fails-before under -DENC_FAILOPEN_FAILBEFORE.
     bool test_a3_decouple_safety_cli = false; // --test-a3-decouple-safety: the §2 CHECKPOINT — single-miss non-load-bearing (anti-0-bytes, byte-faithful) + genuine-death net intact, demote IN PLACE (data-flow-forgiving-ack.md §T2.2/§6).
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
@@ -3724,6 +3835,15 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-kx-data-tamper") == 0)
+        {
+            // Mid-stream AEAD ciphertext tamper fail-secure fire proof — one-shot
+            // at startup, then exit with the test rc. See
+            // source/datalink_layer/test_kx_data_tamper.cc.
+            test_kx_data_tamper_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strcmp(argv[i], "--test-decompress-false-accept") == 0)
         {
             // Streaming decompress-failure silent-false-accept regression — one-shot
@@ -3996,6 +4116,20 @@ int main(int argc, char *argv[])
             // per-batch fallback), and COMPOSITION with Tier-1. See
             // fact-documents/data-flow-forgiving-ack.md §T2.6.
             test_cumulative_ack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-enc-failclosed") == 0)
+        {
+            // Encryption negotiation FAIL-CLOSED regression (one-shot, then exit rc).
+            // Opt-in (-E) against a peer without CAP_ENCRYPTION (unsupported, or a
+            // MITM that stripped the cap bit) -> REFUSE for BOTH strict AND fast;
+            // default-off (ENCRYPT_OFF) -> legal plaintext. Drives the shared
+            // production predicate decide_encryption_negotiation(). Fails-before
+            // under -DENC_FAILOPEN_FAILBEFORE (which recompiles the historical
+            // opportunistic-plaintext fast downgrade). Isolated one-shot so it does
+            // not depend on the full --test suite's wall-clock watchdog.
+            test_enc_failclosed_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5658,6 +5792,20 @@ start_modem:
             fflush(stdout);
             exit(rc);
         }
+        if (test_enc_failclosed_cli) {
+            // Encryption negotiation FAIL-CLOSED regression (one-shot, then exit rc).
+            // Drives the shared production predicate decide_encryption_negotiation()
+            // across the operator/peer capability matrix: default-off -> plaintext,
+            // opted-in + both-cap -> encrypt, opted-in + peer-no-cap (or MITM strip)
+            // -> REFUSE for both strict and fast. Fails-before: -DENC_FAILOPEN_FAILBEFORE.
+            printf("[FLAG] --test-enc-failclosed: invoking the encryption fail-closed "
+                   "negotiation regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_encryption_fail_closed();
+            printf("[FLAG] Encryption fail-closed test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
         if (test_cumulative_ack_cli) {
             // FORGIVING-ACK Tier-2 cumulative-n_r regression (one-shot, then exit rc).
             // Drives the self-heal (a lost report recovered by the next n_r), the
@@ -5747,6 +5895,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_rx_drain_backpressure();
             printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_kx_data_tamper_cli) {
+            // Mid-stream AEAD ciphertext tamper fail-secure fire proof (one-shot, then exit rc).
+            printf("[FLAG] --test-kx-data-tamper: invoking mid-stream AEAD ciphertext tamper fail-secure fire proof\n");
+            fflush(stdout);
+            cl_arq_controller test_arq;
+            int rc = test_arq.test_kx_data_tamper();
+            printf("[FLAG] kx-data-tamper test complete (rc=%d) - exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

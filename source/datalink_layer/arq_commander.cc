@@ -1241,20 +1241,45 @@ void cl_arq_controller::process_messages_commander()
 		// Key exchange gate: if encryption negotiated but not active, run key exchange first
 		if(encryption_enabled && !cipher_suite.is_active() && cipher_suite.get_kx_phase() == KX_IDLE)
 		{
-			printf("[CRYPTO] Turboshift done, initiating key exchange\n");
-			fflush(stdout);
-			add_message_control(KEY_EXCHANGE_1);
+			if(!kx_as_data_path())
+			{
+				printf("[CRYPTO] Turboshift done, initiating key exchange\n");
+				fflush(stdout);
+				add_message_control(KEY_EXCHANGE_1);
 #ifdef MERCURY_GUI_ENABLED
-			// Display-only: surface KX start so STRICT does not look hung.
-			gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
+				// Display-only: surface KX start so STRICT does not look hung.
+				gui_set_kx_progress(cipher_suite.get_kx_phase(), 0, 0);
 #endif
-			// connection_status set to TRANSMITTING_CONTROL by add_message_control
-			return;
+				// connection_status set to TRANSMITTING_CONTROL by add_message_control
+				return;
+			}
+			// KX-AS-DATA (data-flow-hybrid-kex.md §2.2): the reserved forward stream
+			// (x25519_pk_cmd + mlkem_pk) is staged + fed as DATA batches by
+			// process_buffer_data_commander() — NOT the legacy one-shot KEY_EXCHANGE_1
+			// control frame (which deadlocks at ROBUST's tiny geometry). Fall through to
+			// the hold below; only the KX stream flows before activation, user data held.
 		}
-		// Hold data until key exchange completes (encryption negotiated but not yet active)
-		if(encryption_enabled && !cipher_suite.is_active())
+		// Hold user data until key exchange completes (encryption negotiated but not yet
+		// active). EXCEPTION (KX-as-data): while the reserved forward KX stream is active,
+		// allow the data-send path (process_messages_tx_data) to run so the staged KX
+		// batches reach the wire and drive the gearshift climb. User data is still held —
+		// only the KX stream (staged in kx_stream_tx_buf, never fifo_buffer_tx) flows
+		// before activation. Env-gated OFF (kx_stream_tx_active never set) -> unchanged.
+		if(encryption_enabled && !cipher_suite.is_active() && !kx_stream_tx_active)
 		{
-			return;
+			// KX-as-data: the source-switch fills the WHOLE forward/reverse stream into
+			// messages_tx[] in ONE pass, clearing kx_stream_tx_active BEFORE the batch is
+			// even sent. Do NOT re-engage the hold while a KX batch is staged / in flight /
+			// awaiting retransmit -> let process_messages_tx_data() drain it to the wire and
+			// collect ACKs (otherwise the staged forward stream never reaches the RSP and
+			// the handshake stalls). During the KX epoch messages_tx[] holds ONLY KX frames
+			// (user data stays in fifo_buffer_tx; process_buffer_data_commander's KX branch
+			// never pops it), so this is safe. Env off -> kx_as_data_path() false -> the hold
+			// is byte-identical.
+			bool kx_batch_in_flight = kx_as_data_path()
+				&& (block_under_tx == YES || get_nOccupied_messages() > 0 || retransmit_count > 0);
+			if(!kx_batch_in_flight)
+				return;
 		}
 
 		// Phase 3c — consume any pending optimizer-recommended config
@@ -1556,6 +1581,40 @@ int cl_arq_controller::add_message_control(char code)
 			messages_control.length = 1 + X25519_KEY_SIZE;  // 33 bytes
 			messages_control.id = 0;
 			printf("[CRYPTO] Sending X25519 pubkey (32 bytes)\n");
+			fflush(stdout);
+		}
+		else if(code==KEY_EXCHANGE_2)
+		{
+			// Hybrid ML-KEM KX chunk frame (MLKEM_HYBRID_PLAN.md §4). The
+			// current chunk index is kx_tx_next_index; the chunk codec writes
+			// [kind|idx|count|CRC8 | payload] into messages_control.data. The
+			// kx_tx_* state was armed by kx_begin_chunk_send(). The frame is a
+			// normal control frame from here on (LDPC + per-frame control ACK on
+			// the OFDM data_configuration, same transport as KEY_EXCHANGE_1).
+			// NOTE: only KEY_EXCHANGE_2 chunk-encodes here. The CMD NEVER sends
+			// KX3 CHUNKS (the RSP does, via its ACK transport); a CMD-built
+			// KEY_EXCHANGE_3 is the BARE per-chunk KX3 ACK
+			// (data-flow-control-slot-lifecycle.md §8.2(2)) which falls into the
+			// length=1 `else` builder below (kx_send_next_chunk's COMMANDER branch
+			// only ever calls this with KEY_EXCHANGE_2).
+			int cap = kx_tx_chunk_cap;
+			int wrote = cl_cipher_suite::kx_chunk_encode(
+				(uint8_t)kx_tx_kind, kx_tx_src, kx_tx_total,
+				kx_tx_next_index, cap,
+				(uint8_t*)messages_control.data,
+				(N_MAX/8));
+			if(wrote < 0)
+			{
+				printf("[CRYPTO] ERROR: KX chunk encode failed (kind=0x%02x idx=%d cap=%d)\n",
+					kx_tx_kind, kx_tx_next_index, cap);
+				fflush(stdout);
+				messages_control.status = FREE;
+				return ERROR_;
+			}
+			messages_control.length = wrote;
+			messages_control.id = 0;
+			printf("[CRYPTO] Sending KX chunk kind=0x%02x idx=%d/%d (%d bytes)\n",
+				kx_tx_kind, kx_tx_next_index, kx_tx_count, wrote);
 			fflush(stdout);
 		}
 		else if(code==KEY_ACTIVATE)
@@ -7203,7 +7262,18 @@ void cl_arq_controller::finish_turbo_direction()
 	// unlike turbo_received_snr which is reset after each probe step.
 	turbo_received_snr = -99.0f;
 
-	if(turboshift_phase == TURBO_FORWARD && skip_turbo_reverse)
+	// KX-as-data (data-flow-hybrid-kex.md Â§7): in the pre-activation KX epoch the
+	// turboshift MUST NOT run its bidirectional REVERSE-direction probe. That probe fires
+	// its OWN SWITCH_ROLE (below) which collides with the KX reverse-ct role-swap handshake:
+	// it hands the commander role to the peer BEFORE that peer has finished the forward-pk
+	// receipt + reverse-ct staging, so the peer (now commander, kx_stream_tx_len==0) stages a
+	// SECOND fresh forward stream and desyncs the crypto transcript -- activation then never
+	// lands (a cross-layer data-flow audit measured fwd_staged==2, KEY_ACTIVATE==0 on 8/8
+	// robust-start cells). Route the KX-epoch forward-complete into the SAME proven settle
+	// path as --skip-turbo-reverse so the climbed config SETTLES and the KX handshake owns the
+	// role swaps; the forward stream still DROVE the climb off robust (that win is preserved).
+	// Env off / post-activation -> kx_stream_epoch() false -> byte-identical.
+	if(turboshift_phase == TURBO_FORWARD && (skip_turbo_reverse || kx_stream_epoch()))
 	{
 		// Forward direction probed. Skip REVERSE probe (--skip-turbo-reverse).
 		// Reverse path only needs MFSK ACKs on asymmetric channels.
@@ -7480,11 +7550,14 @@ void cl_arq_controller::process_control_commander()
 			b2f_handler.init();
 			b2f_handler.unroll_enabled = true;
 
-			// Encryption negotiation
+			// Encryption negotiation (FAIL-CLOSED; single source of truth in
+			// decide_encryption_negotiation()). DEFAULT-OFF is preserved: when the
+			// operator did not opt in the decision is PLAINTEXT_OK and this block is
+			// a no-op, so legal Part-97 plaintext operation is unchanged.
 			{
-				bool both_support = (local_capability & CAP_ENCRYPTION) &&
-				                    (peer_capability & CAP_ENCRYPTION);
-				if (encryption_mode != ENCRYPT_OFF && both_support)
+				enc_negotiation_outcome_t enc_dec = decide_encryption_negotiation(
+					encryption_mode, local_capability, peer_capability);
+				if (enc_dec == ENC_NEG_ENABLED)
 				{
 					encryption_enabled = true;
 					// Encryption requires batch-level assembly (compression path)
@@ -7496,25 +7569,26 @@ void cl_arq_controller::process_control_commander()
 					printf("[CRYPTO] Encryption negotiated (%s mode), key exchange after turboshift\n",
 						encryption_mode == ENCRYPT_STRICT ? "SNDL-safe" : "classical-first");
 				}
-				else if (encryption_mode != ENCRYPT_OFF && !both_support)
+				else if (enc_dec == ENC_NEG_REFUSE)
 				{
-					if (encryption_mode == ENCRYPT_STRICT)
-					{
-						printf("[CRYPTO] STRICT mode: peer lacks encryption — refusing connection\n");
-						fflush(stdout);
-						const char* err_msg = "ENCRYPTION FAILURE PEER UNSUPPORTED\r";
-						int elen = (int)strlen(err_msg);
-						for(int e=0; e<elen; e++)
-							tcp_socket_control.message->buffer[e] = err_msg[e];
-						tcp_socket_control.message->length = elen;
-						tcp_socket_control.transmit();
-						this->link_status = DROPPED;
-						reset_session_state();
-						return;
-					}
-					printf("[CRYPTO] WARNING: Peer does not support encryption (peer_cap=0x%02X)\n",
-						peer_capability);
+					// Operator opted into -E but the peer does not advertise
+					// CAP_ENCRYPTION (unsupported, or a MITM stripped the cap bit to
+					// force a plaintext downgrade). Fail closed for BOTH strict and
+					// fast: refuse rather than deliver plaintext under an -E opt-in.
+					printf("[CRYPTO] %s mode: peer lacks encryption — refusing connection (fail-closed, no plaintext downgrade)\n",
+						encryption_mode == ENCRYPT_STRICT ? "STRICT" : "FAST");
+					fflush(stdout);
+					const char* err_msg = "ENCRYPTION FAILURE PEER UNSUPPORTED\r";
+					int elen = (int)strlen(err_msg);
+					for(int e=0; e<elen; e++)
+						tcp_socket_control.message->buffer[e] = err_msg[e];
+					tcp_socket_control.message->length = elen;
+					tcp_socket_control.transmit();
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
 				}
+				// ENC_NEG_PLAINTEXT_OK: operator did not opt in — plaintext ops (legal default-off).
 			}
 
 			// FORGIVING-ACK Tier 2 negotiation (fact-documents/data-flow-forgiving-ack.md
@@ -7812,6 +7886,40 @@ void cl_arq_controller::process_control_commander()
 				watchdog_timer.start();
 				link_timer.start();
 			}
+			else if(encryption_mode == ENCRYPT_STRICT)
+			{
+				// HYBRID ML-KEM upgrade (MLKEM_HYBRID_PLAN.md §5, STRICT/SNDL-safe).
+				// X25519 confirm matched; now run KX2/KX3 over the data plane
+				// BEFORE deriving the final hybrid key and activating. Generate the
+				// ML-KEM keypair and start streaming the encaps key (KX2) chunks.
+				// The classical key derived above is NOT activated (STRICT holds
+				// data until the hybrid key is live) — it only seeded the X25519
+				// confirm-tag check just performed. KEY_ACTIVATE is deferred to the
+				// KX3-complete handler.
+				printf("[CRYPTO] X25519 confirmed — beginning ML-KEM hybrid upgrade (KX2)\n");
+				fflush(stdout);
+				messages_control.status = FREE;
+				if(cipher_suite.generate_mlkem_keypair(kx_mlkem_pk) != 0)
+				{
+					printf("[CRYPTO] FATAL: ML-KEM keypair generation failed\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				kx_mlkem_pk_ready = true;
+				cipher_suite.set_kx_phase(KX_MLKEM_PK_SENT);
+				if(kx_begin_chunk_send(KEY_EXCHANGE_2) < 0)
+				{
+					printf("[CRYPTO] FATAL: KX2 send setup failed\n");
+					fflush(stdout);
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				watchdog_timer.start();
+				link_timer.start();
+			}
 			else
 			{
 				printf("[CRYPTO] Key confirmation matches — sending KEY_ACTIVATE\n");
@@ -7820,6 +7928,96 @@ void cl_arq_controller::process_control_commander()
 				messages_control.status = FREE;
 				add_message_control(KEY_ACTIVATE);
 
+				watchdog_timer.start();
+				link_timer.start();
+			}
+		}
+		else if(this->link_status==CONNECTED
+		        && (messages_control.data[0]==KEY_EXCHANGE_2
+		            || messages_control.data[0]==KEY_EXCHANGE_3))
+		{
+			// HYBRID KX chunk ACK handling (CMD side). Two cases:
+			//  (a) KEY_EXCHANGE_2 ACK: the RSP acknowledged a KX2 chunk we sent.
+			//      Queue the next KX2 chunk; when all are sent, the RSP will
+			//      encapsulate and stream KX3 (ciphertext) back — its ACK frames
+			//      carry the KX3 chunks (data[] holds the 4B-headed chunk).
+			//  (b) The ACK frame ALSO carries a KX3 chunk payload (RSP->CMD
+			//      ciphertext). Feed it to the reassembler; on completion, decap
+			//      + derive the hybrid key + send KEY_ACTIVATE.
+			int code_in = (unsigned char)messages_control.data[0];
+			messages_control.status = FREE;
+			if(code_in == KEY_EXCHANGE_2)
+			{
+				kx_tx_next_index++;
+				int more = kx_send_next_chunk();
+				if(more == 1)
+				{
+					// next KX2 chunk queued
+				}
+				else
+				{
+					// All KX2 chunks sent; await KX3 from RSP. The RSP drives KX3
+					// chunk frames; they arrive as KEY_EXCHANGE_3 control frames.
+					cipher_suite.set_kx_phase(KX_MLKEM_CT_SENT);
+					printf("[CRYPTO] KX2 complete (encaps key sent); awaiting KX3 ciphertext\n");
+					fflush(stdout);
+				}
+				watchdog_timer.start();
+				link_timer.start();
+			}
+			else // KEY_EXCHANGE_3 chunk arriving (RSP -> CMD ciphertext)
+			{
+				// FIX (data-flow-control-slot-lifecycle.md): the RX control-slot
+				// producer (arq_responder.cc:830) hardcodes messages_control.length=1
+				// while copying the FULL fixed slot width into data[] (:846). Pass the
+				// REAL slot width — the same geometry the codec uses for capacity
+				// (kx_chunk_payload_capacity() + the 4-byte chunk header) — NOT the
+				// length=1 sentinel, which made kx_chunk_decode reject every chunk.
+				int kx_frame_len = kx_chunk_payload_capacity()
+				                   + cl_cipher_suite::KX_CHUNK_HEADER_LEN;
+				int done = kx_receive_chunk((const uint8_t*)messages_control.data,
+				                            kx_frame_len, KEY_EXCHANGE_3);
+				if(done == 1)
+				{
+					// Full ciphertext reassembled — decapsulate + derive hybrid key.
+					if(cipher_suite.decapsulate_mlkem(kx_mlkem_ct) != 0)
+					{
+						printf("[CRYPTO] FATAL: ML-KEM decapsulation failed\n");
+						fflush(stdout);
+						this->link_status = DROPPED;
+						reset_session_state();
+						return;
+					}
+					// Hybrid derive with full transcript binding (pk order is
+					// ALWAYS commander-then-responder).
+					const uint8_t* pk_cmd = cipher_suite.get_x25519_pubkey();
+					const uint8_t* pk_rsp = cipher_suite.get_x25519_peer_pubkey();
+					cipher_suite.derive_session_key(
+						my_call_sign.c_str(), destination_call_sign.c_str(),
+						(psk_hex[0] != '\0') ? (const uint8_t*)psk_hex : NULL,
+						(psk_hex[0] != '\0') ? (int)strlen(psk_hex) : 0,
+						true,                 // mlkem_done -> hybrid + pq_active
+						kx_mlkem_ct, kx_mlkem_pk, pk_cmd, pk_rsp);
+					cipher_suite.set_kx_phase(KX_HYBRID_DONE);
+					printf("[CRYPTO] Hybrid session key derived — sending KEY_ACTIVATE (PQ)\n");
+					fflush(stdout);
+					add_message_control(KEY_ACTIVATE);
+				}
+				else if(done == 0)
+				{
+					// KX3 PER-CHUNK ACK (data-flow-control-slot-lifecycle.md §8.2(2)):
+					// a NON-FINAL ciphertext chunk reassembled. Send a BARE
+					// KEY_EXCHANGE_3 control request (length=1) back to the RSP — the
+					// trigger for the RSP to advance kx_tx_next_index and queue the
+					// next KX3 chunk (mirror of the CMD KX2-advance at :7184 driving
+					// the RSP KX2 ACK). The slot is FREE here (set at :7183), so
+					// add_message_control queues + enters TRANSMITTING_CONTROL. Only
+					// the FINAL chunk path (done==1, above) sends KEY_ACTIVATE — the
+					// CMD never KX3-ACKs the last chunk (mirror of the RSP not
+					// bare-ACKing KX2-final). done<0 (chunk rejected) -> no ACK; the
+					// RSP's pending chunk times out and retransmits via existing ARQ.
+					add_message_control(KEY_EXCHANGE_3);
+				}
 				watchdog_timer.start();
 				link_timer.start();
 			}
@@ -7851,6 +8049,12 @@ void cl_arq_controller::process_control_commander()
 			rx_nonce_adopted_once = false;
 			decrypt_delivered_bsi = -1;
 			consecutive_auth_failures = 0;
+			// KX-as-data (data-flow-hybrid-kex.md Â§3.4/Â§7): the KX streams consumed wire
+			// bsi 0..N across the two R1 SWITCH_ROLE swaps; re-anchor the Option-W cursors +
+			// de-dup high-water + wire batch_seq_id to a fresh bsi=0 baseline so the first
+			// USER batch (this peer is now the commander) is byte-identical to a normal
+			// session start. Env-gated OFF -> never called on the legacy pump path.
+			if(kx_as_data_path()) kx_stream_reanchor();
 #ifdef MERCURY_GUI_ENABLED
 			g_gui_state.encryption_active.store(true);
 			g_gui_state.encryption_psk_mismatch.store(false);
@@ -8022,8 +8226,13 @@ void cl_arq_controller::process_control_commander()
 			else if (messages_control.data[0]==SWITCH_ROLE)
 			{
 				turbo_switch_role_retries = 0;  // Reset on success
-				// Asymmetric gearshift: swap forward/reverse for the return path
-				if(forward_configuration != CONFIG_NONE && reverse_configuration != CONFIG_NONE)
+				// Asymmetric gearshift: swap forward/reverse for the return path.
+				// KX-as-data: SKIP the swap in the pre-activation epoch — the reverse ct rides
+				// the CURRENT settled config on BOTH peers (the RSP transmits it there too,
+				// arq_responder.cc SWITCH_ROLE KX guard), so a swap here would desync the
+				// receive config from the RSP's transmit config. data-flow-hybrid-kex.md §7.
+				bool kx_epoch_swapback = (encryption_enabled && !cipher_suite.is_active() && kx_as_data_path());
+				if(!kx_epoch_swapback && forward_configuration != CONFIG_NONE && reverse_configuration != CONFIG_NONE)
 				{
 					int tmp = forward_configuration;
 					forward_configuration = reverse_configuration;
@@ -17506,6 +17715,133 @@ int cl_arq_controller::test_idle_switch_role_race()
 }
 
 // ===========================================================================
+// SWITCH_ROLE re-ride race regression (idle-switchrole-race.md §6; cross-layer
+// data-flow audit of session_data_frame_sent) — the R1 reverse-transfer gate.
+//
+// THE BUG (channel-free, pure ARQ state): the idle SWITCH_ROLE end-of-data
+// handoff is trigger-gated on session_data_frame_sent (Part B) — a Commander
+// must SEND a data frame this stint before it may hand its role away. That flag
+// is reset at construction, in reset_session_state(), and at Commander connect-
+// accept (arq_commander.cc:7313), but was NOT reset on a RESPONDER->COMMANDER
+// role SWAP (SWITCH_ROLE swap-in arq_responder.cc:2122). So a peer that streams
+// as Commander (sdfs=true), hands off, and RE-ACQUIRES the role to receive
+// inherits a STALE-true flag: its empty tx FIFO fires a PREMATURE handoff back
+// to an empty peer -> the connected-but-0-deliver race, on the SECOND ride —
+// exactly the reverse-ct double swap R1 must be safe to ride twice.
+//
+// This test drives the REAL role-acquisition primitive set_role(COMMANDER) (the
+// identical call arq_responder.cc:2122 makes on a SWITCH_ROLE swap-in) with a
+// stale sdfs=true, then the REAL idle branch process_buffer_data_commander().
+// Correct-by-construction fix: set_role(COMMANDER) clears sdfs on the transition,
+// so the re-acquired empty-tx Commander cannot arm the handoff. FAILS-BEFORE with
+// -DSWITCHROLE_RERIDE_FAILBEFORE (the reset is compiled out); PASSES-AFTER in the
+// production build. One-shot, exits rc.
+int cl_arq_controller::test_switch_role_reride_race()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-RERIDE] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else     { printf("[TEST-RERIDE] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// --- Dimensions + buffers (same harness as test_idle_switch_role_race) ---
+	max_data_length   = 6;
+	max_header_length = 6;
+	nMessages         = 32;
+	set_data_batch_size(1);
+	deinit_messages_buffers();                       // idempotent
+	int alloc_rc = init_messages_buffers();          // allocs messages_tx[].data + messages_control.data
+	check(alloc_rc == SUCCESSFUL, "S0 message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+
+	// === Stint-1 aftermath: this peer WAS Commander, SENT data (sdfs=true), then
+	//     handed its role away (SWITCH_ROLE) and is now RESPONDER — the exact
+	//     post-first-swap state of R1's reverse-ct sequence. ===
+	role                    = RESPONDER;
+	original_role           = COMMANDER;             // it was the original data commander
+	session_data_frame_sent = true;                  // STALE from stint 1
+
+	// === The SWITCH_ROLE swap-in: drive the REAL role-acquisition primitive.
+	//     arq_responder.cc:2122 calls exactly set_role(COMMANDER) here. ===
+	set_role(COMMANDER);
+
+	// R1' RE-RIDE RESET: acquiring COMMANDER cleared the stale flag so the
+	// re-acquired Commander re-earns its handoff. FAILS-BEFORE: still true.
+	check(session_data_frame_sent == false,
+		"R1' RE-RIDE RESET: SWITCH_ROLE swap-in clears stale session_data_frame_sent "
+		"(FAILS-BEFORE with -DSWITCHROLE_RERIDE_FAILBEFORE)",
+		session_data_frame_sent ? 1 : 0, 0);
+
+	// === The re-acquired Commander is now idle with an EMPTY tx FIFO. Drive the
+	//     REAL idle branch: with sdfs cleared, the Part-B gate must SUPPRESS the
+	//     premature handoff. ===
+	link_status              = CONNECTED;
+	connection_status        = TRANSMITTING_DATA;    // gates the function body
+	block_under_tx           = NO;                   // gates the idle branch
+	retransmit_count         = 0;
+	message_batch_counter_tx = 0;
+	sack_enabled             = false;
+	sack_v2_enabled          = true;
+	encryption_enabled       = false;                // skip the key-exchange gate
+	compression_enabled      = false;
+	messages_control.status  = FREE;
+
+	int fifo_occupied = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	check(fifo_occupied == 0, "S1 tx FIFO is EMPTY (no data written yet)", fifo_occupied, 0);
+	check(get_nOccupied_messages() == 0, "S2 no DATA frames occupied", get_nOccupied_messages(), 0);
+
+	switch_role_timeout = 0;                          // any elapsed>0 fires if armed
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+
+	process_buffer_data_commander();                 // call1: PRE-FIX arms; POST-FIX gate-suppressed
+	usleep(5000);                                     // let wall-clock pass the (0ms) threshold
+	process_buffer_data_commander();                 // call2: elapsed>0 -> fires iff armed
+
+	int control_code = (messages_control.status != FREE && messages_control.data != NULL)
+	                 ? (int)(unsigned char)messages_control.data[0] : -1;
+	bool reride_fired = (control_code == (int)SWITCH_ROLE);
+	printf("[TEST-RERIDE] after re-ride idle calls: control_code=%d (SWITCH_ROLE=%d) reride_fired=%d\n",
+		control_code, (int)SWITCH_ROLE, reride_fired ? 1 : 0);
+	fflush(stdout);
+	check(!reride_fired,
+		"R1 GATE: re-acquired empty-tx Commander must NOT give its role back "
+		"(FAILS-BEFORE; PASSES-AFTER the swap-in reset)",
+		reride_fired ? 1 : 0, 0);
+
+	// === POSITIVE CONTROL: once the re-acquired Commander actually SENDS its
+	//     reverse stream (sdfs set true, as the batch build does at
+	//     arq_commander.cc:2627), the LEGITIMATE end-of-data handback (the SECOND
+	//     SWITCH_ROLE in R1) STILL fires. Guards against over-suppression. ===
+	messages_control.status = FREE;
+	session_data_frame_sent = true;                  // reverse stream WAS sent
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+	switch_role_timeout = 0;
+	process_buffer_data_commander();                 // call1: arm
+	usleep(5000);
+	process_buffer_data_commander();                 // call2: fire
+	int hb_code = (messages_control.status != FREE && messages_control.data != NULL)
+	            ? (int)(unsigned char)messages_control.data[0] : -1;
+	bool handback_fired = (hb_code == (int)SWITCH_ROLE);
+	printf("[TEST-RERIDE] handback control: code=%d fired=%d (SWITCH_ROLE=%d)\n",
+		hb_code, handback_fired ? 1 : 0, (int)SWITCH_ROLE);
+	fflush(stdout);
+	check(handback_fired,
+		"R1 HANDBACK: after the reverse stream WAS sent, the Commander STILL hands "
+		"back (second SWITCH_ROLE preserved)",
+		handback_fired ? 1 : 0, 1);
+
+	deinit_messages_buffers();
+	printf("[TEST-RERIDE] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ===========================================================================
 // BREAK no-progress teardown regression (idle-switchrole-race.md §3/§4 Part C).
 //
 // THE BUG (channel-free, pure ARQ state): the watchdog never disconnects
@@ -21451,7 +21787,29 @@ void cl_arq_controller::process_buffer_data_commander()
 		// process_commander() gates process_messages_tx_data(), but this function
 		// is called separately from process_messages() and needs its own gate.
 		if(encryption_enabled && !cipher_suite.is_active())
-			return;
+		{
+			// KX-AS-DATA forward source-switch (data-flow-hybrid-kex.md §2.2). Under the
+			// opt-in KX-as-data path, stage the reserved forward stream on first entry and
+			// let the raw-leg fill below feed it as DATA batches (driving the climb).
+			// Legacy pump path (env off): hold exactly as before.
+			if(kx_as_data_path())
+			{
+				if(!kx_stream_tx_active && kx_stream_tx_len == 0
+				   && cipher_suite.get_kx_phase() == KX_IDLE)
+				{
+					if(kx_stage_forward_stream() != 0)
+						return;   // stage (RNG) failure -> hold, fail-secure (no plaintext)
+					cipher_suite.set_kx_phase(KX_MLKEM_PK_SENT);  // KX started; don't re-init
+				}
+				// Once the KX stream drains, FALL THROUGH (do NOT return): have_new_tx below
+				// excludes the held user FIFO in the KX epoch, so the fill loop only feeds the
+				// KX stream when active; when it is drained control reaches the normal finalize
+				// branch (clears block_under_tx) and the idle branch (which hosts the R1
+				// SWITCH_ROLE reverse-ct + KEY_ACTIVATE handshake). data-flow-hybrid-kex.md Â§7.
+			}
+			else
+				return;
+		}
 
 		// SACK retransmit pending: don't create new crypto batch from FIFO.
 		// process_messages_tx_data() will send retransmit-only batch.
@@ -21490,7 +21848,19 @@ void cl_arq_controller::process_buffer_data_commander()
 		// (block_under_tx==NO requirement preserved).
 		bool stage_ok = (block_under_tx == NO)
 		             || (sack_v2_enabled && retransmit_count > 0);
-		if( fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size() && stage_ok)
+		// KX-as-data: the reserved forward stream lives in kx_stream_tx_buf (not
+		// fifo_buffer_tx), which may be empty during the KX epoch — allow the fill when
+		// the KX stream is active too. Env-gated OFF -> kx_stream_tx_active never set.
+		// In the KX-as-data pre-activation epoch the user FIFO is HELD: exclude it here so
+		// the fill loop only ever feeds the KX stream (kx_stream_tx_active) and NEVER pops
+		// user data before activation. Once the stream drains this is false, so control
+		// reaches the finalize/idle branches for the role-swap handshake. Env off / post-
+		// activation: byte-identical (the user-FIFO term is restored).
+		bool kx_hold_user = (encryption_enabled && !cipher_suite.is_active() && kx_as_data_path());
+		bool have_new_tx = ((!kx_hold_user)
+		                    && (fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size()))
+		                   || kx_stream_tx_active;
+		if( have_new_tx && stage_ok)
 		{
 			// Option W (data-flow-stream-offset.md §2.1): total TRANSPORTED payload bytes
 			// framed for the new-data batch built THIS call (comp_size in the compressed
@@ -21998,6 +22368,36 @@ void cl_arq_controller::process_buffer_data_commander()
 				batch_uncompressed_size = 0;
 				for(int i=0;i<fill_limit;i++)
 				{
+					// KX-AS-DATA forward source-switch (data-flow-hybrid-kex.md §2.2).
+					// Feed the reserved forward KX stream from its dedicated buffer, NOT
+					// fifo_buffer_tx (user data stays untouched + held). KX batches carry
+					// NO Option-W wire stamp (w_stamp_rides() is false in the KX epoch) and
+					// do NOT advance the Option-W cursor / stream CRC / backup FIFO —
+					// KEY_ACTIVATE re-anchors delivery to a fresh bsi=0, and the RX routes
+					// these frames to kx_ingest() before any stamp/cursor logic. They are
+					// otherwise ordinary DATA frames, so the whole windowing / SACK /
+					// retransmit engine carries them (dissolving the pattern-ACK wall).
+					if(kx_stream_tx_active)
+					{
+						int kx_remain = kx_stream_tx_len - kx_stream_tx_sent;
+						if(kx_remain <= 0){ kx_stream_tx_active = false; break; }
+						data_read_size = (kx_remain < max_frame) ? kx_remain : max_frame;
+						memcpy(message_TxRx_byte_buffer,
+						       kx_stream_tx_buf + kx_stream_tx_sent, data_read_size);
+						kx_stream_tx_sent += data_read_size;
+						block_under_tx = YES;
+						if(data_read_size==max_frame)
+							add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
+						else
+							add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
+						filled++;
+						if(kx_stream_tx_sent >= kx_stream_tx_len)
+						{
+							kx_stream_tx_active = false;   // whole forward stream staged
+							break;
+						}
+						continue;
+					}
 					// Option W CORE (data-flow-stream-offset.md §8.1): reserve W_EOB_RESERVE
 					// payload bytes on the EOB (last) frame of the batch so its
 					// header+payload+stamp fits the codeword C. The last frame is the one at
@@ -22071,6 +22471,45 @@ void cl_arq_controller::process_buffer_data_commander()
 		}
 		else if(block_under_tx==NO && message_batch_counter_tx==0 && get_nOccupied_messages()==0 && messages_control.status==FREE)
 		{
+			// KX-as-data role-swap / activation handshake (data-flow-hybrid-kex.md §7). The
+			// forward/reverse KX batch is fully delivered + ACKed and nothing is in flight
+			// (this branch's exact precondition), so drive the two R1 SWITCH_ROLE swaps +
+			// KEY_ACTIVATE. Three mutually-exclusive states keyed on kx_phase +
+			// kx_reverse_consumed:
+			//   KX_MLKEM_PK_SENT (only the CMD)            -> SWITCH_ROLE (swap #1: RSP streams ct)
+			//   KX_HYBRID_DONE & !consumed (only the RSP)  -> SWITCH_ROLE (swap #2: hand role back)
+			//   KX_HYBRID_DONE &  consumed (only the CMD)  -> KEY_ACTIVATE (activate)
+			// The idle-switchrole re-ride race is cleared by set_role()'s
+			// session_data_frame_sent reset (arq_common.cc:1669) so neither earned swap fires
+			// an empty handoff; an "awaiting the peer" phase simply holds. Env off ->
+			// kx_as_data_path() false -> the generic handoff below is byte-identical.
+			if(encryption_enabled && !cipher_suite.is_active() && kx_as_data_path())
+			{
+				int ph = cipher_suite.get_kx_phase();
+				if(ph == KX_MLKEM_PK_SENT && !kx_role_swap_sent)
+				{
+					kx_role_swap_sent = true;
+					printf("[CRYPTO] KX-as-data: forward pk delivered -> SWITCH_ROLE (RSP streams reverse ct)\n");
+					fflush(stdout);
+					add_message_control(SWITCH_ROLE);
+				}
+				else if(ph == KX_HYBRID_DONE && !kx_reverse_consumed && !kx_role_swap_sent)
+				{
+					kx_role_swap_sent = true;
+					printf("[CRYPTO] KX-as-data: reverse ct delivered -> SWITCH_ROLE (hand role back to CMD)\n");
+					fflush(stdout);
+					add_message_control(SWITCH_ROLE);
+				}
+				else if(ph == KX_HYBRID_DONE && kx_reverse_consumed && !kx_key_activate_sent)
+				{
+					kx_key_activate_sent = true;
+					printf("[CRYPTO] KX-as-data: reverse ct decapsulated -> sending KEY_ACTIVATE\n");
+					fflush(stdout);
+					add_message_control(KEY_ACTIVATE);
+				}
+			}
+			else
+			{
 			// IDLE-SWITCHROLE-RACE TRIGGER-GATE (Part B, idle-switchrole-race.md
 			// §2/§5.2): only arm/fire the idle SWITCH_ROLE handoff if this session
 			// has actually SENT a data frame. A freshly-connected Commander that
@@ -22098,6 +22537,7 @@ void cl_arq_controller::process_buffer_data_commander()
 					switch_role_timer.reset();
 					add_message_control(SWITCH_ROLE);
 				}
+			}
 			}
 		}
 	}
