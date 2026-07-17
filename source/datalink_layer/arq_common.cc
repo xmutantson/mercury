@@ -8352,7 +8352,26 @@ void cl_arq_controller::kx_stream_reanchor()
 	cmd_batch_seq_id                  = 0;
 	rsp_current_expected_batch_seq_id = -1;
 	rsp_prev_batch_seq_id             = -1;
-	printf("[CRYPTO] KX-as-data re-anchor: Option-W cursors/stamps/CRC + wire bsi reset to fresh bsi=0 baseline\n");
+	// COMPLETE the fresh-bsi baseline. The wire bsi wraps back to 0 here, but the
+	// cross-layer data-flow audit of every wire-bsi consumer shows several ACK-
+	// credit / batch-routing high-waters are ALSO keyed on bsi and still hold the
+	// value the KX handshake batches (wire bsi 0..N) left them at. Without this the
+	// FIRST user batch (wire bsi 0) collides with a stale entry: the CMD clean-
+	// confirm de-dup (cmd_last_applied_clean_bsi) still reads 0 from the KX forward
+	// batch, so the reverse ACK for the first user batch is discarded as a DUPLICATE
+	// and the batch never finalizes -> retransmit -> block failure -> BREAK
+	// (delivered_full=0). Reset the SAME bsi-keyed batch/de-dup state a fresh session
+	// starts from (reset_session_state) so the post-activation data path truly matches
+	// a normal session start. The AEAD nonce epoch is reset separately in the
+	// KEY_ACTIVATE handler; the feature-gated inband-rate announce bsi is untouched.
+	captured_batch_seq_id_for_retransmit = -1;
+	last_received_batch_seq_id           = -1;
+	cmd_sack_v2_last_rx_batch_seq_id     = -1;
+	rsp_prev_batch_active                = false;
+	cmd_prev_retain_count                = 0;
+	cmd_last_applied_sack_bsi            = -1;
+	cmd_last_applied_clean_bsi           = -1;
+	printf("[CRYPTO] KX-as-data re-anchor: Option-W cursors/stamps/CRC + wire bsi + ACK-credit de-dup reset to fresh bsi=0 baseline\n");
 	fflush(stdout);
 }
 
