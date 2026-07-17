@@ -5357,6 +5357,24 @@ public:
   bool connect_fuse_defeat;
   int connect_fuse_seed_tx;   // CMD: seed embedded in the SWITCH_BANDWIDTH we sent (CONFIG_NONE=none)
   int connect_fuse_seed_rx;   // RSP: seed carried by the SWITCH_BANDWIDTH we received (CONFIG_NONE=none)
+  // CONNECT-FAST-CONFIG (connect-fast-config-fallback design) — escalate the CONNECT
+  // handshake to a faster OFDM config (WB/NB CONFIG_0) under a SHORT budget, with an
+  // auto-revert to the incumbent ROBUST_0 handshake on failure. HAIL is config-independent
+  // (gated on ack_pattern_time_ms>0, arq_commander.cc:1098), so a config mismatch always
+  // re-synchronizes on the next HAIL cycle — the revert can never strand a half-connected
+  // peer or hang. The fast attempt reproduces the PROVEN fast vehicle: robust_enabled=NO +
+  // the fast config, so session_floor_anchor(false,cfg)=cfg keeps the anchor CONSISTENT with
+  // the live OFDM config (keeping robust_enabled=YES with a CONFIG_0 seat would leave the
+  // anchor at ROBUST_0 while the live config is CONFIG_0 — the §15 supershift divergence the
+  // init() anchor comment warns about). The revert flips back to the incumbent
+  // (robust_enabled restored + ROBUST_0). Env-latched ONCE in the ctor (production path).
+  // Default OFF (CONFIG_NONE) = today's ROBUST_0-only connect, byte-identical.
+  int connect_fast_config;          // MERCURY_CONNECT_FAST_CONFIG (CONFIG_NONE=off; e.g. CONFIG_0=0)
+  int connect_fast_budget_ms;       // MERCURY_CONNECT_FAST_BUDGET_MS — short fast-attempt budget
+  bool connect_fast_active;         // latched true during the fast attempt; cleared on revert/CONNECTED
+  int connect_fast_fallback_config; // config to revert to (ROBUST_0 on a robust session)
+  int connect_fast_fallback_robust; // robust_enabled to restore on revert (the true robust intent)
+  cl_timer connect_fast_timer;      // COMMANDER short-budget timer (armed at CONNECT)
   // R (DUTY fast-start) — the CONNECT-EVIDENCED robust exit target. The completed MFSK
   // CONNECT handshake decoded the robust tier end-to-end — the SAME confirmation the
   // incumbent otherwise spends ~38 s of robust DATA airtime to earn before the C1

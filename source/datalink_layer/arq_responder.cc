@@ -1847,6 +1847,25 @@ void cl_arq_controller::process_messages_rx_data_control()
 			printf("[HAIL] Timeout waiting for START_CONNECTION, resuming HAIL scan\n");
 			fflush(stdout);
 			hail_detected = NO;
+			// CONNECT-FAST-CONFIG revert (RESPONDER): we HAILed back but the fast-config
+			// START_CONNECTION never decoded on this channel. Revert the listen config to the
+			// incumbent ROBUST_0 so the reverted commander's ROBUST_0 HAIL + START_CONNECTION
+			// re-syncs (HAIL is config-independent — a mismatch degrades to a re-HAIL, never a
+			// strand). Latched: fires once per session, symmetric with the COMMANDER revert.
+			if(connect_fast_active)
+			{
+				printf("[CONNECT-FALLBACK] responder: fast connect (CONFIG_%d) listen timed out "
+					"— reverting listen to CONFIG_%d (ROBUST_0)\n",
+					connect_fast_config, connect_fast_fallback_config);
+				fflush(stdout);
+				connect_fast_active = false;
+				robust_enabled = connect_fast_fallback_robust;
+				init_configuration = connect_fast_fallback_config;
+				data_configuration = connect_fast_fallback_config;
+				ack_configuration  = connect_fast_fallback_config;
+				last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+				load_configuration(connect_fast_fallback_config, FULL, YES);
+			}
 		}
 	}
 }

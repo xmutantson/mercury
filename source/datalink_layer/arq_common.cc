@@ -648,6 +648,23 @@ cl_arq_controller::cl_arq_controller()
 		connect_fuse_defeat = duty_master_defeat || (cf && *cf && atoi(cf) != 0);
 		connect_fuse_seed_tx = CONFIG_NONE;
 		connect_fuse_seed_rx = CONFIG_NONE;
+		// CONNECT-FAST-CONFIG (connect-fast-config-fallback design): env-latch the fast
+		// connect config + short budget ONCE here (production path) exactly like the DUTY
+		// knobs above. Default OFF: connect_fast_config = CONFIG_NONE -> today's ROBUST_0
+		// connect handshake, byte-identical. MERCURY_CONNECT_FAST_CONFIG=0 escalates the
+		// handshake to CONFIG_0; MERCURY_CONNECT_FAST_BUDGET_MS overrides the ~8 s budget.
+		const char* cfc = std::getenv("MERCURY_CONNECT_FAST_CONFIG");
+		connect_fast_config = (cfc && *cfc) ? atoi(cfc) : CONFIG_NONE;
+		// Default 15 s: the measured CONFIG_0 CONNECTING phase (HAIL -> START_CONNECTION_ACK /
+		// CONNECTION_ACCEPTED) is ~8.1 s on WB real-audio (START_CONNECTION airtime + RSP
+		// turnaround + the re-emit-gap tail), so the budget must clear ~8 s with margin for
+		// channel/load variance or a good fast connect is falsely reverted. A weak channel (where
+		// the CONFIG_0 frames never decode) still reverts at the budget and connects via ROBUST_0.
+		const char* cfb = std::getenv("MERCURY_CONNECT_FAST_BUDGET_MS");
+		connect_fast_budget_ms = (cfb && *cfb) ? atoi(cfb) : 15000;
+		connect_fast_active = false;
+		connect_fast_fallback_config = ROBUST_0;
+		connect_fast_fallback_robust = YES;
 	}
 	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
 	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at
@@ -2077,6 +2094,31 @@ int cl_arq_controller::init(int tcp_base_port, int gear_shift_on, int initial_mo
 	this->gear_shift_on = gear_shift_on;
 	gear_shift_algorithm=default_configuration_ARQ.gear_shift_algorithm;
 	current_configuration=CONFIG_NONE;
+
+	// CONNECT-FAST-CONFIG (connect-fast-config-fallback design): when the knob is set, run
+	// the CONNECT handshake as the PROVEN fast vehicle (robust_enabled=NO + the fast OFDM
+	// config), remembering the true robust intent for the auto-revert. Overriding
+	// robust_enabled (not just init_configuration) is REQUIRED: the connect frames ride
+	// current_configuration, which is seated from data_configuration just below, and
+	// session_floor_anchor()/config_is_at_top()/config_ladder_down() all key off
+	// robust_enabled. Keeping robust_enabled=YES with a CONFIG_0 seat would leave the anchor
+	// at ROBUST_0 while the live config is CONFIG_0 — the exact §15 supershift re-trigger
+	// divergence the anchor comment below warns about. Flipping robust_enabled=NO makes every
+	// derivation consistent at the fast config (session_floor_anchor(false,cfg)=cfg),
+	// reproducing the proven --start-cfg N seat. The revert (COMMANDER update_status /
+	// RESPONDER HAIL-timeout) restores robust_enabled + ROBUST_0.
+	if(connect_fast_config != CONFIG_NONE)
+	{
+		connect_fast_fallback_robust = robust_enabled;
+		connect_fast_fallback_config = robust_enabled ? ROBUST_0 : initial_mode;
+		connect_fast_active = true;
+		robust_enabled = NO;
+		initial_mode = connect_fast_config;
+		printf("[CONNECT-FAST] connect handshake escalated to CONFIG_%d "
+			"(fallback=CONFIG_%d, budget=%d ms)\n",
+			connect_fast_config, connect_fast_fallback_config, connect_fast_budget_ms);
+		fflush(stdout);
+	}
 
 	if(robust_enabled)
 	{
@@ -6121,6 +6163,108 @@ void cl_arq_controller::update_status()
 		stats.nNAcked_control++;
 	}
 
+	// CONNECT-FAST-CONFIG: a fast connect that reached CONNECTED needs no fallback — retire
+	// the machinery so the budget timer cannot fire on a later LISTENING re-entry.
+	if(connect_fast_active && link_status==CONNECTED)
+	{
+		connect_fast_active = false;
+		connect_fast_timer.stop();
+		connect_fast_timer.reset();
+	}
+
+	// CONNECT-FAST-CONFIG revert (COMMANDER): the fast attempt is STUCK in CONNECTING past
+	// the SHORT budget — HAIL contacted the peer but the fast-config START_CONNECTION never
+	// ACKed on this channel (the WGN:-6 failure mode: HAIL OK, OFDM frames never decode).
+	// Advancing to CONNECTION_ACCEPTED/NEGOTIATING means the fast handshake IS progressing,
+	// so gate on CONNECTING only. Revert to the incumbent ROBUST_0 handshake and retry — HAIL
+	// (config-independent) re-syncs the peer, so a mismatch can never strand a half-connected
+	// peer or hang. Fires BEFORE the 30 s connection_timeout so a weak-channel connect costs
+	// at most ONE short budget (not connection_timeout + the robust connect). The outer
+	// connection_timeout / max_connection_attempts / link_timeout backstops remain unchanged.
+	if(connect_fast_active && role==COMMANDER && link_status==CONNECTING &&
+	   connect_fast_timer.counting==1 &&
+	   connect_fast_timer.get_elapsed_time_ms() >= connect_fast_budget_ms)
+	{
+		printf("[CONNECT-FALLBACK] fast connect (CONFIG_%d) failed after %d ms "
+			"— reverting to CONFIG_%d (ROBUST_0) and retrying\n",
+			connect_fast_config, connect_fast_timer.get_elapsed_time_ms(),
+			connect_fast_fallback_config);
+		fflush(stdout);
+		connect_fast_active = false;
+		robust_enabled = connect_fast_fallback_robust;
+		init_configuration = connect_fast_fallback_config;
+		data_configuration = connect_fast_fallback_config;
+		ack_configuration  = connect_fast_fallback_config;
+		last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+		load_configuration(connect_fast_fallback_config, FULL, YES);
+		hail_detected = NO;                 // force a fresh HAIL at ROBUST_0
+		connect_fast_timer.stop();
+		connect_fast_timer.reset();
+		connection_attempts = 0;            // give the incumbent handshake its full attempt budget
+		connection_attempt_timer.reset();
+		connection_attempt_timer.start();
+		messages_control.status = FREE;
+		link_status = CONNECTING;
+		return;
+	}
+
+	// CONNECT-FAST-CONFIG revert (RESPONDER, stuck-handshake escape). The RSP decoded the
+	// fast-config START_CONNECTION and advanced to CONNECTION_RECEIVED, but the COMMANDER's
+	// short budget expired (a slow / asymmetric reverse path swallowed the START_CONNECTION_ACK)
+	// and it reverted to ROBUST_0 — so TEST_CONNECTION will NEVER arrive at CONFIG_0. The RSP
+	// has no connection_attempt_timer (it never issued CONNECT) and CONNECTION_RECEIVED is not
+	// covered by the connection-attempt timeout, so without this it hangs in CONNECTION_RECEIVED
+	// forever (a strand — a modem must LOSE, not hang). Bound the wait: arm the timer on entry
+	// and, if the RSP sits in CONNECTION_RECEIVED at the fast config past a GENEROUS multiple of
+	// the fast budget (clears a normal CONNECTION_RECEIVED->CONNECTED completion so a good fast
+	// connect is never aborted), revert to ROBUST_0 and resume LISTENING via the SAME teardown
+	// the connection-attempt-timeout path uses — the reverted commander's ROBUST_0 re-HAIL then
+	// re-syncs (HAIL is config-independent). Latched: fires once per session.
+	if(connect_fast_active && role==RESPONDER && link_status==CONNECTION_RECEIVED)
+	{
+		if(connect_fast_timer.counting==0)
+		{
+			connect_fast_timer.reset();
+			connect_fast_timer.start();
+		}
+		else if(connect_fast_timer.get_elapsed_time_ms() >= 2*connect_fast_budget_ms)
+		{
+			printf("[CONNECT-FALLBACK] responder: fast connect (CONFIG_%d) stalled in "
+				"CONNECTION_RECEIVED %d ms (peer reverted) — reverting to CONFIG_%d (ROBUST_0), "
+				"resuming LISTEN\n",
+				connect_fast_config, connect_fast_timer.get_elapsed_time_ms(),
+				connect_fast_fallback_config);
+			fflush(stdout);
+			connect_fast_active = false;
+			robust_enabled = connect_fast_fallback_robust;
+			init_configuration = connect_fast_fallback_config;
+			data_configuration = connect_fast_fallback_config;
+			ack_configuration  = connect_fast_fallback_config;
+			last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+			hail_detected = NO;
+			connect_fast_timer.stop();
+			connect_fast_timer.reset();
+			this->link_status = DROPPED;
+			reset_session_state();
+			reset_all_timers();
+			fifo_buffer_tx.flush();
+			fifo_buffer_backup.flush();
+			fifo_buffer_rx.flush();
+			messages_control.status = FREE;
+			set_role(RESPONDER);
+			link_status = LISTENING;
+			connection_status = RECEIVING;
+			load_configuration(init_configuration, FULL, YES);   // reseat PHY to ROBUST_0
+			return;
+		}
+	}
+	else if(connect_fast_active && role==RESPONDER && connect_fast_timer.counting==1)
+	{
+		// left CONNECTION_RECEIVED (progressed or reset) — disarm the RSP stall timer
+		connect_fast_timer.stop();
+		connect_fast_timer.reset();
+	}
+
 	// Check connection attempt timeout - separate from link_timer which gets restarted on every message
 	if((link_status==CONNECTING || link_status==NEGOTIATING || link_status==CONNECTION_ACCEPTED) &&
 	   connection_attempt_timer.counting==1 &&
@@ -7054,6 +7198,15 @@ void cl_arq_controller::process_user_command(std::string command)
 		connection_attempts=0;
 		connection_attempt_timer.reset();
 		connection_attempt_timer.start();
+
+		// CONNECT-FAST-CONFIG: clear any stale fast-budget timer for this fresh CONNECT.
+		// The budget is ARMED later, at HAIL-detected (arq_commander.cc), so the variable
+		// config-independent HAIL-acquisition time is excluded from the fast budget.
+		if(connect_fast_active)
+		{
+			connect_fast_timer.stop();
+			connect_fast_timer.reset();
+		}
 
 		// Send OK acknowledgement
 		tcp_socket_control.message->buffer[0]='O';

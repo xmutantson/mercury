@@ -1115,6 +1115,19 @@ void cl_arq_controller::process_messages_commander()
 					printf("[HAIL] Response received — peer is Mercury\n");
 					fflush(stdout);
 					hail_detected = YES;
+					// CONNECT-FAST-CONFIG: anchor the SHORT fast-attempt budget HERE, at
+					// HAIL-detected — the instant the CONFIG_0 OFDM handshake begins. HAIL
+					// acquisition is config-INDEPENDENT (same for fast and robust) and its
+					// duration is variable (channel + host-load dependent), so it must NOT
+					// count against the fast budget: anchoring at the CONNECT command let a
+					// slow HAIL acquisition consume the whole budget and revert a handshake
+					// that was actually succeeding. Started once (counting==0 guard); the
+					// revert clears connect_fast_active so it never re-arms.
+					if(connect_fast_active && connect_fast_timer.counting == 0)
+					{
+						connect_fast_timer.reset();
+						connect_fast_timer.start();
+					}
 					break;
 				}
 				// §5.7-B8 + CLOCK-FIDELITY FIX (fix/sim-connect-virtual-clock):
