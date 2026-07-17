@@ -5228,6 +5228,13 @@ public:
   // KEY_ACTIVATE REFUSE). Returns 0 = pass / N = failure count.
   int  test_kx_roundtrip_derive();
 
+  // KX mid-stream AEAD payload TAMPER fire proof (data-flow-hybrid-kex.md live
+  // G3): flip ciphertext bytes on the post-activation data stream and prove the
+  // receiver REJECTS — AEAD auth-fail -> the copy_data_to_buffer() funnel tears
+  // the link, 0 corrupted bytes reach the app, never a plaintext fallback; clean
+  // control delivers. Returns 0 = pass / N = failure count.
+  int  test_kx_data_tamper();
+
   char psk_hex[129];                  // Pre-shared key (hex string, up to 64 bytes = 128 hex chars)
   bool psk_mismatch_pending;          // Commander detected PSK mismatch, KEY_ACTIVATE sent for responder notification
 

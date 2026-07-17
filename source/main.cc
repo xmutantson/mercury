@@ -1812,6 +1812,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_kxrt;
                 failed += ARQ_kxrt.test_kx_roundtrip_derive();
             }
+            // KX-as-data MID-STREAM AEAD payload TAMPER fire proof (the live channel-
+            // MITM gate, data-flow-hybrid-kex.md G3): flip ciphertext bytes on the post-
+            // activation data stream and prove the receiver REJECTS — the AEAD auth-fail
+            // fires, the production copy_data_to_buffer() funnel tears the link, 0 corrupted
+            // bytes reach the app, and it never falls back to plaintext. Clean control
+            // delivers. In-process synthetic-fire.
+            {
+                cl_arq_controller ARQ_kxdt;
+                failed += ARQ_kxdt.test_kx_data_tamper();
+            }
             // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
             // 8e62722e regression that dropped OFDM data delivery to 0 because the
             // pre-data re-ACK pinned the shared frames_to_read=2 across the first
@@ -2943,6 +2953,7 @@ int main(int argc, char *argv[])
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
                                         // must NOT drop popped bytes when the non-blocking app socket back-pressures.
                                         // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
+    bool test_kx_data_tamper_cli = false; // --test-kx-data-tamper: mid-stream AEAD ciphertext tamper fail-secure fire proof
     bool test_decompress_false_accept_cli = false; // --test-decompress-false-accept: streaming decompress-failure
                                         // must NOT push the undecodable raw compressed blob to the app (silent byte-
                                         // corruption). Drives a REAL two-compressor streaming desync + copy_data_to_buffer;
@@ -3785,6 +3796,15 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // source/datalink_layer/test_rx_drain.cc + fix6/STALL_ROOTCAUSE.md.
             test_rx_drain_backpressure_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-kx-data-tamper") == 0)
+        {
+            // Mid-stream AEAD ciphertext tamper fail-secure fire proof — one-shot
+            // at startup, then exit with the test rc. See
+            // source/datalink_layer/test_kx_data_tamper.cc.
+            test_kx_data_tamper_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5839,6 +5859,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_rx_drain_backpressure();
             printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_kx_data_tamper_cli) {
+            // Mid-stream AEAD ciphertext tamper fail-secure fire proof (one-shot, then exit rc).
+            printf("[FLAG] --test-kx-data-tamper: invoking mid-stream AEAD ciphertext tamper fail-secure fire proof\n");
+            fflush(stdout);
+            cl_arq_controller test_arq;
+            int rc = test_arq.test_kx_data_tamper();
+            printf("[FLAG] kx-data-tamper test complete (rc=%d) - exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
