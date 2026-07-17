@@ -9724,6 +9724,13 @@ int cl_arq_controller::test_axis2_quiesce_gate()
 		axis2_move_up_count            = 0;
 		messages_control.status        = FREE;
 		data_batch_size                = START;
+		// REGRESSION ISOLATION (duty P-alt climb-confirm batch shrink): this gate drives
+		// policy_evaluate_axis2 at a non-top OFDM rung (CONFIG_0) so the adaptive controller
+		// runs and the quiesce/defer logic under test is reached. The climb-confirm cap predicate
+		// climb_confirm_batch_active() is TRUE there and early-returns the whole controller before
+		// the quiesce gate. Defeat the lever so the controller runs; the quiesce logic is
+		// independent of it (the lever has its own regression, test_climb_confirm_batch).
+		duty_palt_defeat = true;
 	};
 	const int synth_rx = (int)(START * 0.6f);   // partial_rate = 0.4 (a "bad" observation)
 
@@ -17001,6 +17008,17 @@ int cl_arq_controller::test_mixbatch_fill_overpop_compressed()
 	block_under_tx     = NO;
 	message_batch_counter_tx = 0;
 	compress_ratio_estimate  = 20.0f;   // repetitive payload primes a high ratio
+	// REGRESSION ISOLATION (duty P-alt climb-confirm batch shrink): this unit measures the
+	// mixbatch new-data FILL - the compressed-unit over-pop defeat (A1..A3) and the force-FREE
+	// staged-frame preservation (PART B) - which are ORTHOGONAL to the climb-confirm batch cap.
+	// The cap sole predicate climb_confirm_batch_active() is TRUE at a non-top OFDM config
+	// (this unit runs at the default current_configuration = CONFIG_0), so set_data_batch_size(DBS)
+	// would clamp to CLIMB_CONFIRM_BATCH (10), collapsing the DBS=25 / R=20 geometry the fill
+	// assertions pin (cycle-1 then stages 0 new frames, leaving batch_uncompressed_size at its -1
+	// sentinel and skewing the bus1+bus2 no-loss tally by one). Defeat the lever here so the fill
+	// is measured at the intended DBS; the lever ships default-ON in production and has its own
+	// dedicated regression (test_climb_confirm_batch).
+	duty_palt_defeat = true;
 
 	const int DBS = 25;
 	const int R   = 20;                 // large prefix -> only DBS-R=5 new slots fit
