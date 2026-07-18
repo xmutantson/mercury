@@ -591,6 +591,9 @@ public:
 	// byte-correct, unchanged). When ON it activates the variable-preamble TX +
 	// RX MINI handling. Toggle via the env knob below for A/B + INC-3 work.
 	bool preamble_amortization_enabled = false;
+	// CONTINUOUS-KEYDOWN: carry fine timing across the keydown instead of re-deriving per MINI frame
+	bool keydown_track_timing_enabled = false;
+	int keydown_last_delay = -1; // MINI=0: last decoded frame delay; its sub-symbol phase seeds the next tail prediction
 
 	// TX per-frame override: number of preamble symbols THIS transmit_bit call
 	// emits. -1 = use the full configured preamble_nSymb (legacy). send_batch

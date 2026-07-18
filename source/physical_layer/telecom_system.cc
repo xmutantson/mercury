@@ -704,9 +704,11 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 		return v;
 	}();
 
+	static const int keydown_mini0 = []() { const char* e=std::getenv("MERCURY_KEYDOWN_MINI0"); return (e&&*e)?atoi(e):0; }();
+	if(keydown_mini0) return 0;   // CONTINUOUS-KEYDOWN: zero-preamble tail frames (located by prediction)
 	int eff = mini_nsymb;
-	if(eff > full_nsymb) eff = full_nsymb;        // never exceed the FULL preamble
-	return eff;                                    // MINI resync (default 1 symbol)
+	if(eff > full_nsymb) eff = full_nsymb;
+	return eff;
 }
 
 int cl_telecom_system::tx_effective_preamble_nsymb() const
@@ -715,7 +717,7 @@ int cl_telecom_system::tx_effective_preamble_nsymb() const
 	if(!preamble_amortization_enabled) return full;
 	if(tx_preamble_nsymb_override < 0) return full;        // legacy / unset
 	int eff = tx_preamble_nsymb_override;
-	if(eff < 1) eff = 1;
+	if(eff < 0) eff = 0;
 	if(eff > full) eff = full;
 	return eff;
 }
@@ -726,7 +728,7 @@ int cl_telecom_system::rx_effective_preamble_nsymb() const
 	if(!preamble_amortization_enabled) return full;
 	if(rx_preamble_nsymb_override < 0) return full;        // legacy / unset
 	int eff = rx_preamble_nsymb_override;
-	if(eff < 1) eff = 1;
+	if(eff < 0) eff = 0;
 	if(eff > full) eff = full;
 	return eff;
 }
@@ -1328,6 +1330,16 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// fact-documents/data-flow-preamble-amortization.md §2.
 	int rx_eff_preamble = data_container.preamble_nSymb;
 	if(!preamble_amortization_enabled) rx_eff_preamble = data_container.preamble_nSymb;
+	// CONTINUOUS-KEYDOWN carried-timing tracker state (per receive() call). When
+	// keydown_track_timing_enabled, a tail (MINI) frame whose predict-residual is
+	// SUB-GUARD (noise regime) does NOT re-pin the FFT window to the short-preamble
+	// peak (variance ~1/L injects ICI); the applied timing is predicted+damped,
+	// carried from the full-integration anchor + drift IIR. A LARGER residual is a
+	// genuine relocation (missed frame / re-anchor) and is followed like stock.
+	bool keydown_track_active = false;
+	int  keydown_tracked_delay = 0;
+	static const double keydown_track_beta = []{ const char* e=std::getenv("MERCURY_KEYDOWN_BETA"); double v=(e&&*e)?atoi(e)/100.0:0.25; if(v<0.0)v=0.0; if(v>1.0)v=1.0; return v; }();
+	static const int keydown_track_diag = []{ const char* e=std::getenv("MERCURY_KEYDOWN_DIAG"); return (e&&*e)?atoi(e):0; }();
 
 	// Coarse frequency offset - starts at 0, only searched on trial 1 if trial 0 fails
 	double coarse_freq_offset = 0.0;
@@ -1649,6 +1661,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				&& M != MOD_MFSK
 				&& receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0;
 			if(rx_batch_predict_mode) rx_eff_preamble = 1;
+			static const int keydown_mini0_rx = []() { const char* e=std::getenv("MERCURY_KEYDOWN_MINI0"); return (e&&*e)?atoi(e):0; }();
+			if(rx_batch_predict_mode && keydown_mini0_rx) rx_eff_preamble = 0;   // MINI=0: zero-preamble tail frame
 
 			if(receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
 			{
@@ -1663,6 +1677,21 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				int preamble_interp = verify_nsym * sym_samples;
 				int predicted_pos = ofdm_skip * sym_samples + (int)receive_stats.ofdm_drift_per_frame;
 				if(predicted_pos < 0) predicted_pos = 0;
+				if(keydown_mini0_rx && rx_batch_predict_mode)
+				{
+					// CONTINUOUS-KEYDOWN MINI=0: no tail preamble exists to verify. Locate
+					// the frame purely by prediction (symbol-count + drift IIR), carried from
+					// the full-integration anchor. batch_verified=true skips verify/repin/
+					// full-search; keydown_track_active carries past the site-8 fine re-derive.
+					int keydown_phi = (keydown_last_delay >= 0) ? (keydown_last_delay % sym_samples) : 0;
+					int keydown_pred_ph = predicted_pos + keydown_phi;   // carry the anchor sub-symbol fine-timing phase
+					receive_stats.delay = keydown_pred_ph;
+					receive_stats.coarse_metric = 1.0;
+					keydown_tracked_delay = keydown_pred_ph;
+					keydown_track_active = true;
+					batch_verified = true;
+					if(keydown_track_diag) { printf("[KEYDOWN-TRACK] mini0 pred=%d (pure prediction, 0 preamble) drift=%.2f\n", predicted_pos, receive_stats.ofdm_drift_per_frame); fflush(stdout); }
+				}
 
 				// Verify in ±2*gi_interp window around prediction
 				int verify_start = predicted_pos - 2 * gi_interp;
@@ -1708,10 +1737,26 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					if(verify.correlation >= preamble_detect_threshold)
 					{
 						// Prediction verified — use directly, skip wider search
-						receive_stats.delay = verify.delay;
 						receive_stats.coarse_metric = verify.correlation;
-						int drift = (int)receive_stats.delay - predicted_pos;
-						receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * drift;
+						int raw_resid = (int)verify.delay - predicted_pos;
+						if(keydown_track_timing_enabled && raw_resid <= gi_interp && raw_resid >= -gi_interp)
+						{
+							// NOISE regime: sub-guard residual = the ICI-injecting fine-timing
+							// jitter. Damp it; carry the predicted position (low-variance track).
+							receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * (double)raw_resid;
+							int corr = (int)(keydown_track_beta * (double)raw_resid + (raw_resid>=0?0.5:-0.5));
+							receive_stats.delay = predicted_pos + corr;
+							keydown_tracked_delay = (int)receive_stats.delay;
+							keydown_track_active = true;
+							if(keydown_track_diag) { printf("[KEYDOWN-TRACK] verify pred=%d rawresid=%d corr=%d applied=%d drift=%.2f\n", predicted_pos, raw_resid, corr, (int)receive_stats.delay, receive_stats.ofdm_drift_per_frame); fflush(stdout); }
+						}
+						else
+						{
+							// legacy / RELOCATION regime: follow the raw peak.
+							receive_stats.delay = verify.delay;
+							receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * (double)raw_resid;
+							if(keydown_track_timing_enabled && keydown_track_diag) { printf("[KEYDOWN-TRACK] follow pred=%d rawresid=%d (>guard %d) applied=%d\n", predicted_pos, raw_resid, gi_interp, (int)receive_stats.delay); fflush(stdout); }
+						}
 						batch_verified = true;
 					}
 				}
@@ -1749,10 +1794,22 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						repin.delay = repin.delay * r_M + repin_start_full;
 						if(repin.correlation >= preamble_detect_threshold)
 						{
-							receive_stats.delay = repin.delay;
 							receive_stats.coarse_metric = repin.correlation;
-							int drift = (int)receive_stats.delay - predicted_pos;
-							receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * drift;
+							int raw_resid = (int)repin.delay - predicted_pos;
+							if(keydown_track_timing_enabled && raw_resid <= gi_interp && raw_resid >= -gi_interp)
+							{
+								receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * (double)raw_resid;
+								int corr = (int)(keydown_track_beta * (double)raw_resid + (raw_resid>=0?0.5:-0.5));
+								receive_stats.delay = predicted_pos + corr;
+								keydown_tracked_delay = (int)receive_stats.delay;
+								keydown_track_active = true;
+								if(keydown_track_diag) { printf("[KEYDOWN-TRACK] repin  pred=%d rawresid=%d corr=%d applied=%d drift=%.2f\n", predicted_pos, raw_resid, corr, (int)receive_stats.delay, receive_stats.ofdm_drift_per_frame); fflush(stdout); }
+							}
+							else
+							{
+								receive_stats.delay = repin.delay;
+								receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * (double)raw_resid;
+							}
 							batch_verified = true;
 						}
 					}
@@ -2741,6 +2798,9 @@ skip_h_retry_point:
 					data_container.interpolation_rate, receive_stats.sync_trials, 1, time_sync_trials_max,
 					(preamble_amortization_enabled && M != MOD_MFSK) ? rx_eff_preamble : -1);
 				receive_stats.delay = s8_win_start + fine_result.delay;
+				// CONTINUOUS-KEYDOWN: carry tracked timing (noise-regime tail frames);
+				// skip the short-preamble fine re-derive (its ~1/L variance is the ICI).
+				if(keydown_track_active) receive_stats.delay = keydown_tracked_delay;
 				// P1 candidate (d): the site-8 with_metric fine stage ties across the ~4-symbol
 				// silence-cancellation plateau and (bare metric) undershoots to the earliest tie
 				// (the k-symbol-early post-turnaround wrong-lock). The COARSE energy-weighted
@@ -3839,6 +3899,7 @@ skip_h_retry_point:
 				receive_stats.message_decoded=YES;
 				if(M != MOD_MFSK)
 				{
+					keydown_last_delay = receive_stats.delay;   // MINI=0 phase carry: remember the last good frame position
 					printf("[OFDM-OK] t%d cfg=%d delay=%d iter=%d freq=%.1f var=%.4f meanH=%.3f SNR=%.1f coarse=%.1f\n",
 						receive_stats.sync_trials, current_configuration,
 						receive_stats.delay, receive_stats.iterations_done,

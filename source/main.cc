@@ -5421,6 +5421,9 @@ start_modem:
             printf("Mode selected: ARQ\n");
         cl_arq_controller ARQ;
         ARQ.telecom_system = &telecom_system;
+        // CONTINUOUS-KEYDOWN production setters (real -m ARQ path). Both peers set these.
+        if(const char* kd_e=std::getenv("MERCURY_PREAMBLE_AMORT")) { if(atoi(kd_e)) { telecom_system.preamble_amortization_enabled = true; printf("[FLAG] MERCURY_PREAMBLE_AMORT=1: preamble amortization ENABLED\n"); fflush(stdout); } }
+        if(const char* kt_e=std::getenv("MERCURY_KEYDOWN_TRACK")) { if(atoi(kt_e)) { telecom_system.keydown_track_timing_enabled = true; printf("[FLAG] MERCURY_KEYDOWN_TRACK=1: continuous-keydown carried-timing ENABLED\n"); fflush(stdout); } }
         ARQ.passive_monitor = is_monitor_mode;
         ARQ.monitor_stdout = is_monitor_mode && monitor_stdout;
         if (phy_reinit_settle_ms_cli != -1) {
