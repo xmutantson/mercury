@@ -8076,12 +8076,14 @@ void cl_telecom_system::sfo_grid_test()
 	// operating envelope (depth × Doppler) the big-block holds vs hands off to the
 	// gearshift. Model (Watterson 1970, CCIR 520; the standard HF channel sim):
 	//   H(n,j) = g0(n) + g1(n)·e^{-j·w_j·Δ}
-	//   g0,g1 = INDEPENDENT complex-Gaussian (Rayleigh) tap gains, each Doppler-
-	//           filtered to spread fd via a first-order AR(1) low-pass (the
-	//           Ornstein-Uhlenbeck spectrum, matching cl_sim_phase_noise's pole
-	//           form): g(n) = ρ·g(n-1) + sqrt(1-ρ²)·CN(0,1), ρ = exp(-2π·fd/f_sym),
-	//           f_sym = Fs/Nofdm (one tap update per OFDM symbol). fd is the Doppler
-	//           in Hz; ρ→1 as fd→0 (a SLOW fade is ~constant across the block).
+	//   g0 is the fixed LOS ray. g1 is a complex-Gaussian scatter tap shaped by
+	//           the IONOS firmware's 128-tap adjusted-Gaussian FIR, independently
+	//           on its I/Q rails. A new innovation enters the FIR every
+	//           UPDATE=round(Fs/(64·fd)) PASSBAND samples and the FIR output is held
+	//           between updates (zero-order hold). The grid has one H per OFDM
+	//           symbol, so it samples that held process at each symbol boundary and
+	//           advances the FIR clock by Nofdm·frequency_interpolation_rate physical
+	//           samples per row. Thus f_sym=Fs/(Nofdm·interp), not Fs/Nofdm.
 	//   FADE DEPTH D (dB): path 0 is a CONSTANT unit LOS ray (g0≡1, the stable
 	//           direct path); path 1 is the RAYLEIGH-FADING scatter ray with mean
 	//           amplitude a = 1 - 10^(-D/20) so its destructive combine drives the
@@ -8101,21 +8103,108 @@ void cl_telecom_system::sfo_grid_test()
 	std::vector<std::complex<double>> Hwatt;   // (Ngrid×Nc) per-symbol time-varying H, chan_sel==3
 	if(chan_sel == 3)
 	{
-		// --- per-symbol Doppler-filtered tap gains ---
-		double Fs    = (double)sampling_frequency;            // passband sample rate
-		double f_sym = (Nofdm>0) ? (Fs / (double)Nofdm) : 1.0; // OFDM symbol rate (Hz)
-		double rho   = std::exp(-2.0*M_PI*watt_fd / f_sym);    // AR(1) Doppler pole
-		if(rho > 0.999999) rho = 0.999999;
-		double inn   = std::sqrt(1.0 - rho*rho);               // innovation scale (unit-var)
+		// IONOS 128 Tap Adj Gauss LPF Rev2 (64 Hz design update rate), lifted
+		// verbatim from relay_doppler_ref.py / the firmware. DC gain is 1.0.
+		static const double GAUS_FIR_COEFFS[128] = {
+			1.1755592671332046e-11, 2.0188004956137427e-10, 1.7236333623946176e-09, 9.815423109243151e-09,
+			4.219820040519088e-08, 1.4693429486234634e-07, 4.338503956649552e-07, 1.122118806000393e-06,
+			2.604091536729611e-06, 5.522713327023963e-06, 1.0857390465642334e-05, 2.0011412649247494e-05,
+			3.4893068706162795e-05, 5.7982477259392286e-05, 9.237678934582388e-05, 0.00014180767284007714,
+			0.00021062669000635658, 0.0003037561533907518, 0.0004266051229102419, 0.000584952237938201,
+			0.0007847989367901134, 0.001032198204838678, 0.001333065243166745, 0.001692977321877409,
+			0.002116970561258896, 0.002609341477645015, 0.003173460865247882, 0.00381160700116864,
+			0.004524824309342139, 0.005312812558055807, 0.006173850455688009, 0.007104756211217515,
+			0.008100886298035966, 0.00915617235512072, 0.010263194925878348, 0.01141329161173599,
+			0.012596696236577472, 0.013802704802828978, 0.015019863385625786, 0.016236172665450826,
+			0.01743930354214716, 0.01861681819809535, 0.019756391073966928, 0.020846024470695095,
+			0.021874253876569306, 0.02283033861665188, 0.023704434009553566, 0.02448774186995001,
+			0.02517263689027796, 0.025752767148979578, 0.026223127704178725, 0.026580106921515002,
+			0.02682150583616039, 0.026946531447567135, 0.026955765379786157, 0.02685110980161695,
+			0.026635712883536795, 0.026313876369100774, 0.025890948056565766, 0.025373202123371387,
+			0.024767710285281262, 0.024082206768594926, 0.02332494999439922, 0.022504583735910823,
+			0.02163000032189053, 0.020710208229666707, 0.019754206149457228, 0.018770865316331563,
+			0.01776882160593159, 0.016756378583127243, 0.01574142238665159, 0.01473134903422507,
+			0.013733004447687326, 0.012752637231260112, 0.011795863992392318, 0.010867646776884902,
+			0.009972282000446704, 0.009113400098909145, 0.008293974989634013, 0.007516342337046732,
+			0.006782225544921226, 0.006092768355660706, 0.005448572920512081, 0.004849742212182516,
+			0.004295925680163602, 0.003786367096475506, 0.003319953602663025, 0.002895265044807468,
+			0.002510622769190125, 0.002164137144270543, 0.0018537531721837, 0.001577293652557479,
+			0.001332499460868328, 0.001117066600796574, 0.0009286797833839573, 0.0007650423737761393,
+			0.0006239026277671727, 0.0005030762143350815, 0.0004004650862100223, 0.0003140728178353742,
+			0.00024201657867910556, 0.00018253594974316996, 0.00013399882249807025, 9.49046426887381e-05,
+			6.388527699708468e-05, 3.970378899074398e-05, 2.1251412801076355e-05, 7.5430092767428655e-06,
+			-2.2887192936932196e-06, -8.999992637884094e-06, -1.3243447148502327e-05, -1.557613368708468e-05,
+			-1.6467811426850445e-05, -1.63093528492861e-05, -1.5421097939455242e-05, -1.4061018704922785e-05,
+			-1.243257788819571e-05, -1.0692187735418308e-05, -8.956195575428226e-06, -7.3073424710351094e-06,
+			-5.8006591112396305e-06, -4.468779263172823e-06, -3.3266653970160216e-06, -2.3757534892377295e-06,
+			-1.6075344987453848e-06, -1.0065986371058506e-06, -5.531753923550552e-07, -2.252074190014706e-07
+		};
+
+		double Fs = (double)sampling_frequency;  // physical passband sample rate (normally 48 kHz)
+		long long symbol_samples = (long long)Nofdm * (long long)frequency_interpolation_rate;
+		if(symbol_samples < 1) symbol_samples = 1;
+		bool gaus_doppler = (watt_fd > 0.0);
+
+		// fd<=0 is a compatibility gate: retain the old pole, initialization, RNG
+		// draw count, and per-symbol arithmetic byte-for-byte. Only fd>0 enters the
+		// Gaussian-FIR path below.
+		double f_sym_legacy = (Nofdm>0) ? (Fs / (double)Nofdm) : 1.0;
+		double rho_legacy = std::exp(-2.0*M_PI*watt_fd / f_sym_legacy);
+		if(rho_legacy > 0.999999) rho_legacy = 0.999999;
+		double inn_legacy = std::sqrt(1.0 - rho_legacy*rho_legacy);
 		double a     = 1.0 - std::pow(10.0, -watt_depth/20.0); // 2nd-ray MEAN amplitude
 		if(a < 0.0) a = 0.0;
 		if(a > 0.99) a = 0.99;
 		cl_sim_xoshiro wrng(seed ^ 0xC0FFEEu);
 		auto cgauss = [&](){ return std::complex<double>(wrng.gauss(), wrng.gauss())/std::sqrt(2.0); };
+
+		// Gaussian-FIR state for the scatter path: two 128-sample rings, newest
+		// innovation at fir_head. Innovation variance per rail is 0.5/sum(h^2),
+		// giving var(I)=var(Q)=0.5 and E[|g|^2]=1 at steady state.
+		double fir_i[128] = {0.0};
+		double fir_q[128] = {0.0};
+		int fir_head = 0;
+		double fir_sumsq = 0.0;
+		for(int k=0;k<128;k++) fir_sumsq += GAUS_FIR_COEFFS[k]*GAUS_FIR_COEFFS[k];
+		double fir_inno_std = gaus_doppler ? std::sqrt(0.5/fir_sumsq) : 0.0;
+		auto fir_push = [&]() {
+			fir_head = (fir_head + 127) & 127;
+			fir_i[fir_head] = wrng.gauss() * fir_inno_std;
+			fir_q[fir_head] = wrng.gauss() * fir_inno_std;
+		};
+		auto fir_output = [&]() {
+			double gi=0.0, gq=0.0;
+			for(int k=0;k<128;k++)
+			{
+				int idx = (fir_head + k) & 127;
+				gi += GAUS_FIR_COEFFS[k] * fir_i[idx];
+				gq += GAUS_FIR_COEFFS[k] * fir_q[idx];
+			}
+			return std::complex<double>(gi,gq);
+		};
+		long long update_samples = 1;
+		long long update_pos = 0;
+		std::complex<double> scatter_hold(0.0,0.0);
+		if(gaus_doppler)
+		{
+			// Python round() is nearest-with-ties-to-even; preserve that cadence
+			// rule rather than C++ llround()'s half-away-from-zero behavior.
+			double update_exact = Fs/(64.0*watt_fd);
+			double update_floor = std::floor(update_exact);
+			update_samples = (long long)update_floor;
+			double update_frac = update_exact - update_floor;
+			if(update_frac > 0.5 || (update_frac == 0.5 && (update_samples & 1LL)))
+				update_samples++;
+			if(update_samples < 1) update_samples = 1;
+			// Prime through a full FIR history exactly like DopplerTap.__init__, so
+			// the first grid symbol starts at the stationary distribution.
+			for(int k=0;k<128;k++) fir_push();
+			scatter_hold = fir_output();
+		}
 		// g0 = CONSTANT unit LOS ray; g1 = Rayleigh-fading scatter ray (mean amp a),
-		// init at its stationary distribution (start already faded, not from 0).
+		// initialized at its stationary distribution (start already faded, not 0).
 		std::complex<double> g0(1.0, 0.0);              // fixed LOS (D=0 ⇒ H≡1)
-		std::complex<double> g1 = a * cgauss();         // mean power a²
+		std::complex<double> g1 = gaus_doppler ? (a*scatter_hold) : (a*cgauss());
 		int sshift = ofdm.start_shift;
 		// precompute per-carrier 2nd-path phase e^{-j w_j Δ}
 		std::vector<std::complex<double>> ph2(Nc);
@@ -8129,14 +8218,38 @@ void cl_telecom_system::sfo_grid_test()
 		double psum=0.0;
 		for(int n=0;n<Ngrid;n++)
 		{
-			// advance ONLY the scatter tap one symbol (AR(1) Doppler low-pass); the
-			// LOS tap g0 stays fixed so the depth and Doppler axes are independent.
-			g1 = rho*g1 + (a*inn)*cgauss();
+			// Sample the held scatter gain at this OFDM-symbol boundary. The LOS tap
+			// stays fixed so depth and Doppler remain independent axes. fd<=0 keeps
+			// the exact legacy advance order for the byte-identical compatibility gate.
+			if(!gaus_doppler)
+				g1 = rho_legacy*g1 + (a*inn_legacy)*cgauss();
+			else
+				g1 = a*scatter_hold;
 			for(int j=0;j<Nc;j++)
 			{
 				std::complex<double> H = g0 + g1*ph2[j];
 				Hwatt[(size_t)n*Nc+j] = H;
 				psum += std::norm(H);
+			}
+			if(gaus_doppler)
+			{
+				// DopplerTap.advance(symbol_samples): advance on the physical-sample
+				// clock and update the held FIR output at every 64*fd boundary. There
+				// is deliberately no interpolation between updates (firmware ZOH).
+				long long left = symbol_samples;
+				while(left > 0)
+				{
+					long long span = update_samples - update_pos;
+					long long take = std::min(span, left);
+					update_pos += take;
+					left -= take;
+					if(update_pos >= update_samples)
+					{
+						update_pos = 0;
+						fir_push();
+						scatter_hold = fir_output();
+					}
+				}
 			}
 		}
 		// unit-power normalize over the whole block so the AWGN Es/N0 axis is exact
