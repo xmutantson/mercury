@@ -817,6 +817,21 @@ public:
   // MERCURY_BPRIME_DEFEAT env gate (byte-identical-to-pre-B' when set).
   static bool bprime_defeat_active();
 
+  // LINK-PHASE STEP 2 — the derived block-boundary ACK_SLOT gate. MERCURY_LINKPHASE_ACKSLOT
+  // (default OFF) drives (i) the CMD's post-keydown break-timeout to the DERIVED ack_slot
+  // (LEVER-P keydown length + turnaround budget) instead of the per-frame geometry, and (ii)
+  // the RSP's mid-keydown prev-delivered ACK defer (recovery rides the block-boundary SACK the
+  // CMD now waits for), and (iii) the D5-on-retx per-bsi span stamp. OFF => byte-identical to
+  // stock (invariant I-3, fail-open to today's behavior). Cached (env const per process).
+  static bool linkphase_ackslot_on();
+  // LINK-PHASE STEP 2 (b) — the shared LEVER-P keydown length in ms for a batch of
+  // frame_count DATA frames. PURE in (frame_count, current config geometry, the shared
+  // preamble_sched_nsymb schedule) so TX and RX derive the SAME value: TX to size its own
+  // post-keydown break-timeout, RX to predict peer_keydown_end. Replaces the
+  // frame_count*message_transmission_time_ms model (the LEVER-P desync). force_full mirrors
+  // the retx re-anchor (every frame full preamble). Amortization-OFF => full every frame.
+  int  derive_keydown_length_ms(int frame_count, bool force_full) const;
+
   // D3.1 (data-integrity): the shared LOUD GAP-ABORT teardown. The
   // case-independent action both the FIX-8 re-adopt gate and the new
   // delivery-time gate route to: control-port error, DROPPED, clear the bsi
@@ -3807,6 +3822,13 @@ public:
   StreamStamp tx_stream_stamp[256];    // CMD: per-bsi latched {start,length}. Latched at BUILD,
                                        //      re-emitted verbatim on retx/mixbatch, start restored
                                        //      on re-stage rollback. Index = batch_seq_id & 0xFF.
+  // LINK-PHASE STEP 2 (a) — D5-on-retx span contract. Per-bsi ORIGINAL batch frame count
+  // (span), latched when the batch is FIRST built as new-data (span == that keydown's frame
+  // count), re-emitted VERBATIM in the D5 byte on retx/mixbatch frames keyed on the frame's
+  // OWN batch_seq_id (NOT the physical retx-burst length). Lets an RX that MISSED the original
+  // D5-bearing frame still learn the batch length from a retx frame. 0 = unlatched (falls back
+  // to the legacy D5=0-on-retx). Index = batch_seq_id & 0xFF. Read only under the STEP-2 flag.
+  int tx_batch_span[256];
   uint64_t rx_stream_delivered;        // RSP: cumulative transported bytes delivered through
                                        //      copy_data_to_buffer(), in delivery order.
   // Option W STEP 3 — the running stream CRC-32 accumulators (data-flow-stream-offset.md §8.6).
@@ -6213,6 +6235,20 @@ private:
   // (the fail-before arm). Reset to -1 at session init + on every bsi bump/teardown.
   int rx_buffer_batch_total_frames;    // staged batch_total_frames for current v2 frame, or -1
   int rx_batch_total_frames;           // promoted authoritative per-batch frame count, or -1
+  // LINK-PHASE STEP 2 — fire-proof production counters (see linkphase_ackslot_on()).
+  // NOT wire/protocol state; incremented ONLY under the STEP-2 flag on the production path.
+  long linkphase_prev_ack_deferred;    // RSP: mid-keydown prev-delivered ACKs deferred to the
+                                       //      block-boundary SACK (ARM A defer). 0 => never fired.
+  long linkphase_d5_retx_stamped;      // CMD: retx/mixbatch frames that carried a per-bsi span
+                                       //      in the D5 byte (0 before Step 2). 0 => never fired.
+  long linkphase_cmd_slot_floor_fired; // CMD: post-keydown break-timeouts raised to the derived
+                                       //      ack_slot floor. 0 => never fired.
+  // LINK-PHASE STEP 2 — geometry of the CMD's most recent DATA keydown, captured at send_batch
+  // so calculate_receiving_timeout() can size the derived ack_slot break-floor from the ACTUAL
+  // keydown (frame count + retx/full-preamble flag) rather than a per-frame constant. Read only
+  // under the STEP-2 flag; raise-only so a stale value can never SHORTEN a timeout.
+  int  linkphase_last_kd_frames;       // frames in the last DATA keydown (0 = none yet)
+  bool linkphase_last_kd_force_full;   // was that keydown full-preamble (retx / amort-off)
   // Option B' (data-flow-batch-size.md §9): per-call DELIVERY window override for
   // copy_data_to_buffer(). -1 (default) => copy_data_to_buffer bounds delivery by
   // data_batch_size (byte-identical). The current-batch commit path sets this to the

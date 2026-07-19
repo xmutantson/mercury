@@ -1113,6 +1113,12 @@ cl_arq_controller::cl_arq_controller()
 	rx_buffer_eob_seq=-1;  // R038: per-frame v2 EOB staging (set in receive())
 	rx_buffer_batch_total_frames=-1;  // D5: per-frame batch_total_frames staging (set in receive())
 	rx_batch_total_frames=-1;          // D5: promoted authoritative per-batch frame count, or -1
+	for(int _s=0;_s<256;_s++) tx_batch_span[_s]=0;   // LINK-PHASE STEP 2 (a): per-bsi span latch, 0=unlatched
+	linkphase_prev_ack_deferred=0;      // LINK-PHASE STEP 2 fire-proof counters (production-path)
+	linkphase_d5_retx_stamped=0;
+	linkphase_cmd_slot_floor_fired=0;
+	linkphase_last_kd_frames=0;
+	linkphase_last_kd_force_full=false;
 	rx_copy_window=-1;                  // Option B' (data-flow-batch-size.md §9): clear stale per-call delivery bound
 	data_ack_received=NO;
 	repeating_last_ack=NO;
@@ -1594,6 +1600,55 @@ int cl_arq_controller::rx_effective_window(int sender_total_frames) const
 	return data_batch_size;
 }
 
+// LINK-PHASE STEP 2 — the derived block-boundary ACK_SLOT flag (default OFF). Cached
+// (env const per process). OFF => every STEP-2 gate falls to today's code path, so the
+// binary is byte-identical to stock when unset (invariant I-3). DEFEAT reproduces stock.
+bool cl_arq_controller::linkphase_ackslot_on()
+{
+	static int state = -1;
+	if(state < 0)
+	{
+		const char* e = std::getenv("MERCURY_LINKPHASE_ACKSLOT");
+		state = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return state == 1;
+}
+
+// LINK-PHASE STEP 2 (b) — the shared LEVER-P keydown length (ms) for a batch of
+// frame_count DATA frames. Both peers derive the SAME value from the SAME inputs:
+//   keydown_ms = per_symbol_ms * Sum_{i=0}^{frame_count-1} (Nsymb + preamble_sched_nsymb(i))
+// where per_symbol_ms = message_transmission_time_ms / (Nsymb + full_preamble) is the
+// full-preamble per-frame airtime (message_transmission_time_ms) divided over its symbols.
+// preamble_sched_nsymb is the SAME pure schedule the TX assembler drives (frame 0 = anchor
+// FULL, tail frames = MINI / zero-preamble), so this equals the sample-exact emitted keydown
+// length (frames_region_len / rate) to within rounding — the RX has no samples but derives it
+// arithmetically. Replaces frame_count * message_transmission_time_ms (which over-counts by
+// (frame_count-1)*(full-mini) symbols = the LEVER-P desync). When amortization is OFF (or on
+// a robust/MFSK config) every frame carries the full preamble and this reduces to
+// frame_count * message_transmission_time_ms exactly.
+int cl_arq_controller::derive_keydown_length_ms(int frame_count, bool force_full) const
+{
+	if(frame_count < 1) return 0;
+	if(telecom_system == NULL || message_transmission_time_ms <= 0)
+		return frame_count * message_transmission_time_ms;   // no geometry: legacy model
+	int Nsymb    = telecom_system->data_container.Nsymb;
+	int full_pre = telecom_system->data_container.preamble_nSymb;
+	if(full_pre < 1) full_pre = 1;
+	if(Nsymb   < 1) Nsymb   = 1;
+	// When amortization is disabled every frame emits the FULL preamble, so the schedule
+	// (pure; it does not itself read the flag) must be forced full to match the emitted wire.
+	bool ff = force_full || !telecom_system->preamble_amortization_enabled;
+	double per_symbol_ms = (double)message_transmission_time_ms / (double)(Nsymb + full_pre);
+	long total_symbols = 0;
+	for(int i = 0; i < frame_count; i++)
+		total_symbols += (long)(Nsymb
+			+ cl_telecom_system::preamble_sched_nsymb(i, ff, full_pre));
+	double kd = per_symbol_ms * (double)total_symbols;
+	int r = (int)(kd + 0.5);
+	if(r < 0) r = 0;
+	return r;
+}
+
 void cl_arq_controller::set_data_batch_size(int data_batch_size)
 {
 	// CHOKEPOINT: robust => batch 1 (the single enforcement point).
@@ -1898,6 +1953,44 @@ void cl_arq_controller::calculate_receiving_timeout()
 				(int)tt_defeat, sack_enabled ? sack_timeout_extra_ms : 0,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
+			// LINK-PHASE STEP 2 (c-CMD): the derived block-boundary ACK_SLOT break-floor. The
+			// per-frame window (geometric_floor's frame_drain = 2*msg_tx) is structurally too
+			// short for a continuous KEYDOWN block: the block-ACK lands at the batch turnaround,
+			// keydown_len + turnaround after the timer origin. Replace the magic 15 s floor (and
+			// the static geom_floor's per-frame drain) with the DERIVED slot: LEVER-P keydown
+			// length (STEP-2 b, for the ACTUAL last keydown) + the measured turnaround budget
+			// (this window minus its per-frame drain anchor) + a derived slot_width guard. RAISE-
+			// ONLY (never shortens a timeout) and re-capped at 60 s — invariant I-1 (a dead link
+			// still BREAKs, only later). OFF (or a stale zero last keydown) => byte-identical.
+			// MERCURY_LINKPHASE_CMD_FLOOR_DEFEAT=1 (with the main flag ON) SKIPS this derived
+			// break-floor while KEEPING the RSP mid-keydown ACK defer — reproducing the SUPPRESS
+			// collapse (RSP defers, CMD keeps the per-frame window, breaks at the turnaround).
+			// This is the FAIL-BEFORE arm for the break-storm A/B on the SAME binary.
+			bool cmd_floor_defeat = false;
+			{ const char* ev = std::getenv("MERCURY_LINKPHASE_CMD_FLOOR_DEFEAT");
+			  if(ev && ev[0]=='1') cmd_floor_defeat = true; }
+			if(linkphase_ackslot_on() && !cmd_floor_defeat)
+			{
+				int kd_frames = (linkphase_last_kd_frames > 0)
+				              ? linkphase_last_kd_frames : data_batch_size;
+				int kd_ms     = derive_keydown_length_ms(kd_frames, linkphase_last_kd_force_full);
+				int turnaround = timeout - 2*message_transmission_time_ms;  // sack_arrival + margin (+SRTT)
+				if(turnaround < 0) turnaround = 0;
+				int slot_width = 2*message_transmission_time_ms + ptt_off_delay_ms
+				               + ptt_on_delay_ms + 500;                     // derived guard, not a constant
+				int slot_close = kd_ms + turnaround + slot_width;
+				if(slot_close > timeout)
+				{
+					printf("[LINKPHASE-CMD-SLOT-FLOOR] receiving_timeout %d -> %d ms "
+						"(kd_frames=%d ff=%d kd_ms_lever=%d turnaround=%d slot_width=%d batch=%d)\n",
+						timeout, slot_close, kd_frames, linkphase_last_kd_force_full ? 1 : 0,
+						kd_ms, turnaround, slot_width, data_batch_size);
+					fflush(stdout);
+					timeout = slot_close;
+					linkphase_cmd_slot_floor_fired++;
+				}
+				if(timeout > 60000) timeout = 60000;   // I-1 hard cap: re-anchor, never disable
+			}
 			set_receiving_timeout(timeout);
 		}
 		else
@@ -7960,6 +8053,7 @@ void cl_arq_controller::reset_session_state()
 	rx_stream_crc = CRC32_INIT;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
+	for(int _s=0;_s<256;_s++) tx_batch_span[_s]=0;   // LINK-PHASE STEP 2 (a): clear stale per-bsi spans on session reset
 
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;
@@ -11113,11 +11207,12 @@ static int       tt_d5_present     = -1;
 static int       tt_was_retx       = -1;    // sack_retransmit_active at keydown
 static int       tt_derived_geom   = -1;    // frame_drain(2*msg_tx) + sack_arrival
 static int       tt_derived_sack   = -1;    // sack_arrival only (from true last-sym-out anchor)
+static int       tt_kd_ms_lever    = -1;    // STEP-2(b) LEVER-P schedule derivation of the keydown
 
 // Snapshot at the true last-DATA-sample-out instant (self_keydown_end). Read-only.
 static void arq_turn_trace_capture_keydown(long long kd_samples, int batch_frames, int bsi,
 	int d5_present, int was_retx, int msg_tx_ms, int time_left_ms,
-	int ptt_off_ms, int rsp_decode_ms, int pattern_ms, int ptt_on_ms)
+	int ptt_off_ms, int rsp_decode_ms, int pattern_ms, int ptt_on_ms, int kd_ms_lever)
 {
 	if(!turn_trace_on()) return;
 	tt_keydown_timer.start();               // t=0 at self_keydown_end
@@ -11125,6 +11220,7 @@ static void arq_turn_trace_capture_keydown(long long kd_samples, int batch_frame
 	tt_kd_ms_exact    = (int)((kd_samples * 1000LL) / 48000LL);
 	tt_batch_frames   = batch_frames;
 	tt_kd_ms_estimate = batch_frames*msg_tx_ms + time_left_ms;
+	tt_kd_ms_lever    = kd_ms_lever;
 	tt_bsi            = bsi;
 	tt_d5_present     = d5_present;
 	tt_was_retx       = was_retx;
@@ -11142,14 +11238,26 @@ void arq_turn_trace_emit_ack(const char* kind, unsigned bsi, int arrival_ms, int
 	int stale = ((int)bsi != tt_bsi) ? 1 : 0;   // ACK is for an earlier keydown (collision)
 	int err_geom = actual_from_kd - tt_derived_geom;
 	int err_sack = actual_from_kd - tt_derived_sack;
+	// STEP-2(b) fire proof: kd_lever_err = |LEVER-P schedule derivation - sample-exact keydown|
+	// (should be ~0 — the RX derives the keydown length without the samples). derived_slot_lever
+	// = the block-boundary ACK_SLOT open as the RECEIVER derives it, from a COMMON keydown-START
+	// reference: keydown length (LEVER-P) + turnaround budget. err_slot_lever = that vs actual
+	// (kd_ms_exact + actual_from_kd, both measured from keydown-start). The reducer removes the
+	// stable turnaround bias (median) so p95|err| isolates the derivation accuracy (Step-1 gate).
+	int kd_lever_err     = tt_kd_ms_lever - tt_kd_ms_exact;
+	int derived_slot     = tt_kd_ms_lever + tt_derived_sack;
+	int actual_slot      = tt_kd_ms_exact + actual_from_kd;
+	int err_slot_lever   = derived_slot - actual_slot;
 	printf("[MERCURY_TURN_TRACE] kind=%s ack_bsi=%u kd_bsi=%d stale_anchor=%d "
 		"d5=%d retx_keydown=%d karn_ok=%d kd_samples=%lld kd_ms_exact=%d "
-		"kd_ms_est=%d batch_frames=%d derived_geom=%d derived_sack=%d "
+		"kd_ms_est=%d kd_ms_lever=%d kd_lever_err=%d batch_frames=%d derived_geom=%d derived_sack=%d "
+		"derived_slot=%d actual_slot=%d err_slot_lever=%d "
 		"actual_from_keydown_ms=%d arrival_ms_rxtimer=%d err_geom=%d err_sack=%d\n",
 		kind, bsi, tt_bsi, stale, tt_d5_present, tt_was_retx, karn_ok,
-		tt_kd_samples, tt_kd_ms_exact, tt_kd_ms_estimate, tt_batch_frames,
-		tt_derived_geom, tt_derived_sack, actual_from_kd, arrival_ms,
-		err_geom, err_sack);
+		tt_kd_samples, tt_kd_ms_exact, tt_kd_ms_estimate, tt_kd_ms_lever, kd_lever_err,
+		tt_batch_frames, tt_derived_geom, tt_derived_sack,
+		derived_slot, actual_slot, err_slot_lever,
+		actual_from_kd, arrival_ms, err_geom, err_sack);
 	fflush(stdout);
 }
 // ========================== end MERCURY_TURN_TRACE ==========================
@@ -11360,6 +11468,37 @@ void cl_arq_controller::send_batch()
 			if(btf < 1) btf = 0;            // nothing to claim
 			else if(btf > 255) btf = 255;  // single byte; MAX_SACK_BATCH_SIZE=32 ≪ 255
 			batch_total_frames_wire = btf;
+			// LINK-PHASE STEP 2 (a): latch the ORIGINAL span (== this new-data keydown's frame
+			// count) per-bsi. Idempotent across the batch (all frames share one bsi). Pure
+			// bookkeeping — read ONLY by the gated retx stamp below, so byte-identical when the
+			// flag is off. sack_v2-only (D5 is sack_v2-only).
+			if(sack_v2_enabled && btf > 0 && messages_batch_tx[i].batch_seq_id >= 0)
+				tx_batch_span[messages_batch_tx[i].batch_seq_id & 0xFF] = btf;
+		}
+		else if(linkphase_ackslot_on() && sack_v2_enabled && header_carries_d5
+		        && messages_batch_tx[i].batch_seq_id >= 0)
+		{
+			// LINK-PHASE STEP 2 (a): D5-on-retx span contract. Re-emit the LATCHED original span
+			// of THIS frame's OWN bsi (NOT message_batch_counter_tx, which on retx is the
+			// physical retx-burst length). Per-frame keyed so a mixbatch carries each frame's
+			// own-bsi span. An RX that MISSED the original D5-bearing frame now learns the batch
+			// length from this retx frame. Falls back to legacy D5=0 when the bsi was never
+			// latched (I-5: RX then holds the conservative bound, never short-delivers).
+			int fb = messages_batch_tx[i].batch_seq_id & 0xFF;
+			if(tx_batch_span[fb] > 0)
+			{
+				batch_total_frames_wire = tx_batch_span[fb];
+				linkphase_d5_retx_stamped++;
+				// Fire proof (throttled: first stamp, then every 25th) — the retx/mixbatch frame
+				// carried its OWN bsi's original span in D5 where stock emits 0.
+				if(linkphase_d5_retx_stamped == 1 || (linkphase_d5_retx_stamped % 25) == 0)
+				{
+					printf("[LINKPHASE-D5-RETX-STAMP] bsi=%d span=%d (retx frame carried original "
+						"batch length in D5; #%ld total)\n",
+						fb, batch_total_frames_wire, linkphase_d5_retx_stamped);
+					fflush(stdout);
+				}
+			}
 		}
 
 		if(messages_batch_tx[i].type==DATA_LONG)
@@ -11716,17 +11855,26 @@ void cl_arq_controller::send_batch()
 	// BEFORE the capture ring reset. Anchors the CMD↔RSP overlap window.
 	mtl::log_event("cmd_batch_last_sym_out");
 
+	// LINK-PHASE STEP 2 (c-CMD): capture this keydown's geometry so calculate_receiving_timeout()
+	// can size the derived ack_slot break-floor from the ACTUAL keydown (LEVER-P length), not a
+	// per-frame constant. Behavior-neutral write (read only under the STEP-2 flag, raise-only).
+	linkphase_last_kd_frames     = message_batch_counter_tx;
+	linkphase_last_kd_force_full = batch_force_full;
+
 	// MERCURY_TURN_TRACE (measure-only, off by default): snapshot the sample-exact
 	// self_keydown_end here — frames_region_len = Sum(frame_len[i]) is the exact
 	// emitted-DATA sample count of this keydown; bsi/D5/retx describe the batch
-	// just emitted. No-op unless MERCURY_TURN_TRACE=1. Reads only.
+	// just emitted. kd_ms_lever = the STEP-2(b) LEVER-P schedule derivation of the
+	// SAME keydown (should match kd_ms_exact — the fire proof for part b). No-op
+	// unless MERCURY_TURN_TRACE=1. Reads only.
 	if(turn_trace_on())
 		arq_turn_trace_capture_keydown(
 			(long long)frames_region_len, message_batch_counter_tx,
 			(message_batch_counter_tx>0 ? messages_batch_tx[0].batch_seq_id : -1),
 			header_carries_d5 ? 1 : 0, sack_retransmit_active ? 1 : 0,
 			message_transmission_time_ms, time_left_to_send_last_frame,
-			ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, ack_pattern_time_ms, ptt_on_delay_ms);
+			ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, ack_pattern_time_ms, ptt_on_delay_ms,
+			derive_keydown_length_ms(message_batch_counter_tx, batch_force_full));
 
 	// Unmute + flush right after playback drain (before ptt_off_delay).
 	// During TX, rx_mute=1 kept self-echo out of the ring.

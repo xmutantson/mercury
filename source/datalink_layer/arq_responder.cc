@@ -1548,8 +1548,28 @@ void cl_arq_controller::process_messages_rx_data_control()
 							{
 								unsigned char prev_ack_bsi = (unsigned char)(
 									rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
+								// LINK-PHASE STEP 2 (c-RSP): defer this prev-delivered clean-ACK. It fires
+								// on a retx frame that FILLED a prev-batch hole — by construction WHILE the
+								// CMD is still keyed on its keydown block, so keying the ACK here lands in the
+								// CMD's deaf window (the ARM-A mid-keydown collision). Delivery to the app
+								// ALREADY happened above (copy_data_to_buffer / advance_last_delivered — I-2
+								// UNTOUCHED); only the ACK EMIT is deferred. Recovery rides the block-boundary
+								// SACK/clean-ACK the CMD now waits for (STEP-2 c-CMD derived break-floor). This
+								// is the ARM-A-validated mechanism (0 breaks, 0 corrupt, base-eager delivery
+								// parity), driven by the DERIVED slot instead of an unconditional suppress.
+								// OFF => the emit runs exactly as today (byte-identical, invariant I-3).
+								bool linkphase_defer_prev_ack = linkphase_ackslot_on();
+								if(linkphase_defer_prev_ack)
+								{
+									printf("[LINKPHASE-ACK-DEFER] prev-delivered clean-ACK bsi=%u deferred to "
+										"block boundary (mid-keydown collision avoided); last_delivered=%d\n",
+										(unsigned)prev_ack_bsi, rsp_last_delivered_batch_seq_id);
+									fflush(stdout);
+									linkphase_prev_ack_deferred++;
+								}
 								bool prev_used_mfsk_path = false;
-								if (MFSK_ACK_SACK_ENABLED
+								if (!linkphase_defer_prev_ack
+									&& MFSK_ACK_SACK_ENABLED
 									&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 								{
 									// Phase B Wave 1 flag-day (fact-doc §11.2): bitmap is 30 bits (was 32).
@@ -1591,7 +1611,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 										fflush(stdout);
 									}
 								}
-								if (!prev_used_mfsk_path)
+								if (!prev_used_mfsk_path && !linkphase_defer_prev_ack)
 								{
 									// NB or MFSK-suffix unavailable: legacy MFSK ACK pattern (receiver
 									// treats any pattern hit as a clean ACK -- same as the clean funnel).
