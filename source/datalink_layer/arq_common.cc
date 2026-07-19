@@ -125,6 +125,17 @@ static inline uint8_t cumulative_ack_advertise_bit()
 	return cached ? (uint8_t)CAP_CUMULATIVE_ACK : (uint8_t)0;
 }
 
+// LEVER P: normalize the PHY-published preamble geometry for ARQ ring/cursor
+// accounting. Zero is deliberate only while preamble amortization is active
+// (MINI0 tail); with amortization off it retains its legacy/uninitialized meaning
+// and falls back to FULL. Negative and over-FULL values are always invalid.
+static inline int rx_eff_preamble_geom(int rx_eff, int full, bool amort_on)
+{
+	if(rx_eff < 0 || rx_eff > full || (rx_eff == 0 && !amort_on))
+		return full;
+	return rx_eff;
+}
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -15658,12 +15669,12 @@ void cl_arq_controller::receive()
 			int sp = signal_period;
 			// LEVER P: zero only the ACTUAL decoded frame (eff preamble + data).
 			// Zeroing the FULL preamble_nSymb on a MINI tail frame would erase
-			// 3 symbols into the NEXT frame's MINI preamble in the gapless batch
-			// waveform, destroying it. last_eff_preamble_nsymb == preamble_nSymb
-			// when amortization is off.
-			int zero_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
-			if(zero_eff_pre < 1 || zero_eff_pre > telecom_system->data_container.preamble_nSymb)
-				zero_eff_pre = telecom_system->data_container.preamble_nSymb;
+			// 3 symbols into the NEXT frame's MINI preamble in the gapless batch;
+			// for MINI0 the same FULL clamp would erase 4 symbols of its data.
+			int zero_eff_pre = rx_eff_preamble_geom(
+				telecom_system->receive_stats.last_eff_preamble_nsymb,
+				telecom_system->data_container.preamble_nSymb,
+				telecom_system->preamble_amortization_enabled);
 			int frame_syms = zero_eff_pre
 				+ telecom_system->get_active_nsymb();
 			int frame_samples = frame_syms * symbol_period;
@@ -15739,14 +15750,14 @@ void cl_arq_controller::receive()
 			turnaround_clearance_armed = true;
 			int rx_nsymb = telecom_system->get_active_nsymb();
 			// LEVER P: this frame's actual length is (eff preamble + data). For a
-			// MINI tail frame eff=1, so rx_frame is shorter; the next preamble in
-			// the gapless batch waveform sits exactly rx_frame symbols ahead. The
-			// position chain (ofdm_search_raw / frames_to_read) MUST advance by the
-			// ACTUAL length or the batch-predict window misses every tail frame.
-			// last_eff_preamble_nsymb == preamble_nSymb when amortization is off.
-			int rx_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
-			if(rx_eff_pre < 1 || rx_eff_pre > telecom_system->data_container.preamble_nSymb)
-				rx_eff_pre = telecom_system->data_container.preamble_nSymb;  // defensive
+			// MINI tail frame eff=1 (or eff=0 for MINI0), so rx_frame is shorter;
+			// the next frame in the gapless batch waveform sits exactly rx_frame
+			// symbols ahead. The position chain (ofdm_search_raw / frames_to_read)
+			// MUST advance by the ACTUAL length or batch prediction misses tails.
+			int rx_eff_pre = rx_eff_preamble_geom(
+				telecom_system->receive_stats.last_eff_preamble_nsymb,
+				telecom_system->data_container.preamble_nSymb,
+				telecom_system->preamble_amortization_enabled);
 			int rx_frame = rx_nsymb + rx_eff_pre;
 			int end_of_current_message = received_message_stats.delay / symbol_period  + rx_frame;
 			int frames_left_in_buffer = telecom_system->data_container.buffer_Nsymb - end_of_current_message;
@@ -16309,14 +16320,16 @@ void cl_arq_controller::receive()
 					// LEVER P (INC-3): the beyond-bounds fast-forward `upper` must
 					// match the MINI-aware extraction/gate bound (telecom_system.cc
 					// upper_bound + frame_size_interp). In a MINI batch the tail
-					// frames are (Nsymb+1) symbols, so the FULL-frame `upper` over-
+					// frames are (Nsymb+1), or exactly Nsymb for MINI0, so the
+					// FULL-frame `upper` over-
 					// shifts (skips a decodable tail frame) and misreports beyond-
 					// bounds. last_eff_preamble_nsymb carries the active per-frame
 					// preamble length (== preamble_nSymb on every non-MINI /
 					// amortization-off path, so byte-identical when the feature is off).
-					int ff_eff_pre = telecom_system->receive_stats.last_eff_preamble_nsymb;
-					if(ff_eff_pre < 1 || ff_eff_pre > telecom_system->data_container.preamble_nSymb)
-						ff_eff_pre = telecom_system->data_container.preamble_nSymb;
+					int ff_eff_pre = rx_eff_preamble_geom(
+						telecom_system->receive_stats.last_eff_preamble_nsymb,
+						telecom_system->data_container.preamble_nSymb,
+						telecom_system->preamble_amortization_enabled);
 					int frame_symb = telecom_system->data_container.Nsymb + ff_eff_pre;
 					int upper = telecom_system->data_container.buffer_Nsymb - frame_symb;
 
