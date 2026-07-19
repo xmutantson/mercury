@@ -33,6 +33,11 @@
 #include "gui/gui_state.h"
 #endif
 
+// MERCURY_TURN_TRACE (link-phase Step 1, MEASURE-ONLY): defined in arq_common.cc.
+// Emits one read-only trace line per CMD reverse-ACK turn; no-op when off.
+bool arq_turn_trace_on();
+void arq_turn_trace_emit_ack(const char* kind, unsigned bsi, int arrival_ms, int karn_ok);
+
 // SACK_RX_TRACE: env-gated diagnostic for the SACK_RSP receive path.
 // Enable with MERCURY_SACK_RX_TRACE=1. No output when unset.
 // Cached on first call; one branch per macro hit when disabled.
@@ -532,6 +537,8 @@ bool cl_arq_controller::cmd_compact_confirm_sack_window_accept(bool compact_enab
 			"(cmd_batch_seq_id=%d) arrival_ms=%d\n",
 			(unsigned)cc_bsi, cmd_batch_seq_id, arrival_ms);
 		fflush(stdout);
+		if(arq_turn_trace_on())
+			arq_turn_trace_emit_ack("clean-compact", (unsigned)cc_bsi, arrival_ms, tt_karn_sample_ok()?1:0);
 	}
 	// Whether fresh or de-duplicated, the compact tail was consumed this poll — return
 	// true so the caller skips the (doomed) 13-uncoded decode of the same tail.
@@ -4707,6 +4714,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										(unsigned)rx_bsi, cmd_batch_seq_id,
 										(unsigned)rx_bitmap, mfsk_matched, arrival_ms);
 									fflush(stdout);
+									if(arq_turn_trace_on())
+										arq_turn_trace_emit_ack("clean-mfsksack", (unsigned)rx_bsi, arrival_ms, tt_karn_sample_ok()?1:0);
 									mfsk_handled_this_poll = true;
 								}
 								else
@@ -4756,6 +4765,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										(unsigned)rx_bsi, cmd_batch_seq_id,
 										(unsigned)rx_bitmap, mfsk_matched, arrival_ms);
 									fflush(stdout);
+									if(arq_turn_trace_on())
+										arq_turn_trace_emit_ack("partial-mfsksack", (unsigned)rx_bsi, arrival_ms, tt_karn_sample_ok()?1:0);
 									policy_evaluate_axis3(true);
 									mfsk_handled_this_poll = true;
 								}
@@ -5020,6 +5031,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) arrival_ms=%d — applying to retransmit queue\n",
 								(unsigned)rx_bsi, cmd_batch_seq_id, arrival_ms);
 							fflush(stdout);
+							if(arq_turn_trace_on())
+								arq_turn_trace_emit_ack("sackv2", (unsigned)rx_bsi, arrival_ms, tt_karn_sample_ok()?1:0);
 							policy_evaluate_axis3(true);
 						}
 						else if(!prev_retain_consumed)

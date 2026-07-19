@@ -11078,6 +11078,82 @@ int cl_arq_controller::test_measured_timers()
 	return pass ? 0 : 1;
 }
 
+// ============================ MERCURY_TURN_TRACE ============================
+// Link-phase rollout Step 1 — MEASURE-ONLY premise gate (see the link-phase
+// turn-epoch data-flow audit). OFF by default. When MERCURY_TURN_TRACE=1 it
+// READS state and LOGS one line per reverse-ACK turn, pairing the sample-exact
+// self_keydown_end (captured at the true last-DATA-sample-out instant in
+// send_batch) with the actual reverse-ACK arrival and the config-derived
+// turnaround budget. It writes NO wire bytes, changes NO timer/emit/state, and
+// mutates NO protocol state — byte-identical to stock when off. The replicated
+// (derived) turn contract is kept SEPARATE from local physical truth
+// (samples / PTT / drain); the latter is captured here for measurement ONLY and
+// never reaches any wire field.
+static int turn_trace_state = -1;   // -1 unresolved, 0 off, 1 on (env const per process)
+static inline bool turn_trace_on()
+{
+	if(turn_trace_state < 0)
+	{
+		const char* e = std::getenv("MERCURY_TURN_TRACE");
+		turn_trace_state = (e && atoi(e)) ? 1 : 0;
+	}
+	return turn_trace_state == 1;
+}
+bool arq_turn_trace_on() { return turn_trace_on(); }   // external wrapper for arq_commander.cc
+
+// Per-turn keydown-end snapshot (written in send_batch at self_keydown_end,
+// read at the CMD reverse-ACK decode sites in arq_commander.cc).
+static cl_timer  tt_keydown_timer;          // t=0 at cmd_batch_last_sym_out (self_keydown_end)
+static long long tt_kd_samples     = -1;    // Sum(frame_len) = sample-exact keydown length
+static int       tt_kd_ms_exact    = -1;    // tt_kd_samples * 1000 / 48000 (TX rate)
+static int       tt_kd_ms_estimate = -1;    // batch_frames*msg_tx_ms + time_left (the ms model)
+static int       tt_batch_frames   = -1;
+static int       tt_bsi            = -1;
+static int       tt_d5_present     = -1;
+static int       tt_was_retx       = -1;    // sack_retransmit_active at keydown
+static int       tt_derived_geom   = -1;    // frame_drain(2*msg_tx) + sack_arrival
+static int       tt_derived_sack   = -1;    // sack_arrival only (from true last-sym-out anchor)
+
+// Snapshot at the true last-DATA-sample-out instant (self_keydown_end). Read-only.
+static void arq_turn_trace_capture_keydown(long long kd_samples, int batch_frames, int bsi,
+	int d5_present, int was_retx, int msg_tx_ms, int time_left_ms,
+	int ptt_off_ms, int rsp_decode_ms, int pattern_ms, int ptt_on_ms)
+{
+	if(!turn_trace_on()) return;
+	tt_keydown_timer.start();               // t=0 at self_keydown_end
+	tt_kd_samples     = kd_samples;
+	tt_kd_ms_exact    = (int)((kd_samples * 1000LL) / 48000LL);
+	tt_batch_frames   = batch_frames;
+	tt_kd_ms_estimate = batch_frames*msg_tx_ms + time_left_ms;
+	tt_bsi            = bsi;
+	tt_d5_present     = d5_present;
+	tt_was_retx       = was_retx;
+	tt_derived_sack   = ptt_off_ms + rsp_decode_ms + pattern_ms + ptt_on_ms;
+	tt_derived_geom   = 2*msg_tx_ms + tt_derived_sack;
+}
+
+// Emit one trace line at a CMD reverse-ACK decode. arrival_ms = receiving_timer
+// frame (production anchor); actual_from_keydown_ms = my single last-sym-out
+// anchor. Non-static (called from arq_commander.cc). Read-only.
+void arq_turn_trace_emit_ack(const char* kind, unsigned bsi, int arrival_ms, int karn_ok)
+{
+	if(!turn_trace_on()) return;
+	int actual_from_kd = tt_keydown_timer.get_elapsed_time_ms();
+	int stale = ((int)bsi != tt_bsi) ? 1 : 0;   // ACK is for an earlier keydown (collision)
+	int err_geom = actual_from_kd - tt_derived_geom;
+	int err_sack = actual_from_kd - tt_derived_sack;
+	printf("[MERCURY_TURN_TRACE] kind=%s ack_bsi=%u kd_bsi=%d stale_anchor=%d "
+		"d5=%d retx_keydown=%d karn_ok=%d kd_samples=%lld kd_ms_exact=%d "
+		"kd_ms_est=%d batch_frames=%d derived_geom=%d derived_sack=%d "
+		"actual_from_keydown_ms=%d arrival_ms_rxtimer=%d err_geom=%d err_sack=%d\n",
+		kind, bsi, tt_bsi, stale, tt_d5_present, tt_was_retx, karn_ok,
+		tt_kd_samples, tt_kd_ms_exact, tt_kd_ms_estimate, tt_batch_frames,
+		tt_derived_geom, tt_derived_sack, actual_from_kd, arrival_ms,
+		err_geom, err_sack);
+	fflush(stdout);
+}
+// ========================== end MERCURY_TURN_TRACE ==========================
+
 void cl_arq_controller::send_batch()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
@@ -11639,6 +11715,18 @@ void cl_arq_controller::send_batch()
 	// sound card" instant — the playback buffer just drained, and this is
 	// BEFORE the capture ring reset. Anchors the CMD↔RSP overlap window.
 	mtl::log_event("cmd_batch_last_sym_out");
+
+	// MERCURY_TURN_TRACE (measure-only, off by default): snapshot the sample-exact
+	// self_keydown_end here — frames_region_len = Sum(frame_len[i]) is the exact
+	// emitted-DATA sample count of this keydown; bsi/D5/retx describe the batch
+	// just emitted. No-op unless MERCURY_TURN_TRACE=1. Reads only.
+	if(turn_trace_on())
+		arq_turn_trace_capture_keydown(
+			(long long)frames_region_len, message_batch_counter_tx,
+			(message_batch_counter_tx>0 ? messages_batch_tx[0].batch_seq_id : -1),
+			header_carries_d5 ? 1 : 0, sack_retransmit_active ? 1 : 0,
+			message_transmission_time_ms, time_left_to_send_last_frame,
+			ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, ack_pattern_time_ms, ptt_on_delay_ms);
 
 	// Unmute + flush right after playback drain (before ptt_off_delay).
 	// During TX, rx_mute=1 kept self-echo out of the ring.
