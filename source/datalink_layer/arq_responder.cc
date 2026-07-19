@@ -12751,6 +12751,102 @@ int cl_arq_controller::test_recover_fire()
 
 
 // ============================================================================
+// RETENTION-SHADOW OVERFLOW directed test — CLI --test-retain-shadow-overflow.
+//
+// DETERMINISTIC fail-before/pass-after for the retention-shadow REPAIR. Drives the
+// REAL production helpers (cmd_prev_retain_capture at the retx-send site, then
+// cmd_prev_retain_requeue on a prev-bsi re-SACK) with a WORST-CASE hole burst that
+// EXCEEDS the pre-fix 8-slot shadow. It reproduces the physical root of the
+// link-phase sporadic BREAKs: at data_batch_size=25 a single batch can carry 19-24
+// holes; the 8-slot shadow could hold at most 8, so a re-SACK for the other holes
+// found nothing to re-drive -> cmd_prev_retain_requeue returned 0 (the measured
+// rq0-storm) -> the recoverable prev-hole deadlocked -> BREAK.
+//
+// The flag MERCURY_RETAIN_SHADOW_FIX is read once (cached) at the first capture, so
+// OFF vs ON must be SEPARATE processes (this test asserts the flag-appropriate
+// outcome for whichever env it is launched with). Unlike the real-audio cohort
+// (whose GAP-HOLD trigger is a stochastic timing coincidence), this proof is
+// channel-free and byte-reproducible.
+//   OFF (pre-fix, cap 8):  19 captures -> shadow holds 8; requeue re-drives < 19
+//                          (the undersupply that leaves the re-SACKed hole unhealed).
+//   ON  (repaired, cap 32): 19 captures -> shadow holds 19; requeue re-drives ALL 19.
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_retain_shadow_overflow()
+{
+	const char* TAG = "[TEST-RETAIN-OVERFLOW]";
+	int fails = 0;
+	auto ck = [&](bool c, const char* w) {
+		printf("%s %s: %s\n", TAG, c ? "PASS" : "FAIL", w);
+		if(!c) fails++;
+		fflush(stdout);
+	};
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	if(init_messages_buffers() != SUCCESSFUL)
+	{ printf("%s ERROR: init_messages_buffers failed\n", TAG); return 1; }
+	this->sack_v2_enabled = true;
+	this->data_batch_size = 25;
+
+	// Read the flag the same way retain_shadow_fix_on() does (env, not the cache —
+	// this is the test's own copy so it can state the expected outcome).
+	bool fix_on = false;
+	{ const char* e = std::getenv("MERCURY_RETAIN_SHADOW_FIX");
+	  fix_on = (e && *e && atoi(e) != 0); }
+
+	const int N     = 7;    // the batch that holds the holes
+	const int HOLES = 19;   // > the pre-fix cap of 8 (seed11's measured worst-case)
+
+	cmd_prev_retain_count = 0;
+	retransmit_count      = 0;
+
+	// Capture 19 DISTINCT (bsi=N, slot=s) holes via the REAL capture helper — exactly
+	// what the mixbatch retx SEND does at arq_commander.cc:2594 for every retx frame.
+	for(int s = 0; s < HOLES; s++)
+	{
+		unsigned char b[12];
+		for(int j = 0; j < 12; j++) b[j] = (unsigned char)(0xC0 + s + j);
+		cmd_prev_retain_capture(N, s, 12, DATA_LONG, (unsigned char)s, b);
+	}
+	printf("%s captured %d distinct holes for bsi=%d -> shadow occupancy=%d (fix_on=%d)\n",
+		TAG, HOLES, N, cmd_prev_retain_count, fix_on ? 1 : 0);
+	fflush(stdout);
+
+	// The re-SACK re-advertises the prev hole: slots 0..18 MISSING, 19..24 present.
+	bool got[MAX_SACK_BATCH_SIZE];
+	for(int i = 0; i < MAX_SACK_BATCH_SIZE; i++)
+		got[i] = (i >= HOLES && i < this->data_batch_size);
+
+	int rq = cmd_prev_retain_requeue(N, got, this->data_batch_size);
+	printf("%s re-SACK (19 missing) -> cmd_prev_retain_requeue returned %d (retx_count=%d)\n",
+		TAG, rq, retransmit_count);
+	fflush(stdout);
+
+	if(fix_on)
+	{
+		ck(cmd_prev_retain_count == HOLES,
+			"PASS-AFTER: repaired shadow retained ALL 19 holes (cap 32)");
+		ck(rq == HOLES,
+			"PASS-AFTER: requeue re-drove ALL 19 missing slots (the hole heals)");
+		ck(retransmit_count == HOLES,
+			"PASS-AFTER: 19 retained frames queued for the pure-retx refill");
+	}
+	else
+	{
+		ck(cmd_prev_retain_count == CMD_PREV_RETAIN_BASE,
+			"FAIL-BEFORE: pre-fix shadow overflowed at 8 (cap 8) — 11 holes lost");
+		ck(rq < HOLES,
+			"FAIL-BEFORE: requeue could NOT re-drive all 19 (undersupply) -> the rq0 deadlock");
+	}
+	printf("%s %s (fails=%d)\n", TAG, fails == 0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails == 0 ? 0 : 1;
+}
+
+
+// ============================================================================
 // R2b DELIVER-HELD-CUR fire proof — CLI --test-held-cur-deliver-fire.
 //
 // The RSP half of the recovery contract (deliver the HELD current batch once the

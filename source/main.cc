@@ -3002,6 +3002,7 @@ int main(int argc, char *argv[])
                                         // fail-before via MERCURY_GAP_ABORT_DEFEAT=1 (silent concat), pass-after aborts
                                         // loudly + delivers EXACTLY batches 0-4. One-shot, exits rc.
     bool test_gap_recover_cli = false;  // --test-gap-recover: RECOVERABLE delivery-time GAP-ABORT
+    bool test_retain_overflow_cli = false; // --test-retain-shadow-overflow: deterministic 19>8 hole burst
     bool test_recover_fire_cli = false; // --test-gap-recover-fire: W1 CMD refill fire proof
                                         // (R2a hold + R2c CMD retention). fail-before via
                                         // MERCURY_GAP_RECOVER_DEFEAT=1 (terminal abort, high-water frozen);
@@ -3932,6 +3933,16 @@ int main(int argc, char *argv[])
             // See source/datalink_layer/arq_responder.cc test_recover_fire
             // + fact-documents/data-flow-recoverable-gap-abort.md 5.1.
             test_recover_fire_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-retain-shadow-overflow") == 0)
+        {
+            // Deterministic fail-before/pass-after for the retention-shadow repair:
+            // capture 19 holes (> the pre-fix 8-slot cap), re-SACK, assert requeue
+            // re-drives all 19 (fix ON) vs < 19 (fix OFF, the rq0 deadlock root).
+            // See source/datalink_layer/arq_responder.cc test_retain_shadow_overflow.
+            test_retain_overflow_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6028,6 +6039,18 @@ start_modem:
             cl_arq_controller ARQ_rf;
             int rc = ARQ_rf.test_recover_fire();
             printf("[FLAG] Recover-fire test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_retain_overflow_cli) {
+            // Deterministic retention-shadow overflow proof: 19 holes > pre-fix cap 8
+            // (one-shot, exit rc). Run OFF and ON as separate processes.
+            printf("[FLAG] --test-retain-shadow-overflow: invoking retention-shadow "
+                   "overflow proof\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_ro;
+            int rc = ARQ_ro.test_retain_shadow_overflow();
+            printf("[FLAG] Retain-overflow test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

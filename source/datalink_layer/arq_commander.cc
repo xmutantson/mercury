@@ -97,9 +97,32 @@ static inline bool break_lossless_requeue_enabled()
 // keep their exact behavior on the in-flight batch.
 // ----------------------------------------------------------------------------
 
+// RETENTION-SHADOW REPAIR (data-flow audit). The R2c credited-recovery path shipped
+// but was PRODUCTION-INERT: the 8-slot shadow could not hold one batch's 19-24 holes
+// (data_batch_size=25), cmd_prev_retain_evict() had ZERO production callers so the
+// shadow silted with stale entries, overflow overwrote a fixed slot, and dedup
+// re-capture never reset the re-drive budget -- so cmd_prev_retain_requeue() returned
+// 0 (the measured rq0-storm) and the recoverable prev-hole deadlocked into a BREAK.
+// This flag arms the four-part repair (effective cap 8->32 + production evict at
+// batch-confirm + drop-oldest ring overflow + dedup round reset). Read once, cached
+// per process. Default OFF => the EXACT pre-fix behavior (byte-identical control /
+// fail-before arm). Independent of MERCURY_CMD_PREV_RETAIN_DEFEAT (which disables the
+// shadow entirely). See the retention-shadow cross-layer data-flow audit.
+static bool retain_shadow_fix_on()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_RETAIN_SHADOW_FIX");
+		cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 // Stash a just-SENT retx frame keyed by its ORIGINAL batch_seq_id + slot. Dedup:
-// updates an existing (bsi,slot) entry in place. On overflow, evicts an
-// exhausted (rounds>=RSP_GAP_RECOVER_MAX) entry, else the oldest (index 0).
+// updates an existing (bsi,slot) entry in place. On overflow (repaired), drops the
+// OLDEST entry (ring); pre-fix (OFF) evicts an exhausted
+// (rounds>=RSP_GAP_RECOVER_MAX) entry, else the oldest (index 0).
 void cl_arq_controller::cmd_prev_retain_capture(int bsi, int slot, int len,
 	int type, unsigned char seq_eob, const unsigned char* bytes)
 {
@@ -118,18 +141,51 @@ void cl_arq_controller::cmd_prev_retain_capture(int bsi, int slot, int len,
 			cmd_prev_retain_type[k]    = type;
 			cmd_prev_retain_seq_eob[k] = seq_eob;
 			memcpy(cmd_prev_retain_bytes[k], bytes, len);
+			// REPAIR part 4: a fresh retransmit of this (bsi,slot) restarts its
+			// re-drive budget -- a stale round count from a prior recovery episode
+			// must not permanently disqualify a live frame the peer still demands.
+			// The RSP_GAP_RECOVER_MAX bound still bites a genuinely dead peer (no
+			// fresh retransmit arrives to re-capture, so rounds are never reset;
+			// I-1 verified by the WGN:8 dead-link gate). OFF => unchanged (base).
+			if(retain_shadow_fix_on()) cmd_prev_retain_rounds[k] = 0;
 			return;
 		}
 	}
 
+	// REPAIR part 1: effective cap is runtime-gated. OFF -> 8 (byte-identical to
+	// pre-fix, array over-sized but only 8 slots ever used). ON -> 32 (holds one
+	// batch's worst-case 19-24 holes so requeue can actually find the missing slots).
+	const int cap = retain_shadow_fix_on() ? CMD_PREV_RETAIN_MAX : CMD_PREV_RETAIN_BASE;
 	int idx;
-	if(cmd_prev_retain_count < CMD_PREV_RETAIN_MAX)
+	if(cmd_prev_retain_count < cap)
 	{
 		idx = cmd_prev_retain_count++;
 	}
+	else if(retain_shadow_fix_on())
+	{
+		// REPAIR part 3: drop-oldest RING. Shift entries [1..cap-1] down by one
+		// (evicting index 0, the oldest) and insert the new frame at the tail. A
+		// full shadow now drops the STALEST hole, never a fixed slot -- so the
+		// most-recent (still-recoverable) holes are the ones retained. count stays
+		// at cap. (Combined with the production evict at batch-confirm, the shadow
+		// no longer silts, so this ring is a backstop, not the primary un-silt.)
+		for(int k=1; k<cap; k++)
+		{
+			cmd_prev_retain_bsi[k-1]     = cmd_prev_retain_bsi[k];
+			cmd_prev_retain_slot[k-1]    = cmd_prev_retain_slot[k];
+			cmd_prev_retain_len[k-1]     = cmd_prev_retain_len[k];
+			cmd_prev_retain_type[k-1]    = cmd_prev_retain_type[k];
+			cmd_prev_retain_seq_eob[k-1] = cmd_prev_retain_seq_eob[k];
+			cmd_prev_retain_rounds[k-1]  = cmd_prev_retain_rounds[k];
+			int cl = cmd_prev_retain_len[k];
+			memcpy(cmd_prev_retain_bytes[k-1], cmd_prev_retain_bytes[k],
+				(cl > 0 && cl <= MAX_SACK_FRAME_SIZE) ? cl : 0);
+		}
+		idx = cap - 1;
+	}
 	else
 	{
-		// Full — prefer evicting an exhausted entry; else the oldest (0).
+		// pre-fix (OFF): prefer evicting an exhausted entry; else the oldest (0).
 		idx = 0;
 		for(int k=0; k<cmd_prev_retain_count; k++)
 			if(cmd_prev_retain_rounds[k] >= RSP_GAP_RECOVER_MAX) { idx=k; break; }
@@ -4697,6 +4753,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// climb-engine Bug 1: record this clean batch bsi so a REPEATED clean for
 									// the same bsi is deduped (no double-count of nBatches_fully_acked).
 									cmd_last_applied_clean_bsi = (int)rx_bsi;
+									// REPAIR part 2: PRODUCTION EVICT at batch-confirm. A CLEAN
+									// confirmation proves the RX has the WHOLE batch rx_bsi, so its
+									// retained retx frames can never be a recoverable hole again --
+									// evict them here (this was the ONLY missing production caller of
+									// cmd_prev_retain_evict(); without it the shadow silted with stale
+									// confirmed-batch entries and overflowed within one batch). OFF ->
+									// not called (base: shadow silts, the pre-fix defect). Bounded and
+									// safe: only drops entries for an ALREADY-delivered bsi.
+									if(retain_shadow_fix_on()) cmd_prev_retain_evict((int)rx_bsi);
 									// STAGE 4d (D1 CONFIRM): a CLEAN SACK at-or-after the announce bsi proves the
 									// RX demodulated a batch sent at the announced config -> DISARM the re-tag
 									// (design §1.1/§1.3 consumer 1). No-op when not armed / stale bsi / inband off.

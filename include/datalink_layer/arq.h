@@ -341,7 +341,17 @@ inline bool batchsize_desync_detected(int sender_total_frames, int local_batch, 
 // the same frame 3× in a row rarely, and a larger bound just delays the loud
 // abort on a genuinely dead peer. See data-flow-recoverable-gap-abort.md.
 #define RSP_GAP_RECOVER_MAX  3
-#define CMD_PREV_RETAIN_MAX  8   // retention-shadow slots (>= one batch's worst-case holes)
+// Retention-shadow slot capacity. The array is sized at the LARGER (fixed) value
+// so a repaired session can retain a full batch's worst-case holes (19-24 at
+// data_batch_size=25); the EFFECTIVE cap used by the capture overflow policy is
+// runtime-gated (retain_shadow_fix_on(): CMD_PREV_RETAIN_BASE when OFF -> exact
+// pre-fix behavior/byte-identical, CMD_PREV_RETAIN_MAX when ON). The old comment
+// ">= one batch's worst-case holes" was FALSE at 8 for batch=25 (a load-bearing-
+// number landmine): a 19-hole burst overflowed and only 1-2 frames survived, so
+// cmd_prev_retain_requeue() returned 0 (the rq0-storm) and the recoverable gap
+// deadlocked into a BREAK. See the retention-shadow data-flow audit.
+#define CMD_PREV_RETAIN_MAX  32  // array capacity (repaired effective cap)
+#define CMD_PREV_RETAIN_BASE 8   // pre-fix effective cap (flag OFF = byte-identical)
 
 // §7.13.39 Fix 2 — sequence_number is a uint8 on the wire (low 7 bits = slot,
 // bit 7 = EOB). The collision check masks with 0x7F; batches larger than 128
@@ -2963,6 +2973,7 @@ public:
   // 0=PASS, 1=FAIL. See fact-documents/data-flow-recoverable-gap-abort.md.
   int test_recoverable_gap_abort();
   int test_recover_fire();
+  int test_retain_shadow_overflow();
 
   // R2b DELIVER-HELD-CUR fire proof (CLI --test-held-cur-deliver-fire). Drives
   // the REAL production delivery path end-to-end: feeds a +2 storm topology
