@@ -831,6 +831,15 @@ public:
   // frame_count*message_transmission_time_ms model (the LEVER-P desync). force_full mirrors
   // the retx re-anchor (every frame full preamble). Amortization-OFF => full every frame.
   int  derive_keydown_length_ms(int frame_count, bool force_full) const;
+  // LINK-PHASE STEP 4 (MC-6) — MERCURY_LINKPHASE_RETXSLOT (default OFF). When ON, the RSP
+  // derives its post-SACK retx-turn listen window from the popcount of the SACK it just
+  // authored (see linkphase_derive_retx_slot) instead of the hardcoded 1.5x cadence. OFF =>
+  // byte-identical to stock (fail-open, invariant I-3). Cached (env const per process).
+  static bool linkphase_retxslot_on();
+  // Derive the RSP's post-SACK receiving_timeout (the retx-turn listen window) from the
+  // popcount of the RSP's own authored SACK bitmap. RAISE-ONLY vs base_timeout, 60 s cap
+  // (I-1). Returns base_timeout unchanged when the flag is OFF or popcount_missing <= 0.
+  int  linkphase_derive_retx_slot(int popcount_missing, int base_timeout);
 
   // D3.1 (data-integrity): the shared LOUD GAP-ABORT teardown. The
   // case-independent action both the FIX-8 re-adopt gate and the new
@@ -6243,6 +6252,8 @@ private:
                                        //      in the D5 byte (0 before Step 2). 0 => never fired.
   long linkphase_cmd_slot_floor_fired; // CMD: post-keydown break-timeouts raised to the derived
                                        //      ack_slot floor. 0 => never fired.
+  long linkphase_retx_slot_fired;      // RSP: post-SACK retx-turn listen windows derived from the
+                                       //      authored-SACK popcount (Step 4 MC-6). 0 => never fired.
   // LINK-PHASE STEP 2 — geometry of the CMD's most recent DATA keydown, captured at send_batch
   // so calculate_receiving_timeout() can size the derived ack_slot break-floor from the ACTUAL
   // keydown (frame count + retx/full-preamble flag) rather than a per-frame constant. Read only

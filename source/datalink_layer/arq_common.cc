@@ -1117,6 +1117,7 @@ cl_arq_controller::cl_arq_controller()
 	linkphase_prev_ack_deferred=0;      // LINK-PHASE STEP 2 fire-proof counters (production-path)
 	linkphase_d5_retx_stamped=0;
 	linkphase_cmd_slot_floor_fired=0;
+	linkphase_retx_slot_fired=0;        // LINK-PHASE STEP 4 (MC-6) fire-proof counter
 	linkphase_last_kd_frames=0;
 	linkphase_last_kd_force_full=false;
 	rx_copy_window=-1;                  // Option B' (data-flow-batch-size.md §9): clear stale per-call delivery bound
@@ -1612,6 +1613,62 @@ bool cl_arq_controller::linkphase_ackslot_on()
 		state = (e && *e && atoi(e) != 0) ? 1 : 0;
 	}
 	return state == 1;
+}
+
+bool cl_arq_controller::linkphase_retxslot_on()
+{
+	static int state = -1;
+	if(state < 0)
+	{
+		const char* e = std::getenv("MERCURY_LINKPHASE_RETXSLOT");
+		state = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return state == 1;
+}
+
+// LINK-PHASE STEP 4 (MC-6) — derive the RSP's post-SACK retx-turn LISTEN window from the
+// popcount of the SACK the RSP JUST AUTHORED, replacing the hardcoded 1.5x cadence
+// (arq_responder.cc post-SACK sites). The RSP knows exactly which frames it is missing
+// (popcount_missing = clear bits of its own bitmap), so it can predict the CMD's retransmit
+// turn instead of padding a batch window by 50%.
+//
+// ** MIXBATCH CAVEAT (the load-bearing correctness fact, cross-layer audit §retx-turn):
+// the CMD folds selective-repeat into a FULL data_batch_size keydown whenever it still has
+// new data to send ([CMD-V2-MIXBATCH-RETX], 0-requeued on every retx in the Step-2/3 cohort:
+// 56/56 events, 112/112 keydowns full-batch). So the retx keydown the RSP must cover is the
+// FULL batch, NOT popcount frames. popcount is therefore the pure-retx LOWER bound (the
+// end-of-transfer case where the CMD has no new data); the SAFE listen window covers the
+// full-mixbatch keydown so the RSP NEVER times out before a real retransmit completes
+// (D3.1: never shorten below a real retx). Derived = LEVER-P full-mixbatch keydown length +
+// turnaround budget (CMD last-frame drain + key-up + our decode margin) + a slot guard.
+// RAISE-ONLY vs the stock base window (never shortens it) and re-capped at 60 s (I-1: a dead
+// link still BREAKs, only later). Returns base_timeout unchanged when the flag is OFF or the
+// missing count is unknown (bounded-idle fallback keeps the stock 1.5x cadence at the caller).
+// Fire proof [LINKPHASE-RETX-SLOT] logs popcount -> its derived length (pure-retx bound) next
+// to the full-mixbatch length actually used, so the popcount derivation is visible even though
+// the safe timeout uses the mixbatch bound.
+int cl_arq_controller::linkphase_derive_retx_slot(int popcount_missing, int base_timeout)
+{
+	if(!linkphase_retxslot_on() || popcount_missing <= 0)
+		return base_timeout;                          // flag off / unknown -> caller keeps stock cadence
+	int pop = popcount_missing;
+	if(pop > data_batch_size) pop = data_batch_size;
+	int kd_full = derive_keydown_length_ms(data_batch_size, /*force_full=*/true); // mixbatch bound (safe)
+	int kd_pop  = derive_keydown_length_ms(pop,             /*force_full=*/true); // pure-retx (fire proof)
+	// Turnaround: CMD last-frame drain (2*msg_tx) + key-up (ptt_off+ptt_on) + our decode margin.
+	int turnaround = 2*message_transmission_time_ms + ptt_off_delay_ms
+	               + ptt_on_delay_ms + RSP_DECODE_MARGIN_MS;
+	int slot_guard = 500;
+	int derived = kd_full + turnaround + slot_guard;
+	if(derived < base_timeout) derived = base_timeout;    // RAISE-ONLY: never under-wait a real retx
+	if(derived > 60000)        derived = 60000;           // I-1 hard cap: re-anchor, never disable
+	linkphase_retx_slot_fired++;
+	printf("[LINKPHASE-RETX-SLOT] popcount_missing=%d kd_popcount=%d (pure-retx bound) "
+		"kd_mixbatch=%d turnaround=%d guard=%d base=%d -> receiving_timeout=%d ms (batch=%d)\n",
+		popcount_missing, kd_pop, kd_full, turnaround, slot_guard, base_timeout,
+		derived, data_batch_size);
+	fflush(stdout);
+	return derived;
 }
 
 // LINK-PHASE STEP 2 (b) — the shared LEVER-P keydown length (ms) for a batch of

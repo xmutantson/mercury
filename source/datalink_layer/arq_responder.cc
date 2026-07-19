@@ -2804,16 +2804,28 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					telecom_system->set_mfsk_ctrl_mode(false);
 					telecom_system->data_container.nUnder_processing_events = 0;
 					calculate_receiving_timeout();
-					// Post-SACK timeout: cover CMD listen + CMD retransmit TX.
-					// 1.5x is enough: CMD extended listen (~7.8s) + retransmit
-					// (~9.85s) = ~17.6s cycle. 1.5x * 9850 = 14775ms, so RSP
-					// responds before CMD's next retransmit TX starts.
-					// (Was 2x=19700ms which exceeded CMD cycle, causing RSP ACK
-					// to arrive during CMD retransmit TX — half-duplex collision.)
-					receiving_timeout = receiving_timeout * 3 / 2;
-					printf("[RSP-POST-SACK] timeout=%dms (1.5x normal for retransmit)\n",
-						receiving_timeout);
-					fflush(stdout);
+					// LINK-PHASE STEP 4 (MC-6): derive the post-SACK retx-turn listen window from
+					// the popcount of the SACK we JUST authored, replacing the hardcoded 1.5x
+					// cadence. popcount_missing = clear bits of our bitmap over the ACK-gate window
+					// (eff_window - rx_received). MERCURY_LINKPHASE_RETXSLOT default OFF => the
+					// bounded-idle fallback below (stock 1.5x), byte-identical to base.
+					if(linkphase_retxslot_on() && (eff_window - rx_received) > 0)
+					{
+						int popcount_missing = eff_window - rx_received;
+						receiving_timeout = linkphase_derive_retx_slot(popcount_missing, receiving_timeout);
+					}
+					else
+					{
+						// Bounded-idle FALLBACK (flag OFF, or no authored bitmap): stock 1.5x —
+						// cover CMD extended listen + retransmit TX (~17.6s cycle). 1.5x is enough:
+						// CMD extended listen (~7.8s) + retransmit (~9.85s); RSP responds before
+						// CMD's next retransmit TX starts (2x exceeded the cycle -> half-duplex
+						// collision). Byte-identical to base under the default-OFF flag.
+						receiving_timeout = receiving_timeout * 3 / 2;
+						printf("[RSP-POST-SACK] timeout=%dms (1.5x normal for retransmit)\n",
+							receiving_timeout);
+						fflush(stdout);
+					}
 					receiving_timer.start();
 					connection_status=RECEIVING;
 					return;
@@ -3074,7 +3086,18 @@ void cl_arq_controller::process_messages_acknowledging_data()
 						telecom_system->set_mfsk_ctrl_mode(false);
 						telecom_system->data_container.nUnder_processing_events = 0;
 						calculate_receiving_timeout();
-						receiving_timeout = receiving_timeout * 3 / 2;
+						// LINK-PHASE STEP 4 (MC-6): the prev-hole re-advertise just re-sent the
+						// PREV partial SACK (rsp_resend_prev_partial_sack above), so the missing
+						// count is the prev batch's shortfall. Derive the retx-turn listen window
+						// from it (flag OFF => stock 1.5x, byte-identical).
+						{
+							int prev_missing = rsp_prev_batch_expected_count
+							                 - rsp_prev_batch_received_count;
+							if(linkphase_retxslot_on() && prev_missing > 0)
+								receiving_timeout = linkphase_derive_retx_slot(prev_missing, receiving_timeout);
+							else
+								receiving_timeout = receiving_timeout * 3 / 2;
+						}
 						receiving_timer.start();
 						connection_status = RECEIVING;
 						return;
