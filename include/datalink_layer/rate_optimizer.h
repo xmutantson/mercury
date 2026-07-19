@@ -103,6 +103,18 @@ public:
     void set_hysteresis_ratio(double r) { hysteresis_ratio = r; }
     void set_cooldown_batches(int n)    { cooldown_max = n; }
     void set_switch_cost_ms(int ms)     { switch_cost_ms = ms; }
+    // MC-7: supplying live batch airtime also selects the measured-clock
+    // penalty path. The controller calls this only under
+    // MERCURY_LINKPHASE_OPTCLOCK, leaving the frozen legacy path untouched
+    // when the flag is OFF. Ignore non-positive samples rather than allowing
+    // a bad geometry observation to create a divide-by-zero decision.
+    void set_wire_ms_per_batch(double ms)
+    {
+        if (ms > 0.0) {
+            wire_ms_per_batch = ms;
+            optclock_measured = true;
+        }
+    }
 
     // BREAK-driven cooldown — called from the BREAK handler in arq_common.cc
     // when BREAK fires. Pins cooldown_remaining to N batches so the optimizer
@@ -162,6 +174,8 @@ private:
     double hysteresis_ratio;  // 1.15  (15% gain required to switch)
     int    cooldown_max;      // 5     (batches between optimizer switches)
     int    switch_cost_ms;    // 1800  (PHY-switch round-trip per §3.3)
+    double wire_ms_per_batch; // live emitted DATA-keydown airtime (MC-7)
+    bool   optclock_measured; // false => exact frozen 1800 ms / 10-batch path
 
     // Cooldown remaining (in batches). 0 = optimizer free to switch.
     int    cooldown_remaining;

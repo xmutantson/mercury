@@ -218,6 +218,8 @@ cl_rate_optimizer::cl_rate_optimizer()
     , hysteresis_ratio(1.15)
     , cooldown_max(5)
     , switch_cost_ms(1800)
+    , wire_ms_per_batch(1800.0)
+    , optclock_measured(false)
     , cooldown_remaining(0)
     , eval_count(0)
     , min_cfg_calibrated(-1)
@@ -612,11 +614,51 @@ int cl_rate_optimizer::evaluate(int current_cfg,
     // requires the candidate to beat stay by ~25% to trigger. That's a
     // sane bar for "is the switch worth the SET_CONFIG round trip given
     // we'll hold for at least ~10 batches."
-    const double WIRE_MS_PER_BATCH = 1800.0;
-    const double AMORTIZE_BATCHES  = 10.0;
-    double cost_penalty_bps = stay_score *
-                              ((double)switch_cost_ms /
-                               (WIRE_MS_PER_BATCH * AMORTIZE_BATCHES));
+    double cost_penalty_bps;
+    if (!optclock_measured) {
+        // MERCURY_LINKPHASE_OPTCLOCK=OFF: retain the original constants and
+        // arithmetic expression exactly. This is the frozen, config-invariant
+        // 10% path used by the base binary.
+        const double WIRE_MS_PER_BATCH = 1800.0;
+        const double AMORTIZE_BATCHES  = 10.0;
+        cost_penalty_bps = stay_score *
+                           ((double)switch_cost_ms /
+                            (WIRE_MS_PER_BATCH * AMORTIZE_BATCHES));
+    } else {
+        // MC-7 measured clock. CFG16's proven operating point is a 5572 ms
+        // emitted DATA keydown. Feeding that honest airtime into the old
+        // 10-batch denominator would reduce the tuned bar from 10% to 3.23%
+        // and create an over-climb lean. Retune the holding-period constant
+        // to 3.230438 batches so the reference point remains exactly 10%:
+        //
+        //   1800 / (5572 * 3.230438) = 0.10.
+        //
+        // Away from that anchor, the live wire_ms_per_batch remains in the
+        // denominator: slow/long batches pay proportionally less and
+        // fast/short batches pay proportionally more. The 1800 below is only
+        // the tuning anchor; switch_cost_ms remains the live/future-measured
+        // input to the actual penalty.
+        const double REFERENCE_SWITCH_COST_MS = 1800.0;
+        const double REFERENCE_WIRE_MS_PER_BATCH = 5572.0;
+        const double REFERENCE_PENALTY_RATIO = 0.10;
+        const double AMORTIZE_BATCHES =
+            REFERENCE_SWITCH_COST_MS /
+            (REFERENCE_WIRE_MS_PER_BATCH * REFERENCE_PENALTY_RATIO);
+        cost_penalty_bps = stay_score *
+                           ((double)switch_cost_ms /
+                            (wire_ms_per_batch * AMORTIZE_BATCHES));
+
+        // Fire proof: an adaptive-rate lane can group these records by cfg
+        // and show >1 distinct (wire_ms, penalty_pct) pair. With the flag OFF
+        // there are exactly zero [OPT-CLOCK] records.
+        const double penalty_pct = 100.0 * (double)switch_cost_ms /
+                                   (wire_ms_per_batch * AMORTIZE_BATCHES);
+        printf("[OPT-CLOCK] cfg=%d switch_ms=%d wire_ms=%.0f "
+               "amortize_batches=%.6f penalty_bps=%.1f penalty_pct=%.3f\n",
+               current_cfg, switch_cost_ms, wire_ms_per_batch,
+               AMORTIZE_BATCHES, cost_penalty_bps, penalty_pct);
+        fflush(stdout);
+    }
 
     // SEARCH THE WHOLE TABLE — no ±2 limit. With per-config channel
     // identification we look up tbl[cand][current_label] directly for every

@@ -64,6 +64,21 @@ static inline bool sack_rx_trace_enabled_common()
 	} \
 } while(0)
 
+// LINK-PHASE STEP 7 / MC-7: feed the rate optimizer the emitted DATA-keydown
+// clock instead of its frozen 1800 ms batch constant. Default OFF and cached
+// per process, matching the other link-phase experiment gates. This helper has
+// no data-path authority; it only selects inputs used by optimizer recommendations.
+static inline bool linkphase_optclock_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_LINKPHASE_OPTCLOCK");
+		cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 // TURNAROUND BATCH-AIRTIME RE-PHASE gate (bench-9; common_defines.h
 // TURNAROUND_ACCRUAL_MS_PER_S; TURNAROUND_FIX_DESIGN.md §5.1). DEFAULT-ON (HW A/B
 // PHASE1_VERDICT.md: CFG15 whole-window 3.4x win) but the re-phase remains CFG15-ONLY by the
@@ -9495,6 +9510,30 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 	// (including the cooldown tick) so the optimizer is fully inert under
 	// calibration. opt_load_rate_table() also no-ops when disabled.
 	if (optimizer_disabled)                return false;
+
+	// MC-7 measured optimizer clock. send_batch() captured the exact emitted
+	// DATA-keydown shape (actual frame count plus whether every frame carried a
+	// full preamble), so derive_keydown_length_ms() reproduces its sample-truth
+	// airtime rather than assuming nominal batch_size * per-frame time. The
+	// fallback is defensive for a synthetic/direct caller with no captured
+	// keydown. No live SET_CONFIG RTT meter exists yet, so retain the honest
+	// documented fallback of 1800 ms while wiring it through the existing setter.
+	// With the flag OFF neither setter is called and the optimizer stays on its
+	// original frozen 1800 ms / 10-batch arithmetic path.
+	if (linkphase_optclock_enabled_common())
+	{
+		int batch_frames = linkphase_last_kd_frames;
+		bool force_full = linkphase_last_kd_force_full;
+		if (batch_frames <= 0)
+		{
+			batch_frames = data_batch_size;
+			force_full = false;
+		}
+		const int measured_wire_ms =
+			derive_keydown_length_ms(batch_frames, force_full);
+		rate_opt.set_switch_cost_ms(1800);
+		rate_opt.set_wire_ms_per_batch((double)measured_wire_ms);
+	}
 	// Always drain the cooldown counter regardless of gate outcome so the
 	// counter reflects elapsed batches, not "batches the optimizer actually
 	// looked at".
