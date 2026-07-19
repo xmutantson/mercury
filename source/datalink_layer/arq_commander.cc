@@ -119,6 +119,112 @@ static bool retain_shadow_fix_on()
 	return cached != 0;
 }
 
+// LINK-PHASE STEP 6 / MC-4 — derive the RSP's recoverable batch-generation
+// depth from the storage that actually exists. messages_rx[] holds one CURRENT
+// generation. messages_rx_prev[] adds one PREV generation only in the repaired
+// retention-shadow era, where the CMD shadow can retain a complete worst-case
+// batch of holes (CMD_PREV_RETAIN_MAX >= MAX_SACK_BATCH_SIZE). Thus the shipped
+// repaired geometry derives 1+1=2; disabling the retention repair conservatively
+// collapses admission to current-only depth 1 instead of guessing a magic depth.
+static int rxwindow_rsp_reorder_depth()
+{
+	const int current_generation = 1;
+	const int recoverable_prev_generation =
+		(retain_shadow_fix_on() && CMD_PREV_RETAIN_MAX >= MAX_SACK_BATCH_SIZE) ? 1 : 0;
+	return current_generation + recoverable_prev_generation;
+}
+
+// Consume the existing cumulative-n_r field after its CRC/window checks. The
+// high-water is monotonic with wrap, matching advance_last_delivered() on the RSP.
+// A PARTIAL report whose field equals highest_sent is the producer's documented
+// n_r<0 fallback (cumulative_ack_bsi_field emits per_batch_bsi until something has
+// been delivered), not evidence that the partial batch was delivered.
+void cl_arq_controller::cmd_rxwindow_note_delivered(int n_r, bool clean)
+{
+	if(!linkphase_rxwindow_on() || !sack_v2_enabled || !cumulative_ack_enabled)
+		return;
+
+	const int nr = n_r & 0xFF;
+	const int highest_sent = (cmd_batch_seq_id - 1) & 0xFF;
+	if(!clean && nr == highest_sent)
+		return;
+
+	if(cmd_rxwindow_delivered_high_water < 0)
+	{
+		cmd_rxwindow_delivered_high_water = nr;
+	}
+	else
+	{
+		const int fwd = (nr - (cmd_rxwindow_delivered_high_water & 0xFF)) & 0xFF;
+		if(fwd < 1 || fwd > 128)
+			return;  // duplicate or stale/backward report
+		cmd_rxwindow_delivered_high_water = nr;
+	}
+
+	// Re-evaluate capacity from a fresh clock after real delivery progress.
+	cmd_rxwindow_hold_timer.stop();
+	cmd_rxwindow_hold_timer.reset();
+}
+
+// Return true only for NEW-batch admission. Pure retransmit turns never call this
+// helper, and this helper deliberately does not touch link/watchdog/receiving
+// timers, retransmit queues, BREAK state, or connection state.
+bool cl_arq_controller::cmd_rxwindow_hold_new_batch()
+{
+	if(!linkphase_rxwindow_on() || !sack_v2_enabled || !cumulative_ack_enabled)
+		return false;
+
+	const int delivered_next = (cmd_rxwindow_delivered_high_water < 0)
+		? 0 : ((cmd_rxwindow_delivered_high_water + 1) & 0xFF);
+	const int outstanding = ((cmd_batch_seq_id & 0xFF) - delivered_next) & 0xFF;
+	const int depth = rxwindow_rsp_reorder_depth();
+
+	// A mod-256 distance beyond the half-window is inconsistent with this bounded
+	// protocol (or an enable/reset discontinuity). Fail open rather than deadlock.
+	if(outstanding > 128 || outstanding < depth)
+	{
+		cmd_rxwindow_hold_timer.stop();
+		cmd_rxwindow_hold_timer.reset();
+		return false;
+	}
+
+	if(cmd_rxwindow_hold_timer.counting == NO)
+	{
+		cmd_rxwindow_hold_timer.reset();
+		cmd_rxwindow_hold_timer.start();
+		printf("[LINKPHASE-RXWINDOW] HOLD new bsi=%d highest_sent=%d delivered_hw=%d "
+			"outstanding=%d depth=%d (retx/recovery remain live)\n",
+			cmd_batch_seq_id & 0xFF, (cmd_batch_seq_id - 1) & 0xFF,
+			cmd_rxwindow_delivered_high_water, outstanding, depth);
+		fflush(stdout);
+		return true;
+	}
+
+	// Deadlock safety: use the modem's existing link-loss horizon, not a new magic
+	// timeout. After one link_timeout with no n_r progress, fail open for one
+	// admission and restart the bound. Existing BREAK/link recovery has remained
+	// runnable for the entire hold and remains authoritative.
+	int fallback_ms = link_timeout;
+	if(fallback_ms <= 0) fallback_ms = receiving_timeout;
+	if(fallback_ms <= 0)
+	{
+		cmd_rxwindow_hold_timer.stop();
+		cmd_rxwindow_hold_timer.reset();
+		return false;
+	}
+	if(cmd_rxwindow_hold_timer.get_elapsed_time_ms() >= fallback_ms)
+	{
+		printf("[LINKPHASE-RXWINDOW] FALLBACK new bsi=%d after %dms without n_r progress "
+			"(outstanding=%d depth=%d); fail-open one admission so recovery cannot hang\n",
+			cmd_batch_seq_id & 0xFF, fallback_ms, outstanding, depth);
+		fflush(stdout);
+		cmd_rxwindow_hold_timer.stop();
+		cmd_rxwindow_hold_timer.reset();
+		return false;
+	}
+	return true;
+}
+
 // Stash a just-SENT retx frame keyed by its ORIGINAL batch_seq_id + slot. Dedup:
 // updates an existing (bsi,slot) entry in place. On overflow (repaired), drops the
 // OLDEST entry (ring); pre-fix (OFF) evicts an exhausted
@@ -432,7 +538,10 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	uint32_t all_ones = (data_batch_size >= 32)
 		? 0xFFFFFFFFu
 		: ((1u << data_batch_size) - 1u);
-	return rx_bitmap == all_ones;
+	bool clean = (rx_bitmap == all_ones);
+	if(clean)
+		cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
+	return clean;
 #else
 	return false;
 #endif
@@ -2435,6 +2544,14 @@ void cl_arq_controller::process_messages_tx_data()
 		// (calculate_receiving_timeout reads this flag). Set BEFORE the calc so the widen fires.
 		data_ack_retx_turnaround = true;
 		calculate_receiving_timeout();
+		// LINK-PHASE STEP 5 / MC-3: arm one close edge only when Step 2 supplied
+		// a valid derived ACK_SLOT for this actual retransmit keydown.
+		if(linkphase_slotliveness_on())
+		{
+			linkphase_ack_slot_wait_armed =
+				linkphase_ackslot_on() && linkphase_last_kd_frames > 0;
+			linkphase_ack_slot_miss_counted = false;
+		}
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
 		fflush(stdout);
@@ -3048,6 +3165,14 @@ void cl_arq_controller::process_messages_tx_data()
 		// Recalculate timeout: guard delays from prior ACK detection can leave
 		// receiving_timeout stale, too short for the next ACK round-trip.
 		calculate_receiving_timeout();
+		// LINK-PHASE STEP 5 / MC-3: the slot is valid only when the shipped
+		// derived ACK_SLOT floor owns this data-ACK wait. OFF/DEFEAT writes nothing.
+		if(linkphase_slotliveness_on())
+		{
+			linkphase_ack_slot_wait_armed =
+				linkphase_ackslot_on() && linkphase_last_kd_frames > 0;
+			linkphase_ack_slot_miss_counted = false;
+		}
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
 		fflush(stdout);
@@ -3731,14 +3856,16 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				}
 			}
 
-			// Frame gearshift up failure: BREAK immediately, double threshold.
-			// Only one attempt — no retries. Recover to the working config and
-			// require 2x consecutive ACKs before trying to upshift again.
+			// Frame gearshift up failure: BREAK immediately and double threshold on
+			// the legacy path. MC-3 waits for repeated failed control retransmissions.
 			if(messages_control.data[0] == SET_CONFIG
 				&& turboshift_phase == TURBO_DONE
 				&& !turboshift_active
 				&& break_recovery_phase == 0
-				&& !emergency_break_active)
+				&& !emergency_break_active
+				// An unheard reverse control ACK is not forward-modulation evidence.
+				// Under slot-liveness, demote only after the real retry budget failed.
+				&& (!linkphase_slotliveness_on() || messages_control.nResends <= 1))
 			{
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
@@ -3838,7 +3965,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 			}
 			// Track control failures toward BREAK threshold.
 			// Only during connected data exchange (not connection setup or turboshift).
-			else if(link_status == CONNECTED && turboshift_phase == TURBO_DONE
+			else if(!linkphase_slotliveness_on()
+				&& link_status == CONNECTED && turboshift_phase == TURBO_DONE
 				&& gear_shift_on == YES && !emergency_break_active)
 			{
 				emergency_nack_count++;
@@ -4738,6 +4866,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								bool partial_target_ok = is_clean_confirmation
 									|| partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
 										cumulative_ack_enabled);
+								// MC-4 consumes n_r after CRC + semantic window validation, but
+								// before bitmap de-dup: a repeated bitmap may still carry a newer
+								// cumulative delivered high-water.
+								if(!w1_shadow_consumed && bsi_in_window && bitmap_ok && partial_target_ok)
+									cmd_rxwindow_note_delivered((int)rx_bsi, is_clean_confirmation);
 
 							if(!w1_shadow_consumed && bsi_in_window && bitmap_ok && !duplicate && partial_target_ok)
 							{
@@ -5059,6 +5192,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							fflush(stdout);
 							decoded = false;
 						}
+						// MC-4: this is a CRC-valid, in-window PARTIAL n_r. Record it
+						// before SACK bitmap de-dup, which is independent of high-water
+						// progress. The helper rejects the n_r<0 per-batch fallback.
+						if(decoded)
+							cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/false);
 						// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
 						// §3): the OFDM SACK_RSP transport ALSO carries the frozen n_r under the cap and
 						// SHARES cmd_last_applied_sack_bsi with the MFSK path, so key its de-dup on the
@@ -5579,7 +5717,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			}
 		}
 	}
-	else if (data_ack_received==NO && ack_pattern_time_ms <= 0 && !(last_message_sent_type==CONTROL && last_message_sent_code==REPEAT_LAST_ACK))
+	else if (data_ack_received==NO && ack_pattern_time_ms <= 0
+		&& !(linkphase_slotliveness_on() && linkphase_ack_slot_wait_armed)
+		&& !(last_message_sent_type==CONTROL && last_message_sent_code==REPEAT_LAST_ACK))
 	{
 		consecutive_data_acks = 0;  // Reset on failure
 		// SUSTAINED-ANCHOR GATE (gearshift-climb-engine.md §11): a failed block
@@ -5694,13 +5834,35 @@ void cl_arq_controller::process_messages_rx_acks_data()
 	}
 	else
 	{
+		// LINK-PHASE STEP 5 / MC-3 — this outer edge is the ACK_SLOT CLOSE: the
+		// receive timer is no longer before receiving_timeout. Credit at most one miss
+		// for this armed derived slot, and only if no matching data ACK decoded. Silence
+		// observed by any earlier poll cannot reach this counter. Mirror the qualified
+		// count into the retained emergency counter so all existing demote/BREAK recovery
+		// consumers keep their threshold and recovery path unchanged.
+		const bool slot_liveness_active =
+			linkphase_slotliveness_on() && linkphase_ack_slot_wait_armed;
+		bool slot_qualified_miss = false;
+		if(slot_liveness_active && data_ack_received == NO
+		   && !linkphase_ack_slot_miss_counted)
+		{
+			if(missed_ack_slots < 1000000) missed_ack_slots++;
+			linkphase_ack_slot_miss_counted = true;
+			slot_qualified_miss = true;
+			emergency_nack_count = missed_ack_slots;
+			printf("[LINKPHASE-SLOT-LIVENESS] ACK_SLOT closed without decoded ACK: "
+			       "missed_ack_slots=%d/%d (config=%d)\n",
+				missed_ack_slots, emergency_nack_threshold, current_configuration);
+			fflush(stdout);
+		}
+
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(data_configuration, PHYSICAL_LAYER_ONLY,YES);
 		if (last_message_sent_type==CONTROL && last_message_sent_code==REPEAT_LAST_ACK)
 		{
 			stats.nNAcked_control++;
 		}
-		if(data_ack_received == NO && ack_pattern_time_ms > 0)
+		if(data_ack_received == NO && (ack_pattern_time_ms > 0 || slot_qualified_miss))
 		{
 			// Pattern ACK timeout: REPEAT_LAST_ACK is useless (responder can't
 			// receive control frames while waiting for data). Skip directly to
@@ -5910,8 +6072,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				return;
 			}
 
-			// Count toward emergency BREAK. Batch halving doesn't bypass this.
-			emergency_nack_count++;
+			// Count toward emergency BREAK. With Step 5 active the ACK_SLOT-close
+			// edge above already mirrored missed_ack_slots into this retained counter;
+			// OFF/DEFEAT executes the original raw increment byte-for-byte.
+			if(!slot_liveness_active)
+				emergency_nack_count++;
 
 			// WALL-B FIX-9 D3 (FIX9_D3_DESIGN.md §3, producer P2): count CONSECUTIVE block-failures
 			// AT CONFIG_16 where the reverse MFSK ACK+SACK correlator FAILED TO DECODE (we are in the
@@ -6457,6 +6622,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
+			if(linkphase_slotliveness_on())
+			{
+				missed_ack_slots = 0;
+				linkphase_ack_slot_wait_armed = false;
+				linkphase_ack_slot_miss_counted = false;
+			}
 			// STAGE 4c: any delivery (clean OR partial) proves the link is NOT dead, so
 			// the commander true-loss floor streak resets UNGATED (symmetric with
 			// emergency_nack_count). Keeps the SESSION_DEAD_BATCHES BREAK reachable ONLY
@@ -7500,6 +7671,14 @@ void cl_arq_controller::process_control_commander()
 			session_data_frame_sent = false;
 			session_data_frame_received = false;
 			break_noprogress_cycles = 0;
+			// CONNECT skips reset_session_state(): establish MC-4's virtual
+			// delivered predecessor for this fresh session explicitly.
+			if(linkphase_rxwindow_on())
+			{
+				cmd_rxwindow_delivered_high_water = (cmd_batch_seq_id - 1) & 0xFF;
+				cmd_rxwindow_hold_timer.stop();
+				cmd_rxwindow_hold_timer.reset();
+			}
 			// Reset per-phase so each handshake step gets its own timeout window
 			connection_attempt_timer.reset();
 			connection_attempt_timer.start();
@@ -21938,7 +22117,11 @@ void cl_arq_controller::process_buffer_data_commander()
 		bool have_new_tx = ((!kx_hold_user)
 		                    && (fifo_buffer_tx.get_size()!=fifo_buffer_tx.get_free_size()))
 		                   || kx_stream_tx_active;
-		if( have_new_tx && stage_ok)
+		// MC-4 gates only this NEW-data admission edge. process_messages_tx_data()
+		// has already had its chance to drain a pending pure-retx turn, and a hold
+		// leaves every existing timeout/BREAK/recovery path untouched.
+		bool rxwindow_hold = have_new_tx && stage_ok && cmd_rxwindow_hold_new_batch();
+		if( have_new_tx && stage_ok && !rxwindow_hold)
 		{
 			// Option W (data-flow-stream-offset.md §2.1): total TRANSPORTED payload bytes
 			// framed for the new-data batch built THIS call (comp_size in the compressed

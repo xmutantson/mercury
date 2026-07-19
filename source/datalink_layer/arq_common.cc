@@ -763,6 +763,7 @@ cl_arq_controller::cl_arq_controller()
 	// captured_batch_seq_id_for_retransmit is -1 (no SACK retransmit pending).
 	// last_received_batch_seq_id is -1 (no DATA frame parsed yet).
 	cmd_batch_seq_id=0;
+	cmd_rxwindow_delivered_high_water=-1;
 	captured_batch_seq_id_for_retransmit=-1;
 	last_received_batch_seq_id=-1;
 	// Option W (data-flow-stream-offset.md §2.4): stream cursors anchored at 0,
@@ -1120,6 +1121,9 @@ cl_arq_controller::cl_arq_controller()
 	linkphase_retx_slot_fired=0;        // LINK-PHASE STEP 4 (MC-6) fire-proof counter
 	linkphase_last_kd_frames=0;
 	linkphase_last_kd_force_full=false;
+	missed_ack_slots=0;
+	linkphase_ack_slot_wait_armed=false;
+	linkphase_ack_slot_miss_counted=false;
 	rx_copy_window=-1;                  // Option B' (data-flow-batch-size.md §9): clear stale per-call delivery bound
 	data_ack_received=NO;
 	repeating_last_ack=NO;
@@ -1610,6 +1614,38 @@ bool cl_arq_controller::linkphase_ackslot_on()
 	if(state < 0)
 	{
 		const char* e = std::getenv("MERCURY_LINKPHASE_ACKSLOT");
+		state = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return state == 1;
+}
+
+// LINK-PHASE STEP 5 / MC-3 — convert reverse-ACK absence from a polling-time
+// observation into evidence only at a derived ACK_SLOT close. Default OFF is
+// the exact pre-Step-5 path. DEFEAT is the same-binary fail-before arm.
+bool cl_arq_controller::linkphase_slotliveness_on()
+{
+	static int state = -1;
+	if(state < 0)
+	{
+		const char* e = std::getenv("MERCURY_LINKPHASE_SLOTLIVENESS");
+		const char* d = std::getenv("MERCURY_LINKPHASE_SLOTLIVENESS_DEFEAT");
+		state = (e && *e && atoi(e) != 0 && !(d && *d && atoi(d) != 0)) ? 1 : 0;
+	}
+	// MC-3 consumes Step 2's derived close event; without ACK_SLOT there is no
+	// slot-qualified evidence and every Step-5 behavior gate remains fail-open.
+	return state == 1 && linkphase_ackslot_on();
+}
+
+// LINK-PHASE STEP 6 / MC-4 — new-batch RX-window admission flag. This is
+// deliberately independent of the earlier link-phase flags: the actual gate also
+// requires v2 + negotiated cumulative ACK, so an unset flag (or an incapable peer)
+// falls through to the pre-Step-6 staging path byte-for-byte.
+bool cl_arq_controller::linkphase_rxwindow_on()
+{
+	static int state = -1;
+	if(state < 0)
+	{
+		const char* e = std::getenv("MERCURY_LINKPHASE_RXWINDOW");
 		state = (e && *e && atoi(e) != 0) ? 1 : 0;
 	}
 	return state == 1;
@@ -6399,6 +6435,17 @@ void cl_arq_controller::update_status()
 	{
 		if(messages_tx[i].status==PENDING_ACK && messages_tx[i].ack_timer.get_elapsed_time_ms()>=messages_tx[i].ack_timeout)
 		{
+			// LINK-PHASE STEP 5 / MC-3: a per-message ACK timer can expire while the
+			// commander is still inside the valid derived block ACK_SLOT. That is polling-
+			// time silence, not channel evidence. Leave the frame pending until the slot
+			// closes; process_messages_rx_acks_data() converts it exactly once at that edge.
+			// OFF/DEFEAT, non-CMD, non-data-wait, and non-derived waits run the old body.
+			if(linkphase_slotliveness_on()
+			   && role == COMMANDER
+			   && connection_status == RECEIVING_ACKS_DATA
+			   && linkphase_ack_slot_wait_armed
+			   && receiving_timer.get_elapsed_time_ms() < receiving_timeout)
+				continue;
 			messages_tx[i].status=ACK_TIMED_OUT;
 			stats.nNAcked_data++;
 		}
@@ -8074,6 +8121,15 @@ void cl_arq_controller::reset_session_state()
 	rsp_gap_recover_rounds = 0;
 	rsp_gap_hold_cur_expected = 0;   // R2b: no held current batch survives a session boundary / teardown
 	cmd_prev_retain_count  = 0;
+	// MC-4: reset to the virtual predecessor of the next wire bsi. cmd_batch_seq_id
+	// is intentionally not reset at every session boundary, so using its predecessor
+	// (rather than a hardcoded -1) represents zero outstanding batches after reset.
+	if(linkphase_rxwindow_on())
+	{
+		cmd_rxwindow_delivered_high_water = (cmd_batch_seq_id - 1) & 0xFF;
+		cmd_rxwindow_hold_timer.stop();
+		cmd_rxwindow_hold_timer.reset();
+	}
 
 	// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): SNAPSHOT the
 	// RSP app-delivered high-water into the reset-SURVIVING prev field BEFORE the Option-W
@@ -8205,6 +8261,12 @@ void cl_arq_controller::reset_session_state()
 	bigblock_carve_cooldown_span = 0;
 	cfg16_revack_starve_fails = 0;   // WALL-B FIX-9 D3 (R3 parity): clear the CFG16 reverse-ACK
 	                                 // starvation streak on session reset / new CONNECT.
+	if(linkphase_slotliveness_on())
+	{
+		missed_ack_slots = 0;
+		linkphase_ack_slot_wait_armed = false;
+		linkphase_ack_slot_miss_counted = false;
+	}
 	break_recovery_phase = 0;
 	break_recovery_retries = 0;
 	// IDLE-SWITCHROLE-RACE recovery (idle-switchrole-race.md §3): fresh session —
@@ -8697,6 +8759,12 @@ void cl_arq_controller::kx_stream_reanchor()
 	// the Option-W cursor reset above and the AEAD nonce-epoch reset in the KEY_ACTIVATE
 	// handler, the post-activation data path is byte-identical to a normal session start.
 	cmd_batch_seq_id                  = 0;
+	if(linkphase_rxwindow_on())
+	{
+		cmd_rxwindow_delivered_high_water = -1;
+		cmd_rxwindow_hold_timer.stop();
+		cmd_rxwindow_hold_timer.reset();
+	}
 	rsp_current_expected_batch_seq_id = -1;
 	rsp_prev_batch_seq_id             = -1;
 	// COMPLETE the fresh-bsi baseline. The wire bsi wraps back to 0 here, but the
@@ -18064,4 +18132,3 @@ uint32_t cl_arq_controller::CRC32_calc(const char* data_byte, int nItems)
 	}
 	return crc ^ 0xFFFFFFFFu;
 }
-

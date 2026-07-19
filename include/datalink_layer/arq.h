@@ -834,6 +834,26 @@ public:
   // CMD now waits for), and (iii) the D5-on-retx per-bsi span stamp. OFF => byte-identical to
   // stock (invariant I-3, fail-open to today's behavior). Cached (env const per process).
   static bool linkphase_ackslot_on();
+  // LINK-PHASE STEP 5 / MC-3 — slot-qualified commander liveness. Default OFF;
+  // MERCURY_LINKPHASE_SLOTLIVENESS_DEFEAT restores the pre-Step-5 behavior even
+  // when the main flag is set. The feature is actionable only while a derived
+  // ACK_SLOT wait is armed by Step 2.
+  static bool linkphase_slotliveness_on();
+  // LINK-PHASE STEP 6 / MC-4 — commander new-batch RX-window admission. Default
+  // OFF: MERCURY_LINKPHASE_RXWINDOW must be non-zero, and the gate is actionable
+  // only on a v2 session that negotiated the existing cumulative-n_r ACK field.
+  // No wire change: the CMD tracks the accepted n_r high-water already carried by
+  // ACK+SACK, and holds only NEW-data staging when the RSP's derived current+prev
+  // reorder depth is full. Retransmit/control/recovery paths are never gated.
+  static bool linkphase_rxwindow_on();
+  // Advance the CMD's accepted delivered high-water monotonically (mod 256).
+  // `clean` distinguishes a real clean delivery from the producer's n_r<0
+  // partial-report fallback, whose field contains the partial batch's own bsi.
+  void cmd_rxwindow_note_delivered(int n_r, bool clean);
+  // True while a new batch must be held. A link_timeout-bounded fail-open admits
+  // one batch rather than creating a new hang; existing link/recovery timers run
+  // untouched while held.
+  bool cmd_rxwindow_hold_new_batch();
   // LINK-PHASE STEP 2 (b) — the shared LEVER-P keydown length in ms for a batch of
   // frame_count DATA frames. PURE in (frame_count, current config geometry, the shared
   // preamble_sched_nsymb schedule) so TX and RX derive the SAME value: TX to size its own
@@ -3812,6 +3832,12 @@ public:
   int cmd_batch_seq_id;                // CMD: counter for next NEW-DATA batch (mod 256).
                                        //      First new-data batch sent under value 0;
                                        //      subsequent batches under 1, 2, 3, ...
+  // LINK-PHASE STEP 6 / MC-4 — accepted cumulative delivered high-water on the
+  // CMD and the independent bounded-hold clock. -1 is the virtual predecessor of
+  // first wire bsi 0 (nothing delivered yet). Both are decision-inert unless
+  // MERCURY_LINKPHASE_RXWINDOW is ON and cumulative ACK was negotiated.
+  int      cmd_rxwindow_delivered_high_water;
+  cl_timer cmd_rxwindow_hold_timer;
   int captured_batch_seq_id_for_retransmit;
                                        // CMD: snapshot of cmd_batch_seq_id at the moment a
                                        //      SACK retransmit queue is populated. The
@@ -6271,6 +6297,12 @@ private:
   // under the STEP-2 flag; raise-only so a stale value can never SHORTEN a timeout.
   int  linkphase_last_kd_frames;       // frames in the last DATA keydown (0 = none yet)
   bool linkphase_last_kd_force_full;   // was that keydown full-preamble (retx / amort-off)
+  // LINK-PHASE STEP 5 / MC-3. CMD-only, never on wire. A wait is armed only for
+  // a valid Step-2 derived ACK_SLOT. The close latch makes the miss edge one-shot
+  // even if the receive-state handler is polled again before it changes state.
+  int  missed_ack_slots;               // consecutive derived ACK_SLOT closes with no decoded ACK
+  bool linkphase_ack_slot_wait_armed;  // current data-ACK wait owns a valid derived ACK_SLOT
+  bool linkphase_ack_slot_miss_counted;// the current slot-close edge was already consumed
   // Option B' (data-flow-batch-size.md §9): per-call DELIVERY window override for
   // copy_data_to_buffer(). -1 (default) => copy_data_to_buffer bounds delivery by
   // data_batch_size (byte-identical). The current-batch commit path sets this to the
