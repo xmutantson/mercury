@@ -12794,7 +12794,7 @@ int cl_arq_controller::test_retain_shadow_overflow()
 	// this is the test's own copy so it can state the expected outcome).
 	bool fix_on = false;
 	{ const char* e = std::getenv("MERCURY_RETAIN_SHADOW_FIX");
-	  fix_on = (e && *e && atoi(e) != 0); }
+	  fix_on = !(e && *e && atoi(e) == 0); }  // mirror retain_shadow_fix_on() DEFAULT-ON
 
 	const int N     = 7;    // the batch that holds the holes
 	const int HOLES = 19;   // > the pre-fix cap of 8 (seed11's measured worst-case)

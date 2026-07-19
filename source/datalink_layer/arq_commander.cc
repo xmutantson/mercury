@@ -114,7 +114,7 @@ static bool retain_shadow_fix_on()
 	if(cached < 0)
 	{
 		const char* e = std::getenv("MERCURY_RETAIN_SHADOW_FIX");
-		cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+		cached = (e && *e && atoi(e) == 0) ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock
 	}
 	return cached != 0;
 }

@@ -74,7 +74,7 @@ static inline bool linkphase_optclock_enabled_common()
 	if(cached < 0)
 	{
 		const char* e = std::getenv("MERCURY_LINKPHASE_OPTCLOCK");
-		cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+		cached = (e && *e && atoi(e) == 0) ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock
 	}
 	return cached != 0;
 }
@@ -135,7 +135,7 @@ static inline uint8_t cumulative_ack_advertise_bit()
 	if(cached < 0)
 	{
 		const char* e = std::getenv("MERCURY_CUMULATIVE_ACK");
-		cached = (e && *e && *e != '0') ? 1 : 0;
+		cached = (e && *e && *e == '0') ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock
 	}
 	return cached ? (uint8_t)CAP_CUMULATIVE_ACK : (uint8_t)0;
 }
@@ -1640,7 +1640,7 @@ bool cl_arq_controller::linkphase_ackslot_on()
 	if(state < 0)
 	{
 		const char* e = std::getenv("MERCURY_LINKPHASE_ACKSLOT");
-		state = (e && *e && atoi(e) != 0) ? 1 : 0;
+		state = (e && *e && atoi(e) == 0) ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock
 	}
 	return state == 1;
 }
@@ -1655,7 +1655,7 @@ bool cl_arq_controller::linkphase_slotliveness_on()
 	{
 		const char* e = std::getenv("MERCURY_LINKPHASE_SLOTLIVENESS");
 		const char* d = std::getenv("MERCURY_LINKPHASE_SLOTLIVENESS_DEFEAT");
-		state = (e && *e && atoi(e) != 0 && !(d && *d && atoi(d) != 0)) ? 1 : 0;
+		state = ((d && *d && atoi(d) != 0) || (e && *e && atoi(e) == 0)) ? 0 : 1;  // DEFAULT-ON: DEFEAT or =0 restores stock
 	}
 	// MC-3 consumes Step 2's derived close event; without ACK_SLOT there is no
 	// slot-qualified evidence and every Step-5 behavior gate remains fail-open.

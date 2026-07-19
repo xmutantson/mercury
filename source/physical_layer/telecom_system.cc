@@ -704,7 +704,7 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 		return v;
 	}();
 
-	static const int keydown_mini0 = []() { const char* e=std::getenv("MERCURY_KEYDOWN_MINI0"); return (e&&*e)?atoi(e):0; }();
+	static const int keydown_mini0 = []() { const char* e=std::getenv("MERCURY_KEYDOWN_MINI0"); return (e&&*e)?atoi(e):1; }();  // DEFAULT-ON: explicit =0 restores stock
 	if(keydown_mini0) return 0;   // CONTINUOUS-KEYDOWN: zero-preamble tail frames (located by prediction)
 	int eff = mini_nsymb;
 	if(eff > full_nsymb) eff = full_nsymb;
@@ -1661,7 +1661,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				&& M != MOD_MFSK
 				&& receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0;
 			if(rx_batch_predict_mode) rx_eff_preamble = 1;
-			static const int keydown_mini0_rx = []() { const char* e=std::getenv("MERCURY_KEYDOWN_MINI0"); return (e&&*e)?atoi(e):0; }();
+			static const int keydown_mini0_rx = []() { const char* e=std::getenv("MERCURY_KEYDOWN_MINI0"); return (e&&*e)?atoi(e):1; }();  // DEFAULT-ON: explicit =0 restores stock
 			if(rx_batch_predict_mode && keydown_mini0_rx) rx_eff_preamble = 0;   // MINI=0: zero-preamble tail frame
 
 			if(receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
