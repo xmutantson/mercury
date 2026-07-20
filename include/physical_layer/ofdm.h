@@ -208,9 +208,14 @@ public:
 	// Adjacent column-pilots see ~the same slow-varying channel, so the delta
 	// is dominated by noise. Returns σ²/|X|² in baseband-bin units, or 0.01 if
 	// fewer than 1 valid pair (matches previous default).
+	// adjacent_rows selects row-adjacent pairs and returns σ² in received-data
+	// units after accounting for pilot power; this is used by irregular lattices
+	// with continual pilot columns. pair_count reports whether an estimate exists.
 	// Reference: Ozdemir & Arslan, "Channel Estimation for Wireless OFDM
 	// Systems," IEEE Comm Surveys 2007, §IV-B.
-	double estimate_noise_from_pilot_pairs(std::complex<double>* in);
+	double estimate_noise_from_pilot_pairs(std::complex<double>* in,
+	                                      bool adjacent_rows = false,
+	                                      int* pair_count = nullptr);
 	void CPE_correction(std::complex<double>* in);
 	void restore_channel_amplitude();
 	double carrier_sampling_frequency_sync(std::complex <double>*in, double carrier_freq_width, int preamble_nSymb, double sampling_frequency);

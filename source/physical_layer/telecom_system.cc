@@ -1037,7 +1037,10 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 
 	// Apply test TX carrier offset for frequency sync testing
 	double tx_carrier = carrier_frequency + test_tx_carrier_offset;
-	ofdm.baseband_to_passband(data_container.preamble_symbol_modulated_data,data_container.Nofdm*eff_preamble,data_container.passband_data_tx,sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
+	// A MINI-0 tail has no preamble samples.  The generic interpolator requires at
+	// least two input samples, so do not invoke it for the deliberately empty span.
+	if(eff_preamble_samples > 0)
+		ofdm.baseband_to_passband(data_container.preamble_symbol_modulated_data,data_container.Nofdm*eff_preamble,data_container.passband_data_tx,sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
 	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,data_container.Nofdm*active_nsymb,&data_container.passband_data_tx[eff_preamble_samples],sampling_frequency,tx_carrier,carrier_amplitude,frequency_interpolation_rate);
 
 	ofdm.peak_clip(data_container.passband_data_tx, eff_preamble_samples,ofdm.preamble_papr_cut);
@@ -1393,15 +1396,16 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 	// LEVER P: preamble amortization (OFDM only). rx_eff_preamble is the number
 	// of preamble symbols the frame about to be extracted is expected to carry.
-	// It starts at the configured FULL length and is dropped to MINI (1) when the
-	// batch-predict verify locks a tail frame (ofdm_batch_active). On any full-
-	// buffer (re-anchor / initial) search it stays/returns to FULL — which
-	// matches the TX force-full-on-anchor/after-FAIL rule. Used at the data-
+	// A caller-provided override supplies the known MINI length; otherwise it
+	// starts at FULL and the batch predictor drops it for a tail frame. On any
+	// full-buffer re-anchor search it returns to FULL, matching the TX
+	// force-full-on-anchor/after-FAIL rule. Used at the data-
 	// symbol demod offset and frame-extraction size below. MFSK is unaffected
 	// (the amortization is OFDM-data-only). See
 	// fact-documents/data-flow-preamble-amortization.md §2.
-	int rx_eff_preamble = data_container.preamble_nSymb;
-	if(!preamble_amortization_enabled) rx_eff_preamble = data_container.preamble_nSymb;
+	int rx_eff_preamble = preamble_amortization_enabled
+	                    ? rx_effective_preamble_nsymb()
+	                    : data_container.preamble_nSymb;
 	// CONTINUOUS-KEYDOWN carried-timing tracker state (per receive() call). When
 	// keydown_track_timing_enabled, a tail (MINI) frame whose predict-residual is
 	// SUB-GUARD (noise regime) does NOT re-pin the FFT window to the short-preamble
@@ -7300,6 +7304,7 @@ void cl_telecom_system::sfo_block_test()
 		st_receive_stats st;
 		double metric;
 		long   det;
+		rx_preamble_nsymb_override = frame_pre[f];
 
 		if(bigblock)
 		{
@@ -7427,6 +7432,7 @@ void cl_telecom_system::sfo_block_test()
 		else                         { metric_sum_mini += metric; n_mini++; }
 
 	bigblock_score:;
+		rx_preamble_nsymb_override = -1;
 
 		// BER for this frame: decode bytes -> bits, compare to TX bits.
 		byte_to_bit(data_container.hd_decoded_data_byte, data_container.hd_decoded_data_bit, payload_bytes);
@@ -7514,9 +7520,8 @@ void cl_telecom_system::sfo_block_test()
 //       symbol, treat the decision as an extra "pilot", and re-run a light freq
 //       smooth. Refines H between scatter updates (the design's named DDCE).
 //
-// nv = pilot residual EVM against the FINAL interpolated H (NOT a global scalar) so
-// it tracks the true noise and the continual columns keep ≥N pilot pairs → the
-// TEST-2 nv that holds is preserved (no E1/cfg16-nvfix collapse).
+// nv comes from adjacent raw pilots in the continual columns. It is independent
+// of the fitted surface, so interpolation cannot absorb the noise being measured.
 void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ngrid, int Nc)
 {
 	auto env_i = [](const char* k, int def){ const char* e=std::getenv(k); return (e&&*e)?atoi(e):def; };
@@ -7824,10 +7829,11 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 		(ofdm.estimated_channel+n*NC+j)->status = MEASURED;
 	}
 
-	// nv = pilot residual EVM against the FINAL interpolated H (NOT a global scalar):
-	// resid = Y - H[pilot]*X over every pilot cell. The continual columns alone give
-	// 2*Ngrid pilot pairs, so this never collapses to the 1e-6 floor (preserves the
-	// TEST-2 nv that holds — no E1/cfg16-nvfix over-confident-LLR collapse).
+	// Keep the fitted-surface residual for observability and as the fallback for a
+	// degenerate lattice. On the normal thin lattice, use differences between raw
+	// row-adjacent pilots in the continual columns. Dividing by the two pilots'
+	// inverse energies gives an unbiased received-sample AWGN variance and does not
+	// reuse the interpolated H being evaluated.
 	{
 		double nsum=0.0; int pidx=0, npil=0;
 		for(int n=0;n<NG;n++) for(int j=0;j<NC;j++)
@@ -7838,8 +7844,15 @@ void cl_telecom_system::grid_sparse2d_estimator(std::complex<double>* rx, int Ng
 				nsum += resid.real()*resid.real() + resid.imag()*resid.imag();
 				npil++;
 			}
-		ofdm.noise_variance_estimate = (npil>0) ? (nsum/(double)npil) : 0.01;
+		double residual_nv = (npil>0) ? (nsum/(double)npil) : 0.01;
+		int pair_count = 0;
+		double pair_nv = ofdm.estimate_noise_from_pilot_pairs(rx, true, &pair_count);
+		ofdm.noise_variance_estimate = (pair_count > 0) ? pair_nv : residual_nv;
 		if(ofdm.noise_variance_estimate < 1e-6) ofdm.noise_variance_estimate = 1e-6;
+		printf("[PILOT-THIN-NV] source=%s pairs=%d residual_nv=%.6e corrected_nv=%.6e replaced=%d\n",
+			pair_count > 0 ? "adjacent-cross-pilot" : "pilot-residual-fallback",
+			pair_count, residual_nv, ofdm.noise_variance_estimate, pair_count > 0 ? 1 : 0);
+		fflush(stdout);
 	}
 }
 
@@ -8679,6 +8692,7 @@ void cl_telecom_system::sfo_grid_test()
 	{
 		ofdm.LS_channel_estimator(rx.data());   // pilots -> interpolate across 60-grid
 	}
+	sfo_grid_last_noise_variance = ofdm.noise_variance_estimate;
 
 	// Capture per-data-carrier CSI weight |H_k|² (in deframed raster order) BEFORE the
 	// equalizer wipes estimated_channel[].status. On a frequency-SELECTIVE channel the
@@ -8811,20 +8825,20 @@ void cl_telecom_system::sfo_grid_test()
 			pas_log_prior[5] = lp(plo0);
 		}
 
-		// ---- CFG17 composition: NV_FORCE + ratio-nvfix (default-OFF, byte-identical) ----
+		// ---- CFG17 composition: NV_FORCE + ratio-nvfix -----------------------------
 		// MERCURY_SFO_GRID_NV_FORCE>0: override the estimator's nv with a tiny forced
 		// value, REPRODUCING the HW-only ~1000x post-EQ-EVM nv-collapse (which the
 		// in-process sim never reproduces, PCS_VERDICT.md / nvfix a0e22c8) so the
 		// ratio-gate is testable in sim. Default unset/<=0 -> nv untouched.
 		double nv_force = env_f("MERCURY_SFO_GRID_NV_FORCE", 0.0);
 		if(nv_force > 0.0) ofdm.noise_variance_estimate = nv_force;
-		// MERCURY_SFO_GRID_NVFIX=1: apply the production RATIO-GATED demap-variance
+		// MERCURY_SFO_GRID_NVFIX: apply the production RATIO-GATED demap-variance
 		// (telecom_system.cc:2992-2999) -> demap_variance = (nv < measure_var/K) ?
 		// measure_var : nv, K=8. `variance` (=measure_variance(rx), :7102) IS the
-		// post-EQ measured noise the Euclidean demapper needs. Default unset -> raw nv
-		// (byte-identical to base). NO-OP whenever nv >= variance/8 (always true in sim
-		// UNLESS NV_FORCE collapses it) so even enabled it is a NO-OP on a healthy nv.
-		bool   nvfix = (env_i("MERCURY_SFO_GRID_NVFIX", 0) != 0);
+		// post-EQ measured noise the Euclidean demapper needs. It defaults on only for
+		// the thin lattice and remains default-off for the dense shipping configs.
+		// Explicit 0/1 values remain available for controlled A/B tests.
+		bool   nvfix = (env_i("MERCURY_SFO_GRID_NVFIX", thin ? 1 : 0) != 0);
 		const double NV_COLLAPSE_RATIO_K = 8.0;
 
 		// Per-carrier LLR for the whole grid (production demapper + production nv).

@@ -651,11 +651,11 @@ public:
 	// RX per-frame override: number of preamble symbols the frame about to be
 	// decoded is expected to carry (drives the data-symbol offset + frame
 	// extraction size). -1 = use the full configured preamble_nSymb (legacy).
-	// The ARQ receive driver sets this from the schedule (frame index counted
-	// within the current batch) before each receive_byte.
+	// Known-layout block receivers set this from the emitted frame schedule
+	// before each receive_byte.
 	int rx_preamble_nsymb_override = -1;
 
-	// Effective preamble length helpers: clamp an override into [1, full] or
+	// Effective preamble length helpers: clamp an override into [0, full] or
 	// fall back to the configured length when the override is -1.
 	int tx_effective_preamble_nsymb() const;
 	int rx_effective_preamble_nsymb() const;
@@ -730,6 +730,7 @@ public:
 	// read the decode outcome without parsing stdout. -1 = not-run / no coded block.
 	int sfo_grid_last_cw_ok  = -1;   // codewords decoded clean this run
 	int sfo_grid_last_cw_tot = -1;   // total codewords this run (Kcw)
+	double sfo_grid_last_noise_variance = -1.0; // estimator output before demap backstops
 
 	// TEST 3 (sparse-capable 2D channel interpolator — the §13.5 production gap).
 	// On a frequency-SELECTIVE channel (MERCURY_SFO_GRID_CHAN=1 det-floor / =2 two-ray)

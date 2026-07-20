@@ -1587,15 +1587,18 @@ void cl_preamble_configurator::print()
 // Systems," IEEE Comm Surveys 2007, §IV-B (cross-pilot differential
 // noise estimation). Indexing pattern borrowed from CPE_correction
 // at ofdm.cc:1349.
-double cl_ofdm::estimate_noise_from_pilot_pairs(std::complex<double>* in)
+double cl_ofdm::estimate_noise_from_pilot_pairs(std::complex<double>* in,
+	bool adjacent_rows, int* pair_count_out)
 {
+	if (pair_count_out != nullptr) *pair_count_out = 0;
 	if (Nsymb <= 0 || Nc <= 0) return 0.01;
 	int Dy = pilot_configurator.Dy;
-	if (Dy <= 0) return 0.01;
+	if (!adjacent_rows && Dy <= 0) return 0.01;
 
 	// Per-column state: last pilot row and raw H = Y/X for that pilot.
 	int prev_row[Nc];                       // VLA, Nc <= 50
 	std::complex<double> prev_H[Nc];        // VLA
+	std::complex<double> prev_X[Nc];        // VLA
 	for (int j = 0; j < Nc; j++) prev_row[j] = -1;
 
 	double noise_sum = 0.0;
@@ -1611,21 +1614,40 @@ double cl_ofdm::estimate_noise_from_pilot_pairs(std::complex<double>* in)
 				std::complex<double> X = pilot_configurator.sequence[pilot_index];
 				std::complex<double> H_raw = *(in + i*Nc + j) / X;
 
-				if (prev_row[j] >= 0 && (i - prev_row[j]) == Dy)
+				int expected_delta = adjacent_rows ? 1 : Dy;
+				if (prev_row[j] >= 0 && (i - prev_row[j]) == expected_delta)
 				{
 					std::complex<double> delta = H_raw - prev_H[j];
 					double mag2 = delta.real()*delta.real() + delta.imag()*delta.imag();
-					noise_sum += mag2 * 0.5;   // /2 accounts for noise on both pilots
-					noise_count++;
+					if (adjacent_rows)
+					{
+						double x_energy = std::norm(X);
+						double prev_x_energy = std::norm(prev_X[j]);
+						if (x_energy > 0.0 && prev_x_energy > 0.0)
+						{
+							// Var(Y/X - Y_prev/X_prev) = sigma^2
+							// * (1/|X|^2 + 1/|X_prev|^2).
+							noise_sum += mag2 / (1.0/x_energy + 1.0/prev_x_energy);
+							noise_count++;
+						}
+					}
+					else
+					{
+						// Preserve the established regular-lattice estimator units.
+						noise_sum += mag2 * 0.5;
+						noise_count++;
+					}
 				}
 
 				prev_row[j] = i;
 				prev_H[j] = H_raw;
+				prev_X[j] = X;
 				pilot_index++;
 			}
 		}
 	}
 
+	if (pair_count_out != nullptr) *pair_count_out = noise_count;
 	if (noise_count <= 0) return 0.01;
 	double nv = noise_sum / noise_count;
 	if (nv < 1e-6) nv = 1e-6;   // prevent division instability at very high SNR

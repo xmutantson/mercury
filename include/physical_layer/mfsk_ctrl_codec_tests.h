@@ -63,4 +63,8 @@ int run_recovery_ack_fine_tests();
 // Define MOOSE_CFO_FAILBEFORE to exercise the former half-clamp behavior.
 int run_moose_deadzone_tests();
 
+// Thin-lattice cross-pilot noise-variance regression. Runs the production
+// sparse-grid estimator from 10 through 30 dB Es/N0 and a dense cfg16 control.
+int run_pilot_thin_nv_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_

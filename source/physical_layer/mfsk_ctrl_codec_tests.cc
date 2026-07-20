@@ -66,6 +66,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 // §22 OFDM fine-timing test injects a residual TX carrier offset via the
@@ -8729,4 +8730,113 @@ int run_moose_deadzone_tests() {
 	test_moose_capture_interval_has_no_half_clamp();
 	printf("=== Moose dead-zone done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
+}
+
+// =============================================================================
+// Thin-pilot noise-variance regression.
+// =============================================================================
+
+namespace {
+
+struct pilot_nv_saved_env {
+	const char* key;
+	bool present;
+	std::string value;
+};
+
+void set_pilot_nv_test_env(const char* key, const char* value)
+{
+#if defined(_WIN32)
+	_putenv_s(key, value != nullptr ? value : "");
+#else
+	if (value != nullptr) setenv(key, value, 1); else unsetenv(key);
+#endif
+}
+
+} // namespace
+
+int run_pilot_thin_nv_tests()
+{
+	const char* keys[] = {
+		"MERCURY_SFO_GRID_THIN", "MERCURY_SFO_GRID_SPARSE2D",
+		"MERCURY_SFO_GRID_CODED", "MERCURY_SFO_GRID_M64",
+		"MERCURY_SFO_GRID_PCS", "MERCURY_SFO_GRID_NSYMB",
+		"MERCURY_SFO_GRID_ESN0", "MERCURY_SFO_GRID_CHAN",
+		"MERCURY_SFO_GRID_SEED", "MERCURY_SFO_GRID_TRACK",
+		"MERCURY_SFO_GRID_NOINTERP", "MERCURY_SFO_GRID_GENIE",
+		"MERCURY_SFO_GRID_WIENER", "MERCURY_SFO_GRID_DDCE",
+		"MERCURY_SFO_GRID_CPE", "MERCURY_SFO_GRID_TIME_POLAR",
+		"MERCURY_SFO_GRID_POLAR", "MERCURY_SFO_GRID_NVFIX"
+	};
+	const int key_count = (int)(sizeof(keys) / sizeof(keys[0]));
+	pilot_nv_saved_env saved[key_count];
+	for (int i = 0; i < key_count; ++i)
+	{
+		const char* value = std::getenv(keys[i]);
+		saved[i].key = keys[i];
+		saved[i].present = (value != nullptr);
+		saved[i].value = value != nullptr ? value : "";
+	}
+
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_THIN", "1");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_SPARSE2D", "1");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_CODED", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_M64", "1");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_PCS", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_NSYMB", "60");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_CHAN", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_SEED", "12345");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_TRACK", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_NOINTERP", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_GENIE", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_WIENER", "1");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_DDCE", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_CPE", "1");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_TIME_POLAR", "1");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_POLAR", "1");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_NVFIX", nullptr);
+
+	int failures = 0;
+	cl_telecom_system ts;
+	ts.operation_mode = BER_PLOT_passband;
+	ts.load_configuration(CONFIG_16);
+
+	printf("=== Thin-pilot noise-variance tests ===\n");
+	const int esn0_db[] = {10, 15, 20, 25, 30};
+	for (int db : esn0_db)
+	{
+		char db_text[16];
+		snprintf(db_text, sizeof(db_text), "%d", db);
+		set_pilot_nv_test_env("MERCURY_SFO_GRID_ESN0", db_text);
+		ts.sfo_grid_test();
+		double expected = std::pow(10.0, -(double)db / 10.0);
+		double measured = ts.sfo_grid_last_noise_variance;
+		double ratio = measured / expected;
+		bool pass = std::isfinite(ratio) && ratio >= 0.5 && ratio <= 2.0;
+		printf("  [%s] thin EsN0=%d expected_nv=%.6e measured_nv=%.6e ratio=%.3f\n",
+			pass ? "OK" : "FAIL", db, expected, measured, ratio);
+		if (!pass) failures++;
+	}
+
+	// Dense cfg16 is outside the thin estimator's scope. Lock its deterministic
+	// 21 dB pilot-residual value so a future call-site broadening is caught.
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_THIN", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_SPARSE2D", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_M64", "0");
+	set_pilot_nv_test_env("MERCURY_SFO_GRID_ESN0", "21");
+	ts.sfo_grid_test();
+	const double dense_reference = 8.22879e-3;
+	double dense_nv = ts.sfo_grid_last_noise_variance;
+	bool dense_pass = std::fabs(dense_nv - dense_reference) <= 2.0e-5;
+	printf("  [%s] dense cfg16 expected_nv=%.6e measured_nv=%.6e\n",
+		dense_pass ? "OK" : "FAIL", dense_reference, dense_nv);
+	if (!dense_pass) failures++;
+
+	for (int i = 0; i < key_count; ++i)
+		set_pilot_nv_test_env(saved[i].key,
+			saved[i].present ? saved[i].value.c_str() : nullptr);
+
+	printf("=== Thin-pilot noise-variance tests: %s ===\n",
+		failures == 0 ? "PASS" : "FAIL");
+	return failures;
 }

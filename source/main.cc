@@ -1461,6 +1461,7 @@ int main(int argc, char *argv[])
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             int failed = run_mfsk_ctrl_codec_tests();
             failed += run_moose_deadzone_tests();
+            failed += run_pilot_thin_nv_tests();
             failed += run_sim_clock_tests();
             failed += run_winlink_dict_tests();
             // AEAD bsi-bound nonce regression suite (data-flow-aead-nonce.md):
@@ -2798,6 +2799,12 @@ int main(int argc, char *argv[])
         // CFG15 spacing. MOOSE_CFO_FAILBEFORE reproduces the old dead zone.
         if (strcmp(argv[i], "--test-moose") == 0) {
             int failed = run_moose_deadzone_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-pilot-thin-nv : run the production sparse-grid estimator across
+        // 10-30 dB AWGN plus the dense cfg16 scope control.
+        if (strcmp(argv[i], "--test-pilot-thin-nv") == 0) {
+            int failed = run_pilot_thin_nv_tests();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock
