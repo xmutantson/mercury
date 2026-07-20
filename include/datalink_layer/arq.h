@@ -57,10 +57,10 @@
 // translation unit routes through the SAME definition — in particular the
 // SWITCH_ROLE PTT-off wait in arq_responder.cc, which previously open-coded an
 // empty-body busy-spin that hard-deadlocks under the single-thread virtual
-// clock (single-process-sim-refactor.md §5.6(a) / §5.7-B6). Behavior is
-// byte-identical on every production / two-process-paced-sim path (the
+// clock (single-process-sim-refactor.md §5.6(a) / §5.7-B6). Normal completion
+// behavior is unchanged on production / two-process-paced-sim paths (the
 // step-pump hook inside these helpers is null unless -m SIM_INPROC installs
-// it); routing through them only makes those waits step-pumpable.
+// it); a pending process shutdown is the only additional early return.
 void ptt_busy_wait(cl_timer& t, int delay_ms);
 void drain_playback_wait();
 
@@ -70,15 +70,15 @@ void drain_playback_wait();
 // arq_sim_inproc_active() — true iff the -m SIM_INPROC step-pump is installed
 // (i.e. g_sim_inproc_pump != nullptr). On EVERY production path and the
 // two-process paced sim it returns false, so the gated branches below take the
-// verbatim wall-clock body. The pump is installed ONLY by the SIM_INPROC
+// wall-clock body. The pump is installed ONLY by the SIM_INPROC
 // stepper (arq_commander.cc test_sim_inproc), so this is the authoritative
 // "are we the single-thread in-process stepper?" query.
 //
 // pumped_settle_wait(wait_ms) — clock-faithful settle-wait, THREE paths, all
 // sharing the SAME exit predicate (elapsed >= wait_ms); only the clock-advance
 // MECHANISM differs:
-//   (1) Production / HW (sim_clock_enabled()==0): verbatim msleep(wait_ms) —
-//       BYTE-IDENTICAL to the stock wall settle-wait.
+//   (1) Production / HW (sim_clock_enabled()==0): wall-clock slices ending at
+//       the same wait_ms deadline, with shutdown polled between slices.
 //   (2) Two-process paced sim (-x sim, no pump, sim_clock_enabled()==1): a
 //       cl_timer loop on the VIRTUAL clock (sim_spin_sleep() yields to the
 //       concurrent capture/RX-bridge thread that advances the shared
@@ -89,10 +89,10 @@ void drain_playback_wait();
 //       fix/sim-connect-virtual-clock).
 //   (3) SIM_INPROC (pump installed): a cl_timer + step-pump loop, the pump
 //       advancing the shared clock so a peer instance sees time pass.
-// The exit SEMANTICS are unchanged on all three. Used for the B1-B4 / B7/B8
-// turnaround + HAIL-race settle guards. For B7 the CALLER keeps the delay
-// FORMULA verbatim (Bug #55 HAIL reliability); this helper only routes the
-// already-computed wait_ms through the correct clock.
+// Normal exit semantics are unchanged on all three; shutdown may return early.
+// Used for the B1-B4 / B7/B8 turnaround + HAIL-race settle guards. For B7 the
+// caller keeps the delay formula unchanged (Bug #55 HAIL reliability); this
+// helper only routes the already-computed wait_ms through the correct clock.
 //
 // sim_inproc_rx_mute_settle(wait_ms) — gate-off the RX_MUTE drain guard (B5 /
 // ADD-ON1). The msleep there waits for ASYNC AUDIO CALLBACKS to drain before
@@ -108,7 +108,7 @@ void sim_inproc_rx_mute_settle(int wait_ms);
 // SIM_INPROC TCP-poll gate (single-process-sim-refactor.md §10.5). Set true ONLY
 // while the 2-instance stepper runs; makes process_main() skip its TCP control +
 // data poll blocks (the stepper injects commands + data directly). Default false
-// → production + paced sim run the verbatim blocks (byte-identical).
+// → production + paced sim run the normal blocks; control EOF requests shutdown.
 void arq_set_sim_inproc_skip_tcp(bool on);
 bool arq_sim_inproc_skip_tcp();
 

@@ -7041,9 +7041,15 @@ start_modem:
         }
 #endif
 
-        while (!shutdown_)
+        while (true)
         {
+            if (shutdown_)
+                break;
+
             ARQ.process_main();
+
+            if (shutdown_)
+                break;
 
 #ifdef MERCURY_GUI_ENABLED
             if (!nogui) {

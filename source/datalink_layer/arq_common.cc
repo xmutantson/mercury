@@ -35,6 +35,16 @@
 #include <cstring>
 #include <chrono>
 #include <cstdlib>
+#include <atomic>
+
+extern "C" {
+	extern std::atomic<bool> shutdown_;
+}
+
+static inline bool arq_shutdown_requested()
+{
+	return shutdown_.load();
+}
 
 extern "C" {
     extern double noise_snr_db;
@@ -213,8 +223,8 @@ static inline void sim_spin_sleep()
 // the two-process path.
 //
 // Default null. Production (-x wasapi/alsa) and the two-process paced sim
-// never install it, so their spin-loop bodies are BYTE-IDENTICAL to before
-// (sim_spin_sleep() under sim, msleep(1) otherwise).
+// never install it, so their normal wait mechanism remains sim_spin_sleep()
+// under sim and msleep(1) otherwise.
 typedef void (*sim_inproc_pump_fn)(void* ctx);
 static sim_inproc_pump_fn g_sim_inproc_pump = nullptr;
 static void*              g_sim_inproc_pump_ctx = nullptr;
@@ -268,7 +278,7 @@ void arq_set_sim_inproc_drain_only_pump(sim_inproc_pump_fn fn)
 // would syscall on uninit'd sockets (accept(fd=0) → spam + churn). When this flag
 // is set (ONLY while the 2-instance stepper runs) process_main skips the three TCP
 // blocks. Default false → production + the single-instance Stage-2 prototype +
-// the paced sim are byte-identical (the single-instance prototype drives
+// the paced sim run the normal TCP path (the single-instance prototype drives
 // send_batch directly, never process_main, so it does not need this either).
 static bool g_sim_inproc_skip_tcp = false;
 void arq_set_sim_inproc_skip_tcp(bool on) { g_sim_inproc_skip_tcp = on; }
@@ -281,7 +291,7 @@ bool arq_sim_inproc_skip_tcp()            { return g_sim_inproc_skip_tcp; }
 // with this single seam (tx_transfer already queues, audioio.c:1691). Gated SEPARATELY
 // from arq_sim_inproc_active() so the LEGACY pump stepper (still runnable until Phase d)
 // keeps its pump-driven blocking drain. Production + paced sim never set it (false →
-// verbatim blocking body → byte-identical). See data-flow-sim2-ofdm-delivery-cadence.md §10.
+// normal blocking body). See data-flow-sim2-ofdm-delivery-cadence.md §10.
 static bool g_sim_inproc_outer_stepper = false;
 void arq_set_sim_inproc_outer_stepper(bool on) { g_sim_inproc_outer_stepper = on; }
 bool arq_sim_inproc_outer_stepper_active()     { return g_sim_inproc_outer_stepper; }
@@ -349,21 +359,25 @@ static inline bool sim_outer_stepper_ofdm_phase()
 // Single place the step-pump is invoked from inside the spin loops. When no
 // pump is installed this is exactly the prior body: sim_spin_sleep() under the
 // virtual clock, msleep(1) on the production wall-clock path.
-static inline void sim_spin_or_pump(bool sim_clock_on)
+static inline bool sim_spin_or_pump(bool sim_clock_on)
 {
+	if (arq_shutdown_requested())
+		return false;
+
 	if (g_sim_inproc_pump != nullptr)
 		g_sim_inproc_pump(g_sim_inproc_pump_ctx);  // step-pumpable (SIM_INPROC only)
 	else if (sim_clock_on)
 		sim_spin_sleep();                          // two-process paced sim
 	else
 		msleep(1);                                 // production
+
+	return !arq_shutdown_requested();
 }
 
 // NOTE: external linkage (not static) so the SIM_INPROC prototype in
-// arq_commander.cc can drive the EXACT same spin-loop functions the
-// production TX path uses (proving the real helpers are step-pumpable, not a
-// re-implementation). Bodies are unchanged from the prior static versions, so
-// the production path is behaviorally identical.
+// arq_commander.cc can drive the same spin-loop functions the production TX
+// path uses. The wait predicates and sleep durations are unchanged; only a
+// pending shutdown can return early.
 void ptt_busy_wait(cl_timer& t, int delay_ms)
 {
 	// STEPPER-CORE REWRITE Phase b (sim2-stepper-rewrite): under the OUTER-loop stepper,
@@ -376,7 +390,7 @@ void ptt_busy_wait(cl_timer& t, int delay_ms)
 	// in-call wait terminates, while the TX drain is left to the OUTER loop's per-symbol
 	// feed. On the ROBUST/MFSK HANDSHAKE path the gate is FALSE -> the verbatim spin body
 	// runs (legacy co-routine pump), so the peer's HAIL/control-ACK reply is delivered
-	// intra-call. Production + paced sim keep the verbatim spin body (byte-identical).
+	// intra-call. Production + paced sim keep the same spin timing absent shutdown.
 	if (sim_outer_stepper_paces_active())
 	{
 		if (delay_ms > 0)
@@ -387,12 +401,13 @@ void ptt_busy_wait(cl_timer& t, int delay_ms)
 	// EXIT CONDITION UNCHANGED: virtual (or wall) time must pass delay_ms.
 	// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
 	// double-gated on (pump installed) AND (deliver_done) — both false on every
-	// production / paced-sim path, so the loop body is byte-identical there.
+	// production / paced-sim path, so only shutdown can shorten the wait there.
 	while (t.get_elapsed_time_ms() < delay_ms)
 	{
 		if (g_sim_inproc_pump != nullptr && g_sim_inproc_deliver_done)
 			return;
-		sim_spin_or_pump(sim_clock_on);
+		if (!sim_spin_or_pump(sim_clock_on))
+			return;
 	}
 }
 
@@ -416,7 +431,13 @@ void drain_playback_wait()
 	{
 		if (g_sim_inproc_drain_only_pump != nullptr)
 			while (size_buffer(playback_buffer) > 0)
+			{
+				if (arq_shutdown_requested())
+					return;
 				g_sim_inproc_drain_only_pump(g_sim_inproc_pump_ctx);
+				if (arq_shutdown_requested())
+					return;
+			}
 		return;
 	}
 	const bool sim_clock_on = sim_clock_enabled();
@@ -458,12 +479,13 @@ void drain_playback_wait()
 	{
 		// SIM_INPROC-only post-delivery abort (see arq_set_sim_inproc_deliver_done):
 		// double-gated on (pump installed) AND (deliver_done) — both false on every
-		// production / paced-sim path, so the loop body is byte-identical there. Once
+		// production / paced-sim path, so only shutdown can shorten the wait there. Once
 		// the responder holds the full payload there is nothing left to drain that the
 		// outer loop needs, so unwind back to it (it breaks on the delivery predicate).
 		if (g_sim_inproc_pump != nullptr && g_sim_inproc_deliver_done)
 			return;
-		sim_spin_or_pump(sim_clock_on);
+		if (!sim_spin_or_pump(sim_clock_on))
+			return;
 		if (inproc)
 		{
 			size_t occ = size_buffer(playback_buffer);
@@ -495,13 +517,12 @@ bool arq_sim_inproc_active()
 	return g_sim_inproc_pump != nullptr;
 }
 
-// pumped_settle_wait(): virtual-clock-ify a settle-wait WITHOUT changing its
-// exit semantics. THREE clock-faithful paths, all sharing the SAME exit
-// predicate (elapsed >= wait_ms, identical to ptt_busy_wait) — only the
-// clock-advance MECHANISM differs:
-//   (1) Production / HW (sim_clock_enabled()==0): verbatim wall msleep(wait_ms)
-//       — BYTE-IDENTICAL to the stock settle-wait. This is the only resting
-//       state on hardware; nothing else is reachable when sim is disabled.
+// pumped_settle_wait(): virtual-clock-ify a settle-wait. THREE clock-faithful
+// paths share the same normal exit predicate (elapsed >= wait_ms); only the
+// clock-advance mechanism differs. A pending shutdown returns early.
+//   (1) Production / HW (sim_clock_enabled()==0): wall-clock sleep slices ending
+//       at the same wait_ms deadline. This is the only resting state on hardware;
+//       nothing else is reachable when sim is disabled.
 //   (2) Two-process paced sim (-x sim, pump null, sim_clock_enabled()==1):
 //       spin a cl_timer loop on the VIRTUAL clock (sim_spin_sleep() yields to
 //       the concurrent capture-prep / RX-bridge thread, which advances the
@@ -514,7 +535,7 @@ bool arq_sim_inproc_active()
 //   (3) SIM_INPROC single-thread stepper (pump installed): a cl_timer +
 //       step-pump loop — there is no sibling thread, so the pump advances the
 //       shared clock through the SAME rx_transfer accounting.
-// No early exit, no threshold change on any path.
+// No threshold change on any normal path; shutdown is the only early exit.
 void pumped_settle_wait(int wait_ms)
 {
 	if (wait_ms <= 0)
@@ -553,16 +574,32 @@ void pumped_settle_wait(int wait_ms)
 		// the core. Identical exit predicate (elapsed >= wait_ms); the only
 		// change is the clock the wait is measured against now MATCHES the
 		// deadline's clock, immune to host load. Production / HW
-		// (sim_clock_enabled()==0) keep the verbatim wall msleep -> BYTE-IDENTICAL.
+		// (sim_clock_enabled()==0) keep the same wall-clock wait deadline.
 		if (sim_clock_enabled())
 		{
 			cl_timer t;
 			t.start();
 			while (t.get_elapsed_time_ms() < wait_ms)
-				sim_spin_sleep();   // yield to the sibling RX bridge advancing the virtual clock
+				if (!sim_spin_or_pump(true))
+					return;
 			return;
 		}
-		msleep(wait_ms);            // production / HW: verbatim wall sleep
+		// Keep the same wall-clock deadline while polling the shutdown flag.
+		// A bounded slice prevents a non-signal shutdown request from being
+		// hidden inside a multi-second turnaround wait.
+		cl_timer t;
+		t.start();
+		while (t.get_elapsed_time_ms() < wait_ms)
+		{
+			if (arq_shutdown_requested())
+				return;
+			int remaining_ms = wait_ms - t.get_elapsed_time_ms();
+			int sleep_ms = (remaining_ms < 100) ? remaining_ms : 100;
+			if (sleep_ms > 0)
+				msleep(sleep_ms);
+			if (arq_shutdown_requested())
+				return;
+		}
 		return;
 	}
 	// SIM_INPROC: step-pumped wait, same exit predicate as ptt_busy_wait.
@@ -577,7 +614,8 @@ void pumped_settle_wait(int wait_ms)
 		// returned, so this is never consulted off the SIM_INPROC stepper.
 		if (g_sim_inproc_deliver_done)
 			return;
-		sim_spin_or_pump(true);     // pump installed -> advances the shared clock
+		if (!sim_spin_or_pump(true))
+			return;
 	}
 }
 
@@ -592,7 +630,11 @@ void sim_inproc_rx_mute_settle(int wait_ms)
 {
 	if (g_sim_inproc_pump != nullptr)
 		return;                     // no async drainer in-process -> moot, no-op
+	if (arq_shutdown_requested())
+		return;
 	msleep(wait_ms);                // production + paced sim: verbatim
+	if (arq_shutdown_requested())
+		return;
 }
 
 static const int RX_MUTE_GUARD_MS = 50;
@@ -7187,12 +7229,15 @@ void cl_arq_controller::pad_messages_batch_tx(int size)
 
 void cl_arq_controller::process_main()
 {
+	if (arq_shutdown_requested())
+		return;
+
 	std::string command="";
 
 	// §10.5: the 2-instance SIM_INPROC stepper binds NO socket and injects user
 	// commands + data directly (process_user_command + fifo_buffer_*). Skip the
 	// TCP control + data poll blocks in that mode. Default false (gate cleared) →
-	// production + paced sim run the verbatim blocks → byte-identical.
+	// production + paced sim run the normal TCP blocks; control EOF shuts down.
 	if (!arq_sim_inproc_skip_tcp())
 	{
 	if (tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
@@ -7216,12 +7261,12 @@ void cl_arq_controller::process_main()
 		}
 		else if(nBytes_received==0 || (tcp_socket_control.timer.get_elapsed_time_ms()>=tcp_socket_control.timeout_ms && tcp_socket_control.timeout_ms!=INFINITE_))
 		{
-			// Check if client disconnected cleanly (nBytes_received==0)
-			if(nBytes_received==0 && exit_on_disconnect==YES && had_control_connection==YES)
+			if(nBytes_received==0 && had_control_connection==YES)
 			{
 				std::cout<<std::endl;
-				std::cout<<"Control connection closed by client - exiting as requested"<<std::endl;
-				exit(0);
+				std::cout<<"Control connection closed by client - shutting down"<<std::endl;
+				shutdown_.store(true);
+				return;
 			}
 
 			fifo_buffer_tx.flush();
@@ -7409,6 +7454,9 @@ void cl_arq_controller::process_main()
 	}
 	}  // §10.5: end of the (skippable) TCP control + data poll blocks
 
+	if (arq_shutdown_requested())
+		return;
+
 	// Signal measurement when idle: measure_signal_only() uses FIR_rx_time_sync,
 	// the same filter that receive_byte() uses for preamble detection. Running both
 	// on the same iteration corrupts the FIR delay line state, making Schmidl-Cox
@@ -7482,6 +7530,8 @@ void cl_arq_controller::process_main()
 	}
 
 	process_messages();
+	if (arq_shutdown_requested())
+		return;
 	// ARQ main-loop pacing floor. In production this 2 ms sleep caps the poll
 	// rate at ~500 Hz (plenty for a real radio's frame cadence). Under -x sim
 	// it would throttle the whole control loop to wall-clock 500 Hz and erase
@@ -7495,7 +7545,7 @@ void cl_arq_controller::process_main()
 	// SIM_INPROC inline stepper ADVANCES the shared virtual clock here too
 	// (a bare sim_spin_sleep() is a 200us WALL sleep that would freeze a peer
 	// instance's clock view). When no pump is installed (the two-process paced
-	// sim) sim_spin_or_pump(true) IS sim_spin_sleep() — byte-identical. The
+	// sim) sim_spin_or_pump(true) uses the same sim_spin_sleep() cadence. The
 	// production (sim disabled) branch is the verbatim usleep(2000).
 	//
 	// STEPPER-CORE REWRITE Phase b: under the OUTER-loop stepper, in the OFDM DATA PHASE the
@@ -7506,13 +7556,23 @@ void cl_arq_controller::process_main()
 	// the narrower in-data-batch-tx scope, which the send_batch RAII already cleared by here),
 	// so the whole OFDM data phase routes clock+delivery through the outer loop. The MFSK ACK
 	// patterns deliver via their OWN drain (legacy pump). On the ROBUST/MFSK HANDSHAKE the gate
-	// is FALSE -> the legacy pump runs. Paced sim + production are byte-identical.
+	// is FALSE -> the legacy pump runs. Paced sim + production timing is unchanged
+	// unless shutdown is pending.
 	if (sim_outer_stepper_ofdm_phase())
 		;  // OFDM data phase: outer loop owns clock + delivery; no in-process_main pump
 	else if (sim_clock_enabled())
-		sim_spin_or_pump(true);
+	{
+		if (!sim_spin_or_pump(true))
+			return;
+	}
 	else
+	{
+		if (arq_shutdown_requested())
+			return;
 		usleep(2000);
+		if (arq_shutdown_requested())
+			return;
+	}
 }
 
 void cl_arq_controller::process_user_command(std::string command)
