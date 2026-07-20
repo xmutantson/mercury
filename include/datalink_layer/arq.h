@@ -658,6 +658,10 @@ public:
   void arm_control_turnaround_guard();
   int  test_turnaround_guard();
   int  test_measured_timers();  // R6 SRTT/RTTVAR estimator + ack-timeout invariant regression
+  // Live production-poll exercise for the recovery-only older-phase capture.
+  // A complete ACK lives in retained ring history while the newest tail is
+  // silent. Bare monitor returns false; the recovery capture port accepts 1/1.
+  int  test_recovery_ack_capture_exercise();
   // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
   // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
   // opts into the robust noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST
@@ -2813,6 +2817,9 @@ public:
   // (MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1, same binary): Nofdm drifts 292->310.
   // data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc.
   int test_inband_adopt_nofdm_invariant();
+  // Harvest regression: drive the production down-decoder builder with only the
+  // primary's startup GI patched, then require CONFIG_0 geometry to match it.
+  int test_harvest_inband_cfg0_geometry();
   // §21 CONFIG_0-START robust-floor OVER-SEAT (CLI --test-inband-config0-start-ring): the uncovered
   // sibling of FIX #1e. A session that STARTS at CONFIG_0 (no robust->OFDM adopt) never latches
   // inband_ofdm_acq_ring_shrunk, so inband_seat_robust_ring_floor over-grows the natural OFDM ring
@@ -2821,6 +2828,11 @@ public:
   // binary): ring balloons to the robust floor + tail preamble beyond upper_bound.
   // data-flow-robust-ofdm-adopt-flush.md §21.
   int test_inband_config0_start_ring();
+  // §22: the scoped down-ladder decoder bank inherits the PRIMARY's startup-patched ofdm_gi
+  // so each rung builds at the production geometry (CONFIG_0 Nofdm=292), not the ctor 54/256
+  // (Nofdm=310). PASS-AFTER: inherited -> 292. FAIL-BEFORE (MERCURY_INBAND_GI_INHERIT_DEFEAT=1,
+  // same binary): ctor gi -> 310. data-flow-robust-ofdm-adopt-flush.md §22.
+  int test_inband_down_decoder_gi_inherit();
   // CONFIG_0 clean-lock CRC-fail ROOT: descrambler survives the inband ring-shrink
   // (set_size realloc wiped bit_energy_dispersal_sequence). data-flow-robust-ofdm-adopt-flush.md §17.
   int test_inband_descrambler_survives_ring_shrink();
@@ -3019,6 +3031,16 @@ public:
   // Returns 0=PASS, 1=FAIL. Default builds never call this.
   // See fact-documents/data-flow-data-ack-sack-correlator.md §7.
   int test_data_ack_multiwindow();
+
+  // recovery-ack-capture LEVER 1 focused deterministic capture-window test
+  // (CLI --test-recovery-ack-capture). Constructs the measured HW mis-phase
+  // (a recovery-ACK at a LATE ring phase abutting the right tail edge, and an
+  // unwritten exact-zero ring head) and asserts: fail-before the newest-tail
+  // snapshot scores the truncated/absent buffer (present-run ~3, matched<7);
+  // pass-after the multi-window look-back finds the FULL block at an older
+  // phase (present-run ~16, matched>=7) and the ring-fill gate rejects an
+  // unwritten head. data-flow-recovery-ack-capture.md §7. Returns 0=PASS.
+  int test_recovery_ack_capture();
 
   // D3.1 (data-integrity) — UNIFIED in-order-delivery across EVERY demote case.
   // In-process SIM_INPROC synthetic-fire (CLI --test-inorder-demote). Drives the
@@ -4785,6 +4807,18 @@ public:
   int  inband_session_dead_limit();
   // Tear down the scoped down-window bank (NB/WB switch or session reset).
   void inband_free_down_decoders();
+  // ROOT-CAUSE FIX (data-flow-robust-ofdm-adopt-flush.md §22): copy the PRIMARY
+  // telecom_system's default_configurations_telecom_system (the startup-patched PHY
+  // defaults: ofdm_gi / ofdm_Nfft / FIR cutoffs / ldpc_nIteration_max / carrier_frequency,
+  // installed at main.cc:3547/3651/4825/4896) into a freshly-constructed decoder instance
+  // BEFORE its load_configuration. Without this a fresh cl_telecom_system carries the
+  // physical_config.cc:37 ctor default gi=54/256 -> CONFIG_0 Nofdm = Nfft+round(gi*Nfft)
+  // = 310 (not the production 292), an 18-sample/symbol FFT-window stride error that
+  // pushes post-EQ variance over the SKIP-VAR threshold and skips LDPC (iter=-1) -> 0%
+  // block_success at WB CONFIG_0 -> the robust->OFDM cross never sustains. Idempotent;
+  // safe no-op when telecom_system==NULL. The load_configuration the caller runs next
+  // re-derives the per-config modulation/rate from these inherited defaults.
+  void inband_inherit_phy_defaults(cl_telecom_system* fresh);
   // RANK-1 FIX (data-flow-inband-ondemote-zerobyte.md §2.4/§7): the buffer_Nsymb the
   // down-window decoder BANK uses for the CURRENT RX config = the largest (most-robust)
   // config in the window [cur-D..cur]. The captured snapshot is sized to THIS (not the

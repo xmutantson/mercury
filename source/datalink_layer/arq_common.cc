@@ -161,6 +161,148 @@ static inline int rx_eff_preamble_geom(int rx_eff, int full, bool amort_on)
 	return rx_eff;
 }
 
+// ---------------------------------------------------------------------------
+// recovery-ack-fine (STAGE 1) — enable the EXISTING detect_ack_pattern fine
+// sub-window timing pass for the recovery control-ACK poll only.
+//
+// ROOT CAUSE (HW-confirmed, data-flow-ack-detector.md §2): the recovery
+// control-ACK 16-symbol block straddles the detection window in time → whole-
+// block energy collapse → coarse matched 1-6/16 (~90% miss). The production
+// recovery poll runs detect_ack_pattern with always_fine=FALSE, so a straddled
+// record that sits at matched<=5 NEVER runs the fine pass that could re-align
+// it. The BREAK one-shot already uses always_fine=true for the identical
+// problem (telecom_system.cc detect_break_pattern_from_passband). This lever
+// extends that fine pass to the recovery poll, scoped to RECEIVING_ACKS_CONTROL.
+//
+// HARDENING (MANDATORY): the recovery control-ACK accepts at the WEAK
+// matched>=7/16 + metric>=0.5 with NO CRC gate; the fine pass adds ~311 sub-
+// window MAX draws → a false control-ACK commits a wrong-config recovery (a
+// config drop). The hardened accept therefore requires, in the recovery-fine
+// branch ONLY: (a) a coarse_metric pre-gate that rejects OFDM-alias/noise
+// (mirror the BREAK detector's coarse_metric<0.30 class gate — a strong
+// Schmidl-Cox OFDM correlation present means a competing alias the sub-window
+// MAX could latch); (b) a RAISED accept bar — BREAK-grade matched OR a metric
+// well above the inert 0.5. A REAL fine-recovered straddle hits ~16/16 (the HW
+// hits are perfect 16/16), so a high bar accepts real recoveries while rejecting
+// 7/16 noise. data-ACK / CONNECT / SACK / BREAK accept bars are UNCHANGED.
+//
+// DEFAULT-OFF + BYTE-IDENTICAL: MERCURY_RECOVERY_ACK_FINE unset → recovery_fine
+// is false for every caller → detect_ack_pattern_from_passband's use_fine stays
+// false → the verbatim integer no-fine path → byte-identical. Cached once — no
+// getenv() in the ACK poll hot loop.
+static inline bool recovery_ack_fine_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_FINE");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+// Relaxed-accept bar for the recovery-fine branch (LEVER 2, data-flow-recovery-
+// ack-capture.md §6). The STAGE-1 deployed hardened bar (matched>=12 OR
+// metric>=3.0) was FALSIFIED on the 51 REAL HW buffers (RECOVACK_FINE_VERDICT.json:
+// recovered 1/47 = 2.1%, live ON delivered ZERO bytes) — a ~1-symbol fine nudge
+// from a ~4/16 straddle cannot reach 12/16. The forensics-derived replacement is a
+// TWO-ARM accept on the (fine) detector output, validated on the 51-buffer offline
+// rescore to recover seq25/26/27/49 (4/47 = 8.5%, the honest detector-only ceiling)
+// with ZERO false-accepts (the 15 SILENT-ABSENT and the 6 metric~0.55 noise reaches
+// all stay rejected; the 3 HITs stay accepted):
+//   ARM-A: matched >= RECOVERY_ACK_FINE_MINMATCH(7)  && metric >= MINMETRIC(1.5)
+//   ARM-B: matched >= RECOVERY_ACK_FINE_MINMATCH_HI(5) && metric >= MINMETRIC_HI(3.0)
+// ARM-A re-accepts the genuine straddle-recovered blocks (matched back to 7-8/16
+// with a real-signal metric well over the 0.5 inert noise floor); ARM-B catches the
+// strong-metric / fewer-matched class (seq49: 5/16 @ metric 3.23 — a clean correlator
+// peak the per-symbol count under-reports). Both arms also require the UNCHANGED
+// coarse_metric<0.30 OFDM-alias class gate (mirrors the BREAK detector) AND the
+// UNCHANGED base 7/16+0.5 accept (this bar can only ADD requirements, never lower the
+// base). Env-tunable for FAR-ceiling sweeps; defaults are the FAR-clean forensics
+// values. NOT a bare matched>=7 (that admits the noise reaches — both arms gate metric).
+static inline int recovery_ack_fine_minmatch()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_FINE_MINMATCH");
+		cached = (e && *e) ? atoi(e) : 7;
+		if(cached < 0) cached = 7;
+	}
+	return cached;
+}
+static inline double recovery_ack_fine_minmetric()
+{
+	static double cached = -1.0;
+	if(cached < 0.0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_FINE_MINMETRIC");
+		cached = (e && *e) ? atof(e) : 1.5;
+		if(cached < 0.0) cached = 1.5;
+	}
+	return cached;
+}
+// ARM-B: the strong-metric / fewer-matched fallback. A clean correlator peak
+// (metric well over the 0.5 noise floor) the per-symbol count under-reports — the
+// metric is the FAR discriminator, the >=5 match floor keeps pure noise (random ~2/16
+// mean) out. Validated: catches seq49 (5/16 @ 3.23), rejects all noise (seq13 5/16 @
+// 2.25 < 3.0; the 6 metric~0.55 reaches are far below). Env-tunable.
+static inline int recovery_ack_fine_minmatch_hi()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_FINE_MINMATCH_HI");
+		cached = (e && *e) ? atoi(e) : 5;
+		if(cached < 0) cached = 5;
+	}
+	return cached;
+}
+static inline double recovery_ack_fine_minmetric_hi()
+{
+	static double cached = -1.0;
+	if(cached < 0.0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_FINE_MINMETRIC_HI");
+		cached = (e && *e) ? atof(e) : 3.0;
+		if(cached < 0.0) cached = 3.0;
+	}
+	return cached;
+}
+static const double RECOVERY_ACK_FINE_COARSE_REJECT = 0.30;
+
+// ---------------------------------------------------------------------------
+// recovery-ack-capture LEVER 1 (ROOT, ~93% of misses) — re-phase + multi-window
+// + ring-fill on the recovery control-ACK poll (data-flow-recovery-ack-capture.md
+// §0/§5/§6). HW forensics (51 REAL I/Q buffers, RECOVACK_FINE_VERDICT.json) proved
+// the recovery-ACK miss is CAPTURE-WINDOW MIS-PLACEMENT, not a detector defect: the
+// 16-symbol block arrives LATE / scrolled out of the snapshot / BEFORE ring-fill, so
+// the deployed detector scores a buffer that does NOT contain the block (47 misses =
+// 32% SILENT-ABSENT unwritten-head + 68% LATE-TRUNCATED right-edge). SAME root as the
+// turnaround starvation: the CMD recovery listen/capture window has NO term ∝ forward
+// batch airtime, so the reverse ACK accrues one-sidedly late. A1
+// (MERCURY_TURNAROUND_REPHASE) does NOT cover this poll (it is CONFIG_15-gated; the
+// recovery control runs on ROBUST_0/CONFIG_0) and A2 (MERCURY_DATA_ACK_MULTIWINDOW)
+// does NOT cover it (its mw_scan is START_CONNECTION-only). This lever closes the gap,
+// scoped to connection_status==RECEIVING_ACKS_CONTROL.
+//
+// REVERSE-ACK-ONLY (the simturncal crash constraint, §5): all three sub-levers are
+// CMD reverse-ACK RX-side only — (a) widens the CMD's own RX listen window, (b) reads
+// OLDER phases of the RX capture ring, (c) waits for the RX ring to fill. NONE enters
+// any TX path or re-times a forward OFDM symbol → the forward batch stays BIT-EXACT.
+//
+// DEFAULT-OFF + BYTE-IDENTICAL: MERCURY_RECOVERY_ACK_REPHASE unset → all three
+// sub-levers are skipped → byte-identical. Cached once — no getenv in the poll loop.
+static inline bool recovery_ack_rephase_enabled_common()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_RECOVERY_ACK_REPHASE");
+		cached = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
@@ -2098,6 +2240,29 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// are single-digit seconds; this is defensive against a runaway estimate.
 			if(timeout > 60000) timeout = 60000;
 
+			// recovery-ack-capture LEVER 1(a) RECOVERY-ACK RE-PHASE (data-flow-recovery-ack-
+			// capture.md §0/§6). The BREAK/SET_CONFIG recovery control-ACK poll
+			// (connection_status==RECEIVING_ACKS_CONTROL) has the SAME root mis-phase as the
+			// data-ACK turnaround above — but the A1 adder is CONFIG_15-gated and the recovery
+			// control runs on ROBUST_0/CONFIG_0, so A1 contributes 0 here (audit §4). HW
+			// forensics (47/47 miss buffers contain no full block; the block clusters at the
+			// RIGHT tail edge ~10/16 symbols in) show the reverse recovery-ACK arrives
+			// systematically LATE and slides out of the snapshot. The recovery control batch is
+			// SHORT + fixed, so the late shift is near-FIXED (not batch-airtime-proportional):
+			// re-center the window LATER by one recovery-ACK block airtime (ack_pattern_time_ms,
+			// the span the late block must land within) + a small variance guard, BOUNDED. This
+			// is REVERSE-ACK-ONLY: it only widens the CMD's own RX listen window, never a forward
+			// TX/decode path (§5). DEFAULT-OFF (recovery_ack_rephase_enabled_common); UNSET =>
+			// adder 0 => BYTE-IDENTICAL recovery window.
+			int recovery_rephase_adder = 0;
+			if(recovery_ack_rephase_enabled_common()
+			   && connection_status == RECEIVING_ACKS_CONTROL)
+			{
+				recovery_rephase_adder = ack_pattern_time_ms + RECOVERY_ACK_REPHASE_GUARD_MS;
+				if(recovery_rephase_adder > RECOVERY_ACK_REPHASE_MAX_MS)
+					recovery_rephase_adder = RECOVERY_ACK_REPHASE_MAX_MS;
+				timeout += recovery_rephase_adder;
+			}
 			// During turboshift, RSP calls load_configuration() on every probe,
 			// adding ~200-500ms overhead. Extend receive window to prevent
 			// premature timeout before ACK arrives.
@@ -2107,11 +2272,12 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
-			printf("[CMD-POST-TX-CALIB] timeout=%dms geom_floor=%d (frame_drain=%d + sack_arrival=%d: ptt_off=%d rsp_decode=%d pattern=%d ptt_on=%d) est(cls=%d bk=%d n=%d srtt=%d rttvar=%d K=%d floor=%d) defeat=%d extra=%d batch=%d sack=%d\n",
+			printf("[CMD-POST-TX-CALIB] timeout=%dms geom_floor=%d (frame_drain=%d + sack_arrival=%d: ptt_off=%d rsp_decode=%d pattern=%d ptt_on=%d) est(cls=%d bk=%d n=%d srtt=%d rttvar=%d K=%d floor=%d) defeat=%d extra=%d recov_rephase=%d batch=%d sack=%d\n",
 				timeout, geometric_floor, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
 				tt_cls, tt_bk, tt_e.n, tt_e.srtt_ms, tt_e.rttvar_ms, tt_K, tt_floor,
 				(int)tt_defeat, sack_enabled ? sack_timeout_extra_ms : 0,
+				recovery_rephase_adder,
 				data_batch_size, sack_enabled ? 1 : 0);
 			fflush(stdout);
 			// LINK-PHASE STEP 2 (c-CMD): the derived block-boundary ACK_SLOT break-floor. The
@@ -2583,6 +2749,7 @@ void cl_arq_controller::init_monitor_decoders()
 	{
 		cl_telecom_system tmp;
 		tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+		inband_inherit_phy_defaults(&tmp);   // §22: probe CONFIG_0 size at the primary's gi (Nofdm=292)
 		tmp.load_configuration(CONFIG_0);
 		monitor_primary_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
 		printf("[MONITOR] CONFIG_0 buffer_Nsymb = %d (used as minimum for all decoders)\n",
@@ -2594,6 +2761,9 @@ void cl_arq_controller::init_monitor_decoders()
 	{
 		monitor_decoders[cfg] = new cl_telecom_system();
 		monitor_decoders[cfg]->narrowband_enabled = telecom_system->narrowband_enabled;
+		// §22: inherit the primary's startup-patched PHY defaults (gi etc.) so each monitor
+		// decoder builds its config at the production geometry, not the ctor 54/256 gi.
+		inband_inherit_phy_defaults(monitor_decoders[cfg]);
 		// Force all decoders to use the largest buffer size so they can all
 		// process the same audio snapshot (CONFIG_0 has the most symbols).
 		monitor_decoders[cfg]->data_container.buffer_Nsymb_min = monitor_primary_buffer_nsymb;
@@ -2638,6 +2808,7 @@ void cl_arq_controller::reinit_monitor_decoders()
 	{
 		cl_telecom_system tmp;
 		tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+		inband_inherit_phy_defaults(&tmp);   // §22: probe CONFIG_0 size at the primary's gi (Nofdm=292)
 		tmp.load_configuration(CONFIG_0);
 		monitor_primary_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
 		printf("[MONITOR] CONFIG_0 buffer_Nsymb = %d (new bandwidth)\n",
@@ -2649,6 +2820,7 @@ void cl_arq_controller::reinit_monitor_decoders()
 	{
 		monitor_decoders[cfg] = new cl_telecom_system();
 		monitor_decoders[cfg]->narrowband_enabled = telecom_system->narrowband_enabled;
+		inband_inherit_phy_defaults(monitor_decoders[cfg]);  // §22: production gi, not ctor 54/256
 		monitor_decoders[cfg]->data_container.buffer_Nsymb_min = monitor_primary_buffer_nsymb;
 		monitor_decoders[cfg]->load_configuration(cfg);
 		printf("[MONITOR] Decoder CONFIG_%d ready (Nsymb=%d buffer_Nsymb=%d)\n",
@@ -4872,6 +5044,7 @@ int cl_arq_controller::inband_down_window_buffer_nsymb()
 	inband_floor_probe_count++;              // TEST diagnostic: a real throwaway PHY probe ran
 	cl_telecom_system tmp;
 	tmp.narrowband_enabled = nb;
+	inband_inherit_phy_defaults(&tmp);       // §22: size the window at the primary's gi (Nofdm=292)
 	tmp.load_configuration(low_cfg);
 	int n = tmp.data_container.buffer_Nsymb.load();
 	inband_down_window_nsymb_cached    = n;  // memo (constant for this lo_idx + bandwidth)
@@ -4906,6 +5079,7 @@ int cl_arq_controller::inband_robust_floor_buffer_nsymb()
 	inband_floor_probe_count++;              // TEST diagnostic: a real throwaway PHY probe ran
 	cl_telecom_system tmp;
 	tmp.narrowband_enabled = nb;
+	inband_inherit_phy_defaults(&tmp);       // §22: size the robust floor at the primary's gi
 	tmp.load_configuration(floor_cfg);
 	int n = tmp.data_container.buffer_Nsymb.load();
 	inband_robust_floor_nsymb_cached   = n;  // memo (constant for this bandwidth)
@@ -4926,6 +5100,7 @@ int cl_arq_controller::inband_natural_ofdm_buffer_nsymb(int ofdm_cfg)
 	if(!is_ofdm_config(ofdm_cfg)) return 0;
 	cl_telecom_system tmp;                    // buffer_Nsymb_min defaults to 0 -> natural sizing
 	tmp.narrowband_enabled = telecom_system->narrowband_enabled;
+	inband_inherit_phy_defaults(&tmp);        // §22: natural OFDM size at the primary's gi (Nofdm=292)
 	tmp.load_configuration(ofdm_cfg);
 	return tmp.data_container.buffer_Nsymb.load();   // tmp destructs here
 }
@@ -5200,6 +5375,36 @@ void cl_arq_controller::inband_free_down_decoders()
 	inband_down_buffer_nsymb = 0;
 }
 
+// ROOT-CAUSE FIX (data-flow-robust-ofdm-adopt-flush.md §22): inherit the PRIMARY's
+// startup-patched PHY defaults into a freshly-constructed cl_telecom_system BEFORE its
+// load_configuration. main.cc patches the PRIMARY telecom_system's
+// default_configurations_telecom_system at startup (ofdm_gi at :4896 = Ngi/256 e.g. 36/256
+// for the production 3.0 ms GI; also ofdm_Nfft/FIR/ldpc_nIteration_max/carrier_frequency).
+// A fresh `new cl_telecom_system()` / stack `cl_telecom_system tmp` instead carries the
+// physical_config.cc:37 CTOR default ofdm_gi=54/256. load_configuration reads ofdm.gi
+// straight from this struct (telecom_system.cc:11037) and init() computes
+// Nofdm = Nfft + round(gi*Nfft) (telecom_system.cc:7206-7208), so an un-inherited CONFIG_0
+// decoder builds at Nofdm=310 instead of 292 -> an 18-sample/symbol FFT-window stride error
+// across the frame -> post-EQ variance blows past the SKIP-VAR threshold -> LDPC skipped
+// (iter=-1) -> 0% block_success at WB CONFIG_0 -> the in-band robust->OFDM cross never
+// sustains and the link never climbs past the ROBUST floor. Copying the whole struct (a
+// trivially-copyable POD aside from one std::string) captures every startup patch in one
+// place so no future fresh-instance site can silently drift. No-op when no primary exists
+// (the standalone --test path that constructs its own telecom_system pre-sets gi itself).
+void cl_arq_controller::inband_inherit_phy_defaults(cl_telecom_system* fresh)
+{
+	if(fresh == NULL || telecom_system == NULL) return;
+	// FAIL-BEFORE / A-B knob (§22 regression): MERCURY_INBAND_GI_INHERIT_DEFEAT=1 makes
+	// this a no-op on the SAME binary, restoring the pre-fix behavior where a fresh decoder
+	// keeps the physical_config.cc:37 ctor gi=54/256 -> CONFIG_0 Nofdm=310. The directed
+	// test (test_inband_down_decoder_gi_inherit) asserts the 310 reproduces under it and 292
+	// without it. Production never sets it -> default = the fix is active.
+	const char* defeat = std::getenv("MERCURY_INBAND_GI_INHERIT_DEFEAT");
+	if(defeat && atoi(defeat) != 0) return;
+	fresh->default_configurations_telecom_system =
+		telecom_system->default_configurations_telecom_system;
+}
+
 // Lazily (re)build the scoped down-window decoder bank for FULL_CONFIG_LADDER[lo..hi].
 // AT MOST INBAND_DOWN_D_MAX+1 decoders — never the full NUMBER_OF_CONFIGS bank
 // (the RPi bound, INV-S4-2). Slot i holds FULL_CONFIG_LADDER[lo+i]; rebuilt only
@@ -5244,6 +5449,7 @@ int cl_arq_controller::inband_ensure_down_decoders(int lo_idx, int hi_idx)
 		inband_floor_probe_count++;          // TEST diagnostic: a real throwaway PHY probe ran
 		cl_telecom_system tmp;
 		tmp.narrowband_enabled = nb;
+		inband_inherit_phy_defaults(&tmp);   // §22: probe the bank size at the primary's gi
 		tmp.load_configuration(low_cfg);
 		want_buffer_nsymb = tmp.data_container.buffer_Nsymb.load();
 		inband_ensure_bank_nsymb_cached    = want_buffer_nsymb;  // memo (constant for lo_idx + nb)
@@ -5270,6 +5476,9 @@ int cl_arq_controller::inband_ensure_down_decoders(int lo_idx, int hi_idx)
 		}
 		inband_down_decoders[i] = new cl_telecom_system();
 		inband_down_decoders[i]->narrowband_enabled = telecom_system->narrowband_enabled;
+		// ROOT-CAUSE FIX (§22): inherit the primary's startup-patched PHY defaults (gi etc.)
+		// so this decoder builds CONFIG_0 at the production Nofdm=292, not the ctor 310.
+		inband_inherit_phy_defaults(inband_down_decoders[i]);
 		// Force the common (largest-in-window) buffer so every decoder can process the
 		// same snapshot, exactly as the monitor bank does (arq_common.cc:1762).
 		inband_down_decoders[i]->data_container.buffer_Nsymb_min = inband_down_buffer_nsymb;
@@ -14688,6 +14897,16 @@ bool cl_arq_controller::mw_find_ack_sack_phase(int rwi, int tail_offset,
 bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
                                             bool multiwindow_scan)
 {
+	// recovery-ack-capture LEVER 1(b) (data-flow-recovery-ack-capture.md §6): arm the
+	// EXISTING multi-window look-back for the recovery control-ACK poll under the env
+	// flag, so a late recovery-ACK that scrolled out of the newest tail is still found
+	// at an older retained ring phase (~1301 sym). This is the A2 mechanism applied to
+	// the recovery poll (which A2's START_CONNECTION-only mw_scan did not cover, audit
+	// §4). DEFAULT-OFF (recovery_ack_rephase_enabled_common); UNSET => mw_scan_eff ==
+	// multiwindow_scan (the caller flag) => byte-identical. RX-only ring read (§5).
+	bool multiwindow_scan_eff = multiwindow_scan
+		|| (recovery_ack_rephase_enabled_common()
+		    && this->connection_status == RECEIVING_ACKS_CONTROL);
 	// Tail must cover the entire fresh audio region (= initial guard).
 	// Tail = pattern length + margin + SNR suffix. Ensures ACKs arriving early are captured.
 	// Tail must be large enough that even if the ACK is detected late in the buffer,
@@ -14851,10 +15070,18 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 		// The double-mapped ring (passband_delayed_data sized 2*signal_period,
 		// data_container.cc:170) makes [rwi + off] for off in [0, tail_offset] a
 		// contiguous, in-bounds tail via the mirror copy.
-		if(multiwindow_scan && tail_offset > 0)
+		if(multiwindow_scan_eff && tail_offset > 0)
 		{
 			const int rwi_mw = telecom_system->data_container.ring_write_index;
 			const double MW_GATE_RMS = 0.001; // == ACK_ENERGY_GATE_RMS below
+			// recovery-ack-capture LEVER 1(b): on the recovery control-ACK poll use the
+			// fine pass for the older-phase correlator (consistent with the recovery-fine
+			// body accept); the CONNECT/DATA-ACK callers keep the plain (no-fine) gate ->
+			// byte-identical. The phase gate stays the base 7/16+0.5 (find an energetic
+			// phase); the body's UNCHANGED accept (recovery-fine two-arm or base) makes
+			// the FINAL decision on the chosen phase.
+			bool mw_recovery_fine = recovery_ack_fine_enabled_common()
+				&& this->connection_status == RECEIVING_ACKS_CONTROL;
 			// Stride one ACK-pattern length per phase so consecutive search
 			// windows overlap by the full search range (no ACK can fall entirely
 			// between two phases). Bound the number of older phases to the ACK
@@ -14884,7 +15111,7 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 				int mw_matched = 0; uint32_t mw_mask = 0;
 				double mw_metric = telecom_system->detect_ack_pattern_from_passband(
 					telecom_system->data_container.ready_to_process_passband_delayed_data,
-					tail_samples, &mw_matched, &mw_mask);
+					tail_samples, &mw_matched, &mw_mask, /*use_fine=*/mw_recovery_fine);
 				if(mw_matched >= telecom_system->ack_mfsk.ack_match_threshold
 				   && mw_metric >= ack_metric_threshold)
 				{
@@ -14949,6 +15176,50 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 		{
 			mtl::log_event_kv("cmd_ack_buffer_energy", "rms=%.4f", tail_rms);
 			energy_logged_this_window = true;
+		}
+		// recovery-ack-capture LEVER 1(c) RING-FILL GATE (data-flow-recovery-ack-
+		// capture.md). The 32% SILENT-ABSENT miss class is an UNWRITTEN-ring head --
+		// the recovery poll snapshotted the ring BEFORE the capture-prep thread filled
+		// the tail with the late-arriving ACK, so the head sits at the exact-zero
+		// default-init (memset, data_container.cc:171). Scoring an unwritten ring burns
+		// the poll on a buffer that CANNOT contain the block (these are ONLY fixable
+		// here -- multi-window finds nothing in an all-zero ring). On the recovery poll,
+		// if the snapshot HEAD is exact-zero (unwritten) AND no older phase was chosen
+		// (mw_hit false), DEFER (re-poll) so the prep thread can fill -- instead of
+		// consuming the silent buffer and letting the window expire on a not-yet-arrived
+		// ACK. Bounded by the receiving_timeout the re-phase (1a) widened. DEFAULT-OFF /
+		// RX-only: gated by the env flag + connection_status; UNSET => recovery_ring_
+		// unfilled stays false => the verbatim energy gate => byte-identical.
+		bool recovery_ring_unfilled = false;
+		if(recovery_ack_rephase_enabled_common()
+		   && this->connection_status == RECEIVING_ACKS_CONTROL
+		   && !mw_hit)
+		{
+			// Exact-zero head: a written-but-silent tail carries rx noise (RMS ~0.0002,
+			// never bit-exact 0.0); an UNWRITTEN head is bit-exact 0.0. Probe the FIRST
+			// few (oldest) symbols -- the region the prep thread fills LAST. Strict
+			// |x|==0 so a genuinely silent (written) ring is NOT deferred.
+			int head_n = 4 * sym_samples;
+			if(head_n > tail_samples) head_n = tail_samples;
+			const double* head_ptr =
+				telecom_system->data_container.ready_to_process_passband_delayed_data;
+			bool any_nonzero = false;
+			for(int i = 0; i < head_n; i++)
+				if(head_ptr[i] != 0.0) { any_nonzero = true; break; }
+			recovery_ring_unfilled = !any_nonzero;
+		}
+		if(recovery_ring_unfilled)
+		{
+			// Unwritten ring head -- DEFER (re-poll) so the prep thread can fill the late
+			// ACK before the (re-phased) window expires. Same defer mechanics as the
+			// silent-buffer path below (ftr=2; return false), so a true never-arriving
+			// ACK still escalates when the window expires.
+			ack_diag_poll_count++;
+			MUTEX_LOCK(&capture_prep_mutex);
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			return false;
 		}
 		if(!mw_hit && tail_rms < ACK_ENERGY_GATE_RMS)
 		{
@@ -15093,6 +15364,14 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 		{
 			// Normal mode: just detect ACK pattern
 			uint32_t this_mask = 0;
+			// recovery-ack-fine (STAGE 1): run the detect_ack_pattern fine
+			// sub-window timing pass ONLY for the recovery control-ACK poll
+			// (RECEIVING_ACKS_CONTROL) with the env knob set. The DATA-ACK
+			// (RECEIVING_ACKS_DATA) and BREAK callers keep recovery_fine=false →
+			// use_fine stays false → byte-identical no-fine path. Default-off →
+			// byte-identical for ALL callers.
+			bool recovery_fine = recovery_ack_fine_enabled_common()
+				&& this->connection_status == RECEIVING_ACKS_CONTROL;
 			// Phase D timing — instrument ACK FFT CPU cost. The
 			// detect_ack_pattern_from_passband call runs ~528 FFTs on the M=16
 			// MFSK pattern. Compare cumulative FFT CPU to the 774ms ACK dwell
@@ -15100,7 +15379,7 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			long long _fft_t0_ms = mtl::now_ms();
 			double metric = telecom_system->detect_ack_pattern_from_passband(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
-				tail_samples, &matched_count, &this_mask);
+				tail_samples, &matched_count, &this_mask, /*use_fine=*/recovery_fine);
 			mtl::log_event_kv("cmd_ack_fft", "cpu_ms=%lld matched=%d metric=%.2f",
 				mtl::now_ms() - _fft_t0_ms, matched_count, metric);
 
@@ -15113,11 +15392,49 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			if(metric > ack_diag_peak_metric) ack_diag_peak_metric = metric;
 			ack_diag_poll_count++;
 
-			// Metric threshold: For WB M=16, matched>=8/16 has P(false)~5.6e-5/pos.
+			// Base accept: For WB M=16, matched>=8/16 has P(false)~5.6e-5/pos.
 			// Random noise has metric≈8/Nc=0.16 at 8 matches. metric>=0.5 rejects
 			// noise while accepting marginal signals (was 3.0, caused ~50% timeouts).
 			// Phase-2: --ack-metric-threshold=F overrides.
-			if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold && metric >= ack_metric_threshold)
+			bool base_accept = (matched_count >= telecom_system->ack_mfsk.ack_match_threshold
+			                    && metric >= ack_metric_threshold);
+			// recovery-ack-capture LEVER 2 RELAXED accept (data-flow-recovery-ack-
+			// capture.md §6): when the fine pass is engaged on the recovery control-ACK
+			// poll, the weak 7/16 + 0.5 base bar is NOT enough (the ~311 sub-window MAX
+			// draws can latch noise / an OFDM alias on a NO-CRC accept → wrong-config
+			// recovery → config drop). The STAGE-1 hardened bar (matched>=12 OR
+			// metric>=3.0) was FALSIFIED on the 51 REAL HW buffers (2.1% recovery, live
+			// ZERO bytes); it is REPLACED here by the forensics-derived two-arm bar that
+			// recovers seq25/26/27/49 with ZERO false-accepts on the offline rescore.
+			// Require, on top of the UNCHANGED base bar:
+			//   (a) the UNCHANGED coarse_metric<0.30 OFDM-alias class gate (mirror BREAK);
+			//   (b) ARM-A (matched>=7 && metric>=1.5) OR ARM-B (matched>=5 && metric>=3.0)
+			//       — both metric-gated so the metric~0.55 noise reaches stay rejected.
+			// recovery_fine==false (every other caller, default-off) → this collapses
+			// to base_accept → byte-identical.
+			bool accept = base_accept;
+			if(recovery_fine)
+			{
+				bool coarse_ok = (telecom_system->receive_stats.coarse_metric
+				                  < RECOVERY_ACK_FINE_COARSE_REJECT);
+				bool arm_a = (matched_count >= recovery_ack_fine_minmatch())
+				             && (metric >= recovery_ack_fine_minmetric());
+				bool arm_b = (matched_count >= recovery_ack_fine_minmatch_hi())
+				             && (metric >= recovery_ack_fine_minmetric_hi());
+				bool raised_bar = arm_a || arm_b;
+				accept = base_accept && coarse_ok && raised_bar;
+				if(g_verbose && matched_count > 0)
+				{
+					printf("[RECOVERY-ACK-FINE] matched=%d/%d metric=%.2f coarse=%.2f "
+						"base=%d coarse_ok=%d armA=%d armB=%d -> %s\n",
+						matched_count, telecom_system->ack_mfsk.ack_pattern_nsymb,
+						metric, telecom_system->receive_stats.coarse_metric,
+						base_accept?1:0, coarse_ok?1:0, arm_a?1:0, arm_b?1:0,
+						accept?"ACCEPT":"reject");
+					fflush(stdout);
+				}
+			}
+			if(accept)
 			{
 				// Step 15: legacy MFSK SACK-before-ACK guard removed —
 				// OFDM SACK_RSP cannot false-trigger the MFSK ACK correlator,

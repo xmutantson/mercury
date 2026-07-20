@@ -7981,6 +7981,220 @@ int run_break_fh_gate_tests() {
 	return g_failures;
 }
 
+// =============================================================================
+// recovery-ack-fine (STAGE 1) — the fine sub-window timing pass recovers a
+// recovery control-ACK whose 16-symbol block straddles the detection window in
+// time (data-flow-ack-detector.md §2).
+//
+// MODEL (faithful to the production mechanism, per the spec's hail_score_combined
+// note): score the ACK at a FIXED sub-window offset, mirroring ofdm.cc's per-
+// symbol scorer (energy-gated argmax-peak-bin count + carrier-image, ack_tones
+// indexed [p % ack_pattern_len], +Ngi FFT placement). The recovery poll's coarse
+// search lands the block start on the SYMBOL GRID; an arrival-phase straddle of
+// tau decimated samples leaves a residual the GI cannot absorb once |tau| > Ngi:
+//   - NO-FINE  = score at the symbol-grid-SNAPPED offset (the coarse pick). For
+//     |tau| past ~Ngi the FFT window reads before the cyclic-prefix into the
+//     adjacent symbol → ICI → the per-symbol peak bins move off → matched
+//     COLLAPSES to 1-6/16.
+//   - FINE     = MAX score over the sub-window search [snapped - sym/2, snapped +
+//     sym/2] at base-rate step (exactly ofdm.cc Phase-2). It re-finds the true
+//     offset → matched recovers to the ceiling (~16/16) over the hardened bar.
+// This is why the production gate is `if(always_fine || best_matched>=6)`: a
+// collapsed coarse (matched<6) NEVER refines unless always_fine is forced — the
+// Stage-1 lever for the recovery poll.
+//
+// CAVEAT (in-code, honest): a synthetic-clean ACK + an injected static offset is
+// a REGRESSION SANITY for the fine pass, NOT proof that the REAL HW straddle is a
+// pure timing miss (the clean miss may also be the per-symbol straddle the §4
+// reps-combining addresses). The keystone is the HW real-I/Q offline rescore via
+// the I/Q dump (MERCURY_RECOVERY_ACK_DIAG) — out of scope here (sim/build only).
+static void test_recovery_ack_fine_straddle_sweep() {
+	const char* name = "recovery_ack_fine_straddle_sweep";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);   // WB ROBUST_0 -> ack_mfsk M=16, nStreams=1
+	if (ts.ack_mfsk.M != 16 || ts.ack_mfsk.ack_pattern_nsymb != 16) {
+		test_fail(name, "ack_mfsk not M=16/16-symbol at ROBUST_0"); return;
+	}
+	const int    thr  = ts.ack_mfsk.ack_match_threshold;       // 7/16 (base bar)
+	const double fs   = ts.sampling_frequency;
+	const int    Mdec = ts.data_container.interpolation_rate;  // freq-interp = passband:decimated ratio
+	const int    sym_samples = ts.data_container.Nofdm * Mdec; // passband samples / ACK symbol
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	if (thr != 7) { test_fail(name, "ack_match_threshold expected 7/16"); return; }
+	// Hardened-accept bar this Stage-1 lever ships with (arq_common.cc default):
+	// the fine recovery must clear BREAK-grade matched OR a metric well above 0.5.
+	const int    HARD_MINMATCH = 12;
+	const double HARD_MINMETRIC = 3.0;
+
+	const int nsymb   = ts.ack_mfsk.ack_pattern_nsymb;     // 16
+	const int sym_dec = ts.data_container.Nofdm;           // decimated samples / symbol
+	const int Nfft    = ts.ofdm.Nfft;
+	const int Ngi     = ts.data_container.Nofdm - ts.ofdm.Nfft; // decimated GI tolerance
+	const int Nc      = ts.data_container.Nc;
+	const int half    = Nc / 2;
+	const int ss      = ts.ofdm.start_shift;
+
+	// Build a clean R=1 ACK passband and decimate it ONCE to a reference baseband
+	// ACK (lead pad so a left straddle never underflows when placed in `work`).
+	ts.set_recovery_ack_reps(1);
+	int ack_samples = ts.ack_pattern_passband_samples;
+	if (ack_samples <= 0) { test_fail(name, "ACK passband build failed (ack_samples<=0)"); return; }
+	const int lead_pb = 1 * sym_samples;
+	const int total_pb = ack_samples + lead_pb;
+	std::vector<double> clean_pb((size_t)total_pb, 0.0);
+	int w = ts.generate_ack_pattern_passband(clean_pb.data() + lead_pb);
+	if (w != ack_samples) { test_fail(name, "generate_ack_pattern_passband short write"); return; }
+	std::vector<std::complex<double> > ack_bb((size_t)(total_pb / Mdec), std::complex<double>(0.0,0.0));
+	ts.ofdm.passband_to_baseband_decimated(clean_pb.data(), total_pb, ack_bb.data(),
+		fs, eff_carrier, ts.carrier_amplitude, Mdec, &ts.ofdm.FIR_rx_data);
+	const int lead_bb = lead_pb / Mdec;
+	const int ack_bb_n = ack_samples / Mdec;
+
+	// Place the decimated ACK at lead_dec + tau in a padded work buffer.
+	const int lead_dec = 3 * sym_dec;
+	const int tail_dec = 4 * sym_dec;
+	const int total_dec = ack_bb_n + lead_dec + tail_dec;
+	std::vector<std::complex<double> > work;
+
+	// FIXED-OFFSET scorer — mirrors ofdm.cc detect_ack_pattern's per-symbol body
+	// (energy-gated argmax peak-bin count + carrier-image mirror, ack_tones indexed
+	// [p % ack_pattern_len], FFT at start_off + p*sym + Ngi). NO coarse search: it
+	// scores ONE block start, exactly what the production fine pass evaluates per
+	// sub-window. Returns matched, sets out_metric.
+	std::vector<std::complex<double> > sym((size_t)Nfft), spec((size_t)Nfft);
+	auto score_at = [&](int start_off, double& out_metric) -> int {
+		int matched = 0; double metric = 0.0;
+		for (int p = 0; p < nsymb; p++) {
+			int tone_base = ts.ack_mfsk.ack_tones[p % ts.ack_mfsk.ack_pattern_len];
+			int actual_tone = (tone_base + p * ts.ack_mfsk.tone_hop_step) % ts.ack_mfsk.M;
+			int off = start_off + p * sym_dec + Ngi;
+			if (off < 0 || off + Nfft > total_dec) continue;
+			for (int i = 0; i < Nfft; i++) sym[(size_t)i] = work[(size_t)(off + i)];
+			ts.ofdm.fft(sym.data(), spec.data(), Nfft);
+			auto e = [&](int b){ return spec[(size_t)b].real()*spec[(size_t)b].real()
+			                          + spec[(size_t)b].imag()*spec[(size_t)b].imag(); };
+			int streams_matched = 0; double e_target = 0.0;
+			for (int st = 0; st < ts.ack_mfsk.nStreams; st++) {
+				int esub = ts.ack_mfsk.stream_offsets[st] + actual_tone;
+				int ebin = (esub < half) ? (Nfft - half + esub) : (ss + (esub - half));
+				int mbin = (Nfft - ebin) % Nfft;
+				e_target += e(ebin) + e(mbin);
+				double peak_e = -1.0; int peak_bin = -1;
+				for (int t = 0; t < ts.ack_mfsk.M; t++) {
+					int tsub = ts.ack_mfsk.stream_offsets[st] + t;
+					int b = (tsub < half) ? (Nfft - half + tsub) : (ss + (tsub - half));
+					double ee = e(b);
+					if (ee > peak_e) { peak_e = ee; peak_bin = b; }
+				}
+				if (peak_e > 0 && (peak_bin == ebin || peak_bin == mbin)) streams_matched++;
+			}
+			if (streams_matched < ts.ack_mfsk.nStreams) continue;
+			matched++;
+			double e_total = 0.0;
+			for (int k = 0; k < Nc; k++) {
+				int bk = (k < half) ? (Nfft - half + k) : (ss + (k - half));
+				e_total += e(bk);
+			}
+			if (e_total > 0.0) metric += e_target / e_total;
+		}
+		out_metric = metric;
+		return matched;
+	};
+
+	// NO-FINE: score at the symbol-grid-snapped offset (the coarse pick).
+	// FINE: MAX matched/metric over the base-rate sub-window search ±sym/2 (the
+	// production Phase-2). Both run on the SAME tau-straddled buffer.
+	auto eval_tau = [&](int tau_dec, int& nf_matched, double& nf_metric,
+	                    int& ff_matched, double& ff_metric) {
+		work.assign((size_t)total_dec, std::complex<double>(0.0,0.0));
+		for (int i = 0; i < ack_bb_n; i++) {
+			int dst = lead_dec + tau_dec + i;
+			if (dst >= 0 && dst < total_dec) work[(size_t)dst] = ack_bb[(size_t)(lead_bb + i)];
+		}
+		int true_off = lead_dec + tau_dec;
+		// Coarse symbol-grid snap (the position a symbol-period coarse search lands).
+		int snapped = ((true_off + sym_dec/2) / sym_dec) * sym_dec;
+		nf_matched = score_at(snapped, nf_metric);
+		// Fine: MAX over the ±sym/2 base-rate sub-window search around the snapped pos.
+		ff_matched = 0; ff_metric = 0.0;
+		for (int d = snapped - sym_dec/2; d <= snapped + sym_dec/2; d++) {
+			if (d < 0 || d + (nsymb-1)*sym_dec + Ngi + Nfft > total_dec) continue;
+			double mt = 0.0; int mm = score_at(d, mt);
+			if (mt > ff_metric) { ff_metric = mt; ff_matched = mm; }
+		}
+	};
+
+	printf("    (decimated sym_period=%d, GI tolerance Ngi=%d samples; a straddle past ~Ngi collapses the symbol-grid-snapped score)\n",
+		sym_dec, Ngi);
+	printf("  [MEASURE] recovery-ACK fine-pass timing-straddle recovery (clean, no AWGN):\n");
+	printf("    %-8s %-22s %-22s\n", "tau_dec", "no-fine matched/metric", "fine matched/metric");
+
+	// tau sweep (decimated samples): {0, +-1, +-2, +-4, +-8, ..., +-155}.
+	std::vector<int> taus; taus.push_back(0);
+	const int tau_mags[] = { 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 155 };
+	for (int k = 0; k < (int)(sizeof(tau_mags)/sizeof(tau_mags[0])); k++) {
+		taus.push_back(+tau_mags[k]); taus.push_back(-tau_mags[k]);
+	}
+
+	int n_strad = 0, n_collapsed_below = 0, n_fine_recovered = 0, max_nofine_on_strad = 0;
+	for (size_t ti = 0; ti < taus.size(); ti++) {
+		int tau = taus[ti];
+		int nf = 0, ff = 0; double m_nf = 0.0, m_f = 0.0;
+		eval_tau(tau, nf, m_nf, ff, m_f);
+		char a[48], b[48];
+		snprintf(a, sizeof(a), "%d/%d (%.2f)", nf, nsymb, m_nf);
+		snprintf(b, sizeof(b), "%d/%d (%.2f)", ff, nsymb, m_f);
+		printf("    %-8d %-22s %-22s%s\n", tau, a, b,
+			(nf < thr && ff >= HARD_MINMATCH) ? "  <- recovered" : "");
+		if (nf < thr) {
+			n_strad++;
+			if (nf >= 0 && nf <= 6) n_collapsed_below++;
+			if (nf > max_nofine_on_strad) max_nofine_on_strad = nf;
+			bool fine_ok = (ff >= HARD_MINMATCH) || (m_f >= HARD_MINMETRIC);
+			if (fine_ok) n_fine_recovered++;
+		}
+	}
+
+	printf("    straddled taus (no-fine < %d/16): %d; of those, no-fine in 0..6/16: %d; fine cleared hardened bar: %d\n",
+		thr, n_strad, n_collapsed_below, n_fine_recovered);
+
+	// --- ASSERTS ---
+	// (1) FAIL-BEFORE: the sweep MUST contain taus where the fixed-offset (no-fine)
+	// score collapses below the 7/16 base bar (else the test cannot show the fix).
+	if (n_strad == 0) {
+		test_fail(name, "no tau collapsed the no-fine fixed-offset score below 7/16 — sweep cannot show the fine-pass fix");
+		return;
+	}
+	if (n_collapsed_below == 0) {
+		test_fail(name, "no tau landed the no-fine score in the 0..6/16 collapse band (§2 mechanism not exercised)");
+		return;
+	}
+	// (2) PASS-AFTER (HEADLINE / fails on a binary without the sub-window fine MAX):
+	// EVERY straddled tau the no-fine score drops MUST be recovered by the fine MAX
+	// over the HARDENED accept bar. A real fine-recovered straddle hits ~16/16.
+	if (n_fine_recovered != n_strad) {
+		char m[224]; snprintf(m, sizeof(m),
+			"fine MAX did NOT recover every straddle: %d/%d straddled taus cleared the hardened bar "
+			"(matched>=%d OR metric>=%.1f) — fine pass ineffective?",
+			n_fine_recovered, n_strad, HARD_MINMATCH, HARD_MINMETRIC);
+		test_fail(name, m); return;
+	}
+	printf("    [ASSERT OK] %d straddled taus (worst no-fine matched=%d/16) ALL recovered by the fine sub-window MAX over the hardened bar (matched>=%d OR metric>=%.1f).\n",
+		n_strad, max_nofine_on_strad, HARD_MINMATCH, HARD_MINMETRIC);
+	test_pass(name);
+}
+
+int run_recovery_ack_fine_tests() {
+	g_failures = 0;
+	g_passes   = 0;
+	printf("=== recovery-ACK fine-pass straddle tests (recovery-ack-fine STAGE 1) ===\n");
+	test_recovery_ack_fine_straddle_sweep();
+	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
+	return g_failures;
+}
+
 // Focused runner: ONLY the recovery-ACK robustness suite (the marginal-ACK combining
 // fix, the listen-window ms-mirror, the DELTA-1 reps-agnostic BREAK, and the DELTA-2
 // CFO-refine decision gate). Fast iteration for the recovery-ack work; all are also in
@@ -8165,6 +8379,13 @@ int run_mfsk_ctrl_codec_tests() {
 	// Phase-1 reads CONSTANT-CFO => GO; refine still fails OR drift => STOP (fail loudly).
 	test_recovery_ack_cfo_gate();
 
+	// recovery-ack-fine STAGE 1 (data-flow-ack-detector.md §2): enable the EXISTING
+	// detect_ack_pattern fine sub-window pass for the recovery control-ACK poll. The
+	// 16-sym ACK block straddles the detection window in time → coarse matched 1-6/16
+	// → never refines (always_fine=false). FAIL-BEFORE (no-fine) collapses below the
+	// 7/16 bar across a tau sweep; PASS-AFTER (fine) recovers over the hardened bar.
+	test_recovery_ack_fine_straddle_sweep();
+
 	// §21 PRODUCTION robust-tier-trigger behavior (tier2-suffix-fec-design.md §21,
 	// CAP_SUFFIX_FEC negotiation removed in cleanup/drop-suffix-fec-cap): ACK gate
 	// is robust-tier-only (throughput gate), ACK throughput-neutrality
@@ -8314,5 +8535,198 @@ int run_preamble_sched_tests() {
 	test_preamble_sched_tx_rx_symmetry();
 	test_preamble_sched_batch_accounting();
 	printf("=== LEVER P done: %d passed, %d failed ===\n", g_passes, g_failures);
+	return g_failures;
+}
+
+// =============================================================================
+// MOOSE CFO HALF-CORRECTION DEAD-ZONE regression suite.
+//
+// ROOT CAUSE (telecom_system.cc:carrier_sampling_frequency_sync + the clamp/
+// reject block in the OFDM receive loop): the WB Moose estimator's capture
+// range is +-2 subcarriers (nIS=4 => +-93.75 Hz at subcarrier_spacing 46.875),
+// but the applied correction is CLAMPED to +-1 subcarrier. The PRE-FIX reject
+// threshold was 2*subcarrier_spacing, so any |estimate| in the DEAD ZONE
+// [subcarrier_spacing, 2*subcarrier_spacing] was neither rejected nor fully
+// corrected: it was CLAMPED to +-subcarrier_spacing, COMMITTING a residual CFO
+// up to ~subcarrier_spacing (~41 Hz for the observed -87.9 Hz sub-peak lock).
+// The residual rotates the per-subcarrier channel estimate H symbol-to-symbol;
+// estimate_noise_from_pilot_pairs reads the rotation as catastrophic noise
+// (var ~84 vs clean ~0.036) -> SKIP-VAR gate -> 3-consecutive abort ->
+// FTR-FAIL -> ofdm_ok=0, the link never establishes.
+//
+// FIX: reject threshold == clamp ceiling (subcarrier_spacing). Dead-zone
+// estimates now REJECT-and-advance (walk to the true peak) instead of
+// committing a known-bad half-clamp.
+//
+// These tests drive the PURE decision predicate cl_telecom_system::
+// moose_clamp_decision() with REAL CFG15 geometry (bandwidth 2344, Nc 50 =>
+// subcarrier_spacing 46.875). Compile the unit under test with
+// -DMOOSE_CFO_FAILBEFORE to reproduce the pre-fix behavior: the dead-zone
+// cells then FAIL (they clamp instead of reject), proving the regression
+// captures the bug; the default (fixed) build PASSES.
+// =============================================================================
+
+// The committed-residual invariant: a MOOSE_CLAMP decision must NEVER leave a
+// residual larger than this fraction of a subcarrier. (A real clamp of a small
+// in-range estimate leaves zero residual; the dead-zone half-clamp left ~1x.)
+static const double MOOSE_MAX_COMMITTED_RESIDUAL_FRAC = 0.05;  // 5% of a subcarrier
+
+// Dead-zone cell: |cfo| in (spacing, 2*spacing) with budget remaining MUST
+// reject-and-advance — never commit the catastrophic half-clamp residual.
+static void test_moose_deadzone_rejects(double cfo_hz, const char* name) {
+	const double spacing = 2344.0 / 50.0;   // CFG15 WB subcarrier spacing = 46.875 Hz
+	double corrected = 0.0;
+	cl_telecom_system::moose_decision_t d =
+		cl_telecom_system::moose_clamp_decision(cfo_hz, spacing, /*can_advance=*/true, corrected);
+	if (d != cl_telecom_system::MOOSE_REJECT_ADVANCE) {
+		// Pre-fix path lands here: it CLAMPED and committed a huge residual.
+		double residual = fabs(cfo_hz - corrected);
+		static char buf[160];
+		snprintf(buf, sizeof(buf),
+			"dead-zone cfo=%.2f Hz half-clamped to %.2f Hz (residual=%.2f Hz = %.0f%% of subcarrier) "
+			"instead of reject-and-advance -> would SKIP-VAR -> FTR-FAIL",
+			cfo_hz, corrected, residual, 100.0 * residual / spacing);
+		test_fail(name, buf);
+		return;
+	}
+	test_pass(name);
+}
+
+// Small-CFO cell (non-regression): |cfo| <= spacing must CLAMP and commit at
+// most a negligible residual (real crystal offsets <~20 Hz pass through cleanly).
+static void test_moose_smallcfo_clamps(double cfo_hz, const char* name) {
+	const double spacing = 2344.0 / 50.0;
+	double corrected = 0.0;
+	cl_telecom_system::moose_decision_t d =
+		cl_telecom_system::moose_clamp_decision(cfo_hz, spacing, /*can_advance=*/true, corrected);
+	if (d != cl_telecom_system::MOOSE_CLAMP) {
+		test_fail(name, "small in-range CFO was rejected — would needlessly burn a trial");
+		return;
+	}
+	double residual = fabs(cfo_hz - corrected);
+	if (residual > MOOSE_MAX_COMMITTED_RESIDUAL_FRAC * spacing) {
+		static char buf[160];
+		snprintf(buf, sizeof(buf),
+			"small cfo=%.2f Hz committed residual %.3f Hz (> %.2f Hz) — clamp altered an in-range estimate",
+			cfo_hz, residual, MOOSE_MAX_COMMITTED_RESIDUAL_FRAC * spacing);
+		test_fail(name, buf);
+		return;
+	}
+	// And the clamp must be a no-op for in-range values: corrected == input.
+	if (fabs(corrected - cfo_hz) > 1e-9) {
+		test_fail(name, "in-range clamp changed the value (should be identity)");
+		return;
+	}
+	test_pass(name);
+}
+
+// Boundary: exactly +-spacing must still CLAMP (accept the largest real offset),
+// NOT reject — the fix only rejects what the clamp cannot represent (> spacing).
+static void test_moose_boundary_clamps() {
+	const char* name = "moose_boundary_at_subcarrier_spacing_clamps";
+	const double spacing = 2344.0 / 50.0;
+	double corrected = 0.0;
+	for (double s = -1.0; s <= 1.0; s += 2.0) {
+		double cfo = s * spacing;
+		cl_telecom_system::moose_decision_t d =
+			cl_telecom_system::moose_clamp_decision(cfo, spacing, true, corrected);
+		if (d != cl_telecom_system::MOOSE_CLAMP || fabs(corrected - cfo) > 1e-9) {
+			test_fail(name, "estimate at exactly +-subcarrier_spacing must clamp to itself");
+			return;
+		}
+	}
+	test_pass(name);
+}
+
+// Beyond capture range (>2x spacing) was rejected pre-fix and must stay rejected.
+static void test_moose_beyond_range_rejects() {
+	const char* name = "moose_beyond_capture_range_rejects";
+	const double spacing = 2344.0 / 50.0;
+	double corrected = 0.0;
+	const double cfos[] = { 120.0, -150.0, 200.0 };
+	for (double cfo : cfos) {
+		cl_telecom_system::moose_decision_t d =
+			cl_telecom_system::moose_clamp_decision(cfo, spacing, true, corrected);
+		if (d != cl_telecom_system::MOOSE_REJECT_ADVANCE) {
+			test_fail(name, "out-of-range CFO must reject-and-advance"); return;
+		}
+	}
+	test_pass(name);
+}
+
+// Budget-exhausted edge: when no more trials can be advanced, a dead-zone
+// estimate falls back to CLAMP (best-effort) rather than rejecting into a
+// dead end. Confirms the can_advance guard is honored and the function never
+// strands the receiver with nothing applied.
+static void test_moose_no_advance_falls_back_to_clamp() {
+	const char* name = "moose_budget_exhausted_clamps_best_effort";
+	const double spacing = 2344.0 / 50.0;
+	double corrected = -999.0;
+	cl_telecom_system::moose_decision_t d =
+		cl_telecom_system::moose_clamp_decision(-87.9118, spacing, /*can_advance=*/false, corrected);
+	if (d != cl_telecom_system::MOOSE_CLAMP) {
+		test_fail(name, "with no trial budget the decision must clamp (cannot advance)"); return;
+	}
+	if (fabs(corrected - (-spacing)) > 1e-9) {
+		test_fail(name, "best-effort clamp must saturate to -subcarrier_spacing"); return;
+	}
+	test_pass(name);
+}
+
+// Exhaust the entire estimator capture interval at 1/20-subcarrier resolution.
+// With another timing trial available, every accepted value must be exactly
+// correctable; no point in the former (1x,2x] half-clamp band may be committed.
+static void test_moose_capture_interval_has_no_half_clamp() {
+	const char* name = "moose_capture_interval_has_no_half_clamp";
+	const double spacing = 2344.0 / 50.0;
+	for (int twentieths = -40; twentieths <= 40; ++twentieths) {
+		double measured = spacing * twentieths / 20.0;
+		double corrected = 123456.0;
+		cl_telecom_system::moose_decision_t d =
+			cl_telecom_system::moose_clamp_decision(
+				measured, spacing, /*can_advance=*/true, corrected);
+		bool correctable = fabs(measured) <= spacing;
+		if (correctable &&
+		    (d != cl_telecom_system::MOOSE_CLAMP || fabs(corrected - measured) > 1e-9)) {
+			char buf[192];
+			snprintf(buf, sizeof(buf),
+				"in-range %.3f Hz was not accepted unchanged (decision=%d corrected=%.3f)",
+				measured, (int)d, corrected);
+			test_fail(name, buf);
+			return;
+		}
+		if (!correctable && d != cl_telecom_system::MOOSE_REJECT_ADVANCE) {
+			char buf[192];
+			snprintf(buf, sizeof(buf),
+				"dead-zone %.3f Hz was committed as %.3f Hz instead of advancing the timing trial",
+				measured, corrected);
+			test_fail(name, buf);
+			return;
+		}
+	}
+	test_pass(name);
+}
+
+int run_moose_deadzone_tests() {
+	g_failures = 0;
+	g_passes   = 0;
+	printf("=== Moose CFO half-correction dead-zone tests (CFG15 spacing=46.875 Hz) ===\n");
+	// Keystone FAIL-before/PASS-after cells: the firsthand -87.9118 Hz sub-peak
+	// lock plus representative dead-zone values. Each REJECTS post-fix; each
+	// CLAMPS (and FAILS this assert) under -DMOOSE_CFO_FAILBEFORE.
+	test_moose_deadzone_rejects(-87.9118, "moose_deadzone_subpeak_-87.9Hz_rejects");
+	test_moose_deadzone_rejects( 60.0,    "moose_deadzone_+60Hz_rejects");
+	test_moose_deadzone_rejects(-72.0,    "moose_deadzone_-72Hz_rejects");
+	test_moose_deadzone_rejects( 80.0,    "moose_deadzone_+80Hz_rejects");
+	test_moose_deadzone_rejects( 47.0,    "moose_deadzone_+47Hz_just_above_ceiling_rejects");
+	// Non-regression: small / in-range CFO still clamps cleanly (identity).
+	test_moose_smallcfo_clamps( 0.0,   "moose_smallcfo_0Hz_clamps");
+	test_moose_smallcfo_clamps( 20.0,  "moose_smallcfo_+20Hz_clamps");
+	test_moose_smallcfo_clamps(-40.0,  "moose_smallcfo_-40Hz_clamps");
+	test_moose_boundary_clamps();
+	test_moose_beyond_range_rejects();
+	test_moose_no_advance_falls_back_to_clamp();
+	test_moose_capture_interval_has_no_half_clamp();
+	printf("=== Moose dead-zone done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }

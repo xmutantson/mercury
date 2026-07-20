@@ -53,4 +53,14 @@ int run_break_fh_gate_tests();
 // --test-recovery-ack.
 int run_recovery_ack_tests();
 
+// recovery-ack-fine (STAGE 1): run ONLY the recovery control-ACK fine-pass
+// timing-straddle sweep (fail-before no-fine collapse / pass-after fine recovery
+// over the hardened bar). Fast + deterministic. Returns failed count. Wired via
+// main.cc --test-recovery-ack-fine; also included in the full --test suite.
+int run_recovery_ack_fine_tests();
+// Run only the Moose CFO half-correction dead-zone regression at real CFG15
+// geometry. Fast and deterministic; also included in the full --test suite.
+// Define MOOSE_CFO_FAILBEFORE to exercise the former half-clamp behavior.
+int run_moose_deadzone_tests();
+
 #endif // INC_MFSK_CTRL_CODEC_TESTS_H_

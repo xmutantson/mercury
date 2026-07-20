@@ -326,6 +326,14 @@ public:
 	void fft(std::complex <double>* in, std::complex <double>* out, int _Nfft);
 	int time_sync_Nsymb;
 	double freq_offset_ignore_limit;
+	// recovery-ack-capture LEVER 2 (data-flow-recovery-ack-capture.md §6): when TRUE,
+	// detect_ack_pattern scores a block that OVERSHOOTS the tail on the symbols
+	// actually PRESENT (the LATE-TRUNCATED class — 68% of HW misses) instead of
+	// hard-requiring a full ack_nsymb run to fit. DEFAULT FALSE → the verbatim
+	// full-block-fit path → byte-identical for every caller. Set+cleared ONLY around
+	// the recovery-fine detect call in detect_ack_pattern_from_passband, so no other
+	// caller (DATA-ACK / BREAK / HAIL / CONNECT) ever sees it true.
+	bool ack_allow_partial_tail = false;
 	cl_FIR FIR_rx_data,FIR_rx_time_sync;
 	cl_FIR FIR_tx1, FIR_tx2;
 	int start_shift;

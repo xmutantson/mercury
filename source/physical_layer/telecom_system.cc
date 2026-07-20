@@ -41,6 +41,8 @@
 #endif
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <unistd.h> // getpid() for the recovery-ack-fine I/Q-dump diagnostic (POSIX)
 #endif
 
 extern cbuf_handle_t capture_buffer;
@@ -711,6 +713,41 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 	return eff;
 }
 
+// Moose CFO sanity decision — STATIC / PURE (see header for the full root-cause
+// note). Closes the half-correction DEAD ZONE [subcarrier_spacing,
+// 2*subcarrier_spacing] by making the reject threshold EQUAL the clamp ceiling
+// (subcarrier_spacing) instead of double it. corrected_out is filled only when
+// the decision is MOOSE_CLAMP (the value the caller should apply).
+//
+// MOOSE_CFO_FAILBEFORE reproduces the pre-fix (buggy) behavior so the
+// --test-moose regression can assert FAIL-before / PASS-after in one source:
+// the old reject threshold was 2*subcarrier_spacing, leaving the dead zone
+// half-clamped. Production builds NEVER define it.
+cl_telecom_system::moose_decision_t cl_telecom_system::moose_clamp_decision(
+		double freq_offset_measured, double subcarrier_spacing,
+		bool can_advance_trial, double& corrected_out)
+{
+#ifdef MOOSE_CFO_FAILBEFORE
+	// Pre-fix: reject only beyond +-2 subcarriers; everything below is clamped
+	// to +-1 subcarrier — the [1x,2x] band is committed half-corrected.
+	const double reject_limit = subcarrier_spacing * 2.0;
+#else
+	// Fix: reject threshold == clamp ceiling. The clamp can only correct up to
+	// +-subcarrier_spacing, so anything above it would leave a residual — reject
+	// and advance to the next timing candidate rather than commit a half-clamp.
+	const double reject_limit = subcarrier_spacing;
+#endif
+	if(fabs(freq_offset_measured) > reject_limit && can_advance_trial)
+		return MOOSE_REJECT_ADVANCE;
+
+	// Clamp to +-1 subcarrier spacing (covers real crystal offsets up to ~47 Hz).
+	double c = freq_offset_measured;
+	if(c >  subcarrier_spacing) c =  subcarrier_spacing;
+	if(c < -subcarrier_spacing) c = -subcarrier_spacing;
+	corrected_out = c;
+	return MOOSE_CLAMP;
+}
+
 int cl_telecom_system::tx_effective_preamble_nsymb() const
 {
 	int full = data_container.preamble_nSymb;
@@ -1203,6 +1240,41 @@ double cl_telecom_system::ofdm_meanH_at_delay(double *data, int cand_delay,
 		}
 	}
 	return (h_count > 0) ? (h_sum / h_count) : -1.0;
+}
+
+// Default-off OFDM admission discriminator. This deliberately does not alter
+// the coarse Schmidl-Cox metric floor: valid CFO-impaired WB preambles have
+// been observed below 0.65 on current trunk.
+bool cl_telecom_system::subpeak_metric_gate_enabled()
+{
+	static const int enabled = [] {
+		const char* value = std::getenv("MERCURY_SUBPEAK_METRIC_GATE");
+		return (value && *value) ? atoi(value) : 0;
+	}();
+	return enabled != 0;
+}
+
+bool cl_telecom_system::subpeak_reject_out_of_band(
+		double bb_pream, double pb_pream) const
+{
+	if(pb_pream <= 0.0) return false;
+	return bb_pream / pb_pream >= SUBPEAK_PREAM_RATIO_REJECT;
+}
+
+// Exact production admission predicate, split out so the synthetic-fire test
+// cannot drift from the receive path. The fail-before arm reproduces bare
+// origin/monitor, where the ratio was logged but never rejected.
+bool cl_telecom_system::subpeak_admission_reject(
+		double bb_pream, double pb_pream) const
+{
+#ifdef SUBPEAK_GATE_FAILBEFORE
+	(void)bb_pream;
+	(void)pb_pream;
+	return false;
+#else
+	return subpeak_metric_gate_enabled() &&
+	       subpeak_reject_out_of_band(bb_pream, pb_pream);
+#endif
 }
 
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
@@ -2479,6 +2551,21 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				printf("[ENERGY-DIAG] pream: pb=%.4e bb=%.4e | data: pb=%.4e bb=%.4e | delay=%d data_off=%d buf=%d\n",
 					pb_pream, bb_pream, pb_data, data_e, receive_stats.delay, data_offset, buf_samples_de);
 				fflush(stdout);
+
+				// A reverse MFSK control/BREAK burst can false-lock the forward
+				// OFDM detector. Reject its high in-band/passband preamble ratio
+				// before Moose, pilot variance, and LDPC consume the candidate.
+				if(subpeak_admission_reject(bb_pream, pb_pream))
+				{
+					printf("[SUBPEAK-GATE] OUT-OF-BAND reject: pream bb/pb=%.4f >= %.2f "
+					       "(reverse-MFSK false-lock) metric=%.3f delay=%d\n",
+						pb_pream > 0.0 ? bb_pream / pb_pream : -1.0,
+						SUBPEAK_PREAM_RATIO_REJECT,
+						receive_stats.coarse_metric, receive_stats.delay);
+					fflush(stdout);
+					energy_ok = false;
+					receive_stats.frame_data_missing = true;
+				}
 			}
 
 			// Data missing if data energy is <10% of preamble energy (relative)
@@ -3098,22 +3185,28 @@ skip_h_retry_point:
 			// applying a wild correction that makes things worse.
 			{
 				double subcarrier_spacing = bandwidth / (double)data_container.Nc;
-				double moose_sanity_limit = subcarrier_spacing * 2.0;  // ~93.75 Hz for WB (Moose nIS/2 capture range)
+				// Reject == clamp ceiling (subcarrier_spacing). Any |estimate| above
+				// it can only be HALF-corrected by the clamp, leaving a residual CFO
+				// that the cross-pilot noise estimator reads as catastrophic noise
+				// (SKIP-VAR -> FTR-FAIL). Closing this dead zone [1x,2x] is the fix —
+				// see cl_telecom_system::moose_clamp_decision() for the root-cause note.
+				bool can_advance = (receive_stats.sync_trials < effective_trials_max);
 				if(g_verbose)
-					printf("[MOOSE-RAW] unclamped=%.4f Hz, sanity=%.1f Hz\n", freq_offset_measured, moose_sanity_limit);
-				if(fabs(freq_offset_measured) > moose_sanity_limit && receive_stats.sync_trials < effective_trials_max)
+					printf("[MOOSE-RAW] unclamped=%.4f Hz, clamp_ceiling=%.1f Hz\n",
+						freq_offset_measured, subcarrier_spacing);
+				double clamped = freq_offset_measured;
+				moose_decision_t decision = moose_clamp_decision(
+					freq_offset_measured, subcarrier_spacing, can_advance, clamped);
+				if(decision == MOOSE_REJECT_ADVANCE)
 				{
-					printf("[MOOSE-REJECT] freq=%.1f Hz exceeds sanity limit — bad timing, advancing trial (sack_xcheck=%d trials=%d/%d)\n",
-						freq_offset_measured, sack_cross_check_mode ? 1 : 0,
+					printf("[MOOSE-REJECT] freq=%.1f Hz exceeds clamp ceiling %.1f Hz (dead-zone half-clamp avoided) — bad timing, advancing trial (sack_xcheck=%d trials=%d/%d)\n",
+						freq_offset_measured, subcarrier_spacing, sack_cross_check_mode ? 1 : 0,
 						receive_stats.sync_trials + 1, effective_trials_max);
 					fflush(stdout);
 					receive_stats.sync_trials++;
 					continue;
 				}
-				// Clamp to ±1 subcarrier spacing (covers real offsets up to ~47 Hz)
-				double max_correction = subcarrier_spacing;
-				if(freq_offset_measured > max_correction) freq_offset_measured = max_correction;
-				if(freq_offset_measured < -max_correction) freq_offset_measured = -max_correction;
+				freq_offset_measured = clamped;  // accepted small residual, clamped to +-1 subcarrier
 			}
 
 			// Pre-fix this branch had `if(M == MOD_MFSK) { /* skip */ }`
@@ -4325,7 +4418,7 @@ static inline bool recovery_ack_diag_enabled()
 
 // RX: Detect ACK pattern in passband audio buffer
 // Returns detection metric (0.0 = noise, up to ack_pattern_nsymb = perfect)
-double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int size, int* out_matched, uint32_t* out_match_mask)
+double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int size, int* out_matched, uint32_t* out_match_mask, bool use_fine)
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
 
@@ -4347,6 +4440,15 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 	// → the single-block path, BYTE-IDENTICAL. ack_pattern_nsymb stays the BASE
 	// block length (16); detect_ack_pattern strides R base blocks internally.
 	int best_offset = -1;
+	// recovery-ack-capture LEVER 2 (data-flow-recovery-ack-capture.md §6): score a
+	// tail-overshooting block on the symbols PRESENT for the recovery-fine poll ONLY.
+	// use_fine is itself env-gated (recovery_ack_fine_enabled_common() &&
+	// RECEIVING_ACKS_CONTROL at the call site), so this is true ONLY on the recovery
+	// control-ACK poll with MERCURY_RECOVERY_ACK_FINE set → byte-identical otherwise.
+	// Save/restore so the DELTA-2 re-detect and the diag grid sweep below (which pass
+	// always_fine=false) never inherit a stale partial-tail flag.
+	bool saved_partial_tail = ofdm.ack_allow_partial_tail;
+	ofdm.ack_allow_partial_tail = use_fine;
 	double metric = ofdm.detect_ack_pattern(
 		data_container.baseband_data_interpolated, size / M,
 		1,
@@ -4355,7 +4457,8 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 		ack_mfsk.tone_hop_step, ack_mfsk.M,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		out_matched, 0, nullptr, &best_offset, 0, out_match_mask,
-		/*always_fine=*/false, /*combine_reps=*/ack_mfsk.recovery_ack_reps);
+		/*always_fine=*/use_fine, /*combine_reps=*/ack_mfsk.recovery_ack_reps);
+	ofdm.ack_allow_partial_tail = saved_partial_tail;
 
 	// RECOVERY-ACK robustness DELTA-2 (recovery-ack-robustness.md §6.7): wire the
 	// turbo-arm's CFO refine onto the COMBINING arm. Noncoherent rep-combining is
@@ -4455,6 +4558,71 @@ double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int siz
 	//       energy (matched>0) so it doesn't spam pure-silence polls.
 	if (recovery_ack_diag_enabled() && out_matched && *out_matched > 0)
 	{
+		// I/Q DUMP (recovery-ack-fine, STAGE 1 offline-rescore diagnostic) —
+		// gated under the SAME MERCURY_RECOVERY_ACK_DIAG flag (no default-path
+		// cost). Dump the EXACT decimated baseband buffer detect_ack_pattern
+		// operated on (re-decimate `data` at the uncorrected effective_carrier so
+		// the dump matches the INITIAL integer-path detect input even if the
+		// reps>1 DELTA-2 re-detect or the grid sweep below has since mutated the
+		// shared baseband_data_interpolated), plus the coarse best_offset and the
+		// logged matched/metric/mask. The buffer behind a miss can then be
+		// rescored offline through always_fine=false vs true (Stage-1's keystone
+		// is the HW real-I/Q rescore; this dump is the vehicle). Output dir from
+		// MERCURY_RECOVERY_ACK_DIAG_DIR (default "/tmp"); files are
+		// recovery_ack_iq_<pid>_<seq>.{bin,txt}. .bin = interleaved float64 I,Q
+		// pairs (dec_size samples); .txt = one-line metadata.
+		{
+			static long s_iq_dump_seq = 0;
+			const char* dump_dir = std::getenv("MERCURY_RECOVERY_ACK_DIAG_DIR");
+			if(!dump_dir || !*dump_dir) dump_dir = "/tmp";
+			int dec_size = size / M;
+			if(dec_size > 0)
+			{
+				// Re-decimate at the uncorrected carrier into a SCRATCH buffer
+				// (do NOT touch baseband_data_interpolated — the grid sweep below
+				// re-decimates it itself, and we must not perturb the production
+				// no-side-effect contract). Use a static vector sized lazily.
+				static std::vector<std::complex<double> > iq_scratch;
+				if((int)iq_scratch.size() < dec_size) iq_scratch.assign((size_t)dec_size, std::complex<double>(0.0,0.0));
+				ofdm.passband_to_baseband_decimated(data, size,
+					iq_scratch.data(),
+					sampling_frequency, effective_carrier, carrier_amplitude,
+					M, &ofdm.FIR_rx_data);
+				long seq = s_iq_dump_seq++;
+#if defined(_WIN32)
+				long pid = (long)GetCurrentProcessId();
+#else
+				long pid = (long)getpid();
+#endif
+				char binpath[512], txtpath[512];
+				snprintf(binpath, sizeof(binpath), "%s/recovery_ack_iq_%ld_%05ld.bin", dump_dir, pid, seq);
+				snprintf(txtpath, sizeof(txtpath), "%s/recovery_ack_iq_%ld_%05ld.txt", dump_dir, pid, seq);
+				FILE* bf = fopen(binpath, "wb");
+				if(bf)
+				{
+					// interleaved double I,Q per decimated sample
+					for(int i = 0; i < dec_size; i++)
+					{
+						double iq[2] = { iq_scratch[(size_t)i].real(), iq_scratch[(size_t)i].imag() };
+						fwrite(iq, sizeof(double), 2, bf);
+					}
+					fclose(bf);
+				}
+				FILE* tf = fopen(txtpath, "w");
+				if(tf)
+				{
+					fprintf(tf, "dec_size=%d M=%d eff_carrier=%.6f best_offset=%d matched=%d nsymb=%d metric=%.6f reps=%d mask=0x%04x ack_pattern_nsymb=%d ack_tone_M=%d Ngi=%d Nfft=%d Nofdm=%d\n",
+						dec_size, M, effective_carrier, best_offset,
+						*out_matched, ack_mfsk.ack_pattern_nsymb, metric,
+						ack_mfsk.recovery_ack_reps,
+						out_match_mask ? (*out_match_mask & 0xFFFFu) : 0u,
+						ack_mfsk.ack_pattern_nsymb, ack_mfsk.M,
+						data_container.Nofdm - ofdm.Nfft, ofdm.Nfft, data_container.Nofdm);
+					fclose(tf);
+				}
+			}
+		}
+
 		const int   GRID_HALF_HZ = 30;
 		const int   GRID_STEP_HZ = 3;
 		double best_f = 0.0; int best_grid_matched = -1;
@@ -13190,4 +13358,152 @@ double cl_telecom_system::get_correlator_snr_proxy() const
 double cl_telecom_system::get_channel_selectivity() const
 {
 	return last_channel_selectivity;
+}
+
+int cl_telecom_system::test_subpeak_gate()
+{
+	printf("[TEST-SUBPEAK] reverse-MFSK false-lock admission gate (pream in-band/passband ratio)\n");
+	int fails = 0;
+
+	// --- helper: mean per-sample passband + decimated-baseband energy over the
+	// preamble region, computed EXACTLY as the ENERGY-DIAG block. ---
+	auto pream_ratio = [&](double* passband, int total_pb_samples) -> double {
+		int de_M        = data_container.interpolation_rate;
+		int pream_len   = data_container.preamble_nSymb * data_container.Nofdm * frequency_interpolation_rate;
+		int pream_len_dec = data_container.preamble_nSymb * data_container.Nofdm; // de_sym_dec = Nofdm
+		if(pream_len > total_pb_samples) pream_len = total_pb_samples;
+		// passband mean energy over preamble (matches pb_pream)
+		double pb = 0.0;
+		for(int i = 0; i < pream_len; i++) { double v = passband[i]; pb += v*v; }
+		pb /= pream_len;
+		// production decimation into baseband_data_decimated (matches bb_pream source)
+		int dec_len = total_pb_samples / de_M;
+		ofdm.passband_to_baseband_decimated(passband, total_pb_samples,
+			data_container.baseband_data_decimated, sampling_frequency,
+			carrier_frequency, carrier_amplitude, de_M, &ofdm.FIR_rx_time_sync);
+		double bb = 0.0;
+		int cnt = 0;
+		for(int i = 0; i < pream_len_dec && i < dec_len; i++) {
+			double re = data_container.baseband_data_decimated[i].real();
+			double im = data_container.baseband_data_decimated[i].imag();
+			bb += re*re + im*im; cnt++;
+		}
+		bb = (cnt > 0) ? bb / cnt : 0.0;
+		return (pb > 0.0) ? bb / pb : -1.0;
+	};
+
+	int pream_pb_samples = data_container.preamble_nSymb * data_container.Nofdm * frequency_interpolation_rate;
+	// Generous scratch buffer for both signals (preamble length + slack).
+	int buf_n = pream_pb_samples + 4 * data_container.Nofdm * frequency_interpolation_rate;
+	double* sig = new double[buf_n];
+
+	// (1) REAL WB OFDM preamble: synthesize the preamble passband exactly as
+	// transmit_byte does (baseband_to_passband of the modulated preamble symbols).
+	{
+		for(int i = 0; i < buf_n; i++) sig[i] = 0.0;
+		// Build the OFDM preamble baseband symbols (mirrors transmit_byte:782-840).
+		for(int i = 0; i < data_container.preamble_nSymb * ofdm.Nc; i++)
+			data_container.preamble_data[i] = ofdm.ofdm_preamble[i].value;
+		for(int i = 0; i < data_container.preamble_nSymb; i++)
+			ofdm.symbol_mod(&data_container.preamble_data[i*data_container.Nc],
+			                &data_container.preamble_symbol_modulated_data[i*data_container.Nofdm]);
+		ofdm.baseband_to_passband(data_container.preamble_symbol_modulated_data,
+			data_container.Nofdm*data_container.preamble_nSymb, sig,
+			sampling_frequency, carrier_frequency, carrier_amplitude, frequency_interpolation_rate);
+		double r_real = pream_ratio(sig, pream_pb_samples);
+		bool admit = !subpeak_reject_out_of_band(/*bb*/r_real, /*pb*/1.0); // ratio passed via bb,pb=1
+		printf("[TEST-SUBPEAK]   (1) REAL WB OFDM preamble: pream bb/pb=%.4f thr=%.2f -> %s (expect ADMIT, ratio<thr)\n",
+			r_real, SUBPEAK_PREAM_RATIO_REJECT, admit ? "ADMIT_OK" : "REJECTED_REGRESSION");
+		if(!(r_real >= 0.0 && r_real < SUBPEAK_PREAM_RATIO_REJECT && admit)) fails++;
+
+		// (3) NO-REGRESSION sweep: drive the SAME real preamble progressively
+		// QUIETER (cumulative scale-down to ~1e-7 of full scale, far below the
+		// CFG15 working point). The pream bb/pb ratio is amplitude-INVARIANT (bb
+		// and pb scale together), so a real low-SNR preamble must STILL admit at
+		// every level. This is the catastrophic-acquisition-regression ship-blocker.
+		bool sweep_ok = true;
+		double worst = -1.0;
+		const double scales[] = {0.5, 0.5, 0.4, 0.5, 0.4, 0.5}; // cumulative ~0.5 .. ~5e-3
+		for(double s : scales) {
+			for(int i = 0; i < pream_pb_samples; i++) sig[i] *= s; // cumulative scale-down
+			double rr = pream_ratio(sig, pream_pb_samples);
+			if(rr > worst) worst = rr;
+			bool a = (rr >= 0.0 && rr < SUBPEAK_PREAM_RATIO_REJECT);
+			if(!a) sweep_ok = false;
+		}
+		printf("[TEST-SUBPEAK]   (3) NO-REGRESSION amplitude sweep (real preamble quieted to ~5e-3 FS, worst ratio=%.4f): %s\n",
+			worst, sweep_ok ? "ALL-ADMIT_OK" : "REJECTED_LOW_SNR_REGRESSION");
+		if(!sweep_ok) fails++;
+	}
+
+	// (2) Reverse-MFSK FALSE-LOCK proxy: a narrowband single tone at the carrier
+	// (the MFSK burst is a concentrated single-tone signal). Its in-band energy
+	// survives the decimation nearly intact -> HIGH bb/pb.
+	{
+		for(int i = 0; i < buf_n; i++) sig[i] = 0.0;
+		// MFSK preamble tone sits at carrier_frequency; emit a pure tone there.
+		double w = 2.0 * M_PI * carrier_frequency / sampling_frequency;
+		for(int i = 0; i < pream_pb_samples; i++)
+			sig[i] = carrier_amplitude * cos(w * i);
+		double r_false = pream_ratio(sig, pream_pb_samples);
+		bool reject = subpeak_reject_out_of_band(/*bb*/r_false, /*pb*/1.0);
+		printf("[TEST-SUBPEAK]   (2) narrowband MFSK-burst proxy: pream bb/pb=%.4f thr=%.2f -> %s (expect REJECT, ratio>=thr)\n",
+			r_false, SUBPEAK_PREAM_RATIO_REJECT, reject ? "REJECT_OK" : "ADMITTED_BUG");
+		if(!(r_false >= SUBPEAK_PREAM_RATIO_REJECT && reject)) fails++;
+	}
+
+	// (4) Decision against the exact HW-measured populations (tt_cmd.log, §1.1):
+	// REAL pream ratio 0.565-0.584 must ADMIT; false-lock 0.904-0.907 must REJECT.
+	{
+		const double real_hw[]  = {0.5649, 0.5763, 0.5843};
+		const double false_hw[] = {0.9042, 0.9059, 0.9065};
+		bool ok = true;
+		for(double v : real_hw)  if(subpeak_reject_out_of_band(v, 1.0)) ok = false; // must NOT reject
+		for(double v : false_hw) if(!subpeak_reject_out_of_band(v, 1.0)) ok = false; // must reject
+		printf("[TEST-SUBPEAK]   (4) HW-population decision (REAL 0.565-0.584 admit, false 0.904-0.907 reject): %s\n",
+			ok ? "SEPARATES_OK" : "MISCLASSIFY");
+		if(!ok) fails++;
+	}
+
+	// (5) FAIL-BEFORE/PASS-AFTER at the EXACT production gate-site condition
+	// (`subpeak_admission_reject(bb,pb)`). With the HW false-lock pream ratio
+	// (0.9059): env-OFF the site is bypassed => the burst is ADMITTED as a
+	// forward OFDM frame (=> Moose garbage / SKIP-VAR / aliased BREAK = the bug);
+	// env-ON the site fires => the burst is REJECTED pre-Moose (=> the fix).
+	{
+		const double bb_false = 0.9059, pb_false = 1.0;  // HW false-lock signature
+		const double bb_real  = 0.5763, pb_real  = 1.0;  // HW real-preamble signature
+		bool gate_on = subpeak_metric_gate_enabled();
+		bool site_rejects_false = subpeak_admission_reject(bb_false, pb_false);
+		bool site_rejects_real  = subpeak_admission_reject(bb_real,  pb_real);
+		// Invariant in BOTH env states: a REAL preamble is NEVER rejected by the site.
+		bool ok = (!site_rejects_real)
+		          && (gate_on ? site_rejects_false : !site_rejects_false);
+		printf("[TEST-SUBPEAK]   (5) production gate-site env-%s: false-lock %s, real-preamble %s -> %s\n",
+			gate_on ? "ON" : "OFF",
+			site_rejects_false ? "REJECTED(fix)" : "admitted(default-off-bug-exposed)",
+			site_rejects_real  ? "REJECTED(REGRESSION)" : "admitted(ok)",
+			ok ? (gate_on ? "PASS-AFTER" : "FAIL-BEFORE(expected default-off)") : "UNEXPECTED");
+		if(!ok) fails++;
+	}
+
+	// (6) The ratio gate must not recreate the discarded 0.65 coarse-metric
+	// floor. Current captures include valid CFO-impaired WB preambles at
+	// coarse_metric 0.426-0.609; their real-preamble ratios must remain admitted.
+	{
+		const double coarse_metrics[] = {0.426, 0.500, 0.609};
+		const double real_ratios[] = {0.5649, 0.5763, 0.5843};
+		bool ok = true;
+		for(int i = 0; i < 3; ++i) {
+			bool rejected = subpeak_admission_reject(real_ratios[i], 1.0);
+			printf("[TEST-SUBPEAK]   (6) valid CFO-impaired WB: coarse=%.3f bb/pb=%.4f -> %s\n",
+				coarse_metrics[i], real_ratios[i], rejected ? "REJECTED_REGRESSION" : "ADMIT_OK");
+			if(rejected) ok = false;
+		}
+		if(!ok) fails++;
+	}
+
+	delete[] sig;
+	printf("[TEST-SUBPEAK] %s (%d failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+	return fails==0 ? 0 : 1;
 }

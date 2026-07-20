@@ -24,6 +24,7 @@
 #include "common/timing_log.h"
 #include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 config-tag follow test
 #include <vector>
+#include <random>   // test_recovery_ack_capture: written-but-silent ring noise (ARM3b)
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -10032,6 +10033,163 @@ int cl_arq_controller::test_inband_config0_start_ring()
 }
 
 // ============================================================================
+// §22: in-band down-ladder decoders inherit the PRIMARY's startup-patched GI
+// (data-flow-robust-ofdm-adopt-flush.md §22).  --test-inband-down-decoder-gi-inherit
+// ============================================================================
+// VERIFIED ROOT (instrumented real-audio A/B, diagnosis in _research/inband_cfg0/): the
+// SCOPED down-ladder decoder bank (inband_ensure_down_decoders, arq_common.cc:4579) builds
+// each rung with `new cl_telecom_system()` and previously set ONLY narrowband_enabled +
+// buffer_Nsymb_min before load_configuration — it never inherited the PRIMARY's
+// startup-patched default_configurations_telecom_system.ofdm_gi (main.cc:4896 = 36/256 for
+// the production 3.0 ms GI). A fresh instance keeps the physical_config.cc:37 ctor gi=54/256,
+// so load_configuration (telecom_system.cc:11037 ofdm.gi <- default) + init()
+// (telecom_system.cc:7206-7208 Nofdm = Nfft + round(gi*Nfft)) build CONFIG_0 at Nofdm=310
+// instead of the production 292 — an 18-sample/symbol FFT-window stride error -> post-EQ
+// variance blows past SKIP-VAR -> LDPC skipped (iter=-1) -> 0% block_success at WB CONFIG_0
+// -> the robust->OFDM cross never sustains and the link never climbs past the ROBUST floor.
+//
+// WHY THE EXISTING 56 inband units MISSED IT: every one PRE-SETS
+// ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI on the throwaway instances
+// it builds (e.g. arq_responder.cc:8843/8999/9180), masking the un-inherited default. This
+// test DRIVES THE PRODUCTION BUILDER inband_ensure_down_decoders directly and reads the
+// CONFIG_0 rung's installed geometry WITHOUT pre-patching the decoder's gi — only the
+// PRIMARY is patched, exactly as main.cc does at startup.
+//   - PASS-AFTER (arm 0, the fix): the CONFIG_0 down-decoder inherits the primary gi and
+//     builds at Nofdm=292 (== the primary), with gi == PROD_GI.
+//   - FAIL-BEFORE (arm 1, MERCURY_INBAND_GI_INHERIT_DEFEAT=1 on the SAME binary): the inherit
+//     is a no-op, the decoder keeps the ctor gi=54/256 and builds at Nofdm=310 (reproduces the
+//     stride-error geometry that skips LDPC).
+int cl_arq_controller::test_inband_down_decoder_gi_inherit()
+{
+	const char* TAG = "[TEST-INBAND-DOWN-DECODER-GI-INHERIT]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+		else   { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
+	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
+	bool had_prev = (prev_env != NULL);
+	set_env("MERCURY_INBAND_RATE", "1");
+
+#if defined(_WIN32)
+	bool created_mutex = false;
+	if(capture_prep_mutex == NULL) { capture_prep_mutex = CreateMutex(NULL, FALSE, NULL); created_mutex = true; }
+#endif
+
+	// Production 3.0 ms GI -> Ngi = 36 -> CONFIG_0 Nofdm = 256+36 = 292 (main.cc:4896 startup).
+	const int   PROD_NGI     = (int)(3.0 * 12.0 + 0.5);   // 36
+	const float PROD_GI      = (float)PROD_NGI / 256.0f;  // 36/256
+	const int   EXPECT_NOFDM = 256 + PROD_NGI;            // 292
+	const int   STALE_NOFDM  = 256 + 54;                  // 310 (physical_config.cc:37 ctor gi)
+
+	// CONFIG_0 sits at FULL_CONFIG_LADDER index 3 (ROBUST_0/1/2 = 0/1/2). Build a 1-wide
+	// down-window over it so the bank holds exactly the CONFIG_0 rung.
+	const int CONFIG0_LADDER_IDX = config_ladder_index(CONFIG_0);
+
+	// Build the PRIMARY exactly as production does: patch ITS default gi to PROD_GI, then a
+	// FULL ROBUST_0 init (fully initializes the standalone PHY) — but DO NOT touch the
+	// down-decoders' gi (the production builder must inherit it). Mirrors build_rx_config0.
+	auto build_rx = [&]() -> std::pair<cl_arq_controller*, cl_telecom_system*> {
+		cl_telecom_system* ts_rx = new cl_telecom_system();
+		cl_arq_controller* rx    = new cl_arq_controller();
+		ts_rx->operation_mode     = ARQ_MODE;
+		ts_rx->narrowband_enabled = NO;
+		ts_rx->default_configurations_telecom_system.ofdm_gi = PROD_GI;  // PRIMARY only
+		rx->telecom_system        = ts_rx;
+		rx->narrowband_enabled    = NO;
+		rx->role                  = RESPONDER;
+		rx->robust_enabled        = YES;
+		rx->sack_v2_enabled       = true;
+		rx->inband_rate_enabled   = 1;
+		rx->load_configuration(ROBUST_0, FULL, NO);
+		rx->link_status           = CONNECTED;
+		rx->connection_status     = RECEIVING;
+		rx->passive_monitor       = false;
+		rx->rsp_current_expected_batch_seq_id = 4;
+		return {rx, ts_rx};
+	};
+
+	// Pin the primary's CONFIG_0 geometry as the reference target (292). Loading CONFIG_0 on a
+	// throwaway COPY of the primary defaults yields the value the inherited decoder must match.
+	{
+		auto pr = build_rx();
+		// The primary, when loaded to CONFIG_0, builds at EXPECT_NOFDM — the ground truth.
+		pr.second->load_configuration(CONFIG_0);
+		check(pr.second->data_container.Nofdm == EXPECT_NOFDM,
+			"P0 the PRIMARY builds CONFIG_0 at the production geometry (Nofdm = Nfft+Ngi36)",
+			pr.second->data_container.Nofdm, EXPECT_NOFDM);
+		delete pr.first; delete pr.second;
+	}
+
+	for(int arm = 0; arm < 2; arm++)
+	{
+		bool defeat = (arm == 1);
+		set_env("MERCURY_INBAND_GI_INHERIT_DEFEAT", defeat ? "1" : "");
+
+		auto pr = build_rx();
+		cl_arq_controller* rx = pr.first; cl_telecom_system* ts = pr.second;
+
+		// THE PRODUCTION BUILDER, VERBATIM: build the scoped down-ladder bank over the CONFIG_0
+		// rung. This is the SAME inband_ensure_down_decoders the RX down-ladder resync calls
+		// (arq_common.cc:4485). It constructs `new cl_telecom_system()` per rung and (with the
+		// fix) inherits the primary gi before load_configuration. NO manual gi pre-set here.
+		int built = rx->inband_ensure_down_decoders(CONFIG0_LADDER_IDX, CONFIG0_LADDER_IDX);
+		check(built >= 1, "P1 the down-ladder bank built the CONFIG_0 rung", built, 1);
+
+		// Locate the slot holding CONFIG_0 and read its INSTALLED geometry.
+		cl_telecom_system* dec = NULL;
+		for(int i = 0; i <= INBAND_DOWN_D_MAX; i++)
+			if(rx->inband_down_decoders[i] != NULL && rx->inband_down_decoder_cfg[i] == CONFIG_0)
+			{ dec = rx->inband_down_decoders[i]; break; }
+		check(dec != NULL, "P2 a CONFIG_0 decoder slot exists in the bank", dec ? 1 : 0, 1);
+
+		if(dec != NULL)
+		{
+			int dec_nofdm = dec->data_container.Nofdm;
+			int dec_ngi   = (int)((double)dec->ofdm.gi * (double)dec->ofdm.Nfft + 0.5);
+			if(!defeat)
+			{
+				check(dec_nofdm == EXPECT_NOFDM,
+					"FIX the CONFIG_0 down-decoder inherits the primary GI -> builds at Nofdm=292 "
+					"(correct per-symbol stride -> LDPC runs -> the WB cross sustains)",
+					dec_nofdm, EXPECT_NOFDM);
+				check(dec_ngi == PROD_NGI,
+					"FIX the down-decoder's live ofdm.gi == the primary's production GI (Ngi=36)",
+					dec_ngi, PROD_NGI);
+			}
+			else
+			{
+				check(dec_nofdm == STALE_NOFDM,
+					"DEFEAT (FAIL-BEFORE) the un-inherited decoder keeps the ctor GI -> Nofdm=310 "
+					"(18-sample/symbol stride error -> SKIP-VAR -> LDPC skipped -> 0% block at cfg0)",
+					dec_nofdm, STALE_NOFDM);
+			}
+		}
+		rx->inband_free_down_decoders();
+		delete rx; delete ts;
+	}
+	set_env("MERCURY_INBAND_GI_INHERIT_DEFEAT", "");
+
+#if defined(_WIN32)
+	if(created_mutex && capture_prep_mutex != NULL)
+	{ CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
+#endif
+	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band CONFIG_0 clean-lock CRC-fail ROOT — descrambler survives the ring-shrink
 // (data-flow-robust-ofdm-adopt-flush.md §17).  --test-inband-descrambler-survives-shrink
 // ============================================================================
@@ -13344,6 +13502,202 @@ int cl_arq_controller::test_data_ack_multiwindow()
 	fflush(stdout);
 	return pass ? 0 : 1;
 #endif
+}
+
+// ============================================================================
+// recovery-ack-capture LEVER 1 -- focused deterministic capture-window test
+// ============================================================================
+//
+// CLI: --test-recovery-ack-capture
+//
+// data-flow-recovery-ack-capture.md S0/S7. HW forensics (51 REAL I/Q buffers,
+// RECOVACK_FINE_VERDICT.json) proved the recovery control-ACK miss is CAPTURE-
+// WINDOW MIS-PLACEMENT, not a detector defect: the 16-symbol recovery-ACK block
+// arrives LATE / scrolled out of the newest-tail snapshot / BEFORE ring-fill, so
+// the deployed detector scores a buffer that does NOT contain a full block
+// (47 misses = 32% SILENT-ABSENT unwritten-head + 68% LATE-TRUNCATED right-edge,
+// median present-run 3/16). This test reproduces BOTH measured classes against
+// the REAL production scorer + the REAL capture-ring arithmetic.
+//
+//   ARM1 (LATE-TRUNCATED fail-before): a clean 16-sym ACK placed so it abuts the
+//        RIGHT edge of the newest-tail window -- the newest-tail snapshot holds
+//        only a partial run (present-run ~3, matched < 7/16 bar).
+//   ARM2 (multi-window pass-after): the SAME ring, scanned back through older
+//        phases (LEVER-1(b)), finds the FULL 16-sym block (matched >= 7/16).
+//   ARM3 (SILENT-ABSENT / ring-fill): an UNWRITTEN exact-zero ring head is
+//        flagged not-yet-filled (LEVER-1(c) DEFER); a WRITTEN-but-silent ring is
+//        NOT flagged unfilled.
+//
+// Self-contained, in-process, no IONOS/RF. Returns 0=PASS, 1=FAIL. The capture
+// arithmetic MIRRORS receive_ack_pattern() (arq_common.cc) exactly.
+int cl_arq_controller::test_recovery_ack_capture()
+{
+	const char* NM = "TEST-RECOVERY-ACK-CAPTURE";
+	if(telecom_system == nullptr)
+	{
+		printf("[%s] ERROR: telecom_system is null\n", NM); fflush(stdout); return 1;
+	}
+
+	telecom_system->narrowband_enabled = NO;
+	this->narrowband_enabled           = NO;
+	telecom_system->load_configuration(ROBUST_0);
+	if(telecom_system->ack_mfsk.M != 16 ||
+	   telecom_system->ack_mfsk.ack_pattern_nsymb != 16)
+	{
+		printf("[%s] ERROR: ack_mfsk not M=16/16-sym at ROBUST_0\n", NM);
+		fflush(stdout); return 1;
+	}
+	const int thr = telecom_system->ack_mfsk.ack_match_threshold;
+	if(thr != 7) { printf("[%s] ERROR: ack_match_threshold=%d (want 7)\n", NM, thr); fflush(stdout); return 1; }
+
+	cl_data_container& dc = telecom_system->data_container;
+	const double fs        = telecom_system->sampling_frequency;
+	const int    Mdec      = dc.interpolation_rate;
+	const int    sym_samples   = dc.Nofdm * Mdec;
+	const double eff_carrier   = telecom_system->carrier_frequency + telecom_system->last_coarse_freq_offset;
+
+	int ack_nsymb     = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int ack_base_total= telecom_system->ack_mfsk.ack_base_total_nsymb();
+	int pattern_len   = ack_base_total;
+	int tail_nsymb    = ack_base_total + pattern_len + 16;
+	int buffer_Nsymb  = dc.buffer_Nsymb.load();
+	int signal_period = sym_samples * buffer_Nsymb;
+	int tail_samples  = tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	int tail_offset   = signal_period - tail_samples;
+
+	int ack_samples = telecom_system->ack_pattern_passband_samples;
+	if(ack_samples <= 0 || ack_samples > tail_samples)
+	{
+		printf("[%s] ERROR: bad ack_samples=%d (tail_samples=%d)\n", NM, ack_samples, tail_samples);
+		fflush(stdout); return 1;
+	}
+	std::vector<double> ack_pb((size_t)ack_samples, 0.0);
+	int w = telecom_system->generate_ack_pattern_passband(ack_pb.data());
+	if(w != ack_samples)
+	{
+		printf("[%s] ERROR: generate returned %d (want %d)\n", NM, w, ack_samples);
+		fflush(stdout); return 1;
+	}
+
+	std::vector<std::complex<double> > bb;
+	auto score_at = [&](int off, int& out_matched, double& out_metric) {
+		std::vector<double> snap((size_t)tail_samples, 0.0);
+		for(int i = 0; i < tail_samples; i++)
+			snap[(size_t)i] = dc.passband_delayed_data[off + i];
+		int dec = tail_samples / Mdec;
+		bb.assign((size_t)dec, std::complex<double>(0.0,0.0));
+		telecom_system->ofdm.passband_to_baseband_decimated(snap.data(), tail_samples,
+			bb.data(), fs, eff_carrier, telecom_system->carrier_amplitude, Mdec,
+			&telecom_system->ofdm.FIR_rx_data);
+		int matched = 0; int bo = -1; uint32_t mask = 0;
+		telecom_system->ofdm.ack_allow_partial_tail = true;
+		double met = telecom_system->ofdm.detect_ack_pattern(
+			bb.data(), dec, 1,
+			telecom_system->ack_mfsk.ack_pattern_nsymb,
+			telecom_system->ack_mfsk.ack_tones, telecom_system->ack_mfsk.ack_pattern_len,
+			telecom_system->ack_mfsk.tone_hop_step, telecom_system->ack_mfsk.M,
+			telecom_system->ack_mfsk.nStreams, telecom_system->ack_mfsk.stream_offsets,
+			&matched, 0, nullptr, &bo, 0, &mask,
+			/*always_fine=*/true, /*combine_reps=*/1);
+		telecom_system->ofdm.ack_allow_partial_tail = false;
+		out_matched = matched; out_metric = met;
+	};
+
+	int fails = 0;
+	int total = 2 * signal_period;
+	int stride = pattern_len * sym_samples;
+
+	{
+		memset(dc.passband_delayed_data, 0, (size_t)total * sizeof(double));
+		dc.ring_write_index = 0;
+		int partial_present = 3;
+		int burst_off = tail_offset - (ack_nsymb - partial_present) * sym_samples;
+		if(burst_off < 0) burst_off = 0;
+		if(burst_off + ack_samples > signal_period)
+			burst_off = signal_period - ack_samples;
+		for(int i = 0; i < ack_samples; i++)
+		{
+			dc.passband_delayed_data[burst_off + i]                 = ack_pb[(size_t)i];
+			dc.passband_delayed_data[signal_period + burst_off + i] = ack_pb[(size_t)i];
+		}
+
+		int m_nt = 0; double met_nt = 0.0;
+		score_at(tail_offset, m_nt, met_nt);
+		printf("[%s] ARM1 newest-tail: matched=%d/16 metric=%.2f (placed present~%d) -> %s\n",
+			NM, m_nt, met_nt, partial_present, (m_nt < thr) ? "MISS (expected)" : "UNEXPECTED HIT");
+		if(m_nt >= thr)
+		{
+			printf("[%s] ARM1 FAIL: newest tail captured a full block it should have missed\n", NM);
+			fails++;
+		}
+
+		const double MW_GATE_RMS = 0.001;
+		int chosen_off = -1; int m_mw = 0; double met_mw = 0.0;
+		for(int ph = 1; ph <= 24; ph++)
+		{
+			int off = tail_offset - ph * stride;
+			if(off < 0) break;
+			double sumsq = 0.0;
+			for(int i = 0; i < tail_samples; i++)
+			{
+				double v = dc.passband_delayed_data[off + i];
+				sumsq += v * v;
+			}
+			double rms = std::sqrt(sumsq / tail_samples);
+			if(rms < MW_GATE_RMS) continue;
+			int mm = 0; double mmet = 0.0;
+			score_at(off, mm, mmet);
+			if(mm >= thr)
+			{
+				chosen_off = off; m_mw = mm; met_mw = mmet; break;
+			}
+		}
+		printf("[%s] ARM2 multi-window: chosen_off=%d matched=%d/16 metric=%.2f -> %s\n",
+			NM, chosen_off, m_mw, met_mw, (chosen_off >= 0 && m_mw >= thr) ? "FULL BLOCK RECOVERED" : "NOT FOUND");
+		if(chosen_off < 0 || m_mw < thr)
+		{
+			printf("[%s] ARM2 FAIL: multi-window did not recover the full late block\n", NM);
+			fails++;
+		}
+	}
+
+	{
+		memset(dc.passband_delayed_data, 0, (size_t)total * sizeof(double));
+		int head_n = 4 * sym_samples; if(head_n > tail_samples) head_n = tail_samples;
+		const double* head_ptr = &dc.passband_delayed_data[0 + tail_offset];
+		bool any_nonzero_unwritten = false;
+		for(int i = 0; i < head_n; i++)
+			if(head_ptr[i] != 0.0) { any_nonzero_unwritten = true; break; }
+		bool unfilled_unwritten = !any_nonzero_unwritten;
+		printf("[%s] ARM3a unwritten ring: head all-zero=%d -> %s\n",
+			NM, unfilled_unwritten ? 1 : 0, unfilled_unwritten ? "DEFER (expected)" : "SCORED (bug)");
+		if(!unfilled_unwritten)
+		{
+			printf("[%s] ARM3a FAIL: unwritten exact-zero head not flagged unfilled\n", NM);
+			fails++;
+		}
+
+		std::mt19937 rng(20260616u);
+		std::normal_distribution<double> nd(0.0, 0.0003);
+		for(int i = 0; i < total; i++) dc.passband_delayed_data[i] = nd(rng);
+		bool any_nonzero_written = false;
+		for(int i = 0; i < head_n; i++)
+			if(head_ptr[i] != 0.0) { any_nonzero_written = true; break; }
+		bool unfilled_written = !any_nonzero_written;
+		printf("[%s] ARM3b written-silent ring: flagged unfilled=%d -> %s\n",
+			NM, unfilled_written ? 1 : 0, (!unfilled_written) ? "NOT deferred (expected)" : "FALSE DEFER (bug)");
+		if(unfilled_written)
+		{
+			printf("[%s] ARM3b FAIL: a written (noisy) ring was wrongly flagged unfilled\n", NM);
+			fails++;
+		}
+	}
+
+	bool pass = (fails == 0);
+	printf("[%s] %s: fails=%d\n", NM, pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
 }
 
 // ============================================================================

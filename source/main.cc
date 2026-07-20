@@ -1460,6 +1460,7 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             int failed = run_mfsk_ctrl_codec_tests();
+            failed += run_moose_deadzone_tests();
             failed += run_sim_clock_tests();
             failed += run_winlink_dict_tests();
             // AEAD bsi-bound nonce regression suite (data-flow-aead-nonce.md):
@@ -1511,6 +1512,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_adopt_nofdm_invariant();
             }
+            // Harvest regression: independently require the production-created CONFIG_0
+            // decoder to match the startup-patched primary geometry. The same test patch
+            // fails on bare monitor with Nofdm=310.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_harvest_inband_cfg0_geometry();
+            }
             // §21: CONFIG_0-START robust-floor OVER-SEAT (the uncovered sibling of FIX #1e). A session
             // that starts at CONFIG_0 (no robust->OFDM adopt) never latches inband_ofdm_acq_ring_shrunk,
             // so inband_seat_robust_ring_floor over-grows the natural OFDM ring (217->~804) -> every
@@ -1519,6 +1527,16 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_config0_start_ring();
+            }
+            // §22: the scoped down-ladder decoder bank inherits the PRIMARY's startup-patched ofdm_gi.
+            // A fresh `new cl_telecom_system()` rung otherwise keeps the ctor gi=54/256 -> CONFIG_0
+            // Nofdm=310 (not the production 292), an 18-sample/symbol FFT-window stride error that
+            // skips LDPC at WB CONFIG_0 -> the robust->OFDM cross never sustains. PASS-AFTER: 292.
+            // FAIL-BEFORE (MERCURY_INBAND_GI_INHERIT_DEFEAT=1, same binary): 310.
+            // data-flow-robust-ofdm-adopt-flush.md §22.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_down_decoder_gi_inherit();
             }
             // §17: descrambler survives the inband ring-shrink (the CONFIG_0 clean-lock CRC-fail root).
             {
@@ -2628,6 +2646,15 @@ int main(int argc, char *argv[])
             int failed = run_frame0_mf_selftest();
             return failed;
         }
+        // Reverse-MFSK/forward-OFDM preamble energy-ratio admission gate.
+        // In-process CFG15 synthetic fire; no audio, ARQ, or TCP setup.
+        if (strcmp(argv[i], "--test-subpeak-gate") == 0) {
+            arm_test_watchdog();
+            cl_telecom_system ts;
+            ts.operation_mode = BER_PLOT_passband;
+            ts.load_configuration(CONFIG_15);
+            return ts.test_subpeak_gate();
+        }
         if (strcmp(argv[i], "--test-frame0-replay") == 0) {
             const char* cap = (i+1 < argc) ? argv[i+1] : "";
             return run_frame0_replay_selftest(cap);
@@ -2738,6 +2765,13 @@ int main(int argc, char *argv[])
             int failed = ARQ_nofdm.test_inband_adopt_nofdm_invariant();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-harvest-inband-cfg0-geometry : force the production fresh-decoder
+        // condition and require the CONFIG_0 stride geometry to match the primary.
+        if (strcmp(argv[i], "--test-harvest-inband-cfg0-geometry") == 0) {
+            cl_arq_controller ARQ_cfg0;
+            int failed = ARQ_cfg0.test_harvest_inband_cfg0_geometry();
+            return (failed == 0) ? 0 : 1;
+        }
         // --test-inband-config0-start-ring : run ONLY the §21 CONFIG_0-START robust-floor over-seat
         // regression (the uncovered sibling of FIX #1e) and exit. Fast + deterministic; see
         // arq_responder.cc::test_inband_config0_start_ring + data-flow-robust-ofdm-adopt-flush.md §21.
@@ -2758,6 +2792,12 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-inband-deadbatch-progress") == 0) {
             cl_arq_controller ARQ_db;
             int failed = ARQ_db.test_inband_deadbatch_progress();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-moose: drive the production Moose reject/clamp predicate at
+        // CFG15 spacing. MOOSE_CFO_FAILBEFORE reproduces the old dead zone.
+        if (strcmp(argv[i], "--test-moose") == 0) {
+            int failed = run_moose_deadzone_tests();
             return (failed == 0) ? 0 : 1;
         }
         // --test-winlink-dict : run ONLY the Winlink dict priming + version-lock
@@ -2836,6 +2876,87 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-recovery-ack") == 0) {
             int failed = run_recovery_ack_tests();
             return (failed == 0) ? 0 : 1;
+        }
+        // --test-recovery-ack-fine : recovery-ack-fine STAGE 1 fine-pass timing-
+        // straddle sweep (data-flow-ack-detector.md §2). Fail-before (no-fine
+        // coarse collapse below 7/16) / pass-after (fine recovers over the
+        // hardened bar) across a tau sweep. Fast + deterministic. Also in --test.
+        if (strcmp(argv[i], "--test-recovery-ack-fine") == 0) {
+            int failed = run_recovery_ack_fine_tests();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --rescore-recovery-ack <iqfile.bin> : LEVER 2 OFFLINE NON-CIRCULAR RESCORE
+        // (data-flow-recovery-ack-capture.md §7). Replays a REAL captured recovery-ACK
+        // I/Q buffer (the MERCURY_RECOVERY_ACK_DIAG dump: interleaved float64 I,Q,
+        // dec_size complex samples = EXACTLY data_container.baseband_data_interpolated
+        // [0..size/M) the production recovery poll scored) through the EXACT production
+        // scorer ofdm.detect_ack_pattern(iq, n, /*interp=*/1, ...) and reports both the
+        // deployed no-fine coarse path AND the LEVER-2 fine+partial-tail path, plus the
+        // LEVER-2 two-arm accept decision. The keystone non-circular gate: it isolates
+        // the detector relaxation from live-A/B confounds by replaying the real recorded
+        // I/Q. Diagnostic-only; no default-path cost; byte-identical guarantee untouched.
+        if (strcmp(argv[i], "--rescore-recovery-ack") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--rescore-recovery-ack needs an I/Q .bin path\n");
+                return 2;
+            }
+            const char* iqpath = argv[i + 1];
+            FILE* f = fopen(iqpath, "rb");
+            if (!f) { fprintf(stderr, "RESCORE_ERR cannot open %s\n", iqpath); return 2; }
+            fseek(f, 0, SEEK_END); long bytes = ftell(f); fseek(f, 0, SEEK_SET);
+            long npairs = bytes / (long)(2 * sizeof(double));
+            if (npairs <= 0) { fprintf(stderr, "RESCORE_ERR empty/short %s (%ld bytes)\n", iqpath, bytes); fclose(f); return 2; }
+            std::vector<std::complex<double> > iq((size_t)npairs);
+            for (long k = 0; k < npairs; k++) {
+                double dv[2];
+                if (fread(dv, sizeof(double), 2, f) != 2) { npairs = k; break; }
+                iq[(size_t)k] = std::complex<double>(dv[0], dv[1]);
+            }
+            fclose(f);
+            cl_telecom_system ts;
+            ts.operation_mode = ARQ_MODE;
+            ts.load_configuration(ROBUST_0);   // config-independent ack_mfsk M=16/16-sym
+            int nsymb = ts.ack_mfsk.ack_pattern_nsymb;
+            int matched_nf = 0, matched_ff = 0;
+            int best_off_nf = -1, best_off_ff = -1;
+            uint32_t mask_nf = 0, mask_ff = 0;
+            // ARM-OFF (deployed no-fine coarse): always_fine=false, no partial-tail.
+            ts.ofdm.ack_allow_partial_tail = false;
+            double metric_nf = ts.ofdm.detect_ack_pattern(
+                iq.data(), (int)npairs, /*interp=*/1, nsymb,
+                ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+                ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+                ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+                &matched_nf, 0, nullptr, &best_off_nf, 0, &mask_nf,
+                /*always_fine=*/false, /*combine_reps=*/ts.ack_mfsk.recovery_ack_reps);
+            // ARM-ON (LEVER 2: fine sub-window MAX + partial-tail scoring).
+            ts.ofdm.ack_allow_partial_tail = true;
+            double metric_ff = ts.ofdm.detect_ack_pattern(
+                iq.data(), (int)npairs, /*interp=*/1, nsymb,
+                ts.ack_mfsk.ack_tones, ts.ack_mfsk.ack_pattern_len,
+                ts.ack_mfsk.tone_hop_step, ts.ack_mfsk.M,
+                ts.ack_mfsk.nStreams, ts.ack_mfsk.stream_offsets,
+                &matched_ff, 0, nullptr, &best_off_ff, 0, &mask_ff,
+                /*always_fine=*/true, /*combine_reps=*/ts.ack_mfsk.recovery_ack_reps);
+            ts.ofdm.ack_allow_partial_tail = false;
+            // LEVER-2 two-arm accept (the production recovery-fine gate, arq_common.cc):
+            // (matched>=7 && metric>=1.5) || (matched>=5 && metric>=3.0). The coarse_metric
+            // OFDM-alias class gate is an in-loop value not present in the dumped baseband,
+            // so it is NOT applied here (these are PURE ACK-band baseband dumps with no
+            // competing OFDM signal — the in-loop gate only adds rejections, never accepts).
+            bool arm_a = (matched_ff >= 7) && (metric_ff >= 1.5);
+            bool arm_b = (matched_ff >= 5) && (metric_ff >= 3.0);
+            bool accept = arm_a || arm_b;
+            printf("RESCORE file=%s n=%ld nsymb=%d "
+                   "nofine_matched=%d nofine_metric=%.4f nofine_mask=0x%04x nofine_off=%d "
+                   "fine_matched=%d fine_metric=%.4f fine_mask=0x%04x fine_off=%d "
+                   "armA=%d armB=%d accept=%d\n",
+                   iqpath, npairs, nsymb,
+                   matched_nf, metric_nf, mask_nf & 0xFFFFu, best_off_nf,
+                   matched_ff, metric_ff, mask_ff & 0xFFFFu, best_off_ff,
+                   arm_a ? 1 : 0, arm_b ? 1 : 0, accept ? 1 : 0);
+            fflush(stdout);
+            return 0;
         }
     }
 
@@ -3014,6 +3135,8 @@ int main(int argc, char *argv[])
                                         // TURNAROUND_DEFEAT. One-shot, exits rc.
     bool test_measured_timers_cli = false; // --test-measured-timers: R6 SRTT/RTTVAR turnaround estimator +
                                         // ack_timeout_data >= receiving_timeout invariant regression (one-shot, exit rc).
+    bool test_recovery_ack_capture_exercise_cli = false; // --test-recovery-ack-capture-exercise:
+                                        // live production poll, late retained ACK -> 1/1 accept.
     bool test_turnaround_guard_cli = false; // --test-turnaround-guard: R1 turnaround-clearance guard —
                                         // stamp-then-key drives assert the guard waits out the peer's TX->RX
                                         // mute/flush window (default-on) and adds ~0 when already clear / never armed.
@@ -3060,6 +3183,10 @@ int main(int argc, char *argv[])
                                         // + the R7 mixed-config gap-gate case. fail-before: MERCURY_INBAND_RATE
                                         // unset OR -DINBAND_STAGE3B_FAILBEFORE. One-shot, exits rc.
                                         // data-flow-perbatch-config.md §12 / unilateral-config-tag-design.md §11 Stage 3.
+    bool test_recovery_ack_capture_cli = false; // --test-recovery-ack-capture: LEVER 1 focused
+                                        // capture-window test (recovery-ACK late/truncated + unwritten-head
+                                        // ring). See arq_responder.cc test_recovery_ack_capture +
+                                        // fact-documents/data-flow-recovery-ack-capture.md §7.
     bool test_data_ack_multiwindow_cli = false; // --test-data-ack-multiwindow: Track A — multi-window
                                         // DATA-ACK/SACK correlator. Synthesizes a real ACK+SACK burst at an
                                         // OLDER ring phase with a silent newest tail: fail-before (newest-tail
@@ -3892,6 +4019,15 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
+        else if (strcmp(argv[i], "--test-recovery-ack-capture-exercise") == 0)
+        {
+            // Set before modem initialization so the production gate's cached
+            // first read observes the exercise arm.
+            setenv("MERCURY_RECOVERY_ACK_REPHASE", "1", 1);
+            test_recovery_ack_capture_exercise_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
         else if (strcmp(argv[i], "--test-axis2-quiesce-gate") == 0)
         {
             // R4 LINK-PARAMS quiesce-gate regression — one-shot at startup, exit rc.
@@ -4155,6 +4291,16 @@ int main(int argc, char *argv[])
             // (the genuine-death net is intact). Gate that MUST be GREEN before the
             // Phase-2 demote-decouple. See data-flow-forgiving-ack.md §T2.2/§6.
             test_a3_decouple_safety_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-recovery-ack-capture") == 0)
+        {
+            // recovery-ack-capture LEVER 1 focused capture-window regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_recovery_ack_capture
+            // + fact-documents/data-flow-recovery-ack-capture.md §7.
+            test_recovery_ack_capture_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5981,6 +6127,15 @@ start_modem:
             fflush(stdout);
             exit(rc);
         }
+        if (test_recovery_ack_capture_exercise_cli) {
+            printf("[FLAG] --test-recovery-ack-capture-exercise: forcing late "
+                   "recovery ACK capture\n");
+            fflush(stdout);
+            int rc = ARQ.test_recovery_ack_capture_exercise();
+            printf("[FLAG] Recovery-ACK capture exercise complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
         if (test_axis2_quiesce_gate_cli) {
             // R4 LINK-PARAMS quiesce gate — an Axis-2 move defers while the batch boundary
             // is unclean and fires when clean (one-shot, exit rc).
@@ -6218,6 +6373,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_data_ack_multiwindow();
             printf("[FLAG] Data-ACK-multiwindow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_recovery_ack_capture_cli) {
+            // recovery-ack-capture LEVER 1 focused capture-window test (one-shot, exit rc).
+            printf("[FLAG] --test-recovery-ack-capture: invoking recovery-ACK "
+                   "capture-window regression (LEVER 1)\n");
+            fflush(stdout);
+            int rc = ARQ.test_recovery_ack_capture();
+            printf("[FLAG] Recovery-ACK-capture test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

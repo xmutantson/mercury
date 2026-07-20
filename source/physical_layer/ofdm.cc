@@ -4680,7 +4680,19 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	int best_suffix_matched = 0;
 	uint32_t best_match_mask = 0;
 
-	for (int s = 0; s <= buffer_nsymb - total_needed; s++)
+	// recovery-ack-capture LEVER 2 (data-flow-recovery-ack-capture.md §6): when
+	// ack_allow_partial_tail is set (recovery-fine only), also test start positions
+	// where the base block OVERSHOOTS the tail — the per-symbol loop below already
+	// break's at the buffer edge, so a partial block is scored on the symbols PRESENT
+	// (the LATE-TRUNCATED class, 68% of HW misses, where 0/32 hold a full 16-sym run).
+	// reps>1 partial-tail is NOT supported (the combine reps must all fit); keep the
+	// strict bound there. DEFAULT FALSE → s_max = the verbatim full-fit bound → the
+	// loop is byte-identical for every caller.
+	int s_max = buffer_nsymb - total_needed;
+	if (ack_allow_partial_tail && combine_reps == 1)
+		s_max = buffer_nsymb - 1;   // allow the last 15 partial-tail start positions
+
+	for (int s = 0; s <= s_max; s++)
 	{
 		double metric = 0;
 		int matched = 0;
@@ -4843,11 +4855,21 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			uint32_t mask_f = 0;
 			bool oob = false;
 
+			// recovery-ack-capture LEVER 2: under partial-tail, an OOB symbol STOPS the
+			// per-symbol count but does NOT reject the candidate — the partial score (the
+			// symbols PRESENT) is kept. partial_tail tracks "ran off the tail but score
+			// the partial"; oob keeps the strict "reject" meaning for the default path.
+			bool partial_tail = false;
 			for (int p = 0; p < ack_nsymb && !oob; p++)
 			{
 				int offset = d + p * sym_period_interp + Ngi * interpolation_rate;
 				if (offset + Nfft * interpolation_rate > buffer_size_interp)
 				{
+					if (ack_allow_partial_tail && combine_reps == 1)
+					{
+						partial_tail = true;   // stop counting; keep matched_f so far
+						break;
+					}
 					oob = true;
 					break;
 				}

@@ -407,6 +407,7 @@ source/datalink_layer/test_stream_offset.cc
 source/datalink_layer/test_decompress_false_accept.cc
 source/datalink_layer/test_kx_data_tamper.cc
 source/datalink_layer/test_compact_confirm_rx.cc
+source/datalink_layer/test_recovery_ack_capture_exercise.cc
 source/datalink_layer/b2f_handler.cc
 source/datalink_layer/channel_state_lookup.cc
 source/datalink_layer/datalink_config.cc

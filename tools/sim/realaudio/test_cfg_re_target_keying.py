@@ -15,6 +15,7 @@ FAIL-BEFORE: with the pre-fix `add(int(m.group(2)))`, configs_seen would be the 
 of `current=` values {-1?,100,101,102} and would NOT contain 0 -> the cfg0 assert
 fails (the exact under-report this fixes).
 """
+import io
 import os
 import re
 import sys
@@ -47,6 +48,40 @@ def collect_targets(lines):
     return seen
 
 
+class FakeMercury:
+    """Minimal process seam for driving the production log parser in-process."""
+
+    def __init__(self, lines):
+        payload = "\n".join(lines) + "\n"
+        self.stdout = io.BytesIO(payload.encode("utf-8"))
+
+
+def exercise_rsp_delivery_path():
+    """Force a ROBUST_2 -> CONFIG_0 load followed by actual WB DATA delivery."""
+    st = ra.State()
+    proc = FakeMercury([
+        "[CFG] load_configuration(100) current=-1 level=FULL backup=NO",
+        "[CFG] load_configuration(0) current=102 level=PHYS_ONLY backup=NO",
+        "[RX-BATCH-SEQ] type=DATA_LONG id=1 seq=1 batch_seq_id=3 (v2)",
+        "stats.nReceived_data= 4",
+    ])
+    captured = io.StringIO()
+    ra.log_output(proc, "RSP", captured, 0.0, st)
+
+    assert st.configs_seen == {100, 0}, \
+        "production log_output must record TARGET configs, including CONFIG_0"
+    assert st.rsp_configs_seen == {100, 0}, \
+        "responder config history must be target-keyed and side-specific"
+    assert st.rsp_loaded_wb_id == 0, \
+        "CONFIG_0 target load must arm the durable WB crossing evidence"
+    assert st.rsp_wb_data_frames == 1 and st.rsp_max_wb_cfg_with_data == 0, \
+        "WB crossing requires a responder DATA decode while CONFIG_0 is active"
+    assert st.rsp_nreceived == 4, \
+        "delivery evidence must accompany the WB DATA decode"
+    assert "[RSP] [RX-BATCH-SEQ] type=DATA_LONG" in captured.getvalue(), \
+        "the exercised line must traverse the production logger"
+
+
 def main():
     seen = collect_targets(LOG)
 
@@ -68,7 +103,11 @@ def main():
     assert wb_seen == [0], f"wb_configs_seen must report the cfg0 cross, got {wb_seen}"
     assert max(seen) == 102, "max robust rung preserved"
 
-    print("[OK] CFG_RE target-keying: configs_seen=%s wb_seen=%s (cfg0 cross reported)"
+    # Exercise the real per-process log consumer, not just CFG_RE in isolation.
+    exercise_rsp_delivery_path()
+
+    print("[OK] CFG_RE/log_output target-keying: configs_seen=%s wb_seen=%s "
+          "rsp_wb_data_frames=1 delivered_frames=4"
           % (sorted(seen), wb_seen))
     return 0
 

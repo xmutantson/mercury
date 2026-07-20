@@ -290,7 +290,15 @@ public:
 	// [bsi:8 | bitmap:32 | crc12:12]. Returns samples written, or 0 if
 	// unsupported (NB / M<16). Caller supplies the crc12.
 	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12);
-	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr);  // RX: returns metric
+	// use_fine (recovery-ack-fine, STAGE 1): when true, the underlying
+	// detect_ack_pattern runs its always_fine sub-window timing pass even when
+	// coarse matched<6 — the recovery control-ACK 16-sym block straddles the
+	// detection window in time (whole-block energy collapse → matched 1-6/16),
+	// and only the fine pass can re-align it. Default false → the verbatim
+	// integer no-fine path → byte-identical. ONLY the ARQ recovery-poll caller
+	// (RECEIVING_ACKS_CONTROL + MERCURY_RECOVERY_ACK_FINE) passes true; data-ACK
+	// / BREAK / SACK / CONNECT keep false.
+	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr, bool use_fine = false);  // RX: returns metric
 	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	// RX: detect ACK pattern and decode the 40-bit ACK+SACK suffix (WB M>=16
 	// only). Runs detector + ofdm.decode_suffix_tones + unpack in one call —
@@ -556,6 +564,16 @@ public:
 	void transmit_byte(int* data, int nBytes, double *out, int message_location);
 	st_receive_stats receive_byte(double *data, int* out);
 
+	// Default-off rejection of reverse-direction narrowband MFSK bursts that
+	// Schmidl-Cox can admit as forward OFDM preambles. The discriminator is the
+	// preamble baseband-decimated/passband mean-energy ratio: HW real OFDM is
+	// 0.565-0.584 while the false-lock population is 0.904-0.907.
+	static constexpr double SUBPEAK_PREAM_RATIO_REJECT = 0.74;
+	static bool subpeak_metric_gate_enabled();
+	bool subpeak_reject_out_of_band(double bb_pream, double pb_pream) const;
+	bool subpeak_admission_reject(double bb_pream, double pb_pream) const;
+	int test_subpeak_gate();
+
 	// F1b Part B (true-boundary rescue selector). Re-estimates the OFDM channel at
 	// a candidate full-rate delay and returns mean(|H|) over MEASURED pilots, with
 	// NO frequency-sync re-run and NO receive_stats side effects — a pure selector
@@ -581,6 +599,36 @@ public:
 	// (MINI) for non-anchor non-forced frames; full_nsymb otherwise. STATIC /
 	// PURE so TX and RX get bit-identical results.
 	static int preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb);
+
+	// Moose CFO sanity decision (STATIC / PURE so the production receive loop
+	// and the --test-moose regression call the identical predicate — the
+	// no-divergence guarantee, same pattern as preamble_sched_nsymb).
+	//
+	// The Moose half-symbol estimator (ofdm.cc:carrier_sampling_frequency_sync)
+	// has a WB capture range of +-2 subcarriers (nIS=4 => +-93.75 Hz at
+	// subcarrier_spacing 46.875), but the applied correction is CLAMPED to +-1
+	// subcarrier (+-subcarrier_spacing). Any |estimate| in the half-correction
+	// DEAD ZONE [subcarrier_spacing, 2*subcarrier_spacing] was previously NOT
+	// rejected (old reject threshold was 2*subcarrier_spacing) yet only HALF
+	// corrected by the clamp, committing a residual CFO up to ~subcarrier_spacing
+	// (~47 Hz). That residual rotates the per-subcarrier channel estimate H
+	// symbol-to-symbol; the cross-pilot noise estimator
+	// (ofdm.cc:estimate_noise_from_pilot_pairs) reads the rotation as
+	// catastrophic noise -> SKIP-VAR -> 3-consecutive abort -> FTR-FAIL, so the
+	// link never establishes. Root cause: the reject threshold and the clamp
+	// ceiling were 2:1 instead of equal.
+	//
+	// This predicate closes the dead zone: when |estimate| exceeds the clamp
+	// ceiling (subcarrier_spacing) AND the search can still advance to another
+	// timing candidate, REJECT (the caller advances the trial to hunt the true
+	// peak) instead of committing a known-bad half-clamped residual. Legitimate
+	// small residuals (|estimate| <= subcarrier_spacing, real crystal offsets
+	// <~20 Hz) are clamped/accepted exactly as before.
+	enum moose_decision_t { MOOSE_REJECT_ADVANCE = 0, MOOSE_CLAMP = 1 };
+	static moose_decision_t moose_clamp_decision(double freq_offset_measured,
+	                                              double subcarrier_spacing,
+	                                              bool can_advance_trial,
+	                                              double& corrected_out);
 
 	// Master enable for preamble amortization. DEFAULT OFF pending INC-3 (the
 	// batch-predict position-chain handoff for MINI frames that land beyond the

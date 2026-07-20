@@ -733,6 +733,20 @@ inline bool cumulative_ack_covers(int rx_n_r, int target_bsi, bool cap_on,
 	return back <= (unsigned)CUMULATIVE_ACK_WINDOW;  // (a) at-or-below the high-water
 #endif
 }
+// recovery-ack-capture LEVER 1(a) (data-flow-recovery-ack-capture.md §0/§6): the BREAK/SET_CONFIG
+// RECOVERY control-ACK poll has the SAME root mis-phase as the data-ACK turnaround — the CMD listen
+// window has no term ∝ the forward held airtime, so the reverse recovery-ACK arrives systematically
+// LATE and slides out of the snapshot (HW forensics: 47/47 miss buffers, 0/47 contain a full block;
+// the LATE-TRUNCATED block clusters at the RIGHT tail edge, ~10 of 16 symbols in). UNLIKE the data-ACK
+// turnaround the recovery control batch is SHORT and fixed (a SET_CONFIG control frame on ROBUST_0 +
+// the responder turnaround), so the late shift is near-FIXED (the dumped offsets cluster tightly), NOT
+// batch-airtime-proportional. So the recovery re-phase is a BOUNDED FIXED late-recenter = the recovery
+// ACK block airtime (one ack_pattern_time_ms, the span the block must land within) + a small variance
+// guard. This re-CENTERS the window LATER so its later half brackets the late block (the A1 mechanism,
+// fixed-sized for the short recovery batch). DEFAULT-OFF (MERCURY_RECOVERY_ACK_REPHASE); UNSET => the
+// adder is 0 => BYTE-IDENTICAL recovery window. Bounded so a stuck recovery cannot inflate the window.
+static const int RECOVERY_ACK_REPHASE_GUARD_MS = 150;
+static const int RECOVERY_ACK_REPHASE_MAX_MS   = 2500; // hard ceiling on the recovery late-recenter
 
 // Returns the modulation type for an OFDM config (MOD_BPSK=2, MOD_QPSK=4, etc.)
 // Used by monitor opportunistic decoder to detect same-modulation config switches
