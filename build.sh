@@ -467,6 +467,14 @@ source/crypto/test_aead_nonce.cc
 source/crypto/test_mlkem_hybrid.cc
 "
 
+# Auto-discover test sources added under source/ without compiling other .cc files.
+while IFS= read -r test_src; do
+    if ! printf '%s\n' "$CPP_SOURCES" | grep -Fxq "$test_src"; then
+        CPP_SOURCES="${CPP_SOURCES}${test_src}
+"
+    fi
+done < <(find source -type f -name 'test_*.cc' -print | sort)
+
 # Compression library C sources (PPMd8 from LZMA SDK, zstd amalgamated, LZHUF for B2F)
 COMPRESSION_C_SOURCES="
 source/compression/ppmd/Ppmd8.c
