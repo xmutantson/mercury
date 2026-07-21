@@ -30,6 +30,13 @@ extern "C" {
 // PPMd model order (2-16). Order 6 = 2 MB memory, good for small blocks.
 #define PPMD_ORDER   6
 #define PPMD_MEM_SIZE (1 << 21)  // 2 MB
+#define PPMD_SAVINGS_CREDIT_CAP 65535
+
+static bool compress_retry_defeat_enabled()
+{
+	const char* e = getenv("MERCURY_COMPRESS_RETRY_DEFEAT");
+	return e && *e && atoi(e) != 0;
+}
 
 // ---------- CRC16-MODBUS for streaming desync detection ----------
 
@@ -114,6 +121,7 @@ cl_compressor::cl_compressor()
 	stream_batch_count = 0;
 	ppmd_model_warm = false;
 	ppmd_model_initialized = false;
+	ppmd_savings_credit = 0;
 	zstd_prefix = nullptr;
 	zstd_prefix_len = 0;
 	pending_raw = nullptr;
@@ -188,6 +196,11 @@ void cl_compressor::deinit()
 		free(ppmd_ctx);
 		ppmd_ctx = nullptr;
 	}
+	if (ppmd_mem)
+	{
+		free(ppmd_mem);
+		ppmd_mem = nullptr;
+	}
 	if (zstd_cctx)
 	{
 		ZSTD_freeCCtx((ZSTD_CCtx*)zstd_cctx);
@@ -227,6 +240,7 @@ void cl_compressor::streaming_enable()
 	// on the first ppmd_compress/ppmd_decompress call (or after a reset). Mark it
 	// uninitialized so the first PPMd use Init()s before encoding/decoding.
 	ppmd_model_initialized = false;
+	ppmd_savings_credit = 0;
 	dict_version_active = 0;
 	streaming_active = true;
 
@@ -278,6 +292,9 @@ int cl_compressor::prime_with_dict()
 		streaming_reset();
 		return 0;
 	}
+	// The baked primer is shared starting state, not transmitted savings. Do not
+	// let its compression ratio fund expansion in the first real-data batch.
+	ppmd_savings_credit = 0;
 
 	// (2) Load the raw dict into the zstd prefix window (and mark the model warm).
 	streaming_commit((const unsigned char*)WINLINK_DICT_RAW, (int)WINLINK_DICT_RAW_LEN);
@@ -306,6 +323,7 @@ void cl_compressor::streaming_disable()
 		Ppmd8_Init((CPpmd8*)ppmd_ctx, PPMD_ORDER, PPMD8_RESTORE_METHOD_RESTART);
 	ppmd_model_warm = false;
 	ppmd_model_initialized = false;
+	ppmd_savings_credit = 0;
 	dict_version_active = 0;
 	stream_batch_count = 0;
 
@@ -334,6 +352,7 @@ void cl_compressor::streaming_reset()
 	// uninitialized so the next ppmd_compress/decompress Re-Init()s deterministically
 	// (matches the prior behavior where warm==false forced a re-Init).
 	ppmd_model_initialized = false;
+	ppmd_savings_credit = 0;
 	zstd_prefix_len = 0;
 	pending_raw_len = 0;
 	stream_batch_count = 0;
@@ -418,6 +437,24 @@ void cl_compressor::ppmd_model_reset()
 	// Mark uninitialized so the next ppmd_compress/decompress Re-Init()s fresh and
 	// deterministically on both sides. No Ppmd8_Init here — it is lazy.
 	ppmd_model_initialized = false;
+	ppmd_savings_credit = 0;
+}
+
+void cl_compressor::ppmd_savings_update(int raw_len, int comp_len)
+{
+	int delta = raw_len - comp_len;
+	if (delta > 0)
+	{
+		if (ppmd_savings_credit > PPMD_SAVINGS_CREDIT_CAP - delta)
+			ppmd_savings_credit = PPMD_SAVINGS_CREDIT_CAP;
+		else
+			ppmd_savings_credit += delta;
+	}
+	else if (delta < 0)
+	{
+		ppmd_savings_credit += delta;
+		if (ppmd_savings_credit < 0) ppmd_savings_credit = 0;
+	}
 }
 
 // ---------- Shannon entropy (bits per byte) ----------
@@ -575,6 +612,37 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 	int best_comp_size = in_len;
 	int best_offset = 0;  // offset into workspace where best payload lives
 	bool best_is_raw = true;
+	bool ppmd_credit_bridge = false;
+
+	// A carried PPMd attempt mutates roughly 2 MB of model state. If this input
+	// might exceed the caller's wire capacity, checkpoint that state so a no-fit
+	// result can be retried with a shorter prefix without throwing away the useful
+	// model shared with RX. The checkpoint is only taken for risky warm attempts;
+	// ordinary capacity-safe batches pay no copy/allocation cost.
+	CPpmd8 ppmd_snapshot;
+	unsigned char* ppmd_snapshot_mem = nullptr;
+	bool ppmd_snapshot_valid = false;
+	if (streaming_active && ppmd_model_initialized && ppmd_ctx)
+	{
+		int bridge_limit = in_len / 20;
+		if (bridge_limit < 64) bridge_limit = 64;
+		if (bridge_limit > ppmd_savings_credit)
+			bridge_limit = ppmd_savings_credit;
+		long long worst_selected_total = (long long)hdr_size + in_len + bridge_limit;
+		if (worst_selected_total > out_capacity)
+		{
+			CPpmd8* live = (CPpmd8*)ppmd_ctx;
+			if (!ppmd_mem)
+				ppmd_mem = malloc(live->Size);
+			ppmd_snapshot_mem = (unsigned char*)ppmd_mem;
+			if (ppmd_snapshot_mem)
+			{
+				ppmd_snapshot = *live;
+				memcpy(ppmd_snapshot_mem, live->Base, live->Size);
+				ppmd_snapshot_valid = true;
+			}
+		}
+	}
 
 	// Use heap workspace split in two halves for zstd and PPMd output
 	int half = workspace_size / 2;
@@ -595,16 +663,26 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 	// try-both rather than forcing PPMd-only against a diverged model.)
 	if (streaming_active && ppmd_model_initialized)
 	{
-		if (entropy < ENTROPY_SKIP_ALL)
+		// Zero-order byte entropy is not an incompressibility proof for a
+		// conditional model. Byte-balanced/repeated structures (including JPEG
+		// scan regions) can measure near 8 bits/byte while a carried PPMd model
+		// still predicts them well. Always test the live model; if it does not
+		// shrink this batch, RAW wins below and the stream resets, so genuinely
+		// random attachments pay for only this one transition probe.
+		int ps = ppmd_compress(uin, in_len, workspace + half, half);
+		int expansion = ps - in_len;
+		int bridge_limit = in_len / 20;  // At most 5% local expansion.
+		if (bridge_limit < 64) bridge_limit = 64;
+		bool credit_bridge = ps > 0 && expansion >= 0
+			&& expansion <= bridge_limit
+			&& expansion <= ppmd_savings_credit;
+		if (ps > 0 && (ps < best_comp_size || credit_bridge))
 		{
-			int ps = ppmd_compress(uin, in_len, workspace + half, half);
-			if (ps > 0 && ps < best_comp_size)
-			{
-				best_algo = COMPRESS_ALGO_PPMD;
-				best_comp_size = ps;
-				best_offset = half;
-				best_is_raw = false;
-			}
+			best_algo = COMPRESS_ALGO_PPMD;
+			best_comp_size = ps;
+			best_offset = half;
+			best_is_raw = false;
+			ppmd_credit_bridge = credit_bridge;
 		}
 	}
 	else
@@ -640,15 +718,20 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 	int compressed_total = hdr_size + best_comp_size;
 	int raw_total = hdr_size + in_len;
 
-	// If compressed >= raw, prefer raw (no overhead)
-	if (!best_is_raw && compressed_total >= raw_total)
+	// Normally prefer RAW when compression does not shrink this batch. A warm
+	// PPMd run may instead bridge a small local expansion when accumulated savings
+	// fully cover it; this preserves valuable conditional context without ever
+	// making the carried run cumulatively larger than RAW.
+	if (!best_is_raw && compressed_total >= raw_total && !ppmd_credit_bridge)
 	{
 		best_algo = COMPRESS_ALGO_RAW;
 		best_comp_size = in_len;
 		best_is_raw = true;
 		// Streaming: PPMd model was advanced but RX will use RAW (no model advance).
 		// Reset streaming to avoid desync.
-		if (streaming_active && ppmd_model_warm)
+		bool ppmd_advanced = compress_retry_defeat_enabled()
+			? ppmd_model_warm : ppmd_model_initialized;
+		if (streaming_active && ppmd_advanced)
 		{
 			printf("[COMPRESS] Streaming: PPMd tried but raw wins — resetting\n");
 			fflush(stdout);
@@ -661,9 +744,22 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 	// Check if result fits in output buffer
 	if (total > out_capacity)
 	{
+		// A warm PPMd no-fit can be retried transactionally: restore the exact
+		// pre-probe model, leaving committed stream/prefix/credit untouched.
+		if (ppmd_snapshot_valid && best_algo == COMPRESS_ALGO_PPMD)
+		{
+			CPpmd8* live = (CPpmd8*)ppmd_ctx;
+			memcpy(live->Base, ppmd_snapshot_mem, live->Size);
+			*live = ppmd_snapshot;
+			printf("[COMPRESS] Streaming: doesn't fit - PPMd state rolled back\n");
+			fflush(stdout);
+			return -1;
+		}
 		// Streaming: model was advanced but data won't be sent as-is.
 		// Caller may retry with less data — reset to prevent desync.
-		if (streaming_active && ppmd_model_warm)
+		bool ppmd_advanced = compress_retry_defeat_enabled()
+			? ppmd_model_warm : ppmd_model_initialized;
+		if (streaming_active && ppmd_advanced)
 		{
 			printf("[COMPRESS] Streaming: doesn't fit — resetting\n");
 			fflush(stdout);
@@ -682,6 +778,8 @@ int cl_compressor::compress_block(const char* in, int in_len, char* out, int out
 	// model the RX never initialized → segfault.) The zstd prefix is untouched.
 	if (streaming_active && best_algo != COMPRESS_ALGO_PPMD)
 		ppmd_model_reset();
+	else if (streaming_active)
+		ppmd_savings_update(in_len, best_comp_size);
 
 	// Write header: [algo_flags:1][comp_size:2 LE][orig_size:2 LE][crc16:2 LE if streaming]
 	// algo_flags bits 5-7 carry the ACTIVE dict version (0 = cold) so the RX can
@@ -840,8 +938,13 @@ int cl_compressor::decompress_block(const char* in, int in_len, char* out, int o
 	// diverge), and the next PPMd frame's warm path would decode into an
 	// uninitialized/diverged model (segfault or desync). PPMd frames legitimately
 	// carry the model — they are the only algo that must NOT reset it.
-	if (streaming_active && result > 0 && algo != COMPRESS_ALGO_PPMD)
-		ppmd_model_reset();
+	if (streaming_active && result > 0)
+	{
+		if (algo == COMPRESS_ALGO_PPMD)
+			ppmd_savings_update(orig_size, comp_size);
+		else
+			ppmd_model_reset();
+	}
 
 	return result;
 }

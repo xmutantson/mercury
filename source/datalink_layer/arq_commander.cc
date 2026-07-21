@@ -17252,6 +17252,307 @@ int cl_arq_controller::test_robust0_compress_deadlock()
 	return failed == 0 ? 0 : 1;
 }
 
+// Streaming compression ratio-estimator overshoot regression.
+//
+// The production fill path predicts raw bytes as batch_capacity * an EMA of
+// prior compression ratio. A locally weaker block can therefore compress to a
+// payload larger than batch_capacity. In streaming mode the old path allowed
+// only one compression call, discarded the now-reset model, pushed back 40%,
+// and then sent merely batch_capacity-header bytes RAW. The EMA was not updated,
+// so a high estimate could repeat this RAW conversion for the rest of a file.
+//
+// This test first proves the discriminator with the real codec: the large probe
+// does not fit, while a capacity-safe prefix is genuinely compressible. It then
+// drives the real process_buffer_data_commander() fill path and reconstructs the
+// exact compressed unit from messages_tx. The default requires a compressed,
+// byte-exact retry. MERCURY_COMPRESS_RETRY_DEFEAT=1 restores the one-shot/raw
+// behavior on the same binary and is the fail-before arm.
+int cl_arq_controller::test_streaming_compress_overshoot()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_COMPRESS_RETRY_DEFEAT");
+	  if(e && *e && atoi(e) != 0) defeat = true; }
+
+	printf("[TEST-CMPRETRY] start (MERCURY_COMPRESS_RETRY_DEFEAT=%d)\n",
+		defeat ? 1 : 0);
+	fflush(stdout);
+
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, long got, long want) {
+		if(cond) printf("[TEST-CMPRETRY] PASS: %s (got=%ld want=%ld)\n",
+			name, got, want);
+		else { printf("[TEST-CMPRETRY] FAIL: %s (got=%ld want=%ld)\n",
+			name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// Stable OFDM-like geometry: 69 * 67 = 4623 compressed bytes/batch.
+	max_data_length = 64;
+	max_header_length = 8;
+	sack_v2_enabled = true;
+	sack_enabled = true;
+	header_carries_d5 = false;
+	encryption_enabled = false;
+	robust_enabled = NO;
+	narrowband_enabled = NO;
+	role = COMMANDER;
+	original_role = COMMANDER;
+	link_status = CONNECTED;
+	connection_status = TRANSMITTING_DATA;
+	block_under_tx = NO;
+	retransmit_count = 0;
+	message_batch_counter_tx = 0;
+	// Keep the requested batch geometry out of the independent climb-confirm cap.
+	duty_palt_defeat = true;
+	nMessages = 128;
+	set_data_batch_size(69);
+
+	int max_frame = max_data_length + max_header_length
+		- effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+	int batch_capacity = data_batch_size * max_frame;
+	if(w_stamp_rides()) batch_capacity -= W_EOB_RESERVE;
+	const int max_raw = batch_capacity - COMPRESS_HEADER_SIZE;
+	check(batch_capacity > COMPRESS_HEADER_SIZE,
+		"C0 compression batch has payload capacity", batch_capacity,
+		COMPRESS_HEADER_SIZE + 1);
+
+	// Deterministic moderately-compressible prose-like stream. Word choice varies
+	// enough that a very large stale-EMA pop cannot fit, while repeated language
+	// structure makes a normal batch compress materially below RAW.
+	const int PAYLOAD = 65535;
+	std::vector<char> fed;
+	fed.reserve(PAYLOAD);
+	static const char* words[] = {
+		"station", "message", "county", "weather", "operator", "shelter",
+		"radio", "traffic", "evening", "request", "supply", "north",
+		"south", "river", "report", "control", "battery", "water",
+		"medical", "team", "arrival", "route", "bridge", "current",
+		"conditions", "available", "contact", "emergency", "tomorrow",
+		"local", "service", "please", "confirm", "received", "standing",
+		"by", "from", "subject", "priority", "general", "information",
+		"update", "location", "needed", "complete", "response", "unit",
+		"communications", "incident", "resources", "delivery", "schedule",
+		"estimated", "personnel", "equipment", "temperature", "wind",
+		"visibility", "telephone", "generator", "fuel", "transport",
+		"assigned", "status", "thank"
+	};
+	const unsigned int nwords = (unsigned int)(sizeof(words) / sizeof(words[0]));
+	unsigned int rng = 0x4D455243u;
+	int word_count = 0;
+	while((int)fed.size() < PAYLOAD)
+	{
+		rng = rng * 1664525u + 1013904223u;
+		const char* w = words[(rng >> 16) % nwords];
+		for(int j = 0; w[j] && (int)fed.size() < PAYLOAD; j++)
+			fed.push_back(w[j]);
+		word_count++;
+		char sep = (word_count % 17 == 0) ? '\n'
+			: ((word_count % 9 == 0) ? '.' : ' ');
+		if((int)fed.size() < PAYLOAD) fed.push_back(sep);
+	}
+
+	// Prove this payload/geometry actually discriminates the defect.
+	const int large_probe = 40000;
+	std::vector<char> probe_out(batch_capacity);
+	std::vector<char> rollback_out(batch_capacity);
+	cl_compressor probe_large;
+	probe_large.init();
+	probe_large.streaming_enable();
+	int large_rc = probe_large.compress_block(fed.data(), large_probe,
+		probe_out.data(), batch_capacity);
+	check(large_rc == -1,
+		"C1 stale-EMA large probe does not fit (vacuity guard)", large_rc, -1);
+	int rollback_retry_rc = probe_large.compress_block(fed.data(), max_raw,
+		rollback_out.data(), batch_capacity);
+
+	cl_compressor probe_safe;
+	probe_safe.init();
+	probe_safe.streaming_enable();
+	int safe_rc = probe_safe.compress_block(fed.data(), max_raw,
+		probe_out.data(), batch_capacity);
+	int safe_algo = safe_rc > 0
+		? ((unsigned char)probe_out[0] & COMPRESS_ALGO_MASK) : -1;
+	probe_safe.deinit();
+	check(safe_rc > 0 && safe_algo != COMPRESS_ALGO_RAW,
+		"C2 capacity-safe prefix has a real compression opportunity", safe_algo,
+		COMPRESS_ALGO_PPMD);
+	cl_compressor probe_rx;
+	probe_rx.init();
+	probe_rx.streaming_enable();
+	std::vector<char> rollback_rt((size_t)max_raw);
+	int rollback_decoded = rollback_retry_rc > 0
+		? probe_rx.decompress_block(rollback_out.data(), rollback_retry_rc,
+			rollback_rt.data(), max_raw) : -1;
+	bool rollback_identical = rollback_retry_rc == safe_rc
+		&& rollback_retry_rc > 0
+		&& memcmp(rollback_out.data(), probe_out.data(), (size_t)safe_rc) == 0
+		&& rollback_decoded == max_raw
+		&& memcmp(rollback_rt.data(), fed.data(), (size_t)max_raw) == 0;
+	check(rollback_identical,
+		"C2a warm no-fit rollback is byte-identical to an unprobed control",
+		rollback_retry_rc, safe_rc);
+	probe_large.deinit();
+	probe_safe.deinit();
+	probe_rx.deinit();
+
+	// Cold/no-dictionary retry invariant: the first oversized PPMd probe starts
+	// from an uninitialized model. It still mutates that model before discovering
+	// no-fit, so compress_block() must reset it before the shorter retry. Otherwise
+	// TX encodes the retry from unsent history while RX starts fresh.
+	cl_compressor cold_tx;
+	cold_tx.set_dict_priming(false);
+	cold_tx.init();
+	cold_tx.streaming_enable();
+	cl_compressor cold_rx;
+	cold_rx.set_dict_priming(false);
+	cold_rx.init();
+	cold_rx.streaming_enable();
+	int cold_large_rc = cold_tx.compress_block(fed.data(), large_probe,
+		probe_out.data(), batch_capacity);
+	int cold_retry_rc = cold_tx.compress_block(fed.data(), max_raw,
+		probe_out.data(), batch_capacity);
+	std::vector<char> cold_rt((size_t)max_raw);
+	int cold_decoded = cold_retry_rc > 0
+		? cold_rx.decompress_block(probe_out.data(), cold_retry_rc,
+			cold_rt.data(), max_raw) : -1;
+	bool cold_exact = cold_large_rc == -1
+		&& cold_decoded == max_raw
+		&& memcmp(cold_rt.data(), fed.data(), (size_t)max_raw) == 0;
+	if(defeat)
+		check(cold_large_rc == -1 && !cold_exact,
+			"C2b FAIL-BEFORE cold retry retains unsent model history",
+			cold_decoded, -1);
+	else
+		check(cold_exact,
+			"C2b cold no-fit retry resets unsent model history and decodes exactly",
+			cold_decoded, max_raw);
+	cold_tx.deinit();
+	cold_rx.deinit();
+
+	deinit_messages_buffers();
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "C3 message buffers allocated", alloc_rc,
+		SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+	int pushed = fifo_buffer_tx.push(fed.data(), PAYLOAD);
+	check(pushed == PAYLOAD, "C4 payload staged", pushed, PAYLOAD);
+
+	compressor.init();
+	compressor.streaming_enable();
+	compression_enabled = true;
+	compress_ratio_estimate = 12.0f;  // deliberately stale/high
+	batch_uncompressed_size = -1;
+	process_buffer_data_commander();
+
+	std::vector<char> wire;
+	for(int i = 0; i < nMessages; i++)
+		if(messages_tx[i].status == ADDED_TO_LIST)
+			for(int j = 0; j < messages_tx[i].length; j++)
+				wire.push_back(messages_tx[i].data[j]);
+
+	int algo = wire.empty() ? -1
+		: ((unsigned char)wire[0] & COMPRESS_ALGO_MASK);
+	printf("[TEST-CMPRETRY] production fill: raw=%d wire=%d algo=%d "
+	       "batch_capacity=%d max_raw=%d ratio_est=%.3f\n",
+		batch_uncompressed_size, (int)wire.size(), algo, batch_capacity,
+		max_raw, compress_ratio_estimate);
+	fflush(stdout);
+
+	if(defeat)
+		check(algo == COMPRESS_ALGO_RAW,
+			"C5 FAIL-BEFORE converts the reduced block to RAW", algo,
+			COMPRESS_ALGO_RAW);
+	else
+		check(algo == COMPRESS_ALGO_PPMD || algo == COMPRESS_ALGO_ZSTD,
+			"C5 no-fit is reduced and recompressed (not RAW)", algo,
+			COMPRESS_ALGO_PPMD);
+
+	std::vector<char> roundtrip(PAYLOAD);
+	cl_compressor rx;
+	rx.init();
+	rx.streaming_enable();
+	int decoded = wire.empty() ? -1 : rx.decompress_block(wire.data(),
+		(int)wire.size(), roundtrip.data(), (int)roundtrip.size());
+	bool exact = decoded == batch_uncompressed_size
+		&& decoded > 0
+		&& memcmp(roundtrip.data(), fed.data(), (size_t)decoded) == 0;
+	check(exact, "C6 staged unit round-trips byte-exact", decoded,
+		batch_uncompressed_size);
+	check((int)wire.size() <= batch_capacity,
+		"C7 staged unit respects batch capacity", (long)wire.size(),
+		batch_capacity);
+
+	// Continue across several ACK/commit cycles. This catches the original sticky
+	// basin: one overflow left the EMA high, so every later full batch repeated the
+	// no-fit and manual RAW fallback. Reconstruct the delivered prefix exactly.
+	long sequence_raw = decoded > 0 ? decoded : 0;
+	long sequence_wire = (long)wire.size();
+	int raw_batches = (algo == COMPRESS_ALGO_RAW) ? 1 : 0;
+	bool sequence_exact = exact;
+	for(int cycle = 1; cycle < 4; cycle++)
+	{
+		if(decoded > 0)
+		{
+			rx.streaming_commit((const unsigned char*)roundtrip.data(), decoded);
+			compressor.commit_pending();
+		}
+		for(int i = 0; i < nMessages; i++)
+		{
+			messages_tx[i].status = FREE;
+			messages_tx[i].length = 0;
+		}
+		block_under_tx = NO;
+		batch_uncompressed_size = -1;
+		process_buffer_data_commander();
+
+		wire.clear();
+		for(int i = 0; i < nMessages; i++)
+			if(messages_tx[i].status == ADDED_TO_LIST)
+				for(int j = 0; j < messages_tx[i].length; j++)
+					wire.push_back(messages_tx[i].data[j]);
+		algo = wire.empty() ? -1
+			: ((unsigned char)wire[0] & COMPRESS_ALGO_MASK);
+		if(algo == COMPRESS_ALGO_RAW) raw_batches++;
+		decoded = wire.empty() ? -1 : rx.decompress_block(wire.data(),
+			(int)wire.size(), roundtrip.data(), (int)roundtrip.size());
+		bool cycle_exact = decoded == batch_uncompressed_size
+			&& decoded > 0
+			&& sequence_raw + decoded <= PAYLOAD
+			&& memcmp(roundtrip.data(), fed.data() + sequence_raw,
+				(size_t)decoded) == 0;
+		sequence_exact = sequence_exact && cycle_exact;
+		if(decoded > 0) sequence_raw += decoded;
+		sequence_wire += (long)wire.size();
+		if((int)wire.size() > batch_capacity) sequence_exact = false;
+	}
+
+	check(sequence_exact && sequence_raw > 0,
+		"C8 four-batch delivered stream is a byte-exact prefix", sequence_raw,
+		sequence_raw);
+	if(defeat)
+		check(raw_batches == 4,
+			"C9 FAIL-BEFORE remains trapped in RAW on every batch", raw_batches, 4);
+	else
+		check(raw_batches == 0,
+			"C9 retry/backoff avoids the repeated RAW basin", raw_batches, 0);
+	if(!defeat)
+		check(sequence_wire < sequence_raw,
+			"C10 repaired sequence is materially compressed", sequence_wire,
+			sequence_raw - 1);
+
+	rx.deinit();
+	compressor.deinit();
+	deinit_messages_buffers();
+	printf("[TEST-CMPRETRY] %s (%d failure%s, defeat=%d)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed,
+		failed == 1 ? "" : "s", defeat ? 1 : 0);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 // ===========================================================================
 // MIXBATCH FILL OVER-POP regression (data-flow-mixbatch-fill.md)
 //
@@ -22289,16 +22590,30 @@ void cl_arq_controller::process_buffer_data_commander()
 				// by this guarantees the reserved split never needs an extra frame.
 				if(w_stamp_rides())
 					batch_capacity -= W_EOB_RESERVE;
+				// The compressor workspace and 16-bit original-size field are the
+				// hard unit ceiling. Some maximum SACK geometries exceed the old
+				// 16 KB local output array by 25-32 bytes; advertise only storage
+				// that actually exists.
+				if(batch_capacity > COMPRESS_WORKSPACE_SIZE)
+					batch_capacity = COMPRESS_WORKSPACE_SIZE;
 
-				// Initial guess based on running ratio estimate.
+				// Initial guess based on the running ratio estimate. Target the
+				// existing 85% fill policy against PAYLOAD capacity, not total
+				// capacity: at an accurate estimate, C * ratio compresses to C,
+				// then the streaming header makes the result C+header and guarantees
+				// a no-fit. The headroom also absorbs local ratio variation.
 				// Staging can be up to COMPRESS_WORKSPACE_SIZE (64KB) because
 				// high-ratio compressors (zstd/PPMd) can shrink 33KB+ to <1.5KB.
 				const int staging_max = 65535;  // Header orig_size is uint16; cap to prevent overflow
 				int chdr_size = compressor.get_header_size();
-				int initial_pop = (int)(batch_capacity * compress_ratio_estimate);
+				int payload_capacity = batch_capacity - chdr_size;
+				double estimated_pop = (double)payload_capacity
+					* (double)compress_ratio_estimate * 0.85;
+				int initial_pop = estimated_pop >= (double)staging_max
+					? staging_max : (int)estimated_pop;
 				if(initial_pop > staging_max) initial_pop = staging_max;
-				if(initial_pop < batch_capacity - chdr_size)
-					initial_pop = batch_capacity - chdr_size;
+				if(initial_pop < payload_capacity)
+					initial_pop = payload_capacity;
 
 				char staging[COMPRESS_WORKSPACE_SIZE];
 				// MIXBATCH FILL FIX (ii) -- force-FREE data-loss guard
@@ -22330,16 +22645,24 @@ void cl_arq_controller::process_buffer_data_commander()
 				}
 				else
 				{
-					char comp_buf[16384];
+					char comp_buf[COMPRESS_WORKSPACE_SIZE];
+					static_assert(sizeof(comp_buf) >= COMPRESS_WORKSPACE_SIZE,
+						"compression output buffer must cover advertised capacity");
 					int comp_size = 0;
 					bool compress_ok = false;
 
 					// Adaptive fill loop: compress, check fill ratio, add more.
-					// Streaming mode: single compress call (no retry). The PPMd
-					// model advances on each compress_block call. Retrying with
-					// different data sizes causes TX/RX model desync because RX
-					// only decompresses the final data once.
-					int max_iter = compressor.is_streaming() ? 1 : 4;
+					// A SUCCESSFUL streaming PPMd attempt is never recompressed: it
+					// advanced the live model and RX will decode only that result.
+					// A NO-FIT attempt is different: compress_block() either rolls a
+					// carried PPMd model back to its pre-probe checkpoint or resets a
+					// non-checkpointed model. We may therefore reduce the unsent prefix
+					// and retry without desynchronizing the receiver.
+					bool compress_retry_defeat = false;
+					{ const char* e = std::getenv("MERCURY_COMPRESS_RETRY_DEFEAT");
+					  if(e && *e && atoi(e) != 0) compress_retry_defeat = true; }
+					int max_iter = compressor.is_streaming()
+						? (compress_retry_defeat ? 1 : 16) : 4;
 					for(int iter = 0; iter < max_iter; iter++)
 					{
 						comp_size = compressor.compress_block(
@@ -22349,7 +22672,8 @@ void cl_arq_controller::process_buffer_data_commander()
 						{
 							// Compression succeeded — check fill ratio
 							float fill_ratio = (float)comp_size / (float)batch_capacity;
-							if(fill_ratio >= 0.85f || iter == max_iter - 1)
+							if(compressor.is_streaming()
+							   || fill_ratio >= 0.85f || iter == max_iter - 1)
 							{
 								compress_ok = true;
 								break;  // Good enough
@@ -22372,16 +22696,33 @@ void cl_arq_controller::process_buffer_data_commander()
 						}
 						else if(comp_size == -1)
 						{
-							// Doesn't fit — push back excess and accept as-is
+							// Doesn't fit: push back excess and retry the smaller
+							// unsent prefix. compress_block() either rolled a warm
+							// PPMd model back transactionally or reset it safely.
 							if(compressor.is_streaming())
 							{
-								// Streaming: push back 40%, use raw (model already advanced)
+								// Push back 40%; the codec has made its model safe to retry.
 								int pushback = raw_size * 2 / 5;
 								if(pushback < 1) pushback = 1;
 								fifo_buffer_tx.push_front(
 									staging + raw_size - pushback, pushback);
 								raw_size -= pushback;
-								// Model is desynced — reset streaming
+								// No-fit directly proves this estimate was too high.
+								// Back it off now; a successful retry updates the EMA.
+								if(!compress_retry_defeat && raw_size > 0
+								   && iter + 1 < max_iter)
+								{
+									compress_ratio_estimate *= 0.6f;
+									if(compress_ratio_estimate < 1.0f)
+										compress_ratio_estimate = 1.0f;
+									printf("[COMPRESS-TX] no-fit retry: raw=%d estimate=%.2f attempt=%d\n",
+										raw_size, compress_ratio_estimate, iter + 1);
+									fflush(stdout);
+									continue;
+								}
+								// The manual RAW fallback below carries no streaming/dict
+								// flags, so reset TX to mirror RX's fresh-frame recovery
+								// when retries are disabled or exhausted.
 								compressor.streaming_reset();
 								break;
 							}

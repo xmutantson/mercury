@@ -22,11 +22,13 @@
  * sides to fresh context (self-correcting).
  *
  * algo = 0x00 raw, 0x01 PPMd, 0x02 zstd.
- * A quick Shannon entropy test steers algorithm selection:
+ * With no carried PPMd model, a quick Shannon entropy test steers selection:
  *   entropy > 7.5  → skip compression (send raw)
  *   entropy > 6.0  → try zstd only
  *   entropy <= 6.0 → try both PPMd and zstd, pick smaller
- * Raw is always the fallback if compression doesn't shrink the data.
+ * A carried PPMd model is always tried: zero-order byte entropy cannot detect
+ * conditional/repetition structure. Raw is the fallback unless compression
+ * shrinks the batch, or prior PPMd savings fully fund a small local expansion.
  */
 
 #ifndef MERCURY_COMPRESS_H
@@ -115,9 +117,10 @@ private:
     int ppmd_decompress(const unsigned char* in, int in_len, int orig_len, unsigned char* out, int out_cap);
     int zstd_compress_buf(const unsigned char* in, int in_len, unsigned char* out, int out_cap);
     int zstd_decompress_buf(const unsigned char* in, int in_len, unsigned char* out, int out_cap);
+    void ppmd_savings_update(int raw_len, int comp_len);
 
     void* ppmd_ctx;    // CPpmd8*
-    void* ppmd_mem;    // PPMd allocator memory
+    void* ppmd_mem;    // Lazily allocated PPMd checkpoint arena (same size as live model)
     void* zstd_cctx;   // ZSTD_CCtx*
     void* zstd_dctx;   // ZSTD_DCtx*
     unsigned char* workspace;  // Temp buffer for PPMd/zstd intermediate output
@@ -137,6 +140,9 @@ private:
                                   // the PPMd model, which would otherwise encode/decode into an
                                   // uninitialized model (segfault). See ppmd_compress() for the
                                   // root-cause comment.
+    int ppmd_savings_credit;      // Capped cumulative PPMd payload savings. May fund a small
+                                  // locally-expanding bridge without making the carried run
+                                  // cumulatively larger than RAW.
 
     unsigned char* zstd_prefix;
     int zstd_prefix_len;

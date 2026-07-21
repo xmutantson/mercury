@@ -1850,6 +1850,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_mixcmp;
                 failed += ARQ_mixcmp.test_mixbatch_fill_overpop_compressed();
             }
+            // Streaming compression stale-EMA/no-fit regression: a high ratio
+            // estimate must reduce and recompress, not silently send the reduced
+            // payload RAW. MERCURY_COMPRESS_RETRY_DEFEAT=1 is the fail-before arm.
+            {
+                cl_arq_controller ARQ_cmpretry;
+                failed += ARQ_cmpretry.test_streaming_compress_overshoot();
+            }
             // Fix A — mid-flight data_batch_size SHRINK must not orphan RECEIVED prev
             // frames (baseline-double-delivery.md): drives the REAL set_data_batch_size
             // shrink; reconstructs the copy_data_to_buffer prev delivery set; asserts
@@ -3361,6 +3368,7 @@ int main(int argc, char *argv[])
                                         // watchdog predicate + the produce-gate replication: a stranded RECEIVED slot is
                                         // freed and a later control frame lands. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE.
     bool test_robust0_compress_deadlock_cli = false; // --test-robust0-compress-deadlock: ROBUST_0+streaming-compression
+    bool test_streaming_compress_overshoot_cli = false; // --test-streaming-compress-overshoot: stale-EMA no-fit must retry compressed
     bool test_mixbatch_fill_overpop_cli = false; // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
     bool test_mixbatch_fill_overpop_compressed_cli = false; // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
                                         // deadlock regression. Drives the REAL process_buffer_data_commander() data-fill
@@ -4591,6 +4599,14 @@ int main(int argc, char *argv[])
             // startup, then exit with the test's rc. See
             // fact-documents/data-flow-compress-frame-fill.md §5.
             test_robust0_compress_deadlock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-streaming-compress-overshoot") == 0)
+        {
+            // Streaming-compression stale-EMA overshoot regression (one-shot,
+            // exit rc). MERCURY_COMPRESS_RETRY_DEFEAT=1 restores the RAW trap.
+            test_streaming_compress_overshoot_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6674,6 +6690,15 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_robust0_compress_deadlock();
             printf("[FLAG] Robust0-compress-deadlock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_streaming_compress_overshoot_cli) {
+            printf("[FLAG] --test-streaming-compress-overshoot: invoking stale-EMA "
+                   "streaming compression retry regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_streaming_compress_overshoot();
+            printf("[FLAG] Streaming-compress-overshoot test complete (rc=%d) -- exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

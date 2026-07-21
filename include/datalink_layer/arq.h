@@ -2219,6 +2219,10 @@ public:
   // batch carries > 0 application bytes (FAIL-BEFORE on fef293f: every batch
   // stages 0 payload → 0 throughput forever). One-shot, exits rc. See §5 audit.
   int test_robust0_compress_deadlock();
+  // Streaming compression EMA-overshoot regression. Drives the real compressed
+  // fill path with an intentionally stale/high ratio estimate and verifies that
+  // a no-fit probe is reduced and recompressed instead of silently sent RAW.
+  int test_streaming_compress_overshoot();
   int test_mixbatch_fill_overpop();  // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
   int test_mixbatch_fill_overpop_compressed();  // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
 

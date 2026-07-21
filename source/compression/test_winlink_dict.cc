@@ -258,6 +258,120 @@ static void test_streaming_desync_with_dict()
 	tx.deinit(); rx.deinit();
 }
 
+// Zero-order Shannon entropy is not an incompressibility proof. This stream
+// contains every byte value equally often (8.0 bits/byte), but repeats one fixed
+// 256-byte permutation. A carried order-6 PPMd model compresses the repetition
+// strongly. The old warm-path entropy<7.5 gate skipped the codec and sent RAW.
+static void test_high_entropy_conditional_structure()
+{
+	std::string structured(8192, 0);
+	for(size_t i = 0; i < structured.size(); i++)
+		structured[i] = (char)(unsigned char)(((i & 255u) * 73u + 19u) & 255u);
+
+	cl_compressor tx; tx.set_dict_priming(true); tx.init(); tx.streaming_enable();
+	cl_compressor rx; rx.set_dict_priming(true); rx.init(); rx.streaming_enable();
+	static char out[262144], rt[262144];
+	int w = tx.compress_block(structured.data(), (int)structured.size(),
+		out, (int)sizeof(out));
+	int algo = w > 0 ? ((unsigned char)out[0] & COMPRESS_ALGO_MASK) : -1;
+	int d = w > 0 ? rx.decompress_block(out, w, rt, (int)sizeof(rt)) : -1;
+	bool exact = d == (int)structured.size()
+		&& memcmp(rt, structured.data(), structured.size()) == 0;
+
+	char buf[192];
+	snprintf(buf, sizeof(buf),
+		"8.0-bit byte-balanced repetition: algo=%d wire=%d raw=%d exact=%d",
+		algo, w, (int)structured.size() + tx.get_header_size(), exact ? 1 : 0);
+	wd_check(exact && algo == COMPRESS_ALGO_PPMD
+		&& w < (int)structured.size() + tx.get_header_size(),
+		"high-entropy conditional structure", buf);
+	tx.deinit(); rx.deinit();
+}
+
+// A persistent conditional model can need one locally-expanding bridge before
+// the following repeated region becomes profitable. Prior PPMd savings may fund
+// that bridge, but cumulative PPMd payload must remain smaller than cumulative
+// raw payload. This is the JPEG-header -> first-scan -> later-scan shape.
+static void test_ppmd_savings_credit_bridge()
+{
+	cl_compressor tx; tx.set_dict_priming(true); tx.init(); tx.streaming_enable();
+	cl_compressor rx; rx.set_dict_priming(true); rx.init(); rx.streaming_enable();
+	static char out[262144], rt[262144];
+
+	std::string header;
+	for(int i = 0; i < 24; i++) header += MSG_ICS213;
+	// Long enough that PPMd's adaptation overhead is under the production 5%
+	// bridge bound, while still expanding on its first unpredictable appearance.
+	std::string bridge(30000, 0);
+	unsigned int s = 0x9E3779B9u;
+	for(size_t i = 0; i < bridge.size(); i++)
+	{
+		s = s * 1664525u + 1013904223u;
+		bridge[i] = (char)(unsigned char)(s >> 24);
+	}
+
+	const std::string* seq[3] = { &header, &bridge, &bridge };
+	int algos[3] = {-1, -1, -1};
+	int payloads[3] = {-1, -1, -1};
+	long total_wire = 0;
+	long total_raw_wire = 0;
+	bool exact = true;
+	for(int i = 0; i < 3; i++)
+	{
+		const std::string& m = *seq[i];
+		int w = tx.compress_block(m.data(), (int)m.size(), out, (int)sizeof(out));
+		algos[i] = w > 0 ? ((unsigned char)out[0] & COMPRESS_ALGO_MASK) : -1;
+		payloads[i] = w > 0
+			? ((unsigned char)out[1] | ((unsigned char)out[2] << 8)) : -1;
+		int d = w > 0 ? rx.decompress_block(out, w, rt, (int)sizeof(rt)) : -1;
+		bool one_exact = d == (int)m.size()
+			&& memcmp(rt, m.data(), m.size()) == 0;
+		exact = exact && one_exact;
+		if(one_exact)
+		{
+			rx.streaming_commit((const unsigned char*)m.data(), (int)m.size());
+			tx.set_pending_raw((const unsigned char*)m.data(), (int)m.size());
+			tx.commit_pending();
+		}
+		total_wire += w;
+		total_raw_wire += (long)m.size() + tx.get_header_size();
+	}
+	int first_savings = (int)header.size() - payloads[0];
+	int bridge_expansion = payloads[1] - (int)bridge.size();
+	int bridge_limit = (int)bridge.size() / 20;
+	if(bridge_limit < 64) bridge_limit = 64;
+
+	// With the same primed model but zero earned wire savings, the expanding
+	// bridge must select RAW. This proves batch 2 above uses the credit exception
+	// rather than passing because it happened to shrink on this platform.
+	cl_compressor no_credit;
+	no_credit.set_dict_priming(true);
+	no_credit.init();
+	no_credit.streaming_enable();
+	int nc_w = no_credit.compress_block(bridge.data(), (int)bridge.size(),
+		out, (int)sizeof(out));
+	int no_credit_algo = nc_w > 0
+		? ((unsigned char)out[0] & COMPRESS_ALGO_MASK) : -1;
+	no_credit.deinit();
+
+	char buf[224];
+	snprintf(buf, sizeof(buf),
+		"algos=%d/%d/%d payloads=%d/%d/%d bridge_delta=%d no-credit=%d exact=%d",
+		algos[0], algos[1], algos[2], payloads[0], payloads[1], payloads[2],
+		bridge_expansion, no_credit_algo, exact ? 1 : 0);
+	wd_check(exact
+		&& algos[0] == COMPRESS_ALGO_PPMD
+		&& algos[1] == COMPRESS_ALGO_PPMD
+		&& algos[2] == COMPRESS_ALGO_PPMD
+		&& bridge_expansion > 0
+		&& bridge_expansion <= bridge_limit
+		&& first_savings >= bridge_expansion
+		&& no_credit_algo == COMPRESS_ALGO_RAW
+		&& total_wire < total_raw_wire,
+		"PPMd savings-credit bridge", buf);
+	tx.deinit(); rx.deinit();
+}
+
 int run_winlink_dict_tests()
 {
 	wd_failures = 0; wd_passes = 0;
@@ -271,6 +385,8 @@ int run_winlink_dict_tests()
 	test_bulk_no_regression();
 	test_attachment_inertness();
 	test_streaming_desync_with_dict();
+	test_high_entropy_conditional_structure();
+	test_ppmd_savings_credit_bridge();
 
 	printf("=== Winlink dict: %d passed, %d failed ===\n", wd_passes, wd_failures);
 	return (wd_failures == 0) ? 0 : 1;
