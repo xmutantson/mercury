@@ -23,6 +23,8 @@
 #ifndef INC_COMMON_DEFINES_H_
 #define INC_COMMON_DEFINES_H_
 
+#include <stdint.h>
+
 #define VERSION__ "0.4.2"
 
 // MERCURY_BUILD_ID — git short-rev (+ "-dirty") of the BUILT source, baked
@@ -40,7 +42,7 @@
 #endif
 
 // Compile-time gate for the MFSK ACK+SACK signaling (WB-only). RSP sends
-// ACK/SACK via the MFSK pattern + 52-bit suffix [bsi:8 | bitmap:32 |
+// ACK/SACK via the MFSK pattern + 52-bit suffix [bsi:8 | bitmap:30 |
 // crc12:12] and CMD listens for it. When 0, falls back to the legacy
 // MFSK ACK pattern (no SACK; receiver implicitly treats any hit as a
 // clean batch ACK). Both peers MUST agree (deployed together — no
@@ -48,6 +50,30 @@
 #ifndef MFSK_ACK_SACK_ENABLED
 #define MFSK_ACK_SACK_ENABLED 1
 #endif
+
+// The legacy MFSK ACK/SACK suffix has a fixed 30-bit selective bitmap. Wider
+// ARQ batches use the compact cumulative confirm when clean; on a partial
+// report, slots outside this bitmap are conservatively treated as missing.
+#define MFSK_SACK_BITMAP_BITS 30
+
+static inline uint32_t mfsk_sack_mask_for_frames(int frame_count)
+{
+	if(frame_count <= 0) return 0u;
+	if(frame_count >= MFSK_SACK_BITMAP_BITS) return 0x3FFFFFFFu;
+	return (1u << frame_count) - 1u;
+}
+
+static inline bool mfsk_sack_bitmap_bit(uint32_t bitmap, int frame_index)
+{
+	return frame_index >= 0 && frame_index < MFSK_SACK_BITMAP_BITS
+		&& ((bitmap >> frame_index) & 1u) != 0;
+}
+
+static inline bool mfsk_sack_bitmap_is_clean(uint32_t bitmap, int frame_count)
+{
+	return frame_count > 0 && frame_count <= MFSK_SACK_BITMAP_BITS
+		&& bitmap == mfsk_sack_mask_for_frames(frame_count);
+}
 
 // §21 (tier2-suffix-fec-design.md §21.3): MASTER ENABLE for the
 // robust-tier ACK FEC. The per-batch ACK enhanced-suffix is gated on
@@ -176,9 +202,9 @@ inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
 //
 // ROBUST_DWELL_BATCH_MAX — the hard ceiling the relaxed set_data_batch_size()
 //   chokepoint clamps a robust batch into ([1..MAX]). 8 keeps the all-ones SACK
-//   target (1<<batch)-1 = 0xFF well under both the CMD 32-bit and RSP 30-bit
+//   target (1<<batch)-1 = 0xFF well under the fixed RSP 30-bit
 //   bitmap caps (data-flow-robust-tier-arq-batch.md §3.1), and ≤ the M=16 SACK
-//   suffix's 32-frame bitmap (mfsk-robust-ack.md).
+//   suffix bitmap (mfsk-robust-ack.md).
 // ROBUST_DWELL_BATCH — the value the CMD requests on a proven+parked robust
 //   dwell (the operating point inside [1..MAX]).
 // ROBUST_DWELL_PROOF_BATCHES — consecutive clean batches AT THE ROBUST RUNG

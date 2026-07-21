@@ -234,8 +234,7 @@ int cl_arq_controller::test_compact_confirm_live_rx_path()
 	// deterministic all-ones target that matches the ACK+SACK frame we synthesize.
 	// 30 is the WB <=30-bit invariant ceiling.
 	cmd->data_batch_size = 30;
-	const uint32_t clean_bitmap = (cmd->data_batch_size >= 32)
-		? 0xFFFFFFFFu : ((1u << cmd->data_batch_size) - 1u);
+	const uint32_t clean_bitmap = mfsk_sack_mask_for_frames(cmd->data_batch_size);
 
 	// --- Generate the compact-confirm passband (16 base + 10 suffix = 26 sym) ---
 	int compact_samples = 0;
@@ -537,7 +536,7 @@ int cl_arq_controller::test_compact_confirm_sack_window_rx_path()
 	cmd->data_batch_size = 8;                 // batch>1 (the regression scope)
 	cmd->cmd_last_applied_clean_bsi = -1;     // nothing applied yet
 	cmd->cmd_last_applied_sack_bsi  = -1;
-	const uint32_t clean_bitmap = (1u << cmd->data_batch_size) - 1u;
+	const uint32_t clean_bitmap = mfsk_sack_mask_for_frames(cmd->data_batch_size);
 
 	// --- Generate the compact-confirm passband (16 base + 10 suffix) ---
 	int compact_samples = 0;
@@ -595,9 +594,7 @@ int cl_arq_controller::test_compact_confirm_sack_window_rx_path()
 		if(rx_crc12 != (uint16_t)(cmd->CRC12_calc(ci,5)&0x0FFF)) return false;
 		unsigned cb=(unsigned)(cmd->cmd_batch_seq_id&0xFF), pb=(cb-1u)&0xFFu;
 		if(!((unsigned)rx_bsi==cb||(unsigned)rx_bsi==pb)) return false;
-		uint32_t all_ones=(cmd->data_batch_size>=32)?0xFFFFFFFFu
-			:((1u<<cmd->data_batch_size)-1u);
-		return rx_bitmap==all_ones;
+		return mfsk_sack_bitmap_is_clean(rx_bitmap, cmd->data_batch_size);
 	};
 
 	// ====================================================================

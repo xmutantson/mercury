@@ -6260,6 +6260,24 @@ void cl_telecom_system::init()
 
 	}
 
+	// ---- WIRE LEVER (pilot-thin): cfg16 32-QAM top-gear pilot-lattice density knob ----
+	// Default UNSET => Dy=3, Nsymb=9 => nData==320 == 1600/log2M (full N=1600 codeword),
+	// byte-identical to stock. cfg16 nData is PINNED to 320 by the fixed N=1600 LDPC
+	// codeword (nData*log2M==1600), so thinning the time-pilot lattice at the SAME Nsymb
+	// overflows the codeword (nBits>1600). The realizable wire gain is a THINNER lattice
+	// (Dy=4/5) plus FEWER OFDM data-symbols per codeword (Nsymb override): the same
+	// 1600-bit codeword reaches the wire in less airtime. Both peers read the same env so
+	// the shared TX/RX frame layout stays symmetric. Scoped to CONFIG_16 so the
+	// channel-tracking-critical lower rungs are untouched (thinner pilots = sparser
+	// Doppler/SFO sampling = left-hostile at low SNR / fade).
+	if(M==MOD_32QAM && current_configuration==CONFIG_16)
+	{
+		const char* _pdy = std::getenv("MERCURY_PILOT_DY");
+		if(_pdy && *_pdy){ int _v=atoi(_pdy); if(_v>=3 && _v<=8) ofdm.pilot_configurator.Dy=_v; }
+		const char* _pns = std::getenv("MERCURY_PILOT_NSYMB");
+		if(_pns && *_pns){ int _v=atoi(_pns); if(_v>=4 && _v<=12) ofdm.Nsymb=_v; }
+	}
+
 	// MFSK doesn't use pilots, but pilot_configurator needs valid Dx/Dy
 	if(M == MOD_MFSK)
 	{
@@ -6288,6 +6306,15 @@ void cl_telecom_system::init()
 		reinit_subsystems.ldpc=NO;
 	}
 	calculate_parameters();
+	if(current_configuration==CONFIG_16 && std::getenv("MERCURY_PILOT_DIAG"))
+	{
+		fprintf(stderr,"[PILOT_DIAG] cfg16 Nc=%d Nsymb=%d Dx=%d Dy=%d nPilots=%d nData=%d dcNbits=%d ldpcN=%d ldpcK=%d ldpcP=%d nVirt=%d pilotpct=%.2f\n",
+			ofdm.Nc, ofdm.Nsymb, ofdm.pilot_configurator.Dx, ofdm.pilot_configurator.Dy,
+			ofdm.pilot_configurator.nPilots, ofdm.pilot_configurator.nData,
+			data_container.nBits, ldpc.N, ldpc.K, ldpc.P, ldpc.N-data_container.nBits,
+			100.0*ofdm.pilot_configurator.nPilots/(double)(ofdm.Nc*ofdm.Nsymb));
+		fflush(stderr);
+	}
 
 	if(reinit_subsystems.ofdm_FIR_rx_data==YES)
 	{

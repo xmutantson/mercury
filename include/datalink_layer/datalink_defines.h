@@ -119,7 +119,7 @@
                                 // (data-flow-robust-tier-arq-batch.md §5.2). CMD-decided,
                                 // RSP-mirrored batch size for a PROVEN+PARKED robust dwell.
                                 // Distinct from SET_LINK_PARAMS (0x43) ON PURPOSE: that op's
-                                // RSP handler clamps batch to [AXIS2_BATCH_FLOOR=10,32]
+                                // RSP handler clamps batch to the negotiated Axis-2 range
                                 // (the OFDM Axis-2 contract), which would force a robust
                                 // 4-8 batch UP to 10 on the RSP only → CMD≠RSP all-ones
                                 // target mismatch → the literal Bug-3 4-wire-failure
@@ -133,7 +133,7 @@
                                 // SET_LINK_PARAMS coverage rule). batch ∈ [1..ROBUST_DWELL_BATCH_MAX].
                                 // (Reuses the 0x44 slot freed when OFDM_ACK_CLEAN was
                                 // removed 2026-05-24 — the MFSK ACK+SACK pattern carrying
-                                // [bsi:8|bitmap:32|crc12:12] superseded that frame type;
+                                // [bsi:8|bitmap:30|crc12:12] superseded that frame type;
                                 // see mercury/fact-documents/mfsk-robust-ack.md.)
 
 // Capability flags (embedded in TEST_CONNECTION byte 5).

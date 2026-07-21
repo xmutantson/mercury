@@ -1362,6 +1362,18 @@ void cl_arq_controller::process_messages_rx_data_control()
 							// weioyt1zk: the byte-gate summed over data_batch_size and dropped the
 							// widened tail -> permanent [RSP-V2-PREV-BYTE-SHORTFALL]).
 							int prev_eff_window = rx_effective_window(rsp_prev_batch_expected_count);
+							// GROWTH-TRANSITION integrity: clamp the PREV delivery window DOWN to the
+							// prev batch's GENUINE span, never floored UP to a data_batch_size that GREW
+							// since the prev was sealed (same stale-tail substitution as rsp_commit).
+							{
+								bool growth_deliver_defeat = false;
+								{ const char* e = std::getenv("MERCURY_GROWTH_DELIVER_DEFEAT");
+								  if(e && *e && atoi(e)!=0) growth_deliver_defeat = true; }
+								if(!growth_deliver_defeat
+								   && rsp_prev_batch_expected_count > 0
+								   && rsp_prev_batch_expected_count < prev_eff_window)
+									prev_eff_window = rsp_prev_batch_expected_count;
+							}
 							bool prev_byte_withheld = false;
 							if(!prev_gap_aborted)
 							{
@@ -1581,11 +1593,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 									// too-narrow bitmap, never registers the batch as fully acked, and
 									// retransmits/desyncs the tail. == data_batch_size when not widened.
 									int clean_bits = prev_eff_window;
-									if (clean_bits > 30) clean_bits = 30;
-									uint32_t bitmap_u32;
-									if (clean_bits >= 30)      bitmap_u32 = 0x3FFFFFFFu;
-									else if (clean_bits <= 0)  bitmap_u32 = 0u;
-									else                       bitmap_u32 = (1u << clean_bits) - 1u;
+									uint32_t bitmap_u32 = mfsk_sack_mask_for_frames(clean_bits);
 									// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): n_r in the bsi field when
 									// negotiated (the prev-deliver high-water was just advanced at :911).
 									unsigned char wire_bsi = cumulative_ack_bsi_field(
@@ -1599,10 +1607,20 @@ void cl_arq_controller::process_messages_rx_data_control()
 									// SACK/retransmit prev-storage path -> a RETRANSMIT turnaround -> arm the D2
 									// robust reverse-ACK geometry (settle) for this ACK.
 									ack_tx_retx_turnaround = true;
-									long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+									long long mfsk_ms = 0;
+									bool compact_sent = false;
+									if(scalable_sack_on()
+									   && telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0)
+									{
+										mfsk_ms = send_mfsk_compact_confirm(wire_bsi);
+										compact_sent = mfsk_ms > 0;
+									}
+									if(mfsk_ms <= 0)
+										mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
 									if (mfsk_ms > 0)
 									{
-										printf("[TX-ACK-SACK] prev-delivered via MFSK suffix wire_ms=%lld\n", mfsk_ms);
+										printf("[TX-ACK-SACK] prev-delivered via %s wire_ms=%lld\n",
+											compact_sent ? "COMPACT confirm" : "MFSK suffix", mfsk_ms);
 										fflush(stdout);
 										prev_used_mfsk_path = true;
 									}
@@ -2382,6 +2400,28 @@ void cl_arq_controller::rsp_commit_cur_batch_delivery()
 	// back to data_batch_size (the widened-AND-held corner degrades to Option W's loud
 	// byte-stream-shift abort, never a silent orphan).
 	int eff_window = rx_effective_window(rx_batch_total_frames);
+	// GROWTH-TRANSITION integrity (scalable-SACK batch-size UP-transition): the DELIVERY
+	// window must be the batch's GENUINE frame span, never floored UP to a data_batch_size
+	// that GREW (Axis-2 up / climb) since this batch's frames were stored. rx_effective_
+	// window() floors to data_batch_size for the ACCEPTANCE window; reused as the DELIVERY
+	// bound it would mark+emit stale tail slots [genuine_span, data_batch_size) a prior
+	// LARGER batch left ACKED -> a count-preserving boundary substitution the positional
+	// byte-offset backstops (offset, not content) cannot see. Clamp DOWN to the sender-
+	// declared count (rx_batch_total_frames / D5) when known, else the held span; NEVER
+	// widen -> byte-identical unless the genuine span < the grown data_batch_size.
+	{
+		bool growth_deliver_defeat = false;
+		{ const char* e = std::getenv("MERCURY_GROWTH_DELIVER_DEFEAT");
+		  if(e && *e && atoi(e)!=0) growth_deliver_defeat = true; }
+		if(!growth_deliver_defeat)
+		{
+			int genuine_span = rx_batch_total_frames;
+			if(genuine_span <= 0 && rsp_gap_hold_cur_expected > 0)
+				genuine_span = rsp_gap_hold_cur_expected;
+			if(genuine_span > 0 && genuine_span < eff_window)
+				eff_window = genuine_span;
+		}
+	}
 	// Mark any still-RECEIVED slots ACKED so copy_data_to_buffer's ACKED-only
 	// iteration delivers them (idempotent: at the BATCH-DONE site the slots were
 	// already flipped ACKED before the gap gate, so this is a no-op there; at the
@@ -2599,8 +2639,9 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			if(!batchsize_desync_defeat && !passive_monitor
 			   // Option B' (data-flow-batch-size.md §9): B' WIDENS the window (eff_window) to deliver a
 			   // CMD>RSP over-count IN FULL, so the pre-B' > data_batch_size condition is now benign.
-			   // Narrow the trigger to the TRUE impossibility D5 > MAX_SACK_BATCH_SIZE (32; AXIS2 ceil ==
-			   // 32, unreachable for a legitimate non-crypto OFDM batch). Under MERCURY_BPRIME_DEFEAT the
+			   // Narrow the trigger to the TRUE impossibility D5 > MAX_SACK_BATCH_SIZE (the
+			   // Axis-2 ceiling, unreachable for a legitimate non-crypto OFDM batch). Under
+			   // MERCURY_BPRIME_DEFEAT the
 			   // window collapses AND this reverts to the pre-B' > data_batch_size abort (fail-before).
 			   && batchsize_desync_detected(rx_batch_total_frames,
 			          bprime_defeat_active() ? data_batch_size : MAX_SACK_BATCH_SIZE,
@@ -2731,7 +2772,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							// recovery matters most. Pack the per-frame received
 							// bitmap LSB-first into a uint32_t (matches
 							// send_sack_v2_frame's byte-LSB-first convention at
-							// arq_common.cc:4147-4151 for the first 32 frames).
+							// send_sack_v2_frame's byte-LSB-first convention).
 							bool used_mfsk_path = false;
 							if (MFSK_ACK_SACK_ENABLED
 								&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
@@ -2743,7 +2784,8 @@ void cl_arq_controller::process_messages_acknowledging_data()
 								// silently dropped by pack_ack_sack_payload and the
 								// receiver would never see them.
 								int nbits = eff_window;   // Option B' (§9)
-								if (nbits > 30) nbits = 30;
+								if (nbits > MFSK_SACK_BITMAP_BITS)
+									nbits = MFSK_SACK_BITMAP_BITS;
 								for (int i = 0; i < nbits; i++)
 								{
 									if (sack_bitmap[i])
@@ -3140,7 +3182,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 
 		// Clean-batch ACK transport. WB sessions use the MFSK-suffix
 		// ACK+SACK frame (16-symbol Welch-Costas pattern + 13 MFSK data
-		// symbols carrying [bsi:8 | bitmap:32 | crc12:12]). NB sessions
+		// symbols carrying [bsi:8 | bitmap:30 | crc12:12]). NB sessions
 		// (suffix_len==0) fall back to the legacy MFSK ACK pattern with
 		// no SACK payload — NB doesn't have the symbol-rate budget for
 		// SACK and the receiver implicitly treats any pattern hit as a
@@ -3169,13 +3211,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			{
 				// Phase B Wave 1 flag-day (fact-doc §11.2): bitmap is 30 bits
 				// (was 32). Producer side cap so we never set bits 30/31.
-				uint32_t bitmap_u32;
-				if (eff_window >= 30)
-					bitmap_u32 = 0x3FFFFFFFu;
-				else if (eff_window <= 0)
-					bitmap_u32 = 0u;
-				else
-					bitmap_u32 = (1u << eff_window) - 1u;
+				uint32_t bitmap_u32 = mfsk_sack_mask_for_frames(eff_window);
 				// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): the clean-ACK bsi field carries n_r
 				// (the contiguous delivery high-water) when negotiated. THE SELF-HEAL: if an
 				// EARLIER clean ACK was missed, the high-water is now AHEAD of this batch's
@@ -3196,14 +3232,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				// Option B (data-flow-compact-confirm.md): for a CLEAN batch, prefer the
 				// COMPACT coded confirm — ~70ms shorter AND ~4 dB more robust than the
 				// 13-uncoded suffix. Gated OFF until the faithful real-audio re-verify
-				// (ARQ_COMPACT_CONFIRM_ENABLE). NOT used when cumulative-ack is negotiated
-				// (the compact field carries plain bsi, no n_r reshape — it would drop the
-				// FORGIVING-ACK self-heal), so the compact path requires wire_bsi == ack_bsi.
+				// (ARQ_COMPACT_CONFIRM_ENABLE). Scalable mode carries the negotiated
+				// cumulative high-water in the same compact bsi field.
 				long long mfsk_ms = 0;
 				if (ARQ_COMPACT_CONFIRM_ENABLE
-					&& !cumulative_ack_enabled
 					&& telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0
-					&& wire_bsi == ack_bsi)
+					&& (!cumulative_ack_enabled || scalable_sack_on()))
 				{
 					mfsk_ms = send_mfsk_compact_confirm(wire_bsi);
 					if (mfsk_ms > 0)
@@ -4432,7 +4466,8 @@ void cl_arq_controller::process_control_responder()
 				// decision but rejects out-of-range values.
 				int target = new_batch_u8;
 				if(target < AXIS2_BATCH_FLOOR) target = AXIS2_BATCH_FLOOR;
-				if(target > AXIS2_BATCH_CEIL)  target = AXIS2_BATCH_CEIL;
+				if(target > axis2_batch_ceiling())
+					target = axis2_batch_ceiling();
 
 				int old_batch = data_batch_size;
 				set_data_batch_size(target);
@@ -15878,13 +15913,13 @@ int cl_arq_controller::test_batchsize_desync_delivery()
 			{ printf("[TEST-BSDESYNC] CASE-WIDEN FAIL(fix): eff_window=%d expected %d\n", eff, CMD_TOTAL); fails++; }
 			if(stored != CMD_TOTAL)
 			{ printf("[TEST-BSDESYNC] CASE-WIDEN FAIL(fix): stored %d/%d (store gate did NOT widen)\n", stored, CMD_TOTAL); fails++; }
-			// B' makes the pre-B' desync abort BENIGN: with the narrowed ceiling (32) the
-			// (B) backstop does NOT fire on the 30-frame over-count (30 <= 32).
+			// B' makes the pre-B' desync abort benign: the widened ceiling accepts
+			// this 30-frame over-count.
 			bool desync_narrow = batchsize_desync_detected(CMD_TOTAL,
 				bprime_defeat_active() ? this->data_batch_size : MAX_SACK_BATCH_SIZE,
 				this->sack_v2_enabled);
 			if(desync_narrow)
-			{ printf("[TEST-BSDESYNC] CASE-WIDEN FAIL(fix): (B) backstop FIRED despite widen (30<=32 must be benign)\n"); fails++; }
+			{ printf("[TEST-BSDESYNC] CASE-WIDEN FAIL(fix): (B) backstop FIRED despite widened ceiling\n"); fails++; }
 			// REAL delivery through the widened window: mark RECEIVED->ACKED across
 			// eff_window then the PRODUCTION copy_data_to_buffer() bounded by rx_copy_window.
 			for(int i=0;i<eff && i<this->nMessages;i++)
@@ -16072,6 +16107,92 @@ int cl_arq_controller::test_batchsize_desync_delivery()
 		}
 		this->rx_stream_stamp[P & 0xFF].valid = false;
 		this->rsp_prev_batch_active = false;
+	}
+
+	// ====================================================================
+	// CASE-GROW-STALE-TAIL (scalable-SACK batch-size UP-TRANSITION corruption).
+	// At an Axis-2 / climb batch GROWTH, data_batch_size grows AFTER this batch's
+	// frames were stored. The DELIVERY window rx_effective_window(D5) FLOORS UP to
+	// the grown data_batch_size, so rsp_commit_cur_batch_delivery() marks + delivers
+	// stale slots [D5, data_batch_size) that a PRIOR larger batch left ACKED -> those
+	// stale frames are emitted at the batch boundary (count-preserving substitution;
+	// invisible to the POSITIONAL byte-offset backstops which check offset not content).
+	// Drives the REAL rsp_commit_cur_batch_delivery() + copy_data_to_buffer() +
+	// rx_effective_window(). MERCURY_GROWTH_DELIVER_DEFEAT=1 = fail-before (the stale
+	// tail delivers); default = fix (delivery clamped DOWN to the genuine D5 span).
+	// ====================================================================
+	{
+		bool grow_defeat = false;
+		{ const char* e = std::getenv("MERCURY_GROWTH_DELIVER_DEFEAT");
+		  if(e && *e && atoi(e)!=0) grow_defeat = true; }
+		const int D5_SPAN = 60;    // the batch's GENUINE frame count (sender-declared D5)
+		const int GROWN   = 65;    // data_batch_size AFTER the Axis-2 up-move
+		const int Bc = 5, Bp = 4;  // current + prior batch ids (prior = stale-tail source)
+		this->data_batch_size                   = GROWN;
+		this->link_status                       = CONNECTED;
+		this->compression_enabled               = false;
+		this->rsp_current_expected_batch_seq_id = Bc;
+		this->rsp_last_delivered_batch_seq_id   = (Bc - 1) & 0xFF;   // contiguous: no D3.1 gap
+		this->rsp_gap_hold_cur_expected         = 0;
+		this->rsp_stream_aborted                = false;
+		this->rsp_cross_session_seam_armed      = false;
+		this->fifo_buffer_rx.flush();
+		// Positional / dedup guards inert (fresh stream cursor, no committed wire stamp).
+		this->rx_stream_delivered               = 0;
+		this->rx_stream_emitted_bsi_hw          = -1;
+		this->rx_stream_crc                     = 0;
+		for(int b=0;b<256;b++) this->rx_stream_stamp[b].valid = false;
+
+		// FAITHFUL oracle: the CURRENT batch Bc is EXACTLY D5_SPAN frames (ids 0..D5-1).
+		char tx_true[D5_SPAN * FRAMELEN];
+		for(int i=0;i<D5_SPAN;i++) frame_bytes(Bc, i, &tx_true[i*FRAMELEN]);
+
+		// State at Bc's BATCH-DONE commit instant (mirrors the production ACK-GATE mark
+		// having flipped the genuine slots ACKED):
+		//   slots [0, D5_SPAN)     = Bc genuine frames, ACKED, batch_seq_id=Bc
+		//   slots [D5_SPAN, GROWN) = STALE frames a PRIOR larger batch Bp left ACKED that
+		//                            the growth transition never cleared (batch_seq_id=Bp)
+		for(int i=0;i<this->nMessages;i++)
+		{ messages_rx[i].status=FREE; messages_rx[i].length=0; messages_rx[i].batch_seq_id=-1; }
+		for(int i=0;i<D5_SPAN;i++)
+		{
+			char b[FRAMELEN]; frame_bytes(Bc, i, b);
+			messages_rx[i].type=DATA_SHORT; messages_rx[i].id=(char)i; messages_rx[i].length=FRAMELEN;
+			memcpy(messages_rx[i].data,b,FRAMELEN); messages_rx[i].status=ACKED; messages_rx[i].batch_seq_id=Bc;
+		}
+		for(int i=D5_SPAN;i<GROWN;i++)
+		{
+			char b[FRAMELEN]; frame_bytes(Bp, i, b);   // stale content from the prior batch
+			messages_rx[i].type=DATA_SHORT; messages_rx[i].id=(char)i; messages_rx[i].length=FRAMELEN;
+			memcpy(messages_rx[i].data,b,FRAMELEN); messages_rx[i].status=ACKED; messages_rx[i].batch_seq_id=Bp;
+		}
+		this->rx_batch_total_frames = D5_SPAN;   // D5: the sender-declared genuine span
+
+		rsp_commit_cur_batch_delivery();   // REAL production commit (arq_responder.cc)
+
+		char drained[GROWN * FRAMELEN];
+		int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
+		bool genuine_prefix_ok = (popped >= D5_SPAN*FRAMELEN)
+			&& (memcmp(drained, tx_true, D5_SPAN*FRAMELEN) == 0);
+		bool stale_tail_delivered = (popped > D5_SPAN*FRAMELEN);
+		printf("[TEST-BSDESYNC] CASE-GROW-STALE-TAIL(grow_defeat=%d): popped=%dB genuine=%dB "
+			"stale_tail_delivered=%d prefix_ok=%d\n",
+			grow_defeat?1:0, popped, D5_SPAN*FRAMELEN, stale_tail_delivered?1:0, genuine_prefix_ok?1:0);
+		fflush(stdout);
+		if(!grow_defeat)
+		{
+			// pass-after (fix): delivery clamped to the genuine D5 span; NO stale tail.
+			if(!(popped == D5_SPAN*FRAMELEN && genuine_prefix_ok))
+			{ printf("[TEST-BSDESYNC] CASE-GROW-STALE-TAIL FAIL(fix): expected exactly %dB genuine, "
+				"got %dB (stale tail leaked past the batch boundary)\n", D5_SPAN*FRAMELEN, popped); fails++; }
+		}
+		else
+		{
+			// fail-before (defeat): the over-wide window emits the stale tail -> corruption.
+			if(!stale_tail_delivered)
+			{ printf("[TEST-BSDESYNC] CASE-GROW-STALE-TAIL FAIL(defeat): did NOT reproduce the "
+				"stale-tail delivery (%dB, expected > %dB)\n", popped, D5_SPAN*FRAMELEN); fails++; }
+		}
 	}
 
 	bool pass2 = (fails == 0);

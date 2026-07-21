@@ -145,7 +145,11 @@ static inline uint8_t cumulative_ack_advertise_bit()
 	if(cached < 0)
 	{
 		const char* e = std::getenv("MERCURY_CUMULATIVE_ACK");
-		cached = (e && *e && *e == '0') ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock
+		const char* scalable = std::getenv("MERCURY_SCALABLE_SACK");
+		if(scalable && *scalable && atoi(scalable) != 0)
+			cached = 1;
+		else
+			cached = (e && *e && *e == '0') ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock
 	}
 	return cached ? (uint8_t)CAP_CUMULATIVE_ACK : (uint8_t)0;
 }
@@ -951,6 +955,13 @@ cl_arq_controller::cl_arq_controller()
 	radio_batch_size=25;
 	crypto_batch_size=20;
 	retransmit_headroom=5;
+	if(scalable_sack_on())
+	{
+		// A 90-frame clean over is about 18.6 seconds at the target OFDM rung.
+		radio_batch_size=90;
+		crypto_batch_size=90;
+		retransmit_headroom=0;
+	}
 	crypto_batch_counter_tx=0;
 	crypto_batch_counter_rx=0;
 	retransmit_count=0;
@@ -1792,11 +1803,23 @@ bool cl_arq_controller::bprime_defeat_active()
 	return (e && *e && atoi(e) != 0);
 }
 
+bool cl_arq_controller::scalable_sack_on() const
+{
+	const char* e = std::getenv("MERCURY_SCALABLE_SACK");
+	return e && *e && atoi(e) != 0;
+}
+
+int cl_arq_controller::axis2_batch_ceiling() const
+{
+	return scalable_sack_on() ? AXIS2_BATCH_CEIL : AXIS2_LEGACY_BATCH_CEIL;
+}
+
 // Option B' (data-flow-batch-size.md §9): the effective RX ACCEPTANCE WINDOW.
 // The RX TRUSTS the CRC-protected per-batch sender-declared frame count (D5) when
 // it exceeds the stale command-synced data_batch_size, so a lost/late
 // SET_LINK_PARAMS can no longer truncate a batch the CMD built LARGER (res_c3100).
-// max(data_batch_size, min(D5,32)): NEVER narrows below data_batch_size, so every
+// max(data_batch_size, min(D5,MAX_SACK_BATCH_SIZE)): NEVER narrows below
+// data_batch_size, so every
 // non-desync batch (matched / step-down / compression / encryption / robust /
 // all-retx / D5-absent, and any sack_v2-off session) is BYTE-IDENTICAL. Only a
 // genuine CMD>RSP over-count (D5 > data_batch_size) widens the window, and only up
@@ -1982,7 +2005,7 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 	// the dedicated ROBUST_DWELL_BATCH_OP transport. The CMD/RSP-agreement invariant
 	// is preserved because the same range clamp runs on BOTH sides' setter (the op
 	// applies the SAME value through here on each peer) — there is no asymmetric
-	// [10,32] floor like SET_LINK_PARAMS (OR-2 / L4). recalculate_ack_timeout_for_batch()
+	// Axis-2 floor like SET_LINK_PARAMS (OR-2 / L4). recalculate_ack_timeout_for_batch()
 	// keeps the data-ACK timeout tracking the wider batch (L3): without it CMD times
 	// out mid-batch and full-retransmits, the OPPOSITE of FIX-A's goal.
 	if(is_robust_config(current_configuration))
@@ -2029,13 +2052,15 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 			target = data_batch_size;
 		else
 			target = (max_data_length+max_header_length-ACK_MULTI_ACK_RANGE_HEADER_LENGTH-1);
+		int batch_ceiling = axis2_batch_ceiling();
+		if(target > batch_ceiling) target = batch_ceiling;
 		// P-alt (DUTY fast-start, climb-duty): while CLIMBING a non-top OFDM rung, cap the
 		// confirm batch to CLIMB_CONFIRM_BATCH HERE at the SOLE setter (mirrors the robust
 		// batch=1 clamp above), so EVERY producer is caught — load_configuration's per-config
 		// OFDM batch scaling (the actual climb path), the SACK election, an AXIS-2
 		// SET_LINK_PARAMS apply. SYMMETRIC: both peers load the same config and evaluate the
 		// same predicate. Floored at CLIMB_CONFIRM_BATCH (== AXIS2_BATCH_FLOOR) so a capped
-		// confirm batch never falls below the CMD/RSP-agreed [10,32] floor (no bug-#9 mismatch).
+		// confirm batch never falls below the CMD/RSP-agreed Axis-2 floor.
 		// The 2-clean anchor count / elevator are untouched (smaller/faster batches); reverts
 		// to full batch at the ladder top for steady-state throughput. Clamped into `target`
 		// BEFORE the defer/rescan below so they see the value that will actually be stored.
@@ -2472,9 +2497,11 @@ void cl_arq_controller::sack_negotiated_recompute_batch(const char* who)
 	else if(!is_robust_config(current_configuration))
 	{
 		int max_batch = (message_transmission_time_ms > 0)
-			? (int)(30000.0 / message_transmission_time_ms + 0.5) : 31;
+			? (int)(30000.0 / message_transmission_time_ms + 0.5)
+			: MAX_SACK_BATCH_SIZE;
 		if(max_batch < 5) max_batch = 5;
 		if(max_batch > nMessages) max_batch = nMessages;
+		if(max_batch > MAX_SACK_BATCH_SIZE) max_batch = MAX_SACK_BATCH_SIZE;
 		int new_batch = radio_batch_size;
 		if(new_batch > max_batch) new_batch = max_batch;
 		set_data_batch_size(new_batch);
@@ -3178,8 +3205,8 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// 30 s target (was 12 s): longer batches amortize the ACK turnaround over
 	// more frames, raising wire efficiency. At target=30000 WB CFG6 reaches
 	// batch=25 (vs 10 previously); NB CFG7+ unblocks from the 5-frame floor.
-	// SACK bitmap cap is 32 frames (MAX_SACK_BATCH_SIZE), and radio_batch_size
-	// stays at 25 by default — fits comfortably. Synchronized CMD/RSP via the
+	// The default radio batch stays at 25; scalable SACK raises it to 90 while
+	// retaining the same duration-derived upper bound. Synchronized CMD/RSP via the
 	// same formula in arq_commander.cc:3133 and arq_responder.cc:1708.
 	if(!is_robust_config(configuration) && message_transmission_time_ms > 0)
 	{
@@ -3187,6 +3214,7 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		int max_batch = (int)((float)target_time_ms / message_transmission_time_ms + 0.5);
 		if(max_batch < 5) max_batch = 5;
 		if(max_batch > nMessages) max_batch = nMessages;
+		if(max_batch > MAX_SACK_BATCH_SIZE) max_batch = MAX_SACK_BATCH_SIZE;
 		// Batch sizing: with SACK, partial batches are retransmitted selectively,
 		// so larger batches improve duty cycle without risking full retransmission.
 		// Without SACK: batch=10 balances duty cycle vs batch failure probability.
@@ -6002,21 +6030,33 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 	fflush(stdout);
 
 	// Reuse the frame-driven prev-deliver discipline (arq_responder.cc:1134-1164): swap the
-	// messages_rx pointer to messages_rx_prev so the UNCHANGED compression/decrypt/delivery
-	// loop runs verbatim against the prev storage, mark RECEIVED -> ACKED for the ACKED-only
-	// copy, deliver, then restore + clear prev state so the subsequent ROBUST_0 reshrink is a
-	// clean no-op (rsp_prev_batch_active==false -> rescan_prev_on_batch_shrink early-returns).
+	// messages_rx pointer to messages_rx_prev so the compression/decrypt/delivery loop runs
+	// against the prev storage, mark RECEIVED -> ACKED over the genuine prev span, deliver,
+	// then restore + clear prev state so the subsequent ROBUST_0 reshrink is a clean no-op
+	// (rsp_prev_batch_active==false -> rescan_prev_on_batch_shrink early-returns).
 	struct st_message* saved_rx = messages_rx;
 	bool saved_data_delivered   = batch_data_delivered;
 	messages_rx                 = messages_rx_prev;
 	batch_data_delivered        = false;
-	for(int i=0; i<this->data_batch_size && i<this->nMessages; i++)
+	int prev_delivery_window = rx_effective_window(rsp_prev_batch_expected_count);
+	{
+		bool growth_deliver_defeat = false;
+		{ const char* e = std::getenv("MERCURY_GROWTH_DELIVER_DEFEAT");
+		  if(e && *e && atoi(e)!=0) growth_deliver_defeat = true; }
+		if(!growth_deliver_defeat
+		   && rsp_prev_batch_expected_count > 0
+		   && rsp_prev_batch_expected_count < prev_delivery_window)
+			prev_delivery_window = rsp_prev_batch_expected_count;
+	}
+	for(int i=0; i<prev_delivery_window && i<this->nMessages; i++)
 		if(messages_rx[i].status == RECEIVED)
 			messages_rx[i].status = ACKED;
 	// AEAD nonce source (data-flow-aead-nonce.md §5): pre-BREAK flush delivers
 	// messages_rx_prev[], whose wire bsi is rsp_prev_batch_seq_id.
 	decrypt_delivered_bsi = rsp_prev_batch_seq_id;
+	rx_copy_window = prev_delivery_window;
 	copy_data_to_buffer();
+	rx_copy_window = -1;
 	messages_rx          = saved_rx;
 	batch_data_delivered = saved_data_delivered;
 	for(int i=0; i<this->nMessages; i++)
@@ -11910,7 +11950,7 @@ void cl_arq_controller::send_batch()
 		{
 			int btf = message_batch_counter_tx;
 			if(btf < 1) btf = 0;            // nothing to claim
-			else if(btf > 255) btf = 255;  // single byte; MAX_SACK_BATCH_SIZE=32 ≪ 255
+			else if(btf > 255) btf = 255;  // single byte; MAX_SACK_BATCH_SIZE=96 < 255
 			batch_total_frames_wire = btf;
 			// LINK-PHASE STEP 2 (a): latch the ORIGINAL span (== this new-data keydown's frame
 			// count) per-bsi. Idempotent across the batch (all frames share one bsi). Pure
@@ -12852,6 +12892,15 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	// corrupt subsequent prev-routing). Log + count for visibility.
 	if(rsp_prev_batch_active)
 	{
+		if(scalable_sack_on())
+		{
+			printf("[RSP-SCALABLE-SACK] retaining incomplete prev batch_seq_id=%d "
+				"(%d/%d); refusing to open another receive generation\n",
+				rsp_prev_batch_seq_id, rsp_prev_batch_received_count,
+				rsp_prev_batch_expected_count);
+			fflush(stdout);
+			return;
+		}
 		rsp_prev_batch_stale_count++;
 		printf("[RSP-V2-PREV-STALE] discarding incomplete prev batch_seq_id=%d "
 			"(received=%d/%d) — replacing with new prev_batch_seq_id=%d "
@@ -13042,7 +13091,7 @@ bool cl_arq_controller::rsp_resend_prev_partial_sack()
 	{
 		uint32_t bitmap_u32 = 0;
 		int nbits = sack_win;   // Option B' (§9): eff-window wide, not data_batch_size
-		if(nbits > 30) nbits = 30;
+		if(nbits > MFSK_SACK_BITMAP_BITS) nbits = MFSK_SACK_BITMAP_BITS;
 		for(int i=0; i<nbits; i++)
 			if(sack_bitmap[i]) bitmap_u32 |= (1u << i);
 		long long mfsk_ms = send_mfsk_ack_sack(prev_bsi, bitmap_u32);
@@ -13421,7 +13470,7 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 }
 
 // RSP-side TX wrapper: MFSK ACK+SACK pattern (16 base + 13 suffix = 29
-// symbols on WB) carrying [bsi:8 | bitmap:32 | crc12:12]. Replaces the
+// symbols on WB) carrying [bsi:8 | bitmap:30 | crc12:12]. Replaces the
 // removed OFDM_ACK_CLEAN clean-batch path AND covers the partial-batch
 // case (bitmap = actual per-frame mask). See
 // mercury/fact-documents/mfsk-robust-ack.md for the design.

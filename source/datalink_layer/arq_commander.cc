@@ -535,10 +535,7 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	// CLEAN-batch only: this arm accepts full-batch ACKs (all-ones bitmap). A
 	// partial bitmap belongs to the SACK_RSP path, which runs inside the SACK
 	// window (not this bare arm); reject it here so it is not mis-accepted.
-	uint32_t all_ones = (data_batch_size >= 32)
-		? 0xFFFFFFFFu
-		: ((1u << data_batch_size) - 1u);
-	bool clean = (rx_bitmap == all_ones);
+	bool clean = mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size);
 	if(clean)
 		cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
 	return clean;
@@ -597,11 +594,19 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	if(!decoded)
 		return false;  // soft_decode_compact already gated CRC12-over-[bsi].
 
-	// bsi must be the current or just-prior batch (mod 256) — RSP only confirms a
-	// batch whose batch_seq_id matches one of those (identical to the SACK arm).
+	// Per-batch confirms address current/previous. In scalable mode a negotiated
+	// cumulative confirm carries n_r and may cover either outstanding identity.
 	unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
 	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
-	if(!((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi))
+	bool per_batch_in_window =
+		((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+	bool cumulative = scalable_sack_on() && cumulative_ack_enabled;
+	bool covered =
+		cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
+			cumulative, per_batch_in_window)
+		|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
+			cumulative, per_batch_in_window);
+	if(!covered)
 		return false;
 
 	// CLEAN-batch implicit: a compact confirm MEANS all-ones (the responder only
@@ -1855,7 +1860,8 @@ int cl_arq_controller::add_message_control(char code)
 			int target_batch = pending_link_params_batch_size;
 			if(target_batch < 0) target_batch = data_batch_size;
 			if(target_batch < AXIS2_BATCH_FLOOR) target_batch = AXIS2_BATCH_FLOOR;
-			if(target_batch > AXIS2_BATCH_CEIL)  target_batch = AXIS2_BATCH_CEIL;
+			if(target_batch > axis2_batch_ceiling())
+				target_batch = axis2_batch_ceiling();
 
 			int target_sack = pending_link_params_sack_mode;
 			if(target_sack < 0 || target_sack > 2) target_sack = 1;  // default ON
@@ -2815,10 +2821,14 @@ void cl_arq_controller::process_messages_tx_data()
 	// batch in this mixed path does not bump the counter — that path is
 	// rare because the SACK retransmit-only path above handles the common case).
 	bool batch_includes_new_data = false;
+	// A scalable partial round drains the outstanding generation before any
+	// fresh application frames are admitted. This prevents a second receive
+	// generation from forcing the responder's prev-retention discard path.
+	bool admit_new_generation = !(scalable_sack_on() && v2_mixed_batch);
 	int last_new_data_messages_tx_idx = -1;  // §7.13.39 Fix 3 — for EOB mirror
 	for(int i=0;i<this->nMessages;i++)
 	{
-		if(messages_tx[i].status==ADDED_TO_LIST)
+		if(messages_tx[i].status==ADDED_TO_LIST && admit_new_generation)
 		{
 			if(message_batch_counter_tx<data_batch_size)
 			{
@@ -4522,7 +4532,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// Step 6 of MFSK-suffix ACK+SACK redesign — CMD-side MFSK probe.
 					// Before the OFDM dispatch below, sniff the passband tail for an
 					// MFSK ACK pattern + 10-symbol SACK suffix carrying (batch_seq_id,
-					// 32-bit bitmap). On a clean decode we short-circuit straight to
+					// 30-bit bitmap). On a clean decode we short-circuit straight to
 					// the same downstream handlers that OFDM_ACK_CLEAN / SACK_RSP feed
 					// (v2_ack_pat_pre_detected flag for clean, sack_detected flag for
 					// partial). On miss we fall through to the existing OFDM path
@@ -4759,14 +4769,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// confirmations (all-ones) are NEVER routed here (they ride the self-heal).
 							bool w1_shadow_consumed = false;
 							{
-								uint32_t all_ones_w1 = (data_batch_size >= 32)
-									? 0xFFFFFFFFu : ((1u << data_batch_size) - 1u);
-								if((rx_bitmap & all_ones_w1) != all_ones_w1
+								bool mfsk_clean_w1 =
+									mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size);
+								if(!mfsk_clean_w1
 								   && cmd_prev_resack_is_shadow_target((int)rx_bsi))
 								{
 									bool sackbm_w1[MAX_SACK_BATCH_SIZE];
 									for(int i=0; i<data_batch_size && i<MAX_SACK_BATCH_SIZE; i++)
-										sackbm_w1[i] = ((rx_bitmap >> i) & 1u) ? true : false;
+										sackbm_w1[i] = mfsk_sack_bitmap_bit(rx_bitmap, i);
 									int rq = cmd_prev_retain_requeue((int)rx_bsi, sackbm_w1, data_batch_size);
 									printf("[CMD-PREV-RETAIN-REQUEUE] (mfsk) rx_bsi=%u not current batch "
 										"cmd=%u -- re-queued %d retained frame(s) (retx queue=%d); consuming "
@@ -4835,10 +4845,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								// branch clean-vs-partial; CLEAN dedupes vs cmd_last_applied_clean_bsi,
 								// PARTIAL vs cmd_last_applied_sack_bsi (a repeated clean for the
 								// same bsi is still rejected -> no double-count).
-								uint32_t all_ones = (data_batch_size >= 32)
-									? 0xFFFFFFFFu
-									: ((1u << data_batch_size) - 1u);
-								bool is_clean_confirmation = (rx_bitmap == all_ones);
+								bool is_clean_confirmation =
+									mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size);
 								// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
 								// §3): under the cap the PARTIAL wire bsi is the FROZEN n_r, NOT a per-batch
 								// identity, so key the PARTIAL de-dup on the in-flight batch the bitmap is
@@ -4920,13 +4928,13 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								{
 									// PARTIAL BATCH — mirror OFDM SACK_RSP handler
 									// (~line 2131). Populate sack_bitmap from the
-									// 32-bit bitmap, set sack_detected, record
+									// 30-bit bitmap, set sack_detected, record
 									// arrival history, dedupe state, axis3 ok event.
 									// The big block at ~line 2198 (if(sack_detected))
 									// handles retransmit queue / stats / Axis-2
 									// state from there.
 									for(int i = 0; i < data_batch_size && i < MAX_SACK_BATCH_SIZE; i++)
-										sack_bitmap[i] = ((rx_bitmap >> i) & 1u) ? true : false;
+										sack_bitmap[i] = mfsk_sack_bitmap_bit(rx_bitmap, i);
 									sack_detected = true;
 									cmd_last_applied_sack_bsi = dedup_bsi;   // Tier-2 stall fix: key on in-flight batch identity
 									// ROLLING-PARTIAL unblock (data-flow-inband-frame0-rolling-partial.md
@@ -4937,7 +4945,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// at most the tail/EOB frame the seam can clip — the observed 0x3e and
 									// 0x1e rolling partials). A marginal rung drops >2 -> false (§9).
 									{
-										int n_miss = data_batch_size - __builtin_popcount(rx_bitmap & all_ones);
+										int n_miss = data_batch_size
+											- __builtin_popcount(rx_bitmap
+												& mfsk_sack_mask_for_frames(data_batch_size));
 										last_partial_lead_frame_only =
 											((rx_bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
 									}
@@ -9802,7 +9812,7 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	// down-moves").
 	bool want_up   = (mean_partial < 0.05f)
 	                 && (axis2_consecutive_good_batches >= AXIS2_UP_GOOD_RUN)
-	                 && (data_batch_size + AXIS2_STEP <= AXIS2_BATCH_CEIL);
+	                 && (data_batch_size + AXIS2_STEP <= axis2_batch_ceiling());
 	bool want_down = (mean_partial > 0.20f)
 	                 && (axis2_consecutive_bad_batches >= AXIS2_DOWN_BAD_RUN)
 	                 && (data_batch_size - AXIS2_STEP >= AXIS2_BATCH_FLOOR);
@@ -10111,7 +10121,8 @@ void cl_arq_controller::test_fire_policy_axis2(int direction)
 	// the clamp produces a nonsense negative value).
 	int starting_batch = 25;
 	if(starting_batch < AXIS2_BATCH_FLOOR) starting_batch = AXIS2_BATCH_FLOOR;
-	if(starting_batch > AXIS2_BATCH_CEIL) starting_batch = AXIS2_BATCH_CEIL;
+	if(starting_batch > axis2_batch_ceiling())
+		starting_batch = axis2_batch_ceiling();
 	data_batch_size = starting_batch;
 
 	if(direction == 1)
@@ -11136,8 +11147,8 @@ int cl_arq_controller::test_inband_frame0_partial()
 			last_batch_fully_acked = false;
 			// production lead-frame-recoverable computation (mirror of the partial sites):
 			// frame-0 missing AND at most 2 frames missing total.
-			uint32_t all_ones = (1u << data_batch_size) - 1u;
-			int n_miss = data_batch_size - __builtin_popcount(bitmap & all_ones);
+			int n_miss = data_batch_size
+				- __builtin_popcount(bitmap & mfsk_sack_mask_for_frames(data_batch_size));
 			last_partial_lead_frame_only =
 				((bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
 		}
@@ -11272,8 +11283,8 @@ int cl_arq_controller::test_inband_climb_defer_on_retx()
 	bool fire = false, raise = false, credit = false;
 	auto eval = [&](int streak, int thresh, int retx) {
 		uint32_t bitmap = 0x3eu;                  // lead-frame-only partial (frame-0 missing)
-		uint32_t all_ones = (1u << data_batch_size) - 1u;
-		int n_miss = data_batch_size - __builtin_popcount(bitmap & all_ones);
+		int n_miss = data_batch_size
+			- __builtin_popcount(bitmap & mfsk_sack_mask_for_frames(data_batch_size));
 		last_partial_lead_frame_only =
 			((bitmap & 1u) == 0u) && (n_miss >= 1) && (n_miss <= 2);
 		last_batch_fully_acked = false;

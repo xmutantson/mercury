@@ -568,14 +568,13 @@ int cl_arq_controller::bigblock_test_election_symmetry()
 	// all_ones target — the EXACT cmd_clean_data_ack_crc_valid (arq_commander.cc:
 	// 136-139) expression, computed independently on each peer's pinned batch.
 	auto all_ones_of = [](int batch) -> uint32_t {
-		return (batch >= 32) ? 0xFFFFFFFFu : ((1u << batch) - 1u);
+		return mfsk_sack_mask_for_frames(batch);
 	};
 	uint32_t cmd_all_ones = all_ones_of(cmd_batch);
 	uint32_t rsp_all_ones = all_ones_of(rsp_batch);
 
 	// The RSP emits an all-clean K-bit big-block bitmap. cw_ok all-set -> 0xFF.
-	uint32_t rsp_bitmap = (rsp_batch >= 32) ? 0xFFFFFFFFu
-	                                         : ((1u << rsp_batch) - 1u);
+	uint32_t rsp_bitmap = mfsk_sack_mask_for_frames(rsp_batch);
 
 	// Assertions.
 	bool cmd_is_k   = (cmd_batch == K_target);
@@ -747,7 +746,7 @@ int cl_arq_controller::test_bigblock_climb_election()
 		// value (>K) -> the clean-ACK all_ones target diverges from the K-bit bitmap.
 		bool stays_unelected = (after_cmd != K_target) && (after_rsp != K_target)
 		                     && (after_cmd > K_target) && (after_rsp > K_target);
-		uint32_t cmd_all_ones = (after_cmd >= 32) ? 0xFFFFFFFFu : ((1u<<after_cmd)-1u);
+		uint32_t cmd_all_ones = mfsk_sack_mask_for_frames(after_cmd);
 		bool diverges = (cmd_all_ones != 0xFFu);
 		printf("[TEST-CLIMB-ELECT] FAIL-BEFORE (DEFEAT_ELECTION=1): cfg15-seed batch "
 		       "cmd=%d rsp=%d -> cfg16 batch cmd=%d rsp=%d (K=%d) | cmd_all_ones=0x%X "
@@ -781,8 +780,8 @@ int cl_arq_controller::test_bigblock_climb_election()
 		bool cmd_is_k  = (after_cmd == K_target);
 		bool rsp_is_k  = (after_rsp == K_target);
 		bool symmetric = (after_cmd == after_rsp);
-		uint32_t cmd_all_ones = (after_cmd >= 32) ? 0xFFFFFFFFu : ((1u<<after_cmd)-1u);
-		uint32_t rsp_all_ones = (after_rsp >= 32) ? 0xFFFFFFFFu : ((1u<<after_rsp)-1u);
+		uint32_t cmd_all_ones = mfsk_sack_mask_for_frames(after_cmd);
+		uint32_t rsp_all_ones = mfsk_sack_mask_for_frames(after_rsp);
 		bool all_ones_ff = (cmd_all_ones == 0xFFu) && (rsp_all_ones == 0xFFu);
 		printf("[TEST-CLIMB-ELECT] PASS-AFTER: cfg15-seed batch cmd=%d rsp=%d -> cfg16 "
 		       "ELECTED batch cmd=%d rsp=%d (K=%d) | all_ones cmd=0x%X rsp=0x%X\n",
@@ -2251,8 +2250,7 @@ int cl_arq_controller::test_sim_inproc_bigblock()
 		// target (data_batch_size==K==8) is 0xFF -> they MATCH -> clean ACK credited.
 		uint32_t rsp_bitmap = 0;
 		for(int c=0;c<K;c++) if(B->messages_rx[c].status==RECEIVED) rsp_bitmap |= (1u<<c);
-		uint32_t cmd_all_ones = (A->data_batch_size >= 32) ? 0xFFFFFFFFu
-		                       : ((1u << A->data_batch_size) - 1u);
+		uint32_t cmd_all_ones = mfsk_sack_mask_for_frames(A->data_batch_size);
 		bool ack_match = (rsp_bitmap == cmd_all_ones) && (rsp_bitmap == 0xFFu);
 		bool cmd_credits = cl_arq_controller::sack_clean_confirmation_accepted(
 		                     (unsigned char)block_bsi, /*is_all_ones=*/true,

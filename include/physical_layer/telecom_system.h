@@ -287,7 +287,7 @@ public:
 	int generate_ack_pattern_passband(double* out);  // TX: returns samples written
 	int generate_ack_snr_pattern_passband(double* out, float snr);  // TX: ACK + SNR suffix, returns samples
 	// TX: ACK base + 13-symbol ACK+SACK suffix carrying
-	// [bsi:8 | bitmap:32 | crc12:12]. Returns samples written, or 0 if
+	// [bsi:8 | bitmap:30 | crc12:12]. Returns samples written, or 0 if
 	// unsupported (NB / M<16). Caller supplies the crc12.
 	int generate_ack_sack_pattern_passband(double* out, uint8_t batch_seq_id, uint32_t bitmap, uint16_t crc12);
 	// use_fine (recovery-ack-fine, STAGE 1): when true, the underlying

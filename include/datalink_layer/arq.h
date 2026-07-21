@@ -324,7 +324,7 @@ inline bool batchsize_desync_detected(int sender_total_frames, int local_batch, 
 // SACK: Double-buffered crypto batch storage for partial batch handling.
 // Responder stores frames from up to 2 crypto batches (the one being completed
 // via retransmits and the new one arriving in the same radio batch).
-#define MAX_SACK_BATCH_SIZE  32   // Max frames per crypto batch
+#define MAX_SACK_BATCH_SIZE  96   // Max frames per crypto batch
 #define MAX_SACK_FRAME_SIZE  256  // Max frame payload size
 // §7.13.39 Fix 1 — must be at least 2*MAX_SACK_BATCH_SIZE so the
 // "channel collapse" safety net (retransmit_count > 2*data_batch_size →
@@ -350,7 +350,7 @@ inline bool batchsize_desync_detected(int sender_total_frames, int local_batch, 
 // number landmine): a 19-hole burst overflowed and only 1-2 frames survived, so
 // cmd_prev_retain_requeue() returned 0 (the rq0-storm) and the recoverable gap
 // deadlocked into a BREAK. See the retention-shadow data-flow audit.
-#define CMD_PREV_RETAIN_MAX  32  // array capacity (repaired effective cap)
+#define CMD_PREV_RETAIN_MAX  MAX_SACK_BATCH_SIZE // full-batch retention capacity
 #define CMD_PREV_RETAIN_BASE 8   // pre-fix effective cap (flag OFF = byte-identical)
 
 // §7.13.39 Fix 2 — sequence_number is a uint8 on the wire (low 7 bits = slot,
@@ -455,6 +455,8 @@ public:
   void set_max_buffer_length(int max_data_length, int max_message_length, int max_header_length);
   void set_ack_batch_size(int ack_batch_size);
   void set_data_batch_size(int data_batch_size);
+  bool scalable_sack_on() const;
+  int axis2_batch_ceiling() const;
   // R038 (race audit 2026-06-06) — per-frame v2 EOB staging consumed by the
   // match-current storage block; declared near last_received_end_of_batch_seq.
   // R035 (race audit 2026-06-06) — called from the set_data_batch_size()
@@ -545,7 +547,7 @@ public:
   // CRC-12 over `nBytes` bytes, MSB-first, returning a 12-bit value in the
   // low 12 bits of the uint16_t. Polynomial = POLY_CRC12 = 0xF13
   // (CRC-12-CDMA2000 forward), init = 0xFFF, no final XOR. Used to protect
-  // the 40-bit MFSK ACK+SACK payload (`bsi:8 | bitmap:32`) against false-
+  // the MFSK ACK+SACK payload (`bsi:8 | bitmap:30`) against false-
   // accept after pattern correlator lock. See
   // mercury/fact-documents/mfsk-robust-ack.md §3.2.
   uint16_t CRC12_calc(const char* data_byte, int nBytes);
@@ -914,7 +916,7 @@ public:
                             unsigned char* out_batch_seq_id);
 
   // RSP-side TX wrapper. Send the MFSK ACK+SACK pattern (16 base +
-  // 13 suffix = 29 symbols on WB) carrying [bsi:8 | bitmap:32 | crc12:12].
+  // 13 suffix = 29 symbols on WB) carrying [bsi:8 | bitmap:30 | crc12:12].
   // WB-only — caller must check ack_sack_suffix_len() > 0 before
   // calling (or this returns 0 and the caller falls back to the
   // legacy MFSK ACK pattern for NB / unsupported configurations).
@@ -923,7 +925,7 @@ public:
   // Returns wall-clock TX time in ms, or 0 if the feature is unavailable
   // (NB session, M < 16, or compile-time gate MFSK_ACK_SACK_ENABLED=0).
   // Computes CRC12 over [bsi || bitmap] internally and emits the 16-symbol
-  // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:32 | crc12:12].
+  // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:30 | crc12:12].
   long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap);
 
   // Option B (data-flow-compact-confirm.md): emit the COMPACT coded reverse
@@ -4112,14 +4114,11 @@ public:
                                          //      path, exactly as if the OFDM
                                          //      control frame had been lost on
                                          //      the air).
-  unsigned char cmd_sack_v2_last_rx_bitmap[MAX_SACK_BATCH_SIZE / 8 + 1];
+  unsigned char cmd_sack_v2_last_rx_bitmap[(MAX_SACK_BATCH_SIZE + 7) / 8];
                                          // CMD: most recent decoded bitmap bytes
                                          //      (post-CRC). For test scaffold
                                          //      observability. Sized to fit any
-                                         //      Design A batch size (max 50 → 7
-                                         //      bytes; we provision MAX_SACK_BATCH_SIZE/8+1
-                                         //      = 5 bytes which covers
-                                         //      data_batch_size up to 32).
+                                         //      every supported batch size.
   int           cmd_sack_v2_last_rx_nbits;
                                          // CMD: number of valid bits in
                                          //      cmd_sack_v2_last_rx_bitmap (= the
@@ -4291,15 +4290,14 @@ public:
   // skip when axis2_cooldown_batches > 0 (set to 3 by the Axis-1 supremacy
   // hook on every Axis-1 move).
   //
-  // §4.3.1 batch-size range nominally [10, 50]; Mercury's existing
-  // MAX_SACK_BATCH_SIZE=32 bitmap allocation caps the runtime ceiling to 32
-  // for Step 10 — documented in §7.10 RESULT. AXIS2_BATCH_FLOOR and
-  // AXIS2_BATCH_CEIL provide a single source of truth for clamping.
+  // The runtime ceiling remains 32 by default and widens to the storage cap
+  // only when scalable SACK is explicitly enabled.
   static const int AXIS2_BATCH_FLOOR = 10;
-  static const int AXIS2_BATCH_CEIL  = 32;  // capped by MAX_SACK_BATCH_SIZE
+  static const int AXIS2_LEGACY_BATCH_CEIL = 32;
+  static const int AXIS2_BATCH_CEIL  = MAX_SACK_BATCH_SIZE;
   // P-alt (DUTY fast-start) — the CLIMB-CONFIRM batch cap (see climb_confirm_batch_active()).
   // == AXIS2_BATCH_FLOOR so a capped confirm batch never falls below the CMD/RSP-agreed
-  // SET_LINK_PARAMS floor [10,32] (no bug-#9 clamp mismatch).
+  // SET_LINK_PARAMS floor (no lower-bound clamp mismatch).
   static const int CLIMB_CONFIRM_BATCH = AXIS2_BATCH_FLOOR;
   static const int AXIS2_STEP        = 5;
   static const int AXIS2_RING_DEPTH  = 5;
@@ -5768,7 +5766,7 @@ public:
   // re-elect the batch from current_configuration (the SET_CONFIG both loaded) in the SHARED
   // election sack_negotiated_recompute_batch() with NO SET_LINK_PARAMS (verified on the wire:
   // CONFIG_0->13 re-elected 6->25 on BOTH peers, no link-param round-trip). Floored at
-  // AXIS2_BATCH_FLOOR (== CLIMB_CONFIRM_BATCH) so no CMD/RSP [10,32] clamp mismatch (bug #9).
+  // AXIS2_BATCH_FLOOR (== CLIMB_CONFIRM_BATCH) so no CMD/RSP lower-bound clamp mismatch.
   // The ELEVATOR / N_OFDM=2 count is UNTOUCHED (same 2 clean batches, just smaller/faster)
   // -> the TIER-1 leap is preserved. At the ladder TOP (steady-state) the cap lifts -> full
   // batch for throughput. duty_palt_defeat / master-defeat restores the incumbent full climb
