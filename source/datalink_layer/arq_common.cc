@@ -18139,14 +18139,22 @@ copy_data_done:
 	// on a real, non-dropped emit -- the de-dup gate above returns early). Keyed to
 	// decrypt_delivered_bsi (the wire bsi, the same source the cursor + stamp use), so
 	// a subsequent re-delivery of this bsi (fwd==0) is de-duped at the funnel top.
-	if(decrypt_delivered_bsi >= 0)
+	// A control-path flush (SWITCH_ROLE / FILE_END_) can reach this funnel with a
+	// candidate bsi but no ACKED slots.  A candidate is not an emitted batch:
+	// committing it here poisons de-dup state and consumes the next real stamp.
+	// The defeat knob restores that old behavior for the deterministic regression.
+	bool empty_flush_defeat = false;
+	{ const char* e = std::getenv("MERCURY_SWITCHROLE_EMPTY_FLUSH_DEFEAT");
+	  if(e && *e && atoi(e)!=0) empty_flush_defeat = true; }
+	bool emitted_batch = copied > 0 || empty_flush_defeat;
+	if(emitted_batch && decrypt_delivered_bsi >= 0)
 		rx_stream_emitted_bsi_hw = decrypt_delivered_bsi & 0xFF;
 	// Option W CORE: consume this bsi's parsed stamp on delivery so a later 256-batch
 	// wraparound reuse of the same bsi with a LOST EOB frame reads INVALID (skip),
 	// never a STALE start (which would false-fire the BACKSTOP). A double-delivery of
 	// the same bsi then also reads invalid → the NEXT batch's BACKSTOP catches the
 	// inflated cursor. Guarded (bsi may be -1 on non-bsi paths).
-	if(decrypt_delivered_bsi >= 0)
+	if(emitted_batch && decrypt_delivered_bsi >= 0)
 		rx_stream_stamp[decrypt_delivered_bsi & 0xFF].valid = false;
 	block_ready=1;
 }

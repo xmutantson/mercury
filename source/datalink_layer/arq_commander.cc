@@ -17974,6 +17974,60 @@ int cl_arq_controller::test_idle_switch_role_race()
 		"(end-of-data SWITCH_ROLE preserved)",
 		b2_fired ? 1 : 0, 1);
 
+	// === C: an empty SWITCH_ROLE/FILE_END flush is not a batch delivery ===
+	// The control handlers set decrypt_delivered_bsi to the next expected bsi and
+	// call copy_data_to_buffer() even when no residual ACKED slot exists.  That
+	// candidate bsi must not advance the emit high-water or consume its wire stamp;
+	// otherwise the next real batch is rejected by the funnel's de-dup gate.
+	for(int i=0; i<nMessages; i++) {
+		messages_rx[i].status = FREE;
+		messages_rx[i].length = 0;
+		messages_rx[i].batch_seq_id = -1;
+	}
+	fifo_buffer_rx.set_size(default_configuration_ARQ.fifo_buffer_rx_size);
+	fifo_buffer_rx.flush();
+	rx_copy_window                = -1;
+	compression_enabled          = false;
+	encryption_enabled           = false;
+	rsp_cross_session_seam_armed = false;
+	rx_stream_delivered          = 16;
+	rx_stream_emitted_bsi_hw     = 0;
+	decrypt_delivered_bsi        = 1;
+	for(int s=0; s<256; s++) rx_stream_stamp[s].valid = false;
+	rx_stream_stamp[1].start  = 16;
+	rx_stream_stamp[1].length = 4;
+	rx_stream_stamp[1].crc    = 0;
+	rx_stream_stamp[1].valid  = true;
+
+	copy_data_to_buffer();                    // empty control-path flush for bsi 1
+	check(rx_stream_emitted_bsi_hw == 0,
+		"C1 EMPTY FLUSH: emit high-water remains at last actually emitted bsi",
+		rx_stream_emitted_bsi_hw, 0);
+	check(rx_stream_stamp[1].valid,
+		"C2 EMPTY FLUSH: next real bsi stamp remains valid",
+		rx_stream_stamp[1].valid ? 1 : 0, 1);
+
+	const char next_batch[4] = {'N','E','X','T'};
+	memcpy(messages_rx[0].data, next_batch, sizeof(next_batch));
+	messages_rx[0].length       = (int)sizeof(next_batch);
+	messages_rx[0].status       = ACKED;
+	messages_rx[0].batch_seq_id = 1;
+	decrypt_delivered_bsi       = 1;
+	copy_data_to_buffer();                    // first real delivery of bsi 1
+
+	char got_next[4] = {0,0,0,0};
+	int got_next_n = fifo_buffer_rx.pop(got_next, (int)sizeof(got_next));
+	check(got_next_n == (int)sizeof(next_batch)
+	      && memcmp(got_next, next_batch, sizeof(next_batch)) == 0,
+		"C3 NEXT BSI: real batch survives de-dup and is byte-exact",
+		got_next_n, (int)sizeof(next_batch));
+	check(rx_stream_delivered == 20,
+		"C4 NEXT BSI: transported-byte cursor advances exactly once",
+		(int)rx_stream_delivered, 20);
+	check(rx_stream_emitted_bsi_hw == 1 && !rx_stream_stamp[1].valid,
+		"C5 NEXT BSI: delivery commits high-water and consumes stamp",
+		rx_stream_emitted_bsi_hw, 1);
+
 	deinit_messages_buffers();
 
 	printf("[TEST-IDLESR] %s (%d failure%s)\n",
