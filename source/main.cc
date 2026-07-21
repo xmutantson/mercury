@@ -1247,6 +1247,86 @@ static int run_frame0_replay_selftest(const char* path)
     return decoded ? 0 : 1;
 }
 
+// --test-crc-escape: CRC-ESCAPE accept-gate self-test. Proves the OFDM RX frame
+// accept/reject gate (cl_telecom_system::frame_decode_rejected) REJECTS a non-converged
+// LDPC decode (iterations_done == nIteration_max+1, the FAIL sentinel) whose residual-
+// error bits collide the 16-bit MODBUS CRC to 0 -- the ~2^-16 event that under the
+// legacy crc-only gate committed a corrupt frame on a clean channel (LOSE, not CORRUPT).
+// Deterministic, in-process (no IONOS/RF): loads CONFIG_16 (CRC16_MODBUS_RTU outer code),
+// mocks the exact gate inputs, and drives the PRODUCTION predicate directly.
+//   fail-before: crc_escape_defeat=true  -> legacy gate ACCEPTS (message_decoded=YES; the
+//                CRC-colliding corrupt frame is delivered).
+//   pass-after : crc_escape_defeat=false -> gate REJECTS (message_decoded=NO -> the frame
+//                falls into the FAIL branch and the existing TIME_INTERP-seed rescue).
+// Controls: a CONVERGED crc-good frame is ACCEPTED by BOTH arms (the fix weakens no
+// good-frame acceptance); a crc-bad frame is REJECTED by both.
+static int run_crc_escape_selftest()
+{
+    printf("[TEST-CRC-ESCAPE] OFDM accept-gate CRC-escape convergence-guard self-test\n");
+    int fails = 0;
+    const int cfg = CONFIG_16;
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(cfg);
+
+    // CONFIG_16 is a CRC16_MODBUS_RTU-outer-coded config -- the gate branch under test.
+    if (ts.outer_code != CRC16_MODBUS_RTU) {
+        printf("[TEST-CRC-ESCAPE]   FAIL: CONFIG_16 outer_code=%d != CRC16_MODBUS_RTU(%d)\n",
+               ts.outer_code, CRC16_MODBUS_RTU);
+        printf("[TEST-CRC-ESCAPE] FAILED (1 failure)\n");
+        return 1;
+    }
+    const int nIterMax = ts.ldpc.nIteration_max;
+    const int NONCONV  = nIterMax + 1;                 // canonical LDPC FAIL sentinel
+    const int CONV     = (nIterMax > 1) ? (nIterMax - 1) : 0;  // a converged decode
+
+    // returns 1 == REJECT (message_decoded=NO -> TINTERP); 0 == ACCEPT (delivers)
+    auto decide = [&](int crc, int iters, int all_zeros, bool defeat)->int {
+        st_receive_stats rs;                            // value-initialised (all fields 0)
+        rs.all_zeros       = all_zeros;
+        rs.crc             = crc;
+        rs.iterations_done = iters;
+        return ts.frame_decode_rejected(rs, ts.outer_code, defeat) ? 1 : 0;
+    };
+
+    // ---- fail-before: legacy crc-only gate ACCEPTS the corrupt frame ----
+    int rej_before = decide(/*crc=*/0, /*iters=*/NONCONV, /*all_zeros=*/NO, /*defeat=*/true);
+    bool fail_before_ok = (rej_before == 0);            // ACCEPT == the escape reproduced
+    printf("[TEST-CRC-ESCAPE]   FAIL-BEFORE (defeat, crc=0 iter=%d nonconv): gate=%s -> %s (expect ACCEPT/deliver)\n",
+           NONCONV, rej_before ? "REJECT" : "ACCEPT",
+           rej_before ? "message_decoded=NO" : "message_decoded=YES");
+    if (!fail_before_ok) { fails++; printf("[TEST-CRC-ESCAPE]   FAIL: legacy gate did NOT accept -- fail-before not reproduced\n"); }
+
+    // ---- pass-after: fixed gate REJECTS the same frame -> TINTERP ----
+    int rej_after = decide(/*crc=*/0, /*iters=*/NONCONV, /*all_zeros=*/NO, /*defeat=*/false);
+    bool pass_after_ok = (rej_after == 1);              // REJECT == message_decoded=NO -> TINTERP
+    printf("[TEST-CRC-ESCAPE]   PASS-AFTER  (fixed,  crc=0 iter=%d nonconv): gate=%s -> %s (expect REJECT->TINTERP)\n",
+           NONCONV, rej_after ? "REJECT" : "ACCEPT",
+           rej_after ? "message_decoded=NO" : "message_decoded=YES");
+    if (!pass_after_ok) { fails++; printf("[TEST-CRC-ESCAPE]   FAIL: fixed gate did NOT reject -- CRC-escape still open\n"); }
+
+    // ---- control 1: a CONVERGED crc-good frame is ACCEPTED by BOTH arms ----
+    int good_before = decide(0, CONV, NO, true);
+    int good_after  = decide(0, CONV, NO, false);
+    bool good_ok = (good_before == 0) && (good_after == 0);
+    printf("[TEST-CRC-ESCAPE]   CONTROL good-frame (crc=0 iter=%d converged): before=%s after=%s (expect ACCEPT both)\n",
+           CONV, good_before?"REJECT":"ACCEPT", good_after?"REJECT":"ACCEPT");
+    if (!good_ok) { fails++; printf("[TEST-CRC-ESCAPE]   FAIL: fix weakened converged good-frame acceptance\n"); }
+
+    // ---- control 2: a crc-BAD frame is REJECTED by BOTH arms ----
+    int bad_before = decide(0x1234, CONV, NO, true);
+    int bad_after  = decide(0x1234, CONV, NO, false);
+    bool bad_ok = (bad_before == 1) && (bad_after == 1);
+    printf("[TEST-CRC-ESCAPE]   CONTROL crc-bad   (crc!=0 iter=%d): before=%s after=%s (expect REJECT both)\n",
+           CONV, bad_before?"REJECT":"ACCEPT", bad_after?"REJECT":"ACCEPT");
+    if (!bad_ok) { fails++; printf("[TEST-CRC-ESCAPE]   FAIL: crc-bad frame accepted\n"); }
+
+    printf("[TEST-CRC-ESCAPE] %s (%d failure%s)  [nIterMax=%d FAIL-sentinel=%d]\n",
+           fails==0 ? "ALL PASS" : "FAILED", fails, fails==1?"":"s", nIterMax, NONCONV);
+    return fails==0 ? 0 : 1;
+}
+
 // --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
 // pass-after self-test. See fact-documents/chase-combining-harq.md.
 //
@@ -2010,6 +2090,11 @@ int main(int argc, char *argv[])
             // defeating the primitive restores the pre-fix 0. Fast + deterministic, no
             // IONOS/RF. See fact-documents/chase-combining-harq.md.
             failed += run_chase_selftest();
+            // CRC-ESCAPE accept-gate gate: a non-converged LDPC decode whose residual
+            // errors collide the 16-bit CRC to 0 must be REJECTED (not delivered). Drives
+            // the PRODUCTION frame_decode_rejected() predicate; fail-before via the
+            // crc_escape_defeat arm (legacy crc-only gate). Deterministic, no RF.
+            failed += run_crc_escape_selftest();
             // In-band demote-rebase DOUBLE-DELIVERY (byte-stream corruption): the RSP
             // re-delivers an already-delivered batch across an in-band demote-rebase
             // (re-adopt + lost-ACK retransmit re-reach the delivery funnel with fwd==0).
@@ -2578,6 +2663,14 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-chase") == 0) {
             arm_test_watchdog();
             int failed = run_chase_selftest();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-crc-escape : run ONLY the CRC-escape accept-gate self-test and exit.
+        // Deterministic, in-process; drives the PRODUCTION frame_decode_rejected()
+        // predicate (fail-before via the crc_escape_defeat arm). No IONOS/RF.
+        if (strcmp(argv[i], "--test-crc-escape") == 0) {
+            arm_test_watchdog();
+            int failed = run_crc_escape_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // --test-subpeak-rescue : run ONLY the F1b Part B true-boundary rescue

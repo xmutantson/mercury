@@ -572,6 +572,13 @@ public:
 	static bool subpeak_metric_gate_enabled();
 	bool subpeak_reject_out_of_band(double bb_pream, double pb_pream) const;
 	bool subpeak_admission_reject(double bb_pream, double pb_pream) const;
+	// Accept/reject gate for a decoded frame, extracted from receive_byte() so the
+	// deterministic gate self-test exercises the SAME predicate (see telecom_system.cc).
+	// Returns true when the frame must be REJECTED (routed to the FAIL branch + the
+	// TIME_INTERP-seed rescue). The CRC16 branch requires crc==0 AND a CONVERGED LDPC
+	// decode. crc_escape_defeat restores the legacy CRC-only CRC16 gate for the
+	// fail-before arm of the self-test; the receive path always passes false.
+	bool frame_decode_rejected(const st_receive_stats& rs, int outer_code_in, bool crc_escape_defeat=false) const;
 	int test_subpeak_gate();
 
 	// F1b Part B (true-boundary rescue selector). Re-estimates the OFDM channel at

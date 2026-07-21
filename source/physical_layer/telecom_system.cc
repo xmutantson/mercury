@@ -1280,6 +1280,35 @@ bool cl_telecom_system::subpeak_admission_reject(
 #endif
 }
 
+// Exact production accept/reject decision for a decoded OFDM/MFSK frame, split out
+// so the deterministic gate self-test (--test-crc-escape) cannot drift from the
+// receive path. Returns true when the frame must be REJECTED (routed to the FAIL
+// branch and the TIME_INTERP-seed rescue) rather than committed.
+//
+// The CRC16 branch requires BOTH a passing frame CRC (crc==0) AND a CONVERGED LDPC
+// decode. A non-converged decode returns the canonical FAIL sentinel iterations_done
+// == nIteration_max+1 (ldpc.h): its hard-decision bits are not a valid codeword, so
+// residual bit-errors remain. Without the convergence term such a frame would be
+// COMMITTED whenever its residual errors happen to collide the 16-bit CRC to 0
+// (~2^-16), delivering a corrupt frame on a clean channel. The convergence term
+// closes that escape; a rejected frame reaches the existing TIME_INTERP rescue, which
+// re-decodes cleanly -- exactly what every marginal-LS neighbour frame already does.
+//
+// crc_escape_defeat restores the legacy CRC-only CRC16 gate (crc!=0 only) so the
+// self-test can reproduce the pre-fix delivery of the CRC-colliding non-converged
+// frame. It is NEVER set on the receive path (receive_byte passes false).
+bool cl_telecom_system::frame_decode_rejected(
+		const st_receive_stats& rs, int outer_code_in, bool crc_escape_defeat) const
+{
+	if(rs.all_zeros==YES) return true;
+	if(outer_code_in == CRC16_MODBUS_RTU)
+	{
+		if(crc_escape_defeat) return (rs.crc != 0);
+		return (rs.crc != 0 || rs.iterations_done > ldpc.nIteration_max);
+	}
+	return (rs.iterations_done > (ldpc.nIteration_max-1));
+}
+
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 {
 	// P1: big-block framing branch (gated; default OFF). When set, receive_byte
@@ -3827,9 +3856,10 @@ skip_h_retry_point:
 				receive_stats.crc=CRC16_MODBUS_RTU_calc(data_container.hd_decoded_data_byte, nReal_data/8);
 			}
 
-			if(receive_stats.all_zeros==YES ||
-			   (outer_code == CRC16_MODBUS_RTU && receive_stats.crc != 0) ||
-			   (outer_code != CRC16_MODBUS_RTU && receive_stats.iterations_done > (ldpc.nIteration_max-1)))
+			// Accept/reject decision extracted into frame_decode_rejected() so the
+			// deterministic gate self-test exercises the SAME predicate this path uses.
+			// CRC16 branch: reject unless crc==0 AND the LDPC decode CONVERGED.
+			if(frame_decode_rejected(receive_stats, outer_code))
 			{
 				receive_stats.SNR=-99.9;
 				receive_stats.message_decoded=NO;
