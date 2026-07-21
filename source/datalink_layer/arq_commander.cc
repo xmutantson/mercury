@@ -13217,16 +13217,52 @@ int cl_arq_controller::test_climb_engine()
 	check(data_batch_size == 1, "B2 robust ROBUST_0 batch STAYS 1 (guard at every rung)",
 		data_batch_size, 1);
 
-	// B3: OFDM (CONFIG_10) — Axis-2 is NOT guarded; a run of good batches grows
-	// the batch (floor 10, step 5). Confirms the guard is robust-ONLY (OFDM
-	// behavior unchanged). Start at AXIS2_BATCH_FLOOR so the up-step is in range.
+	// B3: non-top OFDM (CONFIG_10) — the later P-alt climb-confirm policy also
+	// guards Axis-2 while climbing. The shared SET_CONFIG election has pinned the
+	// confirm batch small, so Axis-2 must not grow it back mid-rung and undo the
+	// airtime saving. This supersedes the original (pre-P-alt) "robust-only"
+	// assumption in this older test.
+	duty_palt_defeat = false;
 	current_configuration = CONFIG_10;
 	set_data_batch_size(AXIS2_BATCH_FLOOR);   // 10
 	reset_axis2();
 	for(int k=0;k<6;k++)
 		policy_evaluate_axis2(data_batch_size, data_batch_size);
-	check(data_batch_size > AXIS2_BATCH_FLOOR, "B3 OFDM batch DOES grow (guard is robust-only)",
+	check(data_batch_size == AXIS2_BATCH_FLOOR,
+		"B3 non-top OFDM batch STAYS capped during P-alt climb-confirm",
+		data_batch_size, AXIS2_BATCH_FLOOR);
+
+	// B4: regular-framed top-rung OFDM steady state — P-alt is inactive and the
+	// big-block geometry lock does not apply, so a clean run through the REAL
+	// Axis-2 still grows the batch (floor 10, step 5). Save/restore the framing
+	// mode so this arm isolates ordinary adaptive OFDM without weakening either
+	// production guard.
+	bool saved_bigblock_framing = false;
+	int saved_retransmit_count = retransmit_count;
+	bool saved_last_batch_fully_acked = last_batch_fully_acked;
+	if(telecom_system != NULL)
+	{
+		saved_bigblock_framing = telecom_system->bigblock_framing_enabled;
+		telecom_system->bigblock_framing_enabled = false;
+	}
+	// The synthetic rx_count==batch observations represent clean completed
+	// batches, but unlike the live ACK caller they do not update these separate
+	// quiesce inputs. Prime the matching clean boundary so the intended move is
+	// evaluated instead of being deferred by an unrelated recovery guard.
+	retransmit_count = 0;
+	last_batch_fully_acked = true;
+	current_configuration = CONFIG_16;
+	set_data_batch_size(AXIS2_BATCH_FLOOR);
+	reset_axis2();
+	for(int k=0;k<6;k++)
+		policy_evaluate_axis2(data_batch_size, data_batch_size);
+	check(data_batch_size > AXIS2_BATCH_FLOOR,
+		"B4 regular-framed top-rung OFDM steady-state batch DOES grow",
 		data_batch_size, AXIS2_BATCH_FLOOR + AXIS2_STEP);
+	if(telecom_system != NULL)
+		telecom_system->bigblock_framing_enabled = saved_bigblock_framing;
+	retransmit_count = saved_retransmit_count;
+	last_batch_fully_acked = saved_last_batch_fully_acked;
 
 	// ================================================================
 	// Part C — Bug 3 (THE assertion the singles lacked): end-to-end MULTI-rung
