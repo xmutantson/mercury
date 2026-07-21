@@ -18161,6 +18161,45 @@ copy_data_done:
 
 void cl_arq_controller::restore_tx_from_compressed()
 {
+	// Compression-recovery bsi continuity: process_messages_tx_data() advances
+	// cmd_batch_seq_id immediately after sending a new-data batch, while the sent
+	// frames remain here until their ACK arrives. If BREAK/demote/climb recovery
+	// restores those frames' plaintext under the already-advanced identity, the
+	// responder sees the same bytes as a fresh successor rather than a duplicate
+	// of the in-flight batch. With no Option-W stamp that appends the bytes twice;
+	// with a stamp it trips a loud stream-shift teardown. The raw recovery paths
+	// already restore this identity before freeing messages_tx[]. Do the same at
+	// the single compression funnel, while the original batch_seq_id still exists.
+	// Gated like the raw rollback: v1 never carries or consumes this field.
+	int min_inflight_bsi = -1;
+	if(sack_v2_enabled)
+	{
+		for(int i=0; i<nMessages; i++)
+		{
+			if(messages_tx[i].status == FREE || messages_tx[i].length <= 0
+			   || messages_tx[i].batch_seq_id < 0)
+				continue;
+			int b = messages_tx[i].batch_seq_id & 0xFF;
+			if(min_inflight_bsi < 0)
+				min_inflight_bsi = b;
+			else
+			{
+				unsigned fwd = ((unsigned)(min_inflight_bsi - b)) & 0xFFu;
+				if(fwd >= 1u && fwd <= 128u) min_inflight_bsi = b;
+			}
+		}
+	}
+	bool bsi_rollback_defeat = false;
+	{ const char* e = std::getenv("MERCURY_COMPRESS_RECOVERY_BSI_DEFEAT");
+	  if(e && *e && atoi(e)!=0) bsi_rollback_defeat = true; }
+	if(min_inflight_bsi >= 0 && !bsi_rollback_defeat)
+	{
+		printf("[RESTORE_TX] Rolling cmd_batch_seq_id %d -> %d for compressed "
+			"in-flight replay continuity\n", cmd_batch_seq_id & 0xFF, min_inflight_bsi);
+		fflush(stdout);
+		cmd_batch_seq_id = min_inflight_bsi;
+	}
+
 	// Option W (§2.2): un-commit the in-flight batch's transported bytes BEFORE this
 	// funnel frees messages_tx[] and re-queues plaintext (the compressed/streaming/
 	// encrypted twin of restage_requeue_tx_messages). Runs while messages_tx[] still

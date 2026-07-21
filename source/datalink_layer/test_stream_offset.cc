@@ -1045,6 +1045,142 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
+	// PART Y -- compression recovery must restore BOTH coupled identities: the
+	// transported-byte cursor and cmd_batch_seq_id. restore_tx_from_compressed()
+	// is the one production funnel shared by BREAK, demote, climb, and CFG16-HOLD.
+	// A sent batch B has already advanced cmd_batch_seq_id to B+1 while its frames
+	// remain PENDING_ACK. If recovery restores B's plaintext but leaves that counter
+	// at B+1, the receiver sees the same bytes as a fresh successor instead of a
+	// duplicate of B. With no wire stream stamp (a supported safe-no-op condition),
+	// copy_data_to_buffer() then appends the bytes twice. The default fix restores
+	// the in-flight identity before freeing messages_tx[]; the same-binary
+	// MERCURY_COMPRESS_RECOVERY_BSI_DEFEAT=1 arm preserves B+1 and turns the
+	// identity + byte-exact checks red.
+	// ---------------------------------------------------------------------------
+	printf("[TEST-STREAM-OFFSET] Part Y -- compressed recovery restores in-flight bsi and de-dups replay\n");
+	{
+		bool bsi_defeat = false;
+		{ const char* e = std::getenv("MERCURY_COMPRESS_RECOVERY_BSI_DEFEAT");
+		  if(e && *e && atoi(e)!=0) bsi_defeat = true; }
+
+		if(fifo_buffer_backup.set_size(65536) != SUCCESSFUL)
+		{
+			printf("[TEST-STREAM-OFFSET]  FAIL  Y: fifo_buffer_backup set_size failed\n");
+			g_fails++;
+		}
+		compressor.init();
+		compressor.streaming_enable();
+		this->compression_enabled = true;
+		this->sack_v2_enabled = true;
+
+		auto recovery_case = [&](int inflight_bsi, const char* tag) {
+			const int RAW = 101;
+			unsigned char raw[RAW];
+			for(int i=0;i<RAW;i++) raw[i]=(unsigned char)((i*29 + inflight_bsi*7 + 3) & 0xFF);
+
+			fifo_buffer_tx.flush();
+			fifo_buffer_backup.flush();
+			fifo_buffer_rx.flush();
+			for(int i=0;i<nMessages;i++)
+			{
+				messages_tx[i].status=FREE; messages_tx[i].length=0;
+				messages_rx[i].status=FREE; messages_rx[i].length=0;
+			}
+			for(int i=0;i<256;i++)
+			{
+				tx_stream_stamp[i].valid=false;
+				rx_stream_stamp[i].valid=false;
+			}
+
+			// Production chronology: B is built and sent, so the byte cursor is past
+			// it and the commander's next-new-data identity is B+1. The reverse ACK
+			// is lost, leaving B in messages_tx[] for the recovery funnel.
+			tx_stream_committed=37;
+			tx_stream_crc=CRC32_INIT;
+			stream_tx_latch(inflight_bsi, RAW);
+			messages_tx[0].length=RAW;
+			messages_tx[0].batch_seq_id=inflight_bsi;
+			messages_tx[0].status=PENDING_ACK;
+			for(int i=0;i<RAW;i++) messages_tx[0].data[i]=(char)(raw[i] ^ 0x5A);
+			cmd_batch_seq_id=(inflight_bsi + 1) & 0xFF;
+			fifo_buffer_backup.push((char*)raw, RAW);
+
+			// The real compression recovery funnel rolls the cursor, resets the
+			// streaming context, frees messages_tx[], and restores plaintext.
+			restore_tx_from_compressed();
+			char restored[RAW+8];
+			int restored_n=fifo_buffer_tx.pop(restored, (int)sizeof(restored));
+			bool restore_exact=(restored_n==RAW && memcmp(restored, raw, RAW)==0);
+			char what[160];
+			snprintf(what, sizeof(what), "Y(%s): production restore returns plaintext byte-exact", tag);
+			CHECK(restore_exact, what, restored_n, RAW);
+			snprintf(what, sizeof(what), "Y(%s): cmd identity restored to in-flight batch", tag);
+			CHECK((cmd_batch_seq_id & 0xFF)==(inflight_bsi & 0xFF), what,
+				cmd_batch_seq_id & 0xFF, inflight_bsi & 0xFF);
+			CHECK(tx_stream_committed==37, "Y: stream cursor rolled back in lockstep",
+				(long long)tx_stream_committed, 37);
+
+			// Receiver already emitted B before its ACK was lost. Seed the app FIFO
+			// with that first byte-exact delivery, then re-present the restored bytes
+			// under the identity the commander will use. No stamp is present: this is
+			// the production backstop's documented safe-no-op case, so bsi de-dup is
+			// the sole barrier against a duplicate append.
+			this->compression_enabled=false;
+			this->data_batch_size=1;
+			rx_stream_delivered=RAW;
+			rx_stream_emitted_bsi_hw=inflight_bsi & 0xFF;
+			decrypt_delivered_bsi=cmd_batch_seq_id & 0xFF;
+			fifo_buffer_rx.push((char*)raw, RAW);
+			memcpy(messages_rx[0].data, raw, RAW);
+			messages_rx[0].length=RAW;
+			messages_rx[0].status=ACKED;
+			copy_data_to_buffer();
+			char app[RAW*2+8];
+			int app_n=fifo_buffer_rx.pop(app, (int)sizeof(app));
+			bool app_exact=(app_n==RAW && memcmp(app, raw, RAW)==0);
+			snprintf(what, sizeof(what), "Y(%s): recovered replay does not duplicate app bytes", tag);
+			CHECK(app_exact, what, app_n, RAW);
+			this->compression_enabled=true;
+		};
+
+		recovery_case(41, "ordinary");
+		recovery_case(255, "wrap-255-to-0");
+
+		// No assigned in-flight batch is a strict no-op for the sequence identity.
+		fifo_buffer_tx.flush(); fifo_buffer_backup.flush();
+		for(int i=0;i<nMessages;i++){ messages_tx[i].status=FREE; messages_tx[i].length=0; }
+		cmd_batch_seq_id=77;
+		restore_tx_from_compressed();
+		CHECK(cmd_batch_seq_id==77, "Y(control): no in-flight batch leaves cmd identity unchanged",
+			cmd_batch_seq_id, 77);
+
+		// Legacy v1 never carries batch_seq_id, so even an assigned-looking test
+		// slot must not change its local counter (shipping-v1 behavior unchanged).
+		this->sack_v2_enabled=false;
+		messages_tx[0].status=PENDING_ACK; messages_tx[0].length=8;
+		messages_tx[0].batch_seq_id=12;
+		cmd_batch_seq_id=78;
+		restore_tx_from_compressed();
+		CHECK(cmd_batch_seq_id==78, "Y(control): v1 recovery leaves cmd identity unchanged",
+			cmd_batch_seq_id, 78);
+
+		// A frame staged before process_messages_tx_data() still has the -1
+		// sentinel. It belongs to the current identity and must not roll it back.
+		this->sack_v2_enabled=true;
+		messages_tx[0].status=ADDED_TO_LIST; messages_tx[0].length=8;
+		messages_tx[0].batch_seq_id=-1;
+		cmd_batch_seq_id=79;
+		restore_tx_from_compressed();
+		CHECK(cmd_batch_seq_id==79, "Y(control): unassigned staged frame leaves cmd identity unchanged",
+			cmd_batch_seq_id, 79);
+
+		compressor.streaming_disable();
+		compressor.deinit();
+		this->compression_enabled=false;
+		printf("[TEST-STREAM-OFFSET] Part Y bsi_defeat=%d\n", (int)bsi_defeat);
+	}
+
+	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);
 	fflush(stdout);
 	if(g_fails == 0)
