@@ -318,6 +318,8 @@ public:
 	// byte. Returns samples written, or 0 if unsupported (NB / M<16). CLEAN-batch
 	// confirm only (all-ones bitmap is implicit in the confirm type).
 	int generate_compact_confirm_passband(double* out, uint8_t bsi, uint16_t crc12);
+	int generate_topgear_confirm_passband(double* out, uint8_t bsi, uint16_t crc12,
+	                                      uint8_t report, uint16_t report_crc12);
 	// RX: detect the ACK base, extract the per-tone ENERGY matrix for the first
 	// N=10 suffix symbols (decode_suffix_energies), and soft-decode the compact
 	// codeword (gf16ra::soft_decode_compact) with a CRC12 accept gate. Returns
@@ -325,7 +327,9 @@ public:
 	// *out_matched (optional) gets the base-pattern match count.
 	bool decode_compact_confirm_from_passband(double* data, int size,
 	                                          ctrl_crc12_fn crc12_fn, void* crc12_ctx,
-	                                          uint8_t* out_bsi, int* out_matched = nullptr);
+	                                          uint8_t* out_bsi, int* out_matched = nullptr,
+	                                          uint8_t* out_report = nullptr,
+	                                          bool* out_report_valid = nullptr);
 	void ack_pattern_detection_test();  // SNR sweep + false alarm test
 
 	// BREAK pattern: emergency "drop to ROBUST_0" signal (different tones from ACK)

@@ -4822,6 +4822,38 @@ int cl_telecom_system::generate_compact_confirm_passband(double* out,
 	return compact_samples;
 }
 
+// Topgear extension of the compact clean confirm. Its first 16+10 symbols are
+// identical to generate_compact_confirm_passband(); only an armed session emits
+// the second 10-symbol, independently CRC12-protected report codeword.
+int cl_telecom_system::generate_topgear_confirm_passband(double* out,
+	uint8_t bsi, uint16_t crc12, uint8_t report, uint16_t report_crc12)
+{
+	int suffix_n = ack_mfsk.compact_confirm_suffix_len();
+	if(suffix_n <= 0) return 0;
+	int nsymb = ack_mfsk.ack_pattern_nsymb + 2 * suffix_n;
+	int samples = nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	if(nsymb <= 0 || samples <= 0) return 0;
+
+	float power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+	ack_mfsk.generate_topgear_confirm_pattern(data_container.ofdm_framed_data,
+		bsi, crc12, report, report_crc12);
+	for(int i = 0; i < nsymb; i++)
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+
+	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * ack_boost;
+	}
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out,
+		sampling_frequency, carrier_frequency, carrier_amplitude, frequency_interpolation_rate);
+	ofdm.peak_clip(out, samples, ofdm.data_papr_cut);
+	return samples;
+}
+
 // RX: Detect ACK pattern and decode SNR suffix tones.
 // Returns decoded SNR (dB). Sets *out_snr_valid = true if suffix decoded reliably.
 float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
@@ -5807,10 +5839,13 @@ bool cl_telecom_system::decode_ack_sack_from_passband_soft(double* data, int siz
 // a CRC12-over-[bsi] accept gate. Returns true iff the codeword decodes AND its
 // recomputed CRC12 matches (gf16ra::soft_decode_compact gates internally).
 bool cl_telecom_system::decode_compact_confirm_from_passband(double* data, int size,
-	ctrl_crc12_fn crc12_fn, void* crc12_ctx, uint8_t* out_bsi, int* out_matched)
+	ctrl_crc12_fn crc12_fn, void* crc12_ctx, uint8_t* out_bsi, int* out_matched,
+	uint8_t* out_report, bool* out_report_valid)
 {
 	if (out_bsi) *out_bsi = 0;
 	if (out_matched) *out_matched = 0;
+	if (out_report) *out_report = 0;
+	if (out_report_valid) *out_report_valid = false;
 	if (!out_bsi || !crc12_fn) return false;
 	int suffix_n = ack_mfsk.compact_confirm_suffix_len();
 	if (suffix_n <= 0) return false;                              // NB
@@ -5880,6 +5915,37 @@ bool cl_telecom_system::decode_compact_confirm_from_passband(double* data, int s
 		/*esno_metric=*/4.0, crc12_fn, crc12_ctx, &bsi, &iters);
 	if (!ok) return false;
 	*out_bsi = bsi;
+
+	// Optional topgear report follows the legacy compact codeword. Do not make
+	// its absence/failure invalidate the clean ACK: mixed feature settings must
+	// preserve the original prefix semantics. Explicitly require a full second
+	// codeword in the capture before decoding, so zero-filled tail slots can
+	// never win a CRC by chance on an old peer's shorter frame.
+	if(out_report && out_report_valid)
+	{
+		// dec_size is at the modem/baseband sample rate; data_container.Nofdm
+		// is the public active symbol period (Nfft+Ngi) at that same rate.
+		int sym_period = data_container.Nofdm;
+		int needed_end = best_offset
+		               + (ack_mfsk.ack_pattern_nsymb + 2 * suffix_n) * sym_period;
+		if(needed_end <= dec_size)
+		{
+			std::vector<double> report_energies((size_t)suffix_n * ack_mfsk.M);
+			ofdm.decode_suffix_energies(
+				data_container.baseband_data_interpolated, dec_size, 1,
+				best_offset, ack_mfsk.ack_pattern_nsymb + suffix_n, suffix_n,
+				ack_mfsk.tone_hop_step, ack_mfsk.M,
+				ack_mfsk.nStreams, ack_mfsk.stream_offsets, report_energies.data());
+			uint8_t report = 0;
+			int report_iters = -1;
+			if(gf16ra::soft_decode_compact(report_energies.data(), /*maxiter=*/50,
+				/*esno_metric=*/4.0, crc12_fn, crc12_ctx, &report, &report_iters))
+			{
+				*out_report = report;
+				*out_report_valid = true;
+			}
+		}
+	}
 	return true;
 }
 
@@ -11943,6 +12009,22 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.pilot_configurator.boost=default_configurations_telecom_system.ofdm_pilot_configurator_pilot_boost;
 	ofdm.pilot_configurator.seed=default_configurations_telecom_system.ofdm_pilot_configurator_seed;
 	ofdm.pilot_configurator.pilot_density=default_configurations_telecom_system.ofdm_pilot_density;
+
+	// ── CONFIG_17 (top-gear) PHY PROFILE — GI-TRIM (Stage C, topgear-productionize §3.3) ──
+	// cfg17 is ONE FIXED flat-channel profile both ends load deterministically (design §2).
+	// GI-trim: Ngi 54→27 (gi = 27/Nfft), Nofdm 310→283 => ×1.0954 symbol-rate. GI-trim only
+	// shrinks the TIME-domain samples per symbol (Nofdm=Nfft+Ngi); Nc and Nsymb are unchanged,
+	// so nData/nBits/codeword sizing is IDENTICAL — no framer/LDPC resize (unlike pilot-thin).
+	// SAFETY (§6.3): the frequency-domain grid is GI-BLIND to ISI; a trimmed CP overruns a real
+	// multipath delay spread → collapse. The ONLY guard is the ELECTION FLATNESS GATE
+	// (topgear_channel_clean, now LIVE via the §4 reverse-report transport) refusing cfg17 on
+	// selective channels. cfg17 is reached ONLY when the election is armed+engaged (or a manual
+	// -s 17 test), so on the flat channel it is gated to this trim costs zero decode margin
+	// (proof §4: trim-27 decodes identically to stock-54 on flat). WB profile: Nfft=256 → Ngi=27.
+	if(current_configuration==CONFIG_17 && !narrowband_enabled)
+	{
+		ofdm.gi = 27.0 / (double)ofdm.Nfft;   // Ngi 54→27 (WB Nfft=256)
+	}
 
 	// nIdentical_sections derives from subcarrier spacing in configure().
 	// WB (Nc>=50): every-4th → 4 identical sections (period Nfft/4)

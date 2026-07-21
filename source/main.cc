@@ -3178,6 +3178,7 @@ int main(int argc, char *argv[])
                                         // one genuine K=8 block at several in-window preamble offsets in a FIXED
                                         // production-sized window; near-end (tail past window) DEFERS (guard ON) /
                                         // carves truncated bytes_ok=0 (DEFEAT_ACQGUARD). Reproduces the HW ~5.6% bug.
+    bool test_topgear_clean_election_cli = false; // --test-topgear-clean-election: prove the CONFIG_17 64-QAM top-gear channel-clean election (verdict/hysteresis/ceiling/demote/rate)
     bool test_bigblock_climb_election_cli = false; // --test-bigblock-climb-election: prove the big-block rung is
                                         // ELECTED by the GEARSHIFT CFG16 transition (load_configuration tail), not
                                         // only at connect. fail-before/pass-after via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
@@ -3969,6 +3970,15 @@ int main(int argc, char *argv[])
             // symmetric on both peers, and the elected rung emits + delivers byte-faithful.
             // fail-before/pass-after on the same binary. One-shot at startup, then exit rc.
             test_bigblock_climb_election_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-topgear-clean-election") == 0)
+        {
+            // TOP-GEAR CONFIG_17 channel-clean election (topgear-stack-productionize.md §4):
+            // prove the 64-QAM top-gear election verdict + hysteresis + electability ceiling +
+            // demote primitives + net-PHY >=1.16x rate. fail-before/pass-after, one-shot, exit rc.
+            test_topgear_clean_election_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -5971,6 +5981,22 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_bigblock_txlevel();
             printf("[FLAG] Bigblock-txlevel test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_topgear_clean_election_cli) {
+            // TOP-GEAR CONFIG_17 channel-clean election regression (topgear-stack-productionize.md
+            // §4): the 64-QAM top rung ELECTS only on a clean+FLAT forward channel (SNR margin +
+            // selectivity gate), engages after hysteresis, demotes IMMEDIATELY on marginal/non-flat
+            // (2-path anti-thrash), and delivers >=1.16x cfg16 net-PHY. fail-before/pass-after on
+            // the same binary via MERCURY_TOPGEAR_PORT_DEFEAT=1 (broad port defeat).
+            // MERCURY_TOPGEAR_DEFEAT_CLEAN remains the focused verdict-only negative control.
+            // One-shot at startup, then exit rc.
+            printf("[FLAG] --test-topgear-clean-election: invoking CONFIG_17 top-gear "
+                   "channel-clean election regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_topgear_clean_election();
+            printf("[FLAG] Topgear-clean-election test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

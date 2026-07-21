@@ -283,6 +283,11 @@ public:
 	}
 	void generate_compact_confirm_pattern(std::complex<double>* pattern_out,
 	                                      uint8_t bsi, uint16_t crc12);
+	// Exact compact-confirm prefix followed by a second K=5 codeword carrying
+	// [report:8|crc12(report):12]. Old peers consume only the unchanged prefix.
+	void generate_topgear_confirm_pattern(std::complex<double>* pattern_out,
+	                                      uint8_t bsi, uint16_t crc12,
+	                                      uint8_t report, uint16_t report_crc12);
 	// Generate CONNECT base pattern + 13-symbol ctrl-suffix carrying
 	// (type, payload, crc12). The base pattern uses connect_tones (NOT
 	// ack_tones) so the detector can distinguish CONNECT from ACK+SACK.

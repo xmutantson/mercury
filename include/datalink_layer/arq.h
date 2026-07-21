@@ -934,6 +934,10 @@ public:
   // 13-uncoded ACK suffix AND ~4 dB more robust (cliff measured -4.2 dB deeper).
   // Returns wall-clock TX ms, or 0 if unsupported (NB / compiled out). CRC12 is
   // over the single [bsi] byte. CLEAN-batch only — partial loss uses send_sack.
+  // With topgear opt-in, this preserves the original compact-confirm prefix and
+  // appends an independently CRC12-protected forward SNR/flatness codeword.
+  // Peers without topgear still decode the unchanged prefix; default-off wire
+  // remains exactly the existing compact confirm.
   long long send_mfsk_compact_confirm(unsigned char batch_seq_id);
 
   // Phase B Wave 2 v2 — PHY-level helpers for MFSK CONNECT.
@@ -2558,6 +2562,40 @@ public:
   // the link would crawl/dead. Default-off ≡ byte-identical (the demote stays in place).
   bool inband_a3_decouple_enabled();
 
+  // ── Top-gear (CONFIG_17, 64-QAM) channel-clean gearshift election ─────────────────────
+  // (topgear-stack-productionize.md; mirrors big-block clean-election 931a0c73.) Wires the
+  // 64-QAM top-gear rung as a REAL gearshift election above WB_CONFIG_MAX (CONFIG_16), gated
+  // so it engages ONLY on a solidly-clean, FLAT forward channel and demotes to CONFIG_16 the
+  // instant that stops holding. Default-off (MERCURY_TOPGEAR_ELECT unset) => byte-identical:
+  // cfg17 stays unreachable exactly as the CONFIG_17 skeleton documents.
+  //
+  // topgear_elect_feature_enabled(): cached MERCURY_TOPGEAR_ELECT opt-in. Default off => the
+  //   election never arms, no cfg17 SET_CONFIG is ever produced, the WB ceiling stays 16.
+  // topgear_channel_clean(): true iff the FORWARD channel is clean-ENOUGH-and-FLAT for the
+  //   64-QAM rung: measurements.SNR_downlink supports CFG16 with TOPGEAR_ELECT_MARGIN_DB
+  //   headroom (>~20 dB, the uniform-64 waterfall) AND topgear_channel_flatness is within
+  //   TOPGEAR_FLATNESS_MAX (a frequency-selective/faded channel is REFUSED even at high SNR —
+  //   the anti-thrash safety; cfg17 floors on selective nulls). SNR_downlink is the DATA-
+  //   direction SNR (RSP-measured locally, CMD-received in the reverse report), so it reflects
+  //   exactly the channel a cfg17 data batch traverses.
+  // topgear_elect_evaluate(): hysteretic update of topgear_elect_engaged on each forward
+  //   report at CFG16/CFG17 — ENGAGE after TOPGEAR_ELECT_ENGAGE_STREAK consecutive clean+flat
+  //   reports, DROP IMMEDIATELY on one marginal/non-flat report or on leaving the CFG16/17
+  //   band. No-op unless the feature is enabled.
+  // topgear_wb_ceiling(): the EFFECTIVE WB gearshift ceiling — CONFIG_17 iff the election is
+  //   engaged, else WB_CONFIG_MAX (CONFIG_16). Consumed at the climb-target clamp sites so a
+  //   cfg17 target survives ONLY while engaged; returns CONFIG_16 whenever the feature is off
+  //   => the clamp sites are byte-identical by default.
+  bool topgear_elect_feature_enabled();
+  bool topgear_channel_clean();
+  void topgear_elect_evaluate();
+  int  topgear_wb_ceiling();
+  // Compact-confirm telemetry codec. SNR quantizes DOWN in 2 dB steps. The low
+  // nibble is a marker-backed flatness state (8=unmeasured, 9=flat, 10=non-flat);
+  // every other value is rejected before it can affect election state.
+  unsigned char topgear_pack_report(double snr, double flatness) const;
+  void topgear_apply_report(unsigned char report, int batch_seq_id);
+
   // TX EMIT (design §6). Decide whether the batch about to be sent at config
   // `batch_cfg` differs from the last-announced config and, if so, build the
   // CONFIG_TAG ctrl-suffix artifacts for the FIRST frame of the batch:
@@ -3421,6 +3459,21 @@ public:
   // fail-before/pass-after on the SAME binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION=1
   // (skips the load_configuration tail election). Returns 0 on all-pass, 1 on failure.
   static int test_bigblock_climb_election();
+  // Top-gear CONFIG_17 channel-clean election regression (topgear-stack-productionize.md §4).
+  // CLI: --test-topgear-clean-election. Deterministic, in-process, MERCURY_TOPGEAR_ELECT=1.
+  // Proves the election VERDICT + hysteresis on a REAL CFG16 controller (fail-before/pass-
+  // after on the SAME binary via MERCURY_TOPGEAR_DEFEAT_CLEAN=1):
+  //   (1) MARGINAL forward SNR (inside raw-CFG16 but below TOPGEAR_ELECT_MARGIN_DB) never
+  //       engages -> topgear_wb_ceiling()==CONFIG_16 (cfg17 NOT electable);
+  //   (2) NON-FLAT channel (high SNR but flatness > TOPGEAR_FLATNESS_MAX) never engages —
+  //       the 2-path anti-thrash safety (fail-before observable);
+  //   (3) DEFEAT fail-before: even clean+flat never engages;
+  //   (4) CLEAN+FLAT forward -> engages ONLY after TOPGEAR_ELECT_ENGAGE_STREAK (hysteresis)
+  //       -> topgear_wb_ceiling()==CONFIG_17 (cfg17 electable);
+  //   (5) a single MARGINAL/non-flat report while engaged DROPS it IMMEDIATELY (fast fallback);
+  //   (6) the RATE assertion: cfg17 net-PHY / cfg16 net-PHY (bits/symbol geometry) >= 1.16.
+  // Returns 0 on all-pass, 1 on failure.
+  static int test_topgear_clean_election();
   // WALL-B FIX-3 — RSP carve-suspend watchdog UNIT test (bigblock_p3_hw/_wallb/fix3).
   // CLI: --test-bigblock-carve-suspend-unit. Deterministic in-process test on a REAL RSP
   // cl_arq_controller at CFG16 (big-block framing on): drives the SHARED streak state machine
@@ -4607,6 +4660,25 @@ public:
   //   once + ctor-cached, NOT reset per-session — same discipline as inband_rate_enabled).
   //   The live gate ALSO requires cumulative_ack_enabled (the negotiated A3 self-heal spine).
   int     inband_a3_decouple_env;       // -1 = unresolved, 0 = off, 1 = on
+
+  // ── Top-gear (CONFIG_17, 64-QAM) channel-clean election (topgear-stack-productionize.md) ──
+  // topgear_elect_enabled: cached MERCURY_TOPGEAR_ELECT opt-in (-1 = unresolved). Default off
+  //   (=0) => byte-identical (no cfg17 ever elected). topgear_elect_engaged: the hysteretic
+  //   verdict — true = the forward channel has held clean+flat long enough for the 64-QAM top
+  //   rung, so topgear_wb_ceiling() opens CONFIG_17 and the climb producer may step 16->17;
+  //   false demotes any live cfg17 to CONFIG_16. Reset when the config leaves the CFG16/17
+  //   band (each visit re-earns engagement). topgear_elect_clean_streak: consecutive clean+flat
+  //   forward reports toward TOPGEAR_ELECT_ENGAGE_STREAK. topgear_channel_flatness: the FORWARD
+  //   channel SELECTIVITY (std|H|/mean|H| over data subcarriers, 0.0 = perfectly flat) the gate
+  //   consumes — fed from the modem's existing last_channel_selectivity at the forward-decode
+  //   site where SNR_downlink is refreshed (the SUPER-ACK-style flatness feed, big-block §21.2's
+  //   flagged refinement of a margin-only gate). A NEGATIVE value is the not-yet-measured
+  //   sentinel and fails closed; cfg17 requires a real flatness measurement.
+  int     topgear_elect_enabled;        // -1 = unresolved, 0 = off, 1 = on
+  bool    topgear_elect_engaged;        // hysteretic verdict: cfg17 electable/held
+  int     topgear_elect_clean_streak;   // consecutive clean+flat forward reports at CFG16
+  double  topgear_channel_flatness;     // forward selectivity std|H|/mean|H| (0.0 = flat); TOPGEAR_FLATNESS_MAX gate
+  int     topgear_last_report_bsi;      // de-duplicates repeated compact-confirm polls; -1 = none
 
   // ── STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (inband-reliability-
   //    design.md §1/§4) ──

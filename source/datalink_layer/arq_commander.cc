@@ -587,10 +587,15 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	MUTEX_UNLOCK(&capture_prep_mutex);
 
 	uint8_t rx_bsi = 0;
+	uint8_t topgear_report = 0;
+	bool    topgear_report_valid = false;
+	bool    want_topgear_report = topgear_elect_feature_enabled();
 	int     mfsk_matched = 0;
 	bool decoded = telecom_system->decode_compact_confirm_from_passband(
 		telecom_system->data_container.ready_to_process_passband_delayed_data,
-		tail_samples, cmd_compact_crc12_cb, this, &rx_bsi, &mfsk_matched);
+		tail_samples, cmd_compact_crc12_cb, this, &rx_bsi, &mfsk_matched,
+		want_topgear_report ? &topgear_report : nullptr,
+		want_topgear_report ? &topgear_report_valid : nullptr);
 	if(!decoded)
 		return false;  // soft_decode_compact already gated CRC12-over-[bsi].
 
@@ -608,6 +613,8 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 			cumulative, per_batch_in_window);
 	if(!covered)
 		return false;
+	if(topgear_report_valid)
+		topgear_apply_report(topgear_report, (int)rx_bsi);
 
 	// CLEAN-batch implicit: a compact confirm MEANS all-ones (the responder only
 	// emits it for a fully-received batch; partial loss uses the SACK path).
@@ -1466,6 +1473,63 @@ void cl_arq_controller::process_messages_commander()
 		// queue SET_CONFIG; the standard ACK handler then loads the new
 		// config (same pattern as SUPERSHIFT at line ~3193 + turbo path
 		// at line ~2785).
+
+		// -- Top-gear (CONFIG_17, 64-QAM) channel-clean election producer -----------------
+		// (topgear-stack-productionize.md 3; mirrors big-block clean-election 931a0c73.)
+		// A DEDICATED SET_CONFIG producer for the 64-QAM top rung that OWNS cfg17, sharing
+		// the optimizer producer's precondition gate (turbo/break/CONNECTED/OFDM/idle):
+		//   ENGAGE   : election held clean+flat at CONFIG_16 -> step CONFIG_16 -> CONFIG_17.
+		//   DISENGAGE: verdict dropped while live at CONFIG_17 -> demote 17 -> CONFIG_16.
+		//   HELD     : engaged + already at CONFIG_17 -> SUPPRESS the general optimizer
+		//              producer below (it caps at WB_CONFIG_MAX=16 and would demote-thrash
+		//              the top rung - the pull-back the effective-ceiling cannot reach here).
+		// The election is the SOLE producer of a cfg17 SET_CONFIG (SNR map/optimizer/climb
+		// all cap at 16). No-op unless MERCURY_TOPGEAR_ELECT is set => byte-identical.
+		// SCOPE: validate with MERCURY_INBAND_RATE OFF (the in-band CONFIG_TAG codec does not
+		// yet carry cfg17's synthetic ladder index; the legacy SET_CONFIG handshake packs the
+		// RAW config and negotiates cfg17 correctly - topgear-stack-productionize.md 5).
+		if (topgear_elect_feature_enabled()
+		    && !turboshift_active
+		    && emergency_break_active == 0
+		    && link_status == CONNECTED
+		    && is_ofdm_config(current_configuration)
+		    && block_under_tx == NO
+		    && messages_control.status == FREE)
+		{
+			int tg_target = -1;
+			if (topgear_elect_engaged && current_configuration == CONFIG_16
+			    && (max_config_override < 0 || max_config_override >= CONFIG_17))
+			{
+				tg_target = CONFIG_17;   // ENGAGE: climb the top rung
+			}
+			else if (!topgear_elect_engaged && current_configuration == CONFIG_17)
+			{
+				tg_target = CONFIG_16;   // DISENGAGE: demote to the validated cfg16 rung
+			}
+			else if (topgear_elect_engaged && current_configuration == CONFIG_17)
+			{
+				// HELD at the top rung - OWN it: cancel any general optimizer proposal that
+				// would clamp to WB_CONFIG_MAX (16) and pull the top rung back down.
+				opt_pending_switch_cfg = -1;
+			}
+			if (tg_target >= 0)
+			{
+				printf("[TOPGEAR] queue SET_CONFIG: %d -> %d (channel-clean election; engaged=%d "
+				       "flatness=%.3f snr_dl=%.1f streak=%d)\n",
+				       current_configuration, tg_target, topgear_elect_engaged ? 1 : 0,
+				       topgear_channel_flatness, measurements.SNR_downlink, topgear_elect_clean_streak);
+				fflush(stdout);
+				negotiated_configuration = tg_target;
+				// Same climb-churn bsi rollback the other SET_CONFIG climb producers use, so a
+				// partial-SACK in-flight batch re-presents contiguously at the new config.
+				roll_back_cmd_bsi_to_inflight("TOPGEAR");
+				cleanup();
+				add_message_control(SET_CONFIG);
+				connection_status = TRANSMITTING_CONTROL;
+				return;
+			}
+		}
+
 		if (opt_pending_switch_cfg >= 0
 		    && opt_pending_switch_cfg != current_configuration
 		    && !turboshift_active
@@ -1478,7 +1542,7 @@ void cl_arq_controller::process_messages_commander()
 			int target = opt_pending_switch_cfg;
 			// Clamp to mode-appropriate ceiling + max-config override.
 			const int mode_ceiling =
-				(narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
+				(narrowband_enabled == YES) ? NB_CONFIG_MAX : topgear_wb_ceiling();
 			if (target > mode_ceiling) target = mode_ceiling;
 			if (max_config_override >= 0 && target > max_config_override)
 				target = max_config_override;
@@ -7681,6 +7745,13 @@ void cl_arq_controller::process_control_commander()
 			session_data_frame_sent = false;
 			session_data_frame_received = false;
 			break_noprogress_cycles = 0;
+			// CONNECT does not call reset_session_state(): clear all per-session
+			// topgear evidence here as well, so a prior peer/channel cannot leave
+			// cfg17 armed on this fresh connection.
+			topgear_elect_engaged = false;
+			topgear_elect_clean_streak = 0;
+			topgear_channel_flatness = -1.0;
+			topgear_last_report_bsi = -1;
 			// CONNECT skips reset_session_state(): establish MC-4's virtual
 			// delivered predecessor for this fresh session explicitly.
 			if(linkphase_rxwindow_on())
@@ -7776,7 +7847,6 @@ void cl_arq_controller::process_control_commander()
 					tmp_SNR.char4_SNR[i]=messages_control.data[i+1];
 				}
 				measurements.SNR_downlink=tmp_SNR.f_SNR;
-
 				// Read responder's capability from byte 5.
 				// With LDPC ACK: this is the responder's reply (correct).
 				// With ACK pattern: no data payload, so this is our own TX data (assumes
@@ -8765,7 +8835,7 @@ void cl_arq_controller::process_control_commander()
 						if(is_ofdm_config(current_configuration) && effective_snr > -90)
 						{
 							snr_target = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
-							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
+							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : topgear_wb_ceiling();
 							if(snr_target > cfg_ceiling)
 								snr_target = cfg_ceiling;
 							if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
@@ -8798,7 +8868,7 @@ void cl_arq_controller::process_control_commander()
 						}
 						// Enforce WB/NB ceiling on turboshift probe target
 						{
-							int turbo_cap = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
+							int turbo_cap = (narrowband_enabled == YES) ? NB_CONFIG_MAX : topgear_wb_ceiling();
 							if(negotiated_configuration > turbo_cap)
 								negotiated_configuration = turbo_cap;
 							if(max_config_override >= 0 && negotiated_configuration > max_config_override)

@@ -179,7 +179,15 @@ extern int g_verbose;
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
 
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
-inline bool is_ofdm_config(int config) { return config >= 0 && config <= 16; }
+// is_ofdm_config: TRUE for every OFDM rung, INCLUDING the top-gear CONFIG_17 (64-QAM).
+// cfg17 IS an OFDM config semantically (MOD_64QAM, LDPC, pilots) and MUST report OFDM so
+// the ~144 gearshift/anchor/demote consumers treat a LIVE cfg17 as the OFDM top rung (not
+// as a robust-tier config). Reachability guarantees byte-identical DEFAULT: cfg17 is
+// UNREACHABLE unless MERCURY_TOPGEAR_ELECT arms the top-gear election (WB_CONFIG_MAX stays
+// CONFIG_16, get_configuration caps at 16, config_ladder_up cannot step to it), so for every
+// config ≤16 this returns exactly as before and is_ofdm_config(17) is only ever evaluated
+// once the election has made cfg17 live. See topgear-stack-productionize.md §2. (was ≤16)
+inline bool is_ofdm_config(int config) { return config >= 0 && config <= 17; }
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor
 // for the PRODUCTION enhanced CONNECT suffix at the robust tier. R=4 is the §20
@@ -244,6 +252,15 @@ static const int FULL_CONFIG_LADDER[] = {
 static const int FULL_CONFIG_LADDER_SIZE = 20;
 
 inline int config_ladder_index(int config) {
+	// Top-gear CONFIG_17 sits ONE rung above CONFIG_16 (the array's last real entry, idx
+	// FULL_CONFIG_LADDER_SIZE-1). It is deliberately NOT stored in FULL_CONFIG_LADDER (so
+	// FULL_CONFIG_LADDER_SIZE / the "is_top" SIZE-1 semantics for CONFIG_16 stay byte-
+	// identical), but navigation/comparison logic must order it correctly: give it the
+	// synthetic index FULL_CONFIG_LADDER_SIZE so index(17) > index(16). This makes
+	// config_ladder_down(17)->CONFIG_16 (LADDER[SIZE-1]) and blocks any "16 is higher than
+	// 17" comparison. Inert by reachability when the top-gear election is off (config never
+	// equals CONFIG_17). See topgear-stack-productionize.md §2.
+	if (config == CONFIG_17) return FULL_CONFIG_LADDER_SIZE;
 	for (int i = 0; i < FULL_CONFIG_LADDER_SIZE; i++) {
 		if (FULL_CONFIG_LADDER[i] == config) return i;
 	}
@@ -786,6 +803,7 @@ inline int modulation_for_ofdm_config(int config) {
 	if (config == CONFIG_14)                        return 8;  // MOD_8PSK (14/16)
 	if (config == CONFIG_15)                        return 16; // MOD_16QAM
 	if (config == CONFIG_16)                        return 32; // MOD_32QAM
+	if (config == CONFIG_17)                        return 64; // MOD_64QAM (top-gear, shaped)
 	return -1;  // Not an OFDM config
 }
 
@@ -896,6 +914,37 @@ CONFIG_16 (5664.7 bps).
 // Re-trigger supershift if measured SNR suggests we're this many configs below optimal.
 // Checked after each ladder gearshift SET_CONFIG success (fresh OFDM SNR available).
 #define SUPERSHIFT_RETRIGGER_CONFIGS 3
+
+// ── Top-gear (CONFIG_17, 64-QAM) channel-clean gearshift election ──────────────────────
+// (topgear-stack-productionize.md; mirrors the big-block clean-election 931a0c73 pattern.)
+// The top-gear rung climbs CONFIG_16 -> CONFIG_17 ONLY on a solidly-clean, FLAT forward
+// channel and demotes 17 -> 16 the instant that stops holding. cfg17 = 64-QAM rate-14/16:
+// it needs ~20 dB on flat/WGN (vs the CFG16 edge ~13 dB in get_configuration) and FLOORS on
+// a frequency-selective 2-ray null (>24 dB, capacity-limited). So the election is gated on
+// BOTH a large decode-margin headroom AND a channel-flatness verdict — a high-average-SNR
+// but frequency-selective channel MUST fall back to cfg16, never thrash the top rung.
+//
+// TOPGEAR_ELECT_MARGIN_DB: forward-SNR headroom (dB) ABOVE the CFG16 threshold
+//   (get_configuration: CFG16 at SNR>13) required to ENGAGE cfg17. 7 dB => engage only at
+//   SNR_downlink > ~20 dB, the measured uniform-64 waterfall (topgear-stack-proof.md §3).
+//   NOT a threshold band-aid: the stock CFG16 rung still carries every SNR below this; the
+//   margin only decides whether the CMD spends the denser 64-QAM constellation.
+#define TOPGEAR_ELECT_MARGIN_DB 7.0
+// Consecutive clean+flat forward reports (at CFG16) before ENGAGING cfg17 (hysteresis).
+// Disengage is IMMEDIATE on the first marginal/non-flat report — the safe asymmetry
+// (commit to the top rung slowly, fall back to cfg16 fast; never demote-thrash a fade).
+#define TOPGEAR_ELECT_ENGAGE_STREAK 2
+// Channel-SELECTIVITY ceiling for the top-gear gate. The flatness feed reuses the modem's
+// existing forward-channel selectivity metric last_channel_selectivity = std(|H[k]|)/mean(|H[k]|)
+// over the DATA subcarriers of the preamble channel estimate (telecom_system.cc:2921-2957,
+// the 2D channel-state lookup; 0.0 = perfectly flat, >=0 physically). Above this ceiling the
+// channel is frequency-selective (multipath/fade) and cfg17 is REFUSED — it floors on
+// selective nulls independent of SNR (topgear-stack-proof.md §7), so this is the anti-thrash
+// safety the SNR margin alone cannot provide. 0.15 ≈ ~1.3 dB RMS |H| ripple: a flat/WGN
+// channel at the ~20 dB engage SNR sits ~0.05-0.12; a 2-ray amp-0.3 selective channel sits
+// ~0.21 (RMS/mean of a 0.3 two-ray ripple). CALIBRATION: this classifier threshold is a first
+// value — SWEEP it on the fleet faithful-sim (flat WGN vs CCIR-Poor 2-path) before default-on.
+#define TOPGEAR_FLATNESS_MAX 0.15
 
 // Controlled-elevator multi-rung jump BOUND (gearshift-climb-engine.md §15, the
 // DEEP-SNR over-climb regression fix). Even once the data-viable anchor has PROVEN

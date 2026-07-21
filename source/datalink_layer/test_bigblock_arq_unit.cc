@@ -61,6 +61,12 @@
 #define BB_TEST_K        8
 #define BB_TEST_SUB_LEN  16
 
+static uint16_t topgear_test_crc12_cb(void* ctx, const unsigned char* data, int n)
+{
+	cl_arq_controller* arq = static_cast<cl_arq_controller*>(ctx);
+	return arq->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
 // ----------------------------------------------------------------------------
 // bigblock_block_to_arq() — PRODUCTION block->ARQ delivery entry (P2.4/2.5/2.6).
 //
@@ -1052,6 +1058,300 @@ int cl_arq_controller::test_bigblock_climb_election()
 
 	restore_env();
 	printf("[TEST-CLIMB-ELECT] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
+// TOP-GEAR (CONFIG_17, 64-QAM) CHANNEL-CLEAN ELECTION — deterministic regression.
+// CLI: --test-topgear-clean-election. topgear-stack-productionize.md §4.
+//
+// Proves the top-gear election VERDICT + hysteresis + the electability ceiling + the
+// demote primitives + the net-PHY rate ratio, on a REAL CFG16 COMMANDER controller,
+// MERCURY_TOPGEAR_ELECT=1. Broad fail-before/pass-after uses
+// MERCURY_TOPGEAR_PORT_DEFEAT=1 on the same binary; marginal SNR, non-flat channel,
+// and MERCURY_TOPGEAR_DEFEAT_CLEAN=1 remain focused negative controls. The live
+// SET_CONFIG 16->17 round-trip is the fleet-carve follow-on (§6); this UNIT test drives
+// the election decision logic the producer consumes — exactly the big-block clean-election
+// precedent (verdict unit test + fleet recipe).
+// ============================================================================
+int cl_arq_controller::test_topgear_clean_election()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-TOPGEAR] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) failed++;
+		fflush(stdout);
+	};
+	auto set_env = [](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		setenv(k, v, 1);
+#endif
+	};
+	auto clr_env = [](const char* k){
+#if defined(_WIN32)
+		_putenv_s(k, "");
+#else
+		unsetenv(k);
+#endif
+	};
+
+	printf("[TEST-TOPGEAR] ===== CONFIG_17 64-QAM channel-clean gearshift election =====\n");
+	fflush(stdout);
+
+	// --- Ladder/primitive assertions (common_defines.h): cfg17 ordered ABOVE cfg16, OFDM,
+	//     and demotes to cfg16. These validate the synthetic-index + is_ofdm_config changes.
+	check(is_ofdm_config(CONFIG_17), "cfg17 reports OFDM (is_ofdm_config(17)==true)");
+	check(config_ladder_index(CONFIG_17) > config_ladder_index(CONFIG_16),
+	      "cfg17 ladder index ordered ABOVE cfg16 (no 16>17 mis-compare)");
+	check(config_ladder_down(CONFIG_17, /*robust*/false) == CONFIG_16,
+	      "config_ladder_down(cfg17) -> cfg16 (WB fast-path demote)");
+	check(config_ladder_down(CONFIG_17, /*robust*/true) == CONFIG_16,
+	      "config_ladder_down(cfg17) -> cfg16 (robust-path demote via synthetic index)");
+
+	// --- Build a REAL CFG16 COMMANDER controller (MERCURY_TOPGEAR_ELECT=1). ---
+	set_env("MERCURY_TOPGEAR_ELECT", "1");
+	clr_env("MERCURY_TOPGEAR_DEFEAT_CLEAN");
+	cl_telecom_system* ts = new cl_telecom_system();
+	cl_arq_controller* cmd = new cl_arq_controller();
+	cmd->telecom_system     = ts;
+	cmd->role               = COMMANDER;
+	cmd->sack_enabled       = true;
+	cmd->sack_v2_enabled    = true;
+	cmd->axis3_sack_mode    = 1;
+	cmd->compression_enabled= false;
+	cmd->nMessages          = 255;
+	cmd->max_data_length    = 170;
+	cmd->max_message_length = 200;
+	cmd->max_header_length  = 6;
+	cmd->init_messages_buffers();
+	cmd->load_configuration(CONFIG_16, FULL, YES);
+	check(cmd->current_configuration == CONFIG_16, "controller parked at CFG16");
+	check(cmd->topgear_elect_feature_enabled(), "MERCURY_TOPGEAR_ELECT armed the feature");
+
+	const int STREAK = TOPGEAR_ELECT_ENGAGE_STREAK;
+	// Deep-clean = well above the CFG16 edge (13) + the 64-QAM headroom (7) => ~24 dB.
+	const double SNR_CLEAN    = 24.0;
+	const double SNR_MARGINAL = 18.0;   // raw CFG16 (>13) but 18-7=11 -> CFG14 (fails the margin)
+	const double FLAT_OK      = 0.05;   // selectivity below TOPGEAR_FLATNESS_MAX (flat)
+	const double NON_FLAT     = 0.30;   // selectivity above the ceiling (frequency-selective 2-path)
+
+	auto drive = [&](double snr, double flat, int n){
+		cmd->measurements.SNR_downlink = snr;
+		cmd->topgear_channel_flatness  = flat;
+		for(int i=0;i<n;i++) cmd->topgear_elect_evaluate();
+	};
+	auto reset_state = [&](){ cmd->topgear_elect_engaged=false; cmd->topgear_elect_clean_streak=0; };
+
+	// (1) MARGINAL SNR (flat) -> never engages -> ceiling stays cfg16 (electability closed).
+	reset_state();
+	drive(SNR_MARGINAL, FLAT_OK, STREAK + 1);
+	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
+	      "MARGINAL SNR (flat): election does NOT engage, ceiling==cfg16 (fail-before)");
+
+	// (2) NON-FLAT channel at DEEP SNR -> never engages -> the 2-path anti-thrash safety.
+	reset_state();
+	drive(SNR_CLEAN, NON_FLAT, STREAK + 1);
+	check(!cmd->topgear_channel_clean(), "NON-FLAT deep-SNR: channel_clean()==false (flatness veto)");
+	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
+	      "NON-FLAT deep-SNR: election REFUSES cfg17 (2-path anti-thrash; fail-before)");
+
+	// (3) DEFEAT fail-before: clean+flat but MERCURY_TOPGEAR_DEFEAT_CLEAN=1 -> never engages.
+	reset_state();
+	set_env("MERCURY_TOPGEAR_DEFEAT_CLEAN", "1");
+	drive(SNR_CLEAN, FLAT_OK, STREAK + 1);
+	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
+	      "DEFEAT_CLEAN: clean+flat still never engages (isolates the clean verdict)");
+	clr_env("MERCURY_TOPGEAR_DEFEAT_CLEAN");
+
+	// (4) CLEAN+FLAT -> engages ONLY after TOPGEAR_ELECT_ENGAGE_STREAK reports (hysteresis).
+	reset_state();
+	check(cmd->topgear_channel_clean(), "CLEAN+FLAT: channel_clean()==true (both gates pass)");
+	cmd->measurements.SNR_downlink = SNR_CLEAN;
+	cmd->topgear_channel_flatness  = FLAT_OK;
+	cmd->topgear_elect_evaluate();   // report 1
+	bool held_after_1 = (STREAK <= 1) ? true : !cmd->topgear_elect_engaged;
+	check(held_after_1, "CLEAN+FLAT: hysteresis holds (not engaged before the streak completes)");
+	for(int i=1;i<STREAK;i++) cmd->topgear_elect_evaluate();   // reports 2..STREAK
+	check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
+	      "CLEAN+FLAT: ENGAGES after the streak, ceiling==cfg17 (cfg17 now electable; pass-after)");
+
+	// (5a) IMMEDIATE DROP on one MARGINAL report while engaged (fast fallback).
+	//      Emulate the producer having stepped to cfg17 so the drop path is exercised live.
+	cmd->current_configuration = CONFIG_17;
+	drive(SNR_MARGINAL, FLAT_OK, 1);
+	check(!cmd->topgear_elect_engaged && cmd->topgear_elect_clean_streak == 0
+	      && cmd->topgear_wb_ceiling() == CONFIG_16,
+	      "engaged @cfg17 + one MARGINAL report -> drops IMMEDIATELY, ceiling->cfg16 (fast fallback)");
+
+	// (5b) IMMEDIATE DROP on one NON-FLAT report while engaged (2-path fade fallback).
+	reset_state();
+	cmd->current_configuration = CONFIG_16;
+	drive(SNR_CLEAN, FLAT_OK, STREAK);            // re-engage
+	check(cmd->topgear_elect_engaged, "re-engage clean+flat @cfg16 for the non-flat-drop arm");
+	cmd->current_configuration = CONFIG_17;
+	drive(SNR_CLEAN, NON_FLAT, 1);                // deep SNR but suddenly selective
+	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
+	      "engaged @cfg17 + one NON-FLAT report -> drops IMMEDIATELY (fade fallback, no thrash)");
+
+	// (5c) LEAVING the band clears the verdict (load_configuration reset).
+	reset_state();
+	cmd->current_configuration = CONFIG_16;
+	drive(SNR_CLEAN, FLAT_OK, STREAK);
+	check(cmd->topgear_elect_engaged, "re-engage for the leave-band arm");
+	cmd->load_configuration(CONFIG_13, FULL, YES);
+	check(!cmd->topgear_elect_engaged && cmd->topgear_elect_clean_streak == 0,
+	      "leaving CFG16/17 band clears the engage verdict (each visit re-earns)");
+
+	// (6) RATE assertion: cfg17 net-PHY / cfg16 net-PHY >= 1.16 with REAL loaded constellations
+	//     (identical pilots/Ngi/LDPC-rate, so net-PHY ratio == bits/symbol ratio = log2(64)/log2(32)).
+	cmd->load_configuration(CONFIG_16, FULL, YES);
+	int bits16 = ts->psk.bits_per_symbol();
+	cmd->load_configuration(CONFIG_17, FULL, YES);
+	int bits17 = ts->psk.bits_per_symbol();
+	double rate_ratio = (bits16 > 0) ? (double)bits17 / (double)bits16 : 0.0;
+	printf("[TEST-TOPGEAR] net-PHY rate: cfg16 %d b/sym, cfg17 %d b/sym, ratio=%.3f (bar 1.16x)\n",
+	       bits16, bits17, rate_ratio);
+	fflush(stdout);
+	check(bits16 == 5 && bits17 == 6, "loaded constellations: cfg16=32-QAM(5b), cfg17=64-QAM(6b)");
+	check(rate_ratio >= 1.16, "cfg17 net-PHY / cfg16 net-PHY >= 1.16x (real-constellation geometry)");
+
+	// (7) GI-TRIM ON THE PRODUCTION RUNG (topgear-productionize §3.3, telecom_system.cc:11086).
+	//     load_configuration(CONFIG_17) trims the guard interval Ngi 54->27 (ofdm.gi = 27/Nfft):
+	//     a per-frame symbol-rate lever (Nofdm shrinks; Nc/Nsymb/nData/LDPC unchanged -> no framer
+	//     resize). cfg16 keeps the STOCK GI. So the ACTUAL net-PHY rbc ratio exceeds the bits-only
+	//     1.2x by the GI-trim factor (~1.0954). This asserts REAL loaded PHY state (not a member set).
+	cmd->load_configuration(CONFIG_16, FULL, YES);
+	double gi16 = ts->ofdm.gi;   double rbc16 = ts->rbc;
+	cmd->load_configuration(CONFIG_17, FULL, YES);
+	double gi17 = ts->ofdm.gi;   double rbc17 = ts->rbc;
+	double gi17_expect = 27.0 / (double)ts->ofdm.Nfft;
+	double rbc_ratio = (rbc16 > 0.0) ? rbc17 / rbc16 : 0.0;
+	printf("[TEST-TOPGEAR] GI-trim: cfg16 gi=%.6f cfg17 gi=%.6f (expect %.6f) | rbc16=%.1f rbc17=%.1f ratio=%.4f\n",
+	       gi16, gi17, gi17_expect, rbc16, rbc17, rbc_ratio);
+	fflush(stdout);
+	check(fabs((double)gi17 - gi17_expect) < 1e-6, "cfg17 GI trimmed to 27/Nfft (per-frame throughput lever LIVE on the rung)");
+	check((double)gi16 > (double)gi17 + 1e-6, "cfg16 keeps the STOCK (untrimmed) GI — the trim is CONFIG_17-scoped");
+	check(rbc_ratio >= 1.25, "cfg17 net-PHY rbc / cfg16 >= 1.25x (64-QAM bits x GI-trim, measured on real load)");
+
+	// (8) The not-yet-measured sentinel is distinct from a valid perfectly-flat
+	// channel and fails closed even when SNR is deep-clean.
+	cl_arq_controller* fresh = new cl_arq_controller();
+	check(fresh->topgear_channel_flatness < 0.0,
+	      "fresh CMD flatness == NOT-MEASURED sentinel (-1, not the 0.0 false-flat that made the veto inert)");
+	fresh->measurements.SNR_downlink = SNR_CLEAN;
+	set_env("MERCURY_TOPGEAR_ELECT", "1");
+	check(!fresh->topgear_channel_clean(),
+	      "unmeasured flatness fails CLOSED even at deep SNR (cfg17 cannot be earned from SNR alone)");
+	delete fresh;
+
+	// (9) LIVE recurring telemetry format: the armed clean-confirm appends a second
+	// independently CRC12-protected compact codeword while preserving every symbol
+	// of the legacy ACK-base + bsi-confirm prefix. This is the production transport
+	// the CMD consumes after each clean batch at cfg16/17.
+	cmd->load_configuration(CONFIG_16, FULL, YES);
+	unsigned char report_flat = cmd->topgear_pack_report(SNR_CLEAN, FLAT_OK);
+	char bsi_byte[1] = { 42 };
+	char report_byte[1] = { (char)report_flat };
+	uint16_t bsi_crc = cmd->CRC12_calc(bsi_byte, 1);
+	uint16_t report_crc = cmd->CRC12_calc(report_byte, 1);
+	int prefix_nsymb = ts->ack_mfsk.compact_confirm_pattern_nsymb();
+	int total_nsymb = prefix_nsymb + ts->ack_mfsk.compact_confirm_suffix_len();
+	std::vector<std::complex<double>> legacy_syms((size_t)total_nsymb * ts->data_container.Nc);
+	std::vector<std::complex<double>> topgear_syms((size_t)total_nsymb * ts->data_container.Nc);
+	ts->ack_mfsk.generate_compact_confirm_pattern(legacy_syms.data(), 42, bsi_crc);
+	ts->ack_mfsk.generate_topgear_confirm_pattern(topgear_syms.data(), 42, bsi_crc,
+		report_flat, report_crc);
+	bool prefix_identical = true;
+	for(int i=0; i<prefix_nsymb * ts->data_container.Nc; i++)
+		if(legacy_syms[i] != topgear_syms[i]) { prefix_identical = false; break; }
+	check(prefix_identical,
+	      "topgear compact-confirm preserves the entire legacy ACK+bsi prefix (mixed-setting interop)");
+
+	// Exercise the real passband producer and consumer, not only the symbol
+	// prefix/decision helpers. Guard silence gives the FIR/detector room on both
+	// sides while the active frame remains exactly the production 16+10+10 shape.
+	int sym_samples = ts->data_container.Nofdm * ts->frequency_interpolation_rate;
+	int guard_samples = 4 * sym_samples;
+	int active_samples = total_nsymb * sym_samples;
+	std::vector<double> report_audio((size_t)active_samples + 2 * guard_samples, 0.0);
+	int generated = ts->generate_topgear_confirm_passband(
+		report_audio.data() + guard_samples, 42, bsi_crc, report_flat, report_crc);
+	uint8_t decoded_bsi = 0, decoded_report = 0;
+	bool decoded_report_valid = false;
+	int decoded_matched = 0;
+	bool decoded_confirm = ts->decode_compact_confirm_from_passband(
+		report_audio.data(), (int)report_audio.size(), topgear_test_crc12_cb, cmd,
+		&decoded_bsi, &decoded_matched, &decoded_report, &decoded_report_valid);
+	check(generated == active_samples && decoded_confirm && decoded_report_valid
+	      && decoded_bsi == 42 && decoded_report == report_flat,
+	      "real passband compact producer/consumer round-trips bsi + CRC-protected topgear report");
+	// Commander armed / responder unarmed: the shorter legacy frame must still
+	// confirm the batch, while the absent second codeword remains invalid and
+	// therefore cannot supply channel evidence.
+	std::fill(report_audio.begin(), report_audio.end(), 0.0);
+	int legacy_generated = ts->generate_compact_confirm_passband(
+		report_audio.data() + guard_samples, 42, bsi_crc);
+	decoded_bsi = 0; decoded_report = 0; decoded_report_valid = false;
+	decoded_confirm = ts->decode_compact_confirm_from_passband(
+		report_audio.data(), (int)report_audio.size(), topgear_test_crc12_cb, cmd,
+		&decoded_bsi, &decoded_matched, &decoded_report, &decoded_report_valid);
+	check(legacy_generated == prefix_nsymb * sym_samples && decoded_confirm
+	      && decoded_bsi == 42 && !decoded_report_valid,
+	      "armed commander accepts an unextended legacy compact confirm without fabricating telemetry");
+
+	// The report quantizer floors SNR and carries only a marker-backed flatness
+	// verdict. A corrupt/noise-decoded low nibble outside {8,9,10} is invalid.
+	int report_snr_q = (report_flat >> 4) & 0x0F;
+	double report_snr = report_snr_q * 2.0 - 5.0;
+	check(report_snr <= SNR_CLEAN && (report_flat & 0x0F) == 9,
+	      "telemetry floors SNR and emits the marker-backed FLAT state");
+	reset_state();
+	cmd->topgear_last_report_bsi = -1;
+	cmd->topgear_apply_report((unsigned char)(report_flat & 0xF0), 41);
+	check(cmd->topgear_last_report_bsi == -1 && cmd->topgear_elect_clean_streak == 0,
+	      "CRC-valid payload with an invalid marker/state cannot affect cfg17 evidence");
+
+	// Repeated receive-window polls of one physical confirm must not manufacture
+	// the two-report hysteresis streak; the next distinct BSI completes it.
+	reset_state();
+	cmd->topgear_last_report_bsi = -1;
+	cmd->topgear_apply_report(report_flat, 42);
+	check(cmd->topgear_elect_clean_streak == 1 && !cmd->topgear_elect_engaged,
+	      "first CRC-valid clean report starts, but does not complete, cfg17 hysteresis");
+	cmd->topgear_apply_report(report_flat, 42);
+	check(cmd->topgear_elect_clean_streak == 1 && !cmd->topgear_elect_engaged,
+	      "duplicate poll of the same report BSI is de-duplicated (no synthetic streak)");
+	cmd->topgear_apply_report(report_flat, 43);
+	check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
+	      "second distinct clean compact report engages cfg17 through the recurring live feed");
+	unsigned char report_nonflat = cmd->topgear_pack_report(SNR_CLEAN, NON_FLAT);
+	cmd->topgear_apply_report(report_nonflat, 44);
+	check(!cmd->topgear_elect_engaged && cmd->topgear_elect_clean_streak == 0,
+	      "one CRC-valid non-flat compact report drops cfg17 immediately");
+	unsigned char report_unmeasured = cmd->topgear_pack_report(SNR_CLEAN, -1.0);
+	cmd->topgear_apply_report(report_unmeasured, 45);
+	check(cmd->topgear_channel_flatness < 0.0 && !cmd->topgear_channel_clean(),
+	      "unmeasured telemetry sentinel remains fail-closed on the commander");
+
+	// reset_session_state is a true channel/session boundary. The verdict, streak,
+	// last measurement and BSI de-dup identity must all be re-earned.
+	cmd->topgear_elect_engaged = true;
+	cmd->topgear_elect_clean_streak = STREAK;
+	cmd->topgear_channel_flatness = FLAT_OK;
+	cmd->topgear_last_report_bsi = 99;
+	cmd->reset_session_state();
+	check(!cmd->topgear_elect_engaged && cmd->topgear_elect_clean_streak == 0
+	      && cmd->topgear_channel_flatness < 0.0 && cmd->topgear_last_report_bsi == -1,
+	      "session reset clears all cfg17 channel evidence and report de-dup state");
+
+	delete cmd; delete ts;
+	clr_env("MERCURY_TOPGEAR_ELECT");
+
+	printf("[TEST-TOPGEAR] %s (%d failure%s)\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

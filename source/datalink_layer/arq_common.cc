@@ -1146,6 +1146,19 @@ cl_arq_controller::cl_arq_controller()
 	inband_tx_epoch_parity=0;
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
 	inband_a3_decouple_env=-1;  // unresolved; inband_a3_decouple_enabled() caches the env half
+	// Top-gear (CONFIG_17, 64-QAM) channel-clean election (topgear-stack-productionize.md).
+	// Default-off benign init: env unresolved (feature_enabled caches it), not engaged,
+	// no clean streak, and no forward flatness report accepted yet.
+	topgear_elect_enabled=-1;      // unresolved; topgear_elect_feature_enabled() caches MERCURY_TOPGEAR_ELECT
+	topgear_elect_engaged=false;   // no cfg17 until the forward channel earns it (clean+flat+hysteresis)
+	topgear_elect_clean_streak=0;
+	// -1.0 = NOT-YET-MEASURED sentinel (mirrors telecom_system::last_channel_selectivity's
+	// own -1 convention). topgear_channel_clean() treats <0 as fail-closed: cfg17
+	// cannot be earned without a real measurement. The CMD refreshes this from the
+	// RSP's CRC-protected compact-confirm telemetry. Was 0.0 (a valid perfectly-flat
+	// measurement, indistinguishable from unmeasured — the latent false-flat default).
+	topgear_channel_flatness=-1.0;
+	topgear_last_report_bsi=-1;
 	inband_unilateral_armed=false;  // Stage 3b: set by the SET_CONFIG builder unilateral path
 	// STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (design §1/§4). A fresh
 	// session has nothing announced, so the re-tag is disarmed and no config is confirmed.
@@ -3021,6 +3034,15 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// stale — invalidate them here (RX-side; a harmless no-op on the CMD). Placed AFTER the
 	// no-change early-return so a redundant same-config load never touches them.
 	rx_stream_invalidate_stamps();
+	// Top-gear election (topgear-stack-productionize.md §3): leaving the CFG16/CFG17 band
+	// forces the verdict false + clears the streak — each CFG16 visit must re-earn cfg17.
+	// No-op unless MERCURY_TOPGEAR_ELECT is set (feature-gated) => byte-identical default.
+	if(topgear_elect_feature_enabled()
+	   && configuration != CONFIG_16 && configuration != CONFIG_17)
+	{
+		topgear_elect_engaged = false;
+		topgear_elect_clean_streak = 0;
+	}
 	if(current_configuration!=CONFIG_NONE)
 	{
 		if(level==FULL)
@@ -3501,6 +3523,148 @@ bool cl_arq_controller::inband_a3_decouple_enabled()
 		inband_a3_decouple_env = (e && *e && atoi(e) != 0) ? 1 : 0;
 	}
 	return inband_a3_decouple_env == 1 && cumulative_ack_enabled;
+}
+
+// ── Top-gear (CONFIG_17, 64-QAM) channel-clean gearshift election ─────────────────────────
+// (topgear-stack-productionize.md; mirrors big-block clean-election 931a0c73.) These four
+// methods are ALL no-ops (early-return / identity) unless MERCURY_TOPGEAR_ELECT is set, so a
+// default-off build is byte-identical: cfg17 never elects, the WB ceiling stays CONFIG_16.
+
+// Resolve + cache the MERCURY_TOPGEAR_ELECT env opt-in. Default off => the election never arms.
+bool cl_arq_controller::topgear_elect_feature_enabled()
+{
+	// Broad same-binary fail-before: restore the pre-port state in which cfg17
+	// cannot be elected, without rebuilding or disturbing the default-off path.
+	const char* defeat = std::getenv("MERCURY_TOPGEAR_PORT_DEFEAT");
+	if(defeat && *defeat && atoi(defeat) != 0) return false;
+	if(topgear_elect_enabled < 0)
+	{
+		const char* e = std::getenv("MERCURY_TOPGEAR_ELECT");
+		topgear_elect_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return topgear_elect_enabled == 1;
+}
+
+// The channel-clean-AND-flat verdict for the 64-QAM top rung. cfg17 needs BOTH:
+//  (a) DECODE MARGIN: the forward SNR (measurements.SNR_downlink) supports CFG16 with
+//      TOPGEAR_ELECT_MARGIN_DB headroom — i.e. get_configuration(SNR_downlink - MARGIN) is
+//      still CFG16 (SNR_downlink > ~13+7 = 20 dB, the measured uniform-64 waterfall). Reuses
+//      the SAME get_configuration() SNR->config map the gearshift trusts, so the election is
+//      strictly stronger than the raw CFG16 rung.
+//  (b) FLATNESS: topgear_channel_flatness (forward max|H|/min|H|) within TOPGEAR_FLATNESS_MAX.
+//      64-QAM rate-14/16 FLOORS on a frequency-selective 2-ray null (>24 dB, capacity-limited
+//      independent of SNR — topgear-stack-proof.md §7) so a high-average-SNR-but-selective
+//      channel MUST be refused. This is the anti-thrash safety the SNR margin alone cannot
+//      provide (the SUPER-ACK-style forward-flatness gate, big-block §21.2's flagged refinement).
+// The MERCURY_TOPGEAR_DEFEAT_CLEAN fail-before switch forces this false regardless (isolates the
+// clean verdict as the decider on ONE binary — the fail-before observable for the regression).
+bool cl_arq_controller::topgear_channel_clean()
+{
+	if(!topgear_elect_feature_enabled()) return false;
+	{
+		// Test-only fail-before switch. Read FRESH per call (NOT static-cached) so the
+		// regression can flip fail-before -> pass-after on the SAME binary in one process.
+		const char* e = std::getenv("MERCURY_TOPGEAR_DEFEAT_CLEAN");
+		if(e && *e && atoi(e) != 0) return false;
+	}
+	double snr = measurements.SNR_downlink;
+	if(snr <= -90) return false;   // no forward SNR measured yet -> never engage on a stale/sentinel value
+	// (a) decode-margin: still CFG16 after subtracting the 64-QAM headroom.
+	bool margin_ok = (get_configuration(snr - TOPGEAR_ELECT_MARGIN_DB) >= CONFIG_16);
+	// (b) flatness: the forward channel is flat enough for 64-QAM (else refuse — 2-path safety).
+	// topgear_channel_flatness = selectivity std|H|/mean|H| (0.0 = flat, fed from the modem's
+	// last_channel_selectivity). A NEGATIVE value is NOT-YET-MEASURED and MUST fail
+	// closed: shortened-GI 64-QAM cannot be earned from SNR alone. A measured value
+	// must be within TOPGEAR_FLATNESS_MAX; anything more selective is refused.
+	bool flat_ok = topgear_channel_flatness >= 0.0
+	            && topgear_channel_flatness <= TOPGEAR_FLATNESS_MAX;
+	return margin_ok && flat_ok;
+}
+
+// Pack one conservative forward-channel report into the optional second compact
+// codeword. The high nibble is floor-quantized SNR (-5 + 2*q dB). The low nibble
+// is a marker-backed state: 8=unmeasured, 9=flat-enough, 10=non-flat. Values
+// outside that set are invalid, adding a semantic gate beyond CRC12 when an
+// armed commander receives a shorter legacy confirm followed only by noise.
+unsigned char cl_arq_controller::topgear_pack_report(double snr, double flatness) const
+{
+	int snr_q = 0;
+	if(std::isfinite(snr))
+	{
+		snr_q = (int)floor((snr + 5.0) / 2.0);
+		if(snr_q < 0) snr_q = 0;
+		if(snr_q > 15) snr_q = 15;
+	}
+	int flat_state = 8;  // unmeasured / non-finite: fail closed
+	if(std::isfinite(flatness) && flatness >= 0.0)
+		flat_state = (flatness <= TOPGEAR_FLATNESS_MAX) ? 9 : 10;
+	return (unsigned char)(((unsigned)snr_q << 4) | (unsigned)flat_state);
+}
+
+// Consume a CRC-validated report attached to a CLEAN compact confirm. The BSI
+// de-dup prevents repeated receive-window polls of one on-air confirm from
+// manufacturing the two-report hysteresis streak.
+void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq_id)
+{
+	if(!topgear_elect_feature_enabled()) return;
+	int flat_state = report & 0x0F;
+	if(flat_state < 8 || flat_state > 10)
+	{
+		printf("[TOPGEAR-REPORT] reject invalid marker/state=0x%x\n", flat_state);
+		fflush(stdout);
+		return;
+	}
+	int bsi = batch_seq_id & 0xFF;
+	if(topgear_last_report_bsi == bsi) return;
+	topgear_last_report_bsi = bsi;
+	int snr_q = (report >> 4) & 0x0F;
+	measurements.SNR_downlink = (double)(snr_q * 2 - 5);
+	topgear_channel_flatness = (flat_state == 8) ? -1.0
+	                         : (flat_state == 9) ? 0.0
+	                         : TOPGEAR_FLATNESS_MAX + 0.01;
+	topgear_elect_evaluate();
+	printf("[TOPGEAR-REPORT] bsi=%d snr_floor=%.1f flat_ceil=%.3f streak=%d engaged=%d\n",
+		bsi, measurements.SNR_downlink, topgear_channel_flatness,
+		topgear_elect_clean_streak, topgear_elect_engaged ? 1 : 0);
+	fflush(stdout);
+}
+
+// Hysteretic engage/drop of topgear_elect_engaged, evaluated on each forward report at the
+// CFG16/CFG17 band. ENGAGE after TOPGEAR_ELECT_ENGAGE_STREAK consecutive clean+flat reports;
+// DROP IMMEDIATELY on one marginal/non-flat report or on leaving the CFG16/17 band (the safe
+// asymmetry: commit to the top rung slowly, fall back to cfg16 fast — never demote-thrash a
+// fade). No-op unless the feature is enabled.
+void cl_arq_controller::topgear_elect_evaluate()
+{
+	if(!topgear_elect_feature_enabled()) return;
+	// Only meaningful at CFG16 (candidate to climb) or CFG17 (already there). Any other config
+	// forces the verdict false and clears the streak (each CFG16 visit re-earns engagement).
+	if(current_configuration != CONFIG_16 && current_configuration != CONFIG_17)
+	{
+		topgear_elect_engaged = false;
+		topgear_elect_clean_streak = 0;
+		return;
+	}
+	if(topgear_channel_clean())
+	{
+		if(topgear_elect_clean_streak < TOPGEAR_ELECT_ENGAGE_STREAK) topgear_elect_clean_streak++;
+		if(topgear_elect_clean_streak >= TOPGEAR_ELECT_ENGAGE_STREAK) topgear_elect_engaged = true;
+	}
+	else
+	{
+		// One marginal/non-flat report drops the verdict immediately (fast fallback to cfg16).
+		topgear_elect_engaged = false;
+		topgear_elect_clean_streak = 0;
+	}
+}
+
+// The EFFECTIVE WB gearshift ceiling: CONFIG_17 iff the top-gear election is engaged, else
+// WB_CONFIG_MAX (CONFIG_16). Consumed at the climb-target clamp sites so a cfg17 target
+// survives ONLY while engaged. Returns CONFIG_16 whenever the feature is off => byte-identical.
+int cl_arq_controller::topgear_wb_ceiling()
+{
+	if(topgear_elect_feature_enabled() && topgear_elect_engaged) return CONFIG_17;
+	return WB_CONFIG_MAX;
 }
 
 // In-band rate adaptation (Stage 3a): build the combined CONFIG_TAG suffix tones.
@@ -8664,6 +8828,12 @@ void cl_arq_controller::reset_session_state()
 	// reset_session_state, arq_common.cc:801.)
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
+	// Topgear is per-session channel evidence. Never carry a prior peer/channel's
+	// verdict or report de-dup identity into a fresh session.
+	topgear_elect_engaged = false;
+	topgear_elect_clean_streak = 0;
+	topgear_channel_flatness = -1.0;
+	topgear_last_report_bsi = -1;
 	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):
 	// no cached ACK / probe state to clear per session.
 	block_under_tx = NO;
@@ -13724,7 +13894,12 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_i
 	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
 		return 0;  // NB / unsupported
 
+	bool append_topgear = topgear_elect_feature_enabled()
+	                   && (current_configuration == CONFIG_16
+	                       || current_configuration == CONFIG_17);
 	int nsymb = telecom_system->ack_mfsk.compact_confirm_pattern_nsymb();
+	if(append_topgear)
+		nsymb += telecom_system->ack_mfsk.compact_confirm_suffix_len();
 	int compact_samples = nsymb * telecom_system->data_container.Nofdm
 	                    * telecom_system->frequency_interpolation_rate;
 	if(nsymb <= 0 || compact_samples <= 0)
@@ -13736,9 +13911,21 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_i
 	char crc_input[1];
 	crc_input[0] = (char)batch_seq_id;
 	uint16_t crc12 = CRC12_calc(crc_input, 1);
+	unsigned char topgear_report = 0;
+	uint16_t topgear_crc12 = 0;
+	if(append_topgear)
+	{
+		double flatness = (telecom_system != NULL)
+		                ? telecom_system->last_channel_selectivity : -1.0;
+		topgear_report = topgear_pack_report(measurements.SNR_downlink, flatness);
+		char report_byte[1]; report_byte[0] = (char)topgear_report;
+		topgear_crc12 = CRC12_calc(report_byte, 1);
+	}
 
-	printf("[TX-MFSK-COMPACT] batch_seq_id=%u crc12=0x%03x nsymb=%d on CONFIG_%d\n",
-		(unsigned)batch_seq_id, (unsigned)crc12, nsymb, current_configuration);
+	printf("[TX-MFSK-COMPACT] batch_seq_id=%u crc12=0x%03x nsymb=%d on CONFIG_%d"
+	       "%s\n",
+		(unsigned)batch_seq_id, (unsigned)crc12, nsymb, current_configuration,
+		append_topgear ? " +topgear-report" : "");
 	fflush(stdout);
 
 	// Read+clear the per-call retx-turnaround flag (clean confirm -> FALSE; same
@@ -13775,8 +13962,12 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_i
 	if(!raw_output || !filtered1 || !filtered2) exit(-37);
 	memset(raw_output, 0, padded_size * sizeof(double));
 
-	telecom_system->generate_compact_confirm_passband(&raw_output[symbol_period],
-		batch_seq_id, crc12);
+	if(append_topgear)
+		telecom_system->generate_topgear_confirm_passband(&raw_output[symbol_period],
+			batch_seq_id, crc12, topgear_report, topgear_crc12);
+	else
+		telecom_system->generate_compact_confirm_passband(&raw_output[symbol_period],
+			batch_seq_id, crc12);
 
 	memcpy(&raw_output[0], &raw_output[symbol_period],
 		symbol_period * sizeof(double));
@@ -16360,6 +16551,16 @@ void cl_arq_controller::receive()
 			if(this->role == RESPONDER)
 			{
 				measurements.SNR_downlink = received_message_stats.SNR;
+				// Top-gear election (topgear-stack-productionize.md §3): the RSP just measured
+				// the FORWARD channel on a decoded data frame. Refresh the flatness feed from the
+				// modem's forward-channel selectivity (std|H|/mean|H|, -1 = not measured) and
+				// re-evaluate the engage verdict. No-op unless MERCURY_TOPGEAR_ELECT is set.
+				if(topgear_elect_feature_enabled())
+				{
+					if(telecom_system != NULL && telecom_system->last_channel_selectivity >= 0.0)
+						topgear_channel_flatness = telecom_system->last_channel_selectivity;
+					topgear_elect_evaluate();
+				}
 			}
 
 			{
