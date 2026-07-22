@@ -44,7 +44,7 @@ variance that dominated short-window σ on n=2 sackv2 cells.
 
 All hardware access goes through the butler. No direct SSH / paramiko / serial.
 """
-import argparse, json, os, re, shutil, socket, tempfile, threading, time, sys
+import argparse, hashlib, json, os, re, shutil, socket, tempfile, threading, time, sys
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -85,6 +85,7 @@ CONFIGS = {
     'WB_CFG14': (14, False),
     'WB_CFG15': (15, False),
     'WB_CFG16': (16, False),
+    'WB_CFG17': (17, False),
     # ROBUST_0 (MFSK + rate-1/16 LDPC, config id 100). Pinning the robust
     # tier lets the SACK harness drive the weak-signal floor directly, the
     # same way the calibrator pins configs. Used by the bessel-I0 / mini-
@@ -255,6 +256,26 @@ def b_lock(label, secs=600):
     return bs, r.split()[1]
 
 
+def graceful_stop_mercury(bs, lid, rpi, grace_s=12):
+    """Stop Mercury through the Butler without risking an ALSA hard-kill wedge.
+
+    A nonzero SSH result means a process survived the grace interval.  Callers
+    must fail the cell/session instead of escalating to SIGKILL.
+    """
+    grace_s = max(10, int(grace_s))
+    cmd = (
+        'killall -TERM mercury 2>/dev/null || true; '
+        'i=0; '
+        f'while pgrep -x mercury >/dev/null && [ "$i" -lt {grace_s} ]; do '
+        'sleep 1; i=$((i+1)); done; '
+        'if pgrep -x mercury >/dev/null; then '
+        'echo MERCURY_SURVIVORS; exit 3; '
+        'else echo MERCURY_CLEAN; fi'
+    )
+    reply = b_send(bs, f'SSH {lid} {rpi} {cmd}', t=grace_s + 15)
+    return reply.startswith('OK rc=0'), reply
+
+
 # ── Mercury TCP helpers ───────────────────────────────────────────────────────
 def tcp_connect_retry(host, port, retries=20, delay=2):
     last = None
@@ -310,19 +331,37 @@ def tcp_recv_until(s, target, timeout=120):
     return buf
 
 
-def receiver_thread(host, port, result, stop_event, connect_timeout=15):
+def receiver_thread(host, port, result, stop_event, payload=None,
+                    connect_timeout=15):
     try:
         s = socket.socket()
         s.settimeout(connect_timeout)
         s.connect((host, port))
         s.settimeout(1)
         total = 0
+        mismatches = 0
+        first_mismatch = None
+        received_hash = hashlib.sha256()
+        expected_hash = hashlib.sha256()
         while not stop_event.is_set():
             try:
                 data = s.recv(8192)
                 if data:
+                    received_hash.update(data)
+                    if payload:
+                        expected = bytes(payload[(total + i) % len(payload)]
+                                         for i in range(len(data)))
+                        expected_hash.update(expected)
+                        chunk_mismatches = sum(a != b for a, b in zip(data, expected))
+                        if chunk_mismatches and first_mismatch is None:
+                            first_mismatch = total + next(
+                                i for i, (a, b) in enumerate(zip(data, expected))
+                                if a != b)
+                        mismatches += chunk_mismatches
                     total += len(data)
                     result['bytes'] = total
+                    result['mismatch_bytes'] = mismatches
+                    result['first_mismatch_offset'] = first_mismatch
                 else:
                     break
             except socket.timeout:
@@ -336,6 +375,13 @@ def receiver_thread(host, port, result, stop_event, connect_timeout=15):
     except Exception as e:
         result['error'] = str(e)
     result['bytes'] = result.get('bytes', 0)
+    result['mismatch_bytes'] = result.get('mismatch_bytes', 0)
+    result['first_mismatch_offset'] = result.get('first_mismatch_offset')
+    if 'received_hash' in locals():
+        result['received_sha256'] = received_hash.hexdigest()
+        result['expected_sha256'] = expected_hash.hexdigest() if payload else None
+    result['byte_exact'] = bool(payload and result['bytes'] > 0 and
+                                result['mismatch_bytes'] == 0)
 
 
 def sender_thread(host, port, payload, stop_event, result, connect_timeout=15):
@@ -617,6 +663,8 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
         'rx_bytes_at_settle': 0, 'rx_bytes_measured': 0,
         'settle_s': settle_s, 'measured_s': 0,
         'connected': False, 'error': None,
+        'byte_exact': False, 'mismatch_bytes': 0,
+        'first_mismatch_offset': None,
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'cmd_log': None, 'rsp_log': None,
     }
@@ -666,8 +714,9 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
     try:
         # 1. clean slate
         for rpi in ('rpi1', 'rpi2'):
-            b_send(bs, f'SSH {lid} {rpi} killall -9 mercury 2>/dev/null; echo done')
-        time.sleep(1.5)
+            clean, reply = graceful_stop_mercury(bs, lid, rpi)
+            if not clean:
+                raise RuntimeError(f'preflight cleanup failed on {rpi}: {reply[:160]}')
         # truncate prior logs so this run's log is THIS run only
         b_send(bs, f'SSH {lid} rpi1 : > {RSP_LOG}; echo done')
         b_send(bs, f'SSH {lid} rpi2 : > {CMD_LOG}; echo done')
@@ -725,7 +774,8 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
         # 5. RX + TX threads
         rx = {'bytes': 0}
         rx_t = threading.Thread(target=receiver_thread,
-                                args=(PI_RSP_HOST, PI_RSP_PORT + 1, rx, stop))
+                                args=(PI_RSP_HOST, PI_RSP_PORT + 1, rx, stop,
+                                      payload))
         rx_t.daemon = True; rx_t.start()
         tx_res = {'tx_bytes': 0}
         tx_t = threading.Thread(target=sender_thread,
@@ -781,6 +831,13 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
         result['rx_bytes_at_settle']   = bytes_at_settle
         result['rx_bytes_measured']    = delivered_measured
         result['tx_bytes']             = tx_res.get('tx_bytes', 0)
+        result['byte_exact']            = rx.get('byte_exact', False)
+        result['mismatch_bytes']        = rx.get('mismatch_bytes', 0)
+        result['first_mismatch_offset'] = rx.get('first_mismatch_offset')
+        result['received_sha256']       = rx.get('received_sha256')
+        result['expected_sha256']       = rx.get('expected_sha256')
+        if delivered_total > 0 and not result['byte_exact']:
+            result['error'] = 'byte_integrity_failed'
         result['duration_s']           = round(elapsed, 1)
         result['settle_s']             = settle_s
         result['measured_s']           = round(measured_s, 1)
@@ -801,10 +858,13 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
                     s.close()
             except Exception:
                 pass
-        # kill Mercury BEFORE pulling logs (avoids log-rotation race)
+        # Stop Mercury BEFORE pulling logs (avoids log-rotation race).  Never
+        # hard-kill a process that may still own the Fe-Pi ALSA device.
         for rpi in ('rpi1', 'rpi2'):
-            b_send(bs, f'SSH {lid} {rpi} killall -9 mercury 2>/dev/null; echo done')
-        time.sleep(1.5)
+            clean, reply = graceful_stop_mercury(bs, lid, rpi)
+            if not clean:
+                result['cleanup_error'] = f'{rpi}: {reply[:160]}'
+                result['error'] = result.get('error') or 'graceful_cleanup_failed'
 
         # 8. pull logs — deterministic per-run filename, space-free staging.
         #    The butler DOWNLOAD splits args on whitespace, so a destination
@@ -857,6 +917,12 @@ def stats(values):
             'min': round(min(values), 1), 'max': round(max(values), 1)}
 
 
+def valid_run_bps(run):
+    """Return a cell's bps only when positive delivery is byte-exact."""
+    bps = run.get('bps', 0)
+    return bps if bps > 0 and run.get('byte_exact') else None
+
+
 def main():
     ap = argparse.ArgumentParser(description='SACK lossy-channel A/B sweep')
     ap.add_argument('--out', required=True, help='output JSON path')
@@ -893,7 +959,7 @@ def main():
                          '(legacy harness behavior). use "on" for text payloads '
                          'like pg84.txt to engage PPMd+zstd streaming compression.')
     ap.add_argument('--max-config', type=int, default=None,
-                    help='Hard ceiling on turboshift (0-16). Default: no cap.')
+                    help='Hard ceiling on turboshift (0-17). Default: no cap.')
     args = ap.parse_args()
 
     modes = [m.strip() for m in args.modes.split(',') if m.strip()]
@@ -946,7 +1012,10 @@ def main():
         try:
             # clean slate + program channel
             for rpi in ('rpi1', 'rpi2'):
-                b_send(bs, f'SSH {lid} {rpi} killall -9 mercury 2>/dev/null; echo done')
+                clean, reply = graceful_stop_mercury(bs, lid, rpi)
+                if not clean:
+                    raise RuntimeError(
+                        f'point cleanup failed on {rpi}: {reply[:160]}')
             for c in channel_cmds:
                 r = b_send(bs, f'IONOS {lid} {c}', t=12)
                 print(f'  IONOS {c} -> {r[:40]}')
@@ -973,7 +1042,8 @@ def main():
                               max_config=args.max_config)
                 mech = res.get('mechanism', {})
                 print(f'    bps={res["bps"]} rx={res.get("rx_bytes",0)} '
-                      f'conn={res["connected"]} err={res.get("error")}')
+                      f'exact={res.get("byte_exact")} conn={res["connected"]} '
+                      f'err={res.get("error")}')
                 print(f'    mechanism: sack_events={mech.get("n_cmd_sack_events")} '
                       f'retx_bursts={mech.get("cmd_retx_bursts")} '
                       f'retx_frames={mech.get("cmd_retx_frames_total")} '
@@ -989,7 +1059,7 @@ def main():
         finally:
             try:
                 for rpi in ('rpi1', 'rpi2'):
-                    b_send(bs, f'SSH {lid} {rpi} killall -9 mercury 2>/dev/null; echo done')
+                    graceful_stop_mercury(bs, lid, rpi)
                 b_send(bs, f'UNLOCK {lid}')
                 bs.close()
             except Exception:
@@ -999,9 +1069,12 @@ def main():
         for mode in modes:
             cell = [r for r in out['runs']
                     if r['point'] == point and r['mode'] == mode]
-            valid = [r['bps'] for r in cell if r['bps'] > 0]
+            valid = [bps for r in cell if (bps := valid_run_bps(r)) is not None]
             s = stats(valid)
-            s['failures'] = sum(1 for r in cell if r['bps'] == 0)
+            s['failures'] = sum(
+                1 for r in cell if r['bps'] == 0 or not r.get('byte_exact'))
+            s['corrupt_runs'] = sum(
+                1 for r in cell if (r.get('mismatch_bytes') or 0) > 0)
             # aggregate mechanism
             s['total_retx_frames'] = sum(
                 (r.get('mechanism', {}).get('cmd_retx_frames_total') or 0)
