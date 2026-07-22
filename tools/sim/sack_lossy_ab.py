@@ -44,7 +44,7 @@ variance that dominated short-window σ on n=2 sackv2 cells.
 
 All hardware access goes through the butler. No direct SSH / paramiko / serial.
 """
-import argparse, hashlib, json, os, re, shutil, socket, tempfile, threading, time, sys
+import argparse, hashlib, json, os, re, shutil, socket, subprocess, tempfile, threading, time, sys
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -66,6 +66,7 @@ PI_RSP_PORT  = 8400
 PI_CMD_PORT  = 8300
 PI_MERCURY   = '~/mercury-dev/mercury'
 PI_AUDIO_DEV = 'plughw:Audio'    # Fe-Pi card by NAME (index not stable)
+DEPLOY_SIDECAR = os.path.join(WORKSPACE, 'bigblock_p3_hw', 'last_deployed.json')
 
 CMD_LOG = '/tmp/m_cmd.log'
 RSP_LOG = '/tmp/m_rsp.log'
@@ -240,6 +241,18 @@ def b_send(s, cmd, t=40):
                 break
             buf += d
             if b'\n' in buf:
+                # Butler SSH responses may contain embedded newlines. Drain a
+                # short quiet interval so trailing hash/log lines cannot poison
+                # the next request on this persistent connection.
+                s.settimeout(0.2)
+                try:
+                    while True:
+                        more = s.recv(65536)
+                        if not more:
+                            break
+                        buf += more
+                except socket.timeout:
+                    pass
                 break
         except socket.timeout:
             break
@@ -254,6 +267,59 @@ def b_lock(label, secs=600):
         bs.close()
         raise RuntimeError(f'butler LOCK failed: {r}')
     return bs, r.split()[1]
+
+
+def local_source_identity(root=MERCURY_ROOT):
+    """Return the exact local Git HEAD and dirty state used for deployment."""
+    head = subprocess.run(
+        ['git', '-C', root, 'rev-parse', 'HEAD'], capture_output=True,
+        text=True, timeout=20, check=True).stdout.strip()
+    dirty = bool(subprocess.run(
+        ['git', '-C', root, 'status', '--porcelain'], capture_output=True,
+        text=True, timeout=20, check=True).stdout.strip())
+    return {'git_rev': head, 'git_dirty': dirty}
+
+
+def load_deploy_attestation(path=DEPLOY_SIDECAR, source_identity=None):
+    """Load and validate the source-build attestation written by the deployer."""
+    with open(path, 'r', encoding='utf-8') as f:
+        attestation = json.load(f)
+    required = ('md5', 'sha256', 'src_git_rev', 'src_git_dirty')
+    missing = [key for key in required if key not in attestation]
+    if missing:
+        raise RuntimeError(f'deploy attestation missing {missing}')
+    if not re.fullmatch(r'[0-9a-fA-F]{32}', str(attestation['md5'])):
+        raise RuntimeError('deploy attestation has invalid md5')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', str(attestation['sha256'])):
+        raise RuntimeError('deploy attestation has invalid sha256')
+    source_identity = source_identity or local_source_identity()
+    if source_identity.get('git_dirty'):
+        raise RuntimeError('local Mercury source is dirty; commit or isolate it before IONOS')
+    if attestation.get('src_git_dirty'):
+        raise RuntimeError('deployed Mercury was built from dirty source')
+    if attestation['src_git_rev'] != source_identity.get('git_rev'):
+        raise RuntimeError(
+            'deployed source does not match local HEAD: '
+            f"{attestation['src_git_rev']} != {source_identity.get('git_rev')}")
+    return attestation
+
+
+def attest_remote_binaries(bs, lid, expected):
+    """Fail unless both Pi binaries match the deploy MD5 and SHA-256."""
+    observed = {}
+    for rpi in ('rpi1', 'rpi2'):
+        observed[rpi] = {}
+        for algorithm, length in (('md5', 32), ('sha256', 64)):
+            reply = b_send(
+                bs, f'SSH {lid} {rpi} {algorithm}sum {PI_MERCURY} 2>/dev/null',
+                t=30)
+            match = re.search(rf'\b[0-9a-fA-F]{{{length}}}\b', reply)
+            value = match.group(0).lower() if match else None
+            observed[rpi][algorithm] = value
+            if value != str(expected[algorithm]).lower():
+                raise RuntimeError(
+                    f'{rpi} {algorithm} mismatch: {value} != {expected[algorithm]}')
+    return observed
 
 
 def graceful_stop_mercury(bs, lid, rpi, grace_s=12):
@@ -980,6 +1046,9 @@ def main():
     payload = (open(args.payload, 'rb').read() if os.path.exists(args.payload)
                else bytes(range(256)) * 1024)
     print(f'Payload: {len(payload)} bytes ({args.payload})')
+    deploy_attestation = load_deploy_attestation()
+    print(f'Deployed source: {deploy_attestation["src_git_rev"][:12]} '
+          f'sha256={deploy_attestation["sha256"]}')
 
     out_dir = os.path.splitext(args.out)[0] + '_logs'
     out = {
@@ -988,8 +1057,8 @@ def main():
         'gearshift': args.gearshift,
         'compress': args.compress,
         'max_config': args.max_config,
-        'mercury_head': '4dd8ffb',
-        'sack_fixes': ['f2dbf34', 'e076823'],
+        'mercury_head': deploy_attestation['src_git_rev'],
+        'deploy_attestation': deploy_attestation,
         'points': points, 'runs_per_cell': args.runs,
         'duration_s': args.duration,
         'settle_s': args.settle_s,
@@ -1010,6 +1079,9 @@ def main():
         # interleave A/B runs under it). Re-lock per point to keep leases short.
         bs, lid = b_lock(f'sack_lossy_{point}', 600)
         try:
+            observed_hashes = attest_remote_binaries(bs, lid, deploy_attestation)
+            out.setdefault('observed_binary_hashes', {})[point] = observed_hashes
+            flush()
             # clean slate + program channel
             for rpi in ('rpi1', 'rpi2'):
                 clean, reply = graceful_stop_mercury(bs, lid, rpi)

@@ -2,7 +2,9 @@
 """Deterministic safety and integrity tests for the IONOS sweep harness."""
 
 import importlib.util
+import json
 import pathlib
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -90,6 +92,47 @@ class HarnessSafetyTest(unittest.TestCase):
         self.assertIsNone(SLA.valid_run_bps(
             {"bps": 123.0, "byte_exact": False, "mismatch_bytes": 1}))
         self.assertIsNone(SLA.valid_run_bps({"bps": 0, "byte_exact": True}))
+
+    def test_deploy_attestation_rejects_dirty_or_wrong_source(self):
+        attestation = {
+            "md5": "1" * 32,
+            "sha256": "2" * 64,
+            "src_git_rev": "a" * 40,
+            "src_git_dirty": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "attestation.json"
+            path.write_text(json.dumps(attestation), encoding="utf-8")
+            loaded = SLA.load_deploy_attestation(
+                path, {"git_rev": "a" * 40, "git_dirty": False})
+            self.assertEqual(loaded["sha256"], "2" * 64)
+            with self.assertRaises(RuntimeError):
+                SLA.load_deploy_attestation(
+                    path, {"git_rev": "a" * 40, "git_dirty": True})
+            with self.assertRaises(RuntimeError):
+                SLA.load_deploy_attestation(
+                    path, {"git_rev": "b" * 40, "git_dirty": False})
+
+    def test_both_remote_binary_hashes_must_match(self):
+        expected = {"md5": "1" * 32, "sha256": "2" * 64}
+
+        def good_send(_bs, command, t=0):
+            value = expected["sha256"] if "sha256sum" in command else expected["md5"]
+            return f"OK rc=0\n{value}  /home/pi/mercury-dev/mercury"
+
+        with mock.patch.object(SLA, "b_send", good_send):
+            observed = SLA.attest_remote_binaries(object(), "lease", expected)
+        self.assertEqual(observed["rpi1"]["sha256"], expected["sha256"])
+        self.assertEqual(observed["rpi2"]["md5"], expected["md5"])
+
+        def one_bad_send(_bs, command, t=0):
+            if "rpi2" in command and "sha256sum" in command:
+                return f"OK rc=0\n{'3' * 64}  /home/pi/mercury-dev/mercury"
+            return good_send(_bs, command, t)
+
+        with mock.patch.object(SLA, "b_send", one_bad_send), \
+                self.assertRaises(RuntimeError):
+            SLA.attest_remote_binaries(object(), "lease", expected)
 
 
 if __name__ == "__main__":
