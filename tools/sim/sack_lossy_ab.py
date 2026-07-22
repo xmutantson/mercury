@@ -44,7 +44,7 @@ variance that dominated short-window σ on n=2 sackv2 cells.
 
 All hardware access goes through the butler. No direct SSH / paramiko / serial.
 """
-import argparse, hashlib, json, os, re, shutil, socket, subprocess, tempfile, threading, time, sys
+import argparse, hashlib, json, os, re, shlex, shutil, socket, subprocess, tempfile, threading, time, sys
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -320,6 +320,29 @@ def attest_remote_binaries(bs, lid, expected):
                 raise RuntimeError(
                     f'{rpi} {algorithm} mismatch: {value} != {expected[algorithm]}')
     return observed
+
+
+def normalize_runtime_env(items):
+    """Parse repeatable KEY=VALUE overrides for symmetric peer launch."""
+    runtime_env = {}
+    for item in items or []:
+        if '=' not in item:
+            raise ValueError(f'--env requires KEY=VALUE, got {item!r}')
+        key, value = item.split('=', 1)
+        if not re.fullmatch(r'[A-Z_][A-Z0-9_]*', key):
+            raise ValueError(f'invalid environment key {key!r}')
+        if not value or '\x00' in value or '\n' in value or '\r' in value:
+            raise ValueError(f'invalid environment value for {key}')
+        if key in runtime_env:
+            raise ValueError(f'duplicate environment key {key}')
+        runtime_env[key] = value
+    return dict(sorted(runtime_env.items()))
+
+
+def runtime_env_shell(runtime_env):
+    """Render normalized environment overrides for a remote `env` command."""
+    return ''.join(f'{key}={shlex.quote(value)} '
+                   for key, value in sorted((runtime_env or {}).items()))
 
 
 def graceful_stop_mercury(bs, lid, rpi, grace_s=12):
@@ -696,7 +719,7 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
             mode, run_idx, duration_s, payload, out_dir, settle_s=30,
             sack_rx_trace=False, gearshift=False, compress='off',
             max_config=None, optimizer_disabled=False,
-            mercury_log_path=None):
+            mercury_log_path=None, runtime_env=None):
     """One run for a single (channel point, mode, run index) cell.
 
     mode: 'sack' -> pass --enable-sack to both ; 'nosack' -> nothing extra ;
@@ -731,6 +754,7 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
         'connected': False, 'error': None,
         'byte_exact': False, 'mismatch_bytes': 0,
         'first_mismatch_offset': None,
+        'runtime_env': dict(sorted((runtime_env or {}).items())),
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'cmd_log': None, 'rsp_log': None,
     }
@@ -809,7 +833,9 @@ def run_one(bs, lid, point_name, channel_cmds, cfg_label, cfg_id, is_nb,
             drift_env += 'MERCURY_DRIFT_INSTR=1 '
         if os.environ.get('MERCURY_HAIL_POLL'):
             drift_env += 'MERCURY_HAIL_POLL=1 '
-        env_prefix = f'env {rate_table_env}{sack_rx_trace_env}{drift_env}'
+        runtime_env_text = runtime_env_shell(runtime_env)
+        env_prefix = (f'env {rate_table_env}{sack_rx_trace_env}{drift_env}'
+                      f'{runtime_env_text}')
         # Optional CMD-side mercury --log: when callers (e.g. optimizer_smoke)
         # need timestamped lines (Mercury's `--log` writes [HH:MM:SS.ms]
         # prefixes), they request it here. Stdout redirect alone has no
@@ -1026,6 +1052,9 @@ def main():
                          'like pg84.txt to engage PPMd+zstd streaming compression.')
     ap.add_argument('--max-config', type=int, default=None,
                     help='Hard ceiling on turboshift (0-17). Default: no cap.')
+    ap.add_argument('--env', action='append', default=[], metavar='KEY=VALUE',
+                    help='repeatable Mercury environment override, applied '
+                         'identically to both peers and recorded in the result')
     args = ap.parse_args()
 
     modes = [m.strip() for m in args.modes.split(',') if m.strip()]
@@ -1049,6 +1078,10 @@ def main():
     deploy_attestation = load_deploy_attestation()
     print(f'Deployed source: {deploy_attestation["src_git_rev"][:12]} '
           f'sha256={deploy_attestation["sha256"]}')
+    try:
+        runtime_env = normalize_runtime_env(args.env)
+    except ValueError as e:
+        ap.error(str(e))
 
     out_dir = os.path.splitext(args.out)[0] + '_logs'
     out = {
@@ -1057,6 +1090,9 @@ def main():
         'gearshift': args.gearshift,
         'compress': args.compress,
         'max_config': args.max_config,
+        'runtime_env': runtime_env,
+        'payload_bytes': len(payload),
+        'payload_sha256': hashlib.sha256(payload).hexdigest(),
         'mercury_head': deploy_attestation['src_git_rev'],
         'deploy_attestation': deploy_attestation,
         'points': points, 'runs_per_cell': args.runs,
@@ -1111,7 +1147,8 @@ def main():
                               sack_rx_trace=args.sack_rx_trace,
                               gearshift=args.gearshift,
                               compress=args.compress,
-                              max_config=args.max_config)
+                              max_config=args.max_config,
+                              runtime_env=runtime_env)
                 mech = res.get('mechanism', {})
                 print(f'    bps={res["bps"]} rx={res.get("rx_bytes",0)} '
                       f'exact={res.get("byte_exact")} conn={res["connected"]} '

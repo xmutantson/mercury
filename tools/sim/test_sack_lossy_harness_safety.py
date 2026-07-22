@@ -134,6 +134,22 @@ class HarnessSafetyTest(unittest.TestCase):
                 self.assertRaises(RuntimeError):
             SLA.attest_remote_binaries(object(), "lease", expected)
 
+    def test_runtime_environment_is_sorted_symmetric_and_shell_safe(self):
+        runtime_env = SLA.normalize_runtime_env([
+            "MERCURY_SCALABLE_SACK=1",
+            "MERCURY_PILOT_TARGET_CFG=15",
+            "MERCURY_NOTE=value with space",
+        ])
+        self.assertEqual(list(runtime_env), sorted(runtime_env))
+        rendered = SLA.runtime_env_shell(runtime_env)
+        self.assertIn("MERCURY_PILOT_TARGET_CFG=15", rendered)
+        self.assertIn("MERCURY_SCALABLE_SACK=1", rendered)
+        self.assertIn("MERCURY_NOTE='value with space'", rendered)
+        with self.assertRaises(ValueError):
+            SLA.normalize_runtime_env(["bad-key=1"])
+        with self.assertRaises(ValueError):
+            SLA.normalize_runtime_env(["MERCURY_X=1", "MERCURY_X=2"])
+
 
 if __name__ == "__main__":
     unittest.main()
