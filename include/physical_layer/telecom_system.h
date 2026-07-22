@@ -611,6 +611,13 @@ public:
 	// PURE so TX and RX get bit-identical results.
 	static int preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb);
 
+	// Structural guard for pilot-grid overrides. The OFDM grid fixes the coded
+	// bit count at nData*log2(M); it must fit the active LDPC codeword before any
+	// TX/RX buffer is allowed to consume the geometry. Static/pure so the focused
+	// regression drives the exact production predicate.
+	static bool pilot_geometry_fits_ldpc(int nData, int modulation_order, int ldpc_n);
+	static int pilot_override_target_config();
+
 	// Moose CFO sanity decision (STATIC / PURE so the production receive loop
 	// and the --test-moose regression call the identical predicate — the
 	// no-divergence guarantee, same pattern as preamble_sched_nsymb).

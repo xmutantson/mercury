@@ -8767,6 +8767,8 @@ int run_pilot_thin_nv_tests()
 		"MERCURY_SFO_GRID_WIENER", "MERCURY_SFO_GRID_DDCE",
 		"MERCURY_SFO_GRID_CPE", "MERCURY_SFO_GRID_TIME_POLAR",
 		"MERCURY_SFO_GRID_POLAR", "MERCURY_SFO_GRID_NVFIX"
+		,"MERCURY_PILOT_TARGET_CFG", "MERCURY_PILOT_DY",
+		"MERCURY_PILOT_NSYMB"
 	};
 	const int key_count = (int)(sizeof(keys) / sizeof(keys[0]));
 	pilot_nv_saved_env saved[key_count];
@@ -8795,6 +8797,9 @@ int run_pilot_thin_nv_tests()
 	set_pilot_nv_test_env("MERCURY_SFO_GRID_TIME_POLAR", "1");
 	set_pilot_nv_test_env("MERCURY_SFO_GRID_POLAR", "1");
 	set_pilot_nv_test_env("MERCURY_SFO_GRID_NVFIX", nullptr);
+	set_pilot_nv_test_env("MERCURY_PILOT_TARGET_CFG", nullptr);
+	set_pilot_nv_test_env("MERCURY_PILOT_DY", nullptr);
+	set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", nullptr);
 
 	int failures = 0;
 	cl_telecom_system ts;
@@ -8831,6 +8836,50 @@ int run_pilot_thin_nv_tests()
 	printf("  [%s] dense cfg16 expected_nv=%.6e measured_nv=%.6e\n",
 		dense_pass ? "OK" : "FAIL", dense_reference, dense_nv);
 	if (!dense_pass) failures++;
+
+	// Adjacent-rung geometry selector and fixed-codeword guard. These instantiate
+	// the production configuration path, not a duplicate lattice calculator.
+	auto check_geometry = [&](int cfg, int target, int dy, int ns,
+	                          int want_dy, int want_ns, int want_data,
+	                          const char* name) {
+		char target_text[16], dy_text[16], ns_text[16];
+		snprintf(target_text, sizeof(target_text), "%d", target);
+		snprintf(dy_text, sizeof(dy_text), "%d", dy);
+		snprintf(ns_text, sizeof(ns_text), "%d", ns);
+		set_pilot_nv_test_env("MERCURY_PILOT_TARGET_CFG", target_text);
+		set_pilot_nv_test_env("MERCURY_PILOT_DY", dy_text);
+		set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", ns_text);
+		// load_configuration intentionally no-ops when cfg is already active;
+		// cross an adjacent stock rung so every case exercises a fresh init.
+		if(ts.current_configuration == cfg)
+			ts.load_configuration(CONFIG_12);
+		ts.load_configuration(cfg);
+		bool pass = ts.ofdm.pilot_configurator.Dy == want_dy
+			&& ts.ofdm.Nsymb == want_ns
+			&& ts.ofdm.pilot_configurator.nData == want_data
+			&& cl_telecom_system::pilot_geometry_fits_ldpc(
+				ts.ofdm.pilot_configurator.nData, ts.M, ts.ldpc.N);
+		printf("  [%s] %s cfg=%d target=%d Dy=%d Nsymb=%d nData=%d\n",
+			pass ? "OK" : "FAIL", name, cfg, target,
+			ts.ofdm.pilot_configurator.Dy, ts.ofdm.Nsymb,
+			ts.ofdm.pilot_configurator.nData);
+		if(!pass) failures++;
+	};
+
+	check_geometry(CONFIG_15, CONFIG_14, 5, 13, 3, 12, 400,
+		"target mismatch leaves cfg15 stock");
+	check_geometry(CONFIG_15, CONFIG_15, 5, 10, 5, 10, 400,
+		"cfg15 Dy5/Nsymb10 candidate");
+	check_geometry(CONFIG_14, CONFIG_14, 5, 13, 5, 13, 520,
+		"cfg14 Dy5/Nsymb13 candidate");
+	check_geometry(CONFIG_13, CONFIG_14, 5, 13, 3, 16, 533,
+		"cfg14 override demotion restores cfg13 stock geometry");
+	check_geometry(CONFIG_13, CONFIG_13, 5, 13, 3, 16, 533,
+		"cfg13 target rejected after fading regression");
+	bool overflow_rejected = !cl_telecom_system::pilot_geometry_fits_ldpc(480, MOD_32QAM, 1600);
+	printf("  [%s] overflow guard rejects cfg16 Dy5/Nsymb12 (480*5 > 1600)\n",
+		overflow_rejected ? "OK" : "FAIL");
+	if(!overflow_rejected) failures++;
 
 	for (int i = 0; i < key_count; ++i)
 		set_pilot_nv_test_env(saved[i].key,

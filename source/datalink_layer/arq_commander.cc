@@ -12902,7 +12902,10 @@ int cl_arq_controller::test_climb_confirm_batch()
 	bool saved_def = duty_palt_defeat;
 	int  saved_rob = robust_enabled;
 	int  saved_nb  = narrowband_enabled;
+	int  saved_gear = gear_shift_on;
+	int  saved_max = max_config_override;
 	robust_enabled = YES; narrowband_enabled = NO;   // WB session, robust tier present
+	gear_shift_on = YES; max_config_override = -1;
 
 	// FAIL-BEFORE: P-alt defeated at a non-top OFDM rung -> NOT active (full batch)
 	duty_palt_defeat = true; current_configuration = CONFIG_0;
@@ -12929,10 +12932,37 @@ int cl_arq_controller::test_climb_confirm_batch()
 	int g2 = climb_confirm_batch_active() ? 1 : 0;
 	check(g2 == 0, "GUARD robust (ROBUST_0) -> NOT active", g2, 0);
 
+	// EFFECTIVE-TOP REGRESSION: P-alt is climb-only. A pinned session has no
+	// possible next rung, and --max-config can make cfg14/cfg15 the negotiated
+	// session ceiling. Those states must lift the cap for steady-state throughput.
+	duty_palt_defeat = false; narrowband_enabled = NO;
+	gear_shift_on = NO; max_config_override = -1; current_configuration = CONFIG_15;
+	int pin15 = climb_confirm_batch_active() ? 1 : 0;
+	check(pin15 == 0, "GUARD pinned CONFIG_15 (gearshift off) -> NOT active", pin15, 0);
+
+	gear_shift_on = YES; max_config_override = CONFIG_15; current_configuration = CONFIG_15;
+	int cap15 = climb_confirm_batch_active() ? 1 : 0;
+	check(cap15 == 0, "GUARD max-config CONFIG_15 effective top -> NOT active", cap15, 0);
+	current_configuration = CONFIG_14;
+	int below15 = climb_confirm_batch_active() ? 1 : 0;
+	check(below15 == 1, "TRANSITION CONFIG_14 below max-config 15 -> active", below15, 1);
+
+	max_config_override = CONFIG_14; current_configuration = CONFIG_14;
+	int cap14 = climb_confirm_batch_active() ? 1 : 0;
+	check(cap14 == 0, "GUARD max-config CONFIG_14 effective top -> NOT active", cap14, 0);
+	current_configuration = CONFIG_13;
+	int below14 = climb_confirm_batch_active() ? 1 : 0;
+	check(below14 == 1, "RECOVERY demotion CONFIG_13 below max-config 14 -> active", below14, 1);
+	current_configuration = CONFIG_14;
+	int recover14 = climb_confirm_batch_active() ? 1 : 0;
+	check(recover14 == 0, "RECOVERY return to max-config 14 -> NOT active", recover14, 0);
+
 	current_configuration = saved_cfg;
 	duty_palt_defeat = saved_def;
 	robust_enabled = saved_rob;
 	narrowband_enabled = saved_nb;
+	gear_shift_on = saved_gear;
+	max_config_override = saved_max;
 	printf("[TEST-DUTY-PALT] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
@@ -17207,6 +17237,11 @@ int cl_arq_controller::test_climb_engine()
 			bigblock_carve_cooldown_batches = lsp_saved_cool;
 			measurements.SNR_uplink         = lsp_saved_snr;
 		}
+
+	// Keep effective-ceiling/P-alt transition coverage in the focused climb CLI,
+	// not only in the long aggregate --test suite.
+	if(test_climb_confirm_batch() != 0)
+		failed++;
 
 printf("[TEST-CLIMB] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");

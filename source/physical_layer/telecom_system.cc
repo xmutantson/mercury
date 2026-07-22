@@ -4367,6 +4367,24 @@ void cl_telecom_system::calculate_parameters()
 	sampling_frequency=frequency_interpolation_rate*(bandwidth/ofdm.Nc)*ofdm.Nfft;
 }
 
+bool cl_telecom_system::pilot_geometry_fits_ldpc(int nData, int modulation_order, int ldpc_n)
+{
+	if(nData <= 0 || modulation_order < 2 || ldpc_n <= 0) return false;
+	int bits_per_cell = 0;
+	int v = modulation_order;
+	while((v & 1) == 0) { bits_per_cell++; v >>= 1; }
+	if(v != 1 || bits_per_cell <= 0) return false;  // modulation must be a power of two
+	return (long long)nData * (long long)bits_per_cell <= (long long)ldpc_n;
+}
+
+int cl_telecom_system::pilot_override_target_config()
+{
+	const char* target = std::getenv("MERCURY_PILOT_TARGET_CFG");
+	if(target == NULL || *target == '\0') return CONFIG_16;  // historical knob scope
+	int value = atoi(target);
+	return (value >= CONFIG_14 && value <= CONFIG_16) ? value : CONFIG_NONE;
+}
+
 void cl_telecom_system::set_mfsk_ctrl_mode(bool enable)
 {
 	mfsk_ctrl_mode = enable && (M == MOD_MFSK) && (ctrl_nBits > 0) && (ctrl_nBits < data_container.nBits);
@@ -6356,22 +6374,20 @@ void cl_telecom_system::init()
 
 	}
 
-	// ---- WIRE LEVER (pilot-thin): cfg16 32-QAM top-gear pilot-lattice density knob ----
-	// Default UNSET => Dy=3, Nsymb=9 => nData==320 == 1600/log2M (full N=1600 codeword),
-	// byte-identical to stock. cfg16 nData is PINNED to 320 by the fixed N=1600 LDPC
-	// codeword (nData*log2M==1600), so thinning the time-pilot lattice at the SAME Nsymb
-	// overflows the codeword (nBits>1600). The realizable wire gain is a THINNER lattice
-	// (Dy=4/5) plus FEWER OFDM data-symbols per codeword (Nsymb override): the same
-	// 1600-bit codeword reaches the wire in less airtime. Both peers read the same env so
-	// the shared TX/RX frame layout stays symmetric. Scoped to CONFIG_16 so the
-	// channel-tracking-critical lower rungs are untouched (thinner pilots = sparser
-	// Doppler/SFO sampling = left-hostile at low SNR / fade).
-	if(M==MOD_32QAM && current_configuration==CONFIG_16)
+	// ---- WIRE LEVER (pilot-thin): explicit per-rung experiment selector ----
+	// Unset remains byte-identical: the historical knob targets cfg16. Lower-rung
+	// propagation requires MERCURY_PILOT_TARGET_CFG=14..15 so an experiment cannot
+	// silently alter every rung during a climb. Both peers must use the same values.
+	// Structural safety is enforced after OFDM+LDPC init below; a coded grid that
+	// exceeds N=1600 refuses startup instead of reaching the mapper with nVirt<0.
+	int pilot_override_target = pilot_override_target_config();
+	bool pilot_override_applied = false;
+	if(current_configuration==pilot_override_target)
 	{
 		const char* _pdy = std::getenv("MERCURY_PILOT_DY");
-		if(_pdy && *_pdy){ int _v=atoi(_pdy); if(_v>=3 && _v<=8) ofdm.pilot_configurator.Dy=_v; }
+		if(_pdy && *_pdy){ int _v=atoi(_pdy); if(_v>=3 && _v<=8) { ofdm.pilot_configurator.Dy=_v; pilot_override_applied=true; } }
 		const char* _pns = std::getenv("MERCURY_PILOT_NSYMB");
-		if(_pns && *_pns){ int _v=atoi(_pns); if(_v>=4 && _v<=12) ofdm.Nsymb=_v; }
+		if(_pns && *_pns){ int _v=atoi(_pns); if(_v>=4 && _v<=16) { ofdm.Nsymb=_v; pilot_override_applied=true; } }
 	}
 
 	// MFSK doesn't use pilots, but pilot_configurator needs valid Dx/Dy
@@ -6401,13 +6417,24 @@ void cl_telecom_system::init()
 		// regular OFDM LDPC codeword.
 		reinit_subsystems.ldpc=NO;
 	}
-	calculate_parameters();
-	if(current_configuration==CONFIG_16 && std::getenv("MERCURY_PILOT_DIAG"))
+	if(pilot_override_applied
+		&& !pilot_geometry_fits_ldpc(ofdm.pilot_configurator.nData, M, ldpc.N))
 	{
-		fprintf(stderr,"[PILOT_DIAG] cfg16 Nc=%d Nsymb=%d Dx=%d Dy=%d nPilots=%d nData=%d dcNbits=%d ldpcN=%d ldpcK=%d ldpcP=%d nVirt=%d pilotpct=%.2f\n",
+		fprintf(stderr,"[PILOT-GUARD] refusing cfg%d Dy=%d Nsymb=%d nData=%d M=%d: coded grid exceeds LDPC N=%d\n",
+			current_configuration, ofdm.pilot_configurator.Dy, ofdm.Nsymb,
+			ofdm.pilot_configurator.nData, M, ldpc.N);
+		fflush(stderr);
+		exit(EXIT_FAILURE);
+	}
+	calculate_parameters();
+	if(is_ofdm_config(current_configuration) && std::getenv("MERCURY_PILOT_DIAG"))
+	{
+		int coded_bits = (int)llround((double)ofdm.pilot_configurator.nData*log2((double)M));
+		fprintf(stderr,"[PILOT_DIAG] cfg%d Nc=%d Nsymb=%d Dx=%d Dy=%d nPilots=%d nData=%d codedBits=%d ldpcN=%d ldpcK=%d ldpcP=%d nVirt=%d pilotpct=%.2f\n",
+			current_configuration,
 			ofdm.Nc, ofdm.Nsymb, ofdm.pilot_configurator.Dx, ofdm.pilot_configurator.Dy,
 			ofdm.pilot_configurator.nPilots, ofdm.pilot_configurator.nData,
-			data_container.nBits, ldpc.N, ldpc.K, ldpc.P, ldpc.N-data_container.nBits,
+			coded_bits, ldpc.N, ldpc.K, ldpc.P, ldpc.N-coded_bits,
 			100.0*ofdm.pilot_configurator.nPilots/(double)(ofdm.Nc*ofdm.Nsymb));
 		fflush(stderr);
 	}
@@ -11824,6 +11851,22 @@ void cl_telecom_system::load_configuration(int configuration)
 		reinit_subsystems.ldpc=NO;
 		reinit_subsystems.psk=NO;
 		reinit_subsystems.pre_equalization_channel=NO;
+	}
+
+	// A pilot override changes OFDM/data geometry independently of modulation.
+	// In particular cfg14 and cfg13 are both 8PSK, so the ordinary modulation
+	// comparison below does not rebuild the grid when a cfg14-only experiment
+	// demotes to cfg13. Force the geometry owners through deinit/init whenever a
+	// real transition enters or leaves the selected override rung.
+	const bool pilot_knob_present = std::getenv("MERCURY_PILOT_DY") != NULL
+		|| std::getenv("MERCURY_PILOT_NSYMB") != NULL;
+	const int pilot_target = pilot_override_target_config();
+	if(pilot_knob_present && current_configuration != configuration
+		&& (current_configuration == pilot_target || configuration == pilot_target))
+	{
+		reinit_subsystems.telecom_system=YES;
+		reinit_subsystems.data_container=YES;
+		reinit_subsystems.ofdm=YES;
 	}
 
 	if(current_configuration==CONFIG_NONE)

@@ -5850,7 +5850,16 @@ public:
   bool climb_confirm_batch_active() const {
     if(duty_palt_defeat) return false;
     if(!is_ofdm_config(current_configuration)) return false;
-    return !config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES);
+    // P-alt is a CLIMB accelerator, so a pinned session (gearshift off) is already
+    // at steady state regardless of its selected rung. Likewise --max-config can
+    // make cfg14/cfg15 the effective session ceiling; leaving the cap active there
+    // would suppress Axis-2 and hold the steady-state radio batch at 10 forever.
+    if(gear_shift_on != YES) return false;
+    int ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : WB_CONFIG_MAX;
+    if(max_config_override >= CONFIG_0
+       && config_ladder_index(max_config_override) < config_ladder_index(ceiling))
+      ceiling = max_config_override;
+    return config_ladder_index(current_configuration) < config_ladder_index(ceiling);
   }
   // C1 (data-flow-gearshift-climb.md) — the ROBUST tier-cross probe target. Returns CONFIG_0
   // when a robust climb should PROPOSE the OFDM tier directly (skip ROBUST_1/2 — they carry no
