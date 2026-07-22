@@ -2136,7 +2136,8 @@ int main(int argc, char *argv[])
                     int cap = ts.data_container.pinned_capacity_buffer_Nsymb;
                     if(!ts.data_container.precook_ring_pinned) { printf("[TEST-PRECOOK] FAIL: ring not pinned after precook\n"); pfail++; }
                     if(ring0 == NULL) { printf("[TEST-PRECOOK] FAIL: ring NULL after pin\n"); pfail++; }
-                    int seq[] = { CONFIG_16, ROBUST_0, CONFIG_8, CONFIG_0, ROBUST_2, CONFIG_15, CONFIG_16, ROBUST_1 };
+                    int seq[] = { CONFIG_16, CONFIG_17, CONFIG_16, ROBUST_0, CONFIG_8, CONFIG_0,
+                                  ROBUST_2, CONFIG_15, CONFIG_16, ROBUST_1 };
                     for(unsigned s=0; s<sizeof(seq)/sizeof(seq[0]); s++) {
                         ts.load_configuration(seq[s]);
                         if(ts.data_container.passband_delayed_data != ring0) {

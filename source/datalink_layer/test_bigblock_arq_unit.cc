@@ -1115,7 +1115,11 @@ int cl_arq_controller::test_topgear_clean_election()
 	// --- Build a REAL CFG16 COMMANDER controller (MERCURY_TOPGEAR_ELECT=1). ---
 	set_env("MERCURY_TOPGEAR_ELECT", "1");
 	clr_env("MERCURY_TOPGEAR_DEFEAT_CLEAN");
+	clr_env("MERCURY_CFG17_GI_INVARIANT_DEFEAT");
 	cl_telecom_system* ts = new cl_telecom_system();
+	// Match the normal headless startup default from main.cc (3.0 ms at 12 kHz), rather than
+	// the cl_physical_config constructor's older 4.5 ms value.
+	ts->default_configurations_telecom_system.ofdm_gi = 36.0 / 256.0;
 	cl_arq_controller* cmd = new cl_arq_controller();
 	cmd->telecom_system     = ts;
 	cmd->role               = COMMANDER;
@@ -1219,23 +1223,75 @@ int cl_arq_controller::test_topgear_clean_election()
 	check(bits16 == 5 && bits17 == 6, "loaded constellations: cfg16=32-QAM(5b), cfg17=64-QAM(6b)");
 	check(rate_ratio >= 1.16, "cfg17 net-PHY / cfg16 net-PHY >= 1.16x (real-constellation geometry)");
 
-	// (7) GI-TRIM ON THE PRODUCTION RUNG (topgear-productionize §3.3, telecom_system.cc:11086).
-	//     load_configuration(CONFIG_17) trims the guard interval Ngi 54->27 (ofdm.gi = 27/Nfft):
-	//     a per-frame symbol-rate lever (Nofdm shrinks; Nc/Nsymb/nData/LDPC unchanged -> no framer
-	//     resize). cfg16 keeps the STOCK GI. So the ACTUAL net-PHY rbc ratio exceeds the bits-only
-	//     1.2x by the GI-trim factor (~1.0954). This asserts REAL loaded PHY state (not a member set).
+	// (7) PRECOOK/Nofdm invariant. The old cfg17-only 27/Nfft GI produced Nofdm=283 while
+	//     cfg16 and the pin walk used the process-default Nofdm=292. The defeat arm establishes
+	//     that exact fail-before geometry without deliberately driving precook into abort().
+	set_env("MERCURY_CFG17_GI_INVARIANT_DEFEAT", "1");
+	cl_telecom_system* unsafe = new cl_telecom_system();
+	unsafe->default_configurations_telecom_system.ofdm_gi = 36.0 / 256.0;
+	unsafe->narrowband_enabled = NO;
+	unsafe->load_configuration(CONFIG_16);
+	int unsafe_nofdm16 = unsafe->data_container.Nofdm;
+	unsafe->load_configuration(CONFIG_17);
+	int unsafe_nofdm17 = unsafe->data_container.Nofdm;
+	double unsafe_rbc17 = unsafe->rbc;
+	check(unsafe_nofdm16 == 292 && unsafe_nofdm17 == 283,
+	      "FAIL-BEFORE: cfg17 GI-trim defeat reproduces Nofdm 292->283 variance");
+	delete unsafe;
+	clr_env("MERCURY_CFG17_GI_INVARIANT_DEFEAT");
+
+	// Production keeps the process GI, preserving the pinned ring's one-stride invariant.
 	cmd->load_configuration(CONFIG_16, FULL, YES);
 	double gi16 = ts->ofdm.gi;   double rbc16 = ts->rbc;
+	int nofdm16 = ts->data_container.Nofdm;
 	cmd->load_configuration(CONFIG_17, FULL, YES);
 	double gi17 = ts->ofdm.gi;   double rbc17 = ts->rbc;
-	double gi17_expect = 27.0 / (double)ts->ofdm.Nfft;
+	int nofdm17 = ts->data_container.Nofdm;
 	double rbc_ratio = (rbc16 > 0.0) ? rbc17 / rbc16 : 0.0;
-	printf("[TEST-TOPGEAR] GI-trim: cfg16 gi=%.6f cfg17 gi=%.6f (expect %.6f) | rbc16=%.1f rbc17=%.1f ratio=%.4f\n",
-	       gi16, gi17, gi17_expect, rbc16, rbc17, rbc_ratio);
+	double trim_loss_pct = (unsafe_rbc17 > 0.0) ? 100.0 * (1.0 - rbc17 / unsafe_rbc17) : 0.0;
+	printf("[TEST-TOPGEAR] stock-GI invariant: cfg16 gi=%.6f Nofdm=%d cfg17 gi=%.6f Nofdm=%d | "
+	       "rbc16=%.1f rbc17=%.1f ratio=%.4f | cfg17 stock-vs-trim cost=%.3f%%\n",
+	       gi16, nofdm16, gi17, nofdm17, rbc16, rbc17, rbc_ratio, trim_loss_pct);
 	fflush(stdout);
-	check(fabs((double)gi17 - gi17_expect) < 1e-6, "cfg17 GI trimmed to 27/Nfft (per-frame throughput lever LIVE on the rung)");
-	check((double)gi16 > (double)gi17 + 1e-6, "cfg16 keeps the STOCK (untrimmed) GI — the trim is CONFIG_17-scoped");
-	check(rbc_ratio >= 1.25, "cfg17 net-PHY rbc / cfg16 >= 1.25x (64-QAM bits x GI-trim, measured on real load)");
+	check(fabs((double)gi17 - (double)gi16) < 1e-9 && nofdm17 == nofdm16,
+	      "cfg17 retains process GI/Nofdm (same pinned-ring symbol stride as cfg16)");
+	check(nofdm16 == 292, "production 3 ms GI yields the expected Nofdm=292");
+	check(trim_loss_pct > 3.0 && trim_loss_pct < 3.2,
+	      "dropping unsafe GI trim costs 3.082% cfg17 PHY rate at the production 3 ms GI");
+	check(rbc_ratio >= 1.16,
+	      "cfg17 net-PHY rbc / cfg16 remains >=1.16x from the 64-QAM constellation gain");
+
+	// Exercise the complete production startup and live-switch sequence that real audio exposed:
+	// start cfg17 -> pin walk -> dual bundle build -> cfg17/16 transitions. cfg17 intentionally
+	// remains out of FULL_CONFIG_LADDER and takes the loud PRECOOK-MISS legacy rebuild, which must
+	// keep both the persistent ring address and the process-wide Nofdm unchanged.
+	cl_telecom_system* startup = new cl_telecom_system();
+	startup->default_configurations_telecom_system.ofdm_gi = 36.0 / 256.0;
+	startup->narrowband_enabled = NO;
+	startup->load_configuration(CONFIG_17);
+	startup->precook_pin_shared_ring();
+	double* pinned_ring = startup->data_container.passband_delayed_data;
+	check(startup->data_container.precook_ring_pinned
+	      && startup->current_configuration == CONFIG_17
+	      && startup->data_container.Nofdm == 292,
+	      "cfg17 startup completes precook pin walk and restores cfg17 at Nofdm=292");
+	check(pinned_ring != NULL,
+	      "cfg17 startup publishes a non-null persistent capture ring");
+	startup->precook_config_bundles();
+	long misses_before = startup->precook_miss_count;
+	startup->load_configuration(CONFIG_16);
+	check(startup->current_configuration == CONFIG_16
+	      && startup->data_container.Nofdm == 292
+	      && startup->data_container.passband_delayed_data == pinned_ring,
+	      "cfg17->cfg16 bundle swap preserves pinned ring and Nofdm");
+	startup->load_configuration(CONFIG_17);
+	check(startup->current_configuration == CONFIG_17
+	      && startup->data_container.Nofdm == 292
+	      && startup->data_container.passband_delayed_data == pinned_ring,
+	      "live cfg16->cfg17 rebuild preserves pinned ring and Nofdm");
+	check(startup->precook_miss_count == misses_before + 1,
+	      "cfg17 live transition remains the explicit out-of-ladder PRECOOK-MISS path");
+	delete startup;
 
 	// (8) The not-yet-measured sentinel is distinct from a valid perfectly-flat
 	// channel and fails closed even when SNR is deep-clean.

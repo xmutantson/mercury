@@ -12010,20 +12010,19 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.pilot_configurator.seed=default_configurations_telecom_system.ofdm_pilot_configurator_seed;
 	ofdm.pilot_configurator.pilot_density=default_configurations_telecom_system.ofdm_pilot_density;
 
-	// ── CONFIG_17 (top-gear) PHY PROFILE — GI-TRIM (Stage C, topgear-productionize §3.3) ──
-	// cfg17 is ONE FIXED flat-channel profile both ends load deterministically (design §2).
-	// GI-trim: Ngi 54→27 (gi = 27/Nfft), Nofdm 310→283 => ×1.0954 symbol-rate. GI-trim only
-	// shrinks the TIME-domain samples per symbol (Nofdm=Nfft+Ngi); Nc and Nsymb are unchanged,
-	// so nData/nBits/codeword sizing is IDENTICAL — no framer/LDPC resize (unlike pilot-thin).
-	// SAFETY (§6.3): the frequency-domain grid is GI-BLIND to ISI; a trimmed CP overruns a real
-	// multipath delay spread → collapse. The ONLY guard is the ELECTION FLATNESS GATE
-	// (topgear_channel_clean, now LIVE via the §4 reverse-report transport) refusing cfg17 on
-	// selective channels. cfg17 is reached ONLY when the election is armed+engaged (or a manual
-	// -s 17 test), so on the flat channel it is gated to this trim costs zero decode margin
-	// (proof §4: trim-27 decodes identically to stock-54 on flat). WB profile: Nfft=256 → Ngi=27.
-	if(current_configuration==CONFIG_17 && !narrowband_enabled)
+	// CONFIG_17 keeps the process-wide guard interval. The persistent PRECOOK capture ring and
+	// every bundle use one Nofdm symbol stride for the entire process; a cfg17-only 27/Nfft GI
+	// made a normal 3 ms startup cfg17 use Nofdm=283 while the ladder used Nofdm=292. Starting
+	// at cfg17 therefore aborted during the pin walk, and a live 16->17 switch could not fit the
+	// pinned-ring invariant. Keep the 64-QAM/LDPC/election profile, but defer per-rung GI until
+	// the ring, bundles, audio capture, and all symbol-stride consumers explicitly support it.
+	// Test-only defeat restores the unsafe trim so the geometry regression can prove fail-before
+	// and pass-after on the same binary. Production must never set this knob.
+	const char* cfg17_gi_defeat = std::getenv("MERCURY_CFG17_GI_INVARIANT_DEFEAT");
+	if(current_configuration==CONFIG_17 && !narrowband_enabled
+	   && cfg17_gi_defeat && *cfg17_gi_defeat && atoi(cfg17_gi_defeat) != 0)
 	{
-		ofdm.gi = 27.0 / (double)ofdm.Nfft;   // Ngi 54→27 (WB Nfft=256)
+		ofdm.gi = 27.0 / (double)ofdm.Nfft;
 	}
 
 	// nIdentical_sections derives from subcarrier spacing in configure().
