@@ -725,7 +725,8 @@ def main():
     ap.add_argument("--base-seed", type=int, default=1000,
                     help="sample i uses seed base+i (SAME set per arm = paired).")
     ap.add_argument("--bin", default=DEFAULT_BIN)
-    ap.add_argument("--cell", default=None, help="e.g. WGN:12 (SNR3k=label+2.4)")
+    ap.add_argument("--cell", default=None,
+                    help="e.g. WGN:12 (measured IONOS label->SNR3k map)")
     ap.add_argument("--snr", type=float, default=12.0,
                     help="channel SNR3k dB (used when --cell absent)")
     ap.add_argument("--profile", default="wgn", help="wgn/mpg/mpm/mpp")

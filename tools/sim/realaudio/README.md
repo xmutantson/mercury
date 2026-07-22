@@ -30,7 +30,7 @@ not by the contended CPU. Pinned ROBUST_0 idle vs `stress-ng --cpu 24` gave
 
 | File | Role |
 |------|------|
-| `realaudio_bridge_s32.py` | The IONOS bridge. Opens raw `hw:` S32_LE/2ch/48k, recovers the float64 passband (`/INT_MAX`), runs `Channel.process()` verbatim, re-scales (`*INT_MAX`), writes back. Imports `Channel/PROFILES/WGN_TO_SNR3K` from the parent `tools/sim/sim_channel_relay.py`. |
+| `realaudio_bridge_s32.py` | The IONOS bridge. Opens raw `hw:` S32_LE/2ch/48k, recovers the float64 passband (`/INT_MAX`), runs `Channel.process()` verbatim, re-scales (`*INT_MAX`), writes back. Imports the channel and measured IONOS WGN-label mapper from `tools/sim/sim_channel_relay.py`. |
 | `arq_realaudio.py` | One A/B cell driver: launches the bridge + 2 `-x alsa` mercury processes on one run's 4 cables, drives the canonical ctrl/data TCP protocol (MYCALL/LISTEN/CONNECT), measures connect + delivered bytes/frames. Mirrors `tools/sim_arq_channel.py` exactly; the ONLY change is the audio transport. |
 | `parallel_spawner.py` | Launches N concurrent `arq_realaudio.py` cells, allocates disjoint cards/substreams/ports, summarizes connect+delivery. This is the embarrassingly-parallel substrate entry point. |
 | `ra_cleanup.py` | **Concurrency-safe scoped process cleanup. READ THE PKILL FIX SECTION BELOW.** |
@@ -94,7 +94,7 @@ For an A/B the convention is one spawner/cohort per arm (each arm its own
 `--bin` and/or `--env KEY=VAL` mercury env injection — `arq_realaudio.py --env`
 carries e.g. `MERCURY_INBAND_RATE=...` for a redesign arm, legacy leaves it
 unset), on disjoint cards/ports so both arms can run truly concurrently.
-`--cell WGN:<dB>` sets the SNR (the bridge adds `WGN_TO_SNR3K`); `--profile`
+`--cell WGN:<dB>` sets SNR through the measured affine-plus-endpoint-floor map; `--profile`
 selects the fade profile from `sim_channel_relay.py PROFILES`; `--passthrough`
 disables the channel entirely for a P0 bit-exact reference. Results are JSON:
 per-run `connected`, `rx_bytes`, `rsp_nreceived_frames`, `configs_seen`.

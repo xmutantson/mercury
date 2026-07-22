@@ -67,11 +67,12 @@ frame gaps keep carrying the noise floor (RF realism: band noise does not
 vanish when a station stops keying). BW_noise = 3000 Hz makes the SNR axis the
 channel SNR-in-3-kHz (SNR3k); the modem's own harness uses BW_noise = its
 signal bandwidth (2343.75 Hz WB), so the two share the SAME noise PSD when
-SNR3k = EsN0_harness + 10*log10(3000/BW_signal). The validator
+SNR3k = EsN0_harness + 10*log10(BW_signal/3000). The validator
 tools/test_sim_relay_noise.py checks the noise PSD match numerically.
 
-  --cell WGN:N   convenience: SNR3k = N + 2.4 dB  (testbed WGN-label mapping;
-                 channel SNR3k = WGN_label + 2.4, MEMORY testbed_wgn_snr3k_mapping)
+  --cell WGN:N   convenience: measured IONOS WGN-label -> SNR3k mapping.
+                 The low/mid region is N + 4.8 dB; independent endpoint
+                 self-noise limits the result toward 49.7 dB at very high N.
 
 === Reproducing the HW pathologies ==========================================
   * clean    : --snr 30                          (over-climb to CONFIG_16, no collapse)
@@ -145,7 +146,22 @@ F_NYQUIST = FS / 2.0          # 24000 Hz  (matches telecom_system.cc f_nyquist)
 BW_NOISE = 3000.0             # SNR3k reference noise bandwidth (Hz)
 CENTER_HZ = 1500.0            # OFDM center frequency (modem default)
 
-WGN_TO_SNR3K = 2.4            # channel SNR3k = WGN_label + 2.4 dB (testbed map)
+WGN_TO_SNR3K = 4.8            # measured low/mid IONOS WGN-label intercept (dB)
+IONOS_ENDPOINT_SNR3K_CEILING = 49.7  # independently added endpoint self-noise
+
+
+def ionos_wgn_to_snr3k(label_db):
+    """Map an IONOS WGN dial label to measured external SNR3k.
+
+    The physical 2026-07-21 gate found an approximately unit-slope low/mid
+    mapping with a 4.8 dB intercept and 43.53 dB at WGN:40. Independent noise
+    powers give the 49.7 dB endpoint term below. Direct ``--snr`` remains a
+    literal SNR3k coordinate.
+    """
+    requested = float(label_db) + WGN_TO_SNR3K
+    endpoint = IONOS_ENDPOINT_SNR3K_CEILING
+    return -10.0 * math.log10(10.0 ** (-requested / 10.0) +
+                              10.0 ** (-endpoint / 10.0))
 
 # ITU-R F.1487 / ARSFI mid-latitude HF channel profiles.
 #   delay spread dtau (s), Doppler spread fd (Hz, 2-sigma Gaussian).
@@ -732,7 +748,8 @@ class Channel:
         # virtual clock (sample_clock/FS). Sorted ascending by time. The
         # t=0 edge (if present) sets the starting SNR; later edges fire in
         # process() when the direction's virtual clock crosses them. The
-        # label is mapped label->SNR3k via WGN_TO_SNR3K exactly like --cell.
+        # Each label uses the measured affine-plus-endpoint-floor mapping,
+        # exactly like --cell.
         self.snr_schedule = []            # list of (virt_s, snr3k_db)
         if getattr(args, "snr_schedule", None):
             for tok in args.snr_schedule.split(","):
@@ -741,7 +758,7 @@ class Channel:
                     continue
                 ts, lbl = tok.split(":")
                 self.snr_schedule.append(
-                    (float(ts), float(lbl) + WGN_TO_SNR3K))
+                    (float(ts), ionos_wgn_to_snr3k(lbl)))
             self.snr_schedule.sort(key=lambda e: e[0])
             if self.snr_schedule and self.snr_schedule[0][0] <= 0.0:
                 self.snr_db = self.snr_schedule[0][1]
@@ -940,10 +957,10 @@ def send_all(sock, data):
 
 
 def parse_cell(cell):
-    """--cell WGN:-12  ->  SNR3k dB.  channel SNR3k = WGN_label + 2.4."""
+    """Map ``WGN:N`` through the measured IONOS label compatibility axis."""
     s = cell.strip().upper()
     if s.startswith("WGN:"):
-        return float(s[4:]) + WGN_TO_SNR3K
+        return ionos_wgn_to_snr3k(s[4:])
     # bare number: treat as a literal SNR3k
     return float(s)
 
@@ -955,13 +972,14 @@ def main():
                     help="channel SNR in dB referenced to 3 kHz (SNR3k). "
                          "Overridden by --cell.")
     ap.add_argument("--cell", default=None,
-                    help="convenience SNR spec, e.g. WGN:-12 (SNR3k = label+2.4)")
+                    help="IONOS-compatible WGN label, e.g. WGN:-12; mapped "
+                         "to measured external SNR3k (direct --snr is literal)")
     ap.add_argument("--snr-schedule", default=None,
                     help="OPT-IN time-varying SNR3k: comma list of "
                          "'<virt_s>:<WGN_label>' edges keyed to the per-direction "
                          "virtual clock, e.g. '0:40,30:18' (clean WGN:40 until 30 "
-                         "virtual-s, then degrade to WGN:18). Labels are mapped "
-                         "label->SNR3k via WGN_TO_SNR3K, same as --cell. When set, "
+                         "virtual-s, then degrade to WGN:18). Labels use the "
+                         "measured IONOS map, same as --cell. When set, "
                          "overrides --snr/--cell as the t=0 floor. Default off "
                          "(byte-identical static channel).")
     ap.add_argument("--sig-ref", type=float, default=0.15,
@@ -1172,7 +1190,7 @@ def main():
         f"wire={'STAMPED(8200,needs feat/sim-clock modem)' if args.wire_stamp else 'BARE(8192,compatible)'}")
     if getattr(args, "snr_schedule", None):
         log(f"SNR-SCHEDULE (opt-in, keyed to per-direction virtual clock): "
-            f"{args.snr_schedule}  (label->SNR3k via +{WGN_TO_SNR3K}dB; "
+            f"{args.snr_schedule}  (IONOS measured label->SNR3k map; "
             f"overrides --snr/--cell as the t=0 floor)")
     if realtime_on:
         log("NOTE: V2 WALL-CLOCK real-time pacing ENABLED (MERCURY_SIM_REALTIME) — "

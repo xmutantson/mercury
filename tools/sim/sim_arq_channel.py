@@ -55,7 +55,7 @@ Usage:
 Options:
   --bin PATH        mercury.exe (default: <mercury-repo>/mercury.exe)
   --snr DB          channel SNR3k in dB (referenced to 3 kHz; default 12)
-  --cell WGN:N      convenience SNR3k = N + 2.4 (testbed WGN-label mapping)
+  --cell WGN:N      measured IONOS WGN-label compatibility mapping
   --profile P       fading profile: wgn (none) / mpg / mpm / mpp (ITU HF)
   --cfo-hz HZ       carrier frequency offset (default 0)
   --phase-noise-deg D   per-sample phase-noise stddev in deg (default 0.2)
@@ -542,7 +542,8 @@ def main():
                     help="channel SNR3k in dB (referenced to 3 kHz). "
                          "Overridden by --cell.")
     ap.add_argument("--cell", default=None,
-                    help="convenience SNR spec, e.g. WGN:-12 (SNR3k = label+2.4)")
+                    help="IONOS-compatible WGN label, e.g. WGN:-12; relay maps "
+                         "it to measured external SNR3k")
     ap.add_argument("--snr-schedule", default=None,
                     help="OPT-IN time-varying SNR3k keyed to the relay virtual "
                          "clock: comma list of '<virt_s>:<WGN_label>', e.g. "

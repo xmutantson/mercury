@@ -106,7 +106,8 @@ python tools/sim/sim_arq_channel.py --snr 35 --profile wgn --phase-noise-deg 0 \
 * AWGN matches the BER harness (`telecom_system.cc` f_nyquist / `awgn.cc`); the
   per-sample noise std mirrors it so a sim cell at SNR3k reproduces the harness
   noise PSD. Validated by `tools/test_sim_relay_noise.py` (in the outer tree).
-* `--cell WGN:N` ⇒ SNR3k = N + 2.4 dB (testbed WGN-label mapping; true −10 dB =
-  WGN:−12).
+* `--cell WGN:N` ⇒ measured IONOS compatibility map (about N + 4.8 dB
+  below a 49.7 dB endpoint self-noise ceiling; true −10 dB is approximately
+  WGN:−14.8).
 * Watterson ITU-R MPG/MPM/MPP (fd 0.1/0.5/1.0 Hz, dtau 0.5/1.0/2.0 ms), unit
   mean tap power, Gaussian-Doppler IIR taps.

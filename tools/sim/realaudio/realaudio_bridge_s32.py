@@ -38,7 +38,7 @@ Mercury commander/responder sit on the OTHER ends of those 4 sub-cables.
 --passthrough disables Channel.process entirely (perfect bit-exact cable) for
 the P0 round-trip reference.
 
-Import note: Channel/PROFILES/WGN_TO_SNR3K live in the parent tools/sim package
+Import note: Channel/PROFILES/ionos_wgn_to_snr3k live in the parent tools/sim package
 (sim_channel_relay.py). We add the parent dir to sys.path so this file can live
 in tools/sim/realaudio/ while reusing the canonical channel DSP verbatim.
 """
@@ -58,7 +58,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PARENT_SIM = os.path.dirname(_HERE)               # tools/sim
 sys.path.insert(0, _PARENT_SIM)
 sys.path.insert(0, _HERE)
-from sim_channel_relay import Channel, PROFILES, WGN_TO_SNR3K  # noqa: E402
+from sim_channel_relay import Channel, PROFILES, ionos_wgn_to_snr3k  # noqa: E402
 
 PERIOD = 1024            # frames per ALSA period (~21.3 ms @48k); == CHUNK_SAMPLES
 RATE = 48000
@@ -172,7 +172,7 @@ def main():
     ap.add_argument("--statsfile", default=None)
     a = ap.parse_args()
     if a.cell:
-        a.snr = float(a.cell.split(":", 1)[1]) + WGN_TO_SNR3K
+        a.snr = ionos_wgn_to_snr3k(a.cell.split(":", 1)[1])
 
     cargs = chan_args(a)
     ch_fwd = Channel(cargs, (a.seed * 2654435761) & 0xFFFFFFFF)

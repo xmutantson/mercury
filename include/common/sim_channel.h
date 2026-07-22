@@ -927,7 +927,7 @@ class cl_sim_awgn
 {
 public:
 	// snr3k_db == channel SNR3k (the same axis the relay's --snr takes; the WGN
-	// label maps via WGN_TO_SNR3K=2.4 elsewhere — the caller passes SNR3k here).
+	// WGN labels map through ionos_wgn_to_snr3k() elsewhere; the caller passes SNR3k here).
 	// snr3k_db >= 900 → AWGN is transparent (no additive noise; clean cell) —
 	// but PHASE NOISE still applies (it is the testbed's permanent EVM ceiling,
 	// independent of the AWGN SNR knob).
