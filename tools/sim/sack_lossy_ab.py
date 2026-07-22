@@ -77,12 +77,22 @@ CONFIGS = {
     # fix's primary target). Pinned for the SKIP-VAR gate-fix acquire-vs-decode
     # sweep (COMBINED HW validation 2026-06-02). Not narrowband.
     'WB_CFG0':  (0,  False),
+    'WB_CFG1':  (1,  False),
     # CONFIG_2: WB QPSK-class rate-low, second-deepest. Added for the OFDM
     # coherent-acquisition deep-cell A/B (WIN CAMPAIGN inc.2, 2026-06-02) so
     # the "+CONFIG_2 if it acquires" arm is available. Not narrowband.
     'WB_CFG2':  (2,  False),
+    'WB_CFG3':  (3,  False),
     'WB_CFG4':  (4,  False),
+    'WB_CFG5':  (5,  False),
+    'WB_CFG6':  (6,  False),
+    'WB_CFG7':  (7,  False),
+    'WB_CFG8':  (8,  False),
+    'WB_CFG9':  (9,  False),
     'WB_CFG10': (10, False),
+    'WB_CFG11': (11, False),
+    'WB_CFG12': (12, False),
+    'WB_CFG13': (13, False),
     'WB_CFG14': (14, False),
     'WB_CFG15': (15, False),
     'WB_CFG16': (16, False),
@@ -211,13 +221,11 @@ CHANNEL_POINTS = {
     'mpm18':  ['MPM:18'] + ['FADE DEPTH:0', 'FADE FREQ:0'] + _BASE_GAINS,
     'mpm16':  ['MPM:16'] + ['FADE DEPTH:0', 'FADE FREQ:0'] + _BASE_GAINS,
     # WIN-CAMPAIGN cfg103 (GF16-RA) REACH-under-FADING validation, 2026-06-03.
-    # The 3 standard CCIR Watterson profiles at the noise level that maps to a
-    # TRUE -10 dB SNR3k. Per [[testbed-wgn-snr3k-mapping]] the IONOS noise dial
-    # reads ~2.4 dB optimistic vs measured SNR3k (channel SNR3k = label + 2.4),
-    # so the dial label that yields true -10 dB is -12 (= the WGN:-12 anchor's
-    # noise floor) layered on each multipath profile. This is the STRICT
-    # comparison: VARA's worksheet MPG/MPM/MPP "-10" row used the IONOS DIAL -10
-    # (= true -7.6 dB), so MPx:-12 tests Mercury ~2.4 dB HARDER than VARA's row.
+    # Historical -12-dial faded cells. The old comment called these a physical
+    # -10 dB comparison using the retired +2.4 dB WGN mapping. That claim is
+    # invalid: current AWGN calibration is nonlinear WGN+4.8 dB plus endpoint
+    # noise, and has not yet been independently validated for faded profiles.
+    # Keep the useful channel points, but do not score them as equal-SNR fading.
     'mpg-12': ['MPG:-12'] + ['FADE DEPTH:0', 'FADE FREQ:0'] + _BASE_GAINS,
     'mpm-12': ['MPM:-12'] + ['FADE DEPTH:0', 'FADE FREQ:0'] + _BASE_GAINS,
     'mpp-12': ['MPP:-12'] + ['FADE DEPTH:0', 'FADE FREQ:0'] + _BASE_GAINS,

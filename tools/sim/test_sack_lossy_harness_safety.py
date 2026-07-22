@@ -35,6 +35,10 @@ class _FakeSocket:
 
 
 class HarnessSafetyTest(unittest.TestCase):
+    def test_every_wideband_ofdm_config_is_selectable(self):
+        expected = {f"WB_CFG{i}": (i, False) for i in range(18)}
+        self.assertEqual({key: SLA.CONFIGS[key] for key in expected}, expected)
+
     def test_graceful_cleanup_has_twelve_second_term_only_window(self):
         seen = []
 
