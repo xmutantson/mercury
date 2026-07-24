@@ -57,6 +57,7 @@ cl_mfsk::cl_mfsk()
 	ack_pattern_nsymb = 0;
 	ack_match_threshold = 0;
 	break_match_threshold = 0;
+	break_metric_threshold = 0.0;
 	hail_match_threshold = 0;
 	wb_match_threshold_bias = 0;  // Phase-2 flag default = HEAD
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
@@ -330,6 +331,22 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		// is bounded — the coarse_metric gate already excludes OFDM
 		// signal that aliases the tone bins.
 		break_match_threshold = 10;
+		// BREAK OFDM-alias false-positive fix. The 4.5e-9 estimate above is
+		// ~7 orders too optimistic: it ignores (a) the correlator's sliding-MAX
+		// over the whole multi-second ring and (b) the failed-decode regime where
+		// coarse_metric is STRUCTURALLY <0.30, so the coarse gate OPENS exactly on
+		// the marginal OFDM DATA frames where the 50-subcarrier argmax aliases the
+		// 8 break_tones to matched=10-12. Measured on random non-BREAK OFDM data at
+		// marginal Es/N0, the exact detonation predicate fired at every WB config
+		// (matched 10-12/16, coarse~0.15) — a REAL, not theoretical, false BREAK.
+		// The CLEAN discriminator is the correlation METRIC scale, confirmed in two
+		// independent reproductions: a genuine BREAK correlates at metric~10-16, the
+		// alias at metric~1.0-1.23 (a ~10x physical gap, not a tuning coincidence).
+		// ack_pattern_detection_threshold (1.0 on WB OFDM configs) sits BELOW the
+		// alias ceiling and cannot separate them, so gate the BREAK detonation on a
+		// dedicated metric floor set well inside the gap: >3x above the ~1.2 alias
+		// ceiling, >2x below the ~10 real-BREAK duress floor (clean real BREAK = 16).
+		break_metric_threshold = 4.0;
 	}
 	else if (M == 8)
 	{

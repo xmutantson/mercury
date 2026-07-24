@@ -2978,6 +2978,13 @@ int main(int argc, char *argv[])
             int failed = run_break_fh_gate_tests();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-break-alias : OFDM-alias BREAK false-positive investigation sweep.
+        // Drives real non-BREAK OFDM data (config x Es/N0 grid) through acquisition +
+        // decode + the BREAK correlator; reports whether the detonation predicate ever
+        // fires on data that is NOT a transmitted BREAK. NOT part of --test.
+        if (strcmp(argv[i], "--test-break-alias") == 0) {
+            return run_break_alias_sweep();
+        }
         // --test-recovery-ack : recovery-ack-robustness.md suite (marginal-ACK
         // combining + listen-window ms-mirror + DELTA-1 reps-agnostic BREAK +
         // DELTA-2 CFO-refine decision gate). Fast + deterministic. Also in --test.

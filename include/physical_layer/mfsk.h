@@ -165,6 +165,15 @@ public:
 		return r * ack_pattern_nsymb;
 	}
 	int break_match_threshold; // Min matched symbols for BREAK detection
+	// Min CORRELATION metric for BREAK detonation (WB M=16 only; 0 = inert for the
+	// NB/other-M cases, which fall back to ack_pattern_detection_threshold). The BREAK
+	// correlator metric scales to ~ack_pattern_nsymb for a perfect match: a genuine
+	// BREAK burst lands metric~10-16, while a marginal-decode OFDM DATA frame whose
+	// subcarrier argmax aliases the 8 WB break_tones lands matched>=10 but metric~1.0.
+	// The shared ack_pattern_detection_threshold (1.0 on WB OFDM configs) does NOT
+	// separate them; this dedicated floor sits in the ~10x gap so the alias is rejected
+	// while a real BREAK is still accepted. See the BREAK OFDM-alias data-flow audit.
+	double break_metric_threshold;
 	int hail_match_threshold;  // Min matched symbols for undirected HAIL detection
 	// Phase-2 validation: --wb-match-threshold-bias=N added to ack/break/hail
 	// match thresholds for M=16 and M=32 (the WB cases). Default 0 = HEAD.

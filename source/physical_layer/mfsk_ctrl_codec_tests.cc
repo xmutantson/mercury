@@ -7970,6 +7970,91 @@ static void test_break_fh_gate() {
 	}
 
 	cl_arq_controller::break_fh_gate_test_override = -1;   // restore production env path
+
+	// ---- Test D: BREAK OFDM-alias metric-floor fix (BREAK-alias data-flow audit) ----
+	// ROOT (correction to the §23 note above): the coarse_metric<0.30 gate is INVERTED on
+	// the failed-decode path — it OPENS the probe on exactly the marginal OFDM DATA frames
+	// where the 50-subcarrier argmax aliases the 8 WB break_tones to matched>=10. On random
+	// non-BREAK OFDM data at marginal Es/N0 the exact detonation predicate fires at EVERY WB
+	// config (matched 10-12/16, coarse~0.15) — a REAL false BREAK (see --test-break-alias for
+	// the full production-path sweep). The clean discriminator is the correlation METRIC
+	// scale: a GENUINE BREAK correlates at metric~10-16, the alias at metric~1.0-1.23 (a ~10x
+	// physical gap, two independent reproductions). ack_pattern_detection_threshold (1.0 on WB
+	// OFDM configs) sits BELOW the alias ceiling, so the fix adds a dedicated break_metric
+	// floor (WB M=16 = 4.0) inside the gap. This bounded check runs on the REAL detect path;
+	// the heavy random-OFDM production sweep is --test-break-alias.
+	{
+		cl_telecom_system ts;
+		ts.operation_mode = ARQ_MODE;
+		ts.load_configuration(CONFIG_0);   // WB, ack_mfsk M=16
+		double det_thr = ts.ack_pattern_detection_threshold;
+		double floor   = ts.ack_mfsk.break_metric_threshold;
+		if (floor < det_thr) floor = det_thr;
+		int    thr     = ts.ack_mfsk.break_match_threshold;
+
+		// D0: the fix must be ACTIVE — the WB metric floor strictly exceeds the shared
+		//     detection threshold (else the change is inert and gates nothing).
+		if (!(ts.ack_mfsk.break_metric_threshold > det_thr)) {
+			test_fail(name, "D0: break_metric_threshold does not exceed ack_pattern_detection_threshold on WB — fix inert");
+			return;
+		}
+
+		// D1: the measured ALIAS metric ceiling (~1.23, two independent reproductions) must
+		//     fall BELOW the floor (alias rejected); the CLEAN real BREAK must stay ABOVE it.
+		const double ALIAS_METRIC_CEILING = 1.23;   // worst gated alias metric observed
+		if (!(ALIAS_METRIC_CEILING < floor)) {
+			test_fail(name, "D1: floor does not clear the measured alias metric ceiling (alias would still detonate)");
+			return;
+		}
+		std::vector<double> brk((size_t)ts.ack_pattern_passband_samples + 4096, 0.0);
+		int written = ts.generate_break_pattern_passband(brk.data());
+		if (written <= 0) {
+			test_fail(name, "D1: generate_break_pattern_passband returned 0");
+			return;
+		}
+		int cm_matched = 0;
+		double cm_metric = ts.detect_break_pattern_from_passband(brk.data(), written, &cm_matched);
+		printf("    [BREAK-FH D] floor=%.2f alias_ceiling=%.2f clean_real_break: matched=%d metric=%.2f\n",
+			floor, ALIAS_METRIC_CEILING, cm_matched, cm_metric);
+		if (!(cm_metric >= floor && cm_matched >= thr)) {
+			test_fail(name, "D1: clean real BREAK no longer clears the new floor — sensitivity regression");
+			return;
+		}
+
+		// D2: real-BREAK survival under AWGN at a marginal-but-usable Es/N0 (the responder
+		//     fires BREAK while it can still hear the peer). The fixed predicate must STILL
+		//     detonate on a noisy genuine BREAK — proving the floor rejects metric~1 aliases
+		//     without starving a metric~10 real BREAK.
+		{
+			cl_data_container& dc = ts.data_container;
+			int sym_samples = dc.Nofdm * ts.frequency_interpolation_rate;
+			int buf_samp = (int)dc.buffer_Nsymb * sym_samples;
+			double* rx = dc.ready_to_process_passband_delayed_data;
+			double esn0 = -6.0;
+			float sigma = 1.0f / sqrtf(powf(10.0f, (float)esn0 / 10.0f));
+			float ampl  = sigma / sqrtf(2.0f);
+			int hits = 0, trials = 8, bestm = 0; double bestmet = 0;
+			for (int t = 0; t < trials; t++) {
+				for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
+				int onset = 5 * sym_samples, copy_n = written;
+				if (onset + copy_n > buf_samp) copy_n = buf_samp - onset;
+				for (int i = 0; i < copy_n; i++) rx[onset + i] = brk[i];
+				for (int i = 0; i < buf_samp; i++)
+					rx[i] += (double)(ampl * ts.awgn_channel.awgn_value_generator());
+				int m = 0;
+				double met = ts.detect_break_pattern_from_passband(rx, buf_samp, &m);
+				if (met >= floor && m >= thr) hits++;
+				if (m > bestm) { bestm = m; bestmet = met; }
+			}
+			printf("    [BREAK-FH D] noisy real BREAK @esn0=%.0f: hits=%d/%d best_matched=%d best_metric=%.2f\n",
+				esn0, hits, trials, bestm, bestmet);
+			if (hits == 0) {
+				test_fail(name, "D2: noisy genuine BREAK no longer detonates under the new floor — sensitivity regression");
+				return;
+			}
+		}
+	}
+
 	test_pass(name);
 }
 
@@ -7980,6 +8065,240 @@ int run_break_fh_gate_tests() {
 	test_break_fh_gate();
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
+}
+
+// =============================================================================
+// BREAK OFDM-alias false-positive SWEEP (investigation harness, not a pass/fail
+// test). Feeds REAL non-BREAK OFDM data frames (random payload, production TX
+// path) through real acquisition + decode + the BREAK correlator across a config
+// x Es/N0 grid, and reports whether the exact detonation predicate ever fires on
+// data that is NOT a transmitted BREAK:
+//   coarse_metric < 0.30  &&  metric >= ack_pattern_detection_threshold
+//                         &&  matched >= break_match_threshold
+// This is the faithful RESPONDER failure-branch context: the same ring the failed
+// OFDM decode leaves behind (full signal_period window, slid by the correlator to
+// its best-matching 16-symbol offset — the adversarial max). It evaluates BOTH the
+// OLD detonation predicate (metric >= ack_pattern_detection_threshold — the pre-fix
+// bar, the FAIL-BEFORE witness) and the NEW one (metric >= break_metric floor — the
+// fix), on the SAME captures, so a single run shows the alias detonating under the
+// old bar and rejected under the new one. It ALSO sweeps a GENUINE BREAK burst across
+// the same Es/N0 grid to prove the real BREAK still clears the new floor (no
+// sensitivity regression). The process RETURN CODE is the NEW-predicate false-BREAK
+// count on non-BREAK data PLUS any real-BREAK miss at/above the real-BREAK floor SNR:
+// 0 == fix holds (alias rejected AND real BREAK preserved). Env knobs:
+//   MERCURY_ALIAS_TRIALS  (default 80)  trials per (config,Es/N0)
+//   MERCURY_ALIAS_SEED    (default 12345)
+// Wired via main.cc --test-break-alias.
+int run_break_alias_sweep() {
+	printf("=== BREAK OFDM-alias false-positive sweep (non-BREAK OFDM data) ===\n");
+	int ntrials = 80;
+	{ const char* e = std::getenv("MERCURY_ALIAS_TRIALS"); if (e && atoi(e) > 0) ntrials = atoi(e); }
+	unsigned seed = 12345u;
+	{ const char* e = std::getenv("MERCURY_ALIAS_SEED"); if (e && atoi(e) > 0) seed = (unsigned)atoi(e); }
+	srand(seed);
+
+	// WB OFDM rungs (the alias is claimed for CFG12+; include lower rungs as controls).
+	int cfgs[] = { CONFIG_0, CONFIG_3, CONFIG_6, CONFIG_9, CONFIG_11,
+	               CONFIG_12, CONFIG_13, CONFIG_14, CONFIG_15, CONFIG_16 };
+	int ncfg = (int)(sizeof(cfgs) / sizeof(cfgs[0]));
+
+	int  worst_matched_overall = 0;   // max matched over ALL polls (raw correlator ceiling)
+	int  worst_matched_gated   = 0;   // max matched among polls with coarse<0.30 (dangerous regime)
+	long total_det_old         = 0;   // detonations under the OLD bar (fail-before witness)
+	long total_det_new         = 0;   // detonations under the NEW bar (must be 0 = fix holds)
+	long total_polls           = 0;
+	double worst_alias_gated_metric = 0.0;   // ceiling of the alias correlation metric (gated regime)
+	// capture the single worst OLD-bar detonation for the fail-before record
+	int  cap_matched = -1; double cap_coarse = 0, cap_metric = 0, cap_esn0 = 0; int cap_cfg = -1, cap_thr = 0;
+
+	for (int ci = 0; ci < ncfg; ci++) {
+		cl_telecom_system ts;
+		ts.operation_mode = BER_PLOT_passband;
+		ts.load_configuration(cfgs[ci]);
+
+		int    thr     = ts.ack_mfsk.break_match_threshold;
+		double det_thr = ts.ack_pattern_detection_threshold;
+		// The production BREAK metric floor: dedicated break_metric_threshold, but never
+		// below the shared detection threshold (mirrors arq_common.cc receive()).
+		double metric_floor = ts.ack_mfsk.break_metric_threshold;
+		if (metric_floor < det_thr) metric_floor = det_thr;
+		int    nsymb   = ts.ack_mfsk.ack_pattern_nsymb;
+		cl_data_container& dc = ts.data_container;
+		int interp      = ts.frequency_interpolation_rate;
+		int sym_samples = dc.Nofdm * interp;
+		int buf_nsymb   = (int)dc.buffer_Nsymb;   // atomic -> plain int (no atomic copy)
+		int buf_samp    = buf_nsymb * sym_samples;
+		int frame_symb  = dc.Nsymb + dc.preamble_nSymb;
+		int frame_samp  = frame_symb * sym_samples;
+		int nReal       = dc.nBits - ts.ldpc.P;
+		int fbytes      = (nReal - ts.outer_code_reserved_bits) / 8;
+		if (fbytes < 1) fbytes = 1;
+		std::vector<int>    payload(fbytes, 0);
+		std::vector<double> frame(frame_samp > 0 ? frame_samp : 1, 0.0);
+		double* rx = dc.ready_to_process_passband_delayed_data;
+
+		int  cfg_worst_gated = 0; double cw_coarse = 0, cw_metric = 0, cw_esn0 = 0;
+		int  cfg_worst_raw   = 0;
+		long cfg_det_old = 0, cfg_det_new = 0;
+
+		printf("[ALIAS] cfg=%d thr=%d/%d det_thr=%.2f metric_floor=%.2f frame_symb=%d buf_symb=%d fbytes=%d\n",
+		       cfgs[ci], thr, nsymb, det_thr, metric_floor, frame_symb, buf_nsymb, fbytes);
+		fflush(stdout);
+
+		for (double esn0 = -16.0; esn0 <= 24.0; esn0 += 2.0) {
+			float sigma    = 1.0f / sqrtf(powf(10.0f, (float)esn0 / 10.0f));
+			float ampl_val = sigma / sqrtf(2.0f);
+			int  snr_max_matched = 0, snr_max_gated = 0, fails = 0;
+			long det_old_at_snr = 0, det_new_at_snr = 0;
+			double sum_coarse = 0;
+
+			for (int t = 0; t < ntrials; t++) {
+				for (int i = 0; i < fbytes; i++) payload[i] = rand() & 0xff;
+				ts.transmit_byte(payload.data(), fbytes, frame.data(), SINGLE_MESSAGE);
+
+				for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
+				int onset  = 5 * sym_samples;
+				int copy_n = frame_samp;
+				if (onset + copy_n > buf_samp) copy_n = buf_samp - onset;
+				for (int i = 0; i < copy_n; i++) rx[onset + i] = frame[i];
+				for (int i = 0; i < buf_samp; i++)
+					rx[i] += (double)(ampl_val * ts.awgn_channel.awgn_value_generator());
+
+				// real acquisition + decode (NOT the BER forced-delay path) so
+				// receive_stats.coarse_metric is authentic.
+				ts.receive_stats.ofdm_search_raw        = 0;
+				ts.data_container.nUnder_processing_events = 0;
+				ts.receive_stats.ofdm_batch_active      = false;
+				ts.receive_stats.delay                  = 0;
+				ts.ofdm_forced_delay                    = -1;
+				ts.mfsk_fixed_delay                     = -1;
+				ts.receive_byte(rx, dc.hd_decoded_data_byte);
+
+				double coarse  = ts.receive_stats.coarse_metric;
+				int    decoded = ts.receive_stats.message_decoded;
+				if (decoded != YES) fails++;
+				sum_coarse += coarse;
+
+				int    matched = 0;
+				double metric  = ts.detect_break_pattern_from_passband(rx, buf_samp, &matched);
+				total_polls++;
+
+				bool gate_pass  = (coarse < 0.30);
+				bool det_old    = (metric >= det_thr      && matched >= thr) && gate_pass;
+				bool det_new    = (metric >= metric_floor && matched >= thr) && gate_pass;
+
+				if (matched > snr_max_matched) snr_max_matched = matched;
+				if (matched > cfg_worst_raw)   cfg_worst_raw   = matched;
+				if (matched > worst_matched_overall) worst_matched_overall = matched;
+				if (gate_pass) {
+					if (matched > snr_max_gated) snr_max_gated = matched;
+					if (matched > cfg_worst_gated) {
+						cfg_worst_gated = matched; cw_coarse = coarse; cw_metric = metric; cw_esn0 = esn0;
+					}
+					if (matched > worst_matched_gated) worst_matched_gated = matched;
+					// track the alias metric ceiling ONLY on captures that could clear the
+					// match count (the aliasing regime) — this is the number the floor sits above.
+					if (matched >= thr && metric > worst_alias_gated_metric)
+						worst_alias_gated_metric = metric;
+				}
+				if (det_old) {
+					det_old_at_snr++; cfg_det_old++; total_det_old++;
+					if (matched > cap_matched) {
+						cap_matched = matched; cap_coarse = coarse; cap_metric = metric;
+						cap_esn0 = esn0; cap_cfg = cfgs[ci]; cap_thr = thr;
+					}
+				}
+				if (det_new) { det_new_at_snr++; cfg_det_new++; total_det_new++; }
+			}
+			printf("[ALIAS]   cfg=%2d esn0=%+5.0f maxmatched=%2d/%d gatedmax=%2d fails=%3d/%d meancoarse=%.3f det_old=%ld det_new=%ld\n",
+			       cfgs[ci], esn0, snr_max_matched, nsymb, snr_max_gated, fails, ntrials,
+			       sum_coarse / ntrials, det_old_at_snr, det_new_at_snr);
+			fflush(stdout);
+		}
+		printf("[ALIAS-CFG] cfg=%2d worst_raw_matched=%2d/%d worst_gated_matched=%2d (coarse=%.3f metric=%.2f @esn0=%+.0f) thr=%d det_old=%ld det_new=%ld\n",
+		       cfgs[ci], cfg_worst_raw, nsymb, cfg_worst_gated, cw_coarse, cw_metric, cw_esn0, thr, cfg_det_old, cfg_det_new);
+		fflush(stdout);
+	}
+
+	printf("=== ALIAS SWEEP DONE: worst_raw_matched=%d worst_gated_matched=%d alias_metric_ceiling=%.3f det_old=%ld det_new=%ld / %ld polls ===\n",
+	       worst_matched_overall, worst_matched_gated, worst_alias_gated_metric, total_det_old, total_det_new, total_polls);
+	if (cap_matched >= 0) {
+		printf("=== FAIL-BEFORE WITNESS (OLD bar metric>=det_thr): cfg=%d matched=%d(thr=%d) metric=%.2f coarse=%.3f esn0=%+.0f -> FALSE BREAK on NON-BREAK OFDM data ===\n",
+		       cap_cfg, cap_matched, cap_thr, cap_metric, cap_coarse, cap_esn0);
+	}
+	printf("=== FIX (NEW bar metric>=break_metric floor): total_det_new=%ld (0 == alias REJECTED) ===\n", total_det_new);
+
+	// ---- Real-BREAK survival arm: prove the fix does NOT starve a genuine BREAK ----
+	// Drive an actual BREAK burst (generate_break_pattern_passband) through the SAME
+	// correlator + AWGN across the Es/N0 grid, and confirm it clears the NEW floor at
+	// and above the SNR where a real BREAK is used (the responder fires BREAK while it
+	// can still hear the peer — well above the deep-null regime). We assert survival at
+	// REAL_BREAK_FLOOR_ESN0 and above; below that the burst itself fades and detection
+	// is expected to drop (not a regression the fix introduced).
+	long real_break_miss_above_floor = 0;
+	const double REAL_BREAK_FLOOR_ESN0 = -12.0;
+	{
+		cl_telecom_system ts;
+		ts.operation_mode = BER_PLOT_passband;
+		ts.load_configuration(CONFIG_0);   // WB; ack_mfsk M=16 break tones + thresholds
+		int    thr          = ts.ack_mfsk.break_match_threshold;
+		double det_thr      = ts.ack_pattern_detection_threshold;
+		double metric_floor = ts.ack_mfsk.break_metric_threshold;
+		if (metric_floor < det_thr) metric_floor = det_thr;
+		cl_data_container& dc = ts.data_container;
+		int interp      = ts.frequency_interpolation_rate;
+		int sym_samples = dc.Nofdm * interp;
+		int buf_nsymb   = (int)dc.buffer_Nsymb;
+		int buf_samp    = buf_nsymb * sym_samples;
+		double* rx = dc.ready_to_process_passband_delayed_data;
+		int brk_samp = ts.ack_pattern_passband_samples;
+		std::vector<double> brk((size_t)(brk_samp > 0 ? brk_samp : 1), 0.0);
+		int written = ts.generate_break_pattern_passband(brk.data());
+
+		printf("[REALBREAK] thr=%d/%d metric_floor=%.2f break_samples=%d (survival asserted @esn0>=%.0f)\n",
+		       thr, ts.ack_mfsk.ack_pattern_nsymb, metric_floor, written, REAL_BREAK_FLOOR_ESN0);
+		fflush(stdout);
+
+		for (double esn0 = -16.0; esn0 <= 12.0; esn0 += 2.0) {
+			float sigma    = 1.0f / sqrtf(powf(10.0f, (float)esn0 / 10.0f));
+			// The BREAK burst is transmitted at unit reference power like the data frame
+			// (generate_break_pattern_passband applies the ACK TX gain internally); scale
+			// the AWGN the same way the alias arm does so Es/N0 is comparable.
+			float ampl_val = sigma / sqrtf(2.0f);
+			int trials = 12;
+			int det_new_hits = 0; int best_matched = 0; double best_metric = 0;
+			for (int t = 0; t < trials; t++) {
+				for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
+				int onset = 5 * sym_samples;
+				int copy_n = written;
+				if (onset + copy_n > buf_samp) copy_n = buf_samp - onset;
+				for (int i = 0; i < copy_n; i++) rx[onset + i] = brk[i];
+				for (int i = 0; i < buf_samp; i++)
+					rx[i] += (double)(ampl_val * ts.awgn_channel.awgn_value_generator());
+
+				int matched = 0;
+				double metric = ts.detect_break_pattern_from_passband(rx, buf_samp, &matched);
+				bool det_new = (metric >= metric_floor && matched >= thr);
+				if (det_new) det_new_hits++;
+				if (matched > best_matched) { best_matched = matched; best_metric = metric; }
+			}
+			bool survives = (det_new_hits > 0);
+			if (esn0 >= REAL_BREAK_FLOOR_ESN0 && !survives) real_break_miss_above_floor++;
+			printf("[REALBREAK] esn0=%+5.0f det_new_hits=%2d/%d best_matched=%2d best_metric=%6.2f %s\n",
+			       esn0, det_new_hits, trials, best_matched, best_metric,
+			       (esn0 >= REAL_BREAK_FLOOR_ESN0 ? (survives ? "SURVIVES" : "*** MISS ***") : "(below floor)"));
+			fflush(stdout);
+		}
+	}
+	printf("=== REAL-BREAK SURVIVAL: misses_at_or_above_floor=%ld (0 == no sensitivity regression) ===\n",
+	       real_break_miss_above_floor);
+
+	// RC: nonzero iff the fix failed EITHER direction — a surviving alias detonation
+	// under the new floor, OR a real BREAK that no longer detonates at/above its floor.
+	long rc = total_det_new + real_break_miss_above_floor;
+	printf("=== ALIAS+SURVIVAL RESULT: det_new=%ld real_break_miss=%ld rc=%ld ===\n",
+	       total_det_new, real_break_miss_above_floor, rc);
+	return (int)rc;
 }
 
 // =============================================================================

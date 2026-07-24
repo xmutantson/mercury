@@ -47,6 +47,13 @@ int run_preamble_sched_tests();
 // number of failed tests (0 = all pass). Wired via main.cc --test-break-fh.
 int run_break_fh_gate_tests();
 
+// BREAK OFDM-alias false-positive sweep: drive real non-BREAK OFDM data frames
+// (config x Es/N0 grid) through acquisition+decode+the BREAK correlator and report
+// whether the detonation predicate (coarse<0.30 && metric>=det_thr && matched>=thr)
+// ever fires on data that is NOT a transmitted BREAK. Investigation harness (always
+// returns 0). Wired via main.cc --test-break-alias.
+int run_break_alias_sweep();
+
 // recovery-ack-robustness.md: run ONLY the recovery-ACK robustness suite (marginal-ACK
 // combining, listen-window ms-mirror, DELTA-1 reps-agnostic BREAK, DELTA-2 CFO-refine
 // decision gate). Fast iteration. Returns failed count. Wired via main.cc

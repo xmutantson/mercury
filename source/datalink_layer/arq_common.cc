@@ -16915,7 +16915,21 @@ void cl_arq_controller::receive()
 				// (single-shot -> byte-identical) and when set requires BREAK_KOFN_K consecutive
 				// matches before detonating (the per-batch alias is a one-frame transient; a real
 				// BREAK is retried/sustained so survives K-of-N).
-				bool probe_matched = (metric >= telecom_system->ack_pattern_detection_threshold
+				// BREAK OFDM-alias false-positive fix: gate the detonation on a
+				// dedicated metric FLOOR, not the shared ack_pattern_detection_threshold.
+				// The shared threshold is 1.0 on WB OFDM configs, which sits BELOW the
+				// ~1.0-1.23 metric a marginal-decode OFDM DATA frame aliases into the 8
+				// WB break_tones (matched can still reach 10-12/16 by argmax coincidence).
+				// A GENUINE BREAK burst correlates at metric~10-16 — a ~10x gap. The
+				// per-config break_metric_threshold (WB M=16 = 4.0) sits inside that gap
+				// so the alias is rejected while a real BREAK still detonates. When
+				// break_metric_threshold is 0 (NB / other M, where the alias is not in
+				// play) the floor falls back to ack_pattern_detection_threshold →
+				// byte-identical to the prior behavior on those paths.
+				double break_metric_floor = telecom_system->ack_mfsk.break_metric_threshold;
+				if(break_metric_floor < telecom_system->ack_pattern_detection_threshold)
+					break_metric_floor = telecom_system->ack_pattern_detection_threshold;
+				bool probe_matched = (metric >= break_metric_floor
 				                      && matched >= telecom_system->ack_mfsk.break_match_threshold);
 				if(break_kofn_corroborate(probe_matched))
 				{
