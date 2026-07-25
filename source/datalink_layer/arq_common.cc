@@ -1818,8 +1818,16 @@ bool cl_arq_controller::bprime_defeat_active()
 
 bool cl_arq_controller::scalable_sack_on() const
 {
+	// DEFAULT-ON (baked default + env A/B, mirrors linkphase_ackslot_on /
+	// cumulative_ack_advertise_bit): scalable-SACK ships on — the Axis-2 batch
+	// ceiling is AXIS2_BATCH_CEIL (96) and the cumulative-n_r ACK path is live by
+	// default. MERCURY_SCALABLE_SACK is an A/B DISABLE override: explicit =0
+	// restores the legacy 32-batch ceiling (byte-identical to the pre-scalable
+	// modem); unset or any non-zero value keeps scalable-SACK ON. The stale-tail
+	// defense (rx_effective_window clamp) is a separate, unconditional guard and is
+	// unaffected by this gate.
 	const char* e = std::getenv("MERCURY_SCALABLE_SACK");
-	return e && *e && atoi(e) != 0;
+	return !(e && *e && atoi(e) == 0);   // ON unless explicitly disabled with =0
 }
 
 int cl_arq_controller::axis2_batch_ceiling() const
