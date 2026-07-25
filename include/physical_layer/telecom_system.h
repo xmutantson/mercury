@@ -590,7 +590,7 @@ public:
 	// NO frequency-sync re-run and NO receive_stats side effects — a pure selector
 	// for the SUBPEAK-REJECT sample-anchored rescue. See telecom_system.cc impl and
 	// fact-documents/data-flow-rx-ring-rearm.md.
-	double ofdm_meanH_at_delay(double *data, int cand_delay, double eff_carrier_freq, int rx_eff_preamble);
+	double ofdm_meanH_at_delay(double *data, int cand_delay, double eff_carrier_freq, int rx_eff_preamble, double *out_coherence=nullptr);
 
 	// ===== LEVER P: PREAMBLE AMORTIZATION =====
 	// A batch is one gapless PTT waveform of N concatenated OFDM frames; today

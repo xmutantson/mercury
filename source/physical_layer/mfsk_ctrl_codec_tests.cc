@@ -9200,6 +9200,60 @@ int run_pilot_thin_nv_tests()
 		overflow_rejected ? "OK" : "FAIL");
 	if(!overflow_rejected) failures++;
 
+	// --- cfg16 pilot-thin baked default (roll-in), fail-before / pass-after ---
+	// After the roll-in, cfg16 with NO pilot env must yield the thin geometry
+	// (Dy=5, Nsymb=8) that was previously reachable only through the knob. Capture
+	// the forced-knob geometry as the reference, prove the no-env default
+	// reproduces it byte-for-byte (same nData/nPilots), and confirm the stock
+	// reconstruct (Dy=3/Nsymb=9) still restores the dense grid so the A/B control
+	// survives.
+	set_pilot_nv_test_env("MERCURY_PILOT_TARGET_CFG", nullptr);
+
+	// Forced thin = the proven env config; captured as the reference geometry.
+	set_pilot_nv_test_env("MERCURY_PILOT_DY", "5");
+	set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", "8");
+	if(ts.current_configuration == CONFIG_16) ts.load_configuration(CONFIG_12);
+	ts.load_configuration(CONFIG_16);
+	const int forced_thin_dy = ts.ofdm.pilot_configurator.Dy;
+	const int forced_thin_nsymb = ts.ofdm.Nsymb;
+	const int forced_thin_nData = ts.ofdm.pilot_configurator.nData;
+	const int forced_thin_nPilots = ts.ofdm.pilot_configurator.nPilots;
+
+	// No-env default: after the roll-in this must reproduce the forced thin grid.
+	// On the pre-change binary the no-env grid is Dy=3/Nsymb=9 (dense) → FAILS here.
+	set_pilot_nv_test_env("MERCURY_PILOT_DY", nullptr);
+	set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", nullptr);
+	ts.load_configuration(CONFIG_12);
+	ts.load_configuration(CONFIG_16);
+	bool baked_pass = ts.ofdm.pilot_configurator.Dy == 5
+		&& ts.ofdm.Nsymb == 8
+		&& ts.ofdm.pilot_configurator.nData == forced_thin_nData
+		&& ts.ofdm.pilot_configurator.nPilots == forced_thin_nPilots
+		&& cl_telecom_system::pilot_geometry_fits_ldpc(
+			ts.ofdm.pilot_configurator.nData, ts.M, ts.ldpc.N);
+	printf("  [%s] cfg16 no-env baked pilot-thin Dy=%d Nsymb=%d nData=%d nPilots=%d "
+		"(forced ref Dy=%d Nsymb=%d nData=%d nPilots=%d)\n",
+		baked_pass ? "OK" : "FAIL",
+		ts.ofdm.pilot_configurator.Dy, ts.ofdm.Nsymb,
+		ts.ofdm.pilot_configurator.nData, ts.ofdm.pilot_configurator.nPilots,
+		forced_thin_dy, forced_thin_nsymb, forced_thin_nData, forced_thin_nPilots);
+	if(!baked_pass) failures++;
+
+	// Stock reconstruct: the A/B control knob must still restore the dense grid.
+	set_pilot_nv_test_env("MERCURY_PILOT_DY", "3");
+	set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", "9");
+	ts.load_configuration(CONFIG_12);
+	ts.load_configuration(CONFIG_16);
+	bool stock_reconstruct_pass = ts.ofdm.pilot_configurator.Dy == 3
+		&& ts.ofdm.Nsymb == 9;
+	printf("  [%s] cfg16 stock reconstruct MERCURY_PILOT_DY=3/NSYMB=9 Dy=%d Nsymb=%d\n",
+		stock_reconstruct_pass ? "OK" : "FAIL",
+		ts.ofdm.pilot_configurator.Dy, ts.ofdm.Nsymb);
+	if(!stock_reconstruct_pass) failures++;
+
+	set_pilot_nv_test_env("MERCURY_PILOT_DY", nullptr);
+	set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", nullptr);
+
 	for (int i = 0; i < key_count; ++i)
 		set_pilot_nv_test_env(saved[i].key,
 			saved[i].present ? saved[i].value.c_str() : nullptr);

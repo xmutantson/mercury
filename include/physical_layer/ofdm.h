@@ -180,6 +180,9 @@ public:
 	void deframer(std::complex <double>* in, std::complex <double>* out);
 	void ZF_channel_estimator(std::complex <double>*in);
 	void LS_channel_estimator(std::complex <double>*in);
+	// Geometry-invariant timing-quality selector; sets last_pilot_coherence from
+	// the RAW pilot cells. Call before interpolation/smoothing. See ofdm.h member.
+	void compute_pilot_coherence();
 	// feat/fade-tinterp: FADE-tier per-carrier LINEAR TIME-INTERPOLATION estimator.
 	// On the dense Dx=1/Dy=3 lattice every carrier carries a pilot every Dy symbols,
 	// so each carrier's H(t) is a time series sampled every Dy symbols; linear-
@@ -355,6 +358,26 @@ public:
 	// MMSE regularization: noise variance estimated from pilot residuals
 	// Set by ZF/LS channel estimator, used by channel_equalizer
 	double noise_variance_estimate;
+
+	// Pilot phase-COHERENCE of the RAW (pre-smoothing/pre-interpolation) channel
+	// estimate: C = |Sum_p H_p| / Sum_p |H_p| over the MEASURED pilot cells, in
+	// [0,1]. Set by ZF/LS channel estimator right after the raw per-pilot values
+	// are placed, BEFORE interpolation + smooth_channel_estimate_dft() (the DFT
+	// time-window can partially re-cohere a wrong lock, which would inflate this).
+	//
+	// Unlike mean|H| (an ABSOLUTE magnitude whose wrong-lock collapse depth scales
+	// with pilot count), C is a power- and count-NORMALIZED ratio, so its true-vs-
+	// wrong separation does not shrink as the pilot lattice thins. A good timing
+	// lock leaves the per-pilot channel phases aligned (C -> ~1); a sub-symbol
+	// mistiming imposes a per-carrier phase ramp that decorrelates them (C -> ~1/
+	// sqrt(nPilots), small for any density). This is the channel-estimate-domain
+	// analog of the received-power normalization in the Schmidl & Cox timing metric
+	// M(d)=|P(d)|^2/R(d)^2 (Robust Frequency and Timing Synchronization for OFDM,
+	// IEEE Trans. Commun. 1997) and the phase-slope timing-quality view of van de
+	// Beek/Edfors et al. (On channel estimation in OFDM systems, IEEE VTC 1995).
+	// -1 => not yet computed / no pilots. Read only as a timing-quality SELECTOR;
+	// no effect on the equalized data path.
+	double last_pilot_coherence = -1.0;
 
 	// fix/cfg16-nv-restore validation knob: when true, LS_channel_estimator
 	// prints [LS-NV-DBG] comparing the restored pilot-residual nv with the

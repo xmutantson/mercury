@@ -1654,6 +1654,26 @@ double cl_ofdm::estimate_noise_from_pilot_pairs(std::complex<double>* in,
 	return nv;
 }
 
+// Geometry-invariant timing-quality selector. Walks the MEASURED (raw pilot)
+// cells of estimated_channel and stores the phase-coherence factor
+//   C = |Sum_p H_p| / Sum_p |H_p|   in last_pilot_coherence (see ofdm.h).
+// MUST be called while only pilot cells are MEASURED (before interpolation and
+// smooth_channel_estimate_dft), so it reflects the raw per-pilot phase structure.
+void cl_ofdm::compute_pilot_coherence()
+{
+	std::complex<double> vec_sum(0.0, 0.0);
+	double mag_sum = 0.0;
+	for(int ci = 0; ci < Nsymb * Nc; ci++)
+	{
+		if((estimated_channel + ci)->status == MEASURED)
+		{
+			vec_sum += (estimated_channel + ci)->value;
+			mag_sum += std::abs((estimated_channel + ci)->value);
+		}
+	}
+	last_pilot_coherence = (mag_sum > 1e-12) ? (std::abs(vec_sum) / mag_sum) : -1.0;
+}
+
 void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 {
 	int pilot_index=0;
@@ -1674,6 +1694,11 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 			}
 		}
 	}
+
+	// Timing-quality selector: pilot phase COHERENCE over the RAW ZF estimates,
+	// captured HERE (only pilot cells are MEASURED; interpolation + DFT smoothing
+	// have not run yet). See ofdm.h last_pilot_coherence.
+	compute_pilot_coherence();
 
 	if(Nc <= 10)
 	{
@@ -1883,6 +1908,10 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 
+	// Timing-quality selector: pilot phase COHERENCE over the RAW LS estimates,
+	// captured HERE (only pilot cells are MEASURED; interpolation + DFT smoothing
+	// have not run yet). See ofdm.h last_pilot_coherence.
+	compute_pilot_coherence();
 
 	for(int j=0;j<Nc;j++)
 	{
@@ -2077,6 +2106,18 @@ void cl_ofdm::LS_channel_estimator_tinterp(std::complex <double>*in)
 					known[(size_t)n*C+j] = 1;
 				}
 			}
+	}
+
+	// Timing-quality selector: pilot phase COHERENCE over the RAW time-pilot LS
+	// values (before time/freq interpolation + smoothing). Same definition as
+	// compute_pilot_coherence(), computed on the local Hp anchors here because the
+	// tinterp path marks whole columns MEASURED after interpolation. See ofdm.h.
+	{
+		std::complex<double> vec_sum(0.0, 0.0);
+		double mag_sum = 0.0;
+		for(size_t idx = 0; idx < Hp.size(); idx++)
+			if(known[idx]) { vec_sum += Hp[idx]; mag_sum += std::abs(Hp[idx]); }
+		last_pilot_coherence = (mag_sum > 1e-12) ? (std::abs(vec_sum) / mag_sum) : -1.0;
 	}
 
 	// per carrier: gather pilot-symbol indices, linear-interpolate in time.

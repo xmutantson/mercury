@@ -900,15 +900,39 @@ static int run_acq_bounds_selftest()
 // a no-op under -x sim), so the PRODUCTION rescue-branch FIRING is proven separately by the
 // real-audio needle-2 cohort (anchor_race_vehicle.py: [XCORR-RESCUE-OK] tokens + needle2 -> 0).
 // This test isolates the mechanism the cohort then confirms fires end-to-end.
-static int run_subpeak_rescue_selftest()
+static int subpeak_rescue_geom(int force_Dy, int force_Nsymb, const char* label,
+                               double noise_snr_db /* <0 => noiseless */)
 {
-    printf("[TEST-SUBPEAK-RESCUE] F1b Part B true-boundary rescue mechanism self-test\n");
-    int fails = 0;
-    const int cfg = CONFIG_16;   // the operating config where the post-turnaround loss occurs
+    // GEOMETRY-INVARIANT discriminator: assert on the pilot phase COHERENCE C
+    // (telecom_system.cc last_pilot_coherence), NOT the absolute mean|H|. mean|H|'s
+    // wrong-lock collapse deepens with pilot count, so the thinned cfg16 grid (Dy=5)
+    // leaves a wrong lock reading mean|H|~0.77 -- above the 0.74 legacy floor -- and
+    // the old absolute-floor assertion FALSELY passes the wrong lock. C is count-
+    // normalized: a decorrelated wrong lock reads C~0.1 at ANY density, a good lock
+    // reads C~1, so the same thresholds separate on Dy=3 AND Dy=5.
+    const double C_ENTRY  = 0.35;  // wrong lock must read C below this (production subpeak_coh_entry)
+    const double C_ACCEPT = 0.50;  // true / recovered lock must read C at/above this (subpeak_coh_accept)
+    const double FLOOR    = 0.74;  // legacy good-timing mean|H| floor (printed for context, not asserted-on)
 
+    // Force the cfg16 pilot lattice. Baked default is Dy=5/Nsymb=8; the pilot-override
+    // env reconstructs any (Dy,Nsymb) for CONFIG_16 (pilot_override_target default).
+    const char* ks[2] = { "MERCURY_PILOT_DY", "MERCURY_PILOT_NSYMB" };
+    bool had[2]; std::string sav[2];
+    for (int i=0;i<2;i++){ const char* g=std::getenv(ks[i]); had[i]=(g!=nullptr); sav[i]=g?std::string(g):std::string(); }
+    char dybuf[16], nsbuf[16];
+    snprintf(dybuf,sizeof(dybuf),"%d",force_Dy);
+    snprintf(nsbuf,sizeof(nsbuf),"%d",force_Nsymb);
+    setenv("MERCURY_PILOT_DY", dybuf, 1);
+    setenv("MERCURY_PILOT_NSYMB", nsbuf, 1);
+
+    int fails = 0;
+    const int cfg = CONFIG_16;
     cl_telecom_system ts;
     ts.operation_mode = BER_PLOT_passband;
     ts.load_configuration(cfg);
+
+    // Geometry is now locked into this ts instance; restore the env immediately.
+    for (int i=0;i<2;i++){ if(had[i]) setenv(ks[i],sav[i].c_str(),1); else unsetenv(ks[i]); }
 
     cl_data_container& dc = ts.data_container;
     int interp       = ts.frequency_interpolation_rate;
@@ -928,8 +952,22 @@ static int run_subpeak_rescue_selftest()
     std::vector<double> frame(frame_samp, 0.0);
     ts.transmit_byte(payload.data(), frame_size, frame.data(), SINGLE_MESSAGE);
 
+    // Optional AWGN (low-SNR true-lock case): calibrate sigma to the frame RMS so
+    // the requested passband SNR depresses mean|H| toward the good-timing floor
+    // without destroying the lock -- the exact regime where an ABSOLUTE floor risks
+    // false-rejecting a real frame but a NORMALIZED coherence must not.
+    std::vector<double> used(frame);
+    if (noise_snr_db >= 0.0) {
+        double e = 0.0; for (double v : frame) e += v*v;
+        double rms = (frame.size()>0)? sqrt(e/(double)frame.size()) : 0.0;
+        double sigma = (rms>0.0)? rms / pow(10.0, noise_snr_db/20.0) : 0.0;
+        std::mt19937 rng(0xC0FFEEu + (unsigned)force_Dy*131u + (unsigned)(noise_snr_db*7.0));
+        std::normal_distribution<double> nd(0.0, sigma);
+        for (size_t i=0;i<used.size();i++) used[i] += nd(rng);
+    }
+
     // Place at a true onset preceded by a zero run-up (the flush-memset silence that
-    // seeds the Schmidl-Cox plateau in the field). onset=8 symbols in; full frame fits.
+    // seeds the Schmidl-Cox plateau in the field). onset=8 symbols in.
     double* rx = dc.ready_to_process_passband_delayed_data;
     for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
     int onset_symb = 8;
@@ -937,70 +975,114 @@ static int run_subpeak_rescue_selftest()
     if (D > max_delay) D = max_delay;
     int copy_n = frame_samp;
     if (D + copy_n > buf_samp) copy_n = buf_samp - D;
-    for (int i = 0; i < copy_n; i++) rx[D + i] = frame[i];
+    for (int i = 0; i < copy_n; i++) rx[D + i] = used[i];
 
-    // The field wrong lock sits ~1.5 symbols early (−1787 samp = −1.53 sym in c4).
+    // The field wrong lock sits ~1.5 symbols early.
     int wrong = D - (sym_samples + sym_samples / 2);
     if (wrong < 0) wrong = 0;
 
-    // ---- (1) SELECTOR discrimination via the production helper ----
-    double mH_true  = ts.ofdm_meanH_at_delay(rx, D,     carrier, dc.preamble_nSymb);
-    double mH_wrong = ts.ofdm_meanH_at_delay(rx, wrong, carrier, dc.preamble_nSymb);
-    const double FLOOR = 0.74;
-    // Discrimination, not an absolute magnitude: the wrong lock must fall BELOW the
-    // good-timing acceptance floor (so the rescue never accepts it) AND clearly below
-    // the true onset. (A noiseless synthetic frame collapses less deeply than the field
-    // −1787-sample lock with its long silence run-up + real channel, ~0.56 vs ~0.37, but
-    // the selector still ranks it well below FLOOR — which is all the accept gate needs.)
-    bool sel_true_ok  = (mH_true  >= FLOOR);
-    bool sel_wrong_ok = (mH_wrong <  FLOOR) && (mH_true - mH_wrong >= 0.20);
-    printf("[TEST-SUBPEAK-RESCUE]   selector: meanH(true=%d)=%.3f (>=%.2f? %s)  meanH(wrong=%d)=%.3f (<%.2f & margin>=0.20? %s)\n",
-           D, mH_true, FLOOR, sel_true_ok?"YES":"NO", wrong, mH_wrong, FLOOR, sel_wrong_ok?"YES":"NO");
-    if (!sel_true_ok)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: true-onset mean|H| below good-timing floor\n"); }
-    if (!sel_wrong_ok) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: wrong-lock mean|H| not clearly below the good-timing floor\n"); }
+    // ---- (1) SELECTOR discrimination via the production helper (mean|H| AND C) ----
+    double C_true = -1.0, C_wrong = -1.0;
+    double mH_true  = ts.ofdm_meanH_at_delay(rx, D,     carrier, dc.preamble_nSymb, &C_true);
+    double mH_wrong = ts.ofdm_meanH_at_delay(rx, wrong, carrier, dc.preamble_nSymb, &C_wrong);
+    printf("[TEST-SUBPEAK-RESCUE] [%s] Dy=%d Nsymb=%d %s\n", label, force_Dy, force_Nsymb,
+           (noise_snr_db<0.0)?"noiseless":"low-SNR true-lock");
+    printf("[TEST-SUBPEAK-RESCUE]   selector: true(d=%d) mean|H|=%.3f C=%.3f | wrong(d=%d) mean|H|=%.3f C=%.3f | floor(legacy)=%.2f C_entry=%.2f C_accept=%.2f\n",
+           D, mH_true, C_true, wrong, mH_wrong, C_wrong, FLOOR, C_ENTRY, C_ACCEPT);
 
-    // ---- (2) argmax scan (identical to the receive_byte reject-branch loop) ----
-    int step = sym_samples / 4; if (step < 1) step = 1;
-    double best_mH = mH_wrong; int best_delay = wrong;
-    for (int off = -2*sym_samples; off <= 2*sym_samples; off += step) {
-        int cand = wrong + off;
-        if (cand < 0 || cand > max_delay) continue;
-        double mH = ts.ofdm_meanH_at_delay(rx, cand, carrier, dc.preamble_nSymb);
-        if (mH > best_mH) { best_mH = mH; best_delay = cand; }
-    }
-    bool scan_ok = (best_mH >= FLOOR) && (std::abs(best_delay - D) <= step);
-    printf("[TEST-SUBPEAK-RESCUE]   argmax scan: best_delay=%d (true=%d, err=%d samp, <=%d? %s) best_meanH=%.3f (>=%.2f? %s)\n",
-           best_delay, D, best_delay - D, step, (std::abs(best_delay - D) <= step)?"YES":"NO",
-           best_mH, FLOOR, (best_mH>=FLOOR)?"YES":"NO");
-    if (!scan_ok) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: argmax did not recover the true onset\n"); }
-
-    // ---- (3) production decode legs: truth decodes, wrong lock fails, refined decodes ----
+    // decode-at-forced-delay helper (uses the possibly-noisy frame)
     auto decode_at = [&](int forced_delay)->int {
         for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
-        for (int i = 0; i < copy_n; i++) rx[D + i] = frame[i];
+        for (int i = 0; i < copy_n; i++) rx[D + i] = used[i];
         ts.receive_stats.ofdm_search_raw = 0;
         ts.data_container.nUnder_processing_events = 0;
         ts.receive_stats.ofdm_batch_active = false;
         ts.receive_stats.delay = 0;
         ts.mfsk_fixed_delay = -1;
-        ts.ofdm_forced_delay = forced_delay;   // decode at exactly this delay (no rescue on this path)
+        ts.ofdm_forced_delay = forced_delay;
         ts.receive_byte(rx, dc.hd_decoded_data_byte);
         int ok = (ts.receive_stats.message_decoded == YES) ? 1 : 0;
-        if (ok) {   // confirm byte-correctness, not just the decoded flag
+        if (ok) {
             for (int i = 0; i < frame_size; i++)
                 if ((dc.hd_decoded_data_byte[i] & 0xff) != (payload[i] & 0xff)) { ok = 0; break; }
         }
         return ok;
     };
-    int dec_true  = decode_at(D);
-    int dec_wrong = decode_at(wrong);
-    int dec_best  = decode_at(best_delay);
-    printf("[TEST-SUBPEAK-RESCUE]   decode: true=%s wrong=%s refined=%s\n",
-           dec_true?"DECODED":"FAILED", dec_wrong?"DECODED":"FAILED", dec_best?"DECODED":"FAILED");
-    if (!dec_true)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: clean frame did not decode at the true onset\n"); }
-    if ( dec_wrong) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: wrong lock decoded (fail-before did not reproduce)\n"); }
-    if (!dec_best)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL: refined delay did not decode (pass-after)\n"); }
 
+    if (noise_snr_db < 0.0) {
+        // NOISELESS: full geometry-invariant discrimination on this grid.
+        bool sel_true_ok  = (C_true  >= C_ACCEPT);
+        bool sel_wrong_ok = (C_wrong >= 0.0) && (C_wrong <  C_ENTRY) && (C_true - C_wrong >= 0.30);
+        if (!sel_true_ok)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: true-onset coherence below accept (%.3f < %.2f)\n", label, C_true, C_ACCEPT); }
+        if (!sel_wrong_ok) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: wrong-lock coherence not clearly below entry (C=%.3f, entry=%.2f, margin=%.3f)\n", label, C_wrong, C_ENTRY, C_true - C_wrong); }
+
+        // ---- (2) argmax scan (identical to the receive_byte reject-branch loop) ----
+        int step = sym_samples / 4; if (step < 1) step = 1;
+        double best_mH = mH_wrong; int best_delay = wrong; double best_C = C_wrong;
+        for (int off = -2*sym_samples; off <= 2*sym_samples; off += step) {
+            int cand = wrong + off;
+            if (cand < 0 || cand > max_delay) continue;
+            double candC = -1.0;
+            double mH = ts.ofdm_meanH_at_delay(rx, cand, carrier, dc.preamble_nSymb, &candC);
+            if (mH > best_mH) { best_mH = mH; best_delay = cand; best_C = candC; }
+        }
+        bool scan_ok = (best_C >= C_ACCEPT) && (std::abs(best_delay - D) <= step);
+        printf("[TEST-SUBPEAK-RESCUE]   argmax scan[%s]: best_delay=%d (true=%d, err=%d, <=%d? %s) mean|H|=%.3f C=%.3f (C>=%.2f? %s)\n",
+               label, best_delay, D, best_delay - D, step, (std::abs(best_delay - D) <= step)?"YES":"NO",
+               best_mH, best_C, C_ACCEPT, (best_C>=C_ACCEPT)?"YES":"NO");
+        if (!scan_ok) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: argmax did not recover a coherent true onset\n", label); }
+
+        // ---- (3) production decode legs: truth decodes, wrong fails, refined decodes ----
+        int dec_true  = decode_at(D);
+        int dec_wrong = decode_at(wrong);
+        int dec_best  = decode_at(best_delay);
+        printf("[TEST-SUBPEAK-RESCUE]   decode[%s]: true=%s wrong=%s refined=%s\n",
+               label, dec_true?"DECODED":"FAILED", dec_wrong?"DECODED":"FAILED", dec_best?"DECODED":"FAILED");
+        if (!dec_true)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: clean frame did not decode at the true onset\n", label); }
+        if ( dec_wrong) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: wrong lock decoded (fail-before did not reproduce)\n", label); }
+        if (!dec_best)  { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: refined delay did not decode (pass-after)\n", label); }
+    } else {
+        // LOW-SNR TRUE-LOCK PRESERVATION: a noise-depressed GENUINE lock must still be
+        // ACCEPTED by the coherence floor (never turned into a false sub-peak reject),
+        // and must still DECODE. This guards the risk that a geometry-aware floor
+        // trades a wrong-lock catch for a real-frame false-reject at low SNR.
+        bool true_accept = (C_true >= C_ACCEPT);
+        int dec_true = decode_at(D);
+        printf("[TEST-SUBPEAK-RESCUE]   low-SNR[%s] snr=%.1fdB: true mean|H|=%.3f C=%.3f (accept C>=%.2f? %s) decode=%s\n",
+               label, noise_snr_db, mH_true, C_true, C_ACCEPT, true_accept?"YES":"NO", dec_true?"DECODED":"FAILED");
+        if (!true_accept) { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: LOW-SNR true lock FALSE-REJECTED by coherence floor (C=%.3f < %.2f)\n", label, C_true, C_ACCEPT); }
+        if (!dec_true)    { fails++; printf("[TEST-SUBPEAK-RESCUE]   FAIL[%s]: LOW-SNR true lock did not decode (SNR too low for this check -- raise noise_snr_db)\n", label); }
+    }
+    return fails;
+}
+
+static int run_subpeak_rescue_selftest()
+{
+    printf("[TEST-SUBPEAK-RESCUE] F1b Part B true-boundary rescue mechanism self-test (geometry-parametrized)\n");
+    int fails = 0;
+    // BOTH grids must correctly reject their wrong lock and accept their true lock on
+    // the GEOMETRY-INVARIANT coherence metric: the baked thin default (Dy=5/Nsymb=8)
+    // AND the stock dense reconstruct (Dy=3/Nsymb=9). A future geometry change cannot
+    // silently regress the selector because both densities are asserted here.
+    fails += subpeak_rescue_geom(5, 8, "thin",  -1.0);
+    fails += subpeak_rescue_geom(3, 9, "dense", -1.0);
+    // TRUE-LOCK PRESERVED at low SNR on BOTH grids: the coherence floor must not
+    // false-reject a legitimate lock whose mean|H| is depressed by noise. Because
+    // the discriminator is a phase COHERENCE (magnitude-independent), a sagging
+    // mean|H| does not threaten the accept -- this case proves it. SNR overridable
+    // (MERCURY_SUBPEAK_TEST_SNR) for calibration; the baked value sits in the
+    // decoding regime where mean|H| already visibly sags.
+    // 10 dB: comfortably inside the cfg16 decode regime on this synthetic (decode
+    // holds down to ~8 dB with the fixed seed) yet well below the high-SNR envelope
+    // cfg16 is elected in. Note on this FLAT synthetic mean|H| stays ~1.0 at every
+    // SNR (AGC + LS window preserve it), so the magnitude-sag false-reject the floor
+    // was feared to cause is not even reproducible -- and coherence, being magnitude-
+    // independent, holds ~1.0 regardless. The frequency-selective true-lock case
+    // (where mean|H| genuinely ripples) is the owed real-audio fire proof.
+    double lo_snr = 10.0;
+    { const char* e = std::getenv("MERCURY_SUBPEAK_TEST_SNR"); if(e && *e) lo_snr = atof(e); }
+    fails += subpeak_rescue_geom(5, 8, "thin",  lo_snr);
+    fails += subpeak_rescue_geom(3, 9, "dense", lo_snr);
     printf("[TEST-SUBPEAK-RESCUE] %s (%d failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
     return fails==0 ? 0 : 1;
 }

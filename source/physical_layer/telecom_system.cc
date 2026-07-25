@@ -1190,8 +1190,10 @@ st_receive_stats cl_telecom_system::receive_bit(double *data, int* out)
 // (coarse ± applied Moose). OFDM (non-MFSK) only. Returns -1.0 on a degenerate
 // window. See fact-documents/data-flow-rx-ring-rearm.md §Part-B and _research/F1B_DESIGN.md §2.
 double cl_telecom_system::ofdm_meanH_at_delay(double *data, int cand_delay,
-                                              double eff_carrier_freq, int rx_eff_preamble)
+                                              double eff_carrier_freq, int rx_eff_preamble,
+                                              double *out_coherence)
 {
+	if(out_coherence) *out_coherence = -1.0;
 	int buf_size_interp = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
 	int frame_size_interp = (data_container.Nofdm*(data_container.Nsymb+rx_eff_preamble))*frequency_interpolation_rate;
 	if(cand_delay < 0) cand_delay = 0;
@@ -1232,6 +1234,12 @@ double cl_telecom_system::ofdm_meanH_at_delay(double *data, int cand_delay,
 		ofdm.ZF_channel_estimator(data_container.ofdm_symbol_demodulated_data);
 	else
 		ofdm.LS_channel_estimator(data_container.ofdm_symbol_demodulated_data);
+
+	// Geometry-invariant timing-quality selector, captured by the estimator on the
+	// RAW pilots (pre-smoothing). Returned alongside mean|H| so the sub-peak rescue
+	// can accept/reject on a metric whose true-vs-wrong separation does not shrink
+	// as the pilot lattice thins (see ofdm.h last_pilot_coherence).
+	if(out_coherence) *out_coherence = ofdm.last_pilot_coherence;
 
 	double h_sum = 0; int h_count = 0;
 	for(int ci = 0; ci < ofdm.Nsymb * ofdm.Nc; ci++)
@@ -2626,6 +2634,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 		skip_h_count = 0;
 		double mean_H = -1.0;
+		// Geometry-invariant timing-quality selector for this trial's lock (raw pilot
+		// phase coherence, [0,1]; -1 = not computed). Companion to mean_H for the
+		// thinned-pilot sub-peak discrimination below (see the SUBPEAK-REJECT gate).
+		double coh_C = -1.0;
 		bool skip_h_recovery_attempted = false;
 		int consecutive_skip_var = 0;  // Phase-F stall fix: break trial loop if N+ SKIP-VAR in a row
 		// v2 OFDM sub-peak recovery (additive to the v1 reject at ~line 2310-2331).
@@ -2707,6 +2719,27 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		static const double subpeak_rescue_floor = []{
 			const char* e = std::getenv("MERCURY_SUBPEAK_RESCUE_FLOOR");
 			return (e && *e) ? atof(e) : 0.74;  // good-timing mean|H| floor (comment near the mean_H_threshold gate)
+		}();
+		// GEOMETRY-INVARIANT sub-peak discriminator (pilot phase coherence C, [0,1]).
+		// mean|H| is an ABSOLUTE magnitude: a wrong lock's |H| collapse DEEPENS with
+		// pilot count, so the thinned cfg16 grid (Dy=5) leaves a wrong lock reading
+		// mean|H|~0.77 — above BOTH the 0.5 sub-peak-entry gate and the 0.74 rescue
+		// floor — which silently DISABLES this rescue for the exact cfg16 post-
+		// turnaround frame it exists for. C = |Sum H_p|/Sum|H_p| is count-normalized,
+		// so a decorrelated wrong lock reads C~0.1 at ANY density while a good lock
+		// reads C~1. Applied ONLY where the thin geometry is baked (cfg16/32-QAM);
+		// every other rung keeps its proven dense-pilot mean|H| gates untouched. When
+		// lower rungs are later thinned, extend the scope alongside that change.
+		// Thresholds are env-overridable for A/B; defaults measured on the noiseless
+		// cfg16 selector self-test at BOTH Dy=3 and Dy=5 (--test-subpeak-rescue):
+		// wrong C ~0.02-0.10, true C ~0.99, so 0.35/0.50 separate with wide margin.
+		static const double subpeak_coh_entry = []{
+			const char* e = std::getenv("MERCURY_SUBPEAK_COH_ENTRY");
+			return (e && *e) ? atof(e) : 0.35;  // below this C => flag a thin-grid wrong lock as sub-peak
+		}();
+		static const double subpeak_coh_accept = []{
+			const char* e = std::getenv("MERCURY_SUBPEAK_COH_ACCEPT");
+			return (e && *e) ? atof(e) : 0.50;  // at/above this C => trust a thin-grid recovered onset
 		}();
 		bool xcorr_rescue_attempted = false;  // one rescue per receive_byte (persists across trials)
 skip_h_retry_point:
@@ -3390,6 +3423,11 @@ skip_h_retry_point:
 					}
 					if(h_count > 0) mean_H = h_sum / h_count;
 				}
+				// Geometry-invariant timing-quality selector for this lock: the RAW
+				// pilot phase coherence the estimator just captured (pre-smoothing).
+				// Used by the thinned-pilot sub-peak gate below where mean|H| loses
+				// its wrong-lock margin (see the SUBPEAK-REJECT block).
+				coh_C = ofdm.last_pilot_coherence;
 				// Test-observability: expose the per-trial mean(|H|) the SKIP-H
 				// gate keys on. Write-once-per-trial, read by unit tests only
 				// (ofdm-fine-timing-magnitude.md §3.5). No control-flow effect.
@@ -3444,7 +3482,16 @@ skip_h_retry_point:
 				// preamble. Counts toward skip_h_count so the existing
 				// SKIP-H recovery (line ~2622) scans forward after the
 				// budget is spent.
-				if(receive_stats.coarse_metric >= 0.97 && mean_H < 0.5)
+				// THINNED-PILOT ADDENDUM: on the baked thin cfg16 grid a wrong lock's
+				// mean|H| no longer collapses below 0.5 (it reads ~0.77), so the
+				// mean|H|<0.5 fingerprint MISSES it and the rescue never fires. The
+				// geometry-invariant coherence C DOES collapse (~0.1), so add "C below
+				// entry" as an ALTERNATIVE sub-peak trigger, scoped to the config whose
+				// grid was thinned so no other rung's behavior changes. This only ever
+				// flags MORE candidates as sub-peaks; a genuine lock (C~1) never trips it.
+				bool thin_pilot_cfg = (current_configuration == CONFIG_16 && M == MOD_32QAM);
+				bool coh_flags_subpeak = thin_pilot_cfg && coh_C >= 0.0 && coh_C < subpeak_coh_entry;
+				if(receive_stats.coarse_metric >= 0.97 && (mean_H < 0.5 || coh_flags_subpeak))
 				{
 					// F0-RINGDUMP (capture-replay fixture): at the SUBPEAK-REJECT trigger dump the
 					// raw passband ring + wrong-lock metadata for --test-frame0-replay. Faithful by
@@ -3498,25 +3545,35 @@ skip_h_retry_point:
 						if(fabs(freq_offset_measured) > ofdm.freq_offset_ignore_limit)
 							rescue_eff_cf -= freq_offset_measured;
 						double best_mH = mean_H; int best_delay = orig_delay;
+						double best_C = coh_C;  // coherence at the winning delay (geometry-invariant accept)
 						int step = sym_full / 4; if(step < 1) step = 1;
 						for(int off = -2*sym_full; off <= 2*sym_full; off += step)
 						{
 							int cand = orig_delay + off;
 							if(cand < 0 || cand > max_delay_x) continue;
-							double mH = ofdm_meanH_at_delay(data, cand, rescue_eff_cf, rx_eff_preamble);
-							if(mH > best_mH) { best_mH = mH; best_delay = cand; }
+							double candC = -1.0;
+							double mH = ofdm_meanH_at_delay(data, cand, rescue_eff_cf, rx_eff_preamble, &candC);
+							if(mH > best_mH) { best_mH = mH; best_delay = cand; best_C = candC; }
 						}
-						if(best_mH >= subpeak_rescue_floor && best_delay != orig_delay)
+						// Accept the refined onset if EITHER the proven dense-grid mean|H|
+						// floor is cleared OR (on the thinned cfg16 grid) the geometry-
+						// invariant coherence at the recovered delay is high. The recovered
+						// true onset reads mean|H|~1.0 on both grids, so this OR only adds a
+						// coherence backstop for a noise-depressed thin-grid onset; it never
+						// loosens the dense path.
+						bool accept_mH  = (best_mH >= subpeak_rescue_floor);
+						bool accept_coh = thin_pilot_cfg && best_C >= 0.0 && best_C >= subpeak_coh_accept;
+						if((accept_mH || accept_coh) && best_delay != orig_delay)
 						{
-							printf("[XCORR-RESCUE-OK] trial %d old=%d new=%d meanH %.3f->%.3f delta_sym=%.2f floor=%.2f\n",
-								receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH,
-								(double)(best_delay - orig_delay) / (double)sym_full, subpeak_rescue_floor);
+							printf("[XCORR-RESCUE-OK] trial %d old=%d new=%d meanH %.3f->%.3f C %.3f->%.3f delta_sym=%.2f floor=%.2f cohacc=%.2f\n",
+								receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, coh_C, best_C,
+								(double)(best_delay - orig_delay) / (double)sym_full, subpeak_rescue_floor, subpeak_coh_accept);
 							fflush(stdout);
 							receive_stats.delay = best_delay;
 							goto ofdm_subpeak_retry_point;  // ONE re-decode at the refined delay
 						}
-						printf("[XCORR-RESCUE-FAIL] trial %d old=%d best=%d meanH %.3f->%.3f (below floor %.2f)\n",
-							receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, subpeak_rescue_floor);
+						printf("[XCORR-RESCUE-FAIL] trial %d old=%d best=%d meanH %.3f->%.3f C %.3f->%.3f (below floor %.2f cohacc %.2f)\n",
+							receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, coh_C, best_C, subpeak_rescue_floor, subpeak_coh_accept);
 						fflush(stdout);
 						receive_stats.delay = orig_delay;  // restore; fall through to the reject
 					}
@@ -6382,6 +6439,27 @@ void cl_telecom_system::init()
 	// exceeds N=1600 refuses startup instead of reaching the mapper with nVirt<0.
 	int pilot_override_target = pilot_override_target_config();
 	bool pilot_override_applied = false;
+
+	// ---- BAKED WIRE LEVER (pilot-thin, cfg16 default-ON) ----
+	// The pilot-thin geometry (Dy=5, Nsymb=8) that carried cfg16 to VARA-wire
+	// parity is now the STATIC cfg16 grid, not an opt-in knob. Pilot geometry is a
+	// wire change, so a unilateral per-peer SNR gate would desync the two ends;
+	// baking it into cfg16's fixed geometry gives both peers the same lattice for
+	// free, and cfg16 is only elected at high SNR, so the change is inherently
+	// SNR-gated. Scoped to the LITERAL CONFIG_16 (not the env-repointable
+	// pilot_override_target) so re-pointing MERCURY_PILOT_TARGET_CFG can not move
+	// this baked default onto another rung. Setting pilot_override_applied=true
+	// routes the baked grid through the PILOT-GUARD below. Applied BEFORE the env
+	// block so an A/B control (MERCURY_PILOT_DY=3 MERCURY_PILOT_NSYMB=9) still wins
+	// and reconstructs the stock dense grid. cfg16-ONLY; lower-rung propagation is
+	// a later phase.
+	if(current_configuration==CONFIG_16 && M==MOD_32QAM)
+	{
+		ofdm.pilot_configurator.Dy=5;
+		ofdm.Nsymb=8;
+		pilot_override_applied=true;
+	}
+
 	if(current_configuration==pilot_override_target)
 	{
 		const char* _pdy = std::getenv("MERCURY_PILOT_DY");
