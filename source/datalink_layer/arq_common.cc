@@ -864,11 +864,12 @@ cl_arq_controller::cl_arq_controller()
 		connect_fuse_seed_rx = CONFIG_NONE;
 		// CONNECT-FAST-CONFIG (connect-fast-config-fallback design): env-latch the fast
 		// connect config + short budget ONCE here (production path) exactly like the DUTY
-		// knobs above. Default OFF: connect_fast_config = CONFIG_NONE -> today's ROBUST_0
-		// connect handshake, byte-identical. MERCURY_CONNECT_FAST_CONFIG=0 escalates the
-		// handshake to CONFIG_0; MERCURY_CONNECT_FAST_BUDGET_MS overrides the ~8 s budget.
+		// knobs above. Default ON: connect_fast_config = CONFIG_0 -> the connect handshake
+		// escalates to CONFIG_0 with a budgeted revert to the ROBUST_0 handshake on a weak
+		// channel. MERCURY_CONNECT_FAST_CONFIG overrides the config (=-1 / CONFIG_NONE restores
+		// the byte-identical ROBUST_0 connect); MERCURY_CONNECT_FAST_BUDGET_MS overrides the budget.
 		const char* cfc = std::getenv("MERCURY_CONNECT_FAST_CONFIG");
-		connect_fast_config = (cfc && *cfc) ? atoi(cfc) : CONFIG_NONE;
+		connect_fast_config = (cfc && *cfc) ? atoi(cfc) : CONFIG_0;
 		// Default 15 s: the measured CONFIG_0 CONNECTING phase (HAIL -> START_CONNECTION_ACK /
 		// CONNECTION_ACCEPTED) is ~8.1 s on WB real-audio (START_CONNECTION airtime + RSP
 		// turnaround + the re-emit-gap tail), so the budget must clear ~8 s with margin for
