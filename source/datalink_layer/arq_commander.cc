@@ -52,6 +52,19 @@ static inline bool sack_rx_trace_enabled()
 	return cached != 0;
 }
 
+// Duty-time diagnostic trace: OFF unless MERCURY_DUTY_TRACE=1 in the environment. Inert on the
+// production path (a single cached getenv, no output when disabled).
+static bool duty_trace_enabled()
+{
+	static int v = -1;
+	if(v < 0)
+	{
+		const char* e = std::getenv("MERCURY_DUTY_TRACE");
+		v = (e && e[0] == '1') ? 1 : 0;
+	}
+	return v != 0;
+}
+
 // M6 — BREAK-path lossless requeue (data-flow-arq-recovery-cluster.md §5.6).
 // The Anchor-rung emergency BREAK (~:4071-4177) calls send_break_pattern() and
 // returns WITHOUT rolling cmd_batch_seq_id back to the stranded in-flight batch
@@ -2051,6 +2064,16 @@ int cl_arq_controller::add_message_control(char code)
 		}
 
 		success=SUCCESSFUL;
+		if(code == SET_CONFIG && duty_trace_enabled())
+		{
+			printf("[DUTY-TRACE] set-config-enqueue turboshift_active=%d turboshift_phase=%d "
+				"break_recovery_phase=%d data_ack_received=%d snr_uplink=%.1f "
+				"current=%d negotiated=%d\n",
+				(int)turboshift_active, (int)turboshift_phase, break_recovery_phase,
+				data_ack_received, measurements.SNR_uplink, current_configuration,
+				negotiated_configuration);
+			fflush(stdout);
+		}
 		this->connection_status=TRANSMITTING_CONTROL;
 	}
 	return success;
@@ -6692,6 +6715,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		}
 		else
 		{
+			if(duty_trace_enabled())
+			{
+				printf("[DUTY-TRACE] data-batch-done turboshift_active=%d turboshift_phase=%d "
+					"break_recovery_phase=%d data_ack_received=%d snr_uplink=%.1f "
+					"current=%d negotiated=%d\n",
+					(int)turboshift_active, (int)turboshift_phase, break_recovery_phase,
+					data_ack_received, measurements.SNR_uplink, current_configuration,
+					negotiated_configuration);
+				fflush(stdout);
+			}
 			// data_ack_received==YES (clean OR partial). emergency_nack_count tracks
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
@@ -8037,6 +8070,17 @@ void cl_arq_controller::process_control_commander()
 				connection_attempt_timer.stop();
 				connection_attempt_timer.reset();
 
+				int connect_fuse_floor_config = current_configuration;
+				if(duty_trace_enabled())
+				{
+					printf("[DUTY-TRACE] fusion-apply turboshift_active=%d turboshift_phase=%d "
+						"break_recovery_phase=%d data_ack_received=%d snr_uplink=%.1f "
+						"current=%d negotiated=%d\n",
+						(int)turboshift_active, (int)turboshift_phase, break_recovery_phase,
+						data_ack_received, measurements.SNR_uplink, current_configuration,
+						negotiated_configuration);
+					fflush(stdout);
+				}
 				if(connect_fast_active)
 				{
 					robust_enabled = connect_fast_fallback_robust;
@@ -8044,6 +8088,8 @@ void cl_arq_controller::process_control_commander()
 					data_configuration = connect_fast_fallback_config;
 					ack_configuration  = connect_fast_fallback_config;
 					last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+					if(robust_enabled == YES && is_robust_config(init_configuration))
+						connect_fuse_floor_config = init_configuration;
 					connect_fast_active = false;
 					connect_fast_timer.stop();
 					connect_fast_timer.reset();
@@ -8071,7 +8117,8 @@ void cl_arq_controller::process_control_commander()
 					if(connect_fuse_active() && messages_control.status != FREE &&
 					   messages_control.data[0] == SWITCH_BANDWIDTH)
 					{
-						int fs = connect_fuse_seed_select(connect_seed_target());
+						int fs = connect_fuse_seed_select(connect_seed_target(),
+							connect_fuse_floor_config);
 						// Always occupy data[2] on the FIX path so the RSP never reads a stale byte: a valid
 						// config = the fused seed; 0xFF = no seed (fall back to the two-frame cross). length=3
 						// matches SET_CONFIG so data[2] is buffer-delivered to the RSP (its length field is not).
@@ -8947,6 +8994,31 @@ void cl_arq_controller::process_control_commander()
 								finish_turbo_direction();
 								return;
 							}
+						}
+						// Retrigger clamp livelock guard: the clamp chain above can lower the target to at or below the
+						// current config. Emitting SET_CONFIG then re-announces the config we are already on -- the responder
+						// ACKs it, we re-enter here, and no DATA batch is ever dispatched (a turnaround livelock). When the
+						// target is not a genuine climb, settle straight to DATA at the current config instead of emitting a
+						// no-op control frame. Mirror the CFG16-HOLD terminal state, but do NOT pin the proven ceiling
+						// (nothing was proven) and do NOT call finish_turbo_direction() (it would cap the ceiling at
+						// start_config and block a later legitimate climb).
+						if(config_ladder_index(negotiated_configuration) <= config_ladder_index(current_configuration))
+						{
+							printf("[TURBO] Retrigger clamp: target %d <= current %d -- suppressing no-op SET_CONFIG, "
+								"settling to DATA at config %d\n",
+								negotiated_configuration, current_configuration, current_configuration);
+							fflush(stdout);
+							turboshift_active = false;
+							turbo_supershift_announce_pending = false;
+							turbo_snr_ack_enabled = false;
+							turbo_received_snr = -99.0f;
+							turboshift_phase = TURBO_DONE;
+							turboshift_last_good = current_configuration;
+							negotiated_configuration = current_configuration;
+							data_configuration = current_configuration;
+							reverse_configuration = current_configuration;
+							this->connection_status = TRANSMITTING_DATA;
+							return;
 						}
 						fflush(stdout);
 						cleanup();
@@ -12859,8 +12931,22 @@ int cl_arq_controller::test_connect_fuse()
 	};
 	int saved_cfg  = current_configuration;
 	int saved_ceil = supershift_proven_ceiling;
+	int saved_init = init_configuration;
+	int saved_rob  = robust_enabled;
 	bool saved_fd  = connect_fuse_defeat;
 	bool saved_rd  = duty_r_defeat;
+	auto saved_connection_status = connection_status;
+	auto saved_turboshift_phase = turboshift_phase;
+	bool saved_turboshift_active = turboshift_active;
+	bool saved_announce_pending = turbo_supershift_announce_pending;
+	bool saved_snr_ack_enabled = turbo_snr_ack_enabled;
+	float saved_turbo_received_snr = turbo_received_snr;
+	int saved_turboshift_last_good = turboshift_last_good;
+	int saved_negotiated = negotiated_configuration;
+	int saved_data_config = data_configuration;
+	int saved_reverse_config = reverse_configuration;
+	auto saved_control_status = messages_control.status;
+	char saved_control_code = messages_control.data != NULL ? messages_control.data[0] : 0;
 
 	// FAIL-BEFORE: fusion defeated at the robust floor -> NO seed carried (two-frame cross)
 	connect_fuse_defeat = true;  duty_r_defeat = false;
@@ -12886,10 +12972,81 @@ int cl_arq_controller::test_connect_fuse()
 	int g2 = connect_fuse_seed_select(CONFIG_NONE);
 	check(g2 == CONFIG_NONE, "GUARD already-OFDM (CONFIG_0) -> nothing to fuse", g2, CONFIG_NONE);
 
+	// REGRESSION: connect-fast leaves the live PHY at CONFIG_0 after restoring the
+	// robust session floor. Fusion must evaluate R against that restored floor.
+	connect_fuse_defeat = false;  duty_r_defeat = false;
+	current_configuration = CONFIG_0;  supershift_proven_ceiling = -1;
+	robust_enabled = YES;  init_configuration = ROBUST_0;
+	int cf = connect_fuse_seed_select(CONFIG_NONE, init_configuration);
+	check(cf == CONFIG_0, "connect-fast live CONFIG_0 + restored ROBUST_0 floor -> carry CONFIG_0", cf, CONFIG_0);
+
+	int retrigger_failed = 0;
+	auto retrigger_check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-RETRIGGER-CLAMP] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else
+		{
+			printf("[TEST-RETRIGGER-CLAMP] FAIL: %s (got=%d want=%d)\n", name, got, want);
+			retrigger_failed++;
+			failed++;
+		}
+		fflush(stdout);
+	};
+	current_configuration = CONFIG_13;
+	negotiated_configuration = CONFIG_13;
+	turboshift_active = true;
+	turboshift_phase = TURBO_FORWARD;
+	messages_control.status = FREE;
+	int clamp_ceiling = supershift_proven_ceiling;
+	bool clamp_settles =
+		config_ladder_index(negotiated_configuration) <= config_ladder_index(current_configuration);
+	retrigger_check(clamp_settles, "at-or-below target triggers settle", clamp_settles ? 1 : 0, 1);
+	if(clamp_settles)
+	{
+		turboshift_active = false;
+		turbo_supershift_announce_pending = false;
+		turbo_snr_ack_enabled = false;
+		turbo_received_snr = -99.0f;
+		turboshift_phase = TURBO_DONE;
+		turboshift_last_good = current_configuration;
+		negotiated_configuration = current_configuration;
+		data_configuration = current_configuration;
+		reverse_configuration = current_configuration;
+		connection_status = TRANSMITTING_DATA;
+	}
+	retrigger_check(connection_status == TRANSMITTING_DATA,
+		"settle enters TRANSMITTING_DATA", (int)connection_status, TRANSMITTING_DATA);
+	retrigger_check(turboshift_phase == TURBO_DONE,
+		"settle marks turbo done", (int)turboshift_phase, TURBO_DONE);
+	retrigger_check(!turboshift_active,
+		"settle clears turboshift_active", turboshift_active ? 1 : 0, 0);
+	retrigger_check(supershift_proven_ceiling == clamp_ceiling,
+		"settle does not pin proven ceiling", supershift_proven_ceiling, clamp_ceiling);
+	bool no_set_config = messages_control.status == FREE
+		|| messages_control.data == NULL || messages_control.data[0] != SET_CONFIG;
+	retrigger_check(no_set_config, "settle enqueues no SET_CONFIG", no_set_config ? 1 : 0, 1);
+	printf("[TEST-RETRIGGER-CLAMP] %s (%d failures)\n",
+		retrigger_failed == 0 ? "ALL PASS" : "FAILURES PRESENT", retrigger_failed);
+	fflush(stdout);
+
 	current_configuration     = saved_cfg;
 	supershift_proven_ceiling = saved_ceil;
+	init_configuration        = saved_init;
+	robust_enabled             = saved_rob;
 	connect_fuse_defeat       = saved_fd;
 	duty_r_defeat             = saved_rd;
+	connection_status = saved_connection_status;
+	turboshift_phase = saved_turboshift_phase;
+	turboshift_active = saved_turboshift_active;
+	turbo_supershift_announce_pending = saved_announce_pending;
+	turbo_snr_ack_enabled = saved_snr_ack_enabled;
+	turbo_received_snr = saved_turbo_received_snr;
+	turboshift_last_good = saved_turboshift_last_good;
+	negotiated_configuration = saved_negotiated;
+	data_configuration = saved_data_config;
+	reverse_configuration = saved_reverse_config;
+	messages_control.status = saved_control_status;
+	if(messages_control.data != NULL)
+		messages_control.data[0] = saved_control_code;
 	printf("[TEST-CONNECT-FUSE] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

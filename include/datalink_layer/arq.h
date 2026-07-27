@@ -5818,17 +5818,23 @@ public:
   // Pure: production (the WB-upgrade queue) and the directed test drive the SAME logic.
   bool connect_fuse_active() const { return !connect_fuse_defeat; }
   int connect_fuse_seed_select(int connect_seed) const {
+    return connect_fuse_seed_select(connect_seed, current_configuration);
+  }
+  int connect_fuse_seed_select(int connect_seed, int effective_floor_config) const {
     if(!connect_fuse_active()) return CONFIG_NONE;
     int fs = connect_seed;
-    int rce = robust_connect_exit_target();
+    int rce = robust_connect_exit_target(effective_floor_config);
     if(rce != CONFIG_NONE &&
        (fs == CONFIG_NONE || config_ladder_index(rce) > config_ladder_index(fs)))
       fs = rce;
     return fs;
   }
   int robust_connect_exit_target() const {
+    return robust_connect_exit_target(current_configuration);
+  }
+  int robust_connect_exit_target(int effective_floor_config) const {
     if(duty_r_defeat) return CONFIG_NONE;
-    if(!is_robust_config(current_configuration)) return CONFIG_NONE;
+    if(!is_robust_config(effective_floor_config)) return CONFIG_NONE;
     if(supershift_proven_ceiling >= 0 &&
        config_ladder_index(supershift_proven_ceiling) < config_ladder_index(CONFIG_0))
       return CONFIG_NONE;
