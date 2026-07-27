@@ -21,6 +21,7 @@
  */
 
 #include "physical_layer/telecom_system.h"
+#include <cstring>
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
@@ -38,6 +39,7 @@
 #include <cassert> // fact-doc §13: deterministic bounds assert on the big-block TX/RX write
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
+#include "physical_layer/pocketfft_hdronly.h" // MFSK-WATT: analytic-signal FFT for the time-domain Watterson fade
 #endif
 #if defined(_WIN32)
 #include <windows.h>
@@ -504,6 +506,92 @@ double cl_telecom_system::skip_var_nv_ceiling(int configuration)
 	}
 }
 
+// ===================== MFSK/OFDM parametric-search: TIME-DOMAIN Watterson fade =====================
+// Shared Gaussian-Doppler scatter-tap generator EXTRACTED from the frequency-domain
+// sfo_grid Watterson (this file, chan_sel==3) so the passband BER harness and the grid
+// test share one faithful tap synth. The 128-tap DC-gain-1 adjusted-Gaussian FIR
+// ("IONOS 128 Tap Adj Gauss LPF Rev2", 64 Hz design update) is driven by white complex-
+// Gaussian innovations and zero-order-held between updates (new innovation every
+// round(Fs/(64*fd)) physical samples) -> a unit-average-power complex scatter process
+// with a Gaussian Doppler spectrum. Env-gated; NEVER on a production path
+// (MERCURY_MFSK_WATT unset => the caller block is skipped, passband byte-identical).
+namespace mfsk_watt {
+static const double GAUS_FIR[128] = {
+    1.1755592671332046e-11, 2.0188004956137427e-10, 1.7236333623946176e-09, 9.815423109243151e-09,
+    4.219820040519088e-08, 1.4693429486234634e-07, 4.338503956649552e-07, 1.122118806000393e-06,
+    2.604091536729611e-06, 5.522713327023963e-06, 1.0857390465642334e-05, 2.0011412649247494e-05,
+    3.4893068706162795e-05, 5.7982477259392286e-05, 9.237678934582388e-05, 0.00014180767284007714,
+    0.00021062669000635658, 0.0003037561533907518, 0.0004266051229102419, 0.000584952237938201,
+    0.0007847989367901134, 0.001032198204838678, 0.001333065243166745, 0.001692977321877409,
+    0.002116970561258896, 0.002609341477645015, 0.003173460865247882, 0.00381160700116864,
+    0.004524824309342139, 0.005312812558055807, 0.006173850455688009, 0.007104756211217515,
+    0.008100886298035966, 0.00915617235512072, 0.010263194925878348, 0.01141329161173599,
+    0.012596696236577472, 0.013802704802828978, 0.015019863385625786, 0.016236172665450826,
+    0.01743930354214716, 0.01861681819809535, 0.019756391073966928, 0.020846024470695095,
+    0.021874253876569306, 0.02283033861665188, 0.023704434009553566, 0.02448774186995001,
+    0.02517263689027796, 0.025752767148979578, 0.026223127704178725, 0.026580106921515002,
+    0.02682150583616039, 0.026946531447567135, 0.026955765379786157, 0.02685110980161695,
+    0.026635712883536795, 0.026313876369100774, 0.025890948056565766, 0.025373202123371387,
+    0.024767710285281262, 0.024082206768594926, 0.02332494999439922, 0.022504583735910823,
+    0.02163000032189053, 0.020710208229666707, 0.019754206149457228, 0.018770865316331563,
+    0.01776882160593159, 0.016756378583127243, 0.01574142238665159, 0.01473134903422507,
+    0.013733004447687326, 0.012752637231260112, 0.011795863992392318, 0.010867646776884902,
+    0.009972282000446704, 0.009113400098909145, 0.008293974989634013, 0.007516342337046732,
+    0.006782225544921226, 0.006092768355660706, 0.005448572920512081, 0.004849742212182516,
+    0.004295925680163602, 0.003786367096475506, 0.003319953602663025, 0.002895265044807468,
+    0.002510622769190125, 0.002164137144270543, 0.0018537531721837, 0.001577293652557479,
+    0.001332499460868328, 0.001117066600796574, 0.0009286797833839573, 0.0007650423737761393,
+    0.0006239026277671727, 0.0005030762143350815, 0.0004004650862100223, 0.0003140728178353742,
+    0.00024201657867910556, 0.00018253594974316996, 0.00013399882249807025, 9.49046426887381e-05,
+    6.388527699708468e-05, 3.970378899074398e-05, 2.1251412801076355e-05, 7.5430092767428655e-06,
+    -2.2887192936932196e-06, -8.999992637884094e-06, -1.3243447148502327e-05, -1.557613368708468e-05,
+    -1.6467811426850445e-05, -1.63093528492861e-05, -1.5421097939455242e-05, -1.4061018704922785e-05,
+    -1.243257788819571e-05, -1.0692187735418308e-05, -8.956195575428226e-06, -7.3073424710351094e-06,
+    -5.8006591112396305e-06, -4.468779263172823e-06, -3.3266653970160216e-06, -2.3757534892377295e-06,
+    -1.6075344987453848e-06, -1.0065986371058506e-06, -5.531753923550552e-07, -2.252074190014706e-07
+};
+struct cl_doppler_scatter {
+    cl_sim_xoshiro rng;
+    double fir_i[128]; double fir_q[128];
+    int fir_head; double inno_std;
+    long long update_samples; long long update_pos;
+    std::complex<double> hold;
+    cl_doppler_scatter(uint64_t seed, double fd, double Fs) : rng(seed) {
+        for(int k=0;k<128;k++){ fir_i[k]=0.0; fir_q[k]=0.0; }
+        fir_head=0; update_pos=0; hold=std::complex<double>(0.0,0.0);
+        double sumsq=0.0; for(int k=0;k<128;k++) sumsq+=GAUS_FIR[k]*GAUS_FIR[k];
+        inno_std = std::sqrt(0.5/sumsq);
+        double ue = Fs/(64.0*fd); double uf=std::floor(ue);
+        update_samples=(long long)uf; double fr=ue-uf;
+        if(fr>0.5 || (fr==0.5 && (update_samples&1LL))) update_samples++;
+        if(update_samples<1) update_samples=1;
+        for(int k=0;k<128;k++) push();
+        hold = output();
+    }
+    void push(){ fir_head=(fir_head+127)&127; fir_i[fir_head]=rng.gauss()*inno_std; fir_q[fir_head]=rng.gauss()*inno_std; }
+    std::complex<double> output(){ double gi=0.0,gq=0.0; for(int k=0;k<128;k++){int idx=(fir_head+k)&127; gi+=GAUS_FIR[k]*fir_i[idx]; gq+=GAUS_FIR[k]*fir_q[idx];} return std::complex<double>(gi,gq); }
+    std::complex<double> current() const { return hold; }
+    void advance(long long nsamp){ long long left=nsamp; while(left>0){ long long span=update_samples-update_pos; long long take=(span<left)?span:left; update_pos+=take; left-=take; if(update_pos>=update_samples){ update_pos=0; push(); hold=output(); } } }
+};
+// Analytic (Hilbert) signal of a real passband frame via FFT: X=FFT(x); zero the
+// negative-frequency half, double the positive; xa=IFFT(X). Re{xa}==x (to fp error).
+static void analytic_signal(const double* x, std::complex<double>* xa, int N){
+    if(N<=0) return;
+    std::vector<std::complex<double>> X((size_t)N);
+    for(int n=0;n<N;n++) X[(size_t)n]=std::complex<double>(x[n],0.0);
+    pocketfft::shape_t shape{(size_t)N};
+    pocketfft::stride_t stride{(ptrdiff_t)sizeof(std::complex<double>)};
+    pocketfft::shape_t axes{0};
+    pocketfft::c2c(shape,stride,stride,axes,true,X.data(),X.data(),1.0);
+    int half=N/2;
+    for(int k=1;k<half;k++) X[(size_t)k]*=2.0;
+    for(int k=half+1;k<N;k++) X[(size_t)k]=std::complex<double>(0.0,0.0);
+    if((N&1)!=0) X[(size_t)half]*=2.0; // odd N: top positive bin doubled (no Nyquist)
+    pocketfft::c2c(shape,stride,stride,axes,false,X.data(),X.data(),1.0/(double)N);
+    for(int n=0;n<N;n++) xa[n]=X[(size_t)n];
+}
+} // namespace mfsk_watt
+
 cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 {
 	cl_error_rate lerror_rate;
@@ -547,6 +635,55 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 	// SNR-penalty driver the equalizer normalization hides.
 	double psum[512]={0}; long pcnt[512]={0};
 
+	// MFSK parametric-search: uncoded (pre-LDPC) symbol-error accumulation vs the
+	// Proakis noncoherent orthogonal M-FSK curve. Additive/env-gated; production
+	// unset => byte-identical. Captures cl_mfsk's ML argmax symbol decision.
+	const char* _munc = std::getenv("MERCURY_MFSK_UNCODED");
+	bool mfsk_uncoded = (_munc && atoi(_munc)!=0 && M==MOD_MFSK);
+	long long mfsk_sym_err=0, mfsk_sym_tot=0;
+	if(mfsk_uncoded) mfsk.dbg_capture=true;
+
+	// MFSK/OFDM parametric-search: TIME-DOMAIN Watterson fade (2-path Gaussian-Doppler)
+	// applied to the passband BEFORE AWGN. Env-gated: MERCURY_MFSK_WATT=1 arms it;
+	// production unset => the per-frame block below is skipped and passband stays
+	// byte-identical (AWGN control == HEAD). y[n]=Re{ g0*xa[n] + g1(n)*xa[n-D] }, xa the
+	// analytic signal, g0 the fixed LOS ray, g1 the faded scatter tap. Channel is unit-
+	// average-power (g0^2+E|g1|^2==1) so the AWGN Es/N0 axis is the AVERAGE received SNR
+	// over fade-independent frames (each frame a fresh realization seeded base^frame).
+	auto _env_wf=[](const char* k,double d){const char* e=std::getenv(k); return (e&&*e)?atof(e):d;};
+	const char* _we = std::getenv("MERCURY_MFSK_WATT");
+	bool watt_on = (_we && atoi(_we)!=0);
+	double watt_fd    = _env_wf("MERCURY_MFSK_WATT_FD_HZ",    0.5);
+	double watt_sprms = _env_wf("MERCURY_MFSK_WATT_SPREAD_MS",1.0);
+	double watt_depth = _env_wf("MERCURY_MFSK_WATT_DEPTH_DB", 10.0);
+	uint64_t watt_seed = (uint64_t)_env_wf("MERCURY_MFSK_WATT_SEED", 12345.0);
+	int watt_D = (int)llround(watt_sprms*1e-3*(double)sampling_frequency);
+	if(watt_D<1) watt_D=1;
+	double watt_a = 1.0 - std::pow(10.0, -watt_depth/20.0);
+	if(watt_a<0.0) watt_a=0.0; if(watt_a>0.99) watt_a=0.99;
+	double watt_g0 = 1.0/std::sqrt(1.0+watt_a*watt_a);
+	double watt_g1 = watt_a/std::sqrt(1.0+watt_a*watt_a);
+	if(watt_on && watt_fd<=0.0) watt_on=false; // fd<=0 => no fade (pure AWGN control)
+	long long watt_frame=0;
+	std::vector<std::complex<double>> watt_xa;
+
+	// ===== MFSK non-coherent ACQUISITION probe (effect #1). Env-gated MERCURY_MFSK_ACQ=1.
+	const char* _macq = std::getenv("MERCURY_MFSK_ACQ");
+	bool mfsk_acq = (_macq && atoi(_macq)!=0 && M==MOD_MFSK);
+	const char* _macqn = std::getenv("MERCURY_MFSK_ACQ_NOISEONLY");
+	bool mfsk_acq_noiseonly = (_macqn && atoi(_macqn)!=0);
+	long acq_ok=0, acq_wrong=0, acq_tot=0;
+	long acq_hist[17]={0};
+	long acq_dhist[17]={0};   // returned-offset error in symbols, index=clamp(delta+8,0,16)
+	std::vector<double> acq_wire;
+	uint64_t acq_rng = 0x9E3779B97F4A7C15ULL ^ (uint64_t)llround((double)EsN0*1000.0)
+	                 ^ (uint64_t)(mfsk.M*131 + mfsk.nStreams*7 + (mfsk_acq_noiseonly?1:0));
+	auto acq_next = [&acq_rng]()->uint64_t{ acq_rng^=acq_rng<<13; acq_rng^=acq_rng>>7; acq_rng^=acq_rng<<17; return acq_rng; };
+	if(watt_on)
+		std::cout<<"[MFSK-WATT] on fd="<<watt_fd<<"Hz spread="<<watt_sprms<<"ms(D="<<watt_D
+		         <<") depth="<<watt_depth<<"dB a="<<watt_a<<" g0="<<watt_g0<<" g1rms="<<watt_g1
+		         <<" seed="<<watt_seed<<std::endl;
+
 	while(lerror_rate.Frames_total<max_frame_no)
 	{
 		for(int i=0;i<nReal_data-outer_code_reserved_bits;i++)
@@ -575,6 +712,67 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			sigma_calibrated = true;
 		}
 
+		if(mfsk_acq)
+		{
+			// Faithful ACQ instrument: reproduce the production RX front-end
+			// (telecom_system.cc:1554 passband_to_baseband + :1638 time_sync_mfsk_corr)
+			// on a frame placed at a RANDOM symbol offset inside a noise-padded
+			// receive-length buffer. AWGN over the whole buffer at the same
+			// signal-region-calibrated sigma as the BER sweep (SNR faithful).
+			int fi = frequency_interpolation_rate;
+			int symP = data_container.Nofdm * fi;
+			int frameSym = data_container.Nsymb + data_container.preamble_nSymb;
+			int frameLen = frameSym * symP;
+			int bns = data_container.buffer_Nsymb.load();
+			if(bns < frameSym + 4) bns = frameSym + 4;
+			int wireLen = bns * symP;
+			if((int)acq_wire.size() < wireLen) acq_wire.assign((size_t)wireLen, 0.0);
+			else std::fill(acq_wire.begin(), acq_wire.begin()+wireLen, 0.0);
+			int maxStartSym = bns - frameSym - 2;
+			if(maxStartSym < 1) maxStartSym = 1;
+			int Rsym = 1 + (int)(acq_next() % (uint64_t)maxStartSym);
+			int Rsamp = Rsym * symP;
+			if(!mfsk_acq_noiseonly)
+				for(int i=0;i<frameLen && (Rsamp+i)<wireLen;i++)
+					acq_wire[(size_t)(Rsamp+i)] = data_container.passband_data[i];
+			float ampl_val = sigma / sqrtf(2.0f);
+			for(int i=0;i<wireLen;i++)
+				acq_wire[(size_t)i] += (double)(ampl_val * awgn_channel.awgn_value_generator());
+			ofdm.passband_to_baseband(acq_wire.data(), wireLen,
+				data_container.baseband_data_interpolated, sampling_frequency,
+				carrier_frequency, carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
+			double acq_m = 0.0;
+			int acq_delay = ofdm.time_sync_mfsk_corr(
+				data_container.baseband_data_interpolated, wireLen,
+				data_container.interpolation_rate, 0, &acq_m);
+			int tol = symP/2;
+			acq_tot++;
+			int mh = (int)(acq_m+0.5); if(mh<0)mh=0; if(mh>16)mh=16; acq_hist[mh]++;
+			if(acq_delay>=0)
+			{
+				long dsym = (long)llround((double)((long)acq_delay - (long)Rsamp)/(double)symP);
+				int di=(int)(dsym+8); if(di<0)di=0; if(di>16)di=16; acq_dhist[di]++;
+				if(mfsk_acq_noiseonly) acq_wrong++;
+				else if(std::llabs((long)acq_delay - (long)Rsamp) <= tol) acq_ok++;
+				else acq_wrong++;
+			}
+			if(acq_tot >= max_frame_no)
+			{
+				double snr3k_a = (double)EsN0 + 10.0*log10(bandwidth/3000.0);
+				printf("[MFSK-ACQ] mode=%s M=%d nStreams=%d preN=%d thr=%d esn0=%.3f snr3k=%.3f Pacq=%.4f (%ld/%ld) Pwrong=%.4f (%ld/%ld) tolSamp=%d hist=",
+					mfsk_acq_noiseonly?"NOISE":"SIG", mfsk.M, mfsk.nStreams,
+					mfsk.preamble_nSymb, mfsk.preamble_match_threshold, (double)EsN0, snr3k_a,
+					(double)acq_ok/(double)acq_tot, acq_ok, acq_tot,
+					(double)acq_wrong/(double)acq_tot, acq_wrong, acq_tot, tol);
+				for(int h=0;h<=16;h++) printf("%ld,", acq_hist[h]);
+				printf(" dhist=");
+				for(int h=0;h<=16;h++) printf("%ld,", acq_dhist[h]);
+				printf("\n"); fflush(stdout);
+				break;
+			}
+			continue;
+		}
+
 		// fix/cfg16-nv-restore: optional static 2-ray frequency-selective channel,
 		// applied to the TX passband BEFORE AWGN. Off by default (production BER
 		// unchanged). y[n] = x[n] + fsel_amp * x[n-fsel_delay]; iterate backward so
@@ -587,6 +785,24 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 			{
 				data_container.passband_data[n] += fsel_amp * data_container.passband_data[n - fsel_delay];
 			}
+		}
+
+		// TIME-DOMAIN Watterson fade (see [MFSK-WATT] setup). Fresh per-frame fade
+		// realization => fade-independent frames; averaged SNR held by unit-power channel.
+		if(watt_on)
+		{
+			int nSampW = (data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb)) * this->frequency_interpolation_rate;
+			if((int)watt_xa.size()<nSampW) watt_xa.resize((size_t)nSampW);
+			mfsk_watt::analytic_signal(data_container.passband_data, watt_xa.data(), nSampW);
+			mfsk_watt::cl_doppler_scatter scat(watt_seed ^ (uint64_t)(watt_frame*2654435761ULL + 2166136261ULL), watt_fd, (double)sampling_frequency);
+			for(int n=0;n<nSampW;n++)
+			{
+				std::complex<double> g1 = watt_g1 * scat.current();
+				std::complex<double> yd = (n>=watt_D) ? (g1*watt_xa[(size_t)(n-watt_D)]) : std::complex<double>(0.0,0.0);
+				data_container.passband_data[n] = (watt_g0*watt_xa[(size_t)n] + yd).real();
+				scat.advance(1);
+			}
+			watt_frame++;
 		}
 
 		awgn_channel.apply_with_delay(data_container.passband_data,data_container.passband_delayed_data,sigma,(data_container.Nofdm*(data_container.Nsymb+data_container.preamble_nSymb))*this->frequency_interpolation_rate,((data_container.preamble_nSymb+2)*data_container.Nofdm+delay)*frequency_interpolation_rate);
@@ -604,6 +820,15 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 		this->receive_byte(data_container.passband_delayed_data,data_container.hd_decoded_data_byte);
 		mfsk_fixed_delay = -1;
 		ofdm_forced_delay = -1;
+
+		if(mfsk_uncoded)
+		{
+			for(int _i=0; _i<mfsk.dbg_nsym && _i<cl_mfsk::DBG_MAX; _i++)
+			{
+				mfsk_sym_tot++;
+				if(mfsk.dbg_tx_tones[_i]!=mfsk.dbg_rx_tones[_i]) mfsk_sym_err++;
+			}
+		}
 
 		if(hdump_on && ofdm.Nc>0 && ofdm.Nc<=512 && ofdm.estimated_channel!=NULL)
 		{
@@ -666,6 +891,27 @@ cl_error_rate cl_telecom_system::passband_test_EsN0(float EsN0,int max_frame_no)
 		}
 		fflush(stdout);
 	}
+
+	// MFSK parametric-search readouts (env-gated: production BER output unchanged).
+	if((std::getenv("MERCURY_MFSK_FER") && M==MOD_MFSK) || mfsk_uncoded)
+	{
+		double R_s = (double)sampling_frequency/(double)frequency_interpolation_rate/(double)data_container.Nofdm;
+		double snr3k = EsN0 + 10.0*log10(bandwidth/3000.0);
+		printf("[MFSK-SEARCH] esn0_axis=%.3f (=SNR over BW=%.2fHz) snr3k=%.3f (denom=3000) R_s=%.3f baud FER=%.5f (%ld/%ld) BER=%.6f\n",
+			EsN0, bandwidth, snr3k, R_s, lerror_rate.FER,
+			(long)lerror_rate.Error_frames_total, (long)lerror_rate.Frames_total, lerror_rate.BER);
+		if(mfsk_uncoded && mfsk_sym_tot>0)
+		{
+			double Ps = (double)mfsk_sym_err/(double)mfsk_sym_tot;
+			double EsN0_sym = EsN0 + 10.0*log10(bandwidth/R_s);
+			int kbits = (mfsk.nBits>0)?mfsk.nBits:1;
+			double EbN0 = EsN0_sym - 10.0*log10((double)kbits);
+			printf("[MFSK-UNCODED] M=%d nStreams=%d k=%d Ps=%.6e (%lld/%lld) EsN0_sym=%.3f EbN0=%.3f (BW=%.2f R_s=%.3f)\n",
+				mfsk.M, mfsk.nStreams, kbits, Ps, (long long)mfsk_sym_err, (long long)mfsk_sym_tot, EsN0_sym, EbN0, bandwidth, R_s);
+		}
+		mfsk.dbg_capture=false;
+	}
+
 	return lerror_rate;
 }
 
@@ -1423,6 +1669,40 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.coarse_metric = 0.0;
 	receive_stats.mean_H = -1.0;
 	receive_stats.last_eff_preamble_nsymb = data_container.preamble_nSymb;  // LEVER P: FULL until a MINI tail frame is extracted
+
+	// NB M8 connect wrong-lock counter (env MERCURY_WRONGLOCK_STATS; production
+	// unset => this guard is inert => byte-identical). Runs at every receive_byte
+	// exit via RAII so it captures the FINAL decode outcome regardless of which
+	// return path is taken. Scoped to the NB M8 (single-stream) MFSK path — the
+	// LDPC-fallback carrier NB connect rides. A "fired" event = a lock position
+	// was returned (delay>=0) AND a decode was actually attempted (frame not
+	// deferred for more audio). "wrong" = fired but the frame did not decode.
+	struct _wronglock_acct {
+		cl_telecom_system* ts;
+		bool armed;
+		_wronglock_acct(cl_telecom_system* t) : ts(t) {
+			static const int en = [](){ const char* e = std::getenv("MERCURY_WRONGLOCK_STATS"); return (e && *e) ? atoi(e) : 0; }();
+			armed = (en != 0);
+		}
+		~_wronglock_acct() {
+			if (!armed) return;
+			if (ts->M != MOD_MFSK || ts->mfsk.M != 8 || ts->mfsk.nStreams != 1) return;
+			if (ts->mfsk_fixed_delay >= 0) return;                 // BER forced-delay: not a real acquisition
+			if (ts->receive_stats.delay < 0) return;               // no lock fired this call
+			if (ts->receive_stats.frame_overflow_symbols > 0 || ts->receive_stats.frame_data_missing)
+				return;                                            // frame deferred for more audio: no decode attempted
+			ts->mfsk8_acq_fired++;
+			bool decoded = (ts->receive_stats.message_decoded == YES);
+			if (!decoded) ts->mfsk8_acq_wronglock++;
+			printf("[WRONGLOCK] cfg=%d M=%d preN=%d thr=%d nomirror=%d fired=%lld wrong=%lld delay=%d decoded=%d\n",
+				ts->current_configuration, ts->mfsk.M, ts->mfsk.preamble_nSymb,
+				ts->mfsk.preamble_match_threshold,
+				(int)(std::getenv("MERCURY_MFSK_NOMIRROR") != NULL),
+				(long long)ts->mfsk8_acq_fired, (long long)ts->mfsk8_acq_wronglock,
+				(int)ts->receive_stats.delay, decoded ? 1 : 0);
+			fflush(stdout);
+		}
+	} _wla(this);
 
 	// Timing breakdown
 	double timing_pb_tsync_ms = 0, timing_pb_data_ms = 0, timing_ldpc_ms = 0;
@@ -11693,6 +11973,20 @@ void cl_telecom_system::load_configuration()
 	this->load_configuration(default_configurations_telecom_system.init_configuration);
 }
 
+// MFSK parametric-search sweep: env override of the MFSK alphabet (M) and stream
+// count for the ROBUST/MFSK configs, so the search can explore beyond
+// ROBUST_0/1/2 WITHOUT editing the fixed config table. Additive; production unset
+// => byte-identical. The frame geometry stays codeword-coupled because init()
+// recomputes ofdm.Nsymb = N_MAX / mfsk.bits_per_symbol() (telecom_system.cc:6461),
+// so nBits tracks the swept M/nStreams and the LDPC codeword still fits.
+static void mfsk_sweep_override_MN(int& M, int& nStreams)
+{
+	const char* _em = std::getenv("MERCURY_MFSK_SWEEP_M");
+	const char* _en = std::getenv("MERCURY_MFSK_SWEEP_NSTREAMS");
+	if(_em && *_em){ int _v = atoi(_em); if(_v >= 2 && _v <= 64) M = _v; }
+	if(_en && *_en){ int _v = atoi(_en); if(_v >= 1 && _v <= 4) nStreams = _v; }
+}
+
 void cl_telecom_system::load_configuration(int configuration)
 {
 	if(configuration==current_configuration)
@@ -11910,6 +12204,15 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
 
+	// MFSK parametric-search: env override of the LDPC rate for MFSK configs.
+	// k in {1..14} selects the prebuilt k/16 matrix. Additive; production unset
+	// => byte-identical. (k=7,9,11,13 have no prebuilt matrix; guarded downstream.)
+	if(_modulation==MOD_MFSK)
+	{
+		const char* _msr = std::getenv("MERCURY_MFSK_SWEEP_RATE");
+		if(_msr && *_msr){ int _k = atoi(_msr); if(_k >= 1 && _k <= 14) _ldpc_rate = (float)_k/16.0f; }
+	}
+
 	// Amplitude restoration disabled for all modes: full ZF equalization
 	// preserves |H| for MMSE erasure and CSI weighting on frequency-selective channels.
 	// Previously PSK modes forced |H|=1, losing 35 dB SNR on analog channels with ~8 dB variation.
@@ -11990,6 +12293,7 @@ void cl_telecom_system::load_configuration(int configuration)
 		int new_mfsk_M, new_nStreams;
 		if(configuration == ROBUST_0) { new_mfsk_M = narrowband_enabled ? 8 : 32; new_nStreams = 1; }
 		else { new_mfsk_M = narrowband_enabled ? 4 : 16; new_nStreams = 2; } // ROBUST_1, ROBUST_2
+		mfsk_sweep_override_MN(new_mfsk_M, new_nStreams);
 		if(new_mfsk_M != mfsk.M || new_nStreams != mfsk.nStreams)
 		{
 			reinit_subsystems.telecom_system=YES;
@@ -12286,7 +12590,19 @@ void cl_telecom_system::load_configuration(int configuration)
 				mfsk_M = narrowband_enabled ? 4 : 16;
 				mfsk_nStreams = 2;
 			}
-			mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
+			mfsk_sweep_override_MN(mfsk_M, mfsk_nStreams);
+				mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
+			// Env-gated: a longer robust preamble must flow into the data_container
+			// frame-size authority so TX emits the full sequence and the RX detector
+			// window matches. Unset => mfsk.preamble_nSymb == the existing value =>
+			// byte-identical.
+			{
+				const char* _rp = std::getenv("MERCURY_MFSK_ROBUST_PREAMBLE");
+				bool _sid = (_rp == NULL || strcmp(_rp, "sidelnikov") == 0);  // default-ON
+				if(_rp != NULL && (strcmp(_rp, "short") == 0 || strcmp(_rp, "off") == 0)) _sid = false;
+				if(_sid)
+					ofdm.preamble_configurator.Nsymb = mfsk.preamble_nSymb;
+			}
 		}
 		else
 		{
@@ -12334,7 +12650,8 @@ void cl_telecom_system::load_configuration(int configuration)
 			mfsk_M = narrowband_enabled ? 4 : 16;
 			mfsk_nStreams = 2;
 		}
-		mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
+		mfsk_sweep_override_MN(mfsk_M, mfsk_nStreams);
+				mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
 	}
 
 	// Generate MFSK cross-correlation template for preamble detection (NB+WB).
@@ -12417,8 +12734,8 @@ void cl_telecom_system::load_configuration(int configuration)
 		for(int st = 0; st < 4; st++)
 			ofdm.mfsk_stream_offsets[st] = (st < cl_mfsk::MAX_STREAMS) ? mfsk.stream_offsets[st] : 0;
 		ofdm.mfsk_preamble_nsymb = mfsk.preamble_nSymb;
-		for(int s = 0; s < 16; s++)
-			ofdm.mfsk_preamble_tones[s] = (s < cl_mfsk::MAX_PREAMBLE_SYMB) ? mfsk.preamble_tones[s] : 0;
+		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++)
+			ofdm.mfsk_preamble_tones[s] = mfsk.preamble_tones[s];
 		ofdm.mfsk_preamble_match_threshold = mfsk.preamble_match_threshold;
 	}
 	else
@@ -12433,7 +12750,7 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm.mfsk_nStreams = 0;
 		ofdm.mfsk_preamble_nsymb = 0;
 		ofdm.mfsk_preamble_match_threshold = 0;
-		for(int s = 0; s < 16; s++) ofdm.mfsk_preamble_tones[s] = 0;
+		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++) ofdm.mfsk_preamble_tones[s] = 0;
 		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
 
 #if 1 // P1: template REVIVED for MF plateau-tiebreak VIABILITY MEASUREMENT (inert: time_sync_preamble_matched has 0 production callers)

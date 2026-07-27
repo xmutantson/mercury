@@ -44,6 +44,15 @@ public:
 	int nStreams;    // Parallel MFSK streams (1=ROBUST_0, 2=ROBUST_1/ROBUST_2)
 	int tone_hop_step; // Tone hopping step for frequency diversity (coprime with M)
 
+	// MFSK parametric-search harness: per-symbol ML-argmax capture for the
+	// uncoded (pre-LDPC) symbol-error validation against the Proakis noncoherent
+	// orthogonal M-FSK curve. Additive/off in production (dbg_capture=false).
+	bool dbg_capture = false;
+	int  dbg_nsym    = 0;
+	static const int DBG_MAX = 4096;
+	int  dbg_tx_tones[DBG_MAX];
+	int  dbg_rx_tones[DBG_MAX];
+
 	static const int MAX_STREAMS = 4;
 	int stream_offsets[MAX_STREAMS]; // Starting subcarrier bin for each stream
 
@@ -53,7 +62,7 @@ public:
 	// the WGN:-8 cliff. NB preamble (M=8 / M=4) stays at 8 symbols.
 	// MAX_PREAMBLE_SYMB must be >= max(preamble_nSymb across all configs)
 	// and >= mfsk_corr_template_sym_energy[] size in ofdm.h.
-	static const int MAX_PREAMBLE_SYMB = 16;
+	static const int MAX_PREAMBLE_SYMB = 48;
 	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol
 	int preamble_nSymb;                     // Number of preamble symbols used
 	// Length-scaled detection threshold for the discrete-match preamble

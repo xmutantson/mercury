@@ -8037,6 +8037,18 @@ void cl_arq_controller::process_control_commander()
 				connection_attempt_timer.stop();
 				connection_attempt_timer.reset();
 
+				if(connect_fast_active)
+				{
+					robust_enabled = connect_fast_fallback_robust;
+					init_configuration = connect_fast_fallback_config;
+					data_configuration = connect_fast_fallback_config;
+					ack_configuration  = connect_fast_fallback_config;
+					last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+					connect_fast_active = false;
+					connect_fast_timer.stop();
+					connect_fast_timer.reset();
+				}
+
 				// BW negotiation: if we support WB and currently NB, propose WB upgrade.
 				// Don't check peer_capability here — MFSK ACK patterns don't carry data,
 				// so peer_capability is unreliable. The responder's accept/reject comes

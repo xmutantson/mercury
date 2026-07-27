@@ -464,7 +464,7 @@ public:
 	int mfsk_M;
 	int mfsk_nStreams;
 	int mfsk_stream_offsets[4]; // matches cl_mfsk::MAX_STREAMS
-	int mfsk_preamble_tones[16]; // matches MAX_PREAMBLE_SYMB
+	int mfsk_preamble_tones[48]; // matches MAX_PREAMBLE_SYMB
 	int mfsk_preamble_nsymb;
 	int mfsk_preamble_match_threshold;
 

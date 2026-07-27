@@ -3776,6 +3776,17 @@ void cl_arq_controller::process_control_responder()
 		}
 
 		link_status=CONNECTED;
+		if(connect_fast_active)
+		{
+			robust_enabled = connect_fast_fallback_robust;
+			init_configuration = connect_fast_fallback_config;
+			data_configuration = connect_fast_fallback_config;
+			ack_configuration  = connect_fast_fallback_config;
+			last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+			connect_fast_active = false;
+			connect_fast_timer.stop();
+			connect_fast_timer.reset();
+		}
 #ifdef MERCURY_GUI_ENABLED
 		if(passive_monitor)
 		{

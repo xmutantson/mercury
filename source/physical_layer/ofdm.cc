@@ -24,6 +24,8 @@
 #include "physical_layer/ofdm.h"
 #include "debug/canary_guard.h"
 #include <algorithm>  // for std::swap in optimized FFT
+#include <vector>   // SPARSE-OFDM decimation overlay (env-gated)
+#include <cstdlib>  // SPARSE-OFDM: std::getenv/atoi
 
 // PocketFFT: high-performance FFT library (BSD license)
 // Replaces hand-rolled Cooley-Tukey. ~2-3x faster for N=256.
@@ -189,7 +191,7 @@ cl_ofdm::cl_ofdm()
 	mfsk_nStreams=0;
 	mfsk_preamble_nsymb=0;
 	mfsk_preamble_match_threshold=0;
-	for(int i=0;i<16;i++) mfsk_preamble_tones[i]=0;
+	for(int i=0;i<48;i++) mfsk_preamble_tones[i]=0;
 	for(int i=0;i<4;i++) mfsk_stream_offsets[i]=0;
 	// OFDM matched-filter template
 	ofdm_corr_template=NULL;
@@ -1325,6 +1327,42 @@ void cl_pilot_configurator::configure()
 			{
 				nConfig++;
 				nData--;
+			}
+		}
+	}
+
+	// SPARSE-OFDM decimation overlay (env-gated; production unset => no-op, byte-identical).
+	// VARA L5-9 lever: light a FIXED-LATTICE SUBSET of the DATA carriers spread WIDE for
+	// frequency diversity. MERCURY_MFSK_SPARSE_NCARR=n keeps n DATA carrier columns on a
+	// fixed lattice (spacing = MERCURY_MFSK_SPARSE_STRIDE, else auto = Nc/n) centered in the
+	// band; every other DATA cell -> ZERO. Symmetric TX/RX (both read carrier->type), so
+	// masking this one array decimates the whole framer/deframer path. PILOT/CONFIG cells
+	// are left untouched so the channel estimator keeps its reference. nData is recomputed
+	// so nBits/LDPC-puncturing track the sparse grid. Additive: env unset => block skipped.
+	{
+		const char* _spn = std::getenv("MERCURY_MFSK_SPARSE_NCARR");
+		if(_spn && *_spn)
+		{
+			int ncarr = atoi(_spn);
+			const char* _sps = std::getenv("MERCURY_MFSK_SPARSE_STRIDE");
+			int stride = (_sps && *_sps) ? atoi(_sps) : 0;
+			if(ncarr >= 1 && ncarr < Nc)
+			{
+				if(stride < 1) stride = Nc / ncarr;
+				if(stride < 1) stride = 1;
+				int span  = (ncarr-1)*stride;
+				int start = (Nc - 1 - span) / 2;
+				if(start < 0) start = 0;
+				std::vector<char> keep((size_t)Nc, 0);
+				for(int c=0;c<ncarr;c++){ int col = start + c*stride; if(col>=0 && col<Nc) keep[(size_t)col]=1; }
+				int removed=0;
+				for(int j=0;j<Nsymb;j++) for(int i=0;i<Nc;i++)
+				{
+					struct st_carrier* cc = carrier + j*Nc + i;
+					if(cc->type==DATA && !keep[(size_t)i]) { cc->type=ZERO; nData--; removed++; }
+				}
+				std::cout<<"[SPARSE-OFDM] ncarr="<<ncarr<<" stride="<<stride<<" start="<<start
+				         <<" Nc="<<Nc<<" removedDataCells="<<removed<<" nData="<<nData<<std::endl;
 			}
 		}
 	}
@@ -4195,7 +4233,7 @@ int cl_ofdm::time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_si
 	std::complex<double>* fft_out = work_buf_b;
 
 	// Map preamble tone indices to FFT bin indices for each stream
-	int preamble_bins[8][4]; // [MAX_PREAMBLE_SYMB][MAX_STREAMS]
+	int preamble_bins[48][4]; // [MAX_PREAMBLE_SYMB][MAX_STREAMS] — sized for the 48-symbol robust preamble
 	int half = Nc / 2;
 	for (int p = 0; p < preamble_nSymb; p++)
 	{
@@ -4347,6 +4385,11 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 {
 	if (out_metric) *out_metric = 0.0;
 
+	// Default-ON global: NOMIRROR disables the tone-space mirror-accept in the MFSK
+	// acquisition detector (cuts the false-accept rate; a residual CFO does not populate
+	// the mirror bin). Set MERCURY_MFSK_NOMIRROR=0 to restore the legacy mirror-accept.
+	bool acq_nomirror = true;
+	{ const char* _nm = std::getenv("MERCURY_MFSK_NOMIRROR"); if (_nm != NULL && atoi(_nm) == 0) acq_nomirror = false; }
 	if (mfsk_M <= 0 || mfsk_nStreams <= 0 || mfsk_preamble_nsymb <= 0)
 		return -1;
 	if (mfsk_preamble_match_threshold <= 0)
@@ -4398,7 +4441,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 			// Expected tone for this symbol. No hopping at emit time —
 			// preamble_tones[] stores the full sequence directly
 			// (mfsk.cc generate_preamble:467 reads preamble_tones[s % nsymb]).
-			int actual_tone = mfsk_preamble_tones[p % 16];
+			int actual_tone = mfsk_preamble_tones[p % 48];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
 			// e_target: energy in the expected (+mirror) tone bins summed over all
@@ -4459,7 +4502,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				}
 				int mirror_tone = (mfsk_M - actual_tone) % mfsk_M;
 				symbol_matched = (best_e > 0 &&
-				                  (best_t == actual_tone || best_t == mirror_tone));
+				                  (best_t == actual_tone || (!acq_nomirror && best_t == mirror_tone)));
 			}
 			else
 			{
@@ -4483,7 +4526,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				// accept expected OR mirror as peak. Energy gate prevents 0==0
 				// match on silence.
 				symbol_matched = (peak_e > 0 &&
-				                  (peak_bin == expected_bin || peak_bin == mirror_bin));
+				                  (peak_bin == expected_bin || (!acq_nomirror && peak_bin == mirror_bin)));
 			}
 
 			if (!symbol_matched)
@@ -4551,7 +4594,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 			fft(decimated_sym, fft_out, Nfft);
 
-			int actual_tone = mfsk_preamble_tones[p % 16];
+			int actual_tone = mfsk_preamble_tones[p % 48];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
 			// e_targ: expected(+mirror) tone energy summed over streams — secondary
@@ -4594,7 +4637,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				}
 				int mirror_tone = (mfsk_M - actual_tone) % mfsk_M;
 				symbol_ok = (best_e > 0 &&
-				             (best_t == actual_tone || best_t == mirror_tone));
+				             (best_t == actual_tone || (!acq_nomirror && best_t == mirror_tone)));
 			}
 			else
 			{
@@ -4613,7 +4656,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 					         + fft_out[b].imag() * fft_out[b].imag();
 					if (e > pk) { pk = e; pkbin = b; }
 				}
-				symbol_ok = (pk > 0 && (pkbin == ebin || pkbin == mbin));
+				symbol_ok = (pk > 0 && (pkbin == ebin || (!acq_nomirror && pkbin == mbin)));
 			}
 
 			if (!symbol_ok) continue;

@@ -470,6 +470,13 @@ public:
 	// is now the only SACK transport.
 
 	st_receive_stats receive_stats;
+	// NB M8 connect wrong-lock instrumentation (env MERCURY_WRONGLOCK_STATS;
+	// see receive_byte). A wrong-lock = the M8 preamble detector fired (a lock
+	// position was returned) but the extracted frame failed to decode (CRC
+	// reject) — the garbage-decode signature of a wrong-position lock on the
+	// NB connect (LDPC-fallback) path. Emit is env-gated: unset => untouched.
+	long long mfsk8_acq_fired = 0;
+	long long mfsk8_acq_wronglock = 0;
 
 	int operation_mode;
 

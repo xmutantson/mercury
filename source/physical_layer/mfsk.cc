@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>   // Stage 3c: getenv/atoi for MERCURY_INBAND_TAG_SYNC_REPS
+#include <cstring>
 
 cl_mfsk::cl_mfsk()
 {
@@ -87,6 +88,13 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	nStreams = _nStreams;
 	if (nStreams < 1) nStreams = 1;
 	if (nStreams > MAX_STREAMS) nStreams = MAX_STREAMS;
+	// Env-gated low-sidelobe robust preamble (see insert_sidelnikov rationale).
+	// Unset => original short preamble => byte-identical.
+	const char* _rp_env = std::getenv("MERCURY_MFSK_ROBUST_PREAMBLE");
+	// Default-ON: the low-sidelobe robust preamble ships enabled. Set
+	// MERCURY_MFSK_ROBUST_PREAMBLE=short (or =off) to force the legacy 8-symbol preamble.
+	bool _sid_pre = (_rp_env == NULL || strcmp(_rp_env, "sidelnikov") == 0);
+	if (_rp_env != NULL && (strcmp(_rp_env, "short") == 0 || strcmp(_rp_env, "off") == 0)) _sid_pre = false;
 
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_ack_sack_suffix_tones[i] = -1;
@@ -173,29 +181,61 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	}
 	else if (M == 8)
 	{
-		// Narrowband: 8 symbols, all tones used once
-		preamble_nSymb = 8;
-		preamble_tones[0] = 1;
-		preamble_tones[1] = 5;
-		preamble_tones[2] = 3;
-		preamble_tones[3] = 7;
-		preamble_tones[4] = 0;
-		preamble_tones[5] = 6;
-		preamble_tones[6] = 2;
-		preamble_tones[7] = 4;
+		if (_sid_pre)
+		{
+			// Sidelnikov (p=37) 32-symbol sequence: non-repeating, aperiodic
+			// tone-coincidence <=5/32 at every nonzero shift. Kills the +preN
+			// acquisition alias the short repeated 8-symbol preamble exhibits.
+			preamble_nSymb = 32;
+			const int seq[32] = {
+				1, 3, 6, 5, 3, 7, 6, 5, 2, 5, 3, 6, 4, 1, 3, 7,
+				7, 7, 6, 4, 1, 2, 4, 0, 1, 2, 5, 2, 4, 1, 3, 6
+			};
+			for (int s = 0; s < 32; s++) preamble_tones[s] = seq[s];
+		}
+		else
+		{
+			// Narrowband: 8 symbols, all tones used once
+			preamble_nSymb = 8;
+			preamble_tones[0] = 1;
+			preamble_tones[1] = 5;
+			preamble_tones[2] = 3;
+			preamble_tones[3] = 7;
+			preamble_tones[4] = 0;
+			preamble_tones[5] = 6;
+			preamble_tones[6] = 2;
+			preamble_tones[7] = 4;
+		}
 	}
 	else if (M == 4)
 	{
-		// Narrowband 2-stream: 8 symbols, palindrome for symmetry
-		preamble_nSymb = 8;
-		preamble_tones[0] = 0;
-		preamble_tones[1] = 2;
-		preamble_tones[2] = 1;
-		preamble_tones[3] = 3;
-		preamble_tones[4] = 3;
-		preamble_tones[5] = 1;
-		preamble_tones[6] = 2;
-		preamble_tones[7] = 0;
+		if (_sid_pre)
+		{
+			// Sidelnikov (p=53) 48-symbol sequence: non-repeating, aperiodic
+			// tone-coincidence <=16/48 at every nonzero shift (well below the
+			// 40/48 detection threshold). Replaces the +preN/+4-aliasing
+			// 8-symbol palindrome.
+			preamble_nSymb = 48;
+			const int seq[48] = {
+				0, 1, 2, 0, 1, 3, 2, 1, 2, 1, 2, 0, 1, 2, 0, 0,
+				0, 1, 3, 3, 2, 0, 1, 3, 3, 3, 3, 2, 1, 3, 2, 0,
+				1, 2, 1, 2, 1, 3, 2, 1, 3, 3, 3, 2, 0, 0, 1, 3
+			};
+			for (int s = 0; s < 48; s++) preamble_tones[s] = seq[s];
+		}
+		else
+		{
+			// Narrowband 2-stream: 8 symbols, palindrome for symmetry
+			preamble_nSymb = 8;
+			preamble_tones[0] = 0;
+			preamble_tones[1] = 2;
+			preamble_tones[2] = 1;
+			preamble_tones[3] = 3;
+			preamble_tones[4] = 3;
+			preamble_tones[5] = 1;
+			preamble_tones[6] = 2;
+			preamble_tones[7] = 0;
+		}
 	}
 	else
 	{
@@ -244,6 +284,21 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		preamble_match_threshold = 8;
 	else
 		preamble_match_threshold = 7;
+	if (_sid_pre && (M == 8 || M == 4))
+		preamble_match_threshold = (M == 8) ? 24 : 40;
+	// Arm C (env MERCURY_MFSK_NOMIRROR): the tone-space mirror-accept forced
+	// preamble_match_threshold=8 for the ns>=2 combiner (raising the FAR ceiling
+	// that the mirror false-accepts create). NOMIRROR disables that mirror-accept
+	// in the acquisition detector (see ofdm.cc acq_nomirror), so the FAR pressure
+	// is gone and the threshold reverts 8->7 — recovering the ~1 dB the mirror
+	// cost the ns>=2 combining cliff. Only applies when NOT already overridden by
+	// the sidelnikov preamble. Unset => byte-identical.
+	{
+		const char* _nm = std::getenv("MERCURY_MFSK_NOMIRROR");
+		bool _nomirror = (_nm == NULL) ? true : (atoi(_nm) != 0);  // default-ON; MERCURY_MFSK_NOMIRROR=0 disables
+		if (_nomirror && nStreams >= 2 && !(_sid_pre && (M == 8 || M == 4)))
+			preamble_match_threshold = 7;
+	}
 
 	// ACK pattern tones.
 	// WB (M>=16): Welch-Costas array (p=17, g=5), 8 base tones × 2 reps = 16 symbols.
@@ -1239,6 +1294,11 @@ void cl_mfsk::mod(const int* bits_in, int total_bits,
 
 			if (tone_index >= M) tone_index = M - 1;
 
+			if (dbg_capture) {
+				int _idx = s * nStreams + st;
+				if (_idx >= 0 && _idx < DBG_MAX) dbg_tx_tones[_idx] = tone_index;
+			}
+
 			// Apply tone hopping for frequency diversity
 			int actual_tone = (tone_index + s * tone_hop_step) % M;
 
@@ -1297,6 +1357,8 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 	double peak_sum_all = 0.0;
 	int    peak_count_all = 0;
 
+	if (dbg_capture) dbg_nsym = nSymbols * nStreams;
+
 	for (int s = 0; s < nSymbols; s++)
 	{
 		// Process each stream independently
@@ -1324,6 +1386,13 @@ void cl_mfsk::demod(const std::complex<double>* fft_in, int total_bits,
 			{
 				int actual = (m + hop) % M;
 				E[m] = E_raw[actual];
+			}
+
+			if (dbg_capture) {
+				int _am = 0; double _mx = E[0];
+				for (int m = 1; m < M; m++) if (E[m] > _mx) { _mx = E[m]; _am = m; }
+				int _idx = s * nStreams + st;
+				if (_idx >= 0 && _idx < DBG_MAX) dbg_rx_tones[_idx] = _am;
 			}
 
 			// Compute LLRs for this stream's bits — log-sum-exp noncoherent FSK
