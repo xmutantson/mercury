@@ -1908,6 +1908,11 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_cbr;
                 failed += test_cbr.test_climb_bsi_rollback();
             }
+            // Reverse-SACK partial-target guard reference regression.
+            {
+                cl_arq_controller test_gr;
+                failed += test_gr.test_guard_reanchor();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -2923,6 +2928,13 @@ int main(int argc, char *argv[])
             int failed = ARQ_cbr.test_climb_bsi_rollback();
             return (failed == 0) ? 0 : 1;
         }
+        // --test-guard-reanchor : run only the live-state reverse-SACK guard
+        // reference regression and exit.
+        if (strcmp(argv[i], "--test-guard-reanchor") == 0) {
+            cl_arq_controller ARQ_gr;
+            int failed = ARQ_gr.test_guard_reanchor();
+            return (failed == 0) ? 0 : 1;
+        }
         // --test-inband-plus1-climb : run ONLY the in-band +1 climb regression (the FRAME-UP
         // climb steps +1 under the inband feature, suppressing the SNR-elevator multi-rung
         // jump; legacy keeps the elevator) and exit. Fast + deterministic; see
@@ -3398,6 +3410,7 @@ int main(int argc, char *argv[])
                                         // (silent concat on the SET_CONFIG cases), pass-after aborts loudly
                                         // OR delivers contiguous. One-shot, exits rc.
                                         // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+    bool test_guard_reanchor_cli = false; // --test-guard-reanchor: live reverse-SACK guard reference
     bool test_spec_sack_cli = false;    // --test-spec-sack: LEVER #2 — speculative/prompt SACK. Frame-k still-decoding
                                         // at the window-fraction deadline -> in-window SACK bit_k=0 -> CMD retx ->
                                         // byte-faithful re-receive -> single in-order delivery, no silent loss.
@@ -4559,6 +4572,13 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_commander.cc test_climb_bsi_rollback
             // + fact-documents/data-flow-climb-up-bsi-rollback.md.
             test_climb_bsi_rollback_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-guard-reanchor") == 0)
+        {
+            // Reverse-SACK partial-target guard live-state reference regression.
+            test_guard_reanchor_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6635,6 +6655,15 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_climb_bsi_rollback();
             printf("[FLAG] Climb-bsi-rollback test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_guard_reanchor_cli) {
+            printf("[FLAG] --test-guard-reanchor: invoking reverse-SACK guard "
+                   "reference regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_guard_reanchor();
+            printf("[FLAG] Guard-reanchor test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -3122,6 +3122,11 @@ public:
   // no-op. Returns 0=PASS, 1=FAIL. Default builds never call this.
   int test_climb_bsi_rollback();
 
+  // Reverse-SACK partial-target guard reference regression. CLI:
+  // --test-guard-reanchor. Stages live messages_tx[] state and verifies the
+  // in-flight reference accepts the current partial while rejecting stale input.
+  int test_guard_reanchor();
+
   // D5 — EOB-inference batch truncation (TRACK_C_D2D3D5_DESIGN.md §5.3 /
   // data-flow-prev-bump.md §8). CLI: --test-eob-loss-batch-truncation. Drives
   // the REAL bump_bsi_and_transfer_prev() (the prev_expected producer), the REAL
@@ -5168,6 +5173,8 @@ public:
   // -1 (no-op: gated off / nothing in flight). DISTINCT from the FIX-1 hole-defer
   // (inband_climb_hole_outstanding gates retransmit_count>0 retx holes; this gates the
   // in-flight epoch LABEL — the two are orthogonal).
+  int current_inflight_bsi() const;
+  int partial_guard_reference_bsi() const;
   int roll_back_cmd_bsi_to_inflight(const char* tag);
   // Commander-side true-session-loss floor (the ONLY commander BREAK permitted under
   // inband). Counts consecutive Class-A total-loss batches that occur WHILE already

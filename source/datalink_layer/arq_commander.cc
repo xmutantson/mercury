@@ -4727,6 +4727,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						bool decoded = telecom_system->decode_ack_sack_from_passband(
 							telecom_system->data_container.ready_to_process_passband_delayed_data,
 							tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+						int guard_ref_bsi = partial_guard_reference_bsi();
 
 						// Multi-window recovery (Track A, mwcorr;
 						// fact-documents/data-flow-data-ack-sack-correlator.md §6).
@@ -4937,11 +4938,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
 								// §3): under the cap the PARTIAL wire bsi is the FROZEN n_r, NOT a per-batch
 								// identity, so key the PARTIAL de-dup on the in-flight batch the bitmap is
-								// applied to (cmd_batch_seq_id). CLEAN wire bsi advances per delivery -> keep
+								// applied to (staged-frame ground truth). CLEAN wire bsi advances per delivery -> keep
 								// keying it on rx_bsi. Same key used by the OFDM SACK_RSP path (shared tracker).
 								int dedup_bsi = is_clean_confirmation
 									? (int)rx_bsi
-									: partial_sack_dedup_key((int)rx_bsi, cmd_batch_seq_id, cumulative_ack_enabled);
+									: partial_sack_dedup_key((int)rx_bsi, guard_ref_bsi, cumulative_ack_enabled);
 								bool duplicate = !sack_clean_confirmation_accepted(
 									dedup_bsi, is_clean_confirmation,
 									cmd_last_applied_clean_bsi, cmd_last_applied_sack_bsi);
@@ -4950,7 +4951,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								// applies BY SLOT INDEX to exactly the batch it describes (the contiguous
 								// successor n_r+1). Under the cap the window gate (Sanity 1) admits a report
 								// whose frozen n_r merely lands in prev_bsi's backward self-heal window, and
-								// the cmd_batch_seq_id de-dup key (Sanity 3) does NOT catch a LATE-decoded
+								// the per-in-flight de-dup key (Sanity 3) does NOT catch a LATE-decoded
 								// straggler (MW late-window, :4265) from a PRIOR in-flight batch -> a batch-k
 								// partial arriving after the CMD advanced to k+1 would FALSE-APPLY its batch-k
 								// bitmap to k+1's PENDING_ACK frames (they never retransmit -> silent loss).
@@ -4959,7 +4960,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								// (batches <= n_r) and are NEVER subject to this (is_clean short-circuits).
 								// Cap OFF -> partial_sack_target_is_inflight() returns true (byte-identical).
 								bool partial_target_ok = is_clean_confirmation
-									|| partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
+									|| partial_sack_target_is_inflight((int)rx_bsi, guard_ref_bsi,
 										cumulative_ack_enabled);
 								// MC-4 consumes n_r after CRC + semantic window validation, but
 								// before bitmap de-dup: a repeated bitmap may still carry a newer
@@ -5170,6 +5171,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						unsigned char rx_bsi = 0;
 						bool decoded = decode_sack_v2_frame(
 							sack_bitmap, data_batch_size, &rx_bsi);
+						int guard_ref_bsi = partial_guard_reference_bsi();
 						SACK_TRACE("decode_sack_v2: ok=%d rx_bsi=%u cmd_bsi=%d",
 							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
 						// R2c — RECOVERABLE PREV-BATCH re-SACK (data-flow-recoverable-gap-abort.md
@@ -5275,12 +5277,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// §8.3): the SACK_RSP bitmap applies BY SLOT INDEX to exactly the batch it
 						// describes — the contiguous successor n_r+1. A LATE-decoded straggler from a
 						// PRIOR in-flight batch passes the OOW/backward-window check above (its n_r covers
-						// prev_bsi) and is NOT a de-dup hit (the cmd_batch_seq_id key is fresh), so its
+						// prev_bsi) and is NOT a de-dup hit (the current in-flight key is fresh), so its
 						// bitmap would FALSE-ACK the current batch's frames by slot index (they never
 						// retransmit -> silent loss). Discard iff its resolved target (n_r+1) is NOT the
 						// current in-flight batch (cmd_bsi). Cap OFF -> always in-flight -> inert
 						// (byte-identical). Same guard as the MFSK partial path (:4424).
-						if(decoded && !partial_sack_target_is_inflight((int)rx_bsi, cmd_batch_seq_id,
+						if(decoded && !partial_sack_target_is_inflight((int)rx_bsi, guard_ref_bsi,
 							cumulative_ack_enabled))
 						{
 							printf("[CMD-SACK-V2-STALE] rx_bsi=%u resolves to batch %u != in-flight cmd_bsi=%d "
@@ -5297,8 +5299,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
 						// §3): the OFDM SACK_RSP transport ALSO carries the frozen n_r under the cap and
 						// SHARES cmd_last_applied_sack_bsi with the MFSK path, so key its de-dup on the
-						// SAME in-flight batch identity (cmd_batch_seq_id) to keep the tracker consistent.
-						int sackv2_dedup_bsi = partial_sack_dedup_key((int)rx_bsi, cmd_batch_seq_id, cumulative_ack_enabled);
+						// SAME staged in-flight batch identity to keep the tracker consistent.
+						int sackv2_dedup_bsi = partial_sack_dedup_key((int)rx_bsi, guard_ref_bsi, cumulative_ack_enabled);
 						if(decoded
 						   && sackv2_dedup_bsi == cmd_last_applied_sack_bsi)
 						{
@@ -7294,24 +7296,23 @@ void cl_arq_controller::process_messages_rx_acks_data()
 	}
 }
 
-// CLIMB-CHURN bsi rollback (data-flow-climb-up-bsi-rollback.md §5). Shared
-// capture+rollback ported VERBATIM from the FIX-9 D3 demote (:4057-4108) and
-// M6 BREAK (:4271-4300): scan messages_tx[] for the EARLIEST (mod-256) in-flight
-// (non-FREE, length>0) batch_seq_id and roll cmd_batch_seq_id back to it so a
-// climb-UP re-present of that already-RSP-delivered batch is CONTIGUOUS with the
-// RSP's delivery high-water (sack_v2_readopt_has_gap sees ==last / ==last+1, not
-// a >=2 jump -> NO [RSP-V2-GAP-ABORT] hold). Gated IDENTICALLY to the demote
-// rollback (sack_v2_enabled && !compression_enabled): the compression path's
-// restore_tx_from_compressed() owns its own re-stage and is unchanged; v1
-// sessions never read the v2 gap-gate. MUST run BEFORE the caller frees
-// messages_tx[] (else nothing is in-flight to capture). All non-FREE frames of
-// the stranded block share the SAME batch_seq_id (one batch in flight on the
-// per-frame path), so the EARLIEST mod-256 non-FREE bsi IS the in-flight batch.
-int cl_arq_controller::roll_back_cmd_bsi_to_inflight(const char* tag)
+// Cross-layer audit: cmd_batch_seq_id advances immediately after send_batch()
+// dispatch and is reseated by the lossless-demote, CFG16-HOLD, BREAK, and
+// CLIMB-CHURN rollback paths; frame-0 and stream stamps also consume that
+// counter. messages_tx[].batch_seq_id is stamped when frames are staged and is
+// the same ground truth all rollback paths scan. It therefore continues to
+// identify the stranded batch after a rollback, and advances to the next batch
+// (or no batch) as clean confirmation frees staged frames. Both transport guard
+// calls and both partial de-dup keys consume partial_guard_reference_bsi(), so
+// all four move together. With the cumulative cap, partial_sack_dedup_key()
+// returns this in-flight identity, preserving repeat de-dup and per-batch
+// distinction. Wire format, staging, and the pure predicates are unchanged.
+//
+// Returns the mod-256 identity of the batch currently awaiting ACK (the earliest
+// non-FREE, length>0 staged batch_seq_id in messages_tx[]), or -1 if nothing is
+// in flight. This is the batch a reverse-SACK PARTIAL bitmap targets by slot index.
+int cl_arq_controller::current_inflight_bsi() const
 {
-	if(!(sack_v2_enabled && !compression_enabled))
-		return -1;
-
 	int min_inflight_bsi = -1;
 	for(int i=0; i<nMessages; i++)
 	{
@@ -7330,6 +7331,42 @@ int cl_arq_controller::roll_back_cmd_bsi_to_inflight(const char* tag)
 			}
 		}
 	}
+	return min_inflight_bsi;
+}
+
+// Reference batch identity for the reverse-SACK partial-target guard and its de-dup key.
+// Normally the actual in-flight batch (messages_tx[] ground truth); falls back to
+// cmd_batch_seq_id when nothing is staged. MERCURY_GUARD_REANCHOR_DEFEAT=1 restores the
+// legacy (mis-anchored) behavior of passing the dispatch counter, for A/B isolation.
+int cl_arq_controller::partial_guard_reference_bsi() const
+{
+	static const bool defeat =
+		(std::getenv("MERCURY_GUARD_REANCHOR_DEFEAT") != nullptr);
+	if(defeat)
+		return cmd_batch_seq_id;
+	int ib = current_inflight_bsi();
+	return (ib >= 0) ? ib : cmd_batch_seq_id;
+}
+
+// CLIMB-CHURN bsi rollback (data-flow-climb-up-bsi-rollback.md §5). Shared
+// capture+rollback ported VERBATIM from the FIX-9 D3 demote (:4057-4108) and
+// M6 BREAK (:4271-4300): scan messages_tx[] for the EARLIEST (mod-256) in-flight
+// (non-FREE, length>0) batch_seq_id and roll cmd_batch_seq_id back to it so a
+// climb-UP re-present of that already-RSP-delivered batch is CONTIGUOUS with the
+// RSP's delivery high-water (sack_v2_readopt_has_gap sees ==last / ==last+1, not
+// a >=2 jump -> NO [RSP-V2-GAP-ABORT] hold). Gated IDENTICALLY to the demote
+// rollback (sack_v2_enabled && !compression_enabled): the compression path's
+// restore_tx_from_compressed() owns its own re-stage and is unchanged; v1
+// sessions never read the v2 gap-gate. MUST run BEFORE the caller frees
+// messages_tx[] (else nothing is in-flight to capture). All non-FREE frames of
+// the stranded block share the SAME batch_seq_id (one batch in flight on the
+// per-frame path), so the EARLIEST mod-256 non-FREE bsi IS the in-flight batch.
+int cl_arq_controller::roll_back_cmd_bsi_to_inflight(const char* tag)
+{
+	if(!(sack_v2_enabled && !compression_enabled))
+		return -1;
+
+	int min_inflight_bsi = current_inflight_bsi();
 
 	if(min_inflight_bsi >= 0)
 	{
@@ -7341,6 +7378,79 @@ int cl_arq_controller::roll_back_cmd_bsi_to_inflight(const char* tag)
 		cmd_batch_seq_id = min_inflight_bsi;
 	}
 	return min_inflight_bsi;
+}
+
+// CLI: --test-guard-reanchor
+// Stages live transmitter frames to exercise the production reference selector.
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_guard_reanchor()
+{
+	const bool defeat =
+		(std::getenv("MERCURY_GUARD_REANCHOR_DEFEAT") != nullptr);
+	printf("[TEST-GUARD-REANCHOR] start (MERCURY_GUARD_REANCHOR_DEFEAT=%d)\n",
+		defeat ? 1 : 0);
+	fflush(stdout);
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("[TEST-GUARD-REANCHOR] FAIL setup: init_messages_buffers() rc=%d\n",
+			alloc_rc);
+		fflush(stdout);
+		return 1;
+	}
+
+	const int K = 4;
+	const int rx_bsi = K - 1;
+	for(int i=0; i<nMessages; i++)
+	{
+		messages_tx[i].status       = FREE;
+		messages_tx[i].length       = 0;
+		messages_tx[i].batch_seq_id = 0;
+	}
+	for(int i=0; i<3; i++)
+	{
+		messages_tx[i].status       = PENDING_ACK;
+		messages_tx[i].length       = 32;
+		messages_tx[i].batch_seq_id = K;
+	}
+	this->cmd_batch_seq_id = (K + 1) & 0xFF;
+
+	int fails = 0;
+	auto check = [&](bool ok, const char* label)
+	{
+		printf("[TEST-GUARD-REANCHOR] %s %s\n", ok ? "PASS" : "FAIL", label);
+		if(!ok)
+			fails++;
+	};
+
+	check(current_inflight_bsi() == K,
+		"SCAN: staged batch K is the current in-flight identity");
+
+	bool legacy_accept = partial_sack_target_is_inflight(
+		rx_bsi, cmd_batch_seq_id, /*cap_on=*/true);
+	check(!legacy_accept,
+		"FAIL-BEFORE: dispatch-counter reference rejects the current partial");
+
+	int guard_ref_bsi = partial_guard_reference_bsi();
+	bool fixed_accept = partial_sack_target_is_inflight(
+		rx_bsi, guard_ref_bsi, /*cap_on=*/true);
+	check(guard_ref_bsi == K && fixed_accept,
+		"PASS-AFTER: staged in-flight reference accepts the current partial");
+
+	bool stale_accept = partial_sack_target_is_inflight(
+		K - 3, guard_ref_bsi, /*cap_on=*/true);
+	check(!stale_accept,
+		"STALE-REJECT: older retired-batch partial remains rejected");
+
+	printf("[TEST-GUARD-REANCHOR] %s (fails=%d)\n",
+		fails == 0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails == 0 ? 0 : 1;
 }
 
 // CLI: --test-climb-bsi-rollback  (data-flow-climb-up-bsi-rollback.md §6)
