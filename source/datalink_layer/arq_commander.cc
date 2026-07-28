@@ -875,6 +875,10 @@ int cl_arq_controller::elevator_target_from_snr()
 	// place (the §4.4 hook #3 + the design's "shared by the SNR re-trigger and FRAME-UP
 	// elevator" note). When the cooldown is disarmed (the normal case) this is the identity.
 	snr_ideal = apply_bigblock_cooldown_cap(snr_ideal);
+	// CFG16 decode-margin gate: the SNR re-trigger elevator AND the FRAME-UP elevator share
+	// this method, so folding the gate here holds both off CFG16 until the reverse-path SNR
+	// supports it. Never-raise; identity when the gate is open (high SNR) or WB-off.
+	snr_ideal = apply_cfg16_margin_cap(snr_ideal);
 	return snr_ideal;
 }
 
@@ -892,6 +896,42 @@ int cl_arq_controller::apply_bigblock_cooldown_cap(int proposed) const
 	int cd = bigblock_carve_cooldown_ceiling(bigblock_carve_cooldown_batches, robust_enabled);
 	if(cd >= 0 && config_ladder_index(proposed) > config_ladder_index(cd))
 		return cd;
+	return proposed;
+}
+
+// CFG16 decode-margin election gate — the channel-viability verdict for the CFG16 top rung.
+// Returns true iff the reverse-path SNR (measurements.SNR_uplink, the peer's report of OUR
+// forward link, carried in the MFSK ACK suffix — the SAME signal the SUCCESS_BASED_LADDER climb
+// already trusts) clears CFG16_MIN_SNR_DB. A decisive moderate-vs-high-SNR delivery cohort +
+// cross-layer data-flow audit showed CFG16 is a STRUCTURAL loss below ~snr3k 23-24 dB (no decode
+// margin -> hard BREAK -> ladder storm, 4-22x fewer delivered bytes than holding CFG15); the
+// gate holds CFG15 there and admits CFG16 only where the margin is real. Fail-OPEN on the -99.9
+// sentinel (no ACK suffix decoded yet) so the pre-ACK connect/climb path is byte-identical.
+// MERCURY_DECODE_MARGIN_GATE_DEFEAT forces true (blanket CFG16 = the pre-gate over-election,
+// the fail-before observable). Const: reads a member + a threshold, no get_configuration.
+bool cl_arq_controller::cfg16_decode_margin_ok() const
+{
+	const char* defeat = std::getenv("MERCURY_DECODE_MARGIN_GATE_DEFEAT");
+	if(defeat && *defeat && atoi(defeat) != 0) return true;   // blanket CFG16 (fail-before)
+	double snr = measurements.SNR_uplink;
+	if(snr <= -90.0) return true;                             // unmeasured -> byte-identical
+	return snr > CFG16_MIN_SNR_DB;
+}
+
+// INDEX-MONOTONE never-raise clamp that holds a WB climb target at CFG15 while the CFG16
+// decode-margin gate is closed; otherwise returns `proposed` UNCHANGED. Same shape/composition
+// as apply_bigblock_cooldown_cap() (order-independent with supershift_proven_ceiling / WB-NB
+// ceiling / max_config_override — all "never raise"), and applied at the SAME climb hooks so
+// every CFG16-reaching producer honors one consistent ceiling. WB-only: an NB session (its own
+// NB_CONFIG_MAX ceiling governs) is returned unchanged. When the gate is open (high SNR, the
+// -90 sentinel, or the defeat env) this is the IDENTITY, so high-SNR CFG16 election and the
+// pre-ACK path are byte-identical.
+int cl_arq_controller::apply_cfg16_margin_cap(int proposed) const
+{
+	if(narrowband_enabled == YES) return proposed;   // WB-only gate
+	if(cfg16_decode_margin_ok()) return proposed;    // gate open -> identity
+	if(config_ladder_index(proposed) > config_ladder_index(CONFIG_15))
+		return CONFIG_15;
 	return proposed;
 }
 
@@ -972,6 +1012,9 @@ int cl_arq_controller::connect_seed_target()
 	// Fold the bigblock carve cooldown cap (shared chokepoint) BEFORE the core so a
 	// suspended-CFG16 cooldown also caps the seed (composes order-independently).
 	snr_mapped = apply_bigblock_cooldown_cap(snr_mapped);
+	// CFG16 decode-margin gate: the connect control-plane SNR proxy over-reads, so one seed
+	// read must never plant CFG16 unless the reverse-path SNR clears the margin (never-raise).
+	snr_mapped = apply_cfg16_margin_cap(snr_mapped);
 	int seed = connect_seed_target_core(measurements.SNR_uplink, snr_mapped,
 		init_configuration, supershift_proven_ceiling, narrowband_enabled == YES);
 	if(seed != CONFIG_NONE)
@@ -1546,6 +1589,10 @@ void cl_arq_controller::process_messages_commander()
 			// optimizer axis and the carve-dead rung is re-elected. Index-monotone never-raise;
 			// no-op off the cooldown (batches==0) so optimizer behavior is otherwise unchanged.
 			target = apply_bigblock_cooldown_cap(target);
+			// CFG16 decode-margin gate: the Q-table optimizer is a FOURTH CFG16 producer that
+			// bypasses the gearshift/turbo climb gates, so cap it at CFG15 too until the
+			// reverse-path SNR supports CFG16 (never-raise; identity at high SNR / WB-off).
+			target = apply_cfg16_margin_cap(target);
 			if (target != current_configuration && is_ofdm_config(target))
 			{
 				printf("[OPT] queue SET_CONFIG: %d -> %d (effective-rate optimizer)\n",
@@ -7212,6 +7259,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 #endif
 				negotiated_configuration =
 					inband_climb_target(proposed_frame, snr_elevator, inband_plus1_on);
+				// CFG16 decode-margin gate: proposed_frame is the SNR-blind +1 ladder step, so a
+				// 15->16 FRAME-UP can reach CFG16 on ACK success alone even when the elevator
+				// (already gated) holds CFG15. Cap the FRAME-UP target so the top rung is elected
+				// only when the reverse-path SNR supports it (never-raise; identity at high SNR).
+				negotiated_configuration = apply_cfg16_margin_cap(negotiated_configuration);
 				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs (eff_thresh %d, base %d, clean-streak %d), config %d -> %d\n",
 					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
 					clean_batches_at_current_config, current_configuration, negotiated_configuration);
@@ -7772,6 +7824,10 @@ void cl_arq_controller::finish_turbo_direction()
 		// No-op off the cooldown (apply_bigblock_cooldown_cap is the identity when
 		// bigblock_carve_cooldown_batches==0), so non-bigblock turbo completion is identical.
 		start_config = apply_bigblock_cooldown_cap(start_config);
+		// CFG16 decode-margin gate: with SACK on the start trusts the verified ceiling
+		// (turboshift_last_good, possibly CFG16) UNCONDITIONALLY — so a turbo re-climb must
+		// not restart at CFG16 when the reverse-path SNR no longer supports it (never-raise).
+		start_config = apply_cfg16_margin_cap(start_config);
 
 		// Set ceiling = start config. The SNR→config table is calibrated for AWGN
 		// but fading channels need 3-6 dB more margin. Setting ceiling at start
@@ -9051,6 +9107,10 @@ void cl_arq_controller::process_control_commander()
 						// cannot re-elect the carve-dead CFG16 rung while the cooldown holds.
 						// Index-monotone never-raise; no-op off the cooldown (batches==0).
 						negotiated_configuration = apply_bigblock_cooldown_cap(negotiated_configuration);
+						// CFG16 decode-margin gate on the LOAD-BEARING turbo re-climb hook: after
+						// every other ceiling clamp, hold the probe target at CFG15 unless the
+						// reverse-path SNR supports CFG16 (never-raise; identity at high SNR).
+						negotiated_configuration = apply_cfg16_margin_cap(negotiated_configuration);
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
 						//
@@ -9514,6 +9574,10 @@ void cl_arq_controller::finalize_block_commander()
 				// CFG16 big-block carve cooldown ceiling (CFG15) while the cooldown is armed.
 				if(apply_bigblock_cooldown_cap(proposed) != proposed)
 					ceiling_blocked = true;
+				// CFG16 decode-margin gate (LADDER UP, v1): the success-based ladder step is
+				// SNR-blind, so block the 15->16 step until the reverse-path SNR supports CFG16.
+				if(apply_cfg16_margin_cap(proposed) != proposed)
+					ceiling_blocked = true;
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;
@@ -9538,7 +9602,9 @@ void cl_arq_controller::finalize_block_commander()
 					// is the band-aid until that's built.
 					// WALL-B FIX-5 hook #1b (CEILING RECOVERY, v1): never raise the proven ceiling
 					// above the cooldown ceiling — else it would walk the ceiling back to CFG16.
-					if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed)
+					// AND never raise it while the CFG16 decode-margin gate holds CFG15 (same reason).
+					if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed
+						&& apply_cfg16_margin_cap(proposed) == proposed)
 					{
 						ceiling_success_count++;
 						if(ceiling_success_count >= 5)
@@ -9683,6 +9749,10 @@ void cl_arq_controller::policy_evaluate_axis1()
 		// CFG16 big-block carve cooldown ceiling (CFG15) while the cooldown is armed.
 		if(apply_bigblock_cooldown_cap(proposed) != proposed)
 			ceiling_blocked = true;
+		// CFG16 decode-margin gate (LADDER UP, v2): SNR-blind ladder step -> block the
+		// 15->16 promotion until the reverse-path SNR supports CFG16.
+		if(apply_cfg16_margin_cap(proposed) != proposed)
+			ceiling_blocked = true;
 		if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 		{
 			negotiated_configuration=proposed;
@@ -9708,7 +9778,9 @@ void cl_arq_controller::policy_evaluate_axis1()
 			// site, ~line 4346). Band-aid until 2D channel measurement lands.
 			// WALL-B FIX-5 hook #1b (CEILING RECOVERY, v2): never raise the proven ceiling
 			// above the cooldown ceiling — else it would walk the ceiling back to CFG16.
-			if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed)
+			// AND never raise it while the CFG16 decode-margin gate holds CFG15 (same reason).
+			if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed
+				&& apply_cfg16_margin_cap(proposed) == proposed)
 			{
 				ceiling_success_count++;
 				if(ceiling_success_count >= 5)
@@ -16210,6 +16282,74 @@ int cl_arq_controller::test_climb_engine()
 	}
 
 	// ================================================================
+	// Part T16 — CFG16 DECODE-MARGIN ELECTION GATE (cross-layer data-flow audit of the
+	// config-election path). apply_cfg16_margin_cap() holds a WB climb target at CFG15 unless the
+	// reverse-path SNR (measurements.SNR_uplink) clears CFG16_MIN_SNR_DB. A moderate-vs-high-SNR
+	// delivery cohort proved CFG16 is a STRUCTURAL loss below ~snr3k 23-24 dB (4-22x fewer bytes),
+	// so the gate holds CFG15 at the moderate reverse-path SNR the meter reports there (<=21 dB,
+	// 2-dB-quantized) and admits CFG16 at high SNR (23/25 dB). FAIL-BEFORE = the defeat env /
+	// the sentinel: the gate is the IDENTITY (blanket CFG16, the pre-gate over-election).
+	// ================================================================
+	{
+		double saved_snr = measurements.SNR_uplink;
+		int    saved_nb  = narrowband_enabled;
+		narrowband_enabled = NO;                       // WB path (the gate is WB-only)
+		unsetenv("MERCURY_DECODE_MARGIN_GATE_DEFEAT"); // ensure the gate is ARMED
+
+		// T16a PASS-AFTER — MODERATE reverse-path SNR (snr3k ~20.8 reports <=21 dB): a proposed
+		// climb to CFG16 is HELD at CFG15 (the election is REFUSED; the 4-22x win).
+		measurements.SNR_uplink = 21.0;
+		check(!cfg16_decode_margin_ok(),
+			"T16a MODERATE SNR (21 dB <= CFG16_MIN_SNR_DB): decode-margin gate CLOSED", 0, 0);
+		check(apply_cfg16_margin_cap(CONFIG_16) == CONFIG_15,
+			"T16a a proposed climb to CFG16 is HELD at CFG15 at moderate SNR (pass-after)",
+			apply_cfg16_margin_cap(CONFIG_16), CONFIG_15);
+
+		// T16b NO HIGH-SNR REGRESSION — the snr3k~24 boundary bucket (23 dB) ADMITS CFG16.
+		measurements.SNR_uplink = 23.0;
+		check(cfg16_decode_margin_ok() && apply_cfg16_margin_cap(CONFIG_16) == CONFIG_16,
+			"T16b boundary SNR (23 dB) ADMITS CFG16 (no regression at the snr3k~24 edge)",
+			apply_cfg16_margin_cap(CONFIG_16), CONFIG_16);
+
+		// T16c NO HIGH-SNR REGRESSION — the saturated high report (snr3k~28 -> 25 dB) ADMITS CFG16.
+		measurements.SNR_uplink = 25.0;
+		check(cfg16_decode_margin_ok() && apply_cfg16_margin_cap(CONFIG_16) == CONFIG_16,
+			"T16c high SNR (25 dB, suffix cap) ADMITS CFG16 (high-SNR election preserved)",
+			apply_cfg16_margin_cap(CONFIG_16), CONFIG_16);
+
+		// T16d NEVER-RAISE — a proposal already at/below CFG15 is returned UNCHANGED even when closed.
+		measurements.SNR_uplink = 21.0;
+		check(apply_cfg16_margin_cap(CONFIG_10) == CONFIG_10,
+			"T16d a below-ceiling proposal (CFG10) is UNCHANGED (index-monotone never-raise)",
+			apply_cfg16_margin_cap(CONFIG_10), CONFIG_10);
+
+		// T16e FAIL-BEFORE (sentinel) — no ACK suffix decoded yet -> gate OPEN -> byte-identical.
+		measurements.SNR_uplink = -99.9;
+		check(cfg16_decode_margin_ok() && apply_cfg16_margin_cap(CONFIG_16) == CONFIG_16,
+			"T16e unmeasured SNR (-99.9 sentinel) FAIL-OPENs (pre-ACK path byte-identical)",
+			apply_cfg16_margin_cap(CONFIG_16), CONFIG_16);
+
+		// T16f FAIL-BEFORE (defeat env) — MERCURY_DECODE_MARGIN_GATE_DEFEAT restores blanket CFG16
+		// at the SAME moderate SNR that T16a held: the pre-gate over-election observable.
+		measurements.SNR_uplink = 21.0;
+		setenv("MERCURY_DECODE_MARGIN_GATE_DEFEAT", "1", 1);
+		check(cfg16_decode_margin_ok() && apply_cfg16_margin_cap(CONFIG_16) == CONFIG_16,
+			"T16f DEFEAT env restores blanket CFG16 at moderate SNR (fail-before)",
+			apply_cfg16_margin_cap(CONFIG_16), CONFIG_16);
+		unsetenv("MERCURY_DECODE_MARGIN_GATE_DEFEAT");
+
+		// T16g WB-ONLY — an NB session is returned UNCHANGED (NB has its own NB_CONFIG_MAX ceiling).
+		narrowband_enabled = YES;
+		measurements.SNR_uplink = 21.0;
+		check(apply_cfg16_margin_cap(CONFIG_16) == CONFIG_16,
+			"T16g NB session: the WB-only gate is a no-op (returns proposed unchanged)",
+			apply_cfg16_margin_cap(CONFIG_16), CONFIG_16);
+
+		measurements.SNR_uplink = saved_snr;   // restore
+		narrowband_enabled      = saved_nb;
+	}
+
+	// ================================================================
 	// Part U — WALL-B FIX-7A: turbo CEILING SETTLE-vs-BREAK on a SPECULATIVE
 	// RE-TRIGGER over-reach (fix7/FIX7_DESIGN.md §1+§5, FIX7_ROOTCAUSE.md).
 	// The recorded SIM free-flow collapse (100→101→102→0→4→[RE-TRIGGER]→13→
@@ -17299,13 +17439,15 @@ int cl_arq_controller::test_climb_engine()
 			current_configuration     = CONFIG_0;             // an OFDM rung (is_ofdm_config -> true)
 			last_data_viable_config   = CONFIG_0;             // a PROVEN OFDM anchor (is_ofdm_config)
 			supershift_proven_ceiling = -1;
-			measurements.SNR_uplink   = 21.0;                 // a clean high SNR (tip triad: > -90)
+			measurements.SNR_uplink   = 25.0;                 // a clean high SNR (tip triad: > -90;
+			                                                  // > CFG16_MIN_SNR_DB so the decode-margin
+			                                                  // gate is OPEN and the top-rung leap is admitted)
 			int kk_plus1        = config_ladder_up(CONFIG_0, /*robust_en=*/true, false);  // CONFIG_1 (the conservative +1)
-			int kk_expect_ideal = get_configuration(21.0 - SUPERSHIFT_MARGIN_DB);         // CONFIG_16
+			int kk_expect_ideal = get_configuration(25.0 - SUPERSHIFT_MARGIN_DB);         // CONFIG_16
 			climb_accel_defeat = false; climb_tier2 = true;   // opt-in C2 (MERCURY_CLIMB_TIER2)
 			int kk_leap_fix = elevator_target_from_snr();     // PASS-AFTER (C2 opt-in: the top-rung leap)
 			check(kk_expect_ideal == CONFIG_16,
-				"KK1a premise: 21 dB - 6 dB margin maps to CONFIG_16 (the clean-channel ceiling)",
+				"KK1a premise: 25 dB - 6 dB margin maps to CONFIG_16 (the clean-channel ceiling; clears the decode-margin gate)",
 				kk_expect_ideal, CONFIG_16);
 			check(kk_leap_fix == CONFIG_16,
 				"KK1b PASS-AFTER (C2 opt-in): at a real cfg0 residence the elevator LEAPS to CONFIG_16 in ONE shot -- no latch poke, the leap FIRES",
@@ -17420,7 +17562,9 @@ int cl_arq_controller::test_climb_engine()
 			climb_accel_defeat      = false;
 			climb_tier2             = false;
 			bigblock_carve_cooldown_batches = 0;   // no CFG16 carve cooldown active (identity cap)
-			measurements.SNR_uplink = 21.0;   // clean-high proxy -> get_configuration(21-6)=CFG16 (KK1a premise)
+			measurements.SNR_uplink = 25.0;   // clean-high proxy -> get_configuration(25-6)=CFG16, and
+			                                  // > CFG16_MIN_SNR_DB so the decode-margin gate is OPEN
+			                                  // (the pat-twin pin, not the gate, is the binding cap here)
 			current_configuration   = CONFIG_12;   // recovered to CFG12 after the leap-overshoot BREAK
 			last_data_viable_config = CONFIG_12;   // CFG12 proven OFDM (2 clean batches raise the anchor)
 

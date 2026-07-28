@@ -946,6 +946,32 @@ CONFIG_16 (5664.7 bps).
 // value — SWEEP it on the fleet faithful-sim (flat WGN vs CCIR-Poor 2-path) before default-on.
 #define TOPGEAR_FLATNESS_MAX 0.15
 
+// ── CFG16 (32-QAM rate-14/16) decode-margin election gate ─────────────────────────────
+// CFG16_MIN_SNR_DB: the minimum reverse-path SNR report (measurements.SNR_uplink, the peer's
+// measurement of OUR forward link carried in the MFSK ACK suffix) that admits the CFG16 top
+// rung. Below it the effective WB gearshift ceiling holds CFG15.
+//
+// Rationale (a decisive moderate-vs-high-SNR delivery cohort, cross-layer data-flow audit of
+// the config-election path): CFG16 is a STRUCTURAL loss below ~snr3k 23-24 dB. It has no
+// decode-margin headroom there, so an over-election to CFG16 hard-BREAKs and storms the ladder
+// (measured 4-22x WORSE delivered bytes than holding CFG15 at snr3k 18-20.8, deterministic
+// every cell). Holding CFG15 until the channel actually supports CFG16 is correct rate
+// adaptation (the same discipline the incumbent VARA applies), NOT a threshold band-aid: the
+// stock CFG15 rung carries every SNR below this, and CFG16 still elects (and completes) at high
+// SNR where the margin is real.
+//
+// The gate reuses the SAME reverse-path SNR the SUCCESS_BASED_LADDER climb already trusts
+// (elevator/turbo: get_configuration(SNR_uplink - SUPERSHIFT_MARGIN_DB)), with a LARGER
+// headroom, so the CFG16 election is strictly stronger than the raw CFG16 SNR edge (SNR>13).
+// The suffix SNR is quantized to 2 dB steps and saturates at +25 dB (WB range -5..+25,
+// mfsk snr_to_tone): moderate channels (snr3k ~20.8) report <= 21 dB and high channels
+// (snr3k ~28) saturate at 25 dB, with the snr3k~24 boundary reporting 23 dB. The 22.0 dB
+// threshold lands the cut squarely in that quantization gap (admits reports >= 23 dB, holds at
+// <= 21 dB), so the separation is robust against the meter's saturation and jitter rather than
+// leaning on a knife-edge SNR read. Defeat via MERCURY_DECODE_MARGIN_GATE_DEFEAT restores the
+// blanket CFG16 election (the pre-gate over-election, the fail-before arm).
+#define CFG16_MIN_SNR_DB 22.0
+
 // Controlled-elevator multi-rung jump BOUND (gearshift-climb-engine.md §15, the
 // DEEP-SNR over-climb regression fix). Even once the data-viable anchor has PROVEN
 // the OFDM tier (the §15 primary gate `is_ofdm_config(anchor)`), a single SNR-driven

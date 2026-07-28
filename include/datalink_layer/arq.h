@@ -1770,6 +1770,20 @@ public:
   // elevator_target_from_snr(). See §4.4 + the §5 audit family-B (INV-B1).
   int apply_bigblock_cooldown_cap(int proposed) const;
 
+  // CFG16 decode-margin election gate (cross-layer data-flow audit of the config-election
+  // path). cfg16_decode_margin_ok() is TRUE iff the reverse-path SNR report supports the CFG16
+  // top rung with CFG16_MIN_SNR_DB headroom (measurements.SNR_uplink > CFG16_MIN_SNR_DB); it
+  // fail-OPENs on an unmeasured SNR (-90 sentinel) so the pre-ACK path is byte-identical, and
+  // returns TRUE unconditionally when MERCURY_DECODE_MARGIN_GATE_DEFEAT is set (blanket CFG16,
+  // the fail-before arm). apply_cfg16_margin_cap() is an INDEX-MONOTONE never-raise clamp that
+  // holds a WB climb target at CFG15 while the gate is closed — the same shape as
+  // apply_bigblock_cooldown_cap(), applied at the SAME climb hooks so every CFG16-reaching
+  // producer (elevator / turbo supershift / connect-seed / optimizer / SUCCESS_BASED ladder-up)
+  // honors it. WB-only (NB sessions return `proposed` unchanged). Const (threshold compare only,
+  // no get_configuration). Defined in arq_commander.cc next to apply_bigblock_cooldown_cap().
+  bool cfg16_decode_margin_ok() const;
+  int  apply_cfg16_margin_cap(int proposed) const;
+
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
   // decodes NO LDPC data, so the canonical SNR_uplink producer
