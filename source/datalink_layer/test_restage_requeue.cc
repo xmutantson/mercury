@@ -138,16 +138,59 @@ int cl_arq_controller::test_restage_requeue_orphan()
 		(int)out.size(), (int)expect.size(), (int)len_ok, (int)order_ok, first_bad);
 	fflush(stdout);
 
-	if(len_ok && order_ok)
+	bool ordered_ok = len_ok && order_ok;
+	if(ordered_ok)
 	{
 		printf("[TEST-RESTAGE] PASS — in-flight block re-queued CONTIGUOUS + IN-ORDER "
 			"ahead of newer data, zero loss\n");
 		fflush(stdout);
-		return 0;
 	}
-	printf("[TEST-RESTAGE] FAIL — re-stage %s -> positional SHIFT (the WGN:25 silent "
-		"byte-corruption, first_bad=%d)\n",
-		!len_ok ? "DROPPED in-flight bytes" : "REORDERED the stream", first_bad);
+	else
+	{
+		printf("[TEST-RESTAGE] FAIL — re-stage %s -> positional SHIFT (the WGN:25 silent "
+			"byte-corruption, first_bad=%d)\n",
+			!len_ok ? "DROPPED in-flight bytes" : "REORDERED the stream", first_bad);
+		fflush(stdout);
+	}
+
+	// The defeat arm intentionally exercises the old ordering failure only.
+	if(defeat) return ordered_ok ? 0 : 1;
+
+	// Fail-closed capacity edge: a complete in-flight block that cannot fit
+	// must leave the FIFO, frames, and stream cursor untouched and drop the
+	// link. It must never insert a prefix and free the source frames.
+	this->fifo_buffer_tx.flush();
+	std::vector<char> full((size_t)FIFO_SZ - 50, (char)0x5A);
+	this->fifo_buffer_tx.push(full.data(), (int)full.size());
+	for(int f = 0; f < this->nMessages; f++)
+		this->messages_tx[f].status = FREE;
+	this->messages_tx[0].length       = 100;
+	this->messages_tx[0].status       = PENDING_ACK;
+	this->messages_tx[0].batch_seq_id = 31;
+	for(int j = 0; j < 100; j++) this->messages_tx[0].data[j] = (char)j;
+	this->tx_stream_stamp[31].valid = true;
+	this->tx_stream_stamp[31].start = 9000;
+	this->tx_stream_committed = 9100;
+	this->link_status = CONNECTED;
+	int occ_before = this->fifo_buffer_tx.get_size()
+	               - this->fifo_buffer_tx.get_free_size();
+	uint64_t cursor_before = this->tx_stream_committed;
+
+	restage_requeue_tx_messages();
+
+	int occ_after = this->fifo_buffer_tx.get_size()
+	              - this->fifo_buffer_tx.get_free_size();
+	bool refused_ok = this->link_status == DROPPED
+		&& this->messages_tx[0].status == PENDING_ACK
+		&& occ_after == occ_before
+		&& this->tx_stream_committed == cursor_before;
+	printf("[TEST-RESTAGE] capacity refusal: dropped=%d frame_held=%d "
+	       "fifo_unchanged=%d cursor_unchanged=%d -> %s\n",
+		this->link_status == DROPPED ? 1 : 0,
+		this->messages_tx[0].status == PENDING_ACK ? 1 : 0,
+		occ_after == occ_before ? 1 : 0,
+		this->tx_stream_committed == cursor_before ? 1 : 0,
+		refused_ok ? "PASS" : "FAIL");
 	fflush(stdout);
-	return 1;
+	return (ordered_ok && refused_ok) ? 0 : 1;
 }

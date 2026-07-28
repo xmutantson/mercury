@@ -758,7 +758,8 @@ public:
   //
   // SACK Design A Step 7 — OFDM SACK_RSP TX (RSP side). Builds the control
   // frame [batch_seq_id, bitmap_bytes, CRC8] and TX's it via send_batch() at
-  // the data configuration. Returns the wall-clock TX duration in ms
+  // the fixed robust SACK configuration for wide batches (the data
+  // configuration for compact-width batches). Returns the wall-clock TX duration in ms
   // (measured from the moment send_batch() is invoked until it returns;
   // this is the wire-occupancy figure compared against the legacy MFSK
   // SACK pattern's ~1168 ms — see SACK_DESIGN_A_PLAN.md §7.7).
@@ -766,6 +767,19 @@ public:
   // bitmap[i] = true iff frame i of the batch was RECEIVED.
   long long send_sack_v2_frame(const bool* bitmap, int nframes,
                                unsigned char batch_seq_id);
+  // Wide partial reports cannot use the 30-bit MFSK suffix. They ride one
+  // full-width SACK_RSP at a fixed, substantially more robust OFDM rung so
+  // both peers can switch PHY geometry without a new negotiation field.
+  static int sack_v2_wire_configuration(int data_config, int nframes)
+  {
+    if(nframes > MFSK_SACK_BITMAP_BITS
+       && data_config >= CONFIG_10 && data_config <= CONFIG_17)
+      return CONFIG_10;
+    return data_config;
+  }
+  void switch_sack_v2_phy(int configuration);
+  void arm_sack_v2_robust_rx();
+  void restore_sack_v2_rx_phy();
   // SACK Design A Step 8a — bsi-bump-and-transfer-prev helper, hoisted out of
   // send_sack_v2_frame() so the invariant fires regardless of which transport
   // (OFDM SACK_RSP or MFSK suffix ACK+SACK) carries the partial bitmap on the
@@ -4191,6 +4205,7 @@ public:
                                          // CMD: batch_seq_id field from the most
                                          //      recent CRC-validated SACK_RSP.
                                          //      -1 = none.
+  bool          cmd_sack_v2_robust_rx_armed = false;
   // Test-scaffold fault injection (CLI --test-rsp-sack-rsp-crc-corrupt). When
   // true, the next SACK_RSP frame the RSP transmits has its trailing CRC8 byte
   // XOR'd with 0xFF before TX. One-shot; clears after firing. Used to

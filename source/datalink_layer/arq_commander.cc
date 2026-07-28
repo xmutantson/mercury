@@ -1073,17 +1073,8 @@ void cl_arq_controller::process_messages_commander()
 					}
 					else
 					{
-						// Option W (data-flow-stream-offset.md §2.2, item O1): open-coded BREAK
-						// re-stage (bypasses restage_requeue_tx_messages) — un-commit the in-flight
-						// batch's transported bytes BEFORE re-queuing so the rebuild re-anchors at
-						// the same start offset the receiver delivered to.
-						stream_tx_rollback_inflight();
-						for(int i=nMessages-1; i>=0; i--)
-						{
-							if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-								fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
-							messages_tx[i].status = FREE;
-						}
+						// Re-stage through the ordered, capacity-checked funnel.
+						restage_requeue_tx_messages();
 						fifo_buffer_backup.flush();
 						clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 					}
@@ -1166,19 +1157,8 @@ void cl_arq_controller::process_messages_commander()
 				}
 				else
 				{
-					// Option W (F1/F4.1, silent-corruption-residual.md §16/§17.4): open-coded
-					// BREAK-EXHAUSTED re-stage (bypasses restage_requeue_tx_messages) — un-commit
-					// the in-flight batch's transported bytes BEFORE re-queuing so the rebuild
-					// re-anchors at the same start the receiver delivered to (mirrors the correct
-					// BREAK phase-1 leg :715; the compressed leg above rolls back inside
-					// restore_tx_from_compressed). WITHOUT this the RSP BACKSTOP false-tears-down.
-					stream_tx_rollback_inflight();
-					for(int i=nMessages-1; i>=0; i--)
-					{
-						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-							fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
-						messages_tx[i].status = FREE;
-					}
+					// Re-stage through the ordered, capacity-checked funnel.
+					restage_requeue_tx_messages();
 					fifo_buffer_backup.flush();
 					clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 				}
@@ -3229,6 +3209,10 @@ void cl_arq_controller::process_messages_tx_data()
 		v2_ackpat_defer_count_this_window = 0;  // Bug A fix (§7.13.1)
 		v2_dispatch_last_rwi = -1;               // §7.13.30 v2 dispatch throttle
 		v2_dispatch_min_advance_syms = 1;        // §7.13.30 default throttle interval
+		// A wide partial report rides the fixed robust full-width SACK_RSP
+		// configuration. This changes only the PHY decoder; current_configuration
+		// remains the live data rung for every ARQ and stale-partial decision.
+		arm_sack_v2_robust_rx();
 		// ACK pattern detection uses dedicated ack_mfsk — no config switch needed
 		if(ack_pattern_time_ms <= 0)
 			load_configuration(ack_configuration, PHYSICAL_LAYER_ONLY,NO);
@@ -4583,6 +4567,8 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 
 void cl_arq_controller::process_messages_rx_acks_data()
 {
+	if(receiving_timer.get_elapsed_time_ms() >= receiving_timeout)
+		restore_sack_v2_rx_phy();
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
 	{
 		if(ack_pattern_time_ms > 0)
@@ -5358,6 +5344,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 			if(sack_detected)
 			{
+				restore_sack_v2_rx_phy();
 				printf("[CMD-SACK] Partial batch ACK detected!\n");
 				printf("[CMD-SACK-DIAG] messages_tx status:");
 				for(int d = 0; d < data_batch_size; d++)
@@ -5627,6 +5614,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				SACK_TRACE("dar=YES via MFSK ACK_PAT path pre_detected=%d",
 					v2_ack_pat_pre_detected ? 1 : 0);
 				data_ack_received=YES;
+				restore_sack_v2_rx_phy();
 				consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
 				// CLEAN-BATCH VIABILITY (§9): this is the CLEAN (all-ones) ACK funnel
 				// — the MFSK all-ones suffix (v2_ack_pat_pre_detected, set at the
@@ -7254,20 +7242,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				}
 				else
 				{
-					// Option W (F1/F4.1, silent-corruption-residual.md §16/§17.4): open-coded
-					// GEARSHIFT FRAME-UP re-stage (bypasses restage_requeue_tx_messages) — un-commit
-					// the in-flight batch's transported bytes BEFORE re-queuing so the re-encoded
-					// batch (roll_back_cmd_bsi_to_inflight above re-uses the SAME bsi) re-anchors at
-					// the same start the receiver delivered to. WITHOUT this the mid-transfer climb
-					// latches stamp[bsi]={S+L,...} → RSP BACKSTOP false-teardown of a byte-correct
-					// session. Mirrors the correct BREAK phase-1 leg :715.
-					stream_tx_rollback_inflight();
-					for(int i=nMessages-1; i>=0; i--)
-					{
-						if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-							fifo_buffer_tx.push_front(messages_tx[i].data, messages_tx[i].length);
-						messages_tx[i].status = FREE;
-					}
+					// Re-stage through the ordered, capacity-checked funnel.
+					restage_requeue_tx_messages();
 					fifo_buffer_backup.flush();
 					clear_retx_queue();  // R029: recovery (non-compressed) re-queues plaintext; drop stale retx
 				}

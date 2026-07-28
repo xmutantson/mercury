@@ -8615,6 +8615,9 @@ int cl_arq_controller::test_demote_silence()
 
 void cl_arq_controller::reset_session_state()
 {
+	// A teardown may pre-empt a wide-SACK receive window. Never carry the
+	// temporary control PHY into the next session.
+	restore_sack_v2_rx_phy();
 	// FIX-6: drop any RX-delivery tail buffered behind a back-pressured app socket.
 	// A fresh session must not re-emit bytes from the previous connection's stream.
 	rx_deliver_pending_len = 0;
@@ -13265,7 +13268,8 @@ bool cl_arq_controller::rsp_resend_prev_partial_sack()
 	ack_tx_retx_turnaround = true;
 
 	bool sent = false;
-	if(MFSK_ACK_SACK_ENABLED
+	if(sack_win <= MFSK_SACK_BITMAP_BITS
+	   && MFSK_ACK_SACK_ENABLED
 	   && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 	{
 		uint32_t bitmap_u32 = 0;
@@ -13602,8 +13606,22 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	messages_batch_tx[0] = messages_control;  // struct-copy inherits valid .data
 	message_batch_counter_tx = 1;
 
-	// Full-length OFDM frame on the data configuration (NOT the MFSK ack
-	// config — SACK_RSP carries real LDPC-coded payload).
+	// A wide bitmap cannot ride the compact MFSK suffix. Move only the PHY to
+	// the deterministic robust SACK rung for this one control frame; the ARQ
+	// configuration and all batch/stream state remain anchored to the data
+	// configuration. The commander makes the same deterministic switch while
+	// waiting for the response.
+	int saved_phy_config = telecom_system->current_configuration;
+	int wire_config = sack_v2_wire_configuration(current_configuration, nframes);
+	if(wire_config != saved_phy_config)
+	{
+		printf("[TX-SACK-V2-PHY] sending %d-bit SACK_RSP on CONFIG_%d "
+			"(data CONFIG_%d)\n", nframes, wire_config, current_configuration);
+		fflush(stdout);
+		switch_sack_v2_phy(wire_config);
+	}
+
+	// Full-length OFDM frame (NOT the short MFSK control mode).
 	telecom_system->set_mfsk_ctrl_mode(false);
 	// SACK_DESIGN_A_PLAN §7.13.29 — REMOVED the §7.13.25 double-shot
 	// (`pad_messages_batch_tx(2)`). The trace data showed that BOTH copies
@@ -13615,8 +13633,9 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	// the same scroll happens to it too. Single-shot SACK_RSP at
 	// WB_CFG15 is ~540 ms wire — its preamble stays in the ring for the
 	// full duration, giving the cross-check a chance to actually find it.
-	// If single-shot proves unreliable on lossy channels we can revisit
-	// with a robust-config SACK_RSP TX (CFG10/CFG4) rather than redundancy.
+	// Wide reports now use a single CFG10 frame: robust enough for the
+	// marginal top-rung case without extending the bitmap exchange past the
+	// receive ring.
 
 	SACK_TRACE("RSP TX SACK_RSP: bsi=%u nframes=%d payload_len=%d crc8=0x%02x",
 		(unsigned)batch_seq_id, nframes, payload_len, (unsigned)crc);
@@ -13625,6 +13644,8 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		t_end - t_start).count();
+	if(saved_phy_config != telecom_system->current_configuration)
+		switch_sack_v2_phy(saved_phy_config);
 
 	// §7.13.32 — Release the staging slot AFTER the wire TX completes.
 	// send_batch() reads messages_control via messages_batch_tx[0] (the
@@ -13646,6 +13667,53 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	fflush(stdout);
 	SACK_TRACE("RSP TX SACK_RSP done: wire_ms=%lld tx_count=%lld", elapsed_ms, rsp_sack_v2_tx_count);
 	return elapsed_ms;
+}
+
+void cl_arq_controller::switch_sack_v2_phy(int configuration)
+{
+	if(telecom_system == NULL
+	   || telecom_system->current_configuration == configuration)
+		return;
+
+	// This is an ephemeral control-frame PHY switch, not an ARQ data-config
+	// transition. It must not resize the negotiated batch, move the byte-stream
+	// cursor, or invalidate the responder's partial-batch stamp.
+	telecom_system->data_container.frames_to_read = 0;
+	telecom_system->load_configuration(configuration);
+	telecom_system->set_mfsk_ctrl_mode(false);
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+}
+
+void cl_arq_controller::arm_sack_v2_robust_rx()
+{
+	cmd_sack_v2_robust_rx_armed = false;
+	if(!sack_v2_enabled || telecom_system == NULL)
+		return;
+	int wire_config = sack_v2_wire_configuration(current_configuration,
+		data_batch_size);
+	if(wire_config == current_configuration)
+		return;
+	if(telecom_system->current_configuration != wire_config)
+		switch_sack_v2_phy(wire_config);
+	cmd_sack_v2_robust_rx_armed =
+		(telecom_system->current_configuration == wire_config);
+	if(cmd_sack_v2_robust_rx_armed)
+	{
+		printf("[CMD-SACK-V2-PHY] listening for %d-bit SACK_RSP on CONFIG_%d "
+			"(data CONFIG_%d)\n",
+			data_batch_size, wire_config, current_configuration);
+		fflush(stdout);
+	}
+}
+
+void cl_arq_controller::restore_sack_v2_rx_phy()
+{
+	if(!cmd_sack_v2_robust_rx_armed)
+		return;
+	cmd_sack_v2_robust_rx_armed = false;
+	switch_sack_v2_phy(current_configuration);
 }
 
 // RSP-side TX wrapper: MFSK ACK+SACK pattern (16 base + 13 suffix = 29
@@ -17705,16 +17773,12 @@ void cl_arq_controller::rx_stream_invalidate_stamps()
 
 void cl_arq_controller::restage_requeue_tx_messages()
 {
-	// Option W (§2.2): un-commit the in-flight batch's transported bytes BEFORE they are
-	// re-queued, so the rebuild re-anchors at the SAME start offset. Must run while
-	// messages_tx[] still holds the in-flight frames (this funnel frees them below).
-	stream_tx_rollback_inflight();
-
 	bool defeat = false;
 	{ const char* e = std::getenv("MERCURY_RESTAGE_ORPHAN_DEFEAT");
 	  if(e && *e && atoi(e)!=0) defeat = true; }
 	if(defeat)
 	{
+		stream_tx_rollback_inflight();
 		// FAIL-BEFORE arm: the pre-fix buggy behavior — FORWARD-iter push() to the
 		// BACK, return ignored, unconditional FREE (reorders the re-sent block
 		// behind newer app data AND silently drops when full). Test-only.
@@ -17726,30 +17790,48 @@ void cl_arq_controller::restage_requeue_tx_messages()
 		}
 		return;
 	}
-	// FIXED: reverse-iter + push_front so frame slot 0 lands at the FRONT of the
-	// fifo (the in-flight block is CONTIGUOUS ahead of any newer app data, in slot
-	// order). CHECK the return so a would-be drop is surfaced LOUD, never a silent
-	// orphan. (The fifo ingestion reserve at receive_arq() keeps free >= in-flight
-	// so this shortfall path is not reached in production; it is the safety net.)
-	for(int i=nMessages-1;i>=0;i--)
+	int total_want = 0;
+	for(int i=0;i<nMessages;i++)
+		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+			total_want += messages_tx[i].length;
+	int free_before = fifo_buffer_tx.get_free_size();
+	if(total_want > free_before)
+	{
+		printf("[RESTAGE-ORPHAN] REFUSED: complete in-flight block needs %d bytes, "
+			"fifo has %d free — leaving every frame staged (fail closed; no "
+			"partial prefix splice); dropping the link for a clean restart\n",
+			total_want, free_before);
+		fflush(stdout);
+		link_status = DROPPED;
+		return;
+	}
+
+	// Assemble in slot order and make one all-or-nothing FIFO insertion. A failed
+	// push therefore cannot splice a prefix into the byte stream.
+	std::vector<char> inflight;
+	inflight.reserve((size_t)total_want);
+	for(int i=0;i<nMessages;i++)
 	{
 		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-		{
-			int want = messages_tx[i].length;
-			int pushed = fifo_buffer_tx.push_front(messages_tx[i].data, want);
-			if(pushed != want)
-			{
-				printf("[RESTAGE-ORPHAN] LOUD: fifo_buffer_tx lacked room to re-queue "
-					"in-flight frame slot=%d id=%d len=%d (pushed=%d free=%d) — reserve "
-					"invariant violated; bytes would ORPHAN (reassembly shift). Surfaced, "
-					"not silent.\n",
-					i, (int)(unsigned char)messages_tx[i].id, want, pushed,
-					fifo_buffer_tx.get_free_size());
-				fflush(stdout);
-			}
-		}
-		messages_tx[i].status = FREE;
+			inflight.insert(inflight.end(), messages_tx[i].data,
+				messages_tx[i].data + messages_tx[i].length);
 	}
+	if(total_want > 0
+	   && fifo_buffer_tx.push_front(inflight.data(), total_want) != total_want)
+	{
+		printf("[RESTAGE-ORPHAN] REFUSED: all-or-nothing FIFO insertion failed "
+			"after capacity preflight — leaving frames and cursor staged; "
+			"dropping the link for a clean restart\n");
+		fflush(stdout);
+		link_status = DROPPED;
+		return;
+	}
+
+	// Option W (§2.2): un-commit only after the complete block is safely back
+	// in the FIFO. The rebuild re-anchors at the same byte offset.
+	stream_tx_rollback_inflight();
+	for(int i=0;i<nMessages;i++)
+		messages_tx[i].status = FREE;
 }
 
 int cl_arq_controller::w_parse_eob_stamp(int stamp_off)

@@ -2774,7 +2774,8 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							// send_sack_v2_frame's byte-LSB-first convention at
 							// send_sack_v2_frame's byte-LSB-first convention).
 							bool used_mfsk_path = false;
-							if (MFSK_ACK_SACK_ENABLED
+							if (eff_window <= MFSK_SACK_BITMAP_BITS
+								&& MFSK_ACK_SACK_ENABLED
 								&& telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
 							{
 								uint32_t bitmap_u32 = 0;
@@ -14282,7 +14283,7 @@ int cl_arq_controller::test_sack_oow_reject()
 
 	this->sack_v2_enabled  = true;
 	this->sack_enabled     = true;
-	const int nframes      = 25;
+	const int nframes      = 90;
 	this->data_batch_size  = nframes;
 	// CMD window: cmd_bsi=10, prev_bsi=9. OOW value = 200 (neither).
 	this->cmd_batch_seq_id        = 10;
@@ -14313,9 +14314,12 @@ int cl_arq_controller::test_sack_oow_reject()
 
 	for(int c = 0; c < 3; c++)
 	{
-		// Build the payload: bsi + a non-zero bitmap (bit 0 set) + CRC8.
+		// Build the payload with one received slot above the compact suffix
+		// ceiling. This simultaneously exercises the full-width representation.
 		for(int b = 0; b < bitmap_bytes; b++) tmp_bitmap_byte[b] = 0;
-		tmp_bitmap_byte[0] = 0x01; // frame 0 reported received (non-empty bitmap)
+		const int wide_slot = 73;
+		tmp_bitmap_byte[wide_slot / 8] =
+			(unsigned char)(1u << (wide_slot % 8));
 
 		int payload_len = 1 + bitmap_bytes + 1;
 		// Compose into a local buffer to compute CRC8 over [bsi][bitmap].
@@ -14346,7 +14350,8 @@ int cl_arq_controller::test_sack_oow_reject()
 		bool would_apply_postfix = decoded && in_window;
 
 		bool case_ok = (decoded == cases[c].expect_decoded)
-		            && (in_window == cases[c].expect_in_window);
+		            && (in_window == cases[c].expect_in_window)
+		            && sack_bitmap_out[wide_slot];
 		if(!case_ok) pass = false;
 
 		printf("[TEST-SACK-OOW] case=%s rx_bsi=%u decoded=%d in_window=%d "
@@ -14360,6 +14365,15 @@ int cl_arq_controller::test_sack_oow_reject()
 
 		this->messages_rx_buffer.status = FREE;
 	}
+
+	bool wire_config_ok =
+		sack_v2_wire_configuration(CONFIG_16, nframes) == CONFIG_10
+		&& sack_v2_wire_configuration(CONFIG_16, MFSK_SACK_BITMAP_BITS) == CONFIG_16;
+	if(!wire_config_ok) pass = false;
+	printf("[TEST-SACK-OOW] wide transport: slot=73 round-tripped, "
+	       "CFG16/90->CFG10, CFG16/30->CFG16: %s\n",
+		wire_config_ok ? "OK" : "MISMATCH");
+	fflush(stdout);
 
 	// Sharper assertion: the OOW frame is decoded (root-cause gap proven) yet
 	// rejected by the window guard (fix proven). This is the exact fail-before
