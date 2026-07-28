@@ -7264,6 +7264,40 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// (already gated) holds CFG15. Cap the FRAME-UP target so the top rung is elected
 				// only when the reverse-path SNR supports it (never-raise; identity at high SNR).
 				negotiated_configuration = apply_cfg16_margin_cap(negotiated_configuration);
+				// NO-OP FRAME-UP SUPPRESSION (data-flow-gearshift-climb.md). The margin cap
+				// (and the moderate-SNR CFG16 decode-margin gate) can pull the FRAME-UP target
+				// back to the CURRENT config — a NO-OP "climb": proposed_frame was CFG15->16 but
+				// the gate holds CFG15, so negotiated == current. The commit block below still
+				// emits a FULL SET_CONFIG control round-trip (FIFO re-stage + clear_retx_queue +
+				// control-ACK + re-send) that changes NOTHING on the wire, burning a whole batch
+				// cycle EVERY eff_thresh clean batches while the channel sits below the CFG16
+				// viability floor. When the negotiated forward is IDENTICAL to the live config AND
+				// the reverse-ACK config is already established (reverse_configuration != CONFIG_NONE
+				// — the SET_CONFIG builder's LADDER path leaves reverse UNCHANGED in that case, so
+				// the frame would announce no forward AND no reverse change), SUPPRESS the redundant
+				// round-trip: reset the streak and resume DATA, PRESERVING the retx queue (NO
+				// clear_retx_queue — the in-flight batch stays valid at the unchanged config). A
+				// REAL config change (negotiated != current, e.g. the high-SNR CFG15->16 election
+				// once the margin gate opens, or any tier-cross) fails this guard and still commits
+				// the SET_CONFIG below, so config-sync is intact. Defeat: MERCURY_NOOP_SETCONFIG_KEEP
+				// restores the unconditional emit for A/B isolation.
+				{
+					static const bool noop_setconfig_keep =
+						(std::getenv("MERCURY_NOOP_SETCONFIG_KEEP") != nullptr);
+					if(!noop_setconfig_keep &&
+					   negotiated_configuration == current_configuration &&
+					   reverse_configuration != CONFIG_NONE)
+					{
+						printf("[GEARSHIFT] FRAME-UP NO-OP SUPPRESSED: negotiated config %d == "
+							"current (margin-gated climb target), reverse=%d unchanged -> skip "
+							"redundant SET_CONFIG round-trip, PRESERVE retx queue, resume DATA\n",
+							negotiated_configuration, reverse_configuration);
+						fflush(stdout);
+						consecutive_data_acks = 0;
+						connection_status = TRANSMITTING_DATA;
+						return;
+					}
+				}
 				printf("[GEARSHIFT] FRAME UP: %d consecutive ACKs (eff_thresh %d, base %d, clean-streak %d), config %d -> %d\n",
 					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
 					clean_batches_at_current_config, current_configuration, negotiated_configuration);
