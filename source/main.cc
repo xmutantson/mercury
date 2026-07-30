@@ -2061,6 +2061,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
             }
+            // START_CONNECTION bare-ACK causal gate: reject the impossible
+            // 263-ms detector hit, clear retained pre-epoch phases, and accept
+            // the genuine post-turnaround observation exactly once.
+            {
+                cl_telecom_system start_ack_ts;
+                cl_arq_controller ARQ_start_ack;
+                ARQ_start_ack.telecom_system = &start_ack_ts;
+                failed += ARQ_start_ack.test_start_ack_causal_guard();
+            }
             // OFDM ACQUISITION BOUNDS-GATE RECOVERY gate (data-flow-acq-bounds-gate.md):
             // a tail-band frame whose Schmidl-Cox detection floors past upper_bound but
             // whose body is still in-buffer must be RECOVERED, not force-FAILed/discarded;
@@ -2801,6 +2810,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-start-ack-causal-guard : run only the START_CONNECTION bare-
+        // ACK causal timing/ring-epoch regression. Fast, deterministic, no RF.
+        // -DSTART_ACK_CAUSAL_GUARD_FAILBEFORE reproduces the 263-ms advance.
+        if (strcmp(argv[i], "--test-start-ack-causal-guard") == 0) {
+            cl_telecom_system start_ack_ts;
+            cl_arq_controller ARQ_start_ack;
+            ARQ_start_ack.telecom_system = &start_ack_ts;
+            int failed = ARQ_start_ack.test_start_ack_causal_guard();
             return (failed == 0) ? 0 : 1;
         }
         // --test-zombie-amp : run ONLY the zombie/amplifier layer fail-before/

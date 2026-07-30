@@ -62,6 +62,16 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 
 int tx_transfer(double *buffer, size_t len);
 int rx_transfer(double *buffer, size_t len);
+int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len);
+
+// Paired capture/tag FIFO operations. Every production capture sample carries
+// a START-ACK causal-generation tag through the same reset/read lifecycle.
+int capture_write_samples(double *buffer, size_t len);
+void capture_reset_samples(void);
+int capture_causal_tag_guard_selftest(cl_telecom_system *telecom_system);
+// Conservative time from queued passband samples to physical/simulated output
+// egress, including the opened playback backend's retained-device bound.
+uint64_t playback_causal_egress_bound_ns(size_t queued_samples);
 
 
 void list_soundcards(int audio_system);

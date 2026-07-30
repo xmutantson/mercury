@@ -707,8 +707,14 @@ public:
   // ftr==0 phase the snapshot fired on. Scoped to the CONNECT handshake control
   // ACK only (arq_commander.cc:1981); DATA-ACK/BREAK/HAIL pass false ->
   // byte-identical. Does NOT restart receiving_timer or shrink ftr.
+  // causal_ring_samples is START-only. When >=0, it is the contiguous count
+  // of producer-tagged post-causal samples actually present at the newest
+  // edge of the capture-prep ring. Older samples are zero-masked in both
+  // newest and multiwindow snapshots. Other callers keep -1 and are
+  // byte-identical.
   bool receive_ack_pattern(bool defer_audio_advance = false,
-                           bool multiwindow_scan = false);
+                           bool multiwindow_scan = false,
+                           int causal_ring_samples = -1);
 
   // Multi-window DATA-ACK/SACK correlator (Track A, mwcorr;
   // fact-documents/data-flow-data-ack-sack-correlator.md). The steady
@@ -1233,6 +1239,31 @@ public:
   // ROBUST_0. Returns 0 on pass, 1 on fail. Default builds never call this.
   // See fact-documents/gearshift-start-and-recovery.md §8.
   int test_phantom_ack_gate();
+
+  // START_CONNECTION ACK causal guard. The bare ACK pattern has no payload or
+  // CRC, so a correlator hit is eligible only after the responder could have
+  // emitted enough ACK symbols. Production and --test-start-ack-causal-guard
+  // drive these exact helpers.
+  // Protocol minimum applied by the responder after a complete START decode,
+  // independent of station-local PTT settings and threshold-bias diagnostics.
+  static const int START_ACK_RESPONDER_MIN_DELAY_MS = 728;
+  static int start_ack_responder_delay_ms(int connect_pattern_nsymb,
+                                          int connect_suffix_nsymb,
+                                          int connect_match_threshold,
+                                          int symbol_samples);
+  static int start_ack_causal_audio_epoch_ms(int start_pattern_samples);
+  static int start_ack_causal_accept_floor_ms(int start_pattern_samples,
+                                              int ack_pattern_samples);
+  static int start_ack_causal_eligible_tail_samples(int causal_ring_samples,
+                                                     int phase_shift_samples,
+                                                     int tail_samples);
+  static bool start_ack_causal_should_poll(int causal_ring_samples,
+                                           int ack_pattern_samples);
+  uint32_t arm_start_ack_causal_capture(int samples_through_start_egress);
+  void refresh_start_ack_causal_after_playback_drain();
+  bool test_start_ack_causal_anchor_transfer();
+  bool test_start_ack_causal_post_drain_refresh();
+  int test_start_ack_causal_guard();
 
   // CLEAN-BATCH VIABILITY (§9, 2026-05-29) — PURE policy predicate. A batch may
   // drive the four gearshift promotion consumers (anchor-raise, panic reset,
@@ -5834,6 +5865,19 @@ public:
   int connect_fast_fallback_config; // config to revert to (ROBUST_0 on a robust session)
   int connect_fast_fallback_robust; // robust_enabled to restore on revert (the true robust intent)
   cl_timer connect_fast_timer;      // COMMANDER short-budget timer (armed at CONNECT)
+  // Bare START ACKs are CRC-less. Arm only after a successful MFSK START TX;
+  // the capture producer tags post-deadline samples and capture prep publishes
+  // their contiguous newest-ring count before the detector can run.
+  bool start_ack_causal_guard_armed;
+  // Anchored immediately before START enters tx_transfer(). Its deadline
+  // includes samples already queued ahead of START plus the opened playback
+  // sink's retained-device bound, so an optional pilot or output backlog
+  // cannot make pre-response capture eligible.
+  cl_timer start_ack_causal_timer;
+  // Production-path probe: the generation observed at the exact tx_transfer
+  // call site. The focused regression drives the real START helper and asserts
+  // this equals the generation published before transfer.
+  uint32_t start_ack_causal_tx_observed_generation;
   // R (DUTY fast-start) — the CONNECT-EVIDENCED robust exit target. The completed MFSK
   // CONNECT handshake decoded the robust tier end-to-end — the SAME confirmation the
   // incumbent otherwise spends ~38 s of robust DATA airtime to earn before the C1

@@ -17,6 +17,9 @@
  * not even parse under the C++ compiler). */
 #ifdef __cplusplus
 #include <atomic>
+#include <algorithm>
+#include <mutex>
+#include <vector>
 #else
 #include <stdatomic.h>
 #endif
@@ -137,6 +140,32 @@ static long tune_sample_index = 0;
 
 cbuf_handle_t capture_buffer;
 cbuf_handle_t playback_buffer;
+
+// START-ACK causal sample metadata. The ordinary capture FIFO and this
+// generation-tag FIFO are always written/read/reset as one pair under
+// capture_pair_mutex, so scheduler delay and capture FIFO backlog cannot make
+// an old sample look newer than the commander's published causal deadline.
+static cbuf_handle_t capture_causal_tag_buffer = NULL;
+static uint8_t *capture_causal_tag_storage = NULL;
+static cl_telecom_system *capture_telecom_system = NULL;
+#ifdef __cplusplus
+static std::mutex capture_pair_mutex;
+// Conservative maximum age of samples still queued inside the hardware
+// backend when audio->read has not returned them yet. Initialized fail-closed
+// and tightened from the opened backend's actual buffer length. The software
+// relay has no device queue and sets this to zero.
+static std::atomic<uint64_t> capture_source_queue_guard_ns{
+	100ULL * 1000000ULL};
+// Upper bound from the playback thread consuming a sample to the opened
+// backend rendering it. The sample-rate value is the post-open rate; a slower
+// negotiated rate lengthens the queued-sample duration instead of silently
+// making the START causal deadline early.
+static std::atomic<uint64_t> playback_sink_queue_guard_ns{
+	100ULL * 1000000ULL};
+static std::atomic<uint32_t> playback_sink_sample_rate_hz{48000U};
+static thread_local uint32_t capture_writer_seen_generation = 0;
+static thread_local bool capture_writer_causal_ready = false;
+#endif
 
 int audio_subsystem;
 
@@ -692,6 +721,17 @@ void *radio_playback_thread(void *device_ptr)
 		(cfg->format == FFAUDIO_F_INT16) ? "INT16" : (cfg->format == FFAUDIO_F_INT32) ? "INT32" : (cfg->format == FFAUDIO_F_FLOAT32) ? "FLOAT32" : "UNKNOWN",
 		cfg->sample_rate, cfg->channels, cfg->buffer_length_msec);
 	fflush(stdout);
+	{
+		const uint64_t buffer_ms = cfg->buffer_length_msec > 0
+			? (uint64_t)cfg->buffer_length_msec : 100ULL;
+		const uint32_t sample_rate = cfg->sample_rate > 0
+			? (uint32_t)cfg->sample_rate : 48000U;
+		// As on capture, use twice the opened backend buffer because several
+		// backends partition the requested buffer internally.
+		playback_sink_queue_guard_ns.store(
+			2ULL * buffer_ms * 1000000ULL);
+		playback_sink_sample_rate_hz.store(sample_rate);
+	}
 
 
 	frame_size = cfg->channels * (cfg->format & 0xff) / 8;
@@ -961,6 +1001,298 @@ cleanup_play:
 }
 
 
+static uint32_t capture_causal_begin_chunk(
+	uint32_t generation,
+	uint32_t *seen_generation,
+	bool *causal_ready)
+{
+	if(generation != *seen_generation)
+	{
+		*seen_generation = generation;
+		*causal_ready = false;
+	}
+	return (generation != 0 && *causal_ready) ? generation : 0;
+}
+
+static void capture_causal_commit_chunk(
+	uint32_t generation,
+	uint64_t deadline_ns,
+	uint64_t now_ns,
+	uint64_t source_guard_ns,
+	uint32_t *seen_generation,
+	bool *causal_ready)
+{
+	if(generation == 0 || *seen_generation != generation) return;
+	if(now_ns >= deadline_ns
+	   && now_ns - deadline_ns >= source_guard_ns)
+	{
+		// The crossing chunk may still contain queued/pre-deadline audio.
+		// Keep its label zero; this state applies to the following chunk.
+		*causal_ready = true;
+	}
+}
+
+static void capture_publish_causal_ring_chunk(
+	cl_data_container *dc,
+	const uint32_t *tags,
+	int symbol_period,
+	int signal_period)
+{
+	if(!dc->start_ack_causal_tracking_available) return;
+	const uint32_t generation =
+		dc->start_ack_causal_generation.load();
+	int trailing = 0;
+	while(trailing < symbol_period
+	      && generation != 0
+	      && tags[(size_t)symbol_period - 1U - (size_t)trailing]
+			== generation)
+		trailing++;
+
+	int causal_samples = 0;
+	if(trailing == symbol_period)
+	{
+		causal_samples = dc->start_ack_causal_ring_samples.load();
+		if(causal_samples < 0) causal_samples = 0;
+		if(causal_samples <= signal_period - symbol_period)
+			causal_samples += symbol_period;
+		else
+			causal_samples = signal_period;
+	}
+	else
+	{
+		// Producer writes and demod symbols can have different sizes.
+		causal_samples = trailing;
+	}
+	if(causal_samples > signal_period)
+		causal_samples = signal_period;
+	dc->start_ack_causal_ring_samples = causal_samples;
+	// Publish generation last: a matching generation observed by the
+	// commander always sees this chunk's sample count.
+	dc->start_ack_causal_ring_generation = generation;
+}
+
+uint64_t playback_causal_egress_bound_ns(size_t queued_samples)
+{
+	uint64_t rate = playback_sink_sample_rate_hz.load();
+	if(rate == 0 || rate > 48000ULL) rate = 48000ULL;
+	const uint64_t samples = (uint64_t)queued_samples;
+	const uint64_t whole_seconds = samples / rate;
+	const uint64_t remainder = samples % rate;
+	uint64_t duration_ns = UINT64_MAX;
+	if(whole_seconds <= UINT64_MAX / 1000000000ULL)
+	{
+		duration_ns = whole_seconds * 1000000000ULL;
+		const uint64_t rem_ns =
+			(remainder * 1000000000ULL + rate - 1ULL) / rate;
+		if(duration_ns <= UINT64_MAX - rem_ns)
+			duration_ns += rem_ns;
+		else
+			duration_ns = UINT64_MAX;
+	}
+	const uint64_t guard_ns = playback_sink_queue_guard_ns.load();
+	if(duration_ns > UINT64_MAX - guard_ns) return UINT64_MAX;
+	return duration_ns + guard_ns;
+}
+
+int capture_causal_tag_guard_selftest(cl_telecom_system *telecom_system)
+{
+	uint32_t seen = 0;
+	bool ready = false;
+	const uint32_t generation = 7;
+	const uint64_t deadline = 1000;
+	const uint64_t guard = 300;
+
+	// Three immediately returned device chunks after the causal deadline are
+	// still within the configured device-queue bound and must remain old.
+	const uint64_t queued_times[] = {1000, 1100, 1200};
+	for(size_t i = 0; i < sizeof(queued_times)/sizeof(queued_times[0]); i++)
+	{
+		if(capture_causal_begin_chunk(
+			generation, &seen, &ready) != 0) return 1;
+		capture_causal_commit_chunk(
+			generation, deadline, queued_times[i], guard,
+			&seen, &ready);
+	}
+	// The boundary-crossing chunk is also excluded; only its successor is
+	// eligible for this generation.
+	if(capture_causal_begin_chunk(generation, &seen, &ready) != 0)
+		return 1;
+	capture_causal_commit_chunk(
+		generation, deadline, deadline + guard,
+		guard, &seen, &ready);
+	if(capture_causal_begin_chunk(generation, &seen, &ready)
+	   != generation)
+		return 1;
+
+	// A new START generation immediately invalidates prior readiness.
+	if(capture_causal_begin_chunk(
+		generation + 1U, &seen, &ready) != 0)
+		return 1;
+
+	// Exercise the real paired write/read and the same prep-publication helper
+	// used by radio_capture_prep_thread. Standalone focused/full tests have no
+	// audio backend; if one is active, leave it untouched and retain the pure
+	// producer-state coverage above.
+	if(capture_buffer != NULL || capture_causal_tag_buffer != NULL
+	   || telecom_system == NULL)
+		return 0;
+
+	const size_t sample_capacity = 4096;
+	const size_t tag_capacity =
+		(sample_capacity / sizeof(double)) * sizeof(uint32_t);
+	uint8_t *sample_storage = (uint8_t *)malloc(sample_capacity);
+	uint8_t *tag_storage = (uint8_t *)malloc(tag_capacity);
+	if(sample_storage == NULL || tag_storage == NULL)
+	{
+		free(sample_storage);
+		free(tag_storage);
+		return 1;
+	}
+
+	capture_buffer = circular_buf_init(sample_storage, sample_capacity);
+	capture_causal_tag_buffer =
+		circular_buf_init(tag_storage, tag_capacity);
+	capture_causal_tag_storage = tag_storage;
+	capture_telecom_system = telecom_system;
+	cl_data_container& dc = telecom_system->data_container;
+	dc.start_ack_causal_tracking_available = 1;
+	dc.start_ack_causal_generation = 19;
+	dc.start_ack_causal_ring_generation = 0;
+	dc.start_ack_causal_ring_samples = 0;
+
+	capture_writer_seen_generation = 19;
+	capture_writer_causal_ready = true;
+	double samples[8] = {};
+	uint32_t read_tags[8] = {};
+	int failed = 0;
+	if(capture_write_samples(samples, 8) != 0
+	   || rx_transfer_with_causal_tags(samples, read_tags, 8) != 0)
+		failed = 1;
+	for(int i = 0; i < 8; i++)
+		if(read_tags[i] != 19) failed = 1;
+	capture_publish_causal_ring_chunk(&dc, read_tags, 8, 64);
+	if(dc.start_ack_causal_ring_generation.load() != 19
+	   || dc.start_ack_causal_ring_samples.load() != 8)
+		failed = 1;
+
+	// Reset invalidates already-read old-generation tags. Publishing that
+	// in-flight chunk cannot recreate an eligible suffix.
+	uint32_t old_tags[8];
+	memcpy(old_tags, read_tags, sizeof(old_tags));
+	capture_reset_samples();
+	const uint32_t reset_generation =
+		dc.start_ack_causal_generation.load();
+	capture_publish_causal_ring_chunk(&dc, old_tags, 8, 64);
+	if(reset_generation == 19
+	   || dc.start_ack_causal_ring_generation.load() != reset_generation
+	   || dc.start_ack_causal_ring_samples.load() != 0)
+		failed = 1;
+
+	// The next genuinely current-generation chunk advances through the same
+	// paired FIFO and prep seam.
+	capture_writer_seen_generation = reset_generation;
+	capture_writer_causal_ready = true;
+	memset(read_tags, 0, sizeof(read_tags));
+	if(capture_write_samples(samples, 8) != 0
+	   || rx_transfer_with_causal_tags(samples, read_tags, 8) != 0)
+		failed = 1;
+	capture_publish_causal_ring_chunk(&dc, read_tags, 8, 64);
+	if(dc.start_ack_causal_ring_generation.load() != reset_generation
+	   || dc.start_ack_causal_ring_samples.load() != 8)
+		failed = 1;
+
+	dc.start_ack_causal_tracking_available = 0;
+	dc.start_ack_causal_ring_generation = 0;
+	dc.start_ack_causal_ring_samples = 0;
+	free(capture_buffer->buffer);
+	circular_buf_free(capture_buffer);
+	capture_buffer = NULL;
+	free(capture_causal_tag_buffer->buffer);
+	circular_buf_free(capture_causal_tag_buffer);
+	capture_causal_tag_buffer = NULL;
+	capture_causal_tag_storage = NULL;
+	capture_telecom_system = NULL;
+	capture_writer_seen_generation = 0;
+	capture_writer_causal_ready = false;
+	return failed;
+}
+
+int capture_write_samples(double *buffer, size_t len)
+{
+	if(capture_causal_tag_buffer == NULL || capture_telecom_system == NULL)
+		return write_buffer(capture_buffer, (uint8_t *)buffer,
+			len * sizeof(double));
+
+	cl_data_container *dc = &capture_telecom_system->data_container;
+	const uint32_t generation = dc->start_ack_causal_generation.load();
+	const uint32_t chunk_tag = capture_causal_begin_chunk(
+		generation, &capture_writer_seen_generation,
+		&capture_writer_causal_ready);
+
+	static thread_local std::vector<uint32_t> tags;
+	tags.assign(len, chunk_tag);
+
+	const size_t sample_bytes = len * sizeof(double);
+	const size_t tag_bytes = len * sizeof(uint32_t);
+	int result = -1;
+	{
+		std::lock_guard<std::mutex> pair_guard(capture_pair_mutex);
+		if(circular_buf_free_size(capture_buffer) >= sample_bytes
+		   && circular_buf_free_size(capture_causal_tag_buffer) >= tag_bytes)
+		{
+			// Tags first: a reader can never observe samples without their
+			// paired generation metadata.
+			if(write_buffer(capture_causal_tag_buffer,
+					(uint8_t *)tags.data(), tag_bytes) == 0
+			   && write_buffer(capture_buffer,
+					(uint8_t *)buffer, sample_bytes) == 0)
+				result = 0;
+		}
+	}
+
+	const uint64_t now_ns = sim_clock_now_ns();
+	const uint64_t deadline_ns =
+		dc->start_ack_causal_deadline_ns.load();
+	const uint64_t source_guard_ns =
+		capture_source_queue_guard_ns.load();
+	if(result == 0
+	   && dc->start_ack_causal_generation.load() == generation)
+	{
+		capture_causal_commit_chunk(
+			generation, deadline_ns, now_ns, source_guard_ns,
+			&capture_writer_seen_generation,
+			&capture_writer_causal_ready);
+	}
+	return result;
+}
+
+void capture_reset_samples(void)
+{
+	if(capture_buffer == NULL) return;
+	std::lock_guard<std::mutex> pair_guard(capture_pair_mutex);
+	circular_buf_reset(capture_buffer);
+	if(capture_causal_tag_buffer != NULL)
+		circular_buf_reset(capture_causal_tag_buffer);
+	if(capture_telecom_system != NULL)
+	{
+		cl_data_container& dc = capture_telecom_system->data_container;
+		const uint32_t current =
+			dc.start_ack_causal_generation.load();
+		if(current != 0)
+		{
+			uint32_t next = current + 1U;
+			if(next == 0) next = 1U;
+			// Invalidate any chunk that prep pulled before this reset but has
+			// not yet published into the demod ring.
+			dc.start_ack_causal_generation = next;
+		}
+		capture_telecom_system->data_container
+			.start_ack_causal_ring_generation = 0;
+		capture_telecom_system->data_container
+			.start_ack_causal_ring_samples = 0;
+	}
+}
+
 void *radio_capture_thread(void *device_ptr)
 {
     // GUARD 1: never open a real capture device while -x sim is active.
@@ -1097,6 +1429,17 @@ void *radio_capture_thread(void *device_ptr)
 		(cfg->format == FFAUDIO_F_INT16) ? "INT16" : (cfg->format == FFAUDIO_F_INT32) ? "INT32" : (cfg->format == FFAUDIO_F_FLOAT32) ? "FLOAT32" : "UNKNOWN",
 		cfg->sample_rate, cfg->channels, cfg->buffer_length_msec);
 	fflush(stdout);
+	// A backend may return several immediately available periods after a
+	// scheduler stall. Its opened buffer length bounds the age of retained
+	// device samples; use twice the reported value (WASAPI/DSound commonly
+	// partition the requested buffer internally) and still exclude the whole
+	// deadline-crossing chunk in capture_write_samples().
+	{
+		const uint64_t buffer_ms = cfg->buffer_length_msec > 0
+			? (uint64_t)cfg->buffer_length_msec : 100ULL;
+		capture_source_queue_guard_ns.store(
+			2ULL * buffer_ms * 1000000ULL);
+	}
 
     frame_size = cfg->channels * (cfg->format & 0xff) / 8;
     msec_bytes = cfg->sample_rate * frame_size / 1000;
@@ -1307,7 +1650,7 @@ void *radio_capture_thread(void *device_ptr)
 
 		// Write (possibly gained) samples to capture_buffer for Mercury's core
 		if (circular_buf_free_size(capture_buffer) >= frames_to_write * sizeof(double))
-			write_buffer(capture_buffer, (uint8_t *)buffer_internal, frames_to_write * sizeof(double));
+			capture_write_samples(buffer_internal, (size_t)frames_to_write);
 		else
 			printf("Buffer full in capture buffer!\n");
 	}
@@ -1356,6 +1699,7 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 	cl_telecom_system *telecom_ptr = (cl_telecom_system *) telecom_ptr_void;
 
 	double *buffer_temp = (double *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(double) * 2);
+	std::vector<uint32_t> causal_tags;
 
 	// [C1-LOCKWAIT] benchmark-probe accumulators (function-scope so the exit
 	// summary can report the true running max even when it never crossed the
@@ -1405,7 +1749,14 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 			if (shutdown_) break;
 		}
 
-		rx_transfer(buffer_temp, symbol_period);
+		causal_tags.resize((size_t)symbol_period);
+		if(rx_transfer_with_causal_tags(
+			buffer_temp, causal_tags.data(), (size_t)symbol_period) != 0)
+		{
+			// Paired FIFO metadata is a fail-closed integrity boundary. Do not
+			// place an untagged sample into the demod ring.
+			continue;
+		}
 
 		// DIAG: capture peak amplitude (every 200 symbols ~4.5s for WB)
 		{
@@ -1544,6 +1895,10 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 				}
 				data_container_ptr->ring_write_index =
 					(wi + symbol_period) % sp;
+
+				capture_publish_causal_ring_chunk(
+					data_container_ptr, causal_tags.data(),
+					symbol_period, sp);
 			}
 
 			data_container_ptr->frames_to_read--;
@@ -1953,7 +2308,7 @@ void *sim_rx_bridge_thread(void *unused)
 			if (!sim_clock_enabled() && ++spins > 5000) break;  // ~10 s safety
 		}
 		if (shutdown_) break;
-		write_buffer(capture_buffer, (uint8_t *)chunk, chunk_bytes);
+		capture_write_samples(chunk, SIM_CHUNK_SAMPLES);
 	}
 	free(chunk);
 	return NULL;
@@ -1977,12 +2332,37 @@ int tx_transfer(double *buffer, size_t len)
 }
 
 // size in "double" samples
-int rx_transfer(double *buffer, size_t len)
+int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len)
 {
 	uint8_t *buffer_internal = (uint8_t *) buffer;
 	int buffer_size_bytes = len * sizeof(double);
 
-	read_buffer(capture_buffer, buffer_internal, buffer_size_bytes);
+	if(capture_causal_tag_buffer != NULL)
+	{
+		static thread_local std::vector<uint32_t> discard_tags;
+		if(tags == NULL)
+		{
+			discard_tags.resize(len);
+			tags = discard_tags.data();
+		}
+		const size_t tag_bytes = len * sizeof(uint32_t);
+		std::lock_guard<std::mutex> pair_guard(capture_pair_mutex);
+		if(size_buffer(capture_buffer) < (size_t)buffer_size_bytes
+		   || size_buffer(capture_causal_tag_buffer) < tag_bytes)
+			return -1;
+		if(read_buffer(capture_causal_tag_buffer,
+				(uint8_t *)tags, tag_bytes) != 0)
+			return -1;
+		if(read_buffer(capture_buffer,
+				buffer_internal, buffer_size_bytes) != 0)
+			return -1;
+	}
+	else
+	{
+		read_buffer(capture_buffer, buffer_internal, buffer_size_bytes);
+		if(tags != NULL)
+			memset(tags, 0, len * sizeof(uint32_t));
+	}
 
 	// SIM virtual clock: every double the modem pulls off the RX boundary is
 	// one sample of channel time. Advancing here makes virtual time track the
@@ -2005,6 +2385,11 @@ int rx_transfer(double *buffer, size_t len)
     return 0;
 }
 
+int rx_transfer(double *buffer, size_t len)
+{
+	return rx_transfer_with_causal_tags(buffer, NULL, len);
+}
+
 
 int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsys, pthread_t *radio_capture,
 						  pthread_t *radio_playback, pthread_t *radio_capture_prep, cl_telecom_system *telecom_system)
@@ -2025,8 +2410,21 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
     playback_buffer = circular_buf_init_shm(AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
 #endif
 
-	clear_buffer(capture_buffer);
+	const size_t capture_tag_capacity =
+		(AUDIO_PAYLOAD_BUFFER_SIZE / sizeof(double)) * sizeof(uint32_t);
+	capture_causal_tag_storage =
+		(uint8_t *)malloc(capture_tag_capacity);
+	if(capture_causal_tag_storage != NULL)
+		capture_causal_tag_buffer = circular_buf_init(
+			capture_causal_tag_storage, capture_tag_capacity);
+	capture_telecom_system = telecom_system;
+	telecom_system->data_container.start_ack_causal_tracking_available =
+		capture_causal_tag_buffer != NULL ? 1 : 0;
+	capture_reset_samples();
 	clear_buffer(playback_buffer);
+	capture_source_queue_guard_ns.store(100ULL * 1000000ULL);
+	playback_sink_queue_guard_ns.store(100ULL * 1000000ULL);
+	playback_sink_sample_rate_hz.store(48000U);
 
 #if defined(_WIN32)
     capture_prep_mutex = CreateMutex(NULL, FALSE, NULL);
@@ -2040,6 +2438,8 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
         // device threads abort-before-render if ever entered, and the harness's
         // GUARD 2 can confirm this binary is sim-safe by grepping the marker.
         g_sim_audio_guard_active = 1;
+        capture_source_queue_guard_ns.store(0);
+        playback_sink_queue_guard_ns.store(0);
         printf("[SIM] software channel backend active (no audio device) %s\n",
                SIM_AUDIO_GUARD_MARKER);
         fflush(stdout);
@@ -2069,6 +2469,18 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 #if ENABLE_FLOAT64_TAP_BEFORE == 1
 	fclose(tap_play);
 #endif
+
+	if(capture_telecom_system != NULL)
+		capture_telecom_system->data_container
+			.start_ack_causal_tracking_available = 0;
+	if(capture_causal_tag_buffer != NULL)
+	{
+		free(capture_causal_tag_buffer->buffer);
+		circular_buf_free(capture_causal_tag_buffer);
+		capture_causal_tag_buffer = NULL;
+		capture_causal_tag_storage = NULL;
+	}
+	capture_telecom_system = NULL;
 
 #if defined(_WIN32)
 	CloseHandle(capture_prep_mutex);

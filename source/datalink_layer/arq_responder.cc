@@ -229,7 +229,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 					* telecom_system->data_container.buffer_Nsymb
 					* telecom_system->data_container.interpolation_rate;
 				MUTEX_LOCK(&capture_prep_mutex);
-				circular_buf_reset(capture_buffer);
+				capture_reset_samples();
 				memset(telecom_system->data_container.passband_delayed_data, 0,
 					2 * buf_samples * sizeof(double));
 				telecom_system->data_container.ring_write_index = 0;
@@ -315,14 +315,14 @@ void cl_arq_controller::process_messages_rx_data_control()
 				// pattern = connect_pattern_nsymb base + suffix_len suffix.
 				// Wait (pattern_len - threshold) symbols + 200 ms margin so
 				// CMD's trailing TX doesn't echo into our pattern ACK.
-				int sym_ms = (telecom_system->data_container.Nofdm
-					* telecom_system->data_container.interpolation_rate * 1000) / 48000;
-				int remaining_syms =
-					telecom_system->ack_mfsk.connect_pattern_nsymb
-					+ telecom_system->ack_mfsk.ack_sack_suffix_len()
-					- telecom_system->ack_mfsk.connect_match_threshold;
-				if(remaining_syms < 0) remaining_syms = 0;
-				int delay_ms = remaining_syms * sym_ms + 200;
+				const int sym_samples =
+					telecom_system->data_container.Nofdm
+					* telecom_system->data_container.interpolation_rate;
+				const int delay_ms = start_ack_responder_delay_ms(
+					telecom_system->ack_mfsk.connect_pattern_nsymb,
+					telecom_system->ack_mfsk.ack_sack_suffix_len(),
+					telecom_system->ack_mfsk.connect_match_threshold,
+					sym_samples);
 				printf("[RSP-CONNECT-V2] Waiting %d ms (HAIL race delay) "
 					"before synthesizing messages_rx_buffer\n", delay_ms);
 				fflush(stdout);
@@ -4245,7 +4245,7 @@ void cl_arq_controller::process_control_responder()
 						* telecom_system->data_container.buffer_Nsymb
 						* telecom_system->data_container.interpolation_rate;
 					MUTEX_LOCK(&capture_prep_mutex);
-					circular_buf_reset(capture_buffer);
+					capture_reset_samples();
 					memset(telecom_system->data_container.passband_delayed_data, 0,
 						2 * buf_samples * sizeof(double));
 					telecom_system->data_container.ring_write_index = 0;

@@ -2222,6 +2222,15 @@ void cl_arq_controller::process_messages_tx_control()
 			messages_control.data[0] == START_CONNECTION
 			&& narrowband_enabled != YES
 			&& telecom_system->ack_mfsk.connect_pattern_nsymb > 0;
+		if(messages_control.data[0] == START_CONNECTION)
+		{
+			// Every START transmission owns a fresh causal epoch. A fallback
+			// LDPC START leaves the MFSK-only guard disarmed; a successful MFSK
+			// send below anchors its causal timer at START audio transfer.
+			start_ack_causal_guard_armed = false;
+			start_ack_causal_timer.stop();
+			start_ack_causal_timer.reset();
+		}
 		// Phase B Wave 3 — PHY swap site E (fact-doc §14).
 		// TEST_CONNECTION (CMD→RSP) gets the same MFSK suffix treatment as
 		// START_CONNECTION. The legacy LDPC build at arq_commander.cc:463-477
@@ -2241,6 +2250,7 @@ void cl_arq_controller::process_messages_tx_control()
 			long long elapsed = send_mfsk_start_conn_phy(base_call);
 			if(elapsed > 0)
 			{
+				messages_control.ack_timer.start();
 				printf("[CMD-CONNECT-V2] MFSK START_CONN sent (%lld ms wall-clock)\n",
 					elapsed);
 				fflush(stdout);
@@ -2248,8 +2258,8 @@ void cl_arq_controller::process_messages_tx_control()
 				// for CONTROL frames at arq_common.cc:3668-3672 (post-batch
 				// loop), so the legacy state machine sees the same transition
 				// it would after an LDPC TX.
-				messages_control.ack_timer.start();
 				messages_control.status = PENDING_ACK;
+				start_ack_causal_guard_armed = true;
 				// Clear the batch slot we filled at line :753 / :688 — the
 				// LDPC TX path resets it inside send_batch (arq_common.cc:3674-3679).
 				for(int i = 0; i < message_batch_counter_tx; i++)
@@ -3386,7 +3396,70 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				// an older phase). Scoped to START_CONNECTION only — the steady
 				// DATA-ACK and other control waits are unaffected.
 				bool mw_scan = (messages_control.data[0] == START_CONNECTION);
-				if(receive_ack_pattern(false, mw_scan))
+				int causal_ring_samples = -1;
+				if(mw_scan && start_ack_causal_guard_armed)
+				{
+					cl_data_container& dc = telecom_system->data_container;
+					if(dc.start_ack_causal_tracking_available)
+					{
+						const uint32_t generation =
+							dc.start_ack_causal_generation.load();
+						causal_ring_samples =
+							dc.start_ack_causal_ring_generation.load()
+								== generation
+							? dc.start_ack_causal_ring_samples.load()
+							: 0;
+					}
+					else if(arq_sim_inproc_active())
+					{
+						// An installed in-process pump is the authoritative
+						// signal for both single- and two-instance harnesses.
+						// They own no async capture producer/tag FIFO; the pump
+						// drains each synthetic symbol synchronously, so retain
+						// their sample-count model without enabling this
+						// fallback in any production/audio-backed mode.
+						const uint64_t now_ns = sim_clock_now_ns();
+						const uint64_t deadline_ns =
+							dc.start_ack_causal_deadline_ns.load();
+						const uint64_t causal_ns =
+							now_ns >= deadline_ns
+								? now_ns - deadline_ns : 0;
+						const uint64_t samples =
+							(causal_ns / 1000000ULL) * 48ULL
+							+ ((causal_ns % 1000000ULL) * 48ULL)
+								/ 1000000ULL;
+						causal_ring_samples =
+							samples > 0x7FFFFFFFULL
+								? 0x7FFFFFFF : (int)samples;
+					}
+					else
+					{
+						// If capture metadata could not be initialized, never
+						// accept a CRC-less START ACK from unclassified audio.
+						causal_ring_samples = 0;
+					}
+
+					if(!start_ack_causal_should_poll(
+						causal_ring_samples,
+						telecom_system->ack_pattern_passband_samples))
+					{
+						// Keep the capture-prep ring advancing while the
+						// causal window matures; a stuck ftr==0 would freeze
+						// the exact ACK audio this guard is waiting for.
+						MUTEX_LOCK(&capture_prep_mutex);
+						telecom_system->data_container.frames_to_read = 2;
+						telecom_system->data_container.nUnder_processing_events = 0;
+						MUTEX_UNLOCK(&capture_prep_mutex);
+						return;
+					}
+#ifdef START_ACK_CAUSAL_GUARD_FAILBEFORE
+					// Exact pre-correction behavior for deterministic RED coverage:
+					// no timing gate and no causal history mask.
+					causal_ring_samples = -1;
+#endif
+				}
+				if(receive_ack_pattern(
+					false, mw_scan, causal_ring_samples))
 				{
 					printf("[CMD-ACK-PAT] Control ACK for code=%d detected! elapsed=%dms link=%d status=%d\n",
 					(int)messages_control.data[0], (int)receiving_timer.get_elapsed_time_ms(), (int)link_status, (int)messages_control.status);
@@ -3400,6 +3473,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					gear_shift_timer.reset();
 					messages_control.status=ACKED;
 					stats.nAcked_control++;
+					if(mw_scan)
+						start_ack_causal_guard_armed = false;
 
 					// Guard delay: wait for the radio TX→RX transition to settle.
 					// v9.2: dropped the extra +200ms software margin. The control-ACK
@@ -8854,7 +8929,7 @@ void cl_arq_controller::process_control_commander()
 				// wait is moot (no-op); the circular_buf_reset below still fires.
 				// Verbatim msleep(50) on production / paced sim.
 				sim_inproc_rx_mute_settle(50); // RX_MUTE_GUARD_MS — let in-flight audio callbacks drain
-				circular_buf_reset(capture_buffer);
+				capture_reset_samples();
 				{
 					int buf_samples = telecom_system->data_container.Nofdm
 						* telecom_system->data_container.buffer_Nsymb
@@ -11259,6 +11334,463 @@ int cl_arq_controller::test_phantom_ack_gate()
 
 	printf("[TEST-PHANTOM-ACK] %s (%d failure%s)\n",
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// START_CONNECTION bare-ACK causal guard.
+//
+// The responder's deliberate post-decode race delay is:
+//   D = (connect base + suffix - connect threshold) * floor(symbol_ms) + 200.
+// D is clamped to START_ACK_RESPONDER_MIN_DELAY_MS in the responder, making it
+// a protocol minimum rather than a station-local threshold-tuning side effect.
+//
+// The commander timer is anchored immediately before the first START waveform
+// sample enters tx_transfer(). A peer cannot complete the CRC-protected START
+// decode before the whole START waveform has been transferred, and then must
+// wait at least the fixed protocol minimum. With remote PTT/pilot minima of
+// zero, the peer-independent earliest ACK audio is therefore:
+//   ceil(start_pattern_samples * 1000 / 48000) + protocol_min.
+// No commander-local threshold, symbol geometry, PTT value, capture reset,
+// logging, lock, scheduler, or post-TX delay enters this lower bound.
+//
+// The acceptance floor adds one complete ACK-pattern duration using ceiling
+// sample arithmetic. At and after that floor, receive_ack_pattern() masks every
+// retained sample older than the causal audio epoch in both newest and older
+// multiwindow phases. No delayed/destructive ring reset is involved, so a late
+// first scheduler tick cannot erase a genuine ACK.
+int cl_arq_controller::start_ack_responder_delay_ms(
+	int connect_pattern_nsymb,
+	int connect_suffix_nsymb,
+	int connect_match_threshold,
+	int symbol_samples)
+{
+	long long remaining = (long long)connect_pattern_nsymb
+		+ (long long)connect_suffix_nsymb
+		- (long long)connect_match_threshold;
+	if(remaining < 0) remaining = 0;
+	const long long symbol_ms = symbol_samples > 0
+		? ((long long)symbol_samples * 1000LL) / 48000LL
+		: 0LL;
+	long long responder_race_delay_ms =
+		remaining * symbol_ms + 200LL;
+	if(responder_race_delay_ms < START_ACK_RESPONDER_MIN_DELAY_MS)
+		responder_race_delay_ms = START_ACK_RESPONDER_MIN_DELAY_MS;
+	if(responder_race_delay_ms > 0x7FFFFFFFLL) return 0x7FFFFFFF;
+	return (int)responder_race_delay_ms;
+}
+
+int cl_arq_controller::start_ack_causal_audio_epoch_ms(
+	int start_pattern_samples)
+{
+	const long long samples =
+		start_pattern_samples > 0 ? (long long)start_pattern_samples : 0LL;
+	const long long start_pattern_ms =
+		(samples * 1000LL + 47999LL) / 48000LL;
+	const long long epoch_ms =
+		start_pattern_ms + (long long)START_ACK_RESPONDER_MIN_DELAY_MS;
+	if(epoch_ms > 0x7FFFFFFFLL) return 0x7FFFFFFF;
+	return (int)epoch_ms;
+}
+
+int cl_arq_controller::start_ack_causal_accept_floor_ms(
+	int start_pattern_samples,
+	int ack_pattern_samples)
+{
+	const int epoch_ms = start_ack_causal_audio_epoch_ms(
+		start_pattern_samples);
+	const long long ack_samples =
+		ack_pattern_samples > 0 ? (long long)ack_pattern_samples : 0LL;
+	const long long ack_pattern_ms =
+		(ack_samples * 1000LL + 47999LL) / 48000LL;
+	const long long accept_floor_ms =
+		(long long)epoch_ms + ack_pattern_ms;
+	if(accept_floor_ms > 0x7FFFFFFFLL) return 0x7FFFFFFF;
+	return (int)accept_floor_ms;
+}
+
+uint32_t cl_arq_controller::arm_start_ack_causal_capture(
+	int samples_through_start_egress)
+{
+	cl_data_container& dc = telecom_system->data_container;
+	const uint64_t now_ns = sim_clock_now_ns();
+	uint64_t epoch_ns = 0;
+	if(arq_sim_inproc_active())
+	{
+		// The in-process pump has no output device queue. Its shared virtual
+		// clock advances at exactly 48 kHz.
+		epoch_ns = (uint64_t)start_ack_causal_audio_epoch_ms(
+			samples_through_start_egress) * 1000000ULL;
+	}
+	else
+	{
+		// The count includes everything already queued ahead of START (for
+		// example an optional pilot), plus the START waveform itself. The
+		// audio boundary adds the opened sink's retained-device upper bound.
+		epoch_ns = playback_causal_egress_bound_ns(
+			samples_through_start_egress);
+		const uint64_t response_ns =
+			(uint64_t)START_ACK_RESPONDER_MIN_DELAY_MS * 1000000ULL;
+		if(epoch_ns > UINT64_MAX - response_ns)
+			epoch_ns = UINT64_MAX;
+		else
+			epoch_ns += response_ns;
+	}
+	uint64_t deadline_ns = now_ns + epoch_ns;
+	if(deadline_ns < now_ns) deadline_ns = UINT64_MAX;
+
+	uint32_t generation = dc.start_ack_causal_generation.load() + 1U;
+	if(generation == 0) generation = 1U;
+
+	// Publish payload first and generation last. The capture producer treats a
+	// newly observed generation's entire current chunk as pre-causal, so even a
+	// producer already returning from audio->read at this instant is excluded.
+	dc.start_ack_causal_deadline_ns = deadline_ns;
+	dc.start_ack_causal_ring_generation = 0;
+	dc.start_ack_causal_ring_samples = 0;
+	dc.start_ack_causal_generation = generation;
+
+	start_ack_causal_timer.stop();
+	start_ack_causal_timer.reset();
+	start_ack_causal_timer.start();
+	return generation;
+}
+
+void cl_arq_controller::refresh_start_ack_causal_after_playback_drain()
+{
+#ifndef START_ACK_CAUSAL_GUARD_FAILBEFORE
+	cl_data_container& dc = telecom_system->data_container;
+	const uint64_t now_ns = sim_clock_now_ns();
+	uint64_t remaining_ns = playback_causal_egress_bound_ns(0);
+	const uint64_t response_ns =
+		(uint64_t)START_ACK_RESPONDER_MIN_DELAY_MS * 1000000ULL;
+	if(remaining_ns > UINT64_MAX - response_ns)
+		remaining_ns = UINT64_MAX;
+	else
+		remaining_ns += response_ns;
+
+	uint64_t refreshed_deadline_ns = UINT64_MAX;
+	if(remaining_ns <= UINT64_MAX - now_ns)
+		refreshed_deadline_ns = now_ns + remaining_ns;
+
+	// A nominal queue-duration estimate made before START cannot bound an
+	// unexpectedly stalled playback consumer. Once the ring is observed
+	// drained, retain the later of that estimate and a fresh sink/responder
+	// boundary. The capture reset that follows may advance the generation, but
+	// it must not inherit an already-expired deadline.
+	const uint64_t current_deadline_ns =
+		dc.start_ack_causal_deadline_ns.load();
+	if(refreshed_deadline_ns > current_deadline_ns)
+		dc.start_ack_causal_deadline_ns = refreshed_deadline_ns;
+#endif
+}
+
+int cl_arq_controller::start_ack_causal_eligible_tail_samples(
+	int causal_ring_samples,
+	int phase_shift_samples,
+	int tail_samples)
+{
+	if(causal_ring_samples < 0) return tail_samples;
+	long long eligible = (long long)causal_ring_samples
+		- (long long)phase_shift_samples;
+	if(eligible <= 0) return 0;
+	if(eligible >= tail_samples) return tail_samples;
+	return (int)eligible;
+}
+
+bool cl_arq_controller::start_ack_causal_should_poll(
+	int causal_ring_samples,
+	int ack_pattern_samples)
+{
+	// A complete current-generation ACK waveform must have reached the ring
+	// before the detector may inspect the newest or any retained older phase.
+#ifdef START_ACK_CAUSAL_GUARD_FAILBEFORE
+	(void)causal_ring_samples;
+	(void)ack_pattern_samples;
+	return true;
+#else
+	return causal_ring_samples >= ack_pattern_samples;
+#endif
+}
+
+int cl_arq_controller::test_start_ack_causal_guard()
+{
+	int failed = 0;
+	auto check = [&](bool condition, const char* name)
+	{
+		if(condition)
+			printf("[TEST-START-ACK-CAUSAL] PASS: %s\n", name);
+		else
+		{
+			printf("[TEST-START-ACK-CAUSAL] FAIL: %s\n", name);
+			failed++;
+		}
+	};
+
+	// Exact CONFIG_0 geometry from the commissioning trace. The commander
+	// lower bound depends only on waveform sample counts and the fixed protocol
+	// minimum, never on its own threshold or PTT settings.
+	const int symbol_samples = 292 * 4;
+	const int start_pattern_samples = (16 + 13) * symbol_samples;
+	const int ack_pattern_samples = 16 * symbol_samples;
+	const int audio_epoch_ms = start_ack_causal_audio_epoch_ms(
+		start_pattern_samples);
+	const int accept_floor_ms = start_ack_causal_accept_floor_ms(
+		start_pattern_samples, ack_pattern_samples);
+	check(audio_epoch_ms == 1434,
+		"START waveform plus protocol minimum yields a 1434ms audio epoch");
+	check(accept_floor_ms == 1824,
+		"one complete ACK waveform raises the acceptance floor to 1824ms");
+	check(start_ack_causal_audio_epoch_ms(0)
+			== START_ACK_RESPONDER_MIN_DELAY_MS,
+		"zero-length START input preserves the fixed protocol minimum");
+	check(start_ack_causal_accept_floor_ms(-1, -1)
+			== START_ACK_RESPONDER_MIN_DELAY_MS,
+		"negative sample counts normalize without underflow");
+	check(start_ack_responder_delay_ms(
+			16, 13, 7, symbol_samples)
+			== START_ACK_RESPONDER_MIN_DELAY_MS,
+		"default responder geometry retains the protocol minimum");
+	check(start_ack_responder_delay_ms(
+			16, 13, 6, symbol_samples) == 752,
+		"a locally stricter responder may wait longer than the protocol minimum");
+	check(start_ack_responder_delay_ms(
+			16, 13, 1000, symbol_samples)
+			== START_ACK_RESPONDER_MIN_DELAY_MS,
+		"threshold-bias diagnostics cannot shorten the responder protocol delay");
+	check(test_start_ack_causal_anchor_transfer(),
+		"production START anchor includes queued pilot/backlog, sink guard, and tx ordering");
+	check(test_start_ack_causal_post_drain_refresh(),
+		"delayed playback drain refreshes the capture epoch before reset");
+	check(capture_causal_tag_guard_selftest(telecom_system) == 0,
+		"queued chunks, paired FIFO, prep publish, and reset generation are causal");
+	const int tail_samples = 48 * symbol_samples;
+	const int floor_history_samples =
+		start_ack_causal_eligible_tail_samples(
+			ack_pattern_samples, 0, tail_samples);
+	check(floor_history_samples >= 16 * symbol_samples,
+		"floor exposes at least one full ACK pattern of causal samples");
+
+	int status = PENDING_ACK;
+	int ack_count = 0;
+	bool test_connection_scheduled = false;
+	auto drive_detector = [&](int causal_ring_samples,
+		bool raw_detector_hit,
+		bool candidate_is_post_causal)
+	{
+		bool detector_hit = raw_detector_hit
+			&& candidate_is_post_causal;
+#ifdef START_ACK_CAUSAL_GUARD_FAILBEFORE
+		detector_hit = raw_detector_hit;
+#endif
+		if(status == PENDING_ACK
+		   && detector_hit
+		   && start_ack_causal_should_poll(
+				causal_ring_samples, ack_pattern_samples))
+		{
+			status = ACKED;
+			ack_count++;
+			test_connection_scheduled = true;
+		}
+	};
+
+	// Reproduce the live defect in the waveform-anchored timer frame. The
+	// observed 263ms post-return detector hit maps before the 1434ms causal
+	// epoch. The fail-before compile arm advances to ACKED here; the correction
+	// must not.
+	drive_detector(0, true, false);
+	check(status == PENDING_ACK && ack_count == 0
+	      && !test_connection_scheduled,
+		"pre-epoch detector-positive cannot ACK or schedule TEST_CONNECTION");
+	check(!start_ack_causal_should_poll(
+		ack_pattern_samples - 1, ack_pattern_samples),
+		"acceptance remains closed one captured sample below the floor");
+
+	// At a late first tick the old false-positive phase is older than the epoch
+	// and cannot contain a complete eligible ACK. It is masked, not
+	// destructively flushed.
+	const int late_causal_samples =
+		(2550 - audio_epoch_ms) * 48;
+	const int old_phase_shift_samples = 2 * 16 * symbol_samples;
+	check(start_ack_causal_eligible_tail_samples(
+		late_causal_samples, old_phase_shift_samples, tail_samples)
+			< 16 * symbol_samples,
+		"late first tick cannot expose a full ACK in the old two-stride phase");
+	drive_detector(ack_pattern_samples, true, false);
+	check(status == PENDING_ACK && ack_count == 0,
+		"opening the poll cannot recover the pre-causal false-positive phase");
+	drive_detector(late_causal_samples, true, true);
+	check(status == ACKED && ack_count == 1 && test_connection_scheduled,
+		"late first post-arm tick accepts genuine ACK without erasing it");
+	drive_detector(late_causal_samples + 12000, true, true);
+	check(ack_count == 1, "later detector hits cannot double-ACK the START");
+
+	// Exercise the changed production detector with a real generated ACK
+	// waveform in the double-mapped capture ring. This proves the newest-tail
+	// and older-phase masks themselves, rather than only the timing helpers.
+	telecom_system->narrowband_enabled = NO;
+	narrowband_enabled = NO;
+	telecom_system->load_configuration(CONFIG_0);
+	telecom_system->set_recovery_ack_reps(1);
+	turbo_snr_ack_enabled = false;
+
+	cl_data_container& dc = telecom_system->data_container;
+	const int live_sym_samples = dc.Nofdm * dc.interpolation_rate;
+	const int ack_nsymb = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	const int ack_base_total = telecom_system->ack_mfsk.ack_base_total_nsymb();
+	const int pattern_len = ack_base_total;
+	const int live_tail_nsymb = ack_base_total + pattern_len + 16;
+	const int signal_period = live_sym_samples * dc.buffer_Nsymb.load();
+	int live_tail_samples = live_tail_nsymb * live_sym_samples;
+	if(live_tail_samples > signal_period) live_tail_samples = signal_period;
+	const int live_tail_offset = signal_period - live_tail_samples;
+	const int stride = pattern_len * live_sym_samples;
+	const int burst_len = telecom_system->ack_pattern_passband_samples;
+	const int ack_pattern_ms =
+		(int)(((long long)burst_len * 1000LL + 47999LL) / 48000LL);
+
+	bool geometry_ok =
+		live_sym_samples > 0
+		&& ack_nsymb == 16
+		&& burst_len > 0
+		&& burst_len <= live_tail_samples
+		&& live_tail_offset >= 2 * stride;
+	check(geometry_ok, "CONFIG_0 ring geometry holds two causal test phases");
+
+	if(geometry_ok)
+	{
+		double* burst = new double[burst_len];
+		const int generated =
+			telecom_system->generate_ack_pattern_passband(burst);
+		check(generated == burst_len,
+			"production ACK generator fills the exact test waveform");
+
+		auto stage_ack = [&](int phase, bool at_tail_end,
+			bool add_newest_energy_probe)
+		{
+			memset(dc.passband_delayed_data, 0,
+				(size_t)(2 * signal_period) * sizeof(double));
+			dc.ring_write_index = 0;
+			const int window_off = live_tail_offset - phase * stride;
+			const int burst_off = at_tail_end
+				? window_off + live_tail_samples - burst_len
+				: window_off;
+			if(window_off < 0 || burst_off < 0
+			   || burst_off + burst_len > signal_period)
+				return false;
+			for(int i = 0; i < burst_len; i++)
+			{
+				dc.passband_delayed_data[burst_off + i] = burst[i];
+				dc.passband_delayed_data[
+					signal_period + burst_off + i] = burst[i];
+			}
+			if(add_newest_energy_probe)
+			{
+				const int probe_samples = 8 * live_sym_samples;
+				const int probe_off =
+					live_tail_offset + live_tail_samples - probe_samples;
+				for(int i = 0; i < probe_samples; i++)
+				{
+					const double v = (i & 1) ? 0.01 : -0.01;
+					dc.passband_delayed_data[probe_off + i] = v;
+					dc.passband_delayed_data[
+						signal_period + probe_off + i] = v;
+				}
+			}
+			dc.frames_to_read = 0;
+			dc.nUnder_processing_events = 0;
+			dc.data_ready = 0;
+			return true;
+		};
+
+		auto direct_phase_hit = [&](int phase)
+		{
+			const int off = live_tail_offset - phase * stride;
+			memcpy(dc.ready_to_process_passband_delayed_data,
+				&dc.passband_delayed_data[off],
+				(size_t)live_tail_samples * sizeof(double));
+			int matched = 0;
+			uint32_t mask = 0;
+			const double metric =
+				telecom_system->detect_ack_pattern_from_passband(
+					dc.ready_to_process_passband_delayed_data,
+					live_tail_samples, &matched, &mask, false);
+			return matched >= telecom_system->ack_mfsk.ack_match_threshold
+				&& metric >= ack_metric_threshold;
+		};
+
+		const int live_audio_epoch_ms = start_ack_causal_audio_epoch_ms(
+			telecom_system->ctrl_suffix_pattern_passband_samples);
+		const int live_accept_floor_ms = start_ack_causal_accept_floor_ms(
+			telecom_system->ctrl_suffix_pattern_passband_samples,
+			telecom_system->ack_pattern_passband_samples);
+		const int floor_causal_samples = burst_len;
+		int guarded_floor_samples = floor_causal_samples;
+		int guarded_late_samples = floor_causal_samples + 400 * 48;
+#ifdef START_ACK_CAUSAL_GUARD_FAILBEFORE
+		// Reproduce the old production caller: neither the poll floor nor the
+		// retained-ring mask is active.
+		guarded_floor_samples = -1;
+		guarded_late_samples = -1;
+#endif
+
+		// Newest-tail case: the real pre-epoch ACK is at the oldest end of
+		// the snapshot. A deterministic non-ACK high-frequency probe in the
+		// newest eight symbols opens only the CPU energy gate. The old path
+		// finds the ACK; the causal mask removes it.
+		bool staged = stage_ack(0, false, true);
+		check(staged, "staged newest-tail pre-epoch ACK fixture");
+		bool newest_unmasked = staged
+			&& receive_ack_pattern(false, false, -1);
+		check(newest_unmasked,
+			"age-disabled newest-tail fixture is detector-positive");
+		staged = stage_ack(0, false, true);
+		bool newest_guarded = staged
+			&& receive_ack_pattern(false, false, guarded_floor_samples);
+		check(!newest_guarded,
+			"production newest-tail mask rejects a pre-epoch ACK");
+
+		// Older ph=1 and ph=2 cases: verify the age-disabled function agrees
+		// with the original direct phase correlator, then prove the production
+		// causal mask rejects the same real waveform.
+		for(int phase = 1; phase <= 2; phase++)
+		{
+			staged = stage_ack(phase, false, false);
+			const bool direct_hit = staged && direct_phase_hit(phase);
+			dc.frames_to_read = 0;
+			const bool no_age_hit = staged
+				&& receive_ack_pattern(false, true, -1);
+			check(direct_hit && no_age_hit == direct_hit,
+				phase == 1
+					? "age-disabled ph=1 scan preserves original detection"
+					: "age-disabled ph=2 scan preserves original detection");
+
+			staged = stage_ack(phase, false, false);
+			const bool guarded_hit = staged
+				&& receive_ack_pattern(false, true, guarded_floor_samples);
+			check(!guarded_hit,
+				phase == 1
+					? "production mask rejects pre-epoch ph=1 ACK"
+					: "production mask rejects pre-epoch ph=2 ACK");
+		}
+
+		// Late first tick: a genuine ACK at the newest end remains wholly
+		// inside the eligible history and is accepted without any ring reset.
+		staged = stage_ack(0, true, false);
+		const bool genuine_hit = staged
+			&& receive_ack_pattern(false, true, guarded_late_samples);
+		check(genuine_hit,
+			"late first production poll retains and accepts a genuine ACK");
+
+		check(live_accept_floor_ms - live_audio_epoch_ms == ack_pattern_ms
+		      && floor_causal_samples == burst_len,
+			"acceptance floor exposes one complete generated ACK duration");
+		delete[] burst;
+	}
+
+	printf("[TEST-START-ACK-CAUSAL] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES",
+		failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }
@@ -19680,7 +20212,7 @@ int cl_arq_controller::test_sim_inproc()
 			write_buffer(capture_buffer, (uint8_t*)pump_ctx.scratch,
 			             (size_t)symbol_period * sizeof(double));
 			bool had_data = size_buffer(capture_buffer) > 0;
-			circular_buf_reset(capture_buffer);
+			capture_reset_samples();
 			check(had_data && size_buffer(capture_buffer) == 0,
 			      "G2 circular_buf_reset still empties the capture ring after the gated no-op");
 		}

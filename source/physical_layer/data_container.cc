@@ -74,6 +74,11 @@ cl_data_container::cl_data_container()
 	this->nUnder_processing_events=0;
 	this->rx_mute=0;
 	this->ring_write_index=0;
+	this->start_ack_causal_generation=0;
+	this->start_ack_causal_deadline_ns=0;
+	this->start_ack_causal_tracking_available=0;
+	this->start_ack_causal_ring_generation=0;
+	this->start_ack_causal_ring_samples=0;
 	this->interpolation_rate=0;
 
 	this->total_frame_size=0;
@@ -220,6 +225,8 @@ void cl_data_container::publish_active_ring()
 	this->data_ready = 0;
 	this->nUnder_processing_events = 0;
 	this->ring_write_index = 0;
+	this->start_ack_causal_ring_generation = 0;
+	this->start_ack_causal_ring_samples = 0;
 	// Bounded reset (≤ current allocation), NOT a free/malloc: zero only the active window so the
 	// energy gate skips empty frames until real audio arrives (INV-7); the modulus change would
 	// otherwise leave a mis-indexed accumulation. C2 copies exactly sp; C1 writes within 2·sp.
@@ -463,5 +470,7 @@ void cl_data_container::deinit()
 	this->data_ready=0;
 	this->nUnder_processing_events=0;
 	this->ring_write_index=0;
+	this->start_ack_causal_ring_generation=0;
+	this->start_ack_causal_ring_samples=0;
 	this->interpolation_rate=0;
 }

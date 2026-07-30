@@ -149,6 +149,18 @@ class cl_data_container
 	_Atomic(int) rx_mute_samples;  // samples zeroed by rx_mute since last MF search
 	_Atomic(int) ring_write_index;  // current write position in double-mapped ring buffer
 
+	// START_CONNECTION bare-ACK causal sample boundary. The capture producer
+	// tags each input sample with start_ack_causal_generation only after the
+	// published deadline has passed. Capture prep then counts the contiguous
+	// tagged samples actually written at the newest edge of the demod ring.
+	// The ACK detector consumes that sample count directly; wall time is never
+	// converted into a presumed ring position.
+	_Atomic(uint32_t) start_ack_causal_generation;
+	_Atomic(uint64_t) start_ack_causal_deadline_ns;
+	_Atomic(int) start_ack_causal_tracking_available;
+	_Atomic(uint32_t) start_ack_causal_ring_generation;
+	_Atomic(int) start_ack_causal_ring_samples;
+
 	// Construction-meter accumulators: the prevention needle for the
 	// turnaround blind-window loss. When rx_mute=1 the capture-prep zero-writer
 	// (audioio.c) discards the just-captured ring samples; the meter measures

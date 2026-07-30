@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstring>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <atomic>
 
@@ -880,6 +881,10 @@ cl_arq_controller::cl_arq_controller()
 		connect_fast_active = false;
 		connect_fast_fallback_config = ROBUST_0;
 		connect_fast_fallback_robust = YES;
+		start_ack_causal_guard_armed = false;
+		start_ack_causal_timer.stop();
+		start_ack_causal_timer.reset();
+		start_ack_causal_tx_observed_generation = 0;
 	}
 	// IDLE-SWITCHROLE-RACE per-session flags + recovery counter (idle-switchrole
 	// -race.md §2/§3): init defaults. Re-cleared in reset_session_state() and at
@@ -5999,7 +6004,7 @@ void cl_arq_controller::inband_finalize_ofdm_adopt_ring(int adopted_config)
 			// COLD / stale-preamble / robust(MFSK)-target / defeat: the full destructive flush
 			// (stale OFDM preambles false-lock Schmidl-Cox at the new config without it).
 			if(capture_buffer != NULL)
-				circular_buf_reset(capture_buffer);
+				capture_reset_samples();
 			if(telecom_system->data_container.passband_delayed_data != NULL && buf_samples > 0)
 				memset(telecom_system->data_container.passband_delayed_data, 0,
 					2 * buf_samples * sizeof(double));
@@ -8615,6 +8620,12 @@ int cl_arq_controller::test_demote_silence()
 
 void cl_arq_controller::reset_session_state()
 {
+	// A causal START-ACK epoch belongs to one transmitted START frame only.
+	// Never carry its armed state through a teardown or reconnect.
+	start_ack_causal_guard_armed = false;
+	start_ack_causal_timer.stop();
+	start_ack_causal_timer.reset();
+
 	// A teardown may pre-empt a wide-SACK receive window. Never carry the
 	// temporary control PHY into the next session.
 	restore_sack_v2_rx_phy();
@@ -11960,7 +11971,7 @@ void cl_arq_controller::send_batch()
 	// PTT-off delay. By flushing here, the buffer is clean BEFORE self-echo
 	// starts, and the ACK pattern that arrives after the frame is preserved.
 	// The order-aware ACK detector distinguishes ACK tones from OFDM self-echo.
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
 		MUTEX_LOCK(&capture_prep_mutex);
@@ -12010,7 +12021,7 @@ void cl_arq_controller::send_batch()
 		mtl::log_event("cmd_batch_last_sym_out");
 
 		// Unmute + flush right after playback drain (mirrors the per-frame tail).
-		circular_buf_reset(capture_buffer);
+		capture_reset_samples();
 		{
 			int buf_samples = telecom_system->data_container.Nofdm
 				* telecom_system->data_container.buffer_Nsymb
@@ -12547,7 +12558,7 @@ void cl_arq_controller::send_batch()
 	// Now unmute so the RSP's ACK can arrive during ptt_off_delay.
 	// Safe: on real radio, still keyed during ptt_off_delay (no RX audio).
 	// On VB-Cable, no self-echo (separate in/out cables).
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
 			* telecom_system->data_container.buffer_Nsymb
@@ -12556,6 +12567,8 @@ void cl_arq_controller::send_batch()
 		memset(telecom_system->data_container.passband_delayed_data, 0,
 			2 * buf_samples * sizeof(double));
 		telecom_system->data_container.ring_write_index = 0;
+		telecom_system->data_container.start_ack_causal_ring_generation = 0;
+		telecom_system->data_container.start_ack_causal_ring_samples = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
 	// M2 (SACK turnaround trace): post-TX capture ring reset complete, rx still
@@ -12810,7 +12823,7 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 	// ptt_off_delay, giving 200ms+ margin instead of potentially negative.
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
 		MUTEX_LOCK(&capture_prep_mutex);
@@ -12988,7 +13001,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	// Same flush sequence as send_ack_pattern
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
 		MUTEX_LOCK(&capture_prep_mutex);
@@ -13907,7 +13920,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 	// Same flush sequence as send_ack_pattern / send_ack_pattern_with_snr
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
 		                * telecom_system->data_container.buffer_Nsymb
@@ -13916,6 +13929,8 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		memset(telecom_system->data_container.passband_delayed_data, 0,
 			2 * buf_samples * sizeof(double));
 		telecom_system->data_container.ring_write_index = 0;
+		telecom_system->data_container.start_ack_causal_ring_generation = 0;
+		telecom_system->data_container.start_ack_causal_ring_samples = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
 	telecom_system->data_container.rx_mute = 0;
@@ -14095,7 +14110,7 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_i
 	// Same flush sequence as send_mfsk_ack_sack.
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
 		                * telecom_system->data_container.buffer_Nsymb
@@ -14104,6 +14119,8 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_i
 		memset(telecom_system->data_container.passband_delayed_data, 0,
 			2 * buf_samples * sizeof(double));
 		telecom_system->data_container.ring_write_index = 0;
+		telecom_system->data_container.start_ack_causal_ring_generation = 0;
+		telecom_system->data_container.start_ack_causal_ring_samples = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
 	telecom_system->data_container.rx_mute = 0;
@@ -14310,7 +14327,7 @@ void cl_arq_controller::send_break_pattern()
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
 		MUTEX_LOCK(&capture_prep_mutex);
@@ -14374,6 +14391,49 @@ static uint16_t arq_ctrl_crc12_cb(void* ctx, const unsigned char* data, int n)
 {
 	cl_arq_controller* self = static_cast<cl_arq_controller*>(ctx);
 	return self->CRC12_calc((const char*)data, n) & 0x0FFF;
+}
+
+// The production START transfer seam. The deadline count includes every
+// passband sample already queued ahead of START (including an optional pilot)
+// plus START itself; audioio adds the opened playback sink's retained-device
+// bound. Keeping that publish and tx_transfer together gives the focused
+// regression an executable ordering contract.
+static int transfer_mfsk_ctrl_payload_with_causal_anchor(
+	cl_arq_controller* self,
+	cl_telecom_system* telecom_system,
+	mfsk_ctrl_frame_type type,
+	double* samples,
+	int sample_count)
+{
+	const size_t queued_samples =
+		playback_buffer != NULL
+			? size_buffer(playback_buffer) / sizeof(double) : 0U;
+	const size_t start_samples =
+		sample_count > 0 ? (size_t)sample_count : 0U;
+	const size_t total_samples =
+		queued_samples > (size_t)INT_MAX - std::min(
+			start_samples, (size_t)INT_MAX)
+			? (size_t)INT_MAX
+			: queued_samples + start_samples;
+	if(type == MFSK_CTRL_START_CONN)
+	{
+#ifndef START_ACK_CAUSAL_GUARD_FAILBEFORE
+		self->arm_start_ack_causal_capture((int)total_samples);
+#endif
+		self->start_ack_causal_tx_observed_generation =
+			telecom_system->data_container
+				.start_ack_causal_generation.load();
+	}
+	const int rc = tx_transfer(samples, (size_t)sample_count);
+#ifdef START_ACK_CAUSAL_GUARD_FAILBEFORE
+	if(type == MFSK_CTRL_START_CONN)
+	{
+		// Exact producer-order mutation for deterministic RED coverage: arm
+		// only after transfer, so the observed generation cannot match it.
+		self->arm_start_ack_causal_capture((int)total_samples);
+	}
+#endif
+	return rc;
 }
 
 // Shared TX core: emit CONNECT base + 13-symbol ctrl-suffix for `type` with
@@ -14481,9 +14541,13 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 		delete[] pilot_buffer;
 	}
 
-	tx_transfer(&filtered2[symbol_period], pattern_samples);
+	transfer_mfsk_ctrl_payload_with_causal_anchor(
+		self, telecom_system, type,
+		&filtered2[symbol_period], pattern_samples);
 
 	drain_playback_wait();
+	if(type == MFSK_CTRL_START_CONN)
+		self->refresh_start_ack_causal_after_playback_drain();
 
 	delete[] raw_output;
 	delete[] filtered1;
@@ -14492,7 +14556,7 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	// Same capture-flush sequence as send_mfsk_ack_sack:4406-4429.
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
 		                * telecom_system->data_container.buffer_Nsymb
@@ -14501,6 +14565,8 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 		memset(telecom_system->data_container.passband_delayed_data, 0,
 			2 * buf_samples * sizeof(double));
 		telecom_system->data_container.ring_write_index = 0;
+		telecom_system->data_container.start_ack_causal_ring_generation = 0;
+		telecom_system->data_container.start_ack_causal_ring_samples = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
 	telecom_system->data_container.rx_mute = 0;
@@ -14535,6 +14601,92 @@ static long long send_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 // from the existing messages_control build at arq_commander.cc:454 (base
 // callsign stripped of SSID), but the helper takes it as a parameter so
 // callers stay decoupled from messages_control.
+bool cl_arq_controller::test_start_ack_causal_anchor_transfer()
+{
+	// Drive the exact production transfer seam without PTT, FIR, drain-wait,
+	// sockets, or an audio device. The FAILBEFORE arm in that same seam moves
+	// the publish after tx_transfer and therefore cannot satisfy this probe.
+	bool owned_playback = false;
+	if(playback_buffer == NULL)
+	{
+		const size_t capacity = 4096;
+		uint8_t *storage = (uint8_t *)malloc(capacity);
+		if(storage == NULL) return false;
+		playback_buffer = circular_buf_init(storage, capacity);
+		owned_playback = true;
+	}
+	if(size_buffer(playback_buffer) != 0
+	   || circular_buf_free_size(playback_buffer) < 2 * sizeof(double))
+		return false;
+
+	// Represent a pilot/backlog sample already queued ahead of START. The real
+	// transfer seam must include it in the deadline's output-egress bound.
+	double queued_sample = 0.0;
+	if(write_buffer(playback_buffer, (uint8_t *)&queued_sample,
+			sizeof(queued_sample)) != 0)
+		return false;
+	const uint32_t before =
+		telecom_system->data_container.start_ack_causal_generation.load();
+	start_ack_causal_tx_observed_generation = 0;
+	double sample = 0.0;
+	const uint64_t before_ns = sim_clock_now_ns();
+	const uint64_t expected_epoch_ns =
+		playback_causal_egress_bound_ns(2)
+		+ (uint64_t)START_ACK_RESPONDER_MIN_DELAY_MS * 1000000ULL;
+	const int rc = transfer_mfsk_ctrl_payload_with_causal_anchor(
+		this, telecom_system, MFSK_CTRL_START_CONN, &sample, 1);
+	const uint64_t after_ns = sim_clock_now_ns();
+	const uint32_t after =
+		telecom_system->data_container.start_ack_causal_generation.load();
+	const uint64_t deadline_ns =
+		telecom_system->data_container.start_ack_causal_deadline_ns.load();
+	uint8_t drained[2 * sizeof(double)];
+	if(size_buffer(playback_buffer) >= sizeof(drained))
+		read_buffer(playback_buffer, drained, sizeof(drained));
+
+	const bool ok = rc == 0
+		&& after != 0
+		&& after != before
+		&& start_ack_causal_tx_observed_generation == after
+		&& deadline_ns >= before_ns + expected_epoch_ns
+		&& deadline_ns <= after_ns + expected_epoch_ns;
+	if(owned_playback)
+	{
+		free(playback_buffer->buffer);
+		circular_buf_free(playback_buffer);
+		playback_buffer = NULL;
+	}
+	return ok;
+}
+
+bool cl_arq_controller::test_start_ack_causal_post_drain_refresh()
+{
+	cl_data_container& dc = telecom_system->data_container;
+	const uint64_t saved_deadline_ns =
+		dc.start_ack_causal_deadline_ns.load();
+
+	// Model a playback consumer whose delay exceeded the nominal pre-transfer
+	// queue estimate. The real post-drain seam must replace this expired
+	// boundary before capture_reset_samples() advances the generation.
+	dc.start_ack_causal_deadline_ns = 1;
+	const uint64_t before_ns = sim_clock_now_ns();
+	const uint64_t expected_remaining_ns =
+		playback_causal_egress_bound_ns(0)
+		+ (uint64_t)START_ACK_RESPONDER_MIN_DELAY_MS * 1000000ULL;
+	refresh_start_ack_causal_after_playback_drain();
+	const uint64_t after_ns = sim_clock_now_ns();
+	const uint64_t refreshed_deadline_ns =
+		dc.start_ack_causal_deadline_ns.load();
+
+	const bool ok =
+		expected_remaining_ns >=
+			(uint64_t)START_ACK_RESPONDER_MIN_DELAY_MS * 1000000ULL
+		&& refreshed_deadline_ns >= before_ns + expected_remaining_ns
+		&& refreshed_deadline_ns <= after_ns + expected_remaining_ns;
+	dc.start_ack_causal_deadline_ns = saved_deadline_ns;
+	return ok;
+}
+
 long long cl_arq_controller::send_mfsk_start_conn_phy(const std::string& sender_call)
 {
 	bool nb_flag = (narrowband_enabled == YES || commander_configured_nb == YES);
@@ -14837,7 +14989,7 @@ void cl_arq_controller::send_hail_pattern()
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	circular_buf_reset(capture_buffer);
+	capture_reset_samples();
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
 		MUTEX_LOCK(&capture_prep_mutex);
@@ -15212,7 +15364,8 @@ bool cl_arq_controller::mw_find_ack_sack_phase(int rwi, int tail_offset,
 }
 
 bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
-                                            bool multiwindow_scan)
+                                            bool multiwindow_scan,
+                                            int causal_ring_samples)
 {
 	// recovery-ack-capture LEVER 1(b) (data-flow-recovery-ack-capture.md §6): arm the
 	// EXISTING multi-window look-back for the recovery control-ACK poll under the env
@@ -15252,6 +15405,11 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 	if(tail_samples > signal_period)
 		tail_samples = signal_period;
 	int tail_offset = signal_period - tail_samples;
+	const int causal_history_samples =
+		(causal_ring_samples >= 0)
+		? start_ack_causal_eligible_tail_samples(
+			causal_ring_samples, 0, tail_samples)
+		: -1;
 
 	// ------------------------------------------------------------------
 	// SIM_INPROC control-ACK arrival-window re-scan (ADDITIVE; pump-armed
@@ -15358,6 +15516,7 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 		// the body past the pre-filter; the body's UNCHANGED correlator then
 		// re-confirms on the chosen phase and returns true.
 		bool mw_hit = false;
+		int chosen_phase_shift_samples = 0;
 		// ------------------------------------------------------------------
 		// CMD multi-window control-ACK match (CONNECT round-2 fix #2(a)).
 		// CONNECT_FINAL §3/§7, SUBMODE_ROOTCAUSE §7 #2(a), _connect2/CMD_MULTIWINDOW_DESIGN.md.
@@ -15412,19 +15571,47 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			{
 				int off = tail_offset - ph * stride;
 				if(off < 0) break;
+				const int phase_shift_samples = ph * stride;
 				// Energy pre-gate (cheap): only correlate phases that hold signal.
 				const double* pp = &telecom_system->data_container
 					.passband_delayed_data[rwi_mw + off];
 				double sumsq = 0.0;
-				for(int i = 0; i < tail_samples; i++) sumsq += pp[i] * pp[i];
+				if(causal_history_samples >= 0)
+				{
+					const int eligible_samples =
+						start_ack_causal_eligible_tail_samples(
+							causal_ring_samples, phase_shift_samples, tail_samples);
+					if(eligible_samples <= 0) continue;
+					memcpy(telecom_system->data_container
+							.ready_to_process_passband_delayed_data,
+						pp, tail_samples * sizeof(double));
+					if(eligible_samples < tail_samples)
+						memset(telecom_system->data_container
+								.ready_to_process_passband_delayed_data,
+							0, (tail_samples - eligible_samples) * sizeof(double));
+					for(int i = 0; i < tail_samples; i++)
+					{
+						const double v = telecom_system->data_container
+							.ready_to_process_passband_delayed_data[i];
+						sumsq += v * v;
+					}
+				}
+				else
+				{
+					// Preserve the original age-disabled path exactly: score
+					// the ring in place, and copy only an energetic phase.
+					for(int i = 0; i < tail_samples; i++) sumsq += pp[i] * pp[i];
+				}
 				double rms = std::sqrt(sumsq / tail_samples);
 				if(rms < MW_GATE_RMS) continue;
+				if(causal_history_samples < 0)
+					memcpy(telecom_system->data_container
+							.ready_to_process_passband_delayed_data,
+						pp, tail_samples * sizeof(double));
 				// Run the SAME correlator on this older phase (turbo/non-turbo
 				// share the same accept thresholds; we use the plain ACK
 				// correlator as the gate — the body below re-runs the exact
 				// detector and bookkeeping for the chosen phase).
-				memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
-					pp, tail_samples * sizeof(double));
 				int mw_matched = 0; uint32_t mw_mask = 0;
 				double mw_metric = telecom_system->detect_ack_pattern_from_passband(
 					telecom_system->data_container.ready_to_process_passband_delayed_data,
@@ -15433,6 +15620,7 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 				   && mw_metric >= ack_metric_threshold)
 				{
 					chosen_off = off;
+					chosen_phase_shift_samples = phase_shift_samples;
 					printf("[CMD-ACK-MW] control-ACK found at older phase off=%d "
 						"(newest_tail_off=%d phase=%d matched=%d metric=%.2f)\n",
 						off, tail_offset, ph, mw_matched, mw_metric);
@@ -15451,6 +15639,16 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
 			&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
 			tail_samples * sizeof(double));
+		if(causal_history_samples >= 0)
+		{
+			const int eligible_samples =
+				start_ack_causal_eligible_tail_samples(
+					causal_ring_samples, chosen_phase_shift_samples, tail_samples);
+			if(eligible_samples < tail_samples)
+				memset(telecom_system->data_container
+					.ready_to_process_passband_delayed_data,
+					0, (tail_samples - eligible_samples) * sizeof(double));
+		}
 
 		telecom_system->data_container.data_ready = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
