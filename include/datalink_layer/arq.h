@@ -937,6 +937,10 @@ public:
   // A completing PREV frame may emit immediately only when its negotiated D5
   // marker proves it is the physical last frame of the selective-retry turn.
   bool linkphase_defer_prev_ack(bool ackslot_active, bool proven_retx_tail) const;
+  // SEAM-2 — does a just-emitted cumulative high-water n_r cover the armed pending
+  // prev bsi? Wrap-safe (mod-256, P9 255->0). per_batch fallback is FALSE: a covers
+  // clear must be a genuine cumulative confirm, never a per-batch coincidence.
+  bool linkphase_pending_confirm_covers(int emitted_n_r) const;
   // LINK-PHASE STEP 5 / MC-3 — slot-qualified commander liveness. Default OFF;
   // MERCURY_LINKPHASE_SLOTLIVENESS_DEFEAT restores the pre-Step-5 behavior even
   // when the main flag is set. The feature is actionable only while a derived
@@ -6777,6 +6781,18 @@ private:
                                        //      ack_slot floor. 0 => never fired.
   long linkphase_retx_slot_fired;      // RSP: post-SACK retx-turn listen windows derived from the
                                        //      authored-SACK popcount (Step 4 MC-6). 0 => never fired.
+  // SEAM-2 — generic deferred prev-confirm + boundary flush. When an UNMARKED (no
+  // negotiated D5 turn-tail) previous-batch completion under the ACK-slot feature
+  // defers its clean confirm, the base emits NOTHING and drops it, so the CMD closes
+  // its ACK slot with no ACK = false block failure. This arms a pending flush so a
+  // later boundary (a covering cumulative ACK, or the RX-timeout with no current work)
+  // emits it EXACTLY ONCE via a bsi-carrying transport. NOT wire/protocol state; cleared
+  // on every session reset. The bsi is the cumulative n_r captured at arm time; the
+  // window is the clean-bitmap width for the MFSK-suffix fallback.
+  bool linkphase_pending_prev_confirm; // RSP: a deferred prev clean-confirm awaits a boundary flush
+  int  linkphase_pending_prev_bsi;     // cumulative n_r (wire bsi) to flush; -1 = none pending
+  int  linkphase_pending_prev_window;  // clean-bitmap width for the fallback MFSK suffix; -1 = none
+  long linkphase_pending_prev_flushed; // RSP fire-proof: boundary flushes emitted. 0 => never fired.
   // LINK-PHASE STEP 2 — geometry of the CMD's most recent DATA keydown, captured at send_batch
   // so calculate_receiving_timeout() can size the derived ack_slot break-floor from the ACTUAL
   // keydown (frame count + retx/full-preamble flag) rather than a per-frame constant. Read only

@@ -1389,6 +1389,10 @@ cl_arq_controller::cl_arq_controller()
 	linkphase_d5_retx_stamped=0;
 	linkphase_cmd_slot_floor_fired=0;
 	linkphase_retx_slot_fired=0;        // LINK-PHASE STEP 4 (MC-6) fire-proof counter
+	linkphase_pending_prev_confirm=false;  // SEAM-2: no deferred prev-confirm armed at init
+	linkphase_pending_prev_bsi=-1;
+	linkphase_pending_prev_window=-1;
+	linkphase_pending_prev_flushed=0;      // SEAM-2 fire-proof counter
 	linkphase_last_kd_frames=0;
 	linkphase_last_kd_force_full=false;
 	missed_ack_slots=0;
@@ -1951,6 +1955,18 @@ bool cl_arq_controller::linkphase_defer_prev_ack(bool ackslot_active,
 	if(defeat)
 		return true;  // fail-before: restore the unconditional ACK suppression
 	return !proven_retx_tail;
+}
+
+// SEAM-2 — does a just-emitted cumulative high-water n_r cover the armed pending prev
+// bsi? The pending bsi is itself a cumulative n_r captured when the prev batch delivered,
+// so a later emitted n_r that is at-or-above it retires the deferred confirm for free.
+// per_batch_in_window is passed FALSE so a covers-clear is only ever a genuine cumulative
+// confirm (never a per-batch bsi coincidence); when the cap is off this returns false and
+// the pending must be flushed explicitly at the RX-timeout boundary instead. Wrap-safe.
+bool cl_arq_controller::linkphase_pending_confirm_covers(int emitted_n_r) const
+{
+	return cumulative_ack_covers(emitted_n_r, linkphase_pending_prev_bsi,
+			cumulative_ack_enabled, false);
 }
 
 // LINK-PHASE STEP 5 / MC-3 — convert reverse-ACK absence from a polling-time
@@ -8801,6 +8817,11 @@ void cl_arq_controller::reset_session_state()
 	// seam. The counter is a monitoring statistic — reset per session for a clean count.
 	rsp_rebase_seam_armed = false;
 	rsp_seam_refuse_count = 0;
+	// SEAM-2 (invariant R4): no deferred prev-confirm survives a session reset, so a
+	// stale pending can never flush a bsi from a torn-down batch into a new session.
+	linkphase_pending_prev_confirm=false;
+	linkphase_pending_prev_bsi=-1;
+	linkphase_pending_prev_window=-1;
 
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;

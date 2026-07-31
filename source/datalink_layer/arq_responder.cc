@@ -1576,6 +1576,30 @@ void cl_arq_controller::process_messages_rx_data_control()
 										(unsigned)prev_ack_bsi, rsp_last_delivered_batch_seq_id);
 									fflush(stdout);
 									linkphase_prev_ack_deferred++;
+									// SEAM-2 ARM (post-delivery: the prev/held-cur bytes are ALREADY committed
+									// above, so the invariant "armed only after delivered" holds). The base only
+									// bumps the counter here and emits nothing, so the CMD closes its ACK slot
+									// with no ACK = a false block failure. Arm a pending flush carrying the
+									// cumulative n_r (+ the clean-bitmap width for the MFSK-suffix fallback) so a
+									// later boundary emits it EXACTLY ONCE via a bsi-carrying transport.
+									// MERCURY_PENDING_CONFIRM_DEFEAT=1 restores the base drop (fail-before).
+									{
+										bool pending_confirm_defeat = false;
+										const char* e = std::getenv("MERCURY_PENDING_CONFIRM_DEFEAT");
+										if(e && *e && atoi(e)!=0) pending_confirm_defeat = true;
+										if(!pending_confirm_defeat)
+										{
+											linkphase_pending_prev_confirm = true;
+											linkphase_pending_prev_bsi = (int)cumulative_ack_bsi_field(
+												prev_ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+											linkphase_pending_prev_window = prev_eff_window;
+											printf("[LINKPHASE-PENDING-ARM] deferred prev clean-confirm armed: "
+												"n_r=%d window=%d last_delivered=%d\n",
+												linkphase_pending_prev_bsi, linkphase_pending_prev_window,
+												rsp_last_delivered_batch_seq_id);
+											fflush(stdout);
+										}
+									}
 								}
 								bool prev_used_mfsk_path = false;
 								if (!linkphase_defer_prev_ack
@@ -1844,6 +1868,57 @@ void cl_arq_controller::process_messages_rx_data_control()
 		if ( get_nReceived_messages()!=0)
 		{
 			connection_status=ACKNOWLEDGING_DATA;
+		}
+		// SEAM-2 FLUSH-B: the RX-timeout expired with NO current-batch receive work
+		// (get_nReceived_messages()==0 = the seed106 prev-only topology). The channel
+		// has been idle longer than the whole remaining batch, so the CMD is parked in
+		// its ACK slot, not mid-keydown (collision-safe). A deferred prev-confirm has no
+		// covering ACK-gate emit to ride, so flush it exactly once here.
+		else if(linkphase_pending_prev_confirm)
+		{
+			unsigned char flush_bsi = (unsigned char)(
+				linkphase_pending_prev_bsi >= 0 ? linkphase_pending_prev_bsi : 0);
+			ack_tx_retx_turnaround = true;   // retransmit turnaround: arm the D2 settle
+			long long mfsk_ms = 0;
+			bool compact_sent = false;
+			if(scalable_sack_on()
+			   && telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0)
+			{
+				mfsk_ms = send_mfsk_compact_confirm(flush_bsi);
+				compact_sent = mfsk_ms > 0;
+			}
+			if(mfsk_ms <= 0
+			   && MFSK_ACK_SACK_ENABLED
+			   && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
+			{
+				int wnd = linkphase_pending_prev_window > 0
+					? linkphase_pending_prev_window : data_batch_size;
+				mfsk_ms = send_mfsk_ack_sack(flush_bsi, mfsk_sack_mask_for_frames(wnd));
+			}
+			if(mfsk_ms > 0)
+			{
+				printf("[LINKPHASE-PENDING-FLUSH] deferred prev n_r=%d flushed via %s "
+					"wire_ms=%lld (empty-current boundary)\n",
+					linkphase_pending_prev_bsi,
+					compact_sent ? "COMPACT confirm" : "MFSK suffix", mfsk_ms);
+				fflush(stdout);
+				linkphase_pending_prev_flushed++;
+			}
+			else
+			{
+				// R1: only a bsi-less legacy pattern is available (NB). At THIS first
+				// boundary the pending prev is still the freshest outstanding batch, so a
+				// bare pattern credits it correctly; emit once then clear unconditionally
+				// (never re-flush a bsi-less pattern for a now-stale prev).
+				send_ack_pattern();
+				linkphase_pending_prev_flushed++;
+				printf("[LINKPHASE-PENDING-FLUSH] deferred prev n_r=%d flushed via legacy "
+					"pattern (NB first-boundary)\n", linkphase_pending_prev_bsi);
+				fflush(stdout);
+			}
+			linkphase_pending_prev_confirm = false;
+			linkphase_pending_prev_bsi = -1;
+			linkphase_pending_prev_window = -1;
 		}
 
 		receiving_timer.stop();
@@ -3267,6 +3342,27 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			{
 				// NB or MFSK-suffix unavailable: legacy MFSK pattern.
 				send_ack_pattern();
+			}
+			// SEAM-2 FLUSH-A: a deferred prev clean-confirm rides for free if this
+			// bsi-carrying clean/current ACK we just emitted cumulatively covers it.
+			// Only via the MFSK/compact transport (used_mfsk_path); a bsi-less legacy
+			// pattern credits the CMD's CURRENT batch, never a stale prev, so it must
+			// NOT clear the pending. Clear without re-emitting; a lost repeat self-heals
+			// on the next cumulative n_r.
+			if(linkphase_pending_prev_confirm && used_mfsk_path && cumulative_ack_enabled)
+			{
+				unsigned char emitted_nr = cumulative_ack_bsi_field(
+					ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+				if(linkphase_pending_confirm_covers((int)emitted_nr))
+				{
+					printf("[LINKPHASE-PENDING-COVERED] deferred prev n_r=%d covered by "
+						"emitted n_r=%u; clearing pending without re-emit\n",
+						linkphase_pending_prev_bsi, (unsigned)emitted_nr);
+					fflush(stdout);
+					linkphase_pending_prev_confirm = false;
+					linkphase_pending_prev_bsi = -1;
+					linkphase_pending_prev_window = -1;
+				}
 			}
 		}
 		else
