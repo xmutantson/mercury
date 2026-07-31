@@ -512,7 +512,15 @@ public:
   void set_nMessages(int nMessages);
   void set_max_buffer_length(int max_data_length, int max_message_length, int max_header_length);
   void set_ack_batch_size(int ack_batch_size);
-  void set_data_batch_size(int data_batch_size);
+  // from_link_params: provenance of the requested size. true at EXACTLY ONE
+  // production call site — the RSP SET_LINK_PARAMS CRC8-passed accept (the directed
+  // regression also drives it, to prove the robust clamp ignores provenance) —
+  // where it bypasses ONLY the
+  // climb-confirm clamp (the CMD only emits above-pin values when held-rung
+  // eligible, so the validated wire op IS the eligibility signal; the RSP carries
+  // no eligibility state of its own). The robust range clamp and every other clamp
+  // apply regardless of provenance. See DATAFLOW_AUDIT_burst_coalesce.md.
+  void set_data_batch_size(int data_batch_size, bool from_link_params = false);
   bool scalable_sack_on() const;
   int axis2_batch_ceiling() const;
   // R038 (race audit 2026-06-06) — per-frame v2 EOB staging consumed by the
@@ -5235,6 +5243,15 @@ public:
   // PURE in-process synthetic-fire — permanent regression gate.
   int test_climb_confirm_batch();
 
+  // Held-rung burst coalescing — drives the REAL policy_evaluate_axis2() (probation
+  // counter + released Axis-2 skip), the REAL sole-setter clamp (release + re-pin),
+  // the REAL RSP SET_LINK_PARAMS handler (provenance apply, no re-clamp divergence),
+  // the REAL shared reset helper, and the REAL ctor env latch of
+  // MERCURY_BURST_COALESCE_DEFEAT. FAIL-BEFORE arms via the defeat knob on ONE
+  // binary (pin holds 10 forever, controller never entered). PURE in-process
+  // synthetic-fire — permanent regression gate.
+  int test_burst_coalesce_held_rung();
+
   // DUTY FAST-START lever ELEVATOR FAST-CONFIRM — margin-gated N=1 OFDM climb confirm. Drives
   // the PURE core elevator_fast_confirm_eligible_core(). PASS-AFTER: whole-clean OFDM + SNR
   // capacity headroom -> N=1. FAIL-BEFORE (duty_elev_defeat) -> N=2. GUARDS: partial / mid-retx
@@ -5898,6 +5915,26 @@ public:
   // env-latched in the ctor (MERCURY_DUTY_PALT_DEFEAT / master MERCURY_DUTY_FASTSTART_DEFEAT).
   // When OFF (default) the confirm batch is capped small while climbing a non-top OFDM rung.
   bool duty_palt_defeat;
+  // Held-rung burst coalescing — defeat gate. env-latched in the ctor
+  // (MERCURY_BURST_COALESCE_DEFEAT=1 restores the permanent climb-confirm pin so the
+  // A/B runs FIX vs DEFEAT on ONE binary). When OFF (default) a HELD sub-top OFDM
+  // rung releases the climb-confirm batch cap after a probation of completed batches
+  // at the unchanged config, letting the stock Axis-2 controller grow the batch
+  // toward the nominal election. Deliberately NOT tied to the DUTY_FASTSTART master
+  // defeat: defeating P-alt already lifts the cap entirely (climb_confirm_batch_active
+  // returns false), so tying the two together would conflate the A/B arms.
+  bool burst_coalesce_defeat;
+  // Batches completed at the current config since the last config change / session
+  // reset. Incremented once per policy_evaluate_axis2() call (both production call
+  // sites fire once per completed batch) at the TOP of that function, BEFORE its
+  // early-return guards — an increment below the climb-confirm skip would starve
+  // the counter forever and the release could never arm. Reset through the ONE
+  // shared helper burst_coalesce_reset_probation(), called from load_configuration()
+  // (before any batch election there) and reset_session_state(). CMD-side
+  // eligibility state only: the RSP has no policy_evaluate_axis2() caller, so its
+  // counter stays 0 — correct under the provenance-release shape (the RSP's only
+  // above-pin producer is the CRC8-passed SET_LINK_PARAMS apply).
+  int batches_at_current_config;
   // ELEVATOR FAST-CONFIRM (DUTY fast-start, climb-duty) — margin-gated N=1 OFDM climb confirm
   // defeat gate. env-latched in the ctor (MERCURY_DUTY_ELEV_DEFEAT / master
   // MERCURY_DUTY_FASTSTART_DEFEAT). OFF (default): a WHOLE-clean OFDM batch whose RAW SNR
@@ -6012,6 +6049,38 @@ public:
       ceiling = max_config_override;
     return config_ladder_index(current_configuration) < config_ladder_index(ceiling);
   }
+  // Held-rung burst coalescing (cross-layer data-flow audit: DATAFLOW_AUDIT_burst_
+  // coalesce.md). The climb-confirm cap above is a CLIMB accelerator, but the
+  // margin-gated CFG16 election can HOLD a session below the ladder top indefinitely
+  // (gearshift ON, current < ceiling, decode margin under the cfg16 floor) — the pin
+  // then caps the steady-state batch at CLIMB_CONFIRM_BATCH forever and the Axis-2
+  // skip starves growth (measured: ~164 bursts x ~10 frames, duty 0.75 at a held
+  // cfg15, vs the 77-frame nominal election and duty ~0.96 on the same binary with
+  // the pin lifted). Eligibility = the rung has been HELD, not climbed through:
+  // >= BURST_COALESCE_PROBATION_BATCHES batches completed at an unchanged config
+  // (any FRAME-UP / SET_CONFIG / BREAK / session reset restarts probation — the
+  // counter resets in load_configuration() and reset_session_state()). Probation
+  // depth 4 > the 2-clean climb confirm, so a healthy climb never lifts the pin
+  // mid-rung. sack_v2_enabled required: growth is negotiated via SET_LINK_PARAMS
+  // and repaired via the wide SACK plane, both v2-only. Consulted by the sole-setter
+  // clamp (arq_common.cc) and the Axis-2 skip (arq_commander.cc). Growth itself is
+  // the STOCK Axis-2 machinery (floor 10 = today's pinned size, +5 per 4-clean-batch
+  // run, quiesce gate, proven ceiling), so releasing the pin can never make the
+  // batch smaller than today's behavior; the RSP adopts each step via the
+  // CRC8-protected SET_LINK_PARAMS apply (see set_data_batch_size from_link_params).
+  static const int BURST_COALESCE_PROBATION_BATCHES = 4;
+  bool burst_coalesce_eligible() const {
+    if(burst_coalesce_defeat) return false;
+    if(!sack_v2_enabled) return false;
+    return batches_at_current_config >= BURST_COALESCE_PROBATION_BATCHES;
+  }
+  // The ONE reset chokepoint for the held-rung probation counter — called from
+  // load_configuration() (early, before any batch election runs there, so a config
+  // change can never elect a full batch through stale eligibility) and
+  // reset_session_state() (BREAK teardown / session boundary). The directed
+  // regression drives THIS helper (the full reset paths deref the live PHY and are
+  // not synthetically callable).
+  void burst_coalesce_reset_probation() { batches_at_current_config = 0; }
   // C1 (data-flow-gearshift-climb.md) — the ROBUST tier-cross probe target. Returns CONFIG_0
   // when a robust climb should PROPOSE the OFDM tier directly (skip ROBUST_1/2 — they carry no
   // OFDM evidence, pure delay), or -1 to keep the +1 robust ladder. -1 when: defeated, not at a

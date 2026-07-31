@@ -4479,7 +4479,18 @@ void cl_arq_controller::process_control_responder()
 					target = axis2_batch_ceiling();
 
 				int old_batch = data_batch_size;
-				set_data_batch_size(target);
+				// from_link_params=true — the ONLY production call site with wire
+				// provenance (data-flow audit grep contract: keep it unique; the
+				// directed regression also drives the flag to prove the robust
+				// clamp ignores it). The CRC8-passed op
+				// bypasses the climb-confirm clamp at the sole setter: the CMD only
+				// emits above-pin values when held-rung eligible, and the RSP carries
+				// no eligibility counter of its own (no Axis-2 caller), so without
+				// the provenance leg every applied grow would re-clamp to 10 here =
+				// a permanent CMD/RSP batch divergence. Robust range clamp and the
+				// [AXIS2_BATCH_FLOOR, axis2_batch_ceiling()] defensive clamp above
+				// still apply.
+				set_data_batch_size(target, /*from_link_params=*/true);
 				recalculate_ack_timeout_for_batch();
 
 				// SACK Design A Step 11 — apply sack_mode from CMD.

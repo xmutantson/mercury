@@ -1880,6 +1880,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_pa;
                 failed += test_pa.test_climb_confirm_batch();
             }
+            // Held-rung burst coalescing — a margin-gated election can HOLD a session
+            // at a sub-top OFDM rung forever; the climb-confirm pin then caps the
+            // steady-state batch at 10 and the Axis-2 skip starves growth. The release
+            // (probation counter + provenance-released sole-setter clamp + gated
+            // Axis-2 skip) drives the REAL controller, setter, RSP SET_LINK_PARAMS
+            // handler, reset chokepoint and ctor env latch. FAIL-BEFORE arms via
+            // MERCURY_BURST_COALESCE_DEFEAT on ONE binary.
+            {
+                cl_arq_controller test_bc;
+                failed += test_bc.test_burst_coalesce_held_rung();
+            }
             // DUTY FAST-START lever ELEVATOR FAST-CONFIRM — margin-gated N=1 OFDM climb confirm:
             // on a whole-clean OFDM batch whose raw SNR capacity clears a higher rung, the anchor
             // is seated + the FRAME-UP elevator fires on the FIRST clean (skip the 2nd confirm),

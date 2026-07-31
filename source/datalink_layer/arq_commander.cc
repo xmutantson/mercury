@@ -10122,6 +10122,14 @@ void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg,
 // the next batch.
 void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_observed)
 {
+	// Held-rung probation counter (burst coalescing): one increment per controller
+	// call — both production call sites fire once per completed batch. MUST precede
+	// every early-return guard below: an increment placed after the climb-confirm
+	// skip would starve the counter forever and the held-rung release could never
+	// arm. Reset in load_configuration() / reset_session_state() via
+	// burst_coalesce_reset_probation(). If the call cadence ever changes, keep this
+	// per-BATCH, not per-call.
+	batches_at_current_config++;
 	// climb-engine Bug 3 root cause (gearshift-climb-engine.md §2): ROBUST/MFSK
 	// configs pin data_batch_size=1 by design (arq_common.cc:1229-1234, "MFSK
 	// modes keep batch_size=1 for pattern-ACK optimization"; the OFDM batch-
@@ -10159,7 +10167,14 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	// SET_LINK_PARAMS-grow the confirm batch back up mid-climb (which would re-inflate the
 	// per-rung dwell AND pay a ~2 s round-trip pause). Same shape as the robust / bigblock
 	// guards above. At the ladder TOP (steady-state) Axis-2 runs -> full batch for throughput.
-	if(climb_confirm_batch_active()) return;
+	// Held-rung burst coalescing release: a rung that has been HELD past probation
+	// (burst_coalesce_eligible() — the margin-gated election parking a session below
+	// the top with gearshift ON) is steady state, not a climb, so the controller
+	// runs there: stock Axis-2 growth (+5 per 4-clean run, quiesce gate, proven
+	// ceiling, floor 10 = today's pinned size) grows the batch toward the nominal
+	// election, and down-moves become live at held rungs too. During a real climb
+	// the counter resets on every FRAME-UP load, so the skip still holds mid-climb.
+	if(climb_confirm_batch_active() && !burst_coalesce_eligible()) return;
 	axis2_evaluations++;
 	if(batch_size_observed <= 0) return;  // defensive — no observation
 	if(rx_count < 0) rx_count = 0;
@@ -13870,6 +13885,217 @@ int cl_arq_controller::test_climb_confirm_batch()
 	gear_shift_on = saved_gear;
 	max_config_override = saved_max;
 	printf("[TEST-DUTY-PALT] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// Held-rung burst coalescing — directed regression (DATAFLOW_AUDIT_burst_coalesce.md).
+// A margin-gated election can HOLD a session at a sub-top OFDM rung (gearshift ON,
+// current < ceiling) forever; the climb-confirm pin then caps the steady-state batch
+// at CLIMB_CONFIRM_BATCH and the Axis-2 skip starves growth. This drives the REAL
+// production mechanisms end to end, in-process:
+//   T1  CMD held-rung growth: probation (3 evals skipped, batch pinned), then the
+//       controller enters and the stock Axis-2 up-move fires 10 -> 15
+//       ([POLICY-MOVE] axis=2), local batch 15, emitted SET_LINK_PARAMS frame batch=15.
+//   T2  RSP symmetric apply: the REAL process_control_responder() SET_LINK_PARAMS
+//       branch (CRC8-valid frame) applies 15 at a pinned RSP (counter=0) — no
+//       re-clamp divergence. Guard: a default-provenance set at the same state
+//       still re-pins to 10 (non-wire producers stay clamped).
+//   T3  Fade/demote re-pin: the REAL shared reset helper (the exact chokepoint
+//       load_configuration()/reset_session_state() call — the full paths deref the
+//       live PHY and are not synthetically callable) clears eligibility and the
+//       REAL setter re-pins 77 -> 10.
+//   T4  Defeat arm: MERCURY_BURST_COALESCE_DEFEAT=1 latched through the REAL ctor
+//       env path reproduces today's pin byte-for-byte (batch stays 10, controller
+//       never entered, axis2_evaluations==0).
+//   T5  Guards unchanged: robust range clamp ignores provenance; ladder-top CFG16
+//       lifts the cap independent of eligibility (steady state already full-batch).
+// FAIL-BEFORE arms via the defeat knob on ONE binary. 0=PASS, 1=FAIL.
+int cl_arq_controller::test_burst_coalesce_held_rung()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name, int got, int want) {
+		if(cond) { printf("[TEST-BURST-COALESCE] PASS: %s (got=%d want=%d)\n", name, got, want); }
+		else { printf("[TEST-BURST-COALESCE] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	// Common prime: a HELD cfg15 CMD — WB session, gearshift ON, pin LIVE (P-alt not
+	// defeated), sack v2 on, scalable ceiling irrelevant (10+5=15 clears both 32/96).
+	// Synthetic-fire priming: no load_configuration() ran, so prime the two length
+	// members (same pattern as test_climb_engine) so the setter's wire-derived
+	// ceiling (~206) sits above the working range and it behaves as in production.
+	auto prime_held_cfg15 = [&]() {
+		sack_v2_enabled = true;
+		sack_enabled = true;
+		current_configuration = CONFIG_15;
+		telecom_system = NULL;              // synthetic — bigblock guard is NULL-skipped
+		robust_enabled = YES; narrowband_enabled = NO;
+		gear_shift_on = YES; max_config_override = -1;
+		duty_palt_defeat = false;           // the climb-confirm pin is LIVE at cfg15
+		burst_coalesce_defeat = false;
+		batches_at_current_config = 0;
+		max_data_length = 200;
+		max_header_length = 7;
+		data_batch_size = AXIS2_BATCH_FLOOR;   // today's pinned size (10)
+		nominal_batch_size = data_batch_size;
+		messages_control.status = FREE;
+		retransmit_count = 0;
+		last_batch_fully_acked = true;      // clean boundary — quiesce gate passes
+		for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.0f;
+		axis2_partial_rate_count = AXIS2_RING_DEPTH;   // pre-filled clean ring (mean 0)
+		axis2_partial_rate_pos = 0;
+		axis2_consecutive_good_batches = AXIS2_UP_GOOD_RUN - 1;  // one more good -> want_up
+		axis2_consecutive_bad_batches = 0;
+		axis2_cooldown_batches = 0;
+		batch_size_proven_ceiling = -1;
+		batch_size_ceiling_recovery_batches = 0;
+		axis2_deferred_moves = 0;
+		axis2_evaluations = 0;
+		axis2_move_up_count = 0;
+		axis2_move_down_count = 0;
+	};
+
+	// Sanity: the pin predicate itself is TRUE at the held rung (the scenario exists).
+	prime_held_cfg15();
+	check(climb_confirm_batch_active(), "prime: climb-confirm pin LIVE at held cfg15",
+		climb_confirm_batch_active() ? 1 : 0, 1);
+
+	// ---- T1: held-rung growth through the REAL controller ----
+	// Probation: the first BURST_COALESCE_PROBATION_BATCHES-1 evaluations are still
+	// skipped (counter below threshold at the eligibility check) — batch pinned,
+	// controller never entered.
+	prime_held_cfg15();
+	for(int b = 1; b < BURST_COALESCE_PROBATION_BATCHES; b++)
+		policy_evaluate_axis2(data_batch_size, data_batch_size);   // clean batches
+	check(data_batch_size == AXIS2_BATCH_FLOOR,
+		"T1 probation: batch still pinned after 3 clean batches", data_batch_size, AXIS2_BATCH_FLOOR);
+	check(axis2_evaluations == 0,
+		"T1 probation: controller not entered during probation", (int)axis2_evaluations, 0);
+	// Batch 4: the counter reaches probation depth, the release arms, the controller
+	// runs, the good-run reaches AXIS2_UP_GOOD_RUN and the stock up-move fires 10->15
+	// through the released sole-setter clamp. Install a real control-frame buffer so
+	// the up-move's add_message_control(SET_LINK_PARAMS) encodes an ACTUAL wire frame
+	// (its data[1]=batch, data[3]=CRC8) instead of taking the pre-init NULL-guard
+	// SKIP path (which stages the value, prints "WOULD HAVE SENT", then resets
+	// pending_link_params_batch_size to -1 without emitting bytes). The emitted wire
+	// batch byte — the value the RSP actually applies — is the true post-condition of
+	// "the grow is announced to the peer". Buffer is a local; restored before scope
+	// end so the destructor never frees a stack address (same save/restore discipline
+	// as T2 below).
+	char t1_lp[8];
+	char* t1_saved_cd = messages_control.data;
+	int   t1_saved_cs = messages_control.status;
+	messages_control.data   = t1_lp;
+	messages_control.status = FREE;   // the encoder only runs when the slot is FREE
+	policy_evaluate_axis2(data_batch_size, data_batch_size);
+	int t1_wire_batch = (unsigned char)messages_control.data[1];
+	int t1_wire_crc   = (unsigned char)messages_control.data[3];
+	int t1_want_crc   = (unsigned char)CRC8_calc((char*)&messages_control.data[1], 2);
+	messages_control.data   = t1_saved_cd;   // restore BEFORE any further use / dtor
+	messages_control.status = t1_saved_cs;
+	check(burst_coalesce_eligible(), "T1 release: eligibility armed at probation depth",
+		burst_coalesce_eligible() ? 1 : 0, 1);
+	check(axis2_move_up_count == 1, "T1 growth: [POLICY-MOVE] axis=2 up fired",
+		(int)axis2_move_up_count, 1);
+	check(data_batch_size == AXIS2_BATCH_FLOOR + AXIS2_STEP,
+		"T1 growth: local batch grew 10 -> 15 (clamp released)",
+		data_batch_size, AXIS2_BATCH_FLOOR + AXIS2_STEP);
+	check(t1_wire_batch == AXIS2_BATCH_FLOOR + AXIS2_STEP,
+		"T1 growth: SET_LINK_PARAMS wire frame batch byte = 15",
+		t1_wire_batch, AXIS2_BATCH_FLOOR + AXIS2_STEP);
+	check(t1_wire_crc == t1_want_crc,
+		"T1 growth: SET_LINK_PARAMS wire frame CRC8 valid",
+		t1_wire_crc, t1_want_crc);
+
+	// ---- T2: RSP symmetric apply through the REAL handler ----
+	// An RSP never evaluates Axis-2, so its counter is 0 and it is NOT locally
+	// eligible; the CRC8-passed wire op must still apply (provenance release).
+	prime_held_cfg15();
+	int t2_saved_link_status = link_status;
+	int t2_saved_connection_status = connection_status;
+	char* t2_saved_control_data = messages_control.data;
+	int t2_saved_control_status = messages_control.status;
+	char t2_wire[4];
+	t2_wire[0] = SET_LINK_PARAMS;
+	t2_wire[1] = (char)(AXIS2_BATCH_FLOOR + AXIS2_STEP);   // batch 15
+	t2_wire[2] = (char)1;                                  // sack_mode ON
+	t2_wire[3] = (char)CRC8_calc(&t2_wire[1], 2);
+	messages_control.data = t2_wire;
+	messages_control.status = RECEIVED;
+	link_status = CONNECTED;
+	process_control_responder();
+	check(data_batch_size == AXIS2_BATCH_FLOOR + AXIS2_STEP,
+		"T2 RSP apply: CRC8-passed SET_LINK_PARAMS grow applied (no re-clamp divergence)",
+		data_batch_size, AXIS2_BATCH_FLOOR + AXIS2_STEP);
+	// Guard: at the same pinned state a NON-wire producer stays clamped — the
+	// provenance release is scoped to the wire op only.
+	set_data_batch_size(AXIS2_BATCH_FLOOR + AXIS2_STEP);
+	check(data_batch_size == CLIMB_CONFIRM_BATCH,
+		"T2 guard: default-provenance set at pinned RSP re-pins to 10",
+		data_batch_size, CLIMB_CONFIRM_BATCH);
+	messages_control.data = t2_saved_control_data;
+	messages_control.status = t2_saved_control_status;
+	link_status = t2_saved_link_status;
+	connection_status = t2_saved_connection_status;
+
+	// ---- T3: fade/demote re-pin through the REAL reset chokepoint + REAL setter ----
+	prime_held_cfg15();
+	batches_at_current_config = 9;      // grown, held state
+	data_batch_size = 15;
+	burst_coalesce_reset_probation();   // the exact helper load_configuration() and
+	                                    // reset_session_state() call on the fix paths
+	check(batches_at_current_config == 0, "T3 re-pin: probation counter cleared",
+		batches_at_current_config, 0);
+	check(!burst_coalesce_eligible(), "T3 re-pin: eligibility dropped",
+		burst_coalesce_eligible() ? 1 : 0, 0);
+	set_data_batch_size(77);            // the nominal cfg15 election request
+	check(data_batch_size == CLIMB_CONFIRM_BATCH,
+		"T3 re-pin: election re-clamps to 10 after reset", data_batch_size, CLIMB_CONFIRM_BATCH);
+
+	// ---- T4: defeat arm — byte-identical to today's pinned behavior ----
+	// The knob is env-latched in the ctor (production path): prove it LIVE there.
+	setenv("MERCURY_BURST_COALESCE_DEFEAT", "1", 1);
+	{
+		cl_arq_controller defeat_ctl;
+		check(defeat_ctl.burst_coalesce_defeat,
+			"T4 defeat: MERCURY_BURST_COALESCE_DEFEAT=1 latched by the ctor",
+			defeat_ctl.burst_coalesce_defeat ? 1 : 0, 1);
+	}
+	unsetenv("MERCURY_BURST_COALESCE_DEFEAT");
+	prime_held_cfg15();
+	burst_coalesce_defeat = true;
+	for(int b = 0; b < 2 * BURST_COALESCE_PROBATION_BATCHES; b++)
+		policy_evaluate_axis2(data_batch_size, data_batch_size);
+	check(data_batch_size == AXIS2_BATCH_FLOOR,
+		"T4 defeat: batch pinned at 10 through 8 clean batches", data_batch_size, AXIS2_BATCH_FLOOR);
+	check(axis2_evaluations == 0,
+		"T4 defeat: controller never entered (today's skip intact)", (int)axis2_evaluations, 0);
+	check(axis2_move_up_count == 0,
+		"T4 defeat: no Axis-2 move fired", (int)axis2_move_up_count, 0);
+
+	// ---- T5: neighboring guards unchanged ----
+	// Robust range clamp ignores provenance: a wire-provenance over-request at a
+	// robust config still clamps into [1..ROBUST_DWELL_BATCH_MAX].
+	prime_held_cfg15();
+	current_configuration = ROBUST_0;
+	data_batch_size = 1;
+	set_data_batch_size(25, /*from_link_params=*/true);
+	check(data_batch_size <= ROBUST_DWELL_BATCH_MAX && data_batch_size >= 1,
+		"T5 robust: provenance does NOT bypass the robust range clamp",
+		data_batch_size, ROBUST_DWELL_BATCH_MAX);
+	// Ladder top: the climb-confirm cap lifts at CFG16 regardless of eligibility
+	// (steady state was already full-batch; coalescing must not change it).
+	prime_held_cfg15();
+	current_configuration = CONFIG_16;
+	batches_at_current_config = 0;      // not eligible — and it must not matter
+	set_data_batch_size(64);
+	check(data_batch_size == 64,
+		"T5 cfg16: ladder top keeps full batch independent of eligibility",
+		data_batch_size, 64);
+
+	printf("[TEST-BURST-COALESCE] %s (%d failures)\n",
+		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }

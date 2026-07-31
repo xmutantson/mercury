@@ -850,6 +850,14 @@ cl_arq_controller::cl_arq_controller()
 		// on ONE binary. Env-latched ONCE here (production path) like the R knob above.
 		const char* dp = std::getenv("MERCURY_DUTY_PALT_DEFEAT");
 		duty_palt_defeat = duty_master_defeat || (dp && *dp && atoi(dp) != 0);
+		// Held-rung burst coalescing — ships DEFAULT-ON. MERCURY_BURST_COALESCE_DEFEAT=1
+		// restores the permanent climb-confirm pin so the A/B runs FIX vs DEFEAT on ONE
+		// binary. Env-latched ONCE here (production path) like the P-alt knob above.
+		// Standalone knob (not folded into the DUTY_FASTSTART master): defeating P-alt
+		// already lifts the climb-confirm cap entirely, so folding would conflate arms.
+		const char* bc = std::getenv("MERCURY_BURST_COALESCE_DEFEAT");
+		burst_coalesce_defeat = (bc && *bc && atoi(bc) != 0);
+		batches_at_current_config = 0;
 		// ELEVATOR FAST-CONFIRM (climb-duty). Ships DEFAULT-ON. MERCURY_DUTY_ELEV_DEFEAT=1 (or the
 		// master MERCURY_DUTY_FASTSTART_DEFEAT=1) restores the incumbent N=2 confirm so the fire-proof
 		// runs FIX vs DEFEAT on ONE binary. Env-latched ONCE here like the R / P-alt knobs above.
@@ -2028,7 +2036,7 @@ int cl_arq_controller::derive_keydown_length_ms(int frame_count, bool force_full
 	return r;
 }
 
-void cl_arq_controller::set_data_batch_size(int data_batch_size)
+void cl_arq_controller::set_data_batch_size(int data_batch_size, bool from_link_params)
 {
 	// CHOKEPOINT: robust => batch 1 (the single enforcement point).
 	// At any robust/MFSK config the batch MUST be 1 (all-or-nothing pattern ACK;
@@ -2117,7 +2125,26 @@ void cl_arq_controller::set_data_batch_size(int data_batch_size)
 		// The 2-clean anchor count / elevator are untouched (smaller/faster batches); reverts
 		// to full batch at the ladder top for steady-state throughput. Clamped into `target`
 		// BEFORE the defer/rescan below so they see the value that will actually be stored.
-		if(climb_confirm_batch_active() && target > CLIMB_CONFIRM_BATCH)
+		//
+		// Held-rung burst coalescing (DATAFLOW_AUDIT_burst_coalesce.md): the cap was a
+		// CLIMB accelerator, but the margin-gated CFG16 election can HOLD a session below
+		// the ladder top indefinitely — the pin then caps the steady-state batch at 10
+		// forever (measured duty 0.75 vs 0.96 at a held cfg15 on the same binary). Two
+		// releases, both conservative:
+		//   (1) local eligibility — the rung has been HELD for a probation of completed
+		//       batches (burst_coalesce_eligible(); CMD-side counter, resets on any config
+		//       change / session reset, so every climb, demote, BREAK or reconnect
+		//       re-engages the pin and re-earns the release);
+		//   (2) provenance — from_link_params marks the RSP applying a CRC8-passed
+		//       SET_LINK_PARAMS. The CMD only emits above-pin values when eligible (the
+		//       Axis-2 skip is gated on the same predicate), so the validated wire op IS
+		//       the eligibility signal; without this leg the RSP (whose counter never
+		//       advances — it has no Axis-2 caller) would re-clamp every applied grow back
+		//       to 10 = a permanent CMD/RSP batch divergence, the exact climb-fix-family
+		//       failure class this sole-setter clamp exists to prevent.
+		// The robust range clamp above and every other clamp here ignore provenance.
+		if(climb_confirm_batch_active() && !burst_coalesce_eligible() && !from_link_params
+		   && target > CLIMB_CONFIRM_BATCH)
 			target = CLIMB_CONFIRM_BATCH;
 		// Fix A (baseline-double-delivery.md): defer an orphaning shrink (see the
 		// robust branch above) — the Axis-2 down-move 25->20 mid-partial-batch is the
@@ -3074,6 +3101,14 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// stale — invalidate them here (RX-side; a harmless no-op on the CMD). Placed AFTER the
 	// no-change early-return so a redundant same-config load never touches them.
 	rx_stream_invalidate_stamps();
+	// Held-rung burst coalescing: a REAL config change (FRAME-UP, demote, BREAK
+	// reload, connect-time load) restarts the held-rung probation. Placed HERE —
+	// after the same-config early-return, BEFORE the robust pin and the OFDM batch
+	// scaling below — so every batch election in this function runs with the counter
+	// already reset: a config change can never elect a full batch through stale
+	// eligibility, and the climb-confirm pin re-engages at 10 (conservative
+	// fail-direction). See DATAFLOW_AUDIT_burst_coalesce.md.
+	burst_coalesce_reset_probation();
 	// Top-gear election (topgear-stack-productionize.md §3): leaving the CFG16/CFG17 band
 	// forces the verdict false + clears the streak — each CFG16 visit must re-earn cfg17.
 	// No-op unless MERCURY_TOPGEAR_ELECT is set (feature-gated) => byte-identical default.
@@ -8646,6 +8681,12 @@ int cl_arq_controller::test_demote_silence()
 
 void cl_arq_controller::reset_session_state()
 {
+	// Held-rung burst coalescing: a session boundary (BREAK teardown, link-timeout
+	// reset, clean reconnect — every genuine teardown routes here) restarts the
+	// held-rung probation so the climb-confirm pin re-engages on the next session.
+	// (Connect-accept skips this function; the connect path's load_configuration()
+	// carries the same reset.) See DATAFLOW_AUDIT_burst_coalesce.md.
+	burst_coalesce_reset_probation();
 	// A causal START-ACK epoch belongs to one transmitted START frame only.
 	// Never carry its armed state through a teardown or reconnect.
 	start_ack_causal_guard_armed = false;
