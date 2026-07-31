@@ -1353,6 +1353,7 @@ cl_arq_controller::cl_arq_controller()
 	last_received_end_of_batch_seq=-1;
 	rx_buffer_eob_seq=-1;  // R038: per-frame v2 EOB staging (set in receive())
 	rx_buffer_batch_total_frames=-1;  // D5: per-frame batch_total_frames staging (set in receive())
+	rx_buffer_retx_turn_tail=false;   // negotiated D5 turn-tail marker staging
 	rx_batch_total_frames=-1;          // D5: promoted authoritative per-batch frame count, or -1
 	for(int _s=0;_s<256;_s++) tx_batch_span[_s]=0;   // LINK-PHASE STEP 2 (a): per-bsi span latch, 0=unlatched
 	linkphase_prev_ack_deferred=0;      // LINK-PHASE STEP 2 fire-proof counters (production-path)
@@ -1877,6 +1878,31 @@ bool cl_arq_controller::linkphase_ackslot_on()
 		state = (e && *e && atoi(e) == 0) ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock
 	}
 	return state == 1;
+}
+
+bool cl_arq_controller::retx_turn_tail_on() const
+{
+	return linkphase_ackslot_on()
+		&& scalable_sack_on()
+		&& (local_capability & CAP_RETX_TURN_TAIL)
+		&& (peer_capability & CAP_RETX_TURN_TAIL);
+}
+
+// Capability alone is not a boundary proof: a lost partial SACK falls back to
+// the ordinary timeout builder, which may place fresh data behind retries. The
+// completing frame must carry the negotiated D5 turn-tail marker set only by
+// the decoded-SACK selective-retry builder on its physical final frame.
+bool cl_arq_controller::linkphase_defer_prev_ack(bool ackslot_active,
+		bool proven_retx_tail) const
+{
+	if(!ackslot_active)
+		return false;
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_PREV_ACK_DEFER_DEFEAT");
+	  if(e && *e && atoi(e) != 0) defeat = true; }
+	if(defeat)
+		return true;  // fail-before: restore the unconditional ACK suppression
+	return !proven_retx_tail;
 }
 
 // LINK-PHASE STEP 5 / MC-3 — convert reverse-ACK absence from a polling-time
@@ -8020,7 +8046,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -8126,7 +8152,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		compression_enabled = false;
@@ -8162,7 +8188,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
+		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -8180,7 +8206,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -8199,7 +8225,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit();  // FORGIVING-ACK Tier 2: env-gated cap advertise
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -8689,6 +8715,7 @@ void cl_arq_controller::reset_session_state()
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
 	for(int _s=0;_s<256;_s++) tx_batch_span[_s]=0;   // LINK-PHASE STEP 2 (a): clear stale per-bsi spans on session reset
+	rx_buffer_retx_turn_tail=false;   // no per-frame boundary marker survives reset
 
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;
@@ -12177,6 +12204,28 @@ void cl_arq_controller::send_batch()
 				}
 			}
 		}
+		// A decoded-SACK v2 turn sets sack_retransmit_active and admits no new
+		// generation. Mark only its physical final frame. The ordinary
+		// ACK_TIMED_OUT builder leaves sack_retransmit_active false, so a lost
+		// partial SACK can never manufacture this boundary proof.
+		bool retx_turn_tail = d5_should_mark_retx_tail(
+			retx_turn_tail_on(),
+			sack_v2_enabled,
+			header_carries_d5,
+			sack_retransmit_active,
+			i,
+			message_batch_counter_tx);
+		unsigned char d5_wire = d5_wire_value(
+			batch_total_frames_wire, retx_turn_tail);
+		if(retx_turn_tail)
+		{
+			printf("[LINKPHASE-RETX-TAIL-TX] bsi=%d span=%d frame=%d/%d\n",
+				messages_batch_tx[i].batch_seq_id,
+				batch_total_frames_wire,
+				i + 1,
+				message_batch_counter_tx);
+			fflush(stdout);
+		}
 
 		if(messages_batch_tx[i].type==DATA_LONG)
 		{
@@ -12193,7 +12242,7 @@ void cl_arq_controller::send_batch()
 				message_TxRx_byte_buffer[3]=(char)(bsi & 0xFF);
 				message_TxRx_byte_buffer[4]=messages_batch_tx[i].id;
 				if(header_carries_d5)
-					message_TxRx_byte_buffer[5]=(char)(batch_total_frames_wire & 0xFF);  // D5
+					message_TxRx_byte_buffer[5]=(char)d5_wire;  // D5 span + negotiated turn tail
 			}
 			else
 			{
@@ -12217,7 +12266,7 @@ void cl_arq_controller::send_batch()
 				message_TxRx_byte_buffer[4]=messages_batch_tx[i].id;
 				message_TxRx_byte_buffer[5]=messages_batch_tx[i].length;
 				if(header_carries_d5)
-					message_TxRx_byte_buffer[6]=(char)(batch_total_frames_wire & 0xFF);  // D5
+					message_TxRx_byte_buffer[6]=(char)d5_wire;  // D5 span + negotiated turn tail
 			}
 			else
 			{
@@ -14698,7 +14747,7 @@ long long cl_arq_controller::send_mfsk_start_conn_phy(const std::string& sender_
 }
 
 // RSP-side TX (Site C in §13.2): MFSK TEST_CONNECTION_ACK suffix carrying
-// [echoed_cap:2 | own_cap:2 | ssid:8 | reserved:26].
+// [echoed_cap:4 | own_cap:4 | ssid:8 | reserved:22].
 long long cl_arq_controller::send_mfsk_test_ack_phy(uint8_t echoed_cap,
                                                     uint8_t own_cap,
                                                     uint8_t ssid)
@@ -14870,7 +14919,7 @@ bool cl_arq_controller::receive_mfsk_test_ack_phy(uint8_t* out_echoed_cap,
 }
 
 // CMD-side TX (Site E in §14): MFSK TEST_CONNECTION suffix carrying
-// [snr_q:4 | local_cap:2 | ssid:8 | reserved:24]. The legacy CMD-side
+// [snr_q:4 | local_cap:4 | ssid:8 | reserved:22]. The legacy CMD-side
 // LDPC build at arq_commander.cc:466-475 populates messages_control.data
 // with float SNR + capability + SSID; Site E reads those fields, quantizes
 // SNR via cl_mfsk::snr_to_tone (M=16 → 4 bits, range -5..+25 dB step 2 dB),
@@ -16877,6 +16926,7 @@ void cl_arq_controller::receive()
 				// responder promotes it to rx_batch_total_frames ONLY inside the confirmed
 				// match-current / match-prev storage block (mirrors the R038 EOB staging).
 				rx_buffer_batch_total_frames = -1;
+				rx_buffer_retx_turn_tail = false;
 				if((message_TxRx_byte_buffer[2] & 0x80)
 					&& (messages_rx_buffer.type == DATA_LONG || messages_rx_buffer.type == DATA_SHORT))
 				{
@@ -16948,8 +16998,12 @@ void cl_arq_controller::receive()
 						// legacy → stays -1 (RX keeps any prior count).
 						if(header_carries_d5)
 						{
-							int btf = (unsigned char)message_TxRx_byte_buffer[5];
+							unsigned char d5 =
+								(unsigned char)message_TxRx_byte_buffer[5];
+							int btf = d5_batch_span(d5);
 							rx_buffer_batch_total_frames = (btf > 0) ? btf : -1;
+							rx_buffer_retx_turn_tail =
+								retx_turn_tail_on() && d5_retx_turn_tail(d5);
 						}
 					}
 					else
@@ -17015,8 +17069,12 @@ void cl_arq_controller::receive()
 						// legacy → stays -1 (RX keeps any prior count).
 						if(header_carries_d5)
 						{
-							int btf = (unsigned char)message_TxRx_byte_buffer[6];
+							unsigned char d5 =
+								(unsigned char)message_TxRx_byte_buffer[6];
+							int btf = d5_batch_span(d5);
 							rx_buffer_batch_total_frames = (btf > 0) ? btf : -1;
+							rx_buffer_retx_turn_tail =
+								retx_turn_tail_on() && d5_retx_turn_tail(d5);
 						}
 					}
 					else

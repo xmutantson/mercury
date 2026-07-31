@@ -8097,7 +8097,10 @@ void cl_arq_controller::process_control_commander()
 					reset_session_state();
 					return;
 				}
-				if(echoed_cap != (unsigned char)local_capability)
+				if(!handshake_cap_echo_compatible(
+						(unsigned char)local_capability,
+						echoed_cap,
+						rsp_own))
 				{
 					printf("[HANDSHAKE-ECHO] FAIL cap mismatch: echoed=0x%02X local=0x%02X "
 						"(silent corruption suspected; retries_left=%d)\n",
@@ -8119,6 +8122,13 @@ void cl_arq_controller::process_control_commander()
 				printf("[HANDSHAKE-ECHO] OK echoed_cap=0x%02X own=0x%02X — handshake confirmed\n",
 					echoed_cap, rsp_own);
 				fflush(stdout);
+				if(echoed_cap != (unsigned char)local_capability)
+				{
+					printf("[HANDSHAKE-ECHO] COMPAT optional bit3 absent: "
+						"echoed=0x%02X local=0x%02X peer=0x%02X\n",
+						echoed_cap, (unsigned char)local_capability, rsp_own);
+					fflush(stdout);
+				}
 				handshake_confirmed = true;
 				peer_capability = rsp_own;
 				// No SNR carried in TEST_CONNECTION_ACK — leave SNR unchanged.
@@ -8135,8 +8145,11 @@ void cl_arq_controller::process_control_commander()
 				// With LDPC ACK: this is the responder's reply (correct).
 				// With ACK pattern: no data payload, so this is our own TX data (assumes
 				// symmetric capability — works when both sides use same bandwidth_mode).
+				// The legacy inference helper preserves established bits but clears
+				// CAP_RETX_TURN_TAIL because no responder wire proof exists.
 				// Responder's SWITCH_BANDWIDTH handler rejects if nb_only as a safety net.
-				peer_capability = (uint8_t)messages_control.data[5];
+				peer_capability = legacy_ack_inferred_peer_cap(
+					(uint8_t)messages_control.data[5]);
 			}
 			printf("[BW-NEG] Responder capability: 0x%02X (WB=%s, ENCRYPT=%s)\n",
 				peer_capability,

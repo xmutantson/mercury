@@ -127,11 +127,14 @@ bool unpack_start_conn_payload(uint64_t p38, bool* out_nb_flag,
 //                                        `arq.h:60 #define SSID_NONE 0xFF`)
 //   bit  25     : own_cap[2]      (1)   CAP_CUMULATIVE_ACK (FORGIVING-ACK Tier 2)
 //   bit  24     : echoed_cap[2]   (1)   echo of bit 2
-//   bits 23..0  : reserved        (24)  must be 0 on TX, ignored on RX
+//   bit  23     : own_cap[3]      (1)   CAP_RETX_TURN_TAIL
+//   bit  22     : echoed_cap[3]   (1)   echo of bit 3
+//   bits 21..0  : reserved        (22)  must be 0 on TX, ignored on RX
 //
-// echoed_cap / own_cap are the 3 negotiable MFSK-wire bits
-// (CAP_NEGOTIABLE_MASK=0x07): CAP_WB_CAPABLE (0x01), CAP_ENCRYPTION (0x02),
-// CAP_CUMULATIVE_ACK (0x04). Bits above 0x07 are masked off. Bit 2 reuses formerly-
+// echoed_cap / own_cap are the 4 negotiable MFSK-wire bits
+// (CAP_NEGOTIABLE_MASK=0x0F): CAP_WB_CAPABLE (0x01), CAP_ENCRYPTION (0x02),
+// CAP_CUMULATIVE_ACK (0x04), CAP_RETX_TURN_TAIL (0x08). Bits above 0x0F are
+// masked off. Bits 2 and 3 reuse formerly-
 // reserved payload bits (the §21 precedent) — no payload-width change.
 void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
                             uint8_t own_cap, uint8_t ssid);
@@ -153,7 +156,8 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 //                                       `arq.h:60 #define SSID_NONE 0xFF`).
 //                                       Identical encoding to TEST_ACK.
 //   bit  23     : local_cap[2]   (1)   CAP_CUMULATIVE_ACK (FORGIVING-ACK Tier 2)
-//   bits 22..0  : reserved       (23)  must be 0 on TX, ignored on RX
+//   bit  22     : local_cap[3]   (1)   CAP_RETX_TURN_TAIL
+//   bits 21..0  : reserved       (22)  must be 0 on TX, ignored on RX
 //
 // Site F (RSP RX) reconstructs the legacy float SNR via
 // cl_mfsk::tone_to_snr(snr_q). 2 dB quantization step is documented in the

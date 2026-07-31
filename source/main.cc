@@ -1622,6 +1622,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             int failed = run_mfsk_ctrl_codec_tests();
+            if (getenv("MERCURY_CAP_CODEC_ONLY") != NULL)
+                return failed == 0 ? 0 : 1;
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
             failed += run_sim_clock_tests();
@@ -7328,7 +7330,7 @@ start_modem:
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
-                             ;
+                             | CAP_RETX_TURN_TAIL;
         ARQ.force_compress = (force_compress_cli >= 0) ? (force_compress_cli == 1) : g_settings.force_compress;
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
@@ -7369,7 +7371,7 @@ start_modem:
         // can still be opt-out via --no-sack / --disable-sack-v2 (those flags
         // run later and mask the bits at main.cc:1505-1534).
         ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
-                             ;
+                             | CAP_RETX_TURN_TAIL;
         ARQ.force_compress = (force_compress_cli == 1);
         ARQ.skip_turbo_reverse = skip_turbo_reverse;
         ARQ.max_config_override = max_config_cli;
@@ -7532,7 +7534,8 @@ start_modem:
                 ARQ.robust_enabled = g_gui_state.robust_mode_enabled.load() ? YES : NO;
                 ARQ.bandwidth_mode = g_gui_state.bandwidth_mode.load();
                 ARQ.local_capability = ((ARQ.bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0)
-                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0);
+                                    | ((ARQ.encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0)
+                                    | CAP_RETX_TURN_TAIL;
                 // narrowband_enabled is set at startup (line ~728) based on -Q and -M flags.
                 // Do NOT override here — forcing NB on telecom_system while the actual
                 // config is WB causes get_tx_gain() to return NB gains (+7 dB overboosted).

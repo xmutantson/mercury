@@ -326,6 +326,64 @@ inline bool batchsize_desync_detected(int sender_total_frames, int local_batch, 
 // via retransmits and the new one arriving in the same radio batch).
 #define MAX_SACK_BATCH_SIZE  96   // Max frames per crypto batch
 #define MAX_SACK_FRAME_SIZE  256  // Max frame payload size
+// The negotiated retransmit-turn boundary marker reuses D5 bit 7. Every legal
+// batch span fits in bits 0..6, so masking the marker preserves the full span.
+#define D5_BATCH_SPAN_MASK        0x7F
+#define D5_RETX_TURN_TAIL_BIT     0x80
+static_assert(MAX_SACK_BATCH_SIZE <= D5_BATCH_SPAN_MASK,
+	"D5 turn-tail marker must not narrow the legal batch-span domain");
+inline unsigned char d5_wire_value(int span, bool retx_turn_tail)
+{
+	unsigned char value = (unsigned char)(span & D5_BATCH_SPAN_MASK);
+	if(retx_turn_tail) value |= D5_RETX_TURN_TAIL_BIT;
+	return value;
+}
+inline int d5_batch_span(unsigned char wire)
+{
+	return (int)(wire & D5_BATCH_SPAN_MASK);
+}
+inline bool d5_retx_turn_tail(unsigned char wire)
+{
+	return (wire & D5_RETX_TURN_TAIL_BIT) != 0;
+}
+// Shared production/test predicate. Only a negotiated v2 DATA header emitted
+// by the decoded-SACK retransmit builder may mark the physical turn tail.
+// The ordinary ACK_TIMED_OUT retry builder leaves sack_retransmit_active false.
+inline bool d5_should_mark_retx_tail(bool negotiated, bool sack_v2,
+		bool header_carries_d5, bool sack_retransmit_active,
+		int frame_index, int frame_count)
+{
+	return negotiated
+		&& sack_v2
+		&& header_carries_d5
+		&& sack_retransmit_active
+		&& frame_count > 0
+		&& frame_index == frame_count - 1;
+}
+// Handshake echoes remain exact for every established capability. A peer
+// whose older MFSK codec cannot carry bit 3 may omit only the optional
+// retransmit-tail bit, and only when its own advertised caps omit it too.
+inline bool handshake_cap_echo_compatible(uint8_t local_cap,
+		uint8_t echoed_cap, uint8_t peer_own_cap)
+{
+	uint8_t added = (uint8_t)(echoed_cap & (uint8_t)~local_cap);
+	uint8_t missing = (uint8_t)(local_cap & (uint8_t)~echoed_cap);
+	if(added != 0)
+		return false;
+	if((missing & (uint8_t)~CAP_RETX_TURN_TAIL) != 0)
+		return false;
+	if((missing & CAP_RETX_TURN_TAIL)
+		&& (peer_own_cap & CAP_RETX_TURN_TAIL))
+		return false;
+	return true;
+}
+// A bare legacy ACK carries no responder capability proof; its reconstructed
+// byte is the commander's own TEST_CONNECTION payload. Preserve the historical
+// symmetric assumptions, but never infer the new wire-changing bit from it.
+inline uint8_t legacy_ack_inferred_peer_cap(uint8_t echoed_local_cap)
+{
+	return (uint8_t)(echoed_local_cap & (uint8_t)~CAP_RETX_TURN_TAIL);
+}
 // §7.13.39 Fix 1 — must be at least 2*MAX_SACK_BATCH_SIZE so the
 // "channel collapse" safety net (retransmit_count > 2*data_batch_size →
 // trigger BREAK) actually has headroom to detect a runaway queue without
@@ -854,12 +912,19 @@ public:
   static bool bprime_defeat_active();
 
   // LINK-PHASE STEP 2 — the derived block-boundary ACK_SLOT gate. MERCURY_LINKPHASE_ACKSLOT
-  // (default OFF) drives (i) the CMD's post-keydown break-timeout to the DERIVED ack_slot
+  // (default ON; explicit =0 restores stock) drives (i) the CMD's post-keydown break-timeout to the DERIVED ack_slot
   // (LEVER-P keydown length + turnaround budget) instead of the per-frame geometry, and (ii)
   // the RSP's mid-keydown prev-delivered ACK defer (recovery rides the block-boundary SACK the
   // CMD now waits for), and (iii) the D5-on-retx per-bsi span stamp. OFF => byte-identical to
   // stock (invariant I-3, fail-open to today's behavior). Cached (env const per process).
   static bool linkphase_ackslot_on();
+  // True only in scalable mode when both peers negotiated the D5
+  // retransmit-turn-tail marker. Legacy mode and older peers keep the
+  // conservative previous-ACK defer.
+  bool retx_turn_tail_on() const;
+  // A completing PREV frame may emit immediately only when its negotiated D5
+  // marker proves it is the physical last frame of the selective-retry turn.
+  bool linkphase_defer_prev_ack(bool ackslot_active, bool proven_retx_tail) const;
   // LINK-PHASE STEP 5 / MC-3 — slot-qualified commander liveness. Default OFF;
   // MERCURY_LINKPHASE_SLOTLIVENESS_DEFEAT restores the pre-Step-5 behavior even
   // when the main flag is set. The feature is actionable only while a derived
@@ -5290,7 +5355,7 @@ public:
   int nb_probe_max;             // max NB probe attempts before fallback (default 2)
   bool session_narrowband;      // negotiated NB for this session (NB always wins)
   int bandwidth_mode;           // BW_AUTO=0, BW_NB_ONLY=1
-  uint8_t local_capability;    // CAP_WB_CAPABLE | CAP_COMPRESSION
+  uint8_t local_capability;    // Negotiated CAP_* bits advertised by this endpoint
   uint8_t peer_capability;     // Received from peer via TEST_CONNECTION
   bool wb_upgrade_pending;     // True between SWITCH_BANDWIDTH send and ACK
 
@@ -6483,6 +6548,7 @@ private:
   // EOB inference. MERCURY_D5_INFER_DEFEAT=1 forces the fallback on the SAME binary
   // (the fail-before arm). Reset to -1 at session init + on every bsi bump/teardown.
   int rx_buffer_batch_total_frames;    // staged batch_total_frames for current v2 frame, or -1
+  bool rx_buffer_retx_turn_tail;       // negotiated D5 bit 7 on this frame
   int rx_batch_total_frames;           // promoted authoritative per-batch frame count, or -1
   // LINK-PHASE STEP 2 — fire-proof production counters (see linkphase_ackslot_on()).
   // NOT wire/protocol state; incremented ONLY under the STEP-2 flag on the production path.

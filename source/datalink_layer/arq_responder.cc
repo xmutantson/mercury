@@ -441,7 +441,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 				//   data[0]   = TEST_CONNECTION
 				//   data[1..4]= u_SNR.char4_SNR (float SNR_uplink)
 				//   data[5]   = local_capability (peer's cap byte; MFSK ctrl carries the
-				//               low 3 negotiable bits CAP_NEGOTIABLE_MASK=0x07)
+				//               low 4 negotiable bits CAP_NEGOTIABLE_MASK=0x0F)
 				//   data[6]   = peer SSID
 				//   length    = 7
 				//   sequence_number = control_batch_size - 1 so the consumer
@@ -1561,17 +1561,14 @@ void cl_arq_controller::process_messages_rx_data_control()
 							{
 								unsigned char prev_ack_bsi = (unsigned char)(
 									rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
-								// LINK-PHASE STEP 2 (c-RSP): defer this prev-delivered clean-ACK. It fires
-								// on a retx frame that FILLED a prev-batch hole — by construction WHILE the
-								// CMD is still keyed on its keydown block, so keying the ACK here lands in the
-								// CMD's deaf window (the ARM-A mid-keydown collision). Delivery to the app
-								// ALREADY happened above (copy_data_to_buffer / advance_last_delivered — I-2
-								// UNTOUCHED); only the ACK EMIT is deferred. Recovery rides the block-boundary
-								// SACK/clean-ACK the CMD now waits for (STEP-2 c-CMD derived break-floor). This
-								// is the ARM-A-validated mechanism (0 breaks, 0 corrupt, base-eager delivery
-								// parity), driven by the DERIVED slot instead of an unconditional suppress.
-								// OFF => the emit runs exactly as today (byte-identical, invariant I-3).
-								bool linkphase_defer_prev_ack = linkphase_ackslot_on();
+								// Capability or scalable mode alone is not enough: a lost
+								// partial SACK may use the ordinary timeout builder with fresh
+								// frames trailing the retry. Immediate confirm is safe only if
+								// this completing frame carries the negotiated D5 marker proving
+								// it is the physical selective-retry turn tail. The existing D2
+								// settle below then supplies PTT-off/PTT-on before keying.
+								bool linkphase_defer_prev_ack = this->linkphase_defer_prev_ack(
+									linkphase_ackslot_on(), rx_buffer_retx_turn_tail);
 								if(linkphase_defer_prev_ack)
 								{
 									printf("[LINKPHASE-ACK-DEFER] prev-delivered clean-ACK bsi=%u deferred to "
@@ -13074,6 +13071,8 @@ int cl_arq_controller::test_retain_shadow_overflow()
 //
 // PART A: the RSP deliver-held-cur commit (bytes reach the app FIFO).
 // PART B: the CMD recovery-turnaround credit (data_ack_received / window close).
+// PART C: a negotiated physical retransmit-turn tail reaches the cumulative
+// clean-confirm path instead of the legacy mid-keydown defer.
 // Returns 0=PASS, 1=FAIL. Default builds never call this.
 int cl_arq_controller::test_held_cur_deliver_fire()
 {
@@ -13299,9 +13298,116 @@ int cl_arq_controller::test_held_cur_deliver_fire()
 	ck(this->last_batch_fully_acked == false,
 		"PART B PASS-AFTER: last_batch_fully_acked stays FALSE (no promotion from a recovery round)");
 
+	// ---- PART C: PREV clean-confirm disposition -----------------------------
+	// Fail-before restores the unconditional LINKPHASE-ACK-DEFER gate. The
+	// pass-after predicate requires the negotiated D5 bit carried only by the
+	// physical final frame of a decoded-SACK selective-retry turn. A lost SACK
+	// falls through the ordinary timeout builder and carries no marker.
+	const int C_SPAN = 90;
+	unsigned char selective_tail = d5_wire_value(C_SPAN, /*retx_tail=*/true);
+	unsigned char timeout_retry = d5_wire_value(C_SPAN, /*retx_tail=*/false);
+	ck(d5_batch_span(selective_tail) == C_SPAN
+	   && d5_batch_span(timeout_retry) == C_SPAN,
+		"PART C D5: the turn-tail bit preserves the complete batch span");
+	ck(d5_retx_turn_tail(selective_tail),
+		"PART C D5: decoded-SACK physical tail carries the boundary proof");
+	ck(!d5_retx_turn_tail(timeout_retry),
+		"PART C MISSED-SACK: ordinary timeout retry carries no boundary proof");
+	ck(d5_should_mark_retx_tail(
+			/*negotiated=*/true, /*sack_v2=*/true, /*has_d5=*/true,
+			/*sack_retransmit_active=*/true, /*frame_index=*/3, /*frame_count=*/4),
+		"PART C PREDICATE: decoded-SACK physical final frame is marked");
+	ck(!d5_should_mark_retx_tail(
+			/*negotiated=*/true, /*sack_v2=*/true, /*has_d5=*/true,
+			/*sack_retransmit_active=*/true, /*frame_index=*/2, /*frame_count=*/4),
+		"PART C PREDICATE: a pre-tail retransmit frame is not marked");
+	ck(!d5_should_mark_retx_tail(
+			/*negotiated=*/true, /*sack_v2=*/true, /*has_d5=*/true,
+			/*sack_retransmit_active=*/false, /*frame_index=*/3, /*frame_count=*/4),
+		"PART C MISSED-SACK: ordinary timeout builder cannot mark its tail");
+	ck(!d5_should_mark_retx_tail(
+			/*negotiated=*/false, /*sack_v2=*/true, /*has_d5=*/true,
+			/*sack_retransmit_active=*/true, /*frame_index=*/3, /*frame_count=*/4),
+		"PART C INTEROP: an unnegotiated peer cannot receive a marker");
+	ck(handshake_cap_echo_compatible(
+			(uint8_t)(CAP_WB_CAPABLE | CAP_CUMULATIVE_ACK | CAP_RETX_TURN_TAIL),
+			(uint8_t)(CAP_WB_CAPABLE | CAP_CUMULATIVE_ACK),
+			(uint8_t)(CAP_WB_CAPABLE | CAP_CUMULATIVE_ACK)),
+		"PART C INTEROP: an older 3-bit MFSK peer may omit optional bit 3");
+	ck(!handshake_cap_echo_compatible(
+			(uint8_t)(CAP_ENCRYPTION | CAP_RETX_TURN_TAIL),
+			(uint8_t)0,
+			(uint8_t)0),
+		"PART C FAIL-CLOSED: an established capability may not disappear");
+	ck(!handshake_cap_echo_compatible(
+			(uint8_t)(CAP_WB_CAPABLE | CAP_RETX_TURN_TAIL),
+			(uint8_t)CAP_WB_CAPABLE,
+			(uint8_t)(CAP_WB_CAPABLE | CAP_RETX_TURN_TAIL)),
+		"PART C CONSISTENCY: a new peer cannot claim bit 3 while omitting its echo");
+	ck(!handshake_cap_echo_compatible(
+			(uint8_t)CAP_WB_CAPABLE,
+			(uint8_t)(CAP_WB_CAPABLE | CAP_RETX_TURN_TAIL),
+			(uint8_t)CAP_RETX_TURN_TAIL),
+		"PART C FAIL-CLOSED: an echo may not add an unadvertised bit");
+	uint8_t legacy_inferred = legacy_ack_inferred_peer_cap(
+		(uint8_t)(CAP_WB_CAPABLE | CAP_ENCRYPTION
+			| CAP_CUMULATIVE_ACK | CAP_RETX_TURN_TAIL));
+	ck((legacy_inferred & CAP_RETX_TURN_TAIL) == 0,
+		"PART C INTEROP: a bare legacy ACK cannot infer turn-tail support");
+	ck((legacy_inferred & (CAP_WB_CAPABLE | CAP_ENCRYPTION | CAP_CUMULATIVE_ACK))
+			== (CAP_WB_CAPABLE | CAP_ENCRYPTION | CAP_CUMULATIVE_ACK),
+		"PART C LEGACY: established symmetric capability inference is preserved");
+
+	uint8_t saved_local_cap = this->local_capability;
+	uint8_t saved_peer_cap = this->peer_capability;
+	this->local_capability = CAP_RETX_TURN_TAIL;
+	this->peer_capability = CAP_RETX_TURN_TAIL;
+	putenv_kv("MERCURY_SCALABLE_SACK", "1");
+	ck(this->retx_turn_tail_on(),
+		"PART C NEGOTIATION: scalable mode plus both peers enable the D5 contract");
+	putenv_kv("MERCURY_SCALABLE_SACK", "0");
+	ck(!this->retx_turn_tail_on(),
+		"PART C LEGACY: non-scalable mixed-batch mode retains the conservative defer");
+	putenv_kv("MERCURY_SCALABLE_SACK", "1");
+	this->peer_capability = 0;
+	ck(!this->retx_turn_tail_on(),
+		"PART C INTEROP: an older peer retains the conservative defer");
+	putenv_kv("MERCURY_SCALABLE_SACK", "");
+	this->local_capability = saved_local_cap;
+	this->peer_capability = saved_peer_cap;
+
+	putenv_kv("MERCURY_PREV_ACK_DEFER_DEFEAT", "1");
+	ck(this->linkphase_defer_prev_ack(/*ackslot=*/true, /*proven_tail=*/true),
+		"PART C FAIL-BEFORE: even a proven turn tail remains suppressed");
+	putenv_kv("MERCURY_PREV_ACK_DEFER_DEFEAT", "");
+
+	ck(!this->linkphase_defer_prev_ack(/*ackslot=*/true, /*proven_tail=*/true),
+		"PART C PASS-AFTER: a proven physical turn tail may emit");
+	ck(this->linkphase_defer_prev_ack(/*ackslot=*/true, /*proven_tail=*/false),
+		"PART C SAFETY: missed-SACK/ordinary retry retains the mid-keydown defer");
+	ck(!this->linkphase_defer_prev_ack(/*ackslot=*/false, /*proven_tail=*/false),
+		"PART C SAFETY: ACK-slot OFF retains the existing eager-confirm path");
+
+	this->rsp_last_delivered_batch_seq_id = N;
+	unsigned char prev_only_wire_bsi = cumulative_ack_bsi_field(
+		(unsigned char)N, this->rsp_last_delivered_batch_seq_id, /*cap_on=*/true);
+	ck(prev_only_wire_bsi == (unsigned char)N,
+		"PART C PREV-ONLY: clean confirm identifies the delivered previous batch");
+
+	this->rsp_last_delivered_batch_seq_id = NP1;
+	unsigned char held_wire_bsi = cumulative_ack_bsi_field(
+		(unsigned char)N, this->rsp_last_delivered_batch_seq_id, /*cap_on=*/true);
+	ck(held_wire_bsi == (unsigned char)NP1,
+		"PART C HELD-CUR: cumulative clean confirm covers the delivered held current batch");
+
+	unsigned char wrap_wire_bsi = cumulative_ack_bsi_field(
+		(unsigned char)255, /*high_water=*/0, /*cap_on=*/true);
+	ck(wrap_wire_bsi == (unsigned char)0,
+		"PART C WRAP: cumulative clean-confirm identity is correct across 255->0");
+
 	printf("%s %s (fails=%d) — the RSP deliver-held-cur commit pushes the held "
-		"batch's bytes to the app FIFO and the CMD credits the recovery round; "
-		"the full two-endpoint wire funnel is the deferred sim/real-audio Stage\n",
+		"batch's bytes to the app FIFO, the CMD credits the recovery round, and "
+		"a negotiated retransmit-turn tail reaches the cumulative clean-confirm path\n",
 		TAG, fails==0 ? "PASS" : "FAIL", fails);
 	fflush(stdout);
 	return fails==0 ? 0 : 1;
