@@ -4372,7 +4372,7 @@ int main(int argc, char *argv[])
         {
             // TOP-GEAR CONFIG_17 channel-clean election (topgear-stack-productionize.md §4):
             // prove the 64-QAM top-gear election verdict + hysteresis + electability ceiling +
-            // demote primitives + net-PHY >=1.16x rate. fail-before/pass-after, one-shot, exit rc.
+            // demote primitives + net-PHY ~1.073x R7-64 rate. fail-before/pass-after, one-shot, exit rc.
             test_topgear_clean_election_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
@@ -6426,7 +6426,7 @@ start_modem:
             // TOP-GEAR CONFIG_17 channel-clean election regression (topgear-stack-productionize.md
             // §4): the 64-QAM top rung ELECTS only on a clean+FLAT forward channel (SNR margin +
             // selectivity gate), engages after hysteresis, demotes IMMEDIATELY on marginal/non-flat
-            // (2-path anti-thrash), and delivers >=1.16x cfg16 net-PHY. fail-before/pass-after on
+            // (2-path anti-thrash), and delivers ~1.073x cfg16 net-PHY (R7-64 diet). fail-before/pass-after on
             // the same binary via MERCURY_TOPGEAR_PORT_DEFEAT=1 (broad port defeat).
             // MERCURY_TOPGEAR_DEFEAT_CLEAN remains the focused verdict-only negative control.
             // One-shot at startup, then exit rc.

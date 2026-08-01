@@ -958,7 +958,10 @@ int cl_arq_controller::apply_cfg16_margin_cap(int proposed) const
 //   cfg14 = 14.0  admits meter >= 15   (16.4+1.5 true — the true-18 read of 15 opens it, blocks 14.8)
 //   cfg15 = 16.0  admits meter >= 17   (18.0+1.5 true — the true-24.79 cfg15-regime read of 21 opens it)
 //   cfg16 = 22.0  admits meter >= 23   (== CFG16_MIN_SNR_DB, unchanged, live-meter-calibrated)
-//   cfg17 = 22.0  mirrors cfg16 (top-gear, default-off)
+//   cfg17 = 22.0  mirrors cfg16 (top-gear, default-off). TODO raise to ~25.0 once the
+//                 R7-64 BER/FER curve lands: 64-QAM's ~+3.2 dB d_min cost puts cfg17's
+//                 honest decode floor a bracket above cfg16 (monotone preserved; the J0
+//                 grid-placement assert pins row 16 only, so raising row 17 is safe).
 //   cfg0..cfg8    ungated (-90.0): low rungs decode deep -> identity on OFDM-entry / robust re-climb.
 //
 // The row is MONOTONE (10,12,12,12,12,14,16,22 for cfg9..cfg16) and no gated row is a member of the
@@ -1823,10 +1826,12 @@ void cl_arq_controller::process_messages_commander()
 		//              the top rung - the pull-back the effective-ceiling cannot reach here).
 		// The election is the SOLE producer of a cfg17 SET_CONFIG (SNR map/optimizer/climb
 		// all cap at 16). No-op unless MERCURY_TOPGEAR_ELECT is set => byte-identical.
-		// SCOPE: validate with MERCURY_INBAND_RATE OFF (the in-band CONFIG_TAG codec does not
-		// yet carry cfg17's synthetic ladder index; the legacy SET_CONFIG handshake packs the
+		// SCOPE: cfg17 election is STRUCTURALLY REFUSED when MERCURY_INBAND_RATE is on. The
+		// in-band CONFIG_TAG codec does not carry cfg17's synthetic ladder index; the legacy
+		// SET_CONFIG handshake packs the
 		// RAW config and negotiates cfg17 correctly - topgear-stack-productionize.md 5).
 		if (topgear_elect_feature_enabled()
+		    && !inband_rate_feature_enabled()   // structural refusal: cfg17 has no in-band CONFIG_TAG ladder index
 		    && !turboshift_active
 		    && emergency_break_active == 0
 		    && link_status == CONNECTED

@@ -1210,8 +1210,10 @@ int cl_arq_controller::test_topgear_clean_election()
 	check(!cmd->topgear_elect_engaged && cmd->topgear_elect_clean_streak == 0,
 	      "leaving CFG16/17 band clears the engage verdict (each visit re-earns)");
 
-	// (6) RATE assertion: cfg17 net-PHY / cfg16 net-PHY >= 1.16 with REAL loaded constellations
-	//     (identical pilots/Ngi/LDPC-rate, so net-PHY ratio == bits/symbol ratio = log2(64)/log2(32)).
+	// (6) RATE assertion. cfg17 carries 64-QAM (6 b/sym vs cfg16's 5), so the RAW per-symbol
+	//     gain is 1.20x (asserted first). But the R7-64 diet also reshapes the frame
+	//     (Nsymb 8->7, Dy 4 vs cfg16's 5), so the NET-PHY rbc ratio is the airtime-adjusted
+	//     ~1.073x, NOT the 1.20x per-symbol figure - the two are distinct and both checked.
 	cmd->load_configuration(CONFIG_16, FULL, YES);
 	int bits16 = ts->psk.bits_per_symbol();
 	cmd->load_configuration(CONFIG_17, FULL, YES);
@@ -1258,8 +1260,9 @@ int cl_arq_controller::test_topgear_clean_election()
 	check(nofdm16 == 292, "production 3 ms GI yields the expected Nofdm=292");
 	check(trim_loss_pct > 3.0 && trim_loss_pct < 3.2,
 	      "dropping unsafe GI trim costs 3.082% cfg17 PHY rate at the production 3 ms GI");
-	check(rbc_ratio >= 1.16,
-	      "cfg17 net-PHY rbc / cfg16 remains >=1.16x from the 64-QAM constellation gain");
+	check(rbc_ratio > 1.06 && rbc_ratio < 1.09,
+	      "cfg17 R7-64 net-PHY rbc / cfg16 == ~1.073x (Nsymb 8->7 airtime diet; the raw "
+	      "1.20x per-symbol 64-QAM gain is partly spent on the denser R7-64 pilot frame)");
 
 	// Exercise the complete production startup and live-switch sequence that real audio exposed:
 	// start cfg17 -> pin walk -> dual bundle build -> cfg17/16 transitions. cfg17 intentionally

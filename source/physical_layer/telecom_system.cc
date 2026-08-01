@@ -6822,6 +6822,29 @@ void cl_telecom_system::init()
 		pilot_override_applied=true;
 	}
 
+	// ---- BAKED WIRE LEVER (cfg17 R7-64 top-gear diet, default-off) ----
+	// CONFIG_17 is the 64-QAM top rung. The AUTO 64-QAM defaults (Nsymb=8, Dy=3)
+	// leave cfg17 with the SAME info-per-frame and SAME airtime as cfg16, so the
+	// skeleton earns no throughput once cfg16 itself was pilot-thinned to Nsymb=8.
+	// The gain comes ONLY from cutting OFDM data symbols: Nsymb 8->7 trims the frame
+	// to (Nsymb+preamble)=(7+4)=11 vs 12 symbol periods (~+9% airtime), and 64-QAM's
+	// 6 bits/cell keeps the rate-14/16 codeword packed under the LDPC N=1600 ceiling
+	// in the smaller frame. Dy=4 (vs cfg16's Dy=5) buys back pilot density in the
+	// shorter frame so 64-QAM's finer channel estimate is met - the pilot time-
+	// spacing (4 symbols) is DENSER than cfg16's (5), not thinner. Scoped to the
+	// LITERAL CONFIG_17 (never the env-repointable override) so this baked geometry
+	// cannot move onto another rung, and Nofdm stays at the process-wide 292 stride
+	// (the per-rung GI trim remains deferred, see the guard-interval note below).
+	// pilot_override_applied=true routes the grid through the PILOT-GUARD below
+	// (nData*6 must stay <= 1600). Applied BEFORE the env block so an A/B control
+	// (MERCURY_PILOT_DY / MERCURY_PILOT_NSYMB on the override target) still wins.
+	if(current_configuration==CONFIG_17 && M==MOD_64QAM)
+	{
+		ofdm.pilot_configurator.Dy=4;
+		ofdm.Nsymb=7;
+		pilot_override_applied=true;
+	}
+
 	if(current_configuration==pilot_override_target)
 	{
 		const char* _pdy = std::getenv("MERCURY_PILOT_DY");
