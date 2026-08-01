@@ -1354,6 +1354,7 @@ cl_arq_controller::cl_arq_controller()
 	// axis2_move_fastdown_count); the memory arrays reset here AND at commander_clean_reconnect().
 	floor_cap_fires=0;
 	rung_floor_memory_reset();
+	rung_meter_reset();   // V3: re-arm the connect-regime latch + clear the climb-grade snapshot
 	break_detected=NO;
 	break_probe_consec_match=0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	hail_detected=NO;
@@ -8885,6 +8886,7 @@ void cl_arq_controller::reset_session_state()
 	// Per-rung failure memory reset on clean reconnect (audit §2 — the bump memory is per-connection;
 	// floor_cap_fires is run-lifetime and intentionally NOT cleared here).
 	rung_floor_memory_reset();
+	rung_meter_reset();   // V3: session boundary re-arms the connect-regime latch + clears the snapshot
 	break_detected = NO;
 	break_probe_consec_match = 0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	// fix/break-fh-gate: age the forward-health latch out on session reset so a stale
@@ -15902,6 +15904,11 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 					// suffix carries. Accepted tradeoff: the value goes stale after
 					// turbo (Option B's steady-state ACK suffix is NOT done here).
 					measurements.SNR_uplink = snr_uplink_from_suffix(decoded_snr);
+					// V3 climb-grade snapshot: qualify the pattern-ACK suffix read for the ELECTION
+					// gate. Data-batch confirms latch a fresh climb-grade sample; connect / BREAK-
+					// recovery ACKs (the garbage-high writer noted above) are rejected by
+					// rung_meter_note_read (data-latch / breaks-since-success provenance).
+					rung_meter_note_read(measurements.SNR_uplink);
 					turbo_snr_defer_timer.reset();
 					printf("[CMD-ACK-SNR] ACK detected with SNR=%.1f dB (matched=%d)\n",
 						decoded_snr, matched_count);
@@ -17124,6 +17131,13 @@ void cl_arq_controller::receive()
 			// With pattern ACK, the commander never decodes LDPC during ACK detection,
 			// so SNR_uplink only refreshes during SWITCH_ROLE when we receive data.
 			measurements.SNR_uplink = received_message_stats.SNR;
+			// V3 climb-grade snapshot: qualify this raw read for the ELECTION gate (COMMANDER + WB +
+			// in-transfer regime only). A CONNECT control-frame decode reaches here BEFORE any data
+			// batch (first-data latch off) and a recovery decode reaches here with
+			// breaks_since_last_data_success>0 — rung_meter_note_read rejects both, so the connect
+			// ~34 dB and recovery ~25 dB writers never poison the gate snapshot. The raw
+			// measurements.SNR_uplink above is untouched for all other consumers.
+			rung_meter_note_read(measurements.SNR_uplink);
 			if(this->role == RESPONDER)
 			{
 				measurements.SNR_downlink = received_message_stats.SNR;

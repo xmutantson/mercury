@@ -979,16 +979,34 @@ CONFIG_16 (5664.7 bps).
 // BREAKs. RUNG_MIN_SNR_METER[] (arq_commander.cc) refuses OFDM rungs whose delivery floor the
 // live suffix meter has not cleared, meter-referred and pinned to the version below.
 //
-// CAL VERSION 2 — recalibrated against the LIVE in-transfer meter measured on the anchor cohort.
-// The cohort refuted the cal-v1 "+2.2 dB over-read" premise: the suffix meter, at the config the
-// elevator decides from, actually UNDER-reads true by ~2-3 dB in the clean-decode regime and is
-// quantized to ~2 dB integer steps (measured: true 13->11, 14.8->13, 18->15, 24.79->17..23,
-// 28->25). Cal-v1 mis-set the cfg12..cfg15 rows too HIGH and over-capped the 18-25 dB band. The
-// meter's +25 spikes are a STALE-HIGH fade artifact (frozen after a rung over-elects and its ACKs
-// stop decoding), not a clean read, so they cannot be gated against. A future re-characterization
-// of the suffix meter must bump this version AND re-derive the rows (a J0-style --test assert
-// enforces the pin).
-#define RUNG_FLOOR_METER_CAL_VERSION 2
+// CAL VERSION 3 — freshness-qualified per-rung floor on the LIVE in-transfer meter grid. The anchor
+// cohort measured the suffix meter as quantized to a ~2 dB integer grid {9,11,13,15,17,21,23,25}
+// and config/trajectory-dependent (true 13->11, 14.8->13, 18->15 with a bimodal tail to 11-13,
+// 24.79->17/21/23 stratified by config, 28->25). rung_floor_ok compares with a STRICT `>`, so every
+// gated row is placed half-grid BELOW the grid point it must admit (a row ON a grid point would
+// refuse the very read it names): cfg9=10 admits meter>=11, cfg10..13=12 admit >=13, cfg14=14 admits
+// >=15, cfg15=16 admits >=17, cfg16/17=22 admit >=23. The rows come from the measured 8/8 delivery
+// floor (+1.5 dB hold margin) mapped through that live transfer. The gate no longer reads the raw
+// measurements.SNR_uplink — the connect regime writes it ~34 dB (MFSK control-frame estimator) and
+// the BREAK-recovery regime re-writes it ~25 dB (garbage-high), and an over-elected rung freezes it
+// high after its ACKs stop decoding. Instead the gate reads a COMMANDER-side CLIMB-GRADE SNAPSHOT of
+// the meter (in-transfer regime only), qualified stale by age + wall + provenance (below); a stale
+// snapshot fails the gate CLOSED for CLIMBS ONLY. cfg16 keeps CFG16_MIN_SNR_DB (empirically
+// vindicated, itself live-meter-calibrated); RUNG_MIN_SNR_METER[16] mirrors it so the J0 version
+// assert pins the calibration. A future re-characterization of the meter must bump this version AND
+// re-derive the rows (a J0-style --test assert enforces the pin; the grid-placement assert enforces
+// the strict-`>` half-grid rule).
+#define RUNG_FLOOR_METER_CAL_VERSION 3
+// V3 freshness qualifier. The gate reads a COMMANDER-side climb-grade snapshot of the suffix meter
+// (a sample taken in the in-transfer regime: a data batch has been ACKed this session AND the link
+// is not awaiting BREAK recovery), not the raw measurements.SNR_uplink. A snapshot older than
+// STALE_AGE_BATCHES data-batch attempts, or STALE_WALL_MS wall-ms, or still at the -90 sentinel, is
+// STALE and the gate fails CLOSED for CLIMBS ONLY (holds current; demotes / BREAK / panic->ROBUST_0
+// are never gated). N=2 is the measured stale window of the over-election storm (two silent batches
+// between the last honest read and the frozen-high consumption); it tolerates one normal post-switch
+// ACK miss and closes climbs from the third silent batch of an outage.
+#define RUNG_METER_STALE_AGE_BATCHES 2
+#define RUNG_METER_STALE_WALL_MS     60000
 // Per-rung session-local failure memory (runtime hedge where the static table is optimistic for
 // the actual channel: fading / meter bias / non-WGN). K consecutive at-rung BREAKs while the
 // table admitted the rung bump its session floor by one bracket; a bump decays after DECAY_CLEAN

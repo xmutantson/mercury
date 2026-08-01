@@ -659,7 +659,11 @@ public:
   // suffix is already decoded in process_messages_rx_acks_control() (:1855), so
   // A1's mid-climb SNR decode is PRESERVED — only the post-control, pre-data clear
   // is added. Part N drives this exact method. See §18.
-  void clear_snr_arm_for_data_ack_wait() { turbo_snr_ack_enabled = false; }
+  // Called at every data-ACK-wait entry (the cmd_batch_tx_done boundary, §18) — also the V3
+  // climb-grade snapshot age tick: a batch attempt that does not latch a fresh in-transfer read
+  // ages the snapshot (rung_meter_note_batch_attempt is WB-commander-only, so it is inert for the
+  // responder / NB / non-election paths and does not disturb the turbo_snr arm invariant).
+  void clear_snr_arm_for_data_ack_wait() { turbo_snr_ack_enabled = false; rung_meter_note_batch_attempt(); }
 
 	//! registers the ack of a data message.
 	    /*!
@@ -1916,6 +1920,23 @@ public:
   void rung_floor_note_break(int cfg);
   void rung_floor_note_clean(int cfg);
   void rung_floor_memory_reset();
+  // V3 freshness qualifier (cal v3). rung_floor_ok now reads the COMMANDER-side CLIMB-GRADE SNAPSHOT
+  // (rung_meter_db/_age_batches/_wall_ms) rather than the raw measurements.SNR_uplink. rung_meter_note_read
+  // latches a fresh sample ONLY when it is in-transfer-grade (a data batch has been ACKed this session
+  // AND breaks_since_last_data_success==0) — this kills the connect ~34 dB and the BREAK-recovery ~25 dB
+  // garbage writers. rung_meter_note_batch_attempt ages the snapshot one step per data-ACK-wait entry.
+  // rung_meter_stale() is TRUE on the -90 sentinel, age>N, or wall>N — the gate then fails CLOSED for
+  // climbs above current. rung_meter_reset() re-arms the connect-regime latch at each session boundary.
+  // rung_floor_meter_clears is the floor+freshness check WITHOUT the at/below-current shortcut (the
+  // raise reference for the BREAK-recovery anchor clamp is the raw demote target, not current);
+  // apply_rung_floor_raise_cap walks a proposed raise down to a fresh-cleared rung using it.
+  bool rung_meter_stale() const;
+  void rung_meter_note_read(double snr_value);
+  void rung_meter_note_batch_attempt();
+  void rung_meter_reset();
+  static long long rung_meter_now_ms();
+  bool rung_floor_meter_clears(int cfg) const;
+  int  apply_rung_floor_raise_cap(int proposed) const;
 
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
@@ -6351,6 +6372,15 @@ public:
   int    rung_fail_count[NUMBER_OF_CONFIGS]{};
   double rung_floor_bump_db[NUMBER_OF_CONFIGS]{};
   int    rung_bump_clean_streak[NUMBER_OF_CONFIGS]{};
+  // V3 freshness-qualified climb-grade meter snapshot (COMMANDER-side; cal v3). rung_meter_db is the
+  // last in-transfer-grade suffix-meter sample; _age_batches counts data-ACK-wait entries since it;
+  // _wall_ms is its steady-clock timestamp (0 = never sampled); _data_latched is the first-data latch
+  // (>=1 data batch ACKed this session) that distinguishes the in-transfer regime from the connect
+  // regime. Reset per session (rung_meter_reset at init() + reset_session_state()).
+  double    rung_meter_db{-99.9};
+  int       rung_meter_age_batches{1000000000};
+  long long rung_meter_wall_ms{0};
+  bool      rung_meter_data_latched{false};
   int break_detected;             // YES if BREAK pattern detected by responder
 
   // ---- zombie/amplifier layer (data-flow-zombie-amplifier.md) -------------

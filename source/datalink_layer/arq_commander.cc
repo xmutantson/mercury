@@ -940,38 +940,38 @@ int cl_arq_controller::apply_cfg16_margin_cap(int proposed) const
 }
 
 // ── Per-rung MEASURED election floor gate (generalizes apply_cfg16_margin_cap) ─────────────
-// Meter-referred OFDM-entry floor: compared against measurements.SNR_uplink (the SAME suffix meter
-// the cfg16 gate + the SUCCESS_BASED climb trust). CAL VERSION 2 — recalibrated against the LIVE
-// in-transfer meter measured on the anchor cohort (per-cell CMD meter samples, WGN anchors, clean-
-// decode steady state), NOT the static passband floors.
+// CAL VERSION 3 — a per-rung floor on the LIVE in-transfer meter grid, read through a freshness-
+// qualified climb-grade SNAPSHOT (rung_meter_db), not the raw measurements.SNR_uplink. The anchor
+// cohort measured the suffix meter as quantized to a ~2 dB integer grid {9,11,13,15,17,21,23,25}
+// and config/trajectory-dependent (true 13->11, 14.8->13, 18->15 with a ~25% bimodal tail to 11-13,
+// 24.79->17/21/23 stratified by config, 28->25).
 //
-// What the cohort measured, at the config the elevator actually decides from:
-//   true 13 -> meter 11 | 14.8 -> 13 | 18 -> 15 | 24.79 -> 17..23 | 28 -> 25
-// i.e. the meter UNDER-reads true by ~2-3 dB in the clean-decode regime and is quantized to ~2 dB
-// integer steps. The cal-v1 "+2.2 over-read" correction had the WRONG SIGN and set the cfg12..cfg15
-// rows too HIGH: the cohort lost the incumbent's cfg15 completions at 18 dB and over-capped 2/8
-// cells at 24.79. The meter's +25 spikes are a STALE-HIGH artifact that appears only AFTER a rung
-// over-elects and its ACKs stop decoding (a fade freeze) — not a clean read, so it cannot be gated.
+// rung_floor_ok compares with a STRICT `>`, so every gated row is placed HALF-GRID BELOW the grid
+// point it must admit — a row placed ON a grid point would refuse the very read it names (a 15.0 row
+// admits only meter>=17). Each row therefore names an ADMIT set and is derived from the measured 8/8
+// delivery floor + 1.5 dB hold margin, mapped through the live transfer:
+//   cfg9  = 10.0  admits meter >= 11   (10.4+1.5 true; the wb13 read of 11 clears it, +2.6 dB margin)
+//   cfg10 = 12.0  admits meter >= 13   (13.1+1.5 true)
+//   cfg11 = 12.0  admits meter >= 13   (12.8+1.5 true)
+//   cfg12 = 12.0  admits meter >= 13   (13.4+1.5 true)
+//   cfg13 = 12.0  admits meter >= 13   (13.4+1.5 true — the 14.8 envelope rung, read 13, cfg13-hold)
+//   cfg14 = 14.0  admits meter >= 15   (16.4+1.5 true — the true-18 read of 15 opens it, blocks 14.8)
+//   cfg15 = 16.0  admits meter >= 17   (18.0+1.5 true — the true-24.79 cfg15-regime read of 21 opens it)
+//   cfg16 = 22.0  admits meter >= 23   (== CFG16_MIN_SNR_DB, unchanged, live-meter-calibrated)
+//   cfg17 = 22.0  mirrors cfg16 (top-gear, default-off)
+//   cfg0..cfg8    ungated (-90.0): low rungs decode deep -> identity on OFDM-entry / robust re-climb.
 //
-// The meter's spread in the 18-25 dB band is too wide to finely discriminate cfg14/cfg15/cfg16
-// (p10..p90 spans ~10 dB), so the rows are BAND-LIMITED to where the meter is a reliable
-// discriminator: a single OFDM-entry threshold on cfg9..cfg13 at meter 14.0 — placed cleanly on
-// the quantization grid between the true-14.8 read of 13 and the true-18 read of 15. Below meter
-// 14 the whole gated band is refused and the link holds the honest low config (this kills the wb13
-// over-election storm and the 14.8 catastrophic cfg15 stall — the meter never climbs into the
-// stale-high region, byte-identical to cal-v1 at those anchors). At/above meter 14 the band opens
-// and the incumbent get_configuration + the cfg16 decode-margin gate pick the rung (this restores
-// the 18/24.79 climb that cal-v1 over-capped). cfg14/cfg15 are DEFERRED to those gates (ungated
-// -90 row) because a per-rung meter floor there is unreliable at the measured spread. cfg16 keeps
-// CFG16_MIN_SNR_DB (empirically vindicated, itself live-meter-calibrated); RUNG_MIN_SNR_METER[16]
-// mirrors it so the J0 version assert pins the calibration. cfg0..cfg8 are ungated (low rungs
-// decode deep -> identity on the OFDM-entry / robust re-climb path). The failure memory below is
-// the runtime hedge if a gated row is optimistic on a non-WGN channel.
+// The row is MONOTONE (10,12,12,12,12,14,16,22 for cfg9..cfg16) and no gated row is a member of the
+// meter grid (a J0-style grid-placement assert enforces this). The whole band is refused when the
+// snapshot is stale (connect / recovery / outage), which holds the honest low config until an
+// in-transfer read legitimizes the next rung; the failure memory below raises a row one bracket if a
+// gated rung the table admitted breaks on a non-WGN channel. RUNG_MIN_SNR_METER[16] == CFG16_MIN_SNR_DB
+// so the J0 version assert pins the calibration and the cap composition stays order-independent.
 static const double RUNG_MIN_SNR_METER[NUMBER_OF_CONFIGS] = {
 	/* 0*/ -90.0, /* 1*/ -90.0, /* 2*/ -90.0, /* 3*/ -90.0, /* 4*/ -90.0,
 	/* 5*/ -90.0, /* 6*/ -90.0, /* 7*/ -90.0, /* 8*/ -90.0,
-	/* 9*/  14.0, /*10*/  14.0, /*11*/  14.0, /*12*/  14.0, /*13*/  14.0,
-	/*14*/ -90.0, /*15*/ -90.0, /*16*/  22.0, /*17*/  22.0
+	/* 9*/  10.0, /*10*/  12.0, /*11*/  12.0, /*12*/  12.0, /*13*/  12.0,
+	/*14*/  14.0, /*15*/  16.0, /*16*/  22.0, /*17*/  22.0
 };
 
 double cl_arq_controller::rung_floor_min_meter(int cfg)
@@ -980,27 +980,97 @@ double cl_arq_controller::rung_floor_min_meter(int cfg)
 	return RUNG_MIN_SNR_METER[cfg];
 }
 
-// TRUE iff the reverse-path SNR report admits OFDM rung `cfg` at its meter-referred floor + any
-// session floor bump. Fail-OPEN on the defeat env (fail-before), NB (WB-only), the -90 sentinel
-// (pre-ACK byte-identical), cfg<CONFIG_9 (low rungs decode deep), cfg>CONFIG_15 (cfg16/17 -> cfg16
-// gate). Const: reads members + a static table + a threshold, no get_configuration.
-bool cl_arq_controller::rung_floor_ok(int cfg) const
+// V3 monotonic wall clock (steady_clock ms). Used only to stamp/age the climb-grade snapshot; the
+// suffix meter's staleness in a real-audio run is real wall time (the audio clock is the HW timer).
+long long cl_arq_controller::rung_meter_now_ms()
+{
+	return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// V3 freshness predicate. The climb-grade snapshot is STALE when it has no in-transfer sample yet
+// (-90 sentinel), when more than N data-ACK-wait attempts have passed since the last fresh sample
+// (the over-election storm's measured stale window), or when its wall age exceeds the bound (covers
+// idle, where the batch counter freezes). A stale snapshot fails the gate CLOSED for climbs above
+// current — the demote/BREAK path (which never consults the gate) still runs at full authority.
+bool cl_arq_controller::rung_meter_stale() const
+{
+	if(rung_meter_db <= -90.0) return true;                            // no in-transfer sample yet
+	if(rung_meter_age_batches > RUNG_METER_STALE_AGE_BATCHES) return true;
+	if(rung_meter_wall_ms != 0 &&
+	   rung_meter_now_ms() - rung_meter_wall_ms > RUNG_METER_STALE_WALL_MS) return true;
+	return false;
+}
+
+// V3 producer qualifier. Called from the two raw SNR_uplink producers (the decoded-LDPC-frame path
+// and the pattern-ACK-suffix path). Latch a fresh climb-grade sample ONLY when the read is in the
+// in-transfer regime: (a) COMMANDER (the elector) on a WB link, (b) a data batch has been ACKed this
+// session (first-data latch — kills the connect ~34 dB read, which precedes any data), and (c) not
+// awaiting BREAK recovery (breaks_since_last_data_success==0 — kills the recovery ~25 dB read, which
+// the code itself notes goes garbage-high). Non-qualifying reads leave the snapshot untouched; the
+// raw measurements.SNR_uplink still updates for every existing consumer (display / recovery / the
+// incumbent get_configuration inputs are unchanged — v3 only changes what the ELECTION gate reads).
+void cl_arq_controller::rung_meter_note_read(double snr_value)
+{
+	if(role != COMMANDER) return;                       // commander-side election snapshot only
+	if(narrowband_enabled == YES) return;               // WB-only gate
+	if(!rung_meter_data_latched) return;                // (b) connect-regime read (no data batch yet)
+	if(breaks_since_last_data_success > 0) return;      // (c) BREAK/recovery-regime garbage-high read
+	if(snr_value <= -90.0) return;                       // sentinel guard
+	rung_meter_db = snr_value;
+	rung_meter_age_batches = 0;
+	rung_meter_wall_ms = rung_meter_now_ms();
+}
+
+// V3 age tick. Called once per data-ACK-wait entry (clear_snr_arm_for_data_ack_wait sites — the
+// cmd_batch_tx_done boundary). A batch attempt that does NOT latch a fresh climb-grade read ages the
+// snapshot; the last fresh read resets the age to 0 (rung_meter_note_read). Saturates so it cannot
+// wrap. WB commander only (matches the gate).
+void cl_arq_controller::rung_meter_note_batch_attempt()
+{
+	if(role != COMMANDER) return;
+	if(rung_meter_age_batches < 1000000000) rung_meter_age_batches++;
+}
+
+// V3 session reset — re-arm the connect-regime latch and clear the snapshot at each session boundary
+// (init() + reset_session_state()), so a fresh session starts in the connect regime (stale -> the
+// gate holds the low config until the first in-transfer read).
+void cl_arq_controller::rung_meter_reset()
+{
+	rung_meter_db = -99.9;
+	rung_meter_age_batches = 1000000000;
+	rung_meter_wall_ms = 0;
+	rung_meter_data_latched = false;
+}
+
+// V3 floor+freshness check WITHOUT the at/below-current shortcut. The shortcut in rung_floor_ok (a
+// hold/down-move is never gated) references current_configuration; the BREAK-recovery anchor clamp
+// (T11) instead references the raw demote target, so it needs the raise-only check. Fail-OPEN on the
+// defeat env / NB / cfg<CONFIG_9 / out-of-range / cfg17; fail-CLOSED on a stale snapshot; else the
+// qualified snapshot must clear the rung's meter-referred floor + any session bump.
+bool cl_arq_controller::rung_floor_meter_clears(int cfg) const
 {
 	const char* defeat = std::getenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
 	if(defeat && *defeat && atoi(defeat) != 0) return true;   // blanket admit (fail-before)
 	if(narrowband_enabled == YES) return true;                // WB-only gate
-	double snr = measurements.SNR_uplink;
-	if(snr <= -90.0) return true;                             // unmeasured -> byte-identical
 	if(cfg < CONFIG_9) return true;                           // low OFDM rungs ungated (decode deep)
 	if(cfg < 0 || cfg >= NUMBER_OF_CONFIGS) return true;      // out of range (robust) -> ungated
 	if(cfg == CONFIG_17) return true;                         // top-gear (default-off) not gated here
-	// cfg9..cfg13 gated at the meter-referred OFDM-entry floor (cal v2). cfg14/cfg15 carry the -90
-	// ungated row (deferred to get_configuration + the cfg16 gate — a per-rung meter floor there is
-	// unreliable at the measured spread), so this returns true for them. cfg16's row ==
-	// CFG16_MIN_SNR_DB, so it AGREES with the cfg16 decode-margin gate (both never-raise) and keeps
-	// the cap composition order-independent.
+	if(rung_meter_stale()) return false;                     // stale climb-grade snapshot -> fail closed
 	double bump = rung_floor_bump_db[cfg];
-	return snr > RUNG_MIN_SNR_METER[cfg] + bump;
+	return rung_meter_db > RUNG_MIN_SNR_METER[cfg] + bump;    // qualified snapshot, never raw SNR_uplink
+}
+
+// TRUE iff the QUALIFIED climb-grade snapshot admits OFDM rung `cfg` at its meter-referred floor + any
+// session bump. v3 layers an at/below-current shortcut on top of rung_floor_meter_clears: a hold or a
+// down-move (cfg at/below current_configuration) is structurally NEVER gated, so a stale snapshot only
+// ever HOLDS current — it can never block a demote / BREAK / panic (the af14a9e bound). A climb above
+// current is admitted only on a fresh snapshot that clears the floor. Const.
+bool cl_arq_controller::rung_floor_ok(int cfg) const
+{
+	if(config_ladder_index(cfg) <= config_ladder_index(current_configuration))
+		return true;                                          // hold / down-move -> never gated
+	return rung_floor_meter_clears(cfg);
 }
 
 // INDEX-MONOTONE never-raise clamp: walk a proposed climb target DOWN to the highest floor-cleared
@@ -1023,16 +1093,38 @@ int cl_arq_controller::apply_rung_floor_cap(int proposed) const
 	return t;
 }
 
+// V3 RAISE-only never-raise clamp for the BREAK-recovery anchor clamp (T11). Same walk as
+// apply_rung_floor_cap but uses rung_floor_meter_clears (NO at/below-current shortcut) because the
+// clamp raises the raw demote target UP toward the last data-viable rung, and at the clamp site
+// current_configuration is still the FAILING rung — the shortcut would spuriously admit the raise.
+// Walks `proposed` down to the highest fresh-meter-cleared rung; const, order-independent.
+int cl_arq_controller::apply_rung_floor_raise_cap(int proposed) const
+{
+	if(narrowband_enabled == YES) return proposed;           // WB-only gate
+	if(rung_floor_meter_clears(proposed)) return proposed;   // gate open -> identity
+	int t = proposed;
+	for(int i = 0; i < NUMBER_OF_CONFIGS; i++)
+	{
+		int down = config_ladder_down(t, robust_enabled);
+		if(down == t) break;                                 // at the ladder bottom
+		t = down;
+		if(rung_floor_meter_clears(t)) return t;             // highest fresh-cleared rung <= proposed
+	}
+	return t;
+}
+
 // Counting wrapper for the ELECTION (transform) producer sites: apply the cap and, on a non-identity
 // clamp, bump the run-lifetime floor_cap_fires counter + emit the fire-proof line (counted-at-source).
+// The fire line reports the QUALIFIED snapshot (the actual gate input in cal v3) + its stale flag.
 int cl_arq_controller::rung_floor_cap_fire(int proposed)
 {
 	int capped = apply_rung_floor_cap(proposed);
 	if(capped != proposed)
 	{
 		floor_cap_fires++;
-		printf("[GEARSHIFT] RUNG-FLOOR: capped %d -> %d (meter %.1f, floor %.1f, fires=%lld)\n",
-			proposed, capped, measurements.SNR_uplink, rung_floor_min_meter(proposed), floor_cap_fires);
+		printf("[GEARSHIFT] RUNG-FLOOR: capped %d -> %d (meter %.1f age %d stale %d, floor %.1f, fires=%lld)\n",
+			proposed, capped, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0,
+			rung_floor_min_meter(proposed), floor_cap_fires);
 		fflush(stdout);
 	}
 	return capped;
@@ -1249,7 +1341,22 @@ void cl_arq_controller::process_messages_commander()
 				int raw_target = config_ladder_down_n(emergency_previous_config, break_drop_step, robust_enabled);
 				// Option B (data-anchored promotion): floor at last_data_viable_config
 				// (bypassed under panic). See break_target_with_anchor() / §6/§7.
-				int target = break_target_with_anchor(raw_target);
+				// Option B anchor clamp (may RAISE raw_target up to the last data-viable rung).
+				int clamped = break_target_with_anchor(raw_target);
+				// V3 T11: a STALE/garbage-high meter must not re-raise recovery to a rung that just
+				// failed (the frozen-25 recovery loop). Cap the RAISE at a fresh-meter-cleared rung,
+				// floored at the demote's own raw_target so the demote is never undercut — the result
+				// can never go below raw_target, nor above a floor+freshness-cleared rung. Byte-identical
+				// when the anchor is fresh-cleared or under the panic bypass (clamped==raw_target).
+				int t11_capped = apply_rung_floor_raise_cap(clamped);
+				int target = (config_ladder_index(t11_capped) < config_ladder_index(raw_target))
+					? raw_target : t11_capped;
+				if(target != clamped)
+				{
+					printf("[BREAK] RUNG-FLOOR raise-cap: anchor %d -> %d (meter %.1f age %d stale %d)\n",
+						clamped, target, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0);
+					fflush(stdout);
+				}
 				if(target != raw_target)
 				{
 					printf("[BREAK] Anchor floor: target %d below last_data_viable_config %d — clamping up to %d\n",
@@ -1348,7 +1455,20 @@ void cl_arq_controller::process_messages_commander()
 				// Option B (data-anchored promotion): same anchor floor as the
 				// ACK-received recovery site above — never undercut the highest
 				// data-viable rung, except under the panic-jump. See §6/§7.
-				int target = break_target_with_anchor(raw_target);
+				// Option B anchor clamp + V3 T11 raise-cap (same shape as the ACK-received site
+				// above): the anchor clamp may raise raw_target, but a stale/garbage meter cannot
+				// re-raise recovery to a failing rung; floored at raw_target so the demote is never
+				// undercut. Byte-identical when the anchor is fresh-cleared or under the panic bypass.
+				int clamped = break_target_with_anchor(raw_target);
+				int t11_capped = apply_rung_floor_raise_cap(clamped);
+				int target = (config_ladder_index(t11_capped) < config_ladder_index(raw_target))
+					? raw_target : t11_capped;
+				if(target != clamped)
+				{
+					printf("[BREAK] RUNG-FLOOR raise-cap (exhausted): anchor %d -> %d (meter %.1f age %d stale %d)\n",
+						clamped, target, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0);
+					fflush(stdout);
+				}
 				if(target != raw_target)
 				{
 					printf("[BREAK] Anchor floor (exhausted): target %d below last_data_viable_config %d — clamping up to %d\n",
@@ -7099,6 +7219,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// (cooldown). INDEPENDENT of the breaks_since_last_data_success reset above, so a slow
 				// completion at the anchor cannot wipe a disproof (erasure site 2 neutralized).
 				rung_floor_note_clean(current_configuration);
+				// V3 first-data latch: a clean data batch has been ACKed this session, so subsequent
+				// suffix-meter reads are in-transfer-grade (the connect-regime ~34 dB reads are behind
+				// us). Enables rung_meter_note_read to latch the climb-grade snapshot from here on.
+				rung_meter_data_latched = true;
 				// AARF DECAY (long-run-degradation.md §2.3): frame_shift_threshold
 				// is the FRAME-UP gate denominator (:3869). It is multiplicatively
 				// INCREASED (*=2 at :2447/:3352/:3539) on every FRAME-UP failure but
@@ -11006,80 +11130,123 @@ int cl_arq_controller::test_rung_floor_gate()
 		else     { printf("[TEST-RUNG-FLOOR] FAIL: %s\n", name); fails++; }
 		fflush(stdout);
 	};
-	// WB gearshift session baseline (the gate is WB-only).
+	// WB COMMANDER gearshift session baseline (the gate is WB-commander-only). Climbs are gated only
+	// ABOVE current_configuration, so hold current LOW to make cfg9..cfg16 genuine climbs.
 	narrowband_enabled = NO;
 	robust_enabled     = true;
+	role               = COMMANDER;
+	current_configuration = CONFIG_0;
+	breaks_since_last_data_success = 0;
 	rung_floor_memory_reset();
+	rung_meter_reset();
 	floor_cap_fires = 0;
 	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
+	// Latch a FRESH in-transfer climb-grade snapshot at meter m (age 0, no wall age -> not stale).
+	auto set_meter = [&](double m) {
+		rung_meter_db = m; rung_meter_age_batches = 0; rung_meter_wall_ms = 0;
+	};
 
-	// ── T5: J0 version / meter-cal pin / cal-v2 band-gate structure ──────────────────────────
+	// ── T5: J0 version / meter-cal pin / cal-v3 rows / monotone / grid placement ───────────────
 	check((double)CFG16_MIN_SNR_DB == 22.0, "T5 J0: CFG16_MIN_SNR_DB == 22.0");
 	check(rung_floor_min_meter(CONFIG_16) == CFG16_MIN_SNR_DB,
 		"T5 J0: RUNG_MIN_SNR_METER[16] == CFG16_MIN_SNR_DB (meter-cal pin)");
-	check(RUNG_FLOOR_METER_CAL_VERSION == 2, "T5 J0: meter-cal version pinned == 2");
-	// cal-v2 STRUCTURE: cfg9..cfg13 is a single OFDM-entry band-gate at meter 14.0 (non-decreasing,
-	// all rows equal); cfg14/cfg15 carry the ungated -90 row (deferred to get_configuration + the
-	// cfg16 gate); cfg16 == CFG16_MIN_SNR_DB. A future recalibration must bump the version above.
-	bool low_band_gate =
-		rung_floor_min_meter(CONFIG_9)  == 14.0 &&
-		rung_floor_min_meter(CONFIG_10) == 14.0 &&
-		rung_floor_min_meter(CONFIG_11) == 14.0 &&
-		rung_floor_min_meter(CONFIG_12) == 14.0 &&
-		rung_floor_min_meter(CONFIG_13) == 14.0;
-	check(low_band_gate, "T5: cfg9..cfg13 OFDM-entry band-gate == meter 14.0 (non-decreasing)");
-	bool mid_deferred =
-		rung_floor_min_meter(CONFIG_14) <= -90.0 &&
-		rung_floor_min_meter(CONFIG_15) <= -90.0;
-	check(mid_deferred, "T5: cfg14/cfg15 ungated (deferred to get_configuration + cfg16 gate)");
-	// The low band never sits above the cfg16 gate: an OFDM-entry threshold below the cfg16 floor.
-	check(rung_floor_min_meter(CONFIG_13) < rung_floor_min_meter(CONFIG_16),
-		"T5: OFDM-entry band-gate (14.0) below the cfg16 floor (22.0)");
+	check(RUNG_FLOOR_METER_CAL_VERSION == 3, "T5 J0: meter-cal version pinned == 3");
+	// cal-v3 rows on the live meter grid: cfg9=10, cfg10..13=12, cfg14=14, cfg15=16, cfg16/17=22.
+	bool rows_v3 =
+		rung_floor_min_meter(CONFIG_9)  == 10.0 &&
+		rung_floor_min_meter(CONFIG_10) == 12.0 &&
+		rung_floor_min_meter(CONFIG_11) == 12.0 &&
+		rung_floor_min_meter(CONFIG_12) == 12.0 &&
+		rung_floor_min_meter(CONFIG_13) == 12.0 &&
+		rung_floor_min_meter(CONFIG_14) == 14.0 &&
+		rung_floor_min_meter(CONFIG_15) == 16.0 &&
+		rung_floor_min_meter(CONFIG_16) == 22.0 &&
+		rung_floor_min_meter(CONFIG_17) == 22.0;
+	check(rows_v3, "T5: cal-v3 rows (cfg9=10 cfg10-13=12 cfg14=14 cfg15=16 cfg16/17=22)");
+	bool monotone = true;
+	for(int c = CONFIG_9; c < CONFIG_16; c++)
+		if(rung_floor_min_meter(c) > rung_floor_min_meter(c+1)) monotone = false;
+	check(monotone, "T5: table monotone (non-decreasing cfg9..cfg16)");
+	// GRID PLACEMENT: with a strict `>` predicate, no gated row may sit ON the measured meter grid
+	// {9,11,13,15,17,21,23,25} (a row on a grid point would refuse the very read it names).
+	bool off_grid = true;
+	const double meter_grid[8] = {9.0,11.0,13.0,15.0,17.0,21.0,23.0,25.0};
+	for(int c = CONFIG_9; c <= CONFIG_17; c++)
+		for(int g = 0; g < 8; g++)
+			if(rung_floor_min_meter(c) == meter_grid[g]) off_grid = false;
+	check(off_grid, "T5: no gated row lands ON the meter grid {9,11,13,15,17,21,23,25}");
 
-	// ── T1: cal-v2 fail-before / pass-after on the ELECTION cap (live-meter anchors) ──────────
-	// wb13 (snr3k +13): the LIVE in-transfer meter reads 11 at the config the elevator decides
-	// from. The incumbent lets the link climb into cfg13, where the meter stale-highs and over-
-	// elects cfg14 (measured 8/8 floor 16.4, 0/8 @13.4) -> BREAK storm -> the 2830-B stall. The
-	// cal-v2 band-gate refuses the whole OFDM band below meter 14, walking any gated proposal down
-	// to cfg8 so the link holds the honest low config and never enters the stale-high region.
-	measurements.SNR_uplink = 11.0;                 // live wb13 meter
+	// ── T1: fail-before / pass-after on the ELECTION cap at the live-meter anchors (fresh snapshot) ──
+	// wb13 (snr3k +13): the live in-transfer meter reads 11. cfg9's floor (10) is cleared but
+	// cfg10..cfg13 (12) are not, so the incumbent's climb into cfg13 (which stale-highs and over-
+	// elects cfg14 -> the 2830-B stall) is capped to cfg9-hold (+2.6 dB over cfg9's measured floor).
+	set_meter(11.0);
 	setenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT", "1", 1);
 	check(apply_rung_floor_cap(CONFIG_13) == CONFIG_13,
 		"T1 FAIL-BEFORE: defeat env -> cfg13 admitted at wb13 meter 11 (the climb into the stall)");
 	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
 	long long fires_before = floor_cap_fires;
 	int capped = rung_floor_cap_fire(CONFIG_13);
-	check(capped == CONFIG_8, "T1 PASS-AFTER: band-gate caps cfg13 -> cfg8 at wb13 meter 11");
+	check(capped == CONFIG_9, "T1 PASS-AFTER: cap cfg13 -> cfg9 at wb13 meter 11");
 	check(floor_cap_fires == fires_before + 1, "T1 PASS-AFTER: floor_cap_fires 0 -> 1 (fire proof)");
-	// 14.8 (the proven anti-stall win, PRESERVED): meter 13 is still below the OFDM-entry gate, so
-	// the link holds the honest low config exactly as cal-v1 (byte-identical at this anchor).
-	measurements.SNR_uplink = 13.0;                 // live 14.8 meter
-	check(apply_rung_floor_cap(CONFIG_13) == CONFIG_8,
-		"T1 PRESERVE: 14.8 meter 13 still caps the OFDM band to cfg8 (proven win unchanged)");
-	// 18 (the cal-v1 REGRESSION, RECOVERED): meter 15 clears the OFDM-entry gate, so the band opens
-	// and cfg13 + the deferred cfg15 pass through where cal-v1 (floors 16.9 / 19.5) over-capped them.
-	measurements.SNR_uplink = 15.0;                 // live 18 meter
+	// 14.8: meter 13 -> cfg13-hold (admit cfg13, refuse cfg14). Reclaims the cal-v1/v2 cfg8-pin tax
+	// (the 279 B/s envelope rung) while still refusing the cfg14 over-election that stormed the ladder.
+	set_meter(13.0);
 	check(apply_rung_floor_cap(CONFIG_13) == CONFIG_13,
-		"T1 RECOVER: 18 meter 15 admits cfg13 (OFDM band opens)");
-	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_15,
-		"T1 RECOVER: 18 meter 15 admits cfg15 (mid band deferred, not over-capped)");
+		"T1 14.8: meter 13 admits cfg13 (the 279 B/s envelope rung)");
+	check(apply_rung_floor_cap(CONFIG_14) == CONFIG_13,
+		"T1 14.8: meter 13 refuses cfg14 -> cfg13 (no over-election)");
+	// 18: meter 15 -> cfg14-hold (admit cfg14, refuse cfg15). Recovers the cal-v1 over-cap AND does
+	// not over-elect cfg15 (which the meter never legitimizes at true 18).
+	set_meter(15.0);
+	check(apply_rung_floor_cap(CONFIG_14) == CONFIG_14, "T1 18: meter 15 admits cfg14");
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14, "T1 18: meter 15 refuses cfg15 -> cfg14");
+	// 24.79 stratified ladder (17@cfg13-regime -> 21@cfg15-regime -> 23@cfg16-regime): each read
+	// unlocks the next rung stepwise; cfg16 admitted only when the meter reaches 23.
+	set_meter(17.0);
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_15, "T1 24.79: meter 17 admits cfg15");
+	check(apply_rung_floor_cap(CONFIG_16) == CONFIG_15, "T1 24.79: meter 17 refuses cfg16 -> cfg15");
+	set_meter(23.0);
+	check(apply_rung_floor_cap(CONFIG_16) == CONFIG_16, "T1 24.79: meter 23 admits cfg16 (top rung)");
+	set_meter(25.0);
+	check(apply_rung_floor_cap(CONFIG_16) == CONFIG_16, "T1 28: meter 25 admits cfg16 (transparent)");
 
-	// ── T2: never-raise + a below-floor SNR can never ELEVATE a rung + composition ───────────
+	// ── T2: never-raise + below-floor cannot elevate + post-condition + composition + hold/demote ──
+	set_meter(15.2);
 	bool never_raise = true;
 	for(int c = CONFIG_0; c <= CONFIG_16; c++)
 		if(config_ladder_index(apply_rung_floor_cap(c)) > config_ladder_index(c)) never_raise = false;
-	check(never_raise, "T2: apply_rung_floor_cap never RAISES a target (any rung, meter 15.2)");
-	measurements.SNR_uplink = 12.0;   // below the OFDM-entry band-gate (14.0)
+	check(never_raise, "T2: apply_rung_floor_cap never RAISES a target (any rung)");
+	set_meter(9.0);   // below every gated floor
 	check(config_ladder_index(apply_rung_floor_cap(CONFIG_13)) <= config_ladder_index(CONFIG_8),
-		"T2: below-gate meter (12.0) caps cfg13 down to <= cfg8 (no elevation)");
-	measurements.SNR_uplink = 15.2;
+		"T2: below-floor meter (9.0) caps cfg13 down to <= cfg8 (no elevation)");
+	// POST-CONDITION: every capped result passes rung_floor_ok OR is at/below current OR ungated-bottom.
+	set_meter(15.0);
+	bool post_ok = true;
+	for(int c = CONFIG_9; c <= CONFIG_16; c++)
+	{
+		int r = apply_rung_floor_cap(c);
+		if(!(rung_floor_ok(r)
+		   || config_ladder_index(r) <= config_ladder_index(current_configuration)
+		   || r < CONFIG_9))
+			post_ok = false;
+	}
+	check(post_ok, "T2: apply_rung_floor_cap post-condition (result passes rung_floor_ok / at-or-below current / ungated-bottom)");
+	set_meter(15.2);
 	int ab = apply_rung_floor_cap(apply_cfg16_margin_cap(CONFIG_16));
 	int ba = apply_cfg16_margin_cap(apply_rung_floor_cap(CONFIG_16));
 	check(ab == ba, "T2: cap composes order-independently with the cfg16 gate (from CONFIG_16)");
+	// STALE = hold current, and a demote is NEVER gated (the af14a9e bound).
+	current_configuration = CONFIG_13;
+	rung_meter_reset();   // stale (sentinel) snapshot
+	check(rung_floor_ok(CONFIG_13), "T2 hold: a STALE snapshot still admits the CURRENT rung (hold)");
+	check(rung_floor_ok(CONFIG_8),  "T2 demote: a STALE snapshot never gates a DOWN-move (cfg8 < current)");
+	check(!rung_floor_ok(CONFIG_14), "T2 climb: a STALE snapshot REFUSES a climb above current (cfg14)");
+	current_configuration = CONFIG_0;
 
 	// ── T4: defeat env byte-identical (no cap, no arm) ───────────────────────────────────────
 	setenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT", "1", 1);
-	measurements.SNR_uplink = 15.2;
+	set_meter(15.2);
 	long long fires_pre = floor_cap_fires;
 	int def = rung_floor_cap_fire(CONFIG_14);
 	check(def == CONFIG_14 && floor_cap_fires == fires_pre,
@@ -11092,19 +11259,20 @@ int cl_arq_controller::test_rung_floor_gate()
 
 	// ── T3: failure memory — arm / survive erasure sites / decay / decay-gate / reset ────────
 	rung_floor_memory_reset();
-	measurements.SNR_uplink = 15.0;   // clears cfg13's band-gate (14.0) -> table ADMITS cfg13
-	check(rung_floor_ok(CONFIG_13), "T3 pre: table admits cfg13 at meter 15.0");
+	current_configuration = CONFIG_0;
+	set_meter(13.0);   // clears cfg13's floor (12.0) -> table ADMITS cfg13 (the arm precondition)
+	check(rung_floor_ok(CONFIG_13), "T3 pre: table admits cfg13 at meter 13.0");
 	rung_floor_note_break(CONFIG_13);
 	check(rung_floor_bump_db[CONFIG_13] == 0.0, "T3 arm: 1 break -> no bump yet");
 	rung_floor_note_break(CONFIG_13);
 	rung_floor_note_break(CONFIG_13);
 	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB, "T3 arm: 3 breaks -> +1.5 bump");
-	check(!rung_floor_ok(CONFIG_13), "T3 arm: bump raised cfg13's floor (14.0->15.5, meter 15.0 now refused)");
-	// SURVIVE erasure site 1 (the :7945 proven-ceiling wipe).
+	check(!rung_floor_ok(CONFIG_13), "T3 arm: bump raised cfg13's floor (12.0->13.5, meter 13.0 now refused)");
+	// SURVIVE erasure site 1 (the proven-ceiling wipe).
 	supershift_proven_ceiling = CONFIG_16;
 	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB,
 		"T3 survive: proven-ceiling wipe does NOT touch the bump (erasure site 1)");
-	// SURVIVE erasure site 2 (the :6898 data-success reset).
+	// SURVIVE erasure site 2 (the data-success reset).
 	breaks_since_last_data_success = 0;
 	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB,
 		"T3 survive: data-success reset does NOT touch the bump (erasure site 2)");
@@ -11123,6 +11291,62 @@ int cl_arq_controller::test_rung_floor_gate()
 	rung_floor_memory_reset();
 	check(rung_floor_bump_db[CONFIG_13] == 0.0 && rung_fail_count[CONFIG_13] == 0,
 		"T3 reset: memory_reset clears the bump + fail count");
+
+	// ── T3b: staleness quartet — provenance (connect / recovery) + age + wall ────────────────
+	rung_floor_memory_reset();
+	current_configuration = CONFIG_0;
+	// (1) CONNECT-REGIME: a read before any data batch (first-data latch off) does NOT latch, so the
+	// snapshot stays at the sentinel -> stale -> a climb above current is refused (the connect-leap
+	// hole the earlier band-gate could not close because the raw meter read ~34 dB at connect).
+	rung_meter_reset();                   // data_latched=false, sentinel snapshot
+	breaks_since_last_data_success = 0;
+	rung_meter_note_read(34.5);           // the connect ~34 dB control-frame write
+	check(rung_meter_db <= -90.0, "T3b connect: a pre-data read does NOT latch (snapshot stays sentinel)");
+	check(rung_meter_stale(),     "T3b connect: the sentinel snapshot is STALE");
+	check(!rung_floor_ok(CONFIG_13), "T3b connect: STALE -> the connect climb into cfg13 is refused");
+	// (2) RECOVERY-REGIME: a read while awaiting recovery (breaks>0) does NOT overwrite the snapshot
+	// with the garbage-high recovery value (Fact B step 5 — the frozen-25 writer).
+	rung_meter_data_latched = true;       // data has flowed this session
+	set_meter(13.0);                      // an honest fresh sample
+	breaks_since_last_data_success = 1;   // now awaiting recovery
+	rung_meter_note_read(25.0);           // the BREAK-recovery garbage-25 write
+	check(rung_meter_db == 13.0, "T3b recovery: a break-recovery read does NOT overwrite the snapshot (garbage-25 rejected)");
+	breaks_since_last_data_success = 0;
+	// (3) AGE: a fresh sample followed by > N silent batch attempts goes stale (the FRAME-UP-into-stall
+	// escape: no fresh read latches, the age grows, climbs close from the third silent batch).
+	set_meter(15.0);
+	check(!rung_meter_stale(), "T3b age: a fresh sample is not stale (age 0)");
+	rung_meter_note_batch_attempt(); rung_meter_note_batch_attempt(); rung_meter_note_batch_attempt();
+	check(rung_meter_age_batches == 3 && rung_meter_stale(),
+		"T3b age: 3 silent batch attempts (age>2) -> STALE");
+	check(!rung_floor_ok(CONFIG_14), "T3b age: STALE age -> a climb above current is refused (holds current)");
+	// (4) WALL: a fresh sample older than the wall bound is stale even at age 0 (covers idle, where the
+	// batch counter freezes and an age-only test would keep a pre-idle sample 'fresh' across a quiet period).
+	set_meter(15.0);
+	rung_meter_wall_ms = rung_meter_now_ms() - (RUNG_METER_STALE_WALL_MS + 1000);
+	check(rung_meter_stale(), "T3b wall: a sample older than the wall bound is STALE (idle)");
+	check(!rung_floor_ok(CONFIG_14), "T3b wall: STALE wall -> a climb is refused");
+
+	// ── T6: BREAK-recovery anchor-clamp RAISE gating (T11 — the Fact B step-6 loop kill) ─────────
+	// During recovery current_configuration is still the FAILING rung, and the anchor clamp would
+	// re-raise the recovery target UP to the last data-viable rung. On a STALE/garbage-high meter that
+	// re-raise must be refused; the raise-only cap ignores the at/below-current shortcut (which would
+	// otherwise spuriously admit the raise because the clamped rung is below the failing current rung).
+	current_configuration = CONFIG_15;    // the failing rung
+	rung_meter_reset();                   // stale (the frozen-25 regime)
+	int t6_raw     = CONFIG_8;             // the honest demote target
+	int t6_clamped = CONFIG_14;            // the anchor clamp would re-raise to cfg14 (the failing rung)
+	int t6_capped  = apply_rung_floor_raise_cap(t6_clamped);
+	int t6_target  = (config_ladder_index(t6_capped) < config_ladder_index(t6_raw)) ? t6_raw : t6_capped;
+	check(config_ladder_index(t6_capped) < config_ladder_index(t6_clamped),
+		"T6: the RAISE cap ignores the at/below-current shortcut (caps below the failing current rung)");
+	check(config_ladder_index(t6_target) <= config_ladder_index(t6_raw),
+		"T6: STALE meter -> the anchor-clamp raise is floored at the raw demote target (no re-raise to the failing rung)");
+	// A FRESH meter that clears the anchor leaves the clamp identity (a genuine recovery is unblocked).
+	set_meter(23.0);
+	check(apply_rung_floor_raise_cap(CONFIG_14) == CONFIG_14,
+		"T6: a fresh anchor-cleared meter leaves the anchor clamp identity (viable recovery unblocked)");
+	current_configuration = CONFIG_0;
 
 	printf("[TEST-RUNG-FLOOR] done: %d failure(s)\n", fails);
 	fflush(stdout);
