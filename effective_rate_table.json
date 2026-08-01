@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "calibration_date": "2026-05-23T21:02:18Z",
-  "mercury_head": "68e61e1",
+  "calibration_date": "2026-08-01T19:44:06Z",
+  "mercury_head": "8da6735b8",
   "calibration_setup": {
     "compress": false,
     "sack": true,
@@ -179,7 +179,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn30": {
         "eff_bps_mean": 645.5,
@@ -222,7 +223,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn28": {
         "eff_bps_mean": 655.0,
@@ -265,7 +267,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
         "eff_bps_mean": 655.0,
@@ -308,7 +311,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn24": {
         "eff_bps_mean": 638.5,
@@ -351,7 +355,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
         "eff_bps_mean": 591.5,
@@ -394,7 +399,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn20": {
         "eff_bps_mean": 628.0,
@@ -437,7 +443,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
         "eff_bps_mean": 568.0,
@@ -480,7 +487,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn16": {
         "eff_bps_mean": 613.0,
@@ -523,95 +531,64 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     },
     "9": {
       "clean": {
-        "eff_bps_mean": 1094.5,
-        "eff_bps_min": 1094.5,
-        "eff_bps_max": 1094.5,
+        "eff_bps_mean": 1121.8,
+        "eff_bps_min": 1121.8,
+        "eff_bps_max": 1121.8,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.145,
-        "batch_count_mean": 16.0,
-        "frame_loss_pct": 3.33,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1094.5,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.145,
-            "batch_count": 16,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 34410,
-            "rx_bytes_measured": 32085,
-            "tx_bytes": 311296,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T14:57:43",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG9_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG9_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 370,
-              "cmd_nReSent_data": 2,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 2,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1121.8,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 14171,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 43.58
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 43.58
       },
       "wgn30": {
-        "eff_bps_mean": 1079.0,
-        "eff_bps_min": 1079.0,
-        "eff_bps_max": 1079.0,
+        "eff_bps_mean": 1121.6,
+        "eff_bps_min": 1121.6,
+        "eff_bps_max": 1121.6,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.0375,
-        "batch_count_mean": 16.0,
-        "frame_loss_pct": 3.33,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1079.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0375,
-            "batch_count": 16,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 34410,
-            "rx_bytes_measured": 32085,
-            "tx_bytes": 310272,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T15:03:45",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG9_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG9_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 400,
-              "cmd_nReSent_data": 1,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1121.6,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 14171,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 34.66
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 34.66
       },
       "wgn28": {
         "eff_bps_mean": 1095.2,
@@ -654,50 +631,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
-        "eff_bps_mean": 1054.0,
-        "eff_bps_min": 1054.0,
-        "eff_bps_max": 1054.0,
+        "eff_bps_mean": 1126.3,
+        "eff_bps_min": 1126.3,
+        "eff_bps_max": 1126.3,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.21,
-        "batch_count_mean": 17.0,
-        "frame_loss_pct": 3.56,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1054.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.21,
-            "batch_count": 17,
-            "frame_loss_pct": 3.56,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 34875,
-            "rx_bytes_measured": 32550,
-            "tx_bytes": 310272,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T15:15:53",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG9_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG9_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 375,
-              "cmd_nReSent_data": 3,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 3,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1126.3,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 14171,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 30.74
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell_rerun",
+        "recal_snr3k": 30.74
       },
       "wgn24": {
         "eff_bps_mean": 1051.6,
@@ -796,106 +758,35 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
-        "eff_bps_mean": 906.5,
-        "eff_bps_min": 646.0,
-        "eff_bps_max": 1084.0,
-        "eff_bps_sigma": 188.2,
-        "sack_rate_mean": 0.2292,
-        "batch_count_mean": 14.33,
-        "frame_loss_pct": 14.33,
-        "n_runs": 3,
+        "eff_bps_mean": 1122.6,
+        "eff_bps_min": 1122.6,
+        "eff_bps_max": 1122.6,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1084.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.2275,
-            "batch_count": 18,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 34410,
-            "rx_bytes_measured": 32085,
-            "tx_bytes": 310272,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T23:16:58",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG9_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG9_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 370,
-              "cmd_nReSent_data": 4,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 4,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 989.5,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.29,
-            "batch_count": 17,
-            "frame_loss_pct": 35.67,
-            "opt_window_samples": 5,
+            "eff_bps": 1122.6,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 14171,
+            "sack_rate": 0.0,
             "break_fired": false,
-            "rx_bytes": 26877,
-            "rx_bytes_measured": 24552,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T23:22:31",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG9_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG9_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 317,
-              "cmd_nReSent_data": 62,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 6,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 646.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.17,
-            "batch_count": 8,
-            "frame_loss_pct": 4.0,
-            "opt_window_samples": 2,
-            "break_fired": false,
-            "rx_bytes": 6696,
-            "rx_bytes_measured": 4371,
-            "tx_bytes": 440320,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T23:28:05",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG9_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG9_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 105,
-              "cmd_nReSent_data": 91,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
+            "snr3k": 26.78
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell_rerun",
+        "recal_snr3k": 26.78
       },
       "wgn20": {
         "eff_bps_mean": 857.2,
@@ -994,106 +885,35 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
-        "eff_bps_mean": 824.3,
-        "eff_bps_min": 567.5,
-        "eff_bps_max": 995.0,
-        "eff_bps_sigma": 184.9,
-        "sack_rate_mean": 0.3867,
-        "batch_count_mean": 17.33,
-        "frame_loss_pct": 37.59,
-        "n_runs": 3,
+        "eff_bps_mean": 1125.9,
+        "eff_bps_min": 1125.9,
+        "eff_bps_max": 1125.9,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 995.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.28,
-            "batch_count": 17,
-            "frame_loss_pct": 23.44,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 29481,
-            "rx_bytes_measured": 27156,
-            "tx_bytes": 301056,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T22:42:43",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG9_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG9_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 365,
-              "cmd_nReSent_data": 13,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 6,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 910.5,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.3475,
-            "batch_count": 17,
-            "frame_loss_pct": 44.29,
-            "opt_window_samples": 5,
+            "eff_bps": 1125.9,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 14171,
+            "sack_rate": 0.0,
             "break_fired": false,
-            "rx_bytes": 26505,
-            "rx_bytes_measured": 24180,
-            "tx_bytes": 303104,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T22:48:15",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG9_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG9_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 312,
-              "cmd_nReSent_data": 65,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 7,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 567.5,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.5325,
-            "batch_count": 18,
-            "frame_loss_pct": 45.05,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 17670,
-            "rx_bytes_measured": 15345,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T22:53:49",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG9_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG9_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 267,
-              "cmd_nReSent_data": 102,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 7,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
+            "snr3k": 22.79
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 22.79
       },
       "wgn16": {
         "eff_bps_mean": 943.0,
@@ -1136,17 +956,18 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     },
     "11": {
       "clean": {
-        "eff_bps_mean": 1480.0,
-        "eff_bps_min": 1480.0,
-        "eff_bps_max": 1480.0,
+        "eff_bps_mean": 1500.3,
+        "eff_bps_min": 1500.3,
+        "eff_bps_max": 1500.3,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -1154,42 +975,26 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1480.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 47840,
-            "rx_bytes_measured": 43240,
-            "tx_bytes": 320512,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T15:52:13",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG11_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG11_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1500.3,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 18953,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 43.58
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 43.58
       },
       "wgn30": {
-        "eff_bps_mean": 1485.2,
-        "eff_bps_min": 1485.2,
-        "eff_bps_max": 1485.2,
+        "eff_bps_mean": 1498.5,
+        "eff_bps_min": 1498.5,
+        "eff_bps_max": 1498.5,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -1197,34 +1002,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1485.2,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 47840,
-            "rx_bytes_measured": 43240,
-            "tx_bytes": 319488,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T15:58:17",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG11_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG11_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1498.5,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 18953,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 34.66
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 34.66
       },
       "wgn28": {
         "eff_bps_mean": 1479.0,
@@ -1267,15 +1056,16 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
-        "eff_bps_mean": 1494.8,
-        "eff_bps_min": 1494.8,
-        "eff_bps_max": 1494.8,
+        "eff_bps_mean": 1498.8,
+        "eff_bps_min": 1498.8,
+        "eff_bps_max": 1498.8,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -1283,34 +1073,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1494.8,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 47840,
-            "rx_bytes_measured": 43240,
-            "tx_bytes": 318464,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T16:12:22",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG11_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG11_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1498.8,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 18953,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 30.74
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 30.74
       },
       "wgn24": {
         "eff_bps_mean": 1477.6,
@@ -1353,15 +1127,16 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
-        "eff_bps_mean": 1478.0,
-        "eff_bps_min": 1478.0,
-        "eff_bps_max": 1478.0,
+        "eff_bps_mean": 1505.9,
+        "eff_bps_min": 1505.9,
+        "eff_bps_max": 1505.9,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -1369,34 +1144,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1478.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 47840,
-            "rx_bytes_measured": 43240,
-            "tx_bytes": 318464,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T16:24:29",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn22_CFG11_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn22_CFG11_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1505.9,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 18953,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 26.78
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 26.78
       },
       "wgn20": {
         "eff_bps_mean": 1485.4,
@@ -1439,50 +1198,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
-        "eff_bps_mean": 1468.8,
-        "eff_bps_min": 1468.8,
-        "eff_bps_max": 1468.8,
+        "eff_bps_mean": 1509.2,
+        "eff_bps_min": 1509.2,
+        "eff_bps_max": 1509.2,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.064,
-        "batch_count_mean": 20.0,
-        "frame_loss_pct": 3.33,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1468.8,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.064,
-            "batch_count": 20,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 47840,
-            "rx_bytes_measured": 43240,
-            "tx_bytes": 319488,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T16:36:37",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn18_CFG11_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn18_CFG11_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 1,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1509.2,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 18953,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 22.79
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 22.79
       },
       "wgn16": {
         "eff_bps_mean": 1377.5,
@@ -1525,95 +1269,64 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     },
     "12": {
       "clean": {
-        "eff_bps_mean": 2018.3,
-        "eff_bps_min": 2018.3,
-        "eff_bps_max": 2018.3,
+        "eff_bps_mean": 1909.3,
+        "eff_bps_min": 1909.3,
+        "eff_bps_max": 1909.3,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.0633,
-        "batch_count_mean": 15.0,
-        "frame_loss_pct": 3.33,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2018.3,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0633,
-            "batch_count": 15,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 4,
-            "break_fired": false,
-            "rx_bytes": 62160,
-            "rx_bytes_measured": 57960,
-            "tx_bytes": 334848,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T16:48:43",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG12_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG12_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 370,
-              "cmd_nReSent_data": 1,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1909.3,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 24071,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 43.58
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 43.58
       },
       "wgn30": {
-        "eff_bps_mean": 1986.0,
-        "eff_bps_min": 1986.0,
-        "eff_bps_max": 1986.0,
+        "eff_bps_mean": 1911.5,
+        "eff_bps_min": 1911.5,
+        "eff_bps_max": 1911.5,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.065,
-        "batch_count_mean": 16.0,
-        "frame_loss_pct": 3.33,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1986.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.065,
-            "batch_count": 16,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 62160,
-            "rx_bytes_measured": 57960,
-            "tx_bytes": 334848,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T16:54:44",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG12_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG12_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 400,
-              "cmd_nReSent_data": 1,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1911.5,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 24071,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 34.66
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 34.66
       },
       "wgn28": {
         "eff_bps_mean": 1971.2,
@@ -1656,50 +1369,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
-        "eff_bps_mean": 1583.5,
-        "eff_bps_min": 1583.5,
-        "eff_bps_max": 1583.5,
+        "eff_bps_mean": 1913.0,
+        "eff_bps_min": 1913.0,
+        "eff_bps_max": 1913.0,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.14,
-        "batch_count_mean": 10.0,
-        "frame_loss_pct": 8.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1583.5,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.14,
-            "batch_count": 10,
-            "frame_loss_pct": 8.0,
-            "opt_window_samples": 3,
-            "break_fired": false,
-            "rx_bytes": 25200,
-            "rx_bytes_measured": 21000,
-            "tx_bytes": 462241,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T17:06:51",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG12_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG12_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 155,
-              "cmd_nReSent_data": 92,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 1913.0,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 24071,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 30.74
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 30.74
       },
       "wgn24": {
         "eff_bps_mean": 1696.2,
@@ -1798,106 +1496,35 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
-        "eff_bps_mean": 1707.1,
-        "eff_bps_min": 1603.2,
-        "eff_bps_max": 1799.2,
-        "eff_bps_sigma": 80.4,
-        "sack_rate_mean": 0.315,
-        "batch_count_mean": 17.33,
-        "frame_loss_pct": 33.35,
-        "n_runs": 3,
+        "eff_bps_mean": 1913.4,
+        "eff_bps_min": 1913.4,
+        "eff_bps_max": 1913.4,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1799.2,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.295,
-            "batch_count": 18,
-            "frame_loss_pct": 4.83,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 60480,
-            "rx_bytes_measured": 56280,
-            "tx_bytes": 335872,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T00:25:36",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG12_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG12_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 360,
-              "cmd_nReSent_data": 5,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 4,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 1603.2,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.375,
-            "batch_count": 18,
-            "frame_loss_pct": 44.38,
-            "opt_window_samples": 5,
+            "eff_bps": 1913.4,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 24071,
+            "sack_rate": 0.0,
             "break_fired": false,
-            "rx_bytes": 47208,
-            "rx_bytes_measured": 43008,
-            "tx_bytes": 325632,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T00:31:16",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG12_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG12_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 312,
-              "cmd_nReSent_data": 70,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 7,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 1718.8,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.275,
-            "batch_count": 16,
-            "frame_loss_pct": 50.83,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 47880,
-            "rx_bytes_measured": 43680,
-            "tx_bytes": 326656,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T00:36:48",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG12_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG12_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 312,
-              "cmd_nReSent_data": 62,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 4,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
+            "snr3k": 26.78
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 26.78
       },
       "wgn20": {
         "eff_bps_mean": 1326.0,
@@ -1996,106 +1623,35 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
-        "eff_bps_mean": 1403.8,
-        "eff_bps_min": 1093.5,
-        "eff_bps_max": 1786.0,
-        "eff_bps_sigma": 287.2,
-        "sack_rate_mean": 0.3708,
-        "batch_count_mean": 17.0,
-        "frame_loss_pct": 38.8,
-        "n_runs": 3,
+        "eff_bps_mean": 1908.1,
+        "eff_bps_min": 1908.1,
+        "eff_bps_max": 1908.1,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1332.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.4425,
-            "batch_count": 18,
-            "frame_loss_pct": 43.73,
-            "opt_window_samples": 5,
-            "break_fired": false,
-            "rx_bytes": 46200,
-            "rx_bytes_measured": 42000,
-            "tx_bytes": 331776,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T23:51:16",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG12_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG12_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 327,
-              "cmd_nReSent_data": 54,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 5,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 1093.5,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.52,
-            "batch_count": 18,
-            "frame_loss_pct": 62.0,
-            "opt_window_samples": 5,
+            "eff_bps": 1908.1,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 24071,
+            "sack_rate": 0.0,
             "break_fired": false,
-            "rx_bytes": 22176,
-            "rx_bytes_measured": 17976,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T23:56:50",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG12_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG12_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 205,
-              "cmd_nReSent_data": 169,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 8,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 1786.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.15,
-            "batch_count": 15,
-            "frame_loss_pct": 10.67,
-            "opt_window_samples": 4,
-            "break_fired": false,
-            "rx_bytes": 44520,
-            "rx_bytes_measured": 40320,
-            "tx_bytes": 321536,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T00:02:24",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG12_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG12_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 294,
-              "cmd_nReSent_data": 93,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 2,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
+            "snr3k": 22.79
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 22.79
       },
       "wgn16": {
         "eff_bps_mean": 1113.7,
@@ -2138,17 +1694,18 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     },
     "13": {
       "clean": {
-        "eff_bps_mean": 2293.0,
-        "eff_bps_min": 2293.0,
-        "eff_bps_max": 2293.0,
+        "eff_bps_mean": 2239.9,
+        "eff_bps_min": 2239.9,
+        "eff_bps_max": 2239.9,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -2156,42 +1713,26 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2293.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 73840,
-            "rx_bytes_measured": 66740,
-            "tx_bytes": 479649,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T17:43:08",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG13_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG13_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2239.9,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 28253,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 43.58
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 43.58
       },
       "wgn30": {
-        "eff_bps_mean": 2304.6,
-        "eff_bps_min": 2304.6,
-        "eff_bps_max": 2304.6,
+        "eff_bps_mean": 2245.3,
+        "eff_bps_min": 2245.3,
+        "eff_bps_max": 2245.3,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -2199,34 +1740,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2304.6,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 73840,
-            "rx_bytes_measured": 66740,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T17:49:11",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG13_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG13_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2245.3,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 28253,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 34.66
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 34.66
       },
       "wgn28": {
         "eff_bps_mean": 2280.8,
@@ -2269,15 +1794,16 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
-        "eff_bps_mean": 2300.2,
-        "eff_bps_min": 2300.2,
-        "eff_bps_max": 2300.2,
+        "eff_bps_mean": 2241.9,
+        "eff_bps_min": 2241.9,
+        "eff_bps_max": 2241.9,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -2285,34 +1811,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2300.2,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 73840,
-            "rx_bytes_measured": 66740,
-            "tx_bytes": 351232,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T18:01:17",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG13_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG13_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2241.9,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 28253,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 30.74
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 30.74
       },
       "wgn24": {
         "eff_bps_mean": 2279.1,
@@ -2411,106 +1921,35 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
-        "eff_bps_mean": 2163.5,
-        "eff_bps_min": 1992.3,
-        "eff_bps_max": 2269.4,
-        "eff_bps_sigma": 122.2,
-        "sack_rate_mean": 0.1604,
-        "batch_count_mean": 21.67,
-        "frame_loss_pct": 16.66,
-        "n_runs": 3,
+        "eff_bps_mean": 2239.5,
+        "eff_bps_min": 2239.5,
+        "eff_bps_max": 2239.5,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2228.8,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.15,
-            "batch_count": 22,
-            "frame_loss_pct": 5.33,
-            "opt_window_samples": 7,
-            "break_fired": false,
-            "rx_bytes": 69722,
-            "rx_bytes_measured": 62622,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T01:34:27",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG13_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG13_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 549,
-              "cmd_nReSent_data": 3,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 2,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 2269.4,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.098,
-            "batch_count": 21,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 6,
+            "eff_bps": 2239.5,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 28253,
+            "sack_rate": 0.0,
             "break_fired": false,
-            "rx_bytes": 73840,
-            "rx_bytes_measured": 66740,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T01:40:00",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG13_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG13_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 1,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 1992.3,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.2333,
-            "batch_count": 22,
-            "frame_loss_pct": 41.33,
-            "opt_window_samples": 7,
-            "break_fired": false,
-            "rx_bytes": 61628,
-            "rx_bytes_measured": 54528,
-            "tx_bytes": 344064,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T01:45:33",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG13_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG13_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 462,
-              "cmd_nReSent_data": 62,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 5,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
+            "snr3k": 26.78
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 26.78
       },
       "wgn20": {
         "eff_bps_mean": 1985.9,
@@ -2609,106 +2048,35 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
-        "eff_bps_mean": 2195.2,
-        "eff_bps_min": 2174.5,
-        "eff_bps_max": 2218.3,
-        "eff_bps_sigma": 18.0,
-        "sack_rate_mean": 0.1052,
-        "batch_count_mean": 21.0,
-        "frame_loss_pct": 3.33,
-        "n_runs": 3,
+        "eff_bps_mean": 2235.3,
+        "eff_bps_min": 2235.3,
+        "eff_bps_max": 2235.3,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2218.3,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.1133,
-            "batch_count": 21,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 7,
-            "break_fired": false,
-            "rx_bytes": 73840,
-            "rx_bytes_measured": 66740,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T01:00:04",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG13_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG13_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 549,
-              "cmd_nReSent_data": 3,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 3,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 2192.8,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.064,
-            "batch_count": 20,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 6,
+            "eff_bps": 2235.3,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 28253,
+            "sack_rate": 0.0,
             "break_fired": false,
-            "rx_bytes": 69580,
-            "rx_bytes_measured": 62480,
-            "tx_bytes": 351232,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T01:05:43",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG13_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG13_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 520,
-              "cmd_nReSent_data": 1,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 2,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 2174.5,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.1383,
-            "batch_count": 22,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 7,
-            "break_fired": false,
-            "rx_bytes": 73840,
-            "rx_bytes_measured": 66740,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T01:11:17",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG13_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG13_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 520,
-              "cmd_nReSent_data": 3,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 3,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
+            "snr3k": 22.79
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 22.79
       },
       "wgn16": {
         "eff_bps_mean": 2276.4,
@@ -2751,17 +2119,18 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     },
     "14": {
       "clean": {
-        "eff_bps_mean": 2591.0,
-        "eff_bps_min": 2591.0,
-        "eff_bps_max": 2591.0,
+        "eff_bps_mean": 2609.5,
+        "eff_bps_min": 2609.5,
+        "eff_bps_max": 2609.5,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 19.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -2769,42 +2138,26 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2591.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 19,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 86840,
-            "rx_bytes_measured": 78490,
-            "tx_bytes": 358400,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T18:39:49",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG14_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG14_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 520,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2609.5,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 32903,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 43.58
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 43.58
       },
       "wgn30": {
-        "eff_bps_mean": 2683.4,
-        "eff_bps_min": 2683.4,
-        "eff_bps_max": 2683.4,
+        "eff_bps_mean": 2610.9,
+        "eff_bps_min": 2610.9,
+        "eff_bps_max": 2610.9,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -2812,34 +2165,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2683.4,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 86840,
-            "rx_bytes_measured": 78490,
-            "tx_bytes": 357376,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T18:45:51",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG14_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG14_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2610.9,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 32903,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 34.66
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 34.66
       },
       "wgn28": {
         "eff_bps_mean": 2688.2,
@@ -2882,15 +2219,16 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
-        "eff_bps_mean": 2683.6,
-        "eff_bps_min": 2683.6,
-        "eff_bps_max": 2683.6,
+        "eff_bps_mean": 2618.3,
+        "eff_bps_min": 2618.3,
+        "eff_bps_max": 2618.3,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -2898,34 +2236,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2683.6,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 86840,
-            "rx_bytes_measured": 78490,
-            "tx_bytes": 359424,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T18:57:53",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG14_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG14_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2618.3,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 32903,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 30.74
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 30.74
       },
       "wgn24": {
         "eff_bps_mean": 2683.0,
@@ -2968,15 +2290,16 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
-        "eff_bps_mean": 2683.0,
-        "eff_bps_min": 2683.0,
-        "eff_bps_max": 2683.0,
+        "eff_bps_mean": 2617.4,
+        "eff_bps_min": 2617.4,
+        "eff_bps_max": 2617.4,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 20.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -2984,34 +2307,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2683.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 20,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 86840,
-            "rx_bytes_measured": 78490,
-            "tx_bytes": 358400,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T19:10:01",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn22_CFG14_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn22_CFG14_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 550,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2617.4,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 32903,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 26.78
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 26.78
       },
       "wgn20": {
         "eff_bps_mean": 2662.0,
@@ -3054,50 +2361,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
-        "eff_bps_mean": 1064.0,
-        "eff_bps_min": 1064.0,
-        "eff_bps_max": 1064.0,
+        "eff_bps_mean": 2616.8,
+        "eff_bps_min": 2616.8,
+        "eff_bps_max": 2616.8,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.33,
-        "batch_count_mean": 5.0,
-        "frame_loss_pct": 4.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 1064.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.33,
-            "batch_count": 5,
-            "frame_loss_pct": 4.0,
-            "opt_window_samples": 1,
-            "break_fired": false,
-            "rx_bytes": 4175,
-            "rx_bytes_measured": 0,
-            "tx_bytes": 276480,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T19:22:04",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn18_CFG14_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn18_CFG14_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 49,
-              "cmd_nReSent_data": 76,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 1,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 2616.8,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 32903,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 22.79
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 22.79
       },
       "wgn16": {
         "eff_bps_mean": 2316.0,
@@ -3140,60 +2432,18 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     },
     "15": {
       "clean": {
-        "eff_bps_mean": 3118.4,
-        "eff_bps_min": 3118.4,
-        "eff_bps_max": 3118.4,
-        "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.1257,
-        "batch_count_mean": 25.0,
-        "frame_loss_pct": 41.33,
-        "n_runs": 1,
-        "n_failed_runs": 0,
-        "failed": false,
-        "break_fired": false,
-        "runs": [
-          {
-            "eff_bps": 3118.4,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.1257,
-            "batch_count": 25,
-            "frame_loss_pct": 41.33,
-            "opt_window_samples": 8,
-            "break_fired": false,
-            "rx_bytes": 87864,
-            "rx_bytes_measured": 79464,
-            "tx_bytes": 375808,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T19:34:08",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG15_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG15_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 581,
-              "cmd_nReSent_data": 62,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 5,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          }
-        ]
-      },
-      "wgn30": {
-        "eff_bps_mean": 2207.0,
-        "eff_bps_min": 2207.0,
-        "eff_bps_max": 2207.0,
+        "eff_bps_mean": 3214.1,
+        "eff_bps_min": 3214.1,
+        "eff_bps_max": 3214.1,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 8.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -3201,34 +2451,45 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2207.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 8,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 2,
-            "break_fired": false,
-            "rx_bytes": 21000,
-            "rx_bytes_measured": 12600,
-            "tx_bytes": 292864,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T19:40:12",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG15_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG15_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 130,
-              "cmd_nReSent_data": 90,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 3214.1,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 40604,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 43.58
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 43.58
+      },
+      "wgn30": {
+        "eff_bps_mean": 3225.8,
+        "eff_bps_min": 3225.8,
+        "eff_bps_max": 3225.8,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
+        "n_failed_runs": 0,
+        "failed": false,
+        "break_fired": false,
+        "runs": [
+          {
+            "run_idx": 1,
+            "connected": true,
+            "eff_bps": 3225.8,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 40604,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 34.66
+          }
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 34.66
       },
       "wgn28": {
         "eff_bps_mean": 2739.4,
@@ -3271,50 +2532,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
-        "eff_bps_mean": 2614.4,
-        "eff_bps_min": 2614.4,
-        "eff_bps_max": 2614.4,
+        "eff_bps_mean": 3225.5,
+        "eff_bps_min": 3225.5,
+        "eff_bps_max": 3225.5,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.228,
-        "batch_count_mean": 20.0,
-        "frame_loss_pct": 60.13,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2614.4,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.228,
-            "batch_count": 20,
-            "frame_loss_pct": 60.13,
-            "opt_window_samples": 6,
-            "break_fired": false,
-            "rx_bytes": 43176,
-            "rx_bytes_measured": 34776,
-            "tx_bytes": 335872,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T19:52:15",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG15_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG15_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 316,
-              "cmd_nReSent_data": 215,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 5,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 3225.5,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 40604,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 30.74
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 30.74
       },
       "wgn24": {
         "eff_bps_mean": 2967.4,
@@ -3357,50 +2603,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
-        "eff_bps_mean": 2715.7,
-        "eff_bps_min": 2715.7,
-        "eff_bps_max": 2715.7,
+        "eff_bps_mean": 3232.8,
+        "eff_bps_min": 3232.8,
+        "eff_bps_max": 3232.8,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.2829,
-        "batch_count_mean": 27.0,
-        "frame_loss_pct": 38.83,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2715.7,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.2829,
-            "batch_count": 27,
-            "frame_loss_pct": 38.83,
-            "opt_window_samples": 8,
-            "break_fired": false,
-            "rx_bytes": 69048,
-            "rx_bytes_measured": 60648,
-            "tx_bytes": 365568,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T20:04:20",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn22_CFG15_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn22_CFG15_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 499,
-              "cmd_nReSent_data": 122,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 8,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 3232.8,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 40604,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 26.78
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 26.78
       },
       "wgn20": {
         "eff_bps_mean": 2489.2,
@@ -3443,50 +2674,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
-        "eff_bps_mean": 3172.3,
-        "eff_bps_min": 3172.3,
-        "eff_bps_max": 3172.3,
+        "eff_bps_mean": 3223.2,
+        "eff_bps_min": 3223.2,
+        "eff_bps_max": 3223.2,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.1429,
-        "batch_count_mean": 27.0,
-        "frame_loss_pct": 4.67,
+        "sack_rate_mean": 0.0,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 3172.3,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.1429,
-            "batch_count": 27,
-            "frame_loss_pct": 4.67,
-            "opt_window_samples": 8,
-            "break_fired": false,
-            "rx_bytes": 102480,
-            "rx_bytes_measured": 94080,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T20:18:49",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn18_CFG15_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn18_CFG15_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 640,
-              "cmd_nReSent_data": 6,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 5,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 3223.2,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 40604,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 22.79
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 22.79
       },
       "wgn16": {
         "eff_bps_mean": 1925.0,
@@ -3529,17 +2745,18 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     },
     "16": {
       "clean": {
-        "eff_bps_mean": 3635.8,
-        "eff_bps_min": 3635.8,
-        "eff_bps_max": 3635.8,
+        "eff_bps_mean": 4968.4,
+        "eff_bps_min": 4968.4,
+        "eff_bps_max": 4968.4,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 29.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -3547,42 +2764,26 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 3635.8,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 29,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 9,
-            "break_fired": false,
-            "rx_bytes": 122450,
-            "rx_bytes_measured": 110825,
-            "tx_bytes": 398336,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T20:30:54",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG16_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_clean_CFG16_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 820,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 4968.4,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 62610,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 43.58
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 43.58
       },
       "wgn30": {
-        "eff_bps_mean": 3597.4,
-        "eff_bps_min": 3597.4,
-        "eff_bps_max": 3597.4,
+        "eff_bps_mean": 4977.4,
+        "eff_bps_min": 4977.4,
+        "eff_bps_max": 4977.4,
         "eff_bps_sigma": 0.0,
         "sack_rate_mean": 0.0,
-        "batch_count_mean": 29.0,
+        "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
@@ -3590,34 +2791,18 @@
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 3597.4,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 29,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 9,
-            "break_fired": false,
-            "rx_bytes": 122450,
-            "rx_bytes_measured": 110825,
-            "tx_bytes": 393216,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T20:36:57",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG16_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn30_CFG16_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 820,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 4977.4,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 62610,
+            "sack_rate": 0.0,
+            "break_fired": false,
+            "snr3k": 34.66
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 34.66
       },
       "wgn28": {
         "eff_bps_mean": 3608.5,
@@ -3660,50 +2845,35 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn26": {
-        "eff_bps_mean": 3435.0,
-        "eff_bps_min": 3435.0,
-        "eff_bps_max": 3435.0,
+        "eff_bps_mean": 4956.3,
+        "eff_bps_min": 4956.3,
+        "eff_bps_max": 4956.3,
         "eff_bps_sigma": 0.0,
-        "sack_rate_mean": 0.0933,
-        "batch_count_mean": 15.0,
-        "frame_loss_pct": 3.33,
+        "sack_rate_mean": 0.17,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
         "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 3435.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0933,
-            "batch_count": 15,
-            "frame_loss_pct": 3.33,
-            "opt_window_samples": 4,
-            "break_fired": false,
-            "rx_bytes": 43400,
-            "rx_bytes_measured": 31775,
-            "tx_bytes": 313344,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-23T20:49:08",
-            "cmd_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG16_sackv2_r1_cmd.log",
-            "rsp_log": "mercury/effective_rate_table.v9_logs\\sack_lossy_wgn26_CFG16_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 309,
-              "cmd_nReSent_data": 92,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 2,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
+            "eff_bps": 4956.3,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 62444,
+            "sack_rate": 0.17,
+            "break_fired": false,
+            "snr3k": 30.74
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 30.74
       },
       "wgn24": {
         "eff_bps_mean": 3359.4,
@@ -3802,106 +2972,35 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn22": {
-        "eff_bps_mean": 2296.8,
-        "eff_bps_min": 1645.0,
-        "eff_bps_max": 3241.9,
-        "eff_bps_sigma": 684.1,
-        "sack_rate_mean": 0.2085,
-        "batch_count_mean": 24.0,
-        "frame_loss_pct": 19.4,
-        "n_runs": 3,
+        "eff_bps_mean": 5022.7,
+        "eff_bps_min": 5022.7,
+        "eff_bps_max": 5022.7,
+        "eff_bps_sigma": 0.0,
+        "sack_rate_mean": 0.33,
+        "batch_count_mean": 0.0,
+        "frame_loss_pct": 0.0,
+        "n_runs": 1,
         "n_failed_runs": 0,
         "failed": false,
         "break_fired": false,
         "runs": [
           {
-            "eff_bps": 2003.6,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.4156,
-            "batch_count": 32,
-            "frame_loss_pct": 46.73,
-            "opt_window_samples": 10,
-            "break_fired": false,
-            "rx_bytes": 77810,
-            "rx_bytes_measured": 70370,
-            "tx_bytes": 0,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
+            "run_idx": 1,
             "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T02:28:41",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG16_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG16_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 599,
-              "cmd_nReSent_data": 166,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 10,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 3241.9,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.21,
-            "batch_count": 28,
-            "frame_loss_pct": 11.47,
-            "opt_window_samples": 9,
+            "eff_bps": 5022.7,
+            "eff_bps_source": "steady_state",
+            "rx_bytes": 63274,
+            "sack_rate": 0.33,
             "break_fired": false,
-            "rx_bytes": 82150,
-            "rx_bytes_measured": 74400,
-            "tx_bytes": 360448,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T02:34:14",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG16_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG16_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 588,
-              "cmd_nReSent_data": 106,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 5,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 1645.0,
-            "eff_bps_source": "opt_window",
-            "sack_rate": 0.0,
-            "batch_count": 12,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 3,
-            "break_fired": false,
-            "rx_bytes": 15500,
-            "rx_bytes_measured": 7750,
-            "tx_bytes": 294912,
-            "duration_s": 300.0,
-            "measured_s": 270.0,
-            "connected": true,
-            "error": null,
-            "timestamp": "2026-05-24T02:39:45",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG16_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn22_CFG16_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 130,
-              "cmd_nReSent_data": 195,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
+            "snr3k": 26.78
           }
-        ]
+        ],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 26.78
       },
       "wgn20": {
         "eff_bps_mean": 797.0,
@@ -4000,7 +3099,8 @@
             },
             "run_idx": 3
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       },
       "wgn18": {
         "eff_bps_mean": 0.0,
@@ -4011,95 +3111,12 @@
         "batch_count_mean": 0.0,
         "frame_loss_pct": 0.0,
         "n_runs": 0,
-        "n_failed_runs": 3,
+        "n_failed_runs": 1,
         "failed": true,
-        "break_fired": false,
-        "runs": [
-          {
-            "eff_bps": 0.0,
-            "eff_bps_source": "tcp_bytes",
-            "sack_rate": 0.0,
-            "batch_count": 0,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 0,
-            "break_fired": false,
-            "rx_bytes": 0,
-            "rx_bytes_measured": 0,
-            "tx_bytes": 0,
-            "duration_s": 0,
-            "measured_s": 0,
-            "connected": false,
-            "error": "connect_failed: 'BUFFER 2484\\rBUFFER 10676\\rBUFFER 18868\\rBUFFER 27060\\rBUFFER 35252\\rBUFFER 43444\\rBUFFER 51636\\rBUFFER 59828\\rBUFFER 68020\\rBUFFER 76212\\rBUFFER 84404\\rBUFFER 92596\\rBUFFE'",
-            "timestamp": "2026-05-24T02:08:42",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG16_sackv2_r1_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG16_sackv2_r1_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 0,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 1
-          },
-          {
-            "eff_bps": 0.0,
-            "eff_bps_source": "tcp_bytes",
-            "sack_rate": 0.0,
-            "batch_count": 0,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 0,
-            "break_fired": false,
-            "rx_bytes": 0,
-            "rx_bytes_measured": 0,
-            "tx_bytes": 0,
-            "duration_s": 0,
-            "measured_s": 0,
-            "connected": false,
-            "error": "connect_failed: 'BUFFER 2484\\rBUFFER 10676\\rBUFFER 18868\\rBUFFER 27060\\rBUFFER 35252\\rBUFFER 43444\\rBUFFER 51636\\rBUFFER 59828\\rBUFFER 68020\\rBUFFER 76212\\rBUFFER 84404\\rBUFFER 92596\\rBUFFE'",
-            "timestamp": "2026-05-24T02:09:36",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG16_sackv2_r2_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG16_sackv2_r2_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 0,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 2
-          },
-          {
-            "eff_bps": 0.0,
-            "eff_bps_source": "tcp_bytes",
-            "sack_rate": 0.0,
-            "batch_count": 0,
-            "frame_loss_pct": 0.0,
-            "opt_window_samples": 0,
-            "break_fired": false,
-            "rx_bytes": 0,
-            "rx_bytes_measured": 0,
-            "tx_bytes": 0,
-            "duration_s": 0,
-            "measured_s": 0,
-            "connected": false,
-            "error": "connect_failed: 'BUFFER 8192\\rBUFFER 16384\\rBUFFER 24576\\rBUFFER 32768\\rBUFFER 40960\\rBUFFER 49152\\rBUFFER 57344\\rBUFFER 65536\\rBUFFER 73728\\rBUFFER 81920\\rBUFFER 90112\\rBUFFER 98304\\rBUFFE'",
-            "timestamp": "2026-05-24T02:10:18",
-            "cmd_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG16_sackv2_r3_cmd.log",
-            "rsp_log": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck_logs\\sack_lossy_wgn18_CFG16_sackv2_r3_rsp.log",
-            "mech_summary": {
-              "cmd_nSent_data": 0,
-              "cmd_nReSent_data": 0,
-              "cmd_nLost_data": 0,
-              "n_cmd_sack_events": 0,
-              "cmd_retx_frames_total": 0,
-              "gearshift_lines": 0
-            },
-            "run_idx": 3
-          }
-        ]
+        "break_fired": true,
+        "runs": [],
+        "recal_source": "qtable_20260801_freshcell",
+        "recal_snr3k": 22.79
       },
       "wgn16": {
         "eff_bps_mean": 0.0,
@@ -4142,7 +3159,8 @@
             },
             "run_idx": 1
           }
-        ]
+        ],
+        "recal_source": "retained_68e61e1"
       }
     }
   },
@@ -4152,5 +3170,8 @@
   "total_runtime_s": 26281.6,
   "total_rx_bytes": 3526265,
   "finished": "20260523_212020",
-  "merged_with_spotcheck": "C:/Users/kamer/AppData/Local/Temp/v9_targeted_spotcheck.json"
+  "recal_note": "PARTIAL recal 2026-08-01: 32 above-floor cells (cfg9,11,12,13,14,15,16 x clean/wgn30/wgn26/wgn22/wgn18) re-measured on head 8da6735b8 bin md5 0ac6b0945400bf95004f2cb0bf97aecc, campaign real-audio harness, optimizer-disabled pinned cells, steady_state.bps net, n=1/cell. cfg9 wgn26/wgn22 use connect-flake reruns. Retained from 68e61e1: cfg6 (all), and channels wgn28/wgn24/wgn20/wgn16 (not re-measured). cfg16 wgn18 = collapse (9 breaks) -> failed, matches incumbent.",
+  "recal_fresh_cells": 35,
+  "recal_rerun_folded": 2,
+  "prior_head": "68e61e1"
 }
