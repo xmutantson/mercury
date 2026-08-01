@@ -940,23 +940,38 @@ int cl_arq_controller::apply_cfg16_margin_cap(int proposed) const
 }
 
 // ── Per-rung MEASURED election floor gate (generalizes apply_cfg16_margin_cap) ─────────────
-// Meter-referred per-rung floor: compared against measurements.SNR_uplink (the SAME suffix meter
-// the cfg16 gate + the SUCCESS_BASED climb trust). Each entry = measured 8/8 static floor
-// (CANONICAL_NUMBERS.md §7 + §7-ADDENDUM, snr3k true units, refuter-recomputed bin 982ac639)
-// + 1.5 dB hold margin (one sweep-step / one 8/8->0/8 bracket) + suffix-meter correction (the
-// meter over-reads +2.2 on the ~<=14.5 EVM-saturation plateau, tapering to ~0 at the ~19.5 dB
-// zero-crossing). cfg0..cfg8 are ungated (-90 sentinel: the low rungs decode deep, so the gate is
-// the identity on the OFDM-entry / robust re-climb path -> byte-identical). cfg16/cfg17 are deferred
-// to the CFG16_MIN_SNR_DB gate; RUNG_MIN_SNR_METER[16] mirrors it so the J0 version assert pins the
-// meter calibration. cfg10 (floor 11.6) is DOMINATED by cfg11 (floor 11.3) so cfg11's row (15.0) is
-// below cfg10's (15.3) — an intentional inversion the apply cap's walk handles (lands cfg11 first).
-// cfg14/cfg15 rows are UNCERTAIN (±2-3 dB, the meter's zero-crossing) and validated by the 15/18-dB
-// no-regression cohort gate; the failure memory below is the runtime hedge if a row is optimistic.
+// Meter-referred OFDM-entry floor: compared against measurements.SNR_uplink (the SAME suffix meter
+// the cfg16 gate + the SUCCESS_BASED climb trust). CAL VERSION 2 — recalibrated against the LIVE
+// in-transfer meter measured on the anchor cohort (per-cell CMD meter samples, WGN anchors, clean-
+// decode steady state), NOT the static passband floors.
+//
+// What the cohort measured, at the config the elevator actually decides from:
+//   true 13 -> meter 11 | 14.8 -> 13 | 18 -> 15 | 24.79 -> 17..23 | 28 -> 25
+// i.e. the meter UNDER-reads true by ~2-3 dB in the clean-decode regime and is quantized to ~2 dB
+// integer steps. The cal-v1 "+2.2 over-read" correction had the WRONG SIGN and set the cfg12..cfg15
+// rows too HIGH: the cohort lost the incumbent's cfg15 completions at 18 dB and over-capped 2/8
+// cells at 24.79. The meter's +25 spikes are a STALE-HIGH artifact that appears only AFTER a rung
+// over-elects and its ACKs stop decoding (a fade freeze) — not a clean read, so it cannot be gated.
+//
+// The meter's spread in the 18-25 dB band is too wide to finely discriminate cfg14/cfg15/cfg16
+// (p10..p90 spans ~10 dB), so the rows are BAND-LIMITED to where the meter is a reliable
+// discriminator: a single OFDM-entry threshold on cfg9..cfg13 at meter 14.0 — placed cleanly on
+// the quantization grid between the true-14.8 read of 13 and the true-18 read of 15. Below meter
+// 14 the whole gated band is refused and the link holds the honest low config (this kills the wb13
+// over-election storm and the 14.8 catastrophic cfg15 stall — the meter never climbs into the
+// stale-high region, byte-identical to cal-v1 at those anchors). At/above meter 14 the band opens
+// and the incumbent get_configuration + the cfg16 decode-margin gate pick the rung (this restores
+// the 18/24.79 climb that cal-v1 over-capped). cfg14/cfg15 are DEFERRED to those gates (ungated
+// -90 row) because a per-rung meter floor there is unreliable at the measured spread. cfg16 keeps
+// CFG16_MIN_SNR_DB (empirically vindicated, itself live-meter-calibrated); RUNG_MIN_SNR_METER[16]
+// mirrors it so the J0 version assert pins the calibration. cfg0..cfg8 are ungated (low rungs
+// decode deep -> identity on the OFDM-entry / robust re-climb path). The failure memory below is
+// the runtime hedge if a gated row is optimistic on a non-WGN channel.
 static const double RUNG_MIN_SNR_METER[NUMBER_OF_CONFIGS] = {
 	/* 0*/ -90.0, /* 1*/ -90.0, /* 2*/ -90.0, /* 3*/ -90.0, /* 4*/ -90.0,
 	/* 5*/ -90.0, /* 6*/ -90.0, /* 7*/ -90.0, /* 8*/ -90.0,
-	/* 9*/  14.1, /*10*/  15.3, /*11*/  15.0, /*12*/  16.9, /*13*/  16.9,
-	/*14*/  18.6, /*15*/  19.5, /*16*/  22.0, /*17*/  22.0
+	/* 9*/  14.0, /*10*/  14.0, /*11*/  14.0, /*12*/  14.0, /*13*/  14.0,
+	/*14*/ -90.0, /*15*/ -90.0, /*16*/  22.0, /*17*/  22.0
 };
 
 double cl_arq_controller::rung_floor_min_meter(int cfg)
@@ -979,8 +994,11 @@ bool cl_arq_controller::rung_floor_ok(int cfg) const
 	if(cfg < CONFIG_9) return true;                           // low OFDM rungs ungated (decode deep)
 	if(cfg < 0 || cfg >= NUMBER_OF_CONFIGS) return true;      // out of range (robust) -> ungated
 	if(cfg == CONFIG_17) return true;                         // top-gear (default-off) not gated here
-	// cfg9..cfg16 gated at the meter-referred floor. cfg16's row == CFG16_MIN_SNR_DB, so this AGREES
-	// with the d2b473d cfg16 gate (both never-raise) and makes the cap composition order-independent.
+	// cfg9..cfg13 gated at the meter-referred OFDM-entry floor (cal v2). cfg14/cfg15 carry the -90
+	// ungated row (deferred to get_configuration + the cfg16 gate — a per-rung meter floor there is
+	// unreliable at the measured spread), so this returns true for them. cfg16's row ==
+	// CFG16_MIN_SNR_DB, so it AGREES with the cfg16 decode-margin gate (both never-raise) and keeps
+	// the cap composition order-independent.
 	double bump = rung_floor_bump_db[cfg];
 	return snr > RUNG_MIN_SNR_METER[cfg] + bump;
 }
@@ -10995,45 +11013,65 @@ int cl_arq_controller::test_rung_floor_gate()
 	floor_cap_fires = 0;
 	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
 
-	// ── T5: J0 version / meter-cal pin / table monotonicity ─────────────────────────────────
+	// ── T5: J0 version / meter-cal pin / cal-v2 band-gate structure ──────────────────────────
 	check((double)CFG16_MIN_SNR_DB == 22.0, "T5 J0: CFG16_MIN_SNR_DB == 22.0");
 	check(rung_floor_min_meter(CONFIG_16) == CFG16_MIN_SNR_DB,
 		"T5 J0: RUNG_MIN_SNR_METER[16] == CFG16_MIN_SNR_DB (meter-cal pin)");
-	check(RUNG_FLOOR_METER_CAL_VERSION == 1, "T5 J0: meter-cal version pinned == 1");
-	bool mono =
-		rung_floor_min_meter(CONFIG_9)  <= rung_floor_min_meter(CONFIG_10) &&
-		rung_floor_min_meter(CONFIG_9)  <= rung_floor_min_meter(CONFIG_11) &&
-		rung_floor_min_meter(CONFIG_11) <= rung_floor_min_meter(CONFIG_12) &&
-		rung_floor_min_meter(CONFIG_10) <= rung_floor_min_meter(CONFIG_12) &&
-		rung_floor_min_meter(CONFIG_12) <= rung_floor_min_meter(CONFIG_13) &&
-		rung_floor_min_meter(CONFIG_13) <= rung_floor_min_meter(CONFIG_14) &&
-		rung_floor_min_meter(CONFIG_14) <= rung_floor_min_meter(CONFIG_15) &&
-		rung_floor_min_meter(CONFIG_15) <= rung_floor_min_meter(CONFIG_16);
-	check(mono, "T5: table monotone (cfg10>cfg11 domination exception)");
+	check(RUNG_FLOOR_METER_CAL_VERSION == 2, "T5 J0: meter-cal version pinned == 2");
+	// cal-v2 STRUCTURE: cfg9..cfg13 is a single OFDM-entry band-gate at meter 14.0 (non-decreasing,
+	// all rows equal); cfg14/cfg15 carry the ungated -90 row (deferred to get_configuration + the
+	// cfg16 gate); cfg16 == CFG16_MIN_SNR_DB. A future recalibration must bump the version above.
+	bool low_band_gate =
+		rung_floor_min_meter(CONFIG_9)  == 14.0 &&
+		rung_floor_min_meter(CONFIG_10) == 14.0 &&
+		rung_floor_min_meter(CONFIG_11) == 14.0 &&
+		rung_floor_min_meter(CONFIG_12) == 14.0 &&
+		rung_floor_min_meter(CONFIG_13) == 14.0;
+	check(low_band_gate, "T5: cfg9..cfg13 OFDM-entry band-gate == meter 14.0 (non-decreasing)");
+	bool mid_deferred =
+		rung_floor_min_meter(CONFIG_14) <= -90.0 &&
+		rung_floor_min_meter(CONFIG_15) <= -90.0;
+	check(mid_deferred, "T5: cfg14/cfg15 ungated (deferred to get_configuration + cfg16 gate)");
+	// The low band never sits above the cfg16 gate: an OFDM-entry threshold below the cfg16 floor.
+	check(rung_floor_min_meter(CONFIG_13) < rung_floor_min_meter(CONFIG_16),
+		"T5: OFDM-entry band-gate (14.0) below the cfg16 floor (22.0)");
 
-	// ── T1: the wb13 reproducer — fail-before / pass-after on the ELECTION cap ───────────────
-	// At true snr3k +13 the suffix meter over-reads to ~15.2; the incumbent elects
-	// get_configuration(15.2 - SUPERSHIFT_MARGIN_DB=6.0) = get_configuration(9.2) = CONFIG_14
-	// (telecom_system.cc SNR>9 -> CONFIG_14). cfg14's MEASURED 8/8 floor is 16.4 (0/8 @13.4), so
-	// cfg14 @+13 is below floor -> BREAK storm -> the deterministic 2830-B stall.
-	measurements.SNR_uplink = 15.2;
+	// ── T1: cal-v2 fail-before / pass-after on the ELECTION cap (live-meter anchors) ──────────
+	// wb13 (snr3k +13): the LIVE in-transfer meter reads 11 at the config the elevator decides
+	// from. The incumbent lets the link climb into cfg13, where the meter stale-highs and over-
+	// elects cfg14 (measured 8/8 floor 16.4, 0/8 @13.4) -> BREAK storm -> the 2830-B stall. The
+	// cal-v2 band-gate refuses the whole OFDM band below meter 14, walking any gated proposal down
+	// to cfg8 so the link holds the honest low config and never enters the stale-high region.
+	measurements.SNR_uplink = 11.0;                 // live wb13 meter
 	setenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT", "1", 1);
-	check(apply_rung_floor_cap(CONFIG_14) == CONFIG_14,
-		"T1 FAIL-BEFORE: defeat env -> cfg14 elected at meter 15.2 (the stall)");
+	check(apply_rung_floor_cap(CONFIG_13) == CONFIG_13,
+		"T1 FAIL-BEFORE: defeat env -> cfg13 admitted at wb13 meter 11 (the climb into the stall)");
 	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
 	long long fires_before = floor_cap_fires;
-	int capped = rung_floor_cap_fire(CONFIG_14);
-	check(capped == CONFIG_11, "T1 PASS-AFTER: gate caps cfg14 -> cfg11 at meter 15.2");
+	int capped = rung_floor_cap_fire(CONFIG_13);
+	check(capped == CONFIG_8, "T1 PASS-AFTER: band-gate caps cfg13 -> cfg8 at wb13 meter 11");
 	check(floor_cap_fires == fires_before + 1, "T1 PASS-AFTER: floor_cap_fires 0 -> 1 (fire proof)");
+	// 14.8 (the proven anti-stall win, PRESERVED): meter 13 is still below the OFDM-entry gate, so
+	// the link holds the honest low config exactly as cal-v1 (byte-identical at this anchor).
+	measurements.SNR_uplink = 13.0;                 // live 14.8 meter
+	check(apply_rung_floor_cap(CONFIG_13) == CONFIG_8,
+		"T1 PRESERVE: 14.8 meter 13 still caps the OFDM band to cfg8 (proven win unchanged)");
+	// 18 (the cal-v1 REGRESSION, RECOVERED): meter 15 clears the OFDM-entry gate, so the band opens
+	// and cfg13 + the deferred cfg15 pass through where cal-v1 (floors 16.9 / 19.5) over-capped them.
+	measurements.SNR_uplink = 15.0;                 // live 18 meter
+	check(apply_rung_floor_cap(CONFIG_13) == CONFIG_13,
+		"T1 RECOVER: 18 meter 15 admits cfg13 (OFDM band opens)");
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_15,
+		"T1 RECOVER: 18 meter 15 admits cfg15 (mid band deferred, not over-capped)");
 
 	// ── T2: never-raise + a below-floor SNR can never ELEVATE a rung + composition ───────────
 	bool never_raise = true;
 	for(int c = CONFIG_0; c <= CONFIG_16; c++)
 		if(config_ladder_index(apply_rung_floor_cap(c)) > config_ladder_index(c)) never_raise = false;
 	check(never_raise, "T2: apply_rung_floor_cap never RAISES a target (any rung, meter 15.2)");
-	measurements.SNR_uplink = 12.0;   // below cfg9's floor (14.1)
+	measurements.SNR_uplink = 12.0;   // below the OFDM-entry band-gate (14.0)
 	check(config_ladder_index(apply_rung_floor_cap(CONFIG_13)) <= config_ladder_index(CONFIG_8),
-		"T2: below-floor meter (12.0) caps cfg13 down to <= cfg8 (no elevation)");
+		"T2: below-gate meter (12.0) caps cfg13 down to <= cfg8 (no elevation)");
 	measurements.SNR_uplink = 15.2;
 	int ab = apply_rung_floor_cap(apply_cfg16_margin_cap(CONFIG_16));
 	int ba = apply_cfg16_margin_cap(apply_rung_floor_cap(CONFIG_16));
@@ -11054,14 +11092,14 @@ int cl_arq_controller::test_rung_floor_gate()
 
 	// ── T3: failure memory — arm / survive erasure sites / decay / decay-gate / reset ────────
 	rung_floor_memory_reset();
-	measurements.SNR_uplink = 17.0;   // clears cfg13's static floor (16.9) -> table ADMITS cfg13
-	check(rung_floor_ok(CONFIG_13), "T3 pre: table admits cfg13 at meter 17.0");
+	measurements.SNR_uplink = 15.0;   // clears cfg13's band-gate (14.0) -> table ADMITS cfg13
+	check(rung_floor_ok(CONFIG_13), "T3 pre: table admits cfg13 at meter 15.0");
 	rung_floor_note_break(CONFIG_13);
 	check(rung_floor_bump_db[CONFIG_13] == 0.0, "T3 arm: 1 break -> no bump yet");
 	rung_floor_note_break(CONFIG_13);
 	rung_floor_note_break(CONFIG_13);
 	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB, "T3 arm: 3 breaks -> +1.5 bump");
-	check(!rung_floor_ok(CONFIG_13), "T3 arm: bump raised cfg13's floor (17.0 now refused)");
+	check(!rung_floor_ok(CONFIG_13), "T3 arm: bump raised cfg13's floor (14.0->15.5, meter 15.0 now refused)");
 	// SURVIVE erasure site 1 (the :7945 proven-ceiling wipe).
 	supershift_proven_ceiling = CONFIG_16;
 	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB,
