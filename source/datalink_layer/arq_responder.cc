@@ -1583,23 +1583,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 									// cumulative n_r (+ the clean-bitmap width for the MFSK-suffix fallback) so a
 									// later boundary emits it EXACTLY ONCE via a bsi-carrying transport.
 									// MERCURY_PENDING_CONFIRM_DEFEAT=1 restores the base drop (fail-before).
-									{
-										bool pending_confirm_defeat = false;
-										const char* e = std::getenv("MERCURY_PENDING_CONFIRM_DEFEAT");
-										if(e && *e && atoi(e)!=0) pending_confirm_defeat = true;
-										if(!pending_confirm_defeat)
-										{
-											linkphase_pending_prev_confirm = true;
-											linkphase_pending_prev_bsi = (int)cumulative_ack_bsi_field(
-												prev_ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
-											linkphase_pending_prev_window = prev_eff_window;
-											printf("[LINKPHASE-PENDING-ARM] deferred prev clean-confirm armed: "
-												"n_r=%d window=%d last_delivered=%d\n",
-												linkphase_pending_prev_bsi, linkphase_pending_prev_window,
-												rsp_last_delivered_batch_seq_id);
-											fflush(stdout);
-										}
-									}
+									linkphase_arm_pending_prev_confirm(prev_ack_bsi, prev_eff_window);
 								}
 								bool prev_used_mfsk_path = false;
 								if (!linkphase_defer_prev_ack
@@ -1876,49 +1860,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 		// covering ACK-gate emit to ride, so flush it exactly once here.
 		else if(linkphase_pending_prev_confirm)
 		{
-			unsigned char flush_bsi = (unsigned char)(
-				linkphase_pending_prev_bsi >= 0 ? linkphase_pending_prev_bsi : 0);
-			ack_tx_retx_turnaround = true;   // retransmit turnaround: arm the D2 settle
-			long long mfsk_ms = 0;
-			bool compact_sent = false;
-			if(scalable_sack_on()
-			   && telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0)
-			{
-				mfsk_ms = send_mfsk_compact_confirm(flush_bsi);
-				compact_sent = mfsk_ms > 0;
-			}
-			if(mfsk_ms <= 0
-			   && MFSK_ACK_SACK_ENABLED
-			   && telecom_system->ack_mfsk.ack_sack_suffix_len() > 0)
-			{
-				int wnd = linkphase_pending_prev_window > 0
-					? linkphase_pending_prev_window : data_batch_size;
-				mfsk_ms = send_mfsk_ack_sack(flush_bsi, mfsk_sack_mask_for_frames(wnd));
-			}
-			if(mfsk_ms > 0)
-			{
-				printf("[LINKPHASE-PENDING-FLUSH] deferred prev n_r=%d flushed via %s "
-					"wire_ms=%lld (empty-current boundary)\n",
-					linkphase_pending_prev_bsi,
-					compact_sent ? "COMPACT confirm" : "MFSK suffix", mfsk_ms);
-				fflush(stdout);
-				linkphase_pending_prev_flushed++;
-			}
-			else
-			{
-				// R1: only a bsi-less legacy pattern is available (NB). At THIS first
-				// boundary the pending prev is still the freshest outstanding batch, so a
-				// bare pattern credits it correctly; emit once then clear unconditionally
-				// (never re-flush a bsi-less pattern for a now-stale prev).
-				send_ack_pattern();
-				linkphase_pending_prev_flushed++;
-				printf("[LINKPHASE-PENDING-FLUSH] deferred prev n_r=%d flushed via legacy "
-					"pattern (NB first-boundary)\n", linkphase_pending_prev_bsi);
-				fflush(stdout);
-			}
-			linkphase_pending_prev_confirm = false;
-			linkphase_pending_prev_bsi = -1;
-			linkphase_pending_prev_window = -1;
+			linkphase_flush_pending_prev_confirm();
 		}
 
 		receiving_timer.stop();
@@ -3353,16 +3295,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			{
 				unsigned char emitted_nr = cumulative_ack_bsi_field(
 					ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
-				if(linkphase_pending_confirm_covers((int)emitted_nr))
-				{
-					printf("[LINKPHASE-PENDING-COVERED] deferred prev n_r=%d covered by "
-						"emitted n_r=%u; clearing pending without re-emit\n",
-						linkphase_pending_prev_bsi, (unsigned)emitted_nr);
-					fflush(stdout);
-					linkphase_pending_prev_confirm = false;
-					linkphase_pending_prev_bsi = -1;
-					linkphase_pending_prev_window = -1;
-				}
+				linkphase_clear_pending_if_covered(emitted_nr);
 			}
 		}
 		else
@@ -15306,6 +15239,195 @@ int cl_arq_controller::test_batch_shrink_orphan_current()
 	fflush(stdout);
 	return fails==0 ? 0 : 1;
 }
+
+// CLI: --test-linkphase-pending-confirm  (env MERCURY_PENDING_CONFIRM_DEFEAT=1 restores
+//                                         the base drop on the SAME binary)
+//
+// SEAM-2 (cfg16 deferred prev-confirm + boundary flush) fire proof. THE MISS: an UNMARKED
+// previous-batch completion under the ACK-slot feature DEFERS its clean confirm
+// (linkphase_defer_prev_ack true: ack-slot on, no proven selective-retry turn tail); the
+// base only bumps linkphase_prev_ack_deferred and emits NOTHING, so the CMD closes its ACK
+// slot with no ACK = a false block failure (the prev-only 'seed106' topology of the SEAM-2
+// data-flow audit -- an idle boundary with no current receive work).
+//
+// The fix ARMS a pending confirm at that deferral, then EMITS it exactly once at a later
+// boundary: FLUSH-A (a covering cumulative n_r ACK retires it for free) or FLUSH-B (the
+// RX-timeout with no current work flushes it via a bsi-carrying transport). This test drives
+// the REAL emit path: the prev batch is DELIVERED byte-exact through the production
+// copy_data_to_buffer reassembler (not a high-water poke), then the REAL
+// linkphase_arm_pending_prev_confirm / linkphase_clear_pending_if_covered /
+// linkphase_flush_pending_prev_confirm members (the same functions the RSP pump calls) fire
+// on this binary. The deferral is decided by the REAL linkphase_defer_prev_ack primitive; the
+// pending bsi by the REAL cumulative_ack_bsi_field; the covers-clear by the REAL
+// cumulative_ack_covers. The full process_messages_rx_data_control() cannot be invoked
+// in-process (it needs live modem TX state), so the emit members are factored out and driven
+// directly -- the fail-before/pass-after is a real behavior change, not a simulation.
+//   pass-after (default): [LINKPHASE-PENDING-ARM] arms; [LINKPHASE-PENDING-COVERED] retires
+//     it on a covering n_r; [LINKPHASE-PENDING-FLUSH] emits it (counter 0->1) at the empty
+//     boundary; the prev bytes are byte-exact.
+//   fail-before (DEFEAT=1): the arm is suppressed -> pending stays clear -> no covered, no
+//     flush (counter stays 0) -> the deferred confirm is DROPPED (the base miss) even though
+//     the prev bytes still delivered.
+// Returns 0=PASS, 1=FAIL. Default builds never call this.
+int cl_arq_controller::test_linkphase_pending_confirm_fire()
+{
+	const char* TAG = "[TEST-LINKPHASE-PENDING]";
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_PENDING_CONFIRM_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	printf("%s start (MERCURY_PENDING_CONFIRM_DEFEAT=%d)\n", TAG, defeat?1:0);
+	fflush(stdout);
+	int fails = 0;
+	auto ck = [&](bool c, const char* w){
+		printf("%s %s: %s\n", TAG, c?"PASS":"FAIL", w);
+		if(!c) fails++;
+		fflush(stdout);
+	};
+	auto putenv_kv = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v ? v : "");
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+
+	// --- scaffold ---
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	if(init_messages_buffers() != SUCCESSFUL)
+	{ printf("%s ERROR: init_messages_buffers failed\n", TAG); return 1; }
+	this->fifo_buffer_rx.set_size(262144);
+	this->fifo_buffer_rx.flush();
+	this->sack_v2_enabled        = true;
+	this->sack_enabled           = true;
+	this->current_configuration  = 0;
+	this->compression_enabled    = false;
+	this->encryption_enabled     = false;
+	this->passive_monitor        = true;   // FLUSH-B legacy leg: send_ack_pattern() is a no-op
+	this->link_status            = CONNECTED;
+	this->connection_status      = RECEIVING;
+	this->cumulative_ack_enabled = true;   // negotiated cap: cumulative-n_r confirm semantics live
+	this->rx_buffer_retx_turn_tail = false; // UNMARKED prev: no proven selective-retry tail (seed106)
+	this->telecom_system         = NULL;   // ARM + COVERED legs are telecom-free (as the shrink test)
+
+	const int WND = 6, L = 16;
+	this->data_batch_size = WND;
+
+	// Seat a COMPLETE prev batch in messages_rx_prev[]: slot i carries L copies of (base+i).
+	auto seat_prev = [&](int bsi, unsigned char base){
+		for(int i=0;i<this->nMessages;i++){
+			messages_rx[i].status=FREE; messages_rx[i].length=0; messages_rx[i].batch_seq_id=-1;
+			messages_rx_prev[i].status=FREE; messages_rx_prev[i].length=0; messages_rx_prev[i].batch_seq_id=-1;
+		}
+		for(int i=0;i<WND;i++){
+			messages_rx_prev[i].type            = DATA_SHORT;
+			messages_rx_prev[i].id              = (char)(unsigned char)i;
+			messages_rx_prev[i].length          = L;
+			for(int j=0;j<L;j++) messages_rx_prev[i].data[j] = (char)(unsigned char)(base+i);
+			messages_rx_prev[i].status          = RECEIVED;
+			messages_rx_prev[i].batch_seq_id    = bsi;
+			messages_rx_prev[i].sequence_number = (char)(unsigned char)i;
+		}
+		this->rsp_prev_batch_seq_id         = bsi;
+		this->rsp_prev_batch_active         = true;
+		this->rsp_prev_batch_received_count = WND;
+		this->rsp_prev_batch_expected_count = WND;
+		this->rx_stream_emitted_bsi_hw      = -1;   // reset the emit de-dup for the test rig
+	};
+
+	// Deliver the seated prev batch through the REAL reassembler; verify byte-exact.
+	auto deliver_prev = [&](unsigned char base)->bool{
+		struct st_message* saved = messages_rx;
+		messages_rx = messages_rx_prev;
+		for(int i=0;i<WND && i<this->nMessages;i++)
+			if(messages_rx[i].status==RECEIVED) messages_rx[i].status=ACKED;
+		this->decrypt_delivered_bsi = this->rsp_prev_batch_seq_id;
+		copy_data_to_buffer();
+		messages_rx = saved;
+		for(int i=0;i<this->nMessages;i++) messages_rx_prev[i].status=FREE;
+		advance_last_delivered(this->rsp_prev_batch_seq_id);
+		this->rsp_prev_batch_active=false;
+		unsigned char exp[WND*L]; for(int i=0;i<WND;i++) for(int j=0;j<L;j++) exp[i*L+j]=(unsigned char)(base+i);
+		unsigned char got[WND*L];
+		int popped=this->fifo_buffer_rx.pop((char*)got,(int)sizeof(got));
+		bool ok=(popped==WND*L); for(int b=0;b<popped && ok;b++) if(got[b]!=exp[b]) ok=false;
+		return ok;
+	};
+
+	// The production deferral+arm sequence: REAL defer primitive, then the REAL ARM member.
+	auto defer_and_arm = [&](int bsi){
+		bool defer = linkphase_defer_prev_ack(linkphase_ackslot_on(), this->rx_buffer_retx_turn_tail);
+		if(defer){
+			this->linkphase_prev_ack_deferred++;
+			linkphase_arm_pending_prev_confirm((unsigned char)bsi, WND);
+		}
+		return defer;
+	};
+
+	long flushed0 = this->linkphase_pending_prev_flushed;
+
+	// ====== LEG 1: ARM + FLUSH-A (covering cumulative n_r) ======
+	const int BSI1 = 7;
+	this->rsp_last_delivered_batch_seq_id   = (BSI1 - 1) & 0xFF;   // contiguous
+	this->rsp_current_expected_batch_seq_id = BSI1;
+	seat_prev(BSI1, 0xA0);
+	bool bytes1 = deliver_prev(0xA0);
+	ck(bytes1, "LEG1 delivery: prev batch bytes byte-exact via copy_data_to_buffer (real reassembler)");
+	ck(this->rsp_last_delivered_batch_seq_id==BSI1, "LEG1 delivery: high-water advanced to the delivered bsi");
+	this->linkphase_pending_prev_confirm=false; this->linkphase_pending_prev_bsi=-1; this->linkphase_pending_prev_window=-1;
+	bool defer1 = defer_and_arm(BSI1);
+	ck(defer1, "LEG1 gate: linkphase_defer_prev_ack fires (ack-slot on, unproven retx tail) -- the unmarked-prev defer");
+	if(!defeat){
+		ck(this->linkphase_pending_prev_confirm, "LEG1 ARM: pending prev-confirm ARMED (base dropped it)");
+		ck(this->linkphase_pending_prev_bsi==BSI1, "LEG1 ARM: pending n_r == delivered high-water");
+		unsigned char emitted_nr = cumulative_ack_bsi_field((unsigned char)BSI1, this->rsp_last_delivered_batch_seq_id, this->cumulative_ack_enabled);
+		linkphase_clear_pending_if_covered(emitted_nr);
+		ck(!this->linkphase_pending_prev_confirm, "LEG1 COVERED: covering cumulative n_r retired the pending (no re-emit)");
+	} else {
+		ck(!this->linkphase_pending_prev_confirm, "LEG1 FAIL-BEFORE: arm SUPPRESSED -- deferred confirm DROPPED (base miss, CMD gets no ACK)");
+	}
+
+	// ====== LEG 2: ARM + FLUSH-B (empty-boundary flush, counter 0->1) ======
+	const int BSI2 = 8;
+	this->rsp_current_expected_batch_seq_id = BSI2;
+	seat_prev(BSI2, 0xC0);
+	bool bytes2 = deliver_prev(0xC0);
+	ck(bytes2, "LEG2 delivery: second prev batch byte-exact via copy_data_to_buffer");
+	this->linkphase_pending_prev_confirm=false; this->linkphase_pending_prev_bsi=-1; this->linkphase_pending_prev_window=-1;
+	defer_and_arm(BSI2);
+	if(!defeat){
+		ck(this->linkphase_pending_prev_confirm, "LEG2 ARM: pending re-armed for the empty-boundary flush");
+		// FLUSH-B: RX-timeout with NO current receive work (get_nReceived_messages()==0). Force the
+		// legacy no-op transport (passive_monitor + scalable-off) so the emit counter/print fire
+		// without live modem TX. A valid telecom_system is required only for the suffix-len probes.
+		cl_telecom_system ts;
+		this->telecom_system = &ts;
+		putenv_kv("MERCURY_SCALABLE_SACK", "0");
+		printf("%s PROBE: passive_monitor=%d scalable_sack_on=%d compact_suffix=%d ack_sack_suffix=%d nRxNow=%d\n",
+			TAG, this->passive_monitor?1:0, scalable_sack_on()?1:0,
+			this->telecom_system->ack_mfsk.compact_confirm_suffix_len(),
+			this->telecom_system->ack_mfsk.ack_sack_suffix_len(),
+			get_nReceived_messages());
+		fflush(stdout);
+		long fb_before = this->linkphase_pending_prev_flushed;
+		linkphase_flush_pending_prev_confirm();
+		putenv_kv("MERCURY_SCALABLE_SACK", "");
+		this->telecom_system = NULL;   // do not dangle the stack ts
+		ck(this->linkphase_pending_prev_flushed==fb_before+1, "LEG2 FLUSH-B: boundary flush counter 0->1 (deferred confirm emitted, not dropped)");
+		ck(!this->linkphase_pending_prev_confirm, "LEG2 FLUSH-B: pending cleared after the boundary flush");
+	} else {
+		ck(!this->linkphase_pending_prev_confirm, "LEG2 FAIL-BEFORE: arm SUPPRESSED -- no pending to flush");
+		ck(this->linkphase_pending_prev_flushed==flushed0, "LEG2 FAIL-BEFORE: flush counter stayed 0 (the confirm is lost)");
+	}
+
+	deinit_messages_buffers();
+	printf("%s %s: fails=%d (defeat=%d)\n", TAG, fails==0?"ALL PASS":"FAILURES", fails, defeat?1:0);
+	fflush(stdout);
+	return fails==0 ? 0 : 1;
+}
+
 
 // ============================================================================
 // R029 — stale retx queue survives recovery (in-process synthetic-fire)

@@ -2193,6 +2193,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_shrcur;
                 failed += ARQ_shrcur.test_batch_shrink_orphan_current();
             }
+            // SEAM-2 deferred prev-confirm ARM/FLUSH fire proof (pass-after arm here;
+            // MERCURY_PENDING_CONFIRM_DEFEAT=1 is the fail-before drop).
+            {
+                cl_arq_controller ARQ_lppc;
+                failed += ARQ_lppc.test_linkphase_pending_confirm_fire();
+            }
             // Streaming decompress-failure SILENT-FALSE-ACCEPT (residual-silent-
             // corruption-wgn25.md): the THIRD WGN:25 trigger — a streaming PPMd model
             // desync under out-of-order SACK delivery makes a COMPLETE, CRC-clean batch
@@ -3710,6 +3716,9 @@ int main(int argc, char *argv[])
     bool test_batch_shrink_orphan_current_cli = false; // --test-batch-shrink-orphan-current: rx_btf=-1
                                         // current-batch shrink tail-drop (marginal-SNR silent corruption).
                                         // fail-before via MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1, pass-after defers.
+    bool test_linkphase_pending_confirm_cli = false; // --test-linkphase-pending-confirm: SEAM-2
+                                        // deferred prev-confirm ARM/FLUSH fire proof.
+                                        // fail-before via MERCURY_PENDING_CONFIRM_DEFEAT=1.
     bool test_eob_loss_batch_truncation_cli = false; // --test-eob-loss-batch-truncation: D5 — EOB-inference
     bool test_dedup_rebase_cli = false; // --test-dedup-rebase: in-band demote-rebase double-delivery
                                         // (byte-stream corruption) regression. fail-before via
@@ -4901,6 +4910,13 @@ int main(int argc, char *argv[])
             // source/datalink_layer/arq_responder.cc test_batch_shrink_orphan_current
             // + fact-documents/silent-corruption-marginal-snr.md.
             test_batch_shrink_orphan_current_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-pending-confirm") == 0)
+        {
+            // SEAM-2 deferred prev-confirm ARM/FLUSH fire proof (one-shot at startup, exit rc).
+            test_linkphase_pending_confirm_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7022,6 +7038,16 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_batch_shrink_orphan_current();
             printf("[FLAG] batch-shrink-orphan-current test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_linkphase_pending_confirm_cli) {
+            // SEAM-2 deferred prev-confirm ARM/FLUSH fire proof (one-shot, exit rc).
+            printf("[FLAG] --test-linkphase-pending-confirm: driving the SEAM-2 deferred "
+                   "prev-confirm ARM/FLUSH emit path\n");
+            fflush(stdout);
+            int rc = ARQ.test_linkphase_pending_confirm_fire();
+            printf("[FLAG] linkphase-pending-confirm test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

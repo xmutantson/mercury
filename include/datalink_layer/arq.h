@@ -941,6 +941,10 @@ public:
   // prev bsi? Wrap-safe (mod-256, P9 255->0). per_batch fallback is FALSE: a covers
   // clear must be a genuine cumulative confirm, never a per-batch coincidence.
   bool linkphase_pending_confirm_covers(int emitted_n_r) const;
+  // SEAM-2 emit-path members (factored out of the RSP pump for the in-process fire proof).
+  void linkphase_arm_pending_prev_confirm(unsigned char prev_ack_bsi, int prev_eff_window);
+  void linkphase_flush_pending_prev_confirm();
+  void linkphase_clear_pending_if_covered(unsigned char emitted_n_r);
   // LINK-PHASE STEP 5 / MC-3 — slot-qualified commander liveness. Default OFF;
   // MERCURY_LINKPHASE_SLOTLIVENESS_DEFEAT restores the pre-Step-5 behavior even
   // when the main flag is set. The feature is actionable only while a derived
@@ -3372,6 +3376,7 @@ public:
   // fifo_buffer_rx as a byte oracle. Env MERCURY_BATCHSHRINK_ORPHAN_DEFEAT=1 reverts
   // the fix (fail-before). Returns 0=PASS, 1=FAIL. See silent-corruption-marginal-snr.md.
   int test_batch_shrink_orphan_current();
+  int test_linkphase_pending_confirm_fire();
 
   // ---- P2 big-block ARQ re-granularization (see
   // fact-documents/data-flow-bigblock-arq-unit.md) ----------------------------
