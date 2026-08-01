@@ -13816,7 +13816,10 @@ void cl_telecom_system::return_to_last_configuration()
 }
 
 // SNR-to-config mapping for supershift (BER waterfall + 2 dB margin).
-// Callers apply SUPERSHIFT_MARGIN_DB (3 dB) on top, so effective margin = 5 dB.
+// Callers apply SUPERSHIFT_MARGIN_DB on top (the asserted value is 6.0 dB —
+// arq_commander.cc J0 unit assert). These thresholds are 100-frame passband BER waterfalls,
+// NOT end-to-end ARQ delivery; the per-rung MEASURED election floor gate (arq_commander.cc
+// RUNG_MIN_SNR_METER) admits each rung only at its measured delivery floor on top of this.
 // BER waterfalls (100 frames, passband, EsN0):
 //   C0:-14 C1:-11 C2:-10 C3:-9 C4:-8 C5:-7 C6:-6 C7:-5
 //   C8:-4  C9:-2  C10:-1 C11:+1 C12:+2 C13:+4 C14:+7 C15:+9 C16:+12

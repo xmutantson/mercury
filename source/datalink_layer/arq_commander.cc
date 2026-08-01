@@ -879,6 +879,10 @@ int cl_arq_controller::elevator_target_from_snr()
 	// this method, so folding the gate here holds both off CFG16 until the reverse-path SNR
 	// supports it. Never-raise; identity when the gate is open (high SNR) or WB-off.
 	snr_ideal = apply_cfg16_margin_cap(snr_ideal);
+	// Per-rung MEASURED election floor (generalizes the cfg16 gate to every OFDM rung): cap a
+	// climb target that the over-reading suffix meter elects above its measured delivery floor
+	// (the wb13 snr3k+13 cfg14 stall). Never-raise; identity below CONFIG_9 / at high SNR / WB-off.
+	snr_ideal = rung_floor_cap_fire(snr_ideal);
 	return snr_ideal;
 }
 
@@ -933,6 +937,163 @@ int cl_arq_controller::apply_cfg16_margin_cap(int proposed) const
 	if(config_ladder_index(proposed) > config_ladder_index(CONFIG_15))
 		return CONFIG_15;
 	return proposed;
+}
+
+// ── Per-rung MEASURED election floor gate (generalizes apply_cfg16_margin_cap) ─────────────
+// Meter-referred per-rung floor: compared against measurements.SNR_uplink (the SAME suffix meter
+// the cfg16 gate + the SUCCESS_BASED climb trust). Each entry = measured 8/8 static floor
+// (CANONICAL_NUMBERS.md §7 + §7-ADDENDUM, snr3k true units, refuter-recomputed bin 982ac639)
+// + 1.5 dB hold margin (one sweep-step / one 8/8->0/8 bracket) + suffix-meter correction (the
+// meter over-reads +2.2 on the ~<=14.5 EVM-saturation plateau, tapering to ~0 at the ~19.5 dB
+// zero-crossing). cfg0..cfg8 are ungated (-90 sentinel: the low rungs decode deep, so the gate is
+// the identity on the OFDM-entry / robust re-climb path -> byte-identical). cfg16/cfg17 are deferred
+// to the CFG16_MIN_SNR_DB gate; RUNG_MIN_SNR_METER[16] mirrors it so the J0 version assert pins the
+// meter calibration. cfg10 (floor 11.6) is DOMINATED by cfg11 (floor 11.3) so cfg11's row (15.0) is
+// below cfg10's (15.3) — an intentional inversion the apply cap's walk handles (lands cfg11 first).
+// cfg14/cfg15 rows are UNCERTAIN (±2-3 dB, the meter's zero-crossing) and validated by the 15/18-dB
+// no-regression cohort gate; the failure memory below is the runtime hedge if a row is optimistic.
+static const double RUNG_MIN_SNR_METER[NUMBER_OF_CONFIGS] = {
+	/* 0*/ -90.0, /* 1*/ -90.0, /* 2*/ -90.0, /* 3*/ -90.0, /* 4*/ -90.0,
+	/* 5*/ -90.0, /* 6*/ -90.0, /* 7*/ -90.0, /* 8*/ -90.0,
+	/* 9*/  14.1, /*10*/  15.3, /*11*/  15.0, /*12*/  16.9, /*13*/  16.9,
+	/*14*/  18.6, /*15*/  19.5, /*16*/  22.0, /*17*/  22.0
+};
+
+double cl_arq_controller::rung_floor_min_meter(int cfg)
+{
+	if(cfg < 0 || cfg >= NUMBER_OF_CONFIGS) return -90.0;   // robust / out-of-range -> ungated
+	return RUNG_MIN_SNR_METER[cfg];
+}
+
+// TRUE iff the reverse-path SNR report admits OFDM rung `cfg` at its meter-referred floor + any
+// session floor bump. Fail-OPEN on the defeat env (fail-before), NB (WB-only), the -90 sentinel
+// (pre-ACK byte-identical), cfg<CONFIG_9 (low rungs decode deep), cfg>CONFIG_15 (cfg16/17 -> cfg16
+// gate). Const: reads members + a static table + a threshold, no get_configuration.
+bool cl_arq_controller::rung_floor_ok(int cfg) const
+{
+	const char* defeat = std::getenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
+	if(defeat && *defeat && atoi(defeat) != 0) return true;   // blanket admit (fail-before)
+	if(narrowband_enabled == YES) return true;                // WB-only gate
+	double snr = measurements.SNR_uplink;
+	if(snr <= -90.0) return true;                             // unmeasured -> byte-identical
+	if(cfg < CONFIG_9) return true;                           // low OFDM rungs ungated (decode deep)
+	if(cfg < 0 || cfg >= NUMBER_OF_CONFIGS) return true;      // out of range (robust) -> ungated
+	if(cfg == CONFIG_17) return true;                         // top-gear (default-off) not gated here
+	// cfg9..cfg16 gated at the meter-referred floor. cfg16's row == CFG16_MIN_SNR_DB, so this AGREES
+	// with the d2b473d cfg16 gate (both never-raise) and makes the cap composition order-independent.
+	double bump = rung_floor_bump_db[cfg];
+	return snr > RUNG_MIN_SNR_METER[cfg] + bump;
+}
+
+// INDEX-MONOTONE never-raise clamp: walk a proposed climb target DOWN to the highest floor-cleared
+// rung (floored at the ladder bottom). Same shape/composition as apply_cfg16_margin_cap /
+// apply_bigblock_cooldown_cap (order-independent, can only LOWER a target). Identity when the gate
+// is open (fast path). Const (no side effects); the ELECTION sites use rung_floor_cap_fire, which
+// counts + logs; the predicate sites (ceiling-recovery / ladder-up) call THIS directly.
+int cl_arq_controller::apply_rung_floor_cap(int proposed) const
+{
+	if(narrowband_enabled == YES) return proposed;           // WB-only gate
+	if(rung_floor_ok(proposed)) return proposed;             // gate open -> identity
+	int t = proposed;
+	for(int i = 0; i < NUMBER_OF_CONFIGS; i++)
+	{
+		int down = config_ladder_down(t, robust_enabled);
+		if(down == t) break;                                 // at the ladder bottom
+		t = down;
+		if(rung_floor_ok(t)) return t;                       // highest floor-cleared rung <= proposed
+	}
+	return t;
+}
+
+// Counting wrapper for the ELECTION (transform) producer sites: apply the cap and, on a non-identity
+// clamp, bump the run-lifetime floor_cap_fires counter + emit the fire-proof line (counted-at-source).
+int cl_arq_controller::rung_floor_cap_fire(int proposed)
+{
+	int capped = apply_rung_floor_cap(proposed);
+	if(capped != proposed)
+	{
+		floor_cap_fires++;
+		printf("[GEARSHIFT] RUNG-FLOOR: capped %d -> %d (meter %.1f, floor %.1f, fires=%lld)\n",
+			proposed, capped, measurements.SNR_uplink, rung_floor_min_meter(proposed), floor_cap_fires);
+		fflush(stdout);
+	}
+	return capped;
+}
+
+// PER-RUNG FAILURE MEMORY — arm. A BREAK is committing at `cfg`. If `cfg` is a gated OFDM rung the
+// table ADMITTED (rung_floor_ok held), that is evidence the static floor is optimistic for THIS
+// channel (fading / meter bias / non-WGN): count it; at K consecutive such at-rung BREAKs, raise
+// `cfg`'s session floor one bracket. WB-only, inert under the defeat env. Writes ONLY the failure-
+// memory arrays (never supershift_proven_ceiling / breaks_since_last_data_success / the anchor), so
+// the af14a9e ratchet + panic bypass are byte-identical (audit §4).
+void cl_arq_controller::rung_floor_note_break(int cfg)
+{
+	const char* defeat = std::getenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
+	if(defeat && *defeat && atoi(defeat) != 0) return;       // fail-before: no memory
+	if(narrowband_enabled == YES) return;                    // WB-only
+	if(cfg < CONFIG_9 || cfg > CONFIG_15) return;            // only gated OFDM rungs carry a bump
+	if(!rung_floor_ok(cfg)) return;                          // arm only when the table ADMITTED cfg
+	rung_fail_count[cfg]++;
+	if(rung_fail_count[cfg] >= RUNG_FLOOR_BUMP_ARM_FAILS)
+	{
+		if(rung_floor_bump_db[cfg] < RUNG_FLOOR_BUMP_MAX_DB)
+		{
+			rung_floor_bump_db[cfg] += RUNG_FLOOR_BUMP_STEP_DB;
+			printf("[GEARSHIFT] RUNG-FLOOR MEMORY: cfg%d disproven at meter %.1f (%d at-rung BREAKs) "
+				"-> floor bump +%.1f (now +%.1f)\n", cfg, measurements.SNR_uplink,
+				RUNG_FLOOR_BUMP_ARM_FAILS, RUNG_FLOOR_BUMP_STEP_DB, rung_floor_bump_db[cfg]);
+			fflush(stdout);
+		}
+		rung_fail_count[cfg] = 0;
+	}
+}
+
+// PER-RUNG FAILURE MEMORY — decay. A CLEAN fully-delivered batch at `cfg` proves the current rung
+// recovered (reset ITS fail streak). For each bumped rung R: if we are sustaining delivery BELOW R,
+// accumulate a clean streak and, after DECAY_CLEAN batches, relax R's bump one bracket (cooldown);
+// operating at/above R re-tests it and resets its streak. WB-only, inert under the defeat env. This
+// decay is INDEPENDENT of the :6898 breaks_since_last_data_success reset -> a slow completion at the
+// anchor does not wipe the disproof (audit §4, erasure site 2).
+void cl_arq_controller::rung_floor_note_clean(int cfg)
+{
+	const char* defeat = std::getenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
+	if(defeat && *defeat && atoi(defeat) != 0) return;
+	if(narrowband_enabled == YES) return;
+	if(cfg >= CONFIG_9 && cfg <= CONFIG_15) rung_fail_count[cfg] = 0;   // a rung that recovers is not disproven
+	int ci = config_ladder_index(cfg);
+	for(int R = CONFIG_9; R <= CONFIG_15; R++)
+	{
+		if(rung_floor_bump_db[R] <= 0.0) { rung_bump_clean_streak[R] = 0; continue; }
+		if(ci >= 0 && ci < config_ladder_index(R))            // sustaining delivery BELOW the disproven rung
+		{
+			rung_bump_clean_streak[R]++;
+			if(rung_bump_clean_streak[R] >= RUNG_FLOOR_BUMP_DECAY_CLEAN)
+			{
+				rung_floor_bump_db[R] -= RUNG_FLOOR_BUMP_STEP_DB;
+				if(rung_floor_bump_db[R] < 0.0) rung_floor_bump_db[R] = 0.0;
+				rung_bump_clean_streak[R] = 0;
+				printf("[GEARSHIFT] RUNG-FLOOR MEMORY: cfg%d bump decayed to +%.1f after %d clean batches below\n",
+					R, rung_floor_bump_db[R], RUNG_FLOOR_BUMP_DECAY_CLEAN);
+				fflush(stdout);
+			}
+		}
+		else
+		{
+			rung_bump_clean_streak[R] = 0;                    // at/above R -> re-testing it
+		}
+	}
+}
+
+// Zero the per-rung failure memory. Called at init() and commander_clean_reconnect() (the two seats
+// that reset the gearshift counters). floor_cap_fires is a run-lifetime diagnostic reset at init() only.
+void cl_arq_controller::rung_floor_memory_reset()
+{
+	for(int i = 0; i < NUMBER_OF_CONFIGS; i++)
+	{
+		rung_fail_count[i] = 0;
+		rung_floor_bump_db[i] = 0.0;
+		rung_bump_clean_streak[i] = 0;
+	}
 }
 
 // CONNECT-SEED of the START config (gearshift-start-and-recovery.md §10.2) — PURE
@@ -1015,6 +1176,9 @@ int cl_arq_controller::connect_seed_target()
 	// CFG16 decode-margin gate: the connect control-plane SNR proxy over-reads, so one seed
 	// read must never plant CFG16 unless the reverse-path SNR clears the margin (never-raise).
 	snr_mapped = apply_cfg16_margin_cap(snr_mapped);
+	// Per-rung floor gate on the CONNECT seed: one control-plane SNR read must not seed a START
+	// config above its measured floor (never-raise; identity pre-ACK / low rung / high SNR / NB).
+	snr_mapped = rung_floor_cap_fire(snr_mapped);
 	int seed = connect_seed_target_core(measurements.SNR_uplink, snr_mapped,
 		init_configuration, supershift_proven_ceiling, narrowband_enabled == YES);
 	if(seed != CONFIG_NONE)
@@ -1593,6 +1757,9 @@ void cl_arq_controller::process_messages_commander()
 			// bypasses the gearshift/turbo climb gates, so cap it at CFG15 too until the
 			// reverse-path SNR supports CFG16 (never-raise; identity at high SNR / WB-off).
 			target = apply_cfg16_margin_cap(target);
+			// Per-rung floor gate on the FOURTH (optimizer) producer: the Q-table bypasses the
+			// gearshift/turbo climb gates, so floor-cap its SET_CONFIG target too (never-raise).
+			target = rung_floor_cap_fire(target);
 			if (target != current_configuration && is_ofdm_config(target))
 			{
 				printf("[OPT] queue SET_CONFIG: %d -> %d (effective-rate optimizer)\n",
@@ -6714,6 +6881,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					}
 				}
 
+				// PER-RUNG FAILURE MEMORY (audit §4): a BREAK is committing at the live rung. If the
+				// per-rung floor table ADMITTED this rung, arm/advance its disproof so a re-climb does
+				// not re-elect it (the runtime hedge where the static table is optimistic). Writes ONLY
+				// the failure-memory arrays -> the af14a9e ratchet + panic bypass are byte-identical.
+				rung_floor_note_break(current_configuration);
+
 				// Lower ceiling to prevent climbing back to failing config
 				int new_ceiling = config_ladder_down(current_configuration, robust_enabled);
 				if(supershift_proven_ceiling < 0 || new_ceiling < supershift_proven_ceiling)
@@ -6903,6 +7076,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// demotion require K *consecutive* anchor-rung BREAKs with NO clean
 				// in between — a rung that recovers between failures is not demoted.
 				anchor_consec_break_fails = 0;
+				// PER-RUNG FAILURE MEMORY (audit §4): a CLEAN batch resets the live rung's fail streak
+				// and, if we are sustaining delivery below a disproven rung, decays its floor bump
+				// (cooldown). INDEPENDENT of the breaks_since_last_data_success reset above, so a slow
+				// completion at the anchor cannot wipe a disproof (erasure site 2 neutralized).
+				rung_floor_note_clean(current_configuration);
 				// AARF DECAY (long-run-degradation.md §2.3): frame_shift_threshold
 				// is the FRAME-UP gate denominator (:3869). It is multiplicatively
 				// INCREASED (*=2 at :2447/:3352/:3539) on every FRAME-UP failure but
@@ -7339,6 +7517,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// (already gated) holds CFG15. Cap the FRAME-UP target so the top rung is elected
 				// only when the reverse-path SNR supports it (never-raise; identity at high SNR).
 				negotiated_configuration = apply_cfg16_margin_cap(negotiated_configuration);
+				// Per-rung floor gate on the SNR-blind +1 FRAME-UP: a 13->14 ACK-success step can
+				// reach a below-floor rung the (already-gated) elevator held; cap it (never-raise).
+				negotiated_configuration = rung_floor_cap_fire(negotiated_configuration);
 				// NO-OP FRAME-UP SUPPRESSION (data-flow-gearshift-climb.md). The margin cap
 				// (and the moderate-SNR CFG16 decode-margin gate) can pull the FRAME-UP target
 				// back to the CURRENT config — a NO-OP "climb": proposed_frame was CFG15->16 but
@@ -7937,6 +8118,11 @@ void cl_arq_controller::finish_turbo_direction()
 		// (turboshift_last_good, possibly CFG16) UNCONDITIONALLY — so a turbo re-climb must
 		// not restart at CFG16 when the reverse-path SNR no longer supports it (never-raise).
 		start_config = apply_cfg16_margin_cap(start_config);
+		// Per-rung floor gate on the turbo-forward-complete start_config — the ERASURE-SITE-1 fix
+		// (audit §4): capping start_config HERE floor-caps the supershift_proven_ceiling assigned on
+		// the next line, so the ROBUST->re-climb cannot re-open the ceiling above a closed floor and
+		// re-elect the disproven rung. Never-raise; identity below CONFIG_9 / at high SNR / WB-off.
+		start_config = rung_floor_cap_fire(start_config);
 
 		// Set ceiling = start config. The SNR→config table is calibrated for AWGN
 		// but fading channels need 3-6 dB more margin. Setting ceiling at start
@@ -9233,6 +9419,10 @@ void cl_arq_controller::process_control_commander()
 						// every other ceiling clamp, hold the probe target at CFG15 unless the
 						// reverse-path SNR supports CFG16 (never-raise; identity at high SNR).
 						negotiated_configuration = apply_cfg16_margin_cap(negotiated_configuration);
+						// Per-rung floor gate on the LOAD-BEARING turbo re-climb hook (the path that
+						// survives the BREAK->ROBUST crater and re-climbs): floor-cap the probe target
+						// so the loop cannot re-elect the disproven rung (never-raise; audit §1 P6).
+						negotiated_configuration = rung_floor_cap_fire(negotiated_configuration);
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
 						//
@@ -9700,6 +9890,10 @@ void cl_arq_controller::finalize_block_commander()
 				// SNR-blind, so block the 15->16 step until the reverse-path SNR supports CFG16.
 				if(apply_cfg16_margin_cap(proposed) != proposed)
 					ceiling_blocked = true;
+				// Per-rung floor gate (LADDER UP, v1): block a success-based up-step to a rung the
+				// reverse-path SNR does not support at its measured floor (audit §1 P7; never-raise).
+				if(apply_rung_floor_cap(proposed) != proposed)
+					ceiling_blocked = true;
 				if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 				{
 					negotiated_configuration=proposed;
@@ -9725,8 +9919,11 @@ void cl_arq_controller::finalize_block_commander()
 					// WALL-B FIX-5 hook #1b (CEILING RECOVERY, v1): never raise the proven ceiling
 					// above the cooldown ceiling — else it would walk the ceiling back to CFG16.
 					// AND never raise it while the CFG16 decode-margin gate holds CFG15 (same reason).
+					// AND never raise it above a rung whose per-rung measured floor is not cleared
+					// (audit §1 P8: the proven ceiling can never walk back above a closed floor).
 					if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed
-						&& apply_cfg16_margin_cap(proposed) == proposed)
+						&& apply_cfg16_margin_cap(proposed) == proposed
+						&& apply_rung_floor_cap(proposed) == proposed)
 					{
 						ceiling_success_count++;
 						if(ceiling_success_count >= 5)
@@ -9875,6 +10072,10 @@ void cl_arq_controller::policy_evaluate_axis1()
 		// 15->16 promotion until the reverse-path SNR supports CFG16.
 		if(apply_cfg16_margin_cap(proposed) != proposed)
 			ceiling_blocked = true;
+		// Per-rung floor gate (LADDER UP, v2): block a success-based up-step to a rung the
+		// reverse-path SNR does not support at its measured floor (audit §1 P9; never-raise).
+		if(apply_rung_floor_cap(proposed) != proposed)
+			ceiling_blocked = true;
 		if(!config_is_at_top(current_configuration, robust_enabled, narrowband_enabled == YES) && !ceiling_blocked)
 		{
 			negotiated_configuration=proposed;
@@ -9901,8 +10102,11 @@ void cl_arq_controller::policy_evaluate_axis1()
 			// WALL-B FIX-5 hook #1b (CEILING RECOVERY, v2): never raise the proven ceiling
 			// above the cooldown ceiling — else it would walk the ceiling back to CFG16.
 			// AND never raise it while the CFG16 decode-margin gate holds CFG15 (same reason).
+			// AND never raise it above a rung whose per-rung measured floor is not cleared
+			// (audit §1 P10: the proven ceiling can never walk back above a closed floor).
 			if(ceiling_blocked && apply_bigblock_cooldown_cap(proposed) == proposed
-				&& apply_cfg16_margin_cap(proposed) == proposed)
+				&& apply_cfg16_margin_cap(proposed) == proposed
+				&& apply_rung_floor_cap(proposed) == proposed)
 			{
 				ceiling_success_count++;
 				if(ceiling_success_count >= 5)
@@ -10771,6 +10975,122 @@ int cl_arq_controller::test_axis2_quiesce_gate()
 //          axis2_move_fastdown_count==1.
 //   Arm C  GUARD (default): rx=21/35 (partial 0.40 — "bad" but < the 0.60 threshold) →
 //          NO fast-down (bad-run 1<3 blocks the incremental down too). batch unchanged.
+// PER-RUNG ELECTION FLOOR GATE + FAILURE MEMORY regression (DATAFLOW_AUDIT_rung_floor.md §7).
+// Drives the REAL production decision functions (apply_rung_floor_cap / rung_floor_cap_fire /
+// rung_floor_ok / rung_floor_note_break / rung_floor_note_clean) — no telecom_system, no RF.
+int cl_arq_controller::test_rung_floor_gate()
+{
+	printf("[TEST-RUNG-FLOOR] start\n");
+	fflush(stdout);
+	int fails = 0;
+	auto check = [&](bool cond, const char* name) {
+		if(cond) { printf("[TEST-RUNG-FLOOR] PASS: %s\n", name); }
+		else     { printf("[TEST-RUNG-FLOOR] FAIL: %s\n", name); fails++; }
+		fflush(stdout);
+	};
+	// WB gearshift session baseline (the gate is WB-only).
+	narrowband_enabled = NO;
+	robust_enabled     = true;
+	rung_floor_memory_reset();
+	floor_cap_fires = 0;
+	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
+
+	// ── T5: J0 version / meter-cal pin / table monotonicity ─────────────────────────────────
+	check((double)CFG16_MIN_SNR_DB == 22.0, "T5 J0: CFG16_MIN_SNR_DB == 22.0");
+	check(rung_floor_min_meter(CONFIG_16) == CFG16_MIN_SNR_DB,
+		"T5 J0: RUNG_MIN_SNR_METER[16] == CFG16_MIN_SNR_DB (meter-cal pin)");
+	check(RUNG_FLOOR_METER_CAL_VERSION == 1, "T5 J0: meter-cal version pinned == 1");
+	bool mono =
+		rung_floor_min_meter(CONFIG_9)  <= rung_floor_min_meter(CONFIG_10) &&
+		rung_floor_min_meter(CONFIG_9)  <= rung_floor_min_meter(CONFIG_11) &&
+		rung_floor_min_meter(CONFIG_11) <= rung_floor_min_meter(CONFIG_12) &&
+		rung_floor_min_meter(CONFIG_10) <= rung_floor_min_meter(CONFIG_12) &&
+		rung_floor_min_meter(CONFIG_12) <= rung_floor_min_meter(CONFIG_13) &&
+		rung_floor_min_meter(CONFIG_13) <= rung_floor_min_meter(CONFIG_14) &&
+		rung_floor_min_meter(CONFIG_14) <= rung_floor_min_meter(CONFIG_15) &&
+		rung_floor_min_meter(CONFIG_15) <= rung_floor_min_meter(CONFIG_16);
+	check(mono, "T5: table monotone (cfg10>cfg11 domination exception)");
+
+	// ── T1: the wb13 reproducer — fail-before / pass-after on the ELECTION cap ───────────────
+	// At true snr3k +13 the suffix meter over-reads to ~15.2; the incumbent elects
+	// get_configuration(15.2 - SUPERSHIFT_MARGIN_DB=6.0) = get_configuration(9.2) = CONFIG_14
+	// (telecom_system.cc SNR>9 -> CONFIG_14). cfg14's MEASURED 8/8 floor is 16.4 (0/8 @13.4), so
+	// cfg14 @+13 is below floor -> BREAK storm -> the deterministic 2830-B stall.
+	measurements.SNR_uplink = 15.2;
+	setenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT", "1", 1);
+	check(apply_rung_floor_cap(CONFIG_14) == CONFIG_14,
+		"T1 FAIL-BEFORE: defeat env -> cfg14 elected at meter 15.2 (the stall)");
+	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
+	long long fires_before = floor_cap_fires;
+	int capped = rung_floor_cap_fire(CONFIG_14);
+	check(capped == CONFIG_11, "T1 PASS-AFTER: gate caps cfg14 -> cfg11 at meter 15.2");
+	check(floor_cap_fires == fires_before + 1, "T1 PASS-AFTER: floor_cap_fires 0 -> 1 (fire proof)");
+
+	// ── T2: never-raise + a below-floor SNR can never ELEVATE a rung + composition ───────────
+	bool never_raise = true;
+	for(int c = CONFIG_0; c <= CONFIG_16; c++)
+		if(config_ladder_index(apply_rung_floor_cap(c)) > config_ladder_index(c)) never_raise = false;
+	check(never_raise, "T2: apply_rung_floor_cap never RAISES a target (any rung, meter 15.2)");
+	measurements.SNR_uplink = 12.0;   // below cfg9's floor (14.1)
+	check(config_ladder_index(apply_rung_floor_cap(CONFIG_13)) <= config_ladder_index(CONFIG_8),
+		"T2: below-floor meter (12.0) caps cfg13 down to <= cfg8 (no elevation)");
+	measurements.SNR_uplink = 15.2;
+	int ab = apply_rung_floor_cap(apply_cfg16_margin_cap(CONFIG_16));
+	int ba = apply_cfg16_margin_cap(apply_rung_floor_cap(CONFIG_16));
+	check(ab == ba, "T2: cap composes order-independently with the cfg16 gate (from CONFIG_16)");
+
+	// ── T4: defeat env byte-identical (no cap, no arm) ───────────────────────────────────────
+	setenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT", "1", 1);
+	measurements.SNR_uplink = 15.2;
+	long long fires_pre = floor_cap_fires;
+	int def = rung_floor_cap_fire(CONFIG_14);
+	check(def == CONFIG_14 && floor_cap_fires == fires_pre,
+		"T4: defeat env -> no cap, floor_cap_fires unchanged");
+	rung_floor_note_break(CONFIG_13);
+	rung_floor_note_break(CONFIG_13);
+	rung_floor_note_break(CONFIG_13);
+	check(rung_floor_bump_db[CONFIG_13] == 0.0, "T4: defeat env -> failure memory inert (no bump)");
+	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
+
+	// ── T3: failure memory — arm / survive erasure sites / decay / decay-gate / reset ────────
+	rung_floor_memory_reset();
+	measurements.SNR_uplink = 17.0;   // clears cfg13's static floor (16.9) -> table ADMITS cfg13
+	check(rung_floor_ok(CONFIG_13), "T3 pre: table admits cfg13 at meter 17.0");
+	rung_floor_note_break(CONFIG_13);
+	check(rung_floor_bump_db[CONFIG_13] == 0.0, "T3 arm: 1 break -> no bump yet");
+	rung_floor_note_break(CONFIG_13);
+	rung_floor_note_break(CONFIG_13);
+	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB, "T3 arm: 3 breaks -> +1.5 bump");
+	check(!rung_floor_ok(CONFIG_13), "T3 arm: bump raised cfg13's floor (17.0 now refused)");
+	// SURVIVE erasure site 1 (the :7945 proven-ceiling wipe).
+	supershift_proven_ceiling = CONFIG_16;
+	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB,
+		"T3 survive: proven-ceiling wipe does NOT touch the bump (erasure site 1)");
+	// SURVIVE erasure site 2 (the :6898 data-success reset).
+	breaks_since_last_data_success = 0;
+	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB,
+		"T3 survive: data-success reset does NOT touch the bump (erasure site 2)");
+	// DECAY: 5 clean batches sustained BELOW cfg13 (at cfg11) -> bump relaxes to 0.
+	for(int i = 0; i < RUNG_FLOOR_BUMP_DECAY_CLEAN - 1; i++) rung_floor_note_clean(CONFIG_11);
+	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB, "T3 decay: 4 cleans below -> bump held");
+	rung_floor_note_clean(CONFIG_11);
+	check(rung_floor_bump_db[CONFIG_13] == 0.0, "T3 decay: 5 cleans below cfg13 -> bump decayed to 0");
+	// DECAY-GATE: cleans AT/ABOVE the bumped rung do NOT decay it (re-testing).
+	rung_floor_note_break(CONFIG_13); rung_floor_note_break(CONFIG_13); rung_floor_note_break(CONFIG_13);
+	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB, "T3 re-arm: bump back to +1.5");
+	for(int i = 0; i < RUNG_FLOOR_BUMP_DECAY_CLEAN + 2; i++) rung_floor_note_clean(CONFIG_13);
+	check(rung_floor_bump_db[CONFIG_13] == RUNG_FLOOR_BUMP_STEP_DB,
+		"T3 decay-gate: cleans AT the bumped rung do NOT decay it");
+	// RESET: clears on session reset.
+	rung_floor_memory_reset();
+	check(rung_floor_bump_db[CONFIG_13] == 0.0 && rung_fail_count[CONFIG_13] == 0,
+		"T3 reset: memory_reset clears the bump + fail count");
+
+	printf("[TEST-RUNG-FLOOR] done: %d failure(s)\n", fails);
+	fflush(stdout);
+	return fails;
+}
+
 int cl_arq_controller::test_axis2_fastdown()
 {
 	printf("[TEST-AXIS2-FASTDOWN] start\n");

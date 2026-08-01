@@ -1888,6 +1888,35 @@ public:
   bool cfg16_decode_margin_ok() const;
   int  apply_cfg16_margin_cap(int proposed) const;
 
+  // Per-rung MEASURED election floor gate (cross-layer data-flow audit of the config-election
+  // path, generalizing apply_cfg16_margin_cap from the CFG16 top rung to every OFDM rung). The
+  // GATE INPUT is measurements.SNR_uplink (the SAME smoothed suffix meter the cfg16 gate and the
+  // SUCCESS_BASED climb already trust). rung_floor_ok(cfg) is TRUE iff SNR_uplink clears cfg's
+  // meter-referred measured floor (RUNG_MIN_SNR_METER[cfg] + rung_floor_bump_db[cfg]); it fail-
+  // OPENs on the -90 sentinel (pre-ACK -> byte-identical), on NB (WB-only gate), for cfg<CONFIG_9
+  // (low rungs decode deep) and cfg>CONFIG_15 (cfg16/17 deferred to CFG16_MIN_SNR_DB), and when
+  // MERCURY_RUNG_FLOOR_GATE_DEFEAT is set (blanket admit — the fail-before arm). apply_rung_floor_cap
+  // is an INDEX-MONOTONE never-raise clamp: it walks a proposed climb target DOWN to the highest
+  // floor-cleared rung (same shape/composition as apply_cfg16_margin_cap / apply_bigblock_cooldown_cap,
+  // order-independent — it can only LOWER a target). rung_floor_min_meter() exposes the static row for
+  // the test + the fire-proof printf; RUNG_MIN_SNR_METER[] is defined next to apply_rung_floor_cap.
+  static double rung_floor_min_meter(int cfg);
+  bool rung_floor_ok(int cfg) const;
+  int  apply_rung_floor_cap(int proposed) const;
+  // Counting wrapper for the ELECTION (transform) sites: applies the cap and, on a non-identity
+  // clamp, increments floor_cap_fires + emits the [GEARSHIFT] RUNG-FLOOR fire-proof line. The
+  // predicate sites (ceiling-recovery / ladder-up) call the pure const apply_rung_floor_cap.
+  int  rung_floor_cap_fire(int proposed);
+  // Per-rung failure memory. note_break arms a bump when a gated rung the table ADMITTED breaks
+  // K times; note_clean resets the per-rung fail streak and decays a bump after DECAY_CLEAN clean
+  // batches BELOW the disproven rung. Both are WB-only and inert under the defeat env. The bump
+  // state is SEPARATE from supershift_proven_ceiling / breaks_since_last_data_success, so it survives
+  // the :7945 proven-ceiling wipe AND the :6898 data-success oscillation reset (audit §4). memory_reset
+  // zeroes all three arrays (called at init() + commander_clean_reconnect()).
+  void rung_floor_note_break(int cfg);
+  void rung_floor_note_clean(int cfg);
+  void rung_floor_memory_reset();
+
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
   // decodes NO LDPC data, so the canonical SNR_uplink producer
@@ -2318,6 +2347,10 @@ public:
   //     SET_CONFIG does NOT arm). See data-flow-snr-measurements.md §1.7 / §7.
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
+  // Per-rung election floor gate + failure memory regression (DATAFLOW_AUDIT_rung_floor.md §7):
+  // the wb13 fail-before/pass-after, cap-never-raises, failure-memory arm/survive/decay/reset,
+  // defeat-env byte-identity, and the J0 version/monotone pins. Deterministic, no RF/telecom_system.
+  int test_rung_floor_gate();
 
   // FORGIVING-ACK Tier-2 cumulative-n_r regression (--test-cumulative-ack).
   // Drives the SELF-HEAL (a lost report recovered by the next n_r), the
@@ -6307,6 +6340,17 @@ public:
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)
+  // Per-rung MEASURED election floor gate state (audit: DATAFLOW_AUDIT_rung_floor.md §2). Indexed by
+  // CONFIG value 0..17 (robust configs 100..102 are is_ofdm_config==false and never index these).
+  // floor_cap_fires: run-lifetime diagnostic (# of non-identity RUNG-FLOOR caps), zeroed at init()
+  //   only, emitted into the cohort res JSON via the [GEARSHIFT] RUNG-FLOOR fire line (counted-at-source).
+  // rung_fail_count / rung_floor_bump_db / rung_bump_clean_streak: per-rung failure memory, reset at
+  //   init() AND commander_clean_reconnect() (rung_floor_memory_reset). SEPARATE from
+  //   supershift_proven_ceiling / breaks_since_last_data_success -> survives the :7945 wipe + :6898 reset.
+  long long floor_cap_fires{0};
+  int    rung_fail_count[NUMBER_OF_CONFIGS]{};
+  double rung_floor_bump_db[NUMBER_OF_CONFIGS]{};
+  int    rung_bump_clean_streak[NUMBER_OF_CONFIGS]{};
   int break_detected;             // YES if BREAK pattern detected by responder
 
   // ---- zombie/amplifier layer (data-flow-zombie-amplifier.md) -------------

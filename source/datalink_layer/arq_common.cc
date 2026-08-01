@@ -1349,6 +1349,11 @@ cl_arq_controller::cl_arq_controller()
 	break_recovery_phase=0;
 	break_recovery_retries=0;
 	ceiling_success_count=0;
+	// Per-rung MEASURED election floor gate (audit §2): run-lifetime cap-fire diagnostic + the
+	// per-rung failure memory. floor_cap_fires is zeroed at init() ONLY (run-lifetime, like
+	// axis2_move_fastdown_count); the memory arrays reset here AND at commander_clean_reconnect().
+	floor_cap_fires=0;
+	rung_floor_memory_reset();
 	break_detected=NO;
 	break_probe_consec_match=0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	hail_detected=NO;
@@ -8877,6 +8882,9 @@ void cl_arq_controller::reset_session_state()
 	// arq_commander.cc, since CONNECT skips reset_session_state.)
 	break_noprogress_cycles = 0;
 	ceiling_success_count = 0;
+	// Per-rung failure memory reset on clean reconnect (audit §2 — the bump memory is per-connection;
+	// floor_cap_fires is run-lifetime and intentionally NOT cleared here).
+	rung_floor_memory_reset();
 	break_detected = NO;
 	break_probe_consec_match = 0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	// fix/break-fh-gate: age the forward-health latch out on session reset so a stale

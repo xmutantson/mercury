@@ -972,6 +972,25 @@ CONFIG_16 (5664.7 bps).
 // blanket CFG16 election (the pre-gate over-election, the fail-before arm).
 #define CFG16_MIN_SNR_DB 22.0
 
+// ── Per-rung MEASURED election floor gate (generalizes the CFG16 gate above) ───────────
+// The CFG16 gate holds CFG15 below CFG16's viability floor. The SAME failure mode bites the
+// mid rungs: the suffix SNR meter over-reads at moderate SNR, so the elevator elects a rung
+// ~one step above its MEASURED delivery floor (the wb13 snr3k+13 stall — cfg14 elected while
+// its measured 8/8 floor is 16.4, 0/8 at 13.4). RUNG_MIN_SNR_METER[] (arq_commander.cc) admits
+// each OFDM rung only when measurements.SNR_uplink clears that rung's measured floor + a hold
+// margin, meter-referred. The rows are pinned to the meter calibration by the version below; a
+// future EVM-saturation re-characterization of the suffix meter must bump this version AND
+// re-derive the rows (a J0-style --test assert enforces the pin).
+#define RUNG_FLOOR_METER_CAL_VERSION 1
+// Per-rung session-local failure memory (runtime hedge where the static table is optimistic for
+// the actual channel: fading / meter bias / non-WGN). K consecutive at-rung BREAKs while the
+// table admitted the rung bump its session floor by one bracket; a bump decays after DECAY_CLEAN
+// clean batches sustained below the disproven rung. Bounded at MAX to keep it a hedge, not a pin.
+#define RUNG_FLOOR_BUMP_ARM_FAILS 3
+#define RUNG_FLOOR_BUMP_STEP_DB   1.5
+#define RUNG_FLOOR_BUMP_MAX_DB    6.0
+#define RUNG_FLOOR_BUMP_DECAY_CLEAN 5
+
 // Controlled-elevator multi-rung jump BOUND (gearshift-climb-engine.md §15, the
 // DEEP-SNR over-climb regression fix). Even once the data-viable anchor has PROVEN
 // the OFDM tier (the §15 primary gate `is_ofdm_config(anchor)`), a single SNR-driven
