@@ -2158,6 +2158,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_q2;
                 failed += ARQ_q2.test_axis2_quiesce_gate();
             }
+            // FIX 2 — catastrophic-partial fast-down: a SINGLE batch carrying the full
+            // hysteresis' worth of SACK-bitmap loss (partial>0.60) fast-downs the batch
+            // (AIMD B/2) immediately instead of waiting 3 consecutive bad batches, breaking
+            // the coalescing relapse loop. Drives the REAL policy_evaluate_axis2 across the
+            // defeat knob + a bad-but-not-catastrophic guard.
+            {
+                cl_arq_controller ARQ_fd;
+                failed += ARQ_fd.test_axis2_fastdown();
+            }
             {
                 cl_arq_controller ARQ_gab;
                 failed += ARQ_gab.test_gap_abort_readopt_blind();

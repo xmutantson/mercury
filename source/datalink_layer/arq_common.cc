@@ -865,6 +865,12 @@ cl_arq_controller::cl_arq_controller()
 		const char* bco = std::getenv("MERCURY_BATCH_COAST_DEFEAT");
 		batch_coast_defeat = (bco && *bco && atoi(bco) != 0);
 		batch_coast_advances = 0;
+		// Catastrophic-partial fast-down (FIX 2). Ships DEFAULT-ON.
+		// MERCURY_AXIS2_FASTDOWN_DEFEAT=1 restores the stock 3-consecutive-bad down
+		// path (no single-batch fast-down) so the A/B runs FIX vs DEFEAT on ONE binary.
+		const char* afd = std::getenv("MERCURY_AXIS2_FASTDOWN_DEFEAT");
+		axis2_fastdown_defeat = (afd && *afd && atoi(afd) != 0);
+		axis2_move_fastdown_count = 0;
 		// ELEVATOR FAST-CONFIRM (climb-duty). Ships DEFAULT-ON. MERCURY_DUTY_ELEV_DEFEAT=1 (or the
 		// master MERCURY_DUTY_FASTSTART_DEFEAT=1) restores the incumbent N=2 confirm so the fire-proof
 		// runs FIX vs DEFEAT on ONE binary. Env-latched ONCE here like the R / P-alt knobs above.

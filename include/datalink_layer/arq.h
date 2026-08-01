@@ -2635,6 +2635,11 @@ public:
   void test_fire_policy_axis2(int direction);
   // R4 LINK-PARAMS quiesce-gate regression (--test-axis2-quiesce-gate; also in --test).
   int  test_axis2_quiesce_gate();
+  // Catastrophic-partial fast-down regression (FIX 2; also runs in --test). Drives the
+  // REAL policy_evaluate_axis2() with a single high-partial observation: PASS-AFTER an
+  // immediate [POLICY-MOVE] axis=2 reason=catastrophic_partial to B/2, proven_ceiling
+  // set; FAIL-BEFORE (MERCURY_AXIS2_FASTDOWN_DEFEAT=1) no move; guard partial=0.19 no fire.
+  int  test_axis2_fastdown();
 
   // SACK Design A Step 10 — Axis-2 cooldown helper. Decrement the cooldown
   // counter by one (clamped at 0) and return the post-decrement value. Used
@@ -4563,7 +4568,18 @@ public:
   long long axis2_evaluations;           // count of policy_evaluate_axis2() calls
   long long axis2_move_up_count;         // count of step-up moves
   long long axis2_move_down_count;       // count of step-down moves
+  long long axis2_move_fastdown_count;   // count of catastrophic-partial fast-down moves (FIX 2)
   long long axis2_skipped_in_cooldown;   // count of evaluations skipped due to cooldown
+  // Catastrophic-partial fast-down (FIX 2, DATAFLOW_AUDIT_batch_coast.md §6). A SINGLE
+  // batch whose SACK-bitmap partial_rate exceeds this fraction carries the full
+  // hysteresis' worth of loss evidence in one observation, so Axis-2 fast-downs
+  // immediately (AIMD multiplicative decrease) instead of waiting AXIS2_DOWN_BAD_RUN
+  // consecutive bad batches. The threshold is a COMPOSITION of the two existing
+  // constants — the 0.20 bad-observation threshold (partial_rate>0.20f, inline at
+  // policy_evaluate_axis2) times AXIS2_DOWN_BAD_RUN (3) = 0.60 — not a new eyeballed
+  // number. Own defeat knob MERCURY_AXIS2_FASTDOWN_DEFEAT (env-latched in the ctor).
+  static constexpr float AXIS2_FASTDOWN_PARTIAL = 0.20f * (float)AXIS2_DOWN_BAD_RUN;
+  bool axis2_fastdown_defeat;            // MERCURY_AXIS2_FASTDOWN_DEFEAT=1 restores stock (no fast-down)
   // R4 quiesce gate: consecutive deferrals of a pending Axis-2 move because the batch
   // boundary was unclean (retx pending / last batch not fully ACKed). Reset to 0 when a
   // move fires (clean or forced) or when no move is pending. Bounded by AXIS2_MAX_MOVE_DEFER.

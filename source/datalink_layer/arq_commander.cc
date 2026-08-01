@@ -10266,6 +10266,36 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 	                 && (axis2_consecutive_bad_batches >= AXIS2_DOWN_BAD_RUN)
 	                 && (data_batch_size - AXIS2_STEP >= AXIS2_BATCH_FLOOR);
 
+	// FIX 2 — CATASTROPHIC-PARTIAL FAST-DOWN (DATAFLOW_AUDIT_batch_coast.md §6).
+	// A SINGLE batch whose SACK-bitmap partial_rate exceeds the composition of the
+	// two existing hysteresis constants (AXIS2_FASTDOWN_PARTIAL = 0.20 bad-thresh ×
+	// AXIS2_DOWN_BAD_RUN 3 = 0.60) already carries the full "3 consecutive bad"
+	// worth of loss evidence in one observation, so an AIMD multiplicative decrease
+	// (target = B/2 snapped to the AXIS2_STEP grid, floored at AXIS2_BATCH_FLOOR)
+	// fires immediately instead of waiting three catastrophic keydowns. This breaks
+	// the coalescing relapse loop (probation re-climb +5/4-clean back to the same
+	// fatal width) that the −5 step + ring-reset could not. Signal class:
+	// partial_rate is measured channel loss from the SACK bitmap, not ACK-absence.
+	// Ranked BELOW prevention (batch-coast); judged only on the attribution
+	// sub-cohort. Own defeat knob MERCURY_AXIS2_FASTDOWN_DEFEAT restores stock.
+	bool want_fastdown = false;
+	int  fastdown_target = data_batch_size;
+	if(!axis2_fastdown_defeat
+	   && partial_rate > AXIS2_FASTDOWN_PARTIAL
+	   && data_batch_size > AXIS2_BATCH_FLOOR)
+	{
+		int halved  = data_batch_size / 2;
+		int snapped = ((halved + AXIS2_STEP / 2) / AXIS2_STEP) * AXIS2_STEP;  // nearest step-grid multiple
+		if(snapped < AXIS2_BATCH_FLOOR) snapped = AXIS2_BATCH_FLOOR;
+		if(snapped < data_batch_size)     // must actually decrease
+		{
+			fastdown_target = snapped;
+			want_fastdown   = true;
+			want_up         = false;      // a catastrophic partial is never an up-move
+			want_down       = false;      // fast-down supersedes the incremental down path
+		}
+	}
+
 	// SACK Design A Step 12 — §4.3.4 invariant #7: enforce proven-ceiling.
 	// If the up-move would propose a batch_size above the ceiling, VETO the
 	// move. The ceiling represents the cap set by a prior down-move; we may
@@ -10293,7 +10323,7 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 		}
 	}
 
-	if(want_up || want_down)
+	if(want_up || want_down || want_fastdown)
 	{
 		// R4 — LINK-PARAMS quiesce gate (cross-layer data-flow audit: Axis-2 vs the retx
 		// queue / partial last batch). Renegotiating batch size mid-transfer applies the new
@@ -10339,9 +10369,13 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 		}
 
 		int from = data_batch_size;
-		int to = want_up ? (from + AXIS2_STEP) : (from - AXIS2_STEP);
-		const char* reason = want_up ? "ring_clean" : "ring_lossy";
-		const char* dir    = want_up ? "up"          : "down";
+		int to = want_up ? (from + AXIS2_STEP)
+		       : want_fastdown ? fastdown_target
+		       : (from - AXIS2_STEP);
+		const char* reason = want_up ? "ring_clean"
+		                   : want_fastdown ? "catastrophic_partial"
+		                   : "ring_lossy";
+		const char* dir    = want_up ? "up" : "down";
 
 		printf("[POLICY-MOVE] axis=2 from=%d to=%d direction=%s reason=%s "
 			"mean_partial=%.3f good=%d bad=%d cooldown=%d\n",
@@ -10381,8 +10415,9 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 		set_data_batch_size(to);
 		recalculate_ack_timeout_for_batch();
 
-		if(want_up) axis2_move_up_count++;
-		else        axis2_move_down_count++;
+		if(want_up)            axis2_move_up_count++;
+		else if(want_fastdown) axis2_move_fastdown_count++;
+		else                   axis2_move_down_count++;
 
 		// SACK Design A Step 12 — §4.3.4 invariant #7: on a down-move,
 		// remember the batch_size that just failed (the value we are MOVING
@@ -10394,7 +10429,7 @@ void cl_arq_controller::policy_evaluate_axis2(int rx_count, int batch_size_obser
 		// the same failure regime." On an up-move we do NOT set a ceiling
 		// (an up-move proves the new K is at least as good as from; no
 		// failure observed). On Axis-1 supremacy the ceiling resets to -1.
-		if(want_down)
+		if(want_down || want_fastdown)
 		{
 			int new_ceiling = from - 1;
 			// Adopt the more restrictive of the existing ceiling and the new
@@ -10717,6 +10752,101 @@ int cl_arq_controller::test_axis2_quiesce_gate()
 	unsetenv("MERCURY_AXIS2_QUIESCE_DEFEAT");
 	bool pass = (fails == 0);
 	printf("[TEST-AXIS2-QUIESCE] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// FIX 2 — CATASTROPHIC-PARTIAL FAST-DOWN regression (also runs in --test).
+// Drives the REAL policy_evaluate_axis2() with a SINGLE catastrophic-partial
+// observation at a CLEAN boundary (quiesce gate passes) and a clean pre-filled ring
+// (bad-run 0, so the stock 3-consecutive-bad down path can NOT fire — isolating the
+// fast-down trigger). In-process, no telecom_system (bigblock guard is NULL-skipped),
+// duty P-alt defeated so the controller runs past the climb-confirm skip (the lever
+// has its own regression). 0=PASS, 1=FAIL. Default builds enter this once via --test.
+//   Arm A  FAIL-BEFORE (MERCURY_AXIS2_FASTDOWN_DEFEAT=1): rx=4/35 (partial 0.886) →
+//          NO move (bad-run 1<3, fast-down defeated). batch stays 35, no fastdown count.
+//   Arm B  PASS-AFTER (default): rx=4/35 → immediate [POLICY-MOVE] reason=
+//          catastrophic_partial to B/2 snapped to the AXIS2_STEP grid (35/2=17 →
+//          snap 15), proven_ceiling=34 (from-1), pending SET_LINK_PARAMS batch=15,
+//          axis2_move_fastdown_count==1.
+//   Arm C  GUARD (default): rx=21/35 (partial 0.40 — "bad" but < the 0.60 threshold) →
+//          NO fast-down (bad-run 1<3 blocks the incremental down too). batch unchanged.
+int cl_arq_controller::test_axis2_fastdown()
+{
+	printf("[TEST-AXIS2-FASTDOWN] start\n");
+	fflush(stdout);
+	int fails = 0;
+	const int START = 35;   // a wide coalesced batch, as in the failing cells
+
+	auto prime_clean = [&]() {
+		sack_v2_enabled = true;
+		current_configuration = CONFIG_0;   // OFDM, non-robust, not the CFG16 bigblock rung
+		telecom_system = NULL;              // synthetic — bigblock guard is NULL-skipped
+		for(int i=0;i<AXIS2_RING_DEPTH;i++) axis2_partial_rate_ring[i] = 0.0f;
+		axis2_partial_rate_count       = AXIS2_RING_DEPTH;   // pre-filled CLEAN ring (mean 0)
+		axis2_partial_rate_pos         = 0;
+		axis2_consecutive_good_batches = 0;
+		axis2_consecutive_bad_batches  = 0;   // NO prior bad run — stock down path cannot fire
+		axis2_cooldown_batches         = 0;
+		batch_size_proven_ceiling      = -1;
+		batch_size_ceiling_recovery_batches = 0;
+		axis2_deferred_moves           = 0;
+		axis2_move_down_count          = 0;
+		axis2_move_up_count            = 0;
+		axis2_move_fastdown_count      = 0;
+		messages_control.status        = FREE;
+		retransmit_count               = 0;      // CLEAN boundary so the quiesce gate passes
+		last_batch_fully_acked         = true;
+		// Prime the length members so the sole-setter's wire-derived ceiling (~206)
+		// sits above the working range and set_data_batch_size() applies the target
+		// cleanly (same pattern as test_burst_coalesce_held_rung's prime); without
+		// this the synthetic max_data_length=0 clamps to a negative target.
+		max_data_length                = 200;
+		max_header_length              = 7;
+		data_batch_size                = START;
+		pending_link_params_batch_size = -1;
+		axis2_fastdown_defeat          = false;  // PASS-AFTER default (the ctor env-latch already
+		                                         // set this; the arms toggle the MEMBER directly
+		                                         // since the env is latched once at construction).
+		duty_palt_defeat = true;   // run the controller (climb-confirm skip has its own regression)
+	};
+	auto check = [&](bool cond, const char* name) {
+		if(cond) { printf("[TEST-AXIS2-FASTDOWN] PASS: %s\n", name); }
+		else     { printf("[TEST-AXIS2-FASTDOWN] FAIL: %s\n", name); fails++; }
+		fflush(stdout);
+	};
+
+	// Arm A — FAIL-BEFORE via the defeat knob (member, since MERCURY_AXIS2_FASTDOWN_DEFEAT
+	// is env-latched once in the ctor): catastrophic partial, but fast-down OFF.
+	prime_clean();
+	axis2_fastdown_defeat = true;
+	policy_evaluate_axis2(4, START);   // rx=4/35 → partial 0.886
+	check(data_batch_size == START,        "ArmA defeat: no move (batch held at 35)");
+	check(axis2_move_fastdown_count == 0,  "ArmA defeat: fastdown count 0");
+
+	// Arm B — PASS-AFTER (default): the single catastrophic partial fast-downs now.
+	prime_clean();
+	policy_evaluate_axis2(4, START);   // rx=4/35 → partial 0.886 > 0.60
+	int expect_target = 15;            // 35/2=17 → ((17+2)/5)*5 = 15
+	check(data_batch_size == expect_target,      "ArmB fast-down: batch 35 -> 15 (AIMD B/2 on step grid)");
+	check(axis2_move_fastdown_count == 1,        "ArmB fast-down: fastdown count 1");
+	check(batch_size_proven_ceiling == START-1,  "ArmB fast-down: proven_ceiling = from-1 (34)");
+	check(batch_size_ceiling_recovery_batches == AXIS2_CEILING_RECOVERY_BATCHES,
+	                                             "ArmB fast-down: ceiling recovery armed");
+	// (The SET_LINK_PARAMS wire encode + RSP apply of the fast-down target ride the SAME
+	// pending_link_params -> add_message_control(SET_LINK_PARAMS) -> set_data_batch_size
+	// plumbing that test_burst_coalesce_held_rung T1/T2 already validate byte-for-byte;
+	// pending_link_params_batch_size is consumed by add_message_control here so we assert
+	// the applied local batch above, not the post-consume staging field.)
+
+	// Arm C — GUARD: a "bad" but non-catastrophic partial must NOT fast-down.
+	prime_clean();
+	policy_evaluate_axis2(21, START);  // rx=21/35 → partial 0.40 (>0.20 bad, <0.60)
+	check(data_batch_size == START,        "ArmC guard: bad-but-not-catastrophic → no fast-down (batch held)");
+	check(axis2_move_fastdown_count == 0,  "ArmC guard: fastdown count 0");
+
+	bool pass = (fails == 0);
+	printf("[TEST-AXIS2-FASTDOWN] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
 	fflush(stdout);
 	return pass ? 0 : 1;
 }
