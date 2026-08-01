@@ -4191,6 +4191,23 @@ public:
   // decrypt_delivered_bsi / rsp_current_expected_batch_seq_id. Index = batch_seq_id&0xFF.
   StreamStamp rx_stream_stamp[256];
 
+  // Option W REBASE-SEAM FAIL-CLOSED (data-flow-stream-offset.md §11): a config-change
+  // DEMOTE-REBASE (arq_responder.cc) re-baselines the bsi window (cur=prev=-1) mid-
+  // transfer, after which the next frame re-adopts through the bsi-contiguity gap-gate
+  // — a PROXY for byte-contiguity. If recovery re-labelled the bsi (lossless requeue
+  // rolls cmd_batch_seq_id) the absolute byte cursor can jump WHILE the bsi label stays
+  // contiguous, so a byte-non-contiguous batch passes the gap-gate. The BACKSTOP
+  // (w_stream_shift_detected) that would catch it is FAIL-OPEN on an absent stamp, and
+  // the EOB frame that carries the stamp can be lost — so a shifted batch delivers
+  // silently. This flag ARMS at the DEMOTE-REBASE; while armed, a stamp-riding delivery
+  // that carries NO stamp proving stamp.start==rx_stream_delivered is REFUSED (it cannot
+  // prove byte-contiguity across the seam). It DISARMS the moment a delivery re-proves
+  // alignment with a valid stamp. The legitimate stampless path (robust / tiny-frame
+  // configs, w_stamp_rides()==false) is untouched. Reset at ctor + reset_session_state.
+  bool rsp_rebase_seam_armed;          // RSP: a DEMOTE-REBASE seam is open (require a
+                                       //      stamp to re-prove byte alignment).
+  long long rsp_seam_refuse_count;     // count of [RSP-V2-SEAM-REFUSE] fail-closed teardowns.
+
   // Option W: does the EOB-frame byte-stream stamp ride at the CURRENT config? Both
   // peers run load_configuration() on the SET_CONFIG handshake, so max_data_length /
   // header_carries_d5 / sack_v2_enabled agree — the predicate is DETERMINISTIC on both
@@ -4253,6 +4270,13 @@ public:
   // data_batch_size (byte-identical for every non-desync caller and the regression test).
   bool w_bytegate_shortfall(int wbsi, struct st_message* arr, int win);
   bool w_stream_shift_detected(int wbsi);
+  //   w_seam_refuse: REBASE-SEAM FAIL-CLOSED — while rsp_rebase_seam_armed, does batch
+  //     wbsi lack a stamp proving stamp.start == rx_stream_delivered AT A STAMP-RIDING
+  //     config (w_stamp_rides())? true ⇒ the EOB stamp was lost across the rebase seam,
+  //     byte-contiguity is UNPROVABLE ⇒ REFUSE (copy_data_to_buffer teardown). Returns
+  //     false when the seam is disarmed, when a valid aligned stamp re-proves alignment,
+  //     or at a non-stamp-riding config (the legitimate stampless-contiguous path).
+  bool w_seam_refuse(int wbsi);
 
   // SACK Design A Step 4 — RSP cross-batch routing decision state.
   // All members gated on sack_v2_enabled; v1 path never reads these.

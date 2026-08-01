@@ -1179,6 +1179,135 @@ int cl_arq_controller::test_stream_offset()
 		this->compression_enabled=false;
 		printf("[TEST-STREAM-OFFSET] Part Y bsi_defeat=%d\n", (int)bsi_defeat);
 	}
+	// PART V — REBASE-SEAM FAIL-CLOSED: the byte-offset STREAM-SPLICE escape
+	// (data-flow-stream-offset.md §11). After a DEMOTE-REBASE re-baselines the bsi window
+	// (cur=prev=-1), a byte-NON-contiguous batch can present as bsi-CONTIGUOUS — recovery
+	// re-labels the bsi (lossless requeue rolls cmd_batch_seq_id) while the absolute byte
+	// cursor jumps ~one config's worth of bytes. The delivery-time BACKSTOP
+	// (w_stream_shift_detected) is FAIL-OPEN when the EOB frame (hence the stamp) is LOST,
+	// so the shifted stamp-riding batch delivers SILENTLY (WGN:15 cfg13, 4/8 cells: a
+	// byte-perfect prefix then every later byte lifted ~125 KB ahead — ~125 KB silently
+	// skipped and admitted as contiguous). This drives the PRODUCTION decision predicate
+	// w_seam_refuse() (the SAME copy_data_to_buffer calls) + the PRODUCTION
+	// copy_data_to_buffer() reassembler (compression OFF — byte-exact oracle).
+	//   PASS-AFTER (default): seam armed + stamp-riding + no aligned stamp ⇒ w_seam_refuse()
+	//     true ⇒ the batch is REFUSED (mirroring the socket-bound gap-abort teardown, exactly
+	//     as Part G does) ⇒ 0 silent bytes beyond the good prefix.
+	//   FAIL-BEFORE (MERCURY_STREAM_SEAM_FAILCLOSED=0 — reproduces the pre-fix fail-open on
+	//     the SAME binary): the caller-knob defeats the refuse ⇒ copy_data_to_buffer delivers
+	//     the unproven (possibly-shifted) batch SILENTLY — the escape reproduced.
+	// Also asserts the fix (a) does NOT false-fire when no seam is armed, (b) DISARMS on a
+	// byte-aligned stamped delivery, and (c) does NOT break the legitimate stampless-
+	// contiguous (robust / tiny-frame) path even WHILE the seam is armed.
+	// ---------------------------------------------------------------------------
+	printf("[TEST-STREAM-OFFSET] Part V — REBASE-SEAM fail-closed (byte-offset stream-splice)\n");
+	{
+		bool seam_defeat = false;
+		{ const char* e = std::getenv("MERCURY_STREAM_SEAM_FAILCLOSED");
+		  if(e && *e && atoi(e)==0) seam_defeat = true; }
+
+		this->sack_v2_enabled   = true;
+		this->header_carries_d5 = true;
+		CHECK(w_stamp_rides(), "V: stamp rides at the test config (seam applies)", w_stamp_rides()?1:0, 1);
+
+		const int VBSI = 88;
+		const int VK = 20;   // a ~cfg13 OFDM batch: 20 frames * GFLEN(150) B = 3000 B
+		// The receiver funnel de-dups a re-emit whose wire bsi equals the emit high-water
+		// (fwd==0 -> [RSP-V2-DEDUP-DROP], keyed on rx_stream_emitted_bsi_hw). Across a real
+		// DEMOTE-REBASE the delivery that must re-prove byte alignment is a NEW forward batch
+		// (fwd>=1: the CMD re-sends the abandoned bytes under a rolled bsi), so it clears the
+		// emit de-dup and reaches the rebase-seam gate. Model that before each delivery below
+		// (emit high-water one behind the wire bsi) so each check exercises the REBASE-SEAM
+		// decision + reassembler, not the orthogonal emit de-dup gate (tested in test_dedup_rebase).
+
+		// V0 — NO false-fire (seam NOT armed): a stampless delivery must proceed. This is the
+		// task's "legitimate stampless-contiguous case (no rebase seam)".
+		rsp_rebase_seam_armed       = false;
+		rx_stream_delivered         = 101;                 // a clean 101-byte prefix delivered
+		rx_stream_stamp[VBSI].valid = false;
+		decrypt_delivered_bsi       = VBSI;
+		CHECK(!w_seam_refuse(VBSI), "V0: no seam armed => stampless delivery not refused (no false-fire)", 0, 0);
+		fifo_buffer_rx.flush();
+		int v0_total = seat_rx_batch(VK, VK);
+		uint64_t v0_before = rx_stream_delivered;
+		rx_stream_emitted_bsi_hw = (VBSI - 1) & 0xFF;      // forward batch across the rebase seam (fwd>=1): INV-DEDUP inert, so this exercises the SEAM gate
+		copy_data_to_buffer();                             // seam inert => clean delivery (PRODUCTION path)
+		{ char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+		  CHECK(popped==v0_total, "V0: stampless batch delivered fully when no seam armed", popped, v0_total); }
+		CHECK(rx_stream_delivered == v0_before + (uint64_t)v0_total,
+			"V0: cursor advanced by the delivered bytes", (long long)rx_stream_delivered, (long long)(v0_before + v0_total));
+
+		// V — ARM the seam (as the production DEMOTE-REBASE does) and present the SPLICE: a
+		// bsi-contiguous batch with NO stamp (EOB lost) at a stamp-riding config.
+		rsp_rebase_seam_armed       = true;
+		rx_stream_delivered         = 101;                 // cursor at the good-prefix boundary
+		rx_stream_stamp[VBSI].valid = false;               // EOB frame (stamp) LOST across the seam
+		decrypt_delivered_bsi       = VBSI;
+		// The decision predicate MUST fire (seam armed + stamp-riding + no aligned stamp), BOTH modes.
+		CHECK(w_seam_refuse(VBSI), "V: seam+stamp-riding+no-stamp => REFUSE decision fires", 1, 1);
+		fifo_buffer_rx.flush();
+		int vtotal = seat_rx_batch(VK, VK);
+		if(seam_defeat)
+		{
+			// fail-before: the caller-knob defeats the refuse => copy_data_to_buffer delivers
+			// the unproven (possibly-shifted) batch SILENTLY — the escape reproduced.
+			uint64_t before = rx_stream_delivered;
+			rx_stream_emitted_bsi_hw = (VBSI - 1) & 0xFF;  // forward batch across the rebase seam (fwd>=1): INV-DEDUP inert, so this exercises the SEAM gate
+			copy_data_to_buffer();
+			char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+			bool silent = (popped==vtotal) && (rx_stream_delivered==before+(uint64_t)vtotal);
+			CHECK(silent, "V(defeat): unstamped batch across seam SILENTLY delivered (fail-before escape)", popped, vtotal);
+		}
+		else
+		{
+			// pass-after: the decision fired (asserted above). The production copy_data_to_buffer
+			// refuses via rsp_gap_abort_teardown (socket-bound — mirrored, not invoked, exactly as
+			// Part G does). REFUSE => 0 silent bytes beyond the 101-byte prefix.
+			char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));  // fifo still empty
+			CHECK(popped==0, "V(fix): unstamped stamp-riding batch across seam REFUSED, 0 silent bytes", popped, 0);
+		}
+
+		// V-disarm — a STAMPED, byte-aligned delivery across the seam is byte-PROVABLE => it
+		// delivers AND disarms the seam (the rest of the transfer proceeds normally).
+		rsp_rebase_seam_armed        = true;
+		rx_stream_delivered          = 101;
+		rx_stream_stamp[VBSI].start  = 101;                // stamp proves start == cursor (aligned)
+		rx_stream_stamp[VBSI].length = VK*GFLEN;
+		rx_stream_stamp[VBSI].valid  = true;
+		decrypt_delivered_bsi        = VBSI;
+		CHECK(!w_seam_refuse(VBSI), "V-disarm: aligned stamp across seam => not refused", 0, 0);
+		fifo_buffer_rx.flush();
+		int vd_total = seat_rx_batch(VK, VK);
+		rx_stream_emitted_bsi_hw = (VBSI - 1) & 0xFF;      // forward batch across the rebase seam (fwd>=1): INV-DEDUP inert, so this exercises the SEAM gate
+		copy_data_to_buffer();                             // delivers + disarms (PRODUCTION path)
+		{ char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+		  CHECK(popped==vd_total, "V-disarm: aligned stamped batch delivered fully across seam", popped, vd_total); }
+		CHECK(!rsp_rebase_seam_armed, "V-disarm: seam DISARMED after a byte-aligned delivery",
+			rsp_rebase_seam_armed?1:0, 0);
+
+		// V-legit — WHILE the seam is armed, a NON-stamp-riding (robust / tiny-frame) delivery is
+		// the legitimate stampless-contiguous path and must STILL deliver (the fix must not break
+		// robust demote-recovery). header_carries_d5=false => w_stamp_rides()==false.
+		rsp_rebase_seam_armed        = true;
+		this->header_carries_d5      = false;              // robust config: no stamp rides
+		CHECK(!w_stamp_rides(), "V-legit: non-stamp-riding config (robust)", w_stamp_rides()?1:0, 0);
+		rx_stream_delivered          = 500;
+		rx_stream_stamp[VBSI].valid  = false;
+		decrypt_delivered_bsi        = VBSI;
+		CHECK(!w_seam_refuse(VBSI), "V-legit: robust stampless delivery under armed seam => not refused", 0, 0);
+		fifo_buffer_rx.flush();
+		int vl_total = seat_rx_batch(3, 3);                // a tiny robust batch
+		uint64_t vl_before = rx_stream_delivered;
+		rx_stream_emitted_bsi_hw = (VBSI - 1) & 0xFF;      // forward batch across the rebase seam (fwd>=1): INV-DEDUP inert, so this exercises the SEAM gate
+		copy_data_to_buffer();                             // delivers (seam leaves robust untouched)
+		{ char tmp[65536]; int popped=fifo_buffer_rx.pop(tmp,(int)sizeof(tmp));
+		  CHECK(popped==vl_total, "V-legit: robust stampless batch delivered under armed seam (fix does not break it)", popped, vl_total); }
+		CHECK(rx_stream_delivered == vl_before + (uint64_t)vl_total,
+			"V-legit: robust delivery advanced the cursor", (long long)rx_stream_delivered, (long long)(vl_before + vl_total));
+		this->header_carries_d5 = true;                    // restore
+
+		printf("[TEST-STREAM-OFFSET] Part V seam_defeat=%d (0=fix->refuse, 1=defeat->silent)\n", (int)seam_defeat);
+	}
 
 	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] ---- %d check(s) failed ----\n", g_fails);

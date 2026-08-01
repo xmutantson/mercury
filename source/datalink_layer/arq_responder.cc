@@ -4306,7 +4306,9 @@ void cl_arq_controller::process_control_responder()
 				// SET_CONFIGs do not perturb the window. The delivery-time gate (#1) is
 				// the inviolable backstop if any frame still slips past this re-baseline.
 				// See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md section 3.
+				bool _ss_do_rebase = (sack_v2_enabled && rsp_current_expected_batch_seq_id >= 0);
 				rsp_inband_demote_rebase();   // INV-DEDUP: REAL production rebase (preserves last_delivered + emit high-water)
+				if(_ss_do_rebase) rsp_rebase_seam_armed = true;   // SS: arm rebase-seam fail-closed (silent-corruption P0)
 			}
 
 			if(!passive_monitor)

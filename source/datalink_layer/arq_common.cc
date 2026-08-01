@@ -1022,6 +1022,8 @@ cl_arq_controller::cl_arq_controller()
 	rx_stream_crc=CRC32_INIT;
 	for(int _s=0;_s<256;_s++) tx_stream_stamp[_s].valid=false;
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
+	rsp_rebase_seam_armed=false;   // Option W REBASE-SEAM: no seam open on a fresh controller
+	rsp_seam_refuse_count=0;
 	// SACK Design A Step 4 — RSP cross-batch routing state. All gated on
 	// sack_v2_enabled; v1 path leaves these at their sentinels. Per §4.2.3,
 	// `current_expected` is adopted from the first v2 DATA frame received;
@@ -8795,6 +8797,10 @@ void cl_arq_controller::reset_session_state()
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
 	for(int _s=0;_s<256;_s++) tx_batch_span[_s]=0;   // LINK-PHASE STEP 2 (a): clear stale per-bsi spans on session reset
 	rx_buffer_retx_turn_tail=false;   // no per-frame boundary marker survives reset
+	// Option W REBASE-SEAM: a fresh session anchors the byte cursor at 0 with no open
+	// seam. The counter is a monitoring statistic — reset per session for a clean count.
+	rsp_rebase_seam_armed = false;
+	rsp_seam_refuse_count = 0;
 
 	// Config state — must match init() defaults
 	negotiated_configuration = init_configuration;
@@ -18535,6 +18541,30 @@ bool cl_arq_controller::w_stream_shift_detected(int wbsi)
 	return stamp_start != rx_cursor32;
 }
 
+bool cl_arq_controller::w_seam_refuse(int wbsi)
+{
+	// Option W REBASE-SEAM FAIL-CLOSED decision (data-flow-stream-offset.md §11). Pure;
+	// no side effects, no socket. Shared by the production copy_data_to_buffer and
+	// test_stream_offset (Part V), so the test drives the SAME decision the wire path
+	// uses (the w_stream_shift_detected / w_bytegate_shortfall pattern).
+	if(!rsp_rebase_seam_armed) return false;              // no open seam → never a refuse
+	if(wbsi >= 0)
+	{
+		int b = wbsi & 0xFF;
+		// A valid stamp proving stamp.start == the receiver's absolute cursor re-proves
+		// byte alignment across the seam ⇒ NOT a refuse (the caller disarms + delivers).
+		if(rx_stream_stamp[b].valid
+		   && (uint32_t)(rx_stream_stamp[b].start & 0xFFFFFFFFULL)
+		      == (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL))
+			return false;
+	}
+	// A non-stamp-riding config (robust / tiny-frame) carries NO stamp by construction —
+	// the LEGITIMATE stampless-contiguous path ⇒ NOT a refuse. A stamp-riding config with
+	// no aligned stamp means the EOB frame (hence the stamp) was LOST across the seam ⇒
+	// byte-contiguity is unprovable ⇒ REFUSE.
+	return w_stamp_rides();
+}
+
 void cl_arq_controller::copy_data_to_buffer()
 {
 	// """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -18678,6 +18708,76 @@ void cl_arq_controller::copy_data_to_buffer()
 			fflush(stdout);
 			rsp_gap_abort_teardown("Option W stream-shift: wire stamp.start != rx_stream_delivered");
 			return;   // do NOT deliver a positionally-shifted batch
+		}
+	}
+
+	// Option W REBASE-SEAM FAIL-CLOSED (data-flow-stream-offset.md §11): close the
+	// silent-corruption ESCAPE the BACKSTOP above cannot see. w_stream_shift_detected is
+	// FAIL-OPEN on an ABSENT stamp (returns false when !rx_stream_stamp[b].valid) — so
+	// when the EOB frame that carries the stamp is LOST, the positional check silently
+	// no-ops and a byte-shifted batch delivers. This bites specifically across a
+	// DEMOTE-REBASE seam: the re-baseline (cur=prev=-1) lets the next frame re-adopt
+	// through the bsi-contiguity gap-gate, a PROXY for byte-contiguity. If recovery
+	// re-labelled the bsi (lossless requeue rolls cmd_batch_seq_id) the absolute byte
+	// cursor jumps ~one config's worth of bytes WHILE the bsi label stays contiguous, so
+	// the batch passes every proxy guard (re-queue completeness / batch-size / bsi-
+	// contiguity / EOB count) but is NOT byte-contiguous — and with the EOB (hence the
+	// stamp) lost, the BACKSTOP is blind (WGN:15 cfg13, 4/8 cells corrupt; byte-perfect
+	// prefix then every later byte lifted ~125 KB ahead — ~125 KB silently skipped and
+	// admitted as contiguous). CORRECT-BY-CONSTRUCTION prevention: across the seam,
+	// REQUIRE a stamp that proves stamp.start == rx_stream_delivered before delivering a
+	// stamp-riding batch. An unstamped stamp-riding delivery CANNOT prove byte-contiguity,
+	// so REFUSE it — deliver nothing here, DROP the link per the existing gap-abort
+	// contract (the CMD re-sends the abandoned bytes under a fresh bsi, non-lossy at the
+	// system level — the SAME COMPLETE-or-LOUD discipline as the D3.1 gap-gate). The
+	// LEGITIMATE stampless-contiguous path (robust / tiny-frame configs where
+	// w_stamp_rides()==false carries no stamp by construction) is UNTOUCHED, and a
+	// genuinely-contiguous stamped delivery DISARMS the seam. Default ON (a correctness
+	// fix); MERCURY_STREAM_SEAM_FAILCLOSED=0 restores the pre-fix fail-open delivery (the
+	// fail-before arm), byte-identical when no seam is armed.
+	if(rsp_rebase_seam_armed)
+	{
+		int wbsi = decrypt_delivered_bsi & 0xFF;
+		bool aligned_stamp =
+			(decrypt_delivered_bsi >= 0)
+			&& rx_stream_stamp[wbsi].valid
+			&& ((uint32_t)(rx_stream_stamp[wbsi].start & 0xFFFFFFFFULL)
+			    == (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL));
+		if(aligned_stamp)
+		{
+			// A valid stamp proves stamp.start == the receiver's absolute cursor: byte
+			// alignment is re-established across the seam. Safe to deliver; close the seam.
+			rsp_rebase_seam_armed = false;
+			printf("[RSP-V2-SEAM-CLEAR] bsi=%d stamp.start=%u == rx_delivered — byte "
+				"alignment re-proven across the rebase seam; disarming.\n",
+				wbsi, (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL));
+			fflush(stdout);
+		}
+		else
+		{
+			bool seam_failclosed = true;
+			{ const char* e = std::getenv("MERCURY_STREAM_SEAM_FAILCLOSED");
+			  if(e && *e && atoi(e)==0) seam_failclosed = false; }
+			// w_seam_refuse() is true iff a stamp-riding config delivered with NO stamp
+			// proving alignment across the seam (the EOB frame was lost). Refuse rather
+			// than admit a possibly-shifted batch. A non-stamp-riding (robust / tiny-frame)
+			// delivery is the LEGITIMATE stampless-contiguous path — w_seam_refuse false —
+			// left untouched, seam still armed until a stamp-riding delivery re-proves
+			// alignment (a robust-only remainder never trips it; session reset clears it).
+			if(seam_failclosed && w_seam_refuse(decrypt_delivered_bsi))
+			{
+				rsp_seam_refuse_count++;
+				printf("[RSP-V2-SEAM-REFUSE] bsi=%d rx_delivered=%u stamp.valid=%d — rebase-"
+					"seam fail-closed: a stamp-riding batch with no EOB stamp cannot prove "
+					"byte contiguity across the seam; tearing down (no shifted delivery). "
+					"refuse_count=%lld\n",
+					wbsi, (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL),
+					(decrypt_delivered_bsi >= 0 && rx_stream_stamp[wbsi].valid) ? 1 : 0,
+					rsp_seam_refuse_count);
+				fflush(stdout);
+				rsp_gap_abort_teardown("Option W rebase-seam fail-closed: unstamped stamp-riding delivery cannot prove byte contiguity");
+				return;   // do NOT deliver a batch whose byte offset is unproven
+			}
 		}
 	}
 
