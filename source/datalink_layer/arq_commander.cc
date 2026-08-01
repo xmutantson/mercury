@@ -8685,6 +8685,13 @@ void cl_arq_controller::process_control_commander()
 					data_configuration = connect_fast_fallback_config;
 					ack_configuration  = connect_fast_fallback_config;
 					last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+					// A fast connect completed the handshake at the fast config (CONFIG_0); reseat the
+					// live PHY to the restored pin/fallback so forward DATA is keyed there. The budgeted
+					// revert slow path already reseats via load_configuration; the success path must too,
+					// or a quick connect leaves the commander transmitting at CONFIG_0 while the intent
+					// vars read the pin (connect-fast success-vs-revert restore asymmetry; cross-layer
+					// data-flow audit of the connect_fast restore paths).
+					load_configuration(connect_fast_fallback_config, FULL, YES);
 					if(robust_enabled == YES && is_robust_config(init_configuration))
 						connect_fuse_floor_config = init_configuration;
 					connect_fast_active = false;

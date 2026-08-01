@@ -6101,7 +6101,7 @@ public:
   int connect_fast_config;          // MERCURY_CONNECT_FAST_CONFIG (CONFIG_NONE=off; e.g. CONFIG_0=0)
   int connect_fast_budget_ms;       // MERCURY_CONNECT_FAST_BUDGET_MS — short fast-attempt budget
   bool connect_fast_active;         // latched true during the fast attempt; cleared on revert/CONNECTED
-  int connect_fast_fallback_config; // config to revert to (ROBUST_0 on a robust session)
+  int connect_fast_fallback_config; // config to revert to (the connect-time start/pin config)
   int connect_fast_fallback_robust; // robust_enabled to restore on revert (the true robust intent)
   cl_timer connect_fast_timer;      // COMMANDER short-budget timer (armed at CONNECT)
   // Bare START ACKs are CRC-less. Arm only after a successful MFSK START TX;

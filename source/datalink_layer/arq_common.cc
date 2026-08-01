@@ -2903,11 +2903,17 @@ int cl_arq_controller::init(int tcp_base_port, int gear_shift_on, int initial_mo
 	// divergence the anchor comment below warns about. Flipping robust_enabled=NO makes every
 	// derivation consistent at the fast config (session_floor_anchor(false,cfg)=cfg),
 	// reproducing the proven --start-cfg N seat. The revert (COMMANDER update_status /
-	// RESPONDER HAIL-timeout) restores robust_enabled + ROBUST_0.
+	// RESPONDER HAIL-timeout) restores robust_enabled + the true start/pin config.
 	if(connect_fast_config != CONFIG_NONE)
 	{
 		connect_fast_fallback_robust = robust_enabled;
-		connect_fast_fallback_config = robust_enabled ? ROBUST_0 : initial_mode;
+		// Remember the TRUE start/pin config for the revert. initial_mode is the connect-time
+		// target for BOTH robust and OFDM sessions and is captured HERE, before it is
+		// overwritten with the fast-connect config just below. The old robust?ROBUST_0 form
+		// discarded a robust pin above the floor (e.g. a pinned ROBUST_2), reverting it to
+		// ROBUST_0 instead of the requested config; a non-robust pin already carried the
+		// correct target (initial_mode).
+		connect_fast_fallback_config = initial_mode;
 		connect_fast_active = true;
 		robust_enabled = NO;
 		initial_mode = connect_fast_config;
@@ -7209,7 +7215,7 @@ void cl_arq_controller::update_status()
 	   connect_fast_timer.get_elapsed_time_ms() >= connect_fast_budget_ms)
 	{
 		printf("[CONNECT-FALLBACK] fast connect (CONFIG_%d) failed after %d ms "
-			"— reverting to CONFIG_%d (ROBUST_0) and retrying\n",
+			"— reverting to CONFIG_%d (connect fallback) and retrying\n",
 			connect_fast_config, connect_fast_timer.get_elapsed_time_ms(),
 			connect_fast_fallback_config);
 		fflush(stdout);
@@ -7253,7 +7259,7 @@ void cl_arq_controller::update_status()
 		else if(connect_fast_timer.get_elapsed_time_ms() >= 2*connect_fast_budget_ms)
 		{
 			printf("[CONNECT-FALLBACK] responder: fast connect (CONFIG_%d) stalled in "
-				"CONNECTION_RECEIVED %d ms (peer reverted) — reverting to CONFIG_%d (ROBUST_0), "
+				"CONNECTION_RECEIVED %d ms (peer reverted) — reverting to CONFIG_%d (connect fallback), "
 				"resuming LISTEN\n",
 				connect_fast_config, connect_fast_timer.get_elapsed_time_ms(),
 				connect_fast_fallback_config);

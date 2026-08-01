@@ -1908,7 +1908,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 			if(connect_fast_active)
 			{
 				printf("[CONNECT-FALLBACK] responder: fast connect (CONFIG_%d) listen timed out "
-					"— reverting listen to CONFIG_%d (ROBUST_0)\n",
+					"— reverting listen to CONFIG_%d (connect fallback)\n",
 					connect_fast_config, connect_fast_fallback_config);
 				fflush(stdout);
 				connect_fast_active = false;
@@ -2044,6 +2044,19 @@ void cl_arq_controller::process_messages_acknowledging_control()
 					if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
 						inband_finalize_ofdm_adopt_ring(data_configuration);
 				}
+			}
+			// A fast connect completed the handshake at the fast config; the TEST_CONNECTION_ACK
+			// has now been sent at that config (its geometry is config-dependent, so it MUST air
+			// BEFORE any reseat). Reseat the responder to the restored pin/data config here,
+			// symmetric with the commander success restore: the MFSK-suffix and OFDM TEST_ACK
+			// paths above do not, which stranded the responder at the fast config while the
+			// commander transmitted DATA at the pin (block failures / BREAK churn until a late
+			// precook swap caught up). No-op for a non-fast connect (current == data already).
+			if(data_configuration != current_configuration)
+			{
+				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+				if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
+					inband_finalize_ofdm_adopt_ring(data_configuration);
 			}
 		}
 		else if(ack_pattern_time_ms > 0)
