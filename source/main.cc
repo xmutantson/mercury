@@ -5953,6 +5953,24 @@ start_modem:
 
     if (list_modes)
     {
+        // Print the ladder on the LIVE guard-interval basis (Ngi=36 -> Nofdm=292),
+        // matching the guard interval installed at modem startup. Without this,
+        // load_configuration below runs on the constructor-default gi (54/256,
+        // Nofdm=310) and every printed rbc reads ~6.16% under the on-air rate.
+        {
+            double gi_ms = 3.0;  // production default
+#ifdef MERCURY_GUI_ENABLED
+            if (guard_interval_ms_cli > 0)
+                gi_ms = guard_interval_ms_cli;
+            else if (g_settings.guard_interval_ms != 3.0)
+                gi_ms = g_settings.guard_interval_ms;
+#else
+            if (guard_interval_ms_cli > 0)
+                gi_ms = guard_interval_ms_cli;
+#endif
+            int ngi = (int)(gi_ms * 12.0 + 0.5);  // 12kHz OFDM rate
+            telecom_system.default_configurations_telecom_system.ofdm_gi = (float)ngi / 256.0f;
+        }
         for (int i = 0; i < NUMBER_OF_CONFIGS; i++)
         {
             telecom_system.load_configuration(i);
