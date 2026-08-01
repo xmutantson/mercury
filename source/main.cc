@@ -7000,12 +7000,10 @@ start_modem:
         if (test_batch_shrink_orphan_current_cli) {
             // rx_btf=-1 current-batch shrink tail-drop (marginal-SNR silent corruption) (one-shot, exit rc).
             printf("[FLAG] --test-batch-shrink-orphan-current: invoking rx_btf=-1 "
-                   "current-batch shrink tail-drop regression
-");
+                   "current-batch shrink tail-drop regression\n");
             fflush(stdout);
             int rc = ARQ.test_batch_shrink_orphan_current();
-            printf("[FLAG] batch-shrink-orphan-current test complete (rc=%d) — exiting.
-", rc);
+            printf("[FLAG] batch-shrink-orphan-current test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
