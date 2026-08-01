@@ -241,6 +241,14 @@ public:
 	bool chase_buf_occupied;             // a candidate is buffered
 	long chase_captures;                 // diagnostic-only (INV-CHASE-5: must NOT feed the optimizer)
 	long chase_combines;                 // diagnostic-only
+	long chase_rescues = 0;              // diagnostic-only: combined decodes that CRC-passed and were adopted
+	// Scratch for the receive_byte() rescue hook (§ chase-combining-harq.md): a COPY
+	// of the live decoder-input LLRs (so the native single-look decode is untouched)
+	// plus the combined decode's bit/byte output. Members (not stack) to avoid a
+	// per-frame N_MAX alloc; sized lazily on first use.
+	std::vector<float> chase_combine_scratch;
+	std::vector<int>   chase_rescue_bits;
+	std::vector<int>   chase_rescue_bytes;
 	void chase_reset();                                        // void the buffer (config change / BREAK / reset)
 	void chase_capture(const float* llr, int len, int config);// buffer a failed look's LLR vector
 	// If chase_enabled AND a config-compatible candidate is buffered, add it

@@ -1087,6 +1087,213 @@ static int run_subpeak_rescue_selftest()
     return fails==0 ? 0 : 1;
 }
 
+// --test-chase-ab: production-path HARQ/Chase A/B fire proof (no cards, no RF).
+// Drives the REAL receive_byte() TWICE on the SAME OFDM codeword at a sub-threshold
+// SNR with INDEPENDENT noise realizations: look-1 fails the single-look decode and
+// is buffered by the chase CAPTURE hook (telecom_system.cc terminal-fail branch);
+// look-2 is soft-combined with look-1 by the chase RESCUE hook (before the accept
+// decision) and re-decoded. Reports, per (config, SNR):
+//   single%   = look-1 single-look decode rate (== both arms: floor is NOT lowered)
+//   comb_OFF% = look-2 decode rate, MERCURY_CHASE OFF (incumbent: another single look)
+//   comb_ON%  = look-2 decode rate, MERCURY_CHASE ON  (2-look combine)
+//   rescues   = chase adopts fired;   corrupt = adopted frame whose bytes != payload
+// comb_ON - comb_OFF at equal SNR is the delivered reach; the SNR gap between the
+// single-look and comb_ON waterfalls is the coding gain (~+3 dB MRC per copy).
+struct ChaseABCell {
+    int config; double snr_db; int trials;
+    int single_on; int single_off; int comb_on; int comb_off;
+    long rescues; int corrupt;
+};
+
+static ChaseABCell chase_ab_run_cell(int config, double snr_db, int trials, unsigned base_seed)
+{
+    ChaseABCell R; R.config=config; R.snr_db=snr_db; R.trials=trials;
+    R.single_on=R.single_off=R.comb_on=R.comb_off=0; R.rescues=0; R.corrupt=0;
+
+    for(int t=0;t<trials;t++){
+    // FRESH telecom_system per trial. Latched acquisition/batch state accumulates
+    // across receive_byte calls on a reused instance and starves the decode path
+    // after ~a dozen calls (measured: noiseless decode 100% at 3 trials -> 33% at
+    // 12 on a shared ts); a per-trial instance keeps each to <=4 receives (2 arms x
+    // 2 looks), which stays clean. The chase buffer lives on this ts and correctly
+    // persists across the trial's look-1 -> look-2 within each arm.
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(config);
+    // The single-frame synthetic vehicle's pilot-residual noise_variance_estimate
+    // reads high (~1.4) even NOISELESS (a property of a lone frame vs a real batch),
+    // so the pre-LDPC SKIP-VAR gate would reject every look before the decoder runs.
+    // We are exercising the LDPC decode + the chase capture/rescue hooks, NOT the
+    // SKIP-VAR gate -- disable it so every look reaches ldpc.decode() (the same knob
+    // as --skip-var-gate=off). LDPC+CRC16 remain the actual accept mechanism.
+    ts.skip_var_gate_enabled = false;
+    cl_data_container& dc = ts.data_container;
+    int interp      = ts.frequency_interpolation_rate;
+    int sym_samples = dc.Nofdm * interp;
+    int frame_symb  = dc.Nsymb + dc.preamble_nSymb;
+    int frame_samp  = frame_symb * sym_samples;
+    int buf_samp    = dc.buffer_Nsymb * sym_samples;
+    int max_delay   = buf_samp - frame_samp;
+    int nReal_data  = dc.nBits - ts.ldpc.P;
+    int frame_size  = (nReal_data - ts.outer_code_reserved_bits) / 8;
+    if(frame_size < 1) frame_size = 1;
+    int onset_symb = 8;   // match the proven subpeak decode_at recipe (onset 8, not 3)
+    int D = onset_symb * sym_samples; if(D>max_delay) D=max_delay; if(D<0) D=0;
+    static int ab_dbg = -1;
+    if(ab_dbg<0){ const char* e=std::getenv("MERCURY_CHASE_AB_DEBUG"); ab_dbg=(e&&*e&&atoi(e))?1:0; }
+
+    // Drive ONE noisy look through the production acquisition + decode path.
+    auto run_look = [&](const std::vector<double>& frame, double frame_rms,
+                        unsigned seed, std::vector<int>& out_bytes)->int {
+        // ZERO background (silence run-up) + frame(+noise) at D -- the proven
+        // subpeak_rescue_geom recipe. A noise-filled background outside the frame
+        // spuriously triggers batch/acquisition state on the reused ts and starves
+        // subsequent looks of the decode path.
+        double* rx = dc.ready_to_process_passband_delayed_data;
+        std::mt19937 rng(seed);
+        double sigma = (snr_db < 200.0) ? frame_rms / pow(10.0, snr_db/20.0) : 0.0;
+        std::normal_distribution<double> nd(0.0, sigma);
+        for(int i=0;i<buf_samp;i++) rx[i] = 0.0;
+        int copy_n = frame_samp; if(D+copy_n>buf_samp) copy_n=buf_samp-D;
+        for(int i=0;i<copy_n;i++) rx[D+i] = frame[i] + ((sigma>0.0)? nd(rng):0.0);
+        // Scrub latched per-decode state so a prior failed look cannot poison this one.
+        ts.receive_stats.ofdm_search_raw           = 0;
+        ts.data_container.nUnder_processing_events = 0;
+        ts.receive_stats.ofdm_batch_active        = false;
+        ts.receive_stats.delay                    = 0;
+        ts.use_last_good_freq_offset               = NO;
+        ts.use_last_good_time_sync                 = NO;
+        ts.consecutive_ofdm_decode_fails           = 0;
+        ts.mfsk_fixed_delay                        = -1;
+        // Pin extraction to the KNOWN onset D (same recipe as the subpeak-rescue
+        // decode_at() helper): a lone synthetic frame does not fine-lock cleanly
+        // enough under full search, so we extract at the exact placement. Both looks
+        // use the same delay; the only difference is the independent noise draw --
+        // exactly the same-codeword retx scenario chase combines.
+        ts.ofdm_forced_delay                       = D;
+        ts.receive_byte(rx, dc.hd_decoded_data_byte);
+        int decoded = (ts.receive_stats.message_decoded==YES)?1:0;
+        if(ab_dbg) fprintf(stderr,"[AB-DBG] cfg=%d snr=%.1f seed=%u decoded=%d delay=%d sync_trials=%d crc=0x%04X iter=%d allz=%d\n",
+                           config, snr_db, seed, decoded, (int)ts.receive_stats.delay, ts.receive_stats.sync_trials,
+                           ts.receive_stats.crc, ts.receive_stats.iterations_done, ts.receive_stats.all_zeros);
+        out_bytes.assign(frame_size,0);
+        for(int i=0;i<frame_size;i++) out_bytes[i]=dc.hd_decoded_data_byte[i]&0xff;
+        return decoded;
+    };
+
+    {
+        // Distinct payload (distinct codeword) per trial so a cross-trial mismatched
+        // combine cannot silently help; distinct, well-separated look seeds ensure
+        // the two looks are DECORRELATED (chase-combining-harq.md §6.1 landmine).
+        std::vector<int> payload(frame_size,0);
+        for(int i=0;i<frame_size;i++) payload[i]=((i*53+7) ^ (t*131+29)) & 0xff;
+        std::vector<double> frame(frame_samp,0.0);
+        ts.transmit_byte(payload.data(), frame_size, frame.data(), SINGLE_MESSAGE);
+        double e=0.0; for(double v:frame) e+=v*v;
+        double frame_rms = frame.size()? sqrt(e/(double)frame.size()):0.0;
+        unsigned s1 = base_seed + 100003u*(unsigned)(t+1);
+        unsigned s2 = base_seed + 700019u*(unsigned)(t+1) + 17u;
+
+        std::vector<int> b1,b2;
+        // OFF arm (incumbent): chase disabled -> two independent single looks.
+        ts.chase_enabled = false; ts.chase_reset();
+        R.single_off += run_look(frame, frame_rms, s1, b1);
+        R.comb_off   += run_look(frame, frame_rms, s2, b2);
+        // ON arm: chase enabled -> look-1 captured, look-2 combined+rescued.
+        ts.chase_enabled = true; ts.chase_reset();
+        long resc0 = ts.chase_rescues;
+        R.single_on += run_look(frame, frame_rms, s1, b1);   // fails -> captures
+        int d2 = run_look(frame, frame_rms, s2, b2);         // combine -> maybe rescue
+        R.comb_on += d2;
+        if(d2){ bool ok=true; for(int i=0;i<frame_size;i++) if(b2[i]!=(payload[i]&0xff)){ok=false;break;} if(!ok) R.corrupt++; }
+        R.rescues += (ts.chase_rescues - resc0);
+    }
+    } // end per-trial fresh-ts loop
+    return R;
+}
+
+static int run_chase_ab_selftest()
+{
+    printf("[TEST-CHASE-AB] production-path HARQ/Chase A/B (receive_byte 2-look combine)\n");
+    int trials = 12;
+    { const char* e=std::getenv("MERCURY_CHASE_AB_TRIALS"); if(e&&*e){ trials=atoi(e); if(trials<1) trials=1; } }
+    // Per-config SNR sweeps (dB) straddling each rung's single-look waterfall so the
+    // sub-threshold band (single ~0, comb_ON > 0) is visible. Overridable.
+    // Default SNR sweeps straddle each rung's single-look waterfall INTO the chase
+    // rescue band (single-look ~0, 2-look combine still decodes). Measured on this
+    // synthetic vehicle (requested SNR sits ~10 dB below the effective Es/N0):
+    //   cfg6  single waterfall ~-10.5 dB, combined holds to ~-12.5 (+~2 dB)
+    //   cfg9  single waterfall ~-7   dB, combined holds to ~-10  (+~3 dB)
+    //   cfg13 single waterfall ~-1   dB, combined holds to ~-4   (+~2 dB)
+    struct { int cfg; std::vector<double> snrs; } band[] = {
+        { 6,  { -9,-10,-11,-12,-13} },
+        { 9,  { -6, -8, -9,-10,-11} },
+        { 13, {  0, -2, -4, -5, -6} },
+    };
+    int nband = 3;
+    // Env overrides (calibration without rebuild): MERCURY_CHASE_AB_CONFIGS="6,9,13"
+    // sets which configs; MERCURY_CHASE_AB_SNRS="a,b,c" applies ONE sweep to all.
+    auto parse_list = [](const char* s, std::vector<double>& out){
+        out.clear(); std::string cur;
+        for(const char* p=s;;++p){ if(*p==','||*p=='\0'){ if(!cur.empty()){ out.push_back(atof(cur.c_str())); cur.clear(); } if(*p=='\0') break; } else cur+=*p; }
+    };
+    std::vector<int> cfg_override;
+    { const char* e=std::getenv("MERCURY_CHASE_AB_CONFIGS"); if(e&&*e){ std::vector<double> tmp; parse_list(e,tmp); for(double v:tmp) cfg_override.push_back((int)v); } }
+    std::vector<double> snr_override;
+    { const char* e=std::getenv("MERCURY_CHASE_AB_SNRS"); if(e&&*e) parse_list(e,snr_override); }
+    std::vector<std::pair<int,std::vector<double>>> plan;
+    if(!cfg_override.empty()){
+        for(int c : cfg_override) plan.push_back({c, !snr_override.empty()? snr_override : std::vector<double>{0,2,4,6,8,10,12,14,16,18,20}});
+    } else {
+        for(int bi=0;bi<nband;bi++) plan.push_back({band[bi].cfg, !snr_override.empty()? snr_override : band[bi].snrs});
+    }
+    int fails = 0;
+    bool any_lift = false;
+    printf("[TEST-CHASE-AB] trials=%d per cell; looks are DECORRELATED; distinct codeword per trial\n", trials);
+    printf("  cfg  SNRdB   single%%   comb_OFF%%  comb_ON%%   rescues  corrupt   (comb_ON-OFF = delivered reach)\n");
+    for(auto& pe : plan){
+        for(double snr : pe.second){
+            ChaseABCell R = chase_ab_run_cell(pe.first, snr, trials, 0xC4A5Eu);
+            double sp = 100.0*R.single_on/trials;
+            double coff = 100.0*R.comb_off/trials;
+            double con = 100.0*R.comb_on/trials;
+            printf("  %3d  %5.1f   %5.0f     %5.0f      %5.0f      %4ld     %4d\n",
+                   pe.first, snr, sp, coff, con, R.rescues, R.corrupt);
+            fflush(stdout);
+            // Floor-not-lowered: look-1 single decode identical ON vs OFF.
+            if(R.single_on != R.single_off){
+                printf("    [FAIL] floor moved: single_ON=%d != single_OFF=%d (chase changed the single-look decode)\n",
+                       R.single_on, R.single_off);
+                fails++;
+            }
+            // 0-corruption: no adopted frame may byte-mismatch the payload.
+            if(R.corrupt != 0){
+                printf("    [FAIL] %d chase-adopted frame(s) corrupt (bytes != payload)\n", R.corrupt);
+                fails++;
+            }
+            // Incumbent floor: comb_OFF must not exceed single (it is just another
+            // single look) by more than noise -- sanity, not a hard gate.
+            if(R.comb_on > R.comb_off && R.rescues > 0) any_lift = true;
+        }
+    }
+    // Lift is a HARD gate ONLY on the default (tuned) bands: the sweet-spot cells
+    // rescue reproducibly, so a default run with NO lift means the chase hooks stopped
+    // firing (a regression). Under an env SNR override the band may deliberately miss
+    // the waterfall, so there it is a WARN, not a fail.
+    bool default_bands = cfg_override.empty() && snr_override.empty();
+    if(!any_lift){
+        if(default_bands){
+            printf("[TEST-CHASE-AB] [FAIL] no cell showed comb_ON > comb_OFF with a rescue on the default bands -- the chase capture/rescue hooks did not fire.\n");
+            fails++;
+        } else {
+            printf("[TEST-CHASE-AB] [WARN] no cell showed comb_ON > comb_OFF with a rescue -- SNR band may miss the waterfall; retune MERCURY_CHASE_AB_* or inspect.\n");
+        }
+    }
+    printf("[TEST-CHASE-AB] %s (fails=%d, lift_seen=%s)\n",
+           fails==0 ? "PASS (chase rescues double-fail frames; 0 corrupt; floor unchanged)" : "FAILED", fails, any_lift?"YES":"NO");
+    return fails==0 ? 0 : 1;
+}
+
 // --test-frame0-vehicle: deterministic IN-PROCESS reproduction of the
 // post-turnaround FIRST-FRAME wrong-lock (the anchor-race structural loss).
 // Synthesizes a passband RX buffer = [near-silent AWGN run-up] + [a REAL preamble
@@ -2824,6 +3031,16 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-subpeak-rescue") == 0) {
             arm_test_watchdog();
             int failed = run_subpeak_rescue_selftest();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-chase-ab : production-path HARQ/Chase A/B (receive_byte 2-look
+        // combine). Proves the chase capture+rescue hooks FIRE on the real decode
+        // path, recover sub-threshold frames the single look failed, do NOT lower
+        // the floor (single decode identical ON vs OFF), and never corrupt (adopted
+        // frame byte-checked vs payload). Cheap, deterministic, no cards/RF.
+        if (strcmp(argv[i], "--test-chase-ab") == 0) {
+            arm_test_watchdog();
+            int failed = run_chase_ab_selftest();
             return (failed == 0) ? 0 : 1;
         }
         // --test-sigterm-handler : run ONLY the FIX-C graceful-shutdown handler

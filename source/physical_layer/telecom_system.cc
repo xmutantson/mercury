@@ -4193,6 +4193,88 @@ skip_h_retry_point:
 				receive_stats.crc=CRC16_MODBUS_RTU_calc(data_container.hd_decoded_data_byte, nReal_data/8);
 			}
 
+			// ---- CHASE-COMBINE HARQ rescue (RX-only soft-LLR combine; MERCURY_CHASE=1) ----
+			// The single-look native decode above just FAILED CRC (or hit the iter cap).
+			// If a prior failed look of the SAME codeword (same config AND same decoder-
+			// input length -- INV-CHASE-2) is buffered, sum the two decoder-input LLR
+			// vectors and re-decode: two time-decorrelated looks of one codeword combine
+			// by maximal-ratio LLR-sum for ~+3 dB per copy (chase-combining-harq.md §5).
+			//
+			// SAFETY (LOSE-not-CORRUPT, floor cannot move):
+			//  * RX-ONLY and on a COPY. The native single-look decode already ran on the
+			//    UNTOUCHED data_container.deinterleaved_data and failed; the combine works
+			//    on chase_combine_scratch, so a rescue can only ADD a recovered frame,
+			//    never replace a good decode. MERCURY_CHASE=0 => this block never runs =>
+			//    byte-identical to the pre-chase path (the OFF arm is the incumbent).
+			//  * ADOPT ONLY on a real decode: crc==0 AND NOT all-zeros AND the combined
+			//    decode CONVERGED (iters < cap, INV-CHASE-4.1). A mismatched-codeword sum
+			//    (two UNRELATED frames) almost never both passes CRC16 and converges; and
+			//    an adopted frame flows through the SAME parse+route path as a native
+			//    decode (INV-CHASE-1), so a wrong-batch_seq_id false-accept is DROPPED by
+			//    the existing v2 router (batch_seq_id must be a live id) rather than
+			//    corrupting delivery. The config gate + chase_reset() on load_configuration
+			//    (:12615/:12860) guarantee the buffered look is over the current code.
+			// CRC16 configs only (a non-CRC config cannot self-validate a combined decode).
+			// ALIGNED-PRIMARY gate: capture/combine ONLY the aligned primary decode, NOT a
+			// TINTERP-SEED / subpeak re-decode (those sit at a shifted delay or a different
+			// estimator -- buffering one would misalign the LLR sum against a retx's aligned
+			// look). Both in-flight flags are false only on this frame's first aligned pass.
+			bool chase_aligned_pass = !subpeak_recover_in_flight && !tinterp_rescue_in_flight;
+			if(chase_enabled && M != MOD_MFSK
+			   && outer_code == CRC16_MODBUS_RTU
+			   && chase_aligned_pass
+			   && frame_decode_rejected(receive_stats, outer_code)
+			   && receive_stats.all_zeros == NO
+			   && ldpc.N <= N_MAX)
+			{
+				// (1) RESCUE: if a prior aligned look of a same-config codeword is buffered,
+				// sum it into a COPY of this aligned look and re-decode. Adopt ONLY on a
+				// converged CRC-pass (INV-CHASE-4.1); the copy leaves the native decode
+				// untouched so the floor cannot move.
+				bool adopted = false;
+				if(chase_buf_occupied && chase_buf_config == current_configuration && chase_buf_len == ldpc.N)
+				{
+					if((int)chase_combine_scratch.size() < ldpc.N) chase_combine_scratch.assign(N_MAX, 0.0f);
+					for(int i=0;i<ldpc.N;i++) chase_combine_scratch[i] = data_container.deinterleaved_data[i];
+					if(chase_combine(chase_combine_scratch.data(), ldpc.N, current_configuration))
+					{
+						if((int)chase_rescue_bits.size()  < N_MAX)     chase_rescue_bits.assign(N_MAX, 0);
+						if((int)chase_rescue_bytes.size() < N_MAX/8+1) chase_rescue_bytes.assign(N_MAX/8+1, 0);
+						int c_iters = ldpc.decode(chase_combine_scratch.data(), chase_rescue_bits.data());
+						// Descramble + byte-pack the combined decode, then CRC16 self-check.
+						bit_energy_dispersal(chase_rescue_bits.data(), data_container.bit_energy_dispersal_sequence, chase_rescue_bits.data(), nReal_data);
+						bit_to_byte(chase_rescue_bits.data(), chase_rescue_bytes.data(), nReal_data);
+						bool c_allzero = true;
+						for(int i=0;i<nReal_data/8;i++) if(chase_rescue_bytes[i]!=0){ c_allzero=false; break; }
+						int  c_crc = c_allzero ? 1 : (int)CRC16_MODBUS_RTU_calc(chase_rescue_bytes.data(), nReal_data/8);
+						bool c_converged = (c_iters <= (ldpc.nIteration_max - 1));
+						if(!c_allzero && c_crc == 0 && c_converged)
+						{
+							// ADOPT: publish the rescued frame's bytes exactly as a native
+							// decode would (INV-CHASE-1). The frame_decode_rejected() test just
+							// below then sees crc==0 and routes this frame to the SUCCESS path.
+							for(int i=0;i<nReal_data;i++)   data_container.hd_decoded_data_bit[i]  = chase_rescue_bits[i];
+							for(int i=0;i<nReal_data/8;i++) data_container.hd_decoded_data_byte[i] = chase_rescue_bytes[i];
+							for(int i=0;i<(nReal_data-outer_code_reserved_bits)/8;i++) *(out+i) = chase_rescue_bytes[i];
+							receive_stats.crc             = 0;
+							receive_stats.all_zeros       = NO;
+							receive_stats.iterations_done = c_iters;
+							chase_rescues++;
+							adopted = true;
+							printf("[CHASE-RESCUE] cfg=%d iter=%d captures=%ld combines=%ld rescues=%ld - 2-look combine decoded a frame the single look failed\n",
+								current_configuration, c_iters, chase_captures, chase_combines, chase_rescues);
+							fflush(stdout);
+						}
+					}
+				}
+				// (2) CAPTURE: still failing -> buffer THIS aligned look (the exact float*
+				// handed to ldpc.decode, INV-CHASE-3) so a future same-config retx can
+				// combine against it. Single-slot; overwrites; chase_reset() on any config
+				// change (:12615/:12860) voids it.
+				if(!adopted)
+					chase_capture(data_container.deinterleaved_data, ldpc.N, current_configuration);
+			}
+
 			// Accept/reject decision extracted into frame_decode_rejected() so the
 			// deterministic gate self-test exercises the SAME predicate this path uses.
 			// CRC16 branch: reject unless crc==0 AND the LDPC decode CONVERGED.
