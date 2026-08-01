@@ -118,6 +118,7 @@ struct st_receive_stats{
 	double ofdm_drift_per_frame = 0.0;  // IIR-filtered prediction error (interp samples) for BATCH verify
 	double mean_H = -1.0;  // mean(|estimated_channel|) over MEASURED subcarriers for the last OFDM trial; -1 if not computed (default matches the per-receive reset at telecom_system.cc:1052). Test-observability for the SKIP-H gate (write-once per receive, read by unit tests only). See fact-documents/ofdm-fine-timing-magnitude.md §3.5.
 	int last_eff_preamble_nsymb = 0;  // LEVER P: actual preamble-symbol count of the most recently extracted OFDM frame (FULL anchor vs MINI tail). Read by the ARQ position-advance (rx_frame = last_eff_preamble_nsymb + Nsymb). Defaults to preamble_nSymb when amortization is off.
+	int coast_frames_since_anchor = 0;  // BATCH-GRID COAST (DATAFLOW_AUDIT_batch_coast.md): consecutive forward-DATA frames the RX has COASTED (grid advanced one frame period past a decode FAIL, batch kept alive) since the last CRC-GOOD anchor. Reset to 0 on any successful decode and at session reset. Bounds the coast to the declared batch B so a keydown-end cannot coast into silence forever.
 };
 
 

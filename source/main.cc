@@ -1891,6 +1891,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_bc;
                 failed += test_bc.test_burst_coalesce_held_rung();
             }
+            // BATCH-GRID COAST (FIX 1) — on a mid-batch decode FAIL the stock anti-spin
+            // ladder discards the frame grid and the RX blind-searches into the
+            // beyond-bounds attractor, killing the whole tail. Coast keeps the grid alive
+            // (advance one frame period from the last CRC-GOOD anchor, keep batch_active) so
+            // the existing predict+verify re-locks the next frame. Drives the REAL
+            // batch_coast_try_advance() with REAL cfg15 geometry: PASS-AFTER coasts + counter
+            // fires; FAIL-BEFORE (MERCURY_BATCH_COAST_DEFEAT) inert; per-leg eligibility guards.
+            {
+                cl_arq_controller test_coast;
+                failed += test_coast.test_batch_coast();
+            }
             // DUTY FAST-START lever ELEVATOR FAST-CONFIRM — margin-gated N=1 OFDM climb confirm:
             // on a whole-clean OFDM batch whose raw SNR capacity clears a higher rung, the anchor
             // is seated + the FRAME-UP elevator fires on the FIRST clean (skip the 2nd confirm),

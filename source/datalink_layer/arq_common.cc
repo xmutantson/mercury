@@ -858,6 +858,13 @@ cl_arq_controller::cl_arq_controller()
 		const char* bc = std::getenv("MERCURY_BURST_COALESCE_DEFEAT");
 		burst_coalesce_defeat = (bc && *bc && atoi(bc) != 0);
 		batches_at_current_config = 0;
+		// BATCH-GRID COAST (DATAFLOW_AUDIT_batch_coast.md) — ships DEFAULT-ON.
+		// MERCURY_BATCH_COAST_DEFEAT=1 restores the stock grid-teardown ladder so the
+		// A/B runs FIX vs DEFEAT on ONE binary. Env-latched ONCE here (production path)
+		// exactly like the coalescing knob above. Standalone (not folded into a master).
+		const char* bco = std::getenv("MERCURY_BATCH_COAST_DEFEAT");
+		batch_coast_defeat = (bco && *bco && atoi(bco) != 0);
+		batch_coast_advances = 0;
 		// ELEVATOR FAST-CONFIRM (climb-duty). Ships DEFAULT-ON. MERCURY_DUTY_ELEV_DEFEAT=1 (or the
 		// master MERCURY_DUTY_FASTSTART_DEFEAT=1) restores the incumbent N=2 confirm so the fire-proof
 		// runs FIX vs DEFEAT on ONE binary. Env-latched ONCE here like the R / P-alt knobs above.
@@ -16086,6 +16093,191 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 	return false;
 }
 
+// BATCH-GRID COAST (DATAFLOW_AUDIT_batch_coast.md) -- forward-DATA RX grid coast.
+// Called by receive() at the mid-batch OFDM decode-FAIL anti-spin site. On FAIL the
+// stock ladder discards the frame grid (search_raw=0/batch_active=false) and the RX
+// blind-searches into the pream>upper beyond-bounds attractor to TX-END, killing the
+// whole tail. This keeps the grid ALIVE: advance it ONE full frame period from the
+// shift-tracked cursor (== last CRC-GOOD anchor + n_failed*frame_period across buffer
+// wraps -- the cursor is only RE-anchored on a successful decode at :16876 and here
+// advanced by exactly one frame period, so a bad detection's delay is never trusted)
+// and keep batch_active, so the EXISTING predict+verify (telecom_system.cc:2060)
+// re-locks the next frame. A coasted-but-still-failed frame is a stock SACK hole.
+// The grid arithmetic MIRRORS the success producer (:16818/:16876/:16882) MINUS the
+// nUnder subtraction, which the shared chain at the end of the anti-spin block does
+// once (matching the success path's single nUnder subtract). Eligibility: RSP
+// forward-DATA only (the CMD 7.13.36 SACK-poll preamble-preserve path is
+// role==COMMANDER and disjoint), v2 SACK (the coalescing/wide-batch regime),
+// mid-batch (batch_active && search_raw>0), NOT keydown-end (frame_data_missing
+// disarms -- the energy-gate boundary), bounded by the declared batch B
+// (coast_frames_since_anchor < data_batch_size). Big-block (CFG16, default-off) and
+// MFSK have their own rungs. MERCURY_BATCH_COAST_DEFEAT=1 => always returns false =>
+// the stock teardown ladder runs byte-for-byte. Returns true (and sets *ftr to the
+// buffer shift) iff it COASTED. This IS the production coast path (receive() calls
+// it); the directed regression test_batch_coast() drives it with a real cfg15 TX +
+// receive_byte decode loop (fail-before/pass-after).
+bool cl_arq_controller::batch_coast_try_advance(int frame_symb, int upper,
+	int pream_symb, bool frame_data_missing, int* ftr)
+{
+	bool coast_eligible =
+		   !batch_coast_defeat
+		&& role == RESPONDER
+		&& sack_v2_enabled
+		&& telecom_system->M != MOD_MFSK
+		&& !telecom_system->bigblock_framing_enabled
+		&& telecom_system->receive_stats.ofdm_batch_active
+		&& telecom_system->receive_stats.ofdm_search_raw > 0
+		&& !frame_data_missing
+		&& telecom_system->receive_stats.coast_frames_since_anchor < data_batch_size;
+	if(!coast_eligible) return false;
+
+	int frame_period = frame_symb;   // Nsymb + eff preamble (full when amortization off)
+	int coast_end = telecom_system->receive_stats.ofdm_search_raw + frame_period;
+	int min_ftr_c = coast_end - upper + 4;          // mirror success min_ftr (:16818)
+	int f = (min_ftr_c > 0) ? min_ftr_c : 8;        // always advance the buffer
+	if(f > coast_end) f = coast_end;                // mirror success upper clamp (:16829)
+	int new_sr = coast_end - f - 1;                 // mirror :16876 MINUS nUnder (shared chain)
+	if(new_sr < 0) new_sr = 0;
+	if(upper > 0 && new_sr > upper) new_sr = upper; // mirror :16882 (INV-1)
+	telecom_system->receive_stats.ofdm_search_raw = new_sr;
+	telecom_system->receive_stats.ofdm_batch_active = true;
+	telecom_system->receive_stats.coast_frames_since_anchor++;
+	batch_coast_advances++;
+	*ftr = f;
+	printf("[BATCH-COAST] cfg=%d pream=%d upper=%d frame_period=%d coast_end=%d "
+		"ftr=%d search_raw=%d n_since_anchor=%d metric=%.3f total=%lld\n",
+		current_configuration, pream_symb, upper, frame_period, coast_end, f, new_sr,
+		telecom_system->receive_stats.coast_frames_since_anchor,
+		telecom_system->receive_stats.coarse_metric, batch_coast_advances);
+	fflush(stdout);
+	return true;
+}
+
+// FIX 1 directed regression (also runs in --test) -- drives the REAL
+// batch_coast_try_advance() with a REAL cfg15-loaded PHY geometry (upper/frame_symb
+// are production values, not hardcoded). Synthetic-fire (the codebase pattern used by
+// test_axis2_quiesce_gate / test_burst_coalesce_held_rung / test_climb_confirm_batch):
+// it exercises the real coast state machine + the success-mirroring grid arithmetic.
+// The continuous-keydown LDPC decode-recovery of frames 6-11 (and the FAIL-BEFORE
+// beyond-bounds tail-death) is the COHORT fire proof (fireproof: DEBT) -- reproducing
+// the tail-death CONDITION needs the live receive() capture loop.
+//   PASS-AFTER: on a mid-batch FAIL (frames 4-5) the helper COASTS -- returns true,
+//     keeps ofdm_batch_active, advances the grid one frame period, holds search_raw in
+//     (0,upper] across the whole buffer (INV-1 / R2), and the [BATCH-COAST] counter
+//     fires 0->N. Grid stays ALIVE so frames 6-11 remain recoverable.
+//   FAIL-BEFORE: batch_coast_defeat (MERCURY_BATCH_COAST_DEFEAT) => the helper is INERT
+//     (returns false, grid untouched, counter frozen) => the stock teardown the caller
+//     then runs kills the grid (the tail-death path).
+//   GUARDS: every eligibility leg individually forces a non-coast. 0=PASS, 1=FAIL.
+int cl_arq_controller::test_batch_coast()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		if(cond) printf("[TEST-BATCH-COAST] PASS: %s\n", name);
+		else   { printf("[TEST-BATCH-COAST] FAIL: %s\n", name); failed++; }
+		fflush(stdout);
+	};
+
+	// REAL cfg15 PHY geometry (buffer_Nsymb=139, Nsymb=12, preamble=4 => frame_symb=16,
+	// upper=123 -- the exact values the failing coalescing cells ran at).
+	cl_telecom_system ts;
+	ts.operation_mode = BER_PLOT_passband;
+	ts.load_configuration(CONFIG_15);
+	this->telecom_system = &ts;
+	int frame_symb = ts.data_container.Nsymb + ts.data_container.preamble_nSymb;
+	int upper      = (int)ts.data_container.buffer_Nsymb - frame_symb;
+	printf("[TEST-BATCH-COAST] cfg15 geometry: Nsymb=%d preamble=%d frame_symb=%d buffer_Nsymb=%d upper=%d\n",
+		ts.data_container.Nsymb, ts.data_container.preamble_nSymb, frame_symb,
+		(int)ts.data_container.buffer_Nsymb, upper);
+	fflush(stdout);
+	check(frame_symb > 0 && upper > frame_symb, "real cfg15 geometry loaded (upper>frame_symb)");
+
+	// Common prime: a HELD cfg15 RSP forward-DATA batch, mid-keydown, grid anchored.
+	auto prime = [&](int search_raw){
+		role = RESPONDER;
+		sack_v2_enabled = true;
+		current_configuration = CONFIG_15;
+		data_batch_size = 12;                 // declared B
+		batch_coast_defeat = false;
+		ts.bigblock_framing_enabled = false;
+		ts.receive_stats.ofdm_batch_active = true;
+		ts.receive_stats.ofdm_search_raw   = search_raw;
+		ts.receive_stats.coast_frames_since_anchor = 0;
+		ts.receive_stats.coarse_metric = 0.2;
+	};
+
+	// ---- PASS-AFTER: two consecutive mid-batch FAILs (frames 4,5) COAST ----
+	batch_coast_advances = 0;
+	prime(/*search_raw=*/100);
+	int ftr = 0;
+	bool c4 = batch_coast_try_advance(frame_symb, upper, /*pream_symb=*/100, /*frame_data_missing=*/false, &ftr);
+	check(c4, "frame4 FAIL coasts (returns true)");
+	check(ts.receive_stats.ofdm_batch_active, "frame4: batch kept ALIVE");
+	check(ts.receive_stats.ofdm_search_raw > 0 && ts.receive_stats.ofdm_search_raw <= upper,
+		"frame4: search_raw in (0,upper] (INV-1)");
+	check(ftr > 0, "frame4: buffer advances (ftr>0)");
+	check(ts.receive_stats.coast_frames_since_anchor == 1, "frame4: coast_frames == 1");
+	check(batch_coast_advances == 1, "frame4: [BATCH-COAST] counter 0->1");
+	// mimic the shared post-chain shift (search_raw -= nUnder) between frames.
+	ts.receive_stats.ofdm_search_raw -= 1;
+	bool c5 = batch_coast_try_advance(frame_symb, upper, 100, false, &ftr);
+	check(c5, "frame5 FAIL coasts (returns true)");
+	check(ts.receive_stats.ofdm_batch_active, "frame5: batch STILL alive (frames 6-11 recoverable)");
+	check(ts.receive_stats.ofdm_search_raw > 0 && ts.receive_stats.ofdm_search_raw <= upper,
+		"frame5: search_raw in (0,upper] (INV-1)");
+	check(batch_coast_advances == 2, "frames 4-5: counter == 2 (only 4-5 are holes)");
+
+	// ---- R2 / INV-1: the advance holds in-bounds for search_raw across the buffer ----
+	bool inv_ok = true;
+	for(int sr = 1; sr <= upper; sr++){
+		prime(sr);
+		int f2 = 0;
+		bool got = batch_coast_try_advance(frame_symb, upper, sr, false, &f2);
+		if(!got) { inv_ok = false; break; }
+		int nsr = ts.receive_stats.ofdm_search_raw;
+		if(!(nsr >= 0 && nsr <= upper && f2 > 0)) { inv_ok = false; break; }
+	}
+	check(inv_ok, "R2/INV-1: search_raw sweep 1..upper stays in-bounds, ftr>0 (buffer-wrap safe)");
+
+	// ---- BOUND (declared B exhausted disarms) ----
+	prime(100); ts.receive_stats.coast_frames_since_anchor = data_batch_size;
+	check(!batch_coast_try_advance(frame_symb, upper, 100, false, &ftr),
+		"declared B exhausted (coast_frames==B) => disarm (returns false)");
+	prime(100); ts.receive_stats.coast_frames_since_anchor = data_batch_size - 1;
+	check(batch_coast_try_advance(frame_symb, upper, 100, false, &ftr),
+		"one below B still coasts");
+
+	// ---- FAIL-BEFORE: defeat makes the helper INERT (grid untouched) ----
+	batch_coast_advances = 0;
+	prime(100); batch_coast_defeat = true;
+	long long ctr_before = batch_coast_advances;
+	int sr_before = ts.receive_stats.ofdm_search_raw;
+	bool def = batch_coast_try_advance(frame_symb, upper, 100, false, &ftr);
+	check(!def, "DEFEAT: coast returns false (inert)");
+	check(ts.receive_stats.ofdm_search_raw == sr_before, "DEFEAT: search_raw UNCHANGED");
+	check(batch_coast_advances == ctr_before, "DEFEAT: counter frozen");
+	// the caller then runs the stock teardown -> grid dies (tail-death path).
+	ts.receive_stats.ofdm_search_raw = 0; ts.receive_stats.ofdm_batch_active = false;
+	check(!ts.receive_stats.ofdm_batch_active, "DEFEAT: stock teardown kills the grid (tail-death)");
+
+	// ---- eligibility GUARDS (each leg individually blocks the coast) ----
+	prime(100); role = COMMANDER;
+	check(!batch_coast_try_advance(frame_symb, upper, 100, false, &ftr), "guard: role!=RESPONDER => no coast (CMD SACK-poll disjoint)");
+	prime(100); sack_v2_enabled = false;
+	check(!batch_coast_try_advance(frame_symb, upper, 100, false, &ftr), "guard: sack_v2 off => no coast");
+	prime(100); ts.receive_stats.ofdm_batch_active = false;
+	check(!batch_coast_try_advance(frame_symb, upper, 100, false, &ftr), "guard: not mid-batch => no coast");
+	prime(0);
+	check(!batch_coast_try_advance(frame_symb, upper, 100, false, &ftr), "guard: search_raw<=0 => no coast");
+	prime(100);
+	check(!batch_coast_try_advance(frame_symb, upper, 100, /*frame_data_missing=*/true, &ftr), "guard: keydown-end (frame_data_missing) => disarm");
+
+	this->telecom_system = NULL;   // do not dangle the stack ts
+	printf("[TEST-BATCH-COAST] %s (%d failure%s)\n", failed==0?"ALL PASS":"FAILURES", failed, failed==1?"":"s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 void cl_arq_controller::receive()
 {
 	// BREAK forward-health gate (fix/break-fh-gate): monotonic receive() iteration
@@ -16883,6 +17075,11 @@ void cl_arq_controller::receive()
 				if(upper_clamp > 0 && telecom_system->receive_stats.ofdm_search_raw > upper_clamp)
 					telecom_system->receive_stats.ofdm_search_raw = upper_clamp;
 				telecom_system->receive_stats.ofdm_batch_active = true;
+				// BATCH-GRID COAST re-anchor: a CRC-GOOD frame just seated the grid, so
+				// the coast run (if any) is over — the next mid-batch FAIL coasts from
+				// THIS fresh anchor. Reset the per-anchor coast counter (bounds the coast
+				// to the declared B; see DATAFLOW_AUDIT_batch_coast.md §4).
+				telecom_system->receive_stats.coast_frames_since_anchor = 0;
 
 				// BREAK forward-health gate (fix/break-fh-gate) FIX-A: a forward OFDM
 				// frame just decoded successfully (this is the M!=MOD_MFSK else-branch).
@@ -17387,7 +17584,27 @@ void cl_arq_controller::receive()
 					int frame_symb = telecom_system->data_container.Nsymb + ff_eff_pre;
 					int upper = telecom_system->data_container.buffer_Nsymb - frame_symb;
 
-					if(received_message_stats.frame_data_missing)
+					// === BATCH-GRID COAST (DATAFLOW_AUDIT_batch_coast.md) ===
+					// On a mid-batch decode FAIL the stock anti-spin ladder below DISCARDS the
+					// frame grid (ofdm_search_raw=0 / ofdm_batch_active=false) and the RX falls to
+					// a blind full-buffer search that re-locks on data-region Schmidl-Cox sub-peaks
+					// and never recovers within the keydown (the observed pream=130/upper=123/
+					// shift=8 wall to TX-END), so ONE stochastic CRC/SKIP-VAR miss kills the whole
+					// remaining tail. batch_coast_try_advance() keeps the grid ALIVE: it advances the
+					// grid ONE full frame period from the last CRC-GOOD anchor and keeps
+					// ofdm_batch_active, so the EXISTING predict+verify (telecom_system.cc:2060,
+					// gated on batch_active && search_raw>0) re-locks the next frame with a stock
+					// full-preamble correlation; the failed frame simply becomes a SACK hole. NO
+					// acceptance gate is loosened. Returns true (and sets ftr) when it COASTED;
+					// false => not eligible (defeat / wrong role / keydown-end / declared B
+					// exhausted / big-block / MFSK) and the stock ladder below runs byte-for-byte.
+					if(batch_coast_try_advance(frame_symb, upper, pream_symb,
+						received_message_stats.frame_data_missing, &ftr))
+					{
+						// coasted -- grid advanced one frame period, batch kept alive; fall through
+						// to the shared nUnder subtract + frames_to_read=ftr commit below.
+					}
+					else if(received_message_stats.frame_data_missing)
 					{
 						// §7.13.36 — During a v2 SACK polling window, an
 						// in-flight SACK_RSP (OFDM partial-batch ACK) may be

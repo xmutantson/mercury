@@ -3898,6 +3898,18 @@ public:
 	      \return None
 	   */
   void receive();
+  // BATCH-GRID COAST (DATAFLOW_AUDIT_batch_coast.md) — forward-DATA RX grid coast.
+  // Called by receive() at the mid-batch OFDM decode-FAIL anti-spin site: keeps the
+  // frame grid ALIVE (advance one frame period from the last CRC-GOOD anchor, keep
+  // batch_active) instead of tearing down to a blind full search. Returns true (and
+  // sets *ftr to the buffer shift) iff it COASTED; false ⇒ stock teardown ladder runs.
+  bool batch_coast_try_advance(int frame_symb, int upper, int pream_symb,
+                               bool frame_data_missing, int* ftr);
+  // Directed regression for the coast (also runs in --test): real cfg15 TX + the REAL
+  // receive_byte decode loop + the REAL batch_coast_try_advance() advance; corrupt
+  // frames 4-5 at the sample level. FAIL-BEFORE (MERCURY_BATCH_COAST_DEFEAT=1) tail
+  // dies; PASS-AFTER frames 6-11 decode, [BATCH-COAST] counter fires, only 4-5 hole.
+  int test_batch_coast();
 
 	//! Prints debug information.
 	    /*!
@@ -5935,6 +5947,20 @@ public:
   // counter stays 0 — correct under the provenance-release shape (the RSP's only
   // above-pin producer is the CRC8-passed SET_LINK_PARAMS apply).
   int batches_at_current_config;
+  // BATCH-GRID COAST (DATAFLOW_AUDIT_batch_coast.md) — RX-only forward-DATA grid
+  // coast. Ships DEFAULT-ON. MERCURY_BATCH_COAST_DEFEAT=1 restores the stock
+  // teardown ladder (grid discarded on a mid-batch decode FAIL) so the A/B runs
+  // FIX vs DEFEAT on ONE binary. Env-latched ONCE in the ctor like the coalescing
+  // knob above. Standalone knob (not folded into any master defeat): coast is an
+  // independent RX-side fix from the CMD-side coalescing release.
+  bool batch_coast_defeat;
+  // Monotonic session-lifetime counter of BATCH-GRID COAST advances (each = one
+  // mid-batch decode FAIL where the RX advanced the frame grid one frame period
+  // and kept the batch alive instead of tearing down to a blind full search).
+  // Emitted as total=%d on every [BATCH-COAST] production line so the run JSON is
+  // scored by the counter at the source, not by grepping individual fire lines
+  // (diagnostic-discipline #7). 0 on a run where coast never fired.
+  long long batch_coast_advances;
   // ELEVATOR FAST-CONFIRM (DUTY fast-start, climb-duty) — margin-gated N=1 OFDM climb confirm
   // defeat gate. env-latched in the ctor (MERCURY_DUTY_ELEV_DEFEAT / master
   // MERCURY_DUTY_FASTSTART_DEFEAT). OFF (default): a WHOLE-clean OFDM batch whose RAW SNR
