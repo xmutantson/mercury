@@ -312,6 +312,14 @@ void cl_ofdm::copy_from(const cl_ofdm& s)
 	mfsk_preamble_match_threshold = s.mfsk_preamble_match_threshold;
 	memcpy(mfsk_stream_offsets, s.mfsk_stream_offsets, sizeof(mfsk_stream_offsets));
 	memcpy(mfsk_preamble_tones,  s.mfsk_preamble_tones,  sizeof(mfsk_preamble_tones));
+	// Detect-both alternate set + last-match report (NB robust-preamble
+	// capability negotiation) — must ride the swap or a precooked config
+	// loses the alternate detector arm.
+	mfsk_alt_preamble_nsymb  = s.mfsk_alt_preamble_nsymb;
+	mfsk_alt_match_threshold = s.mfsk_alt_match_threshold;
+	memcpy(mfsk_alt_preamble_tones, s.mfsk_alt_preamble_tones, sizeof(mfsk_alt_preamble_tones));
+	mfsk_matched_preamble_nsymb = s.mfsk_matched_preamble_nsymb;
+	mfsk_matched_alt            = s.mfsk_matched_alt;
 
 	// Template scalars + fixed arrays.
 	mfsk_corr_template_len    = s.mfsk_corr_template_len;

@@ -1171,8 +1171,10 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 
 	if(M == MOD_MFSK)
 	{
-		// MFSK preamble: known single-tone symbols (concentrated energy, detectable in weak signal)
-		mfsk.generate_preamble(data_container.preamble_data, data_container.preamble_nSymb);
+		// MFSK preamble: known single-tone symbols (concentrated energy, detectable in weak signal).
+		// Count = the ACTIVE set length (legacy until the NB robust-preamble
+		// capability is negotiated), not the geometry maximum.
+		mfsk.generate_preamble(data_container.preamble_data, mfsk.preamble_nSymb);
 	}
 	else
 	{
@@ -1228,8 +1230,11 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 	// that is ofdm_preamble[0], the Schmidl-Cox resync anchor. All preamble
 	// emission math below uses eff_preamble; data symbols still start right after
 	// the (shortened) preamble, so the frame waveform is genuinely shorter.
-	// MFSK keeps the full preamble (override is OFDM-data-only); guard on M.
-	int eff_preamble = (M == MOD_MFSK) ? data_container.preamble_nSymb
+	// MFSK keeps its full ACTIVE preamble (override is OFDM-data-only); the
+	// active length is the negotiation authority (mfsk.preamble_nSymb) — it can
+	// be SHORTER than data_container.preamble_nSymb, which is sized for the
+	// longest set so a mid-session negotiation flip never reallocates geometry.
+	int eff_preamble = (M == MOD_MFSK) ? mfsk.preamble_nSymb
 	                                   : tx_effective_preamble_nsymb();
 
 	for(int i=0;i<eff_preamble;i++)
@@ -1303,12 +1308,22 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 
 	if(message_location==SINGLE_MESSAGE)
 	{
-		ofdm.FIR_tx1.apply(data_container.passband_data_tx,data_container.passband_data_tx_filtered_fir_1,data_container.total_frame_size);
-		ofdm.FIR_tx2.apply(data_container.passband_data_tx_filtered_fir_1,data_container.passband_data_tx_filtered_fir_2,data_container.total_frame_size);
+		// The emitted frame can be SHORTER than total_frame_size (MFSK legacy
+		// 8-symbol preamble inside a sidelnikov-sized geometry, before the NB
+		// robust-preamble capability is negotiated). Filter and emit exactly the
+		// emitted span; zero the nominal-size tail so a caller that plays the
+		// nominal length transmits silence, never stale samples. When the
+		// emitted length equals total_frame_size this is the historical path.
+		ofdm.FIR_tx1.apply(data_container.passband_data_tx,data_container.passband_data_tx_filtered_fir_1,eff_frame_samples);
+		ofdm.FIR_tx2.apply(data_container.passband_data_tx_filtered_fir_1,data_container.passband_data_tx_filtered_fir_2,eff_frame_samples);
 
-		for(int i=0;i<data_container.total_frame_size;i++)
+		for(int i=0;i<eff_frame_samples;i++)
 		{
 			*(out+i)=data_container.passband_data_tx_filtered_fir_2[i];
+		}
+		for(int i=eff_frame_samples;i<data_container.total_frame_size;i++)
+		{
+			*(out+i)=0;
 		}
 		//		st_power_measurment power_measurment_preamble=ofdm.measure_signal_power_avg_papr(out, data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate);
 		//		st_power_measurment power_measurment_modulated_data=ofdm.measure_signal_power_avg_papr(&out[data_container.Nofdm*data_container.preamble_nSymb*frequency_interpolation_rate], data_container.Nofdm*data_container.Nsymb*frequency_interpolation_rate);
@@ -1720,9 +1735,11 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// symbol demod offset and frame-extraction size below. MFSK is unaffected
 	// (the amortization is OFDM-data-only). See
 	// fact-documents/data-flow-preamble-amortization.md §2.
-	int rx_eff_preamble = preamble_amortization_enabled
-	                    ? rx_effective_preamble_nsymb()
-	                    : data_container.preamble_nSymb;
+	int rx_eff_preamble = (M == MOD_MFSK)
+	                    ? mfsk.preamble_nSymb
+	                    : (preamble_amortization_enabled
+	                        ? rx_effective_preamble_nsymb()
+	                        : data_container.preamble_nSymb);
 	// CONTINUOUS-KEYDOWN carried-timing tracker state (per receive() call). When
 	// keydown_track_timing_enabled, a tail (MINI) frame whose predict-residual is
 	// SUB-GUARD (noise regime) does NOT re-pin the FFT window to the short-preamble
@@ -1939,7 +1956,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					data_container.baseband_data_decimated,
 					data_container.Nofdm * data_container.buffer_Nsymb,
 					1,
-					data_container.preamble_nSymb, mfsk.preamble_tones,
+					mfsk.preamble_nSymb, mfsk.preamble_tones,
 					mfsk.M, mfsk.nStreams, mfsk.stream_offsets,
 					search_start, &mfsk_sync_metric);
 				receive_stats.delay = (mfsk_delay_dec < 0) ? -1
@@ -1953,6 +1970,22 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				no_preamble.delay = -1;
 				no_preamble.signal_stregth_dbm = receive_stats.signal_stregth_dbm;
 				return no_preamble;
+			}
+
+			// Detect-both (NB robust-preamble negotiation): extract with the
+			// preamble length that MATCHED — the peer's active set — not the
+			// local expectation. Drives the data-symbol offset, the frame
+			// extraction size and the anti-re-decode advance for this frame.
+			if(ofdm.mfsk_corr_template != NULL && ofdm.mfsk_matched_preamble_nsymb > 0)
+			{
+				if(ofdm.mfsk_matched_preamble_nsymb != rx_eff_preamble)
+				{
+					printf("[MFSK-ACQ] cross-set preamble matched: nsymb=%d (local active=%d)
+",
+						ofdm.mfsk_matched_preamble_nsymb, rx_eff_preamble);
+					fflush(stdout);
+				}
+				rx_eff_preamble = ofdm.mfsk_matched_preamble_nsymb;
 			}
 
 		}
@@ -12073,6 +12106,293 @@ void cl_telecom_system::bigblock_livepath_loopback()
 	bigblock_framing_enabled = false;
 }
 
+// (Re)build the MFSK preamble runtime the acquisition detector consumes: the
+// corr template (dead state, kept for revert safety) and the cl_ofdm
+// primary/alternate tone-table mirrors. Factored from load_configuration so a
+// mid-session NB robust-preamble negotiation flip can rebuild it in place.
+void cl_telecom_system::rebuild_mfsk_preamble_runtime()
+{
+	// Re-apply the session-negotiated ACTIVE set first: cl_mfsk::init() (config
+	// load / re-init) always resets a negotiable NB config to the legacy set.
+	if(M == MOD_MFSK && mfsk.robust_preamble_mode == 0)
+		mfsk.set_robust_preamble_sidelnikov(robust_preamble_negotiated);
+
+	// Generate MFSK cross-correlation template for preamble detection (NB+WB).
+	// Round-trip through passband signal chain so template matches RX exactly:
+	// symbol_mod → baseband_to_passband → passband_to_baseband(FIR) → decimate
+	if(M == MOD_MFSK)
+	{
+		if(ofdm.mfsk_corr_template != NULL) { delete[] ofdm.mfsk_corr_template; ofdm.mfsk_corr_template = NULL; }
+
+		// Generate preamble in frequency domain (ACTIVE set length)
+		mfsk.generate_preamble(data_container.preamble_data, mfsk.preamble_nSymb);
+
+		// Modulate to baseband: zero_pad → IFFT → GI add (Nofdm samples per symbol)
+		int template_nsymb = mfsk.preamble_nSymb;
+		int Nofdm = data_container.Nofdm;
+		int bb_len = template_nsymb * Nofdm;
+		std::complex<double>* bb_template = new std::complex<double>[bb_len];
+		for(int i = 0; i < template_nsymb; i++)
+		{
+			ofdm.symbol_mod(&data_container.preamble_data[i * data_container.Nc],
+			                &bb_template[i * Nofdm]);
+		}
+
+		// Round-trip: baseband → passband → FIR-filtered baseband
+		// This ensures the template has the same spectral shaping as the RX signal
+		int interp = frequency_interpolation_rate;
+		int pb_len = bb_len * interp;
+		double* pb_data = new double[pb_len];
+
+		long unsigned saved_pss = ofdm.passband_start_sample;
+		ofdm.passband_start_sample = 0;
+		ofdm.baseband_to_passband(bb_template, bb_len, pb_data,
+			sampling_frequency, carrier_frequency, carrier_amplitude, interp);
+		ofdm.passband_start_sample = saved_pss;
+
+		// Demodulate with FIR_rx_time_sync (same filter used in receive_byte)
+		std::complex<double>* filtered = new std::complex<double>[pb_len];
+		ofdm.passband_to_baseband(pb_data, pb_len, filtered,
+			sampling_frequency, carrier_frequency, carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
+
+		// Store decimated (baseband-rate) template — correlation steps by interp_rate
+		ofdm.mfsk_corr_template_len = bb_len;
+		ofdm.mfsk_corr_template_nsymb = template_nsymb;
+		ofdm.mfsk_corr_template = CNEW(std::complex<double>, bb_len, "ofdm.mfsk_corr_template");
+		for(int i = 0; i < bb_len; i++)
+			ofdm.mfsk_corr_template[i] = filtered[i * interp];
+
+		// Precompute total and per-symbol template energies for normalization.
+		// Cap raised 8 -> 16 on 2026-05-27 (data-flow-preamble_nSymb.md §H1):
+		// WB MFSK now uses a 16-symbol preamble. NB still uses 8 (loop body
+		// executes 8 times); template_nsymb is the runtime authority.
+		ofdm.mfsk_corr_template_energy = 0.0;
+		for(int k = 0; k < template_nsymb && k < 16; k++)
+		{
+			double sym_energy = 0.0;
+			for(int n = 0; n < Nofdm; n++)
+			{
+				int idx = k * Nofdm + n;
+				sym_energy +=
+					ofdm.mfsk_corr_template[idx].real() * ofdm.mfsk_corr_template[idx].real() +
+					ofdm.mfsk_corr_template[idx].imag() * ofdm.mfsk_corr_template[idx].imag();
+			}
+			ofdm.mfsk_corr_template_sym_energy[k] = sym_energy;
+			ofdm.mfsk_corr_template_energy += sym_energy;
+		}
+
+		delete[] pb_data;
+		delete[] filtered;
+		delete[] bb_template;
+
+		printf("[PHY] MFSK corr template: %d symbols, %d samples, energy=%.3f (per-sym corr, FIR round-tripped)\n",
+			template_nsymb, bb_len, ofdm.mfsk_corr_template_energy);
+		fflush(stdout);
+
+		// Populate MFSK preamble parameters consumed by the discrete-match
+		// `time_sync_mfsk_corr` detector (post-2026-05-27 port per
+		// data-preamble-port-research.md §14). Mirror of cl_mfsk fields.
+		ofdm.mfsk_M = mfsk.M;
+		ofdm.mfsk_nStreams = mfsk.nStreams;
+		for(int st = 0; st < 4; st++)
+			ofdm.mfsk_stream_offsets[st] = (st < cl_mfsk::MAX_STREAMS) ? mfsk.stream_offsets[st] : 0;
+		ofdm.mfsk_preamble_nsymb = mfsk.preamble_nSymb;
+		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++)
+			ofdm.mfsk_preamble_tones[s] = mfsk.preamble_tones[s];
+		ofdm.mfsk_preamble_match_threshold = mfsk.preamble_match_threshold;
+
+		// Alternate-set mirror (detect-both): on negotiable NB robust configs
+		// the detector also searches the NON-active sequence, so the RX
+		// acquires a peer on either side of the negotiation (including a
+		// transition build transmitting sidelnikov without advertising it).
+		if(mfsk.robust_preamble_detect_both())
+		{
+			bool sid_act = mfsk.robust_preamble_sid_active;
+			ofdm.mfsk_alt_preamble_nsymb  = sid_act ? mfsk.preamble_nSymb_legacy : mfsk.preamble_nSymb_sid;
+			ofdm.mfsk_alt_match_threshold = sid_act ? mfsk.preamble_match_threshold_legacy : mfsk.preamble_match_threshold_sid;
+			const int* alt_tones = sid_act ? mfsk.preamble_tones_legacy : mfsk.preamble_tones_sid;
+			for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++)
+				ofdm.mfsk_alt_preamble_tones[s] = alt_tones[s];
+		}
+		else
+		{
+			ofdm.mfsk_alt_preamble_nsymb = 0;
+			ofdm.mfsk_alt_match_threshold = 0;
+			for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++)
+				ofdm.mfsk_alt_preamble_tones[s] = 0;
+		}
+	}
+	else
+	{
+		if(ofdm.mfsk_corr_template != NULL) { delete[] ofdm.mfsk_corr_template; ofdm.mfsk_corr_template = NULL; }
+		ofdm.mfsk_corr_template_len = 0;
+		ofdm.mfsk_corr_template_energy = 0.0;
+		ofdm.mfsk_corr_template_nsymb = 0;
+
+		// Reset MFSK preamble params on non-MFSK configs.
+		ofdm.mfsk_M = 0;
+		ofdm.mfsk_nStreams = 0;
+		ofdm.mfsk_preamble_nsymb = 0;
+		ofdm.mfsk_preamble_match_threshold = 0;
+		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++) ofdm.mfsk_preamble_tones[s] = 0;
+		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
+		ofdm.mfsk_alt_preamble_nsymb = 0;
+		ofdm.mfsk_alt_match_threshold = 0;
+		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++) ofdm.mfsk_alt_preamble_tones[s] = 0;
+
+#if 1 // P1: template REVIVED for MF plateau-tiebreak VIABILITY MEASUREMENT (inert: time_sync_preamble_matched has 0 production callers)
+		if(std::getenv("MERCURY_F0V_MF_TEMPLATE") && atoi(std::getenv("MERCURY_F0V_MF_TEMPLATE"))!=0){
+		// Generate OFDM matched-filter template for preamble detection.
+		// Must replicate the full TX→RX chain so the template matches what
+		// receive_byte actually sees:
+		//   preamble × pre_eq → symbol_mod → boost → b2p → FIR_tx1 → FIR_tx2 → p2b(FIR_rx_time_sync)
+		// Pre-equalization applies per-subcarrier complex rotations that completely
+		// reshape the time-domain waveform. Without it, the template has ~0.02
+		// correlation with the received signal (essentially random).
+		if(ofdm.ofdm_corr_template != NULL) { delete[] ofdm.ofdm_corr_template; ofdm.ofdm_corr_template = NULL; }
+
+		int template_nsymb = data_container.preamble_nSymb;
+		int Nofdm = data_container.Nofdm;
+		int bb_len = template_nsymb * Nofdm;
+		std::complex<double>* bb_template = new std::complex<double>[bb_len];
+
+		// Extract preamble subcarrier values WITH pre-equalization (same as transmit_byte).
+		// pre_equalization_channel is computed earlier in load_configuration (line ~2396).
+		std::complex<double> preamble_sc[256];
+		for(int i = 0; i < template_nsymb; i++)
+		{
+			for(int k = 0; k < ofdm.Nc; k++)
+				preamble_sc[k] = ofdm.ofdm_preamble[i * ofdm.Nc + k].value
+					* pre_equalization_channel[k].value;
+			ofdm.symbol_mod(preamble_sc, &bb_template[i * Nofdm]);
+		}
+
+		// === DIAG: pre_eq at template generation (remove after debug) ===
+		printf("[TMPL-PREEQ] CONFIG_%d preamble_nSymb=%d pre_eq[0..4]=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)\n",
+			current_configuration, template_nsymb,
+			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
+			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag(),
+			pre_equalization_channel[2].value.real(), pre_equalization_channel[2].value.imag(),
+			pre_equalization_channel[3].value.real(), pre_equalization_channel[3].value.imag(),
+			pre_equalization_channel[4].value.real(), pre_equalization_channel[4].value.imag());
+		fflush(stdout);
+
+		// Apply power normalization + output power + preamble boost (same as transmit_bit lines 601-602).
+		// sqrt(output_power_Watt) MUST be included so peak_clip applies at the same
+		// absolute threshold as the TX path. CS is amplitude-invariant, so the
+		// extra sqrt(output_power_Watt) factor doesn't affect the final metric,
+		// but peak_clip is a nonlinear operation that depends on absolute amplitude.
+		// Without this scaling, the template is clipped at a different PAPR level
+		// than the TX signal → waveform mismatch → CS metric ~0.15 instead of ~1.0.
+		double power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+		double preamble_boost = ofdm.preamble_configurator.boost;
+		double ofdm_tx_gain = get_tx_gain(TX_SIG_OFDM);
+		for(int i = 0; i < bb_len; i++)
+			bb_template[i] = bb_template[i] / power_normalization * sqrt(output_power_Watt) * preamble_boost * ofdm_tx_gain;
+
+		// Round-trip through full TX→RX passband chain:
+		// baseband_to_passband → peak_clip → FIR_tx1 → FIR_tx2 → passband_to_baseband(FIR_rx_time_sync)
+		int interp = frequency_interpolation_rate;
+		int pb_len = bb_len * interp;
+		double* pb_data = new double[pb_len];
+		double* pb_fir1 = new double[pb_len];
+		double* pb_fir2 = new double[pb_len];
+
+		long unsigned saved_pss = ofdm.passband_start_sample;
+		ofdm.passband_start_sample = 0;
+		ofdm.baseband_to_passband(bb_template, bb_len, pb_data,
+			sampling_frequency, carrier_frequency, carrier_amplitude, interp);
+		ofdm.passband_start_sample = saved_pss;
+
+		// Apply PAPR clipping to match TX path (transmit_bit line 616).
+		// pre_equalization_channel boosts high-frequency preamble subcarriers
+		// (above FIR_rx_data cutoff) to very large amplitudes. Without matching
+		// peak_clip in the template, the clipped TX waveform diverges from the
+		// unclipped template → CS metric drops from ~1.0 to ~0.15.
+		ofdm.peak_clip(pb_data, pb_len, ofdm.preamble_papr_cut);
+
+		// TX shaping filters (same as transmit_byte SINGLE_MESSAGE path)
+		ofdm.FIR_tx1.apply(pb_data, pb_fir1, pb_len);
+		ofdm.FIR_tx2.apply(pb_fir1, pb_fir2, pb_len);
+
+		// Demodulate with FIR_rx_time_sync (same filter used in receive_byte line 767)
+		std::complex<double>* filtered = new std::complex<double>[pb_len];
+		ofdm.passband_to_baseband(pb_fir2, pb_len, filtered,
+			sampling_frequency, carrier_frequency, carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
+
+		// Store decimated (baseband-rate) template
+		ofdm.ofdm_corr_template_len = bb_len;
+		ofdm.ofdm_corr_template_nsymb = template_nsymb;
+		ofdm.ofdm_corr_template = CNEW(std::complex<double>, bb_len, "ofdm.ofdm_corr_template");
+		for(int i = 0; i < bb_len; i++)
+			ofdm.ofdm_corr_template[i] = filtered[i * interp];
+
+		// Precompute per-symbol and total template energies
+		ofdm.ofdm_corr_template_energy = 0.0;
+		for(int k = 0; k < template_nsymb && k < 16; k++)
+		{
+			double sym_energy = 0.0;
+			for(int n = 0; n < Nofdm; n++)
+			{
+				int idx = k * Nofdm + n;
+				sym_energy +=
+					ofdm.ofdm_corr_template[idx].real() * ofdm.ofdm_corr_template[idx].real() +
+					ofdm.ofdm_corr_template[idx].imag() * ofdm.ofdm_corr_template[idx].imag();
+			}
+			ofdm.ofdm_corr_template_sym_energy[k] = sym_energy;
+			ofdm.ofdm_corr_template_energy += sym_energy;
+		}
+
+		delete[] pb_data;
+		delete[] pb_fir1;
+		delete[] pb_fir2;
+		delete[] filtered;
+		delete[] bb_template;
+
+		printf("[PHY] OFDM corr template: %d symbols, %d samples, energy=%.3f (matched filter, FIR round-tripped)\n",
+			template_nsymb, bb_len, ofdm.ofdm_corr_template_energy);
+		printf("[TMPL-INIT] t[0]=(%.6f,%.6f) t[1]=(%.6f,%.6f) t[2]=(%.6f,%.6f)\n",
+			ofdm.ofdm_corr_template[0].real(), ofdm.ofdm_corr_template[0].imag(),
+			ofdm.ofdm_corr_template[1].real(), ofdm.ofdm_corr_template[1].imag(),
+			ofdm.ofdm_corr_template[2].real(), ofdm.ofdm_corr_template[2].imag());
+		printf("[TMPL-INIT] FIR_ts: nTaps=%d cut=%.1f trans=%.1f\n",
+			ofdm.FIR_rx_time_sync.filter_nTaps,
+			ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency,
+			ofdm.FIR_rx_time_sync.filter_transition_bandwidth);
+		printf("[TMPL-INIT] carrier_freq=%.1f output_power=%.3f pre_eq[0]=(%.4f,%.4f) pre_eq[1]=(%.4f,%.4f)\n",
+			carrier_frequency, output_power_Watt,
+			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
+			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag());
+		fflush(stdout);
+		}
+#endif
+	}
+}
+
+// NB robust-preamble negotiation transition (CAP_ROBUST_PREAMBLE_NB). The
+// session layer calls this when the peer's capability byte arrives (both-
+// support => sidelnikov) and at session reset (=> legacy). The flag persists
+// across load_configuration; when the current config is NB MFSK the active
+// set + detector mirrors are re-installed immediately so the very next frame
+// TX/RX uses the negotiated preamble. RX detect-both makes the flip instant
+// safe against in-flight frames from either set.
+void cl_telecom_system::set_robust_preamble_negotiated(bool on)
+{
+	if(robust_preamble_negotiated == on) return;
+	robust_preamble_negotiated = on;
+	if(M == MOD_MFSK && (mfsk.M == 8 || mfsk.M == 4) && mfsk.robust_preamble_mode == 0)
+	{
+		if(mfsk.set_robust_preamble_sidelnikov(on))
+		{
+			rebuild_mfsk_preamble_runtime();
+			printf("[CAPNEG] NB robust preamble active=%s (nSymb=%d thr=%d)
+",
+				on ? "sidelnikov" : "legacy", mfsk.preamble_nSymb, mfsk.preamble_match_threshold);
+			fflush(stdout);
+		}
+	}
+}
+
 void cl_telecom_system::load_configuration()
 {
 	this->load_configuration(default_configurations_telecom_system.init_configuration);
@@ -12697,17 +13017,15 @@ void cl_telecom_system::load_configuration(int configuration)
 			}
 			mfsk_sweep_override_MN(mfsk_M, mfsk_nStreams);
 				mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
-			// Env-gated: a longer robust preamble must flow into the data_container
-			// frame-size authority so TX emits the full sequence and the RX detector
-			// window matches. Unset => mfsk.preamble_nSymb == the existing value =>
-			// byte-identical.
-			{
-				const char* _rp = std::getenv("MERCURY_MFSK_ROBUST_PREAMBLE");
-				bool _sid = (_rp == NULL || strcmp(_rp, "sidelnikov") == 0);  // default-ON
-				if(_rp != NULL && (strcmp(_rp, "short") == 0 || strcmp(_rp, "off") == 0)) _sid = false;
-				if(_sid)
-					ofdm.preamble_configurator.Nsymb = mfsk.preamble_nSymb;
-			}
+			// Frame-geometry authority = the LONGEST preamble set this config
+			// can emit or be asked to detect (the sidelnikov length on
+			// negotiable / forced-sidelnikov NB robust configs, the legacy 8
+			// under MERCURY_MFSK_ROBUST_PREAMBLE=short, 16 on WB). Sizing to
+			// the maximum means a mid-session negotiation flip never needs a
+			// geometry reallocation; the ACTIVE (possibly shorter) set governs
+			// what TX actually emits and what the extraction uses per frame.
+			if(mfsk.preamble_nSymb_max() > ofdm.preamble_configurator.Nsymb)
+				ofdm.preamble_configurator.Nsymb = mfsk.preamble_nSymb_max();
 		}
 		else
 		{
@@ -12759,232 +13077,11 @@ void cl_telecom_system::load_configuration(int configuration)
 				mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
 	}
 
-	// Generate MFSK cross-correlation template for preamble detection (NB+WB).
-	// Round-trip through passband signal chain so template matches RX exactly:
-	// symbol_mod → baseband_to_passband → passband_to_baseband(FIR) → decimate
-	if(M == MOD_MFSK)
-	{
-		if(ofdm.mfsk_corr_template != NULL) { delete[] ofdm.mfsk_corr_template; ofdm.mfsk_corr_template = NULL; }
+	// MFSK preamble runtime (corr template + detector tone-table mirrors) —
+	// factored so a mid-session robust-preamble negotiation flip can rebuild it
+	// without a full configuration reload.
+	rebuild_mfsk_preamble_runtime();
 
-		// Generate preamble in frequency domain
-		mfsk.generate_preamble(data_container.preamble_data, data_container.preamble_nSymb);
-
-		// Modulate to baseband: zero_pad → IFFT → GI add (Nofdm samples per symbol)
-		int template_nsymb = data_container.preamble_nSymb;
-		int Nofdm = data_container.Nofdm;
-		int bb_len = template_nsymb * Nofdm;
-		std::complex<double>* bb_template = new std::complex<double>[bb_len];
-		for(int i = 0; i < template_nsymb; i++)
-		{
-			ofdm.symbol_mod(&data_container.preamble_data[i * data_container.Nc],
-			                &bb_template[i * Nofdm]);
-		}
-
-		// Round-trip: baseband → passband → FIR-filtered baseband
-		// This ensures the template has the same spectral shaping as the RX signal
-		int interp = frequency_interpolation_rate;
-		int pb_len = bb_len * interp;
-		double* pb_data = new double[pb_len];
-
-		long unsigned saved_pss = ofdm.passband_start_sample;
-		ofdm.passband_start_sample = 0;
-		ofdm.baseband_to_passband(bb_template, bb_len, pb_data,
-			sampling_frequency, carrier_frequency, carrier_amplitude, interp);
-		ofdm.passband_start_sample = saved_pss;
-
-		// Demodulate with FIR_rx_time_sync (same filter used in receive_byte)
-		std::complex<double>* filtered = new std::complex<double>[pb_len];
-		ofdm.passband_to_baseband(pb_data, pb_len, filtered,
-			sampling_frequency, carrier_frequency, carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
-
-		// Store decimated (baseband-rate) template — correlation steps by interp_rate
-		ofdm.mfsk_corr_template_len = bb_len;
-		ofdm.mfsk_corr_template_nsymb = template_nsymb;
-		ofdm.mfsk_corr_template = CNEW(std::complex<double>, bb_len, "ofdm.mfsk_corr_template");
-		for(int i = 0; i < bb_len; i++)
-			ofdm.mfsk_corr_template[i] = filtered[i * interp];
-
-		// Precompute total and per-symbol template energies for normalization.
-		// Cap raised 8 -> 16 on 2026-05-27 (data-flow-preamble_nSymb.md §H1):
-		// WB MFSK now uses a 16-symbol preamble. NB still uses 8 (loop body
-		// executes 8 times); template_nsymb is the runtime authority.
-		ofdm.mfsk_corr_template_energy = 0.0;
-		for(int k = 0; k < template_nsymb && k < 16; k++)
-		{
-			double sym_energy = 0.0;
-			for(int n = 0; n < Nofdm; n++)
-			{
-				int idx = k * Nofdm + n;
-				sym_energy +=
-					ofdm.mfsk_corr_template[idx].real() * ofdm.mfsk_corr_template[idx].real() +
-					ofdm.mfsk_corr_template[idx].imag() * ofdm.mfsk_corr_template[idx].imag();
-			}
-			ofdm.mfsk_corr_template_sym_energy[k] = sym_energy;
-			ofdm.mfsk_corr_template_energy += sym_energy;
-		}
-
-		delete[] pb_data;
-		delete[] filtered;
-		delete[] bb_template;
-
-		printf("[PHY] MFSK corr template: %d symbols, %d samples, energy=%.3f (per-sym corr, FIR round-tripped)\n",
-			template_nsymb, bb_len, ofdm.mfsk_corr_template_energy);
-		fflush(stdout);
-
-		// Populate MFSK preamble parameters consumed by the discrete-match
-		// `time_sync_mfsk_corr` detector (post-2026-05-27 port per
-		// data-preamble-port-research.md §14). Mirror of cl_mfsk fields.
-		ofdm.mfsk_M = mfsk.M;
-		ofdm.mfsk_nStreams = mfsk.nStreams;
-		for(int st = 0; st < 4; st++)
-			ofdm.mfsk_stream_offsets[st] = (st < cl_mfsk::MAX_STREAMS) ? mfsk.stream_offsets[st] : 0;
-		ofdm.mfsk_preamble_nsymb = mfsk.preamble_nSymb;
-		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++)
-			ofdm.mfsk_preamble_tones[s] = mfsk.preamble_tones[s];
-		ofdm.mfsk_preamble_match_threshold = mfsk.preamble_match_threshold;
-	}
-	else
-	{
-		if(ofdm.mfsk_corr_template != NULL) { delete[] ofdm.mfsk_corr_template; ofdm.mfsk_corr_template = NULL; }
-		ofdm.mfsk_corr_template_len = 0;
-		ofdm.mfsk_corr_template_energy = 0.0;
-		ofdm.mfsk_corr_template_nsymb = 0;
-
-		// Reset MFSK preamble params on non-MFSK configs.
-		ofdm.mfsk_M = 0;
-		ofdm.mfsk_nStreams = 0;
-		ofdm.mfsk_preamble_nsymb = 0;
-		ofdm.mfsk_preamble_match_threshold = 0;
-		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++) ofdm.mfsk_preamble_tones[s] = 0;
-		for(int st = 0; st < 4; st++) ofdm.mfsk_stream_offsets[st] = 0;
-
-#if 1 // P1: template REVIVED for MF plateau-tiebreak VIABILITY MEASUREMENT (inert: time_sync_preamble_matched has 0 production callers)
-		if(std::getenv("MERCURY_F0V_MF_TEMPLATE") && atoi(std::getenv("MERCURY_F0V_MF_TEMPLATE"))!=0){
-		// Generate OFDM matched-filter template for preamble detection.
-		// Must replicate the full TX→RX chain so the template matches what
-		// receive_byte actually sees:
-		//   preamble × pre_eq → symbol_mod → boost → b2p → FIR_tx1 → FIR_tx2 → p2b(FIR_rx_time_sync)
-		// Pre-equalization applies per-subcarrier complex rotations that completely
-		// reshape the time-domain waveform. Without it, the template has ~0.02
-		// correlation with the received signal (essentially random).
-		if(ofdm.ofdm_corr_template != NULL) { delete[] ofdm.ofdm_corr_template; ofdm.ofdm_corr_template = NULL; }
-
-		int template_nsymb = data_container.preamble_nSymb;
-		int Nofdm = data_container.Nofdm;
-		int bb_len = template_nsymb * Nofdm;
-		std::complex<double>* bb_template = new std::complex<double>[bb_len];
-
-		// Extract preamble subcarrier values WITH pre-equalization (same as transmit_byte).
-		// pre_equalization_channel is computed earlier in load_configuration (line ~2396).
-		std::complex<double> preamble_sc[256];
-		for(int i = 0; i < template_nsymb; i++)
-		{
-			for(int k = 0; k < ofdm.Nc; k++)
-				preamble_sc[k] = ofdm.ofdm_preamble[i * ofdm.Nc + k].value
-					* pre_equalization_channel[k].value;
-			ofdm.symbol_mod(preamble_sc, &bb_template[i * Nofdm]);
-		}
-
-		// === DIAG: pre_eq at template generation (remove after debug) ===
-		printf("[TMPL-PREEQ] CONFIG_%d preamble_nSymb=%d pre_eq[0..4]=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)\n",
-			current_configuration, template_nsymb,
-			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
-			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag(),
-			pre_equalization_channel[2].value.real(), pre_equalization_channel[2].value.imag(),
-			pre_equalization_channel[3].value.real(), pre_equalization_channel[3].value.imag(),
-			pre_equalization_channel[4].value.real(), pre_equalization_channel[4].value.imag());
-		fflush(stdout);
-
-		// Apply power normalization + output power + preamble boost (same as transmit_bit lines 601-602).
-		// sqrt(output_power_Watt) MUST be included so peak_clip applies at the same
-		// absolute threshold as the TX path. CS is amplitude-invariant, so the
-		// extra sqrt(output_power_Watt) factor doesn't affect the final metric,
-		// but peak_clip is a nonlinear operation that depends on absolute amplitude.
-		// Without this scaling, the template is clipped at a different PAPR level
-		// than the TX signal → waveform mismatch → CS metric ~0.15 instead of ~1.0.
-		double power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
-		double preamble_boost = ofdm.preamble_configurator.boost;
-		double ofdm_tx_gain = get_tx_gain(TX_SIG_OFDM);
-		for(int i = 0; i < bb_len; i++)
-			bb_template[i] = bb_template[i] / power_normalization * sqrt(output_power_Watt) * preamble_boost * ofdm_tx_gain;
-
-		// Round-trip through full TX→RX passband chain:
-		// baseband_to_passband → peak_clip → FIR_tx1 → FIR_tx2 → passband_to_baseband(FIR_rx_time_sync)
-		int interp = frequency_interpolation_rate;
-		int pb_len = bb_len * interp;
-		double* pb_data = new double[pb_len];
-		double* pb_fir1 = new double[pb_len];
-		double* pb_fir2 = new double[pb_len];
-
-		long unsigned saved_pss = ofdm.passband_start_sample;
-		ofdm.passband_start_sample = 0;
-		ofdm.baseband_to_passband(bb_template, bb_len, pb_data,
-			sampling_frequency, carrier_frequency, carrier_amplitude, interp);
-		ofdm.passband_start_sample = saved_pss;
-
-		// Apply PAPR clipping to match TX path (transmit_bit line 616).
-		// pre_equalization_channel boosts high-frequency preamble subcarriers
-		// (above FIR_rx_data cutoff) to very large amplitudes. Without matching
-		// peak_clip in the template, the clipped TX waveform diverges from the
-		// unclipped template → CS metric drops from ~1.0 to ~0.15.
-		ofdm.peak_clip(pb_data, pb_len, ofdm.preamble_papr_cut);
-
-		// TX shaping filters (same as transmit_byte SINGLE_MESSAGE path)
-		ofdm.FIR_tx1.apply(pb_data, pb_fir1, pb_len);
-		ofdm.FIR_tx2.apply(pb_fir1, pb_fir2, pb_len);
-
-		// Demodulate with FIR_rx_time_sync (same filter used in receive_byte line 767)
-		std::complex<double>* filtered = new std::complex<double>[pb_len];
-		ofdm.passband_to_baseband(pb_fir2, pb_len, filtered,
-			sampling_frequency, carrier_frequency, carrier_amplitude, 1, &ofdm.FIR_rx_time_sync);
-
-		// Store decimated (baseband-rate) template
-		ofdm.ofdm_corr_template_len = bb_len;
-		ofdm.ofdm_corr_template_nsymb = template_nsymb;
-		ofdm.ofdm_corr_template = CNEW(std::complex<double>, bb_len, "ofdm.ofdm_corr_template");
-		for(int i = 0; i < bb_len; i++)
-			ofdm.ofdm_corr_template[i] = filtered[i * interp];
-
-		// Precompute per-symbol and total template energies
-		ofdm.ofdm_corr_template_energy = 0.0;
-		for(int k = 0; k < template_nsymb && k < 16; k++)
-		{
-			double sym_energy = 0.0;
-			for(int n = 0; n < Nofdm; n++)
-			{
-				int idx = k * Nofdm + n;
-				sym_energy +=
-					ofdm.ofdm_corr_template[idx].real() * ofdm.ofdm_corr_template[idx].real() +
-					ofdm.ofdm_corr_template[idx].imag() * ofdm.ofdm_corr_template[idx].imag();
-			}
-			ofdm.ofdm_corr_template_sym_energy[k] = sym_energy;
-			ofdm.ofdm_corr_template_energy += sym_energy;
-		}
-
-		delete[] pb_data;
-		delete[] pb_fir1;
-		delete[] pb_fir2;
-		delete[] filtered;
-		delete[] bb_template;
-
-		printf("[PHY] OFDM corr template: %d symbols, %d samples, energy=%.3f (matched filter, FIR round-tripped)\n",
-			template_nsymb, bb_len, ofdm.ofdm_corr_template_energy);
-		printf("[TMPL-INIT] t[0]=(%.6f,%.6f) t[1]=(%.6f,%.6f) t[2]=(%.6f,%.6f)\n",
-			ofdm.ofdm_corr_template[0].real(), ofdm.ofdm_corr_template[0].imag(),
-			ofdm.ofdm_corr_template[1].real(), ofdm.ofdm_corr_template[1].imag(),
-			ofdm.ofdm_corr_template[2].real(), ofdm.ofdm_corr_template[2].imag());
-		printf("[TMPL-INIT] FIR_ts: nTaps=%d cut=%.1f trans=%.1f\n",
-			ofdm.FIR_rx_time_sync.filter_nTaps,
-			ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency,
-			ofdm.FIR_rx_time_sync.filter_transition_bandwidth);
-		printf("[TMPL-INIT] carrier_freq=%.1f output_power=%.3f pre_eq[0]=(%.4f,%.4f) pre_eq[1]=(%.4f,%.4f)\n",
-			carrier_frequency, output_power_Watt,
-			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
-			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag());
-		fflush(stdout);
-		}
-#endif
-	}
 
 	bit_interleaver_block_size=data_container.nBits/10;
 	time_freq_interleaver_block_size=data_container.nData/10;
@@ -13347,6 +13444,20 @@ void cl_telecom_system::load_configuration_swap(int configuration, int idx)
 		configuration, idx, M, ldpc.rate, data_container.Nc, data_container.Nsymb,
 		data_container.nBits, (int)data_container.buffer_Nsymb);
 	fflush(stdout);
+
+	// NB robust-preamble negotiation: the precooked bundle carries the
+	// pre-session (legacy-active) tables. Re-apply the session's negotiated
+	// state so a mid-session swap to an NB robust config keeps the negotiated
+	// sidelnikov set active (detect-both makes a missed re-apply safe, but a
+	// silently reverted TX set would forfeit the negotiated low-sidelobe
+	// preamble for the rest of the session).
+	if(M == MOD_MFSK && (mfsk.M == 8 || mfsk.M == 4)
+		&& mfsk.robust_preamble_mode == 0
+		&& robust_preamble_negotiated != mfsk.robust_preamble_sid_active)
+	{
+		if(mfsk.set_robust_preamble_sidelnikov(robust_preamble_negotiated))
+			rebuild_mfsk_preamble_runtime();
+	}
 }
 
 // PRECOOK (Stage 1): size + allocate the ONE persistent shared capture ring and pin it. Called

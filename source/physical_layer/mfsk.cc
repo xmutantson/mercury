@@ -35,10 +35,21 @@ cl_mfsk::cl_mfsk()
 	nStreams = 0;
 	tone_hop_step = 0;
 	preamble_nSymb = 0;
+	preamble_match_threshold = 0;
+	robust_preamble_mode = 0;
+	robust_preamble_sid_active = false;
+	preamble_nSymb_legacy = 0;
+	preamble_match_threshold_legacy = 0;
+	preamble_nSymb_sid = 0;
+	preamble_match_threshold_sid = 0;
 	for (int i = 0; i < MAX_STREAMS; i++)
 		stream_offsets[i] = 0;
 	for (int i = 0; i < MAX_PREAMBLE_SYMB; i++)
+	{
 		preamble_tones[i] = 0;
+		preamble_tones_legacy[i] = 0;
+		preamble_tones_sid[i] = 0;
+	}
 	for (int i = 0; i < MAX_ACK_TONES; i++)
 		ack_tones[i] = 0;
 	for (int i = 0; i < MAX_ACK_TONES; i++)
@@ -88,13 +99,33 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	nStreams = _nStreams;
 	if (nStreams < 1) nStreams = 1;
 	if (nStreams > MAX_STREAMS) nStreams = MAX_STREAMS;
-	// Env-gated low-sidelobe robust preamble (see insert_sidelnikov rationale).
-	// Unset => original short preamble => byte-identical.
+	// NB robust-preamble mode (capability negotiation — see mfsk.h):
+	//   unset       => negotiable: BOTH sets computed, ACTIVE starts legacy, the
+	//                  session layer flips to sidelnikov once both peers
+	//                  advertised CAP_ROBUST_PREAMBLE_NB. RX runs detect-both.
+	//   =sidelnikov => forced sidelnikov ACTIVE from init (pre-negotiation
+	//                  default-ON behavior; still advertises + detect-both).
+	//   =short|=off => forced legacy: sidelnikov tables absent, no advertise,
+	//                  no detect-both — the full pre-sidelnikov behavior.
+	// The unconditional default-ON sidelnikov TX shipped 2026-07-26 was an
+	// acquisition-breaking wire hazard against any older build (the old RX
+	// expects the 8-symbol sequence at length 8 and never reaches threshold on
+	// the 32/48-symbol emission) — hence the negotiated default here.
 	const char* _rp_env = std::getenv("MERCURY_MFSK_ROBUST_PREAMBLE");
-	// Default-ON: the low-sidelobe robust preamble ships enabled. Set
-	// MERCURY_MFSK_ROBUST_PREAMBLE=short (or =off) to force the legacy 8-symbol preamble.
-	bool _sid_pre = (_rp_env == NULL || strcmp(_rp_env, "sidelnikov") == 0);
-	if (_rp_env != NULL && (strcmp(_rp_env, "short") == 0 || strcmp(_rp_env, "off") == 0)) _sid_pre = false;
+	robust_preamble_mode = 0;
+	if (_rp_env != NULL && strcmp(_rp_env, "sidelnikov") == 0) robust_preamble_mode = 1;
+	if (_rp_env != NULL && (strcmp(_rp_env, "short") == 0 || strcmp(_rp_env, "off") == 0)) robust_preamble_mode = 2;
+	bool _sid_pre = (robust_preamble_mode == 1);   // forced-sid => ACTIVE = sidelnikov at init
+	robust_preamble_sid_active = false;
+	preamble_nSymb_legacy = 0;
+	preamble_match_threshold_legacy = 0;
+	preamble_nSymb_sid = 0;
+	preamble_match_threshold_sid = 0;
+	for (int i = 0; i < MAX_PREAMBLE_SYMB; i++)
+	{
+		preamble_tones_legacy[i] = 0;
+		preamble_tones_sid[i] = 0;
+	}
 
 	for (int i = 0; i < MAX_ACK_SACK_SUFFIX; i++)
 		last_ack_sack_suffix_tones[i] = -1;
@@ -181,60 +212,47 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	}
 	else if (M == 8)
 	{
-		if (_sid_pre)
+		// Legacy narrowband: 8 symbols, all tones used once — the interop
+		// floor every shipped build can acquire.
+		preamble_nSymb_legacy = 8;
+		{
+			const int leg[8] = {1, 5, 3, 7, 0, 6, 2, 4};
+			for (int s = 0; s < 8; s++) preamble_tones_legacy[s] = leg[s];
+		}
+		if (robust_preamble_mode != 2)
 		{
 			// Sidelnikov (p=37) 32-symbol sequence: non-repeating, aperiodic
 			// tone-coincidence <=5/32 at every nonzero shift. Kills the +preN
 			// acquisition alias the short repeated 8-symbol preamble exhibits.
-			preamble_nSymb = 32;
+			preamble_nSymb_sid = 32;
 			const int seq[32] = {
 				1, 3, 6, 5, 3, 7, 6, 5, 2, 5, 3, 6, 4, 1, 3, 7,
 				7, 7, 6, 4, 1, 2, 4, 0, 1, 2, 5, 2, 4, 1, 3, 6
 			};
-			for (int s = 0; s < 32; s++) preamble_tones[s] = seq[s];
-		}
-		else
-		{
-			// Narrowband: 8 symbols, all tones used once
-			preamble_nSymb = 8;
-			preamble_tones[0] = 1;
-			preamble_tones[1] = 5;
-			preamble_tones[2] = 3;
-			preamble_tones[3] = 7;
-			preamble_tones[4] = 0;
-			preamble_tones[5] = 6;
-			preamble_tones[6] = 2;
-			preamble_tones[7] = 4;
+			for (int s = 0; s < 32; s++) preamble_tones_sid[s] = seq[s];
 		}
 	}
 	else if (M == 4)
 	{
-		if (_sid_pre)
+		// Legacy narrowband 2-stream: 8 symbols, palindrome for symmetry.
+		preamble_nSymb_legacy = 8;
+		{
+			const int leg[8] = {0, 2, 1, 3, 3, 1, 2, 0};
+			for (int s = 0; s < 8; s++) preamble_tones_legacy[s] = leg[s];
+		}
+		if (robust_preamble_mode != 2)
 		{
 			// Sidelnikov (p=53) 48-symbol sequence: non-repeating, aperiodic
 			// tone-coincidence <=16/48 at every nonzero shift (well below the
 			// 40/48 detection threshold). Replaces the +preN/+4-aliasing
 			// 8-symbol palindrome.
-			preamble_nSymb = 48;
+			preamble_nSymb_sid = 48;
 			const int seq[48] = {
 				0, 1, 2, 0, 1, 3, 2, 1, 2, 1, 2, 0, 1, 2, 0, 0,
 				0, 1, 3, 3, 2, 0, 1, 3, 3, 3, 3, 2, 1, 3, 2, 0,
 				1, 2, 1, 2, 1, 3, 2, 1, 3, 3, 3, 2, 0, 0, 1, 3
 			};
-			for (int s = 0; s < 48; s++) preamble_tones[s] = seq[s];
-		}
-		else
-		{
-			// Narrowband 2-stream: 8 symbols, palindrome for symmetry
-			preamble_nSymb = 8;
-			preamble_tones[0] = 0;
-			preamble_tones[1] = 2;
-			preamble_tones[2] = 1;
-			preamble_tones[3] = 3;
-			preamble_tones[4] = 3;
-			preamble_tones[5] = 1;
-			preamble_tones[6] = 2;
-			preamble_tones[7] = 0;
+			for (int s = 0; s < 48; s++) preamble_tones_sid[s] = seq[s];
 		}
 	}
 	else
@@ -284,20 +302,29 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		preamble_match_threshold = 8;
 	else
 		preamble_match_threshold = 7;
-	if (_sid_pre && (M == 8 || M == 4))
-		preamble_match_threshold = (M == 8) ? 24 : 40;
 	// Arm C (env MERCURY_MFSK_NOMIRROR): the tone-space mirror-accept forced
 	// preamble_match_threshold=8 for the ns>=2 combiner (raising the FAR ceiling
 	// that the mirror false-accepts create). NOMIRROR disables that mirror-accept
 	// in the acquisition detector (see ofdm.cc acq_nomirror), so the FAR pressure
 	// is gone and the threshold reverts 8->7 — recovering the ~1 dB the mirror
-	// cost the ns>=2 combining cliff. Only applies when NOT already overridden by
-	// the sidelnikov preamble. Unset => byte-identical.
+	// cost the ns>=2 combining cliff. Applies to the LEGACY (8-symbol) NB set
+	// and to WB; the sidelnikov set carries its own length-scaled threshold.
 	{
 		const char* _nm = std::getenv("MERCURY_MFSK_NOMIRROR");
 		bool _nomirror = (_nm == NULL) ? true : (atoi(_nm) != 0);  // default-ON; MERCURY_MFSK_NOMIRROR=0 disables
-		if (_nomirror && nStreams >= 2 && !(_sid_pre && (M == 8 || M == 4)))
+		if (_nomirror && nStreams >= 2)
 			preamble_match_threshold = 7;
+	}
+	// NB dual-set install. The per-set thresholds are fixed properties of the
+	// sequences (legacy: the ns-gated 7/8 above; sidelnikov: length-scaled
+	// 24/32 and 40/48). The ACTIVE set starts per robust_preamble_mode; the
+	// session layer may flip it later via set_robust_preamble_sidelnikov().
+	if (M == 8 || M == 4)
+	{
+		preamble_match_threshold_legacy = preamble_match_threshold;
+		preamble_match_threshold_sid = (M == 8) ? 24 : 40;
+		robust_preamble_sid_active = !_sid_pre;      // force the install below
+		set_robust_preamble_sidelnikov(_sid_pre);
 	}
 
 	// ACK pattern tones.
@@ -594,6 +621,32 @@ void cl_mfsk::deinit()
 }
 
 // Generate MFSK preamble: known tones in all streams simultaneously
+// Install the requested NB robust-preamble set as ACTIVE (TX emission + the
+// detector's primary expectation). Wire-safety rule: the caller may only
+// request sidelnikov once the peer has advertised CAP_ROBUST_PREAMBLE_NB —
+// this function is the mechanism, the session layer owns the policy.
+bool cl_mfsk::set_robust_preamble_sidelnikov(bool on)
+{
+	if (M != 8 && M != 4) return false;            // NB dual-set configs only
+	if (preamble_nSymb_legacy <= 0) return false;  // dual-set tables not built
+	if (on && preamble_nSymb_sid <= 0) return false; // no sidelnikov set (forced-legacy)
+	if (robust_preamble_sid_active == on) return false;
+	if (on)
+	{
+		preamble_nSymb = preamble_nSymb_sid;
+		for (int s = 0; s < MAX_PREAMBLE_SYMB; s++) preamble_tones[s] = preamble_tones_sid[s];
+		preamble_match_threshold = preamble_match_threshold_sid;
+	}
+	else
+	{
+		preamble_nSymb = preamble_nSymb_legacy;
+		for (int s = 0; s < MAX_PREAMBLE_SYMB; s++) preamble_tones[s] = preamble_tones_legacy[s];
+		preamble_match_threshold = preamble_match_threshold_legacy;
+	}
+	robust_preamble_sid_active = on;
+	return true;
+}
+
 void cl_mfsk::generate_preamble(std::complex<double>* preamble_out, int nSymb)
 {
 	if (M == 0 || Nc == 0 || nStreams == 0) return;

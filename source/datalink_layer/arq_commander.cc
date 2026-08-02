@@ -8475,6 +8475,9 @@ void cl_arq_controller::process_control_commander()
 				handshake_confirmed = true;
 				peer_capability = rsp_own;
 				// No SNR carried in TEST_CONNECTION_ACK — leave SNR unchanged.
+				// NB robust-preamble negotiation: the responder's own caps just
+				// arrived — flip to sidelnikov on both-support.
+				update_robust_preamble_negotiation();
 			}
 			else
 			{
@@ -8493,6 +8496,10 @@ void cl_arq_controller::process_control_commander()
 				// Responder's SWITCH_BANDWIDTH handler rejects if nb_only as a safety net.
 				peer_capability = legacy_ack_inferred_peer_cap(
 					(uint8_t)messages_control.data[5]);
+				// NB robust-preamble negotiation: a bare legacy ACK carries no
+				// responder capability proof, so the inference helper cleared the
+				// preamble bit -> this resolves to LEGACY (the interop floor).
+				update_robust_preamble_negotiation();
 			}
 			printf("[BW-NEG] Responder capability: 0x%02X (WB=%s, ENCRYPT=%s)\n",
 				peer_capability,

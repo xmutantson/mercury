@@ -63,8 +63,8 @@ public:
 	// MAX_PREAMBLE_SYMB must be >= max(preamble_nSymb across all configs)
 	// and >= mfsk_corr_template_sym_energy[] size in ofdm.h.
 	static const int MAX_PREAMBLE_SYMB = 48;
-	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol
-	int preamble_nSymb;                     // Number of preamble symbols used
+	int preamble_tones[MAX_PREAMBLE_SYMB]; // Known tone indices per preamble symbol (ACTIVE set)
+	int preamble_nSymb;                     // Number of preamble symbols used (ACTIVE set)
 	// Length-scaled detection threshold for the discrete-match preamble
 	// detector (`time_sync_mfsk_corr` ofdm.cc, post-2026-05-27 port per
 	// fact-documents/data-preamble-port-research.md §14). Number of
@@ -72,6 +72,59 @@ public:
 	// Mirrors ack_match_threshold / connect_match_threshold.
 	// FAR ≈ 2.5e-7/poll at M=32 (7/16); ≈ 2.4e-5/poll at M=16.
 	int preamble_match_threshold;
+
+	// NB robust-preamble capability negotiation (CAP_ROBUST_PREAMBLE_NB).
+	// The NB robust-DATA preamble is a WIRE quantity: the RX correlator only
+	// reaches threshold on the exact sequence+length its own tables predict, so
+	// a TX/RX disagreement is an acquisition-breaking wire mismatch. Two NB
+	// sequence sets exist for M=8 / M=4:
+	//   legacy     : the 8-symbol pre-negotiation preamble every shipped build
+	//                can acquire (the interop floor)
+	//   sidelnikov : the 32/48-symbol low-sidelobe sequence (kills the +preN
+	//                acquisition alias) — usable on TX only once the peer has
+	//                ADVERTISED it can receive it (CONNECT capability bit)
+	// Both sets are computed at init(); the ACTIVE set above is what TX emits
+	// and what the detector treats as primary. robust_preamble_mode:
+	//   0 = negotiable (default): active starts LEGACY; the session layer flips
+	//       to sidelnikov via set_robust_preamble_sidelnikov(true) once BOTH
+	//       peers advertised the capability. RX runs detect-both.
+	//   1 = forced sidelnikov (MERCURY_MFSK_ROBUST_PREAMBLE=sidelnikov): active
+	//       is sidelnikov from init (the pre-negotiation default-ON behavior).
+	//   2 = forced legacy (MERCURY_MFSK_ROBUST_PREAMBLE=short|off): active is
+	//       legacy, sidelnikov tables absent, no advertise, no detect-both —
+	//       the full pre-sidelnikov behavior.
+	// WB (M=16/32) is untouched: one set, mode irrelevant.
+	int robust_preamble_mode;          // 0=negotiable 1=forced-sid 2=forced-legacy
+	bool robust_preamble_sid_active;   // which set is ACTIVE (NB only)
+	int preamble_tones_legacy[MAX_PREAMBLE_SYMB];
+	int preamble_nSymb_legacy;
+	int preamble_match_threshold_legacy;
+	int preamble_tones_sid[MAX_PREAMBLE_SYMB];
+	int preamble_nSymb_sid;            // 0 when no sidelnikov set exists (WB / forced-legacy)
+	int preamble_match_threshold_sid;
+	// Swap the ACTIVE NB set. Installs the requested set when it exists
+	// (M=8/M=4 only; sidelnikov absent under forced-legacy). MODE policy —
+	// whether the session layer may flip at all — is the caller's job
+	// (telecom_system only flips when robust_preamble_mode==0). Returns true
+	// when the active set changed.
+	bool set_robust_preamble_sidelnikov(bool on);
+	// Frame-geometry authority: the LONGEST preamble this config can emit or be
+	// asked to detect. data_container/buffer sizing uses this so a mid-session
+	// active-set flip never needs a geometry reallocation.
+	int preamble_nSymb_max() const
+	{
+		return (preamble_nSymb_sid > preamble_nSymb) ? preamble_nSymb_sid : preamble_nSymb;
+	}
+	// True when RX must also search the non-active set (detect-both).
+	bool robust_preamble_detect_both() const
+	{
+		return robust_preamble_mode != 2 && preamble_nSymb_sid > 0;
+	}
+	// This build's RX can acquire the NB sidelnikov preamble (advertise gate).
+	bool robust_preamble_nb_rx_capable() const
+	{
+		return robust_preamble_mode != 2;
+	}
 
 	// ACK/BREAK/HAIL/SACK pattern: known tone sequences for pattern-based signaling.
 	// WB (M>=16): 8 Welch-Costas tones × 2 reps = 16 symbols, with tone hopping.

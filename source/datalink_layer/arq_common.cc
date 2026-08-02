@@ -155,6 +155,24 @@ static inline uint8_t cumulative_ack_advertise_bit()
 	return cached ? (uint8_t)CAP_CUMULATIVE_ACK : (uint8_t)0;
 }
 
+// NB robust-preamble capability (CAP_ROBUST_PREAMBLE_NB): the LOCAL advertise
+// gate. This build's RX detector carries BOTH NB robust-preamble sequence sets
+// (legacy 8-symbol + sidelnikov 32/48, detect-both), so the bit is advertised
+// by default. MERCURY_MFSK_ROBUST_PREAMBLE=short|off forces the full legacy
+// behavior (no sidelnikov tables, no detect-both) and MUST NOT advertise —
+// advertising is a promise about RX capability, and a =short RX cannot acquire
+// the sidelnikov preamble. Mirrors cl_mfsk::init()'s mode parse.
+static inline uint8_t robust_preamble_nb_advertise_bit()
+{
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_MFSK_ROBUST_PREAMBLE");
+		cached = (e != NULL && (strcmp(e, "short") == 0 || strcmp(e, "off") == 0)) ? 0 : 1;
+	}
+	return cached ? (uint8_t)CAP_ROBUST_PREAMBLE_NB : (uint8_t)0;
+}
+
 // LEVER P: normalize the PHY-published preamble geometry for ARQ ring/cursor
 // accounting. Zero is deliberate only while preamble amortization is active
 // (MINI0 tail); with amortization off it retains its legacy/uninitialized meaning
@@ -8249,9 +8267,10 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
 		peer_capability = 0;
 		wb_upgrade_pending = false;
+		update_robust_preamble_negotiation();
 		compression_enabled = false;
 		original_role=COMMANDER;
 		set_role(COMMANDER);
@@ -8355,9 +8374,10 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
 		peer_capability = 0;
 		wb_upgrade_pending = false;
+		update_robust_preamble_negotiation();
 		compression_enabled = false;
 		link_status=LISTENING;
 		connection_status=RECEIVING;
@@ -8391,7 +8411,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
+		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -8409,7 +8429,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -8428,7 +8448,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL;
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -8847,6 +8867,29 @@ int cl_arq_controller::test_demote_silence()
 	return fails;
 }
 
+// NB robust-preamble negotiation (CAP_ROBUST_PREAMBLE_NB): derive the session
+// verdict from the capability bytes and push it into the PHY. Symmetric rule,
+// evaluated independently on both peers:
+//   sidelnikov-TX allowed  <=>  local advertises it AND the peer advertised it.
+// Called wherever peer_capability transitions: TEST_CONNECTION receipt (RSP),
+// TEST_CONNECTION_ACK / legacy-ACK inference (CMD), and session reset (peer
+// byte cleared -> back to the legacy interop floor for the next session).
+void cl_arq_controller::update_robust_preamble_negotiation()
+{
+	if(telecom_system == NULL) return;
+	bool both = (robust_preamble_nb_advertise_bit() != 0)
+	         && ((peer_capability & CAP_ROBUST_PREAMBLE_NB) != 0);
+	if(telecom_system->robust_preamble_negotiated != both)
+	{
+		printf("[CAPNEG] NB robust preamble negotiation: %s (local=0x%02X peer=0x%02X)
+",
+			both ? "SIDELNIKOV" : "LEGACY",
+			(unsigned char)local_capability, (unsigned char)peer_capability);
+		fflush(stdout);
+	}
+	telecom_system->set_robust_preamble_negotiated(both);
+}
+
 void cl_arq_controller::reset_session_state()
 {
 	// Held-rung burst coalescing: a session boundary (BREAK teardown, link-timeout
@@ -9150,6 +9193,9 @@ void cl_arq_controller::reset_session_state()
 	wb_upgrade_pending = false;
 	handshake_confirmed = false;  // v9
 	handshake_retries_left = MAX_HANDSHAKE_RETRIES;  // v9
+	// NB robust-preamble: the peer byte is gone -> next session starts on the
+	// legacy interop floor until re-negotiated.
+	update_robust_preamble_negotiation();
 
 	// Connection
 	connection_id = 0;
@@ -11768,9 +11814,16 @@ void cl_arq_controller::send(st_message* message, int message_location)
 
 	{
 		int active_nsymb = telecom_system->get_active_nsymb();
+		int nominal_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate *
+					(active_nsymb + telecom_system->data_container.preamble_nSymb);
+		// The frame just built can be SHORTER than the nominal geometry (MFSK
+		// legacy 8-symbol preamble inside a sidelnikov-sized geometry, before
+		// the NB robust-preamble capability is negotiated). Key exactly the
+		// emitted span — transmit_byte zero-fills the nominal tail, so playing
+		// nominal would only add dead-air; the eff==nominal path is unchanged.
+		int emitted = telecom_system->tx_last_emitted_frame_samples;
 		tx_transfer(telecom_system->data_container.ready_to_transmit_passband_data_tx,
-					telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate *
-					(active_nsymb + telecom_system->data_container.preamble_nSymb));
+					(emitted > 0 && emitted < nominal_samples) ? emitted : nominal_samples);
 	}
 
 	drain_playback_wait();

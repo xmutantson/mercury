@@ -3672,6 +3672,11 @@ void cl_arq_controller::process_control_responder()
 			(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",
 			(peer_capability & CAP_ENCRYPTION) ? "yes" : "no");
 		fflush(stdout);
+		// NB robust-preamble negotiation: the commander's advertise just arrived.
+		// From here on this responder may emit the sidelnikov robust preamble
+		// (both-support), starting with the TEST_CONNECTION_ACK it queues below
+		// on robust configs — the commander's RX runs detect-both either way.
+		update_robust_preamble_negotiation();
 
 		// Read commander's SSID from byte 6 (sent separately from packed callsign)
 		{
@@ -13418,6 +13423,20 @@ int cl_arq_controller::test_held_cur_deliver_fire()
 	ck((legacy_inferred & (CAP_WB_CAPABLE | CAP_ENCRYPTION | CAP_CUMULATIVE_ACK))
 			== (CAP_WB_CAPABLE | CAP_ENCRYPTION | CAP_CUMULATIVE_ACK),
 		"PART C LEGACY: established symmetric capability inference is preserved");
+	ck(handshake_cap_echo_compatible(
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB),
+			(uint8_t)CAP_WB_CAPABLE,
+			(uint8_t)CAP_WB_CAPABLE),
+		"PART C INTEROP: an older peer may omit the NB robust-preamble bit echo");
+	ck(!handshake_cap_echo_compatible(
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB),
+			(uint8_t)CAP_WB_CAPABLE,
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB)),
+		"PART C CONSISTENCY: a capable peer cannot omit the NB robust-preamble echo");
+	ck((legacy_ack_inferred_peer_cap(
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB))
+			& CAP_ROBUST_PREAMBLE_NB) == 0,
+		"PART C INTEROP: a bare legacy ACK cannot infer NB robust-preamble support");
 
 	uint8_t saved_local_cap = this->local_capability;
 	uint8_t saved_peer_cap = this->peer_capability;

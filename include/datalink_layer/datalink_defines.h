@@ -157,6 +157,17 @@
 // MAX_SACK_BATCH_SIZE (96), so bits 0..6 retain the complete span. An older
 // peer leaves bit 3 clear and keeps the conservative previous-ACK defer.
 #define CAP_RETX_TURN_TAIL 0x08 // Supports the D5 selective-retry turn-tail marker
+// NB robust-preamble capability (robust-preamble rollout step 1+2): this
+// peer's RX acquisition detector carries the NB sidelnikov robust-DATA
+// preamble tables (32-symbol M=8 / 48-symbol M=4) IN ADDITION to the legacy
+// 8-symbol sequences (detect-both), so a peer that sees this bit may emit the
+// sidelnikov preamble at the NB robust tier. Symmetric decision rule on both
+// ends: sidelnikov-TX <=> local advertises AND peer advertised. Absent bit
+// (old build, lost byte, 4-bit ctrl-suffix path) => legacy preamble both ways
+// — the interop floor. Advertising is a promise about RX capability only.
+// 0x20 is reserved for the WB robust-preamble analog (not shipped: the WB
+// sidelnikov preamble measured a wash at operating SNRs).
+#define CAP_ROBUST_PREAMBLE_NB 0x10 // RX can acquire the NB sidelnikov robust preamble
 // The enhanced ctrl-suffix (GF(16) RA FEC + base-pattern combining) on the MFSK
 // CONNECT handshake (tier2-suffix-fec-design.md §21) is NOT capability-negotiated:
 // Mercury shipped no version, so there are no legacy peers, and the GF(16) RA
@@ -164,11 +175,12 @@
 // unconditional default at the robust tier, triggered by the gearshift config
 // (is_robust_config). (The §21 3rd-bit was removed in cleanup/drop-suffix-fec-cap;
 // the slot is now CAP_CUMULATIVE_ACK above.)
-// Bits 0..3 are the negotiable cap bits carried in the MFSK ctrl-suffix cap
+// Bits 0..4 are the negotiable cap bits carried in the MFSK ctrl-suffix cap
 // fields (TEST_ACK echoed_cap/own_cap, TEST_CONN local_cap), which use the formerly
-// reserved payload bits for bits 2 and 3 (the §21 precedent; no payload-width change), and
+// reserved payload bits for bits 2, 3 and 4 (the §21 precedent; no payload-width
+// change — an older peer transmits 0 there and ignores them on RX), and
 // the full LDPC TEST_CONNECTION/ACK capability byte. Packers/unpackers mask to this.
-#define CAP_NEGOTIABLE_MASK 0x0F
+#define CAP_NEGOTIABLE_MASK 0x1F
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };

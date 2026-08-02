@@ -673,6 +673,24 @@ public:
 	// byte-correct, unchanged). When ON it activates the variable-preamble TX +
 	// RX MINI handling. Toggle via the env knob below for A/B + INC-3 work.
 	bool preamble_amortization_enabled = false;
+	// NB robust-preamble capability negotiation (CAP_ROBUST_PREAMBLE_NB).
+	// Session-scoped: true once BOTH peers advertised the capability in the
+	// CONNECT handshake. The session layer (arq) owns the transitions:
+	// set at TEST_CONNECTION / TEST_CONNECTION_ACK capability receipt, cleared
+	// at session reset. While false, NB robust TX emits the LEGACY 8-symbol
+	// preamble (the interop floor); while true, the sidelnikov set. RX runs
+	// detect-both either way (see cl_ofdm::time_sync_mfsk_corr), so the flip
+	// instant needs no cross-peer synchronization. Survives load_configuration
+	// (config switches keep the session's negotiated preamble).
+	bool robust_preamble_negotiated = false;
+	// Apply a negotiation transition NOW (re-installs the active mfsk set and
+	// the detector mirror tables when the current config is NB MFSK).
+	void set_robust_preamble_negotiated(bool on);
+	// (Re)build the MFSK preamble runtime consumed by the detector: the corr
+	// template (dead state, kept for revert safety) + the cl_ofdm primary and
+	// alternate tone-table mirrors. Called by load_configuration and by
+	// set_robust_preamble_negotiated.
+	void rebuild_mfsk_preamble_runtime();
 	// CONTINUOUS-KEYDOWN: carry fine timing across the keydown instead of re-deriving per MINI frame
 	bool keydown_track_timing_enabled = false;
 	int keydown_last_delay = -1; // MINI=0: last decoded frame delay; its sub-symbol phase seeds the next tail prediction

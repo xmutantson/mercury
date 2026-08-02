@@ -211,15 +211,16 @@ static void test_pack_unpack_start_conn_payload() {
 static void test_pack_unpack_test_ack_payload() {
 	const char* name = "pack_unpack_test_ack_payload";
 	std::mt19937 rng(0xC0DE);
-	// Cap fields are the 4 negotiable MFSK-wire bits (CAP_NEGOTIABLE_MASK=0x0F:
-	// WB|ENCRYPTION|CUMULATIVE_ACK|RETX_TURN_TAIL). Bits 2 and 3 reuse
-	// formerly-reserved payload bits, with no payload-width change. Cover the
-	// full 4-bit echoed_cap x own_cap x representative SSID; reserved is bits 21..0.
+	// Cap fields are the 5 negotiable MFSK-wire bits (CAP_NEGOTIABLE_MASK=0x1F:
+	// WB|ENCRYPTION|CUMULATIVE_ACK|RETX_TURN_TAIL|ROBUST_PREAMBLE_NB). Bits 2..4
+	// reuse formerly-reserved payload bits, with no payload-width change. Cover
+	// the full 5-bit echoed_cap x own_cap x representative SSID; reserved is
+	// bits 19..0.
 	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
-	for (int ec = 0; ec < 16; ec++) {
-		for (int oc = 0; oc < 16; oc++) {
+	for (int ec = 0; ec < 32; ec++) {
+		for (int oc = 0; oc < 32; oc++) {
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();
@@ -228,9 +229,9 @@ static void test_pack_unpack_test_ack_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				// reserved is bits 21..0; bits 25..22 carry cap bits 2 and 3.
-				if ((p38 & ((1ULL << 22) - 1ULL)) != 0) {
-					test_fail(name, "reserved bits (21..0) not zero on TX");
+				// reserved is bits 19..0; bits 25..20 carry cap bits 2..4.
+				if ((p38 & ((1ULL << 20) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (19..0) not zero on TX");
 					return;
 				}
 				uint8_t out_ec = 0xFF, out_oc = 0xFF, out_ssid = 0;
@@ -248,15 +249,15 @@ static void test_pack_unpack_test_ack_payload() {
 			}
 		}
 	}
-	// A high cap byte (bits above 0x0F set) must be masked off on TX — the MFSK
-	// wire carries only the 4 negotiable bits.
+	// A high cap byte (bits above 0x1F set) must be masked off on TX — the MFSK
+	// wire carries only the 5 negotiable bits.
 	{
 		uint64_t p38 = 0;
 		pack_test_ack_payload(&p38, 0xFF, 0xFF, 42u);
 		uint8_t lec = 0xFF, loc = 0xFF, lss = 0;
 		bool ok = unpack_test_ack_payload(p38, &lec, &loc, &lss);
-		if (!ok || lec != 0xF || loc != 0xF || lss != 42u) {
-			test_fail(name, "high cap bits not masked to 0x0F on the wire");
+		if (!ok || lec != 0x1F || loc != 0x1F || lss != 42u) {
+			test_fail(name, "high cap bits not masked to 0x1F on the wire");
 			return;
 		}
 	}
@@ -272,7 +273,7 @@ static void test_pack_unpack_test_conn_payload() {
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
 	for (int snr_q = 0; snr_q < 16; snr_q++) {
-		for (int lc = 0; lc < 16; lc++) {  // local_cap is 4 negotiable MFSK-wire bits (0x0F)
+		for (int lc = 0; lc < 32; lc++) {  // local_cap is 5 negotiable MFSK-wire bits (0x1F)
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();  // pre-set garbage
@@ -282,9 +283,9 @@ static void test_pack_unpack_test_conn_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				// reserved is bits 21..0; bits 23/22 carry local_cap[2:3].
-				if ((p38 & ((1ULL << 22) - 1ULL)) != 0) {
-					test_fail(name, "reserved bits (21..0) not zero on TX");
+				// reserved is bits 20..0; bits 23..21 carry local_cap[2:4].
+				if ((p38 & ((1ULL << 21) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (20..0) not zero on TX");
 					return;
 				}
 				uint8_t out_snr = 0xFF, out_lc = 0xFF, out_ssid = 0;
@@ -305,14 +306,14 @@ static void test_pack_unpack_test_conn_payload() {
 			}
 		}
 	}
-	// A high cap byte (bits above 0x0F set) must be masked off on TX.
+	// A high cap byte (bits above 0x1F set) must be masked off on TX.
 	{
 		uint64_t p38 = 0;
 		pack_test_conn_payload(&p38, 9u, 0xFF, 55u);
 		uint8_t lsnr = 0xFF, llc = 0xFF, lss = 0;
 		bool ok = unpack_test_conn_payload(p38, &lsnr, &llc, &lss);
-		if (!ok || llc != 0xF || lsnr != 9u || lss != 55u) {
-			test_fail(name, "high local_cap bits not masked to 0x0F on the wire");
+		if (!ok || llc != 0x1F || lsnr != 9u || lss != 55u) {
+			test_fail(name, "high local_cap bits not masked to 0x1F on the wire");
 			return;
 		}
 	}
@@ -8530,6 +8531,178 @@ int run_recovery_ack_tests() {
 	return g_failures;
 }
 
+
+// §5.3 — NB robust-preamble capability negotiation (CAP_ROBUST_PREAMBLE_NB).
+// The 2026-07-26 default-ON sidelnikov NB preamble shipped with no
+// negotiation: a new TX emitted a 32/48-symbol sequence an old RX (8-symbol
+// tables, length-8 window) can never acquire — a mixed old/new NB pair could
+// not connect. This guard pins the negotiated contract at the PHY level:
+//   (a) negotiable default: ACTIVE = legacy 8-symbol (the interop floor)
+//       while the frame-geometry authority is sized for the sidelnikov max;
+//   (b) detect-both: a sidelnikov frame is acquired via the ALTERNATE
+//       detector arm while legacy is active (retro-covers a transition build
+//       that transmits sidelnikov without advertising it);
+//   (c) the negotiation flip installs sidelnikov as ACTIVE (TX + primary
+//       detector) and keeps legacy as the alternate (reconnect cover), and a
+//       session reset restores the floor;
+//   (d) the handshake-echo compatibility + bare-ACK inference rules never
+//       infer the capability from a peer that did not advertise it.
+static void test_nb_robust_preamble_capneg() {
+	const char* name = "nb_robust_preamble_capneg";
+
+	// (d) capability-byte logic (no DSP).
+	if (!handshake_cap_echo_compatible(
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB),
+			(uint8_t)CAP_WB_CAPABLE,
+			(uint8_t)CAP_WB_CAPABLE)) {
+		test_fail(name, "old-peer echo without the preamble bit must be tolerated");
+		return;
+	}
+	if (handshake_cap_echo_compatible(
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB),
+			(uint8_t)CAP_WB_CAPABLE,
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB))) {
+		test_fail(name, "a capable peer omitting the preamble-bit echo must fail closed");
+		return;
+	}
+	if ((legacy_ack_inferred_peer_cap((uint8_t)0x1F) & CAP_ROBUST_PREAMBLE_NB) != 0) {
+		test_fail(name, "a bare legacy ACK must never infer NB-preamble RX capability");
+		return;
+	}
+	{	// suffix codec carries bit 4 end-to-end
+		uint64_t p38 = 0;
+		uint8_t ec = 0, oc = 0, ss = 0;
+		pack_test_ack_payload(&p38,
+			(uint8_t)(CAP_WB_CAPABLE | CAP_ROBUST_PREAMBLE_NB),
+			(uint8_t)(CAP_ENCRYPTION | CAP_ROBUST_PREAMBLE_NB), 7u);
+		if (!unpack_test_ack_payload(p38, &ec, &oc, &ss)
+			|| (ec & CAP_ROBUST_PREAMBLE_NB) == 0
+			|| (oc & CAP_ROBUST_PREAMBLE_NB) == 0) {
+			test_fail(name, "ctrl-suffix TEST_ACK must round-trip the preamble bit");
+			return;
+		}
+	}
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.narrowband_enabled = YES;
+	ts.load_configuration(ROBUST_0);   // NB MFSK M=8, 1 stream
+
+	if (ts.mfsk.M != 8) {
+		test_fail(name, "pre-condition: NB ROBUST_0 must load M=8");
+		return;
+	}
+	if (ts.mfsk.robust_preamble_mode != 0) {
+		// Env-forced build (MERCURY_MFSK_ROBUST_PREAMBLE set): the negotiable
+		// contract is deliberately inactive; nothing further to assert.
+		printf("  [SKIP-NEG] %s: MERCURY_MFSK_ROBUST_PREAMBLE forces mode %d\n",
+			name, ts.mfsk.robust_preamble_mode);
+		test_pass(name);
+		return;
+	}
+
+	// (a) active set = legacy floor; geometry = sidelnikov maximum.
+	if (ts.mfsk.preamble_nSymb != 8 || ts.mfsk.robust_preamble_sid_active) {
+		test_fail(name, "negotiable default must start with the legacy 8-symbol set active");
+		return;
+	}
+	if (ts.data_container.preamble_nSymb != 32) {
+		char buf[96];
+		snprintf(buf, sizeof(buf),
+			"geometry authority=%d (expected sidelnikov max 32)",
+			ts.data_container.preamble_nSymb);
+		test_fail(name, buf);
+		return;
+	}
+	if (ts.ofdm.mfsk_alt_preamble_nsymb != 32) {
+		test_fail(name, "detector alternate arm must carry the 32-symbol sidelnikov set");
+		return;
+	}
+
+	// Shared TX-synth + detect helper (the §5.2 chain, ACTIVE-set length).
+	auto synth_detect = [&](int* out_matched_nsymb, bool* out_matched_alt) -> int {
+		int Nofdm = ts.data_container.Nofdm;
+		int Nc = ts.data_container.Nc;
+		int pre_n = ts.mfsk.preamble_nSymb;   // ACTIVE set length
+		int interp = ts.data_container.interpolation_rate;
+		int sym_samples = Nofdm * interp;
+		ts.mfsk.generate_preamble(ts.data_container.preamble_data, pre_n);
+		for (int i = 0; i < pre_n; i++)
+			ts.ofdm.symbol_mod(&ts.data_container.preamble_data[i * Nc],
+				&ts.data_container.preamble_symbol_modulated_data[i * Nofdm]);
+		int passband_samples = Nofdm * pre_n * interp;
+		std::vector<double> pb((size_t)passband_samples, 0.0);
+		long unsigned saved_pss = ts.ofdm.passband_start_sample;
+		ts.ofdm.passband_start_sample = 0;
+		ts.ofdm.baseband_to_passband(ts.data_container.preamble_symbol_modulated_data,
+			Nofdm * pre_n, pb.data(), ts.sampling_frequency, ts.carrier_frequency,
+			ts.carrier_amplitude, interp);
+		ts.ofdm.passband_start_sample = saved_pss;
+		int trailing = 12 * sym_samples;
+		int buf_size = ((passband_samples + trailing) / sym_samples) * sym_samples;
+		std::vector<double> buf((size_t)buf_size, 0.0);
+		for (int i = 0; i < passband_samples && i < buf_size; i++) buf[i] = pb[i];
+		std::vector<std::complex<double>> bb((size_t)buf_size,
+			std::complex<double>(0.0, 0.0));
+		ts.ofdm.passband_to_baseband(buf.data(), buf_size, bb.data(),
+			ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude,
+			1, &ts.ofdm.FIR_rx_time_sync);
+		double metric = 0.0;
+		int delay = ts.ofdm.time_sync_mfsk_corr(bb.data(), buf_size, interp, 0, &metric);
+		if (out_matched_nsymb) *out_matched_nsymb = ts.ofdm.mfsk_matched_preamble_nsymb;
+		if (out_matched_alt) *out_matched_alt = ts.ofdm.mfsk_matched_alt;
+		return delay;
+	};
+
+	int mn = 0; bool ma = false;
+	// (a) legacy TX acquires via the PRIMARY arm.
+	int d = synth_detect(&mn, &ma);
+	if (d < 0 || mn != 8 || ma) {
+		char buf[96];
+		snprintf(buf, sizeof(buf),
+			"legacy frame: delay=%d matched_nsymb=%d alt=%d (expect >=0, 8, 0)", d, mn, (int)ma);
+		test_fail(name, buf);
+		return;
+	}
+	// (b) sidelnikov TX (unadvertised transition peer) acquires via the ALT arm.
+	ts.mfsk.set_robust_preamble_sidelnikov(true);    // TX tables only; detector mirrors untouched
+	d = synth_detect(&mn, &ma);
+	ts.mfsk.set_robust_preamble_sidelnikov(false);
+	if (d < 0 || mn != 32 || !ma) {
+		char buf[96];
+		snprintf(buf, sizeof(buf),
+			"sidelnikov frame: delay=%d matched_nsymb=%d alt=%d (expect >=0, 32, 1)", d, mn, (int)ma);
+		test_fail(name, buf);
+		return;
+	}
+	// (c) the production negotiation flip.
+	ts.set_robust_preamble_negotiated(true);
+	if (ts.mfsk.preamble_nSymb != 32 || ts.ofdm.mfsk_preamble_nsymb != 32
+		|| ts.ofdm.mfsk_alt_preamble_nsymb != 8) {
+		test_fail(name, "negotiated flip must install sidelnikov active + legacy alternate");
+		return;
+	}
+	d = synth_detect(&mn, &ma);
+	if (d < 0 || mn != 32 || ma) {
+		test_fail(name, "post-negotiation sidelnikov frame must acquire via the primary arm");
+		return;
+	}
+	ts.mfsk.set_robust_preamble_sidelnikov(false);   // a peer that reset mid-session
+	d = synth_detect(&mn, &ma);
+	ts.mfsk.set_robust_preamble_sidelnikov(true);
+	if (d < 0 || mn != 8 || !ma) {
+		test_fail(name, "post-negotiation legacy frame must acquire via the alternate arm");
+		return;
+	}
+	ts.set_robust_preamble_negotiated(false);
+	if (ts.mfsk.preamble_nSymb != 8) {
+		test_fail(name, "session reset must restore the legacy interop floor");
+		return;
+	}
+
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -8606,6 +8779,7 @@ int run_mfsk_ctrl_codec_tests() {
 	// (data-flow-preamble_nSymb.md, 2026-05-27).
 	test_preamble_nSymb_wb_robust0_extended_to_16();
 	test_mfsk_data_preamble_passband_roundtrip_clean();
+	test_nb_robust_preamble_capneg();   // §5.3 NB robust-preamble negotiation guard
 
 	// §6 MFSK data-preamble discrete-match detector regression suite
 	// (data-preamble-port-research.md §14, 2026-05-27).

@@ -468,7 +468,26 @@ public:
 	int mfsk_preamble_nsymb;
 	int mfsk_preamble_match_threshold;
 
+	// NB robust-preamble detect-both (capability negotiation). The ALTERNATE
+	// set is the non-active NB sequence (legacy 8-sym when sidelnikov is
+	// active, sidelnikov 32/48-sym when legacy is active). When
+	// mfsk_alt_preamble_nsymb > 0, time_sync_mfsk_corr searches the primary
+	// set first and, on a miss, the alternate — so the RX acquires a peer on
+	// EITHER side of the preamble negotiation (and a transition build that
+	// transmits sidelnikov without advertising it). mfsk_matched_preamble_nsymb
+	// reports the length of the sequence that matched on the last positive
+	// detection — the extraction offset/frame-size authority for that frame.
+	int mfsk_alt_preamble_tones[48];
+	int mfsk_alt_preamble_nsymb;      // 0 = detect-both disabled
+	int mfsk_alt_match_threshold;
+	int mfsk_matched_preamble_nsymb;  // set on every positive detection
+	bool mfsk_matched_alt;            // true when the alternate set matched
+
 	int time_sync_mfsk_corr(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int search_start_symb, double* out_metric);
+	// Single-sequence scan body (the pre-negotiation detector, parameterized by
+	// the expected tone sequence). Called by time_sync_mfsk_corr once per set.
+	int time_sync_mfsk_corr_seq(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int search_start_symb, double* out_metric,
+	                            const int* pre_tones, int pre_nsymb, int pre_threshold);
 
 	// OFDM matched-filter preamble template (replaces FFT-based detection)
 	std::complex<double>* ofdm_corr_template;

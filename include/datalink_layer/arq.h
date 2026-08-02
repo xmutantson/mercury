@@ -361,8 +361,14 @@ inline bool d5_should_mark_retx_tail(bool negotiated, bool sack_v2,
 		&& frame_index == frame_count - 1;
 }
 // Handshake echoes remain exact for every established capability. A peer
-// whose older MFSK codec cannot carry bit 3 may omit only the optional
-// retransmit-tail bit, and only when its own advertised caps omit it too.
+// whose older codec cannot carry a NEWER optional bit may omit exactly that
+// bit, and only when its own advertised caps omit it too (a peer that itself
+// advertises the capability has a codec that can echo it — a missing echo
+// there is corruption, not age). Optional set: the retransmit-tail bit (the
+// original precedent) and the NB robust-preamble bit (same class: older
+// builds echo the LDPC byte verbatim but the 4-bit MFSK ctrl-suffix strips
+// it, and pre-capability builds never advertise it).
+#define CAP_ECHO_OPTIONAL ((uint8_t)(CAP_RETX_TURN_TAIL | CAP_ROBUST_PREAMBLE_NB))
 inline bool handshake_cap_echo_compatible(uint8_t local_cap,
 		uint8_t echoed_cap, uint8_t peer_own_cap)
 {
@@ -370,10 +376,9 @@ inline bool handshake_cap_echo_compatible(uint8_t local_cap,
 	uint8_t missing = (uint8_t)(local_cap & (uint8_t)~echoed_cap);
 	if(added != 0)
 		return false;
-	if((missing & (uint8_t)~CAP_RETX_TURN_TAIL) != 0)
+	if((missing & (uint8_t)~CAP_ECHO_OPTIONAL) != 0)
 		return false;
-	if((missing & CAP_RETX_TURN_TAIL)
-		&& (peer_own_cap & CAP_RETX_TURN_TAIL))
+	if((missing & CAP_ECHO_OPTIONAL & peer_own_cap) != 0)
 		return false;
 	return true;
 }
@@ -382,7 +387,12 @@ inline bool handshake_cap_echo_compatible(uint8_t local_cap,
 // symmetric assumptions, but never infer the new wire-changing bit from it.
 inline uint8_t legacy_ack_inferred_peer_cap(uint8_t echoed_local_cap)
 {
-	return (uint8_t)(echoed_local_cap & (uint8_t)~CAP_RETX_TURN_TAIL);
+	// Strip every wire-changing bit: a bare ACK proves nothing about the
+	// responder's RX. Inferring CAP_ROBUST_PREAMBLE_NB here would flip the TX
+	// preamble against exactly the class of peer (old build, bare-ACK-only)
+	// that cannot acquire it.
+	return (uint8_t)(echoed_local_cap
+		& (uint8_t)~(CAP_RETX_TURN_TAIL | CAP_ROBUST_PREAMBLE_NB));
 }
 // §7.13.39 Fix 1 — must be at least 2*MAX_SACK_BATCH_SIZE so the
 // "channel collapse" safety net (retransmit_count > 2*data_batch_size →
@@ -4007,6 +4017,11 @@ public:
 
   void reset_all_timers();
   void reset_session_state();
+  // NB robust-preamble capability negotiation (CAP_ROBUST_PREAMBLE_NB):
+  // derive the session verdict from local/peer capability bytes and push it
+  // into the PHY (telecom_system->set_robust_preamble_negotiated). Called at
+  // every peer_capability transition + session reset. arq_common.cc.
+  void update_robust_preamble_negotiation();
 
   cl_configuration_arq default_configuration_ARQ;
 

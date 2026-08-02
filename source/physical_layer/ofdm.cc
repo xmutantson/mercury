@@ -192,6 +192,11 @@ cl_ofdm::cl_ofdm()
 	mfsk_preamble_nsymb=0;
 	mfsk_preamble_match_threshold=0;
 	for(int i=0;i<48;i++) mfsk_preamble_tones[i]=0;
+	mfsk_alt_preamble_nsymb=0;
+	mfsk_alt_match_threshold=0;
+	for(int i=0;i<48;i++) mfsk_alt_preamble_tones[i]=0;
+	mfsk_matched_preamble_nsymb=0;
+	mfsk_matched_alt=false;
 	for(int i=0;i<4;i++) mfsk_stream_offsets[i]=0;
 	// OFDM matched-filter template
 	ofdm_corr_template=NULL;
@@ -4379,9 +4384,47 @@ int cl_ofdm::time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_si
 // (not cosine²-mean). Diagnostic-only — no flow-control code reads it.
 //
 // Returns delay in interpolated samples, or -1 if no preamble found.
+// Detect-both wrapper (NB robust-preamble capability negotiation): search the
+// PRIMARY (active/negotiated) sequence first; on a miss, search the ALTERNATE
+// set when configured. Reports which sequence matched via
+// mfsk_matched_preamble_nsymb / mfsk_matched_alt so the extraction uses the
+// per-frame preamble length. With no alternate configured this is exactly the
+// single-sequence detector.
 int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
                                   int buffer_size_interp, int interpolation_rate,
                                   int search_start_symb, double* out_metric)
+{
+	mfsk_matched_preamble_nsymb = 0;
+	mfsk_matched_alt = false;
+	int d = time_sync_mfsk_corr_seq(baseband_interp, buffer_size_interp,
+			interpolation_rate, search_start_symb, out_metric,
+			mfsk_preamble_tones, mfsk_preamble_nsymb, mfsk_preamble_match_threshold);
+	if (d >= 0)
+	{
+		mfsk_matched_preamble_nsymb = mfsk_preamble_nsymb;
+		return d;
+	}
+	if (mfsk_alt_preamble_nsymb > 0)
+	{
+		double alt_metric = 0.0;
+		int da = time_sync_mfsk_corr_seq(baseband_interp, buffer_size_interp,
+				interpolation_rate, search_start_symb, &alt_metric,
+				mfsk_alt_preamble_tones, mfsk_alt_preamble_nsymb, mfsk_alt_match_threshold);
+		if (da >= 0)
+		{
+			mfsk_matched_preamble_nsymb = mfsk_alt_preamble_nsymb;
+			mfsk_matched_alt = true;
+			if (out_metric) *out_metric = alt_metric;
+			return da;
+		}
+	}
+	return d;   // primary miss decision count already in *out_metric
+}
+
+int cl_ofdm::time_sync_mfsk_corr_seq(std::complex<double>* baseband_interp,
+                                  int buffer_size_interp, int interpolation_rate,
+                                  int search_start_symb, double* out_metric,
+                                  const int* pre_tones, int pre_nsymb, int pre_threshold)
 {
 	if (out_metric) *out_metric = 0.0;
 
@@ -4390,9 +4433,9 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 	// the mirror bin). Set MERCURY_MFSK_NOMIRROR=0 to restore the legacy mirror-accept.
 	bool acq_nomirror = true;
 	{ const char* _nm = std::getenv("MERCURY_MFSK_NOMIRROR"); if (_nm != NULL && atoi(_nm) == 0) acq_nomirror = false; }
-	if (mfsk_M <= 0 || mfsk_nStreams <= 0 || mfsk_preamble_nsymb <= 0)
+	if (mfsk_M <= 0 || mfsk_nStreams <= 0 || pre_nsymb <= 0)
 		return -1;
-	if (mfsk_preamble_match_threshold <= 0)
+	if (pre_threshold <= 0)
 		return -1;
 	if (work_buf_a == NULL || work_buf_b == NULL || Nfft <= 0)
 		return -1;
@@ -4401,7 +4444,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 	int sym_period_interp = Nofdm * interpolation_rate;
 	if (sym_period_interp <= 0) return -1;
 	int buffer_nsymb = buffer_size_interp / sym_period_interp;
-	int preamble_n = mfsk_preamble_nsymb;
+	int preamble_n = pre_nsymb;
 	if (buffer_nsymb < preamble_n) return -1;
 
 	int s_start = (search_start_symb > 0) ? search_start_symb : 0;
@@ -4441,7 +4484,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 			// Expected tone for this symbol. No hopping at emit time —
 			// preamble_tones[] stores the full sequence directly
 			// (mfsk.cc generate_preamble:467 reads preamble_tones[s % nsymb]).
-			int actual_tone = mfsk_preamble_tones[p % 48];
+			int actual_tone = pre_tones[p % 48];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
 			// e_target: energy in the expected (+mirror) tone bins summed over all
@@ -4594,7 +4637,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 				decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 			fft(decimated_sym, fft_out, Nfft);
 
-			int actual_tone = mfsk_preamble_tones[p % 48];
+			int actual_tone = pre_tones[p % 48];
 			if (actual_tone < 0 || actual_tone >= mfsk_M) continue;
 
 			// e_targ: expected(+mirror) tone energy summed over streams — secondary
@@ -4711,7 +4754,7 @@ int cl_ofdm::time_sync_mfsk_corr(std::complex<double>* baseband_interp,
 	//    this keeps the SAME gate statistic there too).
 	int decision_matched = (mfsk_nStreams >= 2) ? best_matched : fine_best_matched;
 
-	if (decision_matched < mfsk_preamble_match_threshold)
+	if (decision_matched < pre_threshold)
 	{
 		if (out_metric) *out_metric = (double)decision_matched;
 		return -1;
