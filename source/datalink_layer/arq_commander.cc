@@ -8708,7 +8708,18 @@ void cl_arq_controller::process_control_commander()
 					// or a quick connect leaves the commander transmitting at CONFIG_0 while the intent
 					// vars read the pin (connect-fast success-vs-revert restore asymmetry; cross-layer
 					// data-flow audit of the connect_fast restore paths).
-					load_configuration(connect_fast_fallback_config, FULL, YES);
+					// [WBDIRECT-REGRESSION] fail-before hook: MERCURY_CONNECT_FAST_DEFEAT_RESEAT=1
+					// SKIPS this live-PHY reseat so the SAME binary reproduces the pre-fix strand
+					// (commander keeps keying DATA at the fast config while the intent vars read the
+					// pin). Production NEVER sets it — only the loopback regression's fail-before arm.
+					{
+						const char* cfdr = std::getenv("MERCURY_CONNECT_FAST_DEFEAT_RESEAT");
+						if(!(cfdr && *cfdr && atoi(cfdr) != 0))
+							load_configuration(connect_fast_fallback_config, FULL, YES);
+						else
+							printf("[CONNECT-FAST] DEFEAT_RESEAT: commander live-PHY reseat SKIPPED "
+								"(fail-before; stranded at CONFIG_%d)\n", current_configuration);
+					}
 					if(robust_enabled == YES && is_robust_config(init_configuration))
 						connect_fuse_floor_config = init_configuration;
 					connect_fast_active = false;
@@ -22085,6 +22096,48 @@ int cl_arq_controller::test_sim_inproc_2()
 	MercuryInstance* B = new MercuryInstance();  B->tag = "B/RSP";
 	sim2_setup_instance(A, COMMANDER, robust, start_cfg, seed ^ 0xA5A5u);
 	sim2_setup_instance(B, RESPONDER, robust, start_cfg, seed ^ 0x5A5Au);
+	// [WBDIRECT-REGRESSION] connect-fast pin-RESEAT loopback regression (cross-layer
+	// data-flow audit of the connect-fast restore paths). MERCURY_SIM2_CONNECT_FAST=<cfg>
+	// (default -1 = OFF, every existing arm byte-identical) escalates the CONNECT
+	// handshake to <cfg> (e.g. CONFIG_0) and remembers start_cfg as the pin/fallback —
+	// the SAME latch init() installs when MERCURY_CONNECT_FAST_CONFIG is set
+	// (arq_common.cc, the connect_fast_config!=CONFIG_NONE block). On a successful fast
+	// connect the commander (and responder) MUST reseat the LIVE PHY off the fast config
+	// onto the pin; the pre-fix code reseated only the intent vars and left
+	// current_configuration at the fast config, so forward DATA was keyed at CONFIG_0
+	// while the batch/SACK geometry expected the pin (the WB-direct start stall: the
+	// session strands at ~30 delivered bytes). The fail-before hook
+	// MERCURY_CONNECT_FAST_DEFEAT_RESEAT=1 (read at the production reseat sites in
+	// arq_commander.cc / arq_responder.cc) skips the reseat so the SAME binary
+	// reproduces that strand. Configured here, BEFORE the PHY bring-up below, so the
+	// handshake PHY loads at the fast config. Use with the gearshift PINNED off
+	// (MERCURY_SIM2_PIN=1) — the connect-fast success reseat lives in the gear-shift-off
+	// branch of process_control_commander().
+	const long connect_fast_cfg = env_i("MERCURY_SIM2_CONNECT_FAST", -1);
+	if (connect_fast_cfg >= 0) {
+		MercuryInstance* cf_peers[2] = { A, B };
+		for (int pi = 0; pi < 2; pi++) {
+			cl_arq_controller& a = cf_peers[pi]->arq;
+			a.connect_fast_config          = (int)connect_fast_cfg;
+			a.connect_fast_budget_ms       = (int)env_i("MERCURY_SIM2_CONNECT_FAST_BUDGET_MS", 60000);
+			a.connect_fast_fallback_robust = a.robust_enabled;
+			a.connect_fast_fallback_config = a.init_configuration;   // the TRUE pin (== start_cfg)
+			a.connect_fast_active          = true;
+			a.robust_enabled               = NO;
+			a.init_configuration           = (int)connect_fast_cfg;
+			a.data_configuration           = (int)connect_fast_cfg;
+			a.ack_configuration            = (int)connect_fast_cfg;
+			a.last_data_viable_config      =
+				session_floor_anchor(a.robust_enabled, a.init_configuration);
+		}
+		printf("[TEST-SIM-2INST] CONNECT-FAST mode: handshake escalated to CONFIG_%ld, "
+		       "pin/fallback=CONFIG_%d (budget=%d ms, defeat_reseat=%s)\n",
+		       connect_fast_cfg, A->arq.connect_fast_fallback_config,
+		       A->arq.connect_fast_budget_ms,
+		       (std::getenv("MERCURY_CONNECT_FAST_DEFEAT_RESEAT") &&
+		        atoi(std::getenv("MERCURY_CONNECT_FAST_DEFEAT_RESEAT")) != 0) ? "YES" : "no");
+		fflush(stdout);
+	}
 	// PHY bring-up (no TCP) — mirrors init()'s two load_configuration calls. Done
 	// here (not in the free helper) because load_configuration is a private member;
 	// a cl_arq_controller member fn can call it on ANY instance.

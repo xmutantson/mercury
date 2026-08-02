@@ -2052,11 +2052,21 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			// paths above do not, which stranded the responder at the fast config while the
 			// commander transmitted DATA at the pin (block failures / BREAK churn until a late
 			// precook swap caught up). No-op for a non-fast connect (current == data already).
+			// [WBDIRECT-REGRESSION] fail-before hook: MERCURY_CONNECT_FAST_DEFEAT_RESEAT=1
+			// SKIPS the responder live-PHY reseat too, symmetric with the commander, so the
+			// SAME binary reproduces the pre-fix strand. Production NEVER sets it.
 			if(data_configuration != current_configuration)
 			{
-				load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
-				if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
-					inband_finalize_ofdm_adopt_ring(data_configuration);
+				const char* cfdr = std::getenv("MERCURY_CONNECT_FAST_DEFEAT_RESEAT");
+				if(!(cfdr && *cfdr && atoi(cfdr) != 0))
+				{
+					load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+					if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
+						inband_finalize_ofdm_adopt_ring(data_configuration);
+				}
+				else
+					printf("[CONNECT-FAST] DEFEAT_RESEAT: responder live-PHY reseat SKIPPED "
+						"(fail-before; stranded at CONFIG_%d)\n", current_configuration);
 			}
 		}
 		else if(ack_pattern_time_ms > 0)
