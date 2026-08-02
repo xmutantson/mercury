@@ -752,11 +752,13 @@ void *radio_playback_thread(void *device_ptr)
 	// Clock-drift instrumentation: track effective playback sample rate.
 	struct timespec clk_tx_start, clk_tx_window_start, clk_tx_prev_call;
 	long long clk_tx_window_frames;
+	long long clk_tx_cum_frames;
 	int clk_tx_glitch_count;
 	clock_gettime(CLOCK_MONOTONIC, &clk_tx_start);
 	clk_tx_window_start = clk_tx_start;
 	clk_tx_prev_call = clk_tx_start;
 	clk_tx_window_frames = 0;
+	clk_tx_cum_frames = 0;
 	clk_tx_glitch_count = 0;
 
     while (!shutdown_)
@@ -923,9 +925,20 @@ void *radio_playback_thread(void *device_ptr)
 		// sample-clock skew is ±8.16 ppm (CLOCK_VERDICT.md §2, tone method);
 		// the hundreds-of-ppm here is a software measurement artifact (push-rate
 		// vs wall, dominated by 10 s-window quantization). Do NOT treat
-		// [TX-PUSH-RATE] as the crystal. (A future cleanup may report
-		// sink-ACCEPTED frames over an exact-period window.)
+		// [TX-PUSH-RATE] as the crystal.
+		//
+		// DRIFT FIELD FIX (window-quantization -> cumulative convergence): the
+		// per-window rate carries a ±1-period-per-window quantization error that
+		// swings hundreds of ppm and sign-flips window to window on a channel whose
+		// true skew is ±8 ppm — a physical crystal cannot do that, so the field was
+		// pure artifact. The reported `drift` is now the CUMULATIVE rate
+		// (cum_frames / total_wall since stream start): the bounded per-window
+		// quantization error averages out ~1/t, so the estimate CONVERGES on the
+		// real rate instead of oscillating. The per-window rate is still printed as
+		// `wrate` for glitch/underrun diagnostics; `cum_rate`/`drift` is the honest
+		// clock estimate.
 		clk_tx_window_frames += samples_read;
+		clk_tx_cum_frames    += samples_read;
 		{
 			struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
 			double dt_call = (now.tv_sec - clk_tx_prev_call.tv_sec) +
@@ -942,13 +955,15 @@ void *radio_playback_thread(void *device_ptr)
 			double dt_window = (now.tv_sec - clk_tx_window_start.tv_sec) +
 			                   (now.tv_nsec - clk_tx_window_start.tv_nsec) * 1e-9;
 			if (dt_window >= 10.0) {
-				double rate = clk_tx_window_frames / dt_window;
 				double dt_total = (now.tv_sec - clk_tx_start.tv_sec) +
 				                  (now.tv_nsec - clk_tx_start.tv_nsec) * 1e-9;
-				double drift_ppm = (rate - 48000.0) / 48000.0 * 1e6;
-				printf("[TX-PUSH-RATE] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
-					dt_window, (long long)clk_tx_window_frames, rate, drift_ppm, dt_total,
-					clk_tx_glitch_count);
+				double wrate    = clk_tx_window_frames / dt_window;   // per-window (quantization-bounded, diagnostic)
+				double cum_rate = (dt_total > 0.0)
+					? (double)clk_tx_cum_frames / dt_total : 48000.0; // cumulative (converges on the true rate)
+				double drift_ppm = (cum_rate - 48000.0) / 48000.0 * 1e6;
+				printf("[TX-PUSH-RATE] dt=%.2fs frames=%lld cum_frames=%lld wrate=%.3f cum_rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
+					dt_window, (long long)clk_tx_window_frames, (long long)clk_tx_cum_frames,
+					wrate, cum_rate, drift_ppm, dt_total, clk_tx_glitch_count);
 				fflush(stdout);
 				clk_tx_window_start = now;
 				clk_tx_window_frames = 0;
@@ -1520,13 +1535,19 @@ void *radio_capture_thread(void *device_ptr)
 			double dt_window = (now.tv_sec - clk_rx_window_start.tv_sec) +
 			                   (now.tv_nsec - clk_rx_window_start.tv_nsec) * 1e-9;
 			if (dt_window >= 10.0) {
-				double rate = clk_rx_window_frames / dt_window;
+				// DRIFT FIELD FIX (see [TX-PUSH-RATE] above): report the CUMULATIVE
+				// rate (cum_frames / total_wall) so the bounded per-window
+				// quantization error averages out ~1/t and the estimate converges on
+				// the true rate; the per-window rate is kept as `wrate` for diagnostics.
 				double dt_total = (now.tv_sec - clk_rx_start.tv_sec) +
 				                  (now.tv_nsec - clk_rx_start.tv_nsec) * 1e-9;
-				double drift_ppm = (rate - 48000.0) / 48000.0 * 1e6;
-				printf("[RX-DELIVER-RATE] dt=%.2fs frames=%lld rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
-					dt_window, (long long)clk_rx_window_frames, rate, drift_ppm, dt_total,
-					clk_rx_glitch_count);
+				double wrate    = clk_rx_window_frames / dt_window;
+				double cum_rate = (dt_total > 0.0)
+					? (double)clk_rx_cum_frames / dt_total : 48000.0;
+				double drift_ppm = (cum_rate - 48000.0) / 48000.0 * 1e6;
+				printf("[RX-DELIVER-RATE] dt=%.2fs frames=%lld cum_frames=%lld wrate=%.3f cum_rate=%.3f Hz drift=%+.1f ppm total_t=%.1fs glitches=%d\n",
+					dt_window, (long long)clk_rx_window_frames, (long long)clk_rx_cum_frames,
+					wrate, cum_rate, drift_ppm, dt_total, clk_rx_glitch_count);
 				fflush(stdout);
 				clk_rx_window_start = now;
 				clk_rx_window_frames = 0;
