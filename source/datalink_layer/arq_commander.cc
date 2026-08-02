@@ -15039,27 +15039,35 @@ int cl_arq_controller::test_break_weld()
 		else { printf("%s FAIL: %s (got=%d want=%d)\n", TAG, what, got, want); failed++; }
 		fflush(stdout);
 	};
+	auto put_env = [](const char* name, const char* value) {
+#ifdef _WIN32
+		_putenv_s(name, value);
+#else
+		if(value && *value) setenv(name, value, 1);
+		else unsetenv(name);
+#endif
+	};
 
-	set_env("MERCURY_BREAK_PIN_CONFIG", "");
+	put_env("MERCURY_BREAK_PIN_CONFIG", "");
 	check(break_weld_target(CONFIG_15) == CONFIG_15,
 		"control: unset knob preserves the recovery target",
 		break_weld_target(CONFIG_15), CONFIG_15);
-	set_env("MERCURY_BREAK_PIN_CONFIG", "not-a-config");
+	put_env("MERCURY_BREAK_PIN_CONFIG", "not-a-config");
 	check(break_weld_target(CONFIG_14) == CONFIG_14,
 		"invalid text fails open to the recovery target",
 		break_weld_target(CONFIG_14), CONFIG_14);
-	set_env("MERCURY_BREAK_PIN_CONFIG", "9999");
+	put_env("MERCURY_BREAK_PIN_CONFIG", "9999");
 	check(break_weld_target(CONFIG_13) == CONFIG_13,
 		"off-ladder config fails open to the recovery target",
 		break_weld_target(CONFIG_13), CONFIG_13);
-	set_env("MERCURY_BREAK_PIN_CONFIG", "16");
+	put_env("MERCURY_BREAK_PIN_CONFIG", "16");
 	check(break_weld_target(CONFIG_0) == CONFIG_16,
 		"armed knob returns a demoting BREAK to the pinned config",
 		break_weld_target(CONFIG_0), CONFIG_16);
 	check(break_weld_target(ROBUST_0) == CONFIG_16,
 		"armed knob also defeats a panic target",
 		break_weld_target(ROBUST_0), CONFIG_16);
-	set_env("MERCURY_BREAK_PIN_CONFIG", "");
+	put_env("MERCURY_BREAK_PIN_CONFIG", "");
 	printf("%s %s: failures=%d\n", TAG, failed ? "FAIL" : "PASS", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
