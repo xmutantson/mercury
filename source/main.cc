@@ -2371,6 +2371,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_mt;
                 failed += ARQ_mt.test_measured_timers();
             }
+            // Karn discriminator decoupling (MERCURY_KARN_RETX_ONLY): the R6 estimator was
+            // inert on the dominant clean OFDM path because the Karn gate read
+            // data_ack_retx_turnaround (which the H1 widen arms on a CLEAN batch). Drives the
+            // REAL tt_karn_sample_ok() + update_turnaround_estimate(): fail-before (knob off)
+            // starves the estimator (n stays 0); pass-after (knob on) folds the clean sample
+            // (n 0->1) while a genuine retx round and a starve are still excluded.
+            {
+                cl_arq_controller ARQ_kn;
+                failed += ARQ_kn.test_karn_retx_classify();
+            }
             // R4 LINK-PARAMS quiesce gate (arq_commander.cc): an Axis-2 batch-size
             // renegotiation must not fire while the boundary is unclean (retx pending / last
             // batch partial), which would mix old-bsi retransmits into the first batch of the
@@ -3639,6 +3649,9 @@ int main(int argc, char *argv[])
                                         // TURNAROUND_DEFEAT. One-shot, exits rc.
     bool test_measured_timers_cli = false; // --test-measured-timers: R6 SRTT/RTTVAR turnaround estimator +
                                         // ack_timeout_data >= receiving_timeout invariant regression (one-shot, exit rc).
+    bool test_arqsmalls_cli = false;    // --test-arqsmalls: Karn discriminator decoupling
+                                        // (MERCURY_KARN_RETX_ONLY) + DUTY-R pin-respect seed
+                                        // (MERCURY_DUTY_R_PIN_DEFEAT), fast one-shot, exit rc.
     bool test_recovery_ack_capture_exercise_cli = false; // --test-recovery-ack-capture-exercise:
                                         // live production poll, late retained ACK -> 1/1 accept.
     bool test_turnaround_guard_cli = false; // --test-turnaround-guard: R1 turnaround-clearance guard —
@@ -4538,6 +4551,16 @@ int main(int argc, char *argv[])
             // regression — one-shot at startup, exit rc.
             // See source/datalink_layer/arq_common.cc test_measured_timers.
             test_measured_timers_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-arqsmalls") == 0)
+        {
+            // Karn discriminator decoupling + DUTY-R pin-respect seed regression —
+            // fast one-shot at startup, exit rc (avoids the full --test acquisition
+            // trims + watchdog). See arq_common.cc test_karn_retx_classify and
+            // arq_commander.cc test_robust_connect_exit.
+            test_arqsmalls_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6720,6 +6743,18 @@ start_modem:
             cl_arq_controller ARQ_mt;
             int rc = ARQ_mt.test_measured_timers();
             printf("[FLAG] Measured-timers test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_arqsmalls_cli) {
+            // Karn discriminator decoupling (MERCURY_KARN_RETX_ONLY) + DUTY-R
+            // pin-respect seed (MERCURY_DUTY_R_PIN_DEFEAT) — fast one-shot, exit rc.
+            printf("[FLAG] --test-arqsmalls: Karn discriminator + DUTY-R pin-respect regression\n");
+            fflush(stdout);
+            int rc = 0;
+            { cl_arq_controller ARQ_kn; rc += ARQ_kn.test_karn_retx_classify(); }
+            { cl_arq_controller ARQ_dr; rc += ARQ_dr.test_robust_connect_exit(); }
+            printf("[FLAG] arq-smalls test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

@@ -2983,6 +2983,9 @@ void cl_arq_controller::process_messages_tx_data()
 		// we are about to wait for IS a retransmit turnaround -> arm the D2 robust reverse-ACK widen
 		// (calculate_receiving_timeout reads this flag). Set BEFORE the calc so the widen fires.
 		data_ack_retx_turnaround = true;
+		// Karn (MERCURY_KARN_RETX_ONLY): a v1 retransmit-only batch DOES carry retx frames ->
+		// the turnaround is genuinely retransmit-ambiguous -> exclude its RTT sample.
+		data_ack_round_carried_retx = true;
 		calculate_receiving_timeout();
 		// LINK-PHASE STEP 5 / MC-3: arm one close edge only when Step 2 supplied
 		// a valid derived ACK_SLOT for this actual retransmit keydown.
@@ -3610,6 +3613,11 @@ void cl_arq_controller::process_messages_tx_data()
 			    && data_batch_size >= BATCH_MAY_BE_PARTIAL_THRESHOLD)
 #endif
 			);
+		// Karn (MERCURY_KARN_RETX_ONLY): the round carries retx frames iff this is a v2
+		// mixed batch (a retx prefix ahead of the new data). A clean first-pass batch — the
+		// H1 partial-capable widen included — carries NO retx frames, so its RTT sample is a
+		// valid Karn sample (starve>0 is handled belt-and-braces inside tt_karn_sample_ok).
+		data_ack_round_carried_retx = v2_mixed_batch;
 		// Recalculate timeout: guard delays from prior ACK detection can leave
 		// receiving_timeout stale, too short for the next ACK round-trip.
 		calculate_receiving_timeout();
@@ -6286,6 +6294,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					emergency_nack_count = 0;
 					cfg16_revack_starve_fails = 0;
 					data_ack_retx_turnaround = false;
+					data_ack_round_carried_retx = false;   // Karn: fresh epoch, next send re-arms
 					if(sack_v2_enabled)
 						policy_axis1_supremacy_on_move(current_configuration,
 							working_config, "inband_session_dead_batches_floor");
@@ -6336,6 +6345,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// retx-turnaround arm so a stale TRUE cannot widen the post-BREAK control window. The
 			// next data batch re-derives it at the send path.
 			data_ack_retx_turnaround = false;
+			data_ack_round_carried_retx = false;   // Karn: fresh epoch, next send re-arms
 
 			// SACK Design A Step 12 — BREAK supremacy (§4.3.4 invariant #6).
 			if(sack_v2_enabled)
@@ -14350,6 +14360,15 @@ int cl_arq_controller::test_robust_connect_exit()
 	int saved_cfg    = current_configuration;
 	int saved_ceil   = supershift_proven_ceiling;
 	bool saved_def   = duty_r_defeat;
+	int saved_data   = data_configuration;
+	int saved_gs     = gear_shift_on;
+	bool saved_pdef  = duty_r_pin_defeat;
+
+	// Neutralise the PIN-RESPECT gate for the four legacy arms (they assert the CONFIG_0
+	// seed): a gearshift-ON session with data_configuration==CONFIG_0 never triggers it.
+	gear_shift_on     = YES;
+	data_configuration = CONFIG_0;
+	duty_r_pin_defeat = false;
 
 	// --- FAIL-BEFORE: R defeated (MERCURY_DUTY_R_DEFEAT / master-defeat) ---
 	duty_r_defeat = true;
@@ -14381,9 +14400,56 @@ int cl_arq_controller::test_robust_connect_exit()
 	check(g2 == CONFIG_NONE,
 		"GUARD proven-ceiling floored below CONFIG_0 -> NO re-probe", g2, CONFIG_NONE);
 
+	// ===== PIN-RESPECT (§31 DUTY-R) =====
+	// A gearshift-OFF session pinned to a WB OFDM config (data_configuration=CONFIG_16) at a
+	// robust connect. The lever-R CONFIG_0 seed strands it at the OFDM floor (no climb off it).
+	duty_r_defeat             = false;
+	current_configuration     = ROBUST_0;      // robust connect
+	supershift_proven_ceiling = -1;            // no prior BREAK
+	gear_shift_on             = NO;            // pinned (no climb)
+	data_configuration        = CONFIG_16;     // the WB pin target
+
+	// FAIL-BEFORE (pin-respect DEFEATED): legacy unconditional CONFIG_0 seed -> STRAND.
+	duty_r_pin_defeat = true;
+	int pf = robust_connect_exit_target();
+	check(pf == CONFIG_0,
+		"PIN FAIL-BEFORE (defeat): gearshift-OFF WB-pin seeds CONFIG_0 (the strand)", pf, CONFIG_0);
+
+	// PASS-AFTER (pin-respect LIVE): cross DIRECTLY to the pinned WB config, one hop.
+	duty_r_pin_defeat = false;
+	int pp = robust_connect_exit_target();
+	check(pp == CONFIG_16,
+		"PIN PASS-AFTER: gearshift-OFF WB-pin seeds the PIN (respects the pin)", pp, CONFIG_16);
+
+	// PIN GUARD a: gearshift ON (a climbing session) -> byte-identical CONFIG_0 seed
+	// (the CONFIG_0 bootstrap is correct; gearshift climbs off it to the pin).
+	gear_shift_on = YES;
+	int pg1 = robust_connect_exit_target();
+	check(pg1 == CONFIG_0,
+		"PIN GUARD gearshift-ON -> CONFIG_0 seed (climb bootstrap unchanged)", pg1, CONFIG_0);
+	gear_shift_on = NO;
+
+	// PIN GUARD b: the proven ceiling sits BELOW the pin (a prior cross failed) but at/above
+	// CONFIG_0 -> cannot reach the pin, fall back to the CONFIG_0 seed.
+	supershift_proven_ceiling = CONFIG_0;
+	int pg2 = robust_connect_exit_target();
+	check(pg2 == CONFIG_0,
+		"PIN GUARD proven-ceiling below pin -> CONFIG_0 seed (cannot reach pin)", pg2, CONFIG_0);
+	supershift_proven_ceiling = -1;
+
+	// PIN GUARD c: a gearshift-OFF session pinned to CONFIG_0 (or a robust config) -> the
+	// pin clause does not fire (nothing above CONFIG_0 to respect) -> CONFIG_0 seed.
+	data_configuration = CONFIG_0;
+	int pg3 = robust_connect_exit_target();
+	check(pg3 == CONFIG_0,
+		"PIN GUARD gearshift-OFF CONFIG_0 pin -> CONFIG_0 seed (byte-identical)", pg3, CONFIG_0);
+
 	current_configuration     = saved_cfg;
 	supershift_proven_ceiling = saved_ceil;
 	duty_r_defeat             = saved_def;
+	data_configuration        = saved_data;
+	gear_shift_on             = saved_gs;
+	duty_r_pin_defeat         = saved_pdef;
 
 	printf("[TEST-DUTY-R] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);

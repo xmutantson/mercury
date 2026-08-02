@@ -583,6 +583,17 @@ public:
   int  tt_class_of(int cfg) const;
   int  tt_batchbk_of(int batch_airtime_ms) const;
   bool tt_karn_sample_ok() const;
+  // Karn discriminator A/B (MERCURY_KARN_RETX_ONLY, default OFF => byte-identical
+  // legacy coupling). When ON, tt_karn_sample_ok() classifies retransmit-ambiguity
+  // off data_ack_round_carried_retx (the round GENUINELY carried retx frames) instead
+  // of data_ack_retx_turnaround (which ALSO arms on a clean fresh partial-capable OFDM
+  // batch — the H1 reverse-ACK-drift widen — folding ZERO clean samples on the
+  // dominant OFDM path and leaving the measured estimator inert). Read FRESH each call
+  // so the in-process fail-before/pass-after can toggle it; the accept path is not hot.
+  bool tt_karn_retx_only() const {
+    const char* e = std::getenv("MERCURY_KARN_RETX_ONLY");
+    return (e && e[0] && atoi(e) != 0);
+  }
   void update_turnaround_estimate(int cfg, int batch_airtime_ms, int rtt_ms);
   void recalculate_ack_timeout_for_batch();
   // SACK-negotiation batch recompute, shared by the CMD (TEST_CONNECTION_ACK)
@@ -730,6 +741,7 @@ public:
   void arm_control_turnaround_guard();
   int  test_turnaround_guard();
   int  test_measured_timers();  // R6 SRTT/RTTVAR estimator + ack-timeout invariant regression
+  int  test_karn_retx_classify(); // Karn discriminator decoupling A/B (MERCURY_KARN_RETX_ONLY)
   // Live production-poll exercise for the recovery-only older-phase capture.
   // A complete ACK lives in retained ring history while the newest tail is
   // silent. Bare monitor returns false; the recovery capture port accepts 1/1.
@@ -4048,6 +4060,13 @@ public:
   // FALSE (ctor + session resets) -> a pure-clean session never fires the geometry (byte-identical
   // to D2-off / D3-base). NOT on the wire. See §4 cross-layer audit.
   bool data_ack_retx_turnaround;       // CMD: the data-ACK we are waiting for is a retx turnaround
+  // CMD Karn discriminator (MERCURY_KARN_RETX_ONLY arm): TRUE iff the forward batch this
+  // data-ACK answers GENUINELY carried retransmitted frames (v1 retransmit-only send /
+  // v2 mixed-batch retx prefix) — the ONLY retransmit-ambiguous turnarounds under Karn's
+  // rule. Distinct from data_ack_retx_turnaround, which ALSO arms on a clean fresh
+  // partial-capable OFDM batch (H1 widen). Set fresh at the two data-send sites, cleared
+  // on BREAK; init FALSE (ctor). NOT on the wire. See the turnaround-timers audit.
+  bool data_ack_round_carried_retx;    // CMD: the answered batch carried retx frames (Karn)
   bool ack_tx_retx_turnaround;         // RSP: the ACK we are about to key is a retx turnaround
   int retransmit_count;                // Number of frames to retransmit
   int retransmit_batch_id;             // Crypto batch ID of frames being retransmitted
@@ -6034,6 +6053,14 @@ public:
   // restores the incumbent robust dwell so the fire-proof runs FIX vs DEFEAT on ONE
   // binary. Independent of climb_accel_defeat (R is on the CONNECT path, not the leap).
   bool duty_r_defeat;
+  // DUTY lever R — PIN-RESPECT gate (default-ON; A/B defeat MERCURY_DUTY_R_PIN_DEFEAT=1,
+  // env-latched in the ctor). The lever-R CONFIG_0 seed is a CLIMB bootstrap: it only
+  // pays off when gearshift can climb OFF it. On a gearshift-OFF (pinned) session there
+  // is no climb, so a CONFIG_0 seed STRANDS a WB-pinned session at the OFDM floor (the
+  // pin-hijack: runs cfg0, break storm, ~96 B). When ON, a pinned session seeds its
+  // pinned WB config directly through the SAME proven SET_CONFIG tier-cross. DEFEAT
+  // restores the legacy unconditional CONFIG_0 seed so the A/B runs on ONE binary.
+  bool duty_r_pin_defeat;
   // P-alt (DUTY fast-start, climb-duty) — climb-confirm batch shrink defeat gate.
   // env-latched in the ctor (MERCURY_DUTY_PALT_DEFEAT / master MERCURY_DUTY_FASTSTART_DEFEAT).
   // When OFF (default) the confirm batch is capped small while climbing a non-top OFDM rung.
@@ -6157,6 +6184,19 @@ public:
     if(supershift_proven_ceiling >= 0 &&
        config_ladder_index(supershift_proven_ceiling) < config_ladder_index(CONFIG_0))
       return CONFIG_NONE;
+    // PIN-RESPECT (§31 DUTY-R): the CONFIG_0 seed is a climb bootstrap — it only pays off
+    // when gearshift can climb OFF it. On a gearshift-OFF session there is no climb, so a
+    // CONFIG_0 seed STRANDS a WB-pinned session at the OFDM floor (the pin-hijack). When
+    // pinned (gearshift OFF) to a valid OFDM config ABOVE CONFIG_0 and the proven ceiling
+    // permits it, cross DIRECTLY to that pinned config through the SAME proven SET_CONFIG
+    // tier-cross (one hop). Byte-identical when gearshift is ON, or the pin is CONFIG_0 /
+    // a robust config, or MERCURY_DUTY_R_PIN_DEFEAT restores the legacy seed.
+    if(!duty_r_pin_defeat && gear_shift_on != YES
+       && is_ofdm_config(data_configuration)
+       && config_ladder_index(data_configuration) > config_ladder_index(CONFIG_0)
+       && (supershift_proven_ceiling < 0
+           || config_ladder_index(data_configuration) <= config_ladder_index(supershift_proven_ceiling)))
+      return data_configuration;
     return CONFIG_0;
   }
   // P-alt (DUTY fast-start, climb-duty) — CLIMB-CONFIRM BATCH SHRINK. While CLIMBING an

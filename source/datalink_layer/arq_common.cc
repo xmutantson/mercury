@@ -844,6 +844,13 @@ cl_arq_controller::cl_arq_controller()
 		bool duty_master_defeat = (dm && *dm && atoi(dm) != 0);
 		const char* dr = std::getenv("MERCURY_DUTY_R_DEFEAT");
 		duty_r_defeat = duty_master_defeat || (dr && *dr && atoi(dr) != 0);
+		// DUTY lever R PIN-RESPECT — ships DEFAULT-ON. MERCURY_DUTY_R_PIN_DEFEAT=1 restores
+		// the legacy unconditional CONFIG_0 seed (which strands a gearshift-OFF WB-pinned
+		// session at the OFDM floor) so the A/B runs FIX vs DEFEAT on ONE binary. Env-latched
+		// ONCE here (production path) exactly like the duty_r_defeat knob above. NOT folded
+		// into the DUTY_FASTSTART master (it is a pin-correctness guard, not a duty lever).
+		const char* drp = std::getenv("MERCURY_DUTY_R_PIN_DEFEAT");
+		duty_r_pin_defeat = (drp && *drp && atoi(drp) != 0);
 		// P-alt (climb-duty) — climb-confirm batch shrink. Ships DEFAULT-ON.
 		// MERCURY_DUTY_PALT_DEFEAT=1 (or the master MERCURY_DUTY_FASTSTART_DEFEAT=1)
 		// restores the incumbent full climb batch so the fire-proof runs FIX vs DEFEAT
@@ -997,6 +1004,7 @@ cl_arq_controller::cl_arq_controller()
 	// for the D2 robust reverse-ACK geometry. INIT FALSE so a pure-clean session never fires the
 	// settle/widen (byte-identical to D2-off). Both are re-derived per-turnaround, never on the wire.
 	data_ack_retx_turnaround=false;
+	data_ack_round_carried_retx=false;   // Karn: no retx frames until a send arms it
 	ack_tx_retx_turnaround=false;
 	retransmit_batch_id=-1;
 	for(int i=0;i<MAX_RETRANSMIT_HEADROOM;i++) {
@@ -2367,12 +2375,24 @@ int cl_arq_controller::tt_batchbk_of(int batch_airtime_ms) const
 
 // Karn's rule (RFC 6298 §3): never fold an RTT sample from a round that carried
 // retransmitted frames — the returning ACK's turnaround composition is ambiguous.
-// data_ack_retx_turnaround is the member the robust-geometry widen already used;
-// it ORs the v2 mixed-batch and CFG16 reverse-ACK-starve conditions and persists
-// through the receive/accept window. cfg16_revack_starve_fails is belt-and-braces.
+//
+// The retransmit-ambiguity classifier is data_ack_round_carried_retx (TRUE only when the
+// answered batch GENUINELY carried retx frames: v1 retransmit-only send / v2 mixed-batch
+// retx prefix). The LEGACY classifier data_ack_retx_turnaround ALSO arms on a clean fresh
+// partial-capable OFDM batch — the H1 reverse-ACK-drift widen (arq_commander.cc): that is a
+// receive-WINDOW-widen concern, NOT a retransmit-ambiguity. Reading it here excluded EVERY
+// clean multi-frame OFDM sample (the dominant CFG16 path), so tt_rtt[][].n never left 0 and
+// the R6 measured estimator was inert by construction. cfg16_revack_starve_fails is
+// belt-and-braces (a lost prior reverse-ACK also makes the arrival ambiguous).
+//
+// A/B: MERCURY_KARN_RETX_ONLY OFF (default) => byte-identical legacy coupling; ON => the
+// corrected classifier folds clean samples. Default-OFF until the wire cohort clears the
+// measured-window activation. See fact-documents/data-flow-turnaround-timers.md.
 bool cl_arq_controller::tt_karn_sample_ok() const
 {
-	return !data_ack_retx_turnaround && cfg16_revack_starve_fails == 0;
+	bool round_retx = tt_karn_retx_only() ? data_ack_round_carried_retx
+	                                       : data_ack_retx_turnaround;
+	return !round_retx && cfg16_revack_starve_fails == 0;
 }
 
 // RFC 6298 §2.2 (first sample) / §2.3 (subsequent) in integer fixed-point:
@@ -12076,6 +12096,99 @@ int cl_arq_controller::test_measured_timers()
 	printf("[TEST-MEASTIMERS] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// KARN DISCRIMINATOR classifier A/B (MERCURY_KARN_RETX_ONLY). Drives the REAL production
+// gate tt_karn_sample_ok() + the REAL fold update_turnaround_estimate() — the SAME two
+// calls the reverse-ACK accept sites (arq_commander.cc) make. The classifier decoupling
+// separates "the round carried retx frames" (data_ack_round_carried_retx, the Karn signal)
+// from "the CMD receive window is H1-widened" (data_ack_retx_turnaround, which arms on a
+// CLEAN fresh partial-capable OFDM batch). Reading the latter starved the estimator (n=0
+// on the dominant OFDM path). NOTE: this is a UNIT proof of the classifier + fold; the
+// end-to-end WIRE fire proof (a production [TT-RTT-UPDATE] n:0->N on a real clean cell with
+// the knob ON) is owed as a real-audio cohort. See data-flow-turnaround-timers.md.
+int cl_arq_controller::test_karn_retx_classify()
+{
+	printf("[TEST-KARN] start\n");
+	fflush(stdout);
+	int fails = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-KARN] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if(!cond) fails++;
+		fflush(stdout);
+	};
+
+	// Throwaway geometry (mirrors test_measured_timers): CONFIG_13 = class 1, batch 20 =>
+	// bucket 2. A CLEAN fresh multi-frame OFDM batch arms the H1 widen, so
+	// data_ack_retx_turnaround=TRUE while the round carried NO retransmitted frames.
+	this->role                         = COMMANDER;
+	this->message_transmission_time_ms = 200;
+	this->current_configuration        = CONFIG_13;
+	this->data_batch_size              = 20;
+	this->cfg16_revack_starve_fails    = 0;
+	const int cls = tt_class_of(CONFIG_13);
+	const int bk  = tt_batchbk_of(20 * 200);
+
+	// ---- Arm K1: CLEAN fresh OFDM batch (H1 armed) ----
+	// fail-before (knob OFF, legacy coupling): tt_karn_sample_ok() reads
+	// data_ack_retx_turnaround==TRUE -> gate FALSE -> the clean sample is EXCLUDED ->
+	// tt_rtt.n stays 0 (the inert-estimator bug this fix targets).
+	unsetenv("MERCURY_KARN_RETX_ONLY");
+	this->tt_rtt[cls][bk].n = 0; this->tt_rtt[cls][bk].srtt_ms = 0; this->tt_rtt[cls][bk].rttvar_ms = 0;
+	this->data_ack_retx_turnaround    = true;    // H1 widen armed on a clean batch
+	this->data_ack_round_carried_retx = false;   // ...but the round carried NO retx frames
+	bool ok_before = this->tt_karn_sample_ok();
+	if(ok_before) this->update_turnaround_estimate(CONFIG_13, 20 * 200, 2000);
+	int n_before = this->tt_rtt[cls][bk].n;
+	printf("[TEST-KARN] K1 fail-before (legacy): gate_ok=%d n=%d (want 0/0)\n", ok_before ? 1 : 0, n_before);
+	check(ok_before == false, "K1 fail-before (legacy): clean H1 batch -> Karn gate FALSE (sample EXCLUDED)");
+	check(n_before == 0,      "K1 fail-before (legacy): estimator STARVED (n stays 0) -- the inert-estimator bug");
+
+	// pass-after (knob ON): tt_karn_sample_ok() reads data_ack_round_carried_retx==FALSE ->
+	// gate TRUE -> the clean sample is FOLDED -> n 0->1 (the classifier fire proof).
+	setenv("MERCURY_KARN_RETX_ONLY", "1", 1);
+	this->tt_rtt[cls][bk].n = 0; this->tt_rtt[cls][bk].srtt_ms = 0; this->tt_rtt[cls][bk].rttvar_ms = 0;
+	this->data_ack_retx_turnaround    = true;    // H1 producer UNCHANGED (still arms)
+	this->data_ack_round_carried_retx = false;   // clean round
+	bool ok_after = this->tt_karn_sample_ok();
+	if(ok_after) this->update_turnaround_estimate(CONFIG_13, 20 * 200, 2000);
+	int n_after = this->tt_rtt[cls][bk].n;
+	printf("[TEST-KARN] K1 pass-after (fix): gate_ok=%d n=%d srtt=%d (want 1/1/2000)\n",
+		ok_after ? 1 : 0, n_after, this->tt_rtt[cls][bk].srtt_ms);
+	check(ok_after == true, "K1 pass-after (fix): clean H1 batch -> Karn gate TRUE (sample ACCEPTED)");
+	check(n_after == 1,     "K1 pass-after (fix): estimator FOLDS the clean sample (n 0->1) -- FIRE PROOF");
+
+	// ---- Arm K2: a GENUINE retx round is STILL excluded under the fix (Karn preserved) ----
+	setenv("MERCURY_KARN_RETX_ONLY", "1", 1);
+	this->tt_rtt[cls][bk].n = 5; this->tt_rtt[cls][bk].srtt_ms = 2000; this->tt_rtt[cls][bk].rttvar_ms = 100;
+	int srtt5 = this->tt_rtt[cls][bk].srtt_ms;
+	this->data_ack_retx_turnaround    = true;
+	this->data_ack_round_carried_retx = true;    // v1-retx / v2-mixed: the round carried retx frames
+	bool ok_retx = this->tt_karn_sample_ok();
+	if(ok_retx) this->update_turnaround_estimate(CONFIG_13, 20 * 200, 9999);
+	check(ok_retx == false, "K2 (fix): a GENUINE retx round -> Karn gate FALSE (sample still EXCLUDED)");
+	check(this->tt_rtt[cls][bk].srtt_ms == srtt5, "K2 (fix): retx sample does NOT move SRTT (Karn preserved)");
+
+	// ---- Arm K3: starve>0 still excludes even a clean round (belt-and-braces) ----
+	setenv("MERCURY_KARN_RETX_ONLY", "1", 1);
+	this->data_ack_retx_turnaround    = false;
+	this->data_ack_round_carried_retx = false;
+	this->cfg16_revack_starve_fails   = 1;        // a prior reverse-ACK was lost
+	check(this->tt_karn_sample_ok() == false, "K3 (fix): starve>0 -> Karn gate FALSE (belt-and-braces)");
+	this->cfg16_revack_starve_fails   = 0;
+
+	// ---- Arm K4: A/B identity -- knob OFF is byte-identical legacy behaviour ----
+	// The new member is set to a value that WOULD flip the fixed gate; knob OFF must ignore
+	// it and read data_ack_retx_turnaround only.
+	unsetenv("MERCURY_KARN_RETX_ONLY");
+	this->data_ack_retx_turnaround    = false;   // legacy path: clean
+	this->data_ack_round_carried_retx = true;    // would EXCLUDE under the fix (ignored knob-off)
+	check(this->tt_karn_sample_ok() == true, "K4 A/B identity (knob off): gate reads the LEGACY flag ONLY");
+
+	unsetenv("MERCURY_KARN_RETX_ONLY");
+	printf("[TEST-KARN] %s: fails=%d\n", fails == 0 ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return fails == 0 ? 0 : 1;
 }
 
 // ============================ MERCURY_TURN_TRACE ============================
