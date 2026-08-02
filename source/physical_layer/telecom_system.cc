@@ -1980,8 +1980,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			{
 				if(ofdm.mfsk_matched_preamble_nsymb != rx_eff_preamble)
 				{
-					printf("[MFSK-ACQ] cross-set preamble matched: nsymb=%d (local active=%d)
-",
+					printf("[MFSK-ACQ] cross-set preamble matched: nsymb=%d (local active=%d)\n",
 						ofdm.mfsk_matched_preamble_nsymb, rx_eff_preamble);
 					fflush(stdout);
 				}
@@ -12385,8 +12384,7 @@ void cl_telecom_system::set_robust_preamble_negotiated(bool on)
 		if(mfsk.set_robust_preamble_sidelnikov(on))
 		{
 			rebuild_mfsk_preamble_runtime();
-			printf("[CAPNEG] NB robust preamble active=%s (nSymb=%d thr=%d)
-",
+			printf("[CAPNEG] NB robust preamble active=%s (nSymb=%d thr=%d)\n",
 				on ? "sidelnikov" : "legacy", mfsk.preamble_nSymb, mfsk.preamble_match_threshold);
 			fflush(stdout);
 		}

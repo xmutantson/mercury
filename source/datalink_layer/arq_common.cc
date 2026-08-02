@@ -8881,8 +8881,7 @@ void cl_arq_controller::update_robust_preamble_negotiation()
 	         && ((peer_capability & CAP_ROBUST_PREAMBLE_NB) != 0);
 	if(telecom_system->robust_preamble_negotiated != both)
 	{
-		printf("[CAPNEG] NB robust preamble negotiation: %s (local=0x%02X peer=0x%02X)
-",
+		printf("[CAPNEG] NB robust preamble negotiation: %s (local=0x%02X peer=0x%02X)\n",
 			both ? "SIDELNIKOV" : "LEGACY",
 			(unsigned char)local_capability, (unsigned char)peer_capability);
 		fflush(stdout);
