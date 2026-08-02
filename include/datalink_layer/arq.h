@@ -1178,6 +1178,10 @@ public:
   // ladder index). Used by both BREAK recovery sites (arq_commander.cc:81 and
   // the retries-exhausted path) and the synthetic-fire test. See §6/§7.
   int break_target_with_anchor(int raw_target) const;
+  // Diagnostic pin: when MERCURY_BREAK_PIN_CONFIG names a valid ladder config,
+  // BREAK recovery returns to it after the robust coordination exchange.
+  // Unset or invalid values preserve the proposed recovery target.
+  int break_weld_target(int proposed_target) const;
 
   // DEEP-SNR DOWN-HYSTERESIS (gearshift-climb-engine.md §10) — PURE anchor-DEMOTION
   // decision. Given the current anchor, the consecutive anchor-rung BREAK-fail
@@ -2398,6 +2402,7 @@ public:
   //     SET_CONFIG does NOT arm). See data-flow-snr-measurements.md §1.7 / §7.
   // Returns 0 on pass, 1 on fail. See gearshift-climb-engine.md §7.
   int test_climb_engine();
+  int test_break_weld();
   // Per-rung election floor gate + failure memory regression (DATAFLOW_AUDIT_rung_floor.md §7):
   // the wb13 fail-before/pass-after, cap-never-raises, failure-memory arm/survive/decay/reset,
   // defeat-env byte-identity, and the J0 version/monotone pins. Deterministic, no RF/telecom_system.

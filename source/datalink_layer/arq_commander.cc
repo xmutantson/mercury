@@ -841,6 +841,17 @@ int cl_arq_controller::break_target_with_anchor(int raw_target) const
 	return raw_target;
 }
 
+int cl_arq_controller::break_weld_target(int proposed_target) const
+{
+	const char* text = std::getenv("MERCURY_BREAK_PIN_CONFIG");
+	if(text == NULL || *text == '\0') return proposed_target;
+	char* end = NULL;
+	long value = std::strtol(text, &end, 10);
+	if(end == text || *end != '\0') return proposed_target;
+	int pinned = static_cast<int>(value);
+	return config_ladder_index(pinned) >= 0 ? pinned : proposed_target;
+}
+
 // REAL FAST-PROBE piece (B) — the SHARED elevator-target computation
 // (gearshift-climb-engine.md §14). Extracted VERBATIM from the SUPERSHIFT
 // re-trigger (formerly inline at arq_commander.cc:4587-4608) so that site AND the
@@ -1354,6 +1365,14 @@ void cl_arq_controller::process_messages_commander()
 				int t11_capped = apply_rung_floor_raise_cap(clamped);
 				int target = (config_ladder_index(t11_capped) < config_ladder_index(raw_target))
 					? raw_target : t11_capped;
+				int unwelded_target = target;
+				target = break_weld_target(target);
+				if(target != unwelded_target)
+				{
+					printf("[BREAK-WELD] recovery target %d -> pinned config %d\n",
+						unwelded_target, target);
+					fflush(stdout);
+				}
 				if(target != clamped)
 				{
 					printf("[BREAK] RUNG-FLOOR raise-cap: anchor %d -> %d (meter %.1f age %d stale %d)\n",
@@ -1466,6 +1485,14 @@ void cl_arq_controller::process_messages_commander()
 				int t11_capped = apply_rung_floor_raise_cap(clamped);
 				int target = (config_ladder_index(t11_capped) < config_ladder_index(raw_target))
 					? raw_target : t11_capped;
+				int unwelded_target = target;
+				target = break_weld_target(target);
+				if(target != unwelded_target)
+				{
+					printf("[BREAK-WELD] exhausted recovery target %d -> pinned config %d\n",
+						unwelded_target, target);
+					fflush(stdout);
+				}
 				if(target != clamped)
 				{
 					printf("[BREAK] RUNG-FLOOR raise-cap (exhausted): anchor %d -> %d (meter %.1f age %d stale %d)\n",
@@ -15002,6 +15029,42 @@ int cl_arq_controller::test_robust_pipeline()
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
 }
+
+int cl_arq_controller::test_break_weld()
+{
+	const char* TAG = "[TEST-BREAK-WELD]";
+	int failed = 0;
+	auto check = [&](bool ok, const char* what, int got, int want) {
+		if(ok) printf("%s PASS: %s (got=%d want=%d)\n", TAG, what, got, want);
+		else { printf("%s FAIL: %s (got=%d want=%d)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+
+	set_env("MERCURY_BREAK_PIN_CONFIG", "");
+	check(break_weld_target(CONFIG_15) == CONFIG_15,
+		"control: unset knob preserves the recovery target",
+		break_weld_target(CONFIG_15), CONFIG_15);
+	set_env("MERCURY_BREAK_PIN_CONFIG", "not-a-config");
+	check(break_weld_target(CONFIG_14) == CONFIG_14,
+		"invalid text fails open to the recovery target",
+		break_weld_target(CONFIG_14), CONFIG_14);
+	set_env("MERCURY_BREAK_PIN_CONFIG", "9999");
+	check(break_weld_target(CONFIG_13) == CONFIG_13,
+		"off-ladder config fails open to the recovery target",
+		break_weld_target(CONFIG_13), CONFIG_13);
+	set_env("MERCURY_BREAK_PIN_CONFIG", "16");
+	check(break_weld_target(CONFIG_0) == CONFIG_16,
+		"armed knob returns a demoting BREAK to the pinned config",
+		break_weld_target(CONFIG_0), CONFIG_16);
+	check(break_weld_target(ROBUST_0) == CONFIG_16,
+		"armed knob also defeats a panic target",
+		break_weld_target(ROBUST_0), CONFIG_16);
+	set_env("MERCURY_BREAK_PIN_CONFIG", "");
+	printf("%s %s: failures=%d\n", TAG, failed ? "FAIL" : "PASS", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 
 int cl_arq_controller::test_climb_engine()
 {

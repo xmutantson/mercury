@@ -3801,6 +3801,7 @@ int main(int argc, char *argv[])
     bool test_tinterp_seed_cli = false; // --test-tinterp-seed: TINTERP-SEED production it=0 estimator seed-swap failing-first (staging/tinterp-seed).
     bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
+    bool test_break_weld_cli = false;   // --test-break-weld: BREAK recovery target pin (diagnostic knob).
     bool test_rung_floor_cli = false;   // --test-rung-floor: per-rung MEASURED election floor gate + failure memory (DATAFLOW_AUDIT_rung_floor.md): wb13 fail-before/pass-after, never-raise, arm/survive/decay/reset, defeat knob.
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
@@ -5051,6 +5052,12 @@ int main(int argc, char *argv[])
             // Integrated 3-bug climb regression — one-shot at startup, then exit
             // with the test's rc. See fact-documents/gearshift-climb-engine.md §7.
             test_climb_engine_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-break-weld") == 0)
+        {
+            test_break_weld_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7205,6 +7212,14 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_climb_engine();
             printf("[FLAG] Climb-engine test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_break_weld_cli) {
+            printf("[FLAG] --test-break-weld: invoking BREAK recovery pin regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_break_weld();
+            printf("[FLAG] BREAK recovery pin test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
