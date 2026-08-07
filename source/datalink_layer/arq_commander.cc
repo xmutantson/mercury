@@ -11266,7 +11266,11 @@ int cl_arq_controller::test_rung_floor_gate()
 	check(rung_floor_min_meter(CONFIG_16) == CFG16_MIN_SNR_DB,
 		"T5 J0: RUNG_MIN_SNR_METER[16] == CFG16_MIN_SNR_DB (meter-cal pin)");
 	check(RUNG_FLOOR_METER_CAL_VERSION == 3, "T5 J0: meter-cal version pinned == 3");
-	// cal-v3 rows on the live meter grid: cfg9=10, cfg10..13=12, cfg14=14, cfg15=16, cfg16/17=22.
+	// cal-v3 rows on the live meter grid: cfg9=10, cfg10..13=12, cfg14=14, cfg15=16, cfg16=22,
+	// cfg17=24. Row 17 is one grid step below the 25.0 suffix-meter clamp: the admit gate is
+	// strict-greater, so a row AT the clamp could never fire (25.0 > 25.0 is false); at 24.0 a
+	// saturated 25.0 read admits and the next grid read down (23.0) refuses. The table value is
+	// unconditional data; its use stays env-gated behind the row-17 election (MERCURY_ROW17_BUMP).
 	bool rows_v3 =
 		rung_floor_min_meter(CONFIG_9)  == 10.0 &&
 		rung_floor_min_meter(CONFIG_10) == 12.0 &&
@@ -11276,8 +11280,15 @@ int cl_arq_controller::test_rung_floor_gate()
 		rung_floor_min_meter(CONFIG_14) == 14.0 &&
 		rung_floor_min_meter(CONFIG_15) == 16.0 &&
 		rung_floor_min_meter(CONFIG_16) == 22.0 &&
-		rung_floor_min_meter(CONFIG_17) == 22.0;
-	check(rows_v3, "T5: cal-v3 rows (cfg9=10 cfg10-13=12 cfg14=14 cfg15=16 cfg16/17=22)");
+		rung_floor_min_meter(CONFIG_17) == 24.0;
+	check(rows_v3, "T5: cal-v3 rows (cfg9=10 cfg10-13=12 cfg14=14 cfg15=16 cfg16=22 cfg17=24)");
+	// Admit-point pin for row 17 (strict > against the clamped meter): saturation admits, the
+	// grid point below does not. A row moved back onto/above the clamp can never admit and
+	// would weld the top rung shut -- this pair catches that regression in the self-check.
+	check(25.0 > rung_floor_min_meter(CONFIG_17),
+		"T5: saturated meter read (25.0) clears the row-17 floor");
+	check(!(23.0 > rung_floor_min_meter(CONFIG_17)),
+		"T5: next grid read down (23.0) is refused by the row-17 floor");
 	bool monotone = true;
 	for(int c = CONFIG_9; c < CONFIG_16; c++)
 		if(rung_floor_min_meter(c) > rung_floor_min_meter(c+1)) monotone = false;
