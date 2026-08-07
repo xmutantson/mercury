@@ -1224,6 +1224,9 @@ cl_arq_controller::cl_arq_controller()
 	topgear_channel_flatness=-1.0;
 	topgear_cfg17_floor_ok=false;
 	topgear_last_report_bsi=-1;
+	topgear_reengage_cooldown=0;
+	topgear_below_floor_streak=0;
+	topgear_last_flat_state=8;
 	// Consume-race deferred report decode: nothing pending on a fresh controller.
 	topgear_pending_report_bsi=-1;
 	topgear_pending_cfg=CONFIG_NONE;
@@ -3342,6 +3345,8 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	{
 		topgear_elect_engaged = false;
 		topgear_elect_clean_streak = 0;
+		topgear_reengage_cooldown = 0;
+		topgear_below_floor_streak = 0;
 	}
 	if(current_configuration!=CONFIG_NONE)
 	{
@@ -3940,6 +3945,7 @@ void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq
 	                         : (flat_state == 10) ? TOPGEAR_FLATNESS_MAX + 0.01   // non-flat
 	                         : 0.0;                                               // 9 or 11 => flat
 	topgear_cfg17_floor_ok = (flat_state == 11);  // @28 GUARD verdict from the RSP's un-clipped SNR
+	topgear_last_flat_state = flat_state;   // B2: remember WHY (9 below-floor vs 10 non-flat)
 	topgear_elect_evaluate();
 	printf("[TOPGEAR-REPORT] bsi=%d snr_floor=%.1f flat_ceil=%.3f streak=%d engaged=%d\n",
 		bsi, measurements.SNR_downlink, topgear_channel_flatness,
@@ -3961,18 +3967,41 @@ void cl_arq_controller::topgear_elect_evaluate()
 	{
 		topgear_elect_engaged = false;
 		topgear_elect_clean_streak = 0;
+		topgear_below_floor_streak = 0;   // BLOCKER D (B2): re-earn from scratch on band re-entry
 		return;
 	}
 	if(topgear_channel_clean())
 	{
+		topgear_below_floor_streak = 0;   // BLOCKER D (B2): a clean report clears the below-floor dip streak
 		if(topgear_elect_clean_streak < TOPGEAR_ELECT_ENGAGE_STREAK) topgear_elect_clean_streak++;
 		if(topgear_elect_clean_streak >= TOPGEAR_ELECT_ENGAGE_STREAK) topgear_elect_engaged = true;
 	}
 	else
 	{
-		// One marginal/non-flat report drops the verdict immediately (fast fallback to cfg16).
-		topgear_elect_engaged = false;
-		topgear_elect_clean_streak = 0;
+		// BLOCKER D (B2) — split the DROP by CAUSE. A lone flat-BUT-below-floor report
+		// (flat_state==9) at a still-cfg16-viable channel is a per-batch SNR_downlink dip
+		// (measured 27.49 at a nominal 43.58 dial vs the 28.7 floor), NOT channel truth, so
+		// it needs TOPGEAR_BELOW_FLOOR_DROP_STREAK CONSECUTIVE below-floor reports to drop.
+		// The 2-path SAFETY signal (non-flat, flat_state==10), a margin loss, or an unmeasured
+		// report keeps the IMMEDIATE single-report drop. Safety preserved: @28 refusal is
+		// ENGAGE-side (a code-9 channel never reaches the code-11 the engage streak needs), and
+		// a true 28-band channel is below-floor EVERY report so 2-consecutive is met within 2
+		// reports. margin_ok is recomputed exactly as topgear_channel_clean() so a real cfg16
+		// margin loss is NEVER held. Guard-off / non-flat => byte-identical fast drop.
+		bool margin_ok = (get_configuration(measurements.SNR_downlink - TOPGEAR_ELECT_MARGIN_DB) >= CONFIG_16);
+		bool below_floor_only = (topgear_last_flat_state == 9) && margin_ok;
+		if(below_floor_only && (topgear_below_floor_streak + 1) < TOPGEAR_BELOW_FLOOR_DROP_STREAK)
+		{
+			// First below-floor dip: HOLD the verdict, arm the streak (engaged rides through).
+			topgear_below_floor_streak++;
+		}
+		else
+		{
+			// Non-flat / margin loss / unmeasured, OR the Nth consecutive below-floor: drop.
+			topgear_elect_engaged = false;
+			topgear_elect_clean_streak = 0;
+			topgear_below_floor_streak = 0;
+		}
 	}
 }
 
@@ -9248,6 +9277,9 @@ void cl_arq_controller::reset_session_state()
 	topgear_channel_flatness = -1.0;
 	topgear_cfg17_floor_ok = false;
 	topgear_last_report_bsi = -1;
+	topgear_reengage_cooldown = 0;
+	topgear_below_floor_streak = 0;
+	topgear_last_flat_state = 8;
 	// A pending deferred report is prior-session channel evidence too.
 	topgear_pending_report_clear("session-reset");
 	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):

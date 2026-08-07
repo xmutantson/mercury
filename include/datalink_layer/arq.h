@@ -5015,6 +5015,10 @@ public:
   double  topgear_channel_flatness;     // forward selectivity std|H|/mean|H| (0.0 = flat); TOPGEAR_FLATNESS_MAX gate
   bool    topgear_cfg17_floor_ok;       // @28 GUARD: RSP's UN-clipped forward SNR cleared the cfg17 64-QAM floor
   int     topgear_last_report_bsi;      // de-duplicates repeated compact-confirm polls; -1 = none
+  // ── BLOCKER D (ACK-seam dispatch) anti-thrash state ── all dead unless MERCURY_TOPGEAR_ELECT=1.
+  int     topgear_reengage_cooldown;    // B1: clean batches a seam DEMOTE bars the next seam CLIMB; 0 = free
+  int     topgear_below_floor_streak;   // B2: consecutive flat-but-below-floor (state 9) reports; drop at STREAK
+  int     topgear_last_flat_state;      // B2: last decoded forward-report flat_state marker (8/9/10/11)
 
   // ── Topgear report CONSUME-RACE fix: deferred stashed-tail report decode ──
   // Live-vehicle finding (real-loopback, both peers armed, audio-bracketed twice):

@@ -953,6 +953,17 @@ CONFIG_16 (5664.7 bps).
 // decode-favourable 2-path frame that dips under the ceiling.
 #define TOPGEAR_FLATNESS_MAX 0.15
 
+// BLOCKER D anti-thrash (ACK-seam dispatch). After a seam DEMOTE (cfg17->16) the seam
+// CLIMB is barred for this many clean batches so a floor-margin flicker cannot 16<->17
+// thrash. House pattern = rate_opt.force_cooldown(5)/AARF. Counts down one per clean batch.
+#define TOPGEAR_REENGAGE_COOLDOWN_BATCHES 5
+// A lone flat-BUT-below-floor forward report (flat_state==9) is a per-batch SNR_downlink
+// dip at a nominally-winning channel, not channel truth (measured 27.49 at a 43.58 dial vs
+// the 28.7 floor). Require this many CONSECUTIVE below-floor reports before the engaged
+// verdict drops. The 2-path SAFETY signal (non-flat, flat_state==10) keeps the immediate
+// single-report drop; @28 refusal is ENGAGE-side (unaffected).
+#define TOPGEAR_BELOW_FLOOR_DROP_STREAK 2
+
 // TOPGEAR REPORT CONSUME-RACE — deferred-decode deadline. The commander accepts a
 // compact confirm at FIRST-codeword CRC validity, which on the real-loopback vehicle
 // precedes the trailing report codeword's audio arrival (audio-bracketed twice:

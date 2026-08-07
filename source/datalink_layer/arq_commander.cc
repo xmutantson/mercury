@@ -8132,6 +8132,91 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		}
 		} // frame-level gearshift ceiling scope
 
+		// ── TOP-GEAR ACK-SEAM DISPATCH (BLOCKER D) ─────────────────────────────────
+		// The cfg17 election's idle-window SET_CONFIG producer (process_buffer_data_commander,
+		// the [TOPGEAR] queue producer above) can NEVER observe an engaged verdict during a
+		// CONTINUOUS transfer: block_under_tx is BLOCK-scope (YES from first-stage to finalize),
+		// and the between-batch empty instant is consumed by process_buffer_data_commander() in
+		// the SAME poll, so `block_under_tx==NO` never coincides with engagement. Consume the live
+		// engaged verdict HERE, at the clean-ACK seam, using the FRAME-UP promotion protocol
+		// VERBATIM (the modem's own proven mid-transfer switch, ~40 lines up). The idle producer
+		// STAYS (paced traffic + the HELD arm). No-op unless MERCURY_TOPGEAR_ELECT => byte-identical.
+		if(topgear_elect_feature_enabled() && data_ack_received == YES)
+		{
+			// B1: count down clean batches since the last seam demote (once per clean seam).
+			if(last_batch_fully_acked && topgear_reengage_cooldown > 0)
+				topgear_reengage_cooldown--;
+			// Seam gate diagnostic (env-gated; silent + byte-identical when MERCURY_TOPGEAR_SEAM_DIAG unset).
+			if(std::getenv("MERCURY_TOPGEAR_SEAM_DIAG") != nullptr
+			   && (topgear_elect_engaged || current_configuration == CONFIG_17))
+			{
+				int fl_d = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+				printf("[TOPGEAR-SEAM-DIAG] engaged=%d cfg=%d fully_acked=%d cooldown=%d ctrl_free=%d "
+				       "rung17=%d rungmeter=%.1f rungstale=%d rungage=%d fifo=%d override=%d inband=%d turbo=%d brk=%d\n",
+				       topgear_elect_engaged?1:0, current_configuration, last_batch_fully_acked?1:0,
+				       topgear_reengage_cooldown, messages_control.status==FREE?1:0,
+				       rung_floor_ok(CONFIG_17)?1:0, rung_meter_db, rung_meter_stale()?1:0, rung_meter_age_batches,
+				       fl_d, max_config_override,
+				       inband_rate_feature_enabled()?1:0, turboshift_active?1:0, emergency_break_active);
+				fflush(stdout);
+			}
+			if(!inband_rate_feature_enabled()   // cfg17 has no in-band CONFIG_TAG ladder index
+			   && !turboshift_active
+			   && emergency_break_active == 0
+			   && link_status == CONNECTED
+			   && is_ofdm_config(current_configuration)
+			   && messages_control.status == FREE)
+			{
+				int tg_seam_target = -1;
+				if(topgear_elect_engaged && current_configuration == CONFIG_16
+				   && last_batch_fully_acked            // CLIMB only on a fully-clean seam (nothing in flight)
+				   && topgear_reengage_cooldown == 0    // B1 anti-thrash: no re-climb for N batches after a demote
+				   && (max_config_override < 0 || max_config_override >= CONFIG_17)
+				   && rung_floor_ok(CONFIG_17))         // BLOCKER A row-17 floor (identity when ROW17_BUMP off)
+				{
+					int fifo_load = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+					if(fifo_load > 0)                        // r3: don't burn a switch at end-of-transfer
+						tg_seam_target = CONFIG_17;          // CLIMB 16 -> 17
+				}
+				else if(!topgear_elect_engaged && current_configuration == CONFIG_17)
+				{
+					tg_seam_target = CONFIG_16;              // DEMOTE 17 -> 16 (deterministic soft-degrade)
+				}
+				if(tg_seam_target >= 0)
+				{
+					printf("[TOPGEAR] queue SET_CONFIG: %d -> %d (ACK-seam dispatch; engaged=%d "
+					       "flatness=%.3f snr_dl=%.1f streak=%d fully_acked=%d)\n",
+					       current_configuration, tg_seam_target, topgear_elect_engaged ? 1 : 0,
+					       topgear_channel_flatness, measurements.SNR_downlink,
+					       topgear_elect_clean_streak, last_batch_fully_acked ? 1 : 0);
+					fflush(stdout);
+					if(tg_seam_target == CONFIG_16)
+						topgear_reengage_cooldown = TOPGEAR_REENGAGE_COOLDOWN_BATCHES;   // B1: arm the re-climb bar
+					negotiated_configuration = tg_seam_target;
+					// FRAME-UP promotion protocol VERBATIM: capture+roll the in-flight bsi, re-stage
+					// pending TX for re-encode at the new config, release the block, queue the control
+					// SET_CONFIG round-trip. On a clean fully-acked seam the roll/restage are no-ops
+					// (nothing in flight, frames just freed); on the DEMOTE arm they handle any partial.
+					roll_back_cmd_bsi_to_inflight("TOPGEAR-SEAM");
+					if(compression_enabled)
+					{
+						restore_tx_from_compressed();
+					}
+					else
+					{
+						restage_requeue_tx_messages();
+						fifo_buffer_backup.flush();
+						clear_retx_queue();   // R029: recovery re-queues plaintext; drop stale retx
+					}
+					block_under_tx = NO;
+					add_message_control(SET_CONFIG);
+					connection_status = TRANSMITTING_CONTROL;
+					return;
+				}
+			}
+		}
+		// ───────────────────────────────────────────────────────────────────────────
+
 		// FIX-A — ROBUST-tier dwell-batch raise/revert (data-flow-robust-tier-arq-batch.md
 		// §5.2). We reach here ONLY when FRAME-UP DECLINED to promote (a promotion does
 		// add_message_control(SET_CONFIG)+return above), i.e. the climb is PARKED this
