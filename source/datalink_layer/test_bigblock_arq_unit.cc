@@ -1264,6 +1264,35 @@ int cl_arq_controller::test_topgear_clean_election()
 	      "cfg17 R7-64 net-PHY rbc / cfg16 == ~1.073x (Nsymb 8->7 airtime diet; the raw "
 	      "1.20x per-symbol 64-QAM gain is partly spent on the denser R7-64 pilot frame)");
 
+	// (8) @28 OVER-FLOOR GUARD (MERCURY_CFG17_SNR_FLOOR). Drives the REAL report
+	//     pack->apply->evaluate transport (not a state poke). The suffix meter AND the
+	//     report snr_q BOTH saturate at 25, so both a below-floor and an above-floor flat
+	//     report clip to SNR_downlink=25 and pass the margin gate identically — only the
+	//     RSP's UN-clipped floor verdict (flat_state 9 vs 11) separates them.
+	cmd->load_configuration(CONFIG_16, FULL, YES);
+	set_env("MERCURY_CFG17_SNR_FLOOR", "30");
+	unsigned char rpt_below   = cmd->topgear_pack_report(25.0, 0.05);  // flat, 25<30 floor
+	unsigned char rpt_above   = cmd->topgear_pack_report(34.0, 0.05);  // flat, 34>=30 floor
+	unsigned char rpt_nonflat = cmd->topgear_pack_report(34.0, 0.30);  // selective (2-path)
+	check((rpt_below & 0x0F) == 9,   "@28 GUARD pack: flat below cfg17 floor -> flat_state 9 (fail-before)");
+	check((rpt_above & 0x0F) == 11,  "@28 GUARD pack: flat above cfg17 floor -> flat_state 11 (pass-after)");
+	check((rpt_nonflat & 0x0F) == 10,"@28 GUARD pack: non-flat -> flat_state 10 (2-path refusal preserved)");
+	// Both reports clip to SNR_downlink=25 on apply (proves meter saturation); only the
+	// floor verdict differs. Distinct bsi per apply defeats the de-dup.
+	cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
+	cmd->topgear_last_report_bsi = -1; cmd->current_configuration = CONFIG_16;
+	for(int i=0;i<=STREAK;i++) cmd->topgear_apply_report(rpt_below, i);
+	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
+	      "@28 GUARD: below-floor flat report NEVER engages cfg17 despite meter saturation (fail-before)");
+	cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
+	cmd->topgear_last_report_bsi = -1; cmd->current_configuration = CONFIG_16;
+	for(int i=0;i<=STREAK;i++) cmd->topgear_apply_report(rpt_above, 100+i);
+	check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
+	      "@28 GUARD: above-floor flat report engages cfg17 (pass-after)");
+	clr_env("MERCURY_CFG17_SNR_FLOOR");
+	cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
+	cmd->current_configuration = CONFIG_16;
+
 	// Exercise the complete production startup and live-switch sequence that real audio exposed:
 	// start cfg17 -> pin walk -> dual bundle build -> cfg17/16 transitions. cfg17 intentionally
 	// remains out of FULL_CONFIG_LADDER and takes the loud PRECOOK-MISS legacy rebuild, which must
@@ -1361,6 +1390,42 @@ int cl_arq_controller::test_topgear_clean_election()
 	check(legacy_generated == prefix_nsymb * sym_samples && decoded_confirm
 	      && decoded_bsi == 42 && !decoded_report_valid,
 	      "armed commander accepts an unextended legacy compact confirm without fabricating telemetry");
+
+	// BLOCKER C — PRODUCTION-GEOMETRY report transport (the round-trip above passed only
+	// because it handed decode a generous window with the confirm ~4 symbols in). The
+	// production capture (cmd_compact_confirm_crc_valid, arq_commander.cc) snapshots only
+	// the last (ack_nsymb + compact_suffix + 16) symbols of the ring. The topgear confirm
+	// is ack_nsymb + 2*compact_suffix symbols, so at that width the detected ACK base can
+	// sit at most (16 - compact_suffix) = 6 symbols in before the 2nd (report) codeword is
+	// truncated (needed_end > dec_size). Reproduce the EXACT production tail arithmetic at
+	// both widths with the confirm at a realistic offset (8 symbols in) and show the report
+	// transports ONLY at the widened width. MERCURY_TG_GEOM_DIAG=1 prints [TG-GEOM].
+	{
+		int ack_nsymb = ts->ack_mfsk.ack_pattern_nsymb;
+		int csuf      = ts->ack_mfsk.compact_confirm_suffix_len();
+		int off_sym   = 8;                          // detected base lands 8 symbols into the tail
+		int base_tail = ack_nsymb + csuf + 16;      // pre-fix production window (=42)
+		int fix_tail  = ack_nsymb + 2 * csuf + 16;  // widened window (=52)
+		std::vector<double> tail_audio((size_t)fix_tail * sym_samples, 0.0);
+		int gen_c = ts->generate_topgear_confirm_passband(
+			tail_audio.data() + (size_t)off_sym * sym_samples, 42, bsi_crc, report_flat, report_crc);
+		check(gen_c > 0, "(C) topgear confirm generated for the production-geometry probe");
+		uint8_t cbsi = 0, crep = 0; bool crv = false; int cm = 0;
+		// FAIL-BEFORE: the 42-symbol production tail confirms the batch (bsi decodes) but
+		// TRUNCATES the report codeword (needed_end = 8+36 = 44 > dec_size 42).
+		bool ok_base = ts->decode_compact_confirm_from_passband(
+			tail_audio.data(), base_tail * sym_samples, topgear_test_crc12_cb, cmd,
+			&cbsi, &cm, &crep, &crv);
+		check(ok_base && cbsi == 42 && !crv,
+		      "(C) FAIL-BEFORE: 42-sym production tail confirms the batch but TRUNCATES the report (topgear_report_valid=false)");
+		// PASS-AFTER: the SAME audio in the widened 52-symbol tail transports the report.
+		cbsi = 0; crep = 0; crv = false; cm = 0;
+		bool ok_fix = ts->decode_compact_confirm_from_passband(
+			tail_audio.data(), fix_tail * sym_samples, topgear_test_crc12_cb, cmd,
+			&cbsi, &cm, &crep, &crv);
+		check(ok_fix && cbsi == 42 && crv && crep == report_flat,
+		      "(C) PASS-AFTER: widened 52-sym tail transports the report (topgear_report_valid=true, report byte matches)");
+	}
 
 	// The report quantizer floors SNR and carries only a marker-backed flatness
 	// verdict. A corrupt/noise-decoded low nibble outside {8,9,10} is invalid.

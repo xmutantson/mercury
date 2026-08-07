@@ -378,6 +378,10 @@ public:
 	// -1 => not yet computed / no pilots. Read only as a timing-quality SELECTOR;
 	// no effect on the equalized data path.
 	double last_pilot_coherence = -1.0;
+	// Raw per-pilot LS frequency-selectivity std|H|/mean|H| over the MEASURED
+	// pilot cells, captured BEFORE interpolation + DFT smoothing (which inject an
+	// SNR-independent |H| ripple). -1 = not measured this frame. See ofdm.cc.
+	double last_pilot_selectivity = -1.0;
 
 	// fix/cfg16-nv-restore validation knob: when true, LS_channel_estimator
 	// prints [LS-NV-DBG] comparing the restored pilot-residual nv with the

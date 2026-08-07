@@ -946,6 +946,18 @@ CONFIG_16 (5664.7 bps).
 // value — SWEEP it on the fleet faithful-sim (flat WGN vs CCIR-Poor 2-path) before default-on.
 #define TOPGEAR_FLATNESS_MAX 0.15
 
+// @28 OVER-FLOOR GUARD. The coarse suffix meter AND the report snr_q field both
+// SATURATE at 25 dB, so a 25-dB report cannot distinguish an SNR that clears cfg17's
+// 64-QAM decode floor from one that merely clears cfg16 — and cfg17 is HARMFUL below
+// its floor (delivers 0/N @~WGN:28). The RESPONDER, however, holds the UN-clipped
+// forward EVM-SNR (measure_SNR) at report-pack time, which discriminates below the
+// ~28 dB EVM knee. When MERCURY_CFG17_SNR_FLOOR is set (>0), the responder folds a
+// floor verdict into report flat_state code 11 (flat AND >= floor) vs 9 (flat, below
+// floor); the commander engages cfg17 only on 11. Default 0 => guard INACTIVE (the
+// election behaves as before). CALIBRATION-DEBT: the floor value must be pinned from
+// measure_SNR at the harmful (~WGN:28) vs winning (~34.66/43.58) anchors before default-on.
+#define CFG17_SNR_FLOOR_DEFAULT_DB 27.5
+
 // ── CFG16 (32-QAM rate-14/16) decode-margin election gate ─────────────────────────────
 // CFG16_MIN_SNR_DB: the minimum reverse-path SNR report (measurements.SNR_uplink, the peer's
 // measurement of OUR forward link carried in the MFSK ACK suffix) that admits the CFG16 top

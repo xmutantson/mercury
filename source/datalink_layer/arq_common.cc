@@ -1213,6 +1213,7 @@ cl_arq_controller::cl_arq_controller()
 	// RSP's CRC-protected compact-confirm telemetry. Was 0.0 (a valid perfectly-flat
 	// measurement, indistinguishable from unmeasured — the latent false-flat default).
 	topgear_channel_flatness=-1.0;
+	topgear_cfg17_floor_ok=false;
 	topgear_last_report_bsi=-1;
 	inband_unilateral_armed=false;  // Stage 3b: set by the SET_CONFIG builder unilateral path
 	// STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (design §1/§4). A fresh
@@ -3839,7 +3840,12 @@ bool cl_arq_controller::topgear_channel_clean()
 	// must be within TOPGEAR_FLATNESS_MAX; anything more selective is refused.
 	bool flat_ok = topgear_channel_flatness >= 0.0
 	            && topgear_channel_flatness <= TOPGEAR_FLATNESS_MAX;
-	return margin_ok && flat_ok;
+	// @28 GUARD: when MERCURY_CFG17_SNR_FLOOR is set (>0), cfg17 additionally requires
+	// the RSP's UN-clipped forward SNR to have cleared the cfg17 floor (flat_state 11).
+	// Guard OFF => floor_ok is not required (identity with the pre-guard gate).
+	const char* fenv = std::getenv("MERCURY_CFG17_SNR_FLOOR");
+	bool guard_on = (fenv && *fenv && atof(fenv) > 0.0);
+	return margin_ok && flat_ok && (!guard_on || topgear_cfg17_floor_ok);
 }
 
 // Pack one conservative forward-channel report into the optional second compact
@@ -3858,7 +3864,18 @@ unsigned char cl_arq_controller::topgear_pack_report(double snr, double flatness
 	}
 	int flat_state = 8;  // unmeasured / non-finite: fail closed
 	if(std::isfinite(flatness) && flatness >= 0.0)
-		flat_state = (flatness <= TOPGEAR_FLATNESS_MAX) ? 9 : 10;
+	{
+		bool flat = (flatness <= TOPGEAR_FLATNESS_MAX);
+		// @28 GUARD: when the floor env is set, use the UN-clipped forward EVM-SNR
+		// (this `snr` arg = measurements.SNR_downlink on the RSP) to split flat into
+		// 9 (flat, below cfg17 floor => cfg16 ok, cfg17 refused) vs 11 (flat AND >=
+		// floor => cfg17 admissible). Guard OFF (env unset/<=0) => flat always 9 (old).
+		const char* fenv = std::getenv("MERCURY_CFG17_SNR_FLOOR");
+		double floor_db = (fenv && *fenv) ? atof(fenv) : 0.0;
+		bool guard_on = (floor_db > 0.0);
+		bool floor_ok = std::isfinite(snr) && (snr >= floor_db);
+		flat_state = !flat ? 10 : ((guard_on && floor_ok) ? 11 : 9);
+	}
 	return (unsigned char)(((unsigned)snr_q << 4) | (unsigned)flat_state);
 }
 
@@ -3869,7 +3886,7 @@ void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq
 {
 	if(!topgear_elect_feature_enabled()) return;
 	int flat_state = report & 0x0F;
-	if(flat_state < 8 || flat_state > 10)
+	if(flat_state < 8 || flat_state > 11)
 	{
 		printf("[TOPGEAR-REPORT] reject invalid marker/state=0x%x\n", flat_state);
 		fflush(stdout);
@@ -3880,9 +3897,11 @@ void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq
 	topgear_last_report_bsi = bsi;
 	int snr_q = (report >> 4) & 0x0F;
 	measurements.SNR_downlink = (double)(snr_q * 2 - 5);
-	topgear_channel_flatness = (flat_state == 8) ? -1.0
-	                         : (flat_state == 9) ? 0.0
-	                         : TOPGEAR_FLATNESS_MAX + 0.01;
+	// 8=unmeasured (fail closed); 9=flat/below-cfg17-floor; 10=non-flat; 11=flat/above-cfg17-floor.
+	topgear_channel_flatness = (flat_state == 8)  ? -1.0
+	                         : (flat_state == 10) ? TOPGEAR_FLATNESS_MAX + 0.01   // non-flat
+	                         : 0.0;                                               // 9 or 11 => flat
+	topgear_cfg17_floor_ok = (flat_state == 11);  // @28 GUARD verdict from the RSP's un-clipped SNR
 	topgear_elect_evaluate();
 	printf("[TOPGEAR-REPORT] bsi=%d snr_floor=%.1f flat_ceil=%.3f streak=%d engaged=%d\n",
 		bsi, measurements.SNR_downlink, topgear_channel_flatness,
@@ -9147,6 +9166,7 @@ void cl_arq_controller::reset_session_state()
 	topgear_elect_engaged = false;
 	topgear_elect_clean_streak = 0;
 	topgear_channel_flatness = -1.0;
+	topgear_cfg17_floor_ok = false;
 	topgear_last_report_bsi = -1;
 	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):
 	// no cached ACK / probe state to clear per session.

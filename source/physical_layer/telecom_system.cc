@@ -3695,6 +3695,7 @@ skip_h_retry_point:
 			}
 			else
 			{
+				ofdm.last_pilot_selectivity = -1.0;   // fresh per frame; only LS re-measures it
 				ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
 				// CPE correction: remove residual freq offset before channel estimation.
 				// Previously NB-only, but WB also benefits (reduces pilot residuals).
@@ -3774,7 +3775,20 @@ skip_h_retry_point:
 						double s_var  = (s_sumsq / s_count) - (s_mean * s_mean);
 						if(s_var < 0.0) s_var = 0.0;  // numerical guard
 						double s_std  = sqrt(s_var);
-						last_channel_selectivity = (s_mean > 1e-12) ? (s_std / s_mean) : -1.0;
+						double data_sel = (s_mean > 1e-12) ? (s_std / s_mean) : -1.0;
+						// The DATA-bin std/mean reads an SNR-INDEPENDENT ripple (~0.4-1.3) on a
+						// FLAT channel because the DFT smoother + bilinear interpolation inject
+						// magnitude structure that swamps the true selectivity. Prefer the RAW
+						// per-pilot LS reading (ofdm.last_pilot_selectivity), which converges
+						// toward 0 on flat WGN (~0.04 at operating SNR) and rises on a real
+						// 2-path null. MERCURY_SEL_LEGACY=1 restores the (broken) data-bin metric.
+						const char* sel_legacy = std::getenv("MERCURY_SEL_LEGACY");
+						if(sel_legacy && atoi(sel_legacy) != 0)
+							last_channel_selectivity = data_sel;
+						else if(ofdm.last_pilot_selectivity >= 0.0)
+							last_channel_selectivity = ofdm.last_pilot_selectivity;
+						else
+							last_channel_selectivity = data_sel;
 					}
 					else
 					{
@@ -6397,6 +6411,13 @@ bool cl_telecom_system::decode_compact_confirm_from_passband(double* data, int s
 		int sym_period = data_container.Nofdm;
 		int needed_end = best_offset
 		               + (ack_mfsk.ack_pattern_nsymb + 2 * suffix_n) * sym_period;
+		if(std::getenv("MERCURY_TG_GEOM_DIAG"))
+		{
+			fprintf(stderr, "[TG-GEOM] best_off=%d needed_end=%d dec_size=%d fits=%d margin_sym=%d\n",
+				best_offset, needed_end, dec_size, (needed_end<=dec_size)?1:0,
+				dec_size/sym_period - (best_offset/sym_period + ack_mfsk.ack_pattern_nsymb + 2*suffix_n));
+			fflush(stderr);
+		}
 		if(needed_end <= dec_size)
 		{
 			std::vector<double> report_energies((size_t)suffix_n * ack_mfsk.M);

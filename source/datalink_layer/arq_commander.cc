@@ -584,7 +584,19 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	// (13), so the existing ring is strictly safe (data-flow §6 I1/I4).
 	int ack_nsymb   = telecom_system->ack_mfsk.ack_pattern_nsymb;
 	int compact_suffix = telecom_system->ack_mfsk.compact_confirm_suffix_len();
-	const int mfsk_tail_nsymb = ack_nsymb + compact_suffix + 16;
+	// BLOCKER C — report-transport capture window. When the forward topgear report
+	// is armed the responder emits the TOPGEAR confirm (ack_nsymb + 2*compact_suffix
+	// symbols) rather than the plain compact confirm (ack_nsymb + compact_suffix).
+	// Sizing the tail for the plain confirm leaves only 16-compact_suffix (=6) symbols
+	// of positioning margin for the longer topgear confirm, so whenever the detected
+	// ACK base lands >6 symbols into the window the report codeword is truncated out of
+	// the capture (needed_end>dec_size in decode_compact_confirm_from_passband) and
+	// topgear_report_valid never becomes true. Give the topgear confirm the SAME
+	// 16-symbol margin. Default-off feature => byte-identical unless MERCURY_TOPGEAR_ELECT.
+	bool tail_failbefore = false;
+	{ const char* e = std::getenv("MERCURY_TOPGEAR_TAIL_FAILBEFORE"); tail_failbefore = (e && *e && atoi(e) != 0); }
+	const int compact_span = (topgear_elect_feature_enabled() && !tail_failbefore) ? 2 * compact_suffix : compact_suffix;
+	const int mfsk_tail_nsymb = ack_nsymb + compact_span + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
 	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
@@ -1009,7 +1021,7 @@ static const double RUNG_MIN_SNR_METER[NUMBER_OF_CONFIGS] = {
 	/* 0*/ -90.0, /* 1*/ -90.0, /* 2*/ -90.0, /* 3*/ -90.0, /* 4*/ -90.0,
 	/* 5*/ -90.0, /* 6*/ -90.0, /* 7*/ -90.0, /* 8*/ -90.0,
 	/* 9*/  10.0, /*10*/  12.0, /*11*/  12.0, /*12*/  12.0, /*13*/  12.0,
-	/*14*/  14.0, /*15*/  16.0, /*16*/  22.0, /*17*/  22.0
+	/*14*/  14.0, /*15*/  16.0, /*16*/  22.0, /*17*/  24.0
 };
 
 double cl_arq_controller::rung_floor_min_meter(int cfg)
@@ -1093,7 +1105,18 @@ bool cl_arq_controller::rung_floor_meter_clears(int cfg) const
 	if(narrowband_enabled == YES) return true;                // WB-only gate
 	if(cfg < CONFIG_9) return true;                           // low OFDM rungs ungated (decode deep)
 	if(cfg < 0 || cfg >= NUMBER_OF_CONFIGS) return true;      // out of range (robust) -> ungated
-	if(cfg == CONFIG_17) return true;                         // top-gear (default-off) not gated here
+	if(cfg == CONFIG_17)
+	{
+		// BLOCKER A — row-17 election floor (MERCURY_ROW17_BUMP). Default-off =>
+		// returns true (ungated, byte-identical). When armed, cfg17's 64-QAM decode
+		// floor is a bracket above cfg16: gate on rung_meter_db > RUNG_MIN_SNR_METER[17]
+		// (=24.0, strict). The suffix meter clamps at 25.0, so a saturated 25 read
+		// ADMITS (25>24) while 24.0/23.0 REFUSE; a stale snapshot fails CLOSED.
+		const char* r17 = std::getenv("MERCURY_ROW17_BUMP");
+		if(!(r17 && atoi(r17) != 0)) return true;              // default: ungated
+		if(rung_meter_stale()) return false;                   // stale -> fail closed
+		return rung_meter_db > RUNG_MIN_SNR_METER[CONFIG_17] + rung_floor_bump_db[CONFIG_17];
+	}
 	if(rung_meter_stale()) return false;                     // stale climb-grade snapshot -> fail closed
 	double bump = rung_floor_bump_db[cfg];
 	return rung_meter_db > RUNG_MIN_SNR_METER[cfg] + bump;    // qualified snapshot, never raw SNR_uplink
@@ -1892,7 +1915,8 @@ void cl_arq_controller::process_messages_commander()
 		{
 			int tg_target = -1;
 			if (topgear_elect_engaged && current_configuration == CONFIG_16
-			    && (max_config_override < 0 || max_config_override >= CONFIG_17))
+			    && (max_config_override < 0 || max_config_override >= CONFIG_17)
+			    && rung_floor_ok(CONFIG_17))   // BLOCKER A: row-17 floor gate (MERCURY_ROW17_BUMP; identity when off)
 			{
 				tg_target = CONFIG_17;   // ENGAGE: climb the top rung
 			}

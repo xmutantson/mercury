@@ -1951,6 +1951,26 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 
+	// Frequency-selectivity from the RAW per-pilot LS estimates, captured HERE
+	// (only pilot cells MEASURED; interpolation + DFT smoothing have NOT run).
+	// std|H|/mean|H| over the pilots samples H(f) DIRECTLY: a flat channel reads
+	// low (~0.04 at operating SNR), a 2-path null gives a large pilot-to-pilot |H|
+	// swing => high. The post-smoothing DATA-bin metric instead reads an
+	// SNR-independent ~0.4-1.3 ripple the smoother/interpolation inject, so this
+	// raw-pilot reading is what feeds last_channel_selectivity.
+	{
+		double ps=0.0, pss=0.0; int pc=0;
+		for(int ii=0; ii<Nsymb; ii++)
+			for(int jj=0; jj<Nc; jj++)
+				if((ofdm_frame+ii*Nc+jj)->type==PILOT && (estimated_channel+ii*Nc+jj)->status==MEASURED)
+				{ double m=std::abs((estimated_channel+ii*Nc+jj)->value); ps+=m; pss+=m*m; pc++; }
+		if(pc>1){ double pm=ps/pc; double pv=pss/pc-pm*pm; if(pv<0)pv=0;
+			last_pilot_selectivity = (pm>1e-12) ? (sqrt(pv)/pm) : -1.0; }
+		else last_pilot_selectivity = -1.0;
+		if(std::getenv("MERCURY_SEL_DIAG"))
+			std::cerr << "[PILOT-SEL] npil=" << pc << " sel=" << last_pilot_selectivity << std::endl;
+	}
+
 	// Timing-quality selector: pilot phase COHERENCE over the RAW LS estimates,
 	// captured HERE (only pilot cells are MEASURED; interpolation + DFT smoothing
 	// have not run yet). See ofdm.h last_pilot_coherence.

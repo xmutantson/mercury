@@ -4978,6 +4978,7 @@ public:
   bool    topgear_elect_engaged;        // hysteretic verdict: cfg17 electable/held
   int     topgear_elect_clean_streak;   // consecutive clean+flat forward reports at CFG16
   double  topgear_channel_flatness;     // forward selectivity std|H|/mean|H| (0.0 = flat); TOPGEAR_FLATNESS_MAX gate
+  bool    topgear_cfg17_floor_ok;       // @28 GUARD: RSP's UN-clipped forward SNR cleared the cfg17 64-QAM floor
   int     topgear_last_report_bsi;      // de-duplicates repeated compact-confirm polls; -1 = none
 
   // ── STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (inband-reliability-
