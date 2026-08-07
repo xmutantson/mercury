@@ -942,21 +942,36 @@ CONFIG_16 (5664.7 bps).
 // selective nulls independent of SNR (topgear-stack-proof.md §7), so this is the anti-thrash
 // safety the SNR margin alone cannot provide. 0.15 ≈ ~1.3 dB RMS |H| ripple: a flat/WGN
 // channel at the ~20 dB engage SNR sits ~0.05-0.12; a 2-ray amp-0.3 selective channel sits
-// ~0.21 (RMS/mean of a 0.3 two-ray ripple). CALIBRATION: this classifier threshold is a first
-// value — SWEEP it on the fleet faithful-sim (flat WGN vs CCIR-Poor 2-path) before default-on.
+// ~0.21 (RMS/mean of a 0.3 two-ray ripple). CALIBRATED (real-loopback 2-tap Watterson
+// cohort, 48 cells, 8 seeds/condition, decoded-frame per-seed medians of the raw per-pilot
+// metric): flat WGN reads <= 0.035 worst-case across 28-43.58 dB and FALLS with SNR
+// (0.034/0.019/0.012 — channel truth, not the smoother artifact the old data-bin metric
+// showed, which sat SNR-invariant at ~0.27); every 2-path class reads >= 0.172 worst-case
+// decoded-median (mild 0.5 ms through CCIR-poor 2.0 ms; full estimate stream 0.41-0.62).
+// 0.15 separates with +0.115 flat-side / +0.022 worst decoded 2-path margin; the engage
+// streak (2 consecutive clean reports, one miss resets) covers the occasional
+// decode-favourable 2-path frame that dips under the ceiling.
 #define TOPGEAR_FLATNESS_MAX 0.15
 
 // @28 OVER-FLOOR GUARD. The coarse suffix meter AND the report snr_q field both
 // SATURATE at 25 dB, so a 25-dB report cannot distinguish an SNR that clears cfg17's
 // 64-QAM decode floor from one that merely clears cfg16 — and cfg17 is HARMFUL below
 // its floor (delivers 0/N @~WGN:28). The RESPONDER, however, holds the UN-clipped
-// forward EVM-SNR (measure_SNR) at report-pack time, which discriminates below the
-// ~28 dB EVM knee. When MERCURY_CFG17_SNR_FLOOR is set (>0), the responder folds a
-// floor verdict into report flat_state code 11 (flat AND >= floor) vs 9 (flat, below
-// floor); the commander engages cfg17 only on 11. Default 0 => guard INACTIVE (the
-// election behaves as before). CALIBRATION-DEBT: the floor value must be pinned from
-// measure_SNR at the harmful (~WGN:28) vs winning (~34.66/43.58) anchors before default-on.
-#define CFG17_SNR_FLOOR_DEFAULT_DB 27.5
+// forward SNR at report-pack time: measurements.SNR_downlink = receive_stats.SNR =
+// 10*log10(1/EVM-variance) on the wideband LEAST_SQUARE path — NOT the narrowband-only
+// measure_SNR, and NOT saturated (it tracks to ~35 dB; measured 34.8 @43.58).
+// When MERCURY_CFG17_SNR_FLOOR is set (>0), the responder folds a floor verdict into
+// report flat_state code 11 (flat AND >= floor) vs 9 (flat, below floor); the commander
+// engages cfg17 only on 11. Default 0 => guard INACTIVE (the election behaves as before).
+// CALIBRATED on a real-loopback WGN cohort (8 seeds/anchor, decoded-frame SNR_downlink):
+// @28 (harmful) per-seed medians 25.5-26.8, frame-level max exactly 28.7; @34.66 (winning)
+// per-seed medians 30.6-31.7 with frame clear-rate 0.846 at this floor; @43.58 medians
+// 33.7-35.5. 28.7 = midpoint of the worst-case median gap (26.8 vs 30.6, ~1.9 dB/side);
+// the engage streak covers the single boundary frame @28 (28.8-29.0 would refuse it
+// outright at identical admit rate — either sits in the separating window). Arm BOTH
+// peers: the responder packs the verdict, the commander requires it (one-sided arming
+// fails CLOSED — an unarmed responder never packs code 11).
+#define CFG17_SNR_FLOOR_DEFAULT_DB 28.7
 
 // ── CFG16 (32-QAM rate-14/16) decode-margin election gate ─────────────────────────────
 // CFG16_MIN_SNR_DB: the minimum reverse-path SNR report (measurements.SNR_uplink, the peer's
