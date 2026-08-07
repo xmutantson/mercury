@@ -1427,6 +1427,153 @@ int cl_arq_controller::test_topgear_clean_election()
 		      "(C) PASS-AFTER: widened 52-sym tail transports the report (topgear_report_valid=true, report byte matches)");
 	}
 
+	// (C2) CONSUME-RACE — deferred stashed-tail report decode. The live vehicle
+	// (real-loopback, both peers armed) showed the widened tail alone is necessary
+	// but NOT sufficient: the commander accepts the confirm at FIRST-codeword CRC
+	// validity ~2 symbols BEFORE the trailing report codeword's audio has arrived
+	// (audio-bracketed twice), then leaves the ACK-wait state and never re-polls
+	// the tail — 0 report applies, deterministically. Drive the REAL production
+	// entry points (cmd_compact_confirm_crc_valid on the commander capture ring,
+	// then the per-poll deferred decoder) through the race: truncated tail at
+	// consume time, completion afterwards, the batch-TX ring wipe, staleness,
+	// and the deadline.
+	{
+		int ring_sym = ts->data_container.Nofdm * ts->data_container.interpolation_rate;
+		int signal_period = ring_sym * ts->data_container.buffer_Nsymb;
+		int ack_nsymb2 = ts->ack_mfsk.ack_pattern_nsymb;
+		int csuf2 = ts->ack_mfsk.compact_confirm_suffix_len();
+		int confirm_nsymb = ack_nsymb2 + 2 * csuf2;   // 16 + 10 + 10 = 36
+		int miss_nsymb = 3;                           // report symbols still in flight at accept
+		// Generate the FULL topgear confirm for `bsi`, then seat only its FIRST
+		// present_nsymb symbols ending at the ring's freshest sample — the
+		// capture-time truth of a frame whose tail audio has not yet traversed
+		// the loopback + capture pipeline. Mirrors the live capture geometry the
+		// production tail snapshot reads (ring_write_index=0, tail at the end).
+		auto seat_confirm_tail = [&](uint8_t sbsi, int present_nsymb) -> bool {
+			char bb[1] = { (char)sbsi };
+			uint16_t bcrc = cmd->CRC12_calc(bb, 1);
+			char rb[1] = { (char)report_flat };
+			uint16_t rcrc = cmd->CRC12_calc(rb, 1);
+			std::vector<double> full((size_t)confirm_nsymb * ring_sym, 0.0);
+			int gen = ts->generate_topgear_confirm_passband(full.data(), sbsi, bcrc,
+				report_flat, rcrc);
+			if(gen != (int)full.size()) return false;
+			double* ring = ts->data_container.passband_delayed_data;
+			memset(ring, 0, (size_t)2 * signal_period * sizeof(double));
+			int n = present_nsymb * ring_sym;
+			if(n > signal_period) return false;
+			memcpy(ring + (signal_period - n), full.data(), (size_t)n * sizeof(double));
+			memcpy(ring + signal_period, ring, (size_t)signal_period * sizeof(double));
+			ts->data_container.ring_write_index = 0;
+			ts->data_container.rx_mute = 0;
+			return true;
+		};
+		reset_state();
+		cmd->current_configuration = CONFIG_16;
+		cmd->topgear_last_report_bsi = -1;
+		cmd->topgear_pending_report_clear("test-setup");
+
+		// FAIL-BEFORE (env-restored pre-fix single-poll consume): the truncated
+		// tail still ACCEPTS the confirm — and the report is simply LOST, with
+		// nothing pending to ever revisit it. The exact live 0-apply signature.
+		set_env("MERCURY_TOPGEAR_CONSUME_FAILBEFORE", "1");
+		cmd->cmd_batch_seq_id = 50;
+		bool seat_ok = seat_confirm_tail(50, confirm_nsymb - miss_nsymb);
+		check(seat_ok, "(C2) truncated topgear confirm seated on the commander ring");
+		uint8_t got_bsi = 0;
+		bool acc = cmd->cmd_compact_confirm_crc_valid(&got_bsi);
+		check(acc && got_bsi == 50,
+		      "(C2) FAIL-BEFORE: confirm ACCEPTED at first-codeword validity with the report audio missing (the consume race)");
+		check(cmd->topgear_last_report_bsi != 50 && cmd->topgear_pending_report_bsi < 0,
+		      "(C2) FAIL-BEFORE: report LOST — no apply, nothing pending (single-poll consume)");
+		clr_env("MERCURY_TOPGEAR_CONSUME_FAILBEFORE");
+
+		// PASS-AFTER: the same truncated tail arms the deferred decode; the accept
+		// itself is unchanged (consume-now — ACK timing never waits on the report).
+		seat_ok = seat_confirm_tail(50, confirm_nsymb - miss_nsymb);
+		got_bsi = 0;
+		acc = cmd->cmd_compact_confirm_crc_valid(&got_bsi);
+		check(seat_ok && acc && got_bsi == 50 && cmd->topgear_pending_report_bsi == 50,
+		      "(C2) accept still fires on time; deferred report decode ARMED (pending bsi matches)");
+		check(cmd->topgear_last_report_bsi != 50,
+		      "(C2) no premature apply from the incomplete capture");
+		// The report audio ARRIVES (frame now fully in the ring): the per-poll
+		// tick re-snapshots, decodes from the stash, and applies.
+		seat_ok = seat_confirm_tail(50, confirm_nsymb);
+		cmd->topgear_pending_report_tick();
+		check(seat_ok && cmd->topgear_last_report_bsi == 50
+		      && cmd->topgear_pending_report_bsi < 0
+		      && cmd->topgear_elect_clean_streak == 1,
+		      "(C2) tick decodes the completed tail and APPLIES the report (pending cleared, streak advances)");
+		int streak_after = cmd->topgear_elect_clean_streak;
+		cmd->topgear_pending_report_tick();
+		check(cmd->topgear_elect_clean_streak == streak_after
+		      && cmd->topgear_pending_report_bsi < 0,
+		      "(C2) tick is idempotent once cleared (no synthetic streak)");
+
+		// FLUSH-SURVIVAL: send_batch() zeroes the ring at ENTRY ~209 ms after the
+		// accept. The pre-wipe freeze must preserve the tail so the deferred
+		// decode still lands after the wipe (the naive re-poll-the-ring fix loses
+		// this race and goes intermittently inert mid-transfer).
+		cmd->cmd_batch_seq_id = 51;
+		seat_ok = seat_confirm_tail(51, confirm_nsymb - miss_nsymb);
+		got_bsi = 0;
+		acc = cmd->cmd_compact_confirm_crc_valid(&got_bsi);
+		check(seat_ok && acc && cmd->topgear_pending_report_bsi == 51,
+		      "(C2) pending armed for the flush-survival arm");
+		seat_ok = seat_confirm_tail(51, confirm_nsymb);   // audio completes...
+		cmd->topgear_pending_stash_freeze();              // ...entry hook fires...
+		{                                                 // ...then the production wipe.
+			double* ring = ts->data_container.passband_delayed_data;
+			memset(ring, 0, (size_t)2 * signal_period * sizeof(double));
+			ts->data_container.ring_write_index = 0;
+		}
+		cmd->topgear_pending_report_tick();
+		check(seat_ok && cmd->topgear_last_report_bsi == 51
+		      && cmd->topgear_pending_report_bsi < 0,
+		      "(C2) frozen stash SURVIVES the send_batch ring wipe; report applies post-TX");
+
+		// STALENESS: a pending report for bsi N may never apply once the confirm
+		// for N+1 is consumed — the newer consume-time report replaces it.
+		cmd->cmd_batch_seq_id = 52;
+		seat_ok = seat_confirm_tail(52, confirm_nsymb - miss_nsymb);
+		got_bsi = 0;
+		acc = cmd->cmd_compact_confirm_crc_valid(&got_bsi);
+		check(seat_ok && acc && cmd->topgear_pending_report_bsi == 52,
+		      "(C2) stale-arm pending for bsi 52");
+		cmd->cmd_batch_seq_id = 53;
+		seat_ok = seat_confirm_tail(53, confirm_nsymb);   // N+1 arrives COMPLETE
+		got_bsi = 0;
+		acc = cmd->cmd_compact_confirm_crc_valid(&got_bsi);
+		check(seat_ok && acc && got_bsi == 53 && cmd->topgear_last_report_bsi == 53
+		      && cmd->topgear_pending_report_bsi < 0,
+		      "(C2) newer confirm's consume-time report supersedes the stale pending");
+		seat_ok = seat_confirm_tail(52, confirm_nsymb);   // bsi-52 audio shows up late
+		cmd->topgear_pending_report_tick();
+		check(seat_ok && cmd->topgear_last_report_bsi == 53,
+		      "(C2) the superseded bsi-52 report never applies late (staleness bound holds)");
+
+		// DEADLINE: a pending whose report audio never completes expires cleanly
+		// (self-heals on the next confirm's fresh report; no zombie state).
+		set_env("MERCURY_TOPGEAR_PENDING_DEADLINE_MS", "1");
+		cmd->cmd_batch_seq_id = 54;
+		seat_ok = seat_confirm_tail(54, confirm_nsymb - miss_nsymb);
+		got_bsi = 0;
+		acc = cmd->cmd_compact_confirm_crc_valid(&got_bsi);
+		check(seat_ok && acc && cmd->topgear_pending_report_bsi == 54,
+		      "(C2) deadline-arm pending for bsi 54");
+		{	// the report never arrives: only silence behind the wipe
+			double* ring = ts->data_container.passband_delayed_data;
+			memset(ring, 0, (size_t)2 * signal_period * sizeof(double));
+			ts->data_container.ring_write_index = 0;
+		}
+		usleep(5000);
+		cmd->topgear_pending_report_tick();
+		check(cmd->topgear_pending_report_bsi < 0 && cmd->topgear_last_report_bsi == 53,
+		      "(C2) unfulfilled pending expires at the deadline without applying");
+		clr_env("MERCURY_TOPGEAR_PENDING_DEADLINE_MS");
+	}
+
 	// The report quantizer floors SNR and carries only a marker-backed flatness
 	// verdict. A corrupt/noise-decoded low nibble outside {8,9,10} is invalid.
 	int report_snr_q = (report_flat >> 4) & 0x0F;

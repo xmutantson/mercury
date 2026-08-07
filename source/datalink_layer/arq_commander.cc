@@ -641,7 +641,29 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	if(!covered)
 		return false;
 	if(topgear_report_valid)
+	{
 		topgear_apply_report(topgear_report, (int)rx_bsi);
+		// A consume-time report supersedes any older pending one (fresher evidence).
+		topgear_pending_report_clear("consume-time-report");
+	}
+	else if(want_topgear_report
+	        && (current_configuration == CONFIG_16 || current_configuration == CONFIG_17))
+	{
+		// CONSUME-RACE fix: the confirm is being accepted at FIRST-codeword CRC
+		// validity, but on the live vehicle the trailing report codeword's audio has
+		// not fully arrived yet (audio-bracketed: accept fires with ~2 of 36 symbols
+		// still unplayed, every time). Do NOT hold the accept (ACK timing is
+		// protocol-critical); arm the DEFERRED report decode instead — subsequent
+		// polls re-snapshot the tail and decode the report once its audio exists.
+		// The cfg16/17 gate mirrors the responder's append condition
+		// (send_mfsk_compact_confirm) so plain 26-sym confirms never arm pending.
+		// MERCURY_TOPGEAR_CONSUME_FAILBEFORE=1 restores the single-poll consume
+		// (the pre-fix behavior) for the regression's fail-before arm and live A/B.
+		bool consume_failbefore = false;
+		{ const char* e = std::getenv("MERCURY_TOPGEAR_CONSUME_FAILBEFORE"); consume_failbefore = (e && *e && atoi(e) != 0); }
+		if(!consume_failbefore)
+			topgear_pending_report_arm((int)rx_bsi);
+	}
 
 	// CLEAN-batch implicit: a compact confirm MEANS all-ones (the responder only
 	// emits it for a fully-received batch; partial loss uses the SACK path).
@@ -651,6 +673,163 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 #else
 	(void)out_bsi;
 	return false;
+#endif
+}
+
+// ── Topgear report CONSUME-RACE fix: deferred stashed-tail report decode ──
+// See the member-block note in arq.h and the TOPGEAR_PENDING_REPORT_DEADLINE_MS
+// note in common_defines.h for the full mechanism. Summary: the confirm is
+// consumed on time (accept/ACK/RTO timing untouched); the report codeword —
+// whose audio provably had not arrived at consume time (audio-bracketed on the
+// live vehicle) — is decoded LATER from a dedicated tail stash that is
+// re-snapshotted each poll while the ring is live and frozen before any
+// ring-destroying event. All functions are dead unless MERCURY_TOPGEAR_ELECT
+// armed a pending (default path unmoved).
+
+void cl_arq_controller::topgear_pending_report_arm(int bsi)
+{
+#if MFSK_ACK_SACK_ENABLED
+	topgear_pending_report_bsi = bsi & 0xFF;
+	topgear_pending_cfg = current_configuration;
+	topgear_pending_stash_frozen = false;
+	topgear_pending_stash_dirty = false;
+	topgear_pending_stash_samples = 0;
+	topgear_pending_timer.stop();
+	topgear_pending_timer.reset();
+	topgear_pending_timer.start();
+	printf("[TOPGEAR-PENDING] arm bsi=%d cfg=%d (report codeword not yet in capture; deferring decode)\n",
+		topgear_pending_report_bsi, topgear_pending_cfg);
+	fflush(stdout);
+	// First snapshot right away — on a fast capture path the report may already be
+	// complete by the next poll, and the freshest-overwrite ticks only improve it.
+	topgear_pending_stash_refresh();
+#else
+	(void)bsi;
+#endif
+}
+
+void cl_arq_controller::topgear_pending_report_clear(const char* reason)
+{
+#if MFSK_ACK_SACK_ENABLED
+	if(topgear_pending_report_bsi < 0)
+		return;
+	printf("[TOPGEAR-PENDING] clear bsi=%d (%s)\n", topgear_pending_report_bsi, reason);
+	fflush(stdout);
+	topgear_pending_report_bsi = -1;
+	topgear_pending_cfg = CONFIG_NONE;
+	topgear_pending_stash_frozen = false;
+	topgear_pending_stash_dirty = false;
+	topgear_pending_stash_samples = 0;
+	topgear_pending_timer.stop();
+	topgear_pending_timer.reset();
+#else
+	(void)reason;
+#endif
+}
+
+// Live-ring tail -> stash. SAME tail geometry as cmd_compact_confirm_crc_valid's
+// snapshot (the widened topgear span — pending only ever arms with the feature on),
+// but into the DEDICATED stash buffer: ready_to_process_passband_delayed_data is
+// shared scratch that any OFDM/MFSK dispatch may overwrite between polls. No-op
+// once frozen (the ring is gone or about to be) and while rx_mute has the capture
+// thread writing zeros (a muted-ring copy would clobber good stash audio).
+void cl_arq_controller::topgear_pending_stash_refresh()
+{
+#if MFSK_ACK_SACK_ENABLED
+	if(topgear_pending_report_bsi < 0 || topgear_pending_stash_frozen)
+		return;
+	if(telecom_system == NULL || telecom_system->data_container.rx_mute)
+		return;
+	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
+		return;
+	int ack_nsymb      = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int compact_suffix = telecom_system->ack_mfsk.compact_confirm_suffix_len();
+	const int mfsk_tail_nsymb = ack_nsymb + 2 * compact_suffix + 16;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = mfsk_tail_nsymb * sym_samples;
+	if(tail_samples > signal_period)
+		tail_samples = signal_period;
+	int tail_offset = signal_period - tail_samples;
+	if((int)topgear_pending_stash.size() < tail_samples)
+		topgear_pending_stash.resize((size_t)tail_samples);
+	MUTEX_LOCK(&capture_prep_mutex);
+	int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(topgear_pending_stash.data(),
+		&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
+		(size_t)tail_samples * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+	topgear_pending_stash_samples = tail_samples;
+	topgear_pending_stash_dirty = true;
+#endif
+}
+
+// Final refresh + freeze, called BEFORE a ring-destroying event (send_batch()'s
+// entry flush zeroes the ring ~209 ms after the accept — before the report has
+// always traversed the capture pipeline — and every other TX path's post-drain
+// flush is fronted by ptt_on()). ~0.1 ms memcpy; the ONLY thing this fix ever
+// adds to the ARQ critical path. Decode happens off-path at the next tick.
+void cl_arq_controller::topgear_pending_stash_freeze()
+{
+#if MFSK_ACK_SACK_ENABLED
+	if(topgear_pending_report_bsi < 0 || topgear_pending_stash_frozen)
+		return;
+	topgear_pending_stash_refresh();
+	topgear_pending_stash_frozen = true;
+#endif
+}
+
+// Per-poll deferred decode driver (top of process_messages_commander). While a
+// pending report is armed: refresh the stash from the live ring, and whenever the
+// stash changed, re-attempt the FULL confirm decode ON THE STASH. On a decode whose
+// bsi matches the pending confirm and whose report codeword validates, apply it —
+// topgear_apply_report de-dupes per-bsi and validates the marker nibble, so a late
+// or repeated apply is idempotent by design. Staleness is bounded three ways: a
+// NEWER confirm accept replaces/clears the pending (bsi-match keeps a stale stash
+// from crediting the wrong batch), a config change clears it (decode geometry and
+// election context both moved), and the deadline expires it (a missed report
+// self-heals on the next clean confirm's fresh report).
+void cl_arq_controller::topgear_pending_report_tick()
+{
+#if MFSK_ACK_SACK_ENABLED
+	if(topgear_pending_report_bsi < 0)
+		return;
+	if(!topgear_elect_feature_enabled())
+	{
+		topgear_pending_report_clear("feature-off");
+		return;
+	}
+	if(current_configuration != topgear_pending_cfg)
+	{
+		topgear_pending_report_clear("config-change");
+		return;
+	}
+	topgear_pending_stash_refresh();
+	if(topgear_pending_stash_dirty && topgear_pending_stash_samples > 0)
+	{
+		topgear_pending_stash_dirty = false;
+		uint8_t rx_bsi = 0, report = 0;
+		bool report_valid = false;
+		int matched = 0;
+		bool decoded = telecom_system->decode_compact_confirm_from_passband(
+			topgear_pending_stash.data(), topgear_pending_stash_samples,
+			cmd_compact_crc12_cb, this, &rx_bsi, &matched, &report, &report_valid);
+		if(decoded && (int)rx_bsi == topgear_pending_report_bsi && report_valid)
+		{
+			topgear_apply_report(report, (int)rx_bsi);
+			topgear_pending_report_clear("applied");
+			return;
+		}
+	}
+	{
+		int deadline_ms = TOPGEAR_PENDING_REPORT_DEADLINE_MS;
+		const char* e = std::getenv("MERCURY_TOPGEAR_PENDING_DEADLINE_MS");
+		if(e && *e && atoi(e) > 0)
+			deadline_ms = atoi(e);
+		if(topgear_pending_timer.get_elapsed_time_ms() > deadline_ms)
+			topgear_pending_report_clear("deadline");
+	}
 #endif
 }
 
@@ -1368,6 +1547,11 @@ int cl_arq_controller::connect_seed_target()
 
 void cl_arq_controller::process_messages_commander()
 {
+	// Topgear deferred-report driver (consume-race fix): drive any pending
+	// stashed-tail report decode once per poll. First-line early-return unless
+	// MERCURY_TOPGEAR_ELECT armed a pending — the default path does not move.
+	topgear_pending_report_tick();
+
 	// In-band CONNECT-LIVENESS GUARD (data-flow-inband-connect-liveness.md §2). Once per
 	// poll, observe forward-DATA progress; if a connect/negotiate handshake is livelocked
 	// (no nAcked_data advance for N control-plane polls) fire the retained true-loss BREAK.

@@ -1215,6 +1215,12 @@ cl_arq_controller::cl_arq_controller()
 	topgear_channel_flatness=-1.0;
 	topgear_cfg17_floor_ok=false;
 	topgear_last_report_bsi=-1;
+	// Consume-race deferred report decode: nothing pending on a fresh controller.
+	topgear_pending_report_bsi=-1;
+	topgear_pending_cfg=CONFIG_NONE;
+	topgear_pending_stash_frozen=false;
+	topgear_pending_stash_dirty=false;
+	topgear_pending_stash_samples=0;
 	inband_unilateral_armed=false;  // Stage 3b: set by the SET_CONFIG builder unilateral path
 	// STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (design §1/§4). A fresh
 	// session has nothing announced, so the re-tag is disarmed and no config is confirmed.
@@ -2337,6 +2343,12 @@ void cl_arq_controller::set_control_batch_size(int control_batch_size)
 
 void cl_arq_controller::set_role(int role)
 {
+	// Consume-race deferred report: a pending report is bound to a commander-role
+	// receive window at one config; ANY role transition invalidates both (and the
+	// per-poll tick only runs under the commander dispatch, so a stale pending
+	// would otherwise sit un-driven until the deadline). Clear it here — no-op
+	// unless MERCURY_TOPGEAR_ELECT armed one this stint.
+	topgear_pending_report_clear("role-change");
 	if(role==COMMANDER)
 	{
 		// IDLE-SWITCHROLE-RACE re-ride fix (idle-switchrole-race.md §6;
@@ -8543,6 +8555,14 @@ void cl_arq_controller::process_user_command(std::string command)
 void cl_arq_controller::ptt_on()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
+	// Consume-race deferred report: every TX path that keys PTT ends in a
+	// post-drain capture flush that destroys the ring (ACK/BREAK/control/confirm
+	// sends all follow the same scaffolding). ptt_on() fronts them ALL, and at
+	// this point the ring is still live — so this single hook preserves the
+	// pending confirm tail for every TX path without touching each flush site.
+	// (send_batch() wipes at ENTRY, before ptt_on — it carries its own hook.)
+	// No-op unless MERCURY_TOPGEAR_ELECT armed a pending report; idempotent.
+	topgear_pending_stash_freeze();
 	std::string str="PTT ON\r";
 	tcp_socket_control.message->length=str.length();
 
@@ -9168,6 +9188,8 @@ void cl_arq_controller::reset_session_state()
 	topgear_channel_flatness = -1.0;
 	topgear_cfg17_floor_ok = false;
 	topgear_last_report_bsi = -1;
+	// A pending deferred report is prior-session channel evidence too.
+	topgear_pending_report_clear("session-reset");
 	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):
 	// no cached ACK / probe state to clear per session.
 	block_under_tx = NO;
@@ -12378,6 +12400,14 @@ void cl_arq_controller::send_batch()
 			message_batch_counter_tx > 0 ? messages_batch_tx[0].type : -1);
 		fflush(stdout);
 	}
+
+	// Consume-race deferred report: the entry flush below DESTROYS the capture
+	// ring, and the just-accepted confirm's trailing report codeword may still be
+	// in (or still arriving into) it — send_batch() entry follows the accept by
+	// only ~209 ms on the live vehicle. Take the final stash snapshot BEFORE the
+	// wipe (~0.1 ms memcpy; the deferred decode itself runs off-path at the next
+	// poll). No-op unless MERCURY_TOPGEAR_ELECT armed a pending report.
+	topgear_pending_stash_freeze();
 
 	// Flush capture buffer at the START of send_batch(), before TX begins.
 	// On VB-Cable (and real radios), the responder decodes the frame and sends

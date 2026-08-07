@@ -953,6 +953,22 @@ CONFIG_16 (5664.7 bps).
 // decode-favourable 2-path frame that dips under the ceiling.
 #define TOPGEAR_FLATNESS_MAX 0.15
 
+// TOPGEAR REPORT CONSUME-RACE — deferred-decode deadline. The commander accepts a
+// compact confirm at FIRST-codeword CRC validity, which on the real-loopback vehicle
+// precedes the trailing report codeword's audio arrival (audio-bracketed twice:
+// accept at ~33.5/33.9 of 36 symbols played), so the consume-time decode can never
+// see the report and the confirm's tail is never re-polled — 0 report applies,
+// deterministically. The fix keeps the consume-time accept (ACK/BSI timing preserved
+// by construction) and arms a PENDING deferred report decode driven off a dedicated
+// tail stash (see cl_arq_controller::topgear_pending_report_tick). This deadline
+// bounds how long a pending report may wait for its audio: it must survive the
+// arm -> next send_batch() (~0.2 s observed) -> batch TX (~2-3 s at cfg16) ->
+// first post-TX poll sequence, so one batch cadence (~3.2 s) plus margin. A missed
+// report self-heals — the responder appends a fresh report on EVERY cfg16/17 clean
+// confirm and the election streak tolerates one-batch lag by design. Env-overridable
+// for the deterministic unit test only (MERCURY_TOPGEAR_PENDING_DEADLINE_MS).
+#define TOPGEAR_PENDING_REPORT_DEADLINE_MS 5000
+
 // @28 OVER-FLOOR GUARD. The coarse suffix meter AND the report snr_q field both
 // SATURATE at 25 dB, so a 25-dB report cannot distinguish an SNR that clears cfg17's
 // 64-QAM decode floor from one that merely clears cfg16 — and cfg17 is HARMFUL below

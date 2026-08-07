@@ -4981,6 +4981,41 @@ public:
   bool    topgear_cfg17_floor_ok;       // @28 GUARD: RSP's UN-clipped forward SNR cleared the cfg17 64-QAM floor
   int     topgear_last_report_bsi;      // de-duplicates repeated compact-confirm polls; -1 = none
 
+  // ── Topgear report CONSUME-RACE fix: deferred stashed-tail report decode ──
+  // Live-vehicle finding (real-loopback, both peers armed, audio-bracketed twice):
+  // the commander's compact-confirm poll accepts the confirm as soon as the FIRST
+  // (bsi) codeword is CRC-valid — ~2.1-2.5 symbols of the trailing REPORT codeword
+  // were still UNPLAYED at accept — then leaves the ACK-wait state and never re-polls
+  // that tail. Codeword-1 becomes decodable ~10 symbols (~243 ms) before codeword-2's
+  // last symbol exists vs a ~56 ms poll cadence, so the early consume wins EVERY time
+  // (0 report applies, deterministic; loss_class STRUCTURAL). Deferring the ACCEPT
+  // would tax the ARQ critical path (+200-270 ms/batch), poison the measured-
+  // turnaround RTO estimator, and hold a clean batch ACK hostage to 10 tail symbols —
+  // so instead: CONSUME NOW (accept/ACK timing untouched by construction), and arm a
+  // PENDING report-only deferred decode. Each commander poll re-snapshots the 52-sym
+  // tail into this DEDICATED stash (freshest-overwrite; NOT the shared
+  // ready_to_process scratch) and re-attempts the report decode FROM THE STASH.
+  // send_batch() zeroes the capture ring AT ENTRY (~209 ms after accept, before the
+  // report has always traversed the capture pipeline), so every ring-destroying path
+  // FREEZES the stash first (send_batch entry hook + the generic ptt_on() hook that
+  // fronts every other TX path's post-drain flush); after a freeze the tick decodes
+  // from the frozen stash only. Late apply is safe: topgear_apply_report de-dupes
+  // per-bsi and validates the marker nibble, and a replaced/expired pending self-heals
+  // on the next confirm's fresh report. ALL of this state is dead (never armed)
+  // unless MERCURY_TOPGEAR_ELECT=1 — the default path does not move.
+  int      topgear_pending_report_bsi;     // -1 = no pending deferred report
+  int      topgear_pending_cfg;            // config at arm time; any change clears pending
+  bool     topgear_pending_stash_frozen;   // a ring wipe happened -> stop refreshing
+  bool     topgear_pending_stash_dirty;    // stash changed since the last decode attempt
+  int      topgear_pending_stash_samples;  // valid samples in the stash
+  std::vector<double> topgear_pending_stash; // dedicated tail stash buffer
+  cl_timer topgear_pending_timer;          // arm-time deadline clock
+  void topgear_pending_report_arm(int bsi);
+  void topgear_pending_report_clear(const char* reason);
+  void topgear_pending_stash_refresh();    // live-ring tail -> stash (no-op frozen/muted)
+  void topgear_pending_stash_freeze();     // final refresh + freeze BEFORE a ring wipe
+  void topgear_pending_report_tick();      // per-poll deferred decode driver
+
   // ── STAGE 4d — D1 repeat-until-followed + D4 climb/auto-demote (inband-reliability-
   //    design.md §1/§4) ──
   // After a committed config change the sender RE-EMITS the CONFIG_TAG on EVERY
