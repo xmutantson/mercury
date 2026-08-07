@@ -14215,6 +14215,22 @@ void cl_arq_controller::restore_sack_v2_rx_phy()
 {
 	if(!cmd_sack_v2_robust_rx_armed)
 		return;
+	// Consume-race deferred report: this restore's switch_sack_v2_phy ->
+	// load_configuration re-anchors the capture ring (precook swap; the capture
+	// thread logs CAP-STALE and the listen-epoch sample coordinates are gone).
+	// At the accept it fires ~1 ms after the confirm was consumed — while the
+	// confirm's trailing report codeword is still ARRIVING into that ring — so an
+	// accept-time restore destroys the only audio stream that will ever hold the
+	// full frame contiguously (measured live: with the restore in place every
+	// deferred decode failed and every pending expired at the deadline). While a
+	// pending report is armed and its tail is not yet stashed, HOLD the restore:
+	// the RX simply stays in the listen PHY it was already in (the peer is silent
+	// in this window), and every TX path completes the restore BEFORE keying via
+	// its freeze hook (send_batch entry + ptt_on), as does every pending clear —
+	// so TX never runs in the listen PHY and the hold is bounded by the pending
+	// deadline. No-op deferral unless MERCURY_TOPGEAR_ELECT armed a pending.
+	if(topgear_pending_report_bsi >= 0 && !topgear_pending_stash_frozen)
+		return;   // deferred: topgear_pending_stash_freeze()/_clear() complete it
 	cmd_sack_v2_robust_rx_armed = false;
 	switch_sack_v2_phy(current_configuration);
 }

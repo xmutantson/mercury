@@ -1572,6 +1572,27 @@ int cl_arq_controller::test_topgear_clean_election()
 		check(cmd->topgear_pending_report_bsi < 0 && cmd->topgear_last_report_bsi == 53,
 		      "(C2) unfulfilled pending expires at the deadline without applying");
 		clr_env("MERCURY_TOPGEAR_PENDING_DEADLINE_MS");
+
+		// DEFERRED LISTEN-PHY RESTORE: the accept-time SACK-V2 restore re-anchors
+		// the capture ring (the live root of the deferred-decode failures) — while
+		// a pending report's tail is un-stashed the restore must HOLD, and the
+		// freeze hook must complete it before any TX keys. (ts already sits at
+		// cfg16 so the completed switch is the no-op branch; the assertions are on
+		// the arm/hold/complete sequencing, which is the live defect.)
+		cmd->cmd_batch_seq_id = 55;
+		seat_ok = seat_confirm_tail(55, confirm_nsymb - miss_nsymb);
+		got_bsi = 0;
+		acc = cmd->cmd_compact_confirm_crc_valid(&got_bsi);
+		check(seat_ok && acc && cmd->topgear_pending_report_bsi == 55,
+		      "(C2) pending armed for the deferred-restore arm");
+		cmd->cmd_sack_v2_robust_rx_armed = true;
+		cmd->restore_sack_v2_rx_phy();
+		check(cmd->cmd_sack_v2_robust_rx_armed,
+		      "(C2) accept-time PHY restore HELD while the pending tail is un-stashed");
+		cmd->topgear_pending_stash_freeze();
+		check(!cmd->cmd_sack_v2_robust_rx_armed,
+		      "(C2) freeze hook completes the deferred restore before TX could key");
+		cmd->topgear_pending_report_clear("test-teardown");
 	}
 
 	// The report quantizer floors SNR and carries only a marker-backed flatness

@@ -722,6 +722,10 @@ void cl_arq_controller::topgear_pending_report_clear(const char* reason)
 	topgear_pending_stash_samples = 0;
 	topgear_pending_timer.stop();
 	topgear_pending_timer.reset();
+	// Complete any DEFERRED SACK-V2 listen-PHY restore this pending was holding
+	// open (see restore_sack_v2_rx_phy). With the pending gone the deferral
+	// condition is false, so this either restores now or no-ops.
+	restore_sack_v2_rx_phy();
 #else
 	(void)reason;
 #endif
@@ -777,6 +781,13 @@ void cl_arq_controller::topgear_pending_stash_freeze()
 		return;
 	topgear_pending_stash_refresh();
 	topgear_pending_stash_frozen = true;
+	// Complete any DEFERRED SACK-V2 listen-PHY restore now that the tail is
+	// stashed (the accept-time restore is held while a pending report's audio is
+	// still arriving — see restore_sack_v2_rx_phy). Ordering: the tail snapshot
+	// above happened in the listen epoch; the restore's ring re-anchor can no
+	// longer take the audio with it. TX paths call this hook BEFORE keying, so
+	// no transmission ever runs in the listen PHY.
+	restore_sack_v2_rx_phy();
 #endif
 }
 
