@@ -24,6 +24,8 @@
 #include "common/timing_log.h"
 #include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
 #include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstdint>     // uint32_t/uint8_t (2-instance stepper deterministic payload)
 #include <vector>      // std::vector (2-instance stepper large-payload buffer)
@@ -846,10 +848,32 @@ int cl_arq_controller::break_weld_target(int proposed_target) const
 	const char* text = std::getenv("MERCURY_BREAK_PIN_CONFIG");
 	if(text == NULL || *text == '\0') return proposed_target;
 	char* end = NULL;
+	errno = 0;
 	long value = std::strtol(text, &end, 10);
-	if(end == text || *end != '\0') return proposed_target;
+	if(end == text || *end != '\0' || errno == ERANGE
+		|| value < INT_MIN || value > INT_MAX)
+		return proposed_target;
 	int pinned = static_cast<int>(value);
 	return config_ladder_index(pinned) >= 0 ? pinned : proposed_target;
+}
+
+// Keep the two diagnostic attributions tied to the production recovery stages.
+// These helpers are deliberately separate from BREAK-WELD attribution: a pin may
+// change final_target without the anchor floor or rung-floor cap having fired.
+static inline bool break_raise_cap_log_needed(int raw_target, int clamped_target,
+	int capped_target, int final_target)
+{
+	(void)raw_target;
+	(void)final_target;
+	return capped_target != clamped_target;
+}
+
+static inline bool break_anchor_floor_log_needed(int raw_target, int clamped_target,
+	int capped_target, int final_target)
+{
+	(void)capped_target;
+	(void)final_target;
+	return clamped_target != raw_target;
 }
 
 // REAL FAST-PROBE piece (B) — the SHARED elevator-target computation
@@ -1373,16 +1397,16 @@ void cl_arq_controller::process_messages_commander()
 						unwelded_target, target);
 					fflush(stdout);
 				}
-				if(target != clamped)
+				if(break_raise_cap_log_needed(raw_target, clamped, unwelded_target, target))
 				{
 					printf("[BREAK] RUNG-FLOOR raise-cap: anchor %d -> %d (meter %.1f age %d stale %d)\n",
-						clamped, target, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0);
+						clamped, unwelded_target, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0);
 					fflush(stdout);
 				}
-				if(target != raw_target)
+				if(break_anchor_floor_log_needed(raw_target, clamped, unwelded_target, target))
 				{
 					printf("[BREAK] Anchor floor: target %d below last_data_viable_config %d — clamping up to %d\n",
-						raw_target, last_data_viable_config, target);
+						raw_target, last_data_viable_config, clamped);
 					fflush(stdout);
 				}
 				printf("[BREAK] ACK received! Dropping %d step(s): config %d -> %d (robust_enabled=%d)\n",
@@ -1493,16 +1517,16 @@ void cl_arq_controller::process_messages_commander()
 						unwelded_target, target);
 					fflush(stdout);
 				}
-				if(target != clamped)
+				if(break_raise_cap_log_needed(raw_target, clamped, unwelded_target, target))
 				{
 					printf("[BREAK] RUNG-FLOOR raise-cap (exhausted): anchor %d -> %d (meter %.1f age %d stale %d)\n",
-						clamped, target, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0);
+						clamped, unwelded_target, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0);
 					fflush(stdout);
 				}
-				if(target != raw_target)
+				if(break_anchor_floor_log_needed(raw_target, clamped, unwelded_target, target))
 				{
 					printf("[BREAK] Anchor floor (exhausted): target %d below last_data_viable_config %d — clamping up to %d\n",
-						raw_target, last_data_viable_config, target);
+						raw_target, last_data_viable_config, clamped);
 					fflush(stdout);
 				}
 				printf("[BREAK] Dropping %d step(s): config %d -> %d\n",
@@ -15060,6 +15084,10 @@ int cl_arq_controller::test_break_weld()
 	check(break_weld_target(CONFIG_13) == CONFIG_13,
 		"off-ladder config fails open to the recovery target",
 		break_weld_target(CONFIG_13), CONFIG_13);
+	put_env("MERCURY_BREAK_PIN_CONFIG", "4294967312");
+	check(break_weld_target(CONFIG_13) == CONFIG_13,
+		"64-bit overflow text cannot wrap through int to config 16",
+		break_weld_target(CONFIG_13), CONFIG_13);
 	put_env("MERCURY_BREAK_PIN_CONFIG", "16");
 	check(break_weld_target(CONFIG_0) == CONFIG_16,
 		"armed knob returns a demoting BREAK to the pinned config",
@@ -15067,6 +15095,20 @@ int cl_arq_controller::test_break_weld()
 	check(break_weld_target(ROBUST_0) == CONFIG_16,
 		"armed knob also defeats a panic target",
 		break_weld_target(ROBUST_0), CONFIG_16);
+	{
+		const int raw = CONFIG_0;
+		const int clamped = CONFIG_0;
+		const int capped = CONFIG_0;
+		const int final_target = break_weld_target(capped);
+		bool raise_cap_log = break_raise_cap_log_needed(raw, clamped, capped, final_target);
+		bool anchor_floor_log = break_anchor_floor_log_needed(raw, clamped, capped, final_target);
+		check(!raise_cap_log,
+			"weld-only target change is not attributed to the rung-floor raise-cap",
+			raise_cap_log ? 1 : 0, 0);
+		check(!anchor_floor_log,
+			"weld-only target change is not attributed to the anchor floor",
+			anchor_floor_log ? 1 : 0, 0);
+	}
 	put_env("MERCURY_BREAK_PIN_CONFIG", "");
 	printf("%s %s: failures=%d\n", TAG, failed ? "FAIL" : "PASS", failed);
 	fflush(stdout);
