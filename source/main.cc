@@ -1936,6 +1936,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_deliver();
             }
+            // LINK-PHASE PRIMITIVE (increment 1) shadow-agreement directed unit. Member test
+            // on a throwaway controller; PURE in-process synthetic-fire of the production
+            // producers. Fast + deterministic, no IONOS/RF. data-flow-linkphase-primitive.md.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_linkphase_shadow();
+            }
             // In-band capture-ring ROBUST-floor OVER-SEAT regression (the CONFIG_8-climb
             // 24/25-BREAK root): inband_seat_robust_ring_floor over-grew the climbed OFDM
             // ring to the ROBUST floor -> frame-0 SKIP-VAR every batch. Member test on a
@@ -3710,6 +3717,7 @@ int main(int argc, char *argv[])
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_downladder_cli = false;  // --test-inband-downladder: down-ladder BREAK-orphan + silent-snapshot regression.
     bool test_inband_deliver_cli = false;  // --test-inband-deliver: forward-healthy reverse-ACK miss -> NO-BREAK deliver regression.
+    bool test_linkphase_shadow_cli = false; // --test-linkphase-shadow: increment-1 shadow-agreement directed unit.
     bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
@@ -4736,6 +4744,17 @@ int main(int argc, char *argv[])
             // discriminator is removed -> the forward-healthy miss BREAKs -> 0 deliver).
             // See arq_responder.cc test_inband_deliver + data-flow-inband-retx-epoch.md §5.
             test_inband_deliver_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-shadow") == 0)
+        {
+            // LINK-PHASE PRIMITIVE (increment 1) shadow-agreement directed unit (one-shot at
+            // startup, exit rc). Synthetic-fires the production producers; asserts the pre-init
+            // owner==NONE guard, the owner ordering, the DIRECTIONAL over-wait/under-estimate
+            // meter (incl. the intended short-batch clamp + a fail-before shortening), and the
+            // epoch bump on config-switch/BREAK. See data-flow-linkphase-primitive.md.
+            test_linkphase_shadow_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6957,6 +6976,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_deliver();
             printf("[FLAG] Inband-deliver test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_linkphase_shadow_cli) {
+            // LINK-PHASE PRIMITIVE (increment 1) shadow-agreement directed unit (one-shot,
+            // exit rc). Synthetic-fires the production producers on a throwaway controller.
+            printf("[FLAG] --test-linkphase-shadow: invoking increment-1 shadow-agreement "
+                   "directed unit\n");
+            fflush(stdout);
+            cl_arq_controller LP_TEST;
+            int rc = LP_TEST.test_linkphase_shadow();
+            printf("[FLAG] Linkphase-shadow test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

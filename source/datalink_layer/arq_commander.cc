@@ -7372,6 +7372,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 				printf("[BREAK] Sending emergency BREAK pattern\n");
 				fflush(stdout);
+				// LINK-PHASE PRIMITIVE (increment 1): BREAK re-stages the sender -> owner
+				// CMD_KEYED; re-stamp the epoch from the (M6-requeue-rolled) bsi so any
+				// pre-break timeline stamp reads STALE. Write-only; no consumer reads it.
+				lp_note_break(cmd_batch_seq_id);
 				emergency_previous_config = current_configuration;
 				emergency_break_active = 1;
 				emergency_break_retries = 3;
@@ -7443,6 +7447,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				linkphase_ack_slot_wait_armed = false;
 				linkphase_ack_slot_miss_counted = false;
 			}
+			// LINK-PHASE PRIMITIVE (increment 1): the reverse ACK decoded / the batch delivered
+			// -> the CMD's slot closed, ownership back to TURNAROUND. Write-only; no consumer.
+			lp_note_ack_decoded();
 			// STAGE 4c: any delivery (clean OR partial) proves the link is NOT dead, so
 			// the commander true-loss floor streak resets UNGATED (symmetric with
 			// emergency_nack_count). Keeps the SESSION_DEAD_BATCHES BREAK reachable ONLY

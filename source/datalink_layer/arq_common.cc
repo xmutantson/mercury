@@ -1434,6 +1434,11 @@ cl_arq_controller::cl_arq_controller()
 	linkphase_pending_prev_flushed=0;      // SEAM-2 fire-proof counter
 	linkphase_last_kd_frames=0;
 	linkphase_last_kd_force_full=false;
+	// LINK-PHASE PRIMITIVE (increment 1): pre-init the shadow timeline to the NONE default
+	// (no consumer may act on an unpopulated timeline). config_gen persists across session
+	// resets; seed it 0 here at construction, then lp_reset() clears the timeline itself.
+	lp_config_gen=0;
+	lp_reset();
 	missed_ack_slots=0;
 	linkphase_ack_slot_wait_armed=false;
 	linkphase_ack_slot_miss_counted=false;
@@ -3306,6 +3311,10 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// stale — invalidate them here (RX-side; a harmless no-op on the CMD). Placed AFTER the
 	// no-change early-return so a redundant same-config load never touches them.
 	rx_stream_invalidate_stamps();
+	// LINK-PHASE PRIMITIVE (increment 1): a REAL config change bumps the epoch generation so
+	// every future timeline stamp is at the new geometry (placed AFTER the same-config early
+	// return so a redundant load never bumps). Write-only; no consumer reads it.
+	lp_note_config_switch();
 	// Held-rung burst coalescing: a REAL config change (FRAME-UP, demote, BREAK
 	// reload, connect-time load) restarts the held-rung probation. Placed HERE —
 	// after the same-config early-return, BEFORE the robust pin and the OFDM batch
@@ -9012,6 +9021,7 @@ void cl_arq_controller::reset_session_state()
 	for(int _s=0;_s<256;_s++) rx_stream_stamp[_s].valid=false;   // Option W CORE: parsed wire stamps
 	for(int _s=0;_s<256;_s++) tx_batch_span[_s]=0;   // LINK-PHASE STEP 2 (a): clear stale per-bsi spans on session reset
 	rx_buffer_retx_turn_tail=false;   // no per-frame boundary marker survives reset
+	lp_reset();   // LINK-PHASE PRIMITIVE (increment 1): fresh session -> timeline back to NONE
 	// Option W REBASE-SEAM: a fresh session anchors the byte cursor at 0 with no open
 	// seam. The counter is a monitoring statistic — reset per session for a clean count.
 	rsp_rebase_seam_armed = false;
@@ -12381,6 +12391,215 @@ void arq_turn_trace_emit_ack(const char* kind, unsigned bsi, int arrival_ms, int
 }
 // ========================== end MERCURY_TURN_TRACE ==========================
 
+// ===================== LINK-PHASE PRIMITIVE (increment 1) =====================
+// Producers for the shared channel-ownership timeline (lp_state). SHADOW-ONLY: every
+// function below only STORES into lp_state (a pure member write, no control-flow effect)
+// and, under the measure-only MERCURY_TURN_TRACE, prints one [LP_SHADOW_*] line. NO consumer
+// reads lp_state in this increment, so the built binary is byte-identical to stock. The two
+// log lines carry the per-bsi keydown length both sides derive; the shadow-agreement reducer
+// joins them by bsi and checks the directional over-wait / under-estimate meter
+// (mercury/fact-documents/data-flow-linkphase-primitive.md §5).
+long long cl_arq_controller::lp_now()
+{
+	return (long long)lp_clock.get_elapsed_time_ms();
+}
+
+uint32_t cl_arq_controller::lp_make_epoch(int bsi) const
+{
+	return ((uint32_t)lp_config_gen << 8) | ((uint32_t)(bsi & 0xFF));
+}
+
+void cl_arq_controller::lp_reset()
+{
+	lp_state.owner                = LP_NONE;
+	lp_state.owner_keydown_end_ms = 0;
+	lp_state.next_listen_open_ms  = 0;
+	lp_state.epoch                = 0;
+	lp_keydown_start_ms           = 0;
+	lp_last_rx_bsi                = -1;
+	lp_clock.start();
+}
+
+// CMD keydown START (PTT-on). owner -> CMD_KEYED, latch the start instant; the END instant is
+// COMMITTED at keydown END (co-located with the linkphase_last_kd latch) so it shares that
+// latch's reachability — the big-block early-return path skips BOTH, so the two never diverge.
+void cl_arq_controller::lp_note_keydown_start(int bsi)
+{
+	lp_state.owner      = LP_CMD_KEYED;
+	lp_keydown_start_ms = lp_now();
+	lp_state.epoch      = lp_make_epoch(bsi);
+}
+
+// CMD keydown END. Commit owner_keydown_end from the sample-exact keydown length; owner ->
+// TURNAROUND; next_listen_open = end + turnaround budget (READ from the RTO, never written
+// back). Logs the CMD-emitted keydown length per bsi (sample-exact + the arithmetic schedule
+// derivation) for the shadow-agreement join.
+void cl_arq_controller::lp_note_keydown_end(int bsi, int frames_region_len, int frames,
+	bool force_full)
+{
+	int kd_ms_exact = (int)(((long long)frames_region_len * 1000LL) / 48000LL);
+	int kd_ms_lever = derive_keydown_length_ms(frames, force_full);
+	lp_state.owner_keydown_end_ms = lp_keydown_start_ms + kd_ms_exact;
+	lp_state.owner                = LP_TURNAROUND;
+	int turnaround_budget = receiving_timeout - 2 * message_transmission_time_ms;
+	if(turnaround_budget < 0) turnaround_budget = 0;
+	lp_state.next_listen_open_ms = lp_state.owner_keydown_end_ms + turnaround_budget;
+	if(arq_turn_trace_on())
+	{
+		printf("[LP_SHADOW_CMD] bsi=%d retx=%d frames=%d cmd_kd_ms_exact=%d "
+			"cmd_kd_ms_lever=%d owner_keydown_end_ms=%lld next_listen_open_ms=%lld epoch=%u\n",
+			bsi, force_full ? 1 : 0, frames, kd_ms_exact, kd_ms_lever,
+			lp_state.owner_keydown_end_ms, lp_state.next_listen_open_ms, lp_state.epoch);
+		fflush(stdout);
+	}
+}
+
+// RX frame-0 D5 acquire of a NEW bsi. owner -> CMD_KEYED; derive the CMD's keydown length
+// arithmetically from the wired batch geometry (rx_effective_window(D5) frames through the SAME
+// schedule the TX drives) — the RX has no samples. Logs the RX-derived keydown length per bsi
+// for the shadow-agreement join. rx_effective_window returns data_batch_size on a short final
+// batch, so the RX derivation is the DESIGNED-conservative over-wait there (never SHORTER).
+void cl_arq_controller::lp_note_rx_frame0(int bsi, int d5_wire)
+{
+	int eff_window = rx_effective_window(d5_wire);
+	int rx_kd_ms   = derive_keydown_length_ms(eff_window, /*force_full=*/false);
+	lp_state.owner                = LP_CMD_KEYED;
+	lp_state.owner_keydown_end_ms = lp_now() + rx_kd_ms;
+	lp_state.epoch                = lp_make_epoch(bsi);
+	if(arq_turn_trace_on())
+	{
+		printf("[LP_SHADOW_RX] bsi=%d d5=%d eff_window=%d data_batch_size=%d "
+			"rx_kd_ms=%d owner_keydown_end_ms=%lld epoch=%u\n",
+			bsi, d5_wire, eff_window, data_batch_size, rx_kd_ms,
+			lp_state.owner_keydown_end_ms, lp_state.epoch);
+		fflush(stdout);
+	}
+}
+
+void cl_arq_controller::lp_note_rsp_key()
+{
+	lp_state.owner                = LP_RSP_KEYED;
+	lp_state.owner_keydown_end_ms = lp_now();  // reverse-ACK keydown; exact end not consumed in inc 1
+}
+
+void cl_arq_controller::lp_note_ack_decoded()
+{
+	lp_state.owner = LP_TURNAROUND;
+}
+
+void cl_arq_controller::lp_note_break(int bsi)
+{
+	lp_state.owner = LP_CMD_KEYED;
+	lp_state.epoch = lp_make_epoch(bsi);  // recovery re-stamp (bsi advanced by the break requeue)
+}
+
+void cl_arq_controller::lp_note_config_switch()
+{
+	lp_config_gen++;  // new config generation -> every future epoch stamp bumps
+}
+
+// Directed in-process unit for the increment-1 shadow primitive. Synthetic-fires the
+// PRODUCTION producers (lp_note_*) on a throwaway controller with a deterministic legacy
+// geometry (telecom_system NULL => derive_keydown_length_ms(n) == n*message_transmission_time_ms),
+// and asserts: the pre-init owner==NONE guard; the owner ordering at every transition; the
+// DIRECTIONAL meter (RX-derived >= CMD-emitted = SAFE over-wait); the intended short-batch
+// clamp classifying as SAFE (not a desync); the FAIL-BEFORE that a SHORTENING derivation IS
+// flagged an under-estimate; and the epoch bump on config-switch and BREAK. No IONOS/RF.
+int cl_arq_controller::test_linkphase_shadow()
+{
+	int fails = 0;
+	telecom_system = NULL;                 // deterministic legacy derive: derive(n)==n*mtt
+	message_transmission_time_ms = 500;    // per-frame airtime
+	data_batch_size = 10;                  // RX conservative window floor
+	sack_v2_enabled = true;                // D5 + rx_effective_window widening are sack_v2-only
+
+	// ARM 0 — pre-init: the timeline defaults to NONE (no consumer may act on it).
+	lp_reset();
+	if(lp_state.owner != LP_NONE || lp_state.owner_keydown_end_ms != 0
+	   || lp_state.next_listen_open_ms != 0 || lp_state.epoch != 0)
+	{
+		printf("[TEST-LP-SHADOW] FAIL: pre-init timeline not NONE/0 (owner=%d)\n",
+			(int)lp_state.owner); fails++;
+	}
+	else printf("[TEST-LP-SHADOW] PASS: pre-init owner==LP_NONE, instants/epoch 0 "
+		"(unpopulated-timeline guard)\n");
+
+	// ARM 1 — synthetic-fire the CMD keydown producers at a KNOWN geometry.
+	// A 10-frame keydown; frames_region_len chosen so kd_ms_exact == 10*500 == 5000 ms:
+	//   frames_region_len = 5000*48000/1000 = 240000 samples.
+	lp_note_keydown_start(/*bsi=*/5);
+	if(lp_state.owner != LP_CMD_KEYED)
+	{ printf("[TEST-LP-SHADOW] FAIL: keydown-START owner!=CMD_KEYED\n"); fails++; }
+	lp_note_keydown_end(/*bsi=*/5, /*frames_region_len=*/240000, /*frames=*/10,
+		/*force_full=*/false);
+	if(lp_state.owner != LP_TURNAROUND)
+	{ printf("[TEST-LP-SHADOW] FAIL: keydown-END owner!=TURNAROUND\n"); fails++; }
+	int cmd_kd = 5000;   // the CMD sample-exact keydown length just committed
+	// RX derives the SAME keydown from D5=10 (a full batch) through the SAME schedule.
+	lp_note_rx_frame0(/*bsi=*/5, /*d5=*/10);          // production producer fires
+	if(lp_state.owner != LP_CMD_KEYED)
+	{ printf("[TEST-LP-SHADOW] FAIL: rx-frame0 owner!=CMD_KEYED\n"); fails++; }
+	int rx_full = derive_keydown_length_ms(rx_effective_window(10), false);   // == 5000
+#ifdef LINKPHASE_SHADOW_FAILBEFORE
+	rx_full -= 1000;   // inject a SHORTENING so the RX would close before the CMD keydown ends;
+	                   // the SAFE assertion below MUST catch it (proves the meter has teeth).
+#endif
+	if(rx_full < cmd_kd)
+	{ printf("[TEST-LP-SHADOW] FAIL: full-batch RX(%d) < CMD(%d) = under-estimate\n",
+		rx_full, cmd_kd); fails++; }
+	else printf("[TEST-LP-SHADOW] PASS: full-batch RX-derived(%d) >= CMD-emitted(%d) (SAFE)\n",
+		rx_full, cmd_kd);
+
+	// ARM 2 — intended SHORT-BATCH CLAMP registers as SAFE over-wait, NOT a desync.
+	// CMD keyed a 3-frame final batch (cmd=1500); the RX has no samples and
+	// rx_effective_window(D5=3) returns data_batch_size=10 -> derive=5000 >> 1500 = over-wait.
+	int cmd_short = 3 * message_transmission_time_ms;                  // 1500
+	int rx_clamped = derive_keydown_length_ms(rx_effective_window(3), false);  // eff=10 -> 5000
+	bool clamp = rx_effective_window(3) > 3;
+	if(rx_clamped >= cmd_short && clamp)
+		printf("[TEST-LP-SHADOW] PASS: short-batch clamp RX(%d)>=CMD(%d), eff_window(%d)>d5(3) "
+			"= SAFE over-wait, NOT a desync\n", rx_clamped, cmd_short, rx_effective_window(3));
+	else { printf("[TEST-LP-SHADOW] FAIL: short-batch clamp misclassified "
+		"(rx=%d cmd=%d eff=%d)\n", rx_clamped, cmd_short, rx_effective_window(3)); fails++; }
+
+	// ARM 3 (FAIL-BEFORE) — a SHORTENING derivation IS flagged an UNDER-estimate by the meter.
+	// (The production rx_effective_window can only clamp UP, never shorter, so no production
+	// input produces this; this arm proves the meter is not vacuously passing.)
+	int cmd_true = 12 * message_transmission_time_ms;   // CMD keyed 12 frames = 6000
+	int rx_under = derive_keydown_length_ms(8, true);   // a hypothetical 8-frame derivation = 4000
+	if(rx_under < cmd_true)
+		printf("[TEST-LP-SHADOW] PASS(fail-before): a SHORTENING RX derivation (%d < CMD %d) "
+			"IS flagged UNDER-estimate\n", rx_under, cmd_true);
+	else { printf("[TEST-LP-SHADOW] FAIL: under-estimate predicate did not fire "
+		"(rx=%d cmd=%d)\n", rx_under, cmd_true); fails++; }
+
+	// ARM 4 — RSP key + ACK-decoded owner ordering (producers fire at every transition).
+	lp_note_rsp_key();
+	if(lp_state.owner != LP_RSP_KEYED)
+	{ printf("[TEST-LP-SHADOW] FAIL: rsp-key owner!=RSP_KEYED\n"); fails++; }
+	lp_note_ack_decoded();
+	if(lp_state.owner != LP_TURNAROUND)
+	{ printf("[TEST-LP-SHADOW] FAIL: ack-decoded owner!=TURNAROUND\n"); fails++; }
+
+	// ARM 5 — epoch bumps on CONFIG-SWITCH and BREAK (staleness detection substrate).
+	uint32_t ep_before = lp_make_epoch(5);
+	lp_note_config_switch();                     // config_gen++
+	uint32_t ep_after_cfg = lp_make_epoch(5);
+	if(ep_after_cfg == ep_before)
+	{ printf("[TEST-LP-SHADOW] FAIL: config-switch did not bump epoch\n"); fails++; }
+	else printf("[TEST-LP-SHADOW] PASS: config-switch bumped epoch %u -> %u\n",
+		ep_before, ep_after_cfg);
+	lp_note_break(9);                            // owner=CMD_KEYED, epoch re-stamped at new bsi
+	if(lp_state.owner != LP_CMD_KEYED || (lp_state.epoch & 0xFF) != 9)
+	{ printf("[TEST-LP-SHADOW] FAIL: BREAK re-stage (owner=%d epoch_bsi=%u)\n",
+		(int)lp_state.owner, lp_state.epoch & 0xFF); fails++; }
+	else printf("[TEST-LP-SHADOW] PASS: BREAK re-stage owner==CMD_KEYED, epoch bsi=9\n");
+
+	printf("[TEST-LP-SHADOW] %s (fails=%d)\n", fails == 0 ? "ALL PASS" : "FAILURES", fails);
+	return fails;
+}
+// =================== end LINK-PHASE PRIMITIVE (increment 1) ===================
+
 void cl_arq_controller::send_batch()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
@@ -12449,6 +12668,10 @@ void cl_arq_controller::send_batch()
 	telecom_system->data_container.rx_mute = 1;
 
 	ptt_on();
+	// LINK-PHASE PRIMITIVE (increment 1): this side is keying a DATA batch -> owner CMD_KEYED.
+	// The END instant is committed at keydown END (co-located with the linkphase_last_kd latch).
+	lp_note_keydown_start(message_batch_counter_tx > 0
+		? messages_batch_tx[0].batch_seq_id : cmd_batch_seq_id);
 
 	cl_timer ptt_on_delay, ptt_off_delay;
 	ptt_on_delay.start();
@@ -13009,6 +13232,12 @@ void cl_arq_controller::send_batch()
 	// per-frame constant. Behavior-neutral write (read only under the STEP-2 flag, raise-only).
 	linkphase_last_kd_frames     = message_batch_counter_tx;
 	linkphase_last_kd_force_full = batch_force_full;
+	// LINK-PHASE PRIMITIVE (increment 1): commit the keydown-END timeline HERE, co-located with
+	// the latch above so it shares that latch's reachability (both skip the big-block early
+	// return). frames_region_len is the sample-exact emitted-DATA length of this keydown.
+	lp_note_keydown_end(
+		message_batch_counter_tx > 0 ? messages_batch_tx[0].batch_seq_id : cmd_batch_seq_id,
+		frames_region_len, message_batch_counter_tx, batch_force_full);
 
 	// MERCURY_TURN_TRACE (measure-only, off by default): snapshot the sample-exact
 	// self_keydown_end here — frames_region_len = Sum(frame_len[i]) is the exact
@@ -14296,6 +14525,9 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 		return 0;
 	}
+	// LINK-PHASE PRIMITIVE (increment 1): the RSP is committing to key its reverse ACK here ->
+	// owner RSP_KEYED. Write-only; no consumer reads it.
+	lp_note_rsp_key();
 
 	auto t_start = std::chrono::steady_clock::now();
 
@@ -17759,6 +17991,14 @@ void cl_arq_controller::receive()
 							rx_buffer_batch_total_frames = (btf > 0) ? btf : -1;
 							rx_buffer_retx_turn_tail =
 								retx_turn_tail_on() && d5_retx_turn_tail(d5);
+							// LINK-PHASE PRIMITIVE (increment 1): on the FIRST frame of a NEW bsi,
+							// log the RX-derived keydown length so the shadow-agreement reducer can
+							// compare it to the CMD-emitted length. Write-only; no consumer reads it.
+							if(bsi != lp_last_rx_bsi)
+							{
+								lp_last_rx_bsi = bsi;
+								lp_note_rx_frame0(bsi, btf);
+							}
 						}
 					}
 					else
@@ -17830,6 +18070,14 @@ void cl_arq_controller::receive()
 							rx_buffer_batch_total_frames = (btf > 0) ? btf : -1;
 							rx_buffer_retx_turn_tail =
 								retx_turn_tail_on() && d5_retx_turn_tail(d5);
+							// LINK-PHASE PRIMITIVE (increment 1): on the FIRST frame of a NEW bsi,
+							// log the RX-derived keydown length so the shadow-agreement reducer can
+							// compare it to the CMD-emitted length. Write-only; no consumer reads it.
+							if(bsi != lp_last_rx_bsi)
+							{
+								lp_last_rx_bsi = bsi;
+								lp_note_rx_frame0(bsi, btf);
+							}
 						}
 					}
 					else
