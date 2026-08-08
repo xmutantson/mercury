@@ -1729,19 +1729,27 @@ void cl_arq_controller::rescan_prev_on_batch_shrink(int new_batch)
 	int old_batch = this->data_batch_size;
 	if(new_batch >= old_batch) return;   // only SHRINK strands the prev path
 
-	// Recompute received_count within the new (smaller) bound, and detect
-	// already-RECEIVED slots that the new bound orphans in [new_batch, old_batch).
-	int new_received = 0;
-	for(int i = 0; i < new_batch && i < this->nMessages; i++)
-		if(messages_rx_prev[i].status == RECEIVED) new_received++;
-	int orphaned_received = 0;
-	for(int i = new_batch; i < old_batch && i < this->nMessages; i++)
-		if(messages_rx_prev[i].status == RECEIVED) orphaned_received++;
-
+	// Reseat-integrity companion (data-flow-messages_rx_prev.md §4.5 CORRECTION): compute the
+	// new DELIVERY window first, then recompute received_count over [0, new_expected) — the same
+	// honest-count-equals-delivery-window invariant the seal/refill producers restore. Counting
+	// over [0, new_batch) could credit a RECEIVED slot in [new_expected, new_batch) that the
+	// clamped delivery window excludes. Byte-identical when new_expected == new_batch (the common
+	// case; new_expected only drops below new_batch when the frozen expected already was). Latent
+	// for the reseat cell (data_batch_size never SHRANK there — the batch was short-FILLED), but
+	// kept consistent so an Axis-2 down-move / robust-revert cannot re-open the divergence.
 	int old_expected = rsp_prev_batch_expected_count;
 	int new_expected = old_expected;
 	if(new_expected > new_batch) new_expected = new_batch;
 	if(new_expected < 1)         new_expected = 1;
+
+	int new_received = 0;
+	for(int i = 0; i < new_expected && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) new_received++;
+	// Orphaned = RECEIVED slots the new DELIVERY window drops (in [new_expected, old_batch));
+	// these can no longer be delivered intact, so they trigger the streaming defense below.
+	int orphaned_received = 0;
+	for(int i = new_expected; i < old_batch && i < this->nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED) orphaned_received++;
 
 	// If RECEIVED prev data is orphaned beyond the new bound, the prev batch can
 	// no longer be delivered intact. Fire the streaming defense (same guard +
@@ -6521,6 +6529,39 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 		   && rsp_prev_batch_expected_count > 0
 		   && rsp_prev_batch_expected_count < prev_delivery_window)
 			prev_delivery_window = rsp_prev_batch_expected_count;
+	}
+	// FIX (a) loud detector — pre-deliver non-FREE assertion (data-flow-messages_rx_prev.md §4.5
+	// CORRECTION). With the honest completion count (== RECEIVED slots in the delivery window),
+	// received >= expected already IMPLIES every slot in [0, prev_delivery_window) is non-FREE.
+	// Assert it here so a HOLE (a FREE slot inside the delivery window whose completion count was
+	// satisfied by an out-of-window strand) becomes a LOUD withhold, never a silent short/holed
+	// delivery. On violation: withhold — restore the pointer, leave the prev RECEIVED + active so
+	// the CMD ACK-timeout refills (COMPLETE-or-LOUD). Byte-identical when the window is intact
+	// (the shipped default with the count fix on). MERCURY_W_PREVCOUNT_DEFEAT=1 disables it (the
+	// fail-before arm — the pre-fix silent holed delivery on the SAME binary).
+	{
+		bool w_prevcount_defeat = false;
+		{ const char* e = std::getenv("MERCURY_W_PREVCOUNT_DEFEAT");
+		  if(e && *e && atoi(e)!=0) w_prevcount_defeat = true; }
+		if(!w_prevcount_defeat)
+		{
+			int hole = -1;
+			for(int i=0; i<prev_delivery_window && i<this->nMessages; i++)
+				if(messages_rx[i].status == FREE) { hole = i; break; }
+			if(hole >= 0)
+			{
+				printf("[RSP-V2-PREV-HOLE-WITHHOLD] prev_batch_seq_id=%d received=%d/%d has a FREE "
+					"slot at %d inside the delivery window [0,%d) — withholding (the completion "
+					"count was satisfied out-of-window); keeping prev RECEIVED for retx, delivering "
+					"0 bytes (COMPLETE-or-LOUD).\n",
+					rsp_prev_batch_seq_id, rsp_prev_batch_received_count,
+					rsp_prev_batch_expected_count, hole, prev_delivery_window);
+				fflush(stdout);
+				messages_rx        = saved_rx;
+				batch_data_delivered = saved_data_delivered;
+				return 0;   // do NOT deliver a holed prev; leave it active for SACK refill
+			}
+		}
 	}
 	for(int i=0; i<prev_delivery_window && i<this->nMessages; i++)
 		if(messages_rx[i].status == RECEIVED)
@@ -13884,18 +13925,31 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	// guard this can no longer happen; this assertion is a regression alarm that turns a
 	// silent tail-drop into a diagnosable [RSP-V2-SEAL-ORPHAN] event. Log-only (delivery
 	// unchanged) so it can never itself regress the data plane.
+	// Reseat-integrity widen (data-flow-messages_rx_prev.md §4.5 CORRECTION): scan from
+	// prev_expected (the genuine DELIVERY window), NOT data_batch_size. The old [data_batch_size,
+	// nMessages) bound was blind to a RECEIVED slot in the GAP [prev_expected, data_batch_size)
+	// — the cross-storage index-skew strand (a frame whose wire id skewed it past the true span
+	// while data_batch_size sat stale-large) — and it FALSE-warned on the legitimate res_c3100
+	// widen tail [data_batch_size, xfer_win) (which prev_expected == xfer_win excludes). The
+	// transfer below delivers [0, prev_expected); any RECEIVED source slot at index >= prev_expected
+	// is a real in-order frame this seal will strand (gap-slot skew below data_batch_size, OR a
+	// mid-flight-shrink orphan beyond xfer_win). Log-only (delivery unchanged) so it can never
+	// itself regress the data plane; the count fix (below) + the funnel span-gate PREVENT the
+	// strand from delivering short.
 	if(messages_rx != NULL)
 	{
 		int stranded = 0, hi = -1;
-		for(int i = this->data_batch_size; i < this->nMessages; i++)
+		for(int i = prev_expected; i < this->nMessages; i++)
 			if(messages_rx[i].status == RECEIVED) { stranded++; hi = i; }
 		if(stranded > 0)
 		{
 			printf("[RSP-V2-SEAL-ORPHAN] WARNING: sealing bsi=%d with %d RECEIVED "
-				"current-batch slot(s) stranded beyond data_batch_size=%d (highest=%d) — "
-				"a mid-flight shrink orphaned real in-order bytes (would silently truncate "
-				"the delivered stream). Investigate defer_shrink_if_would_orphan_prev.\n",
-				rsp_current_expected_batch_seq_id, stranded, this->data_batch_size, hi);
+				"current-batch slot(s) stranded beyond prev_expected=%d (data_batch_size=%d "
+				"highest=%d) — a cross-storage index skew or a mid-flight shrink orphaned real "
+				"in-order bytes (would silently truncate the delivered stream). Investigate "
+				"the wire id assignment / defer_shrink_if_would_orphan_prev.\n",
+				rsp_current_expected_batch_seq_id, stranded, prev_expected,
+				this->data_batch_size, hi);
 			fflush(stdout);
 		}
 	}
@@ -13920,6 +13974,21 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 	// here (reset below). prev_expected already tracks this widened span (via :10839).
 	int xfer_win = rx_effective_window(rx_batch_total_frames);
 	if(xfer_win > this->nMessages) xfer_win = this->nMessages;
+	// FIX (a) producer 1 — honest completion count = DELIVERY window (data-flow-messages_rx_prev.md
+	// §4.5 CORRECTION). Count xferred_received ONLY over [0, prev_expected) (the window the prev
+	// will actually DELIVER), NOT over [0, xfer_win) (the wider STORE window). Byte-identical when
+	// prev_expected == xfer_win (the normal D5==data_batch_size case AND the res_c3100 widen where
+	// prev_expected == rx_batch_total_frames == xfer_win). It ONLY changes the D5 < data_batch_size
+	// short-fill/skew case: a RECEIVED slot in the gap [prev_expected, xfer_win) (a wire-id skew
+	// past the true span while data_batch_size sat stale-large) is TRANSFERRED (memcpy below, so a
+	// genuine widened tail is never dropped) but NOT counted — so the completion count can no longer
+	// be satisfied by a slot that the delivery window excludes, and the batch HOLDS (SACK-recovered)
+	// instead of sealing "complete" with an empty head position -> a silent short delivery.
+	// MERCURY_W_PREVCOUNT_DEFEAT=1 restores the store-window count (the fail-before arm on the SAME
+	// binary; reproduces the deletion deterministically).
+	bool w_prevcount_defeat = false;
+	{ const char* e = std::getenv("MERCURY_W_PREVCOUNT_DEFEAT");
+	  if(e && *e && atoi(e)!=0) w_prevcount_defeat = true; }
 	for(int i=0; i<xfer_win; i++)
 	{
 		messages_rx_prev[i].type   = messages_rx[i].type;
@@ -13932,7 +14001,8 @@ void cl_arq_controller::bump_bsi_and_transfer_prev()
 			memcpy(messages_rx_prev[i].data, messages_rx[i].data,
 				messages_rx[i].length);
 		}
-		if(messages_rx[i].status == RECEIVED) xferred_received++;
+		if(messages_rx[i].status == RECEIVED
+		   && (w_prevcount_defeat || i < prev_expected)) xferred_received++;
 		xferred++;
 		// Free the source slot so the current-batch (N+1) frames land
 		// into a clean messages_rx[].
@@ -13985,13 +14055,25 @@ bool cl_arq_controller::rsp_resend_prev_partial_sack()
 	if(!(sack_v2_enabled && rsp_prev_batch_active && rsp_prev_batch_seq_id >= 0))
 		return false;
 
-	// Option B' completeness (data-flow-batch-size.md §9): span the SACK bitmap over the
-	// EFFECTIVE (possibly widened) prev window, NOT the stale data_batch_size — a res_c3100
-	// widened prev that is still PARTIAL must re-request its tail slots [data_batch_size, D5)
-	// or the CMD never re-drives them and the widened prev can never complete (LOSS-CLASS
-	// prevention: the lossy-channel sibling of the on-air withhold). == data_batch_size when
-	// not widened (byte-identical). rsp_prev_batch_expected_count carries the widened count.
-	int sack_win = rx_effective_window(rsp_prev_batch_expected_count);
+	// Span the SACK bitmap over the genuine DELIVERY window rsp_prev_batch_expected_count, NOT
+	// rx_effective_window() of it. rx_effective_window never narrows below data_batch_size, so on
+	// a short-fill (D5 < data_batch_size) it RE-WIDENS the window back to the stale-large
+	// data_batch_size — and a RECEIVED gap slot in [prev_expected, data_batch_size) (a wire-id
+	// skew) then advertises as a FILLED sequence position, so the CMD keeps SUPPRESSING the real
+	// head frames it maps there and the prev can never honestly refill (the reseat-integrity
+	// companion, data-flow-messages_rx_prev.md §4.5 CORRECTION). Byte-identical for every non-
+	// short-fill case: when not widened prev_expected == data_batch_size, and for a res_c3100
+	// widen prev_expected == rx_batch_total_frames == rx_effective_window(prev_expected), so the
+	// widened tail slots [data_batch_size, D5) are STILL re-requested (Option B' completeness,
+	// data-flow-batch-size.md §9). Only the short-fill window shrinks 40 -> 38, advertising the
+	// true holes. MERCURY_W_PREVCOUNT_DEFEAT=1 restores the re-widened window (fail-before parity).
+	bool w_prevcount_defeat = false;
+	{ const char* e = std::getenv("MERCURY_W_PREVCOUNT_DEFEAT");
+	  if(e && *e && atoi(e)!=0) w_prevcount_defeat = true; }
+	int sack_win = w_prevcount_defeat
+		? rx_effective_window(rsp_prev_batch_expected_count)
+		: rsp_prev_batch_expected_count;
+	if(sack_win < 1) sack_win = 1;
 	if(sack_win > MAX_SACK_BATCH_SIZE) sack_win = MAX_SACK_BATCH_SIZE;
 	bool sack_bitmap[MAX_SACK_BATCH_SIZE];
 	for(int i=0; i<MAX_SACK_BATCH_SIZE; i++)
@@ -19223,8 +19305,24 @@ bool cl_arq_controller::w_bytegate_shortfall(int wbsi, struct st_message* arr, i
 	int b = wbsi & 0xFF;
 	if(!rx_stream_stamp[b].valid || rx_stream_stamp[b].length == 0) return false;
 	int w = win;
-	if(w < this->data_batch_size) w = this->data_batch_size;   // never narrow below the stale size
-	if(w > this->nMessages)       w = this->nMessages;
+	// FIX (b) part 2 — sum DELIVERED bytes over the ACTUAL caller window, NOT re-widened up to
+	// data_batch_size (data-flow-messages_rx_prev.md §4.5 CORRECTION). The old floor
+	// (if w < data_batch_size w = data_batch_size) is exactly why this wire-stamp gate was INERT
+	// on the short-fill reseat cell: the growth-clamped PREV gate passes win = prev_expected (38),
+	// but the floor re-widened the sum window back to the stale-large data_batch_size (40) and
+	// swept the RECEIVED gap slots (38,39) into the total -> delivered_bytes == stamp.length ->
+	// false PASS. Summing over the genuine delivery window makes the gate WITHHOLD a short PREV.
+	// Byte-identical for every OTHER caller: the 1-/2-arg entries and the in-order ACK-GATE pass
+	// win == data_batch_size (floor is a no-op), and a res_c3100 widen passes win > data_batch_size
+	// (floor already inert). Only a sub-data_batch_size PREV window (the short-fill) changes, and
+	// only to detect a shortfall the old floor masked. MERCURY_W_SPANGATE_DEFEAT=1 restores the
+	// re-widen floor (the fail-before arm on the SAME binary).
+	bool w_spangate_defeat = false;
+	{ const char* e = std::getenv("MERCURY_W_SPANGATE_DEFEAT");
+	  if(e && *e && atoi(e)!=0) w_spangate_defeat = true; }
+	if(w_spangate_defeat && w < this->data_batch_size) w = this->data_batch_size;
+	if(w < 1)               w = 1;
+	if(w > this->nMessages) w = this->nMessages;
 	int delivered_bytes = 0;
 	for(int i=0; i<w; i++)
 		if(arr[i].status==RECEIVED || arr[i].status==ACKED)
@@ -19339,6 +19437,54 @@ void cl_arq_controller::copy_data_to_buffer()
 		cw = this->rx_copy_window;
 		if(cw > this->nMessages) cw = this->nMessages;
 	}
+
+	// FIX (b) part 1 — the pre-delivery byte-SPAN STRAND GATE (data-flow-messages_rx_prev.md
+	// §4.5 CORRECTION). This is the SINGLE receiver delivery funnel: all emit routes + both
+	// prev paths reach it. The reassembler below delivers ACKED slots over [0, cw) and then FREEs
+	// [cw, nMessages). If any RECEIVED|ACKED slot sits OUTSIDE the delivery window [0, cw), the
+	// batch was CREDITED for its bytes (the completion count) but they will be FREEd UNDELIVERED
+	// — a clean deletion (the cross-storage index-skew strand: a frame whose wire id skewed it
+	// into the gap [prev_expected, store_win) while data_batch_size sat stale-large). Self-
+	// consistent + stamp-independent (covers robust / cfg0). PRECISE: it diverges IFF a RECEIVED
+	// slot lies outside the delivery window, which happens ONLY under the gap-slot pathology —
+	// a healthy batch and a res_c3100 widen leave [D5, store_win) FREE, so it never false-fires
+	// (regression arms: the healthy + widen deliveries in test_reseat_span, byte-identical). On a
+	// strand: REFUSE before client delivery via the shared rsp_gap_abort_teardown contract
+	// (COMPLETE-or-LOUD at the FIRST divergent byte, not ~1.6 batches late like the positional
+	// backstop). The refuse+refill FIRST discipline lives one gate up (the PREV byte-gate at
+	// arq_responder.cc withholds + keeps the prev RECEIVED for retx); this funnel gate is the
+	// shared last-resort abort for a strand that reaches delivery. Composes with the DEDUP / seam
+	// / stream-shift / D3.1 guards on a DISJOINT trigger. MERCURY_W_SPANGATE_DEFEAT=1 restores the
+	// pre-fix silent short delivery (the fail-before arm on the SAME binary).
+	if(messages_rx != NULL)
+	{
+		bool w_spangate_defeat = false;
+		{ const char* e = std::getenv("MERCURY_W_SPANGATE_DEFEAT");
+		  if(e && *e && atoi(e)!=0) w_spangate_defeat = true; }
+		if(!w_spangate_defeat)
+		{
+			long long strand_bytes = 0; int strand_hi = -1, strand_n = 0;
+			for(int i = cw; i < this->nMessages; i++)
+				if(messages_rx[i].status == RECEIVED || messages_rx[i].status == ACKED)
+				{ strand_bytes += messages_rx[i].length; strand_hi = i; strand_n++; }
+			if(strand_bytes > 0)
+			{
+				long long deliver_span = 0;
+				for(int i = 0; i < cw && i < this->nMessages; i++)
+					if(messages_rx[i].status == ACKED) deliver_span += messages_rx[i].length;
+				printf("[RSP-V2-PREV-SPAN-REFUSE] bsi=%d cw=%d deliver_span=%lld would strand %d "
+					"RECEIVED slot(s) = %lld byte(s) beyond the delivery window (highest=%d) — a "
+					"cross-storage index-skew credited bytes it will not deliver; refusing before "
+					"the short delivery (COMPLETE-or-LOUD).\n",
+					decrypt_delivered_bsi & 0xFF, cw, deliver_span, strand_n,
+					strand_bytes, strand_hi);
+				fflush(stdout);
+				rsp_gap_abort_teardown("Option W span-gate: RECEIVED bytes stranded outside the delivery window");
+				return;   // do NOT deliver a batch that was credited for undelivered bytes
+			}
+		}
+	}
+
 	// Option W (data-flow-stream-offset.md §2.3): total TRANSPORTED bytes this delivery
 	// reassembled + delivered = Σ ACKED messages_rx[i].length for i<data_batch_size. The
 	// SAME quantity the sender committed (INV5). Advances rx_stream_delivered at

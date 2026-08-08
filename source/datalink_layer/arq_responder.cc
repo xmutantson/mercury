@@ -1185,8 +1185,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 						}
 						messages_rx_prev[loc].status = RECEIVED;
 						messages_rx_prev[loc].batch_seq_id = messages_rx_buffer.batch_seq_id;
-						if(prev_status != RECEIVED && prev_status != ACKED)
-							rsp_prev_batch_received_count++;
+						bool prev_was_fresh = (prev_status != RECEIVED && prev_status != ACKED);
 						// D5: a prev-routed frame carries the PREV batch's authoritative
 						// frame count. If the prev was armed with an EOB-INFERRED (too
 						// short) expected_count because the original EOB frame was lost,
@@ -1197,6 +1196,12 @@ void cl_arq_controller::process_messages_rx_data_control()
 						// dropping it. Clamp to [received_count, data_batch_size]: never
 						// shrink below what we already hold, never exceed the storage
 						// bound. Gated off under MERCURY_D5_INFER_DEFEAT (fail-before).
+						// Reseat-integrity ordering (data-flow-messages_rx_prev.md §4.5
+						// CORRECTION): this re-derivation runs BEFORE the count bump below,
+						// so a fresh frame that arrives at a loc the short EOB-inference had
+						// excluded is credited within the just-GROWN delivery window (it
+						// would otherwise be dropped by FIX (a) producer 2's loc<expected
+						// gate on the lost-EOB grow path).
 						if(rsp_prev_batch_active && rx_buffer_batch_total_frames > 0)
 						{
 							bool d5_infer_defeat = false;
@@ -1225,6 +1230,26 @@ void cl_arq_controller::process_messages_rx_data_control()
 									rsp_prev_batch_expected_count = wired;
 								}
 							}
+						}
+						// FIX (a) producer 2 — honest completion count = DELIVERY window
+						// (data-flow-messages_rx_prev.md §4.5 CORRECTION). Bump received_count
+						// ONLY when this fresh slot is INSIDE the delivery window
+						// [0, prev_expected). The store above already accepted loc over the
+						// wider store window (rx_effective_window), so without this gate a
+						// wire-id skew that lands a frame in the gap [prev_expected,
+						// store_win) would over-credit the completion count and seal a
+						// short-delivering "complete" batch. prev_expected is the true batch
+						// span (the wired D5 count, just re-derived above), so this is
+						// byte-identical whenever the store window equals the delivery window
+						// (every non-short-fill case). MERCURY_W_PREVCOUNT_DEFEAT=1 restores
+						// the store-window count (the fail-before arm on the SAME binary).
+						{
+							bool w_prevcount_defeat = false;
+							{ const char* e = std::getenv("MERCURY_W_PREVCOUNT_DEFEAT");
+							  if(e && *e && atoi(e)!=0) w_prevcount_defeat = true; }
+							if(prev_was_fresh
+							   && (w_prevcount_defeat || loc < rsp_prev_batch_expected_count))
+								rsp_prev_batch_received_count++;
 						}
 
 						printf("[RSP-V2-PREV-RX] bsi=%d id=%d seq=%d/%d len=%d "
@@ -1394,7 +1419,42 @@ void cl_arq_controller::process_messages_rx_data_control()
 									prev_byte_withheld = true;
 								}
 							}
-							if(!prev_gap_aborted && !prev_byte_withheld) {
+							// FIX (a) loud detector — pre-deliver non-FREE assertion
+							// (data-flow-messages_rx_prev.md §4.5 CORRECTION). With the honest
+							// completion count (== RECEIVED slots in the delivery window),
+							// received >= expected IMPLIES every slot in [0, prev_eff_window) is
+							// non-FREE. Assert it so a HOLE (a FREE slot inside the delivery window
+							// whose count was satisfied by an out-of-window strand) becomes a LOUD
+							// withhold, never a silent short/holed delivery — keep the prev RECEIVED
+							// + active for the CMD ACK-timeout refill (COMPLETE-or-LOUD). Byte-
+							// identical when the window is intact (the count fix keeps it so).
+							// MERCURY_W_PREVCOUNT_DEFEAT=1 disables it (the fail-before arm).
+							bool prev_hole_withheld = false;
+							if(!prev_gap_aborted && !prev_byte_withheld)
+							{
+								bool w_prevcount_defeat = false;
+								{ const char* e = std::getenv("MERCURY_W_PREVCOUNT_DEFEAT");
+								  if(e && *e && atoi(e)!=0) w_prevcount_defeat = true; }
+								if(!w_prevcount_defeat)
+								{
+									int hole = -1;
+									for(int i=0; i<prev_eff_window && i<this->nMessages; i++)
+										if(messages_rx_prev[i].status == FREE) { hole = i; break; }
+									if(hole >= 0)
+									{
+										printf("[RSP-V2-PREV-HOLE-WITHHOLD] prev_batch_seq_id=%d "
+											"received=%d/%d has a FREE slot at %d inside the delivery "
+											"window [0,%d) — withholding (count satisfied out-of-"
+											"window); keeping prev RECEIVED for retx, delivering 0 "
+											"bytes (COMPLETE-or-LOUD).\n",
+											rsp_prev_batch_seq_id, rsp_prev_batch_received_count,
+											rsp_prev_batch_expected_count, hole, prev_eff_window);
+										fflush(stdout);
+										prev_hole_withheld = true;
+									}
+								}
+							}
+							if(!prev_gap_aborted && !prev_byte_withheld && !prev_hole_withheld) {
 							if(compressor.is_streaming() && batch_data_delivered) {
 								// V1 defense: out-of-order prev-batch delivery would desync the
 								// streaming PPMd model. Current batch already committed; prev-batch
@@ -5488,6 +5548,73 @@ int cl_arq_controller::test_reseat_span()
 	int d_widen = run_scenario(/*pc*/false, /*sg*/false, 40, 44, 0);
 	check(d_widen == WIDEN_FULL, "WIDEN (res_c3100 D5>dbs) delivers in FULL (no false-fire)",
 		d_widen, WIDEN_FULL);
+
+	// ARM 7 — FIX (a) loud detector: the pre-deliver non-FREE hole-withhold. A dishonestly-
+	// complete prev (received == expected, but a FREE slot INSIDE the delivery window whose count
+	// was satisfied out-of-window) is a HOLE the honest count fix already prevents; this asserts
+	// the belt-and-suspenders detector turns it into a LOUD withhold rather than a silent holed
+	// delivery. Poked count (fix (a) makes this state unreachable in normal flow) driven through
+	// the PRODUCTION deliver_complete_inflight_before_break; no strand (slots 38/39 FREE) so the
+	// span-gate stays inert and the hole detector is isolated. defeat=1 delivers the hole (5969),
+	// defeat=0 withholds (0) — the in-binary fail-before/pass-after for the detector.
+	auto run_hole_scenario = [&](bool pc_defeat) -> int {
+		set_env("MERCURY_W_PREVCOUNT_DEFEAT", pc_defeat ? "1" : "");
+		set_env("MERCURY_W_SPANGATE_DEFEAT",  "");   // span-gate ON; no strand -> inert
+		this->nMessages          = 255;
+		this->max_data_length    = 170;
+		this->max_message_length = 200;
+		this->max_header_length  = 6;
+		if(init_messages_buffers() != SUCCESSFUL) { check(false, "init_messages_buffers(hole)", 0, 1); return -1; }
+		this->fifo_buffer_rx.set_size(262144);
+		this->fifo_buffer_rx.flush();
+		this->sack_v2_enabled                   = true;
+		this->sack_enabled                      = true;
+		this->axis3_sack_mode                   = 1;
+		this->compression_enabled               = false;
+		this->header_carries_d5                 = true;
+		this->passive_monitor                   = false;
+		this->link_status                       = CONNECTED;
+		this->connection_status                 = RECEIVING;
+		this->inband_rate_enabled               = 1;
+		this->data_batch_size                   = 40;
+		this->batch_data_delivered              = false;
+		this->rsp_current_expected_batch_seq_id = 35;
+		this->rsp_prev_batch_seq_id             = 34;
+		this->rsp_prev_batch_active             = true;
+		this->rsp_prev_batch_expected_count     = 38;
+		this->rsp_prev_batch_received_count     = 38;   // POKE: count dishonestly complete (a HOLE)
+		this->rsp_last_delivered_batch_seq_id   = 33;
+		this->rsp_stream_aborted                = false;
+		this->rx_stream_delivered               = 0;
+		this->rx_stream_emitted_bsi_hw          = -1;
+		this->decrypt_delivered_bsi             = -1;
+		this->rsp_cross_session_seam_armed      = false;
+		this->rsp_rebase_seam_armed             = false;
+		this->rx_batch_total_frames             = -1;
+		this->last_received_end_of_batch_seq    = -1;
+		for(int i=0;i<256;i++) rx_stream_stamp[i].valid = false;
+		// prev slots: 0/1 FREE (head hole), 2..37 RECEIVED (bytes), 38/39 FREE (no strand).
+		for(int i=0;i<this->nMessages;i++) messages_rx_prev[i].status = FREE;
+		for(int seq=2; seq<38; seq++)
+		{
+			int L = frame_len(seq, 38);
+			messages_rx_prev[seq].type   = DATA_LONG;
+			messages_rx_prev[seq].id     = (char)(unsigned char)seq;
+			messages_rx_prev[seq].length = L;
+			for(int j=0;j<L;j++) messages_rx_prev[seq].data[j] = (char)(unsigned char)(seq*7 + j);
+			messages_rx_prev[seq].status = RECEIVED;
+			messages_rx_prev[seq].batch_seq_id = 34;
+		}
+		int before = fifo_bytes();
+		deliver_complete_inflight_before_break();
+		return fifo_bytes() - before;
+	};
+	int d_hole_defeat = run_hole_scenario(/*pc_defeat*/true);
+	check(d_hole_defeat == SHORT, "HOLE detector DEFEATED delivers the holed prev (fail-before)",
+		d_hole_defeat, SHORT);
+	int d_hole_fix = run_hole_scenario(/*pc_defeat*/false);
+	check(d_hole_fix == 0, "HOLE detector WITHHOLDS the holed prev — 0 bytes (pass-after)",
+		d_hole_fix, 0);
 
 	// Clean up the env for any subsequent test.
 	set_env("MERCURY_W_PREVCOUNT_DEFEAT", "");
