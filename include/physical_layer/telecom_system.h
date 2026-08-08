@@ -487,6 +487,30 @@ public:
 	long long mfsk8_acq_fired = 0;
 	long long mfsk8_acq_wronglock = 0;
 
+	// ACQ BAND-EXCLUSION (data-flow-linkphase-break-storm.md §5 P1). The
+	// high-SNR break-storm's persistence engine is the no-exclusion Schmidl-Cox
+	// sub-peak re-pick: after a [SUBPEAK-REJECT]/[XCORR-RESCUE-FAIL] the reject
+	// loop restores orig_delay (telecom_system.cc, the fine window seeds off
+	// pream_symb_loc = delay/sym, so the next trial re-locks the SAME
+	// content-stable wrong point) with no record of the rejected offset, so a
+	// momentary onset dip becomes a sustained absorbing lock on a BAND of delays
+	// (field: ~141k-147k full-rate samples, ~21 distinct offsets). P1 records
+	// each rejected delay as a small band CENTER and, when a subsequent
+	// sub-peak reject lands inside an already-recorded band (a confirmed repeat
+	// re-pick, the storm signature), forces a clean grid re-acquire past the band
+	// instead of restoring the wrong point again. Ring of recent band centers;
+	// reset on any successful decode (re-anchor). Env-gated default-OFF
+	// (MERCURY_ACQ_BAND_EXCL): unset => the whole block is skipped =>
+	// byte-identical to base. It fires ONLY inside the sub-peak reject branch, so
+	// a real preamble (mean|H|~1.0, never a sub-peak) can never trigger it — no
+	// clean-path regression by construction. RESPONDER receive-loop local; no
+	// COMMANDER RTO state touched.
+	static const int ACQ_EXCL_RING = 8;   // recent rejected-band centers retained
+	int acq_excl_center[ACQ_EXCL_RING] = {0};  // full-rate sample offsets
+	int acq_excl_count = 0;               // number of valid centers (<= ring)
+	int acq_excl_head = 0;                // next write slot (wrap-evict oldest)
+	long long acq_band_excl_fires = 0;    // production counter: P1 re-acquire escapes
+
 	int operation_mode;
 
 	// Phase-2 validation flag (set via --skip-var-gate=on|off CLI). Default true
@@ -583,6 +607,18 @@ public:
 
 	void transmit_byte(int* data, int nBytes, double *out, int message_location);
 	st_receive_stats receive_byte(double *data, int* out);
+
+	// P1 ACQ BAND-EXCLUSION decision (data-flow-linkphase-break-storm.md §5 P1).
+	// Extracted from receive_byte()'s sub-peak reject branch so the deterministic
+	// self-test (test_acq_band_excl) drives the SAME predicate the production path
+	// runs. Returns true iff `delay` falls within `radius` of an already-recorded
+	// rejected-band center (a confirmed repeat re-pick) — the caller then forces a
+	// clean grid re-acquire; on a miss it records `delay` as a new band center
+	// (wrap-evicting the oldest) and returns false. radius<=0 derives ~2 OFDM
+	// symbols from the loaded geometry. When hit, *matched_center receives the
+	// band center that matched (for the [ACQ-EXCL] fire line).
+	bool acq_band_excl_hit(int delay, int radius, int* matched_center);
+	int test_acq_band_excl();
 
 	// Default-off rejection of reverse-direction narrowband MFSK bursts that
 	// Schmidl-Cox can admit as forward OFDM preambles. The discriminator is the

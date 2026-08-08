@@ -890,6 +890,12 @@ cl_arq_controller::cl_arq_controller()
 		const char* bco = std::getenv("MERCURY_BATCH_COAST_DEFEAT");
 		batch_coast_defeat = (bco && *bco && atoi(bco) != 0);
 		batch_coast_advances = 0;
+		// P2 BOUNDED COAST — DEFAULT-OFF (<=0). MERCURY_BATCH_COAST_MAX=N caps the
+		// coast at depth N and forces a clean re-acquire past a DEEP over-read;
+		// unset/<=0 keeps the stock full-batch bound (byte-identical to base).
+		const char* bcm = std::getenv("MERCURY_BATCH_COAST_MAX");
+		batch_coast_max = (bcm && *bcm) ? atoi(bcm) : 0;
+		batch_coast_stops = 0;
 		// Catastrophic-partial fast-down (FIX 2). Ships DEFAULT-ON.
 		// MERCURY_AXIS2_FASTDOWN_DEFEAT=1 restores the stock 3-consecutive-bad down
 		// path (no single-batch fast-down) so the A/B runs FIX vs DEFEAT on ONE binary.
@@ -16533,7 +16539,14 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 bool cl_arq_controller::batch_coast_try_advance(int frame_symb, int upper,
 	int pream_symb, bool frame_data_missing, int* ftr)
 {
-	bool coast_eligible =
+	// P2 BOUNDED COAST (default-OFF). coast_bound is the stock full-batch bound
+	// unless MERCURY_BATCH_COAST_MAX=N (0<N<data_batch_size) tightens it.
+	int coast_bound = data_batch_size;
+	if(batch_coast_max > 0 && batch_coast_max < data_batch_size)
+		coast_bound = batch_coast_max;
+
+	// Every coast-eligibility leg EXCEPT the coast-depth bound.
+	bool coast_base_legs =
 		   !batch_coast_defeat
 		&& role == RESPONDER
 		&& sack_v2_enabled
@@ -16541,8 +16554,34 @@ bool cl_arq_controller::batch_coast_try_advance(int frame_symb, int upper,
 		&& !telecom_system->bigblock_framing_enabled
 		&& telecom_system->receive_stats.ofdm_batch_active
 		&& telecom_system->receive_stats.ofdm_search_raw > 0
-		&& !frame_data_missing
-		&& telecom_system->receive_stats.coast_frames_since_anchor < data_batch_size;
+		&& !frame_data_missing;
+
+	// P2 TRIP: armed, otherwise-eligible, and the coast has reached the tightened
+	// bound while the stock bound would still coast (a DEEP over-read). Force a
+	// clean re-acquire past the coasted region: tear down the pinned grid and
+	// return false so the caller's stock ladder blind-re-searches, instead of
+	// coasting deeper into the plateau/gap. (When the knob is unset this whole
+	// branch is dead — coast_bound==data_batch_size, so the reached-bound &&
+	// still-below-full-batch conjunction can never hold.)
+	if(batch_coast_max > 0 && coast_base_legs
+	   && telecom_system->receive_stats.coast_frames_since_anchor >= coast_bound
+	   && telecom_system->receive_stats.coast_frames_since_anchor < data_batch_size)
+	{
+		batch_coast_stops++;
+		printf("[BATCH-COAST-STOP] cfg=%d n_since_anchor=%d bound=%d — forcing clean re-acquire stops=%lld\n",
+			current_configuration,
+			telecom_system->receive_stats.coast_frames_since_anchor,
+			coast_bound, batch_coast_stops);
+		fflush(stdout);
+		telecom_system->receive_stats.ofdm_search_raw = 0;       // tear down the pinned grid
+		telecom_system->receive_stats.ofdm_batch_active = false;
+		telecom_system->receive_stats.coast_frames_since_anchor = 0;
+		return false;
+	}
+
+	bool coast_eligible =
+		   coast_base_legs
+		&& telecom_system->receive_stats.coast_frames_since_anchor < coast_bound;
 	if(!coast_eligible) return false;
 
 	int frame_period = frame_symb;   // Nsymb + eff preamble (full when amortization off)
@@ -16613,6 +16652,8 @@ int cl_arq_controller::test_batch_coast()
 		current_configuration = CONFIG_15;
 		data_batch_size = 12;                 // declared B
 		batch_coast_defeat = false;
+		batch_coast_max = 0;                  // P2 default-OFF (stock full-batch bound)
+		batch_coast_stops = 0;
 		ts.bigblock_framing_enabled = false;
 		ts.receive_stats.ofdm_batch_active = true;
 		ts.receive_stats.ofdm_search_raw   = search_raw;
@@ -16685,6 +16726,61 @@ int cl_arq_controller::test_batch_coast()
 	check(!batch_coast_try_advance(frame_symb, upper, 100, false, &ftr), "guard: search_raw<=0 => no coast");
 	prime(100);
 	check(!batch_coast_try_advance(frame_symb, upper, 100, /*frame_data_missing=*/true, &ftr), "guard: keydown-end (frame_data_missing) => disarm");
+
+	// ================= P2 BOUNDED COAST (data-flow-linkphase-break-storm.md §5 P2) =================
+	// The stock coast bound is the full declared batch (data_batch_size=12 here).
+	// P2 (MERCURY_BATCH_COAST_MAX=N) tightens that to N and, when a coast reaches
+	// depth N while the stock bound would still coast, forces a clean re-acquire
+	// (grid torn down) instead of coasting deeper — the deep-plateau escape.
+	const int P2N = 4;                       // test bound (< data_batch_size=12)
+
+	// FAIL-BEFORE (P2 OFF): at depth N the STOCK coast still advances (returns
+	// true, grid kept alive) — the unbounded behavior the storm rides.
+	prime(100); batch_coast_max = 0;
+	ts.receive_stats.coast_frames_since_anchor = P2N;
+	{
+		int f = 0;
+		bool coasts = batch_coast_try_advance(frame_symb, upper, 100, false, &f);
+		check(coasts, "P2 FAIL-BEFORE: OFF => depth N still COASTS (unbounded, returns true)");
+		check(ts.receive_stats.ofdm_batch_active, "P2 FAIL-BEFORE: OFF => grid kept alive (coasts deeper)");
+		check(batch_coast_stops == 0, "P2 FAIL-BEFORE: OFF => no [BATCH-COAST-STOP]");
+	}
+
+	// PASS-AFTER (P2 ARMED at N): at depth N the coast TRIPS — returns false, the
+	// grid is torn down (search_raw=0, batch inactive, coast reset), and the
+	// [BATCH-COAST-STOP] counter fires 0->1. The caller then blind-re-searches.
+	prime(100); batch_coast_max = P2N;
+	ts.receive_stats.coast_frames_since_anchor = P2N;
+	{
+		int f = 0;
+		bool coasts = batch_coast_try_advance(frame_symb, upper, 100, false, &f);
+		check(!coasts, "P2 PASS-AFTER: ARMED => depth==N TRIPS (returns false)");
+		check(ts.receive_stats.ofdm_search_raw == 0, "P2 PASS-AFTER: grid torn down (search_raw=0)");
+		check(!ts.receive_stats.ofdm_batch_active, "P2 PASS-AFTER: batch inactive => forced clean re-acquire");
+		check(ts.receive_stats.coast_frames_since_anchor == 0, "P2 PASS-AFTER: coast counter reset");
+		check(batch_coast_stops == 1, "P2 PASS-AFTER: [BATCH-COAST-STOP] fires 0->1");
+	}
+
+	// GUARD: below the bound (depth N-1) still coasts (sparse-fade rescue preserved).
+	prime(100); batch_coast_max = P2N;
+	ts.receive_stats.coast_frames_since_anchor = P2N - 1;
+	{
+		int f = 0;
+		bool coasts = batch_coast_try_advance(frame_symb, upper, 100, false, &f);
+		check(coasts, "P2 GUARD: armed, depth N-1 still COASTS (sparse-fade rescue preserved)");
+		check(batch_coast_stops == 0, "P2 GUARD: no trip below the bound");
+	}
+
+	// GUARD: a trip requires the coast to be otherwise eligible — keydown-end
+	// (frame_data_missing) at depth N does NOT fire the P2 stop (it disarms first).
+	prime(100); batch_coast_max = P2N;
+	ts.receive_stats.coast_frames_since_anchor = P2N;
+	{
+		int f = 0;
+		bool coasts = batch_coast_try_advance(frame_symb, upper, 100, /*frame_data_missing=*/true, &f);
+		check(!coasts, "P2 GUARD: keydown-end at depth N => no coast (disarm)");
+		check(batch_coast_stops == 0, "P2 GUARD: keydown-end does NOT trip the P2 stop");
+	}
 
 	this->telecom_system = NULL;   // do not dangle the stack ts
 	printf("[TEST-BATCH-COAST] %s (%d failure%s)\n", failed==0?"ALL PASS":"FAILURES", failed, failed==1?"":"s");

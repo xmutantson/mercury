@@ -1578,6 +1578,98 @@ bool cl_telecom_system::frame_decode_rejected(
 	return (rs.iterations_done > (ldpc.nIteration_max-1));
 }
 
+bool cl_telecom_system::acq_band_excl_hit(int delay, int radius, int* matched_center)
+{
+	if(radius <= 0)
+	{
+		int sym_full_x = data_container.Nofdm * frequency_interpolation_rate;
+		radius = (sym_full_x > 0 ? 2 * sym_full_x : 4000);  // default ~2 OFDM symbols
+	}
+	for(int k = 0; k < acq_excl_count; k++)
+	{
+		if(std::abs(delay - acq_excl_center[k]) <= radius)
+		{
+			if(matched_center) *matched_center = acq_excl_center[k];
+			return true;   // repeat re-pick inside an already-excluded band
+		}
+	}
+	// Miss: record this delay as a new band center (wrap-evict oldest).
+	acq_excl_center[acq_excl_head] = delay;
+	acq_excl_head = (acq_excl_head + 1) % ACQ_EXCL_RING;
+	if(acq_excl_count < ACQ_EXCL_RING) acq_excl_count++;
+	return false;
+}
+
+// P1 ACQ BAND-EXCLUSION directed regression (runs in --test). Drives the REAL
+// production predicate acq_band_excl_hit() (the same call receive_byte() makes at
+// the sub-peak reject site), so the exclusion logic the storm fix relies on is
+// exercised, not simulated. Synthetic-fire house pattern (test_batch_coast /
+// test_subpeak_rescue). The end-to-end fire proof (a stormed cell COMPLETING) is
+// the stored-seed cohort A/B — this test proves the DECISION fires correctly.
+//   FAIL-BEFORE (no exclusion memory): the first reject at the plateau delay is a
+//     MISS (returns false) — base behavior, the wrong point is restored & re-locked.
+//   PASS-AFTER (exclusion memory): a SECOND reject in the same band is a HIT
+//     (returns true) → the caller forces a clean re-acquire, breaking the loop.
+//   0=PASS, 1=FAIL.
+int cl_telecom_system::test_acq_band_excl()
+{
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		if(cond) printf("[TEST-ACQ-EXCL] PASS: %s\n", name);
+		else   { printf("[TEST-ACQ-EXCL] FAIL: %s\n", name); failed++; }
+		fflush(stdout);
+	};
+
+	// Real cfg15 geometry so the derived (radius<=0) default is a real symbol span.
+	operation_mode = BER_PLOT_passband;
+	load_configuration(CONFIG_15);
+	int sym_full = data_container.Nofdm * frequency_interpolation_rate;
+	int radius = 2 * sym_full;               // explicit radius (matches the default)
+	printf("[TEST-ACQ-EXCL] cfg15 sym_full=%d radius=%d\n", sym_full, radius);
+	fflush(stdout);
+	check(sym_full > 0, "cfg15 geometry loaded (sym_full>0)");
+
+	// fresh ring
+	acq_excl_count = 0; acq_excl_head = 0;
+
+	// The field storm plateau band (~141k-147k full-rate samples, ~21 offsets).
+	const int PLATEAU = 142309;              // refuter-observed pinned delay
+	int mc = -1;
+
+	// FAIL-BEFORE: first reject at the plateau is a MISS (records the band).
+	bool first = acq_band_excl_hit(PLATEAU, radius, &mc);
+	check(!first, "FAIL-BEFORE: first plateau reject is a MISS (base restores wrong point)");
+	check(acq_excl_count == 1, "band recorded (count 0->1)");
+
+	// PASS-AFTER: a repeat reject at the SAME delay is a HIT → force re-acquire.
+	mc = -1;
+	bool repeat = acq_band_excl_hit(PLATEAU, radius, &mc);
+	check(repeat, "PASS-AFTER: repeat plateau reject is a HIT (forces clean re-acquire)");
+	check(mc == PLATEAU, "HIT reports the matched band center");
+
+	// A nearby delay within the band (same wrong-lock, ±half symbol) also HITs.
+	mc = -1;
+	bool near = acq_band_excl_hit(PLATEAU + sym_full, radius, &mc);   // within 2*sym_full
+	check(near, "in-band neighbor (+1 symbol) is a HIT (BAND, not a single delay)");
+
+	// A delay FAR outside the band is a MISS and opens a NEW band (not one delay).
+	mc = -1;
+	int FAR = PLATEAU + 40 * sym_full;
+	bool far = acq_band_excl_hit(FAR, radius, &mc);
+	check(!far, "far delay (out of band) is a MISS => new band, not a global block");
+	check(acq_excl_count == 2, "second band opened (count 1->2)");
+
+	// Re-anchor semantics: clearing the ring restores base behavior (next reject MISS).
+	acq_excl_count = 0; acq_excl_head = 0;
+	mc = -1;
+	bool after_reset = acq_band_excl_hit(PLATEAU, radius, &mc);
+	check(!after_reset, "after re-anchor reset: plateau reject is a MISS again (memory cleared)");
+
+	printf("[TEST-ACQ-EXCL] %s (%d failure%s)\n", failed==0?"ALL PASS":"FAILURES", failed, failed==1?"":"s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 {
 	// P1: big-block framing branch (gated; default OFF). When set, receive_byte
@@ -3053,6 +3145,23 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			const char* e = std::getenv("MERCURY_SUBPEAK_COH_ACCEPT");
 			return (e && *e) ? atof(e) : 0.50;  // at/above this C => trust a thin-grid recovered onset
 		}();
+		// P1 ACQ BAND-EXCLUSION (data-flow-linkphase-break-storm.md §5 P1;
+		// _research/CANONICAL_NUMBERS.md §70/§72). Default-OFF: unset =>
+		// acq_band_excl==0 => the exclusion block is skipped => byte-identical to
+		// base. When armed, a repeat sub-peak reject inside an already-recorded
+		// rejected BAND (radius acq_excl_radius, default 2 OFDM symbols — the
+		// field storm band ~141k-147k spans ~2 symbols per side of a center)
+		// forces a clean grid re-acquire past the band instead of the
+		// no-exclusion restore-orig_delay re-lock. See the header comment on
+		// acq_excl_center[].
+		static const int acq_band_excl = []{
+			const char* e = std::getenv("MERCURY_ACQ_BAND_EXCL");
+			return (e && *e) ? atoi(e) : 0;   // DEFAULT-OFF
+		}();
+		static const int acq_excl_radius_env = []{
+			const char* e = std::getenv("MERCURY_ACQ_EXCL_RADIUS");
+			return (e && *e) ? atoi(e) : 0;   // 0 => derive from symbol geometry
+		}();
 		bool xcorr_rescue_attempted = false;  // one rescue per receive_byte (persists across trials)
 skip_h_retry_point:
 		while (receive_stats.sync_trials<=effective_trials_max)
@@ -3906,6 +4015,42 @@ skip_h_retry_point:
 					printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
 						receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
 					fflush(stdout);
+					// P1 ACQ BAND-EXCLUSION (default-OFF). Record this rejected
+					// delay as a band center; if it lands inside an ALREADY-recorded
+					// band (a confirmed repeat re-pick — the storm's absorbing
+					// no-exclusion loop that restores orig_delay every trial), stop
+					// restoring the wrong point: tear the batch grid down so the
+					// RESPONDER re-acquires cleanly PAST the band on the next
+					// receive_byte, and abort the trial loop. This runs ONLY inside
+					// the sub-peak reject branch, so a real preamble (mean|H|~1.0,
+					// never a sub-peak) can never reach it — no clean-path regression.
+					if(acq_band_excl && M != MOD_MFSK && ofdm_forced_delay < 0 && mfsk_fixed_delay < 0)
+					{
+						int sym_full_x = data_container.Nofdm * frequency_interpolation_rate;
+						int radius = (acq_excl_radius_env > 0)
+							? acq_excl_radius_env
+							: (sym_full_x > 0 ? 2 * sym_full_x : 4000);  // default ~2 OFDM symbols
+						int matched = -1;
+						// acq_band_excl_hit is the PRODUCTION decision (also driven directly
+						// by test_acq_band_excl): true => repeat re-pick in an already-recorded
+						// band; false => new band, now recorded.
+						if(acq_band_excl_hit(receive_stats.delay, radius, &matched))
+						{
+							// Repeat lock inside an excluded band → force clean re-acquire.
+							acq_band_excl_fires++;
+							printf("[ACQ-EXCL] trial %d delay=%d in excluded band center=%d radius=%d "
+								"— forcing clean re-acquire past band (fires=%lld)\n",
+								receive_stats.sync_trials, receive_stats.delay, matched, radius, acq_band_excl_fires);
+							fflush(stdout);
+							receive_stats.ofdm_search_raw = 0;      // tear down the pinned grid
+							receive_stats.ofdm_batch_active = false;
+							receive_stats.coast_frames_since_anchor = 0;
+							receive_stats.frame_skip_var_aborted = true;
+							skip_h_count++;
+							receive_stats.sync_trials++;
+							break;                                   // exit trial loop → caller re-searches
+						}
+					}
 					skip_h_count++;
 					receive_stats.sync_trials++;
 					continue;
@@ -4489,6 +4634,12 @@ skip_h_retry_point:
 				}
 
 				receive_stats.message_decoded=YES;
+				// P1 ACQ BAND-EXCLUSION: a successful decode is the re-anchor — the
+				// forward stream is being read cleanly, so drop the recorded
+				// rejected-band centers (touches only P1's own members; invisible to
+				// the base path).
+				acq_excl_count = 0;
+				acq_excl_head = 0;
 				if(M != MOD_MFSK)
 				{
 					keydown_last_delay = receive_stats.delay;   // MINI=0 phase carry: remember the last good frame position

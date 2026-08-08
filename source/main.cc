@@ -2109,6 +2109,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_coast;
                 failed += test_coast.test_batch_coast();
             }
+            // P1 ACQ BAND-EXCLUSION — the high-SNR break-storm persistence engine is
+            // the no-exclusion Schmidl-Cox sub-peak re-pick (the reject loop restores
+            // orig_delay every trial, re-locking the same content-stable wrong point in
+            // a BAND of delays). P1 records rejected delays as band centers and forces a
+            // clean re-acquire on a repeat re-pick inside a recorded band. Drives the
+            // REAL predicate acq_band_excl_hit(): FAIL-BEFORE (empty memory) misses;
+            // PASS-AFTER (band recorded) hits; BAND (not single-delay) neighbor hits.
+            {
+                cl_telecom_system test_excl;
+                failed += test_excl.test_acq_band_excl();
+            }
             // DUTY FAST-START lever ELEVATOR FAST-CONFIRM — margin-gated N=1 OFDM climb confirm:
             // on a whole-clean OFDM batch whose raw SNR capacity clears a higher rung, the anchor
             // is seated + the FRAME-UP elevator fires on the FIRST clean (skip the 2nd confirm),
