@@ -752,6 +752,7 @@ public:
   int  test_turnaround_guard();
   int  test_measured_timers();  // R6 SRTT/RTTVAR estimator + ack-timeout invariant regression
   int  test_karn_retx_classify(); // Karn discriminator decoupling A/B (MERCURY_KARN_RETX_ONLY)
+  int  test_rsp_timeout_format(); // [RSP-TIMEOUT] diagnostic field-alignment regression (data-flow-rsp-timeout.md)
   // Live production-poll exercise for the recovery-only older-phase capture.
   // A complete ACK lives in retained ring history while the newest tail is
   // silent. Bare monitor returns false; the recovery capture port accepts 1/1.

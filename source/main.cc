@@ -2381,6 +2381,17 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_kn;
                 failed += ARQ_kn.test_karn_retx_classify();
             }
+            // [RSP-TIMEOUT] diagnostic field-alignment gate (data-flow-rsp-timeout.md):
+            // the RESPONDER receive-window diagnostic passed a double field to a %d slot,
+            // shifting every field after it one slot left on the x86-64 SysV ABI so the
+            // timeout= label showed an unpushed stack slot (garbage) while the armed value
+            // hid under sack=. Drives the REAL calculate_receiving_timeout() RESPONDER path,
+            // captures the line off stdout, and asserts the printed fields align with the
+            // armed receiving_timeout. Deterministic, no RF.
+            {
+                cl_arq_controller ARQ_rtf;
+                failed += ARQ_rtf.test_rsp_timeout_format();
+            }
             // R4 LINK-PARAMS quiesce gate (arq_commander.cc): an Axis-2 batch-size
             // renegotiation must not fire while the boundary is unclean (retx pending / last
             // batch partial), which would mix old-bsi retransmits into the first batch of the
