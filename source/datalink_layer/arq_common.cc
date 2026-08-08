@@ -2681,7 +2681,7 @@ void cl_arq_controller::calculate_receiving_timeout()
 		int rsp_timeout = (data_batch_size)*message_transmission_time_ms+time_left_to_send_last_frame+ptt_on_delay_ms;
 		// RSP timeout: base timeout covers batch reception
 		printf("[RSP-TIMEOUT] batch=%d msg_time=%d time_left=%d ptt=%d sack=%d -> timeout=%d\n",
-			data_batch_size, message_transmission_time_ms, time_left_to_send_last_frame, ptt_on_delay_ms, sack_enabled ? 1 : 0, rsp_timeout);
+			data_batch_size, message_transmission_time_ms, (int)time_left_to_send_last_frame, ptt_on_delay_ms, sack_enabled ? 1 : 0, rsp_timeout);
 		fflush(stdout);
 		set_receiving_timeout(rsp_timeout);
 	}
