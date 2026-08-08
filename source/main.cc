@@ -1864,6 +1864,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_downladder();
             }
+            // Reseat span integrity: the prev-batch cross-storage index-skew 332-byte
+            // deletion. Drives the PRODUCTION store -> seal -> copy_data_to_buffer and
+            // proves the seal-count + funnel byte-span keystones prevent the short delivery
+            // while healthy + res_c3100-widened deliveries stay byte-identical. Member test
+            // on a throwaway controller; fast + deterministic, no IONOS/RF. data-flow-
+            // messages_rx_prev.md §4.5 CORRECTION.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_reseat_span();
+            }
             // ROBUST->OFDM ADOPT live-burst PRESERVE regression (the last transition-class hole:
             // the unilateral adopt into an OFDM config used to WIPE the in-flight preamble
             // mid-capture -> no acquire -> TERMINAL BREAK -> ROBUST_0 spiral). Member test on a
@@ -3716,6 +3726,7 @@ int main(int argc, char *argv[])
     bool test_inband_fallback_cli = false;  // --test-inband-fallback: in-band Stage 4 — LOST-TAG DOWN-LADDER.
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_downladder_cli = false;  // --test-inband-downladder: down-ladder BREAK-orphan + silent-snapshot regression.
+    bool test_reseat_span_cli = false;  // --test-reseat-span: prev-batch cross-storage index-skew 332-byte deletion keystone.
     bool test_inband_deliver_cli = false;  // --test-inband-deliver: forward-healthy reverse-ACK miss -> NO-BREAK deliver regression.
     bool test_linkphase_shadow_cli = false; // --test-linkphase-shadow: increment-1 shadow-agreement directed unit.
     bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
@@ -4730,6 +4741,18 @@ int main(int argc, char *argv[])
             // bytes). PART B: a silent (0-peak) snapshot does NOT tick the dead-batch streak.
             // See arq_responder.cc test_inband_downladder + data-flow-inband-downladder.md.
             test_inband_downladder_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-reseat-span") == 0)
+        {
+            // Reseat span integrity (one-shot at startup, exit rc): the prev-batch
+            // cross-storage index-skew 332-byte deletion. Drives the PRODUCTION store ->
+            // seal -> copy_data_to_buffer across STOCK (both keystones defeated -> 5969/
+            // deficit 332) and fixed arms (seal-count + funnel byte-span -> 0 short bytes),
+            // plus healthy + res_c3100-widen no-false-fire controls. See arq_responder.cc
+            // test_reseat_span + data-flow-messages_rx_prev.md §4.5.
+            test_reseat_span_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6965,6 +6988,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_inband_downladder();
             printf("[FLAG] Inband-downladder test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_reseat_span_cli) {
+            // Reseat span integrity (one-shot, exit rc). Drives the PRODUCTION store -> seal
+            // -> copy_data_to_buffer; STOCK reproduces the 332-byte deletion, the fixed arms
+            // hold/refuse, healthy + widen stay byte-identical.
+            printf("[FLAG] --test-reseat-span: invoking prev-batch cross-storage span "
+                   "integrity regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_reseat_span();
+            printf("[FLAG] Reseat-span test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

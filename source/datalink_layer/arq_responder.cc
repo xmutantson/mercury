@@ -5283,6 +5283,224 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 }
 
 // ============================================================================
+// RESEAT SPAN INTEGRITY — prev-batch cross-storage index-skew 332-byte deletion
+// (data-flow-messages_rx_prev.md §4.5 CORRECTION ; CLI: --test-reseat-span)
+// ============================================================================
+//
+// Reproduces the store/deliver WINDOW-DIVERGENCE corruption class as an in-process
+// synthetic-fire (no IONOS, no RF) and proves the two keystone fixes prevent it while
+// leaving healthy + res_c3100-widened deliveries byte-identical.
+//
+// THE DEFECT (cross-layer data-flow audit of messages_rx_prev[] + the seal/refill/gate
+// windows): a batch's completion COUNT was tallied over the STORE window
+// [0, rx_effective_window(D5)) while delivery happens over the CLAMPED window
+// [0, prev_expected). When a prior larger batch left data_batch_size stale-large
+// (data_batch_size=40) and the sealing batch's true span is shorter (D5=38), the store
+// window never narrows below data_batch_size (rx_effective_window, arq_common.cc), so a
+// frame whose wire id skews it into the gap [prev_expected, data_batch_size) is COUNTED
+// yet sits OUTSIDE the delivery iteration — it is FREEd undelivered. Result: the batch
+// seals "38/38 complete" with two head positions empty -> a clean 332-byte (2 x DATA_LONG)
+// silent deletion.
+//
+// THE SKEW that seeds the gap slot: the sealing batch's first transmission carried
+// wire id = seq + 38 (the prior batch's frame count — a command-side slot-base non-reset),
+// so seq0/seq1 store at out-of-window slots 38/39 and seq2..37 (id 40..75) are REJECTED by
+// the store bound. The retransmit (id = seq) refills seq2..37 at slots 2..37; seq0/seq1
+// were SACK-suppressed (the command marked their skewed ids acknowledged) and never resent.
+//
+// PRODUCTION PRIMITIVES DRIVEN:
+//   • add_message_rx_data()               — the real current-batch store bound
+//   • bump_bsi_and_transfer_prev()        — the real seal (FIX a producer 1 lives here)
+//   • deliver_complete_inflight_before_break() -> copy_data_to_buffer()
+//                                          — the real prev delivery + reassembler
+//                                            (FIX b span-gate lives at the funnel)
+// The retx REFILL into messages_rx_prev[] is transcribed (the prev-match store is inline in
+// process_messages_rx_data_control, which cannot be invoked in-process — the SAME constraint
+// test_partial_bsi_advance Step 5 documents); its count rule mirrors the production refill
+// gate but is NOT the discriminating fix for THIS cell — the SEAL count (producer 1, driven
+// through the real bump helper) is. The 332-byte deletion in the STOCK arm is produced by
+// the REAL copy_data_to_buffer() FREE loop, not by the transcription.
+//
+// ARMS (all in ONE process; only the fix-env varies so the sole variable is the fix):
+//   stock  (both defeated)  : delivers 5969, deficit 332  — FAIL-BEFORE, reproduced in prod
+//   fix-a  (seal-count ON)  : HELD (received 36 < 38)      — 0 short bytes
+//   fix-b  (span-gate ON)   : REFUSED at the funnel        — 0 short bytes
+//   both                    : HELD                          — 0 short bytes
+//   healthy (D5 == dbs)     : full delivery, deficit 0      — no false-fire (fixes ON)
+//   widen   (D5 = 44 > dbs) : full delivery, deficit 0      — no false-fire (fixes ON)
+//
+// On the UNPATCHED tree the fix arms deliver 5969 (not 0) -> rc=1 (fail-before). With both
+// keystones the fix arms deliver 0 and the healthy/widen arms are byte-identical -> rc=0.
+// Returns 0=PASS, 1=FAIL. Default builds never call this (separate CLI + --test).
+int cl_arq_controller::test_reseat_span()
+{
+	const char* TAG = "[TEST-RESEAT-SPAN]";
+	int failed = 0;
+	auto check = [&](bool cond, const char* what, long got, long want) {
+		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
+		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
+		fflush(stdout);
+	};
+	auto set_env = [&](const char* k, const char* v){
+#if defined(_WIN32)
+		_putenv_s(k, v);
+#else
+		if(v && *v) setenv(k, v, 1); else unsetenv(k);
+#endif
+	};
+	auto fifo_bytes = [&]() -> int {
+		return this->fifo_buffer_rx.get_size() - this->fifo_buffer_rx.get_free_size();
+	};
+
+	// Frame geometry: 38 frames total 6301 B (seq0..36 = 166, seq37 = 159); the head
+	// pair seq0+seq1 = 332 B is the deficit; delivered tail seq2..37 = 5969 B.
+	auto frame_len = [&](int seq, int d5) -> int {
+		if(d5 == 38 && seq == 37) return 159;   // tune the EOB frame so d5=38 totals 6301
+		return 166;
+	};
+
+	// One scenario run: set the fix envs, rebuild synthetic RX state, drive the PRODUCTION
+	// store -> seal -> (transcribed refill) -> delivery, return bytes appended to the app FIFO.
+	//   skew=38 : the corrupt cell (seq0/seq1 land at gap slots 38/39, resent tail id=seq)
+	//   skew=0  : healthy / res_c3100-widen control (id=seq, fully present at seal)
+	auto run_scenario = [&](bool pc_defeat, bool sg_defeat,
+	                        int dbs, int d5, int skew) -> int {
+		set_env("MERCURY_W_PREVCOUNT_DEFEAT", pc_defeat ? "1" : "");
+		set_env("MERCURY_W_SPANGATE_DEFEAT",  sg_defeat ? "1" : "");
+
+		// --- Step 0: buffers + SACK-v2 receive state (mirror test_inband_downladder) ---
+		this->nMessages          = 255;
+		this->max_data_length    = 170;
+		this->max_message_length = 200;
+		this->max_header_length  = 6;
+		if(init_messages_buffers() != SUCCESSFUL) { check(false, "init_messages_buffers", 0, 1); return -1; }
+		this->fifo_buffer_rx.set_size(262144);
+		this->fifo_buffer_rx.flush();
+		this->sack_v2_enabled                   = true;
+		this->sack_enabled                      = true;
+		this->axis3_sack_mode                   = 1;      // SACK_MODE_ON
+		this->compression_enabled               = false;  // raw per-slot delivery (FIFO-observable)
+		this->header_carries_d5                 = true;   // D5-bearing OFDM header (166 B fits cap 170)
+		this->passive_monitor                   = false;
+		this->link_status                       = CONNECTED;
+		this->connection_status                 = RECEIVING;
+		this->inband_rate_enabled               = 1;      // deliver_complete vehicle feature ON
+		this->data_batch_size                   = dbs;    // stale-large for the corrupt cell
+		this->batch_data_delivered              = false;
+		this->rsp_current_expected_batch_seq_id = 34;
+		this->rsp_prev_batch_seq_id             = -1;
+		this->rsp_prev_batch_active             = false;
+		this->rsp_prev_batch_received_count     = 0;
+		this->rsp_prev_batch_expected_count     = 0;
+		this->rsp_last_delivered_batch_seq_id   = 33;     // prev bsi=34 is the contiguous next deliver
+		this->rsp_stream_aborted                = false;
+		this->rx_stream_delivered               = 0;
+		this->rx_stream_emitted_bsi_hw          = -1;
+		this->decrypt_delivered_bsi             = -1;
+		this->rsp_cross_session_seam_armed      = false;
+		this->rsp_rebase_seam_armed             = false;
+		for(int i=0;i<256;i++) rx_stream_stamp[i].valid = false;  // no wire-stamp guard interference
+		// The sealing batch's authoritative D5 count (the current-batch latch).
+		this->rx_batch_total_frames             = d5;
+		this->rx_buffer_batch_total_frames      = d5;
+		this->last_received_end_of_batch_seq    = -1;
+
+		// --- Step 1: first-transmission store via PRODUCTION add_message_rx_data(id=seq+skew) ---
+		// skew=38 -> seq0/seq1 -> loc38/39 stored; seq2..37 (id40..75) -> MESSAGE_ID_ERROR rejected.
+		char payload[256];
+		int stored_first = 0;
+		for(int seq=0; seq<d5; seq++)
+		{
+			int L = frame_len(seq, d5);
+			for(int j=0;j<L;j++) payload[j] = (char)(unsigned char)(seq*7 + j);
+			int id = seq + skew;
+			if(add_message_rx_data(DATA_LONG, (char)(unsigned char)id, L, payload) == SUCCESSFUL)
+				stored_first++;
+		}
+
+		// --- Step 2: seal via PRODUCTION bump_bsi_and_transfer_prev (FIX a producer 1) ---
+		bump_bsi_and_transfer_prev();   // -> rsp_prev_batch_seq_id=34, expected=d5
+
+		// --- Step 3: retx REFILL of the resent tail into messages_rx_prev[] (transcribed) ---
+		// Corrupt cell: the resent frames are seq2..37 at loc=seq (skew reset); seq0/seq1 were
+		// SACK-suppressed and never resent. Healthy/widen (skew=0): fully present at seal, no
+		// refill. The count bump mirrors the production refill gate (FIX a producer 2): a fresh
+		// slot bumps only when loc < prev_expected (or unconditionally under the fix defeat).
+		if(skew != 0)
+		{
+			int refill_from = 2;   // seq0/seq1 (loc38/39 gap slots) are not resent
+			for(int seq=refill_from; seq<d5; seq++)
+			{
+				int loc = seq;   // resent tail carries id=seq
+				char prev_status = messages_rx_prev[loc].status;
+				if(prev_status == RECEIVED || prev_status == ACKED) continue;
+				int L = frame_len(seq, d5);
+				messages_rx_prev[loc].type   = DATA_LONG;
+				messages_rx_prev[loc].id     = (char)(unsigned char)loc;
+				messages_rx_prev[loc].length = L;
+				for(int j=0;j<L;j++) messages_rx_prev[loc].data[j] = (char)(unsigned char)(seq*7 + j);
+				messages_rx_prev[loc].status = RECEIVED;
+				messages_rx_prev[loc].batch_seq_id = 34;
+				bool count_this = pc_defeat ? true : (loc < this->rsp_prev_batch_expected_count);
+				if(count_this) this->rsp_prev_batch_received_count++;
+			}
+		}
+
+		// --- Step 4: deliver via PRODUCTION deliver_complete_inflight_before_break -> copy_data_to_buffer ---
+		int before = fifo_bytes();
+		deliver_complete_inflight_before_break();
+		return fifo_bytes() - before;
+	};
+
+	// Expected byte counts.
+	const int CRED = 6301, SHORT = 5969, DEFICIT = 332;
+	const int HEALTHY_FULL = 40 * 166;        // 6640
+	const int WIDEN_FULL   = 44 * 166;        // 7304
+	(void)DEFICIT;
+
+	printf("%s driving PRODUCTION store->seal->refill->copy_data_to_buffer across arms\n", TAG);
+	fflush(stdout);
+
+	// ARM 1 — STOCK (both keystones defeated): the fail-before, reproduced in production code.
+	int d_stock = run_scenario(/*pc*/true, /*sg*/true, /*dbs*/40, /*d5*/38, /*skew*/38);
+	check(d_stock == SHORT, "STOCK reproduces the short delivery (deficit 332) in prod copy_data_to_buffer",
+		d_stock, SHORT);
+
+	// ARM 2 — FIX-a (seal count over the delivery window): the batch HOLDS, 0 short bytes.
+	int d_fixa = run_scenario(/*pc*/false, /*sg*/true, 40, 38, 38);
+	check(d_fixa == 0, "FIX-a HOLDS the batch (received 36 < 38) — 0 short bytes", d_fixa, 0);
+
+	// ARM 3 — FIX-b (funnel span-gate): the strand is REFUSED before delivery, 0 short bytes.
+	int d_fixb = run_scenario(/*pc*/true, /*sg*/false, 40, 38, 38);
+	check(d_fixb == 0, "FIX-b REFUSES the strand at the copy_data_to_buffer funnel — 0 short bytes",
+		d_fixb, 0);
+
+	// ARM 4 — BOTH keystones ON (the shipped default): HELD, 0 short bytes.
+	int d_both = run_scenario(/*pc*/false, /*sg*/false, 40, 38, 38);
+	check(d_both == 0, "BOTH keystones ON — 0 short bytes (shipped default)", d_both, 0);
+
+	// ARM 5 — HEALTHY control (D5 == data_batch_size, no skew): full delivery, no false-fire.
+	int d_healthy = run_scenario(/*pc*/false, /*sg*/false, 40, 40, 0);
+	check(d_healthy == HEALTHY_FULL, "HEALTHY delivers in FULL (no false-fire, byte-identical)",
+		d_healthy, HEALTHY_FULL);
+
+	// ARM 6 — res_c3100 WIDEN control (D5=44 > data_batch_size=40): full delivery, no false-fire.
+	int d_widen = run_scenario(/*pc*/false, /*sg*/false, 40, 44, 0);
+	check(d_widen == WIDEN_FULL, "WIDEN (res_c3100 D5>dbs) delivers in FULL (no false-fire)",
+		d_widen, WIDEN_FULL);
+
+	// Clean up the env for any subsequent test.
+	set_env("MERCURY_W_PREVCOUNT_DEFEAT", "");
+	set_env("MERCURY_W_SPANGATE_DEFEAT", "");
+
+	printf("%s %s: failed=%d (STOCK short=%d deficit=%d; fixes-on 0; healthy=%d widen=%d)\n",
+		TAG, failed == 0 ? "PASS" : "FAIL", failed, d_stock, d_stock >= 0 ? (CRED - d_stock) : -1,
+		d_healthy, d_widen);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
+// ============================================================================
 // In-band rate adaptation — Stage 2 directed loopback follow test
 // (unilateral-config-tag-design.md §11 Stage 2; data-flow-perbatch-config.md §8.2)
 // ============================================================================

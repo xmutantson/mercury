@@ -3067,6 +3067,14 @@ public:
   // inband_try_down_ladder_on_decode_fail. data-flow-inband-downladder.md §3/§5.3.
   int test_inband_downladder();
 
+  // RESEAT SPAN INTEGRITY (CLI --test-reseat-span): the prev-batch cross-storage index-skew
+  // 332-byte deletion. Drives the PRODUCTION store (add_message_rx_data) -> seal
+  // (bump_bsi_and_transfer_prev) -> copy_data_to_buffer and asserts the two keystone fixes
+  // (seal-count over the delivery window; funnel byte-span strand-gate) prevent the short
+  // delivery while healthy + res_c3100-widened deliveries stay byte-identical.
+  // data-flow-messages_rx_prev.md §4.5 CORRECTION.
+  int test_reseat_span();
+
   // ROBUST->OFDM ADOPT: PRESERVE THE LIVE IN-FLIGHT BURST (CLI --test-inband-adopt-preserve).
   // The last transition-class hole: the unilateral adopt INTO an OFDM config wiped the in-flight
   // OFDM preamble already mid-capture (HINGE-1 unconditional ring memset) -> FTR search_raw=0 ->
