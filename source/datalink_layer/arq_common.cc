@@ -19439,24 +19439,33 @@ void cl_arq_controller::copy_data_to_buffer()
 	}
 
 	// FIX (b) part 1 — the pre-delivery byte-SPAN STRAND GATE (data-flow-messages_rx_prev.md
-	// §4.5 CORRECTION). This is the SINGLE receiver delivery funnel: all emit routes + both
-	// prev paths reach it. The reassembler below delivers ACKED slots over [0, cw) and then FREEs
-	// [cw, nMessages). If any RECEIVED|ACKED slot sits OUTSIDE the delivery window [0, cw), the
-	// batch was CREDITED for its bytes (the completion count) but they will be FREEd UNDELIVERED
-	// — a clean deletion (the cross-storage index-skew strand: a frame whose wire id skewed it
-	// into the gap [prev_expected, store_win) while data_batch_size sat stale-large). Self-
-	// consistent + stamp-independent (covers robust / cfg0). PRECISE: it diverges IFF a RECEIVED
-	// slot lies outside the delivery window, which happens ONLY under the gap-slot pathology —
-	// a healthy batch and a res_c3100 widen leave [D5, store_win) FREE, so it never false-fires
-	// (regression arms: the healthy + widen deliveries in test_reseat_span, byte-identical). On a
-	// strand: REFUSE before client delivery via the shared rsp_gap_abort_teardown contract
-	// (COMPLETE-or-LOUD at the FIRST divergent byte, not ~1.6 batches late like the positional
-	// backstop). The refuse+refill FIRST discipline lives one gate up (the PREV byte-gate at
-	// arq_responder.cc withholds + keeps the prev RECEIVED for retx); this funnel gate is the
-	// shared last-resort abort for a strand that reaches delivery. Composes with the DEDUP / seam
-	// / stream-shift / D3.1 guards on a DISJOINT trigger. MERCURY_W_SPANGATE_DEFEAT=1 restores the
-	// pre-fix silent short delivery (the fail-before arm on the SAME binary).
-	if(messages_rx != NULL)
+	// §4.5 CORRECTION). copy_data_to_buffer() is the SINGLE receiver delivery funnel; the two
+	// cross-storage PREV completion sites (deliver_complete_inflight_before_break, arq_common.cc;
+	// the frame-driven prev-deliver, arq_responder.cc) both SWAP messages_rx -> messages_rx_prev
+	// before calling it, so `messages_rx == messages_rx_prev` uniquely identifies a PREV delivery.
+	// The reassembler below delivers ACKED slots over [0, cw) and FREEs [cw, nMessages). On the
+	// PREV path a RECEIVED|ACKED slot OUTSIDE the delivery window [0, cw) is a GENUINE strand: the
+	// prev buffer is fully FREEd after every prev delivery, so anything beyond cw is a frame OF
+	// THIS batch whose wire id skewed it into the gap [prev_expected, store_win) while
+	// data_batch_size sat stale-large — it was CREDITED toward completion but will be FREEd
+	// UNDELIVERED (the clean deletion). Self-consistent + stamp-independent (covers robust / cfg0).
+	//
+	// SCOPED TO THE PREV PATH DELIBERATELY (the regression arm that earned it: CASE-GROW-STALE-TAIL
+	// in test_bsdesync). The CURRENT-batch in-order route legitimately leaves STALE ACKED slots in
+	// [D5, data_batch_size) — a PRIOR larger batch's frames the growth transition never cleared —
+	// which the GROWTH-DELIVER clamp (cw = D5) then correctly DROPS. Those are not this batch's
+	// bytes (they carry a prior batch_seq_id) and dropping them is CORRECT, so the gate must NOT
+	// fire on the current route. A genuine current-batch frame is always within cw by construction
+	// (cw = rx_effective_window(D5) >= D5 covers every declared frame), so scoping to the prev path
+	// loses no genuine-strand coverage. On a prev strand: REFUSE via the shared rsp_gap_abort_
+	// teardown contract (COMPLETE-or-LOUD at the FIRST divergent byte, not ~1.6 batches late like
+	// the positional backstop). The refuse+refill FIRST discipline lives one gate up (the PREV
+	// byte-gate at arq_responder.cc withholds + keeps the prev RECEIVED for retx); this funnel gate
+	// is the last-resort abort for a strand that reaches delivery. Composes with the DEDUP / seam /
+	// stream-shift / D3.1 guards on a DISJOINT trigger. Regression: healthy + res_c3100-widen prev
+	// deliveries leave [D5, store_win) FREE (no false-fire; test_reseat_span byte-identical).
+	// MERCURY_W_SPANGATE_DEFEAT=1 restores the pre-fix silent short delivery (the fail-before arm).
+	if(messages_rx != NULL && messages_rx_prev != NULL && messages_rx == messages_rx_prev)
 	{
 		bool w_spangate_defeat = false;
 		{ const char* e = std::getenv("MERCURY_W_SPANGATE_DEFEAT");
@@ -19479,8 +19488,8 @@ void cl_arq_controller::copy_data_to_buffer()
 					decrypt_delivered_bsi & 0xFF, cw, deliver_span, strand_n,
 					strand_bytes, strand_hi);
 				fflush(stdout);
-				rsp_gap_abort_teardown("Option W span-gate: RECEIVED bytes stranded outside the delivery window");
-				return;   // do NOT deliver a batch that was credited for undelivered bytes
+				rsp_gap_abort_teardown("Option W span-gate: PREV RECEIVED bytes stranded outside the delivery window");
+				return;   // do NOT deliver a prev batch credited for undelivered bytes
 			}
 		}
 	}
