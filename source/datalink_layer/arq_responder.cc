@@ -5396,6 +5396,18 @@ int cl_arq_controller::test_reseat_span()
 {
 	const char* TAG = "[TEST-RESEAT-SPAN]";
 	int failed = 0;
+	// The FIX-b span-gate REFUSES via the shared rsp_gap_abort_teardown, whose
+	// reset_session_state() writes three telecom_system fields (arq_common.cc:9240/9243/9249).
+	// In the aggregate --test this member test runs on a bare cl_arq_controller (telecom_system
+	// == NULL), so give it a default-constructed telecom_system (no load_configuration needed —
+	// only those plain fields are written) and free it at the end. Standalone (--test-reseat-span
+	// on the fully-initialized ARQ) already has one; the guard leaves that path untouched.
+	bool created_ts = false;
+	if(this->telecom_system == NULL)
+	{
+		this->telecom_system = new cl_telecom_system();
+		created_ts = true;
+	}
 	auto check = [&](bool cond, const char* what, long got, long want) {
 		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
 		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
@@ -5619,6 +5631,7 @@ int cl_arq_controller::test_reseat_span()
 	// Clean up the env for any subsequent test.
 	set_env("MERCURY_W_PREVCOUNT_DEFEAT", "");
 	set_env("MERCURY_W_SPANGATE_DEFEAT", "");
+	if(created_ts) { delete this->telecom_system; this->telecom_system = NULL; }
 
 	printf("%s %s: failed=%d (STOCK short=%d deficit=%d; fixes-on 0; healthy=%d widen=%d)\n",
 		TAG, failed == 0 ? "PASS" : "FAIL", failed, d_stock, d_stock >= 0 ? (CRED - d_stock) : -1,
