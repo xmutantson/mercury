@@ -1874,6 +1874,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_reseat_span();
             }
+            // CMD-side id-skew ROOT (the correct-by-construction TX counterpart to the reseat
+            // keystones): a fresh non-mixed new-data batch is rebased to messages_tx slots [0,ND)
+            // so the wire id == batch position == receiver storage loc. Reproduces the bsi33->bsi34
+            // +38 skew via the PRODUCTION add_message_tx_data first-free staging, asserts the
+            // rebase corrects it (and the defeat env preserves it), and that the §87 geometry with
+            // id=seq DELIVERS IN PLACE (6301 B) through the production receiver. CANONICAL_NUMBERS.md §87.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_cmd_idskew();
+            }
             // ROBUST->OFDM ADOPT live-burst PRESERVE regression (the last transition-class hole:
             // the unilateral adopt into an OFDM config used to WIPE the in-flight preamble
             // mid-capture -> no acquire -> TERMINAL BREAK -> ROBUST_0 spiral). Member test on a
@@ -3727,6 +3737,7 @@ int main(int argc, char *argv[])
     bool test_inband_seamless_cli = false;  // --test-inband-seamless: in-band Stage 3d — PRE-FRAME SEAMLESS.
     bool test_inband_downladder_cli = false;  // --test-inband-downladder: down-ladder BREAK-orphan + silent-snapshot regression.
     bool test_reseat_span_cli = false;  // --test-reseat-span: prev-batch cross-storage index-skew 332-byte deletion keystone.
+    bool test_cmd_idskew_cli = false;  // --test-cmd-idskew: CMD-side id-skew root — rebase a fresh new-data batch to slots [0,ND).
     bool test_inband_deliver_cli = false;  // --test-inband-deliver: forward-healthy reverse-ACK miss -> NO-BREAK deliver regression.
     bool test_linkphase_shadow_cli = false; // --test-linkphase-shadow: increment-1 shadow-agreement directed unit.
     bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
@@ -4753,6 +4764,19 @@ int main(int argc, char *argv[])
             // plus healthy + res_c3100-widen no-false-fire controls. See arq_responder.cc
             // test_reseat_span + data-flow-messages_rx_prev.md §4.5.
             test_reseat_span_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cmd-idskew") == 0)
+        {
+            // CMD-side id-skew ROOT (one-shot at startup, exit rc): the correct-by-construction
+            // TX counterpart to the reseat keystones. Drives the PRODUCTION add_message_tx_data
+            // staging of two consecutive new-data batches (the second skewed to slots [PRIOR,..)),
+            // then the PRODUCTION rebase — STOCK (MERCURY_CMD_IDSKEW_DEFEAT=1) reproduces the
+            // first-tx id=seq+PRIOR skew, FIX rebases to id=seq — plus a §87-geometry arm where
+            // id=seq now DELIVERS IN PLACE (full 6301 B) through the production receiver. See
+            // arq_commander.cc test_cmd_idskew + CANONICAL_NUMBERS.md §87.
+            test_cmd_idskew_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7000,6 +7024,17 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_reseat_span();
             printf("[FLAG] Reseat-span test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_cmd_idskew_cli) {
+            // CMD id-skew root (one-shot, exit rc). Drives the PRODUCTION staging + rebase;
+            // STOCK reproduces the id=seq+prior skew, FIX rebases to id=seq, and the §87
+            // geometry with id=seq DELIVERS IN PLACE (6301 B) through the production receiver.
+            printf("[FLAG] --test-cmd-idskew: invoking CMD-side new-data slot-rebase regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_cmd_idskew();
+            printf("[FLAG] CMD-idskew test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

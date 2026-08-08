@@ -3075,6 +3075,26 @@ public:
   // data-flow-messages_rx_prev.md §4.5 CORRECTION.
   int test_reseat_span();
 
+  // CMD ID-SKEW ROOT (the correct-by-construction TX-side counterpart to the reseat
+  // keystones): rebase a fresh NON-MIXED new-data batch's frames down to messages_tx
+  // slots [0, ND) so the wire id (== the messages_tx slot the first-free allocator
+  // handed out) equals the batch position — which the RSP uses as the storage loc and
+  // the CMD SACK read / prev-retain path index the received-bitmap by. Restores the
+  // "batch occupies slots [0, data_batch_size)" invariant that the whole ARQ id/loc
+  // correlation assumes, which breaks when the previous batch is still unconfirmed in
+  // the low slots at staging time (the bsi33->bsi34 +38 skew, CANONICAL_NUMBERS.md §87).
+  // Returns the number of frames rebased. MERCURY_CMD_IDSKEW_DEFEAT=1 reverts it (the
+  // fail-before arm). No-op / byte-identical when already contiguous or the mixed path.
+  int cmd_rebase_newdata_slots();
+
+  // CMD ID-SKEW regression (CLI --test-cmd-idskew): drives the PRODUCTION staging
+  // (add_message_tx_data first-free) of two consecutive new-data batches so the second
+  // lands at skewed slots, then the PRODUCTION rebase, asserting the wire-id source
+  // (messages_tx[i].id) == batch position after the fix and == seq+prior-count with the
+  // defeat env; plus a §87-geometry arm driving the PRODUCTION RSP store->seal->deliver
+  // with the corrected id=seq that now DELIVERS IN PLACE (count honest AND bytes complete).
+  int test_cmd_idskew();
+
   // ROBUST->OFDM ADOPT: PRESERVE THE LIVE IN-FLIGHT BURST (CLI --test-inband-adopt-preserve).
   // The last transition-class hole: the unilateral adopt INTO an OFDM config wiped the in-flight
   // OFDM preamble already mid-capture (HINGE-1 unconditional ring memset) -> FTR search_raw=0 ->
