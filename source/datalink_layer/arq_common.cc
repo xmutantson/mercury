@@ -890,11 +890,14 @@ cl_arq_controller::cl_arq_controller()
 		const char* bco = std::getenv("MERCURY_BATCH_COAST_DEFEAT");
 		batch_coast_defeat = (bco && *bco && atoi(bco) != 0);
 		batch_coast_advances = 0;
-		// P2 BOUNDED COAST — DEFAULT-OFF (<=0). MERCURY_BATCH_COAST_MAX=N caps the
-		// coast at depth N and forces a clean re-acquire past a DEEP over-read;
-		// unset/<=0 keeps the stock full-batch bound (byte-identical to base).
+		// P2 BOUNDED COAST — DEFAULT-ON (depth 8; =0 disables). Unset caps the coast
+		// at depth 8 and forces a clean re-acquire past a DEEP over-read;
+		// MERCURY_BATCH_COAST_MAX=N overrides the depth; =0 (or <=0) keeps the stock
+		// full-batch bound (byte-identical to base). 8 is the R6-armed depth
+		// (_research/CANONICAL_NUMBERS.md §84): above the benign shallow over-read so
+		// the sparse-fade multi-frame coast still runs, below the pathological deep.
 		const char* bcm = std::getenv("MERCURY_BATCH_COAST_MAX");
-		batch_coast_max = (bcm && *bcm) ? atoi(bcm) : 0;
+		batch_coast_max = (bcm && *bcm) ? atoi(bcm) : 8;   // DEFAULT-ON (=0 disables)
 		batch_coast_stops = 0;
 		// Catastrophic-partial fast-down (FIX 2). Ships DEFAULT-ON.
 		// MERCURY_AXIS2_FASTDOWN_DEFEAT=1 restores the stock 3-consecutive-bad down
@@ -16771,8 +16774,8 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 bool cl_arq_controller::batch_coast_try_advance(int frame_symb, int upper,
 	int pream_symb, bool frame_data_missing, int* ftr)
 {
-	// P2 BOUNDED COAST (default-OFF). coast_bound is the stock full-batch bound
-	// unless MERCURY_BATCH_COAST_MAX=N (0<N<data_batch_size) tightens it.
+	// P2 BOUNDED COAST (DEFAULT-ON depth 8; =0 disables). coast_bound is the stock
+	// full-batch bound unless batch_coast_max (0<N<data_batch_size) tightens it.
 	int coast_bound = data_batch_size;
 	if(batch_coast_max > 0 && batch_coast_max < data_batch_size)
 		coast_bound = batch_coast_max;
@@ -16863,6 +16866,19 @@ int cl_arq_controller::test_batch_coast()
 		fflush(stdout);
 	};
 
+	// DEFAULT-ON verification (=0 disables): the ctor env-latch (arq_common.cc:897)
+	// arms P2 at depth 8 when MERCURY_BATCH_COAST_MAX is unset, and disables it (0)
+	// when the env is "0". Read the ctor-latched member BEFORE prime() overwrites it.
+	// FAILS on the pre-flip default (latched 0 != expected 8), PASSES once the default
+	// is armed -- the fail-before/pass-after for the default flip. With the env "0"
+	// exported this expects 0 and passes (the =0 escape to the byte-identical base).
+	{
+		const char* bcm_env = std::getenv("MERCURY_BATCH_COAST_MAX");
+		int expect_default_on = (bcm_env && *bcm_env) ? atoi(bcm_env) : 8;
+		check(batch_coast_max == expect_default_on,
+			"DEFAULT-ON: ctor latch arms P2 (env-unset => depth 8; =0 disables)");
+	}
+
 	// REAL cfg15 PHY geometry (buffer_Nsymb=139, Nsymb=12, preamble=4 => frame_symb=16,
 	// upper=123 -- the exact values the failing coalescing cells ran at).
 	cl_telecom_system ts;
@@ -16884,7 +16900,7 @@ int cl_arq_controller::test_batch_coast()
 		current_configuration = CONFIG_15;
 		data_batch_size = 12;                 // declared B
 		batch_coast_defeat = false;
-		batch_coast_max = 0;                  // P2 default-OFF (stock full-batch bound)
+		batch_coast_max = 0;                  // P2 disabled here (stock full-batch bound)
 		batch_coast_stops = 0;
 		ts.bigblock_framing_enabled = false;
 		ts.receive_stats.ofdm_batch_active = true;

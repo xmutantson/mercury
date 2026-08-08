@@ -6163,10 +6163,10 @@ public:
   // (diagnostic-discipline #7). 0 on a run where coast never fired.
   long long batch_coast_advances;
   // P2 BOUNDED COAST (data-flow-linkphase-break-storm.md §5 P2;
-  // _research/CANONICAL_NUMBERS.md §70/§72). DEFAULT-OFF: batch_coast_max<=0 =>
-  // the coast keeps its stock full-batch bound (coast_frames_since_anchor <
-  // data_batch_size) => byte-identical to base. When armed
-  // (MERCURY_BATCH_COAST_MAX=N, 0<N<data_batch_size), a coast that reaches depth N
+  // _research/CANONICAL_NUMBERS.md §70/§72/§84). DEFAULT-ON (depth 8; =0 disables):
+  // MERCURY_BATCH_COAST_MAX=0 (or <=0) => the coast keeps its stock full-batch bound
+  // (coast_frames_since_anchor < data_batch_size) => byte-identical to base. When
+  // armed (unset => 8, or =N with 0<N<data_batch_size), a coast that reaches depth N
   // — while the stock bound would still coast — is a DEEP over-read (the field
   // storm coasts to 46-55 = full batch; benign turnaround over-reads stop at
   // depth <=4 on frame_data_missing), so instead of coasting deeper into the

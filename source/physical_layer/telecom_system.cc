@@ -3146,17 +3146,17 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			return (e && *e) ? atof(e) : 0.50;  // at/above this C => trust a thin-grid recovered onset
 		}();
 		// P1 ACQ BAND-EXCLUSION (data-flow-linkphase-break-storm.md §5 P1;
-		// _research/CANONICAL_NUMBERS.md §70/§72). Default-OFF: unset =>
+		// _research/CANONICAL_NUMBERS.md §70/§72/§84). DEFAULT-ON (=0 disables):
+		// unset => acq_band_excl==1 => a repeat sub-peak reject inside an
+		// already-recorded rejected BAND (radius acq_excl_radius, default 2 OFDM
+		// symbols — the field storm band ~141k-147k spans ~2 symbols per side of a
+		// center) forces a clean grid re-acquire past the band instead of the
+		// no-exclusion restore-orig_delay re-lock. MERCURY_ACQ_BAND_EXCL=0 =>
 		// acq_band_excl==0 => the exclusion block is skipped => byte-identical to
-		// base. When armed, a repeat sub-peak reject inside an already-recorded
-		// rejected BAND (radius acq_excl_radius, default 2 OFDM symbols — the
-		// field storm band ~141k-147k spans ~2 symbols per side of a center)
-		// forces a clean grid re-acquire past the band instead of the
-		// no-exclusion restore-orig_delay re-lock. See the header comment on
-		// acq_excl_center[].
+		// base. See the header comment on acq_excl_center[].
 		static const int acq_band_excl = []{
 			const char* e = std::getenv("MERCURY_ACQ_BAND_EXCL");
-			return (e && *e) ? atoi(e) : 0;   // DEFAULT-OFF
+			return (e && *e) ? atoi(e) : 1;   // DEFAULT-ON (=0 disables)
 		}();
 		static const int acq_excl_radius_env = []{
 			const char* e = std::getenv("MERCURY_ACQ_EXCL_RADIUS");
@@ -4015,7 +4015,7 @@ skip_h_retry_point:
 					printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
 						receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
 					fflush(stdout);
-					// P1 ACQ BAND-EXCLUSION (default-OFF). Record this rejected
+					// P1 ACQ BAND-EXCLUSION (DEFAULT-ON, =0 disables). Record this rejected
 					// delay as a band center; if it lands inside an ALREADY-recorded
 					// band (a confirmed repeat re-pick — the storm's absorbing
 					// no-exclusion loop that restores orig_delay every trial), stop

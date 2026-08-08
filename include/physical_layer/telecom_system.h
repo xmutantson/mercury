@@ -499,9 +499,10 @@ public:
 	// sub-peak reject lands inside an already-recorded band (a confirmed repeat
 	// re-pick, the storm signature), forces a clean grid re-acquire past the band
 	// instead of restoring the wrong point again. Ring of recent band centers;
-	// reset on any successful decode (re-anchor). Env-gated default-OFF
-	// (MERCURY_ACQ_BAND_EXCL): unset => the whole block is skipped =>
-	// byte-identical to base. It fires ONLY inside the sub-peak reject branch, so
+	// reset on any successful decode (re-anchor). Env-gated DEFAULT-ON
+	// (MERCURY_ACQ_BAND_EXCL, =0 disables): unset => the block is armed;
+	// MERCURY_ACQ_BAND_EXCL=0 => the whole block is skipped => byte-identical to
+	// base. It fires ONLY inside the sub-peak reject branch, so
 	// a real preamble (mean|H|~1.0, never a sub-peak) can never trigger it — no
 	// clean-path regression by construction. RESPONDER receive-loop local; no
 	// COMMANDER RTO state touched.
