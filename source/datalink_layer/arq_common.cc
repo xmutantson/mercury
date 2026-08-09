@@ -9048,6 +9048,10 @@ void cl_arq_controller::update_robust_preamble_negotiation()
 
 void cl_arq_controller::reset_session_state()
 {
+	printf("RX-OVERRUN-TOTAL n=%ld\n",
+		telecom_system->data_container.nUnder_processing_events_total.exchange(0));
+	fflush(stdout);
+
 	// Held-rung burst coalescing: a session boundary (BREAK teardown, link-timeout
 	// reset, clean reconnect — every genuine teardown routes here) restarts the
 	// held-rung probation so the climb-confirm pin re-engages on the next session.

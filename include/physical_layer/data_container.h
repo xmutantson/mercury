@@ -143,6 +143,7 @@ class cl_data_container
 	_Atomic(int) frames_to_read;
 	_Atomic(int) data_ready;
 	_Atomic(int) nUnder_processing_events;
+	_Atomic(long) nUnder_processing_events_total;
 	_Atomic(int) buffer_Nsymb;
 	int buffer_Nsymb_min{0};  // Monitor mode: minimum buffer size (0=auto-calculate)
 	_Atomic(int) rx_mute;

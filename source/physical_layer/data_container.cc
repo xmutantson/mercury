@@ -72,6 +72,7 @@ cl_data_container::cl_data_container()
 	this->frames_to_read=0;
 	this->data_ready=0;
 	this->nUnder_processing_events=0;
+	this->nUnder_processing_events_total=0;
 	this->rx_mute=0;
 	this->ring_write_index=0;
 	this->start_ack_causal_generation=0;

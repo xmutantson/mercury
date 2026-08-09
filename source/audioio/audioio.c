@@ -1887,8 +1887,10 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 			// Without this gate, NB MFSK fills of 500+ symbols inflate nUnder
 			// to ~500, wiping out mfsk_search_raw and causing re-decode of
 			// stale preambles (RSP stuck in FAIL decode loop).
-			if(data_container_ptr->data_ready == 1 && data_container_ptr->frames_to_read <= 0)
+			if(data_container_ptr->data_ready == 1 && data_container_ptr->frames_to_read <= 0) {
 				data_container_ptr->nUnder_processing_events++;
+				data_container_ptr->nUnder_processing_events_total++;
+			}
 
 			// Double-mapped ring buffer write: write at write_index AND
 			// write_index+sp (mirror). Reading sp samples from any position
