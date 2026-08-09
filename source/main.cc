@@ -1965,6 +1965,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_linkphase_shadow();
             }
+            // MC-7 optimizer clock regression: a completed keydown's END-stamped
+            // duration wins over a different live derive after a geometry switch;
+            // a stale epoch retains the legacy live fallback.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_linkphase_optclock_end_stamp();
+            }
             // In-band capture-ring ROBUST-floor OVER-SEAT regression (the CONFIG_8-climb
             // 24/25-BREAK root): inband_seat_robust_ring_floor over-grew the climbed OFDM
             // ring to the ROBUST floor -> frame-0 SKIP-VAR every batch. Member test on a

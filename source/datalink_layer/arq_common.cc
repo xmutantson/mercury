@@ -10495,7 +10495,7 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 			force_full = false;
 		}
 		const int measured_wire_ms =
-			derive_keydown_length_ms(batch_frames, force_full);
+			lp_optclock_keydown_ms(batch_frames, force_full);
 		rate_opt.set_switch_cost_ms(1800);
 		rate_opt.set_wire_ms_per_batch((double)measured_wire_ms);
 	}
@@ -12607,6 +12607,77 @@ void cl_arq_controller::lp_note_break(int bsi)
 void cl_arq_controller::lp_note_config_switch()
 {
 	lp_config_gen++;  // new config generation -> every future epoch stamp bumps
+}
+
+// MC-7 optimizer clock selector. A completed local keydown owns its duration at END;
+// re-deriving that historical transmission after a geometry change overstates or
+// understates the wire clock. The epoch-generation guard rejects a stamp from an old
+// configuration, and every absent/stale case preserves the former live derivation.
+int cl_arq_controller::lp_optclock_keydown_ms(int fallback_frames,
+	bool fallback_force_full, bool* used_end_stamp) const
+{
+	if(used_end_stamp) *used_end_stamp = false;
+	const uint32_t stamped_bsi = lp_state.epoch & 0xFFu;
+	const bool stamp_current =
+		linkphase_last_kd_frames > 0
+		&& lp_state.epoch == lp_make_epoch((int)stamped_bsi)
+		&& lp_state.owner_keydown_end_ms > lp_keydown_start_ms;
+	if(stamp_current)
+	{
+		if(used_end_stamp) *used_end_stamp = true;
+		return (int)(lp_state.owner_keydown_end_ms - lp_keydown_start_ms);
+	}
+	return derive_keydown_length_ms(fallback_frames, fallback_force_full);
+}
+
+// Synthetic geometry-switch regression for MC-7. The END stamp records 5000 ms,
+// then live geometry changes so the legacy re-derive becomes 6000 ms. Production's
+// selector must feed the optimizer the historical END duration; after an epoch bump,
+// the same stamp is stale and must take the live fallback.
+int cl_arq_controller::test_linkphase_optclock_end_stamp()
+{
+	int fails = 0;
+	telecom_system = NULL;
+	message_transmission_time_ms = 500;
+	data_batch_size = 10;
+	lp_reset();
+	lp_note_keydown_start(/*bsi=*/7);
+	linkphase_last_kd_frames = 10;
+	linkphase_last_kd_force_full = false;
+	lp_note_keydown_end(/*bsi=*/7, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+
+	message_transmission_time_ms = 600; // post-END geometry: live derive is now 6000 ms
+	const int live_ms = derive_keydown_length_ms(10, false);
+	bool used_stamp = false;
+	const int optimizer_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(live_ms != 6000 || optimizer_ms != 5000 || !used_stamp)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: live=%d optimizer=%d stamp=%d "
+		       "(expected live=6000 optimizer=5000 stamp=1)\n",
+			live_ms, optimizer_ms, used_stamp ? 1 : 0);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: geometry-switch optimizer input uses "
+		       "END stamp 5000 ms, not live re-derive 6000 ms\n");
+
+	lp_note_config_switch();
+	used_stamp = true;
+	const int stale_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(stale_ms != live_ms || used_stamp)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: stale stamp fallback=%d live=%d stamp=%d\n",
+			stale_ms, live_ms, used_stamp ? 1 : 0);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: stale epoch rejects END stamp and "
+		       "falls back to live derive %d ms\n", stale_ms);
+
+	printf("[TEST-LP-OPTCLOCK] %s (failures=%d)\n", fails ? "FAIL" : "ALL PASS", fails);
+	fflush(stdout);
+	return fails;
 }
 
 // Directed in-process unit for the increment-1 shadow primitive. Synthetic-fires the

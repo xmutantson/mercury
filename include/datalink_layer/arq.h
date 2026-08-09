@@ -3167,6 +3167,7 @@ public:
   // short-batch clamp and a fail-before shortening), and the epoch bump on config-switch/BREAK.
   // Returns 0=PASS. In-process, no IONOS/RF. See data-flow-linkphase-primitive.md.
   int test_linkphase_shadow();
+  int test_linkphase_optclock_end_stamp();
 
   // IN-BAND CAPTURE-RING ROBUST-FLOOR OVER-SEAT TEST (CLI --test-inband-ring-floor).
   // Drives inband_seat_robust_ring_floor() at CONFIG_8 (a climbed OFDM rung holding its natural
@@ -6992,6 +6993,8 @@ private:
   void lp_note_ack_decoded();                             // CMD decodes reverse ACK: owner=TURNAROUND
   void lp_note_break(int bsi);                            // BREAK re-stage: owner=CMD_KEYED, epoch re-stamp
   void lp_note_config_switch();                           // config switch: ++lp_config_gen (epoch generation)
+  int  lp_optclock_keydown_ms(int fallback_frames, bool fallback_force_full,
+                              bool* used_end_stamp = NULL) const;
   // === end LINK-PHASE PRIMITIVE ===================================================
   // LINK-PHASE STEP 5 / MC-3. CMD-only, never on wire. A wait is armed only for
   // a valid Step-2 derived ACK_SLOT. The close latch makes the miss edge one-shot
