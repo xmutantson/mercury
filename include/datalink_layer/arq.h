@@ -3086,7 +3086,8 @@ public:
   // correlation assumes, which breaks when the previous batch is still unconfirmed in
   // the low slots at staging time (the bsi33->bsi34 +38 skew, CANONICAL_NUMBERS.md §87).
   // Returns the number of frames rebased. MERCURY_CMD_IDSKEW_DEFEAT=1 reverts it (the
-  // fail-before arm). No-op / byte-identical when already contiguous or the mixed path.
+  // fail-before arm). Applies to both v1 and v2 non-mixed batches; no-op / byte-identical
+  // when already contiguous or the v2 mixed path.
   int cmd_rebase_newdata_slots();
 
   // CMD ID-SKEW regression (CLI --test-cmd-idskew): drives the PRODUCTION staging

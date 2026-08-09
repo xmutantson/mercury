@@ -3146,8 +3146,9 @@ int cl_arq_controller::add_message_tx_data(char type, int length, char* data)
 // Rather than teach every id/loc consumer to distinguish slot from batch-position (a wide,
 // error-prone decoupling), RESTORE the invariant at the build transition: compact the fresh
 // batch's frames down to slots [0, ND). Then slot == id == batch position == loc for every
-// consumer, correct-by-construction, and the batch DELIVERS IN PLACE. Non-mixed sack_v2 only
-// (the mixed path already assigns the ordinal id via set_batch_tx_slot). Byte-identical when
+// consumer, correct-by-construction, and the batch DELIVERS IN PLACE. Applies to non-mixed v1
+// and v2 batches (the v2 mixed path already assigns the ordinal id via set_batch_tx_slot).
+// Byte-identical when
 // the frames are already contiguous at [0, ND) — the healthy case does no work. Moves in
 // ascending target order (each source slot >= its target, so a slot is always free by the
 // time it is written) and is ALL-OR-NOTHING: it bails without moving if any target slot holds
@@ -3159,7 +3160,6 @@ int cl_arq_controller::cmd_rebase_newdata_slots()
 {
 	{ const char* e = std::getenv("MERCURY_CMD_IDSKEW_DEFEAT");
 	  if(e && *e && atoi(e) != 0) return 0; }        // fail-before arm: leave the skew in place
-	if(!sack_v2_enabled) return 0;                   // wire id/loc coupling is a sack_v2 concern
 
 	// Gather this batch's staged new-data frames in ASCENDING slot order (one batch's worth).
 	int src[MAX_SACK_BATCH_SIZE];
@@ -3635,7 +3635,8 @@ void cl_arq_controller::process_messages_tx_data()
 	//
 	// ID-SKEW ROOT FIX (§87): before assigning batch positions, rebase a fresh non-mixed
 	// new-data batch's frames down to messages_tx slots [0, ND) so the wire id (= slot) equals
-	// the batch position the receiver stores at. The mixed path already assigns the ordinal id
+	// the batch position the receiver stores at. This applies to v1 and v2: both serialize .id
+	// and store by it. The v2 mixed path already assigns the ordinal id
 	// via set_batch_tx_slot, so skip it there. No-op / byte-identical for an already-contiguous
 	// batch. See cmd_rebase_newdata_slots() above for the full mechanism + invariant.
 	if(!v2_mixed_batch)
@@ -20890,6 +20891,70 @@ int cl_arq_controller::test_cmd_idskew()
 	check(ids_ok, "FIX: every new-data frame wire id == its seq (0..ND-1, no skew)", first_id, 0);
 	check(bytes_ok, "FIX: payload preserved byte-exact across the rebase (no alias/corruption)", bytes_ok?1:0, 1);
 	check(high_free, "FIX: the skewed high slots are vacated (FREE)", high_free?1:0, 1);
+
+	// ---- ARM V1 DECISIVE: the same occupied-low-slot staging with sack_v2 disabled.
+	// v1 serializes messages_tx[].id too, and the responder stores by that id, so it needs
+	// the same slot==sequence invariant even though it does not carry a batch_seq_id byte.
+	// Drive the production first-free allocator, the production rebase, and the production
+	// receiver store/delivery path.  This is deliberately 38 non-mixed frames: the
+	// recorded +38 skew leaves only ids 38/39 inside the nominal 40-frame receive window.
+	{
+		sack_v2_enabled = false;
+		stage_skew();
+		int moved_v1 = cmd_rebase_newdata_slots();
+		check(moved_v1 == ND, "V1: occupied-low-slot batch rebased to [0,ND)", moved_v1, ND);
+
+		char expected[6301];
+		char wire_payload[ND][L];
+		char wire_id[ND];
+		int wire_len[ND];
+		int expected_n = 0;
+		int wire_n = 0;
+		bool v1_ids_ok = true;
+		for(int slot=0; slot<nMessages && wire_n<ND; slot++) {
+			if(messages_tx[slot].status != ADDED_TO_LIST) continue;
+			int seq = wire_n++;
+			int fl = (seq == ND-1) ? 159 : L;
+			for(int j=0; j<fl; j++) expected[expected_n++] = (char)(unsigned char)(seq*7 + j);
+			wire_id[seq] = messages_tx[slot].id;
+			wire_len[seq] = fl;
+			memcpy(wire_payload[seq], messages_tx[slot].data, (size_t)fl);
+			if((int)(unsigned char)wire_id[seq] != seq) v1_ids_ok = false;
+		}
+		check(wire_n == ND && v1_ids_ok, "V1: all serialized wire ids equal sequence",
+			v1_ids_ok?1:0, 1);
+
+		nMessages = 255;
+		if(init_messages_buffers() != SUCCESSFUL) { check(false,"init_messages_buffers(v1 deliver)",0,1); }
+		fifo_buffer_rx.set_size(262144);
+		fifo_buffer_rx.flush();
+		sack_v2_enabled = false; sack_enabled = true; axis3_sack_mode = 0;
+		compression_enabled = false; header_carries_d5 = true; passive_monitor = false;
+		link_status = CONNECTED; connection_status = RECEIVING; inband_rate_enabled = 1;
+		data_batch_size = 40; batch_data_delivered = false;
+		rsp_current_expected_batch_seq_id = 34; rsp_prev_batch_seq_id = -1;
+		rsp_prev_batch_active = false; rsp_prev_batch_received_count = 0; rsp_prev_batch_expected_count = 0;
+		rsp_last_delivered_batch_seq_id = 33; rsp_stream_aborted = false; rx_stream_delivered = 0;
+		rx_stream_emitted_bsi_hw = -1; decrypt_delivered_bsi = -1;
+		rsp_cross_session_seam_armed = false; rsp_rebase_seam_armed = false;
+		for(int i=0;i<256;i++) rx_stream_stamp[i].valid = false;
+		rx_batch_total_frames = ND; rx_buffer_batch_total_frames = ND; last_received_end_of_batch_seq = -1;
+		int stored = 0;
+		for(int seq=0; seq<ND; seq++)
+			if(add_message_rx_data(DATA_LONG, wire_id[seq], wire_len[seq],
+				wire_payload[seq]) == SUCCESSFUL) stored++;
+		for(int i=0; i<data_batch_size; i++)
+			if(messages_rx[i].status == RECEIVED) messages_rx[i].status = ACKED;
+		rx_copy_window = ND;
+		decrypt_delivered_bsi = -1;
+		copy_data_to_buffer();
+		char delivered_bytes[6301];
+		int delivered = fifo_buffer_rx.pop(delivered_bytes, (int)sizeof(delivered_bytes));
+		bool bytes_equal = delivered == expected_n && memcmp(delivered_bytes, expected, (size_t)expected_n) == 0;
+		check(stored == ND, "V1: all 38 frames stored in-window", stored, ND);
+		check(delivered == expected_n, "V1: delivered byte count is complete", delivered, expected_n);
+		check(bytes_equal, "V1: delivered bytes equal expected sequence", bytes_equal?1:0, 1);
+	}
 
 	// ---- ARM DELIVER-IN-PLACE: the §87 geometry (dbs=40 > d5=38) with the CORRECTED id=seq
 	// now DELIVERS IN PLACE through the PRODUCTION receiver (the prize). All 38 frames store at

@@ -1875,10 +1875,12 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_reseat_span();
             }
             // CMD-side id-skew ROOT (the correct-by-construction TX counterpart to the reseat
-            // keystones): a fresh non-mixed new-data batch is rebased to messages_tx slots [0,ND)
+            // keystones): a fresh v1/v2 non-mixed new-data batch is rebased to
+            // messages_tx slots [0,ND)
             // so the wire id == batch position == receiver storage loc. Reproduces the bsi33->bsi34
             // +38 skew via the PRODUCTION add_message_tx_data first-free staging, asserts the
-            // rebase corrects it (and the defeat env preserves it), and that the §87 geometry with
+            // rebase corrects it in both wire versions (and the defeat env preserves it),
+            // and that the §87 geometry with
             // id=seq DELIVERS IN PLACE (6301 B) through the production receiver. CANONICAL_NUMBERS.md §87.
             {
                 cl_arq_controller test_arq;
@@ -4773,7 +4775,7 @@ int main(int argc, char *argv[])
             // TX counterpart to the reseat keystones. Drives the PRODUCTION add_message_tx_data
             // staging of two consecutive new-data batches (the second skewed to slots [PRIOR,..)),
             // then the PRODUCTION rebase — STOCK (MERCURY_CMD_IDSKEW_DEFEAT=1) reproduces the
-            // first-tx id=seq+PRIOR skew, FIX rebases to id=seq — plus a §87-geometry arm where
+            // first-tx id=seq+PRIOR skew, FIX rebases v1/v2 to id=seq — plus a §87-geometry arm where
             // id=seq now DELIVERS IN PLACE (full 6301 B) through the production receiver. See
             // arq_commander.cc test_cmd_idskew + CANONICAL_NUMBERS.md §87.
             test_cmd_idskew_cli = true;
