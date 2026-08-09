@@ -3980,13 +3980,14 @@ void cl_arq_controller::topgear_elect_evaluate()
 	{
 		// BLOCKER D (B2) — split the DROP by CAUSE. A lone flat-BUT-below-floor report
 		// (flat_state==9) at a still-cfg16-viable channel is a per-batch SNR_downlink dip
-		// (measured 27.49 at a nominal 43.58 dial vs the 28.7 floor), NOT channel truth, so
-		// it needs TOPGEAR_BELOW_FLOOR_DROP_STREAK CONSECUTIVE below-floor reports to drop.
-		// The 2-path SAFETY signal (non-flat, flat_state==10), a margin loss, or an unmeasured
-		// report keeps the IMMEDIATE single-report drop. Safety preserved: @28 refusal is
-		// ENGAGE-side (a code-9 channel never reaches the code-11 the engage streak needs), and
-		// a true 28-band channel is below-floor EVERY report so 2-consecutive is met within 2
-		// reports. margin_ok is recomputed exactly as topgear_channel_clean() so a real cfg16
+		// (measured 27.49 at a nominal 43.58 dial vs the CFG17_SNR_FLOOR_DEFAULT_DB floor),
+		// NOT channel truth, so it needs TOPGEAR_BELOW_FLOOR_DROP_STREAK CONSECUTIVE
+		// below-floor reports to drop. The 2-path SAFETY signal (non-flat, flat_state==10), a
+		// margin loss, or an unmeasured report keeps the IMMEDIATE single-report drop. Safety
+		// preserved: below-floor refusal is ENGAGE-side (a code-9 channel never reaches the
+		// code-11 the engage streak needs), and a channel parked below the floor is below-floor
+		// EVERY report so 2-consecutive is met within 2 reports. margin_ok is recomputed
+		// exactly as topgear_channel_clean() so a real cfg16
 		// margin loss is NEVER held. Guard-off / non-flat => byte-identical fast drop.
 		bool margin_ok = (get_configuration(measurements.SNR_downlink - TOPGEAR_ELECT_MARGIN_DB) >= CONFIG_16);
 		bool below_floor_only = (topgear_last_flat_state == 9) && margin_ok;

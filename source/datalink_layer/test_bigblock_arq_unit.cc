@@ -1293,6 +1293,30 @@ int cl_arq_controller::test_topgear_clean_election()
 	cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
 	cmd->current_configuration = CONFIG_16;
 
+	// (8b) OVER-FLOOR GUARD REFIT armed smoke (CFG17_SNR_FLOOR_DEFAULT_DB = the honest
+	//      steady-axis floor). Arm the guard at the calibrated floor and drive the REAL
+	//      pack->apply->evaluate transport at a reliable-dial forward anchor: SNR_downlink
+	//      ~25.67 clears the 24.0 floor (flat_state 11) and ENGAGES cfg17. FAIL-BEFORE at the
+	//      pre-refit 28.7 floor: 25.67 < 28.7 -> flat_state 9 -> never engages (welded shut).
+	{
+		char refitbuf[32];
+		snprintf(refitbuf, sizeof(refitbuf), "%.4f", (double)CFG17_SNR_FLOOR_DEFAULT_DB);
+		set_env("MERCURY_CFG17_SNR_FLOOR", refitbuf);
+		cmd->load_configuration(CONFIG_16, FULL, YES);
+		unsigned char rpt_refit = cmd->topgear_pack_report(25.67, 0.05);   // reliable-24 forward anchor
+		check((rpt_refit & 0x0F) == 11,
+		      "@24 REFIT pack: reliable-dial SNR_downlink 25.67 clears the 24.0 floor -> flat_state 11 "
+		      "(fail-before at the 28.7 floor: 25.67<28.7 -> flat_state 9)");
+		cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
+		cmd->topgear_last_report_bsi = -1; cmd->current_configuration = CONFIG_16;
+		for(int i=0;i<=STREAK;i++) cmd->topgear_apply_report(rpt_refit, 200+i);
+		check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
+		      "@24 REFIT: reliable forward anchor at the refit floor ENGAGES cfg17 (armed smoke; pass-after)");
+		clr_env("MERCURY_CFG17_SNR_FLOOR");
+		cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
+		cmd->current_configuration = CONFIG_16;
+	}
+
 	// Exercise the complete production startup and live-switch sequence that real audio exposed:
 	// start cfg17 -> pin walk -> dual bundle build -> cfg17/16 transitions. cfg17 intentionally
 	// remains out of FULL_CONFIG_LADDER and takes the loud PRECOOK-MISS legacy rebuild, which must

@@ -11861,6 +11861,34 @@ int cl_arq_controller::test_rung_floor_gate()
 		"T6: a fresh anchor-cleared meter leaves the anchor clamp identity (viable recovery unblocked)");
 	current_configuration = CONFIG_0;
 
+	// ── T7: cfg17 OVER-FLOOR GUARD refit (CFG17_SNR_FLOOR_DEFAULT_DB) ──────────────────────────
+	// The guard splits a flat forward report into flat_state 11 (>= the cfg17 decode floor,
+	// admit) vs 9 (below, refuse) using the RESPONDER's un-clipped SNR_downlink. The floor was
+	// re-anchored from a peak-mode 28.7 (which welded cfg17 shut: steady SNR_downlink maxes
+	// ~28.08 even AT the reliable floor) to the steady-axis pinned bracket value 24.0. Drive the
+	// REAL topgear_pack_report at the calibrated floor: a reliable-dial forward anchor reads
+	// SNR_downlink ~25.67 (>= 24.0) and MUST pack flat_state 11; the dead/edge dials (~22.4/23.4)
+	// pack flat_state 9. FAIL-BEFORE (28.7 floor): 25.67 < 28.7 -> flat_state 9 (no admit).
+	{
+		char floorbuf[32];
+		snprintf(floorbuf, sizeof(floorbuf), "%.4f", (double)CFG17_SNR_FLOOR_DEFAULT_DB);
+		setenv("MERCURY_CFG17_SNR_FLOOR", floorbuf, 1);
+		unsigned char rpt_admit = topgear_pack_report(25.67, 0.05);   // reliable-24 forward anchor
+		unsigned char rpt_edge  = topgear_pack_report(23.40, 0.05);   // edge-22 dial (below floor)
+		unsigned char rpt_dead  = topgear_pack_report(22.35, 0.05);   // dead-20 dial (below floor)
+		unsigned char rpt_top   = topgear_pack_report(30.60, 0.05);   // winning top anchor (34.66 dial)
+		check((rpt_admit & 0x0F) == 11,
+			"T7 refit: reliable-dial SNR_downlink 25.67 clears CFG17_SNR_FLOOR_DEFAULT_DB -> flat_state 11 "
+			"(pass-after at 24.0; FAIL-BEFORE at the 28.7 floor: 25.67<28.7 -> flat_state 9, cfg17 welded shut)");
+		check((rpt_edge & 0x0F) == 9,
+			"T7 refit: edge-dial 23.40 below the refit floor -> flat_state 9 (refuse; the 22/24 boundary holds)");
+		check((rpt_dead & 0x0F) == 9,
+			"T7 refit: dead-dial 22.35 below the refit floor -> flat_state 9 (refuse)");
+		check((rpt_top & 0x0F) == 11,
+			"T7 refit: un-clipped meter still admits the winning top anchor (SNR_downlink 30.6 -> flat_state 11)");
+		unsetenv("MERCURY_CFG17_SNR_FLOOR");
+	}
+
 	printf("[TEST-RUNG-FLOOR] done: %d failure(s)\n", fails);
 	fflush(stdout);
 	return fails;

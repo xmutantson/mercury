@@ -959,9 +959,9 @@ CONFIG_16 (5664.7 bps).
 #define TOPGEAR_REENGAGE_COOLDOWN_BATCHES 5
 // A lone flat-BUT-below-floor forward report (flat_state==9) is a per-batch SNR_downlink
 // dip at a nominally-winning channel, not channel truth (measured 27.49 at a 43.58 dial vs
-// the 28.7 floor). Require this many CONSECUTIVE below-floor reports before the engaged
-// verdict drops. The 2-path SAFETY signal (non-flat, flat_state==10) keeps the immediate
-// single-report drop; @28 refusal is ENGAGE-side (unaffected).
+// the CFG17_SNR_FLOOR_DEFAULT_DB floor). Require this many CONSECUTIVE below-floor reports
+// before the engaged verdict drops. The 2-path SAFETY signal (non-flat, flat_state==10)
+// keeps the immediate single-report drop; below-floor refusal is ENGAGE-side (unaffected).
 #define TOPGEAR_BELOW_FLOOR_DROP_STREAK 2
 
 // TOPGEAR REPORT CONSUME-RACE — deferred-decode deadline. The commander accepts a
@@ -980,25 +980,35 @@ CONFIG_16 (5664.7 bps).
 // for the deterministic unit test only (MERCURY_TOPGEAR_PENDING_DEADLINE_MS).
 #define TOPGEAR_PENDING_REPORT_DEADLINE_MS 5000
 
-// @28 OVER-FLOOR GUARD. The coarse suffix meter AND the report snr_q field both
+// OVER-FLOOR GUARD. The coarse suffix meter AND the report snr_q field both
 // SATURATE at 25 dB, so a 25-dB report cannot distinguish an SNR that clears cfg17's
 // 64-QAM decode floor from one that merely clears cfg16 — and cfg17 is HARMFUL below
-// its floor (delivers 0/N @~WGN:28). The RESPONDER, however, holds the UN-clipped
-// forward SNR at report-pack time: measurements.SNR_downlink = receive_stats.SNR =
-// 10*log10(1/EVM-variance) on the wideband LEAST_SQUARE path — NOT the narrowband-only
-// measure_SNR, and NOT saturated (it tracks to ~35 dB; measured 34.8 @43.58).
-// When MERCURY_CFG17_SNR_FLOOR is set (>0), the responder folds a floor verdict into
-// report flat_state code 11 (flat AND >= floor) vs 9 (flat, below floor); the commander
-// engages cfg17 only on 11. Default 0 => guard INACTIVE (the election behaves as before).
-// CALIBRATED on a real-loopback WGN cohort (8 seeds/anchor, decoded-frame SNR_downlink):
-// @28 (harmful) per-seed medians 25.5-26.8, frame-level max exactly 28.7; @34.66 (winning)
-// per-seed medians 30.6-31.7 with frame clear-rate 0.846 at this floor; @43.58 medians
-// 33.7-35.5. 28.7 = midpoint of the worst-case median gap (26.8 vs 30.6, ~1.9 dB/side);
-// the engage streak covers the single boundary frame @28 (28.8-29.0 would refuse it
-// outright at identical admit rate — either sits in the separating window). Arm BOTH
-// peers: the responder packs the verdict, the commander requires it (one-sided arming
-// fails CLOSED — an unarmed responder never packs code 11).
-#define CFG17_SNR_FLOOR_DEFAULT_DB 28.7
+// its floor (delivers 0/N at delivered <= ~20 dB). The RESPONDER, however, holds the
+// UN-clipped forward SNR at report-pack time: measurements.SNR_downlink =
+// receive_stats.SNR = 10*log10(1/EVM-variance) on the wideband LEAST_SQUARE path — NOT
+// the narrowband-only measure_SNR, and NOT saturated (it tracks to ~35 dB; measured
+// 34.8 at delivered 43.58). When MERCURY_CFG17_SNR_FLOOR is set (>0), the responder
+// folds a floor verdict into report flat_state code 11 (flat AND >= floor) vs 9 (flat,
+// below floor); the commander engages cfg17 only on 11. Default 0 => guard INACTIVE
+// (the election behaves as before). Arm BOTH peers: the responder packs the verdict,
+// the commander requires it (one-sided arming fails CLOSED — an unarmed responder
+// never packs code 11).
+//
+// FLOOR RE-ANCHORED 28.7 -> 24.0 (steady-axis pinned floor bracket). The original 28.7
+// was set from a PEAK-mode WGN cohort and turned out to be a measurement artifact: on
+// the on-label (steady) axis the un-clipped SNR_downlink maxes ~28.08 even AT cfg17's
+// reliable delivery floor (645 reads, none >= 28.7), so a 28.7 floor NEVER clears and
+// WELDS cfg17 shut. The corrected anchor comes from a pin=17 --no-gearshift floor
+// bracket over delivered dials {18,20,22,24,26} (steady, 0-corrupt): cfg17 is DEAD at
+// delivered <= 20 (0/8, zero bytes), an EDGE at 22 (1/4 complete), and RELIABLE at >= 24
+// (8/8 complete, keyed ~1.8x cfg16-net). The responder's un-clipped SNR_downlink reads a
+// per-cell median of ~22.4 at the dead-20 dial, ~23.4 at the edge-22 dial, and ~25.67 at
+// the reliable-24 dial (roughly delivered + 1.5-2.3 dB). A 24.0 floor therefore ADMITS
+// from the reliable dial (25.67 >= 24) while REFUSING the dead/edge dials (22.4/23.4 < 24)
+// — the honest decode floor, not the peak-hot 28.7. (Reachability at the winning top
+// anchors is unaffected: delivered 34.66/43.58 read SNR_downlink ~30.6/34.8, well clear
+// of 24.0.)
+#define CFG17_SNR_FLOOR_DEFAULT_DB 24.0
 
 // ── CFG16 (32-QAM rate-14/16) decode-margin election gate ─────────────────────────────
 // CFG16_MIN_SNR_DB: the minimum reverse-path SNR report (measurements.SNR_uplink, the peer's
