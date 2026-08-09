@@ -1298,14 +1298,22 @@ bool cl_arq_controller::rung_floor_meter_clears(int cfg) const
 	if(cfg == CONFIG_17)
 	{
 		// BLOCKER A — row-17 election floor (MERCURY_ROW17_BUMP). Default-off =>
-		// returns true (ungated, byte-identical). When armed, cfg17's 64-QAM decode
-		// floor is a bracket above cfg16: gate on rung_meter_db > RUNG_MIN_SNR_METER[17]
-		// (=24.0, strict). The suffix meter clamps at 25.0, so a saturated 25 read
-		// ADMITS (25>24) while 24.0/23.0 REFUSE; a stale snapshot fails CLOSED.
+		// returns true (ungated, byte-identical). cfg17 is a FORWARD-decode config: its
+		// 64-QAM viability is a DOWNLINK property, already measured by the top-gear guard's
+		// un-clipped SNR_downlink floor verdict (topgear_cfg17_floor_ok, packed as report
+		// flat_state 11 by the responder). The REVERSE uplink suffix meter (rung_meter_db,
+		// clamped at 25) is the WRONG instrument here and OVER-BLOCKS: at a winning forward
+		// anchor (delivered ~24, SNR_downlink ~25.67) the reverse meter can read a grid 23,
+		// and 23 > 24 is false, so the old reverse gate refused the very cfg17 the forward
+		// guard has earned (a saturated 25 read was the only reverse value that admitted).
+		// Gate on the FORWARD verdict instead; it defaults false (fail-closed) until a clean
+		// forward report clears the guard floor, so a stale/unmeasured forward channel still
+		// refuses. RUNG_MIN_SNR_METER[17] (=24.0) is retained as the documented row + J0 pin.
+		// Arm the guard (MERCURY_CFG17_SNR_FLOOR) alongside ROW17_BUMP: without a forward-floor
+		// report the responder never packs code 11, so cfg17 stays fail-closed by design.
 		const char* r17 = std::getenv("MERCURY_ROW17_BUMP");
 		if(!(r17 && atoi(r17) != 0)) return true;              // default: ungated
-		if(rung_meter_stale()) return false;                   // stale -> fail closed
-		return rung_meter_db > RUNG_MIN_SNR_METER[CONFIG_17] + rung_floor_bump_db[CONFIG_17];
+		return topgear_cfg17_floor_ok;                         // forward floor, not the reverse uplink meter
 	}
 	if(rung_meter_stale()) return false;                     // stale climb-grade snapshot -> fail closed
 	double bump = rung_floor_bump_db[cfg];
@@ -11887,6 +11895,28 @@ int cl_arq_controller::test_rung_floor_gate()
 		check((rpt_top & 0x0F) == 11,
 			"T7 refit: un-clipped meter still admits the winning top anchor (SNR_downlink 30.6 -> flat_state 11)");
 		unsetenv("MERCURY_CFG17_SNR_FLOOR");
+	}
+
+	// ── T8: BLOCKER A cfg17 forward-floor gate (MERCURY_ROW17_BUMP) ────────────────────────────
+	// cfg17's election floor must key off the FORWARD channel (topgear_cfg17_floor_ok), not the
+	// REVERSE uplink suffix meter. A winning forward anchor whose reverse meter under-reads (a
+	// FRESH grid 23, which fails the old rung_meter_db>24 reverse gate) must still admit cfg17
+	// once the forward guard has cleared. FAIL-BEFORE (reverse-meter gate): 23 > 24 is false, so
+	// rung_floor_ok(17) refused the forward-cleared cfg17.
+	{
+		setenv("MERCURY_ROW17_BUMP", "1", 1);
+		current_configuration = CONFIG_16;        // cfg17 is a climb above current (no at/below shortcut)
+		set_meter(23.0);                          // FRESH reverse meter reading a grid 23 (< the 25 clamp)
+		topgear_cfg17_floor_ok = false;           // forward floor NOT yet cleared
+		check(!rung_floor_ok(CONFIG_17),
+			"T8 blocker-A: forward floor uncleared -> cfg17 election refused (fail-closed, both arms)");
+		topgear_cfg17_floor_ok = true;            // forward guard cleared (report flat_state 11)
+		check(rung_floor_ok(CONFIG_17),
+			"T8 blocker-A: forward-cleared cfg17 ADMITS despite reverse meter 23 (pass-after; FAIL-BEFORE: "
+			"the reverse >24 gate refused 23)");
+		unsetenv("MERCURY_ROW17_BUMP");
+		topgear_cfg17_floor_ok = false;
+		current_configuration = CONFIG_0;
 	}
 
 	printf("[TEST-RUNG-FLOOR] done: %d failure(s)\n", fails);
