@@ -1600,6 +1600,12 @@ bool cl_telecom_system::acq_band_excl_hit(int delay, int radius, int* matched_ce
 	return false;
 }
 
+void cl_telecom_system::acq_band_excl_begin_epoch()
+{
+	acq_excl_count = 0;
+	acq_excl_head = 0;
+}
+
 // P1 ACQ BAND-EXCLUSION directed regression (runs in --test). Drives the REAL
 // production predicate acq_band_excl_hit() (the same call receive_byte() makes at
 // the sub-peak reject site), so the exclusion logic the storm fix relies on is
@@ -1629,8 +1635,8 @@ int cl_telecom_system::test_acq_band_excl()
 	fflush(stdout);
 	check(sym_full > 0, "cfg15 geometry loaded (sym_full>0)");
 
-	// fresh ring
-	acq_excl_count = 0; acq_excl_head = 0;
+	// Fresh capture/batch epoch.
+	acq_band_excl_begin_epoch();
 
 	// The field storm plateau band (~141k-147k full-rate samples, ~21 offsets).
 	const int PLATEAU = 142309;              // refuter-observed pinned delay
@@ -1659,11 +1665,16 @@ int cl_telecom_system::test_acq_band_excl()
 	check(!far, "far delay (out of band) is a MISS => new band, not a global block");
 	check(acq_excl_count == 2, "second band opened (count 1->2)");
 
-	// Re-anchor semantics: clearing the ring restores base behavior (next reject MISS).
-	acq_excl_count = 0; acq_excl_head = 0;
+	// Directed stale-ring regression: this relative delay now contains a valid
+	// preamble in a NEW batch. Starting that epoch must discard the former band's
+	// exclusion, so the production predicate cannot suppress the new candidate.
+	// FAIL-BEFORE: the stale ring reports HIT. PASS-AFTER: the epoch reset makes it
+	// a MISS (eligible for the normal preamble/decode path).
+	acq_band_excl_begin_epoch();
 	mc = -1;
 	bool after_reset = acq_band_excl_hit(PLATEAU, radius, &mc);
-	check(!after_reset, "after re-anchor reset: plateau reject is a MISS again (memory cleared)");
+	check(!after_reset, "new batch accepts valid preamble at formerly-excluded relative delay");
+	check(acq_excl_count == 1, "new epoch records no stale centers (candidate opens a fresh band)");
 
 	printf("[TEST-ACQ-EXCL] %s (%d failure%s)\n", failed==0?"ALL PASS":"FAILURES", failed, failed==1?"":"s");
 	fflush(stdout);
@@ -1672,6 +1683,12 @@ int cl_telecom_system::test_acq_band_excl()
 
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 {
+	// An inactive OFDM grid starts a fresh capture/batch acquisition epoch.
+	// Rejected offsets are buffer-relative and must not escape that scope.
+	// Retry trials and calls in an active batch retain the ring and can fire P1.
+	if(!receive_stats.ofdm_batch_active)
+		acq_band_excl_begin_epoch();
+
 	// P1: big-block framing branch (gated; default OFF). When set, receive_byte
 	// acquires ONCE over the captured passband and decodes the K codewords with the
 	// channel-adaptive estimator + CSI-LLR, returning the per-codeword decode result
@@ -4638,8 +4655,7 @@ skip_h_retry_point:
 				// forward stream is being read cleanly, so drop the recorded
 				// rejected-band centers (touches only P1's own members; invisible to
 				// the base path).
-				acq_excl_count = 0;
-				acq_excl_head = 0;
+				acq_band_excl_begin_epoch();
 				if(M != MOD_MFSK)
 				{
 					keydown_last_delay = receive_stats.delay;   // MINI=0 phase carry: remember the last good frame position

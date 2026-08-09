@@ -2144,7 +2144,8 @@ int main(int argc, char *argv[])
             // a BAND of delays). P1 records rejected delays as band centers and forces a
             // clean re-acquire on a repeat re-pick inside a recorded band. Drives the
             // REAL predicate acq_band_excl_hit(): FAIL-BEFORE (empty memory) misses;
-            // PASS-AFTER (band recorded) hits; BAND (not single-delay) neighbor hits.
+            // PASS-AFTER (band recorded) hits; BAND (not single-delay) neighbor hits;
+            // a new batch accepts a valid preamble at the formerly-excluded delay.
             {
                 cl_telecom_system test_excl;
                 failed += test_excl.test_acq_band_excl();

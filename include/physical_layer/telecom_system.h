@@ -499,7 +499,8 @@ public:
 	// sub-peak reject lands inside an already-recorded band (a confirmed repeat
 	// re-pick, the storm signature), forces a clean grid re-acquire past the band
 	// instead of restoring the wrong point again. Ring of recent band centers;
-	// reset on any successful decode (re-anchor). Env-gated DEFAULT-ON
+	// reset at each fresh acquisition epoch and on any successful decode
+	// (re-anchor). Env-gated DEFAULT-ON
 	// (MERCURY_ACQ_BAND_EXCL, =0 disables): unset => the block is armed;
 	// MERCURY_ACQ_BAND_EXCL=0 => the whole block is skipped => byte-identical to
 	// base. It fires ONLY inside the sub-peak reject branch, so
@@ -619,6 +620,7 @@ public:
 	// symbols from the loaded geometry. When hit, *matched_center receives the
 	// band center that matched (for the [ACQ-EXCL] fire line).
 	bool acq_band_excl_hit(int delay, int radius, int* matched_center);
+	void acq_band_excl_begin_epoch();
 	int test_acq_band_excl();
 
 	// Default-off rejection of reverse-direction narrowband MFSK bursts that
