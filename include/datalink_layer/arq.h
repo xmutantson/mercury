@@ -2822,6 +2822,8 @@ public:
   // every other value is rejected before it can affect election state.
   unsigned char topgear_pack_report(double snr, double flatness) const;
   void topgear_apply_report(unsigned char report, int batch_seq_id);
+  bool topgear_forward_report_is_fresh() const;
+  void topgear_clear_forward_verdict();
 
   // TX EMIT (design §6). Decide whether the batch about to be sent at config
   // `batch_cfg` differs from the last-announced config and, if so, build the
@@ -5014,6 +5016,7 @@ public:
   int     topgear_elect_clean_streak;   // consecutive clean+flat forward reports at CFG16
   double  topgear_channel_flatness;     // forward selectivity std|H|/mean|H| (0.0 = flat); TOPGEAR_FLATNESS_MAX gate
   bool    topgear_cfg17_floor_ok;       // @28 GUARD: RSP's UN-clipped forward SNR cleared the cfg17 64-QAM floor
+  int     topgear_cfg17_floor_bsi;      // BSI generation that earned floor_ok; -1 = no live verdict
   int     topgear_last_report_bsi;      // de-duplicates repeated compact-confirm polls; -1 = none
   // ── BLOCKER D (ACK-seam dispatch) anti-thrash state ── all dead unless MERCURY_TOPGEAR_ELECT=1.
   int     topgear_reengage_cooldown;    // B1: clean batches a seam DEMOTE bars the next seam CLIMB; 0 = free

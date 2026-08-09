@@ -1223,6 +1223,7 @@ cl_arq_controller::cl_arq_controller()
 	// measurement, indistinguishable from unmeasured — the latent false-flat default).
 	topgear_channel_flatness=-1.0;
 	topgear_cfg17_floor_ok=false;
+	topgear_cfg17_floor_bsi=-1;
 	topgear_last_report_bsi=-1;
 	topgear_reengage_cooldown=0;
 	topgear_below_floor_streak=0;
@@ -2373,7 +2374,11 @@ void cl_arq_controller::set_role(int role)
 	// per-poll tick only runs under the commander dispatch, so a stale pending
 	// would otherwise sit un-driven until the deadline). Clear it here — no-op
 	// unless MERCURY_TOPGEAR_ELECT armed one this stint.
-	topgear_pending_report_clear("role-change");
+	if(this->role != role)
+	{
+		topgear_pending_report_clear("role-change");
+		topgear_clear_forward_verdict();
+	}
 	if(role==COMMANDER)
 	{
 		// IDLE-SWITCHROLE-RACE re-ride fix (idle-switchrole-race.md §6;
@@ -3329,6 +3334,9 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// every future timeline stamp is at the new geometry (placed AFTER the same-config early
 	// return so a redundant load never bumps). Write-only; no consumer reads it.
 	lp_note_config_switch();
+	// Forward floor evidence is tied to the report/config generation that earned
+	// it. Any real PHY configuration change requires a new report.
+	topgear_clear_forward_verdict();
 	// Held-rung burst coalescing: a REAL config change (FRAME-UP, demote, BREAK
 	// reload, connect-time load) restarts the held-rung probation. Placed HERE —
 	// after the same-config early-return, BEFORE the robust pin and the OFDM batch
@@ -3347,6 +3355,7 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		topgear_elect_clean_streak = 0;
 		topgear_reengage_cooldown = 0;
 		topgear_below_floor_streak = 0;
+		topgear_clear_forward_verdict();
 	}
 	if(current_configuration!=CONFIG_NONE)
 	{
@@ -3888,7 +3897,24 @@ bool cl_arq_controller::topgear_channel_clean()
 	// Guard OFF => floor_ok is not required (identity with the pre-guard gate).
 	const char* fenv = std::getenv("MERCURY_CFG17_SNR_FLOOR");
 	bool guard_on = (fenv && *fenv && atof(fenv) > 0.0);
-	return margin_ok && flat_ok && (!guard_on || topgear_cfg17_floor_ok);
+	return margin_ok && flat_ok && (!guard_on || topgear_forward_report_is_fresh());
+}
+
+bool cl_arq_controller::topgear_forward_report_is_fresh() const
+{
+	if(!topgear_cfg17_floor_ok || topgear_cfg17_floor_bsi < 0) return false;
+	if(topgear_cfg17_floor_bsi != topgear_last_report_bsi) return false;
+	if(role != COMMANDER) return false;
+	if(current_configuration != CONFIG_16 && current_configuration != CONFIG_17) return false;
+	unsigned age = ((unsigned)(cmd_batch_seq_id & 0xFF)
+	              - (unsigned)(topgear_cfg17_floor_bsi & 0xFF)) & 0xFFu;
+	return age <= 1u;
+}
+
+void cl_arq_controller::topgear_clear_forward_verdict()
+{
+	topgear_cfg17_floor_ok = false;
+	topgear_cfg17_floor_bsi = -1;
 }
 
 // Pack one conservative forward-channel report into the optional second compact
@@ -3931,6 +3957,7 @@ void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq
 	int flat_state = report & 0x0F;
 	if(flat_state < 8 || flat_state > 11)
 	{
+		topgear_clear_forward_verdict();
 		printf("[TOPGEAR-REPORT] reject invalid marker/state=0x%x\n", flat_state);
 		fflush(stdout);
 		return;
@@ -3945,6 +3972,7 @@ void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq
 	                         : (flat_state == 10) ? TOPGEAR_FLATNESS_MAX + 0.01   // non-flat
 	                         : 0.0;                                               // 9 or 11 => flat
 	topgear_cfg17_floor_ok = (flat_state == 11);  // @28 GUARD verdict from the RSP's un-clipped SNR
+	topgear_cfg17_floor_bsi = topgear_cfg17_floor_ok ? bsi : -1;
 	topgear_last_flat_state = flat_state;   // B2: remember WHY (9 below-floor vs 10 non-flat)
 	topgear_elect_evaluate();
 	printf("[TOPGEAR-REPORT] bsi=%d snr_floor=%.1f flat_ceil=%.3f streak=%d engaged=%d\n",
@@ -3968,6 +3996,7 @@ void cl_arq_controller::topgear_elect_evaluate()
 		topgear_elect_engaged = false;
 		topgear_elect_clean_streak = 0;
 		topgear_below_floor_streak = 0;   // BLOCKER D (B2): re-earn from scratch on band re-entry
+		topgear_clear_forward_verdict();
 		return;
 	}
 	if(topgear_channel_clean())
@@ -9277,6 +9306,7 @@ void cl_arq_controller::reset_session_state()
 	topgear_elect_clean_streak = 0;
 	topgear_channel_flatness = -1.0;
 	topgear_cfg17_floor_ok = false;
+	topgear_cfg17_floor_bsi = -1;
 	topgear_last_report_bsi = -1;
 	topgear_reengage_cooldown = 0;
 	topgear_below_floor_streak = 0;

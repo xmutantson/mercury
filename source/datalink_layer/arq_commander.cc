@@ -689,6 +689,7 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 void cl_arq_controller::topgear_pending_report_arm(int bsi)
 {
 #if MFSK_ACK_SACK_ENABLED
+	topgear_clear_forward_verdict();
 	topgear_pending_report_bsi = bsi & 0xFF;
 	topgear_pending_cfg = current_configuration;
 	topgear_pending_stash_frozen = false;
@@ -715,6 +716,8 @@ void cl_arq_controller::topgear_pending_report_clear(const char* reason)
 		return;
 	printf("[TOPGEAR-PENDING] clear bsi=%d (%s)\n", topgear_pending_report_bsi, reason);
 	fflush(stdout);
+	if(strcmp(reason, "applied") != 0)
+		topgear_clear_forward_verdict();
 	topgear_pending_report_bsi = -1;
 	topgear_pending_cfg = CONFIG_NONE;
 	topgear_pending_stash_frozen = false;
@@ -1313,7 +1316,9 @@ bool cl_arq_controller::rung_floor_meter_clears(int cfg) const
 		// report the responder never packs code 11, so cfg17 stays fail-closed by design.
 		const char* r17 = std::getenv("MERCURY_ROW17_BUMP");
 		if(!(r17 && atoi(r17) != 0)) return true;              // default: ungated
-		return topgear_cfg17_floor_ok;                         // forward floor, not the reverse uplink meter
+		const char* floor = std::getenv("MERCURY_CFG17_SNR_FLOOR");
+		if(!(floor && *floor && atof(floor) > 0.0)) return false;
+		return topgear_forward_report_is_fresh();
 	}
 	if(rung_meter_stale()) return false;                     // stale climb-grade snapshot -> fail closed
 	double bump = rung_floor_bump_db[cfg];
@@ -8848,6 +8853,7 @@ void cl_arq_controller::process_control_commander()
 			topgear_elect_engaged = false;
 			topgear_elect_clean_streak = 0;
 			topgear_channel_flatness = -1.0;
+			topgear_clear_forward_verdict();
 			topgear_last_report_bsi = -1;
 			// CONNECT skips reset_session_state(): establish MC-4's virtual
 			// delivered predecessor for this fresh session explicitly.
@@ -11885,6 +11891,8 @@ int cl_arq_controller::test_rung_floor_gate()
 		unsigned char rpt_edge  = topgear_pack_report(23.40, 0.05);   // edge-22 dial (below floor)
 		unsigned char rpt_dead  = topgear_pack_report(22.35, 0.05);   // dead-20 dial (below floor)
 		unsigned char rpt_top   = topgear_pack_report(30.60, 0.05);   // winning top anchor (34.66 dial)
+		unsigned char rpt_below = topgear_pack_report(23.999, 0.05);
+		unsigned char rpt_at    = topgear_pack_report(24.000, 0.05);
 		check((rpt_admit & 0x0F) == 11,
 			"T7 refit: reliable-dial SNR_downlink 25.67 clears CFG17_SNR_FLOOR_DEFAULT_DB -> flat_state 11 "
 			"(pass-after at 24.0; FAIL-BEFORE at the 28.7 floor: 25.67<28.7 -> flat_state 9, cfg17 welded shut)");
@@ -11894,6 +11902,10 @@ int cl_arq_controller::test_rung_floor_gate()
 			"T7 refit: dead-dial 22.35 below the refit floor -> flat_state 9 (refuse)");
 		check((rpt_top & 0x0F) == 11,
 			"T7 refit: un-clipped meter still admits the winning top anchor (SNR_downlink 30.6 -> flat_state 11)");
+		check((rpt_below & 0x0F) == 9,
+			"T7 boundary: 23.999 is below the cfg17 forward floor and is refused");
+		check((rpt_at & 0x0F) == 11,
+			"T7 boundary: 24.000 is exactly on the cfg17 forward floor and is admitted");
 		unsetenv("MERCURY_CFG17_SNR_FLOOR");
 	}
 
@@ -11904,18 +11916,54 @@ int cl_arq_controller::test_rung_floor_gate()
 	// once the forward guard has cleared. FAIL-BEFORE (reverse-meter gate): 23 > 24 is false, so
 	// rung_floor_ok(17) refused the forward-cleared cfg17.
 	{
+		setenv("MERCURY_TOPGEAR_ELECT", "1", 1);
 		setenv("MERCURY_ROW17_BUMP", "1", 1);
+		setenv("MERCURY_CFG17_SNR_FLOOR", "24.0", 1);
+		topgear_elect_enabled = 1;
+		role = COMMANDER;
 		current_configuration = CONFIG_16;        // cfg17 is a climb above current (no at/below shortcut)
+		cmd_batch_seq_id = 42;
 		set_meter(23.0);                          // FRESH reverse meter reading a grid 23 (< the 25 clamp)
-		topgear_cfg17_floor_ok = false;           // forward floor NOT yet cleared
 		check(!rung_floor_ok(CONFIG_17),
 			"T8 blocker-A: forward floor uncleared -> cfg17 election refused (fail-closed, both arms)");
-		topgear_cfg17_floor_ok = true;            // forward guard cleared (report flat_state 11)
+		unsigned char wire_report = topgear_pack_report(25.67, 0.05);
+		topgear_apply_report(wire_report, cmd_batch_seq_id);
 		check(rung_floor_ok(CONFIG_17),
-			"T8 blocker-A: forward-cleared cfg17 ADMITS despite reverse meter 23 (pass-after; FAIL-BEFORE: "
+			"T8 transport: pack -> apply -> rung_floor_ok admits a fresh forward verdict despite reverse meter 23 (FAIL-BEFORE: "
 			"the reverse >24 gate refused 23)");
+		cmd_batch_seq_id += 2;
+		check(!rung_floor_ok(CONFIG_17),
+			"T8 freshness: the earned verdict expires when its report generation ages out");
+
+		// Responder armed, commander off: a code 11 on the wire is insufficient;
+		// the commander's local arm is independently required.
+		cmd_batch_seq_id = 50;
+		setenv("MERCURY_CFG17_SNR_FLOOR", "24.0", 1);
+		wire_report = topgear_pack_report(25.67, 0.05);
+		unsetenv("MERCURY_CFG17_SNR_FLOOR");
+		topgear_apply_report(wire_report, cmd_batch_seq_id);
+		check(!rung_floor_ok(CONFIG_17),
+			"T8 one-sided: responder armed + commander off does not admit cfg17");
+
+		// Commander armed, responder off: the responder emits legacy flat state 9.
+		unsetenv("MERCURY_CFG17_SNR_FLOOR");
+		wire_report = topgear_pack_report(25.67, 0.05);
+		setenv("MERCURY_CFG17_SNR_FLOOR", "24.0", 1);
+		cmd_batch_seq_id = 51;
+		topgear_apply_report(wire_report, cmd_batch_seq_id);
+		check(!rung_floor_ok(CONFIG_17),
+			"T8 one-sided: commander armed + responder off refuses cfg17");
+
+		// Invalid/unmeasured replacement must revoke rather than preserve true.
+		cmd_batch_seq_id = 52;
+		topgear_apply_report(topgear_pack_report(NAN, NAN), cmd_batch_seq_id);
+		check(!rung_floor_ok(CONFIG_17),
+			"T8 invalid/unmeasured: replacement report clears the forward verdict");
 		unsetenv("MERCURY_ROW17_BUMP");
-		topgear_cfg17_floor_ok = false;
+		unsetenv("MERCURY_CFG17_SNR_FLOOR");
+		unsetenv("MERCURY_TOPGEAR_ELECT");
+		topgear_clear_forward_verdict();
+		topgear_elect_enabled = -1;
 		current_configuration = CONFIG_0;
 	}
 

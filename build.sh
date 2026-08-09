@@ -168,7 +168,7 @@ fi
 #      host from the real source worktree and forwards it; the on-Pi tarball has no .git,
 #      so this is how both Pis bake the SAME id for the same commit).
 #   2. git rev-parse in this source tree (native host builds with a .git present).
-#   3. "nogit" fallback — keeps the id (and thus the md5) deterministic when neither
+#   3. "nogit" fallback — keeps the id (and thus the md5) deterministic when neithe
 #      the env nor a .git is available.
 BUILD_ID="${MERCURY_BUILD_ID:-}"
 if [ -z "$BUILD_ID" ]; then
