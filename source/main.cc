@@ -3750,6 +3750,7 @@ int main(int argc, char *argv[])
     bool test_cmd_idskew_cli = false;  // --test-cmd-idskew: CMD-side id-skew root — rebase a fresh new-data batch to slots [0,ND).
     bool test_inband_deliver_cli = false;  // --test-inband-deliver: forward-healthy reverse-ACK miss -> NO-BREAK deliver regression.
     bool test_linkphase_shadow_cli = false; // --test-linkphase-shadow: increment-1 shadow-agreement directed unit.
+    bool test_linkphase_optclock_cli = false; // --test-linkphase-optclock: END-stamp freshness directed unit.
     bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
@@ -4812,6 +4813,13 @@ int main(int argc, char *argv[])
             // meter (incl. the intended short-batch clamp + a fail-before shortening), and the
             // epoch bump on config-switch/BREAK. See data-flow-linkphase-primitive.md.
             test_linkphase_shadow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-optclock") == 0)
+        {
+            // MC-7 END-stamp ownership/freshness regression (one-shot at startup, exit rc).
+            test_linkphase_optclock_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7068,6 +7076,15 @@ start_modem:
             cl_arq_controller LP_TEST;
             int rc = LP_TEST.test_linkphase_shadow();
             printf("[FLAG] Linkphase-shadow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_linkphase_optclock_cli) {
+            printf("[FLAG] --test-linkphase-optclock: invoking END-stamp freshness directed unit\n");
+            fflush(stdout);
+            cl_arq_controller LP_TEST;
+            int rc = LP_TEST.test_linkphase_optclock_end_stamp();
+            printf("[FLAG] Linkphase-optclock test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
