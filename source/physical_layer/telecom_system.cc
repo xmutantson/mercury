@@ -961,8 +961,10 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 	return eff;
 }
 
-bool cl_telecom_system::fine_energy_adjustment_allowed(bool carried_timing_active, bool carried_defeat)
+bool cl_telecom_system::fine_energy_adjustment_allowed(bool carried_timing_active,
+	int effective_preamble_nsymb, bool carried_defeat)
 {
+	(void)effective_preamble_nsymb;
 	return !carried_timing_active || carried_defeat;
 }
 
@@ -3444,7 +3446,7 @@ skip_h_retry_point:
 			// MINI0 has no preamble here; interpreting its first data symbol as a
 			// preamble-energy profile can move a correct prediction by whole symbols.
 			if(M != MOD_MFSK && fine_energy_adjustment_allowed(
-				keydown_track_active, fine_energy_carried_defeat))
+				keydown_track_active, rx_eff_preamble, fine_energy_carried_defeat))
 			{
 				// Plan-B Step 6a (site 8-energy, post-fine-sync energy gate):
 				// per-symbol mean energy vs energy_gate_floor — rate-invariant.

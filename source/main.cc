@@ -1809,15 +1809,17 @@ struct Mini0CarriedCell {
 
 // Drive one zero-preamble tail through the real receive_byte timing, energy,
 // channel-estimation and SKIP-VAR path, followed by the real ARQ coast helper.
-static Mini0CarriedCell run_mini0_carried_cell(bool legacy_defeat, bool carried=true)
+static Mini0CarriedCell run_carried_preamble_cell(int tail_preamble_nsymb,
+    bool legacy_defeat, int forced_shift_symbols)
 {
     cl_telecom_system ts;
     ts.operation_mode = BER_PLOT_passband;
     ts.load_configuration(CONFIG_17);
+	bool carried = tail_preamble_nsymb >= 0;
     ts.preamble_amortization_enabled = carried;
     ts.keydown_track_timing_enabled = carried;
     ts.fine_energy_carried_defeat = legacy_defeat;
-	ts.fine_energy_test_force_shift_symbols = carried ? 1 : 0;
+	ts.fine_energy_test_force_shift_symbols = forced_shift_symbols;
 
     cl_data_container& dc = ts.data_container;
     int interp = ts.frequency_interpolation_rate;
@@ -1828,9 +1830,10 @@ static Mini0CarriedCell run_mini0_carried_cell(bool legacy_defeat, bool carried=
     std::vector<int> payload(payload_bytes, 0);
     for(int i=0; i<payload_bytes; i++) payload[i] = (i * 53 + 7) & 0xff;
 
-    ts.tx_preamble_nsymb_override = carried ? 0 : -1;
+	int emitted_preamble = carried ? tail_preamble_nsymb : dc.preamble_nSymb;
+	ts.tx_preamble_nsymb_override = carried ? tail_preamble_nsymb : -1;
     ts.tx_last_emitted_frame_samples =
-        (dc.Nsymb + (carried ? 0 : dc.preamble_nSymb)) * sym_samples;
+		(dc.Nsymb + emitted_preamble) * sym_samples;
     ts.transmit_byte(payload.data(), payload_bytes, dc.passband_data, SINGLE_MESSAGE);
     int emitted = ts.tx_last_emitted_frame_samples;
     ts.tx_preamble_nsymb_override = -1;
@@ -1850,7 +1853,9 @@ static Mini0CarriedCell run_mini0_carried_cell(bool legacy_defeat, bool carried=
     ts.data_container.nUnder_processing_events = 0;
     ts.ofdm_forced_delay = carried ? -1 : onset;
     ts.mfsk_fixed_delay = -1;
+	ts.rx_preamble_nsymb_override = carried ? tail_preamble_nsymb : -1;
     st_receive_stats st = ts.receive_byte(rx, dc.hd_decoded_data_byte);
+	ts.rx_preamble_nsymb_override = -1;
 
     int exact = (st.message_decoded == YES) ? 1 : 0;
     if(exact) for(int i=0; i<payload_bytes; i++)
@@ -1885,9 +1890,9 @@ static Mini0CarriedCell run_mini0_carried_cell(bool legacy_defeat, bool carried=
 
 static int run_mini0_carried_timing_test()
 {
-    Mini0CarriedCell legacy = run_mini0_carried_cell(true);
-    Mini0CarriedCell fixed = run_mini0_carried_cell(false);
-	Mini0CarriedCell control = run_mini0_carried_cell(false, false);
+	Mini0CarriedCell legacy = run_carried_preamble_cell(0, true, 1);
+	Mini0CarriedCell fixed = run_carried_preamble_cell(0, false, 1);
+	Mini0CarriedCell control = run_carried_preamble_cell(-1, false, 0);
     printf("[TEST-MINI0-CARRIED] legacy: decoded=%d exact=%d energy_shift=%d skipvar=%d coast=%d nv=%.4f\n",
         legacy.decoded, legacy.byte_exact, legacy.shift_symbols,
         legacy.skip_var_aborted, legacy.coasted, legacy.noise_variance);
@@ -1906,6 +1911,32 @@ static int run_mini0_carried_timing_test()
     printf("[TEST-MINI0-CARRIED] %s (legacy +1-symbol->SKIP-VAR->coast; fixed byte-exact hold)\n",
 		(legacy_chain && fixed_chain && control_chain) ? "ALL PASS" : "FAILED");
 	return (legacy_chain && fixed_chain && control_chain) ? 0 : 1;
+}
+
+// Explicit MERCURY_KEYDOWN_MINI0=0 process control. The first cell proves the
+// real carried MINI1 path remains byte-exact. The forced cell proves its real
+// one-symbol preamble still reaches the post-sync energy-refinement stage.
+static int run_mini1_carried_timing_test()
+{
+	const char* mini0 = std::getenv("MERCURY_KEYDOWN_MINI0");
+	if(!mini0 || atoi(mini0) != 0) {
+		printf("[TEST-MINI1-CARRIED] FAILED: requires MERCURY_KEYDOWN_MINI0=0\n");
+		return 1;
+	}
+	Mini0CarriedCell ordinary = run_carried_preamble_cell(1, false, 0);
+	Mini0CarriedCell refined = run_carried_preamble_cell(1, false, 1);
+	printf("[TEST-MINI1-CARRIED] ordinary: decoded=%d exact=%d energy_shift=%d skipvar=%d coast=%d nv=%.4f\n",
+		ordinary.decoded, ordinary.byte_exact, ordinary.shift_symbols,
+		ordinary.skip_var_aborted, ordinary.coasted, ordinary.noise_variance);
+	printf("[TEST-MINI1-CARRIED] refinement probe: decoded=%d exact=%d energy_shift=%d skipvar=%d coast=%d nv=%.4f\n",
+		refined.decoded, refined.byte_exact, refined.shift_symbols,
+		refined.skip_var_aborted, refined.coasted, refined.noise_variance);
+	bool ordinary_ok = ordinary.decoded && ordinary.byte_exact
+		&& !ordinary.skip_var_aborted && !ordinary.coasted;
+	bool refinement_reached = refined.shift_symbols == 1;
+	printf("[TEST-MINI1-CARRIED] %s (ordinary MINI1 byte-exact; forced energy refinement retained)\n",
+		(ordinary_ok && refinement_reached) ? "ALL PASS" : "FAILED");
+	return (ordinary_ok && refinement_reached) ? 0 : 1;
 }
 
 int main(int argc, char *argv[])
@@ -3540,6 +3571,9 @@ int main(int argc, char *argv[])
         }
 		if (strcmp(argv[i], "--test-mini0-carried") == 0) {
 			return run_mini0_carried_timing_test();
+		}
+		if (strcmp(argv[i], "--test-mini1-carried") == 0) {
+			return run_mini1_carried_timing_test();
 		}
         // --test-break-fh : fix/break-fh-gate §23 BREAK forward-health gate suite
         // (FH-latch suppression of the held-CFG16 marginal-OFDM alias + K-of-N

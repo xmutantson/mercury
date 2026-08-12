@@ -668,7 +668,8 @@ public:
 	// Post-sync preamble-energy correction may refine an acquired delay only when
 	// no stronger timing source already owns it. Static/pure so the production
 	// receive path and the focused regression use the identical policy.
-	static bool fine_energy_adjustment_allowed(bool carried_timing_active, bool carried_defeat=false);
+	static bool fine_energy_adjustment_allowed(bool carried_timing_active,
+		int effective_preamble_nsymb, bool carried_defeat=false);
 	// Focused production-path A/B support. The defeat restores legacy ownership;
 	// the shift record reports what the real post-sync energy stage did.
 	bool fine_energy_carried_defeat = false;

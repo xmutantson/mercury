@@ -9313,11 +9313,13 @@ static void test_preamble_sched_batch_accounting() {
 // refine timing. Its carried prediction is the timing authority.
 static void test_preamble_energy_respects_carried_timing() {
 	const char* name = "preamble_energy_respects_carried_timing";
-	if (!cl_telecom_system::fine_energy_adjustment_allowed(false)) {
+	if (!cl_telecom_system::fine_energy_adjustment_allowed(false, 4)) {
 		test_fail(name, "ordinary acquired timing must retain preamble-energy correction"); return; }
-	if (cl_telecom_system::fine_energy_adjustment_allowed(true)) {
+	if (cl_telecom_system::fine_energy_adjustment_allowed(true, 0)) {
 		test_fail(name, "carried zero-preamble timing must not be moved by preamble-energy correction"); return; }
-	if (!cl_telecom_system::fine_energy_adjustment_allowed(true, true)) {
+	if (!cl_telecom_system::fine_energy_adjustment_allowed(true, 1)) {
+		test_fail(name, "carried MINI1 timing must retain real-preamble energy correction"); return; }
+	if (!cl_telecom_system::fine_energy_adjustment_allowed(true, 0, true)) {
 		test_fail(name, "defeat must restore the legacy carried-timing behavior"); return; }
 	test_pass(name);
 }
