@@ -26185,6 +26185,9 @@ void cl_arq_controller::process_buffer_data_commander()
 				// fill_limit == data_batch_size (byte-identical to pre-fix). Env DEFEAT
 				// restores the pre-fix over-pop on the SAME binary (the fail-before arm).
 				int fill_limit = data_batch_size;
+				bool slotcap_defeat = false;
+				{ const char* e = std::getenv("MERCURY_MIXBATCH_SLOTCAP_DEFEAT");
+				  if(e && *e && atoi(e)!=0) slotcap_defeat = true; }
 				if(sack_v2_enabled)
 				{
 					bool overpop_defeat = false;
@@ -26201,6 +26204,14 @@ void cl_arq_controller::process_buffer_data_commander()
 						fill_limit = data_batch_size - retx_prefix - already_staged;
 						if(fill_limit < 0) fill_limit = 0;
 					}
+				}
+				// Batch arithmetic cannot reserve slots that are still occupied by
+				// a prior in-flight batch. Use the exact FREE predicate consumed by
+				// add_message_tx_data() before removing any source bytes.
+				if(!slotcap_defeat)
+				{
+					int free_slots = get_nFree_messages();
+					if(fill_limit > free_slots) fill_limit = free_slots;
 				}
 				batch_uncompressed_size = 0;
 				for(int i=0;i<fill_limit;i++)
@@ -26221,12 +26232,20 @@ void cl_arq_controller::process_buffer_data_commander()
 						data_read_size = (kx_remain < max_frame) ? kx_remain : max_frame;
 						memcpy(message_TxRx_byte_buffer,
 						       kx_stream_tx_buf + kx_stream_tx_sent, data_read_size);
+						int add_result;
+						if(data_read_size==max_frame)
+							add_result = add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
+						else
+							add_result = add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
+						if(add_result != SUCCESSFUL && !slotcap_defeat)
+						{
+							printf("[KX-TX] ERROR: no message slot for staged KX data (result=%d)\n",
+								add_result);
+							fflush(stdout);
+							break;
+						}
 						kx_stream_tx_sent += data_read_size;
 						block_under_tx = YES;
-						if(data_read_size==max_frame)
-							add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
-						else
-							add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
 						filled++;
 						if(kx_stream_tx_sent >= kx_stream_tx_len)
 						{
@@ -26258,6 +26277,27 @@ void cl_arq_controller::process_buffer_data_commander()
 						last_transmission_block_stats.nReSent_data=0;
 						break;
 					}
+					int add_result;
+					if(data_read_size==max_frame)
+						add_result = add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
+					else
+						add_result = add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
+					if(add_result != SUCCESSFUL && !slotcap_defeat)
+					{
+						// Preflight and enqueue use the same FREE predicate. Restore an
+						// unexpectedly rejected frame before changing any commit state.
+						int restored = fifo_buffer_tx.push_front(message_TxRx_byte_buffer, data_read_size);
+						printf("[TX-STAGE] ERROR: add_message_tx_data failed (result=%d restored=%d/%d)\n",
+							add_result, restored, data_read_size);
+						fflush(stdout);
+						if(restored != data_read_size)
+						{
+							printf("[TX-STAGE] FATAL: source restore failed; dropping link\n");
+							fflush(stdout);
+							link_status = DROPPED;
+						}
+						break;
+					}
 					fifo_buffer_backup.push(message_TxRx_byte_buffer, data_read_size);
 					batch_uncompressed_size += data_read_size;
 					// Option W (§2.1): raw leg — frame payload IS the transported payload
@@ -26274,10 +26314,6 @@ void cl_arq_controller::process_buffer_data_commander()
 					gui_push_monitor_text(message_TxRx_byte_buffer, data_read_size, true);
 #endif
 					block_under_tx=YES;
-					if(data_read_size==max_frame)
-						add_message_tx_data(DATA_LONG, data_read_size, message_TxRx_byte_buffer);
-					else
-						add_message_tx_data(DATA_SHORT, data_read_size, message_TxRx_byte_buffer);
 					filled++;
 				}
 			}
