@@ -963,9 +963,7 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 
 bool cl_telecom_system::fine_energy_adjustment_allowed(bool carried_timing_active, bool carried_defeat)
 {
-	(void)carried_timing_active;
-	(void)carried_defeat;
-	return true;
+	return !carried_timing_active || carried_defeat;
 }
 
 // Moose CFO sanity decision — STATIC / PURE (see header for the full root-cause
