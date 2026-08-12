@@ -12675,6 +12675,29 @@ int cl_arq_controller::test_linkphase_optclock_end_stamp()
 		printf("[TEST-LP-OPTCLOCK] PASS: stale epoch rejects END stamp and "
 		       "falls back to live derive %d ms\n", stale_ms);
 
+	// A BREAK does not change configuration. Nevertheless it ends the causal lifetime of the
+	// completed START/END pair. Restamp a valid keydown at the current configuration, then BREAK
+	// before another END is committed. The selector must reject that preceding keydown and use the
+	// explicit live-shape fallback.
+	message_transmission_time_ms = 500;
+	lp_note_keydown_start(/*bsi=*/8);
+	lp_note_keydown_end(/*bsi=*/8, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+	message_transmission_time_ms = 600;
+	lp_note_break(/*bsi=*/9);
+	used_stamp = true;
+	const int post_break_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(post_break_ms != 6000 || used_stamp)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: same-config BREAK reused preceding END "
+		       "stamp=%d ms used=%d (expected fallback=6000 used=0)\n",
+			post_break_ms, used_stamp ? 1 : 0);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: same-config BREAK invalidates preceding "
+		       "END stamp and falls back to 6000 ms\n");
+
 	printf("[TEST-LP-OPTCLOCK] %s (failures=%d)\n", fails ? "FAIL" : "ALL PASS", fails);
 	fflush(stdout);
 	return fails;
