@@ -1445,6 +1445,7 @@ cl_arq_controller::cl_arq_controller()
 	// (no consumer may act on an unpopulated timeline). config_gen persists across session
 	// resets; seed it 0 here at construction, then lp_reset() clears the timeline itself.
 	lp_config_gen=0;
+	lp_keydown_generation=0;
 	lp_reset();
 	missed_ack_slots=0;
 	linkphase_ack_slot_wait_armed=false;
@@ -12502,12 +12503,11 @@ void arq_turn_trace_emit_ack(const char* kind, unsigned bsi, int arrival_ms, int
 }
 // ========================== end MERCURY_TURN_TRACE ==========================
 
-// ===================== LINK-PHASE PRIMITIVE (increment 1) =====================
-// Producers for the shared channel-ownership timeline (lp_state). SHADOW-ONLY: every
-// function below only STORES into lp_state (a pure member write, no control-flow effect)
-// and, under the measure-only MERCURY_TURN_TRACE, prints one [LP_SHADOW_*] line. NO consumer
-// reads lp_state in this increment, so the built binary is byte-identical to stock. The two
-// log lines carry the per-bsi keydown length both sides derive; the shadow-agreement reducer
+// ===================== LINK-PHASE PRIMITIVE =====================
+// Producers for the shared channel-ownership timeline (lp_state). Under the measure-only
+// MERCURY_TURN_TRACE they print [LP_SHADOW_*] lines. The optimizer clock is the first
+// production reader and accepts only a token-qualified completed local keydown. The two
+// trace lines carry the per-bsi keydown length both sides derive; the shadow-agreement reducer
 // joins them by bsi and checks the directional over-wait / under-estimate meter
 // (mercury/fact-documents/data-flow-linkphase-primitive.md §5).
 long long cl_arq_controller::lp_now()
@@ -12526,7 +12526,9 @@ void cl_arq_controller::lp_reset()
 	lp_state.owner_keydown_end_ms = 0;
 	lp_state.next_listen_open_ms  = 0;
 	lp_state.epoch                = 0;
+	lp_state.keydown_end_token    = 0;
 	lp_keydown_start_ms           = 0;
+	lp_keydown_start_token        = 0;
 	lp_last_rx_bsi                = -1;
 	lp_clock.start();
 }
@@ -12536,9 +12538,22 @@ void cl_arq_controller::lp_reset()
 // latch's reachability — the big-block early-return path skips BOTH, so the two never diverge.
 void cl_arq_controller::lp_note_keydown_start(int bsi)
 {
+	// Zero means invalid. Once the full-width counter is exhausted, retain zero forever
+	// instead of reusing a token and making an old endpoint current again.
+	if(lp_keydown_generation != UINT64_MAX)
+		lp_keydown_generation++;
 	lp_state.owner      = LP_CMD_KEYED;
 	lp_keydown_start_ms = lp_now();
+	lp_keydown_start_token = lp_keydown_generation;
 	lp_state.epoch      = lp_make_epoch(bsi);
+	lp_state.owner_keydown_end_ms = 0;
+	lp_state.next_listen_open_ms = 0;
+	lp_state.keydown_end_token = 0;
+	if(lp_keydown_generation == UINT64_MAX)
+	{
+		lp_keydown_start_ms = 0;
+		lp_keydown_start_token = 0;
+	}
 }
 
 // CMD keydown END. Commit owner_keydown_end from the sample-exact keydown length; owner ->
@@ -12550,8 +12565,17 @@ void cl_arq_controller::lp_note_keydown_end(int bsi, int frames_region_len, int 
 {
 	int kd_ms_exact = (int)(((long long)frames_region_len * 1000LL) / 48000LL);
 	int kd_ms_lever = derive_keydown_length_ms(frames, force_full);
+	if(lp_keydown_start_token == 0 || lp_state.owner != LP_CMD_KEYED
+	   || lp_state.epoch != lp_make_epoch(bsi))
+	{
+		lp_state.owner_keydown_end_ms = 0;
+		lp_state.next_listen_open_ms = 0;
+		lp_state.keydown_end_token = 0;
+		return;
+	}
 	lp_state.owner_keydown_end_ms = lp_keydown_start_ms + kd_ms_exact;
 	lp_state.owner                = LP_TURNAROUND;
+	lp_state.keydown_end_token    = lp_keydown_start_token;
 	int turnaround_budget = receiving_timeout - 2 * message_transmission_time_ms;
 	if(turnaround_budget < 0) turnaround_budget = 0;
 	lp_state.next_listen_open_ms = lp_state.owner_keydown_end_ms + turnaround_budget;
@@ -12575,7 +12599,11 @@ void cl_arq_controller::lp_note_rx_frame0(int bsi, int d5_wire)
 	int eff_window = rx_effective_window(d5_wire);
 	int rx_kd_ms   = derive_keydown_length_ms(eff_window, /*force_full=*/false);
 	lp_state.owner                = LP_CMD_KEYED;
+	lp_keydown_start_ms           = 0;
+	lp_keydown_start_token        = 0;
+	lp_state.keydown_end_token    = 0;
 	lp_state.owner_keydown_end_ms = lp_now() + rx_kd_ms;
+	lp_state.next_listen_open_ms  = 0;
 	lp_state.epoch                = lp_make_epoch(bsi);
 	if(arq_turn_trace_on())
 	{
@@ -12590,7 +12618,11 @@ void cl_arq_controller::lp_note_rx_frame0(int bsi, int d5_wire)
 void cl_arq_controller::lp_note_rsp_key()
 {
 	lp_state.owner                = LP_RSP_KEYED;
+	lp_keydown_start_ms           = 0;
+	lp_keydown_start_token        = 0;
+	lp_state.keydown_end_token    = 0;
 	lp_state.owner_keydown_end_ms = lp_now();  // reverse-ACK keydown; exact end not consumed in inc 1
+	lp_state.next_listen_open_ms  = 0;
 }
 
 void cl_arq_controller::lp_note_ack_decoded()
@@ -12600,13 +12632,27 @@ void cl_arq_controller::lp_note_ack_decoded()
 
 void cl_arq_controller::lp_note_break(int bsi)
 {
+	if(lp_keydown_generation != UINT64_MAX)
+		lp_keydown_generation++;
 	lp_state.owner = LP_CMD_KEYED;
 	lp_state.epoch = lp_make_epoch(bsi);  // recovery re-stamp (bsi advanced by the break requeue)
+	lp_keydown_start_ms = 0;
+	lp_keydown_start_token = 0;
+	lp_state.owner_keydown_end_ms = 0;
+	lp_state.keydown_end_token = 0;
+	lp_state.next_listen_open_ms = 0;
 }
 
 void cl_arq_controller::lp_note_config_switch()
 {
 	lp_config_gen++;  // new config generation -> every future epoch stamp bumps
+	if(lp_keydown_generation != UINT64_MAX)
+		lp_keydown_generation++;
+	lp_keydown_start_ms = 0;
+	lp_keydown_start_token = 0;
+	lp_state.owner_keydown_end_ms = 0;
+	lp_state.keydown_end_token = 0;
+	lp_state.next_listen_open_ms = 0;
 }
 
 // MC-7 optimizer clock selector. A completed local keydown owns its duration at END;
@@ -12617,11 +12663,14 @@ int cl_arq_controller::lp_optclock_keydown_ms(int fallback_frames,
 	bool fallback_force_full, bool* used_end_stamp) const
 {
 	if(used_end_stamp) *used_end_stamp = false;
-	const uint32_t stamped_bsi = lp_state.epoch & 0xFFu;
 	const bool stamp_current =
 		linkphase_last_kd_frames > 0
-		&& lp_state.epoch == lp_make_epoch((int)stamped_bsi)
-		&& lp_state.owner_keydown_end_ms > lp_keydown_start_ms;
+		&& lp_state.owner == LP_TURNAROUND
+		&& (lp_state.epoch >> 8) == lp_config_gen
+		&& lp_keydown_start_token != 0
+		&& lp_state.keydown_end_token == lp_keydown_start_token
+		&& lp_state.keydown_end_token == lp_keydown_generation
+		&& lp_state.owner_keydown_end_ms >= lp_keydown_start_ms;
 	if(stamp_current)
 	{
 		if(used_end_stamp) *used_end_stamp = true;
@@ -12697,6 +12746,20 @@ int cl_arq_controller::test_linkphase_optclock_end_stamp()
 	else
 		printf("[TEST-LP-OPTCLOCK] PASS: same-config BREAK invalidates preceding "
 		       "END stamp and falls back to 6000 ms\n");
+
+	// A new START has no END yet and must not expose the preceding keydown's endpoint.
+	lp_note_keydown_start(/*bsi=*/10);
+	used_stamp = true;
+	const int start_only_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(start_only_ms != 6000 || used_stamp)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: START-without-END exposed stamp=%d ms "
+		       "used=%d (expected fallback=6000 used=0)\n",
+			start_only_ms, used_stamp ? 1 : 0);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: START-without-END rejects preceding stamp\n");
 
 	printf("[TEST-LP-OPTCLOCK] %s (failures=%d)\n", fails ? "FAIL" : "ALL PASS", fails);
 	fflush(stdout);

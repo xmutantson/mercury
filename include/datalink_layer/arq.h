@@ -6961,28 +6961,30 @@ private:
   int  linkphase_last_kd_frames;       // frames in the last DATA keydown (0 = none yet)
   bool linkphase_last_kd_force_full;   // was that keydown full-preamble (retx / amort-off)
   // === LINK-PHASE PRIMITIVE (increment 1 — shadow-only) ===========================
-  // The single authoritative half-duplex channel-ownership timeline both state machines
-  // will consult once the mirrored-timer consumers migrate (increments 2/2b/2c). In this
-  // increment the object is COMPUTED and LOGGED at every ownership transition but NO consumer
-  // reads it: every producer below is a pure member store (no control-flow effect), and the
-  // two [LP_SHADOW_*] log lines are gated on the measure-only MERCURY_TURN_TRACE (off by
-  // default), so the built binary is byte-identical to stock. The shadow-agreement cohort
+  // Half-duplex channel-ownership timeline. It is computed at ownership transitions; the
+  // optimizer clock consumes only a token-qualified completed local keydown. Later mirrored-
+  // timer consumers remain gated on their own evidence. The two [LP_SHADOW_*] log lines are
+  // gated on the measure-only MERCURY_TURN_TRACE (off by default). The shadow-agreement cohort
   // joins the CMD-emitted and RX-derived keydown lengths per bsi to prove the two sides
   // derive the SAME timeline (the directional over-wait / under-estimate meter). Owner doc:
-  // mercury/fact-documents/data-flow-linkphase-primitive.md. Consumers arrive in later steps.
+  // mercury/fact-documents/data-flow-linkphase-primitive.md. The optimizer clock is the first
+  // production consumer; other consumers remain gated on their own evidence.
   enum lp_owner { LP_NONE, LP_CMD_KEYED, LP_TURNAROUND, LP_RSP_KEYED };
   struct link_phase {
     lp_owner  owner;                 // who holds the channel right now
     long long owner_keydown_end_ms;  // LOCAL-clock instant this owner's keydown audio finishes
     long long next_listen_open_ms;   // LOCAL-clock instant the reverse listener's window opens
     uint32_t  epoch;                 // ownership generation = (config_gen << 8) | (bsi & 0xFF)
+    uint64_t  keydown_end_token;     // local CMD token committed with END (0 = invalid)
   };
-  link_phase lp_state;                 // one per session; write-only in increment 1
+  link_phase lp_state;                 // one per session
   cl_timer   lp_clock;                 // session-local monotonic ms clock for the two _ms instants
   long long  lp_keydown_start_ms;      // CMD: keydown-START instant, committed at keydown END
+  uint64_t   lp_keydown_generation;    // full-width local CMD keydown/recovery generation
+  uint64_t   lp_keydown_start_token;   // generation stored with START (0 = invalid)
   uint32_t   lp_config_gen;            // config generation, ++ on every load_configuration (epoch hi bits)
   int        lp_last_rx_bsi;           // RX: last bsi a frame-0 shadow was logged for (-1 = none)
-  // Producers (defined in arq_common.cc) — the ownership transitions. No consumer in increment 1.
+  // Producers (defined in arq_common.cc) — the ownership transitions.
   long long lp_now();                                     // read lp_clock (session-local ms)
   uint32_t  lp_make_epoch(int bsi) const;                 // (lp_config_gen << 8) | (bsi & 0xFF)
   void lp_reset();                                        // owner=NONE, instants=0, epoch=0, restart clock
