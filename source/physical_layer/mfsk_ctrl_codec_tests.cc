@@ -8712,6 +8712,51 @@ static void set_mfsk_geometry_test_env(const char* key, const char* value)
 #endif
 }
 
+static bool same_mfsk_geometry_state(const cl_mfsk& a, const cl_mfsk& b)
+{
+	if(a.M != b.M || a.nBits != b.nBits || a.Nc != b.Nc || a.nStreams != b.nStreams
+		|| a.tone_hop_step != b.tone_hop_step
+		|| a.preamble_nSymb != b.preamble_nSymb
+		|| a.preamble_match_threshold != b.preamble_match_threshold
+		|| a.robust_preamble_mode != b.robust_preamble_mode
+		|| a.robust_preamble_sid_active != b.robust_preamble_sid_active
+		|| a.preamble_nSymb_legacy != b.preamble_nSymb_legacy
+		|| a.preamble_match_threshold_legacy != b.preamble_match_threshold_legacy
+		|| a.preamble_nSymb_sid != b.preamble_nSymb_sid
+		|| a.preamble_match_threshold_sid != b.preamble_match_threshold_sid
+		|| a.ack_pattern_len != b.ack_pattern_len
+		|| a.ack_pattern_nsymb != b.ack_pattern_nsymb
+		|| a.ack_match_threshold != b.ack_match_threshold
+		|| a.break_match_threshold != b.break_match_threshold
+		|| a.break_metric_threshold != b.break_metric_threshold
+		|| a.hail_match_threshold != b.hail_match_threshold
+		|| a.hail_detect_nsymb != b.hail_detect_nsymb
+		|| a.hail_detect_threshold != b.hail_detect_threshold
+		|| a.connect_pattern_nsymb != b.connect_pattern_nsymb
+		|| a.connect_match_threshold != b.connect_match_threshold)
+		return false;
+
+	for(int i = 0; i < cl_mfsk::MAX_STREAMS; ++i)
+		if(a.stream_offsets[i] != b.stream_offsets[i]) return false;
+	for(int i = 0; i < cl_mfsk::MAX_PREAMBLE_SYMB; ++i)
+	{
+		if(a.preamble_tones[i] != b.preamble_tones[i]
+			|| a.preamble_tones_legacy[i] != b.preamble_tones_legacy[i]
+			|| a.preamble_tones_sid[i] != b.preamble_tones_sid[i])
+			return false;
+	}
+	for(int i = 0; i < cl_mfsk::MAX_ACK_TONES; ++i)
+	{
+		if(a.ack_tones[i] != b.ack_tones[i] || a.break_tones[i] != b.break_tones[i]
+			|| a.hail_tones[i] != b.hail_tones[i]
+			|| a.connect_tones[i] != b.connect_tones[i])
+			return false;
+	}
+	for(int i = 0; i < cl_mfsk::MAX_ACK_TONES + cl_mfsk::HAIL_SUFFIX_LEN; ++i)
+		if(a.hail_detect_tones[i] != b.hail_detect_tones[i]) return false;
+	return true;
+}
+
 static void test_mfsk_geometry_guard()
 {
 	const char* name = "mfsk_geometry_guard";
@@ -8763,20 +8808,23 @@ static void test_mfsk_geometry_guard()
 		}
 	}
 
-	cl_mfsk invalid;
-	invalid.init(invalid_M, invalid_Nc, invalid_nStreams);
-	if(invalid.M != 0 || invalid.Nc != 0 || invalid.nStreams != 0)
+	cl_mfsk fresh_invalid;
+	fresh_invalid.init(invalid_M, invalid_Nc, invalid_nStreams);
+	if(fresh_invalid.M != 0 || fresh_invalid.Nc != 0 || fresh_invalid.nStreams != 0
+		|| fresh_invalid.preamble_nSymb != 0 || fresh_invalid.preamble_nSymb_legacy != 0
+		|| fresh_invalid.preamble_nSymb_sid != 0 || fresh_invalid.ack_pattern_nsymb != 0
+		|| fresh_invalid.connect_pattern_nsymb != 0 || fresh_invalid.hail_detect_nsymb != 0)
 	{
-		printf("  [FAIL] %s: direct invalid init remained active M=%d Nc=%d nStreams=%d; "
+		printf("  [FAIL] %s: fresh invalid init was not inert M=%d Nc=%d nStreams=%d; "
 			"first invalid carrier=%d (stream=%d tone=%d), max=%d\n",
-			name, invalid.M, invalid.Nc, invalid.nStreams, invalid_first_index,
+			name, fresh_invalid.M, fresh_invalid.Nc, fresh_invalid.nStreams, invalid_first_index,
 			invalid_first_stream, invalid_first_tone, invalid_max_index);
 		failures++;
 	}
 	else
 	{
 		std::vector<std::complex<double>> canary(52, std::complex<double>(7.0, -3.0));
-		invalid.generate_preamble(canary.data() + 1, 1);
+		fresh_invalid.generate_preamble(canary.data() + 1, 1);
 		for(size_t i = 0; i < canary.size(); ++i)
 		{
 			if(canary[i] != std::complex<double>(7.0, -3.0))
@@ -8788,12 +8836,31 @@ static void test_mfsk_geometry_guard()
 		}
 	}
 
-	cl_mfsk boundary;
-	boundary.init(16, 50, 3);
-	if(boundary.M != 16 || boundary.Nc != 50 || boundary.nStreams != 3
-		|| boundary.stream_offsets[2] + boundary.M - 1 != 48)
+	cl_mfsk live_then_invalid;
+	live_then_invalid.init(8, 10, 1);
+	cl_mfsk live_geometry_before;
+	live_geometry_before.copy_from(live_then_invalid);
+	std::vector<std::complex<double>> live_preamble_before(
+		(size_t)live_then_invalid.preamble_nSymb * live_then_invalid.Nc);
+	live_then_invalid.generate_preamble(live_preamble_before.data(), live_then_invalid.preamble_nSymb);
+	live_then_invalid.init(invalid_M, invalid_Nc, invalid_nStreams);
+	std::vector<std::complex<double>> live_preamble_after(
+		(size_t)live_then_invalid.preamble_nSymb * live_then_invalid.Nc);
+	live_then_invalid.generate_preamble(live_preamble_after.data(), live_then_invalid.preamble_nSymb);
+	if(!same_mfsk_geometry_state(live_then_invalid, live_geometry_before)
+		|| live_preamble_after != live_preamble_before)
 	{
-		printf("  [FAIL] %s: safe M16x3 boundary rejected or mis-sized\n", name);
+		printf("  [FAIL] %s: valid-to-invalid direct init did not preserve coherent live geometry\n",
+			name);
+		failures++;
+	}
+
+	cl_mfsk boundary;
+	boundary.init(16, 48, 3);
+	if(boundary.M != 16 || boundary.Nc != 48 || boundary.nStreams != 3
+		|| boundary.stream_offsets[0] != 0 || boundary.stream_offsets[2] + boundary.M - 1 != 47)
+	{
+		printf("  [FAIL] %s: exact-boundary M16x3/Nc48 rejected or mis-sized\n", name);
 		failures++;
 	}
 
@@ -8811,6 +8878,58 @@ static void test_mfsk_geometry_guard()
 		}
 	}
 
+	{
+		cl_telecom_system ts;
+		ts.narrowband_enabled = NO;
+		ts.load_configuration(ROBUST_0);
+		const int prior_current_configuration = ts.current_configuration;
+		const int prior_last_configuration = ts.last_configuration;
+		const double prior_telecom_M = ts.M;
+		const int prior_active_bundle_idx = ts.active_bundle_idx;
+		const int prior_ofdm_Nc = ts.ofdm.Nc;
+		const int prior_ofdm_Nsymb = ts.ofdm.Nsymb;
+		const int prior_data_Nc = ts.data_container.Nc;
+		const int prior_data_M = ts.data_container.M;
+		const int prior_data_Nsymb = ts.data_container.Nsymb;
+		const int prior_data_nBits = ts.data_container.nBits;
+		cl_mfsk prior_mfsk;
+		prior_mfsk.copy_from(ts.mfsk);
+		set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_M", "32");
+		set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_NSTREAMS", "2");
+		ts.load_configuration(ROBUST_1);
+		if(ts.current_configuration != prior_current_configuration
+			|| ts.last_configuration != prior_last_configuration
+			|| ts.M != prior_telecom_M || ts.active_bundle_idx != prior_active_bundle_idx
+			|| ts.ofdm.Nc != prior_ofdm_Nc || ts.ofdm.Nsymb != prior_ofdm_Nsymb
+			|| ts.data_container.Nc != prior_data_Nc || ts.data_container.M != prior_data_M
+			|| ts.data_container.Nsymb != prior_data_Nsymb
+			|| ts.data_container.nBits != prior_data_nBits
+			|| !same_mfsk_geometry_state(ts.mfsk, prior_mfsk))
+		{
+			printf("  [FAIL] %s: invalid config transition did not preserve current geometry\n", name);
+			failures++;
+		}
+	}
+
+	set_mfsk_geometry_test_env("MERCURY_NC_OVERRIDE", "64");
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_M", "32");
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_NSTREAMS", "2");
+	{
+		cl_telecom_system ts;
+		ts.narrowband_enabled = NO;
+		ts.load_configuration(ROBUST_0);
+		if(ts.current_configuration != ROBUST_0 || ts.ofdm.Nc != 64
+			|| ts.mfsk.M != 32 || ts.mfsk.Nc != 64 || ts.mfsk.nStreams != 2
+			|| ts.mfsk.stream_offsets[0] != 0
+			|| ts.mfsk.stream_offsets[1] + ts.mfsk.M - 1 != 63)
+		{
+			printf("  [FAIL] %s: selected exact-boundary M32x2/Nc64 rejected or mis-sized\n",
+				name);
+			failures++;
+		}
+	}
+
+	set_mfsk_geometry_test_env("MERCURY_NC_OVERRIDE", nullptr);
 	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_M", "8");
 	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_NSTREAMS", "2");
 	{

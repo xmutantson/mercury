@@ -76,26 +76,47 @@ one `Nc`-carrier row. None owns extra overflow capacity.
 
 Valid states are:
 
-1. Inert/default: `M == Nc == nStreams == 0`. Generation and demodulation
-   return before indexing.
+1. Inert/default: a freshly constructed object has
+   `M == Nc == nStreams == 0` and zero derived lengths. Generation and
+   demodulation return before indexing. A rejected first initialization does
+   not change this state.
 2. Live: all dimensions are positive, `nStreams <= 4`, and
    `M <= Nc / nStreams`. Centered offsets then make the last used carrier
    strictly less than `Nc`.
-3. Configuration rejection: an invalid selected tuple leaves the telecom
-   system at its prior configuration; from startup it remains `CONFIG_NONE`.
+3. Direct reinitialization rejection: validation happens before `deinit()` or
+   any other write. A live object therefore retains its entire prior coherent
+   geometry, including derived preamble/control lengths, tones, and generated
+   waveform.
+4. Configuration rejection: an invalid selected tuple leaves the telecom
+   system and MFSK geometry at their prior coherent configuration; from startup
+   it remains `CONFIG_NONE` with a freshly inert MFSK object.
 
-Direct invalid initialization first deinitializes the geometry, then returns.
-This makes retries, demotion/climb, BREAK/control generation, reconnect, and
-session reset fail inert if a malformed tuple ever bypasses selection. Normal
-stock and exact-boundary geometries are unchanged. No waveform parameter,
-threshold, tone map, or valid-grid offset changed.
+These rejection rules prevent a hybrid state during retries, demotion/climb,
+BREAK/control generation, reconnect, and session reset. Normal stock and
+exact-boundary geometries are unchanged. No waveform parameter, threshold,
+tone map, or valid-grid offset changed.
 
 ## Deterministic evidence
 
 The focused regression is `mfsk_geometry_guard` in
 `source/physical_layer/mfsk_ctrl_codec_tests.cc`. Before the guard it reported
-three geometry failures: both invalid active configurations and the direct
-initializer, with the WB first-invalid witness `carrier=50, stream=1, tone=18`.
+three geometry failures: both invalid active configurations and the fresh
+direct initializer, with the WB first-invalid witness
+`carrier=50, stream=1, tone=18`.
+
+The pass-after regression additionally proves:
+
+- fresh invalid initialization remains fully inert, including derived lengths;
+- valid `M8 x 1 / Nc10` followed by invalid `M32 x 2 / Nc50` produces the
+  identical preamble and preserves its nonzero legacy/Sidelnikov preamble
+  lengths and thresholds plus sampled derived control state;
+- a live `ROBUST_0` to invalid `ROBUST_1` request preserves `ROBUST_0` and its
+  current/last configuration, telecom modulation, active bundle index,
+  OFDM/data-container dimensions, and MFSK derived lengths and complete tone
+  tables;
+- exact equality is accepted directly at `M16 x 3 / Nc48` and through the
+  loader/AUTO-selected carrier path at `M32 x 2 / Nc64`, whose last carrier is
+  index 63.
 
 After the guard:
 
@@ -122,8 +143,8 @@ Both binaries were built from the base above plus the scoped working diff with
 `build.sh debug` and `build.sh asan`, respectively. Their SHA-256 values were:
 
 ```text
-mercury_debug  fe69cb39711407b68cfeaa9c52203dfbbf8f11a6200f8abe766196bd24ea298d
-mercury_asan   4dfd004f96f3a8b5387bffac394831075d2a050ee6f9ee448f80021bb2a4293b
+mercury_debug  30e2bbf3380f86eb5a0fdccdc7aaf6090d2554148423514efca6f251e3c16037
+mercury_asan   6f8f938ad82522cb1c64a43495495160a37325c2b31d7b2a758227c29d279290
 ```
 
 The repository-wide `./mercury_debug --test` smoke was also started with the

@@ -94,7 +94,6 @@ cl_mfsk::~cl_mfsk()
 
 void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 {
-	deinit();
 	if (!valid_geometry(_M, _Nc, _nStreams))
 	{
 		fprintf(stderr, "[PHY] Refusing invalid MFSK geometry: M=%d Nc=%d nStreams=%d\n",
@@ -102,6 +101,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		return;
 	}
 
+	deinit();
 	M = _M;
 	Nc = _Nc;
 	nStreams = _nStreams;
