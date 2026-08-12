@@ -20389,7 +20389,12 @@ int cl_arq_controller::test_mixbatch_fill_overpop()
 	bool defeat = false;
 	{ const char* e = std::getenv("MERCURY_MIXBATCH_OVERPOP_DEFEAT");
 	  if(e && *e && atoi(e)!=0) defeat = true; }
-	printf("[TEST-MIXFILL] start (MERCURY_MIXBATCH_OVERPOP_DEFEAT=%d)\n", defeat?1:0);
+	bool slotcap_defeat = false;
+	{ const char* e = std::getenv("MERCURY_MIXBATCH_SLOTCAP_DEFEAT");
+	  if(e && *e && atoi(e)!=0) slotcap_defeat = true; }
+	printf("[TEST-MIXFILL] start (MERCURY_MIXBATCH_OVERPOP_DEFEAT=%d "
+	       "MERCURY_MIXBATCH_SLOTCAP_DEFEAT=%d)\n",
+	       defeat?1:0, slotcap_defeat?1:0);
 	fflush(stdout);
 
 	int failed = 0;
@@ -20516,9 +20521,108 @@ int cl_arq_controller::test_mixbatch_fill_overpop()
 		check(first_bad != -1, "C3 fail-before REORDERS the delivered stream", first_bad, 1);
 	}
 
+	// ---- CYCLE 3: HOLD corruption geometry (88 live slots, only 32 FREE) ----
+	// The two corrupt cfg17 HOLD cells each deleted exactly 9,284 bytes. Their
+	// sender state was nMessages=120 with 88 prior-batch frames still live, a
+	// one-frame retx prefix, and data_batch_size=90. The old fill arithmetic
+	// attempted 89 new frames even though add_message_tx_data() could accept only
+	// 32. It popped and committed all attempts, ignored 57 enqueue failures, and
+	// Option W shortened the final attempted frame by seven bytes:
+	//     56 * 163 + (163 - 7) = 9,284 orphaned source bytes.
 	deinit_messages_buffers();
-	printf("[TEST-MIXFILL] %s: fails=%d (defeat=%d)\n",
-		failed==0 ? "ALL PASS" : "FAILURES", failed, defeat?1:0);
+	max_data_length    = 161;
+	max_header_length  = 8;
+	header_carries_d5  = true;
+	sack_v2_enabled    = true;
+	sack_enabled       = true;
+	cumulative_ack_enabled = false;
+	compression_enabled= false;
+	encryption_enabled = false;
+	role               = COMMANDER;
+	original_role      = COMMANDER;
+	link_status        = CONNECTED;
+	connection_status  = TRANSMITTING_DATA;
+	block_under_tx     = YES;
+	message_batch_counter_tx = 0;
+	cmd_batch_seq_id   = 13;
+	retransmit_count   = 1;
+	nMessages          = 120;
+	set_data_batch_size(90);
+	alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "S0 message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+
+	const int SLOT_MF = max_data_length + max_header_length
+	                  - effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+	check(SLOT_MF == 163, "S0b production max_frame reproduced", SLOT_MF, 163);
+	for(int i=0;i<88;i++)
+	{
+		messages_tx[i].status = PENDING_ACK;
+		messages_tx[i].type   = DATA_LONG;
+		messages_tx[i].length = SLOT_MF;
+	}
+	const int free_before = get_nFree_messages();
+	check(free_before == 32, "S0c exact live-slot pressure reproduced", free_before, 32);
+
+	const int SLOT_FED = 20000;
+	{
+		char* fed = new char[SLOT_FED];
+		for(int k=0;k<SLOT_FED;k++) fed[k] = (char)(unsigned char)(k & 0xFF);
+		int pushed = fifo_buffer_tx.push(fed, SLOT_FED);
+		check(pushed == SLOT_FED, "S0d slot-pressure source staged", pushed, SLOT_FED);
+		delete[] fed;
+	}
+	const int source_before = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	const int backup_before = fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	process_buffer_data_commander();
+
+	int staged_frames = 0;
+	int staged_bytes = 0;
+	for(int i=0;i<nMessages;i++)
+	{
+		if(messages_tx[i].status == ADDED_TO_LIST)
+		{
+			staged_frames++;
+			staged_bytes += messages_tx[i].length;
+		}
+	}
+	const int source_after = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	const int backup_after = fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	const int consumed = source_before - source_after;
+	const int backup_added = backup_after - backup_before;
+	const int orphan = consumed - staged_bytes;
+	const int expected_orphan = 56 * SLOT_MF + (SLOT_MF - W_EOB_RESERVE);
+
+	printf("[TEST-MIXFILL] slot-pressure free=%d staged_frames=%d staged_bytes=%d "
+	       "consumed=%d backup_added=%d orphan=%d expected_fail_before=%d\n",
+	       free_before, staged_frames, staged_bytes, consumed, backup_added,
+	       orphan, expected_orphan);
+	fflush(stdout);
+	check(staged_frames == free_before,
+		"S1 all and only available message slots used", staged_frames, free_before);
+	check(backup_added == consumed,
+		"S2 backup accounts for source consumption", backup_added, consumed);
+	if(!slotcap_defeat)
+	{
+		check(orphan == 0,
+			"S3 every consumed source byte has a live message", orphan, 0);
+		check(consumed == 31 * SLOT_MF + (SLOT_MF - W_EOB_RESERVE),
+			"S4 EOB reserve applies to final successfully staged frame",
+			consumed, 31 * SLOT_MF + (SLOT_MF - W_EOB_RESERVE));
+	}
+	else
+	{
+		check(expected_orphan == 9284,
+			"S3a defeat oracle pins captured deletion", expected_orphan, 9284);
+		check(orphan == expected_orphan,
+			"S3b defeat reproduces exact source-byte orphan", orphan, expected_orphan);
+	}
+
+	deinit_messages_buffers();
+	printf("[TEST-MIXFILL] %s: fails=%d (defeat=%d slotcap_defeat=%d)\n",
+		failed==0 ? "ALL PASS" : "FAILURES", failed,
+		defeat?1:0, slotcap_defeat?1:0);
 	fflush(stdout);
 	return failed==0 ? 0 : 1;
 }
