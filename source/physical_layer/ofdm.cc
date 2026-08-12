@@ -1851,6 +1851,22 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
  */
 }
 
+double cl_ofdm::pilot_magnitude_cv(const double* magnitudes, int count)
+{
+	if(magnitudes == NULL || count <= 1) return -1.0;
+	double sum = 0.0, sumsq = 0.0;
+	for(int i=0; i<count; i++)
+	{
+		if(!std::isfinite(magnitudes[i]) || magnitudes[i] < 0.0) return -1.0;
+		sum += magnitudes[i];
+		sumsq += magnitudes[i] * magnitudes[i];
+	}
+	double mean = sum / count;
+	double variance = sumsq / count - mean * mean;
+	if(variance < 0.0) variance = 0.0;
+	return (mean > 1e-12) ? sqrt(variance) / mean : -1.0;
+}
+
 void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 {
 	std::complex <double> pilot_data[Nsymb*Nc]={std::complex <double> (0,0)};
@@ -1959,16 +1975,16 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 	// SNR-independent ~0.4-1.3 ripple the smoother/interpolation inject, so this
 	// raw-pilot reading is what feeds last_channel_selectivity.
 	{
-		double ps=0.0, pss=0.0; int pc=0;
+		std::vector<double> magnitudes;
 		for(int ii=0; ii<Nsymb; ii++)
 			for(int jj=0; jj<Nc; jj++)
 				if((ofdm_frame+ii*Nc+jj)->type==PILOT && (estimated_channel+ii*Nc+jj)->status==MEASURED)
-				{ double m=std::abs((estimated_channel+ii*Nc+jj)->value); ps+=m; pss+=m*m; pc++; }
-		if(pc>1){ double pm=ps/pc; double pv=pss/pc-pm*pm; if(pv<0)pv=0;
-			last_pilot_selectivity = (pm>1e-12) ? (sqrt(pv)/pm) : -1.0; }
-		else last_pilot_selectivity = -1.0;
+					magnitudes.push_back(std::abs((estimated_channel+ii*Nc+jj)->value));
+		last_pilot_selectivity = pilot_magnitude_cv(
+			magnitudes.empty() ? NULL : magnitudes.data(), (int)magnitudes.size());
 		if(std::getenv("MERCURY_SEL_DIAG"))
-			std::cerr << "[PILOT-SEL] npil=" << pc << " sel=" << last_pilot_selectivity << std::endl;
+			std::cerr << "[PILOT-SEL] npil=" << magnitudes.size()
+			          << " sel=" << last_pilot_selectivity << std::endl;
 	}
 
 	// Timing-quality selector: pilot phase COHERENCE over the RAW LS estimates,
@@ -2169,6 +2185,26 @@ void cl_ofdm::LS_channel_estimator_tinterp(std::complex <double>*in)
 					known[(size_t)n*C+j] = 1;
 				}
 			}
+	}
+
+	// Publish frequency selectivity from THIS estimator pass's raw pilot LS
+	// anchors, before interpolation or smoothing. receive_byte clears the member
+	// before every estimator pass; assigning every exit here prevents a TINTERP
+	// retry from retaining an earlier frame/config value. With fewer than two
+	// finite anchors (or a zero mean), keep the fail-closed -1 sentinel so the
+	// caller cannot mistake an invalid interpolation for a channel measurement.
+	{
+		std::vector<double> magnitudes;
+		for(size_t idx = 0; idx < Hp.size(); idx++)
+		{
+			if(!known[idx]) continue;
+			magnitudes.push_back(std::abs(Hp[idx]));
+		}
+		last_pilot_selectivity = pilot_magnitude_cv(
+			magnitudes.empty() ? NULL : magnitudes.data(), (int)magnitudes.size());
+		if(std::getenv("MERCURY_SEL_DIAG"))
+			std::cerr << "[PILOT-SEL] npil=" << magnitudes.size()
+			          << " sel=" << last_pilot_selectivity << std::endl;
 	}
 
 	// Timing-quality selector: pilot phase COHERENCE over the RAW time-pilot LS

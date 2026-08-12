@@ -1659,10 +1659,38 @@ int cl_arq_controller::test_topgear_clean_election()
 	cmd->topgear_elect_clean_streak = STREAK;
 	cmd->topgear_channel_flatness = FLAT_OK;
 	cmd->topgear_last_report_bsi = 99;
+	ts->ofdm.last_pilot_selectivity = FLAT_OK;
+	ts->last_channel_selectivity = FLAT_OK;
 	cmd->reset_session_state();
 	check(!cmd->topgear_elect_engaged && cmd->topgear_elect_clean_streak == 0
-	      && cmd->topgear_channel_flatness < 0.0 && cmd->topgear_last_report_bsi == -1,
+	      && cmd->topgear_channel_flatness < 0.0 && cmd->topgear_last_report_bsi == -1
+	      && ts->ofdm.last_pilot_selectivity < 0.0 && ts->last_channel_selectivity < 0.0,
 	      "session reset clears all cfg17 channel evidence and report de-dup state");
+
+	// BREAK recovery uses this exact PHYSICAL_LAYER_ONLY load primitive after the
+	// decoded BREAK handler chooses ROBUST_0. No prior-channel metric may survive
+	// into the recovery configuration before its first frame.
+	ts->ofdm.last_pilot_selectivity = FLAT_OK;
+	ts->last_channel_selectivity = FLAT_OK;
+	cmd->load_configuration(ROBUST_0, PHYSICAL_LAYER_ONLY, YES);
+	check(ts->ofdm.last_pilot_selectivity < 0.0 && ts->last_channel_selectivity < 0.0,
+	      "BREAK-recovery PHY load invalidates both prior-channel selectivity caches");
+
+	// Commander CONNECT-accept deliberately skips reset_session_state, so exercise
+	// that actual branch and prove its explicit epoch reset reaches both PHY caches.
+	cmd->load_configuration(CONFIG_16, FULL, YES);
+	ts->ofdm.last_pilot_selectivity = FLAT_OK;
+	ts->last_channel_selectivity = FLAT_OK;
+	cmd->topgear_channel_flatness = FLAT_OK;
+	cmd->topgear_elect_engaged = true;
+	cmd->link_status = CONNECTING;
+	cmd->connection_status = RECEIVING_ACKS_CONTROL;
+	cmd->messages_control.data[0] = START_CONNECTION;
+	cmd->process_control_commander();
+	check(cmd->link_status == CONNECTION_ACCEPTED
+	      && !cmd->topgear_elect_engaged && cmd->topgear_channel_flatness < 0.0
+	      && ts->ofdm.last_pilot_selectivity < 0.0 && ts->last_channel_selectivity < 0.0,
+	      "CONNECT-accept branch invalidates ARQ and PHY channel evidence");
 
 	delete cmd; delete ts;
 	clr_env("MERCURY_TOPGEAR_ELECT");

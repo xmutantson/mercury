@@ -33,6 +33,7 @@
 #include <thread>   // R006: --test-shutdown-atomic cross-thread smoke
 #include <type_traits> // R006: static_assert shutdown_ is atomic
 #include <random>   // P1 frame-0 vehicle: deterministic AWGN run-up synthesis
+#include <limits>
 #include <cstring>  // FIX-C: memset for sigaction struct init (explicit, not transitive)
 #include <csignal>  // FIX-C: SIGTERM/SIGINT graceful-shutdown handler (raise/SIGTERM)
 #ifndef _WIN32
@@ -669,13 +670,15 @@ static void tinterp_set_env(const char* k, const char* v)
 // restored so the harness default-off paths are not perturbed for later in-process work.
 static void tinterp_run_cell(const char* esn0, const char* chan, const char* depth,
                              const char* fd, const char* dly, int tinterp_prod,
-                             int& cw_ok, int& cw_tot)
+                             int valid_tinterp_pilots, double selectivity_preseed,
+                             int& cw_ok, int& cw_tot, double& pilot_selectivity)
 {
     const char* keys[] = {
         "MERCURY_SFO_GRID", "MERCURY_SFO_GRID_CODED", "MERCURY_SFO_GRID_ESN0",
         "MERCURY_SFO_GRID_CHAN", "MERCURY_SFO_GRID_WATT_DEPTH_DB",
         "MERCURY_SFO_GRID_WATT_FD_HZ", "MERCURY_SFO_GRID_WATT_DLY",
-        "MERCURY_SFO_GRID_TINTERP_PROD"
+        "MERCURY_SFO_GRID_TINTERP_PROD",
+        "MERCURY_SFO_GRID_TINTERP_VALID_PILOTS"
     };
     const int nk = (int)(sizeof(keys)/sizeof(keys[0]));
     struct Saved { const char* key; bool had; std::string val; } sv[16];
@@ -692,13 +695,18 @@ static void tinterp_run_cell(const char* esn0, const char* chan, const char* dep
     tinterp_set_env("MERCURY_SFO_GRID_WATT_FD_HZ", fd);
     tinterp_set_env("MERCURY_SFO_GRID_WATT_DLY", dly);
     tinterp_set_env("MERCURY_SFO_GRID_TINTERP_PROD", tinterp_prod ? "1" : "0");
+    char valid_pilots[24];
+    snprintf(valid_pilots, sizeof(valid_pilots), "%d", valid_tinterp_pilots);
+    tinterp_set_env("MERCURY_SFO_GRID_TINTERP_VALID_PILOTS", valid_pilots);
 
     cl_telecom_system ts;
     ts.operation_mode = BER_PLOT_passband;
     ts.load_configuration(CONFIG_15);   // CFG15 dense Dx=1/Dy=3 lattice (the MPG cell)
+    ts.ofdm.last_pilot_selectivity = selectivity_preseed;
     ts.sfo_grid_test();
     cw_ok  = ts.sfo_grid_last_cw_ok;
     cw_tot = ts.sfo_grid_last_cw_tot;
+    pilot_selectivity = ts.ofdm.last_pilot_selectivity;
 
     for (int i = 0; i < nk; i++) {
 #if defined(_WIN32)
@@ -713,6 +721,7 @@ static int run_tinterp_seed_selftest()
 {
     printf("[TEST-TINTERP-SEED] TINTERP-SEED production estimator self-test (it=0 seed swap)\n");
     int fails = 0;
+    double clean_ls_sel = -1.0, clean_ti_sel = -1.0;
 
     // ---- Cell A: GOOD Watterson fade (MPG). LS FLOORS 0/K, TINTERP CROSSES K/K. ----
     // CHAN=3 depth=10dB fd=0.1Hz dly=24 @ EsN0=24 (test_fade_tinterp.py MPG). The held LS
@@ -722,8 +731,11 @@ static int run_tinterp_seed_selftest()
     // only the it=0 estimator seed differs (the exact swap the receive_byte rescue performs).
     {
         int ls_ok=-1, ls_tot=-1, ti_ok=-1, ti_tot=-1;
-        tinterp_run_cell("24","3","10","0.1","24", 0, ls_ok, ls_tot);   // LS-only (before)
-        tinterp_run_cell("24","3","10","0.1","24", 1, ti_ok, ti_tot);   // TINTERP (after)
+        double ls_sel=-1.0, ti_sel=-1.0;
+        tinterp_run_cell("24","3","10","0.1","24", 0, -1, 0.777,
+                         ls_ok, ls_tot, ls_sel);   // LS-only (before)
+        tinterp_run_cell("24","3","10","0.1","24", 1, -1, 0.777,
+                         ti_ok, ti_tot, ti_sel);   // TINTERP (after)
         bool before_floors = (ls_tot > 0 && ls_ok == 0);
         bool after_crosses = (ti_tot > 0 && ti_ok == ti_tot);
         bool ok = before_floors && after_crosses;
@@ -741,18 +753,211 @@ static int run_tinterp_seed_selftest()
     // Asserting equal decode counts on clean is the standalone no-op proof.
     {
         int ls_ok=-1, ls_tot=-1, ti_ok=-1, ti_tot=-1;
-        tinterp_run_cell("24","0","0","0.5","24", 0, ls_ok, ls_tot);    // LS-only clean
-        tinterp_run_cell("24","0","0","0.5","24", 1, ti_ok, ti_tot);    // TINTERP clean
+        tinterp_run_cell("24","0","0","0.5","24", 0, -1, 0.777,
+                         ls_ok, ls_tot, clean_ls_sel);    // LS-only clean
+        tinterp_run_cell("24","0","0","0.5","24", 1, -1, 0.777,
+                         ti_ok, ti_tot, clean_ti_sel);    // TINTERP clean
         bool ls_full = (ls_tot > 0 && ls_ok == ls_tot);
         bool ti_noop = (ti_tot == ls_tot && ti_ok == ls_ok);
-        bool ok = ls_full && ti_noop;
-        printf("[TEST-TINTERP-SEED]   CELL-B CLEAN@24dB no-op: LS=%d/%d TINTERP=%d/%d -> %s\n",
-               ls_ok, ls_tot, ti_ok, ti_tot,
+        bool sel_equal = fabs(clean_ls_sel - clean_ti_sel) <= 1e-12;
+        bool sel_ok = (clean_ls_sel >= 0.0 && clean_ls_sel < 0.15
+                       && clean_ti_sel >= 0.0 && clean_ti_sel < 0.15
+                       && fabs(clean_ti_sel - 0.777) > 1e-9 && sel_equal);
+        bool ok = ls_full && ti_noop && sel_ok;
+        printf("[TEST-TINTERP-SEED]   CELL-B CLEAN@24dB no-op: LS=%d/%d sel=%.6f "
+               "TINTERP=%d/%d sel=%.6f -> %s\n",
+               ls_ok, ls_tot, clean_ls_sel, ti_ok, ti_tot, clean_ti_sel,
                ok?"PASS(no-op)":"FAIL(regression)");
         if(!ok) fails++;
     }
 
+    // ---- Cell C: static TWO-RAY selectivity. Both estimators must publish the
+    // current pilot geometry, and TINTERP must overwrite the stale tripwire. ----
+    {
+        int ls_ok=-1, ls_tot=-1, ti_ok=-1, ti_tot=-1;
+        double ls_sel=-1.0, ti_sel=-1.0;
+        tinterp_run_cell("40","2","0","0.5","24", 0, -1, 0.777,
+                         ls_ok, ls_tot, ls_sel);
+        tinterp_run_cell("40","2","0","0.5","24", 1, -1, 0.777,
+                         ti_ok, ti_tot, ti_sel);
+        bool current = (ls_sel >= 0.0 && fabs(ls_sel - 0.777) > 1e-9
+                        && fabs(ti_sel - 0.777) > 1e-9);
+		// Both estimator paths must publish the same-semantic instantaneous
+		// pilot response. A strong two-ray fixture must cross the production
+		// boundary in both, not only in TINTERP.
+		bool discriminates = (clean_ls_sel >= 0.0 && clean_ti_sel >= 0.0
+		                      && ls_sel > 0.15 && ti_sel > 0.15
+		                      && ls_sel > 4.0*clean_ls_sel
+		                      && ti_sel > 4.0*clean_ti_sel
+		                      && fabs(ls_sel-ti_sel) <= 1e-12);
+        bool ok = current && discriminates;
+        printf("[TEST-TINTERP-SEED]   CELL-C TWO-RAY@40dB: LS-sel=%.6f "
+               "TINTERP-sel=%.6f current=%d -> %s\n",
+               ls_sel, ti_sel, current?1:0, ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell D: no valid TINTERP pilot symbols. Fail closed to -1 and never
+    // retain the preseeded prior-frame value. Decode outcome is irrelevant. ----
+    {
+        int ti_ok=-1, ti_tot=-1;
+        double ti_sel=-1.0;
+        tinterp_run_cell("40","0","0","0.5","24", 1, 0, 0.777,
+                         ti_ok, ti_tot, ti_sel);
+        bool ok = (ti_sel == -1.0);
+        printf("[TEST-TINTERP-SEED]   CELL-D INVALID-PILOTS stale guard: "
+               "preseed=0.777 after=%.6f -> %s\n", ti_sel, ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+    // ---- Cell E: exactly one usable pilot through the full TINTERP estimator.
+    // The collection path must count it, reject it as insufficient evidence, and
+    // overwrite the prior-frame tripwire with the fail-closed sentinel. ----
+    {
+        int ti_ok=-1, ti_tot=-1;
+        double ti_sel=-1.0;
+        tinterp_run_cell("40","0","0","0.5","24", 1, 1, 0.777,
+                         ti_ok, ti_tot, ti_sel);
+        bool ok = (ti_sel == -1.0);
+        printf("[TEST-TINTERP-SEED]   CELL-E ONE-PILOT estimator guard: "
+               "preseed=0.777 after=%.6f -> %s\n", ti_sel, ok?"PASS":"FAIL");
+        if(!ok) fails++;
+    }
+
+	// ---- Cell F: exact production arithmetic and consumer fail-closed edges. ----
+	{
+		double one[] = {1.0};
+		double nonfinite[] = {1.0, std::numeric_limits<double>::infinity()};
+		double nearzero[] = {1e-300, 2e-300};
+		double extreme[] = {std::numeric_limits<double>::max(),
+		                    std::numeric_limits<double>::max()/2.0};
+		double cv_one = cl_ofdm::pilot_magnitude_cv(one, 1);
+		double cv_nonfinite = cl_ofdm::pilot_magnitude_cv(nonfinite, 2);
+		double cv_nearzero = cl_ofdm::pilot_magnitude_cv(nearzero, 2);
+		double cv_extreme = cl_ofdm::pilot_magnitude_cv(extreme, 2);
+
+		cl_telecom_system ts;
+#if defined(_WIN32)
+		_putenv_s("MERCURY_SEL_LEGACY", "");
+#else
+		unsetenv("MERCURY_SEL_LEGACY");
+#endif
+		ts.ofdm.last_pilot_selectivity = -1.0;
+		ts.update_channel_selectivity(0.888);
+		double invalid_selected = ts.last_channel_selectivity;
+		ts.ofdm.last_pilot_selectivity = 0.123;
+		ts.update_channel_selectivity(0.888);
+		double raw_selected = ts.last_channel_selectivity;
+		tinterp_set_env("MERCURY_SEL_LEGACY", "1");
+		ts.update_channel_selectivity(0.888);
+		double legacy_selected = ts.last_channel_selectivity;
+#if defined(_WIN32)
+		_putenv_s("MERCURY_SEL_LEGACY", "");
+#else
+		unsetenv("MERCURY_SEL_LEGACY");
+#endif
+		bool ok = (cv_one == -1.0 && cv_nonfinite == -1.0
+		           && cv_nearzero == -1.0 && std::isfinite(cv_extreme)
+		           && cv_extreme >= 0.0 && invalid_selected == -1.0
+		           && fabs(raw_selected-0.123) < 1e-12
+		           && fabs(legacy_selected-0.888) < 1e-12);
+		printf("[TEST-TINTERP-SEED]   CELL-F numeric+consumer: one=%.6f nonfinite=%.6f "
+		       "nearzero=%.6f extreme=%.6f invalid-selected=%.6f raw=%.6f legacy=%.6f -> %s\n",
+		       cv_one, cv_nonfinite, cv_nearzero, cv_extreme, invalid_selected,
+		       raw_selected, legacy_selected, ok?"PASS":"FAIL");
+		if(!ok) fails++;
+	}
+
     printf("[TEST-TINTERP-SEED] %s (%d cell failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
+    return fails==0 ? 0 : 1;
+}
+
+// Actual receive-flow discriminator for the selectivity state contract. Unlike
+// the estimator-only grid above, every cell enters cl_telecom_system::receive_byte.
+static int run_tinterp_receive_path_selftest()
+{
+    printf("[TEST-TINTERP-RX] receive_byte selectivity transition self-test\n");
+    int fails = 0;
+    const char* keys[] = {"MERCURY_MFSK_WATT", "MERCURY_MFSK_WATT_FD_HZ",
+                          "MERCURY_MFSK_WATT_SPREAD_MS", "MERCURY_MFSK_WATT_DEPTH_DB",
+                          "MERCURY_MFSK_WATT_SEED"};
+    struct Saved { bool had; std::string value; } saved[5];
+    for(int i=0;i<5;i++) { const char* v=std::getenv(keys[i]); saved[i].had=(v!=NULL); saved[i].value=v?v:""; }
+    auto restore_env = [&](){
+        for(int i=0;i<5;i++) {
+#if defined(_WIN32)
+            _putenv_s(keys[i], saved[i].had ? saved[i].value.c_str() : "");
+#else
+            if(saved[i].had) setenv(keys[i], saved[i].value.c_str(), 1); else unsetenv(keys[i]);
+#endif
+        }
+    };
+
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_15);
+
+    // A deterministic slow-fade frame makes primary LS fail and enters the real
+    // retry label. The accepted-frame TINTERP rescue is separately covered by
+    // Cell A in the estimator/FEC discriminator above.
+    tinterp_set_env("MERCURY_MFSK_WATT", "1");
+    tinterp_set_env("MERCURY_MFSK_WATT_FD_HZ", "0.1");
+    tinterp_set_env("MERCURY_MFSK_WATT_SPREAD_MS", "0.5");
+    tinterp_set_env("MERCURY_MFSK_WATT_DEPTH_DB", "10");
+    tinterp_set_env("MERCURY_MFSK_WATT_SEED", "1");
+    ts.passband_test_EsN0(10.0f, 1);
+    bool retry_ok = ts.receive_stats.tinterp_rescue_attempted
+                 && ts.ofdm.channel_estimator == LEAST_SQUARE;
+    printf("[TEST-TINTERP-RX]   CELL-A LS->TINTERP retry attempted=%d succeeded=%d restored=%d -> %s\n",
+           ts.receive_stats.tinterp_rescue_attempted?1:0,
+           ts.receive_stats.tinterp_rescue_succeeded?1:0,
+           ts.ofdm.channel_estimator==LEAST_SQUARE?1:0, retry_ok?"PASS":"FAIL");
+    if(!retry_ok) fails++;
+
+    // Consecutive clean frame on the same object must overwrite both stale caches
+    // through the real estimator and selector call site without entering retry.
+    tinterp_set_env("MERCURY_MFSK_WATT", "0");
+    ts.ofdm.last_pilot_selectivity = 0.777;
+    ts.last_channel_selectivity = 0.777;
+    cl_error_rate clean = ts.passband_test_EsN0(40.0f, 1);
+    bool clean_ok = (clean.Error_frames_total == 0)
+                 && !ts.receive_stats.tinterp_rescue_attempted
+                 && std::isfinite(ts.ofdm.last_pilot_selectivity)
+                 && ts.ofdm.last_pilot_selectivity >= 0.0
+                 && fabs(ts.last_channel_selectivity-ts.ofdm.last_pilot_selectivity) <= 1e-12
+                 && fabs(ts.last_channel_selectivity-0.777) > 1e-9;
+    printf("[TEST-TINTERP-RX]   CELL-B consecutive clean LS pilot=%.6f selected=%.6f -> %s\n",
+           ts.ofdm.last_pilot_selectivity, ts.last_channel_selectivity, clean_ok?"PASS":"FAIL");
+    if(!clean_ok) fails++;
+
+    // Full receive flow with exactly one usable TINTERP pilot. The test hook is
+    // applied after TX/CPE and restored immediately after the estimator.
+    ts.ofdm.channel_estimator = TIME_INTERP;
+    ts.selectivity_test_valid_pilots = 1;
+    ts.ofdm.last_pilot_selectivity = 0.777;
+    ts.last_channel_selectivity = 0.777;
+    ts.passband_test_EsN0(40.0f, 1);
+    bool one_ok = ts.ofdm.last_pilot_selectivity == -1.0
+               && ts.last_channel_selectivity == -1.0;
+    printf("[TEST-TINTERP-RX]   CELL-C one-pilot actual selector pilot=%.6f selected=%.6f -> %s\n",
+           ts.ofdm.last_pilot_selectivity, ts.last_channel_selectivity, one_ok?"PASS":"FAIL");
+    if(!one_ok) fails++;
+    ts.selectivity_test_valid_pilots = -1;
+
+    // A config epoch must invalidate both caches immediately, before a new frame.
+    ts.ofdm.last_pilot_selectivity = 0.777;
+    ts.last_channel_selectivity = 0.777;
+    ts.load_configuration(CONFIG_16);
+    bool transition_ok = ts.ofdm.last_pilot_selectivity == -1.0
+                      && ts.last_channel_selectivity == -1.0;
+    printf("[TEST-TINTERP-RX]   CELL-D config transition pilot=%.6f selected=%.6f -> %s\n",
+           ts.ofdm.last_pilot_selectivity, ts.last_channel_selectivity,
+           transition_ok?"PASS":"FAIL");
+    if(!transition_ok) fails++;
+
+    restore_env();
+    printf("[TEST-TINTERP-RX] %s (%d cell failure%s)\n",
+           fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
     return fails==0 ? 0 : 1;
 }
 
@@ -4010,6 +4215,7 @@ int main(int argc, char *argv[])
     bool test_pas_cli = false;          // --test-pas: PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
     bool test_cfg17_cli = false;        // --test-cfg17: CFG17 shaped-64-QAM composition (PAS+TINTERP-seed+ratio-nvfix) failing-first (feat/cfg17).
     bool test_tinterp_seed_cli = false; // --test-tinterp-seed: TINTERP-SEED production it=0 estimator seed-swap failing-first (staging/tinterp-seed).
+    bool test_tinterp_receive_cli = false; // --test-tinterp-receive: actual receive_byte producer/selector transitions.
     bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
     bool test_break_weld_cli = false;   // --test-break-weld: BREAK recovery target pin (diagnostic knob).
@@ -5121,6 +5327,12 @@ int main(int argc, char *argv[])
             // TIME_INTERP seed crosses K/K, plus a clean-channel no-op. The exact
             // estimator the MERCURY_TINTERP_SEED receive_byte rescue selects.
             test_tinterp_seed_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-tinterp-receive") == 0)
+        {
+            test_tinterp_receive_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6895,6 +7107,14 @@ start_modem:
             fflush(stdout);
             int rc = run_tinterp_seed_selftest();
             printf("[FLAG] TINTERP-SEED self-test complete (rc=%d) - exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_tinterp_receive_cli) {
+            printf("[FLAG] --test-tinterp-receive: invoking receive_byte selectivity transition self-test\n");
+            fflush(stdout);
+            int rc = run_tinterp_receive_path_selftest();
+            printf("[FLAG] TINTERP receive-path self-test complete (rc=%d) - exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

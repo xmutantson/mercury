@@ -1801,6 +1801,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.all_zeros = NO;
 	receive_stats.coarse_metric = 0.0;
 	receive_stats.mean_H = -1.0;
+	receive_stats.tinterp_rescue_attempted = false;
+	receive_stats.tinterp_rescue_succeeded = false;
 	receive_stats.last_eff_preamble_nsymb = data_container.preamble_nSymb;  // LEVER P: FULL until a MINI tail frame is extracted
 
 	// NB M8 connect wrong-lock counter (env MERCURY_WRONGLOCK_STATS; production
@@ -3844,6 +3846,19 @@ skip_h_retry_point:
 				// Previously NB-only, but WB also benefits (reduces pilot residuals).
 				ofdm.CPE_correction(data_container.ofdm_symbol_demodulated_data);
 
+				// Deterministic test-only pilot-population override. Preserve the exact
+				// transmitted sequence and restore it immediately after the estimator so
+				// only the producer/selector path is under test.
+				std::vector<std::complex<double>> selectivity_test_saved_pilots;
+				if(selectivity_test_valid_pilots >= 0 && ofdm.pilot_configurator.nPilots > 0)
+				{
+					int n = ofdm.pilot_configurator.nPilots;
+					selectivity_test_saved_pilots.assign(ofdm.pilot_configurator.sequence,
+					                                         ofdm.pilot_configurator.sequence+n);
+					for(int p=selectivity_test_valid_pilots; p<n; p++)
+						ofdm.pilot_configurator.sequence[p] = std::complex<double>(0.0, 0.0);
+				}
+
 				if(ofdm.channel_estimator==ZERO_FORCE)
 				{
 					ofdm.ZF_channel_estimator(data_container.ofdm_symbol_demodulated_data);
@@ -3864,6 +3879,9 @@ skip_h_retry_point:
 					// See data-flow-noise_variance_estimate.md.
 					ofdm.LS_channel_estimator_tinterp(data_container.ofdm_symbol_demodulated_data);
 				}
+				if(!selectivity_test_saved_pilots.empty())
+					for(size_t p=0; p<selectivity_test_saved_pilots.size(); p++)
+						ofdm.pilot_configurator.sequence[p] = selectivity_test_saved_pilots[p];
 
 				mean_H = -1.0;
 				int h_count = 0;
@@ -3925,13 +3943,7 @@ skip_h_retry_point:
 						// per-pilot LS reading (ofdm.last_pilot_selectivity), which converges
 						// toward 0 on flat WGN (~0.04 at operating SNR) and rises on a real
 						// 2-path null. MERCURY_SEL_LEGACY=1 restores the (broken) data-bin metric.
-						const char* sel_legacy = std::getenv("MERCURY_SEL_LEGACY");
-						if(sel_legacy && atoi(sel_legacy) != 0)
-							last_channel_selectivity = data_sel;
-						else if(ofdm.last_pilot_selectivity >= 0.0)
-							last_channel_selectivity = ofdm.last_pilot_selectivity;
-						else
-							last_channel_selectivity = data_sel;
+						update_channel_selectivity(data_sel);
 					}
 					else
 					{
@@ -4541,6 +4553,7 @@ skip_h_retry_point:
 				{
 					tinterp_rescue_phase = 1;
 					tinterp_rescue_in_flight = true;
+					receive_stats.tinterp_rescue_attempted = true;
 					ofdm.channel_estimator = TIME_INTERP;
 					printf("[TINTERP-SEED] cfg=%d delay=%d meanH=%.3f coarse=%.3f crc=0x%04X - LS failed, retry with TIME_INTERP fade estimator\n",
 						current_configuration, receive_stats.delay, mean_H,
@@ -4668,6 +4681,8 @@ skip_h_retry_point:
 				}
 
 				receive_stats.message_decoded=YES;
+				if(tinterp_rescue_in_flight)
+					receive_stats.tinterp_rescue_succeeded = true;
 				// P1 ACQ BAND-EXCLUSION: a successful decode is the re-anchor — the
 				// forward stream is being read cleanly, so drop the recorded
 				// rejected-band centers (touches only P1's own members; invisible to
@@ -9534,6 +9549,21 @@ void cl_telecom_system::sfo_grid_test()
 		// the nv-floor (no 1e-6 collapse). A/B vs the prod else on the SAME seed.
 		int sm = env_i("MERCURY_SFO_GRID_TINTERP_SMOOTH", 0);
 		ofdm.tinterp_smooth_halfwin = (sm > 0) ? sm : 0;
+		// Test-only anchor-count arm: after waveform generation, retain exactly the
+		// requested number of valid symbols for the production TINTERP estimator.
+		// A negative value leaves the normal grid unchanged.
+		int valid_pilot_limit = env_i("MERCURY_SFO_GRID_TINTERP_VALID_PILOTS", -1);
+		if(valid_pilot_limit >= 0)
+		{
+			int pidx = 0;
+			for(int n=0;n<Ngrid;n++) for(int j=0;j<Nc;j++)
+				if((ofdm.ofdm_frame+n*Nc+j)->type==PILOT)
+				{
+					if(pidx >= valid_pilot_limit)
+						ofdm.pilot_configurator.sequence[pidx] = std::complex<double>(0.0, 0.0);
+					pidx++;
+				}
+		}
 		ofdm.LS_channel_estimator_tinterp(rx.data());
 		std::cout << "[SFO-GRID-EST] cand=TINTERP_PROD smooth=" << ofdm.tinterp_smooth_halfwin
 		          << " nv=" << ofdm.noise_variance_estimate << std::endl;
@@ -14392,6 +14422,17 @@ double cl_telecom_system::get_correlator_snr_proxy() const
 double cl_telecom_system::get_channel_selectivity() const
 {
 	return last_channel_selectivity;
+}
+
+void cl_telecom_system::update_channel_selectivity(double data_bin_selectivity)
+{
+	const char* sel_legacy = std::getenv("MERCURY_SEL_LEGACY");
+	if(sel_legacy && atoi(sel_legacy) != 0)
+		last_channel_selectivity = data_bin_selectivity;
+	else if(ofdm.last_pilot_selectivity >= 0.0)
+		last_channel_selectivity = ofdm.last_pilot_selectivity;
+	else
+		last_channel_selectivity = data_bin_selectivity;
 }
 
 int cl_telecom_system::test_subpeak_gate()

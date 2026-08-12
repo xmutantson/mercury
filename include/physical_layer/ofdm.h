@@ -180,6 +180,10 @@ public:
 	void deframer(std::complex <double>* in, std::complex <double>* out);
 	void ZF_channel_estimator(std::complex <double>*in);
 	void LS_channel_estimator(std::complex <double>*in);
+	// Scale-independent coefficient of variation used by the pilot-selectivity
+	// producer. Public so the deterministic numeric-edge self-test exercises the
+	// exact production arithmetic rather than a duplicate.
+	static double pilot_magnitude_cv(const double* magnitudes, int count);
 	// Geometry-invariant timing-quality selector; sets last_pilot_coherence from
 	// the RAW pilot cells. Call before interpolation/smoothing. See ofdm.h member.
 	void compute_pilot_coherence();
