@@ -12761,6 +12761,151 @@ int cl_arq_controller::test_linkphase_optclock_end_stamp()
 	else
 		printf("[TEST-LP-OPTCLOCK] PASS: START-without-END rejects preceding stamp\n");
 
+	// Observing the commander's keydown on the RX side transfers ownership away from a
+	// completed local keydown. The local token pair must no longer be consumable.
+	message_transmission_time_ms = 500;
+	lp_note_keydown_start(/*bsi=*/12);
+	lp_note_keydown_end(/*bsi=*/12, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+	message_transmission_time_ms = 600;
+	lp_note_rx_frame0(/*bsi=*/12, /*d5_wire=*/10);
+	used_stamp = true;
+	const int post_rx_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(post_rx_ms != 6000 || used_stamp || lp_state.owner != LP_CMD_KEYED
+	   || lp_keydown_start_token != 0 || lp_state.keydown_end_token != 0)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: RX ownership retained local stamp=%d used=%d "
+		       "owner=%d start_token=%llu end_token=%llu\n",
+			post_rx_ms, used_stamp ? 1 : 0, (int)lp_state.owner,
+			(unsigned long long)lp_keydown_start_token,
+			(unsigned long long)lp_state.keydown_end_token);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: RX ownership invalidates local END token\n");
+
+	// Keying a reverse ACK similarly transfers ownership and invalidates any completed
+	// local keydown pair, regardless of whether the configuration changed.
+	message_transmission_time_ms = 500;
+	lp_note_keydown_start(/*bsi=*/13);
+	lp_note_keydown_end(/*bsi=*/13, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+	message_transmission_time_ms = 600;
+	lp_note_rsp_key();
+	used_stamp = true;
+	const int post_rsp_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(post_rsp_ms != 6000 || used_stamp || lp_state.owner != LP_RSP_KEYED
+	   || lp_keydown_start_token != 0 || lp_state.keydown_end_token != 0)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: RSP key retained local stamp=%d used=%d "
+		       "owner=%d start_token=%llu end_token=%llu\n",
+			post_rsp_ms, used_stamp ? 1 : 0, (int)lp_state.owner,
+			(unsigned long long)lp_keydown_start_token,
+			(unsigned long long)lp_state.keydown_end_token);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: RSP key invalidates local END token\n");
+
+	// Session reset invalidates the pair without rewinding the full-width generation.
+	message_transmission_time_ms = 500;
+	lp_note_keydown_start(/*bsi=*/14);
+	lp_note_keydown_end(/*bsi=*/14, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+	const uint64_t pre_reset_token = lp_state.keydown_end_token;
+	lp_reset();
+	message_transmission_time_ms = 600;
+	used_stamp = true;
+	const int post_reset_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(post_reset_ms != 6000 || used_stamp || lp_state.owner != LP_NONE
+	   || lp_keydown_start_token != 0 || lp_state.keydown_end_token != 0
+	   || lp_keydown_generation != pre_reset_token)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: reset retained/reused stamp=%d used=%d "
+		       "owner=%d generation=%llu prior=%llu start_token=%llu end_token=%llu\n",
+			post_reset_ms, used_stamp ? 1 : 0, (int)lp_state.owner,
+			(unsigned long long)lp_keydown_generation,
+			(unsigned long long)pre_reset_token,
+			(unsigned long long)lp_keydown_start_token,
+			(unsigned long long)lp_state.keydown_end_token);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: reset invalidates pair without rewinding token\n");
+
+	// A decoded ACK is not an invalidation: it preserves the still-current completed
+	// local pair. The first START after reset must allocate a different token.
+	message_transmission_time_ms = 500;
+	lp_note_keydown_start(/*bsi=*/15);
+	const uint64_t post_reset_token = lp_keydown_start_token;
+	lp_note_keydown_end(/*bsi=*/15, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+	lp_note_ack_decoded();
+	message_transmission_time_ms = 600;
+	used_stamp = false;
+	const int post_ack_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(post_ack_ms != 5000 || !used_stamp || lp_state.owner != LP_TURNAROUND
+	   || post_reset_token == 0 || post_reset_token == pre_reset_token
+	   || lp_keydown_start_token != post_reset_token
+	   || lp_state.keydown_end_token != post_reset_token)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: ACK decode did not preserve current pair "
+		       "stamp=%d used=%d owner=%d prior=%llu current=%llu start=%llu end=%llu\n",
+			post_ack_ms, used_stamp ? 1 : 0, (int)lp_state.owner,
+			(unsigned long long)pre_reset_token,
+			(unsigned long long)post_reset_token,
+			(unsigned long long)lp_keydown_start_token,
+			(unsigned long long)lp_state.keydown_end_token);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: decoded ACK preserves current completed pair\n");
+
+	// An END from a different BSI is not the END for the current START and must not
+	// publish a consumable pair.
+	message_transmission_time_ms = 500;
+	lp_note_keydown_start(/*bsi=*/16);
+	lp_note_keydown_end(/*bsi=*/17, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+	message_transmission_time_ms = 600;
+	used_stamp = true;
+	const int mismatched_end_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(mismatched_end_ms != 6000 || used_stamp || lp_state.owner != LP_CMD_KEYED
+	   || lp_keydown_start_token == 0 || lp_state.keydown_end_token != 0
+	   || lp_state.owner_keydown_end_ms != 0)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: mismatched END became consumable "
+		       "stamp=%d used=%d owner=%d start_token=%llu end_token=%llu end_ms=%lld\n",
+			mismatched_end_ms, used_stamp ? 1 : 0, (int)lp_state.owner,
+			(unsigned long long)lp_keydown_start_token,
+			(unsigned long long)lp_state.keydown_end_token,
+			lp_state.owner_keydown_end_ms);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: mismatched END cannot publish a stamp\n");
+
+	// The selector itself also rejects a nonzero END token that no longer matches START.
+	message_transmission_time_ms = 500;
+	lp_note_keydown_start(/*bsi=*/18);
+	lp_note_keydown_end(/*bsi=*/18, /*frames_region_len=*/240000,
+		/*frames=*/10, /*force_full=*/false);
+	lp_state.keydown_end_token = lp_keydown_start_token + 1;
+	message_transmission_time_ms = 600;
+	used_stamp = true;
+	const int mismatched_token_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(mismatched_token_ms != 6000 || used_stamp)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: mismatched END token became consumable "
+		       "stamp=%d used=%d start_token=%llu end_token=%llu\n",
+			mismatched_token_ms, used_stamp ? 1 : 0,
+			(unsigned long long)lp_keydown_start_token,
+			(unsigned long long)lp_state.keydown_end_token);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: mismatched END token is rejected\n");
+
 	// Exhaustion is fail-closed: the full-width token is never reused as a valid START.
 	lp_keydown_generation = UINT64_MAX - 1;
 	lp_note_keydown_start(/*bsi=*/11);
