@@ -1352,6 +1352,7 @@ int cl_arq_controller::test_topgear_clean_election()
 	// (8) The not-yet-measured sentinel is distinct from a valid perfectly-flat
 	// channel and fails closed even when SNR is deep-clean.
 	cl_arq_controller* fresh = new cl_arq_controller();
+	fresh->telecom_system = ts;
 	check(fresh->topgear_channel_flatness < 0.0,
 	      "fresh CMD flatness == NOT-MEASURED sentinel (-1, not the 0.0 false-flat that made the veto inert)");
 	fresh->measurements.SNR_downlink = SNR_CLEAN;
