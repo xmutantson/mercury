@@ -1798,6 +1798,116 @@ static void arm_test_watchdog() {
     }).detach();
 }
 
+struct Mini0CarriedCell {
+    int decoded;
+    int byte_exact;
+    int shift_symbols;
+    int skip_var_aborted;
+    int coasted;
+    double noise_variance;
+};
+
+// Drive one zero-preamble tail through the real receive_byte timing, energy,
+// channel-estimation and SKIP-VAR path, followed by the real ARQ coast helper.
+static Mini0CarriedCell run_mini0_carried_cell(bool legacy_defeat, bool carried=true)
+{
+    cl_telecom_system ts;
+    ts.operation_mode = BER_PLOT_passband;
+    ts.load_configuration(CONFIG_17);
+    ts.preamble_amortization_enabled = carried;
+    ts.keydown_track_timing_enabled = carried;
+    ts.fine_energy_carried_defeat = legacy_defeat;
+	ts.fine_energy_test_force_shift_symbols = carried ? 1 : 0;
+
+    cl_data_container& dc = ts.data_container;
+    int interp = ts.frequency_interpolation_rate;
+    int sym_samples = dc.Nofdm * interp;
+    int buf_samples = dc.buffer_Nsymb * sym_samples;
+    int payload_bytes = (dc.nBits - ts.ldpc.P - ts.outer_code_reserved_bits) / 8;
+    if(payload_bytes < 1) payload_bytes = 1;
+    std::vector<int> payload(payload_bytes, 0);
+    for(int i=0; i<payload_bytes; i++) payload[i] = (i * 53 + 7) & 0xff;
+
+    ts.tx_preamble_nsymb_override = carried ? 0 : -1;
+    ts.tx_last_emitted_frame_samples =
+        (dc.Nsymb + (carried ? 0 : dc.preamble_nSymb)) * sym_samples;
+    ts.transmit_byte(payload.data(), payload_bytes, dc.passband_data, SINGLE_MESSAGE);
+    int emitted = ts.tx_last_emitted_frame_samples;
+    ts.tx_preamble_nsymb_override = -1;
+
+    double* rx = dc.ready_to_process_passband_delayed_data;
+    for(int i=0; i<buf_samples; i++) rx[i] = 0.0;
+    const int onset_symbols = 8;
+    int onset = onset_symbols * sym_samples;
+    int copy_n = emitted;
+    if(onset + copy_n > buf_samples) copy_n = buf_samples - onset;
+    for(int i=0; i<copy_n; i++) rx[onset + i] = dc.passband_data[i];
+    ts.receive_stats.ofdm_search_raw = carried ? onset_symbols : 0;
+    ts.receive_stats.ofdm_batch_active = carried;
+    ts.receive_stats.ofdm_drift_per_frame = 0.0;
+    ts.receive_stats.delay = 0;
+    ts.keydown_last_delay = 0;
+    ts.data_container.nUnder_processing_events = 0;
+    ts.ofdm_forced_delay = carried ? -1 : onset;
+    ts.mfsk_fixed_delay = -1;
+    st_receive_stats st = ts.receive_byte(rx, dc.hd_decoded_data_byte);
+
+    int exact = (st.message_decoded == YES) ? 1 : 0;
+    if(exact) for(int i=0; i<payload_bytes; i++)
+        if((dc.hd_decoded_data_byte[i] & 0xff) != (payload[i] & 0xff)) { exact=0; break; }
+
+    cl_arq_controller arq;
+    arq.telecom_system = &ts;
+    arq.role = RESPONDER;
+    arq.sack_v2_enabled = true;
+    arq.current_configuration = CONFIG_17;
+    arq.data_batch_size = 90;
+    arq.batch_coast_defeat = false;
+    arq.batch_coast_max = 8;
+    int ftr = 0;
+    int frame_symbols = dc.Nsymb + st.last_eff_preamble_nsymb;
+    int upper = dc.buffer_Nsymb - frame_symbols;
+    bool coasted = false;
+    if(st.message_decoded != YES)
+        coasted = arq.batch_coast_try_advance(frame_symbols, upper,
+            st.delay / sym_samples, false, &ftr);
+
+    Mini0CarriedCell out;
+    out.decoded = (st.message_decoded == YES) ? 1 : 0;
+    out.byte_exact = exact;
+    out.shift_symbols = ts.fine_energy_last_shift_symbols;
+    out.skip_var_aborted = st.frame_skip_var_aborted ? 1 : 0;
+    out.coasted = coasted ? 1 : 0;
+    out.noise_variance = ts.ofdm.noise_variance_estimate;
+    arq.telecom_system = NULL;
+    return out;
+}
+
+static int run_mini0_carried_timing_test()
+{
+    Mini0CarriedCell legacy = run_mini0_carried_cell(true);
+    Mini0CarriedCell fixed = run_mini0_carried_cell(false);
+	Mini0CarriedCell control = run_mini0_carried_cell(false, false);
+    printf("[TEST-MINI0-CARRIED] legacy: decoded=%d exact=%d energy_shift=%d skipvar=%d coast=%d nv=%.4f\n",
+        legacy.decoded, legacy.byte_exact, legacy.shift_symbols,
+        legacy.skip_var_aborted, legacy.coasted, legacy.noise_variance);
+    printf("[TEST-MINI0-CARRIED] fixed:  decoded=%d exact=%d energy_shift=%d skipvar=%d coast=%d nv=%.4f\n",
+        fixed.decoded, fixed.byte_exact, fixed.shift_symbols,
+        fixed.skip_var_aborted, fixed.coasted, fixed.noise_variance);
+	printf("[TEST-MINI0-CARRIED] no-carry control: decoded=%d exact=%d energy_shift=%d skipvar=%d coast=%d nv=%.4f\n",
+		control.decoded, control.byte_exact, control.shift_symbols,
+		control.skip_var_aborted, control.coasted, control.noise_variance);
+    bool legacy_chain = legacy.shift_symbols == 1 && !legacy.decoded
+        && legacy.skip_var_aborted && legacy.coasted;
+    bool fixed_chain = fixed.shift_symbols == 0 && fixed.decoded
+        && fixed.byte_exact && !fixed.skip_var_aborted && !fixed.coasted;
+	bool control_chain = control.shift_symbols == 0 && control.decoded
+		&& control.byte_exact && !control.skip_var_aborted && !control.coasted;
+    printf("[TEST-MINI0-CARRIED] %s (legacy +1-symbol->SKIP-VAR->coast; fixed byte-exact hold)\n",
+		(legacy_chain && fixed_chain && control_chain) ? "ALL PASS" : "FAILED");
+	return (legacy_chain && fixed_chain && control_chain) ? 0 : 1;
+}
+
 int main(int argc, char *argv[])
 {
 #if defined(_WIN32)
@@ -1834,6 +1944,7 @@ int main(int argc, char *argv[])
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
             failed += run_sim_clock_tests();
+			failed += run_mini0_carried_timing_test();
             failed += run_winlink_dict_tests();
             // AEAD bsi-bound nonce regression suite (data-flow-aead-nonce.md):
             // SECURITY INVARIANT — no (key,nonce) reuse; nonce binds to the wire
@@ -3427,6 +3538,9 @@ int main(int argc, char *argv[])
             int failed = run_preamble_sched_tests();
             return (failed == 0) ? 0 : 1;
         }
+		if (strcmp(argv[i], "--test-mini0-carried") == 0) {
+			return run_mini0_carried_timing_test();
+		}
         // --test-break-fh : fix/break-fh-gate §23 BREAK forward-health gate suite
         // (FH-latch suppression of the held-CFG16 marginal-OFDM alias + K-of-N
         // corroboration + genuine-BREAK survival, both gate states). Fast +

@@ -9246,13 +9246,16 @@ int run_ofdm_fine_timing_tests() {
 static void test_preamble_sched_predicate() {
 	const char* name = "preamble_sched_predicate";
 	const int full_n = 4;
+	const char* km0 = std::getenv("MERCURY_KEYDOWN_MINI0");
+	const int tail_n = (!km0 || atoi(km0) != 0) ? 0 : 1;
 	// frame 0 -> FULL (anchor)
 	if (cl_telecom_system::preamble_sched_nsymb(0, false, full_n) != full_n) {
 		test_fail(name, "frame 0 (anchor) must be FULL"); return; }
-	// frames 1..24 -> MINI (1)
+	// frames 1..24 -> the selected continuous-keydown tail (MINI0 by default,
+	// legacy MINI1 when MERCURY_KEYDOWN_MINI0=0).
 	for (int i = 1; i <= 24; i++) {
-		if (cl_telecom_system::preamble_sched_nsymb(i, false, full_n) != 1) {
-			test_fail(name, "tail frame must be MINI=1"); return; }
+		if (cl_telecom_system::preamble_sched_nsymb(i, false, full_n) != tail_n) {
+			test_fail(name, "tail frame must match the selected MINI schedule"); return; }
 	}
 	// force_full overrides MINI on any tail index (retx / after-FAIL)
 	for (int i = 0; i <= 24; i++) {
@@ -9270,15 +9273,17 @@ static void test_preamble_sched_predicate() {
 // guarantee — both sides call the identical predicate).
 static void test_preamble_sched_tx_rx_symmetry() {
 	const char* name = "preamble_sched_tx_rx_symmetry";
+	const char* km0 = std::getenv("MERCURY_KEYDOWN_MINI0");
+	const int minimum = (!km0 || atoi(km0) != 0) ? 0 : 1;
 	for (int full = 1; full <= 16; full++) {
 		for (int idx = 0; idx < 30; idx++) {
 			for (int ff = 0; ff <= 1; ff++) {
 				int a = cl_telecom_system::preamble_sched_nsymb(idx, ff != 0, full);
 				int b = cl_telecom_system::preamble_sched_nsymb(idx, ff != 0, full);
 				if (a != b) { test_fail(name, "non-deterministic"); return; }
-				// invariants: 1 <= result <= max(full,1)
+				// invariants: MINI0 permits zero; legacy MINI1 starts at one.
 				int fmax = (full < 1) ? 1 : full;
-				if (a < 1 || a > fmax) { test_fail(name, "out of [1,full]"); return; }
+				if (a < minimum || a > fmax) { test_fail(name, "out of [MINI,full]"); return; }
 			}
 		}
 	}
@@ -9291,13 +9296,29 @@ static void test_preamble_sched_tx_rx_symmetry() {
 static void test_preamble_sched_batch_accounting() {
 	const char* name = "preamble_sched_batch_accounting";
 	const int full_n = 4, nframes = 25;
+	const char* km0 = std::getenv("MERCURY_KEYDOWN_MINI0");
+	const int tail_n = (!km0 || atoi(km0) != 0) ? 0 : 1;
 	int amortized = 0, legacy = 0;
 	for (int i = 0; i < nframes; i++) {
 		amortized += cl_telecom_system::preamble_sched_nsymb(i, false, full_n);
 		legacy    += full_n;
 	}
 	if (legacy != 100)    { test_fail(name, "legacy must be 100"); return; }
-	if (amortized != 28)  { test_fail(name, "amortized must be 28 (4 + 24*1)"); return; }
+	if (amortized != full_n + (nframes - 1) * tail_n) {
+		test_fail(name, "amortized total must match FULL + tail schedule"); return; }
+	test_pass(name);
+}
+
+// A zero-preamble continuous-keydown tail has no preamble whose energy can
+// refine timing. Its carried prediction is the timing authority.
+static void test_preamble_energy_respects_carried_timing() {
+	const char* name = "preamble_energy_respects_carried_timing";
+	if (!cl_telecom_system::fine_energy_adjustment_allowed(false)) {
+		test_fail(name, "ordinary acquired timing must retain preamble-energy correction"); return; }
+	if (cl_telecom_system::fine_energy_adjustment_allowed(true)) {
+		test_fail(name, "carried zero-preamble timing must not be moved by preamble-energy correction"); return; }
+	if (!cl_telecom_system::fine_energy_adjustment_allowed(true, true)) {
+		test_fail(name, "defeat must restore the legacy carried-timing behavior"); return; }
 	test_pass(name);
 }
 
@@ -9308,6 +9329,7 @@ int run_preamble_sched_tests() {
 	test_preamble_sched_predicate();
 	test_preamble_sched_tx_rx_symmetry();
 	test_preamble_sched_batch_accounting();
+	test_preamble_energy_respects_carried_timing();
 	printf("=== LEVER P done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
 }

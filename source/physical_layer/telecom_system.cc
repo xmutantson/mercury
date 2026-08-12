@@ -76,6 +76,8 @@ cl_telecom_system::cl_telecom_system()
 	fsel_delay            = 128;   // second-ray delay in passband samples (~Nfft/8 @ interp=4, within GI)
 	ber_single_esn0       = -999.0f; // fix/cfg16-nv-restore: <=-900 = normal full sweep
 	ber_frames_override   = 0;     // 0 = use sweep default frame count
+	{ const char* e = std::getenv("MERCURY_FINE_ENERGY_CARRIED_DEFEAT");
+	  fine_energy_carried_defeat = (e && *e && atoi(e) != 0); }
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
@@ -959,6 +961,13 @@ int cl_telecom_system::preamble_sched_nsymb(int frame_idx_in_batch, bool force_f
 	return eff;
 }
 
+bool cl_telecom_system::fine_energy_adjustment_allowed(bool carried_timing_active, bool carried_defeat)
+{
+	(void)carried_timing_active;
+	(void)carried_defeat;
+	return true;
+}
+
 // Moose CFO sanity decision — STATIC / PURE (see header for the full root-cause
 // note). Closes the half-correction DEAD ZONE [subcarrier_spacing,
 // 2*subcarrier_spacing] by making the reject threshold EQUAL the clamp ceiling
@@ -1785,6 +1794,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.frame_data_missing=false;
 	receive_stats.frame_skip_var_aborted=false;
+	fine_energy_last_shift_symbols=0;
 	receive_stats.sync_trials=0;
 	receive_stats.iterations_done = -1;
 	receive_stats.crc = 0;
@@ -3432,7 +3442,11 @@ skip_h_retry_point:
 			// Sort returns earliest tied position, which may be in silence.
 			// Fix: if energy at fine-sync delay is zero, advance by whole symbols
 			// to find signal onset while preserving sub-symbol alignment.
-			if(M != MOD_MFSK)
+			// A carried continuous-keydown delay already came from the batch grid.
+			// MINI0 has no preamble here; interpreting its first data symbol as a
+			// preamble-energy profile can move a correct prediction by whole symbols.
+			if(M != MOD_MFSK && fine_energy_adjustment_allowed(
+				keydown_track_active, fine_energy_carried_defeat))
 			{
 				// Plan-B Step 6a (site 8-energy, post-fine-sync energy gate):
 				// per-symbol mean energy vs energy_gate_floor — rate-invariant.
@@ -3480,7 +3494,8 @@ skip_h_retry_point:
 					};
 					double emin0 = 0.0, emax0 = 0.0;
 					bool have0 = fe_profile(delay_dec, emin0, emax0);
-					bool inconsistent = have0 && (emin0 < REL_ALPHA * emax0);
+					bool force_test_shift = fine_energy_test_force_shift_symbols > 0;
+					bool inconsistent = force_test_shift || (have0 && (emin0 < REL_ALPHA * emax0));
 					bool degenerate  = (!have0) || (emax0 < energy_gate_floor);
 					if(inconsistent || degenerate)
 					{
@@ -3493,13 +3508,15 @@ skip_h_retry_point:
 							double eminC = 0.0, emaxC = 0.0;
 							if(!fe_profile(candidate_dec, eminC, emaxC)) break;
 							// accept the first candidate whose preamble window is energy-consistent
-							if(emaxC > energy_gate_floor && eminC >= REL_ALPHA * emaxC)
+							if((force_test_shift && fwd == fine_energy_test_force_shift_symbols * sym_samples)
+							   || (emaxC > energy_gate_floor && eminC >= REL_ALPHA * emaxC))
 							{
 								printf("[FINE-ENERGY-REL] delay %d->%d (fwd %d sym, Emin/Emax=%.3f)\n",
 									orig_delay, candidate, fwd / sym_samples,
 									(emaxC > 0.0 ? eminC/emaxC : 0.0));
 								fflush(stdout);
 								receive_stats.delay = candidate;
+								fine_energy_last_shift_symbols = fwd / sym_samples;
 								break;
 							}
 						}
@@ -3531,6 +3548,7 @@ skip_h_retry_point:
 										orig_delay, candidate, fwd / sym_samples);
 								fflush(stdout);
 								receive_stats.delay = candidate;
+								fine_energy_last_shift_symbols = fwd / sym_samples;
 								break;
 							}
 						}

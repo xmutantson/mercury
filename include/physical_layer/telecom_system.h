@@ -665,6 +665,15 @@ public:
 	// (MINI) for non-anchor non-forced frames; full_nsymb otherwise. STATIC /
 	// PURE so TX and RX get bit-identical results.
 	static int preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb);
+	// Post-sync preamble-energy correction may refine an acquired delay only when
+	// no stronger timing source already owns it. Static/pure so the production
+	// receive path and the focused regression use the identical policy.
+	static bool fine_energy_adjustment_allowed(bool carried_timing_active, bool carried_defeat=false);
+	// Focused production-path A/B support. The defeat restores legacy ownership;
+	// the shift record reports what the real post-sync energy stage did.
+	bool fine_energy_carried_defeat = false;
+	int fine_energy_last_shift_symbols = 0;
+	int fine_energy_test_force_shift_symbols = 0;
 
 	// Structural guard for pilot-grid overrides. The OFDM grid fixes the coded
 	// bit count at nData*log2(M); it must fit the active LDPC codeword before any
