@@ -12761,6 +12761,24 @@ int cl_arq_controller::test_linkphase_optclock_end_stamp()
 	else
 		printf("[TEST-LP-OPTCLOCK] PASS: START-without-END rejects preceding stamp\n");
 
+	// Exhaustion is fail-closed: the full-width token is never reused as a valid START.
+	lp_keydown_generation = UINT64_MAX - 1;
+	lp_note_keydown_start(/*bsi=*/11);
+	used_stamp = true;
+	const int exhausted_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
+	if(exhausted_ms != 6000 || used_stamp || lp_keydown_start_token != 0
+	   || lp_state.keydown_end_token != 0 || lp_keydown_start_ms != 0)
+	{
+		printf("[TEST-LP-OPTCLOCK] FAIL: exhausted token remained consumable "
+		       "stamp=%d used=%d start_token=%llu end_token=%llu start_ms=%lld\n",
+			exhausted_ms, used_stamp ? 1 : 0,
+			(unsigned long long)lp_keydown_start_token,
+			(unsigned long long)lp_state.keydown_end_token, lp_keydown_start_ms);
+		fails++;
+	}
+	else
+		printf("[TEST-LP-OPTCLOCK] PASS: token exhaustion fails closed\n");
+
 	printf("[TEST-LP-OPTCLOCK] %s (failures=%d)\n", fails ? "FAIL" : "ALL PASS", fails);
 	fflush(stdout);
 	return fails;
