@@ -8703,10 +8703,161 @@ static void test_nb_robust_preamble_capneg() {
 	test_pass(name);
 }
 
+static void set_mfsk_geometry_test_env(const char* key, const char* value)
+{
+#ifdef _WIN32
+	_putenv_s(key, value != nullptr ? value : "");
+#else
+	if(value != nullptr) setenv(key, value, 1); else unsetenv(key);
+#endif
+}
+
+static void test_mfsk_geometry_guard()
+{
+	const char* name = "mfsk_geometry_guard";
+	struct saved_env {
+		const char* key;
+		bool present;
+		std::string value;
+	};
+	const char* keys[] = {
+		"MERCURY_MFSK_SWEEP_M",
+		"MERCURY_MFSK_SWEEP_NSTREAMS",
+		"MERCURY_NC_OVERRIDE"
+	};
+	saved_env saved[3];
+	for(int i = 0; i < 3; ++i)
+	{
+		const char* value = std::getenv(keys[i]);
+		saved[i] = {keys[i], value != nullptr, value != nullptr ? value : ""};
+	}
+
+	int failures = 0;
+	const int invalid_M = 32;
+	const int invalid_Nc = 50;
+	const int invalid_nStreams = 2;
+	const int invalid_first_stream = 1;
+	const int invalid_first_tone = invalid_Nc - invalid_M;
+	const int invalid_first_index = invalid_first_stream * invalid_M + invalid_first_tone;
+	const int invalid_max_index = invalid_M * invalid_nStreams - 1;
+	if(invalid_first_index != invalid_Nc || invalid_first_tone < 0
+		|| invalid_max_index != 63)
+	{
+		printf("  [FAIL] %s: invalid-grid witness calculation changed\n", name);
+		failures++;
+	}
+	set_mfsk_geometry_test_env("MERCURY_NC_OVERRIDE", nullptr);
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_M", "32");
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_NSTREAMS", "2");
+	{
+		cl_telecom_system ts;
+		ts.narrowband_enabled = NO;
+		ts.load_configuration(ROBUST_0);
+		if(ts.current_configuration != CONFIG_NONE)
+		{
+			printf("  [FAIL] %s: invalid WB sweep activated config=%d M=%d Nc=%d nStreams=%d; "
+				"first invalid carrier=%d (stream=%d tone=%d), max=%d\n",
+				name, ts.current_configuration, ts.mfsk.M, ts.mfsk.Nc, ts.mfsk.nStreams,
+				invalid_first_index, invalid_first_stream, invalid_first_tone, invalid_max_index);
+			failures++;
+		}
+	}
+
+	cl_mfsk invalid;
+	invalid.init(invalid_M, invalid_Nc, invalid_nStreams);
+	if(invalid.M != 0 || invalid.Nc != 0 || invalid.nStreams != 0)
+	{
+		printf("  [FAIL] %s: direct invalid init remained active M=%d Nc=%d nStreams=%d; "
+			"first invalid carrier=%d (stream=%d tone=%d), max=%d\n",
+			name, invalid.M, invalid.Nc, invalid.nStreams, invalid_first_index,
+			invalid_first_stream, invalid_first_tone, invalid_max_index);
+		failures++;
+	}
+	else
+	{
+		std::vector<std::complex<double>> canary(52, std::complex<double>(7.0, -3.0));
+		invalid.generate_preamble(canary.data() + 1, 1);
+		for(size_t i = 0; i < canary.size(); ++i)
+		{
+			if(canary[i] != std::complex<double>(7.0, -3.0))
+			{
+				printf("  [FAIL] %s: invalid generator modified output at index %zu\n", name, i);
+				failures++;
+				break;
+			}
+		}
+	}
+
+	cl_mfsk boundary;
+	boundary.init(16, 50, 3);
+	if(boundary.M != 16 || boundary.Nc != 50 || boundary.nStreams != 3
+		|| boundary.stream_offsets[2] + boundary.M - 1 != 48)
+	{
+		printf("  [FAIL] %s: safe M16x3 boundary rejected or mis-sized\n", name);
+		failures++;
+	}
+
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_M", nullptr);
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_NSTREAMS", nullptr);
+	{
+		cl_telecom_system ts;
+		ts.narrowband_enabled = NO;
+		ts.load_configuration(ROBUST_0);
+		if(ts.current_configuration != ROBUST_0 || ts.mfsk.M != 32
+			|| ts.mfsk.Nc != 50 || ts.mfsk.nStreams != 1)
+		{
+			printf("  [FAIL] %s: stock WB geometry changed\n", name);
+			failures++;
+		}
+	}
+
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_M", "8");
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_NSTREAMS", "2");
+	{
+		cl_telecom_system ts;
+		ts.narrowband_enabled = YES;
+		ts.load_configuration(ROBUST_0);
+		if(ts.current_configuration != CONFIG_NONE)
+		{
+			printf("  [FAIL] %s: invalid NB sweep activated config=%d M=%d Nc=%d nStreams=%d\n",
+				name, ts.current_configuration, ts.mfsk.M, ts.mfsk.Nc, ts.mfsk.nStreams);
+			failures++;
+		}
+	}
+
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_M", nullptr);
+	set_mfsk_geometry_test_env("MERCURY_MFSK_SWEEP_NSTREAMS", nullptr);
+	{
+		cl_telecom_system ts;
+		ts.narrowband_enabled = YES;
+		ts.load_configuration(ROBUST_0);
+		if(ts.current_configuration != ROBUST_0 || ts.mfsk.M != 8
+			|| ts.mfsk.Nc != 10 || ts.mfsk.nStreams != 1)
+		{
+			printf("  [FAIL] %s: stock NB geometry changed\n", name);
+			failures++;
+		}
+	}
+
+	for(int i = 0; i < 3; ++i)
+		set_mfsk_geometry_test_env(saved[i].key,
+			saved[i].present ? saved[i].value.c_str() : nullptr);
+
+	if(failures == 0) test_pass(name);
+	else g_failures += failures;
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
 	printf("=== MFSK ctrl-suffix codec tests (Phase B Wave 1 + Wave 2 v2 + Wave 3) ===\n");
+	if(getenv("MERCURY_MFSK_GEOMETRY_ONLY") != NULL)
+	{
+		test_mfsk_geometry_guard();
+		printf("=== MFSK geometry tests done: %d passed, %d failed ===\n",
+			g_passes, g_failures);
+		return g_failures;
+	}
 	// Narrow deterministic lane for capability-wire changes. It exercises the
 	// complete TEST_ACK and TEST_CONN cap domains without entering unrelated
 	// modulation sweeps; the ordinary --test path below remains unchanged.

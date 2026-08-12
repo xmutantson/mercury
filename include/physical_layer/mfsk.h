@@ -511,6 +511,12 @@ public:
 	// M3 uniformity with the other geometry classes.
 	void copy_from(const cl_mfsk& s) { *this = s; }
 
+	static bool valid_geometry(int M, int Nc, int nStreams)
+	{
+		return M > 0 && Nc > 0 && nStreams > 0 && nStreams <= MAX_STREAMS
+			&& M <= Nc / nStreams;
+	}
+
 	void init(int _M, int _Nc, int _nStreams = 1);
 	void deinit();
 

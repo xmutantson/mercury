@@ -12598,6 +12598,15 @@ static void mfsk_sweep_override_MN(int& M, int& nStreams)
 	if(_en && *_en){ int _v = atoi(_en); if(_v >= 1 && _v <= 4) nStreams = _v; }
 }
 
+static int mfsk_selected_Nc(bool narrowband_enabled)
+{
+	int Nc = narrowband_enabled ? 10 : 50;
+	const char* _ncov = std::getenv("MERCURY_NC_OVERRIDE");
+	if(!narrowband_enabled && _ncov && atoi(_ncov) > 0)
+		Nc = atoi(_ncov);
+	return Nc;
+}
+
 void cl_telecom_system::load_configuration(int configuration)
 {
 	if(configuration==current_configuration)
@@ -12822,6 +12831,19 @@ void cl_telecom_system::load_configuration(int configuration)
 	{
 		const char* _msr = std::getenv("MERCURY_MFSK_SWEEP_RATE");
 		if(_msr && *_msr){ int _k = atoi(_msr); if(_k >= 1 && _k <= 14) _ldpc_rate = (float)_k/16.0f; }
+
+		int selected_M = (configuration == ROBUST_0)
+			? (narrowband_enabled ? 8 : 32)
+			: (narrowband_enabled ? 4 : 16);
+		int selected_nStreams = (configuration == ROBUST_0) ? 1 : 2;
+		mfsk_sweep_override_MN(selected_M, selected_nStreams);
+		int selected_Nc = mfsk_selected_Nc(narrowband_enabled == YES);
+		if(!cl_mfsk::valid_geometry(selected_M, selected_Nc, selected_nStreams))
+		{
+			fprintf(stderr, "[PHY] Refusing config %d: invalid MFSK geometry M=%d Nc=%d nStreams=%d\n",
+				configuration, selected_M, selected_Nc, selected_nStreams);
+			return;
+		}
 	}
 
 	// Amplitude restoration disabled for all modes: full ZF equalization
@@ -13202,7 +13224,7 @@ void cl_telecom_system::load_configuration(int configuration)
 				mfsk_nStreams = 2;
 			}
 			mfsk_sweep_override_MN(mfsk_M, mfsk_nStreams);
-				mfsk.init(mfsk_M, ofdm.Nc, mfsk_nStreams);
+			mfsk.init(mfsk_M, mfsk_selected_Nc(narrowband_enabled == YES), mfsk_nStreams);
 			// Frame-geometry authority = the LONGEST preamble set this config
 			// can emit or be asked to detect (the sidelnikov length on
 			// negotiable / forced-sidelnikov NB robust configs, the legacy 8

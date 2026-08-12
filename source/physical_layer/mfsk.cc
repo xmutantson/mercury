@@ -94,11 +94,17 @@ cl_mfsk::~cl_mfsk()
 
 void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 {
+	deinit();
+	if (!valid_geometry(_M, _Nc, _nStreams))
+	{
+		fprintf(stderr, "[PHY] Refusing invalid MFSK geometry: M=%d Nc=%d nStreams=%d\n",
+			_M, _Nc, _nStreams);
+		return;
+	}
+
 	M = _M;
 	Nc = _Nc;
 	nStreams = _nStreams;
-	if (nStreams < 1) nStreams = 1;
-	if (nStreams > MAX_STREAMS) nStreams = MAX_STREAMS;
 	// NB robust-preamble mode (capability negotiation — see mfsk.h):
 	//   unset       => negotiable: BOTH sets computed, ACTIVE starts legacy, the
 	//                  session layer flips to sidelnikov once both peers
