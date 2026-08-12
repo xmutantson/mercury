@@ -184,6 +184,11 @@ public:
 	// producer. Public so the deterministic numeric-edge self-test exercises the
 	// exact production arithmetic rather than a duplicate.
 	static double pilot_magnitude_cv(const double* magnitudes, int count);
+	// Common selectivity producer for every channel-estimator path. Measures the
+	// instantaneous pilot LS response abs(Yp)/abs(Xp), before estimator-specific
+	// smoothing or interpolation. Returns -1 when current evidence is invalid.
+	double measure_pilot_selectivity(const std::complex<double>* in,
+	                                int* usable_count = NULL) const;
 	// Geometry-invariant timing-quality selector; sets last_pilot_coherence from
 	// the RAW pilot cells. Call before interpolation/smoothing. See ofdm.h member.
 	void compute_pilot_coherence();

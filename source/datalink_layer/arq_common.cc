@@ -9307,6 +9307,7 @@ void cl_arq_controller::reset_session_state()
 	session_data_frame_received = false;
 	// Topgear is per-session channel evidence. Never carry a prior peer/channel's
 	// verdict or report de-dup identity into a fresh session.
+	telecom_system->invalidate_channel_selectivity();
 	topgear_elect_engaged = false;
 	topgear_elect_clean_streak = 0;
 	topgear_channel_flatness = -1.0;

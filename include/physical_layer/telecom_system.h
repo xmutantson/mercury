@@ -1272,6 +1272,10 @@ public:
 	// Kept as one authority so the production consumer and its fail-closed test
 	// cannot drift apart.
 	void update_channel_selectivity(double data_bin_selectivity);
+	// Invalidate both producer and consumer caches at a channel/config/session
+	// epoch boundary. Redundant same-config calls are not boundaries; explicit
+	// BREAK and CONNECT paths call this before their same-config early returns.
+	void invalidate_channel_selectivity();
 
 	// Returns last ACK/HAIL correlator metric, normalized to dB:
 	//   metric_normalized = best_metric / ack_pattern_nsymb  ∈ [0, 1]

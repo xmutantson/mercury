@@ -8851,6 +8851,7 @@ void cl_arq_controller::process_control_commander()
 			// CONNECT does not call reset_session_state(): clear all per-session
 			// topgear evidence here as well, so a prior peer/channel cannot leave
 			// cfg17 armed on this fresh connection.
+			telecom_system->invalidate_channel_selectivity();
 			topgear_elect_engaged = false;
 			topgear_elect_clean_streak = 0;
 			topgear_channel_flatness = -1.0;

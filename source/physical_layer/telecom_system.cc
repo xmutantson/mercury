@@ -4554,6 +4554,7 @@ skip_h_retry_point:
 					tinterp_rescue_phase = 1;
 					tinterp_rescue_in_flight = true;
 					receive_stats.tinterp_rescue_attempted = true;
+					invalidate_channel_selectivity();
 					ofdm.channel_estimator = TIME_INTERP;
 					printf("[TINTERP-SEED] cfg=%d delay=%d meanH=%.3f coarse=%.3f crc=0x%04X - LS failed, retry with TIME_INTERP fade estimator\n",
 						current_configuration, receive_stats.delay, mean_H,
@@ -12707,6 +12708,7 @@ void cl_telecom_system::load_configuration(int configuration)
 
 	printf("[PHY] Loading configuration %d (was %d)\n", configuration, current_configuration);
 	fflush(stdout);
+	invalidate_channel_selectivity();
 
 	int _modulation = MOD_BPSK;
 	float _ldpc_rate = 1/16.0f;
@@ -13535,6 +13537,7 @@ void cl_telecom_system::load_configuration(int configuration)
 // NB-clamped. The no-op / range / NB-clamp guards ran in the caller.
 void cl_telecom_system::load_configuration_swap(int configuration, int idx)
 {
+	invalidate_channel_selectivity();
 	// PRECOOK V2 (Step B) — select the bundle from the LIVE bandwidth's set. The caller looked up
 	// idx via bundle_index(configuration, narrowband_enabled), which keys on the same bandwidth, so
 	// bundle_set(narrowband_enabled)[idx] is the exact bundle that matched (WB or NB).
@@ -14428,11 +14431,19 @@ void cl_telecom_system::update_channel_selectivity(double data_bin_selectivity)
 {
 	const char* sel_legacy = std::getenv("MERCURY_SEL_LEGACY");
 	if(sel_legacy && atoi(sel_legacy) != 0)
-		last_channel_selectivity = data_bin_selectivity;
-	else if(ofdm.last_pilot_selectivity >= 0.0)
+		last_channel_selectivity = (std::isfinite(data_bin_selectivity)
+			&& data_bin_selectivity >= 0.0) ? data_bin_selectivity : -1.0;
+	else if(std::isfinite(ofdm.last_pilot_selectivity)
+		&& ofdm.last_pilot_selectivity >= 0.0)
 		last_channel_selectivity = ofdm.last_pilot_selectivity;
 	else
-		last_channel_selectivity = data_bin_selectivity;
+		last_channel_selectivity = -1.0;
+}
+
+void cl_telecom_system::invalidate_channel_selectivity()
+{
+	ofdm.last_pilot_selectivity = -1.0;
+	last_channel_selectivity = -1.0;
 }
 
 int cl_telecom_system::test_subpeak_gate()

@@ -1854,17 +1854,65 @@ void cl_ofdm::ZF_channel_estimator(std::complex <double>*in)
 double cl_ofdm::pilot_magnitude_cv(const double* magnitudes, int count)
 {
 	if(magnitudes == NULL || count <= 1) return -1.0;
-	double sum = 0.0, sumsq = 0.0;
+	double scale = 0.0;
 	for(int i=0; i<count; i++)
 	{
 		if(!std::isfinite(magnitudes[i]) || magnitudes[i] < 0.0) return -1.0;
-		sum += magnitudes[i];
-		sumsq += magnitudes[i] * magnitudes[i];
+		if(magnitudes[i] > scale) scale = magnitudes[i];
 	}
-	double mean = sum / count;
-	double variance = sumsq / count - mean * mean;
+	if(!std::isfinite(scale) || scale <= 0.0) return -1.0;
+
+	// Scale into [0,1] before accumulating. This preserves coefficient of
+	// variation while preventing finite DBL_MAX inputs from overflowing m*m.
+	double scaled_sum = 0.0;
+	for(int i=0; i<count; i++) scaled_sum += magnitudes[i] / scale;
+	double scaled_mean = scaled_sum / count;
+	double physical_mean = scale * scaled_mean;
+	if(!std::isfinite(scaled_mean) || !std::isfinite(physical_mean)
+		|| physical_mean <= 1e-12) return -1.0;
+
+	double variance_sum = 0.0;
+	for(int i=0; i<count; i++)
+	{
+		double delta = magnitudes[i] / scale - scaled_mean;
+		variance_sum += delta * delta;
+	}
+	double variance = variance_sum / count;
 	if(variance < 0.0) variance = 0.0;
-	return (mean > 1e-12) ? sqrt(variance) / mean : -1.0;
+	double result = sqrt(variance) / scaled_mean;
+	return std::isfinite(result) ? result : -1.0;
+}
+
+double cl_ofdm::measure_pilot_selectivity(const std::complex<double>* in,
+	                                      int* usable_count) const
+{
+	if(usable_count != NULL) *usable_count = 0;
+	if(in == NULL || Nsymb <= 0 || Nc <= 0) return -1.0;
+
+	std::vector<double> magnitudes;
+	int pidx = 0;
+	for(int i=0; i<Nsymb; i++)
+	{
+		for(int j=0; j<Nc; j++)
+		{
+			if((ofdm_frame+i*Nc+j)->type != PILOT) continue;
+			std::complex<double> x = pilot_configurator.sequence[pidx++];
+			std::complex<double> y = *(in+i*Nc+j);
+			if(!std::isfinite(x.real()) || !std::isfinite(x.imag())) return -1.0;
+			double xmag = std::abs(x);
+			if(!std::isfinite(xmag)) return -1.0;
+			if(xmag <= 1e-12) continue;
+			if(!std::isfinite(y.real()) || !std::isfinite(y.imag())) return -1.0;
+			double ymag = std::abs(y);
+			if(!std::isfinite(ymag)) return -1.0;
+			double magnitude = ymag / xmag;
+			if(!std::isfinite(magnitude)) return -1.0;
+			magnitudes.push_back(magnitude);
+		}
+	}
+	if(usable_count != NULL) *usable_count = (int)magnitudes.size();
+	return pilot_magnitude_cv(magnitudes.empty() ? NULL : magnitudes.data(),
+	                          (int)magnitudes.size());
 }
 
 void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
@@ -1967,23 +2015,18 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 
-	// Frequency-selectivity from the RAW per-pilot LS estimates, captured HERE
-	// (only pilot cells MEASURED; interpolation + DFT smoothing have NOT run).
-	// std|H|/mean|H| over the pilots samples H(f) DIRECTLY: a flat channel reads
+	// Frequency selectivity from instantaneous pilot LS ratios abs(Yp)/abs(Xp),
+	// captured before interpolation + DFT smoothing. This common producer is
+	// independent of the estimator's own smoothing/window policy. A flat channel reads
 	// low (~0.04 at operating SNR), a 2-path null gives a large pilot-to-pilot |H|
 	// swing => high. The post-smoothing DATA-bin metric instead reads an
 	// SNR-independent ~0.4-1.3 ripple the smoother/interpolation inject, so this
 	// raw-pilot reading is what feeds last_channel_selectivity.
 	{
-		std::vector<double> magnitudes;
-		for(int ii=0; ii<Nsymb; ii++)
-			for(int jj=0; jj<Nc; jj++)
-				if((ofdm_frame+ii*Nc+jj)->type==PILOT && (estimated_channel+ii*Nc+jj)->status==MEASURED)
-					magnitudes.push_back(std::abs((estimated_channel+ii*Nc+jj)->value));
-		last_pilot_selectivity = pilot_magnitude_cv(
-			magnitudes.empty() ? NULL : magnitudes.data(), (int)magnitudes.size());
+		int pilot_count = 0;
+		last_pilot_selectivity = measure_pilot_selectivity(in, &pilot_count);
 		if(std::getenv("MERCURY_SEL_DIAG"))
-			std::cerr << "[PILOT-SEL] npil=" << magnitudes.size()
+			std::cerr << "[PILOT-SEL] npil=" << pilot_count
 			          << " sel=" << last_pilot_selectivity << std::endl;
 	}
 
@@ -2187,23 +2230,17 @@ void cl_ofdm::LS_channel_estimator_tinterp(std::complex <double>*in)
 			}
 	}
 
-	// Publish frequency selectivity from THIS estimator pass's raw pilot LS
-	// anchors, before interpolation or smoothing. receive_byte clears the member
+	// Publish frequency selectivity from the same instantaneous pilot LS ratios
+	// the normal LS path uses, before interpolation or smoothing. receive_byte clears the member
 	// before every estimator pass; assigning every exit here prevents a TINTERP
 	// retry from retaining an earlier frame/config value. With fewer than two
 	// finite anchors (or a zero mean), keep the fail-closed -1 sentinel so the
 	// caller cannot mistake an invalid interpolation for a channel measurement.
 	{
-		std::vector<double> magnitudes;
-		for(size_t idx = 0; idx < Hp.size(); idx++)
-		{
-			if(!known[idx]) continue;
-			magnitudes.push_back(std::abs(Hp[idx]));
-		}
-		last_pilot_selectivity = pilot_magnitude_cv(
-			magnitudes.empty() ? NULL : magnitudes.data(), (int)magnitudes.size());
+		int pilot_count = 0;
+		last_pilot_selectivity = measure_pilot_selectivity(in, &pilot_count);
 		if(std::getenv("MERCURY_SEL_DIAG"))
-			std::cerr << "[PILOT-SEL] npil=" << magnitudes.size()
+			std::cerr << "[PILOT-SEL] npil=" << pilot_count
 			          << " sel=" << last_pilot_selectivity << std::endl;
 	}
 

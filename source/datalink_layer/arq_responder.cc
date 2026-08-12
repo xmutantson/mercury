@@ -503,6 +503,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 				passive_monitor ? "Observed" : "Responding with ACK", link_status);
 			fflush(stdout);
 			break_detected = NO;
+			telecom_system->invalidate_channel_selectivity();
 
 			// Bug fix (POST_BREAK_STUCK_INVESTIGATION.md §5.1 / §8.1,
 			// SACK_DESIGN_A_PLAN §7.13.14): force-FREE the control slot.

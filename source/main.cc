@@ -831,6 +831,7 @@ static int run_tinterp_seed_selftest()
 		double nearzero[] = {1e-300, 2e-300};
 		double extreme[] = {std::numeric_limits<double>::max(),
 		                    std::numeric_limits<double>::max()/2.0};
+		double cv_zero = cl_ofdm::pilot_magnitude_cv(NULL, 0);
 		double cv_one = cl_ofdm::pilot_magnitude_cv(one, 1);
 		double cv_nonfinite = cl_ofdm::pilot_magnitude_cv(nonfinite, 2);
 		double cv_nearzero = cl_ofdm::pilot_magnitude_cv(nearzero, 2);
@@ -842,9 +843,18 @@ static int run_tinterp_seed_selftest()
 #else
 		unsetenv("MERCURY_SEL_LEGACY");
 #endif
-		ts.ofdm.last_pilot_selectivity = -1.0;
-		ts.update_channel_selectivity(0.888);
+		double invalid_values[] = {cv_zero, cv_one, cv_nonfinite, cv_nearzero};
+		bool invalid_failclosed = true;
+		for(size_t i=0; i<sizeof(invalid_values)/sizeof(invalid_values[0]); i++)
+		{
+			ts.ofdm.last_pilot_selectivity = invalid_values[i];
+			ts.update_channel_selectivity(0.888);
+			if(ts.last_channel_selectivity != -1.0) invalid_failclosed = false;
+		}
 		double invalid_selected = ts.last_channel_selectivity;
+		ts.ofdm.last_pilot_selectivity = cv_extreme;
+		ts.update_channel_selectivity(0.888);
+		double extreme_selected = ts.last_channel_selectivity;
 		ts.ofdm.last_pilot_selectivity = 0.123;
 		ts.update_channel_selectivity(0.888);
 		double raw_selected = ts.last_channel_selectivity;
@@ -856,15 +866,18 @@ static int run_tinterp_seed_selftest()
 #else
 		unsetenv("MERCURY_SEL_LEGACY");
 #endif
-		bool ok = (cv_one == -1.0 && cv_nonfinite == -1.0
+		bool ok = (cv_zero == -1.0 && cv_one == -1.0 && cv_nonfinite == -1.0
 		           && cv_nearzero == -1.0 && std::isfinite(cv_extreme)
-		           && cv_extreme >= 0.0 && invalid_selected == -1.0
+		           && cv_extreme >= 0.0 && invalid_failclosed
+		           && invalid_selected == -1.0
+		           && fabs(extreme_selected-cv_extreme) < 1e-12
 		           && fabs(raw_selected-0.123) < 1e-12
 		           && fabs(legacy_selected-0.888) < 1e-12);
-		printf("[TEST-TINTERP-SEED]   CELL-F numeric+consumer: one=%.6f nonfinite=%.6f "
-		       "nearzero=%.6f extreme=%.6f invalid-selected=%.6f raw=%.6f legacy=%.6f -> %s\n",
-		       cv_one, cv_nonfinite, cv_nearzero, cv_extreme, invalid_selected,
-		       raw_selected, legacy_selected, ok?"PASS":"FAIL");
+		printf("[TEST-TINTERP-SEED]   CELL-F numeric+consumer: zero=%.6f one=%.6f "
+		       "nonfinite=%.6f nearzero=%.6f extreme=%.6f invalid-selected=%.6f "
+		       "extreme-selected=%.6f raw=%.6f legacy=%.6f -> %s\n",
+		       cv_zero, cv_one, cv_nonfinite, cv_nearzero, cv_extreme, invalid_selected,
+		       extreme_selected, raw_selected, legacy_selected, ok?"PASS":"FAIL");
 		if(!ok) fails++;
 	}
 
