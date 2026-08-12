@@ -1264,10 +1264,10 @@ public:
 	//
 	// Sentinels:
 	//   correlator dB:  -99.0 → no ACK/HAIL detection attempted yet
-	//   selectivity:    -1.0  → no preamble channel estimate yet
+	//   selectivity:    -1.0  → no valid current-frame pilot estimate yet
 	//                          (selectivity is physically >= 0)
 	double last_correlator_metric_db;     // cached by detect_ack/hail_pattern_from_passband
-	double last_channel_selectivity;      // cached after preamble channel estimate
+	double last_channel_selectivity;      // cached after current-frame pilot estimation
 	// Select the current raw-pilot metric or the explicit legacy defeat metric.
 	// Kept as one authority so the production consumer and its fail-closed test
 	// cannot drift apart.
@@ -1283,9 +1283,9 @@ public:
 	// Higher = better channel. Sentinel -99.0 means no measurement yet.
 	double get_correlator_snr_proxy() const;
 
-	// Returns std(|H[k]|) / mean(|H[k]|) across OFDM DATA subcarriers from
-	// the most recent preamble channel estimate. Flat AWGN → ~0;
-	// selective multipath → > 0.3. Sentinel -1.0 means no estimate yet.
+	// Returns std(|Yp/Xp|) / mean(|Yp/Xp|) across finite current-frame OFDM
+	// pilot positions before interpolation or smoothing. Flat AWGN → ~0;
+	// selective multipath rises. Sentinel -1.0 means no valid estimate yet.
 	double get_channel_selectivity() const;
 
 };

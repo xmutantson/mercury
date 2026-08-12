@@ -1281,12 +1281,18 @@ int cl_arq_controller::test_topgear_clean_election()
 	// floor verdict differs. Distinct bsi per apply defeats the de-dup.
 	cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
 	cmd->topgear_last_report_bsi = -1; cmd->current_configuration = CONFIG_16;
-	for(int i=0;i<=STREAK;i++) cmd->topgear_apply_report(rpt_below, i);
+	for(int i=0;i<=STREAK;i++) {
+		cmd->cmd_batch_seq_id = i;
+		cmd->topgear_apply_report(rpt_below, i);
+	}
 	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
 	      "@28 GUARD: below-floor flat report NEVER engages cfg17 despite meter saturation (fail-before)");
 	cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
 	cmd->topgear_last_report_bsi = -1; cmd->current_configuration = CONFIG_16;
-	for(int i=0;i<=STREAK;i++) cmd->topgear_apply_report(rpt_above, 100+i);
+	for(int i=0;i<=STREAK;i++) {
+		cmd->cmd_batch_seq_id = 100+i;
+		cmd->topgear_apply_report(rpt_above, 100+i);
+	}
 	check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
 	      "@28 GUARD: above-floor flat report engages cfg17 (pass-after)");
 	clr_env("MERCURY_CFG17_SNR_FLOOR");
@@ -1309,7 +1315,10 @@ int cl_arq_controller::test_topgear_clean_election()
 		      "(fail-before at the 28.7 floor: 25.67<28.7 -> flat_state 9)");
 		cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
 		cmd->topgear_last_report_bsi = -1; cmd->current_configuration = CONFIG_16;
-		for(int i=0;i<=STREAK;i++) cmd->topgear_apply_report(rpt_refit, 200+i);
+		for(int i=0;i<=STREAK;i++) {
+			cmd->cmd_batch_seq_id = 200+i;
+			cmd->topgear_apply_report(rpt_refit, 200+i);
+		}
 		check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
 		      "@24 REFIT: reliable forward anchor at the refit floor ENGAGES cfg17 (armed smoke; pass-after)");
 		clr_env("MERCURY_CFG17_SNR_FLOOR");

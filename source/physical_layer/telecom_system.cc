@@ -182,7 +182,7 @@ cl_telecom_system::cl_telecom_system()
 	narrowband_enabled=NO;
 	pre_equalization_channel=NULL;
 	// 2D channel-state lookup helpers (see fact-doc channel-state-2d-lookup.md §8 Step 1).
-	// Sentinels until the first ACK/HAIL detection / preamble channel estimate runs.
+	// Sentinels until the first ACK/HAIL detection / valid pilot estimate runs.
 	last_correlator_metric_db = -99.0;
 	last_channel_selectivity  = -1.0;
 	init_tx_gain_defaults();
@@ -3840,7 +3840,7 @@ skip_h_retry_point:
 			}
 			else
 			{
-				ofdm.last_pilot_selectivity = -1.0;   // fresh per frame; only LS re-measures it
+				ofdm.last_pilot_selectivity = -1.0;   // fresh per attempt; both OFDM estimators re-measure it
 				ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
 				// CPE correction: remove residual freq offset before channel estimation.
 				// Previously NB-only, but WB also benefits (reduces pilot residuals).

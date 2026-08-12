@@ -935,9 +935,9 @@ CONFIG_16 (5664.7 bps).
 // (commit to the top rung slowly, fall back to cfg16 fast; never demote-thrash a fade).
 #define TOPGEAR_ELECT_ENGAGE_STREAK 2
 // Channel-SELECTIVITY ceiling for the top-gear gate. The flatness feed reuses the modem's
-// existing forward-channel selectivity metric last_channel_selectivity = std(|H[k]|)/mean(|H[k]|)
-// over the DATA subcarriers of the preamble channel estimate (telecom_system.cc:2921-2957,
-// the 2D channel-state lookup; 0.0 = perfectly flat, >=0 physically). Above this ceiling the
+// forward-channel selectivity metric last_channel_selectivity = std(|Yp/Xp|)/mean(|Yp/Xp|)
+// over the finite current-frame pilot positions, before estimator-specific interpolation or
+// smoothing (0.0 = perfectly flat, >=0 physically). Above this ceiling the
 // channel is frequency-selective (multipath/fade) and cfg17 is REFUSED — it floors on
 // selective nulls independent of SNR (topgear-stack-proof.md §7), so this is the anti-thrash
 // safety the SNR margin alone cannot provide. 0.15 ≈ ~1.3 dB RMS |H| ripple: a flat/WGN
