@@ -122,6 +122,9 @@ public:
 	// (short / would-block send) without real sockets.
 	static int (*g_test_transmit_hook)(const char* buf, int length);
 	int receive();
+	// Abandon only the accepted peer for a failed application-data epoch while
+	// preserving a server's listening socket for a clean retry.
+	void close_connection();
 	void print_packet_status();
 	int get_status();
 

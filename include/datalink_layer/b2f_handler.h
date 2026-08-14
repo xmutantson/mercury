@@ -46,6 +46,11 @@
 // Line buffer for B2F text framing
 #define B2F_LINE_BUF_SIZE     512
 
+// tcp_socket_data.receive() is bounded by MAX_BUFFER_SIZE == 8192.  A
+// completed transform may be larger than its caller's output buffer; retain
+// any same-receive tail until the transformed record has drained.
+#define B2F_DEFERRED_INPUT_SIZE  (8 * 1024)
+
 struct st_b2f_proposal
 {
 	char type;              // 'E' = EM (encapsulated), 'C' = CM (control)
@@ -75,15 +80,23 @@ public:
 	// Process data received from TCP before pushing to FIFO.
 	// Parses B2F framing, decompresses LZHUF payloads to plaintext.
 	// Returns bytes written to out_buf, or -1 on error.
+	// Calls with in_len == 0 drain retained output and same-receive input.
 	// If unroll is disabled, copies input to output unchanged.
 	int filter_tx(const char* in, int in_len, char* out, int out_cap);
+	bool has_pending_tx_work() const;
+	bool has_fatal_error() const { return fatal_error; }
+	// Restore a returned TX chunk when the downstream all-or-nothing FIFO
+	// rejects it.  The restored bytes remain ahead of the retained suffix.
+	bool requeue_tx_output(const char* data, int len);
 
 	// --- RX path: FIFO -> Winlink client (incoming from RF) ---
 	// Process data from FIFO before sending to TCP.
 	// Recompresses plaintext back to LZHUF where expected by B2F state.
 	// Returns bytes written to out_buf, or -1 on error.
+	// Calls with in_len == 0 drain retained output and same-receive input.
 	// If unroll is disabled, copies input to output unchanged.
 	int filter_rx(const char* in, int in_len, char* out, int out_cap);
+	bool has_pending_rx_work() const;
 
 	// Session state queries
 	bool is_b2f_session() const { return b2f_detected; }
@@ -152,6 +165,20 @@ private:
 
 	// Plaintext buffer (for decompressed data / LZHUF recompression)
 	uint8_t* plain_buf;
+	uint8_t* rx_pending_buf;
+
+	// Completed transform output remains handler-owned until every byte has
+	// been returned.  Input behind that record in the same bounded receive is
+	// retained so it cannot overtake the pending output.
+	int tx_pending_output_pos;
+	int tx_pending_output_len;
+	char tx_deferred_input[B2F_DEFERRED_INPUT_SIZE];
+	int tx_deferred_input_len;
+	int rx_pending_output_pos;
+	int rx_pending_output_len;
+	char rx_deferred_input[B2F_DEFERRED_INPUT_SIZE];
+	int rx_deferred_input_len;
+	bool fatal_error;
 
 	bool initialized;
 
@@ -170,6 +197,11 @@ private:
 	// *in_consumed is set to bytes consumed from in (may be less than in_len).
 	int process_tx_payload(const char* in, int in_len, char* out, int out_cap, int* in_consumed);
 	int process_rx_payload(const char* in, int in_len, char* out, int out_cap, int* in_consumed);
+
+	int drain_tx_pending(char* out, int out_cap);
+	int drain_rx_pending(char* out, int out_cap);
+	int filter_tx_input(const char* in, int in_len, char* out, int out_cap);
+	int filter_rx_input(const char* in, int in_len, char* out, int out_cap);
 };
 
 #endif // B2F_HANDLER_H

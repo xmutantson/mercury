@@ -298,6 +298,40 @@ int cl_tcp_socket::receive()
 	return n;
 }
 
+void cl_tcp_socket::close_connection()
+{
+	if(type==TYPE_SERVER)
+	{
+		if(connection_fd>0)
+		{
+#if defined(_WIN32)
+			closesocket(connection_fd);
+#else
+			close(connection_fd);
+#endif
+		}
+		connection_fd=0;
+		status = socket_fd>0 ? TCP_STATUS_LISTENING : TCP_STATUS_CLOSED;
+	}
+	else
+	{
+		if(socket_fd>0)
+		{
+#if defined(_WIN32)
+			closesocket(socket_fd);
+#else
+			close(socket_fd);
+#endif
+		}
+		socket_fd=0;
+		status=TCP_STATUS_CLOSED;
+	}
+	message->length=0;
+	message->status=MESSAGE_STATUS_FREE;
+	timer.stop();
+	timer.reset();
+}
+
 int cl_tcp_socket::get_status()
 {
 	return status;
@@ -333,5 +367,4 @@ void cl_tcp_socket::print_packet_status()
 
 	}
 }
-
 

@@ -4945,6 +4945,24 @@ void cl_arq_controller::process_buffer_data_responder()
 				rx_deliver_pending_len = 0;  // tail fully drained
 			}
 
+			// Drain a completed reroll before popping newer raw FIFO bytes. One
+			// socket-sized chunk is returned per tick; the suffix remains owned by
+			// the handler and cannot be silently deleted by the output cap.
+			if(b2f_handler.is_initialized() && b2f_handler.has_pending_rx_work())
+			{
+				char b2f_pending[MAX_BUFFER_SIZE];
+				int b2f_len = b2f_handler.filter_rx(nullptr, 0,
+					b2f_pending, sizeof(b2f_pending));
+				if(b2f_len < 0)
+				{
+					abort_b2f_transfer("RX retained-output drain failed");
+					return;
+				}
+				if(b2f_len > 0)
+					rx_deliver_send(b2f_pending, b2f_len);
+				return;
+			}
+
 			while(fifo_buffer_rx.get_size()!=fifo_buffer_rx.get_free_size())
 			{
 				// Pop raw data from RX FIFO
@@ -4956,7 +4974,7 @@ void cl_arq_controller::process_buffer_data_responder()
 				// Build the to-send unit (`send_buf`/`send_len`). For B2F the unit is
 				// the POST-transform stream (the raw bytes are consumed by the parser
 				// and cannot be re-popped — audit R4); otherwise it is rx_raw verbatim.
-				char b2f_buf[MAX_BUFFER_SIZE * 4]; // LZHUF can be larger than plaintext (rare)
+				char b2f_buf[MAX_BUFFER_SIZE];
 				const char* send_buf = rx_raw;
 				int send_len = 0;
 
@@ -4965,6 +4983,11 @@ void cl_arq_controller::process_buffer_data_responder()
 				{
 					int b2f_len = b2f_handler.filter_rx(rx_raw, rx_raw_len,
 						b2f_buf, sizeof(b2f_buf));
+					if(b2f_len < 0)
+					{
+						abort_b2f_transfer("RX parser/reroll failed");
+						return;
+					}
 
 					// Auto-arm compression when B2F detected on RX path
 					// (CAP_COMPRESSION removed — always unconditional).

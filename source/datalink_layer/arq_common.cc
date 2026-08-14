@@ -8170,7 +8170,15 @@ void cl_arq_controller::process_main()
 					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
 						restage_reserve += messages_tx[i].length;
 		}
-		if(fifo_buffer_tx.get_free_size() >= MAX_BUFFER_SIZE + restage_reserve)
+		// Drain handler-owned transform output before another socket receive.
+		// Later application bytes must not overtake a completed B2F record.
+		if(b2f_handler.is_initialized() && b2f_handler.has_pending_tx_work())
+		{
+			if(stage_b2f_tx(nullptr, 0, restage_reserve) < 0)
+				return;
+		}
+		if(!b2f_handler.has_pending_tx_work() &&
+		   fifo_buffer_tx.get_free_size() >= MAX_BUFFER_SIZE + restage_reserve)
 		{
 			int nBytes_received=tcp_socket_data.receive();
 			if(nBytes_received>0)
@@ -8180,11 +8188,12 @@ void cl_arq_controller::process_main()
 				// B2F filter: parse outgoing stream, unroll LZHUF payloads
 				if(b2f_handler.is_initialized())
 				{
-					char b2f_buf[MAX_BUFFER_SIZE * 4]; // plaintext can be larger than LZHUF
-					int b2f_len = b2f_handler.filter_tx(
+					int b2f_len = stage_b2f_tx(
 						tcp_socket_data.message->buffer,
 						tcp_socket_data.message->length,
-						b2f_buf, sizeof(b2f_buf));
+						restage_reserve);
+					if(b2f_len < 0)
+						return;
 
 					// Auto-arm compression when B2F SID detected (Winlink traffic).
 					// CAP_COMPRESSION removed — always unconditional.
@@ -8196,11 +8205,6 @@ void cl_arq_controller::process_main()
 						fflush(stdout);
 					}
 
-					if(b2f_len > 0)
-						fifo_buffer_tx.push(b2f_buf, b2f_len);
-					else if(!b2f_handler.is_b2f_session())
-						fifo_buffer_tx.push(tcp_socket_data.message->buffer, tcp_socket_data.message->length);
-					// else: B2F active, parser accumulating partial line -- skip raw push
 				}
 				else
 				{
@@ -9045,6 +9049,82 @@ void cl_arq_controller::update_robust_preamble_negotiation()
 		fflush(stdout);
 	}
 	telecom_system->set_robust_preamble_negotiated(both);
+}
+
+int cl_arq_controller::stage_b2f_tx(const char* input, int input_len,
+	int restage_reserve)
+{
+	if(!b2f_handler.is_initialized())
+		return 0;
+	if(b2f_handler.has_fatal_error())
+	{
+		abort_b2f_transfer("TX transform entered fail-closed state");
+		return -1;
+	}
+
+	int out_cap = fifo_buffer_tx.get_free_size() - restage_reserve;
+	if(out_cap <= 0)
+	{
+		if(input_len > 0)
+		{
+			abort_b2f_transfer("TX transform input arrived without FIFO ownership");
+			return -1;
+		}
+		return 0;
+	}
+	char b2f_buf[MAX_BUFFER_SIZE * 4];
+	if(out_cap > (int)sizeof(b2f_buf))
+		out_cap = sizeof(b2f_buf);
+
+	int b2f_len = b2f_handler.filter_tx(input, input_len, b2f_buf, out_cap);
+	if(b2f_len < 0)
+	{
+		abort_b2f_transfer("TX parser/transform failed");
+		return -1;
+	}
+	if(b2f_len == 0)
+		return 0;
+
+	int pushed = fifo_buffer_tx.push(b2f_buf, b2f_len);
+	if(pushed == b2f_len)
+		return b2f_len;
+
+	// push() is all-or-nothing. Restore the rejected prefix ahead of the
+	// handler's suffix so a transient capacity race remains lossless.
+	bool restored = pushed == 0 &&
+		b2f_handler.requeue_tx_output(b2f_buf, b2f_len);
+	printf("[B2F-TX] FIFO rejected transformed output (%d/%d); restore=%d\n",
+		pushed, b2f_len, restored ? 1 : 0);
+	fflush(stdout);
+	if(!restored)
+	{
+		abort_b2f_transfer("TX FIFO rejection could not be restored");
+		return -1;
+	}
+	return 0;
+}
+
+void cl_arq_controller::abort_b2f_transfer(const char* reason)
+{
+	printf("[B2F] FATAL: %s -- dropping transfer for clean application retry\n",
+		reason ? reason : "unspecified transform failure");
+	fflush(stdout);
+	if(tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
+	{
+		const char* disc = "DISCONNECTED\r";
+		tcp_socket_control.message->length = (int)strlen(disc);
+		memcpy(tcp_socket_control.message->buffer, disc,
+			tcp_socket_control.message->length);
+		tcp_socket_control.transmit();
+	}
+	link_status = DROPPED;
+	reset_session_state();
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+	fifo_buffer_rx.flush();
+	rx_deliver_pending_len = 0;
+	tcp_socket_data.close_connection();
+	reset_all_timers();
 }
 
 void cl_arq_controller::reset_session_state()

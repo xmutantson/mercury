@@ -30,8 +30,16 @@ cl_b2f_handler::cl_b2f_handler()
 {
 	payload_buf = nullptr;
 	plain_buf = nullptr;
+	rx_pending_buf = nullptr;
 	initialized = false;
 	unroll_enabled = true;
+	tx_pending_output_pos = 0;
+	tx_pending_output_len = 0;
+	tx_deferred_input_len = 0;
+	rx_pending_output_pos = 0;
+	rx_pending_output_len = 0;
+	rx_deferred_input_len = 0;
+	fatal_error = false;
 	reset();
 }
 
@@ -46,8 +54,9 @@ void cl_b2f_handler::init()
 
 	payload_buf = (uint8_t*)malloc(B2F_PAYLOAD_BUF_SIZE);
 	plain_buf = (uint8_t*)malloc(B2F_PLAIN_BUF_SIZE);
+	rx_pending_buf = (uint8_t*)malloc(B2F_PLAIN_BUF_SIZE);
 
-	if (!payload_buf || !plain_buf)
+	if (!payload_buf || !plain_buf || !rx_pending_buf)
 	{
 		deinit();
 		return;
@@ -63,11 +72,26 @@ void cl_b2f_handler::deinit()
 {
 	if (payload_buf) { free(payload_buf); payload_buf = nullptr; }
 	if (plain_buf) { free(plain_buf); plain_buf = nullptr; }
+	if (rx_pending_buf) { free(rx_pending_buf); rx_pending_buf = nullptr; }
+	tx_pending_output_pos = 0;
+	tx_pending_output_len = 0;
+	tx_deferred_input_len = 0;
+	rx_pending_output_pos = 0;
+	rx_pending_output_len = 0;
+	rx_deferred_input_len = 0;
+	fatal_error = false;
 	initialized = false;
 }
 
 void cl_b2f_handler::reset()
 {
+	tx_pending_output_pos = 0;
+	tx_pending_output_len = 0;
+	tx_deferred_input_len = 0;
+	rx_pending_output_pos = 0;
+	rx_pending_output_len = 0;
+	rx_deferred_input_len = 0;
+	fatal_error = false;
 	state = B2F_IDLE;
 	current_proposer = PROPOSER_NONE;
 	b2f_detected = false;
@@ -79,6 +103,76 @@ void cl_b2f_handler::reset()
 	payload_buf_pos = 0;
 	reroll_divergence = 0;
 	reroll_poisoned = false;
+}
+
+bool cl_b2f_handler::has_pending_tx_work() const
+{
+	return tx_pending_output_pos < tx_pending_output_len ||
+		tx_deferred_input_len > 0;
+}
+
+bool cl_b2f_handler::has_pending_rx_work() const
+{
+	return rx_pending_output_pos < rx_pending_output_len ||
+		rx_deferred_input_len > 0;
+}
+
+bool cl_b2f_handler::requeue_tx_output(const char* data, int len)
+{
+	if (len <= 0)
+		return true;
+	if (!data || !payload_buf)
+	{
+		fatal_error = true;
+		return false;
+	}
+
+	int remaining = tx_pending_output_len - tx_pending_output_pos;
+	if (remaining < 0 || len > B2F_PAYLOAD_BUF_SIZE - remaining)
+	{
+		fatal_error = true;
+		return false;
+	}
+	if (remaining > 0)
+		memmove(payload_buf + len, payload_buf + tx_pending_output_pos, remaining);
+	memcpy(payload_buf, data, len);
+	tx_pending_output_pos = 0;
+	tx_pending_output_len = len + remaining;
+	return true;
+}
+
+int cl_b2f_handler::drain_tx_pending(char* out, int out_cap)
+{
+	if (out_cap <= 0 || tx_pending_output_pos >= tx_pending_output_len)
+		return 0;
+	int remaining = tx_pending_output_len - tx_pending_output_pos;
+	int copy = remaining < out_cap ? remaining : out_cap;
+	memcpy(out, payload_buf + tx_pending_output_pos, copy);
+	tx_pending_output_pos += copy;
+	if (tx_pending_output_pos == tx_pending_output_len)
+	{
+		tx_pending_output_pos = 0;
+		tx_pending_output_len = 0;
+		payload_buf_pos = 0;
+	}
+	return copy;
+}
+
+int cl_b2f_handler::drain_rx_pending(char* out, int out_cap)
+{
+	if (out_cap <= 0 || rx_pending_output_pos >= rx_pending_output_len)
+		return 0;
+	int remaining = rx_pending_output_len - rx_pending_output_pos;
+	int copy = remaining < out_cap ? remaining : out_cap;
+	memcpy(out, rx_pending_buf + rx_pending_output_pos, copy);
+	rx_pending_output_pos += copy;
+	if (rx_pending_output_pos == rx_pending_output_len)
+	{
+		rx_pending_output_pos = 0;
+		rx_pending_output_len = 0;
+		payload_buf_pos = 0;
+	}
+	return copy;
 }
 
 // ---- B2F Line Parsers ----
@@ -445,7 +539,9 @@ int cl_b2f_handler::process_tx_payload(const char* in, int in_len, char* out, in
 
 		// Can only unroll full transfers — resume sends partial LZHUF
 		bool can_unroll = unroll_enabled && initialized &&
-		                  proposals[current_payload_idx].resume_offset == 0;
+		                  proposals[current_payload_idx].resume_offset == 0 &&
+		                  proposals[current_payload_idx].comp_size <= B2F_PLAIN_BUF_SIZE &&
+		                  proposals[current_payload_idx].uncomp_size <= B2F_PLAIN_BUF_SIZE;
 		if (can_unroll)
 		{
 			if (payload_buf_pos + chunk <= B2F_PAYLOAD_BUF_SIZE)
@@ -470,25 +566,21 @@ int cl_b2f_handler::process_tx_payload(const char* in, int in_len, char* out, in
 						(float)payload_buf_pos / (float)plain_len);
 					fflush(stdout);
 
-					if (out_pos + (int)plain_len <= out_cap)
-					{
-						memcpy(out + out_pos, plain_buf, plain_len);
-						out_pos += (int)plain_len;
-					}
+					// Caller capacity is backpressure, not permission to discard a
+					// completed record. Retain it and release bounded prefixes.
+					memcpy(payload_buf, plain_buf, plain_len);
+					tx_pending_output_pos = 0;
+					tx_pending_output_len = (int)plain_len;
 				}
 				else
 				{
 					printf("[B2F-TX] LZHUF decode FAILED for %s (rc=%d), passthrough\n",
 						proposals[current_payload_idx].mid, rc);
 					fflush(stdout);
-					if (out_pos + payload_buf_pos <= out_cap)
-					{
-						memcpy(out + out_pos, payload_buf, payload_buf_pos);
-						out_pos += payload_buf_pos;
-					}
+					tx_pending_output_pos = 0;
+					tx_pending_output_len = payload_buf_pos;
 				}
 
-				payload_buf_pos = 0;
 				current_payload_idx = find_next_accepted(current_payload_idx + 1);
 				if (current_payload_idx >= 0)
 				{
@@ -505,15 +597,19 @@ int cl_b2f_handler::process_tx_payload(const char* in, int in_len, char* out, in
 					printf("[B2F-TX] All payloads unrolled\n");
 					fflush(stdout);
 				}
+
+				out_pos += drain_tx_pending(out + out_pos, out_cap - out_pos);
+				if (tx_pending_output_pos < tx_pending_output_len)
+					break;
 			}
 		}
 		else
 		{
-			if (out_pos + chunk <= out_cap)
-			{
-				memcpy(out + out_pos, in + in_pos, chunk);
-				out_pos += chunk;
-			}
+			int room = out_cap - out_pos;
+			if (chunk > room) chunk = room;
+			if (chunk <= 0) break;
+			memcpy(out + out_pos, in + in_pos, chunk);
+			out_pos += chunk;
 			in_pos += chunk;
 			payload_bytes_remaining -= chunk;
 
@@ -560,7 +656,9 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 
 		// Can only reroll full transfers — resume sends partial LZHUF
 		bool can_unroll = unroll_enabled && initialized &&
-		                  proposals[current_payload_idx].resume_offset == 0;
+		                  proposals[current_payload_idx].resume_offset == 0 &&
+		                  proposals[current_payload_idx].comp_size <= B2F_PLAIN_BUF_SIZE &&
+		                  proposals[current_payload_idx].uncomp_size <= B2F_PLAIN_BUF_SIZE;
 		if (can_unroll)
 		{
 			if (payload_buf_pos + chunk <= B2F_PAYLOAD_BUF_SIZE)
@@ -586,11 +684,9 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 							payload_buf_pos, lzhuf_len);
 						fflush(stdout);
 
-						if (out_pos + (int)lzhuf_len <= out_cap)
-						{
-							memcpy(out + out_pos, plain_buf, lzhuf_len);
-							out_pos += (int)lzhuf_len;
-						}
+						memcpy(rx_pending_buf, plain_buf, lzhuf_len);
+						rx_pending_output_pos = 0;
+						rx_pending_output_len = (int)lzhuf_len;
 					}
 					else
 					{
@@ -619,11 +715,9 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 								lzhuf_len, proposals[current_payload_idx].comp_size,
 								proposals[current_payload_idx].mid);
 							fflush(stdout);
-							if (out_pos + (int)lzhuf_len <= out_cap)
-							{
-								memcpy(out + out_pos, plain_buf, lzhuf_len);
-								out_pos += (int)lzhuf_len;
-							}
+							memcpy(rx_pending_buf, plain_buf, lzhuf_len);
+							rx_pending_output_pos = 0;
+							rx_pending_output_len = (int)lzhuf_len;
 						}
 						else
 						{
@@ -643,19 +737,19 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 					printf("[B2F-RX] LZHUF encode FAILED for %s (rc=%d), passthrough\n",
 						proposals[current_payload_idx].mid, rc);
 					fflush(stdout);
-					if (out_pos + payload_buf_pos <= out_cap)
-					{
-						memcpy(out + out_pos, payload_buf, payload_buf_pos);
-						out_pos += payload_buf_pos;
-					}
+					memcpy(rx_pending_buf, payload_buf, payload_buf_pos);
+					rx_pending_output_pos = 0;
+					rx_pending_output_len = payload_buf_pos;
 				}
 
-				payload_buf_pos = 0;
 				current_payload_idx = find_next_accepted(current_payload_idx + 1);
 				if (current_payload_idx >= 0)
 				{
 					auto& np = proposals[current_payload_idx];
-					bool next_can_unroll = np.resume_offset == 0;
+					bool next_can_unroll = unroll_enabled && initialized &&
+						np.resume_offset == 0 &&
+						np.comp_size <= B2F_PLAIN_BUF_SIZE &&
+						np.uncomp_size <= B2F_PLAIN_BUF_SIZE;
 					payload_bytes_remaining = next_can_unroll ?
 						np.uncomp_size :
 						(np.comp_size - np.resume_offset);
@@ -670,15 +764,19 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 					printf("[B2F-RX] All payloads rerolled\n");
 					fflush(stdout);
 				}
+
+				out_pos += drain_rx_pending(out + out_pos, out_cap - out_pos);
+				if (rx_pending_output_pos < rx_pending_output_len)
+					break;
 			}
 		}
 		else
 		{
-			if (out_pos + chunk <= out_cap)
-			{
-				memcpy(out + out_pos, in + in_pos, chunk);
-				out_pos += chunk;
-			}
+			int room = out_cap - out_pos;
+			if (chunk > room) chunk = room;
+			if (chunk <= 0) break;
+			memcpy(out + out_pos, in + in_pos, chunk);
+			out_pos += chunk;
 			in_pos += chunk;
 			payload_bytes_remaining -= chunk;
 
@@ -704,13 +802,13 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 
 // ---- Top-level filters ----
 
-int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap)
+int cl_b2f_handler::filter_tx_input(const char* in, int in_len, char* out, int out_cap)
 {
 	if (!initialized)
 	{
-		int copy = in_len < out_cap ? in_len : out_cap;
-		memcpy(out, in, copy);
-		return copy;
+		if (in_len > out_cap) return -1;
+		memcpy(out, in, in_len);
+		return in_len;
 	}
 
 	int out_pos = 0;
@@ -723,7 +821,7 @@ int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap
 	// passthrough, again from the line parser on the next call.)
 	if (!b2f_detected)
 	{
-		for (; in_pos < in_len && !b2f_detected; in_pos++)
+		for (; in_pos < in_len && !b2f_detected && out_pos < out_cap; in_pos++)
 		{
 			char c = in[in_pos];
 
@@ -754,6 +852,19 @@ int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap
 			}
 		}
 
+		if (!b2f_detected && in_pos < in_len)
+		{
+			int remaining = in_len - in_pos;
+			if (remaining > B2F_DEFERRED_INPUT_SIZE || tx_deferred_input_len != 0)
+			{
+				fatal_error = true;
+				return -1;
+			}
+			memcpy(tx_deferred_input, in + in_pos, remaining);
+			tx_deferred_input_len = remaining;
+			return out_pos;
+		}
+
 		if (!b2f_detected)
 			return out_pos;
 
@@ -764,6 +875,19 @@ int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap
 
 	while (in_pos < in_len)
 	{
+		if (out_pos >= out_cap)
+		{
+			int remaining = in_len - in_pos;
+			if (remaining > B2F_DEFERRED_INPUT_SIZE || tx_deferred_input_len != 0)
+			{
+				fatal_error = true;
+				return -1;
+			}
+			memcpy(tx_deferred_input, in + in_pos, remaining);
+			tx_deferred_input_len = remaining;
+			break;
+		}
+
 		if (state == B2F_PAYLOAD_TRANSFER && current_proposer == PROPOSER_LOCAL)
 		{
 			int avail = in_len - in_pos;
@@ -772,6 +896,26 @@ int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap
 			if (written < 0) return -1;
 			out_pos += written;
 			in_pos += consumed;
+			if (tx_pending_output_pos < tx_pending_output_len)
+			{
+				int remaining = in_len - in_pos;
+				if (remaining > B2F_DEFERRED_INPUT_SIZE || tx_deferred_input_len != 0)
+				{
+					fatal_error = true;
+					return -1;
+				}
+				if (remaining > 0)
+				{
+					memcpy(tx_deferred_input, in + in_pos, remaining);
+					tx_deferred_input_len = remaining;
+				}
+				break;
+			}
+			if (consumed == 0 && written == 0)
+			{
+				fatal_error = true;
+				return -1;
+			}
 		}
 		else
 		{
@@ -796,13 +940,48 @@ int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap
 	return out_pos;
 }
 
-int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap)
+int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap)
+{
+	if (in_len < 0 || out_cap < 0 || (in_len > 0 && !in) || !out || fatal_error)
+		return -1;
+	if (in_len > 0 && has_pending_rx_work())
+		return -1;
+
+	int out_pos = drain_tx_pending(out, out_cap);
+	if (tx_pending_output_pos < tx_pending_output_len)
+		return in_len == 0 ? out_pos : -1;
+
+	if (tx_deferred_input_len > 0)
+	{
+		if (in_len > 0)
+			return -1;
+		char deferred[B2F_DEFERRED_INPUT_SIZE];
+		int deferred_len = tx_deferred_input_len;
+		memcpy(deferred, tx_deferred_input, deferred_len);
+		tx_deferred_input_len = 0;
+		int written = filter_tx_input(deferred, deferred_len,
+			out + out_pos, out_cap - out_pos);
+		if (written < 0) return -1;
+		out_pos += written;
+	}
+
+	if (in_len > 0)
+	{
+		int written = filter_tx_input(in, in_len,
+			out + out_pos, out_cap - out_pos);
+		if (written < 0) return -1;
+		out_pos += written;
+	}
+	return out_pos;
+}
+
+int cl_b2f_handler::filter_rx_input(const char* in, int in_len, char* out, int out_cap)
 {
 	if (!initialized)
 	{
-		int copy = in_len < out_cap ? in_len : out_cap;
-		memcpy(out, in, copy);
-		return copy;
+		if (in_len > out_cap) return -1;
+		memcpy(out, in, in_len);
+		return in_len;
 	}
 
 	// Fail-closed (C3): a prior reroll DIVERGED from the sender's LZHUF encoding.
@@ -819,7 +998,7 @@ int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap
 	// and fall through to the line parser for remaining bytes in this chunk.
 	if (!b2f_detected)
 	{
-		for (; in_pos < in_len && !b2f_detected; in_pos++)
+		for (; in_pos < in_len && !b2f_detected && out_pos < out_cap; in_pos++)
 		{
 			char c = in[in_pos];
 
@@ -850,6 +1029,19 @@ int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap
 			}
 		}
 
+		if (!b2f_detected && in_pos < in_len)
+		{
+			int remaining = in_len - in_pos;
+			if (remaining > B2F_DEFERRED_INPUT_SIZE || rx_deferred_input_len != 0)
+			{
+				fatal_error = true;
+				return -1;
+			}
+			memcpy(rx_deferred_input, in + in_pos, remaining);
+			rx_deferred_input_len = remaining;
+			return out_pos;
+		}
+
 		if (!b2f_detected)
 			return out_pos;
 
@@ -860,6 +1052,19 @@ int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap
 
 	while (in_pos < in_len)
 	{
+		if (out_pos >= out_cap)
+		{
+			int remaining = in_len - in_pos;
+			if (remaining > B2F_DEFERRED_INPUT_SIZE || rx_deferred_input_len != 0)
+			{
+				fatal_error = true;
+				return -1;
+			}
+			memcpy(rx_deferred_input, in + in_pos, remaining);
+			rx_deferred_input_len = remaining;
+			break;
+		}
+
 		if (state == B2F_PAYLOAD_TRANSFER && current_proposer == PROPOSER_REMOTE)
 		{
 			int avail = in_len - in_pos;
@@ -868,6 +1073,26 @@ int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap
 			if (written < 0) return -1;
 			out_pos += written;
 			in_pos += consumed;
+			if (rx_pending_output_pos < rx_pending_output_len)
+			{
+				int remaining = in_len - in_pos;
+				if (remaining > B2F_DEFERRED_INPUT_SIZE || rx_deferred_input_len != 0)
+				{
+					fatal_error = true;
+					return -1;
+				}
+				if (remaining > 0)
+				{
+					memcpy(rx_deferred_input, in + in_pos, remaining);
+					rx_deferred_input_len = remaining;
+				}
+				break;
+			}
+			if (consumed == 0 && written == 0)
+			{
+				fatal_error = true;
+				return -1;
+			}
 		}
 		else
 		{
@@ -889,5 +1114,40 @@ int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap
 		}
 	}
 
+	return out_pos;
+}
+
+int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap)
+{
+	if (in_len < 0 || out_cap < 0 || (in_len > 0 && !in) || !out || fatal_error)
+		return -1;
+	if (in_len > 0 && has_pending_tx_work())
+		return -1;
+
+	int out_pos = drain_rx_pending(out, out_cap);
+	if (rx_pending_output_pos < rx_pending_output_len)
+		return in_len == 0 ? out_pos : -1;
+
+	if (rx_deferred_input_len > 0)
+	{
+		if (in_len > 0)
+			return -1;
+		char deferred[B2F_DEFERRED_INPUT_SIZE];
+		int deferred_len = rx_deferred_input_len;
+		memcpy(deferred, rx_deferred_input, deferred_len);
+		rx_deferred_input_len = 0;
+		int written = filter_rx_input(deferred, deferred_len,
+			out + out_pos, out_cap - out_pos);
+		if (written < 0) return -1;
+		out_pos += written;
+	}
+
+	if (in_len > 0)
+	{
+		int written = filter_rx_input(in, in_len,
+			out + out_pos, out_cap - out_pos);
+		if (written < 0) return -1;
+		out_pos += written;
+	}
 	return out_pos;
 }

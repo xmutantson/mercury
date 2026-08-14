@@ -1111,6 +1111,11 @@ public:
   void process_messages_rx_acks_data();
   void process_control_commander();
   void process_buffer_data_commander();
+  // B2F transformed records may exceed one output/FIFO insertion.  Stage one
+  // bounded, all-or-nothing chunk and retain ownership on backpressure.
+  int stage_b2f_tx(const char* input, int input_len, int restage_reserve);
+  // A transform error is a transfer failure, never a zero-byte success.
+  void abort_b2f_transfer(const char* reason);
   void finalize_block_commander();
   // Fix C / H#1 (data-flow-fifo-backup.md §6.1): ACK-confirm-keyed backup flush.
   // finalize_block_commander() is the normal backup flush but it is SKIPPED whenever a
