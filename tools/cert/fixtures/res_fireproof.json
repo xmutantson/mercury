@@ -1,0 +1,82 @@
+{
+ "tag": "fireproof",
+ "arm": "fireproof",
+ "env": [
+  "MERCURY_SIM_PSIG_MODE=steady",
+  "MERCURY_TURN_TRACE=1"
+ ],
+ "passthrough": false,
+ "snr": 28.0,
+ "cell": null,
+ "profile": "wgn",
+ "seed": 1,
+ "start_cfg": 100,
+ "card": "Loopback",
+ "subs": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "rsp_port": 7150,
+ "cmd_port": 7154,
+ "no_gearshift": false,
+ "connected": true,
+ "cmd_connected": true,
+ "rsp_connected": true,
+ "connected_at_s": 51.71,
+ "tx_bytes": 8192,
+ "rx_bytes": 8192,
+ "payload_target": 8192,
+ "delivered_full": true,
+ "rsp_nreceived_frames": 57,
+ "cmd_nreceived_frames": 0,
+ "breaks": 0,
+ "rx_overrun_total": 0,
+ "rx_overrun_segments": [
+  0
+ ],
+ "encrypt": null,
+ "enc_activated": false,
+ "aead_authfails": 0,
+ "nonce_enc_count": 0,
+ "nonce_reuse_count": 0,
+ "dec_ok_count": 0,
+ "configs_seen": [
+  0,
+  7,
+  13,
+  16,
+  100
+ ],
+ "rsp_configs_seen": [
+  0,
+  7,
+  13,
+  16,
+  100
+ ],
+ "cmd_configs_seen": [
+  0,
+  7,
+  13,
+  16,
+  100
+ ],
+ "max_config_reached": 100,
+ "wb_configs_seen": [
+  0,
+  7,
+  13,
+  16
+ ],
+ "climbed_past_robust0": true,
+ "rsp_loaded_wb_id": 0,
+ "rsp_wb_data_frames": 114,
+ "max_wb_cfg_with_data": 16,
+ "time_to_cross_s": 76.739,
+ "crossed": true,
+ "climbed_past_cfg0": true,
+ "rx_bps_wall": 612.9,
+ "wall_secs": 106.9
+}

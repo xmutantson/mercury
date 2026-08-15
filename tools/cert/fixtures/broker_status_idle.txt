@@ -1,0 +1,1 @@
+OK {"caps":{"max_cards_per_lease":1,"max_cpu_per_lease":8},"boxes":{"11":{"active_leases":0},"21":{"active_leases":0},"31":{"active_leases":0}}}

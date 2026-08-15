@@ -1,0 +1,27 @@
+{
+  "tag": "smoke_s00001",
+  "seed": 1,
+  "spawner_width": 1,
+  "bridge_underruns": {
+    "fwd": 0,
+    "rev": 0,
+    "total": 0
+  },
+  "rx_overrun_total": 0,
+  "connected": true,
+  "delivered_full": true,
+  "byte_integrity_ok": true,
+  "traffic": "random-binary",
+  "warm_start": true,
+  "warm_start_ok": true,
+  "score_horizon_s": 800.0,
+  "score_horizon_reached": true,
+  "snr": 28.0,
+  "requested_snr3k": 28.0,
+  "snr3k": 28.0,
+  "snr3k_attested": true,
+  "profile": "wgn",
+  "payload_target": 262144,
+  "verdict": "PASS",
+  "simulation_fixture": true
+}
