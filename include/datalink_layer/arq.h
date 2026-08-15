@@ -3968,6 +3968,14 @@ public:
 	     *  \return SUCESSFUL or ERROR
 	   */
   int add_message_rx_data(char type, char id, int length, char* data);
+	//! SACK Design A Step 8a match-prev store (the REFILL), factored out of
+	//! process_messages_rx_data_control. Reads messages_rx_buffer + member state,
+	//! writes messages_rx_prev[loc] + the honest completion count.
+	    /*!
+	      \return true iff a frame was stored (len_ok); false triggers the
+	              caller's [RSP-V2-PREV-DROP] length_or_loc_out_of_range log
+	   */
+  bool store_prev_match_frame();
 	//! Prepares control ack message.
 	    /*!
 	      \return None

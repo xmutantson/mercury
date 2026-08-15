@@ -145,6 +145,147 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 // window by the RECEIVING-entry set (frame_symb+10) the OFDM data path needs.
 
 
+// SACK Design A Step 8a -- match-prev store (the REFILL), factored out of
+// process_messages_rx_data_control so the reseat-span regression drives the
+// PRODUCTION prev-match store (store -> honest completion count) instead of
+// transcribing it. Reads messages_rx_buffer (the just-received prev-routed
+// frame) + member state; writes messages_rx_prev[loc] and the honest count.
+// Returns true iff a frame was stored (len_ok): the caller then runs the
+// completion/delivery block, and on false logs [RSP-V2-PREV-DROP]
+// length_or_loc_out_of_range -- byte-identical to the pre-refactor inline
+// if(len_ok){...}else{...}.
+bool cl_arq_controller::store_prev_match_frame()
+{
+	int loc = (int)((unsigned char)messages_rx_buffer.id);
+	int eff_long  = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+	int eff_short = effective_data_short_header_length(sack_v2_enabled, header_carries_d5);
+	int max_long  = max_data_length + max_header_length - eff_long;
+	int max_short = max_data_length + max_header_length - eff_short;
+	bool len_ok = true;
+	if(messages_rx_buffer.type == DATA_LONG
+	   && messages_rx_buffer.length > max_long) len_ok = false;
+	if(messages_rx_buffer.type == DATA_SHORT
+	   && messages_rx_buffer.length > max_short) len_ok = false;
+	(void)eff_short;  // referenced via max_short above
+	// R7 fix (data-flow-messages_rx_prev.md §5):
+	// Constrain loc to [0, data_batch_size) — NOT [0, nMessages).
+	// The prev-batch completion trigger at :513 fires when
+	// rsp_prev_batch_received_count >= rsp_prev_batch_expected_count,
+	// and expected_count is capped at data_batch_size by the bsi-bump
+	// path (arq_common.cc:4072). A bit-errored ID in the range
+	// [data_batch_size, nMessages) used to (a) write to a slot that
+	// is never read by the swap-and-deliver loop (arq_responder.cc:537
+	// iterates i<data_batch_size && i<nMessages) and (b) bump the
+	// received_count, prematurely triggering completion when real
+	// frames had not all arrived. Matches the new-data path bound
+	// at arq_responder.cc:54 which uses data_batch_size.
+	// Option B' (data-flow-batch-size.md §9): bound the prev slot by the
+	// effective window derived from THIS prev frame's own CRC-protected D5
+	// count (rx_buffer_batch_total_frames = the PREV batch's declared span),
+	// so a prev batch the sender built larger than data_batch_size is not
+	// truncated at the store gate. == data_batch_size in every non-desync
+	// case. The nMessages check below stays the hard storage bound.
+	int prev_store_win = rx_effective_window(rx_buffer_batch_total_frames);
+	if(loc < 0 || loc >= prev_store_win)          len_ok = false;
+	if(loc >= this->nMessages)                    len_ok = false;
+	if(messages_rx_buffer.length < 0)             len_ok = false;
+	if(!len_ok) return false;
+	// Capture pre-store status so we can detect newly
+	// RECEIVED slots (avoid double-counting on repeat
+	// retransmits — RSP may see the same retx multiple
+	// times if CMD couldn't decode the SACK_RSP).
+	char prev_status = messages_rx_prev[loc].status;
+	messages_rx_prev[loc].type   = messages_rx_buffer.type;
+	messages_rx_prev[loc].length = messages_rx_buffer.length;
+	for(int j=0; j<messages_rx_buffer.length; j++)
+		messages_rx_prev[loc].data[j] = messages_rx_buffer.data[j];
+	{
+		int fill_end = max_long;
+		if(fill_end > N_MAX/8) fill_end = N_MAX/8;
+		for(int j=messages_rx_buffer.length; j<fill_end; j++)
+			messages_rx_prev[loc].data[j] = 0;
+	}
+	messages_rx_prev[loc].status = RECEIVED;
+	messages_rx_prev[loc].batch_seq_id = messages_rx_buffer.batch_seq_id;
+	bool prev_was_fresh = (prev_status != RECEIVED && prev_status != ACKED);
+	// D5: a prev-routed frame carries the PREV batch's authoritative
+	// frame count. If the prev was armed with an EOB-INFERRED (too
+	// short) expected_count because the original EOB frame was lost,
+	// re-derive expected_count from the wired count the moment a
+	// surviving frame of that batch reveals it — so the lost-EOB tail
+	// is now INSIDE expected_count, the completion gate waits for it,
+	// and the SACK span (below) requests it instead of silently
+	// dropping it. Clamp to [received_count, data_batch_size]: never
+	// shrink below what we already hold, never exceed the storage
+	// bound. Gated off under MERCURY_D5_INFER_DEFEAT (fail-before).
+	// Reseat-integrity ordering (data-flow-messages_rx_prev.md §4.5
+	// CORRECTION): this re-derivation runs BEFORE the count bump below,
+	// so a fresh frame that arrives at a loc the short EOB-inference had
+	// excluded is credited within the just-GROWN delivery window (it
+	// would otherwise be dropped by FIX (a) producer 2's loc<expected
+	// gate on the lost-EOB grow path).
+	if(rsp_prev_batch_active && rx_buffer_batch_total_frames > 0)
+	{
+		bool d5_infer_defeat = false;
+		{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
+		  if(e && *e && atoi(e)!=0) d5_infer_defeat = true; }
+		if(!d5_infer_defeat)
+		{
+			int wired = rx_buffer_batch_total_frames;
+			// Option B' (§9): cap by eff_window (== data_batch_size unless
+			// the sender over-declared this prev batch) rather than the stale
+			// data_batch_size, so the prev-completion gate waits for the TRUE
+			// span. Byte-identical when D5 <= data_batch_size.
+			int wcap = rx_effective_window(rx_buffer_batch_total_frames);
+			if(wired > wcap) wired = wcap;
+			if(wired < rsp_prev_batch_received_count)
+				wired = rsp_prev_batch_received_count;
+			if(wired > rsp_prev_batch_expected_count)
+			{
+				printf("[RSP-V2-D5-PREVEXP] prev_batch_seq_id=%d "
+					"expected %d -> %d (wired batch_total_frames=%d; "
+					"EOB-inference was short)\n",
+					rsp_prev_batch_seq_id,
+					rsp_prev_batch_expected_count, wired,
+					rx_buffer_batch_total_frames);
+				fflush(stdout);
+				rsp_prev_batch_expected_count = wired;
+			}
+		}
+	}
+	// FIX (a) producer 2 — honest completion count = DELIVERY window
+	// (data-flow-messages_rx_prev.md §4.5 CORRECTION). Bump received_count
+	// ONLY when this fresh slot is INSIDE the delivery window
+	// [0, prev_expected). The store above already accepted loc over the
+	// wider store window (rx_effective_window), so without this gate a
+	// wire-id skew that lands a frame in the gap [prev_expected,
+	// store_win) would over-credit the completion count and seal a
+	// short-delivering "complete" batch. prev_expected is the true batch
+	// span (the wired D5 count, just re-derived above), so this is
+	// byte-identical whenever the store window equals the delivery window
+	// (every non-short-fill case). MERCURY_W_PREVCOUNT_DEFEAT=1 restores
+	// the store-window count (the fail-before arm on the SAME binary).
+	{
+		bool w_prevcount_defeat = false;
+		{ const char* e = std::getenv("MERCURY_W_PREVCOUNT_DEFEAT");
+		  if(e && *e && atoi(e)!=0) w_prevcount_defeat = true; }
+		if(prev_was_fresh
+		   && (w_prevcount_defeat || loc < rsp_prev_batch_expected_count))
+			rsp_prev_batch_received_count++;
+	}
+
+	printf("[RSP-V2-PREV-RX] bsi=%d id=%d seq=%d/%d len=%d "
+		"prev_received=%d/%d\n",
+		(int)(unsigned char)messages_rx_buffer.batch_seq_id,
+		(int)(unsigned char)messages_rx_buffer.id,
+		messages_rx_buffer.sequence_number, data_batch_size,
+		messages_rx_buffer.length,
+		rsp_prev_batch_received_count,
+		rsp_prev_batch_expected_count);
+	fflush(stdout);
+	return true;
+}
+
 void cl_arq_controller::process_messages_rx_data_control()
 {
 	// Fast HAIL scanning while LISTENING: use receive_hail_pattern() (~32ms cycles)
@@ -1135,134 +1276,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 				// completion independently from the current-batch ACK-GATE.
 				if(v2_route_to_prev)
 				{
-					int loc = (int)((unsigned char)messages_rx_buffer.id);
-					int eff_long  = effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
-					int eff_short = effective_data_short_header_length(sack_v2_enabled, header_carries_d5);
-					int max_long  = max_data_length + max_header_length - eff_long;
-					int max_short = max_data_length + max_header_length - eff_short;
-					bool len_ok = true;
-					if(messages_rx_buffer.type == DATA_LONG
-					   && messages_rx_buffer.length > max_long) len_ok = false;
-					if(messages_rx_buffer.type == DATA_SHORT
-					   && messages_rx_buffer.length > max_short) len_ok = false;
-					(void)eff_short;  // referenced via max_short above
-					// R7 fix (data-flow-messages_rx_prev.md §5):
-					// Constrain loc to [0, data_batch_size) — NOT [0, nMessages).
-					// The prev-batch completion trigger at :513 fires when
-					// rsp_prev_batch_received_count >= rsp_prev_batch_expected_count,
-					// and expected_count is capped at data_batch_size by the bsi-bump
-					// path (arq_common.cc:4072). A bit-errored ID in the range
-					// [data_batch_size, nMessages) used to (a) write to a slot that
-					// is never read by the swap-and-deliver loop (arq_responder.cc:537
-					// iterates i<data_batch_size && i<nMessages) and (b) bump the
-					// received_count, prematurely triggering completion when real
-					// frames had not all arrived. Matches the new-data path bound
-					// at arq_responder.cc:54 which uses data_batch_size.
-					// Option B' (data-flow-batch-size.md §9): bound the prev slot by the
-					// effective window derived from THIS prev frame's own CRC-protected D5
-					// count (rx_buffer_batch_total_frames = the PREV batch's declared span),
-					// so a prev batch the sender built larger than data_batch_size is not
-					// truncated at the store gate. == data_batch_size in every non-desync
-					// case. The nMessages check below stays the hard storage bound.
-					int prev_store_win = rx_effective_window(rx_buffer_batch_total_frames);
-					if(loc < 0 || loc >= prev_store_win)          len_ok = false;
-					if(loc >= this->nMessages)                    len_ok = false;
-					if(messages_rx_buffer.length < 0)             len_ok = false;
-					if(len_ok)
+					if(store_prev_match_frame())
 					{
-						// Capture pre-store status so we can detect newly
-						// RECEIVED slots (avoid double-counting on repeat
-						// retransmits — RSP may see the same retx multiple
-						// times if CMD couldn't decode the SACK_RSP).
-						char prev_status = messages_rx_prev[loc].status;
-						messages_rx_prev[loc].type   = messages_rx_buffer.type;
-						messages_rx_prev[loc].length = messages_rx_buffer.length;
-						for(int j=0; j<messages_rx_buffer.length; j++)
-							messages_rx_prev[loc].data[j] = messages_rx_buffer.data[j];
-						{
-							int fill_end = max_long;
-							if(fill_end > N_MAX/8) fill_end = N_MAX/8;
-							for(int j=messages_rx_buffer.length; j<fill_end; j++)
-								messages_rx_prev[loc].data[j] = 0;
-						}
-						messages_rx_prev[loc].status = RECEIVED;
-						messages_rx_prev[loc].batch_seq_id = messages_rx_buffer.batch_seq_id;
-						bool prev_was_fresh = (prev_status != RECEIVED && prev_status != ACKED);
-						// D5: a prev-routed frame carries the PREV batch's authoritative
-						// frame count. If the prev was armed with an EOB-INFERRED (too
-						// short) expected_count because the original EOB frame was lost,
-						// re-derive expected_count from the wired count the moment a
-						// surviving frame of that batch reveals it — so the lost-EOB tail
-						// is now INSIDE expected_count, the completion gate waits for it,
-						// and the SACK span (below) requests it instead of silently
-						// dropping it. Clamp to [received_count, data_batch_size]: never
-						// shrink below what we already hold, never exceed the storage
-						// bound. Gated off under MERCURY_D5_INFER_DEFEAT (fail-before).
-						// Reseat-integrity ordering (data-flow-messages_rx_prev.md §4.5
-						// CORRECTION): this re-derivation runs BEFORE the count bump below,
-						// so a fresh frame that arrives at a loc the short EOB-inference had
-						// excluded is credited within the just-GROWN delivery window (it
-						// would otherwise be dropped by FIX (a) producer 2's loc<expected
-						// gate on the lost-EOB grow path).
-						if(rsp_prev_batch_active && rx_buffer_batch_total_frames > 0)
-						{
-							bool d5_infer_defeat = false;
-							{ const char* e = std::getenv("MERCURY_D5_INFER_DEFEAT");
-							  if(e && *e && atoi(e)!=0) d5_infer_defeat = true; }
-							if(!d5_infer_defeat)
-							{
-								int wired = rx_buffer_batch_total_frames;
-								// Option B' (§9): cap by eff_window (== data_batch_size unless
-								// the sender over-declared this prev batch) rather than the stale
-								// data_batch_size, so the prev-completion gate waits for the TRUE
-								// span. Byte-identical when D5 <= data_batch_size.
-								int wcap = rx_effective_window(rx_buffer_batch_total_frames);
-								if(wired > wcap) wired = wcap;
-								if(wired < rsp_prev_batch_received_count)
-									wired = rsp_prev_batch_received_count;
-								if(wired > rsp_prev_batch_expected_count)
-								{
-									printf("[RSP-V2-D5-PREVEXP] prev_batch_seq_id=%d "
-										"expected %d -> %d (wired batch_total_frames=%d; "
-										"EOB-inference was short)\n",
-										rsp_prev_batch_seq_id,
-										rsp_prev_batch_expected_count, wired,
-										rx_buffer_batch_total_frames);
-									fflush(stdout);
-									rsp_prev_batch_expected_count = wired;
-								}
-							}
-						}
-						// FIX (a) producer 2 — honest completion count = DELIVERY window
-						// (data-flow-messages_rx_prev.md §4.5 CORRECTION). Bump received_count
-						// ONLY when this fresh slot is INSIDE the delivery window
-						// [0, prev_expected). The store above already accepted loc over the
-						// wider store window (rx_effective_window), so without this gate a
-						// wire-id skew that lands a frame in the gap [prev_expected,
-						// store_win) would over-credit the completion count and seal a
-						// short-delivering "complete" batch. prev_expected is the true batch
-						// span (the wired D5 count, just re-derived above), so this is
-						// byte-identical whenever the store window equals the delivery window
-						// (every non-short-fill case). MERCURY_W_PREVCOUNT_DEFEAT=1 restores
-						// the store-window count (the fail-before arm on the SAME binary).
-						{
-							bool w_prevcount_defeat = false;
-							{ const char* e = std::getenv("MERCURY_W_PREVCOUNT_DEFEAT");
-							  if(e && *e && atoi(e)!=0) w_prevcount_defeat = true; }
-							if(prev_was_fresh
-							   && (w_prevcount_defeat || loc < rsp_prev_batch_expected_count))
-								rsp_prev_batch_received_count++;
-						}
-
-						printf("[RSP-V2-PREV-RX] bsi=%d id=%d seq=%d/%d len=%d "
-							"prev_received=%d/%d\n",
-							(int)(unsigned char)messages_rx_buffer.batch_seq_id,
-							(int)(unsigned char)messages_rx_buffer.id,
-							messages_rx_buffer.sequence_number, data_batch_size,
-							messages_rx_buffer.length,
-							rsp_prev_batch_received_count,
-							rsp_prev_batch_expected_count);
-						fflush(stdout);
 
 						// Prev-batch completion: deliver via copy_data_to_buffer
 						// using a temporary pointer swap so the existing
@@ -5397,15 +5412,22 @@ int cl_arq_controller::test_partial_bsi_advance(const char* transport)
 // PRODUCTION PRIMITIVES DRIVEN:
 //   • add_message_rx_data()               — the real current-batch store bound
 //   • bump_bsi_and_transfer_prev()        — the real seal (FIX a producer 1 lives here)
+//   • store_prev_match_frame()            — the REAL prev-match retx store (FIX a producer 2
+//                                            + the D5 re-derivation + store bound live here),
+//                                            extracted verbatim from the match-prev branch of
+//                                            process_messages_rx_data_control and called by
+//                                            BOTH production and this test
 //   • deliver_complete_inflight_before_break() -> copy_data_to_buffer()
 //                                          — the real prev delivery + reassembler
 //                                            (FIX b span-gate lives at the funnel)
-// The retx REFILL into messages_rx_prev[] is transcribed (the prev-match store is inline in
-// process_messages_rx_data_control, which cannot be invoked in-process — the SAME constraint
-// test_partial_bsi_advance Step 5 documents); its count rule mirrors the production refill
-// gate but is NOT the discriminating fix for THIS cell — the SEAL count (producer 1, driven
-// through the real bump helper) is. The 332-byte deletion in the STOCK arm is produced by
-// the REAL copy_data_to_buffer() FREE loop, not by the transcription.
+// The retx REFILL into messages_rx_prev[] is now driven through the PRODUCTION store
+// (store_prev_match_frame): the test seats each resent frame into messages_rx_buffer exactly
+// as receive() would seat a decoded prev-routed DATA_LONG, then calls the same store the
+// receiver calls. The FULL process_messages_rx_data_control() itself is still not callable
+// in-process (its unconditional receive() dereferences audio buffers a default-constructed
+// telecom_system has never allocated), which is why the store is invoked directly — the SAME
+// pattern the test uses for the seal and the deliver. The 332-byte deletion in the STOCK arm
+// is produced by the REAL copy_data_to_buffer() FREE loop over the honest-count-sealed batch.
 //
 // ARMS (all in ONE process; only the fix-env varies so the sole variable is the fix):
 //   stock  (both defeated)  : delivers 5969, deficit 332  — FAIL-BEFORE, reproduced in prod
@@ -5519,28 +5541,34 @@ int cl_arq_controller::test_reseat_span()
 		// --- Step 2: seal via PRODUCTION bump_bsi_and_transfer_prev (FIX a producer 1) ---
 		bump_bsi_and_transfer_prev();   // -> rsp_prev_batch_seq_id=34, expected=d5
 
-		// --- Step 3: retx REFILL of the resent tail into messages_rx_prev[] (transcribed) ---
-		// Corrupt cell: the resent frames are seq2..37 at loc=seq (skew reset); seq0/seq1 were
-		// SACK-suppressed and never resent. Healthy/widen (skew=0): fully present at seal, no
-		// refill. The count bump mirrors the production refill gate (FIX a producer 2): a fresh
-		// slot bumps only when loc < prev_expected (or unconditionally under the fix defeat).
+		// --- Step 3: retx REFILL of the resent tail into messages_rx_prev[] via the PRODUCTION
+		// prev-match store (store_prev_match_frame — the block extracted from
+		// process_messages_rx_data_control). Corrupt cell: the resent frames are seq2..37 at
+		// loc=seq (skew reset); seq0/seq1 were SACK-suppressed and never resent. Healthy/widen
+		// (skew=0): fully present at seal, no refill. Each retx frame is seated into
+		// messages_rx_buffer exactly as receive() would seat a decoded prev-routed DATA_LONG,
+		// then store_prev_match_frame() runs the REAL store bound + D5 re-derivation + FIX-a
+		// producer-2 honest count (loc < prev_expected under the guard; read from the env the
+		// arm already set). No transcription: a regression in the production store now fails here.
+		// (void)pc_defeat — the store reads MERCURY_W_PREVCOUNT_DEFEAT itself.
 		if(skew != 0)
 		{
+			(void)pc_defeat;
+			this->rx_buffer_batch_total_frames = d5;   // the prev batch's wired D5 span (store window)
 			int refill_from = 2;   // seq0/seq1 (loc38/39 gap slots) are not resent
 			for(int seq=refill_from; seq<d5; seq++)
 			{
-				int loc = seq;   // resent tail carries id=seq
-				char prev_status = messages_rx_prev[loc].status;
-				if(prev_status == RECEIVED || prev_status == ACKED) continue;
+				int loc = seq;   // resent tail carries id=seq (skew reset)
 				int L = frame_len(seq, d5);
-				messages_rx_prev[loc].type   = DATA_LONG;
-				messages_rx_prev[loc].id     = (char)(unsigned char)loc;
-				messages_rx_prev[loc].length = L;
-				for(int j=0;j<L;j++) messages_rx_prev[loc].data[j] = (char)(unsigned char)(seq*7 + j);
-				messages_rx_prev[loc].status = RECEIVED;
-				messages_rx_prev[loc].batch_seq_id = 34;
-				bool count_this = pc_defeat ? true : (loc < this->rsp_prev_batch_expected_count);
-				if(count_this) this->rsp_prev_batch_received_count++;
+				messages_rx_buffer.type            = DATA_LONG;
+				messages_rx_buffer.id              = (char)(unsigned char)loc;
+				messages_rx_buffer.length          = L;
+				messages_rx_buffer.status          = RECEIVED;
+				messages_rx_buffer.batch_seq_id    = 34;
+				messages_rx_buffer.sequence_number = (char)(unsigned char)seq;
+				for(int j=0;j<L;j++)
+					messages_rx_buffer.data[j] = (char)(unsigned char)(seq*7 + j);
+				store_prev_match_frame();
 			}
 		}
 
@@ -5620,7 +5648,7 @@ int cl_arq_controller::test_reseat_span()
 		this->rsp_prev_batch_seq_id             = 34;
 		this->rsp_prev_batch_active             = true;
 		this->rsp_prev_batch_expected_count     = 38;
-		this->rsp_prev_batch_received_count     = 38;   // POKE: count dishonestly complete (a HOLE)
+		this->rsp_prev_batch_received_count     = 0;    // store_prev_match_frame bumps to 36 below; then POKE to 38
 		this->rsp_last_delivered_batch_seq_id   = 33;
 		this->rsp_stream_aborted                = false;
 		this->rx_stream_delivered               = 0;
@@ -5629,20 +5657,29 @@ int cl_arq_controller::test_reseat_span()
 		this->rsp_cross_session_seam_armed      = false;
 		this->rsp_rebase_seam_armed             = false;
 		this->rx_batch_total_frames             = -1;
+		this->rx_buffer_batch_total_frames      = 38;   // prev D5 span -> store window for the fills below
 		this->last_received_end_of_batch_seq    = -1;
 		for(int i=0;i<256;i++) rx_stream_stamp[i].valid = false;
 		// prev slots: 0/1 FREE (head hole), 2..37 RECEIVED (bytes), 38/39 FREE (no strand).
+		// Fill 2..37 through the PRODUCTION prev-match store (no transcription) — this bumps
+		// received_count to 36 honestly; the head hole 0/1 stays FREE.
 		for(int i=0;i<this->nMessages;i++) messages_rx_prev[i].status = FREE;
 		for(int seq=2; seq<38; seq++)
 		{
 			int L = frame_len(seq, 38);
-			messages_rx_prev[seq].type   = DATA_LONG;
-			messages_rx_prev[seq].id     = (char)(unsigned char)seq;
-			messages_rx_prev[seq].length = L;
-			for(int j=0;j<L;j++) messages_rx_prev[seq].data[j] = (char)(unsigned char)(seq*7 + j);
-			messages_rx_prev[seq].status = RECEIVED;
-			messages_rx_prev[seq].batch_seq_id = 34;
+			messages_rx_buffer.type            = DATA_LONG;
+			messages_rx_buffer.id              = (char)(unsigned char)seq;
+			messages_rx_buffer.length          = L;
+			messages_rx_buffer.status          = RECEIVED;
+			messages_rx_buffer.batch_seq_id    = 34;
+			messages_rx_buffer.sequence_number = (char)(unsigned char)seq;
+			for(int j=0;j<L;j++)
+				messages_rx_buffer.data[j] = (char)(unsigned char)(seq*7 + j);
+			store_prev_match_frame();
 		}
+		// POKE the count to a DISHONEST complete (38) with slots 0/1 still FREE — the exact
+		// out-of-window over-count the hole detector must catch (unreachable via honest store).
+		this->rsp_prev_batch_received_count     = 38;
 		int before = fifo_bytes();
 		deliver_complete_inflight_before_break();
 		return fifo_bytes() - before;
