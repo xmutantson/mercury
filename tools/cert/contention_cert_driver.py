@@ -1345,7 +1345,12 @@ def run_preflight(args: argparse.Namespace) -> int:
         landmine = {"tool": str(tool), "rc": None, "stdout": "", "stderr": "",
                     "deferred": True}
     else:
-        command = [sys.executable, str(tool), str(spec_path)]
+        # The gate's smoke runs one full contract cell; its timeout must cover
+        # the registered horizon plus connect/warm/teardown, never the tool's
+        # 300 s default (which guillotines an 800 s smoke at rc=124).
+        gate_timeout = float(CONTRACT["seconds"]) + 300.0
+        command = [sys.executable, str(tool), str(spec_path),
+                   "--timeout", str(gate_timeout)]
         completed = subprocess.run(command, text=True, capture_output=True, timeout=3600)
         check("landmine_preflight", completed.returncode == 0,
               f"rc={completed.returncode} command={command}")
