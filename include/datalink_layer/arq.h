@@ -40,6 +40,7 @@
 #include "datalink_layer/b2f_handler.h"
 #include "datalink_layer/rate_optimizer.h"
 #include "datalink_layer/channel_state_lookup.h"
+#include "datalink_layer/l1_tx_journal.h"
 #include "crypto/mercury_crypto.h"
 #include <iomanip>
 #include <thread>
@@ -513,6 +514,18 @@ public:
 	cl_arq_controller();
   ~cl_arq_controller();
 
+  // Default-off L1 transmit ownership. The terminal queue is the explicit
+  // upper owner after teardown; it deliberately survives reset_session_state().
+  mercury::L1TerminalQueue l1_terminal_queue;
+  mercury::L1TxJournal l1_tx_journal;
+  bool l1_stage_batch_before_tx();
+  void l1_mark_batch_sent();
+  void l1_apply_reset_event(mercury::L1ResetEvent event);
+  bool l1_terminalize_queued(const char* reason);
+  int l1_test_timeout_case(const char* marker, int* awaiting_after,
+                           int* queued_after, int* reset_completed);
+  int test_l1_stage2_ownership();
+
 
   void set_nResends(int nResends);
   void set_ack_timeout_control(int ack_timeout_control);
@@ -692,6 +705,8 @@ public:
 	      \return None
 	   */
   void register_ack(int message_id);
+  bool register_acks(const std::vector<int>& message_ids,
+                     bool accept_timed_out = false);
   void pad_messages_batch_tx(int size);
 
   void process_main();

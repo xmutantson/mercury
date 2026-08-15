@@ -4046,6 +4046,7 @@ int main(int argc, char *argv[])
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
     bool test_restage_requeue_orphan_cli = false; // --test-restage-requeue-orphan: §12 re-stage re-queue orphan/reorder
     bool test_stream_offset_cli = false; // --test-stream-offset: Option W FOUNDATION — absolute-byte-stream cursor ground-truth
+    bool test_l1_stage2_ownership_cli = false;
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
                                         // must NOT drop popped bytes when the non-blocking app socket back-pressures.
                                         // FAILS at 62cb3dc (the 61,621-byte stall), PASSES after. One-shot, exits rc.
@@ -4917,6 +4918,12 @@ int main(int argc, char *argv[])
             // source/datalink_layer/test_stream_offset.cc +
             // fact-documents/data-flow-stream-offset.md.
             test_stream_offset_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-l1-stage2-ownership") == 0)
+        {
+            test_l1_stage2_ownership_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7160,6 +7167,12 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_stream_offset();
             printf("[FLAG] stream-offset test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_l1_stage2_ownership_cli) {
+            int rc = ARQ.test_l1_stage2_ownership();
+            printf("[FLAG] L1 stage-2 ownership test complete (rc=%d)\n", rc);
             fflush(stdout);
             exit(rc);
         }

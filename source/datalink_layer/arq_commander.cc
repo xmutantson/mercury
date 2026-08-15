@@ -422,7 +422,34 @@ bool cl_arq_controller::cmd_prev_resack_is_shadow_target(int rx_bsi)
 
 void cl_arq_controller::register_ack(int message_id)
 {
-	if(message_id>=0 && message_id<this->nMessages && messages_tx[message_id].status==PENDING_ACK)
+	register_acks(std::vector<int>(1, message_id));
+}
+
+bool cl_arq_controller::register_acks(const std::vector<int>& message_ids,
+	bool accept_timed_out)
+
+{
+	std::vector<std::pair<uint8_t, uint16_t> > journal_keys;
+	std::vector<int> accepted;
+	for(int message_id : message_ids)
+	{
+		if(message_id<0 || message_id>=this->nMessages) continue;
+		const int status = messages_tx[message_id].status;
+		if(status!=PENDING_ACK &&
+		   !(status==ACK_TIMED_OUT &&
+		     (l1_tx_journal.enabled() || accept_timed_out)))
+			continue;
+		accepted.push_back(message_id);
+		journal_keys.push_back({(uint8_t)messages_tx[message_id].batch_seq_id,
+			(uint8_t)messages_tx[message_id].id});
+	}
+	if(!l1_tx_journal.acknowledge_many(journal_keys))
+	{
+		fprintf(stderr, "[L1-JOURNAL] rejected whole positive ACK (%zu key(s))\n",
+			journal_keys.size());
+		return false;
+	}
+	for(int message_id : accepted)
 	{
 		messages_tx[message_id].status=ACKED;
 		stats.nAcked_data++;
@@ -431,6 +458,7 @@ void cl_arq_controller::register_ack(int message_id)
 	// the delivered raw from fifo_buffer_backup now, before any config-change re-stage
 	// (finalize may be pre-empted by a queued SET_CONFIG / relaxed-mixbatch staging).
 	maybe_backup_confirm_flush();
+	return true;
 }
 
 // Fix C / H#1 (data-flow-fifo-backup.md §6.1). See the arq.h declaration for the full
@@ -1707,6 +1735,7 @@ void cl_arq_controller::process_messages_commander()
 		else
 		{
 			// Timeout — retry BREAK
+			l1_apply_reset_event(mercury::L1ResetEvent::BREAK_RECOVERY_TIMEOUT);
 			emergency_break_retries--;
 			if(emergency_break_retries > 0)
 			{
@@ -6200,20 +6229,31 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// got (sack_bitmap[i] == true). Bytes saved into the retransmit
 				// queue are NOT delivered yet — exclude them.
 				unsigned long long opt_sack_bytes_delivered = 0;
+				std::vector<int> sack_positive_ids;
+				std::vector<bool> sack_just_acked(nMessages, false);
+				for(int i = 0; i < nMessages; i++)
+					if((messages_tx[i].status == PENDING_ACK ||
+					    messages_tx[i].status == ACK_TIMED_OUT) &&
+					   i < data_batch_size && sack_bitmap[i])
+					{
+						sack_positive_ids.push_back(i);
+						sack_just_acked[i] = true;
+					}
+				// Legacy SACK handling accepted ACK_TIMED_OUT frames even with the
+				// journal disabled; preserve that default-path transition exactly.
+				if(!register_acks(sack_positive_ids, true)) return;
 				for(int i = 0; i < nMessages; i++)
 				{
+					if(sack_just_acked[i])
+					{
+						opt_sack_bytes_delivered += (unsigned)messages_tx[i].length;
+						rx_count++;
+						continue;
+					}
 					if(messages_tx[i].status != PENDING_ACK && messages_tx[i].status != ACK_TIMED_OUT)
 						continue;
 
-					if(i < data_batch_size && sack_bitmap[i])
-					{
-						// Frame received by responder — mark ACKED
-						opt_sack_bytes_delivered += (unsigned)messages_tx[i].length;
-						messages_tx[i].status = ACKED;
-						stats.nAcked_data++;
-						rx_count++;
-					}
-					else if(retransmit_count < MAX_RETRANSMIT_HEADROOM)
+					if(retransmit_count < MAX_RETRANSMIT_HEADROOM)
 					{
 						// Frame missing — save encrypted payload for retransmit.
 						//
@@ -6456,14 +6496,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// frame is about to be delivered. Sum lengths BEFORE register_ack
 				// mutates statuses.
 				unsigned long long opt_clean_bytes_delivered = 0;
+				std::vector<int> clean_ack_ids;
 				for(int i=0; i<nMessages; i++)
 				{
 					if(messages_tx[i].status==PENDING_ACK || messages_tx[i].status==ACK_TIMED_OUT)
 					{
 						opt_clean_bytes_delivered += (unsigned)messages_tx[i].length;
-						register_ack(i);
+						clean_ack_ids.push_back(i);
 					}
 				}
+				register_acks(clean_ack_ids);
 				// Record as clean (sack_used=false, failed=false). v2_ack_pat_pre_detected
 				// = 1 means we got here via the MFSK-suffix clean ACK; either way the
 				// batch closed with NO SACK_RSP cycle, so this is the "clean" bucket.
@@ -6560,13 +6602,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					// Guard: start > end under garbage frames wraps unsigned char → infinite loop
 					if(start <= end)
 					{
+						std::vector<int> range_ack_ids;
 						for(int i=start;i<=end;i++)
 						{
 							if(i >= 0 && i < nMessages
 							   && messages_tx[i].status == PENDING_ACK)
 								opt_ldpc_bytes_delivered += (unsigned)messages_tx[i].length;
-							register_ack(i);
+							range_ack_ids.push_back(i);
 						}
+						register_acks(range_ack_ids);
 					}
 					opt_ldpc_ack_fired = true;
 				}
@@ -6588,14 +6632,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					int max_acks = max_data_length + max_header_length - ACK_MULTI_ACK_RANGE_HEADER_LENGTH - 1;
 					if(max_acks < 0) max_acks = 0;
 					if(ack_count > max_acks) ack_count = max_acks;
+					std::vector<int> multi_ack_ids;
 					for(int i=0;i<ack_count;i++)
 					{
 						int msg_id = (unsigned char)messages_rx_buffer.data[i+1];
 						if(msg_id >= 0 && msg_id < nMessages
 						   && messages_tx[msg_id].status == PENDING_ACK)
 							opt_ldpc_bytes_delivered += (unsigned)messages_tx[msg_id].length;
-						register_ack(msg_id);
+						multi_ack_ids.push_back(msg_id);
 					}
+					register_acks(multi_ack_ids);
 					opt_ldpc_ack_fired = true;
 				}
 				messages_rx_buffer.status=FREE;
@@ -6804,7 +6850,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			for(int i=0; i<nMessages; i++)
 			{
 				if(messages_tx[i].status == PENDING_ACK)
+				{
 					messages_tx[i].status = ACK_TIMED_OUT;
+					l1_apply_reset_event(mercury::L1ResetEvent::ACK_TIMEOUT);
+				}
 			}
 			// SACK Design A Step 11 — Axis 3 per-batch tick on full ACK timeout.
 			//
@@ -8882,6 +8931,7 @@ void cl_arq_controller::process_control_commander()
 				this->connection_id=messages_control.data[1];
 				this->assigned_connection_id=messages_control.data[1];
 			}
+			l1_tx_journal.begin_session((uint8_t)this->connection_id);
 		}
 		else if((this->link_status==CONNECTION_ACCEPTED || this->link_status==CONNECTED)
 		        && (messages_control.data[0]==TEST_CONNECTION
@@ -9543,6 +9593,7 @@ void cl_arq_controller::process_control_commander()
 
 			// KEY_ACTIVATE ACKed — encryption is now active on both sides
 			cipher_suite.activate();
+			l1_apply_reset_event(mercury::L1ResetEvent::CRYPTO_REKEY);
 			// AEAD nonce sequence state: fresh per session+direction. First
 			// batch (wire bsi=0) -> index 0. (data-flow-aead-nonce.md §init)
 			tx_nonce_epoch = 0;

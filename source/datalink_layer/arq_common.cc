@@ -807,6 +807,8 @@ static const int RX_MUTE_GUARD_MS = 50;
 
 cl_arq_controller::cl_arq_controller()
 {
+	l1_tx_journal.set_terminal_owner(&l1_terminal_queue);
+	l1_tx_journal.recover_restart_marker();
 	connection_status=IDLE;
 	link_status=IDLE;
 	nMessages=0;
@@ -1592,6 +1594,11 @@ int cl_arq_controller::test_encryption_fail_closed()
 
 cl_arq_controller::~cl_arq_controller()
 {
+	if(l1_tx_journal.enabled())
+	{
+		if(!l1_terminalize_queued("controller-destruction"))
+			std::abort();
+	}
 	if(messages_control_bu.data!=NULL)
 	{
 		delete[] messages_control_bu.data;
@@ -1868,6 +1875,7 @@ void cl_arq_controller::rsp_apply_deferred_batch_shrink()
 // only ever read over [0, retransmit_count), so zeroing the count discards them.
 void cl_arq_controller::clear_retx_queue()
 {
+	l1_apply_reset_event(mercury::L1ResetEvent::QUEUE_FLUSH);
 	if(retransmit_count != 0)
 	{
 		printf("[RETX-CLEAR] dropping %d stale retransmit frame(s) on recovery "
@@ -7340,6 +7348,7 @@ void cl_arq_controller::update_status()
 			   && receiving_timer.get_elapsed_time_ms() < receiving_timeout)
 				continue;
 			messages_tx[i].status=ACK_TIMED_OUT;
+			l1_apply_reset_event(mercury::L1ResetEvent::ACK_TIMEOUT);
 			stats.nNAcked_data++;
 		}
 	}
@@ -9130,6 +9139,11 @@ void cl_arq_controller::abort_b2f_transfer(const char* reason)
 
 void cl_arq_controller::reset_session_state()
 {
+	if(l1_tx_journal.enabled() && !l1_terminalize_queued("session-teardown-cancel"))
+	{
+		fprintf(stderr, "[L1-JOURNAL] terminal owner refused reset transfer; aborting before discard\n");
+		std::abort();
+	}
 	printf("RX-OVERRUN-TOTAL n=%ld\n",
 		telecom_system->data_container.nUnder_processing_events_total.exchange(0));
 	fflush(stdout);
@@ -13113,9 +13127,73 @@ int cl_arq_controller::test_linkphase_shadow()
 }
 // =================== end LINK-PHASE PRIMITIVE (increment 1) ===================
 
+bool cl_arq_controller::l1_stage_batch_before_tx()
+{
+	if(!l1_tx_journal.enabled()) return true;
+	int span = 0;
+	for(int i=0;i<message_batch_counter_tx;i++)
+		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			span++;
+	int batch_index = 0;
+	std::vector<mercury::L1StageItem> items;
+	items.reserve((std::size_t)span);
+	uint8_t transmitted_bsi = 0;
+	for(int i=0;i<message_batch_counter_tx;i++)
+	{
+		if(messages_batch_tx[i].type!=DATA_LONG && messages_batch_tx[i].type!=DATA_SHORT)
+			continue;
+		mercury::L1StageItem item;
+		const uint8_t item_bsi = (uint8_t)messages_batch_tx[i].batch_seq_id;
+		if(!items.empty() && item_bsi != transmitted_bsi) return false;
+		transmitted_bsi = item_bsi;
+		item.slot = (uint8_t)messages_batch_tx[i].id;
+		item.batch_index = (uint16_t)batch_index++;
+		item.span = (uint16_t)span;
+		item.plaintext.assign(messages_batch_tx[i].data,
+			messages_batch_tx[i].data + messages_batch_tx[i].length);
+		item.configuration = current_configuration;
+		items.push_back(std::move(item));
+	}
+	return items.empty() || l1_tx_journal.stage_batch(transmitted_bsi, items);
+}
+
+void cl_arq_controller::l1_mark_batch_sent()
+{
+	if(!l1_tx_journal.enabled()) return;
+	std::vector<std::pair<uint8_t, uint16_t> > keys;
+	for(int i=0;i<message_batch_counter_tx;i++)
+		if(messages_batch_tx[i].type==DATA_LONG || messages_batch_tx[i].type==DATA_SHORT)
+			keys.push_back({(uint8_t)messages_batch_tx[i].batch_seq_id,
+				(uint8_t)messages_batch_tx[i].id});
+	if(!l1_tx_journal.mark_sent_many(keys)) std::abort();
+}
+
+void cl_arq_controller::l1_apply_reset_event(mercury::L1ResetEvent event)
+{
+	l1_tx_journal.apply(event);
+}
+
+bool cl_arq_controller::l1_terminalize_queued(const char* reason)
+{
+	if(!l1_tx_journal.enabled()) return true;
+	const int occupied = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	std::vector<char> queued((std::size_t)(occupied > 0 ? occupied : 0));
+	if(occupied > 0 && fifo_buffer_tx.pop(queued.data(), occupied) != occupied)
+		return false;
+	if(l1_tx_journal.terminalize(reason, queued)) return true;
+	if(occupied > 0 && fifo_buffer_tx.push_front(queued.data(), occupied) != occupied)
+		std::abort();
+	return false;
+}
+
 void cl_arq_controller::send_batch()
 {
 	if(passive_monitor) return;  // Never transmit in monitor mode
+	if(!l1_stage_batch_before_tx())
+	{
+		fprintf(stderr, "[L1-JOURNAL] stage/marker failed; DATA transmission refused\n");
+		return;
+	}
 	// STEPPER-CORE REWRITE Phase b: mark the whole send_batch body as DATA-batch TX so the
 	// outer-stepper TX-wait seams (drain_playback_wait / ptt_busy_wait) QUEUE-and-return
 	// (per-symbol pacing) for the OFDM DATA path ONLY — NOT for the MFSK ACK patterns / control
@@ -13204,6 +13282,7 @@ void cl_arq_controller::send_batch()
 
 		if(g_verbose) { printf("[TX] big-block: waiting for playback buffer to drain...\n"); fflush(stdout); }
 		drain_playback_wait();
+		l1_mark_batch_sent();
 		mtl::log_event("cmd_batch_last_sym_out");
 
 		// Unmute + flush right after playback drain (mirrors the per-frame tail).
@@ -13734,6 +13813,7 @@ void cl_arq_controller::send_batch()
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
 	// wait buffer to be played
 	drain_playback_wait();
+	l1_mark_batch_sent();
 
 	// M1 (SACK turnaround trace): the true "last DATA audio sample left the
 	// sound card" instant — the playback buffer just drained, and this is
@@ -15519,6 +15599,9 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 void cl_arq_controller::send_break_pattern()
 {
 	if(passive_monitor) return;
+	l1_apply_reset_event(l1_tx_journal.recovery_open()
+		? mercury::L1ResetEvent::COLLISION
+		: mercury::L1ResetEvent::LOCAL_BREAK);
 	// STAGE 4c instrument: count BREAK emissions (the --test-inband-no-break harness
 	// reads this to assert BREAK-count==0 on a degradation-demote and ==1 at the
 	// true-loss floor). Observation only — no production behavior depends on it.
@@ -19633,6 +19716,8 @@ void cl_arq_controller::rx_stream_invalidate_stamps()
 
 void cl_arq_controller::restage_requeue_tx_messages()
 {
+	l1_apply_reset_event(mercury::L1ResetEvent::SOFT_RESET);
+	l1_apply_reset_event(mercury::L1ResetEvent::CONFIG_CHANGE);
 	bool defeat = false;
 	{ const char* e = std::getenv("MERCURY_RESTAGE_ORPHAN_DEFEAT");
 	  if(e && *e && atoi(e)!=0) defeat = true; }

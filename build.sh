@@ -399,6 +399,7 @@ CPP_SOURCES="
 source/main.cc
 source/datalink_layer/arq_commander.cc
 source/datalink_layer/arq_common.cc
+source/datalink_layer/l1_tx_journal.cc
 source/datalink_layer/arq_responder.cc
 source/datalink_layer/l1_block_codec.cc
 source/datalink_layer/test_bigblock_arq_unit.cc
@@ -646,6 +647,16 @@ ar rc "${BUILDDIR}/audioio.a" $AUDIO_OBJ_FILES
 # Link
 echo "Linking $OUTPUT..."
 $CXX -o "$OUTPUT" $OBJ_FILES $COMPRESS_OBJ_FILES $CRYPTO_OBJ_FILES "${BUILDDIR}/audioio.a" $LDFLAGS
+
+# The journal contract test has its own main and is intentionally outside the
+# modem link. Run it on every native build so reset-row coverage cannot drift.
+if [ "$PLATFORM" != "windows" ] && [ "${MERCURY_CROSS_BUILD:-0}" != "1" ]; then
+    L1_TEST_BIN="${BUILDDIR}/test_l1_tx_journal"
+    echo "Building and running L1 ownership journal contract test..."
+    $CXX $CXXFLAGS -I./include source/datalink_layer/l1_tx_journal.cc \
+        source/datalink_layer/test_l1_tx_journal.cc -o "$L1_TEST_BIN" -pthread
+    "$L1_TEST_BIN"
+fi
 
 echo "=== Build complete: $OUTPUT ==="
 ls -la "$OUTPUT"

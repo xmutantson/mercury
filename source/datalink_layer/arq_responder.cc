@@ -499,6 +499,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 			break_detected = NO;
 		if(break_detected == YES && break_frame_actionable(link_status))
 		{
+			l1_apply_reset_event(mercury::L1ResetEvent::PEER_BREAK);
 			printf("[BREAK] %s (link_status=%d), dropping to ROBUST_0\n",
 				passive_monitor ? "Observed" : "Responding with ACK", link_status);
 			fflush(stdout);
@@ -4187,6 +4188,7 @@ void cl_arq_controller::process_control_responder()
 				printf("[CRYPTO] KEY_ACTIVATE confirmed — key confirmation matches\n");
 				fflush(stdout);
 				cipher_suite.activate();
+				l1_apply_reset_event(mercury::L1ResetEvent::CRYPTO_REKEY);
 				// AEAD nonce sequence state: fresh per session+direction.
 				// (data-flow-aead-nonce.md §init)
 				tx_nonce_epoch = 0;
