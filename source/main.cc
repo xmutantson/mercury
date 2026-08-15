@@ -4335,7 +4335,7 @@ int main(int argc, char *argv[])
         printf("  --channel-lookup <path>  Load 2D channel-state lookup table (observation only, Phase 2 Step 5).\n");
         printf("  --ptt-delay [ms]  Override PTT on/off delay (0 for no-PTT setups)\n");
         printf("\nModulation and bandwidth:\n");
-        printf("  -s [config]       Modulation: 0-16 (OFDM), 100-102 (ROBUST MFSK). Use -l to list.\n");
+        printf("  -s [config]       Modulation: 0-17 (OFDM), 100-102 (ROBUST MFSK), 105 (LOW48 experiment).\n");
         printf("  -g                Enable adaptive gearshift\n");
         printf("  -R                Enable ROBUST mode (MFSK weak-signal hailing)\n");
         printf("  -M [auto|nb]      Bandwidth: auto (NB hail + WB upgrade) or nb (500 Hz only)\n");
@@ -6520,7 +6520,10 @@ start_modem:
     }
 
 
-    if ((mod_config >= NUMBER_OF_CONFIGS && !is_robust_config(mod_config)) || (mod_config < 0))
+    if ((mod_config >= NUMBER_OF_CONFIGS && !is_robust_config(mod_config)
+			&& !is_low48_anchor_config(mod_config)) || (mod_config < 0)
+			|| (is_low48_anchor_config(mod_config)
+				&& (!explicit_config || operation_mode != BER_PLOT_passband)))
     {
         printf("Wrong modulation config %d\n", mod_config);
         exit(EXIT_FAILURE);

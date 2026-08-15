@@ -3970,9 +3970,15 @@ skip_h_retry_point:
 				// entry" as an ALTERNATIVE sub-peak trigger, scoped to the config whose
 				// grid was thinned so no other rung's behavior changes. This only ever
 				// flags MORE candidates as sub-peaks; a genuine lock (C~1) never trips it.
-				bool thin_pilot_cfg = (current_configuration == CONFIG_16 && M == MOD_32QAM);
+				// Sparse-wide config 105 also has a geometry-scaled mean|H| (only its
+				// ten known columns are MEASURED), so use the raw-pilot coherence
+				// selector there exactly as the thin cfg16 lattice does.  The absolute
+				// 0.5 mean|H| fingerprint is valid only on the dense stock grids.
+				bool thin_pilot_cfg = (current_configuration == CONFIG_16 && M == MOD_32QAM)
+					|| (current_configuration == LOW48_ANCHOR_S20_R6 && M == MOD_QPSK);
 				bool coh_flags_subpeak = thin_pilot_cfg && coh_C >= 0.0 && coh_C < subpeak_coh_entry;
-				if(receive_stats.coarse_metric >= 0.97 && (mean_H < 0.5 || coh_flags_subpeak))
+				if(receive_stats.coarse_metric >= 0.97
+					&& ((!thin_pilot_cfg && mean_H < 0.5) || coh_flags_subpeak))
 				{
 					// F0-RINGDUMP (capture-replay fixture): at the SUBPEAK-REJECT trigger dump the
 					// raw passband ring + wrong-lock metadata for --test-frame0-replay. Faithful by
@@ -7054,6 +7060,15 @@ void cl_telecom_system::init()
 	// exceeds N=1600 refuses startup instead of reaching the mapper with nVirt<0.
 	int pilot_override_target = pilot_override_target_config();
 	bool pilot_override_applied = false;
+
+	// Fixed S20-R6 wire geometry.  This is not an environment-selectable pilot
+	// thinning arm: config 105 alone owns the 40-symbol/20-data-column map.
+	if(current_configuration==LOW48_ANCHOR_S20_R6 && M==MOD_QPSK)
+	{
+		ofdm.Nsymb=40;
+		ofdm.pilot_configurator.sparse_wide_data_carriers=20;
+		pilot_override_applied=true;
+	}
 
 	// ---- BAKED WIRE LEVER (pilot-thin, cfg16 default-ON) ----
 	// The pilot-thin geometry (Dy=5, Nsymb=8) that carried cfg16 to VARA-wire
@@ -12662,9 +12677,17 @@ void cl_telecom_system::load_configuration(int configuration)
 		return;
 	}
 
-	if(configuration<0 || (configuration>=NUMBER_OF_CONFIGS && !is_robust_config(configuration)))
+	if(configuration<0 || (configuration>=NUMBER_OF_CONFIGS
+		&& !is_robust_config(configuration) && !is_low48_anchor_config(configuration)))
 	{
 		return;
+	}
+	if(is_low48_anchor_config(configuration) && narrowband_enabled == YES)
+	{
+		fprintf(stderr, "[LOW48-GUARD] config %d is a fixed 50-carrier WB geometry; NB is unsupported\n",
+			configuration);
+		fflush(stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	// NB mode: clamp OFDM configs to CONFIG_6 max (QPSK/QAM need more pilots than Nc=10 provides)
@@ -12851,6 +12874,16 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
+	else if(configuration==LOW48_ANCHOR_S20_R6)
+	{
+		// Design vehicle S20-R6: 20 sparse-wide QPSK data carriers, rate 6/16,
+		// 40 data symbols, four full preamble symbols.  The fixed carrier map is
+		// installed by cl_pilot_configurator::configure().
+		_modulation=MOD_QPSK;
+		_ldpc_rate=6/16.0;
+		ofdm_preamble_configurator_Nsymb=4;
+		ofdm_channel_estimator=LEAST_SQUARE;
+	}
 	else if(configuration==ROBUST_0)
 	{
 		_modulation=MOD_MFSK;
@@ -12889,9 +12922,12 @@ void cl_telecom_system::load_configuration(int configuration)
 		int selected_Nc = mfsk_selected_Nc(narrowband_enabled == YES);
 		if(!cl_mfsk::valid_geometry(selected_M, selected_Nc, selected_nStreams))
 		{
-			fprintf(stderr, "[PHY] Refusing config %d: invalid MFSK geometry M=%d Nc=%d nStreams=%d\n",
-				configuration, selected_M, selected_Nc, selected_nStreams);
-			return;
+			// Monitor validates the geometry before cl_mfsk::init(); keep that
+			// earlier stop while preserving the directed guard's fail-closed result.
+			fprintf(stderr, "[MFSK-GUARD] rejecting M=%d nStreams=%d Nc=%d (requires M*nStreams<=Nc)\n",
+				selected_M, selected_nStreams, selected_Nc);
+			fflush(stderr);
+			exit(EXIT_FAILURE);
 		}
 	}
 
@@ -12930,6 +12966,19 @@ void cl_telecom_system::load_configuration(int configuration)
 		reinit_subsystems.telecom_system=YES;
 		reinit_subsystems.data_container=YES;
 		reinit_subsystems.ofdm=YES;
+	}
+	// The anchor grid changes data/pilot/zero roles independently of modulation
+	// and code rate (it shares both with CONFIG_8), so entering or leaving it
+	// must rebuild every geometry owner.
+	if(current_configuration != configuration
+		&& (is_low48_anchor_config(current_configuration)
+			|| is_low48_anchor_config(configuration)))
+	{
+		reinit_subsystems.telecom_system=YES;
+		reinit_subsystems.data_container=YES;
+		reinit_subsystems.ofdm=YES;
+		reinit_subsystems.psk=YES;
+		reinit_subsystems.pre_equalization_channel=YES;
 	}
 
 	if(current_configuration==CONFIG_NONE)
@@ -13116,6 +13165,14 @@ void cl_telecom_system::load_configuration(int configuration)
 	ofdm.pilot_configurator.boost=default_configurations_telecom_system.ofdm_pilot_configurator_pilot_boost;
 	ofdm.pilot_configurator.seed=default_configurations_telecom_system.ofdm_pilot_configurator_seed;
 	ofdm.pilot_configurator.pilot_density=default_configurations_telecom_system.ofdm_pilot_density;
+	ofdm.pilot_configurator.sparse_wide_data_carriers =
+		is_low48_anchor_config(current_configuration) ? 20 : 0;
+	// The independent rate budget is explicitly on the production 3.0 ms guard
+	// interval (Ngi=36 at 12 kHz).  PLOT_PASSBAND otherwise retains the older
+	// constructor default of 4.5 ms, so pin the experiment to its specified wire
+	// geometry here rather than silently measuring a different frame duration.
+	if(is_low48_anchor_config(current_configuration))
+		ofdm.gi = 36.0 / (double)ofdm.Nfft;
 
 	// CONFIG_17 keeps the process-wide guard interval. The persistent PRECOOK capture ring and
 	// every bundle use one Nofdm symbol stride for the entire process; a cfg17-only 27/Nfft GI

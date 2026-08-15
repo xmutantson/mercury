@@ -1172,6 +1172,7 @@ cl_pilot_configurator::cl_pilot_configurator()
 	seed=0;
 	print_on=NO;
 	pilot_density=HIGH_DENSITY;
+	sparse_wide_data_carriers=0;
 }
 
 cl_pilot_configurator::~cl_pilot_configurator()
@@ -1249,6 +1250,82 @@ void cl_pilot_configurator::deinit()
 
 void cl_pilot_configurator::configure()
 {
+	// LOW48 S20-R6 fixed sparse-wide grid.  Twenty QPSK data columns are
+	// distributed from carrier 0 through 49 by nearest-integer interpolation.
+	// Ten continual pilot columns are distributed over the complementary set;
+	// the remaining twenty columns are zero.  Holding the column roles for all
+	// 40 symbols gives exactly 800 data cells (1600 coded QPSK bits) while keeping
+	// data, pilot, and zero sets disjoint and TX/RX symmetric.
+	if(sparse_wide_data_carriers > 0)
+	{
+		const int nDataColumns = sparse_wide_data_carriers;
+		const int nPilotColumns = nDataColumns / 2;
+		if(Nc != 50 || Nsymb != 40 || nDataColumns != 20 || nPilotColumns != 10)
+		{
+			fprintf(stderr, "[LOW48-GUARD] invalid sparse geometry Nc=%d Nsymb=%d dataCols=%d pilotCols=%d\n",
+				Nc, Nsymb, nDataColumns, nPilotColumns);
+			fflush(stderr);
+			exit(EXIT_FAILURE);
+		}
+
+		std::vector<char> data_column((size_t)Nc, 0);
+		std::vector<char> pilot_column((size_t)Nc, 0);
+		std::vector<int> complement;
+		for(int k=0; k<nDataColumns; k++)
+		{
+			const int col = (k*(Nc-1) + (nDataColumns-1)/2) / (nDataColumns-1);
+			if(col < 0 || col >= Nc || data_column[(size_t)col])
+			{
+				fprintf(stderr, "[LOW48-GUARD] duplicate/out-of-range data carrier %d\n", col);
+				exit(EXIT_FAILURE);
+			}
+			data_column[(size_t)col] = 1;
+		}
+		for(int col=0; col<Nc; col++)
+			if(!data_column[(size_t)col]) complement.push_back(col);
+		for(int k=0; k<nPilotColumns; k++)
+		{
+			const int ci = (k*((int)complement.size()-1) + (nPilotColumns-1)/2) / (nPilotColumns-1);
+			const int col = complement[(size_t)ci];
+			if(col < 0 || col >= Nc || data_column[(size_t)col] || pilot_column[(size_t)col])
+			{
+				fprintf(stderr, "[LOW48-GUARD] overlapping/out-of-range pilot carrier %d\n", col);
+				exit(EXIT_FAILURE);
+			}
+			pilot_column[(size_t)col] = 1;
+		}
+
+		nData=0;
+		nPilots=0;
+		nConfig=0;
+		for(int row=0; row<Nsymb; row++)
+		{
+			for(int col=0; col<Nc; col++)
+			{
+				int type = ZERO;
+				if(data_column[(size_t)col]) type = DATA;
+				else if(pilot_column[(size_t)col]) type = PILOT;
+				(virtual_carrier+row*Nc_max+col)->type=type;
+				(carrier+row*Nc+col)->type=type;
+				if(type==DATA) nData++;
+				else if(type==PILOT) nPilots++;
+			}
+		}
+		if(nData != 800 || nPilots != 400)
+		{
+			fprintf(stderr, "[LOW48-GUARD] cell-count mismatch data=%d pilots=%d\n", nData, nPilots);
+			exit(EXIT_FAILURE);
+		}
+		printf("[LOW48-GEOMETRY] dataCols=");
+		for(int col=0; col<Nc; col++) if(data_column[(size_t)col]) printf("%s%d", col?",":"", col);
+		printf(" pilotCols=");
+		bool first=true;
+		for(int col=0; col<Nc; col++) if(pilot_column[(size_t)col]) { printf("%s%d", first?"":",", col); first=false; }
+		printf(" nData=%d nPilots=%d nZero=%d\n", nData, nPilots, Nc*Nsymb-nData-nPilots);
+		fflush(stdout);
+		return;
+	}
+
 	int x=0;
 	int y=0;
 
@@ -2035,27 +2112,71 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 	// have not run yet). See ofdm.h last_pilot_coherence.
 	compute_pilot_coherence();
 
-	for(int j=0;j<Nc;j++)
+	if(pilot_configurator.sparse_wide_data_carriers > 0)
 	{
-		if(j%this->pilot_configurator.Dx==0)
+		// The S20 grid uses continual pilot COLUMNS rather than the production
+		// diagonal Dx/Dy lattice.  Interpolate in frequency between the measured
+		// pilot columns on every row and hold the two band edges.  The generic
+		// Dx=1 code below assumes every column contains time pilots and therefore
+		// cannot fill an all-data/all-zero column.
+		for(int row=0; row<Nsymb; row++)
 		{
-			interpolate_linear_col(estimated_channel,Nc,Nsymb,j);
-		}
-		else if(j==Nc-1)
-		{
-			interpolate_linear_col(estimated_channel,Nc,Nsymb,j);
+			int first=-1, last=-1;
+			for(int col=0; col<Nc; col++)
+				if((estimated_channel+row*Nc+col)->status==MEASURED)
+				{ if(first<0) first=col; last=col; }
+			if(first < 0)
+			{
+				fprintf(stderr, "[LOW48-GUARD] estimator row %d has no pilot anchor\n", row);
+				exit(EXIT_FAILURE);
+			}
+			for(int col=0; col<first; col++)
+				(estimated_channel+row*Nc+col)->value=(estimated_channel+row*Nc+first)->value;
+			for(int col=last+1; col<Nc; col++)
+				(estimated_channel+row*Nc+col)->value=(estimated_channel+row*Nc+last)->value;
+			int previous=first;
+			for(int col=first+1; col<=last; col++)
+			{
+				if((estimated_channel+row*Nc+col)->status==MEASURED)
+				{
+					std::complex<double> h0=(estimated_channel+row*Nc+previous)->value;
+					std::complex<double> h1=(estimated_channel+row*Nc+col)->value;
+					for(int fill=previous+1; fill<col; fill++)
+					{
+						double t=(double)(fill-previous)/(double)(col-previous);
+						(estimated_channel+row*Nc+fill)->value=h0*(1.0-t)+h1*t;
+					}
+					previous=col;
+				}
+			}
+			for(int col=0; col<Nc; col++)
+				(estimated_channel+row*Nc+col)->status=MEASURED;
 		}
 	}
-
-	for(int j=0;j<Nc;j+=this->pilot_configurator.Dx)
+	else
 	{
-		if(j+this->pilot_configurator.Dx<Nc)
+		for(int j=0;j<Nc;j++)
 		{
-			interpolate_bilinear_matrix(estimated_channel,Nc,Nsymb,j,j+this->pilot_configurator.Dx,0,Nsymb-1);
+			if(j%this->pilot_configurator.Dx==0)
+			{
+				interpolate_linear_col(estimated_channel,Nc,Nsymb,j);
+			}
+			else if(j==Nc-1)
+			{
+				interpolate_linear_col(estimated_channel,Nc,Nsymb,j);
+			}
 		}
-		else if(j!=Nc-1)
+
+		for(int j=0;j<Nc;j+=this->pilot_configurator.Dx)
 		{
-			interpolate_bilinear_matrix(estimated_channel,Nc,Nsymb,j,Nc-1,0,Nsymb-1);
+			if(j+this->pilot_configurator.Dx<Nc)
+			{
+				interpolate_bilinear_matrix(estimated_channel,Nc,Nsymb,j,j+this->pilot_configurator.Dx,0,Nsymb-1);
+			}
+			else if(j!=Nc-1)
+			{
+				interpolate_bilinear_matrix(estimated_channel,Nc,Nsymb,j,Nc-1,0,Nsymb-1);
+			}
 		}
 	}
 

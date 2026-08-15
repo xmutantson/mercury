@@ -214,6 +214,7 @@ void cl_pilot_configurator::copy_from(const cl_pilot_configurator& s)
 	boost         = s.boost;
 	print_on      = s.print_on;
 	pilot_density = s.pilot_density;
+	sparse_wide_data_carriers = s.sparse_wide_data_carriers;
 	start_shift   = s.start_shift;
 
 	// ★ L1: do NOT copy s.carrier (a back-pointer into the src's ofdm_frame).
@@ -503,6 +504,7 @@ const char* cl_pilot_configurator::precook_deep_equal(const cl_pilot_configurato
 {
 	if(Nc_max != o.Nc_max)   return "pilot.Nc_max";
 	if(nPilots != o.nPilots) return "pilot.nPilots";
+	if(sparse_wide_data_carriers != o.sparse_wide_data_carriers) return "pilot.sparse_wide_data_carriers";
 	if((virtual_carrier == NULL) != (o.virtual_carrier == NULL)) return "pilot.virtual_carrier(null-mismatch)";
 	if(virtual_carrier != NULL && Nc_max > 0)
 		if(memcmp(virtual_carrier, o.virtual_carrier, sizeof(struct st_carrier) * (size_t)Nc_max * (size_t)Nc_max) != 0)

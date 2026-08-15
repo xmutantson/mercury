@@ -94,6 +94,18 @@ cl_mfsk::~cl_mfsk()
 
 void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 {
+	// Each stream owns M contiguous bins.  Reject an overfull geometry before
+	// publishing offsets or allowing modulation/demodulation to index the carrier
+	// arrays.  Monitor already rejects incomplete/nonpositive geometry below;
+	// finalized positive-Nc calls take the directed fail-closed path required here.
+	if(_Nc > 0 && !valid_geometry(_M, _Nc, _nStreams))
+	{
+		fprintf(stderr, "[MFSK-GUARD] rejecting M=%d nStreams=%d Nc=%d (requires M*nStreams<=Nc)\n",
+			_M, _nStreams, _Nc);
+		fflush(stderr);
+		exit(EXIT_FAILURE);
+	}
+
 	if (!valid_geometry(_M, _Nc, _nStreams))
 	{
 		fprintf(stderr, "[PHY] Refusing invalid MFSK geometry: M=%d Nc=%d nStreams=%d\n",

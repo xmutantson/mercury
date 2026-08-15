@@ -100,6 +100,7 @@ tools/*.sh
 !tools/compression_test.py
 !tools/dual_benchmark.py
 !tools/encryption_test.py
+!tools/test_low48_anchor.py
 !tools/generate_ldpc_10_16.py
 !tools/generate_ldpc_12_16.py
 !tools/mercury_benchmark.py

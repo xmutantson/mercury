@@ -75,6 +75,10 @@ public:
 	struct st_carrier* carrier;
 	int print_on;
 	int pilot_density;
+	// Default 0 selects the production lattice.  The explicit low48 lane sets
+	// this to 20 and receives a deterministic, disjoint 20-data/10-pilot sparse
+	// wide grid; it is a fixed wire geometry, not an environment override.
+	int sparse_wide_data_carriers;
 
 private:
 	struct st_carrier* virtual_carrier;

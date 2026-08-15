@@ -178,7 +178,15 @@ extern int g_verbose;
 #define ROBUST_1 101  // 16-MFSK x2, LDPC rate 1/16, ~22 bps
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
 
+// Honest-4.8 dB anchor experiment.  This deliberately lives outside both the
+// production OFDM numbering and FULL_CONFIG_LADDER: it is reachable only when
+// a caller explicitly selects `-s 105`.  No gearshift/capability table may
+// advertise or elect it until the same-build BER experiment is complete.
+// IDs 103 and 104 are reserved by earlier experimental lanes.
+#define LOW48_ANCHOR_S20_R6 105
+
 inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
+inline bool is_low48_anchor_config(int config) { return config == LOW48_ANCHOR_S20_R6; }
 // is_ofdm_config: TRUE for every OFDM rung, INCLUDING the top-gear CONFIG_17 (64-QAM).
 // cfg17 IS an OFDM config semantically (MOD_64QAM, LDPC, pilots) and MUST report OFDM so
 // the ~144 gearshift/anchor/demote consumers treat a LIVE cfg17 as the OFDM top rung (not
@@ -187,7 +195,9 @@ inline bool is_robust_config(int config) { return config >= 100 && config <= 102
 // CONFIG_16, get_configuration caps at 16, config_ladder_up cannot step to it), so for every
 // config ≤16 this returns exactly as before and is_ofdm_config(17) is only ever evaluated
 // once the election has made cfg17 live. See topgear-stack-productionize.md §2. (was ≤16)
-inline bool is_ofdm_config(int config) { return config >= 0 && config <= 17; }
+inline bool is_ofdm_config(int config) {
+	return (config >= 0 && config <= 17) || is_low48_anchor_config(config);
+}
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor
 // for the PRODUCTION enhanced CONNECT suffix at the robust tier. R=4 is the §20
@@ -1160,6 +1170,7 @@ inline const char* config_to_string(int config) {
 		case ROBUST_0: return "ROBUST 0 (32-MFSK, ~14 bps)";
 		case ROBUST_1: return "ROBUST 1 (16-MFSK x2, ~22 bps)";
 		case ROBUST_2: return "ROBUST 2 (16-MFSK x2, ~87 bps)";
+		case LOW48_ANCHOR_S20_R6: return "LOW48 S20-R6 (sparse-wide QPSK 6/16, ~545 bps)";
 		case CONFIG_0:  return "CONFIG 0 (BPSK 1/16, ~84 bps)";
 		case CONFIG_1:  return "CONFIG 1 (BPSK 2/16, ~185 bps)";
 		case CONFIG_2:  return "CONFIG 2 (BPSK 3/16, ~285 bps)";
@@ -1202,6 +1213,7 @@ inline const char* config_to_short_string(int config) {
 		case ROBUST_0: return "ROBUST 0";
 		case ROBUST_1: return "ROBUST 1";
 		case ROBUST_2: return "ROBUST 2";
+		case LOW48_ANCHOR_S20_R6: return "LOW48 S20-R6";
 		case CONFIG_0:  return "CFG 0 BPSK";
 		case CONFIG_1:  return "CFG 1 BPSK";
 		case CONFIG_2:  return "CFG 2 BPSK";
