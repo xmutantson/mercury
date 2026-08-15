@@ -68,11 +68,44 @@ CRYPTO_TX_RE = re.compile(r"\[CRYPTO-TX\] Encrypting \d+ bytes, wire_bsi=\d+ ind
 CRYPTO_RX_OK_RE = re.compile(r"\[CRYPTO-RX\] Decrypted: \d+ -> \d+ bytes OK")
 # Durable cross signal: an RSP-side WB-OFDM DATA frame decoded (batch or arq path).
 RXDATA_RE = re.compile(r"\[RX-BATCH-SEQ\]\s+type=DATA|\[RX-DATA\]\s+type=")
+RX_OVERRUN_MARKER = "RX-OVERRUN-TOTAL"
+RX_OVERRUN_RE = re.compile(r"RX-OVERRUN-TOTAL n=(\d+)$")
 
 
 def is_wb_config(cfg):
     # WB OFDM = ids 0..16; ROBUST MFSK = 100/101/102 (common_defines.h:122-155).
     return cfg is not None and 0 <= cfg <= 16
+
+
+def parse_rx_overrun_segments(lines):
+    """Return every per-session RX overrun total in one merged cell log.
+
+    reset_session_state() exchanges the modem counter back to zero, so a cell
+    that reconnects can emit several segments.  A line containing the marker
+    but not the production format is rejected instead of being misreported as
+    an absent metric.
+    """
+    segments = []
+    for lineno, line in enumerate(lines, 1):
+        text = line.rstrip("\r\n")
+        if RX_OVERRUN_MARKER not in text:
+            continue
+        match = RX_OVERRUN_RE.search(text)
+        if match is None:
+            raise ValueError(
+                f"malformed {RX_OVERRUN_MARKER} line {lineno}: {text!r}")
+        segments.append(int(match.group(1)))
+    return segments
+
+
+def parse_rx_overrun_metrics(lines):
+    segments = parse_rx_overrun_segments(lines)
+    return (sum(segments) if segments else None), segments
+
+
+def read_rx_overrun_metrics(logpath):
+    with open(logpath, "r", encoding="utf-8", errors="replace") as logfile:
+        return parse_rx_overrun_metrics(logfile)
 
 
 class State:
@@ -457,6 +490,17 @@ def main():
         logfile.close()
 
     dwell = max(1.0, time.time() - t0)
+    try:
+        rx_overrun_total, rx_overrun_segments = read_rx_overrun_metrics(logpath)
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"[harness] FATAL: RX overrun metric rejected: {e}\n")
+        sys.stderr.flush()
+        return 2
+    if rx_overrun_total is None:
+        sys.stderr.write(
+            f"[harness] INVALID METRIC: no {RX_OVERRUN_MARKER} lines in "
+            f"{logpath}; rx_overrun_total=null\n")
+        sys.stderr.flush()
     configs_sorted = sorted(st.configs_seen)
     rsp_configs_sorted = sorted(st.rsp_configs_seen)
     cmd_configs_sorted = sorted(st.cmd_configs_seen)
@@ -495,6 +539,8 @@ def main():
         "rsp_nreceived_frames": st.rsp_nreceived,
         "cmd_nreceived_frames": st.cmd_nreceived,
         "breaks": st.breaks,
+        "rx_overrun_total": rx_overrun_total,
+        "rx_overrun_segments": rx_overrun_segments,
         "encrypt": args.encrypt,
         "enc_activated": st.enc_activated,
         "aead_authfails": st.authfails,
