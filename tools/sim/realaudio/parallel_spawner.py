@@ -53,7 +53,7 @@ def card_name(idx):
     return "Loopback" if idx == 0 else f"Loopback_{idx}"
 
 
-def run_plan(n, port_base, card_base=0, tag_prefix="par"):
+def run_plan(n, port_base, card_base=0, tag_prefix="par", seed_offset=0):
     """Return list of per-run dicts: card, subs, rsp_port, cmd_port, seed, tag.
 
     card_base offsets the starting snd-aloop card index so multiple concurrent
@@ -74,9 +74,104 @@ def run_plan(n, port_base, card_base=0, tag_prefix="par"):
             "subs": subs,
             "rsp_port": rsp_port,
             "cmd_port": cmd_port,
-            "seed": i + 1,                 # deterministic per-run seed = run index+1
+            "seed": i + 1 + seed_offset,   # deterministic, shiftable multi-wave seed
             "tag": f"{tag_prefix}{i:02d}",
         })
+    return plan
+
+
+def parse_spawn_plan(raw, expected_n=None):
+    """Validate the explicit per-cell plan interface used by wave drivers.
+
+    Each row names its card (or card_idx), slot/substreams, two control ports,
+    tag, and seed. The normalized shape is the same as ``run_plan`` so cleanup
+    and launch consume injected and generated plans identically.
+    """
+    try:
+        rows = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"--spawn-plan is not valid JSON: {exc}") from exc
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("--spawn-plan must be a non-empty JSON list")
+    if expected_n is not None and len(rows) != expected_n:
+        raise ValueError(
+            f"--spawn-plan has {len(rows)} cells but --n is {expected_n}")
+
+    plan = []
+    for index, source in enumerate(rows):
+        if not isinstance(source, dict):
+            raise ValueError(f"--spawn-plan cell {index} must be an object")
+        row = dict(source)
+        card_idx = row.get("card_idx")
+        if card_idx is not None:
+            card_idx = int(card_idx)
+        card = row.get("card")
+        if card is None:
+            if card_idx is None:
+                raise ValueError(
+                    f"--spawn-plan cell {index} needs card or card_idx")
+            card = card_name(card_idx)
+
+        slot = row.get("slot")
+        subs = row.get("subs")
+        if subs is None:
+            if slot is None:
+                raise ValueError(
+                    f"--spawn-plan cell {index} needs slot or subs")
+            slot = int(slot)
+            if slot not in (0, 1):
+                raise ValueError(
+                    f"--spawn-plan cell {index} slot must be 0 or 1")
+            subs = [slot * 4 + offset for offset in range(4)]
+        else:
+            if (not isinstance(subs, list) or len(subs) != 4
+                    or any(not isinstance(value, int) for value in subs)):
+                raise ValueError(
+                    f"--spawn-plan cell {index} subs must be four integers")
+            if slot is None:
+                slot = subs[0] // 4
+            slot = int(slot)
+            if slot not in (0, 1):
+                raise ValueError(
+                    f"--spawn-plan cell {index} slot must be 0 or 1")
+            expected_subs = [slot * 4 + offset for offset in range(4)]
+            if subs != expected_subs:
+                raise ValueError(
+                    f"--spawn-plan cell {index} subs do not match slot {slot}: "
+                    f"expected {expected_subs}")
+
+        try:
+            rsp_port = int(row["rsp_port"])
+            cmd_port = int(row["cmd_port"])
+            seed = int(row["seed"])
+            tag = str(row["tag"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--spawn-plan cell {index} needs integer rsp_port/cmd_port/seed "
+                "and a tag") from exc
+        if not tag:
+            raise ValueError(f"--spawn-plan cell {index} tag must not be empty")
+        plan.append({
+            "idx": int(row.get("idx", index)),
+            "card": str(card),
+            "card_idx": card_idx,
+            "slot": int(slot),
+            "subs": list(subs),
+            "rsp_port": rsp_port,
+            "cmd_port": cmd_port,
+            "seed": seed,
+            "tag": tag,
+        })
+
+    def unique(name, values):
+        if len(values) != len(set(values)):
+            raise ValueError(f"--spawn-plan contains duplicate {name}")
+
+    unique("tags", [row["tag"] for row in plan])
+    unique("ports", [port for row in plan
+                     for port in (row["rsp_port"], row["cmd_port"])])
+    unique("card/substream allocations", [
+        (row["card"], sub) for row in plan for sub in row["subs"]])
     return plan
 
 
@@ -92,18 +187,81 @@ def print_setup(n):
     print("cat /proc/asound/cards")
 
 
-def main():
+def build_cell_command(args, cell, json_path):
+    """Build one child argv; legacy defaults reproduce the committed argv."""
+    cmd = [sys.executable, "-u", HARNESS,
+           "--bin", args.bin, "--bridge", args.bridge,
+           "--tag", cell["tag"], "--json", json_path,
+           "--logdir", args.logdir,
+           "--start-cfg", str(args.start_cfg),
+           "--secs", str(args.secs), "--payload", str(args.payload),
+           "--seed", str(cell["seed"]),
+           "--card", cell["card"],
+           "--subs", ",".join(str(sub) for sub in cell["subs"]),
+           "--rsp-port", str(cell["rsp_port"]),
+           "--cmd-port", str(cell["cmd_port"]),
+           "--cap-periods", str(args.cap_periods),
+           "--play-periods", str(args.play_periods),
+           "--prime-periods", str(args.prime_periods),
+           "--no-kill"]
+    if args.no_gearshift:
+        cmd += ["--no-gearshift"]
+    if args.score_horizon_s is not None:
+        cmd += ["--score-horizon-s", str(args.score_horizon_s)]
+    if args.warm_start:
+        cmd += ["--warm-start"]
+    if args.traffic != "legacy":
+        cmd += ["--traffic", args.traffic]
+    if args.snr is not None:
+        cmd += ["--snr", str(args.snr)]
+    if args.snr3k is not None:
+        cmd += ["--snr3k", str(args.snr3k)]
+    if args.passthrough:
+        cmd += ["--passthrough"]
+    if args.cell:
+        cmd += ["--cell", args.cell]
+    if args.profile:
+        cmd += ["--profile", args.profile]
+    if args.cfo_hz:
+        cmd += ["--cfo-hz", str(args.cfo_hz)]
+    if args.phase_noise_deg:
+        cmd += ["--phase-noise-deg", str(args.phase_noise_deg)]
+    if args.fade_depth_db:
+        cmd += ["--fade-depth-db", str(args.fade_depth_db)]
+    if args.encrypt:
+        cmd += ["--encrypt", args.encrypt]
+    if args.psk:
+        cmd += ["--psk", args.psk]
+    if args.arm:
+        cmd += ["--arm", args.arm]
+    for item in args.env:
+        cmd += ["--env", item]
+    return cmd
+
+
+def build_arg_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=12)
     ap.add_argument("--bin", default="/home/kameron/raspeed/mercury")
     ap.add_argument("--bridge", default=os.path.join(HERE, "realaudio_bridge_s32.py"))
     ap.add_argument("--secs", type=int, default=130)
     ap.add_argument("--payload", type=int, default=512)
+    ap.add_argument("--score-horizon-s", type=float, default=None,
+                    help="fixed child observation/score horizon independent of --secs")
+    ap.add_argument("--warm-start", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="gate every child on PRECOOK+Idle readiness before CONNECT")
     ap.add_argument("--start-cfg", type=int, default=100)
     ap.add_argument("--no-gearshift", action="store_true")
     ap.add_argument("--passthrough", action="store_true")
     ap.add_argument("--cell", default=None)
     ap.add_argument("--profile", default="wgn")
+    ap.add_argument("--snr", type=float, default=None,
+                    help="channel WGN dial forwarded independently to each child")
+    ap.add_argument("--snr3k", type=float, default=None,
+                    help="requested SNR3k coordinate forwarded independently")
+    ap.add_argument("--traffic", choices=["legacy", "random-binary"],
+                    default="legacy")
     ap.add_argument("--cfo-hz", type=float, default=0.0)
     ap.add_argument("--phase-noise-deg", type=float, default=0.0)
     ap.add_argument("--fade-depth-db", type=float, default=0.0)
@@ -115,6 +273,10 @@ def main():
                     help="starting snd-aloop card index (disjoint cohorts use disjoint bases)")
     ap.add_argument("--tag-prefix", default="par",
                     help="prefix for per-cell tag/result filenames (unique per cohort)")
+    ap.add_argument("--seed-offset", type=int, default=0,
+                    help="add to generated per-cell seeds for multi-wave runs")
+    ap.add_argument("--spawn-plan", default=None,
+                    help="explicit JSON per-cell card/slot/ports/tag/seed plan")
     ap.add_argument("--logdir", default="/tmp/raspeed/logs")
     ap.add_argument("--out", default="/tmp/raspeed/PARALLEL_RESULT.json")
     ap.add_argument("--launch-stagger", type=float, default=0.0,
@@ -128,14 +290,40 @@ def main():
                     help="KEY=VAL env injected into BOTH mercury per cell (repeatable)")
     ap.add_argument("--print-setup", action="store_true",
                     help="print the modprobe command to provision snd-aloop and exit")
-    args = ap.parse_args()
+    ap.add_argument("--dry-run", action="store_true",
+                    help="validate argparse/plan and print child commands without launching")
+    return ap
+
+
+def main(argv=None):
+    ap = build_arg_parser()
+    args = ap.parse_args(argv)
+    if args.score_horizon_s is not None and args.score_horizon_s <= 0:
+        ap.error("--score-horizon-s must be positive")
+    if args.spawn_plan and args.seed_offset:
+        ap.error("--seed-offset cannot be combined with explicit --spawn-plan seeds")
 
     if args.print_setup:
         print_setup(args.n)
         return 0
 
+    try:
+        plan = (parse_spawn_plan(args.spawn_plan, args.n)
+                if args.spawn_plan else run_plan(
+                    args.n, args.port_base, args.card_base, args.tag_prefix,
+                    seed_offset=args.seed_offset))
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    if args.dry_run:
+        commands = []
+        for cell in plan:
+            jpath = os.path.join(args.logdir, f"res_{cell['tag']}.json")
+            commands.append(build_cell_command(args, cell, jpath))
+        print(json.dumps({"plan": plan, "commands": commands}, indent=1))
+        return 0
+
     os.makedirs(args.logdir, exist_ok=True)
-    plan = run_plan(args.n, args.port_base, args.card_base, args.tag_prefix)
 
     # CONCURRENCY-SAFE cohort cleanup: clear ONLY stale leftovers for the
     # cells THIS spawner is about to launch (its own plan: each cell's card +
@@ -149,40 +337,7 @@ def main():
     cohort_t0 = time.time()
     for p in plan:
         jpath = os.path.join(args.logdir, f"res_{p['tag']}.json")
-        cmd = [sys.executable, "-u", HARNESS,
-               "--bin", args.bin, "--bridge", args.bridge,
-               "--tag", p["tag"], "--json", jpath, "--logdir", args.logdir,
-               "--start-cfg", str(args.start_cfg),
-               "--secs", str(args.secs), "--payload", str(args.payload),
-               "--seed", str(p["seed"]),
-               "--card", p["card"], "--subs", ",".join(str(s) for s in p["subs"]),
-               "--rsp-port", str(p["rsp_port"]), "--cmd-port", str(p["cmd_port"]),
-               "--cap-periods", str(args.cap_periods),
-               "--play-periods", str(args.play_periods),
-               "--prime-periods", str(args.prime_periods),
-               "--no-kill"]
-        if args.no_gearshift:
-            cmd += ["--no-gearshift"]
-        if args.passthrough:
-            cmd += ["--passthrough"]
-        if args.cell:
-            cmd += ["--cell", args.cell]
-        if args.profile:
-            cmd += ["--profile", args.profile]
-        if args.cfo_hz:
-            cmd += ["--cfo-hz", str(args.cfo_hz)]
-        if args.phase_noise_deg:
-            cmd += ["--phase-noise-deg", str(args.phase_noise_deg)]
-        if args.fade_depth_db:
-            cmd += ["--fade-depth-db", str(args.fade_depth_db)]
-        if args.encrypt:
-            cmd += ["--encrypt", args.encrypt]
-        if args.psk:
-            cmd += ["--psk", args.psk]
-        if args.arm:
-            cmd += ["--arm", args.arm]
-        for kv in args.env:
-            cmd += ["--env", kv]
+        cmd = build_cell_command(args, p, jpath)
         outlog = open(os.path.join(args.logdir, f"spawn_{p['tag']}.out"), "wb")
         proc = subprocess.Popen(cmd, stdout=outlog, stderr=subprocess.STDOUT)
         procs.append((p, proc, jpath, outlog))
@@ -197,7 +352,8 @@ def main():
                      f"T+{time.time()-cohort_t0:.1f}s; waiting...\n")
     sys.stderr.flush()
 
-    # wait for all children (each self-terminates at --secs or on delivery)
+    # Fixed-horizon children remain alive through their horizon; legacy children
+    # retain the committed --secs-or-delivery termination behavior.
     for p, proc, jpath, outlog in procs:
         proc.wait()
         outlog.close()
@@ -210,7 +366,8 @@ def main():
                 r = json.load(f)
         except Exception as e:  # noqa: BLE001
             r = {"tag": p["tag"], "error": str(e), "connected": False,
-                 "delivered_full": False, "rx_bytes": None,
+                 "delivered_full": False, "byte_integrity_ok": False,
+                 "rx_bytes": None,
                  "rsp_nreceived_frames": None}
         r["plan_card"] = p["card"]
         r["plan_subs"] = p["subs"]
@@ -219,6 +376,8 @@ def main():
     n_conn = sum(1 for r in results if r.get("connected"))
     n_deliv = sum(1 for r in results if r.get("rx_bytes"))
     n_full = sum(1 for r in results if r.get("delivered_full"))
+    n_integrity_ok = sum(1 for r in results
+                         if r.get("byte_integrity_ok") is True)
     tot_authfails = sum((r.get("aead_authfails") or 0) for r in results)
     tot_nonce_reuse = sum((r.get("nonce_reuse_count") or 0) for r in results)
     summary = {
@@ -228,10 +387,18 @@ def main():
         "cohort_wall_secs": round(cohort_wall, 1),
         "passthrough": args.passthrough,
         "cell": args.cell,
+        "traffic": args.traffic,
+        "snr": args.snr,
+        "snr3k": args.snr3k,
+        "warm_start": args.warm_start,
+        "score_horizon_s": args.score_horizon_s,
+        "seed_offset": args.seed_offset,
+        "explicit_plan": args.spawn_plan is not None,
         "start_cfg": args.start_cfg,
         "n_connected": n_conn,
         "n_delivered_any": n_deliv,
         "n_delivered_full": n_full,
+        "n_byte_integrity_ok": n_integrity_ok,
         "all_connected": n_conn == args.n,
         "total_aead_authfails": tot_authfails,
         "total_nonce_reuse": tot_nonce_reuse,
@@ -242,6 +409,8 @@ def main():
              "connected_at_s": r.get("connected_at_s"),
              "rx_bytes": r.get("rx_bytes"),
              "delivered_full": r.get("delivered_full"),
+             "byte_integrity_ok": r.get("byte_integrity_ok"),
+             "score_horizon_reached": r.get("score_horizon_reached"),
              "payload_target": r.get("payload_target"),
              "encrypt": r.get("encrypt"),
              "enc_activated": r.get("enc_activated"),

@@ -1,0 +1,53 @@
+{
+  "random_binary": {
+    "offset_0_length_64_hex": "07124924a2e1c01c2d6d95f11ec8a54ccdbfcf77451e698fffb674135ba938e8d1e49bf09ac9cc1c96d0a6b930da28d546991f10c8a66e2fdc1c7ba2e9610c1d",
+    "offset_19_length_57_hex": "77451e698fffb674135ba938e8d1e49bf09ac9cc1c96d0a6b930da28d546991f10c8a66e2fdc1c7ba2e9610c1dea4deab7637df11c47f564ee"
+  },
+  "warm_log": [
+    ["RSP", 1.0, "link_status:Idle"],
+    ["CMD", 1.1, "link_status:Idle"],
+    ["RSP", 31.2, "[PRECOOK] config bundles built"],
+    ["RSP", 31.4, "link_status:Idle"],
+    ["CMD", 32.1, "[PRECOOK] config bundles built"],
+    ["CMD", 32.5, "link_status:Idle"]
+  ],
+  "spawn_plan": [
+    {
+      "card_idx": 7,
+      "slot": 1,
+      "rsp_port": 8120,
+      "cmd_port": 8124,
+      "tag": "cert_a",
+      "seed": 13
+    },
+    {
+      "card": "Loopback_2",
+      "slot": 0,
+      "rsp_port": 8290,
+      "cmd_port": 8294,
+      "tag": "cert_b",
+      "seed": 10001
+    }
+  ],
+  "legacy_result_keys": [
+    "tag", "arm", "env", "passthrough", "snr", "cell", "profile",
+    "seed", "start_cfg", "card", "subs", "rsp_port", "cmd_port",
+    "no_gearshift", "connected", "cmd_connected", "rsp_connected",
+    "connected_at_s", "tx_bytes", "rx_bytes", "payload_target",
+    "delivered_full", "rsp_nreceived_frames", "cmd_nreceived_frames",
+    "breaks", "rx_overrun_total", "rx_overrun_segments", "encrypt",
+    "enc_activated", "aead_authfails", "nonce_enc_count",
+    "nonce_reuse_count", "dec_ok_count", "configs_seen",
+    "rsp_configs_seen", "cmd_configs_seen", "max_config_reached",
+    "wb_configs_seen", "climbed_past_robust0", "rsp_loaded_wb_id",
+    "rsp_wb_data_frames", "max_wb_cfg_with_data", "time_to_cross_s",
+    "crossed", "climbed_past_cfg0", "rx_bps_wall", "wall_secs"
+  ],
+  "additive_result_keys": [
+    "traffic", "snr3k", "connected_at_cold_s", "warm_start",
+    "warm_start_ok", "warm_offset_s", "warm_at_s", "byte_integrity_ok",
+    "integrity_mismatch_bytes", "integrity_mismatch_segments",
+    "integrity_first_bad_offset", "score_horizon_s",
+    "score_horizon_reached", "score_rx_Bmin", "wall_secs_cold"
+  ]
+}
