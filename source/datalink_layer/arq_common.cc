@@ -3958,6 +3958,32 @@ unsigned char cl_arq_controller::topgear_pack_report(double snr, double flatness
 	return (unsigned char)(((unsigned)snr_q << 4) | (unsigned)flat_state);
 }
 
+// Choose WHICH forward-channel selectivity the compact-confirm topgear report packs
+// (cross-layer data-flow audit fix; DEFAULT-ON).
+//
+// DEFAULT (MERCURY_TOPGEAR_PACK_GOODDECODE unset or != 0): pack topgear_channel_flatness -
+// the selectivity captured ONLY inside the decoded-forward-data-frame SUCCESS path (guarded
+// >=0.0 at the RESPONDER success gate), i.e. the last GOOD decode's CV, which never captures
+// a failed/transient attempt. It is -1 until the first good forward decode, which packs
+// fail-closed (flat_state 8) - the same conservative default the report already uses.
+//
+// MERCURY_TOPGEAR_PACK_GOODDECODE == 0 (legacy, fix disabled): the historical value -
+// telecom_system->last_channel_selectivity, the LAST-ATTEMPT selectivity. It is overwritten
+// on EVERY decode attempt (pre-CRC, telecom_system.cc) and reset to -1 on a config switch, so
+// under CFG16/17 election cycling it can hold a transient / false-lock / climb-frame CV
+// (> TOPGEAR_FLATNESS_MAX) at pack time even when the last GOOD decode was honestly flat ->
+// topgear_pack_report packs flat_state 10 (non-flat) -> the commander vetoes an honest-flat
+// cfg17 (the false veto; fires on cfg16 confirms too).
+double cl_arq_controller::topgear_pack_flatness_value() const
+{
+	double last_attempt = (telecom_system != NULL)
+	                    ? telecom_system->last_channel_selectivity : -1.0;
+	const char* e = std::getenv("MERCURY_TOPGEAR_PACK_GOODDECODE");
+	if(e && *e && atoi(e) == 0)
+		return last_attempt;   // legacy last-ATTEMPT CV (fix disabled)
+	return topgear_channel_flatness;   // last GOOD forward-decode CV (-1 = none yet -> fail-closed)
+}
+
 // Consume a CRC-validated report attached to a CLEAN compact confirm. The BSI
 // de-dup prevents repeated receive-window polls of one on-air confirm from
 // manufacturing the two-report hysteresis streak.
@@ -15385,9 +15411,32 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_i
 	uint16_t topgear_crc12 = 0;
 	if(append_topgear)
 	{
-		double flatness = (telecom_system != NULL)
-		                ? telecom_system->last_channel_selectivity : -1.0;
+		// Cross-layer data-flow audit fix: pack the guarded last-GOOD-decode selectivity
+		// (topgear_pack_flatness_value) instead of the raw last-ATTEMPT CV. DEFAULT-ON;
+		// MERCURY_TOPGEAR_PACK_GOODDECODE=0 restores the legacy last-ATTEMPT read.
+		double flatness = topgear_pack_flatness_value();
+		// Additive selection diagnostic (behind MERCURY_PACK_SEL_DIAG; no behavior change).
+		// lcs = the LAST-ATTEMPT selectivity actually packed; tgf = the last GOOD-decode
+		// selectivity (topgear_channel_flatness). A state-10 pack where lcs>0.15 while
+		// tgf<0.15 is the false-veto sampling defect (a transient/failed-attempt CV packed
+		// in place of the honest good-decode CV).
+		if(std::getenv("MERCURY_PACK_SEL_DIAG"))
+		{
+			double lcs = (telecom_system != NULL)
+			           ? telecom_system->last_channel_selectivity : -1.0;
+			fprintf(stderr, "[PACK-SEL] cfg=%d lcs=%.4f tgf=%.4f selected=%.4f snr_dl=%.2f\n",
+				current_configuration, lcs, topgear_channel_flatness,
+				flatness, measurements.SNR_downlink);
+			fflush(stderr);
+		}
 		topgear_report = topgear_pack_report(measurements.SNR_downlink, flatness);
+		if(std::getenv("MERCURY_PACK_SEL_DIAG"))
+		{
+			int fs = topgear_report & 0x0F;
+			fprintf(stderr, "[PACK-SEL] packed cfg=%d flat_state=%d state10=%d\n",
+				current_configuration, fs, (fs == 10) ? 1 : 0);
+			fflush(stderr);
+		}
 		char report_byte[1]; report_byte[0] = (char)topgear_report;
 		topgear_crc12 = CRC12_calc(report_byte, 1);
 	}

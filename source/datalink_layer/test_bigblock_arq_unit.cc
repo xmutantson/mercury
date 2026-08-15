@@ -1326,6 +1326,75 @@ int cl_arq_controller::test_topgear_clean_election()
 		cmd->current_configuration = CONFIG_16;
 	}
 
+	// (8c) PACK-SEL SELECTION — the forward-report flatness SAMPLING SOURCE (cross-layer
+	//      data-flow audit fix; MERCURY_TOPGEAR_PACK_GOODDECODE, DEFAULT-ON).
+	//      The compact-confirm topgear report samples the flatness at PACK time. Under CFG16/17
+	//      election cycling the RAW last-attempt selectivity (last_channel_selectivity) can hold a
+	//      transient / false-lock / climb-frame CV even when the last GOOD forward decode was
+	//      honestly flat, so the report packs flat_state 10 (non-flat) and the commander vetoes an
+	//      honest-flat cfg17. topgear_pack_flatness_value() selects the value packed: the guarded
+	//      last-GOOD-decode CV (topgear_channel_flatness) by DEFAULT, or the legacy raw last-attempt
+	//      CV when MERCURY_TOPGEAR_PACK_GOODDECODE=0. Each arm SETS the env explicitly so the arm's
+	//      verdict is independent of the shipped default; arm (d) then verifies the default itself.
+	{
+		set_env("MERCURY_CFG17_SNR_FLOOR", "24.0");
+		cmd->current_configuration     = CONFIG_17;
+		cmd->measurements.SNR_downlink = 34.0;    // clears the 24.0 forward floor
+		ts->last_channel_selectivity   = 0.50;    // TRANSIENT last-attempt CV (> TOPGEAR_FLATNESS_MAX)
+		cmd->topgear_channel_flatness  = 0.009;   // last GOOD forward decode: honestly flat
+
+		// (a) FIX OFF (MERCURY_TOPGEAR_PACK_GOODDECODE=0, legacy last-attempt sampling): packs the
+		//     transient last-attempt CV 0.50 -> flat_state 10 (env set explicitly, so the fail-before
+		//     arm reproduces the legacy false veto regardless of the build default).
+		set_env("MERCURY_TOPGEAR_PACK_GOODDECODE", "0");
+		double sel_off = cmd->topgear_pack_flatness_value();
+		unsigned char rpt_off = cmd->topgear_pack_report(cmd->measurements.SNR_downlink, sel_off);
+		check((rpt_off & 0x0F) == 10,
+		      "PACK-SEL fail-before: fix OFF (=0) packs transient last-attempt CV 0.50 -> flat_state 10 "
+		      "(legacy false veto of an honest-flat cfg17 reproduced)");
+
+		// (b) FIX ON (=1): packs the good-decode CV 0.009 -> flat + above-floor -> flat_state 11 (NOT 10).
+		set_env("MERCURY_TOPGEAR_PACK_GOODDECODE", "1");
+		double sel_on = cmd->topgear_pack_flatness_value();
+		unsigned char rpt_on = cmd->topgear_pack_report(cmd->measurements.SNR_downlink, sel_on);
+		int fs_on = rpt_on & 0x0F;
+		check(fs_on == 11 || fs_on == 9,
+		      "PACK-SEL pass-after: fix ON (=1) packs good-decode CV 0.009 -> flat_state 11/9 "
+		      "(honest-flat cfg17 admitted, not the state-10 veto)");
+		check(fs_on != 10,
+		      "PACK-SEL pass-after: fix ON (=1) does NOT pack the false non-flat veto (flat_state != 10)");
+
+		// (c) SAFETY, FIX ON (=1): a GENUINELY selective good-decode CV still vetoes (state 10 preserved).
+		set_env("MERCURY_TOPGEAR_PACK_GOODDECODE", "1");
+		cmd->topgear_channel_flatness = 0.50;     // real 2-path selectivity in the GOOD decode
+		double sel_sel = cmd->topgear_pack_flatness_value();
+		unsigned char rpt_sel = cmd->topgear_pack_report(cmd->measurements.SNR_downlink, sel_sel);
+		check((rpt_sel & 0x0F) == 10,
+		      "PACK-SEL safety: fix ON (=1) + genuinely selective good-decode CV 0.50 -> flat_state 10 "
+		      "(2-path veto preserved)");
+
+		// (d) DEFAULT-ON (env UNSET): the shipped merge default samples the good-decode CV, NOT the
+		//     transient last-attempt CV. Synthetic pack of a 0.50 transient last-attempt + 0.02 good
+		//     decode -> flat_state 11 (proves the fix is genuinely ON with no env set).
+		clr_env("MERCURY_TOPGEAR_PACK_GOODDECODE");
+		ts->last_channel_selectivity  = 0.50;     // TRANSIENT last-attempt CV
+		cmd->topgear_channel_flatness = 0.02;     // last GOOD forward decode: honestly flat
+		double sel_def = cmd->topgear_pack_flatness_value();
+		unsigned char rpt_def = cmd->topgear_pack_report(cmd->measurements.SNR_downlink, sel_def);
+		int fs_def = rpt_def & 0x0F;
+		check(fs_def == 11 || fs_def == 9,
+		      "PACK-SEL default-ON: env UNSET packs good-decode CV 0.02 -> flat_state 11/9 "
+		      "(the merged default samples the good decode, not the 0.50 transient)");
+		check(fs_def != 10,
+		      "PACK-SEL default-ON: env UNSET does NOT pack the false non-flat veto (flat_state != 10)");
+
+		clr_env("MERCURY_TOPGEAR_PACK_GOODDECODE");
+		clr_env("MERCURY_CFG17_SNR_FLOOR");
+		cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
+		cmd->topgear_channel_flatness = -1.0;
+		cmd->current_configuration = CONFIG_16;
+	}
+
 	// Exercise the complete production startup and live-switch sequence that real audio exposed:
 	// start cfg17 -> pin walk -> dual bundle build -> cfg17/16 transitions. cfg17 intentionally
 	// remains out of FULL_CONFIG_LADDER and takes the loud PRECOOK-MISS legacy rebuild, which must

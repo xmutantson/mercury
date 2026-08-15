@@ -2841,6 +2841,11 @@ public:
   // nibble is a marker-backed flatness state (8=unmeasured, 9=flat, 10=non-flat);
   // every other value is rejected before it can affect election state.
   unsigned char topgear_pack_report(double snr, double flatness) const;
+  // Cross-layer data-flow audit fix: select which forward-selectivity value the
+  // compact-confirm topgear report packs. DEFAULT-ON: env unset = the guarded
+  // last-GOOD-decode CV (topgear_channel_flatness); MERCURY_TOPGEAR_PACK_GOODDECODE=0
+  // restores the legacy last-ATTEMPT CV (the prior inline read). Const.
+  double topgear_pack_flatness_value() const;
   void topgear_apply_report(unsigned char report, int batch_seq_id);
   bool topgear_forward_report_is_fresh() const;
   void topgear_clear_forward_verdict();
