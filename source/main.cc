@@ -54,6 +54,8 @@
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
 
+int run_b2f_bounded_output_test();
+
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_main.h"
 #include "gui/gui_state.h"
@@ -2185,6 +2187,10 @@ int main(int argc, char *argv[])
     // caller below. The flag must be checked before any audio/GUI/threading
     // init so the test process stays minimal.
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--test-b2f-bounded-output") == 0) {
+            arm_test_watchdog();
+            return run_b2f_bounded_output_test();
+        }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             int failed = run_mfsk_ctrl_codec_tests();

@@ -150,7 +150,7 @@ static bool rx_large_body()
 	return exact && !handler.has_pending_rx_work();
 }
 
-int main()
+int run_b2f_bounded_output_test()
 {
 	bool tx_ok = tx_large_body();
 	bool rx_ok = rx_large_body();
