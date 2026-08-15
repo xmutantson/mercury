@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include "datalink_layer/l1_block_codec.h"
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
 #include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 in-band rate-adapt config tag
@@ -18457,10 +18458,26 @@ void cl_arq_controller::receive()
 					(unsigned char)this->connection_id);
 				fflush(stdout);
 			}
-			if(passive_monitor || message_TxRx_byte_buffer[1] == this->connection_id || message_TxRx_byte_buffer[1] == BROADCAST_ID)
+			const uint8_t wire_prefix[] = {
+				(uint8_t)message_TxRx_byte_buffer[0],
+				(uint8_t)message_TxRx_byte_buffer[1],
+				(uint8_t)message_TxRx_byte_buffer[2]
+			};
+			l1_block::LegacyParserAckState legacy_state = {
+				messages_rx_buffer.status,
+				(uint8_t)messages_rx_buffer.type,
+				(uint8_t)messages_rx_buffer.sequence_number,
+				(uint8_t)last_received_message_sequence
+			};
+			if((passive_monitor || message_TxRx_byte_buffer[1] == this->connection_id
+				|| message_TxRx_byte_buffer[1] == BROADCAST_ID)
+				&& l1_block::seat_legacy_receive_prefix(wire_prefix,
+					sizeof(wire_prefix), &legacy_state))
 			{
-				messages_rx_buffer.status=RECEIVED;
-				messages_rx_buffer.type=message_TxRx_byte_buffer[0];
+				messages_rx_buffer.status = legacy_state.rx_status;
+				messages_rx_buffer.type = (char)legacy_state.rx_type;
+				messages_rx_buffer.sequence_number = (char)legacy_state.rx_sequence;
+				last_received_message_sequence = (char)legacy_state.last_received_sequence;
 				// Bit 7 of sequence_number = end-of-batch flag from commander (data frames only)
 				// R038 (race audit 2026-06-06): this capture runs PRE-ROUTING — before
 				// the responder classifies the frame as match-current / match-prev /
@@ -18489,8 +18506,6 @@ void cl_arq_controller::receive()
 					else
 						last_received_end_of_batch_seq = eob_seq;  // v1: unchanged
 				}
-				messages_rx_buffer.sequence_number=message_TxRx_byte_buffer[2] & 0x7F;
-				last_received_message_sequence=messages_rx_buffer.sequence_number;
 				// Defensive clamp: never write more than alloc_size (N_MAX/8 = 200) bytes
 				// into any .data buffer, regardless of max_data_length + max_header_length.
 				const int alloc_size = N_MAX / 8;

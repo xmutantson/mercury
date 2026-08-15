@@ -115,6 +115,12 @@
                                 // CRC8 over [echoed_peer_cap, own_cap], POLY=0xF4.
                                 // CMD validates echoed_peer_cap == local_capability
                                 // before transitioning out of CONNECTION_ACCEPTED.
+#define BLOCK_DESC       0x46   // Bounded-block forward descriptor
+#define BLOCK_SACK       0x47   // Bounded-block reverse selective ACK
+#define BLOCK_OFFER      0x48   // Bounded-block negotiation offer
+#define BLOCK_ACCEPT     0x49   // Bounded-block negotiation acceptance
+#define BLOCK_COMMIT     0x4A   // Bounded-block negotiation commit
+#define BLOCK_COMMIT_ACK 0x4B   // Bounded-block negotiation commit acknowledgement
 #define ROBUST_DWELL_BATCH_OP 0x44  // FIX-A: ROBUST-tier dwell-batch decouple
                                 // (data-flow-robust-tier-arq-batch.md §5.2). CMD-decided,
                                 // RSP-mirrored batch size for a PROVEN+PARKED robust dwell.

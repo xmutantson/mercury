@@ -400,6 +400,7 @@ source/main.cc
 source/datalink_layer/arq_commander.cc
 source/datalink_layer/arq_common.cc
 source/datalink_layer/arq_responder.cc
+source/datalink_layer/l1_block_codec.cc
 source/datalink_layer/test_bigblock_arq_unit.cc
 source/datalink_layer/test_rx_drain.cc
 source/datalink_layer/test_restage_requeue.cc
@@ -616,6 +617,16 @@ done
 
 # Wait for all compilations to finish
 wait_all
+
+run_l1_block_codec_test() {
+    local test_bin="${BUILDDIR}/test_l1_block_codec"
+    echo "Building and running L1 block codec test..."
+    $CXX $CXXFLAGS source/datalink_layer/l1_block_codec.cc \
+        source/datalink_layer/test_l1_block_codec.cc -o "$test_bin"
+    "$test_bin"
+}
+
+run_l1_block_codec_test
 
 if [ "$COMPILED" -eq 0 ]; then
     # Check if output exists and is up to date
