@@ -47,7 +47,11 @@
     "traffic", "snr3k", "connected_at_cold_s", "warm_start",
     "warm_start_ok", "warm_offset_s", "warm_at_s", "byte_integrity_ok",
     "integrity_mismatch_bytes", "integrity_mismatch_segments",
-    "integrity_first_bad_offset", "score_horizon_s",
-    "score_horizon_reached", "score_rx_Bmin", "wall_secs_cold"
+    "integrity_first_bad_offset", "integrity_disconnects", "integrity_sessions",
+    "max_session_bytes", "total_received_bytes", "content_delivered_md5",
+    "content_expected_md5", "content_md5_ok", "score_horizon_s",
+    "score_horizon_reached", "score_rx_Bmin", "wall_secs_cold",
+    "delivered_full_count_only", "delivered_full_single_session",
+    "content_shear_suspected", "realized_width"
   ]
 }

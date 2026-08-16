@@ -89,12 +89,16 @@ class ByteIntegrityCapabilityTest(unittest.TestCase):
         damaged = bytearray(stream)
         damaged[41] ^= 0x80
         corrupt.feed(damaged)
-        self.assertEqual(corrupt.snapshot(), {
-            "byte_integrity_ok": False,
-            "integrity_mismatch_bytes": 1,
-            "integrity_mismatch_segments": 1,
-            "integrity_first_bad_offset": 41,
-        })
+        snap = corrupt.snapshot()
+        self.assertFalse(snap["byte_integrity_ok"])
+        self.assertEqual(snap["integrity_mismatch_bytes"], 1)
+        self.assertEqual(snap["integrity_mismatch_segments"], 1)
+        self.assertEqual(snap["integrity_first_bad_offset"], 41)
+        self.assertEqual(snap["integrity_disconnects"], 0)
+        self.assertEqual(snap["integrity_sessions"], 1)
+        self.assertEqual(snap["max_session_bytes"], 96)
+        self.assertEqual(snap["total_received_bytes"], 96)
+        self.assertFalse(snap["content_md5_ok"])
 
 
 class CertDriverArgparseIntegrationTest(unittest.TestCase):

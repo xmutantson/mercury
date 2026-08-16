@@ -137,29 +137,84 @@ def fixed_score_deadline(t0, connect_issued_at, horizon_s,
 
 
 class ByteIntegrityTracker:
-    """Streaming byte oracle shared by legacy and random-binary traffic."""
+    """Session-aware streaming byte oracle shared by legacy and random-binary
+    traffic.
+
+    Each ARQ session restarts the application payload at offset 0.  A single
+    logical cell can span several sessions: a disconnect/reconnect drops the
+    RF link but leaves the local KISS data socket open, and the responder
+    re-delivers the transfer from its beginning on the fresh session.  A byte
+    oracle that compares the concatenated wire stream against ONE monotonic
+    source offset therefore SHEARS at every session boundary -- session two's
+    bytes (delivered from application offset 0) are checked against the source
+    at the running total, a false mismatch that reads as corruption.  The
+    contention-certification round-5 corrupt-cell drill traced exactly this:
+    three sessions of 24 + 0 + 18432 bytes concatenated to 18456 with the shear
+    at byte 24, a ~1/256 spurious match rate.
+
+    note_disconnect() realigns the expected-source offset to 0 at each session
+    boundary so every session is scored against its own fresh payload prefix,
+    while the cumulative mismatch evidence (a genuine mid-session corruption)
+    is preserved across boundaries.  A per-session delivered-byte high-water
+    mark backs an honest completion check: a cell that only reaches the payload
+    target by re-delivering a prefix across sessions has NOT delivered the
+    payload in one clean session and must not count as complete.
+    """
+
+    _RAW_CAP_BYTES = 4 << 20        # forensic rx-buffer ceiling (per cell)
+    _CAP_CHUNKS = 8                 # first N mismatched chunks kept for capbytes
+    _CAP_SPAN = 64                  # bytes retained per captured mismatch chunk
 
     def __init__(self, traffic):
         self.traffic = traffic
-        self.received_bytes = 0
+        # session_offset realigns to 0 at each disconnect; total_bytes never does.
+        self.session_offset = 0
+        self.total_bytes = 0
+        self.max_session_bytes = 0
         self.mismatch_bytes = 0
         self.mismatch_segments = 0
         self.first_bad_offset = None
+        self.disconnects = 0
+        self.sessions = 1
+        self._delivered_md5 = hashlib.md5()
+        self._expected_md5 = hashlib.md5()
+        self._cap = []
+        self._raw = bytearray()
         self.lock = threading.Lock()
 
     def feed(self, data):
         data = bytes(data)
         with self.lock:
-            base = self.received_bytes
-            expected = traffic_slice(self.traffic, base, len(data))
+            expected = traffic_slice(self.traffic, self.session_offset, len(data))
             bad = [i for i, pair in enumerate(zip(data, expected))
                    if pair[0] != pair[1]]
             if bad:
                 self.mismatch_bytes += len(bad)
                 self.mismatch_segments += 1
                 if self.first_bad_offset is None:
-                    self.first_bad_offset = base + bad[0]
-            self.received_bytes += len(data)
+                    self.first_bad_offset = self.total_bytes + bad[0]
+                if len(self._cap) < self._CAP_CHUNKS:
+                    self._cap.append((
+                        self.total_bytes,
+                        bytes(data[:self._CAP_SPAN]),
+                        bytes(expected[:self._CAP_SPAN]),
+                    ))
+            self._delivered_md5.update(data)
+            self._expected_md5.update(expected)
+            self.session_offset += len(data)
+            self.total_bytes += len(data)
+            if self.session_offset > self.max_session_bytes:
+                self.max_session_bytes = self.session_offset
+            if len(self._raw) < self._RAW_CAP_BYTES:
+                self._raw += data[:self._RAW_CAP_BYTES - len(self._raw)]
+
+    def note_disconnect(self):
+        """Realign the expected-source offset to 0 for the next ARQ session."""
+        with self.lock:
+            self.disconnects += 1
+            if self.session_offset > 0:
+                self.sessions += 1
+            self.session_offset = 0
 
     @property
     def ok(self):
@@ -168,12 +223,52 @@ class ByteIntegrityTracker:
 
     def snapshot(self):
         with self.lock:
+            delivered_md5 = self._delivered_md5.hexdigest()
+            expected_md5 = self._expected_md5.hexdigest()
             return {
                 "byte_integrity_ok": self.mismatch_bytes == 0,
                 "integrity_mismatch_bytes": self.mismatch_bytes,
                 "integrity_mismatch_segments": self.mismatch_segments,
                 "integrity_first_bad_offset": self.first_bad_offset,
+                "integrity_disconnects": self.disconnects,
+                "integrity_sessions": self.sessions,
+                "max_session_bytes": self.max_session_bytes,
+                "total_received_bytes": self.total_bytes,
+                "content_delivered_md5": delivered_md5,
+                "content_expected_md5": expected_md5,
+                "content_md5_ok": delivered_md5 == expected_md5,
             }
+
+    def dump_forensics(self, capbytes_path, rx_bin_path):
+        """Persist first-mismatch chunks + the raw received stream, ONLY when a
+        content violation was observed.  A clean cell writes nothing; its
+        durable proof of byte-identity is the delivered/expected md5 pair in the
+        result JSON."""
+        with self.lock:
+            if self.mismatch_bytes == 0:
+                return
+            cap = list(self._cap)
+            raw = bytes(self._raw)
+            first_bad = self.first_bad_offset
+            mism = self.mismatch_bytes
+            segs = self.mismatch_segments
+            total = self.total_bytes
+        try:
+            with open(capbytes_path, "w") as handle:
+                handle.write(
+                    f"first_bad={first_bad} total_rx={total} "
+                    f"mismatch={mism} segs={segs}\n")
+                for base, deliv, exp in cap:
+                    handle.write(f"BASE {base} LEN {len(deliv)}\n")
+                    handle.write(f"DELIV {deliv.hex()}\n")
+                    handle.write(f"EXPEC {exp.hex()}\n")
+        except OSError:
+            pass
+        try:
+            with open(rx_bin_path, "wb") as handle:
+                handle.write(raw)
+        except OSError:
+            pass
 
 
 def is_wb_config(cfg):
@@ -254,7 +349,7 @@ def observe_warm_line(st, label, text, event_at):
             st.warm_at[label] = event_at
 
 
-def log_output(proc, label, logfile, t0, st):
+def log_output(proc, label, logfile, t0, st, integrity=None, stop=None):
     try:
         for line in iter(proc.stdout.readline, b''):
             text = line.decode("utf-8", "replace").rstrip()
@@ -271,6 +366,14 @@ def log_output(proc, label, logfile, t0, st):
                         st.rsp_connected = True
             if DISC_RE.search(text):
                 st.disconnected = True
+                # Session boundary: realign the RX byte oracle to application
+                # offset 0 for the next ARQ session (the responder re-delivers
+                # the transfer from its beginning).  Gate on the RSP peer (the
+                # side whose data socket feeds the oracle) and skip teardown
+                # disconnects raised after the observation window closed.
+                if (integrity is not None and label == "RSP"
+                        and (stop is None or not stop.is_set())):
+                    integrity.note_disconnect()
             m = NRECV_RE.search(text)
             if m:
                 v = int(m.group(1))
@@ -443,6 +546,9 @@ def build_arg_parser():
     ap.add_argument("--tag", default="cell")
     ap.add_argument("--arm", default="legacy",
                     help="A/B arm label (e.g. redesign|legacy); recorded in JSON")
+    ap.add_argument("--realized-width", type=int, default=None,
+                    help="concurrent live real-audio cells on this box during "
+                         "this cell; recorded verbatim for wide-window evidence")
     ap.add_argument("--env", action="append", default=[],
                     help="KEY=VAL env var injected into BOTH mercury instances "
                          "(repeatable); used to carry the redesign env trio")
@@ -549,7 +655,8 @@ def main(argv=None):
         p = subprocess.Popen(mercury_cmd(port, in_dev, out_dev),
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              env=cell_env)
-        threading.Thread(target=log_output, args=(p, label, logfile, t0, st),
+        threading.Thread(target=log_output,
+                         args=(p, label, logfile, t0, st, integrity, stop),
                          daemon=True).start()
         return p
 
@@ -706,6 +813,26 @@ def main(argv=None):
     dwell_cold = max(1.0, time.time() - t0)
     dwell = max(1.0, dwell_cold - warm_offset)
     integrity_result = integrity.snapshot()
+    # Forensic artifacts land under logdir (captured by the certification
+    # driver's wholesale run-dir tar) and are written ONLY on a content
+    # violation; a clean cell's durable byte-identity proof is the
+    # delivered/expected md5 pair recorded in the result JSON.  The round-5
+    # corrupt cell was un-auditable because these were never persisted.
+    integrity.dump_forensics(
+        os.path.join(args.logdir, f"capbytes_{args.tag}.txt"),
+        os.path.join(args.logdir, f"rx_{args.tag}.bin"))
+    # HONEST COMPLETION: count-only rx>=payload silently passes a multi-session
+    # cell that only reaches the target by RE-DELIVERING a prefix across
+    # sessions.  Require a single session to have delivered the payload AND the
+    # session-aware oracle to be clean.  The legacy count-only value survives
+    # under its own name so old and new cells stay distinguishable in audits.
+    delivered_full_count_only = res["rx"] >= args.payload
+    delivered_full_single_session = (
+        integrity_result["max_session_bytes"] >= args.payload)
+    delivered_full = bool(
+        delivered_full_single_session and integrity_result["byte_integrity_ok"])
+    content_shear_suspected = bool(
+        delivered_full_count_only and not integrity_result["byte_integrity_ok"])
     try:
         rx_overrun_total, rx_overrun_segments = read_rx_overrun_metrics(logpath)
     except (OSError, ValueError) as e:
@@ -760,7 +887,11 @@ def main(argv=None):
                       for key, value in sorted(warm_snapshot.items())},
         "tx_bytes": res["tx"], "rx_bytes": res["rx"],
         "payload_target": args.payload,
-        "delivered_full": res["rx"] >= args.payload,
+        "realized_width": args.realized_width,
+        "delivered_full": delivered_full,
+        "delivered_full_count_only": delivered_full_count_only,
+        "delivered_full_single_session": delivered_full_single_session,
+        "content_shear_suspected": content_shear_suspected,
         "rsp_nreceived_frames": st.rsp_nreceived,
         "cmd_nreceived_frames": st.cmd_nreceived,
         "breaks": st.breaks,
@@ -768,6 +899,13 @@ def main(argv=None):
         "integrity_mismatch_bytes": integrity_result["integrity_mismatch_bytes"],
         "integrity_mismatch_segments": integrity_result["integrity_mismatch_segments"],
         "integrity_first_bad_offset": integrity_result["integrity_first_bad_offset"],
+        "integrity_disconnects": integrity_result["integrity_disconnects"],
+        "integrity_sessions": integrity_result["integrity_sessions"],
+        "max_session_bytes": integrity_result["max_session_bytes"],
+        "total_received_bytes": integrity_result["total_received_bytes"],
+        "content_delivered_md5": integrity_result["content_delivered_md5"],
+        "content_expected_md5": integrity_result["content_expected_md5"],
+        "content_md5_ok": integrity_result["content_md5_ok"],
         "rx_overrun_total": rx_overrun_total,
         "rx_overrun_segments": rx_overrun_segments,
         "encrypt": args.encrypt,
