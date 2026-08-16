@@ -7882,8 +7882,18 @@ void cl_telecom_system::BER_PLOT_passband_process_main()
 	if(ber_single_esn0 > -900.0f)
 	{
 		int nf = (ber_frames_override > 0) ? ber_frames_override : nFrames_per_point;
-		float b = passband_test_EsN0(ber_single_esn0, nf).BER;
+		cl_error_rate _er = passband_test_EsN0(ber_single_esn0, nf);
+		float b = _er.BER;
 		std::cout<<ber_single_esn0<<";"<<b<<std::endl;
+		// Additive diagnostic on the test-only --ber-esn0 path: FER + frame/bit
+		// counts printed alongside the unchanged "<EsN0>;<BER>" line above. Does not
+		// alter the BER computation or any production/live path. This config carries
+		// one LDPC codeword per frame, so FER is the codeword-error (frame-error) rate.
+		std::cout<<"[BER-FER] esn0="<<ber_single_esn0<<" ber="<<b
+		         <<" fer="<<_er.FER<<" err_frames="<<(long long)_er.Error_frames_total
+		         <<" frames="<<(long long)_er.Frames_total
+		         <<" err_bits="<<(long long)_er.Error_bits_total
+		         <<" bits="<<(long long)_er.Bits_total<<std::endl;
 		BER_plot.close();
 		return;
 	}

@@ -1992,6 +1992,26 @@ double cl_ofdm::measure_pilot_selectivity(const std::complex<double>* in,
 	                          (int)magnitudes.size());
 }
 
+// Parametric notch-resolving estimator selector (DEFAULT-ON; env unset => mode 1).
+// Read ONCE into a function-local static (single-threaded per-frame call). Consulted
+// only for the sparse-wide continual-pilot lattice (LOW48 / config-105 class, gated on
+// pilot_configurator.sparse_wide_data_carriers > 0), so DEFAULT-ON is a proven no-op on
+// every shipped ladder config (all have sparse_wide_data_carriers == 0).
+//   0 = OFF     : stock LS + linear frequency interpolation + DFT smoothing.
+//   1 = ON      : parametric 2-ray fit when a within-CP echo is detected, else defer
+//                 to stock interpolation; the existing pilot-residual nv is kept.
+//   2 = ON+nvXP : same H, but nv from the cross-pilot differential thermal floor
+//                 (nv-isolation control) instead of the pilot-residual estimate.
+// Env MERCURY_EST_NOTCH selects the mode: unset => 1 (ON); MERCURY_EST_NOTCH=0 disables.
+static int est_notch_mode()
+{
+	static const int mode = []() -> int {
+		const char* e = std::getenv("MERCURY_EST_NOTCH");
+		return (e != nullptr) ? atoi(e) : 1;
+	}();
+	return mode;
+}
+
 void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 {
 	std::complex <double> pilot_data[Nsymb*Nc]={std::complex <double> (0,0)};
@@ -2112,6 +2132,160 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 	// have not run yet). See ofdm.h last_pilot_coherence.
 	compute_pilot_coherence();
 
+	// ---- Parametric 2-ray (LOS + single within-CP echo) notch estimator ----
+	// Env-gated MERCURY_EST_NOTCH (DEFAULT-ON: env unset => mode 1; MERCURY_EST_NOTCH=0
+	// disables). The do_notch gate below additionally requires the sparse-wide continual-
+	// pilot lattice (sparse_wide_data_carriers>0, config-105 class), so on every shipped
+	// ladder config this whole block is skipped and the output is byte-identical to the
+	// stock estimator. The sparse continual-pilot
+	// lattice under-resolves a within-guard echo whose frequency-ripple period
+	// (Nfft/D carriers) approaches the pilot-grid Nyquist, so linear frequency
+	// interpolation mis-places the fade null and yields a confident-wrong H between
+	// pilots (the LOW48 poor-fade FER floor). The physical channel here is one LOS ray
+	// at delay 0 plus one scatter ray inside the guard interval, so H(k) = g0 +
+	// g1*exp(-j*2*pi*k*D/Nfft) is a 5-real-parameter model. Fit it directly to the
+	// pilot LS ratios instead of interpolating: estimate the echo delay D ONCE per
+	// frame (pooling the fit residual over every symbol, since the geometry is static
+	// over the slow Doppler) and re-fit the complex gains PER SYMBOL to follow the
+	// intra-frame Doppler; then reconstruct H analytically at every carrier -- exact
+	// at the fade null, unlike interpolation. A diagonal load stabilizes the 2x2 gain
+	// solve; a model-order gate accepts the echo only when it truly resolves one, and
+	// on a clean channel the estimator DEFERS to the stock interpolation+smoother.
+	// Refs: Y. (G.) Li, L. J. Cimini et al., "Channel Estimation for OFDM Transmission
+	// in Multipath Fading Channels Based on Parametric Channel Modeling," IEEE Trans.
+	// Comm. 49(3):467-479, 2001; O. Simeone, Y. Bar-Ness, U. Spagnolini, "Pilot-Based
+	// Channel Estimation for OFDM Systems by Tracking the Delay-Subspace," IEEE Trans.
+	// Wireless Comm. 3(1):315-325, 2004 (slow delay subspace + fast per-symbol gains);
+	// diagonal loading per O. Edfors et al., "OFDM Channel Estimation by SVD," IEEE
+	// Trans. Comm. 46(7):931-939, 1998.
+	int  est_notch    = est_notch_mode();
+	bool do_notch     = (est_notch != 0 && pilot_configurator.sparse_wide_data_carriers > 0 && Nc > 10);
+	bool notch_filled = false;   // set true once the parametric writer overwrites H
+	if(do_notch)
+	{
+		const int    Nc2   = Nc/2;
+		const int    Dmax  = (Ngi > 1) ? Ngi : 1;
+		const double twopi = 2.0*acos(-1.0);
+
+		// (1) Continual-pilot columns + their SIGNED FFT-bin indices (framer map:
+		//     carrier j<Nc/2 -> bin j-Nc/2 ; j>=Nc/2 -> j-Nc/2+start_shift).
+		std::vector<int>    pil_col;
+		std::vector<double> pil_k;
+		for(int j=0; j<Nc; j++)
+			if((ofdm_frame + 0*Nc + j)->type == PILOT)
+			{
+				pil_col.push_back(j);
+				pil_k.push_back( (j < Nc2) ? (double)(j - Nc2)
+				                           : (double)(j - Nc2 + start_shift) );
+			}
+		int nPil = (int)pil_col.size();
+
+		if(nPil >= 3)
+		{
+			// (2) Snapshot the windowed-LS pilot estimates (the composite H the
+			//     equalizer consumes) before any overwrite.
+			std::vector<std::complex<double> > y((size_t)Nsymb*nPil);
+			for(int s=0; s<Nsymb; s++)
+				for(int p=0; p<nPil; p++)
+					y[(size_t)s*nPil+p] = (estimated_channel + s*Nc + pil_col[p])->value;
+
+			const double ridge = 1e-3 * (double)nPil;   // Tikhonov diagonal load
+
+			// (3) Flat (single-ray) frame residual: the no-echo null hypothesis.
+			double flat_res = 0.0;
+			for(int s=0; s<Nsymb; s++)
+			{
+				std::complex<double> sum(0,0);
+				for(int p=0; p<nPil; p++) sum += y[(size_t)s*nPil+p];
+				std::complex<double> g0 = sum / (double)nPil;
+				for(int p=0; p<nPil; p++)
+				{ std::complex<double> d = y[(size_t)s*nPil+p]-g0; flat_res += d.real()*d.real()+d.imag()*d.imag(); }
+			}
+
+			// (4) 1-D delay search: LOS pinned at delay 0, echo delay d1 in [1,Dmax].
+			//     The 2x2 normal matrix depends only on d1, so build it once per d1.
+			int best_d1 = 0; double best_res = flat_res;
+			std::vector<std::complex<double> > b1(nPil);
+			for(int d1=1; d1<=Dmax; d1++)
+			{
+				for(int p=0; p<nPil; p++)
+				{ double ph = -twopi*pil_k[p]*(double)d1/(double)Nfft; b1[p]=std::complex<double>(cos(ph),sin(ph)); }
+				std::complex<double> M01(0,0); double M11=0.0;
+				for(int p=0; p<nPil; p++){ M01+=b1[p]; M11+=std::norm(b1[p]); }
+				double M00r=(double)nPil+ridge, M11r=M11+ridge;
+				std::complex<double> M10=std::conj(M01);
+				std::complex<double> det=M00r*M11r-M01*M10;
+				if(std::abs(det)<1e-12) continue;
+				double tot=0.0;
+				for(int s=0; s<Nsymb; s++)
+				{
+					std::complex<double> r0(0,0),r1(0,0);
+					for(int p=0; p<nPil; p++){ std::complex<double> yy=y[(size_t)s*nPil+p]; r0+=yy; r1+=std::conj(b1[p])*yy; }
+					std::complex<double> g0=(M11r*r0-M01*r1)/det;
+					std::complex<double> g1=(-M10*r0+M00r*r1)/det;
+					for(int p=0; p<nPil; p++){ std::complex<double> d=y[(size_t)s*nPil+p]-(g0+g1*b1[p]); tot+=d.real()*d.real()+d.imag()*d.imag(); }
+				}
+				if(tot<best_res){ best_res=tot; best_d1=d1; }
+			}
+
+			// (5) Model-order gate (GLRT-style): accept the echo ONLY if it cuts the
+			//     pooled residual substantially. Adding one complex gain (2 real DOF)
+			//     to 10 complex pilots reduces a pure-NOISE residual by only ~11%,
+			//     while a genuine within-CP echo cuts it by >90% (poor d10 97%,
+			//     moderate 98%). A 50% floor cleanly separates them. On rejection
+			//     (clean/echo-free channel) the parametric writer is skipped and the
+			//     estimator DEFERS to the stock interpolation+smoother below, so AWGN
+			//     and non-fading channels stay byte-identical to the stock estimator.
+			bool use_echo = (best_d1 > 0) && (best_res < 0.5*flat_res);
+
+			if(use_echo)
+			{
+				int d1 = best_d1;
+				for(int p=0; p<nPil; p++)
+				{ double ph=-twopi*pil_k[p]*(double)d1/(double)Nfft; b1[p]=std::complex<double>(cos(ph),sin(ph)); }
+				std::complex<double> M01(0,0); double M11=0.0;
+				for(int p=0; p<nPil; p++){ M01+=b1[p]; M11+=std::norm(b1[p]); }
+				double M00r=(double)nPil+ridge, M11r=M11+ridge;
+				std::complex<double> M10=std::conj(M01);
+				std::complex<double> det=M00r*M11r-M01*M10;
+				for(int s=0; s<Nsymb; s++)
+				{
+					std::complex<double> r0(0,0),r1(0,0);
+					for(int p=0; p<nPil; p++){ std::complex<double> yy=y[(size_t)s*nPil+p]; r0+=yy; r1+=std::conj(b1[p])*yy; }
+					std::complex<double> g0=(M11r*r0-M01*r1)/det;
+					std::complex<double> g1=(-M10*r0+M00r*r1)/det;
+					for(int j=0; j<Nc; j++)
+					{
+						double kj=(j<Nc2)?(double)(j-Nc2):(double)(j-Nc2+start_shift);
+						double ph=-twopi*kj*(double)d1/(double)Nfft;
+						(estimated_channel + s*Nc + j)->value  = g0 + g1*std::complex<double>(cos(ph),sin(ph));
+						(estimated_channel + s*Nc + j)->status = MEASURED;
+					}
+				}
+				notch_filled = true;   // parametric H written => skip interp + smoother
+			}
+			// else: echo rejected => leave raw LS pilots intact, fall through to stock.
+
+			// (6) One-shot activation witness (fire proof): the estimator fired, with
+			//     the recovered echo delay and null-vs-echo residuals. Poor bracket:
+			//     the 2 ms echo => d1 ~ 24 baseband samples; a clean channel => d1
+			//     rejected (use_echo=0), deferring to interpolation.
+			static bool _notch_banner = false;
+			if(!_notch_banner)
+			{
+				_notch_banner = true;
+				printf("[EST-NOTCH] mode=%d %s Nc=%d Nsymb=%d nPil=%d d1=%d use_echo=%d "
+				       "flat_res=%.4e echo_res=%.4e Dmax=%d\n",
+				       est_notch, use_echo ? "parametric" : "deferred", Nc, Nsymb, nPil,
+				       best_d1, use_echo?1:0, flat_res, best_res, Dmax);
+				fflush(stdout);
+			}
+		}
+		// nPil<3 (never on the LOW48 10-pilot lattice) also defers to stock below.
+	}
+
+	if(!notch_filled)
+	{
 	if(pilot_configurator.sparse_wide_data_carriers > 0)
 	{
 		// The S20 grid uses continual pilot COLUMNS rather than the production
@@ -2179,13 +2353,17 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 			}
 		}
 	}
+	}   // end if(!notch_filled) -- stock interpolation branch
 
 	// DFT-based channel estimate smoothing (same as ZF estimator). For the LS
 	// path this runs BEFORE the noise-variance estimate (restored pre-E1 order,
 	// reverting commit 38f5c60 for THIS estimator only) so the residual is
 	// measured against the SAME final smoothed+interpolated H that the data
 	// carriers are equalized with. See fix/cfg16-nv-restore rationale below.
-	smooth_channel_estimate_dft();
+	// The parametric notch estimator writes an analytic (already delay-limited) H,
+	// so the DFT time-window smoother is skipped when it fired (notch_filled).
+	if(!notch_filled)
+		smooth_channel_estimate_dft();
 
 	// CFG16 32-QAM clean-channel regression fix (fix/cfg16-nv-restore,
 	// fact-documents/data-flow-noise_variance_estimate.md).
@@ -2261,6 +2439,13 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 	// above; this toggle isolates the exact quantity that changed. Production
 	// path keeps the restored residual (this flag default false).
 	if(ls_use_crosspilot_nv)
+		noise_variance_estimate = estimate_noise_from_pilot_pairs(in);
+
+	// Parametric notch nv-isolation control (MERCURY_EST_NOTCH=2): keep the parametric
+	// H but take nv from the cross-pilot differential thermal floor instead of the
+	// pilot-residual estimate above. Isolates the nv contribution; mode 1 keeps the
+	// residual nv. Default (mode 0/OFF) leaves this untouched.
+	if(do_notch && est_notch == 2)
 		noise_variance_estimate = estimate_noise_from_pilot_pairs(in);
 
 	// [LS-NV-DBG] Validation instrumentation (fix/cfg16-nv-restore): log the
