@@ -1269,8 +1269,13 @@ int cl_arq_controller::test_topgear_clean_election()
 	//     report snr_q BOTH saturate at 25, so both a below-floor and an above-floor flat
 	//     report clip to SNR_downlink=25 and pass the margin gate identically — only the
 	//     RSP's UN-clipped floor verdict (flat_state 9 vs 11) separates them.
+	//     This arm pins the LEGACY raw-SNR floor compare (MERCURY_TOPGEAR_FLOOR_QUANTIZED=0):
+	//     its 30 dB floor sits ABOVE the snr_q reconstruction ceiling (snr_q*2-5 maxes at 25),
+	//     so it exercises the legacy-mode saturation path; the quantized-floor DEFAULT is
+	//     covered at the production 24 dB floor by arm (8d) below.
 	cmd->load_configuration(CONFIG_16, FULL, YES);
 	set_env("MERCURY_CFG17_SNR_FLOOR", "30");
+	set_env("MERCURY_TOPGEAR_FLOOR_QUANTIZED", "0");
 	unsigned char rpt_below   = cmd->topgear_pack_report(25.0, 0.05);  // flat, 25<30 floor
 	unsigned char rpt_above   = cmd->topgear_pack_report(34.0, 0.05);  // flat, 34>=30 floor
 	unsigned char rpt_nonflat = cmd->topgear_pack_report(34.0, 0.30);  // selective (2-path)
@@ -1295,6 +1300,7 @@ int cl_arq_controller::test_topgear_clean_election()
 	}
 	check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
 	      "@28 GUARD: above-floor flat report engages cfg17 (pass-after)");
+	clr_env("MERCURY_TOPGEAR_FLOOR_QUANTIZED");
 	clr_env("MERCURY_CFG17_SNR_FLOOR");
 	cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
 	cmd->current_configuration = CONFIG_16;
@@ -1392,6 +1398,63 @@ int cl_arq_controller::test_topgear_clean_election()
 		clr_env("MERCURY_CFG17_SNR_FLOOR");
 		cmd->topgear_elect_engaged = false; cmd->topgear_elect_clean_streak = 0;
 		cmd->topgear_channel_flatness = -1.0;
+		cmd->current_configuration = CONFIG_16;
+	}
+
+	// (8d) DIAL-22 QUANTIZED-FLOOR CONSISTENCY -- the RSP forward-report floor admit must match the
+	//      commander's reconstructed forward EVM-SNR (snr_q*2-5), not the raw un-clipped SNR
+	//      (cross-layer data-flow audit fix; MERCURY_TOPGEAR_FLOOR_QUANTIZED, DEFAULT-ON). A raw SNR
+	//      in [24,25) at a nominal-22 dial quantizes to snr_q=14 -> the commander reconstructs 23
+	//      (< the 24 floor) yet the raw-SNR admit test (24>=24) packs flat_state 11, leaking an
+	//      honest below-floor cfg17 (the dial-22 2/16 floor-leak). The fix computes floor_ok from the
+	//      same quantized value the commander reconstructs, so 23<24 -> flat_state 9. Each arm SETS
+	//      the env explicitly so its verdict is independent of the shipped default; arm (d) then
+	//      verifies the default itself.
+	{
+		set_env("MERCURY_CFG17_SNR_FLOOR", "24.0");
+		double flat_cv = 0.009;                     // honestly flat forward channel
+		double raw_snr = 24.0;                       // in [24,25): snr_q=14, reconstructs to 23<24
+
+		// (a) FIX OFF (MERCURY_TOPGEAR_FLOOR_QUANTIZED=0, legacy raw-SNR compare): raw-SNR floor_ok
+		//     (24>=24) -> flat_state 11 (env set explicitly, so the fail-before arm reproduces the
+		//     legacy floor-leak regardless of the build default).
+		set_env("MERCURY_TOPGEAR_FLOOR_QUANTIZED", "0");
+		unsigned char rpt_q_off = cmd->topgear_pack_report(raw_snr, flat_cv);
+		check((rpt_q_off & 0x0F) == 11,
+		      "DIAL22-FLOOR fail-before: fix OFF (=0) admits raw SNR 24.0 in [24,25) -> flat_state 11 "
+		      "(reconstructed 23<24 floor-leak reproduced)");
+
+		// (b) FIX ON (=1): quantized floor_ok (snr_q*2-5 = 23 >= 24 is false) -> flat_state 9 (NOT 11).
+		set_env("MERCURY_TOPGEAR_FLOOR_QUANTIZED", "1");
+		unsigned char rpt_q_on = cmd->topgear_pack_report(raw_snr, flat_cv);
+		check((rpt_q_on & 0x0F) == 9,
+		      "DIAL22-FLOOR pass-after: fix ON (=1) refuses raw SNR 24.0 (reconstructs 23<24) -> "
+		      "flat_state 9 (below-floor, cfg17 NOT admitted; floor-leak killed)");
+		check((rpt_q_on & 0x0F) != 11,
+		      "DIAL22-FLOOR pass-after: fix ON (=1) does NOT admit the below-floor cfg17 (flat_state != 11)");
+
+		// (c) SAFETY, FIX ON (=1): a genuinely above-floor SNR (snr_q=15 -> reconstructs 25>=24) still admits.
+		set_env("MERCURY_TOPGEAR_FLOOR_QUANTIZED", "1");
+		double raw_hi = 25.5;                        // snr_q=15, reconstructs to 25 >= 24
+		unsigned char rpt_q_hi = cmd->topgear_pack_report(raw_hi, flat_cv);
+		check((rpt_q_hi & 0x0F) == 11,
+		      "DIAL22-FLOOR safety: fix ON (=1) + reconstructed 25>=24 -> flat_state 11 "
+		      "(above-floor cfg17 still admitted)");
+
+		// (d) DEFAULT-ON (env UNSET): the shipped merge default compares the quantized value, NOT the
+		//     raw SNR. raw SNR 24.0 -> reconstructs 23<24 -> flat_state 9 (proves the fix is genuinely
+		//     ON with no env set).
+		clr_env("MERCURY_TOPGEAR_FLOOR_QUANTIZED");
+		unsigned char rpt_q_def = cmd->topgear_pack_report(raw_snr, flat_cv);
+		int fs_q_def = rpt_q_def & 0x0F;
+		check(fs_q_def == 9,
+		      "DIAL22-FLOOR default-ON: env UNSET refuses raw SNR 24.0 (reconstructs 23<24) -> "
+		      "flat_state 9 (the merged default compares the quantized value, not the raw SNR)");
+		check(fs_q_def != 11,
+		      "DIAL22-FLOOR default-ON: env UNSET does NOT admit the below-floor cfg17 (flat_state != 11)");
+
+		clr_env("MERCURY_TOPGEAR_FLOOR_QUANTIZED");
+		clr_env("MERCURY_CFG17_SNR_FLOOR");
 		cmd->current_configuration = CONFIG_16;
 	}
 

@@ -3952,7 +3952,21 @@ unsigned char cl_arq_controller::topgear_pack_report(double snr, double flatness
 		const char* fenv = std::getenv("MERCURY_CFG17_SNR_FLOOR");
 		double floor_db = (fenv && *fenv) ? atof(fenv) : 0.0;
 		bool guard_on = (floor_db > 0.0);
-		bool floor_ok = std::isfinite(snr) && (snr >= floor_db);
+		// Dial-22 floor-leak fix (cross-layer data-flow audit; DEFAULT-ON): the commander
+		// reconstructs the forward EVM-SNR as snr_q*2-5 (the floor-quantized value that
+		// topgear_apply_report rebuilds from the packed report), but this RSP-side floor
+		// admit historically compared the raw un-clipped `snr`. A raw SNR in [floor, floor+2)
+		// sets snr_q so the RECONSTRUCTED value lands BELOW the floor while the raw compare
+		// passes -> flat_state 11 admits a cfg17 the commander then treats as below-floor
+		// (the [24,25)@nominal-22 leak: raw>=24 but the reconstructed 23<24). DEFAULT
+		// (env unset): compare the SAME quantized value the commander reconstructs, so the
+		// RSP admit decision == the commander reconstruction. MERCURY_TOPGEAR_FLOOR_QUANTIZED=0
+		// restores the legacy raw-SNR compare (byte-identical to the pre-fix gate).
+		double floor_metric = (double)(snr_q * 2 - 5);   // == the value topgear_apply_report reconstructs
+		const char* qenv = std::getenv("MERCURY_TOPGEAR_FLOOR_QUANTIZED");
+		if(qenv && *qenv && atoi(qenv) == 0)
+			floor_metric = snr;   // legacy raw un-clipped SNR compare (fix disabled)
+		bool floor_ok = std::isfinite(floor_metric) && (floor_metric >= floor_db);
 		flat_state = !flat ? 10 : ((guard_on && floor_ok) ? 11 : 9);
 	}
 	return (unsigned char)(((unsigned)snr_q << 4) | (unsigned)flat_state);
@@ -4007,7 +4021,7 @@ void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq
 	topgear_channel_flatness = (flat_state == 8)  ? -1.0
 	                         : (flat_state == 10) ? TOPGEAR_FLATNESS_MAX + 0.01   // non-flat
 	                         : 0.0;                                               // 9 or 11 => flat
-	topgear_cfg17_floor_ok = (flat_state == 11);  // @28 GUARD verdict from the RSP's un-clipped SNR
+	topgear_cfg17_floor_ok = (flat_state == 11);  // cfg17 floor verdict from the RSP report (RSP compares the quantized snr_q*2-5 by default; MERCURY_TOPGEAR_FLOOR_QUANTIZED=0 => legacy raw SNR)
 	topgear_cfg17_floor_bsi = topgear_cfg17_floor_ok ? bsi : -1;
 	topgear_last_flat_state = flat_state;   // B2: remember WHY (9 below-floor vs 10 non-flat)
 	topgear_elect_evaluate();
