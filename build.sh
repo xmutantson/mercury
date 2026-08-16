@@ -204,6 +204,10 @@ if [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "mingw"* ]] || [[ "$OSTYPE" == 
     PLATFORM="windows"
     CXXFLAGS="$CXXFLAGS -I./third_party/glfw/include"
     LDFLAGS="-L./third_party/glfw/lib -lglfw3 -lopengl32 -lgdi32 -lole32 -ldsound -ldxguid -lws2_32 -lbcrypt -static-libgcc -static-libstdc++ -static -l:libwinpthread.a $EXTRA_LDFLAGS"
+    # Standalone test binaries must link static too: a dynamic link picks up
+    # whatever libstdc++-6.dll is first on PATH (e.g. Git's mingw64), and the
+    # cross-toolchain ABI mismatch segfaults the test run.
+    TEST_LDFLAGS="-static -static-libgcc -static-libstdc++"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     PLATFORM="macos"
     CXXFLAGS="$CXXFLAGS $(pkg-config --cflags glfw3)"
@@ -624,7 +628,7 @@ run_l1_block_codec_test() {
     local test_bin="${BUILDDIR}/test_l1_block_codec"
     echo "Building and running L1 block codec test..."
     $CXX $CXXFLAGS source/datalink_layer/l1_block_codec.cc \
-        source/datalink_layer/test_l1_block_codec.cc -o "$test_bin"
+        source/datalink_layer/test_l1_block_codec.cc -o "$test_bin" ${TEST_LDFLAGS:-}
     "$test_bin"
 }
 
@@ -636,7 +640,7 @@ run_l1_stage3_test() {
     $CXX $CXXFLAGS source/datalink_layer/l1_block_codec.cc \
         source/datalink_layer/l1_tx_journal.cc \
         source/datalink_layer/l1_block_ack.cc \
-        source/datalink_layer/test_l1_stage3.cc -o "$test_bin" -pthread
+        source/datalink_layer/test_l1_stage3.cc -o "$test_bin" -pthread ${TEST_LDFLAGS:-}
     "$test_bin"
 }
 

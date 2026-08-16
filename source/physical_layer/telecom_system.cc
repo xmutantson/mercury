@@ -1663,14 +1663,14 @@ int cl_telecom_system::test_acq_band_excl()
 
 	// A nearby delay within the band (same wrong-lock, ±half symbol) also HITs.
 	mc = -1;
-	bool near = acq_band_excl_hit(PLATEAU + sym_full, radius, &mc);   // within 2*sym_full
-	check(near, "in-band neighbor (+1 symbol) is a HIT (BAND, not a single delay)");
+	bool near_hit = acq_band_excl_hit(PLATEAU + sym_full, radius, &mc);   // within 2*sym_full
+	check(near_hit, "in-band neighbor (+1 symbol) is a HIT (BAND, not a single delay)");
 
-	// A delay FAR outside the band is a MISS and opens a NEW band (not one delay).
+	// A delay well outside the band is a MISS and opens a NEW band (not one delay).
 	mc = -1;
-	int FAR = PLATEAU + 40 * sym_full;
-	bool far = acq_band_excl_hit(FAR, radius, &mc);
-	check(!far, "far delay (out of band) is a MISS => new band, not a global block");
+	int far_delay = PLATEAU + 40 * sym_full;
+	bool far_hit = acq_band_excl_hit(far_delay, radius, &mc);
+	check(!far_hit, "far delay (out of band) is a MISS => new band, not a global block");
 	check(acq_excl_count == 2, "second band opened (count 1->2)");
 
 	// Directed stale-ring regression: this relative delay now contains a valid

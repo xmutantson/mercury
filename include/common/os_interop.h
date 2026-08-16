@@ -19,6 +19,21 @@
 #include <pthread.h>
 #include <io.h>
 #include <time.h>
+#include <stdlib.h>
+
+// MSVCRT never declares the POSIX env setters; provide them here so every
+// translation unit that reaches this interop layer can use the POSIX names.
+static inline int setenv(const char *name, const char *value, int overwrite)
+{
+	if (!overwrite && getenv(name) != NULL)
+		return 0;
+	return _putenv_s(name, value);
+}
+
+static inline int unsetenv(const char *name)
+{
+	return _putenv_s(name, "");
+}
 
 #ifdef __cplusplus
 extern "C" {

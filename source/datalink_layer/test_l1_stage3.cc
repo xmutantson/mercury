@@ -4,6 +4,15 @@
 #include <cstdlib>
 #include <vector>
 
+#ifdef _WIN32
+// MSVCRT never declares the POSIX env setters (same shim as arq_common.cc).
+static int setenv(const char* name, const char* value, int overwrite) {
+	if(!overwrite && getenv(name) != NULL) return 0;
+	return _putenv_s(name, value);
+}
+static int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
+
 using l1_block::BlockAckRuntime;
 using l1_block::DispatchDisposition;
 

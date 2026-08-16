@@ -6,6 +6,12 @@
 #include <fstream>
 #include <utility>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace mercury {
 namespace {
 std::atomic<uint64_t> g_session_counter(1);
@@ -338,7 +344,13 @@ bool L1TxJournal::write_marker() {
     out.flush();
     if (!out.good()) return false;
   }
+#ifdef _WIN32
+  // POSIX rename atomically replaces an existing target; Windows refuses it.
+  return MoveFileExA(temporary.c_str(), marker_path_.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
   return std::rename(temporary.c_str(), marker_path_.c_str()) == 0;
+#endif
 }
 
 void L1TxJournal::clear_marker() {
