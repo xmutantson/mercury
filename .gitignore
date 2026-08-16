@@ -118,3 +118,5 @@ tools/*.sh
 !tools/timesync_trace_validate.py
 !tools/validate_ldpc_matrices.py
 !tools/wb_sweep_clean.py
+_codex_worktrees/
+l1s3_impl/
