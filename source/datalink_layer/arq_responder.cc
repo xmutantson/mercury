@@ -582,7 +582,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 				//   data[0]   = TEST_CONNECTION
 				//   data[1..4]= u_SNR.char4_SNR (float SNR_uplink)
 				//   data[5]   = local_capability (peer's cap byte; MFSK ctrl carries the
-				//               low 4 negotiable bits CAP_NEGOTIABLE_MASK=0x0F)
+				//               six negotiable bits CAP_NEGOTIABLE_MASK=0x3F)
 				//   data[6]   = peer SSID
 				//   length    = 7
 				//   sequence_number = control_batch_size - 1 so the consumer
@@ -623,6 +623,29 @@ void cl_arq_controller::process_messages_rx_data_control()
 		// owned by the RECEIVING-entry set (frame_symb+10, see :1913) that the OFDM
 		// data path needs; nothing pins it to 2 in the pre-data window anymore.
 		this->receive();
+
+		// A short final group is closed by an authenticated/session-bound
+		// BLOCK_COMMIT. The RX dispatcher has already validated it before any
+		// legacy parser mutation; flush the retained batch bitmaps now.
+		if(messages_rx_buffer.status == RECEIVED
+		   && messages_rx_buffer.type == BLOCK_COMMIT
+		   && l1_blockack_data_active())
+		{
+			std::vector<uint8_t> wire;
+			const bool requested = l1_blockack.take_flush_request();
+			messages_rx_buffer.status = FREE;
+			if(requested && l1_blockack.flush_received_batches(&wire))
+			{
+				l1_send_block_control(wire);
+				printf("[L1-BLOCKACK-RSP] tail commit flushed retained group\n");
+				fflush(stdout);
+			}
+			telecom_system->set_mfsk_ctrl_mode(false);
+			calculate_receiving_timeout();
+			receiving_timer.start();
+			connection_status = RECEIVING;
+			return;
+		}
 
 		// Emergency BREAK: commander signals "drop to ROBUST_0"
 		// Only act on a BREAK aimed at THIS session — prevents idle radios on a
@@ -2623,7 +2646,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 	// nUnder is counted (not accumulated frame-processing nUnder).
 	telecom_system->data_container.nUnder_processing_events = 0;
 
-	if(ack_pattern_time_ms > 0)
+	if(ack_pattern_time_ms > 0 || l1_blockack_data_active())
 	{
 		// Send ACK tone pattern (universal, all modes)
 		if(repeating_last_ack==NO)
@@ -2806,6 +2829,29 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					bool sack_bitmap[MAX_SACK_BATCH_SIZE];
 					for(int i = 0; i < eff_window && i < MAX_SACK_BATCH_SIZE; i++)   // Option B' (§9)
 						sack_bitmap[i] = (messages_rx[i].status == RECEIVED);
+
+					// Stage-3 uses the same production ACK gate, but a partial batch
+					// closes the group immediately. Positive slots are reported; the
+					// commander's journal retains every miss and both peers abort
+					// loudly rather than sending later data across an undelivered hole.
+					if(l1_blockack_data_active())
+					{
+						const uint8_t bsi = (uint8_t)(
+							rsp_current_expected_batch_seq_id >= 0
+								? rsp_current_expected_batch_seq_id : 0);
+						std::vector<bool> received((std::size_t)eff_window, false);
+						for(int i=0;i<eff_window && i<MAX_SACK_BATCH_SIZE;i++)
+							received[(std::size_t)i] = sack_bitmap[i];
+						std::vector<uint8_t> wire;
+						if(l1_blockack.observe_received_batch(bsi, received,
+							/*final=*/true, &wire))
+							l1_send_block_control(wire);
+						printf("[L1-BLOCKACK-RSP] partial bsi=%u flushed; "
+							"aborting before any later-batch delivery\n", (unsigned)bsi);
+						fflush(stdout);
+						rsp_gap_abort_teardown("L1 block partial retained by sender journal");
+						return;
+					}
 
 					// SACK Design A Step 7 — OFDM SACK_RSP control frame
 					// (~390 ms wire occupancy). Step 15: legacy MFSK SACK
@@ -3315,6 +3361,29 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		{
 			// no confirm emitted — see the gap-abort rationale above.
 		}
+		else if(l1_blockack_data_active())
+		{
+			const uint8_t ack_bsi = (uint8_t)(
+				rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
+			std::vector<bool> received((std::size_t)eff_window, true);
+			std::vector<uint8_t> wire;
+			if(l1_blockack.observe_received_batch(ack_bsi, received,
+				/*final=*/false, &wire))
+			{
+				l1_send_block_control(wire);
+			}
+			else
+			{
+				// No reverse keying for an intermediate clean batch. Re-arm the
+				// production LDPC receive geometry for the next forward batch.
+				telecom_system->data_container.frames_to_read =
+					telecom_system->data_container.preamble_nSymb
+					+ telecom_system->get_active_nsymb();
+				printf("[L1-BLOCKACK-RSP] clean bsi=%u retained; ACK deferred\n",
+					(unsigned)ack_bsi);
+				fflush(stdout);
+			}
+		}
 		else if(sack_v2_enabled)
 		{
 			unsigned char ack_bsi = (unsigned char)(
@@ -3764,6 +3833,9 @@ void cl_arq_controller::process_control_responder()
 		// (both-support), starting with the TEST_CONNECTION_ACK it queues below
 		// on robust configs — the commander's RX runs detect-both either way.
 		update_robust_preamble_negotiation();
+		// The decoded TEST_CONNECTION is the authenticated peer capability
+		// proof on the responder. Stage-3 still requires both advertised bits.
+		l1_complete_blockack_handshake(true);
 
 		// Read commander's SSID from byte 6 (sent separately from packed callsign)
 		{

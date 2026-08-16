@@ -41,6 +41,7 @@
 #include "datalink_layer/rate_optimizer.h"
 #include "datalink_layer/channel_state_lookup.h"
 #include "datalink_layer/l1_tx_journal.h"
+#include "datalink_layer/l1_block_ack.h"
 #include "crypto/mercury_crypto.h"
 #include <iomanip>
 #include <thread>
@@ -369,7 +370,7 @@ inline bool d5_should_mark_retx_tail(bool negotiated, bool sack_v2,
 // original precedent) and the NB robust-preamble bit (same class: older
 // builds echo the LDPC byte verbatim but the 4-bit MFSK ctrl-suffix strips
 // it, and pre-capability builds never advertise it).
-#define CAP_ECHO_OPTIONAL ((uint8_t)(CAP_RETX_TURN_TAIL | CAP_ROBUST_PREAMBLE_NB))
+#define CAP_ECHO_OPTIONAL ((uint8_t)(CAP_RETX_TURN_TAIL | CAP_ROBUST_PREAMBLE_NB | CAP_L1_BLOCKACK))
 inline bool handshake_cap_echo_compatible(uint8_t local_cap,
 		uint8_t echoed_cap, uint8_t peer_own_cap)
 {
@@ -393,7 +394,8 @@ inline uint8_t legacy_ack_inferred_peer_cap(uint8_t echoed_local_cap)
 	// preamble against exactly the class of peer (old build, bare-ACK-only)
 	// that cannot acquire it.
 	return (uint8_t)(echoed_local_cap
-		& (uint8_t)~(CAP_RETX_TURN_TAIL | CAP_ROBUST_PREAMBLE_NB));
+		& (uint8_t)~(CAP_RETX_TURN_TAIL | CAP_ROBUST_PREAMBLE_NB
+			| CAP_L1_BLOCKACK));
 }
 // §7.13.39 Fix 1 — must be at least 2*MAX_SACK_BATCH_SIZE so the
 // "channel collapse" safety net (retransmit_count > 2*data_batch_size →
@@ -518,6 +520,11 @@ public:
   // upper owner after teardown; it deliberately survives reset_session_state().
   mercury::L1TerminalQueue l1_terminal_queue;
   mercury::L1TxJournal l1_tx_journal;
+  l1_block::BlockAckRuntime l1_blockack;
+  void l1_complete_blockack_handshake(bool authenticated_echo);
+  bool l1_blockack_data_active() const;
+  long long l1_send_block_control(const std::vector<uint8_t>& wire);
+  void l1_release_current_batch_to_journal();
   bool l1_stage_batch_before_tx();
   void l1_mark_batch_sent();
   void l1_apply_reset_event(mercury::L1ResetEvent event);

@@ -174,6 +174,36 @@ static inline uint8_t robust_preamble_nb_advertise_bit()
 	return cached ? (uint8_t)CAP_ROBUST_PREAMBLE_NB : (uint8_t)0;
 }
 
+void cl_arq_controller::l1_complete_blockack_handshake(bool authenticated_echo)
+{
+	const uint8_t conn = (uint8_t)(connection_id != 0
+		? connection_id : assigned_connection_id);
+	const uint8_t lo = local_capability < peer_capability
+		? local_capability : peer_capability;
+	const uint8_t hi = local_capability < peer_capability
+		? peer_capability : local_capability;
+	const uint16_t negotiation = (uint16_t)(((uint16_t)lo << 8) | hi);
+	l1_blockack.begin_session(conn, 0x4c310000u | conn, 1, negotiation);
+	l1_blockack.complete_handshake(local_capability, peer_capability,
+		authenticated_echo);
+}
+
+bool cl_arq_controller::l1_blockack_data_active() const
+{
+	if(!l1_blockack.enabled() || data_batch_size <= 0) return false;
+	// A BLOCK_SACK body is fixed(22) + N directory entries(5 each) +
+	// ceil(N*span/8) bitmap + CRC(1), plus the standard 3-byte frame header.
+	// Fail closed to the legacy per-batch ACK on low-rate configurations whose
+	// information word cannot carry the negotiated worst-case aggregate.
+	const std::size_t batches = l1_blockack.aggregate_batches();
+	const std::size_t slots = batches * (std::size_t)data_batch_size;
+	const std::size_t needed = l1_block::CONTROL_HEADER_BYTES + 22u
+		+ 5u * batches + (slots + 7u) / 8u
+		+ l1_block::INTEGRITY_TRAILER_BYTES;
+	const int available = max_data_length + max_header_length;
+	return available > 0 && needed <= (std::size_t)available;
+}
+
 // LEVER P: normalize the PHY-published preamble geometry for ARQ ring/cursor
 // accounting. Zero is deliberate only while preamble amortization is active
 // (MINI0 tail); with amortization off it retains its legacy/uninitialized meaning
@@ -8471,7 +8501,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
 		commander_configured_nb=narrowband_enabled;
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit() | l1_block::capability_advertise_bit();
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		update_robust_preamble_negotiation();
@@ -8578,7 +8608,7 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		original_role=RESPONDER;
 		set_role(RESPONDER);
-		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
+		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit() | l1_block::capability_advertise_bit();
 		peer_capability = 0;
 		wb_upgrade_pending = false;
 		update_robust_preamble_negotiation();
@@ -8615,7 +8645,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting NB only (500 Hz)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_NB_ONLY;
-		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
+		local_capability = ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit() | l1_block::capability_advertise_bit();
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_NB_ONLY);
 #endif
@@ -8633,7 +8663,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (%s)\n", command.c_str());
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit() | l1_block::capability_advertise_bit();
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -8652,7 +8682,7 @@ void cl_arq_controller::process_user_command(std::string command)
 		printf("[BW] Setting auto mode (BW2500, legacy)\n");
 		fflush(stdout);
 		bandwidth_mode = BW_AUTO;
-		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit();
+		local_capability = CAP_WB_CAPABLE | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit() | l1_block::capability_advertise_bit();
 #ifdef MERCURY_GUI_ENABLED
 		g_gui_state.bandwidth_mode.store(BW_AUTO);
 #endif
@@ -9495,6 +9525,7 @@ void cl_arq_controller::reset_session_state()
 	commander_configured_nb = -1;
 	session_narrowband = false;
 	peer_capability = 0;
+	l1_blockack.reset_session();
 	wb_upgrade_pending = false;
 	handshake_confirmed = false;  // v9
 	handshake_retries_left = MAX_HANDSHAKE_RETRIES;  // v9
@@ -12045,7 +12076,8 @@ void cl_arq_controller::send(st_message* message, int message_location)
 		message_TxRx_byte_buffer[2]=message->sequence_number;
 		header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 	}
-	else if (message->type==SACK_RSP)
+	else if (message->type==SACK_RSP || l1_block::is_block_message_type(
+		(uint8_t)message->type))
 	{
 		// SACK Design A Step 7 — OFDM SACK_RSP control frame. Same 3-byte
 		// header as ACK_RANGE / ACK_MULTI / CONTROL: [type, conn_id, seq_num].
@@ -13208,6 +13240,52 @@ void cl_arq_controller::l1_mark_batch_sent()
 	if(!l1_tx_journal.mark_sent_many(keys)) std::abort();
 }
 
+void cl_arq_controller::l1_release_current_batch_to_journal()
+{
+	if(!l1_blockack.enabled()) return;
+	// The journal is already the SENT owner. Free only the single-batch legacy
+	// cache so another generation can be built; this is not a delivery claim.
+	for(int i=0;i<nMessages;i++)
+		if(messages_tx[i].status==PENDING_ACK
+			|| messages_tx[i].status==ACK_TIMED_OUT)
+			messages_tx[i].status=ACKED;
+	cleanup();
+	block_under_tx=NO;
+}
+
+long long cl_arq_controller::l1_send_block_control(
+	const std::vector<uint8_t>& wire)
+{
+	if(passive_monitor || !l1_blockack.enabled()
+		|| wire.size() <= l1_block::CONTROL_HEADER_BYTES
+		|| !l1_block::is_block_message_type(wire[0])
+		|| wire[1] != (uint8_t)connection_id)
+		return 0;
+	const std::size_t body_size = wire.size() - l1_block::CONTROL_HEADER_BYTES;
+	const int available = max_data_length + max_header_length;
+	if(body_size > (std::size_t)(N_MAX / 8) || available <= 0
+		|| wire.size() > (std::size_t)available) return 0;
+
+	messages_control.type = (char)wire[0];
+	messages_control.sequence_number = (char)wire[2];
+	messages_control.id = 0;
+	messages_control.length = (int)body_size;
+	for(std::size_t i=0;i<body_size;i++)
+		messages_control.data[i] = (char)wire[l1_block::CONTROL_HEADER_BYTES + i];
+	messages_control.status = ADDED_TO_BATCH_BUFFER;
+	messages_control.batch_seq_id = -1;
+	message_batch_counter_tx = 0;
+	messages_batch_tx[0] = messages_control;
+	message_batch_counter_tx = 1;
+	telecom_system->set_mfsk_ctrl_mode(false);
+	auto started = std::chrono::steady_clock::now();
+	send_batch();
+	auto stopped = std::chrono::steady_clock::now();
+	messages_control.status = FREE;
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+		stopped - started).count();
+}
+
 void cl_arq_controller::l1_apply_reset_event(mercury::L1ResetEvent event)
 {
 	l1_tx_journal.apply(event);
@@ -13560,7 +13638,9 @@ void cl_arq_controller::send_batch()
 			message_TxRx_byte_buffer[2]=messages_batch_tx[i].sequence_number;
 			header_length=ACK_MULTI_ACK_RANGE_HEADER_LENGTH;
 		}
-		else if (messages_batch_tx[i].type==SACK_RSP)
+		else if (messages_batch_tx[i].type==SACK_RSP
+			|| l1_block::is_block_message_type(
+				(uint8_t)messages_batch_tx[i].type))
 		{
 			// SACK Design A Step 7 — OFDM SACK_RSP. 3-byte standard header;
 			// payload [batch_seq_id, bitmap..., CRC8] is carried in
@@ -18587,8 +18667,8 @@ void cl_arq_controller::receive()
 				}
 			}
 
+			int byte_copy_len = this->max_data_length + this->max_header_length;
 			{
-				int byte_copy_len = this->max_data_length + this->max_header_length;
 				if(byte_copy_len > N_MAX/8) byte_copy_len = N_MAX/8;
 				for(int i=0; i < byte_copy_len; i++)
 				{
@@ -18604,21 +18684,37 @@ void cl_arq_controller::receive()
 					(unsigned char)this->connection_id);
 				fflush(stdout);
 			}
-			const uint8_t wire_prefix[] = {
-				(uint8_t)message_TxRx_byte_buffer[0],
-				(uint8_t)message_TxRx_byte_buffer[1],
-				(uint8_t)message_TxRx_byte_buffer[2]
-			};
 			l1_block::LegacyParserAckState legacy_state = {
 				messages_rx_buffer.status,
 				(uint8_t)messages_rx_buffer.type,
 				(uint8_t)messages_rx_buffer.sequence_number,
 				(uint8_t)last_received_message_sequence
 			};
-			if((passive_monitor || message_TxRx_byte_buffer[1] == this->connection_id
+			l1_block::DispatchDisposition l1_disposition =
+				l1_block::DispatchDisposition::IGNORED;
+			if(passive_monitor || message_TxRx_byte_buffer[1] == this->connection_id
 				|| message_TxRx_byte_buffer[1] == BROADCAST_ID)
-				&& l1_block::seat_legacy_receive_prefix(wire_prefix,
-					sizeof(wire_prefix), &legacy_state))
+			{
+				l1_disposition = l1_blockack.dispatch_received_frame(
+					(const uint8_t*)message_TxRx_byte_buffer,
+					(std::size_t)byte_copy_len, &legacy_state, &l1_tx_journal);
+				if(l1_disposition == l1_block::DispatchDisposition::BLOCK_ACK_APPLIED)
+				{
+					messages_rx_buffer.status = RECEIVED;
+					messages_rx_buffer.type = BLOCK_SACK;
+					messages_rx_buffer.sequence_number = 0;
+					last_received_message_sequence = 0;
+				}
+				else if(l1_disposition ==
+					l1_block::DispatchDisposition::BLOCK_FRAME_ACCEPTED)
+				{
+					messages_rx_buffer.status = RECEIVED;
+					messages_rx_buffer.type = message_TxRx_byte_buffer[0];
+					messages_rx_buffer.sequence_number = 0;
+					last_received_message_sequence = 0;
+				}
+			}
+			if(l1_disposition == l1_block::DispatchDisposition::LEGACY_SEATED)
 			{
 				messages_rx_buffer.status = legacy_state.rx_status;
 				messages_rx_buffer.type = (char)legacy_state.rx_type;

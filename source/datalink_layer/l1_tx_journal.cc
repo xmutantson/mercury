@@ -14,6 +14,11 @@ bool env_on(const char* name) {
   const char* value = std::getenv(name);
   return value && value[0] && std::atoi(value) != 0;
 }
+
+bool env_exact_one(const char* name) {
+  const char* value = std::getenv(name);
+  return value && value[0] == '1' && value[1] == '\0';
+}
 }  // namespace
 
 const char* l1_reset_event_name(L1ResetEvent event) {
@@ -65,7 +70,10 @@ std::size_t L1TerminalQueue::size() const {
 }
 
 L1TxJournal::L1TxJournal(L1TerminalQueue* terminal_owner)
-    : enabled_(env_on("MERCURY_L1_JOURNAL")), terminal_owner_(terminal_owner) {
+    : enabled_(env_on("MERCURY_L1_JOURNAL") ||
+               env_exact_one("MERCURY_L1_BLOCKACK")),
+      block_ack_mode_(env_exact_one("MERCURY_L1_BLOCKACK")),
+      terminal_owner_(terminal_owner) {
   const char* marker = std::getenv("MERCURY_L1_JOURNAL_STATE");
   marker_path_ = marker && marker[0] ? marker : ".mercury_l1_journal.pending";
   if (enabled_ && terminal_owner_) recover_restart_marker();
@@ -144,14 +152,16 @@ bool L1TxJournal::stage(uint8_t transmitted_bsi, uint16_t slot,
 bool L1TxJournal::stage_batch(uint8_t transmitted_bsi,
                              const std::vector<L1StageItem>& items) {
   if (!enabled_) return true;
-  if (items.empty() || items.size() > kSlotCap) return false;
+  if (items.empty() || items.size() > kBatchSlotCap) return false;
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (items[i].plaintext.empty()) return false;
     for (std::size_t j = i + 1; j < items.size(); ++j)
       if (items[i].slot == items[j].slot) return false;
   }
   if (!session_id_) begin_session(0);
-  if (have_last_bsi_ && transmitted_bsi < last_bsi_) apply(L1ResetEvent::BSI_WRAP);
+  if (have_last_bsi_ && transmitted_bsi < last_bsi_ &&
+      !(block_ack_mode_ && last_bsi_ == 255 && transmitted_bsi == 0))
+    apply(L1ResetEvent::BSI_WRAP);
   have_last_bsi_ = true;
   last_bsi_ = transmitted_bsi;
   std::vector<L1JournalEntry> before = entries_;
@@ -193,7 +203,7 @@ bool L1TxJournal::stage_batch(uint8_t transmitted_bsi,
         entries_.push_back(std::move(entry));
       }
     }
-    if (entries_.size() > kSlotCap) {
+    if (entries_.size() > kRetainedSlotCap) {
       entries_.swap(before);
       block_serial_ = serial_before;
       ordered_tx_seq_ = sequence_before;
@@ -252,9 +262,10 @@ bool L1TxJournal::acknowledge_many(
     for (auto it = entries_.begin(); it != entries_.end(); ++it)
       if (it->key == key) { acknowledged_.push_back(key); entries_.erase(it); break; }
   }
-  if (acknowledged_.size() > kSlotCap)
+  if (acknowledged_.size() > kRetainedSlotCap)
     acknowledged_.erase(acknowledged_.begin(),
-                        acknowledged_.begin() + (acknowledged_.size() - kSlotCap));
+                        acknowledged_.begin() +
+                            (acknowledged_.size() - kRetainedSlotCap));
   recovery_open_ = false;
   if (entries_.empty()) clear_marker();
   else if (!write_marker()) {

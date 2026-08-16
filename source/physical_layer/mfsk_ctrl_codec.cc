@@ -149,17 +149,19 @@ bool unpack_start_conn_payload(uint64_t p38, bool* out_nb_flag,
 //   bit  22     : echoed_cap[3]   (1)   echo of bit 3
 //   bit  21     : own_cap[4]      (1)   CAP_ROBUST_PREAMBLE_NB
 //   bit  20     : echoed_cap[4]   (1)   echo of bit 4
-//   bits 19..0  : reserved        (20)
+//   bit  19     : own_cap[5]      (1)   CAP_L1_BLOCKACK
+//   bit  18     : echoed_cap[5]   (1)   echo of bit 5
+//   bits 17..0  : reserved        (18)
 //
-// The cap fields carry the 5 negotiable MFSK-wire bits (CAP_WB_CAPABLE 0x01,
+// The cap fields carry the 6 negotiable MFSK-wire bits (CAP_WB_CAPABLE 0x01,
 // CAP_ENCRYPTION 0x02, CAP_CUMULATIVE_ACK 0x04, CAP_RETX_TURN_TAIL 0x08,
-// CAP_ROBUST_PREAMBLE_NB 0x10 = MASK0x1F). Bits 2..4 of each cap reuse
+// CAP_ROBUST_PREAMBLE_NB 0x10, CAP_L1_BLOCKACK 0x20 = MASK0x3F). Bits 2..5 reuse
 // a formerly-RESERVED payload bit ("must be 0 on TX, ignored on RX") — the EXACT §21
 // precedent that carried a 3rd cap bit (CAP_SUFFIX_FEC, since removed). This is a
 // SEMANTICS reuse of reserved bits, NOT a payload-width change: a legacy peer leaves
 // them 0 ⇒ bit 2 reads 0 ⇒ both_support false ⇒ per-batch fallback (interop-safe).
-// The PHY codec stays datalink-independent: it carries the low 5 negotiable bits via
-// literal shift/mask pairs (== datalink_defines.h CAP_NEGOTIABLE_MASK 0x1F) without
+// The PHY codec stays datalink-independent: it carries the low 6 negotiable bits via
+// literal shift/mask pairs (== datalink_defines.h CAP_NEGOTIABLE_MASK 0x3F) without
 // knowing the bit meanings.
 
 void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
@@ -176,7 +178,9 @@ void pack_test_ack_payload(uint64_t* p38, uint8_t echoed_cap,
 	v |= ((uint64_t)((echoed_cap >> 3) & 0x1)) << 22;  // echoed_cap bit 3 (echo of bit 3)
 	v |= ((uint64_t)((own_cap    >> 4) & 0x1)) << 21;  // own_cap bit 4 (CAP_ROBUST_PREAMBLE_NB)
 	v |= ((uint64_t)((echoed_cap >> 4) & 0x1)) << 20;  // echoed_cap bit 4 (echo of bit 4)
-	// reserved (bits 19..0) MUST be zero on TX
+	v |= ((uint64_t)((own_cap    >> 5) & 0x1)) << 19;  // own_cap bit 5 (CAP_L1_BLOCKACK)
+	v |= ((uint64_t)((echoed_cap >> 5) & 0x1)) << 18;  // echoed_cap bit 5 (echo of bit 5)
+	// reserved (bits 17..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -188,11 +192,13 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 	*echoed_cap = (uint8_t)(((v >> 36) & 0x3)
 		| (((v >> 24) & 0x1) << 2)
 		| (((v >> 22) & 0x1) << 3)
-		| (((v >> 20) & 0x1) << 4));
+		| (((v >> 20) & 0x1) << 4)
+		| (((v >> 18) & 0x1) << 5));
 	*own_cap    = (uint8_t)(((v >> 34) & 0x3)
 		| (((v >> 25) & 0x1) << 2)
 		| (((v >> 23) & 0x1) << 3)
-		| (((v >> 21) & 0x1) << 4));
+		| (((v >> 21) & 0x1) << 4)
+		| (((v >> 19) & 0x1) << 5));
 	*ssid       = (uint8_t)((v >> 26) & 0xFF);
 	return true;
 }
@@ -207,9 +213,10 @@ bool unpack_test_ack_payload(uint64_t p38, uint8_t* echoed_cap,
 //   bit  23     : local_cap[2]   (1)   FORGIVING-ACK Tier 2 (CAP_CUMULATIVE_ACK)
 //   bit  22     : local_cap[3]   (1)   CAP_RETX_TURN_TAIL
 //   bit  21     : local_cap[4]   (1)   CAP_ROBUST_PREAMBLE_NB
-//   bits 20..0  : reserved       (21)
+//   bit  20     : local_cap[5]   (1)   CAP_L1_BLOCKACK
+//   bits 19..0  : reserved       (20)
 //
-// The cap field carries the 5 negotiable MFSK-wire bits (CAP_WB_CAPABLE 0x01,
+// The cap field carries the 6 negotiable MFSK-wire bits (CAP_WB_CAPABLE 0x01,
 // CAP_ENCRYPTION 0x02, CAP_CUMULATIVE_ACK 0x04, CAP_RETX_TURN_TAIL 0x08,
 // CAP_ROBUST_PREAMBLE_NB 0x10). Bits 2..4 reuse formerly-RESERVED
 // payload bit (the §21 precedent; see pack_test_ack_payload) — SEMANTICS reuse, NOT
@@ -226,7 +233,8 @@ void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
 	v |= ((uint64_t)((local_cap >> 2) & 0x1)) << 23;  // local_cap bit 2 (CAP_CUMULATIVE_ACK)
 	v |= ((uint64_t)((local_cap >> 3) & 0x1)) << 22;  // local_cap bit 3 (CAP_RETX_TURN_TAIL)
 	v |= ((uint64_t)((local_cap >> 4) & 0x1)) << 21;  // local_cap bit 4 (CAP_ROBUST_PREAMBLE_NB)
-	// reserved (bits 20..0) MUST be zero on TX
+	v |= ((uint64_t)((local_cap >> 5) & 0x1)) << 20;  // local_cap bit 5 (CAP_L1_BLOCKACK)
+	// reserved (bits 19..0) MUST be zero on TX
 	*p38 = v & ((1ULL << 38) - 1ULL);
 }
 
@@ -239,7 +247,8 @@ bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
 	*local_cap = (uint8_t)(((v >> 32) & 0x3)
 		| (((v >> 23) & 0x1) << 2)
 		| (((v >> 22) & 0x1) << 3)
-		| (((v >> 21) & 0x1) << 4));
+		| (((v >> 21) & 0x1) << 4)
+		| (((v >> 20) & 0x1) << 5));
 	*ssid      = (uint8_t)((v >> 24) & 0xFF);
 	return true;
 }

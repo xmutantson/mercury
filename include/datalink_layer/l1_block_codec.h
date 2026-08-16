@@ -19,7 +19,9 @@ enum : uint8_t {
 };
 
 static const uint8_t VERSION = 1;
-static const uint16_t MAX_SLOT_CAP = 96;
+// Eight retained legacy-sized batches (96 slots each). Stage-3 extends the
+// ownership horizon, not the per-batch ARQ slot limit.
+static const uint16_t MAX_SLOT_CAP = 8 * 96;
 // The codec owns the payload after the standard [type, connection, sequence]
 // header. Every encoded body ends in the same CRC-8 used by SACK_RSP; the
 // standard header remains protected by the enclosing data-frame CRC-16.

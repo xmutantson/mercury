@@ -3945,6 +3945,17 @@ void cl_arq_controller::process_messages_tx_data()
 				return;
 			}
 		}
+		const uint8_t l1_block_tx_bsi = (uint8_t)(cmd_batch_seq_id & 0xFF);
+		bool l1_block_tail_candidate = false;
+		if(l1_blockack_data_active() && batch_includes_new_data)
+		{
+			bool staged_more = false;
+			for(int i=0;i<nMessages;i++)
+				if(messages_tx[i].status == ADDED_TO_LIST) staged_more = true;
+			const int fifo_occupied = fifo_buffer_tx.get_size()
+				- fifo_buffer_tx.get_free_size();
+			l1_block_tail_candidate = !staged_more && fifo_occupied == 0;
+		}
 		send_batch();
 		if(v2_mixed_batch)
 		{
@@ -3958,13 +3969,29 @@ void cl_arq_controller::process_messages_tx_data()
 		if(batch_includes_new_data)
 		{
 			cmd_batch_seq_id = (cmd_batch_seq_id + 1) & 0xFF;
+			if(l1_blockack_data_active())
+			{
+				l1_blockack.note_transmitted_batch(l1_block_tx_bsi);
+				if(l1_block_tail_candidate
+				   && l1_blockack.intermediate_silence_expected())
+				{
+					std::vector<uint8_t> commit;
+					if(l1_blockack.build_tail_commit(&commit))
+					{
+						l1_send_block_control(commit);
+						printf("[L1-BLOCKACK-CMD] tail commit after bsi=%u\n",
+							(unsigned)l1_block_tx_bsi);
+						fflush(stdout);
+					}
+				}
+			}
 		}
 		stats.nBatches_sent++;
 		last_transmission_block_stats.nBatches_sent++;
 
 		// Post-TX flush handled inside send_batch() via rx_mute.
 
-		if(ack_pattern_time_ms > 0)
+		if(ack_pattern_time_ms > 0 || l1_blockack_data_active())
 		{
 			// Expect ACK tone pattern — start polling quickly (same as control path).
 			telecom_system->data_container.frames_to_read = 4;
@@ -5420,18 +5447,38 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 
 void cl_arq_controller::process_messages_rx_acks_data()
 {
+	// Silence is the expected success signal between clean members of a
+	// negotiated block. Once this bounded window closes, transfer the legacy
+	// one-batch cache to the already-SENT journal owner and build the next BSI.
+	// No ACK counters, delivery flags, optimizer credit, or journal settlement
+	// are touched here; only a validated BLOCK_SACK can do those things.
+	if(l1_blockack.intermediate_silence_expected()
+	   && receiving_timer.get_elapsed_time_ms() >= receiving_timeout)
+	{
+		restore_sack_v2_rx_phy();
+		l1_release_current_batch_to_journal();
+		receiving_timer.stop();
+		receiving_timer.reset();
+		load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+		connection_status = TRANSMITTING_DATA;
+		printf("[L1-BLOCKACK-CMD] silent intermediate window closed; "
+			"journal retains ownership, advancing forward burst\n");
+		fflush(stdout);
+		return;
+	}
 	if(receiving_timer.get_elapsed_time_ms() >= receiving_timeout)
 		restore_sack_v2_rx_phy();
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
 	{
-		if(ack_pattern_time_ms > 0)
+		if(ack_pattern_time_ms > 0 || l1_blockack_data_active())
 		{
 			// Detection strategy: check SACK alongside ACK from the start.
 			// We only require a short minimum delay (ack_pattern_time_ms) so
 			// the RSP has time to send its response. Step 15: the legacy
 			// receive_sack_pattern() correlator is gone — SACK detection is
 			// now exclusively the OFDM SACK_RSP decode in the v2 branch below.
-			bool sack_window_open = sack_enabled && data_ack_received == NO
+			bool sack_window_open = (sack_enabled || l1_blockack_data_active())
+				&& data_ack_received == NO
 				&& receiving_timer.get_elapsed_time_ms() > (unsigned int)(ack_pattern_time_ms);
 
 			SACK_TRACE("poll bsi=%d cfg=%d rx_t=%ums ack_t=%dms sack_en=%d v2_en=%d window=%d axis3=%d dar=%d peak_match=%d",
@@ -5453,7 +5500,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			if(sack_window_open)
 			{
 				memset(sack_bitmap, 0, sizeof(sack_bitmap));
-				if(sack_v2_enabled && axis3_sack_mode != SACK_MODE_OFF)
+				if(l1_blockack_data_active()
+				   || (sack_v2_enabled && axis3_sack_mode != SACK_MODE_OFF))
 				{
 					// Step 6 of MFSK-suffix ACK+SACK redesign — CMD-side MFSK probe.
 					// Before the OFDM dispatch below, sniff the passband tail for an
@@ -5984,6 +6032,39 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						SACK_TRACE("v2 OFDM dispatch: calling receive() advance=%d need_syms=%d",
 							advance, v2_dispatch_min_advance_syms);
 						this->receive();
+						if(messages_rx_buffer.status == RECEIVED
+						   && messages_rx_buffer.type == BLOCK_SACK
+						   && !l1_blockack.last_ack_all_received())
+						{
+							// The dispatcher already settled every positive bit atomically.
+							// Missing entries remain journal-owned. This first production
+							// version closes the session loudly rather than advancing across
+							// an undelivered generation or fabricating retransmission state.
+							messages_rx_buffer.status = FREE;
+							if(!l1_terminalize_queued("block-ack-partial-terminal"))
+								std::abort();
+							printf("[L1-BLOCKACK-ARQ] partial aggregate: retained misses "
+								"transferred to terminal owner; dropping session loudly\n");
+							fflush(stdout);
+							link_status = DROPPED;
+							reset_session_state();
+							reset_all_timers();
+							return;
+						}
+						else if(messages_rx_buffer.status == RECEIVED
+						   && messages_rx_buffer.type == BLOCK_SACK
+						   && l1_blockack.last_ack_all_received())
+						{
+							// The real RX dispatcher has already validated and atomically
+							// settled every covered transmitted-BSI journal key. Route the
+							// current live batch through the existing clean-ACK funnel so
+							// ARQ status/stats/timers stay single-sourced.
+							v2_ack_pat_pre_detected = true;
+							mfsk_handled_this_poll = true;
+							messages_rx_buffer.status = FREE;
+							printf("[L1-BLOCKACK-ARQ] clean aggregate routed to data_ack_received=YES funnel\n");
+							fflush(stdout);
+						}
 
 						// After receive(): if INCOMPLETE-overflow fired,
 						// the next dispatch must wait for the missing
@@ -6585,7 +6666,41 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// (no SACK_RSP cycle), so sack_used=false.
 				unsigned long long opt_ldpc_bytes_delivered = 0;
 				bool opt_ldpc_ack_fired = false;
-				if(messages_rx_buffer.type==ACK_RANGE)
+				if(messages_rx_buffer.type==BLOCK_SACK && l1_blockack.enabled())
+				{
+					if(!l1_blockack.last_ack_all_received())
+					{
+						messages_rx_buffer.status=FREE;
+						if(!l1_terminalize_queued("block-ack-partial-terminal"))
+							std::abort();
+						printf("[L1-BLOCKACK-ARQ] partial aggregate on LDPC fallback; "
+							"terminal owner accepted misses\n");
+						fflush(stdout);
+						link_status=DROPPED;
+						reset_session_state();
+						reset_all_timers();
+						return;
+					}
+					data_ack_received=YES;
+					last_batch_fully_acked=true;
+					std::vector<int> block_ack_ids;
+					for(int i=0;i<nMessages;i++)
+						if(messages_tx[i].status==PENDING_ACK
+						   || messages_tx[i].status==ACK_TIMED_OUT)
+						{
+							opt_ldpc_bytes_delivered +=
+								(unsigned)messages_tx[i].length;
+							block_ack_ids.push_back(i);
+						}
+					register_acks(block_ack_ids, true);
+					stats.nBatches_acked += (long long)l1_blockack.last_ack_batch_count();
+					stats.nBatches_fully_acked +=
+						(long long)l1_blockack.last_ack_batch_count();
+					opt_ldpc_ack_fired=true;
+					printf("[L1-BLOCKACK-ARQ] clean aggregate accepted on LDPC fallback\n");
+					fflush(stdout);
+				}
+				else if(messages_rx_buffer.type==ACK_RANGE)
 				{
 					data_ack_received=YES;
 					consec_pure_silent_rounds = 0;   // R5: a credited data-ACK is a live peer -- reset the silent streak
@@ -9029,6 +9144,9 @@ void cl_arq_controller::process_control_commander()
 				// preamble bit -> this resolves to LEGACY (the interop floor).
 				update_robust_preamble_negotiation();
 			}
+			// Only the CRC-checked capability echo can enable Stage-3. The legacy
+			// inferred-capability branch therefore always resolves to legacy ACK.
+			l1_complete_blockack_handshake(is_ack && handshake_confirmed);
 			printf("[BW-NEG] Responder capability: 0x%02X (WB=%s, ENCRYPT=%s)\n",
 				peer_capability,
 				(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",

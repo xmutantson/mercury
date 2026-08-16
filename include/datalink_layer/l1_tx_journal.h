@@ -120,6 +120,7 @@ class L1TxJournal {
   void clear_marker();
 
   bool enabled_ = false;
+  bool block_ack_mode_ = false;
   bool recovery_open_ = false;
   bool have_last_bsi_ = false;
   uint8_t last_bsi_ = 0;
@@ -128,7 +129,8 @@ class L1TxJournal {
   uint64_t block_serial_ = 0;
   uint64_t ordered_tx_seq_ = 0;
   uint64_t authenticated_transfer_id_ = 0;
-  static const std::size_t kSlotCap = 96;
+  static const std::size_t kBatchSlotCap = 96;
+  static const std::size_t kRetainedSlotCap = 8 * kBatchSlotCap;
   std::vector<L1JournalEntry> entries_;
   std::vector<L1JournalKey> acknowledged_;
   L1TerminalQueue* terminal_owner_ = nullptr;

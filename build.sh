@@ -400,6 +400,7 @@ source/main.cc
 source/datalink_layer/arq_commander.cc
 source/datalink_layer/arq_common.cc
 source/datalink_layer/l1_tx_journal.cc
+source/datalink_layer/l1_block_ack.cc
 source/datalink_layer/arq_responder.cc
 source/datalink_layer/l1_block_codec.cc
 source/datalink_layer/test_bigblock_arq_unit.cc
@@ -628,6 +629,18 @@ run_l1_block_codec_test() {
 }
 
 run_l1_block_codec_test
+
+run_l1_stage3_test() {
+    local test_bin="${BUILDDIR}/test_l1_stage3"
+    echo "Building and running L1 Stage-3 production-path test..."
+    $CXX $CXXFLAGS source/datalink_layer/l1_block_codec.cc \
+        source/datalink_layer/l1_tx_journal.cc \
+        source/datalink_layer/l1_block_ack.cc \
+        source/datalink_layer/test_l1_stage3.cc -o "$test_bin" -pthread
+    "$test_bin"
+}
+
+run_l1_stage3_test
 
 if [ "$COMPILED" -eq 0 ]; then
     # Check if output exists and is up to date

@@ -211,16 +211,17 @@ static void test_pack_unpack_start_conn_payload() {
 static void test_pack_unpack_test_ack_payload() {
 	const char* name = "pack_unpack_test_ack_payload";
 	std::mt19937 rng(0xC0DE);
-	// Cap fields are the 5 negotiable MFSK-wire bits (CAP_NEGOTIABLE_MASK=0x1F:
-	// WB|ENCRYPTION|CUMULATIVE_ACK|RETX_TURN_TAIL|ROBUST_PREAMBLE_NB). Bits 2..4
+	// Cap fields are the 6 negotiable MFSK-wire bits (CAP_NEGOTIABLE_MASK=0x3F:
+	// WB|ENCRYPTION|CUMULATIVE_ACK|RETX_TURN_TAIL|ROBUST_PREAMBLE_NB|BLOCKACK).
+	// Bits 2..5
 	// reuse formerly-reserved payload bits, with no payload-width change. Cover
-	// the full 5-bit echoed_cap x own_cap x representative SSID; reserved is
-	// bits 19..0.
+	// the full 6-bit echoed_cap x own_cap x representative SSID; reserved is
+	// bits 17..0.
 	const uint8_t ssids[] = {0, 1, 7, 15, 16, 17, 18, 19, 50, 99, 255};
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
-	for (int ec = 0; ec < 32; ec++) {
-		for (int oc = 0; oc < 32; oc++) {
+	for (int ec = 0; ec < 64; ec++) {
+		for (int oc = 0; oc < 64; oc++) {
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();
@@ -229,9 +230,9 @@ static void test_pack_unpack_test_ack_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				// reserved is bits 19..0; bits 25..20 carry cap bits 2..4.
-				if ((p38 & ((1ULL << 20) - 1ULL)) != 0) {
-					test_fail(name, "reserved bits (19..0) not zero on TX");
+				// reserved is bits 17..0; bits 25..18 carry cap bits 2..5.
+				if ((p38 & ((1ULL << 18) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (17..0) not zero on TX");
 					return;
 				}
 				uint8_t out_ec = 0xFF, out_oc = 0xFF, out_ssid = 0;
@@ -249,15 +250,15 @@ static void test_pack_unpack_test_ack_payload() {
 			}
 		}
 	}
-	// A high cap byte (bits above 0x1F set) must be masked off on TX — the MFSK
-	// wire carries only the 5 negotiable bits.
+	// A high cap byte (bits above 0x3F set) must be masked off on TX — the MFSK
+	// wire carries only the 6 negotiable bits.
 	{
 		uint64_t p38 = 0;
 		pack_test_ack_payload(&p38, 0xFF, 0xFF, 42u);
 		uint8_t lec = 0xFF, loc = 0xFF, lss = 0;
 		bool ok = unpack_test_ack_payload(p38, &lec, &loc, &lss);
-		if (!ok || lec != 0x1F || loc != 0x1F || lss != 42u) {
-			test_fail(name, "high cap bits not masked to 0x1F on the wire");
+		if (!ok || lec != 0x3F || loc != 0x3F || lss != 42u) {
+			test_fail(name, "high cap bits not masked to 0x3F on the wire");
 			return;
 		}
 	}
@@ -273,7 +274,7 @@ static void test_pack_unpack_test_conn_payload() {
 	const int nssids = (int)(sizeof(ssids) / sizeof(ssids[0]));
 	int trials = 0;
 	for (int snr_q = 0; snr_q < 16; snr_q++) {
-		for (int lc = 0; lc < 32; lc++) {  // local_cap is 5 negotiable MFSK-wire bits (0x1F)
+		for (int lc = 0; lc < 64; lc++) {  // local_cap is 6 negotiable MFSK-wire bits (0x3F)
 			for (int si = 0; si < nssids; si++) {
 				uint8_t ssid = ssids[si];
 				uint64_t p38 = (uint64_t)rng();  // pre-set garbage
@@ -283,9 +284,9 @@ static void test_pack_unpack_test_conn_payload() {
 					test_fail(name, "payload overflows 38 bits");
 					return;
 				}
-				// reserved is bits 20..0; bits 23..21 carry local_cap[2:4].
-				if ((p38 & ((1ULL << 21) - 1ULL)) != 0) {
-					test_fail(name, "reserved bits (20..0) not zero on TX");
+				// reserved is bits 19..0; bits 23..20 carry local_cap[2:5].
+				if ((p38 & ((1ULL << 20) - 1ULL)) != 0) {
+					test_fail(name, "reserved bits (19..0) not zero on TX");
 					return;
 				}
 				uint8_t out_snr = 0xFF, out_lc = 0xFF, out_ssid = 0;
@@ -306,14 +307,14 @@ static void test_pack_unpack_test_conn_payload() {
 			}
 		}
 	}
-	// A high cap byte (bits above 0x1F set) must be masked off on TX.
+	// A high cap byte (bits above 0x3F set) must be masked off on TX.
 	{
 		uint64_t p38 = 0;
 		pack_test_conn_payload(&p38, 9u, 0xFF, 55u);
 		uint8_t lsnr = 0xFF, llc = 0xFF, lss = 0;
 		bool ok = unpack_test_conn_payload(p38, &lsnr, &llc, &lss);
-		if (!ok || llc != 0x1F || lsnr != 9u || lss != 55u) {
-			test_fail(name, "high local_cap bits not masked to 0x1F on the wire");
+		if (!ok || llc != 0x3F || lsnr != 9u || lss != 55u) {
+			test_fail(name, "high local_cap bits not masked to 0x3F on the wire");
 			return;
 		}
 	}

@@ -174,6 +174,9 @@
 // 0x20 is reserved for the WB robust-preamble analog (not shipped: the WB
 // sidelnikov preamble measured a wash at operating SNRs).
 #define CAP_ROBUST_PREAMBLE_NB 0x10 // RX can acquire the NB sidelnikov robust preamble
+// Stage-3 bounded block ACK. The bit is advertised only under
+// MERCURY_L1_BLOCKACK=1 and engages only on authenticated both-support.
+#define CAP_L1_BLOCKACK 0x20
 // The enhanced ctrl-suffix (GF(16) RA FEC + base-pattern combining) on the MFSK
 // CONNECT handshake (tier2-suffix-fec-design.md §21) is NOT capability-negotiated:
 // Mercury shipped no version, so there are no legacy peers, and the GF(16) RA
@@ -181,12 +184,12 @@
 // unconditional default at the robust tier, triggered by the gearshift config
 // (is_robust_config). (The §21 3rd-bit was removed in cleanup/drop-suffix-fec-cap;
 // the slot is now CAP_CUMULATIVE_ACK above.)
-// Bits 0..4 are the negotiable cap bits carried in the MFSK ctrl-suffix cap
+// Bits 0..5 are the negotiable cap bits carried in the MFSK ctrl-suffix cap
 // fields (TEST_ACK echoed_cap/own_cap, TEST_CONN local_cap), which use the formerly
-// reserved payload bits for bits 2, 3 and 4 (the §21 precedent; no payload-width
+// reserved payload bits for bits 2 through 5 (the §21 precedent; no payload-width
 // change — an older peer transmits 0 there and ignores them on RX), and
 // the full LDPC TEST_CONNECTION/ACK capability byte. Packers/unpackers mask to this.
-#define CAP_NEGOTIABLE_MASK 0x1F
+#define CAP_NEGOTIABLE_MASK 0x3F
 
 // Bandwidth mode (persisted in INI, controls NB/WB negotiation)
 enum BandwidthMode { BW_AUTO = 0, BW_NB_ONLY = 1 };
