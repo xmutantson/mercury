@@ -506,6 +506,12 @@ struct st_measurements
 	  double SNR_downlink;
 	  double signal_stregth_dbm;
 	  double frequency_offset;;
+	  // Pollution guard (default-off): the SNR of the last decoded forward-DATA frame (DATA_LONG /
+	  // DATA_SHORT). Unlike SNR_uplink (overwritten by EVERY decoded frame incl. control frames), this
+	  // is written ONLY on payload decodes, so the turbo SET_CONFIG ACK suffix can encode the honest
+	  // forward-DATA channel measure instead of the ~34 dB SET_CONFIG control-frame decode that clamps
+	  // to the ceiling tone (a spurious 25.0 at the commander). -99.9 = no data frame decoded yet.
+	  double SNR_uplink_data;
 };
 
 
@@ -803,6 +809,16 @@ public:
   // reps stay 1 (recomputes the same 390). CMD-side.
   void recompute_ack_pattern_time_ms();
   void send_ack_pattern_with_snr(float snr);  // TX ACK + 4 MFSK symbols encoding SNR
+  // ── ACK-SUFFIX POLLUTION GUARD (MERCURY_RSP_SUFFIX_DATA_SNR, default-off) ──────────────────────
+  // TRUE iff the guard is armed. When armed, the turbo SET_CONFIG ACK suffix encodes the last
+  // forward-DATA-frame SNR (measurements.SNR_uplink_data) instead of measurements.SNR_uplink, which
+  // an immediately-preceding CONTROL-frame decode overwrites with a ~34 dB read (ceiling-tone clamp
+  // => spurious 25.0 at the commander). rsp_note_data_frame_snr captures the field on payload decodes
+  // only; rsp_suffix_snr_value returns the value the suffix send encodes (guarded selection).
+  static bool rsp_suffix_data_snr_active();
+  void   rsp_note_data_frame_snr(int frame_type, double snr);
+  double rsp_suffix_snr_value() const;
+  int    test_ack_suffix_pollution_guard();
   // Level 3: RX + detect ACK pattern, returns true if detected.
   //
   // defer_audio_advance (§7.13.29): when true, a positive detection does NOT
@@ -1967,6 +1983,16 @@ public:
   // order-independent — it can only LOWER a target). rung_floor_min_meter() exposes the static row for
   // the test + the fire-proof printf; RUNG_MIN_SNR_METER[] is defined next to apply_rung_floor_cap.
   static double rung_floor_min_meter(int cfg);
+  // B2 (default-off): TRUE iff MERCURY_RUNG_STEADY_REFRESH is armed. Gates BOTH the healthy-hold
+  // freshness exemption in rung_floor_meter_clears AND the cal-STEADY (v4) cfg14/cfg15 floor table
+  // in rung_floor_min_meter. Static (consulted from the static floor accessor + the const gate).
+  static bool rung_steady_refresh_active();
+  // B2 (default-off): the value the floor gate judges the climb-grade meter against. cal-v3 (env
+  // unset) => the raw latest snapshot rung_meter_db, byte-identical. Under MERCURY_RUNG_STEADY_REFRESH
+  // => the bounded latch-max (temporal hysteresis): the recent windowed peak while it is still within
+  // RUNG_METER_HOLD_WINDOW_BATCHES, else the raw snapshot. Rides a transient quantized down-dip below
+  // the floor without holding a stale-high value past the window. Const.
+  double rung_meter_floor_value() const;
   bool rung_floor_ok(int cfg) const;
   int  apply_rung_floor_cap(int proposed) const;
   // Counting wrapper for the ELECTION (transform) sites: applies the cap and, on a non-identity
@@ -6618,6 +6644,25 @@ public:
   int       rung_meter_age_batches{1000000000};
   long long rung_meter_wall_ms{0};
   bool      rung_meter_data_latched{false};
+  // B2 (default-off): steady-state health clocks for the MERCURY_RUNG_STEADY_REFRESH healthy-hold
+  // freshness exemption. _clean_age counts data-ACK-wait entries since the last CLEAN forward-batch
+  // confirm (reset 0 there); it distinguishes a healthy hold from an outage/idle. _healthy_hold_
+  // batches counts consecutive contiguous clean confirms (restart on a gap, reset 0 on a BREAK) —
+  // the sustained-health arm. cal-v3 never reads either; reset per session (rung_meter_reset).
+  int       rung_meter_clean_age{1000000000};
+  int       rung_meter_healthy_hold_batches{0};
+  // B2 (default-off): the TEMPORAL-HYSTERESIS latch-max. _hold_db is the best (max) qualified read
+  // within the trailing healthy window; _hold_age_batches counts data-ACK-wait entries since that
+  // peak was last set/refreshed. The floor gate judges the meter via rung_meter_floor_value(), which
+  // returns _hold_db while _hold_age_batches <= RUNG_METER_HOLD_WINDOW_BATCHES (so a transient
+  // quantized DOWN-dip below the floor does not cap a viable climb) and falls back to the raw
+  // rung_meter_db once the window expires (so a sustained decline decays the hold). Invalidated on a
+  // BREAK (re-earned after recovery) and reset per session. cal-v3 never reads either field.
+  double    rung_meter_hold_db{-99.9};
+  int       rung_meter_hold_age_batches{1000000000};
+  // B2 (default-off) diagnostic: run-lifetime count of climbs ADMITTED by the latch-max where the raw
+  // latest snapshot alone would have capped them (the [GEARSHIFT] RUNG-FLOOR-HOLD wire witness).
+  long long floor_hold_admits{0};
   int break_detected;             // YES if BREAK pattern detected by responder
 
   // ---- zombie/amplifier layer (data-flow-zombie-amplifier.md) -------------

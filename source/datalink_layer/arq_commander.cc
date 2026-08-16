@@ -1245,10 +1245,53 @@ static const double RUNG_MIN_SNR_METER[NUMBER_OF_CONFIGS] = {
 	/*14*/  14.0, /*15*/  16.0, /*16*/  22.0, /*17*/  24.0
 };
 
+// CAL VERSION STEADY (4) — the EARNED cfg14/cfg15 recalibration, active ONLY under
+// MERCURY_RUNG_STEADY_REFRESH (default-off => the cal-v3 table above is used, byte-identical).
+// Derivation (delivery evidence, RUNGFLOOR_DEFEAT_20260816, n=16/arm at true-14.8): the live suffix
+// meter reads {13,15} at 14.8; 16/16 defeat cells reached+held cfg15 and 15/16 delivered md5-verified
+// full payloads at 1.25x the VARA bar with FEWER storms, while the cal-v3 gate capped cfg14 at
+// meter 13 (floor 14.0, even when FRESH) and cfg15 at meter 15 (floor 16.0). The cfg15 floor 16.0
+// (admit meter>=17 = the true-24.79 regime) blocked a config viable ~3 dB lower. Lower cfg14 and
+// cfg15 to 12.0 so BOTH admit meter>=13 (true-14.8+) and refuse meter<=11 (true-13-) under the
+// strict-`>` half-grid rule. cfg9..cfg13 and cfg16/cfg17 are UNCHANGED (the evidence does not cover
+// them); RUNG_MIN_SNR_METER_STEADY[16]==CFG16_MIN_SNR_DB retains the J0 pin. Monotone + off-grid.
+static const double RUNG_MIN_SNR_METER_STEADY[NUMBER_OF_CONFIGS] = {
+	/* 0*/ -90.0, /* 1*/ -90.0, /* 2*/ -90.0, /* 3*/ -90.0, /* 4*/ -90.0,
+	/* 5*/ -90.0, /* 6*/ -90.0, /* 7*/ -90.0, /* 8*/ -90.0,
+	/* 9*/  10.0, /*10*/  12.0, /*11*/  12.0, /*12*/  12.0, /*13*/  12.0,
+	/*14*/  12.0, /*15*/  12.0, /*16*/  22.0, /*17*/  24.0
+};
+
+// TRUE iff the default-off steady-state climb-grade refresh + earned cfg14/cfg15 recalibration is
+// armed (MERCURY_RUNG_STEADY_REFRESH set non-zero). Read per-call to match the defeat-env pattern;
+// static so rung_floor_min_meter (static) and the const gate can both consult it.
+bool cl_arq_controller::rung_steady_refresh_active()
+{
+	const char* e = std::getenv("MERCURY_RUNG_STEADY_REFRESH");
+	return (e && *e && atoi(e) != 0);
+}
+
 double cl_arq_controller::rung_floor_min_meter(int cfg)
 {
 	if(cfg < 0 || cfg >= NUMBER_OF_CONFIGS) return -90.0;   // robust / out-of-range -> ungated
+	if(rung_steady_refresh_active()) return RUNG_MIN_SNR_METER_STEADY[cfg];   // cal STEADY (env-gated)
 	return RUNG_MIN_SNR_METER[cfg];
+}
+
+// B2 TEMPORAL HYSTERESIS (default-off): the value the floor gate judges the climb-grade meter
+// against. cal-v3 (env unset) => the raw latest snapshot, byte-identical to the pre-B2 gate. Under
+// MERCURY_RUNG_STEADY_REFRESH => the bounded latch-max: the recent windowed peak of qualified reads
+// while that peak is still within its window (rides a transient quantized down-dip below the floor
+// without lowering the meter the gate sees), else the latest raw read (a sustained decline that ages
+// the peak out of its window decays it back to the fresh, lower value). The peak is invalidated on a
+// BREAK (re-earned after recovery), so this never carries a stale-high value across a storm.
+double cl_arq_controller::rung_meter_floor_value() const
+{
+	if(!rung_steady_refresh_active()) return rung_meter_db;   // cal-v3: raw snapshot, byte-identical
+	if(rung_meter_hold_age_batches <= RUNG_METER_HOLD_WINDOW_BATCHES
+	   && rung_meter_hold_db > rung_meter_db)
+		return rung_meter_hold_db;                            // windowed peak rides a transient dip
+	return rung_meter_db;                                     // no valid peak above the latest -> raw
 }
 
 // V3 monotonic wall clock (steady_clock ms). Used only to stamp/age the climb-grade snapshot; the
@@ -1291,6 +1334,18 @@ void cl_arq_controller::rung_meter_note_read(double snr_value)
 	rung_meter_db = snr_value;
 	rung_meter_age_batches = 0;
 	rung_meter_wall_ms = rung_meter_now_ms();
+	// B2 TEMPORAL HYSTERESIS (default-off consumer): maintain the bounded latch-max of qualified
+	// climb-grade reads. A read at/above the current hold — or one arriving after the hold's window
+	// has expired — becomes the new hold and restarts the window; a read BELOW the hold WITHIN the
+	// window is a transient quantized down-dip and does NOT lower the hold (the batch clock keeps
+	// aging it, so a SUSTAINED decline eventually crosses the window and the next read decays the
+	// hold to that fresh, lower value). The floor gate reads this via rung_meter_floor_value(); cal-v3
+	// never consults it, so this write is behavior-neutral when the env is unset.
+	if(snr_value >= rung_meter_hold_db || rung_meter_hold_age_batches > RUNG_METER_HOLD_WINDOW_BATCHES)
+	{
+		rung_meter_hold_db = snr_value;
+		rung_meter_hold_age_batches = 0;
+	}
 }
 
 // V3 age tick. Called once per data-ACK-wait entry (clear_snr_arm_for_data_ack_wait sites — the
@@ -1301,6 +1356,14 @@ void cl_arq_controller::rung_meter_note_batch_attempt()
 {
 	if(role != COMMANDER) return;
 	if(rung_meter_age_batches < 1000000000) rung_meter_age_batches++;
+	// B2 (default-off consumer): the clean-batch clock ages alongside the SNR-read clock. It is
+	// reset to 0 ONLY by a clean fully-acked forward batch (rung_floor_note_clean site), so it
+	// distinguishes a HEALTHY hold (clean confirms every batch -> stays small) from an OUTAGE /
+	// idle (no clean confirm -> grows). The healthy-hold exemption reads it; cal-v3 ignores it.
+	if(rung_meter_clean_age < 1000000000) rung_meter_clean_age++;
+	// B2 (default-off consumer): the latch-max window ages alongside the SNR-read clock. rung_meter_
+	// floor_value() trusts the held peak only while this stays <= RUNG_METER_HOLD_WINDOW_BATCHES.
+	if(rung_meter_hold_age_batches < 1000000000) rung_meter_hold_age_batches++;
 }
 
 // V3 session reset — re-arm the connect-regime latch and clear the snapshot at each session boundary
@@ -1312,6 +1375,10 @@ void cl_arq_controller::rung_meter_reset()
 	rung_meter_age_batches = 1000000000;
 	rung_meter_wall_ms = 0;
 	rung_meter_data_latched = false;
+	rung_meter_clean_age = 1000000000;         // B2: no clean batch yet this session
+	rung_meter_healthy_hold_batches = 0;       // B2: no healthy-hold streak yet
+	rung_meter_hold_db = -99.9;                // B2: no latch-max peak yet this session
+	rung_meter_hold_age_batches = 1000000000;
 }
 
 // V3 floor+freshness check WITHOUT the at/below-current shortcut. The shortcut in rung_floor_ok (a
@@ -1348,9 +1415,34 @@ bool cl_arq_controller::rung_floor_meter_clears(int cfg) const
 		if(!(floor && *floor && atof(floor) > 0.0)) return false;
 		return topgear_forward_report_is_fresh();
 	}
-	if(rung_meter_stale()) return false;                     // stale climb-grade snapshot -> fail closed
+	if(rung_meter_stale())
+	{
+		// ── B2 HEALTHY-HOLD FRESHNESS EXEMPTION (MERCURY_RUNG_STEADY_REFRESH, default-off) ─────
+		// The stale gate closes climbs during an OUTAGE (a rung frozen high after its ACKs stop
+		// decoding). It cannot, alone, distinguish that from a HEALTHY forward HOLD, where the
+		// suffix meter simply has no steady-state refresh producer. During a demonstrably healthy
+		// hold — a real last-known read, no active BREAK recovery, clean forward batches STILL
+		// confirming (clean-age fresh, the anti-outage + activity guard that subsumes any idle/wall
+		// test), and a SUSTAINED streak of them — a snapshot stale by AGE is allowed to admit a
+		// BOUNDED one-rung climb, provided the last-known read STILL CLEARS the target floor. The
+		// climb changes current_configuration (restarting the one-rung window) and, via the
+		// turnaround, triggers a fresh SNR read, so it cannot ratchet multiple rungs on one stale
+		// sample. Storm-safe: when ACKs stop, clean-age grows past the window and the streak resets
+		// on the first break, so the exemption disarms and the gate fails closed exactly as cal-v3.
+		if(rung_steady_refresh_active()
+		   && rung_meter_db > -90.0                                                     // real last-known read
+		   && breaks_since_last_data_success == 0                                       // no active recovery
+		   && rung_meter_clean_age <= RUNG_METER_STALE_AGE_BATCHES                      // clean confirms still flowing
+		   && rung_meter_healthy_hold_batches >= RUNG_STEADY_HEALTHY_HOLD_BATCHES       // sustained health
+		   && config_ladder_index(cfg) == config_ladder_index(current_configuration) + 1)  // BOUNDED one rung
+		{
+			double xbump = rung_floor_bump_db[cfg];
+			return rung_meter_floor_value() > rung_floor_min_meter(cfg) + xbump;   // windowed max must still clear the floor
+		}
+		return false;                                        // stale climb-grade snapshot -> fail closed
+	}
 	double bump = rung_floor_bump_db[cfg];
-	return rung_meter_db > RUNG_MIN_SNR_METER[cfg] + bump;    // qualified snapshot, never raw SNR_uplink
+	return rung_meter_floor_value() > rung_floor_min_meter(cfg) + bump;  // qualified snapshot / latch-max (cal-v3 or STEADY)
 }
 
 // TRUE iff the QUALIFIED climb-grade snapshot admits OFDM rung `cfg` at its meter-referred floor + any
@@ -1414,10 +1506,28 @@ int cl_arq_controller::rung_floor_cap_fire(int proposed)
 	if(capped != proposed)
 	{
 		floor_cap_fires++;
-		printf("[GEARSHIFT] RUNG-FLOOR: capped %d -> %d (meter %.1f age %d stale %d, floor %.1f, fires=%lld)\n",
-			proposed, capped, rung_meter_db, rung_meter_age_batches, rung_meter_stale() ? 1 : 0,
+		printf("[GEARSHIFT] RUNG-FLOOR: capped %d -> %d (meter %.1f hold %.1f holdage %d age %d stale %d, floor %.1f, fires=%lld)\n",
+			proposed, capped, rung_meter_db, rung_meter_hold_db, rung_meter_hold_age_batches,
+			rung_meter_age_batches, rung_meter_stale() ? 1 : 0,
 			rung_floor_min_meter(proposed), floor_cap_fires);
 		fflush(stdout);
+	}
+	else if(rung_steady_refresh_active()
+	        && config_ladder_index(proposed) > config_ladder_index(current_configuration))
+	{
+		// B2 LATCH-MAX WIRE WITNESS (default-off): this climb was ADMITTED. Check whether the windowed
+		// peak — not the raw latest snapshot — is what cleared the floor (the raw read alone would have
+		// capped it). That is the temporal-hysteresis fix FIRING: a transient quantized dip below the
+		// floor did not cap a viable climb. Counted-at-source so the cohort res JSON carries the count.
+		double fl = rung_floor_min_meter(proposed) + rung_floor_bump_db[proposed];
+		double fv = rung_meter_floor_value();
+		if(rung_meter_db <= fl && fv > fl)
+		{
+			floor_hold_admits++;
+			printf("[GEARSHIFT] RUNG-FLOOR-HOLD: admitted %d (raw meter %.1f <= floor %.1f; windowed hold %.1f holdage %d cleared it) hold_admits=%lld\n",
+				proposed, rung_meter_db, fl, fv, rung_meter_hold_age_batches, floor_hold_admits);
+			fflush(stdout);
+		}
 	}
 	return capped;
 }
@@ -7520,6 +7630,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// success reset clears the counter; until then every consecutive
 				// BREAK bottoms out.
 				breaks_since_last_data_success++;
+				// B2 (default-off consumer): a BREAK ends the healthy hold — disarm the freshness
+				// exemption immediately (the recovery path is never gated regardless; this only
+				// prevents a stale-meter one-rung climb from firing during recovery).
+				rung_meter_healthy_hold_batches = 0;
+				// B2 (default-off consumer): a BREAK also invalidates the latch-max — a peak captured
+				// before the storm must not ride a climb during/after recovery. The hold is re-earned
+				// only once fresh qualified reads flow again (rung_meter_note_read gates on breaks==0).
+				rung_meter_hold_db = -99.9;
+				rung_meter_hold_age_batches = 1000000000;
 				if(breaks_since_last_data_success >= 2)
 				{
 					printf("[BREAK-PANIC] %d BREAKs without data success — "
@@ -7793,6 +7912,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// suffix-meter reads are in-transfer-grade (the connect-regime ~34 dB reads are behind
 				// us). Enables rung_meter_note_read to latch the climb-grade snapshot from here on.
 				rung_meter_data_latched = true;
+				// B2 (default-off consumer): a clean fully-acked forward batch. Extend the healthy-
+				// hold streak when the previous batch also confirmed with no gap (clean_age<=1); a
+				// gap restarts it at 1. Reset the clean-batch clock to 0. Read ONLY by the healthy-
+				// hold freshness exemption in rung_floor_meter_clears (cal-v3 ignores both counters).
+				if(rung_meter_clean_age <= 1)
+				{
+					if(rung_meter_healthy_hold_batches < 1000000000) rung_meter_healthy_hold_batches++;
+				}
+				else
+				{
+					rung_meter_healthy_hold_batches = 1;
+				}
+				rung_meter_clean_age = 0;
 				// AARF DECAY (long-run-degradation.md §2.3): frame_shift_threshold
 				// is the FRAME-UP gate denominator (:3869). It is multiplicatively
 				// INCREASED (*=2 at :2447/:3352/:3539) on every FRAME-UP failure but
@@ -11828,9 +11960,12 @@ int cl_arq_controller::test_rung_floor_gate()
 	rung_meter_reset();
 	floor_cap_fires = 0;
 	unsetenv("MERCURY_RUNG_FLOOR_GATE_DEFEAT");
-	// Latch a FRESH in-transfer climb-grade snapshot at meter m (age 0, no wall age -> not stale).
+	// Latch a FRESH in-transfer climb-grade snapshot at meter m (age 0, no wall age -> not stale). Also
+	// seeds the B2 latch-max at m (a real read establishes both via rung_meter_note_read); with hold==db
+	// the accessor returns db, so cal-v3 tests are unaffected. T10 overrides the hold to test the ride.
 	auto set_meter = [&](double m) {
 		rung_meter_db = m; rung_meter_age_batches = 0; rung_meter_wall_ms = 0;
+		rung_meter_hold_db = m; rung_meter_hold_age_batches = 0;
 	};
 
 	// ── T5: J0 version / meter-cal pin / cal-v3 rows / monotone / grid placement ───────────────
@@ -11873,6 +12008,38 @@ int cl_arq_controller::test_rung_floor_gate()
 		for(int g = 0; g < 8; g++)
 			if(rung_floor_min_meter(c) == meter_grid[g]) off_grid = false;
 	check(off_grid, "T5: no gated row lands ON the meter grid {9,11,13,15,17,21,23,25}");
+
+	// ── T5-STEADY: cal-STEADY (v4) pin + recalibrated rows + monotone + grid + [16] pin + restore ──
+	// The default-off recalibration (MERCURY_RUNG_STEADY_REFRESH). rung_floor_min_meter switches to
+	// the STEADY table under the env; it lowers cfg14/cfg15 to 12.0 (admit meter>=13 = true-14.8+)
+	// and leaves cfg9..13 + cfg16/17 identical to cal-v3.
+	check(RUNG_FLOOR_METER_CAL_VERSION_STEADY == 4, "T5-STEADY J0: cal-STEADY version pinned == 4");
+	setenv("MERCURY_RUNG_STEADY_REFRESH", "1", 1);
+	check(rung_steady_refresh_active(), "T5-STEADY: env arms the steady-refresh path");
+	bool srows =
+		rung_floor_min_meter(CONFIG_9)  == 10.0 &&
+		rung_floor_min_meter(CONFIG_10) == 12.0 &&
+		rung_floor_min_meter(CONFIG_11) == 12.0 &&
+		rung_floor_min_meter(CONFIG_12) == 12.0 &&
+		rung_floor_min_meter(CONFIG_13) == 12.0 &&
+		rung_floor_min_meter(CONFIG_14) == 12.0 &&
+		rung_floor_min_meter(CONFIG_15) == 12.0 &&
+		rung_floor_min_meter(CONFIG_16) == 22.0 &&
+		rung_floor_min_meter(CONFIG_17) == 24.0;
+	check(srows, "T5-STEADY: recalibrated rows (cfg9=10 cfg10-15=12 cfg16=22 cfg17=24; cfg14/15 admit meter>=13)");
+	check(rung_floor_min_meter(CONFIG_16) == CFG16_MIN_SNR_DB, "T5-STEADY J0: STEADY[16] == CFG16_MIN_SNR_DB (pin held)");
+	bool smono = true;
+	for(int c = CONFIG_9; c < CONFIG_16; c++)
+		if(rung_floor_min_meter(c) > rung_floor_min_meter(c+1)) smono = false;
+	check(smono, "T5-STEADY: STEADY table monotone (non-decreasing cfg9..cfg16)");
+	bool soff = true;
+	for(int c = CONFIG_9; c <= CONFIG_17; c++)
+		for(int g = 0; g < 8; g++)
+			if(rung_floor_min_meter(c) == meter_grid[g]) soff = false;
+	check(soff, "T5-STEADY: no STEADY row lands ON the meter grid");
+	unsetenv("MERCURY_RUNG_STEADY_REFRESH");
+	check(rung_floor_min_meter(CONFIG_15) == 16.0 && rung_floor_min_meter(CONFIG_14) == 14.0,
+		"T5-STEADY: env cleared -> cal-v3 rows restored (default byte-identical)");
 
 	// ── T1: fail-before / pass-after on the ELECTION cap at the live-meter anchors (fresh snapshot) ──
 	// wb13 (snr3k +13): the live in-transfer meter reads 11. cfg9's floor (10) is cleared but
@@ -12137,6 +12304,159 @@ int cl_arq_controller::test_rung_floor_gate()
 		topgear_elect_enabled = -1;
 		current_configuration = CONFIG_0;
 	}
+
+	// ── T9: STEADY REFRESH + RECALIBRATION — fail-before / pass-after + storm-safety + one-rung ──
+	// The default-off mid-band cfg15 ceiling fix (MERCURY_RUNG_STEADY_REFRESH). Two coupled
+	// mechanisms, both proven fail-before (cal-v3) / pass-after (STEADY):
+	//  (A) RECALIBRATION — a FRESH meter-13 read (true-14.8, where 16/16 defeat cells reached+held
+	//      cfg15 and 15/16 delivered at 1.25x bar) is REFUSED by cal-v3 (floor 16) and ADMITTED by
+	//      the STEADY table (floor 12). This is the binding 14.8 blocker (fresh meter, floor value).
+	//  (B) REFRESH — an AGE-stale snapshot (meter 17, the 18-dial straggler where 17>floor-16 but
+	//      the age flag refuses) admits a BOUNDED one-rung climb during a demonstrably healthy hold,
+	//      and STILL fails closed on an outage / recovery / unsustained hold (the storm-safe arm).
+	rung_floor_memory_reset();
+	rung_meter_reset();
+	narrowband_enabled = NO;
+	role = COMMANDER;
+
+	// (A) RECALIBRATION — current cfg13, a FRESH meter-13 read (age 0 -> not stale), healthy.
+	current_configuration = CONFIG_13;
+	set_meter(13.0);
+	rung_meter_data_latched = true;
+	breaks_since_last_data_success = 0;
+	unsetenv("MERCURY_RUNG_STEADY_REFRESH");
+	check(apply_rung_floor_cap(CONFIG_14) == CONFIG_13,
+		"T9a FAIL-BEFORE: cal-v3 refuses cfg14 at FRESH meter 13 (floor 14) -> elevator cannot even reach cfg14 at 14.8");
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_13,
+		"T9a FAIL-BEFORE: cal-v3 refuses cfg15 at FRESH meter 13 (floor 16), caps to cfg13-hold");
+	setenv("MERCURY_RUNG_STEADY_REFRESH", "1", 1);
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_15,
+		"T9a PASS-AFTER: STEADY table admits cfg15 at FRESH meter 13 (floor 12) -> 14.8 reaches cfg15");
+	unsetenv("MERCURY_RUNG_STEADY_REFRESH");
+
+	// (B) REFRESH — current cfg14, last-known read 17 (clears cfg15 even in cal-v3) but AGE-stale.
+	rung_meter_reset();
+	current_configuration = CONFIG_14;
+	set_meter(17.0);
+	rung_meter_data_latched = true;
+	breaks_since_last_data_success = 0;
+	rung_meter_age_batches = 3;                                    // AGE-stale (age > STALE_AGE_BATCHES)
+	rung_meter_clean_age = 0;                                      // clean confirms STILL flowing
+	rung_meter_healthy_hold_batches = RUNG_STEADY_HEALTHY_HOLD_BATCHES;   // sustained health
+	check(rung_meter_stale(), "T9b pre: age 3 -> the snapshot is STALE");
+	unsetenv("MERCURY_RUNG_STEADY_REFRESH");
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T9b FAIL-BEFORE: cal-v3 AGE-stale refuses the cfg15 climb (holds cfg14) even though meter 17 > floor 16");
+	setenv("MERCURY_RUNG_STEADY_REFRESH", "1", 1);
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_15,
+		"T9b PASS-AFTER: healthy-hold exemption re-admits the one-rung cfg15 climb on the stale-but-floor-clearing read");
+	// (B') BOUNDED ONE RUNG — from cfg14 the exemption admits at most cfg15, never a two-rung jump.
+	check(apply_rung_floor_cap(CONFIG_16) == CONFIG_15,
+		"T9c one-rung: a cfg16 proposal from cfg14 caps to cfg15 (current+1) — no multi-rung ratchet on one stale sample");
+
+	// (C) STORM-SAFETY — the exemption MUST disarm whenever the hold is NOT healthy (same stale 17).
+	rung_meter_clean_age = 5;                                      // ACKs stopped -> clean confirms no longer flowing
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T9d STORM-SAFE: ACKs stopped (clean_age>window) -> exemption disarms, gate fails closed (holds cfg14)");
+	rung_meter_clean_age = 0;                                      // cleans flowing again, but...
+	breaks_since_last_data_success = 1;                            // ...an active BREAK recovery
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T9d STORM-SAFE: active BREAK recovery (breaks>0) -> exemption disarms, gate fails closed");
+	breaks_since_last_data_success = 0;
+	rung_meter_healthy_hold_batches = 1;                           // health not yet sustained
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T9d STORM-SAFE: unsustained hold (streak<arm) -> exemption disarms, gate fails closed");
+	unsetenv("MERCURY_RUNG_STEADY_REFRESH");
+	current_configuration = CONFIG_0;
+	rung_meter_reset();
+	rung_floor_memory_reset();
+
+	// ── T10: LATCH-MAX / TEMPORAL HYSTERESIS — the residual w2 stale-dip gap ──────────────────────
+	// The binding w2 residual (meter-source audit §136): on a forward-only hold the 2-dB-quantized
+	// suffix meter can write a single grid value one step BELOW the recalibrated floor 12 ("capped
+	// 15->14 meter 11.0 stale 1 floor 12.0") even though the honest true-14.8 channel reads {13,15}.
+	// The floor gate now judges a BOUNDED latch-max (the best qualified read within a healthy window)
+	// via rung_meter_floor_value(), so a transient dip does not cap a viable climb — but a peak aged
+	// past its window, a genuinely low channel, and a post-BREAK peak are all REFUSED (the bound + the
+	// storm-disarm). All checks are env-on (MERCURY_RUNG_STEADY_REFRESH); cal-v3 reads no hold field.
+	rung_floor_memory_reset();
+	rung_meter_reset();
+	narrowband_enabled = NO;
+	role = COMMANDER;
+	setenv("MERCURY_RUNG_STEADY_REFRESH", "1", 1);
+
+	// (A) THE STALE-DIP RIDE — current cfg14, a FRESH raw dip to 11 (age 0 -> not stale) with a recent
+	//     windowed peak 13. FAIL-BEFORE = no valid peak (hold aged past the window) -> the gate sees
+	//     the raw 11 < floor 12 and caps. PASS-AFTER = the peak is in-window -> it rides the dip.
+	current_configuration = CONFIG_14;
+	set_meter(11.0);                                  // db=11 (the transient dip), hold seeded to 11
+	rung_meter_data_latched = true;
+	breaks_since_last_data_success = 0;
+	rung_meter_hold_db = 13.0;                        // a real recent peak (the honest {13,15} channel)
+	rung_meter_hold_age_batches = 5;                  // ...but AGED PAST the window (fail-before)
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T10a FAIL-BEFORE: no in-window peak -> the raw dip 11 < floor 12 caps cfg15 to cfg14 (the observed w2 residual)");
+	rung_meter_hold_age_batches = 1;                  // the peak is now IN-window (pass-after)
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_15,
+		"T10a PASS-AFTER: the windowed peak 13 (holdage 1<=4) rides the dip -> cfg15 admitted at floor 12");
+	// WIRE WITNESS — the counting election wrapper increments floor_hold_admits + emits RUNG-FLOOR-HOLD.
+	long long fh_before = floor_hold_admits;
+	int fired = rung_floor_cap_fire(CONFIG_15);
+	check(fired == CONFIG_15 && floor_hold_admits == fh_before + 1,
+		"T10a WITNESS: rung_floor_cap_fire admits cfg15 and the hold-admit counter fires 0->1 (wire witness)");
+
+	// (B) THE BOUND — a peak aged PAST the window must NOT ride (a sustained decline / degrading
+	//     channel). Same raw dip 11, same peak 13, but holdage 5 > window 4 -> gate falls back to raw.
+	rung_meter_hold_db = 13.0;
+	rung_meter_hold_age_batches = 5;
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T10b BOUND: a peak aged past the window (holdage 5>4) does NOT ride -> degrading channel refused (holds cfg14)");
+	// A genuinely low channel (peak and read both 9) is refused outright.
+	set_meter(9.0);                                   // db=hold=9, in-window
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T10b BOUND: a genuinely low channel (windowed max 9 < floor 12) is refused (holds cfg14)");
+
+	// (C) STORM-DISARM — a BREAK invalidates the hold (the break site sets hold_db=-99.9). Restore a
+	//     valid ride, prove it rides, then apply the documented break invalidation and prove it stops.
+	set_meter(11.0);
+	rung_meter_hold_db = 13.0;
+	rung_meter_hold_age_batches = 1;
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_15,
+		"T10c pre: with the valid in-window peak the climb rides (sanity)");
+	rung_meter_hold_db = -99.9;                       // exactly what the BREAK site writes
+	rung_meter_hold_age_batches = 1000000000;
+	check(apply_rung_floor_cap(CONFIG_15) == CONFIG_14,
+		"T10c STORM-DISARM: a BREAK invalidates the hold -> the dip 11 caps cfg15 (holds cfg14)");
+
+	// (D) MAINTENANCE via the PRODUCTION path — rides ONE dip, DECAYS on a sustained decline. Drives
+	//     rung_meter_note_read + rung_meter_note_batch_attempt (the live producers), not field pokes.
+	rung_meter_reset();
+	current_configuration = CONFIG_14;
+	rung_meter_data_latched = true;
+	breaks_since_last_data_success = 0;
+	rung_meter_note_read(13.0);                        // first read -> peak 13
+	check(rung_meter_hold_db == 13.0 && rung_meter_hold_age_batches == 0,
+		"T10d: the first qualified read sets the peak (13, holdage 0)");
+	rung_meter_note_batch_attempt();                  // holdage -> 1
+	rung_meter_note_read(11.0);                        // a dip WITHIN the window
+	check(rung_meter_hold_db == 13.0 && rung_meter_db == 11.0,
+		"T10d: a dip within the window does not lower the peak (hold 13, raw 11)");
+	check(rung_meter_floor_value() == 13.0,
+		"T10d: rung_meter_floor_value() rides the in-window peak (13)");
+	rung_meter_note_batch_attempt();                  // holdage 2
+	rung_meter_note_batch_attempt();                  // holdage 3
+	rung_meter_note_batch_attempt();                  // holdage 4
+	rung_meter_note_batch_attempt();                  // holdage 5 (> window 4)
+	rung_meter_note_read(11.0);                        // read after the window expired -> peak DECAYS
+	check(rung_meter_hold_db == 11.0 && rung_meter_hold_age_batches == 0,
+		"T10d: after the window expires a fresh read decays the peak to the current value (11)");
+	check(rung_meter_floor_value() == 11.0,
+		"T10d: rung_meter_floor_value() no longer rides a decayed peak (11)");
+
+	unsetenv("MERCURY_RUNG_STEADY_REFRESH");
+	current_configuration = CONFIG_0;
+	rung_meter_reset();
+	rung_floor_memory_reset();
 
 	printf("[TEST-RUNG-FLOOR] done: %d failure(s)\n", fails);
 	fflush(stdout);

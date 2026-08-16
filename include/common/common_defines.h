@@ -1090,6 +1090,50 @@ CONFIG_16 (5664.7 bps).
 #define RUNG_FLOOR_BUMP_MAX_DB    6.0
 #define RUNG_FLOOR_BUMP_DECAY_CLEAN 5
 
+// ── B2 STEADY-STATE CLIMB-GRADE REFRESH + EARNED cfg14/cfg15 RECALIBRATION (default-off) ──────
+// MERCURY_RUNG_STEADY_REFRESH gates the mid-band cfg15 ceiling fix. It has TWO coupled parts,
+// both inert (byte-identical to cal-v3) when the env is unset:
+//  (1) THE REFRESH — a HEALTHY-HOLD freshness exemption in rung_floor_meter_clears. The stale gate
+//      exists to close climbs during an OUTAGE (a rung frozen high after its ACKs stop decoding),
+//      but the climb-grade suffix meter has NO steady-state refresh producer during a healthy
+//      forward hold (the pattern-ACK suffix is turbo-only; the LDPC path never runs forward-only),
+//      so age crosses STALE_AGE_BATCHES within ~3 clean batches and every subsequent climb is
+//      refused even when the last-known read cleared the floor. During a demonstrably healthy hold
+//      (clean forward batches STILL confirming AND a sustained run of them AND no active BREAK
+//      recovery) an AGE-stale snapshot admits a BOUNDED one-rung climb, provided the last-known
+//      read still CLEARS the target floor. Storm-safe: when ACKs stop, the clean-batch clock ages
+//      out and the streak resets on the first break, so the exemption disarms and the gate fails
+//      closed exactly as cal-v3. HEALTHY_HOLD_BATCHES is the sustained-clean count required to arm
+//      it (> the stale window, so it arms only after the hold has out-lived one age-out).
+//  (2) THE RECALIBRATION — cal version STEADY (4) re-derives the cfg14/cfg15 election floors from
+//      measured delivery evidence at true-14.8: 16/16 defeat cells reached and HELD cfg15 with the
+//      live meter reading {13,15} (gate cells capped cfg14 at meter 13 / cfg15 at meter 15), and
+//      15/16 delivered md5-verified full payloads at 1.25x the VARA bar with FEWER storms. cfg15's
+//      cal-v3 floor 16.0 (admit meter>=17, the true-24.79 regime) blocked a config viable ~3 dB
+//      lower. The STEADY table lowers cfg14 16.0->12.0-band and cfg15 16.0->12.0 so BOTH admit
+//      meter>=13 (true-14.8+) and refuse meter<=11 (true-13-): floor 12.0 with the strict-`>`
+//      half-grid rule admits the grid-13 read and rejects the grid-11 read. cfg16/17 are UNCHANGED
+//      (the evidence does not cover them); RUNG_MIN_SNR_METER_STEADY[16]==CFG16_MIN_SNR_DB keeps
+//      the J0 calibration pin. Monotone (10,12,12,12,12,12,12,22,24) and off-grid preserved.
+//  (3) THE LATCH-MAX (temporal hysteresis) — the residual w2 gap. On a forward-only hold the suffix
+//      meter is 2-dB-quantized and sparse, so a single transient DOWN-fluctuation can write a grid
+//      value one step BELOW the recalibrated floor (the observed "capped 15->14 meter 11.0 stale 1
+//      floor 12.0": the honest true-14.8 channel reads {13,15} yet one read dipped to 11 < floor 12
+//      and capped a viable climb). Lowering the floor to absorb the dip would be threshold-tuning of
+//      a NOISE problem; a temporal problem gets a temporal fix. The gate therefore judges the floor
+//      against a BOUNDED latch-max — the best qualified read within a healthy window — rather than
+//      the single latest quantized snapshot. HOLD_WINDOW_BATCHES bounds it: a fresh read at/above the
+//      hold (or arriving after the window expired) becomes the new hold and restarts the window; a
+//      read below the hold WITHIN the window is treated as a transient dip and does not lower it; a
+//      SUSTAINED decline ages the hold out of its window and it decays to the fresh (lower) read.
+//      Storm-safe: a BREAK invalidates the hold (re-earned only after recovery), and the window bound
+//      + the one-rung cap prevent riding a stale-high value into a genuinely degrading channel.
+//      cal-v3 (env unset) never consults the hold; the floor gate then reads the raw snapshot exactly
+//      as before (byte-identical).
+#define RUNG_FLOOR_METER_CAL_VERSION_STEADY 4
+#define RUNG_STEADY_HEALTHY_HOLD_BATCHES 3
+#define RUNG_METER_HOLD_WINDOW_BATCHES 4
+
 // Controlled-elevator multi-rung jump BOUND (gearshift-climb-engine.md §15, the
 // DEEP-SNR over-climb regression fix). Even once the data-viable anchor has PROVEN
 // the OFDM tier (the §15 primary gate `is_ofdm_config(anchor)`), a single SNR-driven

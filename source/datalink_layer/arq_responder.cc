@@ -2177,10 +2177,18 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				measurements.SNR_uplink > -90;
 			if(is_turbo_setconfig)
 			{
-				printf("[ACK-CTRL] Sending ACK+SNR pattern (SNR=%.1f dB)\n",
-					measurements.SNR_uplink);
+				// POLLUTION GUARD (default-off): encode the honest forward-DATA-frame SNR instead of
+				// measurements.SNR_uplink, which the immediately-preceding SET_CONFIG control-frame
+				// decode overwrote with a ~34 dB read (ceiling-tone clamp => spurious 25 at the CMD).
+				// rsp_suffix_snr_value() returns SNR_uplink unchanged when the guard is off.
+				double suffix_snr = rsp_suffix_snr_value();
+				if(rsp_suffix_data_snr_active() && suffix_snr != measurements.SNR_uplink)
+					printf("[ACK-CTRL] Sending ACK+SNR pattern (SNR=%.1f dB; guard: forward-DATA %.1f replaces control-frame %.1f)\n",
+						suffix_snr, suffix_snr, measurements.SNR_uplink);
+				else
+					printf("[ACK-CTRL] Sending ACK+SNR pattern (SNR=%.1f dB)\n", suffix_snr);
 				fflush(stdout);
-				send_ack_pattern_with_snr((float)measurements.SNR_uplink);
+				send_ack_pattern_with_snr((float)suffix_snr);
 			}
 			else
 			{

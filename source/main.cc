@@ -2835,6 +2835,11 @@ int main(int argc, char *argv[])
                 failed += ARQ_rf.test_rung_floor_gate();
             }
             {
+                // ACK-suffix pollution guard fail-before/pass-after (forward-DATA SNR vs control decode).
+                cl_arq_controller ARQ_aksfx;
+                failed += ARQ_aksfx.test_ack_suffix_pollution_guard();
+            }
+            {
                 cl_arq_controller ARQ_gab;
                 failed += ARQ_gab.test_gap_abort_readopt_blind();
             }
@@ -4240,6 +4245,7 @@ int main(int argc, char *argv[])
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
     bool test_break_weld_cli = false;   // --test-break-weld: BREAK recovery target pin (diagnostic knob).
     bool test_rung_floor_cli = false;   // --test-rung-floor: per-rung MEASURED election floor gate + failure memory (DATAFLOW_AUDIT_rung_floor.md): wb13 fail-before/pass-after, never-raise, arm/survive/decay/reset, defeat knob.
+    bool test_acksuffix_cli = false;    // --test-acksuffix: ACK-suffix pollution guard fail-before/pass-after (forward-DATA SNR vs control-frame decode).
                                         // Asserts a PARTIAL SACK does NOT raise last_data_viable_config, reset the BREAK
                                         // panic counter / break_drop_step, advance the FRAME-UP counter, or clear the 85%
                                         // up-promotion gate; a CLEAN all-ones batch does all of those; and that BREAK can
@@ -5567,6 +5573,13 @@ int main(int argc, char *argv[])
             // Per-rung MEASURED election floor gate + failure memory regression — one-shot at
             // startup, then exit with the test's rc. See DATAFLOW_AUDIT_rung_floor.md §7.
             test_rung_floor_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-acksuffix") == 0)
+        {
+            // ACK-suffix pollution guard fail-before/pass-after — one-shot at startup, then exit rc.
+            test_acksuffix_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7785,6 +7798,18 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_rung_floor_gate();
             printf("[FLAG] Rung-floor test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_acksuffix_cli) {
+            // ACK-suffix pollution guard regression (one-shot, then exit rc). Drives the production
+            // rsp_note_data_frame_snr + rsp_suffix_snr_value: a payload decode captures the forward-
+            // DATA SNR, a control decode does not overwrite it, and the suffix encodes the honest data
+            // read with the guard on vs the polluted control read with it off.
+            printf("[FLAG] --test-acksuffix: invoking ACK-suffix pollution guard regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_ack_suffix_pollution_guard();
+            printf("[FLAG] ACK-suffix test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

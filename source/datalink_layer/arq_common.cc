@@ -1025,6 +1025,7 @@ cl_arq_controller::cl_arq_controller()
 
 	measurements.SNR_uplink=-99.9;
 	measurements.SNR_downlink=-99.9;
+	measurements.SNR_uplink_data=-99.9;   // pollution guard: no forward-DATA frame decoded yet
 	measurements.signal_stregth_dbm=-99.9;
 	measurements.frequency_offset=-99.9;
 
@@ -14338,6 +14339,98 @@ void cl_arq_controller::recompute_ack_pattern_time_ms()
 	}
 }
 
+// ── ACK-SUFFIX POLLUTION GUARD (MERCURY_RSP_SUFFIX_DATA_SNR, default-off) ─────────────────────────
+// Root (meter-source audit): the turbo SET_CONFIG ACK suffix (send_ack_pattern_with_snr, sole caller
+// arq_responder.cc) encodes measurements.SNR_uplink, a field EVERY decoded frame overwrites — incl.
+// CONTROL frames. On a config switch the responder's last decode is the ~34 dB SET_CONFIG control
+// frame; snr_to_tone clamps that to the ceiling tone 15, and the commander decodes a spurious 25.0
+// that latches into its climb-grade meter (an OVER-election path). The guard captures the last
+// forward-DATA-frame SNR into a dedicated field (payload decodes only) and has the suffix encode THAT
+// instead, so the commander sees the honest forward-DATA channel measure. Default-off => byte-
+// identical (the suffix keeps encoding SNR_uplink and the field is simply unread).
+bool cl_arq_controller::rsp_suffix_data_snr_active()
+{
+	const char* e = std::getenv("MERCURY_RSP_SUFFIX_DATA_SNR");
+	return (e && *e && atoi(e) != 0);
+}
+
+// Capture the forward-DATA-frame SNR. Called from receive() at the frame-type classification for both
+// the block-ack and legacy data paths. Records the value ONLY on payload frames (DATA_LONG /
+// DATA_SHORT), so a subsequent CONTROL / SET_CONFIG / ACK decode cannot overwrite what the turbo
+// suffix encodes. The write is behavior-neutral when the guard is off (nothing else reads the field).
+void cl_arq_controller::rsp_note_data_frame_snr(int frame_type, double snr)
+{
+	if(frame_type == DATA_LONG || frame_type == DATA_SHORT)
+		measurements.SNR_uplink_data = snr;
+}
+
+// The SNR value the turbo SET_CONFIG ACK suffix encodes. Default-off => measurements.SNR_uplink
+// (byte-identical to the pre-guard behavior). Armed => the last forward-DATA-frame SNR when one has
+// been captured (> -90), else fall back to SNR_uplink (no data frame decoded yet -> legacy-safe).
+double cl_arq_controller::rsp_suffix_snr_value() const
+{
+	if(rsp_suffix_data_snr_active() && measurements.SNR_uplink_data > -90.0)
+		return measurements.SNR_uplink_data;
+	return measurements.SNR_uplink;
+}
+
+// Fail-before / pass-after unit for the ACK-suffix pollution guard. Drives the SAME production methods
+// receive() and the suffix send call (rsp_note_data_frame_snr + rsp_suffix_snr_value), not a fixture:
+// a payload decode captures the data SNR, a control decode does NOT overwrite it, and the suffix
+// encodes the polluted control read with the guard off vs the honest data read with it on.
+int cl_arq_controller::test_ack_suffix_pollution_guard()
+{
+	int fails = 0;
+	auto check = [&](bool cond, const char* msg) {
+		if(!cond) { fails++; printf("[TEST-ACKSUFFIX] FAIL: %s\n", msg); }
+		else      { printf("[TEST-ACKSUFFIX] ok: %s\n", msg); }
+		fflush(stdout);
+	};
+	printf("[TEST-ACKSUFFIX] start (ACK-suffix pollution guard)\n"); fflush(stdout);
+
+	measurements.SNR_uplink = -99.9;
+	measurements.SNR_uplink_data = -99.9;
+	unsetenv("MERCURY_RSP_SUFFIX_DATA_SNR");
+
+	// (1) CAPTURE — a payload decode records the forward-DATA SNR.
+	rsp_note_data_frame_snr(DATA_LONG, 13.0);
+	check(measurements.SNR_uplink_data == 13.0, "T1: a DATA_LONG decode captures the forward-data SNR (13)");
+	rsp_note_data_frame_snr(DATA_SHORT, 15.0);
+	check(measurements.SNR_uplink_data == 15.0, "T1: a DATA_SHORT decode updates the forward-data SNR (15)");
+
+	// (2) A CONTROL / SET_CONFIG / ACK decode must NOT overwrite the captured data SNR.
+	rsp_note_data_frame_snr(CONTROL, 34.0);
+	check(measurements.SNR_uplink_data == 15.0, "T2: a CONTROL decode does NOT overwrite the data SNR (stays 15)");
+	rsp_note_data_frame_snr(SET_CONFIG, 34.3);
+	check(measurements.SNR_uplink_data == 15.0, "T2: a SET_CONFIG decode does NOT overwrite the data SNR (stays 15)");
+	rsp_note_data_frame_snr(ACK_CONTROL, 30.0);
+	check(measurements.SNR_uplink_data == 15.0, "T2: an ACK_CONTROL decode does NOT overwrite the data SNR (stays 15)");
+
+	// (3) THE POLLUTION — the shared SNR_uplink IS overwritten by the control decode (~34.3 dB), which
+	//     is exactly what the legacy suffix encodes (ceiling-tone clamp -> spurious 25 at the CMD).
+	measurements.SNR_uplink = 34.3;
+
+	// (4) FAIL-BEFORE — guard off: the suffix encodes the polluted control-frame read.
+	unsetenv("MERCURY_RSP_SUFFIX_DATA_SNR");
+	check(rsp_suffix_snr_value() == 34.3,
+		"T3 FAIL-BEFORE: guard off -> suffix encodes the polluted control-frame SNR (34.3)");
+
+	// (5) PASS-AFTER — guard on: the suffix encodes the honest forward-DATA SNR.
+	setenv("MERCURY_RSP_SUFFIX_DATA_SNR", "1", 1);
+	check(rsp_suffix_snr_value() == 15.0,
+		"T4 PASS-AFTER: guard on -> suffix encodes the forward-DATA SNR (15), not the control-frame 34.3");
+
+	// (6) FALLBACK — guard on but no data frame captured yet -> legacy-safe (SNR_uplink).
+	measurements.SNR_uplink_data = -99.9;
+	check(rsp_suffix_snr_value() == 34.3,
+		"T5 FALLBACK: guard on but no data SNR captured -> falls back to SNR_uplink (34.3)");
+	unsetenv("MERCURY_RSP_SUFFIX_DATA_SNR");
+
+	printf("[TEST-ACKSUFFIX] done: %d failure(s)\n", fails);
+	fflush(stdout);
+	return fails;
+}
+
 // Transmit ACK + SNR suffix pattern (turboshift only)
 void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 {
@@ -18712,6 +18805,9 @@ void cl_arq_controller::receive()
 					messages_rx_buffer.type = message_TxRx_byte_buffer[0];
 					messages_rx_buffer.sequence_number = 0;
 					last_received_message_sequence = 0;
+					// POLLUTION GUARD (default-off consumer): capture the forward-DATA-frame SNR on a
+					// block-mode payload decode (no-op for non-DATA types). See rsp_note_data_frame_snr.
+					rsp_note_data_frame_snr((int)messages_rx_buffer.type, received_message_stats.SNR);
 				}
 			}
 			if(l1_disposition == l1_block::DispatchDisposition::LEGACY_SEATED)
@@ -18720,6 +18816,10 @@ void cl_arq_controller::receive()
 				messages_rx_buffer.type = (char)legacy_state.rx_type;
 				messages_rx_buffer.sequence_number = (char)legacy_state.rx_sequence;
 				last_received_message_sequence = (char)legacy_state.last_received_sequence;
+				// POLLUTION GUARD (default-off consumer): capture the forward-DATA-frame SNR on a legacy
+				// payload decode (DATA_LONG / DATA_SHORT only; no-op otherwise), so a subsequent CONTROL
+				// / SET_CONFIG decode cannot overwrite the value the turbo SET_CONFIG ACK suffix encodes.
+				rsp_note_data_frame_snr((int)messages_rx_buffer.type, received_message_stats.SNR);
 				// Bit 7 of sequence_number = end-of-batch flag from commander (data frames only)
 				// R038 (race audit 2026-06-06): this capture runs PRE-ROUTING — before
 				// the responder classifies the frame as match-current / match-prev /
