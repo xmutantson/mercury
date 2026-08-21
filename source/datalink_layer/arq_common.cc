@@ -20177,6 +20177,7 @@ bool cl_arq_controller::w_seam_refuse(int wbsi)
 	// test_stream_offset (Part V), so the test drives the SAME decision the wire path
 	// uses (the w_stream_shift_detected / w_bytegate_shortfall pattern).
 	if(!rsp_rebase_seam_armed) return false;              // no open seam → never a refuse
+	if(wbsi < 0) return false;                             // no batch to deliver → never a refuse
 	if(wbsi >= 0)
 	{
 		int b = wbsi & 0xFF;

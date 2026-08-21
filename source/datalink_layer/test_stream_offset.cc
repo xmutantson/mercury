@@ -1237,6 +1237,15 @@ int cl_arq_controller::test_stream_offset()
 		CHECK(rx_stream_delivered == v0_before + (uint64_t)v0_total,
 			"V0: cursor advanced by the delivered bytes", (long long)rx_stream_delivered, (long long)(v0_before + v0_total));
 
+		// V-empty — FILE_END and other no-residual flushes enter the delivery funnel
+		// with the -1 sentinel. No batch exists, so the seam predicate must not turn
+		// that sentinel into wire bsi 255 and refuse an otherwise clean config climb.
+		rsp_rebase_seam_armed = true;
+		decrypt_delivered_bsi = -1;
+		CHECK(!w_seam_refuse(decrypt_delivered_bsi),
+			"V-empty: no-batch sentinel is not refused as unstamped delivery",
+			w_seam_refuse(decrypt_delivered_bsi)?1:0, 0);
+
 		// V — ARM the seam (as the production DEMOTE-REBASE does) and present the SPLICE: a
 		// bsi-contiguous batch with NO stamp (EOB lost) at a stamp-riding config.
 		rsp_rebase_seam_armed       = true;
