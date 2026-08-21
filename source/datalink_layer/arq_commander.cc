@@ -7263,7 +7263,17 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// edge above already mirrored missed_ack_slots into this retained counter;
 			// OFF/DEFEAT executes the original raw increment byte-for-byte.
 			if(!slot_liveness_active)
-				emergency_nack_count++;
+			{
+				// Site 1 (demote temporal hysteresis, MERCURY_DEMOTE_TEMPORAL_HYSTERESIS=1):
+				// a data-ACK timeout while a COMPLETE L1 block aggregate is legitimately
+				// outstanding is a DEFERRED / still-in-flight aggregate, NOT ACK-absence.
+				// Hold it (do not count) for a bounded budget so the ordinary retransmit
+				// (which triggers the responder aggregate replay) can recover; sustained
+				// absence (budget spent) still counts and reaches the BREAK threshold.
+				// Byte-identical when the gate is off (l1_aggregate_defer_hold()==false).
+				if(!l1_aggregate_defer_hold())
+					emergency_nack_count++;
+			}
 
 			// WALL-B FIX-9 D3 (FIX9_D3_DESIGN.md §3, producer P2): count CONSECUTIVE block-failures
 			// AT CONFIG_16 where the reverse MFSK ACK+SACK correlator FAILED TO DECODE (we are in the
@@ -7838,6 +7848,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// CONSECUTIVE TOTAL block failures (threshold 3 at :3334); any delivery —
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
+			l1_aggregate_defer_streak = 0;  // deferred aggregate arrived (clean/partial) -> recovery, disarm the hold
 			if(linkphase_slotliveness_on())
 			{
 				missed_ack_slots = 0;
@@ -9150,6 +9161,8 @@ void cl_arq_controller::process_control_commander()
 			telecom_system->invalidate_channel_selectivity();
 			topgear_elect_engaged = false;
 			topgear_elect_clean_streak = 0;
+			topgear_drop_streak = 0;
+			l1_aggregate_defer_streak = 0;
 			topgear_channel_flatness = -1.0;
 			topgear_clear_forward_verdict();
 			topgear_last_report_bsi = -1;

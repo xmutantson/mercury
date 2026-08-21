@@ -40,6 +40,11 @@ bool feature_gate_enabled() {
 	return value && std::strcmp(value, "1") == 0;
 }
 
+bool temporal_hysteresis_enabled() {
+	const char* value = std::getenv("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+	return value && std::strcmp(value, "1") == 0;
+}
+
 uint8_t capability_advertise_bit() {
 	return feature_gate_enabled() ? (uint8_t)CAP_L1_BLOCKACK : (uint8_t)0;
 }
@@ -52,7 +57,8 @@ BlockAckRuntime::BlockAckRuntime()
 	  last_ack_all_received_(false), last_ack_batch_count_(0),
 	  last_ack_slot_count_(0), tx_pending_start_bsi_(0),
 	  tx_pending_batches_(0), tx_tail_commit_sent_(false),
-	  flush_requested_(false) {}
+	  flush_requested_(false), last_tx_ack_valid_(false),
+	  last_tx_ack_tail_bsi_(0) {}
 
 uint8_t BlockAckRuntime::advertised_capability(uint8_t legacy) const {
 #ifdef L1_BLOCK_GATE_OFF_DEFEAT
@@ -82,6 +88,9 @@ void BlockAckRuntime::begin_session(uint8_t connection, uint32_t session,
 	tx_pending_batches_ = 0;
 	tx_tail_commit_sent_ = false;
 	flush_requested_ = false;
+	last_tx_ack_valid_ = false;
+	last_tx_ack_tail_bsi_ = 0;
+	last_tx_ack_wire_.clear();
 }
 
 void BlockAckRuntime::note_transmitted_batch(uint8_t bsi) {
@@ -103,6 +112,16 @@ void BlockAckRuntime::note_transmitted_batch(uint8_t bsi) {
 bool BlockAckRuntime::intermediate_silence_expected() const {
 	return negotiated_ && tx_pending_batches_ > 0
 		&& tx_pending_batches_ < aggregate_batches_ && !tx_tail_commit_sent_;
+}
+
+bool BlockAckRuntime::aggregate_response_outstanding() const {
+	// The complement of intermediate_silence_expected() within an active block:
+	// the block is COMPLETE (Nth batch transmitted) or a short final group has
+	// had its tail commit sent, and the single aggregate BLOCK_SACK is the only
+	// outstanding reverse frame. A timeout in this window is a DEFERRED (or lost)
+	// aggregate, not a channel ACK-absence.
+	return negotiated_ && tx_pending_batches_ > 0
+		&& (tx_pending_batches_ >= aggregate_batches_ || tx_tail_commit_sent_);
 }
 
 bool BlockAckRuntime::build_tail_commit(std::vector<uint8_t>* wire) {
@@ -243,6 +262,23 @@ bool BlockAckRuntime::observe_received_batch(uint8_t bsi,
 	if(wire) wire->clear();
 	if(!negotiated_ || !wire || received.empty()
 		|| received.size() > MAX_BATCH_SLOTS) return false;
+	// A full aggregate response is transmitted once and the responder then clears
+	// its pending window. If that response is lost, the commander can only
+	// retransmit the just-flushed tail batch (earlier members are journal-only).
+	// Replaying the exact prior aggregate for that exact tail BSI closes the still-
+	// outstanding identity. Without this replay, the duplicate tail is adopted as
+	// batch 1 of a new block and its deliberately deferred ACK manufactures
+	// permanent absence. The existing commander miss budget remains authoritative
+	// if every replay is also lost.
+	if(temporal_hysteresis_enabled() && pending_batches_.empty()
+		&& last_tx_ack_valid_ && bsi == last_tx_ack_tail_bsi_)
+	{
+		*wire = last_tx_ack_wire_;
+		std::printf("[L1-BLOCKACK-REPLAY] duplicate tail bsi=%u; replaying prior aggregate\n",
+			(unsigned)bsi);
+		std::fflush(stdout);
+		return true;
+	}
 	if(!pending_batches_.empty()) {
 		const uint8_t expected = (uint8_t)(pending_start_bsi_
 			+ (uint8_t)pending_batches_.size());
@@ -296,6 +332,11 @@ bool BlockAckRuntime::flush_received_batches(std::vector<uint8_t>* wire) {
 		(unsigned)sack.block_serial, (unsigned)sack.block_start_bsi,
 		sack.batches.size(), (unsigned)sack.bitmap_width_bits, sack.final ? 1 : 0);
 	std::fflush(stdout);
+	if(temporal_hysteresis_enabled()) {
+		last_tx_ack_valid_ = true;
+		last_tx_ack_tail_bsi_ = pending_batches_.back().bsi;
+		last_tx_ack_wire_ = *wire;
+	}
 	pending_batches_.clear();
 	pending_bitmap_.clear();
 	pending_width_ = 0;

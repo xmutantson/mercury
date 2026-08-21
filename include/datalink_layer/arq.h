@@ -2870,6 +2870,14 @@ public:
   bool topgear_channel_clean();
   void topgear_elect_evaluate();
   int  topgear_wb_ceiling();
+  // ACK-seam BREAK temporal-validity classifier (MERCURY_DEMOTE_TEMPORAL_HYSTERESIS=1,
+  // default-off). Called at the emergency-BREAK miss increment. Returns true if this
+  // receive timeout falls in an L1 aggregate-outstanding window and is being HELD (not
+  // counted as a block-failure) under the deferral budget — the caller then SKIPS the
+  // emergency_nack_count increment. Returns false when the gate is off, the window is
+  // not aggregate-outstanding, or the budget is spent (sustained absence), in which case
+  // the caller counts the miss exactly as before. Byte-identical when the gate is off.
+  bool l1_aggregate_defer_hold();
   // Compact-confirm telemetry codec. SNR quantizes DOWN in 2 dB steps. The low
   // nibble is a marker-backed flatness state (8=unmeasured, 9=flat, 10=non-flat);
   // every other value is rejected before it can affect election state.
@@ -5089,6 +5097,7 @@ public:
   // ── BLOCKER D (ACK-seam dispatch) anti-thrash state ── all dead unless MERCURY_TOPGEAR_ELECT=1.
   int     topgear_reengage_cooldown;    // B1: clean batches a seam DEMOTE bars the next seam CLIMB; 0 = free
   int     topgear_below_floor_streak;   // B2: consecutive flat-but-below-floor (state 9) reports; drop at STREAK
+  int     topgear_drop_streak;          // default-off temporal gate: consecutive bad reports while engaged
   int     topgear_last_flat_state;      // B2: last decoded forward-report flat_state marker (8/9/10/11)
 
   // ── Topgear report CONSUME-RACE fix: deferred stashed-tail report decode ──
@@ -6559,6 +6568,7 @@ public:
   // Emergency BREAK: drop to ROBUST_0 when current config is undecodable
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)
+  int l1_aggregate_defer_streak;  // default-off temporal gate: consecutive aggregate-window timeouts HELD (not counted toward emergency BREAK) while an L1 block aggregate is legitimately outstanding
   int emergency_break_active;     // 1 = BREAK sent, waiting for ACK
   int emergency_break_retries;    // retries left for current BREAK attempt
   int emergency_previous_config;  // config that was failing

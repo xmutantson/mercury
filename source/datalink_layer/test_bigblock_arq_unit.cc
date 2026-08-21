@@ -1148,7 +1148,7 @@ int cl_arq_controller::test_topgear_clean_election()
 		cmd->topgear_channel_flatness  = flat;
 		for(int i=0;i<n;i++) cmd->topgear_elect_evaluate();
 	};
-	auto reset_state = [&](){ cmd->topgear_elect_engaged=false; cmd->topgear_elect_clean_streak=0; };
+	auto reset_state = [&](){ cmd->topgear_elect_engaged=false; cmd->topgear_elect_clean_streak=0; cmd->topgear_drop_streak=0; };
 
 	// (1) MARGINAL SNR (flat) -> never engages -> ceiling stays cfg16 (electability closed).
 	reset_state();
@@ -1200,6 +1200,90 @@ int cl_arq_controller::test_topgear_clean_election()
 	drive(SNR_CLEAN, NON_FLAT, 1);                // deep SNR but suddenly selective
 	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
 	      "engaged @cfg17 + one NON-FLAT report -> drops IMMEDIATELY (fade fallback, no thrash)");
+
+	// (5b.1) Default-off temporal-validity successor. One isolated non-flat
+	// report is not sustained channel evidence; a following clean report cancels
+	// the debt. Two consecutive non-flat reports still drop the engaged verdict.
+	reset_state();
+	cmd->current_configuration = CONFIG_16;
+	drive(SNR_CLEAN, FLAT_OK, STREAK);
+	check(cmd->topgear_elect_engaged,
+	      "re-engage clean+flat @cfg16 for gated transient/sustained arms");
+	cmd->current_configuration = CONFIG_17;
+	set_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS", "1");
+	drive(SNR_CLEAN, NON_FLAT, 1);
+	check(cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_17,
+	      "temporal gate: one NON-FLAT report is held as transient");
+	drive(SNR_CLEAN, FLAT_OK, 1);
+	drive(SNR_CLEAN, NON_FLAT, 1);
+	check(cmd->topgear_elect_engaged,
+	      "temporal gate: a clean report cancels prior bad-report debt");
+	drive(SNR_CLEAN, NON_FLAT, 1);
+	check(!cmd->topgear_elect_engaged && cmd->topgear_wb_ceiling() == CONFIG_16,
+	      "temporal gate: two consecutive NON-FLAT reports still demote");
+	clr_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+
+	// (5b.2) Site 1 -- ACK-seam BREAK temporal-validity classifier. A COMPLETE L1
+	// block awaiting its single aggregate BLOCK_SACK is a DEFERRED / in-flight
+	// aggregate, NOT a channel ACK-absence: hold up to L1_AGGREGATE_DEFER_MAX such
+	// receive timeouts WITHOUT counting them toward the emergency BREAK; once the
+	// budget is spent, sustained absence counts exactly as before so the BREAK
+	// threshold is still reachable. l1_blockack gate + N are fixed at CONSTRUCTION,
+	// so this arm builds a fresh commander AFTER arming MERCURY_L1_BLOCKACK.
+	{
+		set_env("MERCURY_L1_BLOCKACK", "1");
+		set_env("MERCURY_L1_BLOCKACK_N", "4");
+		cl_arq_controller* l1cmd = new cl_arq_controller();
+		l1cmd->telecom_system      = ts;
+		l1cmd->role                = COMMANDER;
+		l1cmd->current_configuration = CONFIG_16;
+		l1cmd->l1_blockack.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		l1cmd->l1_blockack.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		for(uint8_t bsi = 20; bsi < 24; ++bsi)
+			l1cmd->l1_blockack.note_transmitted_batch(bsi);
+		check(l1cmd->l1_blockack.aggregate_response_outstanding(),
+		      "site1: fresh commander is aggregate-outstanding (complete block, aggregate ACK due)");
+
+		// Gate OFF: byte-identical -> never held even with the aggregate outstanding.
+		clr_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+		l1cmd->l1_aggregate_defer_streak = 0;
+		check(!l1cmd->l1_aggregate_defer_hold() && l1cmd->l1_aggregate_defer_streak == 0,
+		      "site1 gate OFF: aggregate-window timeout NOT held (miss counted, byte-identical)");
+
+		// Gate ON: the first L1_AGGREGATE_DEFER_MAX aggregate-window timeouts are HELD.
+		set_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS", "1");
+		l1cmd->l1_aggregate_defer_streak = 0;
+		int held = 0;
+		for(int i = 0; i < L1_AGGREGATE_DEFER_MAX; ++i)
+			if(l1cmd->l1_aggregate_defer_hold()) held++;
+		check(held == L1_AGGREGATE_DEFER_MAX
+		      && l1cmd->l1_aggregate_defer_streak == L1_AGGREGATE_DEFER_MAX,
+		      "site1 gate ON: deferred aggregate held for the full budget (transient not counted)");
+
+		// Direction (b): budget spent -> HOLD returns false -> the caller counts the
+		// miss -> genuine SUSTAINED absence still reaches emergency_nack_threshold.
+		check(!l1cmd->l1_aggregate_defer_hold(),
+		      "site1: budget spent -> sustained absence counts (BREAK/demote still reachable)");
+
+		// Recovery disarms the hold (streak reset at the data-ACK success site).
+		l1cmd->l1_aggregate_defer_streak = 0;
+		check(l1cmd->l1_aggregate_defer_hold() && l1cmd->l1_aggregate_defer_streak == 1,
+		      "site1: after recovery reset the aggregate window holds again");
+
+		// The intermediate 1..N-1 window is NOT the aggregate seam -> never held.
+		l1cmd->l1_blockack.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		l1cmd->l1_blockack.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		l1cmd->l1_blockack.note_transmitted_batch(40);
+		l1cmd->l1_aggregate_defer_streak = 0;
+		check(!l1cmd->l1_blockack.aggregate_response_outstanding()
+		      && !l1cmd->l1_aggregate_defer_hold(),
+		      "site1: intermediate (non-outstanding) window is never held (only the aggregate seam)");
+
+		clr_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+		clr_env("MERCURY_L1_BLOCKACK");
+		clr_env("MERCURY_L1_BLOCKACK_N");
+		delete l1cmd;
+	}
 
 	// (5c) LEAVING the band clears the verdict (load_configuration reset).
 	reset_state();

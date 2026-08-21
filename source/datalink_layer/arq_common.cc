@@ -1261,6 +1261,8 @@ cl_arq_controller::cl_arq_controller()
 	topgear_last_report_bsi=-1;
 	topgear_reengage_cooldown=0;
 	topgear_below_floor_streak=0;
+	topgear_drop_streak=0;
+	l1_aggregate_defer_streak=0;
 	topgear_last_flat_state=8;
 	// Consume-race deferred report decode: nothing pending on a fresh controller.
 	topgear_pending_report_bsi=-1;
@@ -3396,6 +3398,8 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		topgear_elect_clean_streak = 0;
 		topgear_reengage_cooldown = 0;
 		topgear_below_floor_streak = 0;
+		topgear_drop_streak = 0;
+		l1_aggregate_defer_streak = 0;
 		topgear_clear_forward_verdict();
 	}
 	if(current_configuration!=CONFIG_NONE)
@@ -4077,12 +4081,14 @@ void cl_arq_controller::topgear_elect_evaluate()
 		topgear_elect_engaged = false;
 		topgear_elect_clean_streak = 0;
 		topgear_below_floor_streak = 0;   // BLOCKER D (B2): re-earn from scratch on band re-entry
+		topgear_drop_streak = 0;
 		topgear_clear_forward_verdict();
 		return;
 	}
 	if(topgear_channel_clean())
 	{
 		topgear_below_floor_streak = 0;   // BLOCKER D (B2): a clean report clears the below-floor dip streak
+		topgear_drop_streak = 0;
 		if(topgear_elect_clean_streak < TOPGEAR_ELECT_ENGAGE_STREAK) topgear_elect_clean_streak++;
 		if(topgear_elect_clean_streak >= TOPGEAR_ELECT_ENGAGE_STREAK) topgear_elect_engaged = true;
 	}
@@ -4101,17 +4107,38 @@ void cl_arq_controller::topgear_elect_evaluate()
 		// margin loss is NEVER held. Guard-off / non-flat => byte-identical fast drop.
 		bool margin_ok = (get_configuration(measurements.SNR_downlink - TOPGEAR_ELECT_MARGIN_DB) >= CONFIG_16);
 		bool below_floor_only = (topgear_last_flat_state == 9) && margin_ok;
-		if(below_floor_only && (topgear_below_floor_streak + 1) < TOPGEAR_BELOW_FLOOR_DROP_STREAK)
+		bool temporal_drop_active = l1_block::temporal_hysteresis_enabled()
+			&& topgear_elect_engaged;
+		if(temporal_drop_active
+		   && (topgear_drop_streak + 1) < TOPGEAR_TEMPORAL_DROP_STREAK)
+		{
+			topgear_drop_streak++;
+			printf("[TOPGEAR-HYST] transient bad report held (%d/%d state=%d snr=%.1f flatness=%.3f)\n",
+				topgear_drop_streak, TOPGEAR_TEMPORAL_DROP_STREAK,
+				topgear_last_flat_state, measurements.SNR_downlink,
+				topgear_channel_flatness);
+			fflush(stdout);
+		}
+		else if(!temporal_drop_active && below_floor_only
+			&& (topgear_below_floor_streak + 1) < TOPGEAR_BELOW_FLOOR_DROP_STREAK)
 		{
 			// First below-floor dip: HOLD the verdict, arm the streak (engaged rides through).
 			topgear_below_floor_streak++;
 		}
 		else
 		{
+			if(temporal_drop_active && topgear_drop_streak > 0)
+			{
+				printf("[TOPGEAR-HYST] sustained bad reports; demoting cfg17 (state=%d snr=%.1f flatness=%.3f)\n",
+					topgear_last_flat_state, measurements.SNR_downlink,
+					topgear_channel_flatness);
+				fflush(stdout);
+			}
 			// Non-flat / margin loss / unmeasured, OR the Nth consecutive below-floor: drop.
 			topgear_elect_engaged = false;
 			topgear_elect_clean_streak = 0;
 			topgear_below_floor_streak = 0;
+			topgear_drop_streak = 0;
 		}
 	}
 }
@@ -4123,6 +4150,46 @@ int cl_arq_controller::topgear_wb_ceiling()
 {
 	if(topgear_elect_feature_enabled() && topgear_elect_engaged) return CONFIG_17;
 	return WB_CONFIG_MAX;
+}
+
+// ACK-seam BREAK temporal-validity classifier. Site 1 of the demote-hysteresis fix.
+// The commander's emergency-BREAK path counts every reverse-ACK timeout as a
+// consecutive block-failure (emergency_nack_count) and BREAKs at
+// emergency_nack_threshold. But when a COMPLETE L1 block is legitimately awaiting
+// its single aggregate BLOCK_SACK (aggregate_response_outstanding()), a timeout is a
+// DEFERRED / still-in-flight aggregate — the responder emitted it and the commander
+// simply has not decoded it yet, or the responder is about to re-emit it (the L1
+// replay, fired by the ordinary tail retransmit) — NOT a channel ACK-absence. The
+// intermediate 1..N-1 window is already handled upstream by
+// intermediate_silence_expected(); this covers the tail/aggregate-pending complement.
+// HOLD such a timeout (do not count it) for up to L1_AGGREGATE_DEFER_MAX consecutive
+// occurrences; the ordinary retransmit still fires meanwhile and typically recovers.
+// Once the budget is spent the aggregate is treated as genuinely absent and every
+// later timeout counts exactly as before — so real SUSTAINED absence still reaches
+// emergency_nack_threshold and demotes (only the demote instant slips by the bounded
+// budget, the temporal-validity cost). No-op / byte-identical unless the gate is on.
+bool cl_arq_controller::l1_aggregate_defer_hold()
+{
+	if(!l1_block::temporal_hysteresis_enabled()) return false;
+	if(!l1_blockack.aggregate_response_outstanding()) return false;
+	if(l1_aggregate_defer_streak >= L1_AGGREGATE_DEFER_MAX)
+	{
+		// Deferral budget spent: the aggregate never arrived across the whole
+		// temporal window => sustained absence. Count the miss (the caller does the
+		// increment) exactly as the gate-off path; emit the demote-side witness so a
+		// cohort can separate a recovered deferral from a genuine sustained loss.
+		printf("[L1-DEFER-DEMOTE] aggregate deferral budget spent; counting miss (streak=%d/%d nack=%d config=%d)\n",
+			l1_aggregate_defer_streak, L1_AGGREGATE_DEFER_MAX,
+			emergency_nack_count, current_configuration);
+		fflush(stdout);
+		return false;
+	}
+	l1_aggregate_defer_streak++;
+	printf("[L1-DEFER-HOLD] deferred aggregate held, miss NOT counted (streak=%d/%d nack=%d config=%d)\n",
+		l1_aggregate_defer_streak, L1_AGGREGATE_DEFER_MAX,
+		emergency_nack_count, current_configuration);
+	fflush(stdout);
+	return true;
 }
 
 // In-band rate adaptation (Stage 3a): build the combined CONFIG_TAG suffix tones.
@@ -9482,6 +9549,8 @@ void cl_arq_controller::reset_session_state()
 	topgear_last_report_bsi = -1;
 	topgear_reengage_cooldown = 0;
 	topgear_below_floor_streak = 0;
+	topgear_drop_streak = 0;
+	l1_aggregate_defer_streak = 0;
 	topgear_last_flat_state = 8;
 	// A pending deferred report is prior-session channel evidence too.
 	topgear_pending_report_clear("session-reset");

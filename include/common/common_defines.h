@@ -974,6 +974,23 @@ CONFIG_16 (5664.7 bps).
 // keeps the immediate single-report drop; below-floor refusal is ENGAGE-side (unaffected).
 #define TOPGEAR_BELOW_FLOOR_DROP_STREAK 2
 
+// Default-off temporal-validity gate: an engaged top rung holds one isolated
+// bad forward report, but two consecutive bad reports still force the safe
+// cfg17->cfg16 demote. Clean evidence clears the debt.
+#define TOPGEAR_TEMPORAL_DROP_STREAK 2
+
+// Default-off temporal-validity gate for the L1 block-ACK ACK-seam BREAK path
+// (MERCURY_DEMOTE_TEMPORAL_HYSTERESIS=1). While a COMPLETE block is legitimately
+// awaiting its single aggregate BLOCK_SACK (aggregate_response_outstanding()), a
+// receive timeout is a DEFERRED / still-in-flight aggregate, not a channel
+// ACK-absence: hold up to this many such aggregate-window timeouts WITHOUT
+// counting them toward the emergency BREAK (emergency_nack_count). The
+// retransmit still fires (which triggers the responder's aggregate replay), so
+// the deferral usually recovers. Once the budget is spent the aggregate is
+// treated as genuinely absent and every later timeout counts exactly as before,
+// so real sustained absence still reaches emergency_nack_threshold and demotes.
+#define L1_AGGREGATE_DEFER_MAX 2
+
 // TOPGEAR REPORT CONSUME-RACE — deferred-decode deadline. The commander accepts a
 // compact confirm at FIRST-codeword CRC validity, which on the real-loopback vehicle
 // precedes the trailing report codeword's audio arrival (audio-bracketed twice:

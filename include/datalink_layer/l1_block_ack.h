@@ -45,6 +45,13 @@ public:
 	// commit for a short final group, waits for the aggregate response.
 	void note_transmitted_batch(uint8_t bsi);
 	bool intermediate_silence_expected() const;
+	// True while a COMPLETE block (Nth batch sent, or a short final group whose
+	// tail commit has been sent) is legitimately awaiting its single aggregate
+	// BLOCK_SACK. This is the exact complement of intermediate_silence_expected()
+	// within an active block: the tail/aggregate-pending window that a deferred or
+	// still-in-flight aggregate response occupies. Goes false the instant the
+	// aggregate is applied (dispatch_received_frame sets tx_pending_batches_=0).
+	bool aggregate_response_outstanding() const;
 	bool build_tail_commit(std::vector<uint8_t>* wire);
 
 	DispatchDisposition dispatch_received_frame(const uint8_t* wire,
@@ -84,9 +91,13 @@ private:
 	uint8_t tx_pending_batches_;
 	bool tx_tail_commit_sent_;
 	bool flush_requested_;
+	bool last_tx_ack_valid_;
+	uint8_t last_tx_ack_tail_bsi_;
+	std::vector<uint8_t> last_tx_ack_wire_;
 };
 
 bool feature_gate_enabled();
+bool temporal_hysteresis_enabled();
 uint8_t capability_advertise_bit();
 
 }  // namespace l1_block

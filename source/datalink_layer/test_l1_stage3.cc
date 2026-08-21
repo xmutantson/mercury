@@ -248,6 +248,112 @@ void aggregation_and_atomic_settlement() {
 	unsetenv("MERCURY_L1_JOURNAL");
 }
 
+// Site 1 classifier: aggregate_response_outstanding() must be the exact
+// complement of intermediate_silence_expected() within an active block — false
+// for the intermediate 1..N-1 window, true once the block is complete (Nth batch
+// sent) or a short tail commit has been sent, and false again the instant the
+// aggregate is applied. This is the predicate the commander BREAK-path hold keys
+// on to distinguish a deferred/in-flight aggregate from a channel ACK-absence.
+void aggregate_outstanding_classifier() {
+	set_gate(true, 4);
+	BlockAckRuntime commander;
+	commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+
+	// Fresh session: no block active — neither window is open.
+	CHECK(!commander.intermediate_silence_expected()
+		&& !commander.aggregate_response_outstanding(),
+		"fresh block session: neither silence window is open");
+
+	// Intermediate 1..N-1 batches: silence expected, aggregate NOT yet outstanding.
+	commander.note_transmitted_batch(20);
+	commander.note_transmitted_batch(21);
+	commander.note_transmitted_batch(22);
+	CHECK(commander.intermediate_silence_expected()
+		&& !commander.aggregate_response_outstanding(),
+		"intermediate 1..N-1 window: silence expected, aggregate NOT outstanding");
+
+	// Nth batch transmitted: block complete, the single aggregate is now DUE.
+	commander.note_transmitted_batch(23);
+	CHECK(!commander.intermediate_silence_expected()
+		&& commander.aggregate_response_outstanding(),
+		"complete block (Nth batch): aggregate outstanding, silence window closed");
+
+	// Applying the aggregate clears the outstanding window (tx_pending_batches_=0).
+	std::vector<uint8_t> agg = full_sack_wire(0x5a, 20, 4, 2);
+	l1_block::LegacyParserAckState st = {FREE, NONE, 0, 0};
+	CHECK(commander.dispatch_received_frame(agg.data(), agg.size(), &st, NULL)
+		!= DispatchDisposition::INVALID,
+		"commander applies the full aggregate");
+	CHECK(!commander.intermediate_silence_expected()
+		&& !commander.aggregate_response_outstanding(),
+		"aggregate applied: outstanding window closes");
+
+	// Short final group whose tail commit has been sent is ALSO outstanding.
+	BlockAckRuntime tail_cmd;
+	tail_cmd.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	tail_cmd.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	tail_cmd.note_transmitted_batch(30);
+	tail_cmd.note_transmitted_batch(31);
+	std::vector<uint8_t> commit;
+	CHECK(tail_cmd.build_tail_commit(&commit),
+		"short-tail commander builds a tail commit");
+	CHECK(!tail_cmd.intermediate_silence_expected()
+		&& tail_cmd.aggregate_response_outstanding(),
+		"short tail after commit: aggregate outstanding, silence window closed");
+}
+
+void lost_aggregate_replay() {
+	set_gate(true, 4);
+	unsetenv("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+	BlockAckRuntime off_responder;
+	off_responder.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	off_responder.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	std::vector<uint8_t> off_dropped;
+	for(uint8_t bsi = 20; bsi < 24; ++bsi) {
+		std::vector<uint8_t> frame;
+		if(off_responder.observe_received_batch(bsi,
+			std::vector<bool>{true, true}, false, &frame)) off_dropped = frame;
+	}
+	std::vector<uint8_t> off_replay;
+	CHECK(!off_dropped.empty() && !off_responder.observe_received_batch(23,
+		std::vector<bool>{true, true}, false, &off_replay) && off_replay.empty(),
+		"temporal gate OFF preserves duplicate-tail deferral with zero replay bytes");
+
+	setenv("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS", "1", 1);
+	BlockAckRuntime responder;
+	responder.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	responder.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	BlockAckRuntime commander;
+	commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+
+	std::vector<uint8_t> dropped;
+	for(uint8_t bsi = 20; bsi < 24; ++bsi) {
+		commander.note_transmitted_batch(bsi);
+		std::vector<uint8_t> frame;
+		if(responder.observe_received_batch(bsi,
+			std::vector<bool>{true, true}, false, &frame)) dropped = frame;
+	}
+	CHECK(!dropped.empty(), "fixture emits the full N=4 aggregate that is dropped");
+	CHECK(dropped == off_dropped,
+		"temporal gate leaves the first aggregate wire byte-identical");
+
+	// The commander's retained one-batch cache contains only the aggregate tail.
+	// If the aggregate response is lost it retransmits that tail BSI. The responder
+	// must classify it as a duplicate of the just-flushed block and replay the exact
+	// aggregate, not adopt it as batch 1 of a fresh block and defer forever.
+	std::vector<uint8_t> replay;
+	CHECK(responder.observe_received_batch(23,
+		std::vector<bool>{true, true}, false, &replay) && replay == dropped,
+		"lost aggregate + duplicate tail BSI replays the exact validated BLOCK_SACK");
+	l1_block::LegacyParserAckState state = {FREE, NONE, 0, 0};
+	CHECK(!replay.empty() && commander.dispatch_received_frame(replay.data(),
+		replay.size(), &state, NULL) == DispatchDisposition::BLOCK_FRAME_ACCEPTED,
+		"commander accepts replay under the still-outstanding aggregate identity");
+	unsetenv("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+}
+
 void gate_off_byte_identity() {
 	set_gate(false);
 	BlockAckRuntime off;
@@ -288,6 +394,8 @@ int main() {
 	legacy_rx_fence();
 	capability_negotiation();
 	aggregation_and_atomic_settlement();
+	aggregate_outstanding_classifier();
+	lost_aggregate_replay();
 	gate_off_byte_identity();
 	std::printf("L1 Stage-3: %s (%d failures)\n",
 		failures ? "FAIL" : "PASS", failures);
