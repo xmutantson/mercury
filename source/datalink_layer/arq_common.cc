@@ -910,6 +910,12 @@ cl_arq_controller::cl_arq_controller()
 		// into the DUTY_FASTSTART master (it is a pin-correctness guard, not a duty lever).
 		const char* drp = std::getenv("MERCURY_DUTY_R_PIN_DEFEAT");
 		duty_r_pin_defeat = (drp && *drp && atoi(drp) != 0);
+		// ELECTION METER-VALIDITY GATE (R2v2) -- ships DEFAULT-ON: the robust->OFDM speculative
+		// cross requires a valid forward SNR (prevents the low-SNR sentinel-election
+		// config-churn; clean-channel start parity measured on hardware).
+		// MERCURY_ELECT_VALID_METERS=0 restores the incumbent sentinel cross for A/B.
+		const char* evm = std::getenv("MERCURY_ELECT_VALID_METERS");
+		elect_valid_meters = !(evm && *evm && atoi(evm) == 0);
 		// P-alt (climb-duty) — climb-confirm batch shrink. Ships DEFAULT-ON.
 		// MERCURY_DUTY_PALT_DEFEAT=1 (or the master MERCURY_DUTY_FASTSTART_DEFEAT=1)
 		// restores the incumbent full climb batch so the fire-proof runs FIX vs DEFEAT

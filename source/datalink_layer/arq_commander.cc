@@ -15577,6 +15577,57 @@ int cl_arq_controller::test_robust_connect_exit()
 	check(pa == CONFIG_0,
 		"PASS-AFTER: R live at ROBUST_0 -> seed CONFIG_0 (skip robust dwell)", pa, CONFIG_0);
 
+	// ===== R2v2 ELECTION METER-VALIDITY GATE (MERCURY_ELECT_VALID_METERS) =====
+	// The shared robust->OFDM speculative cross fires the CONFIG_0 probe meter-INDEPENDENTLY.
+	// At a low-SNR connect the forward SNR is the -99.9 sentinel; the meter-independent cross
+	// then re-probes forever (the low-SNR config-churn). The gate HOLDS robust until a valid
+	// forward SNR exists. Drives the REAL predicate on ONE binary via the env-latched flag.
+	bool   saved_evm = elect_valid_meters;
+	double saved_snr = measurements.SNR_uplink;
+	duty_r_defeat = false;
+	current_configuration = ROBUST_0;
+	supershift_proven_ceiling = -1;
+	gear_shift_on = YES;               // neutralise PIN-RESPECT (a gearshift-ON climb session)
+	data_configuration = CONFIG_0;
+	duty_r_pin_defeat = false;
+
+	// FAIL-BEFORE (gate OFF = default): a sentinel forward SNR STILL elects the CONFIG_0 cross
+	// (reproduces the sentinel election at the root of the low-SNR churn).
+	elect_valid_meters = false;
+	measurements.SNR_uplink = -99.9;
+	int ev_fb = robust_connect_exit_target();
+	check(ev_fb == CONFIG_0,
+		"EVM FAIL-BEFORE: gate OFF + sentinel SNR -> CONFIG_0 cross (the churn root)", ev_fb, CONFIG_0);
+
+	// PASS-AFTER (gate ON): a sentinel forward SNR HOLDS robust (no speculative cross).
+	elect_valid_meters = true;
+	measurements.SNR_uplink = -99.9;
+	int ev_pa = robust_connect_exit_target();
+	check(ev_pa == CONFIG_NONE,
+		"EVM PASS-AFTER: gate ON + sentinel SNR -> HOLD robust (no cross)", ev_pa, CONFIG_NONE);
+
+	// MISSED-ELECTION SAFETY (gate ON + VALID SNR): the gate must NOT freeze elections -- a
+	// valid forward SNR still elects the CONFIG_0 cross.
+	elect_valid_meters = true;
+	measurements.SNR_uplink = 15.0;
+	int ev_safe = robust_connect_exit_target();
+	check(ev_safe == CONFIG_0,
+		"EVM SAFETY: gate ON + VALID SNR -> CONFIG_0 cross (elections NOT frozen)", ev_safe, CONFIG_0);
+
+	// SIBLING (robust_climb_probe_target) shares the gate: sentinel -> -1, valid -> CONFIG_0.
+	elect_valid_meters = true;
+	measurements.SNR_uplink = -99.9;
+	int ev_sib_hold = robust_climb_probe_target();
+	check(ev_sib_hold == -1,
+		"EVM SIBLING: climb-probe gate ON + sentinel -> -1 (hold robust)", ev_sib_hold, -1);
+	measurements.SNR_uplink = 15.0;
+	int ev_sib_go = robust_climb_probe_target();
+	check(ev_sib_go == CONFIG_0,
+		"EVM SIBLING: climb-probe gate ON + valid SNR -> CONFIG_0", ev_sib_go, CONFIG_0);
+
+	elect_valid_meters      = saved_evm;
+	measurements.SNR_uplink = saved_snr;
+
 	// --- GUARD 1: not a robust config (already OFDM) -> NO seed even with R live ---
 	current_configuration = CONFIG_0;
 	int g1 = robust_connect_exit_target();

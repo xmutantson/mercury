@@ -6240,6 +6240,16 @@ public:
   // restores the incumbent robust dwell so the fire-proof runs FIX vs DEFEAT on ONE
   // binary. Independent of climb_accel_defeat (R is on the CONNECT path, not the leap).
   bool duty_r_defeat;
+  // ELECTION METER-VALIDITY GATE (R2v2) -- DEFAULT-OFF A/B lever
+  // (MERCURY_ELECT_VALID_METERS, env-latched in the ctor). When ON, the shared robust->OFDM
+  // speculative cross (robust_connect_exit_target + robust_climb_probe_target) is gated on a
+  // VALID forward SNR (measurements.SNR_uplink > -90 -- the same sentinel guard
+  // connect_seed_target / the FRAME-UP OFDM elevator / supershift already use) instead of
+  // firing meter-INDEPENDENTLY. Prevents the low-SNR sentinel-election config-churn: at a
+  // low-SNR connect the forward SNR is the uninitialised -99.9 sentinel, so the meter-
+  // independent CONFIG_0 cross fires, cannot decode, BREAKs, and the recovery re-probes
+  // forever. OFF (default) -> byte-identical (the cross stays meter-independent).
+  bool elect_valid_meters;
   // DUTY lever R — PIN-RESPECT gate (default-ON; A/B defeat MERCURY_DUTY_R_PIN_DEFEAT=1,
   // env-latched in the ctor). The lever-R CONFIG_0 seed is a CLIMB bootstrap: it only
   // pays off when gearshift can climb OFF it. On a gearshift-OFF (pinned) session there
@@ -6384,6 +6394,11 @@ public:
   int robust_connect_exit_target(int effective_floor_config) const {
     if(duty_r_defeat) return CONFIG_NONE;
     if(!is_robust_config(effective_floor_config)) return CONFIG_NONE;
+    // R2v2 election meter-validity gate (default-OFF): HOLD the robust config until a valid
+    // forward SNR exists. This cross is otherwise meter-INDEPENDENT and re-fires the CONFIG_0
+    // probe from the -99.9 sentinel at low SNR -> config-churn -> 0 delivery. The >-90
+    // predicate is the SAME one connect_seed_target/the FRAME-UP elevator/supershift use.
+    if(elect_valid_meters && measurements.SNR_uplink <= -90.0) return CONFIG_NONE;
     if(supershift_proven_ceiling >= 0 &&
        config_ladder_index(supershift_proven_ceiling) < config_ladder_index(CONFIG_0))
       return CONFIG_NONE;
@@ -6469,6 +6484,11 @@ public:
   int robust_climb_probe_target() const {
     if(climb_accel_defeat) return -1;
     if(!is_robust_config(current_configuration)) return -1;
+    // R2v2 election meter-validity gate (default-OFF): the shared sibling of
+    // robust_connect_exit_target -- the FRAME-UP elevator's robust->OFDM cross. HOLD robust
+    // until a valid forward SNR exists (same -99.9 sentinel guard), else the CONFIG_0 probe
+    // re-fires from the sentinel at low SNR -> churn.
+    if(elect_valid_meters && measurements.SNR_uplink <= -90.0) return -1;
     if(supershift_proven_ceiling >= 0 &&
        config_ladder_index(supershift_proven_ceiling) < config_ladder_index(CONFIG_0))
       return -1;
