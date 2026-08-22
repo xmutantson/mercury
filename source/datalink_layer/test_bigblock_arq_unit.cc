@@ -1531,6 +1531,11 @@ int cl_arq_controller::test_topgear_clean_election()
 				? std::vector<bool>{true, false} : std::vector<bool>{true, true};
 			presp.observe_received_batch(bsi, got, bsi == 81, &pwire);
 		}
+		// Fresh RX session so the commander expects THIS aggregate's block serial:
+		// the prior clean dispatch advanced rx_block_serial_, and a stale-serial
+		// aggregate would be rejected as INVALID (leaving the clean state in place).
+		pcmd->l1_blockack.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		pcmd->l1_blockack.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
 		l1_block::LegacyParserAckState pst = {FREE, NONE, 0, 0};
 		pcmd->l1_blockack.dispatch_received_frame(pwire.data(), pwire.size(),
 			&pst, &pj);
