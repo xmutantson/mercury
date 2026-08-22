@@ -77,8 +77,9 @@ static inline bool sack_rx_trace_enabled_common()
 } while(0)
 
 // LINK-PHASE STEP 7 / MC-7: feed the rate optimizer the emitted DATA-keydown
-// clock instead of its frozen 1800 ms batch constant. Default OFF and cached
-// per process, matching the other link-phase experiment gates. This helper has
+// clock instead of its frozen 1800 ms batch constant. Default ON (explicit
+// MERCURY_LINKPHASE_OPTCLOCK=0 restores the stock frozen-constant path) and
+// cached per process. This helper has
 // no data-path authority; it only selects inputs used by optimizer recommendations.
 static inline bool linkphase_optclock_enabled_common()
 {
@@ -2050,6 +2051,25 @@ bool cl_arq_controller::linkphase_ackslot_on()
 	return state == 1;
 }
 
+// LINK-PHASE increment 2 (MC-2) gate — DEFAULT-OFF, cached per process. When set
+// (MERCURY_LINKPHASE_MC2 to a non-zero value) the CMD block-boundary ACK_SLOT break-floor
+// sizes its keydown-END length from the shared link-phase primitive's epoch-guarded
+// owner_keydown_end stamp instead of re-deriving the private frame-count latch through
+// possibly-changed live geometry, and lp_note_keydown_end commits the arithmetic-schedule
+// end (kd_ms_lever) so the swap is byte-identical to the latch derivation on the clean path.
+// Unset / empty / "0" / non-numeric => OFF => every MC-2 site falls to today's exact path,
+// byte-identical to stock (fail-closed).
+bool cl_arq_controller::mc2_slotfloor_on()
+{
+	static int state = -1;
+	if(state < 0)
+	{
+		const char* e = std::getenv("MERCURY_LINKPHASE_MC2");
+		state = (e && *e && atoi(e) != 0) ? 1 : 0;   // DEFAULT-OFF: explicit non-zero enables
+	}
+	return state == 1;
+}
+
 bool cl_arq_controller::retx_turn_tail_on() const
 {
 	return linkphase_ackslot_on()
@@ -2685,25 +2705,41 @@ void cl_arq_controller::calculate_receiving_timeout()
 			  if(ev && ev[0]=='1') cmd_floor_defeat = true; }
 			if(linkphase_ackslot_on() && !cmd_floor_defeat)
 			{
-				int kd_frames = (linkphase_last_kd_frames > 0)
-				              ? linkphase_last_kd_frames : data_batch_size;
-				int kd_ms     = derive_keydown_length_ms(kd_frames, linkphase_last_kd_force_full);
-				int turnaround = timeout - 2*message_transmission_time_ms;  // sack_arrival + margin (+SRTT)
-				if(turnaround < 0) turnaround = 0;
-				int slot_width = 2*message_transmission_time_ms + ptt_off_delay_ms
-				               + ptt_on_delay_ms + 500;                     // derived guard, not a constant
-				int slot_close = kd_ms + turnaround + slot_width;
-				if(slot_close > timeout)
+				if(mc2_slotfloor_on())
 				{
-					printf("[LINKPHASE-CMD-SLOT-FLOOR] receiving_timeout %d -> %d ms "
-						"(kd_frames=%d ff=%d kd_ms_lever=%d turnaround=%d slot_width=%d batch=%d)\n",
-						timeout, slot_close, kd_frames, linkphase_last_kd_force_full ? 1 : 0,
-						kd_ms, turnaround, slot_width, data_batch_size);
-					fflush(stdout);
-					timeout = slot_close;
-					linkphase_cmd_slot_floor_fired++;
+					// INCREMENT 2 (MC-2, default-OFF via MERCURY_LINKPHASE_MC2): the slot floor's
+					// keydown-END length comes from the shared link-phase primitive
+					// (owner_keydown_end, epoch-guarded) instead of the private
+					// linkphase_last_kd_frames latch. The RAISE-ONLY apply, the fired counter and
+					// the I-1 60 s cap live in mc2_apply_slot_floor()/mc2_slot_floor_kd_ms() so the
+					// in-process unit drives the SAME production arithmetic. The private latch and its
+					// other readers (the two slot-liveness arms, the MC-7 optimizer clock) are
+					// untouched; the reader consolidation is a later increment.
+					int kd_src = 0;
+					timeout = mc2_apply_slot_floor(timeout, kd_src);
 				}
-				if(timeout > 60000) timeout = 60000;   // I-1 hard cap: re-anchor, never disable
+				else
+				{
+					int kd_frames = (linkphase_last_kd_frames > 0)
+					              ? linkphase_last_kd_frames : data_batch_size;
+					int kd_ms     = derive_keydown_length_ms(kd_frames, linkphase_last_kd_force_full);
+					int turnaround = timeout - 2*message_transmission_time_ms;  // sack_arrival + margin (+SRTT)
+					if(turnaround < 0) turnaround = 0;
+					int slot_width = 2*message_transmission_time_ms + ptt_off_delay_ms
+					               + ptt_on_delay_ms + 500;                     // derived guard, not a constant
+					int slot_close = kd_ms + turnaround + slot_width;
+					if(slot_close > timeout)
+					{
+						printf("[LINKPHASE-CMD-SLOT-FLOOR] receiving_timeout %d -> %d ms "
+							"(kd_frames=%d ff=%d kd_ms_lever=%d turnaround=%d slot_width=%d batch=%d)\n",
+							timeout, slot_close, kd_frames, linkphase_last_kd_force_full ? 1 : 0,
+							kd_ms, turnaround, slot_width, data_batch_size);
+						fflush(stdout);
+						timeout = slot_close;
+						linkphase_cmd_slot_floor_fired++;
+					}
+					if(timeout > 60000) timeout = 60000;   // I-1 hard cap: re-anchor, never disable
+				}
 			}
 			set_receiving_timeout(timeout);
 		}
@@ -10763,6 +10799,10 @@ void cl_arq_controller::opt_load_rate_table()
 	rate_opt.load("effective_rate_table.synthetic.json");
 }
 
+// Forward declaration: the MC-7 optimizer-clock fire-proof witness below is gated by the
+// shared link-phase turn-trace flag, whose wrapper (arq_turn_trace_on) is defined later in
+// this translation unit.
+bool arq_turn_trace_on();
 bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 {
 	if (out_recommended_cfg) *out_recommended_cfg = current_configuration;
@@ -10789,10 +10829,29 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 			batch_frames = data_batch_size;
 			force_full = false;
 		}
+		bool used_end_stamp = false;
 		const int measured_wire_ms =
-			lp_optclock_keydown_ms(batch_frames, force_full);
+			lp_optclock_keydown_ms(batch_frames, force_full, &used_end_stamp);
 		rate_opt.set_switch_cost_ms(1800);
 		rate_opt.set_wire_ms_per_batch((double)measured_wire_ms);
+		// Fire-proof witness for the MC-7 END-stamp consumer (link-phase C7): emitted once per
+		// optimizer batch-end evaluation, gated by the shared link-phase turn-trace flag
+		// (MERCURY_TURN_TRACE) so OFF is byte-identical to stock. used_end_stamp=1 means the
+		// optimizer clock consumed the committed owner_keydown_end stamp instead of the live
+		// re-derivation; measured_wire_ms is the value fed to the optimizer and fallback_derive_ms
+		// is the derivation it replaced. Join to [LP_SHADOW_CMD] on epoch to confirm the stamp
+		// equals that keydown's committed length.
+		if(arq_turn_trace_on())
+		{
+			const int fallback_derive_ms =
+				derive_keydown_length_ms(batch_frames, force_full);
+			printf("[MC7-OPTCLOCK] used_end_stamp=%d measured_wire_ms=%d "
+				"fallback_derive_ms=%d batch_frames=%d ff=%d cfg=%d epoch=%u gen=%u\n",
+				used_end_stamp ? 1 : 0, measured_wire_ms, fallback_derive_ms,
+				batch_frames, force_full ? 1 : 0, current_configuration,
+				lp_state.epoch, lp_config_gen);
+			fflush(stdout);
+		}
 	}
 	// Always drain the cooldown counter regardless of gate outcome so the
 	// counter reflects elapsed batches, not "batches the optimizer actually
@@ -12868,7 +12927,12 @@ void cl_arq_controller::lp_note_keydown_end(int bsi, int frames_region_len, int 
 		lp_state.keydown_end_token = 0;
 		return;
 	}
-	lp_state.owner_keydown_end_ms = lp_keydown_start_ms + kd_ms_exact;
+	// INCREMENT 2 (MC-2, default-OFF via MERCURY_LINKPHASE_MC2): commit the arithmetic-
+	// schedule keydown end (kd_ms_lever) when MC-2 is armed, so the slot-floor's primitive
+	// read is byte-identical to its private-latch derivation on the clean path; otherwise
+	// commit the sample-exact end (kd_ms_exact) — the stock value also read by the MC-7
+	// optimizer clock. See mc2_slot_floor_kd_ms and data-flow-linkphase-primitive.md.
+	lp_state.owner_keydown_end_ms = lp_keydown_start_ms + (mc2_slotfloor_on() ? kd_ms_lever : kd_ms_exact);
 	lp_state.owner                = LP_TURNAROUND;
 	lp_state.keydown_end_token    = lp_keydown_start_token;
 	int turnaround_budget = receiving_timeout - 2 * message_transmission_time_ms;
@@ -12948,6 +13012,165 @@ void cl_arq_controller::lp_note_config_switch()
 	lp_state.owner_keydown_end_ms = 0;
 	lp_state.keydown_end_token = 0;
 	lp_state.next_listen_open_ms = 0;
+}
+
+int cl_arq_controller::mc2_slot_floor_kd_ms(int& kd_src_out) const
+{
+	bool lp_primitive_current =
+		   (lp_state.owner != LP_NONE)
+#ifndef LINKPHASE_MC2_NOGUARD
+		&& ((lp_state.epoch >> 8) == lp_config_gen)   // config-generation freshness (the epoch guard)
+#endif
+		&& (lp_state.owner_keydown_end_ms > lp_keydown_start_ms);
+	// -DLINKPHASE_MC2_NOGUARD drops the config-generation freshness check: a stale-config
+	// primitive value is then consumed and the slot floor mis-sizes from the old keydown-end —
+	// the FAIL-BEFORE arm that proves the epoch guard (ARM 2 of test_linkphase_mc2_slotfloor) has
+	// teeth. Default (guard present) => the stale value is rejected.
+	if(lp_primitive_current)
+	{
+		kd_src_out = 1;
+		return (int)(lp_state.owner_keydown_end_ms - lp_keydown_start_ms);
+	}
+	kd_src_out = 0;
+	int kd_frames = (linkphase_last_kd_frames > 0)
+	              ? linkphase_last_kd_frames : data_batch_size;
+	return derive_keydown_length_ms(kd_frames, linkphase_last_kd_force_full);
+}
+
+// INCREMENT 2 (MC-2): apply the derived block-boundary ACK_SLOT break-floor to the receive
+// timeout, RAISE-ONLY (re-capped at 60 s, invariant I-1). The keydown-END length comes from
+// mc2_slot_floor_kd_ms() (the primitive swap); the turnaround budget, slot_width guard, the
+// slot_close sum, the if(slot_close > timeout) raise, the fired counter, and the I-1 cap are
+// UNCHANGED from the prior inline site — extracted verbatim so this exact arithmetic runs on
+// both the production path and the in-process unit (no simulate-vs-real divergence). Returns the
+// (possibly raised) timeout; kd_src_out reports the keydown-end source for the diagnostic line.
+int cl_arq_controller::mc2_apply_slot_floor(int timeout, int& kd_src_out)
+{
+	int kd_ms = mc2_slot_floor_kd_ms(kd_src_out);
+	int kd_frames = (linkphase_last_kd_frames > 0)
+	              ? linkphase_last_kd_frames : data_batch_size;   // diagnostic only
+	int turnaround = timeout - 2*message_transmission_time_ms;    // sack_arrival + margin (+SRTT)
+	if(turnaround < 0) turnaround = 0;
+	int slot_width = 2*message_transmission_time_ms + ptt_off_delay_ms
+	               + ptt_on_delay_ms + 500;                       // derived guard, not a constant
+	int slot_close = kd_ms + turnaround + slot_width;
+	if(slot_close > timeout)
+	{
+		printf("[LINKPHASE-CMD-SLOT-FLOOR] receiving_timeout %d -> %d ms "
+			"(kd_src=%d kd_frames=%d ff=%d kd_ms=%d turnaround=%d slot_width=%d batch=%d "
+			"epoch=%u gen=%u)\n",
+			timeout, slot_close, kd_src_out, kd_frames, linkphase_last_kd_force_full ? 1 : 0,
+			kd_ms, turnaround, slot_width, data_batch_size, lp_state.epoch, lp_config_gen);
+		fflush(stdout);
+		timeout = slot_close;
+		linkphase_cmd_slot_floor_fired++;
+	}
+	if(timeout > 60000) timeout = 60000;   // I-1 hard cap: re-anchor, never disable
+	return timeout;
+}
+
+// INCREMENT 2 (MC-2) directed in-process unit. Synthetic-fires the PRODUCTION producers and
+// drives the PRODUCTION selection/arithmetic (mc2_slot_floor_kd_ms / mc2_apply_slot_floor) on a
+// throwaway controller with the deterministic legacy geometry (telecom_system NULL =>
+// derive_keydown_length_ms(n) == n*message_transmission_time_ms). Asserts, in order:
+//  ARM 0 pre-init      — owner==NONE => the guard falls back to the latch derivation (src=0);
+//  ARM 1 clean path    — a valid same-config primitive is used (src=1) and, at a geometry where
+//                        kd_ms_exact == kd_ms_lever, its value is BYTE-IDENTICAL to the latch path;
+//  ARM 2 stale-epoch   — after a config switch bumps the generation, the STALE primitive value is
+//    (fail-before)       REJECTED and the floor sizes from the new-geometry fallback (never the
+//                        stale keydown-end); WITHOUT the epoch guard the stale value would be used;
+//  ARM 3 RAISE-ONLY    — mc2_apply_slot_floor never returns a timeout below its input.
+// No IONOS/RF. Fast + deterministic.
+int cl_arq_controller::test_linkphase_mc2_slotfloor()
+{
+	int fails = 0;
+	telecom_system = NULL;                 // deterministic legacy derive: derive(n)==n*mtt
+	message_transmission_time_ms = 500;    // per-frame airtime
+	data_batch_size = 10;                  // latch-absent fallback frame count
+	ptt_off_delay_ms = 0; ptt_on_delay_ms = 0;
+	lp_config_gen = 0;
+	linkphase_cmd_slot_floor_fired = 0;
+
+	// ARM 0 — pre-init: owner==NONE => the guard must fall back to the private latch derivation.
+	lp_reset();
+	linkphase_last_kd_frames = 8; linkphase_last_kd_force_full = false;
+	int src = -1;
+	int kd  = mc2_slot_floor_kd_ms(src);
+	int expect_fallback = derive_keydown_length_ms(8, false);     // 8*500 = 4000
+	if(src != 0 || kd != expect_fallback)
+	{ printf("[TEST-LP-MC2] FAIL: pre-init not latch fallback (src=%d kd=%d exp=%d)\n",
+		src, kd, expect_fallback); fails++; }
+	else printf("[TEST-LP-MC2] PASS: pre-init owner==LP_NONE -> latch fallback kd=%d (src=0)\n", kd);
+
+	// ARM 1 — clean path byte-identity. Fire the CMD keydown producers at a geometry where the
+	// sample-exact keydown length equals the arithmetic latch derivation exactly:
+	//   frames_region_len = 240000 samples => kd_ms_exact = 240000/48 = 5000 = 10 frames * 500 ms.
+	lp_reset();
+	linkphase_last_kd_frames = 10; linkphase_last_kd_force_full = false;
+	lp_note_keydown_start(/*bsi=*/5);
+	lp_note_keydown_end(/*bsi=*/5, /*frames_region_len=*/240000, /*frames=*/10, /*force_full=*/false);
+	src = -1;
+	kd  = mc2_slot_floor_kd_ms(src);
+	int latch_kd = derive_keydown_length_ms(10, false);           // 5000
+	if(src != 1)
+	{ printf("[TEST-LP-MC2] FAIL: clean path did not use the primitive (src=%d)\n", src); fails++; }
+	else if(kd != latch_kd)
+	{ printf("[TEST-LP-MC2] FAIL: clean-path primitive kd=%d != latch kd=%d (not byte-identical)\n",
+		kd, latch_kd); fails++; }
+	else printf("[TEST-LP-MC2] PASS: clean-path primitive kd=%d == latch kd=%d (src=1, byte-identical)\n",
+		kd, latch_kd);
+
+	// ARM 2 — stale-epoch config switch (FAIL-BEFORE / PASS-AFTER). The primitive still holds the
+	// OLD-config keydown-end (5000 ms). A config switch bumps the generation and changes geometry;
+	// the latch is re-derived at the NEW geometry. The stale primitive MUST be rejected by the
+	// epoch guard, so the floor sizes from the new-geometry fallback (1800), never the stale 5000.
+	// WITHOUT the (epoch>>8)==lp_config_gen guard the helper would return the stale 5000 = the bug.
+	// Tip reconciliation: lp_note_config_switch() now RESETS owner_keydown_end_ms to 0, which
+	// would let ARM 2 pass on the positive-length guard alone and neuter the epoch-guard
+	// fail-before. Bump the config generation DIRECTLY so the primitive keeps a positive,
+	// stale-generation keydown-end and the (epoch>>8)==lp_config_gen guard is the load-
+	// bearing check (-DLINKPHASE_MC2_NOGUARD then consumes the stale value = the fail-before).
+	lp_config_gen++;                       // 0 -> 1: primitive.epoch generation now stale
+	message_transmission_time_ms = 300;    // NEW geometry
+	linkphase_last_kd_frames = 6;          // NEW keydown latch (fresh at the new config)
+	int stale_primitive_kd = (int)(lp_state.owner_keydown_end_ms - lp_keydown_start_ms);  // 5000
+	int new_geom_fallback  = derive_keydown_length_ms(6, false);  // 6*300 = 1800
+	src = -1;
+	kd  = mc2_slot_floor_kd_ms(src);
+	if(src != 0 || kd != new_geom_fallback)
+	{ printf("[TEST-LP-MC2] FAIL: stale config switch used stale primitive "
+		"(src=%d kd=%d stale=%d new_geom=%d)\n", src, kd, stale_primitive_kd, new_geom_fallback);
+		fails++; }
+	else printf("[TEST-LP-MC2] PASS: stale config switch rejected stale primitive %d, used "
+		"new-geometry fallback %d (src=0)\n", stale_primitive_kd, new_geom_fallback);
+
+	// ARM 3 — RAISE-ONLY. Re-populate a valid same-config primitive, then drive the production
+	// slot-floor apply with (a) a tiny input timeout (slot_close > timeout -> raised) and (b) a
+	// large input below the I-1 cap (already >= slot_close -> unchanged). The result must never be
+	// below the input.
+	lp_reset();
+	message_transmission_time_ms = 500;
+	ptt_off_delay_ms = 0; ptt_on_delay_ms = 0;
+	linkphase_last_kd_frames = 10; linkphase_last_kd_force_full = false;
+	lp_note_keydown_start(/*bsi=*/7);
+	lp_note_keydown_end(/*bsi=*/7, /*frames_region_len=*/240000, /*frames=*/10, /*force_full=*/false);
+	int s2 = 0;
+	int t_small = 100;
+	int raised = mc2_apply_slot_floor(t_small, s2);
+	if(raised < t_small)
+	{ printf("[TEST-LP-MC2] FAIL: RAISE-ONLY violated (in=%d out=%d)\n", t_small, raised); fails++; }
+	else printf("[TEST-LP-MC2] PASS: RAISE-ONLY small in=%d -> out=%d (>=, src=%d)\n",
+		t_small, raised, s2);
+	int t_big = 59000;
+	int held = mc2_apply_slot_floor(t_big, s2);
+	if(held < t_big)
+	{ printf("[TEST-LP-MC2] FAIL: RAISE-ONLY violated (in=%d out=%d)\n", t_big, held); fails++; }
+	else printf("[TEST-LP-MC2] PASS: RAISE-ONLY large in=%d -> out=%d (>=)\n", t_big, held);
+
+	if(fails == 0) printf("[TEST-LP-MC2] ALL PASS\n");
+	else           printf("[TEST-LP-MC2] %d FAIL(s)\n", fails);
+	fflush(stdout);
+	return fails;
 }
 
 // MC-7 optimizer clock selector. A completed local keydown owns its duration at END;

@@ -1002,6 +1002,7 @@ public:
   // CMD now waits for), and (iii) the D5-on-retx per-bsi span stamp. OFF => byte-identical to
   // stock (invariant I-3, fail-open to today's behavior). Cached (env const per process).
   static bool linkphase_ackslot_on();
+  static bool mc2_slotfloor_on();   // increment 2 (MC-2) gate: DEFAULT-OFF (MERCURY_LINKPHASE_MC2); fail-closed to stock
   // True only in scalable mode when both peers negotiated the D5
   // retransmit-turn-tail marker. Legacy mode and older peers keep the
   // conservative previous-ACK defer.
@@ -3253,6 +3254,10 @@ public:
   // short-batch clamp and a fail-before shortening), and the epoch bump on config-switch/BREAK.
   // Returns 0=PASS. In-process, no IONOS/RF. See data-flow-linkphase-primitive.md.
   int test_linkphase_shadow();
+  // INCREMENT 2 (MC-2) directed unit: pre-init latch fallback, clean-path byte-identity,
+  // stale-generation config-switch fallback (fail-before via -DLINKPHASE_MC2_NOGUARD /
+  // pass-after), and the RAISE-ONLY invariant. Returns 0=PASS. In-process, no IONOS/RF.
+  int test_linkphase_mc2_slotfloor();
   int test_linkphase_optclock_end_stamp();
 
   // IN-BAND CAPTURE-RING ROBUST-FLOOR OVER-SEAT TEST (CLI --test-inband-ring-floor).
@@ -7132,6 +7137,11 @@ private:
   void lp_note_ack_decoded();                             // CMD decodes reverse ACK: owner=TURNAROUND
   void lp_note_break(int bsi);                            // BREAK re-stage: owner=CMD_KEYED, epoch re-stamp
   void lp_note_config_switch();                           // config switch: ++lp_config_gen (epoch generation)
+  // Consumer C1 (MC-2, increment 2): the CMD block-boundary ACK_SLOT break-floor keydown-END
+  // source. Selects the epoch-guarded primitive owner_keydown_end, else the private latch;
+  // applies it RAISE-ONLY. The private latch and its other readers stay in place.
+  int  mc2_slot_floor_kd_ms(int& kd_src_out) const;
+  int  mc2_apply_slot_floor(int timeout, int& kd_src_out);
   int  lp_optclock_keydown_ms(int fallback_frames, bool fallback_force_full,
                               bool* used_end_stamp = NULL) const;
   // === end LINK-PHASE PRIMITIVE ===================================================
