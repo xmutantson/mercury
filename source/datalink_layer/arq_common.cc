@@ -1488,6 +1488,8 @@ cl_arq_controller::cl_arq_controller()
 	linkphase_d5_retx_stamped=0;
 	linkphase_cmd_slot_floor_fired=0;
 	linkphase_retx_slot_fired=0;        // LINK-PHASE STEP 4 (MC-6) fire-proof counter
+	linkphase_false_break_averted=0;    // LINK-PHASE STEP 3 (increment 3) prevention counters
+	linkphase_ofdm_beyond_rescue_fired=0;
 	linkphase_pending_prev_confirm=false;  // SEAM-2: no deferred prev-confirm armed at init
 	linkphase_pending_prev_bsi=-1;
 	linkphase_pending_prev_window=-1;
@@ -2065,6 +2067,26 @@ bool cl_arq_controller::mc2_slotfloor_on()
 	if(state < 0)
 	{
 		const char* e = std::getenv("MERCURY_LINKPHASE_MC2");
+		state = (e && *e && atoi(e) != 0) ? 1 : 0;   // DEFAULT-OFF: explicit non-zero enables
+	}
+	return state == 1;
+}
+
+// LINK-PHASE STEP 3 (increment 3) gate — DEFAULT-OFF, cached per process. When set
+// (MERCURY_LINKPHASE_ACKWIN to a non-zero value) the CMD reverse-ACK detection window is
+// positioned from the sample-anchored link-phase primitive: (a) the DATA-ACK accept adds an
+// older-phase rescan for a reverse-ACK that scrolled out of the newest tail, and (b) the OFDM
+// beyond-bounds ladder fast-forwards a reverse-SACK preamble just past the acquisition-ring
+// bound instead of tearing down the grid. Both paths are reached ONLY after the incumbent
+// newest-tail logic fails, so the feature WIDENS acceptance and never narrows it. Unset / empty /
+// "0" / non-numeric => OFF => every step-3 site falls to today's path, byte-identical to stock
+// (fail-closed).
+bool cl_arq_controller::linkphase_ackwin_on()
+{
+	static int state = -1;
+	if(state < 0)
+	{
+		const char* e = std::getenv("MERCURY_LINKPHASE_ACKWIN");
 		state = (e && *e && atoi(e) != 0) ? 1 : 0;   // DEFAULT-OFF: explicit non-zero enables
 	}
 	return state == 1;
@@ -13173,6 +13195,118 @@ int cl_arq_controller::test_linkphase_mc2_slotfloor()
 	return fails;
 }
 
+// INCREMENT 3 (step-3) directed unit — the sample-anchored reverse-ACK detection window's
+// PRODUCTION DECISION LOGIC (the gate predicate lp_ack_window_active + the sub-class-b branch
+// predicate lp_ackwin_beyond_rescue_eligible — the SAME functions the live paths call) plus the
+// byte-identical-OFF / WIDEN-only invariant of cmd_data_ack_anchored_rescan_accept. Deterministic,
+// telecom_system==NULL (the gate closes before any DSP so the NULL is never dereferenced). The
+// full sub-class-a older-phase DSP CREDIT (waveform -> detect -> CRC -> meter 0->N) is proven on
+// the WIRE by the live 14.8 storm smoke (the required fire-proof), NOT simulated here.
+//  ARM 0 pre-init          — owner==NONE => gate CLOSED; both new paths inert.
+//  ARM 1 gate open/close    — a valid completed keydown (owner==TURNAROUND, matched tokens, fresh
+//    (fail-before/after)      epoch) OPENS the window; a config-switch generation bump (stale
+//                             epoch) or a BREAK (owner!=TURNAROUND) CLOSES it. cmd_data_ack_
+//                             anchored_rescan_accept returns false OFF (byte-identical, NULL-safe).
+//  ARM 2 sub-b rescue       — the beyond-ring predicate is eligible for a small-overshoot,
+//    (fail-before/after)      present-band-metric preamble during the open window, and NOT eligible
+//                             for gap>24 / metric<0.11 / metric>=0.5 / wrong role / closed window.
+//  ARM 3 backstop invariant — with the window closed the rescan returns false (the incumbent
+//                             miss/break path is reached byte-identical).
+int cl_arq_controller::test_linkphase_ackwin()
+{
+	int fails = 0;
+	telecom_system = NULL;                 // gate closes before any telecom_system deref
+	message_transmission_time_ms = 500;
+	data_batch_size = 10;
+	ptt_off_delay_ms = 0; ptt_on_delay_ms = 0;
+	receiving_timeout = 3000;
+	lp_config_gen = 0;
+	role = COMMANDER;
+	connection_status = RECEIVING_ACKS_DATA;
+	linkphase_false_break_averted = 0;
+	linkphase_ofdm_beyond_rescue_fired = 0;
+
+	// ARM 0 — pre-init: owner==LP_NONE => window CLOSED.
+	lp_reset();
+	if(lp_ack_window_active(NULL))
+	{ printf("[TEST-LP-ACKWIN] FAIL: pre-init owner==LP_NONE reported window OPEN\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: pre-init owner==LP_NONE -> window CLOSED\n");
+	if(cmd_data_ack_anchored_rescan_accept())
+	{ printf("[TEST-LP-ACKWIN] FAIL: rescan credited with the window CLOSED (pre-init)\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: rescan returns false with window CLOSED (byte-identical OFF)\n");
+	if(lp_ackwin_beyond_rescue_eligible(/*pream*/130, /*upper*/127, /*metric*/0.12))
+	{ printf("[TEST-LP-ACKWIN] FAIL: sub-b eligible pre-init (window CLOSED)\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: sub-b NOT eligible pre-init (window CLOSED)\n");
+
+	// ARM 1 — a completed CMD keydown OPENS the window under the strong token guard. PASS-AFTER:
+	// owner==TURNAROUND + matched tokens + fresh epoch + next_listen_open_ms>0 => OPEN.
+	lp_reset();
+	linkphase_last_kd_frames = 10; linkphase_last_kd_force_full = false;
+	lp_note_keydown_start(/*bsi=*/5);
+	lp_note_keydown_end(/*bsi=*/5, /*frames_region_len=*/240000, /*frames=*/10, /*force_full=*/false);
+	if(!lp_ack_window_active(NULL))
+	{ printf("[TEST-LP-ACKWIN] FAIL: completed keydown did not OPEN the window\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: completed keydown (owner==TURNAROUND, tokens matched) -> window OPEN\n");
+	// FAIL-BEFORE (a): stale epoch after a config-switch generation bump => CLOSED (the strong
+	// guard rejects the stale stamp — mirrors the MC-2 ARM-2 stale-epoch fail-before).
+	lp_config_gen++;   // primitive.epoch generation now stale vs lp_config_gen
+	if(lp_ack_window_active(NULL))
+	{ printf("[TEST-LP-ACKWIN] FAIL: stale-epoch primitive kept the window OPEN\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: stale-epoch (config-gen bump) -> window CLOSED\n");
+	// FAIL-BEFORE (b): a BREAK moves owner to CMD_KEYED => CLOSED.
+	lp_reset();
+	lp_note_keydown_start(/*bsi=*/6);
+	lp_note_keydown_end(/*bsi=*/6, /*frames_region_len=*/240000, /*frames=*/10, /*force_full=*/false);
+	lp_note_break(/*bsi=*/7);
+	if(lp_ack_window_active(NULL))
+	{ printf("[TEST-LP-ACKWIN] FAIL: post-BREAK owner!=TURNAROUND kept the window OPEN\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: post-BREAK owner==CMD_KEYED -> window CLOSED\n");
+
+	// ARM 2 — sub-class-b beyond-ring rescue predicate. Re-open the window, then walk the band.
+	lp_reset();
+	linkphase_last_kd_frames = 10; linkphase_last_kd_force_full = false;
+	lp_note_keydown_start(/*bsi=*/8);
+	lp_note_keydown_end(/*bsi=*/8, /*frames_region_len=*/240000, /*frames=*/10, /*force_full=*/false);
+	// PASS-AFTER: the §158 signature — pream just past upper, present-band metric ~0.12.
+	if(!lp_ackwin_beyond_rescue_eligible(/*pream*/130, /*upper*/127, /*metric*/0.12))
+	{ printf("[TEST-LP-ACKWIN] FAIL: §158 reverse-SACK (pream=130 upper=127 metric=0.12) NOT rescued\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: reverse-SACK pream=130 upper=127 metric=0.12 -> rescue eligible\n");
+	if(!lp_ackwin_beyond_rescue_eligible(/*pream*/141, /*upper*/127, /*metric*/0.131))
+	{ printf("[TEST-LP-ACKWIN] FAIL: reverse-SACK pream=141 upper=127 metric=0.131 NOT rescued\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: reverse-SACK pream=141 upper=127 metric=0.131 -> rescue eligible\n");
+	// FAIL-BEFORE band edges: gap too large, metric below the alias floor, metric at/above 0.5,
+	// and pream within bounds (not beyond) all reject.
+	bool edge_ok =
+		   !lp_ackwin_beyond_rescue_eligible(/*pream*/200, /*upper*/127, /*metric*/0.12)   // gap 73 > 24
+		&& !lp_ackwin_beyond_rescue_eligible(/*pream*/130, /*upper*/127, /*metric*/0.09)   // metric < 0.11
+		&& !lp_ackwin_beyond_rescue_eligible(/*pream*/130, /*upper*/127, /*metric*/0.60)   // metric >= 0.5 (stock)
+		&& !lp_ackwin_beyond_rescue_eligible(/*pream*/125, /*upper*/127, /*metric*/0.12);  // not beyond
+	if(!edge_ok)
+	{ printf("[TEST-LP-ACKWIN] FAIL: a band-edge case was wrongly rescued\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: gap>24 / metric<0.11 / metric>=0.5 / in-bounds all rejected\n");
+	// wrong role rejects even in-band.
+	role = RESPONDER;
+	if(lp_ackwin_beyond_rescue_eligible(/*pream*/130, /*upper*/127, /*metric*/0.12))
+	{ printf("[TEST-LP-ACKWIN] FAIL: RESPONDER role was rescued\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: RESPONDER role NOT eligible (COMMANDER-only)\n");
+	role = COMMANDER;
+
+	// ARM 3 — backstop invariant: with the window CLOSED (config switch), the rescan credits
+	// nothing (returns false) so the incumbent miss/break path is reached byte-identical.
+	lp_note_config_switch();
+	if(lp_ack_window_active(NULL))
+	{ printf("[TEST-LP-ACKWIN] FAIL: config-switch left the window OPEN\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: config-switch closes the window (backstop: incumbent break path intact)\n");
+	if(cmd_data_ack_anchored_rescan_accept() || linkphase_false_break_averted != 0)
+	{ printf("[TEST-LP-ACKWIN] FAIL: rescan credited / counter moved with the window CLOSED\n"); fails++; }
+	else printf("[TEST-LP-ACKWIN] PASS: window CLOSED -> no credit, averted counter stays 0 (WIDEN-only)\n");
+
+	if(fails == 0) printf("[TEST-LP-ACKWIN] ALL PASS\n");
+	else           printf("[TEST-LP-ACKWIN] %d FAIL(s)\n", fails);
+	fflush(stdout);
+	return fails;
+}
+
 // MC-7 optimizer clock selector. A completed local keydown owns its duration at END;
 // re-deriving that historical transmission after a geometry change overstates or
 // understates the wire clock. The epoch-generation guard rejects a stamp from an old
@@ -13195,6 +13329,52 @@ int cl_arq_controller::lp_optclock_keydown_ms(int fallback_frames,
 		return (int)(lp_state.owner_keydown_end_ms - lp_keydown_start_ms);
 	}
 	return derive_keydown_length_ms(fallback_frames, fallback_force_full);
+}
+
+// LINK-PHASE STEP 3 (increment 3) consumer C2: is the CMD reverse-ACK detection window OPEN?
+// TRUE only while a completed local keydown is in TURNAROUND under the SAME strong token-guarded
+// predicate the optimizer clock (lp_optclock_keydown_ms) uses — NOT the weaker MC-2 epoch-only
+// guard (this applies the §161 Q4 recommendation from the start). Because the gate is this
+// strong, the sample-anchored older-phase rescan / beyond-bounds rescue can only fire when a
+// reverse ACK is genuinely expected on THIS session/config/keydown, so an older-phase or
+// beyond-bound preamble cannot be mis-credited from stale/foreign audio. Optionally returns
+// next_listen_open_ms so the caller can bound the look-back to the sample-derived turnaround
+// window. Read-only; mutates no primitive field.
+bool cl_arq_controller::lp_ack_window_active(long long* next_listen_open_ms_out) const
+{
+	const bool window_open =
+		lp_state.owner == LP_TURNAROUND
+		&& (lp_state.epoch >> 8) == lp_config_gen
+		&& lp_keydown_start_token != 0
+		&& lp_state.keydown_end_token == lp_keydown_start_token
+		&& lp_state.keydown_end_token == lp_keydown_generation
+		&& lp_state.owner_keydown_end_ms >= lp_keydown_start_ms
+		&& lp_state.next_listen_open_ms > 0;
+	if(window_open && next_listen_open_ms_out)
+		*next_listen_open_ms_out = lp_state.next_listen_open_ms;
+	return window_open;
+}
+
+// LINK-PHASE STEP 3 (increment 3, sub-class b) eligibility predicate. Knob-independent (the
+// receive() caller gates on linkphase_ackwin_on()) so the directed unit can drive it
+// deterministically. A reverse-SACK OFDM preamble that lands just past the acquisition-ring
+// upper bound at a present-but-low metric is the real reverse SACK during the CMD turnaround
+// (the CMD is not receiving forward data here), NOT a data-region false peak — fast-forward it
+// into bounds rather than tear the grid down. Bounded overshoot keeps the fast-forward small;
+// the metric band [0.11, 0.5) sits ABOVE the 0.08-0.11 data-region-alias floor and BELOW the 0.5
+// stock fast-forward gate (>=0.5 is already handled by the stock path).
+bool cl_arq_controller::lp_ackwin_beyond_rescue_eligible(int pream_symb, int upper,
+	double coarse_metric) const
+{
+	const int    LP_ACKWIN_BEYOND_MAX_SYMB   = 24;
+	const double LP_ACKWIN_BEYOND_METRIC_MIN = 0.11;
+	const int overshoot = pream_symb - upper;
+	return role == COMMANDER
+		&& lp_ack_window_active(NULL)
+		&& overshoot > 0
+		&& overshoot <= LP_ACKWIN_BEYOND_MAX_SYMB
+		&& coarse_metric >= LP_ACKWIN_BEYOND_METRIC_MIN
+		&& coarse_metric < 0.5;
 }
 
 // Synthetic geometry-switch regression for MC-7. The END stamp records 5000 ms,
@@ -19713,13 +19893,49 @@ void cl_arq_controller::receive()
 					}
 					else if(pream_symb > upper)
 					{
-						if(telecom_system->receive_stats.coarse_metric >= 0.5)
+						// LINK-PHASE STEP 3 (increment 3, sub-class b) — reverse-SACK acquisition
+						// rescue. During the CMD turnaround (owner==TURNAROUND, strong-guarded), a
+						// reverse-SACK preamble landing just past the acquisition-ring upper bound
+						// at a present-but-low metric (~0.12, §158) is the real reverse SACK, not a
+						// data-region false peak — the CMD is not receiving forward data here, only
+						// the reverse ACK. The stock low-metric branch tears the grid down and the
+						// reverse ACK is never polled -> false BREAK. Fast-forward it into bounds
+						// (the SAME shift the metric>=0.5 path uses) so the SACK can decode; no
+						// accept/CRC gate is loosened. Bounded overshoot (<=24 symb, well under a
+						// frame) + a metric band ABOVE the 0.08-0.11 data-region-alias floor +
+						// role==COMMANDER + the strong primitive gate keep it byte-identical OFF and
+						// safe. WIDENS acquisition, never narrows: if the SACK still fails to decode,
+						// the incumbent RTO/break deadline (receiving_timeout, untouched) fires
+						// exactly as before.
+#ifndef LINKPHASE_ACKWIN_NOSCAN
+						const bool lp_ackwin_beyond_rescue =
+							linkphase_ackwin_on()
+							&& lp_ackwin_beyond_rescue_eligible(
+								pream_symb, upper,
+								telecom_system->receive_stats.coarse_metric);
+#else
+						const bool lp_ackwin_beyond_rescue = false;  // FAIL-BEFORE: feature compiled out
+#endif
+						if(telecom_system->receive_stats.coarse_metric >= 0.5
+						   || lp_ackwin_beyond_rescue)
 						{
-							// Beyond-bounds with meaningful metric: fast-forward
-							// to bring the preamble within bounds in one shift.
-							// +20 margin ensures the preamble lands well within
-							// bounds even with timing jitter.
+							// Beyond-bounds with meaningful metric (or the step-3 reverse-SACK
+							// rescue): fast-forward to bring the preamble within bounds in one
+							// shift. +20 margin ensures the preamble lands well within bounds
+							// even with timing jitter.
 							ftr = pream_symb - upper + 20;
+#ifndef LINKPHASE_ACKWIN_NOSCAN
+							if(lp_ackwin_beyond_rescue
+							   && telecom_system->receive_stats.coarse_metric < 0.5)
+							{
+								linkphase_ofdm_beyond_rescue_fired++;
+								printf("[LINKPHASE-ACKWIN] beyond-bounds rescue subclass=b "
+									"pream=%d upper=%d metric=%.3f ff=%d\n",
+									pream_symb, upper,
+									telecom_system->receive_stats.coarse_metric, ftr);
+								fflush(stdout);
+							}
+#endif
 						}
 						else
 						{

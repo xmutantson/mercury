@@ -1003,6 +1003,7 @@ public:
   // stock (invariant I-3, fail-open to today's behavior). Cached (env const per process).
   static bool linkphase_ackslot_on();
   static bool mc2_slotfloor_on();   // increment 2 (MC-2) gate: DEFAULT-OFF (MERCURY_LINKPHASE_MC2); fail-closed to stock
+  static bool linkphase_ackwin_on();  // increment 3 (step-3) gate: DEFAULT-OFF (MERCURY_LINKPHASE_ACKWIN); fail-closed to stock
   // True only in scalable mode when both peers negotiated the D5
   // retransmit-turn-tail marker. Legacy mode and older peers keep the
   // conservative previous-ACK defer.
@@ -1301,6 +1302,16 @@ public:
   // (ack_sack_suffix_len()==0), no decode, CRC mismatch, out-of-window bsi, or a
   // non-clean (partial) bitmap. Used by the bare-pattern data-ACK arm only.
   bool cmd_clean_data_ack_crc_valid();
+
+  // LINK-PHASE STEP 3 (increment 3) — the sample-anchored older-phase reverse-ACK rescan.
+  // PURELY ADDITIVE OR-term at the DATA-ACK accept site: returns false (byte-identical) unless
+  // linkphase_ackwin_on() && lp_ack_window_active() && connection_status==RECEIVING_ACKS_DATA.
+  // When armed AND reached (i.e. the incumbent newest-tail accept already failed) it steps back
+  // through older ring phases bounded by the primitive-derived look-back, running BOTH the bare
+  // pattern gate AND the clean-batch CRC decode on the SAME snapshot per phase. First phase that
+  // clears both credits the reverse-ACK (linkphase_false_break_averted++) and returns true. The
+  // caller then enters the SAME clean-batch ACK funnel. WIDENS acceptance, never narrows.
+  bool cmd_data_ack_anchored_rescan_accept();
 
   // Option B (data-flow-compact-confirm.md §5): peek the passband tail for a
   // CRC12-valid, in-window COMPACT confirm (K=5 GF(16)-RA, N=10, carrying
@@ -3259,6 +3270,11 @@ public:
   // pass-after), and the RAISE-ONLY invariant. Returns 0=PASS. In-process, no IONOS/RF.
   int test_linkphase_mc2_slotfloor();
   int test_linkphase_optclock_end_stamp();
+  // INCREMENT 3 (step-3) directed unit: pre-init gate-inert (ARM 0), the sub-class-a older-phase
+  // rescan credit (ARM 1), the sub-class-b OFDM beyond-bounds fast-forward rescue (ARM 2), and the
+  // WIDEN-only break-backstop invariant (ARM 3). Fail-before via -DLINKPHASE_ACKWIN_NOSCAN /
+  // pass-after. Returns 0=PASS. In-process, no IONOS/RF. See data-flow-linkphase-primitive.md.
+  int test_linkphase_ackwin();
 
   // IN-BAND CAPTURE-RING ROBUST-FLOOR OVER-SEAT TEST (CLI --test-inband-ring-floor).
   // Drives inband_seat_robust_ring_floor() at CONFIG_8 (a climbed OFDM rung holding its natural
@@ -7084,6 +7100,15 @@ private:
                                        //      ack_slot floor. 0 => never fired.
   long linkphase_retx_slot_fired;      // RSP: post-SACK retx-turn listen windows derived from the
                                        //      authored-SACK popcount (Step 4 MC-6). 0 => never fired.
+  // LINK-PHASE STEP 3 (increment 3) — sample-anchored reverse-ACK detection-window PREVENTION
+  // counters (see linkphase_ackwin_on()). CMD-only, NOT wire/protocol state; incremented ONLY
+  // under the STEP-3 flag on the production DATA-ACK accept / OFDM beyond-bounds paths.
+  long linkphase_false_break_averted;       // CMD: reverse-ACKs credited at an anchored older ring
+                                            //      phase the incumbent newest-tail poll missed
+                                            //      (sub-class a). 0 => never fired.
+  long linkphase_ofdm_beyond_rescue_fired;  // CMD: reverse-SACK OFDM preambles just beyond the
+                                            //      acquisition-ring bound fast-forwarded into bounds
+                                            //      instead of grid-torn (sub-class b). 0 => never fired.
   // SEAM-2 — generic deferred prev-confirm + boundary flush. When an UNMARKED (no
   // negotiated D5 turn-tail) previous-batch completion under the ACK-slot feature
   // defers its clean confirm, the base emits NOTHING and drops it, so the CMD closes
@@ -7144,6 +7169,20 @@ private:
   int  mc2_apply_slot_floor(int timeout, int& kd_src_out);
   int  lp_optclock_keydown_ms(int fallback_frames, bool fallback_force_full,
                               bool* used_end_stamp = NULL) const;
+  // Consumer C2 (step-3, increment 3): the CMD reverse-ACK detection window is OPEN. TRUE only
+  // while the CMD holds a completed local keydown (owner==TURNAROUND) under the STRONG token-
+  // guarded predicate the optimizer clock uses (NOT the weaker MC-2 epoch-only guard), so the
+  // sample-anchored older-phase rescan / beyond-bounds rescue can only fire when a reverse ACK
+  // is genuinely expected. Optionally returns next_listen_open_ms for the sample-derived
+  // look-back bound. Read-only; writes no primitive field.
+  bool lp_ack_window_active(long long* next_listen_open_ms_out = NULL) const;
+  // Sub-class b predicate (step-3): is a beyond-acquisition-ring OFDM preamble the reverse SACK
+  // we are waiting for (eligible for the fast-forward rescue)? TRUE iff role==COMMANDER, the
+  // reverse-ACK window is open (lp_ack_window_active), the overshoot is bounded (0<pream-upper<=24
+  // symbols, well under a frame), and the metric sits in the present-preamble band ABOVE the
+  // 0.08-0.11 data-region-alias floor and BELOW the 0.5 stock fast-forward gate. Knob-independent
+  // (the caller gates on linkphase_ackwin_on()); the same predicate the receive() ladder calls.
+  bool lp_ackwin_beyond_rescue_eligible(int pream_symb, int upper, double coarse_metric) const;
   // === end LINK-PHASE PRIMITIVE ===================================================
   // LINK-PHASE STEP 5 / MC-3. CMD-only, never on wire. A wait is armed only for
   // a valid Step-2 derived ACK_SLOT. The close latch makes the miss edge one-shot

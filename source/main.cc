@@ -2341,6 +2341,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_linkphase_mc2_slotfloor();
             }
+            // LINK-PHASE STEP 3 (increment 3) sample-anchored reverse-ACK detection window:
+            // the gate predicate + the sub-class-b beyond-ring rescue predicate + the
+            // byte-identical-OFF / WIDEN-only invariant. In-process, no IONOS/RF.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_linkphase_ackwin();
+            }
             // MC-7 optimizer clock regression: a completed keydown's END-stamped
             // duration wins over a different live derive after a geometry switch;
             // a stale epoch retains the legacy live fallback.
@@ -4143,6 +4150,7 @@ int main(int argc, char *argv[])
     bool test_linkphase_shadow_cli = false; // --test-linkphase-shadow: increment-1 shadow-agreement directed unit.
     bool test_linkphase_mc2_cli = false;    // --test-linkphase-mc2: increment-2 MC-2 slot-floor directed unit.
     bool test_linkphase_optclock_cli = false; // --test-linkphase-optclock: END-stamp freshness directed unit.
+    bool test_linkphase_ackwin_cli = false; // --test-linkphase-ackwin: increment-3 reverse-ACK detection-window directed unit.
     bool test_inband_ring_floor_cli = false;  // --test-inband-ring-floor: capture-ring ROBUST-floor over-seat at a climbed OFDM rung.
     bool test_inband_liveness_cli = false;  // --test-inband-liveness: connect-liveness guard (control-plane livelock backstop).
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
@@ -5236,6 +5244,15 @@ int main(int argc, char *argv[])
         {
             // MC-7 END-stamp ownership/freshness regression (one-shot at startup, exit rc).
             test_linkphase_optclock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-ackwin") == 0)
+        {
+            // LINK-PHASE STEP 3 (increment 3) reverse-ACK detection-window directed unit (one-shot
+            // at startup, exit rc). Drives the production gate + sub-b rescue predicates and the
+            // WIDEN-only / byte-identical-OFF invariant.
+            test_linkphase_ackwin_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7575,6 +7592,18 @@ start_modem:
             cl_arq_controller LP_TEST;
             int rc = LP_TEST.test_linkphase_mc2_slotfloor();
             printf("[FLAG] Linkphase-mc2 test complete (rc=%d) exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_linkphase_ackwin_cli) {
+            // LINK-PHASE STEP 3 (increment 3) reverse-ACK detection-window directed unit (one-shot,
+            // exit rc). Drives the production gate + sub-b rescue predicates on a throwaway controller.
+            printf("[FLAG] --test-linkphase-ackwin: invoking increment-3 reverse-ACK "
+                   "detection-window directed unit\n");
+            fflush(stdout);
+            cl_arq_controller LP_TEST;
+            int rc = LP_TEST.test_linkphase_ackwin();
+            printf("[FLAG] Linkphase-ackwin test complete (rc=%d) exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

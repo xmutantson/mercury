@@ -624,6 +624,152 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 #endif
 }
 
+// LINK-PHASE STEP 3 (increment 3, sub-class a) — the sample-anchored older-phase reverse-ACK
+// rescan. This is a PURELY ADDITIVE OR-term appended at the DATA-ACK accept site: it is reached
+// ONLY after the incumbent newest-tail accept (cmd_compact_confirm_live_accept) has already
+// returned false, and it returns false (byte-identical to stock) unless the step-3 knob is on,
+// the CMD reverse-ACK window is open under the strong primitive guard, and we are in a DATA-ACK
+// wait. The §158 storm signature is a reverse ACK that was physically received but scrolled out
+// of the newest audio tail before the poll fired, so every newest-tail snapshot read a partial
+// pattern (matched can peak >=8 on a poll yet metric stays below accept — the correlation is
+// diluted by the misaligned/missing portion). The incumbent already correlates the newest tail;
+// this steps BACK through older ring phases (the retained history holds far more than the ACK
+// round-trip) and runs BOTH the bare-pattern gate AND the clean-batch CRC content gate on the
+// SAME snapshot per phase — so the bare match and the CRC decode necessarily agree on ONE phase.
+// The search is POSITIONED/BOUNDED by the sample-derived primitive window (next_listen_open_ms
+// -> a look-back cap) and GATED to owner==TURNAROUND, so it can only credit a reverse ACK that
+// is genuinely expected on this session/config/keydown; the EXACT phase is chosen by sample
+// content (the correlator + CRC pass), never by a wall-clock poll instant. WIDENS acceptance,
+// never narrows: a miss at every phase returns false and the caller's incumbent miss/break path
+// runs exactly as today. NB (suffix-incapable) credits on the bare pattern alone, mirroring the
+// incumbent `!suffix_capable` arm.
+bool cl_arq_controller::cmd_data_ack_anchored_rescan_accept()
+{
+	long long next_listen_open_ms = 0;
+	if(!linkphase_ackwin_on()
+	   || this->connection_status != RECEIVING_ACKS_DATA
+	   || !lp_ack_window_active(&next_listen_open_ms))
+		return false;
+#ifdef LINKPHASE_ACKWIN_NOSCAN
+	// FAIL-BEFORE build: the older-phase step is compiled out, so the anchored rescan can never
+	// credit -> the incumbent newest-tail miss stands (the ARM-1 fail-before of test_linkphase_ackwin).
+	return false;
+#else
+	// Tail window — identical geometry to cmd_clean_data_ack_crc_valid (the newest-tail content
+	// gate this rescans at older phases).
+	int ack_nsymb   = telecom_system->ack_mfsk.ack_pattern_nsymb;
+	int pattern_len = telecom_system->ack_mfsk.ack_snr_pattern_nsymb();
+	int sack_suffix_len = telecom_system->ack_mfsk.ack_sack_suffix_len();
+	if(sack_suffix_len > pattern_len - ack_nsymb)
+		pattern_len = ack_nsymb + sack_suffix_len;
+	const int mfsk_tail_nsymb = ack_nsymb + pattern_len + 16;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	if(sym_samples <= 0) return false;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = mfsk_tail_nsymb * sym_samples;
+	if(tail_samples > signal_period)
+		tail_samples = signal_period;
+	int tail_offset = signal_period - tail_samples;
+	if(tail_offset <= 0) return false;   // no retained history to rescan
+
+	// Stride one ACK-pattern length per phase (overlapping windows; no ACK falls entirely
+	// between two phases), the same stride the existing multi-window scan uses.
+	int stride = ack_nsymb * sym_samples;
+	if(stride < sym_samples) stride = sym_samples;
+
+	// Sample-derived look-back bound from the primitive: how far back the reverse ACK could sit,
+	// = the time since the reverse listener opened, in 48 kHz audio samples. Clamp to the ring
+	// and hard-cap the phase count so the per-poll correlator cost stays modest.
+	const int LP_ACKWIN_MAX_PHASES = 24;
+	long long ms_since_open = lp_now() - next_listen_open_ms;
+	int lookback_samples = tail_samples;
+	if(ms_since_open > 0 && ms_since_open < 60000)
+		lookback_samples += (int)(ms_since_open * 48);   // 48 samples/ms @ 48 kHz audio ring
+	if(lookback_samples > tail_offset) lookback_samples = tail_offset;
+	int max_phases = lookback_samples / stride + 1;
+	if(max_phases > LP_ACKWIN_MAX_PHASES) max_phases = LP_ACKWIN_MAX_PHASES;
+
+	const bool suffix_capable = (sack_suffix_len > 0);
+	const unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
+	const unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
+
+	for(int ph = 1; ph <= max_phases; ph++)
+	{
+		int off = tail_offset - ph * stride;
+		if(off < 0) break;
+		// Read-only snapshot of this older phase (no frames_to_read mutation).
+		MUTEX_LOCK(&capture_prep_mutex);
+		int rwi = telecom_system->data_container.ring_write_index;
+		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+			&telecom_system->data_container.passband_delayed_data[rwi + off],
+			tail_samples * sizeof(double));
+		MUTEX_UNLOCK(&capture_prep_mutex);
+
+		// Bare-pattern gate (the SAME accept bar as the incumbent newest-tail poll).
+		int matched = 0; uint32_t mask = 0;
+		double metric = telecom_system->detect_ack_pattern_from_passband(
+			telecom_system->data_container.ready_to_process_passband_delayed_data,
+			tail_samples, &matched, &mask, /*use_fine=*/false);
+		if(!(matched >= telecom_system->ack_mfsk.ack_match_threshold
+		     && metric >= ack_metric_threshold))
+			continue;
+
+		if(suffix_capable)
+		{
+#if MFSK_ACK_SACK_ENABLED
+			// WB content gate: the clean-batch CRC decode, on the SAME older-phase buffer, so the
+			// bare match and the CRC agree on ONE phase. Byte-for-byte the cmd_clean_data_ack_crc_valid
+			// decision (decode -> CRC12 -> coverage -> clean/all-ones), only at this phase.
+			uint8_t  rx_bsi = 0;
+			uint32_t rx_bitmap = 0;
+			uint16_t rx_crc12 = 0;
+			int      mfsk_matched = 0;
+			bool decoded = telecom_system->decode_ack_sack_from_passband(
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
+			if(!decoded)
+				continue;
+			char crc_input[5];
+			crc_input[0] = (char)rx_bsi;
+			crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
+			crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
+			crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
+			crc_input[4] = (char)( rx_bitmap        & 0xFF);
+			if(rx_crc12 != CRC12_calc(crc_input, 5))
+				continue;
+			bool per_batch_in_window =
+				((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
+			bool covered =
+				cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
+					cumulative_ack_enabled, per_batch_in_window)
+				|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
+					cumulative_ack_enabled, per_batch_in_window);
+			if(!covered)
+				continue;
+			if(!mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size))
+				continue;
+			cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
+#else
+			continue;   // suffix-capable but SACK decode unavailable -> cannot validate; do not credit
+#endif
+		}
+
+		// Credit at this anchored older phase. Advance the ring the same way the incumbent
+		// accept branch would (frames_to_read=4 via commit_ack_pattern_consumed), account the
+		// prevention counter, and emit the wire-activation witness.
+		commit_ack_pattern_consumed();
+		linkphase_false_break_averted++;
+		printf("[LINKPHASE-ACKWIN] rescan credited reverse-ACK subclass=a ph=%d "
+			"back_samples=%d matched=%d metric=%.3f cmd_bsi=%u\n",
+			ph, ph * stride, matched, metric, cmd_bsi);
+		fflush(stdout);
+		return true;
+	}
+	return false;
+#endif  // LINKPHASE_ACKWIN_NOSCAN
+}
+
 // Production CRC12 callback for the compact-confirm decode (ctx = this).
 // File-local clone of arq_common.cc's arq_ctrl_crc12_cb (that one is static
 // there). NEVER inline the CRC (v1 bug #1 init mismatch). Matches ctrl_crc12_fn.
@@ -6727,7 +6873,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			else if(data_ack_received==NO
 			        && (v2_ack_pat_pre_detected
 			            || cmd_compact_confirm_live_accept(sack_window_open,
-			                                               ARQ_COMPACT_CONFIRM_ENABLE != 0)))
+			                                               ARQ_COMPACT_CONFIRM_ENABLE != 0)
+			            // LINK-PHASE STEP 3 (sub-class a): additive sample-anchored older-phase
+			            // rescan. Reached ONLY when the incumbent newest-tail accept above failed;
+			            // returns false (byte-identical) unless MERCURY_LINKPHASE_ACKWIN is set and
+			            // the strong-guarded reverse-ACK window is open. WIDENS acceptance only.
+			            || cmd_data_ack_anchored_rescan_accept()))
 			{
 				printf("[CMD-ACK-PAT] Data ACK pattern detected!\n");
 				fflush(stdout);
