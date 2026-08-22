@@ -173,19 +173,35 @@ extern int g_verbose;
 #define CONFIG_17 17
 
 // ROBUST (MFSK) configurations - values 100+ to avoid collision with OFDM configs
-#define NUMBER_OF_ROBUST_CONFIGS 3
+#define NUMBER_OF_ROBUST_CONFIGS 4
 #define ROBUST_0 100  // 32-MFSK, LDPC rate 1/16, ~14 bps (hailing mode)
 #define ROBUST_1 101  // 16-MFSK x2, LDPC rate 1/16, ~22 bps
 #define ROBUST_2 102  // 16-MFSK x2, LDPC rate 1/4,  ~87 bps
+// ROBUST_3: low-band CAPACITY rung. Same 16-MFSK x2 waveform/preamble/geometry as
+// ROBUST_1/2 (a pure FEC-rate step above ROBUST_2's 4/16), LDPC rate 8/16 -> ~164 net
+// bit/s = ~20.5 B/s at the live R_s=41.10 baud. Measured AWGN decode floor -6.5 Es/N0 =
+// -7.57 snr3k, i.e. 2.4 dB margin below the -5.2 dB(snr3k) capacity anchor whose whole-
+// transfer bar is 17.8 B/s (controls-validated design-SNR sweep). This is the first re-
+// parameterized low-band rung: it ADDS a rung above ROBUST_2's -8 dB floor, it does not
+// replace it. Wired pinned-only / off-ladder / default-OFF exactly like the cfg105 anchor
+// below: reachable only via an explicit `-s 103`, never elected by the climb engine, and a
+// peer that was not itself pinned to it refuses to negotiate onto it (config_negotiable_to).
+#define ROBUST_3 103  // 16-MFSK x2, LDPC rate 8/16, ~164 bps (low-band capacity rung)
 
 // Honest-4.8 dB anchor experiment.  This deliberately lives outside both the
 // production OFDM numbering and FULL_CONFIG_LADDER: it is reachable only when
 // a caller explicitly selects `-s 105`.  No gearshift/capability table may
 // advertise or elect it until the same-build BER experiment is complete.
-// IDs 103 and 104 are reserved by earlier experimental lanes.
+// ID 104 is reserved by an earlier experimental lane.
 #define LOW48_ANCHOR_S20_R6 105
 
-inline bool is_robust_config(int config) { return config >= 100 && config <= 102; }
+inline bool is_robust_config(int config) { return config >= 100 && config <= 103; }
+// ROBUST_3 (cfg103) is a pinned-only, off-ladder low-band rung. It IS a robust MFSK config
+// to every consumer (LDPC iteration budget, ctrl-frame puncturing, ACK detection threshold,
+// M/nStreams selection all take the correct general-robust branch), but it is singled out for
+// the ladder fixed-point and the fail-closed negotiation gate below — mirroring how the cfg105
+// anchor is singled out by is_low48_anchor_config while still reporting is_ofdm_config.
+inline bool is_robust3_config(int config) { return config == ROBUST_3; }
 inline bool is_low48_anchor_config(int config) { return config == LOW48_ANCHOR_S20_R6; }
 // is_ofdm_config: TRUE for every OFDM rung, INCLUDING the top-gear CONFIG_17 (64-QAM).
 // cfg17 IS an OFDM config semantically (MOD_64QAM, LDPC, pilots) and MUST report OFDM so
@@ -197,6 +213,24 @@ inline bool is_low48_anchor_config(int config) { return config == LOW48_ANCHOR_S
 // once the election has made cfg17 live. See topgear-stack-productionize.md §2. (was ≤16)
 inline bool is_ofdm_config(int config) {
 	return (config >= 0 && config <= 17) || is_low48_anchor_config(config);
+}
+
+// A config number received in a SET_CONFIG control frame or a connect-seed is
+// NEGOTIABLE-TO only if this peer can legitimately run it. ROBUST_3 (cfg103) is a
+// pinned-only low-band rung that lives OUTSIDE the ladder and outside the capability
+// advertisement: a peer adopts it ONLY when it is itself a cfg103-pinned session
+// (self_robust3_pinned). A peer that never heard of cfg103 (an older build whose
+// is_robust_config still caps at 102, and whose is_ofdm_config never covered 103)
+// refuses it structurally; a same-build peer that was NOT pinned to it refuses cleanly
+// (fail-closed) rather than being dragged onto an off-ladder experimental config that
+// would desync the two ends. Every other config keeps the historic is_ofdm||is_robust
+// gate byte-for-byte (note is_robust_config(103) is now true, so cfg103 would otherwise
+// leak through the plain gate — this intercept is what keeps a non-pinned session from
+// adopting an unsolicited cfg103).
+inline bool config_negotiable_to(int config, bool self_robust3_pinned) {
+	if (is_robust3_config(config))
+		return self_robust3_pinned;
+	return is_ofdm_config(config) || is_robust_config(config);
 }
 
 // §21 (tier2-suffix-fec-design.md): the base-pattern noncoherent combining factor
@@ -289,6 +323,10 @@ inline int config_ladder_index(int config) {
 // added clause is a no-op (the full-ladder branch already ran), so the proven
 // climb/anti-thrash paths are byte-identical. See §19.
 inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = false) {
+	// ROBUST_3 (cfg103) is off-ladder pinned-only: never climbs/demotes via the ladder.
+	// (Already a fixed point here — 103 is absent from FULL_CONFIG_LADDER so idx<0 returns
+	// config below — but stated explicitly to survive any future fast-path/membership change.)
+	if (is_robust3_config(config)) return config;
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled && !is_robust_config(config)) {
 		return (config < ceiling) ? config + 1 : config;
@@ -303,6 +341,7 @@ inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = f
 }
 
 inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool narrowband = false) {
+	if (is_robust3_config(config)) return config;  // ROBUST_3: ladder fixed point (off-ladder pinned-only)
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		int target = config + steps;
@@ -319,6 +358,7 @@ inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool n
 }
 
 inline int config_ladder_down(int config, bool robust_enabled) {
+	if (is_robust3_config(config)) return config;  // ROBUST_3: ladder fixed point (off-ladder pinned-only)
 	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		return (config > CONFIG_0) ? config - 1 : config;
 	}
@@ -328,6 +368,10 @@ inline int config_ladder_down(int config, bool robust_enabled) {
 }
 
 inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
+	// ROBUST_3: ladder fixed point. LOAD-BEARING here (unlike up/up_n/down): the base
+	// full-ladder path clamps a not-found idx (-1) to 0 and would return FULL_CONFIG_LADDER[0]
+	// = ROBUST_0, i.e. a multi-step demote of cfg103 would silently drop to ROBUST_0. Hold 103.
+	if (is_robust3_config(config)) return config;
 	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		int target = config - steps;
 		return (target > CONFIG_0) ? target : CONFIG_0;

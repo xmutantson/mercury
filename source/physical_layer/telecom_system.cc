@@ -12915,6 +12915,19 @@ void cl_telecom_system::load_configuration(int configuration)
 		ofdm_preamble_configurator_Nsymb=4;
 		ofdm_channel_estimator=LEAST_SQUARE;
 	}
+	else if(configuration==ROBUST_3)
+	{
+		// Low-band capacity rung: same 16-MFSK x2 geometry/preamble as ROBUST_1/2
+		// (selected_M/selected_nStreams below take the non-ROBUST_0 branch = M16 x2),
+		// a pure FEC-rate step above ROBUST_2. Rate 8/16 -> ~164 net bit/s (~20.5 B/s
+		// at R_s=41.10). Measured AWGN decode floor -6.5 Es/N0 = -7.57 snr3k (2.4 dB
+		// below the -5.2 capacity anchor). Rate 7/16 was NOT viable (no prebuilt k=7
+		// LDPC matrix), so 8/16 is the deepest-margin valid bar-clearing rate.
+		_modulation=MOD_MFSK;
+		_ldpc_rate=8/16.0;  // Rate 1/2: 2x throughput vs ROBUST_2, waterfall at -7.6 snr3k
+		ofdm_preamble_configurator_Nsymb=4;
+		ofdm_channel_estimator=LEAST_SQUARE;
+	}
 
 	// MFSK parametric-search: env override of the LDPC rate for MFSK configs.
 	// k in {1..14} selects the prebuilt k/16 matrix. Additive; production unset

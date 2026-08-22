@@ -4006,6 +4006,9 @@ int main(int argc, char *argv[])
                                         // 600/2000/4000/8000; SIMFTR_ROOTCAUSE.md §7/§8 fix #1), then (2) OUTER-stepper
                                         // OFDM big-block no-wedge + clean-carve + C0-a byte-correct sustain (Phase b).
                                         // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
+    bool test_cfg103_gate_cli = false;   // --test-cfg103-gate: ROBUST_3 (cfg103) wiring guard unit
+                                        // (ladder fixed point + fail-closed config_negotiable_to);
+                                        // fail-before base arithmetic vs pass-after live, one-shot exit rc.
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
                                         // LIVE receive_bigblock+de-whiten+per-cw-CRC carve; 3 arms prove the root
                                         // cause is the RX capture WINDOW (cw1..cw7 corruption), NOT whiten/offset.
@@ -4754,6 +4757,12 @@ int main(int argc, char *argv[])
             // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
             // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
             test_bigblock_fullpath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cfg103-gate") == 0)
+        {
+            test_cfg103_gate_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6888,6 +6897,59 @@ start_modem:
             fflush(stdout);
             exit(rc);
         }
+        if (test_cfg103_gate_cli) {
+            // ROBUST_3 (cfg103) wiring guard unit. Pure header-inline decisions: the ladder
+            // fixed point and the fail-closed negotiation gate. Each guard is asserted
+            // fail-before (base arithmetic reconstructed inline = the exact hazard) AND
+            // pass-after (the live guarded function), so one binary shows both. Exit rc.
+            printf("[FLAG] --test-cfg103-gate: ROBUST_3 wiring guards "
+                   "(fail-before base arithmetic vs pass-after live)\n");
+            fflush(stdout);
+            int gfails = 0;
+            auto gck = [&](bool cond, const char* name){
+                printf("[CFG103-GATE] %s: %s\n", cond ? "PASS" : "FAIL", name);
+                if(!cond) gfails++;
+            };
+            const int R3 = ROBUST_3;   // 103
+            // --- Classification witnesses ---
+            gck(is_robust_config(R3) == true,  "widen: is_robust_config(103)=true (MFSK robust rung)");
+            gck(is_robust3_config(R3) == true, "predicate: is_robust3_config(103)=true");
+            gck(is_ofdm_config(R3) == false,   "is_ofdm_config(103)=false (not an OFDM rung)");
+            gck(config_ladder_index(R3) == -1, "off-ladder: config_ladder_index(103) = -1");
+            // --- Ladder fixed point ---
+            {
+                // fail-before: the BASE down_n arithmetic (no guard) drops cfg103 to ROBUST_0.
+                int idx = config_ladder_index(R3); idx -= 3; if(idx<0) idx=0;
+                int base_downn = FULL_CONFIG_LADDER[idx];
+                gck(base_downn == ROBUST_0, "fail-before: base ladder_down_n(103,3) = ROBUST_0 (silent demote hazard)");
+            }
+            gck(config_ladder_down_n(R3, 3, true)  == R3, "pass-after: ladder_down_n(103,3,r1) holds 103");
+            gck(config_ladder_down_n(R3, 3, false) == R3, "pass-after: ladder_down_n(103,3,r0) holds 103");
+            gck(config_ladder_down(R3, false) == R3, "pass-after: ladder_down(103,r0) holds 103");
+            gck(config_ladder_down(R3, true)  == R3, "pass-after: ladder_down(103,r1) holds 103");
+            gck(config_ladder_up(R3, false, false) == R3, "pass-after: ladder_up(103) holds 103");
+            gck(config_ladder_up_n(R3, 5, false, false) == R3, "pass-after: ladder_up_n(103,5) holds 103");
+            gck(config_ladder_down(CONFIG_12, false) == CONFIG_11, "unchanged: ladder_down(12)=11");
+            gck(config_ladder_up(CONFIG_12, false, false) == CONFIG_13, "unchanged: ladder_up(12)=13");
+            gck(config_ladder_down(ROBUST_2, true) == ROBUST_1, "unchanged: ladder_down(ROBUST_2)=ROBUST_1");
+            gck(config_ladder_down_n(ROBUST_2, 3, true) == ROBUST_0, "unchanged: ladder_down_n(ROBUST_2,3)=ROBUST_0");
+            // --- Fail-closed negotiation gate ---
+            gck((is_ofdm_config(R3) || is_robust_config(R3)) == true,
+                "fail-before: base plain gate WOULD accept cfg103 (is_robust widened) = the leak");
+            gck(config_negotiable_to(R3, false) == false,
+                "pass-after: NON-pinned peer REFUSES cfg103 (fail-closed)");
+            gck(config_negotiable_to(R3, true) == true,
+                "pass-after: cfg103-PINNED peer ACCEPTS cfg103");
+            gck(config_negotiable_to(CONFIG_16, false) == true, "unchanged: cfg16 negotiable");
+            gck(config_negotiable_to(ROBUST_0, false) == true, "unchanged: ROBUST_0 negotiable");
+            gck(config_negotiable_to(ROBUST_2, false) == true, "unchanged: ROBUST_2 negotiable");
+            gck(config_negotiable_to(LOW48_ANCHOR_S20_R6, false) == true, "note: cfg105 plain-negotiable here (its own gate lives elsewhere)");
+            gck(config_negotiable_to(104, false) == false, "unchanged: reserved id 104 not negotiable");
+            int grc = gfails ? 1 : 0;
+            printf("[FLAG] --test-cfg103-gate complete: %d failures (rc=%d) -- exiting.\n", gfails, grc);
+            fflush(stdout);
+            exit(grc);
+        }
         if (test_sim_sustain_cli) {
             // SIM_INPROC SUSTAIN BATTERY — runs BOTH durable sustain regressions back-to-back on
             // the SAME binary and exits with the OR of their return codes (any failure -> nonzero):
@@ -8377,6 +8439,13 @@ start_modem:
             ARQ.local_capability |= CAP_ENCRYPTION;
 #endif
         telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
+        // ROBUST_3 (cfg103) is a pinned-only, off-ladder low-band rung. When it is
+        // explicitly pinned in ARQ mode, force the gearshift OFF so no climb / optimizer /
+        // SNR producer can negotiate the session off the pinned rung; it is held for the
+        // whole session (a BREAK still degrades to the robust floor as the sanctioned exit).
+        // Byte-identical for every non-cfg103 config. Mirrors the cfg105 anchor staging.
+        if (is_robust3_config(mod_config) && explicit_config)
+            gear_shift_mode = NO_GEAR_SHIFT;
         ARQ.init(base_tcp_port, (gear_shift_mode == NO_GEAR_SHIFT)? NO : YES, mod_config);
 
         // Monitor mode: auto-start in LISTENING state (no TCP LISTEN ON needed)
