@@ -1285,6 +1285,49 @@ int cl_arq_controller::test_topgear_clean_election()
 		delete l1cmd;
 	}
 
+	// (5b.3) Site 3 -- no-block-ACK emergency-BREAK ACK-miss temporal-validity classifier.
+	// A reverse-ACK timeout with SUB-THRESHOLD correlator activity (peak_matched>0) is a
+	// DEFERRED / marginal reverse ACK present, NOT true absence: hold up to
+	// EMERGENCY_ACKMISS_DEFER_MAX such misses WITHOUT counting toward the emergency BREAK.
+	// Pure silence (matched==0 -- the genuine channel-cliff signature) is true absence and
+	// is counted immediately; budget spent => counted as before so sustained absence still
+	// reaches emergency_nack_threshold. Measured 14.8: cliff timeouts matched 0/7 (counted);
+	// transient timeouts matched 3-5/7 (held).
+	{
+		const int PARTIAL = 4;   // measured 14.8 transient partials matched 3-5/7
+		const int SILENCE = 0;   // measured channel-cliff (RSP-V2-DROP cascade) timeouts matched 0/7
+		// Gate OFF: byte-identical -> never held even with reverse activity present.
+		clr_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+		cmd->emergency_ackmiss_defer_streak = 0;
+		check(!cmd->emergency_ackmiss_defer_hold(PARTIAL) && cmd->emergency_ackmiss_defer_streak == 0,
+		      "site3 gate OFF: sub-threshold ACK miss NOT held (counted, byte-identical)");
+		// Gate ON: transient partial-correlator misses are HELD for the full budget.
+		set_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS", "1");
+		cmd->emergency_ackmiss_defer_streak = 0;
+		int ackmiss_held = 0;
+		for(int i = 0; i < EMERGENCY_ACKMISS_DEFER_MAX; ++i)
+			if(cmd->emergency_ackmiss_defer_hold(PARTIAL)) ackmiss_held++;
+		check(ackmiss_held == EMERGENCY_ACKMISS_DEFER_MAX
+		      && cmd->emergency_ackmiss_defer_streak == EMERGENCY_ACKMISS_DEFER_MAX,
+		      "site3 gate ON: transient sub-threshold ACK misses held for the full budget");
+		// Budget spent -> sustained partial-but-undecodable counts (BREAK/demote reachable).
+		check(!cmd->emergency_ackmiss_defer_hold(PARTIAL),
+		      "site3: budget spent -> sustained absence counts (BREAK/demote still reachable)");
+		// Pure silence is TRUE ABSENCE (channel-cliff): counted immediately, no budget consumed,
+		// so three consecutive silence misses reach the demote unchanged (storm protection).
+		cmd->emergency_ackmiss_defer_streak = 0;
+		check(!cmd->emergency_ackmiss_defer_hold(SILENCE)
+		      && !cmd->emergency_ackmiss_defer_hold(SILENCE)
+		      && !cmd->emergency_ackmiss_defer_hold(SILENCE)
+		      && cmd->emergency_ackmiss_defer_streak == 0,
+		      "site3: pure silence (channel-cliff) is true absence -> every miss counted, not held");
+		// Recovery reset re-arms the hold.
+		cmd->emergency_ackmiss_defer_streak = 0;
+		check(cmd->emergency_ackmiss_defer_hold(PARTIAL) && cmd->emergency_ackmiss_defer_streak == 1,
+		      "site3: after recovery reset the hold re-arms");
+		clr_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+	}
+
 	// (5c) LEAVING the band clears the verdict (load_configuration reset).
 	reset_state();
 	cmd->current_configuration = CONFIG_16;

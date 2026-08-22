@@ -2878,6 +2878,15 @@ public:
   // not aggregate-outstanding, or the budget is spent (sustained absence), in which case
   // the caller counts the miss exactly as before. Byte-identical when the gate is off.
   bool l1_aggregate_defer_hold();
+  // No-block-ACK emergency-BREAK ACK-miss temporal-validity classifier
+  // (MERCURY_DEMOTE_TEMPORAL_HYSTERESIS=1, default-off). Called at the emergency-BREAK
+  // miss increment with this round's reverse-ACK correlator peak (ack_diag_peak_matched).
+  // Returns true (miss HELD, caller skips the credit) when the gate is on, the correlator
+  // saw sub-threshold reverse activity (a deferred/marginal ACK, not silence), and the
+  // bounded hold budget is not spent. Returns false (caller counts the miss exactly as
+  // before) when the gate is off, the correlator saw pure silence (true absence), or the
+  // budget is spent (sustained absence). Byte-identical when the gate is off.
+  bool emergency_ackmiss_defer_hold(int peak_matched);
   // Compact-confirm telemetry codec. SNR quantizes DOWN in 2 dB steps. The low
   // nibble is a marker-backed flatness state (8=unmeasured, 9=flat, 10=non-flat);
   // every other value is rejected before it can affect election state.
@@ -6569,6 +6578,7 @@ public:
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)
   int l1_aggregate_defer_streak;  // default-off temporal gate: consecutive aggregate-window timeouts HELD (not counted toward emergency BREAK) while an L1 block aggregate is legitimately outstanding
+  int emergency_ackmiss_defer_streak;  // default-off temporal gate: consecutive no-block-ACK reverse-ACK timeouts with sub-threshold correlator activity HELD (not counted toward emergency BREAK)
   int emergency_break_active;     // 1 = BREAK sent, waiting for ACK
   int emergency_break_retries;    // retries left for current BREAK attempt
   int emergency_previous_config;  // config that was failing

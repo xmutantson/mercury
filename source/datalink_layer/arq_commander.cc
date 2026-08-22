@@ -7030,6 +7030,22 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		if(slot_liveness_active && data_ack_received == NO
 		   && !linkphase_ack_slot_miss_counted)
 		{
+			// Site 3 (demote temporal hysteresis, MERCURY_DEMOTE_TEMPORAL_HYSTERESIS=1): a reverse-
+			// ACK timeout whose correlator still saw sub-threshold activity (ack_diag_peak_matched
+			// >= EMERGENCY_ACKMISS_ACTIVITY_MIN) is a DEFERRED / marginal reverse ACK present on the
+			// channel, NOT a channel ACK-absence (a genuine channel-cliff presents as matched==0 and
+			// is never held). Hold up to EMERGENCY_ACKMISS_DEFER_MAX such qualified-slot misses
+			// WITHOUT crediting missed_ack_slots / emergency_nack_count; the slot is still consumed
+			// and slot_qualified_miss stays true so the ordinary retransmit below still fires. Budget
+			// spent or pure silence => credited as before so sustained absence still BREAKs. Byte-
+			// identical when the gate is off (emergency_ackmiss_defer_hold()==false).
+			if(emergency_ackmiss_defer_hold(ack_diag_peak_matched))
+			{
+				linkphase_ack_slot_miss_counted = true;   // slot consumed; miss HELD (0 demote credit)
+				slot_qualified_miss = true;               // retransmit still fires (deferral recovers via resend)
+			}
+			else
+			{
 			if(missed_ack_slots < 1000000) missed_ack_slots++;
 			linkphase_ack_slot_miss_counted = true;
 			slot_qualified_miss = true;
@@ -7038,6 +7054,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			       "missed_ack_slots=%d/%d (config=%d)\n",
 				missed_ack_slots, emergency_nack_threshold, current_configuration);
 			fflush(stdout);
+			}
 		}
 
 		if(ack_pattern_time_ms <= 0)
@@ -7271,7 +7288,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// (which triggers the responder aggregate replay) can recover; sustained
 				// absence (budget spent) still counts and reaches the BREAK threshold.
 				// Byte-identical when the gate is off (l1_aggregate_defer_hold()==false).
-				if(!l1_aggregate_defer_hold())
+				if(!l1_aggregate_defer_hold() && !emergency_ackmiss_defer_hold(ack_diag_peak_matched))
 					emergency_nack_count++;
 			}
 
@@ -7849,6 +7866,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// even a partial — breaks that streak, so it resets UNGATED. (§9.7.)
 			emergency_nack_count = 0;  // Reset on success
 			l1_aggregate_defer_streak = 0;  // deferred aggregate arrived (clean/partial) -> recovery, disarm the hold
+			emergency_ackmiss_defer_streak = 0;  // reverse ACK decoded -> recovery, re-arm the sub-threshold hold
 			if(linkphase_slotliveness_on())
 			{
 				missed_ack_slots = 0;
@@ -9163,6 +9181,7 @@ void cl_arq_controller::process_control_commander()
 			topgear_elect_clean_streak = 0;
 			topgear_drop_streak = 0;
 			l1_aggregate_defer_streak = 0;
+			emergency_ackmiss_defer_streak = 0;
 			topgear_channel_flatness = -1.0;
 			topgear_clear_forward_verdict();
 			topgear_last_report_bsi = -1;

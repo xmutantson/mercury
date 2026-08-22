@@ -1263,6 +1263,7 @@ cl_arq_controller::cl_arq_controller()
 	topgear_below_floor_streak=0;
 	topgear_drop_streak=0;
 	l1_aggregate_defer_streak=0;
+	emergency_ackmiss_defer_streak=0;
 	topgear_last_flat_state=8;
 	// Consume-race deferred report decode: nothing pending on a fresh controller.
 	topgear_pending_report_bsi=-1;
@@ -3400,6 +3401,7 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		topgear_below_floor_streak = 0;
 		topgear_drop_streak = 0;
 		l1_aggregate_defer_streak = 0;
+		emergency_ackmiss_defer_streak = 0;
 		topgear_clear_forward_verdict();
 	}
 	if(current_configuration!=CONFIG_NONE)
@@ -4188,6 +4190,45 @@ bool cl_arq_controller::l1_aggregate_defer_hold()
 	printf("[L1-DEFER-HOLD] deferred aggregate held, miss NOT counted (streak=%d/%d nack=%d config=%d)\n",
 		l1_aggregate_defer_streak, L1_AGGREGATE_DEFER_MAX,
 		emergency_nack_count, current_configuration);
+	fflush(stdout);
+	return true;
+}
+
+// No-block-ACK emergency-BREAK ACK-miss temporal-validity classifier. Site 3 of the
+// demote-hysteresis family. The commander's emergency-BREAK path (the slot-liveness
+// mirror and the raw increment) counts every reverse-ACK timeout as a consecutive block-
+// failure and BREAKs at emergency_nack_threshold. But a timeout whose ACK correlator still
+// saw SUB-THRESHOLD activity (peak_matched >= EMERGENCY_ACKMISS_ACTIVITY_MIN) is a DEFERRED
+// / marginal reverse ACK that was present on the channel and simply did not cross the decode
+// threshold (fine-timing / near-cliff SNR) -- NOT a channel ACK-absence. HOLD such a miss
+// (do not credit it) for up to EMERGENCY_ACKMISS_DEFER_MAX consecutive occurrences; the
+// ordinary retransmit still fires meanwhile and typically recovers. Pure silence
+// (peak_matched below the floor -- the signature of a genuine channel-cliff / RSP-V2-DROP
+// cascade) is true absence and is counted immediately. Once the budget is spent the reverse
+// path is treated as genuinely absent and every later miss counts exactly as before -- so
+// real SUSTAINED absence still reaches emergency_nack_threshold and demotes (only the demote
+// instant slips by the bounded budget). No-op / byte-identical unless the gate is on. Prior
+// art: Rhizomatica Mercury V2 bounded reverse-loss hold; ARDOP two-evidence demote asymmetry.
+bool cl_arq_controller::emergency_ackmiss_defer_hold(int peak_matched)
+{
+	if(!l1_block::temporal_hysteresis_enabled()) return false;
+	if(peak_matched < EMERGENCY_ACKMISS_ACTIVITY_MIN) return false;  // pure silence => true absence, count now
+	if(emergency_ackmiss_defer_streak >= EMERGENCY_ACKMISS_DEFER_MAX)
+	{
+		// Budget spent: sub-threshold reverse activity persisted across the whole temporal
+		// window without a decode => sustained undecodable reverse path. Count the miss (the
+		// caller does the credit) exactly as the gate-off path; emit the demote-side witness
+		// so a cohort can separate a recovered deferral from a genuine sustained loss.
+		printf("[ACKPAT-DEFER-DEMOTE] sub-threshold ACK budget spent; counting miss (streak=%d/%d matched=%d nack=%d config=%d)\n",
+			emergency_ackmiss_defer_streak, EMERGENCY_ACKMISS_DEFER_MAX,
+			peak_matched, emergency_nack_count, current_configuration);
+		fflush(stdout);
+		return false;
+	}
+	emergency_ackmiss_defer_streak++;
+	printf("[ACKPAT-DEFER-HOLD] sub-threshold reverse ACK present, miss NOT counted (streak=%d/%d matched=%d nack=%d config=%d)\n",
+		emergency_ackmiss_defer_streak, EMERGENCY_ACKMISS_DEFER_MAX,
+		peak_matched, emergency_nack_count, current_configuration);
 	fflush(stdout);
 	return true;
 }
@@ -9551,6 +9592,7 @@ void cl_arq_controller::reset_session_state()
 	topgear_below_floor_streak = 0;
 	topgear_drop_streak = 0;
 	l1_aggregate_defer_streak = 0;
+	emergency_ackmiss_defer_streak = 0;
 	topgear_last_flat_state = 8;
 	// A pending deferred report is prior-session channel evidence too.
 	topgear_pending_report_clear("session-reset");

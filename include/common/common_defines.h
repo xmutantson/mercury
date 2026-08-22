@@ -991,6 +991,25 @@ CONFIG_16 (5664.7 bps).
 // so real sustained absence still reaches emergency_nack_threshold and demotes.
 #define L1_AGGREGATE_DEFER_MAX 2
 
+// Default-off temporal-validity gate for the no-block-ACK emergency-BREAK ACK-miss
+// path (MERCURY_DEMOTE_TEMPORAL_HYSTERESIS=1). A reverse-ACK timeout whose correlator
+// still saw SUB-THRESHOLD activity (ack_diag_peak_matched >= EMERGENCY_ACKMISS_ACTIVITY_MIN)
+// is a DEFERRED / marginal reverse ACK present on the channel, not a channel ACK-absence:
+// hold up to this many such consecutive misses WITHOUT crediting the emergency BREAK
+// counter (missed_ack_slots / emergency_nack_count). The ordinary retransmit still fires,
+// so the deferral usually recovers. Pure silence (matched below the floor) is treated as
+// true absence and counted immediately; once the budget is spent every later miss counts
+// exactly as before, so real sustained absence still reaches emergency_nack_threshold and
+// BREAKs. A genuine channel-cliff (RSP-V2-DROP / GAP-ABORT cascade) presents as pure-
+// silence timeouts (matched==0) and is therefore never held.
+#define EMERGENCY_ACKMISS_DEFER_MAX 2
+// Minimum reverse-ACK correlator symbol matches that count as reverse activity present
+// (not pure silence). Measured 14.8 sub-threshold partials matched 3-5/7; measured true
+// silence / channel-cliff matched 0/7 -- a wide gap, so any nonzero floor reproduces the
+// classification. Set to 1 (any correlation with the ACK pattern) so the hold errs toward
+// NOT demoting on marginal reverse energy; the bounded budget caps a mis-hold to a few polls.
+#define EMERGENCY_ACKMISS_ACTIVITY_MIN 1
+
 // TOPGEAR REPORT CONSUME-RACE — deferred-decode deadline. The commander accepts a
 // compact confirm at FIRST-codeword CRC validity, which on the real-loopback vehicle
 // precedes the trailing report codeword's audio arrival (audio-bracketed twice:
