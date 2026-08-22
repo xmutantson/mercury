@@ -529,6 +529,9 @@ public:
   l1_block::BlockAckRuntime l1_blockack;
   void l1_complete_blockack_handshake(bool authenticated_echo);
   bool l1_blockack_data_active() const;
+  bool l1_blockack_pipeline_active() const;
+  unsigned int l1_pipeline_intermediate_advance_timeout() const;
+  bool l1_pipeline_watchdog_would_force(long long block_air_ms) const;
   long long l1_send_block_control(const std::vector<uint8_t>& wire);
   void l1_release_current_batch_to_journal();
   bool l1_stage_batch_before_tx();
@@ -6578,6 +6581,7 @@ public:
   int emergency_nack_count;       // consecutive failed data blocks
   int emergency_nack_threshold;   // trigger threshold (default 2)
   int l1_aggregate_defer_streak;  // default-off temporal gate: consecutive aggregate-window timeouts HELD (not counted toward emergency BREAK) while an L1 block aggregate is legitimately outstanding
+  long long block_forward_air_ms; // default-off pipeline: accumulated forward-burst airtime (ms) in the current block, for the time-based watchdog boundary bound
   int emergency_ackmiss_defer_streak;  // default-off temporal gate: consecutive no-block-ACK reverse-ACK timeouts with sub-threshold correlator activity HELD (not counted toward emergency BREAK)
   int emergency_break_active;     // 1 = BREAK sent, waiting for ACK
   int emergency_break_retries;    // retries left for current BREAK attempt

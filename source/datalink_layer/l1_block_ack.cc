@@ -45,6 +45,11 @@ bool temporal_hysteresis_enabled() {
 	return value && std::strcmp(value, "1") == 0;
 }
 
+bool pipeline_enabled() {
+	const char* value = std::getenv("MERCURY_L1_BLOCKACK_PIPELINE");
+	return value && std::strcmp(value, "1") == 0;
+}
+
 uint8_t capability_advertise_bit() {
 	return feature_gate_enabled() ? (uint8_t)CAP_L1_BLOCKACK : (uint8_t)0;
 }

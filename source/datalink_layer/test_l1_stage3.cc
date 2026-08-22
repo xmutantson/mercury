@@ -388,6 +388,46 @@ void gate_off_byte_identity() {
 	set_gate(false);
 }
 
+// STAGE R pipeline gate (MERCURY_L1_BLOCKACK_PIPELINE) is LIVE + exact-value, and the
+// knob is a COMMANDER receive-window policy that must not change any BlockAckRuntime
+// wire/state output: the CMD->RSP aggregate is byte-identical with the knob off vs on.
+void pipeline_gate_and_roundtrip_identity() {
+	unsetenv("MERCURY_L1_BLOCKACK_PIPELINE");
+	CHECK(!l1_block::pipeline_enabled(), "pipeline gate OFF when unset");
+	setenv("MERCURY_L1_BLOCKACK_PIPELINE", "1", 1);
+	CHECK(l1_block::pipeline_enabled(), "pipeline gate ON at exact value 1");
+	setenv("MERCURY_L1_BLOCKACK_PIPELINE", "0", 1);
+	CHECK(!l1_block::pipeline_enabled(), "pipeline gate OFF at 0");
+	setenv("MERCURY_L1_BLOCKACK_PIPELINE", "2", 1);
+	CHECK(!l1_block::pipeline_enabled(), "pipeline gate OFF at non-1 value");
+	unsetenv("MERCURY_L1_BLOCKACK_PIPELINE");
+
+	set_gate(true, 4);
+	std::vector<std::vector<uint8_t> > off_frames, on_frames;
+	for(int arm = 0; arm < 2; ++arm) {
+		if(arm == 0) unsetenv("MERCURY_L1_BLOCKACK_PIPELINE");
+		else setenv("MERCURY_L1_BLOCKACK_PIPELINE", "1", 1);
+		BlockAckRuntime cmd, rsp;
+		cmd.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		cmd.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		rsp.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		rsp.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		std::vector<std::vector<uint8_t> >& out = (arm == 0) ? off_frames : on_frames;
+		for(uint8_t bsi = 20; bsi < 24; ++bsi) {
+			cmd.note_transmitted_batch(bsi);
+			CHECK(cmd.intermediate_silence_expected() != cmd.aggregate_response_outstanding(),
+				"pipeline arm: intermediate/boundary are exact complements within the block");
+			std::vector<uint8_t> frame;
+			if(rsp.observe_received_batch(bsi, std::vector<bool>{true, true}, false, &frame))
+				out.push_back(frame);
+		}
+	}
+	CHECK(off_frames == on_frames && off_frames.size() == 1,
+		"pipeline knob leaves the block-ACK aggregate wire byte-identical (RX unchanged)");
+	unsetenv("MERCURY_L1_BLOCKACK_PIPELINE");
+	set_gate(false);
+}
+
 }  // namespace
 
 int main() {
@@ -397,6 +437,7 @@ int main() {
 	aggregate_outstanding_classifier();
 	lost_aggregate_replay();
 	gate_off_byte_identity();
+	pipeline_gate_and_roundtrip_identity();
 	std::printf("L1 Stage-3: %s (%d failures)\n",
 		failures ? "FAIL" : "PASS", failures);
 	return failures ? 1 : 0;

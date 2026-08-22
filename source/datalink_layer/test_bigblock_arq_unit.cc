@@ -1328,6 +1328,92 @@ int cl_arq_controller::test_topgear_clean_election()
 		clr_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
 	}
 
+	// (5b.4) STAGE R block-ACK pipelining (MERCURY_L1_BLOCKACK_PIPELINE). Within a
+	// negotiated block the intermediate 1..N-1 windows advance after a SHORT gap
+	// instead of a full receiving_timeout; a real receive window opens only at the
+	// block boundary; a time-based bound forces an early boundary before reverse
+	// silence approaches link_timeout. Default off => byte-identical; on => meaningful
+	// only when block-ACK is armed for data. Fresh controller (gate+N fixed at ctor).
+	{
+		set_env("MERCURY_L1_BLOCKACK", "1");
+		set_env("MERCURY_L1_BLOCKACK_N", "4");
+		cl_arq_controller* pcmd = new cl_arq_controller();
+		pcmd->telecom_system        = ts;
+		pcmd->role                  = COMMANDER;
+		pcmd->current_configuration = CONFIG_16;
+		pcmd->receiving_timeout     = 8000;   // representative cfg13-15 boundary window
+		pcmd->link_timeout          = 90000;  // the operative data-transfer link_timeout
+		pcmd->data_batch_size       = 4;      // >0 so l1_blockack_data_active() is live
+		pcmd->max_data_length       = 200;    // ample room for the N=4 aggregate
+		pcmd->max_header_length     = 10;
+		pcmd->l1_blockack.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		pcmd->l1_blockack.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+
+		// Gate LIVE + only-meaningful-when-armed.
+		clr_env("MERCURY_L1_BLOCKACK_PIPELINE");
+		check(!pcmd->l1_blockack_pipeline_active(),
+		      "stageR: pipeline knob OFF => inactive (byte-identical legacy path)");
+		set_env("MERCURY_L1_BLOCKACK_PIPELINE", "1");
+		check(pcmd->l1_blockack_pipeline_active(),
+		      "stageR: pipeline knob ON + block-ACK armed => active");
+
+		// Intermediate advance threshold: SHORT gap when pipelining, else the full
+		// receiving_timeout (the ~5x dead-air recovery).
+		pcmd->l1_blockack.note_transmitted_batch(20);   // batch 1/4 => intermediate
+		check(pcmd->l1_blockack.intermediate_silence_expected(),
+		      "stageR: batch 1/4 is an intermediate silence window");
+		unsigned int gap_on = pcmd->l1_pipeline_intermediate_advance_timeout();
+		clr_env("MERCURY_L1_BLOCKACK_PIPELINE");
+		unsigned int gap_off = pcmd->l1_pipeline_intermediate_advance_timeout();
+		check(gap_off == (unsigned int)pcmd->receiving_timeout
+		      && gap_on < gap_off && gap_on <= 500,
+		      "stageR: pipelined advance is a short gap; legacy is the full window");
+
+		// Time-based watchdog boundary bound. rt=8000, lt=90000 => trip at air+rt >=
+		// lt*3/5 => air >= 46000 ms. Below => no force; at/above => force. Boundary
+		// (Nth) batch is never forced (already the natural boundary).
+		set_env("MERCURY_L1_BLOCKACK_PIPELINE", "1");
+		check(!pcmd->l1_pipeline_watchdog_would_force(20000),
+		      "stageR watchdog: 20 s block air is well below the bound => no early force");
+		check(pcmd->l1_pipeline_watchdog_would_force(60000),
+		      "stageR watchdog: 60 s block air exceeds the bound => force early boundary");
+		check(pcmd->l1_pipeline_watchdog_would_force(46000)
+		      && !pcmd->l1_pipeline_watchdog_would_force(45999),
+		      "stageR watchdog: trip point is exactly (lt*NUM/DEN - rt)");
+		clr_env("MERCURY_L1_BLOCKACK_PIPELINE");
+		check(!pcmd->l1_pipeline_watchdog_would_force(60000),
+		      "stageR watchdog: pipeline OFF never forces (byte-identical)");
+		set_env("MERCURY_L1_BLOCKACK_PIPELINE", "1");
+
+		// Complete the block: the Nth batch closes the intermediate window and opens the
+		// ONE real receive window; the watchdog never forces at the boundary.
+		pcmd->l1_blockack.note_transmitted_batch(21);
+		pcmd->l1_blockack.note_transmitted_batch(22);
+		pcmd->l1_blockack.note_transmitted_batch(23);   // Nth => boundary
+		check(!pcmd->l1_blockack.intermediate_silence_expected()
+		      && pcmd->l1_blockack.aggregate_response_outstanding(),
+		      "stageR: Nth batch => boundary window (aggregate due), silence closed");
+		check(!pcmd->l1_pipeline_watchdog_would_force(80000),
+		      "stageR watchdog: at the boundary (not intermediate) the bound never fires");
+
+		// Site-1 escalation is UNAFFECTED by pipelining: sustained no-aggregate at the
+		// boundary still counts toward the emergency BREAK exactly as today (the pipeline
+		// knob does not touch l1_aggregate_defer_hold).
+		set_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS", "1");
+		pcmd->l1_aggregate_defer_streak = 0;
+		int p_held = 0;
+		for(int i = 0; i < L1_AGGREGATE_DEFER_MAX; ++i)
+			if(pcmd->l1_aggregate_defer_hold()) p_held++;
+		check(p_held == L1_AGGREGATE_DEFER_MAX && !pcmd->l1_aggregate_defer_hold(),
+		      "stageR: with pipelining the boundary escalation (site-1) is unchanged");
+		clr_env("MERCURY_DEMOTE_TEMPORAL_HYSTERESIS");
+
+		clr_env("MERCURY_L1_BLOCKACK_PIPELINE");
+		clr_env("MERCURY_L1_BLOCKACK");
+		clr_env("MERCURY_L1_BLOCKACK_N");
+		delete pcmd;
+	}
+
 	// (5c) LEAVING the band clears the verdict (load_configuration reset).
 	reset_state();
 	cmd->current_configuration = CONFIG_16;

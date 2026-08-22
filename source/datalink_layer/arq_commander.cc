@@ -38,6 +38,43 @@
 // MERCURY_TURN_TRACE (link-phase Step 1, MEASURE-ONLY): defined in arq_common.cc.
 // Emits one read-only trace line per CMD reverse-ACK turn; no-op when off.
 bool arq_turn_trace_on();
+
+// STAGE R (block-ACK pipelining, MERCURY_L1_BLOCKACK_PIPELINE): within a negotiated
+// block the intermediate 1..N-1 windows carry no reverse ACK (silence is the success
+// signal), so waiting a full receiving_timeout on each is dead air (~40-48% at
+// cfg13-15). With pipelining the commander drops PTT and listens only a SHORT gap
+// before advancing the forward burst; a real receive window opens only at the block
+// boundary where the aggregate BLOCK_SACK is actually due. Default off => the gap ms
+// is never consulted and the legacy full-window path runs byte-identically.
+static const unsigned int L1_BLOCKACK_PIPELINE_GAP_MS = 300;
+// Time-based watchdog boundary bound (the reverse-silence latent regime). With
+// pipelining reverse silence per block ~= block forward air + one boundary window.
+// To keep it below link_timeout by construction for ALL configs/N, force an early
+// boundary (via the existing tail-commit path) once (block forward air + the boundary
+// window it will need) reaches NUM/DEN of link_timeout. At 3/5 with the 30 s per-batch
+// airtime cap, worst-case reverse silence stays below (0.6*lt + 30 s) < lt whenever
+// lt >= 75 s (the operative data-transfer link_timeout is 90 s).
+static const long long L1_BLOCKACK_PIPELINE_WD_NUM = 3;
+static const long long L1_BLOCKACK_PIPELINE_WD_DEN = 5;
+
+// STAGE R decision helpers (single source of truth; unit-tested on a real
+// controller). The intermediate advance threshold: a SHORT gap when pipelining,
+// else the full receiving_timeout (byte-identical legacy path).
+unsigned int cl_arq_controller::l1_pipeline_intermediate_advance_timeout() const
+{
+	return l1_blockack_pipeline_active()
+		? L1_BLOCKACK_PIPELINE_GAP_MS : (unsigned int)receiving_timeout;
+}
+// The time-based watchdog boundary predicate: force an early block boundary when
+// the projected reverse silence (block forward air + the boundary window it will
+// need) reaches NUM/DEN of link_timeout. Only meaningful mid-block under pipelining.
+bool cl_arq_controller::l1_pipeline_watchdog_would_force(long long block_air_ms) const
+{
+	return l1_blockack_pipeline_active()
+		&& l1_blockack.intermediate_silence_expected()
+		&& (block_air_ms + (long long)receiving_timeout) * L1_BLOCKACK_PIPELINE_WD_DEN
+			>= (long long)link_timeout * L1_BLOCKACK_PIPELINE_WD_NUM;
+}
 void arq_turn_trace_emit_ack(const char* kind, unsigned bsi, int arrival_ms, int karn_ok);
 
 // SACK_RX_TRACE: env-gated diagnostic for the SACK_RSP receive path.
@@ -4081,15 +4118,30 @@ void cl_arq_controller::process_messages_tx_data()
 			cmd_batch_seq_id = (cmd_batch_seq_id + 1) & 0xFF;
 			if(l1_blockack_data_active())
 			{
+				// STAGE R accumulator: forward-burst airtime in the current block.
+				// Reset when a fresh block starts (before this batch neither silence
+				// window is open). Estimated as per-frame tx time * batch frame count.
+				if(!l1_blockack.intermediate_silence_expected()
+				   && !l1_blockack.aggregate_response_outstanding())
+					block_forward_air_ms = 0;
+				block_forward_air_ms += (long long)message_transmission_time_ms
+					* (long long)(data_batch_size > 0 ? data_batch_size : 1);
 				l1_blockack.note_transmitted_batch(l1_block_tx_bsi);
-				if(l1_block_tail_candidate
+				// Force the block boundary early when continuing to accumulate silence
+				// would push the reverse gap toward link_timeout (the watchdog contract).
+				// Pipeline-gated; legacy block-ACK leaves this false => byte-identical.
+				bool l1_pipeline_wd_boundary =
+					l1_pipeline_watchdog_would_force(block_forward_air_ms);
+				if((l1_block_tail_candidate || l1_pipeline_wd_boundary)
 				   && l1_blockack.intermediate_silence_expected())
 				{
 					std::vector<uint8_t> commit;
 					if(l1_blockack.build_tail_commit(&commit))
 					{
 						l1_send_block_control(commit);
-						printf("[L1-BLOCKACK-CMD] tail commit after bsi=%u\n",
+						printf(l1_pipeline_wd_boundary
+							? "[L1-BLOCKACK-PIPELINE] watchdog boundary forced bsi=%u\n"
+							: "[L1-BLOCKACK-CMD] tail commit after bsi=%u\n",
 							(unsigned)l1_block_tx_bsi);
 						fflush(stdout);
 					}
@@ -4182,6 +4234,14 @@ void cl_arq_controller::process_messages_tx_data()
 		printf("[CMD-POST-TX] receiving_timeout=%dms msg_tx_time=%dms batch=%d sack=%d\n",
 			receiving_timeout, message_transmission_time_ms, data_batch_size, sack_enabled ? 1 : 0);
 		fflush(stdout);
+		// STAGE R boundary witness: the ONE real receive window per block (the aggregate
+		// BLOCK_SACK is due). Distinct + countable vs the per-batch gap-advance witness.
+		if(l1_blockack_pipeline_active() && l1_blockack.aggregate_response_outstanding())
+		{
+			printf("[L1-BLOCKACK-PIPELINE] boundary window open cfg=%d timeout=%dms air=%lldms\n",
+				current_configuration, receiving_timeout, block_forward_air_ms);
+			fflush(stdout);
+		}
 		receiving_timer.start();
 	}
 }
@@ -5562,8 +5622,15 @@ void cl_arq_controller::process_messages_rx_acks_data()
 	// one-batch cache to the already-SENT journal owner and build the next BSI.
 	// No ACK counters, delivery flags, optimizer credit, or journal settlement
 	// are touched here; only a validated BLOCK_SACK can do those things.
+	// STAGE R: intermediate advance threshold is the FULL receiving_timeout on the
+	// legacy path (byte-identical) but only a SHORT gap under pipelining. The boundary
+	// window (aggregate_response_outstanding()) is UNCHANGED: intermediate_silence_
+	// expected() is false there, so this early advance never fires at the boundary and
+	// the site-1/site-3 escalation is untouched.
+	unsigned int intermediate_advance_timeout =
+		l1_pipeline_intermediate_advance_timeout();
 	if(l1_blockack.intermediate_silence_expected()
-	   && receiving_timer.get_elapsed_time_ms() >= receiving_timeout)
+	   && receiving_timer.get_elapsed_time_ms() >= intermediate_advance_timeout)
 	{
 		restore_sack_v2_rx_phy();
 		l1_release_current_batch_to_journal();
@@ -5571,8 +5638,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		receiving_timer.reset();
 		load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
 		connection_status = TRANSMITTING_DATA;
-		printf("[L1-BLOCKACK-CMD] silent intermediate window closed; "
-			"journal retains ownership, advancing forward burst\n");
+		if(l1_blockack_pipeline_active())
+			printf("[L1-BLOCKACK-PIPELINE] intermediate gap advance gap_ms=%u cfg=%d\n",
+				intermediate_advance_timeout, current_configuration);
+		else
+			printf("[L1-BLOCKACK-CMD] silent intermediate window closed; "
+				"journal retains ownership, advancing forward burst\n");
 		fflush(stdout);
 		return;
 	}

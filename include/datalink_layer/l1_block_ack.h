@@ -98,6 +98,7 @@ private:
 
 bool feature_gate_enabled();
 bool temporal_hysteresis_enabled();
+bool pipeline_enabled();
 uint8_t capability_advertise_bit();
 
 }  // namespace l1_block

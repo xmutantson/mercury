@@ -204,6 +204,14 @@ bool cl_arq_controller::l1_blockack_data_active() const
 	return available > 0 && needed <= (std::size_t)available;
 }
 
+// STAGE R pipeline gate: the short-gap intermediate advance and the time-based
+// watchdog boundary bound are meaningful ONLY when block-ACK is armed for data.
+// Reads MERCURY_L1_BLOCKACK_PIPELINE (default off => byte-identical legacy path).
+bool cl_arq_controller::l1_blockack_pipeline_active() const
+{
+	return l1_blockack_data_active() && l1_block::pipeline_enabled();
+}
+
 // LEVER P: normalize the PHY-published preamble geometry for ARQ ring/cursor
 // accounting. Zero is deliberate only while preamble amortization is active
 // (MINI0 tail); with amortization off it retains its legacy/uninitialized meaning
@@ -1263,6 +1271,7 @@ cl_arq_controller::cl_arq_controller()
 	topgear_below_floor_streak=0;
 	topgear_drop_streak=0;
 	l1_aggregate_defer_streak=0;
+	block_forward_air_ms=0;
 	emergency_ackmiss_defer_streak=0;
 	topgear_last_flat_state=8;
 	// Consume-race deferred report decode: nothing pending on a fresh controller.
