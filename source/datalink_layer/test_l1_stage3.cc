@@ -428,6 +428,104 @@ void pipeline_gate_and_roundtrip_identity() {
 	set_gate(false);
 }
 
+// STAGE F gearshift feed (MERCURY_L1_BLOCKACK_GEARFEED). The gate is LIVE +
+// exact-value, and dispatch_received_frame exposes the aggregate's per-batch
+// breakdown (last_applied_batches) that the commander replays into the
+// gearshift. The knob is COMMANDER-side and touches NO wire/RX state, so it does
+// not appear in this l1 layer beyond the gate + the exposure accessor.
+void gearfeed_gate_and_exposure() {
+	unsetenv("MERCURY_L1_BLOCKACK_GEARFEED");
+	CHECK(!l1_block::gearfeed_enabled(), "gearfeed gate OFF when unset");
+	setenv("MERCURY_L1_BLOCKACK_GEARFEED", "1", 1);
+	CHECK(l1_block::gearfeed_enabled(), "gearfeed gate ON at exact value 1");
+	setenv("MERCURY_L1_BLOCKACK_GEARFEED", "0", 1);
+	CHECK(!l1_block::gearfeed_enabled(), "gearfeed gate OFF at 0");
+	setenv("MERCURY_L1_BLOCKACK_GEARFEED", "2", 1);
+	CHECK(!l1_block::gearfeed_enabled(), "gearfeed gate OFF at non-1 value");
+	unsetenv("MERCURY_L1_BLOCKACK_GEARFEED");
+
+	set_gate(true, 4);
+	setenv("MERCURY_L1_JOURNAL", "1", 1);
+	mercury::L1TerminalQueue terminal;
+
+	// A CLEAN N=4 aggregate: last_applied_batches() reports 4 batches, each with
+	// acked_slots == span_slots (all delivered), and last_ack_all_received().
+	{
+		mercury::L1TxJournal journal(&terminal);
+		journal.begin_session(0x5a, 0x11223344u);
+		BlockAckRuntime responder;
+		responder.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		responder.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		std::vector<uint8_t> wire;
+		for(uint8_t bsi = 50; bsi < 54; ++bsi) {
+			std::vector<mercury::L1StageItem> items;
+			for(uint16_t slot = 0; slot < 2; ++slot) {
+				mercury::L1StageItem item;
+				item.slot = slot; item.batch_index = (uint16_t)(bsi - 50);
+				item.span = 2; item.plaintext.assign(1, (char)(bsi + slot));
+				items.push_back(item);
+			}
+			journal.stage_batch(bsi, items);
+			journal.mark_sent(bsi, 0);
+			journal.mark_sent(bsi, 1);
+			responder.observe_received_batch(bsi, std::vector<bool>{true, true},
+				bsi == 53, &wire);
+		}
+		BlockAckRuntime commander;
+		commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		l1_block::LegacyParserAckState state = {FREE, NONE, 0, 0};
+		commander.dispatch_received_frame(wire.data(), wire.size(), &state, &journal);
+		const std::vector<l1_block::PerBatchAck>& b = commander.last_applied_batches();
+		bool ok = commander.last_ack_all_received()
+			&& commander.last_ack_batch_count() == 4
+			&& b.size() == 4;
+		for(std::size_t i = 0; ok && i < b.size(); ++i)
+			ok = ok && b[i].bsi == (uint8_t)(50 + i)
+			     && b[i].span_slots == 2 && b[i].acked_slots == 2;
+		CHECK(ok, "clean aggregate exposes 4 per-batch entries, each acked==span");
+	}
+
+	// A PARTIAL aggregate: one slot missing in the 2nd batch => that entry reports
+	// acked_slots < span_slots and last_ack_all_received() is false (the commander
+	// DROPs such an aggregate in production; the per-batch truth is still exact).
+	{
+		mercury::L1TxJournal journal(&terminal);
+		journal.begin_session(0x5a, 0x11223344u);
+		BlockAckRuntime responder;
+		responder.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		responder.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		std::vector<uint8_t> wire;
+		for(uint8_t bsi = 60; bsi < 62; ++bsi) {
+			std::vector<mercury::L1StageItem> items;
+			for(uint16_t slot = 0; slot < 2; ++slot) {
+				mercury::L1StageItem item;
+				item.slot = slot; item.batch_index = (uint16_t)(bsi - 60);
+				item.span = 2; item.plaintext.assign(1, (char)(bsi + slot));
+				items.push_back(item);
+			}
+			journal.stage_batch(bsi, items);
+			journal.mark_sent(bsi, 0);
+			journal.mark_sent(bsi, 1);
+			std::vector<bool> got = (bsi == 61)
+				? std::vector<bool>{true, false} : std::vector<bool>{true, true};
+			responder.observe_received_batch(bsi, got, bsi == 61, &wire);
+		}
+		BlockAckRuntime commander;
+		commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		l1_block::LegacyParserAckState state = {FREE, NONE, 0, 0};
+		commander.dispatch_received_frame(wire.data(), wire.size(), &state, &journal);
+		const std::vector<l1_block::PerBatchAck>& b = commander.last_applied_batches();
+		bool ok = !commander.last_ack_all_received() && b.size() == 2
+			&& b[0].acked_slots == 2 && b[1].span_slots == 2 && b[1].acked_slots == 1;
+		CHECK(ok, "partial aggregate exposes the under-delivered batch (acked<span, not all-received)");
+	}
+
+	unsetenv("MERCURY_L1_JOURNAL");
+	set_gate(false);
+}
+
 }  // namespace
 
 int main() {
@@ -438,6 +536,7 @@ int main() {
 	lost_aggregate_replay();
 	gate_off_byte_identity();
 	pipeline_gate_and_roundtrip_identity();
+	gearfeed_gate_and_exposure();
 	std::printf("L1 Stage-3: %s (%d failures)\n",
 		failures ? "FAIL" : "PASS", failures);
 	return failures ? 1 : 0;

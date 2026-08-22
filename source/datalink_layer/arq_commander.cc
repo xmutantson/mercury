@@ -6802,6 +6802,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// batch path). The gap between this and cmd_batch_tx_start is
 				// "prep + PTT-on + audio buffer fill" — i.e., what the user
 				// identified as the 407ms prep gap to drill into.
+				// [L1-GEARFEED] feed the gearshift the N-1 silent intermediate batches
+				// of this aggregate (ladder clean-rate + Axis-2/3 + optimizer ring).
+				l1_gearfeed_replay_intermediate();
 				mtl::log_event("cmd_ack_post_work_done");
 
 				if(messages_control.data[0]==REPEAT_LAST_ACK &&
@@ -8065,6 +8068,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				{
 					clean_batches_at_current_config++;
 				}
+				// [L1-GEARFEED] credit the N-1 silent intermediate batches to the
+				// sustained-anchor streak so a clean block seats the anchor as N
+				// per-batch clean batches would (0 off/unarmed/not-all-received).
+				clean_batches_at_current_config += l1_gearfeed_extra_batches();
 				// Option B (data-anchored promotion): a DATA batch was confirmed
 				// FULLY delivered at this config. Record it as the highest data-viable
 				// rung — anchors BREAK recovery (arq_commander.cc:81) and the
@@ -8332,6 +8339,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			!optimizer_owns_upward_frame)
 		{
 			consecutive_data_acks++;
+			// [L1-GEARFEED] credit the N-1 silent intermediate batches to the
+			// FRAME-UP streak so a clean block advances the climb as N per-batch
+			// clean batches would (0 off/unarmed/not-all-received).
+			consecutive_data_acks += l1_gearfeed_extra_batches();
 			// ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, Option 3,
 			// climb follow-up ③): step up FASTER when the channel is PROVEN
 			// sustained-clean at this rung, conservative when marginal. The EFFECTIVE
@@ -10733,6 +10744,80 @@ void cl_arq_controller::process_control_commander()
 
 // Shared BLOCK_END state transitions: reset block, flush backup, stats, gearshift.
 // Called from both explicit BLOCK_END ACK handler and implicit path (batch_size==1).
+// ---------------------------------------------------------------------------
+// Block-ACK gearshift feed (MERCURY_L1_BLOCKACK_GEARFEED). Under block-ACK the
+// responder returns ONE aggregate BLOCK_SACK per N forward batches, so the
+// commander sees a single clean-ACK pass for a whole block. The gearshift climb
+// feeds on PER-BATCH evidence -- the FRAME-UP consecutive_data_acks streak, the
+// sustained-anchor clean_batches_at_current_config streak, the block-level clean
+// rate (last_transmission_block_stats), and the Axis-2/3 controllers -- so a
+// block collapses N batches into ONE observation and the climb starves at ~1/N
+// its rate: armed cells cap at cfg15. This feed reconstructs the N-1 SILENT
+// intermediate batches' evidence at aggregate-apply time so the optimizer ends
+// each block in the state N per-batch responses would have produced.
+//
+// A partial aggregate DROPs the session at both apply sites, so an APPLIED
+// aggregate that reaches the climb path is all-clean (every covered batch fully
+// delivered); the intermediate batches are therefore replayed as clean. The
+// gate returns 0 unless the feed is armed AND the aggregate was all-received, so
+// a degraded aggregate (which never reaches here in production) yields no climb
+// credit -- the protection direction holds by construction. Off, every consumer
+// adds 0 / runs 0 iterations => byte-identical.
+int cl_arq_controller::l1_gearfeed_extra_batches() const
+{
+	if(!l1_block::gearfeed_enabled() || !l1_blockack.enabled()
+	   || !l1_blockack.last_ack_all_received())
+		return 0;
+	const std::size_t n = l1_blockack.last_ack_batch_count();
+	return (n >= 2) ? (int)(n - 1) : 0;
+}
+
+void cl_arq_controller::l1_gearfeed_replay_intermediate()
+{
+	if(l1_gearfeed_extra_batches() <= 0)
+		return;
+	// Replay the SILENT intermediate batches from the aggregate's actual
+	// per-batch breakdown, in transmit order. The clean-ACK funnel already
+	// contributed the boundary (last) batch's evidence, so replay batches
+	// 0..n-2. Each batch is credited clean/partial from its own acked/span (an
+	// applied aggregate is all-clean today, since a partial DROPs; carrying the
+	// per-batch truth keeps this correct if that policy ever changes).
+	// Per-batch delivered bytes and per-batch wire_ms do not ride the aggregate,
+	// so replayed optimizer-ring slots carry 0 for both: they advance the window
+	// sample count and the clean/no-SACK classification (what the effective-rate
+	// optimizer's climb gate reads) WITHOUT perturbing the throughput estimate,
+	// which excludes never-back-filled slots by construction (opt_record_batch).
+	// The bias is neutral on the climb gate; the optimizer is additionally inert
+	// unless a rate table is loaded.
+	const std::vector<l1_block::PerBatchAck>& batches =
+		l1_blockack.last_applied_batches();
+	int replayed = 0;
+	for(std::size_t i = 0; i + 1 < batches.size(); ++i)
+	{
+		const l1_block::PerBatchAck& b = batches[i];
+		const bool clean = (b.acked_slots >= b.span_slots);
+		last_transmission_block_stats.nBatches_acked++;
+		if(clean)
+			last_transmission_block_stats.nBatches_fully_acked++;
+		opt_record_batch(0u, /*sack_used=*/!clean, /*failed=*/false);
+		{
+			int rec = current_configuration;
+			if(opt_evaluate_batch_end(&rec))
+				opt_pending_switch_cfg = rec;
+		}
+		if(sack_v2_enabled)
+		{
+			policy_evaluate_axis2((int)b.acked_slots, (int)b.span_slots);
+			axis3_batch_tick();
+		}
+		replayed++;
+	}
+	printf("[L1-GEARFEED] replayed intermediate batches=%d block_batches=%zu cfg=%d\n",
+		replayed, batches.size(), current_configuration);
+	fflush(stdout);
+}
+
+
 void cl_arq_controller::finalize_block_commander()
 {
 	for(int i=0;i<this->nMessages;i++)

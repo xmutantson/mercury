@@ -19,6 +19,19 @@ enum class DispatchDisposition {
 	INVALID
 };
 
+// Per-batch delivery summary extracted from a decoded aggregate BLOCK_SACK.
+// One entry per batch the aggregate covered, in transmit order. span_slots is
+// the batch's frame count; acked_slots is how many of those frames the
+// receiver reported delivered. The commander uses this to reconstruct, at
+// aggregate-apply time, the per-batch climb evidence the optimizer would have
+// received from N individual SACK/ACK responses (the block-ACK aggregate
+// otherwise collapses N batches into a single optimizer observation).
+struct PerBatchAck {
+	uint8_t bsi;
+	uint16_t span_slots;
+	uint16_t acked_slots;
+};
+
 // Session-scoped Stage-3 policy and wire dispatcher. All enablement is derived
 // from the process gate plus authenticated handshake bytes; callers cannot
 // force the negotiated state directly.
@@ -39,6 +52,12 @@ public:
 	bool last_ack_all_received() const { return last_ack_all_received_; }
 	std::size_t last_ack_batch_count() const { return last_ack_batch_count_; }
 	std::size_t last_ack_slot_count() const { return last_ack_slot_count_; }
+	// Per-batch breakdown of the most recently applied aggregate (transmit
+	// order). Populated by dispatch_received_frame on every decoded aggregate;
+	// read only by the commander's gearshift-feed replay (gearfeed_enabled()).
+	const std::vector<PerBatchAck>& last_applied_batches() const {
+		return last_applied_batches_;
+	}
 
 	// Commander-side burst ownership. A new batch remains journal-owned while
 	// the short inter-batch receive window is silent. The Nth batch, or a tail
@@ -87,6 +106,7 @@ private:
 	bool last_ack_all_received_;
 	std::size_t last_ack_batch_count_;
 	std::size_t last_ack_slot_count_;
+	std::vector<PerBatchAck> last_applied_batches_;
 	uint8_t tx_pending_start_bsi_;
 	uint8_t tx_pending_batches_;
 	bool tx_tail_commit_sent_;
@@ -99,6 +119,11 @@ private:
 bool feature_gate_enabled();
 bool temporal_hysteresis_enabled();
 bool pipeline_enabled();
+// Commander-side gearshift-feed of aggregate BLOCK_SACK contents. Default off;
+// "1" only. Meaningful only when block-ACK is armed for data. When on, the
+// commander replays per-batch climb evidence at aggregate-apply time so the
+// optimizer is not starved between aggregates.
+bool gearfeed_enabled();
 uint8_t capability_advertise_bit();
 
 }  // namespace l1_block

@@ -1414,6 +1414,138 @@ int cl_arq_controller::test_topgear_clean_election()
 		delete pcmd;
 	}
 
+	// (5b.5) STAGE F block-ACK gearshift feed (MERCURY_L1_BLOCKACK_GEARFEED). A
+	// clean aggregate covers N=4 forward batches but reaches the commander as ONE
+	// clean-ACK pass, so the per-batch climb streaks advance +1 instead of +N and
+	// armed cells cap at cfg15. The feed credits the N-1 SILENT intermediate
+	// batches at aggregate-apply time. Default off => extra_batches()==0 => every
+	// consumer adds 0 (byte-identical). Fresh controller; a clean N=4 aggregate is
+	// dispatched into its l1_blockack via the production wire path.
+	{
+		set_env("MERCURY_L1_BLOCKACK", "1");
+		set_env("MERCURY_L1_BLOCKACK_N", "4");
+		set_env("MERCURY_L1_JOURNAL", "1");
+		cl_arq_controller* pcmd = new cl_arq_controller();
+		pcmd->telecom_system        = ts;
+		pcmd->role                  = COMMANDER;
+		pcmd->current_configuration = CONFIG_13;   // an OFDM rung armed cells run
+		pcmd->data_batch_size       = 2;
+		pcmd->sack_v2_enabled       = YES;
+		pcmd->l1_blockack.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		pcmd->l1_blockack.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+
+		// Build + apply a CLEAN N=4 aggregate (all slots delivered) through the
+		// production dispatch path so last_ack_*/last_applied_batches are set
+		// exactly as a live receive would set them.
+		mercury::L1TerminalQueue terminal;
+		mercury::L1TxJournal journal(&terminal);
+		journal.begin_session(0x5a, 0x11223344u);
+		l1_block::BlockAckRuntime responder;
+		responder.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		responder.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		std::vector<uint8_t> wire;
+		for(uint8_t bsi = 70; bsi < 74; ++bsi) {
+			std::vector<mercury::L1StageItem> items;
+			for(uint16_t slot = 0; slot < 2; ++slot) {
+				mercury::L1StageItem item;
+				item.slot = slot; item.batch_index = (uint16_t)(bsi - 70);
+				item.span = 2; item.plaintext.assign(1, (char)(bsi + slot));
+				items.push_back(item);
+			}
+			journal.stage_batch(bsi, items);
+			journal.mark_sent(bsi, 0);
+			journal.mark_sent(bsi, 1);
+			responder.observe_received_batch(bsi, std::vector<bool>{true, true},
+				bsi == 73, &wire);
+		}
+		l1_block::LegacyParserAckState st = {FREE, NONE, 0, 0};
+		pcmd->l1_blockack.dispatch_received_frame(wire.data(), wire.size(),
+			&st, &journal);
+		check(pcmd->l1_blockack.last_ack_all_received()
+		      && pcmd->l1_blockack.last_ack_batch_count() == 4,
+		      "stageF: clean N=4 aggregate applied (all-received, 4 batches)");
+
+		// Gate LIVE + only-meaningful-when-armed-and-all-received.
+		clr_env("MERCURY_L1_BLOCKACK_GEARFEED");
+		check(pcmd->l1_gearfeed_extra_batches() == 0,
+		      "stageF: feed OFF => extra_batches()==0 (byte-identical, no credit)");
+		set_env("MERCURY_L1_BLOCKACK_GEARFEED", "1");
+		check(pcmd->l1_gearfeed_extra_batches() == 3,
+		      "stageF: feed ON + clean N=4 aggregate => credit N-1 = 3 intermediate batches");
+
+		// FAIL-BEFORE / PASS-AFTER climb (FRAME-UP streak). The clean-ACK funnel
+		// contributes the boundary batch (+1). frame_shift_threshold base is 3, so
+		// one aggregate-pass (streak 1) is BELOW the gate => capped; the feed lifts
+		// the streak to N=4 >= 3 => FRAME-UP fires (climb).
+		int base_threshold = pcmd->frame_shift_threshold;
+		clr_env("MERCURY_L1_BLOCKACK_GEARFEED");
+		pcmd->consecutive_data_acks = 0;
+		pcmd->consecutive_data_acks += 1;                              // funnel boundary batch
+		pcmd->consecutive_data_acks += pcmd->l1_gearfeed_extra_batches();
+		bool capped_off = (pcmd->consecutive_data_acks < base_threshold);
+		set_env("MERCURY_L1_BLOCKACK_GEARFEED", "1");
+		pcmd->consecutive_data_acks = 0;
+		pcmd->consecutive_data_acks += 1;                              // funnel boundary batch
+		pcmd->consecutive_data_acks += pcmd->l1_gearfeed_extra_batches();
+		bool climbs_on = (pcmd->consecutive_data_acks >= base_threshold);
+		check(capped_off && climbs_on && base_threshold == 3,
+		      "stageF: fail-before capped (streak 1<3); pass-after climbs (streak 4>=3)");
+
+		// Ladder clean-rate: replay_intermediate() credits the N-1 intermediate
+		// batches to the block clean count (nBatches_fully_acked), lifting the
+		// clean rate from ~1/N toward N/N. OFF => no credit.
+		set_env("MERCURY_L1_BLOCKACK_GEARFEED", "1");
+		pcmd->last_transmission_block_stats.nBatches_fully_acked = 0;
+		pcmd->last_transmission_block_stats.nBatches_acked = 0;
+		pcmd->l1_gearfeed_replay_intermediate();
+		int fully_on = pcmd->last_transmission_block_stats.nBatches_fully_acked;
+		clr_env("MERCURY_L1_BLOCKACK_GEARFEED");
+		pcmd->last_transmission_block_stats.nBatches_fully_acked = 0;
+		pcmd->last_transmission_block_stats.nBatches_acked = 0;
+		pcmd->l1_gearfeed_replay_intermediate();
+		int fully_off = pcmd->last_transmission_block_stats.nBatches_fully_acked;
+		check(fully_on == 3 && fully_off == 0,
+		      "stageF: replay credits ladder clean count by N-1 on (3), 0 off (byte-identical)");
+
+		// PROTECTION direction: a DEGRADED (not-all-received) aggregate yields NO
+		// climb credit even with the feed ON (extra_batches() gates on all-received;
+		// in production such an aggregate DROPs before reaching the feed).
+		mercury::L1TxJournal pj(&terminal);
+		pj.begin_session(0x5a, 0x11223344u);
+		l1_block::BlockAckRuntime presp;
+		presp.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+		presp.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		std::vector<uint8_t> pwire;
+		for(uint8_t bsi = 80; bsi < 82; ++bsi) {
+			std::vector<mercury::L1StageItem> items;
+			for(uint16_t slot = 0; slot < 2; ++slot) {
+				mercury::L1StageItem item;
+				item.slot = slot; item.batch_index = (uint16_t)(bsi - 80);
+				item.span = 2; item.plaintext.assign(1, (char)(bsi + slot));
+				items.push_back(item);
+			}
+			pj.stage_batch(bsi, items);
+			pj.mark_sent(bsi, 0);
+			pj.mark_sent(bsi, 1);
+			std::vector<bool> got = (bsi == 81)
+				? std::vector<bool>{true, false} : std::vector<bool>{true, true};
+			presp.observe_received_batch(bsi, got, bsi == 81, &pwire);
+		}
+		l1_block::LegacyParserAckState pst = {FREE, NONE, 0, 0};
+		pcmd->l1_blockack.dispatch_received_frame(pwire.data(), pwire.size(),
+			&pst, &pj);
+		set_env("MERCURY_L1_BLOCKACK_GEARFEED", "1");
+		check(!pcmd->l1_blockack.last_ack_all_received()
+		      && pcmd->l1_gearfeed_extra_batches() == 0,
+		      "stageF: degraded aggregate => extra_batches()==0 (protection: no climb credit)");
+
+		clr_env("MERCURY_L1_BLOCKACK_GEARFEED");
+		clr_env("MERCURY_L1_JOURNAL");
+		clr_env("MERCURY_L1_BLOCKACK");
+		clr_env("MERCURY_L1_BLOCKACK_N");
+		delete pcmd;
+	}
+
 	// (5c) LEAVING the band clears the verdict (load_configuration reset).
 	reset_state();
 	cmd->current_configuration = CONFIG_16;

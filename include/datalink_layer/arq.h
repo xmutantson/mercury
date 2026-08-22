@@ -532,6 +532,14 @@ public:
   bool l1_blockack_pipeline_active() const;
   unsigned int l1_pipeline_intermediate_advance_timeout() const;
   bool l1_pipeline_watchdog_would_force(long long block_air_ms) const;
+  // Block-ACK gearshift feed (MERCURY_L1_BLOCKACK_GEARFEED, default off).
+  // extra_batches() returns N-1 (the silent intermediate batches of the most
+  // recently applied all-received aggregate) when the feed is armed, else 0 --
+  // so the streak-credit consumers add 0 and are byte-identical off.
+  // replay_intermediate() replays those N-1 batches' clean evidence into the
+  // ladder / Axis-2/3 / optimizer ring at aggregate-apply time.
+  int l1_gearfeed_extra_batches() const;
+  void l1_gearfeed_replay_intermediate();
   long long l1_send_block_control(const std::vector<uint8_t>& wire);
   void l1_release_current_batch_to_journal();
   bool l1_stage_batch_before_tx();

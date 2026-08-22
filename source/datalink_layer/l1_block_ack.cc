@@ -50,6 +50,11 @@ bool pipeline_enabled() {
 	return value && std::strcmp(value, "1") == 0;
 }
 
+bool gearfeed_enabled() {
+	const char* value = std::getenv("MERCURY_L1_BLOCKACK_GEARFEED");
+	return value && std::strcmp(value, "1") == 0;
+}
+
 uint8_t capability_advertise_bit() {
 	return feature_gate_enabled() ? (uint8_t)CAP_L1_BLOCKACK : (uint8_t)0;
 }
@@ -89,6 +94,7 @@ void BlockAckRuntime::begin_session(uint8_t connection, uint32_t session,
 	last_ack_all_received_ = false;
 	last_ack_batch_count_ = 0;
 	last_ack_slot_count_ = 0;
+	last_applied_batches_.clear();
 	tx_pending_start_bsi_ = 0;
 	tx_pending_batches_ = 0;
 	tx_tail_commit_sent_ = false;
@@ -239,13 +245,20 @@ DispatchDisposition BlockAckRuntime::dispatch_received_frame(
 		return DispatchDisposition::INVALID;
 
 	std::vector<std::pair<uint8_t, uint16_t> > keys;
+	last_applied_batches_.clear();
+	last_applied_batches_.reserve(decoded.value.batches.size());
 	for(std::size_t batch = 0; batch < decoded.value.batches.size(); ++batch) {
 		const BatchEntry& entry = decoded.value.batches[batch];
+		uint16_t acked_in_batch = 0;
 		for(uint16_t slot = 0; slot < entry.span_slots; ++slot) {
 			const uint16_t bit = (uint16_t)(entry.bitmap_offset_bits + slot);
-			if(bitmap_bit(decoded.value.bitmap, bit))
+			if(bitmap_bit(decoded.value.bitmap, bit)) {
 				keys.push_back(std::make_pair(entry.bsi, slot));
+				++acked_in_batch;
+			}
 		}
+		PerBatchAck summary = {entry.bsi, entry.span_slots, acked_in_batch};
+		last_applied_batches_.push_back(summary);
 	}
 	last_ack_all_received_ = keys.size() == decoded.value.bitmap_width_bits;
 	last_ack_batch_count_ = decoded.value.batches.size();
