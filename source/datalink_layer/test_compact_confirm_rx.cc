@@ -234,6 +234,17 @@ int cl_arq_controller::test_compact_confirm_live_rx_path()
 	// deterministic all-ones target that matches the ACK+SACK frame we synthesize.
 	// 30 is the WB <=30-bit invariant ceiling.
 	cmd->data_batch_size = 30;
+	cmd->nMessages = cmd->data_batch_size;
+	cmd->max_data_length = 170;
+	cmd->max_header_length = 6;
+	cmd->max_message_length = 200;
+	ctx.check(cmd->init_messages_buffers() == SUCCESSFUL,
+		"A2 fixture stages an owned generation for compact validation");
+	for(int i=0; i<cmd->data_batch_size; i++) {
+		cmd->messages_tx[i].status = PENDING_ACK;
+		cmd->messages_tx[i].length = 1;
+		cmd->messages_tx[i].batch_seq_id = bsi;
+	}
 	const uint32_t clean_bitmap = mfsk_sack_mask_for_frames(cmd->data_batch_size);
 
 	// --- Generate the compact-confirm passband (16 base + 10 suffix = 26 sym) ---
@@ -534,6 +545,17 @@ int cl_arq_controller::test_compact_confirm_sack_window_rx_path()
 	const uint8_t bsi = 0x2A;
 	cmd->cmd_batch_seq_id = bsi;
 	cmd->data_batch_size = 8;                 // batch>1 (the regression scope)
+	cmd->nMessages = cmd->data_batch_size;
+	cmd->max_data_length = 170;
+	cmd->max_header_length = 6;
+	cmd->max_message_length = 200;
+	ctx.check(cmd->init_messages_buffers() == SUCCESSFUL,
+		"A2 fixture stages an owned generation for compact validation");
+	for(int i=0; i<cmd->data_batch_size; i++) {
+		cmd->messages_tx[i].status = PENDING_ACK;
+		cmd->messages_tx[i].length = 1;
+		cmd->messages_tx[i].batch_seq_id = bsi;
+	}
 	cmd->cmd_last_applied_clean_bsi = -1;     // nothing applied yet
 	cmd->cmd_last_applied_sack_bsi  = -1;
 	const uint32_t clean_bitmap = mfsk_sack_mask_for_frames(cmd->data_batch_size);

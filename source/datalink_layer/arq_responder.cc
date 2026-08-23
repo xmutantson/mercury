@@ -1717,11 +1717,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 									if(scalable_sack_on()
 									   && telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0)
 									{
-										mfsk_ms = send_mfsk_compact_confirm(wire_bsi);
+										mfsk_ms = send_mfsk_compact_confirm(prev_ack_bsi);
 										compact_sent = mfsk_ms > 0;
 									}
 									if(mfsk_ms <= 0)
-										mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+										mfsk_ms = send_mfsk_ack_sack(prev_ack_bsi, bitmap_u32);
 									if (mfsk_ms > 0)
 									{
 										printf("[TX-ACK-SACK] prev-delivered via %s wire_ms=%lld\n",
@@ -2931,6 +2931,13 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							// paths must transmit the PARTIAL batch's bsi
 							// (= pre-bump value), not the new current_expected.
 							unsigned char sacked_bsi = bsi;
+#if !defined(NDEBUG) && defined(MERCURY_GEN_CANON_ASSERT)
+							for(int i=0; i<eff_window && i<nMessages; i++)
+								if(messages_rx[i].status == RECEIVED
+								   && messages_rx[i].batch_seq_id >= 0
+								   && (messages_rx[i].batch_seq_id & 0xFF) != sacked_bsi)
+									std::abort();
+#endif
 							bump_bsi_and_transfer_prev();
 
 							// MFSK-suffix ACK+SACK — WB-only (suffix_len()>0).
@@ -2960,15 +2967,9 @@ void cl_arq_controller::process_messages_acknowledging_data()
 									if (sack_bitmap[i])
 										bitmap_u32 |= (1u << i);
 								}
-								// FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md
-								// §T2.0/§T2.3): when the cumulative cap is negotiated, the bsi FIELD
-								// carries n_r (the contiguous delivery high-water,
-								// rsp_last_delivered_batch_seq_id) instead of the partial batch's bsi.
-								// The 30-bit bitmap is UNCHANGED — it still describes the in-flight
-								// PARTIAL batch, which in Mercury's stop-and-wait is exactly the
-								// contiguous successor n_r+1 (the CMD applies the bitmap by SLOT INDEX
-								// to its current messages_tx[], independent of the bsi value). Default-
-								// off ⇒ field == sacked_bsi (byte-identical).
+									// A2: sacked_bsi is the bitmap source/target. The encoder below derives
+									// wire=target-1 in negotiated cumulative mode (mod 256), or wire=target
+									// in per-batch mode. No producer supplies a pre-shaped/high-water octet.
 								unsigned char wire_bsi = cumulative_ack_bsi_field(
 									sacked_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
 								printf("[RSP-MFSK-SACK] partial path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
@@ -2980,7 +2981,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 								// CMD will retransmit -> THIS is the retransmit turnaround the drift slip rides
 								// on -> arm the D2 robust reverse-ACK geometry (settle) for this ACK.
 								ack_tx_retx_turnaround = true;
-								long long mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+								long long mfsk_ms = send_mfsk_ack_sack(sacked_bsi, bitmap_u32);
 								if (mfsk_ms > 0)
 								{
 									printf("[TX-ACK-SACK] partial via MFSK suffix wire_ms=%lld\n",
@@ -2996,11 +2997,8 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							}
 							if (!used_mfsk_path)
 							{
-								// FORGIVING-ACK Tier 2: same bsi-field reshape on the OFDM SACK_RSP
-								// transport (n_r in the field when negotiated; bitmap unchanged).
-								unsigned char wire_bsi = cumulative_ack_bsi_field(
-									sacked_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
-								send_sack_v2_frame(sack_bitmap, eff_window, wire_bsi);   // Option B' (§9)
+									// Same target-owned encoder rule on the OFDM SACK_RSP transport.
+								send_sack_v2_frame(sack_bitmap, eff_window, sacked_bsi);   // Option B' (§9)
 							}
 						}
 					}
@@ -3404,11 +3402,9 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				// Phase B Wave 1 flag-day (fact-doc §11.2): bitmap is 30 bits
 				// (was 32). Producer side cap so we never set bits 30/31.
 				uint32_t bitmap_u32 = mfsk_sack_mask_for_frames(eff_window);
-				// FORGIVING-ACK Tier 2 (§T2.0/§T2.3): the clean-ACK bsi field carries n_r
-				// (the contiguous delivery high-water) when negotiated. THE SELF-HEAL: if an
-				// EARLIER clean ACK was missed, the high-water is now AHEAD of this batch's
-				// own bsi, so n_r retroactively confirms the earlier batch FOR FREE on this
-				// turnaround. The all-ones bitmap is unchanged. Default-off ⇒ field == ack_bsi.
+					// A2: ack_bsi is the delivered clean target. The encoder derives
+					// wire=target-1 in cumulative mode; the implicit/all-ones result credits
+					// target only after the commander resolves and validates that identity.
 				unsigned char wire_bsi = cumulative_ack_bsi_field(
 					ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
 				printf("[RSP-MFSK-SACK] clean path: batch_seq_id=%u (wire_bsi=%u n_r=%d cum=%d) bitmap=0x%08x nframes=%d\n",
@@ -3431,7 +3427,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					&& telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0
 					&& (!cumulative_ack_enabled || scalable_sack_on()))
 				{
-					mfsk_ms = send_mfsk_compact_confirm(wire_bsi);
+					mfsk_ms = send_mfsk_compact_confirm(ack_bsi);
 					if (mfsk_ms > 0)
 					{
 						printf("[TX-ACK-SACK] clean via COMPACT confirm wire_ms=%lld\n", mfsk_ms);
@@ -3441,7 +3437,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				}
 				if (!used_mfsk_path)
 				{
-					mfsk_ms = send_mfsk_ack_sack(wire_bsi, bitmap_u32);
+					mfsk_ms = send_mfsk_ack_sack(ack_bsi, bitmap_u32);
 				}
 				if (mfsk_ms > 0)
 				{
@@ -13982,19 +13978,19 @@ int cl_arq_controller::test_held_cur_deliver_fire()
 	this->rsp_last_delivered_batch_seq_id = N;
 	unsigned char prev_only_wire_bsi = cumulative_ack_bsi_field(
 		(unsigned char)N, this->rsp_last_delivered_batch_seq_id, /*cap_on=*/true);
-	ck(prev_only_wire_bsi == (unsigned char)N,
-		"PART C PREV-ONLY: clean confirm identifies the delivered previous batch");
+	ck(prev_only_wire_bsi == (unsigned char)((N - 1) & 0xFF),
+		"PART C PREV-ONLY: clean confirm wire is target-1");
 
 	this->rsp_last_delivered_batch_seq_id = NP1;
 	unsigned char held_wire_bsi = cumulative_ack_bsi_field(
 		(unsigned char)N, this->rsp_last_delivered_batch_seq_id, /*cap_on=*/true);
-	ck(held_wire_bsi == (unsigned char)NP1,
-		"PART C HELD-CUR: cumulative clean confirm covers the delivered held current batch");
+	ck(held_wire_bsi == (unsigned char)((N - 1) & 0xFF),
+		"PART C HELD-CUR: bitmap target, not unrelated high-water, owns wire identity");
 
 	unsigned char wrap_wire_bsi = cumulative_ack_bsi_field(
-		(unsigned char)255, /*high_water=*/0, /*cap_on=*/true);
-	ck(wrap_wire_bsi == (unsigned char)0,
-		"PART C WRAP: cumulative clean-confirm identity is correct across 255->0");
+		(unsigned char)0, /*high_water ignored=*/0, /*cap_on=*/true);
+	ck(wrap_wire_bsi == (unsigned char)255,
+		"PART C WRAP: target 0 encodes as wire 255");
 
 	printf("%s %s (fails=%d) — the RSP deliver-held-cur commit pushes the held "
 		"batch's bytes to the app FIFO, the CMD credits the recovery round, and "

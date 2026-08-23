@@ -2117,9 +2117,9 @@ bool cl_arq_controller::linkphase_defer_prev_ack(bool ackslot_active,
 	return !proven_retx_tail;
 }
 
-// SEAM-2 — does a just-emitted cumulative high-water n_r cover the armed pending prev
-// bsi? The pending bsi is itself a cumulative n_r captured when the prev batch delivered,
-// so a later emitted n_r that is at-or-above it retires the deferred confirm for free.
+// SEAM-2 — does a just-emitted cumulative prefix cover the armed pending target?
+// A later target's wire prefix that reaches the pending generation retires the
+// deferred confirmation for free.
 // per_batch_in_window is passed FALSE so a covers-clear is only ever a genuine cumulative
 // confirm (never a per-batch bsi coincidence); when the cap is off this returns false and
 // the pending must be flushed explicitly at the RX-timeout boundary instead. Wrap-safe.
@@ -2143,11 +2143,10 @@ void cl_arq_controller::linkphase_arm_pending_prev_confirm(unsigned char prev_ac
 	if(!pending_confirm_defeat)
 	{
 		linkphase_pending_prev_confirm = true;
-		linkphase_pending_prev_bsi = (int)cumulative_ack_bsi_field(
-			prev_ack_bsi, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+		linkphase_pending_prev_bsi = (int)(prev_ack_bsi & 0xFF);
 		linkphase_pending_prev_window = prev_eff_window;
 		printf("[LINKPHASE-PENDING-ARM] deferred prev clean-confirm armed: "
-			"n_r=%d window=%d last_delivered=%d\n",
+			"target=%d window=%d last_delivered=%d\n",
 			linkphase_pending_prev_bsi, linkphase_pending_prev_window,
 			rsp_last_delivered_batch_seq_id);
 		fflush(stdout);
@@ -2156,7 +2155,7 @@ void cl_arq_controller::linkphase_arm_pending_prev_confirm(unsigned char prev_ac
 
 void cl_arq_controller::linkphase_flush_pending_prev_confirm()
 {
-	unsigned char flush_bsi = (unsigned char)(
+	unsigned char flush_target = (unsigned char)(
 		linkphase_pending_prev_bsi >= 0 ? linkphase_pending_prev_bsi : 0);
 	ack_tx_retx_turnaround = true;   // retransmit turnaround: arm the D2 settle
 	long long mfsk_ms = 0;
@@ -2164,7 +2163,7 @@ void cl_arq_controller::linkphase_flush_pending_prev_confirm()
 	if(scalable_sack_on()
 	   && telecom_system->ack_mfsk.compact_confirm_suffix_len() > 0)
 	{
-		mfsk_ms = send_mfsk_compact_confirm(flush_bsi);
+		mfsk_ms = send_mfsk_compact_confirm(flush_target);
 		compact_sent = mfsk_ms > 0;
 	}
 	if(mfsk_ms <= 0
@@ -2173,11 +2172,11 @@ void cl_arq_controller::linkphase_flush_pending_prev_confirm()
 	{
 		int wnd = linkphase_pending_prev_window > 0
 			? linkphase_pending_prev_window : data_batch_size;
-		mfsk_ms = send_mfsk_ack_sack(flush_bsi, mfsk_sack_mask_for_frames(wnd));
+		mfsk_ms = send_mfsk_ack_sack(flush_target, mfsk_sack_mask_for_frames(wnd));
 	}
 	if(mfsk_ms > 0)
 	{
-		printf("[LINKPHASE-PENDING-FLUSH] deferred prev n_r=%d flushed via %s "
+		printf("[LINKPHASE-PENDING-FLUSH] deferred prev target=%d flushed via %s "
 			"wire_ms=%lld (empty-current boundary)\n",
 			linkphase_pending_prev_bsi,
 			compact_sent ? "COMPACT confirm" : "MFSK suffix", mfsk_ms);
@@ -2192,7 +2191,7 @@ void cl_arq_controller::linkphase_flush_pending_prev_confirm()
 		// (never re-flush a bsi-less pattern for a now-stale prev).
 		send_ack_pattern();
 		linkphase_pending_prev_flushed++;
-		printf("[LINKPHASE-PENDING-FLUSH] deferred prev n_r=%d flushed via legacy "
+		printf("[LINKPHASE-PENDING-FLUSH] deferred prev target=%d flushed via legacy "
 			"pattern (NB first-boundary)\n", linkphase_pending_prev_bsi);
 		fflush(stdout);
 	}
@@ -2205,8 +2204,8 @@ void cl_arq_controller::linkphase_clear_pending_if_covered(unsigned char emitted
 {
 	if(linkphase_pending_confirm_covers((int)emitted_n_r))
 	{
-		printf("[LINKPHASE-PENDING-COVERED] deferred prev n_r=%d covered by "
-			"emitted n_r=%u; clearing pending without re-emit\n",
+		printf("[LINKPHASE-PENDING-COVERED] deferred prev target=%d covered by "
+			"emitted prefix=%u; clearing pending without re-emit\n",
 			linkphase_pending_prev_bsi, (unsigned)emitted_n_r);
 		fflush(stdout);
 		linkphase_pending_prev_confirm = false;
@@ -15372,6 +15371,13 @@ bool cl_arq_controller::rsp_resend_prev_partial_sack()
 		                  && messages_rx_prev[i].status == RECEIVED);
 
 	unsigned char prev_bsi = (unsigned char)(rsp_prev_batch_seq_id & 0xFF);
+#if !defined(NDEBUG) && defined(MERCURY_GEN_CANON_ASSERT)
+	for(int i=0; i<sack_win && i<nMessages; i++)
+		if(messages_rx_prev[i].status == RECEIVED
+		   && messages_rx_prev[i].batch_seq_id >= 0
+		   && (messages_rx_prev[i].batch_seq_id & 0xFF) != prev_bsi)
+			std::abort();
+#endif
 	printf("[RSP-V2-GAP-RESACK] re-advertising prev hole batch_seq_id=%u "
 		"received=%d/%d (recoverable HOLD round=%d)\n",
 		(unsigned)prev_bsi, rsp_prev_batch_received_count,
@@ -15620,7 +15626,7 @@ void cl_arq_controller::rsp_seam_clear_on_clean_eot()
 }
 
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
-                                                unsigned char batch_seq_id)
+                                                unsigned char target_batch_seq_id)
 {
 	if(passive_monitor) return 0;
 	if(nframes <= 0 || nframes > MAX_SACK_BATCH_SIZE)
@@ -15640,6 +15646,8 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	// thereby skip the bump-and-transfer). send_sack_v2_frame() is now a pure
 	// wire-transmit primitive — no bsi/prev side effects.
 
+	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
+		target_batch_seq_id, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
 	int bitmap_bytes = (nframes + 7) / 8;
 	int payload_len  = 1 /*batch_seq_id*/ + bitmap_bytes + 1 /*CRC8*/;
 
@@ -15860,13 +15868,13 @@ void cl_arq_controller::restore_sack_v2_rx_phy()
 // the legacy MFSK ACK pattern (no SACK; NB never had the symbol-rate
 // budget for SACK and the receiver implicitly treats any pattern hit
 // as a clean ACK). On WB, returns wall-clock TX time in ms.
-long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
+long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_id,
                                                 uint32_t bitmap)
 {
 	if(passive_monitor) return 0;
 
 #if !MFSK_ACK_SACK_ENABLED
-	(void)batch_seq_id; (void)bitmap;
+	(void)target_batch_seq_id; (void)bitmap;
 	return 0;  // Feature compiled out — caller falls back to OFDM path.
 #else
 	// Runtime guard: NB session (M=8) has ack_sack_suffix_len()==0.
@@ -15907,6 +15915,8 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 
 	auto t_start = std::chrono::steady_clock::now();
 
+	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
+		target_batch_seq_id, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
 	// Compute CRC12 over the 40-bit [bsi || bitmap] payload (big-endian).
 	// CRC12 protects against false-accept after correlator lock — see
 	// mercury/fact-documents/mfsk-robust-ack.md §3.2.
@@ -16095,17 +16105,19 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char batch_seq_id,
 // passband sample count. The PTT / FIR / pilot / drain / capture-flush
 // scaffolding is identical so turnaround behaviour matches the ACK path. CLEAN
 // batch only.
-long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char batch_seq_id)
+long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batch_seq_id)
 {
 	if(passive_monitor) return 0;
 
 #if !MFSK_ACK_SACK_ENABLED
-	(void)batch_seq_id;
+	(void)target_batch_seq_id;
 	return 0;
 #else
 	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
 		return 0;  // NB / unsupported
 
+	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
+		target_batch_seq_id, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
 	bool append_topgear = topgear_elect_feature_enabled()
 	                   && (current_configuration == CONFIG_16
 	                       || current_configuration == CONFIG_17);

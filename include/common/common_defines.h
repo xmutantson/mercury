@@ -24,6 +24,7 @@
 #define INC_COMMON_DEFINES_H_
 
 #include <stdint.h>
+#include <cstdlib>
 
 #define VERSION__ "0.4.2"
 
@@ -753,19 +754,16 @@ static const int TURNAROUND_ACCRUAL_MS_PER_S = 30; // relay-locked (8606389); ms
 static const int ACCRUAL_PHASE_GUARD_MS    = 150;
 
 // ===========================================================================
-// FORGIVING-ACK TIER 2 — cumulative-n_r status report (self-healing spine)
+// FORGIVING-ACK TIER 2 — cumulative predecessor status (self-healing spine)
 // fact-documents/data-flow-forgiving-ack.md TIER 2.
 // ===========================================================================
-// A missed reverse-ACK is SUPERSEDED by the next one: the SACK's 8-bit bsi field
-// is reinterpreted (when the CAP_CUMULATIVE_ACK capability is negotiated on BOTH
-// ends) as n_r = the cumulative contiguous delivery high-water
-// (rsp_last_delivered_batch_seq_id). A later report's n_r covers everything every
-// earlier report would have, so a residual miss is recovered FOR FREE on the next
-// turnaround (STANAG-5066 acknowledged-through semantics). SEMANTICS-only — no
-// wire-width change; the 30/32-bit selective bitmap is unchanged (it describes the
-// batch ABOVE n_r). Both helpers are PURE so --test-cumulative-ack drives the EXACT
-// production predicates; -DCUMULATIVE_ACK_FAILBEFORE pins the apply to the per-batch
-// fallback for the fail-before arm.
+// With CAP_CUMULATIVE_ACK negotiated on both ends, A2 gives the compact bsi octet
+// one meaning: target-1 modulo 256. It cumulatively credits the prefix through that
+// predecessor; the attached bitmap/compact clean result describes target. A later
+// target can therefore supersede a missed reverse ACK without divorcing the bitmap
+// from its source generation. This changes no wire width. The older high-water
+// producer interpretation remains available only under MERCURY_GEN_CANON=0 for the
+// paired fire-proof control arm.
 
 // CUMULATIVE_ACK_WINDOW: how many batches BACKWARD from n_r the CMD will accept as
 // cumulatively-acknowledged. Mercury is batch-level stop-and-wait (cmd_batch_seq_id
@@ -775,17 +773,34 @@ static const int ACCRUAL_PHASE_GUARD_MS    = 150;
 // backward wrap direction is never ambiguous. TUNABLE.
 static const int CUMULATIVE_ACK_WINDOW = 8;
 
-// SEND helper (RSP, producer): choose the value written into the SACK bsi field.
-// When the cumulative cap is negotiated AND a high-water exists, send n_r (the
-// contiguous high-water, which by INV-T2-CONTIG can never point past an undelivered
-// batch); otherwise send the legacy per-batch bsi (byte-identical default-off). A
-// high_water < 0 (nothing delivered yet) falls back to per_batch_bsi so a fresh
-// session never emits a 0xFF/garbage n_r. Returns a value already masked to 8 bits.
+// A2 generation canonicalization.  MERCURY_GEN_CANON defaults ON because this is
+// a correctness rule inside the already-negotiated compact ACK format.  Explicit
+// 0 retains the pre-A2 producer/consumer interpretation for paired fire-proof
+// cells only; no new capability or reserved wire bit is consumed.
+inline bool generation_canon_enabled() {
+	const char* value = std::getenv("MERCURY_GEN_CANON");
+	return !(value && value[0] && std::atoi(value) == 0);
+}
+
+// Producer rule: callers supply the bitmap/clean-confirm SOURCE generation.
+// The encoder derives the compact octet.  Arithmetic is unsigned modulo 256;
+// target 0 therefore encodes as 255 and there is no sentinel/fallback state.
 inline unsigned char cumulative_ack_bsi_field(unsigned char per_batch_bsi,
-		int high_water, bool cap_on) {
-	if (cap_on && high_water >= 0)
-		return (unsigned char)(high_water & 0xFF);
+		int legacy_high_water, bool cap_on) {
+	if (generation_canon_enabled() && cap_on)
+		return (unsigned char)(((unsigned)per_batch_bsi - 1u) & 0xFFu);
+	if (cap_on && legacy_high_water >= 0)
+		return (unsigned char)(legacy_high_water & 0xFF);
 	return per_batch_bsi;
+}
+
+// Consumer rule: resolve exactly once after transport integrity succeeds, then
+// use this target for ownership, class, route, de-dup, and slot validation.
+inline unsigned char generation_ack_resolve_target(unsigned char wire_field,
+		bool cap_on) {
+	if (generation_canon_enabled() && cap_on)
+		return (unsigned char)(((unsigned)wire_field + 1u) & 0xFFu);
+	return wire_field;
 }
 
 // APPLY helper (CMD, consumer): does a received report with high-water n_r address

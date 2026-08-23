@@ -186,11 +186,9 @@ static int rxwindow_rsp_reorder_depth()
 	return current_generation + recoverable_prev_generation;
 }
 
-// Consume the existing cumulative-n_r field after its CRC/window checks. The
-// high-water is monotonic with wrap, matching advance_last_delivered() on the RSP.
-// A PARTIAL report whose field equals highest_sent is the producer's documented
-// n_r<0 fallback (cumulative_ack_bsi_field emits per_batch_bsi until something has
-// been delivered), not evidence that the partial batch was delivered.
+// Consume the raw cumulative prefix after integrity, target ownership/span, and
+// class validation.  This is deliberately the wire field (target-1), while all
+// routing and bitmap consumers use the separately resolved target.
 void cl_arq_controller::cmd_rxwindow_note_delivered(int n_r, bool clean)
 {
 	if(!linkphase_rxwindow_on() || !sack_v2_enabled || !cumulative_ack_enabled)
@@ -198,7 +196,7 @@ void cl_arq_controller::cmd_rxwindow_note_delivered(int n_r, bool clean)
 
 	const int nr = n_r & 0xFF;
 	const int highest_sent = (cmd_batch_seq_id - 1) & 0xFF;
-	if(!clean && nr == highest_sent)
+	if(!generation_canon_enabled() && !clean && nr == highest_sent)
 		return;
 
 	if(cmd_rxwindow_delivered_high_water < 0)
@@ -596,20 +594,12 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	if(rx_crc12 != CRC12_calc(crc_input, 5))
 		return false;
 
-	// Sanity: the report must cover the batch the CMD is waiting on. PER-BATCH:
-	// bsi is the current or just-prior batch. CUMULATIVE (FORGIVING-ACK Tier 2,
-	// when negotiated): rx_bsi is n_r and the outstanding batch is covered iff it
-	// lies in the bounded backward window of n_r (the self-heal; §T2.3/§T2.4).
-	unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
-	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
-	bool per_batch_in_window =
-		((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
-	bool covered =
-		cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-			cumulative_ack_enabled, per_batch_in_window)
-		|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-			cumulative_ack_enabled, per_batch_in_window);
-	if(!covered)
+	const int target = (int)generation_ack_resolve_target(
+		rx_bsi, cumulative_ack_enabled);
+	const int inflight = current_inflight_bsi();
+	if(!generation_ack_target_owned(target, data_batch_size,
+		/*allow_shadow=*/false, nullptr)
+	   || inflight < 0 || target != (inflight & 0xFF))
 		return false;
 
 	// CLEAN-batch only: this arm accepts full-batch ACKs (all-ones bitmap). A
@@ -617,7 +607,15 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	// window (not this bare arm); reject it here so it is not mis-accepted.
 	bool clean = mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size);
 	if(clean)
+	{
 		cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
+		if(std::getenv("MERCURY_GEN_CANON_WITNESS"))
+			printf("[GEN-CANON-RESOLVE] transport=MFSK-CLEAN wire=%u target=%u "
+			       "canon=%d cumulative=%d clean=1 span=%d owner=live\n",
+				(unsigned)rx_bsi, (unsigned)target,
+				generation_canon_enabled() ? 1 : 0,
+				cumulative_ack_enabled ? 1 : 0, data_batch_size);
+	}
 	return clean;
 #else
 	return false;
@@ -738,14 +736,12 @@ bool cl_arq_controller::cmd_data_ack_anchored_rescan_accept()
 			crc_input[4] = (char)( rx_bitmap        & 0xFF);
 			if(rx_crc12 != CRC12_calc(crc_input, 5))
 				continue;
-			bool per_batch_in_window =
-				((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
-			bool covered =
-				cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-					cumulative_ack_enabled, per_batch_in_window)
-				|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-					cumulative_ack_enabled, per_batch_in_window);
-			if(!covered)
+			const int target = (int)generation_ack_resolve_target(
+				rx_bsi, cumulative_ack_enabled);
+			const int inflight = current_inflight_bsi();
+			if(!generation_ack_target_owned(target, data_batch_size,
+				/*allow_shadow=*/false, nullptr)
+			   || inflight < 0 || target != (inflight & 0xFF))
 				continue;
 			if(!mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size))
 				continue;
@@ -837,23 +833,26 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	if(!decoded)
 		return false;  // soft_decode_compact already gated CRC12-over-[bsi].
 
-	// Per-batch confirms address current/previous. In scalable mode a negotiated
-	// cumulative confirm carries n_r and may cover either outstanding identity.
-	unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
-	unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
-	bool per_batch_in_window =
-		((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
 	bool cumulative = scalable_sack_on() && cumulative_ack_enabled;
-	bool covered =
-		cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-			cumulative, per_batch_in_window)
-		|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-			cumulative, per_batch_in_window);
-	if(!covered)
+	const int target = (int)generation_ack_resolve_target(rx_bsi, cumulative);
+	const int inflight = current_inflight_bsi();
+	if(!generation_ack_target_owned(target, data_batch_size,
+		/*allow_shadow=*/false, nullptr)
+	   || inflight < 0 || target != (inflight & 0xFF))
 		return false;
+	if(std::getenv("MERCURY_GEN_CANON_WITNESS"))
+	{
+		printf("[GEN-CANON-RESOLVE] transport=COMPACT wire=%u target=%u "
+		       "canon=%d cumulative=%d clean=1 span=%d owner=live/journal\n",
+			(unsigned)rx_bsi, (unsigned)target,
+			generation_canon_enabled() ? 1 : 0,
+			cumulative ? 1 : 0, data_batch_size);
+		fflush(stdout);
+	}
+	cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
 	if(topgear_report_valid)
 	{
-		topgear_apply_report(topgear_report, (int)rx_bsi);
+		topgear_apply_report(topgear_report, target);
 		// A consume-time report supersedes any older pending one (fresher evidence).
 		topgear_pending_report_clear("consume-time-report");
 	}
@@ -873,13 +872,13 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 		bool consume_failbefore = false;
 		{ const char* e = std::getenv("MERCURY_TOPGEAR_CONSUME_FAILBEFORE"); consume_failbefore = (e && *e && atoi(e) != 0); }
 		if(!consume_failbefore)
-			topgear_pending_report_arm((int)rx_bsi);
+			topgear_pending_report_arm(target);
 	}
 
 	// CLEAN-batch implicit: a compact confirm MEANS all-ones (the responder only
 	// emits it for a fully-received batch; partial loss uses the SACK path).
 	if(out_bsi)
-		*out_bsi = rx_bsi;
+		*out_bsi = (uint8_t)target;
 	return true;
 #else
 	(void)out_bsi;
@@ -1040,9 +1039,11 @@ void cl_arq_controller::topgear_pending_report_tick()
 		bool decoded = telecom_system->decode_compact_confirm_from_passband(
 			topgear_pending_stash.data(), topgear_pending_stash_samples,
 			cmd_compact_crc12_cb, this, &rx_bsi, &matched, &report, &report_valid);
-		if(decoded && (int)rx_bsi == topgear_pending_report_bsi && report_valid)
+		int resolved_target = (int)generation_ack_resolve_target(
+			rx_bsi, scalable_sack_on() && cumulative_ack_enabled);
+		if(decoded && resolved_target == topgear_pending_report_bsi && report_valid)
 		{
-			topgear_apply_report(report, (int)rx_bsi);
+			topgear_apply_report(report, resolved_target);
 			topgear_pending_report_clear("applied");
 			return;
 		}
@@ -5978,11 +5979,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
 							}
 						}
+						const bool ack_frame_seen = decoded;
 
 						// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
 						// On mismatch, treat as no-ACK — the timeout-retransmit path
 						// is the safe fallback when a corrupted "looks like a clean
 						// ACK" frame could otherwise cause silent data loss.
+						int resolved_target = -1;
+						bool is_clean_confirmation = false;
+						bool bitmap_ok = false;
+						bool bitmap_all = false;
+						bool target_is_shadow = false;
+						bool target_owned = false;
 						if(decoded)
 						{
 							char crc_input[5];
@@ -6004,6 +6012,46 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								decoded = false;
 							}
 						}
+						if(decoded)
+						{
+							is_clean_confirmation =
+								mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size);
+							bitmap_all = data_batch_size > 0;
+							for(int i=0; i<data_batch_size && i<MAX_SACK_BATCH_SIZE; i++)
+							{
+								const bool bit = mfsk_sack_bitmap_bit(rx_bitmap, i);
+								bitmap_ok = bitmap_ok || bit;
+								bitmap_all = bitmap_all && bit;
+							}
+							st_resolved_generation_ack resolved = {};
+							target_owned = resolve_and_validate_generation_ack(
+								rx_bsi, data_batch_size, /*integrity_ok=*/true,
+								is_clean_confirmation,
+								bitmap_ok, bitmap_all, &resolved);
+							resolved_target = resolved.target;
+							target_is_shadow = resolved.shadow_owned;
+							if(!target_owned)
+							{
+								printf("[CMD-MFSK-ACK-SACK-REJECT] wire=%u target=%u owner=0 "
+								       "bitmap_any=%d clean=%d bitmap_all=%d span=%d -- no credit\n",
+									(unsigned)rx_bsi, (unsigned)resolved_target,
+									bitmap_ok ? 1 : 0, is_clean_confirmation ? 1 : 0,
+									bitmap_all ? 1 : 0, data_batch_size);
+								fflush(stdout);
+								decoded = false;
+							}
+							else if(std::getenv("MERCURY_GEN_CANON_WITNESS"))
+							{
+								printf("[GEN-CANON-RESOLVE] transport=MFSK wire=%u target=%u "
+								       "canon=%d cumulative=%d clean=%d span=%d owner=%s\n",
+									(unsigned)rx_bsi, (unsigned)resolved_target,
+									generation_canon_enabled() ? 1 : 0,
+									cumulative_ack_enabled ? 1 : 0,
+									is_clean_confirmation ? 1 : 0, data_batch_size,
+									target_is_shadow ? "shadow" : "live/journal");
+								fflush(stdout);
+							}
+						}
 
 						// RETIRED §6 base-pattern climb-confirm (data-flow-inband-basepattern-
 						// confirm-falseconfirm.md). The §6 KEYSTONE confirmed a CLIMB re-tag here
@@ -6019,7 +6067,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// CRC-valid confirm at :3758/:3783/:3953, untouched) + the D4 auto-demote
 						// net. The call is retained so -DINBAND_BASEPATTERN_CONFIRM_FAILBEFORE can
 						// reproduce the BUG (the fails-before arm). Flag-off byte-identical.
-						if(!decoded)
+						if(!decoded && !ack_frame_seen)
 							inband_retag_confirm_from_base_pattern(mfsk_matched,
 								telecom_system->ack_mfsk.ack_match_threshold);
 
@@ -6031,7 +6079,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// Stage-4d auto-demote to the RX config (BREAK-count==0), short-
 						// circuiting the R-retry wait. No-op when inband off / no NACK present.
 #ifndef INBAND_NACK_FAILBEFORE
-						if(!decoded && inband_rate_feature_enabled())
+						if(!decoded && !ack_frame_seen && inband_rate_feature_enabled())
 						{
 							uint8_t nack_rx_cfg = 0, nack_reason = 0, nack_bsi = 0, nack_parity = 0;
 							if(inband_decode_nack_from_capture(&nack_rx_cfg, &nack_reason,
@@ -6050,16 +6098,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 
 						if(decoded)
 						{
-							// Sanity 1: the report must cover the batch the CMD is
-							// waiting on. PER-BATCH: bsi must be the current or just-prior
-							// batch (mod 256) — RSP only ACKs frames whose batch_seq_id is
-							// one of those. CUMULATIVE (FORGIVING-ACK Tier 2, when negotiated):
-							// rx_bsi is n_r (the contiguous high-water) and the outstanding
-							// batch (cmd_bsi or prev_bsi) is acknowledged iff it lies in the
-							// bounded BACKWARD window [n_r-W..n_r] — this is THE SELF-HEAL: a
-							// later n_r covers a batch whose own earlier report was missed.
-							// cumulative_ack_covers never looks FORWARD of n_r, so a corrupt/
-							// stale n_r can never ACK a future/unsent batch (§T2.4).
+								// The shared gate above has already resolved wire to the exact
+								// bitmap/clean target and validated its owner, span, and class.
 							unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
 							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
 							// R2c-W1 (data-flow-recoverable-gap-abort.md 5.1): a PARTIAL re-SACK (has a
@@ -6071,25 +6111,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// confirmations (all-ones) are NEVER routed here (they ride the self-heal).
 							bool w1_shadow_consumed = false;
 							{
-								bool mfsk_clean_w1 =
-									mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size);
-								if(!mfsk_clean_w1
-								   && cmd_prev_resack_is_shadow_target((int)rx_bsi))
+								if(!is_clean_confirmation && bitmap_ok && target_owned
+								   && target_is_shadow
+								   && cmd_prev_resack_is_shadow_target(resolved_target))
 								{
 									bool sackbm_w1[MAX_SACK_BATCH_SIZE];
 									for(int i=0; i<data_batch_size && i<MAX_SACK_BATCH_SIZE; i++)
 										sackbm_w1[i] = mfsk_sack_bitmap_bit(rx_bitmap, i);
-									int rq = cmd_prev_retain_requeue((int)rx_bsi, sackbm_w1, data_batch_size);
-									printf("[CMD-PREV-RETAIN-REQUEUE] (mfsk) rx_bsi=%u not current batch "
+									int rq = cmd_prev_retain_requeue(resolved_target, sackbm_w1, data_batch_size);
+									printf("[CMD-PREV-RETAIN-REQUEUE] (mfsk) wire=%u target=%u not current batch "
 										"cmd=%u -- re-queued %d retained frame(s) (retx queue=%d); consuming "
 										"SACK (skip by-slot apply; next retransmit re-drives the hole)\n",
-										(unsigned)rx_bsi, cmd_bsi, rq, retransmit_count);
+										(unsigned)rx_bsi, (unsigned)resolved_target, cmd_bsi, rq, retransmit_count);
 									fflush(stdout);
-									link_timer.start();
-									watchdog_timer.start();
-									policy_evaluate_axis3(true);
-									mfsk_handled_this_poll = true;
-									w1_shadow_consumed = true;
 									// R2b — RECOVERY TURNAROUND (data-flow-recoverable-gap-abort.md 5.5). A
 									// shadow-retained partial re-SACK with rq>0 is a CREDITED retransmit REQUEST,
 									// not a block failure: the peer is provably alive AND re-requesting the exact
@@ -6111,6 +6145,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									  if(e && *e && atoi(e)!=0) gap_turn_defeat = true; }
 									if(!gap_turn_defeat && rq > 0)
 									{
+										cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/false);
+										link_timer.start();
+										watchdog_timer.start();
+										policy_evaluate_axis3(true);
+										mfsk_handled_this_poll = true;
+										w1_shadow_consumed = true;
 										data_ack_received            = YES;
 										consec_pure_silent_rounds    = 0;
 										last_batch_fully_acked       = false;
@@ -6125,17 +6165,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									}
 								}
 							}
-							bool per_batch_in_window =
-								((unsigned)rx_bsi == cmd_bsi || (unsigned)rx_bsi == prev_bsi);
-							bool bsi_in_window =
-								cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-									cumulative_ack_enabled, per_batch_in_window)
-								|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-									cumulative_ack_enabled, per_batch_in_window);
-							// Sanity 2: bitmap=0 means "received nothing" — RSP
-							// never sends a SACK in that case (no batch_started),
-							// so treat as a false decode.
-							bool bitmap_ok = (rx_bitmap != 0u);
+							bool bsi_in_window = target_owned;
 							// Sanity 3: dedupe vs the last SACK we already applied
 							// (mirrors the OFDM SACK_RSP duplicate guard at ~2141).
 							// climb-engine Bug 1 (gearshift-climb-engine.md §4): SPLIT the dedupe by
@@ -6147,35 +6177,16 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								// branch clean-vs-partial; CLEAN dedupes vs cmd_last_applied_clean_bsi,
 								// PARTIAL vs cmd_last_applied_sack_bsi (a repeated clean for the
 								// same bsi is still rejected -> no double-count).
-								bool is_clean_confirmation =
-									mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size);
-								// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
-								// §3): under the cap the PARTIAL wire bsi is the FROZEN n_r, NOT a per-batch
-								// identity, so key the PARTIAL de-dup on the in-flight batch the bitmap is
-								// applied to (staged-frame ground truth). CLEAN wire bsi advances per delivery -> keep
-								// keying it on rx_bsi. Same key used by the OFDM SACK_RSP path (shared tracker).
-								int dedup_bsi = is_clean_confirmation
-									? (int)rx_bsi
-									: partial_sack_dedup_key((int)rx_bsi, guard_ref_bsi, cumulative_ack_enabled);
+									// A2 de-dup is keyed on the resolved target for both clean and
+									// partial reports; the raw predecessor never becomes an identity.
+								int dedup_bsi = resolved_target;
 								bool duplicate = !sack_clean_confirmation_accepted(
 									dedup_bsi, is_clean_confirmation,
 									cmd_last_applied_clean_bsi, cmd_last_applied_sack_bsi);
-								// Sanity 4 (stale-partial FALSE-ACK guard,
-								// data-flow-inband-dataplane-stall-post-leap.md §8.3): a PARTIAL's bitmap
-								// applies BY SLOT INDEX to exactly the batch it describes (the contiguous
-								// successor n_r+1). Under the cap the window gate (Sanity 1) admits a report
-								// whose frozen n_r merely lands in prev_bsi's backward self-heal window, and
-								// the per-in-flight de-dup key (Sanity 3) does NOT catch a LATE-decoded
-								// straggler (MW late-window, :4265) from a PRIOR in-flight batch -> a batch-k
-								// partial arriving after the CMD advanced to k+1 would FALSE-APPLY its batch-k
-								// bitmap to k+1's PENDING_ACK frames (they never retransmit -> silent loss).
-								// Accept the PARTIAL apply iff its resolved target (n_r+1) IS the current
-								// in-flight batch (cmd_bsi). CLEAN confirmations ride the cumulative self-heal
-								// (batches <= n_r) and are NEVER subject to this (is_clean short-circuits).
-								// Cap OFF -> partial_sack_target_is_inflight() returns true (byte-identical).
+									// A partial bitmap is legal only for its resolved current owner.
+									// A late prior-generation report cannot apply by slot to a newer batch.
 								bool partial_target_ok = is_clean_confirmation
-									|| partial_sack_target_is_inflight((int)rx_bsi, guard_ref_bsi,
-										cumulative_ack_enabled);
+									|| resolved_target == (guard_ref_bsi & 0xFF);
 								// MC-4 consumes n_r after CRC + semantic window validation, but
 								// before bitmap de-dup: a repeated bitmap may still carry a newer
 								// cumulative delivered high-water.
@@ -6195,7 +6206,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									v2_ack_pat_pre_detected = true;
 									// climb-engine Bug 1: record this clean batch bsi so a REPEATED clean for
 									// the same bsi is deduped (no double-count of nBatches_fully_acked).
-									cmd_last_applied_clean_bsi = (int)rx_bsi;
+									cmd_last_applied_clean_bsi = resolved_target;
 									// REPAIR part 2: PRODUCTION EVICT at batch-confirm. A CLEAN
 									// confirmation proves the RX has the WHOLE batch rx_bsi, so its
 									// retained retx frames can never be a recoverable hole again --
@@ -6204,11 +6215,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// confirmed-batch entries and overflowed within one batch). OFF ->
 									// not called (base: shadow silts, the pre-fix defect). Bounded and
 									// safe: only drops entries for an ALREADY-delivered bsi.
-									if(retain_shadow_fix_on()) cmd_prev_retain_evict((int)rx_bsi);
+									if(retain_shadow_fix_on()) cmd_prev_retain_evict(resolved_target);
 									// STAGE 4d (D1 CONFIRM): a CLEAN SACK at-or-after the announce bsi proves the
 									// RX demodulated a batch sent at the announced config -> DISARM the re-tag
 									// (design §1.1/§1.3 consumer 1). No-op when not armed / stale bsi / inband off.
-									inband_retag_confirm_from_sack((int)rx_bsi);
+									inband_retag_confirm_from_sack(resolved_target);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									// R6: fold this reverse-ACK arrival into the measured-turnaround estimator,
 									// Karn-gated (RFC 6298 §3): skip retransmit rounds (ambiguous turnaround).
@@ -6219,11 +6230,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 											data_batch_size * message_transmission_time_ms, arrival_ms);
 									printf("[CMD-MFSK-ACK-SACK] CLEAN batch_seq_id=%u (cmd_batch_seq_id=%d) "
 										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
-										(unsigned)rx_bsi, cmd_batch_seq_id,
+										(unsigned)resolved_target, cmd_batch_seq_id,
 										(unsigned)rx_bitmap, mfsk_matched, arrival_ms);
 									fflush(stdout);
 									if(arq_turn_trace_on())
-										arq_turn_trace_emit_ack("clean-mfsksack", (unsigned)rx_bsi, arrival_ms, tt_karn_sample_ok()?1:0);
+										arq_turn_trace_emit_ack("clean-mfsksack", (unsigned)resolved_target, arrival_ms, tt_karn_sample_ok()?1:0);
 									mfsk_handled_this_poll = true;
 								}
 								else
@@ -6256,7 +6267,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									// STAGE 4d (D1 CONFIRM): a PARTIAL SACK still PROVES the RX demodulated the
 									// batch at the announced config (it decoded SOME frames of it), so a PARTIAL
 									// confirms exactly like a CLEAN (design §1.7 ruling). DISARM the re-tag.
-									inband_retag_confirm_from_sack((int)rx_bsi);
+									inband_retag_confirm_from_sack(resolved_target);
 									int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 									// R6: fold this reverse-ACK arrival into the measured-turnaround estimator,
 									// Karn-gated (RFC 6298 §3): skip retransmit rounds (ambiguous turnaround).
@@ -6272,11 +6283,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 										sack_arrival_history_count++;
 									printf("[CMD-MFSK-ACK-SACK] PARTIAL batch_seq_id=%u (cmd_batch_seq_id=%d) "
 										"bitmap=0x%08x matched=%d arrival_ms=%d\n",
-										(unsigned)rx_bsi, cmd_batch_seq_id,
+										(unsigned)resolved_target, cmd_batch_seq_id,
 										(unsigned)rx_bitmap, mfsk_matched, arrival_ms);
 									fflush(stdout);
 									if(arq_turn_trace_on())
-										arq_turn_trace_emit_ack("partial-mfsksack", (unsigned)rx_bsi, arrival_ms, tt_karn_sample_ok()?1:0);
+										arq_turn_trace_emit_ack("partial-mfsksack", (unsigned)resolved_target, arrival_ms, tt_karn_sample_ok()?1:0);
 									policy_evaluate_axis3(true);
 									mfsk_handled_this_poll = true;
 								}
@@ -6419,8 +6430,42 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						bool decoded = decode_sack_v2_frame(
 							sack_bitmap, data_batch_size, &rx_bsi);
 						int guard_ref_bsi = partial_guard_reference_bsi();
+						bool bitmap_any = false;
+						bool bitmap_clean = data_batch_size > 0;
+						for(int i=0; i<data_batch_size && i<MAX_SACK_BATCH_SIZE; i++)
+						{
+							bitmap_any = bitmap_any || sack_bitmap[i];
+							bitmap_clean = bitmap_clean && sack_bitmap[i];
+						}
+						st_resolved_generation_ack resolved = {};
+						bool target_owned = decoded && resolve_and_validate_generation_ack(
+							rx_bsi, data_batch_size, /*integrity_ok=*/true,
+							/*clean=*/false,
+							bitmap_any, bitmap_clean, &resolved);
+						const int resolved_target = resolved.target;
+						const bool target_is_shadow = resolved.shadow_owned;
 						SACK_TRACE("decode_sack_v2: ok=%d rx_bsi=%u cmd_bsi=%d",
 							decoded ? 1 : 0, (unsigned)rx_bsi, cmd_batch_seq_id);
+						if(decoded && !target_owned)
+						{
+							printf("[CMD-SACK-V2-REJECT] wire=%u target=%u owner=%d "
+							       "bitmap_any=%d partial=%d span=%d -- no credit\n",
+								(unsigned)rx_bsi, (unsigned)resolved_target,
+								target_owned ? 1 : 0, bitmap_any ? 1 : 0,
+								bitmap_clean ? 0 : 1, data_batch_size);
+							fflush(stdout);
+							decoded = false;
+						}
+						if(decoded && std::getenv("MERCURY_GEN_CANON_WITNESS"))
+						{
+							printf("[GEN-CANON-RESOLVE] transport=OFDM wire=%u target=%u "
+							       "canon=%d cumulative=%d clean=0 span=%d owner=%s\n",
+								(unsigned)rx_bsi, (unsigned)resolved_target,
+								generation_canon_enabled() ? 1 : 0,
+								cumulative_ack_enabled ? 1 : 0, data_batch_size,
+								target_is_shadow ? "shadow" : "live/journal");
+							fflush(stdout);
+						}
 						// R2c — RECOVERABLE PREV-BATCH re-SACK (data-flow-recoverable-gap-abort.md
 						// §5). If the decoded SACK's bsi is NOT the in-flight batch (the case the
 						// OOW/STALE guards below DROP) but IS a retained prev batch still reporting
@@ -6431,26 +6476,22 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// in-flight batch's next retransmit turnaround. Consume the SACK
 						// (decoded=false) so the in-flight guards stay inert.
 						bool prev_retain_consumed = false;
-						if(decoded && cmd_prev_resack_is_shadow_target((int)rx_bsi))
+						if(decoded && target_is_shadow
+						   && cmd_prev_resack_is_shadow_target(resolved_target))
 						{
 							// R2c-W1: rx_bsi is a shadow-retained NON-current batch (the armed-prev
 							// hole re-advertised by the recoverable HOLD, or a batch 2+ behind). Its
 							// frames are gone from messages_tx[], so re-drive the RETAINED bytes and
 							// CONSUME the SACK -- the by-slot apply below would FALSE-ACK the current
 							// batch frames by index (they would never retransmit).
-							int rq = cmd_prev_retain_requeue((int)rx_bsi, sack_bitmap, data_batch_size);
-							printf("[CMD-PREV-RETAIN-REQUEUE] rx_bsi=%u not current batch cmd=%u -- "
+							int rq = cmd_prev_retain_requeue(resolved_target, sack_bitmap, data_batch_size);
+							printf("[CMD-PREV-RETAIN-REQUEUE] wire=%u target=%u not current batch cmd=%u -- "
 								"re-queued %d retained frame(s) (retx queue=%d); consuming SACK "
 								"(skip by-slot apply; next retransmit re-drives the hole)\n",
-								(unsigned)rx_bsi, (unsigned)(cmd_batch_seq_id & 0xFF), rq, retransmit_count);
+								(unsigned)rx_bsi, (unsigned)resolved_target,
+								(unsigned)(cmd_batch_seq_id & 0xFF), rq, retransmit_count);
 							fflush(stdout);
-							// Peer is alive + re-requesting: keep the link/watchdog timers fresh so a
-							// bounded recovery does not trip a spurious BREAK/reconnect.
-							link_timer.start();
-							watchdog_timer.start();
-							policy_evaluate_axis3(true);   // a valid reverse SACK decoded
 							decoded = false;               // skip the by-slot apply (would false-ACK cmd_bsi)
-							prev_retain_consumed = true;
 							// R2b — RECOVERY TURNAROUND (data-flow-recoverable-gap-abort.md 5.5). A
 							// shadow-retained partial re-SACK with rq>0 is a CREDITED retransmit REQUEST,
 							// not a block failure: the peer is provably alive AND re-requesting the exact
@@ -6472,6 +6513,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							  if(e && *e && atoi(e)!=0) gap_turn_defeat = true; }
 							if(!gap_turn_defeat && rq > 0)
 							{
+								cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/false);
+								link_timer.start();
+								watchdog_timer.start();
+								policy_evaluate_axis3(true);
+								prev_retain_consumed = true;
 								data_ack_received            = YES;
 								consec_pure_silent_rounds    = 0;
 								last_batch_fully_acked       = false;
@@ -6497,29 +6543,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// fail (fall through to the timeout-driven full-batch
 						// retransmit, exactly as if the OFDM frame had been lost).
 						// PER-BATCH: rx_bsi must be cmd_bsi or prev_bsi (sack_v2_bsi_in_window).
-						// CUMULATIVE (FORGIVING-ACK Tier 2): rx_bsi is n_r; the in-flight PARTIAL
-						// batch (whose bitmap this frame carries) is the contiguous successor n_r+1,
-						// so accept iff the outstanding batch (cmd_bsi or prev_bsi) is covered by
-						// n_r's bounded backward window (§T2.3/§T2.4). The bitmap→messages_tx[] slot
-						// mapping is by INDEX, independent of the bsi value, so it is unchanged.
-						{
-							unsigned cmd_bsi  = (unsigned)(cmd_batch_seq_id & 0xFF);
-							unsigned prev_bsi = (cmd_bsi - 1u) & 0xFFu;
-							bool per_batch_in_window =
-								sack_v2_bsi_in_window((int)rx_bsi, cmd_batch_seq_id);
-							bool covered =
-								cumulative_ack_covers((int)rx_bsi, (int)cmd_bsi,
-									cumulative_ack_enabled, per_batch_in_window)
-								|| cumulative_ack_covers((int)rx_bsi, (int)prev_bsi,
-									cumulative_ack_enabled, per_batch_in_window);
-							if(decoded && !covered)
-							{
-								printf("[CMD-SACK-V2-OOW] rx_bsi=%u not in window {cmd=%u,prev=%u} (cum=%d) — discarding (treat as CRC fail)\n",
-									(unsigned)rx_bsi, cmd_bsi, prev_bsi, cumulative_ack_enabled ? 1 : 0);
-								fflush(stdout);
-								decoded = false;
-							}
-						}
+						// Target ownership and span were validated above, before routing.
 						// Stale-partial FALSE-ACK guard (data-flow-inband-dataplane-stall-post-leap.md
 						// §8.3): the SACK_RSP bitmap applies BY SLOT INDEX to exactly the batch it
 						// describes — the contiguous successor n_r+1. A LATE-decoded straggler from a
@@ -6527,10 +6551,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// prev_bsi) and is NOT a de-dup hit (the current in-flight key is fresh), so its
 						// bitmap would FALSE-ACK the current batch's frames by slot index (they never
 						// retransmit -> silent loss). Discard iff its resolved target (n_r+1) is NOT the
-						// current in-flight batch (cmd_bsi). Cap OFF -> always in-flight -> inert
-						// (byte-identical). Same guard as the MFSK partial path (:4424).
-						if(decoded && !partial_sack_target_is_inflight((int)rx_bsi, guard_ref_bsi,
-							cumulative_ack_enabled))
+						// current in-flight batch (cmd_bsi), in either negotiated mode. Same
+						// resolved-target guard as the MFSK partial path.
+						if(decoded && resolved_target != (guard_ref_bsi & 0xFF))
 						{
 							printf("[CMD-SACK-V2-STALE] rx_bsi=%u resolves to batch %u != in-flight cmd_bsi=%d "
 								"— discarding stale partial (treat as CRC fail)\n",
@@ -6543,11 +6566,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						// progress. The helper rejects the n_r<0 per-batch fallback.
 						if(decoded)
 							cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/false);
-						// FORGIVING-ACK Tier-2 stall fix (data-flow-inband-dataplane-stall-post-leap.md
-						// §3): the OFDM SACK_RSP transport ALSO carries the frozen n_r under the cap and
-						// SHARES cmd_last_applied_sack_bsi with the MFSK path, so key its de-dup on the
-						// SAME staged in-flight batch identity to keep the tracker consistent.
-						int sackv2_dedup_bsi = partial_sack_dedup_key((int)rx_bsi, guard_ref_bsi, cumulative_ack_enabled);
+						// OFDM shares the MFSK resolved-target de-dup key.
+						int sackv2_dedup_bsi = resolved_target;
 						if(decoded
 						   && sackv2_dedup_bsi == cmd_last_applied_sack_bsi)
 						{
@@ -6563,7 +6583,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							// STAGE 4d (D1 CONFIRM): an OFDM SACK_RSP at-or-after the announce bsi
 							// proves the RX demodulated the batch at the announced config -> DISARM
 							// the re-tag (design §1.1/§1.3 consumer 1). No-op when not armed / inband off.
-							inband_retag_confirm_from_sack((int)rx_bsi);
+							inband_retag_confirm_from_sack(resolved_target);
 							int arrival_ms = (int)receiving_timer.get_elapsed_time_ms();
 							// R6: fold this reverse-ACK arrival into the measured-turnaround estimator,
 							// Karn-gated (RFC 6298 §3): skip retransmit rounds (ambiguous turnaround).
@@ -6578,17 +6598,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							if(sack_arrival_history_count < SACK_ARRIVAL_HISTORY)
 								sack_arrival_history_count++;
 							printf("[CMD-SACK-V2] decoded SACK_RSP batch_seq_id=%u (cmd_batch_seq_id=%d) arrival_ms=%d — applying to retransmit queue\n",
-								(unsigned)rx_bsi, cmd_batch_seq_id, arrival_ms);
+								(unsigned)resolved_target, cmd_batch_seq_id, arrival_ms);
 							fflush(stdout);
 							if(arq_turn_trace_on())
-								arq_turn_trace_emit_ack("sackv2", (unsigned)rx_bsi, arrival_ms, tt_karn_sample_ok()?1:0);
+								arq_turn_trace_emit_ack("sackv2", (unsigned)resolved_target, arrival_ms, tt_karn_sample_ok()?1:0);
 							policy_evaluate_axis3(true);
-						}
-						else if(!prev_retain_consumed)
-						{
-							// R2c consumed a valid recovery re-SACK already (axis3(true) fired
-							// there); only signal a reverse-SACK MISS on a genuine decode fail.
-							policy_evaluate_axis3(false);
 						}
 						messages_rx_buffer.status = FREE;
 					}
@@ -8857,6 +8871,83 @@ int cl_arq_controller::partial_guard_reference_bsi() const
 	return (ib >= 0) ? ib : cmd_batch_seq_id;
 }
 
+// A2 ownership/span gate for compact per-batch reports.  The target must be
+// owned by the live per-batch staging array, the R2c retention shadow, or an
+// explicitly journaled generation.  Aggregate directory BSIs never call this.
+bool cl_arq_controller::generation_ack_target_owned(int target_bsi, int span,
+	bool allow_shadow, bool* is_shadow) const
+{
+	if(is_shadow) *is_shadow = false;
+	if(span < 1 || span > MAX_SACK_BATCH_SIZE || span != data_batch_size)
+		return false;
+	const int target = target_bsi & 0xFF;
+	bool live = false;
+	bool live_mismatch = false;
+	for(int i=0; i<nMessages; i++)
+	{
+		if(messages_tx[i].status == FREE || messages_tx[i].length <= 0)
+			continue;
+		if((messages_tx[i].batch_seq_id & 0xFF) == target)
+			live = true;
+		else
+			live_mismatch = true;
+	}
+	// The per-batch staging array is one generation.  A mixed live array cannot
+	// safely be indexed by a generation bitmap, even if one slot happens to own
+	// the resolved target.
+	if(live) return !live_mismatch;
+	if(allow_shadow)
+	{
+		for(int i=0; i<cmd_prev_retain_count; i++)
+		{
+			if(cmd_prev_retain_bsi[i] == target
+			   && cmd_prev_retain_slot[i] >= 0
+			   && cmd_prev_retain_slot[i] < span)
+			{
+				if(is_shadow) *is_shadow = true;
+				return true;
+			}
+		}
+	}
+	if(l1_tx_journal.enabled())
+	{
+		for(const auto& entry : l1_tx_journal.entries())
+			if(entry.key.bsi == target && entry.span == (uint16_t)span)
+				return true;
+	}
+	return false;
+}
+
+bool cl_arq_controller::resolve_and_validate_generation_ack(uint8_t wire_field,
+	int span, bool integrity_ok, bool clean, bool bitmap_any, bool bitmap_all,
+	st_resolved_generation_ack* out) const
+{
+	if(!out || !integrity_ok)
+		return false;
+	st_resolved_generation_ack resolved = {};
+	resolved.wire_field = wire_field;
+	resolved.target = generation_ack_resolve_target(
+		wire_field, cumulative_ack_enabled);
+	resolved.cumulative = cumulative_ack_enabled;
+	resolved.clean = clean;
+	resolved.span = span;
+	resolved.shadow_owned = false;
+	*out = resolved;
+	if(!generation_ack_target_owned(resolved.target, span,
+		/*allow_shadow=*/!clean, &resolved.shadow_owned))
+		return false;
+	if(clean)
+	{
+		const int inflight = current_inflight_bsi();
+		if(inflight < 0 || resolved.target != (inflight & 0xFF))
+			return false;
+	}
+	if(!bitmap_any || clean != bitmap_all)
+		return false;
+	*out = resolved;
+	return true;
+}
+
 // CLIMB-CHURN bsi rollback (data-flow-climb-up-bsi-rollback.md §5). Shared
 // capture+rollback ported VERBATIM from the FIX-9 D3 demote (:4057-4108) and
 // M6 BREAK (:4271-4300): scan messages_tx[] for the EARLIEST (mod-256) in-flight
@@ -8940,19 +9031,19 @@ int cl_arq_controller::test_guard_reanchor()
 	check(current_inflight_bsi() == K,
 		"SCAN: staged batch K is the current in-flight identity");
 
-	bool legacy_accept = partial_sack_target_is_inflight(
-		rx_bsi, cmd_batch_seq_id, /*cap_on=*/true);
+	bool legacy_accept = generation_ack_resolve_target(rx_bsi, true)
+		== (cmd_batch_seq_id & 0xFF);
 	check(!legacy_accept,
 		"FAIL-BEFORE: dispatch-counter reference rejects the current partial");
 
 	int guard_ref_bsi = partial_guard_reference_bsi();
-	bool fixed_accept = partial_sack_target_is_inflight(
-		rx_bsi, guard_ref_bsi, /*cap_on=*/true);
+	bool fixed_accept = generation_ack_resolve_target(rx_bsi, true)
+		== (guard_ref_bsi & 0xFF);
 	check(guard_ref_bsi == K && fixed_accept,
 		"PASS-AFTER: staged in-flight reference accepts the current partial");
 
-	bool stale_accept = partial_sack_target_is_inflight(
-		K - 3, guard_ref_bsi, /*cap_on=*/true);
+	bool stale_accept = generation_ack_resolve_target(K - 3, true)
+		== (guard_ref_bsi & 0xFF);
 	check(!stale_accept,
 		"STALE-REJECT: older retired-batch partial remains rejected");
 
@@ -14545,13 +14636,17 @@ int cl_arq_controller::test_cumulative_ack()
 
 	// --- Part P: PURE helper truth tables ---------------------------------------
 	{
-		// SEND helper: cap-on -> n_r in the bsi field; cap-off / no-high-water -> per-batch.
-		check(cumulative_ack_bsi_field(/*per_batch=*/7, /*high_water=*/12, /*cap=*/true) == 12,
-			"P1 send: cap-on bsi field carries n_r (high-water)", (int)cumulative_ack_bsi_field(7,12,true), 12);
+		// SEND helper: canonical cumulative mode always encodes target-1.
+		check(cumulative_ack_bsi_field(/*target=*/7, /*high_water ignored=*/12, /*cap=*/true) == 6,
+			"P1 send: cap-on wire field is target-1", (int)cumulative_ack_bsi_field(7,12,true), 6);
 		check(cumulative_ack_bsi_field(7, 12, false) == 7,
 			"P2 send: cap-off bsi field is per-batch (byte-identical)", (int)cumulative_ack_bsi_field(7,12,false), 7);
-		check(cumulative_ack_bsi_field(7, -1, true) == 7,
-			"P3 send: cap-on but no delivery yet (n_r<0) falls back to per-batch", (int)cumulative_ack_bsi_field(7,-1,true), 7);
+		check(cumulative_ack_bsi_field(7, -1, true) == 6,
+			"P3 send: no-high-water state has no wire exception", (int)cumulative_ack_bsi_field(7,-1,true), 6);
+		check(cumulative_ack_bsi_field(0, -1, true) == 255,
+			"P3b send: target 0 wraps to wire 255", (int)cumulative_ack_bsi_field(0,-1,true), 255);
+		check(generation_ack_resolve_target(255, true) == 0,
+			"P3c receive: wire 255 resolves to target 0", (int)generation_ack_resolve_target(255,true), 0);
 
 		// APPLY helper (cap-on): [n_r-W .. n_r+1].
 		check(cumulative_ack_covers(12, 12, true, false) == true,
@@ -16624,7 +16719,7 @@ int cl_arq_controller::test_climb_engine()
 	// successor n_r+1. A batch-k partial LATE-decoded (MW late-window) AFTER the
 	// CMD advanced to k+1 (a) PASSES the window gate (its n_r=k-1 covers prev_bsi
 	// via the overhang-1 arm) and (b) is NOT a de-dup hit (the cmd_batch_seq_id
-	// key = k+1 is fresh) — so partial_sack_target_is_inflight is the SOLE guard
+	// key = k+1 is fresh) — so the resolved-target equality is the SOLE guard
 	// standing between it and a FALSE ACK of k+1's frames (their retransmit is
 	// suppressed -> silent loss). -DCUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE pins
 	// the predicate to accept (reproduces the false-ACK -> AP5 FAILS).
@@ -16633,7 +16728,7 @@ int cl_arq_controller::test_climb_engine()
 	// AP5a — the CURRENT-batch partial (target n_r+1 == cmd_bsi) is ACCEPTED: the
 	// stall fix ("partials for the CURRENT batch still apply") is PRESERVED. This
 	// also covers the frozen-n_r stall itself (cmd_bsi = n_r+1 there too).
-	bool ap5a = partial_sack_target_is_inflight(/*rx_bsi=n_r*/K-1, /*cmd_batch_seq_id*/K, /*cap_on*/true);
+	bool ap5a = generation_ack_resolve_target(K-1, true) == K;
 	check(ap5a == true,
 		"AP5a current-batch PARTIAL (target n_r+1 == cmd_bsi) ACCEPTED (stall fix preserved)",
 		ap5a ? 1 : 0, 1);
@@ -16656,16 +16751,16 @@ int cl_arq_controller::test_climb_engine()
 	// AP5 (THE assertion) — the stale batch-k partial arriving at cmd=k+1 is
 	// REJECTED by the target guard (n_r+1 = K != cmd_bsi = K+1). FAIL-BEFORE
 	// (pinned accept) would apply it -> false-ACK k+1's frames.
-	bool ap5 = partial_sack_target_is_inflight(/*rx_bsi=n_r*/K-1, /*cmd_batch_seq_id*/K+1, /*cap_on*/true);
+	bool ap5 = generation_ack_resolve_target(K-1, true) == K+1;
 	check(ap5 == false,
 		"AP5 stale batch-k PARTIAL at cmd=k+1 REJECTED (no false-ACK of k+1 frames)",
 		ap5 ? 1 : 0, 0);
-	// AP5c — cap OFF: the guard is INERT (legacy window+de-dup fence it) -> the
-	// same stale-shaped inputs return true (byte-identical, no behavior change).
-	bool ap5c = partial_sack_target_is_inflight(K-1, K+1, /*cap_on*/false);
-	check(ap5c == true,
-		"AP5c cap-OFF stale-partial guard INERT (byte-identical)",
-		ap5c ? 1 : 0, 1);
+	// AP5c — per-batch mode resolves the field as the target and applies the same
+	// direct target equality; there is no second raw-field interpretation.
+	bool ap5c = generation_ack_resolve_target(K-1, false) == K+1;
+	check(ap5c == false,
+		"AP5c cap-OFF stale target rejected by direct resolved-target equality",
+		ap5c ? 1 : 0, 0);
 
 	// ================================================================
 	// Part B — Bug 2/3: keep batch=1 at robust. Drive the REAL

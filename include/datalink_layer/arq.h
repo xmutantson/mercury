@@ -276,6 +276,16 @@ struct st_message
 	int batch_seq_id;
 };
 
+struct st_resolved_generation_ack
+{
+  uint8_t wire_field;
+  uint8_t target;
+  bool cumulative;
+  bool clean;
+  int span;
+  bool shadow_owned;
+};
+
 // SACK Design A Steps 1 + 2 — effective header length helpers.
 // Returns the runtime DATA_LONG / DATA_SHORT header length on the wire,
 // gated on the session's sack_v2_enabled. When v2 is OFF (default), these
@@ -914,7 +924,7 @@ public:
   // Pre-conditions: caller has verified sack_v2_enabled && nframes > 0.
   // bitmap[i] = true iff frame i of the batch was RECEIVED.
   long long send_sack_v2_frame(const bool* bitmap, int nframes,
-                               unsigned char batch_seq_id);
+                               unsigned char target_batch_seq_id);
   // Wide partial reports cannot use the 30-bit MFSK suffix. They ride one
   // full-width SACK_RSP at a fixed, substantially more robust OFDM rung so
   // both peers can switch PHY geometry without a new negotiation field.
@@ -1105,7 +1115,7 @@ public:
   // (NB session, M < 16, or compile-time gate MFSK_ACK_SACK_ENABLED=0).
   // Computes CRC12 over [bsi || bitmap] internally and emits the 16-symbol
   // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:30 | crc12:12].
-  long long send_mfsk_ack_sack(unsigned char batch_seq_id, uint32_t bitmap);
+  long long send_mfsk_ack_sack(unsigned char target_batch_seq_id, uint32_t bitmap);
 
   // Option B (data-flow-compact-confirm.md): emit the COMPACT coded reverse
   // confirm for a CLEAN (all-ones) batch — ACK base (16) + K=5 GF(16)-RA
@@ -1117,7 +1127,7 @@ public:
   // appends an independently CRC12-protected forward SNR/flatness codeword.
   // Peers without topgear still decode the unchanged prefix; default-off wire
   // remains exactly the existing compact confirm.
-  long long send_mfsk_compact_confirm(unsigned char batch_seq_id);
+  long long send_mfsk_compact_confirm(unsigned char target_batch_seq_id);
 
   // Phase B Wave 2 v2 — PHY-level helpers for MFSK CONNECT.
   // These are called from inside the legacy state-machine dispatchers
@@ -2225,50 +2235,6 @@ public:
 #else
     if(cap_on) return cmd_batch_seq_id & 0xFF;  // cap ON: in-flight batch identity (advances per batch)
     return rx_bsi & 0xFF;                        // cap OFF: legacy per-batch bsi (unchanged)
-#endif
-  }
-
-  // ── FORGIVING-ACK Tier-2 STALE-PARTIAL FALSE-ACK GUARD ────────────────────
-  // (data-flow-inband-dataplane-stall-post-leap.md §8.3). The companion to
-  // partial_sack_dedup_key, closing the latent robustness gap that key OPENED.
-  // A PARTIAL's 30-bit selective bitmap is applied BY SLOT INDEX to the in-flight
-  // batch, so it describes EXACTLY ONE batch: the contiguous successor n_r+1
-  // (cumulative_ack_covers arm b — Mercury is batch-level stop-and-wait, so the
-  // only batch above the delivery high-water n_r is n_r+1). Under the cap the
-  // window gate (bsi_in_window, arq_commander.cc:4384-4392) ADMITS any report
-  // whose frozen n_r merely lands in the bounded backward self-heal window of
-  // cmd_bsi OR prev_bsi — CORRECT for a CLEAN cumulative delivery confirmation
-  // (arm a retires batches <= n_r) but NOT a discriminator of which batch a
-  // PARTIAL bitmap targets. Since the night stall fix keys the partial de-dup on
-  // the in-flight batch identity (cmd_batch_seq_id), a STALE partial for batch k,
-  // LATE-decoded (MW late-window re-decode, arq_commander.cc:4265) AFTER the CMD
-  // advanced to k+1, is NOT a duplicate (cmd-key is k+1, fresh) and its n_r=k-1
-  // still satisfies the backward window — so its batch-k bitmap would be
-  // FALSE-APPLIED by slot index to k+1's PENDING_ACK frames, a FALSE ACK that
-  // suppresses their retransmit (silent data loss; §8.3 latent gap). This is the
-  // missing PARTIAL-ONLY validation: accept the bitmap apply iff the batch it
-  // describes (n_r+1) IS the current in-flight batch (cmd_bsi). A legit current
-  // partial ALWAYS satisfies this (n_r = cmd_bsi-1: the high-water is the batch
-  // just below the in-flight one), INCLUDING the frozen-n_r stall the night fix
-  // targets (there cmd_bsi = n_r+1 too), so the stall fix is fully preserved.
-  // Cap OFF: the wire bsi IS the per-batch identity and the legacy {cmd_bsi,
-  // prev_bsi} window + per-batch de-dup already fence it -> return true
-  // UNCONDITIONALLY (byte-identical; the whole non-Tier-2 fleet + every existing
-  // test stay bit-for-bit). Does NOT touch the wire encoding, the de-dup key, or
-  // cumulative_ack_covers' backward self-heal (CLEAN confirmations still ride it).
-  // PURE + static so --test-climb-engine drives the EXACT production decision.
-  // -DCUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE pins accept (reproduces the false-ACK)
-  // so the regression fails-before / passes-after in the SAME binary.
-  static bool partial_sack_target_is_inflight(int rx_bsi, int cmd_batch_seq_id, bool cap_on)
-  {
-#ifdef CUMULATIVE_ACK_STALEPARTIAL_FAILBEFORE
-    (void)rx_bsi; (void)cmd_batch_seq_id; (void)cap_on;
-    return true;                                 // FAIL-BEFORE: no stale-partial discard (the false-ACK).
-#else
-    if(!cap_on) return true;                     // cap OFF: legacy window+de-dup fence it (byte-identical)
-    unsigned succ    = ((unsigned)(rx_bsi & 0xFF) + 1u) & 0xFFu;  // batch the bitmap describes (n_r+1)
-    unsigned cmd_bsi = (unsigned)(cmd_batch_seq_id & 0xFF);
-    return succ == cmd_bsi;                       // apply iff that batch IS the in-flight batch
 #endif
   }
 
@@ -3498,6 +3464,11 @@ public:
   // --test-guard-reanchor. Stages live messages_tx[] state and verifies the
   // in-flight reference accepts the current partial while rejecting stale input.
   int test_guard_reanchor();
+
+  // A2 generation canonicalization decisive experiment. Drives the production
+  // retention-shadow route/requeue helpers with a cumulative prev-hole report
+  // while the dispatch counter has advanced to N+1. CLI: --test-generation-canon.
+  int test_generation_canon();
 
   // D5 — EOB-inference batch truncation (TRACK_C_D2D3D5_DESIGN.md §5.3 /
   // data-flow-prev-bump.md §8). CLI: --test-eob-loss-batch-truncation. Drives
@@ -5675,6 +5646,13 @@ public:
   // in-flight epoch LABEL — the two are orthogonal).
   int current_inflight_bsi() const;
   int partial_guard_reference_bsi() const;
+  bool generation_ack_target_owned(int target_bsi, int span,
+                                   bool allow_shadow,
+                                   bool* is_shadow = nullptr) const;
+  bool resolve_and_validate_generation_ack(uint8_t wire_field, int span,
+                                           bool integrity_ok, bool clean, bool bitmap_any,
+                                           bool bitmap_all,
+                                           st_resolved_generation_ack* out) const;
   int roll_back_cmd_bsi_to_inflight(const char* tag);
   // Commander-side true-session-loss floor (the ONLY commander BREAK permitted under
   // inband). Counts consecutive Class-A total-loss batches that occur WHILE already
@@ -7118,7 +7096,7 @@ private:
   // on every session reset. The bsi is the cumulative n_r captured at arm time; the
   // window is the clean-bitmap width for the MFSK-suffix fallback.
   bool linkphase_pending_prev_confirm; // RSP: a deferred prev clean-confirm awaits a boundary flush
-  int  linkphase_pending_prev_bsi;     // cumulative n_r (wire bsi) to flush; -1 = none pending
+  int  linkphase_pending_prev_bsi;     // deferred source/target generation; -1 = none pending
   int  linkphase_pending_prev_window;  // clean-bitmap width for the fallback MFSK suffix; -1 = none
   long linkphase_pending_prev_flushed; // RSP fire-proof: boundary flushes emitted. 0 => never fired.
   // LINK-PHASE STEP 2 — geometry of the CMD's most recent DATA keydown, captured at send_batch

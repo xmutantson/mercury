@@ -2575,6 +2575,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_gr;
                 failed += test_gr.test_guard_reanchor();
             }
+            // A2 generation canonicalization: cumulative target N must resolve
+            // before the R2c retention-shadow route while dispatch is at N+1.
+            {
+                cl_arq_controller test_gc;
+                failed += test_gc.test_generation_canon();
+            }
             // FIX-C graceful-shutdown handler: handler installed above, this
             // self-raises SIGTERM/SIGINT and asserts shutdown_ flips, then
             // clears the flag so the rest of the process is unperturbed.
@@ -3684,6 +3690,13 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-guard-reanchor") == 0) {
             cl_arq_controller ARQ_gr;
             int failed = ARQ_gr.test_guard_reanchor();
+            return (failed == 0) ? 0 : 1;
+        }
+        // --test-generation-canon : A2 cumulative generation resolution and
+        // retention-shadow route synthetic fire (in-process, no PHY/audio).
+        if (strcmp(argv[i], "--test-generation-canon") == 0) {
+            cl_arq_controller ARQ_gc;
+            int failed = ARQ_gc.test_generation_canon();
             return (failed == 0) ? 0 : 1;
         }
         // --test-inband-plus1-climb : run ONLY the in-band +1 climb regression (the FRAME-UP
