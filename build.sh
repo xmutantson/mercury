@@ -3,6 +3,7 @@
 # Usage: ./build.sh [mode] [clean]
 #   Modes: release (default), debug, asan, ubsan, o0, o1, o2, o3
 #   clean: removes all object files first
+#   MERCURY_BUILD_JOBS=N caps parallel compiler jobs (default: host CPU count)
 #
 # Examples:
 #   ./build.sh              # Release build (-O3)
@@ -299,7 +300,7 @@ else
 fi
 
 # Parallel job count
-NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+NPROC="${MERCURY_BUILD_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 # --- Dependency-tracked parallel compilation ---
 # Uses gcc -MMD to generate .d files alongside .o files.
@@ -407,6 +408,7 @@ source/datalink_layer/l1_tx_journal.cc
 source/datalink_layer/l1_block_ack.cc
 source/datalink_layer/arq_responder.cc
 source/datalink_layer/l1_block_codec.cc
+source/datalink_layer/lp_transition_harness.cc
 source/datalink_layer/test_bigblock_arq_unit.cc
 source/datalink_layer/test_rx_drain.cc
 source/datalink_layer/test_restage_requeue.cc

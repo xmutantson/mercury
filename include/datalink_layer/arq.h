@@ -510,6 +510,8 @@ struct st_stats
 	  float success_rate_data;
 };
 
+namespace mercury { class LpTransitionHarness; }
+
 struct st_measurements
 {
 	  double SNR_uplink;
@@ -527,6 +529,7 @@ struct st_measurements
 
 class cl_arq_controller
 {
+	friend class mercury::LpTransitionHarness;
 
 public:
 	cl_arq_controller();

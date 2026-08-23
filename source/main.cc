@@ -51,6 +51,7 @@
 #include "crypto/test_aead_nonce.h"   // AEAD bsi-bound nonce regression suite
 #include "crypto/test_mlkem_hybrid.h" // ML-KEM-768 hybrid KEX regression suite
 #include "datalink_layer/arq.h"
+#include "datalink_layer/lp_transition_harness.h"
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
 
@@ -2190,6 +2191,14 @@ int main(int argc, char *argv[])
     // caller below. The flag must be checked before any audio/GUI/threading
     // init so the test process stays minimal.
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--test-lp-timeline-harness") == 0) {
+            arm_test_watchdog();
+            std::string demo_trace;
+            int failed = mercury::run_lp_transition_demo(&demo_trace);
+            std::printf("%s", demo_trace.c_str());
+            failed += mercury::run_lp_transition_harness_tests();
+            return failed == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--test-b2f-bounded-output") == 0) {
             arm_test_watchdog();
             return run_b2f_bounded_output_test();
@@ -2355,6 +2364,10 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_linkphase_optclock_end_stamp();
             }
+            // Phase-0 deterministic transition oracle: two production
+            // controllers, sample-derived event queue, scripted delivery
+            // actions, reverse-ACK seam trace, and 3 seeds x 3 repetitions.
+            failed += mercury::run_lp_transition_harness_tests();
             // In-band capture-ring ROBUST-floor OVER-SEAT regression (the CONFIG_8-climb
             // 24/25-BREAK root): inband_seat_robust_ring_floor over-grew the climbed OFDM
             // ring to the ROBUST floor -> frame-0 SKIP-VAR every batch. Member test on a
