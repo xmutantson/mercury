@@ -38,6 +38,11 @@ class RandomBinaryCapabilityTest(unittest.TestCase):
             arq.random_binary_slice(19, 57),
             arq.random_binary_slice(0, 76)[19:])
 
+    def test_sensitive_env_values_are_not_emitted(self):
+        self.assertEqual(
+            arq.redacted_env_items(["MERCURY_MODE=1", "API_TOKEN=secret"]),
+            ["MERCURY_MODE=1", "API_TOKEN=<redacted>"])
+
 
 class ScoreHorizonCapabilityTest(unittest.TestCase):
     def test_horizon_supersedes_secs_and_delivery(self):
@@ -48,13 +53,13 @@ class ScoreHorizonCapabilityTest(unittest.TestCase):
         self.assertEqual(arq.fixed_score_deadline(1000, 10, 800, 70), 1870)
 
 
-class IndependentDialCapabilityTest(unittest.TestCase):
-    def test_snr_and_snr3k_are_both_forwarded(self):
+class VersionedDialCapabilityTest(unittest.TestCase):
+    def test_snr3k_is_the_single_forwarded_control(self):
         args = spawner.build_arg_parser().parse_args(
-            ["--n", "1", "--snr", "28", "--snr3k", "27.5"])
+            ["--n", "1", "--snr3k", "27.5"])
         cell = spawner.run_plan(1, args.port_base)[0]
         command = spawner.build_cell_command(args, cell, "/tmp/cell.json")
-        self.assertEqual(command[command.index("--snr") + 1], "28.0")
+        self.assertNotIn("--snr", command)
         self.assertEqual(command[command.index("--snr3k") + 1], "27.5")
 
 
@@ -109,7 +114,7 @@ class CertDriverArgparseIntegrationTest(unittest.TestCase):
             "--start-cfg", "100", "--payload", "262144", "--secs", "800",
             "--profile", "wgn", "--launch-stagger", "2", "--arm", "contention",
             "--warm-start", "--traffic", "random-binary",
-            "--score-horizon-s", "800", "--snr", "28", "--snr3k", "28",
+            "--score-horizon-s", "800", "--snr3k-db", "28",
             "--seed-offset", "0",
             "--spawn-plan", json.dumps(FIXTURE["spawn_plan"], separators=(",", ":")),
         ]
@@ -120,7 +125,7 @@ class CertDriverArgparseIntegrationTest(unittest.TestCase):
         self.assertEqual(len(dry_run["commands"]), 2)
         for child in dry_run["commands"]:
             for flag in ("--warm-start", "--traffic", "--score-horizon-s",
-                         "--snr", "--snr3k"):
+                         "--snr3k-db"):
                 self.assertIn(flag, child)
 
 
@@ -147,7 +152,7 @@ class GoldenNoFlagIdentityTest(unittest.TestCase):
         self.assertEqual(cell_defaults.traffic, arq.TRAFFIC_LEGACY)
         self.assertFalse(cell_defaults.warm_start)
         self.assertIsNone(cell_defaults.score_horizon_s)
-        self.assertEqual(cell_defaults.snr, 30.0)
+        self.assertIsNone(cell_defaults.snr)
         self.assertIsNone(cell_defaults.snr3k)
         self.assertEqual(arq.traffic_slice("legacy", 0, 4096),
                          bytes(range(256)) * 16)

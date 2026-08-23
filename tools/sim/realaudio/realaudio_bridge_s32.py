@@ -59,6 +59,9 @@ _PARENT_SIM = os.path.dirname(_HERE)               # tools/sim
 sys.path.insert(0, _PARENT_SIM)
 sys.path.insert(0, _HERE)
 from sim_channel_relay import Channel, PROFILES, ionos_wgn_to_snr3k  # noqa: E402
+from sim_axis import (AXIS_CHOICES, AXIS_V2, DEFAULT_AXIS,
+                      AxisError, headroom_plan, infer_bandwidth, resolve_axis,
+                      sha256_json)  # noqa: E402
 
 PERIOD = 1024            # frames per ALSA period (~21.3 ms @48k); == CHUNK_SAMPLES
 RATE = 48000
@@ -67,7 +70,15 @@ INT_MAX = 2147483647.0   # matches audioio.c INT_MAX scaling (both directions)
 
 def chan_args(a):
     return types.SimpleNamespace(
-        snr=a.snr, loss=a.loss, burst=a.burst, profile=a.profile,
+        axis=a.axis, snr=a.snr3k_db, snr3k_db=a.snr3k_db,
+        cn_config_db=a.cn_config_db,
+        configured_bandwidth_hz=a.configured_bandwidth_hz,
+        input_coordinate=a.input_coordinate,
+        reference_power=a.reference_power,
+        reference_id=a.reference_id,
+        reference_n_samples=a.reference_n_samples,
+        binary_sha256=a.binary_sha256, recipe_sha256=a.recipe_sha256,
+        loss=a.loss, burst=a.burst, profile=a.profile,
         cfo_hz=a.cfo_hz, phase_noise_deg=a.phase_noise_deg,
         sig_ref=a.sig_ref, fade_depth_db=a.fade_depth_db)
 
@@ -87,7 +98,8 @@ def open_play(dev, periods):
 
 
 def pump(name, cap_dev, play_dev, ch, stop, stats, passthrough,
-         cap_periods, play_periods, prime_periods):
+         cap_periods, play_periods, prime_periods, composite_scale,
+         s32_mode, headroom):
     cap = open_cap(cap_dev, cap_periods)
     play = open_play(play_dev, play_periods)
     silence = np.zeros(PERIOD * 2, dtype="<i4").tobytes()
@@ -96,6 +108,10 @@ def pump(name, cap_dev, play_dev, ch, stop, stats, passthrough,
     underruns = 0
     nframes = 0
     sig_frames = 0          # frames carrying non-zero input (signal energy)
+    pre_scale_peak = 0.0
+    hard_clip_count = 0
+    s32_saturation_count = 0
+    clip_denominator = 0
     while not stop.is_set():
         length, data = cap.read()          # BLOCKING, kernel-clocked
         if length <= 0:
@@ -116,7 +132,15 @@ def pump(name, cap_dev, play_dev, ch, stop, stats, passthrough,
                 sig_frames += length
             out = ch.process(xf.tolist())
             o = np.asarray(out, dtype=np.float64)
+            if o.size:
+                pre_scale_peak = max(pre_scale_peak,
+                                     float(np.max(np.abs(o))))
+            o *= composite_scale
+            hard_clip_count += int(np.count_nonzero(np.abs(o) > 1.0))
+            clip_denominator += int(o.size)
             o *= INT_MAX
+            s32_saturation_count += int(
+                np.count_nonzero(np.abs(o) > INT_MAX))
             np.clip(o, -INT_MAX, INT_MAX, out=o)
             oi32 = o.astype("<i4")
         # re-interleave to stereo (duplicate ch0 to both, like audioio.c:807-808)
@@ -139,8 +163,20 @@ def pump(name, cap_dev, play_dev, ch, stop, stats, passthrough,
             except alsaaudio.ALSAAudioError:
                 pass
         nframes += length
+    applied = ch.attestation()
+    applied.update({
+        "composite_scale": composite_scale,
+        "pre_scale_peak": pre_scale_peak,
+        "hard_clip_count": hard_clip_count,
+        "s32_saturation_count": s32_saturation_count,
+        "clip_event_denominator": clip_denominator,
+        "s32_mode": s32_mode,
+        "headroom_k": headroom.get("headroom_k"),
+        "headroom_n_samples": headroom.get("headroom_n_samples"),
+        "headroom_epsilon": headroom.get("headroom_epsilon"),
+    })
     stats[name] = {"frames": nframes, "sig_frames": sig_frames,
-                   "underruns": underruns}
+                   "underruns": underruns, "axis_attestation": applied}
     try:
         cap.close()
         play.close()
@@ -156,7 +192,25 @@ def main():
     ap.add_argument("--rev-play", default="hw:Loopback,0,3")
     ap.add_argument("--passthrough", action="store_true",
                     help="perfect bit-exact cable (no Channel.process)")
-    ap.add_argument("--snr", type=float, default=30.0)
+    ap.add_argument("--axis", choices=AXIS_CHOICES, default=DEFAULT_AXIS)
+    ap.add_argument("--snr", type=float, default=None,
+                    help="historical v0-only dial")
+    ap.add_argument("--snr3k-db", type=float, default=None)
+    ap.add_argument("--snr3k", type=float, default=None,
+                    help="DEPRECATED controlling alias for --snr3k-db")
+    ap.add_argument("--cn-config-db", type=float, default=None)
+    ap.add_argument("--configured-bandwidth-hz", type=float, default=None)
+    ap.add_argument("--band-family", choices=("WB", "NB"), default=None)
+    ap.add_argument("--reference-power", type=float, default=None)
+    ap.add_argument("--reference-id", default=None)
+    ap.add_argument("--reference-n-samples", type=int, default=None)
+    ap.add_argument("--calibration-peak", type=float, default=None)
+    ap.add_argument("--headroom-n-samples", type=int, default=None)
+    ap.add_argument("--headroom-epsilon", type=float, default=None)
+    ap.add_argument("--s32-mode", choices=("auto", "prescaled", "s32-hardclip"),
+                    default="auto")
+    ap.add_argument("--binary-sha256", default=None)
+    ap.add_argument("--recipe-sha256", default=None)
     ap.add_argument("--cell", default=None)
     ap.add_argument("--profile", choices=list(PROFILES.keys()), default="wgn")
     ap.add_argument("--cfo-hz", type=float, default=0.0)
@@ -171,13 +225,67 @@ def main():
     ap.add_argument("--prime-periods", type=int, default=2)
     ap.add_argument("--statsfile", default=None)
     a = ap.parse_args()
-    if a.cell:
-        a.snr = ionos_wgn_to_snr3k(a.cell.split(":", 1)[1])
+    bandwidth = (a.configured_bandwidth_hz
+                 if a.configured_bandwidth_hz is not None
+                 else infer_bandwidth(None, a.band_family))
+    try:
+        resolved = resolve_axis(
+            a.axis, snr=a.snr, snr3k=a.snr3k, snr3k_db=a.snr3k_db,
+            cn_config_db=a.cn_config_db,
+            cell_snr3k_db=(ionos_wgn_to_snr3k(a.cell.split(":", 1)[1])
+                           if a.cell else None),
+            configured_bandwidth_hz=bandwidth, default_snr3k_db=30.0)
+    except (AxisError, ValueError, IndexError) as exc:
+        ap.error(str(exc))
+    a.snr3k_db = resolved["snr3k_db"]
+    a.cn_config_db = resolved["cn_config_db"]
+    a.configured_bandwidth_hz = resolved["configured_bandwidth_hz"]
+    a.input_coordinate = resolved["input_coordinate"]
+    if a.axis == AXIS_V2:
+        if (a.reference_power is None or not a.reference_id
+                or not a.reference_n_samples):
+            ap.error("v2 requires reference power/id/sample denominator")
+        if a.calibration_peak is None:
+            ap.error("v2 requires --calibration-peak")
+        if a.s32_mode == "auto":
+            a.s32_mode = "prescaled"
+    else:
+        if a.s32_mode == "prescaled":
+            ap.error("prescaled S32 is canonical only for v2")
+        if a.s32_mode == "auto":
+            a.s32_mode = "s32-hardclip"
+    if a.s32_mode == "prescaled":
+        try:
+            headroom = headroom_plan(
+                a.calibration_peak,
+                a.reference_power * 24000.0 /
+                (10.0 ** (a.snr3k_db / 10.0) * 3000.0),
+                a.headroom_n_samples, a.headroom_epsilon)
+        except AxisError as exc:
+            ap.error(str(exc))
+    else:
+        headroom = {"composite_scale": 1.0, "headroom_k": None,
+                    "headroom_n_samples": a.headroom_n_samples,
+                    "headroom_epsilon": a.headroom_epsilon}
+    composite_scale = headroom["composite_scale"]
+    if a.binary_sha256 is None:
+        a.binary_sha256 = "unattested"
+    if a.recipe_sha256 is None:
+        a.recipe_sha256 = sha256_json({
+            "axis": a.axis, "snr3k_db": a.snr3k_db,
+            "cn_config_db": a.cn_config_db,
+            "configured_bandwidth_hz": a.configured_bandwidth_hz,
+            "reference_id": a.reference_id, "reference_power": a.reference_power,
+            "s32_mode": a.s32_mode, "composite_scale": composite_scale,
+        })
 
     cargs = chan_args(a)
     ch_fwd = Channel(cargs, (a.seed * 2654435761) & 0xFFFFFFFF)
     ch_rev = Channel(cargs, (a.seed * 40503 + 7) & 0xFFFFFFFF)
-    mode = "PASSTHROUGH" if a.passthrough else f"SNR3k={a.snr:.2f} profile={a.profile}"
+    mode = ("PASSTHROUGH" if a.passthrough else
+            f"axis={a.axis} SNR3k={a.snr3k_db:.2f} "
+            f"CNcfg={a.cn_config_db:.2f} profile={a.profile} "
+            f"s32={a.s32_mode} scale={composite_scale:.12g}")
     sys.stderr.write(f"[bridge_s32] {mode} cfo={a.cfo_hz} pn={a.phase_noise_deg} "
                      f"seed={a.seed} rings cap={a.cap_periods} play={a.play_periods} "
                      f"prime={a.prime_periods} cables "
@@ -199,10 +307,12 @@ def main():
 
     tf = threading.Thread(target=pump, args=(
         "fwd", a.fwd_cap, a.fwd_play, ch_fwd, stop, stats, a.passthrough,
-        a.cap_periods, a.play_periods, a.prime_periods))
+        a.cap_periods, a.play_periods, a.prime_periods, composite_scale,
+        a.s32_mode, headroom))
     tr = threading.Thread(target=pump, args=(
         "rev", a.rev_cap, a.rev_play, ch_rev, stop, stats, a.passthrough,
-        a.cap_periods, a.play_periods, a.prime_periods))
+        a.cap_periods, a.play_periods, a.prime_periods, composite_scale,
+        a.s32_mode, headroom))
     tf.start()
     tr.start()
     try:
@@ -213,6 +323,24 @@ def main():
     stop.set()
     tf.join(timeout=3)
     tr.join(timeout=3)
+    if "fwd" in stats and "rev" in stats:
+        fwd_att = stats["fwd"]["axis_attestation"]
+        rev_att = stats["rev"]["axis_attestation"]
+        aggregate = dict(fwd_att)
+        aggregate["pre_scale_peak"] = max(
+            fwd_att["pre_scale_peak"], rev_att["pre_scale_peak"])
+        for key in ("hard_clip_count", "s32_saturation_count",
+                    "clip_event_denominator", "noise_n_samples"):
+            aggregate[key] = fwd_att.get(key, 0) + rev_att.get(key, 0)
+        aggregate["seed"] = a.seed
+        aggregate["direction_attestations"] = {
+            "fwd": fwd_att, "rev": rev_att,
+        }
+        budget = aggregate.get("headroom_n_samples")
+        aggregate["headroom_budget_exceeded"] = bool(
+            budget is not None
+            and aggregate["clip_event_denominator"] > budget)
+        stats["axis_attestation"] = aggregate
     sys.stderr.write(f"[bridge_s32] stats={stats}\n")
     if a.statsfile:
         import json

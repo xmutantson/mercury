@@ -1,0 +1,11 @@
+{
+  "axis_version": "v1-steady-snr3k",
+  "byte_count": 327680,
+  "deployed_source": "/mnt/c/mercury_codex_stage/efficacy_driver/harness_sim/sim_channel_relay.py",
+  "deployed_source_sha256": "2b6f82d08a1d5d40c33433dca240b4f02317ee52c55aab5167a329a49aea0245",
+  "fixture_order": "hail-ack:8x1024,wb-m16x2:32x1024",
+  "output_sha256": "c80b524cb85b64857dd92710ae91d7c3d6c1417f2e9a4987ecc962f8772a70fb",
+  "sample_count": 40960,
+  "seed": 1901,
+  "snr3k_db": 4.8
+}

@@ -1,0 +1,271 @@
+{
+  "records": [
+    {
+      "calibration_peak": 0.31622722802036896,
+      "capture_n_samples": 69632,
+      "configured_bandwidth_hz": 2343.75,
+      "fixture_path": "fixtures/pcal-hail-ack-wb-v1.f64le",
+      "fixture_sha256": "f454bc2a57400c1fa0c6b2f2767f55921699cddb7cb147bac23b36ea253ef929",
+      "key": {
+        "band_family": "WB",
+        "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+        "config": "universal",
+        "sample_rate_hz": 48000,
+        "tx_gain_overrides": "none",
+        "waveform_class": "hail-ack"
+      },
+      "recipe": {
+        "environment": {
+          "LC_ALL": "C",
+          "PYTHONHASHSEED": "0"
+        },
+        "key": {
+          "band_family": "WB",
+          "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+          "config": "universal",
+          "sample_rate_hz": 48000,
+          "tx_gain_overrides": "none",
+          "waveform_class": "hail-ack"
+        },
+        "source_kind": "deterministic-production-wire-qualification-fixture",
+        "steady_n_samples": 65536,
+        "tool": "calibration_capture.py",
+        "transient_exclusion_samples": 4096
+      },
+      "recipe_sha256": "acb7f7613e7dfdb97c6c8c4a86d592a272ef4464bdcf9bda336a2a589b49f19d",
+      "reference_id": "pcal-hail-ack-wb-v1",
+      "reference_n_samples": 65536,
+      "reference_power": 0.05000000000000003,
+      "transient_exclusion_samples": 4096
+    },
+    {
+      "calibration_peak": 0.28284223127594826,
+      "capture_n_samples": 69632,
+      "configured_bandwidth_hz": 468.75,
+      "fixture_path": "fixtures/pcal-nb-mfsk-1s-v1.f64le",
+      "fixture_sha256": "75425e6e1a01cb8ff9896eff3394d31cc846826645c52b9267ea700028a5dcaf",
+      "key": {
+        "band_family": "NB",
+        "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+        "config": "nb-1s",
+        "sample_rate_hz": 48000,
+        "tx_gain_overrides": "none",
+        "waveform_class": "nb-mfsk-1stream"
+      },
+      "recipe": {
+        "environment": {
+          "LC_ALL": "C",
+          "PYTHONHASHSEED": "0"
+        },
+        "key": {
+          "band_family": "NB",
+          "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+          "config": "nb-1s",
+          "sample_rate_hz": 48000,
+          "tx_gain_overrides": "none",
+          "waveform_class": "nb-mfsk-1stream"
+        },
+        "source_kind": "deterministic-production-wire-qualification-fixture",
+        "steady_n_samples": 65536,
+        "tool": "calibration_capture.py",
+        "transient_exclusion_samples": 4096
+      },
+      "recipe_sha256": "a90168b658145520646ae8c0a7ba7e9536e97cd11727ce30e3fe0088f6a25018",
+      "reference_id": "pcal-nb-mfsk-1s-v1",
+      "reference_n_samples": 65536,
+      "reference_power": 0.039999999999999994,
+      "transient_exclusion_samples": 4096
+    },
+    {
+      "calibration_peak": 0.3019164804375184,
+      "capture_n_samples": 69632,
+      "configured_bandwidth_hz": 468.75,
+      "fixture_path": "fixtures/pcal-nb-mfsk-2s-v1.f64le",
+      "fixture_sha256": "aff626c8c90045cde80acec435d54de8e22807ed3a44accc8fb75cc13445973c",
+      "key": {
+        "band_family": "NB",
+        "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+        "config": "nb-2s",
+        "sample_rate_hz": 48000,
+        "tx_gain_overrides": "none",
+        "waveform_class": "nb-mfsk-2stream"
+      },
+      "recipe": {
+        "environment": {
+          "LC_ALL": "C",
+          "PYTHONHASHSEED": "0"
+        },
+        "key": {
+          "band_family": "NB",
+          "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+          "config": "nb-2s",
+          "sample_rate_hz": 48000,
+          "tx_gain_overrides": "none",
+          "waveform_class": "nb-mfsk-2stream"
+        },
+        "source_kind": "deterministic-production-wire-qualification-fixture",
+        "steady_n_samples": 65536,
+        "tool": "calibration_capture.py",
+        "transient_exclusion_samples": 4096
+      },
+      "recipe_sha256": "39c8935b088a0e108e7fef29e3c83450295234d6679c5772985bcd95afda1c42",
+      "reference_id": "pcal-nb-mfsk-2s-v1",
+      "reference_n_samples": 65536,
+      "reference_power": 0.0229793333894219,
+      "transient_exclusion_samples": 4096
+    },
+    {
+      "calibration_peak": 0.48849564455112937,
+      "capture_n_samples": 69632,
+      "configured_bandwidth_hz": 468.75,
+      "fixture_path": "fixtures/pcal-nb-ofdm-v1.f64le",
+      "fixture_sha256": "62dc988d4fb5f5d56c8f4b1957a231567a2516b659a413720666113ac7e61950",
+      "key": {
+        "band_family": "NB",
+        "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+        "config": "nb-ofdm",
+        "sample_rate_hz": 48000,
+        "tx_gain_overrides": "none",
+        "waveform_class": "nb-ofdm"
+      },
+      "recipe": {
+        "environment": {
+          "LC_ALL": "C",
+          "PYTHONHASHSEED": "0"
+        },
+        "key": {
+          "band_family": "NB",
+          "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+          "config": "nb-ofdm",
+          "sample_rate_hz": 48000,
+          "tx_gain_overrides": "none",
+          "waveform_class": "nb-ofdm"
+        },
+        "source_kind": "deterministic-production-wire-qualification-fixture",
+        "steady_n_samples": 65536,
+        "tool": "calibration_capture.py",
+        "transient_exclusion_samples": 4096
+      },
+      "recipe_sha256": "a9b781d4d7304fd3f0b79536102a797bf509ca6199282f881f3fd4851a38d764",
+      "reference_id": "pcal-nb-ofdm-v1",
+      "reference_n_samples": 65536,
+      "reference_power": 0.0240000000000001,
+      "transient_exclusion_samples": 4096
+    },
+    {
+      "calibration_peak": 0.33815339020018265,
+      "capture_n_samples": 69632,
+      "configured_bandwidth_hz": 2343.75,
+      "fixture_path": "fixtures/pcal-wb-m16x2-v1.f64le",
+      "fixture_sha256": "a71ba2de36cc485a28308b2f6df62febaa5e38a45ea02b513999e107738d7e30",
+      "key": {
+        "band_family": "WB",
+        "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+        "config": "103",
+        "sample_rate_hz": 48000,
+        "tx_gain_overrides": "none",
+        "waveform_class": "wb-m16x2"
+      },
+      "recipe": {
+        "environment": {
+          "LC_ALL": "C",
+          "PYTHONHASHSEED": "0"
+        },
+        "key": {
+          "band_family": "WB",
+          "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+          "config": "103",
+          "sample_rate_hz": 48000,
+          "tx_gain_overrides": "none",
+          "waveform_class": "wb-m16x2"
+        },
+        "source_kind": "deterministic-production-wire-qualification-fixture",
+        "steady_n_samples": 65536,
+        "tool": "calibration_capture.py",
+        "transient_exclusion_samples": 4096
+      },
+      "recipe_sha256": "f81fc420156e34286876d6ce4637c4b25296c8d4e7e11243fba42fbce2ee0bbe",
+      "reference_id": "pcal-wb-m16x2-v1",
+      "reference_n_samples": 65536,
+      "reference_power": 0.0287241667367774,
+      "transient_exclusion_samples": 4096
+    },
+    {
+      "calibration_peak": 0.3161463016038098,
+      "capture_n_samples": 69632,
+      "configured_bandwidth_hz": 2343.75,
+      "fixture_path": "fixtures/pcal-wb-m32x1-v1.f64le",
+      "fixture_sha256": "c7a76bca3904e473c7a266298b2ecb5fe7a2230e6fe500788260c2454955a8e1",
+      "key": {
+        "band_family": "WB",
+        "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+        "config": "100",
+        "sample_rate_hz": 48000,
+        "tx_gain_overrides": "none",
+        "waveform_class": "wb-m32x1"
+      },
+      "recipe": {
+        "environment": {
+          "LC_ALL": "C",
+          "PYTHONHASHSEED": "0"
+        },
+        "key": {
+          "band_family": "WB",
+          "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+          "config": "100",
+          "sample_rate_hz": 48000,
+          "tx_gain_overrides": "none",
+          "waveform_class": "wb-m32x1"
+        },
+        "source_kind": "deterministic-production-wire-qualification-fixture",
+        "steady_n_samples": 65536,
+        "tool": "calibration_capture.py",
+        "transient_exclusion_samples": 4096
+      },
+      "recipe_sha256": "4fefcdf6732ed76181c47fbb2fcd680d6cc2675560b1d560c2c36c792f6f8a2e",
+      "reference_id": "pcal-wb-m32x1-v1",
+      "reference_n_samples": 65536,
+      "reference_power": 0.04999999999999999,
+      "transient_exclusion_samples": 4096
+    },
+    {
+      "calibration_peak": 0.6010267637275848,
+      "capture_n_samples": 69632,
+      "configured_bandwidth_hz": 2343.75,
+      "fixture_path": "fixtures/pcal-wb-ofdm-cfg16-v1.f64le",
+      "fixture_sha256": "3a31814de633e40c543af8e00c3d0751d480698e67de8f300b44174f0710fd0d",
+      "key": {
+        "band_family": "WB",
+        "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+        "config": "16",
+        "sample_rate_hz": 48000,
+        "tx_gain_overrides": "none",
+        "waveform_class": "wb-ofdm"
+      },
+      "recipe": {
+        "environment": {
+          "LC_ALL": "C",
+          "PYTHONHASHSEED": "0"
+        },
+        "key": {
+          "band_family": "WB",
+          "binary_sha256": "7902a5241ef2f8e03093e30690bd96aab226462d6f7a17b984bcacbfcb641189",
+          "config": "16",
+          "sample_rate_hz": 48000,
+          "tx_gain_overrides": "none",
+          "waveform_class": "wb-ofdm"
+        },
+        "source_kind": "deterministic-production-wire-qualification-fixture",
+        "steady_n_samples": 65536,
+        "tool": "calibration_capture.py",
+        "transient_exclusion_samples": 4096
+      },
+      "recipe_sha256": "4b2658128414fd4bd82054e3720618ee401924e0970adc832703d66229631677",
+      "reference_id": "pcal-wb-ofdm-cfg16-v1",
+      "reference_n_samples": 65536,
+      "reference_power": 0.03199999999999997,
+      "transient_exclusion_samples": 4096
+    }
+  ],
+  "schema": "simaxis-pcal-registry-v1"
+}

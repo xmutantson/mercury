@@ -27,7 +27,7 @@ on its two mercury -x alsa processes AND its bridge. Those device strings appear
 VERBATIM in the target's /proc/<pid>/cmdline. A run also owns its rsp/cmd TCP
 ports (and port+1 data sockets), which appear as "-p <port>" in mercury argv.
 
-scoped_cleanup() scans /proc and SIGKILLs only processes whose cmdline contains
+scoped_cleanup() scans /proc and SIGTERMs only processes whose cmdline contains
 one of THIS owner's device strings or "-p <port>" tokens. A sibling on a disjoint
 card/subs/port set can never match, so it is never reaped. The caller's own
 process tree (self + descendants) is excluded as a belt-and-braces guard.
@@ -114,8 +114,8 @@ def own_tokens(card, subs, ports):
     return toks
 
 
-def scoped_cleanup(card, subs, ports, settle=1.0, verbose=False):
-    """SIGKILL only the mercury / realaudio_bridge processes that OWN one of this
+def scoped_cleanup(card, subs, ports, settle=10.0, verbose=False):
+    """SIGTERM only the mercury / realaudio_bridge processes that OWN one of this
     run's ALSA cables or TCP ports. Never touches a sibling on disjoint cables.
 
     Returns the list of (pid, cmdline) actually killed (for logging / proof).
@@ -134,18 +134,22 @@ def scoped_cleanup(card, subs, ports, settle=1.0, verbose=False):
             continue
         if any(tok in cl for tok in toks):
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGTERM)
                 killed.append((pid, cl))
                 if verbose:
-                    print(f"[ra_cleanup] killed {pid}: {cl[:120]}")
+                    print(f"[ra_cleanup] SIGTERM {pid}: {cl[:120]}")
             except OSError:
                 pass
     if killed:
-        time.sleep(settle)
+        deadline = time.monotonic() + max(10.0, float(settle))
+        while time.monotonic() < deadline:
+            if all(not os.path.exists(f"/proc/{pid}") for pid, _ in killed):
+                break
+            time.sleep(0.1)
     return killed
 
 
-def scoped_cleanup_cells(cells, settle=1.0, verbose=False):
+def scoped_cleanup_cells(cells, settle=10.0, verbose=False):
     """Cohort-level cleanup for a spawner: clear stale leftovers for EVERY cell
     THIS spawner is about to launch (its own plan), and nothing else.
 
@@ -157,6 +161,6 @@ def scoped_cleanup_cells(cells, settle=1.0, verbose=False):
         ports = [c["rsp_port"], c["cmd_port"]]
         all_killed += scoped_cleanup(c["card"], c["subs"], ports,
                                      settle=0.0, verbose=verbose)
-    if all_killed:
-        time.sleep(settle)
+    if all_killed and settle > 10.0:
+        time.sleep(settle - 10.0)
     return all_killed

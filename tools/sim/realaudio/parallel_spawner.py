@@ -45,6 +45,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ra_cleanup import scoped_cleanup_cells  # concurrency-safe cohort cleanup
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+from sim_axis import (AXIS_CHOICES, DEFAULT_AXIS, AxisError, infer_bandwidth,
+                      require_single_axis, resolve_axis)
+from sim_channel_relay import parse_cell
 HARNESS = os.path.join(HERE, "arq_realaudio.py")
 
 
@@ -204,6 +208,8 @@ def build_cell_command(args, cell, json_path):
            "--play-periods", str(args.play_periods),
            "--prime-periods", str(args.prime_periods),
            "--no-kill"]
+    if args.axis != DEFAULT_AXIS:
+        cmd += ["--axis", args.axis]
     if args.no_gearshift:
         cmd += ["--no-gearshift"]
     if args.score_horizon_s is not None:
@@ -214,8 +220,32 @@ def build_cell_command(args, cell, json_path):
         cmd += ["--traffic", args.traffic]
     if args.snr is not None:
         cmd += ["--snr", str(args.snr)]
+    if args.snr3k_db is not None:
+        cmd += ["--snr3k-db", str(args.snr3k_db)]
     if args.snr3k is not None:
         cmd += ["--snr3k", str(args.snr3k)]
+    if args.cn_config_db is not None:
+        cmd += ["--cn-config-db", str(args.cn_config_db)]
+    if args.configured_bandwidth_hz is not None:
+        cmd += ["--configured-bandwidth-hz",
+                str(args.configured_bandwidth_hz)]
+    if args.band_family:
+        cmd += ["--band-family", args.band_family]
+    for option, value in (
+            ("--calibration-registry", args.calibration_registry),
+            ("--reference-id", args.reference_id),
+            ("--reference-power", args.reference_power),
+            ("--reference-class", args.reference_class),
+            ("--tx-gain-overrides", (args.tx_gain_overrides
+                                      if args.axis == "v2-fixed-config" else None)),
+            ("--sample-rate-hz", (args.sample_rate_hz
+                                   if args.axis == "v2-fixed-config" else None)),
+            ("--headroom-n-samples", args.headroom_n_samples),
+            ("--headroom-epsilon", args.headroom_epsilon)):
+        if value is not None:
+            cmd += [option, str(value)]
+    if args.s32_mode != "auto":
+        cmd += ["--s32-mode", args.s32_mode]
     if args.passthrough:
         cmd += ["--passthrough"]
     if args.cell:
@@ -256,10 +286,26 @@ def build_arg_parser():
     ap.add_argument("--passthrough", action="store_true")
     ap.add_argument("--cell", default=None)
     ap.add_argument("--profile", default="wgn")
+    ap.add_argument("--axis", choices=AXIS_CHOICES, default=DEFAULT_AXIS)
     ap.add_argument("--snr", type=float, default=None,
-                    help="channel WGN dial forwarded independently to each child")
+                    help="historical v0-only channel dial")
+    ap.add_argument("--snr3k-db", type=float, default=None)
     ap.add_argument("--snr3k", type=float, default=None,
-                    help="requested SNR3k coordinate forwarded independently")
+                    help="DEPRECATED controlling alias for --snr3k-db")
+    ap.add_argument("--cn-config-db", type=float, default=None)
+    ap.add_argument("--configured-bandwidth-hz", type=float, default=None)
+    ap.add_argument("--band-family", choices=("WB", "NB"), default=None)
+    ap.add_argument("--calibration-registry", default=None)
+    ap.add_argument("--reference-id", default=None)
+    ap.add_argument("--reference-power", type=float, default=None)
+    ap.add_argument("--reference-class", default=None)
+    ap.add_argument("--tx-gain-overrides", default="none")
+    ap.add_argument("--sample-rate-hz", type=int, default=48000)
+    ap.add_argument("--headroom-n-samples", type=int, default=None)
+    ap.add_argument("--headroom-epsilon", type=float, default=None)
+    ap.add_argument("--s32-mode",
+                    choices=("auto", "prescaled", "s32-hardclip"),
+                    default="auto")
     ap.add_argument("--traffic", choices=["legacy", "random-binary"],
                     default="legacy")
     ap.add_argument("--cfo-hz", type=float, default=0.0)
@@ -302,6 +348,18 @@ def main(argv=None):
         ap.error("--score-horizon-s must be positive")
     if args.spawn_plan and args.seed_offset:
         ap.error("--seed-offset cannot be combined with explicit --spawn-plan seeds")
+    try:
+        resolve_axis(
+            args.axis, snr=args.snr, snr3k=args.snr3k,
+            snr3k_db=args.snr3k_db, cn_config_db=args.cn_config_db,
+            cell_snr3k_db=(parse_cell(args.cell) if args.cell else None),
+            configured_bandwidth_hz=(
+                args.configured_bandwidth_hz
+                if args.configured_bandwidth_hz is not None
+                else infer_bandwidth(args.start_cfg, args.band_family)),
+            default_snr3k_db=30.0)
+    except (AxisError, ValueError) as exc:
+        ap.error(str(exc))
 
     if args.print_setup:
         print_setup(args.n)
@@ -380,6 +438,13 @@ def main(argv=None):
                          if r.get("byte_integrity_ok") is True)
     tot_authfails = sum((r.get("aead_authfails") or 0) for r in results)
     tot_nonce_reuse = sum((r.get("nonce_reuse_count") or 0) for r in results)
+    reducer_error = None
+    try:
+        cohort_axis = require_single_axis(results)
+    except AxisError as exc:
+        cohort_axis = None
+        reducer_error = str(exc)
+    attested = results[0] if results and reducer_error is None else {}
     summary = {
         "n": args.n,
         "arm": args.arm,
@@ -388,8 +453,12 @@ def main(argv=None):
         "passthrough": args.passthrough,
         "cell": args.cell,
         "traffic": args.traffic,
-        "snr": args.snr,
-        "snr3k": args.snr3k,
+        "axis_version": cohort_axis,
+        "reducer_rejected": reducer_error is not None,
+        "reducer_error": reducer_error,
+        "configured_bandwidth_hz": attested.get("configured_bandwidth_hz"),
+        "snr3k_db": attested.get("snr3k_db"),
+        "cn_config_db": attested.get("cn_config_db"),
         "warm_start": args.warm_start,
         "score_horizon_s": args.score_horizon_s,
         "seed_offset": args.seed_offset,
@@ -405,6 +474,13 @@ def main(argv=None):
         "per_run": [
             {"tag": r.get("tag"), "card": r.get("plan_card"),
              "subs": r.get("plan_subs"), "seed": r.get("seed"),
+             "axis_version": r.get("axis_version"),
+             "reference_id": r.get("reference_id"),
+             "snr3k_db": r.get("snr3k_db"),
+             "cn_config_db": r.get("cn_config_db"),
+             "noise_variance": r.get("noise_variance"),
+             "composite_scale": r.get("composite_scale"),
+             "hard_clip_count": r.get("hard_clip_count"),
              "connected": r.get("connected"),
              "connected_at_s": r.get("connected_at_s"),
              "rx_bytes": r.get("rx_bytes"),
@@ -440,7 +516,7 @@ def main(argv=None):
     sys.stderr.write("[spawner] DONE marker -> %s\n" % done_path)
     sys.stderr.flush()
     print(json.dumps(summary, indent=1))
-    return 0
+    return 2 if reducer_error is not None else 0
 
 
 if __name__ == "__main__":

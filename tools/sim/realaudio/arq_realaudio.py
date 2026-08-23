@@ -31,6 +31,7 @@ S32/2ch/48k to match (zero plug conversion on either side).
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -39,8 +40,15 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.dirname(_HERE))
 from ra_cleanup import scoped_cleanup  # concurrency-safe per-run cleanup
+from sim_axis import (AXIS_CHOICES, AXIS_V0, AXIS_V2, DEFAULT_AXIS, AxisError,
+                      calibration_key, infer_bandwidth,
+                      load_and_select_calibration, resolve_axis, sha256_file,
+                      sha256_json, validate_attestation)
+from sim_channel_relay import parse_cell
 
 CONNECT_RE = re.compile(r"link_status:Connected to")
 DISC_RE = re.compile(r"link_status:Disconnected|DISCONNECTED")
@@ -76,12 +84,27 @@ CRYPTO_RX_OK_RE = re.compile(r"\[CRYPTO-RX\] Decrypted: \d+ -> \d+ bytes OK")
 RXDATA_RE = re.compile(r"\[RX-BATCH-SEQ\]\s+type=DATA|\[RX-DATA\]\s+type=")
 RX_OVERRUN_MARKER = "RX-OVERRUN-TOTAL"
 RX_OVERRUN_RE = re.compile(r"RX-OVERRUN-TOTAL n=(\d+)$")
+SENSITIVE_ENV_RE = re.compile(
+    r"(?:PASS|PASSWORD|PSK|SECRET|TOKEN|CREDENTIAL|PRIVATE|API[_-]?KEY)",
+    re.IGNORECASE)
 
 TRAFFIC_LEGACY = "legacy"
 TRAFFIC_RANDOM_BINARY = "random-binary"
 TRAFFIC_CHOICES = (TRAFFIC_LEGACY, TRAFFIC_RANDOM_BINARY)
 _LEGACY_CHUNK = bytes(range(256)) * 8
 _RANDOM_BINARY_KEY = b"mercury-capstone-incompressible-v1"
+
+
+def redacted_env_items(items):
+    """Preserve experimental env settings without emitting credentials."""
+    result = []
+    for item in items:
+        key, separator, value = item.partition("=")
+        if separator and SENSITIVE_ENV_RE.search(key):
+            result.append(key + "=<redacted>")
+        else:
+            result.append(item)
+    return result
 
 
 def random_binary_slice(offset, length):
@@ -528,10 +551,28 @@ def build_arg_parser():
              "the default remains the committed cold-start behavior")
     ap.add_argument("--warm-timeout", type=float, default=120.0)
     ap.add_argument("--passthrough", action="store_true")
-    ap.add_argument("--snr", type=float, default=30.0)
+    ap.add_argument("--axis", choices=AXIS_CHOICES, default=DEFAULT_AXIS,
+                    help="versioned channel axis; campaign default remains v1")
+    ap.add_argument("--snr", type=float, default=None,
+                    help="historical ambiguous dial; v0 only")
+    ap.add_argument("--snr3k-db", type=float, default=None)
     ap.add_argument(
         "--snr3k", type=float, default=None,
-        help="independent requested SNR3k coordinate recorded alongside --snr")
+        help="DEPRECATED controlling alias for --snr3k-db")
+    ap.add_argument("--cn-config-db", type=float, default=None)
+    ap.add_argument("--configured-bandwidth-hz", type=float, default=None)
+    ap.add_argument("--band-family", choices=("WB", "NB"), default=None)
+    ap.add_argument("--calibration-registry", default=None)
+    ap.add_argument("--reference-id", default=None)
+    ap.add_argument("--reference-power", type=float, default=None)
+    ap.add_argument("--reference-class", default=None)
+    ap.add_argument("--tx-gain-overrides", default="none")
+    ap.add_argument("--sample-rate-hz", type=int, default=48000)
+    ap.add_argument("--headroom-n-samples", type=int, default=None)
+    ap.add_argument("--headroom-epsilon", type=float, default=None)
+    ap.add_argument("--s32-mode",
+                    choices=("auto", "prescaled", "s32-hardclip"),
+                    default="auto")
     ap.add_argument("--traffic", choices=TRAFFIC_CHOICES, default=TRAFFIC_LEGACY,
                     help="legacy committed ramp or deterministic incompressible bytes")
     ap.add_argument("--cell", default=None)
@@ -579,6 +620,74 @@ def main(argv=None):
     if args.warm_timeout <= 0:
         ap.error("--warm-timeout must be positive")
 
+    configured_bandwidth_hz = (
+        args.configured_bandwidth_hz
+        if args.configured_bandwidth_hz is not None
+        else infer_bandwidth(args.start_cfg, args.band_family))
+    try:
+        resolved_axis = resolve_axis(
+            args.axis, snr=args.snr, snr3k=args.snr3k,
+            snr3k_db=args.snr3k_db, cn_config_db=args.cn_config_db,
+            cell_snr3k_db=(parse_cell(args.cell) if args.cell else None),
+            configured_bandwidth_hz=configured_bandwidth_hz,
+            default_snr3k_db=30.0)
+    except (AxisError, ValueError) as exc:
+        ap.error(str(exc))
+
+    try:
+        binary_sha256 = sha256_file(args.bin)
+    except OSError as exc:
+        ap.error("cannot hash --bin: %s" % exc)
+
+    calibration = None
+    if args.axis == AXIS_V2:
+        missing = [name for name, value in (
+            ("--calibration-registry", args.calibration_registry),
+            ("--reference-id", args.reference_id),
+            ("--reference-power", args.reference_power),
+            ("--reference-class", args.reference_class),
+            ("--band-family", args.band_family),
+            ("--headroom-n-samples", args.headroom_n_samples),
+            ("--headroom-epsilon", args.headroom_epsilon),
+        ) if value is None]
+        if missing:
+            ap.error("v2 preflight requires " + ", ".join(missing))
+        key = calibration_key(
+            binary_sha256=binary_sha256, config=args.start_cfg,
+            band_family=args.band_family,
+            tx_gain_overrides=args.tx_gain_overrides,
+            sample_rate_hz=args.sample_rate_hz,
+            waveform_class=args.reference_class)
+        try:
+            calibration = load_and_select_calibration(
+                args.calibration_registry, key, args.reference_id)
+        except (AxisError, OSError, ValueError) as exc:
+            ap.error("v2 calibration preflight failed: %s" % exc)
+        if not math.isclose(args.reference_power,
+                            float(calibration["reference_power"]),
+                            rel_tol=0.0, abs_tol=1e-15):
+            ap.error("--reference-power does not match the registry record")
+        if not math.isclose(configured_bandwidth_hz,
+                            float(calibration["configured_bandwidth_hz"]),
+                            rel_tol=0.0, abs_tol=1e-12):
+            ap.error("--configured-bandwidth-hz does not match calibration")
+
+    recipe_sha256 = sha256_json({
+        "axis": resolved_axis, "start_cfg": args.start_cfg,
+        "reference_id": args.reference_id,
+        "reference_power": args.reference_power,
+        "reference_class": args.reference_class,
+        "tx_gain_overrides": args.tx_gain_overrides,
+        "sample_rate_hz": args.sample_rate_hz,
+        "profile": args.profile, "cfo_hz": args.cfo_hz,
+        "phase_noise_deg": args.phase_noise_deg,
+        "seed": args.seed, "s32_mode": args.s32_mode,
+        "headroom_n_samples": args.headroom_n_samples,
+        "headroom_epsilon": args.headroom_epsilon,
+        "passthrough": args.passthrough,
+        "env": sorted(args.env),
+    })
+
     os.makedirs(args.logdir, exist_ok=True)
     # Per-cell env injection: each mercury instance inherits the parent env PLUS
     # the KEY=VAL pairs passed via --env. This is how the redesign arm carries
@@ -622,6 +731,8 @@ def main(argv=None):
     stop = threading.Event()
     t0 = time.time()
     bridge = None
+    bridge_stats_path = os.path.join(
+        args.logdir, f"bridge_{args.tag}_stats.json")
     res = {"tx": 0, "rx": 0}
     integrity = ByteIntegrityTracker(args.traffic)
     connected_at = None
@@ -665,7 +776,9 @@ def main(argv=None):
         bcmd = [sys.executable, args.bridge,
                 "--fwd-cap", fwd_cap, "--fwd-play", fwd_play,
                 "--rev-cap", rev_cap, "--rev-play", rev_play,
-                "--snr", str(args.snr), "--profile", args.profile,
+                "--axis", args.axis,
+                "--configured-bandwidth-hz", str(configured_bandwidth_hz),
+                "--profile", args.profile,
                 "--cfo-hz", str(args.cfo_hz),
                 "--phase-noise-deg", str(args.phase_noise_deg),
                 "--fade-depth-db", str(args.fade_depth_db),
@@ -673,11 +786,33 @@ def main(argv=None):
                 "--cap-periods", str(args.cap_periods),
                 "--play-periods", str(args.play_periods),
                 "--prime-periods", str(args.prime_periods),
-                "--statsfile", os.path.join(args.logdir, f"bridge_{args.tag}_stats.json")]
+                "--binary-sha256", binary_sha256,
+                "--recipe-sha256", recipe_sha256,
+                "--s32-mode", args.s32_mode,
+                "--statsfile", bridge_stats_path]
+        input_coordinate = resolved_axis["input_coordinate"]
+        if input_coordinate == "snr":
+            bcmd += ["--snr", str(resolved_axis["snr3k_db"])]
+        elif input_coordinate == "snr3k":
+            bcmd += ["--snr3k", str(resolved_axis["snr3k_db"])]
+        elif input_coordinate == "snr3k_db":
+            bcmd += ["--snr3k-db", str(resolved_axis["snr3k_db"])]
+        elif input_coordinate == "cn_config_db":
+            bcmd += ["--cn-config-db", str(resolved_axis["cn_config_db"])]
+        elif input_coordinate == "cell":
+            bcmd += ["--cell", args.cell]
+        if calibration is not None:
+            bcmd += [
+                "--reference-power", str(calibration["reference_power"]),
+                "--reference-id", calibration["reference_id"],
+                "--reference-n-samples",
+                str(calibration["reference_n_samples"]),
+                "--calibration-peak", str(calibration["calibration_peak"]),
+                "--headroom-n-samples", str(args.headroom_n_samples),
+                "--headroom-epsilon", str(args.headroom_epsilon),
+            ]
         if args.passthrough:
             bcmd += ["--passthrough"]
-        if args.cell:
-            bcmd += ["--cell", args.cell]
         blog = open(os.path.join(args.logdir, f"bridge_{args.tag}.log"), "wb")
         bridge = subprocess.Popen(bcmd, stdout=blog, stderr=blog)
         time.sleep(2.0)
@@ -796,18 +931,28 @@ def main(argv=None):
                 pass
         for p in procs:
             try:
-                p.kill()
+                p.terminate()
             except OSError:
                 pass
+        terminate_deadline = time.time() + 10.0
+        for p in procs:
+            remaining = max(0.0, terminate_deadline - time.time())
+            try:
+                p.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                sys.stderr.write(
+                    "[harness] process did not exit after SIGTERM grace; "
+                    "leaving it for scoped recovery: pid=%s\n" % p.pid)
         if bridge:
             try:
                 bridge.terminate()
-                bridge.wait(timeout=3)
-            except Exception:
-                try:
-                    bridge.kill()
-                except Exception:
-                    pass
+                bridge.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                sys.stderr.write(
+                    "[harness] bridge did not exit after SIGTERM grace; "
+                    "not sending SIGKILL: pid=%s\n" % bridge.pid)
+            except OSError:
+                pass
         logfile.close()
 
     dwell_cold = max(1.0, time.time() - t0)
@@ -865,11 +1010,23 @@ def main(argv=None):
                          and st.rsp_max_wb_cfg_with_data >= 1)
     # legacy compat boolean (kept; now derived from the corrected RSP-side WB set).
     climbed_past_robust0 = bool(wb_seen) or any(c > 100 for c in rsp_configs_sorted)
+    try:
+        with open(bridge_stats_path, "r", encoding="utf-8") as stream:
+            bridge_stats = json.load(stream)
+        axis_attestation = validate_attestation(
+            bridge_stats["axis_attestation"])
+    except (OSError, KeyError, ValueError, TypeError, AxisError) as exc:
+        sys.stderr.write("[harness] FATAL bridge attestation rejected: %s\n" % exc)
+        return 2
+
     result = {
-        "tag": args.tag, "arm": args.arm, "env": args.env,
+        "tag": args.tag, "arm": args.arm,
+        "env": redacted_env_items(args.env),
         "traffic": args.traffic,
         "passthrough": args.passthrough,
-        "snr": args.snr, "snr3k": args.snr3k,
+        "snr": (axis_attestation["snr3k_db"]
+                if axis_attestation["axis_version"] == AXIS_V0 else None),
+        "snr3k": axis_attestation["snr3k_db"],
         "cell": args.cell, "profile": args.profile,
         "seed": args.seed, "start_cfg": args.start_cfg,
         "card": args.card, "subs": subs,
@@ -937,6 +1094,7 @@ def main(argv=None):
         "wall_secs": round(dwell, 1),
         "wall_secs_cold": round(dwell_cold, 1),
     }
+    result.update(axis_attestation)
     print(json.dumps(result))
     if args.json:
         with open(args.json, "w") as f:

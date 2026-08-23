@@ -113,6 +113,9 @@ import time
 
 import numpy as np
 
+from sim_axis import (AXIS_CHOICES, AXIS_V0, AXIS_V1, AXIS_V2, DEFAULT_AXIS,
+                      AxisError, cn_from_snr3k, infer_bandwidth, resolve_axis)
+
 CHUNK_SAMPLES = 1024          # MUST match SIM_CHUNK_SAMPLES in audioio.c
 CHUNK_BYTES = CHUNK_SAMPLES * 8
 STAMP_BYTES = 8               # <Q LE uint64 relay-stamped virtual clock (opt-in)
@@ -742,7 +745,17 @@ class Channel:
     """Per-direction channel state (independent noise/fade per link)."""
 
     def __init__(self, args, rng_seed):
-        self.snr_db = args.snr            # SNR3k in dB
+        self.axis_version = getattr(args, "axis", DEFAULT_AXIS)
+        if self.axis_version not in AXIS_CHOICES:
+            raise AxisError("unknown axis_version %r" % self.axis_version)
+        self.snr_db = float(getattr(args, "snr3k_db", args.snr))
+        self.cn_config_db = float(getattr(
+            args, "cn_config_db",
+            cn_from_snr3k(self.snr_db, getattr(
+                args, "configured_bandwidth_hz", 2343.75))))
+        self.configured_bandwidth_hz = float(getattr(
+            args, "configured_bandwidth_hz", 2343.75))
+        self.input_coordinate = getattr(args, "input_coordinate", "snr")
         # ---- OPT-IN time-varying SNR schedule -------------------------
         # Parse '<virt_s>:<WGN_label>' edges keyed to the per-direction
         # virtual clock (sample_clock/FS). Sorted ascending by time. The
@@ -772,17 +785,52 @@ class Channel:
         self.rng = Xoshiro(rng_seed)       # Python RNG for AWGN + burst
         np_rng = self.rng.seed_np()        # numpy RNG for taps + phase noise
 
-        # ---- Inc 3 noise calibration ----------------------------------
+        # ---- Inc 3 / SIMAXIS noise calibration ------------------------
         # P_sig is measured live (mean-square of TX passband). Start from a
         # sticky reference until real TX power is seen so the handshake's
         # first frames already sit in the calibrated noise floor.
         self.snr_lin = 10.0 ** (self.snr_db / 10.0)
-        self.p_sig = max(args.sig_ref, 1e-6) ** 2   # sig_ref is an RMS; P=RMS^2
-        self.p_sig_measured = False
+        if self.axis_version == AXIS_V2:
+            self.p_sig = float(args.reference_power)
+            if self.p_sig <= 0.0:
+                raise AxisError("v2 reference_power must be positive")
+            self.p_sig_measured = True
+            self.reference_mode = "fixed-archived-pcal"
+            self.reference_id = str(args.reference_id)
+            self.reference_n_samples = int(args.reference_n_samples)
+        else:
+            self.p_sig = max(args.sig_ref, 1e-6) ** 2
+            self.p_sig_measured = False
+            if self.axis_version == AXIS_V1:
+                self.reference_mode = "steady-active-chunk-median"
+                self.reference_id = "traffic-steady-v1"
+            else:
+                self.reference_mode = "peak-chunk-mean-square"
+                self.reference_id = "traffic-peak-v0"
+            self.reference_n_samples = 0
         self.noise_std = self._noise_std_from_psig(self.p_sig)
 
         self.peak_diag = 0.0
         self.peak_ms = 0.0                 # sticky peak mean-square (power)
+
+        # v1 is the deployed steady meter, preserved exactly: median of all
+        # active 1024-sample chunk powers, refreshed after every eight active
+        # chunks.  v0 is the audited peak hold.  v2 never observes traffic when
+        # choosing its fixed noise floor.
+        self.psig_mode = {
+            AXIS_V0: "peak", AXIS_V1: "steady", AXIS_V2: "fixed",
+        }[self.axis_version]
+        self._active_ms = []
+        self._psig_active_floor = 1e-7
+        self._psig_recompute_every = 8
+        self._psig_since_recompute = 0
+        self._psig_diag_samples = 0
+        self._psig_diag_next = 0
+        self.noise_n_samples = 0
+        self.last_signal_component = np.empty(0, dtype=np.float64)
+        self.last_noise_component = np.empty(0, dtype=np.float64)
+        self.binary_sha256 = getattr(args, "binary_sha256", None)
+        self.recipe_sha256 = getattr(args, "recipe_sha256", None)
 
         # ---- Inc 4 Watterson taps -------------------------------------
         prof = PROFILES.get(self.profile)
@@ -816,6 +864,28 @@ class Channel:
         var = p_sig * F_NYQUIST / (self.snr_lin * BW_NOISE)
         return math.sqrt(max(var, 0.0))
 
+    @property
+    def applied_noise_variance(self):
+        return self.noise_std * self.noise_std
+
+    def attestation(self):
+        """Applied channel values; callers add transport/headroom counters."""
+        return {
+            "axis_version": self.axis_version,
+            "input_coordinate": self.input_coordinate,
+            "reference_mode": self.reference_mode,
+            "reference_id": self.reference_id,
+            "reference_power": self.p_sig,
+            "reference_n_samples": self.reference_n_samples,
+            "configured_bandwidth_hz": self.configured_bandwidth_hz,
+            "snr3k_db": self.snr_db,
+            "cn_config_db": self.cn_config_db,
+            "noise_variance": self.applied_noise_variance,
+            "noise_n_samples": self.noise_n_samples,
+            "binary_sha256": self.binary_sha256,
+            "recipe_sha256": self.recipe_sha256,
+        }
+
     def process(self, samples):
         x = np.asarray(samples, dtype=np.float64)
         n = x.size
@@ -825,13 +895,39 @@ class Channel:
         if amax > self.peak_diag:
             self.peak_diag = amax
         ms = float(np.mean(x * x)) if n else 0.0
-        # sticky power: only update from chunks with real signal energy so
-        # silent gaps don't drag P_sig (and thus the noise floor) toward 0.
-        if ms > self.peak_ms:
+        peak_advanced = ms > self.peak_ms
+        if peak_advanced:
             self.peak_ms = ms
+        if self.psig_mode == "steady":
+            if ms > self._psig_active_floor:
+                self._active_ms.append(ms)
+                self.reference_n_samples += n
+                self._psig_since_recompute += 1
+                if self._psig_since_recompute >= self._psig_recompute_every:
+                    self._psig_since_recompute = 0
+                    self.p_sig = float(np.median(self._active_ms))
+                    self.p_sig_measured = True
+                    self.noise_std = self._noise_std_from_psig(self.p_sig)
+        elif self.psig_mode == "peak" and peak_advanced:
+            # Byte-identical v0 law: sticky maximum chunk mean-square.
             self.p_sig = self.peak_ms
             self.p_sig_measured = True
+            self.reference_n_samples = n
             self.noise_std = self._noise_std_from_psig(self.p_sig)
+
+        self._psig_diag_samples += n
+        if self._psig_diag_samples >= self._psig_diag_next:
+            self._psig_diag_next = self._psig_diag_samples + 5 * 48000
+            active_median = (float(np.median(self._active_ms))
+                             if self._active_ms else 0.0)
+            active_mean = (float(np.mean(self._active_ms))
+                           if self._active_ms else 0.0)
+            print("[PSIG_DIAG] mode=%s p_sig_used=%.6f peak_ms_seen=%.6f "
+                  "active_median_ms=%.6f active_mean_ms=%.6f n_active=%d "
+                  "noise_std=%.6f snr_label=%.1f" %
+                  (self.psig_mode, self.p_sig, self.peak_ms, active_median,
+                   active_mean, len(self._active_ms), self.noise_std,
+                   self.snr_db), flush=True)
 
         # --- 1. Watterson multipath fading (complex baseband) ----------
         if self.fading:
@@ -882,7 +978,13 @@ class Channel:
             # use the deterministic Xoshiro stream for reproducibility
             noise = np.fromiter((self.rng.gauss() for _ in range(n)),
                                 dtype=np.float64, count=n)
-            out = out + self.noise_std * noise
+            noise_component = self.noise_std * noise
+            out = out + noise_component
+        else:
+            noise_component = np.zeros(n, dtype=np.float64)
+        self.last_signal_component = np.real(y).copy()
+        self.last_noise_component = noise_component
+        self.noise_n_samples += n
 
         # --- 3. orthogonal impulse / burst erasure (NOT multipath) ------
         if self.burst and self.loss > 0.0:
@@ -968,9 +1070,23 @@ def parse_cell(cell):
 def main():
     ap = argparse.ArgumentParser(description="SIM ARQ channel relay (Watterson + SNR3k)")
     ap.add_argument("--port", type=int, default=52100)
-    ap.add_argument("--snr", type=float, default=12.0,
-                    help="channel SNR in dB referenced to 3 kHz (SNR3k). "
-                         "Overridden by --cell.")
+    ap.add_argument("--axis", choices=AXIS_CHOICES, default=DEFAULT_AXIS,
+                    help="versioned channel axis (default: %(default)s)")
+    ap.add_argument("--snr", type=float, default=None,
+                    help="ambiguous historical dial; accepted only with "
+                         "--axis %s" % AXIS_V0)
+    ap.add_argument("--snr3k-db", type=float, default=None,
+                    help="controlling SNR in the 3000 Hz reference bandwidth")
+    ap.add_argument("--snr3k", type=float, default=None,
+                    help="DEPRECATED controlling alias for --snr3k-db")
+    ap.add_argument("--cn-config-db", type=float, default=None,
+                    help="controlling C/N in --configured-bandwidth-hz")
+    ap.add_argument("--configured-bandwidth-hz", type=float, default=None)
+    ap.add_argument("--band-family", choices=("WB", "NB"), default=None)
+    ap.add_argument("--reference-power", type=float, default=None,
+                    help="archived Pcal power; required by v2")
+    ap.add_argument("--reference-id", default=None)
+    ap.add_argument("--reference-n-samples", type=int, default=None)
     ap.add_argument("--cell", default=None,
                     help="IONOS-compatible WGN label, e.g. WGN:-12; mapped "
                          "to measured external SNR3k (direct --snr is literal)")
@@ -1157,8 +1273,29 @@ def main():
                  "stamp, lurching the relay-stamped virtual clock forward across "
                  "the handshake (overshoots connect windows). Use --idle-bigstep 1.")
 
-    if args.cell:
-        args.snr = parse_cell(args.cell)
+    bandwidth = (args.configured_bandwidth_hz
+                 if args.configured_bandwidth_hz is not None
+                 else infer_bandwidth(None, args.band_family))
+    try:
+        resolved = resolve_axis(
+            args.axis, snr=args.snr, snr3k=args.snr3k,
+            snr3k_db=args.snr3k_db, cn_config_db=args.cn_config_db,
+            cell_snr3k_db=(parse_cell(args.cell) if args.cell else None),
+            configured_bandwidth_hz=bandwidth, default_snr3k_db=12.0)
+    except (AxisError, ValueError) as exc:
+        ap.error(str(exc))
+    if args.axis == AXIS_V2:
+        if args.reference_power is None or not args.reference_id:
+            ap.error("v2 requires --reference-power and --reference-id")
+        if args.reference_n_samples is None or args.reference_n_samples <= 0:
+            ap.error("v2 requires positive --reference-n-samples")
+        if args.snr_schedule:
+            ap.error("v2 fixed-config does not permit --snr-schedule")
+    args.snr = resolved["snr3k_db"]
+    args.snr3k_db = resolved["snr3k_db"]
+    args.cn_config_db = resolved["cn_config_db"]
+    args.configured_bandwidth_hz = resolved["configured_bandwidth_hz"]
+    args.input_coordinate = resolved["input_coordinate"]
 
     logf = open(args.log, "w") if args.log else sys.stdout
 
@@ -1178,7 +1315,9 @@ def main():
     prof = PROFILES.get(args.profile)
     prof_s = "none" if prof is None else f"dtau={prof['dtau']*1e3:.1f}ms fd={prof['fd']}Hz"
     log(f"relay listening on 127.0.0.1:{args.port} "
-        f"SNR3k={args.snr:.2f}dB ({'cell '+args.cell if args.cell else 'snr'}) "
+        f"axis={args.axis} SNR3k={args.snr3k_db:.2f}dB "
+        f"C/N(Bcfg)={args.cn_config_db:.2f}dB Bcfg={args.configured_bandwidth_hz:g}Hz "
+        f"(input={args.input_coordinate}) "
         f"profile={args.profile} ({prof_s}) cfo={args.cfo_hz}Hz "
         f"phase_noise={args.phase_noise_deg}deg "
         f"burst={args.burst} loss={args.loss} seed={args.seed} "
