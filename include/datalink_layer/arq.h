@@ -6353,11 +6353,6 @@ public:
   bool connect_fast_active;         // latched true during the fast attempt; cleared on revert/CONNECTED
   int connect_fast_fallback_config; // config to revert to (the connect-time start/pin config)
   int connect_fast_fallback_robust; // robust_enabled to restore on revert (the true robust intent)
-  // Explicit admission authority for an off-ladder pinned-only config. This is
-  // CONFIG_NONE for ordinary sessions and the exact symbolic config selected by
-  // -s or MERCURY_CONNECT_FAST_CONFIG otherwise. Peer-supplied config values are
-  // accepted only when they equal this local authority.
-  int admission_pinned_config;
   cl_timer connect_fast_timer;      // COMMANDER short-budget timer (armed at CONNECT)
   // Bare START ACKs are CRC-less. Arm only after a successful MFSK START TX;
   // the capture producer tags post-deadline samples and capture prep publishes

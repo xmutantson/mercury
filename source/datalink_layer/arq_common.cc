@@ -984,7 +984,6 @@ cl_arq_controller::cl_arq_controller()
 		connect_fast_active = false;
 		connect_fast_fallback_config = ROBUST_0;
 		connect_fast_fallback_robust = YES;
-		admission_pinned_config = CONFIG_NONE;
 		start_ack_causal_guard_armed = false;
 		start_ack_causal_timer.stop();
 		start_ack_causal_timer.reset();
@@ -3102,12 +3101,6 @@ int cl_arq_controller::init(int tcp_base_port, int gear_shift_on, int initial_mo
 	// derivation consistent at the fast config (session_floor_anchor(false,cfg)=cfg),
 	// reproducing the proven --start-cfg N seat. The revert (COMMANDER update_status /
 	// RESPONDER HAIL-timeout) restores robust_enabled + the true start/pin config.
-	// An explicit LOW48 pin owns the whole session, including CONNECT. Without this
-	// override the default fast-connect vehicle would temporarily replace an -s pin
-	// and, after a successful handshake, leave the session on the wrong config.
-	if(is_low48_anchor_config(admission_pinned_config))
-		connect_fast_config = admission_pinned_config;
-
 	if(connect_fast_config != CONFIG_NONE)
 	{
 		connect_fast_fallback_robust = robust_enabled;

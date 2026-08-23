@@ -2327,7 +2327,7 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				data_configuration = connect_fuse_seed_rx;
 				connect_fuse_seed_rx = CONFIG_NONE;
 				if(data_configuration != current_configuration &&
-				   config_negotiable_to(data_configuration, admission_pinned_config))
+				   (config_negotiable_to(data_configuration, is_robust3_config(init_configuration) || is_robust3_config(connect_fast_fallback_config))))
 				{
 					load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
 					if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
@@ -4408,7 +4408,7 @@ void cl_arq_controller::process_control_responder()
 				if(!connect_fuse_defeat)
 				{
 					int s_seed = (int)(unsigned char)messages_control.data[2];
-					if(config_negotiable_to(s_seed, admission_pinned_config))
+					if(config_negotiable_to(s_seed, is_robust3_config(init_configuration) || is_robust3_config(connect_fast_fallback_config)))
 					{
 						connect_fuse_seed_rx = s_seed;
 						printf("[BW-NEG] FUSE: SWITCH_BANDWIDTH carries connect-seed config %d\n", s_seed);
@@ -4446,7 +4446,7 @@ void cl_arq_controller::process_control_responder()
 				// Monitor: load config immediately (no ACK to send first)
 				data_configuration = forward_configuration;
 				if(forward_configuration != current_configuration &&
-						config_negotiable_to(forward_configuration, admission_pinned_config))
+					(config_negotiable_to(forward_configuration, is_robust3_config(init_configuration) || is_robust3_config(connect_fast_fallback_config))))
 				{
 					load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
 
@@ -4493,7 +4493,7 @@ void cl_arq_controller::process_control_responder()
 				telecom_system->data_container.nUnder_processing_events = 0;
 			}
 			else if(forward_configuration != current_configuration &&
-					config_negotiable_to(forward_configuration, admission_pinned_config))
+				(config_negotiable_to(forward_configuration, is_robust3_config(init_configuration) || is_robust3_config(connect_fast_fallback_config))))
 			{
 				// Don't load_configuration here — ack_configuration must stay on
 				// the OLD config so the ACK reaches the commander (still on old config).
