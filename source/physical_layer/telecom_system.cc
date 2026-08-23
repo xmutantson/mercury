@@ -1868,6 +1868,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// genuine relocation (missed frame / re-anchor) and is followed like stock.
 	bool keydown_track_active = false;
 	int  keydown_tracked_delay = 0;
+	// Position provenance for acquisition-only discriminators.  This is set only
+	// when MINI0 takes its coordinate directly from the decoded-anchor batch grid;
+	// verify/re-pin/full-search candidates retain searched provenance.
+	bool position_from_batch_predictor = false;
 	static const double keydown_track_beta = []{ const char* e=std::getenv("MERCURY_KEYDOWN_BETA"); double v=(e&&*e)?atoi(e)/100.0:0.25; if(v<0.0)v=0.0; if(v>1.0)v=1.0; return v; }();
 	static const int keydown_track_diag = []{ const char* e=std::getenv("MERCURY_KEYDOWN_DIAG"); return (e&&*e)?atoi(e):0; }();
 
@@ -2232,6 +2236,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					int keydown_pred_ph = predicted_pos + keydown_phi;   // carry the anchor sub-symbol fine-timing phase
 					receive_stats.delay = keydown_pred_ph;
 					receive_stats.coarse_metric = 1.0;
+					position_from_batch_predictor = true;
 					keydown_tracked_delay = keydown_pred_ph;
 					keydown_track_active = true;
 					batch_verified = true;
@@ -2281,6 +2286,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 					if(verify.correlation >= preamble_detect_threshold)
 					{
+						// The verifier, not the batch boundary, now owns the coordinate.
+						position_from_batch_predictor = false;
 						// Prediction verified — use directly, skip wider search
 						receive_stats.coarse_metric = verify.correlation;
 						int raw_resid = (int)verify.delay - predicted_pos;
@@ -3977,7 +3984,13 @@ skip_h_retry_point:
 				bool thin_pilot_cfg = (current_configuration == CONFIG_16 && M == MOD_32QAM)
 					|| (current_configuration == LOW48_ANCHOR_S20_R6 && M == MOD_QPSK);
 				bool coh_flags_subpeak = thin_pilot_cfg && coh_C >= 0.0 && coh_C < subpeak_coh_entry;
-				if(receive_stats.coarse_metric >= 0.97
+				// SUBPEAK is an acquisition discriminator: it has authority over
+				// coordinates selected by a search, not a cfg105 MINI0 boundary carried
+				// from the decoded anchor.  Keep the exemption provenance-based and
+				// cfg105-scoped; no metric threshold or search behavior is changed.
+				bool subpeak_gate_has_authority = !is_low48_anchor_config(current_configuration)
+					|| !position_from_batch_predictor;
+				if(subpeak_gate_has_authority && receive_stats.coarse_metric >= 0.97
 					&& ((!thin_pilot_cfg && mean_H < 0.5) || coh_flags_subpeak))
 				{
 					// F0-RINGDUMP (capture-replay fixture): at the SUBPEAK-REJECT trigger dump the
