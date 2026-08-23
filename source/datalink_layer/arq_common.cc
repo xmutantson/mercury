@@ -19236,7 +19236,11 @@ void cl_arq_controller::receive()
 				// margin here: batch prediction consumes this cursor as the tail
 				// grid, so backing it up by one symbol seats the nominal prediction
 				// one symbol early.
-				int frame_end_symb = received_message_stats.delay / symbol_period + rx_frame;
+				int anchor_grid_delay = received_message_stats.delay;
+				if(is_low48_anchor_config(current_configuration)
+					&& telecom_system->keydown_last_delay >= 0)
+					anchor_grid_delay = telecom_system->keydown_last_delay;
+				int frame_end_symb = anchor_grid_delay / symbol_period + rx_frame;
 				int anti_redecode_margin =
 					is_low48_anchor_config(current_configuration) ? 0 : 1;
 				telecom_system->receive_stats.ofdm_search_raw =

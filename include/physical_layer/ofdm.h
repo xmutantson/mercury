@@ -513,6 +513,9 @@ public:
 	double ofdm_corr_template_sym_energy[16]; // per-symbol energy
 	double ofdm_corr_template_energy; // total energy
 	TimeSyncResult time_sync_preamble_matched(std::complex<double>* baseband_interp, int buffer_size_interp, int interpolation_rate, int preamble_nSymb);
+	TimeSyncResult time_sync_preamble_matched_local(std::complex<double>* baseband_interp,
+		int buffer_size_interp, int interpolation_rate, int preamble_nSymb,
+		int center, int half_window);
 };
 
 

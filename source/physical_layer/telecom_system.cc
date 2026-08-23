@@ -4697,7 +4697,44 @@ skip_h_retry_point:
 				acq_band_excl_begin_epoch();
 				if(M != MOD_MFSK)
 				{
-					keydown_last_delay = receive_stats.delay;   // MINI=0 phase carry: remember the last good frame position
+					keydown_last_delay = receive_stats.delay;
+					if(is_low48_anchor_config(current_configuration)
+						&& ofdm.ofdm_corr_template != NULL)
+					{
+						// The CP/repetition detector admits any point on its timing
+						// plateau. A decoded full preamble supplies a known waveform,
+						// so resolve its wire boundary by normalized matched correlation
+						// inside one guard interval. This single boundary drives both
+						// the batch cursor quotient and the MINI0 phase residue.
+						const int interp = data_container.interpolation_rate;
+						const int guard = data_container.Ngi * interp;
+						const int preamble_samples = data_container.preamble_nSymb
+							* data_container.Nofdm * interp;
+						const int margin = ((ofdm.FIR_rx_time_sync.filter_nTaps
+							+ interp - 1) / interp) * interp;
+						const int buffer_samples = data_container.Nofdm
+							* data_container.buffer_Nsymb * interp;
+						int slice_start = keydown_last_delay - guard - margin;
+						int slice_end = keydown_last_delay + guard
+							+ preamble_samples + margin;
+						if(slice_start < 0) slice_start = 0;
+						if(slice_end > buffer_samples) slice_end = buffer_samples;
+						const int slice_size = slice_end - slice_start;
+						if(slice_size > 0
+							&& slice_size <= data_container.baseband_data_fine_slice_size)
+						{
+							ofdm.passband_to_baseband(&((double*)data)[slice_start],
+								slice_size, data_container.baseband_data_fine_slice,
+								sampling_frequency, carrier_frequency + coarse_freq_offset,
+								carrier_amplitude, 1, &ofdm.FIR_rx_time_sync, slice_start);
+							TimeSyncResult boundary = ofdm.time_sync_preamble_matched_local(
+								data_container.baseband_data_fine_slice, slice_size,
+								interp, data_container.preamble_nSymb,
+								keydown_last_delay - slice_start, guard);
+							if(boundary.correlation > 0.0)
+								keydown_last_delay = slice_start + boundary.delay;
+						}
+					}
 					printf("[OFDM-OK] t%d cfg=%d delay=%d iter=%d freq=%.1f var=%.4f meanH=%.3f SNR=%.1f coarse=%.1f\n",
 						receive_stats.sync_trials, current_configuration,
 						receive_stats.delay, receive_stats.iterations_done,
@@ -12500,9 +12537,11 @@ void cl_telecom_system::rebuild_mfsk_preamble_runtime()
 		ofdm.mfsk_alt_match_threshold = 0;
 		for(int s = 0; s < cl_mfsk::MAX_PREAMBLE_SYMB; s++) ofdm.mfsk_alt_preamble_tones[s] = 0;
 
-#if 1 // P1: template REVIVED for MF plateau-tiebreak VIABILITY MEASUREMENT (inert: time_sync_preamble_matched has 0 production callers)
-		if(std::getenv("MERCURY_F0V_MF_TEMPLATE") && atoi(std::getenv("MERCURY_F0V_MF_TEMPLATE"))!=0){
-		// Generate OFDM matched-filter template for preamble detection.
+		// The cfg105 zero-preamble tail needs the decoded full-preamble anchor's
+		// wire boundary, not the CP/repetition metric's plateau member. Build the
+		// known reference only for that configuration.
+		if(is_low48_anchor_config(current_configuration)) {
+		// Generate the OFDM matched-filter template for local boundary refinement.
 		// Must replicate the full TX→RX chain so the template matches what
 		// receive_byte actually sees:
 		//   preamble × pre_eq → symbol_mod → boost → b2p → FIR_tx1 → FIR_tx2 → p2b(FIR_rx_time_sync)
@@ -12526,16 +12565,6 @@ void cl_telecom_system::rebuild_mfsk_preamble_runtime()
 					* pre_equalization_channel[k].value;
 			ofdm.symbol_mod(preamble_sc, &bb_template[i * Nofdm]);
 		}
-
-		// === DIAG: pre_eq at template generation (remove after debug) ===
-		printf("[TMPL-PREEQ] CONFIG_%d preamble_nSymb=%d pre_eq[0..4]=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f)\n",
-			current_configuration, template_nsymb,
-			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
-			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag(),
-			pre_equalization_channel[2].value.real(), pre_equalization_channel[2].value.imag(),
-			pre_equalization_channel[3].value.real(), pre_equalization_channel[3].value.imag(),
-			pre_equalization_channel[4].value.real(), pre_equalization_channel[4].value.imag());
-		fflush(stdout);
 
 		// Apply power normalization + output power + preamble boost (same as transmit_bit lines 601-602).
 		// sqrt(output_power_Watt) MUST be included so peak_clip applies at the same
@@ -12609,23 +12638,20 @@ void cl_telecom_system::rebuild_mfsk_preamble_runtime()
 		delete[] filtered;
 		delete[] bb_template;
 
-		printf("[PHY] OFDM corr template: %d symbols, %d samples, energy=%.3f (matched filter, FIR round-tripped)\n",
-			template_nsymb, bb_len, ofdm.ofdm_corr_template_energy);
-		printf("[TMPL-INIT] t[0]=(%.6f,%.6f) t[1]=(%.6f,%.6f) t[2]=(%.6f,%.6f)\n",
-			ofdm.ofdm_corr_template[0].real(), ofdm.ofdm_corr_template[0].imag(),
-			ofdm.ofdm_corr_template[1].real(), ofdm.ofdm_corr_template[1].imag(),
-			ofdm.ofdm_corr_template[2].real(), ofdm.ofdm_corr_template[2].imag());
-		printf("[TMPL-INIT] FIR_ts: nTaps=%d cut=%.1f trans=%.1f\n",
-			ofdm.FIR_rx_time_sync.filter_nTaps,
-			ofdm.FIR_rx_time_sync.lpf_filter_cut_frequency,
-			ofdm.FIR_rx_time_sync.filter_transition_bandwidth);
-		printf("[TMPL-INIT] carrier_freq=%.1f output_power=%.3f pre_eq[0]=(%.4f,%.4f) pre_eq[1]=(%.4f,%.4f)\n",
-			carrier_frequency, output_power_Watt,
-			pre_equalization_channel[0].value.real(), pre_equalization_channel[0].value.imag(),
-			pre_equalization_channel[1].value.real(), pre_equalization_channel[1].value.imag());
-		fflush(stdout);
 		}
-#endif
+		else
+		{
+			if(ofdm.ofdm_corr_template != NULL)
+			{
+				delete[] ofdm.ofdm_corr_template;
+				ofdm.ofdm_corr_template = NULL;
+			}
+			ofdm.ofdm_corr_template_len = 0;
+			ofdm.ofdm_corr_template_nsymb = 0;
+			ofdm.ofdm_corr_template_energy = 0.0;
+			for(int i = 0; i < 16; i++)
+				ofdm.ofdm_corr_template_sym_energy[i] = 0.0;
+		}
 	}
 }
 

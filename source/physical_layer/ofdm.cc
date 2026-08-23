@@ -4618,6 +4618,55 @@ TimeSyncResult cl_ofdm::time_sync_preamble_matched(
 	return result;
 }
 
+TimeSyncResult cl_ofdm::time_sync_preamble_matched_local(
+	std::complex<double>* baseband_interp, int buffer_size_interp,
+	int interpolation_rate, int preamble_nSymb, int center, int half_window)
+{
+	TimeSyncResult result;
+	result.delay = center;
+	result.correlation = 0.0;
+	if(ofdm_corr_template == NULL || ofdm_corr_template_len <= 0
+		|| interpolation_rate <= 0 || half_window < 0)
+		return result;
+
+	const int Nofdm = Nfft + Ngi;
+	const int template_nsymb = std::min(ofdm_corr_template_nsymb, preamble_nSymb);
+	const int preamble_interp = template_nsymb * Nofdm * interpolation_rate;
+	int first = std::max(0, center - half_window);
+	int last = std::min(center + half_window, buffer_size_interp - preamble_interp);
+	if(template_nsymb <= 0 || last < first)
+		return result;
+
+	double best_metric = -1.0;
+	for(int pos = first; pos <= last; pos++)
+	{
+		double total_metric = 0.0;
+		for(int sym = 0; sym < template_nsymb; sym++)
+		{
+			double corr_re = 0.0, corr_im = 0.0, rx_energy = 0.0;
+			for(int n = 0; n < Nofdm; n++)
+			{
+				const std::complex<double> rx = baseband_interp[
+					pos + (sym * Nofdm + n) * interpolation_rate];
+				const std::complex<double> ref = ofdm_corr_template[sym * Nofdm + n];
+				corr_re += ref.real() * rx.real() + ref.imag() * rx.imag();
+				corr_im += ref.imag() * rx.real() - ref.real() * rx.imag();
+				rx_energy += std::norm(rx);
+			}
+			const double denominator = ofdm_corr_template_sym_energy[sym] * rx_energy;
+			if(denominator > 1e-30)
+				total_metric += (corr_re * corr_re + corr_im * corr_im) / denominator;
+		}
+		if(total_metric > best_metric)
+		{
+			best_metric = total_metric;
+			result.delay = pos;
+			result.correlation = total_metric;
+		}
+	}
+	return result;
+}
+
 int cl_ofdm::time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_size_interp,
                             int interpolation_rate, int preamble_nSymb,
                             const int* preamble_tones, int mfsk_M,
