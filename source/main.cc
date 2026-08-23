@@ -4050,6 +4050,7 @@ int main(int argc, char *argv[])
                                         // OFDM big-block no-wedge + clean-carve + C0-a byte-correct sustain (Phase b).
                                         // fail-before/pass-after on the same binary. One-shot at startup, exit rc.
     bool test_cfg103_gate_cli = false;   // --test-cfg103-gate: ROBUST_3 (cfg103) wiring guard unit
+    bool test_low48_admission_cli = false; // --test-low48-admission: symbolic pinned-only admission guards
                                         // (ladder fixed point + fail-closed config_negotiable_to);
                                         // fail-before base arithmetic vs pass-after live, one-shot exit rc.
     bool test_bigblock_multicw_cli = false; // --test-bigblock-multicw: FULL K=8 block (all 8 codewords) through the
@@ -4808,6 +4809,12 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "--test-cfg103-gate") == 0)
         {
             test_cfg103_gate_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-low48-admission") == 0)
+        {
+            test_low48_admission_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -6606,10 +6613,19 @@ start_modem:
     }
 
 
+    const char* low48_fast_env = std::getenv("MERCURY_CONNECT_FAST_CONFIG");
+    char* low48_fast_end = NULL;
+    long low48_fast_value = low48_fast_env ? std::strtol(low48_fast_env, &low48_fast_end, 10) : 0;
+    bool low48_fast_pin = low48_fast_env && low48_fast_end != low48_fast_env
+        && *low48_fast_end == '\0' && low48_fast_value == LOW48_ANCHOR_S20_R6;
+    bool low48_cli_pin = explicit_config && is_low48_anchor_config(mod_config);
+    bool low48_arq_pinned = operation_mode == ARQ_MODE && (low48_cli_pin || low48_fast_pin);
+
     if ((mod_config >= NUMBER_OF_CONFIGS && !is_robust_config(mod_config)
 			&& !is_low48_anchor_config(mod_config)) || (mod_config < 0)
 			|| (is_low48_anchor_config(mod_config)
-				&& (!explicit_config || operation_mode != BER_PLOT_passband)))
+				&& !((explicit_config && operation_mode == BER_PLOT_passband)
+					|| low48_arq_pinned)))
     {
         printf("Wrong modulation config %d\n", mod_config);
         exit(EXIT_FAILURE);
@@ -7000,17 +7016,57 @@ start_modem:
             // --- Fail-closed negotiation gate ---
             gck((is_ofdm_config(R3) || is_robust_config(R3)) == true,
                 "fail-before: base plain gate WOULD accept cfg103 (is_robust widened) = the leak");
-            gck(config_negotiable_to(R3, false) == false,
+            gck(config_negotiable_to(R3, CONFIG_NONE) == false,
                 "pass-after: NON-pinned peer REFUSES cfg103 (fail-closed)");
-            gck(config_negotiable_to(R3, true) == true,
+            gck(config_negotiable_to(R3, R3) == true,
                 "pass-after: cfg103-PINNED peer ACCEPTS cfg103");
-            gck(config_negotiable_to(CONFIG_16, false) == true, "unchanged: cfg16 negotiable");
-            gck(config_negotiable_to(ROBUST_0, false) == true, "unchanged: ROBUST_0 negotiable");
-            gck(config_negotiable_to(ROBUST_2, false) == true, "unchanged: ROBUST_2 negotiable");
-            gck(config_negotiable_to(LOW48_ANCHOR_S20_R6, false) == true, "note: cfg105 plain-negotiable here (its own gate lives elsewhere)");
-            gck(config_negotiable_to(104, false) == false, "unchanged: reserved id 104 not negotiable");
+            gck(config_negotiable_to(CONFIG_16, CONFIG_NONE) == true, "unchanged: cfg16 negotiable");
+            gck(config_negotiable_to(ROBUST_0, CONFIG_NONE) == true, "unchanged: ROBUST_0 negotiable");
+            gck(config_negotiable_to(ROBUST_2, CONFIG_NONE) == true, "unchanged: ROBUST_2 negotiable");
+            gck(config_negotiable_to(LOW48_ANCHOR_S20_R6, CONFIG_NONE) == false,
+                "pinned-only peer guard also refuses the LOW48 anchor without its own pin");
+            gck(config_negotiable_to(104, CONFIG_NONE) == false, "unchanged: reserved id 104 not negotiable");
             int grc = gfails ? 1 : 0;
             printf("[FLAG] --test-cfg103-gate complete: %d failures (rc=%d) -- exiting.\n", gfails, grc);
+            fflush(stdout);
+            exit(grc);
+        }
+        if (test_low48_admission_cli) {
+            printf("[FLAG] --test-low48-admission: symbolic pinned-only admission guards\n");
+            fflush(stdout);
+            int gfails = 0;
+            auto gck = [&](bool cond, const char* name){
+                printf("[LOW48-ADMISSION] %s: %s\n", cond ? "PASS" : "FAIL", name);
+                if(!cond) gfails++;
+            };
+            const int A = LOW48_ANCHOR_S20_R6;
+            gck(is_low48_anchor_config(A), "symbolic anchor predicate is true");
+            gck(is_ofdm_config(A) && !is_robust_config(A), "anchor takes the OFDM class, not ROBUST");
+            gck(config_ladder_index(A) == -1, "anchor is absent from FULL_CONFIG_LADDER");
+            bool listed = false;
+            for(int i=0; i<FULL_CONFIG_LADDER_SIZE; i++) listed |= FULL_CONFIG_LADDER[i] == A;
+            gck(!listed, "climb ladder cannot advertise or elect the anchor");
+            gck(config_ladder_up(A, false, false) == A, "ladder_up holds the pinned anchor");
+            gck(config_ladder_up_n(A, FULL_CONFIG_LADDER_SIZE, false, false) == A,
+                "ladder_up_n holds the pinned anchor");
+            gck(config_ladder_down(A, false) == A, "ladder_down holds the pinned anchor");
+            gck(config_ladder_down_n(A, FULL_CONFIG_LADDER_SIZE, false) == A,
+                "ladder_down_n holds the pinned anchor");
+            gck(config_negotiable_to(A, CONFIG_NONE) == false,
+                "non-pinned peer refuses the anchor");
+            gck(config_negotiable_to(A, ROBUST_3) == false,
+                "peer pinned to another experimental config refuses the anchor");
+            gck(config_negotiable_to(A, A) == true,
+                "peer pinned to the same symbolic anchor accepts it");
+            gck(config_negotiable_to(ROBUST_3, A) == false,
+                "anchor-pinned peer refuses the other pinned-only config");
+            gck(config_negotiable_to(CONFIG_16, CONFIG_NONE) == true,
+                "ordinary OFDM negotiation is unchanged");
+            gck(config_negotiable_to(ROBUST_0, CONFIG_NONE) == true,
+                "ordinary ROBUST negotiation is unchanged");
+            int grc = gfails ? 1 : 0;
+            printf("[FLAG] --test-low48-admission complete: %d failures (rc=%d) -- exiting.\n",
+                gfails, grc);
             fflush(stdout);
             exit(grc);
         }
@@ -8530,9 +8586,13 @@ start_modem:
         // ROBUST_3 (cfg103) is a pinned-only, off-ladder low-band rung. When it is
         // explicitly pinned in ARQ mode, force the gearshift OFF so no climb / optimizer /
         // SNR producer can negotiate the session off the pinned rung; it is held for the
-        // whole session (a BREAK still degrades to the robust floor as the sanctioned exit).
-        // Byte-identical for every non-cfg103 config. Mirrors the cfg105 anchor staging.
-        if (is_robust3_config(mod_config) && explicit_config)
+        // whole session. BREAK/recovery remains on the pinned fixed point; no ladder
+        // transition can elect another config. Byte-identical for ordinary configs.
+        if (low48_arq_pinned)
+            ARQ.admission_pinned_config = LOW48_ANCHOR_S20_R6;
+        else if (is_robust3_config(mod_config) && explicit_config)
+            ARQ.admission_pinned_config = ROBUST_3;
+        if (ARQ.admission_pinned_config != CONFIG_NONE)
             gear_shift_mode = NO_GEAR_SHIFT;
         ARQ.init(base_tcp_port, (gear_shift_mode == NO_GEAR_SHIFT)? NO : YES, mod_config);
 

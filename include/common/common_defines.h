@@ -217,20 +217,19 @@ inline bool is_ofdm_config(int config) {
 }
 
 // A config number received in a SET_CONFIG control frame or a connect-seed is
-// NEGOTIABLE-TO only if this peer can legitimately run it. ROBUST_3 (cfg103) is a
-// pinned-only low-band rung that lives OUTSIDE the ladder and outside the capability
-// advertisement: a peer adopts it ONLY when it is itself a cfg103-pinned session
-// (self_robust3_pinned). A peer that never heard of cfg103 (an older build whose
-// is_robust_config still caps at 102, and whose is_ofdm_config never covered 103)
-// refuses it structurally; a same-build peer that was NOT pinned to it refuses cleanly
-// (fail-closed) rather than being dragged onto an off-ladder experimental config that
-// would desync the two ends. Every other config keeps the historic is_ofdm||is_robust
-// gate byte-for-byte (note is_robust_config(103) is now true, so cfg103 would otherwise
-// leak through the plain gate — this intercept is what keeps a non-pinned session from
-// adopting an unsolicited cfg103).
-inline bool config_negotiable_to(int config, bool self_robust3_pinned) {
-	if (is_robust3_config(config))
-		return self_robust3_pinned;
+// NEGOTIABLE-TO only if this peer can legitimately run it. Experimental pinned-only
+// configs live outside the ladder and capability advertisement: a peer adopts one
+// only when its local admission authority names that exact symbolic config. This
+// prevents both an older peer and an unpinned same-build peer from being dragged onto
+// an off-ladder config. Every ordinary config keeps the historic
+// is_ofdm_config||is_robust_config decision.
+inline bool is_pinned_only_config(int config) {
+	return is_robust3_config(config) || is_low48_anchor_config(config);
+}
+
+inline bool config_negotiable_to(int config, int self_pinned_config) {
+	if (is_pinned_only_config(config))
+		return config == self_pinned_config;
 	return is_ofdm_config(config) || is_robust_config(config);
 }
 
@@ -324,10 +323,9 @@ inline int config_ladder_index(int config) {
 // added clause is a no-op (the full-ladder branch already ran), so the proven
 // climb/anti-thrash paths are byte-identical. See §19.
 inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = false) {
-	// ROBUST_3 (cfg103) is off-ladder pinned-only: never climbs/demotes via the ladder.
-	// (Already a fixed point here — 103 is absent from FULL_CONFIG_LADDER so idx<0 returns
-	// config below — but stated explicitly to survive any future fast-path/membership change.)
-	if (is_robust3_config(config)) return config;
+	// Pinned-only configs are off-ladder fixed points: no climb, demote, or
+	// future fast-path membership change may move a pinned session.
+	if (is_pinned_only_config(config)) return config;
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled && !is_robust_config(config)) {
 		return (config < ceiling) ? config + 1 : config;
@@ -342,7 +340,7 @@ inline int config_ladder_up(int config, bool robust_enabled, bool narrowband = f
 }
 
 inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool narrowband = false) {
-	if (is_robust3_config(config)) return config;  // ROBUST_3: ladder fixed point (off-ladder pinned-only)
+	if (is_pinned_only_config(config)) return config;
 	int ceiling = narrowband ? NB_CONFIG_MAX : WB_CONFIG_MAX;
 	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		int target = config + steps;
@@ -359,7 +357,7 @@ inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool n
 }
 
 inline int config_ladder_down(int config, bool robust_enabled) {
-	if (is_robust3_config(config)) return config;  // ROBUST_3: ladder fixed point (off-ladder pinned-only)
+	if (is_pinned_only_config(config)) return config;
 	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		return (config > CONFIG_0) ? config - 1 : config;
 	}
@@ -369,10 +367,9 @@ inline int config_ladder_down(int config, bool robust_enabled) {
 }
 
 inline int config_ladder_down_n(int config, int steps, bool robust_enabled) {
-	// ROBUST_3: ladder fixed point. LOAD-BEARING here (unlike up/up_n/down): the base
-	// full-ladder path clamps a not-found idx (-1) to 0 and would return FULL_CONFIG_LADDER[0]
-	// = ROBUST_0, i.e. a multi-step demote of cfg103 would silently drop to ROBUST_0. Hold 103.
-	if (is_robust3_config(config)) return config;
+	// LOAD-BEARING for any off-ladder config: the base full-ladder path clamps a
+	// not-found index to the bottom rung. Pinned-only configs must instead hold.
+	if (is_pinned_only_config(config)) return config;
 	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder
 		int target = config - steps;
 		return (target > CONFIG_0) ? target : CONFIG_0;
