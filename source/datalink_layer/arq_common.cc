@@ -19231,10 +19231,17 @@ void cl_arq_controller::receive()
 				// overshoots by nUnder symbols after the reset at line 3291,
 				// causing the next batch frame to land BEFORE ofdm_skip and
 				// become invisible to detection.
-				// -1 margin catches frames 1 symbol below expected position.
+				// The next zero-preamble tail starts exactly one decoded frame
+				// after the anchor.  Do not retain the full-search anti-redecode
+				// margin here: batch prediction consumes this cursor as the tail
+				// grid, so backing it up by one symbol seats the nominal prediction
+				// one symbol early.
 				int frame_end_symb = received_message_stats.delay / symbol_period + rx_frame;
+				int anti_redecode_margin =
+					is_low48_anchor_config(current_configuration) ? 0 : 1;
 				telecom_system->receive_stats.ofdm_search_raw =
-					frame_end_symb - telecom_system->data_container.frames_to_read - nUnder_snapshot - 1;
+					frame_end_symb - telecom_system->data_container.frames_to_read
+						- nUnder_snapshot - anti_redecode_margin;
 				if(telecom_system->receive_stats.ofdm_search_raw < 0)
 					telecom_system->receive_stats.ofdm_search_raw = 0;
 				// Clamp at upper_bound: search_raw can exceed buffer_Nsymb - rx_frame
