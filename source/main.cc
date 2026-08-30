@@ -4062,6 +4062,9 @@ int main(int argc, char *argv[])
     bool test_bigblock_chanest_cli = false; // --test-bigblock-chanest: GENUINE (ref==NULL) 2-instance CFG16 big-block
                                         // decode under a CFO/SFO-impaired channel; reproduces the HW [RXACQ] meanH
                                         // collapse off-bench (clean passes, CFO/SFO collapses the block estimate).
+    bool test_nb_cfo_correction_cli = false; // --test-nb-cfo-correction: narrowband CONFIG_0 residual
+                                        // carrier-offset correction regression (control 0 Hz + an in-window
+                                        // offset through the in-process sim channel; fail-before/pass-after).
     bool test_bigblock_acqwindow_cli = false; // --test-bigblock-acqwindow: §19 acquisition-window POSITION guard —
                                         // one genuine K=8 block at several in-window preamble offsets in a FIXED
                                         // production-sized window; near-end (tail past window) DEFERS (guard ON) /
@@ -4856,6 +4859,15 @@ int main(int argc, char *argv[])
             // the HW [RXACQ] meanH collapse OFF-BENCH (clean default passes; CFO/SFO collapses
             // the block-wide estimate -> 0-delivery). One-shot.
             test_bigblock_chanest_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-nb-cfo-correction") == 0)
+        {
+            // Narrowband CONFIG_0 residual carrier-offset correction regression: a genuine
+            // CONFIG_0 narrowband frame through the in-process sim channel with an exact,
+            // fixed, in-window SSB offset; control 0 Hz + offset arm, fail-before/pass-after.
+            test_nb_cfo_correction_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -7064,6 +7076,19 @@ start_modem:
             fflush(stdout);
             int rc = cl_arq_controller::test_inband_down_resync();
             printf("[FLAG] Inband-down-resync test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_nb_cfo_correction_cli) {
+            // Narrowband CONFIG_0 residual carrier-offset correction regression: assert a genuine
+            // narrowband CONFIG_0 frame decodes under an exact in-window carrier offset injected by
+            // the in-process sim channel (fail-before absent/wrong-sign -> pass-after correct sign).
+            extern int nb_cfo_correction_test();
+            printf("[FLAG] --test-nb-cfo-correction: invoking narrowband CONFIG_0 residual "
+                   "carrier-offset correction regression\n");
+            fflush(stdout);
+            int rc = nb_cfo_correction_test();
+            printf("[FLAG] NB-CFO-correction test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

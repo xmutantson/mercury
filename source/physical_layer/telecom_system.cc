@@ -3645,6 +3645,15 @@ skip_h_retry_point:
 				// Coarse sync residual (±7.5 Hz max) is handled by ZF estimator
 				// (no cross-pilot averaging → immune to phase rotation).
 				freq_offset_measured = 0;
+				// Correct the residual carrier offset the coarse stage leaves on the
+				// narrowband CONFIG_0 path. The purpose-built NB estimator returns the
+				// physical offset (signal minus LO); the shared re-mix below SUBTRACTS
+				// freq_offset_measured, so negate it. Gated to CONFIG_0 with a valid
+				// multi-symbol preamble (the estimator needs >=2 preamble symbols).
+				if(current_configuration == CONFIG_0 && rx_eff_preamble >= 2)
+					freq_offset_measured = -ofdm.carrier_frequency_sync_nb(
+						&data_container.baseband_data[data_container.Ngi],
+						bandwidth/(double)data_container.Nc, rx_eff_preamble);
 				if(g_verbose)
 					printf("[NB-FREQ] skipped (relying on coarse sync + ZF)\n");
 			}
