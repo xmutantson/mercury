@@ -247,6 +247,15 @@ template<typename T> class arr
       sz = n;
       }
 
+    void grow_at_least(size_t n)
+      {
+      if (n<=sz) return;
+      T *pnew = ralloc(n);
+      dealloc(p);
+      p = pnew;
+      sz = n;
+      }
+
     T &operator[](size_t idx) { return p[idx]; }
     const T &operator[](size_t idx) const { return p[idx]; }
 
@@ -1596,11 +1605,45 @@ template<bool fwd, typename T> void passg (size_t ido, size_t ip,
     }
   }
 
+template<typename T> static arr<T> &execution_scratch(size_t n)
+  {
+  static thread_local arr<T> scratch;
+  scratch.grow_at_least(n);
+  return scratch;
+  }
+
+#ifdef POCKETFFT_TEST_REENTRANCY
+template<typename T> static bool &execution_scratch_in_use()
+  {
+  static thread_local bool in_use = false;
+  return in_use;
+  }
+
+template<typename T> class execution_scratch_guard
+  {
+  private:
+    bool &in_use;
+  public:
+    execution_scratch_guard() : in_use(execution_scratch_in_use<T>())
+      {
+      if (in_use)
+        throw std::logic_error("recursive pocketfft execution scratch checkout");
+      in_use = true;
+      }
+    ~execution_scratch_guard() { in_use = false; }
+    execution_scratch_guard(const execution_scratch_guard &) = delete;
+    execution_scratch_guard &operator=(const execution_scratch_guard &) = delete;
+  };
+#endif
+
 template<bool fwd, typename T> void pass_all(T c[], T0 fct) const
   {
   if (length==1) { c[0]*=fct; return; }
+#ifdef POCKETFFT_TEST_REENTRANCY
+  execution_scratch_guard<T> scratch_guard;
+#endif
   size_t l1=1;
-  arr<T> ch(length);
+  arr<T> &ch = execution_scratch<T>(length);
   T *p1=c, *p2=ch.data();
 
   for(size_t k1=0; k1<fact.size(); k1++)
