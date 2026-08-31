@@ -171,8 +171,8 @@
 // ends: sidelnikov-TX <=> local advertises AND peer advertised. Absent bit
 // (old build, lost byte, 4-bit ctrl-suffix path) => legacy preamble both ways
 // — the interop floor. Advertising is a promise about RX capability only.
-// 0x20 is reserved for the WB robust-preamble analog (not shipped: the WB
-// sidelnikov preamble measured a wash at operating SNRs).
+// No capability bit is allocated for a WB robust-preamble analog: the WB
+// sidelnikov preamble measured a wash at operating SNRs and was not shipped.
 #define CAP_ROBUST_PREAMBLE_NB 0x10 // RX can acquire the NB sidelnikov robust preamble
 // Stage-3 bounded block ACK. The bit is advertised only under
 // MERCURY_L1_BLOCKACK=1 and engages only on authenticated both-support.

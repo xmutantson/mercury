@@ -102,6 +102,8 @@ enum class AckReportOwner : std::uint8_t {
     Journal
 };
 
+static constexpr std::uint16_t kAckReportSlotCapacity = 8u * 96u;
+
 /*
  * AckReportIdentity
  * Owner: the decoded report until resolution; after validation, exactly one of
@@ -129,7 +131,10 @@ struct AckReportIdentity {
         return session.valid() && config.valid() && target_generation.valid()
             && bitmap_generation.valid()
             && target_generation.wire_value() == bitmap_generation.wire_value()
-            && slot_count != 0 && kind != AckReportKind::Invalid
+            && slot_count != 0
+            && static_cast<std::uint32_t>(first_slot) + slot_count
+                <= kAckReportSlotCapacity
+            && kind != AckReportKind::Invalid
             && owner != AckReportOwner::None
             && (kind != AckReportKind::Aggregate || block_serial.valid());
     }
