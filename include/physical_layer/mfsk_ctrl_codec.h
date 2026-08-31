@@ -438,7 +438,7 @@ static const int CFG_TAG_TONE_PERM[16] = {
 	// bi-orthogonal complement exercise the full M=16 set. (Bit-reversal of i over
 	// the low 3 bits keeps adjacent positions on spectrally-separated tone pairs.)
 	0, 4, 2, 6, 1, 5, 3, 7,   // perm[i] in {0..7}; perm[i]^0xF in {8..15}
-	0, 4, 2, 6, 1, 5, 3, 7,
+	8, 12, 10, 14, 9, 13, 11, 15,
 };
 void cfg_tag_softchips_from_energies(const double* energies16x16,
                                      double* out_chips /*[16]*/);

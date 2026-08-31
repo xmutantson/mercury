@@ -282,7 +282,7 @@ public:
 	// Suffix length: NB M=8 returns 0 (deferred). WB M=16 → 4 bits/symbol
 	// → 13 symbols for 52 bits. Total ACK pattern wall-clock: 16 base +
 	// 13 suffix = 29 symbols ≈ 705 ms (WB).
-	int ack_sack_suffix_len() const { return (M >= 16) ? 13 : 0; }  // 0 = unsupported
+	int ack_sack_suffix_len() const { return (M == 16) ? 13 : 0; }  // 0 = unsupported
 	int ack_sack_pattern_nsymb() const { return ack_pattern_nsymb + ack_sack_suffix_len(); }
 
 	// Tier-2 suffix FEC (tier2-suffix-fec-design.md §19, INCREMENT 1). When
@@ -514,7 +514,7 @@ public:
 	static bool valid_geometry(int M, int Nc, int nStreams)
 	{
 		return M > 0 && Nc > 0 && nStreams > 0 && nStreams <= MAX_STREAMS
-			&& M <= Nc / nStreams;
+			&& M <= 64 && M <= Nc / nStreams;
 	}
 
 	void init(int _M, int _Nc, int _nStreams = 1);
