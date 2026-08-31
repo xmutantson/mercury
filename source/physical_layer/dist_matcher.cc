@@ -14,8 +14,9 @@
 // multinomial(counts) = (sum counts)! / prod(counts[i]!). Computed
 // incrementally as a product of binomials to keep intermediates small:
 //   C(n; k0,k1,..) = C(n, k0) * C(n-k0, k1) * ...
-// Returns false on overflow (a count product would exceed 2^127); the caller
-// rejects such a composition at configure() so shape/deshape never overflow.
+// Returns false if an intermediate product exceeds the unsigned __int128
+// maximum (2^128 - 1); the caller rejects such a composition at configure()
+// so shape/deshape never overflow.
 typedef unsigned __int128 u128;
 
 static bool mul_checked(u128 a, u128 b, u128* out)
@@ -83,11 +84,12 @@ cl_dist_matcher::~cl_dist_matcher()
 bool cl_dist_matcher::configure(int _n_levels, const int* _composition, int block_len)
 {
 	ready = false;
-	if(_n_levels <= 0 || _n_levels > DM_MAX_LEVELS || block_len <= 0) return false;
+	if(_n_levels <= 0 || _n_levels > DM_MAX_LEVELS || block_len <= 0 ||
+	   _composition == nullptr) return false;
 	int sum = 0;
 	for(int i = 0; i < _n_levels; ++i)
 	{
-		if(_composition[i] < 0) return false;
+		if(_composition[i] < 0 || _composition[i] > block_len - sum) return false;
 		sum += _composition[i];
 	}
 	if(sum != block_len) return false;
@@ -122,14 +124,15 @@ bool cl_dist_matcher::configure(int _n_levels, const int* _composition, int bloc
 bool cl_dist_matcher::configure_maxwell_boltzmann(int _n_levels, const int* amplitudes,
                                                  double lambda, int block_len)
 {
-	if(_n_levels <= 0 || _n_levels > DM_MAX_LEVELS || block_len <= 0) return false;
+	if(_n_levels <= 0 || _n_levels > DM_MAX_LEVELS || block_len <= 0 ||
+	   amplitudes == nullptr || !std::isfinite(lambda)) return false;
 	double w[DM_MAX_LEVELS], s = 0.0;
 	for(int i = 0; i < _n_levels; ++i)
 	{
 		w[i] = std::exp(-lambda * (double)amplitudes[i] * (double)amplitudes[i]);
 		s += w[i];
 	}
-	if(s <= 0.0) return false;
+	if(!std::isfinite(s) || s <= 0.0) return false;
 
 	// Largest-remainder rounding to an integer composition summing to block_len.
 	int  base[DM_MAX_LEVELS];
@@ -216,7 +219,7 @@ bool cl_dist_matcher::deshape(const int* in_levels, int* out_bits) const
 	for(int pos = 0; pos < blocklen; ++pos)
 	{
 		int chosen = in_levels[pos];
-		if(chosen < 0 || chosen >= n_levels) return false;
+		if(chosen < 0 || chosen >= n_levels || rem_counts[chosen] == 0) return false;
 		for(int lev = 0; lev < n_levels; ++lev)
 		{
 			if(rem_counts[lev] == 0) continue;
