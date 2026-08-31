@@ -25,8 +25,8 @@
 cl_tcp_socket::cl_tcp_socket()
 {
 	type=TYPE_SERVER;
-	socket_fd=0;
-	connection_fd=0;
+	socket_fd=ERROR_;
+	connection_fd=ERROR_;
 	status=TCP_STATUS_CLOSED;
 	address="";
 	port=0;
@@ -38,7 +38,7 @@ cl_tcp_socket::cl_tcp_socket()
 	memset(&server, 0, sizeof(server));
 	memset(&client, 0, sizeof(client));
 	allow_out_of_order_release=0;
-	message= new st_tcp_message;
+	message = new st_tcp_message{};
 	timeout_ms=1000;
 	link_buffer=NULL;
 	buffer_occupancy=0;
@@ -47,7 +47,7 @@ cl_tcp_socket::cl_tcp_socket()
 }
 cl_tcp_socket::~cl_tcp_socket()
 {
-	if(socket_fd>0)
+	if(socket_fd!=ERROR_)
 	{
 #if defined(_WIN32)
         closesocket(socket_fd);
@@ -61,6 +61,12 @@ cl_tcp_socket::~cl_tcp_socket()
 
 int cl_tcp_socket::init()
 {
+	if(status==TCP_STATUS_CLOSED && (port < 0 || port > 65535))
+	{
+		status=TCP_STATUS_OTHER_ERROR;
+		return ERROR_;
+	}
+
 #if defined(_WIN32)
 	WSADATA wsaData;
 	int iResult = WSAStartup(MAKEWORD(2 ,2), &wsaData);
@@ -72,6 +78,22 @@ int cl_tcp_socket::init()
 #endif
 
     int return_val=SUCCESS;
+	auto discard_socket = [this]()
+	{
+#if defined(_WIN32)
+		if(socket_fd!=ERROR_)
+		{
+			closesocket(socket_fd);
+		}
+		WSACleanup();
+#else
+		if(socket_fd!=ERROR_)
+		{
+			close(socket_fd);
+		}
+#endif
+		socket_fd=ERROR_;
+	};
 	if(status==TCP_STATUS_CLOSED)
 	{
 		if(type==TYPE_SERVER)
@@ -81,6 +103,8 @@ int cl_tcp_socket::init()
 			{
 				status=TCP_STATUS_SOCKET_CREATION_ERROR;
 				return_val=ERROR_;
+				discard_socket();
+				return return_val;
 			}
 			else
 			{
@@ -102,7 +126,7 @@ int cl_tcp_socket::init()
 #else
 				server.sin_addr.s_addr = htonl(INADDR_ANY);
 #endif
-				server.sin_port = htons((uint16_t)port);
+				server.sin_port = htons(static_cast<uint16_t>(port));
 				status=TCP_STATUS_SOCKET_CREATED;
 			}
 			int enable = 1;  // Must be int, not char, for Windows setsockopt
@@ -111,12 +135,16 @@ int cl_tcp_socket::init()
 			{
 				status=TCP_STATUS_REUSEADDR_ERROR;
 				return_val=ERROR_;
+				discard_socket();
+				return return_val;
 			}
 #if !defined(_WIN32)
 			if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(int)) != 0)
 			{
 				status=TCP_STATUS_REUSEPORT_ERROR;
 				return_val=ERROR_;
+				discard_socket();
+				return return_val;
 			}
 #endif
 			int bind_result = bind(socket_fd, (struct sockaddr*)&server, sizeof(server));
@@ -124,6 +152,8 @@ int cl_tcp_socket::init()
 			{
 				status=TCP_STATUS_BINDING_ERROR;
 				return_val=ERROR_;
+				discard_socket();
+				return return_val;
 			}
 			else
 			{
@@ -134,6 +164,8 @@ int cl_tcp_socket::init()
 			{
 				status=TCP_STATUS_LISTENING_ERROR;
 				return_val=ERROR_;
+				discard_socket();
+				return return_val;
 			}
 			else
 			{
@@ -154,12 +186,14 @@ int cl_tcp_socket::init()
 				status=TCP_STATUS_SOCKET_CREATION_ERROR;
 				std::cout<<"Error-Client socket can't be created"<<std::endl;
 				return_val=ERROR_;
+				discard_socket();
+				return return_val;
 			}
 			else
 			{
 				server.sin_family = AF_INET;
 				server.sin_addr.s_addr = inet_addr(address);
-				server.sin_port = htons(port);
+				server.sin_port = htons(static_cast<uint16_t>(port));
 				status=TCP_STATUS_SOCKET_CREATED;
 				std::cout<<"Client socket is created"<<std::endl;
 
@@ -247,25 +281,33 @@ int (*cl_tcp_socket::g_test_transmit_hook)(const char* buf, int length) = nullpt
 int cl_tcp_socket::transmit()
 {
 	int n=0;
+#if defined(MSG_NOSIGNAL)
+	const int send_flags=MSG_NOSIGNAL;
+#else
+	const int send_flags=0;
+#endif
 
 	if(g_test_transmit_hook != nullptr)
 	{
 		// Test seam: model the app socket's send() (short / would-block) without RF.
 		n = g_test_transmit_hook(message->buffer, message->length);
-		if(type==TYPE_SERVER) server_sent_packets++; else client_sent_packets++;
+		if(n > 0)
+		{
+			if(type==TYPE_SERVER) server_sent_packets++; else client_sent_packets++;
+		}
 		return n;
 	}
 
 	if (type==TYPE_SERVER)
 	{
-		n= send(connection_fd,message->buffer, message->length,0);
-		server_sent_packets++;
+		n= send(connection_fd,message->buffer, message->length,send_flags);
+		if(n > 0) server_sent_packets++;
 
 	}
 	else if(type==TYPE_CLIENT)
 	{
-		n= send(socket_fd,message->buffer, message->length,0);
-		client_sent_packets++;
+		n= send(socket_fd,message->buffer, message->length,send_flags);
+		if(n > 0) client_sent_packets++;
 	}
 
 	return n;
@@ -302,7 +344,7 @@ void cl_tcp_socket::close_connection()
 {
 	if(type==TYPE_SERVER)
 	{
-		if(connection_fd>0)
+		if(connection_fd!=ERROR_)
 		{
 #if defined(_WIN32)
 			closesocket(connection_fd);
@@ -310,12 +352,12 @@ void cl_tcp_socket::close_connection()
 			close(connection_fd);
 #endif
 		}
-		connection_fd=0;
-		status = socket_fd>0 ? TCP_STATUS_LISTENING : TCP_STATUS_CLOSED;
+		connection_fd=ERROR_;
+		status = socket_fd!=ERROR_ ? TCP_STATUS_LISTENING : TCP_STATUS_CLOSED;
 	}
 	else
 	{
-		if(socket_fd>0)
+		if(socket_fd!=ERROR_)
 		{
 #if defined(_WIN32)
 			closesocket(socket_fd);
@@ -323,7 +365,7 @@ void cl_tcp_socket::close_connection()
 			close(socket_fd);
 #endif
 		}
-		socket_fd=0;
+		socket_fd=ERROR_;
 		status=TCP_STATUS_CLOSED;
 	}
 	message->length=0;
