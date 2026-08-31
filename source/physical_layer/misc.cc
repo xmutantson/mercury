@@ -21,10 +21,14 @@
  */
 
 #include "physical_layer/misc.h"
+#include <cstddef>
 
 
 void shift_left(double* matrix, int size, int nShift)
 {
+	if(size <= 0 || nShift <= 0)
+		return;
+
 	for(int j=0;j<size-nShift;j++)
 	{
 		matrix[j]=matrix[j+nShift];
@@ -33,33 +37,12 @@ void shift_left(double* matrix, int size, int nShift)
 
 double get_angle(std::complex <double> value)
 {
-	double theta=0;
-
-	if(value.real() == 0) // check for divide by zero
-	{
-		theta = M_PI / 2;
-	}
-	else if(value.real() > 0)
-	{
-		theta=atan(value.imag()/value.real());
-	}
-	else if (value.real() < 0 && value.imag() >= 0)
-	{
-		theta=atan(value.imag()/value.real()) +  M_PI;
-	}
-	else if (value.real() < 0 && value.imag() < 0)
-	{
-		theta=atan(value.imag()/value.real()) -  M_PI;
-	}
-
-	return theta;
+	return std::atan2(value.imag(), value.real());
 }
 
 double get_amplitude(std::complex <double> value)
 {
-	double amplitude;
-	amplitude=sqrt(pow(value.real(),2)+pow(value.imag(),2));
-	return amplitude;
+	return std::hypot(value.real(), value.imag());
 }
 
 std::complex <double> set_complex(double amplitude, double theta)
@@ -81,10 +64,16 @@ void matrix_multiplication(std::complex <double>* a, int a_width, int a_hight, s
 	{
 		for(int j=0;j<b_width;j++)
 		{
-			*(c+i*b_width+j)=0;
+			const std::size_t c_index = static_cast<std::size_t>(i) *
+				static_cast<std::size_t>(b_width) + static_cast<std::size_t>(j);
+			c[c_index]=0;
 			for(int k=0;k<a_width;k++)
 			{
-				*(c+i*b_width+j)+=*(a+i*a_width+k) * *(b+k*b_width+j);
+				const std::size_t a_index = static_cast<std::size_t>(i) *
+					static_cast<std::size_t>(a_width) + static_cast<std::size_t>(k);
+				const std::size_t b_index = static_cast<std::size_t>(k) *
+					static_cast<std::size_t>(b_width) + static_cast<std::size_t>(j);
+				c[c_index]+=a[a_index] * b[b_index];
 			}
 		}
 	}
@@ -98,7 +87,9 @@ void byte_to_bit(int* data_byte, int* data_bit, int nBytes)
 		mask=0x01;
 		for(int j=0;j<8;j++)
 		{
-			data_bit[i*8+j]=((data_byte[i]&mask)==mask);
+			const std::size_t bit_index = static_cast<std::size_t>(i) * 8 +
+				static_cast<std::size_t>(j);
+			data_bit[bit_index]=((data_byte[i]&mask)==mask);
 			mask=mask<<1;
 		}
 	}
@@ -106,6 +97,9 @@ void byte_to_bit(int* data_byte, int* data_bit, int nBytes)
 
 void bit_to_byte(int* data_bit, int* data_byte, int nBits)
 {
+	if(nBits <= 0)
+		return;
+
 	int mask;
 	for(int i=0;i<nBits/8;i++)
 	{

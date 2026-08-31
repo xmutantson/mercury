@@ -70,6 +70,15 @@ std::complex <double> interpolate_bilinear(std::complex <double> a,double a_x,do
 void interpolate_linear_col(st_channel_real* estimated_channel, int max_col, int max_row, int col)
 {
 	int loc_start,loc_end,nLocations;
+	int nMeasuredLocations=0;
+
+	for(int i=0;i<max_row && nMeasuredLocations<2;i++)
+	{
+		if(estimated_channel[i*max_col+col].status==MEASURED)
+			nMeasuredLocations++;
+	}
+	if(nMeasuredLocations<2)
+		return;
 
 	loc_start=0;
 	loc_end=max_row-1;
@@ -163,6 +172,15 @@ void interpolate_linear_col(st_channel_real* estimated_channel, int max_col, int
 void interpolate_linear_col(st_channel_complex* estimated_channel, int max_col, int max_row, int col)
 {
 	int loc_start,loc_end,nLocations;
+	int nMeasuredLocations=0;
+
+	for(int i=0;i<max_row && nMeasuredLocations<2;i++)
+	{
+		if(estimated_channel[i*max_col+col].status==MEASURED)
+			nMeasuredLocations++;
+	}
+	if(nMeasuredLocations<2)
+		return;
 
 	loc_start=0;
 	loc_end=max_row-1;
