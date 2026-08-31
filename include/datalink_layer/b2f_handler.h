@@ -66,6 +66,8 @@ class cl_b2f_handler
 public:
 	cl_b2f_handler();
 	~cl_b2f_handler();
+	cl_b2f_handler(const cl_b2f_handler&) = delete;
+	cl_b2f_handler& operator=(const cl_b2f_handler&) = delete;
 
 	// Allocate payload buffers.  Call once at startup.
 	void init();

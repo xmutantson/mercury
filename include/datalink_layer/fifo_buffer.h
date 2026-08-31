@@ -34,6 +34,8 @@ class cl_fifo_buffer
 public:
 	cl_fifo_buffer();
   ~cl_fifo_buffer();
+  cl_fifo_buffer(const cl_fifo_buffer&) = delete;
+  cl_fifo_buffer& operator=(const cl_fifo_buffer&) = delete;
 
   void flush();
   int set_size(int size);

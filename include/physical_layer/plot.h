@@ -33,6 +33,9 @@ private:
 
 
 public:
+	cl_plot(const cl_plot&) = delete;
+	cl_plot& operator=(const cl_plot&) = delete;
+
 	cl_plot();
 	~cl_plot();
 	void open(std::string main_title);
