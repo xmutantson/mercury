@@ -61,15 +61,19 @@ void mirror_nonce(uint8_t nonce[12], uint32_t direction, uint64_t batch_index)
 // each suite has its own ephemeral keypair, so a self-DH would NOT match the
 // peer. (Discovered via the reorder-roundtrip FAIL: separate self-DH keys ->
 // mismatched session keys -> every decrypt auth-fails.)
-void make_paired_suites(cl_cipher_suite& cmd, cl_cipher_suite& rsp)
+int make_paired_suites(cl_cipher_suite& cmd, cl_cipher_suite& rsp)
 {
     uint8_t pk_cmd[X25519_KEY_SIZE];
     uint8_t pk_rsp[X25519_KEY_SIZE];
-    cmd.generate_x25519_keypair(pk_cmd);
-    rsp.generate_x25519_keypair(pk_rsp);
+    if (cmd.generate_x25519_keypair(pk_cmd) != 0)
+        return -1;
+    if (rsp.generate_x25519_keypair(pk_rsp) != 0)
+        return -1;
     // Each computes the shared secret from the OTHER's pubkey -> identical secret.
-    cmd.compute_x25519_shared(pk_rsp);
-    rsp.compute_x25519_shared(pk_cmd);
+    if (cmd.compute_x25519_shared(pk_rsp) != 0)
+        return -1;
+    if (rsp.compute_x25519_shared(pk_cmd) != 0)
+        return -1;
     const char* psk = "MERCURY-AEAD-NONCE-TEST-PSK";
     // Same (commander_call, responder_call) ordering on both ends so the salt
     // matches (production passes them role-consistently).
@@ -79,6 +83,7 @@ void make_paired_suites(cl_cipher_suite& cmd, cl_cipher_suite& rsp)
                            (const uint8_t*)psk, (int)strlen(psk), false);
     cmd.activate();
     rsp.activate();
+    return 0;
 }
 
 int fail(const char* what)
@@ -166,7 +171,8 @@ int test_direction_disjoint()
 int test_reorder_retx_roundtrip()
 {
     cl_cipher_suite tx, rx;
-    make_paired_suites(tx, rx);   // tx=CMD encrypt, rx=RSP decrypt, SHARED key
+    if (make_paired_suites(tx, rx) != 0)
+        return fail("X25519 pairing setup failed");
 
     const uint32_t DIR = DIRECTION_CMD_TO_RSP;
     const int N = 5;
@@ -231,7 +237,8 @@ int test_kx_truncated_reject()
 {
     cl_cipher_suite cs;
     uint8_t pk[X25519_KEY_SIZE];
-    cs.generate_x25519_keypair(pk);
+    if (cs.generate_x25519_keypair(pk) != 0)
+        return fail("X25519 keypair generation failed");
 
     // A short/missing pubkey must be REJECTED before the 32-byte read.
     uint8_t shortbuf[8] = {1,2,3,4,5,6,7,8};
@@ -255,8 +262,10 @@ int test_kx_truncated_reject()
 int test_tamper_rejected()
 {
     cl_cipher_suite tx, rx;
-    make_paired_suites(tx, rx);   // SHARED key so a CLEAN ct would decrypt;
-                                  // the tamper must be what fails, not the key.
+    if (make_paired_suites(tx, rx) != 0)
+        return fail("X25519 pairing setup failed");
+    // SHARED key so a CLEAN ct would decrypt;
+    // the tamper must be what fails, not the key.
     uint8_t pt[32];
     for (int i = 0; i < 32; i++) pt[i] = (uint8_t)(i + 1);
     uint8_t ct[32 + AUTH_TAG_SIZE];
@@ -301,7 +310,8 @@ int test_tamper_rejected()
 int test_backward_across_wrap()
 {
     cl_cipher_suite tx, rx;
-    make_paired_suites(tx, rx);
+    if (make_paired_suites(tx, rx) != 0)
+        return fail("X25519 pairing setup failed");
     const uint32_t DIR = DIRECTION_RSP_TO_CMD;
 
     // TX encrypts 254,255,0,1 in order, each a distinct payload.
@@ -365,7 +375,9 @@ int test_backward_across_wrap()
 int test_batch_span_truncation_authfail()
 {
     cl_cipher_suite tx, rx;
-    make_paired_suites(tx, rx);   // SHARED key so only TRUNCATION fails, not key
+    if (make_paired_suites(tx, rx) != 0)
+        return fail("X25519 pairing setup failed");
+    // SHARED key so only TRUNCATION fails, not key
 
     const uint32_t DIR = DIRECTION_CMD_TO_RSP;
     // Model a CFG-class encrypted batch: crypto_batch_size(20) frames at a
@@ -450,10 +462,11 @@ struct tx_seal_model {
     uint64_t gen = 0;
     uint64_t high_water = UINT64_MAX;     // unset
 
-    // Seal one batch at wire bsi over plaintext pt; returns ciphertext.
+    // Seal one batch at wire bsi over plaintext pt; returns 0 on success,
+    // -1 if encryption fails, and writes ciphertext to ct.
     // Mirrors the production: unwrap -> fold gen -> high-water guard -> encrypt.
-    std::vector<uint8_t> seal(int wire_bsi, const std::vector<uint8_t>& pt,
-                              uint64_t* out_idx)
+    int seal(int wire_bsi, const std::vector<uint8_t>& pt,
+             std::vector<uint8_t>& ct, uint64_t* out_idx)
     {
         uint64_t uw = cl_cipher_suite::unwrap_batch_index(wire_bsi, &epoch, &last_bsi);
         uint64_t idx = cl_cipher_suite::fold_gen_index(gen, uw);
@@ -463,12 +476,17 @@ struct tx_seal_model {
             idx = cl_cipher_suite::fold_gen_index(gen, uw);
         }
         high_water = idx;
-        std::vector<uint8_t> ct(pt.size() + AUTH_TAG_SIZE);
+        ct.resize(pt.size() + AUTH_TAG_SIZE);
         int n = cs.encrypt(pt.data(), (int)pt.size(), ct.data(), (int)ct.size(),
                            idx, DIRECTION_CMD_TO_RSP, AUTH_TAG_SIZE);
-        ct.resize(n > 0 ? n : 0);
+        if (n < 0) {
+            ct.clear();
+            if (out_idx) *out_idx = idx;
+            return -1;
+        }
+        ct.resize(n);
         if (out_idx) *out_idx = idx;
-        return ct;
+        return 0;
     }
     // restore_tx_from_compressed recovery: bump the generation.
     void recovery() { gen++; }
@@ -515,7 +533,8 @@ std::vector<uint8_t> mk_pt(int seed, int len)
 int test_break_rebuild_no_reuse()
 {
     tx_seal_model tx; rx_decrypt_model rx;
-    make_paired_suites(tx.cs, rx.cs);
+    if (make_paired_suites(tx.cs, rx.cs) != 0)
+        return fail("X25519 pairing setup failed");
 
     std::set<uint64_t> emitted;
 
@@ -523,7 +542,9 @@ int test_break_rebuild_no_reuse()
     rx.transition_readopt();   // first-ever adopt (gen stays 0)
     for (int b = 0; b <= 6; b++) {
         uint64_t idx; auto pt = mk_pt(b, 80);
-        auto ct = tx.seal(b, pt, &idx);
+        std::vector<uint8_t> ct;
+        if (tx.seal(b, pt, ct, &idx) != 0)
+            return fail("pre-BREAK seal failed");
         if (!emitted.insert(idx).second) return fail("pre-BREAK index reused");
         std::vector<uint8_t> out;
         if (rx.decrypt(b, ct, out) != (int)pt.size() || out != pt)
@@ -532,7 +553,9 @@ int test_break_rebuild_no_reuse()
 
     // TX seals bsi=7 (aborted batch — never delivered to RX).
     uint64_t idx_a; auto pt_a = mk_pt(700, 90);
-    auto ct_a = tx.seal(7, pt_a, &idx_a);
+    std::vector<uint8_t> ct_a;
+    if (tx.seal(7, pt_a, ct_a, &idx_a) != 0)
+        return fail("aborted seal failed");
     if (!emitted.insert(idx_a).second) return fail("aborted seal index reused");
     // (RX never sees ct_a — the batch was freed mid-flight by the BREAK.)
 
@@ -544,7 +567,9 @@ int test_break_rebuild_no_reuse()
     // The re-build re-stamps the SAME wire bsi=7 (rolled back for delivery
     // contiguity) over DIFFERENT plaintext (re-compressed at the demoted cfg).
     uint64_t idx_b; auto pt_b = mk_pt(701, 50);   // different content + length
-    auto ct_b = tx.seal(7, pt_b, &idx_b);
+    std::vector<uint8_t> ct_b;
+    if (tx.seal(7, pt_b, ct_b, &idx_b) != 0)
+        return fail("BREAK re-seal failed");
 
     // (1) the two seals at bsi=7 MUST have used DISTINCT indices.
     if (idx_a == idx_b)
@@ -572,7 +597,8 @@ int test_break_rebuild_no_reuse()
 int test_sack_reorder_retx_no_reuse()
 {
     tx_seal_model tx; rx_decrypt_model rx;
-    make_paired_suites(tx.cs, rx.cs);
+    if (make_paired_suites(tx.cs, rx.cs) != 0)
+        return fail("X25519 pairing setup failed");
 
     const int BASE = 20, N = 10;
     std::set<uint64_t> emitted;
@@ -580,7 +606,8 @@ int test_sack_reorder_retx_no_reuse()
     std::vector<uint64_t> idx(N);
     for (int k = 0; k < N; k++) {
         pt[k] = mk_pt(2000 + k, 70 + k);
-        ct[k] = tx.seal(BASE + k, pt[k], &idx[k]);
+        if (tx.seal(BASE + k, pt[k], ct[k], &idx[k]) != 0)
+            return fail("SACK seal failed");
         if (!emitted.insert(idx[k]).second)
             return fail("SACK new-seal nonce reused");
     }
@@ -609,7 +636,8 @@ int test_sack_reorder_retx_no_reuse()
 int test_wrap_with_recoveries_no_reuse()
 {
     tx_seal_model tx; rx_decrypt_model rx;
-    make_paired_suites(tx.cs, rx.cs);
+    if (make_paired_suites(tx.cs, rx.cs) != 0)
+        return fail("X25519 pairing setup failed");
 
     std::set<uint64_t> emitted;
     rx.transition_readopt();   // first adopt
@@ -626,7 +654,10 @@ int test_wrap_with_recoveries_no_reuse()
             rx.transition_readopt();
             // re-stamp the SAME wire bsi (no forward advance) over new plaintext
             auto rpt = mk_pt(90000 + n, 60);
-            uint64_t ridx; auto rct = tx.seal(wire, rpt, &ridx);
+            uint64_t ridx;
+            std::vector<uint8_t> rct;
+            if (tx.seal(wire, rpt, rct, &ridx) != 0)
+                return fail("wrap+recovery: seal failed");
             if (!emitted.insert(ridx).second)
                 return fail("wrap+recovery: re-stamp folded index REUSED (NONCE REUSE)");
             last_restamp_wire = wire; last_pt = rpt; last_ct = rct;
@@ -643,7 +674,10 @@ int test_wrap_with_recoveries_no_reuse()
             continue;
         }
         auto pt = mk_pt(n, 64);
-        uint64_t idx; auto ct = tx.seal(wire, pt, &idx);
+        uint64_t idx;
+        std::vector<uint8_t> ct;
+        if (tx.seal(wire, pt, ct, &idx) != 0)
+            return fail("wrap+recovery: seal failed");
         if (!emitted.insert(idx).second)
             return fail("wrap+recovery: forward folded index REUSED across wrap");
         std::vector<uint8_t> out;
@@ -669,18 +703,23 @@ int test_wrap_with_recoveries_no_reuse()
 int test_high_water_guard_backstop()
 {
     tx_seal_model tx; rx_decrypt_model rx;
-    make_paired_suites(tx.cs, rx.cs);
+    if (make_paired_suites(tx.cs, rx.cs) != 0)
+        return fail("X25519 pairing setup failed");
 
     // Seal bsi=3 (gen 0).
     uint64_t idx0; auto pt0 = mk_pt(300, 64);
-    auto ct0 = tx.seal(3, pt0, &idx0);
+    std::vector<uint8_t> ct0;
+    if (tx.seal(3, pt0, ct0, &idx0) != 0)
+        return fail("initial seal failed");
 
     // Re-seal the SAME bsi=3 over DIFFERENT plaintext WITHOUT bumping the gen
     // (tx.recovery() intentionally NOT called). unwrap(3) with last_bsi already 3
     // returns the SAME unwrap index; gen is still 0 -> candidate index == idx0
     // <= high_water -> the GUARD must fire and bump the gen internally.
     uint64_t idx1; auto pt1 = mk_pt(301, 40);
-    auto ct1 = tx.seal(3, pt1, &idx1);
+    std::vector<uint8_t> ct1;
+    if (tx.seal(3, pt1, ct1, &idx1) != 0)
+        return fail("guarded re-seal failed");
 
     if (idx1 == idx0)
         return fail("high-water guard did NOT prevent reuse (same index, diff plaintext)");

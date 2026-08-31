@@ -105,6 +105,7 @@ int cl_arq_controller::test_rx_drain_backpressure()
 	// Mark the data socket ACCEPTED and install the back-pressured stub. status is
 	// public; the ctor already allocated tcp_socket_data.message.
 	this->tcp_socket_data.status = TCP_STATUS_ACCEPTED;
+	int (*saved_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
 	cl_tcp_socket::g_test_transmit_hook = rx_drain_test_hook;
 	g_received.clear();
 
@@ -177,8 +178,8 @@ int cl_arq_controller::test_rx_drain_backpressure()
 			break;
 	}
 
-	// --- Detach the stub so nothing else routes through it ---
-	cl_tcp_socket::g_test_transmit_hook = nullptr;
+	// --- Restore the hook that was active before this test ---
+	cl_tcp_socket::g_test_transmit_hook = saved_hook;
 
 	// --- ASSERTIONS ---------------------------------------------------------
 	int got = (int)g_received.size();

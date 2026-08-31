@@ -67,14 +67,16 @@
 // on BOTH ends (the production derive inputs). Each suite holds its own ephemeral
 // keypair, so a self-DH would NOT match — the exchange is what makes the key
 // shared. Mirrors make_paired_suites() in test_aead_nonce.cc.
-static void kx_tamper_pair(cl_cipher_suite& a, cl_cipher_suite& b)
+static bool kx_tamper_pair(cl_cipher_suite& a, cl_cipher_suite& b)
 {
 	uint8_t pk_a[X25519_KEY_SIZE];
 	uint8_t pk_b[X25519_KEY_SIZE];
-	a.generate_x25519_keypair(pk_a);
-	b.generate_x25519_keypair(pk_b);
-	a.compute_x25519_shared(pk_b);
-	b.compute_x25519_shared(pk_a);
+	if(a.generate_x25519_keypair(pk_a) != 0 ||
+	   b.generate_x25519_keypair(pk_b) != 0)
+		return false;
+	if(a.compute_x25519_shared(pk_b) != 0 ||
+	   b.compute_x25519_shared(pk_a) != 0)
+		return false;
 	const char* psk = "MERCURY-KX-DATA-TAMPER-TEST-PSK";
 	a.derive_session_key("CMDTEST", "RSPTEST",
 	                     (const uint8_t*)psk, (int)strlen(psk), false);
@@ -82,6 +84,7 @@ static void kx_tamper_pair(cl_cipher_suite& a, cl_cipher_suite& b)
 	                     (const uint8_t*)psk, (int)strlen(psk), false);
 	a.activate();
 	b.activate();
+	return true;
 }
 
 int cl_arq_controller::test_kx_data_tamper()
@@ -98,8 +101,11 @@ int cl_arq_controller::test_kx_data_tamper()
 	// ====================================================================== //
 	{
 		cl_cipher_suite tx, rx;
-		kx_tamper_pair(tx, rx);
-		check(tx.is_active() && rx.is_active(), "PART A: paired suites active (shared key)");
+		bool paired = kx_tamper_pair(tx, rx);
+		check(paired && tx.is_active() && rx.is_active(),
+			"PART A: paired suites active (shared key)");
+		if(!paired || !tx.is_active() || !rx.is_active())
+			return failures;
 
 		// A realistic mid-stream DATA batch payload.
 		const int PT = 200;
@@ -127,7 +133,10 @@ int cl_arq_controller::test_kx_data_tamper()
 		// ---- forward direction (CMD->RSP, dir=0 — the live DATA direction) ----
 		uint8_t ctf[PT + AUTH_TAG_SIZE];
 		int nf = seal(DIRECTION_CMD_TO_RSP, ctf, sizeof(ctf));
-		check(nf == PT + AUTH_TAG_SIZE, "forward: production encrypt sealed batch (len == pt+tag)");
+		bool nf_ok = nf >= 0 && nf <= (int)sizeof(ctf)
+			&& nf == PT + AUTH_TAG_SIZE;
+		check(nf_ok, "forward: production encrypt sealed batch (len == pt+tag)");
+		if(!nf_ok) return failures;
 
 		{	// non-vacuity: a CLEAN forward ct decrypts byte-identical
 			uint8_t clean[PT];
@@ -165,6 +174,10 @@ int cl_arq_controller::test_kx_data_tamper()
 		// ---- reverse direction (RSP->CMD, dir=1) — extend prior coverage -----
 		uint8_t ctr[PT + AUTH_TAG_SIZE];
 		int nr = seal(DIRECTION_RSP_TO_CMD, ctr, sizeof(ctr));
+		bool nr_ok = nr >= 0 && nr <= (int)sizeof(ctr)
+			&& nr == PT + AUTH_TAG_SIZE;
+		check(nr_ok, "reverse: production encrypt sealed batch (len == pt+tag)");
+		if(!nr_ok) return failures;
 		{	// non-vacuity
 			uint8_t clean[PT];
 			int d = open_at(ctr, nr, 0, DIRECTION_RSP_TO_CMD, clean, sizeof(clean));
@@ -242,7 +255,15 @@ int cl_arq_controller::test_kx_data_tamper()
 		// pair the controller's own cipher_suite (RX) with a fresh sender tx
 		this->cipher_suite.wipe();
 		cl_cipher_suite tx;
-		kx_tamper_pair(tx, this->cipher_suite);
+		bool paired = kx_tamper_pair(tx, this->cipher_suite);
+		if(!paired){
+			check(false, "production path key exchange setup");
+			if(out_occ) *out_occ = -1;
+			if(out_dropped) *out_dropped = false;
+			if(out_authfail) *out_authfail = 0;
+			if(out_match) *out_match = false;
+			return;
+		}
 
 		uint32_t dir = (role_for_rx == COMMANDER)
 			? DIRECTION_RSP_TO_CMD : DIRECTION_CMD_TO_RSP;
@@ -257,6 +278,20 @@ int cl_arq_controller::test_kx_data_tamper()
 			0, cl_cipher_suite::unwrap_batch_index(0, &e, &l));
 		int wlen = tx.encrypt((const uint8_t*)comp, comp_len,
 			wire, sizeof(wire), bidx, dir, AUTH_TAG_SIZE);
+
+		bool wire_ok = comp_len > 0
+			&& comp_len <= (int)sizeof(wire) - AUTH_TAG_SIZE
+			&& wlen >= 0 && wlen <= (int)sizeof(wire)
+			&& wlen <= N_MAX / 8
+			&& wlen == comp_len + AUTH_TAG_SIZE;
+		check(wire_ok, "production encrypt returned a bounded wire length");
+		if(!wire_ok){
+			if(out_occ) *out_occ = -1;
+			if(out_dropped) *out_dropped = false;
+			if(out_authfail) *out_authfail = 0;
+			if(out_match) *out_match = false;
+			return;
+		}
 
 		// apply the wire tamper for this position
 		bool wrong_bsi = false;

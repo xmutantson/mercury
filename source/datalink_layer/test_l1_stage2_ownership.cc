@@ -14,6 +14,12 @@ int cl_arq_controller::l1_test_timeout_case(const char* marker,
   *awaiting_after = *queued_after = *reset_completed = 0;
   cl_telecom_system* ts = new cl_telecom_system();
   telecom_system = ts;
+  auto cleanup = [&]() {
+    deinit_messages_buffers();
+    telecom_system = NULL;
+    delete ts;
+    std::remove(marker);
+  };
   role = COMMANDER;
   original_role = COMMANDER;
   robust_enabled = NO;
@@ -50,8 +56,7 @@ int cl_arq_controller::l1_test_timeout_case(const char* marker,
     if(messages_tx[i].status != FREE && messages_tx[i].length == 1 &&
        messages_tx[i].data[0] == awaiting[0]) { slot = i; break; }
   if(slot < 0) {
-    telecom_system = NULL;
-    delete ts;
+    cleanup();
     return 1;
   }
   messages_tx[slot].batch_seq_id = 219;
@@ -63,7 +68,10 @@ int cl_arq_controller::l1_test_timeout_case(const char* marker,
   if(l1_tx_journal.enabled()) {
     l1_tx_journal.begin_session(37);
     if(!l1_tx_journal.stage(219, (uint16_t)slot, 0, 1,
-                            awaiting.data(), awaiting.size(), CONFIG_0)) return 1;
+                            awaiting.data(), awaiting.size(), CONFIG_0)) {
+      cleanup();
+      return 1;
+    }
     l1_tx_journal.mark_sent(219, (uint16_t)slot);
   }
   fifo_buffer_tx.push(const_cast<char*>(queued.data()), (int)queued.size());
@@ -95,14 +103,28 @@ int cl_arq_controller::l1_test_timeout_case(const char* marker,
     if(occupied > 0) (*queued_after)++;
   }
 
-  deinit_messages_buffers();
-  telecom_system = NULL;
-  delete ts;
-  std::remove(marker);
+  cleanup();
   return 0;
 }
 
 int cl_arq_controller::test_l1_stage2_ownership() {
+  struct EnvRestore {
+    const char* key;
+    bool had;
+    std::string value;
+    ~EnvRestore() {
+      if(had) setenv(key, value.c_str(), 1);
+      else unsetenv(key);
+    }
+  };
+  const char* previous_state = std::getenv("MERCURY_L1_JOURNAL_STATE");
+  const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
+  EnvRestore restore_state = {"MERCURY_L1_JOURNAL_STATE",
+                              previous_state != nullptr,
+                              previous_state ? std::string(previous_state) : std::string()};
+  EnvRestore restore_journal = {"MERCURY_L1_JOURNAL",
+                                previous_journal != nullptr,
+                                previous_journal ? std::string(previous_journal) : std::string()};
   char marker[160];
   std::snprintf(marker, sizeof(marker), "/tmp/mercury_l1_prod_%ld.pending",
                 (long)getpid());
@@ -123,7 +145,6 @@ int cl_arq_controller::test_l1_stage2_ownership() {
   check(aa == 1 && aq == 1,
         "pass-after accepted terminal owner retains both ranges");
   check(ar == 1, "destructive reset follows terminal acceptance receipt");
-  setenv("MERCURY_L1_JOURNAL", "0", 1);
   std::printf("[TEST-L1-STAGE2] %s failures=%d before={%d,%d,%d} after={%d,%d,%d}\n",
       failures ? "FAIL" : "PASS", failures, ba, bq, br, aa, aq, ar);
   return failures ? 1 : 0;

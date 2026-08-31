@@ -159,6 +159,7 @@ static void test_bulk_no_regression()
 		int d = rx.decompress_block(out, w, rt, (int)sizeof(rt));
 		bool ok = (d == (int)para.size() && memcmp(rt, para.data(), para.size()) == 0);
 		all_rt = all_rt && ok;
+		if (!ok) break;  // Never advance either streaming peer after a failed decode.
 		int algo = (unsigned char)out[0] & COMPRESS_ALGO_MASK;
 		if (rx.is_streaming()) rx.streaming_commit((unsigned char*)para.data(), (int)para.size());
 		if (tx.is_streaming() && algo != COMPRESS_ALGO_RAW)
