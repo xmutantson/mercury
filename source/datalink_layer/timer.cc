@@ -22,11 +22,13 @@
 
 #include "datalink_layer/timer.h"
 #include "common/sim_clock.h"
+#include <limits>
 
 
 // clock_gettime implementation for WIN32
 // https://stackoverflow.com/questions/5404277/porting-clock-gettime-to-windows
 #if defined(_WIN32)
+#include <mutex>
 #include <windows.h>
 #define MS_PER_SEC      1000ULL     // MS = milliseconds
 #define US_PER_MS       1000ULL     // US = microseconds
@@ -43,15 +45,18 @@
 
 int clock_gettime_monotonic(struct timespec *tv)
 {
+    static std::once_flag ticksPerSecOnce;
     static LARGE_INTEGER ticksPerSec;
+    static bool ticksPerSecValid = false;
     LARGE_INTEGER ticks;
 
-    if (!ticksPerSec.QuadPart) {
-        QueryPerformanceFrequency(&ticksPerSec);
-        if (!ticksPerSec.QuadPart) {
-            errno = ENOTSUP;
-            return -1;
-        }
+    std::call_once(ticksPerSecOnce, []() {
+        ticksPerSecValid = QueryPerformanceFrequency(&ticksPerSec) != 0 &&
+                           ticksPerSec.QuadPart != 0;
+    });
+    if (!ticksPerSecValid) {
+        errno = ENOTSUP;
+        return -1;
     }
 
     QueryPerformanceCounter(&ticks);
@@ -165,6 +170,8 @@ void cl_timer::start()
 
 void cl_timer::stop()
 {
+	if(counting != YES)
+		return;
 	cl_timer_clock_read(&stopTime);
 	seconds=stopTime.tv_sec-startTime.tv_sec;
 	nanoseconds=stopTime.tv_nsec-startTime.tv_nsec;
@@ -217,7 +224,14 @@ void cl_timer::update()
 int cl_timer::get_elapsed_time_ms()
 {
 	this->update();
-	return this->seconds*1000+miliSeconds;
+	const long long elapsed_ms =
+		static_cast<long long>(this->seconds) * 1000LL +
+		this->miliSeconds;
+	if(elapsed_ms > std::numeric_limits<int>::max())
+		return std::numeric_limits<int>::max();
+	if(elapsed_ms < std::numeric_limits<int>::min())
+		return std::numeric_limits<int>::min();
+	return static_cast<int>(elapsed_ms);
 }
 
 int cl_timer::get_counter_status()
