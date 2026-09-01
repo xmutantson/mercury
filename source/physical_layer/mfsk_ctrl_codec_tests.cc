@@ -65,6 +65,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <random>
 #include <string>
 #include <vector>
@@ -5610,6 +5611,124 @@ static void hail_decimate(cl_telecom_system& ts, const std::vector<double>& pb,
 		M, &ts.ofdm.FIR_rx_data);
 }
 
+// E4 detect-fft-memo equivalence + fire-proof (idle-CPU lever). The coarse
+// ACK/HAIL correlator re-transforms the SAME symbol window once per start
+// position that spans it (~hail_detect_nsymb FFTs per distinct window). The memo
+// path transforms each distinct window ONCE and caches its |FFT|^2. This test
+// proves the optimization is (1) ACQUISITION-SAFE — the memoized detector
+// returns BIT-IDENTICAL matched-count / suffix / metric to the legacy inline-FFT
+// path on a clean beacon, a noisy beacon, and pure noise, so detection
+// sensitivity AND the detect/no-detect decision are unchanged; and (2) ACTIVE,
+// not inert — the coarse FFT-execution counter drops sharply with the memo on
+// (fail-before if a future change makes it inert). detect_memo_force toggles the
+// path in-process so both arms run in one --test invocation.
+static void test_detect_fft_memo_equivalence() {
+	const char* name = "detect_fft_memo_equivalence";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	ts.ack_mfsk.clear_hail_target();   // undirected HAIL = the idle listen path
+
+	int nsymb = ts.ack_mfsk.hail_detect_nsymb;
+	if (ts.ack_mfsk.M < 16 || nsymb <= 0) { test_fail(name, "HAIL config not WB/loaded"); return; }
+
+	std::vector<double> tmpl; int sig_off = 0; double p_sig = 0.0;
+	if (!build_hail_template(ts, /*cfo_hz=*/8.0, tmpl, sig_off, p_sig)) {
+		test_fail(name, "build_hail_template failed"); return;
+	}
+	const int PB = (int)tmpl.size();
+	const double sig_rms = std::sqrt(p_sig);
+
+	// Three inputs spanning the decision space: a clean beacon (strong detect), a
+	// noisy beacon near the working point, and pure noise (no signal). The memo
+	// must reproduce the legacy result on ALL three (deterministic seed).
+	std::mt19937 rng(0xE4DEF77Au);
+	struct MemoCase { const char* label; std::vector<double> buf; };
+	std::vector<MemoCase> cases;
+	cases.push_back({"clean", tmpl});
+	{
+		std::vector<double> nb = tmpl;
+		std::normal_distribution<double> nd(0.0, sig_rms * 5.0);
+		for (int i = 0; i < PB; i++) nb[(size_t)i] += nd(rng);
+		cases.push_back({"noisy_beacon", nb});
+	}
+	{
+		std::vector<double> nb((size_t)PB, 0.0);
+		std::normal_distribution<double> nd(0.0, sig_rms * 5.0);
+		for (int i = 0; i < PB; i++) nb[(size_t)i] = nd(rng);
+		cases.push_back({"pure_noise", nb});
+	}
+
+	long tot_off = 0, tot_on = 0;
+	for (size_t ci = 0; ci < cases.size(); ci++) {
+		const char* lbl = cases[ci].label;
+		double* buf = cases[ci].buf.data();
+
+		int m_off = 0, sfx_off = 0;
+		ts.ofdm.detect_memo_force = 0;                 // legacy inline-FFT path
+		ts.ofdm.detect_ack_fft_count = 0;
+		double met_off = ts.detect_hail_pattern_from_passband(buf, PB, &m_off, 0, &sfx_off);
+		long fft_off = ts.ofdm.detect_ack_fft_count;
+
+		int m_on = 0, sfx_on = 0;
+		ts.ofdm.detect_memo_force = 1;                 // memoized path
+		ts.ofdm.detect_ack_fft_count = 0;
+		double met_on = ts.detect_hail_pattern_from_passband(buf, PB, &m_on, 0, &sfx_on);
+		long fft_on = ts.ofdm.detect_ack_fft_count;
+
+		printf("    [%s] matched off/on=%d/%d  suffix off/on=%d/%d  metric off/on=%.9g/%.9g  coarseFFT off/on=%ld/%ld\n",
+			lbl, m_off, m_on, sfx_off, sfx_on, met_off, met_on, fft_off, fft_on);
+
+		if (m_off != m_on || sfx_off != sfx_on || met_off != met_on) {
+			char b[224];
+			snprintf(b, sizeof(b),
+				"%s: memo path diverged (matched %d!=%d, suffix %d!=%d, metric %.17g!=%.17g)",
+				lbl, m_off, m_on, sfx_off, sfx_on, met_off, met_on);
+			ts.ofdm.detect_memo_force = -1;
+			test_fail(name, b); return;
+		}
+		tot_off += fft_off; tot_on += fft_on;
+	}
+	ts.ofdm.detect_memo_force = -1;
+
+	// Fire-proof: the memo must materially cut coarse FFT executions (else inert).
+	if (!(tot_on > 0 && tot_off >= 3 * tot_on)) {
+		char b[160];
+		snprintf(b, sizeof(b),
+			"memo inert: coarse FFTs off=%ld on=%ld (require off >= 3*on)", tot_off, tot_on);
+		test_fail(name, b); return;
+	}
+	printf("    detect-fft-memo ACTIVE + byte-identical: coarse FFTs %ld -> %ld (%.1fx fewer) over %zu inputs\n",
+		tot_off, tot_on, (double)tot_off / (double)tot_on, cases.size());
+
+	// Optional CPU microbench (MERCURY_DETECT_FFT_MEMO_BENCH=1): time the
+	// production detector on a fixed pure-noise buffer, memo off vs on. Isolates
+	// the detector CPU the lever targets (~all of idle-listen CPU per the
+	// efficiency profile). Env-gated so the default --test output stays
+	// deterministic (clock() = process CPU time; the loop is single-threaded).
+	if (std::getenv("MERCURY_DETECT_FFT_MEMO_BENCH") != nullptr) {
+		std::vector<double> nb((size_t)PB, 0.0);
+		std::normal_distribution<double> nd(0.0, sig_rms * 5.0);
+		for (int i = 0; i < PB; i++) nb[(size_t)i] = nd(rng);
+		const int ITERS = 3000;
+		int mm = 0, sf = 0;
+		ts.ofdm.detect_memo_force = 0;
+		clock_t c0 = clock();
+		for (int k = 0; k < ITERS; k++) ts.detect_hail_pattern_from_passband(nb.data(), PB, &mm, 0, &sf);
+		clock_t c1 = clock();
+		ts.ofdm.detect_memo_force = 1;
+		for (int k = 0; k < ITERS; k++) ts.detect_hail_pattern_from_passband(nb.data(), PB, &mm, 0, &sf);
+		clock_t c2 = clock();
+		ts.ofdm.detect_memo_force = -1;
+		double ms_off = 1000.0 * (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
+		double ms_on  = 1000.0 * (double)(c2 - c1) / (double)CLOCKS_PER_SEC;
+		printf("    [BENCH] detect x%d: off=%.1f ms on=%.1f ms  detector-speedup=%.2fx  (us/call off=%.1f on=%.1f)\n",
+			ITERS, ms_off, ms_on, (ms_on > 0 ? ms_off / ms_on : 0.0),
+			1000.0 * ms_off / ITERS, 1000.0 * ms_on / ITERS);
+	}
+	test_pass(name);
+}
+
 // §11 — THE MEASUREMENT: HAIL beacon-detection cliff (P(detect) vs SNR3k) under
 // the current 3.0 metric gate, the relaxed 2.0/0.65 gates, and R=1/2/3/5
 // noncoherent beacon energy-combining. Also reports the base-matched-only floor
@@ -9106,6 +9225,12 @@ int run_mfsk_ctrl_codec_tests() {
 	test_compact_confirm_cliff_sweep();   // PASS iff N=10 cliff >= +1.5 dB deeper than uncoded-13
 	test_compact_confirm_passband_roundtrip_clean();   // full TX->passband->RX DSP chain
 	test_compact_confirm_no_cross_validate();          // false-confirm invariant: no aliasing
+
+	// E4 idle-CPU lever: coarse ACK/HAIL correlator per-symbol FFT memoization.
+	// Byte-identical detection (matched/suffix/metric) vs the legacy inline-FFT
+	// path across clean/noisy/pure-noise inputs + a fire-proof that the memo cuts
+	// coarse FFT executions (acquisition-preserving optimization, default-off).
+	test_detect_fft_memo_equivalence();
 
 	// §11 HAIL beacon-detection floor sim (HAIL weak-signal investigation,
 	// 2026-05-31). MEASURE-only: prints the metric-gate-relax dB, the

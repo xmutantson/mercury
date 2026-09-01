@@ -86,6 +86,22 @@ bool fft_float_enabled()
 	return on;
 }
 
+// E4 idle-CPU lever (detect-fft-memo): default-on memoization of the coarse ACK/HAIL
+// correlator's per-symbol FFT. The coarse sliding search re-FFTs the SAME symbol
+// window once per start position that spans it (~ack_nsymb times); caching each
+// distinct symbol's |FFT|^2 once yields byte-identical detection with ~10x fewer
+// FFTs at idle. Default ON (fleet-validated); disable with
+// MERCURY_DETECT_FFT_MEMO=0. Read once into a function-local static so the poll
+// hot path is a single branch, never a getenv() call.
+bool detect_fft_memo_enabled()
+{
+	static const bool on = []{
+		const char* e = std::getenv("MERCURY_DETECT_FFT_MEMO");
+		return !(e && *e && atoi(e) == 0);   // DEFAULT-ON: explicit =0 restores stock
+	}();
+	return on;
+}
+
 std::map<size_t, pocketfft::detail::pocketfft_c<float>>& fft_plan_cache_f()
 {
 	static std::map<size_t, pocketfft::detail::pocketfft_c<float>> cache;
@@ -169,6 +185,11 @@ cl_ofdm::cl_ofdm()
 	// Pre-allocated Nfft work buffers (Group A)
 	work_buf_a=NULL;
 	work_buf_b=NULL;
+	// E4 detect-fft-memo: coarse-correlator per-symbol FFT-power cache (grow-once)
+	detect_memo_pow=NULL;
+	detect_memo_cap=0;
+	detect_ack_fft_count=0;
+	detect_memo_force=-1;
 	// Pre-allocated time_sync_preamble buffers (Group B)
 	tsync_corr_loc=NULL;
 	tsync_corr_vals=NULL;
@@ -319,6 +340,8 @@ void cl_ofdm::deinit()
 	p2b_buffer_size=0;
 	CDELETE(work_buf_a);
 	CDELETE(work_buf_b);
+	if(detect_memo_pow!=NULL){delete[] detect_memo_pow; detect_memo_pow=NULL;}
+	detect_memo_cap=0;
 	if(tsync_corr_loc!=NULL){delete[] tsync_corr_loc; tsync_corr_loc=NULL;}
 	if(tsync_corr_vals!=NULL){delete[] tsync_corr_vals; tsync_corr_vals=NULL;}
 	tsync_corr_size=0;
@@ -5289,6 +5312,48 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	if (ack_allow_partial_tail && combine_reps == 1)
 		s_max = buffer_nsymb - 1;   // allow the last 15 partial-tail start positions
 
+	// E4 detect-fft-memo (idle-CPU lever): the coarse loop below re-FFTs the SAME
+	// symbol window for every start position s that spans it — for a symbol at
+	// absolute index (s+p) the FFT input/output depend ONLY on (s+p), so each
+	// distinct window is transformed up to ack_nsymb times. Idle undirected HAIL:
+	// ack_nsymb=16, buffer_nsymb=40, s_max=24 -> 25x16=400 coarse FFTs over only
+	// ~40 distinct windows (~10x redundancy; FFT is ~68% of idle cycles per the
+	// efficiency profile). Precompute each distinct window's |FFT|^2 ONCE here and
+	// have the coarse psp() read the cache: the power values are BIT-IDENTICAL, so
+	// matched-count / metric / best_offset and the detect decision are unchanged.
+	// Only the reps==1 path is memoized (the default ACK/HAIL/BREAK poll); the
+	// reps>1 recovery-combining path and the fine (sub-symbol) pass are untouched.
+	const bool memo_on = (combine_reps == 1) &&
+		(detect_memo_force >= 0 ? (detect_memo_force != 0) : detect_fft_memo_enabled());
+	int memo_max_sym = -1;
+	if (memo_on)
+	{
+		// Highest absolute symbol index the coarse loop can reach whose full FFT
+		// window still fits the buffer (mirrors the per-symbol break bound below).
+		memo_max_sym = s_max + ack_nsymb - 1;
+		int last_in_buf = buffer_nsymb - 1;
+		if (memo_max_sym > last_in_buf) memo_max_sym = last_in_buf;
+		size_t need = (size_t)(memo_max_sym + 1) * (size_t)Nfft;
+		if (detect_memo_cap < need)
+		{
+			if (detect_memo_pow != NULL) { delete[] detect_memo_pow; detect_memo_pow = NULL; }
+			detect_memo_pow = new double[need];   // grow-once; allocation-free after warmup
+			detect_memo_cap = need;
+		}
+		for (int j = 0; j <= memo_max_sym; j++)
+		{
+			int off = j * sym_period_interp + Ngi * interpolation_rate;
+			for (int i = 0; i < Nfft; i++)
+				decimated_sym[i] = baseband_interp[off + i * interpolation_rate];
+			fft(decimated_sym, fft_out, Nfft);
+			detect_ack_fft_count++;
+			double* row = detect_memo_pow + (size_t)j * Nfft;
+			for (int b = 0; b < Nfft; b++)
+				row[b] = fft_out[b].real() * fft_out[b].real() +
+				         fft_out[b].imag() * fft_out[b].imag();
+		}
+	}
+
 	for (int s = 0; s <= s_max; s++)
 	{
 		double metric = 0;
@@ -5312,14 +5377,21 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 				if (!accumulate_sym_power(offset, pow_accum.data()))
 					break;   // a rep ran off the buffer
 			}
+			else if (memo_on)
+			{
+				// per-symbol |FFT|^2 already cached in detect_memo_pow above
+				// (byte-identical to the inline FFT); psp() reads the cache row.
+			}
 			else
 			{
 				for (int i = 0; i < Nfft; i++)
 					decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 				fft(decimated_sym, fft_out, Nfft);
+				detect_ack_fft_count++;
 			}
 			auto psp = [&](int b) -> double {
 				if (combine_reps > 1) return pow_accum[b];
+				if (memo_on) return detect_memo_pow[(size_t)sym_idx * Nfft + b];
 				return fft_out[b].real() * fft_out[b].real() +
 				       fft_out[b].imag() * fft_out[b].imag();
 			};

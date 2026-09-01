@@ -445,6 +445,15 @@ public:
 	std::complex<double>* work_buf_a;
 	std::complex<double>* work_buf_b;
 
+	// E4 detect-fft-memo: grow-once cache of the coarse ACK/HAIL correlator's
+	// per-symbol |FFT|^2 power spectra (one row of Nfft doubles per distinct
+	// symbol window in the search buffer). Allocation-free after warmup. Gated by
+	// detect_fft_memo_enabled() / detect_memo_force; byte-identical when off.
+	double* detect_memo_pow;
+	size_t  detect_memo_cap;        // capacity of detect_memo_pow, in doubles
+	long    detect_ack_fft_count;   // coarse-path FFTs executed in detect_ack_pattern (memo fire-proof counter)
+	int     detect_memo_force;      // -1 = follow MERCURY_DETECT_FFT_MEMO env; 0/1 = force off/on (test hook)
+
 	// Pre-allocated grow-as-needed buffers for time_sync_preamble[_with_metric]
 	int* tsync_corr_loc;
 	double* tsync_corr_vals;
