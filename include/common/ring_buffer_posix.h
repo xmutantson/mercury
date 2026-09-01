@@ -65,7 +65,7 @@ void circular_buf_unlink_shm(char *base_name);
 int read_buffer(cbuf_handle_t cbuf, uint8_t *data, size_t len);
 
 // returns the number of bytes read on success, -1 on error (blocking version)
-int read_buffer_all(cbuf_handle_t cbuf, uint8_t *data);
+int read_buffer_all(cbuf_handle_t cbuf, uint8_t *data, size_t data_capacity);
 
 // returns 0 on success, -1 on error (blocking version)
 int write_buffer(cbuf_handle_t cbuf, uint8_t * data, size_t len);

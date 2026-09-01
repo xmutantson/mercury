@@ -480,7 +480,7 @@ bool circular_buf_full(cbuf_handle_t cbuf)
     return is_full;
 }
 
-int read_buffer_all(cbuf_handle_t cbuf, uint8_t *data)
+int read_buffer_all(cbuf_handle_t cbuf, uint8_t *data, size_t data_capacity)
 {
     assert(cbuf && data && cbuf->internal && cbuf->buffer);
 
@@ -492,6 +492,12 @@ int read_buffer_all(cbuf_handle_t cbuf, uint8_t *data)
 
     size = cbuf->internal->max;
     len = circular_buf_size_internal(cbuf);
+
+    if (len > data_capacity)
+    {
+        MUTEX_UNLOCK( &cbuf->internal->mutex );
+        return -1;
+    }
 
     if(len > 0)
     {

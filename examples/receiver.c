@@ -46,7 +46,7 @@ int main(int argc, char *argv[])
     int counter = 0;
     while(true)
     {
-        int size = read_buffer_all(buffer, data);
+        int size = read_buffer_all(buffer, data, sizeof(data));
         fwrite(data, size, 1, output);
         fflush(output);
         fprintf(stderr, "\rRX Frames: %c (%04d)", spinner[counter % 4], counter);
