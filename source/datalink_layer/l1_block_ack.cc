@@ -223,7 +223,10 @@ DispatchDisposition BlockAckRuntime::dispatch_received_frame(
 			if(pending_batches_.empty()
 				|| decoded.value.block_serial != (uint16_t)(tx_block_serial_ + 1u)
 				|| decoded.value.block_start_bsi != pending_start_bsi_
-				|| decoded.value.batch_index + 1u != pending_batches_.size())
+				|| decoded.value.batch_index + 1u != pending_batches_.size()
+				|| !decoded.value.block_mode
+				|| decoded.value.batch_count_limit != aggregate_batches_
+				|| decoded.value.batch_span != pending_batches_.size())
 				return DispatchDisposition::INVALID;
 			flush_requested_ = true;
 		}
@@ -234,14 +237,18 @@ DispatchDisposition BlockAckRuntime::dispatch_received_frame(
 	const uint16_t encoded_size = get16(body + 4);
 	if(encoded_size > body_size) return DispatchDisposition::INVALID;
 	body_size = encoded_size;
+	if(tx_pending_batches_ == 0) return DispatchDisposition::INVALID;
 
 	const uint16_t serial = get16(body + 16);
 	const uint8_t start = body[18];
-	Binding binding = {session_id_, epoch_, negotiation_id_, serial, start,
+	Binding binding = {session_id_, epoch_, negotiation_id_,
+		(uint16_t)(rx_block_serial_ + 1u), tx_pending_start_bsi_,
 		aggregate_batches_, MAX_SLOT_CAP};
 	DecodeOptions options = {binding};
 	DecodeResult<BlockSack> decoded = decode_sack(body, body_size, options);
-	if(!decoded.valid || serial != (uint16_t)(rx_block_serial_ + 1u))
+	if(!decoded.valid
+		|| decoded.value.batches.size() != tx_pending_batches_
+		|| decoded.value.final != (tx_pending_batches_ < aggregate_batches_))
 		return DispatchDisposition::INVALID;
 
 	std::vector<std::pair<uint8_t, uint16_t> > keys;
@@ -309,7 +316,10 @@ bool BlockAckRuntime::observe_received_batch(uint8_t bsi,
 	}
 	if((uint32_t)pending_width_ + received.size() > MAX_SLOT_CAP)
 		return false;
-	if(pending_batches_.empty()) pending_start_bsi_ = bsi;
+	if(pending_batches_.empty()) {
+		last_tx_ack_valid_ = false;
+		pending_start_bsi_ = bsi;
+	}
 	BatchEntry entry = {bsi, (uint16_t)received.size(), pending_width_};
 	pending_batches_.push_back(entry);
 	for(std::size_t slot = 0; slot < received.size(); ++slot)
