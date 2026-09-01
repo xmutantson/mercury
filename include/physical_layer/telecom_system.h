@@ -681,6 +681,11 @@ public:
 	bool fine_energy_carried_defeat = false;
 	int fine_energy_last_shift_symbols = 0;
 	int fine_energy_test_force_shift_symbols = 0;
+	// Focused-regression defeat for the sub-peak XCORR onset rescue, so a forced
+	// mis-anchored cell can demonstrate the unprotected decode loss. Default
+	// false (production path unaffected); MERCURY_SUBPEAK_RESCUE_DEFEAT is the
+	// process-wide env equivalent used on the live path.
+	bool subpeak_rescue_test_defeat = false;
 
 	// Structural guard for pilot-grid overrides. The OFDM grid fixes the coded
 	// bit count at nData*log2(M); it must fit the active LDPC codeword before any

@@ -4041,7 +4041,7 @@ skip_h_retry_point:
 					// per receive_byte; OFDM only; disabled on the forced-delay BER
 					// path. MERCURY_SUBPEAK_RESCUE_DEFEAT=1 → this block is skipped
 					// and the reject below is byte-identical to baseline.
-					if(!subpeak_rescue_defeat && M != MOD_MFSK && !xcorr_rescue_attempted
+					if(!subpeak_rescue_defeat && !subpeak_rescue_test_defeat && M != MOD_MFSK && !xcorr_rescue_attempted
 					   && ofdm_forced_delay < 0 && mfsk_fixed_delay < 0)
 					{
 						xcorr_rescue_attempted = true;

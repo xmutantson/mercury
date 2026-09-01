@@ -2044,6 +2044,10 @@ static Mini0CarriedCell run_carried_preamble_cell(int tail_preamble_nsymb,
     ts.preamble_amortization_enabled = carried;
     ts.keydown_track_timing_enabled = carried;
     ts.fine_energy_carried_defeat = legacy_defeat;
+    // The legacy negative-control arm also disables the sub-peak onset rescue so
+    // the forced +1-symbol mis-anchor stays catastrophic (the rescue, added
+    // later, otherwise recovers the true onset and masks the decode loss).
+    ts.subpeak_rescue_test_defeat = legacy_defeat;
 	ts.fine_energy_test_force_shift_symbols = forced_shift_symbols;
 
     cl_data_container& dc = ts.data_container;
@@ -2127,13 +2131,17 @@ static int run_mini0_carried_timing_test()
 	printf("[TEST-MINI0-CARRIED] no-carry control: decoded=%d exact=%d energy_shift=%d skipvar=%d coast=%d nv=%.4f\n",
 		control.decoded, control.byte_exact, control.shift_symbols,
 		control.skip_var_aborted, control.coasted, control.noise_variance);
-    bool legacy_chain = legacy.shift_symbols == 1 && !legacy.decoded
-        && legacy.skip_var_aborted && legacy.coasted;
+    // Negative control: with the carried-timing refinement defeated AND the
+    // sub-peak onset rescue disabled for this arm, the forced +1-symbol shift
+    // stays catastrophic and the frame is lost. The downstream skip-var/coast
+    // disposition is incidental to the loss (the later sub-peak rescue changes
+    // which reject stage the miss flows through), so it is reported but not gated.
+    bool legacy_chain = legacy.shift_symbols == 1 && !legacy.decoded;
     bool fixed_chain = fixed.shift_symbols == 0 && fixed.decoded
         && fixed.byte_exact && !fixed.skip_var_aborted && !fixed.coasted;
 	bool control_chain = control.shift_symbols == 0 && control.decoded
 		&& control.byte_exact && !control.skip_var_aborted && !control.coasted;
-    printf("[TEST-MINI0-CARRIED] %s (legacy +1-symbol->SKIP-VAR->coast; fixed byte-exact hold)\n",
+    printf("[TEST-MINI0-CARRIED] %s (legacy +1-symbol decode-loss; fixed byte-exact hold)\n",
 		(legacy_chain && fixed_chain && control_chain) ? "ALL PASS" : "FAILED");
 	return (legacy_chain && fixed_chain && control_chain) ? 0 : 1;
 }
@@ -2206,6 +2214,12 @@ int main(int argc, char *argv[])
         }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
+            // Pin the process-global C RNG to a fixed, platform-independent
+            // state at the very start of the Monte-Carlo battery so every noise
+            // realization is reproducible across build environments. A fresh
+            // process is only implicitly seed-1; making it explicit also clears
+            // any RNG consumption from earlier static initialization.
+            srand(1u);
             int failed = run_mfsk_ctrl_codec_tests();
             if (getenv("MERCURY_CAP_CODEC_ONLY") != NULL)
                 return failed == 0 ? 0 : 1;
