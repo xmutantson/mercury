@@ -71,7 +71,7 @@ public:
 	float GBF_eta; //!< The GBF algorithms correction rate.
 	int nIteration_max; //!< The maximum number of LDPC decoding iterations allowed.
 	int print_nIteration;
-	void init();
+	int init();
 	void deinit();
 
 	// PRECOOK M3 (BUNDLE_FIELD_CHECKLIST PART 3): copy all scalars + the

@@ -61,18 +61,22 @@ cl_ldpc::~cl_ldpc()
 	deinit();
 }
 
-void cl_ldpc::init()
+int cl_ldpc::init()
 {
+	deinit();
 	standard_val=standard;
 	N=framesize;
-	K=(int)((float)N*rate);
-	P=N-K;
 	decoding_algorithm_val=decoding_algorithm;
 	eta_val=GBF_eta;
 	nIteration_max_val=nIteration_max;
 	print_nIteration_val= print_nIteration;
-	Cwidth=0;
-	update_code_parameters();
+	if(N<=0 || N>N_MAX || !(rate>0.0f && rate<1.0f))
+		return -1;
+	K=(int)((float)N*rate);
+	P=N-K;
+	if(decoding_algorithm_val!=GBF && decoding_algorithm_val!=SPA)
+		return -1;
+	return update_code_parameters();
 }
 
 void cl_ldpc::deinit()
@@ -86,10 +90,12 @@ void cl_ldpc::deinit()
 	nIteration_max_val=0;
 	print_nIteration_val=0;
 	Cwidth=0;
-
-	Cwidth=0;
+	Vwidth=0;
+	dwidth=0;
 	QCmatrixC=NULL;
 	QCmatrixEnc=NULL;
+	QCmatrixV=NULL;
+	QCmatrixd=NULL;
 
 	CDELETE(R);
 	CDELETE(Q);
@@ -100,6 +106,17 @@ void cl_ldpc::deinit()
 
 void cl_ldpc::encode(const int* data, int*  encoded_data)
  {
+	if(encoded_data==NULL)
+		return;
+
+	if(data==NULL || QCmatrixEnc==NULL || N<=0 || N>N_MAX
+		|| K<=0 || K>N || P<=0 || P!=N-K || Cwidth<2)
+	{
+		if(N>0 && N<=N_MAX)
+			memset(encoded_data, 0, sizeof(int) * (size_t)N);
+		return;
+	}
+
  	int CwidthMax=Cwidth-1;
  	int* QCmatrixEnc_;
  	QCmatrixEnc_=QCmatrixEnc;
@@ -124,11 +141,12 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
 
  int cl_ldpc::update_code_parameters()
   {
-  	int success=0;
+  	int success=-1;
   	if(standard_val==MERCURY)
   	{
   		if(N==MERCURY_NORMAL)
   		{
+  			success=0;
   			if(K==100)//rate == 1/16
   			{
   				Cwidth=mercury_normal_Cwidth_1_16;
@@ -259,9 +277,8 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
   			}
   			else
   			{
-  				std::cout<<"K="<<K<<" Wrong Code Rate"<<std::endl<<"Exiting.."<<std::endl;
-  				success=-1;
-  				exit(1);
+  				std::cout<<"K="<<K<<" Wrong Code Rate"<<std::endl;
+  				return -1;
   			}
   			if(R==NULL || Q==NULL)
   			{
@@ -291,6 +308,24 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
 
  int cl_ldpc::decode(const float* data,  int*  decoded_data, double* app_llr)
  {
+	 auto fail_decode = [&]() {
+		 last_early_term_iter=-1;
+		 if(decoded_data!=NULL && K>0 && K<=N && K<=N_MAX)
+			 memset(decoded_data, 0, sizeof(int) * (size_t)K);
+		 if(app_llr!=NULL && N>0 && N<=N_MAX)
+			 memset(app_llr, 0, sizeof(double) * (size_t)N);
+		 return nIteration_max_val + 1;
+	 };
+
+	 if(data==NULL || decoded_data==NULL || N<=0 || N>N_MAX
+		 || K<=0 || K>N || P<=0 || P!=N-K
+		 || Cwidth<2 || QCmatrixC==NULL)
+		 return fail_decode();
+	 if(decoding_algorithm_val==SPA
+		 && (Vwidth<=0 || dwidth<=0 || QCmatrixV==NULL
+			 || QCmatrixd==NULL || R==NULL || Q==NULL || V_pos==NULL))
+		 return fail_decode();
+
 	 int iterations_done=0;
  	if(decoding_algorithm_val==GBF)
  	{
@@ -322,5 +357,9 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
  		last_early_term_iter = -1;
  		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort,app_llr,et_mode,&last_early_term_iter);
  	}
+	else
+	{
+		return fail_decode();
+	}
  	return iterations_done;
  }
