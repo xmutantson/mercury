@@ -56,6 +56,7 @@
 #include "common/sim_clock.h"
 
 int run_b2f_bounded_output_test();
+int run_fft_scratch_tests();
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_main.h"
@@ -2211,6 +2212,7 @@ int main(int argc, char *argv[])
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
             failed += run_sim_clock_tests();
+            failed += run_fft_scratch_tests();
 			failed += run_mini0_carried_timing_test();
             failed += run_winlink_dict_tests();
             // AEAD bsi-bound nonce regression suite (data-flow-aead-nonce.md):

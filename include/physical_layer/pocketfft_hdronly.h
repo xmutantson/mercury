@@ -204,6 +204,17 @@ inline void aligned_dealloc(void *ptr)
 # endif
 #endif
 
+// Optional heap-allocation observer for allocation regression tests.
+// Production installs no observer, so the only added cost on the allocation
+// path is a single not-taken branch; heap allocations are rare once FFT plans
+// and the persistent execution scratch are warm. A unit test installs an
+// observer to assert the steady-state execute path performs no heap allocation.
+typedef void (*heap_event_fn)(size_t nbytes);
+inline heap_event_fn &heap_alloc_observer()
+  { static heap_event_fn fn = nullptr; return fn; }
+inline void note_heap_alloc(size_t nbytes)
+  { heap_event_fn fn = heap_alloc_observer(); if (fn) fn(nbytes); }
+
 template<typename T> class arr
   {
   private:
@@ -216,6 +227,7 @@ template<typename T> class arr
       if (num==0) return nullptr;
       void *res = malloc(num*sizeof(T));
       if (!res) throw std::bad_alloc();
+      note_heap_alloc(num*sizeof(T));
       return reinterpret_cast<T *>(res);
       }
     static void dealloc(T *ptr)
@@ -225,6 +237,7 @@ template<typename T> class arr
       {
       if (num==0) return nullptr;
       void *ptr = aligned_alloc(64, num*sizeof(T));
+      note_heap_alloc(num*sizeof(T));
       return static_cast<T*>(ptr);
       }
     static void dealloc(T *ptr)
