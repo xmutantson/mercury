@@ -3247,11 +3247,22 @@ void cl_ofdm::smooth_channel_estimate_dft()
 	if(window_taps < 3) window_taps = 3;
 	if(window_taps >= Nc / 2) return;  // Window too wide, smoothing won't help
 
+	// Grow-once per-decode-thread transform scratch (shared by both smoother
+	// paths). Each buffer is FULLY overwritten before use every call: the
+	// center band copy plus the two edge reflections cover all samples, and
+	// the IFFT writes the whole output, so persisting them across calls is
+	// value-identical to a fresh allocation and removes two heap allocations
+	// per decoded OFDM symbol on the RX hot path.
+	static thread_local std::vector<std::complex<double>> dft_buf_in;
+	static thread_local std::vector<std::complex<double>> dft_buf_out;
+
 	if(mode == 0)
 	{
 		// LEGACY leaky path (A/B baseline): rectangular IFFT over active band.
-		std::complex<double>* buf_in = new std::complex<double>[Nc];
-		std::complex<double>* buf_out = new std::complex<double>[Nc];
+		if((int)dft_buf_in.size()  < Nc) dft_buf_in.resize(Nc);
+		if((int)dft_buf_out.size() < Nc) dft_buf_out.resize(Nc);
+		std::complex<double>* buf_in = dft_buf_in.data();
+		std::complex<double>* buf_out = dft_buf_out.data();
 		for(int i = 0; i < Nsymb; i++)
 		{
 			for(int j = 0; j < Nc; j++)
@@ -3263,8 +3274,6 @@ void cl_ofdm::smooth_channel_estimate_dft()
 			for(int j = 0; j < Nc; j++)
 				(estimated_channel + i*Nc + j)->value = buf_in[j];
 		}
-		delete[] buf_in;
-		delete[] buf_out;
 		return;
 	}
 
@@ -3291,8 +3300,10 @@ void cl_ofdm::smooth_channel_estimate_dft()
 		return;
 	}
 
-	std::complex<double>* buf_in  = new std::complex<double>[Ne];
-	std::complex<double>* buf_out = new std::complex<double>[Ne];
+	if((int)dft_buf_in.size()  < Ne) dft_buf_in.resize(Ne);
+	if((int)dft_buf_out.size() < Ne) dft_buf_out.resize(Ne);
+	std::complex<double>* buf_in  = dft_buf_in.data();
+	std::complex<double>* buf_out = dft_buf_out.data();
 
 	for(int i = 0; i < Nsymb; i++)
 	{
@@ -3332,8 +3343,6 @@ void cl_ofdm::smooth_channel_estimate_dft()
 			(estimated_channel + i*Nc + j)->value = buf_in[Next + j];
 	}
 
-	delete[] buf_in;
-	delete[] buf_out;
 }
 
 void cl_ofdm::channel_equalizer(std::complex <double>* in, std::complex <double>* out)
