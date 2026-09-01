@@ -163,17 +163,17 @@ void cl_ldpc::copy_from(const cl_ldpc& s)
 	// Owned workspace: alloc to src size, memcpy content for byte-parity.
 	if(s.R != NULL && s.N > 0 && s.Vwidth > 0)
 	{
-		R = CNEW(double, s.N * s.Vwidth, "ldpc.R.copy");
+		R = CNEW(double, (size_t)s.N * (size_t)s.Vwidth, "ldpc.R.copy");
 		memcpy(R, s.R, sizeof(double) * (size_t)s.N * (size_t)s.Vwidth);
 	}
 	if(s.Q != NULL && s.N > 0 && s.Vwidth > 0)
 	{
-		Q = CNEW(double, s.N * s.Vwidth, "ldpc.Q.copy");
+		Q = CNEW(double, (size_t)s.N * (size_t)s.Vwidth, "ldpc.Q.copy");
 		memcpy(Q, s.Q, sizeof(double) * (size_t)s.N * (size_t)s.Vwidth);
 	}
 	if(s.V_pos != NULL && s.P > 0 && s.Cwidth > 0)
 	{
-		V_pos = CNEW(int, s.P * s.Cwidth, "ldpc.V_pos.copy");
+		V_pos = CNEW(int, (size_t)s.P * (size_t)s.Cwidth, "ldpc.V_pos.copy");
 		memcpy(V_pos, s.V_pos, sizeof(int) * (size_t)s.P * (size_t)s.Cwidth);
 	}
 
@@ -223,7 +223,7 @@ void cl_pilot_configurator::copy_from(const cl_pilot_configurator& s)
 
 	if(s.virtual_carrier != NULL && s.Nc_max > 0)
 	{
-		virtual_carrier = CNEW(struct st_carrier, s.Nc_max * s.Nc_max, "pilot.virtual_carrier.copy");
+		virtual_carrier = CNEW(struct st_carrier, (size_t)s.Nc_max * (size_t)s.Nc_max, "pilot.virtual_carrier.copy");
 		memcpy(virtual_carrier, s.virtual_carrier, sizeof(struct st_carrier) * (size_t)s.Nc_max * (size_t)s.Nc_max);
 	}
 	if(s.sequence != NULL && s.nPilots > 0)
@@ -261,7 +261,7 @@ void cl_preamble_configurator::copy_from(const cl_preamble_configurator& s)
 
 	if(s.sequence != NULL && s.Nsymb > 0 && s.Nc > 0)
 	{
-		sequence = CNEW(std::complex<double>, s.Nsymb * s.Nc, "preamble.sequence.copy");
+		sequence = CNEW(std::complex<double>, (size_t)s.Nsymb * (size_t)s.Nc, "preamble.sequence.copy");
 		memcpy(sequence, s.sequence, sizeof(std::complex<double>) * (size_t)s.Nsymb * (size_t)s.Nc);
 	}
 }
@@ -335,7 +335,7 @@ void cl_ofdm::copy_from(const cl_ofdm& s)
 	// ---- 2.2 owning pointers (deep-copy; guard src!=NULL && size>0) ----
 	if(s.ofdm_frame != NULL && s.Nsymb > 0 && s.Nc > 0)
 	{
-		ofdm_frame = CNEW(struct st_carrier, s.Nsymb * s.Nc, "ofdm.ofdm_frame.copy");
+		ofdm_frame = CNEW(struct st_carrier, (size_t)s.Nsymb * (size_t)s.Nc, "ofdm.ofdm_frame.copy");
 		memcpy(ofdm_frame, s.ofdm_frame, sizeof(struct st_carrier) * (size_t)s.Nsymb * (size_t)s.Nc);
 	}
 	// ofdm_preamble is sized by preamble_configurator.Nsymb * Nc (read from src).
@@ -343,18 +343,18 @@ void cl_ofdm::copy_from(const cl_ofdm& s)
 		int pre_nsymb = s.preamble_configurator.Nsymb;
 		if(s.ofdm_preamble != NULL && pre_nsymb > 0 && s.Nc > 0)
 		{
-			ofdm_preamble = CNEW(struct st_carrier, pre_nsymb * s.Nc, "ofdm.ofdm_preamble.copy");
+			ofdm_preamble = CNEW(struct st_carrier, (size_t)pre_nsymb * (size_t)s.Nc, "ofdm.ofdm_preamble.copy");
 			memcpy(ofdm_preamble, s.ofdm_preamble, sizeof(struct st_carrier) * (size_t)pre_nsymb * (size_t)s.Nc);
 		}
 	}
 	if(s.estimated_channel != NULL && s.Nsymb > 0 && s.Nc > 0)
 	{
-		estimated_channel = CNEW(struct st_channel_complex, s.Nsymb * s.Nc, "ofdm.estimated_channel.copy");
+		estimated_channel = CNEW(struct st_channel_complex, (size_t)s.Nsymb * (size_t)s.Nc, "ofdm.estimated_channel.copy");
 		memcpy(estimated_channel, s.estimated_channel, sizeof(struct st_channel_complex) * (size_t)s.Nsymb * (size_t)s.Nc);
 	}
 	if(s.estimated_channel_without_amplitude_restoration != NULL && s.Nsymb > 0 && s.Nc > 0)
 	{
-		estimated_channel_without_amplitude_restoration = CNEW(struct st_channel_complex, s.Nsymb * s.Nc, "ofdm.est_channel_noamp.copy");
+		estimated_channel_without_amplitude_restoration = CNEW(struct st_channel_complex, (size_t)s.Nsymb * (size_t)s.Nc, "ofdm.est_channel_noamp.copy");
 		memcpy(estimated_channel_without_amplitude_restoration, s.estimated_channel_without_amplitude_restoration,
 		       sizeof(struct st_channel_complex) * (size_t)s.Nsymb * (size_t)s.Nc);
 	}
@@ -541,6 +541,8 @@ const char* cl_ofdm::precook_deep_equal(const cl_ofdm& o) const
 	{
 		int pre_nsymb = preamble_configurator.Nsymb;
 		if((ofdm_preamble == NULL) != (o.ofdm_preamble == NULL)) return "ofdm.ofdm_preamble(null-mismatch)";
+		if(preamble_configurator.Nsymb != o.preamble_configurator.Nsymb)
+			return "preamble.Nsymb";
 		if(ofdm_preamble != NULL && pre_nsymb > 0 && Nc > 0)
 			if(memcmp(ofdm_preamble, o.ofdm_preamble, sizeof(struct st_carrier) * (size_t)pre_nsymb * (size_t)Nc) != 0)
 				return "ofdm.ofdm_preamble";
