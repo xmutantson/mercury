@@ -10969,6 +10969,10 @@ int cl_arq_controller::test_inband_deadbatch_progress()
 		if(v && *v) setenv(k, v, 1); else unsetenv(k);
 #endif
 	};
+	const int previous_sim_clock_enabled = sim_clock_enabled();
+	sim_clock_set_enabled(1);
+	check(sim_clock_enabled() != 0,
+		"CLOCK: deterministic virtual clock engaged", sim_clock_enabled(), 1);
 	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
 	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
 	bool had_prev = (prev_env != NULL);
@@ -11044,11 +11048,11 @@ int cl_arq_controller::test_inband_deadbatch_progress()
 		rx->inband_dead_tick_frames_snap = 0;
 		int limit = rx->inband_session_dead_limit();
 		int ticks = 0;
-		// `limit` REAL batch periods. The first period exercises the LIVE timer (spin past the 3000 ms
-		// floor) to prove the time path; the rest model the elapsed period (timer disarmed = the exact
-		// state the guard sees once the cl_timer crosses the floor). Zero progress every period -> each
-		// MUST tick -> the streak reaches the BREAK floor.
-		bool first_was_live_timer = false;
+		// `limit` REAL batch periods. The first period exercises the LIVE timer by advancing its injected
+		// virtual clock past the 3000 ms floor; the rest model the elapsed period (timer disarmed = the
+		// exact state the guard sees once the cl_timer crosses the floor). Zero progress every period ->
+		// each MUST tick -> the streak reaches the BREAK floor.
+		bool first_was_injected_timer = false;
 		for(int period = 0; period < limit; period++)
 		{
 			int c = rx->inband_deadbatch_classify();
@@ -11060,13 +11064,22 @@ int cl_arq_controller::test_inband_deadbatch_progress()
 				int c2 = rx->inband_deadbatch_classify();
 				check(c2 == cl_arq_controller::INBAND_DB_RATE_LIMITED,
 					"B: a sub-second re-fire within the SAME period is rate-limited (even on a true loss)", c2, cl_arq_controller::INBAND_DB_RATE_LIMITED);
-				cl_timer w; w.start(); while(w.get_elapsed_time_ms() < 3050) { /* age the live batch-period timer */ }
-				first_was_live_timer = true;
+				const uint64_t samples_before = sim_clock_now_samples();
+				const uint64_t elapsed_samples = 3050ULL * SIM_CLOCK_SAMPLE_RATE_HZ / 1000ULL;
+				sim_clock_add_samples(elapsed_samples);
+				const uint64_t samples_after = sim_clock_now_samples();
+				check(samples_after - samples_before == elapsed_samples,
+					"B: injected clock advances one batch period deterministically",
+					(long)(samples_after - samples_before), (long)elapsed_samples);
+				check(rx->inband_dead_tick_timer.get_elapsed_time_ms() == 3050,
+					"B: live batch-period timer reads the injected elapsed time",
+					rx->inband_dead_tick_timer.get_elapsed_time_ms(), 3050);
+				first_was_injected_timer = true;
 			}
 			else
 				rx->inband_dead_tick_timer_armed = false;   // model the next real batch period elapsed
 		}
-		check(first_was_live_timer, "B: the live cl_timer batch-period path was exercised", first_was_live_timer?1:0, 1);
+		check(first_was_injected_timer, "B: the live cl_timer batch-period path was exercised with injected time", first_was_injected_timer?1:0, 1);
 		check(ticks >= limit, "B: a REAL zero-progress total loss ticks once per real batch period -> reaches BREAK floor (recovery NOT regressed)", ticks, limit);
 		delete rx; delete ts;
 	}
@@ -11075,6 +11088,9 @@ int cl_arq_controller::test_inband_deadbatch_progress()
 	if(created_mutex && capture_prep_mutex != NULL) { CloseHandle(capture_prep_mutex); capture_prep_mutex = NULL; }
 #endif
 	set_env("MERCURY_INBAND_RATE", had_prev ? prev_saved.c_str() : "");
+	sim_clock_set_enabled(previous_sim_clock_enabled);
+	check(sim_clock_enabled() == previous_sim_clock_enabled,
+		"CLOCK: prior clock mode restored", sim_clock_enabled(), previous_sim_clock_enabled);
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

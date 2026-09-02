@@ -60,6 +60,14 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 
 int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_t *radio_capture_prep);
 
+// Test-only fault-injection seam for deterministic thread-start rollback tests.
+// Passing NULL for either callback restores the corresponding pthread default.
+typedef int (*audioio_pthread_create_fn)(pthread_t *, const pthread_attr_t *,
+										 void *(*)(void *), void *);
+typedef int (*audioio_pthread_join_fn)(pthread_t, void **);
+void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
+										 audioio_pthread_join_fn join_fn);
+
 int tx_transfer(double *buffer, size_t len);
 int rx_transfer(double *buffer, size_t len);
 int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len);
@@ -69,6 +77,7 @@ int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len);
 int capture_write_samples(double *buffer, size_t len);
 void capture_reset_samples(void);
 int capture_causal_tag_guard_selftest(cl_telecom_system *telecom_system);
+int capture_enqueue_backpressure_selftest(void);
 // Conservative time from queued passband samples to physical/simulated output
 // egress, including the opened playback backend's retained-device bound.
 uint64_t playback_causal_egress_bound_ns(size_t queued_samples);

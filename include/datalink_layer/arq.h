@@ -565,6 +565,10 @@ public:
   int test_l1_stage2_ownership();
   int test_gui_init_fail_closed();
   int test_audio_open_fail_closed();
+  int test_audio_thread_create_fail_closed();
+  int test_agw_server_start_fail_closed();
+  int test_capture_enqueue_backpressure();
+  int test_soundcard_restart_save_fail_closed();
 
 
   void set_nResends(int nResends);

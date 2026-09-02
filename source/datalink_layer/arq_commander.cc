@@ -36,6 +36,7 @@ extern "C" { extern std::atomic<bool> shutdown_; }
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_main.h"
 #include "gui/gui_state.h"
+#include "gui/dialogs/soundcard_dialog.h"
 #endif
 
 // MERCURY_TURN_TRACE (link-phase Step 1, MEASURE-ONLY): defined in arq_common.cc.
@@ -114,6 +115,94 @@ int cl_arq_controller::test_audio_open_fail_closed()
 	printf("[TEST-AUDIO-OPEN] invalid capture/playback IDs -> init=%d: %s\n",
 	       result, passed ? "PASS" : "FAIL");
 	return passed ? 0 : 1;
+}
+
+static std::atomic<int> audio_test_create_calls{0};
+static std::atomic<int> audio_test_join_calls{0};
+static std::atomic<int> audio_test_join_failures{0};
+
+static void *audio_test_worker(void *)
+{
+	while(!shutdown_)
+		std::this_thread::yield();
+	return NULL;
+}
+
+static int audio_test_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+									 void *(*)(void *), void *)
+{
+	const int call = ++audio_test_create_calls;
+	if(call == 2)
+		return EAGAIN;
+	return pthread_create(thread, attr, audio_test_worker, NULL);
+}
+
+static int audio_test_pthread_join(pthread_t thread, void **result)
+{
+	++audio_test_join_calls;
+	const int status = pthread_join(thread, result);
+	if(status != 0)
+		++audio_test_join_failures;
+	return status;
+}
+
+int cl_arq_controller::test_audio_thread_create_fail_closed()
+{
+	pthread_t capture_thread, playback_thread, prep_thread;
+	cl_telecom_system test_telecom;
+	const bool saved_shutdown = shutdown_.exchange(false);
+	audio_test_create_calls = 0;
+	audio_test_join_calls = 0;
+	audio_test_join_failures = 0;
+	audioio_set_thread_functions_for_test(audio_test_pthread_create,
+	                                      audio_test_pthread_join);
+	// The injected first worker never enters the backend routine, so this remains
+	// device-free while exercising the ordinary device-mode creation order.
+	const int result = audioio_init_internal(NULL, NULL, AUDIO_SUBSYSTEM_ALSA,
+	                                         &capture_thread, &playback_thread,
+	                                         &prep_thread, &test_telecom);
+	audioio_set_thread_functions_for_test(NULL, NULL);
+	shutdown_ = true;
+	audioio_deinit(&capture_thread, &playback_thread, &prep_thread);
+	shutdown_ = saved_shutdown;
+
+	const int creates = audio_test_create_calls.load();
+	const int joins = audio_test_join_calls.load();
+	const int join_failures = audio_test_join_failures.load();
+	const bool passed = result != 0 && creates == 2 && joins == 1
+	                 && join_failures == 0;
+	printf("[TEST-AUDIO-THREAD-CREATE] fail call=2 -> init=%d creates=%d "
+	       "joins=%d join_failures=%d: %s\n",
+	       result, creates, joins, join_failures, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+}
+
+int cl_arq_controller::test_capture_enqueue_backpressure()
+{
+	const bool saved_shutdown = shutdown_.exchange(false);
+	const int failed = capture_enqueue_backpressure_selftest();
+	shutdown_ = saved_shutdown;
+	printf("[TEST-CAPTURE-BACKPRESSURE] full FIFO drains and preserves samples: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
+int cl_arq_controller::test_soundcard_restart_save_fail_closed()
+{
+#ifndef MERCURY_GUI_ENABLED
+	printf("[TEST-SOUNDCARD-RESTART] SKIP (GUI support not compiled)\n");
+	return 0;
+#else
+	const bool saved_shutdown = g_gui_state.request_shutdown.exchange(false);
+	const bool restarted = restartMercury(std::string());
+	const bool shutdown_requested = g_gui_state.request_shutdown.load();
+	g_gui_state.request_shutdown.store(saved_shutdown);
+
+	const bool passed = !restarted && !shutdown_requested;
+	printf("[TEST-SOUNDCARD-RESTART] failed config save -> restarted=%d shutdown=%d: %s\n",
+	       restarted, shutdown_requested, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+#endif
 }
 
 // STAGE R (block-ACK pipelining, MERCURY_L1_BLOCKACK_PIPELINE): within a negotiated

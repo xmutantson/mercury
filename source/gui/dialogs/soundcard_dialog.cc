@@ -20,6 +20,7 @@
 #include <mach-o/dyld.h>
 #endif
 #endif
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -44,10 +45,13 @@ SoundCardDialog& get_soundcard_dialog() {
 }
 
 // Helper to restart Mercury
-static void restartMercury() {
+bool restartMercury(const std::string& config_path) {
     // Save settings before restart
-    std::string config_path = getDefaultConfigPath();
-    g_settings.save(config_path);
+    if (!g_settings.save(config_path)) {
+        fprintf(stderr, "ERROR: Failed to save settings to %s; restart aborted.\n",
+                config_path.c_str());
+        return false;
+    }
 
 #ifdef _WIN32
     // Get the path to the current executable
@@ -61,6 +65,7 @@ static void restartMercury() {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         g_gui_state.request_shutdown.store(true);
+        return true;
     }
 #elif defined(__APPLE__)
     // macOS: use _NSGetExecutablePath
@@ -74,6 +79,7 @@ static void restartMercury() {
             _exit(1);
         } else if (pid > 0) {
             g_gui_state.request_shutdown.store(true);
+            return true;
         }
     }
 #else
@@ -89,9 +95,12 @@ static void restartMercury() {
             _exit(1);
         } else if (pid > 0) {
             g_gui_state.request_shutdown.store(true);
+            return true;
         }
     }
 #endif
+
+    return false;
 }
 
 SoundCardDialog::SoundCardDialog()
@@ -509,7 +518,7 @@ bool SoundCardDialog::render() {
             is_open_ = false;
 
             // Restart Mercury to apply audio device changes
-            restartMercury();
+            restartMercury(getDefaultConfigPath());
         }
 
         ImGui::SameLine();

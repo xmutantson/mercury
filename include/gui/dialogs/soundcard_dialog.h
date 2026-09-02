@@ -82,4 +82,8 @@ private:
 SoundCardDialog& get_soundcard_dialog();
 #define g_soundcard_dialog (get_soundcard_dialog())
 
+// Save settings and restart Mercury. Returns false without restarting when the
+// settings cannot be saved.
+bool restartMercury(const std::string& config_path);
+
 #endif // SOUNDCARD_DIALOG_H_

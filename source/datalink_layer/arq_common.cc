@@ -3164,8 +3164,7 @@ int cl_arq_controller::init(int tcp_base_port, int gear_shift_on, int initial_mo
 
 	if(tcp_socket_data.init()!=SUCCESS || tcp_socket_control.init()!=SUCCESS )
 	{
-		printf("Error initializing the TCP sockets. Exiting..\n");
-		exit(-1);
+		return ERROR_;
 	}
 
 	load_configuration(ack_configuration,FULL,NO);

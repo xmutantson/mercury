@@ -2295,6 +2295,40 @@ int cl_arq_controller::test_modulation_cli_validation()
     return fails;
 }
 
+static int validate_modem_server_startup(int result, FILE* diagnostic)
+{
+    if (result == SUCCESSFUL)
+        return EXIT_SUCCESS;
+
+    fprintf(diagnostic, "ERROR: AGW/TCP server startup failed; modem startup aborted\n");
+    return EXIT_FAILURE;
+}
+
+int cl_arq_controller::test_agw_server_start_fail_closed()
+{
+    FILE* diagnostic = tmpfile();
+    if (diagnostic == NULL)
+    {
+        printf("[TEST-AGW-START] FAIL: could not create diagnostic capture\n");
+        return 1;
+    }
+    const int accepted = validate_modem_server_startup(SUCCESSFUL, diagnostic);
+    const int rejected = validate_modem_server_startup(ERROR_, diagnostic);
+    fflush(diagnostic);
+    rewind(diagnostic);
+    char message[160] = {0};
+    const size_t message_length = fread(message, 1, sizeof(message) - 1, diagnostic);
+    fclose(diagnostic);
+
+    const bool passed = accepted == EXIT_SUCCESS
+        && rejected == EXIT_FAILURE
+        && message_length > 0
+        && strstr(message, "server startup failed") != NULL;
+    printf("[TEST-AGW-START] success=%d bind-failure=%d diagnostic=%d: %s\n",
+           accepted, rejected, message_length > 0, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 int cl_arq_controller::test_encryption_cli_validation()
 {
     int fails = 0;
@@ -2364,6 +2398,10 @@ int main(int argc, char *argv[])
             arm_test_watchdog();
             return run_b2f_bounded_output_test();
         }
+        if (strcmp(argv[i], "--test-audio-thread-create") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_audio_thread_create_fail_closed();
+        }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             // Pin the process-global C RNG to a fixed, platform-independent
@@ -2421,12 +2459,23 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_gui;
                 failed += test_gui.test_gui_init_fail_closed();
+                failed += test_gui.test_soundcard_restart_save_fail_closed();
             }
             // Device workers open asynchronously; startup must still fail closed
-            // when either real backend rejects its configured device ID.
+            // when either real backend rejects its configured device ID. Capture
+            // backpressure must preserve a full-FIFO period and remain shutdown-safe.
             {
                 cl_arq_controller test_audio;
                 failed += test_audio.test_audio_open_fail_closed();
+                failed += test_audio.test_audio_thread_create_fail_closed();
+                failed += test_audio.test_capture_enqueue_backpressure();
+            }
+            // A second modem process must not share the configured AGW/TCP
+            // listener, and a bind failure must reject startup rather than
+            // leave the modem running without its application interface.
+            {
+                cl_arq_controller test_agw;
+                failed += test_agw.test_agw_server_start_fail_closed();
             }
             // ML-KEM-768 hybrid KEX regression suite (MLKEM_HYBRID_PLAN.md,
             // data-flow-hybrid-kex.md): combiner symmetry, ML-KEM-first IKM
@@ -8786,7 +8835,15 @@ start_modem:
         // Byte-identical for every non-cfg103 config. Mirrors the cfg105 anchor staging.
         if (is_robust3_config(mod_config) && explicit_config)
             gear_shift_mode = NO_GEAR_SHIFT;
-        ARQ.init(base_tcp_port, (gear_shift_mode == NO_GEAR_SHIFT)? NO : YES, mod_config);
+        const int server_start_result = ARQ.init(
+            base_tcp_port, (gear_shift_mode == NO_GEAR_SHIFT)? NO : YES, mod_config);
+        if (validate_modem_server_startup(server_start_result, stderr) != EXIT_SUCCESS)
+        {
+            if (input_dev) free(input_dev);
+            if (output_dev) free(output_dev);
+            shutdown_tee_logging();
+            return EXIT_FAILURE;
+        }
 
         // Monitor mode: auto-start in LISTENING state (no TCP LISTEN ON needed)
         if (is_monitor_mode) {

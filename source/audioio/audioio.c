@@ -182,6 +182,38 @@ static int playback_startup_status = AUDIO_START_PENDING;
 static bool capture_thread_started = false;
 static bool playback_thread_started = false;
 static bool capture_prep_thread_started = false;
+static audioio_pthread_create_fn audioio_pthread_create = pthread_create;
+static audioio_pthread_join_fn audioio_pthread_join = pthread_join;
+
+void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
+										 audioio_pthread_join_fn join_fn)
+{
+	audioio_pthread_create = create_fn != NULL ? create_fn : pthread_create;
+	audioio_pthread_join = join_fn != NULL ? join_fn : pthread_join;
+}
+
+static int audioio_start_thread(pthread_t *thread, void *(*entry)(void *),
+								void *arg, bool *started)
+{
+	const int result = audioio_pthread_create(thread, NULL, entry, arg);
+	*started = result == 0;
+	return result;
+}
+
+static void audioio_join_started_threads(pthread_t *radio_capture,
+										 pthread_t *radio_playback,
+										 pthread_t *radio_capture_prep)
+{
+	if(capture_prep_thread_started)
+		audioio_pthread_join(*radio_capture_prep, NULL);
+	if(capture_thread_started)
+		audioio_pthread_join(*radio_capture, NULL);
+	if(playback_thread_started)
+		audioio_pthread_join(*radio_playback, NULL);
+	capture_prep_thread_started = false;
+	capture_thread_started = false;
+	playback_thread_started = false;
+}
 
 static void publish_audio_startup(bool capture, int status)
 {
@@ -1319,6 +1351,140 @@ int capture_write_samples(double *buffer, size_t len)
 	return result;
 }
 
+typedef void (*capture_enqueue_wait_fn)(void *context);
+
+static void capture_enqueue_wait(void *context)
+{
+	(void)context;
+	sim_paced_wait(1);
+}
+
+// Preserve each period returned by the capture backend when the core is
+// temporarily behind.  write_buffer() cannot be used as the wait primitive:
+// it blocks inside the ring and cannot observe shutdown_, which can deadlock
+// audioio_deinit().
+static int capture_enqueue_samples_with_wait(double *buffer, size_t len,
+		capture_enqueue_wait_fn wait_fn, void *wait_context)
+{
+	if(len == 0) return 0;
+	if(buffer == NULL || capture_buffer == NULL || wait_fn == NULL
+	   || len > SIZE_MAX / sizeof(double))
+		return -1;
+
+	const size_t sample_bytes = len * sizeof(double);
+	if(sample_bytes > circular_buf_capacity(capture_buffer))
+		return -1;
+
+	while(!shutdown_)
+	{
+		if(circular_buf_free_size(capture_buffer) < sample_bytes)
+		{
+			wait_fn(wait_context);
+			continue;
+		}
+
+		if(capture_write_samples(buffer, len) == 0)
+			return 0;
+
+		// The sample FIFO had room, so a failure here means the paired
+		// causal-tag FIFO is inconsistent.  Waiting cannot repair that
+		// invariant; fail closed instead of spinning or dropping the chunk.
+		if(circular_buf_free_size(capture_buffer) >= sample_bytes)
+			return -1;
+		wait_fn(wait_context);
+	}
+	return -1;
+}
+
+static int capture_enqueue_samples(double *buffer, size_t len)
+{
+	return capture_enqueue_samples_with_wait(
+		buffer, len, capture_enqueue_wait, NULL);
+}
+
+struct capture_backpressure_test_context
+{
+	double drained[2];
+	int waits;
+	int failed;
+};
+
+static void capture_backpressure_test_drain(void *opaque)
+{
+	capture_backpressure_test_context *context =
+		(capture_backpressure_test_context *)opaque;
+	context->waits++;
+	if(context->waits != 1
+	   || read_buffer(capture_buffer, (uint8_t *)context->drained,
+		   sizeof(context->drained)) != 0)
+	{
+		context->failed = 1;
+		shutdown_ = true;
+	}
+}
+
+static void capture_backpressure_test_stop(void *opaque)
+{
+	int *waits = (int *)opaque;
+	(*waits)++;
+	shutdown_ = true;
+}
+
+int capture_enqueue_backpressure_selftest(void)
+{
+	if(capture_buffer != NULL || capture_causal_tag_buffer != NULL
+	   || capture_telecom_system != NULL || shutdown_)
+		return 1;
+
+	double *storage = (double *)malloc(4 * sizeof(double));
+	if(storage == NULL) return 1;
+	capture_buffer = circular_buf_init(
+		(uint8_t *)storage, 4 * sizeof(double));
+
+	double initial[] = {1.0, 2.0, 3.0, 4.0};
+	double incoming[] = {5.0, 6.0};
+	double remaining[4] = {};
+	capture_backpressure_test_context context = {};
+	int failed = 0;
+
+	if(write_buffer(capture_buffer, (uint8_t *)initial,
+		   sizeof(initial)) != 0
+	   || capture_enqueue_samples_with_wait(incoming, 2,
+		   capture_backpressure_test_drain, &context) != 0
+	   || context.failed || context.waits != 1
+	   || read_buffer(capture_buffer, (uint8_t *)remaining,
+		   sizeof(remaining)) != 0)
+		failed = 1;
+
+	const double expected[] = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+	double observed[6] = {
+		context.drained[0], context.drained[1], remaining[0],
+		remaining[1], remaining[2], remaining[3]};
+	if(memcmp(observed, expected, sizeof(expected)) != 0)
+		failed = 1;
+
+	// A full FIFO must also remain shutdown-observable: the ring's blocking
+	// writer cannot provide this guarantee itself.
+	int shutdown_waits = 0;
+	if(write_buffer(capture_buffer, (uint8_t *)initial,
+		   sizeof(initial)) != 0
+	   || capture_enqueue_samples_with_wait(incoming, 2,
+		   capture_backpressure_test_stop, &shutdown_waits) == 0
+	   || shutdown_waits != 1
+	   || size_buffer(capture_buffer) != sizeof(initial))
+		failed = 1;
+	shutdown_ = false;
+	if(read_buffer(capture_buffer, (uint8_t *)remaining,
+		   sizeof(remaining)) != 0
+	   || memcmp(remaining, initial, sizeof(initial)) != 0)
+		failed = 1;
+
+	circular_buf_free(capture_buffer);
+	capture_buffer = NULL;
+	free(storage);
+	return failed;
+}
+
 void capture_reset_samples(void)
 {
 	if(capture_buffer == NULL) return;
@@ -1717,11 +1883,20 @@ void *radio_capture_thread(void *device_ptr)
 		fwrite(buffer_internal, 1, frames_to_write * sizeof(double), tap);
 #endif
 
-		// Write (possibly gained) samples to capture_buffer for Mercury's core
-		if (circular_buf_free_size(capture_buffer) >= frames_to_write * sizeof(double))
-			capture_write_samples(buffer_internal, (size_t)frames_to_write);
-		else
-			printf("Buffer full in capture buffer!\n");
+		// Write (possibly gained) samples to capture_buffer for Mercury's core.
+		// Backpressure preserves this backend period; an impossible queue state
+		// fails the audio worker closed instead of silently losing samples.
+		if(capture_enqueue_samples(
+				buffer_internal, (size_t)frames_to_write) != 0)
+		{
+			if(!shutdown_)
+			{
+				fprintf(stderr,
+					"ERROR: failed to enqueue captured audio samples\n");
+				shutdown_ = true;
+			}
+			break;
+		}
 	}
 
 	r = audio->stop(b);
@@ -2517,14 +2692,23 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
         printf("[SIM] software channel backend active (no audio device) %s\n",
                SIM_AUDIO_GUARD_MARKER);
         fflush(stdout);
-        playback_thread_started = pthread_create(radio_playback, NULL, sim_tx_bridge_thread, NULL) == 0;
-        capture_thread_started = pthread_create(radio_capture, NULL, sim_rx_bridge_thread, NULL) == 0;
-        capture_prep_thread_started = pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread,
-                                                     (void *) telecom_system) == 0;
-        if(!playback_thread_started || !capture_thread_started || !capture_prep_thread_started)
+        int thread_result = audioio_start_thread(radio_playback,
+                                                 sim_tx_bridge_thread, NULL,
+                                                 &playback_thread_started);
+        if(thread_result == 0)
+            thread_result = audioio_start_thread(radio_capture,
+                                                 sim_rx_bridge_thread, NULL,
+                                                 &capture_thread_started);
+        if(thread_result == 0)
+            thread_result = audioio_start_thread(radio_capture_prep,
+                                                 radio_capture_prep_thread,
+                                                 (void *) telecom_system,
+                                                 &capture_prep_thread_started);
+        if(thread_result != 0)
         {
-            fprintf(stderr, "ERROR: could not start all audio threads\n");
+            fprintf(stderr, "ERROR: could not start all audio threads (%d)\n", thread_result);
             shutdown_ = true;
+            audioio_join_started_threads(radio_capture, radio_playback, radio_capture_prep);
             return -1;
         }
         return 0;
@@ -2536,20 +2720,23 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
         playback_startup_status = AUDIO_START_PENDING;
     }
 
-    capture_thread_started = pthread_create(radio_capture, NULL, radio_capture_thread,
-                                            (void *) capture_dev) == 0;
-	playback_thread_started = pthread_create(radio_playback, NULL, radio_playback_thread,
-                                           (void *) playback_dev) == 0;
-	capture_prep_thread_started = pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread,
-                                               (void *) telecom_system) == 0;
-	if(!capture_thread_started)
-		publish_audio_startup(true, AUDIO_START_FAILED);
-	if(!playback_thread_started)
-		publish_audio_startup(false, AUDIO_START_FAILED);
-	if(!capture_prep_thread_started)
+    int thread_result = audioio_start_thread(radio_capture, radio_capture_thread,
+                                             (void *) capture_dev,
+                                             &capture_thread_started);
+	if(thread_result == 0)
+		thread_result = audioio_start_thread(radio_playback, radio_playback_thread,
+		                                     (void *) playback_dev,
+		                                     &playback_thread_started);
+	if(thread_result == 0)
+		thread_result = audioio_start_thread(radio_capture_prep,
+		                                     radio_capture_prep_thread,
+		                                     (void *) telecom_system,
+		                                     &capture_prep_thread_started);
+	if(thread_result != 0)
 	{
-		fprintf(stderr, "ERROR: could not start audio preparation thread\n");
+		fprintf(stderr, "ERROR: could not start all audio threads (%d)\n", thread_result);
 		shutdown_ = true;
+		audioio_join_started_threads(radio_capture, radio_playback, radio_capture_prep);
 		return -1;
 	}
 
@@ -2564,7 +2751,10 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 	                && playback_startup_status == AUDIO_START_READY;
 	lock.unlock();
 	if(!ready)
+	{
 		shutdown_ = true;
+		audioio_join_started_threads(radio_capture, radio_playback, radio_capture_prep);
+	}
 	return ready ? 0 : -1;
 }
 
@@ -2576,21 +2766,7 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 		return 0;
 	}
 
-	if(capture_prep_thread_started)
-	{
-		pthread_join(*radio_capture_prep, NULL);
-	}
-	if(capture_thread_started)
-	{
-		pthread_join(*radio_capture, NULL);
-	}
-	if(playback_thread_started)
-	{
-		pthread_join(*radio_playback, NULL);
-	}
-	capture_prep_thread_started = false;
-	capture_thread_started = false;
-	playback_thread_started = false;
+	audioio_join_started_threads(radio_capture, radio_playback, radio_capture_prep);
 
 #if ENABLE_FLOAT64_TAP_BEFORE == 1
 	fclose(tap_play);

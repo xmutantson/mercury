@@ -130,7 +130,17 @@ int cl_tcp_socket::init()
 				status=TCP_STATUS_SOCKET_CREATED;
 			}
 			int enable = 1;  // Must be int, not char, for Windows setsockopt
-			int sso_result = setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&enable, sizeof(int));
+#if defined(_WIN32)
+			// A modem server has a single owner. SO_REUSEADDR on Windows permits a
+			// second listener to take the same port, so request exclusive ownership.
+			int sso_result = setsockopt(socket_fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+			                              (const char*)&enable, sizeof(int));
+#else
+			// SO_REUSEADDR permits a prompt restart after close, but (unlike
+			// SO_REUSEPORT) does not load-balance one modem port across processes.
+			int sso_result = setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR,
+			                              (const char*)&enable, sizeof(int));
+#endif
 			if (sso_result != 0)
 			{
 				status=TCP_STATUS_REUSEADDR_ERROR;
@@ -138,15 +148,6 @@ int cl_tcp_socket::init()
 				discard_socket();
 				return return_val;
 			}
-#if !defined(_WIN32)
-			if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(int)) != 0)
-			{
-				status=TCP_STATUS_REUSEPORT_ERROR;
-				return_val=ERROR_;
-				discard_socket();
-				return return_val;
-			}
-#endif
 			int bind_result = bind(socket_fd, (struct sockaddr*)&server, sizeof(server));
 			if (bind_result != 0)
 			{
@@ -409,4 +410,3 @@ void cl_tcp_socket::print_packet_status()
 
 	}
 }
-
