@@ -53,7 +53,8 @@
 //
 // These are the two spin-loop shapes that recur across the send path:
 //   ptt_busy_wait(t, delay_ms) — block until virtual/wall time crosses delay_ms
-//   drain_playback_wait()      — block until the playback ring is fully drained
+//   drain_playback_wait()      — block until the playback ring is fully drained;
+//                                false means the wait was aborted before empty
 //
 // Declared here (rather than re-forward-declared per .cc) so EVERY ARQ
 // translation unit routes through the SAME definition — in particular the
@@ -64,7 +65,7 @@
 // step-pump hook inside these helpers is null unless -m SIM_INPROC installs
 // it); a pending process shutdown is the only additional early return.
 void ptt_busy_wait(cl_timer& t, int delay_ms);
-void drain_playback_wait();
+bool drain_playback_wait();
 
 // ---------------------------------------------------------------------------
 // SIM_INPROC settle-wait helpers (single-process-sim-refactor.md §5.7 / §7).
@@ -1177,6 +1178,7 @@ public:
 
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
+  int test_send_hail_drain_failure(); // drain failure must free buffers and unkey PTT
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
   void process_messages_rx_acks_control();
   void process_messages_rx_acks_data();

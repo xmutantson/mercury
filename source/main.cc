@@ -2380,6 +2380,10 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_ssid_bounds();
                 failed += test_arq.test_modulation_cli_validation();
             }
+            {
+                cl_arq_controller test_hail;
+                failed += test_hail.test_send_hail_drain_failure();
+            }
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
             failed += run_sim_clock_tests();

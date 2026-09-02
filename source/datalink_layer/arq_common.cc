@@ -616,7 +616,7 @@ void ptt_busy_wait(cl_timer& t, int delay_ms)
 	}
 }
 
-void drain_playback_wait()
+bool drain_playback_wait()
 {
 	// STEPPER-CORE REWRITE Phase b (sim2-stepper-rewrite): under the OUTER-loop stepper, on the
 	// OFDM DATA path drain_playback_wait EGRESSES the big-block out of the TX play ring into the
@@ -638,12 +638,12 @@ void drain_playback_wait()
 			while (size_buffer(playback_buffer) > 0)
 			{
 				if (arq_shutdown_requested())
-					return;
+					return false;
 				g_sim_inproc_drain_only_pump(g_sim_inproc_pump_ctx);
 				if (arq_shutdown_requested())
-					return;
+					return false;
 			}
-		return;
+		return size_buffer(playback_buffer) == 0;
 	}
 	const bool sim_clock_on = sim_clock_enabled();
 	// EXIT CONDITION UNCHANGED on production + the two-process paced sim: the
@@ -688,9 +688,9 @@ void drain_playback_wait()
 		// the responder holds the full payload there is nothing left to drain that the
 		// outer loop needs, so unwind back to it (it breaks on the delivery predicate).
 		if (g_sim_inproc_pump != nullptr && g_sim_inproc_deliver_done)
-			return;
+			return false;
 		if (!sim_spin_or_pump(sim_clock_on))
-			return;
+			return false;
 		if (inproc)
 		{
 			size_t occ = size_buffer(playback_buffer);
@@ -704,10 +704,11 @@ void drain_playback_wait()
 				       "can terminate (harness-only; production DAC always drains)\n",
 				       no_progress, occ);
 				fflush(stdout);
-				break;
+				return false;
 			}
 		}
 	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -17083,6 +17084,14 @@ bool cl_arq_controller::receive_mfsk_test_conn_phy(uint8_t* out_snr_q,
 	return true;
 }
 
+// Test seams for the HAIL drain-failure regression. Production keeps the real
+// wait and delete[] implementations; --test temporarily substitutes observers.
+typedef bool (*hail_drain_wait_fn)();
+typedef void (*hail_buffer_delete_fn)(double*);
+static void delete_hail_buffer(double* buffer) { delete[] buffer; }
+static hail_drain_wait_fn g_hail_drain_wait = drain_playback_wait;
+static hail_buffer_delete_fn g_hail_buffer_delete = delete_hail_buffer;
+
 // TX "I am Mercury" HAIL beacon — prefix + optional CRC suffix for directed hailing.
 void cl_arq_controller::send_hail_pattern()
 {
@@ -17150,11 +17159,21 @@ void cl_arq_controller::send_hail_pattern()
 
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
-	drain_playback_wait();
+	if(!g_hail_drain_wait())
+	{
+		// The playback wait can abort on shutdown or a harness no-progress
+		// condition. Fail closed: never leave the radio keyed, and release the
+		// three frame buffers before abandoning this void send operation.
+		ptt_off();
+		g_hail_buffer_delete(raw_output);
+		g_hail_buffer_delete(filtered1);
+		g_hail_buffer_delete(filtered2);
+		return;
+	}
 
-	delete[] raw_output;
-	delete[] filtered1;
-	delete[] filtered2;
+	g_hail_buffer_delete(raw_output);
+	g_hail_buffer_delete(filtered1);
+	g_hail_buffer_delete(filtered2);
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
@@ -17184,6 +17203,109 @@ void cl_arq_controller::send_hail_pattern()
 	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
+}
+
+static int g_hail_test_freed_buffers = 0;
+static int g_hail_test_ptt_off_calls = 0;
+
+static bool hail_test_drain_not_ready()
+{
+	return false;
+}
+
+static void hail_test_delete_buffer(double* buffer)
+{
+	if(buffer != NULL)
+		g_hail_test_freed_buffers++;
+	delete[] buffer;
+}
+
+static int hail_test_transmit_hook(const char* buffer, int length)
+{
+	static const char ptt_off_command[] = "PTT OFF\r";
+	if(length == (int)sizeof(ptt_off_command) - 1
+	   && memcmp(buffer, ptt_off_command, sizeof(ptt_off_command) - 1) == 0)
+		g_hail_test_ptt_off_calls++;
+	return length;
+}
+
+// Fail-before/pass-after regression for the drain failure exit in
+// send_hail_pattern(). Before the fix the void drain API could not report the
+// abort, so the send path could not reliably unkey and release its three frame
+// buffers. The injected NotReady-equivalent result now takes the fail-closed
+// exit and the existing TCP transmit seam observes the real ptt_off() command.
+int cl_arq_controller::test_send_hail_drain_failure()
+{
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-HAIL-DRAIN] %s: %s\n", condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.load_configuration(CONFIG_0);
+
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_ptt_on_delay_ms = ptt_on_delay_ms;
+	int saved_ptt_off_delay_ms = ptt_off_delay_ms;
+	int saved_pilot_tone_ms = pilot_tone_ms;
+	int saved_pilot_tone_hz = pilot_tone_hz;
+	hail_drain_wait_fn saved_drain_wait = g_hail_drain_wait;
+	hail_buffer_delete_fn saved_buffer_delete = g_hail_buffer_delete;
+	int (*saved_transmit_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-HAIL-DRAIN] FAIL: could not allocate playback ring\n");
+		return 1;
+	}
+
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	ptt_on_delay_ms = 0;
+	ptt_off_delay_ms = 0;
+	pilot_tone_ms = 0;
+	pilot_tone_hz = 0;
+	g_hail_test_freed_buffers = 0;
+	g_hail_test_ptt_off_calls = 0;
+	g_hail_drain_wait = hail_test_drain_not_ready;
+	g_hail_buffer_delete = hail_test_delete_buffer;
+	cl_tcp_socket::g_test_transmit_hook = hail_test_transmit_hook;
+
+	send_hail_pattern();
+
+	check(size_buffer(test_playback) > 0,
+		"mock drain failure was reached after HAIL audio was queued");
+	check(g_hail_test_ptt_off_calls == 1,
+		"drain failure calls ptt_off exactly once");
+	check(g_hail_test_freed_buffers == 3,
+		"drain failure frees raw_output, filtered1, and filtered2");
+
+	cl_tcp_socket::g_test_transmit_hook = saved_transmit_hook;
+	g_hail_buffer_delete = saved_buffer_delete;
+	g_hail_drain_wait = saved_drain_wait;
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	ptt_on_delay_ms = saved_ptt_on_delay_ms;
+	ptt_off_delay_ms = saved_ptt_off_delay_ms;
+	pilot_tone_ms = saved_pilot_tone_ms;
+	pilot_tone_hz = saved_pilot_tone_hz;
+	playback_buffer = saved_playback;
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-HAIL-DRAIN] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
 }
 
 // RX: Detect HAIL beacon in capture buffer tail (same mechanism as receive_ack_pattern).
