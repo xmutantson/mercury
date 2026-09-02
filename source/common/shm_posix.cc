@@ -137,6 +137,14 @@ void *shm_map(int fd, size_t size)
     }
 
     void *data = (void *) MapViewOfFile(fmap, FILE_MAP_WRITE, 0, 0, size);
+    // The view keeps the mapping object alive, so this handle is no longer
+    // needed once MapViewOfFile has returned.
+    if (!CloseHandle(fmap))
+    {
+        if (data != NULL)
+            UnmapViewOfFile(data);
+        return NULL;
+    }
 
     return data;
 #else
@@ -147,19 +155,9 @@ void *shm_map(int fd, size_t size)
 // returns 0 on success, -1 on error
 int shm_unmap(void *addr, size_t size)
 {
-#if defined(WIN32)
-
-#if 0  // TODO: we need to have access to these variables...
-    if (fmap != NULL)
-    {
-        if (mptr != NULL)
-        {
-            UnmapViewOfFile(mptr);
-        }
-        CloseHandle(fmap);
-    }
-#endif
-    return 0;
+#if defined(_WIN32)
+    (void) size;
+    return UnmapViewOfFile(addr) ? 0 : -1;
 #else
      return munmap(addr, size);
 #endif

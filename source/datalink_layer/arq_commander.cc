@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include "common/shm_posix.h"
 #include "common/timing_log.h"
 #include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
 #include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
@@ -42,6 +43,50 @@ extern "C" { extern std::atomic<bool> shutdown_; }
 // MERCURY_TURN_TRACE (link-phase Step 1, MEASURE-ONLY): defined in arq_common.cc.
 // Emits one read-only trace line per CMD reverse-ACK turn; no-op when off.
 bool arq_turn_trace_on();
+
+int cl_arq_controller::test_shm_unmap_fail_closed()
+{
+#if !defined(_WIN32)
+	printf("[TEST-SHM-UNMAP] SKIP (Windows-only regression)\n");
+	return 0;
+#else
+	const size_t size = 4096;
+	HANDLE mapping = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+	                                   0, static_cast<DWORD>(size), NULL);
+	if(mapping == NULL)
+	{
+		printf("[TEST-SHM-UNMAP] FAIL: CreateFileMapping failed (%lu)\n",
+		       static_cast<unsigned long>(GetLastError()));
+		return 1;
+	}
+
+	void *view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, size);
+	const DWORD map_error = view == NULL ? GetLastError() : ERROR_SUCCESS;
+	if(!CloseHandle(mapping))
+	{
+		const DWORD close_error = GetLastError();
+		if(view != NULL)
+			UnmapViewOfFile(view);
+		printf("[TEST-SHM-UNMAP] FAIL: CloseHandle failed (%lu)\n",
+		       static_cast<unsigned long>(close_error));
+		return 1;
+	}
+	if(view == NULL)
+	{
+		printf("[TEST-SHM-UNMAP] FAIL: MapViewOfFile failed (%lu)\n",
+		       static_cast<unsigned long>(map_error));
+		return 1;
+	}
+
+	static_cast<volatile unsigned char *>(view)[0] = 0x5a;
+	const int result = shm_unmap(view, size);
+	const BOOL remained_mapped = UnmapViewOfFile(view);
+	const bool passed = result == 0 && remained_mapped == FALSE;
+	printf("[TEST-SHM-UNMAP] unmap=%d view_released=%d: %s\n",
+	       result, remained_mapped == FALSE, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+#endif
+}
 
 #ifdef MERCURY_GUI_ENABLED
 static int test_gui_init_failure()

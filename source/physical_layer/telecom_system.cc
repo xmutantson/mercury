@@ -8146,11 +8146,25 @@ void cl_telecom_system::sfo_block_test()
 
 		// Emit one frame into passband_data; transmit_byte populates it and sets
 		// tx_last_emitted_frame_samples to the ACTUAL emitted length (preamble+data).
-		tx_last_emitted_frame_samples = full_frame;
+		// Clear the status first so an early-returning TX cannot inherit a plausible
+		// length from this harness and silently continue with stale waveform data.
+		tx_last_emitted_frame_samples = 0;
 		this->transmit_byte(data_container.data_byte, payload_bytes,
 		                    data_container.passband_data, SINGLE_MESSAGE);
+		// Test-only fault seam for the --test death test. Unset by default and scoped
+		// to this already opt-in SFO harness; it models a failed/overrunning producer.
+		const char* forced_emitted = std::getenv("MERCURY_TEST_SFO_BLOCK_EMITTED_SAMPLES");
+		if(forced_emitted && *forced_emitted)
+			tx_last_emitted_frame_samples = atoi(forced_emitted);
 		int emitted = tx_last_emitted_frame_samples;
-		if(emitted <= 0 || emitted > full_frame) emitted = full_frame;
+		if(emitted <= 0 || emitted > full_frame)
+		{
+			std::cerr << "[SFO-BLOCK] transmit_byte reported invalid frame length "
+			          << emitted << " (capacity " << full_frame << ", frame " << f
+			          << "); aborting" << std::endl;
+			tx_preamble_nsymb_override = -1;
+			std::abort();
+		}
 
 		frame_off[f] = write_pos;
 		frame_len[f] = emitted;

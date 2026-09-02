@@ -566,6 +566,7 @@ public:
   int test_gui_init_fail_closed();
   int test_audio_open_fail_closed();
   int test_audio_thread_create_fail_closed();
+  int test_shm_unmap_fail_closed();
   int test_agw_server_start_fail_closed();
   int test_capture_enqueue_backpressure();
   int test_soundcard_restart_save_fail_closed();
@@ -675,6 +676,7 @@ public:
   void sack_negotiated_recompute_batch(const char* who);
   void set_call_sign(std::string call_sign);
   int test_ssid_bounds();
+  int test_data_container_ownership_constraints();
   int test_gbf_decoder_constraints();
   int test_turbo_iterations_sentinel();
   // CLI regression: numeric modulation configs parse exactly, while malformed
@@ -3213,6 +3215,9 @@ public:
   // Pinned-ring sample-capacity fail-closed regression. Loads a real config whose Nofdm is one
   // sample larger than the pin reference and requires the config publish to abort, never clamp.
   int test_precook_sample_capacity_abort();
+  // SFO harness TX-length regression. Invalid transmit_byte sample reports must abort before
+  // the harness copies stale data or overruns its full-frame allocation; never clamp and continue.
+  int test_sfo_block_emitted_samples_abort();
   // Harvest regression: drive the production down-decoder builder with only the
   // primary's startup GI patched, then require CONFIG_0 geometry to match it.
   int test_harvest_inband_cfg0_geometry();
@@ -5822,7 +5827,8 @@ public:
   // compressed unit and prove no plaintext DATA frames are staged.
   int test_encrypt_failure_tx_fail_closed();
   // CLI regression: accepted --encrypt spellings parse to the requested mode,
-  // while an unknown spelling is rejected with a diagnostic and no mode change.
+  // while an unknown spelling aborts startup with a diagnostic instead of
+  // silently continuing with ENCRYPT_OFF.
   int test_encryption_cli_validation();
   // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1):
   // negotiated session flag — both ends advertised CAP_CUMULATIVE_ACK (which is itself

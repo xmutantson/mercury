@@ -35,6 +35,8 @@ class cl_data_container
 	public:
 	cl_data_container();
 	~cl_data_container();
+	cl_data_container(const cl_data_container&) = delete;
+	cl_data_container& operator=(const cl_data_container&) = delete;
 	int* data_bit;
 	int* data_bit_energy_dispersal;
 	int* data_byte;

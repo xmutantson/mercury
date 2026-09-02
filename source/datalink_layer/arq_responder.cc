@@ -10394,6 +10394,56 @@ int cl_arq_controller::test_precook_sample_capacity_abort()
 #endif
 }
 
+// The SFO block harness owns a full-frame-sized destination for each transmit_byte call. A
+// nonpositive write report means TX failed (or failed to publish its result), while a report above
+// that capacity means the producer overran the buffer. Both must terminate the harness before it
+// copies or advances by that value. Drive the real TX loop and inject each invalid result through
+// its test-only environment seam; pre-fix, the harness clamped all three to full_frame and lived.
+int cl_arq_controller::test_sfo_block_emitted_samples_abort()
+{
+	const char* TAG = "[TEST-SFO-BLOCK-EMITTED-SAMPLES]";
+#if defined(_WIN32)
+	printf("%s SKIP: death-test process isolation is not available on Windows\n", TAG);
+	fflush(stdout);
+	return 0;
+#else
+	const char* invalid[] = { "0", "-1", "999999999" };
+	int failed = 0;
+	for(size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
+	{
+		pid_t child = fork();
+		if(child < 0)
+		{
+			printf("%s FAIL: fork failed for value %s (errno=%d)\n", TAG, invalid[i], errno);
+			fflush(stdout);
+			failed++;
+			continue;
+		}
+		if(child == 0)
+		{
+			setenv("MERCURY_SFO_BLOCK_NFRAMES", "1", 1);
+			setenv("MERCURY_TEST_SFO_BLOCK_EMITTED_SAMPLES", invalid[i], 1);
+			cl_telecom_system ts;
+			ts.operation_mode = BER_PLOT_passband;
+			ts.narrowband_enabled = NO;
+			ts.load_configuration(CONFIG_15);
+			ts.sfo_block_test();
+			_exit(0);
+		}
+
+		int status = 0;
+		pid_t waited;
+		do { waited = waitpid(child, &status, 0); } while(waited < 0 && errno == EINTR);
+		bool aborted = waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+		printf("%s %s: emitted=%s %s\n", TAG, aborted ? "PASS" : "FAIL", invalid[i],
+			aborted ? "failed closed with SIGABRT" : "continued after invalid TX length");
+		fflush(stdout);
+		if(!aborted) failed++;
+	}
+	return failed == 0 ? 0 : 1;
+#endif
+}
+
 // FIX (data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc): the OFDM SYMBOL GEOMETRY
 // (Nofdm = Nfft+Ngi) MUST be INVARIANT across the HINGE-1 robust->OFDM ring-shrink. The shrink
 // (force_set_capture_ring_natural, telecom_system.cc) un-seats the robust ring floor and re-runs
@@ -14686,9 +14736,18 @@ int cl_arq_controller::test_inorder_demote()
 	// MERCURY_GAP_ABORT_DEFEAT; on a gap, raise the loud GAP-ABORT (DROPPED, no
 	// FIFO push). Otherwise advance the high-water + push the batch bytes. Returns
 	// true if the batch was delivered, false if aborted.
+	bool mock_delivery_step_gap_once = false;
+	auto test_delivery_step_is_gap = [&](int bsi, int last_delivered_bsi)->bool {
+		if(mock_delivery_step_gap_once)
+		{
+			mock_delivery_step_gap_once = false;
+			return true;
+		}
+		return (!defeat) && delivery_step_is_gap(bsi, last_delivered_bsi);
+	};
 	auto deliver_commit = [&](int bsi)->bool {
-		bool gap = (!defeat)
-			&& delivery_step_is_gap(bsi, this->rsp_last_delivered_batch_seq_id);
+		bool gap = test_delivery_step_is_gap(
+			bsi, this->rsp_last_delivered_batch_seq_id);
 		if(gap)
 		{
 			printf("[RSP-V2-GAP-ABORT] delivery-time bsi=%d non-contiguous with "
@@ -14733,7 +14792,7 @@ int cl_arq_controller::test_inorder_demote()
 
 	// Helper: deliver the clean prefix 0..4 (BATCH-DONE commits) and seal the
 	// session bsi state to {cur=5, prev=4, last_delivered=4}.
-	auto deliver_clean_prefix = [&]() {
+	auto deliver_clean_prefix = [&]()->bool {
 		this->fifo_buffer_rx.flush();
 		this->rsp_current_expected_batch_seq_id = 0;
 		this->rsp_prev_batch_seq_id             = -1;
@@ -14742,12 +14801,45 @@ int cl_arq_controller::test_inorder_demote()
 		this->link_status                       = CONNECTED;
 		for(int b=0; b<5; b++)
 		{
-			deliver_commit(this->rsp_current_expected_batch_seq_id);
+			if(!deliver_commit(this->rsp_current_expected_batch_seq_id))
+				return false;
 			this->rsp_prev_batch_seq_id = this->rsp_current_expected_batch_seq_id;
 			this->rsp_current_expected_batch_seq_id =
 				(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
 		}
+		return true;
 	};
+
+	// Setup must fail closed if even the first clean-prefix commit detects a gap.
+	// This mocked predicate call reproduces the ignored-verdict defect: the old
+	// helper continued advancing synthetic state after deliver_commit() aborted.
+	mock_delivery_step_gap_once = true;
+	bool clean_prefix_setup_ok = deliver_clean_prefix();
+	char setup_drained[BATCH_BYTES];
+	int setup_popped = this->fifo_buffer_rx.pop(
+		setup_drained, (int)sizeof(setup_drained));
+	if(clean_prefix_setup_ok
+	   || mock_delivery_step_gap_once
+	   || this->link_status != DROPPED
+	   || this->rsp_current_expected_batch_seq_id != 0
+	   || this->rsp_prev_batch_seq_id != -1
+	   || this->rsp_last_delivered_batch_seq_id != -1
+	   || setup_popped != 0)
+	{
+		printf("[TEST-INORDER-DEMOTE] FAIL CLEAN-PREFIX-GAP: setup did not stop "
+			"at the first aborted commit (ok=%d mock_pending=%d link=%d cur=%d "
+			"prev=%d last=%d popped=%d)\n",
+			clean_prefix_setup_ok ? 1 : 0, mock_delivery_step_gap_once ? 1 : 0,
+			this->link_status, this->rsp_current_expected_batch_seq_id,
+			this->rsp_prev_batch_seq_id, this->rsp_last_delivered_batch_seq_id,
+			setup_popped);
+		fails++;
+	}
+	else
+	{
+		printf("[TEST-INORDER-DEMOTE] CLEAN-PREFIX-GAP PASS: setup stopped "
+			"at the first aborted commit without advancing state\n");
+	}
 
 	// Oracle: the delivered app FIFO must be EXACTLY the contiguous prefix [0..4]
 	// (gate fired) OR — only legal if NOT aborted — a contiguous extension. A
@@ -14805,7 +14897,7 @@ int cl_arq_controller::test_inorder_demote()
 	//     stays CONNECTED, stream continues. Drives the REAL sack_v2_readopt_has_gap + delivery
 	//     commit + fifo_buffer_rx — the exact production decision the M6 rollback changes.
 	{
-		deliver_clean_prefix();
+		if(!deliver_clean_prefix()) return 1;
 		// BREAK self-heal: wipe cur/prev to -1 (arq_responder.cc:474). Batch 5 (and any
 		// later in-flight) stranded; high-water STAYS 4.
 		this->rsp_current_expected_batch_seq_id = -1;
@@ -14848,7 +14940,7 @@ int cl_arq_controller::test_inorder_demote()
 	// delivers it -> silent concat. POST-fix: #2 re-baselines cur=prev=-1 on the
 	// SET_CONFIG, the frame re-adopts via sack_v2_readopt_has_gap -> abort.
 	{
-		deliver_clean_prefix();
+		if(!deliver_clean_prefix()) return 1;
 		// Incomplete batch 5 in flight: cur=5, prev=4 (PREV-BUMP would have
 		// stashed an incomplete 5). The SET_CONFIG demote arrives.
 		this->rsp_current_expected_batch_seq_id = 5;
@@ -14875,7 +14967,7 @@ int cl_arq_controller::test_inorder_demote()
 
 	// === CASE 3: FIX-9 D3 demote CFG16->CFG15 (SET_CONFIG-only) — identical shape.
 	{
-		deliver_clean_prefix();
+		if(!deliver_clean_prefix()) return 1;
 		this->rsp_current_expected_batch_seq_id = 5;
 		this->rsp_prev_batch_seq_id             = 4;
 		bool delivered;
@@ -14895,7 +14987,7 @@ int cl_arq_controller::test_inorder_demote()
 
 	// === CASE 4: FIX-3 verification-probe-skip demote (SET_CONFIG-only).
 	{
-		deliver_clean_prefix();
+		if(!deliver_clean_prefix()) return 1;
 		this->rsp_current_expected_batch_seq_id = 5;
 		this->rsp_prev_batch_seq_id             = 4;
 		bool delivered;
@@ -14915,7 +15007,7 @@ int cl_arq_controller::test_inorder_demote()
 
 	// === CASE 5: plain gearshift step-down mid-batch (SET_CONFIG-only, non-BREAK).
 	{
-		deliver_clean_prefix();
+		if(!deliver_clean_prefix()) return 1;
 		this->rsp_current_expected_batch_seq_id = 5;
 		this->rsp_prev_batch_seq_id             = 4;
 		bool delivered;
@@ -14940,7 +15032,7 @@ int cl_arq_controller::test_inorder_demote()
 	// #1 ALSO catches it directly even if the re-baseline were skipped, because a
 	// commit at bsi=8 after last_delivered=4 is a forward step of 4 (>=2).
 	{
-		deliver_clean_prefix();
+		if(!deliver_clean_prefix()) return 1;
 		// PREV-BUMP an incomplete batch 5: cur=6, prev=5, but 5 was NOT delivered
 		// (last_delivered STAYS 4).
 		this->rsp_current_expected_batch_seq_id = 6;
@@ -14968,7 +15060,7 @@ int cl_arq_controller::test_inorder_demote()
 	// next batch is bsi=5 (contiguous). The re-baseline + re-adopt must ACCEPT it
 	// (byte-identical legitimate climb), NOT spuriously abort.
 	{
-		deliver_clean_prefix();         // last_delivered=4, cur=5
+		if(!deliver_clean_prefix()) return 1; // last_delivered=4, cur=5
 		// batch 5 was COMPLETE on this rung — deliver it (high-water -> 5).
 		deliver_commit(5);              // contiguous, accepted, last_delivered=5
 		this->rsp_prev_batch_seq_id = 5;
@@ -15015,7 +15107,7 @@ int cl_arq_controller::test_inorder_demote()
 	//     concat, no false abort. Drives the REAL sack_v2_readopt_has_gap + delivery_step_is_gap +
 	//     fifo_buffer_rx.
 	{
-		deliver_clean_prefix();                 // last_delivered=4, cur=5, prev=4
+		if(!deliver_clean_prefix()) return 1; // last_delivered=4, cur=5, prev=4
 		// The in-flight CFG16 batch 5 was DELIVERED to the app at CFG16 (high-water -> 5) BEFORE the
 		// CMD confirmed receipt — the precise pre-demote state the sim reached.
 		deliver_commit(5);                      // contiguous, accepted, last_delivered=5

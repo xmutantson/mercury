@@ -2387,6 +2387,21 @@ int cl_arq_controller::test_modulation_cli_validation()
     return fails;
 }
 
+int cl_arq_controller::test_data_container_ownership_constraints()
+{
+    const bool copy_constructible =
+        std::is_copy_constructible<cl_data_container>::value;
+    const bool copy_assignable =
+        std::is_copy_assignable<cl_data_container>::value;
+    const bool pass = !copy_constructible && !copy_assignable;
+
+    printf("[TEST-DATA-CONTAINER-OWNERSHIP] copy-constructible=%d "
+           "copy-assignable=%d -> %s\n",
+           copy_constructible ? 1 : 0, copy_assignable ? 1 : 0,
+           pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 int cl_arq_controller::test_gbf_decoder_constraints()
 {
     const float llr[2] = {1.0f, 1.0f};
@@ -2577,24 +2592,33 @@ int cl_arq_controller::test_agw_server_start_fail_closed()
 int cl_arq_controller::test_encryption_cli_validation()
 {
     int fails = 0;
-    auto check = [&](const char* value, bool want_ok, int want_mode)
+    auto check = [&](const char* value, bool want_ok, int initial_mode, int want_mode)
     {
-        int mode = -1;
+        int mode = initial_mode;
         std::string error;
         bool ok = parse_encryption_mode_cli(value, mode, error);
+        const int resolved_mode = (mode >= 0) ? mode : ENCRYPT_OFF;
+        const bool plaintext_fallback = ok && resolved_mode == ENCRYPT_OFF;
         bool pass = ok == want_ok && mode == want_mode
-                 && (want_ok ? error.empty() : !error.empty());
+                 && (want_ok ? error.empty() : !error.empty())
+                 && (want_ok || !plaintext_fallback);
         if (!pass) fails++;
-        printf("[TEST-ENC-CLI] --encrypt %-6s ok=%d mode=%d diagnostic=%d -> %s\n",
-               value, ok ? 1 : 0, mode, error.empty() ? 0 : 1,
+        printf("[TEST-ENC-CLI] --encrypt %-7s startup=%s cli-mode=%d resolved-mode=%d "
+               "plaintext-fallback=%d "
+               "diagnostic=%d -> %s\n",
+               value, ok ? "continue" : "abort", mode, resolved_mode,
+               plaintext_fallback ? 1 : 0,
+               error.empty() ? 0 : 1,
                pass ? "PASS" : "FAIL");
     };
 
-    check("strict", true, ENCRYPT_STRICT);
-    check("1",      true, ENCRYPT_STRICT);
-    check("fast",   true, ENCRYPT_FAST);
-    check("2",      true, ENCRYPT_FAST);
-    check("stric",  false, -1);
+    check("strict",  true,  -1,          ENCRYPT_STRICT);
+    check("1",       true,  -1,          ENCRYPT_STRICT);
+    check("fast",    true,  -1,          ENCRYPT_FAST);
+    check("2",       true,  -1,          ENCRYPT_FAST);
+    // Reproduce the dangerous fallback path: the untouched -1 sentinel would
+    // resolve to ENCRYPT_OFF, so an unknown explicit request must abort startup.
+    check("strictt", false, -1, -1);
 
     printf("[TEST-ENC-CLI] %s (%d failure(s))\n",
            fails == 0 ? "PASS" : "FAIL", fails);
@@ -2661,11 +2685,13 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_ssid_bounds();
+                failed += test_arq.test_data_container_ownership_constraints();
                 failed += test_arq.test_gbf_decoder_constraints();
                 failed += test_arq.test_modulation_cli_validation();
                 failed += test_arq.test_tx_level_cli_validation();
                 failed += test_arq.test_bandpass_cli_validation();
                 failed += test_arq.test_audio_subsystem_cli_validation();
+                failed += test_arq.test_shm_unmap_fail_closed();
             }
             {
                 cl_arq_controller test_hail;
@@ -2796,6 +2822,13 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_precook_sample_capacity_abort();
+            }
+            // SFO block TX geometry must fail closed: transmit_byte reporting no samples,
+            // a negative span, or more than the full-frame allocation aborts the harness
+            // before stale-data use / out-of-bounds copy. The old clamp silently continued.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_sfo_block_emitted_samples_abort();
             }
             // Harvest regression: independently require the production-created CONFIG_0
             // decoder to match the startup-patched primary geometry. The same test patch
@@ -3398,6 +3431,13 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller ARQ_gab;
                 failed += ARQ_gab.test_gap_abort_readopt_blind();
+            }
+            // The in-order demote scaffold must fail closed if clean-prefix
+            // setup itself encounters a delivery gap; no corrupt synthetic
+            // state may leak into the demote cases that follow.
+            {
+                cl_arq_controller ARQ_id;
+                failed += ARQ_id.test_inorder_demote();
             }
             // zombie/amplifier layer (data-flow-zombie-amplifier.md): R2b BREAK-accept-
             // while-DROPPED, the ROBUST_DWELL keep-alive gate, and the watchdog
