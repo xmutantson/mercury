@@ -1586,6 +1586,13 @@ bool cl_telecom_system::frame_decode_rejected(
 	return (rs.iterations_done > (ldpc.nIteration_max-1));
 }
 
+int cl_telecom_system::turbo_iterations_to_publish(
+		int selected_ldpc_iterations, int selected_turbo_iteration,
+		bool sentinel_defeat)
+{
+	return sentinel_defeat ? selected_turbo_iteration : selected_ldpc_iterations;
+}
+
 bool cl_telecom_system::acq_band_excl_hit(int delay, int radius, int* matched_center)
 {
 	if(radius <= 0)
@@ -4373,6 +4380,7 @@ skip_h_retry_point:
 				bit_energy_dispersal(data_container.hd_decoded_data_bit, data_container.bit_energy_dispersal_sequence, it0_disp, nReal_data);
 				int best_crc = frame_crc(it0_disp);
 				int best_iter = 0;
+				int best_decode_iterations = receive_stats.iterations_done;
 				int unsat_prev = receive_stats.iterations_done;   // BP iters = §6.5 monotone surrogate
 				for(int it=1; it < turbo_iters_env && best_crc != 0; ++it)
 				{
@@ -4414,13 +4422,13 @@ skip_h_retry_point:
 					int it_crc = frame_crc(it_disp);
 					bool improved = (it_crc==0) || (it_iters < unsat_prev);
 					if(it_crc==0 || (best_crc!=0 && improved))
-					{ for(int i=0;i<nReal_data;i++) best_bits[i]=data_container.hd_decoded_data_bit[i]; best_crc=it_crc; best_iter=it; }
+					{ for(int i=0;i<nReal_data;i++) best_bits[i]=data_container.hd_decoded_data_bit[i]; best_crc=it_crc; best_iter=it; best_decode_iterations=it_iters; }
 					if(!improved) break;
 					unsat_prev = it_iters;
 				}
 				// Publish the BEST iteration's hard bits (monotone-safe; never worse than it=0).
 				for(int i=0;i<nReal_data;i++) data_container.hd_decoded_data_bit[i]=best_bits[i];
-				receive_stats.iterations_done = best_iter;
+				receive_stats.iterations_done = turbo_iterations_to_publish(best_decode_iterations, best_iter);
 				if(best_iter>0)
 				{
 					printf("[TURBO] cfg=%d best_iter=%d crc=0x%04X (data-aided CE refined the frame)\n", current_configuration, best_iter, best_crc & 0xFFFF);

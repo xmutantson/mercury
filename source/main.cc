@@ -1838,6 +1838,59 @@ static int run_crc_escape_selftest()
     return fails==0 ? 0 : 1;
 }
 
+int cl_arq_controller::test_turbo_iterations_sentinel()
+{
+    printf("[TEST-TURBO-SENTINEL] turbo decode-verdict preservation self-test\n");
+    int fails = 0;
+
+    cl_telecom_system telecom;
+    telecom.operation_mode = BER_PLOT_passband;
+    telecom.load_configuration(CONFIG_16);
+    if (telecom.outer_code != CRC16_MODBUS_RTU) {
+        printf("[TEST-TURBO-SENTINEL] FAIL: CONFIG_16 is not CRC16 outer-coded\n");
+        return 1;
+    }
+
+    const int fail_sentinel = telecom.ldpc.nIteration_max + 1;
+    st_receive_stats rs;
+    rs.all_zeros = NO;
+    rs.crc = 0;  // residual hard bits collide CRC16, the fail-closed case
+
+    // Fail-before: the old publication stored turbo loop index 0, making the
+    // non-converged CRC-colliding frame appear converged and therefore accepted.
+    rs.iterations_done = cl_telecom_system::turbo_iterations_to_publish(
+        fail_sentinel, /*selected_turbo_iteration=*/0, /*sentinel_defeat=*/true);
+    bool legacy_rejected = telecom.frame_decode_rejected(rs, telecom.outer_code);
+    if (rs.iterations_done != 0 || legacy_rejected) {
+        printf("[TEST-TURBO-SENTINEL] FAIL: legacy overwrite was not reproduced (iter=%d rejected=%d)\n",
+               rs.iterations_done, legacy_rejected ? 1 : 0);
+        fails++;
+    }
+
+    // Pass-after: publish the selected decode's real result. The canonical FAIL
+    // sentinel survives and the production accept/reject gate rejects the frame.
+    rs.iterations_done = cl_telecom_system::turbo_iterations_to_publish(
+        fail_sentinel, /*selected_turbo_iteration=*/0);
+    bool fixed_rejected = telecom.frame_decode_rejected(rs, telecom.outer_code);
+    if (rs.iterations_done != fail_sentinel || !fixed_rejected) {
+        printf("[TEST-TURBO-SENTINEL] FAIL: FAIL sentinel lost (iter=%d expected=%d rejected=%d)\n",
+               rs.iterations_done, fail_sentinel, fixed_rejected ? 1 : 0);
+        fails++;
+    }
+
+    // A later turbo candidate that also fails must likewise retain its decoder
+    // sentinel; the turbo loop number is never a convergence verdict.
+    rs.iterations_done = cl_telecom_system::turbo_iterations_to_publish(
+        fail_sentinel, /*selected_turbo_iteration=*/1);
+    if (!telecom.frame_decode_rejected(rs, telecom.outer_code)) {
+        printf("[TEST-TURBO-SENTINEL] FAIL: non-converged turbo refinement was accepted\n");
+        fails++;
+    }
+
+    printf("[TEST-TURBO-SENTINEL] %s\n", fails == 0 ? "PASS" : "FAIL");
+    return fails;
+}
+
 // --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
 // pass-after self-test. See fact-documents/chase-combining-harq.md.
 //
@@ -3026,6 +3079,13 @@ int main(int argc, char *argv[])
             // the PRODUCTION frame_decode_rejected() predicate; fail-before via the
             // crc_escape_defeat arm (legacy crc-only gate). Deterministic, no RF.
             failed += run_crc_escape_selftest();
+            // Turbo-EQ verdict preservation: publishing the selected hard bits must
+            // publish that LDPC decode's iteration result too, never the turbo loop
+            // index. A CRC-colliding FAIL sentinel must remain rejected.
+            {
+                cl_arq_controller ARQ_turbo;
+                failed += ARQ_turbo.test_turbo_iterations_sentinel();
+            }
             // In-band demote-rebase DOUBLE-DELIVERY (byte-stream corruption): the RSP
             // re-delivers an already-delivered batch across an in-band demote-rebase
             // (re-adopt + lost-ACK retransmit re-reach the delivery funnel with fwd==0).

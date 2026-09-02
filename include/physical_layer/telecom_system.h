@@ -644,6 +644,12 @@ public:
 	// decode. crc_escape_defeat restores the legacy CRC-only CRC16 gate for the
 	// fail-before arm of the self-test; the receive path always passes false.
 	bool frame_decode_rejected(const st_receive_stats& rs, int outer_code_in, bool crc_escape_defeat=false) const;
+	// Preserve the LDPC decoder result associated with the turbo iteration whose
+	// hard bits are published. The turbo loop index is diagnostic only and must
+	// never replace the decoder's nIteration_max+1 FAIL sentinel.
+	static int turbo_iterations_to_publish(int selected_ldpc_iterations,
+	                                        int selected_turbo_iteration,
+	                                        bool sentinel_defeat=false);
 	int test_subpeak_gate();
 
 	// F1b Part B (true-boundary rescue selector). Re-estimates the OFDM channel at

@@ -668,6 +668,7 @@ public:
   void sack_negotiated_recompute_batch(const char* who);
   void set_call_sign(std::string call_sign);
   int test_ssid_bounds();
+  int test_turbo_iterations_sentinel();
 
   int get_nOccupied_messages();
   int get_nFree_messages();
