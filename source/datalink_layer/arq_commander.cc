@@ -32,12 +32,53 @@
 #include <algorithm>   // std::min (2-instance stepper RX drain)
 
 #ifdef MERCURY_GUI_ENABLED
+#include "gui/gui_main.h"
 #include "gui/gui_state.h"
 #endif
 
 // MERCURY_TURN_TRACE (link-phase Step 1, MEASURE-ONLY): defined in arq_common.cc.
 // Emits one read-only trace line per CMD reverse-ACK turn; no-op when off.
 bool arq_turn_trace_on();
+
+#ifdef MERCURY_GUI_ENABLED
+static int test_gui_init_failure()
+{
+	return -1;
+}
+#endif
+
+int cl_arq_controller::test_gui_init_fail_closed()
+{
+#ifndef MERCURY_GUI_ENABLED
+	printf("[TEST-GUI-INIT] SKIP (GUI support not compiled)\n");
+	return 0;
+#else
+	gui_thread_context context(test_gui_init_failure);
+	gui_thread_func(&context);
+
+	FILE* diagnostic = tmpfile();
+	if(diagnostic == NULL)
+	{
+		printf("[TEST-GUI-INIT] FAIL: could not create diagnostic capture\n");
+		return 1;
+	}
+
+	int status = context.status.load(std::memory_order_acquire);
+	int validation = gui_validate_startup(status, diagnostic);
+	fflush(diagnostic);
+	rewind(diagnostic);
+	char message[160] = {0};
+	size_t message_length = fread(message, 1, sizeof(message) - 1, diagnostic);
+	fclose(diagnostic);
+
+	bool passed = status == GUI_STARTUP_FAILED && validation != 0
+	           && message_length > 0
+	           && strstr(message, "ERROR: GUI initialization failed") != NULL;
+	printf("[TEST-GUI-INIT] failing initializer -> status=%d validation=%d diagnostic=%d: %s\n",
+	       status, validation, message[0] != '\0', passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+#endif
+}
 
 // STAGE R (block-ACK pipelining, MERCURY_L1_BLOCKACK_PIPELINE): within a negotiated
 // block the intermediate 1..N-1 windows carry no reverse ACK (silence is the success

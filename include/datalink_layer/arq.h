@@ -562,6 +562,7 @@ public:
   int l1_test_timeout_case(const char* marker, int* awaiting_after,
                            int* queued_after, int* reset_completed);
   int test_l1_stage2_ownership();
+  int test_gui_init_fail_closed();
 
 
   void set_nResends(int nResends);

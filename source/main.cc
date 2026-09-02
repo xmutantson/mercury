@@ -2174,6 +2174,8 @@ static int run_mini1_carried_timing_test()
 
 int main(int argc, char *argv[])
 {
+    int main_exit_status = EXIT_SUCCESS;
+
 #if defined(_WIN32)
     SetUnhandledExceptionFilter(crash_handler);
     // Also try vectored handler for heap corruption
@@ -2251,6 +2253,14 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_enc_tx;
                 failed += test_enc_tx.test_encrypt_failure_tx_fail_closed();
+            }
+            // GUI initialization is asynchronous, but modem startup must still fail
+            // closed if the GUI thread reports that gui_init() failed. The directed
+            // member test injects a failing initializer and exercises the same status
+            // publication + validation path used below, without opening a real window.
+            {
+                cl_arq_controller test_gui;
+                failed += test_gui.test_gui_init_fail_closed();
             }
             // ML-KEM-768 hybrid KEX regression suite (MLKEM_HYBRID_PLAN.md,
             // data-flow-hybrid-kex.md): combiner symmetry, ML-KEM-first IKM
@@ -8679,13 +8689,44 @@ start_modem:
 
 #ifdef MERCURY_GUI_ENABLED
         pthread_t gui_thread;
+        bool gui_thread_created = false;
+        bool gui_startup_failed = false;
+        gui_thread_context gui_context;
         if (!nogui) {
             printf("Starting GUI...\n");
-            pthread_create(&gui_thread, NULL, gui_thread_func, NULL);
+            int thread_result = pthread_create(&gui_thread, NULL, gui_thread_func,
+                                               &gui_context);
+            if (thread_result != 0) {
+                fprintf(stderr, "ERROR: could not start GUI thread (%d); modem startup aborted\n",
+                        thread_result);
+                gui_startup_failed = true;
+            } else {
+                gui_thread_created = true;
+                int startup_status;
+                do {
+                    startup_status = gui_context.status.load(std::memory_order_acquire);
+                    if (startup_status == GUI_STARTUP_PENDING)
+                        std::this_thread::yield();
+                } while (startup_status == GUI_STARTUP_PENDING);
+
+                if (gui_validate_startup(startup_status, stderr) != 0) {
+                    gui_startup_failed = true;
+                    pthread_join(gui_thread, NULL);
+                    gui_thread_created = false;
+                }
+            }
+            if (gui_startup_failed)
+                main_exit_status = EXIT_FAILURE;
         }
 #endif
 
-        while (true)
+        while (
+#ifdef MERCURY_GUI_ENABLED
+               !gui_startup_failed
+#else
+               true
+#endif
+        )
         {
             if (shutdown_)
                 break;
@@ -8776,7 +8817,7 @@ start_modem:
         }
 
 #ifdef MERCURY_GUI_ENABLED
-        if (!nogui) {
+        if (gui_thread_created) {
             g_gui_state.request_shutdown.store(true);
             pthread_join(gui_thread, NULL);
         }
@@ -9022,5 +9063,5 @@ start_modem:
 
     shutdown_tee_logging();
 
-    return EXIT_SUCCESS;
+    return main_exit_status;
 }

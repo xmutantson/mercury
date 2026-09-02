@@ -1568,7 +1568,15 @@ void gui_shutdown() {
 
 // GUI thread entry point (called from main.cc)
 void* gui_thread_func(void* arg) {
-    if (gui_init() != 0) {
+    gui_thread_context* context = static_cast<gui_thread_context*>(arg);
+    int init_result = (context && context->init) ? context->init() : gui_init();
+    if (context) {
+        context->status.store(init_result == 0 ? GUI_STARTUP_SUCCEEDED
+                                               : GUI_STARTUP_FAILED,
+                              std::memory_order_release);
+    }
+
+    if (init_result != 0) {
         printf("Failed to initialize GUI\n");
         return nullptr;
     }
@@ -1577,4 +1585,12 @@ void* gui_thread_func(void* arg) {
     gui_shutdown();
 
     return nullptr;
+}
+
+int gui_validate_startup(int status, FILE* error_stream) {
+    if (status == GUI_STARTUP_SUCCEEDED)
+        return 0;
+
+    fprintf(error_stream, "ERROR: GUI initialization failed; modem startup aborted\n");
+    return -1;
 }
