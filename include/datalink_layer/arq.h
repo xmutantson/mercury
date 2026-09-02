@@ -563,6 +563,7 @@ public:
                            int* queued_after, int* reset_completed);
   int test_l1_stage2_ownership();
   int test_gui_init_fail_closed();
+  int test_audio_open_fail_closed();
 
 
   void set_nResends(int nResends);

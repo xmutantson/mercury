@@ -31,6 +31,8 @@
 #include <vector>      // std::vector (2-instance stepper large-payload buffer)
 #include <algorithm>   // std::min (2-instance stepper RX drain)
 
+extern "C" { extern std::atomic<bool> shutdown_; }
+
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_main.h"
 #include "gui/gui_state.h"
@@ -78,6 +80,40 @@ int cl_arq_controller::test_gui_init_fail_closed()
 	       status, validation, message[0] != '\0', passed ? "PASS" : "FAIL");
 	return passed ? 0 : 1;
 #endif
+}
+
+int cl_arq_controller::test_audio_open_fail_closed()
+{
+#if defined(__linux__)
+	const int backend = AUDIO_SUBSYSTEM_ALSA;
+#elif defined(_WIN32)
+	const int backend = AUDIO_SUBSYSTEM_WASAPI;
+#elif defined(__FREEBSD__)
+	const int backend = AUDIO_SUBSYSTEM_OSS;
+#elif defined(__APPLE__)
+	const int backend = AUDIO_SUBSYSTEM_COREAUDIO;
+#else
+	printf("[TEST-AUDIO-OPEN] SKIP (no supported audio backend)\n");
+	return 0;
+#endif
+
+	char invalid_device[] = "__mercury_device_does_not_exist__";
+	pthread_t capture_thread, playback_thread, prep_thread;
+	cl_telecom_system test_telecom;
+	const bool saved_shutdown = shutdown_.exchange(false);
+	const int result = audioio_init_internal(invalid_device, invalid_device, backend,
+	                                         &capture_thread, &playback_thread, &prep_thread,
+	                                         &test_telecom);
+	// Keep cleanup bounded even if a regression reports success and leaves the
+	// audio workers running.
+	shutdown_ = true;
+	audioio_deinit(&capture_thread, &playback_thread, &prep_thread);
+	shutdown_ = saved_shutdown;
+
+	const bool passed = result != 0;
+	printf("[TEST-AUDIO-OPEN] invalid capture/playback IDs -> init=%d: %s\n",
+	       result, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
 }
 
 // STAGE R (block-ACK pipelining, MERCURY_L1_BLOCKACK_PIPELINE): within a negotiated

@@ -2310,6 +2310,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_gui;
                 failed += test_gui.test_gui_init_fail_closed();
             }
+            // Device workers open asynchronously; startup must still fail closed
+            // when either real backend rejects its configured device ID.
+            {
+                cl_arq_controller test_audio;
+                failed += test_audio.test_audio_open_fail_closed();
+            }
             // ML-KEM-768 hybrid KEX regression suite (MLKEM_HYBRID_PLAN.md,
             // data-flow-hybrid-kex.md): combiner symmetry, ML-KEM-first IKM
             // order, transcript binding (tamper -> key divergence), and the
@@ -6848,6 +6854,14 @@ start_modem:
 
     // initializing audio system
     pthread_t radio_capture, radio_playback, radio_capture_prep;
+    auto start_audio_or_fail = [&]() {
+        if(audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
+                                 &radio_playback, &radio_capture_prep, &telecom_system) != 0)
+        {
+            fprintf(stderr, "ERROR: audio device startup failed; modem startup aborted\n");
+            main_exit_status = EXIT_FAILURE;
+        }
+    };
 
     if (telecom_system.operation_mode == MONITOR_MODE)
         telecom_system.operation_mode = ARQ_MODE;  // Reuse ARQ infrastructure
@@ -8727,12 +8741,11 @@ start_modem:
 			fflush(stdout);
 		}
 
-		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
-							  &radio_playback, &radio_capture_prep, &telecom_system);
+		start_audio_or_fail();
 
         // Initialize parallel OFDM decoders for monitor mode (after audio init
         // so primary telecom_system has its final narrowband/config state)
-        if (is_monitor_mode)
+        if (main_exit_status == EXIT_SUCCESS && is_monitor_mode)
             ARQ.init_monitor_decoders();
 
 #ifdef MERCURY_GUI_ENABLED
@@ -8740,7 +8753,7 @@ start_modem:
         bool gui_thread_created = false;
         bool gui_startup_failed = false;
         gui_thread_context gui_context;
-        if (!nogui) {
+        if (main_exit_status == EXIT_SUCCESS && !nogui) {
             printf("Starting GUI...\n");
             int thread_result = pthread_create(&gui_thread, NULL, gui_thread_func,
                                                &gui_context);
@@ -8971,8 +8984,7 @@ start_modem:
         telecom_system.constellation_plot.open("PLOT");
         telecom_system.constellation_plot.reset("PLOT");
 
-		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
-							  &radio_playback, &radio_capture_prep, &telecom_system);
+		start_audio_or_fail();
 
         while (!shutdown_)
         {
@@ -8987,8 +8999,7 @@ start_modem:
         telecom_system.load_configuration(mod_config);
         printf("Modulation: %d  Bitrate: %.2f bps  Shannon_limit: %.2f db\n",  mod_config, telecom_system.rbc, telecom_system.Shannon_limit);
 
-		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
-							  &radio_playback, &radio_capture_prep, &telecom_system);
+		start_audio_or_fail();
 
         while (!shutdown_)
         {
@@ -9032,8 +9043,7 @@ start_modem:
         telecom_system.load_configuration(mod_config);
         printf("Modulation: %d  Bitrate: %.2f bps  Shannon_limit: %.2f db\n",  mod_config, telecom_system.rbc, telecom_system.Shannon_limit);
 
-		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
-							  &radio_playback, &radio_capture_prep, &telecom_system);
+		start_audio_or_fail();
 
         while (!shutdown_)
         {
@@ -9048,8 +9058,7 @@ start_modem:
         telecom_system.load_configuration(mod_config);
         printf("Modulation: %d  Bitrate: %.2f bps  Shannon_limit: %.2f db\n",  mod_config, telecom_system.rbc, telecom_system.Shannon_limit);
 
-		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
-							  &radio_playback, &radio_capture_prep, &telecom_system);
+		start_audio_or_fail();
 
         while (!shutdown_)
         {
@@ -9069,7 +9078,7 @@ start_modem:
 
         buffer = circular_buf_init_shm(SHM_PAYLOAD_BUFFER_SIZE, (char *) SHM_PAYLOAD_NAME);
 
-        audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture, &radio_playback, &radio_capture_prep, &telecom_system);
+        start_audio_or_fail();
 
         while (!shutdown_)
         {
@@ -9090,8 +9099,7 @@ start_modem:
 
         buffer = circular_buf_init_shm(SHM_PAYLOAD_BUFFER_SIZE, (char *) SHM_PAYLOAD_NAME);
 
-		audioio_init_internal(input_dev, output_dev, audio_system, &radio_capture,
-							  &radio_playback, &radio_capture_prep, &telecom_system);
+		start_audio_or_fail();
 
         while (!shutdown_)
         {

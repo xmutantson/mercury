@@ -18,6 +18,7 @@
 #ifdef __cplusplus
 #include <atomic>
 #include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <vector>
 #else
@@ -165,6 +166,33 @@ static std::atomic<uint64_t> playback_sink_queue_guard_ns{
 static std::atomic<uint32_t> playback_sink_sample_rate_hz{48000U};
 static thread_local uint32_t capture_writer_seen_generation = 0;
 static thread_local bool capture_writer_causal_ready = false;
+
+// Device opens happen inside the capture/playback threads.  Publish their
+// startup result so audioio_init_internal() can return a meaningful status
+// instead of reporting success before either backend has opened.
+enum audio_startup_status {
+	AUDIO_START_PENDING = 0,
+	AUDIO_START_READY = 1,
+	AUDIO_START_FAILED = -1
+};
+static std::mutex audio_startup_mutex;
+static std::condition_variable audio_startup_cv;
+static int capture_startup_status = AUDIO_START_PENDING;
+static int playback_startup_status = AUDIO_START_PENDING;
+static bool capture_thread_started = false;
+static bool playback_thread_started = false;
+static bool capture_prep_thread_started = false;
+
+static void publish_audio_startup(bool capture, int status)
+{
+	{
+		std::lock_guard<std::mutex> lock(audio_startup_mutex);
+		int& current = capture ? capture_startup_status : playback_startup_status;
+		if(current == AUDIO_START_PENDING)
+			current = status;
+	}
+	audio_startup_cv.notify_all();
+}
 #endif
 
 int audio_subsystem;
@@ -619,8 +647,11 @@ void *radio_playback_thread(void *device_ptr)
 			if (wasapi_id != NULL) {
 				conf.buf.device_id = (const char*)wasapi_id;
 			} else {
-				printf("Warning: WASAPI device '%s' not found, using default\n", (const char*)device_ptr);
-				conf.buf.device_id = NULL;  // Use default device
+				fprintf(stderr, "ERROR: WASAPI playback device '%s' not found\n",
+				        (const char*)device_ptr);
+				publish_audio_startup(false, AUDIO_START_FAILED);
+				shutdown_ = true;
+				return NULL;
 			}
 		}
 	}
@@ -634,8 +665,11 @@ void *radio_playback_thread(void *device_ptr)
 			if (dsound_guid != NULL) {
 				conf.buf.device_id = (const char*)dsound_guid;
 			} else {
-				printf("Warning: DirectSound device '%s' not found, using default\n", (const char*)device_ptr);
-				conf.buf.device_id = NULL;  // Use default device
+				fprintf(stderr, "ERROR: DirectSound playback device '%s' not found\n",
+				        (const char*)device_ptr);
+				publish_audio_startup(false, AUDIO_START_FAILED);
+				shutdown_ = true;
+				return NULL;
 			}
 		}
 	}
@@ -694,6 +728,7 @@ void *radio_playback_thread(void *device_ptr)
 	if ( audio->init(&aconf) != 0)
     {
         printf("Error in audio->init()\n");
+		publish_audio_startup(false, AUDIO_START_FAILED);
         goto finish_play;
     }
 
@@ -702,6 +737,7 @@ void *radio_playback_thread(void *device_ptr)
 	if (b == NULL)
 	{
 		printf("Error in audio->alloc()\n");
+		publish_audio_startup(false, AUDIO_START_FAILED);
 		goto finish_play;
 	}
 
@@ -712,8 +748,10 @@ void *radio_playback_thread(void *device_ptr)
 	if (r != 0)
 	{
 		printf("error in audio->open(): %d: %s\n", r, audio->error(b));
+		publish_audio_startup(false, AUDIO_START_FAILED);
 		goto cleanup_play;
 	}
+	publish_audio_startup(false, AUDIO_START_READY);
 
 	printf("I/O playback (%s) format=%d (%s) / %dHz / %dch / %dms buffer\n",
 		conf.buf.device_id ? conf.buf.device_id : "default",
@@ -1349,8 +1387,11 @@ void *radio_capture_thread(void *device_ptr)
 			if (wasapi_id != NULL) {
 				conf.buf.device_id = (const char*)wasapi_id;
 			} else {
-				printf("Warning: WASAPI device '%s' not found, using default\n", (const char*)device_ptr);
-				conf.buf.device_id = NULL;  // Use default device
+				fprintf(stderr, "ERROR: WASAPI capture device '%s' not found\n",
+				        (const char*)device_ptr);
+				publish_audio_startup(true, AUDIO_START_FAILED);
+				shutdown_ = true;
+				return NULL;
 			}
 		}
 		fflush(stdout);
@@ -1366,8 +1407,11 @@ void *radio_capture_thread(void *device_ptr)
 				conf.buf.device_id = (const char*)dsound_guid;
 				printf("[CAPTURE INIT] Found device GUID, using specific device\n");
 			} else {
-				printf("[CAPTURE INIT] Warning: DirectSound device '%s' not found, using default\n", (const char*)device_ptr);
-				conf.buf.device_id = NULL;  // Use default device
+				fprintf(stderr, "ERROR: DirectSound capture device '%s' not found\n",
+				        (const char*)device_ptr);
+				publish_audio_startup(true, AUDIO_START_FAILED);
+				shutdown_ = true;
+				return NULL;
 			}
 		} else {
 			printf("[CAPTURE INIT] No device specified, using default\n");
@@ -1417,6 +1461,7 @@ void *radio_capture_thread(void *device_ptr)
 	if ( audio->init(&aconf) != 0)
     {
         printf("Error in audio->init()\n");
+		publish_audio_startup(true, AUDIO_START_FAILED);
         goto finish_cap;
     }
 
@@ -1425,6 +1470,7 @@ void *radio_capture_thread(void *device_ptr)
 	if (b == NULL)
     {
         printf("Error in audio->alloc()\n");
+		publish_audio_startup(true, AUDIO_START_FAILED);
         goto finish_cap;
     }
 
@@ -1435,8 +1481,10 @@ void *radio_capture_thread(void *device_ptr)
 	if (r != 0)
     {
         printf("error in audio->open(): %d: %s\n", r, audio->error(b));
+		publish_audio_startup(true, AUDIO_START_FAILED);
         goto cleanup_cap;
     }
+	publish_audio_startup(true, AUDIO_START_READY);
 
 	printf("I/O capture (%s) format=%d (%s) / %dHz / %dch / %dms buffer\n",
 		conf.buf.device_id ? conf.buf.device_id : "default",
@@ -2418,6 +2466,9 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 						  pthread_t *radio_playback, pthread_t *radio_capture_prep, cl_telecom_system *telecom_system)
 {
     audio_subsystem = audio_subsys;
+	capture_thread_started = false;
+	playback_thread_started = false;
+	capture_prep_thread_started = false;
 
 #if ENABLE_FLOAT64_TAP_BEFORE == 1
 	tap_play = fopen("tap-playback-b.f64", "w");
@@ -2466,28 +2517,80 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
         printf("[SIM] software channel backend active (no audio device) %s\n",
                SIM_AUDIO_GUARD_MARKER);
         fflush(stdout);
-        pthread_create(radio_playback, NULL, sim_tx_bridge_thread, NULL);
-        pthread_create(radio_capture,  NULL, sim_rx_bridge_thread, NULL);
-        pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread, (void *) telecom_system);
+        playback_thread_started = pthread_create(radio_playback, NULL, sim_tx_bridge_thread, NULL) == 0;
+        capture_thread_started = pthread_create(radio_capture, NULL, sim_rx_bridge_thread, NULL) == 0;
+        capture_prep_thread_started = pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread,
+                                                     (void *) telecom_system) == 0;
+        if(!playback_thread_started || !capture_thread_started || !capture_prep_thread_started)
+        {
+            fprintf(stderr, "ERROR: could not start all audio threads\n");
+            shutdown_ = true;
+            return -1;
+        }
         return 0;
     }
 
-    pthread_create(radio_capture, NULL, radio_capture_thread, (void *) capture_dev);
-	pthread_create(radio_playback, NULL, radio_playback_thread, (void *) playback_dev);
-	pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread, (void *) telecom_system);
+    {
+        std::lock_guard<std::mutex> lock(audio_startup_mutex);
+        capture_startup_status = AUDIO_START_PENDING;
+        playback_startup_status = AUDIO_START_PENDING;
+    }
 
-	return 0;
+    capture_thread_started = pthread_create(radio_capture, NULL, radio_capture_thread,
+                                            (void *) capture_dev) == 0;
+	playback_thread_started = pthread_create(radio_playback, NULL, radio_playback_thread,
+                                           (void *) playback_dev) == 0;
+	capture_prep_thread_started = pthread_create(radio_capture_prep, NULL, radio_capture_prep_thread,
+                                               (void *) telecom_system) == 0;
+	if(!capture_thread_started)
+		publish_audio_startup(true, AUDIO_START_FAILED);
+	if(!playback_thread_started)
+		publish_audio_startup(false, AUDIO_START_FAILED);
+	if(!capture_prep_thread_started)
+	{
+		fprintf(stderr, "ERROR: could not start audio preparation thread\n");
+		shutdown_ = true;
+		return -1;
+	}
+
+	std::unique_lock<std::mutex> lock(audio_startup_mutex);
+	audio_startup_cv.wait(lock, [] {
+		return capture_startup_status == AUDIO_START_FAILED
+		    || playback_startup_status == AUDIO_START_FAILED
+		    || (capture_startup_status == AUDIO_START_READY
+		        && playback_startup_status == AUDIO_START_READY);
+	});
+	const bool ready = capture_startup_status == AUDIO_START_READY
+	                && playback_startup_status == AUDIO_START_READY;
+	lock.unlock();
+	if(!ready)
+		shutdown_ = true;
+	return ready ? 0 : -1;
 }
 
 int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_t *radio_capture_prep)
 {
     // Guard: if audio was never initialized (e.g. BER test modes), skip everything
-    if(!capture_buffer)
-        return 0;
+	if(!capture_buffer)
+	{
+		return 0;
+	}
 
-    pthread_join(*radio_capture_prep, NULL);
-    pthread_join(*radio_capture, NULL);
-    pthread_join(*radio_playback, NULL);
+	if(capture_prep_thread_started)
+	{
+		pthread_join(*radio_capture_prep, NULL);
+	}
+	if(capture_thread_started)
+	{
+		pthread_join(*radio_capture, NULL);
+	}
+	if(playback_thread_started)
+	{
+		pthread_join(*radio_playback, NULL);
+	}
+	capture_prep_thread_started = false;
+	capture_thread_started = false;
+	playback_thread_started = false;
 
 #if ENABLE_FLOAT64_TAP_BEFORE == 1
 	fclose(tap_play);
@@ -2519,5 +2622,7 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
     circular_buf_destroy_shm(playback_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
     circular_buf_free_shm(playback_buffer);
 #endif
+	capture_buffer = NULL;
+	playback_buffer = NULL;
     return 0;
 }
