@@ -25,6 +25,11 @@
 #include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 config-tag follow test
 #include <vector>
 #include <random>   // test_recovery_ack_capture: written-but-silent ring noise (ARM3b)
+#if !defined(_WIN32)
+#include <cerrno>
+#include <csignal>
+#include <sys/wait.h>
+#endif
 
 #ifdef MERCURY_GUI_ENABLED
 #include "gui/gui_state.h"
@@ -10311,6 +10316,67 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 	return failed == 0 ? 0 : 1;
 }
 
+// A pinned capture ring is a closed geometry domain. Reproduce an out-of-domain config switch by
+// pinning the real data_container at CONFIG_0's reference Nofdm, raising the process geometry by
+// one sample/symbol, and loading CONFIG_17 through cl_telecom_system::load_configuration(). The
+// CONFIG_0 buffer floor makes the requested sample count strictly exceed the physical pin while
+// every other CONFIG_17 dimension still fits. Pre-fix, publish_active_ring silently clamped the
+// symbol window and the child returned success; the fix must terminate it with SIGABRT.
+int cl_arq_controller::test_precook_sample_capacity_abort()
+{
+	const char* TAG = "[TEST-PRECOOK-SAMPLE-CAPACITY]";
+#if defined(_WIN32)
+	printf("%s SKIP: death-test process isolation is not available on Windows\n", TAG);
+	fflush(stdout);
+	return 0;
+#else
+	cl_telecom_system* ts = new cl_telecom_system();
+	ts->narrowband_enabled = NO;
+	ts->load_configuration(CONFIG_0);
+
+	cl_data_container& dc = ts->data_container;
+	const int reference_nofdm = dc.Nofdm;
+	const int reference_bn = dc.buffer_Nsymb.load();
+	// Give the fine-slice/preamble planes one-symbol headroom so the sample-capacity check is the
+	// first and only pinned-capacity invariant violated by the one-sample Nofdm regression.
+	dc.alloc_shared_buffers(N_MAX, dc.Nc, 64, dc.Nfft, dc.Nofdm, 128,
+		dc.preamble_nSymb + 1, dc.interpolation_rate, reference_bn);
+	// Keep the child config at the pinned symbol capacity. Increasing Nofdm by one then makes
+	// sp=(ref+1)*reference_bn*interp > pinned_capacity_samples deterministically.
+	dc.buffer_Nsymb_min = reference_bn;
+	ts->default_configurations_telecom_system.ofdm_gi =
+		(float)(reference_nofdm - dc.Nfft + 1) / (float)dc.Nfft;
+
+	pid_t child = fork();
+	if(child < 0)
+	{
+		printf("%s FAIL: fork failed (errno=%d)\n", TAG, errno);
+		fflush(stdout);
+		delete ts;
+		return 1;
+	}
+	if(child == 0)
+	{
+		ts->load_configuration(CONFIG_17);
+		_exit(0);
+	}
+
+	int status = 0;
+	pid_t waited;
+	do { waited = waitpid(child, &status, 0); } while(waited < 0 && errno == EINTR);
+	bool aborted = waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+	if(aborted)
+		printf("%s PASS: oversized config publish failed closed with SIGABRT "
+			"(reference Nofdm=%d, requested=%d)\n", TAG, reference_nofdm, reference_nofdm + 1);
+	else
+		printf("%s FAIL: oversized config publish continued (waited=%ld status=%d)\n",
+			TAG, (long)waited, status);
+	fflush(stdout);
+	delete ts;
+	return aborted ? 0 : 1;
+#endif
+}
+
 // FIX (data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc): the OFDM SYMBOL GEOMETRY
 // (Nofdm = Nfft+Ngi) MUST be INVARIANT across the HINGE-1 robust->OFDM ring-shrink. The shrink
 // (force_set_capture_ring_natural, telecom_system.cc) un-seats the robust ring floor and re-runs
@@ -10876,6 +10942,38 @@ int cl_arq_controller::test_inband_descrambler_survives_ring_shrink()
 		ref_N = ref.ldpc.N;
 		for(int i=0;i<ref_N && i<N_MAX;i++) ref_seq_full[i]=ref.data_container.bit_energy_dispersal_sequence[i];
 	}
+	auto matches_reference = [&](const int* sequence, int sequence_N, int* compared) {
+		*compared = 0;
+		if(sequence == NULL || sequence_N <= 0 || sequence_N > N_MAX ||
+		   ref_N <= 0 || ref_N > N_MAX || sequence_N != ref_N)
+			return false;
+		for(int i=0;i<sequence_N && i<N_MAX;i++)
+		{
+			(*compared)++;
+			if(sequence[i] != ref_seq_full[i]) return false;
+		}
+		return true;
+	};
+
+	// Bounds regression: corrupt a real loaded configuration's public LDPC geometry to model a
+	// future/malformed configuration that exceeds the fixed descrambler allocation. The comparison
+	// must fail closed before reading either sequence; the compared count makes this deterministic
+	// without relying on a sanitizer to catch the historical ref_seq_full[N_MAX] read.
+	{
+		cl_telecom_system oversized;
+		oversized.operation_mode = ARQ_MODE; oversized.narrowband_enabled = NO;
+		oversized.default_configurations_telecom_system.ofdm_gi = PROD_GI;
+		oversized.load_configuration(CONFIG_0);
+		int loaded_N = oversized.ldpc.N;
+		oversized.ldpc.N = N_MAX + 1;
+		int compared = -1;
+		bool oversized_matches = matches_reference(
+			oversized.data_container.bit_energy_dispersal_sequence, oversized.ldpc.N, &compared);
+		check(!oversized_matches, "PASS-AFTER BOUNDS: ldpc.N > N_MAX fails the reference comparison closed",
+			oversized_matches ? 1 : 0, 0);
+		check(compared == 0, "PASS-AFTER BOUNDS: oversized geometry reads zero reference elements", compared, 0);
+		oversized.ldpc.N = loaded_N;
+	}
 
 	for(int arm = 0; arm < 2; arm++)
 	{
@@ -10904,8 +11002,8 @@ int cl_arq_controller::test_inband_descrambler_survives_ring_shrink()
 		// load-bearing invariant is NOT "all-zero" but "matches the TX reference the RSP must
 		// descramble with". The FAIL-BEFORE arm asserts the descrambler DIVERGES from the TX ref
 		// (whatever the realloc left) -> the round-trip cannot recover M. Robust to the allocator.
-		bool matches_ref = true;
-		for(int i=0;i<N;i++) if(ts->data_container.bit_energy_dispersal_sequence[i]!=ref_seq_full[i]){ matches_ref=false; break; }
+		int compared = 0;
+		bool matches_ref = matches_reference(ts->data_container.bit_energy_dispersal_sequence, N, &compared);
 
 		int M_msg[8] = {1,0,1,1,0,0,1,0};
 		int recovered[8];

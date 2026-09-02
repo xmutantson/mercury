@@ -129,7 +129,7 @@ void cl_data_container::set_active_geometry(int nData, int Nc, int M, int Nfft, 
 	// allocation = silent heap corruption on a life-critical PHY. Refuse it LOUDLY and abort rather
 	// than corrupt: this converts any future unhandled state into a named startup-class abort, not a
 	// live 0-connect. In-domain (the live gate) this NEVER fires. (publish_active_ring separately
-	// clamps the C1-visible ring sp/buffer_Nsymb; this guards the ARQ-thread scratch dims.)
+	// guards the C1-visible ring sp/buffer_Nsymb; this guards the ARQ-thread scratch dims.)
 	if(this->precook_ring_pinned)
 	{
 		const char* over = nullptr; int need = 0, cap = 0;
@@ -206,20 +206,16 @@ void cl_data_container::publish_active_ring()
 	// Nofdm exceeds the pin's ref_Nofdm can overrun the allocation even with buffer_Nsymb ≤ capacity
 	// (this was the live-acq failure: bundles built at Nofdm=310 vs a ring pinned at 292). The root
 	// fix (bundles inherit the live gi) keeps Nofdm invariant so this never fires, but enforce the
-	// sp invariant here too: clamp the published window to what physically fits rather than let C1's
-	// 2·sp mirror write / the demod read run OOB. Log loudly — a hit means a geometry regression.
+	// sp invariant here too. A hit is a closed-domain geometry regression: continuing with a smaller
+	// published window hides it and leaves the PHY running with inconsistent geometry, so fail closed.
 	if(this->precook_ring_pinned && this->pinned_capacity_samples > 0
 	   && sp > this->pinned_capacity_samples)
 	{
-		int fit_bn = (this->Nofdm > 0 && this->interpolation_rate > 0)
-			? this->pinned_capacity_samples / (this->Nofdm * this->interpolation_rate) : active_bn;
 		fprintf(stderr, "[PRECOOK] FATAL: published sp=%d (Nofdm=%d bn=%d interp=%d) exceeds pinned "
-			"sample capacity=%d — Nofdm/geometry regression vs pin; clamping bn %d→%d to avoid ring OOB\n",
-			sp, this->Nofdm, active_bn, this->interpolation_rate, this->pinned_capacity_samples,
-			active_bn, fit_bn);
+			"sample capacity=%d — Nofdm/geometry regression vs pin; aborting config publish\n",
+			sp, this->Nofdm, active_bn, this->interpolation_rate, this->pinned_capacity_samples);
 		fflush(stderr);
-		active_bn = (fit_bn > 0) ? fit_bn : 1;
-		sp = this->Nofdm * active_bn * this->interpolation_rate;
+		abort();
 	}
 	this->buffer_Nsymb = active_bn;   // ATOMIC publish — the C1-critical store
 	this->frames_to_read = this->preamble_nSymb + this->Nsymb;

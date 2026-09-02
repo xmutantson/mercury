@@ -205,6 +205,52 @@ int cl_arq_controller::test_soundcard_restart_save_fail_closed()
 #endif
 }
 
+int cl_arq_controller::test_soundcard_audio_init_fail_closed()
+{
+#ifndef MERCURY_GUI_ENABLED
+	printf("[TEST-SOUNDCARD-INIT] SKIP (GUI support not compiled)\n");
+	return 0;
+#else
+	const int failed = soundcard_dialog_audio_init_fail_closed_selftest();
+	printf("[TEST-SOUNDCARD-INIT] backend init failure preserves configured devices: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+#endif
+}
+
+int cl_arq_controller::test_soundcard_restart_launch_fail_closed()
+{
+#if !defined(MERCURY_GUI_ENABLED) || !defined(_WIN32)
+	printf("[TEST-SOUNDCARD-RESTART-LAUNCH] SKIP (Windows GUI support not compiled)\n");
+	return 0;
+#else
+	FILE* diagnostic = tmpfile();
+	if(diagnostic == NULL)
+	{
+		printf("[TEST-SOUNDCARD-RESTART-LAUNCH] FAIL: could not create diagnostic capture\n");
+		return 1;
+	}
+
+	const bool saved_shutdown = g_gui_state.request_shutdown.exchange(false);
+	const bool restarted = restartMercuryProcess("", diagnostic);
+	const bool shutdown_requested = g_gui_state.request_shutdown.load();
+	g_gui_state.request_shutdown.store(saved_shutdown);
+	fflush(diagnostic);
+	rewind(diagnostic);
+	char message[256] = {0};
+	const size_t message_length = fread(message, 1, sizeof(message) - 1, diagnostic);
+	fclose(diagnostic);
+
+	const bool reported = message_length > 0
+	                   && strstr(message, "CreateProcessA failed") != NULL;
+	const bool passed = !restarted && !shutdown_requested && reported;
+	printf("[TEST-SOUNDCARD-RESTART-LAUNCH] corrupt exe path -> restarted=%d "
+	       "shutdown=%d reported=%d: %s\n",
+	       restarted, shutdown_requested, reported, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+#endif
+}
+
 // STAGE R (block-ACK pipelining, MERCURY_L1_BLOCKACK_PIPELINE): within a negotiated
 // block the intermediate 1..N-1 windows carry no reverse ACK (silence is the success
 // signal), so waiting a full receiving_timeout on each is dead air (~40-48% at

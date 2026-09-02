@@ -569,6 +569,8 @@ public:
   int test_agw_server_start_fail_closed();
   int test_capture_enqueue_backpressure();
   int test_soundcard_restart_save_fail_closed();
+  int test_soundcard_audio_init_fail_closed();
+  int test_soundcard_restart_launch_fail_closed();
 
 
   void set_nResends(int nResends);
@@ -677,6 +679,7 @@ public:
   // CLI regression: numeric modulation configs parse exactly, while malformed
   // or unknown values are rejected without changing the selected config.
   int test_modulation_cli_validation();
+  int test_tx_level_cli_validation();
 
   int get_nOccupied_messages();
   int get_nFree_messages();
@@ -3202,6 +3205,9 @@ public:
   // (MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT=1, same binary): Nofdm drifts 292->310.
   // data-flow-robust-ofdm-adopt-flush.md §15, diagnosis a468b2fc.
   int test_inband_adopt_nofdm_invariant();
+  // Pinned-ring sample-capacity fail-closed regression. Loads a real config whose Nofdm is one
+  // sample larger than the pin reference and requires the config publish to abort, never clamp.
+  int test_precook_sample_capacity_abort();
   // Harvest regression: drive the production down-decoder builder with only the
   // primary's startup GI patched, then require CONFIG_0 geometry to match it.
   int test_harvest_inband_cfg0_geometry();
@@ -3219,7 +3225,8 @@ public:
   // same binary): ctor gi -> 310. data-flow-robust-ofdm-adopt-flush.md §22.
   int test_inband_down_decoder_gi_inherit();
   // CONFIG_0 clean-lock CRC-fail ROOT: descrambler survives the inband ring-shrink
-  // (set_size realloc wiped bit_energy_dispersal_sequence). data-flow-robust-ofdm-adopt-flush.md §17.
+  // (set_size realloc wiped bit_energy_dispersal_sequence), with fail-closed N_MAX comparison bounds.
+  // data-flow-robust-ofdm-adopt-flush.md §17.
   int test_inband_descrambler_survives_ring_shrink();
   // Dead-batch streak ties to REAL batch periods + ZERO-PROGRESS (the climb-killer fix); a real
   // total loss STILL BREAKs. data-flow-robust-ofdm-adopt-flush.md §19.

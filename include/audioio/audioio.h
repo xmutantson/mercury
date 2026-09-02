@@ -44,6 +44,7 @@
 
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
+extern double tx_level_linear;
 
 // Phase-F validation: override ALSA buffer length (Linux only). 0 = default 30ms.
 extern int g_audio_buffer_ms_override;

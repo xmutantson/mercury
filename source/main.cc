@@ -26,6 +26,7 @@
 #include <fstream>
 #include <chrono>
 #include <cstdint>
+#include <cerrno>
 #include <cstdlib>
 #include <ctime>
 #include <cstdarg>
@@ -2266,6 +2267,24 @@ static bool parse_modulation_cli(const char* value, int& config, std::string& er
     return true;
 }
 
+static bool parse_tx_level_cli(const char* value, double& level, std::string& error)
+{
+    error.clear();
+    errno = 0;
+    char* end = NULL;
+    double parsed = strtod(value, &end);
+    if (end == value || *end != '\0' || errno == ERANGE
+        || !std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0)
+    {
+        error = "Invalid TX level '" + std::string(value)
+              + "', expected a number in the range 0.0-1.0";
+        return false;
+    }
+
+    level = parsed;
+    return true;
+}
+
 int cl_arq_controller::test_modulation_cli_validation()
 {
     int fails = 0;
@@ -2291,6 +2310,35 @@ int cl_arq_controller::test_modulation_cli_validation()
     check("104",   false, CONFIG_17, CONFIG_17);
 
     printf("[TEST-MOD-CLI] %s (%d failure(s))\n",
+           fails == 0 ? "PASS" : "FAIL", fails);
+    return fails;
+}
+
+int cl_arq_controller::test_tx_level_cli_validation()
+{
+    int fails = 0;
+    auto check = [&](const char* value, bool want_ok, double initial, double want_level)
+    {
+        double level = initial;
+        std::string error;
+        bool ok = parse_tx_level_cli(value, level, error);
+        bool pass = ok == want_ok && level == want_level
+                 && (want_ok ? error.empty() : !error.empty());
+        if (!pass) fails++;
+        printf("[TEST-TX-LEVEL-CLI] --tx-level %-8s ok=%d level=%.3f diagnostic=%d -> %s\n",
+               value, ok ? 1 : 0, level, error.empty() ? 0 : 1,
+               pass ? "PASS" : "FAIL");
+    };
+
+    check("0.0",  true,  0.25, 0.0);
+    check("0.5",  true,  0.25, 0.5);
+    check("1.0",  true,  0.25, 1.0);
+    check("-0.1", false, 0.25, 0.25);
+    check("5.0",  false, 0.25, 0.25);
+    check("nan",  false, 0.25, 0.25);
+    check("0.5x", false, 0.25, 0.25);
+
+    printf("[TEST-TX-LEVEL-CLI] %s (%d failure(s))\n",
            fails == 0 ? "PASS" : "FAIL", fails);
     return fails;
 }
@@ -2417,6 +2465,7 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_ssid_bounds();
                 failed += test_arq.test_modulation_cli_validation();
+                failed += test_arq.test_tx_level_cli_validation();
             }
             {
                 cl_arq_controller test_hail;
@@ -2460,6 +2509,8 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_gui;
                 failed += test_gui.test_gui_init_fail_closed();
                 failed += test_gui.test_soundcard_restart_save_fail_closed();
+                failed += test_gui.test_soundcard_audio_init_fail_closed();
+                failed += test_gui.test_soundcard_restart_launch_fail_closed();
             }
             // Device workers open asynchronously; startup must still fail closed
             // when either real backend rejects its configured device ID. Capture
@@ -2532,6 +2583,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_adopt_nofdm_invariant();
             }
+            // Pinned-ring geometry must fail closed: a real config load with Nofdm one sample
+            // larger than the pin reference must abort instead of silently shrinking the
+            // published ring window to fit the old allocation.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_precook_sample_capacity_abort();
+            }
             // Harvest regression: independently require the production-created CONFIG_0
             // decoder to match the startup-patched primary geometry. The same test patch
             // fails on bare monitor with Nofdm=310.
@@ -2558,7 +2616,8 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_down_decoder_gi_inherit();
             }
-            // §17: descrambler survives the inband ring-shrink (the CONFIG_0 clean-lock CRC-fail root).
+            // §17: descrambler survives the inband ring-shrink, including a fail-closed N_MAX+1
+            // comparison-bounds regression (the CONFIG_0 clean-lock CRC-fail root).
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_descrambler_survives_ring_shrink();
@@ -4676,6 +4735,7 @@ int main(int argc, char *argv[])
 
         printf("\nGain and calibration:\n");
         printf("  -T [dB]           TX gain override (e.g. -T -25.6)\n");
+        printf("  --tx-level [0.0-1.0]  TX level as a linear amplitude multiplier\n");
         printf("  -G [dB]           RX gain override (e.g. -G 25.6)\n");
         printf("  -B [gain]         NB MFSK boost override\n");
         printf("  -Q [n]            NB probe max (0=disable, default 2)\n");
@@ -4710,6 +4770,26 @@ int main(int argc, char *argv[])
             for (int j = i; j < argc - 1; j++)
                 argv[j] = argv[j + 1];
             argc--;
+            i--;
+        }
+        else if (strcmp(argv[i], "--tx-level") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "ERROR: --tx-level requires a value in the range 0.0-1.0\n");
+                return EXIT_FAILURE;
+            }
+            double tx_level = 1.0;
+            std::string error;
+            if (!parse_tx_level_cli(argv[i + 1], tx_level, error))
+            {
+                fprintf(stderr, "ERROR: %s\n", error.c_str());
+                return EXIT_FAILURE;
+            }
+            tx_level_linear = tx_level;
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
             i--;
         }
         else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc)

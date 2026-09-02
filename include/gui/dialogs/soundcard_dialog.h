@@ -6,6 +6,7 @@
 #ifndef SOUNDCARD_DIALOG_H_
 #define SOUNDCARD_DIALOG_H_
 
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,10 @@ public:
     int selected_audio_system_;    // 0=WASAPI, 1=DirectSound
 
 private:
+    bool acceptAndRestart(const std::string& config_path);
+
+    friend int soundcard_dialog_audio_init_fail_closed_selftest();
+
     bool is_open_;
     bool devices_enumerated_;
 
@@ -85,5 +90,14 @@ SoundCardDialog& get_soundcard_dialog();
 // Save settings and restart Mercury. Returns false without restarting when the
 // settings cannot be saved.
 bool restartMercury(const std::string& config_path);
+
+// Directed regression used by the modem's --test battery.
+int soundcard_dialog_audio_init_fail_closed_selftest();
+#ifdef _WIN32
+// Launch the replacement process and request shutdown only after Windows has
+// accepted it. Exposed separately so the failure path can be tested without
+// saving settings or starting a second modem.
+bool restartMercuryProcess(const char* executable_path, std::FILE* diagnostic);
+#endif
 
 #endif // SOUNDCARD_DIALOG_H_

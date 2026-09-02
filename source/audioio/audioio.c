@@ -136,6 +136,9 @@ static inline double noise_gaussian(void) {
 // 1.0 = unity (0 dB). Applied unconditionally in capture path.
 double rx_gain_linear = 1.0;
 
+// Optional --tx-level linear multiplier. Unity preserves the legacy TX path.
+double tx_level_linear = 1.0;
+
 // Tune tone state (for GUI tune button)
 static long tune_sample_index = 0;
 
@@ -868,6 +871,10 @@ void *radio_playback_thread(void *device_ptr)
 		// Apply TX gain from GUI
 		gui_apply_tx_gain(buffer_double, samples_read);
 #endif
+		if (tx_level_linear != 1.0) {
+			for (int i = 0; i < samples_read; i++)
+				buffer_double[i] *= tx_level_linear;
+		}
 
 		// convert from double to format-specific output
 		// Check if format is FLOAT32 (WASAPI), INT32 (DirectSound/ALSA), or INT16 (DirectSound 16-bit)

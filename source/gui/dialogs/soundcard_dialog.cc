@@ -38,6 +38,14 @@ extern const ffaudio_interface ffpulse;
 #endif
 }
 
+static const ffaudio_interface* audio_interface_for_test = nullptr;
+static int failing_audio_init_calls = 0;
+
+static int failing_audio_init(ffaudio_init_conf*) {
+    ++failing_audio_init_calls;
+    return -1;
+}
+
 // Global dialog - Meyer's Singleton to avoid static init order fiasco
 SoundCardDialog& get_soundcard_dialog() {
     static SoundCardDialog instance;
@@ -45,6 +53,28 @@ SoundCardDialog& get_soundcard_dialog() {
 }
 
 // Helper to restart Mercury
+#ifdef _WIN32
+bool restartMercuryProcess(const char* executable_path, std::FILE* diagnostic) {
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessA(executable_path, NULL, NULL, NULL, FALSE, 0, NULL, NULL,
+                        &si, &pi)) {
+        const DWORD error = GetLastError();
+        fprintf(diagnostic,
+                "ERROR: Failed to restart Mercury: CreateProcessA failed "
+                "with Windows error %lu.\n",
+                static_cast<unsigned long>(error));
+        return false;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    g_gui_state.request_shutdown.store(true);
+    return true;
+}
+#endif
+
 bool restartMercury(const std::string& config_path) {
     // Save settings before restart
     if (!g_settings.save(config_path)) {
@@ -56,17 +86,18 @@ bool restartMercury(const std::string& config_path) {
 #ifdef _WIN32
     // Get the path to the current executable
     char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    const DWORD exe_path_length = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    if (exe_path_length == 0 || exe_path_length >= MAX_PATH) {
+        const DWORD error = GetLastError();
+        fprintf(stderr,
+                "ERROR: Failed to restart Mercury: GetModuleFileNameA failed "
+                "with Windows error %lu.\n",
+                static_cast<unsigned long>(error));
+        return false;
+    }
 
     // Launch new instance
-    STARTUPINFOA si = {sizeof(si)};
-    PROCESS_INFORMATION pi;
-    if (CreateProcessA(exePath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        g_gui_state.request_shutdown.store(true);
-        return true;
-    }
+    return restartMercuryProcess(exePath, stderr);
 #elif defined(__APPLE__)
     // macOS: use _NSGetExecutablePath
     char exePath[PATH_MAX];
@@ -171,6 +202,7 @@ void SoundCardDialog::close() {
 }
 
 void SoundCardDialog::refreshDevices() {
+    devices_enumerated_ = false;
     input_devices_.clear();
     output_devices_.clear();
 
@@ -182,15 +214,14 @@ void SoundCardDialog::refreshDevices() {
 #else  // Linux
     const ffaudio_interface* audio = (temp_audio_system_ == 0) ? &ffalsa : &ffpulse;
 #endif
+    if (audio_interface_for_test) {
+        audio = audio_interface_for_test;
+    }
 
     // Initialize audio subsystem
     ffaudio_init_conf init_conf = {};
     init_conf.app_name = "Mercury";
     if (audio->init(&init_conf) != 0) {
-        // Add default entries if init fails
-        input_devices_.push_back({"Default Input Device", "", true, 0, 0});
-        output_devices_.push_back({"Default Output Device", "", true, 0, 0});
-        devices_enumerated_ = true;
         return;
     }
 
@@ -269,6 +300,88 @@ void SoundCardDialog::refreshDevices() {
     }
 
     devices_enumerated_ = true;
+}
+
+bool SoundCardDialog::acceptAndRestart(const std::string& config_path) {
+    if (!devices_enumerated_) {
+        return false;
+    }
+
+    selected_input_device_ = temp_input_device_;
+    selected_output_device_ = temp_output_device_;
+    selected_audio_system_ = temp_audio_system_;
+
+    int in_ch_validated = temp_input_channel_;
+    if (temp_input_device_ >= 0 && temp_input_device_ < (int)input_devices_.size()) {
+        g_settings.input_device = input_devices_[temp_input_device_].name;
+        if (input_devices_[temp_input_device_].channels == 1) {
+            in_ch_validated = 0;
+        }
+    }
+    selected_input_channel_ = in_ch_validated;
+
+    int out_ch_validated = temp_output_channel_;
+    if (temp_output_device_ >= 0 && temp_output_device_ < (int)output_devices_.size()) {
+        g_settings.output_device = output_devices_[temp_output_device_].name;
+        if (output_devices_[temp_output_device_].channels == 1) {
+            out_ch_validated = 2;
+        }
+    }
+    selected_output_channel_ = out_ch_validated;
+
+    g_settings.input_channel = in_ch_validated;
+    g_settings.output_channel = out_ch_validated;
+#ifdef _WIN32
+    g_settings.audio_system = (temp_audio_system_ == 0) ? "wasapi" : "dsound";
+#elif defined(__APPLE__)
+    g_settings.audio_system = "coreaudio";
+#else  // Linux
+    g_settings.audio_system = (temp_audio_system_ == 0) ? "alsa" : "pulse";
+#endif
+
+    is_open_ = false;
+    restartMercury(config_path);
+    return true;
+}
+
+int soundcard_dialog_audio_init_fail_closed_selftest() {
+#ifdef _WIN32
+    const ffaudio_interface* system_audio = &ffwasapi;
+#elif defined(__APPLE__)
+    const ffaudio_interface* system_audio = &ffcoreaudio;
+#else
+    const ffaudio_interface* system_audio = &ffalsa;
+#endif
+    ffaudio_interface failing_audio = *system_audio;
+    failing_audio.init = failing_audio_init;
+
+    const MercurySettings saved_settings = g_settings;
+    const std::string original_input = "Original Input Device";
+    const std::string original_output = "Original Output Device";
+    g_settings.input_device = original_input;
+    g_settings.output_device = original_output;
+
+    failing_audio_init_calls = 0;
+    audio_interface_for_test = &failing_audio;
+    SoundCardDialog dialog;
+    dialog.open();
+    audio_interface_for_test = nullptr;
+
+    // This is the same action invoked by the "OK & Restart" button.  The empty
+    // path would also make restart harmless if the fail-closed guard regressed.
+    const bool accepted = dialog.acceptAndRestart(std::string());
+    const bool passed = failing_audio_init_calls == 1
+                     && !dialog.devices_enumerated_
+                     && dialog.input_devices_.empty()
+                     && dialog.output_devices_.empty()
+                     && !accepted
+                     && dialog.isOpen()
+                     && g_settings.input_device == original_input
+                     && g_settings.output_device == original_output;
+
+    audio_interface_for_test = nullptr;
+    g_settings = saved_settings;
+    return passed ? 0 : 1;
 }
 
 bool SoundCardDialog::render() {
@@ -466,6 +579,10 @@ bool SoundCardDialog::render() {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
             "Tip: Most radio USB interfaces are mono. If you see [Mono], channel selection is automatic.");
+        if (!devices_enumerated_) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                "Audio device initialization failed. Settings were not changed.");
+        }
 
         ImGui::Spacing();
         ImGui::Spacing();
@@ -477,48 +594,7 @@ bool SoundCardDialog::render() {
 
         ImGui::SetCursorPosX(start_x);
         if (ImGui::Button("OK & Restart", ImVec2(button_width + 20, 0))) {
-            // Validate and apply settings
-            selected_input_device_ = temp_input_device_;
-            selected_output_device_ = temp_output_device_;
-            selected_audio_system_ = temp_audio_system_;
-
-            // Validate input channel against device capabilities
-            int in_ch_validated = temp_input_channel_;
-            if (temp_input_device_ >= 0 && temp_input_device_ < (int)input_devices_.size()) {
-                g_settings.input_device = input_devices_[temp_input_device_].name;
-                int dev_ch = input_devices_[temp_input_device_].channels;
-                if (dev_ch == 1) {
-                    in_ch_validated = 0;  // Force LEFT for mono device
-                }
-            }
-            selected_input_channel_ = in_ch_validated;
-
-            // Validate output channel against device capabilities
-            int out_ch_validated = temp_output_channel_;
-            if (temp_output_device_ >= 0 && temp_output_device_ < (int)output_devices_.size()) {
-                g_settings.output_device = output_devices_[temp_output_device_].name;
-                int dev_ch = output_devices_[temp_output_device_].channels;
-                if (dev_ch == 1) {
-                    out_ch_validated = 2;  // Force STEREO mode for mono device (outputs to both/only channel)
-                }
-            }
-            selected_output_channel_ = out_ch_validated;
-
-            g_settings.input_channel = in_ch_validated;
-            g_settings.output_channel = out_ch_validated;
-#ifdef _WIN32
-            g_settings.audio_system = (temp_audio_system_ == 0) ? "wasapi" : "dsound";
-#elif defined(__APPLE__)
-            g_settings.audio_system = "coreaudio";
-#else  // Linux
-            g_settings.audio_system = (temp_audio_system_ == 0) ? "alsa" : "pulse";
-#endif
-
-            settings_applied = true;
-            is_open_ = false;
-
-            // Restart Mercury to apply audio device changes
-            restartMercury(getDefaultConfigPath());
+            settings_applied = acceptAndRestart(getDefaultConfigPath());
         }
 
         ImGui::SameLine();

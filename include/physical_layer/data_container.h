@@ -103,9 +103,9 @@ class cl_data_container
 	int pinned_capacity_buffer_Nsymb{0};
 	// pinned_capacity_samples: the physical per-mirror sample capacity of the pinned passband ring
 	//   (== max_Nofdm·max_buffer_Nsymb·interp alloc_shared_buffers sized). publish_active_ring()
-	//   clamps the published sp against THIS (not just the buffer_Nsymb symbol count) so a config
-	//   whose Nofdm differs from the pin's ref_Nofdm can never drive C1's 2·sp mirror write / the
-	//   demod read out of the allocation. 0 until the ring is pinned. See data-flow-precook-ring.md.
+	//   refuses a published sp above THIS (not just the buffer_Nsymb symbol count) so a config whose
+	//   Nofdm differs from the pin's ref_Nofdm cannot silently shrink the active window or drive C1's
+	//   2·sp mirror write / the demod read out of the allocation. 0 until the ring is pinned.
 	int pinned_capacity_samples{0};
 	// PRECOOK V2 (Step A/C) — per-dimension pinned capacities recorded at pin time (the ABSOLUTE
 	//   max over the CLOSED geometry-input domain: {NB,WB} × FULL_CONFIG_LADDER × thin-grid Ngrid ×
