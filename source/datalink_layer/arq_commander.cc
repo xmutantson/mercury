@@ -26546,6 +26546,97 @@ void cl_arq_controller::test_fire_policy_axis3(int kind)
 	}
 }
 
+// Encryption failure must never fall through to the frame splitter.  Exercise
+// the real compressed-data TX path with a valid active cipher but an AEAD unit
+// larger than its fixed 16 KiB output buffer, so encrypt() deterministically
+// returns -1 for insufficient capacity.  Before the fail-closed return below,
+// the plaintext comp_buf was split into DATA frames; after it, no frame is
+// staged.  In-process only: no PHY, audio, or RF.
+int cl_arq_controller::test_encrypt_failure_tx_fail_closed()
+{
+	int failed = 0;
+	auto check = [&](bool condition, const char* name, long got, long want)
+	{
+		if(condition)
+			printf("[TEST-ENC-TX-FAILCLOSED] PASS: %s (got=%ld want=%ld)\n",
+				name, got, want);
+		else
+		{
+			printf("[TEST-ENC-TX-FAILCLOSED] FAIL: %s (got=%ld want=%ld)\n",
+				name, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+
+	// 90 * 195 bytes produces a 17,550-byte ciphertext, deterministically
+	// exceeding the production enc_buf[16384].  Each frame still fits the
+	// normal N_MAX/8 message allocation.
+	max_data_length = 194;
+	max_header_length = 6;
+	max_message_length = 200;
+	sack_enabled = true;
+	sack_v2_enabled = true;
+	header_carries_d5 = false;
+	current_configuration = CONFIG_0;
+	robust_enabled = NO;
+	narrowband_enabled = NO;
+	role = COMMANDER;
+	original_role = COMMANDER;
+	link_status = CONNECTED;
+	connection_status = TRANSMITTING_DATA;
+	block_under_tx = NO;
+	retransmit_count = 0;
+	nMessages = 128;
+	data_batch_size = 90;
+	crypto_batch_size = 90;
+	compress_ratio_estimate = 1.0f;
+	encryption_enabled = true;
+
+	deinit_messages_buffers();
+	int alloc_rc = init_messages_buffers();
+	check(alloc_rc == SUCCESSFUL, "message buffers allocated", alloc_rc, SUCCESSFUL);
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+
+	compressor.init();
+	compressor.streaming_disable();
+	compression_enabled = true;
+	cipher_suite.activate();
+
+	const int payload_size = 40000;
+	std::vector<char> payload((size_t)payload_size);
+	for(int i = 0; i < payload_size; i++)
+		payload[(size_t)i] = (char)('A' + (i % 23));
+	int pushed = fifo_buffer_tx.push(payload.data(), payload_size);
+	check(pushed == payload_size, "test payload staged", pushed, payload_size);
+
+	const int max_frame = max_data_length + max_header_length
+		- effective_data_long_header_length(sack_v2_enabled, header_carries_d5);
+	const int sealed_size = data_batch_size * max_frame;
+	check(sealed_size > 16384, "sealed unit exceeds encrypt output capacity",
+		sealed_size, 16385);
+
+	process_buffer_data_commander();
+
+	int staged_frames = get_nOccupied_messages();
+	check(tx_nonce_sealed_high_water != UINT64_MAX,
+		"production path reached the encrypt attempt",
+		tx_nonce_sealed_high_water == UINT64_MAX ? 0 : 1, 1);
+	check(staged_frames == 0,
+		"encrypt failure stages no plaintext DATA frames", staged_frames, 0);
+
+	compressor.deinit();
+	deinit_messages_buffers();
+	printf("[TEST-ENC-TX-FAILCLOSED] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed,
+		failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 void cl_arq_controller::process_buffer_data_commander()
 {
 	int data_read_size;
@@ -27053,6 +27144,7 @@ void cl_arq_controller::process_buffer_data_commander()
 							printf("[CRYPTO] Encrypt failed (wire_bsi %d index %llu)\n",
 								tx_wire_bsi, (unsigned long long)tx_batch_index);
 							fflush(stdout);
+							return;  // Fail closed: never frame the plaintext comp_buf.
 						}
 					}
 

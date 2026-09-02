@@ -5790,6 +5790,9 @@ public:
   // 0=PASS, else the fail count. Fails-before: -DENC_FAILOPEN_FAILBEFORE (which
   // compiles the historical opportunistic-plaintext FAST downgrade back in).
   int test_encryption_fail_closed();
+  // TX-path fail-closed regression: force encrypt() to reject an oversized
+  // compressed unit and prove no plaintext DATA frames are staged.
+  int test_encrypt_failure_tx_fail_closed();
   // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1):
   // negotiated session flag — both ends advertised CAP_CUMULATIVE_ACK (which is itself
   // gated by the env opt-in MERCURY_CUMULATIVE_ACK on the local advertise). When true,

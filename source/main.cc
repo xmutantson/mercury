@@ -2245,6 +2245,13 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_enc;
                 failed += test_enc.test_encryption_fail_closed();
             }
+            // AEAD TX failure FAIL-CLOSED regression: drives the REAL compressed
+            // commander fill path with an active cipher and an oversized sealed
+            // unit, then proves encrypt() failure stages zero plaintext frames.
+            {
+                cl_arq_controller test_enc_tx;
+                failed += test_enc_tx.test_encrypt_failure_tx_fail_closed();
+            }
             // ML-KEM-768 hybrid KEX regression suite (MLKEM_HYBRID_PLAN.md,
             // data-flow-hybrid-kex.md): combiner symmetry, ML-KEM-first IKM
             // order, transcript binding (tamper -> key divergence), and the
