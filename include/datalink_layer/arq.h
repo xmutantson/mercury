@@ -2501,6 +2501,9 @@ public:
   // fill path with an intentionally stale/high ratio estimate and verifies that
   // a no-fit probe is reduced and recompressed instead of silently sent RAW.
   int test_streaming_compress_overshoot();
+  // Streaming setup must fail closed if either carry buffer cannot be allocated.
+  // Deterministically fails the second allocation and verifies cleanup/retry.
+  int test_streaming_allocation_failure();
   int test_mixbatch_fill_overpop();  // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
   int test_mixbatch_fill_overpop_compressed();  // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
 

@@ -20955,6 +20955,40 @@ printf("[TEST-CLIMB] %s (%d failure%s)\n",
 	return failed == 0 ? 0 : 1;
 }
 
+// Streaming allocation failure regression. The fault hook is default-off and
+// affects only streaming_enable()'s two carry-buffer allocations. Failing the
+// second allocation reproduces the partial-allocation case: streaming must stay
+// inactive, and the first allocation must be released so a later retry succeeds.
+int cl_arq_controller::test_streaming_allocation_failure()
+{
+	const char* key = "MERCURY_TEST_STREAMING_ALLOC_FAIL_AT";
+	const char* old_value = std::getenv(key);
+	const bool had_old_value = old_value != nullptr;
+	const std::string saved_value = old_value ? old_value : "";
+
+	cl_compressor test_compressor;
+	test_compressor.set_dict_priming(false);
+	test_compressor.init();
+
+	setenv(key, "2", 1);
+	test_compressor.streaming_enable();
+	bool failed_closed = !test_compressor.is_streaming();
+
+	unsetenv(key);
+	test_compressor.streaming_enable();
+	bool retry_succeeded = test_compressor.is_streaming();
+
+	if (had_old_value) setenv(key, saved_value.c_str(), 1);
+	else unsetenv(key);
+
+	printf("[TEST-STREAM-ALLOC] second allocation failure stays disabled: %s\n",
+		failed_closed ? "PASS" : "FAIL");
+	printf("[TEST-STREAM-ALLOC] cleaned partial allocation permits retry: %s\n",
+		retry_succeeded ? "PASS" : "FAIL");
+	fflush(stdout);
+	return failed_closed && retry_succeeded ? 0 : 1;
+}
+
 // ROBUST_0 + streaming-compression deadlock regression
 // (data-flow-compress-frame-fill.md). Production bug: with compression ON,
 // every ARQ session now STARTS at ROBUST_0 (batch=1) since MFSK-CONNECT

@@ -2820,6 +2820,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_cmpretry;
                 failed += ARQ_cmpretry.test_streaming_compress_overshoot();
             }
+            // Streaming setup allocation failure must be visible to callers:
+            // no partially initialized carry state may report itself active.
+            {
+                cl_arq_controller ARQ_stream_alloc;
+                failed += ARQ_stream_alloc.test_streaming_allocation_failure();
+            }
             // Fix A — mid-flight data_batch_size SHRINK must not orphan RECEIVED prev
             // frames (baseline-double-delivery.md): drives the REAL set_data_batch_size
             // shrink; reconstructs the copy_data_to_buffer prev delivery set; asserts

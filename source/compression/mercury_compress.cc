@@ -38,6 +38,14 @@ static bool compress_retry_defeat_enabled()
 	return e && *e && atoi(e) != 0;
 }
 
+static void* streaming_malloc(size_t size, int allocation_number)
+{
+	const char* e = getenv("MERCURY_TEST_STREAMING_ALLOC_FAIL_AT");
+	if (e && *e && atoi(e) == allocation_number)
+		return nullptr;
+	return malloc(size);
+}
+
 // ---------- CRC16-MODBUS for streaming desync detection ----------
 
 static uint16_t compress_crc16(const unsigned char* data, int len)
@@ -227,12 +235,26 @@ void cl_compressor::streaming_enable()
 	if (!initialized) return;
 	if (streaming_active) return;  // Already enabled
 
-	zstd_prefix = (unsigned char*)malloc(ZSTD_PREFIX_CAPACITY);
+	zstd_prefix = (unsigned char*)streaming_malloc(ZSTD_PREFIX_CAPACITY, 1);
 	zstd_prefix_len = 0;
 
 	pending_raw_capacity = COMPRESS_WORKSPACE_SIZE;
-	pending_raw = (unsigned char*)malloc(pending_raw_capacity);
+	pending_raw = (unsigned char*)streaming_malloc(pending_raw_capacity, 2);
 	pending_raw_len = 0;
+
+	if (!zstd_prefix || !pending_raw)
+	{
+		free(zstd_prefix);
+		zstd_prefix = nullptr;
+		zstd_prefix_len = 0;
+		free(pending_raw);
+		pending_raw = nullptr;
+		pending_raw_len = 0;
+		pending_raw_capacity = 0;
+		fprintf(stderr, "[STREAMING] ERROR: buffer allocation failed; streaming remains disabled\n");
+		fflush(stderr);
+		return;
+	}
 
 	stream_batch_count = 0;
 	ppmd_model_warm = false;
