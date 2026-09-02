@@ -2241,6 +2241,60 @@ static bool parse_encryption_mode_cli(const char* value, int& mode, std::string&
     return true;
 }
 
+static bool parse_modulation_cli(const char* value, int& config, std::string& error)
+{
+    error.clear();
+    char* end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0'
+        || parsed < std::numeric_limits<int>::min()
+        || parsed > std::numeric_limits<int>::max())
+    {
+        error = "Invalid modulation config '" + std::string(value) + "'";
+        return false;
+    }
+
+    int candidate = static_cast<int>(parsed);
+    if (!is_ofdm_config(candidate) && !is_robust_config(candidate)
+        && !is_low48_anchor_config(candidate))
+    {
+        error = "Unknown modulation config '" + std::string(value) + "'";
+        return false;
+    }
+
+    config = candidate;
+    return true;
+}
+
+int cl_arq_controller::test_modulation_cli_validation()
+{
+    int fails = 0;
+    auto check = [&](const char* value, bool want_ok, int initial, int want_config)
+    {
+        int config = initial;
+        std::string error;
+        bool ok = parse_modulation_cli(value, config, error);
+        bool pass = ok == want_ok && config == want_config
+                 && (want_ok ? error.empty() : !error.empty());
+        if (!pass) fails++;
+        printf("[TEST-MOD-CLI] -s %-6s ok=%d config=%d diagnostic=%d -> %s\n",
+               value, ok ? 1 : 0, config, error.empty() ? 0 : 1,
+               pass ? "PASS" : "FAIL");
+    };
+
+    check("0",     true,  CONFIG_1, CONFIG_0);
+    check("17",    true,  CONFIG_1, CONFIG_17);
+    check("100",   true,  CONFIG_1, ROBUST_0);
+    check("105",   true,  CONFIG_1, LOW48_ANCHOR_S20_R6);
+    check("BPSKZ", false, CONFIG_17, CONFIG_17);
+    check("1junk", false, CONFIG_17, CONFIG_17);
+    check("104",   false, CONFIG_17, CONFIG_17);
+
+    printf("[TEST-MOD-CLI] %s (%d failure(s))\n",
+           fails == 0 ? "PASS" : "FAIL", fails);
+    return fails;
+}
+
 int cl_arq_controller::test_encryption_cli_validation()
 {
     int fails = 0;
@@ -2324,6 +2378,7 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_ssid_bounds();
+                failed += test_arq.test_modulation_cli_validation();
             }
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
@@ -6188,7 +6243,14 @@ int main(int argc, char *argv[])
             break;
         case 's':
             if (optarg)
-                mod_config = atoi(optarg);
+            {
+                std::string error;
+                if (!parse_modulation_cli(optarg, mod_config, error))
+                {
+                    fprintf(stderr, "ERROR: %s\n", error.c_str());
+                    return EXIT_FAILURE;
+                }
+            }
             explicit_config = true;
             break;
         case 'l':
