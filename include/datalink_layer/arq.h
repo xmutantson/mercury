@@ -5795,6 +5795,9 @@ public:
   // TX-path fail-closed regression: force encrypt() to reject an oversized
   // compressed unit and prove no plaintext DATA frames are staged.
   int test_encrypt_failure_tx_fail_closed();
+  // CLI regression: accepted --encrypt spellings parse to the requested mode,
+  // while an unknown spelling is rejected with a diagnostic and no mode change.
+  int test_encryption_cli_validation();
   // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1):
   // negotiated session flag — both ends advertised CAP_CUMULATIVE_ACK (which is itself
   // gated by the env opt-in MERCURY_CUMULATIVE_ACK on the local advertise). When true,

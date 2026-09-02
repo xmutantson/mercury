@@ -2172,6 +2172,49 @@ static int run_mini1_carried_timing_test()
 	return (ordinary_ok && refinement_reached) ? 0 : 1;
 }
 
+static bool parse_encryption_mode_cli(const char* value, int& mode, std::string& error)
+{
+    error.clear();
+    if (strcmp(value, "strict") == 0 || strcmp(value, "1") == 0)
+        mode = ENCRYPT_STRICT;
+    else if (strcmp(value, "fast") == 0 || strcmp(value, "2") == 0)
+        mode = ENCRYPT_FAST;
+    else
+    {
+        error = "Unknown encryption mode '" + std::string(value)
+              + "', use 'strict' or 'fast'";
+        return false;
+    }
+    return true;
+}
+
+int cl_arq_controller::test_encryption_cli_validation()
+{
+    int fails = 0;
+    auto check = [&](const char* value, bool want_ok, int want_mode)
+    {
+        int mode = -1;
+        std::string error;
+        bool ok = parse_encryption_mode_cli(value, mode, error);
+        bool pass = ok == want_ok && mode == want_mode
+                 && (want_ok ? error.empty() : !error.empty());
+        if (!pass) fails++;
+        printf("[TEST-ENC-CLI] --encrypt %-6s ok=%d mode=%d diagnostic=%d -> %s\n",
+               value, ok ? 1 : 0, mode, error.empty() ? 0 : 1,
+               pass ? "PASS" : "FAIL");
+    };
+
+    check("strict", true, ENCRYPT_STRICT);
+    check("1",      true, ENCRYPT_STRICT);
+    check("fast",   true, ENCRYPT_FAST);
+    check("2",      true, ENCRYPT_FAST);
+    check("stric",  false, -1);
+
+    printf("[TEST-ENC-CLI] %s (%d failure(s))\n",
+           fails == 0 ? "PASS" : "FAIL", fails);
+    return fails;
+}
+
 int main(int argc, char *argv[])
 {
     int main_exit_status = EXIT_SUCCESS;
@@ -2250,6 +2293,7 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_enc;
                 failed += test_enc.test_encryption_fail_closed();
+                failed += test_enc.test_encryption_cli_validation();
             }
             // AEAD TX failure FAIL-CLOSED regression: drives the REAL compressed
             // commander fill path with an active cipher and an oversized sealed
@@ -6209,13 +6253,12 @@ int main(int argc, char *argv[])
         case 'E':
             if (optarg)
             {
-                std::string enc_arg(optarg);
-                if (enc_arg == "strict" || enc_arg == "1")
-                    encryption_mode_cli = ENCRYPT_STRICT;
-                else if (enc_arg == "fast" || enc_arg == "2")
-                    encryption_mode_cli = ENCRYPT_FAST;
-                else
-                    printf("Unknown encryption mode '%s', use 'strict' or 'fast'\n", optarg);
+                std::string error;
+                if (!parse_encryption_mode_cli(optarg, encryption_mode_cli, error))
+                {
+                    fprintf(stderr, "ERROR: %s\n", error.c_str());
+                    return EXIT_FAILURE;
+                }
                 printf("Encryption: %s\n", encryption_mode_cli == ENCRYPT_STRICT ? "SNDL-safe (strict)" :
                        encryption_mode_cli == ENCRYPT_FAST ? "classical-first (fast)" : "unknown");
             }
@@ -7286,6 +7329,7 @@ start_modem:
                    "negotiation regression\n");
             fflush(stdout);
             int rc = ARQ.test_encryption_fail_closed();
+            rc += ARQ.test_encryption_cli_validation();
             printf("[FLAG] Encryption fail-closed test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
