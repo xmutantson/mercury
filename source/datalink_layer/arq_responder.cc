@@ -8852,6 +8852,8 @@ int cl_arq_controller::test_inband_seamless()
 {
 	const char* TAG = "[TEST-INBAND-SEAMLESS]";
 	int failed = 0;
+	const int previous_sim_clock_enabled = sim_clock_enabled();
+	sim_clock_set_enabled(1);
 	auto check = [&](bool cond, const char* what, long got, long want) {
 		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
 		else     { printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want); failed++; }
@@ -9010,7 +9012,7 @@ int cl_arq_controller::test_inband_seamless()
 		MUTEX_UNLOCK(&capture_prep_mutex);
 
 		// PRODUCTION STEP 1: pre-frame tag detect over the snapshot (timed for INV-3d-B).
-		auto t0 = std::chrono::steady_clock::now();
+		uint64_t t0 = sim_clock_now_ns();
 		int followed_cfg = cur_cfg;
 		int followed = 0;
 #ifndef INBAND_STAGE3D_FAILBEFORE
@@ -9018,9 +9020,8 @@ int cl_arq_controller::test_inband_seamless()
 			ts_rx->data_container.ready_to_process_passband_delayed_data,
 			signal_period, &followed_cfg);
 #endif
-		auto t1 = std::chrono::steady_clock::now();
-		if(out_detect_ms) *out_detect_ms =
-			std::chrono::duration<double, std::milli>(t1 - t0).count();
+		uint64_t t1 = sim_clock_now_ns();
+		if(out_detect_ms) *out_detect_ms = (double)(t1 - t0) / 1000000.0;
 
 		// PRODUCTION STEP 2: receive_byte over the PRODUCTION MEMBER BUFFER — exactly
 		// what receive() does at arq_common.cc:~9913. A MODULATION-boundary follow
@@ -9139,15 +9140,12 @@ int cl_arq_controller::test_inband_seamless()
 				if((got[i] & 0xFF) != (truth[i] & 0xFF)) { byte_faithful = false; break; }
 		check(byte_faithful, "B3 NO-CHANGE: the frame is byte-faithful (identical to base)",
 			byte_faithful ? 1 : 0, 1);
-		// The absent-tag detect is a single bounded base-correlation pass (NO blocking, NO
-		// reserved slot). It returns on the cheap count-gate reject. Assert it is bounded
-		// (a hard wall-clock cap — far above the real cost — that a BLOCKING wait would
-		// blow through). The RX never sleeps waiting for an absent tag.
-		check(dms < 250.0,
-			"B4 NO-DEAD-TIME: the absent-tag detect is bounded (no wait for an absent tag); ms*1000",
-			(long)(dms * 1000.0), 250000);
-		printf("%s B4-note: no-change pre-frame detect cost = %.3f ms (a single base-correlation "
-			"pass; zero added wait vs base)\n", TAG, dms);
+		// The detector is synchronous and must not consume any channel time waiting for an
+		// absent tag. Measure on the injected sample clock so the battery is independent of
+		// host load; the outer watchdog remains the wall-clock wedge backstop.
+		check(dms == 0.0,
+			"B4 NO-DEAD-TIME: absent-tag detect consumes zero deterministic channel time; us",
+			(long)(dms * 1000.0), 0);
 		fflush(stdout);
 	}
 
@@ -9239,18 +9237,36 @@ int cl_arq_controller::test_inband_seamless()
 		int Nofdm = ts_rx->data_container.Nofdm;
 		int interp = ts_rx->frequency_interpolation_rate;
 		int signal_period = Nofdm * interp * ts_rx->data_container.buffer_Nsymb;
+		bool staged = false;
 		MUTEX_LOCK(&capture_prep_mutex);
-		ts_rx->data_container.ring_write_index = 0;
-		for(int i = 0; i < (int)win.size() && i < signal_period; i++)
-			ts_rx->data_container.passband_delayed_data[i] = win[i];
+		if(signal_period > 0
+		   && win.size() == (size_t)signal_period
+		   && ts_rx->data_container.passband_delayed_data != NULL
+		   && ts_rx->data_container.ready_to_process_passband_delayed_data != NULL)
+		{
+			ts_rx->data_container.ring_write_index = 0;
+			// Poison the production snapshot first: without the copy below, the Stage-4
+			// entry sees silence even though the unrelated live ring contains CONFIG_9.
+			memset(ts_rx->data_container.ready_to_process_passband_delayed_data, 0,
+				(size_t)signal_period * sizeof(double));
+			memcpy(ts_rx->data_container.passband_delayed_data, win.data(),
+				(size_t)signal_period * sizeof(double));
+			memcpy(ts_rx->data_container.ready_to_process_passband_delayed_data, win.data(),
+				(size_t)signal_period * sizeof(double));
+			staged = true;
+		}
 		MUTEX_UNLOCK(&capture_prep_mutex);
 
 		rx->inband_terminal_break_due = false;
-		rx->inband_try_down_ladder_on_decode_fail();
-		check(rx->inband_terminal_break_due == false,
-			"D2 LOST-TAG: BREAK-count == 0 (the down-ladder recovered, no BREAK)",
-			rx->inband_terminal_break_due ? 1 : 0, 0);
-		check(rx->current_configuration == CFG_TO,
+		check(staged,
+			"D2a LOST-TAG fixture stages the CONFIG_9 window in the production snapshot",
+			staged ? 1 : 0, 1);
+		if(staged)
+			rx->inband_try_down_ladder_on_decode_fail();
+		check(staged && rx->inband_terminal_break_due == false,
+			"D2b LOST-TAG: BREAK-count == 0 (the down-ladder recovered, no BREAK)",
+			staged ? (rx->inband_terminal_break_due ? 1 : 0) : -1, 0);
+		check(staged && rx->current_configuration == CFG_TO,
 			"D3 LOST-TAG: the down-ladder resynced to the true config CONFIG_9",
 			rx->current_configuration, CFG_TO);
 		delete rx; delete ts_rx;
@@ -9258,6 +9274,7 @@ int cl_arq_controller::test_inband_seamless()
 #endif
 
 	restore_env();
+	sim_clock_set_enabled(previous_sim_clock_enabled);
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

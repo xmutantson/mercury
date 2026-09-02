@@ -25,10 +25,12 @@
 
 #include "physical_defines.h"
 
+// Invalid pointers, dimensions (including N != K + P), or check-matrix indices
+// are rejected with nIteration_max + 1 before LLRo is modified.
 int decode_GBF(
 		const float LLRi[],
 		int LLRo[],
-		int* C,
+		const int* C,
 		int CWidth,
 		int CWidthMax,
 		int N,

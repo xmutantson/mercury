@@ -675,11 +675,16 @@ public:
   void sack_negotiated_recompute_batch(const char* who);
   void set_call_sign(std::string call_sign);
   int test_ssid_bounds();
+  int test_gbf_decoder_constraints();
   int test_turbo_iterations_sentinel();
   // CLI regression: numeric modulation configs parse exactly, while malformed
   // or unknown values are rejected without changing the selected config.
   int test_modulation_cli_validation();
   int test_tx_level_cli_validation();
+  int test_bandpass_cli_validation();
+  // Audio subsystem spellings map exactly; an unknown token is rejected with
+  // a diagnostic and cannot alter the caller's current selection.
+  int test_audio_subsystem_cli_validation();
 
   int get_nOccupied_messages();
   int get_nFree_messages();

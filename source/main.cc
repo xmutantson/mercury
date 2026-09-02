@@ -2285,6 +2285,79 @@ static bool parse_tx_level_cli(const char* value, double& level, std::string& er
     return true;
 }
 
+static bool parse_bandpass_cli(const char* value, double& low_hz, double& high_hz,
+                               std::string& error)
+{
+    error.clear();
+    const std::string input = value == NULL ? "" : value;
+    const std::string::size_type separator = input.find('-');
+    if (separator == std::string::npos || separator == 0
+        || separator + 1 == input.size()
+        || input.find('-', separator + 1) != std::string::npos)
+    {
+        error = "Invalid bandpass '" + input
+              + "', expected LOW-HIGH in the range 0-24000 Hz";
+        return false;
+    }
+
+    const std::string low_text = input.substr(0, separator);
+    const std::string high_text = input.substr(separator + 1);
+    errno = 0;
+    char* low_end = NULL;
+    const double parsed_low = strtod(low_text.c_str(), &low_end);
+    const bool low_valid = low_end != low_text.c_str() && *low_end == '\0'
+        && errno != ERANGE && std::isfinite(parsed_low);
+
+    errno = 0;
+    char* high_end = NULL;
+    const double parsed_high = strtod(high_text.c_str(), &high_end);
+    const bool high_valid = high_end != high_text.c_str() && *high_end == '\0'
+        && errno != ERANGE && std::isfinite(parsed_high);
+
+    if (!low_valid || !high_valid || parsed_low < 0.0
+        || parsed_low >= parsed_high || parsed_high > 24000.0)
+    {
+        error = "Invalid bandpass '" + input
+              + "', expected 0 <= LOW < HIGH <= 24000 Hz";
+        return false;
+    }
+
+    low_hz = parsed_low;
+    high_hz = parsed_high;
+    return true;
+}
+
+static bool parse_audio_subsystem_cli(const char* value, int& audio_system,
+                                      std::string& error)
+{
+    error.clear();
+    int parsed = -1;
+    if (strcmp(value, "alsa") == 0)
+        parsed = AUDIO_SUBSYSTEM_ALSA;
+    else if (strcmp(value, "pulse") == 0)
+        parsed = AUDIO_SUBSYSTEM_PULSE;
+    else if (strcmp(value, "dsound") == 0)
+        parsed = AUDIO_SUBSYSTEM_DSOUND;
+    else if (strcmp(value, "wasapi") == 0)
+        parsed = AUDIO_SUBSYSTEM_WASAPI;
+    else if (strcmp(value, "oss") == 0)
+        parsed = AUDIO_SUBSYSTEM_OSS;
+    else if (strcmp(value, "coreaudio") == 0)
+        parsed = AUDIO_SUBSYSTEM_COREAUDIO;
+    else if (strcmp(value, "sim") == 0)
+        parsed = AUDIO_SUBSYSTEM_SIM;
+    else
+    {
+        error = "Unknown audio subsystem '" + std::string(value)
+              + "', use 'alsa', 'pulse', 'dsound', 'wasapi', 'oss', "
+                "'coreaudio', or 'sim'";
+        return false;
+    }
+
+    audio_system = parsed;
+    return true;
+}
+
 int cl_arq_controller::test_modulation_cli_validation()
 {
     int fails = 0;
@@ -2314,6 +2387,55 @@ int cl_arq_controller::test_modulation_cli_validation()
     return fails;
 }
 
+int cl_arq_controller::test_gbf_decoder_constraints()
+{
+    const float llr[2] = {1.0f, 1.0f};
+    const int checks[2] = {0, 1};
+    const int iteration_limit = 4;
+    const int untouched = 0x5a5a5a5a;
+    int fails = 0;
+
+    int valid_output[1] = {untouched};
+    const int valid_result = decode_GBF(
+        llr, valid_output, checks, 2, 2, 2, 1, 1, iteration_limit, 0.5f);
+    const bool valid_ok = valid_result == 0 && valid_output[0] == 0;
+    if (!valid_ok) fails++;
+
+    int inconsistent_output[2] = {untouched, untouched};
+    const int inconsistent_result = decode_GBF(
+        llr, inconsistent_output, checks, 2, 2, 2, 2, 1,
+        iteration_limit, 0.5f);
+    const bool inconsistent_ok = inconsistent_result == iteration_limit + 1
+        && inconsistent_output[0] == untouched
+        && inconsistent_output[1] == untouched;
+    if (!inconsistent_ok) fails++;
+
+    int width_output[1] = {untouched};
+    const int width_result = decode_GBF(
+        llr, width_output, checks, 2, 1, 2, 1, 1,
+        iteration_limit, 0.5f);
+    const bool width_ok = width_result == iteration_limit + 1
+        && width_output[0] == untouched;
+    if (!width_ok) fails++;
+
+    const int invalid_checks[2] = {0, 2};
+    int index_output[1] = {untouched};
+    const int index_result = decode_GBF(
+        llr, index_output, invalid_checks, 2, 2, 2, 1, 1,
+        iteration_limit, 0.5f);
+    const bool index_ok = index_result == iteration_limit + 1
+        && index_output[0] == untouched;
+    if (!index_ok) fails++;
+
+    printf("[TEST-GBF-CONSTRAINTS] valid=%s inconsistent-NKP=%s width=%s index=%s -> %s\n",
+           valid_ok ? "PASS" : "FAIL",
+           inconsistent_ok ? "PASS" : "FAIL",
+           width_ok ? "PASS" : "FAIL",
+           index_ok ? "PASS" : "FAIL",
+           fails == 0 ? "PASS" : "FAIL");
+    return fails;
+}
+
 int cl_arq_controller::test_tx_level_cli_validation()
 {
     int fails = 0;
@@ -2339,6 +2461,81 @@ int cl_arq_controller::test_tx_level_cli_validation()
     check("0.5x", false, 0.25, 0.25);
 
     printf("[TEST-TX-LEVEL-CLI] %s (%d failure(s))\n",
+           fails == 0 ? "PASS" : "FAIL", fails);
+    return fails;
+}
+
+int cl_arq_controller::test_bandpass_cli_validation()
+{
+    int fails = 0;
+    auto check = [&](char* value, bool want_ok, double want_low, double want_high)
+    {
+        const std::string original(value);
+        double low = 123.0;
+        double high = 456.0;
+        std::string error;
+        const bool ok = parse_bandpass_cli(value, low, high, error);
+        const bool unchanged = original == value;
+        const bool pass = ok == want_ok && unchanged
+            && low == (want_ok ? want_low : 123.0)
+            && high == (want_ok ? want_high : 456.0)
+            && (want_ok ? error.empty() : !error.empty());
+        if (!pass) fails++;
+        printf("[TEST-BANDPASS-CLI] --bandpass %-18s ok=%d low=%.1f high=%.1f "
+               "argv-unchanged=%d diagnostic=%d -> %s\n",
+               value, ok ? 1 : 0, low, high, unchanged ? 1 : 0,
+               error.empty() ? 0 : 1, pass ? "PASS" : "FAIL");
+    };
+
+    char valid[] = "300-3000";
+    char boundaries[] = "0-24000";
+    char invalid_format[] = "invalid-format";
+    char missing_high[] = "300-";
+    char trailing_junk[] = "300-3000Hz";
+    char reversed[] = "3000-300";
+    char out_of_range[] = "300-24001";
+    char non_finite[] = "300-inf";
+    check(valid, true, 300.0, 3000.0);
+    check(boundaries, true, 0.0, 24000.0);
+    check(invalid_format, false, 0.0, 0.0);
+    check(missing_high, false, 0.0, 0.0);
+    check(trailing_junk, false, 0.0, 0.0);
+    check(reversed, false, 0.0, 0.0);
+    check(out_of_range, false, 0.0, 0.0);
+    check(non_finite, false, 0.0, 0.0);
+
+    printf("[TEST-BANDPASS-CLI] %s (%d failure(s))\n",
+           fails == 0 ? "PASS" : "FAIL", fails);
+    return fails;
+}
+
+int cl_arq_controller::test_audio_subsystem_cli_validation()
+{
+    int fails = 0;
+    auto check = [&](const char* value, bool want_ok, int initial, int want_system)
+    {
+        int audio_system = initial;
+        std::string error;
+        bool ok = parse_audio_subsystem_cli(value, audio_system, error);
+        bool pass = ok == want_ok && audio_system == want_system
+                 && (want_ok ? error.empty() : !error.empty());
+        if (!pass) fails++;
+        printf("[TEST-AUDIO-SUBSYSTEM-CLI] -x %-10s ok=%d system=%d diagnostic=%d -> %s\n",
+               value, ok ? 1 : 0, audio_system, error.empty() ? 0 : 1,
+               pass ? "PASS" : "FAIL");
+    };
+
+    check("alsa",      true,  -1, AUDIO_SUBSYSTEM_ALSA);
+    check("pulse",     true,  -1, AUDIO_SUBSYSTEM_PULSE);
+    check("dsound",    true,  -1, AUDIO_SUBSYSTEM_DSOUND);
+    check("wasapi",    true,  -1, AUDIO_SUBSYSTEM_WASAPI);
+    check("oss",       true,  -1, AUDIO_SUBSYSTEM_OSS);
+    check("coreaudio", true,  -1, AUDIO_SUBSYSTEM_COREAUDIO);
+    check("sim",       true,  -1, AUDIO_SUBSYSTEM_SIM);
+    check("foo",       false, -1, -1);
+    check("foo",       false, AUDIO_SUBSYSTEM_PULSE, AUDIO_SUBSYSTEM_PULSE);
+
+    printf("[TEST-AUDIO-SUBSYSTEM-CLI] %s (%d failure(s))\n",
            fails == 0 ? "PASS" : "FAIL", fails);
     return fails;
 }
@@ -2464,8 +2661,11 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_ssid_bounds();
+                failed += test_arq.test_gbf_decoder_constraints();
                 failed += test_arq.test_modulation_cli_validation();
                 failed += test_arq.test_tx_level_cli_validation();
+                failed += test_arq.test_bandpass_cli_validation();
+                failed += test_arq.test_audio_subsystem_cli_validation();
             }
             {
                 cl_arq_controller test_hail;
@@ -2540,6 +2740,13 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_downladder();
+            }
+            // PRE-FRAME seamless + lost-tag fallback regression. PART D poisons and then
+            // explicitly stages the production snapshot before driving the real Stage-4
+            // entry, preventing a live-ring/staged-buffer mixed-state fixture.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_inband_seamless();
             }
             // Reseat span integrity: the prev-batch cross-storage index-skew 332-byte
             // deletion. Drives the PRODUCTION store -> seal -> copy_data_to_buffer and
@@ -4284,6 +4491,8 @@ int main(int argc, char *argv[])
     int robust_mode = 0;  // 0=disabled, 1=enabled via -R flag
     int narrowband_mode = -1;  // -1=use INI, 0=force wideband (-W), 1=force narrowband (-N)
     int bandwidth_mode_cli = -1;  // -1=use INI, 0=BW_AUTO, 1=BW_NB_ONLY
+    double bandpass_low_cli = -1.0;  // --bandpass LOW-HIGH; negative means unset
+    double bandpass_high_cli = -1.0;
     int force_compress_cli = -1;  // -1=use INI, 0=off, 1=on
     int encryption_mode_cli = -1; // -1=use INI, ENCRYPT_OFF/ENCRYPT_STRICT/ENCRYPT_FAST
     char psk_hex_cli[129] = {0};  // Pre-shared key from -K flag (hex string)
@@ -4698,6 +4907,7 @@ int main(int argc, char *argv[])
         printf("  -o [device]       Audio playback device\n");
         printf("  -x [api]          Sound system: alsa, pulse, dsound, wasapi, sim (default: alsa/wasapi)\n");
         printf("                    sim = device-free software channel (ARQ loopback via tools/sim/sim_channel_relay.py)\n");
+        printf("                    MERCURY_STRICT_AUDIO_SUBSYSTEM=1 rejects unknown -x values\n");
         printf("  -A [channel]      Audio channel index override (enables multichannel mode)\n");
         printf("  --rx-channel [0|1|2]  RX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 0)\n");
         printf("  --tx-channel [0|1|2]  TX audio channel: 0=LEFT, 1=RIGHT, 2=STEREO (default: 2)\n");
@@ -4716,6 +4926,7 @@ int main(int argc, char *argv[])
         printf("  -g                Enable adaptive gearshift\n");
         printf("  -R                Enable ROBUST mode (MFSK weak-signal hailing)\n");
         printf("  -M [auto|nb]      Bandwidth: auto (NB hail + WB upgrade) or nb (500 Hz only)\n");
+        printf("  --bandpass [LOW-HIGH]  Audio passband in Hz (0 <= LOW < HIGH <= 24000)\n");
         printf("  -N                Force narrowband mode (500 Hz, 10 subcarriers)\n");
         printf("  -W                Force wideband mode (2344 Hz, 50 subcarriers)\n");
         printf("  -I [5-50]         LDPC decoder max iterations (default: 50)\n");
@@ -4787,6 +4998,25 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             tx_level_linear = tx_level;
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        }
+        else if (strcmp(argv[i], "--bandpass") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "ERROR: --bandpass requires LOW-HIGH in the range 0-24000 Hz\n");
+                return EXIT_FAILURE;
+            }
+            std::string error;
+            if (!parse_bandpass_cli(argv[i + 1], bandpass_low_cli,
+                                    bandpass_high_cli, error))
+            {
+                fprintf(stderr, "ERROR: %s\n", error.c_str());
+                return EXIT_FAILURE;
+            }
             for (int j = i; j < argc - 2; j++)
                 argv[j] = argv[j + 2];
             argc -= 2;
@@ -6359,20 +6589,20 @@ int main(int argc, char *argv[])
                 operation_mode = SIM_INPROC;
             break;
         case 'x':
-            if (!strcmp(optarg, "alsa"))
-                audio_system = AUDIO_SUBSYSTEM_ALSA;
-            if (!strcmp(optarg, "pulse"))
-                audio_system = AUDIO_SUBSYSTEM_PULSE;
-            if (!strcmp(optarg, "dsound"))
-                audio_system = AUDIO_SUBSYSTEM_DSOUND;
-            if (!strcmp(optarg, "wasapi"))
-                audio_system = AUDIO_SUBSYSTEM_WASAPI;
-            if (!strcmp(optarg, "oss"))
-                audio_system = AUDIO_SUBSYSTEM_OSS;
-            if (!strcmp(optarg, "coreaudio"))
-                audio_system = AUDIO_SUBSYSTEM_COREAUDIO;
-            if (!strcmp(optarg, "sim"))
-                audio_system = AUDIO_SUBSYSTEM_SIM;
+            {
+                std::string error;
+                if (!parse_audio_subsystem_cli(optarg, audio_system, error))
+                {
+                    // Startup behavior changes are opt-in: without this flag,
+                    // retain the legacy platform-default fallback.
+                    const char* strict = std::getenv("MERCURY_STRICT_AUDIO_SUBSYSTEM");
+                    if (strict != NULL && strict[0] != '\0' && atoi(strict) != 0)
+                    {
+                        fprintf(stderr, "ERROR: %s\n", error.c_str());
+                        return EXIT_FAILURE;
+                    }
+                }
+            }
             break;
         case 'g':
             gear_shift_mode = GEAR_SHIFT_ENABLED;
@@ -6553,6 +6783,16 @@ int main(int argc, char *argv[])
     }
 
 start_modem:
+
+    if (bandpass_low_cli >= 0.0)
+    {
+        // The stock waveform is centered at 1500 Hz. Shift that center to the
+        // middle of the explicitly selected radio audio passband.
+        carrier_frequency_offset = (bandpass_low_cli + bandpass_high_cli) / 2.0 - 1500.0;
+        printf("Audio bandpass: %.2f-%.2f Hz (center %.2f Hz)\n",
+               bandpass_low_cli, bandpass_high_cli,
+               carrier_frequency_offset + 1500.0);
+    }
 
 #ifndef MERCURY_GUI_ENABLED
     nogui = true;  // Force headless if GUI not compiled in

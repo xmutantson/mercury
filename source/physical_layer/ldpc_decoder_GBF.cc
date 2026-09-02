@@ -21,11 +21,13 @@
  */
 
 #include "physical_layer/ldpc_decoder_GBF.h"
+#include <climits>
+#include <cmath>
 
 int decode_GBF(
 		const float LLRi[],
 		int LLRo[],
-		int* C,
+		const int* C,
 		int CWidth,
 		int CWidthMax,
 		int N,
@@ -35,6 +37,28 @@ int decode_GBF(
 		float eta
 )
 {
+	const int failure = (nIteration_max >= 0 && nIteration_max < INT_MAX)
+		? nIteration_max + 1 : INT_MAX;
+	if(LLRi == NULL || LLRo == NULL || C == NULL
+		|| N <= 0 || N > N_MAX || K <= 0 || K > N
+		|| P <= 0 || P > N || K != N - P
+		|| CWidth <= 0 || CWidthMax <= 0
+		|| CWidth > CWidthMax || CWidthMax > C_WIDTH_MAX
+		|| nIteration_max < 0 || !std::isfinite(eta) || eta <= 0.0f)
+	{
+		return failure;
+	}
+	for(int row = 0; row < P; row++)
+	{
+		for(int column = 0; column < CWidth; column++)
+		{
+			const int variable = C[row * CWidthMax + column];
+			if(variable < -1 || variable >= N || (column == 0 && variable == -1))
+			{
+				return failure;
+			}
+		}
+	}
 
 	int Cout[N_MAX];
 	int LLRbin[N_MAX];
@@ -118,5 +142,4 @@ int decode_GBF(
 /* F. Jerji and C. Akamine, "Gradient Bit-Flipping LDPC Decoder for ATSC 3.0," 2019 IEEE International Symposium on Broadband Multimedia Systems and Broadcasting (BMSB), 2019, pp. 1-4, doi: 10.1109/BMSB47279.2019.8971839.
  * https://ieeexplore.ieee.org/document/8971839
  */
-
 
