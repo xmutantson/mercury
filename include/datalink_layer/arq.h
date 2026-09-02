@@ -172,8 +172,8 @@ inline int callsign_get_ssid(const std::string& callsign)
 		if(c == 'X' || c == 'x') return 19;
 		return SSID_NONE;
 	}
-	else if(ssid_str.size() == 2 && ssid_str[0] >= '0' && ssid_str[0] <= '1'
-	        && ssid_str[1] >= '0' && ssid_str[1] <= '9')
+	else if(ssid_str.size() == 2 && ssid_str[0] == '1'
+	        && ssid_str[1] >= '0' && ssid_str[1] <= '5')
 	{
 		return (ssid_str[0] - '0') * 10 + (ssid_str[1] - '0');
 	}
@@ -666,6 +666,7 @@ public:
   // See data-flow-batch-size.md §5. `who` is "CMD"/"RSP" for the log line only.
   void sack_negotiated_recompute_batch(const char* who);
   void set_call_sign(std::string call_sign);
+  int test_ssid_bounds();
 
   int get_nOccupied_messages();
   int get_nFree_messages();

@@ -2940,6 +2940,18 @@ void cl_arq_controller::set_call_sign(std::string call_sign)
 	}
 }
 
+int cl_arq_controller::test_ssid_bounds()
+{
+	// Numeric AX.25 SSIDs stop at 15. The letter aliases remain distinct
+	// protocol extensions and must continue to map to their reserved values.
+	const bool pass = callsign_get_ssid("N0CALL-0") == 0
+		&& callsign_get_ssid("N0CALL-15") == 15
+		&& callsign_get_ssid("N0CALL-16") == SSID_NONE
+		&& callsign_get_ssid("N0CALL-L") == 16;
+	printf("[TEST-SSID-BOUNDS] %s\n", pass ? "PASS" : "FAIL");
+	return pass ? 0 : 1;
+}
+
 int cl_arq_controller::get_nOccupied_messages()
 {
 	int nOccupied_messages=0;

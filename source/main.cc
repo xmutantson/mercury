@@ -2225,6 +2225,10 @@ int main(int argc, char *argv[])
             int failed = run_mfsk_ctrl_codec_tests();
             if (getenv("MERCURY_CAP_CODEC_ONLY") != NULL)
                 return failed == 0 ? 0 : 1;
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_ssid_bounds();
+            }
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
             failed += run_sim_clock_tests();
