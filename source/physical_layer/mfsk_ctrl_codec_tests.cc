@@ -9938,6 +9938,60 @@ int run_pilot_thin_nv_tests()
 	set_pilot_nv_test_env("MERCURY_PILOT_DY", nullptr);
 	set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", nullptr);
 
+	// --- cfg16 single-pilot column hold: fail-before / pass-after (production decode) ---
+	// The baked cfg16 grid (Dy=5, Nsymb=8) leaves ~40% of carrier columns with a lone
+	// time-pilot. interpolate_linear_col needs >=2 anchors and returns early on those,
+	// leaving the column at H=0; smooth_channel_estimate_dft() then averages each
+	// symbol's H(k) across the zeros, biasing mean|H| low (measured ~0.87 on a CLEAN
+	// 28 dB channel) and inflating the pilot-residual noise variance ~44x, so LS iter-caps and the
+	// frame is only recovered by the time-interpolation retry (a per-frame double
+	// decode -> the steady-state CPU tax that fails under load). Holding the lone pilot
+	// across its column (ls_hold_single_pilot) completes the grid before smoothing, so
+	// LS decodes on the FIRST pass. Both arms run the SAME binary through the real
+	// TX -> AWGN -> RX decode (passband_test_EsN0); the fix is a member toggle, no
+	// env/rebuild. A clean 28 dB Es/N0 frame matches the load-invariance test channel.
+	{
+		cl_telecom_system tsh;
+		tsh.operation_mode = BER_PLOT_passband;
+		tsh.load_configuration(CONFIG_16);
+
+		// FAIL-BEFORE: current behaviour (single-pilot columns dropped to zero). The
+		// LS primary decode fails CRC and the DEFAULT-ON time-interpolation rescue
+		// fires (retry=1) -- the per-frame double decode. Note receive_stats.mean_H is
+		// the LAST estimator pass, so on a rescued frame it reads the TINTERP value
+		// (~1.0), NOT the failing LS value (~0.87 -- witnessed in the CLI reproduction
+		// logs); the RETRY FLAG is therefore the unconfounded before-witness that the
+		// double decode exists. (The rescue is a process-cached static, so it cannot be
+		// disabled per-arm inside the --test battery.)
+		tsh.ofdm.ls_hold_single_pilot = false;
+		tsh.receive_stats.tinterp_rescue_attempted = false;
+		tsh.passband_test_EsN0(28.0f, 4);
+		bool retry_off = tsh.receive_stats.tinterp_rescue_attempted;
+
+		// PASS-AFTER: hold the lone pilot across its column before smoothing. LS now
+		// decodes on the FIRST pass, so NO rescue fires (retry=0), mean|H| is restored
+		// to ~1.0, and every frame is clean (errframes=0). This is OFDM-FAIL->0 for
+		// cfg16 through the production decode path.
+		tsh.ofdm.ls_hold_single_pilot = true;
+		tsh.receive_stats.tinterp_rescue_attempted = false;
+		cl_error_rate on = tsh.passband_test_EsN0(28.0f, 4);
+		double meanH_on = tsh.receive_stats.mean_H;
+		bool   retry_on = tsh.receive_stats.tinterp_rescue_attempted;
+
+		bool before_ok = retry_off;                          // LS-primary failed -> double decode
+		bool after_ok  = !retry_on                           // LS decoded first pass, no rescue
+			&& on.Error_frames_total == 0.0                  // every frame clean
+			&& meanH_on > 0.95;                              // estimate restored to ~1.0
+		printf("  [%s] cfg16 single-pilot-hold FAIL-BEFORE retry=%d "
+			"(expect retry=1: LS fails -> time-interp rescue = double decode)\n",
+			before_ok ? "OK" : "FAIL", retry_off ? 1 : 0);
+		printf("  [%s] cfg16 single-pilot-hold PASS-AFTER  meanH=%.3f retry=%d errframes=%.0f "
+			"(expect meanH~1.0, retry=0, errframes=0: first-pass LS)\n",
+			after_ok ? "OK" : "FAIL", meanH_on, retry_on ? 1 : 0, on.Error_frames_total);
+		if(!before_ok) failures++;
+		if(!after_ok)  failures++;
+	}
+
 	for (int i = 0; i < key_count; ++i)
 		set_pilot_nv_test_env(saved[i].key,
 			saved[i].present ? saved[i].value.c_str() : nullptr);

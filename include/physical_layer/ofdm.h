@@ -407,6 +407,25 @@ public:
 	// Default false = the fix (restored pilot residual). --ls-crosspilot-nv=on.
 	bool ls_use_crosspilot_nv;
 
+	// Thinned-lattice single-pilot column hold (fix/cfg16-single-pilot-hold). On an
+	// irregular/thinned diagonal pilot grid a carrier column can contain exactly ONE
+	// time-pilot within the frame (cfg16 Dy=5/Nsymb=8 leaves ~40% of columns with a
+	// lone pilot; the diagonal offsets that fall in [Nsymb-Dy, Dy) never get a second
+	// anchor). interpolate_linear_col needs >=2 anchors and returns early on such a
+	// column, leaving its non-pilot cells at the H=0 the estimator initialised. The
+	// DFT frequency smoother then averages each symbol's H(k) across those zeros,
+	// biasing every carrier's |H| low (measured mean|H|~0.87 on a clean 28 dB channel,
+	// vs 1.0 with the hold) and inflating the pilot-residual noise variance ~44x (0.12
+	// vs the 0.003 thermal floor) -> the LDPC decoder iter-caps and the frame is
+	// only recovered by the time-interpolation retry (a per-frame double decode). When
+	// true, HOLD the lone pilot's value across its whole column before smoothing (the
+	// maximum-likelihood estimate of a slowly-varying channel from a single sample),
+	// so the grid is complete and LS decodes on the first pass. Inert on every dense
+	// grid (all shipped configs except cfg16/cfg17 have >=2 pilots per column, so no
+	// column is ever held). Default FALSE (byte-identical) pending the load A/B; env
+	// MERCURY_LS_HOLD_SINGLE_PILOT sets it at construction, tests set it directly.
+	bool ls_hold_single_pilot;
+
 	// feat/fade-tinterp: optional pilot pre-smooth half-window for the TIME_INTERP
 	// estimator (the "tinterp_s" candidate; the 900-cell sweep showed the pre-smooth
 	// adds nothing on MPG/MPM/MPP, so default 0). Set >0 to MA-smooth the per-carrier

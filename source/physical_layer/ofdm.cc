@@ -170,6 +170,10 @@ cl_ofdm::cl_ofdm()
 	noise_variance_estimate=0.01; // Safe default (SNR ~20dB)
 	ls_nv_debug_enabled=false; // fix/cfg16-nv-restore: opt-in [LS-NV-DBG] logging
 	ls_use_crosspilot_nv=false; // fix/cfg16-nv-restore: default = the fix (residual nv)
+	// fix/cfg16-single-pilot-hold: default OFF (byte-identical). cl_ofdm is constructed
+	// once per telecom_system and never rebuilt on config switch, so this env read at
+	// construction reaches every decode; tests override the member directly.
+	{ const char* _e=std::getenv("MERCURY_LS_HOLD_SINGLE_PILOT"); ls_hold_single_pilot=(_e && *_e && atoi(_e)!=0); }
 	tinterp_smooth_halfwin=0; // feat/fade-tinterp: TIME_INTERP pilot pre-smooth off by default
 	dd_data_conf_thresh=0.30; // Turbo-EQ: data-aided improve-only confidence threshold (read only inside the turbo loop)
 	dd_seed_floor=false; // Turbo-EQ TINTERP-seed: false = pilots-only floor (byte-identical default); true = keep the it=0 (TINTERP) H as the low-confidence floor
@@ -2377,6 +2381,38 @@ void cl_ofdm::LS_channel_estimator(std::complex <double>*in)
 		}
 	}
 	}   // end if(!notch_filled) -- stock interpolation branch
+
+	// Thinned-lattice single-pilot column hold (fix/cfg16-single-pilot-hold). See
+	// ofdm.h ls_hold_single_pilot. On the stock diagonal lattice a carrier column can
+	// hold exactly ONE time-pilot (cfg16 Dy=5/Nsymb=8); interpolate_linear_col needs
+	// >=2 anchors and returned early, leaving that column at the H=0 init above. Run
+	// BEFORE smooth_channel_estimate_dft() so the smoother does not spread those zeros
+	// into the genuine pilot estimates (measured: mean|H| 0.87->1.0, pilot-residual nv
+	// 0.12->0.003 on a clean 28 dB cfg16 frame). Each held column is filled with its lone pilot
+	// value (INTERPOLATED status), the ML estimate of a slow channel from one sample.
+	// Skipped on the sparse-wide (cfg105) grid, which fills every column itself, and on
+	// the notch path, which writes an analytic full-grid H. Inert wherever every column
+	// already has >=2 pilots (all shipped configs except cfg16/cfg17), so no dense grid
+	// changes. Default OFF (byte-identical) until the load A/B.
+	if(ls_hold_single_pilot && !notch_filled && pilot_configurator.sparse_wide_data_carriers == 0)
+	{
+		for(int j=0;j<Nc;j++)
+		{
+			int measured_rows=0, pilot_row=-1;
+			for(int i=0;i<Nsymb;i++)
+				if((estimated_channel+i*Nc+j)->status==MEASURED){ measured_rows++; pilot_row=i; }
+			if(measured_rows==1)
+			{
+				std::complex<double> hv=(estimated_channel+pilot_row*Nc+j)->value;
+				for(int i=0;i<Nsymb;i++)
+					if(i!=pilot_row)
+					{
+						(estimated_channel+i*Nc+j)->value=hv;
+						(estimated_channel+i*Nc+j)->status=INTERPOLATED;
+					}
+			}
+		}
+	}
 
 	// DFT-based channel estimate smoothing (same as ZF estimator). For the LS
 	// path this runs BEFORE the noise-variance estimate (restored pre-E1 order,
