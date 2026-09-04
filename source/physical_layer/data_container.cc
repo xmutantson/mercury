@@ -463,6 +463,18 @@ void cl_data_container::deinit()
 	CDELETE(this->passband_data_tx_filtered_fir_2);
 	CDELETE(this->ready_to_transmit_passband_data_tx);
 
+	// The pinned state describes the allocations freed above.  Leaving it set makes a
+	// later set_size() take the no-allocation path and publish freed/null buffers.
+	this->precook_ring_pinned=false;
+	this->pinned_capacity_buffer_Nsymb=0;
+	this->pinned_capacity_samples=0;
+	this->pinned_capacity_Nc=0;
+	this->pinned_capacity_nsymb_nc=0;
+	this->pinned_capacity_nData=0;
+	this->pinned_capacity_total_frame_size=0;
+	this->pinned_capacity_preamble=0;
+	this->pinned_capacity_fine_slice=0;
+
 	this->frames_to_read=0;
 	this->data_ready=0;
 	this->nUnder_processing_events=0;

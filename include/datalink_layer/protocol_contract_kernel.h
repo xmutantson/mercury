@@ -1,9 +1,9 @@
 /*
  * Mercury: additive protocol identity and event vocabulary.
  *
- * This header deliberately has no integration with the live controller yet.
- * It gives later contract migrations strong names without changing a wire
- * field, timer, state transition, or production decision in Phase 0.
+ * Most vocabulary remains additive. The config-transition observer has a
+ * default-off live integration; no wire field or timer behavior changes while
+ * that migration flag is disabled.
  */
 #ifndef INC_PROTOCOL_CONTRACT_KERNEL_H_
 #define INC_PROTOCOL_CONTRACT_KERNEL_H_
@@ -44,6 +44,45 @@ public:
     constexpr std::uint32_t value() const { return value_; }
 private:
     std::uint32_t value_;
+};
+
+/*
+ * Default-off live config-transition observer.  The link-phase primitive
+ * stores its config generation in the high 24 bits of a uint32_t epoch, so a
+ * generation outside that range cannot be represented without aliasing an
+ * older geometry.  A rejected observation permanently invalidates this
+ * contract instance; its caller must stop the transition and clear any
+ * timeline evidence derived from it.
+ */
+class LinkPhaseConfigContract {
+public:
+    LinkPhaseConfigContract()
+        : valid_(true), last_observed_ns_(0), has_observation_(false) {}
+
+    bool observe_transition(ConfigEpoch next, std::uint64_t observed_ns) {
+        static constexpr std::uint32_t kMaxPackedConfigEpoch = 0x00ffffffu;
+        const bool accepted = valid_ && next.valid()
+            && next.value() <= kMaxPackedConfigEpoch
+            && (!last_config_.valid()
+                || next.value() == last_config_.value() + 1u)
+            && (!has_observation_ || observed_ns >= last_observed_ns_);
+        if(!accepted) {
+            valid_ = false;
+            return false;
+        }
+        last_config_ = next;
+        last_observed_ns_ = observed_ns;
+        has_observation_ = true;
+        return true;
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    ConfigEpoch last_config_;
+    bool valid_;
+    std::uint64_t last_observed_ns_;
+    bool has_observation_;
 };
 
 /*

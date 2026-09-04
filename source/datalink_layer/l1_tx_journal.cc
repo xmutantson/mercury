@@ -157,7 +157,7 @@ bool L1TxJournal::stage(uint8_t transmitted_bsi, uint16_t slot,
 
 bool L1TxJournal::stage_batch(uint8_t transmitted_bsi,
                              const std::vector<L1StageItem>& items) {
-  if (!enabled_) return true;
+  if (!enabled_) return false;
   if (items.empty() || items.size() > kBatchSlotCap) return false;
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (items[i].plaintext.empty()) return false;
@@ -236,7 +236,7 @@ void L1TxJournal::mark_sent(uint8_t bsi, uint16_t slot) {
 
 bool L1TxJournal::mark_sent_many(
     const std::vector<std::pair<uint8_t, uint16_t>>& keys) {
-  if (!enabled_) return true;
+  if (!enabled_) return false;
   for (const auto& key : keys) if (!find_current(key.first, key.second)) return false;
   for (const auto& key : keys) find_current(key.first, key.second)->state = L1JournalState::SENT;
   return true;

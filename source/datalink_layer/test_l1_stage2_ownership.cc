@@ -7,6 +7,70 @@
 #include <unistd.h>
 #include <vector>
 
+int cl_arq_controller::test_l1_tx_journal_disabled_fail_closed() {
+  struct EnvRestore {
+    const char* key;
+    bool had;
+    std::string value;
+    ~EnvRestore() {
+      if(had) setenv(key, value.c_str(), 1);
+      else unsetenv(key);
+    }
+  };
+  const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
+  const char* previous_blockack = std::getenv("MERCURY_L1_BLOCKACK");
+  EnvRestore restore_journal = {"MERCURY_L1_JOURNAL",
+                                previous_journal != nullptr,
+                                previous_journal ? std::string(previous_journal) : std::string()};
+  EnvRestore restore_blockack = {"MERCURY_L1_BLOCKACK",
+                                 previous_blockack != nullptr,
+                                 previous_blockack ? std::string(previous_blockack) : std::string()};
+  setenv("MERCURY_L1_JOURNAL", "0", 1);
+  setenv("MERCURY_L1_BLOCKACK", "0", 1);
+
+  mercury::L1TxJournal journal;
+  mercury::L1StageItem item;
+  item.slot = 0;
+  item.batch_index = 0;
+  item.span = 1;
+  item.plaintext = {'x'};
+
+  const bool passed = !journal.enabled() && !journal.stage_batch(1, {item}) &&
+                      journal.size() == 0;
+  std::printf("[TEST-L1-JOURNAL-DISABLED] %s\n", passed ? "PASS" : "FAIL");
+  return passed ? 0 : 1;
+}
+
+int cl_arq_controller::test_l1_journal_disabled_mark_sent_many() {
+  struct EnvRestore {
+    const char* key;
+    bool had;
+    std::string value;
+    ~EnvRestore() {
+      if(had) setenv(key, value.c_str(), 1);
+      else unsetenv(key);
+    }
+  };
+  const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
+  const char* previous_blockack = std::getenv("MERCURY_L1_BLOCKACK");
+  EnvRestore restore_journal = {
+      "MERCURY_L1_JOURNAL", previous_journal != nullptr,
+      previous_journal ? std::string(previous_journal) : std::string()};
+  EnvRestore restore_blockack = {
+      "MERCURY_L1_BLOCKACK", previous_blockack != nullptr,
+      previous_blockack ? std::string(previous_blockack) : std::string()};
+
+  setenv("MERCURY_L1_JOURNAL", "0", 1);
+  setenv("MERCURY_L1_BLOCKACK", "0", 1);
+  mercury::L1TxJournal journal;
+  const bool passed = !journal.enabled() &&
+                      !journal.mark_sent_many({{17, 3}}) &&
+                      journal.size() == 0;
+  std::printf("[TEST-L1-JOURNAL-DISABLED] %s mark_sent_many fails closed\n",
+              passed ? "PASS" : "FAIL");
+  return passed ? 0 : 1;
+}
+
 int cl_arq_controller::l1_test_timeout_case(const char* marker,
                                              int* awaiting_after,
                                              int* queued_after,

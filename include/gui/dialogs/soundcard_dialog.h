@@ -67,6 +67,7 @@ public:
 private:
     bool acceptAndRestart(const std::string& config_path);
 
+    friend int soundcard_dialog_restart_fail_closed_selftest();
     friend int soundcard_dialog_audio_init_fail_closed_selftest();
 
     bool is_open_;
@@ -92,6 +93,7 @@ SoundCardDialog& get_soundcard_dialog();
 bool restartMercury(const std::string& config_path);
 
 // Directed regression used by the modem's --test battery.
+int soundcard_dialog_restart_fail_closed_selftest();
 int soundcard_dialog_audio_init_fail_closed_selftest();
 #ifdef _WIN32
 // Launch the replacement process and request shutdown only after Windows has

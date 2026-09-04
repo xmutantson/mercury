@@ -6470,6 +6470,70 @@ static void test_connect_preamble_combining_cliff_sweep() {
 // when off: R=1 framed layout == the pre-change single block. Always-on
 // (mercury.exe --test) — on the pre-change binary combine_reps is ignored, the
 // straddle persists at R=4, P stays low, and assert (2) FAILS.
+int cl_arq_controller::test_recovery_ack_tail_capacity() {
+	const char* name = "TEST-RECOVERY-ACK-TAIL-CAPACITY";
+
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	const int base_total = ts.set_recovery_ack_reps(4);
+
+	cl_data_container& dc = ts.data_container;
+	const int sym_samples = dc.Nofdm * dc.interpolation_rate;
+	const int signal_period = sym_samples * dc.buffer_Nsymb.load();
+	const int ack_samples = ts.ack_pattern_passband_samples;
+	const int trailing_samples = 4 * sym_samples;
+	if (base_total != 4 * ts.ack_mfsk.ack_pattern_nsymb ||
+	    sym_samples <= 0 || signal_period <= 0 || ack_samples <= 0 ||
+	    ack_samples != base_total * sym_samples ||
+	    ack_samples + trailing_samples > signal_period ||
+	    dc.passband_delayed_data == nullptr ||
+	    dc.ready_to_process_passband_delayed_data == nullptr) {
+		printf("[%s] FAIL: invalid ROBUST_0 capture geometry\n", name);
+		return 1;
+	}
+
+	std::vector<double> ack((size_t)ack_samples, 0.0);
+	const int written = ts.generate_ack_pattern_passband(ack.data());
+	if (written != ack_samples) {
+		printf("[%s] FAIL: generated %d samples, expected %d\n",
+			name, written, ack_samples);
+		return 1;
+	}
+
+	// End the ACK four symbols before the newest ring edge. The production tail
+	// must retain all R*16 symbols plus this ordinary arrival-position margin.
+	// A too-short tail (for example ack_base_total/2) snapshots only the final
+	// repetitions, and the real detector fails closed because combine_reps=4
+	// requires the complete 64-symbol span.
+	memset(dc.passband_delayed_data, 0,
+		(size_t)2 * signal_period * sizeof(double));
+	const int ack_offset = signal_period - trailing_samples - ack_samples;
+	memcpy(&dc.passband_delayed_data[ack_offset], ack.data(),
+		(size_t)ack_samples * sizeof(double));
+	memcpy(&dc.passband_delayed_data[signal_period + ack_offset], ack.data(),
+		(size_t)ack_samples * sizeof(double));
+	dc.ring_write_index = 0;
+	dc.frames_to_read = 0;
+
+	cl_telecom_system* saved_telecom = telecom_system;
+	const bool saved_turbo = turbo_snr_ack_enabled;
+	const int saved_status = connection_status;
+	telecom_system = &ts;
+	turbo_snr_ack_enabled = false;
+	connection_status = IDLE; // keep optional recovery re-phase/fine paths out of this sizing test
+	const bool detected = receive_ack_pattern(/*defer_audio_advance=*/true,
+		/*multiwindow_scan=*/false, /*causal_ring_samples=*/-1);
+	connection_status = saved_status;
+	turbo_snr_ack_enabled = saved_turbo;
+	telecom_system = saved_telecom;
+
+	printf("[%s] R=4 span=%d sym, production receive result=%d -> %s\n",
+		name, base_total, detected ? 1 : 0,
+		detected ? "PASS" : "FAIL (capture tail truncated the detector span)");
+	return detected ? 0 : 1;
+}
+
 static void test_recovery_ack_robust_marginal() {
 	const char* name = "recovery_ack_robust_marginal";
 
@@ -6557,30 +6621,16 @@ static void test_recovery_ack_robust_marginal() {
 	}
 	if (ack4 != 4 * ack1) { test_fail(name, "R=4 ACK is not 4x the R=1 ACK length"); return; }
 
-	// CROSS-LAYER INVARIANT (recovery-ack-robustness.md §6.2): the RX combine span
-	// (R×16) MUST fit the receive_ack_pattern() capture tail, else detect_ack_pattern
-	// returns 0.0 (buffer_nsymb < total_needed) and the combined recovery ACK is
-	// NEVER detected. Mirror the production tail formula (arq_common.cc
-	// receive_ack_pattern): tail_nsymb = ack_base_total + pattern_len + 16, then
-	// clamped to buffer_Nsymb. Assert the R=4 base (64) fits the un-clamped tail AND
-	// the ROBUST_0 ring. (This guards the sibling bug the §6.2 audit caught — the
-	// original tail used ack_pattern_nsymb=16, too short for R=4's 64-symbol combine.)
+	// CROSS-LAYER INVARIANT (recovery-ack-robustness.md §6.2): drive the real
+	// receive_ack_pattern() tail snapshot and check its return. The former
+	// arithmetic-only `base_total > base_total + base_total + 16` assertion was
+	// false for every valid base_total, so it could not detect a production tail
+	// regression. This guard fails if the real tail cannot carry an R=4 ACK.
 	{
-		ts.set_recovery_ack_reps(4);
-		int base_total = ts.ack_mfsk.ack_base_total_nsymb();        // 64
-		int tail_nsymb = base_total + base_total + 16;              // prod formula (non-turbo)
-		int ring_nsymb = ts.data_container.buffer_Nsymb;
-		if (base_total > tail_nsymb) {
-			test_fail(name, "R=4 combine span exceeds the receive_ack_pattern tail formula"); return;
+		cl_arq_controller tail_guard;
+		if (tail_guard.test_recovery_ack_tail_capacity() != 0) {
+			test_fail(name, "production receive_ack_pattern rejected a clean R=4 ACK"); return;
 		}
-		if (ring_nsymb > 0 && base_total > ring_nsymb) {
-			char b[160]; snprintf(b, sizeof(b),
-				"R=4 combine span (%d sym) exceeds the ROBUST_0 capture ring (%d sym)", base_total, ring_nsymb);
-			test_fail(name, b); return;
-		}
-		ts.set_recovery_ack_reps(1);
-		printf("    [INVARIANT] R=4 combine span %d sym fits tail %d sym / ring %d sym (§6.2 sibling-bug guard)\n",
-			base_total, tail_nsymb, ring_nsymb);
 	}
 
 	// Operating point: the R=1 matched-COUNT cliff under AWGN (+ a fine-pass-

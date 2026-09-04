@@ -238,10 +238,26 @@ int cl_arq_controller::test_capture_allocation_fail_closed()
 	return failed;
 }
 
+int cl_arq_controller::test_audio_payload_allocation_fail_closed()
+{
+	const int failed = audioio_payload_allocation_failure_selftest();
+	printf("[TEST-AUDIO-PAYLOAD-ALLOC] injected malloc failure rejects audio init: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
 int cl_arq_controller::test_sim_tx_bridge_allocation_fail_closed()
 {
 	const int failed = sim_tx_bridge_allocation_failure_selftest();
 	printf("[TEST-SIM-TX-ALLOC] allocation failure requests shutdown: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
+int cl_arq_controller::test_sim_rx_bridge_allocation_fail_closed()
+{
+	const int failed = sim_rx_bridge_allocation_failure_selftest();
+	printf("[TEST-SIM-RX-ALLOC] allocation failure requests shutdown: %s\n",
 	       failed == 0 ? "PASS" : "FAIL");
 	return failed;
 }
@@ -252,6 +268,14 @@ int cl_arq_controller::test_capture_enqueue_backpressure()
 	const int failed = capture_enqueue_backpressure_selftest();
 	shutdown_ = saved_shutdown;
 	printf("[TEST-CAPTURE-BACKPRESSURE] full FIFO drains and preserves samples: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
+int cl_arq_controller::test_rx_transfer_read_failure()
+{
+	const int failed = rx_transfer_read_failure_selftest();
+	printf("[TEST-RX-TRANSFER-READ] failure propagates without clock advance: %s\n",
 	       failed == 0 ? "PASS" : "FAIL");
 	return failed;
 }
@@ -282,6 +306,19 @@ int cl_arq_controller::test_soundcard_audio_init_fail_closed()
 #else
 	const int failed = soundcard_dialog_audio_init_fail_closed_selftest();
 	printf("[TEST-SOUNDCARD-INIT] backend init failure preserves configured devices: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+#endif
+}
+
+int cl_arq_controller::test_soundcard_dialog_restart_fail_closed()
+{
+#ifndef MERCURY_GUI_ENABLED
+	printf("[TEST-SOUNDCARD-DIALOG-RESTART] SKIP (GUI support not compiled)\n");
+	return 0;
+#else
+	const int failed = soundcard_dialog_restart_fail_closed_selftest();
+	printf("[TEST-SOUNDCARD-DIALOG-RESTART] failed restart rolls back dialog settings: %s\n",
 	       failed == 0 ? "PASS" : "FAIL");
 	return failed;
 #endif
@@ -8328,6 +8365,12 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					policy_axis1_supremacy_on_move(current_configuration,
 						current_configuration, "break_block_failure_threshold");
 				send_break_pattern();
+				if(!lp_note_break_recovery(cmd_batch_seq_id))
+				{
+					fprintf(stderr, "[LP-CONTRACT] BREAK recovery transition rejected; "
+						"listener remains closed\n");
+					return;
+				}
 				// Poll for ACK from responder
 				telecom_system->data_container.frames_to_read = 4;
 				calculate_receiving_timeout();

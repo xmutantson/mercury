@@ -2413,6 +2413,50 @@ int cl_arq_controller::test_data_container_ownership_constraints()
     return pass ? 0 : 1;
 }
 
+int cl_arq_controller::test_data_container_deinit_resets_pinning()
+{
+    cl_data_container data;
+    data.alloc_shared_buffers(256, 50, 4, 112, 128, 8, 4, 1, 1200);
+
+    const bool pin_precondition = data.precook_ring_pinned
+        && data.pinned_capacity_buffer_Nsymb == 1200
+        && data.pinned_capacity_samples == 128 * 1200
+        && data.pinned_capacity_Nc == 50
+        && data.pinned_capacity_nsymb_nc > 0
+        && data.pinned_capacity_nData == 256
+        && data.pinned_capacity_total_frame_size > 0
+        && data.pinned_capacity_preamble == 4
+        && data.pinned_capacity_fine_slice > 0;
+
+    data.deinit();
+    const bool metadata_reset = !data.precook_ring_pinned
+        && data.pinned_capacity_buffer_Nsymb == 0
+        && data.pinned_capacity_samples == 0
+        && data.pinned_capacity_Nc == 0
+        && data.pinned_capacity_nsymb_nc == 0
+        && data.pinned_capacity_nData == 0
+        && data.pinned_capacity_total_frame_size == 0
+        && data.pinned_capacity_preamble == 0
+        && data.pinned_capacity_fine_slice == 0;
+
+    // A different, smaller geometry must take set_size()'s allocation path again.
+    data.set_size(128, 50, 2, 80, 96, 4, 2, 1);
+    const bool reallocated = data.data_bit != nullptr
+        && data.modulated_data != nullptr
+        && data.passband_delayed_data != nullptr
+        && data.ready_to_process_passband_delayed_data != nullptr
+        && data.baseband_data != nullptr
+        && data.passband_data_tx != nullptr
+        && data.bit_energy_dispersal_sequence != nullptr;
+
+    const bool pass = pin_precondition && metadata_reset && reallocated;
+    printf("[TEST-DATA-CONTAINER-DEINIT] pin-precondition=%d metadata-reset=%d "
+           "reallocated=%d -> %s\n",
+           pin_precondition ? 1 : 0, metadata_reset ? 1 : 0,
+           reallocated ? 1 : 0, pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 int cl_arq_controller::test_gbf_decoder_constraints()
 {
     const float llr[2] = {1.0f, 1.0f};
@@ -2764,6 +2808,11 @@ int main(int argc, char *argv[])
             failed += mercury::run_lp_transition_harness_tests();
             return failed == 0 ? 0 : 1;
         }
+        if (strcmp(argv[i], "--test-linkphase-config-contract") == 0) {
+            arm_test_watchdog();
+            cl_arq_controller test_arq;
+            return test_arq.test_linkphase_config_transition_failure() == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--test-b2f-bounded-output") == 0) {
             arm_test_watchdog();
             return run_b2f_bounded_output_test();
@@ -2775,6 +2824,10 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-sim-tx-allocation") == 0) {
             cl_arq_controller test_audio;
             return test_audio.test_sim_tx_bridge_allocation_fail_closed();
+        }
+        if (strcmp(argv[i], "--test-sim-rx-allocation") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_sim_rx_bridge_allocation_fail_closed();
         }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
@@ -2791,6 +2844,7 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_ssid_bounds();
                 failed += test_arq.test_data_container_ownership_constraints();
+                failed += test_arq.test_data_container_deinit_resets_pinning();
                 failed += test_arq.test_gbf_decoder_constraints();
                 failed += test_arq.test_modulation_cli_validation();
                 failed += test_arq.test_tx_level_cli_validation();
@@ -2801,6 +2855,9 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_shm_unmap_fail_closed();
                 failed += test_arq.test_bigblock_wav_short_read();
                 failed += test_arq.test_sim_inproc_pump_fail_closed();
+                failed += test_arq.test_recovery_ack_tail_capacity();
+                failed += test_arq.test_l1_tx_journal_disabled_fail_closed();
+                failed += test_arq.test_l1_journal_disabled_mark_sent_many();
             }
             {
                 cl_arq_controller test_hail;
@@ -2854,6 +2911,7 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_gui;
                 failed += test_gui.test_gui_init_fail_closed();
                 failed += test_gui.test_soundcard_restart_save_fail_closed();
+                failed += test_gui.test_soundcard_dialog_restart_fail_closed();
                 failed += test_gui.test_soundcard_audio_init_fail_closed();
                 failed += test_gui.test_soundcard_restart_launch_fail_closed();
             }
@@ -2866,8 +2924,11 @@ int main(int argc, char *argv[])
                 failed += test_audio.test_soundcard_list_alloc_fail_closed();
                 failed += test_audio.test_audio_thread_create_fail_closed();
                 failed += test_audio.test_capture_allocation_fail_closed();
+                failed += test_audio.test_audio_payload_allocation_fail_closed();
                 failed += test_audio.test_sim_tx_bridge_allocation_fail_closed();
+                failed += test_audio.test_sim_rx_bridge_allocation_fail_closed();
                 failed += test_audio.test_capture_enqueue_backpressure();
+                failed += test_audio.test_rx_transfer_read_failure();
             }
             // A second modem process must not share the configured AGW/TCP
             // listener, and a bind failure must reject startup rather than
@@ -3032,6 +3093,20 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_linkphase_optclock_end_stamp();
+            }
+            // A failed BREAK transition invalidates the link-phase contract and
+            // must stop recovery before ListenerReady or subsequent caller work.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_lp_break_recovery_fail_closed();
+            }
+            // A rejected config-transition observation must stop the caller
+            // before it changes ARQ/PHY geometry and clear stale timeline
+            // evidence. Uses the sample clock, so no wall-clock timing enters
+            // the failure-path assertion.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_linkphase_config_transition_failure();
             }
             // Phase-0 deterministic transition oracle: two production
             // controllers, sample-derived event queue, scripted delivery

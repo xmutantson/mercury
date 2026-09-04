@@ -92,6 +92,14 @@ static inline bool linkphase_optclock_enabled_common()
 	return cached != 0;
 }
 
+// Phase-0 protocol-contract migration remains default-OFF for live traffic.
+// Read fresh because the directed regression toggles it in-process.
+static inline bool linkphase_config_contract_enabled_common()
+{
+	const char* e = std::getenv("MERCURY_LINKPHASE_CONFIG_CONTRACT");
+	return e && *e && atoi(e) != 0;
+}
+
 // TURNAROUND BATCH-AIRTIME RE-PHASE gate (bench-9; common_defines.h
 // TURNAROUND_ACCRUAL_MS_PER_S; TURNAROUND_FIX_DESIGN.md §5.1). DEFAULT-ON (HW A/B
 // PHASE1_VERDICT.md: CFG15 whole-window 3.4x win) but the re-phase remains CFG15-ONLY by the
@@ -3461,7 +3469,13 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 	// LINK-PHASE PRIMITIVE (increment 1): a REAL config change bumps the epoch generation so
 	// every future timeline stamp is at the new geometry (placed AFTER the same-config early
 	// return so a redundant load never bumps). Write-only; no consumer reads it.
-	lp_note_config_switch();
+	if(!lp_note_config_switch())
+	{
+		printf("[ERR-LP-CONTRACT] refusing config switch %d -> %d\n",
+			this->current_configuration, configuration);
+		fflush(stdout);
+		return;
+	}
 	// Forward floor evidence is tied to the report/config generation that earned
 	// it. Any real PHY configuration change requires a new report.
 	topgear_clear_forward_verdict();
@@ -12917,6 +12931,13 @@ void cl_arq_controller::lp_reset()
 	lp_keydown_start_ms           = 0;
 	lp_keydown_start_token        = 0;
 	lp_last_rx_bsi                = -1;
+	lp_contract_valid             = true;
+	lp_test_force_observe_failure = false;
+	lp_contract_last_event        = mercury::protocol::LinkPhaseEvent::Invalid;
+	lp_contract_last_bsi          = -1;
+	lp_contract_last_event_ms     = 0;
+	lp_contract_ordinal           = 0;
+	lp_listener_ready_calls       = 0;
 	lp_clock.start();
 }
 
@@ -13035,9 +13056,85 @@ void cl_arq_controller::lp_note_break(int bsi)
 	lp_state.next_listen_open_ms = 0;
 }
 
-void cl_arq_controller::lp_note_config_switch()
+bool cl_arq_controller::lp_transition_contract_on()
 {
-	lp_config_gen++;  // new config generation -> every future epoch stamp bumps
+	const char* value = std::getenv("MERCURY_LP_TRANSITION_CONTRACT");
+	return value != NULL && value[0] != '\0' && std::atoi(value) != 0;
+}
+
+// Validate and publish one post-BREAK contract event. This is deliberately
+// narrow: the rest of the link-phase migration remains observation-only. Any
+// invalid transition poisons this recovery contract until lp_reset().
+bool cl_arq_controller::observe_transition(
+	mercury::protocol::LinkPhaseEvent event, int bsi)
+{
+	const long long now_ms = lp_now();
+	bool valid = lp_contract_valid && !lp_test_force_observe_failure
+		&& bsi >= 0 && bsi <= 255 && now_ms >= lp_contract_last_event_ms;
+	if(event == mercury::protocol::LinkPhaseEvent::BreakObserved)
+	{
+		valid = valid && lp_state.owner == LP_CMD_KEYED
+			&& lp_state.epoch == lp_make_epoch(bsi);
+	}
+	else if(event == mercury::protocol::LinkPhaseEvent::ListenerReady)
+	{
+		valid = valid
+			&& lp_contract_last_event == mercury::protocol::LinkPhaseEvent::BreakObserved
+			&& lp_contract_last_bsi == bsi;
+	}
+	else
+	{
+		valid = false;
+	}
+
+	if(!valid || lp_contract_ordinal == ULLONG_MAX)
+	{
+		lp_contract_valid = false;
+		return false;
+	}
+
+	lp_contract_last_event = event;
+	lp_contract_last_bsi = bsi;
+	lp_contract_last_event_ms = now_ms;
+	lp_contract_ordinal++;
+	return true;
+}
+
+bool cl_arq_controller::lp_listener_ready(int bsi)
+{
+	lp_listener_ready_calls++;
+	if(!observe_transition(mercury::protocol::LinkPhaseEvent::ListenerReady, bsi))
+		return false;
+	lp_state.owner = LP_TURNAROUND;
+	lp_state.next_listen_open_ms = lp_contract_last_event_ms;
+	return true;
+}
+
+bool cl_arq_controller::lp_note_break_recovery(int bsi)
+{
+	if(!lp_transition_contract_on()) return true;
+
+	// The verdict is authoritative. In particular, do not announce listener
+	// readiness after observe_transition invalidated the recovery contract.
+	if(!observe_transition(mercury::protocol::LinkPhaseEvent::BreakObserved, bsi))
+		return false;
+	return lp_listener_ready(bsi);
+}
+
+bool cl_arq_controller::lp_note_config_switch()
+{
+	const uint32_t next_config_gen = lp_config_gen + 1u;
+	if(linkphase_config_contract_enabled_common()
+	   && !lp_config_contract.observe_transition(
+		mercury::protocol::ConfigEpoch(next_config_gen), sim_clock_now_ns()))
+	{
+		// observe_transition invalidates its contract on failure.  Fail closed:
+		// discard every timeline stamp and leave the current config generation
+		// unchanged so load_configuration() can abort before changing geometry.
+		lp_reset();
+		return false;
+	}
+	lp_config_gen = next_config_gen;  // new generation -> every future epoch stamp bumps
 	if(lp_keydown_generation != UINT64_MAX)
 		lp_keydown_generation++;
 	lp_keydown_start_ms = 0;
@@ -13045,6 +13142,144 @@ void cl_arq_controller::lp_note_config_switch()
 	lp_state.owner_keydown_end_ms = 0;
 	lp_state.keydown_end_token = 0;
 	lp_state.next_listen_open_ms = 0;
+	return true;
+}
+
+// Fail-before/pass-after regression for the ignored observe_transition verdict.
+// The next generation cannot fit in lp_state.epoch's 24-bit config field, so
+// the real observer rejects it.  load_configuration() must honor that verdict,
+// leave both ARQ and PHY geometry untouched, and invalidate stale link-phase
+// evidence.  Virtual sample time keeps the observation deterministic.
+int cl_arq_controller::test_linkphase_config_transition_failure()
+{
+	int fails = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-LP-CONFIG-CONTRACT] %s: %s\n",
+			condition ? "PASS" : "FAIL", name);
+		if(!condition) fails++;
+	};
+
+	const char* prior_env = std::getenv("MERCURY_LINKPHASE_CONFIG_CONTRACT");
+	const bool had_prior_env = prior_env != NULL;
+	const std::string prior_env_value = prior_env ? prior_env : "";
+	const int prior_sim_clock = sim_clock_enabled();
+	setenv_portable("MERCURY_LINKPHASE_CONFIG_CONTRACT", "1");
+	sim_clock_set_enabled(1);
+	sim_clock_add_samples(480);  // 10 ms on the deterministic 48-kHz clock
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.current_configuration = CONFIG_0;
+	current_configuration = CONFIG_0;
+	telecom_system = &test_telecom;
+	lp_config_gen = 0x00ffffffu;
+	lp_state.owner = LP_TURNAROUND;
+	lp_state.owner_keydown_end_ms = 123;
+	lp_state.next_listen_open_ms = 456;
+	lp_state.epoch = lp_make_epoch(7);
+	lp_state.keydown_end_token = 9;
+	lp_keydown_start_ms = 100;
+	lp_keydown_start_token = 9;
+
+	load_configuration(CONFIG_1, PHYSICAL_LAYER_ONLY, NO);
+
+	check(current_configuration == CONFIG_0,
+		"rejected observation stops load_configuration before geometry changes");
+	check(test_telecom.current_configuration == CONFIG_0,
+		"rejected observation stops before publishing new PHY geometry");
+	check(lp_config_gen == 0x00ffffffu,
+		"rejected observation does not publish an unrepresentable generation");
+	check(!lp_config_contract.valid(),
+		"observe_transition failure invalidates the transition contract");
+	check(lp_state.owner == LP_NONE && lp_state.epoch == 0
+		&& lp_state.owner_keydown_end_ms == 0
+		&& lp_state.next_listen_open_ms == 0
+		&& lp_state.keydown_end_token == 0,
+		"rejected observation clears all stale link-phase evidence");
+
+	sim_clock_set_enabled(prior_sim_clock);
+	if(had_prior_env)
+		setenv_portable("MERCURY_LINKPHASE_CONFIG_CONTRACT", prior_env_value.c_str());
+	else
+		unsetenv_portable("MERCURY_LINKPHASE_CONFIG_CONTRACT");
+
+	printf("[TEST-LP-CONFIG-CONTRACT] %s (%d failure%s)\n",
+		fails == 0 ? "ALL PASS" : "FAILURES", fails, fails == 1 ? "" : "s");
+	fflush(stdout);
+	return fails;
+}
+
+int cl_arq_controller::test_lp_break_recovery_fail_closed()
+{
+	int fails = 0;
+	const char* key = "MERCURY_LP_TRANSITION_CONTRACT";
+	const char* prior = std::getenv(key);
+	const bool had_prior = prior != NULL;
+	const std::string prior_value = prior ? prior : "";
+#if defined(_WIN32)
+	_putenv_s(key, "1");
+#else
+	setenv(key, "1", 1);
+#endif
+
+	const int prior_sim_enabled = sim_clock_enabled();
+	sim_clock_set_enabled(1);
+	lp_config_gen = 1;
+	lp_reset();
+	lp_note_break(/*bsi=*/7);
+	sim_clock_add_samples(480);  // deterministic 10 ms at 48 kHz
+	lp_test_force_observe_failure = true;
+	const bool rejected = !lp_note_break_recovery(/*bsi=*/7);
+	if(!rejected || lp_contract_valid || lp_listener_ready_calls != 0
+	   || lp_state.owner != LP_CMD_KEYED)
+	{
+		printf("[TEST-LP-BREAK-RECOVERY] FAIL: rejected=%d valid=%d "
+		       "listener_calls=%u owner=%d\n",
+			rejected ? 1 : 0, lp_contract_valid ? 1 : 0,
+			lp_listener_ready_calls, (int)lp_state.owner);
+		fails++;
+	}
+	else
+	{
+		printf("[TEST-LP-BREAK-RECOVERY] PASS: rejected BreakObserved stopped "
+		       "before ListenerReady\n");
+	}
+
+	// A valid recovery proves the positive path and the clock domain: both
+	// events publish at exactly the virtual 10 ms instant, with no wall sleep.
+	lp_reset();
+	lp_note_break(/*bsi=*/8);
+	sim_clock_add_samples(480);
+	const bool accepted = lp_note_break_recovery(/*bsi=*/8);
+	if(!accepted || !lp_contract_valid || lp_listener_ready_calls != 1
+	   || lp_contract_last_event != mercury::protocol::LinkPhaseEvent::ListenerReady
+	   || lp_contract_last_bsi != 8 || lp_contract_last_event_ms != 10
+	   || lp_contract_ordinal != 2 || lp_state.owner != LP_TURNAROUND)
+	{
+		printf("[TEST-LP-BREAK-RECOVERY] FAIL: accepted=%d valid=%d "
+		       "listener_calls=%u event=%d bsi=%d at_ms=%lld ordinal=%llu owner=%d\n",
+			accepted ? 1 : 0, lp_contract_valid ? 1 : 0,
+			lp_listener_ready_calls, (int)lp_contract_last_event,
+			lp_contract_last_bsi, lp_contract_last_event_ms,
+			lp_contract_ordinal, (int)lp_state.owner);
+		fails++;
+	}
+	else
+	{
+		printf("[TEST-LP-BREAK-RECOVERY] PASS: valid BREAK->LISTENER_READY "
+		       "at deterministic t=10 ms\n");
+	}
+
+	sim_clock_set_enabled(prior_sim_enabled);
+#if defined(_WIN32)
+	_putenv_s(key, had_prior ? prior_value.c_str() : "");
+#else
+	if(had_prior) setenv(key, prior_value.c_str(), 1);
+	else unsetenv(key);
+#endif
+	printf("[TEST-LP-BREAK-RECOVERY] %s (failures=%d)\n",
+		fails == 0 ? "ALL PASS" : "FAIL", fails);
+	return fails;
 }
 
 int cl_arq_controller::mc2_slot_floor_kd_ms(int& kd_src_out) const
@@ -13304,7 +13539,8 @@ int cl_arq_controller::test_linkphase_ackwin()
 
 	// ARM 3 — backstop invariant: with the window CLOSED (config switch), the rescan credits
 	// nothing (returns false) so the incumbent miss/break path is reached byte-identical.
-	lp_note_config_switch();
+	if(!lp_note_config_switch())
+	{ printf("[TEST-LP-ACKWIN] FAIL: config-switch contract rejected valid transition\n"); fails++; }
 	if(lp_ack_window_active(NULL))
 	{ printf("[TEST-LP-ACKWIN] FAIL: config-switch left the window OPEN\n"); fails++; }
 	else printf("[TEST-LP-ACKWIN] PASS: config-switch closes the window (backstop: incumbent break path intact)\n");
@@ -13420,7 +13656,8 @@ int cl_arq_controller::test_linkphase_optclock_end_stamp()
 		printf("[TEST-LP-OPTCLOCK] PASS: geometry-switch optimizer input uses "
 		       "END stamp 5000 ms, not live re-derive 6000 ms\n");
 
-	lp_note_config_switch();
+	if(!lp_note_config_switch())
+	{ printf("[TEST-LP-OPTCLOCK] FAIL: config-switch contract rejected valid transition\n"); fails++; }
 	used_stamp = true;
 	const int stale_ms = lp_optclock_keydown_ms(10, false, &used_stamp);
 	if(stale_ms != live_ms || used_stamp)
@@ -13723,7 +13960,8 @@ int cl_arq_controller::test_linkphase_shadow()
 
 	// ARM 5 — epoch bumps on CONFIG-SWITCH and BREAK (staleness detection substrate).
 	uint32_t ep_before = lp_make_epoch(5);
-	lp_note_config_switch();                     // config_gen++
+	if(!lp_note_config_switch())                 // config_gen++
+	{ printf("[TEST-LP-SHADOW] FAIL: config-switch contract rejected valid transition\n"); fails++; }
 	uint32_t ep_after_cfg = lp_make_epoch(5);
 	if(ep_after_cfg == ep_before)
 	{ printf("[TEST-LP-SHADOW] FAIL: config-switch did not bump epoch\n"); fails++; }

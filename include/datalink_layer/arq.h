@@ -42,6 +42,7 @@
 #include "datalink_layer/channel_state_lookup.h"
 #include "datalink_layer/l1_tx_journal.h"
 #include "datalink_layer/l1_block_ack.h"
+#include "datalink_layer/protocol_contract_kernel.h"
 #include "crypto/mercury_crypto.h"
 #include <iomanip>
 #include <thread>
@@ -562,17 +563,23 @@ public:
   bool l1_terminalize_queued(const char* reason);
   int l1_test_timeout_case(const char* marker, int* awaiting_after,
                            int* queued_after, int* reset_completed);
+  int test_l1_tx_journal_disabled_fail_closed();
+  int test_l1_journal_disabled_mark_sent_many();
   int test_l1_stage2_ownership();
   int test_gui_init_fail_closed();
   int test_audio_open_fail_closed();
   int test_soundcard_list_alloc_fail_closed();
   int test_audio_thread_create_fail_closed();
   int test_capture_allocation_fail_closed();
+  int test_audio_payload_allocation_fail_closed();
   int test_sim_tx_bridge_allocation_fail_closed();
+  int test_sim_rx_bridge_allocation_fail_closed();
   int test_shm_unmap_fail_closed();
   int test_agw_server_start_fail_closed();
   int test_capture_enqueue_backpressure();
+  int test_rx_transfer_read_failure();
   int test_soundcard_restart_save_fail_closed();
+  int test_soundcard_dialog_restart_fail_closed();
   int test_soundcard_audio_init_fail_closed();
   int test_soundcard_restart_launch_fail_closed();
 
@@ -680,6 +687,7 @@ public:
   void set_call_sign(std::string call_sign);
   int test_ssid_bounds();
   int test_data_container_ownership_constraints();
+  int test_data_container_deinit_resets_pinning();
   int test_gbf_decoder_constraints();
   int test_turbo_iterations_sentinel();
   // CLI regression: numeric modulation configs parse exactly, while malformed
@@ -3288,11 +3296,15 @@ public:
   // pass-after), and the RAISE-ONLY invariant. Returns 0=PASS. In-process, no IONOS/RF.
   int test_linkphase_mc2_slotfloor();
   int test_linkphase_optclock_end_stamp();
+  // BREAK recovery contract regression: a rejected BreakObserved transition
+  // must stop before ListenerReady and before the recovery caller continues.
+  int test_lp_break_recovery_fail_closed();
   // INCREMENT 3 (step-3) directed unit: pre-init gate-inert (ARM 0), the sub-class-a older-phase
   // rescan credit (ARM 1), the sub-class-b OFDM beyond-bounds fast-forward rescue (ARM 2), and the
   // WIDEN-only break-backstop invariant (ARM 3). Fail-before via -DLINKPHASE_ACKWIN_NOSCAN /
   // pass-after. Returns 0=PASS. In-process, no IONOS/RF. See data-flow-linkphase-primitive.md.
   int test_linkphase_ackwin();
+  int test_linkphase_config_transition_failure();
 
   // IN-BAND CAPTURE-RING ROBUST-FLOOR OVER-SEAT TEST (CLI --test-inband-ring-floor).
   // Drives inband_seat_robust_ring_floor() at CONFIG_8 (a climbed OFDM rung holding its natural
@@ -3475,6 +3487,11 @@ public:
   // phase (present-run ~16, matched>=7) and the ring-fill gate rejects an
   // unwritten head. data-flow-recovery-ack-capture.md §7. Returns 0=PASS.
   int test_recovery_ack_capture();
+
+  // Recovery-ACK §6.2 cross-layer guard. Generates a real R=4 ACK and drives
+  // receive_ack_pattern() through its production capture-tail sizing, failing
+  // if the tail is too short for the four-repetition detector span.
+  int test_recovery_ack_tail_capacity();
 
   // D3.1 (data-integrity) — UNIFIED in-order-delivery across EVERY demote case.
   // In-process SIM_INPROC synthetic-fire (CLI --test-inorder-demote). Drives the
@@ -7187,6 +7204,7 @@ private:
   uint64_t   lp_keydown_generation;    // full-width local CMD keydown/recovery generation
   uint64_t   lp_keydown_start_token;   // generation stored with START (0 = invalid)
   uint32_t   lp_config_gen;            // config generation, ++ on every load_configuration (epoch hi bits)
+  mercury::protocol::LinkPhaseConfigContract lp_config_contract;
   int        lp_last_rx_bsi;           // RX: last bsi a frame-0 shadow was logged for (-1 = none)
   // Producers (defined in arq_common.cc) — the ownership transitions.
   long long lp_now();                                     // read lp_clock (session-local ms)
@@ -7198,7 +7216,20 @@ private:
   void lp_note_rsp_key();                                 // RSP keys reverse ACK: owner=RSP_KEYED
   void lp_note_ack_decoded();                             // CMD decodes reverse ACK: owner=TURNAROUND
   void lp_note_break(int bsi);                            // BREAK re-stage: owner=CMD_KEYED, epoch re-stamp
-  void lp_note_config_switch();                           // config switch: ++lp_config_gen (epoch generation)
+  // Default-off contract guard for the post-BREAK listener transition. A false
+  // result is terminal for the recovery call site: ListenerReady was not emitted.
+  bool lp_note_break_recovery(int bsi);
+  bool observe_transition(mercury::protocol::LinkPhaseEvent event, int bsi);
+  bool lp_listener_ready(int bsi);
+  static bool lp_transition_contract_on();
+  bool lp_note_config_switch();                           // false => contract refused; caller must stop switch
+  bool lp_contract_valid;
+  bool lp_test_force_observe_failure;
+  mercury::protocol::LinkPhaseEvent lp_contract_last_event;
+  int lp_contract_last_bsi;
+  long long lp_contract_last_event_ms;
+  unsigned long long lp_contract_ordinal;
+  unsigned int lp_listener_ready_calls;
   // Consumer C1 (MC-2, increment 2): the CMD block-boundary ACK_SLOT break-floor keydown-END
   // source. Selects the epoch-guarded primitive owner_keydown_end, else the private latch;
   // applies it RAISE-ONLY. The private latch and its other readers stay in place.

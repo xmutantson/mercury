@@ -184,6 +184,9 @@ static std::atomic<uint64_t> playback_sink_queue_guard_ns{
 static std::atomic<uint32_t> playback_sink_sample_rate_hz{48000U};
 static thread_local uint32_t capture_writer_seen_generation = 0;
 static thread_local bool capture_writer_causal_ready = false;
+// Exact read_buffer API seam for the deterministic --test failure case.
+typedef int (*audioio_read_buffer_fn)(cbuf_handle_t, uint8_t *, size_t);
+static audioio_read_buffer_fn audioio_capture_read_buffer = read_buffer;
 
 // Device opens happen inside the capture/playback threads.  Publish their
 // startup result so audioio_init_internal() can return a meaningful status
@@ -204,6 +207,9 @@ static audioio_pthread_create_fn audioio_pthread_create = pthread_create;
 static audioio_pthread_join_fn audioio_pthread_join = pthread_join;
 typedef void *(*audioio_malloc_fn)(size_t);
 static audioio_malloc_fn audioio_capture_malloc = malloc;
+static audioio_malloc_fn audioio_payload_malloc = malloc;
+static bool audioio_payload_malloc_overridden = false;
+static bool audioio_payload_buffers_heap_backed = false;
 
 void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
 										 audioio_pthread_join_fn join_fn)
@@ -2401,10 +2407,18 @@ typedef int sim_sock_t;
 static sim_sock_t sim_sock = SIM_BAD_SOCK;   // shared by both bridge threads
 static int sim_connected = 0;
 static int sim_tx_allocation_fails_for_test = 0;
+static int sim_rx_allocation_fails_for_test = 0;
 
 static void *sim_tx_chunk_alloc(size_t size)
 {
 	if (sim_tx_allocation_fails_for_test)
+		return NULL;
+	return malloc(size);
+}
+
+static void *sim_rx_chunk_alloc(size_t size)
+{
+	if (sim_rx_allocation_fails_for_test)
 		return NULL;
 	return malloc(size);
 }
@@ -2631,7 +2645,12 @@ void *sim_rx_bridge_thread(void *unused)
 	if (shutdown_) return NULL;
 
 	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
-	double  *chunk = (double *)malloc(chunk_bytes);
+	double  *chunk = (double *)sim_rx_chunk_alloc((size_t)chunk_bytes);
+	if (chunk == NULL) {
+		fprintf(stderr, "ERROR: SIM RX bridge chunk allocation failed\n");
+		shutdown_ = true;
+		return NULL;
+	}
 	uint8_t  stamp_buf[8];
 	// --wire-stamp mode (sim-arq-channel.md §10.5b/§11.2): the relay prepends an
 	// 8-byte LE per-direction END-sample stamp ahead of each chunk and BOTH peers
@@ -2704,6 +2723,24 @@ void *sim_rx_bridge_thread(void *unused)
 	return NULL;
 }
 
+int sim_rx_bridge_allocation_failure_selftest(void)
+{
+	const bool saved_shutdown = shutdown_.exchange(false);
+	const int saved_connected = sim_connected;
+
+	// Bypass the relay wait so the real bridge entry point reaches its
+	// allocation without network or audio hardware.
+	sim_connected = 1;
+	sim_rx_allocation_fails_for_test = 1;
+	void *result = sim_rx_bridge_thread(NULL);
+	sim_rx_allocation_fails_for_test = 0;
+	sim_connected = saved_connected;
+
+	const bool passed = result == NULL && shutdown_.load();
+	shutdown_ = saved_shutdown;
+	return passed ? 0 : 1;
+}
+
 // size in "double" samples
 int tx_transfer(double *buffer, size_t len)
 {
@@ -2749,7 +2786,9 @@ int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len)
 	}
 	else
 	{
-		read_buffer(capture_buffer, buffer_internal, buffer_size_bytes);
+		if(audioio_capture_read_buffer(capture_buffer, buffer_internal,
+				buffer_size_bytes) != 0)
+			return -1;
 		if(tags != NULL)
 			memset(tags, 0, len * sizeof(uint32_t));
 	}
@@ -2780,6 +2819,36 @@ int rx_transfer(double *buffer, size_t len)
 	return rx_transfer_with_causal_tags(buffer, NULL, len);
 }
 
+static int audioio_test_read_failure(cbuf_handle_t, uint8_t *, size_t)
+{
+	return -1;
+}
+
+int rx_transfer_read_failure_selftest(void)
+{
+	if(capture_buffer != NULL || capture_causal_tag_buffer != NULL)
+		return 1;
+
+	double storage = 0.0;
+	capture_buffer = circular_buf_init(
+		(uint8_t *)&storage, sizeof(storage));
+	audioio_read_buffer_fn saved_read = audioio_capture_read_buffer;
+	const int saved_sim_clock_enabled = sim_clock_enabled();
+	const int saved_wire_stamp = sim_clock_wire_stamp();
+	sim_clock_set_enabled(1);
+	sim_clock_set_wire_stamp(0);
+	const uint64_t samples_before = sim_clock_now_samples();
+	audioio_capture_read_buffer = audioio_test_read_failure;
+	const int result = rx_transfer(&storage, 1);
+	const uint64_t samples_after = sim_clock_now_samples();
+	audioio_capture_read_buffer = saved_read;
+	sim_clock_set_wire_stamp(saved_wire_stamp);
+	sim_clock_set_enabled(saved_sim_clock_enabled);
+	circular_buf_free(capture_buffer);
+	capture_buffer = NULL;
+	return result == -1 && samples_after == samples_before ? 0 : 1;
+}
+
 
 int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsys, pthread_t *radio_capture,
 						  pthread_t *radio_playback, pthread_t *radio_capture_prep, cl_telecom_system *telecom_system)
@@ -2793,15 +2862,74 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 	tap_play = fopen("tap-playback-b.f64", "w");
 #endif
 
+	capture_buffer = NULL;
+	playback_buffer = NULL;
+	audioio_payload_buffers_heap_backed = false;
+
 #if defined(_WIN32)
-	uint8_t *buffer_cap = (uint8_t *)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
-	uint8_t *buffer_play = (uint8_t *)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
-    capture_buffer = circular_buf_init(buffer_cap, AUDIO_PAYLOAD_BUFFER_SIZE);
-    playback_buffer = circular_buf_init(buffer_play, AUDIO_PAYLOAD_BUFFER_SIZE);
+	const bool use_heap_buffers = true;
 #else
-    capture_buffer = circular_buf_init_shm(AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
-    playback_buffer = circular_buf_init_shm(AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
+	// The override keeps allocation-failure testing device- and platform-free;
+	// ordinary POSIX startup continues to use the shared-memory rings.
+	const bool use_heap_buffers = audioio_payload_malloc_overridden;
 #endif
+	if(use_heap_buffers)
+	{
+		uint8_t *buffer_cap =
+			(uint8_t *)audioio_payload_malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		uint8_t *buffer_play =
+			(uint8_t *)audioio_payload_malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+		if(buffer_cap == NULL || buffer_play == NULL)
+		{
+			free(buffer_cap);
+			free(buffer_play);
+			fprintf(stderr, "ERROR: could not allocate audio payload buffers\n");
+			return -1;
+		}
+
+		capture_buffer = circular_buf_init(buffer_cap, AUDIO_PAYLOAD_BUFFER_SIZE);
+		playback_buffer = circular_buf_init(buffer_play, AUDIO_PAYLOAD_BUFFER_SIZE);
+		if(capture_buffer == NULL || playback_buffer == NULL)
+		{
+			if(capture_buffer != NULL)
+				circular_buf_free(capture_buffer);
+			if(playback_buffer != NULL)
+				circular_buf_free(playback_buffer);
+			free(buffer_cap);
+			free(buffer_play);
+			capture_buffer = NULL;
+			playback_buffer = NULL;
+			fprintf(stderr, "ERROR: could not initialize audio payload buffers\n");
+			return -1;
+		}
+		audioio_payload_buffers_heap_backed = true;
+	}
+	else
+	{
+		capture_buffer = circular_buf_init_shm(
+			AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
+		playback_buffer = circular_buf_init_shm(
+			AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
+		if(capture_buffer == NULL || playback_buffer == NULL)
+		{
+			if(capture_buffer != NULL)
+			{
+				circular_buf_destroy_shm(capture_buffer,
+					AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
+				circular_buf_free_shm(capture_buffer);
+			}
+			if(playback_buffer != NULL)
+			{
+				circular_buf_destroy_shm(playback_buffer,
+					AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
+				circular_buf_free_shm(playback_buffer);
+			}
+			capture_buffer = NULL;
+			playback_buffer = NULL;
+			fprintf(stderr, "ERROR: could not initialize audio payload buffers\n");
+			return -1;
+		}
+	}
 
 	const size_t capture_tag_capacity =
 		(AUDIO_PAYLOAD_BUFFER_SIZE / sizeof(double)) * sizeof(uint32_t);
@@ -2936,13 +3064,45 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 	free(playback_buffer->buffer);
 	circular_buf_free(playback_buffer);
 #else
-    circular_buf_destroy_shm(capture_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
-    circular_buf_free_shm(capture_buffer);
+	if(audioio_payload_buffers_heap_backed)
+	{
+		free(capture_buffer->buffer);
+		circular_buf_free(capture_buffer);
+		free(playback_buffer->buffer);
+		circular_buf_free(playback_buffer);
+	}
+	else
+	{
+		circular_buf_destroy_shm(capture_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
+		circular_buf_free_shm(capture_buffer);
 
-    circular_buf_destroy_shm(playback_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
-    circular_buf_free_shm(playback_buffer);
+		circular_buf_destroy_shm(playback_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
+		circular_buf_free_shm(playback_buffer);
+	}
 #endif
 	capture_buffer = NULL;
 	playback_buffer = NULL;
+	audioio_payload_buffers_heap_backed = false;
     return 0;
+}
+
+int audioio_payload_allocation_failure_selftest(void)
+{
+	if(capture_buffer != NULL || playback_buffer != NULL)
+		return 1;
+
+	pthread_t capture_thread, playback_thread, prep_thread;
+	cl_telecom_system telecom_system;
+	audioio_malloc_fn saved_malloc = audioio_payload_malloc;
+	const bool saved_override = audioio_payload_malloc_overridden;
+	audioio_payload_malloc = audioio_test_malloc_failure;
+	audioio_payload_malloc_overridden = true;
+	const int result = audioio_init_internal(
+		NULL, NULL, AUDIO_SUBSYSTEM_SIM, &capture_thread, &playback_thread,
+		&prep_thread, &telecom_system);
+	audioio_payload_malloc = saved_malloc;
+	audioio_payload_malloc_overridden = saved_override;
+
+	return result != 0 && capture_buffer == NULL && playback_buffer == NULL
+		? 0 : 1;
 }

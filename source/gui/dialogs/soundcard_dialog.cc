@@ -40,10 +40,17 @@ extern const ffaudio_interface ffpulse;
 
 static const ffaudio_interface* audio_interface_for_test = nullptr;
 static int failing_audio_init_calls = 0;
+static bool (*restart_mercury_for_test)(const std::string&) = nullptr;
+static int failing_restart_calls = 0;
 
 static int failing_audio_init(ffaudio_init_conf*) {
     ++failing_audio_init_calls;
     return -1;
+}
+
+static bool failing_restart(const std::string&) {
+    ++failing_restart_calls;
+    return false;
 }
 
 // Global dialog - Meyer's Singleton to avoid static init order fiasco
@@ -303,31 +310,35 @@ void SoundCardDialog::refreshDevices() {
 }
 
 bool SoundCardDialog::acceptAndRestart(const std::string& config_path) {
-    if (!devices_enumerated_) {
+#ifdef __APPLE__
+    const int audio_system_count = 1;
+#else
+    const int audio_system_count = 2;
+#endif
+    if (!devices_enumerated_
+            || temp_input_device_ < 0
+            || temp_input_device_ >= (int)input_devices_.size()
+            || temp_output_device_ < 0
+            || temp_output_device_ >= (int)output_devices_.size()
+            || temp_input_channel_ < 0 || temp_input_channel_ > 2
+            || temp_output_channel_ < 0 || temp_output_channel_ > 2
+            || temp_audio_system_ < 0 || temp_audio_system_ >= audio_system_count) {
         return false;
     }
 
-    selected_input_device_ = temp_input_device_;
-    selected_output_device_ = temp_output_device_;
-    selected_audio_system_ = temp_audio_system_;
+    const MercurySettings previous_settings = g_settings;
 
     int in_ch_validated = temp_input_channel_;
-    if (temp_input_device_ >= 0 && temp_input_device_ < (int)input_devices_.size()) {
-        g_settings.input_device = input_devices_[temp_input_device_].name;
-        if (input_devices_[temp_input_device_].channels == 1) {
-            in_ch_validated = 0;
-        }
+    g_settings.input_device = input_devices_[temp_input_device_].name;
+    if (input_devices_[temp_input_device_].channels == 1) {
+        in_ch_validated = 0;
     }
-    selected_input_channel_ = in_ch_validated;
 
     int out_ch_validated = temp_output_channel_;
-    if (temp_output_device_ >= 0 && temp_output_device_ < (int)output_devices_.size()) {
-        g_settings.output_device = output_devices_[temp_output_device_].name;
-        if (output_devices_[temp_output_device_].channels == 1) {
-            out_ch_validated = 2;
-        }
+    g_settings.output_device = output_devices_[temp_output_device_].name;
+    if (output_devices_[temp_output_device_].channels == 1) {
+        out_ch_validated = 2;
     }
-    selected_output_channel_ = out_ch_validated;
 
     g_settings.input_channel = in_ch_validated;
     g_settings.output_channel = out_ch_validated;
@@ -339,9 +350,64 @@ bool SoundCardDialog::acceptAndRestart(const std::string& config_path) {
     g_settings.audio_system = (temp_audio_system_ == 0) ? "alsa" : "pulse";
 #endif
 
+    const bool restarted = restart_mercury_for_test
+                         ? restart_mercury_for_test(config_path)
+                         : restartMercury(config_path);
+    if (!restarted) {
+        g_settings = previous_settings;
+        if (!config_path.empty() && !g_settings.save(config_path)) {
+            fprintf(stderr,
+                    "ERROR: Failed to restore settings after restart failure: %s.\n",
+                    config_path.c_str());
+        }
+        return false;
+    }
+
+    selected_input_device_ = temp_input_device_;
+    selected_output_device_ = temp_output_device_;
+    selected_audio_system_ = temp_audio_system_;
+    selected_input_channel_ = in_ch_validated;
+    selected_output_channel_ = out_ch_validated;
     is_open_ = false;
-    restartMercury(config_path);
     return true;
+}
+
+int soundcard_dialog_restart_fail_closed_selftest() {
+    const MercurySettings saved_settings = g_settings;
+    const std::string original_input = "Original Input Device";
+    const std::string original_output = "Original Output Device";
+    const std::string candidate_input = "Candidate Input Device";
+    const std::string candidate_output = "Candidate Output Device";
+    g_settings.input_device = original_input;
+    g_settings.output_device = original_output;
+    g_settings.input_channel = 1;
+    g_settings.output_channel = 0;
+
+    SoundCardDialog dialog;
+    dialog.is_open_ = true;
+    dialog.devices_enumerated_ = true;
+    dialog.input_devices_.push_back({candidate_input, "input-id", false, 1, 48000});
+    dialog.output_devices_.push_back({candidate_output, "output-id", false, 1, 48000});
+    dialog.temp_input_device_ = 0;
+    dialog.temp_output_device_ = 0;
+    dialog.temp_input_channel_ = 1;
+    dialog.temp_output_channel_ = 0;
+
+    failing_restart_calls = 0;
+    restart_mercury_for_test = failing_restart;
+    const bool accepted = dialog.acceptAndRestart(std::string());
+    restart_mercury_for_test = nullptr;
+
+    const bool passed = failing_restart_calls == 1
+                     && !accepted
+                     && dialog.isOpen()
+                     && g_settings.input_device == original_input
+                     && g_settings.output_device == original_output
+                     && g_settings.input_channel == 1
+                     && g_settings.output_channel == 0;
+
+    g_settings = saved_settings;
+    return passed ? 0 : 1;
 }
 
 int soundcard_dialog_audio_init_fail_closed_selftest() {
