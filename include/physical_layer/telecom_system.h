@@ -876,6 +876,7 @@ public:
 	// MERCURY_BIGBLOCK_DECODE_WAV=<path> (decode). Returns 1 on full success.
 	int bigblock_tx_to_wav(const char* wav_path);
 	int bigblock_decode_from_wav(const char* wav_path);
+	static int test_bigblock_wav_short_read();
 	// Shared builder: rebuild ofdm at Nsymb=Ngrid with the thin freq-focused lattice
 	// (cont_cols/scat_dx/scat_dy) + reseed the pilot DBPSK sequence, exactly as
 	// sfo_grid_test does. Returns nData; out-params give Ngrid/log2M/nBits. Both the TX

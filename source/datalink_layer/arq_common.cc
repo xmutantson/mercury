@@ -15879,7 +15879,37 @@ void cl_arq_controller::restore_sack_v2_rx_phy()
 // the runtime mfsk M<16 (NB). On the NB path the caller falls back to
 // the legacy MFSK ACK pattern (no SACK; NB never had the symbol-rate
 // budget for SACK and the receiver implicitly treats any pattern hit
+// as a clean ACK). On WB, returns wall-clock TX time in ms, or 0 if playback
+// fails to drain.
+typedef bool (*mfsk_ack_sack_drain_wait_fn)();
+typedef void (*mfsk_ack_sack_buffer_delete_fn)(double*);
+static void delete_mfsk_ack_sack_buffer(double* buffer) { delete[] buffer; }
+static mfsk_ack_sack_drain_wait_fn g_mfsk_ack_sack_drain_wait = drain_playback_wait;
+static mfsk_ack_sack_buffer_delete_fn g_mfsk_ack_sack_buffer_delete =
+	delete_mfsk_ack_sack_buffer;
 // as a clean ACK). On WB, returns wall-clock TX time in ms.
+enum class RxMuteCaptureResetResult
+{
+	Ready,
+	NotReady
+};
+
+typedef RxMuteCaptureResetResult (*rx_mute_capture_reset_fn)();
+
+static RxMuteCaptureResetResult reset_capture_after_rx_mute()
+{
+	if(capture_buffer == NULL)
+		return RxMuteCaptureResetResult::NotReady;
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);
+	capture_reset_samples();
+	return RxMuteCaptureResetResult::Ready;
+}
+
+// Single authority for the mute-then-reset commit. Production uses the real
+// capture FIFO; the directed regression substitutes a NotReady result.
+static rx_mute_capture_reset_fn g_mfsk_ack_capture_reset_authority =
+	reset_capture_after_rx_mute;
+
 long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_id,
                                                 uint32_t bitmap)
 {
@@ -16049,20 +16079,38 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 	fflush(stdout);
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
-	// Wait for playback to drain
-	drain_playback_wait();
+	// Wait for playback to drain. A failed drain means the frame did not finish
+	// transmitting, so fail closed before flushing RX state or reporting success.
+	if(!g_mfsk_ack_sack_drain_wait())
+	{
+		ptt_off();
+		g_mfsk_ack_sack_buffer_delete(raw_output);
+		g_mfsk_ack_sack_buffer_delete(filtered1);
+		g_mfsk_ack_sack_buffer_delete(filtered2);
+		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
+		return 0;
+	}
 
 	printf("[TX-MFSK-ACK-SACK] Audio done\n");
 	fflush(stdout);
 
-	delete[] raw_output;
-	delete[] filtered1;
-	delete[] filtered2;
+	g_mfsk_ack_sack_buffer_delete(raw_output);
+	g_mfsk_ack_sack_buffer_delete(filtered1);
+	g_mfsk_ack_sack_buffer_delete(filtered2);
 
 	// Same flush sequence as send_ack_pattern / send_ack_pattern_with_snr
 	telecom_system->data_container.rx_mute = 1;
-	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	capture_reset_samples();
+	if(g_mfsk_ack_capture_reset_authority() != RxMuteCaptureResetResult::Ready)
+	{
+		// The radio is already keyed and RX mute was committed before reset
+		// readiness was known. Fail closed and leave receive-side state usable.
+		ptt_off();
+		telecom_system->data_container.rx_mute = 0;
+		telecom_system->data_container.rx_mute_samples = 0;
+		telecom_system->data_container.nUnder_processing_events = 0;
+		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
+		return -1;
+	}
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
 		                * telecom_system->data_container.buffer_Nsymb
@@ -16110,6 +16158,256 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 #endif  // MFSK_ACK_SACK_ENABLED
 }
 
+static int g_mfsk_ack_sack_test_freed_buffers = 0;
+static int g_mfsk_ack_sack_test_ptt_off_calls = 0;
+
+static bool mfsk_ack_sack_test_drain_not_ready()
+{
+	return false;
+}
+
+static void mfsk_ack_sack_test_delete_buffer(double* buffer)
+{
+	if(buffer != NULL)
+		g_mfsk_ack_sack_test_freed_buffers++;
+	delete[] buffer;
+}
+
+static int mfsk_ack_sack_test_transmit_hook(const char* buffer, int length)
+{
+	static const char ptt_off_command[] = "PTT OFF\r";
+	if(length == (int)sizeof(ptt_off_command) - 1
+	   && memcmp(buffer, ptt_off_command, sizeof(ptt_off_command) - 1) == 0)
+		g_mfsk_ack_sack_test_ptt_off_calls++;
+	return length;
+}
+
+static int g_mfsk_ack_reset_test_calls = 0;
+static int g_mfsk_ack_reset_test_ptt_off_calls = 0;
+
+static RxMuteCaptureResetResult mfsk_ack_test_reset_not_ready()
+{
+	g_mfsk_ack_reset_test_calls++;
+	return RxMuteCaptureResetResult::NotReady;
+}
+
+static void mfsk_ack_test_playback_pump(void*)
+{
+	clear_buffer(playback_buffer);
+}
+
+static int mfsk_ack_test_transmit_hook(const char* buffer, int length)
+{
+	static const char ptt_off_command[] = "PTT OFF\r";
+	if(length == (int)sizeof(ptt_off_command) - 1
+	   && memcmp(buffer, ptt_off_command, sizeof(ptt_off_command) - 1) == 0)
+		g_mfsk_ack_reset_test_ptt_off_calls++;
+	return length;
+}
+
+// Fail-before/pass-after regression for the drain-failure exit in
+// send_mfsk_ack_sack(). The injected NotReady-equivalent result must release
+// all three frame buffers, unkey PTT, and return failure without flushing RX
+// state as though the ACK had completed.
+int cl_arq_controller::test_send_mfsk_ack_sack_drain_failure()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-MFSK-ACK-SACK-DRAIN] SKIP: MFSK_ACK_SACK_ENABLED == 0\n");
+	return 0;
+#else
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-MFSK-ACK-SACK-DRAIN] %s: %s\n",
+			condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.load_configuration(CONFIG_0);
+	if(test_telecom.ack_mfsk.ack_sack_suffix_len() <= 0)
+	{
+		printf("[TEST-MFSK-ACK-SACK-DRAIN] FAIL: CONFIG_0 has no ACK+SACK suffix\n");
+		return 1;
+	}
+
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_ptt_on_delay_ms = ptt_on_delay_ms;
+	int saved_ptt_off_delay_ms = ptt_off_delay_ms;
+	int saved_pilot_tone_ms = pilot_tone_ms;
+	int saved_pilot_tone_hz = pilot_tone_hz;
+	mfsk_ack_sack_drain_wait_fn saved_drain_wait = g_mfsk_ack_sack_drain_wait;
+	mfsk_ack_sack_buffer_delete_fn saved_buffer_delete = g_mfsk_ack_sack_buffer_delete;
+	int (*saved_transmit_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-MFSK-ACK-SACK-DRAIN] FAIL: could not allocate playback ring\n");
+		return 1;
+	}
+
+	const int rx_state_sentinel = 73;
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	ptt_on_delay_ms = 0;
+	ptt_off_delay_ms = 0;
+	pilot_tone_ms = 0;
+	pilot_tone_hz = 0;
+	test_telecom.data_container.frames_to_read = rx_state_sentinel;
+	g_mfsk_ack_sack_test_freed_buffers = 0;
+	g_mfsk_ack_sack_test_ptt_off_calls = 0;
+	g_mfsk_ack_sack_drain_wait = mfsk_ack_sack_test_drain_not_ready;
+	g_mfsk_ack_sack_buffer_delete = mfsk_ack_sack_test_delete_buffer;
+	cl_tcp_socket::g_test_transmit_hook = mfsk_ack_sack_test_transmit_hook;
+
+	long long result = send_mfsk_ack_sack(7, 0x5u);
+
+	check(size_buffer(test_playback) > 0,
+		"mock drain failure was reached after ACK+SACK audio was queued");
+	check(result == 0, "drain failure is reported to the caller");
+	check(g_mfsk_ack_sack_test_ptt_off_calls == 1,
+		"drain failure calls ptt_off exactly once");
+	check(g_mfsk_ack_sack_test_freed_buffers == 3,
+		"drain failure frees raw_output, filtered1, and filtered2");
+	check(test_telecom.data_container.frames_to_read == rx_state_sentinel,
+		"drain failure does not flush receive state as a completed ACK");
+	check(!test_telecom.ack_mfsk.ack_suffix_fec_coded,
+		"drain failure clears the per-call ACK FEC flag");
+
+	cl_tcp_socket::g_test_transmit_hook = saved_transmit_hook;
+	g_mfsk_ack_sack_buffer_delete = saved_buffer_delete;
+	g_mfsk_ack_sack_drain_wait = saved_drain_wait;
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	ptt_on_delay_ms = saved_ptt_on_delay_ms;
+	ptt_off_delay_ms = saved_ptt_off_delay_ms;
+	pilot_tone_ms = saved_pilot_tone_ms;
+	pilot_tone_hz = saved_pilot_tone_hz;
+	playback_buffer = saved_playback;
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-MFSK-ACK-SACK-DRAIN] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed,
+		failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
+#endif
+}
+
+// Fail-before/pass-after regression for the reset-authority failure after
+// send_mfsk_ack_sack() has keyed PTT and committed rx_mute=1. The in-process
+// pump drains the real generated ACK without wall-clock waits; only the reset
+// authority is mocked.
+int cl_arq_controller::test_send_mfsk_ack_sack_reset_failure()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-MFSK-ACK-RESET] SKIP: MFSK_ACK_SACK_ENABLED == 0\n");
+	return 0;
+#else
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-MFSK-ACK-RESET] %s: %s\n",
+			condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.load_configuration(CONFIG_0);
+	if(test_telecom.ack_mfsk.ack_sack_suffix_len() <= 0)
+	{
+		printf("[TEST-MFSK-ACK-RESET] FAIL: CONFIG_0 has no ACK+SACK suffix\n");
+		return 1;
+	}
+
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_current_configuration = current_configuration;
+	int saved_ptt_on_delay_ms = ptt_on_delay_ms;
+	int saved_ptt_off_delay_ms = ptt_off_delay_ms;
+	int saved_pilot_tone_ms = pilot_tone_ms;
+	int saved_pilot_tone_hz = pilot_tone_hz;
+	rx_mute_capture_reset_fn saved_reset_authority =
+		g_mfsk_ack_capture_reset_authority;
+	sim_inproc_pump_fn saved_pump = g_sim_inproc_pump;
+	void* saved_pump_ctx = g_sim_inproc_pump_ctx;
+	int (*saved_transmit_hook)(const char*, int) =
+		cl_tcp_socket::g_test_transmit_hook;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-MFSK-ACK-RESET] FAIL: could not allocate playback ring\n");
+		return 1;
+	}
+
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	current_configuration = CONFIG_0;
+	ptt_on_delay_ms = 0;
+	ptt_off_delay_ms = 0;
+	pilot_tone_ms = 0;
+	pilot_tone_hz = 0;
+	test_telecom.data_container.rx_mute = 0;
+	test_telecom.data_container.rx_mute_samples = 17;
+	test_telecom.data_container.nUnder_processing_events = 9;
+	g_mfsk_ack_reset_test_calls = 0;
+	g_mfsk_ack_reset_test_ptt_off_calls = 0;
+	g_mfsk_ack_capture_reset_authority = mfsk_ack_test_reset_not_ready;
+	arq_set_sim_inproc_pump(mfsk_ack_test_playback_pump, NULL);
+	cl_tcp_socket::g_test_transmit_hook = mfsk_ack_test_transmit_hook;
+
+	long long result = send_mfsk_ack_sack(7, 0x15U);
+
+	check(result == -1, "NotReady returns the documented failure result");
+	check(g_mfsk_ack_reset_test_calls == 1,
+		"mock reset authority is reached exactly once");
+	check(g_mfsk_ack_reset_test_ptt_off_calls == 1,
+		"reset failure calls ptt_off exactly once");
+	check(test_telecom.data_container.rx_mute.load() == 0,
+		"reset failure restores rx_mute to zero");
+	check(test_telecom.data_container.rx_mute_samples.load() == 0,
+		"reset failure clears muted-sample accounting");
+	check(test_telecom.data_container.nUnder_processing_events.load() == 0,
+		"reset failure clears in-flight processing accounting");
+	check(!test_telecom.ack_mfsk.ack_suffix_fec_coded,
+		"reset failure clears the per-call ACK FEC flag");
+
+	cl_tcp_socket::g_test_transmit_hook = saved_transmit_hook;
+	arq_set_sim_inproc_pump(saved_pump, saved_pump_ctx);
+	g_mfsk_ack_capture_reset_authority = saved_reset_authority;
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	current_configuration = saved_current_configuration;
+	ptt_on_delay_ms = saved_ptt_on_delay_ms;
+	ptt_off_delay_ms = saved_ptt_off_delay_ms;
+	pilot_tone_ms = saved_pilot_tone_ms;
+	pilot_tone_hz = saved_pilot_tone_hz;
+	playback_buffer = saved_playback;
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-MFSK-ACK-RESET] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed,
+		failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
+#endif
+}
+
 // Option B (data-flow-compact-confirm.md): emit the COMPACT coded reverse
 // confirm. STRUCTURAL CLONE of send_mfsk_ack_sack — the ONLY differences are:
 // (1) CRC12 over the single [bsi] byte (not [bsi||bitmap]); (2) the compact
@@ -16117,6 +16415,26 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 // passband sample count. The PTT / FIR / pilot / drain / capture-flush
 // scaffolding is identical so turnaround behaviour matches the ACK path. CLEAN
 // batch only.
+typedef bool (*compact_confirm_drain_wait_fn)();
+typedef void (*compact_confirm_buffer_delete_fn)(double*);
+static void delete_compact_confirm_buffer(double* buffer) { delete[] buffer; }
+static compact_confirm_drain_wait_fn g_compact_confirm_drain_wait = drain_playback_wait;
+static compact_confirm_buffer_delete_fn g_compact_confirm_buffer_delete =
+	delete_compact_confirm_buffer;
+enum class rx_mute_capture_reset_result { Ready, NotReady };
+typedef rx_mute_capture_reset_result (*rx_mute_capture_reset_authority_fn)();
+
+static rx_mute_capture_reset_result reset_compact_confirm_capture()
+{
+	capture_reset_samples();
+	return rx_mute_capture_reset_result::Ready;
+}
+
+// Test seam for the capture-reset failure regression. Production always calls
+// the real capture reset above; --test temporarily substitutes NotReady.
+static rx_mute_capture_reset_authority_fn g_compact_confirm_capture_reset_authority =
+	reset_compact_confirm_capture;
+
 long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batch_seq_id)
 {
 	if(passive_monitor) return 0;
@@ -16265,19 +16583,36 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	fflush(stdout);
 	tx_transfer(&filtered2[symbol_period], compact_samples);
 
-	drain_playback_wait();
+	if(!g_compact_confirm_drain_wait())
+	{
+		// A shutdown or harness no-progress abort leaves queued audio unsent.
+		// Fail closed before returning: unkey the radio and release every
+		// frame buffer owned by this send operation.
+		ptt_off();
+		g_compact_confirm_buffer_delete(raw_output);
+		g_compact_confirm_buffer_delete(filtered1);
+		g_compact_confirm_buffer_delete(filtered2);
+		return -1;
+	}
 
 	printf("[TX-MFSK-COMPACT] Audio done\n");
 	fflush(stdout);
 
-	delete[] raw_output;
-	delete[] filtered1;
-	delete[] filtered2;
+	g_compact_confirm_buffer_delete(raw_output);
+	g_compact_confirm_buffer_delete(filtered1);
+	g_compact_confirm_buffer_delete(filtered2);
 
 	// Same flush sequence as send_mfsk_ack_sack.
 	telecom_system->data_container.rx_mute = 1;
 	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);
-	capture_reset_samples();
+	if(g_compact_confirm_capture_reset_authority() != rx_mute_capture_reset_result::Ready)
+	{
+		// Fail closed: capture reset did not acquire authority, so abandon the
+		// send without leaving either the transmitter or RX mute asserted.
+		ptt_off();
+		telecom_system->data_container.rx_mute = 0;
+		return -1;
+	}
 	{
 		int buf_samples = telecom_system->data_container.Nofdm
 		                * telecom_system->data_container.buffer_Nsymb
@@ -16312,6 +16647,226 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 		t_end - t_start).count();
 	return elapsed_ms;
 #endif  // MFSK_ACK_SACK_ENABLED
+}
+
+static int g_compact_confirm_test_freed_buffers = 0;
+static int g_compact_confirm_test_ptt_off_calls = 0;
+
+static bool compact_confirm_test_drain_not_ready()
+{
+	return false;
+}
+
+static void compact_confirm_test_delete_buffer(double* buffer)
+{
+	if(buffer != NULL)
+		g_compact_confirm_test_freed_buffers++;
+	delete[] buffer;
+}
+
+static int compact_confirm_test_transmit_hook(const char* buffer, int length)
+{
+	static const char ptt_off_command[] = "PTT OFF\r";
+	if(length == (int)sizeof(ptt_off_command) - 1
+	   && memcmp(buffer, ptt_off_command, sizeof(ptt_off_command) - 1) == 0)
+		g_compact_confirm_test_ptt_off_calls++;
+	return length;
+}
+
+static int g_compact_reset_test_ptt_off_calls = 0;
+
+static rx_mute_capture_reset_result compact_reset_test_not_ready()
+{
+	return rx_mute_capture_reset_result::NotReady;
+}
+
+static void compact_reset_test_drain_playback(void*)
+{
+	clear_buffer(playback_buffer);
+}
+
+static int compact_reset_test_transmit_hook(const char* buffer, int length)
+{
+	static const char ptt_off_command[] = "PTT OFF\r";
+	if(length == (int)sizeof(ptt_off_command) - 1
+	   && memcmp(buffer, ptt_off_command, sizeof(ptt_off_command) - 1) == 0)
+		g_compact_reset_test_ptt_off_calls++;
+	return length;
+}
+
+// Fail-before/pass-after regression for the compact-confirm drain failure.
+// Inject a NotReady-equivalent wait result after audio is queued and observe
+// both fail-closed effects through the production seams: PTT OFF and deletion
+// of all three frame buffers. Delays are zero so the test never reads wall time.
+int cl_arq_controller::test_send_mfsk_compact_confirm_drain_failure()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-COMPACT-DRAIN] SKIP: MFSK_ACK_SACK_ENABLED == 0\n");
+	return 0;
+#else
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-COMPACT-DRAIN] %s: %s\n", condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.load_configuration(CONFIG_0);
+
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_configuration = current_configuration;
+	int saved_ptt_on_delay_ms = ptt_on_delay_ms;
+	int saved_ptt_off_delay_ms = ptt_off_delay_ms;
+	int saved_pilot_tone_ms = pilot_tone_ms;
+	int saved_pilot_tone_hz = pilot_tone_hz;
+	compact_confirm_drain_wait_fn saved_drain_wait = g_compact_confirm_drain_wait;
+	compact_confirm_buffer_delete_fn saved_buffer_delete = g_compact_confirm_buffer_delete;
+	int (*saved_transmit_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-COMPACT-DRAIN] FAIL: could not allocate playback ring\n");
+		return 1;
+	}
+
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	current_configuration = CONFIG_0;
+	ptt_on_delay_ms = 0;
+	ptt_off_delay_ms = 0;
+	pilot_tone_ms = 0;
+	pilot_tone_hz = 0;
+	g_compact_confirm_test_freed_buffers = 0;
+	g_compact_confirm_test_ptt_off_calls = 0;
+	g_compact_confirm_drain_wait = compact_confirm_test_drain_not_ready;
+	g_compact_confirm_buffer_delete = compact_confirm_test_delete_buffer;
+	cl_tcp_socket::g_test_transmit_hook = compact_confirm_test_transmit_hook;
+
+	long long result = send_mfsk_compact_confirm(0);
+
+	check(size_buffer(test_playback) > 0,
+		"mock drain failure was reached after compact-confirm audio was queued");
+	check(result == -1, "drain failure returns -1");
+	check(g_compact_confirm_test_ptt_off_calls == 1,
+		"drain failure calls ptt_off exactly once");
+	check(g_compact_confirm_test_freed_buffers == 3,
+		"drain failure frees raw_output, filtered1, and filtered2");
+
+	cl_tcp_socket::g_test_transmit_hook = saved_transmit_hook;
+	g_compact_confirm_buffer_delete = saved_buffer_delete;
+	g_compact_confirm_drain_wait = saved_drain_wait;
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	current_configuration = saved_configuration;
+	ptt_on_delay_ms = saved_ptt_on_delay_ms;
+	ptt_off_delay_ms = saved_ptt_off_delay_ms;
+	pilot_tone_ms = saved_pilot_tone_ms;
+	pilot_tone_hz = saved_pilot_tone_hz;
+	playback_buffer = saved_playback;
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-COMPACT-DRAIN] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
+#endif
+}
+
+// Fail-before/pass-after regression for the capture-reset authority failure in
+// send_mfsk_compact_confirm(). The injected NotReady result is reached only
+// after PTT is keyed and rx_mute is asserted; the failure exit must roll both
+// states back and return the deterministic error sentinel rather than wall time.
+int cl_arq_controller::test_send_mfsk_compact_confirm_reset_failure()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-COMPACT-RESET] SKIP: MFSK_ACK_SACK_ENABLED == 0\n");
+	return 0;
+#else
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-COMPACT-RESET] %s: %s\n", condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.load_configuration(CONFIG_0);
+
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_current_configuration = current_configuration;
+	int saved_ptt_on_delay_ms = ptt_on_delay_ms;
+	int saved_ptt_off_delay_ms = ptt_off_delay_ms;
+	int saved_pilot_tone_ms = pilot_tone_ms;
+	int saved_pilot_tone_hz = pilot_tone_hz;
+	sim_inproc_pump_fn saved_pump = g_sim_inproc_pump;
+	void* saved_pump_ctx = g_sim_inproc_pump_ctx;
+	rx_mute_capture_reset_authority_fn saved_reset_authority =
+		g_compact_confirm_capture_reset_authority;
+	int (*saved_transmit_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-COMPACT-RESET] FAIL: could not allocate playback ring\n");
+		return 1;
+	}
+
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	current_configuration = CONFIG_0;
+	ptt_on_delay_ms = 0;
+	ptt_off_delay_ms = 0;
+	pilot_tone_ms = 0;
+	pilot_tone_hz = 0;
+	g_compact_reset_test_ptt_off_calls = 0;
+	g_sim_inproc_pump = compact_reset_test_drain_playback;
+	g_sim_inproc_pump_ctx = NULL;
+	g_compact_confirm_capture_reset_authority = compact_reset_test_not_ready;
+	cl_tcp_socket::g_test_transmit_hook = compact_reset_test_transmit_hook;
+
+	const long long result = send_mfsk_compact_confirm(23);
+
+	check(result == -1, "NotReady returns the deterministic failure sentinel");
+	check(g_compact_reset_test_ptt_off_calls == 1,
+		"NotReady calls ptt_off exactly once");
+	check(test_telecom.data_container.rx_mute == 0,
+		"NotReady clears rx_mute");
+
+	cl_tcp_socket::g_test_transmit_hook = saved_transmit_hook;
+	g_compact_confirm_capture_reset_authority = saved_reset_authority;
+	g_sim_inproc_pump_ctx = saved_pump_ctx;
+	g_sim_inproc_pump = saved_pump;
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	current_configuration = saved_current_configuration;
+	ptt_on_delay_ms = saved_ptt_on_delay_ms;
+	ptt_off_delay_ms = saved_ptt_off_delay_ms;
+	pilot_tone_ms = saved_pilot_tone_ms;
+	pilot_tone_hz = saved_pilot_tone_hz;
+	playback_buffer = saved_playback;
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-COMPACT-RESET] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
+#endif
 }
 
 bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,

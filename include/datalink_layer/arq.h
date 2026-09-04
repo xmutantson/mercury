@@ -565,7 +565,10 @@ public:
   int test_l1_stage2_ownership();
   int test_gui_init_fail_closed();
   int test_audio_open_fail_closed();
+  int test_soundcard_list_alloc_fail_closed();
   int test_audio_thread_create_fail_closed();
+  int test_capture_allocation_fail_closed();
+  int test_sim_tx_bridge_allocation_fail_closed();
   int test_shm_unmap_fail_closed();
   int test_agw_server_start_fail_closed();
   int test_capture_enqueue_backpressure();
@@ -683,10 +686,13 @@ public:
   // or unknown values are rejected without changing the selected config.
   int test_modulation_cli_validation();
   int test_tx_level_cli_validation();
+  int test_tx_level_concurrent_sync();
   int test_bandpass_cli_validation();
+  int test_audio_device_path_bounds();
   // Audio subsystem spellings map exactly; an unknown token is rejected with
   // a diagnostic and cannot alter the caller's current selection.
   int test_audio_subsystem_cli_validation();
+  int test_bigblock_wav_short_read();
 
   int get_nOccupied_messages();
   int get_nFree_messages();
@@ -1136,11 +1142,15 @@ public:
   // legacy MFSK ACK pattern for NB / unsupported configurations).
   // OFDM_ACK_CLEAN was removed 2026-05-24 — see mfsk-robust-ack.md.
   //
-  // Returns wall-clock TX time in ms, or 0 if the feature is unavailable
-  // (NB session, M < 16, or compile-time gate MFSK_ACK_SACK_ENABLED=0).
+  // Returns wall-clock TX time in ms, 0 if the feature is unavailable
+  // (NB session, M < 16, or compile-time gate MFSK_ACK_SACK_ENABLED=0) or
+  // playback fails to drain, or -1 when the post-TX capture reset cannot be
+  // authorized.
   // Computes CRC12 over [bsi || bitmap] internally and emits the 16-symbol
   // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:30 | crc12:12].
   long long send_mfsk_ack_sack(unsigned char target_batch_seq_id, uint32_t bitmap);
+  int test_send_mfsk_ack_sack_drain_failure();
+  int test_send_mfsk_ack_sack_reset_failure(); // reset NotReady must unkey and restore RX state
 
   // Option B (data-flow-compact-confirm.md): emit the COMPACT coded reverse
   // confirm for a CLEAN (all-ones) batch — ACK base (16) + K=5 GF(16)-RA
@@ -1153,6 +1163,7 @@ public:
   // Peers without topgear still decode the unchanged prefix; default-off wire
   // remains exactly the existing compact confirm.
   long long send_mfsk_compact_confirm(unsigned char target_batch_seq_id);
+  int test_send_mfsk_compact_confirm_reset_failure();
 
   // Phase B Wave 2 v2 — PHY-level helpers for MFSK CONNECT.
   // These are called from inside the legacy state-machine dispatchers
@@ -1193,6 +1204,7 @@ public:
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   void send_hail_pattern();    // TX "I am Mercury" beacon
   int test_send_hail_drain_failure(); // drain failure must free buffers and unkey PTT
+  int test_send_mfsk_compact_confirm_drain_failure();
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
   void process_messages_rx_acks_control();
   void process_messages_rx_acks_data();
@@ -2618,6 +2630,10 @@ public:
   // PHY + audio ring buffers (no device, no bridge/prep threads, no TCP, no
   // relay). Returns 0 on a clean inline cycle, 1 on any failure. -m SIM_INPROC.
   int test_sim_inproc();
+
+  // Invalid SIM_INPROC pump contexts must be rejected before the pump becomes
+  // active or the caller enters send_batch()'s blocking waits.
+  int test_sim_inproc_pump_fail_closed();
 
   // 2-INSTANCE SIM_INPROC stepper (single-process-sim-refactor.md §10.5). Static
   // because it constructs its OWN two cl_telecom_system + two cl_arq_controller

@@ -10169,7 +10169,7 @@ static bool bigblock_read_wav(const char* path, std::vector<double>& out, int& s
 		{
 			uint32_t nbytes=csz;
 			pcm.resize(nbytes/2);
-			if(fread(pcm.data(),1,nbytes,f)!=nbytes){ /* short read tolerated */ }
+			if(fread(pcm.data(),1,nbytes,f)!=nbytes){ fclose(f); return false; }
 			haveData=true;
 			if(csz & 1) fseek(f, 1, SEEK_CUR); // pad byte
 		}
@@ -10189,6 +10189,53 @@ static bool bigblock_read_wav(const char* path, std::vector<double>& out, int& s
 	return true;
 }
 } // anon namespace
+
+int cl_telecom_system::test_bigblock_wav_short_read()
+{
+	char path[] = "/tmp/mercury_wav_short_read_XXXXXX";
+	int fd = mkstemp(path);
+	if(fd < 0){
+		printf("[TEST-BIGBLOCK-WAV-SHORT-READ] FAIL: mkstemp\n");
+		return 1;
+	}
+	FILE* f = fdopen(fd, "wb");
+	if(!f){
+		close(fd);
+		unlink(path);
+		printf("[TEST-BIGBLOCK-WAV-SHORT-READ] FAIL: fdopen\n");
+		return 1;
+	}
+
+	// Declare four S16 samples, but provide only two. The old reader accepted
+	// the zero-filled tail of pcm as real audio and returned success.
+	std::vector<unsigned char> wav;
+	wav.insert(wav.end(), {'R','I','F','F'});
+	wav_hdr_le::put_u32(wav, 44u);           // full RIFF size would be 52 bytes
+	wav.insert(wav.end(), {'W','A','V','E'});
+	wav.insert(wav.end(), {'f','m','t',' '});
+	wav_hdr_le::put_u32(wav, 16u);
+	wav_hdr_le::put_u16(wav, 1u);            // PCM
+	wav_hdr_le::put_u16(wav, 1u);            // mono
+	wav_hdr_le::put_u32(wav, 48000u);
+	wav_hdr_le::put_u32(wav, 96000u);
+	wav_hdr_le::put_u16(wav, 2u);
+	wav_hdr_le::put_u16(wav, 16u);
+	wav.insert(wav.end(), {'d','a','t','a'});
+	wav_hdr_le::put_u32(wav, 8u);            // declared payload
+	wav.insert(wav.end(), {0x01,0x00,0x02,0x00}); // truncated payload
+
+	bool wrote = fwrite(wav.data(), 1, wav.size(), f) == wav.size();
+	wrote = fclose(f) == 0 && wrote;
+	std::vector<double> pcm;
+	int sample_rate = 0, channels = 0;
+	bool accepted = wrote && bigblock_read_wav(path, pcm, sample_rate, channels);
+	unlink(path);
+
+	bool passed = wrote && !accepted;
+	printf("[TEST-BIGBLOCK-WAV-SHORT-READ] truncated data chunk accepted=%d: %s\n",
+	       accepted ? 1 : 0, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+}
 
 // Shared lattice rebuild — IDENTICAL to sfo_grid_test's thin-lattice setup, so the
 // TX framer, the RX deframer/estimator, and the pilot DBPSK sequence match exactly.

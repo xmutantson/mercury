@@ -162,6 +162,14 @@ int cl_arq_controller::test_audio_open_fail_closed()
 	return passed ? 0 : 1;
 }
 
+int cl_arq_controller::test_soundcard_list_alloc_fail_closed()
+{
+	const int failed = list_soundcards_dev_alloc_failure_selftest();
+	printf("[TEST-SOUNDCARD-LIST-ALLOC] dev_alloc failure uninitializes backend: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
 static std::atomic<int> audio_test_create_calls{0};
 static std::atomic<int> audio_test_join_calls{0};
 static std::atomic<int> audio_test_join_failures{0};
@@ -220,6 +228,22 @@ int cl_arq_controller::test_audio_thread_create_fail_closed()
 	       "joins=%d join_failures=%d: %s\n",
 	       result, creates, joins, join_failures, passed ? "PASS" : "FAIL");
 	return passed ? 0 : 1;
+}
+
+int cl_arq_controller::test_capture_allocation_fail_closed()
+{
+	const int failed = audioio_capture_allocation_failure_selftest();
+	printf("[TEST-CAPTURE-ALLOC] injected malloc failure rejects capture startup: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
+int cl_arq_controller::test_sim_tx_bridge_allocation_fail_closed()
+{
+	const int failed = sim_tx_bridge_allocation_failure_selftest();
+	printf("[TEST-SIM-TX-ALLOC] allocation failure requests shutdown: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
 }
 
 int cl_arq_controller::test_capture_enqueue_backpressure()
@@ -23261,7 +23285,51 @@ void sim_inproc_pump(void* ctxv)
 		ctx->clock_samples += sp;
 	}
 }
+
+// A pump that cannot advance a symbol turns every SIM_INPROC TX wait into an
+// unbounded spin. Validate the complete context before publishing the callback
+// globally so callers can fail closed without entering send_batch().
+bool sim_inproc_validate_pump(SimInprocPumpCtx* ctx)
+{
+	if (ctx == nullptr || ctx->symbol_period_samples <= 0 || ctx->scratch == nullptr)
+	{
+		arq_set_sim_inproc_pump(nullptr, nullptr);
+		fprintf(stderr, "[SIM_INPROC] ERROR: refusing unusable step-pump "
+		        "(symbol_period=%d, scratch=%s)\n",
+		        ctx == nullptr ? 0 : ctx->symbol_period_samples,
+		        (ctx != nullptr && ctx->scratch != nullptr) ? "set" : "NULL");
+		fflush(stderr);
+		return false;
+	}
+	return true;
+}
 }  // namespace
+
+int cl_arq_controller::test_sim_inproc_pump_fail_closed()
+{
+	arq_set_sim_inproc_pump(nullptr, nullptr);
+
+	SimInprocPumpCtx pump_ctx;
+	pump_ctx.symbol_period_samples = 128;
+	const bool null_scratch_rejected = !sim_inproc_validate_pump(&pump_ctx);
+	const bool null_scratch_closed = !arq_sim_inproc_active();
+
+	double scratch = 0.0;
+	pump_ctx.symbol_period_samples = 0;
+	pump_ctx.scratch = &scratch;
+	const bool zero_period_rejected = !sim_inproc_validate_pump(&pump_ctx);
+	const bool zero_period_closed = !arq_sim_inproc_active();
+
+	arq_set_sim_inproc_pump(nullptr, nullptr);
+	const bool passed = null_scratch_rejected && null_scratch_closed
+	                 && zero_period_rejected && zero_period_closed;
+	printf("[TEST-SIM-INPROC-PUMP] invalid scratch rejected=%d closed=%d; "
+	       "zero period rejected=%d closed=%d: %s\n",
+	       null_scratch_rejected, null_scratch_closed,
+	       zero_period_rejected, zero_period_closed, passed ? "PASS" : "FAIL");
+	fflush(stdout);
+	return passed ? 0 : 1;
+}
 
 int cl_arq_controller::test_sim_inproc()
 {
@@ -23316,6 +23384,20 @@ int cl_arq_controller::test_sim_inproc()
 	       nMessages);
 	fflush(stdout);
 
+	// Validate the allocation and derived geometry before installing the pump
+	// or enabling the deterministic clock. Otherwise send_batch() would enter
+	// blocking waits whose installed pump can make no progress.
+	SimInprocPumpCtx pump_ctx;
+	pump_ctx.symbol_period_samples = symbol_period;
+	if (symbol_period > 0)
+		pump_ctx.scratch = (double*)malloc((size_t)symbol_period * sizeof(double) * 2);
+	if (!sim_inproc_validate_pump(&pump_ctx))
+	{
+		check(false, "A2 step-pump context valid before installation");
+		if (pump_ctx.scratch != nullptr) free(pump_ctx.scratch);
+		return 1;
+	}
+
 	// passband_delayed_data + capture_prep_mutex are normally set up by
 	// audioio_init (audioio.c:1719) and the PHY load. send_batch() locks
 	// capture_prep_mutex and zeroes passband_delayed_data; the PHY load
@@ -23353,16 +23435,13 @@ int cl_arq_controller::test_sim_inproc()
 	check(sim_clock_enabled() != 0, "A3 virtual clock engaged");
 
 	// --- 4. Install the step-pump (the inline single-thread drainer) ---
-	SimInprocPumpCtx pump_ctx;
-	pump_ctx.symbol_period_samples = symbol_period;
-	pump_ctx.scratch = (double*)malloc((size_t)symbol_period * sizeof(double) * 2);
 	arq_set_sim_inproc_pump(sim_inproc_pump, &pump_ctx);
 	// Ensure the SIM_INPROC post-delivery spin-abort (fix #1) is disarmed for this
 	// single-instance stepper: sim_inproc_pump (NOT _2) never arms it, but a prior
 	// test_sim_inproc_2() run in the same process may have left it set — reset so the
 	// spin helpers here behave byte-identically to the unmodified single-instance path.
 	arq_set_sim_inproc_deliver_done(false);
-	check(pump_ctx.scratch != nullptr, "A4 step-pump installed");
+	check(true, "A4 valid step-pump installed");
 
 	// Non-zero PTT delays so the two PTT waits inside send_batch() MUST advance
 	// the virtual clock to exit — this is what proves the clock-advance pump

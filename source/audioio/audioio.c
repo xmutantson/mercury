@@ -136,8 +136,23 @@ static inline double noise_gaussian(void) {
 // 1.0 = unity (0 dB). Applied unconditionally in capture path.
 double rx_gain_linear = 1.0;
 
-// Optional --tx-level linear multiplier. Unity preserves the legacy TX path.
-double tx_level_linear = 1.0;
+// Optional --tx-level linear multiplier. The playback worker reads this while
+// control/main code may update it, so keep the storage private and atomic.
+// Callers must go through the validating accessors below.
+static std::atomic<double> tx_level_linear{1.0};
+
+bool audioio_set_tx_level(double level)
+{
+	if (!std::isfinite(level) || level < 0.0 || level > 1.0)
+		return false;
+	tx_level_linear.store(level, std::memory_order_release);
+	return true;
+}
+
+double audioio_get_tx_level(void)
+{
+	return tx_level_linear.load(std::memory_order_acquire);
+}
 
 // Tune tone state (for GUI tune button)
 static long tune_sample_index = 0;
@@ -187,6 +202,8 @@ static bool playback_thread_started = false;
 static bool capture_prep_thread_started = false;
 static audioio_pthread_create_fn audioio_pthread_create = pthread_create;
 static audioio_pthread_join_fn audioio_pthread_join = pthread_join;
+typedef void *(*audioio_malloc_fn)(size_t);
+static audioio_malloc_fn audioio_capture_malloc = malloc;
 
 void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
 										 audioio_pthread_join_fn join_fn)
@@ -227,6 +244,47 @@ static void publish_audio_startup(bool capture, int status)
 			current = status;
 	}
 	audio_startup_cv.notify_all();
+}
+
+static int allocate_capture_internal_buffer(double **buffer)
+{
+	*buffer = (double *)audioio_capture_malloc(
+		AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(double) * 2);
+	if(*buffer != NULL)
+		return 0;
+
+	fprintf(stderr, "ERROR: could not allocate capture conversion buffer\n");
+	publish_audio_startup(true, AUDIO_START_FAILED);
+	return -1;
+}
+
+static void *audioio_test_malloc_failure(size_t)
+{
+	return NULL;
+}
+
+int audioio_capture_allocation_failure_selftest(void)
+{
+	double *buffer = NULL;
+	audioio_malloc_fn saved_malloc = audioio_capture_malloc;
+	int saved_status;
+	{
+		std::lock_guard<std::mutex> lock(audio_startup_mutex);
+		saved_status = capture_startup_status;
+		capture_startup_status = AUDIO_START_PENDING;
+	}
+	audioio_capture_malloc = audioio_test_malloc_failure;
+	const int result = allocate_capture_internal_buffer(&buffer);
+	audioio_capture_malloc = saved_malloc;
+
+	bool passed;
+	{
+		std::lock_guard<std::mutex> lock(audio_startup_mutex);
+		passed = result != 0 && buffer == NULL
+		      && capture_startup_status == AUDIO_START_FAILED;
+		capture_startup_status = saved_status;
+	}
+	return passed ? 0 : 1;
 }
 #endif
 
@@ -871,9 +929,12 @@ void *radio_playback_thread(void *device_ptr)
 		// Apply TX gain from GUI
 		gui_apply_tx_gain(buffer_double, samples_read);
 #endif
-		if (tx_level_linear != 1.0) {
+		// One snapshot per audio block prevents a concurrent parameter update
+		// from applying two different levels within the same block.
+		const double tx_level = audioio_get_tx_level();
+		if (tx_level != 1.0) {
 			for (int i = 0; i < samples_read; i++)
-				buffer_double[i] *= tx_level_linear;
+				buffer_double[i] *= tx_level;
 		}
 
 		// convert from double to format-specific output
@@ -1657,8 +1718,6 @@ void *radio_capture_thread(void *device_ptr)
 		publish_audio_startup(true, AUDIO_START_FAILED);
         goto cleanup_cap;
     }
-	publish_audio_startup(true, AUDIO_START_READY);
-
 	printf("I/O capture (%s) format=%d (%s) / %dHz / %dch / %dms buffer\n",
 		conf.buf.device_id ? conf.buf.device_id : "default",
 		cfg->format,
@@ -1680,7 +1739,9 @@ void *radio_capture_thread(void *device_ptr)
     frame_size = cfg->channels * (cfg->format & 0xff) / 8;
     msec_bytes = cfg->sample_rate * frame_size / 1000;
 
-	buffer_internal = (double *) malloc(AUDIO_PAYLOAD_BUFFER_SIZE * sizeof(double) * 2);
+	if(allocate_capture_internal_buffer(&buffer_internal) != 0)
+		goto cleanup_cap;
+	publish_audio_startup(true, AUDIO_START_READY);
 
 	// Determine input channel index (0-based)
 	// For multi-channel devices (>2ch), configured_input_channel is used directly as index.
@@ -2189,6 +2250,74 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 }
 
 
+static int list_soundcards_test_init_calls = 0;
+static int list_soundcards_test_dev_alloc_calls = 0;
+static int list_soundcards_test_uninit_calls = 0;
+
+static int list_soundcards_test_init(ffaudio_init_conf *)
+{
+	list_soundcards_test_init_calls++;
+	return 0;
+}
+
+static ffaudio_dev *list_soundcards_test_dev_alloc(ffuint)
+{
+	list_soundcards_test_dev_alloc_calls++;
+	return NULL;
+}
+
+static void list_soundcards_test_uninit(void)
+{
+	list_soundcards_test_uninit_calls++;
+}
+
+static void list_soundcards_with_audio(ffaudio_interface *audio)
+{
+	ffaudio_init_conf aconf = {};
+	if ( audio->init(&aconf) != 0)
+    {
+        printf("Error in audio->init()\n");
+        return;
+    }
+
+	ffaudio_dev *d;
+
+	// FFAUDIO_DEV_PLAYBACK, FFAUDIO_DEV_CAPTURE
+	static const char* const mode[] = { "playback", "capture" };
+	for (ffuint i = 0;  i != 2;  i++)
+    {
+		printf("%s devices:\n", mode[i]);
+		d = audio->dev_alloc(i);
+        if (d == NULL)
+        {
+            printf("Error in audio->dev_alloc\n");
+			audio->uninit();
+            return;
+        }
+
+		for (;;)
+        {
+			int r = audio->dev_next(d);
+			if (r > 0)
+				break;
+			else
+                if (r < 0)
+                {
+                    printf("error: %s", audio->dev_error(d));
+                    break;
+                }
+
+			printf("device: name: '%s'  id: '%s'  default: %s\n"
+				, audio->dev_info(d, FFAUDIO_DEV_NAME)
+				, audio->dev_info(d, FFAUDIO_DEV_ID)
+				, audio->dev_info(d, FFAUDIO_DEV_IS_DEFAULT)
+				);
+		}
+
+		audio->dev_free(d);
+	}
+}
+
 void list_soundcards(int audio_system)
 {
     ffaudio_interface *audio;
@@ -2215,48 +2344,25 @@ void list_soundcards(int audio_system)
         audio = (ffaudio_interface *) &ffaaudio;
 #endif
 
-	ffaudio_init_conf aconf = {};
-	if ( audio->init(&aconf) != 0)
-    {
-        printf("Error in audio->init()\n");
-        return;
-    }
+	list_soundcards_with_audio(audio);
+}
 
-	ffaudio_dev *d;
+int list_soundcards_dev_alloc_failure_selftest(void)
+{
+	ffaudio_interface failing_audio = {};
 
-	// FFAUDIO_DEV_PLAYBACK, FFAUDIO_DEV_CAPTURE
-	static const char* const mode[] = { "playback", "capture" };
-	for (ffuint i = 0;  i != 2;  i++)
-    {
-		printf("%s devices:\n", mode[i]);
-		d = audio->dev_alloc(i);
-        if (d == NULL)
-        {
-            printf("Error in audio->dev_alloc\n");
-            return;
-        }
+	failing_audio.init = list_soundcards_test_init;
+	failing_audio.dev_alloc = list_soundcards_test_dev_alloc;
+	failing_audio.uninit = list_soundcards_test_uninit;
 
-		for (;;)
-        {
-			int r = audio->dev_next(d);
-			if (r > 0)
-				break;
-			else
-                if (r < 0)
-                {
-                    printf("error: %s", audio->dev_error(d));
-                    break;
-                }
+	list_soundcards_test_init_calls = 0;
+	list_soundcards_test_dev_alloc_calls = 0;
+	list_soundcards_test_uninit_calls = 0;
+	list_soundcards_with_audio(&failing_audio);
 
-			printf("device: name: '%s'  id: '%s'  default: %s\n"
-				, audio->dev_info(d, FFAUDIO_DEV_NAME)
-				, audio->dev_info(d, FFAUDIO_DEV_ID)
-				, audio->dev_info(d, FFAUDIO_DEV_IS_DEFAULT)
-				);
-		}
-
-		audio->dev_free(d);
-	}
+	return list_soundcards_test_init_calls == 1
+		&& list_soundcards_test_dev_alloc_calls == 1
+		&& list_soundcards_test_uninit_calls == 1 ? 0 : 1;
 }
 
 // ===========================================================================
@@ -2294,6 +2400,14 @@ typedef int sim_sock_t;
 
 static sim_sock_t sim_sock = SIM_BAD_SOCK;   // shared by both bridge threads
 static int sim_connected = 0;
+static int sim_tx_allocation_fails_for_test = 0;
+
+static void *sim_tx_chunk_alloc(size_t size)
+{
+	if (sim_tx_allocation_fails_for_test)
+		return NULL;
+	return malloc(size);
+}
 
 // GUARD 1 marker + g_sim_audio_guard_active are declared at file scope near the
 // top of this TU (before the device threads that reference them).
@@ -2411,7 +2525,12 @@ void *sim_tx_bridge_thread(void *unused)
 	if (sim_connect_once() != 0) { shutdown_ = true; return NULL; }
 
 	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
-	double *chunk = (double *)malloc(chunk_bytes);
+	double *chunk = (double *)sim_tx_chunk_alloc((size_t)chunk_bytes);
+	if (chunk == NULL) {
+		fprintf(stderr, "ERROR: SIM TX bridge chunk allocation failed\n");
+		shutdown_ = true;
+		return NULL;
+	}
 
 	// Clock-paced idle-silence throttle: engaged only on the wire-stamped
 	// 2-process phase-lock path. tx_samples = this peer's TX direction sample
@@ -2478,6 +2597,24 @@ void *sim_tx_bridge_thread(void *unused)
 	}
 	free(chunk);
 	return NULL;
+}
+
+int sim_tx_bridge_allocation_failure_selftest(void)
+{
+	const bool saved_shutdown = shutdown_.exchange(false);
+	const int saved_connected = sim_connected;
+
+	// Bypass only the relay connection so the real bridge entry point reaches
+	// its allocation without network or audio hardware.
+	sim_connected = 1;
+	sim_tx_allocation_fails_for_test = 1;
+	void *result = sim_tx_bridge_thread(NULL);
+	sim_tx_allocation_fails_for_test = 0;
+	sim_connected = saved_connected;
+
+	const bool passed = result == NULL && shutdown_.load();
+	shutdown_ = saved_shutdown;
+	return passed ? 0 : 1;
 }
 
 // RX bridge: pull channel-impaired passband from the relay and push it into

@@ -1892,6 +1892,11 @@ int cl_arq_controller::test_turbo_iterations_sentinel()
     return fails;
 }
 
+int cl_arq_controller::test_bigblock_wav_short_read()
+{
+	return cl_telecom_system::test_bigblock_wav_short_read();
+}
+
 // --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
 // pass-after self-test. See fact-documents/chase-combining-harq.md.
 //
@@ -2358,6 +2363,12 @@ static bool parse_audio_subsystem_cli(const char* value, int& audio_system,
     return true;
 }
 
+static void copy_audio_device_path(char* destination, const char* source)
+{
+    strncpy(destination, source, ALSA_MAX_PATH - 1);
+    destination[ALSA_MAX_PATH - 1] = '\0';
+}
+
 int cl_arq_controller::test_modulation_cli_validation()
 {
     int fails = 0;
@@ -2480,6 +2491,68 @@ int cl_arq_controller::test_tx_level_cli_validation()
     return fails;
 }
 
+int cl_arq_controller::test_tx_level_concurrent_sync()
+{
+    const double saved = audioio_get_tx_level();
+    int fails = 0;
+
+    // Fail closed: a malformed runtime parameter must not replace the last
+    // valid value. These are the same bounds enforced by --tx-level parsing.
+    if (!audioio_set_tx_level(0.25))
+        fails++;
+    const double before_invalid = audioio_get_tx_level();
+    const bool rejected = !audioio_set_tx_level(
+        std::numeric_limits<double>::quiet_NaN());
+    const bool unchanged = audioio_get_tx_level() == before_invalid;
+    if (!rejected || !unchanged)
+        fails++;
+
+    // Model a parameter callback publishing updates while the playback/main
+    // consumer snapshots the active level. The pre-fix global double makes
+    // this access a C++ data race; the accessor pair makes every publication
+    // atomic, and a consumer can use one coherent snapshot for a whole block.
+    std::atomic<bool> start{false};
+    std::atomic<bool> done{false};
+    std::atomic<int> writer_failures{0};
+    std::thread writer([&]() {
+        while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        for (int i = 0; i < 200000; ++i) {
+            const double value = (i & 1) ? 0.75 : 0.25;
+            if (!audioio_set_tx_level(value))
+                writer_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    start.store(true, std::memory_order_release);
+    int invalid_reads = 0;
+    do {
+        const double value = audioio_get_tx_level();
+        if (value != 0.25 && value != 0.75)
+            invalid_reads++;
+    } while (!done.load(std::memory_order_acquire));
+    writer.join();
+
+    const double final_value = audioio_get_tx_level();
+    if (writer_failures.load(std::memory_order_relaxed) != 0 ||
+        invalid_reads != 0 || final_value != 0.75)
+        fails++;
+
+    // Avoid leaking test state into later --test cases; the saved value came
+    // from the validated production store and therefore must restore cleanly.
+    const bool restored = audioio_set_tx_level(saved);
+    if (!restored)
+        fails++;
+
+    printf("[TEST-TX-LEVEL-SYNC] rejected-invalid=%d unchanged=%d "
+           "writer-failures=%d invalid-reads=%d final=%.2f restored=%d -> %s\n",
+           rejected ? 1 : 0, unchanged ? 1 : 0,
+           writer_failures.load(std::memory_order_relaxed), invalid_reads,
+           final_value, restored ? 1 : 0, fails == 0 ? "PASS" : "FAIL");
+    return fails;
+}
+
 int cl_arq_controller::test_bandpass_cli_validation()
 {
     int fails = 0;
@@ -2522,6 +2595,34 @@ int cl_arq_controller::test_bandpass_cli_validation()
     printf("[TEST-BANDPASS-CLI] %s (%d failure(s))\n",
            fails == 0 ? "PASS" : "FAIL", fails);
     return fails;
+}
+
+int cl_arq_controller::test_audio_device_path_bounds()
+{
+    char input[ALSA_MAX_PATH + 1];
+    char output[ALSA_MAX_PATH + 1];
+    memset(input, 0xa5, sizeof(input));
+    memset(output, 0xa5, sizeof(output));
+    input[ALSA_MAX_PATH] = 'I';
+    output[ALSA_MAX_PATH] = 'O';
+
+    const std::string overlong(ALSA_MAX_PATH + 72, 'i');
+    const std::string boundary(ALSA_MAX_PATH - 1, 'o');
+    copy_audio_device_path(input, overlong.c_str());
+    copy_audio_device_path(output, boundary.c_str());
+
+    const bool input_ok = input[ALSA_MAX_PATH - 1] == '\0'
+        && input[ALSA_MAX_PATH] == 'I'
+        && memcmp(input, overlong.data(), ALSA_MAX_PATH - 1) == 0;
+    const bool output_ok = output[ALSA_MAX_PATH - 1] == '\0'
+        && output[ALSA_MAX_PATH] == 'O'
+        && memcmp(output, boundary.data(), ALSA_MAX_PATH - 1) == 0;
+    const bool pass = input_ok && output_ok;
+
+    printf("[TEST-AUDIO-DEVICE-PATH] overlong-input=%s boundary-output=%s -> %s\n",
+           input_ok ? "PASS" : "FAIL", output_ok ? "PASS" : "FAIL",
+           pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
 }
 
 int cl_arq_controller::test_audio_subsystem_cli_validation()
@@ -2671,6 +2772,10 @@ int main(int argc, char *argv[])
             cl_arq_controller test_audio;
             return test_audio.test_audio_thread_create_fail_closed();
         }
+        if (strcmp(argv[i], "--test-sim-tx-allocation") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_sim_tx_bridge_allocation_fail_closed();
+        }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             // Pin the process-global C RNG to a fixed, platform-independent
@@ -2689,13 +2794,27 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_gbf_decoder_constraints();
                 failed += test_arq.test_modulation_cli_validation();
                 failed += test_arq.test_tx_level_cli_validation();
+                failed += test_arq.test_tx_level_concurrent_sync();
                 failed += test_arq.test_bandpass_cli_validation();
+                failed += test_arq.test_audio_device_path_bounds();
                 failed += test_arq.test_audio_subsystem_cli_validation();
                 failed += test_arq.test_shm_unmap_fail_closed();
+                failed += test_arq.test_bigblock_wav_short_read();
+                failed += test_arq.test_sim_inproc_pump_fail_closed();
             }
             {
                 cl_arq_controller test_hail;
                 failed += test_hail.test_send_hail_drain_failure();
+            }
+            {
+                cl_arq_controller test_mfsk_ack_sack;
+                failed += test_mfsk_ack_sack.test_send_mfsk_ack_sack_drain_failure();
+                cl_arq_controller test_ack;
+                failed += test_ack.test_send_mfsk_ack_sack_reset_failure();
+                cl_arq_controller test_compact_confirm;
+                failed += test_compact_confirm.test_send_mfsk_compact_confirm_drain_failure();
+                cl_arq_controller test_compact_reset;
+                failed += test_compact_reset.test_send_mfsk_compact_confirm_reset_failure();
             }
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
@@ -2744,7 +2863,10 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_audio;
                 failed += test_audio.test_audio_open_fail_closed();
+                failed += test_audio.test_soundcard_list_alloc_fail_closed();
                 failed += test_audio.test_audio_thread_create_fail_closed();
+                failed += test_audio.test_capture_allocation_fail_closed();
+                failed += test_audio.test_sim_tx_bridge_allocation_fail_closed();
                 failed += test_audio.test_capture_enqueue_backpressure();
             }
             // A second modem process must not share the configured AGW/TCP
@@ -5037,7 +5159,11 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "ERROR: %s\n", error.c_str());
                 return EXIT_FAILURE;
             }
-            tx_level_linear = tx_level;
+            if (!audioio_set_tx_level(tx_level))
+            {
+                fprintf(stderr, "ERROR: rejected TX level after validation\n");
+                return EXIT_FAILURE;
+            }
             for (int j = i; j < argc - 2; j++)
                 argv[j] = argv[j + 2];
             argc -= 2;
@@ -6569,11 +6695,11 @@ int main(int argc, char *argv[])
         {
         case 'i':
             if (optarg)
-                strncpy(input_dev, optarg, ALSA_MAX_PATH-1);
+                copy_audio_device_path(input_dev, optarg);
             break;
         case 'o':
             if (optarg)
-                strncpy(output_dev, optarg, ALSA_MAX_PATH-1);
+                copy_audio_device_path(output_dev, optarg);
             break;
         case 'r':
             if (!strcmp(optarg, "stockhf"))
@@ -6848,11 +6974,11 @@ start_modem:
 
             // Apply audio device settings from INI (if not overridden by command line)
             if (input_dev[0] == 0 && !g_settings.input_device.empty()) {
-                strncpy(input_dev, g_settings.input_device.c_str(), ALSA_MAX_PATH - 1);
+                copy_audio_device_path(input_dev, g_settings.input_device.c_str());
                 printf("Using input device from settings: %s\n", input_dev);
             }
             if (output_dev[0] == 0 && !g_settings.output_device.empty()) {
-                strncpy(output_dev, g_settings.output_device.c_str(), ALSA_MAX_PATH - 1);
+                copy_audio_device_path(output_dev, g_settings.output_device.c_str());
                 printf("Using output device from settings: %s\n", output_dev);
             }
 

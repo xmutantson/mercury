@@ -44,7 +44,11 @@
 
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
-extern double tx_level_linear;
+
+// Process-wide TX level shared by control/main code and the playback worker.
+// Invalid values are rejected without changing the active level.
+bool audioio_set_tx_level(double level);
+double audioio_get_tx_level(void);
 
 // Phase-F validation: override ALSA buffer length (Linux only). 0 = default 30ms.
 extern int g_audio_buffer_ms_override;
@@ -79,12 +83,15 @@ int capture_write_samples(double *buffer, size_t len);
 void capture_reset_samples(void);
 int capture_causal_tag_guard_selftest(cl_telecom_system *telecom_system);
 int capture_enqueue_backpressure_selftest(void);
+int audioio_capture_allocation_failure_selftest(void);
+int sim_tx_bridge_allocation_failure_selftest(void);
 // Conservative time from queued passband samples to physical/simulated output
 // egress, including the opened playback backend's retained-device bound.
 uint64_t playback_causal_egress_bound_ns(size_t queued_samples);
 
 
 void list_soundcards(int audio_system);
+int list_soundcards_dev_alloc_failure_selftest(void);
 
 #if defined(_WIN32)
 // Validate audio device configuration (stereo, sample rate)
