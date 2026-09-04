@@ -566,6 +566,9 @@ public:
   int test_l1_tx_journal_disabled_fail_closed();
   int test_l1_journal_disabled_mark_sent_many();
   int test_l1_stage2_ownership();
+  int test_l1_acknowledge_disabled_fail_closed();
+  int test_l1_terminalize_disabled_fail_closed();
+  int test_l1_tx_journal_disabled_migration();
   int test_gui_init_fail_closed();
   int test_audio_open_fail_closed();
   int test_soundcard_list_alloc_fail_closed();
@@ -575,9 +578,12 @@ public:
   int test_sim_tx_bridge_allocation_fail_closed();
   int test_sim_rx_bridge_allocation_fail_closed();
   int test_shm_unmap_fail_closed();
+  int test_suffix_soft_nb_unsupported_fail_closed();
+  int test_fir_dump_exit_fail_closed();
   int test_agw_server_start_fail_closed();
   int test_capture_enqueue_backpressure();
   int test_rx_transfer_read_failure();
+  int test_rx_test_stream_wait();
   int test_soundcard_restart_save_fail_closed();
   int test_soundcard_dialog_restart_fail_closed();
   int test_soundcard_audio_init_fail_closed();
@@ -1210,6 +1216,8 @@ public:
                                    uint8_t* out_ssid);
 
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
+  int test_send_break_drain_failure(); // drain failure must free buffers and unkey PTT
+  int test_send_break_pattern_reset_failure(); // reset NotReady must unkey and clear RX mute
   void send_hail_pattern();    // TX "I am Mercury" beacon
   int test_send_hail_drain_failure(); // drain failure must free buffers and unkey PTT
   int test_send_mfsk_compact_confirm_drain_failure();
@@ -3990,6 +3998,12 @@ public:
   // delivered + [RSP-DECOMPRESS-FALSE-ACCEPT-BLOCKED] loud detect. See
   // source/datalink_layer/test_decompress_false_accept.cc. Returns 0=PASS,1=FAIL.
   int test_decompress_false_accept();
+  // Compression reassembly bounds regression. Stages a stamp-carrying 96-frame
+  // compression batch whose transported size exceeds the former 16 KiB local
+  // buffer, then drives the real copy_data_to_buffer() funnel and verifies the
+  // plaintext FIFO and transported-byte cursor are both complete. The
+  // MERCURY_COMPRESS_REASSEMBLY_BOUNDS_DEFEAT=1 arm restores the old truncation.
+  int test_compress_reassembly_bounds();
 
   // R030 (race audit 2026-06-06) — v2 PENDING_ACK flip aliasing test.
   // CLI: --test-v2-pendingack-flip-alias. Builds a v2 MIXED batch with the

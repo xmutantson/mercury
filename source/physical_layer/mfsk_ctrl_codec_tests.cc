@@ -3704,23 +3704,53 @@ static void test_suffix_soft_pure_noise_far() {
 }
 
 // §9.5 — NB (M<16) unchanged: soft entry points return false (no suffix FEC).
+// Returns false when the NB configuration invariant has drifted, rather than
+// silently treating an unexercised decoder path as a passing test.
+static bool suffix_soft_nb_unsupported_check(cl_telecom_system& ts,
+	bool* soft_decode_exercised) {
+	*soft_decode_exercised = false;
+	if (ts.ack_mfsk.ack_sack_suffix_len() != 0)
+		return false;
+
+	cl_arq_controller arq;
+	std::vector<double> audio(16384, 0.0);
+	uint64_t rx_p38 = 0;
+	*soft_decode_exercised = true;
+	bool ok = ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(),
+		MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rx_p38, nullptr, nullptr);
+	return !ok;
+}
+
 static void test_suffix_soft_nb_unsupported() {
 	const char* name = "suffix_soft_nb_unsupported";
 	cl_telecom_system ts; ts.operation_mode = ARQ_MODE;
 	ts.narrowband_enabled = true;
 	ts.load_configuration(ROBUST_0);
-	cl_arq_controller arq;
-	if (ts.ack_mfsk.ack_sack_suffix_len() != 0) {
-		// Some builds keep ack_mfsk at M=16 even for NB data; only assert when
-		// the suffix is genuinely unsupported.
-		test_pass(name); return;
+	bool exercised = false;
+	if (!suffix_soft_nb_unsupported_check(ts, &exercised)) {
+		if (!exercised)
+			test_fail(name, "NB configuration unexpectedly has a non-zero suffix_len");
+		else
+			test_fail(name, "soft decode returned true on NB (suffix_len=0)");
+		return;
 	}
-	std::vector<double> audio(16384, 0.0);
-	uint64_t rx_p38 = 0;
-	bool ok = ts.decode_ctrl_suffix_from_passband_soft(audio.data(), (int)audio.size(),
-		MFSK_CTRL_START_CONN, prod_crc12_cb, &arq, &rx_p38, nullptr, nullptr);
-	if (ok) { test_fail(name, "soft decode returned true on NB (suffix_len=0)"); return; }
 	test_pass(name);
+}
+
+// Fail-before/pass-after regression for the test itself. Simulate configuration
+// drift through cl_mfsk's public initialization API and prove a non-zero NB
+// suffix is rejected instead of passing without exercising the soft decoder.
+int cl_arq_controller::test_suffix_soft_nb_unsupported_fail_closed() {
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE;
+	ts.narrowband_enabled = true;
+	ts.load_configuration(ROBUST_0);
+	ts.ack_mfsk.init(16, 50, 1);
+
+	bool exercised = false;
+	bool accepted = suffix_soft_nb_unsupported_check(ts, &exercised);
+	bool pass = ts.ack_mfsk.ack_sack_suffix_len() != 0 && !accepted && !exercised;
+	printf("[TEST-SUFFIX-NB-FAIL-CLOSED] %s\n", pass ? "PASS" : "FAIL");
+	return pass ? 0 : 1;
 }
 
 // §9.6 — THE MEASUREMENT: suffix decode cliff (P(CRC-pass) vs SNR3k) for the

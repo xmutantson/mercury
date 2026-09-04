@@ -7,16 +7,19 @@
 #include <unistd.h>
 #include <vector>
 
+namespace {
+struct EnvRestore {
+  const char* key;
+  bool had;
+  std::string value;
+  ~EnvRestore() {
+    if(had) setenv(key, value.c_str(), 1);
+    else unsetenv(key);
+  }
+};
+}  // namespace
+
 int cl_arq_controller::test_l1_tx_journal_disabled_fail_closed() {
-  struct EnvRestore {
-    const char* key;
-    bool had;
-    std::string value;
-    ~EnvRestore() {
-      if(had) setenv(key, value.c_str(), 1);
-      else unsetenv(key);
-    }
-  };
   const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
   const char* previous_blockack = std::getenv("MERCURY_L1_BLOCKACK");
   EnvRestore restore_journal = {"MERCURY_L1_JOURNAL",
@@ -42,15 +45,6 @@ int cl_arq_controller::test_l1_tx_journal_disabled_fail_closed() {
 }
 
 int cl_arq_controller::test_l1_journal_disabled_mark_sent_many() {
-  struct EnvRestore {
-    const char* key;
-    bool had;
-    std::string value;
-    ~EnvRestore() {
-      if(had) setenv(key, value.c_str(), 1);
-      else unsetenv(key);
-    }
-  };
   const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
   const char* previous_blockack = std::getenv("MERCURY_L1_BLOCKACK");
   EnvRestore restore_journal = {
@@ -67,6 +61,60 @@ int cl_arq_controller::test_l1_journal_disabled_mark_sent_many() {
                       !journal.mark_sent_many({{17, 3}}) &&
                       journal.size() == 0;
   std::printf("[TEST-L1-JOURNAL-DISABLED] %s mark_sent_many fails closed\n",
+              passed ? "PASS" : "FAIL");
+  return passed ? 0 : 1;
+}
+
+int cl_arq_controller::test_l1_terminalize_disabled_fail_closed() {
+  const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
+  const char* previous_blockack = std::getenv("MERCURY_L1_BLOCKACK");
+  EnvRestore restore_journal = {
+      "MERCURY_L1_JOURNAL", previous_journal != nullptr,
+      previous_journal ? std::string(previous_journal) : std::string()};
+  EnvRestore restore_blockack = {
+      "MERCURY_L1_BLOCKACK", previous_blockack != nullptr,
+      previous_blockack ? std::string(previous_blockack) : std::string()};
+  setenv("MERCURY_L1_JOURNAL", "0", 1);
+  setenv("MERCURY_L1_BLOCKACK", "0", 1);
+
+  mercury::L1TerminalQueue terminal;
+  mercury::L1TxJournal journal(&terminal);
+  const std::vector<char> queued = {'n', 'o', 't', '-', 'd', 'e', 'l', 'i',
+                                    'v', 'e', 'r', 'e', 'd'};
+  const bool empty_ok = journal.terminalize("nothing-pending", {});
+  const bool pending_refused =
+      !journal.terminalize("disabled-with-pending-data", queued);
+  const bool no_report = terminal.size() == 0;
+
+  int failures = 0;
+  auto check = [&](bool ok, const char* name) {
+    std::printf("[TEST-L1-TERMINAL-DISABLED] %s %s\n",
+                ok ? "PASS" : "FAIL", name);
+    if(!ok) failures++;
+  };
+  check(empty_ok, "empty terminalization remains a no-op success");
+  check(pending_refused,
+        "pending plaintext cannot claim terminal delivery while disabled");
+  check(no_report, "disabled journal emitted no terminal receipt");
+  return failures ? 1 : 0;
+}
+
+int cl_arq_controller::test_l1_tx_journal_disabled_migration() {
+  const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
+  const char* previous_blockack = std::getenv("MERCURY_L1_BLOCKACK");
+  EnvRestore restore_journal = {
+      "MERCURY_L1_JOURNAL", previous_journal != nullptr,
+      previous_journal ? std::string(previous_journal) : std::string()};
+  EnvRestore restore_blockack = {
+      "MERCURY_L1_BLOCKACK", previous_blockack != nullptr,
+      previous_blockack ? std::string(previous_blockack) : std::string()};
+  setenv("MERCURY_L1_JOURNAL", "0", 1);
+  setenv("MERCURY_L1_BLOCKACK", "0", 1);
+
+  mercury::L1TxJournal journal;
+  const bool passed = !journal.enabled() &&
+                      !journal.migrate_authenticated(41, 0xfeedbeefULL);
+  std::printf("[TEST-L1-JOURNAL-DISABLED-MIGRATION] %s\n",
               passed ? "PASS" : "FAIL");
   return passed ? 0 : 1;
 }
@@ -172,15 +220,6 @@ int cl_arq_controller::l1_test_timeout_case(const char* marker,
 }
 
 int cl_arq_controller::test_l1_stage2_ownership() {
-  struct EnvRestore {
-    const char* key;
-    bool had;
-    std::string value;
-    ~EnvRestore() {
-      if(had) setenv(key, value.c_str(), 1);
-      else unsetenv(key);
-    }
-  };
   const char* previous_state = std::getenv("MERCURY_L1_JOURNAL_STATE");
   const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
   EnvRestore restore_state = {"MERCURY_L1_JOURNAL_STATE",
@@ -212,4 +251,23 @@ int cl_arq_controller::test_l1_stage2_ownership() {
   std::printf("[TEST-L1-STAGE2] %s failures=%d before={%d,%d,%d} after={%d,%d,%d}\n",
       failures ? "FAIL" : "PASS", failures, ba, bq, br, aa, aq, ar);
   return failures ? 1 : 0;
+}
+
+int cl_arq_controller::test_l1_acknowledge_disabled_fail_closed() {
+  const char* previous_journal = std::getenv("MERCURY_L1_JOURNAL");
+  const char* previous_blockack = std::getenv("MERCURY_L1_BLOCKACK");
+  EnvRestore restore_journal = {
+      "MERCURY_L1_JOURNAL", previous_journal != nullptr,
+      previous_journal ? std::string(previous_journal) : std::string()};
+  EnvRestore restore_blockack = {
+      "MERCURY_L1_BLOCKACK", previous_blockack != nullptr,
+      previous_blockack ? std::string(previous_blockack) : std::string()};
+  setenv("MERCURY_L1_JOURNAL", "0", 1);
+  setenv("MERCURY_L1_BLOCKACK", "0", 1);
+
+  mercury::L1TxJournal journal;
+  const bool passed = !journal.enabled() &&
+                      !journal.acknowledge_many({{42, 7}});
+  std::printf("[TEST-L1-ACK-DISABLED] %s\n", passed ? "PASS" : "FAIL");
+  return passed ? 0 : 1;
 }

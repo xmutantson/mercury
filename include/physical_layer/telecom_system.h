@@ -804,7 +804,8 @@ public:
 
 	void calculate_parameters();
 
-	void init();
+	// Returns 0 on success and -1 when initialization is intentionally stopped.
+	int init();
 	void deinit();
 	cl_plot BER_plot, constellation_plot;
 
@@ -1128,8 +1129,10 @@ public:
 	// = clean) optionally adds AWGN.
 	void bigblock_livepath_loopback();
 
-	void load_configuration();
-	void load_configuration(int configuration);
+	// Returns 0 on success and -1 when the configuration is invalid or PHY
+	// initialization fails.
+	int load_configuration();
+	int load_configuration(int configuration);
 	// PRECOOK (Stage 1): allocate the persistent shared capture ring ONCE at the MAX geometry
 	// across every FULL_CONFIG_LADDER config in BOTH bandwidths, then pin it
 	// (data_container.precook_ring_pinned=true) so load_configuration never frees/reallocs it —

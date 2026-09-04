@@ -113,7 +113,7 @@ void L1TxJournal::begin_session(uint8_t wire_connection_id,
 
 bool L1TxJournal::migrate_authenticated(uint8_t wire_connection_id,
                                         uint64_t authenticated_transfer_id) {
-  if (!enabled_) return true;
+  if (!enabled_) return false;
   if (!authenticated_transfer_id_ ||
       authenticated_transfer_id != authenticated_transfer_id_) return false;
   const uint64_t serial = g_session_counter.fetch_add(1);
@@ -248,7 +248,7 @@ bool L1TxJournal::acknowledge(uint8_t bsi, uint16_t slot) {
 
 bool L1TxJournal::acknowledge_many(
     const std::vector<std::pair<uint8_t, uint16_t>>& keys) {
-  if (!enabled_) return true;
+  if (!enabled_) return false;
   const std::vector<L1JournalEntry> entries_before = entries_;
   const std::vector<L1JournalKey> acknowledged_before = acknowledged_;
   std::vector<L1JournalKey> resolved;
@@ -318,7 +318,7 @@ void L1TxJournal::apply(L1ResetEvent event) {
 
 bool L1TxJournal::terminalize(const char* reason,
                               const std::vector<char>& queued_plaintext) {
-  if (!enabled_) return true;
+  if (!enabled_) return entries_.empty() && queued_plaintext.empty();
   if (entries_.empty() && queued_plaintext.empty()) return true;
   if (!terminal_owner_) return false;
   L1TerminalReport report;

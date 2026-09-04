@@ -81,6 +81,20 @@ int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len);
 // a START-ACK causal-generation tag through the same reset/read lifecycle.
 int capture_write_samples(double *buffer, size_t len);
 void capture_reset_samples(void);
+
+// RX_TEST stream-ready wait. The capture-prep producer signals this immediately
+// after publishing data_ready=1. The timeout is only a monotonic shutdown
+// backstop; callers must check the result and must not decode on ERROR/TIMEOUT.
+enum audioio_rx_ready_wait_result {
+	AUDIOIO_RX_READY_WAIT_ERROR = -1,
+	AUDIOIO_RX_READY_WAIT_TIMEOUT = 0,
+	AUDIOIO_RX_READY_WAIT_READY = 1,
+	AUDIOIO_RX_READY_WAIT_SHUTDOWN = 2
+};
+int audioio_wait_for_rx_ready(cl_data_container *data_container,
+						  unsigned int timeout_ms);
+void audioio_signal_rx_ready(void);
+
 int capture_causal_tag_guard_selftest(cl_telecom_system *telecom_system);
 int capture_enqueue_backpressure_selftest(void);
 int rx_transfer_read_failure_selftest(void);

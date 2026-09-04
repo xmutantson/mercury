@@ -49,6 +49,7 @@
 
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
+extern "C" { extern std::atomic<bool> shutdown_; }
 
 // Test mode: artificial TX carrier offset in Hz (for testing frequency sync)
 extern "C" double test_tx_carrier_offset;
@@ -6964,7 +6965,7 @@ void cl_telecom_system::ack_pattern_detection_test()
 	delete[] rx_buffer;
 }
 
-void cl_telecom_system::init()
+int cl_telecom_system::init()
 {
 	if(ofdm.Nc==AUTO_SELLECT)
 	{
@@ -7269,8 +7270,8 @@ void cl_telecom_system::init()
 	// byte-identical). filter_coefficients is private, so we emit the public design
 	// params (nTaps/cuts/transition/window/type/fs) — the windowed-sinc response is
 	// deterministic from these, replicated 1:1 in the Python analyzer. With
-	// MERCURY_FIR_DUMP_EXIT set we exit BEFORE the Nc-coupled decode path, so wide-Nc
-	// runs never touch invalid LDPC framing.
+	// MERCURY_FIR_DUMP_EXIT set we stop initialization BEFORE the Nc-coupled decode
+	// path, so wide-Nc runs never touch invalid LDPC framing.
 	{
 		const char* _fd = std::getenv("MERCURY_FIR_DUMP");
 		if(_fd && atoi(_fd) != 0)
@@ -7302,7 +7303,12 @@ void cl_telecom_system::init()
 				ofdm.FIR_rx_time_sync.filter_transition_bandwidth, ofdm.FIR_rx_time_sync.sampling_frequency);
 			fflush(stdout);
 			const char* _fde = std::getenv("MERCURY_FIR_DUMP_EXIT");
-			if(_fde && atoi(_fde) != 0) { exit(0); }
+			if(_fde && atoi(_fde) != 0)
+			{
+				fprintf(stderr, "[PHY] FIR dump requested initialization stop\n");
+				fflush(stderr);
+				return -1;
+			}
 		}
 	}
 
@@ -7402,6 +7408,7 @@ void cl_telecom_system::init()
 	receive_stats.signal_stregth_dbm=-999;
 	consecutive_ofdm_decode_fails=0;  // STALE-CFO scoped reset (long-run-degradation.md §2.2)
 
+	return 0;
 }
 
 void cl_telecom_system::deinit()
@@ -7633,8 +7640,34 @@ void cl_telecom_system::RX_TEST_process_main()
 
 	if(data_container.data_ready == 0)
 	{
-		msleep(1);
-		return;
+		const char* stream_wait_env = std::getenv("MERCURY_RX_TEST_STREAM_WAIT");
+		const bool stream_wait_enabled = stream_wait_env != NULL
+			&& *stream_wait_env != '\0' && atoi(stream_wait_env) != 0;
+		if(!stream_wait_enabled)
+		{
+			// Behavioral rollout is default-OFF: preserve the legacy poll unless
+			// the operator explicitly enables the stream-conditioned wait.
+			msleep(1);
+			return;
+		}
+
+		const int wait_result = audioio_wait_for_rx_ready(&data_container, 100U);
+		if(wait_result == AUDIOIO_RX_READY_WAIT_READY)
+		{
+			// Continue directly into the snapshot; do not yield a newly-ready
+			// frame back to the outer polling loop.
+		}
+		else if(wait_result == AUDIOIO_RX_READY_WAIT_TIMEOUT
+			 || wait_result == AUDIOIO_RX_READY_WAIT_SHUTDOWN)
+		{
+			return;
+		}
+		else
+		{
+			fprintf(stderr, "ERROR: RX_TEST stream-ready wait failed\n");
+			shutdown_ = true;
+			return;
+		}
 	}
 
 	MUTEX_LOCK(&capture_prep_mutex);
@@ -12769,9 +12802,9 @@ void cl_telecom_system::set_robust_preamble_negotiated(bool on)
 	}
 }
 
-void cl_telecom_system::load_configuration()
+int cl_telecom_system::load_configuration()
 {
-	this->load_configuration(default_configurations_telecom_system.init_configuration);
+	return this->load_configuration(default_configurations_telecom_system.init_configuration);
 }
 
 // MFSK parametric-search sweep: env override of the MFSK alphabet (M) and stream
@@ -12797,17 +12830,17 @@ static int mfsk_selected_Nc(bool narrowband_enabled)
 	return Nc;
 }
 
-void cl_telecom_system::load_configuration(int configuration)
+int cl_telecom_system::load_configuration(int configuration)
 {
 	if(configuration==current_configuration)
 	{
-		return;
+		return 0;
 	}
 
 	if(configuration<0 || (configuration>=NUMBER_OF_CONFIGS
 		&& !is_robust_config(configuration) && !is_low48_anchor_config(configuration)))
 	{
-		return;
+		return -1;
 	}
 	if(is_low48_anchor_config(configuration) && narrowband_enabled == YES)
 	{
@@ -12839,7 +12872,7 @@ void cl_telecom_system::load_configuration(int configuration)
 		if(_swap_idx >= 0)
 		{
 			load_configuration_swap(configuration, _swap_idx);
-			return;
+			return 0;
 		}
 		// PRECOOK V2 (Step C) — LOUD CLOSURE. Reaching the legacy body under a pinned ring with the
 		// bundles built means NO bundle matched (cfg, bandwidth): an out-of-ladder config (CONFIG_17)
@@ -13492,7 +13525,16 @@ void cl_telecom_system::load_configuration(int configuration)
 		printf("[PHY-SWITCH] init() start (nb=%d M=%.0f config=%d)\n",
 			narrowband_enabled, M, current_configuration);
 		fflush(stdout);
-		this->init();
+		const int init_status = this->init();
+		if(init_status != 0)
+		{
+			if(capture_mutex_held)
+			{
+				MUTEX_UNLOCK(&capture_prep_mutex);
+				capture_mutex_held = false;
+			}
+			return init_status;
+		}
 		printf("[PHY-SWITCH] init() done (Nc=%d Nsymb=%d Nofdm=%d buffer_Nsymb=%d)\n",
 			ofdm.Nc, ofdm.Nsymb, (int)data_container.Nofdm, (int)data_container.buffer_Nsymb);
 		fflush(stdout);
@@ -13720,6 +13762,8 @@ void cl_telecom_system::load_configuration(int configuration)
 		MUTEX_UNLOCK(&capture_prep_mutex);
 		in_precook_publish = false;
 	}
+
+	return 0;
 }
 
 // PRECOOK (Stage 2) STEP 3 — the M3 config swap. Installs config_bundles[idx] as the LIVE

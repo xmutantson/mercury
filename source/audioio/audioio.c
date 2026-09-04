@@ -19,7 +19,9 @@
 #include <atomic>
 #include <algorithm>
 #include <condition_variable>
+#include <chrono>
 #include <mutex>
+#include <system_error>
 #include <vector>
 #else
 #include <stdatomic.h>
@@ -198,6 +200,13 @@ enum audio_startup_status {
 };
 static std::mutex audio_startup_mutex;
 static std::condition_variable audio_startup_cv;
+// Stream condition for RX_TEST. The generation makes every producer
+// publication observable even when data_ready toggles faster than the old
+// 1-ms polling interval. It is protected by rx_ready_mutex so the predicate
+// check and wait cannot lose a notification.
+static std::mutex rx_ready_mutex;
+static std::condition_variable rx_ready_cv;
+static uint64_t rx_ready_generation = 0;
 static int capture_startup_status = AUDIO_START_PENDING;
 static int playback_startup_status = AUDIO_START_PENDING;
 static bool capture_thread_started = false;
@@ -210,6 +219,53 @@ static audioio_malloc_fn audioio_capture_malloc = malloc;
 static audioio_malloc_fn audioio_payload_malloc = malloc;
 static bool audioio_payload_malloc_overridden = false;
 static bool audioio_payload_buffers_heap_backed = false;
+
+int audioio_wait_for_rx_ready(cl_data_container *data_container,
+						  unsigned int timeout_ms)
+{
+	// A zero or unreasonably large backstop is a caller error. Refuse it rather
+	// than accidentally converting this stream wait into an unbounded block.
+	if(data_container == NULL || timeout_ms == 0 || timeout_ms > 60000U)
+		return AUDIOIO_RX_READY_WAIT_ERROR;
+
+	try
+	{
+		std::unique_lock<std::mutex> lock(rx_ready_mutex);
+		const uint64_t observed_generation = rx_ready_generation;
+		if(data_container->data_ready.load(std::memory_order_acquire) != 0)
+			return AUDIOIO_RX_READY_WAIT_READY;
+		if(shutdown_.load(std::memory_order_acquire))
+			return AUDIOIO_RX_READY_WAIT_SHUTDOWN;
+
+		const std::chrono::steady_clock::time_point deadline =
+			std::chrono::steady_clock::now()
+			+ std::chrono::milliseconds(timeout_ms);
+		const bool changed = rx_ready_cv.wait_until(lock, deadline, [&] {
+			return data_container->data_ready.load(std::memory_order_acquire) != 0
+				|| shutdown_.load(std::memory_order_acquire)
+				|| rx_ready_generation != observed_generation;
+		});
+		if(!changed)
+			return AUDIOIO_RX_READY_WAIT_TIMEOUT;
+		if(shutdown_.load(std::memory_order_acquire))
+			return AUDIOIO_RX_READY_WAIT_SHUTDOWN;
+		return data_container->data_ready.load(std::memory_order_acquire) != 0
+			? AUDIOIO_RX_READY_WAIT_READY : AUDIOIO_RX_READY_WAIT_TIMEOUT;
+	}
+	catch(const std::system_error&)
+	{
+		return AUDIOIO_RX_READY_WAIT_ERROR;
+	}
+}
+
+void audioio_signal_rx_ready(void)
+{
+	{
+		std::lock_guard<std::mutex> lock(rx_ready_mutex);
+		++rx_ready_generation;
+	}
+	rx_ready_cv.notify_all();
+}
 
 void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
 										 audioio_pthread_join_fn join_fn)
@@ -2027,6 +2083,9 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 	double c1_lw_sum_us = 0.0;
 	long   c1_lw_samples = 0;
 	long   c1_lw_n_over  = 0;
+	const char* rx_test_wait_env = getenv("MERCURY_RX_TEST_STREAM_WAIT");
+	const bool rx_test_stream_wait = rx_test_wait_env != NULL
+		&& *rx_test_wait_env != '\0' && atoi(rx_test_wait_env) != 0;
 
 	// [CBC-METER] construction meter (Step-0 prevention needle). Reads the gate
 	// once and resets the process-lifetime accumulators so the summary is clean
@@ -2228,8 +2287,12 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 			data_container_ptr->data_ready = 1;
 		}
 		MUTEX_UNLOCK(&capture_prep_mutex);
+		if(rx_test_stream_wait)
+			audioio_signal_rx_ready();
 	}
 
+	if(rx_test_stream_wait)
+		audioio_signal_rx_ready();
 
 	printf("radio_capture_prep_thread exit\n");
 	if(c1_lw_probe) {

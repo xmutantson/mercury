@@ -17177,6 +17177,18 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 	return true;
 }
 
+// Test seams for the BREAK drain-failure regression. Production keeps the real
+// wait and delete[] implementations; --test temporarily substitutes observers.
+typedef bool (*break_drain_wait_fn)();
+typedef void (*break_buffer_delete_fn)(double*);
+static void delete_break_buffer(double* buffer) { delete[] buffer; }
+static break_drain_wait_fn g_break_drain_wait = drain_playback_wait;
+static break_buffer_delete_fn g_break_buffer_delete = delete_break_buffer;
+// Test seam for the BREAK capture-reset failure regression. Production uses
+// the same checked reset authority as the MFSK ACK path above.
+static rx_mute_capture_reset_fn g_break_capture_reset_authority =
+	reset_capture_after_rx_mute;
+
 // Transmit BREAK tone pattern — emergency "drop to ROBUST_0" signal
 void cl_arq_controller::send_break_pattern()
 {
@@ -17281,16 +17293,32 @@ void cl_arq_controller::send_break_pattern()
 
 	tx_transfer(&filtered2[symbol_period], pattern_samples);
 
-	drain_playback_wait();
+	if(!g_break_drain_wait())
+	{
+		// A shutdown or harness no-progress abort leaves queued audio unsent.
+		// Fail closed before returning: unkey the radio and release every
+		// frame buffer owned by this send operation.
+		ptt_off();
+		g_break_buffer_delete(raw_output);
+		g_break_buffer_delete(filtered1);
+		g_break_buffer_delete(filtered2);
+		return;
+	}
 
-	delete[] raw_output;
-	delete[] filtered1;
-	delete[] filtered2;
+	g_break_buffer_delete(raw_output);
+	g_break_buffer_delete(filtered1);
+	g_break_buffer_delete(filtered2);
 
 	// Flush before ptt_off_delay (same rationale as send_ack_pattern).
 	telecom_system->data_container.rx_mute = 1;
-	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);  // §5.7-B5: gate-off (no async drainer in-process); reset still fires
-	capture_reset_samples();
+	if(g_break_capture_reset_authority() != RxMuteCaptureResetResult::Ready)
+	{
+		// Reset authority was unavailable after keying and muting. Fail closed:
+		// unkey immediately and leave receive capture unmuted for the caller.
+		ptt_off();
+		telecom_system->data_container.rx_mute = 0;
+		return;
+	}
 	{
 		int buf_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.buffer_Nsymb * telecom_system->data_container.interpolation_rate;
 		MUTEX_LOCK(&capture_prep_mutex);
@@ -17317,6 +17345,223 @@ void cl_arq_controller::send_break_pattern()
 	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 
 	ptt_off();
+}
+
+static int g_break_test_freed_buffers = 0;
+static int g_break_test_ptt_off_calls = 0;
+
+static bool break_test_drain_not_ready()
+{
+	return false;
+}
+
+static void break_test_delete_buffer(double* buffer)
+{
+	if(buffer != NULL)
+		g_break_test_freed_buffers++;
+	delete[] buffer;
+}
+
+static int g_break_reset_test_calls = 0;
+static int g_break_reset_test_ptt_off_calls = 0;
+
+static RxMuteCaptureResetResult break_test_reset_not_ready()
+{
+	g_break_reset_test_calls++;
+	return RxMuteCaptureResetResult::NotReady;
+}
+
+static void break_test_playback_pump(void*)
+{
+	clear_buffer(playback_buffer);
+}
+
+static int break_test_transmit_hook(const char* buffer, int length)
+{
+	static const char ptt_off_command[] = "PTT OFF\r";
+	if(length == (int)sizeof(ptt_off_command) - 1
+	   && memcmp(buffer, ptt_off_command, sizeof(ptt_off_command) - 1) == 0)
+		g_break_test_ptt_off_calls++;
+	return length;
+}
+
+static int break_reset_test_transmit_hook(const char* buffer, int length)
+{
+	static const char ptt_off_command[] = "PTT OFF\r";
+	if(length == (int)sizeof(ptt_off_command) - 1
+	   && memcmp(buffer, ptt_off_command, sizeof(ptt_off_command) - 1) == 0)
+		g_break_reset_test_ptt_off_calls++;
+	return length;
+}
+
+// Fail-before/pass-after regression for the drain-failure exit in
+// send_break_pattern(). The injected NotReady-equivalent result must unkey PTT
+// and release all three frame buffers. Delays are zero so the test does not
+// depend on wall-clock timing.
+int cl_arq_controller::test_send_break_drain_failure()
+{
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-BREAK-DRAIN] %s: %s\n", condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.load_configuration(CONFIG_0);
+
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_configuration = current_configuration;
+	int saved_ptt_on_delay_ms = ptt_on_delay_ms;
+	int saved_ptt_off_delay_ms = ptt_off_delay_ms;
+	int saved_pilot_tone_ms = pilot_tone_ms;
+	int saved_pilot_tone_hz = pilot_tone_hz;
+	break_drain_wait_fn saved_drain_wait = g_break_drain_wait;
+	break_buffer_delete_fn saved_buffer_delete = g_break_buffer_delete;
+	int (*saved_transmit_hook)(const char*, int) =
+		cl_tcp_socket::g_test_transmit_hook;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-BREAK-DRAIN] FAIL: could not allocate playback ring\n");
+		return 1;
+	}
+
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	current_configuration = CONFIG_0;
+	ptt_on_delay_ms = 0;
+	ptt_off_delay_ms = 0;
+	pilot_tone_ms = 0;
+	pilot_tone_hz = 0;
+	g_break_test_freed_buffers = 0;
+	g_break_test_ptt_off_calls = 0;
+	g_break_drain_wait = break_test_drain_not_ready;
+	g_break_buffer_delete = break_test_delete_buffer;
+	cl_tcp_socket::g_test_transmit_hook = break_test_transmit_hook;
+
+	send_break_pattern();
+
+	check(size_buffer(test_playback) > 0,
+		"mock drain failure was reached after BREAK audio was queued");
+	check(g_break_test_ptt_off_calls == 1,
+		"drain failure calls ptt_off exactly once");
+	check(g_break_test_freed_buffers == 3,
+		"drain failure frees raw_output, filtered1, and filtered2");
+
+	cl_tcp_socket::g_test_transmit_hook = saved_transmit_hook;
+	g_break_buffer_delete = saved_buffer_delete;
+	g_break_drain_wait = saved_drain_wait;
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	current_configuration = saved_configuration;
+	ptt_on_delay_ms = saved_ptt_on_delay_ms;
+	ptt_off_delay_ms = saved_ptt_off_delay_ms;
+	pilot_tone_ms = saved_pilot_tone_ms;
+	pilot_tone_hz = saved_pilot_tone_hz;
+	playback_buffer = saved_playback;
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-BREAK-DRAIN] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed,
+		failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
+}
+
+// Fail-before/pass-after regression for the reset-authority failure after
+// send_break_pattern() has keyed PTT and committed rx_mute=1. Delays are zero
+// and the in-process pump drains playback, so the test does not depend on wall
+// time. Only the capture-reset authority is mocked.
+int cl_arq_controller::test_send_break_pattern_reset_failure()
+{
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-BREAK-RESET] %s: %s\n",
+			condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	test_telecom.load_configuration(CONFIG_0);
+
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_current_configuration = current_configuration;
+	int saved_ptt_on_delay_ms = ptt_on_delay_ms;
+	int saved_ptt_off_delay_ms = ptt_off_delay_ms;
+	int saved_pilot_tone_ms = pilot_tone_ms;
+	int saved_pilot_tone_hz = pilot_tone_hz;
+	rx_mute_capture_reset_fn saved_reset_authority =
+		g_break_capture_reset_authority;
+	sim_inproc_pump_fn saved_pump = g_sim_inproc_pump;
+	void* saved_pump_ctx = g_sim_inproc_pump_ctx;
+	int (*saved_transmit_hook)(const char*, int) =
+		cl_tcp_socket::g_test_transmit_hook;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-BREAK-RESET] FAIL: could not allocate playback ring\n");
+		return 1;
+	}
+
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	current_configuration = CONFIG_0;
+	ptt_on_delay_ms = 0;
+	ptt_off_delay_ms = 0;
+	pilot_tone_ms = 0;
+	pilot_tone_hz = 0;
+	test_telecom.data_container.rx_mute = 0;
+	g_break_reset_test_calls = 0;
+	g_break_reset_test_ptt_off_calls = 0;
+	g_break_capture_reset_authority = break_test_reset_not_ready;
+	arq_set_sim_inproc_pump(break_test_playback_pump, NULL);
+	cl_tcp_socket::g_test_transmit_hook = break_reset_test_transmit_hook;
+
+	send_break_pattern();
+
+	check(g_break_reset_test_calls == 1,
+		"NotReady reset authority is reached exactly once");
+	check(g_break_reset_test_ptt_off_calls == 1,
+		"NotReady calls ptt_off exactly once");
+	check(test_telecom.data_container.rx_mute.load() == 0,
+		"NotReady restores rx_mute to zero");
+
+	cl_tcp_socket::g_test_transmit_hook = saved_transmit_hook;
+	arq_set_sim_inproc_pump(saved_pump, saved_pump_ctx);
+	g_break_capture_reset_authority = saved_reset_authority;
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	current_configuration = saved_current_configuration;
+	ptt_on_delay_ms = saved_ptt_on_delay_ms;
+	ptt_off_delay_ms = saved_ptt_off_delay_ms;
+	pilot_tone_ms = saved_pilot_tone_ms;
+	pilot_tone_hz = saved_pilot_tone_hz;
+	playback_buffer = saved_playback;
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-BREAK-RESET] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed,
+		failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
 }
 
 // =============================================================================
@@ -21840,8 +22085,8 @@ void cl_arq_controller::copy_data_to_buffer()
 	// reassembled + delivered = Σ ACKED messages_rx[i].length for i<data_batch_size. The
 	// SAME quantity the sender committed (INV5). Advances rx_stream_delivered at
 	// copy_data_done (the single receiver funnel — covers in-order, cross-storage PREV,
-	// orphan, and bigblock delivery). Counted independent of the 16 KB `assembled` cap so
-	// it equals the sender's stamp.length even for a >16 KB batch.
+	// orphan, and bigblock delivery). The compression leg validates this total against
+	// the same workspace limit as the sender before it copies or counts any bytes.
 	int delivered_transported = 0;
 
 	// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b) — the CROSS-SESSION
@@ -21996,7 +22241,42 @@ void cl_arq_controller::copy_data_to_buffer()
 		// then decompress as a single block.
 		// IMPORTANT: Only iterate data_batch_size slots (not nMessages) to avoid
 		// including stale ACKED data from previous batches in higher-numbered slots.
-		char assembled[16384];
+		// The TX compression unit is bounded by COMPRESS_WORKSPACE_SIZE, not 16 KiB.
+		// Validate the whole span before freeing frames or advancing Option W: a bad
+		// length must fail closed, never be silently omitted while still counted.
+		long long required_size = 0;
+		bool invalid_span = false;
+		for(int i=0; i<cw; i++)
+		{
+			if(messages_rx[i].status != ACKED) continue;
+			if(messages_rx[i].length < 0 || messages_rx[i].length > N_MAX/8)
+			{
+				invalid_span = true;
+				break;
+			}
+			required_size += messages_rx[i].length;
+			if(required_size > COMPRESS_WORKSPACE_SIZE)
+			{
+				invalid_span = true;
+				break;
+			}
+		}
+		if(invalid_span)
+		{
+			printf("[RSP-COMPRESS-REASSEMBLY-REFUSE] invalid ACKED span: bytes=%lld "
+			       "workspace=%d -- tearing down before delivery accounting\n",
+				required_size, COMPRESS_WORKSPACE_SIZE);
+			fflush(stdout);
+			rsp_gap_abort_teardown("compressed batch exceeds validated reassembly bounds");
+			return;
+		}
+
+		bool reassembly_bounds_defeat = false;
+		{ const char* e = std::getenv("MERCURY_COMPRESS_REASSEMBLY_BOUNDS_DEFEAT");
+		  if(e && *e && atoi(e)!=0) reassembly_bounds_defeat = true; }
+		const int assembled_capacity = reassembly_bounds_defeat
+			? 16384 : COMPRESS_WORKSPACE_SIZE;
+		char assembled[COMPRESS_WORKSPACE_SIZE];
 		int assembled_size = 0;
 
 		for(int i=0;i<cw;i++)   // Option B' (§9): cw == eff_window (== data_batch_size unless the sender over-declared)
@@ -22007,10 +22287,10 @@ void cl_arq_controller::copy_data_to_buffer()
 				// Option W STEP 3 (§8.6): fold the delivered transported bytes (this frame's
 				// reassembled ciphertext/compressed payload) into the running RX stream CRC-32,
 				// in slot (== stream) order. The TX folded the identical bytes (comp_buf) in the
-				// same order at build (INV5). Folded from messages_rx[i].data (not the capped
-				// `assembled` buffer) so a >16 KB batch still folds every byte.
+				// same order at build (INV5). Fold directly from messages_rx[i].data so the
+				// CRC covers every transported byte in slot order.
 				rx_stream_crc = crc32_update(rx_stream_crc, messages_rx[i].data, messages_rx[i].length);
-				if(assembled_size + messages_rx[i].length <= (int)sizeof(assembled))
+				if(assembled_size + messages_rx[i].length <= assembled_capacity)
 				{
 					memcpy(assembled + assembled_size,
 						messages_rx[i].data, messages_rx[i].length);
@@ -22033,7 +22313,7 @@ void cl_arq_controller::copy_data_to_buffer()
 			// --- Decrypt batch (after reassembly, before decompression) ---
 			char* comp_data = assembled;
 			int comp_len = assembled_size;
-			char decrypt_buf[16384];
+			char decrypt_buf[COMPRESS_WORKSPACE_SIZE];
 
 			if(cipher_suite.is_active() && assembled_size > 0)
 			{

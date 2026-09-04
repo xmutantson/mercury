@@ -44,6 +44,36 @@ extern "C" { extern std::atomic<bool> shutdown_; }
 // Emits one read-only trace line per CMD reverse-ACK turn; no-op when off.
 bool arq_turn_trace_on();
 
+int cl_arq_controller::test_fir_dump_exit_fail_closed()
+{
+	// Before the fix the production call below reached exit(0), so the --test
+	// process ended here without reporting the remaining battery results.
+	const char* dump_before = std::getenv("MERCURY_FIR_DUMP");
+	const char* exit_before = std::getenv("MERCURY_FIR_DUMP_EXIT");
+	const bool had_dump = dump_before != nullptr;
+	const bool had_exit = exit_before != nullptr;
+	const std::string saved_dump = had_dump ? dump_before : "";
+	const std::string saved_exit = had_exit ? exit_before : "";
+
+	setenv("MERCURY_FIR_DUMP", "1", 1);
+	setenv("MERCURY_FIR_DUMP_EXIT", "1", 1);
+
+	cl_telecom_system system;
+	system.operation_mode = ARQ_MODE;
+	const int status = system.load_configuration(CONFIG_0);
+
+	if(had_dump) setenv("MERCURY_FIR_DUMP", saved_dump.c_str(), 1);
+	else unsetenv("MERCURY_FIR_DUMP");
+	if(had_exit) setenv("MERCURY_FIR_DUMP_EXIT", saved_exit.c_str(), 1);
+	else unsetenv("MERCURY_FIR_DUMP_EXIT");
+
+	const bool passed = status != 0;
+	printf("[TEST-FIR-DUMP-EXIT] load_configuration status=%d: %s\n",
+		status, passed ? "PASS" : "FAIL");
+	fflush(stdout);
+	return passed ? 0 : 1;
+}
+
 int cl_arq_controller::test_shm_unmap_fail_closed()
 {
 #if !defined(_WIN32)
@@ -278,6 +308,95 @@ int cl_arq_controller::test_rx_transfer_read_failure()
 	printf("[TEST-RX-TRANSFER-READ] failure propagates without clock advance: %s\n",
 	       failed == 0 ? "PASS" : "FAIL");
 	return failed;
+}
+
+int cl_arq_controller::test_rx_test_stream_wait()
+{
+	const bool saved_shutdown = shutdown_.exchange(false);
+	cl_data_container state;
+	state.data_ready.store(0, std::memory_order_release);
+
+	const int cycles = 256;
+	std::atomic<int> requested{0};
+	std::atomic<int> completed{0};
+	std::atomic<int> wait_error{0};
+	std::thread consumer([&] {
+		for(int i = 1; i <= cycles; ++i)
+		{
+			requested.store(i, std::memory_order_release);
+			const int result = audioio_wait_for_rx_ready(&state, 1000U);
+			if(result != AUDIOIO_RX_READY_WAIT_READY
+			   || state.data_ready.exchange(0, std::memory_order_acq_rel) == 0)
+			{
+				wait_error.store(result == AUDIOIO_RX_READY_WAIT_READY
+					? AUDIOIO_RX_READY_WAIT_ERROR : result,
+					std::memory_order_release);
+				return;
+			}
+			completed.store(i, std::memory_order_release);
+		}
+	});
+
+	// No sleeps: drive readiness as fast as the two threads can hand it off.
+	// steady_clock bounds only a broken-test escape and cannot jump with wall
+	// clock adjustments.
+	bool stalled = false;
+	for(int i = 1; i <= cycles && !stalled; ++i)
+	{
+		const std::chrono::steady_clock::time_point request_deadline =
+			std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while(requested.load(std::memory_order_acquire) < i
+		      && wait_error.load(std::memory_order_acquire) == 0)
+		{
+			if(std::chrono::steady_clock::now() >= request_deadline)
+			{
+				stalled = true;
+				break;
+			}
+			std::this_thread::yield();
+		}
+		if(stalled || wait_error.load(std::memory_order_acquire) != 0)
+			break;
+
+		state.data_ready.store(1, std::memory_order_release);
+		audioio_signal_rx_ready();
+
+		const std::chrono::steady_clock::time_point completion_deadline =
+			std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while(completed.load(std::memory_order_acquire) < i
+		      && wait_error.load(std::memory_order_acquire) == 0)
+		{
+			if(std::chrono::steady_clock::now() >= completion_deadline)
+			{
+				stalled = true;
+				break;
+			}
+			std::this_thread::yield();
+		}
+	}
+
+	if(stalled || wait_error.load(std::memory_order_acquire) != 0)
+	{
+		shutdown_.store(true, std::memory_order_release);
+		audioio_signal_rx_ready();
+	}
+	consumer.join();
+
+	const int null_result = audioio_wait_for_rx_ready(NULL, 1U);
+	const int zero_timeout_result = audioio_wait_for_rx_ready(&state, 0U);
+	shutdown_.store(saved_shutdown, std::memory_order_release);
+
+	const bool passed = !stalled
+		&& wait_error.load(std::memory_order_acquire) == 0
+		&& completed.load(std::memory_order_acquire) == cycles
+		&& null_result == AUDIOIO_RX_READY_WAIT_ERROR
+		&& zero_timeout_result == AUDIOIO_RX_READY_WAIT_ERROR;
+	printf("[TEST-RX-TEST-STREAM-WAIT] handoffs=%d/%d wait_error=%d "
+	       "invalid={%d,%d}: %s\n",
+	       completed.load(std::memory_order_acquire), cycles,
+	       wait_error.load(std::memory_order_acquire), null_result,
+	       zero_timeout_result, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
 }
 
 int cl_arq_controller::test_soundcard_restart_save_fail_closed()
@@ -796,7 +915,8 @@ bool cl_arq_controller::register_acks(const std::vector<int>& message_ids,
 		journal_keys.push_back({(uint8_t)messages_tx[message_id].batch_seq_id,
 			(uint8_t)messages_tx[message_id].id});
 	}
-	if(!l1_tx_journal.acknowledge_many(journal_keys))
+	if(l1_tx_journal.enabled() &&
+	   !l1_tx_journal.acknowledge_many(journal_keys))
 	{
 		fprintf(stderr, "[L1-JOURNAL] rejected whole positive ACK (%zu key(s))\n",
 			journal_keys.size());

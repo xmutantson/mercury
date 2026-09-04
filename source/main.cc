@@ -2389,6 +2389,7 @@ int cl_arq_controller::test_modulation_cli_validation()
     check("17",    true,  CONFIG_1, CONFIG_17);
     check("100",   true,  CONFIG_1, ROBUST_0);
     check("105",   true,  CONFIG_1, LOW48_ANCHOR_S20_R6);
+    check("INVALID", false, CONFIG_17, CONFIG_17);
     check("BPSKZ", false, CONFIG_17, CONFIG_17);
     check("1junk", false, CONFIG_17, CONFIG_17);
     check("104",   false, CONFIG_17, CONFIG_17);
@@ -2829,6 +2830,10 @@ int main(int argc, char *argv[])
             cl_arq_controller test_audio;
             return test_audio.test_sim_rx_bridge_allocation_fail_closed();
         }
+        if (strcmp(argv[i], "--test-rx-test-stream-wait") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_rx_test_stream_wait();
+        }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             // Pin the process-global C RNG to a fixed, platform-independent
@@ -2840,6 +2845,14 @@ int main(int argc, char *argv[])
             int failed = run_mfsk_ctrl_codec_tests();
             if (getenv("MERCURY_CAP_CODEC_ONLY") != NULL)
                 return failed == 0 ? 0 : 1;
+            // Compression reassembly bounds: a valid stamp-carrying 96-frame batch
+            // can exceed 16 KiB. Drive the REAL compression delivery funnel and
+            // require byte-exact app output plus matching transported cursor.
+            // MERCURY_COMPRESS_REASSEMBLY_BOUNDS_DEFEAT=1 restores the old truncation.
+            {
+                cl_arq_controller ARQ_crb;
+                failed += ARQ_crb.test_compress_reassembly_bounds();
+            }
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_ssid_bounds();
@@ -2853,15 +2866,28 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_audio_device_path_bounds();
                 failed += test_arq.test_audio_subsystem_cli_validation();
                 failed += test_arq.test_shm_unmap_fail_closed();
+                failed += test_arq.test_suffix_soft_nb_unsupported_fail_closed();
+                failed += test_arq.test_fir_dump_exit_fail_closed();
                 failed += test_arq.test_bigblock_wav_short_read();
                 failed += test_arq.test_sim_inproc_pump_fail_closed();
                 failed += test_arq.test_recovery_ack_tail_capacity();
                 failed += test_arq.test_l1_tx_journal_disabled_fail_closed();
                 failed += test_arq.test_l1_journal_disabled_mark_sent_many();
+                failed += test_arq.test_l1_acknowledge_disabled_fail_closed();
+                failed += test_arq.test_l1_terminalize_disabled_fail_closed();
+                failed += test_arq.test_l1_tx_journal_disabled_migration();
+            }
+            {
+                cl_arq_controller test_break;
+                failed += test_break.test_send_break_drain_failure();
             }
             {
                 cl_arq_controller test_hail;
                 failed += test_hail.test_send_hail_drain_failure();
+            }
+            {
+                cl_arq_controller test_break;
+                failed += test_break.test_send_break_pattern_reset_failure();
             }
             {
                 cl_arq_controller test_mfsk_ack_sack;
@@ -2929,6 +2955,7 @@ int main(int argc, char *argv[])
                 failed += test_audio.test_sim_rx_bridge_allocation_fail_closed();
                 failed += test_audio.test_capture_enqueue_backpressure();
                 failed += test_audio.test_rx_transfer_read_failure();
+                failed += test_audio.test_rx_test_stream_wait();
             }
             // A second modem process must not share the configured AGW/TCP
             // listener, and a bind failure must reject startup rather than
