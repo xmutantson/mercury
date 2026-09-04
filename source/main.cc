@@ -3023,6 +3023,7 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_hail;
                 failed += test_hail.test_send_hail_drain_failure();
+                failed += test_hail.test_connection_timer_reanchor();
             }
             {
                 cl_arq_controller test_break;

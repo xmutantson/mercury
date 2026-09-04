@@ -1228,6 +1228,8 @@ public:
   int test_break_ack_set_config_failure(); // rejected recovery enqueue must not enter control TX
   void send_hail_pattern();    // TX "I am Mercury" beacon
   int test_send_hail_drain_failure(); // drain failure must free buffers and unkey PTT
+  void accept_hail_detection(); // latch HAIL and arm handshake-relative timers once
+  int test_connection_timer_reanchor();
   int test_send_mfsk_compact_confirm_drain_failure();
   bool receive_hail_pattern(); // RX + detect HAIL beacon, returns true if detected
   void process_messages_rx_acks_control();
@@ -6457,7 +6459,7 @@ public:
   bool connect_fast_active;         // latched true during the fast attempt; cleared on revert/CONNECTED
   int connect_fast_fallback_config; // config to revert to (the connect-time start/pin config)
   int connect_fast_fallback_robust; // robust_enabled to restore on revert (the true robust intent)
-  cl_timer connect_fast_timer;      // COMMANDER short-budget timer (armed at CONNECT)
+  cl_timer connect_fast_timer;      // COMMANDER short-budget timer (armed at HAIL detection)
   // Bare START ACKs are CRC-less. Arm only after a successful MFSK START TX;
   // the capture producer tags post-deadline samples and capture prep publishes
   // their contiguous newest-ring count before the detector can run.

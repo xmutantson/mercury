@@ -2467,6 +2467,126 @@ int cl_arq_controller::connect_seed_target()
 #endif
 }
 
+// Latch the COMMANDER's HAIL response and anchor the timers whose budgets begin
+// with the OFDM handshake.  hail_detected is the per-attempt one-shot guard:
+// retries may poll this helper again, but cannot move either anchor a second time.
+void cl_arq_controller::accept_hail_detection()
+{
+	if(hail_detected == YES)
+		return;
+
+	hail_detected = YES;
+
+	// The outer connection budget historically started at CONNECT.  Opt in to
+	// excluding config-independent, variable-duration HAIL acquisition from it.
+	const char* reanchor = std::getenv("MERCURY_CONNECT_TIMER_REANCHOR");
+	if(reanchor && *reanchor && atoi(reanchor) != 0)
+	{
+		connection_attempt_timer.reset();
+		connection_attempt_timer.start();
+	}
+
+	// CONNECT-FAST-CONFIG: anchor the SHORT fast-attempt budget HERE, at
+	// HAIL-detected — the instant the CONFIG_0 OFDM handshake begins. HAIL
+	// acquisition is config-INDEPENDENT (same for fast and robust) and its
+	// duration is variable (channel + host-load dependent), so it must NOT
+	// count against the fast budget: anchoring at the CONNECT command let a
+	// slow HAIL acquisition consume the whole budget and revert a handshake
+	// that was actually succeeding. Started once (counting==0 guard); the
+	// revert clears connect_fast_active so it never re-arms.
+	if(connect_fast_active && connect_fast_timer.counting == 0)
+	{
+		connect_fast_timer.reset();
+		connect_fast_timer.start();
+	}
+}
+
+// Deterministic fail-before/pass-after regression for the HAIL timer anchor.
+// Drives accept_hail_detection(), the same transition used by the live detector,
+// against the sample clock so host scheduling cannot affect elapsed-time checks.
+int cl_arq_controller::test_connection_timer_reanchor()
+{
+	const char* key = "MERCURY_CONNECT_TIMER_REANCHOR";
+	const char* old_value = std::getenv(key);
+	const bool had_old_value = old_value != NULL;
+	const std::string saved_value = old_value ? old_value : "";
+	const int old_sim_clock = sim_clock_enabled();
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-CONNECT-TIMER-REANCHOR] %s: %s\n",
+			condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+	auto prime_aged_attempt = [&](bool fast_path) {
+		hail_detected = NO;
+		connect_fast_active = fast_path;
+		connect_fast_timer.stop();
+		connect_fast_timer.reset();
+		connection_attempts = 7;
+		connection_attempt_timer.stop();
+		connection_attempt_timer.reset();
+		connection_attempt_timer.start();
+		sim_clock_add_samples(SIM_CLOCK_SAMPLE_RATE_HZ); // exactly 1000 ms
+	};
+
+	sim_clock_set_enabled(1);
+
+	// Default OFF: preserve the CONNECT-time anchor (legacy/fail-before behavior).
+	unsetenv(key);
+	prime_aged_attempt(false);
+	accept_hail_detection();
+	check(connection_attempt_timer.get_elapsed_time_ms() == 1000,
+		"default OFF keeps the original CONNECT-time anchor");
+	check(connection_attempts == 7,
+		"default OFF leaves connection_attempts unchanged");
+
+	// Explicit =0 has the same default-off semantics.
+	setenv(key, "0", 1);
+	prime_aged_attempt(false);
+	accept_hail_detection();
+	check(connection_attempt_timer.get_elapsed_time_ms() == 1000,
+		"explicit =0 keeps the original CONNECT-time anchor");
+
+	// Opted in: the accepted HAIL begins a fresh outer handshake budget even
+	// when connect-fast is inactive (the robust-from-start defect case).
+	setenv(key, "1", 1);
+	prime_aged_attempt(false);
+	accept_hail_detection();
+	check(connection_attempt_timer.counting == YES
+		&& connection_attempt_timer.get_elapsed_time_ms() == 0,
+		"flag ON restarts the outer timer at HAIL detection on the robust path");
+	check(connection_attempts == 7,
+		"flag ON leaves connection_attempts unchanged");
+
+	// The HAIL latch is the one-shot guard for this attempt.
+	sim_clock_add_samples(SIM_CLOCK_SAMPLE_RATE_HZ / 2); // +500 ms after HAIL
+	accept_hail_detection();
+	check(connection_attempt_timer.get_elapsed_time_ms() == 500,
+		"repeat notification cannot re-anchor the same attempt");
+
+	// Fast connects still arm their existing short budget, and now receive the
+	// same outer-budget anchor as robust connects.
+	prime_aged_attempt(true);
+	accept_hail_detection();
+	check(connection_attempt_timer.get_elapsed_time_ms() == 0
+		&& connect_fast_timer.counting == YES
+		&& connect_fast_timer.get_elapsed_time_ms() == 0,
+		"flag ON re-anchors the outer timer and arms the short timer on the fast path");
+
+	connection_attempt_timer.stop();
+	connection_attempt_timer.reset();
+	connect_fast_timer.stop();
+	connect_fast_timer.reset();
+	sim_clock_set_enabled(old_sim_clock);
+	if(had_old_value) setenv(key, saved_value.c_str(), 1);
+	else unsetenv(key);
+
+	printf("[TEST-CONNECT-TIMER-REANCHOR] %s (%d failures)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES PRESENT", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+}
+
 
 int cl_arq_controller::queue_break_recovery_set_config()
 {
@@ -2911,20 +3031,7 @@ void cl_arq_controller::process_messages_commander()
 				{
 					printf("[HAIL] Response received — peer is Mercury\n");
 					fflush(stdout);
-					hail_detected = YES;
-					// CONNECT-FAST-CONFIG: anchor the SHORT fast-attempt budget HERE, at
-					// HAIL-detected — the instant the CONFIG_0 OFDM handshake begins. HAIL
-					// acquisition is config-INDEPENDENT (same for fast and robust) and its
-					// duration is variable (channel + host-load dependent), so it must NOT
-					// count against the fast budget: anchoring at the CONNECT command let a
-					// slow HAIL acquisition consume the whole budget and revert a handshake
-					// that was actually succeeding. Started once (counting==0 guard); the
-					// revert clears connect_fast_active so it never re-arms.
-					if(connect_fast_active && connect_fast_timer.counting == 0)
-					{
-						connect_fast_timer.reset();
-						connect_fast_timer.start();
-					}
+					accept_hail_detection();
 					break;
 				}
 				// §5.7-B8 + CLOCK-FIDELITY FIX (fix/sim-connect-virtual-clock):
