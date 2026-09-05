@@ -167,6 +167,61 @@ static long tune_sample_index = 0;
 cbuf_handle_t capture_buffer;
 cbuf_handle_t playback_buffer;
 
+#if !defined(_WIN32)
+// Per-process-unique POSIX shared-memory base names for the audio rings.
+//
+// The audio rings are an INTRA-process transport: the capture ring is filled by
+// the ALSA capture (or SIM RX bridge) thread and drained by the capture-prep /
+// rx_transfer consumer; the playback ring is filled by the modem and drained by
+// the ALSA playback (or SIM TX bridge) thread. Every producer and consumer is a
+// thread of the SAME process, reached through the process-global capture_buffer
+// / playback_buffer handles above; no separate process ever attaches to these
+// rings by name (the only AUDIO_*_PAYLOAD_NAME references in the tree are the
+// create/destroy calls in this file).
+//
+// shm_create_and_get_fd() is open-or-create by contract: a second opener of an
+// existing name ATTACHES to the same object, preserving its identity and
+// contents (see the shm-create-preserves-existing regression). With a FIXED
+// name, two processes that share one /dev/shm namespace -- both peers of an A/B
+// pair, or two cohort cells on one box, which the harness launches as plain
+// child processes with no mount/IPC namespace isolation -- therefore attach to
+// each other's rings: the sample data cross-contaminates and, worse, the second
+// process re-initializes and locks the PTHREAD_PROCESS_SHARED mutex/cond the
+// first process's threads are actively using, while either process's teardown
+// unmaps the region out from under the other. That can wedge a thread inside
+// MUTEX_LOCK where it can no longer observe shutdown_, hanging audioio_deinit().
+//
+// Suffixing the base name with the pid makes each process's rings a distinct
+// object, so cross-process aliasing is structurally impossible even without
+// namespace isolation, while the intra-process rendezvous is byte-identical (the
+// ring semantics and data flow are unchanged; only the /dev/shm filename
+// differs, and nothing external reads it). MERCURY_AUDIO_RING_ALIAS_DEFEAT
+// restores the legacy fixed name so the isolation regression test can reproduce
+// the aliasing on a single built binary.
+static char audio_capt_ring_name[MAX_POSIX_SHM_NAME];
+static char audio_play_ring_name[MAX_POSIX_SHM_NAME];
+
+static void audioio_format_ring_name(char *out, size_t out_size, const char *base)
+{
+	if(out == NULL || out_size == 0)
+		return;
+	if(getenv("MERCURY_AUDIO_RING_ALIAS_DEFEAT") != NULL)
+		snprintf(out, out_size, "%s", base);
+	else
+		snprintf(out, out_size, "%s.%ld", base, (long) getpid());
+}
+
+void audioio_capture_ring_shm_name(char *out, size_t out_size)
+{
+	audioio_format_ring_name(out, out_size, AUDIO_CAPT_PAYLOAD_NAME);
+}
+
+void audioio_playback_ring_shm_name(char *out, size_t out_size)
+{
+	audioio_format_ring_name(out, out_size, AUDIO_PLAY_PAYLOAD_NAME);
+}
+#endif
+
 // START-ACK causal sample metadata. The ordinary capture FIFO and this
 // generation-tag FIFO are always written/read/reset as one pair under
 // capture_pair_mutex, so scheduler delay and capture FIFO backlog cannot make
@@ -3398,22 +3453,31 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 	}
 	else
 	{
+		audioio_capture_ring_shm_name(audio_capt_ring_name, sizeof(audio_capt_ring_name));
+		audioio_playback_ring_shm_name(audio_play_ring_name, sizeof(audio_play_ring_name));
+		// Clear any orphan left by a prior same-pid process that exited before
+		// its teardown could unlink (a SIGKILL survivor can carry a locked
+		// PTHREAD_PROCESS_SHARED mutex). The name is unique to THIS pid, so this
+		// can never remove a live peer's ring; it only guarantees this process
+		// creates from a fresh object.
+		circular_buf_unlink_shm(audio_capt_ring_name);
+		circular_buf_unlink_shm(audio_play_ring_name);
 		capture_buffer = circular_buf_init_shm(
-			AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
+			AUDIO_PAYLOAD_BUFFER_SIZE, audio_capt_ring_name);
 		playback_buffer = circular_buf_init_shm(
-			AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
+			AUDIO_PAYLOAD_BUFFER_SIZE, audio_play_ring_name);
 		if(capture_buffer == NULL || playback_buffer == NULL)
 		{
 			if(capture_buffer != NULL)
 			{
 				circular_buf_destroy_shm(capture_buffer,
-					AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
+					AUDIO_PAYLOAD_BUFFER_SIZE, audio_capt_ring_name);
 				circular_buf_free_shm(capture_buffer);
 			}
 			if(playback_buffer != NULL)
 			{
 				circular_buf_destroy_shm(playback_buffer,
-					AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
+					AUDIO_PAYLOAD_BUFFER_SIZE, audio_play_ring_name);
 				circular_buf_free_shm(playback_buffer);
 			}
 			capture_buffer = NULL;
@@ -3565,10 +3629,10 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 	}
 	else
 	{
-		circular_buf_destroy_shm(capture_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_CAPT_PAYLOAD_NAME);
+		circular_buf_destroy_shm(capture_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, audio_capt_ring_name);
 		circular_buf_free_shm(capture_buffer);
 
-		circular_buf_destroy_shm(playback_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, (char *) AUDIO_PLAY_PAYLOAD_NAME);
+		circular_buf_destroy_shm(playback_buffer, AUDIO_PAYLOAD_BUFFER_SIZE, audio_play_ring_name);
 		circular_buf_free_shm(playback_buffer);
 	}
 #endif

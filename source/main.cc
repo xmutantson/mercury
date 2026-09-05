@@ -2968,6 +2968,10 @@ int main(int argc, char *argv[])
             cl_arq_controller test_shm;
             return test_shm.test_shm_create_preserves_existing();
         }
+        if (strcmp(argv[i], "--test-audio-shm-isolation") == 0) {
+            cl_arq_controller test_shm;
+            return test_shm.test_audio_shm_ring_isolation();
+        }
         if (strcmp(argv[i], "--test-capture-prep-geometry") == 0) {
             cl_arq_controller test_audio;
             return test_audio.test_capture_prep_geometry_change();
@@ -3007,6 +3011,7 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_audio_subsystem_cli_validation();
                 failed += test_arq.test_shm_unmap_fail_closed();
                 failed += test_arq.test_shm_create_preserves_existing();
+                failed += test_arq.test_audio_shm_ring_isolation();
                 failed += test_arq.test_suffix_soft_nb_unsupported_fail_closed();
                 failed += test_arq.test_fir_dump_exit_fail_closed();
                 failed += test_arq.test_bigblock_wav_short_read();

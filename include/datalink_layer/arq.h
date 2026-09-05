@@ -581,6 +581,7 @@ public:
   int test_sim_playback_connection_fail_closed();
   int test_shm_unmap_fail_closed();
   int test_shm_create_preserves_existing();
+  int test_audio_shm_ring_isolation();
   int test_suffix_soft_nb_unsupported_fail_closed();
   int test_fir_dump_exit_fail_closed();
   int test_agw_server_start_fail_closed();

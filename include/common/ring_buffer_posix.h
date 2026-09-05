@@ -57,6 +57,10 @@ void circular_buf_destroy_shm(cbuf_handle_t cbuf, size_t size, char *base_name);
 //  free the process local cbuf_handle_t
 void circular_buf_free_shm(cbuf_handle_t cbuf);
 
+// Unlink base_name-1 / base_name-2 without a mapped handle (missing objects are
+// ignored). Clears a stale orphan before a fresh create.
+void circular_buf_unlink_shm(char *base_name);
+
 // returns 0 on success, -1 on error (blocking version)
 int read_buffer(cbuf_handle_t cbuf, uint8_t *data, size_t len);
 

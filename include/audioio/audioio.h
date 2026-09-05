@@ -45,6 +45,16 @@
 extern cbuf_handle_t capture_buffer;
 extern cbuf_handle_t playback_buffer;
 
+#if !defined(_WIN32)
+// Compose this process's per-instance audio-ring SHM base name (capture /
+// playback). Unique per pid so two processes sharing one /dev/shm never alias
+// their audio rings; MERCURY_AUDIO_RING_ALIAS_DEFEAT restores the legacy fixed
+// name (isolation regression test only). POSIX-only: on Windows the audio rings
+// are private heap buffers, so there is no shared object to disambiguate.
+void audioio_capture_ring_shm_name(char *out, size_t out_size);
+void audioio_playback_ring_shm_name(char *out, size_t out_size);
+#endif
+
 // Process-wide TX level shared by control/main code and the playback worker.
 // Invalid values are rejected without changing the active level.
 bool audioio_set_tx_level(double level);

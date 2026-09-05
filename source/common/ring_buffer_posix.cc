@@ -281,6 +281,27 @@ void circular_buf_destroy_shm(cbuf_handle_t cbuf, size_t size, char *base_name)
 #endif
 }
 
+// Unlink the two shared-memory objects (base_name-1 / base_name-2) WITHOUT
+// needing a mapped handle. Clears a stale orphan left by a process that exited
+// without running circular_buf_destroy_shm (e.g. SIGKILL) so a fresh create
+// starts from a clean object. Missing objects are not an error.
+void circular_buf_unlink_shm(char *base_name)
+{
+#if !defined(_WIN32)
+    char tmp[MAX_POSIX_SHM_NAME];
+
+    strcpy(tmp, base_name);
+    strcat(tmp, "-1");
+    shm_unlink(tmp);
+
+    strcpy(tmp, base_name);
+    strcat(tmp, "-2");
+    shm_unlink(tmp);
+#else
+    (void) base_name;
+#endif
+}
+
 void circular_buf_reset(cbuf_handle_t cbuf)
 {
     assert(cbuf && cbuf->internal);

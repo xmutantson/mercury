@@ -241,6 +241,152 @@ int cl_arq_controller::test_shm_create_preserves_existing()
 #endif
 }
 
+int cl_arq_controller::test_audio_shm_ring_isolation()
+{
+#if defined(_WIN32)
+	printf("[TEST-SHM-AUDIO-ALIAS] SKIP (POSIX-only regression)\n");
+	return 0;
+#else
+	const char* TAG = "[TEST-SHM-AUDIO-ALIAS]";
+	// Two mercury processes on one box (both peers of an A/B pair, or two cohort
+	// cells -- the harness launches them as plain child processes with no
+	// mount/IPC namespace isolation) must get DISTINCT audio rings. Reproduce
+	// the two-process case with a fork: parent and child each build the
+	// capture-ring name the production path uses (audioio_capture_ring_shm_name)
+	// and create the ring through the real circular_buf_init_shm. With the fix
+	// the pid suffix makes the two names -- and the two backing objects --
+	// distinct, so the child's fresh buffer does NOT carry the parent's
+	// sentinel. MERCURY_AUDIO_RING_ALIAS_DEFEAT restores the fixed name (== the
+	// pre-fix production behavior) so this same binary reproduces the aliasing:
+	// the child then attaches to the parent's object and reads back the parent's
+	// sentinel (fail-before).
+	const size_t size = 4096;
+	const unsigned char PARENT_SENTINEL = 0xA5;
+	const int EXIT_ISOLATED = 10;   // child buffer fresh -> rings isolated
+	const int EXIT_ALIASED  = 11;   // child buffer carried parent's sentinel
+
+	char parent_name[MAX_POSIX_SHM_NAME];
+	audioio_capture_ring_shm_name(parent_name, sizeof(parent_name));
+
+	cbuf_handle_t parent_ring = circular_buf_init_shm(size, parent_name);
+	if(parent_ring == NULL)
+	{
+		printf("%s FAIL: parent ring create failed\n", TAG);
+		return 1;
+	}
+	memset(parent_ring->buffer, PARENT_SENTINEL, size);
+
+	// Backing-object identity of the parent's data ring ("-1"). This is the same
+	// inode /proc/<pid>/maps would show for the mmap'd region; two isolated rings
+	// must have DIFFERENT (st_dev, st_ino). Computed before fork so the child
+	// inherits the parent's values through the copied address space (no pipe).
+	unsigned long long pdev = 0, pino = 0;
+	bool phave = false;
+	{
+		char n1[MAX_POSIX_SHM_NAME];
+		snprintf(n1, sizeof(n1), "%s-1", parent_name);
+		int f = shm_open(n1, O_RDWR, 0644);
+		struct stat st;
+		if(f >= 0 && fstat(f, &st) == 0)
+		{
+			pdev = (unsigned long long) st.st_dev;
+			pino = (unsigned long long) st.st_ino;
+			phave = true;
+		}
+		if(f >= 0) close(f);
+	}
+	printf("%s parent ring '%s-1' backing dev=%llu ino=%llu\n", TAG, parent_name, pdev, pino);
+	fflush(stdout);
+
+	pid_t child = fork();
+	if(child < 0)
+	{
+		const int saved_errno = errno;
+		circular_buf_destroy_shm(parent_ring, size, parent_name);
+		circular_buf_free_shm(parent_ring);
+		printf("%s FAIL: fork failed (errno=%d)\n", TAG, saved_errno);
+		return 1;
+	}
+	if(child == 0)
+	{
+		// Child = the second process. It derives ITS OWN name via the same
+		// production helper (its pid differs from the parent's), creates the
+		// ring, and checks whether the first data byte already carries the
+		// parent's sentinel -- only possible if the names collided and the
+		// create attached to the parent's object.
+		char child_name[MAX_POSIX_SHM_NAME];
+		audioio_capture_ring_shm_name(child_name, sizeof(child_name));
+		cbuf_handle_t child_ring = circular_buf_init_shm(size, child_name);
+		if(child_ring == NULL)
+			_exit(3);
+		const unsigned char observed = child_ring->buffer[0];
+
+		// Two independent aliasing signals that MUST agree: backing-inode identity
+		// and data cross-contamination. They share the same backing object iff the
+		// name collided (fixed-name / alias-defeat), which is the defect.
+		unsigned long long cdev = 0, cino = 0;
+		bool chave = false;
+		{
+			char n1[MAX_POSIX_SHM_NAME];
+			snprintf(n1, sizeof(n1), "%s-1", child_name);
+			int f = shm_open(n1, O_RDWR, 0644);
+			struct stat st;
+			if(f >= 0 && fstat(f, &st) == 0)
+			{
+				cdev = (unsigned long long) st.st_dev;
+				cino = (unsigned long long) st.st_ino;
+				chave = true;
+			}
+			if(f >= 0) close(f);
+		}
+		const bool inode_shared = phave && chave && cdev == pdev && cino == pino;
+		const bool sentinel_shared = (observed == PARENT_SENTINEL);
+		printf("%s child ring '%s-1' backing dev=%llu ino=%llu (parent ino=%llu) "
+		       "inode_shared=%d sentinel_shared=%d\n",
+		       TAG, child_name, cdev, cino, pino, inode_shared, sentinel_shared);
+		fflush(stdout);
+
+		circular_buf_destroy_shm(child_ring, size, child_name);
+		circular_buf_free_shm(child_ring);
+
+		if(!phave || !chave)
+			_exit(4);                       // could not stat a backing object
+		if(inode_shared != sentinel_shared)
+			_exit(12);                      // the two signals disagree -> instrument fault
+		_exit(inode_shared ? EXIT_ALIASED : EXIT_ISOLATED);
+	}
+
+	int status = 0;
+	pid_t waited;
+	do { waited = waitpid(child, &status, 0); } while(waited < 0 && errno == EINTR);
+	const bool child_ok = waited == child && WIFEXITED(status);
+	const int child_code = child_ok ? WEXITSTATUS(status) : -1;
+	const bool isolated = child_ok && child_code == EXIT_ISOLATED;
+	const bool aliased  = child_ok && child_code == EXIT_ALIASED;
+	const bool inconsistent = child_ok && child_code == 12;
+
+	// Teardown must leave no stale object behind. Destroy the parent ring and
+	// assert both backing objects are gone from the namespace.
+	circular_buf_destroy_shm(parent_ring, size, parent_name);
+	circular_buf_free_shm(parent_ring);
+
+	bool stale = false;
+	char probe[MAX_POSIX_SHM_NAME];
+	snprintf(probe, sizeof(probe), "%s-1", parent_name);
+	int leftover_fd = shm_open(probe, O_RDWR, 0644);
+	if(leftover_fd >= 0) { stale = true; close(leftover_fd); shm_unlink(probe); }
+	snprintf(probe, sizeof(probe), "%s-2", parent_name);
+	leftover_fd = shm_open(probe, O_RDWR, 0644);
+	if(leftover_fd >= 0) { stale = true; close(leftover_fd); shm_unlink(probe); }
+
+	const bool passed = child_ok && isolated && !stale && !inconsistent;
+	printf("%s child_ok=%d isolated=%d aliased=%d inconsistent=%d no_stale=%d: %s\n",
+	       TAG, child_ok, isolated, aliased, inconsistent, !stale, passed ? "PASS" : "FAIL");
+	fflush(stdout);
+	return passed ? 0 : 1;
+#endif
+}
+
 #ifdef MERCURY_GUI_ENABLED
 static int test_gui_init_failure()
 {
