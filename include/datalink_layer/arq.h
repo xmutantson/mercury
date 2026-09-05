@@ -577,11 +577,14 @@ public:
   int test_audio_payload_allocation_fail_closed();
   int test_sim_tx_bridge_allocation_fail_closed();
   int test_sim_rx_bridge_allocation_fail_closed();
+  int test_sim_playback_connection_fail_closed();
   int test_shm_unmap_fail_closed();
+  int test_shm_create_preserves_existing();
   int test_suffix_soft_nb_unsupported_fail_closed();
   int test_fir_dump_exit_fail_closed();
   int test_agw_server_start_fail_closed();
   int test_capture_enqueue_backpressure();
+  int test_capture_prep_geometry_change();
   int test_rx_transfer_read_failure();
   int test_rx_test_stream_wait();
   int test_soundcard_restart_save_fail_closed();
@@ -695,7 +698,9 @@ public:
   int test_data_container_ownership_constraints();
   int test_data_container_deinit_resets_pinning();
   int test_gbf_decoder_constraints();
+  int test_gbf_final_iteration_sentinel();
   int test_turbo_iterations_sentinel();
+  int test_mini_data_energy_gate();
   // CLI regression: numeric modulation configs parse exactly, while malformed
   // or unknown values are rejected without changing the selected config.
   int test_modulation_cli_validation();
@@ -707,6 +712,7 @@ public:
   // a diagnostic and cannot alter the caller's current selection.
   int test_audio_subsystem_cli_validation();
   int test_bigblock_wav_short_read();
+  int test_rx_shm_output_overflow();
 
   int get_nOccupied_messages();
   int get_nFree_messages();
@@ -1163,6 +1169,7 @@ public:
   // Computes CRC12 over [bsi || bitmap] internally and emits the 16-symbol
   // pattern + 13-symbol MFSK suffix carrying [bsi:8 | bitmap:30 | crc12:12].
   long long send_mfsk_ack_sack(unsigned char target_batch_seq_id, uint32_t bitmap);
+  int test_send_mfsk_ack_sack_fec_state_cleanup();
   int test_send_mfsk_ack_sack_drain_failure();
   int test_send_mfsk_ack_sack_reset_failure(); // reset NotReady must unkey and restore RX state
 
@@ -1218,6 +1225,7 @@ public:
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   int test_send_break_drain_failure(); // drain failure must free buffers and unkey PTT
   int test_send_break_pattern_reset_failure(); // reset NotReady must unkey and clear RX mute
+  int test_break_ack_set_config_failure(); // rejected recovery enqueue must not enter control TX
   void send_hail_pattern();    // TX "I am Mercury" beacon
   int test_send_hail_drain_failure(); // drain failure must free buffers and unkey PTT
   int test_send_mfsk_compact_confirm_drain_failure();
@@ -2660,6 +2668,11 @@ public:
   // Selected by -m SIM_INPROC with MERCURY_SIM_2INST=1 / --sim-2inst.
   static int test_sim_inproc_2();
 
+  // POSIX teardown regression for test_sim_inproc_2(): reproduces the stale
+  // by-value pthread_mutex_t left by sim2_activate(), then requires teardown's
+  // reset helper to leave capture_prep_mutex lockable for later --test cases.
+  int test_sim2_capture_mutex_cleanup();
+
   // FULL-PATH REGRESSION (bigblock-whiten-align): the cross-layer test the CASE A-D
   // synthetic carve tests could NOT catch (they hand a caller-owned vector as the RX
   // passband and never exercise the LIVE receive_bigblock buffer-realloc / the per-block
@@ -3929,6 +3942,10 @@ public:
   // REJECTS it (pre-fix: no guard -> bitmap applied -> mis-ACK), and an
   // in-window frame is still ACCEPTED (regression guard). Returns 0=PASS,1=FAIL.
   int test_sack_oow_reject();
+  // Fail closed when the live responder's current-batch store gate rejects a
+  // CRC-valid DATA frame (MESSAGE_ID_ERROR / MESSAGE_LENGTH_ERROR). The
+  // production behavior is opt-in via MERCURY_RX_STORE_FAIL_CLOSED=1.
+  int test_rx_store_verdict_fail_closed();
 
   // R038 (race audit 2026-06-06) — EOB-poison-from-prev-retransmit test.
   // CLI: --test-eob-poison-prev-retx. Drives the real EOB staging/promotion
@@ -6764,6 +6781,10 @@ public:
   int cfg16_revack_starve_fails{0};
   int break_recovery_phase;       // 0=off, 1=coord at ROBUST_0, 2=probing target
   int break_recovery_retries;     // probe attempts remaining (2 total)
+  // Unit-test seam: replace the status immediately after the BREAK recovery
+  // force-clear. Production leaves this at -1, so the slot remains FREE.
+  int test_break_set_config_status_after_clear{-1};
+  int queue_break_recovery_set_config();
   int ceiling_success_count;      // consecutive successful blocks at ceiling (for ceiling recovery)
   // Per-rung MEASURED election floor gate state (audit: DATAFLOW_AUDIT_rung_floor.md §2). Indexed by
   // CONFIG value 0..17 (robust configs 100..102 are is_ofdm_config==false and never index these).

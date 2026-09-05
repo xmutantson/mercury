@@ -79,6 +79,8 @@ cl_telecom_system::cl_telecom_system()
 	ber_frames_override   = 0;     // 0 = use sweep default frame count
 	{ const char* e = std::getenv("MERCURY_FINE_ENERGY_CARRIED_DEFEAT");
 	  fine_energy_carried_defeat = (e && *e && atoi(e) != 0); }
+	{ const char* e = std::getenv("MERCURY_MINI_DATA_ENERGY_GATE");
+	  mini_data_energy_gate_enabled = (e && *e && atoi(e) != 0); }
 	mean_h_gate_threshold = 0.30;  // default = HEAD (b806b76); pre-IONOS was 0.50
 	energy_gate_floor    = 1e-12;  // default = HEAD (b806b76); pre-IONOS was 0.001
 	ofdm_defer_overflow_enabled = true; // default = HEAD (7076a4b Fix A)
@@ -96,6 +98,8 @@ cl_telecom_system::cl_telecom_system()
 	// gearshift wiring + the CFG16-acq fix before it can ship. Keep default-off.
 	{ const char* e = std::getenv("MERCURY_BIGBLOCK_FRAMING");
 	  if(e && *e && atoi(e) != 0) bigblock_framing_enabled = true; }
+	{ const char* e = std::getenv("MERCURY_RX_SHM_FAIL_CLOSED");
+	  rx_shm_fail_closed_enabled = (e && *e && atoi(e) != 0); }
 	receive_stats.iterations_done=-1;
 	receive_stats.delay=0;
 	receive_stats.delay_of_last_decoded_message=-1;
@@ -1012,6 +1016,16 @@ int cl_telecom_system::tx_effective_preamble_nsymb() const
 	if(eff < 0) eff = 0;
 	if(eff > full) eff = full;
 	return eff;
+}
+
+int cl_telecom_system::data_energy_gate_preamble_nsymb(
+	int configured_preamble_nsymb, int effective_preamble_nsymb) const
+{
+	if(configured_preamble_nsymb <= 0 || effective_preamble_nsymb < 0
+		|| effective_preamble_nsymb > configured_preamble_nsymb)
+		return -1;
+	return mini_data_energy_gate_enabled
+		? effective_preamble_nsymb : configured_preamble_nsymb;
 }
 
 int cl_telecom_system::rx_effective_preamble_nsymb() const
@@ -2998,8 +3012,19 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			int de_M = data_container.interpolation_rate;
 			int de_sym_dec = data_container.Nofdm;
 			int de_buf_dec = data_container.Nofdm * data_container.buffer_Nsymb;
-			int data_offset = receive_stats.delay + data_container.preamble_nSymb * sym_samples_de;
-			int data_offset_dec = receive_stats.delay / de_M + data_container.preamble_nSymb * de_sym_dec;
+			int gate_preamble_nsymb = data_energy_gate_preamble_nsymb(
+				data_container.preamble_nSymb, rx_eff_preamble);
+			if(gate_preamble_nsymb < 0)
+			{
+				printf("[OFDM-SYNC] invalid data-energy geometry: configured_preamble=%d effective_preamble=%d\n",
+					data_container.preamble_nSymb, rx_eff_preamble);
+				fflush(stdout);
+				energy_ok = false;
+				receive_stats.frame_data_missing = true;
+				gate_preamble_nsymb = data_container.preamble_nSymb;
+			}
+			int data_offset = receive_stats.delay + gate_preamble_nsymb * sym_samples_de;
+			int data_offset_dec = receive_stats.delay / de_M + gate_preamble_nsymb * de_sym_dec;
 			double data_e = 0.0;
 			int d_count = 0;
 			int check_len = 4 * sym_samples_de; // first 4 data symbols
@@ -7730,6 +7755,118 @@ void cl_telecom_system::RX_TEST_process_main()
 }
 
 
+bool cl_telecom_system::RX_SHM_deliver_decoded_frame(cbuf_handle_t buffer,
+		uint8_t *data, size_t frame_size)
+{
+	const bool invalid = buffer == NULL || data == NULL || frame_size == 0;
+	const bool full = !invalid && frame_size > circular_buf_free_size(buffer);
+	if(invalid || full)
+	{
+		if(rx_shm_fail_closed_enabled)
+		{
+			rx_shm_output_drop_count.fetch_add(1, std::memory_order_relaxed);
+			fprintf(stderr, "Decoded frame lost because of %s!\n",
+			        invalid ? "invalid SHM output" : "full buffer");
+		}
+		else if(full)
+		{
+			// Preserve the default-off diagnostic and behavior byte-for-byte.
+			printf("Decoded frame lost because of full buffer!\n");
+		}
+		return false;
+	}
+
+	// write_buffer() is blocking, but after the free-space check its sole RX
+	// producer can commit without waiting. Still check the documented return so
+	// an implementation/backend failure is never mistaken for delivery.
+	const int write_status = write_buffer(buffer, data, frame_size);
+	if(write_status != 0)
+	{
+		if(rx_shm_fail_closed_enabled)
+			rx_shm_output_drop_count.fetch_add(1, std::memory_order_relaxed);
+		fprintf(stderr, "Decoded frame lost because SHM output write failed (%d)!\n",
+		        write_status);
+		return false;
+	}
+	return true;
+}
+
+int cl_telecom_system::test_rx_shm_output_overflow()
+{
+	static const char *ENV = "MERCURY_RX_SHM_FAIL_CLOSED";
+	const char *old_env = std::getenv(ENV);
+	const bool had_old_env = old_env != NULL;
+	const std::string saved_env = had_old_env ? old_env : "";
+	auto set_flag = [&](const char *value) { setenv(ENV, value, 1); };
+	auto restore_flag = [&]() {
+		if(had_old_env) setenv(ENV, saved_env.c_str(), 1);
+		else unsetenv(ENV);
+	};
+
+	uint8_t storage[8] = {};
+	uint8_t fill[sizeof(storage)] = {};
+	uint8_t decoded = 0x5a;
+	cbuf_handle_t output = circular_buf_init(storage, sizeof(storage));
+	int failures = 0;
+	if(write_buffer(output, fill, sizeof(fill)) != 0 || !circular_buf_full(output))
+	{
+		printf("[TEST-RX-SHM-OVERFLOW] FAIL: could not fill output fixture\n");
+		circular_buf_free(output);
+		restore_flag();
+		return 1;
+	}
+
+	// Fail-before arm: default-off retains the historical stdout-only signal.
+	set_flag("0");
+	cl_telecom_system legacy;
+	const bool legacy_delivered = legacy.RX_SHM_deliver_decoded_frame(
+		output, &decoded, sizeof(decoded));
+	const uint64_t legacy_drops = legacy.RX_SHM_output_drop_count();
+	if(legacy_delivered || legacy_drops != 0 || !circular_buf_full(output))
+	{
+		printf("[TEST-RX-SHM-OVERFLOW] FAIL-BEFORE reproduction failed "
+		       "(delivered=%d drops=%llu full=%d)\n",
+		       legacy_delivered ? 1 : 0,
+		       (unsigned long long)legacy_drops,
+		       circular_buf_full(output) ? 1 : 0);
+		failures++;
+	}
+
+	// Pass-after arm: the same full-buffer decode is now machine-observable.
+	set_flag("1");
+	cl_telecom_system fixed;
+	const bool fixed_delivered = fixed.RX_SHM_deliver_decoded_frame(
+		output, &decoded, sizeof(decoded));
+	const uint64_t fixed_drops = fixed.RX_SHM_output_drop_count();
+	if(fixed_delivered || fixed_drops != 1 || !circular_buf_full(output))
+	{
+		printf("[TEST-RX-SHM-OVERFLOW] PASS-AFTER failed "
+		       "(delivered=%d drops=%llu full=%d)\n",
+		       fixed_delivered ? 1 : 0,
+		       (unsigned long long)fixed_drops,
+		       circular_buf_full(output) ? 1 : 0);
+		failures++;
+	}
+
+	// Capacity available remains a successful delivery and cannot raise the
+	// error counter.
+	circular_buf_reset(output);
+	if(!fixed.RX_SHM_deliver_decoded_frame(output, &decoded, sizeof(decoded))
+	   || fixed.RX_SHM_output_drop_count() != 1 || size_buffer(output) != 1)
+	{
+		printf("[TEST-RX-SHM-OVERFLOW] FAIL: successful-delivery control\n");
+		failures++;
+	}
+
+	circular_buf_free(output);
+	restore_flag();
+	printf("[TEST-RX-SHM-OVERFLOW] %s (legacy drops=%llu, enabled drops=%llu)\n",
+	       failures == 0 ? "PASS" : "FAIL",
+	       (unsigned long long)legacy_drops,
+	       (unsigned long long)fixed.RX_SHM_output_drop_count());
+	return failures;
+}
+
 void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 {
     static uint32_t spinner_anim = 0; char spinner[] = ".oOo";
@@ -7806,10 +7943,7 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 				data[i] = (uint8_t) out_data[i];
 			}
 
-			if ( frame_size <= (int) circular_buf_free_size(buffer) )
-				write_buffer(buffer, data, frame_size);
-			else
-				printf("Decoded frame lost because of full buffer!\n");
+			RX_SHM_deliver_decoded_frame(buffer, data, (size_t)frame_size);
 
 
 			// Only display signal strength if in reasonable range (-150 to +50 dBm)

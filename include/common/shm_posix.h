@@ -29,7 +29,7 @@ extern "C" {
 // returns non-negative integer file descriptor or negative if shm not created
 int shm_open_and_get_fd(char *name);
 
-// check if shm is already created, as this functions will unlink the shm if already created, and create a new one
+// open an existing shared-memory object or create it if absent, then set its size
 // returns non-negative integer
 int shm_create_and_get_fd(char *name, size_t size);
 

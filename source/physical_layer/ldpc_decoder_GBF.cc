@@ -136,10 +136,13 @@ int decode_GBF(
 	{
 		LLRo[i]=(LLRtmp[i]<0);
 	}
+	if(iteration > 0 && iteration == nIteration_max)
+	{
+		return failure;
+	}
 	return iteration;
 }
 
 /* F. Jerji and C. Akamine, "Gradient Bit-Flipping LDPC Decoder for ATSC 3.0," 2019 IEEE International Symposium on Broadband Multimedia Systems and Broadcasting (BMSB), 2019, pp. 1-4, doi: 10.1109/BMSB47279.2019.8971839.
  * https://ieeexplore.ieee.org/document/8971839
  */
-

@@ -27,10 +27,20 @@
 #include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
 #include <cerrno>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>     // uint32_t/uint8_t (2-instance stepper deterministic payload)
 #include <vector>      // std::vector (2-instance stepper large-payload buffer)
 #include <algorithm>   // std::min (2-instance stepper RX drain)
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 extern "C" { extern std::atomic<bool> shutdown_; }
 
@@ -114,6 +124,119 @@ int cl_arq_controller::test_shm_unmap_fail_closed()
 	const bool passed = result == 0 && remained_mapped == FALSE;
 	printf("[TEST-SHM-UNMAP] unmap=%d view_released=%d: %s\n",
 	       result, remained_mapped == FALSE, passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+#endif
+}
+
+int cl_arq_controller::test_shm_create_preserves_existing()
+{
+#if defined(_WIN32)
+	printf("[TEST-SHM-CREATE] SKIP (POSIX-only regression)\n");
+	return 0;
+#else
+	const char* TAG = "[TEST-SHM-CREATE]";
+	const size_t size = 4096;
+	char name[MAX_POSIX_SHM_NAME];
+	const int name_length = snprintf(name, sizeof(name), "/mercury-shm-create-%ld", (long)getpid());
+	if(name_length < 0 || (size_t)name_length >= sizeof(name))
+	{
+		printf("%s FAIL: could not format shared-memory name\n", TAG);
+		return 1;
+	}
+
+	// No wall-clock input: the process id supplies a collision-free name for this
+	// process, and the inherited namespace lets the parent inspect the child result.
+	if(shm_unlink(name) != 0 && errno != ENOENT)
+	{
+		printf("%s FAIL: stale-name cleanup failed (errno=%d)\n", TAG, errno);
+		return 1;
+	}
+	int original_fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+	if(original_fd < 0 || ftruncate(original_fd, (off_t)size) != 0)
+	{
+		const int saved_errno = errno;
+		if(original_fd >= 0) close(original_fd);
+		shm_unlink(name);
+		printf("%s FAIL: setup failed (errno=%d)\n", TAG, saved_errno);
+		return 1;
+	}
+
+	const unsigned char marker = 0x5a;
+	struct stat original_stat;
+	if(pwrite(original_fd, &marker, sizeof(marker), 0) != (ssize_t)sizeof(marker) ||
+	   fstat(original_fd, &original_stat) != 0)
+	{
+		const int saved_errno = errno;
+		close(original_fd);
+		shm_unlink(name);
+		printf("%s FAIL: could not initialize original object (errno=%d)\n", TAG, saved_errno);
+		return 1;
+	}
+
+	pid_t child = fork();
+	if(child < 0)
+	{
+		const int saved_errno = errno;
+		close(original_fd);
+		shm_unlink(name);
+		printf("%s FAIL: fork failed (errno=%d)\n", TAG, saved_errno);
+		return 1;
+	}
+	if(child == 0)
+	{
+		struct rlimit limit;
+		if(getrlimit(RLIMIT_NOFILE, &limit) != 0)
+			_exit(2);
+		rlim_t test_limit = 128;
+		if((rlim_t)original_fd >= test_limit)
+			test_limit = (rlim_t)original_fd + 1;
+		if(limit.rlim_cur > test_limit)
+		{
+			limit.rlim_cur = test_limit;
+			if(setrlimit(RLIMIT_NOFILE, &limit) != 0)
+				_exit(3);
+		}
+
+		while(open("/dev/null", O_RDONLY) >= 0) {}
+		if(errno != EMFILE)
+			_exit(4);
+
+		// Leave one descriptor available. The old implementation consumed it in
+		// its existence probe, unlinked the object, then aborted when its second
+		// shm_open hit EMFILE. A single open-or-create operation must succeed.
+		if(close(original_fd) != 0)
+			_exit(5);
+		int created_fd = shm_create_and_get_fd(name, size);
+		if(created_fd < 0)
+			_exit(6);
+		close(created_fd);
+		_exit(0);
+	}
+
+	int status = 0;
+	pid_t waited;
+	do { waited = waitpid(child, &status, 0); } while(waited < 0 && errno == EINTR);
+
+	int reopened_fd = shm_open(name, O_RDWR, 0600);
+	struct stat reopened_stat;
+	unsigned char observed = 0;
+	const bool child_succeeded = waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	const bool namespace_present = reopened_fd >= 0;
+	const bool same_object = namespace_present && fstat(reopened_fd, &reopened_stat) == 0 &&
+		reopened_stat.st_dev == original_stat.st_dev && reopened_stat.st_ino == original_stat.st_ino;
+	const bool marker_preserved = namespace_present &&
+		pread(reopened_fd, &observed, sizeof(observed), 0) == (ssize_t)sizeof(observed) &&
+		observed == marker;
+
+	if(reopened_fd >= 0) close(reopened_fd);
+	close(original_fd);
+	shm_unlink(name);
+
+	const bool passed = child_succeeded && namespace_present && same_object && marker_preserved;
+	printf("%s child_ok=%d namespace=%d same_object=%d marker=%d: %s\n",
+	       TAG, child_succeeded, namespace_present, same_object, marker_preserved,
+	       passed ? "PASS" : "FAIL");
+	fflush(stdout);
 	return passed ? 0 : 1;
 #endif
 }
@@ -292,12 +415,28 @@ int cl_arq_controller::test_sim_rx_bridge_allocation_fail_closed()
 	return failed;
 }
 
+int cl_arq_controller::test_sim_playback_connection_fail_closed()
+{
+	const int failed = sim_playback_connection_failure_selftest();
+	printf("[TEST-SIM-CONNECT-CLOCK] unreachable relay closes playback clock: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
 int cl_arq_controller::test_capture_enqueue_backpressure()
 {
 	const bool saved_shutdown = shutdown_.exchange(false);
 	const int failed = capture_enqueue_backpressure_selftest();
 	shutdown_ = saved_shutdown;
 	printf("[TEST-CAPTURE-BACKPRESSURE] full FIFO drains and preserves samples: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
+int cl_arq_controller::test_capture_prep_geometry_change()
+{
+	const int failed = capture_prep_geometry_change_selftest();
+	printf("[TEST-CAPTURE-PREP-GEOMETRY] stale symbol rejected; current geometry accepted: %s\n",
 	       failed == 0 ? "PASS" : "FAIL");
 	return failed;
 }
@@ -2329,6 +2468,103 @@ int cl_arq_controller::connect_seed_target()
 }
 
 
+int cl_arq_controller::queue_break_recovery_set_config()
+{
+	// Force-clear: cleanup() skips PENDING_ACK status.
+	messages_control.status = FREE;
+	if(test_break_set_config_status_after_clear >= 0)
+		messages_control.status = test_break_set_config_status_after_clear;
+
+	const int result = add_message_control(SET_CONFIG);
+	if(result != SUCCESSFUL)
+	{
+		printf("[BREAK] ERROR: SET_CONFIG enqueue rejected (control status=%d)\n",
+			(int)messages_control.status);
+		fflush(stdout);
+		return result;
+	}
+
+	printf("[BREAK] SET_CONFIG queued: data[1]=%d data[2]=%d\n",
+		(int)messages_control.data[1], (int)messages_control.data[2]);
+	fflush(stdout);
+	connection_status = TRANSMITTING_CONTROL;
+	link_timer.start();
+	watchdog_timer.start();
+	return SUCCESSFUL;
+}
+
+// Regression for the BREAK ACK-received enqueue contract. The injected busy
+// status lands after the recovery force-clear, making the real
+// add_message_control(SET_CONFIG) return ERROR_. The caller must not publish a
+// control-TX state or start either transition timer without a queued frame.
+int cl_arq_controller::test_break_ack_set_config_failure()
+{
+	int fails = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-BREAK-SET-CONFIG] %s: %s\n",
+			condition ? "PASS" : "FAIL", name);
+		if(!condition) fails++;
+	};
+
+	const int prior_sim_clock = sim_clock_enabled();
+	sim_clock_set_enabled(1);
+
+	nMessages = 1;
+	max_data_length = 6;
+	max_header_length = 6;
+	max_message_length = 12;
+	inband_rate_enabled = 0;
+	if(init_messages_buffers() != SUCCESSFUL)
+	{
+		printf("[TEST-BREAK-SET-CONFIG] FAIL: message-buffer allocation\n");
+		sim_clock_set_enabled(prior_sim_clock);
+		return 1;
+	}
+
+	connection_status = RECEIVING_ACKS_CONTROL;
+	link_timer.stop();
+	link_timer.reset();
+	watchdog_timer.stop();
+	watchdog_timer.reset();
+	messages_control.length = 0;
+	messages_control.data[0] = 0;
+	test_break_set_config_status_after_clear = PENDING_ACK;
+
+	const int rejected = queue_break_recovery_set_config();
+	check(rejected == ERROR_,
+		"busy control slot makes SET_CONFIG enqueue return ERROR_");
+	check(connection_status == RECEIVING_ACKS_CONTROL,
+		"rejected enqueue does not enter TRANSMITTING_CONTROL");
+	check(messages_control.length == 0 && messages_control.data[0] == 0,
+		"rejected enqueue leaves no fabricated control frame");
+	check(link_timer.counting == NO && watchdog_timer.counting == NO,
+		"rejected enqueue does not start link or watchdog timers");
+
+	// Positive control: the same production helper queues a real SET_CONFIG and
+	// starts both timers when the slot remains FREE.
+	test_break_set_config_status_after_clear = -1;
+	const int queued = queue_break_recovery_set_config();
+	check(queued == SUCCESSFUL && messages_control.status == ADDED_TO_LIST
+		&& (unsigned char)messages_control.data[0] == (unsigned char)SET_CONFIG,
+		"free control slot queues SET_CONFIG");
+	check(connection_status == TRANSMITTING_CONTROL,
+		"successful enqueue enters TRANSMITTING_CONTROL");
+	check(link_timer.counting == YES && watchdog_timer.counting == YES,
+		"successful enqueue starts link and watchdog timers");
+	sim_clock_add_samples(480); // deterministic 10 ms at 48 kHz
+	check(link_timer.get_elapsed_time_ms() == 10
+		&& watchdog_timer.get_elapsed_time_ms() == 10,
+		"transition timers use deterministic virtual time in test");
+
+	test_break_set_config_status_after_clear = -1;
+	deinit_messages_buffers();
+	sim_clock_set_enabled(prior_sim_clock);
+	printf("[TEST-BREAK-SET-CONFIG] %s (%d failure%s)\n",
+		fails == 0 ? "ALL PASS" : "FAILURES", fails, fails == 1 ? "" : "s");
+	fflush(stdout);
+	return fails;
+}
+
 void cl_arq_controller::process_messages_commander()
 {
 	// Topgear deferred-report driver (consume-race fix): drive any pending
@@ -2453,15 +2689,8 @@ void cl_arq_controller::process_messages_commander()
 					fflush(stdout);
 				}
 
-				// Force-clear: cleanup() skips PENDING_ACK status
-				messages_control.status = FREE;
-				add_message_control(SET_CONFIG);
-				printf("[BREAK] SET_CONFIG queued: data[1]=%d data[2]=%d\n",
-					(int)messages_control.data[1], (int)messages_control.data[2]);
-				fflush(stdout);
-				connection_status = TRANSMITTING_CONTROL;
-				link_timer.start();
-				watchdog_timer.start();
+				if(queue_break_recovery_set_config() != SUCCESSFUL)
+					return;
 			}
 		}
 		else
@@ -24442,6 +24671,27 @@ void sim2_activate(MercuryInstance* m)
 	}
 }
 
+#if !defined(_WIN32)
+// sim2_activate() copies the active instance's opaque pthread mutex into the
+// process-global used by the production ARQ paths.  Once the two instance
+// mutexes have been destroyed that copy is no longer usable.  Reinitialize the
+// global from uninitialized storage and validate it before any later --test
+// case can take the lock.  The defeat flag is test-only and default-off.
+int sim2_reset_capture_prep_mutex()
+{
+	if (std::getenv("MERCURY_SIM2_CAPTURE_MUTEX_RESET_DEFEAT") != nullptr)
+		return ECANCELED;
+
+	int rc = pthread_mutex_init(&capture_prep_mutex, nullptr);
+	if (rc != 0)
+		return rc;
+	rc = pthread_mutex_trylock(&capture_prep_mutex);
+	if (rc != 0)
+		return rc;
+	return pthread_mutex_unlock(&capture_prep_mutex);
+}
+#endif
+
 }  // namespace
 
 // FULL-PATH REGRESSION (bigblock-whiten-align): capture of the last 2-instance run's
@@ -25426,12 +25676,89 @@ int cl_arq_controller::test_sim_inproc_2()
 #endif
 	A->audio.free_all();
 	B->audio.free_all();
+#if !defined(_WIN32)
+	const int mutex_reset_rc = sim2_reset_capture_prep_mutex();
+	check(mutex_reset_rc == 0,
+	      "G-CLEANUP: capture_prep_mutex reinitialized and lock-validated after instance teardown");
+#endif
 	delete A; delete B;
 
 	printf("[TEST-SIM-2INST] %s (%d failure%s)\n",
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
+}
+
+// POSIX regression for the SIM_INPROC two-instance mutex teardown.  Copying a
+// locked mutex reproduces sim2_activate's by-value global swap while making the
+// stale state deterministic even on pthread implementations that do not poison
+// destroyed mutexes.  The defeat arm leaves that copy locked; the fixed helper
+// must replace it with a fresh, usable mutex.
+int cl_arq_controller::test_sim2_capture_mutex_cleanup()
+{
+#if defined(_WIN32)
+	printf("[TEST-SIM2-MUTEX-CLEANUP] SKIP (POSIX-only regression)\n");
+	return 0;
+#else
+	int failed = 0;
+	auto check = [&](bool cond, const char* name) {
+		printf("[TEST-SIM2-MUTEX-CLEANUP] %s: %s\n", cond ? "PASS" : "FAIL", name);
+		if (!cond) failed++;
+	};
+
+	const char* old_defeat = std::getenv("MERCURY_SIM2_CAPTURE_MUTEX_RESET_DEFEAT");
+	const bool had_old_defeat = old_defeat != nullptr;
+	const std::string saved_defeat = had_old_defeat ? old_defeat : "";
+
+	pthread_mutex_t instance_mutex;
+	int rc = pthread_mutex_init(&instance_mutex, nullptr);
+	check(rc == 0, "instance pthread_mutex_init succeeds");
+	if (rc != 0)
+		return 1;
+	rc = pthread_mutex_lock(&instance_mutex);
+	check(rc == 0, "instance mutex locks before sim2_activate-style copy");
+	if (rc != 0) {
+		const int destroy_rc = pthread_mutex_destroy(&instance_mutex);
+		check(destroy_rc == 0, "failed-lock instance mutex cleanup succeeds");
+		return 1;
+	}
+	capture_prep_mutex = instance_mutex;
+	rc = pthread_mutex_unlock(&instance_mutex);
+	check(rc == 0, "instance mutex unlock succeeds");
+	rc = pthread_mutex_destroy(&instance_mutex);
+	check(rc == 0, "instance mutex destroy succeeds");
+
+	rc = setenv("MERCURY_SIM2_CAPTURE_MUTEX_RESET_DEFEAT", "1", 1);
+	check(rc == 0, "fail-before defeat arm enabled");
+	const int defeated_reset_rc = sim2_reset_capture_prep_mutex();
+	check(defeated_reset_rc == ECANCELED, "fail-before cleanup is deterministically bypassed");
+	int stale_lock_rc = pthread_mutex_trylock(&capture_prep_mutex);
+	check(stale_lock_rc != 0, "fail-before copied mutex is not usable after instance destroy");
+	if (stale_lock_rc == 0) {
+		const int stale_unlock_rc = pthread_mutex_unlock(&capture_prep_mutex);
+		check(stale_unlock_rc == 0, "unexpected fail-before lock is safely released");
+	}
+
+	rc = unsetenv("MERCURY_SIM2_CAPTURE_MUTEX_RESET_DEFEAT");
+	check(rc == 0, "fail-before defeat arm disabled");
+	const int reset_rc = sim2_reset_capture_prep_mutex();
+	check(reset_rc == 0, "pass-after cleanup reinitializes and validates the global mutex");
+	if (reset_rc == 0) {
+		const int lock_rc = pthread_mutex_trylock(&capture_prep_mutex);
+		check(lock_rc == 0, "pass-after production lock path can take capture_prep_mutex");
+		if (lock_rc == 0) {
+			const int unlock_rc = pthread_mutex_unlock(&capture_prep_mutex);
+			check(unlock_rc == 0, "pass-after production lock path releases capture_prep_mutex");
+		}
+	}
+
+	const int restore_rc = had_old_defeat
+		? setenv("MERCURY_SIM2_CAPTURE_MUTEX_RESET_DEFEAT", saved_defeat.c_str(), 1)
+		: unsetenv("MERCURY_SIM2_CAPTURE_MUTEX_RESET_DEFEAT");
+	check(restore_rc == 0, "defeat environment restored");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+#endif
 }
 
 // ============================================================================

@@ -1286,6 +1286,73 @@ static void capture_publish_causal_ring_chunk(
 	dc->start_ack_causal_ring_generation = generation;
 }
 
+static bool capture_prep_periods(
+	cl_data_container *dc,
+	int *symbol_period,
+	int *signal_period)
+{
+	if(dc == NULL || symbol_period == NULL || signal_period == NULL)
+		return false;
+
+	const int nofdm = dc->Nofdm;
+	const int interpolation_rate = dc->interpolation_rate;
+	const int buffer_nsymb = dc->buffer_Nsymb.load();
+	if(nofdm <= 0 || interpolation_rate <= 0 || buffer_nsymb <= 1)
+		return false;
+
+	const long long current_symbol_period =
+		(long long)nofdm * (long long)interpolation_rate;
+	const long long current_signal_period =
+		current_symbol_period * (long long)buffer_nsymb;
+	if(current_symbol_period <= 0 || current_symbol_period > INT_MAX
+	   || current_signal_period <= current_symbol_period
+	   || current_signal_period > INT_MAX)
+		return false;
+
+	*symbol_period = (int)current_symbol_period;
+	*signal_period = (int)current_signal_period;
+	return true;
+}
+
+// The FIFO chunk was sized before capture_prep_mutex was acquired. Re-read
+// both periods under the mutex and allow a ring write only when that chunk is
+// still one complete symbol in the currently published geometry.
+static bool capture_prep_chunk_matches_geometry(
+	cl_data_container *dc,
+	int captured_symbol_period,
+	int *current_symbol_period,
+	int *current_signal_period)
+{
+	return capture_prep_periods(
+			dc, current_symbol_period, current_signal_period)
+		&& *current_symbol_period == captured_symbol_period;
+}
+
+int capture_prep_geometry_change_selftest(void)
+{
+	cl_data_container dc;
+	dc.Nofdm = 2;
+	dc.interpolation_rate = 2;
+	dc.buffer_Nsymb = 3;
+	const int captured_symbol_period = 4;
+
+	// Deterministically model a config publish between FIFO dequeue and the
+	// ring-write lock. Old code re-read only sp=24 and wrote 4 stale samples;
+	// the guarded write must reject because the current symbol is 6 samples.
+	dc.Nofdm = 3;
+	dc.buffer_Nsymb = 4;
+	int observed_symbol_period = 0;
+	int observed_signal_period = 0;
+	const bool stale_rejected = !capture_prep_chunk_matches_geometry(
+		&dc, captured_symbol_period,
+		&observed_symbol_period, &observed_signal_period);
+	const bool current_accepted = capture_prep_chunk_matches_geometry(
+		&dc, 6, &observed_symbol_period, &observed_signal_period);
+	return stale_rejected && current_accepted
+		&& observed_symbol_period == 6
+		&& observed_signal_period == 24 ? 0 : 1;
+}
+
 uint64_t playback_causal_egress_bound_ns(size_t queued_samples)
 {
 	uint64_t rate = playback_sink_sample_rate_hz.load();
@@ -1532,6 +1599,35 @@ static int capture_enqueue_samples(double *buffer, size_t len)
 		buffer, len, capture_enqueue_wait, NULL);
 }
 
+// Keep the SIM bridge's lossless backpressure behavior opt-in until it has
+// fleet coverage.  Even on the legacy path, a rejected write is fatal rather
+// than an unreported hole in the received sample stream.
+static int sim_rx_enqueue_received_samples_with_wait(double *buffer, size_t len,
+		int lossless_backpressure, capture_enqueue_wait_fn wait_fn,
+		void *wait_context)
+{
+	return lossless_backpressure
+		? capture_enqueue_samples_with_wait(
+			buffer, len, wait_fn, wait_context)
+		: capture_write_samples(buffer, len);
+}
+
+static int sim_rx_validate_enqueue_result(int result)
+{
+	if(result == 0) return 0;
+	if(!shutdown_.exchange(true))
+		fprintf(stderr, "ERROR: SIM RX bridge failed to enqueue captured samples\n");
+	return -1;
+}
+
+static int sim_rx_enqueue_received_samples(double *buffer, size_t len,
+		int lossless_backpressure)
+{
+	return sim_rx_enqueue_received_samples_with_wait(
+		buffer, len, lossless_backpressure,
+		capture_enqueue_wait, NULL);
+}
+
 struct capture_backpressure_test_context
 {
 	double drained[2];
@@ -1579,7 +1675,7 @@ int capture_enqueue_backpressure_selftest(void)
 
 	if(write_buffer(capture_buffer, (uint8_t *)initial,
 		   sizeof(initial)) != 0
-	   || capture_enqueue_samples_with_wait(incoming, 2,
+	   || sim_rx_enqueue_received_samples_with_wait(incoming, 2, 1,
 		   capture_backpressure_test_drain, &context) != 0
 	   || context.failed || context.waits != 1
 	   || read_buffer(capture_buffer, (uint8_t *)remaining,
@@ -1608,6 +1704,12 @@ int capture_enqueue_backpressure_selftest(void)
 		   sizeof(remaining)) != 0
 	   || memcmp(remaining, initial, sizeof(initial)) != 0)
 		failed = 1;
+
+	// The bridge must consume the write verdict. Inject it directly so this
+	// fail-closed assertion has no wall-clock timeout or socket dependency.
+	if(sim_rx_validate_enqueue_result(-1) == 0 || !shutdown_)
+		failed = 1;
+	shutdown_ = false;
 
 	circular_buf_free(capture_buffer);
 	capture_buffer = NULL;
@@ -2109,13 +2211,14 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 	while (!shutdown_)
     {
 		cl_data_container *data_container_ptr = &telecom_ptr->data_container;
-		int signal_period = data_container_ptr->Nofdm * data_container_ptr->buffer_Nsymb * data_container_ptr->interpolation_rate; // in samples
-		int symbol_period = data_container_ptr->Nofdm * data_container_ptr->interpolation_rate;
-		int location_of_last_frame = signal_period - symbol_period - 1; // TODO: do we need this "-1"?
-
-		if (symbol_period == 0) {
+		int signal_period = 0;
+		int symbol_period = 0;
+		if(!capture_prep_periods(
+			data_container_ptr, &symbol_period, &signal_period)) {
+			sim_paced_wait(1);
 			continue;
 		}
+		int location_of_last_frame = signal_period - symbol_period - 1; // TODO: do we need this "-1"?
 
 		// Wait for enough data, checking shutdown_ to avoid blocking forever
 		{
@@ -2220,19 +2323,27 @@ void *radio_capture_prep_thread(void *telecom_ptr_void)
 		}
 #endif
 
-		// Re-read buffer parameters inside mutex to prevent use-after-free
-		// during config switches that deinit/reinit passband_delayed_data.
-		// The values read outside the mutex (signal_period) may be stale if
-		// deinit zeroed Nofdm/buffer_Nsymb between the read and the lock.
+		// Re-read all buffer geometry inside the mutex.  The FIFO chunk above
+		// has the old symbol length, so a configuration change that also changes
+		// Nofdm/interpolation_rate must discard it rather than write that stale
+		// length into the newly published ring geometry.
 		{
-			int sp = data_container_ptr->Nofdm * data_container_ptr->buffer_Nsymb * data_container_ptr->interpolation_rate;
+			int current_symbol_period = 0;
+			int sp = 0;
+			const bool geometry_matches =
+				capture_prep_chunk_matches_geometry(
+					data_container_ptr, symbol_period,
+					&current_symbol_period, &sp);
 			if(sp != signal_period && sp != 0) {
-				printf("[CAP-STALE] sp_old=%d sp_new=%d symb_old=%d buf=%p tid=%lu\n",
-					signal_period, sp, symbol_period, (void*)data_container_ptr->passband_delayed_data,
-					(unsigned long)pthread_self());
+				printf("[CAP-STALE] sp_old=%d sp_new=%d symb_old=%d symb_new=%d buf=%p tid=%lu%s\n",
+					signal_period, sp, symbol_period, current_symbol_period,
+					(void*)data_container_ptr->passband_delayed_data,
+					(unsigned long)pthread_self(),
+					geometry_matches ? "" : " -- discarded");
 				fflush(stdout);
 			}
-			if(sp == 0 || data_container_ptr->passband_delayed_data == NULL || sp <= symbol_period) {
+			if(!geometry_matches
+			   || data_container_ptr->passband_delayed_data == NULL) {
 				MUTEX_UNLOCK(&capture_prep_mutex);
 				continue;
 			}
@@ -2471,6 +2582,23 @@ static sim_sock_t sim_sock = SIM_BAD_SOCK;   // shared by both bridge threads
 static int sim_connected = 0;
 static int sim_tx_allocation_fails_for_test = 0;
 static int sim_rx_allocation_fails_for_test = 0;
+static int sim_connect_attempt_limit_for_test = -1;
+static int sim_port_for_test = -1;
+
+static void sim_close_connection(void)
+{
+	if (sim_sock != SIM_BAD_SOCK) {
+#if defined(_WIN32)
+		shutdown(sim_sock, SD_BOTH);
+		closesocket(sim_sock);
+#else
+		shutdown(sim_sock, SHUT_RDWR);
+		close(sim_sock);
+#endif
+		sim_sock = SIM_BAD_SOCK;
+	}
+	sim_connected = 0;
+}
 
 static void *sim_tx_chunk_alloc(size_t size)
 {
@@ -2528,7 +2656,8 @@ static int sim_connect_once(void)
 
 	const char *port_s = getenv("MERCURY_SIM_PORT");
 	const char *role_s = getenv("MERCURY_SIM_ROLE");
-	int port = port_s ? atoi(port_s) : 52100;
+	int port = sim_port_for_test >= 0
+		? sim_port_for_test : (port_s ? atoi(port_s) : 52100);
 	char role = (role_s && role_s[0]) ? role_s[0] : 'A';
 
 	sim_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -2548,9 +2677,15 @@ static int sim_connect_once(void)
 	// Retry: the relay or the peer may start a moment after us.
 	int attempts = 0;
 	while (connect(sim_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-		if (shutdown_) return -1;
-		if (++attempts > 200) {   // ~20 s
+		if (shutdown_) {
+			sim_close_connection();
+			return -1;
+		}
+		const int attempt_limit = sim_connect_attempt_limit_for_test >= 0
+			? sim_connect_attempt_limit_for_test : 200;
+		if (++attempts > attempt_limit) {   // normally ~20 s
 			printf("[SIM] connect to 127.0.0.1:%d failed after %d attempts\n", port, attempts);
+			sim_close_connection();
 			return -1;
 		}
 		ffthread_sleep(100);
@@ -2558,6 +2693,7 @@ static int sim_connect_once(void)
 	// Send role tag so the relay knows which direction we are.
 	if (sim_send_all(sim_sock, (const uint8_t *)&role, 1) != 0) {
 		printf("[SIM] role handshake send failed\n");
+		sim_close_connection();
 		return -1;
 	}
 	sim_connected = 1;
@@ -2599,7 +2735,15 @@ static int sim_connect_once(void)
 void *sim_tx_bridge_thread(void *unused)
 {
 	(void)unused;
-	if (sim_connect_once() != 0) { shutdown_ = true; return NULL; }
+	if (sim_connect_once() != 0) {
+		// main.cc opens the process-wide virtual sample clock before starting
+		// this worker.  A rejected relay connection is terminal, so close that
+		// clock here as part of the same failed-startup transaction.
+		sim_clock_set_wire_stamp(0);
+		sim_clock_set_enabled(0);
+		shutdown_ = true;
+		return NULL;
+	}
 
 	const int chunk_bytes = SIM_CHUNK_SAMPLES * (int)sizeof(double);
 	double *chunk = (double *)sim_tx_chunk_alloc((size_t)chunk_bytes);
@@ -2694,6 +2838,35 @@ int sim_tx_bridge_allocation_failure_selftest(void)
 	return passed ? 0 : 1;
 }
 
+int sim_playback_connection_failure_selftest(void)
+{
+	if (sim_connected || sim_sock != SIM_BAD_SOCK)
+		return 1;
+
+	const bool saved_shutdown = shutdown_.exchange(false);
+	const int saved_clock_enabled = sim_clock_enabled();
+	const int saved_wire_stamp = sim_clock_wire_stamp();
+
+	// Port zero cannot have a listening TCP relay.  Limit the real localhost
+	// connect path to one attempt so the regression has no wall-clock retry.
+	sim_port_for_test = 0;
+	sim_connect_attempt_limit_for_test = 0;
+	sim_clock_set_enabled(1);
+	sim_clock_set_wire_stamp(1);
+	void *result = sim_tx_bridge_thread(NULL);
+	sim_connect_attempt_limit_for_test = -1;
+	sim_port_for_test = -1;
+
+	const bool passed = result == NULL && shutdown_.load()
+		&& !sim_clock_enabled() && !sim_clock_wire_stamp()
+		&& !sim_connected && sim_sock == SIM_BAD_SOCK;
+	sim_close_connection();
+	sim_clock_set_wire_stamp(saved_wire_stamp);
+	sim_clock_set_enabled(saved_clock_enabled);
+	shutdown_ = saved_shutdown;
+	return passed ? 0 : 1;
+}
+
 // RX bridge: pull channel-impaired passband from the relay and push it into
 // capture_buffer, where radio_capture_prep_thread + rx_transfer consume it.
 void *sim_rx_bridge_thread(void *unused)
@@ -2722,6 +2895,10 @@ void *sim_rx_bridge_thread(void *unused)
 	// the whole run — a mid-run flip would desync the 8-byte framing.
 	const int wire_stamp = sim_clock_wire_stamp();
 	int       first_chunk = 1;
+	const char *backpressure_env =
+		getenv("MERCURY_SIM_RX_BACKPRESSURE");
+	const int lossless_backpressure = backpressure_env != NULL
+		&& backpressure_env[0] != '\0' && atoi(backpressure_env) != 0;
 
 	while (!shutdown_) {
 		uint64_t stamp = 0;
@@ -2773,14 +2950,19 @@ void *sim_rx_bridge_thread(void *unused)
 		// drain as soon as we hand the core to the prep thread; the 5000-spin
 		// "~10 s" cap is sized for the production 2 ms sleep and would trip far
 		// too early under the sub-ms sim pace and drop a chunk.
-		int spins = 0;
-		while (!shutdown_ &&
-		       circular_buf_free_size(capture_buffer) < (size_t)chunk_bytes) {
-			sim_paced_wait(2);
-			if (!sim_clock_enabled() && ++spins > 5000) break;  // ~10 s safety
+		if (!lossless_backpressure) {
+			int spins = 0;
+			while (!shutdown_ &&
+			       circular_buf_free_size(capture_buffer) < (size_t)chunk_bytes) {
+				sim_paced_wait(2);
+				if (!sim_clock_enabled() && ++spins > 5000) break;  // ~10 s safety
+			}
+			if (shutdown_) break;
 		}
-		if (shutdown_) break;
-		capture_write_samples(chunk, SIM_CHUNK_SAMPLES);
+		if (sim_rx_validate_enqueue_result(
+				sim_rx_enqueue_received_samples(chunk, SIM_CHUNK_SAMPLES,
+					lossless_backpressure)) != 0)
+			break;
 	}
 	free(chunk);
 	return NULL;

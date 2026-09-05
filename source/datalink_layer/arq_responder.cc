@@ -1787,7 +1787,25 @@ void cl_arq_controller::process_messages_rx_data_control()
 						messages_rx_buffer.sequence_number, data_batch_size,
 						messages_rx_buffer.length);
 				}
-				add_message_rx_data(messages_rx_buffer.type, messages_rx_buffer.id, messages_rx_buffer.length, messages_rx_buffer.data);
+				int store_result = add_message_rx_data(messages_rx_buffer.type,
+					messages_rx_buffer.id, messages_rx_buffer.length,
+					messages_rx_buffer.data);
+				// Fleet-validation gate: unset preserves the legacy ARQ response;
+				// enabled rejects the frame before any success-only state advances.
+				bool enforce_store_verdict = false;
+				{ const char* e = std::getenv("MERCURY_RX_STORE_FAIL_CLOSED");
+				  if(e && *e && atoi(e) != 0) enforce_store_verdict = true; }
+				if(store_result != SUCCESSFUL && enforce_store_verdict)
+				{
+					printf("[RSP-RX-STORE-REJECT] type=%d id=%d seq=%d len=%d verdict=%d\n",
+						messages_rx_buffer.type,
+						(int)(unsigned char)messages_rx_buffer.id,
+						messages_rx_buffer.sequence_number,
+						messages_rx_buffer.length, store_result);
+					fflush(stdout);
+				}
+				if(store_result == SUCCESSFUL || !enforce_store_verdict)
+				{
 				batch_rx_frame_count++;
 				// §19: session-monotonic forward-progress counter. batch_rx_frame_count RESETS at every
 				// batch boundary, so the dead-batch tick guard (arq_common.cc §19) needs a counter that
@@ -1938,6 +1956,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 				fflush(stdout);
 				set_receiving_timeout(rx_timeout);
 				receiving_timer.start();
+				}  // end accepted (or compatibility-mode) add_message_rx_data store
 
 				}  // end if(!v2_route_drop) — SACK Design A Step 4 routing decision
 			}
@@ -15166,6 +15185,148 @@ int cl_arq_controller::test_inorder_demote()
 		pass ? "PASS" : "FAIL", fails, defeat ? 1 : 0, lossy_demote ? 1 : 0);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+// ============================================================================
+// Current-batch store-verdict fail-closed regression (test-only)
+// ============================================================================
+//
+// The DATA dispatcher must not turn add_message_rx_data() rejections into
+// receive progress. Stage CRC-valid/match-current frames exactly as receive()
+// hands them to this consumer, while keeping the PHY capture gate closed so
+// the test remains entirely in-process. The virtual clock makes the active
+// receiving-window branch deterministic.
+int cl_arq_controller::test_rx_store_verdict_fail_closed()
+{
+	const char* TAG = "[TEST-RX-STORE-VERDICT]";
+	int failed = 0;
+	auto check = [&](bool condition, const char* what, long got, long want) {
+		if(condition)
+			printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+		else
+		{
+			printf("%s FAIL: %s (got=%ld want=%ld)\n", TAG, what, got, want);
+			failed++;
+		}
+		fflush(stdout);
+	};
+	auto set_gate_env = [](const char* value) {
+#if defined(_WIN32)
+		_putenv_s("MERCURY_RX_STORE_FAIL_CLOSED", value ? value : "");
+#else
+		if(value) setenv("MERCURY_RX_STORE_FAIL_CLOSED", value, 1);
+		else unsetenv("MERCURY_RX_STORE_FAIL_CLOSED");
+#endif
+	};
+
+	const int previous_sim_clock_enabled = sim_clock_enabled();
+	sim_clock_set_enabled(1);
+	const char* previous_gate_env = std::getenv("MERCURY_RX_STORE_FAIL_CLOSED");
+	const bool had_previous_gate_env = previous_gate_env != NULL;
+	const std::string previous_gate_value = previous_gate_env
+		? std::string(previous_gate_env) : std::string();
+	set_gate_env("1");
+
+	this->nMessages          = 255;
+	this->max_data_length    = 170;
+	this->max_message_length = 200;
+	this->max_header_length  = 6;
+	int alloc_rc = init_messages_buffers();
+	if(alloc_rc != SUCCESSFUL)
+	{
+		printf("%s ERROR: init_messages_buffers() failed (rc=%d)\n", TAG, alloc_rc);
+		fflush(stdout);
+		set_gate_env(had_previous_gate_env ? previous_gate_value.c_str() : NULL);
+		sim_clock_set_enabled(previous_sim_clock_enabled);
+		return 1;
+	}
+
+	cl_telecom_system test_telecom;
+	this->telecom_system = &test_telecom;
+	// frames_to_read != 0 makes receive() take its normal "not enough captured
+	// audio yet" return without replacing the already-decoded frame below.
+	test_telecom.data_container.frames_to_read = 1;
+	this->role              = RESPONDER;
+	this->original_role     = RESPONDER;
+	this->link_status       = CONNECTED;
+	this->connection_status = RECEIVING;
+	this->passive_monitor   = false;
+	this->break_detected    = NO;
+	this->sack_enabled      = true;
+	this->sack_v2_enabled   = true;
+	this->compression_enabled = false;
+	this->inband_rate_enabled = 0;
+	this->data_batch_size   = 2;
+	this->rsp_current_expected_batch_seq_id = 17;
+	this->rsp_prev_batch_seq_id = 16;
+	this->batch_rx_frame_count = 0;
+	this->inband_total_data_frames_rx = 0;
+	this->last_received_end_of_batch_seq = -1;
+	this->rx_batch_total_frames = -1;
+	this->set_receiving_timeout(10000);
+	this->receiving_timer.start();
+
+	auto dispatch_rejected_frame = [&](int id, int length, const char* label) {
+		this->messages_rx_buffer.type = DATA_LONG;
+		this->messages_rx_buffer.id = (char)(unsigned char)id;
+		this->messages_rx_buffer.sequence_number = 1;
+		this->messages_rx_buffer.batch_seq_id = 17; // match-current
+		this->messages_rx_buffer.length = length;
+		this->messages_rx_buffer.status = RECEIVED; // receive()'s CRC-valid verdict
+		this->rx_buffer_eob_seq = 1;
+		this->rx_buffer_batch_total_frames = 2;
+		for(int i = 0; i < 8; i++)
+			this->messages_rx_buffer.data[i] = (char)(0x40 + i);
+
+		process_messages_rx_data_control();
+
+		check(this->messages_rx_buffer.status == FREE,
+			label, this->messages_rx_buffer.status, FREE);
+		check(this->batch_rx_frame_count == 0,
+			"rejected frame does not advance batch progress",
+			this->batch_rx_frame_count, 0);
+		check(this->inband_total_data_frames_rx == 0,
+			"rejected frame does not advance session progress",
+			(long)this->inband_total_data_frames_rx, 0);
+		check(this->last_received_end_of_batch_seq == -1,
+			"rejected frame does not promote EOB metadata",
+			this->last_received_end_of_batch_seq, -1);
+		check(this->rx_batch_total_frames == -1,
+			"rejected frame does not promote batch-length metadata",
+			this->rx_batch_total_frames, -1);
+	};
+
+	// MESSAGE_ID_ERROR: id == acceptance-window size is just outside [0, 2).
+	dispatch_rejected_frame(2, 8, "ID-rejected frame is consumed without storage");
+	check(this->messages_rx[2].status == FREE,
+		"ID-rejected frame leaves its store slot FREE",
+		this->messages_rx[2].status, FREE);
+
+	// MESSAGE_LENGTH_ERROR: valid id, one byte above DATA_LONG's real payload cap.
+	const int max_payload = this->max_data_length + this->max_header_length
+		- effective_data_long_header_length(this->sack_v2_enabled,
+			this->header_carries_d5);
+	dispatch_rejected_frame(0, max_payload + 1,
+		"length-rejected frame is consumed without storage");
+	check(this->messages_rx[0].status == FREE,
+		"length-rejected frame leaves its store slot FREE",
+		this->messages_rx[0].status, FREE);
+	check(this->receiving_timeout == 10000,
+		"reject path does not re-arm a success-derived receive timeout",
+		this->receiving_timeout, 10000);
+	check(this->receiving_timer.get_elapsed_time_ms() == 0,
+		"dispatcher test uses deterministic virtual time",
+		this->receiving_timer.get_elapsed_time_ms(), 0);
+
+	this->telecom_system = NULL;
+	set_gate_env(had_previous_gate_env ? previous_gate_value.c_str() : NULL);
+	sim_clock_set_enabled(previous_sim_clock_enabled);
+	check(sim_clock_enabled() == previous_sim_clock_enabled,
+		"prior clock mode restored", sim_clock_enabled(), previous_sim_clock_enabled);
+
+	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "PASS" : "FAIL", failed);
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
 }
 
 // ============================================================================

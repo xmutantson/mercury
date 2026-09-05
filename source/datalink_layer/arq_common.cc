@@ -16157,6 +16157,14 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 	(void)target_batch_seq_id; (void)bitmap;
 	return 0;  // Feature compiled out — caller falls back to OFDM path.
 #else
+	// ack_suffix_fec_coded is shared with the PHY packer but owned by this call.
+	// Scope cleanup keeps every return path fail-closed.
+	struct AckSuffixFecReset {
+		bool& flag;
+		explicit AckSuffixFecReset(bool& value) : flag(value) { flag = false; }
+		~AckSuffixFecReset() { flag = false; }
+	} ack_fec_reset(telecom_system->ack_mfsk.ack_suffix_fec_coded);
+
 	// Runtime guard: NB session (M=8) has ack_sack_suffix_len()==0.
 	if(telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0)
 		return 0;
@@ -16185,10 +16193,7 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 
 	int nsymb = telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
 	if(nsymb <= 0 || telecom_system->ack_sack_pattern_passband_samples <= 0)
-	{
-		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 		return 0;
-	}
 	// LINK-PHASE PRIMITIVE (increment 1): the RSP is committing to key its reverse ACK here ->
 	// owner RSP_KEYED. Write-only; no consumer reads it.
 	lp_note_rsp_key();
@@ -16325,7 +16330,6 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 		g_mfsk_ack_sack_buffer_delete(raw_output);
 		g_mfsk_ack_sack_buffer_delete(filtered1);
 		g_mfsk_ack_sack_buffer_delete(filtered2);
-		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 		return 0;
 	}
 
@@ -16346,7 +16350,6 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 		telecom_system->data_container.rx_mute = 0;
 		telecom_system->data_container.rx_mute_samples = 0;
 		telecom_system->data_container.nUnder_processing_events = 0;
-		telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
 		return -1;
 	}
 	{
@@ -16384,16 +16387,76 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 
 	ptt_off();
 
-	// §21.3: clear the per-call ACK FEC flag so it can NEVER leak to a later,
-	// non-eligible ACK (e.g. after a turboshift to an OFDM config). The CONNECT
-	// suffix_fec_coded is untouched — this is the ACK-only flag.
-	telecom_system->ack_mfsk.ack_suffix_fec_coded = false;
-
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		t_end - t_start).count();
 	return elapsed_ms;
 #endif  // MFSK_ACK_SACK_ENABLED
+}
+
+// Fail-before/pass-after regression for the unsupported-suffix early return.
+// Seed the state a failed coded ACK would leave behind, then take the NB guard
+// without any audio or wall-clock waits. The production packer must subsequently
+// observe an uncoded ACK state at an ineligible OFDM configuration.
+int cl_arq_controller::test_send_mfsk_ack_sack_fec_state_cleanup()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-MFSK-ACK-FEC-CLEANUP] SKIP: MFSK_ACK_SACK_ENABLED == 0\n");
+	return 0;
+#else
+	int failed = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-MFSK-ACK-FEC-CLEANUP] %s: %s\n",
+			condition ? "PASS" : "FAIL", name);
+		if(!condition) failed++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	if(test_telecom.load_configuration(CONFIG_0) != 0
+	   || test_telecom.ack_mfsk.M != 16)
+	{
+		printf("[TEST-MFSK-ACK-FEC-CLEANUP] FAIL: could not load WB CONFIG_0\n");
+		return 1;
+	}
+
+	cl_telecom_system* saved_telecom = telecom_system;
+	bool saved_passive_monitor = passive_monitor;
+	int saved_current_configuration = current_configuration;
+
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	current_configuration = CONFIG_0; // ACK suffix FEC is ineligible here.
+
+	// Model the shared state left by an enabled robust-tier ACK whose mid-TX
+	// wait failed, then force the next call through its no-suffix early exit.
+	test_telecom.ack_mfsk.ack_suffix_fec_coded = true;
+	test_telecom.ack_mfsk.M = 8;
+	long long result = send_mfsk_ack_sack(7, 0x5U);
+	check(result == 0, "unsupported suffix returns without transmitting");
+	check(!test_telecom.ack_mfsk.ack_suffix_fec_coded,
+		"early return clears stale per-call ACK FEC state");
+
+	// Restore WB geometry and exercise the real generation-time packer seam.
+	test_telecom.ack_mfsk.M = 16;
+	int suffix_tones[64] = {0};
+	int suffix_len = -1;
+	if(!test_telecom.ack_mfsk.ack_suffix_fec_coded)
+		suffix_len = test_telecom.ack_mfsk.pack_ack_sack_payload(
+			7, 0x5U, 0, suffix_tones);
+	check(suffix_len == test_telecom.ack_mfsk.ack_sack_suffix_len(),
+		"subsequent ineligible ACK is uncoded at generation time");
+
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	current_configuration = saved_current_configuration;
+
+	printf("[TEST-MFSK-ACK-FEC-CLEANUP] %s (%d failure%s)\n",
+		failed == 0 ? "ALL PASS" : "FAILURES", failed,
+		failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed;
+#endif
 }
 
 static int g_mfsk_ack_sack_test_freed_buffers = 0;

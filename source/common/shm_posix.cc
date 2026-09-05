@@ -54,7 +54,7 @@ int shm_open_and_get_fd(char *name)
     return fd;
 }
 
-// check if shm is already created, as this functions will unlink the shm if already created, and create a new one
+// Open an existing shared-memory object or create it if absent, then set its size.
 // returns non-negative integer
 int shm_create_and_get_fd(char *name, size_t size)
 {
@@ -101,12 +101,9 @@ int shm_create_and_get_fd(char *name, size_t size)
 		abort();
 	}
 #else
-    if (shm_open(name, O_RDWR, 0644) >= 0)
-    {
-        // fprintf(stderr, "POSIX shared memory already created. Re-creating it.\n");
-        shm_unlink(name);
-    }
-
+    // Open before resizing so an acquisition failure leaves any existing
+    // namespace entry intact. POSIX shm has no atomic rename/replace operation;
+    // unlinking first would irreversibly lose the old name on error.
     if((fd = shm_open(name, O_RDWR | O_CREAT, 0644)) == -1)
     {
         fprintf(stderr, "ERROR: This should never happen! SHM creation error!\n");

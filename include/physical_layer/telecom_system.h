@@ -43,6 +43,8 @@ class cl_ldpc_decode_pool;
 #include "common/ring_buffer_posix.h"
 #include "common/os_interop.h"
 #include <iomanip>
+#include <atomic>
+#include <cstdint>
 #include <vector>
 #include <memory>
 
@@ -677,6 +679,12 @@ public:
 	// (MINI) for non-anchor non-forced frames; full_nsymb otherwise. STATIC /
 	// PURE so TX and RX get bit-identical results.
 	static int preamble_sched_nsymb(int frame_idx_in_batch, bool force_full, int full_nsymb);
+	// Select the preamble span skipped by the post-sync data-energy gate. The
+	// MINI-aware behavior is default-off until fleet validation; invalid geometry
+	// returns -1 so the receive path can reject the candidate fail-closed.
+	int data_energy_gate_preamble_nsymb(int configured_preamble_nsymb,
+		int effective_preamble_nsymb) const;
+	bool mini_data_energy_gate_enabled = false;
 	// Post-sync preamble-energy correction may refine an acquired delay only when
 	// no stronger timing source already owns it. Static/pure so the production
 	// receive path and the focused regression use the identical policy.
@@ -801,6 +809,8 @@ public:
 
 	int bit_interleaver_block_size;
 	int time_freq_interleaver_block_size;
+	bool rx_shm_fail_closed_enabled = false;
+	std::atomic<uint64_t> rx_shm_output_drop_count{0};
 
 	void calculate_parameters();
 
@@ -815,6 +825,15 @@ public:
 	void RX_TEST_process_main();
 	void TX_SHM_process_main(cbuf_handle_t buffer);
 	void RX_SHM_process_main(cbuf_handle_t buffer);
+	// Default-off fail-closed reporting for decoded-frame SHM output. The helper
+	// is shared with the regression test so it exercises the production guard
+	// and checked write. MERCURY_RX_SHM_FAIL_CLOSED=1 publishes every refused or
+	// failed delivery through this per-PHY counter instead of stdout alone.
+	bool RX_SHM_deliver_decoded_frame(cbuf_handle_t buffer, uint8_t *data,
+	                                  size_t frame_size);
+	uint64_t RX_SHM_output_drop_count() const
+		{ return rx_shm_output_drop_count.load(std::memory_order_relaxed); }
+	static int test_rx_shm_output_overflow();
 	void BER_PLOT_baseband_process_main();
 	void BER_PLOT_passband_process_main();
 	// Timing-acquisition-under-SFO harness (F1 fix). Entry via -m PLOT_PASSBAND -s

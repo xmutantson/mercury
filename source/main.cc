@@ -1892,9 +1892,75 @@ int cl_arq_controller::test_turbo_iterations_sentinel()
     return fails;
 }
 
+// MINI frames carry one preamble symbol, so their first four data symbols begin
+// at symbol 1 rather than at the configured FULL-preamble boundary (symbol 4).
+// Reproduce the old false-pass with silent symbols 1..3 and energetic symbols
+// 4..7, then require the MINI-aware production selector to inspect the earlier
+// window. The amplitudes make the old window pass the 10% relative gate while
+// the corrected window fails it deterministically.
+int cl_arq_controller::test_mini_data_energy_gate()
+{
+	printf("[TEST-MINI-DATA-ENERGY] effective-preamble offset regression\n");
+	const int full_preamble = 4;
+	const int mini_preamble = 1;
+	const int samples_per_symbol = 8;
+	cl_telecom_system telecom;
+	std::vector<std::complex<double> > samples(8 * samples_per_symbol,
+		std::complex<double>(0.0, 0.0));
+	for(int sym = 0; sym < 8; sym++)
+	{
+		double energy = (sym == 0) ? 1.0 : (sym >= 4 ? 0.20 : 0.0);
+		double amplitude = std::sqrt(energy);
+		for(int i = 0; i < samples_per_symbol; i++)
+			samples[sym * samples_per_symbol + i] = std::complex<double>(amplitude, 0.0);
+	}
+
+	auto mean_four_symbols = [&](int preamble_nsymb) {
+		int begin = preamble_nsymb * samples_per_symbol;
+		int end = begin + 4 * samples_per_symbol;
+		if(begin < 0 || end > (int)samples.size()) return -1.0;
+		double sum = 0.0;
+		for(int i = begin; i < end; i++) sum += std::norm(samples[i]);
+		return sum / (4 * samples_per_symbol);
+	};
+
+	telecom.mini_data_energy_gate_enabled = false;
+	int legacy_offset = telecom.data_energy_gate_preamble_nsymb(
+		full_preamble, mini_preamble);
+	telecom.mini_data_energy_gate_enabled = true;
+	int fixed_offset = telecom.data_energy_gate_preamble_nsymb(
+		full_preamble, mini_preamble);
+	double legacy_energy = mean_four_symbols(legacy_offset);
+	double fixed_energy = mean_four_symbols(fixed_offset);
+	bool legacy_passes = legacy_energy >= 0.10;
+	bool fixed_rejects = fixed_energy < 0.10;
+	bool invalid_rejects =
+		telecom.data_energy_gate_preamble_nsymb(0, 0) < 0
+		&& telecom.data_energy_gate_preamble_nsymb(4, -1) < 0
+		&& telecom.data_energy_gate_preamble_nsymb(4, 5) < 0;
+
+	int fails = 0;
+	if(legacy_offset != 4 || fixed_offset != 1 || !legacy_passes
+		|| !fixed_rejects || !invalid_rejects)
+	{
+		printf("[TEST-MINI-DATA-ENERGY] FAIL: offsets legacy=%d fixed=%d energies=%.3f/%.3f invalid=%d\n",
+			legacy_offset, fixed_offset, legacy_energy, fixed_energy,
+			invalid_rejects ? 1 : 0);
+		fails++;
+	}
+	printf("[TEST-MINI-DATA-ENERGY] %s (legacy=%.3f PASS, fixed=%.3f REJECT)\n",
+		fails == 0 ? "PASS" : "FAIL", legacy_energy, fixed_energy);
+	return fails;
+}
+
 int cl_arq_controller::test_bigblock_wav_short_read()
 {
 	return cl_telecom_system::test_bigblock_wav_short_read();
+}
+
+int cl_arq_controller::test_rx_shm_output_overflow()
+{
+	return cl_telecom_system::test_rx_shm_output_overflow();
 }
 
 // --test-chase: chase-combining (HARQ Type-I soft-LLR combine) fail-before /
@@ -2507,6 +2573,62 @@ int cl_arq_controller::test_gbf_decoder_constraints()
     return fails;
 }
 
+int cl_arq_controller::test_gbf_final_iteration_sentinel()
+{
+    // One parity check over two bits. With eta=0.5, bit 0 reaches zero after
+    // two flips, so the syndrome first clears at the iteration-3 check.
+    const float llr[2] = {-1.0f, 10.0f};
+    const int checks[2] = {0, 1};
+    const int iteration_limit = 3;
+    const int failure = iteration_limit + 1;
+    int decoded[1] = {-1};
+    int fails = 0;
+
+    const int result = decode_GBF(
+        llr, decoded, checks, 2, 2, 2, 1, 1,
+        iteration_limit, 0.5f);
+
+    cl_telecom_system telecom;
+    telecom.ldpc.nIteration_max = iteration_limit;
+    st_receive_stats rs{};
+    rs.all_zeros = NO;
+    rs.crc = 0;
+
+    // Fail-before: the former boundary result looked converged to the real CRC
+    // admission predicate, so a CRC-colliding frame was accepted.
+    rs.iterations_done = iteration_limit;
+    const bool legacy_rejected = telecom.frame_decode_rejected(
+        rs, CRC16_MODBUS_RTU);
+    if(legacy_rejected) fails++;
+
+    // Pass-after: the decoder publishes the canonical failure sentinel and the
+    // production admission predicate rejects the same CRC-good hard bits.
+    rs.iterations_done = result;
+    const bool fixed_rejected = telecom.frame_decode_rejected(
+        rs, CRC16_MODBUS_RTU);
+    if(result != failure || decoded[0] != 0 || !fixed_rejected) fails++;
+
+    // The boundary alone is rejected: with one more allowed iteration, the
+    // identical convergence at iteration 3 remains an ordinary success.
+    int control_decoded[1] = {-1};
+    const int control_result = decode_GBF(
+        llr, control_decoded, checks, 2, 2, 2, 1, 1,
+        iteration_limit + 1, 0.5f);
+    telecom.ldpc.nIteration_max = iteration_limit + 1;
+    rs.iterations_done = control_result;
+    const bool control_rejected = telecom.frame_decode_rejected(
+        rs, CRC16_MODBUS_RTU);
+    if(control_result != iteration_limit || control_decoded[0] != 0
+       || control_rejected) fails++;
+
+    printf("[TEST-GBF-FINAL-ITERATION] legacy=%s result=%d sentinel=%d rejected=%d "
+           "control-result=%d control-rejected=%d -> %s\n",
+           legacy_rejected ? "REJECT" : "ACCEPT", result, failure,
+           fixed_rejected ? 1 : 0, control_result,
+           control_rejected ? 1 : 0, fails == 0 ? "PASS" : "FAIL");
+    return fails;
+}
+
 int cl_arq_controller::test_tx_level_cli_validation()
 {
     int fails = 0;
@@ -2830,9 +2952,21 @@ int main(int argc, char *argv[])
             cl_arq_controller test_audio;
             return test_audio.test_sim_rx_bridge_allocation_fail_closed();
         }
+        if (strcmp(argv[i], "--test-sim-connect-clock") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_sim_playback_connection_fail_closed();
+        }
         if (strcmp(argv[i], "--test-rx-test-stream-wait") == 0) {
             cl_arq_controller test_audio;
             return test_audio.test_rx_test_stream_wait();
+        }
+        if (strcmp(argv[i], "--test-shm-create-preserves-existing") == 0) {
+            cl_arq_controller test_shm;
+            return test_shm.test_shm_create_preserves_existing();
+        }
+        if (strcmp(argv[i], "--test-capture-prep-geometry") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_capture_prep_geometry_change();
         }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
@@ -2859,6 +2993,8 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_data_container_ownership_constraints();
                 failed += test_arq.test_data_container_deinit_resets_pinning();
                 failed += test_arq.test_gbf_decoder_constraints();
+                failed += test_arq.test_gbf_final_iteration_sentinel();
+                failed += test_arq.test_mini_data_energy_gate();
                 failed += test_arq.test_modulation_cli_validation();
                 failed += test_arq.test_tx_level_cli_validation();
                 failed += test_arq.test_tx_level_concurrent_sync();
@@ -2866,10 +3002,13 @@ int main(int argc, char *argv[])
                 failed += test_arq.test_audio_device_path_bounds();
                 failed += test_arq.test_audio_subsystem_cli_validation();
                 failed += test_arq.test_shm_unmap_fail_closed();
+                failed += test_arq.test_shm_create_preserves_existing();
                 failed += test_arq.test_suffix_soft_nb_unsupported_fail_closed();
                 failed += test_arq.test_fir_dump_exit_fail_closed();
                 failed += test_arq.test_bigblock_wav_short_read();
+                failed += test_arq.test_rx_shm_output_overflow();
                 failed += test_arq.test_sim_inproc_pump_fail_closed();
+                failed += test_arq.test_sim2_capture_mutex_cleanup();
                 failed += test_arq.test_recovery_ack_tail_capacity();
                 failed += test_arq.test_l1_tx_journal_disabled_fail_closed();
                 failed += test_arq.test_l1_journal_disabled_mark_sent_many();
@@ -2890,7 +3029,12 @@ int main(int argc, char *argv[])
                 failed += test_break.test_send_break_pattern_reset_failure();
             }
             {
+                cl_arq_controller test_break;
+                failed += test_break.test_break_ack_set_config_failure();
+            }
+            {
                 cl_arq_controller test_mfsk_ack_sack;
+                failed += test_mfsk_ack_sack.test_send_mfsk_ack_sack_fec_state_cleanup();
                 failed += test_mfsk_ack_sack.test_send_mfsk_ack_sack_drain_failure();
                 cl_arq_controller test_ack;
                 failed += test_ack.test_send_mfsk_ack_sack_reset_failure();
@@ -2953,7 +3097,9 @@ int main(int argc, char *argv[])
                 failed += test_audio.test_audio_payload_allocation_fail_closed();
                 failed += test_audio.test_sim_tx_bridge_allocation_fail_closed();
                 failed += test_audio.test_sim_rx_bridge_allocation_fail_closed();
+                failed += test_audio.test_sim_playback_connection_fail_closed();
                 failed += test_audio.test_capture_enqueue_backpressure();
+                failed += test_audio.test_capture_prep_geometry_change();
                 failed += test_audio.test_rx_transfer_read_failure();
                 failed += test_audio.test_rx_test_stream_wait();
             }
@@ -3077,6 +3223,12 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_inband_deadbatch_progress();
+            }
+            // A DATA frame rejected by add_message_rx_data() must not advance
+            // current-batch/session progress or promote staged batch metadata.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_rx_store_verdict_fail_closed();
             }
             // In-band CONNECT-LIVENESS GUARD regression (control-plane livelock backstop).
             // Member test on a throwaway controller (builds its own telecom_system). Fast +
