@@ -383,6 +383,15 @@ int cl_arq_controller::test_audio_thread_create_fail_closed()
 	return passed ? 0 : 1;
 }
 
+int cl_arq_controller::test_audio_rt_priority()
+{
+	const int failed = audioio_rt_priority_selftest();
+	printf("[TEST-RT-PRIORITY] off=silent/unchanged on=three-witnesses "
+	       "and fail-soft completion: %s\n",
+	       failed == 0 ? "PASS" : "FAIL");
+	return failed;
+}
+
 int cl_arq_controller::test_capture_allocation_fail_closed()
 {
 	const int failed = audioio_capture_allocation_failure_selftest();

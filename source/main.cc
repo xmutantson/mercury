@@ -2944,6 +2944,10 @@ int main(int argc, char *argv[])
             cl_arq_controller test_audio;
             return test_audio.test_audio_thread_create_fail_closed();
         }
+        if (strcmp(argv[i], "--test-rt-priority") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_audio_rt_priority();
+        }
         if (strcmp(argv[i], "--test-sim-tx-allocation") == 0) {
             cl_arq_controller test_audio;
             return test_audio.test_sim_tx_bridge_allocation_fail_closed();
@@ -3094,6 +3098,7 @@ int main(int argc, char *argv[])
                 failed += test_audio.test_audio_open_fail_closed();
                 failed += test_audio.test_soundcard_list_alloc_fail_closed();
                 failed += test_audio.test_audio_thread_create_fail_closed();
+                failed += test_audio.test_audio_rt_priority();
                 failed += test_audio.test_capture_allocation_fail_closed();
                 failed += test_audio.test_audio_payload_allocation_fail_closed();
                 failed += test_audio.test_sim_tx_bridge_allocation_fail_closed();
@@ -9710,6 +9715,9 @@ start_modem:
                 main_exit_status = EXIT_FAILURE;
         }
 #endif
+
+        if (main_exit_status == EXIT_SUCCESS)
+            audioio_apply_receive_decode_priority();
 
         while (
 #ifdef MERCURY_GUI_ENABLED

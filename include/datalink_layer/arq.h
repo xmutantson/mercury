@@ -573,6 +573,7 @@ public:
   int test_audio_open_fail_closed();
   int test_soundcard_list_alloc_fail_closed();
   int test_audio_thread_create_fail_closed();
+  int test_audio_rt_priority();
   int test_capture_allocation_fail_closed();
   int test_audio_payload_allocation_fail_closed();
   int test_sim_tx_bridge_allocation_fail_closed();

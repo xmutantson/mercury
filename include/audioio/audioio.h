@@ -73,6 +73,10 @@ typedef int (*audioio_pthread_join_fn)(pthread_t, void **);
 void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
 										 audioio_pthread_join_fn join_fn);
 
+// Called once on the main ARQ thread immediately before its first process_main()
+// receive/decode pass. No-op unless MERCURY_RT_PRIORITY >= 2.
+void audioio_apply_receive_decode_priority(void);
+
 int tx_transfer(double *buffer, size_t len);
 int rx_transfer(double *buffer, size_t len);
 int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len);
@@ -104,6 +108,7 @@ int audioio_payload_allocation_failure_selftest(void);
 int sim_tx_bridge_allocation_failure_selftest(void);
 int sim_rx_bridge_allocation_failure_selftest(void);
 int sim_playback_connection_failure_selftest(void);
+int audioio_rt_priority_selftest(void);
 // Conservative time from queued passband samples to physical/simulated output
 // egress, including the opened playback backend's retained-device bound.
 uint64_t playback_causal_egress_bound_ns(size_t queued_samples);

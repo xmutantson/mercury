@@ -27,8 +27,13 @@
 #include <stdatomic.h>
 #endif
 #include <limits.h>
+#include <errno.h>
 #include <string.h>
 #include <math.h>
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/resource.h>
+#endif
 #ifdef _WIN32
 #include <wchar.h>
 #endif
@@ -190,6 +195,136 @@ static thread_local bool capture_writer_causal_ready = false;
 typedef int (*audioio_read_buffer_fn)(cbuf_handle_t, uint8_t *, size_t);
 static audioio_read_buffer_fn audioio_capture_read_buffer = read_buffer;
 
+// MERCURY_RT_PRIORITY is deliberately read at each targeted thread entry so
+// an unset/zero lever performs no scheduler calls and emits no witness.  Level
+// 1 covers the capture/playback device services; level 2 also covers the main
+// ARQ loop thread which executes the receive/decode path.
+static int mercury_rt_priority_level(void)
+{
+	const char *value = getenv("MERCURY_RT_PRIORITY");
+	if(value == NULL || *value == '\0')
+		return 0;
+	char *end = NULL;
+	const int saved_errno = errno;
+	errno = 0;
+	const long level = strtol(value, &end, 10);
+	const int parse_error = errno;
+	errno = saved_errno;
+	if(parse_error != 0 || end == value || level <= 0)
+		return 0;
+	return level > INT_MAX ? INT_MAX : (int)level;
+}
+
+#if defined(__linux__)
+static const char *audioio_sched_policy_name(int policy)
+{
+	switch(policy)
+	{
+		case SCHED_FIFO: return "SCHED_FIFO";
+		case SCHED_RR: return "SCHED_RR";
+		case SCHED_OTHER: return "SCHED_OTHER";
+		default: return "UNKNOWN";
+	}
+}
+#elif defined(_WIN32)
+static const char *audioio_windows_priority_name(int priority)
+{
+	switch(priority)
+	{
+		case THREAD_PRIORITY_TIME_CRITICAL: return "TIME_CRITICAL";
+		case THREAD_PRIORITY_HIGHEST: return "HIGHEST";
+		case THREAD_PRIORITY_ABOVE_NORMAL: return "ABOVE_NORMAL";
+		case THREAD_PRIORITY_NORMAL: return "NORMAL";
+		case THREAD_PRIORITY_BELOW_NORMAL: return "BELOW_NORMAL";
+		case THREAD_PRIORITY_LOWEST: return "LOWEST";
+		case THREAD_PRIORITY_IDLE: return "IDLE";
+		default: return "UNKNOWN";
+	}
+}
+#endif
+
+static bool audioio_apply_rt_priority(const char *thread_name, bool audio_thread,
+	                                  FILE *witness)
+{
+	const int level = mercury_rt_priority_level();
+	if(level == 0 || (!audio_thread && level < 2))
+		return false;
+
+#if defined(__linux__)
+	struct sched_param requested = {};
+	requested.sched_priority = 10;
+	const int fifo_error = pthread_setschedparam(
+		pthread_self(), SCHED_FIFO, &requested);
+	int other_error = 0;
+	int nice_error = 0;
+	if(fifo_error == EPERM)
+	{
+		struct sched_param fallback = {};
+		other_error = pthread_setschedparam(
+			pthread_self(), SCHED_OTHER, &fallback);
+		errno = 0;
+		const int current_nice = getpriority(PRIO_PROCESS, 0);
+		if(errno != 0)
+			nice_error = errno;
+		else if(current_nice > -5 && setpriority(PRIO_PROCESS, 0, -5) != 0)
+			nice_error = errno;
+	}
+
+	int achieved_policy = -1;
+	struct sched_param achieved = {};
+	const int sched_query_error = pthread_getschedparam(
+		pthread_self(), &achieved_policy, &achieved);
+	errno = 0;
+	const int achieved_nice = getpriority(PRIO_PROCESS, 0);
+	const int nice_query_error = errno;
+	const bool fallback_achieved = fifo_error == EPERM
+		&& other_error == 0 && nice_error == 0
+		&& sched_query_error == 0 && achieved_policy == SCHED_OTHER
+		&& nice_query_error == 0 && achieved_nice <= -5;
+	const char *result = fifo_error == 0 ? "ok"
+		: (fallback_achieved ? "fallback" : "fail-soft");
+	fprintf(witness,
+		"[RT-PRIORITY] thread=%s requested=SCHED_FIFO/10 -> "
+		"achieved=%s/%d,nice=%d result=%s "
+		"errors(fifo=%d,other=%d,nice=%d,query=%d/%d)\n",
+		thread_name,
+		sched_query_error == 0 ? audioio_sched_policy_name(achieved_policy)
+		                       : "UNKNOWN",
+		sched_query_error == 0 ? achieved.sched_priority : -1,
+		nice_query_error == 0 ? achieved_nice : INT_MAX,
+		result, fifo_error, other_error, nice_error,
+		sched_query_error, nice_query_error);
+#elif defined(_WIN32)
+	const int requested = audio_thread ? THREAD_PRIORITY_TIME_CRITICAL
+	                                   : THREAD_PRIORITY_ABOVE_NORMAL;
+	const BOOL changed = SetThreadPriority(GetCurrentThread(), requested);
+	const DWORD change_error = changed ? ERROR_SUCCESS : GetLastError();
+	const int achieved = GetThreadPriority(GetCurrentThread());
+	const DWORD query_error = achieved == THREAD_PRIORITY_ERROR_RETURN
+		? GetLastError() : ERROR_SUCCESS;
+	fprintf(witness,
+		"[RT-PRIORITY] thread=%s requested=%s -> achieved=%s "
+		"result=%s errors(change=%lu,query=%lu)\n",
+		thread_name, audioio_windows_priority_name(requested),
+		query_error == ERROR_SUCCESS
+			? audioio_windows_priority_name(achieved) : "UNKNOWN",
+		changed ? "ok" : "fail-soft",
+		(unsigned long)change_error, (unsigned long)query_error);
+#else
+	fprintf(witness,
+		"[RT-PRIORITY] thread=%s requested=unsupported -> "
+		"achieved=unchanged result=fail-soft\n",
+		thread_name);
+#endif
+	fflush(witness);
+	return true;
+}
+
+void audioio_apply_receive_decode_priority(void)
+{
+	audioio_apply_rt_priority("receive-decode", false, stderr);
+}
+
 // Device opens happen inside the capture/playback threads.  Publish their
 // startup result so audioio_init_internal() can return a meaningful status
 // instead of reporting success before either backend has opened.
@@ -272,6 +407,116 @@ void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
 {
 	audioio_pthread_create = create_fn != NULL ? create_fn : pthread_create;
 	audioio_pthread_join = join_fn != NULL ? join_fn : pthread_join;
+}
+
+struct rt_priority_test_args {
+	const char *thread_name;
+	bool audio_thread;
+	FILE *witness;
+	bool invoked;
+};
+
+static void *audioio_rt_priority_test_thread(void *opaque)
+{
+	rt_priority_test_args *args = (rt_priority_test_args *)opaque;
+	args->invoked = audioio_apply_rt_priority(
+		args->thread_name, args->audio_thread, args->witness);
+	return NULL;
+}
+
+static int audioio_run_rt_priority_test_thread(const char *thread_name,
+	                                           bool audio_thread,
+	                                           FILE *witness,
+	                                           bool expected_invoked)
+{
+	rt_priority_test_args args = {
+		thread_name, audio_thread, witness, false
+	};
+	pthread_t thread;
+	if(pthread_create(&thread, NULL, audioio_rt_priority_test_thread, &args) != 0)
+		return 1;
+	if(pthread_join(thread, NULL) != 0)
+		return 1;
+	return args.invoked == expected_invoked ? 0 : 1;
+}
+
+static int audioio_count_text(const char *text, const char *needle)
+{
+	int count = 0;
+	const size_t needle_len = strlen(needle);
+	while((text = strstr(text, needle)) != NULL)
+	{
+		++count;
+		text += needle_len;
+	}
+	return count;
+}
+
+int audioio_rt_priority_selftest(void)
+{
+	const char *old_value = getenv("MERCURY_RT_PRIORITY");
+	const bool had_old_value = old_value != NULL;
+	char *saved_value = NULL;
+	if(had_old_value)
+	{
+		saved_value = (char *)malloc(strlen(old_value) + 1);
+		if(saved_value == NULL)
+			return 1;
+		strcpy(saved_value, old_value);
+	}
+
+	int failed = 0;
+	FILE *off_witness = tmpfile();
+	FILE *on_witness = tmpfile();
+	if(off_witness == NULL || on_witness == NULL)
+		failed = 1;
+	else
+	{
+		setenv("MERCURY_RT_PRIORITY", "0", 1);
+		failed += audioio_run_rt_priority_test_thread(
+			"audio-capture", true, off_witness, false);
+		failed += audioio_run_rt_priority_test_thread(
+			"audio-playback", true, off_witness, false);
+		failed += audioio_run_rt_priority_test_thread(
+			"receive-decode", false, off_witness, false);
+		fflush(off_witness);
+		const long off_bytes = ftell(off_witness);
+		if(off_bytes != 0)
+			++failed;
+
+		setenv("MERCURY_RT_PRIORITY", "2", 1);
+		failed += audioio_run_rt_priority_test_thread(
+			"audio-capture", true, on_witness, true);
+		failed += audioio_run_rt_priority_test_thread(
+			"audio-playback", true, on_witness, true);
+		failed += audioio_run_rt_priority_test_thread(
+			"receive-decode", false, on_witness, true);
+
+		fflush(on_witness);
+		rewind(on_witness);
+		char text[4096] = {0};
+		const size_t length = fread(text, 1, sizeof(text) - 1, on_witness);
+		text[length] = '\0';
+		if(audioio_count_text(text, "[RT-PRIORITY]") != 3
+		   || strstr(text, "thread=audio-capture requested=") == NULL
+		   || strstr(text, "thread=audio-playback requested=") == NULL
+		   || strstr(text, "thread=receive-decode requested=") == NULL
+		   || audioio_count_text(text, " -> achieved=") != 3
+		   || audioio_count_text(text, "result=") != 3)
+			++failed;
+		fputs(text, stdout);
+	}
+
+	if(off_witness != NULL)
+		fclose(off_witness);
+	if(on_witness != NULL)
+		fclose(on_witness);
+	if(had_old_value)
+		setenv("MERCURY_RT_PRIORITY", saved_value, 1);
+	else
+		unsetenv("MERCURY_RT_PRIORITY");
+	free(saved_value);
+	return failed;
 }
 
 static int audioio_start_thread(pthread_t *thread, void *(*entry)(void *),
@@ -758,6 +1003,7 @@ int validate_audio_config(const char *capture_dev, const char *playback_dev, int
 
 void *radio_playback_thread(void *device_ptr)
 {
+	audioio_apply_rt_priority("audio-playback", true, stderr);
     // GUARD 1: never open a real playback device while -x sim is active.
     if (g_sim_audio_guard_active) {
         fprintf(stderr, "FATAL %s: radio_playback_thread entered under -x sim; "
@@ -1746,6 +1992,7 @@ void capture_reset_samples(void)
 
 void *radio_capture_thread(void *device_ptr)
 {
+	audioio_apply_rt_priority("audio-capture", true, stderr);
     // GUARD 1: never open a real capture device while -x sim is active.
     if (g_sim_audio_guard_active) {
         fprintf(stderr, "FATAL %s: radio_capture_thread entered under -x sim; "
