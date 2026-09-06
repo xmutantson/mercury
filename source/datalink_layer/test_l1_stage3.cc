@@ -40,7 +40,7 @@ void set_gate(bool enabled, int batches = 4) {
 std::vector<uint8_t> full_sack_wire(uint8_t connection, uint8_t start,
 	uint8_t count, uint16_t span) {
 	l1_block::BlockSack sack = {};
-	sack.final = true;
+	sack.final = count < 4;
 	sack.session_id = 0x11223344u;
 	sack.epoch = 7;
 	sack.negotiation_id = 0x4455;
@@ -66,6 +66,96 @@ std::vector<uint8_t> full_sack_wire(uint8_t connection, uint8_t start,
 	wire.push_back(0);
 	wire.insert(wire.end(), body.begin(), body.end());
 	return wire;
+}
+
+void arm_commander(BlockAckRuntime* commander, uint8_t start, uint8_t count) {
+	commander->begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	commander->complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	for(uint8_t i = 0; i < count; ++i)
+		commander->note_transmitted_batch((uint8_t)(start + i));
+}
+
+void resign_block_body(std::vector<uint8_t>* wire) {
+	const std::size_t body = l1_block::CONTROL_HEADER_BYTES;
+	(*wire)[wire->size() - 1] = l1_block::control_crc8(
+		wire->data() + body, wire->size() - body - 1);
+}
+
+void dispatch_acceptance_contract() {
+	set_gate(true, 4);
+	const uint8_t start = 80;
+
+	// Build a real responder aggregate. This fixed wire vector is the valid-path
+	// pre-hardening witness: semantic binding checks must not change one byte.
+	BlockAckRuntime responder;
+	responder.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	responder.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	std::vector<uint8_t> valid_wire;
+	for(uint8_t i = 0; i < 4; ++i)
+		responder.observe_received_batch((uint8_t)(start + i),
+			std::vector<bool>{true, true}, false, &valid_wire);
+	const uint8_t expected_bytes[] = {
+		0x47,0x5a,0x00,0x01,0x00,0x00,0x2a,0x00,0x2c,0x11,0x22,0x33,
+		0x44,0x00,0x00,0x00,0x07,0x44,0x55,0x00,0x01,0x50,0x04,0x00,
+		0x08,0x00,0x00,0x02,0x00,0x00,0x01,0x00,0x02,0x00,0x02,0x02,
+		0x00,0x02,0x00,0x04,0x03,0x00,0x02,0x00,0x06,0xff,0xad
+	};
+	CHECK(valid_wire == std::vector<uint8_t>(expected_bytes,
+		expected_bytes + sizeof(expected_bytes)),
+		"valid matched aggregate retains its byte-exact wire image");
+
+	BlockAckRuntime valid_commander;
+	arm_commander(&valid_commander, start, 4);
+	l1_block::LegacyParserAckState valid_state = {FREE, NONE, 0, 0};
+	CHECK(valid_commander.dispatch_received_frame(valid_wire.data(), valid_wire.size(),
+		&valid_state, NULL) == DispatchDisposition::BLOCK_FRAME_ACCEPTED,
+		"valid locally matched aggregate ACK is accepted");
+
+	// Re-sign a structurally valid SACK after changing only its authored start.
+	// The former dispatcher bound decode_sack() to this untrusted wire field,
+	// making the check tautological instead of matching the pending TX group.
+	std::vector<uint8_t> wrong_start = valid_wire;
+	wrong_start[l1_block::CONTROL_HEADER_BYTES + 18] = (uint8_t)(start + 1);
+	resign_block_body(&wrong_start);
+	BlockAckRuntime start_commander;
+	arm_commander(&start_commander, start, 4);
+	l1_block::LegacyParserAckState start_state = {FREE, NONE, 0, 0};
+	CHECK(start_commander.dispatch_received_frame(wrong_start.data(), wrong_start.size(),
+		&start_state, NULL) == DispatchDisposition::INVALID,
+		"SACK with wrong wire start is rejected by dispatch");
+
+	// This is independently canonical and CRC-valid, but covers three batches
+	// while the local commander has exactly four pending.
+	std::vector<uint8_t> wrong_count = full_sack_wire(0x5a, start, 3, 2);
+	BlockAckRuntime count_commander;
+	arm_commander(&count_commander, start, 4);
+	l1_block::LegacyParserAckState count_state = {FREE, NONE, 0, 0};
+	CHECK(count_commander.dispatch_received_frame(wrong_count.data(), wrong_count.size(),
+		&count_state, NULL) == DispatchDisposition::INVALID,
+		"SACK with wrong pending batch count is rejected by dispatch");
+
+	// A valid short-tail COMMIT is re-signed after clearing only block_mode.
+	// Codec validity is preserved; the production dispatcher must reject it.
+	BlockAckRuntime tail_responder;
+	tail_responder.begin_session(0x5a, 0x11223344u, 7, 0x4455);
+	tail_responder.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	std::vector<uint8_t> ignored;
+	tail_responder.observe_received_batch(90, std::vector<bool>{true}, false, &ignored);
+	tail_responder.observe_received_batch(91, std::vector<bool>{true}, false, &ignored);
+	BlockAckRuntime tail_commander;
+	arm_commander(&tail_commander, 90, 2);
+	std::vector<uint8_t> commit;
+	CHECK(tail_commander.build_tail_commit(&commit),
+		"fixture builds a valid short-tail COMMIT");
+	commit[l1_block::CONTROL_HEADER_BYTES + 1] = 0;
+	resign_block_body(&commit);
+	l1_block::LegacyParserAckState commit_state = {FREE, NONE, 0, 0};
+	CHECK(tail_responder.dispatch_received_frame(commit.data(), commit.size(),
+		&commit_state, NULL) == DispatchDisposition::INVALID
+		&& !tail_responder.take_flush_request(),
+		"COMMIT with block_mode=false is rejected by dispatch");
+
+	set_gate(false);
 }
 
 void legacy_rx_fence() {
@@ -175,7 +265,11 @@ void aggregation_and_atomic_settlement() {
 	BlockAckRuntime commander;
 	commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
 	commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	uint8_t next_bsi = 20;
 	for(size_t i = 0; i < emitted.size(); ++i) {
+		const uint8_t batch_count = i < 2 ? 4 : 1;
+		for(uint8_t batch = 0; batch < batch_count; ++batch)
+			commander.note_transmitted_batch(next_bsi++);
 		l1_block::LegacyParserAckState state = {FREE, NONE, 0, 0};
 		CHECK(commander.dispatch_received_frame(emitted[i].data(), emitted[i].size(),
 			&state, &journal) == DispatchDisposition::BLOCK_ACK_APPLIED,
@@ -207,6 +301,8 @@ void aggregation_and_atomic_settlement() {
 	BlockAckRuntime wrap_commander;
 	wrap_commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
 	wrap_commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	for(int index = 0; index < 4; ++index)
+		wrap_commander.note_transmitted_batch((uint8_t)(254 + index));
 	l1_block::LegacyParserAckState wrap_state = {FREE, NONE, 0, 0};
 	CHECK(wrap_commander.dispatch_received_frame(wrap_wire.data(), wrap_wire.size(),
 		&wrap_state, &wrap_journal) == DispatchDisposition::BLOCK_ACK_APPLIED &&
@@ -237,6 +333,8 @@ void aggregation_and_atomic_settlement() {
 	BlockAckRuntime partial_commander;
 	partial_commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
 	partial_commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+	partial_commander.note_transmitted_batch(40);
+	partial_commander.note_transmitted_batch(41);
 	l1_block::LegacyParserAckState partial_state = {FREE, NONE, 0, 0};
 	CHECK(partial_commander.dispatch_received_frame(partial_wire.data(),
 		partial_wire.size(), &partial_state, &partial_journal)
@@ -474,6 +572,8 @@ void gearfeed_gate_and_exposure() {
 		BlockAckRuntime commander;
 		commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
 		commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		for(uint8_t bsi = 50; bsi < 54; ++bsi)
+			commander.note_transmitted_batch(bsi);
 		l1_block::LegacyParserAckState state = {FREE, NONE, 0, 0};
 		commander.dispatch_received_frame(wire.data(), wire.size(), &state, &journal);
 		const std::vector<l1_block::PerBatchAck>& b = commander.last_applied_batches();
@@ -514,6 +614,8 @@ void gearfeed_gate_and_exposure() {
 		BlockAckRuntime commander;
 		commander.begin_session(0x5a, 0x11223344u, 7, 0x4455);
 		commander.complete_handshake(CAP_L1_BLOCKACK, CAP_L1_BLOCKACK, true);
+		commander.note_transmitted_batch(60);
+		commander.note_transmitted_batch(61);
 		l1_block::LegacyParserAckState state = {FREE, NONE, 0, 0};
 		commander.dispatch_received_frame(wire.data(), wire.size(), &state, &journal);
 		const std::vector<l1_block::PerBatchAck>& b = commander.last_applied_batches();
@@ -529,6 +631,7 @@ void gearfeed_gate_and_exposure() {
 }  // namespace
 
 int main() {
+	dispatch_acceptance_contract();
 	legacy_rx_fence();
 	capability_negotiation();
 	aggregation_and_atomic_settlement();
