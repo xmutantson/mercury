@@ -120,3 +120,4 @@ tools/*.sh
 !tools/wb_sweep_clean.py
 _codex_worktrees/
 l1s3_impl/
+build/
