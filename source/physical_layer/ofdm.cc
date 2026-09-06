@@ -170,10 +170,11 @@ cl_ofdm::cl_ofdm()
 	noise_variance_estimate=0.01; // Safe default (SNR ~20dB)
 	ls_nv_debug_enabled=false; // fix/cfg16-nv-restore: opt-in [LS-NV-DBG] logging
 	ls_use_crosspilot_nv=false; // fix/cfg16-nv-restore: default = the fix (residual nv)
-	// fix/cfg16-single-pilot-hold: default OFF (byte-identical). cl_ofdm is constructed
-	// once per telecom_system and never rebuilt on config switch, so this env read at
-	// construction reaches every decode; tests override the member directly.
-	{ const char* _e=std::getenv("MERCURY_LS_HOLD_SINGLE_PILOT"); ls_hold_single_pilot=(_e && *_e && atoi(_e)!=0); }
+	// fix/cfg16-single-pilot-hold: DEFAULT-ON for cfg16/17 (=0 disables); prevents est-SNR
+	// erasure retransmits. cl_ofdm is constructed once per telecom_system and never rebuilt
+	// on config switch, so this env read at construction reaches every decode; tests override
+	// the member directly.
+	{ const char* _e=std::getenv("MERCURY_LS_HOLD_SINGLE_PILOT"); ls_hold_single_pilot=!(_e && *_e && atoi(_e)==0); }
 	tinterp_smooth_halfwin=0; // feat/fade-tinterp: TIME_INTERP pilot pre-smooth off by default
 	dd_data_conf_thresh=0.30; // Turbo-EQ: data-aided improve-only confidence threshold (read only inside the turbo loop)
 	dd_seed_floor=false; // Turbo-EQ TINTERP-seed: false = pilots-only floor (byte-identical default); true = keep the it=0 (TINTERP) H as the low-confidence floor
