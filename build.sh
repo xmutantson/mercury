@@ -655,6 +655,32 @@ run_l1_stage3_test() {
 
 run_l1_stage3_test
 
+run_ldpc_contract_test() {
+    local test_bin="${BUILDDIR}/test_ldpc_contract"
+    local ldpc_objects="
+${BUILDDIR}/source/physical_layer/ldpc.o
+${BUILDDIR}/source/physical_layer/ldpc_decoder_GBF.o
+${BUILDDIR}/source/physical_layer/ldpc_decoder_SPA.o
+${BUILDDIR}/source/physical_layer/mercury_met_2_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_1_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_2_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_3_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_4_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_5_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_6_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_8_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_10_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_12_16.o
+${BUILDDIR}/source/physical_layer/mercury_normal_14_16.o
+"
+    echo "Building and running LDPC contract hardening test..."
+    $CXX $CXXFLAGS source/physical_layer/test_ldpc_contract.cc \
+        $ldpc_objects -o "$test_bin" -pthread ${TEST_LDFLAGS:-}
+    "$test_bin"
+}
+
+run_ldpc_contract_test
+
 if [ "$COMPILED" -eq 0 ]; then
     # Check if output exists and is up to date
     if [ -f "$OUTPUT" ]; then
