@@ -632,7 +632,10 @@ run_l1_block_codec_test() {
     echo "Building and running L1 block codec test..."
     $CXX $CXXFLAGS source/datalink_layer/l1_block_codec.cc \
         source/datalink_layer/test_l1_block_codec.cc -o "$test_bin" ${TEST_LDFLAGS:-}
-    "$test_bin"
+    # Run the binary just produced. On the Windows/mingw target the compiler emits
+    # "$test_bin.exe"; running the bare name would exec a stale cross-platform ELF of
+    # the same name if one is present in the build dir. Select by platform.
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) "${test_bin}.exe" ;; *) "$test_bin" ;; esac
 }
 
 run_l1_block_codec_test
@@ -644,7 +647,10 @@ run_l1_stage3_test() {
         source/datalink_layer/l1_tx_journal.cc \
         source/datalink_layer/l1_block_ack.cc \
         source/datalink_layer/test_l1_stage3.cc -o "$test_bin" -pthread ${TEST_LDFLAGS:-}
-    "$test_bin"
+    # Run the binary just produced. On the Windows/mingw target the compiler emits
+    # "$test_bin.exe"; running the bare name would exec a stale cross-platform ELF of
+    # the same name if one is present in the build dir. Select by platform.
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) "${test_bin}.exe" ;; *) "$test_bin" ;; esac
 }
 
 run_l1_stage3_test
