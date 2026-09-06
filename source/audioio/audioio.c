@@ -3451,6 +3451,10 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 		}
 		audioio_payload_buffers_heap_backed = true;
 	}
+	// SHM payload rings are POSIX-only; on the Windows target use_heap_buffers is forced true
+	// above, so this branch is dead there -- compile it out so the POSIX-only ring symbols
+	// (declared under the same !_WIN32 guard) are not referenced on the Windows build.
+#if !defined(_WIN32)
 	else
 	{
 		audioio_capture_ring_shm_name(audio_capt_ring_name, sizeof(audio_capt_ring_name));
@@ -3486,6 +3490,7 @@ int audioio_init_internal(char *capture_dev, char *playback_dev, int audio_subsy
 			return -1;
 		}
 	}
+#endif
 
 	const size_t capture_tag_capacity =
 		(AUDIO_PAYLOAD_BUFFER_SIZE / sizeof(double)) * sizeof(uint32_t);
