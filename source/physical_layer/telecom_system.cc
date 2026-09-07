@@ -14114,6 +14114,13 @@ void cl_telecom_system::precook_pin_shared_ring()
 
 	int saved_cfg = current_configuration;
 	int saved_nb  = narrowband_enabled;
+	// Stage 2 repeats this exact closed-domain walk using fresh scratch objects.
+	// Retain only the immutable pre-equalizer result from this first walk; all
+	// owning/mutable PHY state continues to be constructed and deep-copied normally.
+	precook_preeq_seed_wb.clear();
+	precook_preeq_seed_nb.clear();
+	precook_preeq_seed_wb.resize(FULL_CONFIG_LADDER_SIZE);
+	precook_preeq_seed_nb.resize(FULL_CONFIG_LADDER_SIZE);
 
 	// PRECOOK V2 (Step A) — DUAL-BANDWIDTH ABSOLUTE-MAX PIN over the CLOSED geometry-input domain:
 	// {NB, WB} × FULL_CONFIG_LADDER × the big-block thin-grid Ngrid × the startup config, all under
@@ -14142,6 +14149,12 @@ void cl_telecom_system::precook_pin_shared_ring()
 			int cfg = FULL_CONFIG_LADDER[i];
 			current_configuration = CONFIG_NONE;   // defeat the no-op early-return → force a full load
 			load_configuration(cfg);
+			std::vector<st_channel_complex>& seed =
+				(narrowband_enabled != NO) ? precook_preeq_seed_nb[i] : precook_preeq_seed_wb[i];
+			seed.clear();
+			if(pre_equalization_channel != NULL && data_container.Nc > 0)
+				seed.assign(pre_equalization_channel,
+					pre_equalization_channel + data_container.Nc);
 			int bn = data_container.buffer_Nsymb.load();
 			if(bn > max_bn) max_bn = bn;
 			if(data_container.Nsymb > max_Nsymb) max_Nsymb = data_container.Nsymb;
@@ -14276,6 +14289,9 @@ int cl_telecom_system::bundle_index(int configuration, int narrowband) const
 // STEP 3. Production stays byte-identical (nothing reads config_bundles yet).
 void cl_telecom_system::precook_config_bundles()
 {
+	const char* verify_env = std::getenv("MERCURY_PRECOOK_REUSE_VERIFY");
+	const bool verify_reuse = verify_env && *verify_env && atoi(verify_env) != 0;
+	int verified_reuse = 0;
 	// PRECOOK V2 (Step B) — build BOTH bandwidth bundle sets (WB then NB). Each scratch carries its
 	// OWN narrowband_enabled, so building both does NOT touch this->narrowband_enabled (the live
 	// bandwidth is untouched). Reachable slots only per band: WB builds all 20; NB builds ROBUST_*
@@ -14310,7 +14326,46 @@ void cl_telecom_system::precook_config_bundles()
 			// byte-for-byte the live/legacy geometry and the swap publishes sp against the pinned ring.
 			scratch->default_configurations_telecom_system = this->default_configurations_telecom_system;
 			scratch->narrowband_enabled = band;
+			const std::vector<std::vector<st_channel_complex>>& seeds =
+				nb ? precook_preeq_seed_nb : precook_preeq_seed_wb;
+			if(li < (int)seeds.size() && !seeds[li].empty())
+			{
+				scratch->precook_preeq_seed_override = &seeds[li];
+				scratch->precook_preeq_seed_configuration = cfg;
+				scratch->precook_preeq_seed_narrowband = band;
+			}
 			scratch->load_configuration(cfg);
+			if(scratch->precook_preeq_seed_override != nullptr
+				&& scratch->precook_preeq_seed_hits != 1)
+			{
+				fprintf(stderr, "[PRECOOK] FATAL: deterministic pre-eq seed was not consumed exactly once "
+					"(cfg=%d nb=%d hits=%ld). Aborting.\n",
+					cfg, band, scratch->precook_preeq_seed_hits);
+				fflush(stderr); abort();
+			}
+			if(verify_reuse && scratch->precook_preeq_seed_override != nullptr)
+			{
+				// Diagnostic-only proof mode: independently rebuild the same key with
+				// reuse disabled and demand a byte-exact value match.  Production never
+				// pays this cost; it is used by the directed acceptance test.
+				cl_telecom_system reference;
+				reference.default_configurations_telecom_system =
+					this->default_configurations_telecom_system;
+				reference.narrowband_enabled = band;
+				reference.load_configuration(cfg);
+				const size_t bytes = sizeof(st_channel_complex)
+					* scratch->precook_preeq_seed_override->size();
+				if(reference.pre_equalization_channel == NULL
+					|| reference.data_container.Nc != scratch->data_container.Nc
+					|| memcmp(reference.pre_equalization_channel,
+						scratch->pre_equalization_channel, bytes) != 0)
+				{
+					fprintf(stderr, "[PRE-EQ-REUSE-VERIFY] FATAL mismatch cfg=%d nb=%d Nc=%d\n",
+						cfg, band, scratch->data_container.Nc);
+					fflush(stderr); abort();
+				}
+				verified_reuse++;
+			}
 
 			// §5.3 assert: catch ANY silent internal remap (the NB clamp, or a future one). We build
 			// only reachable slots, so this must hold; a mismatch = a mislabeled bundle landmine.
@@ -14430,9 +14485,15 @@ void cl_telecom_system::precook_config_bundles()
 	active_bundle_idx = -1;
 	precook_bundles_built = true;
 	printf("[PRECOOK] dual bundle sets built: WB=%d slots, NB=%d slots (unreachable NB OFDM>%d left "
-		"empty; every bundle fits the pinned ring)\n",
+		"empty; every bundle fits the pinned ring; deterministic pre-eq builds reused)\n",
 		(int)config_bundles_wb.size(), (int)config_bundles_nb.size(), NB_CONFIG_MAX);
 	fflush(stdout);
+	if(verify_reuse)
+	{
+		printf("[PRE-EQ-REUSE-VERIFY] ALL PASS: %d deterministic seeds byte-identical to independent builds\n",
+			verified_reuse);
+		fflush(stdout);
+	}
 }
 
 // Grow the capture ring (passband_delayed_data etc.) to hold at least `min_nsymb` symbols
@@ -14738,6 +14799,25 @@ void cl_telecom_system::enable_per_instance_rng(unsigned int seed)
 
 void cl_telecom_system::get_pre_equalization_channel()
 {
+	// Safe Stage-1 -> Stage-2 reuse.  The source is an immutable value vector from
+	// this process's immediately preceding closed-domain sizing walk.  Require an
+	// exact config, band, and Nc match, then deep-copy into the scratch object's own
+	// allocation.  get_pre_equalization_channel is followed by descrambler
+	// regeneration, which reseeds rng_, so eliding its draws preserves later RNG
+	// state as well as every output byte.
+	if(precook_preeq_seed_override != nullptr
+		&& current_configuration == precook_preeq_seed_configuration
+		&& narrowband_enabled == precook_preeq_seed_narrowband
+		&& (int)precook_preeq_seed_override->size() == data_container.Nc)
+	{
+		memcpy(pre_equalization_channel, precook_preeq_seed_override->data(),
+			sizeof(struct st_channel_complex) * (size_t)data_container.Nc);
+		precook_preeq_seed_hits++;
+		printf("[PRE-EQ-REUSE] cfg=%d nb=%d Nc=%d (Stage-1 immutable seed)\n",
+			current_configuration, narrowband_enabled, data_container.Nc);
+		fflush(stdout);
+		return;
+	}
 	int nTries=1000;
 	for(int i=0;i<data_container.Nc;i++)
 	{

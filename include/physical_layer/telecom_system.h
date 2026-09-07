@@ -1177,6 +1177,18 @@ public:
 	// stay nullptr. bundle_set(narrowband) selects the right vector.
 	std::vector<std::unique_ptr<st_config_bundle>> config_bundles_wb;
 	std::vector<std::unique_ptr<st_config_bundle>> config_bundles_nb;
+	// The Stage-1 ring-sizing walk has already run the deterministic 1000-draw
+	// pre-equalizer build for every reachable (band, config).  Preserve those tiny,
+	// immutable results so the fresh Stage-2 scratch objects can deep-copy them
+	// instead of repeating the dominant FIR workload.  This is deliberately
+	// process-local: no pointers, allocator state, FFT workspaces, or mutable PHY
+	// objects cross a process/cell boundary.
+	std::vector<std::vector<st_channel_complex>> precook_preeq_seed_wb;
+	std::vector<std::vector<st_channel_complex>> precook_preeq_seed_nb;
+	const std::vector<st_channel_complex>* precook_preeq_seed_override = nullptr;
+	int precook_preeq_seed_configuration = CONFIG_NONE;
+	int precook_preeq_seed_narrowband = -1;
+	long precook_preeq_seed_hits = 0;
 	bool precook_bundles_built = false;   // true once precook_config_bundles() built BOTH sets
 	long precook_miss_count = 0;          // Step C: # of under-pin legacy fallbacks (live gate needs 0)
 	int active_bundle_idx = -1;
