@@ -535,6 +535,40 @@ def rx_thread_fn(sock, stop, res):
             break
 
 
+def relay_coordinate_args(args):
+    """Return one unambiguous relay channel coordinate.
+
+    The relay rejects multiple controlling coordinates and its current default
+    axis no longer accepts the historical ambiguous ``--snr`` spelling.  The
+    harness CLI has always documented ``--snr`` as SNR3k, so translate it to
+    the explicit relay spelling and let ``--cell`` replace it when selected.
+    """
+    if args.cell:
+        return ["--cell", args.cell]
+    return ["--snr3k-db", str(args.snr)]
+
+
+def resolve_connect_policy(start_cfg, no_gearshift, wire_stamp):
+    """Resolve the fixed-DATA-config CONNECT and virtual-clock contract.
+
+    ``--no-gearshift`` makes ``start_cfg`` the harness-owned DATA pin.  Use that
+    same value for the modem's CONNECT-FAST load/fallback on both peers.  The
+    START suffix remains the robust, config-independent MFSK waveform, and both
+    peers restore the same fixed DATA config after CONNECT.
+
+    Accelerated two-process CONNECT also needs the relay-stamped shared clock:
+    process-local sample clocks can otherwise put the responder's HAIL reply
+    after the commander's virtual listen deadline.  Auto-enable the existing
+    phase-clock primitive only for pinned sessions.  Non-pinned runs retain the
+    historical bare-wire default; explicit 0 remains a diagnostic/compatibility
+    override.
+    """
+    pinned = bool(no_gearshift)
+    connect_fast_config = int(start_cfg) if pinned else None
+    wire_stamp_auto = pinned and wire_stamp is None
+    effective_wire_stamp = int(pinned) if wire_stamp is None else int(wire_stamp)
+    return connect_fast_config, effective_wire_stamp, wire_stamp_auto
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=DEFAULT_BIN)
@@ -672,14 +706,18 @@ def main():
     ap.add_argument("--turnaround-jitter-ms", type=float, default=6.0,
                     help="relay --turnaround-jitter-ms passthrough (per-key-up "
                          "turnaround jitter; the dominant trigger). DEFAULT 6.0.")
-    ap.add_argument("--wire-stamp", type=int, default=0, choices=(0, 1),
-                    help="relay --wire-stamp passthrough. DEFAULT 0 (bare 8192, "
-                         "compatible with every shipped -x sim mercury). Set 1 "
-                         "ONLY when --bin reads the 8-byte stamp (feat/sim-clock "
-                         "modem half); a non-stamp modem silently corrupts the "
-                         "wire. See _simcal_takeover/ASSESSMENT.md.")
+    ap.add_argument("--wire-stamp", type=int, default=None, choices=(0, 1),
+                    help="relay --wire-stamp passthrough. DEFAULT: 1 for a "
+                         "--no-gearshift pinned session (shared-clock CONNECT "
+                         "correctness), otherwise 0 (historical bare wire). "
+                         "Explicit 0 retains the diagnostic/compatibility path.")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
+
+    (pin_connect_fast_config,
+     args.wire_stamp,
+     wire_stamp_auto) = resolve_connect_policy(
+        args.start_cfg, args.no_gearshift, args.wire_stamp)
 
     # GUARD 2: refuse a non-guard binary BEFORE launching the relay or any
     # mercury process. If args.bin lacks the GUARD-1 marker this exits(2) here
@@ -733,6 +771,11 @@ def main():
           f"turnaround_drift={args.turnaround_drift}"
           f"(ppm a2b={args.turnaround_ppm_a2b},b2a={args.turnaround_ppm_b2a},"
           f"jit={args.turnaround_jitter_ms}ms)")
+    if pin_connect_fast_config is not None:
+        print(f"pin_connect       : DATA=CONFIG_{args.start_cfg} "
+              f"CONNECT_FAST=CONFIG_{pin_connect_fast_config} "
+              f"wire_stamp={args.wire_stamp}"
+              f"{' (auto)' if wire_stamp_auto else ' (explicit)'}")
     print(f"payload={args.payload} ({len(payload)} bytes, md5={payload_md5})\n")
 
     # PORT-SCOPED pre-clean: kill only whatever lingers on OUR auto-picked ports
@@ -825,6 +868,10 @@ def main():
         env = dict(os.environ)
         env["MERCURY_SIM_PORT"] = str(args.port)
         env["MERCURY_SIM_ROLE"] = role
+        if pin_connect_fast_config is not None:
+            # THE PIN RULE: do not inherit CONFIG_0 (or a stale ambient value)
+            # as a second controlling coordinate for a fixed-config session.
+            env["MERCURY_CONNECT_FAST_CONFIG"] = str(pin_connect_fast_config)
         return subprocess.Popen(base_cmd(port, role), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -1289,7 +1336,9 @@ def main():
                 "bounded_by": bounded_by,
                 "barrier_k": args.barrier_k,
                 "wire_stamp": args.wire_stamp,
+                "wire_stamp_auto": wire_stamp_auto,
                 "no_gearshift": args.no_gearshift,
+                "pin_connect_fast_config": pin_connect_fast_config,
                 # GAP #1: HW-representative per-frame CHANNEL wire rate (rx*8 /
                 # delivering-direction frame-airtime). Undiluted by climb ramp /
                 # idle / setup. Reconciles with the modem rbc + HW. None if the
