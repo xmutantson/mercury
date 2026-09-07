@@ -21,6 +21,25 @@
  */
 
 #include "physical_layer/fir_filter.h"
+#include <cstdlib>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+// Four independent output accumulators expose the FIR's output-parallelism to
+// scalar out-of-order cores and SIMD.  Keep a process-wide A/B escape hatch so
+// the original implementation can be measured from the same binary.  The new
+// path is default-on; every output still visits coefficients in ascending j
+// order, preserving the original accumulation order bit-for-bit.
+static inline bool fir_block4_enabled()
+{
+	static const int v = []{
+		const char* e = std::getenv("MERCURY_FIR_BLOCK4");
+		return (e && *e) ? atoi(e) : 1;
+	}();
+	return v != 0;
+}
 
 cl_FIR::cl_FIR()
 {
@@ -334,23 +353,97 @@ void cl_FIR::apply_decimate(std::complex <double>* in, std::complex <double>* ou
 
 void cl_FIR::apply(double* in, double* out, int nItems)
 {
-	double acc;
-	for(int i=0;i<(nItems+filter_nTaps-1);i++)
+	// Exact baseline/revert arm for A/B measurement.
+#if defined(__aarch64__)
+	if(!fir_block4_enabled())
+#endif
 	{
-		acc=0;
-		for(int j=0;j<filter_nTaps;j++)
+		double acc;
+		for(int i=0;i<(nItems+filter_nTaps-1);i++)
 		{
-			if((i-j)>=0 && (i-j)<nItems)
+			acc=0;
+			for(int j=0;j<filter_nTaps;j++)
 			{
-				acc+=in[i-j]*filter_coefficients[j];
+				if((i-j)>=0 && (i-j)<nItems)
+				{
+					acc+=in[i-j]*filter_coefficients[j];
+				}
+			}
+
+			if(i>=((int)(filter_nTaps-1)/2) && i<(nItems+(int)(filter_nTaps-1)/2))
+			{
+				out[i-(int)(filter_nTaps-1)/2]=acc;
 			}
 		}
-
-		if(i>=((int)(filter_nTaps-1)/2) && i<(nItems+(int)(filter_nTaps-1)/2))
-		{
-			out[i-(int)(filter_nTaps-1)/2]=acc;
-		}
+#if defined(__aarch64__)
+		return;
+#endif
 	}
+
+#if !defined(__aarch64__)
+	// The measured target is AArch64.  Keep every other architecture on the
+	// original implementation until it has its own code-generation/parity proof.
+	return;
+#else
+	const int N = filter_nTaps;
+	if(nItems <= 0 || N <= 0)
+		return;
+	const int half = (N - 1) / 2;
+	const double* coef = filter_coefficients;
+
+	// Boundary outputs have a partial input window.  Iterate j in precisely the
+	// same ascending order as the old convolution and merely hoist its bounds
+	// checks out of the tap loop.
+	auto apply_boundary = [&](int k) {
+		const int i = k + half;
+		int j_begin = i - nItems + 1;
+		if(j_begin < 0) j_begin = 0;
+		int j_end = i + 1;
+		if(j_end > N) j_end = N;
+		double acc = 0.0;
+		for(int j=j_begin; j<j_end; j++)
+			acc = std::fma(in[i-j], coef[j], acc);
+		out[k] = acc;
+	};
+
+	// A full N-tap window exists only when nItems >= N.
+	if(nItems < N)
+	{
+		for(int k=0; k<nItems; k++) apply_boundary(k);
+		return;
+	}
+
+	for(int k=0; k<half; k++) apply_boundary(k);
+
+	const int steady_end = nItems - half; // exclusive
+	int k = half;
+	for(; k+3<steady_end; k+=4)
+	{
+		// Lanes are four adjacent output samples.  Each lane receives one fused
+		// multiply-add per j, in the same order as the former scalar FMADD loop.
+		float64x2_t acc01 = vdupq_n_f64(0.0);
+		float64x2_t acc23 = vdupq_n_f64(0.0);
+		for(int j=0; j<N; j++)
+		{
+			const double* x = &in[k + half - j];
+			acc01 = vfmaq_n_f64(acc01, vld1q_f64(x),     coef[j]);
+			acc23 = vfmaq_n_f64(acc23, vld1q_f64(x + 2), coef[j]);
+		}
+		vst1q_f64(out + k,     acc01);
+		vst1q_f64(out + k + 2, acc23);
+	}
+
+	// Zero-to-three full-window outputs left after blocking.
+	for(; k<steady_end; k++)
+	{
+		double acc=0.0;
+		const int i=k+half;
+		for(int j=0; j<N; j++) acc = std::fma(in[i-j], coef[j], acc);
+		out[k]=acc;
+	}
+
+	for(k=steady_end; k<nItems; k++) apply_boundary(k);
+#endif
 }
 
 void cl_FIR::deinit()
