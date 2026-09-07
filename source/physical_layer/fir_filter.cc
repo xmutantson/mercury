@@ -262,7 +262,45 @@ void cl_FIR::apply_decimate(std::complex <double>* in, std::complex <double>* ou
 	}
 
 	// Phase 2: steady-state (no bounds checks → autovectorizes)
-	for (int m = m_start_steady; m <= m_end_steady; m++)
+	// Process four independent outputs together. Each accumulator still visits
+	// taps in exactly the same order as the scalar loop below; the blocking only
+	// exposes independent dependency chains and reuses each coefficient load.
+	// This is portable scalar C++ (no ISA-specific intrinsics).
+	int m = m_start_steady;
+	for (; m + 3 <= m_end_steady; m += 4)
+	{
+		double acc0_r = 0.0, acc0_i = 0.0;
+		double acc1_r = 0.0, acc1_i = 0.0;
+		double acc2_r = 0.0, acc2_i = 0.0;
+		double acc3_r = 0.0, acc3_i = 0.0;
+		const std::complex<double>* __restrict__ window0 = &in[(m + 0) * M - half];
+		const std::complex<double>* __restrict__ window1 = &in[(m + 1) * M - half];
+		const std::complex<double>* __restrict__ window2 = &in[(m + 2) * M - half];
+		const std::complex<double>* __restrict__ window3 = &in[(m + 3) * M - half];
+		for (int j = 0; j < N; j++)
+		{
+			const double c = coef[N - 1 - j];
+			acc0_r += window0[j].real() * c;
+			acc0_i += window0[j].imag() * c;
+			acc1_r += window1[j].real() * c;
+			acc1_i += window1[j].imag() * c;
+			acc2_r += window2[j].real() * c;
+			acc2_i += window2[j].imag() * c;
+			acc3_r += window3[j].real() * c;
+			acc3_i += window3[j].imag() * c;
+		}
+		out[m + 0].real(acc0_r);
+		out[m + 0].imag(acc0_i);
+		out[m + 1].real(acc1_r);
+		out[m + 1].imag(acc1_i);
+		out[m + 2].real(acc2_r);
+		out[m + 2].imag(acc2_i);
+		out[m + 3].real(acc3_r);
+		out[m + 3].imag(acc3_i);
+	}
+
+	// Scalar cleanup for zero to three remaining steady-state outputs.
+	for (; m <= m_end_steady; m++)
 	{
 		double acc_r = 0.0, acc_i = 0.0;
 		const std::complex<double>* __restrict__ window = &in[m * M - half];
@@ -329,4 +367,3 @@ void cl_FIR::deinit()
 		filter_coefficients=NULL;
 	}
 }
-
