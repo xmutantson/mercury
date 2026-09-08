@@ -9968,6 +9968,14 @@ start_modem:
     {
         printf("Mode selected: PLOT_PASSBAND\n");
         telecom_system.load_configuration(mod_config);
+		// Measurement-only deterministic seed battery for exact-decoder A/Bs.
+		// Unset preserves the historical process-default RNG streams verbatim.
+		if(const char* e=std::getenv("MERCURY_BER_SEED"))
+		{
+			unsigned int seed=(unsigned int)strtoul(e, nullptr, 0);
+			srand(seed);
+			telecom_system.ts_srandom(seed);
+		}
         telecom_system.test_puncture_nBits = puncture_nBits;
         if(puncture_nBits > 0)
             printf("Punctured LDPC: transmitting %d of %d bits\n", puncture_nBits, telecom_system.data_container.nBits);

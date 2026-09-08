@@ -22,6 +22,14 @@
 
 #include "physical_layer/ldpc_decoder_SPA.h"
 #include <cstdlib>   // std::getenv / atoi for the MERCURY_LDPC_FWDBACK gate
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+#endif
+#include <thread>
 #include <vector>    // LEVER G: int16 message-state buffers (fixed-point min-sum)
 
 // SOLUTION A (fix/ldpc-decode-accel): forward-backward check-node update.
@@ -48,6 +56,224 @@ static inline bool ldpc_fwdback_enabled()
 	}();
 	return v != 0;
 }
+
+// Exact flooding-SPA row parallelism. Check rows only read the frozen Q snapshot
+// for the current iteration, and every edge maps to one unique R cell. Therefore
+// rows may be evaluated concurrently without changing a single floating-point
+// operation, its order within a row, or the subsequent variable-node reduction.
+// The high-degree 14/16 code in a LITTLE-only affinity mask is the only auto-on
+// target; lower-rate, BIG-only, and mixed-affinity decodes stay serial to avoid
+// measured thread overhead. MERCURY_LDPC_EXACT_THREADS=1 is the same-binary
+// reference arm, while values 2..4 override the worker count for measurement.
+static inline int ldpc_exact_threads(int CWidth, int P)
+{
+	const char* e = std::getenv("MERCURY_LDPC_EXACT_THREADS");
+	int n=1;
+	if(e && *e)
+	{
+		n=atoi(e);
+	}
+	else if(CWidth >= 32 && P >= 64)
+	{
+	#if defined(__linux__) || defined(__ANDROID__)
+		// The Note9's LITTLE-only cpuset benefits from three-way row work; its
+		// BIG cpuset does not. Auto-enable only when every allowed CPU is in the
+		// lower-numbered half of an even-sized topology. Unpinned/mixed and BIG-
+		// only processes retain the serial arm; the env override remains explicit.
+		cpu_set_t allowed;
+		CPU_ZERO(&allowed);
+		if(sched_getaffinity(0, sizeof(allowed), &allowed)==0)
+		{
+			long online=sysconf(_SC_NPROCESSORS_ONLN);
+			int split=(online>1) ? (int)online/2 : 1;
+			int low=0, high=0;
+			for(int cpu=0; cpu<online && cpu<CPU_SETSIZE; cpu++)
+				if(CPU_ISSET(cpu, &allowed)) (cpu<split ? low : high)++;
+			if(low>=3 && high==0) n=3;
+		}
+	#endif
+	}
+	if(n < 1) n = 1;
+	if(n > 4) n = 4;
+	if(n > P) n = P;
+	return n;
+}
+
+static inline void spa_fwdback_rows(
+		int row_begin, int row_end,
+		const int* row_degree, const int* edge_var, const int* edge_vslot,
+		int CWidth, double* Q, double* R, int VWidthMax)
+{
+	const int CW_SCRATCH = 64;
+	double fb_t[CW_SCRATCH];
+	double fb_pref[CW_SCRATCH];
+
+	for(int iindex=row_begin; iindex<row_end; iindex++)
+	{
+		const int base=iindex*CWidth;
+		const int nv=row_degree[iindex];
+		for(int k=0; k<nv; k++)
+		{
+			int vj=edge_var[base+k];
+			int vi=edge_vslot[base+k];
+			fb_t[k]=tanh(0.5*(double)*(Q+vj*VWidthMax+vi));
+		}
+		if(nv==0) continue;
+
+		fb_pref[0]=1.0;
+		for(int k=1; k<nv; k++) fb_pref[k]=fb_pref[k-1]*fb_t[k-1];
+
+		double suffix=1.0;
+		for(int k=nv-1; k>=0; k--)
+		{
+			double temp=fb_pref[k]*suffix;
+			if(temp==1) temp=0.9999999;
+			if(temp==-1) temp=-0.9999999;
+			int vj=edge_var[base+k];
+			int vi=edge_vslot[base+k];
+			*(R+vj*VWidthMax+vi)=2*atanh(temp);
+			suffix*=fb_t[k];
+		}
+	}
+}
+
+class spa_exact_row_pool
+{
+public:
+	spa_exact_row_pool(int nthreads, int* C_, int CWidth_, int CWidthMax_,
+	                   double* Q_, double* R_, int* V_pos_, int VWidthMax_, int P_,
+	                   const float* LLRi_, double* LLRtmp_, int* LLRbin_,
+	                   int N_, int VWidth_, int* d, int dWidth)
+		: n(nthreads), C(C_), CWidth(CWidth_), CWidthMax(CWidthMax_),
+		  Q(Q_), R(R_), V_pos(V_pos_), VWidthMax(VWidthMax_), P(P_),
+		  LLRi(LLRi_), LLRtmp(LLRtmp_), LLRbin(LLRbin_), N(N_), VWidth(VWidth_),
+		  var_width((size_t)N_, 0), row_degree((size_t)P_, 0),
+		  edge_var((size_t)P_*(size_t)CWidth_, -1),
+		  edge_vslot((size_t)P_*(size_t)CWidth_, -1)
+	{
+		int start=0, end=0;
+		for(int section=0; section<dWidth; section+=2)
+		{
+			end+=d[section];
+			for(int i=start; i<end; i++) var_width[(size_t)i]=d[section+1];
+			start=end;
+		}
+		for(int row=0; row<P; row++)
+		{
+			int base=row*CWidth;
+			for(int col=0; col<CWidth; col++)
+			{
+				int v=C[base+col];
+				if(v==-1) break;
+				edge_var[(size_t)base+col]=v;
+				edge_vslot[(size_t)base+col]=V_pos[base+col];
+				row_degree[(size_t)row]++;
+			}
+		}
+		for(int id=1; id<n; id++) workers.emplace_back(&spa_exact_row_pool::worker, this, id);
+	}
+
+	~spa_exact_row_pool()
+	{
+		{
+			std::lock_guard<std::mutex> lk(mtx);
+			stop=true;
+			generation++;
+		}
+		cv_start.notify_all();
+		for(auto& t: workers) if(t.joinable()) t.join();
+	}
+
+	void run_checks()
+	{
+		run(0);
+	}
+
+	void run_variables()
+	{
+		run(1);
+	}
+
+private:
+	void run(int requested_phase)
+	{
+		{
+			std::lock_guard<std::mutex> lk(mtx);
+			done=0;
+			phase=requested_phase;
+			generation++;
+		}
+		cv_start.notify_all();
+		run_chunk(0);
+		std::unique_lock<std::mutex> lk(mtx);
+		cv_done.wait(lk, [&]{ return done==n-1; });
+	}
+
+	int n;
+	int* C;
+	int CWidth, CWidthMax;
+	double *Q, *R;
+	int* V_pos;
+	int VWidthMax, P;
+	const float* LLRi;
+	double* LLRtmp;
+	int* LLRbin;
+	int N, VWidth;
+	std::vector<int> var_width;
+	std::vector<int> row_degree, edge_var, edge_vslot;
+	std::vector<std::thread> workers;
+	std::mutex mtx;
+	std::condition_variable cv_start, cv_done;
+	unsigned long long generation=0;
+	int done=0;
+	int phase=0;
+	bool stop=false;
+
+	void run_chunk(int id)
+	{
+		if(phase==0)
+		{
+			int begin=(P*id)/n;
+			int end=(P*(id+1))/n;
+			spa_fwdback_rows(begin, end, row_degree.data(), edge_var.data(),
+			                  edge_vslot.data(), CWidth, Q, R, VWidthMax);
+		}
+		else
+		{
+			int begin=(N*id)/n;
+			int end=(N*(id+1))/n;
+			for(int i=begin; i<end; i++)
+			{
+				double app=LLRi[i];
+				for(int j=0; j<VWidth; j++) app+=*(R+i*VWidthMax+j);
+				LLRtmp[i]=app;
+				LLRbin[i]=(app<0);
+				for(int j=0; j<var_width[(size_t)i]; j++)
+					*(Q+i*VWidthMax+j)=app-*(R+i*VWidthMax+j);
+			}
+		}
+	}
+
+	void worker(int id)
+	{
+		unsigned long long seen=0;
+		for(;;)
+		{
+			{
+				std::unique_lock<std::mutex> lk(mtx);
+				cv_start.wait(lk, [&]{ return stop || generation!=seen; });
+				if(stop) return;
+				seen=generation;
+			}
+			run_chunk(id);
+			{
+				std::lock_guard<std::mutex> lk(mtx);
+				done++;
+				if(done==n-1) cv_done.notify_one();
+			}
+		}
+	}
+};
 
 // LEVER D (feat/decode-marathon): LAYERED / row-layered / horizontal-shuffled BP.
 // The default path above is FLOODING: within one iteration every check node reads
@@ -640,6 +866,14 @@ int decode_SPA(
 		}
 
 		const bool layered = ldpc_layered_enabled();
+		const int exact_threads = (!fixedpoint && !layered && !minsum && fwdback)
+			? ldpc_exact_threads(CWidth, P) : 1;
+		std::unique_ptr<spa_exact_row_pool> exact_pool;
+		if(exact_threads > 1)
+			exact_pool.reset(new spa_exact_row_pool(exact_threads, C, CWidth, CWidthMax,
+			                                      Q, R, V_pos, VWidthMax, P,
+			                                      LLRi, LLRtmp, LLRbin, N, VWidth,
+			                                      d, dWidth));
 		// ====================================================================
 		// LEVER G: FIXED-POINT (int16) MIN-SUM path. A clean alternative to the
 		// float branches below. Runs ONLY when fixedpoint==true (min-sum + the
@@ -1055,7 +1289,11 @@ int decode_SPA(
 			// multiply ordering changes (FP last-ULP reassociation, proven benign
 			// by the coded BER diff). The temp==±1 saturation clamp is applied to
 			// the SAME leave-one-out product value before 2*atanh, exactly as above.
-			for ( iindex=0;iindex<P;iindex++)
+			if(exact_pool)
+			{
+				exact_pool->run_checks();
+			}
+			else for ( iindex=0;iindex<P;iindex++)
 			{
 				int nv=0;   // number of valid (non -1) edges in this check row
 				for ( Cindex=0;Cindex<CWidth;Cindex++)
@@ -1091,7 +1329,11 @@ int decode_SPA(
 			}
 			}
 
-			for( i=0;i<N;i++)
+			if(exact_pool)
+			{
+				exact_pool->run_variables();
+			}
+			else for( i=0;i<N;i++)
 			{
 				LLRtmp[i]=LLRi[i];
 				for ( j=0;j<VWidth;j++)
@@ -1144,22 +1386,25 @@ int decode_SPA(
 			}
 
 
-			int start=0;
-			int end=0;
-			int width=0;
-			for (int section=0;section<dWidth;section+=2)
+			if(!exact_pool)
 			{
-				end+=d[section];
-				width=d[section+1];
-
-				for( i=start;i<end;i++)
+				int start=0;
+				int end=0;
+				int width=0;
+				for (int section=0;section<dWidth;section+=2)
 				{
-					for( j=0;j<width;j++)
+					end+=d[section];
+					width=d[section+1];
+
+					for( i=start;i<end;i++)
 					{
-						*(Q+i*VWidthMax+j)=LLRtmp[i]-*(R+i*VWidthMax+j);
+						for( j=0;j<width;j++)
+						{
+							*(Q+i*VWidthMax+j)=LLRtmp[i]-*(R+i*VWidthMax+j);
+						}
 					}
+					start+=d[section];
 				}
-				start+=d[section];
 			}
 		}
 		}   // end else (flooding loop; layered branch above)

@@ -21,6 +21,7 @@
  */
 
 #include "physical_layer/ldpc.h"
+#include <cstdint>
 #include "debug/canary_guard.h"
 #include <cstring>  // memset: zero decode workspace at alloc (PRECOOK memcmp determinism)
 
@@ -361,5 +362,27 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
 	{
 		return fail_decode();
 	}
- 	return iterations_done;
+	// Measurement-only exactness/iteration probe. Each line binds the consumed
+	// float LLR bit patterns to the produced information bits and return count;
+	// unset in production, so it has no hot-path cost beyond one cached branch.
+	static const bool exact_probe = []{
+		const char* e=std::getenv("MERCURY_LDPC_EXACT_PROBE");
+		return e && *e && atoi(e)!=0;
+	}();
+	if(exact_probe)
+	{
+		uint64_t ih=1469598103934665603ULL;
+		uint64_t oh=1469598103934665603ULL;
+		for(int i=0;i<N;i++)
+		{
+			uint32_t u=0;
+			memcpy(&u, data+i, sizeof(u));
+			for(int b=0;b<4;b++){ ih^=(uint8_t)(u>>(8*b)); ih*=1099511628211ULL; }
+		}
+		for(int i=0;i<K;i++){ oh^=(uint8_t)(decoded_data[i]&1); oh*=1099511628211ULL; }
+		printf("[LDPC-EXACT] N=%d K=%d in=%016llx out=%016llx iter=%d et=%d\n",
+		       N, K, (unsigned long long)ih, (unsigned long long)oh,
+		       iterations_done, last_early_term_iter);
+	}
+	return iterations_done;
  }
