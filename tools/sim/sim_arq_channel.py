@@ -884,7 +884,7 @@ def main():
                      # A double "--seed" here would let the relay's argparse take
                      # the LAST one silently -- the kind of collision we resolve.
                      "--seed", str(args.relay_seed),
-                     "--snr", str(args.snr), "--loss", str(args.loss),
+                     "--loss", str(args.loss),
                      "--profile", args.profile,
                      "--cfo-hz", str(args.cfo_hz),
                      "--phase-noise-deg", str(args.phase_noise_deg),
@@ -900,10 +900,9 @@ def main():
                      "--erase-b2a-burst", str(args.erase_b2a_burst),
                      "--airtime-json", relay_airtime_json,
                      "--log", relay_log]
+        relay_cmd += relay_coordinate_args(args)
         if args.turnaround_drift:
             relay_cmd.append("--turnaround-drift")
-        if args.cell:
-            relay_cmd += ["--cell", args.cell]
         if args.snr_schedule:
             relay_cmd += ["--snr-schedule", args.snr_schedule]
         if args.burst:
