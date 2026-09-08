@@ -25,10 +25,6 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
-#if defined(__linux__) || defined(__ANDROID__)
-#include <sched.h>
-#include <unistd.h>
-#endif
 #include <thread>
 #include <vector>    // LEVER G: int16 message-state buffers (fixed-point min-sum)
 
@@ -61,10 +57,10 @@ static inline bool ldpc_fwdback_enabled()
 // for the current iteration, and every edge maps to one unique R cell. Therefore
 // rows may be evaluated concurrently without changing a single floating-point
 // operation, its order within a row, or the subsequent variable-node reduction.
-// The high-degree 14/16 code in a LITTLE-only affinity mask is the only auto-on
-// target; lower-rate, BIG-only, and mixed-affinity decodes stay serial to avoid
-// measured thread overhead. MERCURY_LDPC_EXACT_THREADS=1 is the same-binary
-// reference arm, while values 2..4 override the worker count for measurement.
+// The high-degree 14/16 code is default-on with three threads on AArch64 and
+// default-off on every other architecture. Lower-degree decodes stay serial.
+// MERCURY_LDPC_EXACT_THREADS=1 is the same-binary reference arm, while values
+// 2..4 override the worker count on every architecture for measurement.
 static inline int ldpc_exact_threads(int CWidth, int P)
 {
 	const char* e = std::getenv("MERCURY_LDPC_EXACT_THREADS");
@@ -75,22 +71,8 @@ static inline int ldpc_exact_threads(int CWidth, int P)
 	}
 	else if(CWidth >= 32 && P >= 64)
 	{
-	#if defined(__linux__) || defined(__ANDROID__)
-		// The Note9's LITTLE-only cpuset benefits from three-way row work; its
-		// BIG cpuset does not. Auto-enable only when every allowed CPU is in the
-		// lower-numbered half of an even-sized topology. Unpinned/mixed and BIG-
-		// only processes retain the serial arm; the env override remains explicit.
-		cpu_set_t allowed;
-		CPU_ZERO(&allowed);
-		if(sched_getaffinity(0, sizeof(allowed), &allowed)==0)
-		{
-			long online=sysconf(_SC_NPROCESSORS_ONLN);
-			int split=(online>1) ? (int)online/2 : 1;
-			int low=0, high=0;
-			for(int cpu=0; cpu<online && cpu<CPU_SETSIZE; cpu++)
-				if(CPU_ISSET(cpu, &allowed)) (cpu<split ? low : high)++;
-			if(low>=3 && high==0) n=3;
-		}
+	#if defined(__aarch64__) || defined(_M_ARM64)
+		n=3;
 	#endif
 	}
 	if(n < 1) n = 1;
