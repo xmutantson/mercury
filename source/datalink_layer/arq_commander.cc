@@ -25089,6 +25089,21 @@ int cl_arq_controller::test_sim_inproc_2()
 	// --- Construct two instances + two channels (one per direction) ---
 	MercuryInstance* A = new MercuryInstance();  A->tag = "A/CMD";
 	MercuryInstance* B = new MercuryInstance();  B->tag = "B/RSP";
+	// main.cc bridges an explicit SIM_INPROC --gi through this test-only seam.
+	// Apply it before sim2_setup_instance() performs either peer's first PHY
+	// load.  The variable is absent unless the user supplied --gi, preserving
+	// the legacy simulator geometry and every existing regression by default.
+	const double sim2_gi_ms = env_d("MERCURY_SIM2_GI_MS", -1.0);
+	if (sim2_gi_ms >= 1.0 && sim2_gi_ms <= 8.0) {
+		const int sim2_ngi = (int)(sim2_gi_ms * 12.0 + 0.5);
+		A->ts.default_configurations_telecom_system.ofdm_gi =
+			(float)sim2_ngi / 256.0f;
+		B->ts.default_configurations_telecom_system.ofdm_gi =
+			(float)sim2_ngi / 256.0f;
+		printf("[TEST-SIM-2INST] explicit GI: %.2f ms (Ngi=%d) on both peers\n",
+		       sim2_gi_ms, sim2_ngi);
+		fflush(stdout);
+	}
 	sim2_setup_instance(A, COMMANDER, robust, start_cfg, seed ^ 0xA5A5u);
 	sim2_setup_instance(B, RESPONDER, robust, start_cfg, seed ^ 0x5A5Au);
 	// [WBDIRECT-REGRESSION] connect-fast pin-RESEAT loopback regression (cross-layer

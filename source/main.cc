@@ -7759,6 +7759,27 @@ start_modem:
     // timing. See fact-documents/single-process-sim-refactor.md. Exits rc.
     if (telecom_system.operation_mode == SIM_INPROC)
     {
+        // The normal ARQ startup applies --gi below, immediately before the
+        // production PHY is initialized.  SIM_INPROC returns before reaching
+        // that block and its two private telecom_system instances therefore
+        // used the constructor GI (Ngi=54) even when --gi was explicit.  Pass
+        // the already-validated CLI value through the simulator's existing
+        // environment parameter seam.  With --gi absent no variable is set and
+        // the historical SIM_INPROC path is byte-identical.
+        if (guard_interval_ms_cli > 0)
+        {
+            char sim2_gi_ms[32];
+            snprintf(sim2_gi_ms, sizeof(sim2_gi_ms), "%.9g",
+                     guard_interval_ms_cli);
+#if defined(_WIN32)
+            _putenv_s("MERCURY_SIM2_GI_MS", sim2_gi_ms);
+#else
+            setenv("MERCURY_SIM2_GI_MS", sim2_gi_ms, 1);
+#endif
+            printf("[SIM_INPROC] honoring --gi %.2f ms in private modem instances\n",
+                   guard_interval_ms_cli);
+            fflush(stdout);
+        }
         // §10.5: with MERCURY_SIM_2INST=1 (or --sim-2inst, parsed earlier into
         // the same env-style toggle) run the 2-INSTANCE lockstep stepper; default
         // runs the single-instance Stage-2 GO/NO-GO prototype (preserved as the
