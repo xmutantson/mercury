@@ -72,6 +72,7 @@ fact-documents/
 
 # Cross-built binaries
 /mercury_aarch64
+/tools/sim/realaudio/realaudio_bridge_s32_c
 
 # Reference docs (large, not source)
 /Mercury_Mode_Reference.pdf
