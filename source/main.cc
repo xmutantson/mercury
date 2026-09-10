@@ -52,6 +52,7 @@
 #include "crypto/test_aead_nonce.h"   // AEAD bsi-bound nonce regression suite
 #include "crypto/test_mlkem_hybrid.h" // ML-KEM-768 hybrid KEX regression suite
 #include "datalink_layer/arq.h"
+#include "datalink_layer/fade_core.h"
 #include "datalink_layer/lp_transition_harness.h"
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
@@ -2979,6 +2980,8 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-snr-decision-grid") == 0) {
             int failed = run_snr_decision_grid_selftest();
             return (failed == 0) ? 0 : 1;
+        if (strcmp(argv[i], "--test-fade-core") == 0) {
+            return mercury::fade::run_fade_core_tests();
         }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
@@ -2992,6 +2995,7 @@ int main(int argc, char *argv[])
             failed += run_snr_decision_grid_selftest();
             if (getenv("MERCURY_CAP_CODEC_ONLY") != NULL)
                 return failed == 0 ? 0 : 1;
+            failed += mercury::fade::run_fade_core_tests();
             // Compression reassembly bounds: a valid stamp-carrying 96-frame batch
             // can exceed 16 KiB. Drive the REAL compression delivery funnel and
             // require byte-exact app output plus matching transported cursor.
