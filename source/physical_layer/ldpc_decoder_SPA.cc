@@ -21,7 +21,9 @@
  */
 
 #include "physical_layer/ldpc_decoder_SPA.h"
+#include "common/common_defines.h"
 #include <cstdlib>   // std::getenv / atoi for the MERCURY_LDPC_FWDBACK gate
+#include <cstring>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -335,17 +337,6 @@ static inline bool ldpc_layered_enabled()
 //     unreliable (sign-flipping) var-node messages => near-SPA at MS complexity,
 //     independent of noise-variance estimation error.
 //
-// Gate: MERCURY_LDPC_MINSUM unset/0 => the SPA tanh/atanh kernel runs bit-for-bit
-// (default-off byte-identical render). Read once per process (static cache).
-static inline bool ldpc_minsum_enabled()
-{
-	static const int v = []{
-		const char* e = std::getenv("MERCURY_LDPC_MINSUM");
-		return (e && *e) ? atoi(e) : 0;
-	}();
-	return v != 0;
-}
-
 // ============================================================================
 // LEVER G (feat/decode-marathon): FIXED-POINT (int16) MIN-SUM. Quantizes the
 // min-sum decode STATE (the messages R/Q and the a-posteriori APP) to int16 with
@@ -389,16 +380,61 @@ static inline bool ldpc_minsum_enabled()
 //     row from injecting a runaway value, exactly as the float MS_MAG_MAX guard.
 //     The min-sum magnitude ceiling is taken as min(CAP, S*16.6355) so the int
 //     kernel shares the float kernel's dynamic range.
-// Gate: MERCURY_LDPC_FIXEDPOINT unset/0 => the FLOAT min-sum (or SPA) kernel runs
-// bit-for-bit. REQUIRES MERCURY_LDPC_MINSUM (gated below so fixed-point only
-// engages on the min-sum path — the SPA tanh/atanh kernel needs float). Read once.
+// In the historical global A/B arm (MERCURY_LDPC_MINSUM=1), this secondary
+// lever preserves the old float-vs-fixed selection. The scoped arm always
+// returns MINSUM_FIXED from ldpc_decoder_policy_for_config().
 static inline bool ldpc_fixedpoint_enabled()
 {
-	static const int v = []{
-		const char* e = std::getenv("MERCURY_LDPC_FIXEDPOINT");
-		return (e && *e) ? atoi(e) : 0;
-	}();
-	return v != 0;
+	const char* e = std::getenv("MERCURY_LDPC_FIXEDPOINT");
+	return e && *e && atoi(e) != 0;
+}
+
+ldpc_decoder_kind ldpc_decoder_policy_for_config(int configuration)
+{
+	const char* lever = std::getenv("MERCURY_LDPC_MINSUM");
+	if(lever == nullptr || *lever == '\0' || std::strcmp(lever, "0") == 0)
+		return LDPC_DECODER_SPA;
+
+	// Historical A/B parity: `1` means min-sum on every SPA-family decode,
+	// with MERCURY_LDPC_FIXEDPOINT retaining its old secondary role.
+	if(std::strcmp(lever, "1") == 0)
+		return ldpc_fixedpoint_enabled()
+			? LDPC_DECODER_MINSUM_FIXED : LDPC_DECODER_MINSUM;
+
+	if(std::strcmp(lever, "scoped") == 0)
+	{
+		// The configuration table gives cfg15, cfg16, and cfg17 the identical
+		// rate-14/16 QC-LDPC matrix. cfg16/cfg17 were priced directly; cfg15 is
+		// admitted because its decoder graph is literally the same table entry.
+		// No NB alias is added: NB clamps requests above NB_CONFIG_MAX (cfg14)
+		// before ldpc.configuration is assigned, so cfg15/16/17 are unreachable
+		// as NB states. cfg14 and every unpriced OFDM/robust/experimental config
+		// deliberately remain exact SPA.
+		switch(configuration)
+		{
+			case CONFIG_15:
+			case CONFIG_16:
+			case CONFIG_17:
+				return LDPC_DECODER_MINSUM_FIXED;
+			default:
+				return LDPC_DECODER_SPA;
+		}
+	}
+
+	// Fail closed. In particular, legacy truthy spellings other than the
+	// documented `1` cannot accidentally turn min-sum on globally.
+	return LDPC_DECODER_SPA;
+}
+
+const char* ldpc_decoder_kind_name(ldpc_decoder_kind kind)
+{
+	switch(kind)
+	{
+		case LDPC_DECODER_MINSUM:       return "MINSUM";
+		case LDPC_DECODER_MINSUM_FIXED: return "MINSUM_FIXED";
+		case LDPC_DECODER_SPA:
+		default:                        return "SPA";
+	}
 }
 
 // LLR scale S (fixed-point Q-format multiplier). Default 64 (Q9.6). Clamped to a
@@ -686,7 +722,8 @@ int decode_SPA(
 		std::atomic<bool>* abort_flag,
 		double* app_llr,
 		int early_term_mode,
-		int* out_early_term_iter
+		int* out_early_term_iter,
+		ldpc_decoder_kind decoder_kind
 )
 {
 	int Cout[N_MAX];
@@ -811,16 +848,14 @@ int decode_SPA(
 		double  fb_q   [CW_SCRATCH];           // raw Q per valid edge (min-sum input)
 		double  fb_rout[CW_SCRATCH];           // min-sum check->var output per edge
 
-		// LEVER E gates (read once via static-cached helpers; cheap to hoist here).
-		const bool   minsum    = ldpc_minsum_enabled();
+		// The caller resolved the single config-aware policy once for this decode.
+		const bool   minsum    = decoder_kind != LDPC_DECODER_SPA;
 		const int    ms_variant= minsum ? ldpc_minsum_variant() : MS_NMS;
 		const double ms_alpha  = minsum ? ldpc_minsum_alpha()   : 0.8;
 
-		// LEVER G (fixed-point int16 min-sum): engages ONLY when both the min-sum
-		// gate AND the fixed-point gate are set (the SPA tanh/atanh kernel needs
-		// float; quantizing it makes no sense, so fixed-point is min-sum-only). When
-		// off, fixedpoint==false => the float kernels above run bit-for-bit.
-		const bool   fixedpoint = minsum && ldpc_fixedpoint_enabled();
+		// LEVER G (fixed-point int16 min-sum). The enum cannot represent fixed SPA,
+		// so this is a one-value check and the exact-SPA path remains untouched.
+		const bool   fixedpoint = decoder_kind == LDPC_DECODER_MINSUM_FIXED;
 		const int    fp_S       = fixedpoint ? ldpc_fixedpoint_scale() : 64;
 		const int    fp_cap     = fixedpoint ? ldpc_fixedpoint_sat()   : 4096;
 		// alpha in Q-format (NMS scale / OMS offset, fixed units). round(alpha*S).

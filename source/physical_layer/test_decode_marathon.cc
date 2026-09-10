@@ -50,6 +50,134 @@
 
 namespace {
 
+bool buffers_equal(const std::vector<int>& a, const std::vector<int>& b);
+
+struct tdm_env_saved
+{
+	const char* key;
+	bool present;
+	std::string value;
+	explicit tdm_env_saved(const char* k) : key(k), present(false)
+	{
+		const char* v = std::getenv(k);
+		if(v != nullptr) { present = true; value = v; }
+	}
+	void restore() const { tdm_setenv(key, present ? value.c_str() : nullptr); }
+};
+
+// Config-scoping boundary gate. This calls the production policy for the whole
+// config domain under every documented lever state, then performs paired exact
+// SPA-vs-scoped decodes on every robust config. The latter proves the policy is
+// not merely a table claim: cl_ldpc::decode consumed SPA and produced identical
+// output bytes and iteration counts for the same input.
+bool run_decoder_policy_boundary(cl_telecom_system* ts)
+{
+	tdm_env_saved saved_minsum("MERCURY_LDPC_MINSUM");
+	tdm_env_saved saved_fixed("MERCURY_LDPC_FIXEDPOINT");
+	bool pass = true;
+	int checks = 0;
+
+	std::vector<int> configs;
+	for(int cfg=CONFIG_0; cfg<=CONFIG_17; ++cfg) configs.push_back(cfg);
+	configs.push_back(ROBUST_0);
+	configs.push_back(ROBUST_1);
+	configs.push_back(ROBUST_2);
+	configs.push_back(ROBUST_3);
+	configs.push_back(LOW48_ANCHOR_S20_R6);
+	configs.push_back(CONFIG_NONE);
+	configs.push_back(999);
+
+	auto verify = [&](const char* tag, const char* lever, const char* fixed,
+	                  bool global, bool scoped, ldpc_decoder_kind global_kind)
+	{
+		tdm_setenv("MERCURY_LDPC_MINSUM", lever);
+		tdm_setenv("MERCURY_LDPC_FIXEDPOINT", fixed);
+		for(int cfg : configs)
+		{
+			ldpc_decoder_kind want = LDPC_DECODER_SPA;
+			if(global) want = global_kind;
+			else if(scoped && cfg >= CONFIG_15 && cfg <= CONFIG_17)
+				want = LDPC_DECODER_MINSUM_FIXED;
+			ldpc_decoder_kind got = ldpc_decoder_policy_for_config(cfg);
+			checks++;
+			if(got != want)
+			{
+				printf("[TEST-LDPC-POLICY] FAIL %s cfg=%d got=%s want=%s\n",
+				       tag, cfg, ldpc_decoder_kind_name(got),
+				       ldpc_decoder_kind_name(want));
+				pass = false;
+			}
+		}
+	};
+
+	verify("default", nullptr, nullptr, false, false, LDPC_DECODER_SPA);
+	verify("forced-SPA", "0", "1", false, false, LDPC_DECODER_SPA);
+	verify("global-float", "1", nullptr, true, false, LDPC_DECODER_MINSUM);
+	verify("global-fixed", "1", "1", true, false, LDPC_DECODER_MINSUM_FIXED);
+	verify("scoped", "scoped", nullptr, false, true, LDPC_DECODER_SPA);
+	verify("invalid-fail-closed", "yes", "1", false, false, LDPC_DECODER_SPA);
+
+	// Paired byte proof for every robust/MFSK config through the real decode entry.
+	const int robust_configs[] = { ROBUST_0, ROBUST_1, ROBUST_2, ROBUST_3 };
+	for(int cfg : robust_configs)
+	{
+		ts->load_configuration(cfg);
+		std::vector<int> info((size_t)ts->ldpc.K, 0);
+		std::vector<int> encoded((size_t)ts->ldpc.N, 0);
+		std::vector<float> llr((size_t)ts->ldpc.N, 0.0f);
+		std::vector<int> spa((size_t)ts->ldpc.K, -1);
+		std::vector<int> scoped_out((size_t)ts->ldpc.K, -2);
+		for(int i=0; i<ts->ldpc.K; ++i) info[(size_t)i] = (i*17 + cfg) & 1;
+		ts->ldpc.encode(info.data(), encoded.data());
+		for(int i=0; i<ts->ldpc.N; ++i)
+			llr[(size_t)i] = encoded[(size_t)i] ? -20.0f : 20.0f;
+
+		tdm_setenv("MERCURY_LDPC_MINSUM", "0");
+		int spa_iter = ts->ldpc.decode(llr.data(), spa.data());
+		tdm_setenv("MERCURY_LDPC_MINSUM", "scoped");
+		int scoped_iter = ts->ldpc.decode(llr.data(), scoped_out.data());
+		bool bytes_equal = buffers_equal(spa, scoped_out);
+		bool actual_spa = ts->ldpc.last_decoder_kind == LDPC_DECODER_SPA;
+		bool this_pass = bytes_equal && actual_spa && spa_iter == scoped_iter;
+		printf("[TEST-LDPC-POLICY] cfg=%d robust path=%s bytes_equal=%d "
+		       "iter_equal=%d (%d/%d)\n", cfg,
+		       ldpc_decoder_kind_name(ts->ldpc.last_decoder_kind),
+		       (int)bytes_equal, (int)(spa_iter == scoped_iter), spa_iter, scoped_iter);
+		pass &= this_pass;
+	}
+
+	// NB has no cfg15/16/17 aliases: the production loader clamps a cfg16
+	// request to cfg14 before publishing ldpc.configuration. Exercise that exact
+	// ordering and require the resulting decoder decision to be SPA.
+	ts->narrowband_enabled = YES;
+	ts->current_configuration = CONFIG_NONE;
+	tdm_setenv("MERCURY_LDPC_MINSUM", "scoped");
+	ts->load_configuration(CONFIG_16);
+	ldpc_decoder_kind nb_kind = ldpc_decoder_policy_for_config(ts->ldpc.configuration);
+	bool nb_pass = ts->current_configuration == CONFIG_14
+		&& ts->ldpc.configuration == CONFIG_14
+		&& nb_kind == LDPC_DECODER_SPA;
+	printf("[TEST-LDPC-POLICY] NB cfg16 request -> active=%d ldpc.cfg=%d path=%s pass=%d\n",
+	       ts->current_configuration, ts->ldpc.configuration,
+	       ldpc_decoder_kind_name(nb_kind), (int)nb_pass);
+	pass &= nb_pass;
+
+	// Restore the caller's A/B arm and the marathon's cfg16 geometry.
+	saved_minsum.restore();
+	saved_fixed.restore();
+	ts->narrowband_enabled = NO;
+	ts->current_configuration = CONFIG_NONE;
+	ts->load_configuration(CONFIG_16);
+
+	printf("[TEST-LDPC-POLICY] %s: %d mapping checks; cfg14/NB boundary=%s; "
+	       "cfg15/16/17=%s under scoped\n",
+	       pass ? "ALL PASS" : "FAILURES PRESENT", checks,
+	       ldpc_decoder_kind_name(LDPC_DECODER_SPA),
+	       ldpc_decoder_kind_name(LDPC_DECODER_MINSUM_FIXED));
+	fflush(stdout);
+	return pass;
+}
+
 // Deterministic xorshift PRNG (no libc RNG => identical across platforms/threads).
 struct tdm_rng { unsigned long long s; unsigned long long next(){ s^=s<<13; s^=s>>7; s^=s<<17; return s; } };
 
@@ -222,6 +350,7 @@ int test_decode_marathon_run()
 	}
 
 	bool all_pass = true;
+	all_pass &= run_decoder_policy_boundary(ts);
 
 	// Batch 1 — nominal big-block K=8: mostly clean, two uncorrectable.
 	{

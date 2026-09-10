@@ -26,7 +26,23 @@
 #include <cmath>
 #include <atomic>
 #include "physical_defines.h"
-#include "ldpc.h"
+
+// Decoder selected by the one process-wide policy function below.  The enum is
+// deliberately explicit rather than a pair of booleans so callers cannot
+// accidentally request fixed-point SPA (which is not a valid implementation).
+enum ldpc_decoder_kind
+{
+	LDPC_DECODER_SPA = 0,
+	LDPC_DECODER_MINSUM = 1,
+	LDPC_DECODER_MINSUM_FIXED = 2
+};
+
+// Resolve MERCURY_LDPC_MINSUM for one already-clamped, active configuration.
+// Unset/"0" is production SPA, "1" is the historical global min-sum A/B arm,
+// and "scoped" selects fixed-point min-sum only for the priced OFDM data set.
+// Any unrecognized value fails closed to SPA.
+ldpc_decoder_kind ldpc_decoder_policy_for_config(int configuration);
+const char* ldpc_decoder_kind_name(ldpc_decoder_kind kind);
 
 int decode_SPA(
 		const float LLRi[],
@@ -58,8 +74,9 @@ int decode_SPA(
 		                            // Both use floor=P/2 (swept lossless). On a
 		                            // detector trip decode_SPA returns the canonical
 		                            // FAIL sentinel nIteration_max+1.
-		int* out_early_term_iter = nullptr // measurement-only: real iter at trip,
+		int* out_early_term_iter = nullptr, // measurement-only: real iter at trip,
 		                            // else -1. No control-flow effect.
+		ldpc_decoder_kind decoder_kind = LDPC_DECODER_SPA
 );
 
 

@@ -141,6 +141,8 @@ void cl_ldpc::copy_from(const cl_ldpc& s)
 	GBF_eta            = s.GBF_eta;
 	nIteration_max     = s.nIteration_max;
 	print_nIteration   = s.print_nIteration;
+	configuration      = s.configuration;
+	last_decoder_kind  = LDPC_DECODER_SPA; // runtime observation, not bundle state
 
 	// Private scalars.
 	Cwidth                 = s.Cwidth;
@@ -480,6 +482,7 @@ const char* cl_ldpc::precook_deep_equal(const cl_ldpc& o) const
 	if(N != o.N)             return "ldpc.N";
 	if(P != o.P)             return "ldpc.P";
 	if(K != o.K)             return "ldpc.K";
+	if(configuration != o.configuration) return "ldpc.configuration";
 	if(Cwidth != o.Cwidth)   return "ldpc.Cwidth";
 	if(Vwidth != o.Vwidth)   return "ldpc.Vwidth";
 	if(dwidth != o.dwidth)   return "ldpc.dwidth";

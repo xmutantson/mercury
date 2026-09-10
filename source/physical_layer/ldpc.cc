@@ -44,6 +44,8 @@ cl_ldpc::cl_ldpc()
 	nIteration_max=0;
 	GBF_eta=0;
 	print_nIteration=NO;
+	configuration=-1;
+	last_decoder_kind=LDPC_DECODER_SPA;
 
 	Cwidth=0;
 	QCmatrixC=NULL;
@@ -356,7 +358,8 @@ void cl_ldpc::encode(const int* data, int*  encoded_data)
  		}();
  		int et_mode = early_term_speculative ? 2 : (synd_earlyterm_env != 0 ? 1 : 0);
  		last_early_term_iter = -1;
- 		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort,app_llr,et_mode,&last_early_term_iter);
+		last_decoder_kind = ldpc_decoder_policy_for_config(configuration);
+		iterations_done=decode_SPA(data,decoded_data,QCmatrixC,Cwidth,Cwidth, QCmatrixV,Vwidth,Vwidth,QCmatrixd,dwidth,R,Q,V_pos,N,K,P,nIteration_max_val,decode_abort,app_llr,et_mode,&last_early_term_iter,last_decoder_kind);
  	}
 	else
 	{

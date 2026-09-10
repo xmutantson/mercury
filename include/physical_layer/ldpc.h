@@ -71,6 +71,13 @@ public:
 	float GBF_eta; //!< The GBF algorithms correction rate.
 	int nIteration_max; //!< The maximum number of LDPC decoding iterations allowed.
 	int print_nIteration;
+	// Active, already-NB-clamped modem configuration.  Decoder choice cannot be
+	// inferred from rate alone: cfg100 and cfg0 share rate 1/16 but must remain
+	// exact SPA while the priced high-data configs may use scoped min-sum.
+	int configuration;
+	// Test/diagnostic observability for the policy actually consumed by the most
+	// recent SPA-family decode.  It has no control-flow consumer.
+	ldpc_decoder_kind last_decoder_kind;
 	int init();
 	void deinit();
 

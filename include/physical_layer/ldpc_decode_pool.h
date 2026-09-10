@@ -101,8 +101,9 @@ private:
 	bool                       stop_flag = false;
 	bool                       defeat_share = false; // test-only FAIL-BEFORE: share ctx[0] workspace
 
-	// config signature the pool was built for (so ensure() can detect a change)
-	int sig_N = -1, sig_K = -1, sig_alg = -1, sig_iter = -1;
+	// Config signature the pool was built for (including config identity because
+	// cfg14->cfg15 keeps N/K/algorithm/iterations but changes scoped policy).
+	int sig_N = -1, sig_K = -1, sig_alg = -1, sig_iter = -1, sig_config = -1;
 
 	void worker_loop(int widx);
 	void clone_config_into(cl_ldpc& dst, const cl_ldpc& src);

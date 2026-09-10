@@ -30,6 +30,7 @@ void cl_ldpc_decode_pool::clone_config_into(cl_ldpc& dst, const cl_ldpc& src)
 	dst.GBF_eta             = src.GBF_eta;
 	dst.nIteration_max      = src.nIteration_max;
 	dst.print_nIteration    = src.print_nIteration;
+	dst.configuration      = src.configuration;
 	dst.init();             // allocates private R/Q/V_pos; freezes N/P/K/Cwidth...
 }
 
@@ -45,6 +46,7 @@ bool cl_ldpc_decode_pool::ensure(const cl_ldpc& cfg_template, int n_workers)
 	const int want_K    = cfg_template.K;
 	const int want_alg  = cfg_template.decoding_algorithm;
 	const int want_iter = cfg_template.nIteration_max;
+	const int want_config = cfg_template.configuration;
 
 	// test-only FAIL-BEFORE hook (read fresh; a toggle forces a rebuild below).
 	bool want_defeat = false;
@@ -54,7 +56,7 @@ bool cl_ldpc_decode_pool::ensure(const cl_ldpc& cfg_template, int n_workers)
 	if(!workers.empty()
 	   && (int)workers.size() == n_workers
 	   && sig_N == want_N && sig_K == want_K
-	   && sig_alg == want_alg && sig_iter == want_iter
+	   && sig_alg == want_alg && sig_iter == want_iter && sig_config == want_config
 	   && defeat_share == want_defeat)
 	{
 		return true;
@@ -87,6 +89,7 @@ bool cl_ldpc_decode_pool::ensure(const cl_ldpc& cfg_template, int n_workers)
 		workers.emplace_back(&cl_ldpc_decode_pool::worker_loop, this, w);
 
 	sig_N = want_N; sig_K = want_K; sig_alg = want_alg; sig_iter = want_iter;
+	sig_config = want_config;
 	return true;
 }
 
@@ -108,7 +111,7 @@ void cl_ldpc_decode_pool::shutdown()
 	for(auto* c : ctx) delete c;    // ~cl_ldpc frees R/Q/V_pos
 	ctx.clear();
 
-	sig_N = sig_K = sig_alg = sig_iter = -1;
+	sig_N = sig_K = sig_alg = sig_iter = sig_config = -1;
 }
 
 // One persistent worker. Sleeps on cv_work until a batch is posted (job_generation

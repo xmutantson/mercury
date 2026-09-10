@@ -13407,6 +13407,10 @@ int cl_telecom_system::load_configuration(int configuration)
 
 	M=_modulation;
 	ldpc.rate=_ldpc_rate;
+	// `configuration` has already passed the NB clamp above.  Carry that active
+	// identity into every decode; rate alone cannot distinguish robust cfg100
+	// from OFDM cfg0, nor the priced cfg15/16/17 set from other rate-14/16 rungs.
+	ldpc.configuration=configuration;
 	ofdm.preamble_configurator.Nsymb=ofdm_preamble_configurator_Nsymb;
 	// NB MFSK: 8-symbol preamble for cross-correlation detection.
 	// WB MFSK: 16-symbol preamble (raised from 4 on 2026-05-27 per

@@ -195,11 +195,13 @@ mercury -m MONITOR --stdout
 
 ## Environment Variables
 
-Opt-in diagnostics and overrides — none of these change correctness; they
-only affect logging or table-load behavior.
+Operational overrides and opt-in diagnostics. The LDPC selector below changes
+decoder behavior only when explicitly armed; its production default is SPA.
 
 | Variable                  | Effect                                                  |
 |---------------------------|---------------------------------------------------------|
+| `MERCURY_LDPC_MINSUM=0\|1\|scoped` | LDPC decoder A/B policy: `0` (and unset) forces all-SPA; `1` preserves global min-sum behavior; `scoped` selects fixed-point NMS only for cfg15/16/17. |
+| `MERCURY_LDPC_FIXEDPOINT=1` | With `MERCURY_LDPC_MINSUM=1`, select the historical global fixed-point min-sum arm; ignored by `0` and unnecessary for `scoped`. |
 | `MERCURY_HAIL_POLL=1`     | Emit `[HAIL-POLL]` trace lines for hail-poll cadence.   |
 | `MERCURY_SACK_RX_TRACE=1` | Emit per-message SACK RX trace (commander + common).   |
 | `MERCURY_RATE_TABLE=<path>` | Override the effective-rate optimizer's calibration table path. Optimizer auto-disables on miss. |
