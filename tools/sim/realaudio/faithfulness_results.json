@@ -1,0 +1,143 @@
+{
+  "thresholds": {
+    "snr_abs_delta_db": 0.1,
+    "doppler_psd_rmse_db": 0.85,
+    "doppler_spread_delta_pct": 4.0
+  },
+  "snr": [
+    {
+      "dial": 10,
+      "mapped_snr3k_db": 14.7985948779362,
+      "python_realized_db": 14.80015457819653,
+      "c_realized_db": 14.800154578196523,
+      "c_minus_python_db": -7.105427357601002e-15,
+      "abs_delta_db": 7.105427357601002e-15,
+      "pass": true
+    },
+    {
+      "dial": 20,
+      "mapped_snr3k_db": 24.785969195215195,
+      "python_realized_db": 24.787528895475525,
+      "c_realized_db": 24.787528895475518,
+      "c_minus_python_db": -7.105427357601002e-15,
+      "abs_delta_db": 7.105427357601002e-15,
+      "pass": true
+    },
+    {
+      "dial": 30,
+      "mapped_snr3k_db": 34.66169097892815,
+      "python_realized_db": 34.66325067918848,
+      "c_realized_db": 34.66325067918847,
+      "c_minus_python_db": -7.105427357601002e-15,
+      "abs_delta_db": 7.105427357601002e-15,
+      "pass": true
+    },
+    {
+      "dial": 40,
+      "mapped_snr3k_db": 43.582453227807406,
+      "python_realized_db": 43.58401292806774,
+      "c_realized_db": 43.584012928067736,
+      "c_minus_python_db": -7.105427357601002e-15,
+      "abs_delta_db": 7.105427357601002e-15,
+      "pass": true
+    }
+  ],
+  "fade": [
+    {
+      "profile": "MPG",
+      "fd_hz": 0.1,
+      "tap_update_samples": 7500,
+      "doppler_psd_rmse_db": 0.5771789364762617,
+      "python_rms_doppler_hz": 0.04936168306581053,
+      "c_rms_doppler_hz": 0.04932463535373996,
+      "rms_doppler_delta_pct": 0.07505358360891869,
+      "target_delay_samples": 24,
+      "python_delay_samples": 24,
+      "c_delay_samples": 24,
+      "python_delay_fit_mse": 1.6900868246786285e-31,
+      "c_delay_fit_mse": 1.6900791754818273e-31,
+      "pass": true
+    },
+    {
+      "profile": "MPM",
+      "fd_hz": 0.5,
+      "tap_update_samples": 1500,
+      "doppler_psd_rmse_db": 0.5771789364762617,
+      "python_rms_doppler_hz": 0.24680841532905265,
+      "c_rms_doppler_hz": 0.2466231767686998,
+      "rms_doppler_delta_pct": 0.0750535836089243,
+      "target_delay_samples": 48,
+      "python_delay_samples": 48,
+      "c_delay_samples": 48,
+      "python_delay_fit_mse": 1.6909847995270208e-31,
+      "c_delay_fit_mse": 1.691061014945586e-31,
+      "pass": true
+    },
+    {
+      "profile": "MPP",
+      "fd_hz": 1.0,
+      "tap_update_samples": 750,
+      "doppler_psd_rmse_db": 0.5771789364762617,
+      "python_rms_doppler_hz": 0.4936168306581053,
+      "c_rms_doppler_hz": 0.4932463535373996,
+      "rms_doppler_delta_pct": 0.0750535836089243,
+      "target_delay_samples": 96,
+      "python_delay_samples": 96,
+      "c_delay_samples": 96,
+      "python_delay_fit_mse": 1.689229362084909e-31,
+      "c_delay_fit_mse": 1.6891955075082908e-31,
+      "pass": true
+    }
+  ],
+  "passthrough": {
+    "frames": 100010,
+    "byte_exact": true,
+    "mismatched_words": 0
+  },
+  "format": {
+    "frames": 100010,
+    "byte_exact": true,
+    "mismatched_words": 0,
+    "int32_min_expected_after_channel_path": -2147483647
+  },
+  "attestation": {
+    "pass": true,
+    "cell": "WGN:40",
+    "profile": "WGN",
+    "commanded_snr": 40,
+    "realized_snr3k": 43.582453227807406,
+    "realized_snr_offset_db": 3.582453227807406,
+    "seed": 7,
+    "passthrough": false,
+    "realized_p_sig": 0.02249999999999816
+  },
+  "axis_attestation": {
+    "pass": true,
+    "axis_version": "v1-steady-snr3k",
+    "input_coordinate": "cell",
+    "reference_mode": "steady-active-chunk-median",
+    "reference_id": "traffic-steady-v1",
+    "reference_power": 0.022500000000000065,
+    "reference_n_samples": 0,
+    "configured_bandwidth_hz": 2343.75,
+    "snr3k_db": 43.582453227807406,
+    "cn_config_db": 44.65455292428609,
+    "noise_variance": 7.88909493611436e-06,
+    "seed": 7,
+    "composite_scale": 1.0,
+    "pre_scale_peak": 0,
+    "hard_clip_count": 0,
+    "s32_saturation_count": 0,
+    "clip_event_denominator": 0,
+    "s32_mode": "s32-hardclip",
+    "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "recipe_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "gates": {
+    "snr": true,
+    "fade": true,
+    "format_passthrough": true,
+    "attestation": true
+  },
+  "faithfulness": "PASS"
+}
