@@ -1003,8 +1003,11 @@ cl_arq_controller::cl_arq_controller()
 	// Commander connect-accept (CONNECT skips reset_session_state).
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
-	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):
-	// the ACK cache + turnaround probe state no longer exist.
+	connect_ack_cache.valid = false;
+	connect_ack_cache.echoed_cap = 0;
+	connect_ack_cache.own_cap = 0;
+	connect_ack_cache.ssid = 0;
+	connect_ack_cache.replays = 0;
 	break_noprogress_cycles = 0;
 	stats.nSent_data=0;
 	stats.nAcked_data=0;
@@ -9694,8 +9697,8 @@ void cl_arq_controller::reset_session_state()
 	topgear_last_flat_state = 8;
 	// A pending deferred report is prior-session channel evidence too.
 	topgear_pending_report_clear("session-reset");
-	// CONNECT-REACK REMOVED (excise of 8e62722e, connect-testack-handshake.md §9):
-	// no cached ACK / probe state to clear per session.
+	connect_ack_cache.valid = false;
+	connect_ack_cache.replays = 0;
 	block_under_tx = NO;
 	consecutive_data_acks = 0;
 	success_rate_data_clean = 100.0;  // CLEAN-BATCH VIABILITY (§9) — neutral per session
@@ -17980,57 +17983,19 @@ long long cl_arq_controller::send_mfsk_test_ack_phy(uint8_t echoed_cap,
 		MFSK_CTRL_TEST_ACK, p38, "CONNECT-ACK");
 }
 
-// Shared RX core: snapshot the capture-buffer tail, run the CONNECT base
-// detector + suffix decode, verify CRC12 via the production CRC12_calc,
-// require the type discriminator to match `expected_type`. Returns true on
-// a clean type-matched CRC-validated decode; the caller unpacks `out_p38`.
-//
-// IMPORTANT: this is called from BEFORE the legacy LDPC receive() path runs,
-// so the gate at "if frames_to_read != 0" is the only place we sample the
-// buffer. The caller (Site B / Site D) overrides frames_to_read to 2 if it
-// finds a larger value (mirroring HAIL's override at arq_responder.cc:128-136)
-// — v1 bug #3 was the lack of this override.
-static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
-                                              cl_telecom_system* telecom_system,
-                                              mfsk_ctrl_frame_type expected_type,
-                                              uint64_t* out_p38,
-                                              const char* tag)
+// Shared decoder for an owned CONNECT capture or a passive decode of an OFDM
+// snapshot that the legacy receive() path already staged.  It validates the
+// type discriminator and production CRC12 before returning the suffix payload.
+// Only the owning path is allowed to alter capture state.
+static bool decode_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
+                                             cl_telecom_system* telecom_system,
+                                             double* samples,
+                                             int sample_count,
+                                             mfsk_ctrl_frame_type expected_type,
+                                             uint64_t* out_p38,
+                                             const char* tag,
+                                             bool owns_capture)
 {
-	int conn_nsymb = telecom_system->ack_mfsk.connect_pattern_nsymb;
-	// §19.4 C6: use the CODED suffix length (52 with Tier-2 FEC, 13 uncoded) so
-	// the captured passband tail actually CONTAINS the full coded suffix plus
-	// the existing 16-symbol margin. tail_samples is clamped to signal_period
-	// below (the ring), which is hundreds of symbols at the robust configs, so
-	// the larger coded window fits. §20.3 C6: the base now occupies
-	// connect_base_total_nsymb() (R×16 when combining) — the capture tail must
-	// hold all R base reps + the suffix + margin (R=1 → conn_nsymb, byte-identical).
-	int base_total_nsymb = telecom_system->ack_mfsk.connect_base_total_nsymb();
-	int suffix_nsymb = telecom_system->ack_mfsk.ctrl_suffix_len();
-	if(conn_nsymb <= 0 || suffix_nsymb <= 0) return false;
-	const int tail_nsymb = base_total_nsymb + suffix_nsymb + 16;
-	int sym_samples = telecom_system->data_container.Nofdm
-	                * telecom_system->data_container.interpolation_rate;
-	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
-	int tail_samples = tail_nsymb * sym_samples;
-	if(tail_samples > signal_period) tail_samples = signal_period;
-	int tail_offset = signal_period - tail_samples;
-
-	MUTEX_LOCK(&capture_prep_mutex);
-
-	if(telecom_system->data_container.frames_to_read != 0)
-	{
-		MUTEX_UNLOCK(&capture_prep_mutex);
-		return false;
-	}
-
-	int rwi = telecom_system->data_container.ring_write_index;
-	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
-		&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
-		tail_samples * sizeof(double));
-
-	telecom_system->data_container.data_ready = 0;
-	MUTEX_UNLOCK(&capture_prep_mutex);
-
 	mfsk_ctrl_frame_type rx_type;
 	uint64_t rx_p38 = 0;
 	uint16_t rx_crc12 = 0;
@@ -18039,14 +18004,16 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	// run its CRC accept gate (no-op for the uncoded path, which returns the
 	// unpacked crc12 for the outer re-check below).
 	bool decoded = telecom_system->decode_ctrl_suffix_from_passband(
-		telecom_system->data_container.ready_to_process_passband_delayed_data,
-		tail_samples, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
+		samples, sample_count, &rx_type, &rx_p38, &rx_crc12, &rx_matched,
 		arq_ctrl_crc12_cb, self);
 
 	if(!decoded)
 	{
-		telecom_system->data_container.frames_to_read = 2;
-		telecom_system->data_container.nUnder_processing_events = 0;
+		if(owns_capture)
+		{
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+		}
 		return false;
 	}
 
@@ -18063,8 +18030,11 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 				tag, (int)rx_type, (int)expected_type, rx_matched);
 			fflush(stdout);
 		}
-		telecom_system->data_container.frames_to_read = 2;
-		telecom_system->data_container.nUnder_processing_events = 0;
+		if(owns_capture)
+		{
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+		}
 		return false;
 	}
 
@@ -18081,12 +18051,17 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 			tag, (int)rx_type, (unsigned long long)rx_p38,
 			(unsigned)rx_crc12, (unsigned)expected, rx_matched);
 		fflush(stdout);
-		telecom_system->data_container.frames_to_read = 2;
-		telecom_system->data_container.nUnder_processing_events = 0;
+		if(owns_capture)
+		{
+			telecom_system->data_container.frames_to_read = 2;
+			telecom_system->data_container.nUnder_processing_events = 0;
+		}
 		return false;
 	}
 
 	*out_p38 = rx_p38;
+	if(!owns_capture) return true;
+
 	// Flush the matched audio region — the next caller iteration must not
 	// re-detect this same frame. Mirror receive_hail_pattern at :4856-4863.
 	MUTEX_LOCK(&capture_prep_mutex);
@@ -18098,6 +18073,42 @@ static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
 	telecom_system->receive_stats.ofdm_batch_active = false;
 	MUTEX_UNLOCK(&capture_prep_mutex);
 	return true;
+}
+
+static bool receive_mfsk_ctrl_suffix_phy_core(cl_arq_controller* self,
+                                              cl_telecom_system* telecom_system,
+                                              mfsk_ctrl_frame_type expected_type,
+                                              uint64_t* out_p38,
+                                              const char* tag)
+{
+	int conn_nsymb = telecom_system->ack_mfsk.connect_pattern_nsymb;
+	int base_total_nsymb = telecom_system->ack_mfsk.connect_base_total_nsymb();
+	int suffix_nsymb = telecom_system->ack_mfsk.ctrl_suffix_len();
+	if(conn_nsymb <= 0 || suffix_nsymb <= 0) return false;
+	const int tail_nsymb = base_total_nsymb + suffix_nsymb + 16;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = tail_nsymb * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	int tail_offset = signal_period - tail_samples;
+
+	MUTEX_LOCK(&capture_prep_mutex);
+	if(telecom_system->data_container.frames_to_read != 0)
+	{
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		return false;
+	}
+	int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
+		tail_samples * sizeof(double));
+	telecom_system->data_container.data_ready = 0;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+
+	return decode_mfsk_ctrl_suffix_phy_core(self, telecom_system,
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		tail_samples, expected_type, out_p38, tag, true);
 }
 
 // RSP-side RX (Site B in §13.2): detect MFSK START_CONN, unpack callsign +
@@ -18182,6 +18193,29 @@ bool cl_arq_controller::receive_mfsk_test_conn_phy(uint8_t* out_snr_q,
 		*out_local_cap, *out_ssid);
 	fflush(stdout);
 	return true;
+}
+
+bool cl_arq_controller::receive_mfsk_test_conn_from_staged_phy(
+	uint8_t* out_snr_q, uint8_t* out_local_cap, uint8_t* out_ssid)
+{
+	if(!out_snr_q || !out_local_cap || !out_ssid) return false;
+	int conn_nsymb = telecom_system->ack_mfsk.connect_pattern_nsymb;
+	int base_total_nsymb = telecom_system->ack_mfsk.connect_base_total_nsymb();
+	int suffix_nsymb = telecom_system->ack_mfsk.ctrl_suffix_len();
+	if(conn_nsymb <= 0 || suffix_nsymb <= 0) return false;
+	int sym_samples = telecom_system->data_container.Nofdm
+	                * telecom_system->data_container.interpolation_rate;
+	int signal_period = sym_samples * telecom_system->data_container.buffer_Nsymb;
+	int tail_samples = (base_total_nsymb + suffix_nsymb + 16) * sym_samples;
+	if(tail_samples > signal_period) tail_samples = signal_period;
+	double* tail =
+		telecom_system->data_container.ready_to_process_passband_delayed_data
+		+ (signal_period - tail_samples);
+	uint64_t p38 = 0;
+	if(!decode_mfsk_ctrl_suffix_phy_core(this, telecom_system, tail, tail_samples,
+			MFSK_CTRL_TEST_CONN, &p38, "CONNECT-TEST-RETRY", false))
+		return false;
+	return unpack_test_conn_payload(p38, out_snr_q, out_local_cap, out_ssid);
 }
 
 // Test seams for the HAIL drain-failure regression. Production keeps the real

@@ -1223,6 +1223,12 @@ public:
   bool receive_mfsk_test_conn_phy(uint8_t* out_snr_q,
                                    uint8_t* out_local_cap,
                                    uint8_t* out_ssid);
+  // Decode a duplicate TEST_CONNECTION from the OFDM consumer's already-staged
+  // snapshot.  This never changes frames_to_read; the data receiver remains the
+  // sole owner of the shared capture countdown once the link is CONNECTED.
+  bool receive_mfsk_test_conn_from_staged_phy(uint8_t* out_snr_q,
+                                               uint8_t* out_local_cap,
+                                               uint8_t* out_ssid);
 
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
   int test_send_break_drain_failure(); // drain failure must free buffers and unkey PTT
@@ -2590,14 +2596,8 @@ public:
   // happens. One-shot, exits rc.
   int test_break_noprogress_teardown();
 
-  // CONNECT-REACK EXCISE regression (--test-connect-reack, also in master
-  // --test; connect-testack-handshake.md §9). Guards the removal of 8e62722e:
-  // drives a REAL OFDM-config RX in the CONNECTED pre-data RECEIVING window and
-  // asserts the SHARED frames_to_read the OFDM data path consumes is NOT pinned
-  // to 2 (PASS-AFTER), while a defeat arm (MERCURY_REACK_CLAMP_DEFEAT) that
-  // re-introduces the removed clamp DOES pin it to 2 (FAIL-BEFORE). The removed
-  // pre-data re-ACK clamped frames_to_read=2 across the first WB batch, starving
-  // OFDM data RX so the gearshift never climbed off config100. 0 PASS / 1 FAIL.
+  // Final-connect retry regression. Checks replay identity, retry timer epoch,
+  // replay bounds, first-data termination, and OFDM capture ownership.
   int test_connect_reack();
 
   // RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md). PURE predicate: the
@@ -5112,6 +5112,45 @@ public:
   // delivery commit (arq_responder.cc:101, beside nReceived_data++); RESET with
   // the other session flags.
   bool session_data_frame_received;
+
+  // The responder can commit locally before the commander receives the final
+  // connect ACK.  Retain exactly the ACK identity for this session so a decoded
+  // duplicate final request can be answered idempotently without renegotiating.
+  struct {
+    bool valid;
+    uint8_t echoed_cap;
+    uint8_t own_cap;
+    uint8_t ssid;
+    int replays;
+  } connect_ack_cache;
+
+  inline bool connect_reack_pre_data_window() const
+  {
+    return link_status == CONNECTED
+        && connection_status == RECEIVING
+        && batch_rx_frame_count == 0
+        && !session_data_frame_received
+        && messages_control.status == FREE
+        && connect_ack_cache.valid
+        && connect_ack_cache.replays < nResends
+        && !passive_monitor
+        && narrowband_enabled != YES;
+  }
+
+  inline bool connect_reack_duplicate_matches(uint8_t local_cap,
+                                               uint8_t ssid) const
+  {
+    return connect_ack_cache.valid
+        && local_cap == connect_ack_cache.echoed_cap
+        && ssid == (uint8_t)callsign_get_ssid(destination_call_sign);
+  }
+
+  inline bool connect_final_retry_reanchors(int code) const
+  {
+    return (link_status == CONNECTING || link_status == NEGOTIATING
+            || link_status == CONNECTION_ACCEPTED)
+        && code == TEST_CONNECTION;
+  }
 
   int gearshift_timeout;
   int connection_timeout;

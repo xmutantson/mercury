@@ -3688,12 +3688,8 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_kxdt;
                 failed += ARQ_kxdt.test_kx_data_tamper();
             }
-            // CONNECT-REACK EXCISE gate (connect-testack-handshake.md §9): the
-            // 8e62722e regression that dropped OFDM data delivery to 0 because the
-            // pre-data re-ACK pinned the shared frames_to_read=2 across the first
-            // WB batch (so the gearshift never climbed off config100). The re-ACK
-            // is REMOVED; this gate drives a REAL OFDM-config RX in the CONNECTED
-            // pre-data window and asserts frames_to_read is NOT pinned to 2.
+            // Final-connect retry gate: replay identity, retry epoch, replay
+            // bounds, and OFDM capture ownership.
             {
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
@@ -4509,9 +4505,8 @@ int main(int argc, char *argv[])
             int failed = ARQ_reride.test_switch_role_reride_race();
             return (failed == 0) ? 0 : 1;
         }
-        // --test-connect-reack : run ONLY the CONNECT-REACK EXCISE regression
-        // (8e62722e removed: the pre-data window must NOT pin frames_to_read=2)
-        // and exit. Fast + deterministic; see arq_responder.cc::test_connect_reack().
+        // --test-connect-reack : run only the final-connect retry contract
+        // regression and exit. Fast and deterministic.
         if (strcmp(argv[i], "--test-connect-reack") == 0) {
             cl_arq_controller ARQ_reack;
             int failed = ARQ_reack.test_connect_reack();

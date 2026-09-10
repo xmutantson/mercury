@@ -3982,6 +3982,17 @@ void cl_arq_controller::process_messages_tx_control()
 	{
 		if(--messages_control.nResends>0&&message_batch_counter_tx<control_batch_size)
 		{
+			// A final-connect retry is a new causal attempt, just like a
+			// START_CONNECTION retry.  Without this re-anchor, the fixed phase
+			// watchdog can expire while the retry's ACK is already on the wire.
+			if(connect_final_retry_reanchors((unsigned char)messages_control.data[0]))
+			{
+				connection_attempt_timer.reset();
+				connection_attempt_timer.start();
+				printf("[CONNECT-RETRY] final TEST_CONNECTION retry re-anchored phase watchdog\n");
+				fflush(stdout);
+			}
+
 			// Increment connection attempts counter if trying to connect
 			if((link_status==CONNECTING || link_status==NEGOTIATING || link_status==CONNECTION_ACCEPTED) &&
 			   messages_control.data[0]==START_CONNECTION)

@@ -130,24 +130,11 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	return success;
 }
 
-// CONNECT-REACK REMOVED (connect-testack-handshake.md §9, excise of 8e62722e).
-// The pre-data duplicate-TEST_CONNECTION re-ACK and its window-bounded ftr
-// arbiter (connect_reack_probe_window_open) clamped the SHARED PHY
-// frames_to_read=2 across the CONNECTED pre-data RECEIVING window, which spans
-// the first WB OFDM batch. With ftr pinned at 2 the OFDM data consumer
-// (this->receive()) could not stage a full data frame, so the FIRST WB batch
-// was never captured and the gearshift stayed stuck at config100 (never climbed
-// off ROBUST). The later window-bound (2*mtt+ptt) did not help: that window
-// still overlaps the first WB batch. Audit (data-flow-frames-to-read §pre-data):
-// the dispatcher/commander connect handshake completes entirely via the LDPC
-// control path (TEST_CONNECTION_ACK queued at process_control_responder, Site C
-// TX) with ZERO references to the re-ACK; the heal restored nothing the
-// handshake needed. Legacy gearshift (the default) reached and HELD CONFIG_16 on
-// HW before 8e62722e. Excised: the arbiter helper, the pre-data re-ACK + ftr
-// hand-back block (process_messages_rx_data_control), the connect_ack_cache
-// populate (process_control_responder), the predicate/state in arq.h, and the
-// session inits in arq_common.cc. frames_to_read is now owned in the pre-data
-// window by the RECEIVING-entry set (frame_symb+10) the OFDM data path needs.
+// A prior duplicate-TEST_CONNECTION repair polled before the OFDM consumer and
+// repeatedly clamped the shared frames_to_read countdown to 2, starving the
+// first data batch.  The current replay path is deliberately after receive():
+// it inspects only the already-staged failed OFDM snapshot and never changes the
+// capture countdown while probing.
 
 
 // SACK Design A Step 8a -- match-prev store (the REFILL), factored out of
@@ -530,9 +517,8 @@ void cl_arq_controller::process_messages_rx_data_control()
 		// preamble_nSymb + Nsymb. Hardware bug 2026-05-27: with CONNECTED
 		// in the gate, RSP reached "Connected to TESTA" but zero
 		// [RX-TIMING] events ever fired. Same shape as eec768e's Site B
-		// narrowing. Lost TEST_CONN_ACK retransmits are handled by the
-		// legacy connection_timeout watchdog tearing the session back to
-		// LISTENING.
+		// narrowing. A lost TEST_CONN_ACK is handled after the OFDM consumer
+		// stages and rejects the duplicate request, without taking capture ownership.
 		//
 		// Other gates (messages_control.status == FREE, !passive_monitor,
 		// connect_pattern_nsymb > 0, messages_rx_buffer.status != RECEIVED)
@@ -619,15 +605,43 @@ void cl_arq_controller::process_messages_rx_data_control()
 			}
 		}
 
-		// CONNECT-REACK pre-data re-ACK REMOVED (excise of 8e62722e,
-		// connect-testack-handshake.md §9). The block here clamped the shared
-		// frames_to_read=2 across the CONNECTED pre-data window (which spans the
-		// first WB OFDM batch), starving the OFDM data consumer below
-		// (this->receive()) so the first WB batch was never captured and the
-		// gearshift never climbed off config100. Once CONNECTED, frames_to_read is
-		// owned by the RECEIVING-entry set (frame_symb+10, see :1913) that the OFDM
-		// data path needs; nothing pins it to 2 in the pre-data window anymore.
 		this->receive();
+
+		// The responder commits CONNECTED before the commander can acknowledge
+		// receipt of TEST_CONNECTION_ACK.  If that one ACK is lost, the commander
+		// repeats TEST_CONNECTION, but Site F above is no longer active.  Inspect
+		// only an OFDM window the data owner has already staged and failed; this
+		// adds no capture countdown writes and cannot starve the first data batch.
+		if(connect_reack_pre_data_window()
+		   && rx_fresh_window_decoded_this_pass
+		   && messages_rx_buffer.status != RECEIVED
+		   && telecom_system->ack_mfsk.connect_pattern_nsymb > 0)
+		{
+			uint8_t rx_snr_q = 0, rx_local_cap = 0, rx_ssid = 0;
+			if(receive_mfsk_test_conn_from_staged_phy(
+					&rx_snr_q, &rx_local_cap, &rx_ssid)
+			   && connect_reack_duplicate_matches(rx_local_cap, rx_ssid))
+			{
+				long long elapsed = send_mfsk_test_ack_phy(
+					connect_ack_cache.echoed_cap,
+					connect_ack_cache.own_cap,
+					connect_ack_cache.ssid);
+				connect_ack_cache.replays++;
+				printf("[CONNECT-REACK] duplicate TEST_CONNECTION -> cached TEST_ACK "
+					"(%lld ms), replay=%d/%d\n", elapsed,
+					connect_ack_cache.replays, nResends);
+				fflush(stdout);
+
+				// The ACK transmitter leaves its short MFSK capture countdown in
+				// place.  Hand ownership straight back to the OFDM data receiver.
+				MUTEX_LOCK(&capture_prep_mutex);
+				telecom_system->data_container.frames_to_read =
+					telecom_system->data_container.preamble_nSymb
+					+ telecom_system->data_container.Nsymb + 10;
+				telecom_system->data_container.nUnder_processing_events = 0;
+				MUTEX_UNLOCK(&capture_prep_mutex);
+			}
+		}
 
 		// A short final group is closed by an authenticated/session-bound
 		// BLOCK_COMMIT. The RX dispatcher has already validated it before any
@@ -4073,10 +4087,11 @@ void cl_arq_controller::process_control_responder()
 				(unsigned char)local_capability,
 				(unsigned char)messages_control.data[3]);
 			fflush(stdout);
-			// CONNECT-REACK cache populate REMOVED (excise of 8e62722e,
-			// connect-testack-handshake.md §9). The handshake ACK is built and
-			// queued above (messages_control TEST_CONNECTION_ACK -> Site C TX);
-			// the connect path no longer caches a triple for a pre-data re-ACK.
+			connect_ack_cache.valid = true;
+			connect_ack_cache.echoed_cap = (uint8_t)peer_capability;
+			connect_ack_cache.own_cap = (uint8_t)local_capability;
+			connect_ack_cache.ssid = (uint8_t)callsign_get_ssid(my_call_sign);
+			connect_ack_cache.replays = 0;
 		}
 		watchdog_timer.start();
 		link_timer.start();
@@ -12103,39 +12118,9 @@ int cl_arq_controller::test_inband_ring_floor_overseat()
 	return failed == 0 ? 0 : 1;
 }
 
-// ============================================================================
-// CONNECT-REACK EXCISE regression (connect-testack-handshake.md §9)
-// ============================================================================
-//
-// CLI: --test-connect-reack   (also wired into master --test).
-//
-// GUARDS THE EXCISE OF 8e62722e. The removed CONNECT-REACK pre-data re-ACK
-// clamped the SHARED PHY frames_to_read=2 across the CONNECTED pre-data
-// RECEIVING window (the original block on EVERY tick; the later 2*mtt+ptt
-// window-bound still overlapped the first WB OFDM batch). With ftr pinned at 2
-// the OFDM data consumer (this->receive()) could not stage a full data frame,
-// so the FIRST WB batch was never captured and the gearshift stayed stuck at
-// config100 (never climbed off ROBUST). The fix is REMOVAL: in the pre-data
-// window the responder no longer touches frames_to_read — it is owned by the
-// RECEIVING-entry set (frame_symb+10, arq_responder.cc:1913) the OFDM data path
-// needs.
-//
-// This drives a REAL RX (live telecom_system + data_container) in the CONNECTED
-// pre-data RECEIVING state and asserts the cross-layer invariant directly on the
-// SHARED frames_to_read the OFDM data path consumes:
-//
-//   C0 setup: a real OFDM-config RX, CONNECTED + RECEIVING + pre-data
-//      (batch_rx_frame_count==0), frames_to_read seeded to the data value
-//      (frame_symb+10) exactly as the RECEIVING entry sets it.
-//   C1 PASS-AFTER (production binary): after the pre-data control path runs, the
-//      shared frames_to_read is NOT pinned to 2 — it still holds the OFDM data
-//      value, so the first WB batch is capturable (the climb is unblocked).
-//   C2 FAIL-BEFORE (MERCURY_REACK_CLAMP_DEFEAT=1, SAME binary): re-introduce the
-//      8e62722e clamp (ftr=2 in the pre-data window). frames_to_read drops to 2
-//      — the exact starvation the excise removes — proving this test catches a
-//      regression of the removed clamp.
-//
-// Returns 0=PASS, 1=FAIL. Default builds never call this.
+// Final-connect retry contract regression.  The end-to-end simulation erases
+// one TEST_CONNECTION_ACK; this unit keeps the state, identity, retry-epoch,
+// and capture-ownership invariants cheap enough for the master test suite.
 int cl_arq_controller::test_connect_reack()
 {
 	int failed = 0;
@@ -12145,60 +12130,62 @@ int cl_arq_controller::test_connect_reack()
 		if(!cond) failed++;
 	};
 
-	auto run_arm = [&](bool defeat) -> int {
-		// --- C0: real OFDM-config RX in the CONNECTED pre-data window --------
-		cl_telecom_system* ts = new cl_telecom_system();
-		cl_arq_controller* rx = new cl_arq_controller();
-		ts->operation_mode     = ARQ_MODE;
-		ts->narrowband_enabled = NO;
-		rx->telecom_system     = ts;
-		rx->narrowband_enabled = NO;
-		rx->role               = RESPONDER;
-		rx->robust_enabled     = YES;
-		rx->load_configuration(CONFIG_1, FULL, NO);   // an OFDM rung
-		rx->link_status        = CONNECTED;
-		rx->connection_status  = RECEIVING;
-		rx->passive_monitor    = false;
-		rx->batch_rx_frame_count = 0;                 // PRE-DATA: no frame yet
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.narrowband_enabled = NO;
+	telecom_system = &ts;
+	narrowband_enabled = NO;
+	role = RESPONDER;
+	robust_enabled = YES;
+	load_configuration(CONFIG_1, FULL, NO);
+	link_status = CONNECTED;
+	connection_status = RECEIVING;
+	passive_monitor = false;
+	batch_rx_frame_count = 0;
+	messages_control.status = FREE;
+	nResends = 3;
+	destination_call_sign = "TESTA";
+	connect_ack_cache.valid = true;
+	connect_ack_cache.echoed_cap = 0x1d;
+	connect_ack_cache.own_cap = 0x1d;
+	connect_ack_cache.ssid = SSID_NONE;
+	connect_ack_cache.replays = 0;
 
-		// The data-RX ftr the RECEIVING entry sets (arq_responder.cc:1913) and the
-		// OFDM data consumer (this->receive()) needs to stage a full data frame.
-		int frame_symb = ts->data_container.preamble_nSymb
-		               + ts->data_container.Nsymb;
-		int data_ftr   = frame_symb + 10;
-		ts->data_container.frames_to_read = data_ftr;
+	bool old_site_f = (link_status == CONNECTION_RECEIVED);
+	CHECK("C1 old Site-F gate cannot receive a CONNECTED duplicate", !old_site_f);
+	CHECK("C2 cached pre-data replay window is open", connect_reack_pre_data_window());
+	CHECK("C3 exact peer identity is accepted",
+		connect_reack_duplicate_matches(0x1d, SSID_NONE));
+	CHECK("C4 changed capability is rejected",
+		!connect_reack_duplicate_matches(0x0d, SSID_NONE));
 
-		// --- The pre-data window's frames_to_read OWNERSHIP --------------------
-		// PRODUCTION (excise present): nothing in the pre-data window touches
-		// frames_to_read — the OFDM data path owns it. We model that no-op here.
-		// DEFEAT (MERCURY_REACK_CLAMP_DEFEAT=1): re-introduce the EXACT removed
-		// 8e62722e clamp to prove this test fails-before.
-		if(defeat)
-		{
-			if(ts->data_container.frames_to_read > 2)
-			{
-				MUTEX_LOCK(&capture_prep_mutex);
-				ts->data_container.frames_to_read = 2;   // the removed clamp
-				MUTEX_UNLOCK(&capture_prep_mutex);
-			}
-		}
+	int frame_symb = ts.data_container.preamble_nSymb
+	               + ts.data_container.Nsymb;
+	int data_ftr = frame_symb + 10;
+	ts.data_container.frames_to_read = data_ftr;
+	(void)connect_reack_pre_data_window();
+	CHECK("C5 replay eligibility does not take capture ownership",
+		ts.data_container.frames_to_read == data_ftr);
 
-		int ftr_after = (int)ts->data_container.frames_to_read.load();
-		delete rx; delete ts;
-		return ftr_after;
-	};
+	link_status = CONNECTION_ACCEPTED;
+	CHECK("C6 TEST_CONNECTION retry starts a fresh phase epoch",
+		connect_final_retry_reanchors(TEST_CONNECTION));
+	CHECK("C7 unrelated controls do not move the connect deadline",
+		!connect_final_retry_reanchors(START_CONNECTION));
+	link_status = CONNECTED;
+	batch_rx_frame_count = 1;
+	session_data_frame_received = true;
+	CHECK("C8 first data frame permanently closes the replay window",
+		!connect_reack_pre_data_window());
+	batch_rx_frame_count = 0;
+	CHECK("C8b later batch reset cannot reopen the replay window",
+		!connect_reack_pre_data_window());
+	session_data_frame_received = false;
+	connect_ack_cache.replays = nResends;
+	CHECK("C9 replay budget bounds an unconfirmed peer",
+		!connect_reack_pre_data_window());
 
-	// --- C1 PASS-AFTER: production pre-data path does NOT pin ftr=2 ----------
-	int ftr_prod = run_arm(/*defeat=*/false);
-	CHECK("C1 PASS-AFTER: CONNECTED pre-data window leaves shared frames_to_read "
-	      "at the OFDM data value (>2) -> first WB batch capturable (climb unblocked)",
-	      ftr_prod > 2);
-
-	// --- C2 FAIL-BEFORE: the removed clamp pins ftr=2 (starvation) -----------
-	int ftr_defeat = run_arm(/*defeat=*/true);
-	CHECK("C2 FAIL-BEFORE: the removed 8e62722e clamp pins frames_to_read=2 "
-	      "(the OFDM data-RX starvation the excise removes)",
-	      ftr_defeat == 2);
+	telecom_system = NULL;
 
 	printf("[TEST-REACK] %s (%d failures)\n",
 	       failed == 0 ? "ALL PASS" : "FAILED", failed);
