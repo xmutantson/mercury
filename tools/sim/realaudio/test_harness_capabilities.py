@@ -130,20 +130,20 @@ class CertDriverArgparseIntegrationTest(unittest.TestCase):
 
 
 class GoldenNoFlagIdentityTest(unittest.TestCase):
-    def test_legacy_defaults_and_child_argv_are_unchanged(self):
+    def test_default_child_argv_uses_native_tune(self):
         args = spawner.build_arg_parser().parse_args(["--n", "1"])
         cell = spawner.run_plan(1, args.port_base)[0]
         actual = spawner.build_cell_command(args, cell, "/tmp/res.json")
         expected = [
             sys.executable, "-u", spawner.HARNESS,
             "--bin", "/home/kameron/raspeed/mercury",
-            "--bridge", os.path.join(str(HERE), "realaudio_bridge_s32.py"),
+            "--bridge", spawner.default_bridge_path(),
             "--tag", "par00", "--json", "/tmp/res.json",
             "--logdir", "/tmp/raspeed/logs", "--start-cfg", "100",
             "--secs", "130", "--payload", "512", "--seed", "1",
             "--card", "Loopback", "--subs", "0,1,2,3",
             "--rsp-port", "7100", "--cmd-port", "7104",
-            "--cap-periods", "3", "--play-periods", "4",
+            "--cap-periods", "4", "--play-periods", "5",
             "--prime-periods", "2", "--no-kill",
             "--profile", "wgn", "--arm", "legacy",
         ]

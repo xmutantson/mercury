@@ -50,12 +50,16 @@ import time
 import types
 
 import numpy as np
-import alsaaudio
+try:
+    import alsaaudio
+except ImportError:
+    alsaaudio = None
 
 # Channel DSP lives in the parent tools/sim/ package. Add it to sys.path so the
 # bridge can be run from anywhere and still import the canonical relay verbatim.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PARENT_SIM = os.path.dirname(_HERE)               # tools/sim
+_NATIVE_BRIDGE = os.path.join(_HERE, "realaudio_bridge_s32_c")
 sys.path.insert(0, _PARENT_SIM)
 sys.path.insert(0, _HERE)
 from sim_channel_relay import Channel, PROFILES, ionos_wgn_to_snr3k  # noqa: E402
@@ -185,6 +189,12 @@ def pump(name, cap_dev, play_dev, ch, stop, stats, passthrough,
 
 
 def main():
+    if (os.path.isfile(_NATIVE_BRIDGE)
+            and os.environ.get("MERCURY_ALLOW_PY_BRIDGE") != "1"):
+        sys.stderr.write(
+            "[bridge_s32] native bridge is present; refusing superseded "
+            "Python bridge (set MERCURY_ALLOW_PY_BRIDGE=1 to override)\n")
+        raise SystemExit(2)
     ap = argparse.ArgumentParser()
     ap.add_argument("--fwd-cap", default="hw:Loopback,1,0")
     ap.add_argument("--fwd-play", default="hw:Loopback,0,1")
@@ -225,6 +235,8 @@ def main():
     ap.add_argument("--prime-periods", type=int, default=2)
     ap.add_argument("--statsfile", default=None)
     a = ap.parse_args()
+    if alsaaudio is None:
+        ap.error("alsaaudio is required for the live Python bridge")
     bandwidth = (a.configured_bandwidth_hz
                  if a.configured_bandwidth_hz is not None
                  else infer_bandwidth(None, a.band_family))
