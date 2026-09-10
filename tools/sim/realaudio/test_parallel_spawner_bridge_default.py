@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for native-first real-audio bridge selection."""
 import io
+from contextlib import redirect_stderr
 from pathlib import Path
 import sys
 import tempfile
@@ -47,6 +48,42 @@ class BridgeDefaultSelectionTest(unittest.TestCase):
             self.assertEqual(
                 arq.bridge_command_prefix(str(native)),
                 ["sudo", "-n", "/usr/bin/nice", "-n", "-5", str(native)])
+
+    def test_python_invocation_uses_interpreter_even_when_not_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Path(directory) / "bridge.py"
+            bridge.write_text("print('bridge')\n", encoding="utf-8")
+
+            self.assertEqual(
+                arq.bridge_command_prefix(str(bridge)),
+                [sys.executable, str(bridge)])
+
+    def test_elf_magic_selects_native_without_execute_bit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Path(directory) / "bridge-native"
+            bridge.write_bytes(b"\x7fELF" + b"test fixture")
+            bridge.chmod(0o644)
+
+            self.assertEqual(
+                arq.bridge_command_prefix(str(bridge)), [str(bridge)])
+
+    def test_unknown_non_executable_type_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Path(directory) / "bridge.txt"
+            bridge.write_text("not a bridge\n", encoding="utf-8")
+            bridge.chmod(0o644)
+
+            with self.assertRaisesRegex(
+                    arq.BridgeCommandError,
+                    r"invalid --bridge .*unsupported bridge type.*\.py.*ELF"):
+                arq.bridge_command_prefix(str(bridge))
+
+            diagnostic = io.StringIO()
+            with redirect_stderr(diagnostic), self.assertRaises(SystemExit) as raised:
+                arq.main(["--bridge", str(bridge)])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("invalid --bridge", diagnostic.getvalue())
+            self.assertIn("unsupported bridge type", diagnostic.getvalue())
 
 
 if __name__ == "__main__":
