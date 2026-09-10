@@ -2976,6 +2976,10 @@ int main(int argc, char *argv[])
             cl_arq_controller test_audio;
             return test_audio.test_capture_prep_geometry_change();
         }
+        if (strcmp(argv[i], "--test-snr-decision-grid") == 0) {
+            int failed = run_snr_decision_grid_selftest();
+            return (failed == 0) ? 0 : 1;
+        }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             // Pin the process-global C RNG to a fixed, platform-independent
@@ -2985,6 +2989,7 @@ int main(int argc, char *argv[])
             // any RNG consumption from earlier static initialization.
             srand(1u);
             int failed = run_mfsk_ctrl_codec_tests();
+            failed += run_snr_decision_grid_selftest();
             if (getenv("MERCURY_CAP_CODEC_ONLY") != NULL)
                 return failed == 0 ? 0 : 1;
             // Compression reassembly bounds: a valid stamp-carrying 96-frame batch

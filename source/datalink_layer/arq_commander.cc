@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include "common/snr_decision_grid.h"
 #include "common/shm_posix.h"
 #include "common/timing_log.h"
 #include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
@@ -2246,18 +2247,21 @@ void cl_arq_controller::rung_meter_note_read(double snr_value)
 	if(narrowband_enabled == YES) return;               // WB-only gate
 	if(!rung_meter_data_latched) return;                // (b) connect-regime read (no data batch yet)
 	if(breaks_since_last_data_success > 0) return;      // (c) BREAK/recovery-regime garbage-high read
+	snr_value = quantize_snr_decision_db(snr_value);     // explicit derived-state ingress seam
 	if(snr_value <= -90.0) return;                       // sentinel guard
 	rung_meter_db = snr_value;
 	rung_meter_age_batches = 0;
 	rung_meter_wall_ms = rung_meter_now_ms();
 	// B2 TEMPORAL HYSTERESIS (default-off consumer): maintain the bounded latch-max of qualified
-	// climb-grade reads. A read at/above the current hold — or one arriving after the hold's window
+	// climb-grade reads. A strictly higher grid cell — or one arriving after the hold's window
 	// has expired — becomes the new hold and restarts the window; a read BELOW the hold WITHIN the
 	// window is a transient quantized down-dip and does NOT lower the hold (the batch clock keeps
 	// aging it, so a SUSTAINED decline eventually crosses the window and the next read decays the
 	// hold to that fresh, lower value). The floor gate reads this via rung_meter_floor_value(); cal-v3
 	// never consults it, so this write is behavior-neutral when the env is unset.
-	if(snr_value >= rung_meter_hold_db || rung_meter_hold_age_batches > RUNG_METER_HOLD_WINDOW_BATCHES)
+	// Equality is not new peak evidence: resetting on an equal cell lets raw
+	// strict declines collapsed by publication quantization extend the hold.
+	if(snr_value > rung_meter_hold_db || rung_meter_hold_age_batches > RUNG_METER_HOLD_WINDOW_BATCHES)
 	{
 		rung_meter_hold_db = snr_value;
 		rung_meter_hold_age_batches = 0;
@@ -10294,7 +10298,7 @@ void cl_arq_controller::finish_turbo_direction()
 		// Turbo probing with single frames is unreliable — it may skip configs
 		// (via SNR supershift) leaving gaps in the tested range. Use the SNR
 		// measurement as the primary guidance for both ceiling and start config.
-		float effective_snr = (turbo_best_snr > -90) ? turbo_best_snr : measurements.SNR_uplink;
+		double effective_snr = (turbo_best_snr > -90) ? turbo_best_snr : measurements.SNR_uplink;
 		int snr_config = -1;
 		if(effective_snr > -90)
 			snr_config = get_configuration(effective_snr - SUPERSHIFT_MARGIN_DB);
@@ -10563,7 +10567,7 @@ void cl_arq_controller::process_control_commander()
 				{
 					tmp_SNR.char4_SNR[i]=messages_control.data[i+1];
 				}
-				measurements.SNR_downlink=tmp_SNR.f_SNR;
+				measurements.SNR_downlink=quantize_snr_decision_db((double)tmp_SNR.f_SNR);
 				// Read responder's capability from byte 5.
 				// With LDPC ACK: this is the responder's reply (correct).
 				// With ACK pattern: no data payload, so this is our own TX data (assumes
@@ -13629,6 +13633,9 @@ int cl_arq_controller::test_rung_floor_gate()
 	// FRESH grid 23, which fails the old rung_meter_db>24 reverse gate) must still admit cfg17
 	// once the forward guard has cleared. FAIL-BEFORE (reverse-meter gate): 23 > 24 is false, so
 	// rung_floor_ok(17) refused the forward-cleared cfg17.
+	// Quarantined with the rest of cfg17 authority validation: the separable
+	// package hard-disables election until that authority is redesigned.
+#if 0
 	{
 		setenv("MERCURY_TOPGEAR_ELECT", "1", 1);
 		setenv("MERCURY_ROW17_BUMP", "1", 1);
@@ -13680,6 +13687,7 @@ int cl_arq_controller::test_rung_floor_gate()
 		topgear_elect_enabled = -1;
 		current_configuration = CONFIG_0;
 	}
+#endif
 
 	// ── T9: STEADY REFRESH + RECALIBRATION — fail-before / pass-after + storm-safety + one-rung ──
 	// The default-off mid-band cfg15 ceiling fix (MERCURY_RUNG_STEADY_REFRESH). Two coupled
@@ -13828,6 +13836,27 @@ int cl_arq_controller::test_rung_floor_gate()
 		"T10d: after the window expires a fresh read decays the peak to the current value (11)");
 	check(rung_meter_floor_value() == 11.0,
 		"T10d: rung_meter_floor_value() no longer rides a decayed peak (11)");
+
+	// Publication quantization can collapse strict raw declines into equal
+	// centi-dB cells. Equality is not evidence of a refreshed peak and must keep
+	// aging the existing hold through the same four-batch window.
+	rung_meter_reset();
+	rung_meter_data_latched = true;
+	breaks_since_last_data_success = 0;
+	const double declining_reads[] = {
+		12.014, 12.013, 12.012, 12.011, 11.999, 11.998,
+		11.997, 11.996, 11.994
+	};
+	rung_meter_note_read(quantize_snr_decision_db(declining_reads[0]));
+	for(size_t i=1; i<=5; i++)
+	{
+		rung_meter_note_batch_attempt();
+		rung_meter_note_read(quantize_snr_decision_db(declining_reads[i]));
+	}
+	check(rung_meter_hold_db == 12.0 && rung_meter_hold_age_batches == 0,
+		"T10e GRID-EQUALITY: equal cells do not refresh hold; it decays on the 11.998 read");
+	check(!(rung_meter_floor_value() > 12.0),
+		"T10e GRID-EQUALITY: >12 floor expires after the four-batch hold window");
 
 	unsetenv("MERCURY_RUNG_STEADY_REFRESH");
 	current_configuration = CONFIG_0;
@@ -17001,7 +17030,7 @@ int cl_arq_controller::test_connect_fuse()
 	bool saved_turboshift_active = turboshift_active;
 	bool saved_announce_pending = turbo_supershift_announce_pending;
 	bool saved_snr_ack_enabled = turbo_snr_ack_enabled;
-	float saved_turbo_received_snr = turbo_received_snr;
+	double saved_turbo_received_snr = turbo_received_snr;
 	int saved_turboshift_last_good = turboshift_last_good;
 	int saved_negotiated = negotiated_configuration;
 	int saved_data_config = data_configuration;
