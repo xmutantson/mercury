@@ -93,12 +93,31 @@ TRAFFIC_RANDOM_BINARY = "random-binary"
 TRAFFIC_CHOICES = (TRAFFIC_LEGACY, TRAFFIC_RANDOM_BINARY)
 _LEGACY_CHUNK = bytes(range(256)) * 8
 _RANDOM_BINARY_KEY = b"mercury-capstone-incompressible-v1"
+_ELF_MAGIC = b"\x7fELF"
+
+
+class BridgeCommandError(ValueError):
+    """Raised when --bridge does not identify a supported bridge program."""
 
 
 def bridge_command_prefix(bridge_path):
-    """Return the interpreter/scheduler argv for a configured bridge path."""
-    if bridge_path.endswith(".py") or not os.access(bridge_path, os.X_OK):
+    """Return a fail-closed interpreter/scheduler argv for ``bridge_path``."""
+    if not os.path.isfile(bridge_path):
+        raise BridgeCommandError(
+            f"invalid --bridge {bridge_path!r}: expected a regular file")
+    if bridge_path.endswith(".py"):
         return [sys.executable, bridge_path]
+    try:
+        with open(bridge_path, "rb") as stream:
+            is_elf = stream.read(len(_ELF_MAGIC)) == _ELF_MAGIC
+    except OSError as exc:
+        raise BridgeCommandError(
+            f"invalid --bridge {bridge_path!r}: cannot read file: {exc}") from exc
+    if not is_elf and not os.access(bridge_path, os.X_OK):
+        raise BridgeCommandError(
+            f"invalid --bridge {bridge_path!r}: unsupported bridge type; "
+            "expected a .py script, an ELF binary, or an executable "
+            "without a .py suffix")
     if os.path.basename(bridge_path) == "realaudio_bridge_s32_c":
         return ["sudo", "-n", "/usr/bin/nice", "-n", "-5", bridge_path]
     return [bridge_path]
@@ -628,6 +647,10 @@ def main(argv=None):
         ap.error("--score-horizon-s must be positive")
     if args.warm_timeout <= 0:
         ap.error("--warm-timeout must be positive")
+    try:
+        bridge_prefix = bridge_command_prefix(args.bridge)
+    except BridgeCommandError as exc:
+        ap.error(str(exc))
 
     configured_bandwidth_hz = (
         args.configured_bandwidth_hz
@@ -782,10 +805,9 @@ def main(argv=None):
 
     try:
         # 1. bridge first (opens the 4 loopback subdevices for THIS run).
-        # A .py/non-executable bridge retains the Python fallback. Native
-        # bridges execute directly; the imported bridge's proven fleet tune is
-        # SCHED_OTHER nice -5 (the ring depths are supplied below).
-        bridge_prefix = bridge_command_prefix(args.bridge)
+        # A .py bridge retains the Python interpreter. ELF binaries and other
+        # executable non-.py bridges execute directly; the imported bridge's
+        # proven fleet tune is SCHED_OTHER nice -5 (the ring depths are below).
         bcmd = bridge_prefix + [
                 "--fwd-cap", fwd_cap, "--fwd-play", fwd_play,
                 "--rev-cap", rev_cap, "--rev-play", rev_play,
