@@ -25,6 +25,7 @@
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
+#include "common/snr_decision_grid.h"
 #include "physical_layer/dist_matcher.h" // PAS/PCS distribution matcher (lever #2, feat/pcs)
 #include "physical_layer/ldpc_decode_pool.h" // LEVER C: multi-core big-block decode pool (feat/decode-marathon)
 #include <thread> // LEVER C: std::thread::hardware_concurrency() for the pool clamp
@@ -4743,6 +4744,10 @@ skip_h_retry_point:
 
 				}
 
+				// Accepted-frame SNR enters the modem's defined decision domain here.
+				// Publish only the nearest centi-dB cell so ARQ policy, reports, GUI,
+				// and logs all make decisions from the same control-plane value.
+				receive_stats.SNR = quantize_snr_decision_db(receive_stats.SNR);
 				receive_stats.message_decoded=YES;
 				if(tinterp_rescue_in_flight)
 					receive_stats.tinterp_rescue_succeeded = true;
@@ -14773,6 +14778,99 @@ int cl_telecom_system::get_configuration(double SNR)
 		configuration=CONFIG_0;
 
 	return configuration;
+}
+
+int run_snr_decision_grid_selftest()
+{
+	int fails = 0;
+	int threshold_cases = 0;
+	auto check = [&](bool condition, const char* what) {
+		if(!condition)
+		{
+			fails++;
+			printf("[TEST-SNR-GRID] FAIL: %s\n", what);
+		}
+	};
+	auto aligned = [](double value) {
+		return std::isfinite(value)
+			&& std::fabs(value * 100.0 - std::round(value * 100.0)) < 1e-9;
+	};
+	auto strict_pair = [&](const char* consumer, double threshold) {
+		const double epsilon = 1e-12;
+		const double below = threshold - epsilon;
+		const double above = threshold + epsilon;
+		char msg[192];
+		snprintf(msg, sizeof(msg), "%s threshold is centi-dB aligned", consumer);
+		check(aligned(threshold), msg);
+		snprintf(msg, sizeof(msg), "%s raw perturbation straddles strict threshold", consumer);
+		check((below > threshold) != (above > threshold), msg);
+		snprintf(msg, sizeof(msg), "%s quantized perturbation has one decision", consumer);
+		check((quantize_snr_decision_db(below) > threshold)
+			== (quantize_snr_decision_db(above) > threshold), msg);
+		threshold_cases++;
+	};
+
+	// Complete strict-threshold inventory from the accepted-SNR consumer audit.
+	const double gear[] = {-9, -8, -7, -6, -5, -4, -3, -2, 0, 1, 3, 4, 6, 9, 11, 13};
+	for(double threshold : gear) strict_pair("gear-map", threshold);
+	strict_pair("sentinel-validity", -90.0);
+	strict_pair("cfg16-margin", CFG16_MIN_SNR_DB);
+
+	const double rung_floor[] = {10, 12, 14, 16, 22, 24};
+	const double rung_bump[] = {0, RUNG_FLOOR_BUMP_STEP_DB, 2 * RUNG_FLOOR_BUMP_STEP_DB,
+		3 * RUNG_FLOOR_BUMP_STEP_DB, RUNG_FLOOR_BUMP_MAX_DB};
+	for(double floor_db : rung_floor)
+		for(double bump_db : rung_bump)
+			strict_pair("rung-floor-derived", floor_db + bump_db);
+
+	for(double threshold : gear)
+		strict_pair("elevator-margin-derived", threshold + SUPERSHIFT_MARGIN_DB);
+	for(double threshold : gear)
+		strict_pair("connect-seed-margin-derived", threshold + CONNECT_SEED_MARGIN_DB);
+	strict_pair("topgear-margin-derived", 13.0 + TOPGEAR_ELECT_MARGIN_DB);
+	strict_pair("topgear-floor", 24.0);
+	strict_pair("turbo-best/config", 13.0 + SUPERSHIFT_MARGIN_DB);
+
+	// The report/tone encoders change bins only at odd integer-dB boundaries.
+	for(int q = 0; q <= 15; q++)
+		strict_pair("topgear/turbo-2dB-bin", -5.0 + 2.0 * q);
+
+	check(quantize_snr_decision_db(0.004999999999) == 0.0,
+		"positive value below half-centi rounds to zero");
+	check(quantize_snr_decision_db(0.005) == 0.01,
+		"positive half-centi rounds away from zero");
+	check(quantize_snr_decision_db(0.005000000001) == 0.01,
+		"positive value above half-centi rounds up");
+	check(quantize_snr_decision_db(-0.004999999999) == 0.0,
+		"negative value above half-centi rounds to zero");
+	check(quantize_snr_decision_db(-0.005) == -0.01,
+		"negative half-centi rounds away from zero");
+	check(quantize_snr_decision_db(-0.005000000001) == -0.01,
+		"negative value below half-centi rounds down");
+	check(quantize_snr_decision_db(-99.9) == -99.9,
+		"unmeasured sentinel is preserved");
+	check(std::isnan(quantize_snr_decision_db(NAN)), "NaN is preserved");
+	check(quantize_snr_decision_db(INFINITY) == INFINITY, "infinity is preserved");
+
+	// Derived seams: integer margins and half-dB bump accumulation remain on
+	// the grid; max/hold selects an existing cell rather than creating a value.
+	const double cell = quantize_snr_decision_db(13.371);
+	check(aligned(cell - SUPERSHIFT_MARGIN_DB), "elevator margin preserves grid");
+	check(aligned(cell - CONNECT_SEED_MARGIN_DB), "connect margin preserves grid");
+	check(aligned(12.0 + 3 * RUNG_FLOOR_BUMP_STEP_DB), "rung bump sum preserves grid");
+	const double held = std::max(quantize_snr_decision_db(12.999999999999),
+		quantize_snr_decision_db(13.000000000001));
+	check(held == 13.0 && aligned(held), "held maximum preserves grid cell");
+
+	// A float32 legacy-wire round trip is normalized again at decode ingress.
+	const double wire_source = quantize_snr_decision_db(13.371);
+	const double wire_decode = quantize_snr_decision_db((double)(float)wire_source);
+	check(wire_decode == wire_source, "legacy float32 decode returns to source grid cell");
+
+	printf("[TEST-SNR-GRID] %s: %d strict cases, %d failure%s\n",
+		fails == 0 ? "PASS" : "FAILED", threshold_cases, fails, fails == 1 ? "" : "s");
+	fflush(stdout);
+	return fails;
 }
 
 // Per-instance RNG routing (single-process-sim-refactor.md §10.1). When

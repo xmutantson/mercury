@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include "common/snr_decision_grid.h"
 #include "datalink_layer/l1_block_codec.h"
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
@@ -3986,22 +3987,14 @@ bool cl_arq_controller::inband_a3_decouple_enabled()
 
 // ── Top-gear (CONFIG_17, 64-QAM) channel-clean gearshift election ─────────────────────────
 // (topgear-stack-productionize.md; mirrors big-block clean-election 931a0c73.) These four
-// methods are ALL no-ops (early-return / identity) unless MERCURY_TOPGEAR_ELECT is set, so a
-// default-off build is byte-identical: cfg17 never elects, the WB ceiling stays CONFIG_16.
+// methods are all unreachable through election while the authority redesign is pending:
+// cfg17 never elects and the WB ceiling stays CONFIG_16.
 
-// Resolve + cache the MERCURY_TOPGEAR_ELECT env opt-in. Default off => the election never arms.
+// cfg17 election is intentionally unavailable until its session authority is
+// redesigned. No environment setting may arm this path in the separable build.
 bool cl_arq_controller::topgear_elect_feature_enabled()
 {
-	// Broad same-binary fail-before: restore the pre-port state in which cfg17
-	// cannot be elected, without rebuilding or disturbing the default-off path.
-	const char* defeat = std::getenv("MERCURY_TOPGEAR_PORT_DEFEAT");
-	if(defeat && *defeat && atoi(defeat) != 0) return false;
-	if(topgear_elect_enabled < 0)
-	{
-		const char* e = std::getenv("MERCURY_TOPGEAR_ELECT");
-		topgear_elect_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
-	}
-	return topgear_elect_enabled == 1;
+	return false;
 }
 
 // The channel-clean-AND-flat verdict for the 64-QAM top rung. cfg17 needs BOTH:
@@ -19165,9 +19158,10 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 
 				if(snr_valid)
 				{
-					turbo_received_snr = decoded_snr;
-					if(decoded_snr > turbo_best_snr)
-						turbo_best_snr = decoded_snr;
+					const double decision_snr = snr_uplink_from_suffix(decoded_snr);
+					turbo_received_snr = decision_snr;
+					if(decision_snr > turbo_best_snr)
+						turbo_best_snr = decision_snr;
 					// SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
 					// data-flow-snr-measurements.md §1.5). ALSO populate
 					// measurements.SNR_uplink so the SUPERSHIFT re-trigger gate
@@ -19182,7 +19176,7 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 					// (SNR_downlink is RESPONDER-only there). Same decoded value the
 					// suffix carries. Accepted tradeoff: the value goes stale after
 					// turbo (Option B's steady-state ACK suffix is NOT done here).
-					measurements.SNR_uplink = snr_uplink_from_suffix(decoded_snr);
+					measurements.SNR_uplink = decision_snr;
 					// V3 climb-grade snapshot: qualify the pattern-ACK suffix read for the ELECTION
 					// gate. Data-batch confirms latch a fresh climb-grade sample; connect / BREAK-
 					// recovery ACKs (the garbage-high writer noted above) are rejected by

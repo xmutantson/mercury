@@ -1102,6 +1102,26 @@ int cl_arq_controller::test_topgear_clean_election()
 	printf("[TEST-TOPGEAR] ===== CONFIG_17 64-QAM channel-clean gearshift election =====\n");
 	fflush(stdout);
 
+	// The separable grid/FIR package deliberately carries no cfg17 authority.
+	// Exercise every legacy enable input and require the single feature gate to
+	// remain closed until the pending authority redesign lands.
+	set_env("MERCURY_TOPGEAR_ELECT", "1");
+	set_env("MERCURY_ROW17_BUMP", "1");
+	set_env("MERCURY_CFG17_SNR_FLOOR", "24.0");
+	cl_arq_controller* gate_probe = new cl_arq_controller();
+	check(!gate_probe->topgear_elect_feature_enabled(),
+	      "cfg17 election is un-armable pending authority redesign");
+	delete gate_probe;
+	clr_env("MERCURY_CFG17_SNR_FLOOR");
+	clr_env("MERCURY_ROW17_BUMP");
+	clr_env("MERCURY_TOPGEAR_ELECT");
+	printf("[TEST-TOPGEAR] %s (%d failure%s)\n",
+	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
+	fflush(stdout);
+	return failed == 0 ? 0 : 1;
+
+#if 0 // cfg17 authority tests remain quarantined until the redesign is implemented.
+
 	// --- Ladder/primitive assertions (common_defines.h): cfg17 ordered ABOVE cfg16, OFDM,
 	//     and demotes to cfg16. These validate the synthetic-index + is_ofdm_config changes.
 	check(is_ofdm_config(CONFIG_17), "cfg17 reports OFDM (is_ofdm_config(17)==true)");
@@ -2191,6 +2211,7 @@ int cl_arq_controller::test_topgear_clean_election()
 	       failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
+#endif
 }
 
 // ============================================================================

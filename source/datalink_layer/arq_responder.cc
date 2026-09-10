@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/arq.h"
+#include "common/snr_decision_grid.h"
 #include "common/timing_log.h"
 #include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 config-tag follow test
 #include <vector>
@@ -3845,7 +3846,7 @@ void cl_arq_controller::process_control_responder()
 		{
 			tmp_SNR.char4_SNR[i]=messages_control.data[i+1];
 		}
-		measurements.SNR_uplink=(double)tmp_SNR.f_SNR;
+		measurements.SNR_uplink=quantize_snr_decision_db((double)tmp_SNR.f_SNR);
 
 		// Read commander's capability from byte 5 of decoded LDPC frame.
 		// Always present (LDPC decodes full block; unused bytes are zero-padded).

@@ -35,6 +35,7 @@
 #include "datalink_config.h"
 #include "datalink_defines.h"
 #include "common/common_defines.h"
+#include "common/snr_decision_grid.h"
 #include "audioio/audioio.h"
 #include "compression/mercury_compress.h"
 #include "datalink_layer/b2f_handler.h"
@@ -2140,7 +2141,7 @@ public:
   // CMD-only suffix path writes SNR_uplink only). No side effects so the
   // unit test (Part G) replays the identical expression. See §1.5 / §6.
   static double snr_uplink_from_suffix(float decoded_snr)
-  { return (double)decoded_snr; }
+  { return quantize_snr_decision_db((double)decoded_snr); }
 
   // SUPERSHIFT SNR-sentinel ENABLEMENT (climb follow-up #1b, Option 1;
   // data-flow-snr-measurements.md §1.7 / §7). snr_uplink_from_suffix() (above)
@@ -6328,8 +6329,8 @@ public:
     }
   }
   bool turbo_snr_ack_enabled;      // true during turboshift: send/receive SNR in ACK suffix
-  float turbo_received_snr;        // SNR decoded from ACK suffix (-99 = not available)
-  float turbo_best_snr;            // Best SNR seen across entire turbo phase (-99 = none)
+  double turbo_received_snr;       // grid-aligned SNR decoded from ACK suffix (-99 = not available)
+  double turbo_best_snr;           // grid-aligned best SNR across turbo phase (-99 = none)
   // Climb-acceleration (data-flow-gearshift-climb.md).
   // A/B defeat knob (MERCURY_CLIMB_ACCEL_DEFEAT=1): restores the pre-accel INCUMBENT crawl —
   // legacy leap cap 13, unconditional handoff cap, no robust tier-cross. Env-latched in the

@@ -48,6 +48,10 @@ class cl_ldpc_decode_pool;
 #include <vector>
 #include <memory>
 
+// Focused regression for the accepted-SNR decision-domain contract. Also
+// runs in the aggregate --test battery.
+int run_snr_decision_grid_selftest();
+
 
 #if defined(_WIN32)
 #define msleep(a) Sleep(a)

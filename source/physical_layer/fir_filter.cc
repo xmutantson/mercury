@@ -22,9 +22,76 @@
 
 #include "physical_layer/fir_filter.h"
 #include <cstdlib>
+#include <cstdint>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
+#endif
+
+#if (defined(__x86_64__) || defined(_M_X64)) && \
+	(defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define MERCURY_FIR_X86_AVX2_EXACT 1
+#else
+#define MERCURY_FIR_X86_AVX2_EXACT 0
+#endif
+
+// Four independent real outputs share one AVX2 register. Keep multiply and
+// add as separate operations so each lane has the same two binary64 rounding
+// points and ascending tap order as the scalar authority. The exact kernel is
+// opt-in and runtime-qualified; unsupported CPUs retain the scalar path.
+static inline bool fir_x86_avx2_exact_enabled()
+{
+#if MERCURY_FIR_X86_AVX2_EXACT
+	static const int v=[] {
+		const char* e=std::getenv("MERCURY_FIR_AVX2_EXACT");
+		if(!(e && *e && atoi(e)!=0)) return 0;
+		__builtin_cpu_init();
+		return __builtin_cpu_supports("avx2") ? 1 : 0;
+	}();
+	return v!=0;
+#else
+	return false;
+#endif
+}
+
+#if MERCURY_FIR_X86_AVX2_EXACT
+__attribute__((target("avx2")))
+static void fir_apply_x86_avx2_exact(const double* in, double* out, int nItems,
+									 int N, const double* coef)
+{
+	const int half=(N-1)/2;
+	auto boundary=[&](int k) {
+		const int i=k+half;
+		int j_begin=i-nItems+1; if(j_begin<0) j_begin=0;
+		int j_end=i+1; if(j_end>N) j_end=N;
+		double acc=0.0;
+		for(int j=j_begin;j<j_end;j++) acc += in[i-j]*coef[j];
+		out[k]=acc;
+	};
+	if(nItems<N) { for(int k=0;k<nItems;k++) boundary(k); return; }
+	for(int k=0;k<half;k++) boundary(k);
+	const int steady_end=nItems-half;
+	int k=half;
+	for(;k+3<steady_end;k+=4)
+	{
+		__m256d acc=_mm256_setzero_pd();
+		for(int j=0;j<N;j++)
+		{
+			__m256d x=_mm256_loadu_pd(&in[k+half-j]);
+			__m256d product=_mm256_mul_pd(x,_mm256_set1_pd(coef[j]));
+			acc=_mm256_add_pd(acc,product);
+		}
+		_mm256_storeu_pd(out+k,acc);
+	}
+	for(;k<steady_end;k++)
+	{
+		const int i=k+half; double acc=0.0;
+		for(int j=0;j<N;j++) acc += in[i-j]*coef[j];
+		out[k]=acc;
+	}
+	for(;k<nItems;k++) boundary(k);
+}
 #endif
 
 // Four independent output accumulators expose the FIR's output-parallelism to
@@ -353,6 +420,18 @@ void cl_FIR::apply_decimate(std::complex <double>* in, std::complex <double>* ou
 
 void cl_FIR::apply(double* in, double* out, int nItems)
 {
+	const std::uintptr_t in_begin=(std::uintptr_t)in;
+	const std::uintptr_t in_end=in_begin+(nItems>0?(std::size_t)nItems*sizeof(double):0);
+	const std::uintptr_t out_begin=(std::uintptr_t)out;
+	const std::uintptr_t out_end=out_begin+(nItems>0?(std::size_t)nItems*sizeof(double):0);
+	const bool overlap=in_begin<out_end && out_begin<in_end;
+	if(fir_x86_avx2_exact_enabled() && !overlap)
+	{
+		if(nItems>0 && filter_nTaps>0)
+			fir_apply_x86_avx2_exact(in,out,nItems,filter_nTaps,filter_coefficients);
+		return;
+	}
+
 	// Exact baseline/revert arm for A/B measurement.
 #if defined(__aarch64__)
 	if(!fir_block4_enabled())
