@@ -100,12 +100,17 @@ MINGW_CC  = x86_64-w64-mingw32-gcc
 MINGW_CXX = x86_64-w64-mingw32-g++
 MINGW_AR  = x86_64-w64-mingw32-ar
 
-.PHONY: clean install examples audioio windows
+.PHONY: clean install examples audioio windows realaudio-bridge
 
 all: mercury examples
 
 examples:
 	$(MAKE) -C examples
+
+# Optional native real-audio simulation bridge. Fleet deployments invoke this
+# target explicitly; the normal Mercury build and build.sh do not build it.
+realaudio-bridge:
+	$(MAKE) -C tools/sim/realaudio
 
 source/audioio/audioio.a: source/audioio/audioio.c
 	$(MAKE) -C source/audioio GUI_ENABLED=$(GUI_ENABLED)
