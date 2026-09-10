@@ -44,8 +44,34 @@ std::vector<std::uint8_t> bytes(std::uint8_t seed, std::size_t count) {
   return out;
 }
 
+std::vector<std::uint8_t> block(std::uint8_t seed) {
+  std::vector<std::uint8_t> out(24);
+  for(std::size_t i = 0; i < out.size(); ++i)
+    out[i] = static_cast<std::uint8_t>(seed + 13 * i);
+  return out;
+}
+
 Receiver::Clock::time_point future_ms(int milliseconds) {
   return Receiver::Clock::now() + std::chrono::milliseconds(milliseconds);
+}
+
+Receiver::Clock::time_point after_ms(int ms) {
+  return Receiver::Clock::now() + std::chrono::milliseconds(ms);
+}
+
+DataRecord fabricate(const StreamDescriptor& descriptor,
+                     std::uint64_t generation,
+                     const std::vector<std::uint8_t>& value,
+                     Protection protection) {
+  DataRecord record;
+  record.identity.stream = descriptor;
+  record.identity.generation = generation;
+  record.identity.application_bytes = value.size();
+  record.identity.application_digest = digest_bytes(value.data(), value.size());
+  record.protection = protection;
+  record.transported = value;
+  record.transported_digest = digest_bytes(value.data(), value.size());
+  return record;
 }
 
 }  // namespace
@@ -77,6 +103,171 @@ int run_fade_core_tests() {
   }
   log.check(origin_set_unique, "ORIGIN",
             "256 additional origins contain no process-local repeat");
+
+  // Exact S1b descriptor-forgery reproduction: authenticate generation 1 under
+  // baseline 0, then relabel only the stream's first generation to 1.  The
+  // relabel must change both canonical encodings, so it cannot reuse either
+  // the DATA authenticator or a feedback authenticator.
+  const Address forged_address = address(0x1111111111111111ULL,
+                                         0x2222222222222222ULL,
+                                         77, 9, Direction::A_TO_B);
+  std::uint8_t origin_bytes[ORIGIN_BYTES];
+  for(std::size_t i = 0; i < ORIGIN_BYTES; ++i)
+    origin_bytes[i] = static_cast<std::uint8_t>(0x41 + i);
+  Origin origin;
+  const bool origin_created =
+      Origin::from_wire(origin_bytes, sizeof(origin_bytes), &origin);
+  StreamDescriptor baseline0;
+  StreamDescriptor baseline1;
+  const bool baselines_created = origin_created
+      && StreamDescriptor::from_wire(
+          forged_address, 9001, origin, 0x4142434445464748ULL, 0, &baseline0)
+      && StreamDescriptor::from_wire(
+          forged_address, 9001, origin, 0x4142434445464748ULL, 1, &baseline1);
+
+  const std::vector<std::uint8_t> b1 = block(0x83);
+  DataRecord genuine1 = fabricate(baseline0, 1, b1,
+                                  Protection::AEAD_COVERED);
+  DataRecord relabelled1 = genuine1;
+  relabelled1.identity.stream = baseline1;
+  const bool unequal_descriptors = baseline0 != baseline1;
+  const bool canonical_collision =
+      canonical_identity_bytes(genuine1.identity)
+          == canonical_identity_bytes(relabelled1.identity);
+  Feedback genuine_feedback;
+  genuine_feedback.kind = FeedbackKind::COMMIT;
+  genuine_feedback.identity = genuine1.identity;
+  genuine_feedback.transported_digest = genuine1.transported_digest;
+  genuine_feedback.committed_application_bytes = b1.size();
+  Feedback relabelled_feedback = genuine_feedback;
+  relabelled_feedback.identity = relabelled1.identity;
+  const bool feedback_collision =
+      canonical_feedback_bytes(genuine_feedback)
+          == canonical_feedback_bytes(relabelled_feedback);
+  std::vector<std::uint8_t> forged_sink;
+  Receiver forged_receiver(forged_address, 9001, [&](const CommitView& view) {
+    forged_sink.insert(forged_sink.end(), view.application_bytes,
+                       view.application_bytes + view.application_size);
+    return true;
+  });
+  Feedback forged_receipt;
+  CommitTicket forged_ticket;
+  Feedback forged_commit;
+  const bool forged_published = baselines_created
+      && forged_receiver.publish_once(baseline1, after_ms(2000))
+          == PublishResult::PUBLISHED;
+  const bool forged_admitted = forged_published
+      && forged_receiver.admit(relabelled1, Verification::AEAD_VERIFIED,
+                               &forged_receipt) == AdmitResult::ACCEPTED;
+  const bool forged_committed = forged_admitted
+      && forged_receiver.prepare_commit(relabelled1.identity, &forged_ticket)
+      && forged_receiver.commit(std::move(forged_ticket), b1.data(), b1.size(),
+                                &forged_commit);
+  const bool descriptor_secure = !(unequal_descriptors && canonical_collision
+      && feedback_collision
+      && forged_published && forged_admitted && forged_committed
+      && forged_sink == b1);
+  log.check(baselines_created && unequal_descriptors
+            && !canonical_collision && !feedback_collision
+            && descriptor_secure,
+            "DESCRIPTOR-FORGERY",
+            "first_generation relabel cannot reuse canonical DATA or feedback "
+            "bytes to commit generation 1 as the first 24-byte block");
+
+  // Cover the whole identity class, not one example descriptor. Every field
+  // consulted by Address, StreamDescriptor, or RecordIdentity equality must
+  // independently perturb DATA identity bytes and inherited feedback bytes.
+  std::uint8_t alternate_origin_bytes[ORIGIN_BYTES];
+  std::memcpy(alternate_origin_bytes, origin_bytes,
+              sizeof(alternate_origin_bytes));
+  alternate_origin_bytes[0] ^= 0x80;
+  Origin alternate_origin;
+  const bool alternate_origin_created = Origin::from_wire(
+      alternate_origin_bytes, sizeof(alternate_origin_bytes),
+      &alternate_origin);
+  struct IdentityVariant {
+    const char* field;
+    RecordIdentity identity;
+  };
+  std::vector<IdentityVariant> identity_variants;
+  const auto add_stream_variant = [&](const char* field,
+                                      const Address& variant_address,
+                                      std::uint64_t session,
+                                      const Origin& variant_origin,
+                                      std::uint64_t instance,
+                                      std::uint64_t first_generation) {
+    StreamDescriptor descriptor;
+    if(!StreamDescriptor::from_wire(variant_address, session, variant_origin,
+                                    instance, first_generation, &descriptor))
+      return false;
+    RecordIdentity identity = genuine1.identity;
+    identity.stream = descriptor;
+    identity_variants.push_back(IdentityVariant{field, identity});
+    return true;
+  };
+  Address changed_address = forged_address;
+  changed_address.sender += 1;
+  bool coverage_setup = alternate_origin_created
+      && add_stream_variant("sender is canonically bound", changed_address,
+                            9001, origin, 0x4142434445464748ULL, 0);
+  changed_address = forged_address;
+  changed_address.receiver += 1;
+  coverage_setup = add_stream_variant(
+      "receiver is canonically bound", changed_address, 9001, origin,
+      0x4142434445464748ULL, 0) && coverage_setup;
+  changed_address = forged_address;
+  changed_address.connection += 1;
+  coverage_setup = add_stream_variant(
+      "connection is canonically bound", changed_address, 9001, origin,
+      0x4142434445464748ULL, 0) && coverage_setup;
+  changed_address = forged_address;
+  changed_address.stream += 1;
+  coverage_setup = add_stream_variant(
+      "stream is canonically bound", changed_address, 9001, origin,
+      0x4142434445464748ULL, 0) && coverage_setup;
+  changed_address = forged_address;
+  changed_address.direction = Direction::B_TO_A;
+  coverage_setup = add_stream_variant(
+      "direction is canonically bound", changed_address, 9001, origin,
+      0x4142434445464748ULL, 0) && coverage_setup;
+  coverage_setup = add_stream_variant(
+      "session is canonically bound", forged_address, 9002, origin,
+      0x4142434445464748ULL, 0) && coverage_setup;
+  coverage_setup = add_stream_variant(
+      "origin is canonically bound", forged_address, 9001, alternate_origin,
+      0x4142434445464748ULL, 0) && coverage_setup;
+  coverage_setup = add_stream_variant(
+      "instance is canonically bound", forged_address, 9001, origin,
+      0x4142434445464749ULL, 0) && coverage_setup;
+  coverage_setup = add_stream_variant(
+      "first_generation is canonically bound", forged_address, 9001, origin,
+      0x4142434445464748ULL, 1) && coverage_setup;
+
+  RecordIdentity changed_identity = genuine1.identity;
+  changed_identity.generation += 1;
+  identity_variants.push_back(
+      IdentityVariant{"generation is canonically bound", changed_identity});
+  changed_identity = genuine1.identity;
+  changed_identity.application_bytes += 1;
+  identity_variants.push_back(IdentityVariant{
+      "application_bytes is canonically bound", changed_identity});
+  changed_identity = genuine1.identity;
+  changed_identity.application_digest[0] ^= 0x01;
+  identity_variants.push_back(IdentityVariant{
+      "application_digest is canonically bound", changed_identity});
+
+  log.check(coverage_setup && identity_variants.size() == 12,
+            "IDENTITY-COVERAGE", "all identity-field variants constructed");
+  for(const IdentityVariant& variant : identity_variants) {
+    Feedback variant_feedback = genuine_feedback;
+    variant_feedback.identity = variant.identity;
+    log.check(variant.identity != genuine1.identity
+              && canonical_identity_bytes(variant.identity)
+                  != canonical_identity_bytes(genuine1.identity)
+              && canonical_feedback_bytes(variant_feedback)
+                  != canonical_feedback_bytes(genuine_feedback),
+              "IDENTITY-COVERAGE", variant.field);
+  }
 
   Receiver newer_session(forward, 7002, [](const CommitView&) {
     return true;

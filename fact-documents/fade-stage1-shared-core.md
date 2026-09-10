@@ -17,7 +17,8 @@ must use this core at the same ownership boundaries.
 3. The selected wire design encodes that identity. If DATA is already AEAD
    protected, `canonical_identity_bytes` is existing AEAD AAD. Otherwise the
    existing authenticated frame covers those bytes. The binding also carries
-   the sender's application length and digest. Do not add another MAC.
+   every immutable descriptor field, including `first_generation`, plus the
+   sender's application length and digest. Do not add another MAC.
 4. The receiver constructs `Receiver` with the full expected address and the
    current authenticated session identifier. It authenticates/decrypts the
    frame and calls `Receiver::admit`
@@ -48,7 +49,7 @@ must use this core at the same ownership boundaries.
 | Retain until COMMIT | Source bytes remain in `SourceRetainer` after RECEIPT and are erased only by a fully matching COMMIT. |
 | Receipt differs from commit | Separate feedback kinds and canonical encodings; COMMIT exists only after the application sink returns success. |
 | Active non-sliding deadline | `steady_clock` absolute deadline plus a dedicated condition-variable worker; duplicate DATA/control and progress never write the deadline. |
-| Address preservation | Canonical identity includes both endpoint IDs, connection, stream, direction, session, origin, instance, and full generation; equality gates storage and feedback release. |
+| Address preservation | Version 2 canonical identity includes both endpoint IDs, connection, stream, direction, session, origin, instance, first generation, and record generation; feedback inherits the same complete descriptor binding. Equality gates storage and feedback release. |
 | Structural production isolation | Production header/source have no test/fault switch, environment lookup, defeat macro, or test-build branch. Build-time audit fails if one is introduced. |
 
 Generation exhaustion fails closed rather than wrapping. Pending receiver storage
@@ -59,10 +60,11 @@ exact duplicates are idempotent and produce RECEIPT only.
 
 `mercury --test-fade-core` covers all five predecessor refutation categories,
 the missing-first-generation 24-byte deletion case, conflicting and relabelled
-identity, reconnect feedback replay, source retention, commit backpressure,
-concurrent revocation, active deadline expiry, and generation exhaustion. The
-same test is part of full `mercury --test` and is also built and run during every
-normal build.
+identity, exhaustive descriptor-field canonical coverage for DATA and feedback,
+the first-generation relabel forgery, reconnect feedback replay, source
+retention, commit backpressure, concurrent revocation, active deadline expiry,
+and generation exhaustion. The same test is part of full `mercury --test` and
+is also built and run during every normal build.
 
 The WGN gate replays the frozen six-run clean cohort at the core boundary: six
 262144-byte exact transfers, 18 timed RF batches per transfer, and the frozen

@@ -186,7 +186,7 @@ std::vector<std::uint8_t> canonical_identity_bytes(
   std::vector<std::uint8_t> out;
   if(!identity.valid()) return out;
   static const std::uint8_t domain[] = {
-      'M','E','R','C','U','R','Y','-','F','A','D','E','-','C','1',1};
+      'M','E','R','C','U','R','Y','-','F','A','D','E','-','C','1',2};
   out.insert(out.end(), domain, domain + sizeof(domain));
   const Address& address = identity.stream.address();
   put_u64(&out, address.sender);
@@ -198,6 +198,7 @@ std::vector<std::uint8_t> canonical_identity_bytes(
   out.insert(out.end(), identity.stream.origin().bytes().begin(),
              identity.stream.origin().bytes().end());
   put_u64(&out, identity.stream.instance());
+  put_u64(&out, identity.stream.first_generation());
   put_u64(&out, identity.generation);
   put_u64(&out, identity.application_bytes);
   out.insert(out.end(), identity.application_digest.begin(),
