@@ -55,6 +55,37 @@ static inline bool fir_x86_avx2_exact_enabled()
 #endif
 }
 
+static inline bool fir_complex_ranges_overlap(const std::complex<double>* in,
+	std::size_t in_count, const std::complex<double>* out, std::size_t out_count)
+{
+	const std::uintptr_t in_begin=reinterpret_cast<std::uintptr_t>(in);
+	const std::uintptr_t in_end=in_begin+in_count*sizeof(*in);
+	const std::uintptr_t out_begin=reinterpret_cast<std::uintptr_t>(out);
+	const std::uintptr_t out_end=out_begin+out_count*sizeof(*out);
+	return in_begin<out_end && out_begin<in_end;
+}
+
+#if defined(MERCURY_FIR_TEST_DISPATCH)
+static std::uint64_t fir_complex_avx2_dispatches=0;
+static std::uint64_t fir_decimate_complex_avx2_dispatches=0;
+
+extern "C" void mercury_fir_test_reset_dispatch_counts()
+{
+	fir_complex_avx2_dispatches=0;
+	fir_decimate_complex_avx2_dispatches=0;
+}
+
+extern "C" std::uint64_t mercury_fir_test_complex_avx2_dispatches()
+{
+	return fir_complex_avx2_dispatches;
+}
+
+extern "C" std::uint64_t mercury_fir_test_decimate_complex_avx2_dispatches()
+{
+	return fir_decimate_complex_avx2_dispatches;
+}
+#endif
+
 #if MERCURY_FIR_X86_AVX2_EXACT
 __attribute__((target("avx2")))
 static void fir_apply_x86_avx2_exact(const double* in, double* out, int nItems,
@@ -91,6 +122,69 @@ static void fir_apply_x86_avx2_exact(const double* in, double* out, int nItems,
 		out[k]=acc;
 	}
 	for(;k<nItems;k++) boundary(k);
+}
+
+// std::complex<double> is stored as adjacent real/imaginary doubles.  Pair two
+// independent outputs in each AVX2 register so every lane follows the scalar
+// accumulator's coefficient order and binary64 rounding points.  Coefficients
+// are real, therefore no horizontal operation or complex reassociation is
+// involved.
+__attribute__((target("avx2")))
+static int fir_apply_complex_steady_x86_avx2_exact(
+	const std::complex<double>* in, std::complex<double>* out, int k,
+	int steady_end, int N, int half, const double* coef)
+{
+	for(;k+3<steady_end;k+=4)
+	{
+		__m256d acc01=_mm256_setzero_pd();
+		__m256d acc23=_mm256_setzero_pd();
+		for(int j=0;j<N;j++)
+		{
+			const __m256d c=_mm256_set1_pd(coef[N-1-j]);
+			const double* x01=reinterpret_cast<const double*>(&in[k-half+j]);
+			const double* x23=reinterpret_cast<const double*>(&in[k-half+j+2]);
+			const __m256d product01=_mm256_mul_pd(_mm256_loadu_pd(x01),c);
+			const __m256d product23=_mm256_mul_pd(_mm256_loadu_pd(x23),c);
+			acc01=_mm256_add_pd(acc01,product01);
+			acc23=_mm256_add_pd(acc23,product23);
+		}
+		_mm256_storeu_pd(reinterpret_cast<double*>(out+k),acc01);
+		_mm256_storeu_pd(reinterpret_cast<double*>(out+k+2),acc23);
+	}
+	return k;
+}
+
+__attribute__((target("avx2")))
+static int fir_apply_decimate_complex_steady_x86_avx2_exact(
+	const std::complex<double>* in, std::complex<double>* out, int m,
+	int m_end_steady, int M, int N, int half, const double* coef)
+{
+	for(;m+3<=m_end_steady;m+=4)
+	{
+		__m256d acc01=_mm256_setzero_pd();
+		__m256d acc23=_mm256_setzero_pd();
+		const std::complex<double>* window0=&in[(m+0)*M-half];
+		const std::complex<double>* window1=&in[(m+1)*M-half];
+		const std::complex<double>* window2=&in[(m+2)*M-half];
+		const std::complex<double>* window3=&in[(m+3)*M-half];
+		for(int j=0;j<N;j++)
+		{
+			const __m256d c=_mm256_set1_pd(coef[N-1-j]);
+			const __m128d x0=_mm_loadu_pd(reinterpret_cast<const double*>(window0+j));
+			const __m128d x1=_mm_loadu_pd(reinterpret_cast<const double*>(window1+j));
+			const __m128d x2=_mm_loadu_pd(reinterpret_cast<const double*>(window2+j));
+			const __m128d x3=_mm_loadu_pd(reinterpret_cast<const double*>(window3+j));
+			const __m256d x01=_mm256_insertf128_pd(_mm256_castpd128_pd256(x0),x1,1);
+			const __m256d x23=_mm256_insertf128_pd(_mm256_castpd128_pd256(x2),x3,1);
+			const __m256d product01=_mm256_mul_pd(x01,c);
+			const __m256d product23=_mm256_mul_pd(x23,c);
+			acc01=_mm256_add_pd(acc01,product01);
+			acc23=_mm256_add_pd(acc23,product23);
+		}
+		_mm256_storeu_pd(reinterpret_cast<double*>(out+m),acc01);
+		_mm256_storeu_pd(reinterpret_cast<double*>(out+m+2),acc23);
+	}
+	return m;
 }
 #endif
 
@@ -259,6 +353,11 @@ void cl_FIR::apply(std::complex <double>* in, std::complex <double>* out, int nI
 	const int N = filter_nTaps;
 	const int half = (N - 1) / 2;
 	const double* __restrict__ coef = filter_coefficients;
+#if MERCURY_FIR_X86_AVX2_EXACT
+	const bool exact_avx2 = fir_x86_avx2_exact_enabled() &&
+		!fir_complex_ranges_overlap(in,nItems>0?(std::size_t)nItems:0,
+			out,nItems>0?(std::size_t)nItems:0);
+#endif
 
 	// Phase 1: prologue (k < half) — input would underflow
 	int prologue_end = (half < nItems) ? half : nItems;
@@ -278,7 +377,20 @@ void cl_FIR::apply(std::complex <double>* in, std::complex <double>* out, int nI
 
 	// Phase 2: steady-state — no branches, hot loop
 	int steady_end = nItems - half;
-	for (int k = (half < nItems) ? half : nItems; k < steady_end; k++)
+	int k = (half < nItems) ? half : nItems;
+#if MERCURY_FIR_X86_AVX2_EXACT
+	if(exact_avx2)
+	{
+#if defined(MERCURY_FIR_TEST_DISPATCH)
+		const int first=k;
+#endif
+		k=fir_apply_complex_steady_x86_avx2_exact(in,out,k,steady_end,N,half,coef);
+#if defined(MERCURY_FIR_TEST_DISPATCH)
+		if(k!=first) ++fir_complex_avx2_dispatches;
+#endif
+	}
+#endif
+	for (; k < steady_end; k++)
 	{
 		double acc_r = 0.0, acc_i = 0.0;
 		const std::complex<double>* __restrict__ window = &in[k - half];
@@ -323,6 +435,11 @@ void cl_FIR::apply_decimate(std::complex <double>* in, std::complex <double>* ou
 	const int half = (N - 1) / 2;
 	const int out_size = in_size / M;
 	const double* __restrict__ coef = filter_coefficients;
+#if MERCURY_FIR_X86_AVX2_EXACT
+	const bool exact_avx2 = fir_x86_avx2_exact_enabled() &&
+		!fir_complex_ranges_overlap(in,in_size>0?(std::size_t)in_size:0,
+			out,out_size>0?(std::size_t)out_size:0);
+#endif
 
 	// Steady-state range: m*M - half >= 0 AND m*M - half + N - 1 < in_size
 	int m_start_steady = (half + M - 1) / M;
@@ -353,6 +470,19 @@ void cl_FIR::apply_decimate(std::complex <double>* in, std::complex <double>* ou
 	// exposes independent dependency chains and reuses each coefficient load.
 	// This is portable scalar C++ (no ISA-specific intrinsics).
 	int m = m_start_steady;
+#if MERCURY_FIR_X86_AVX2_EXACT
+	if(exact_avx2)
+	{
+#if defined(MERCURY_FIR_TEST_DISPATCH)
+		const int first=m;
+#endif
+		m=fir_apply_decimate_complex_steady_x86_avx2_exact(
+			in,out,m,m_end_steady,M,N,half,coef);
+#if defined(MERCURY_FIR_TEST_DISPATCH)
+		if(m!=first) ++fir_decimate_complex_avx2_dispatches;
+#endif
+	}
+#endif
 	for (; m + 3 <= m_end_steady; m += 4)
 	{
 		double acc0_r = 0.0, acc0_i = 0.0;
