@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 arq_realaudio.py - drive TWO stock `-x alsa` Mercury instances through the
-real-audio IONOS bridge (realaudio_bridge_s32.py) over snd-aloop.
+real-audio IONOS bridge over snd-aloop.
 
 Mirrors tools/sim_arq_channel.py EXACTLY (same ctrl/data TCP protocol: ctrl on
 PORT, data on PORT+1, MYCALL/LISTEN/CONNECT, tx=bytes(range(256))*8 chunks,
@@ -93,6 +93,15 @@ TRAFFIC_RANDOM_BINARY = "random-binary"
 TRAFFIC_CHOICES = (TRAFFIC_LEGACY, TRAFFIC_RANDOM_BINARY)
 _LEGACY_CHUNK = bytes(range(256)) * 8
 _RANDOM_BINARY_KEY = b"mercury-capstone-incompressible-v1"
+
+
+def bridge_command_prefix(bridge_path):
+    """Return the interpreter/scheduler argv for a configured bridge path."""
+    if bridge_path.endswith(".py") or not os.access(bridge_path, os.X_OK):
+        return [sys.executable, bridge_path]
+    if os.path.basename(bridge_path) == "realaudio_bridge_s32_c":
+        return ["sudo", "-n", "/usr/bin/nice", "-n", "-5", bridge_path]
+    return [bridge_path]
 
 
 def redacted_env_items(items):
@@ -773,7 +782,11 @@ def main(argv=None):
 
     try:
         # 1. bridge first (opens the 4 loopback subdevices for THIS run).
-        bcmd = [sys.executable, args.bridge,
+        # A .py/non-executable bridge retains the Python fallback. Native
+        # bridges execute directly; the imported bridge's proven fleet tune is
+        # SCHED_OTHER nice -5 (the ring depths are supplied below).
+        bridge_prefix = bridge_command_prefix(args.bridge)
+        bcmd = bridge_prefix + [
                 "--fwd-cap", fwd_cap, "--fwd-play", fwd_play,
                 "--rev-cap", rev_cap, "--rev-play", rev_play,
                 "--axis", args.axis,

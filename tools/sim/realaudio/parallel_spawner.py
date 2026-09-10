@@ -3,7 +3,7 @@
 parallel_spawner.py - launch N concurrent real-audio Mercury round-trips over
 snd-aloop and prove CORRECTNESS AT SPEED.
 
-The real-audio runs (arq_realaudio.py + realaudio_bridge_s32.py) are INDEPENDENT:
+The real-audio runs (arq_realaudio.py + a realaudio bridge) are INDEPENDENT:
 each owns its own 4 snd-aloop cables, its own 2 mercury -x alsa processes, its own
 IONOS bridge, and its own TCP control/data ports. Because each capture read is
 kernel-clocked by the snd-aloop hardware timer (NOT the CPU), the runs are
@@ -34,6 +34,14 @@ Usage
   python3 parallel_spawner.py --n 12 --bin /path/to/mercury \\
       --secs 130 --payload 512 --start-cfg 100 --no-gearshift \\
       --passthrough            # or: --cell WGN:55 --profile wgn
+
+Bridge succession
+-----------------
+The default ``--bridge`` is the adjacent ``realaudio_bridge_s32_c`` whenever
+that built binary is present. If it is absent, the spawner warns and falls back
+to ``realaudio_bridge_s32.py``. The Python bridge independently refuses to run
+when the native binary exists unless ``MERCURY_ALLOW_PY_BRIDGE=1`` is set; an
+explicit Python selection must follow that same opt-in contract.
 """
 import argparse
 import json
@@ -50,6 +58,24 @@ from sim_axis import (AXIS_CHOICES, DEFAULT_AXIS, AxisError, infer_bandwidth,
                       require_single_axis, resolve_axis)
 from sim_channel_relay import parse_cell
 HARNESS = os.path.join(HERE, "arq_realaudio.py")
+NATIVE_BRIDGE = os.path.join(HERE, "realaudio_bridge_s32_c")
+PYTHON_BRIDGE = os.path.join(HERE, "realaudio_bridge_s32.py")
+
+
+def default_bridge_path(native_path=NATIVE_BRIDGE,
+                        python_path=PYTHON_BRIDGE):
+    """Select the native bridge when built, otherwise the Python fallback."""
+    return native_path if os.path.isfile(native_path) else python_path
+
+
+def warn_for_python_fallback(bridge_path, native_path=NATIVE_BRIDGE,
+                             python_path=PYTHON_BRIDGE, stream=None):
+    """Warn when the unresolved native default selected the Python bridge."""
+    if (bridge_path == python_path and not os.path.isfile(native_path)):
+        stream = stream or sys.stderr
+        stream.write(
+            "[spawner] WARNING: native bridge is absent; falling back to "
+            f"{python_path}. Build it with `make realaudio-bridge`.\n")
 
 
 def card_name(idx):
@@ -273,7 +299,7 @@ def build_arg_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=12)
     ap.add_argument("--bin", default="/home/kameron/raspeed/mercury")
-    ap.add_argument("--bridge", default=os.path.join(HERE, "realaudio_bridge_s32.py"))
+    ap.add_argument("--bridge", default=default_bridge_path())
     ap.add_argument("--secs", type=int, default=130)
     ap.add_argument("--payload", type=int, default=512)
     ap.add_argument("--score-horizon-s", type=float, default=None,
@@ -311,8 +337,8 @@ def build_arg_parser():
     ap.add_argument("--cfo-hz", type=float, default=0.0)
     ap.add_argument("--phase-noise-deg", type=float, default=0.0)
     ap.add_argument("--fade-depth-db", type=float, default=0.0)
-    ap.add_argument("--cap-periods", type=int, default=3)
-    ap.add_argument("--play-periods", type=int, default=4)
+    ap.add_argument("--cap-periods", type=int, default=4)
+    ap.add_argument("--play-periods", type=int, default=5)
     ap.add_argument("--prime-periods", type=int, default=2)
     ap.add_argument("--port-base", type=int, default=7100)
     ap.add_argument("--card-base", type=int, default=0,
@@ -344,6 +370,7 @@ def build_arg_parser():
 def main(argv=None):
     ap = build_arg_parser()
     args = ap.parse_args(argv)
+    warn_for_python_fallback(args.bridge)
     if args.score_horizon_s is not None and args.score_horizon_s <= 0:
         ap.error("--score-horizon-s must be positive")
     if args.spawn_plan and args.seed_offset:
