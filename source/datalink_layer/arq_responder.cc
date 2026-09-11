@@ -18103,6 +18103,21 @@ int cl_arq_controller::test_origin_bind()
 	ck(gap_is_recoverable_prev_hole(6, -1, true, 5, 3, ORIG5) == true,
 	   "W3 origin=5 armed prev, successor 6 -> recoverable hold");
 
+	// --- Plaintext ARMING (the refuter break): the gate must be armed on a plaintext
+	// session with NO KX. Pre-fix rsp_stream_origin_gen was armed ONLY in
+	// kx_stream_reanchor(), so a plaintext controller kept origin_gen = -1, took the legacy
+	// fail-open branch, and reproduced the offset-0 head-skip live. Post-fix the ctor and
+	// every true session boundary (reset_session_state) arm it to 0 without any KX. ---
+	ck(this->rsp_stream_origin_gen == 0,
+	   "P0 ctor arms the origin gate on a plaintext controller (no KX)");
+	this->reset_session_state();
+	ck(this->rsp_stream_origin_gen == 0,
+	   "P1 reset_session_state (true session boundary) ARMS the origin gate for plaintext (no KX)");
+	// With the plaintext arm proven (origin_gen==0), the PATH-A hold and PATH-B abort arms
+	// above (A1-A3 / B1-B4, all driven with origin_gen=0) are exactly the plaintext-session
+	// decisions: a non-origin first delivery HOLDs (recoverable) or ABORTs (loud), never a
+	// silent offset-0 commit.
+
 	printf("[TEST-ORIGIN-BIND] %s (%d failures)\n",
 	       fails==0 ? "ALL PASS" : "FAILURES", fails);
 	fflush(stdout);

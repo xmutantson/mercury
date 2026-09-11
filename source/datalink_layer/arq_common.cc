@@ -1133,6 +1133,10 @@ cl_arq_controller::cl_arq_controller()
 	// reset + FULL load_configuration so the post-reset adopt gate can detect a
 	// dropped-batch hole. See bigblock_p3_hw/_fix8/FIX8_DESIGN.md §4.2-§4.3.
 	rsp_last_delivered_batch_seq_id=-1;
+	// Authenticated stream ORIGIN gate armed from construction: the first user-data batch of
+	// the first transfer is wire bsi 0 (cmd_batch_seq_id=0 above). Re-armed at every session
+	// boundary (reset_session_state) and KX re-anchor (kx_stream_reanchor).
+	rsp_stream_origin_gen=0;
 	// INV-DEDUP emit high-water (data-flow-stream-offset.md -- demote-rebase double-
 	// delivery): -1 = nothing appended to fifo_buffer_rx yet this LINK. Init here
 	// (ctor) and re-anchored ONLY where rx_stream_delivered re-anchors to 0 (a true
@@ -9449,9 +9453,14 @@ void cl_arq_controller::reset_session_state()
 	// state, so clearing them here is correct on every session boundary.
 	rsp_gap_recover_rounds = 0;
 	rsp_gap_hold_cur_expected = 0;   // R2b: no held current batch survives a session boundary / teardown
-	// Disarm the authenticated stream ORIGIN gate on a session boundary; the next
-	// authenticated session re-arms it at its KEY_ACTIVATE re-anchor.
-	rsp_stream_origin_gen = -1;
+	// Arm the authenticated stream ORIGIN gate at every true session boundary (CONNECT /
+	// disconnect / role-switch -- the same boundary that clears rsp_last_delivered below).
+	// A fresh transfer's first user-data batch is wire bsi 0 (cmd_batch_seq_id init) on
+	// PLAINTEXT sessions as well as encrypted; kx_stream_reanchor() re-arms it for the
+	// KX-authenticated re-anchor. Without arming here the plaintext path (the default, and
+	// the one the corruption reproduces on) took the legacy fail-open branch and head-skipped.
+	// (data-flow-rx-fadecore-adoption.md)
+	rsp_stream_origin_gen = 0;
 	cmd_prev_retain_count  = 0;
 	// MC-4: reset to the virtual predecessor of the next wire bsi. cmd_batch_seq_id
 	// is intentionally not reset at every session boundary, so using its predecessor
