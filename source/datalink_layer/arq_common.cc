@@ -12604,6 +12604,12 @@ int cl_arq_controller::test_measured_timers()
 	unsetenv("MERCURY_MEASURED_TIMERS_K");
 	unsetenv("MERCURY_MEASURED_TIMERS_FLOOR_MS");
 	unsetenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT");
+	// The link-phase CMD block-boundary ACK_SLOT floor (linkphase_ackslot_on, DEFAULT-ON)
+	// raises receiving_timeout by a keydown-derived slot ON TOP of the R6 window. This
+	// unit asserts the R6 estimator/window arithmetic itself, so pin the slot floor off
+	// via its production defeat knob for the duration (the link-phase suites own the
+	// floor's coverage). Cleared with the other knobs at the end.
+	setenv("MERCURY_LINKPHASE_CMD_FLOOR_DEFEAT", "1", 1);
 
 	const int GEOM_FLOOR = 1500;
 	const int cls2 = tt_class_of(CONFIG_13);              // expect 1
@@ -12711,6 +12717,7 @@ int cl_arq_controller::test_measured_timers()
 	unsetenv("MERCURY_MEASURED_TIMERS_FLOOR_MS");
 	unsetenv("MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT");
 	unsetenv("MERCURY_WATCHDOG_FLOOR_DEFEAT");
+	unsetenv("MERCURY_LINKPHASE_CMD_FLOOR_DEFEAT");
 	bool pass = (fails == 0);
 	printf("[TEST-MEASTIMERS] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
 	fflush(stdout);
