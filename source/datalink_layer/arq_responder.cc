@@ -4029,6 +4029,14 @@ void cl_arq_controller::process_control_responder()
 		}
 
 		link_status=CONNECTED;
+		// Arm the authenticated stream ORIGIN generation at the RSP connect-accept
+		// (data-flow-rx-fadecore-adoption.md). A freshly accepted session begins its
+		// first user-data batch at wire bsi 0, so the offset-0 delivery gate now
+		// admits ONLY bsi 0 as the legal stream origin on this session (plaintext and
+		// the universal case). kx_stream_reanchor re-arms on an authenticated re-key;
+		// reset_session_state disarms on a session boundary, so unconnected / direct
+		// funnel-poke states keep legacy (unarmed, byte-identical) behavior.
+		rsp_stream_origin_gen = 0;
 		if(connect_fast_active)
 		{
 			robust_enabled = connect_fast_fallback_robust;
@@ -18054,6 +18062,17 @@ int cl_arq_controller::test_origin_bind()
 		fflush(stdout);
 	};
 	const int ORIG = 0;   // authenticated origin generation (KX re-anchor baseline)
+
+	// --- No-false-arm safety (harness): a controller that has NOT accepted a
+	// connect is UNARMED. The connect-accept arm (right after link_status=
+	// CONNECTED) is the only unconditional session-start arm and is provable
+	// only on a LIVE session (no connect handler in this harness), so the wire
+	// fire-proof is its proof. What IS unit-provable is the safety converse: a
+	// fresh controller that never connects (like the direct funnel-poke tests
+	// test_compress_reassembly_bounds / test_stream_offset) stays unarmed, so
+	// the origin backstop is inert on them (byte-identical legacy behavior).
+	ck(rsp_stream_origin_gen == -1,
+	   "N1 ctor default: no connect accepted => origin gate unarmed (-1)");
 
 	// --- Control: the authenticated origin IS legal at offset 0 ---
 	ck(delivery_step_is_gap(ORIG, -1, ORIG) == false,
