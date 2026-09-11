@@ -3,9 +3,11 @@
  *
  * The core deliberately owns no modem framing, crypto primitive, or ARQ policy.
  * A transport authenticates the canonical identity bytes once (as AEAD AAD when
- * AEAD is already present, otherwise under its existing frame authenticator)
- * and hands the verified record to Receiver.  The core then preserves that
- * identity, storage ownership, delivery order, and the receipt/commit split.
+ * AEAD is already present, otherwise under its existing frame authenticator),
+ * mints a WireAttestation at that one verification boundary, and hands the
+ * verified record to Receiver together with that attestation.  The core then
+ * preserves that identity, storage ownership, delivery order, and the
+ * receipt/commit split.
  */
 #ifndef INC_DATALINK_LAYER_FADE_CORE_H_
 #define INC_DATALINK_LAYER_FADE_CORE_H_
@@ -107,7 +109,7 @@ struct RecordIdentity {
 };
 
 /*
- * Verification is an attestation from the one wire-authentication boundary.
+ * Verification names the mode of the one wire-authentication boundary.
  * AEAD_COVERED means canonical_identity_bytes() was already AEAD-covered; the
  * core intentionally adds no second MAC.  AUTHENTICATED_FRAME is for a
  * non-AEAD carrier whose existing protected frame covers the same bytes.
@@ -145,6 +147,45 @@ std::vector<std::uint8_t> canonical_identity_bytes(
 std::vector<std::uint8_t> canonical_feedback_bytes(const Feedback& feedback);
 Digest digest_bytes(const std::uint8_t* bytes, std::size_t size);
 
+/*
+ * WireAttestation is the object-bound form of the wire-authentication result.
+ * The transport mints one at its single verification boundary, immediately
+ * after the existing AEAD or protected-frame check accepts, over exactly the
+ * record or feedback the check accepted.  The attestation binds the canonical
+ * encoding, the protection mode, and the transported digest, so no field can
+ * change between authentication and admission, and a bare success value can
+ * no longer stand in for the boundary.  Attestations are move-only and are
+ * spent by the call that consumes them; a spent or default-constructed
+ * attestation admits nothing.
+ */
+class WireAttestation {
+ public:
+  WireAttestation();
+  WireAttestation(WireAttestation&& rhs) noexcept;
+  WireAttestation& operator=(WireAttestation&& rhs) noexcept;
+  WireAttestation(const WireAttestation&) = delete;
+  WireAttestation& operator=(const WireAttestation&) = delete;
+
+  static WireAttestation attest_data(const DataRecord& record,
+                                     Verification verification);
+  static WireAttestation attest_feedback(const Feedback& feedback,
+                                         Verification verification);
+
+  bool valid() const;
+  Verification verification() const { return verification_; }
+
+ private:
+  friend class Receiver;
+  friend class SourceRetainer;
+  enum class Kind : std::uint8_t { ABSENT = 0, DATA_RECORD, FEEDBACK_RECORD };
+  bool covers_data(const DataRecord& record) const;
+  bool covers_feedback(const Feedback& feedback) const;
+  void consume();
+  Kind kind_;
+  Verification verification_;
+  Digest binding_;
+};
+
 enum class SourceState : std::uint8_t {
   SOURCE_STAGED = 0,
   SOURCE_SENT,
@@ -154,6 +195,9 @@ enum class SourceState : std::uint8_t {
 /*
  * SourceRetainer owns the original source bytes until a matching COMMIT.
  * RECEIPT only changes retransmission state; it never frees source authority.
+ * Feedback is applied only with the attestation minted over exactly the
+ * feedback bytes the wire authenticator accepted; feedback relabelled after
+ * that boundary no longer matches its attestation and is refused.
  */
 class SourceRetainer {
  public:
@@ -165,7 +209,7 @@ class SourceRetainer {
              const std::uint8_t* transported, std::size_t transported_size,
              DataRecord* out);
   bool mark_sent(std::uint64_t generation);
-  bool apply_feedback(const Feedback& feedback, Verification verification);
+  bool apply_feedback(const Feedback& feedback, WireAttestation&& attestation);
   bool rebind(const StreamDescriptor& replacement);
 
   std::size_t retained_count() const;
@@ -246,6 +290,12 @@ enum class AdmitResult : std::uint8_t {
  * Receiver has exactly one application sink for its lifetime.  Admission,
  * ticket minting, append, ordered-cursor advance, and revoke serialize on the
  * same mutex.  Therefore revoke() returning is a complete revocation barrier.
+ *
+ * Admission consumes the wire attestation minted for exactly this record and
+ * requires a receipt output.  A null receipt output, a missing or spent
+ * attestation, or any record field changed since attestation refuses the
+ * record before storage; a record can therefore never reach COMMIT without a
+ * RECEIPT having been produced first.
  */
 class Receiver {
  public:
@@ -260,8 +310,8 @@ class Receiver {
 
   PublishResult publish_once(const StreamDescriptor& descriptor,
                              Clock::time_point absolute_deadline);
-  AdmitResult admit(const DataRecord& record, Verification verification,
-                    Feedback* feedback);
+  AdmitResult admit(const DataRecord& record, WireAttestation&& attestation,
+                    Feedback* receipt);
   bool prepare_commit(const RecordIdentity& identity, CommitTicket* out);
   bool commit(CommitTicket&& ticket, const std::uint8_t* application_bytes,
               std::size_t application_size, Feedback* committed);

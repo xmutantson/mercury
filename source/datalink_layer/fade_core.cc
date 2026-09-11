@@ -87,6 +87,38 @@ bool digest_equal(const Digest& lhs, const Digest& rhs) {
   return difference == 0;
 }
 
+/*
+ * Attestation preimages are domain-separated from every canonical encoding
+ * and from each other, so a data attestation can never satisfy a feedback
+ * check or the reverse.
+ */
+std::vector<std::uint8_t> attestation_preimage(
+    std::uint8_t domain, const std::vector<std::uint8_t>& canonical) {
+  std::vector<std::uint8_t> out;
+  if(canonical.empty()) return out;
+  static const std::uint8_t tag[] = {
+      'M','E','R','C','U','R','Y','-','F','A','D','E','-','A','T'};
+  out.reserve(sizeof(tag) + 1 + canonical.size());
+  out.insert(out.end(), tag, tag + sizeof(tag));
+  out.push_back(domain);
+  out.insert(out.end(), canonical.begin(), canonical.end());
+  return out;
+}
+
+std::vector<std::uint8_t> data_attestation_bytes(const DataRecord& record) {
+  std::vector<std::uint8_t> canonical =
+      canonical_identity_bytes(record.identity);
+  if(canonical.empty()) return canonical;
+  canonical.push_back(static_cast<std::uint8_t>(record.protection));
+  canonical.insert(canonical.end(), record.transported_digest.begin(),
+                   record.transported_digest.end());
+  return attestation_preimage(1, canonical);
+}
+
+std::vector<std::uint8_t> feedback_attestation_bytes(const Feedback& feedback) {
+  return attestation_preimage(2, canonical_feedback_bytes(feedback));
+}
+
 }  // namespace
 
 bool Address::valid() const {
@@ -223,6 +255,72 @@ Digest digest_bytes(const std::uint8_t* bytes, std::size_t size) {
   return digest;
 }
 
+WireAttestation::WireAttestation()
+    : kind_(Kind::ABSENT), verification_(Verification::FAILED), binding_{} {}
+
+WireAttestation::WireAttestation(WireAttestation&& rhs) noexcept
+    : kind_(rhs.kind_), verification_(rhs.verification_),
+      binding_(rhs.binding_) {
+  rhs.consume();
+}
+
+WireAttestation& WireAttestation::operator=(WireAttestation&& rhs) noexcept {
+  if(this == &rhs) return *this;
+  kind_ = rhs.kind_;
+  verification_ = rhs.verification_;
+  binding_ = rhs.binding_;
+  rhs.consume();
+  return *this;
+}
+
+WireAttestation WireAttestation::attest_data(const DataRecord& record,
+                                             Verification verification) {
+  WireAttestation out;
+  if(verification != Verification::AEAD_VERIFIED
+     && verification != Verification::FRAME_VERIFIED) return out;
+  const std::vector<std::uint8_t> preimage = data_attestation_bytes(record);
+  if(preimage.empty()) return out;
+  out.kind_ = Kind::DATA_RECORD;
+  out.verification_ = verification;
+  out.binding_ = digest_bytes(preimage.data(), preimage.size());
+  return out;
+}
+
+WireAttestation WireAttestation::attest_feedback(const Feedback& feedback,
+                                                 Verification verification) {
+  WireAttestation out;
+  if(verification != Verification::AEAD_VERIFIED
+     && verification != Verification::FRAME_VERIFIED) return out;
+  const std::vector<std::uint8_t> preimage = feedback_attestation_bytes(feedback);
+  if(preimage.empty()) return out;
+  out.kind_ = Kind::FEEDBACK_RECORD;
+  out.verification_ = verification;
+  out.binding_ = digest_bytes(preimage.data(), preimage.size());
+  return out;
+}
+
+bool WireAttestation::valid() const { return kind_ != Kind::ABSENT; }
+
+bool WireAttestation::covers_data(const DataRecord& record) const {
+  if(kind_ != Kind::DATA_RECORD) return false;
+  const std::vector<std::uint8_t> preimage = data_attestation_bytes(record);
+  if(preimage.empty()) return false;
+  return digest_equal(binding_, digest_bytes(preimage.data(), preimage.size()));
+}
+
+bool WireAttestation::covers_feedback(const Feedback& feedback) const {
+  if(kind_ != Kind::FEEDBACK_RECORD) return false;
+  const std::vector<std::uint8_t> preimage = feedback_attestation_bytes(feedback);
+  if(preimage.empty()) return false;
+  return digest_equal(binding_, digest_bytes(preimage.data(), preimage.size()));
+}
+
+void WireAttestation::consume() {
+  kind_ = Kind::ABSENT;
+  verification_ = Verification::FAILED;
+  binding_ = Digest{};
+}
+
 SourceRetainer::SourceRetainer(std::uint64_t local_endpoint,
                                const StreamDescriptor& descriptor,
                                Protection protection)
@@ -288,9 +386,16 @@ bool SourceRetainer::verification_matches(Verification verification) const {
 }
 
 bool SourceRetainer::apply_feedback(const Feedback& feedback,
-                                    Verification verification) {
+                                    WireAttestation&& attestation) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if(!verification_matches(verification)
+  // The attestation must have been minted over exactly these feedback bytes;
+  // it is spent by this application attempt whatever the outcome, and any
+  // field changed after the wire-authentication boundary fails the binding.
+  const bool attested = attestation.valid()
+      && attestation.covers_feedback(feedback);
+  const Verification verification = attestation.verification();
+  attestation.consume();
+  if(!attested || !verification_matches(verification)
      || feedback.identity.stream != descriptor_) return false;
   auto it = entries_.find(feedback.identity.generation);
   if(it == entries_.end()) {
@@ -483,16 +588,26 @@ bool Receiver::same_stream(const RecordIdentity& identity) const {
 }
 
 AdmitResult Receiver::admit(const DataRecord& record,
-                            Verification verification, Feedback* feedback) {
-  if(feedback) *feedback = Feedback();
+                            WireAttestation&& attestation, Feedback* receipt) {
   std::lock_guard<std::mutex> lock(mutex_);
+  // One wire event authorizes one admission attempt: the attestation is
+  // spent here whatever the outcome, and its binding is judged against the
+  // record as presented, so nothing can change after authentication.
+  const bool attested = attestation.valid() && attestation.covers_data(record);
+  const Verification verification = attestation.verification();
+  attestation.consume();
+  // The RECEIPT output is mandatory.  Without it a record could reach COMMIT
+  // with no RECEIPT ever produced, collapsing the receipt/commit split, so a
+  // null output refuses admission before any storage mutation.
+  if(!receipt) return AdmitResult::REFUSED;
+  *receipt = Feedback();
   if(!published_ || revoked_) return AdmitResult::REFUSED;
   if(Clock::now() >= deadline_) {
     revoke_locked(true);
     return AdmitResult::REFUSED;
   }
   // This check is unconditional and precedes every parser/storage mutation.
-  if(!record.identity.valid() || !same_stream(record.identity)
+  if(!attested || !record.identity.valid() || !same_stream(record.identity)
      || !verification_matches(record.protection, verification)
      || record.transported.empty()) return AdmitResult::REFUSED;
   const Digest actual = digest_bytes(record.transported.data(),
@@ -511,12 +626,10 @@ AdmitResult Receiver::admit(const DataRecord& record,
       revoke_locked(false);
       return AdmitResult::CONFLICT_REVOKED;
     }
-    if(feedback) {
-      feedback->kind = FeedbackKind::COMMIT;
-      feedback->identity = record.identity;
-      feedback->transported_digest = record.transported_digest;
-      feedback->committed_application_bytes = prior->second.application_bytes;
-    }
+    receipt->kind = FeedbackKind::COMMIT;
+    receipt->identity = record.identity;
+    receipt->transported_digest = record.transported_digest;
+    receipt->committed_application_bytes = prior->second.application_bytes;
     return AdmitResult::EXACT_DUPLICATE;
   }
   if(exhausted_ || record.identity.generation < next_generation_)
@@ -531,11 +644,9 @@ AdmitResult Receiver::admit(const DataRecord& record,
        && digest_equal(present->second.transported_digest,
                        record.transported_digest)
        && present->second.transported == record.transported) {
-      if(feedback) {
-        feedback->kind = FeedbackKind::RECEIPT;
-        feedback->identity = record.identity;
-        feedback->transported_digest = record.transported_digest;
-      }
+      receipt->kind = FeedbackKind::RECEIPT;
+      receipt->identity = record.identity;
+      receipt->transported_digest = record.transported_digest;
       return AdmitResult::EXACT_DUPLICATE;
     }
     revoke_locked(false);
@@ -546,11 +657,9 @@ AdmitResult Receiver::admit(const DataRecord& record,
   } catch (...) {
     return AdmitResult::REFUSED;
   }
-  if(feedback) {
-    feedback->kind = FeedbackKind::RECEIPT;
-    feedback->identity = record.identity;
-    feedback->transported_digest = record.transported_digest;
-  }
+  receipt->kind = FeedbackKind::RECEIPT;
+  receipt->identity = record.identity;
+  receipt->transported_digest = record.transported_digest;
   return AdmitResult::ACCEPTED;
 }
 

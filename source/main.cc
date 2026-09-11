@@ -2980,6 +2980,7 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-snr-decision-grid") == 0) {
             int failed = run_snr_decision_grid_selftest();
             return (failed == 0) ? 0 : 1;
+        }
         if (strcmp(argv[i], "--test-fade-core") == 0) {
             return mercury::fade::run_fade_core_tests();
         }

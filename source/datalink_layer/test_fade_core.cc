@@ -74,6 +74,23 @@ DataRecord fabricate(const StreamDescriptor& descriptor,
   return record;
 }
 
+/*
+ * The tests model the transport's single wire-authentication boundary: each
+ * admission or feedback application first mints the attestation over exactly
+ * the bytes the scenario's authenticator saw, then hands it to the core.
+ */
+AdmitResult admit_verified(Receiver* receiver, const DataRecord& record,
+                           Verification verification, Feedback* receipt) {
+  return receiver->admit(
+      record, WireAttestation::attest_data(record, verification), receipt);
+}
+
+bool apply_verified(SourceRetainer* source, const Feedback& feedback,
+                    Verification verification) {
+  return source->apply_feedback(
+      feedback, WireAttestation::attest_feedback(feedback, verification));
+}
+
 }  // namespace
 
 int run_fade_core_tests() {
@@ -157,8 +174,9 @@ int run_fade_core_tests() {
       && forged_receiver.publish_once(baseline1, after_ms(2000))
           == PublishResult::PUBLISHED;
   const bool forged_admitted = forged_published
-      && forged_receiver.admit(relabelled1, Verification::AEAD_VERIFIED,
-                               &forged_receipt) == AdmitResult::ACCEPTED;
+      && admit_verified(&forged_receiver, relabelled1,
+                        Verification::AEAD_VERIFIED,
+                        &forged_receipt) == AdmitResult::ACCEPTED;
   const bool forged_committed = forged_admitted
       && forged_receiver.prepare_commit(relabelled1.identity, &forged_ticket)
       && forged_receiver.commit(std::move(forged_ticket), b1.data(), b1.size(),
@@ -300,7 +318,9 @@ int run_fade_core_tests() {
             "RETENTION", "two source batches staged with full ownership");
 
   Feedback receipt;
-  log.check(receiver.admit(data0, Verification::FRAME_VERIFIED, &receipt)
+  Feedback discard;
+  log.check(admit_verified(&receiver, data0, Verification::FRAME_VERIFIED,
+                           &receipt)
                 == AdmitResult::REFUSED
             && receiver.stored_count() == 0,
             "REFUTE3", "pre-publication DATA refused before storage");
@@ -320,34 +340,39 @@ int run_fade_core_tests() {
   DataRecord wrong = data0;
   wrong.identity.stream = rev;
   const std::size_t before_bad = receiver.stored_count();
-  log.check(receiver.admit(wrong, Verification::FRAME_VERIFIED, nullptr)
+  log.check(admit_verified(&receiver, wrong, Verification::FRAME_VERIFIED,
+                           &discard)
                 == AdmitResult::REFUSED
             && receiver.stored_count() == before_bad,
             "ADMISSION", "wrong origin/address rejected before storage");
-  log.check(receiver.admit(data0, Verification::AEAD_VERIFIED, nullptr)
+  log.check(admit_verified(&receiver, data0, Verification::AEAD_VERIFIED,
+                           &discard)
                 == AdmitResult::REFUSED
             && receiver.stored_count() == before_bad,
             "ADMISSION", "verification mode cannot be relabelled");
   wrong = data0;
   wrong.transported[0] ^= 0x80;
-  log.check(receiver.admit(wrong, Verification::FRAME_VERIFIED, nullptr)
+  log.check(admit_verified(&receiver, wrong, Verification::FRAME_VERIFIED,
+                           &discard)
                 == AdmitResult::REFUSED
             && receiver.stored_count() == before_bad,
             "ADMISSION", "sender digest mismatch rejected before storage");
   wrong = data0;
   wrong.identity.generation = 1000;
-  log.check(receiver.admit(wrong, Verification::FRAME_VERIFIED, nullptr)
+  log.check(admit_verified(&receiver, wrong, Verification::FRAME_VERIFIED,
+                           &discard)
                 == AdmitResult::REFUSED
             && receiver.stored_count() == before_bad,
             "REFUTE5", "fast/out-of-window path cannot bypass generation gate");
 
   Feedback receipt1;
-  log.check(receiver.admit(data1, Verification::FRAME_VERIFIED, &receipt1)
+  log.check(admit_verified(&receiver, data1, Verification::FRAME_VERIFIED,
+                           &receipt1)
                 == AdmitResult::ACCEPTED
             && receipt1.kind == FeedbackKind::RECEIPT
             && receipt1.identity == data1.identity,
             "INTEGRITY24", "successor may be received but keeps sender identity");
-  log.check(source.apply_feedback(receipt1, Verification::FRAME_VERIFIED)
+  log.check(apply_verified(&source, receipt1, Verification::FRAME_VERIFIED)
             && source.retained_count() == 2
             && source.retained_source_bytes() == 48,
             "RETENTION", "RECEIPT does not release either source batch");
@@ -357,9 +382,10 @@ int run_fade_core_tests() {
             "INTEGRITY24", "missing 24-byte generation blocks successor commit");
 
   Feedback receipt0;
-  log.check(receiver.admit(data0, Verification::FRAME_VERIFIED, &receipt0)
+  log.check(admit_verified(&receiver, data0, Verification::FRAME_VERIFIED,
+                           &receipt0)
                 == AdmitResult::ACCEPTED
-            && source.apply_feedback(receipt0, Verification::FRAME_VERIFIED)
+            && apply_verified(&source, receipt0, Verification::FRAME_VERIFIED)
             && source.retained_count() == 2,
             "REFUTE1", "late predecessor received without releasing source");
   CommitTicket ticket0;
@@ -375,7 +401,7 @@ int run_fade_core_tests() {
             && commit0.committed_application_bytes == 24,
             "COMMIT", "sink acceptance creates distinct COMMIT feedback");
   Feedback replayed_commit0;
-  log.check(receiver.admit(data0, Verification::FRAME_VERIFIED,
+  log.check(admit_verified(&receiver, data0, Verification::FRAME_VERIFIED,
                            &replayed_commit0)
                 == AdmitResult::EXACT_DUPLICATE
             && replayed_commit0.kind == FeedbackKind::COMMIT
@@ -388,9 +414,9 @@ int run_fade_core_tests() {
                              block0.size(), &unused)
             && sink_calls == 1,
             "SINK", "second consumer cannot append the committed generation");
-  log.check(source.apply_feedback(commit0, Verification::FRAME_VERIFIED)
-            && source.apply_feedback(replayed_commit0,
-                                     Verification::FRAME_VERIFIED)
+  log.check(apply_verified(&source, commit0, Verification::FRAME_VERIFIED)
+            && apply_verified(&source, replayed_commit0,
+                              Verification::FRAME_VERIFIED)
             && source.retained_count() == 1
             && !source.retained(data0.identity.generation),
             "RETENTION", "matching and duplicate COMMIT are idempotent release");
@@ -402,8 +428,8 @@ int run_fade_core_tests() {
   wrong_length_commit.identity = data1.identity;
   wrong_length_commit.transported_digest = data1.transported_digest;
   wrong_length_commit.committed_application_bytes = block1.size() - 1;
-  log.check(!source.apply_feedback(wrong_length_commit,
-                                   Verification::FRAME_VERIFIED)
+  log.check(!apply_verified(&source, wrong_length_commit,
+                            Verification::FRAME_VERIFIED)
             && source.retained_count() == 1,
             "RETENTION", "COMMIT length must match retained source authority");
   std::vector<std::uint8_t> corrupt_application = block1;
@@ -420,7 +446,7 @@ int run_fade_core_tests() {
   log.check(receiver.prepare_commit(data1.identity, &ticket1)
             && receiver.commit(std::move(ticket1), block1.data(), block1.size(),
                                &commit1)
-            && source.apply_feedback(commit1, Verification::FRAME_VERIFIED)
+            && apply_verified(&source, commit1, Verification::FRAME_VERIFIED)
             && source.retained_count() == 0,
             "INTEGRITY24", "predecessor then successor commit byte-exactly");
   std::vector<std::uint8_t> expected = block0;
@@ -443,8 +469,8 @@ int run_fade_core_tests() {
   relabelled.identity.stream = rev;
   relabelled.transported_digest = address_record.transported_digest;
   relabelled.committed_application_bytes = block0.size();
-  log.check(!address_source.apply_feedback(relabelled,
-                                           Verification::FRAME_VERIFIED)
+  log.check(!apply_verified(&address_source, relabelled,
+                            Verification::FRAME_VERIFIED)
             && address_source.retained_count() == 1,
             "ADDRESS", "feedback cannot erase source after address relabelling");
   log.check(canonical_identity_bytes(address_record.identity)
@@ -465,8 +491,8 @@ int run_fade_core_tests() {
   stale_feedback.kind = FeedbackKind::COMMIT;
   stale_feedback.identity = address_record.identity;
   stale_feedback.transported_digest = address_record.transported_digest;
-  log.check(!address_source.apply_feedback(stale_feedback,
-                                           Verification::FRAME_VERIFIED)
+  log.check(!apply_verified(&address_source, stale_feedback,
+                            Verification::FRAME_VERIFIED)
             && address_source.retained_count() == 1,
             "REFUTE2", "prior-session COMMIT cannot release rebound source");
 
@@ -479,8 +505,8 @@ int run_fade_core_tests() {
   });
   revoked_receiver.publish_once(reconnect, future_ms(5000));
   Feedback rebound_receipt;
-  revoked_receiver.admit(rebound, Verification::FRAME_VERIFIED,
-                         &rebound_receipt);
+  admit_verified(&revoked_receiver, rebound, Verification::FRAME_VERIFIED,
+                 &rebound_receipt);
   CommitTicket revoked_ticket;
   const bool ticket_minted =
       revoked_receiver.prepare_commit(rebound.identity, &revoked_ticket);
@@ -506,7 +532,8 @@ int run_fade_core_tests() {
     return true;
   });
   serial_receiver.publish_once(reconnect, future_ms(5000));
-  serial_receiver.admit(rebound, Verification::FRAME_VERIFIED, nullptr);
+  admit_verified(&serial_receiver, rebound, Verification::FRAME_VERIFIED,
+                 &discard);
   CommitTicket serial_ticket;
   serial_receiver.prepare_commit(rebound.identity, &serial_ticket);
   std::thread commit_thread([&] {
@@ -535,7 +562,7 @@ int run_fade_core_tests() {
     return false;
   });
   backpressure.publish_once(fwd, future_ms(5000));
-  backpressure.admit(data0, Verification::FRAME_VERIFIED, nullptr);
+  admit_verified(&backpressure, data0, Verification::FRAME_VERIFIED, &discard);
   CommitTicket backpressure_ticket;
   backpressure.prepare_commit(data0.identity, &backpressure_ticket);
   log.check(!backpressure.commit(std::move(backpressure_ticket), block0.data(),
@@ -554,13 +581,14 @@ int run_fade_core_tests() {
   const Receiver::Clock::time_point absolute = future_ms(90);
   deadline_receiver.publish_once(fwd, absolute);
   Feedback deadline_receipt;
-  const AdmitResult first_deadline_admit = deadline_receiver.admit(
-      data0, Verification::FRAME_VERIFIED, &deadline_receipt);
+  const AdmitResult first_deadline_admit = admit_verified(
+      &deadline_receiver, data0, Verification::FRAME_VERIFIED,
+      &deadline_receipt);
   bool duplicate_progress = first_deadline_admit == AdmitResult::ACCEPTED;
   for(int i = 0; i < 5; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    const AdmitResult result = deadline_receiver.admit(
-        data0, Verification::FRAME_VERIFIED, nullptr);
+    const AdmitResult result = admit_verified(
+        &deadline_receiver, data0, Verification::FRAME_VERIFIED, &discard);
     duplicate_progress = duplicate_progress
         && (result == AdmitResult::EXACT_DUPLICATE
             || result == AdmitResult::REFUSED);
@@ -609,16 +637,128 @@ int run_fade_core_tests() {
   duplicate_receiver.publish_once(near_wrap, future_ms(5000));
   Feedback wrap_receipt_a;
   Feedback wrap_receipt_b;
-  log.check(duplicate_receiver.admit(wrap0, Verification::AEAD_VERIFIED,
-                                     &wrap_receipt_a)
+  log.check(admit_verified(&duplicate_receiver, wrap0,
+                           Verification::AEAD_VERIFIED, &wrap_receipt_a)
                 == AdmitResult::ACCEPTED
-            && duplicate_receiver.admit(wrap0, Verification::AEAD_VERIFIED,
-                                        &wrap_receipt_b)
+            && admit_verified(&duplicate_receiver, wrap0,
+                              Verification::AEAD_VERIFIED, &wrap_receipt_b)
                 == AdmitResult::EXACT_DUPLICATE
             && duplicate_sink.empty()
             && wrap_receipt_a.kind == FeedbackKind::RECEIPT
             && wrap_receipt_b.kind == FeedbackKind::RECEIPT,
             "FEEDBACK", "duplicate receipt is idempotent and not a commit");
+
+  // The admission boundary is object-bound.  The attestation minted at the
+  // wire-authentication boundary is the only admissible witness, it binds
+  // every authenticated byte, it is spent by first use, and a RECEIPT output
+  // is mandatory.  Each refusal below reproduces one previously accepted
+  // misuse of the old bare-enum boundary.
+  StreamDescriptor bound_stream;
+  log.check(make_descriptor(&factory, forward, 7004, 0, &bound_stream),
+            "APIBOUND", "bound stream descriptor created");
+  std::vector<std::uint8_t> bound_sink;
+  Receiver bound_receiver(forward, 7004, [&](const CommitView& view) {
+    bound_sink.insert(bound_sink.end(), view.application_bytes,
+                      view.application_bytes + view.application_size);
+    return true;
+  });
+  log.check(bound_receiver.publish_once(bound_stream, future_ms(5000))
+                == PublishResult::PUBLISHED,
+            "APIBOUND", "bound receiver published");
+  SourceRetainer bound_source(forward.sender, bound_stream,
+                              Protection::AUTHENTICATED_FRAME);
+  DataRecord bound0;
+  log.check(bound_source.stage(block0.data(), block0.size(), block0.data(),
+                               block0.size(), &bound0),
+            "APIBOUND", "bound record staged");
+
+  log.check(bound_receiver.admit(
+                bound0,
+                WireAttestation::attest_data(bound0,
+                                             Verification::FRAME_VERIFIED),
+                nullptr) == AdmitResult::REFUSED
+            && bound_receiver.stored_count() == 0,
+            "APIBOUND", "null receipt output refused before storage");
+
+  WireAttestation attested_before_mutation =
+      WireAttestation::attest_data(bound0, Verification::FRAME_VERIFIED);
+  DataRecord moved_generation = bound0;
+  moved_generation.identity.generation += 1;
+  Feedback bound_scratch;
+  log.check(bound_receiver.admit(moved_generation,
+                                 std::move(attested_before_mutation),
+                                 &bound_scratch) == AdmitResult::REFUSED
+            && bound_receiver.stored_count() == 0,
+            "APIBOUND", "record mutated after attestation refused before storage");
+
+  WireAttestation attested_frame =
+      WireAttestation::attest_data(bound0, Verification::FRAME_VERIFIED);
+  DataRecord relabelled_protection = bound0;
+  relabelled_protection.protection = Protection::AEAD_COVERED;
+  log.check(bound_receiver.admit(relabelled_protection,
+                                 std::move(attested_frame),
+                                 &bound_scratch) == AdmitResult::REFUSED
+            && bound_receiver.stored_count() == 0,
+            "APIBOUND", "protection relabel after attestation refused");
+
+  WireAttestation absent;
+  log.check(bound_receiver.admit(bound0, std::move(absent), &bound_scratch)
+                == AdmitResult::REFUSED
+            && bound_receiver.stored_count() == 0,
+            "APIBOUND", "an absent attestation admits nothing");
+
+  Feedback bound_receipt;
+  log.check(admit_verified(&bound_receiver, bound0,
+                           Verification::FRAME_VERIFIED, &bound_receipt)
+                == AdmitResult::ACCEPTED
+            && bound_receipt.kind == FeedbackKind::RECEIPT,
+            "APIBOUND", "attested admission still yields a receipt");
+  log.check(!WireAttestation::attest_data(bound0,
+                                          Verification::FAILED).valid()
+            && !WireAttestation::attest_feedback(
+                    bound_receipt, Verification::FAILED).valid(),
+            "APIBOUND", "a failed verification mints no attestation");
+  log.check(apply_verified(&bound_source, bound_receipt,
+                           Verification::FRAME_VERIFIED)
+            && bound_source.retained_count() == 1,
+            "APIBOUND", "attested receipt is applied and retains source");
+
+  // The S1b receipt-promotion reproduction: the attestation was minted over
+  // the RECEIPT bytes, then the feedback is relabelled to COMMIT afterwards.
+  // The relabelled bytes no longer match the attested bytes, so the retained
+  // source survives.
+  WireAttestation receipt_attestation = WireAttestation::attest_feedback(
+      bound_receipt, Verification::FRAME_VERIFIED);
+  Feedback promoted = bound_receipt;
+  promoted.kind = FeedbackKind::COMMIT;
+  promoted.committed_application_bytes = block0.size();
+  log.check(!bound_source.apply_feedback(promoted,
+                                         std::move(receipt_attestation))
+            && bound_source.retained_count() == 1,
+            "APIBOUND", "receipt relabelled to commit cannot release source");
+
+  WireAttestation single_use =
+      WireAttestation::attest_data(bound0, Verification::FRAME_VERIFIED);
+  log.check(bound_receiver.admit(bound0, std::move(single_use), &bound_scratch)
+                == AdmitResult::EXACT_DUPLICATE
+            && bound_scratch.kind == FeedbackKind::RECEIPT,
+            "APIBOUND", "fresh attestation covers an exact duplicate");
+  // Deliberately present the spent witness a second time.
+  log.check(bound_receiver.admit(bound0, std::move(single_use), &bound_scratch)
+                == AdmitResult::REFUSED,
+            "APIBOUND", "an attestation is spent by its first use");
+
+  CommitTicket bound_ticket;
+  Feedback bound_commit;
+  log.check(bound_receiver.prepare_commit(bound0.identity, &bound_ticket)
+            && bound_receiver.commit(std::move(bound_ticket), block0.data(),
+                                     block0.size(), &bound_commit)
+            && bound_commit.kind == FeedbackKind::COMMIT
+            && apply_verified(&bound_source, bound_commit,
+                              Verification::FRAME_VERIFIED)
+            && bound_source.retained_count() == 0
+            && bound_sink == block0,
+            "APIBOUND", "attested commit round trip releases source");
 
   // CI replay of the frozen six-run clean-WGN class.  The observed cohort used
   // 18 timed RF batches per 262144-byte transfer and had mean CONNECT-to-settle
@@ -661,15 +801,16 @@ int run_fade_core_tests() {
       CommitTicket ticket;
       complete = wgn_source.stage(payload.data() + offset, chunk,
                                   payload.data() + offset, chunk, &record)
-          && wgn_receiver.admit(record, Verification::FRAME_VERIFIED, &got)
+          && admit_verified(&wgn_receiver, record,
+                            Verification::FRAME_VERIFIED, &got)
                  == AdmitResult::ACCEPTED
           && got.kind == FeedbackKind::RECEIPT
-          && wgn_source.apply_feedback(got, Verification::FRAME_VERIFIED)
+          && apply_verified(&wgn_source, got, Verification::FRAME_VERIFIED)
           && wgn_receiver.prepare_commit(record.identity, &ticket)
           && wgn_receiver.commit(std::move(ticket), payload.data() + offset,
                                  chunk, &put)
           && put.kind == FeedbackKind::COMMIT
-          && wgn_source.apply_feedback(put, Verification::FRAME_VERIFIED);
+          && apply_verified(&wgn_source, put, Verification::FRAME_VERIFIED);
       offset += chunk;
     }
     complete = complete && offset == payload.size() && delivered == payload
@@ -688,7 +829,7 @@ int run_fade_core_tests() {
               "forward_occupancy=%.3f%% batches_per_transfer=%d\n",
               wgn_completions, 100.0 * frozen_forward_occupancy, wgn_batches);
 
-  std::printf("[TEST-FADE-CORE] %s failures=%d suites=5 integrity24=%s\n",
+  std::printf("[TEST-FADE-CORE] %s failures=%d suites=6 integrity24=%s\n",
               log.failures ? "FAIL" : "PASS", log.failures,
               log.failures ? "FAIL" : "PASS");
   return log.failures ? 1 : 0;
