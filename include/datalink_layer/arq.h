@@ -6398,7 +6398,7 @@ public:
   // restores the incumbent robust dwell so the fire-proof runs FIX vs DEFEAT on ONE
   // binary. Independent of climb_accel_defeat (R is on the CONNECT path, not the leap).
   bool duty_r_defeat;
-  // ELECTION METER-VALIDITY GATE (R2v2) -- DEFAULT-OFF A/B lever
+  // ELECTION METER-VALIDITY GATE (R2v2) -- ships DEFAULT-ON (env A/B lever)
   // (MERCURY_ELECT_VALID_METERS, env-latched in the ctor). When ON, the shared robust->OFDM
   // speculative cross (robust_connect_exit_target + robust_climb_probe_target) is gated on a
   // VALID forward SNR (measurements.SNR_uplink > -90 -- the same sentinel guard
@@ -6406,7 +6406,7 @@ public:
   // firing meter-INDEPENDENTLY. Prevents the low-SNR sentinel-election config-churn: at a
   // low-SNR connect the forward SNR is the uninitialised -99.9 sentinel, so the meter-
   // independent CONFIG_0 cross fires, cannot decode, BREAKs, and the recovery re-probes
-  // forever. OFF (default) -> byte-identical (the cross stays meter-independent).
+  // forever. MERCURY_ELECT_VALID_METERS=0 restores the meter-independent cross for A/B.
   bool elect_valid_meters;
   // DUTY lever R — PIN-RESPECT gate (default-ON; A/B defeat MERCURY_DUTY_R_PIN_DEFEAT=1,
   // env-latched in the ctor). The lever-R CONFIG_0 seed is a CLIMB bootstrap: it only

@@ -16866,6 +16866,12 @@ int cl_arq_controller::test_robust_connect_exit()
 	gear_shift_on     = YES;
 	data_configuration = CONFIG_0;
 	duty_r_pin_defeat = false;
+	// The R2v2 election meter-validity gate ships DEFAULT-ON (env-latched in the ctor):
+	// the robust->OFDM seed HOLDS on a sentinel forward SNR. These legacy arms assert
+	// SEED SELECTION (the EVM arms below drive the meter gate in BOTH directions), so
+	// establish the valid-meter precondition here; restored with the other saves below.
+	double saved_snr_pre = measurements.SNR_uplink;
+	measurements.SNR_uplink = 15.0;
 
 	// --- FAIL-BEFORE: R defeated (MERCURY_DUTY_R_DEFEAT / master-defeat) ---
 	duty_r_defeat = true;
@@ -16998,6 +17004,7 @@ int cl_arq_controller::test_robust_connect_exit()
 	data_configuration        = saved_data;
 	gear_shift_on             = saved_gs;
 	duty_r_pin_defeat         = saved_pdef;
+	measurements.SNR_uplink   = saved_snr_pre;
 
 	printf("[TEST-DUTY-R] %s (%d failures)\n",
 		failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
@@ -17037,6 +17044,17 @@ int cl_arq_controller::test_connect_fuse()
 	int saved_reverse_config = reverse_configuration;
 	auto saved_control_status = messages_control.status;
 	char saved_control_code = messages_control.data != NULL ? messages_control.data[0] : 0;
+	// The fused robust-exit seed requires a VALID forward SNR (R2v2 meter-validity gate,
+	// DEFAULT-ON) and reads the pin-respect state (gearshift/pin). Establish a climb-
+	// session precondition (valid meter, gearshift ON, CONFIG_0 pin) so these arms assert
+	// SEED FUSION only; restored below (data_configuration via saved_data_config).
+	double saved_snr_cf = measurements.SNR_uplink;
+	int    saved_gs_cf  = gear_shift_on;
+	bool   saved_pd_cf  = duty_r_pin_defeat;
+	measurements.SNR_uplink = 15.0;
+	gear_shift_on = YES;
+	data_configuration = CONFIG_0;
+	duty_r_pin_defeat = false;
 
 	// FAIL-BEFORE: fusion defeated at the robust floor -> NO seed carried (two-frame cross)
 	connect_fuse_defeat = true;  duty_r_defeat = false;
@@ -17137,6 +17155,9 @@ int cl_arq_controller::test_connect_fuse()
 	messages_control.status = saved_control_status;
 	if(messages_control.data != NULL)
 		messages_control.data[0] = saved_control_code;
+	measurements.SNR_uplink = saved_snr_cf;
+	gear_shift_on           = saved_gs_cf;
+	duty_r_pin_defeat       = saved_pd_cf;
 	printf("[TEST-CONNECT-FUSE] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;
