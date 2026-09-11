@@ -2373,9 +2373,24 @@ public:
   //                       it anyway, no regress, no hole; audit R1)
   // PURE + static so the SIM_INPROC test drives the EXACT production decision.
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md §2.
-  static bool delivery_step_is_gap(int bsi, int last_delivered_bsi)
+  static bool delivery_step_is_gap(int bsi, int last_delivered_bsi,
+                                   int origin_gen = -1)
   {
-    if(last_delivered_bsi < 0) return false;
+    // Authenticated-origin gate (data-flow-rx-fadecore-adoption.md): at a
+    // candidate FIRST delivery (last_delivered < 0) the byte-contiguity of stream
+    // offset 0 is unprovable from the bsi ruler alone -- the prior "first delivery
+    // always legal" branch let a NON-origin batch (a dropped origin's successor)
+    // commit at offset 0 (the offset-0 head-skip). The authenticated stream origin
+    // generation is re-established fresh on each authenticated session by the
+    // KEY_ACTIVATE re-anchor (kx_stream_reanchor: cmd_batch_seq_id = 0), so a first
+    // delivery is a legal origin ONLY IF it carries that generation. origin_gen < 0
+    // (unarmed / non-authenticated / the pure regression callers) keeps the legacy
+    // first-delivery-always-legal behaviour byte-identically.
+    if(last_delivered_bsi < 0)
+    {
+      if(origin_gen < 0) return false;
+      return ((unsigned)(bsi & 0xFF) != (unsigned)(origin_gen & 0xFF));
+    }
     unsigned last = (unsigned)(last_delivered_bsi & 0xFF);
     unsigned b    = (unsigned)(bsi & 0xFF);
     unsigned fwd  = (b - last) & 0xFFu;
@@ -2394,9 +2409,27 @@ public:
   // fact-documents/data-flow-recoverable-gap-abort.md §5.
   static bool gap_is_recoverable_prev_hole(int cur_bsi, int last_delivered_bsi,
                                            bool prev_active, int prev_bsi,
-                                           int prev_received_count)
+                                           int prev_received_count,
+                                           int origin_gen = -1)
   {
-    if(last_delivered_bsi < 0) return false;
+    // Authenticated-origin recoverable hold (PATH-A). At a candidate FIRST delivery
+    // (last_delivered < 0) the origin batch (origin_gen) may have been ADOPTED and
+    // sealed into prev with a one-frame hole while its +1 successor completed first.
+    // That is the ONE session-start topology a bounded hold heals: hold the
+    // successor, re-advertise the origin's hole, deliver the origin first once it
+    // refills, then the held successor. A first delivery with NO armed prev at the
+    // origin generation (the origin was wholly lost, never adopted) is NOT
+    // recoverable here -> the caller's delivery_step_is_gap routes it to the LOUD
+    // gap-abort, never a silent offset-0 commit. origin_gen < 0 keeps legacy.
+    if(last_delivered_bsi < 0)
+    {
+      if(origin_gen < 0) return false;
+      if(!prev_active) return false;
+      if(prev_received_count <= 0) return false;
+      unsigned o = (unsigned)(origin_gen & 0xFF);
+      if((unsigned)(prev_bsi & 0xFF) != o) return false;
+      return ((unsigned)(cur_bsi & 0xFF) == ((o + 1u) & 0xFFu));
+    }
     if(!prev_active) return false;
     if(prev_received_count <= 0) return false;
     unsigned last = (unsigned)(last_delivered_bsi & 0xFF);
@@ -4565,6 +4598,14 @@ public:
   // scaffolding; in today's mechanism (a) retransmits carry the
   // CURRENT batch_seq_id and always match `rsp_current_expected_batch_seq_id`).
   int rsp_current_expected_batch_seq_id; // RSP: expected current batch_seq_id.
+  // Authenticated stream ORIGIN generation for the offset-0 delivery gate
+  // (data-flow-rx-fadecore-adoption.md). -1 = unarmed (legacy first-delivery-
+  // always-legal); armed to 0 by kx_stream_reanchor() on each authenticated
+  // session's KEY_ACTIVATE re-anchor (the fresh cmd_batch_seq_id=0 baseline);
+  // disarmed to -1 at reset_session_state(). Read by delivery_step_is_gap /
+  // gap_is_recoverable_prev_hole at the BATCH-DONE + prev + held-cur gates and by
+  // the copy_data_to_buffer first-emit origin backstop.
+  int rsp_stream_origin_gen = -1;
                                          //      Adopted from first v2 DATA frame seen
                                          //      (-1 sentinel = not yet adopted). Bumped
                                          //      by +1 mod 256 at ACK-GATE-PASS (full

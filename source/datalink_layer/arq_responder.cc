@@ -1399,7 +1399,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 								if(!gap_defeat
 								   && (rsp_stream_aborted
 								       || delivery_step_is_gap(rsp_prev_batch_seq_id,
-								                               rsp_last_delivered_batch_seq_id)))
+								                               rsp_last_delivered_batch_seq_id, rsp_stream_origin_gen)))
 								{
 									char reason[112];
 									snprintf(reason, sizeof(reason),
@@ -1628,7 +1628,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 								   && rsp_current_expected_batch_seq_id >= 0
 								   && !rsp_stream_aborted
 								   && !delivery_step_is_gap(rsp_current_expected_batch_seq_id,
-								                            rsp_last_delivered_batch_seq_id))
+								                            rsp_last_delivered_batch_seq_id, rsp_stream_origin_gen))
 								{
 									// The held cur must still be FULLY present: every slot [0, expected-1]
 									// of messages_rx[] RECEIVED. The retx that filled the prev hole routed
@@ -3263,7 +3263,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				if(!gap_defeat
 				   && (rsp_stream_aborted
 				       || delivery_step_is_gap(rsp_current_expected_batch_seq_id,
-				                               rsp_last_delivered_batch_seq_id)))
+				                               rsp_last_delivered_batch_seq_id, rsp_stream_origin_gen)))
 				{
 					// R2a — RECOVERABLE HOLD (data-flow-recoverable-gap-abort.md).
 					// Before the terminal abort, check whether this is the ONE healable
@@ -3291,7 +3291,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							rsp_current_expected_batch_seq_id,
 							rsp_last_delivered_batch_seq_id,
 							rsp_prev_batch_active, rsp_prev_batch_seq_id,
-							rsp_prev_batch_received_count))
+							rsp_prev_batch_received_count, rsp_stream_origin_gen))
 					{
 						// Revert the just-marked ACKED current-batch slots back to
 						// RECEIVED so this batch is HELD (survives for delivery once the

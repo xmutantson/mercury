@@ -6844,7 +6844,7 @@ int cl_arq_controller::deliver_complete_inflight_before_break()
 		// refuse the flush unconditionally (do not push into a DROPPED stream).
 		if(!gap_defeat
 		   && (rsp_stream_aborted
-		       || delivery_step_is_gap(rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id)))
+		       || delivery_step_is_gap(rsp_prev_batch_seq_id, rsp_last_delivered_batch_seq_id, rsp_stream_origin_gen)))
 			return 0;
 	}
 
@@ -9449,6 +9449,9 @@ void cl_arq_controller::reset_session_state()
 	// state, so clearing them here is correct on every session boundary.
 	rsp_gap_recover_rounds = 0;
 	rsp_gap_hold_cur_expected = 0;   // R2b: no held current batch survives a session boundary / teardown
+	// Disarm the authenticated stream ORIGIN gate on a session boundary; the next
+	// authenticated session re-arms it at its KEY_ACTIVATE re-anchor.
+	rsp_stream_origin_gen = -1;
 	cmd_prev_retain_count  = 0;
 	// MC-4: reset to the virtual predecessor of the next wire bsi. cmd_batch_seq_id
 	// is intentionally not reset at every session boundary, so using its predecessor
@@ -10132,6 +10135,11 @@ void cl_arq_controller::kx_stream_reanchor()
 	}
 	rsp_current_expected_batch_seq_id = -1;
 	rsp_prev_batch_seq_id             = -1;
+	// Arm the authenticated stream ORIGIN generation (data-flow-rx-fadecore-
+	// adoption.md): the KX-authenticated fresh baseline places the FIRST user-data
+	// batch at wire bsi 0 on both peers (cmd_batch_seq_id=0 above), so the offset-0
+	// delivery gate now admits ONLY bsi 0 as the legal stream origin.
+	rsp_stream_origin_gen             = 0;
 	// COMPLETE the fresh-bsi baseline. The wire bsi wraps back to 0 here, but the
 	// cross-layer data-flow audit of every wire-bsi consumer shows several ACK-
 	// credit / batch-routing high-waters are ALSO keyed on bsi and still hold the
@@ -22105,6 +22113,39 @@ void cl_arq_controller::copy_data_to_buffer()
 			return;
 		}
 		// dedup_defeat: fall through to the pre-fix re-emit (reproduces the splice).
+	}
+
+	// Authenticated-origin FAIL-CLOSED backstop (data-flow-rx-fadecore-adoption.md):
+	// copy_data_to_buffer() is the single receiver byte funnel. At the FIRST emit of
+	// an authenticated session (rx_stream_emitted_bsi_hw < 0 = nothing folded yet)
+	// the byte at stream offset 0 MUST be the authenticated origin generation. The
+	// upstream BATCH-DONE / prev gates already HOLD (PATH-A) or LOUD-abort (PATH-B) a
+	// non-origin first delivery via delivery_step_is_gap; this is the last-resort net
+	// for any residual route that reaches the funnel for a non-origin first emit --
+	// refuse it LOUDLY (never a silent offset-0 head-skip). Keyed on
+	// decrypt_delivered_bsi (the wire bsi, set immediately before every call). Inert
+	// unless armed (rsp_stream_origin_gen >= 0) and unless this is the first emit, so
+	// byte-identical on every normal delivery. MERCURY_ORIGIN_BACKSTOP_DEFEAT=1
+	// restores the pre-fix silent path (the fail-before arm on the SAME binary).
+	if(rsp_stream_origin_gen >= 0 && rx_stream_emitted_bsi_hw < 0
+	   && decrypt_delivered_bsi >= 0
+	   && ((unsigned)(decrypt_delivered_bsi & 0xFF)
+	       != (unsigned)(rsp_stream_origin_gen & 0xFF)))
+	{
+		bool origin_backstop_defeat = false;
+		{ const char* e = std::getenv("MERCURY_ORIGIN_BACKSTOP_DEFEAT");
+		  if(e && *e && atoi(e)!=0) origin_backstop_defeat = true; }
+		if(!origin_backstop_defeat)
+		{
+			printf("[RSP-V2-ORIGIN-REFUSE] first emit bsi=%d != authenticated stream "
+				"origin gen=%d (rx_delivered=%llu) -- refusing offset-0 head-skip; "
+				"tearing down (no non-origin first delivery)\n",
+				decrypt_delivered_bsi & 0xFF, rsp_stream_origin_gen,
+				(unsigned long long)rx_stream_delivered);
+			fflush(stdout);
+			rsp_gap_abort_teardown("authenticated-origin backstop: first delivery is not the stream origin");
+			return;
+		}
 	}
 
 	int copied = 0;
