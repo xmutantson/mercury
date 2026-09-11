@@ -11867,6 +11867,12 @@ int cl_arq_controller::test_inband_deliver()
 				// freed messages_tx[] + restaged from FIFO, so re-stage an in-flight batch and put
 				// the link back in the control-plane stall signature (nAcked_data flat).
 				stage_inflight_batch(cmd, B, /*n_frames=*/24, /*ahead=*/0);
+				// The fail-closed in-flight restage refuses in this fifo-less fixture
+				// (get_free_size()==-1) and DROPS the link after each demote; the guard
+				// then disarms on link_status != CONNECTED. This arm scripts the LEGACY
+				// per-miss walk, so re-establish the CONNECTED stall precondition each
+				// cycle (the drop path keeps its own fail-closed coverage).
+				cmd->link_status                    = CONNECTED;
 				cmd->connection_status              = TRANSMITTING_CONTROL;
 				cmd->cmd_inband_liveness_no_progress_polls = 0;
 				int cfg_before = cmd->current_configuration;
