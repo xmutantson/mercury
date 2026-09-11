@@ -3908,6 +3908,15 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_dd;
                 failed += ARQ_dd.test_dedup_rebase();
             }
+            // Authenticated stream-ORIGIN offset-0 delivery gate (data-flow-rx-fadecore-
+            // adoption.md): a non-origin batch (the successor of a dropped/lost origin) must
+            // never commit at stream offset 0. PATH-A holds+heals; PATH-B aborts loudly.
+            // Drives the REAL delivery_step_is_gap / gap_is_recoverable_prev_hole predicates;
+            // fail-before/pass-after on the SAME binary via the origin_gen argument.
+            {
+                cl_arq_controller ARQ_ob;
+                failed += ARQ_ob.test_origin_bind();
+            }
 
             // PRECOOK (Stage 1) shared-ring PIN invariant regression. Pins the persistent
             // capture ring (precook_pin_shared_ring), then drives a representative gearshift

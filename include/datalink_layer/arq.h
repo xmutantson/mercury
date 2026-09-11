@@ -3509,6 +3509,7 @@ public:
   // in-order 6->7->8, high-water never advances while the hole exists. Returns
   // 0=PASS, 1=FAIL. See fact-documents/data-flow-recoverable-gap-abort.md.
   int test_recoverable_gap_abort();
+  int test_origin_bind();  // --test-origin-bind: authenticated stream-origin offset-0 gate
   int test_recover_fire();
   int test_retain_shadow_overflow();
 

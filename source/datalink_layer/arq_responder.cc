@@ -18033,3 +18033,78 @@ int cl_arq_controller::test_kx_chunk_live_rx()
 	fflush(stdout);
 	return failed;
 }
+
+
+// --test-origin-bind: authenticated stream-ORIGIN offset-0 delivery gate
+// (data-flow-rx-fadecore-adoption.md). Drives the EXACT production PURE predicates
+// (delivery_step_is_gap / gap_is_recoverable_prev_hole) that the BATCH-DONE + prev +
+// held-cur gates call, for the two offset-0 head-skip geometries: PATH-A (origin
+// adopted + sealed-with-hole, successor completes first -> HOLD then heal) and PATH-B
+// (origin wholly lost, RSP first-adopts a non-origin batch, no armed prev -> LOUD
+// abort, never a silent offset-0 commit). Fail-before/pass-after on the SAME binary
+// via the origin_gen argument: origin_gen < 0 (unarmed) reproduces the pre-fix
+// "first delivery always legal" head-skip; origin_gen >= 0 (armed at kx_stream_reanchor)
+// holds/aborts. Pure + deterministic; no channel / IONOS / RF.
+int cl_arq_controller::test_origin_bind()
+{
+	int fails = 0;
+	auto ck = [&](bool cond, const char* name){
+		if(cond){ printf("[TEST-ORIGIN-BIND] PASS: %s\n", name); }
+		else    { printf("[TEST-ORIGIN-BIND] FAIL: %s\n", name); fails++; }
+		fflush(stdout);
+	};
+	const int ORIG = 0;   // authenticated origin generation (KX re-anchor baseline)
+
+	// --- Control: the authenticated origin IS legal at offset 0 ---
+	ck(delivery_step_is_gap(ORIG, -1, ORIG) == false,
+	   "C0 origin (bsi0) legal at offset 0 (armed)");
+
+	// --- PATH-A: origin adopted + sealed-with-hole, successor completes first ---
+	ck(delivery_step_is_gap(1, -1, ORIG) == true,
+	   "A1 non-origin successor (bsi1) is a gap at offset 0 (armed)");
+	ck(gap_is_recoverable_prev_hole(1, -1, /*prev_active=*/true, /*prev_bsi=*/ORIG,
+	                                /*prev_received=*/3, ORIG) == true,
+	   "A2 successor HELD (origin is armed partial prev) -- recoverable, not aborted");
+	ck(delivery_step_is_gap(1, ORIG, ORIG) == false,
+	   "A3 held successor delivers in-order once origin committed (last=0)");
+
+	// --- PATH-B: origin wholly lost, first-adopt non-origin, no armed prev ---
+	ck(delivery_step_is_gap(1, -1, ORIG) == true,
+	   "B1 first-adopt non-origin (bsi1) is a gap at offset 0 (armed)");
+	ck(gap_is_recoverable_prev_hole(1, -1, /*prev_active=*/false, /*prev_bsi=*/-1,
+	                                /*prev_received=*/0, ORIG) == false,
+	   "B2 no armed origin prev -> NOT recoverable -> routes to LOUD gap-abort");
+	ck(delivery_step_is_gap(2, -1, ORIG) == true,
+	   "B3 deeper non-origin first delivery (bsi2) is a gap (armed)");
+	ck(gap_is_recoverable_prev_hole(2, -1, /*prev_active=*/true, /*prev_bsi=*/ORIG,
+	                                /*prev_received=*/3, ORIG) == false,
+	   "B4 cur (bsi2) is not the origin's immediate successor -> not recoverable -> abort");
+
+	// --- Legacy / regression: unarmed (origin_gen<0) keeps first-delivery-always-legal ---
+	ck(delivery_step_is_gap(1, -1) == false,
+	   "L1 unarmed: non-origin first delivery legal (byte-identical legacy)");
+	ck(delivery_step_is_gap(1, -1, -1) == false,
+	   "L2 explicit origin_gen=-1: legacy first-delivery-legal");
+	ck(gap_is_recoverable_prev_hole(1, -1, true, 0, 3) == false,
+	   "L3 unarmed recoverable predicate: legacy last<0 -> false");
+	ck(delivery_step_is_gap(12, 10, ORIG) == true,
+	   "L4 mid-stream +2 hole still a gap (armed, unchanged)");
+	ck(delivery_step_is_gap(11, 10, ORIG) == false,
+	   "L5 mid-stream contiguous +1 still legal (armed, unchanged)");
+	ck(gap_is_recoverable_prev_hole(8, 6, true, 7, 24, ORIG) == true,
+	   "L6 mid-stream recoverable +2/armed-prev unchanged (armed)");
+	ck(gap_is_recoverable_prev_hole(8, 6, true, 7, 24) == true,
+	   "L7 mid-stream recoverable unchanged when unarmed too");
+
+	// --- Wrap: a non-zero origin generation binds correctly (mod-256) ---
+	const int ORIG5 = 5;
+	ck(delivery_step_is_gap(5, -1, ORIG5) == false, "W1 origin gen=5 legal at offset 0");
+	ck(delivery_step_is_gap(6, -1, ORIG5) == true,  "W2 non-origin (6) is a gap when origin=5");
+	ck(gap_is_recoverable_prev_hole(6, -1, true, 5, 3, ORIG5) == true,
+	   "W3 origin=5 armed prev, successor 6 -> recoverable hold");
+
+	printf("[TEST-ORIGIN-BIND] %s (%d failures)\n",
+	       fails==0 ? "ALL PASS" : "FAILURES", fails);
+	fflush(stdout);
+	return fails;
+}
