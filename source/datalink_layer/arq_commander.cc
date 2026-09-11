@@ -22330,11 +22330,27 @@ int cl_arq_controller::test_streaming_compress_overshoot()
 		if(algo == COMPRESS_ALGO_RAW) raw_batches++;
 		decoded = wire.empty() ? -1 : rx.decompress_block(wire.data(),
 			(int)wire.size(), roundtrip.data(), (int)roundtrip.size());
-		bool cycle_exact = decoded == batch_uncompressed_size
-			&& decoded > 0
-			&& sequence_raw + decoded <= PAYLOAD
-			&& memcmp(roundtrip.data(), fed.data() + sequence_raw,
-				(size_t)decoded) == 0;
+		int first_mm = -1;
+		if(decoded > 0 && sequence_raw + decoded <= PAYLOAD)
+			for(int k = 0; k < decoded; k++)
+				if(roundtrip[(size_t)k] != fed[(size_t)(sequence_raw + k)]) { first_mm = k; break; }
+		printf("[TEST-CMPRETRY] cycle %d: algo=%d wire=%ld decoded=%d want=%d stream_off=%ld first_mismatch=%d\n",
+			cycle, algo, (long)wire.size(), decoded, batch_uncompressed_size, sequence_raw, first_mm);
+		fflush(stdout);
+		// The staged stream can EXHAUST before the scripted cycles run out (the
+		// compressor packs the 65535-byte payload into fewer batches as its ratio
+		// improves; measured 27840+27282+10413 = the whole payload in three). An
+		// empty batch is valid IFF the full payload has already been delivered
+		// byte-exact; an empty batch MID-stream is a staging defect and still fails.
+		bool cycle_exact;
+		if(wire.empty())
+			cycle_exact = (sequence_raw == (long)PAYLOAD);
+		else
+			cycle_exact = decoded == batch_uncompressed_size
+				&& decoded > 0
+				&& sequence_raw + decoded <= PAYLOAD
+				&& memcmp(roundtrip.data(), fed.data() + sequence_raw,
+					(size_t)decoded) == 0;
 		sequence_exact = sequence_exact && cycle_exact;
 		if(decoded > 0) sequence_raw += decoded;
 		sequence_wire += (long)wire.size();
