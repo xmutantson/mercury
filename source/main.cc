@@ -4012,7 +4012,7 @@ int main(int argc, char *argv[])
                         if(matches) printf("%s PASS-AFTER: pinned live descrambler EQUALS seed-0 ref (dump[0..15]=%s, ref=%s)\n", TAG, live.c_str(), dump16(ref_seq).c_str());
                         else { printf("%s FAIL: pinned live descrambler != seed-0 ref (dump[0..15]=%s, ref=%s)\n", TAG, live.c_str(), dump16(ref_seq).c_str()); dfail++; }
                     } else {
-                        if(!matches) printf("%s FAIL-BEFORE ok: DEFEAT descrambler DIVERGES from ref (garbage/zeroed, dump[0..15]=%s)\n", TAG, live.c_str());
+                        if(!matches) printf("%s DEFEAT-ARM ok (fail-before): descrambler DIVERGES from ref (garbage/zeroed, dump[0..15]=%s)\n", TAG, live.c_str());
                         else { printf("%s FAIL: DEFEAT descrambler matched ref (poison did not take)\n", TAG); dfail++; }
                     }
                 }
