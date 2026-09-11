@@ -39,20 +39,33 @@
 // Four independent real outputs share one AVX2 register. Keep multiply and
 // add as separate operations so each lane has the same two binary64 rounding
 // points and ascending tap order as the scalar authority. The exact kernel is
-// opt-in and runtime-qualified; unsupported CPUs retain the scalar path.
+// default-on and runtime-qualified; unsupported CPUs retain the scalar path.
 static inline bool fir_x86_avx2_exact_enabled()
 {
 #if MERCURY_FIR_X86_AVX2_EXACT
-	static const int v=[] {
-		const char* e=std::getenv("MERCURY_FIR_AVX2_EXACT");
-		if(!(e && *e && atoi(e)!=0)) return 0;
+	static const int cpu_ok=[] {
 		__builtin_cpu_init();
 		return __builtin_cpu_supports("avx2") ? 1 : 0;
 	}();
-	return v!=0;
+	if(!cpu_ok) return false;
+	// Lever law: unset (or empty) means default-ON; `0` disables and restores
+	// the scalar authority. Read per call (not cached) so a lever change made
+	// by a test or a pinned A/B cell takes effect without a process restart;
+	// one getenv per buffer-sized call is noise next to the O(nItems*nTaps)
+	// kernel it guards.
+	const char* e=std::getenv("MERCURY_FIR_AVX2_EXACT");
+	return !(e && *e && atoi(e)==0);
 #else
 	return false;
 #endif
+}
+
+// Lever/CPU state query for the exactness gate and A/B tooling: true iff the
+// exact AVX2 kernels are selected for eligible calls in this process right
+// now (the CPU supports AVX2 and the lever is not `0`).
+bool fir_exact_avx2_active()
+{
+	return fir_x86_avx2_exact_enabled();
 }
 
 static inline bool fir_complex_ranges_overlap(const std::complex<double>* in,

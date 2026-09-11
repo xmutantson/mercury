@@ -83,6 +83,12 @@ public:
 	int filter_nTaps;
 };
 
+// True iff the byte-exact AVX2 FIR kernels are active for eligible calls in
+// this process (x86-64 with AVX2, and MERCURY_FIR_AVX2_EXACT is not `0`).
+// Lever law: unset (or empty) defaults ON; `0` disables. Builds without the
+// AVX2 kernels always return false.
+bool fir_exact_avx2_active();
+
 
 
 

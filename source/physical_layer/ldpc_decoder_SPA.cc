@@ -392,38 +392,43 @@ static inline bool ldpc_fixedpoint_enabled()
 ldpc_decoder_kind ldpc_decoder_policy_for_config(int configuration)
 {
 	const char* lever = std::getenv("MERCURY_LDPC_MINSUM");
-	if(lever == nullptr || *lever == '\0' || std::strcmp(lever, "0") == 0)
-		return LDPC_DECODER_SPA;
 
-	// Historical A/B parity: `1` means min-sum on every SPA-family decode,
-	// with MERCURY_LDPC_FIXEDPOINT retaining its old secondary role.
-	if(std::strcmp(lever, "1") == 0)
-		return ldpc_fixedpoint_enabled()
-			? LDPC_DECODER_MINSUM_FIXED : LDPC_DECODER_MINSUM;
-
-	if(std::strcmp(lever, "scoped") == 0)
+	// Lever law: unset (or empty) means default-ON and `0` disables. The
+	// default arm is the priced config-scoped policy below, identical to the
+	// explicit `scoped` spelling, which stays documented for pinned A/B runs.
+	if(lever != nullptr && *lever != '\0' && std::strcmp(lever, "scoped") != 0)
 	{
-		// The configuration table gives cfg15, cfg16, and cfg17 the identical
-		// rate-14/16 QC-LDPC matrix. cfg16/cfg17 were priced directly; cfg15 is
-		// admitted because its decoder graph is literally the same table entry.
-		// No NB alias is added: NB clamps requests above NB_CONFIG_MAX (cfg14)
-		// before ldpc.configuration is assigned, so cfg15/16/17 are unreachable
-		// as NB states. cfg14 and every unpriced OFDM/robust/experimental config
-		// deliberately remain exact SPA.
-		switch(configuration)
-		{
-			case CONFIG_15:
-			case CONFIG_16:
-			case CONFIG_17:
-				return LDPC_DECODER_MINSUM_FIXED;
-			default:
-				return LDPC_DECODER_SPA;
-		}
+		if(std::strcmp(lever, "0") == 0)
+			return LDPC_DECODER_SPA;
+
+		// Historical A/B parity: `1` means min-sum on every SPA-family decode,
+		// with MERCURY_LDPC_FIXEDPOINT retaining its old secondary role.
+		if(std::strcmp(lever, "1") == 0)
+			return ldpc_fixedpoint_enabled()
+				? LDPC_DECODER_MINSUM_FIXED : LDPC_DECODER_MINSUM;
+
+		// Fail closed. Legacy truthy spellings other than the documented `1`
+		// cannot widen min-sum beyond the priced scope: they select exact SPA
+		// everywhere, strictly narrower than the default.
+		return LDPC_DECODER_SPA;
 	}
 
-	// Fail closed. In particular, legacy truthy spellings other than the
-	// documented `1` cannot accidentally turn min-sum on globally.
-	return LDPC_DECODER_SPA;
+	// The configuration table gives cfg15, cfg16, and cfg17 the identical
+	// rate-14/16 QC-LDPC matrix. cfg16/cfg17 were priced directly; cfg15 is
+	// admitted because its decoder graph is literally the same table entry.
+	// No NB alias is added: NB clamps requests above NB_CONFIG_MAX (cfg14)
+	// before ldpc.configuration is assigned, so cfg15/16/17 are unreachable
+	// as NB states. cfg14 and every unpriced OFDM/robust/experimental config
+	// deliberately remain exact SPA.
+	switch(configuration)
+	{
+		case CONFIG_15:
+		case CONFIG_16:
+		case CONFIG_17:
+			return LDPC_DECODER_MINSUM_FIXED;
+		default:
+			return LDPC_DECODER_SPA;
+	}
 }
 
 const char* ldpc_decoder_kind_name(ldpc_decoder_kind kind)

@@ -110,7 +110,10 @@ bool run_decoder_policy_boundary(cl_telecom_system* ts)
 		}
 	};
 
-	verify("default", nullptr, nullptr, false, false, LDPC_DECODER_SPA);
+	// Lever law (default-ON): unset and empty both select the priced scoped
+	// policy: cfg15/16/17 fixed-point min-sum, exact SPA everywhere else.
+	verify("default-scoped", nullptr, nullptr, false, true, LDPC_DECODER_SPA);
+	verify("empty-scoped", "", nullptr, false, true, LDPC_DECODER_SPA);
 	verify("forced-SPA", "0", "1", false, false, LDPC_DECODER_SPA);
 	verify("global-float", "1", nullptr, true, false, LDPC_DECODER_MINSUM);
 	verify("global-fixed", "1", "1", true, false, LDPC_DECODER_MINSUM_FIXED);
@@ -161,6 +164,47 @@ bool run_decoder_policy_boundary(cl_telecom_system* ts)
 	       ts->current_configuration, ts->ldpc.configuration,
 	       ldpc_decoder_kind_name(nb_kind), (int)nb_pass);
 	pass &= nb_pass;
+
+	// Default-ON fire witness through the production decode entry: with the
+	// lever UNSET a real cfg16 decode must select the scoped fixed-point
+	// min-sum kernel and still return the exact info bits; with `0` the same
+	// decode must run exact SPA. This pins the unset default itself, not just
+	// the mapping table above.
+	ts->narrowband_enabled = NO;
+	ts->current_configuration = CONFIG_NONE;
+	ts->load_configuration(CONFIG_16);
+	{
+		std::vector<int> info((size_t)ts->ldpc.K, 0);
+		std::vector<int> encoded((size_t)ts->ldpc.N, 0);
+		std::vector<float> llr((size_t)ts->ldpc.N, 0.0f);
+		std::vector<int> out_default((size_t)ts->ldpc.K, -1);
+		std::vector<int> out_off((size_t)ts->ldpc.K, -2);
+		for(int i=0; i<ts->ldpc.K; ++i) info[(size_t)i] = (i*29 + 7) & 1;
+		ts->ldpc.encode(info.data(), encoded.data());
+		for(int i=0; i<ts->ldpc.N; ++i)
+			llr[(size_t)i] = encoded[(size_t)i] ? -20.0f : 20.0f;
+
+		tdm_setenv("MERCURY_LDPC_MINSUM", nullptr);
+		ts->ldpc.decode(llr.data(), out_default.data());
+		ldpc_decoder_kind kind_default = ts->ldpc.last_decoder_kind;
+		bool default_faithful = buffers_equal(info, out_default);
+
+		tdm_setenv("MERCURY_LDPC_MINSUM", "0");
+		ts->ldpc.decode(llr.data(), out_off.data());
+		ldpc_decoder_kind kind_off = ts->ldpc.last_decoder_kind;
+		bool off_faithful = buffers_equal(info, out_off);
+
+		bool fire_pass = kind_default == LDPC_DECODER_MINSUM_FIXED
+			&& default_faithful
+			&& kind_off == LDPC_DECODER_SPA
+			&& off_faithful;
+		printf("[TEST-LDPC-POLICY] cfg16 unset-default path=%s faithful=%d; "
+		       "lever=0 path=%s faithful=%d; fire=%s\n",
+		       ldpc_decoder_kind_name(kind_default), (int)default_faithful,
+		       ldpc_decoder_kind_name(kind_off), (int)off_faithful,
+		       fire_pass ? "PASS" : "FAIL");
+		pass &= fire_pass;
+	}
 
 	// Restore the caller's A/B arm and the marathon's cfg16 geometry.
 	saved_minsum.restore();

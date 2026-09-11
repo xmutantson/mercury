@@ -5249,6 +5249,7 @@ int main(int argc, char *argv[])
     bool test_tinterp_seed_cli = false; // --test-tinterp-seed: TINTERP-SEED production it=0 estimator seed-swap failing-first (staging/tinterp-seed).
     bool test_tinterp_receive_cli = false; // --test-tinterp-receive: actual receive_byte producer/selector transitions.
     bool test_decode_marathon_cli = false; // --test-decode-marathon: LEVER C parallel==serial big-block decode integrity (decode-marathon-C.md §8).
+    bool test_fir_lever_cli = false;    // --test-fir-lever: exact-AVX2 FIR lever law (unset=default-on, 0=scalar authority) + byte-exactness at the production entry points.
     bool test_climb_engine_cli = false; // --test-climb-engine: integrated 3-bug climb regression (gearshift-climb-engine.md §7).
     bool test_break_weld_cli = false;   // --test-break-weld: BREAK recovery target pin (diagnostic knob).
     bool test_rung_floor_cli = false;   // --test-rung-floor: per-rung MEASURED election floor gate + failure memory (DATAFLOW_AUDIT_rung_floor.md): wb13 fail-before/pass-after, never-raise, arm/survive/decay/reset, defeat knob.
@@ -6629,6 +6630,16 @@ int main(int argc, char *argv[])
             // with a shared-workspace fail-before. One-shot at startup, then exit rc.
             // See fact-documents/decode-marathon-C.md §8.
             test_decode_marathon_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-fir-lever") == 0)
+        {
+            // Exact-AVX2 FIR lever gate: unset means default-on (on capable
+            // hosts), `0` restores the scalar authority, and the exact kernels
+            // must stay byte-identical to scalar at the production entry
+            // points. One-shot at startup, then exit rc.
+            test_fir_lever_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -9047,6 +9058,19 @@ start_modem:
             fflush(stdout);
             int rc = test_decode_marathon_run();
             printf("[FLAG] Decode-marathon test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_fir_lever_cli) {
+            // Exact-AVX2 FIR lever law (unset=default-on, `0`=scalar) plus a
+            // byte-exactness re-proof at the production FIR entry points.
+            // One-shot, then exit rc.
+            extern int test_fir_lever_run();
+            printf("[FLAG] --test-fir-lever: invoking exact-FIR lever law + "
+                   "exactness gate\n");
+            fflush(stdout);
+            int rc = test_fir_lever_run();
+            printf("[FLAG] FIR-lever test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
