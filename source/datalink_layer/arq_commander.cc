@@ -13611,6 +13611,10 @@ int cl_arq_controller::test_rung_floor_gate()
 		unsigned char rpt_top   = topgear_pack_report(30.60, 0.05);   // winning top anchor (34.66 dial)
 		unsigned char rpt_below = topgear_pack_report(23.999, 0.05);
 		unsigned char rpt_at    = topgear_pack_report(24.000, 0.05);
+		unsigned char rpt_q     = topgear_pack_report(25.000, 0.05);
+		setenv("MERCURY_TOPGEAR_FLOOR_QUANTIZED", "0", 1);
+		unsigned char rpt_leak  = topgear_pack_report(24.000, 0.05);
+		unsetenv("MERCURY_TOPGEAR_FLOOR_QUANTIZED");
 		check((rpt_admit & 0x0F) == 11,
 			"T7 refit: reliable-dial SNR_downlink 25.67 clears CFG17_SNR_FLOOR_DEFAULT_DB -> flat_state 11 "
 			"(pass-after at 24.0; FAIL-BEFORE at the 28.7 floor: 25.67<28.7 -> flat_state 9, cfg17 welded shut)");
@@ -13622,8 +13626,16 @@ int cl_arq_controller::test_rung_floor_gate()
 			"T7 refit: un-clipped meter still admits the winning top anchor (SNR_downlink 30.6 -> flat_state 11)");
 		check((rpt_below & 0x0F) == 9,
 			"T7 boundary: 23.999 is below the cfg17 forward floor and is refused");
-		check((rpt_at & 0x0F) == 11,
-			"T7 boundary: 24.000 is exactly on the cfg17 forward floor and is admitted");
+		// Dial-22 floor-leak fix (topgear_pack_report, DEFAULT-ON): the admit compares the
+		// QUANTIZED reconstruction snr_q*2-5 (the value the commander rebuilds), not the raw
+		// SNR. Raw 24.000 quantizes to snr_q=14 -> reconstructed 23 < 24 -> REFUSED (the
+		// [24,25) leak the fix closes); the first admitted raw value is 25.000 (rebuilds 25).
+		check((rpt_at & 0x0F) == 9,
+			"T7 boundary: raw 24.000 rebuilds below the cfg17 floor (23) and is refused (leak closed)");
+		check((rpt_q & 0x0F) == 11,
+			"T7 boundary: raw 25.000 rebuilds on the cfg17 floor (25) and is admitted");
+		check((rpt_leak & 0x0F) == 11,
+			"T7 legacy raw-compare (quantized fix defeated) admits raw 24.000 (the pre-fix leak)");
 		unsetenv("MERCURY_CFG17_SNR_FLOOR");
 	}
 
