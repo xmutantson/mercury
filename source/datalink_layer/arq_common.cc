@@ -18854,7 +18854,8 @@ bool cl_arq_controller::mw_find_ack_sack_phase(int rwi, int tail_offset,
 
 bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
                                             bool multiwindow_scan,
-                                            int causal_ring_samples)
+                                            int causal_ring_samples,
+                                            bool control_ack_strict)
 {
 	// recovery-ack-capture LEVER 1(b) (data-flow-recovery-ack-capture.md §6): arm the
 	// EXISTING multi-window look-back for the recovery control-ACK poll under the env
@@ -19406,8 +19407,43 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			// Random noise has metric≈8/Nc=0.16 at 8 matches. metric>=0.5 rejects
 			// noise while accepting marginal signals (was 3.0, caused ~50% timeouts).
 			// Phase-2: --ack-metric-threshold=F overrides.
+			// Control-ACK acceptance hardening (cross-layer control-ACK audit):
+			// a CLOSE/control reverse-ACK is a bare content-free MFSK base tone, so
+			// the only content-free discriminator between a real (even weak) control
+			// tone burst and a pure-noise correlation is the in-band energy
+			// concentration. The control-ACK accept previously used the lax DATA-ACK
+			// metric floor (ack_metric_threshold, 0.5); every other control-frame
+			// detector (detect_ack_snr_from_passband, decode_ctrl_suffix_from_passband,
+			// the CONNECT path) uses the control floor CTRL_DETECT_METRIC_MIN. When
+			// control_ack_strict is set (the CLOSE control-ACK wait only), apply the
+			// control-detection floor so a low-energy noise correlation cannot be
+			// promoted to an ACKed CLOSE and complete a spurious teardown. Default-false
+			// for every data/BREAK/HAIL/turbo/non-CLOSE caller -> byte-identical.
+			// Second, anti-forge condition (control_ack_strict only): the PER-SYMBOL
+			// in-band energy concentration (metric / matched) must also clear
+			// CTRL_ACK_CONCENTRATION_MIN. The summed-metric floor alone can be cleared by
+			// noise that accumulates many low-concentration matched symbols (measured: a
+			// small tail of pure-WGN windows reaches summed metric >= the control floor via
+			// matched COUNT, not tone energy). A real tone burst concentrates its energy in
+			// the expected tones (concentration ~1.0); white noise spreads it across all
+			// bins (~0.1), so noise cannot forge BOTH the summed floor AND the concentration.
+			// All non-control callers skip this (byte-identical).
+			const double CTRL_ACK_CONCENTRATION_MIN = 0.35;
+#ifdef CTRL_ACK_FLOOR_FAILBEFORE
+			const double ctrl_ack_metric_floor = ack_metric_threshold;
+			const bool   ctrl_ack_concentration_ok = true;   // defeat: pre-fix, no concentration gate
+#else
+			const double ctrl_ack_metric_floor = control_ack_strict
+				? (double)cl_mfsk::CTRL_DETECT_METRIC_MIN
+				: ack_metric_threshold;
+			const bool   ctrl_ack_concentration_ok =
+				(!control_ack_strict)
+				|| (matched_count > 0
+				    && (metric / (double)matched_count) >= CTRL_ACK_CONCENTRATION_MIN);
+#endif
 			bool base_accept = (matched_count >= telecom_system->ack_mfsk.ack_match_threshold
-			                    && metric >= ack_metric_threshold);
+			                    && metric >= ctrl_ack_metric_floor
+			                    && ctrl_ack_concentration_ok);
 			// recovery-ack-capture LEVER 2 RELAXED accept (data-flow-recovery-ack-
 			// capture.md §6): when the fine pass is engaged on the recovery control-ACK
 			// poll, the weak 7/16 + 0.5 base bar is NOT enough (the ~311 sub-window MAX

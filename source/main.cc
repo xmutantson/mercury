@@ -3063,6 +3063,10 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_compact_reset;
                 failed += test_compact_reset.test_send_mfsk_compact_confirm_reset_failure();
             }
+            {
+                cl_arq_controller test_ctrl_ack;
+                failed += test_ctrl_ack.test_ctrl_ack_noise_rejection();
+            }
             failed += run_moose_deadzone_tests();
             failed += run_pilot_thin_nv_tests();
             failed += run_sim_clock_tests();

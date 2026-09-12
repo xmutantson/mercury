@@ -175,6 +175,15 @@ if [ "${TERMINAL_SETTLE_DEADLINE_FAILBEFORE:-0}" = "1" ]; then
     TRACE_CFLAGS="$TRACE_CFLAGS -DTERMINAL_SETTLE_DEADLINE_FAILBEFORE"
     echo "  (TERMINAL_SETTLE_DEADLINE_FAILBEFORE defeat build - terminal-settlement deadline mis-scaled)"
 fi
+# Optional: CTRL_ACK_FLOOR_FAILBEFORE=1 ./build.sh o3 -- test-infra defeat build that reverts
+# the CLOSE control-ACK accept to the loose data-ACK metric floor (the pre-fix behavior), so the
+# control-ACK noise-rejection regression demonstrates the fail-before (noise-band correlations
+# admitted). Must reach BOTH the arq_common.cc accept path AND the test TU, so it is carried in
+# TRACE_CFLAGS (which flows into CXXFLAGS below). Test-only; never a production build.
+if [ "${CTRL_ACK_FLOOR_FAILBEFORE:-0}" = "1" ]; then
+    TRACE_CFLAGS="$TRACE_CFLAGS -DCTRL_ACK_FLOOR_FAILBEFORE"
+    echo "  (CTRL_ACK_FLOOR_FAILBEFORE defeat build - CLOSE control-ACK reverted to the loose data floor)"
+fi
 
 # --- Deterministic git build-id baked into the binary banner ---------------
 # Writes include/common/build_id.h with #define MERCURY_BUILD_ID "<shortrev>[-dirty]".
@@ -438,6 +447,7 @@ source/datalink_layer/test_decompress_false_accept.cc
 source/datalink_layer/test_kx_data_tamper.cc
 source/datalink_layer/test_compact_confirm_rx.cc
 source/datalink_layer/test_recovery_ack_capture_exercise.cc
+source/datalink_layer/test_ctrl_ack_noise_rejection.cc
 source/datalink_layer/test_rsp_timeout_format.cc
 source/datalink_layer/b2f_handler.cc
 source/datalink_layer/channel_state_lookup.cc

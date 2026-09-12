@@ -5498,7 +5498,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 #endif
 				}
 				if(receive_ack_pattern(
-					false, mw_scan, causal_ring_samples))
+					false, mw_scan, causal_ring_samples,
+					/*control_ack_strict=*/messages_control.data[0]==CLOSE_CONNECTION))
 				{
 					printf("[CMD-ACK-PAT] Control ACK for code=%d detected! elapsed=%dms link=%d status=%d\n",
 					(int)messages_control.data[0], (int)receiving_timer.get_elapsed_time_ms(), (int)link_status, (int)messages_control.status);

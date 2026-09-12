@@ -860,6 +860,10 @@ public:
   // A complete ACK lives in retained ring history while the newest tail is
   // silent. Bare monitor returns false; the recovery capture port accepts 1/1.
   int  test_recovery_ack_capture_exercise();
+  // Control-ACK noise-rejection regression: the CLOSE control-ACK accept must
+  // use the control energy floor (CTRL_DETECT_METRIC_MIN), not the lax data floor,
+  // so a low-energy noise correlation cannot complete a spurious teardown.
+  int  test_ctrl_ack_noise_rejection();
   // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
   // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
   // opts into the robust noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST
@@ -920,7 +924,8 @@ public:
   // byte-identical.
   bool receive_ack_pattern(bool defer_audio_advance = false,
                            bool multiwindow_scan = false,
-                           int causal_ring_samples = -1);
+                           int causal_ring_samples = -1,
+                           bool control_ack_strict = false);
 
   // Multi-window DATA-ACK/SACK correlator (Track A, mwcorr;
   // fact-documents/data-flow-data-ack-sack-correlator.md). The steady
