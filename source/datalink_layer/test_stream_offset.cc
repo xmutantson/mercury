@@ -31,6 +31,11 @@
 #include <vector>
 
 static int g_fails = 0;
+static int accept_test_socket_write(const char*, int length)
+{
+	return length;
+}
+
 static void CHECK(bool cond, const char* what, long long got, long long want)
 {
 	if(cond)
@@ -741,6 +746,27 @@ int cl_arq_controller::test_stream_offset()
 	//     SILENTLY spliced onto app position 101 — the corruption reproduced.
 	// Also asserts NO false-refuse: a fresh transfer (prev==0) never arms, and the transfer AFTER
 	// a refusal delivers fully (prev cleared → no livelock).
+	int saved_data_socket_status = tcp_socket_data.status;
+	tcp_socket_data.status = TCP_STATUS_ACCEPTED;
+	auto drive_directed_start_accept = [&]() {
+		// Drive the callsign-matched production consumer, not merely its seam-arm
+		// helper. This is the reconnect path used by an ordinary responder while
+		// the application data socket remains attached across link sessions.
+		this->passive_monitor = false;
+		this->narrowband_enabled = NO;
+		this->my_call_sign = "RSP123";
+		this->link_status = LISTENING;
+		this->connection_status = RECEIVING;
+		messages_control.data[0] = START_CONNECTION;
+		messages_control.data[1] = (char)CRC8_calc(
+			(char*)my_call_sign.c_str(), my_call_sign.length());
+		callsign_pack("CMD123", 6, &messages_control.data[2]);
+		messages_control.status = RECEIVED;
+		int (*saved_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+		cl_tcp_socket::g_test_transmit_hook = accept_test_socket_write;
+		process_control_responder();
+		cl_tcp_socket::g_test_transmit_hook = saved_hook;
+	};
 	printf("[TEST-STREAM-OFFSET] Part X — reconnect-continuity fail-closed (cross-session splice)\n");
 	{
 		bool failclosed_defeat = false;
@@ -760,7 +786,6 @@ int cl_arq_controller::test_stream_offset()
 
 		// --- X0: NO false-refuse — a persistent socket with NOTHING delivered before (a fresh
 		// transfer) must NOT arm the seam, and the batch delivers fully. ---
-		rsp_test_force_app_persistent  = true;     // a client is attached to the app data socket
 		rsp_prev_session_app_delivered = 0;        // but the prior session delivered nothing
 		rsp_stream_aborted             = false;
 		rsp_reconnect_seam_arm_on_accept();        // PRODUCTION arm decision
@@ -801,7 +826,6 @@ int cl_arq_controller::test_stream_offset()
 		// (2) GENUINE teardown → REAL reset_session_state() (the snapshot's home). The app data
 		// socket persists across the reconnect. rsp_stream_aborted is false ⇒ a genuine session
 		// boundary (not a mid-transfer gap-abort) ⇒ the snapshot fires.
-		rsp_test_force_app_persistent = true;
 		rsp_stream_aborted            = false;
 		reset_session_state();                     // REAL reset — snapshots prev=101, zeroes cursor
 		CHECK(rsp_prev_session_app_delivered == 101,
@@ -811,9 +835,15 @@ int cl_arq_controller::test_stream_offset()
 			"X: real reset re-anchored the RX byte cursor at 0",
 			(long long)rx_stream_delivered, 0);
 
-		// (3) Fresh START_CONNECTION accept → PRODUCTION arm decision.
-		rsp_stream_aborted = false;                // the accept clears the abort latch
-		rsp_reconnect_seam_arm_on_accept();
+		// (3) Fresh directed START_CONNECTION → PRODUCTION accept + arm decision.
+		rsp_stream_aborted = true;                 // the accept itself must clear this latch
+		drive_directed_start_accept();
+		CHECK(link_status == CONNECTION_RECEIVED,
+			"X: directed START reached the callsign-matched accept branch",
+			link_status, CONNECTION_RECEIVED);
+		CHECK(!rsp_stream_aborted,
+			"X: directed START accept cleared the prior abort latch",
+			rsp_stream_aborted?1:0, 0);
 		if(failclosed_defeat)
 			CHECK(!rsp_cross_session_seam_armed, "X(defeat): DEFEAT env leaves the seam disarmed",
 				rsp_cross_session_seam_armed?1:0, 0);
@@ -861,10 +891,9 @@ int cl_arq_controller::test_stream_offset()
 				"X(fix): prev-delivered cleared post-refusal (next transfer fresh — no livelock)",
 				(long long)rsp_prev_session_app_delivered, 0);
 
-			// (5) NO livelock / NO false-refuse: the NEXT genuine reconnect (still on the persistent
-			// socket) must NOT re-arm (prev cleared), and its fresh transfer delivers fully.
-			rsp_stream_aborted = false;            // next accept clears the latch
-			rsp_reconnect_seam_arm_on_accept();
+			// (5) NO livelock / NO false-refuse: the NEXT genuine directed reconnect (still on the
+			// persistent socket) must NOT re-arm (prev cleared), and its fresh transfer delivers fully.
+			drive_directed_start_accept();
 			CHECK(!rsp_cross_session_seam_armed,
 				"X(fix): NEXT reconnect does NOT re-arm (prev cleared → no livelock)",
 				rsp_cross_session_seam_armed?1:0, 0);
@@ -881,7 +910,6 @@ int cl_arq_controller::test_stream_offset()
 			CHECK(p2==120,
 				"X(fix): fresh transfer after a refusal delivers fully (no false-refuse)", p2, 120);
 		}
-		rsp_test_force_app_persistent = false;     // leave no test-force flag set
 		printf("[TEST-STREAM-OFFSET] Part X failclosed_defeat=%d (0=fix→REFUSE, 1=defeat→SPLICE expected)\n",
 			(int)failclosed_defeat);
 	}
@@ -907,7 +935,7 @@ int cl_arq_controller::test_stream_offset()
 		rsp_stream_aborted             = false;
 		rsp_cross_session_seam_armed   = false;
 		rsp_prev_session_app_delivered = 0;
-		rsp_test_force_app_persistent  = true;     // a client stays attached across the reconnect
+		rsp_test_force_app_persistent  = false;    // use the production ACCEPTED-socket predicate
 
 		// (1) Session 1 delivers 185 app bytes through the PRODUCTION funnel while the sender's
 		// committed cursor raced far ahead (the low-SNR thrash).
@@ -939,10 +967,15 @@ int cl_arq_controller::test_stream_offset()
 			"X2: high-water SURVIVED the latched gap-abort+timeout teardown (F1 fire; ae8a236=0)",
 			(long long)rsp_prev_session_app_delivered, 185);
 
-		// (4) Fresh START_CONNECTION accept -> the accept clears the abort latch, then the PRODUCTION
-		// arm decision runs.
-		rsp_stream_aborted = false;
-		rsp_reconnect_seam_arm_on_accept();
+		// (4) Fresh directed START_CONNECTION -> the callsign-matched production accept clears the
+		// abort latch and runs the seam-arm decision.
+		drive_directed_start_accept();
+		CHECK(link_status == CONNECTION_RECEIVED,
+			"X2: directed START reached the callsign-matched accept branch",
+			link_status, CONNECTION_RECEIVED);
+		CHECK(!rsp_stream_aborted,
+			"X2: directed START accept cleared the gap-abort latch",
+			rsp_stream_aborted?1:0, 0);
 		CHECK(rsp_cross_session_seam_armed,
 			"X2: seam ARMED at the fresh accept after the REAL teardown (F1 fire; ae8a236=disarmed)",
 			rsp_cross_session_seam_armed?1:0, 1);
@@ -975,7 +1008,6 @@ int cl_arq_controller::test_stream_offset()
 		CHECK(rsp_prev_session_app_delivered==0,
 			"X2: prev-delivered cleared post-refusal (next transfer fresh -- no livelock)",
 			(long long)rsp_prev_session_app_delivered, 0);
-		rsp_test_force_app_persistent = false;
 	}
 
 	// ---------------------------------------------------------------------------
@@ -993,7 +1025,7 @@ int cl_arq_controller::test_stream_offset()
 		rsp_stream_aborted             = false;
 		rsp_cross_session_seam_armed   = false;
 		rsp_prev_session_app_delivered = 0;
-		rsp_test_force_app_persistent  = true;
+		rsp_test_force_app_persistent  = false;
 
 		// (1) A transfer delivers 240 app bytes and completes CLEANLY (peer CLOSE / EOT verified).
 		decrypt_delivered_bsi = 210;
@@ -1041,8 +1073,8 @@ int cl_arq_controller::test_stream_offset()
 		char x3tmp[65536]; int x3popped=fifo_buffer_rx.pop(x3tmp,(int)sizeof(x3tmp));
 		CHECK(x3popped==200,
 			"X3: back-to-back transfer after a clean EOT delivers fully (byte-identical)", x3popped, 200);
-		rsp_test_force_app_persistent = false;
 	}
+	tcp_socket_data.status = saved_data_socket_status;
 
 	// ---------------------------------------------------------------------------
 	// PART Y -- compression recovery must restore BOTH coupled identities: the
