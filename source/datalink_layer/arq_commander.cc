@@ -3251,6 +3251,14 @@ void cl_arq_controller::process_messages_commander()
 				fflush(stdout);
 				disconnect_requested=NO;
 				this->link_status=DISCONNECTING;
+			// Terminal-settlement convergence (data-flow-stream-offset.md 8.6): arm the bounded
+			// settle deadline. TX FIFO is drained + every data batch + the EOT is ACKed by the time
+			// CLOSE is queued (arq_commander.cc:3234), so full delivery is already assured; the reverse
+			// CLOSE-ACK is a courtesy handshake. If it is lost, update_status() converges after the
+			// deadline instead of hanging in DISCONNECTING to the process horizon.
+			disconnecting_settle_timer.stop();
+			disconnecting_settle_timer.reset();
+			disconnecting_settle_timer.start();
 				messages_control.status=FREE;
 				add_message_control(CLOSE_CONNECTION);
 			}
@@ -4062,6 +4070,18 @@ void cl_arq_controller::process_messages_tx_control()
 		{
 			stats.nLost_control++;
 			messages_control.status=FAILED_;
+#ifndef TERMINAL_SETTLE_FAILBEFORE
+				// A graceful CLOSE that exhausted its retransmits with no reverse ACK: converge rather
+				// than leave the session FAILED_ + hung. (Observed bug never reaches here — the timer
+				// deadline in update_status is the primary path — but a peer whose retransmits DO exhaust
+				// cleanly converges here immediately.)
+				if(link_status==DISCONNECTING && messages_control.data!=NULL
+				   && (unsigned char)messages_control.data[0]==CLOSE_CONNECTION)
+				{
+					cmd_terminal_settle_converge("close_retransmits_exhausted");
+					return;
+				}
+#endif
 		}
 	}
 
@@ -10423,6 +10443,41 @@ void cl_arq_controller::finish_turbo_direction()
 	}
 }
 
+void cl_arq_controller::cmd_terminal_settle_converge(const char* reason)
+{
+	// See data-flow-stream-offset.md 8.6. Reached only on the COMMANDER graceful-close path when the
+	// reverse CLOSE-ACK never arrived. Full delivery + EOT were assured before CLOSE was queued, so the
+	// sender declares the session locally settled (Two-Generals: a final ACK can always be lost) and runs
+	// the SAME terminal teardown the ACKed-CLOSE path runs.
+	disconnecting_settle_timer.stop();
+	disconnecting_settle_timer.reset();
+	cmd_terminal_converge_events++;
+	printf("[CMD-EOT-CONVERGE] CLOSE ACK not received after bounded retransmits; all data ACKed "
+		"— session settled (%s); emitting terminal DISCONNECTED (converge #%d)\n",
+		reason, cmd_terminal_converge_events);
+	fflush(stdout);
+
+	reset_session_state();
+	load_configuration(init_configuration,FULL,YES);
+	this->link_status=LISTENING;
+	this->connection_status=RECEIVING;
+	reset_all_timers();
+	telecom_system->data_container.frames_to_read =
+		telecom_system->data_container.preamble_nSymb + telecom_system->data_container.Nsymb;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+	fifo_buffer_rx.flush();
+	messages_control.status=FREE;
+	set_role(RESPONDER);
+
+	std::string str="DISCONNECTED\r";
+	tcp_socket_control.message->length=str.length();
+	for(int i=0;i<tcp_socket_control.message->length;i++)
+		tcp_socket_control.message->buffer[i]=str[i];
+	tcp_socket_control.transmit();
+}
+
 void cl_arq_controller::process_control_commander()
 {
 	if(this->connection_status==RECEIVING_ACKS_CONTROL)
@@ -11893,6 +11948,7 @@ void cl_arq_controller::process_control_commander()
 				link_timer.start();
 			}
 		}
+
 		else if(this->link_status==DISCONNECTING && messages_control.data[0]==CLOSE_CONNECTION)
 		{
 			reset_session_state();
@@ -28930,4 +28986,166 @@ int cl_arq_controller::test_retx_slot_order()
 		1, R, rotated1 ? 0 : 1);
 	fflush(stdout);
 	return pass ? 0 : 1;
+}
+
+int cl_arq_controller::test_terminal_settlement()
+{
+	// Terminal-settlement convergence test (data-flow-stream-offset.md 8.6).
+	// PART A: Half B CMD converge via the PRODUCTION update_status() path (fail-before/pass-after).
+	// PART B: Half A RSP re-ACK predicate invariants (fast, deterministic).
+	int failures = 0;
+	auto CHECK = [&failures](bool cond, const char* label) {
+		if (!cond) {
+			printf("  [FAIL] %s\n", label);
+			failures++;
+		}
+	};
+
+	// PART A0 (config-real deadline bound -- the guard that the 3/200 hard-codes previously masked):
+	// load the PRODUCTION WB config (cfg16) so nResends + ack_timeout_control are the LIVE values, then
+	// compute the settle deadline via the SAME production helper update_status() uses and assert it is
+	// within the absolute hard cap. The masked bug: (nResends+2)*ack_timeout_control = ~585 s at cfg16.
+	{
+		cl_telecom_system ts_cfg;
+		telecom_system = &ts_cfg;
+		role = COMMANDER;
+		load_configuration(16, FULL, YES);
+		int live_nResends = nResends;
+		int live_ack_to   = ack_timeout_control;
+		int computed      = terminal_settle_deadline_ms();
+		long long old_formula = (long long)(live_nResends + 2) * (long long)live_ack_to;
+		printf("[TEST-TERMINAL-SETTLE] cfg16-live nResends=%d ack_timeout_control=%d "
+		       "computed_deadline_ms=%d old_formula_ms=%lld cap_ms=%d floor_ms=%d\n",
+		       live_nResends, live_ack_to, computed, old_formula,
+		       (int)TERMINAL_SETTLE_CAP_MS, (int)TERMINAL_SETTLE_FLOOR_MS);
+		// Instrument adequacy: the loaded config MUST reach the blow-up regime, else this test cannot
+		// catch the class (the old 3/200 hard-codes are exactly why it did not).
+		CHECK(old_formula > (long long)TERMINAL_SETTLE_CAP_MS,
+		      "A0-INSTR: cfg16 live values exceed the cap under the OLD (nResends+2)*ack_timeout_control formula (config-real regime reached)");
+		// The corrected deadline is within the absolute bound and decoupled from the 20-deep nResends.
+		CHECK(computed <= (int)TERMINAL_SETTLE_CAP_MS, "A0a: computed deadline within absolute hard cap at cfg16");
+		CHECK(computed >= (int)TERMINAL_SETTLE_FLOOR_MS, "A0b: computed deadline at least the floor");
+		CHECK((long long)computed < old_formula,
+		      "A0c: corrected deadline strictly below the old mis-scaled formula at cfg16 (decoupled)");
+	}
+
+	// PART A: Half B CMD bounded-retry-then-converge via update_status()
+	{
+		// Minimal COMMANDER setup (mirror test_connect_reack)
+		cl_telecom_system ts;
+		telecom_system = &ts;
+		role = COMMANDER;
+		load_configuration(0, FULL, YES);
+
+		// Init tcp_socket_control message buffer for safe transmit() (may no-op if socket not ACCEPTED)
+		if (tcp_socket_control.message != NULL) {
+			// Buffer already allocated, safe to use
+		} else {
+			// Allocate minimal buffer
+			// tcp_socket_control.message buffer is already initialized
+		}
+
+		// Bounded deadline params (small, for a FAST fire-spin). The deadline VALUE correctness at the
+		// production config is asserted in PART A0 above; here we only need a small deadline so the
+		// production update_status() converge fires quickly (helper clamps 3*200=600 up to the 3 s floor).
+		nResends = 3;
+		ack_timeout_control = 200;
+
+		// Simulate production ENTRY to DISCONNECTING (NOT a poke to converged state)
+		link_status = DISCONNECTING;
+		disconnecting_settle_timer.stop();
+		disconnecting_settle_timer.reset();
+		disconnecting_settle_timer.start();
+
+		// Simulate un-ACKed CLOSE_CONNECTION
+		messages_control.status = PENDING_ACK;
+		if (messages_control.data == NULL) messages_control.data = new char[256];
+		messages_control.data[0] = CLOSE_CONNECTION;
+
+		// SPIN the PRODUCTION function: call update_status() until converged or timeout. The spin bound
+		// is derived from the SAME production helper so it tracks any change to the deadline computation.
+		int settle_deadline_ms = terminal_settle_deadline_ms();
+		int wall_bound_ms = settle_deadline_ms + 2000;
+		cl_timer wall_clock;
+		wall_clock.start();
+		while (link_status != LISTENING && wall_clock.get_elapsed_time_ms() < wall_bound_ms) {
+			update_status();
+#ifdef _WIN32
+			Sleep(50);  // 50 ms sleep
+#else
+			usleep(50000);  // 50 ms
+#endif
+		}
+
+#ifdef TERMINAL_SETTLE_FAILBEFORE
+		// FAIL-BEFORE: link stays DISCONNECTING, converge never fires
+		CHECK(link_status == DISCONNECTING, "A-FAILBEFORE: link still DISCONNECTING (hang)");
+		CHECK(cmd_terminal_converge_events == 0, "A-FAILBEFORE: converge never fired");
+#else
+		// PASS-AFTER: converge fired, link -> LISTENING
+		CHECK(link_status == LISTENING, "A1: link_status==LISTENING after converge");
+		CHECK(cmd_terminal_converge_events >= 1, "A2: cmd_terminal_converge_events >= 1");
+		CHECK(role == RESPONDER, "A3: role==RESPONDER after terminal teardown");
+		CHECK(disconnecting_settle_timer.counting == 0, "A4: settle timer stopped");
+#endif
+	}
+
+	// PART B: Half A RSP re-ACK predicate invariants
+	{
+		// Reset to clean state
+		settled_close_cache.valid = true;
+		settled_close_cache.peer_committed = 151194;
+		settled_close_cache.peer_crc = 0xef7c51cb;
+		settled_close_cache.replays = 0;
+		nResends = 3;
+		passive_monitor = false;
+
+		CHECK(settled_reack_window_open(), "B1: window open (valid + replays < nResends)");
+		CHECK(settled_close_duplicate_matches(151194, 0xef7c51cb),
+		      "B2: exact match accepted");
+		CHECK(!settled_close_duplicate_matches(151195, 0xef7c51cb),
+		      "B3: different committed rejected");
+		CHECK(!settled_close_duplicate_matches(151194, 0xef7c51cc),
+		      "B4: different crc rejected");
+
+		// Exhaust replays -> window closes
+		settled_close_cache.replays = nResends;
+		CHECK(!settled_reack_window_open(), "B5: window closed when replays == nResends");
+
+		// Invalidation
+		settled_close_cache.valid = false;
+		settled_close_cache.replays = 0;
+		CHECK(!settled_reack_window_open(), "B6: window closed when invalid");
+		CHECK(!settled_close_duplicate_matches(151194, 0xef7c51cb),
+		      "B7: invalid cache rejects even exact match");
+	}
+
+#if defined(TERMINAL_SETTLE_DEADLINE_FAILBEFORE)
+	// Defeat build: the deadline is restored to the mis-scaled (nResends+2)*ack_timeout_control. The
+	// config-real PART A0 assertions MUST fail (computed deadline exceeds the cap at cfg16); the fast
+	// fire-spin still fires on the tiny test values, so this isolates the deadline-scale guard.
+	if (failures > 0)
+		printf("[TEST-TERMINAL-SETTLE] DEADLINE-FAILBEFORE-DEMONSTRATED "
+		       "(deadline mis-scaled past the cap at cfg16; config-real guard caught it, %d failures)\n", failures);
+	else
+		printf("[TEST-TERMINAL-SETTLE] DEADLINE-FAILBEFORE-NOT-DEMONSTRATED "
+		       "(config-real guard did NOT catch the mis-scale)\n");
+#elif defined(TERMINAL_SETTLE_FAILBEFORE)
+	// Defeat build: the convergence is compiled out. A DISTINCT verdict token keeps the defeat arm from
+	// ever being string-identical to its pass-after control -- the absent [CMD-EOT-CONVERGE] witness is
+	// no longer the only disambiguator. The fail-before asserts (A-FAILBEFORE) PASS exactly when the
+	// hang reproduces (link stays DISCONNECTING, converge never fires).
+	if (failures == 0)
+		printf("[TEST-TERMINAL-SETTLE] FAILBEFORE-DEMONSTRATED "
+		       "(convergence compiled out; CMD hangs in DISCONNECTING, converge=0)\n");
+	else
+		printf("[TEST-TERMINAL-SETTLE] FAILBEFORE-NOT-DEMONSTRATED (%d failures)\n", failures);
+#else
+	if (failures == 0)
+		printf("[TEST-TERMINAL-SETTLE] ALL PASS\n");
+	else
+		printf("[TEST-TERMINAL-SETTLE] FAILED (%d failures)\n", failures);
+#endif
+
+	return failures;
 }

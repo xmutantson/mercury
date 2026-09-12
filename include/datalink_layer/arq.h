@@ -2633,6 +2633,18 @@ public:
   // Final-connect retry regression. Checks replay identity, retry timer epoch,
   // replay bounds, first-data termination, and OFDM capture ownership.
   int test_connect_reack();
+  // Terminal-settlement convergence deadline bounds (data-flow-stream-offset.md 8.6). ABSOLUTE wall
+  // bound, HARD-CAPPED, DECOUPLED from the 20-deep DATA retransmit budget (nResends). The prior
+  // (nResends+2)*ack_timeout_control evaluated to ~585 s at connected cfg16 (nResends=20,
+  // ack_timeout_control~26.6 s) and never fired on the wire; see terminal_settle_deadline_ms().
+  enum {
+    TERMINAL_SETTLE_FLOOR_MS    = 3000,   // never converge sooner than 3 s (tiny-timeout configs / cfg0 test)
+    TERMINAL_SETTLE_CAP_MS      = 45000,  // hard ceiling: >> a healthy CLOSE-ACK RTT, << field horizon (~560 s)
+    TERMINAL_SETTLE_RTT_WINDOWS = 3       // <= a few control-ACK windows below the cap
+  };
+  void cmd_terminal_settle_converge(const char* reason);
+  int terminal_settle_deadline_ms() const;
+  int test_terminal_settlement();
 
   // RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md). PURE predicate: the
   // RECEIVED-state watchdog decision for the one-deep messages_control mailbox.
@@ -5088,6 +5100,10 @@ public:
 
   cl_timer watchdog_timer;
   cl_timer link_timer;
+  cl_timer disconnecting_settle_timer;   // COMMANDER graceful-close settle deadline (armed when CLOSE queued)
+  // Terminal-settlement convergence meters (data-flow-stream-offset.md 8.6 teardown). MONOTONIC per run.
+  int cmd_terminal_converge_events;      // CMD declared session locally settled + emitted terminal DISCONNECTED
+  int rsp_terminal_reack_replays;        // RSP replayed its cached settlement ACK on a duplicate CLOSE
   cl_timer receiving_timer;
   cl_timer print_stats_timer;
   cl_timer gear_shift_timer;
@@ -5166,6 +5182,31 @@ public:
     uint8_t ssid;
     int replays;
   } connect_ack_cache;
+
+  // On a clean EOT-verified CLOSE the RSP resets to LISTENING with no re-ACK-able settled state, so a
+  // reverse CLOSE-ACK lost to a fade cannot be re-solicited (mirror of the connect_ack_cache gap on the
+  // session-END side). Retain the settled identity so a DUPLICATE CLOSE matching it can be re-ACKed
+  // idempotently, bounded by nResends, without re-running teardown or touching capture ownership /
+  // the fade-core origin gate.
+  struct {
+    bool valid;
+    uint64_t peer_committed;   // sender's final total_committed_bytes (EOT payload data[1..8])
+    uint32_t peer_crc;         // sender's running stream CRC-32 (EOT payload data[9..12])
+    int replays;
+  } settled_close_cache;
+
+  inline bool settled_reack_window_open() const
+  {
+    return settled_close_cache.valid
+        && settled_close_cache.replays < nResends
+        && !passive_monitor;
+  }
+  inline bool settled_close_duplicate_matches(uint64_t committed, uint32_t crc) const
+  {
+    return settled_close_cache.valid
+        && committed == settled_close_cache.peer_committed
+        && crc == settled_close_cache.peer_crc;
+  }
 
   inline bool connect_reack_pre_data_window() const
   {

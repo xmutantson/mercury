@@ -888,6 +888,12 @@ cl_arq_controller::cl_arq_controller()
 	gearshift_timeout=1000;
 	connection_timeout=30000;
 	nResends=3;
+	cmd_terminal_converge_events=0;
+	rsp_terminal_reack_replays=0;
+	settled_close_cache.valid=false;
+	settled_close_cache.peer_committed=0;
+	settled_close_cache.peer_crc=0;
+	settled_close_cache.replays=0;
 	// Climb-acceleration (data-flow-gearshift-climb.md): the A/B defeat knobs are env-latched
 	// ONCE here so a real-audio run reads them on the production path and the fire-proof runs
 	// the A/B on ONE binary. The DEFAULT (no env) = Tier-1: C1 ON, C2/C3 OFF. ACCEL_DEFEAT reverts the whole
@@ -7631,6 +7637,19 @@ void cl_arq_controller::update_status()
 		messages_control.status=ACK_TIMED_OUT;
 		stats.nNAcked_control++;
 	}
+	// Terminal-settlement convergence backstop (data-flow-stream-offset.md 8.6). Only the COMMANDER
+	// graceful-close path arms disconnecting_settle_timer (at CLOSE queue). If the reverse CLOSE-ACK is
+	// lost, the ACKed-CLOSE teardown (arq_commander.cc:11896) is never reached and the CMD re-sends
+	// CLOSE indefinitely (23k times observed, ~64 s) with the generic watchdog inert — a byte-complete
+	// transfer scored SETTLEMENT_DEADLINE. After a bounded deadline (retransmit budget honored) declare
+	// the session locally settled and emit the terminal DISCONNECTED.
+#ifndef TERMINAL_SETTLE_FAILBEFORE
+	if(role==COMMANDER && link_status==DISCONNECTING && disconnecting_settle_timer.counting)
+	{
+		if(disconnecting_settle_timer.get_elapsed_time_ms() >= terminal_settle_deadline_ms())
+			cmd_terminal_settle_converge("disconnecting_settle_deadline");
+	}
+#endif
 
 	// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change A): RECEIVED-state
 	// watchdog force-FREE. The one-deep messages_control mailbox MUST return to FREE
@@ -9007,10 +9026,46 @@ void cl_arq_controller::process_messages()
 	}
 }
 
+int cl_arq_controller::terminal_settle_deadline_ms() const
+{
+	// Terminal-settlement convergence wall bound (data-flow-stream-offset.md 8.6). The COMMANDER
+	// graceful-close path arms disconnecting_settle_timer when CLOSE is queued; full delivery + EOT are
+	// already ACKed at that point, so the reverse CLOSE-ACK is a courtesy handshake. If it is lost we
+	// converge after a BOUNDED wait rather than hang in DISCONNECTING to the process horizon.
+	//
+	// The prior (nResends+2)*ack_timeout_control coupled the wait to the 20-deep DATA retransmit budget
+	// AND the WB control timeout: at connected cfg16 (nResends=20, ack_timeout_control~26.6 s) it
+	// evaluated to ~585,552 ms (~9.76 min) -- ~100x the longest real hang -- so the backstop never
+	// fired on the wire. Re-scaled to an ABSOLUTE, HARD-CAPPED bound, decoupled from the 20-deep
+	// nResends:
+	//   * TERMINAL_SETTLE_RTT_WINDOWS (3) * ack_timeout_control bounds the wait to a few control-ACK
+	//     windows for small-timeout configs, so a legitimate reverse CLOSE-ACK still completes the
+	//     normal ACKed-CLOSE teardown first (reset_all_timers() disarms this timer) -- healthy closes
+	//     are unaffected;
+	//   * TERMINAL_SETTLE_CAP_MS (45 s) HARD-CAPS it so a large WB control timeout cannot scale it
+	//     toward the horizon. At cfg16 the cap binds (3*26.6 s = 79.8 s -> 45 s), i.e. the effective
+	//     deadline is the absolute 45 s cap -- independent of the exact control timeout, > one full
+	//     cfg16 control-ACK window (~26.6 s) with margin, and ~13x below the old 585 s;
+	//   * TERMINAL_SETTLE_FLOOR_MS (3 s) keeps tiny-timeout configs (and the unit test at cfg0) >= 3 s.
+#ifdef TERMINAL_SETTLE_DEADLINE_FAILBEFORE
+	// Defeat arm (test-infra only; never a production build): restore the mis-scaled formula so the
+	// config-real unit assertion (computed deadline <= cap at cfg16) FAILS distinctly, proving the
+	// guard catches a regression back to the ~585 s blow-up.
+	return (nResends + 2) * ack_timeout_control;
+#else
+	int d = TERMINAL_SETTLE_RTT_WINDOWS * ack_timeout_control;
+	if(d < TERMINAL_SETTLE_FLOOR_MS) d = TERMINAL_SETTLE_FLOOR_MS;
+	if(d > TERMINAL_SETTLE_CAP_MS)   d = TERMINAL_SETTLE_CAP_MS;
+	return d;
+#endif
+}
+
 void cl_arq_controller::reset_all_timers()
 {
 	link_timer.stop();
 	link_timer.reset();
+	disconnecting_settle_timer.stop();
+	disconnecting_settle_timer.reset();
 	watchdog_timer.stop();
 	watchdog_timer.reset();
 	gear_shift_timer.stop();

@@ -4037,6 +4037,7 @@ void cl_arq_controller::process_control_responder()
 		// reset_session_state disarms on a session boundary, so unconnected / direct
 		// funnel-poke states keep legacy (unarmed, byte-identical) behavior.
 		rsp_stream_origin_gen = 0;
+				settled_close_cache.valid = false;  // session-start disarm (never re-ACK a stale descriptor)
 		if(connect_fast_active)
 		{
 			robust_enabled = connect_fast_fallback_robust;
@@ -4882,6 +4883,44 @@ void cl_arq_controller::process_control_responder()
 	{
 		if(code==CLOSE_CONNECTION)
 		{
+				// Terminal-settlement re-ACK (idempotent settlement; mirror of connect_ack_cache). A
+				// duplicate CLOSE+EOT matching the cached settled descriptor means our reverse CLOSE-ACK was
+				// lost and the CMD is re-soliciting. Replay the terminal ACK, bounded by nResends, WITHOUT
+				// re-running teardown / EOT-verify (rx_stream_delivered is 0 post-reset) and WITHOUT taking
+				// capture-countdown ownership or re-arming the origin gate. Requires the EOT payload present.
+				if(link_status != CONNECTED && settled_reack_window_open())
+				{
+					unsigned char dup_crc8 = (unsigned char)CRC8_calc(
+						(char*)&messages_control.data[1], W_EOT_PAYLOAD_BYTES - 1);
+					bool dup_eot_present =
+						((unsigned char)messages_control.data[W_EOT_PAYLOAD_BYTES] == dup_crc8);
+					if(dup_eot_present)
+					{
+						uint64_t dup_committed = 0;
+						for(int i=0;i<8;i++)
+							dup_committed |= ((uint64_t)(unsigned char)messages_control.data[1+i]) << (8*i);
+						uint32_t dup_crc = 0;
+						for(int i=0;i<4;i++)
+							dup_crc |= ((uint32_t)(unsigned char)messages_control.data[9+i]) << (8*i);
+						if(settled_close_duplicate_matches(dup_committed, dup_crc))
+						{
+							settled_close_cache.replays++;
+							rsp_terminal_reack_replays++;
+							printf("[RSP-EOT-REACK] duplicate CLOSE -> cached terminal ACK replay=%d/%d "
+								"committed=%llu crc=0x%08x\n",
+								settled_close_cache.replays, nResends,
+								(unsigned long long)dup_committed, dup_crc);
+							fflush(stdout);
+							// Re-ACK via the existing control-ACK builder without re-running teardown:
+							// keep messages_control RECEIVED and route to ACKNOWLEDGING_CONTROL (the SAME
+							// path that sent the first reverse CLOSE-ACK). No reset_session_state, no
+							// frames_to_read write, no rsp_stream_origin_gen change.
+							connection_status = ACKNOWLEDGING_CONTROL;
+							return;
+						}
+					}
+				}
+
 			// Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b): a PROVEN-CLEAN
 			// end-of-transfer makes the persistent app socket a legitimate message boundary. Track it
 			// here and clear the app-delivered high-water AFTER reset_session_state() re-snapshots it
@@ -4936,6 +4975,10 @@ void cl_arq_controller::process_control_responder()
 							(unsigned long long)rx_stream_delivered, rx_stream_crc);
 						fflush(stdout);
 						clean_eot_verified = true;   // reconnect-seam F2: proven-clean boundary
+						settled_close_cache.valid = true;
+						settled_close_cache.peer_committed = peer_committed;
+						settled_close_cache.peer_crc = peer_crc;
+						settled_close_cache.replays = 0;
 					}
 				}
 			}

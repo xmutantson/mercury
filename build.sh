@@ -156,6 +156,25 @@ if [ "${IDLE_GATE_TRACE:-0}" = "1" ]; then
     TRACE_CFLAGS="$TRACE_CFLAGS -DIDLE_GATE_TRACE"
     echo "  (IDLE_GATE_TRACE instrumentation ENABLED)"
 fi
+# Optional: TERMINAL_SETTLE_FAILBEFORE=1 ./build.sh o3 — test-infra defeat build that
+# compiles OUT the COMMANDER terminal-settlement convergence (the update_status settle
+# deadline in arq_common.cc AND the exhaustion-belt converge in arq_commander.cc). The
+# terminal-settlement test then asserts the pre-fix DISCONNECTING hang. This macro must
+# reach BOTH TUs, so it is carried in TRACE_CFLAGS which flows into CXXFLAGS below.
+# Test-only; never set in a production build — without the env var the binary is
+# byte-identical to baseline.
+if [ "${TERMINAL_SETTLE_FAILBEFORE:-0}" = "1" ]; then
+    TRACE_CFLAGS="$TRACE_CFLAGS -DTERMINAL_SETTLE_FAILBEFORE"
+    echo "  (TERMINAL_SETTLE_FAILBEFORE defeat build — terminal-settlement convergence compiled OUT)"
+fi
+# Optional: TERMINAL_SETTLE_DEADLINE_FAILBEFORE=1 ./build.sh o3 -- test-infra defeat build that
+# restores the mis-scaled (nResends+2)*ack_timeout_control settle deadline, so the config-real
+# terminal-settlement assertion (deadline within the absolute cap at cfg16) FAILS distinctly. Must
+# reach arq_common.cc (the deadline helper); carried in TRACE_CFLAGS. Test-only; never production.
+if [ "${TERMINAL_SETTLE_DEADLINE_FAILBEFORE:-0}" = "1" ]; then
+    TRACE_CFLAGS="$TRACE_CFLAGS -DTERMINAL_SETTLE_DEADLINE_FAILBEFORE"
+    echo "  (TERMINAL_SETTLE_DEADLINE_FAILBEFORE defeat build - terminal-settlement deadline mis-scaled)"
+fi
 
 # --- Deterministic git build-id baked into the binary banner ---------------
 # Writes include/common/build_id.h with #define MERCURY_BUILD_ID "<shortrev>[-dirty]".

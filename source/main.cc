@@ -3703,6 +3703,7 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller ARQ_reack;
                 failed += ARQ_reack.test_connect_reack();
+	{ cl_arq_controller ARQ_ts; failed += ARQ_ts.test_terminal_settlement(); }
             }
             // START_CONNECTION bare-ACK causal gate: reject the impossible
             // 263-ms detector hit, clear retained pre-epoch phases, and accept
@@ -4531,6 +4532,11 @@ int main(int argc, char *argv[])
             int failed = ARQ_reack.test_connect_reack();
             return (failed == 0) ? 0 : 1;
         }
+		if (strcmp(argv[i], "--test-terminal-settlement") == 0) {
+			cl_arq_controller A;
+			int f = A.test_terminal_settlement();
+			return f == 0 ? 0 : 1;
+		}
         // --test-start-ack-causal-guard : run only the START_CONNECTION bare-
         // ACK causal timing/ring-epoch regression. Fast, deterministic, no RF.
         // -DSTART_ACK_CAUSAL_GUARD_FAILBEFORE reproduces the 263-ms advance.
