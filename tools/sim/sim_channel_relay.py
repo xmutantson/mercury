@@ -266,43 +266,105 @@ class AnalyticFilter:
         return i_chunk + 1j * q_chunk
 
 
+# IONOS firmware 128-tap Gaussian Doppler FIR. It is designed for a 64 Hz
+# update rate, Fc=0.5856 Hz, and a Gaussian shape (-9.1 dB at 1 Hz, -37.1 dB
+# at 2 Hz). The coefficients are DC-normalized.
+GAUS_FIR_COEFFS = np.array([
+    1.1755592671332046e-11, 2.0188004956137427e-10, 1.7236333623946176e-09,
+    9.815423109243151e-09, 4.219820040519088e-08, 1.4693429486234634e-07,
+    4.338503956649552e-07, 1.122118806000393e-06, 2.604091536729611e-06,
+    5.522713327023963e-06, 1.0857390465642334e-05, 2.0011412649247494e-05,
+    3.4893068706162795e-05, 5.7982477259392286e-05, 9.237678934582388e-05,
+    0.00014180767284007714, 0.00021062669000635658, 0.0003037561533907518,
+    0.0004266051229102419, 0.000584952237938201, 0.0007847989367901134,
+    0.001032198204838678, 0.001333065243166745, 0.001692977321877409,
+    0.002116970561258896, 0.002609341477645015, 0.003173460865247882,
+    0.00381160700116864, 0.004524824309342139, 0.005312812558055807,
+    0.006173850455688009, 0.007104756211217515, 0.008100886298035966,
+    0.00915617235512072, 0.010263194925878348, 0.01141329161173599,
+    0.012596696236577472, 0.013802704802828978, 0.015019863385625786,
+    0.016236172665450826, 0.01743930354214716, 0.01861681819809535,
+    0.019756391073966928, 0.020846024470695095, 0.021874253876569306,
+    0.02283033861665188, 0.023704434009553566, 0.02448774186995001,
+    0.02517263689027796, 0.025752767148979578, 0.026223127704178725,
+    0.026580106921515002, 0.02682150583616039, 0.026946531447567135,
+    0.026955765379786157, 0.02685110980161695, 0.026635712883536795,
+    0.026313876369100774, 0.025890948056565766, 0.025373202123371387,
+    0.024767710285281262, 0.024082206768594926, 0.02332494999439922,
+    0.022504583735910823, 0.02163000032189053, 0.020710208229666707,
+    0.019754206149457228, 0.018770865316331563, 0.01776882160593159,
+    0.016756378583127243, 0.01574142238665159, 0.01473134903422507,
+    0.013733004447687326, 0.012752637231260112, 0.011795863992392318,
+    0.010867646776884902, 0.009972282000446704, 0.009113400098909145,
+    0.008293974989634013, 0.007516342337046732, 0.006782225544921226,
+    0.006092768355660706, 0.005448572920512081, 0.004849742212182516,
+    0.004295925680163602, 0.003786367096475506, 0.003319953602663025,
+    0.002895265044807468, 0.002510622769190125, 0.002164137144270543,
+    0.0018537531721837, 0.001577293652557459, 0.001332499460868328,
+    0.001117066600796574, 0.0009286797833839573, 0.0007650423737761393,
+    0.0006239026277671727, 0.0005030762143350815, 0.0004004650862100223,
+    0.0003140728178353742, 0.00024201657867910556, 0.00018253594974316996,
+    0.00013399882249807025, 9.49046426887381e-05, 6.388527699708468e-05,
+    3.970378899074398e-05, 2.1251412801076355e-05, 7.543009276742865e-06,
+    -2.2887192936932196e-06, -8.999992637884094e-06,
+    -1.3243447148502327e-05, -1.557613368708468e-05,
+    -1.6467811426850445e-05, -1.63093528492861e-05,
+    -1.5421097939455242e-05, -1.4061018704922785e-05,
+    -1.243257788819571e-05, -1.0692187735418308e-05,
+    -8.956195575428226e-06, -7.3073424710351094e-06,
+    -5.8006591112396305e-06, -4.468779263172823e-06,
+    -3.326665397016021e-06, -2.3757534892377295e-06,
+    -1.6075344987453848e-06, -1.0065986371058506e-06,
+    -5.531753923550552e-07, -2.252074190014706e-07,
+], dtype=np.float64)
+
+_FIR_SUMSQ = float(np.sum(GAUS_FIR_COEFFS * GAUS_FIR_COEFFS))
+_FIR_NH = GAUS_FIR_COEFFS.size
+
+
 # ---------------------------------------------------------------------------
-# Gaussian-Doppler tap generator (Watterson). Produces a complex Gaussian
-# process with a Gaussian-shaped Doppler power spectrum, updated at a coarse
-# rate (every UPDATE samples) and linearly interpolated per sample. The coarse
-# samples are first-order low-pass filtered white complex Gaussian; the LPF
-# time constant is set so the 3 dB Doppler bandwidth matches fd.
+# Gaussian-Doppler tap generator (Watterson). A complex-Gaussian innovation is
+# drawn at 64 times the Doppler rate, shaped through the firmware FIR, and held
+# constant until the next update.
 # ---------------------------------------------------------------------------
 class DopplerTap:
     def __init__(self, fd_hz, rng_np, update=None):
         self.fd = fd_hz
         self.rng = rng_np
-        # update interval: ~64x the Doppler rate (>> Nyquist for fd), bounded.
         if update is None:
             if fd_hz > 0:
-                update = max(1, int(FS / (fd_hz * 64.0)))
+                update = max(1, int(round(FS / (fd_hz * 64.0))))
             else:
                 update = CHUNK_SAMPLES
-        self.update = min(update, CHUNK_SAMPLES)
-        self.dt = self.update / FS
-        # Gaussian-Doppler: model as 1st-order IIR on complex white noise.
-        # 3 dB bandwidth ~ fd -> alpha = exp(-2*pi*fd*dt). Scale the white
-        # innovation so the steady-state tap variance is 1 (unit-power tap).
+        self.update = update
         if fd_hz > 0:
-            self.alpha = math.exp(-2.0 * math.pi * fd_hz * self.dt)
+            self.inno_std = math.sqrt(0.5 / _FIR_SUMSQ)
         else:
-            self.alpha = 1.0
-        self.inno = math.sqrt(max(0.0, 1.0 - self.alpha * self.alpha))
-        # state: current and next coarse tap value (complex), interp between.
-        self.g_prev = self._white()
-        self.g_next = self.alpha * self.g_prev + self.inno * self._white()
-        self.pos = 0          # sample position within the current update span
+            self.inno_std = 0.0
+        self.fir_i = np.zeros(_FIR_NH, dtype=np.float64)
+        self.fir_q = np.zeros(_FIR_NH, dtype=np.float64)
+        if fd_hz > 0:
+            for _ in range(_FIR_NH):
+                self._fir_update()
+            self.g_hold = self._fir_output()
+        else:
+            self.g_hold = self._static_white()
+        self.pos = 0
 
-    def _white(self):
-        # unit-variance complex Gaussian: var(real)=var(imag)=1/2
+    def _static_white(self):
         r = self.rng.standard_normal()
         i = self.rng.standard_normal()
         return (r + 1j * i) / math.sqrt(2.0)
+
+    def _fir_update(self):
+        self.fir_i = np.roll(self.fir_i, 1)
+        self.fir_q = np.roll(self.fir_q, 1)
+        self.fir_i[0] = self.rng.standard_normal() * self.inno_std
+        self.fir_q[0] = self.rng.standard_normal() * self.inno_std
+
+    def _fir_output(self):
+        return (float(np.dot(GAUS_FIR_COEFFS, self.fir_i)) +
+                1j * float(np.dot(GAUS_FIR_COEFFS, self.fir_q)))
 
     def advance(self, n):
         """Return an array of n complex tap gains, advancing internal state."""
@@ -310,22 +372,18 @@ class DopplerTap:
         k = 0
         while k < n:
             if self.fd <= 0:
-                # static tap (no Doppler): constant unit gain
-                out[k:] = self.g_prev
+                out[k:] = self.g_hold
                 self.pos = (self.pos + (n - k)) % self.update
                 break
             span = self.update - self.pos
             take = min(span, n - k)
-            # linear interpolation g_prev -> g_next across the update span
-            t0 = self.pos
-            frac = (np.arange(t0, t0 + take) + 0.5) / self.update
-            out[k:k + take] = (1.0 - frac) * self.g_prev + frac * self.g_next
+            out[k:k + take] = self.g_hold
             k += take
             self.pos += take
             if self.pos >= self.update:
                 self.pos = 0
-                self.g_prev = self.g_next
-                self.g_next = self.alpha * self.g_prev + self.inno * self._white()
+                self._fir_update()
+                self.g_hold = self._fir_output()
         return out
 
 
