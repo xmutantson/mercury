@@ -15,15 +15,18 @@
 
 set -e
 cd "$(dirname "$0")"
+REPO_ROOT="$(pwd -P)"
 
 MODE="${1:-release}"
 CLEAN=""
+RUN_TEST=0
 
 # Parse arguments
 for arg in "$@"; do
     case "$arg" in
         clean) CLEAN=1 ;;
         release|debug|asan|ubsan|o0|o1|o2|o3) MODE="$arg" ;;
+        --test) RUN_TEST=1 ;;
     esac
 done
 
@@ -326,6 +329,9 @@ elif [ "${MERCURY_CROSS_BUILD:-0}" = "1" ]; then
 else
     OUTPUT="mercury${SUFFIX}"
 fi
+OUTPUT_PATH="$REPO_ROOT/$OUTPUT"
+BUILD_START_MARKER="$REPO_ROOT/$BUILDDIR/.build-start"
+: > "$BUILD_START_MARKER"
 
 # Parallel job count
 NPROC="${MERCURY_BUILD_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
@@ -381,6 +387,54 @@ wait_all() {
         echo "*** Compilation failed"
         exit 1
     fi
+}
+
+file_mtime() {
+    local path="$1"
+    local mtime
+    if mtime=$(stat -c %Y -- "$path" 2>/dev/null); then
+        printf '%s\n' "$mtime"
+    else
+        stat -f %m -- "$path"
+    fi
+}
+
+validate_output() {
+    local output_mtime dep dep_mtime actual_id
+    if [ ! -f "$OUTPUT_PATH" ]; then
+        echo "ERROR: produced output is missing: $OUTPUT_PATH" >&2
+        return 1
+    fi
+    if [ ! -x "$OUTPUT_PATH" ]; then
+        echo "ERROR: produced output is not executable: $OUTPUT_PATH" >&2
+        return 1
+    fi
+    output_mtime=$(file_mtime "$OUTPUT_PATH")
+    for dep in "$_BUILD_ID_HEADER" $OBJ_FILES $COMPRESS_OBJ_FILES $CRYPTO_OBJ_FILES \
+        $AUDIO_OBJ_FILES "${BUILDDIR}/audioio.a"; do
+        if [ ! -f "$dep" ]; then
+            echo "ERROR: participating build input is missing: $dep" >&2
+            return 1
+        fi
+        dep_mtime=$(file_mtime "$dep")
+        if [ "$output_mtime" -lt "$dep_mtime" ]; then
+            echo "ERROR: produced output is older than participating input: $OUTPUT_PATH < $dep" >&2
+            return 1
+        fi
+    done
+    if [ "${LINK_RAN:-0}" = "1" ] && [ "$output_mtime" -lt "$(file_mtime "$BUILD_START_MARKER")" ]; then
+        echo "ERROR: linker output predates build start: $OUTPUT_PATH" >&2
+        return 1
+    fi
+    if ! actual_id=$("$OUTPUT_PATH" --print-build-id); then
+        echo "ERROR: produced output does not support --print-build-id: $OUTPUT_PATH" >&2
+        return 1
+    fi
+    if [ "$actual_id" != "$BUILD_ID" ]; then
+        echo "ERROR: produced build id mismatch: expected '$BUILD_ID', got '$actual_id'" >&2
+        return 1
+    fi
+    echo "  (produced output verified: $OUTPUT_PATH; build id: $actual_id)"
 }
 
 # needs_rebuild SRC OBJ — true if obj is missing, src is newer, or any dep header changed
@@ -659,6 +713,13 @@ done
 # Wait for all compilations to finish
 wait_all
 
+# A valid no-op must still prove that the existing repository output is the
+# artifact described by this build and is not older than any link input.
+if [ "$COMPILED" -eq 0 ]; then
+    LINK_RAN=0
+    validate_output
+fi
+
 run_l1_block_codec_test() {
     local test_bin="${BUILDDIR}/test_l1_block_codec"
     echo "Building and running L1 block codec test..."
@@ -737,13 +798,14 @@ ${BUILDDIR}/source/physical_layer/mercury_normal_14_16.o
 run_ldpc_contract_test
 
 if [ "$COMPILED" -eq 0 ]; then
-    # Check if output exists and is up to date
-    if [ -f "$OUTPUT" ]; then
-        echo "  (nothing changed)"
-        echo "=== Build complete: $OUTPUT ==="
-        ls -la "$OUTPUT"
-        exit 0
+    echo "  (nothing changed)"
+    if [ "$RUN_TEST" -eq 1 ]; then
+        echo "Running repository test action: $OUTPUT_PATH --test"
+        "$OUTPUT_PATH" --test
     fi
+    echo "=== Build complete: $OUTPUT_PATH ==="
+    ls -la "$OUTPUT_PATH"
+    exit 0
 fi
 
 echo "  $COMPILED files compiled"
@@ -753,7 +815,14 @@ ar rc "${BUILDDIR}/audioio.a" $AUDIO_OBJ_FILES
 
 # Link
 echo "Linking $OUTPUT..."
-$CXX -o "$OUTPUT" $OBJ_FILES $COMPRESS_OBJ_FILES $CRYPTO_OBJ_FILES "${BUILDDIR}/audioio.a" $LDFLAGS
+$CXX -o "$OUTPUT_PATH" $OBJ_FILES $COMPRESS_OBJ_FILES $CRYPTO_OBJ_FILES "${BUILDDIR}/audioio.a" $LDFLAGS
+LINK_RAN=1
+validate_output
+
+if [ "$RUN_TEST" -eq 1 ]; then
+    echo "Running repository test action: $OUTPUT_PATH --test"
+    "$OUTPUT_PATH" --test
+fi
 
 # The journal contract test has its own main and is intentionally outside the
 # modem link. Run it on every native build so reset-row coverage cannot drift.
@@ -766,7 +835,7 @@ if [ "$PLATFORM" != "windows" ] && [ "${MERCURY_CROSS_BUILD:-0}" != "1" ]; then
 fi
 
 echo "=== Build complete: $OUTPUT ==="
-ls -la "$OUTPUT"
+ls -la "$OUTPUT_PATH"
 
 if [ "$MODE" = "release" ]; then
     echo ""

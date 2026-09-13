@@ -56,6 +56,7 @@
 #include "datalink_layer/lp_transition_harness.h"
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
+#include "common/build_id.h"
 
 int run_b2f_bounded_output_test();
 int run_fft_scratch_tests();
@@ -2896,6 +2897,11 @@ int cl_arq_controller::test_encryption_cli_validation()
 
 int main(int argc, char *argv[])
 {
+    if (argc == 2 && strcmp(argv[1], "--print-build-id") == 0) {
+        std::printf("%s\n", MERCURY_BUILD_ID);
+        return 0;
+    }
+
     int main_exit_status = EXIT_SUCCESS;
 
 #if defined(_WIN32)
