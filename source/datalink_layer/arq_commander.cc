@@ -6281,7 +6281,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 //   6. add_message_control(SET_CONFIG) (under inband: the unilateral drop + W1 tag)
 //      + connection_status=TRANSMITTING_CONTROL.
 // NO send_break_pattern, NO emergency_break_active. The caller `return`s after this.
-bool cl_arq_controller::inband_route_failure_demote(int demote_target, const char* reason)
+bool cl_arq_controller::inband_route_failure_demote(int demote_target, const char* reason,
+	bool pin_ceiling)
 {
 	if(demote_target < 0 || demote_target == current_configuration)
 		return false;   // no lower rung / no-op — caller must route to the dead-batch floor
@@ -6348,7 +6349,14 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	// immediately re-elect the failing rung. (D3 :4075-4077.)
 	data_configuration       = demote_target;
 	negotiated_configuration = demote_target;
-	supershift_proven_ceiling = demote_target;
+	// pin_ceiling default true (every BREAK/NACK caller) PINS the proven ceiling at the
+	// demoted rung so the SNR re-trigger cannot immediately re-elect the rung that just
+	// failed (D3 :4075-4077). The MERCURY_SNR_TRACK proactive demote passes false: it is a
+	// precautionary SNR-sensed move, not a proven failure, so leaving the ceiling where it
+	// was lets a recovered meter climb straight back (the RUNG_MIN_SNR_METER floor gate, not
+	// a pinned ceiling, is the over-climb guard on that path).
+	if(pin_ceiling)
+		supershift_proven_ceiling = demote_target;
 
 	// Consume the deadline: clear BOTH the nack streak and the revack-starve streak so a
 	// fresh per-frame failure re-accumulates from 1. (D3 :4100-4101.)
@@ -9122,6 +9130,48 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				bigblock_carve_cooldown_span = 0;
 			}
 
+			// ── PROACTIVE SNR-TRACK DEMOTE (MERCURY_SNR_TRACK, default-off) ─────────────────
+			// Fade-tracking DOWN-shift. The link is ALIVE this batch (it produced a data-ACK,
+			// clean or partial) and the freshly-latched climb-grade suffix meter now reads BELOW
+			// the CURRENT rung's measured-viability floor — the SNR has dropped under the rung we
+			// are airing. The incumbent ladder NEVER demotes here: rung_floor_ok() shortcuts any
+			// at/below-current move and every real demote is failure-triggered, so it rides the
+			// failing rung into the trough and BREAKs ~8 s late. Demote NOW, before the frames
+			// fail, to the highest rung the live meter still clears (apply_rung_floor_raise_cap
+			// walks CURRENT down to it — never into a needless stall). Route through the shipped
+			// in-band CONFIG_TAG demote transport (inband_route_failure_demote — the SAME ~0.76 s
+			// unilateral tag the failure demotes use; legacy routes it via the fast SET_CONFIG
+			// handshake) but pin_ceiling=false: a precautionary SNR move is not a proven BREAK, so
+			// a recovered meter must be free to climb back (the RUNG_MIN_SNR_METER floor, not a
+			// pinned ceiling, guards over-climb). WB commander, FRESH meter, gated OFDM rung only
+			// (cfg<CONFIG_9 floors are -90 -> rung_floor_meter_clears is always true there -> this
+			// never fires). Off-flag: byte-identical (the whole block is behind the gate).
+			if(snr_track_feature_enabled()
+			   && role == COMMANDER
+			   && narrowband_enabled != YES
+			   && gear_shift_on == YES
+			   && is_ofdm_config(current_configuration)
+			   && !rung_meter_stale()
+			   && !rung_floor_meter_clears(current_configuration))
+			{
+				int snr_demote_target = apply_rung_floor_raise_cap(current_configuration);
+				if(snr_demote_target >= 0
+				   && config_ladder_index(snr_demote_target)
+				      < config_ladder_index(current_configuration))
+				{
+					printf("[GEARSHIFT] SNR-TRACK proactive demote: live meter %.1f (hold %.1f) "
+						"below config %d floor %.1f -> demoting %d->%d BEFORE loss "
+						"(cause=snr, not failure)\n",
+						rung_meter_db, rung_meter_hold_db, current_configuration,
+						rung_floor_min_meter(current_configuration),
+						current_configuration, snr_demote_target);
+					fflush(stdout);
+					if(inband_route_failure_demote(snr_demote_target, "snr_track_floor",
+						/*pin_ceiling=*/false))
+						return;   // batch re-staged at the demoted rung; skip the climb this cycle
+				}
+			}
+
 			// CLEAN-BATCH VIABILITY (§9): the panic/aggression resets AND the
 			// data-viable anchor-raise are PROMOTION decisions — they must fire ONLY
 			// on a CLEAN, fully-delivered batch. A genuine PARTIAL SACK keeps the link
@@ -9507,6 +9557,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					"the first clean batch (skip the 2nd confirm)\n", current_configuration);
 				fflush(stdout);
 			}
+			// SNR-TRACK fast up-climb (MERCURY_SNR_TRACK, default-off): ride the recovery up
+			// within one coherence -- fire the FRAME-UP on the FIRST clean batch (skip the N=2 /
+			// AARF-doubled / fast-probe streak). The RUNG_MIN_SNR_METER floor (applied to the
+			// target below via rung_floor_cap_fire) is the over-climb guard, so "fast" cannot
+			// over-elect. Off-flag: byte-identical.
+			if(snr_track_feature_enabled())
+			{
+				eff_frame_shift_threshold = FRAME_SHIFT_FAST;
+				printf("[GEARSHIFT] SNR-TRACK fast-confirm: 1-batch climb armed at config %d "
+					"(meter %.1f) -> firing FRAME-UP on the first clean batch\n",
+					current_configuration, rung_meter_db);
+				fflush(stdout);
+			}
 			// DEFER-WHILE-HOLE-OUTSTANDING (data-flow-inband-frame0-rolling-partial.md §10):
 			// the streak CREDIT (consecutive_data_acks++) above is UNCONDITIONAL — 2801d7c's
 			// purpose (the lead-frame-only partial still builds the climb streak) is preserved.
@@ -9595,6 +9658,25 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					if(tier_cross >= 0 &&
 					   config_ladder_index(tier_cross) > config_ladder_index(snr_elevator))
 						snr_elevator = tier_cross;
+				}
+				// SNR-TRACK capacity-cap fix (MERCURY_SNR_TRACK): the elevator's get_configuration(SNR
+				// - SUPERSHIFT_MARGIN_DB) capacity estimate parked the climb well below the live-meter-
+				// supported rung (the probe stuck it at cfg8 in a good window). RUNG_MIN_SNR_METER is the
+				// MEASURED per-rung viability verdict, so let it LIFT the climb target to the highest rung
+				// the FRESH meter clears (apply_rung_floor_raise_cap walks down from the WB ceiling),
+				// still capped by a real-BREAK proven ceiling. This only RAISES toward a meter-cleared
+				// rung (never above the floor -- that IS the guard); the inband +1 clamp below still steps
+				// one rung/batch so CMD/RSP stay aligned (no reverse-SACK stranding), and legacy takes the
+				// multi-rung jump via the fast SET_CONFIG. WB commander, fresh meter. Off-flag: byte-identical.
+				if(snr_track_feature_enabled() && narrowband_enabled != YES
+				   && is_ofdm_config(current_configuration) && !rung_meter_stale())
+				{
+					int meter_target = apply_rung_floor_raise_cap(WB_CONFIG_MAX);
+					if(supershift_proven_ceiling >= 0
+					   && config_ladder_index(meter_target) > config_ladder_index(supershift_proven_ceiling))
+						meter_target = supershift_proven_ceiling;
+					if(config_ladder_index(meter_target) > config_ladder_index(snr_elevator))
+						snr_elevator = meter_target;
 				}
 #ifdef INBAND_PLUS1_CLIMB_FAILBEFORE
 				bool inband_plus1_on = false;  // fails-before: elevator jump NOT suppressed

@@ -1277,6 +1277,7 @@ cl_arq_controller::cl_arq_controller()
 	inband_last_announced_config=CONFIG_NONE;
 	inband_tx_epoch_parity=0;
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
+	snr_track_enabled=-1;    // unresolved; snr_track_feature_enabled() caches it (default-off)
 	inband_a3_decouple_env=-1;  // unresolved; inband_a3_decouple_enabled() caches the env half
 	// Top-gear (CONFIG_17, 64-QAM) channel-clean election (topgear-stack-productionize.md).
 	// Default-off benign init: env unresolved (feature_enabled caches it), not engaged,
@@ -3974,6 +3975,20 @@ bool cl_arq_controller::inband_rate_feature_enabled()
 		inband_rate_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
 	}
 	return inband_rate_enabled == 1;
+}
+
+// Resolve + cache the MERCURY_SNR_TRACK env flag (default-off). Same env-keyed, resolve-once,
+// ctor-cached discipline as inband_rate_feature_enabled(). When off, every MERCURY_SNR_TRACK
+// branch (proactive demote + fast up-climb) is skipped => byte-identical to the incumbent
+// ladder. See snr_track_enabled / the arq.h declaration for the feature summary.
+bool cl_arq_controller::snr_track_feature_enabled()
+{
+	if(snr_track_enabled < 0)
+	{
+		const char* e = std::getenv("MERCURY_SNR_TRACK");
+		snr_track_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return snr_track_enabled == 1;
 }
 
 // A3 demote-decouple gate (data-flow-inband-a3-decouple.md §1.2). STRICT-SEQUENCED:

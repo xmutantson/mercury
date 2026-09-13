@@ -2949,6 +2949,16 @@ public:
   // feature is enabled. Cheap after the first call (cached in inband_rate_enabled).
   bool inband_rate_feature_enabled();
 
+  // Resolve + cache the MERCURY_SNR_TRACK env flag (default-off). When set, the
+  // commander-side gearshift becomes SNR-SENSED fast fade-tracking: a fresh climb-grade
+  // suffix meter that drops BELOW the current rung's RUNG_MIN_SNR_METER floor fires a
+  // PROACTIVE demote (before frames fail), and a recovered meter drives a FAST up-climb to
+  // the highest meter-supported rung (first-clean confirm, not the N=2 / AARF-doubled
+  // streak). The RUNG_MIN_SNR_METER floor is the over-climb guard; the in-band CONFIG_TAG
+  // (or legacy SET_CONFIG) is the transport. Cheap after the first call (cached in
+  // snr_track_enabled). Off => every new branch is behind the gate => byte-identical.
+  bool snr_track_feature_enabled();
+
   // A3 demote-decouple gate (data-flow-inband-a3-decouple.md §1.2). Returns true iff
   // BOTH the env opt-in MERCURY_INBAND_A3_DECOUPLE is set (cached in
   // inband_a3_decouple_env) AND the A3 cumulative-ACK capability is NEGOTIATED for this
@@ -5312,6 +5322,10 @@ public:
   int     inband_last_announced_config; // CONFIG_NONE until the first tag
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
+  // snr_track_enabled: cached MERCURY_SNR_TRACK flag (resolved once via
+  //   snr_track_feature_enabled()). Default-off => byte-identical. Same ctor-cached,
+  //   env-keyed, NOT-reset-per-session discipline as inband_rate_enabled.
+  int     snr_track_enabled;            // -1 = unresolved, 0 = off, 1 = on
   // A3 demote-decouple env cache (data-flow-inband-a3-decouple.md): the env half of
   //   inband_a3_decouple_enabled(). -1 = unresolved, 0 = off, 1 = on. Env-keyed (resolved
   //   once + ctor-cached, NOT reset per-session — same discipline as inband_rate_enabled).
@@ -5857,7 +5871,14 @@ public:
   // sets connection_status=TRANSMITTING_CONTROL. Returns true if it routed the
   // demote (caller must `return` — the demote owns the next transition). MUST be
   // called only with a valid lower rung (caller checks !config_is_at_bottom).
-  bool inband_route_failure_demote(int demote_target, const char* reason);
+  // pin_ceiling (default true): pin supershift_proven_ceiling at demote_target so the SNR
+  // re-trigger cannot re-elect a rung a real BREAK/NACK just disproved. The MERCURY_SNR_TRACK
+  // PROACTIVE demote passes false: a precautionary SNR-sensed down-shift is NOT a proven
+  // failure, so a recovered meter must be free to climb back (the RUNG_MIN_SNR_METER floor,
+  // not a pinned ceiling, is the over-climb guard there). All existing callers keep the
+  // default => byte-identical.
+  bool inband_route_failure_demote(int demote_target, const char* reason,
+                                   bool pin_ceiling = true);
   // roll_back_cmd_bsi_to_inflight: the CLIMB-UP counterpart of the demote bsi rollback
   // (data-flow-inband-frame0-rolling-partial.md §13). The demote/BREAK paths
   // (inband_route_failure_demote :3134, CFG16-HOLD :5037, M6 BREAK :5242) roll
