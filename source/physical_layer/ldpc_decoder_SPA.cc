@@ -29,6 +29,9 @@
 #include <mutex>
 #include <thread>
 #include <vector>    // LEVER G: int16 message-state buffers (fixed-point min-sum)
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
 
 // SOLUTION A (fix/ldpc-decode-accel): forward-backward check-node update.
 // The original SPA check-node update (below, default path) recomputes the full
@@ -82,6 +85,96 @@ static inline int ldpc_exact_threads(int CWidth, int P)
 	if(n > P) n = P;
 	return n;
 }
+
+// The flooding variable-node update has one order-sensitive reduction per
+// variable. On AArch64, evaluate two independent variables in the two FP64
+// NEON lanes: each lane still adds R[...,j] in ascending j order, and the
+// contiguous Q writes use only subtracts (never FMA). This is deliberately
+// separate from the check-node transcendentals: replacing scalar libm
+// tanh/atanh with an approximation cannot satisfy Mercury's byte-identity bar.
+// MERCURY_LDPC_NEON=0 is the same-binary scalar override.
+static inline bool ldpc_neon_enabled()
+{
+	static const int enabled = []{
+		const char* e=std::getenv("MERCURY_LDPC_NEON");
+		if(e && *e) return atoi(e)!=0;
+	#if defined(__aarch64__) || defined(_M_ARM64)
+		return true;
+	#else
+		return false;
+	#endif
+	}();
+	return enabled != 0;
+}
+
+static inline void spa_variable_rows_scalar(
+		int begin, int end, const float* LLRi, const double* R,
+		double* Q, double* LLRtmp, int* LLRbin,
+		const int* var_width, int VWidth, int VWidthMax)
+{
+	for(int i=begin; i<end; i++)
+	{
+		double app=LLRi[i];
+		for(int j=0; j<VWidth; j++) app+=R[i*VWidthMax+j];
+		LLRtmp[i]=app;
+		LLRbin[i]=(app<0);
+		for(int j=0; j<var_width[i]; j++) Q[i*VWidthMax+j]=app-R[i*VWidthMax+j];
+	}
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+static inline void spa_variable_rows_neon(
+		int begin, int end, const float* LLRi, const double* R,
+		double* Q, double* LLRtmp, int* LLRbin,
+		const int* var_width, int VWidth, int VWidthMax)
+{
+	int i=begin;
+	for(; i+1<end; i+=2)
+	{
+		const double* ra=R+i*VWidthMax;
+		const double* rb=ra+VWidthMax;
+		float64x2_t app=vcvt_f64_f32(vld1_f32(LLRi+i));
+		int j=0;
+		for(; j+1<VWidth; j+=2)
+		{
+			const float64x2_t a=vld1q_f64(ra+j);
+			const float64x2_t b=vld1q_f64(rb+j);
+			app=vaddq_f64(app, vzip1q_f64(a,b));
+			app=vaddq_f64(app, vzip2q_f64(a,b));
+		}
+		if(j<VWidth)
+		{
+			float64x2_t r=vdupq_n_f64(ra[j]);
+			r=vsetq_lane_f64(rb[j],r,1);
+			app=vaddq_f64(app,r);
+		}
+
+		vst1q_f64(LLRtmp+i,app);
+		const double app0=vgetq_lane_f64(app,0);
+		const double app1=vgetq_lane_f64(app,1);
+		LLRbin[i]=(app0<0);
+		LLRbin[i+1]=(app1<0);
+
+		int width=var_width[i];
+		j=0;
+		const float64x2_t app0v=vdupq_n_f64(app0);
+		for(; j+1<width; j+=2)
+			vst1q_f64(Q+i*VWidthMax+j,
+			          vsubq_f64(app0v,vld1q_f64(ra+j)));
+		if(j<width) Q[i*VWidthMax+j]=app0-ra[j];
+
+		width=var_width[i+1];
+		j=0;
+		const float64x2_t app1v=vdupq_n_f64(app1);
+		for(; j+1<width; j+=2)
+			vst1q_f64(Q+(i+1)*VWidthMax+j,
+			          vsubq_f64(app1v,vld1q_f64(rb+j)));
+		if(j<width) Q[(i+1)*VWidthMax+j]=app1-rb[j];
+	}
+	spa_variable_rows_scalar(i,end,LLRi,R,Q,LLRtmp,LLRbin,
+	                         var_width,VWidth,VWidthMax);
+}
+#endif
 
 static inline void spa_fwdback_rows(
 		int row_begin, int row_end,
@@ -226,15 +319,14 @@ private:
 		{
 			int begin=(N*id)/n;
 			int end=(N*(id+1))/n;
-			for(int i=begin; i<end; i++)
-			{
-				double app=LLRi[i];
-				for(int j=0; j<VWidth; j++) app+=*(R+i*VWidthMax+j);
-				LLRtmp[i]=app;
-				LLRbin[i]=(app<0);
-				for(int j=0; j<var_width[(size_t)i]; j++)
-					*(Q+i*VWidthMax+j)=app-*(R+i*VWidthMax+j);
-			}
+		#if defined(__aarch64__) || defined(_M_ARM64)
+			if(ldpc_neon_enabled())
+				spa_variable_rows_neon(begin,end,LLRi,R,Q,LLRtmp,LLRbin,
+				                       var_width.data(),VWidth,VWidthMax);
+			else
+		#endif
+				spa_variable_rows_scalar(begin,end,LLRi,R,Q,LLRtmp,LLRbin,
+				                         var_width.data(),VWidth,VWidthMax);
 		}
 	}
 
