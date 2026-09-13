@@ -2136,6 +2136,11 @@ public:
   static long long rung_meter_now_ms();
   bool rung_floor_meter_clears(int cfg) const;
   int  apply_rung_floor_raise_cap(int proposed) const;
+  void snr_track_note_meter_read();
+  void snr_track_note_meter_batch(bool clean_batch);
+  void snr_track_meter_window_reset();
+  int  snr_track_sustained_target() const;
+  int  snr_track_apply_climb_cap(int proposed) const;
 
   // SUPERSHIFT SNR-sentinel fix (climb follow-up #1, Option A;
   // data-flow-snr-measurements.md §1.5). The CMD's forward MFSK-ACK climb
@@ -2952,9 +2957,9 @@ public:
   // Resolve + cache the MERCURY_SNR_TRACK env flag (default-off). When set, the
   // commander-side gearshift becomes SNR-SENSED fast fade-tracking: a fresh climb-grade
   // suffix meter that drops BELOW the current rung's RUNG_MIN_SNR_METER floor fires a
-  // PROACTIVE demote (before frames fail), and a recovered meter drives a FAST up-climb to
-  // the highest meter-supported rung (first-clean confirm, not the N=2 / AARF-doubled
-  // streak). The RUNG_MIN_SNR_METER floor is the over-climb guard; the in-band CONFIG_TAG
+  // PROACTIVE demote (before frames fail), and a recovered meter drives a FAST
+  // up-climb after two fresh reads or one fresh read held through a clean batch. A 2 dB
+  // peak margin and the rolling minimum of fresh reads cap the climb; the in-band CONFIG_TAG
   // (or legacy SET_CONFIG) is the transport. Cheap after the first call (cached in
   // snr_track_enabled). Off => every new branch is behind the gate => byte-identical.
   bool snr_track_feature_enabled();
@@ -6415,6 +6420,8 @@ public:
   // require TWO consecutive clean batches. Both TUNABLE.
   static const int SUSTAINED_ANCHOR_N_ROBUST = 1;
   static const int SUSTAINED_ANCHOR_N_OFDM   = 2;
+  static const int SNR_TRACK_SUSTAINED_BATCHES = 2;
+  static constexpr double SNR_TRACK_PEAK_MARGIN_DB = 2.0;
   // ADAPTIVE FRAME-UP THRESHOLD (gearshift-climb-engine.md §12, 2026-05-30) — the
   // FAST-probe target for frame_shift_threshold once a rung is PROVEN sustained-
   // clean. 1 = step up on the very next clean batch (the forward-AARF half af14a9e
@@ -6975,6 +6982,9 @@ public:
   // BREAK (re-earned after recovery) and reset per session. cal-v3 never reads either field.
   double    rung_meter_hold_db{-99.9};
   int       rung_meter_hold_age_batches{1000000000};
+  int       snr_track_prev_meter_cap{CONFIG_NONE};
+  int       snr_track_sustained_cap{CONFIG_NONE};
+  int       snr_track_fresh_batches{0};
   // B2 (default-off) diagnostic: run-lifetime count of climbs ADMITTED by the latch-max where the raw
   // latest snapshot alone would have capped them (the [GEARSHIFT] RUNG-FLOOR-HOLD wire witness).
   long long floor_hold_admits{0};

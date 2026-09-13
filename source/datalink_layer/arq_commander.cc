@@ -2068,6 +2068,8 @@ int cl_arq_controller::elevator_target_from_snr()
 	// climb target that the over-reading suffix meter elects above its measured delivery floor
 	// (the wb13 snr3k+13 cfg14 stall). Never-raise; identity below CONFIG_9 / at high SNR / WB-off.
 	snr_ideal = rung_floor_cap_fire(snr_ideal);
+	if(snr_track_feature_enabled())
+		snr_ideal = snr_track_apply_climb_cap(snr_ideal);
 	return snr_ideal;
 }
 
@@ -2266,6 +2268,8 @@ void cl_arq_controller::rung_meter_note_read(double snr_value)
 		rung_meter_hold_db = snr_value;
 		rung_meter_hold_age_batches = 0;
 	}
+	if(snr_track_feature_enabled())
+		snr_track_note_meter_read();
 }
 
 // V3 age tick. Called once per data-ACK-wait entry (clear_snr_arm_for_data_ack_wait sites — the
@@ -2299,6 +2303,77 @@ void cl_arq_controller::rung_meter_reset()
 	rung_meter_healthy_hold_batches = 0;       // B2: no healthy-hold streak yet
 	rung_meter_hold_db = -99.9;                // B2: no latch-max peak yet this session
 	rung_meter_hold_age_batches = 1000000000;
+	snr_track_meter_window_reset();
+}
+
+void cl_arq_controller::snr_track_meter_window_reset()
+{
+	snr_track_prev_meter_cap = CONFIG_NONE;
+	snr_track_sustained_cap = CONFIG_NONE;
+	snr_track_fresh_batches = 0;
+}
+
+// Record an actual fresh suffix-meter read. The rolling minimum of two reads rejects an
+// alternating 9/15 dB MPG peak; a 2 dB margin on cfg14 and above also prevents one held
+// 15 dB read from licensing the unsustainable peak rung.
+void cl_arq_controller::snr_track_note_meter_read()
+{
+	int sample_cap = WB_CONFIG_MAX;
+	while(sample_cap >= CONFIG_9
+	      && !(rung_meter_db > rung_floor_min_meter(sample_cap)
+	           + rung_floor_bump_db[sample_cap]
+	           + (sample_cap >= CONFIG_14 ? SNR_TRACK_PEAK_MARGIN_DB : 0.0)))
+		sample_cap = config_ladder_down(sample_cap, robust_enabled);
+
+	if(snr_track_fresh_batches == 0 || snr_track_prev_meter_cap == CONFIG_NONE)
+	{
+		snr_track_fresh_batches = 1;
+		snr_track_sustained_cap = sample_cap;
+	}
+	else
+	{
+		snr_track_fresh_batches = SNR_TRACK_SUSTAINED_BATCHES;
+		snr_track_sustained_cap =
+			config_ladder_index(sample_cap) < config_ladder_index(snr_track_prev_meter_cap)
+			? sample_cap : snr_track_prev_meter_cap;
+	}
+	snr_track_prev_meter_cap = sample_cap;
+}
+
+// A clean data batch may confirm one fresh held read while it remains inside the normal
+// freshness window. It cannot start a window from a cached value; partial or stale data
+// breaks the confirmation run.
+void cl_arq_controller::snr_track_note_meter_batch(bool clean_batch)
+{
+	if(!clean_batch || rung_meter_stale())
+	{
+		snr_track_meter_window_reset();
+		return;
+	}
+	if(snr_track_fresh_batches == 1)
+		snr_track_fresh_batches = SNR_TRACK_SUSTAINED_BATCHES;
+}
+
+int cl_arq_controller::snr_track_sustained_target() const
+{
+	if(rung_meter_stale() || snr_track_fresh_batches < SNR_TRACK_SUSTAINED_BATCHES)
+		return CONFIG_NONE;
+	return snr_track_sustained_cap;
+}
+
+int cl_arq_controller::snr_track_apply_climb_cap(int proposed) const
+{
+	if(!rung_meter_data_latched)
+		return proposed;
+	int cap = snr_track_sustained_target();
+	if(cap == CONFIG_NONE)
+		cap = config_ladder_index(current_configuration) < config_ladder_index(CONFIG_8)
+			? CONFIG_8 : current_configuration;
+	else if(config_ladder_index(cap) < config_ladder_index(current_configuration))
+		cap = current_configuration;
+	if(config_ladder_index(proposed) > config_ladder_index(cap))
+		return cap;
+	return proposed;
 }
 
 // V3 floor+freshness check WITHOUT the at/below-current shortcut. The shortcut in rung_floor_ok (a
@@ -9146,6 +9221,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// pinned ceiling, guards over-climb). WB commander, FRESH meter, gated OFDM rung only
 			// (cfg<CONFIG_9 floors are -90 -> rung_floor_meter_clears is always true there -> this
 			// never fires). Off-flag: byte-identical (the whole block is behind the gate).
+			if(snr_track_feature_enabled())
+				snr_track_note_meter_batch(
+					promotion_allowed_on_batch(last_batch_fully_acked));
 			if(snr_track_feature_enabled()
 			   && role == COMMANDER
 			   && narrowband_enabled != YES
@@ -9166,6 +9244,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						rung_floor_min_meter(current_configuration),
 						current_configuration, snr_demote_target);
 					fflush(stdout);
+					snr_track_meter_window_reset();
 					if(inband_route_failure_demote(snr_demote_target, "snr_track_floor",
 						/*pin_ceiling=*/false))
 						return;   // batch re-staged at the demoted rung; skip the climb this cycle
@@ -9558,16 +9637,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				fflush(stdout);
 			}
 			// SNR-TRACK fast up-climb (MERCURY_SNR_TRACK, default-off): ride the recovery up
-			// within one coherence -- fire the FRAME-UP on the FIRST clean batch (skip the N=2 /
-			// AARF-doubled / fast-probe streak). The RUNG_MIN_SNR_METER floor (applied to the
-			// target below via rung_floor_cap_fire) is the over-climb guard, so "fast" cannot
-			// over-elect. Off-flag: byte-identical.
-			if(snr_track_feature_enabled())
+			// only after a fresh read is confirmed by another read or a clean held batch. The
+			// rolling fresh-read minimum and peak margin cap the jump.
+			// Off-flag: byte-identical.
+			int snr_track_climb_cap = snr_track_feature_enabled()
+				? snr_track_sustained_target() : CONFIG_NONE;
+			if(snr_track_feature_enabled()
+			   && snr_track_climb_cap != CONFIG_NONE
+			   && config_ladder_index(snr_track_climb_cap)
+			      > config_ladder_index(current_configuration))
 			{
 				eff_frame_shift_threshold = FRAME_SHIFT_FAST;
-				printf("[GEARSHIFT] SNR-TRACK fast-confirm: 1-batch climb armed at config %d "
-					"(meter %.1f) -> firing FRAME-UP on the first clean batch\n",
-					current_configuration, rung_meter_db);
+				printf("[GEARSHIFT] SNR-TRACK sustained-confirm: %d fresh batches at config %d "
+					"(meter %.1f, cap %d) -> firing FRAME-UP\n",
+					snr_track_fresh_batches, current_configuration, rung_meter_db,
+					snr_track_climb_cap);
 				fflush(stdout);
 			}
 			// DEFER-WHILE-HOLE-OUTSTANDING (data-flow-inband-frame0-rolling-partial.md §10):
@@ -9669,14 +9753,14 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// one rung/batch so CMD/RSP stay aligned (no reverse-SACK stranding), and legacy takes the
 				// multi-rung jump via the fast SET_CONFIG. WB commander, fresh meter. Off-flag: byte-identical.
 				if(snr_track_feature_enabled() && narrowband_enabled != YES
-				   && is_ofdm_config(current_configuration) && !rung_meter_stale())
+				   && is_ofdm_config(current_configuration)
+				   && snr_track_climb_cap != CONFIG_NONE)
 				{
-					int meter_target = apply_rung_floor_raise_cap(WB_CONFIG_MAX);
+					int meter_target = snr_track_climb_cap;
 					if(supershift_proven_ceiling >= 0
 					   && config_ladder_index(meter_target) > config_ladder_index(supershift_proven_ceiling))
 						meter_target = supershift_proven_ceiling;
-					if(config_ladder_index(meter_target) > config_ladder_index(snr_elevator))
-						snr_elevator = meter_target;
+					snr_elevator = meter_target;
 				}
 #ifdef INBAND_PLUS1_CLIMB_FAILBEFORE
 				bool inband_plus1_on = false;  // fails-before: elevator jump NOT suppressed
@@ -9693,6 +9777,18 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// Per-rung floor gate on the SNR-blind +1 FRAME-UP: a 13->14 ACK-success step can
 				// reach a below-floor rung the (already-gated) elevator held; cap it (never-raise).
 				negotiated_configuration = rung_floor_cap_fire(negotiated_configuration);
+				// SNR tracking may climb only as far as the rolling fresh-meter window
+				// supports. Until that window is complete, hold the current rung.
+				if(snr_track_feature_enabled())
+				{
+					int sustained_cap = snr_track_climb_cap;
+					if(sustained_cap == CONFIG_NONE)
+						sustained_cap = config_ladder_index(current_configuration)
+							< config_ladder_index(CONFIG_8) ? CONFIG_8 : current_configuration;
+					if(config_ladder_index(negotiated_configuration)
+					   > config_ladder_index(sustained_cap))
+						negotiated_configuration = sustained_cap;
+				}
 				// NO-OP FRAME-UP SUPPRESSION (data-flow-gearshift-climb.md). The margin cap
 				// (and the moderate-SNR CFG16 decode-margin gate) can pull the FRAME-UP target
 				// back to the CURRENT config — a NO-OP "climb": proposed_frame was CFG15->16 but
@@ -9731,6 +9827,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					consecutive_data_acks, eff_frame_shift_threshold, frame_shift_threshold,
 					clean_batches_at_current_config, current_configuration, negotiated_configuration);
 				fflush(stdout);
+				if(snr_track_feature_enabled())
+					snr_track_meter_window_reset();
 				// Fire-proof diagnostic (data-flow-gearshift-climb.md): a greppable positive signal
 				// that the FRAME-UP elevator/tier-cross produced a MULTI-RUNG leap (the negotiated
 				// target outran the conservative +1 proposed_frame). The first attempt's gate failed
@@ -11828,6 +11926,9 @@ void cl_arq_controller::process_control_commander()
 						// survives the BREAK->ROBUST crater and re-climbs): floor-cap the probe target
 						// so the loop cannot re-elect the disproven rung (never-raise; audit §1 P6).
 						negotiated_configuration = rung_floor_cap_fire(negotiated_configuration);
+						if(snr_track_feature_enabled())
+							negotiated_configuration =
+								snr_track_apply_climb_cap(negotiated_configuration);
 						// Guard: if target config is beyond SNR capability, do not probe.
 						// Probing to an undecodable config leaves both sides stuck.
 						//
@@ -12010,6 +12111,8 @@ void cl_arq_controller::process_control_commander()
 							turboshift_last_good = current_configuration;
 							turboshift_retries = 1;
 							negotiated_configuration = snr_ideal;
+							if(snr_track_feature_enabled())
+								snr_track_meter_window_reset();
 							cleanup();
 							add_message_control(SET_CONFIG);
 							this->connection_status = TRANSMITTING_CONTROL;
@@ -13711,6 +13814,42 @@ int cl_arq_controller::test_rung_floor_gate()
 	check(rung_meter_stale(), "T3b wall: a sample older than the wall bound is STALE (idle)");
 	check(!rung_floor_ok(CONFIG_14), "T3b wall: STALE wall -> a climb is refused");
 
+	// ── T3c: SNR-track fresh/sustained window ──────────────────────────────────────────────
+	rung_floor_memory_reset();
+	rung_meter_reset();
+	rung_meter_data_latched = true;
+	breaks_since_last_data_success = 0;
+	set_meter(13.0);
+	snr_track_note_meter_read();
+	check(snr_track_sustained_target() == CONFIG_NONE,
+		"T3c: one fresh meter read cannot arm an SNR-track climb");
+	set_meter(15.0);
+	snr_track_note_meter_read();
+	check(snr_track_sustained_target() == CONFIG_13,
+		"T3c: fresh 13/15 pair caps the climb at cfg13, not the cfg14 peak");
+	check(snr_track_apply_climb_cap(CONFIG_16) == CONFIG_13,
+		"T3c: the shared climb cap clamps an elevator/turbo target to cfg13");
+	set_meter(9.0);
+	snr_track_note_meter_read();
+	check(snr_track_sustained_target() == CONFIG_8,
+		"T3c: rolling 15/9 pair drops the sustained cap to cfg8");
+	snr_track_meter_window_reset();
+	set_meter(15.0);
+	snr_track_note_meter_read();
+	rung_meter_age_batches = 1;
+	snr_track_note_meter_batch(true);
+	check(snr_track_sustained_target() == CONFIG_13,
+		"T3c: a held 15 dB peak with margin caps at cfg13, not cfg14");
+	snr_track_note_meter_batch(false);
+	check(snr_track_sustained_target() == CONFIG_NONE,
+		"T3c: a partial batch breaks the sustained run");
+	set_meter(15.0);
+	rung_meter_age_batches = 1;
+	snr_track_note_meter_batch(true);
+	check(snr_track_sustained_target() == CONFIG_NONE,
+		"T3c: a cached meter from an earlier batch cannot arm fast-confirm");
+	check(snr_track_apply_climb_cap(CONFIG_16) == CONFIG_8,
+		"T3c: without a sustained window the safe ungated climb stops at cfg8");
 	// ── T6: BREAK-recovery anchor-clamp RAISE gating (T11 — the Fact B step-6 loop kill) ─────────
 	// During recovery current_configuration is still the FAILING rung, and the anchor clamp would
 	// re-raise the recovery target UP to the last data-viable rung. On a STALE/garbage-high meter that
