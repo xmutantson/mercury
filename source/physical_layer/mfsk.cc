@@ -562,6 +562,91 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		connect_match_threshold = 0;
 	}
 
+	// Scream correlation-token family (turnaround control).
+	// Four 8-tone Welch-Costas bases on the unused primitive roots {10,11,12,14}
+	// mod 17 (phase-optimized to break even-power coincidence with the shipped
+	// ACK/BREAK/HAIL/CONNECT bases), 16 symbols each (8 x 2 reps, same plumbing
+	// as ACK), plus one shared 5-symbol presence prefix (root g=3, phase 6).
+	// Rung order: [0]=-1, [1]=-2, [2]=-4, [3]=FLOOR. Pairwise 8-tone Hamming
+	// distance >= 6/8 vs every shipped base and each other (enforced by
+	// test_base_pattern_cross_correlation). NB uses symbol-permuted copies of
+	// the shipped Sidelnikov sequence. A permutation of the tone alphabet
+	// preserves its aperiodic autocorrelation; distinct non-affine permutations
+	// avoid turning an ordinary carrier offset into a different rung.
+	scream_pattern_len     = 8;
+	scream_pattern_nsymb   = 16;
+	scream_match_threshold = 7;
+	scream_prefix_len      = 5;
+	scream_prefix_nsymb    = 5;
+	scream_prefix_match_threshold = 3;
+	if (M == 16)
+	{
+		static const int scr[SCREAM_NBASES][8] = {
+			{14, 13,  3,  5,  8,  4, 15,  6},   // g10  rung -1
+			{ 4,  3,  9,  7,  2, 15,  5, 14},   // g11  rung -2
+			{ 7, 10, 12,  2,  1,  6, 15,  4},   // g12  rung -4
+			{12, 11, 14,  5, 15,  2,  7,  9}    // g14  rung FLOOR
+		};
+		for (int b = 0; b < SCREAM_NBASES; b++)
+			for (int i = 0; i < 8; i++) scream_tones[b][i] = scr[b][i];
+		const int pre[5] = {10, 15, 13, 7, 6};   // g=3 phase 6
+		for (int i = 0; i < 5; i++) scream_prefix_tones[i] = pre[i];
+	}
+	else if (M == 32)
+	{
+		// 2x-scaled M=16 bases (max M16 tone 15 -> 30, in range for M=32; no
+		// substitution needed), same rung order + prefix.
+		static const int scr[SCREAM_NBASES][8] = {
+			{28, 26,  6, 10, 16,  8, 30, 12},
+			{ 8,  6, 18, 14,  4, 30, 10, 28},
+			{14, 20, 24,  4,  2, 12, 30,  8},
+			{24, 22, 28, 10, 30,  4, 14, 18}
+		};
+		for (int b = 0; b < SCREAM_NBASES; b++)
+			for (int i = 0; i < 8; i++) scream_tones[b][i] = scr[b][i];
+		const int pre[5] = {20, 30, 26, 14, 12};
+		for (int i = 0; i < 5; i++) scream_prefix_tones[i] = pre[i];
+	}
+	else if (M == 8)
+	{
+		scream_pattern_len = scream_pattern_nsymb = 32;
+		scream_match_threshold = 24;
+		scream_prefix_match_threshold = 4;
+		// Four bijective alphabet relabelings of the p=37 Sidelnikov ACK
+		// sequence. These retain the <=3/32 non-zero-shift autocorrelation.
+		static const int perm[SCREAM_NBASES][8] = {
+			{2,5,1,7,4,0,6,3}, {6,0,5,2,7,3,1,4},
+			{3,7,0,6,1,5,4,2}, {5,2,7,0,6,4,3,1}
+		};
+		for (int b = 0; b < SCREAM_NBASES; b++)
+			for (int i = 0; i < 32; i++)
+				scream_tones[b][i] = perm[b][ack_tones[i] & 7];
+		const int pre[5] = {0, 6, 2, 7, 4};
+		for (int i = 0; i < 5; i++) scream_prefix_tones[i] = pre[i];
+	}
+	else if (M == 4)
+	{
+		scream_pattern_len = scream_pattern_nsymb = 48;
+		scream_match_threshold = 40;
+		scream_prefix_match_threshold = 4;
+		static const int perm[SCREAM_NBASES][4] = {
+			{1,3,0,2}, {2,0,3,1}, {3,2,1,0}, {1,0,3,2}
+		};
+		for (int b = 0; b < SCREAM_NBASES; b++)
+			for (int i = 0; i < 48; i++)
+				scream_tones[b][i] = perm[b][ack_tones[i] & 3];
+		const int pre[5] = {3, 0, 2, 1, 3};
+		for (int i = 0; i < 5; i++) scream_prefix_tones[i] = pre[i];
+	}
+	else
+	{
+		// No scream token is defined for modulation alphabets outside the four
+		// supported WB/NB control geometries above.
+		for (int b = 0; b < SCREAM_NBASES; b++)
+			for (int i = 0; i < MAX_ACK_TONES; i++) scream_tones[b][i] = 0;
+		for (int i = 0; i < MAX_ACK_TONES; i++) scream_prefix_tones[i] = 0;
+	}
+
 	// Step 15: legacy MFSK SACK tone tables removed — partial-batch SACK is
 	// now exclusively the OFDM SACK_RSP control frame (arq_common.cc Step 7).
 
@@ -577,6 +662,28 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		break_match_threshold += wb_match_threshold_bias;
 		hail_match_threshold  += wb_match_threshold_bias;
 		connect_match_threshold += wb_match_threshold_bias;
+	}
+}
+
+void cl_mfsk::generate_scream_pattern(std::complex<double>* pattern_out, int rung)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0 || pattern_out == NULL) return;
+	if (rung < 0 || rung >= SCREAM_NBASES) return;
+	double amp = sqrt((double)Nc / nStreams);
+	const int total = scream_prefix_nsymb + scream_pattern_nsymb;
+	for (int abs_s = 0; abs_s < total; abs_s++)
+	{
+		for (int k = 0; k < Nc; k++)
+			pattern_out[abs_s * Nc + k] = std::complex<double>(0.0, 0.0);
+		const bool prefix = abs_s < scream_prefix_nsymb;
+		const int s = prefix ? abs_s : abs_s - scream_prefix_nsymb;
+		const int tone_base = prefix
+			? scream_prefix_tones[s % scream_prefix_len]
+			: scream_tones[rung][s % scream_pattern_len];
+		const int actual_tone = (tone_base + s * tone_hop_step) % M;
+		for (int st = 0; st < nStreams; st++)
+			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
+				std::complex<double>(amp, 0.0);
 	}
 }
 

@@ -597,6 +597,8 @@ def main():
     # the Nth RSP->CMD signal burst (2 = first TEST_CONNECTION_ACK). 0=disabled.
     ap.add_argument("--erase-b2a-burst", type=int, default=0,
                     help="TEST-ONLY: drop the Nth RSP->CMD burst (2=first TEST_ACK)")
+    ap.add_argument("--erase-a2b-burst", type=int, default=0,
+                    help="TEST-ONLY: drop the Nth CMD->RSP signal burst")
     # deprecated flat-fade knobs (superseded by --profile); kept for compat.
     ap.add_argument("--fade-hz", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--fade-depth", type=float, default=0.0, help=argparse.SUPPRESS)
@@ -897,6 +899,7 @@ def main():
                      "--turnaround-ppm-a2b", str(args.turnaround_ppm_a2b),
                      "--turnaround-ppm-b2a", str(args.turnaround_ppm_b2a),
                      "--turnaround-jitter-ms", str(args.turnaround_jitter_ms),
+                     "--erase-a2b-burst", str(args.erase_a2b_burst),
                      "--erase-b2a-burst", str(args.erase_b2a_burst),
                      "--airtime-json", relay_airtime_json,
                      "--log", relay_log]

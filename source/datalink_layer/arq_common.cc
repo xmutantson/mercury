@@ -1277,6 +1277,21 @@ cl_arq_controller::cl_arq_controller()
 	inband_last_announced_config=CONFIG_NONE;
 	inband_tx_epoch_parity=0;
 	inband_rate_enabled=-1;  // unresolved; inband_rate_feature_enabled() caches it
+	scream_wake_enabled=-1;
+	scream_reentry_listen_armed=false;
+	scream_reentry_listen_timer.stop();
+	scream_reentry_listen_timer.reset();
+	scream_reentry_recovery_pending=false;
+	scream_emit_count=0;
+	scream_detect_count=0;
+	scream_presence_trip_count=0;
+	scream_reentry_listen_count=0;
+	scream_reentry_accept_count=0;
+	scream_resume_pending=false;
+	scream_resume_count=0;
+	scream_link_timeout_grace_used=false;
+	scream_probe_count=0;
+	scream_probe_next_ms=500;
 	snr_track_enabled=-1;    // unresolved; snr_track_feature_enabled() caches it (default-off)
 	inband_a3_decouple_env=-1;  // unresolved; inband_a3_decouple_enabled() caches the env half
 	// Top-gear (CONFIG_17, 64-QAM) channel-clean election (topgear-stack-productionize.md).
@@ -2720,6 +2735,32 @@ void cl_arq_controller::calculate_receiving_timeout()
 			// Default 0 post-fix; re-inflate at runtime if needed.
 			if(sack_enabled)
 				timeout += sack_timeout_extra_ms;
+
+			// T2 SCREAM WAKE scheduled listen slot.  The responder's empty-forward-
+			// window deadline and this commander's reverse-ACK deadline have different
+			// timer origins: the former is re-armed when the preceding batch is retired,
+			// while the latter begins after the current keydown drains.  On a whole-batch
+			// loss that phase difference can place the responder's ~0.5 s scream just
+			// beyond the ordinary ACK slot.  Keep the commander unkeyed long enough to
+			// cover the measured worst phase skew plus the complete wake waveform.
+			// A normal ACK still returns immediately, so this budget is paid only on a
+			// failed/volatile turn.  OFF, robust, and control-ACK paths are byte-identical.
+			int scream_listen_adder = 0;
+			if(scream_wake_feature_enabled()
+			   && connection_status == RECEIVING_ACKS_DATA
+			   && is_ofdm_config(current_configuration)
+			   && current_configuration != CONFIG_0)
+			{
+				const int SCREAM_DEADLINE_SKEW_GUARD_MS = 16000;
+				scream_listen_adder = SCREAM_DEADLINE_SKEW_GUARD_MS;
+				scream_probe_next_ms = 500;
+				timeout += scream_listen_adder;
+				if(timeout > 60000) timeout = 60000;
+				printf("[SCREAM-LISTEN] scheduled post-batch slot timeout=%dms "
+				       "adder=%dms cfg=%d\n",
+					timeout, scream_listen_adder, current_configuration);
+				fflush(stdout);
+			}
 			printf("[CMD-POST-TX-CALIB] timeout=%dms geom_floor=%d (frame_drain=%d + sack_arrival=%d: ptt_off=%d rsp_decode=%d pattern=%d ptt_on=%d) est(cls=%d bk=%d n=%d srtt=%d rttvar=%d K=%d floor=%d) defeat=%d extra=%d recov_rephase=%d batch=%d sack=%d\n",
 				timeout, geometric_floor, frame_drain, sack_arrival,
 				ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, pattern_time, ptt_on_delay_ms,
@@ -3972,9 +4013,110 @@ bool cl_arq_controller::inband_rate_feature_enabled()
 	if(inband_rate_enabled < 0)
 	{
 		const char* e = std::getenv("MERCURY_INBAND_RATE");
-		inband_rate_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
+		const char* s = std::getenv("MERCURY_SCREAM_WAKE");
+		// SCREAM is a complete T2 lever: its handoff is CONFIG_TAG, so enabling
+		// the wake necessarily enables the already-safe tag transport too.
+		inband_rate_enabled = ((e && *e && atoi(e) != 0)
+			|| (s && *s && atoi(s) != 0)) ? 1 : 0;
 	}
 	return inband_rate_enabled == 1;
+}
+
+bool cl_arq_controller::scream_wake_feature_enabled()
+{
+	if(scream_wake_enabled < 0)
+	{
+		const char* e = std::getenv("MERCURY_SCREAM_WAKE");
+		scream_wake_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
+		if(scream_wake_enabled == 1 && !channel_lookup.is_loaded())
+		{
+			const char* q = std::getenv("MERCURY_SCREAM_QTABLE");
+			if(q == NULL || *q == '\0') q = "channel_state_lookup.json";
+			if(channel_lookup.init_from_json(q))
+				printf("[SCREAM-MAP] loaded %d channel-state cells from %s\n",
+					channel_lookup.n_cells(), q);
+			else
+				printf("[SCREAM-MAP] table unavailable (%s); fail-safe rung=FLOOR\n",
+					channel_lookup.last_error());
+			fflush(stdout);
+		}
+	}
+	return scream_wake_enabled == 1;
+}
+
+int cl_arq_controller::scream_rung_to_config(int current_cfg, int rung) const
+{
+	int cur = config_ladder_index(current_cfg);
+	if(cur < 0) return CONFIG_NONE;
+	// FLOOR deliberately means the lowest live OFDM rung, never the slow robust
+	// control tier. CONFIG_TAG re-entry at cfg17 is unnecessary: screams demote.
+	int floor_idx = config_ladder_index(CONFIG_0);
+	if(floor_idx < 0) return CONFIG_NONE;
+	int dst = floor_idx;
+	if(rung >= 0 && rung <= 2)
+	{
+		static const int drop[3] = {1, 2, 4};
+		dst = cur - drop[rung];
+		if(dst < floor_idx) dst = floor_idx;
+	}
+	if(dst >= FULL_CONFIG_LADDER_SIZE) dst = FULL_CONFIG_LADDER_SIZE - 1;
+	return FULL_CONFIG_LADDER[dst];
+}
+
+int cl_arq_controller::scream_choose_rung() const
+{
+	// Deterministic fire-proof override; production normally derives the request
+	// from the loaded channel-state table and the last real failed-window meter.
+	const char* forced = std::getenv("MERCURY_SCREAM_RUNG");
+	if(forced && *forced)
+	{
+		int r = atoi(forced);
+		if(r >= 0 && r < cl_mfsk::SCREAM_NBASES) return r;
+	}
+	if(telecom_system == NULL) return 3;
+	double snr = telecom_system->get_correlator_snr_proxy();
+	double sel = telecom_system->get_channel_selectivity();
+	if(!channel_lookup.is_loaded() || snr == -99.0 || sel < 0.0) return 3;
+	int proposed = channel_lookup.lookup(snr, sel);
+	if(proposed < 0 || is_robust_config(proposed)) return 3;
+	int cur = config_ladder_index(current_configuration);
+	int dst = config_ladder_index(proposed);
+	if(cur < 0 || dst < 0) return 3;
+	// One conservative rung below the Q-table nominal, then quantize the request.
+	dst--;
+	int floor_idx = config_ladder_index(CONFIG_0);
+	if(dst < floor_idx) dst = floor_idx;
+	int delta = cur - dst;
+	if(delta <= 1) return 0;
+	if(delta <= 2) return 1;
+	if(delta <= 4) return 2;
+	return 3;
+}
+
+int cl_arq_controller::test_scream_rung_map()
+{
+	struct map_case { int current; int rung; int expected; } cases[] = {
+		{CONFIG_16, 0, CONFIG_15}, {CONFIG_16, 1, CONFIG_14},
+		{CONFIG_16, 2, CONFIG_12}, {CONFIG_16, 3, CONFIG_0},
+		{CONFIG_2,  0, CONFIG_1},  {CONFIG_2,  1, CONFIG_0},
+		{CONFIG_2,  2, CONFIG_0},  {CONFIG_2,  3, CONFIG_0},
+		{CONFIG_17, 0, CONFIG_16}, {CONFIG_17, 1, CONFIG_15}
+	};
+	int failures = 0;
+	for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+	{
+		int got = scream_rung_to_config(cases[i].current, cases[i].rung);
+		bool pass = got == cases[i].expected;
+		printf("[TEST-SCREAM-MAP] %s current=%d rung=%d target=%d expected=%d\n",
+			pass ? "PASS" : "FAIL", cases[i].current, cases[i].rung,
+			got, cases[i].expected);
+		if(!pass) failures++;
+	}
+	bool invalid_pass = scream_rung_to_config(CONFIG_NONE, 0) == CONFIG_NONE;
+	printf("[TEST-SCREAM-MAP] %s invalid current fails closed\n",
+		invalid_pass ? "PASS" : "FAIL");
+	if(!invalid_pass) failures++;
+	return failures;
 }
 
 // Resolve + cache the MERCURY_SNR_TRACK env flag (default-off). Same env-keyed, resolve-once,
@@ -4880,7 +5022,12 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 	// which already self-gates on a CRC/LDPC decode — INV-C) the gate passes through. Only
 	// applies to an OFDM-target adopt (the contamination is an OFDM-acquisition problem); a
 	// robust/MFSK target is judged by its own machinery. Feature-gated (legacy byte-identical).
+	// A validated scream explicitly opens a one-shot blind re-entry window. In
+	// that state the CRC/binding-valid CONFIG_TAG is the synchronization anchor;
+	// applying the ordinary old-config OFDM clean-lock gate would circularly
+	// require the receiver to lock the very config it has not followed yet.
 	if(is_ofdm_config(followed_config)
+	   && !scream_reentry_listen_armed
 	   && inband_adopt_gate_snapshot != NULL
 	   && inband_adopt_gate_snapshot_len > 0
 	   && !inband_adopt_metric_gate_ok(inband_adopt_gate_snapshot,
@@ -4916,7 +5063,35 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 	// inband_adopt_resynced_config so the tag-follow path (here) AND the Stage-4
 	// down-ladder share ONE implementation — only the trigger differs (passband tag
 	// vs blind down-window decode). See data-flow-perbatch-config.md §13.2(c).
+	// A scream re-entry can re-frame the outstanding high-rate batch at the
+	// announced lower rung.  Preserve the absolute byte ruler across the HINGE
+	// reset so copy_data_to_buffer() can discard/trim any rebuilt overlap before
+	// admitting new bytes.  Capture this before inband_adopt_resynced_config()
+	// resets the responder generation window.
+	bool scream_rebase_seam = scream_reentry_listen_armed
+		&& sack_v2_enabled
+		&& rx_stream_delivered > 0;
 	inband_adopt_resynced_config(followed_config);
+	if(scream_rebase_seam)
+		rsp_rebase_seam_armed = true;
+	if(scream_reentry_listen_armed)
+	{
+		scream_reentry_listen_armed = false;
+		scream_reentry_listen_timer.stop();
+		scream_reentry_listen_timer.reset();
+		scream_reentry_recovery_pending = true;
+		// A valid tag is fresh peer activity and begins the responder half of
+		// the bounded recovery phase.  Re-anchor its liveness clocks and permit
+		// one interval while waiting for the first low-rate DATA frame; that
+		// frame clears recovery_pending, so healthy traffic pays no extra wait.
+		link_timer.start();
+		watchdog_timer.start();
+		scream_link_timeout_grace_used = false;
+		scream_reentry_accept_count++;
+		printf("[SCREAM-REENTRY] CONFIG_TAG ACCEPT count=%ld config=%d; blind resume armed\n",
+			scream_reentry_accept_count, followed_config);
+		fflush(stdout);
+	}
 
 	if(out_followed_config) *out_followed_config = followed_config;
 	return 1;
@@ -5762,6 +5937,14 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 	if(!present)
 		return 0;   // no tag in this window -> steady state / lost tag (Stage 4 recovers)
 
+	// A scream listener has an explicit post-tag guard on the transmitter.  Its
+	// first tag-only acquisition therefore cannot also contain a complete frame 0:
+	// after accepting the tag we must discard this old-config snapshot and wait for
+	// the freshly reinitialized capture ring.  Ordinary gapless in-band follows do
+	// need to preserve frame 0.  Remember the distinction before the accept path
+	// consumes scream_reentry_listen_armed.
+	bool scream_tag_only_follow = scream_reentry_listen_armed;
+
 	// ─── FRAME-0 PRESERVATION (data-flow-perbatch-config.md §15 INV-3d-A) ───
 	// A REAL config change that crosses a MODULATION boundary (e.g. 8PSK CONFIG_10 ->
 	// QPSK CONFIG_9) makes load_configuration set reinit_subsystems.data_container=YES
@@ -5816,7 +5999,7 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 		fflush(stdout);
 	}
 #else
-	if(followed == 1 && followed_cfg != cfg_before)
+	if(followed == 1 && followed_cfg != cfg_before && !scream_tag_only_follow)
 	{
 		double* member = telecom_system->data_container.ready_to_process_passband_delayed_data;
 		long new_len = (long)telecom_system->data_container.Nofdm
@@ -5837,7 +6020,11 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 #endif
 
 	if(out_followed_config) *out_followed_config = followed_cfg;
-	return followed;
+	// Return 2 only for the scream tag-only handoff.  The sole production caller
+	// treats it as "followed, but do not demodulate this pre-guard snapshot" and
+	// lets the new-config ring collect the following frame.  Other callers retain
+	// the historical 0/1 contract.
+	return (followed == 1 && scream_tag_only_follow) ? 2 : followed;
 }
 
 // ============================================================================
@@ -6721,11 +6908,19 @@ void cl_arq_controller::inband_finalize_ofdm_adopt_ring(int adopted_config)
 			telecom_system->data_container.nUnder_processing_events = 0;
 			int frame_symb = telecom_system->data_container.preamble_nSymb
 			               + telecom_system->data_container.Nsymb;
-			telecom_system->data_container.frames_to_read = frame_symb + 10;
+			// A scream re-entry starts from an explicitly emptied capture ring and
+			// includes the pre-frame CONFIG_TAG ahead of frame 0.  Four additional
+			// symbol periods let that complete frame settle inside the natural ring;
+			// without them the first search can land its preamble just beyond the
+			// legal upper bound (observed CONFIG_8: pream=137, upper=135) and then
+			// chase the tail for the rest of the batch.  Ordinary in-band follows
+			// retain their proven +10 geometry.
+			int settle_margin = scream_reentry_listen_armed ? 14 : 10;
+			telecom_system->data_container.frames_to_read = frame_symb + settle_margin;
 			printf("[INBAND-RX] HINGE-1 OFDM-RX re-init: nUnder=0, frames_to_read=%d "
-				"(frame_symb=%d) -> fresh anchor search will see a full CONFIG_%d frame\n",
+				"(frame_symb=%d margin=%d) -> fresh anchor search will see a full CONFIG_%d frame\n",
 				(int)telecom_system->data_container.frames_to_read.load(),
-				frame_symb, followed_config);
+				frame_symb, settle_margin, followed_config);
 			fflush(stdout);
 		}
 		MUTEX_UNLOCK(&capture_prep_mutex);
@@ -6784,7 +6979,8 @@ void cl_arq_controller::inband_finalize_ofdm_adopt_ring(int adopted_config)
 				telecom_system->data_container.nUnder_processing_events = 0;
 				int frame_symb2 = telecom_system->data_container.preamble_nSymb
 				                + telecom_system->data_container.Nsymb;
-				telecom_system->data_container.frames_to_read = frame_symb2 + 10;
+				int settle_margin2 = scream_reentry_listen_armed ? 14 : 10;
+				telecom_system->data_container.frames_to_read = frame_symb2 + settle_margin2;
 				MUTEX_UNLOCK(&capture_prep_mutex);
 			}
 			// FIX #1d / #1e (data-flow-robust-ofdm-adopt-flush.md §11/§14): set the shrink GATE flag
@@ -7919,7 +8115,30 @@ void cl_arq_controller::update_status()
 		printf("Switching to RESPONDER mode after max connection attempts\n");
 	}
 
-	if(link_timer.get_elapsed_time_ms()>=link_timeout)
+	// T2 SCREAM WAKE: the legacy session-idle deadline can coincide with the
+	// first failed-batch ACK slot. Preserve exactly one link-timeout interval for
+	// the scheduled wake/listen exchange before destructive teardown.  The
+	// responder gets the same bounded interval after it accepts CONFIG_TAG and
+	// while it awaits the first re-entry DATA frame. A clean data ACK / first DATA
+	// clears the phase; a genuinely dead link reaches the unchanged teardown on
+	// the next link_timeout.
+	bool scream_link_grace = link_timer.get_elapsed_time_ms() >= link_timeout
+		&& scream_wake_feature_enabled()
+		&& link_status == CONNECTED
+		&& ((role == COMMANDER && connection_status == RECEIVING_ACKS_DATA)
+		    || (role == RESPONDER && scream_reentry_recovery_pending))
+		&& is_ofdm_config(current_configuration)
+		&& !scream_link_timeout_grace_used;
+	if(scream_link_grace)
+	{
+		scream_link_timeout_grace_used = true;
+		link_timer.start();
+		watchdog_timer.start();
+		printf("[SCREAM-LISTEN] link-timeout teardown deferred once for wake slot "
+		       "cfg=%d budget=%dms\n", current_configuration, link_timeout);
+		fflush(stdout);
+	}
+	else if(link_timer.get_elapsed_time_ms()>=link_timeout)
 	{
 		this->link_status=DROPPED;
 		reset_session_state();
@@ -9482,6 +9701,9 @@ void cl_arq_controller::abort_b2f_transfer(const char* reason)
 
 void cl_arq_controller::reset_session_state()
 {
+	scream_link_timeout_grace_used = false;
+	scream_reentry_listen_armed = false;
+	scream_reentry_recovery_pending = false;
 	if(l1_tx_journal.enabled() && !l1_terminalize_queued("session-teardown-cancel"))
 	{
 		fprintf(stderr, "[L1-JOURNAL] terminal owner refused reset transfer; aborting before discard\n");
@@ -14776,7 +14998,26 @@ void cl_arq_controller::send_batch()
 			{ tag_bsi = messages_batch_tx[i].batch_seq_id; break; }
 		}
 		if(tag_bsi >= 0)
-			emit_config_tag_passband(current_configuration, (tag_bsi < 0) ? 0 : tag_bsi);
+		{
+			int tag_samples = emit_config_tag_passband(
+				current_configuration, (tag_bsi < 0) ? 0 : tag_bsi);
+			// A scream re-entry starts from a deliberately flushed capture ring and
+			// asks the peer to change PHY before frame 0.  Give that one-shot path a
+			// real processing gap after the robust CONFIG_TAG has left the playback
+			// ring.  Without it, host scheduling can let the lower-rung DATA train
+			// overtake the peer's tag decoder/config switch; repeat tags then reproduce
+			// the same race.  Ordinary in-band changes and the default-off path retain
+			// their existing gapless [tag][frame 0] wire order.
+			if(tag_samples > 0 && scream_resume_pending)
+			{
+				const int SCREAM_POST_TAG_GUARD_MS = 750;
+				drain_playback_wait();
+				printf("[SCREAM-LISTEN] post-tag DATA guard=%dms; peer PHY switch window\n",
+					SCREAM_POST_TAG_GUARD_MS);
+				fflush(stdout);
+				pumped_settle_wait(SCREAM_POST_TAG_GUARD_MS);
+			}
+		}
 	}
 
 	// LEVER P: transmit each frame at its actual packed offset and actual length
@@ -17333,6 +17574,75 @@ static break_buffer_delete_fn g_break_buffer_delete = delete_break_buffer;
 static rx_mute_capture_reset_fn g_break_capture_reset_authority =
 	reset_capture_after_rx_mute;
 
+// Transmit a T2 scream in the already-scheduled reverse response slot.
+void cl_arq_controller::send_scream_pattern(int rung)
+{
+	if(passive_monitor || !scream_wake_feature_enabled() || telecom_system == NULL) return;
+	if(rung < 0 || rung >= cl_mfsk::SCREAM_NBASES) rung = 3;
+	ptt_on();
+	cl_timer on_timer, off_timer;
+	on_timer.start();
+	const int symbol_period = telecom_system->data_container.Nofdm
+		* telecom_system->data_container.interpolation_rate;
+	const int pattern_samples = telecom_system->scream_pattern_passband_samples;
+	if(pattern_samples <= 0) { ptt_off(); return; }
+	const int padded_size = pattern_samples + 2 * symbol_period;
+	std::vector<double> raw((size_t)padded_size, 0.0);
+	std::vector<double> filtered1((size_t)padded_size, 0.0);
+	std::vector<double> filtered2((size_t)padded_size, 0.0);
+	int written = telecom_system->generate_scream_pattern_passband(
+		&raw[(size_t)symbol_period], rung);
+	if(written != pattern_samples) { ptt_off(); return; }
+	memcpy(raw.data(), &raw[(size_t)symbol_period], (size_t)symbol_period * sizeof(double));
+	memcpy(&raw[(size_t)(symbol_period + pattern_samples)],
+		&raw[(size_t)pattern_samples], (size_t)symbol_period * sizeof(double));
+	telecom_system->ofdm.FIR_tx1.apply(raw.data(), filtered1.data(), padded_size);
+	telecom_system->ofdm.FIR_tx2.apply(filtered1.data(), filtered2.data(), padded_size);
+	ptt_busy_wait(on_timer, ptt_on_delay_ms);
+	tx_transfer(&filtered2[(size_t)symbol_period], (size_t)pattern_samples);
+	if(!drain_playback_wait()) { ptt_off(); return; }
+	scream_emit_count++;
+	printf("[SCREAM-EMIT] count=%ld rung=%d samples=%d wire_ms=%.1f cfg=%d\n",
+		scream_emit_count, rung, pattern_samples,
+		1000.0 * pattern_samples / telecom_system->sampling_frequency,
+		current_configuration);
+	fflush(stdout);
+
+	// No reply is sent. The screamer turns straight around into the pre-frame
+	// CONFIG_TAG listener and waits for the re-aired in-flight batch.
+	telecom_system->data_container.rx_mute = 1;
+	sim_inproc_rx_mute_settle(RX_MUTE_GUARD_MS);
+	capture_reset_samples();
+	const int buf_samples = telecom_system->data_container.Nofdm
+		* telecom_system->data_container.buffer_Nsymb
+		* telecom_system->data_container.interpolation_rate;
+	MUTEX_LOCK(&capture_prep_mutex);
+	memset(telecom_system->data_container.passband_delayed_data, 0,
+		(size_t)(2 * buf_samples) * sizeof(double));
+	telecom_system->data_container.ring_write_index = 0;
+	MUTEX_UNLOCK(&capture_prep_mutex);
+	telecom_system->data_container.rx_mute = 0;
+	telecom_system->data_container.rx_mute_samples = 0;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	telecom_system->receive_stats.delay_of_last_decoded_message = -1;
+	telecom_system->receive_stats.mfsk_search_raw = 0;
+	telecom_system->receive_stats.ofdm_search_raw = 0;
+	telecom_system->receive_stats.ofdm_batch_active = false;
+	int frame_symb = telecom_system->data_container.preamble_nSymb
+		+ telecom_system->data_container.Nsymb;
+	telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(frame_symb + 10);
+	scream_reentry_listen_armed = true;
+	scream_reentry_listen_timer.start();
+	scream_reentry_listen_count++;
+	printf("[SCREAM-LISTEN] CONFIG_TAG re-entry window opened count=%ld ftr=%d\n",
+		scream_reentry_listen_count,
+		telecom_system->data_container.frames_to_read.load());
+	fflush(stdout);
+	off_timer.start();
+	ptt_busy_wait(off_timer, ptt_off_delay_ms);
+	ptt_off();
+}
+
 // Transmit BREAK tone pattern — emergency "drop to ROBUST_0" signal
 void cl_arq_controller::send_break_pattern()
 {
@@ -19542,6 +19852,111 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 	return false;
 }
 
+bool cl_arq_controller::receive_scream_pattern(int* out_rung)
+{
+	if(out_rung) *out_rung = -1;
+	if(!scream_wake_feature_enabled() || telecom_system == NULL
+	   || data_ack_received != NO) return false;
+	// The responder's failure timer can place the pre-keyed burst anywhere from
+	// at different phases after this ACK-slot timer starts (the timer is in the
+	// modem's sample clock, including accelerated simulation). Decide every
+	// 500 ms across the bounded failed-ACK window over the existing capture ring.
+	// Retaining the whole ring is load-bearing when the state-machine poll is
+	// delayed by an accelerated sample clock or host scheduling: a short recent
+	// tail can advance past the 0.5 s token between decisions even though the RF
+	// receiver captured it. This
+	// is a read-only capture peek (the MFSK SACK path uses the same ownership
+	// rule), so an OFDM frames_to_read countdown cannot starve the wake listener.
+	// The number of decisions remains small and deterministic, so the DSP battery
+	// can report both per-decision and per-gap FAR instead of multiplying by an
+	// unbounded fast polling loop.
+	const int SCREAM_DECISION_STRIDE_MS = 500;
+	int elapsed_ms = receiving_timer.get_elapsed_time_ms();
+	if(scream_probe_next_ms > 60000 || elapsed_ms < scream_probe_next_ms) return false;
+	scream_probe_next_ms += SCREAM_DECISION_STRIDE_MS;
+	scream_probe_count++;
+	const int sym_samples = telecom_system->data_container.Nofdm
+		* telecom_system->data_container.interpolation_rate;
+	const int signal_period = sym_samples
+		* telecom_system->data_container.buffer_Nsymb;
+	if(signal_period <= 0) return false;
+	const int probe_samples = signal_period;
+	MUTEX_LOCK(&capture_prep_mutex);
+	const int rwi = telecom_system->data_container.ring_write_index;
+	memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+		&telecom_system->data_container.passband_delayed_data[
+			rwi + signal_period - probe_samples],
+		(size_t)probe_samples * sizeof(double));
+	MUTEX_UNLOCK(&capture_prep_mutex);
+	int prefix_matched = 0, full_matched = 0;
+	double full_metric = 0.0;
+	int rung = telecom_system->detect_scream_pattern_from_passband(
+		telecom_system->data_container.ready_to_process_passband_delayed_data,
+		probe_samples, &prefix_matched, &full_matched, &full_metric);
+	printf("[SCREAM-PROBE] gap decision count=%ld prefix=%d full=%d metric=%.2f rung=%d ftr=%d\n",
+		scream_probe_count, prefix_matched, full_matched, full_metric, rung,
+		telecom_system->data_container.frames_to_read.load());
+	fflush(stdout);
+	if(prefix_matched >= telecom_system->ack_mfsk.scream_prefix_match_threshold)
+	{
+		scream_presence_trip_count++;
+		printf("[SCREAM-LISTEN] presence trip #%ld prefix=%d/%d full=%d/%d metric=%.2f rung=%d\n",
+			scream_presence_trip_count, prefix_matched,
+			telecom_system->ack_mfsk.scream_prefix_nsymb, full_matched,
+			telecom_system->ack_mfsk.scream_pattern_nsymb, full_metric, rung);
+		fflush(stdout);
+	}
+	if(rung < 0) return false;
+	scream_detect_count++;
+	if(out_rung) *out_rung = rung;
+	telecom_system->data_container.frames_to_read = 4;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	printf("[SCREAM-DETECT] count=%ld rung=%d prefix=%d full=%d metric=%.2f\n",
+		scream_detect_count, rung, prefix_matched, full_matched, full_metric);
+	fflush(stdout);
+	return true;
+}
+
+bool cl_arq_controller::apply_scream_wake(int rung)
+{
+	if(!scream_wake_feature_enabled() || !inband_rate_feature_enabled()) return false;
+	int target = scream_rung_to_config(current_configuration, rung);
+	if(target == CONFIG_NONE || target == current_configuration
+	   || config_ladder_index(target) >= config_ladder_index(current_configuration))
+		return false;
+	printf("[SCREAM-REENTRY] detected rung=%d maps CONFIG_%d -> CONFIG_%d; "
+		"opening unilateral CONFIG_TAG resume (zero handshake)\n",
+		rung, current_configuration, target);
+	fflush(stdout);
+	// The peer is still finishing its scream key-up/key-down sequence when the
+	// correlator first reaches a full token. Hold a bounded quiet turnaround so
+	// its capture is unmuted and CONFIG_TAG begins in a real listen gap.
+	const int SCREAM_REENTRY_TURNAROUND_MS = 750;
+	printf("[SCREAM-LISTEN] post-detect turnaround guard=%dms before CONFIG_TAG+DATA\n",
+		SCREAM_REENTRY_TURNAROUND_MS);
+	fflush(stdout);
+	pumped_settle_wait(SCREAM_REENTRY_TURNAROUND_MS);
+	bool applied = inband_route_failure_demote(target, "scream_wake", true);
+	if(applied)
+	{
+		// The pre-detect listen grace can consume most of the ordinary session
+		// deadline.  A validated wire token is fresh progress: re-anchor the
+		// existing bounded liveness clocks so CONFIG_TAG follow and floor-config
+		// reacquisition receive one complete interval.  The next unchanged
+		// deadline still takes the stock destructive teardown path.
+		link_timer.start();
+		watchdog_timer.start();
+		// The pre-detect listen may already have consumed its one teardown grace.
+		// A CRC-independent, full-token wake detection is fresh peer liveness and
+		// starts a distinct CONFIG_TAG/data recovery phase.  Re-arm exactly one
+		// bounded grace for that phase; the next unchanged deadline still tears
+		// down normally, so this cannot turn a dead session into an unbounded wait.
+		scream_link_timeout_grace_used = false;
+		scream_resume_pending = true;
+	}
+	return applied;
+}
+
 // BATCH-GRID COAST (DATAFLOW_AUDIT_batch_coast.md) -- forward-DATA RX grid coast.
 // Called by receive() at the mid-batch OFDM decode-FAIL anti-spin site. On FAIL the
 // stock ladder discards the frame grid (search_raw=0/batch_active=false) and the RX
@@ -20088,6 +20503,20 @@ void cl_arq_controller::receive()
 			int pre_followed = inband_detect_follow_from_snapshot(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
 				signal_period, &pre_followed_cfg);
+			if(pre_followed == 2)
+			{
+				// The validated scream CONFIG_TAG was captured before the sender's
+				// post-tag guard elapsed.  This snapshot is tag-only (and was taken
+				// with the old PHY); decoding it as a new-config DATA frame poisons
+				// acquisition with a false timing anchor.  The follow path already
+				// reinitialized/re-armed the live ring, so leave it untouched and
+				// wait for the first complete post-guard DATA window.
+				rx_fresh_window_decoded_this_pass = false;
+				printf("[SCREAM-REENTRY] tag-only snapshot retired; awaiting fresh CONFIG_%d DATA window\n",
+					pre_followed_cfg);
+				fflush(stdout);
+				return;
+			}
 			if(pre_followed == 1)
 			{
 				printf("[INBAND-RX] PRE-FRAME tag-follow to CONFIG_%d before frame-0 demod "
@@ -22333,6 +22762,17 @@ void cl_arq_controller::copy_data_to_buffer()
 	// orphan, and bigblock delivery). The compression leg validates this total against
 	// the same workspace limit as the sender before it copies or counts any bytes.
 	int delivered_transported = 0;
+	// A lost reverse ACK followed by a SCREAM demote can re-frame one already-
+	// delivered high-rate batch into several smaller low-rate batches.  The first
+	// rebuilt piece retains the old bsi and is caught by INV-DEDUP above; later
+	// pieces have fresh bsi values, but their absolute Option-W ranges still lie
+	// wholly or partly behind rx_stream_delivered.  Preserve that byte cursor as
+	// the authority across the rebase seam: discard a wholly overlapped raw piece,
+	// or skip the already-delivered prefix of a straddling raw piece.  This is
+	// deliberately limited to the untransformed byte path; compressed/encrypted/KX
+	// overlap remains fail-closed because transported offsets cannot safely select
+	// a plaintext suffix there.
+	int reframe_overlap_skip = 0;
 
 	// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b) — the CROSS-SESSION
 	// backstop, one layer above the within-session positional backstop below. The within-session
@@ -22369,6 +22809,44 @@ void cl_arq_controller::copy_data_to_buffer()
 		return;   // do NOT deliver the positionally-unprovable cross-session batch
 	}
 
+	if(scream_wake_feature_enabled()
+	   && rsp_rebase_seam_armed && decrypt_delivered_bsi >= 0
+	   && !compression_viable_for_batch() && !cipher_suite.is_active()
+	   && !kx_stream_epoch())
+	{
+		int wbsi = decrypt_delivered_bsi & 0xFF;
+		if(rx_stream_stamp[wbsi].valid && rx_stream_stamp[wbsi].length > 0)
+		{
+			uint64_t start = rx_stream_stamp[wbsi].start;
+			uint64_t end = start + (uint64_t)rx_stream_stamp[wbsi].length;
+			if(start < rx_stream_delivered && end <= rx_stream_delivered)
+			{
+				printf("[RSP-V2-REFRAME-DEDUP] bsi=%d range=[%llu,%llu) already "
+					"delivered through %llu -- skipping rebuilt low-rate piece\n",
+					wbsi, (unsigned long long)start, (unsigned long long)end,
+					(unsigned long long)rx_stream_delivered);
+				fflush(stdout);
+				for(int i=0;i<this->nMessages;i++)
+					if(messages_rx[i].status!=FREE) messages_rx[i].status=FREE;
+				// This wire generation was consumed without emitting bytes.  Advancing
+				// the generation high-water lets the next rebuilt piece pass the normal
+				// contiguous-bsi gate while the absolute cursor stays unchanged.
+				rx_stream_emitted_bsi_hw = wbsi;
+				rx_stream_stamp[wbsi].valid = false;
+				return;
+			}
+			if(start < rx_stream_delivered && end > rx_stream_delivered)
+			{
+				reframe_overlap_skip = (int)(rx_stream_delivered - start);
+				printf("[RSP-V2-REFRAME-TRIM] bsi=%d range=[%llu,%llu) overlaps "
+					"delivered cursor %llu -- skipping %d-byte rebuilt prefix\n",
+					wbsi, (unsigned long long)start, (unsigned long long)end,
+					(unsigned long long)rx_stream_delivered, reframe_overlap_skip);
+				fflush(stdout);
+			}
+		}
+	}
+
 	// Option W CORE — RSP BACKSTOP (data-flow-stream-offset.md §8.2 step 6): the
 	// LOUD-floor positional check. At the FIRST byte of this batch's delivery, the
 	// SENDER's committed start offset for this bsi (the wire stamp) MUST equal the
@@ -22381,7 +22859,7 @@ void cl_arq_controller::copy_data_to_buffer()
 	// (robust config / old peer / lost EOB frame) is a SAFE NO-OP, never a false
 	// teardown. MERCURY_W_STREAM_SHIFT_DEFEAT=1 restores the pre-fix silent delivery
 	// (the STEP-2c fail-before arm).
-	if(w_stream_shift_detected(decrypt_delivered_bsi))
+	if(reframe_overlap_skip == 0 && w_stream_shift_detected(decrypt_delivered_bsi))
 	{
 		bool w_shift_defeat = false;
 		{ const char* e = std::getenv("MERCURY_W_STREAM_SHIFT_DEFEAT");
@@ -22432,16 +22910,18 @@ void cl_arq_controller::copy_data_to_buffer()
 		bool aligned_stamp =
 			(decrypt_delivered_bsi >= 0)
 			&& rx_stream_stamp[wbsi].valid
-			&& ((uint32_t)(rx_stream_stamp[wbsi].start & 0xFFFFFFFFULL)
-			    == (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL));
+			&& (((uint32_t)(rx_stream_stamp[wbsi].start & 0xFFFFFFFFULL)
+			     == (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL))
+			    || reframe_overlap_skip > 0);
 		if(aligned_stamp)
 		{
 			// A valid stamp proves stamp.start == the receiver's absolute cursor: byte
 			// alignment is re-established across the seam. Safe to deliver; close the seam.
 			rsp_rebase_seam_armed = false;
-			printf("[RSP-V2-SEAM-CLEAR] bsi=%d stamp.start=%u == rx_delivered — byte "
+			printf("[RSP-V2-SEAM-CLEAR] bsi=%d stamp.start=%u cursor=%u trim=%d — byte "
 				"alignment re-proven across the rebase seam; disarming.\n",
-				wbsi, (uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL));
+				wbsi, (uint32_t)(rx_stream_stamp[wbsi].start & 0xFFFFFFFFULL),
+				(uint32_t)(rx_stream_delivered & 0xFFFFFFFFULL), reframe_overlap_skip);
 			fflush(stdout);
 		}
 		else
@@ -22749,6 +23229,7 @@ void cl_arq_controller::copy_data_to_buffer()
 	{
 		// --- No compression: original per-message push ---
 		// Only iterate eff_window (== data_batch_size unless the sender over-declared) slots
+		int overlap_left = reframe_overlap_skip;
 		for(int i=0;i<cw;i++)   // Option B' (§9)
 		{
 			if(messages_rx[i].status==ACKED)
@@ -22812,20 +23293,33 @@ void cl_arq_controller::copy_data_to_buffer()
 					copied++;
 					continue;   // consumed as KX; no app delivery, no cursor/CRC advance
 				}
-				delivered_transported += messages_rx[i].length;   // Option W (§2.3)
+				int payload_off = 0;
+				if(overlap_left > 0)
+				{
+					payload_off = std::min(overlap_left, messages_rx[i].length);
+					overlap_left -= payload_off;
+				}
+				int payload_len = messages_rx[i].length - payload_off;
+				delivered_transported += payload_len;   // Option W (§2.3), excluding reframe overlap
 				// Option W STEP 3 (§8.6): raw leg — fold the delivered transported bytes into the
 				// running RX stream CRC-32, in slot (== stream) order. Identical bytes+order to the
-				// TX raw-leg fold (message_TxRx_byte_buffer at build), so the registers agree.
-				rx_stream_crc = crc32_update(rx_stream_crc, messages_rx[i].data, messages_rx[i].length);
+				// TX raw-leg fold (message_TxRx_byte_buffer at build), so the registers agree. Across
+				// a SCREAM reframe seam the sender rolled its CRC back and re-folded the duplicate
+				// prefix; the receiver already owns that prefix, so fold only the new suffix.
+				if(payload_len > 0)
+					rx_stream_crc = crc32_update(rx_stream_crc,
+						messages_rx[i].data + payload_off, payload_len);
 #ifdef MERCURY_GUI_ENABLED
-				gui_push_monitor_text(messages_rx[i].data, messages_rx[i].length, false);
+				if(payload_len > 0)
+					gui_push_monitor_text(messages_rx[i].data + payload_off, payload_len, false);
 #endif
-				if(monitor_stdout)
+				if(monitor_stdout && payload_len > 0)
 				{
-					fwrite(messages_rx[i].data, 1, messages_rx[i].length, stdout);
+					fwrite(messages_rx[i].data + payload_off, 1, payload_len, stdout);
 					fflush(stdout);
 				}
-				total_bytes += fifo_push_rx(messages_rx[i].data, messages_rx[i].length);
+				if(payload_len > 0)
+					total_bytes += fifo_push_rx(messages_rx[i].data + payload_off, payload_len);
 				messages_rx[i].status=FREE;
 				copied++;
 			}

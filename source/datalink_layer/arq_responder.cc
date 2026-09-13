@@ -120,6 +120,13 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 	if(messages_rx[loc].status==FREE || messages_rx[loc].status==ACKED)
 	{
 		stats.nReceived_data++;
+		if(scream_reentry_recovery_pending)
+		{
+			scream_reentry_recovery_pending = false;
+			printf("[SCREAM-REENTRY] first post-tag DATA frame stored cfg=%d; wake re-armed\n",
+				current_configuration);
+			fflush(stdout);
+		}
 		// IDLE-SWITCHROLE-RACE recovery (idle-switchrole-race.md §3): this session
 		// has DELIVERED an RX data frame -> real forward progress. The BREAK
 		// no-progress teardown discriminator (Part C) keys on this per-session bool
@@ -2023,6 +2030,47 @@ void cl_arq_controller::process_messages_rx_data_control()
 				data_batch_size,
 				receiving_timeout);
 			fflush(stdout);
+
+			// Keep the CONFIG_TAG accept override armed across ordinary receive-window
+			// restarts: the commander's repeat-until-followed tag cadence can be longer
+			// than one low-rate receive timeout.  The 60 s cap is still finite; after
+			// it expires a new scream may request a fresh recovery attempt.
+			if(scream_reentry_listen_armed
+			   && scream_reentry_listen_timer.get_elapsed_time_ms() >= 60000)
+			{
+				scream_reentry_listen_armed = false;
+				scream_reentry_listen_timer.stop();
+				scream_reentry_listen_timer.reset();
+				printf("[SCREAM-LISTEN] 60000ms CONFIG_TAG window expired without accept; retry eligible\n");
+				fflush(stdout);
+			}
+			else if(scream_reentry_listen_armed)
+			{
+				printf("[SCREAM-LISTEN] CONFIG_TAG arm retained across RX timeout (%d/60000ms)\n",
+					scream_reentry_listen_timer.get_elapsed_time_ms());
+				fflush(stdout);
+			}
+
+			// T2 SCREAM WAKE: a whole scheduled forward receive window elapsed with
+			// no decoded frame.  The CMD is now in its already-existing reverse
+			// ACK/listen slot, so the presence prefix can occupy that slot without
+			// adding a new turnaround or colliding with a forward keydown.  After the
+			// burst, send_scream_pattern() flushes the local capture and opens the
+			// CONFIG_TAG re-entry window.  CONFIG_0 has no lower re-entry rung, so do
+			// not scream forever at the floor.
+			if(scream_wake_feature_enabled()
+			   && !scream_reentry_listen_armed
+			   && !scream_reentry_recovery_pending
+			   && is_ofdm_config(current_configuration)
+			   && config_ladder_index(current_configuration)
+			      > config_ladder_index(CONFIG_0))
+			{
+				int rung = scream_choose_rung();
+				printf("[SCREAM-TRIGGER] forward receive window empty cfg=%d rung=%d\n",
+					current_configuration, rung);
+				fflush(stdout);
+				send_scream_pattern(rung);
+			}
 
 			// Restart timer so we can receive the next CMD retransmit.
 			// Without this, the stopped timer returns 0 forever and the

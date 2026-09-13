@@ -59,6 +59,7 @@
 #include "physical_layer/telecom_system.h"
 #include "physical_layer/physical_defines.h"
 #include "datalink_layer/arq.h"           // §3 Wave 2 v2 cross-layer tests
+#include "datalink_layer/channel_state_lookup.h"   // Phase 0 Q-table loader unit check
 
 #include <cmath>
 #include <cstdint>
@@ -457,6 +458,46 @@ static void test_base_pattern_cross_correlation() {
 		int d_ack  = hamming_distance_tones(conn, ack,  8);
 		int d_brk  = hamming_distance_tones(conn, brk,  8);
 		int d_hail = hamming_distance_tones(conn, hail, 8);
+		// Scream correlation-token family orthogonality (turnaround control).
+		// Each of the 4 Welch-Costas scream bases must stay >= 6/8 Hamming from
+		// every shipped control base (ACK/BREAK/HAIL/CONNECT + the WB data
+		// preamble) and from each other, at M=16 and M=32, so the 4 sequential
+		// classification correlators cannot ambiguate. Locked worst pair is 7/8.
+		{
+			const int* scr[cl_mfsk::SCREAM_NBASES] = {
+				m.scream_tones[0], m.scream_tones[1],
+				m.scream_tones[2], m.scream_tones[3]
+			};
+			const char* snames[cl_mfsk::SCREAM_NBASES] = {"g10", "g11", "g12", "g14"};
+			const int* ctrl_t[5] = {ack, brk, hail, conn, m.preamble_tones};
+			const char* ctrl_n[5] = {"ack", "break", "hail", "connect", "preamble"};
+			for (int b = 0; b < cl_mfsk::SCREAM_NBASES; b++) {
+				for (int c = 0; c < 5; c++) {
+					int ds = hamming_distance_tones(scr[b], ctrl_t[c], 8);
+					if (ds < 6) {
+						char buf[200];
+						snprintf(buf, sizeof(buf),
+							"M=%d scream %s vs %s = %d/8 (need >=6)",
+							M, snames[b], ctrl_n[c], ds);
+						test_fail(name, buf);
+						return;
+					}
+				}
+			}
+			for (int i = 0; i < cl_mfsk::SCREAM_NBASES; i++) {
+				for (int j = i + 1; j < cl_mfsk::SCREAM_NBASES; j++) {
+					int ds = hamming_distance_tones(scr[i], scr[j], 8);
+					if (ds < 6) {
+						char buf[200];
+						snprintf(buf, sizeof(buf),
+							"M=%d scream %s vs %s = %d/8 (need >=6)",
+							M, snames[i], snames[j], ds);
+						test_fail(name, buf);
+						return;
+					}
+				}
+			}
+		}
 		if (d_ack < 6 || d_brk < 6 || d_hail < 6) {
 			char buf[200];
 			snprintf(buf, sizeof(buf),
@@ -464,6 +505,58 @@ static void test_base_pattern_cross_correlation() {
 				M, d_ack, d_brk, d_hail);
 			test_fail(name, buf);
 			return;
+		}
+	}
+	// NB mirrors are bijective relabelings of the shipped Sidelnikov sequence.
+	// Relabeling preserves every equality comparison, so assert the published
+	// aperiodic self-coincidence bounds directly and also prove that no aligned
+	// scream/shipped-control or scream/scream pair reaches the production count
+	// threshold.  This covers both NB geometries used on the wire.
+	for (int M = 8; M >= 4; M /= 2) {
+		cl_mfsk m;
+		m.init(M, 50, M == 8 ? 1 : 2);
+		const int n = m.scream_pattern_nsymb;
+		const int bound = (M == 8) ? 5 : 16;
+		const int* ctrl[3] = {m.ack_tones, m.break_tones, m.hail_tones};
+		for (int b = 0; b < cl_mfsk::SCREAM_NBASES; b++) {
+			int max_self = 0;
+			for (int shift = 1; shift < n; shift++) {
+				int coinc = 0;
+				for (int i = 0; i + shift < n; i++)
+					if (m.scream_tones[b][i] == m.scream_tones[b][i + shift]) coinc++;
+				if (coinc > max_self) max_self = coinc;
+			}
+			if (max_self > bound) {
+				char buf[180];
+				snprintf(buf, sizeof(buf),
+					"M=%d scream[%d] aperiodic coincidence=%d (bound=%d)",
+					M, b, max_self, bound);
+				test_fail(name, buf);
+				return;
+			}
+			for (int c = 0; c < 3; c++) {
+				int coinc = n - hamming_distance_tones(m.scream_tones[b], ctrl[c], n);
+				if (coinc >= m.scream_match_threshold) {
+					char buf[180];
+					snprintf(buf, sizeof(buf),
+						"M=%d scream[%d] vs ctrl[%d]=%d coincidences (threshold=%d)",
+						M, b, c, coinc, m.scream_match_threshold);
+					test_fail(name, buf);
+					return;
+				}
+			}
+			for (int b2 = b + 1; b2 < cl_mfsk::SCREAM_NBASES; b2++) {
+				int coinc = n - hamming_distance_tones(
+					m.scream_tones[b], m.scream_tones[b2], n);
+				if (coinc >= m.scream_match_threshold) {
+					char buf[180];
+					snprintf(buf, sizeof(buf),
+						"M=%d scream[%d] vs scream[%d]=%d coincidences (threshold=%d)",
+						M, b, b2, coinc, m.scream_match_threshold);
+					test_fail(name, buf);
+					return;
+				}
+			}
 		}
 	}
 	test_pass(name);
@@ -9166,10 +9259,617 @@ static void test_mfsk_geometry_guard()
 	else g_failures += failures;
 }
 
+
+// ============================================================================
+// Turnaround control: channel-state Q-table loader unit check plus SCREAM WAKE
+// production emitter/detector round trips and the env-gated DSP validation lane.
+// ============================================================================
+
+// Canonical channel-state Q-table fixture; kept byte-identical to
+// channel_state_lookup.json so the loader test detects drift in either copy.
+static const char* k_qtable_json =
+R"QJSON({
+  "_comment": "2D channel-state -> optimal-config Q-table. Compiled from CANONICAL_NUMBERS.md S7/S7-ADDENDUM (static floors) + S17 (robust live floor >= -5.2, NOT decoder-only) per SPEC_T2 S5 and fact-doc channel-state-2d-lookup.md S4. Coarse monotone-by-index climb ladder; fine config choice is the gearshift/optimizer's job (fact-doc S1). Anchors: (30,0.0)->16 (12,0.0)->10 (0,0.0)->100(ROBUST_0).",
+  "snr_bins": [
+    30,
+    24,
+    18,
+    16,
+    14,
+    13,
+    12,
+    11,
+    6,
+    0,
+    -5.2
+  ],
+  "sel_bins": [
+    0.0,
+    0.1,
+    0.2,
+    0.3,
+    0.5,
+    0.7
+  ],
+  "cells": {
+    "30,0": 16,
+    "30,0.1": 15,
+    "30,0.2": 14,
+    "30,0.3": 13,
+    "30,0.5": 11,
+    "30,0.7": 9,
+    "24,0": 16,
+    "24,0.1": 15,
+    "24,0.2": 14,
+    "24,0.3": 13,
+    "24,0.5": 11,
+    "24,0.7": 9,
+    "18,0": 15,
+    "18,0.1": 14,
+    "18,0.2": 13,
+    "18,0.3": 12,
+    "18,0.5": 10,
+    "18,0.7": 100,
+    "16,0": 14,
+    "16,0.1": 13,
+    "16,0.2": 12,
+    "16,0.3": 11,
+    "16,0.5": 9,
+    "16,0.7": 100,
+    "14,0": 13,
+    "14,0.1": 12,
+    "14,0.2": 11,
+    "14,0.3": 10,
+    "14,0.5": 100,
+    "14,0.7": "dead",
+    "13,0": 11,
+    "13,0.1": 10,
+    "13,0.2": 9,
+    "13,0.3": 100,
+    "13,0.5": 100,
+    "13,0.7": "dead",
+    "12,0": 10,
+    "12,0.1": 9,
+    "12,0.2": 100,
+    "12,0.3": 100,
+    "12,0.5": "dead",
+    "12,0.7": "dead",
+    "11,0": 9,
+    "11,0.1": 100,
+    "11,0.2": 100,
+    "11,0.3": 100,
+    "11,0.5": "dead",
+    "11,0.7": "dead",
+    "6,0": 102,
+    "6,0.1": 102,
+    "6,0.2": 102,
+    "6,0.3": 102,
+    "6,0.5": 100,
+    "6,0.7": "dead",
+    "0,0": 100,
+    "0,0.1": 100,
+    "0,0.2": 100,
+    "0,0.3": 100,
+    "0,0.5": 100,
+    "0,0.7": "dead",
+    "-5.2,0": 100,
+    "-5.2,0.1": 100,
+    "-5.2,0.2": 100,
+    "-5.2,0.3": 100,
+    "-5.2,0.5": 100,
+    "-5.2,0.7": "dead"
+  }
+}
+)QJSON";
+static const int k_qtable_n_cells = 66;  // populated (incl dead)
+
+// Portable writable temp-file path for the loader unit check (removed after use).
+static std::string qtable_test_temp_path() {
+	const char* envs[3] = {"TMPDIR", "TMP", "TEMP"};
+	for (int i = 0; i < 3; i++) {
+		const char* d = std::getenv(envs[i]);
+		if (d != NULL && d[0] != '\0')
+			return std::string(d) + "/_channel_state_lookup_canon_test.json";
+	}
+#if defined(_WIN32)
+	return std::string(".\\_channel_state_lookup_canon_test.json");
+#else
+	return std::string("/tmp/_channel_state_lookup_canon_test.json");
+#endif
+}
+
+static void test_channel_state_lookup_canonical_table() {
+	const char* name = "channel_state_lookup_canonical_table";
+	std::string path = qtable_test_temp_path();
+	{
+		FILE* fp = std::fopen(path.c_str(), "w");
+		if (fp == NULL) { test_fail(name, "cannot open temp file"); return; }
+		std::fputs(k_qtable_json, fp);
+		std::fclose(fp);
+	}
+	cl_channel_state_lookup tbl;
+	bool ok = tbl.init_from_json(path.c_str());
+	std::remove(path.c_str());
+	if (!ok || !tbl.is_loaded()) {
+		char buf[220];
+		snprintf(buf, sizeof(buf), "init_from_json/is_loaded failed: %s", tbl.last_error());
+		test_fail(name, buf); return;
+	}
+	struct { double snr; double sel; int want; const char* tag; } cases[3] = {
+		{30.0, 0.0,  16, "(30,0.0)->16"},
+		{12.0, 0.0,  10, "(12,0.0)->10"},
+		{ 0.0, 0.0, 100, "(0,0.0)->100"}
+	};
+	for (int i = 0; i < 3; i++) {
+		int got = tbl.lookup(cases[i].snr, cases[i].sel);
+		if (got != cases[i].want) {
+			char buf[200];
+			snprintf(buf, sizeof(buf), "lookup %s got %d", cases[i].tag, got);
+			test_fail(name, buf); return;
+		}
+	}
+	if (tbl.n_cells() != k_qtable_n_cells) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "n_cells=%d want %d", tbl.n_cells(), k_qtable_n_cells);
+		test_fail(name, buf); return;
+	}
+	test_pass(name);
+}
+
+// Build a clean (noiseless) passband template from an optional presence prefix
+// concatenated with a full base, each hop-indexed from its own symbol 0 exactly
+// as the shipped correlator reconstructs it. Mirrors build_hail_template +
+// generate_ack_pattern; test-only (no production emitter). out_sig_pb = the
+// signal-only passband (prefix then base); out_lead_pb / out_total_pb frame it
+// with 4 symbols of leading + trailing silence so the sweep can add +-50%%
+// symbol jitter; out_p_sig = mean passband power over the signal span.
+static bool build_scream_template(
+	cl_telecom_system& ts,
+	const int* pre_tones, int pre_len, int pre_nsymb,
+	const int* base_tones, int base_len, int base_nsymb,
+	std::vector<double>& out_sig_pb, int& out_lead_pb, int& out_total_pb, double& out_p_sig)
+{
+	cl_mfsk& m = ts.ack_mfsk;
+	int Nofdm = ts.data_container.Nofdm;
+	int Nc    = ts.data_container.Nc;
+	int interp = ts.data_container.interpolation_rate;
+	if (m.M < 16 || Nofdm <= 0 || Nc <= 0 || interp <= 0 || m.nStreams <= 0) return false;
+	int pn = (pre_nsymb > 0 && pre_tones != NULL && pre_len > 0) ? pre_nsymb : 0;
+	int total_sym = pn + base_nsymb;
+	double amp = std::sqrt((double)Nc / m.nStreams);
+	std::vector<std::complex<double> > pat_freq((size_t)total_sym * Nc, std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < pn; s++) {
+		int tb = pre_tones[s % pre_len];
+		int actual = ((tb + s * m.tone_hop_step) % m.M + m.M) % m.M;
+		for (int st = 0; st < m.nStreams; st++)
+			pat_freq[(size_t)s * Nc + m.stream_offsets[st] + actual] = std::complex<double>(amp, 0.0);
+	}
+	for (int s = 0; s < base_nsymb; s++) {
+		int tb = base_tones[s % base_len];
+		int actual = ((tb + s * m.tone_hop_step) % m.M + m.M) % m.M;
+		int abs_s = pn + s;
+		for (int st = 0; st < m.nStreams; st++)
+			pat_freq[(size_t)abs_s * Nc + m.stream_offsets[st] + actual] = std::complex<double>(amp, 0.0);
+	}
+	std::vector<std::complex<double> > pat_time((size_t)total_sym * Nofdm, std::complex<double>(0.0, 0.0));
+	for (int s = 0; s < total_sym; s++)
+		ts.ofdm.symbol_mod(&pat_freq[(size_t)s * Nc], &pat_time[(size_t)s * Nofdm]);
+	int pattern_pb = Nofdm * total_sym * interp;
+	int lead = 4 * Nofdm * interp, trail = 4 * Nofdm * interp;
+	out_total_pb = lead + pattern_pb + trail;
+	out_sig_pb.assign((size_t)pattern_pb, 0.0);
+	long unsigned saved = ts.ofdm.passband_start_sample;
+	ts.ofdm.passband_start_sample = 0;
+	ts.ofdm.baseband_to_passband(pat_time.data(), Nofdm * total_sym, out_sig_pb.data(),
+		ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, interp);
+	ts.ofdm.passband_start_sample = saved;
+	double psum = 0.0;
+	for (int i = 0; i < pattern_pb; i++) psum += out_sig_pb[(size_t)i] * out_sig_pb[(size_t)i];
+	out_p_sig = (pattern_pb > 0) ? psum / (double)pattern_pb : 0.0;
+	out_lead_pb = lead;
+	return true;
+}
+
+static void test_scream_base_patterns_detect_clean() {
+	const char* name = "scream_base_patterns_detect_clean";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);   // WB M=16, nStreams=1
+	cl_mfsk& m = ts.ack_mfsk;
+	if (m.M != 16) { test_fail(name, "expected M=16 at ROBUST_0"); return; }
+	const int interp = ts.data_container.interpolation_rate;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	const int* scr[4] = { m.scream_tones[0], m.scream_tones[1], m.scream_tones[2], m.scream_tones[3] };
+	const char* snames[4] = {"g10(-1)", "g11(-2)", "g12(-4)", "g14(FLOOR)"};
+	for (int b = 0; b < cl_mfsk::SCREAM_NBASES; b++) {
+		std::vector<double> sig; int lead = 0, total = 0; double psig = 0.0;
+		if (!build_scream_template(ts, m.scream_prefix_tones, m.scream_prefix_len, m.scream_prefix_nsymb,
+				scr[b], m.scream_pattern_len, m.scream_pattern_nsymb, sig, lead, total, psig)) {
+			test_fail(name, "template build failed"); return;
+		}
+		std::vector<double> work((size_t)total, 0.0);
+		for (int i = 0; i < (int)sig.size(); i++) work[(size_t)(lead + i)] = sig[(size_t)i];
+		int dec = total / interp;
+		std::vector<std::complex<double> > bb((size_t)dec, std::complex<double>(0.0, 0.0));
+		ts.ofdm.passband_to_baseband_decimated(work.data(), total, bb.data(),
+			ts.sampling_frequency, eff_carrier, ts.carrier_amplitude, interp, &ts.ofdm.FIR_rx_data);
+		int m_self = 0, bo = -1;
+		ts.ofdm.detect_ack_pattern(bb.data(), dec, 1, m.scream_pattern_nsymb, scr[b],
+			m.scream_pattern_len, m.tone_hop_step, m.M, m.nStreams, m.stream_offsets,
+			&m_self, 0, nullptr, &bo, 0, nullptr);
+		if (m_self < m.scream_match_threshold) {
+			char buf[200]; snprintf(buf, sizeof(buf),
+				"clean self-detect %s matched=%d (need >=%d)", snames[b], m_self, m.scream_match_threshold);
+			test_fail(name, buf); return;
+		}
+		int m_pre = 0, bop = -1;
+		ts.ofdm.detect_ack_pattern(bb.data(), dec, 1, m.scream_prefix_nsymb, m.scream_prefix_tones,
+			m.scream_prefix_len, m.tone_hop_step, m.M, m.nStreams, m.stream_offsets,
+			&m_pre, 0, nullptr, &bop, 0, nullptr);
+		if (m_pre < m.scream_prefix_len) {
+			char buf[200]; snprintf(buf, sizeof(buf),
+				"clean prefix-detect (%s signal) matched=%d (need ==%d)", snames[b], m_pre, m.scream_prefix_len);
+			test_fail(name, buf); return;
+		}
+	}
+	test_pass(name);
+}
+
+// Exercise the actual wire emitter and the joint prefix/body/geometry detector,
+// not a test-side reconstruction.  The detector must recover all four rung
+// identities from a realistic capture window with leading/trailing silence.
+static void test_scream_production_roundtrip_clean() {
+	const char* name = "scream_production_roundtrip_clean";
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	const int sym_pb = ts.data_container.Nofdm * ts.data_container.interpolation_rate;
+	const int signal_n = ts.scream_pattern_passband_samples;
+	if(signal_n <= 0 || sym_pb <= 0) {
+		test_fail(name, "invalid scream geometry"); return;
+	}
+	for(int rung = 0; rung < cl_mfsk::SCREAM_NBASES; rung++) {
+		std::vector<double> signal((size_t)signal_n, 0.0);
+		std::vector<double> capture((size_t)(signal_n + 8 * sym_pb), 0.0);
+		if(ts.generate_scream_pattern_passband(signal.data(), rung) != signal_n) {
+			test_fail(name, "production emitter length mismatch"); return;
+		}
+		std::copy(signal.begin(), signal.end(), capture.begin() + 4 * sym_pb);
+		int pre = 0, full = 0;
+		double metric = 0.0;
+		int got = ts.detect_scream_pattern_from_passband(capture.data(),
+			(int)capture.size(), &pre, &full, &metric);
+		if(got != rung) {
+			char buf[220];
+			snprintf(buf, sizeof(buf),
+				"rung=%d got=%d prefix=%d full=%d metric=%.3f",
+				rung, got, pre, full, metric);
+			test_fail(name, buf); return;
+		}
+	}
+	// Two independently valid rung tokens in one acquisition window are
+	// ambiguous. The production detector must refuse the rate change rather than
+	// resolving the collision by iteration order or a small metric difference.
+	{
+		std::vector<double> a((size_t)signal_n, 0.0);
+		std::vector<double> b((size_t)signal_n, 0.0);
+		std::vector<double> capture((size_t)(2 * signal_n + 12 * sym_pb), 0.0);
+		if(ts.generate_scream_pattern_passband(a.data(), 0) != signal_n
+		   || ts.generate_scream_pattern_passband(b.data(), 1) != signal_n) {
+			test_fail(name, "ambiguous-token emitter length mismatch"); return;
+		}
+		for(int i = 0; i < signal_n; ++i)
+		{
+			capture[(size_t)(4 * sym_pb + i)] = a[(size_t)i];
+			capture[(size_t)(8 * sym_pb + signal_n + i)] = b[(size_t)i];
+		}
+		int pre = 0, full = 0; double metric = 0.0;
+		int got = ts.detect_scream_pattern_from_passband(capture.data(),
+			(int)capture.size(), &pre, &full, &metric);
+		if(got >= 0) {
+			char buf[220];
+			snprintf(buf, sizeof(buf),
+				"ambiguous rungs accepted as %d prefix=%d full=%d metric=%.3f",
+				got, pre, full, metric);
+			test_fail(name, buf); return;
+		}
+	}
+	// A normal reverse ACK occupies the same scheduler slot and is therefore
+	// the most important structured non-wake control.  It must not satisfy the
+	// prefix/body geometry even on a clean channel.
+	{
+		const int ack_n = ts.ack_pattern_passband_samples;
+		std::vector<double> ack((size_t)ack_n, 0.0);
+		std::vector<double> capture((size_t)(ack_n + 8 * sym_pb), 0.0);
+		ts.generate_ack_pattern_passband(ack.data());
+		std::copy(ack.begin(), ack.end(), capture.begin() + 4 * sym_pb);
+		int pre = 0, full = 0; double metric = 0.0;
+		int got = ts.detect_scream_pattern_from_passband(capture.data(),
+			(int)capture.size(), &pre, &full, &metric);
+		if(got >= 0) {
+			char buf[220];
+			snprintf(buf, sizeof(buf),
+				"clean ACK false-triggered rung=%d prefix=%d full=%d metric=%.3f",
+				got, pre, full, metric);
+			test_fail(name, buf); return;
+		}
+	}
+	test_pass(name);
+}
+
+// Standalone WB scream detection-rate sweep (SPEC_T2 section 9). Env-gated
+// (MERCURY_SCREAM_SWEEP=1). Drives the 4 scream bases + the shipped ACK base
+// (control) through AWGN at calibrated sigma over SNR3k -20..+20 dB with +-50%%
+// symbol-period timing jitter, n=120 trials/pt; prints full-pattern detection
+// rate (with denominators), Stage-1 prefix presence + pure-noise FAR, Stage-2
+// end-to-end Pacq/Pwrong, the 4x4 confusion at representative SNRs, and each
+// base's floor vs the ACK control. The reportable fleet run uses deterministic
+// seeds and keeps the complete denominators in its captured log.
+static void test_scream_detection_sweep() {
+	const char* name = "scream_detection_sweep";
+	if (std::getenv("MERCURY_SCREAM_SWEEP") == NULL) return;   // env-gated no-op
+	printf("  [MEASURE] WB scream detection sweep (M=16 ROBUST_0; control = shipped ACK base):\n");
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(ROBUST_0);
+	cl_mfsk& m = ts.ack_mfsk;
+	if (m.M != 16) { test_fail(name, "expected M=16 at ROBUST_0"); return; }
+	const double fs = ts.sampling_frequency;
+	const int interp = ts.data_container.interpolation_rate;
+	const int symP_pb = ts.data_container.Nofdm * interp;
+	const double eff_carrier = ts.carrier_frequency + ts.last_coarse_freq_offset;
+	const int thr = m.scream_match_threshold;   // 7/16
+	const int pre_lib = 3;                        // liberal Stage-1 threshold (3/5) -- measurement param, not a wire value
+	const int NP = 5;
+	const int* bases[5] = { m.scream_tones[0], m.scream_tones[1], m.scream_tones[2], m.scream_tones[3], m.ack_tones };
+	const char* pnames[5] = { "g10(-1)", "g11(-2)", "g12(-4)", "g14(FLOOR)", "ACK(ctrl)" };
+	const bool has_prefix[5] = { true, true, true, true, false };
+	std::vector<std::vector<double> > sig(NP);
+	std::vector<int> lead(NP), total(NP);
+	std::vector<double> psig(NP);
+	for (int p = 0; p < NP; p++) {
+		const int* pre = has_prefix[p] ? m.scream_prefix_tones : NULL;
+		int pl = has_prefix[p] ? m.scream_prefix_len : 0;
+		int pns = has_prefix[p] ? m.scream_prefix_nsymb : 0;
+		if (!build_scream_template(ts, pre, pl, pns, bases[p], m.scream_pattern_len, m.scream_pattern_nsymb,
+				sig[p], lead[p], total[p], psig[p])) {
+			test_fail(name, "template build failed"); return;
+		}
+	}
+	int NTRIAL = 120;
+	if(const char* e = std::getenv("MERCURY_SCREAM_TRIALS")) {
+		int v = atoi(e); if(v > 0) NTRIAL = v;
+	}
+	const int SNR_LO = -20, SNR_HI = 20, SNR_STEP = 2;
+	const int NPTS = (SNR_HI - SNR_LO) / SNR_STEP + 1;
+	double floor_snr[5]; for (int p = 0; p < 5; p++) floor_snr[p] = 999.0;
+	const int rep_snrs[3] = { -14, -8, 0 };
+	long confus[3][4][5];
+	for (int r = 0; r < 3; r++) for (int a = 0; a < 4; a++) for (int c = 0; c < 5; c++) confus[r][a][c] = 0;
+	printf("    grid SNR3k %d..%d dB step %d, %d trials/pt, +-50%% symbol jitter (tol=symP/2=%d pb-samp)\n",
+		SNR_LO, SNR_HI, SNR_STEP, NTRIAL, symP_pb / 2);
+	printf("    [T1] full-pattern self-detect count (matched>=%d/16), denom=det/%d:\n", thr, NTRIAL);
+	printf("      %-8s", "SNR3k");
+	for (int p = 0; p < NP; p++) printf(" %13s", pnames[p]);
+	printf("\n");
+	std::vector<int> snr_axis(NPTS, 0);
+	std::vector<double> st1_rate(NPTS, 0.0), pacq_rate(NPTS, 0.0), pwrong_rate(NPTS, 0.0);
+	std::vector<double> prod_acq_rate(NPTS, 0.0), prod_wrong_rate(NPTS, 0.0);
+	int pt = 0;
+	for (int s_i = SNR_LO; s_i <= SNR_HI; s_i += SNR_STEP, pt++) {
+		double snr = (double)s_i;
+		snr_axis[pt] = s_i;
+		int det[5] = {0, 0, 0, 0, 0};
+		int pre_ok_sum = 0, acq_sum = 0, wrong_sum = 0;
+		int prod_acq_sum = 0, prod_wrong_sum = 0;
+		int rep_idx = -1;
+		for (int r = 0; r < 3; r++) if (rep_snrs[r] == s_i) rep_idx = r;
+		for (int p = 0; p < NP; p++) {
+			double n3k = psig[p] / std::pow(10.0, snr / 10.0);
+			double sigma = std::sqrt(n3k * (fs / 2.0) / 3000.0);
+			uint32_t sweep_seed = 0x5C4EA000u;
+			if(const char* e = std::getenv("MERCURY_SCREAM_SEED"))
+				sweep_seed ^= (uint32_t)strtoul(e, NULL, 0);
+			std::mt19937 rng((uint32_t)(sweep_seed
+				+ (unsigned)((s_i - SNR_LO) * NP + p)));
+			std::normal_distribution<double> nd(0.0, sigma);
+			std::uniform_int_distribution<int> jit(-symP_pb / 2, symP_pb / 2);
+			int tot = total[p];
+			std::vector<double> work((size_t)tot);
+			std::vector<std::complex<double> > bb((size_t)(tot / interp), std::complex<double>(0.0, 0.0));
+			for (int it = 0; it < NTRIAL; it++) {
+				int j = jit(rng);
+				for (int i = 0; i < tot; i++) work[(size_t)i] = nd(rng);
+				int pos = lead[p] + j;
+				for (int i = 0; i < (int)sig[p].size(); i++) {
+					int k = pos + i;
+					if (k >= 0 && k < tot) work[(size_t)k] += sig[p][(size_t)i];
+				}
+				int dec = tot / interp;
+				ts.ofdm.passband_to_baseband_decimated(work.data(), tot, bb.data(),
+					fs, eff_carrier, ts.carrier_amplitude, interp, &ts.ofdm.FIR_rx_data);
+				int m_self = 0, bo = -1;
+				ts.ofdm.detect_ack_pattern(bb.data(), dec, 1, m.scream_pattern_nsymb, bases[p],
+					m.scream_pattern_len, m.tone_hop_step, m.M, m.nStreams, m.stream_offsets,
+					&m_self, 0, nullptr, &bo, 0, nullptr);
+				if (m_self >= thr) det[p]++;
+				if (p < 4) {
+					int prod_pre = 0, prod_full = 0;
+					double prod_metric = 0.0;
+					int prod_rung = ts.detect_scream_pattern_from_passband(
+						work.data(), tot, &prod_pre, &prod_full, &prod_metric);
+					if(prod_rung == p) prod_acq_sum++;
+					else if(prod_rung >= 0) prod_wrong_sum++;
+					int m_pre = 0, bop = -1;
+					ts.ofdm.detect_ack_pattern(bb.data(), dec, 1, m.scream_prefix_nsymb, m.scream_prefix_tones,
+						m.scream_prefix_len, m.tone_hop_step, m.M, m.nStreams, m.stream_offsets,
+						&m_pre, 0, nullptr, &bop, 0, nullptr);
+					bool present = (m_pre >= pre_lib);
+					if (present) pre_ok_sum++;
+					int best = -1, best_m = -1;
+					for (int b2 = 0; b2 < 4; b2++) {
+						int mc = 0, bb2 = -1;
+						ts.ofdm.detect_ack_pattern(bb.data(), dec, 1, m.scream_pattern_nsymb, m.scream_tones[b2],
+							m.scream_pattern_len, m.tone_hop_step, m.M, m.nStreams, m.stream_offsets,
+							&mc, 0, nullptr, &bb2, 0, nullptr);
+						if (mc > best_m) { best_m = mc; best = b2; }
+					}
+					bool rung_ok = (best_m >= thr);
+					if (present && rung_ok && best == p) acq_sum++;
+					else if (present && rung_ok && best != p) wrong_sum++;
+					if (rep_idx >= 0) {
+						int pred = rung_ok ? best : 4;
+						confus[rep_idx][p][pred]++;
+					}
+				}
+			}
+			double rate = (double)det[p] / NTRIAL;
+			if (rate >= 0.5 && snr < floor_snr[p]) floor_snr[p] = snr;
+		}
+		printf("      %-8.1f", snr);
+		for (int p = 0; p < NP; p++) printf(" %11d/%d", det[p], NTRIAL);
+		printf("\n");
+		st1_rate[pt]   = (double)pre_ok_sum / (4 * NTRIAL);
+		pacq_rate[pt]  = (double)acq_sum   / (4 * NTRIAL);
+		pwrong_rate[pt] = (double)wrong_sum / (4 * NTRIAL);
+		prod_acq_rate[pt] = (double)prod_acq_sum / (4 * NTRIAL);
+		prod_wrong_rate[pt] = (double)prod_wrong_sum / (4 * NTRIAL);
+	}
+	printf("    [T2] Stage-1 prefix presence (matched>=%d/5) + Stage-2 end-to-end over 4 rungs (denom=%d):\n",
+		pre_lib, 4 * NTRIAL);
+	printf("      %-8s %15s %17s %14s\n", "SNR3k", "Stage1_present", "Pacq(pres&rung)", "Pwrong");
+	for (int i = 0; i < NPTS; i++)
+		printf("      %-8d %14.3f %16.3f %13.3f\n", snr_axis[i], st1_rate[i], pacq_rate[i], pwrong_rate[i]);
+	printf("    [T3] Production joint detector (WB prefix=5/5 + body>=12/16 + metric>=3 + geometry, denom=%d):\n",
+		4 * NTRIAL);
+	printf("      %-8s %17s %14s\n", "SNR3k", "correct_accept", "wrong_rung");
+	for (int i = 0; i < NPTS; i++)
+		printf("      %-8d %16.3f %13.3f\n", snr_axis[i], prod_acq_rate[i], prod_wrong_rate[i]);
+	{
+		int FT = 10000;
+		if(const char* e = std::getenv("MERCURY_SCREAM_FAR_TRIALS")) {
+			int v = atoi(e); if(v > 0) FT = v;
+		}
+		double snr_far = -14.0;
+		double n3k = psig[4] / std::pow(10.0, snr_far / 10.0);
+		double sigma = std::sqrt(n3k * (fs / 2.0) / 3000.0);
+		// Match one production wake decision exactly: receive_scream_pattern()
+		// correlates the already-allocated full capture ring so scheduler delays
+		// cannot age a captured token out of a short tail. FAR must use that same
+		// number of searched timing offsets, not the smaller cliff-sweep fixture.
+		int tot = ts.data_container.buffer_Nsymb * symP_pb;
+		uint32_t far_seed = 0x0FA5C4EAu;
+		if(const char* e = std::getenv("MERCURY_SCREAM_FAR_SEED"))
+			far_seed ^= (uint32_t)strtoul(e, NULL, 0);
+		std::mt19937 frng(far_seed);
+		std::normal_distribution<double> fnd(0.0, sigma);
+		std::vector<double> work((size_t)tot);
+		std::vector<std::complex<double> > bb((size_t)(tot / interp), std::complex<double>(0.0, 0.0));
+		int pre_fa = 0, base_fa = 0, joint_fa = 0, joint_presence = 0;
+		int base_fa_each[5] = {0, 0, 0, 0, 0};
+		int joint_fa_each[4] = {0, 0, 0, 0};
+		int ack_production_fa = 0;
+		for (int tr = 0; tr < FT; tr++) {
+			for (int i = 0; i < tot; i++) work[(size_t)i] = fnd(frng);
+			int jp = 0, jf = 0; double jm = 0.0;
+			int jr = ts.detect_scream_pattern_from_passband(
+				work.data(), tot, &jp, &jf, &jm);
+			if(jp >= m.scream_prefix_match_threshold) joint_presence++;
+			if(jr >= 0) {
+				joint_fa++;
+				if(jr < 4) joint_fa_each[jr]++;
+			}
+			int dec = tot / interp;
+			ts.ofdm.passband_to_baseband_decimated(work.data(), tot, bb.data(),
+				fs, eff_carrier, ts.carrier_amplitude, interp, &ts.ofdm.FIR_rx_data);
+			int m_pre = 0, bop = -1;
+			ts.ofdm.detect_ack_pattern(bb.data(), dec, 1, m.scream_prefix_nsymb, m.scream_prefix_tones,
+				m.scream_prefix_len, m.tone_hop_step, m.M, m.nStreams, m.stream_offsets, &m_pre, 0, nullptr, &bop, 0, nullptr);
+			if (m_pre >= pre_lib) pre_fa++;
+			bool any = false;
+			for (int b2 = 0; b2 < 5; b2++) {
+				int mc = 0, bb2 = -1;
+				double raw_metric = ts.ofdm.detect_ack_pattern(bb.data(), dec, 1,
+					m.scream_pattern_nsymb, bases[b2],
+					m.scream_pattern_len, m.tone_hop_step, m.M, m.nStreams, m.stream_offsets, &mc, 0, nullptr, &bb2, 0, nullptr);
+				if (mc >= thr) {
+					if (b2 < 4) any = true;
+					base_fa_each[b2]++;
+				}
+				if (b2 == 4 && mc >= m.ack_match_threshold
+				   && raw_metric >= ts.ack_pattern_detection_threshold)
+					ack_production_fa++;
+			}
+			if (any) base_fa++;
+		}
+		printf("    [FAR] pure-noise (sigma@%.0f dB vs ACK p_sig, %d trials): "
+			"raw-prefix(>=%d/5)=%d/%d raw-any-base(>=%d/16)=%d/%d "
+			"production-prefix=%d/%d production-joint-wake=%d/%d\n",
+			snr_far, FT, pre_lib, pre_fa, FT, thr, base_fa, FT,
+			joint_presence, FT, joint_fa, FT);
+		printf("    [FAR-PER-BASE] raw body threshold >=%d: "
+			"g10=%d/%d g11=%d/%d g12=%d/%d g14=%d/%d ACK=%d/%d\n",
+			thr, base_fa_each[0], FT, base_fa_each[1], FT,
+			base_fa_each[2], FT, base_fa_each[3], FT, base_fa_each[4], FT);
+		printf("    [FAR-PER-RUNG] production joint wake: "
+			"g10=%d/%d g11=%d/%d g12=%d/%d g14=%d/%d\n",
+			joint_fa_each[0], FT, joint_fa_each[1], FT,
+			joint_fa_each[2], FT, joint_fa_each[3], FT);
+		printf("    [FAR-CONTROL] shipped ACK production count+metric gate: %d/%d\n",
+			ack_production_fa, FT);
+	}
+	for (int r = 0; r < 3; r++) {
+		printf("    [CONFUSION @ SNR3k=%d dB] rows=true rung, cols=[g10 g11 g12 g14 none], denom=%d each:\n",
+			rep_snrs[r], NTRIAL);
+		const char* rn[4] = {"g10(-1)   ", "g11(-2)   ", "g12(-4)   ", "g14(FLOOR)"};
+		for (int a = 0; a < 4; a++) {
+			printf("      %s", rn[a]);
+			for (int c = 0; c < 5; c++) printf(" %5ld", confus[r][a][c]);
+			printf("\n");
+		}
+	}
+	double ack_floor = floor_snr[4];
+	printf("    [FLOOR] full-pattern self-detect floor (lowest SNR3k with rate>=0.5):\n");
+	for (int p = 0; p < NP; p++) {
+		printf("      %-12s floor = %6.1f dB", pnames[p], floor_snr[p]);
+		if (p < 4) {
+			double delta = floor_snr[p] - ack_floor;
+			const char* verdict = (delta > 1.0)
+				? "  UNDERPERFORMS ACK control (>1 dB worse)"
+				: "  meets no-worse-than-ACK+1dB criterion";
+			printf("  (delta vs ACK %+.1f dB)%s", delta, verdict);
+		} else {
+			printf("  [CONTROL]");
+		}
+		printf("\n");
+	}
+	if (NTRIAL < 100)
+		printf("    NOTE: smoke-only trial count; use >=100 trials for reportable floors.\n");
+	else
+		printf("    NOTE: reportable Monte Carlo trial count; compare confidence and detector gates explicitly.\n");
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
 	printf("=== MFSK ctrl-suffix codec tests (Phase B Wave 1 + Wave 2 v2 + Wave 3) ===\n");
+	if(getenv("MERCURY_SCREAM_SWEEP") != NULL)
+	{
+		// Orthogonality is the precondition for interpreting any detection
+		// result; run the WB and NB family gate before the Monte Carlo sweep.
+		test_base_pattern_cross_correlation();
+		if(g_failures != 0)
+		{
+			printf("=== Scream detection sweep STOP: orthogonality gate failed ===\n");
+			return g_failures;
+		}
+		test_scream_production_roundtrip_clean();
+		test_scream_detection_sweep();
+		printf("=== Scream detection sweep done: %d passed, %d failed ===\n",
+			g_passes, g_failures);
+		return g_failures;
+	}
 	if(getenv("MERCURY_MFSK_GEOMETRY_ONLY") != NULL)
 	{
 		test_mfsk_geometry_guard();
@@ -9230,6 +9930,12 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ctrl_suffix_crc12_corruption();
 	test_base_pattern_cross_correlation();
 	test_ack_sack_bitmap_30bit_cap();
+
+	// Turnaround control additions (outside the frozen ARQ region):
+	test_channel_state_lookup_canonical_table();   // Q-table loader canonical-table check
+	test_scream_base_patterns_detect_clean();       // WB scream family clean-channel detect sanity
+	test_scream_production_roundtrip_clean();        // actual emitter -> joint detector, all rungs
+	test_scream_detection_sweep();                   // env-gated DSP detection sweep (no-op unless MERCURY_SCREAM_SWEEP)
 
 	// §2 passband round-trip — require cl_telecom_system::load_configuration
 	test_mfsk_connect_passband_roundtrip_clean();

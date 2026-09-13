@@ -2984,6 +2984,18 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-fade-core") == 0) {
             return mercury::fade::run_fade_core_tests();
         }
+        if (strcmp(argv[i], "--test-scream-wake") == 0) {
+            arm_test_watchdog();
+            if (getenv("MERCURY_SCREAM_SWEEP") == NULL) {
+                fprintf(stderr, "--test-scream-wake requires MERCURY_SCREAM_SWEEP=1\n");
+                return 2;
+            }
+            srand(1u);
+            int failed = run_mfsk_ctrl_codec_tests();
+            cl_arq_controller scream_map_test;
+            failed += scream_map_test.test_scream_rung_map();
+            return failed == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--test") == 0) {
             arm_test_watchdog();   // wall-clock backstop: wedged --test can't hang forever
             // Pin the process-global C RNG to a fixed, platform-independent

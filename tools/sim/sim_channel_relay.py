@@ -1177,7 +1177,14 @@ def main():
     ap.add_argument("--fade-depth", type=float, default=0.0,
                     help="(DEPRECATED) old flat-fade depth; use --profile instead")
     ap.add_argument("--seed", type=int, default=1)
-    # ---- CONNECT-REACK T1: deterministic single-ACK loss (test-only) ---------
+    # ---- Deterministic single-burst loss (test-only) -------------------------
+    # The A->B arm is the forward-data twin used by re-entry validation: erase
+    # one selected commander burst after the connection and first delivered
+    # batch, forcing a real empty responder window without mutating modem state.
+    # DEFAULT 0 is inert.
+    ap.add_argument("--erase-a2b-burst", type=int, default=0,
+                    help="TEST-ONLY: zero the Nth CMD->RSP signal burst (1-based). "
+                         "DEFAULT 0 (disabled).")
     # Erase (zero the channel input of) the Nth SIGNAL BURST on the b2a
     # (RSP->CMD) direction, 1-based. Burst #1 is the START_CONNECTION ACK,
     # burst #2 is the FIRST TEST_CONNECTION_ACK. --erase-b2a-burst 2 thus
@@ -1451,7 +1458,7 @@ def main():
                                   Xoshiro(args.seed * 3266489917 & 0xFFFFFFFF))}
     # CONNECT-REACK T1 single-burst eraser (TEST-ONLY). Only the b2a (RSP->CMD)
     # direction can carry a TEST_ACK; a2b is disabled (target 0 = inert).
-    eraser = {"a2b": BurstEraser(0),
+    eraser = {"a2b": BurstEraser(args.erase_a2b_burst),
               "b2a": BurstEraser(args.erase_b2a_burst)}
     # FAITHFUL turnaround-timing model (M1-M3; SIMFIDELITY_ROOTCAUSE §3.2). Per
     # direction: ±ppm crystal slip + seeded per-key-up jitter realized as integer

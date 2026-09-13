@@ -300,6 +300,7 @@ public:
 	int ack_pattern_passband_samples;    // = ack_mfsk.ack_pattern_nsymb * Nofdm * freq_interp_rate
 	int ack_snr_pattern_passband_samples;  // = (ack_pattern_nsymb + SNR_SUFFIX_LEN) * Nofdm * freq_interp_rate
 	int ack_sack_pattern_passband_samples; // = ack_sack_pattern_nsymb() * Nofdm * freq_interp_rate (WB-only; 0 on NB)
+	int scream_pattern_passband_samples; // = (prefix + full base) * symbol period
 	double ack_pattern_detection_threshold;  // metric threshold for detection
 	int generate_ack_pattern_passband(double* out);  // TX: returns samples written
 	int generate_ack_snr_pattern_passband(double* out, float snr);  // TX: ACK + SNR suffix, returns samples
@@ -316,6 +317,13 @@ public:
 	// (RECEIVING_ACKS_CONTROL + MERCURY_RECOVERY_ACK_FINE) passes true; data-ACK
 	// / BREAK / SACK / CONNECT keep false.
 	double detect_ack_pattern_from_passband(double* data, int size, int* out_matched = nullptr, uint32_t* out_match_mask = nullptr, bool use_fine = false);  // RX: returns metric
+	int generate_scream_pattern_passband(double* out, int rung);
+	// Returns rung [0..3], or -1. Stage-1 presence is reported separately so
+	// wake-only false triggers (which merely spend the listen slot) are countable.
+	int detect_scream_pattern_from_passband(double* data, int size,
+	                                      int* out_prefix_matched = nullptr,
+	                                      int* out_full_matched = nullptr,
+	                                      double* out_full_metric = nullptr);
 	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
 	// RX: detect ACK pattern and decode the 40-bit ACK+SACK suffix (WB M>=16
 	// only). Runs detector + ofdm.decode_suffix_tones + unpack in one call —

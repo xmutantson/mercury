@@ -6379,6 +6379,10 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 		{
 			if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
 			{
+				// A slot staged for the NEXT build carries batch_seq_id=-1.  It is
+				// pending data, not an in-flight wire generation; masking it to 255
+				// can roll a SCREAM demote from bsi 1 to 255 and manufacture a gap.
+				// Only already-aired frames own the rollback identity.
 				int b = messages_tx[i].batch_seq_id & 0xFF;
 				if(min_inflight_bsi < 0)
 					min_inflight_bsi = b;
@@ -6388,6 +6392,28 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 					if(fwd >= 1u && fwd <= 128u)
 						min_inflight_bsi = b;
 				}
+			}
+		}
+		// A preceding ordinary timeout may already have losslessly returned the
+		// failed batch to fifo_buffer_tx and freed every messages_tx slot before
+		// the asynchronous scream arrives.  In that state the next generation
+		// after the last clean cumulative delivery is the stranded batch's wire
+		// identity.  Its still-valid Option-W stamp proves that generation was
+		// built; use it as the rollback anchor instead of leaving the advanced
+		// dispatch counter in place.
+		if(min_inflight_bsi < 0)
+		{
+			int delivered_hw = cmd_rxwindow_delivered_high_water;
+			if(delivered_hw < 0) delivered_hw = cmd_last_applied_clean_bsi;
+			int candidate = (delivered_hw < 0) ? 0 : ((delivered_hw + 1) & 0xFF);
+			if(candidate != (cmd_batch_seq_id & 0xFF)
+			   && tx_stream_stamp[candidate].valid)
+			{
+				printf("[INBAND-NOBREAK] RESTAGED DEMOTE: no live frame slots; "
+					"clean_hw=%d selects stamped pending bsi=%d (dispatch=%d)\n",
+					delivered_hw, candidate, cmd_batch_seq_id & 0xFF);
+				fflush(stdout);
+				min_inflight_bsi = candidate;
 			}
 		}
 	}
@@ -6846,6 +6872,19 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		restore_sack_v2_rx_phy();
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
 	{
+		// T2 SCREAM WAKE rides the RSP's normal reverse response slot.  Sniff it
+		// before ACK/SACK dispatch so a full scream cannot be misclassified as a
+		// partial control response.  The demotion helper restages the in-flight
+		// bytes and emits CONFIG_TAG; it owns the resulting state transition.
+		if(data_ack_received == NO && !scream_resume_pending
+		   && is_ofdm_config(current_configuration))
+		{
+			int scream_rung = -1;
+			if(receive_scream_pattern(&scream_rung)
+			   && apply_scream_wake(scream_rung))
+				return;
+		}
+
 		if(ack_pattern_time_ms > 0 || l1_blockack_data_active())
 		{
 			// Detection strategy: check SACK alongside ACK from the start.
@@ -9476,6 +9515,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			frame_gearshift_retry_count = 0;       // §7.13.33 reset
 		}
 
+		if(data_ack_received == YES)
+			scream_link_timeout_grace_used = false;
+
+		if(data_ack_received == YES && scream_resume_pending)
+		{
+			scream_resume_pending = false;
+			scream_resume_count++;
+			printf("[SCREAM-RESUME] count=%ld first post-wake data ACK cfg=%d "
+				"acked_frames=%d tx_fifo_pending=%d\n",
+				scream_resume_count, current_configuration,
+				stats.nAcked_data,
+				fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size());
+			fflush(stdout);
+		}
+
 		// Auto-arm compression after B2F SID is ACKed
 		if(data_ack_received==YES && b2f_compression_pending)
 		{
@@ -9992,6 +10046,7 @@ int cl_arq_controller::current_inflight_bsi() const
 	{
 		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
 		{
+			if(messages_tx[i].batch_seq_id < 0) continue;
 			int b = messages_tx[i].batch_seq_id & 0xFF;
 			if(min_inflight_bsi < 0)
 				min_inflight_bsi = b;

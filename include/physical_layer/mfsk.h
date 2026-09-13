@@ -207,6 +207,24 @@ public:
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
 
+	// Scream correlation-token family (turnaround control). Four orthogonal
+	// 8-tone Welch-Costas bases on the unused primitive roots {10,11,12,14}
+	// mod 17 (the control roots' negatives, phase-chosen to break even-power
+	// coincidence), each a 16-symbol (8 tones x 2 reps) pattern mirroring
+	// ack_tones, plus one shared 5-symbol presence prefix. Rung order:
+	// [0]=-1, [1]=-2, [2]=-4, [3]=FLOOR. Installed for M=16 (and 2x-scaled for
+	// M=32) in init(). Narrowband uses symbol-permuted Sidelnikov mirrors with
+	// the shipped 32/48-symbol geometry and no hopping.
+	static const int SCREAM_NBASES = 4;
+	int scream_tones[SCREAM_NBASES][MAX_ACK_TONES];
+	int scream_prefix_tones[MAX_ACK_TONES];
+	int scream_pattern_len;       // base tone-sequence length (8 for WB)
+	int scream_pattern_nsymb;     // total symbols per full pattern (16 = 8 x 2 reps)
+	int scream_match_threshold;   // min matched symbols for a full-pattern detect (7, as ACK)
+	int scream_prefix_len;        // presence-prefix base length (5)
+	int scream_prefix_nsymb;      // presence-prefix symbols on the wire (5)
+	int scream_prefix_match_threshold; // liberal Stage-1 presence gate
+
 	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4). The BREAK-recovery
 	// reverse control-ACK lands at a marginal 6-7/16 on a CLEAN channel because a
 	// turnaround timing straddle knocks 1-2 symbols off the HARD per-symbol
@@ -539,6 +557,11 @@ public:
 	// reps=1 → exactly generate_ack_pattern's single 16-symbol block
 	// (byte-identical). pattern_out: ack_base_total_nsymb() * Nc complex values.
 	void generate_ack_pattern_reps(std::complex<double>* pattern_out);
+
+	// Generate [shared presence prefix || selected full scream base]. rung is
+	// 0=-1, 1=-2, 2=-4, 3=FLOOR. The hop index restarts at the full base so the
+	// table-parameterized detector can classify it directly.
+	void generate_scream_pattern(std::complex<double>* pattern_out, int rung);
 
 	// Generate BREAK pattern: same structure as ACK but with break_tones
 	void generate_break_pattern(std::complex<double>* pattern_out);

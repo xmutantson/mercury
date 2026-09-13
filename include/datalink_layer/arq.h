@@ -2954,6 +2954,17 @@ public:
   // feature is enabled. Cheap after the first call (cached in inband_rate_enabled).
   bool inband_rate_feature_enabled();
 
+  // T2 scream wake. One default-off lever arms both this wake layer and the
+  // CONFIG_TAG transport it hands off to. The normal post-batch reverse slot is
+  // the scheduled listen gap, so a quiet/healthy link gains no extra airtime.
+  bool scream_wake_feature_enabled();
+  int  scream_choose_rung() const;
+  int  scream_rung_to_config(int current_cfg, int rung) const;
+  void send_scream_pattern(int rung);
+  bool receive_scream_pattern(int* out_rung);
+  bool apply_scream_wake(int rung);
+  int  test_scream_rung_map();
+
   // Resolve + cache the MERCURY_SNR_TRACK env flag (default-off). When set, the
   // commander-side gearshift becomes SNR-SENSED fast fade-tracking: a fresh climb-grade
   // suffix meter that drops BELOW the current rung's RUNG_MIN_SNR_METER floor fires a
@@ -5327,6 +5338,20 @@ public:
   int     inband_last_announced_config; // CONFIG_NONE until the first tag
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
+  int     scream_wake_enabled;          // MERCURY_SCREAM_WAKE, default off
+  bool    scream_reentry_listen_armed;  // screamer awaits the next CONFIG_TAG
+  cl_timer scream_reentry_listen_timer; // bounded across ordinary RX-window restarts
+  bool    scream_reentry_recovery_pending; // accepted tag; suppress repeat scream until DATA
+  long    scream_emit_count;
+  long    scream_detect_count;
+  long    scream_presence_trip_count;
+  long    scream_reentry_listen_count;
+  long    scream_reentry_accept_count;
+  bool    scream_resume_pending;       // commander awaits first post-wake data ACK
+  long    scream_resume_count;
+  bool    scream_link_timeout_grace_used; // one bounded grace per pre/post-wake recovery phase
+  long    scream_probe_count;
+  int     scream_probe_next_ms;        // next bounded Stage-1/2 gap decision
   // snr_track_enabled: cached MERCURY_SNR_TRACK flag (resolved once via
   //   snr_track_feature_enabled()). Default-off => byte-identical. Same ctor-cached,
   //   env-keyed, NOT-reset-per-session discipline as inband_rate_enabled.

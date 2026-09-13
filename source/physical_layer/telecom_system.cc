@@ -146,6 +146,7 @@ cl_telecom_system::cl_telecom_system()
 	mfsk_ctrl_mode=false;
 	coarse_freq_sync_enabled=false;
 	ack_pattern_passband_samples=0;
+	scream_pattern_passband_samples=0;
 	ack_snr_pattern_passband_samples=0;
 	ack_sack_pattern_passband_samples=0;
 	connect_pattern_passband_samples=0;
@@ -5216,6 +5217,110 @@ int cl_telecom_system::generate_ack_pattern_passband(double* out)
 
 
 	return ack_pattern_passband_samples;
+}
+
+int cl_telecom_system::generate_scream_pattern_passband(double* out, int rung)
+{
+	if(out == NULL || rung < 0 || rung >= cl_mfsk::SCREAM_NBASES
+	   || scream_pattern_passband_samples <= 0) return 0;
+	const int nsymb = ack_mfsk.scream_prefix_nsymb + ack_mfsk.scream_pattern_nsymb;
+	const double power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+	ack_mfsk.generate_scream_pattern(data_container.ofdm_framed_data, rung);
+	for(int i = 0; i < nsymb; i++)
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	const double boost = get_tx_gain(TX_SIG_BREAK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * boost;
+	}
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out, sampling_frequency, carrier_frequency,
+		carrier_amplitude, frequency_interpolation_rate);
+	ofdm.peak_clip(out, scream_pattern_passband_samples, ofdm.data_papr_cut);
+	return scream_pattern_passband_samples;
+}
+
+int cl_telecom_system::detect_scream_pattern_from_passband(double* data, int size,
+	int* out_prefix_matched, int* out_full_matched, double* out_full_metric)
+{
+	if(out_prefix_matched) *out_prefix_matched = 0;
+	if(out_full_matched) *out_full_matched = 0;
+	if(out_full_metric) *out_full_metric = 0.0;
+	if(data == NULL || size <= 0 || scream_pattern_passband_samples <= 0) return -1;
+	const int decim = data_container.interpolation_rate;
+	const int dec_size = size / decim;
+	const double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated, sampling_frequency,
+		effective_carrier, carrier_amplitude, decim, &ofdm.FIR_rx_data);
+
+	// Search the prefix and body as one contiguous token.  Independent global
+	// searches can pair a random 5/5 prefix elsewhere in a long ACK window with
+	// the real body, causing the geometry test to reject a clean on-wire scream.
+	// detect_ack_pattern's suffix counter gives the body score at the SAME winning
+	// offset, so Stage 1 and Stage 2 remain separately observable while acquisition
+	// is now intrinsically geometry-bound.
+	const int prefix_n = ack_mfsk.scream_prefix_nsymb;
+	const int body_n = ack_mfsk.scream_pattern_nsymb;
+	const int token_n = prefix_n + body_n;
+	int best_rung = -1, best_matched = -1, best_prefix = 0, best_body = 0;
+	double best_metric = 0.0;
+	const double SCREAM_PRODUCTION_METRIC_GATE = 3.0;
+	const int production_prefix_threshold = prefix_n;
+	const int production_body_threshold = (body_n == 16)
+		? 12 : ack_mfsk.scream_match_threshold;
+	int actionable_rungs = 0;
+	for(int rung = 0; rung < cl_mfsk::SCREAM_NBASES; rung++)
+	{
+		std::vector<int> token((size_t)token_n, 0);
+		for(int p = 0; p < prefix_n; p++)
+			token[(size_t)p] = ack_mfsk.scream_prefix_tones[p % ack_mfsk.scream_prefix_len];
+		// The detector applies hopping by absolute token symbol p, whereas the
+		// emitter restarts the hop index at body symbol zero.  Counter-rotate each
+		// body base tone by prefix_n hops so the combined template is wire-exact.
+		for(int s = 0; s < body_n; s++)
+		{
+			int t = ack_mfsk.scream_tones[rung][s % ack_mfsk.scream_pattern_len]
+				- prefix_n * ack_mfsk.tone_hop_step;
+			t %= ack_mfsk.M; if(t < 0) t += ack_mfsk.M;
+			token[(size_t)(prefix_n + s)] = t;
+		}
+		int matched = 0, body_matched = 0, offset = -1;
+		double metric = ofdm.detect_ack_pattern(
+			data_container.baseband_data_interpolated, dec_size, 1,
+			token_n, token.data(), token_n, ack_mfsk.tone_hop_step, ack_mfsk.M,
+			ack_mfsk.nStreams, ack_mfsk.stream_offsets, &matched,
+			prefix_n, &body_matched, &offset, 0, nullptr, /*always_fine=*/true);
+		int prefix_matched = matched - body_matched;
+		if(prefix_matched >= production_prefix_threshold
+		   && body_matched >= production_body_threshold
+		   && metric >= SCREAM_PRODUCTION_METRIC_GATE)
+			actionable_rungs++;
+		if(matched > best_matched || (matched == best_matched && metric > best_metric))
+		{
+			best_rung = rung;
+			best_matched = matched;
+			best_prefix = matched - body_matched;
+			best_body = body_matched;
+			best_metric = metric;
+		}
+	}
+	if(out_prefix_matched) *out_prefix_matched = best_prefix;
+	if(out_full_matched) *out_full_matched = best_body;
+	if(out_full_metric) *out_full_metric = best_metric;
+	// The 3/5 prefix and 7/16 body remain the liberal Stage-1/Stage-2 sensitivity
+	// measurements, but an actionable wake must reject structured reverse-slot
+	// traffic as well as AWGN. A live full-ring sweep caught an ordinary control
+	// waveform at the minimum 3+7 counts with a high metric. Require the complete
+	// shared prefix and 12/16 body in WB before a token can command a rate move;
+	// NB already has stricter 24/32 or 40/48 body thresholds.
+	if(best_prefix < production_prefix_threshold
+	   || best_body < production_body_threshold
+	   || best_metric < SCREAM_PRODUCTION_METRIC_GATE
+	   || best_rung < 0 || actionable_rungs != 1) return -1;
+	return best_rung;
 }
 
 // RECOVERY-ACK robustness PHASE-1 diagnostic gate (recovery-ack-robustness.md §6.7).
@@ -13835,6 +13940,8 @@ int cl_telecom_system::load_configuration(int configuration)
 	}
 
 	ack_pattern_passband_samples = ack_mfsk.ack_pattern_nsymb * data_container.Nofdm * frequency_interpolation_rate;
+	scream_pattern_passband_samples = (ack_mfsk.scream_prefix_nsymb + ack_mfsk.scream_pattern_nsymb)
+		* data_container.Nofdm * frequency_interpolation_rate;
 	ack_snr_pattern_passband_samples = ack_mfsk.ack_snr_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
 	// ACK+SACK pattern (WB-only — NB has M=8 and ack_sack_suffix_len()=0,
 	// which makes ack_sack_pattern_nsymb() == ack_pattern_nsymb. Multiplying
@@ -14048,6 +14155,8 @@ void cl_telecom_system::load_configuration_swap(int configuration, int idx)
 			ack_mfsk.tone_hop_step = 0;             // NB Sidelnikov: no hopping
 	}
 	ack_pattern_passband_samples      = ack_mfsk.ack_pattern_nsymb        * data_container.Nofdm * frequency_interpolation_rate;
+	scream_pattern_passband_samples   = (ack_mfsk.scream_prefix_nsymb + ack_mfsk.scream_pattern_nsymb)
+		* data_container.Nofdm * frequency_interpolation_rate;
 	ack_snr_pattern_passband_samples  = ack_mfsk.ack_snr_pattern_nsymb()  * data_container.Nofdm * frequency_interpolation_rate;
 	ack_sack_pattern_passband_samples = ack_mfsk.ack_sack_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
 	connect_pattern_passband_samples  = ack_mfsk.connect_pattern_nsymb    * data_container.Nofdm * frequency_interpolation_rate;
