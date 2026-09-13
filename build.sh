@@ -236,7 +236,7 @@ if [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "mingw"* ]] || [[ "$OSTYPE" == 
     # Standalone test binaries must link static too: a dynamic link picks up
     # whatever libstdc++-6.dll is first on PATH (e.g. Git's mingw64), and the
     # cross-toolchain ABI mismatch segfaults the test run.
-    TEST_LDFLAGS="-static -static-libgcc -static-libstdc++"
+    TEST_LDFLAGS="-static -static-libgcc -static-libstdc++ -lbcrypt"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     PLATFORM="macos"
     CXXFLAGS="$CXXFLAGS $(pkg-config --cflags glfw3)"
