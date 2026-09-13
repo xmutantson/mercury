@@ -63,6 +63,7 @@ typedef struct {
     bool passthrough, burst, dry_run, self_test, format_only;
     char vector_in[1024], vector_out[1024], double_in[1024], double_out[1024];
     char tap_out[1024];
+    char snr_schedule[1024];
     size_t tap_count,tap_stride;
 } options_t;
 
@@ -195,6 +196,9 @@ typedef struct {
     double *bp_h,*bp_hist;
     int bp_n,bp_pos;
     uint64_t sample_clock;
+    double sched_last_snr;
+    bool sched_valid,sched_offline;
+    char sched_tag[8];
 } channel_t;
 
 static double ionos_wgn_to_snr3k(double label) {
@@ -243,6 +247,147 @@ static double max_pop(double*h,size_t*n){double root=h[0],v=h[--*n];size_t i=0;w
 static double min_pop(double*h,size_t*n){double root=h[0],v=h[--*n];size_t i=0;while(2*i+1<*n){size_t ch=2*i+1;if(ch+1<*n&&h[ch+1]<h[ch])ch++;if(h[ch]>=v)break;h[i]=h[ch];i=ch;}if(*n)h[i]=v;return root;}
 static double median_active(channel_t*c){return c->heap_lo_n==c->heap_hi_n?.5*(c->heap_lo[0]+c->heap_hi[0]):c->heap_lo[0];}
 static double noise_std(channel_t*c,double p){return sqrt(fmax(p*F_NYQUIST/(c->snr_lin*BW_NOISE),0.0));}
+
+/* Optional time-indexed SNR schedule.  Rows are "t_offset_s,snr3k_db" pairs on
+ * the same axis as --snr; the applied SNR is a linear interpolation of the rows
+ * against stream time, clamped to the first/last row outside the range.  The
+ * schedule is process-wide so the forward and reverse channels fade together
+ * off one shared time origin.  When no schedule is loaded none of this code
+ * runs: the per-sample path and its RNG draws are untouched, so output is
+ * byte-identical to the static --snr path. */
+typedef struct { double t, snr; } sched_point_t;
+typedef struct { double wall, t, applied, noise_std, realized; char chan[8]; } sched_event_t;
+typedef struct {
+    bool loaded;
+    sched_point_t *pts; size_t n;                 /* parsed intent, sorted by t */
+    sched_event_t *events; size_t nevents, cap_events;
+    pthread_mutex_t lock;
+    bool origin_set;
+    struct timespec origin_mono;                  /* CLOCK_MONOTONIC at stream start */
+    double origin_wall;                           /* CLOCK_REALTIME epoch at stream start */
+    char time_base[16];
+    bool logged; double log_snr, log_t;           /* material-change gate state */
+    bool applied_any; double last_t, last_snr, last_noise_std, last_realized;
+} snr_schedule_t;
+static snr_schedule_t g_schedule = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static int sched_cmp(const void *a, const void *b) {
+    double ta = ((const sched_point_t *)a)->t, tb = ((const sched_point_t *)b)->t;
+    return ta < tb ? -1 : ta > tb ? 1 : 0;
+}
+static int schedule_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "snr-schedule: cannot open %s: %s\n", path, strerror(errno)); return -1; }
+    char line[512]; size_t cap = 0, n = 0; sched_point_t *pts = NULL; long lineno = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        char *p = line; while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '\0' || *p == '#') continue;
+        char *end = NULL; double t = strtod(p, &end);
+        char *q = end; while (*q == ' ' || *q == '\t') q++; if (*q == ',') q++;
+        char *end2 = NULL; double s = strtod(q, &end2);
+        char *r = end2; while (*r == ' ' || *r == '\t' || *r == '\r' || *r == '\n') r++;
+        if (end == p || end2 == q || (*r != '\0' && *r != '#')) {
+            fprintf(stderr, "snr-schedule: %s:%ld: malformed row (expected 't_offset_s,snr_db')\n", path, lineno);
+            free(pts); fclose(f); return -1;
+        }
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 8; sched_point_t *np = realloc(pts, nc * sizeof(*np));
+            if (!np) { free(pts); fclose(f); fprintf(stderr, "snr-schedule: out of memory\n"); return -1; }
+            pts = np; cap = nc;
+        }
+        pts[n].t = t; pts[n].snr = s; n++;
+    }
+    fclose(f);
+    if (n == 0) { free(pts); fprintf(stderr, "snr-schedule: %s: no data rows\n", path); return -1; }
+    qsort(pts, n, sizeof(*pts), sched_cmp);
+    g_schedule.pts = pts; g_schedule.n = n; g_schedule.loaded = true;
+    return 0;
+}
+static double schedule_interp(double t) {
+    const sched_point_t *p = g_schedule.pts; size_t n = g_schedule.n;
+    if (t <= p[0].t) return p[0].snr;
+    if (t >= p[n - 1].t) return p[n - 1].snr;
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (t >= p[i].t && t <= p[i + 1].t) {
+            double dt = p[i + 1].t - p[i].t;
+            if (dt <= 0.0) return p[i + 1].snr;           /* coincident times -> step */
+            return p[i].snr + (t - p[i].t) / dt * (p[i + 1].snr - p[i].snr);
+        }
+    }
+    return p[n - 1].snr;
+}
+static void schedule_record(channel_t *c, double t, double applied) {
+    double nv = c->noise_std;
+    double realized = nv > 0.0 ? 10.0 * log10(c->p_sig * F_NYQUIST / (nv * nv * BW_NOISE)) : applied;
+    pthread_mutex_lock(&g_schedule.lock);
+    g_schedule.applied_any = true;
+    g_schedule.last_t = t; g_schedule.last_snr = applied;
+    g_schedule.last_noise_std = nv; g_schedule.last_realized = realized;
+    bool material = !g_schedule.logged || fabs(applied - g_schedule.log_snr) >= 0.1 ||
+                    (t - g_schedule.log_t) >= 0.25;
+    if (material) {
+        if (g_schedule.nevents == g_schedule.cap_events) {
+            size_t nc = g_schedule.cap_events ? g_schedule.cap_events * 2 : 256;
+            sched_event_t *ne = realloc(g_schedule.events, nc * sizeof(*ne));
+            if (ne) { g_schedule.events = ne; g_schedule.cap_events = nc; }
+        }
+        if (g_schedule.nevents < g_schedule.cap_events) {
+            sched_event_t *e = &g_schedule.events[g_schedule.nevents++];
+            e->wall = g_schedule.origin_wall + t; e->t = t; e->applied = applied;
+            e->noise_std = nv; e->realized = realized;
+            snprintf(e->chan, sizeof(e->chan), "%s", c->sched_tag[0] ? c->sched_tag : "");
+        }
+        g_schedule.logged = true; g_schedule.log_snr = applied; g_schedule.log_t = t;
+    }
+    pthread_mutex_unlock(&g_schedule.lock);
+}
+static void schedule_apply(channel_t *c) {
+    double t;
+    pthread_mutex_lock(&g_schedule.lock);
+    if (!g_schedule.origin_set) {
+        clock_gettime(CLOCK_MONOTONIC, &g_schedule.origin_mono);
+        struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
+        g_schedule.origin_wall = (double)rt.tv_sec + rt.tv_nsec * 1e-9;
+        snprintf(g_schedule.time_base, sizeof(g_schedule.time_base), "%s",
+                 c->sched_offline ? "sample_clock" : "monotonic");
+        g_schedule.origin_set = true;
+    }
+    if (c->sched_offline) {
+        t = (double)c->sample_clock / RATE;
+    } else {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        t = (double)(now.tv_sec - g_schedule.origin_mono.tv_sec) +
+            (now.tv_nsec - g_schedule.origin_mono.tv_nsec) * 1e-9;
+        if (t < 0.0) t = 0.0;
+    }
+    pthread_mutex_unlock(&g_schedule.lock);
+    double snr = schedule_interp(t);
+    if (!c->sched_valid || snr != c->sched_last_snr) {
+        c->snr_lin = pow(10.0, snr / 10.0);
+        c->noise_std = noise_std(c, c->p_sig);
+        c->sched_last_snr = snr; c->sched_valid = true;
+    }
+    schedule_record(c, t, snr);
+}
+static void schedule_finalize(void) {
+    pthread_mutex_lock(&g_schedule.lock);
+    if (g_schedule.applied_any &&
+        (g_schedule.nevents == 0 || g_schedule.events[g_schedule.nevents - 1].t < g_schedule.last_t)) {
+        if (g_schedule.nevents == g_schedule.cap_events) {
+            size_t nc = g_schedule.cap_events ? g_schedule.cap_events * 2 : 256;
+            sched_event_t *ne = realloc(g_schedule.events, nc * sizeof(*ne));
+            if (ne) { g_schedule.events = ne; g_schedule.cap_events = nc; }
+        }
+        if (g_schedule.nevents < g_schedule.cap_events) {
+            sched_event_t *e = &g_schedule.events[g_schedule.nevents++];
+            e->wall = g_schedule.origin_wall + g_schedule.last_t; e->t = g_schedule.last_t;
+            e->applied = g_schedule.last_snr; e->noise_std = g_schedule.last_noise_std;
+            e->realized = g_schedule.last_realized; strcpy(e->chan, "end");
+        }
+    }
+    pthread_mutex_unlock(&g_schedule.lock);
+}
 static double sinc_np(double x){return x==0.0?1.0:sin(PI*x)/(PI*x);}
 static int bandpass_init(channel_t*c) {
     if(!(c->opt.bp_hi>c->opt.bp_lo && c->opt.bp_lo>0)) return 0;
@@ -294,6 +439,7 @@ static int append_active(channel_t*c,double ms){
     c->active_n++;return 0;
 }
 static void channel_process(channel_t*c,const double*x,double*out,size_t n){
+    if(g_schedule.loaded)schedule_apply(c);
     double ms=0;for(size_t i=0;i<n;i++)ms+=x[i]*x[i];if(n)ms/=n;
     bool peak=ms>c->peak_ms;if(peak)c->peak_ms=ms;
     if(c->psig_mode==PSIG_STEADY&&ms>1e-7){
@@ -393,6 +539,38 @@ static void *pump_main(void*arg){
 }
 
 static void json_string(FILE*f,const char*s){fputc('"',f);for(;*s;s++){unsigned char c=*s;if(c=='"'||c=='\\'){fputc('\\',f);fputc(c,f);}else if(c<32)fprintf(f,"\\u%04x",c);else fputc(c,f);}fputc('"',f);}
+/* Emits the schedule origin/intent/applied keys (no leading/trailing comma) so
+ * the caller can splice them into an existing object.  Locked because the pump
+ * threads append events while the main thread periodically flushes. */
+static void schedule_emit_json(FILE*f){
+    pthread_mutex_lock(&g_schedule.lock);
+    fprintf(f,"\n  \"snr_schedule_origin\": {\"wall_clock_epoch\": %.6f, \"monotonic_origin_s\": %.6f, \"time_base\": ",
+            g_schedule.origin_wall,
+            (double)g_schedule.origin_mono.tv_sec+g_schedule.origin_mono.tv_nsec*1e-9);
+    json_string(f,g_schedule.time_base[0]?g_schedule.time_base:"unset");
+    fprintf(f,"},\n  \"snr_schedule_intent\": [");
+    for(size_t i=0;i<g_schedule.n;i++)
+        fprintf(f,"%s\n    {\"t_offset_s\": %.6f, \"snr_db\": %.6f}",i?",":"",g_schedule.pts[i].t,g_schedule.pts[i].snr);
+    fprintf(f,"\n  ],\n  \"snr_schedule_applied\": [");
+    for(size_t i=0;i<g_schedule.nevents;i++){
+        sched_event_t*e=&g_schedule.events[i];
+        fprintf(f,"%s\n    {\"wall_clock\": %.6f, \"t_offset_s\": %.6f, \"applied_snr3k_db\": %.6f, \"noise_std\": %.9g, \"realized_snr3k\": %.6f, \"chan\": ",
+                i?",":"",e->wall,e->t,e->applied,e->noise_std,e->realized);
+        json_string(f,e->chan);
+        fputc('}',f);
+    }
+    fprintf(f,"\n  ]");
+    pthread_mutex_unlock(&g_schedule.lock);
+}
+static int write_schedule_statsfile(const options_t*o){
+    if(!o->statsfile[0]||!g_schedule.loaded)return 0;
+    char tmp[1200];snprintf(tmp,sizeof(tmp),"%s.tmp.%ld",o->statsfile,(long)getpid());
+    FILE*f=fopen(tmp,"w");if(!f)return-1;
+    fputc('{',f);schedule_emit_json(f);fprintf(f,"\n}\n");
+    fflush(f);fsync(fileno(f));
+    if(fclose(f)||rename(tmp,o->statsfile)){unlink(tmp);return-1;}
+    return 0;
+}
 static void stat_snapshot(pump_t*p,uint64_t*fr,uint64_t*sf,double*ss,uint64_t*ur,
                           double*peak,uint64_t*hard,uint64_t*sat,uint64_t*den,
                           double*reference_power,double*noise_variance){
@@ -412,7 +590,9 @@ static int flush_stats(const options_t*o,pump_t*fwd,pump_t*rev){
     fprintf(f,", \"reference_mode\": \"steady-active-chunk-median\", \"reference_id\": \"traffic-steady-v1\", \"reference_power\": %.17g, \"reference_n_samples\": 0",fref);
     fprintf(f,", \"configured_bandwidth_hz\": %.17g, \"snr3k_db\": %.17g, \"cn_config_db\": %.17g, \"noise_variance\": %.17g",o->configured_bandwidth_hz,o->snr,o->cn_config_db,fnoise);
     fprintf(f,", \"seed\": %d, \"composite_scale\": 1.0, \"pre_scale_peak\": %.17g, \"hard_clip_count\": %"PRIu64", \"s32_saturation_count\": %"PRIu64", \"clip_event_denominator\": %"PRIu64", \"s32_mode\": ",o->seed,fmax(fp,rp),fh+rh,fx+rx,fd+rd);json_string(f,!strcmp(o->s32_mode,"auto")?"s32-hardclip":o->s32_mode);
-    fprintf(f,", \"binary_sha256\": ");json_string(f,o->binary_sha256);fprintf(f,", \"recipe_sha256\": ");json_string(f,o->recipe_sha256);fprintf(f,"}\n}\n");
+    fprintf(f,", \"binary_sha256\": ");json_string(f,o->binary_sha256);fprintf(f,", \"recipe_sha256\": ");json_string(f,o->recipe_sha256);fprintf(f,"}");
+    if(g_schedule.loaded){fputc(',',f);schedule_emit_json(f);}
+    fprintf(f,"\n}\n");
     fflush(f);fsync(fileno(f));if(fclose(f)||rename(tmp,o->statsfile)){unlink(tmp);return-1;}return 0;
 }
 
@@ -435,7 +615,7 @@ static int parse_args(int argc,char**argv,options_t*o){
         if(!strcmp(a,"--help")||!strcmp(a,"-h")){usage(stdout);exit(0);}else if(!strcmp(a,"--passthrough"))o->passthrough=true;else if(!strcmp(a,"--burst"))o->burst=true;else if(!strcmp(a,"--dry-run"))o->dry_run=true;else if(!strcmp(a,"--self-test"))o->self_test=true;else if(!strcmp(a,"--format-only"))o->format_only=true;
         else if(val(argc,argv,&i,&v)<0)return-1;
         else if(!strcmp(a,"--fwd-cap"))snprintf(o->fwd_cap,sizeof(o->fwd_cap),"%s",v);else if(!strcmp(a,"--fwd-play"))snprintf(o->fwd_play,sizeof(o->fwd_play),"%s",v);else if(!strcmp(a,"--rev-cap"))snprintf(o->rev_cap,sizeof(o->rev_cap),"%s",v);else if(!strcmp(a,"--rev-play"))snprintf(o->rev_play,sizeof(o->rev_play),"%s",v);
-        else if(!strcmp(a,"--profile")){if(parse_profile(o,v))return-1;}else if(!strcmp(a,"--snr")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr");}else if(!strcmp(a,"--snr3k")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k");}else if(!strcmp(a,"--snr3k-db")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k_db");}else if(!strcmp(a,"--cn-config-db")){o->cn_config_db=strtod(v,NULL);strcpy(o->input_coordinate,"cn_config_db");}else if(!strcmp(a,"--cell")){snprintf(o->cell,sizeof(o->cell),"%s",v);strcpy(o->input_coordinate,"cell");}else if(!strcmp(a,"--axis"))snprintf(o->axis,sizeof(o->axis),"%s",v);else if(!strcmp(a,"--configured-bandwidth-hz"))o->configured_bandwidth_hz=strtod(v,NULL);else if(!strcmp(a,"--binary-sha256"))snprintf(o->binary_sha256,sizeof(o->binary_sha256),"%s",v);else if(!strcmp(a,"--recipe-sha256"))snprintf(o->recipe_sha256,sizeof(o->recipe_sha256),"%s",v);else if(!strcmp(a,"--s32-mode"))snprintf(o->s32_mode,sizeof(o->s32_mode),"%s",v);else if(!strcmp(a,"--cfo-hz"))o->cfo_hz=strtod(v,NULL);else if(!strcmp(a,"--phase-noise-deg"))o->phase_noise_deg=strtod(v,NULL);else if(!strcmp(a,"--fade-depth-db"))o->fade_depth_db=strtod(v,NULL);else if(!strcmp(a,"--loss"))o->loss=strtod(v,NULL);else if(!strcmp(a,"--sig-ref"))o->sig_ref=strtod(v,NULL);else if(!strcmp(a,"--seed"))o->seed=(int)strtol(v,NULL,10);else if(!strcmp(a,"--cap-periods"))o->cap_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--play-periods"))o->play_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--prime-periods"))o->prime_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--statsfile"))snprintf(o->statsfile,sizeof(o->statsfile),"%s",v);
+        else if(!strcmp(a,"--profile")){if(parse_profile(o,v))return-1;}else if(!strcmp(a,"--snr")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr");}else if(!strcmp(a,"--snr3k")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k");}else if(!strcmp(a,"--snr3k-db")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k_db");}else if(!strcmp(a,"--cn-config-db")){o->cn_config_db=strtod(v,NULL);strcpy(o->input_coordinate,"cn_config_db");}else if(!strcmp(a,"--cell")){snprintf(o->cell,sizeof(o->cell),"%s",v);strcpy(o->input_coordinate,"cell");}else if(!strcmp(a,"--axis"))snprintf(o->axis,sizeof(o->axis),"%s",v);else if(!strcmp(a,"--configured-bandwidth-hz"))o->configured_bandwidth_hz=strtod(v,NULL);else if(!strcmp(a,"--binary-sha256"))snprintf(o->binary_sha256,sizeof(o->binary_sha256),"%s",v);else if(!strcmp(a,"--recipe-sha256"))snprintf(o->recipe_sha256,sizeof(o->recipe_sha256),"%s",v);else if(!strcmp(a,"--s32-mode"))snprintf(o->s32_mode,sizeof(o->s32_mode),"%s",v);else if(!strcmp(a,"--cfo-hz"))o->cfo_hz=strtod(v,NULL);else if(!strcmp(a,"--phase-noise-deg"))o->phase_noise_deg=strtod(v,NULL);else if(!strcmp(a,"--fade-depth-db"))o->fade_depth_db=strtod(v,NULL);else if(!strcmp(a,"--loss"))o->loss=strtod(v,NULL);else if(!strcmp(a,"--sig-ref"))o->sig_ref=strtod(v,NULL);else if(!strcmp(a,"--seed"))o->seed=(int)strtol(v,NULL,10);else if(!strcmp(a,"--cap-periods"))o->cap_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--play-periods"))o->play_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--prime-periods"))o->prime_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--statsfile"))snprintf(o->statsfile,sizeof(o->statsfile),"%s",v);else if(!strcmp(a,"--snr-schedule"))snprintf(o->snr_schedule,sizeof(o->snr_schedule),"%s",v);
         else if(!strcmp(a,"--audio-bandpass")){if(!strcmp(v,"narrow")){o->bp_lo=300;o->bp_hi=2900;}else if(!strcmp(v,"wide")){o->bp_lo=300;o->bp_hi=6300;}else if(strcmp(v,"off"))return-1;}else if(!strcmp(a,"--bandpass-lo-hz"))o->bp_lo=strtod(v,NULL);else if(!strcmp(a,"--bandpass-hi-hz"))o->bp_hi=strtod(v,NULL);else if(!strcmp(a,"--bandpass-taps"))o->bp_taps=(int)strtol(v,NULL,10);
         else if(!strcmp(a,"--vector-in"))snprintf(o->vector_in,sizeof(o->vector_in),"%s",v);else if(!strcmp(a,"--vector-out"))snprintf(o->vector_out,sizeof(o->vector_out),"%s",v);else if(!strcmp(a,"--double-in"))snprintf(o->double_in,sizeof(o->double_in),"%s",v);else if(!strcmp(a,"--double-out"))snprintf(o->double_out,sizeof(o->double_out),"%s",v);else if(!strcmp(a,"--tap-out"))snprintf(o->tap_out,sizeof(o->tap_out),"%s",v);else if(!strcmp(a,"--tap-count"))o->tap_count=(size_t)strtoull(v,NULL,10);else if(!strcmp(a,"--tap-stride"))o->tap_stride=(size_t)strtoull(v,NULL,10);else return-1;
     }
@@ -452,20 +632,22 @@ static int parse_args(int argc,char**argv,options_t*o){
         up[k]=0; snprintf(o->cell,sizeof(o->cell),"%s:%g",up,o->snr);
     }
     o->cn_config_db=o->snr+10.0*log10(3000.0/o->configured_bandwidth_hz);
+    if(o->snr_schedule[0]&&schedule_load(o->snr_schedule))return-1;
     return 0;
 }
 
 static int vector_mode(const options_t*o){
     FILE*fi=fopen(o->vector_in,"rb"),*fo=fopen(o->vector_out,"wb");if(!fi||!fo){perror("vector file");return 2;}channel_t c;if(channel_init(&c,o,(uint32_t)(o->seed*UINT32_C(2654435761))))return 2;
+    c.sched_offline=true;strcpy(c.sched_tag,"vec");
     int32_t ib[PERIOD*2],ob[PERIOD*2];double x[PERIOD],y[PERIOD];size_t words;
     while((words=fread(ib,sizeof(int32_t),PERIOD*2,fi))){size_t n=words/2;for(size_t i=0;i<n;i++)x[i]=(double)ib[2*i]/INT_MAX_D;
         if(o->passthrough){for(size_t i=0;i<n;i++)ob[2*i]=ob[2*i+1]=ib[2*i];}
         else {if(o->format_only)memcpy(y,x,n*sizeof(double));else channel_process(&c,x,y,n);for(size_t i=0;i<n;i++){double v=y[i]*INT_MAX_D;if(v>INT_MAX_D)v=INT_MAX_D;if(v< -INT_MAX_D)v=-INT_MAX_D;ob[2*i]=ob[2*i+1]=(int32_t)v;}}
         if(fwrite(ob,sizeof(int32_t),n*2,fo)!=n*2){perror("write");return 2;}if(words%2)break;
-    }channel_free(&c);fclose(fi);fclose(fo);return 0;
+    }schedule_finalize();write_schedule_statsfile(o);channel_free(&c);fclose(fi);fclose(fo);return 0;
 }
 static int double_mode(const options_t*o){
-    FILE*fi=fopen(o->double_in,"rb"),*fo=fopen(o->double_out,"wb");if(!fi||!fo){perror("double file");return 2;}channel_t c;if(channel_init(&c,o,(uint32_t)(o->seed*UINT32_C(2654435761))))return 2;double x[PERIOD],y[PERIOD];size_t n;while((n=fread(x,sizeof(double),PERIOD,fi))){channel_process(&c,x,y,n);if(fwrite(y,sizeof(double),n,fo)!=n)return 2;}channel_free(&c);fclose(fi);fclose(fo);return 0;
+    FILE*fi=fopen(o->double_in,"rb"),*fo=fopen(o->double_out,"wb");if(!fi||!fo){perror("double file");return 2;}channel_t c;if(channel_init(&c,o,(uint32_t)(o->seed*UINT32_C(2654435761))))return 2;c.sched_offline=true;strcpy(c.sched_tag,"dbl");double x[PERIOD],y[PERIOD];size_t n;while((n=fread(x,sizeof(double),PERIOD,fi))){channel_process(&c,x,y,n);if(fwrite(y,sizeof(double),n,fo)!=n)return 2;}schedule_finalize();write_schedule_statsfile(o);channel_free(&c);fclose(fi);fclose(fo);return 0;
 }
 static int tap_mode(const options_t*o){
     double dt,fd;profile_params(o->profile,&dt,&fd);if(fd<=0){fprintf(stderr,"tap mode needs fading profile\n");return 2;}FILE*f=fopen(o->tap_out,"wb");if(!f){perror("tap-out");return 2;}doppler_t d;doppler_init(&d,fd,(uint64_t)o->seed);size_t stride=o->tap_stride?o->tap_stride:d.update;for(size_t i=0;i<o->tap_count;i++){double pair[2]={creal(d.hold),cimag(d.hold)};if(fwrite(pair,sizeof(double),2,f)!=2){fclose(f);return 2;}doppler_skip(&d,stride);}fclose(f);return 0;
@@ -481,11 +663,12 @@ int main(int argc,char**argv){
     pump_t fwd={.opt=&o},rev={.opt=&o};strcpy(fwd.name,"fwd");strcpy(rev.name,"rev");strcpy(fwd.cap_dev,o.fwd_cap);strcpy(fwd.play_dev,o.fwd_play);strcpy(rev.cap_dev,o.rev_cap);strcpy(rev.play_dev,o.rev_play);pthread_mutex_init(&fwd.stats.lock,NULL);pthread_mutex_init(&rev.stats.lock,NULL);pthread_mutex_init(&fwd.pcm_lock,NULL);pthread_mutex_init(&rev.pcm_lock,NULL);
     if(o.dry_run||o.self_test){dry_stats(&fwd,&o,(uint32_t)(o.seed*UINT32_C(2654435761)));dry_stats(&rev,&o,(uint32_t)(o.seed*UINT32_C(40503)+7));if(!o.statsfile[0])snprintf(o.statsfile,sizeof(o.statsfile),"/tmp/bridge_c_dry_%ld.json",(long)getpid());int e=flush_stats(&o,&fwd,&rev);fprintf(stderr,"[bridge_s32_c] %s wrote %s\n",e?"DRY-RUN FAIL":"DRY-RUN PASS",o.statsfile);channel_free(&fwd.channel);channel_free(&rev.channel);return e?1:0;}
     if(channel_init(&fwd.channel,&o,(uint32_t)(o.seed*UINT32_C(2654435761)))||channel_init(&rev.channel,&o,(uint32_t)(o.seed*UINT32_C(40503)+7))){fprintf(stderr,"channel init failed\n");return 2;}
+    strcpy(fwd.channel.sched_tag,"fwd");strcpy(rev.channel.sched_tag,"rev");
     fprintf(stderr,"[bridge_s32_c] %s SNR3k=%.3f profile=%s seed=%d rings cap=%d play=%d prime=%d cables fwd[%s->%s] rev[%s->%s]\n",o.passthrough?"PASSTHROUGH":"CHANNEL",o.snr,o.profile_name,o.seed,o.cap_periods,o.play_periods,o.prime_periods,o.fwd_cap,o.fwd_play,o.rev_cap,o.rev_play);
     struct sigaction sa={0};sa.sa_handler=signal_handler;sigaction(SIGINT,&sa,NULL);sigaction(SIGTERM,&sa,NULL);
     pthread_t tf,tr;if(pthread_create(&tf,NULL,pump_main,&fwd)||pthread_create(&tr,NULL,pump_main,&rev)){fprintf(stderr,"pthread_create failed\n");return 2;}
     while(!stop_requested){struct timespec ts={.tv_sec=0,.tv_nsec=500000000};nanosleep(&ts,NULL);flush_stats(&o,&fwd,&rev);}
     pthread_mutex_lock(&fwd.pcm_lock);if(fwd.cap_shared)snd_pcm_drop(fwd.cap_shared);if(fwd.play_shared)snd_pcm_drop(fwd.play_shared);pthread_mutex_unlock(&fwd.pcm_lock);
     pthread_mutex_lock(&rev.pcm_lock);if(rev.cap_shared)snd_pcm_drop(rev.cap_shared);if(rev.play_shared)snd_pcm_drop(rev.play_shared);pthread_mutex_unlock(&rev.pcm_lock);
-    pthread_join(tf,NULL);pthread_join(tr,NULL);flush_stats(&o,&fwd,&rev);channel_free(&fwd.channel);channel_free(&rev.channel);return 0;
+    pthread_join(tf,NULL);pthread_join(tr,NULL);schedule_finalize();flush_stats(&o,&fwd,&rev);channel_free(&fwd.channel);channel_free(&rev.channel);return 0;
 }
