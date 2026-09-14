@@ -117,6 +117,19 @@ int cl_arq_controller::add_message_rx_data(char type, char id, int length, char*
 			messages_rx[loc].data[j]=0;
 		}
 	}
+	// Candidate semantics: persistent emptiness means no accepted CRC-valid DATA
+	// activity at all.  A duplicate which overwrites a RECEIVED partial slot is
+	// not unique byte progress, but it still proves the forward RF path is active;
+	// therefore it must break the continuous-empty interval just like a new slot.
+	if(scream_empty_holdoff_armed)
+	{
+		scream_empty_holdoff_armed = false;
+		scream_empty_holdoff_timer.stop();
+		scream_empty_holdoff_timer.reset();
+		scream_empty_holdoff_ms = 0;
+		printf("[SCREAM-HOLDOFF] CRC-valid DATA activity; persistent-empty candidate cleared\n");
+		fflush(stdout);
+	}
 	if(messages_rx[loc].status==FREE || messages_rx[loc].status==ACKED)
 	{
 		stats.nReceived_data++;
@@ -1976,9 +1989,14 @@ void cl_arq_controller::process_messages_rx_data_control()
 					messages_rx_buffer.sequence_number,
 					last_received_end_of_batch_seq, rx_timeout, receiving_timeout);
 				fflush(stdout);
-				set_receiving_timeout(rx_timeout);
-				receiving_timer.start();
-				}  // end accepted (or compatibility-mode) add_message_rx_data store
+					set_receiving_timeout(rx_timeout);
+					receiving_timer.start();
+					// A complete D5 batch is now in storage.  Produce PREKEY authority
+					// only if every clean-ACK withhold gate agrees, then let the normal
+					// scheduler overlap key-up/prefix audio with the observed clean tail.
+					t1_authorize_clean_ack_if_ready();
+					t1_schedkey_poll();
+					}  // end accepted (or compatibility-mode) add_message_rx_data store
 
 				}  // end if(!v2_route_drop) — SACK Design A Step 4 routing decision
 			}
@@ -2051,13 +2069,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 				fflush(stdout);
 			}
 
-			// T2 SCREAM WAKE: a whole scheduled forward receive window elapsed with
-			// no decoded frame.  The CMD is now in its already-existing reverse
-			// ACK/listen slot, so the presence prefix can occupy that slot without
-			// adding a new turnaround or colliding with a forward keydown.  After the
-			// burst, send_scream_pattern() flushes the local capture and opens the
-			// CONFIG_TAG re-entry window.  CONFIG_0 has no lower re-entry rung, so do
-			// not scream forever at the floor.
+			// T2 SCREAM WAKE: an empty scheduled receive window is only a proposal.
+			// Arm after three in-order delivered batches, then require continuous
+			// emptiness for a hardware-scaled holdoff. This makes the burst a last-
+			// resort dead-forward-path wake rather than an early-session reflex.
+			// CONFIG_0 has no lower re-entry rung, so do not scream at the floor.
 			if(scream_wake_feature_enabled()
 			   && !scream_reentry_listen_armed
 			   && !scream_reentry_recovery_pending
@@ -2065,11 +2081,42 @@ void cl_arq_controller::process_messages_rx_data_control()
 			   && config_ladder_index(current_configuration)
 			      > config_ladder_index(CONFIG_0))
 			{
-				int rung = scream_choose_rung();
-				printf("[SCREAM-TRIGGER] forward receive window empty cfg=%d rung=%d\n",
-					current_configuration, rung);
-				fflush(stdout);
-				send_scream_pattern(rung);
+				if(scream_forward_batches_delivered < 3)
+				{
+					printf("[SCREAM-SUPPRESS] empty window before forward-progress watermark (%d/3) cfg=%d\n",
+						scream_forward_batches_delivered, current_configuration);
+					fflush(stdout);
+				}
+				else if(!scream_empty_holdoff_armed)
+				{
+					scream_empty_holdoff_ms =
+						scream_trigger_holdoff_for_timeout(receiving_timeout);
+					scream_empty_holdoff_armed = true;
+					scream_empty_holdoff_timer.start();
+					printf("[SCREAM-HOLDOFF] first empty window after %d delivered batches; require %dms persistent emptiness cfg=%d\n",
+						scream_forward_batches_delivered, scream_empty_holdoff_ms,
+						current_configuration);
+					fflush(stdout);
+				}
+				else
+				{
+					int empty_ms = scream_empty_holdoff_timer.get_elapsed_time_ms();
+					if(scream_trigger_policy_ready(scream_forward_batches_delivered,
+							scream_empty_holdoff_armed, empty_ms,
+							scream_empty_holdoff_ms))
+					{
+						int rung = scream_choose_rung();
+						printf("[SCREAM-TRIGGER] persistent forward path empty for %dms cfg=%d rung=%d delivered=%d\n",
+							empty_ms, current_configuration, rung,
+							scream_forward_batches_delivered);
+						fflush(stdout);
+						scream_empty_holdoff_armed = false;
+						scream_empty_holdoff_timer.stop();
+						scream_empty_holdoff_timer.reset();
+						scream_empty_holdoff_ms = 0;
+						send_scream_pattern(rung);
+					}
+				}
 			}
 
 			// Restart timer so we can receive the next CMD retransmit.
@@ -2077,6 +2124,13 @@ void cl_arq_controller::process_messages_rx_data_control()
 			// RSP is stuck in RECEIVING (0 < timeout always true, but
 			// the else block never triggers again).
 			calculate_receiving_timeout();
+			if(scream_empty_holdoff_armed)
+			{
+				int remaining = scream_empty_holdoff_ms
+					- scream_empty_holdoff_timer.get_elapsed_time_ms();
+				if(remaining < 1) remaining = 1;
+				if(remaining < receiving_timeout) receiving_timeout = remaining;
+			}
 			receiving_timer.start();
 		}
 
@@ -2712,6 +2766,21 @@ void cl_arq_controller::rsp_inband_demote_rebase()
 
 void cl_arq_controller::process_messages_acknowledging_data()
 {
+	// PREKEY safety invariant: this handler may return to RECEIVING only after the
+	// scheduled key has either been consumed by the clean ACK for its exact BSI or
+	// cancelled (which physically unkeys and restores RX).  Keep this whole-handler
+	// backstop in addition to the explicit withhold-site cancels below so a future
+	// early return cannot recreate a stuck-keyed/stuck-deaf link.
+	struct t1_keyed_receiving_exit_guard {
+		cl_arq_controller* arq;
+		explicit t1_keyed_receiving_exit_guard(cl_arq_controller* p) : arq(p) {}
+		~t1_keyed_receiving_exit_guard()
+		{
+			if(arq->connection_status == RECEIVING && arq->t1_schedkey.keyed)
+				arq->t1_cancel_schedkey("ack-handler-receiving-exit");
+		}
+	} t1_exit_guard(this);
+
 	printf("[RSP-RX-TIMEOUT] Entering ACK-GATE: rx_count=%d timeout=%d batch=%d\n",
 		batch_rx_frame_count, receiving_timeout, data_batch_size);
 	fflush(stdout);
@@ -2911,8 +2980,23 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				return;
 			}
 
+			// A clean batch may decode before the commander's sacrificial tail reaches its
+			// scheduled boundary. Keep ACK audio gated and return to the outer loop so the
+			// independently armed frame-0 scheduler can key there. No busy wait is introduced:
+			// update_status() continues polling freshness/cancellation, and partial batches
+			// bypass this gate to the reactive D2 path below.
+			if(t1_schedkey.armed && rx_received == expected
+			   && t1_schedkey.bsi == rsp_current_expected_batch_seq_id)
+			{
+				t1_authorize_clean_ack_if_ready();
+				t1_schedkey_poll();
+				if(t1_schedkey.clean_ack_authorized && t1_schedkey.armed)
+					return;
+			}
+
 			if(data_batch_size > 1 && rx_received < expected && !passive_monitor)
 			{
+				t1_cancel_schedkey("partial-ack-gate");
 				if(sack_enabled && rx_received > 0)
 				{
 					// SACK: send selective ACK with bitmap of received frames
@@ -3209,6 +3293,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				if(!w_bytegate_defeat && w_bytegate_shortfall(wbsi))
 				{
 					{
+						t1_cancel_schedkey("byte-shortfall-withhold");
 						printf("[RSP-V2-BYTE-SHORTFALL] WITHHOLD clean ACK: bsi=%d committed=%u "
 							"(frame-count PASS but byte shortfall — tail-drop / shrunk-count); "
 							"re-arm so SACK re-requests. NOT crediting, NOT flushing.\n",
@@ -3252,6 +3337,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				int need    = rx_fifo_batch_need();
 				if(!bp_defeat && rx_free < need)
 				{
+					t1_cancel_schedkey("rxfifo-backpressure-hold");
 					printf("[ACK-GATE-BACKPRESSURE] HOLD: app FIFO free=%d < batch need=%d — "
 						"NOT ACKing/delivering; CMD retransmits, re-deliver when app drains "
 						"(Fix H#3, no post-ACK loss)\n", rx_free, need);
@@ -3332,7 +3418,7 @@ void cl_arq_controller::process_messages_acknowledging_data()
 					bool recover_defeat = false;
 					{ const char* e = std::getenv("MERCURY_GAP_RECOVER_DEFEAT");
 					  if(e && *e && atoi(e)!=0) recover_defeat = true; }
-					if(!recover_defeat
+						if(!recover_defeat
 					   && !rsp_stream_aborted
 					   && rsp_gap_recover_rounds < RSP_GAP_RECOVER_MAX
 					   && gap_is_recoverable_prev_hole(
@@ -3340,8 +3426,13 @@ void cl_arq_controller::process_messages_acknowledging_data()
 							rsp_last_delivered_batch_seq_id,
 							rsp_prev_batch_active, rsp_prev_batch_seq_id,
 							rsp_prev_batch_received_count, rsp_stream_origin_gen))
-					{
-						// Revert the just-marked ACKED current-batch slots back to
+						{
+							printf("[T1-SAFETY-COVER] recoverable-prev-hole-hold entered "
+								"keyed=%d bsi=%d\n", t1_schedkey.keyed ? 1 : 0,
+								rsp_current_expected_batch_seq_id);
+							fflush(stdout);
+							t1_cancel_schedkey("recoverable-prev-hole-hold");
+							// Revert the just-marked ACKED current-batch slots back to
 						// RECEIVED so this batch is HELD (survives for delivery once the
 						// hole fills) and is NOT mistaken for a deliverable ACKED batch.
 						int reverted = 0;
@@ -3564,6 +3655,12 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			// path, no config switch needed.
 			send_ack_pattern();
 		}
+
+		// The first clean turnaround is intentionally baseline-only.  Publish
+		// PREKEY eligibility only after its clean ACK has left this endpoint;
+		// batch 2 is the earliest batch that may carry/schedule the overlap.
+		if(!passive_monitor && !batch_gap_aborted && !l1_blockack_data_active())
+			t1_data_phase_proven = true;
 
 		if(passive_monitor)
 		{
@@ -3914,6 +4011,20 @@ void cl_arq_controller::process_control_responder()
 		// Always present (LDPC decodes full block; unused bytes are zero-padded).
 		// Backwards-compatible: old firmware doesn't fill byte 5 → decodes as 0 = no WB.
 		peer_capability = (uint8_t)messages_control.data[5];
+		int t1_pk = -1, t1_pd = -1, t1_pu = -1;
+		bool t1_ldpc_calibration = messages_control.length >= 12
+			&& t1_calibration_decode(
+				&messages_control.data[7], 5, &t1_pk, &t1_pd, &t1_pu);
+		if(t1_ldpc_calibration)
+		{
+			t1_peer_calibration_valid = true;
+			t1_peer_keyup_ms = t1_pk;
+			t1_peer_deaf_ms = t1_pd;
+			t1_peer_undeaf_ms = t1_pu;
+			printf("[T1-CALIB-WIRE] peer keyup=%d deaf=%d undeaf=%d ms\n",
+				t1_pk, t1_pd, t1_pu);
+			fflush(stdout);
+		}
 		printf("[BW-NEG] Commander capability: 0x%02X (WB=%s, ENCRYPT=%s)\n",
 			peer_capability,
 			(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",
@@ -4085,6 +4196,12 @@ void cl_arq_controller::process_control_responder()
 		// reset_session_state disarms on a session boundary, so unconnected / direct
 		// funnel-poke states keep legacy (unarmed, byte-identical) behavior.
 		rsp_stream_origin_gen = 0;
+		// T1c CONNECT-TIME CALIBRATION BOOTSTRAP (SPEC T1 s2): warm the learned turnaround timing
+		// terms at the RSP connect-accept so the reverse-ACK scheduled pre-key is not inert on the
+		// live path. Local-only (no wire frame, no added round-trip) and run AFTER the session is
+		// accepted, so it can never delay or fail a connect; wire-byte-identical with the
+		// MERCURY_T1_SCHEDKEY lever off. The peer-measured keyup refinement is the HELD wire exchange.
+		t1_seed_calibration_defaults();
 				settled_close_cache.valid = false;  // session-start disarm (never re-ACK a stale descriptor)
 		if(connect_fast_active)
 		{
@@ -4138,6 +4255,12 @@ void cl_arq_controller::process_control_responder()
 			messages_control.data[3] = (char)CRC8_calc(
 				(char*)&messages_control.data[1], 2);
 			messages_control.length = 4;
+			if(t1_peer_calibration_valid)
+			{
+				t1_calibration_encode(&messages_control.data[4], ptt_on_delay_ms,
+					0, ptt_off_delay_ms);
+				messages_control.length = 9;
+			}
 			connection_status = ACKNOWLEDGING_CONTROL;
 			printf("[HANDSHAKE-ECHO] RSP queued TEST_CONNECTION_ACK: "
 				"echoed_cap=0x%02X own_cap=0x%02X crc8=0x%02X\n",
@@ -17086,6 +17209,40 @@ int cl_arq_controller::test_dedup_rebase()
 
 	int fails=0;
 
+	// ================= CASE 0 -- ordinary in-order duplicate =================
+	{
+		this->rsp_current_expected_batch_seq_id=B;
+		this->rsp_prev_batch_seq_id           =(B-1)&0xFF;
+		this->rsp_last_delivered_batch_seq_id =(B-1)&0xFF;
+		this->rx_stream_emitted_bsi_hw        =-1;
+		this->rx_stream_delivered             =0;
+		this->rx_stream_crc                   =0;
+		this->rsp_stream_aborted              =false;
+		this->rsp_cross_session_seam_armed    =false;
+		this->scream_forward_batches_delivered=0;
+		this->fifo_buffer_rx.flush();
+
+		seat_batchB();
+		rsp_commit_cur_batch_delivery();
+		char first[NFR*FLEN];
+		int p1=this->fifo_buffer_rx.pop(first,(int)sizeof(first));
+		int wm1=this->scream_forward_batches_delivered;
+
+		// Lost ACK, no demote: the same BSI re-reaches the normal commit.
+		this->rsp_current_expected_batch_seq_id=B;
+		seat_batchB();
+		rsp_commit_cur_batch_delivery();
+		char duplicate[NFR*FLEN];
+		int p2=this->fifo_buffer_rx.pop(duplicate,(int)sizeof(duplicate));
+		int wm2=this->scream_forward_batches_delivered;
+		bool pass=defeat
+			? (p1==NFR*FLEN && p2==NFR*FLEN && wm1==1 && wm2==2)
+			: (p1==NFR*FLEN && p2==0 && wm1==1 && wm2==1);
+		printf("[TEST-SCREAM-WATERMARK] %s in-order duplicate: bytes=%d/%d watermark=%d->%d\n",
+			pass?"PASS":"FAIL", p1, p2, wm1, wm2);
+		if(!pass) fails++;
+	}
+
 	// ================= CASE A -- the witness (in-order both emits) =================
 	{
 		this->rsp_current_expected_batch_seq_id=B;
@@ -17096,6 +17253,7 @@ int cl_arq_controller::test_dedup_rebase()
 		this->rx_stream_crc                   =0;
 		this->rsp_stream_aborted              =false;
 		this->rsp_cross_session_seam_armed    =false;
+		this->scream_forward_batches_delivered=0;
 		this->fifo_buffer_rx.flush();
 
 		// ---- 1st delivery: REAL delivery-time gate + REAL commit funnel ----
@@ -17104,6 +17262,7 @@ int cl_arq_controller::test_dedup_rebase()
 		rsp_commit_cur_batch_delivery();
 		char s1[NFR*FLEN]; int p1=this->fifo_buffer_rx.pop(s1,(int)sizeof(s1));
 		uint64_t cur1=this->rx_stream_delivered;
+		int watermark1=this->scream_forward_batches_delivered;
 		bool s1_ok=(p1==NFR*FLEN)&&(memcmp(s1,oracle,NFR*FLEN)==0);
 		printf("[TEST-DEDUP-REBASE] CASE-A 1st: popped=%dB s1_ok=%d emit_hw=%d last_delivered=%d cursor=%llu\n", p1, s1_ok?1:0, this->rx_stream_emitted_bsi_hw, this->rsp_last_delivered_batch_seq_id, (unsigned long long)cur1);
 		fflush(stdout);
@@ -17128,6 +17287,7 @@ int cl_arq_controller::test_dedup_rebase()
 		rsp_commit_cur_batch_delivery();   // 2nd copy_data_to_buffer -> the DEDUP GATE fires here
 		char s2[2*NFR*FLEN]; int p2=this->fifo_buffer_rx.pop(s2,(int)sizeof(s2));
 		uint64_t cur2=this->rx_stream_delivered;
+		int watermark2=this->scream_forward_batches_delivered;
 		printf("[TEST-DEDUP-REBASE] CASE-A 2nd: popped=%dB cursor %llu->%llu\n", p2, (unsigned long long)cur1, (unsigned long long)cur2);
 		fflush(stdout);
 		if(defeat){
@@ -17139,6 +17299,10 @@ int cl_arq_controller::test_dedup_rebase()
 			if(!clean){ printf("[TEST-DEDUP-REBASE] CASE-A FAIL(fix): double-delivery NOT prevented (re-appended=%dB cursor %llu->%llu)\n", p2, (unsigned long long)cur1, (unsigned long long)cur2); fails++; }
 			else printf("[TEST-DEDUP-REBASE] CASE-A(fix): byte-identical -- 0B re-appended, cursor held at %llu\n", (unsigned long long)cur2);
 		}
+		bool watermark_pass = defeat ? (watermark2==2) : (watermark1==1 && watermark2==1);
+		printf("[TEST-SCREAM-WATERMARK] %s demote/rebase duplicate: watermark=%d->%d\n",
+			watermark_pass?"PASS":"FAIL", watermark1, watermark2);
+		if(!watermark_pass) fails++;
 	}
 
 	// ================= CASE B -- cross-route single-funnel proof =================
@@ -17151,6 +17315,7 @@ int cl_arq_controller::test_dedup_rebase()
 		this->rx_stream_crc                   =0;
 		this->rsp_stream_aborted              =false;
 		this->rsp_cross_session_seam_armed    =false;
+		this->scream_forward_batches_delivered=0;
 		this->fifo_buffer_rx.flush();
 
 		// 1st delivery via the PREV-route funnel (mirror the arq_responder.cc PREV emit)
@@ -17163,9 +17328,14 @@ int cl_arq_controller::test_dedup_rebase()
 		this->rx_copy_window=-1;
 		char s1b[NFR*FLEN]; int p1b=this->fifo_buffer_rx.pop(s1b,(int)sizeof(s1b));
 		uint64_t c1b=this->rx_stream_delivered;
+		int prev_watermark=this->scream_forward_batches_delivered;
 		bool s1b_ok=(p1b==NFR*FLEN)&&(memcmp(s1b,oracle,NFR*FLEN)==0);
 		if(!s1b_ok){ printf("[TEST-DEDUP-REBASE] CASE-B FAIL: PREV 1st delivery not faithful (popped=%d)\n", p1b); fails++; }
 		if(this->rx_stream_emitted_bsi_hw!=B){ printf("[TEST-DEDUP-REBASE] CASE-B FAIL: emit_hw=%d want %d after PREV emit\n", this->rx_stream_emitted_bsi_hw, B); fails++; }
+		bool prev_watermark_pass=(prev_watermark==1);
+		printf("[TEST-SCREAM-WATERMARK] %s recovered-PREV delivery advances once: watermark=%d\n",
+			prev_watermark_pass?"PASS":"FAIL", prev_watermark);
+		if(!prev_watermark_pass) fails++;
 
 		// rebase, then in-order re-commit of B (2nd emit via the OTHER route)
 		this->current_configuration=102; this->forward_configuration=0;
@@ -17184,6 +17354,25 @@ int cl_arq_controller::test_dedup_rebase()
 			bool clean=(p2b==0)&&(c2b==c1b);
 			if(!clean){ printf("[TEST-DEDUP-REBASE] CASE-B FAIL(fix): cross-route double-delivery not prevented (re-appended=%dB)\n", p2b); fails++; }
 		}
+	}
+
+	// ================= CASE C -- duplicate RF activity clears emptiness =================
+	{
+		for(int i=0;i<this->nMessages;i++) messages_rx[i].status=FREE;
+		this->rx_batch_total_frames=NFR;
+		this->rx_buffer_batch_total_frames=NFR;
+		char first[FLEN]; frame_bytes(1, first);
+		messages_rx[1].status=RECEIVED;  // already-filled partial slot
+		messages_rx[1].length=FLEN;
+		this->scream_empty_holdoff_armed=true;
+		this->scream_empty_holdoff_ms=6595;
+		this->scream_empty_holdoff_timer.start();
+		int rc=add_message_rx_data(DATA_SHORT, (char)1, FLEN, first);
+		bool pass=(rc==SUCCESSFUL && !this->scream_empty_holdoff_armed
+			&& this->scream_empty_holdoff_ms==0);
+		printf("[TEST-SCREAM-CANDIDATE] %s CRC-valid duplicate over RECEIVED slot clears continuous-empty candidate\n",
+			pass?"PASS":"FAIL");
+		if(!pass) fails++;
 	}
 
 	bool pass=(fails==0);

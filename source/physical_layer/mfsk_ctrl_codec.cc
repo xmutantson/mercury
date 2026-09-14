@@ -253,6 +253,33 @@ bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
 	return true;
 }
 
+// PREKEY reuses only the low 18 bits common to TEST_CONN and TEST_ACK. The
+// two-bit tag makes an all-zero legacy suffix unambiguously absent; CRC-12 is
+// calculated over the complete typed payload by the surrounding codec.
+static const uint64_t T1_RESERVED_MASK = (1ULL << 18) - 1ULL;
+static const uint64_t T1_RESERVED_TAG  = 2ULL << 16; // binary 10
+
+void pack_t1_calibration_reserved(uint64_t* p38, uint8_t keyup_q5,
+                                  uint8_t undeaf_q5)
+{
+	if(!p38) return;
+	*p38 = (*p38 & ~T1_RESERVED_MASK)
+		| T1_RESERVED_TAG
+		| ((uint64_t)keyup_q5 << 8)
+		| (uint64_t)undeaf_q5;
+}
+
+bool unpack_t1_calibration_reserved(uint64_t p38, uint8_t* keyup_q5,
+                                    uint8_t* undeaf_q5)
+{
+	if(!keyup_q5 || !undeaf_q5
+	   || (p38 & (3ULL << 16)) != T1_RESERVED_TAG)
+		return false;
+	*keyup_q5 = (uint8_t)((p38 >> 8) & 0xFF);
+	*undeaf_q5 = (uint8_t)(p38 & 0xFF);
+	return true;
+}
+
 // =============================================================================
 // CRC-aided soft list decode (connect-suffix-fec-research.md §3 Tier 1)
 // =============================================================================

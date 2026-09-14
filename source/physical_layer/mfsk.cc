@@ -581,6 +581,8 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	scream_prefix_match_threshold = 3;
 	if (M == 16)
 	{
+		const int prekey[PREKEY_PREFIX_LEN] = {7, 2, 3, 13, 11};
+		for (int i = 0; i < PREKEY_PREFIX_LEN; i++) prekey_prefix_tones[i] = prekey[i];
 		static const int scr[SCREAM_NBASES][8] = {
 			{14, 13,  3,  5,  8,  4, 15,  6},   // g10  rung -1
 			{ 4,  3,  9,  7,  2, 15,  5, 14},   // g11  rung -2
@@ -594,6 +596,8 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	}
 	else if (M == 32)
 	{
+		const int prekey[PREKEY_PREFIX_LEN] = {14, 4, 6, 26, 22};
+		for (int i = 0; i < PREKEY_PREFIX_LEN; i++) prekey_prefix_tones[i] = prekey[i];
 		// 2x-scaled M=16 bases (max M16 tone 15 -> 30, in range for M=32; no
 		// substitution needed), same rung order + prefix.
 		static const int scr[SCREAM_NBASES][8] = {
@@ -609,6 +613,8 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	}
 	else if (M == 8)
 	{
+		const int prekey[PREKEY_PREFIX_LEN] = {7, 2, 3, 5, 1};
+		for (int i = 0; i < PREKEY_PREFIX_LEN; i++) prekey_prefix_tones[i] = prekey[i];
 		scream_pattern_len = scream_pattern_nsymb = 32;
 		scream_match_threshold = 24;
 		scream_prefix_match_threshold = 4;
@@ -626,6 +632,8 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 	}
 	else if (M == 4)
 	{
+		const int prekey[PREKEY_PREFIX_LEN] = {3, 2, 3, 1, 3};
+		for (int i = 0; i < PREKEY_PREFIX_LEN; i++) prekey_prefix_tones[i] = prekey[i];
 		scream_pattern_len = scream_pattern_nsymb = 48;
 		scream_match_threshold = 40;
 		scream_prefix_match_threshold = 4;
@@ -645,6 +653,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		for (int b = 0; b < SCREAM_NBASES; b++)
 			for (int i = 0; i < MAX_ACK_TONES; i++) scream_tones[b][i] = 0;
 		for (int i = 0; i < MAX_ACK_TONES; i++) scream_prefix_tones[i] = 0;
+		for (int i = 0; i < PREKEY_PREFIX_LEN; i++) prekey_prefix_tones[i] = 0;
 	}
 
 	// Step 15: legacy MFSK SACK tone tables removed — partial-batch SACK is
@@ -684,6 +693,25 @@ void cl_mfsk::generate_scream_pattern(std::complex<double>* pattern_out, int run
 		for (int st = 0; st < nStreams; st++)
 			pattern_out[abs_s * Nc + stream_offsets[st] + actual_tone] =
 				std::complex<double>(amp, 0.0);
+	}
+}
+
+void cl_mfsk::generate_prekey_prefix(std::complex<double>* pattern_out, int reps)
+{
+	if (M == 0 || Nc == 0 || nStreams == 0 || pattern_out == NULL || reps < 1) return;
+	double amp = sqrt((double)Nc / nStreams);
+	for (int r = 0; r < reps; r++)
+	{
+		for (int s = 0; s < PREKEY_PREFIX_LEN; s++)
+		{
+			const int out_s = r * PREKEY_PREFIX_LEN + s;
+			for (int k = 0; k < Nc; k++)
+				pattern_out[out_s * Nc + k] = std::complex<double>(0.0, 0.0);
+			const int actual_tone = (prekey_prefix_tones[s] + s * tone_hop_step) % M;
+			for (int st = 0; st < nStreams; st++)
+				pattern_out[out_s * Nc + stream_offsets[st] + actual_tone] =
+					std::complex<double>(amp, 0.0);
+		}
 	}
 }
 

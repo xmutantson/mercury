@@ -147,6 +147,7 @@ cl_telecom_system::cl_telecom_system()
 	coarse_freq_sync_enabled=false;
 	ack_pattern_passband_samples=0;
 	scream_pattern_passband_samples=0;
+	prekey_prefix_unit_passband_samples=0;
 	ack_snr_pattern_passband_samples=0;
 	ack_sack_pattern_passband_samples=0;
 	connect_pattern_passband_samples=0;
@@ -5240,6 +5241,50 @@ int cl_telecom_system::generate_scream_pattern_passband(double* out, int rung)
 		carrier_amplitude, frequency_interpolation_rate);
 	ofdm.peak_clip(out, scream_pattern_passband_samples, ofdm.data_papr_cut);
 	return scream_pattern_passband_samples;
+}
+
+int cl_telecom_system::generate_prekey_prefix_passband(double* out, int reps)
+{
+	if(out == NULL || reps < 1 || prekey_prefix_unit_passband_samples <= 0) return 0;
+	const int nsymb = reps * cl_mfsk::PREKEY_PREFIX_LEN;
+	const int samples = reps * prekey_prefix_unit_passband_samples;
+	const double power_normalization = sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
+	ack_mfsk.generate_prekey_prefix(data_container.ofdm_framed_data, reps);
+	for(int i = 0; i < nsymb; i++)
+		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
+			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
+	const double boost = get_tx_gain(TX_SIG_ACK);
+	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
+	{
+		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
+		data_container.ofdm_symbol_modulated_data[j] *= sqrt(output_power_Watt) * boost;
+	}
+	ofdm.baseband_to_passband(data_container.ofdm_symbol_modulated_data,
+		data_container.Nofdm * nsymb, out, sampling_frequency, carrier_frequency,
+		carrier_amplitude, frequency_interpolation_rate);
+	ofdm.peak_clip(out, samples, ofdm.data_papr_cut);
+	return samples;
+}
+
+double cl_telecom_system::detect_prekey_prefix_from_passband(double* data, int size,
+	int* out_matched)
+{
+	if(out_matched) *out_matched = 0;
+	if(data == NULL || size <= 0 || prekey_prefix_unit_passband_samples <= 0)
+		return 0.0;
+	const int decim = data_container.interpolation_rate;
+	const int dec_size = size / decim;
+	const double effective_carrier = carrier_frequency + last_coarse_freq_offset;
+	ofdm.passband_to_baseband_decimated(data, size,
+		data_container.baseband_data_interpolated, sampling_frequency,
+		effective_carrier, carrier_amplitude, decim, &ofdm.FIR_rx_data);
+	int best_offset = -1;
+	return ofdm.detect_ack_pattern(
+		data_container.baseband_data_interpolated, dec_size, 1,
+		cl_mfsk::PREKEY_PREFIX_LEN, ack_mfsk.prekey_prefix_tones,
+		cl_mfsk::PREKEY_PREFIX_LEN, ack_mfsk.tone_hop_step, ack_mfsk.M,
+		ack_mfsk.nStreams, ack_mfsk.stream_offsets, out_matched,
+		0, nullptr, &best_offset, 0, nullptr, /*always_fine=*/true);
 }
 
 int cl_telecom_system::detect_scream_pattern_from_passband(double* data, int size,
@@ -13942,6 +13987,8 @@ int cl_telecom_system::load_configuration(int configuration)
 	ack_pattern_passband_samples = ack_mfsk.ack_pattern_nsymb * data_container.Nofdm * frequency_interpolation_rate;
 	scream_pattern_passband_samples = (ack_mfsk.scream_prefix_nsymb + ack_mfsk.scream_pattern_nsymb)
 		* data_container.Nofdm * frequency_interpolation_rate;
+	prekey_prefix_unit_passband_samples = cl_mfsk::PREKEY_PREFIX_LEN
+		* data_container.Nofdm * frequency_interpolation_rate;
 	ack_snr_pattern_passband_samples = ack_mfsk.ack_snr_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;
 	// ACK+SACK pattern (WB-only — NB has M=8 and ack_sack_suffix_len()=0,
 	// which makes ack_sack_pattern_nsymb() == ack_pattern_nsymb. Multiplying
@@ -14156,6 +14203,8 @@ void cl_telecom_system::load_configuration_swap(int configuration, int idx)
 	}
 	ack_pattern_passband_samples      = ack_mfsk.ack_pattern_nsymb        * data_container.Nofdm * frequency_interpolation_rate;
 	scream_pattern_passband_samples   = (ack_mfsk.scream_prefix_nsymb + ack_mfsk.scream_pattern_nsymb)
+		* data_container.Nofdm * frequency_interpolation_rate;
+	prekey_prefix_unit_passband_samples = cl_mfsk::PREKEY_PREFIX_LEN
 		* data_container.Nofdm * frequency_interpolation_rate;
 	ack_snr_pattern_passband_samples  = ack_mfsk.ack_snr_pattern_nsymb()  * data_container.Nofdm * frequency_interpolation_rate;
 	ack_sack_pattern_passband_samples = ack_mfsk.ack_sack_pattern_nsymb() * data_container.Nofdm * frequency_interpolation_rate;

@@ -562,6 +562,11 @@ public:
 	// 0=-1, 1=-2, 2=-4, 3=FLOOR. The hop index restarts at the full base so the
 	// table-parameterized detector can classify it directly.
 	void generate_scream_pattern(std::complex<double>* pattern_out, int rung);
+	// PREKEY acquisition unit: five-symbol Welch-Costas base, repeated with a
+	// per-repetition hop reset so a listener may acquire at any boundary.
+	static const int PREKEY_PREFIX_LEN = 5;
+	int prekey_prefix_tones[PREKEY_PREFIX_LEN];
+	void generate_prekey_prefix(std::complex<double>* pattern_out, int reps);
 
 	// Generate BREAK pattern: same structure as ACK but with break_tones
 	void generate_break_pattern(std::complex<double>* pattern_out);

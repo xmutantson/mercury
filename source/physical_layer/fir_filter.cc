@@ -568,12 +568,14 @@ void cl_FIR::apply(double* in, double* out, int nItems)
 	const std::uintptr_t out_begin=(std::uintptr_t)out;
 	const std::uintptr_t out_end=out_begin+(nItems>0?(std::size_t)nItems*sizeof(double):0);
 	const bool overlap=in_begin<out_end && out_begin<in_end;
+#if MERCURY_FIR_X86_AVX2_EXACT
 	if(fir_x86_avx2_exact_enabled() && !overlap)
 	{
 		if(nItems>0 && filter_nTaps>0)
 			fir_apply_x86_avx2_exact(in,out,nItems,filter_nTaps,filter_coefficients);
 		return;
 	}
+#endif
 
 	// Exact baseline/revert arm for A/B measurement.
 #if defined(__aarch64__)

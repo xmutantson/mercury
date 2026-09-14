@@ -3597,6 +3597,12 @@ int cl_arq_controller::add_message_control(char code)
 			messages_control.data[5]=(char)local_capability;
 			messages_control.data[6]=(char)callsign_get_ssid(my_call_sign);
 			messages_control.length=7;
+			if(t1_calibration_wire_enabled())
+			{
+				t1_calibration_encode(&messages_control.data[7], ptt_on_delay_ms,
+					0, ptt_off_delay_ms);
+				messages_control.length=12;
+			}
 			messages_control.id=0;
 		}
 		else if(code==TEST_CONNECTION_ACK)
@@ -6356,6 +6362,12 @@ void cl_arq_controller::process_messages_rx_acks_control()
 //   6. add_message_control(SET_CONFIG) (under inband: the unilateral drop + W1 tag)
 //      + connection_status=TRANSMITTING_CONTROL.
 // NO send_break_pattern, NO emergency_break_active. The caller `return`s after this.
+bool cl_arq_controller::scream_rollback_slot_eligible(int status, int length,
+	int batch_seq_id) const
+{
+	return status != FREE && length > 0 && batch_seq_id >= 0;
+}
+
 bool cl_arq_controller::inband_route_failure_demote(int demote_target, const char* reason,
 	bool pin_ceiling)
 {
@@ -6377,7 +6389,8 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	{
 		for(int i=0; i<nMessages; i++)
 		{
-			if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+			if(scream_rollback_slot_eligible(messages_tx[i].status,
+				messages_tx[i].length, messages_tx[i].batch_seq_id))
 			{
 				// A slot staged for the NEXT build carries batch_seq_id=-1.  It is
 				// pending data, not an in-flight wire generation; masking it to 255
@@ -6838,6 +6851,48 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 
 void cl_arq_controller::process_messages_rx_acks_data()
 {
+	// Watch the newest causal audio for one exact acquisition repetition. Once
+	// acquired, only the CRC-bearing compact decoder may inspect this response.
+	// With no prefix (partial/retx response), the existing reactive OFDM path is
+	// never delayed. send_batch() arms the watch only for original D5 data.
+	if(t1_cmd_capture_hold_active && !t1_cmd_prefix_acquired)
+	{
+		int rwi = 0, signal_period = 0, sym_samples = 0;
+		MUTEX_LOCK(&capture_prep_mutex);
+		rwi = telecom_system->data_container.ring_write_index;
+		sym_samples = telecom_system->data_container.Nofdm
+			* telecom_system->data_container.interpolation_rate;
+		signal_period = sym_samples
+			* telecom_system->data_container.buffer_Nsymb;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+		if(rwi != t1_cmd_capture_hold_start_rwi && signal_period > 0
+		   && sym_samples > 0)
+		{
+			const int watch_syms = 24;
+			int watch_samples = watch_syms * sym_samples;
+			if(watch_samples > signal_period) watch_samples = signal_period;
+			const int watch_offset = signal_period - watch_samples;
+			MUTEX_LOCK(&capture_prep_mutex);
+			memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
+				&telecom_system->data_container.passband_delayed_data[rwi + watch_offset],
+				(size_t)watch_samples * sizeof(double));
+			MUTEX_UNLOCK(&capture_prep_mutex);
+			t1_cmd_capture_hold_start_rwi = rwi;
+			int matched = 0;
+			double metric = telecom_system->detect_prekey_prefix_from_passband(
+				telecom_system->data_container.ready_to_process_passband_delayed_data,
+				watch_samples, &matched);
+			// Exact 5/5 plus the same strong metric floor used by the production
+			// scream token. A 5/5 bin coincidence at a weak metric must not fence
+			// a legitimate partial OFDM response.
+			if(matched == cl_mfsk::PREKEY_PREFIX_LEN && metric >= 3.0)
+			{
+				t1_cmd_prefix_acquired = true;
+				mtl::log_event_kv("t1_cmd_prefix_acquired",
+					"matched=%d metric=%.3f rwi=%d", matched, metric, rwi);
+			}
+		}
+	}
 	// Silence is the expected success signal between clean members of a
 	// negotiated block. Once this bounded window closes, transfer the legacy
 	// one-batch cache to the already-SENT journal owner and build the next BSI.
@@ -6877,6 +6932,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// partial control response.  The demotion helper restages the in-flight
 		// bytes and emits CONFIG_TAG; it owns the resulting state transition.
 		if(data_ack_received == NO && !scream_resume_pending
+		   && !t1_cmd_prefix_acquired
 		   && is_ofdm_config(current_configuration))
 		{
 			int scream_rung = -1;
@@ -6987,7 +7043,21 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						if(cmd_compact_confirm_sack_window_accept(
 							ARQ_COMPACT_CONFIRM_ENABLE != 0,
 							&v2_ack_pat_pre_detected))
+						{
 							mfsk_handled_this_poll = true;
+							if(t1_cmd_prefix_acquired)
+								mtl::log_event("t1_cmd_prefix_confirmed");
+							t1_cmd_capture_hold_active = false;
+							t1_cmd_prefix_acquired = false;
+							t1_cmd_capture_hold_samples = 0;
+						}
+						else if(t1_cmd_prefix_acquired)
+						{
+							// A real acquisition unit was received but the compact CRC
+							// is not complete/valid yet. Consume nothing and retry on
+							// later audio; timeout/retransmit remains the safe fallback.
+							mfsk_handled_this_poll = true;
+						}
 						// On a compact accept we are DONE for this poll; skip the 13-uncoded
 						// ACK+SACK decode + OFDM dispatch entirely (the compact tail is NOT a
 						// valid 5-byte [bsi||bitmap] frame, so decoding it as one only burns
@@ -9515,6 +9585,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			frame_gearshift_retry_count = 0;       // §7.13.33 reset
 		}
 
+		// Mirror the responder's post-send watermark only after this side has
+		// validated delivery of a complete clean DATA batch.
+		if(data_ack_received == YES && last_batch_fully_acked)
+			t1_data_phase_proven = true;
+
 		if(data_ack_received == YES)
 			scream_link_timeout_grace_used = false;
 
@@ -10846,6 +10921,24 @@ void cl_arq_controller::process_control_commander()
 				}
 				handshake_confirmed = true;
 				peer_capability = rsp_own;
+				int pk = -1, pd = -1, pu = -1;
+				bool t1_ldpc_calibration = messages_control.length >= 9
+					&& t1_calibration_decode(
+						&messages_control.data[4], 5, &pk, &pd, &pu);
+				if(t1_ldpc_calibration)
+				{
+					t1_peer_calibration_valid = true;
+					t1_peer_keyup_ms = pk;
+					t1_peer_deaf_ms = pd;
+					t1_peer_undeaf_ms = pu;
+				}
+				if(t1_peer_calibration_valid)
+				{
+					t1_seed_calibration_defaults();
+					printf("[T1-CALIB-WIRE] peer keyup=%d deaf=%d undeaf=%d ms; PREKEY negotiated\n",
+						t1_peer_keyup_ms, t1_peer_deaf_ms, t1_peer_undeaf_ms);
+					fflush(stdout);
+				}
 				// No SNR carried in TEST_CONNECTION_ACK — leave SNR unchanged.
 				// NB robust-preamble negotiation: the responder's own caps just
 				// arrived — flip to sidelnikov on both-support.

@@ -1282,6 +1282,11 @@ cl_arq_controller::cl_arq_controller()
 	scream_reentry_listen_timer.stop();
 	scream_reentry_listen_timer.reset();
 	scream_reentry_recovery_pending=false;
+	scream_forward_batches_delivered=0;
+	scream_empty_holdoff_armed=false;
+	scream_empty_holdoff_timer.stop();
+	scream_empty_holdoff_timer.reset();
+	scream_empty_holdoff_ms=0;
 	scream_emit_count=0;
 	scream_detect_count=0;
 	scream_presence_trip_count=0;
@@ -1455,6 +1460,22 @@ cl_arq_controller::cl_arq_controller()
 	for(int c=0; c<TT_NUM_CLASS; c++)
 		for(int b=0; b<TT_NUM_BATCHBK; b++)
 			{ tt_rtt[c][b].srtt_ms = 0; tt_rtt[c][b].rttvar_ms = 0; tt_rtt[c][b].n = 0; }
+	// T1 (zero-dead-time turnaround): reset the learned per-direction timing-term tracks in
+	// lockstep with the R6 estimator above (COLD => reactive fallback). Floor set at config load.
+	for(int d=0; d<T1_NUM_DIR; d++)
+		for(int t=0; t<T1_NUM_TERM; t++)
+			{ t1_term_est[d][t].srtt_ms = 0; t1_term_est[d][t].rttvar_ms = 0; t1_term_est[d][t].n = 0; }
+	t1_txdelay_floor_ms = 0;   // amp-safety lead floor; datalink_config sets it to ptt_on_delay_ms
+	t1_schedkey = {false, false, -1, 0, 0, 0, 0, 0, false};
+	t1_peer_calibration_valid = false;
+	t1_data_phase_proven = false;
+	t1_peer_keyup_ms = t1_peer_deaf_ms = t1_peer_undeaf_ms = -1;
+	t1_cmd_capture_hold_active = false;
+	t1_cmd_prefix_acquired = false;
+	t1_cmd_capture_hold_samples = 0;
+	t1_cmd_capture_hold_start_rwi = -1;
+	t1_schedkey_arm_count = t1_schedkey_fire_count = 0;
+	t1_schedkey_cancel_count = t1_schedkey_reject_count = 0;
 	v2_dispatch_last_rwi = -1;
 	v2_dispatch_min_advance_syms = 1;
 
@@ -2615,6 +2636,478 @@ void cl_arq_controller::update_turnaround_estimate(int cfg, int batch_airtime_ms
 		tt_class_of(cfg), tt_batchbk_of(batch_airtime_ms), e.n, e.srtt_ms, e.rttvar_ms, rtt_ms);
 	fflush(stdout);
 }
+
+// ======================= T1 ZERO-DEAD-TIME TURNAROUND MODEL =======================
+// Learned-timing model (the zero-dead-time turnaround design).
+// The four learned terms fold as RFC-6298 SRTT/RTTVAR tracks (the SAME integer estimator as
+// update_turnaround_estimate, one idiom in the file). OBSERVE-ONLY in T1a: these compute +
+// feed the [LP_SHADOW_RX] trace; the live keying instant is UNCHANGED (re-aiming is T1b).
+void cl_arq_controller::t1_reset_fresh_session_state()
+{
+	t1_data_phase_proven = false;
+	t1_peer_calibration_valid = false;
+	t1_peer_keyup_ms = -1;
+	t1_peer_deaf_ms = -1;
+	t1_peer_undeaf_ms = -1;
+}
+
+bool cl_arq_controller::t1_calib_defeat() const
+{
+	const char* e = std::getenv("MERCURY_T1_CALIB_DEFEAT");
+	return (e && e[0] && atoi(e) != 0);
+}
+
+// The ONLY writer of t1_term_est. RFC 6298 §2.2 (first sample) / §2.3 (subsequent) integer
+// fixed-point fold, identical arithmetic to update_turnaround_estimate. Guards a negative
+// sample and the index range.
+void cl_arq_controller::t1_note_term_sample(int dir, int term, int sample_ms)
+{
+	if(dir < 0 || dir >= T1_NUM_DIR || term < 0 || term >= T1_NUM_TERM) return;
+	if(sample_ms < 0) return;   // a negative latency is not a sample
+	turnaround_rtt_est &e = t1_term_est[dir][term];
+	if(e.n == 0) { e.srtt_ms = sample_ms; e.rttvar_ms = sample_ms / 2; }
+	else {
+		int err = e.srtt_ms - sample_ms; if(err < 0) err = -err;
+		e.rttvar_ms = e.rttvar_ms - (e.rttvar_ms >> 2) + (err       >> 2);
+		e.srtt_ms   = e.srtt_ms   - (e.srtt_ms   >> 3) + (sample_ms >> 3);
+	}
+	if(e.n < 1000000) e.n++;
+}
+
+// Raw SRTT (mean) of a term. COLD (n==0) or defeated => -1 (uncalibrated).
+int cl_arq_controller::t1_term_srtt_ms(int dir, int term) const
+{
+	if(dir < 0 || dir >= T1_NUM_DIR || term < 0 || term >= T1_NUM_TERM) return -1;
+	const turnaround_rtt_est &e = t1_term_est[dir][term];
+	if(e.n == 0 || t1_calib_defeat()) return -1;
+	return e.srtt_ms;
+}
+
+// Conservative high-percentile term value (the conservative-window discipline): SRTT + max(G, K*RTTVAR), so a late
+// sample never shrinks the guard below safety. COLD or defeated => -1 (uncalibrated).
+int cl_arq_controller::t1_term_ms(int dir, int term) const
+{
+	if(dir < 0 || dir >= T1_NUM_DIR || term < 0 || term >= T1_NUM_TERM) return -1;
+	const turnaround_rtt_est &e = t1_term_est[dir][term];
+	if(e.n == 0 || t1_calib_defeat()) return -1;
+	int K = 4;                               // Jacobson K (RFC 6298 §2.2); shares the R6 default
+	int var_term = K * e.rttvar_ms;
+	if(var_term < TT_CLOCK_G_MS) var_term = TT_CLOCK_G_MS;
+	return e.srtt_ms + var_term;
+}
+
+// The pre-key lead T1 acts on (the learned-timing design):
+//   lead = max(user_txdelay_floor, peer_t_keyup - own_t_deaf)   clamped >= 0
+// peer_t_keyup is the keyer's OWN keyup AS THE PEER MEASURED IT (term 1 is peer-observed but
+// belongs to the keyer, §1 table) -> the keyer-direction KEYUP (conservative high-percentile);
+// own_t_deaf is the keyer-direction DEAF (local mean). Returns T1_LEAD_REACTIVE (-1) when
+// either term is COLD/defeated -> the scheduler falls back to today's reactive turnaround
+// (the robust turnaround fallback; never worse than baseline). The max() floor is the amp-chain
+// safety lead (§5h) the scheduler can never undercut; the >=0 clamp means T1 never keys AFTER
+// the peer's listen window opens.
+int cl_arq_controller::compute_pre_key_lead(int keyer_dir) const
+{
+	int keyup = t1_term_ms(keyer_dir, T1_KEYUP);       // conservative (high) keyup
+	int deaf  = t1_term_srtt_ms(keyer_dir, T1_DEAF);   // mean deaf
+	if(keyup < 0 || deaf < 0) return T1_LEAD_REACTIVE; // uncalibrated -> reactive fallback
+	int overlap = keyup - deaf;
+	int lead = (t1_txdelay_floor_ms > overlap) ? t1_txdelay_floor_ms : overlap;
+	if(lead < 0) lead = 0;                             // never negative
+	return lead;
+}
+
+// Observe-only scheduled key instant (the scheduled-keying design): key at predictive keydown-end - lead.
+// Returns owner_keydown_end_ms UNCHANGED when uncalibrated (the reactive fallback keys no
+// earlier). COMPUTED + TRACED in T1a; it does NOT re-aim the live key (that is T1b).
+long long cl_arq_controller::t1_scheduled_key_ms(int keyer_dir, long long owner_keydown_end_ms) const
+{
+	int lead = compute_pre_key_lead(keyer_dir);
+	if(lead == T1_LEAD_REACTIVE) return owner_keydown_end_ms;  // no pre-key; reactive path unchanged
+	return owner_keydown_end_ms - (long long)lead;
+}
+
+// T1b SCHEDULED-KEYING LEVER (MERCURY_T1_SCHEDKEY). DEFAULT-OFF on-air: until the bench A/B
+// confirms the physical zero-dead-time latency win this re-aim rests off, and is driven ON only
+// in the --test harness. Once the bench fire-proof lands it ships default-on (the lever law).
+bool cl_arq_controller::t1_schedkey_enabled() const
+{
+	const char* e = std::getenv("MERCURY_T1_SCHEDKEY");
+	return (e && e[0] && atoi(e) != 0);
+}
+
+// The T1b scheduled pre-key keyup WAIT (the zero-dead-time keyup hook). Given the reverse-ACK
+// keyup site's current clock (now_ms), returns how long to wait before keying so the carrier
+// radiates at owner_keydown_end_ms - lead -- i.e. the keyup/ALC settle overlaps the transmitter's
+// sacrificial tail, and the far end's ears open into an already-settled carrier. Returns
+// T1_SCHED_REACTIVE (the caller keeps its existing reactive keyup wait -- the robust fallback of
+// §4c/§5i, never a hang, never worse than baseline) whenever ANY precondition is missing:
+//   - the A/B lever is off (MERCURY_T1_SCHEDKEY)                 -- the scheduled-keying negative control;
+//   - the batch end is not predictively known (header_carries_d5 == false: robust/no-D5 tier);
+//   - there is no valid predictive keydown-end stamp (owner_keydown_end_ms <= 0);
+//   - the direction's timing terms are COLD/defeated (compute_pre_key_lead == reactive).
+// If the target instant has just passed, return zero: the caller may key now, which is
+// no earlier than the calibrated safe instant. Stamp freshness is checked at the live
+// call site before this pure timing calculation is allowed to shorten the reactive wait.
+// Pure/read-only: it reads the learned terms + the caller-supplied clock; it NEVER writes
+// receiving_timeout (I2/I-1 invariants) and never mutates the term tracks.
+long long cl_arq_controller::t1_scheduled_keyup_wait_ms(int keyer_dir, bool header_carries_d5,
+		long long owner_keydown_end_ms, long long now_ms) const
+{
+	if(!t1_schedkey_enabled())    return T1_SCHED_REACTIVE;  // A/B lever off (negative control)
+	if(!header_carries_d5)        return T1_SCHED_REACTIVE;  // no predictive end (robust/no-D5 fallback)
+	if(owner_keydown_end_ms <= 0) return T1_SCHED_REACTIVE;  // no valid predictive stamp
+	int lead = compute_pre_key_lead(keyer_dir);
+	if(lead == T1_LEAD_REACTIVE)  return T1_SCHED_REACTIVE;  // uncalibrated -> reactive fallback
+	long long sched_wait = (owner_keydown_end_ms - (long long)lead) - now_ms;
+	if(sched_wait < 0) sched_wait = 0;                        // never schedule in the past
+	return sched_wait;
+}
+
+static const int T1_FORWARD_TAIL_REPS = 3;
+static const int T1_REVERSE_PREFIX_REPS = 5;
+static const unsigned char T1_CAL_MAGIC = 0xB7;
+
+bool cl_arq_controller::t1_calibration_wire_enabled() const
+{
+	return t1_schedkey_enabled();
+}
+
+void cl_arq_controller::t1_calibration_encode(char* p, int keyup_ms, int deaf_ms,
+	int undeaf_ms)
+{
+	auto q = [](int ms) -> unsigned char {
+		if(ms < 0) ms = 0;
+		if(ms > 1275) ms = 1275;
+		return (unsigned char)((ms + 2) / 5);
+	};
+	p[0] = (char)T1_CAL_MAGIC;
+	p[1] = (char)q(keyup_ms);
+	p[2] = (char)q(deaf_ms);
+	p[3] = (char)q(undeaf_ms);
+	p[4] = (char)CRC8_calc(p, 4);
+}
+
+bool cl_arq_controller::t1_calibration_decode(const char* p, int n, int* keyup_ms,
+	int* deaf_ms, int* undeaf_ms)
+{
+	if(!t1_calibration_wire_enabled() || p == NULL || n < 5
+	   || (unsigned char)p[0] != T1_CAL_MAGIC
+	   || (unsigned char)p[4] != (unsigned char)CRC8_calc((char*)p, 4))
+		return false;
+	if(keyup_ms)  *keyup_ms  = 5 * (unsigned char)p[1];
+	if(deaf_ms)   *deaf_ms   = 5 * (unsigned char)p[2];
+	if(undeaf_ms) *undeaf_ms = 5 * (unsigned char)p[3];
+	return true;
+}
+
+void cl_arq_controller::t1_cancel_schedkey(const char* reason)
+{
+	if(t1_cmd_capture_hold_active || t1_cmd_prefix_acquired)
+	{
+		mtl::log_event_kv("t1_cmd_prefix_watch_cancelled", "reason=%s acquired=%d",
+			reason ? reason : "unspecified", t1_cmd_prefix_acquired ? 1 : 0);
+		t1_cmd_capture_hold_active = false;
+		t1_cmd_prefix_acquired = false;
+		t1_cmd_capture_hold_samples = 0;
+		t1_cmd_capture_hold_start_rwi = -1;
+	}
+	if(!t1_schedkey.armed && !t1_schedkey.keyed) return;
+	mtl::log_event_kv("t1_schedkey_cancelled", "reason=%s bsi=%d epoch=%u keyed=%d",
+		reason ? reason : "unspecified", t1_schedkey.bsi, t1_schedkey.epoch,
+		t1_schedkey.keyed ? 1 : 0);
+	t1_schedkey_cancel_count++;
+	if(t1_schedkey.keyed)
+	{
+		ptt_off();
+		if(telecom_system != NULL)
+		{
+			telecom_system->data_container.rx_mute = 0;
+			telecom_system->data_container.rx_mute_samples = 0;
+		}
+	}
+	t1_schedkey = {false, false, -1, 0, 0, 0, 0, 0, false};
+}
+
+void cl_arq_controller::t1_arm_new_d5_frame0(int bsi, int d5_wire,
+	bool physical_retransmit)
+{
+	if(t1_schedkey.armed || t1_schedkey.keyed)
+		t1_cancel_schedkey("superseded-new-frame0");
+	const int wire_bsi = bsi & 0xFF;
+	const int span = d5_batch_span((unsigned char)d5_wire);
+	// A frame-0 decoded after any later slot is already seated is an out-of-order /
+	// retransmitted frame-0, not the predictive start of a new physical keydown.
+	// Its D5 span therefore cannot safely project a future end; reject it so a
+	// last-arriving EOB frame-0 cannot arm an idle key after batch completion.
+	bool late_frame0 = false;
+	if(messages_rx != NULL && span > 1)
+	{
+		int lim = span;
+		if(lim > nMessages) lim = nMessages;
+		for(int i=1; i<lim; i++)
+			if(messages_rx[i].status == RECEIVED || messages_rx[i].status == ACKED)
+			{
+				late_frame0 = true;
+				break;
+			}
+	}
+	const int lead = compute_pre_key_lead(T1_DIR_REV);
+	const int settle_need_ms = (t1_peer_undeaf_ms > lead)
+		? t1_peer_undeaf_ms : lead;
+	const int tail_ms = (telecom_system != NULL)
+		? (telecom_system->prekey_prefix_unit_passband_samples * T1_FORWARD_TAIL_REPS
+			* 1000 / 48000) : 375;
+	const bool fresh = lp_state.owner == LP_CMD_KEYED
+		&& lp_state.epoch == lp_make_epoch(wire_bsi)
+		&& lp_last_rx_bsi == wire_bsi
+		&& lp_state.owner_keydown_end_ms > 0;
+	const bool eligible = t1_schedkey_enabled() && t1_data_phase_proven
+		&& role == RESPONDER
+		&& link_status == CONNECTED && sack_v2_enabled && header_carries_d5
+		&& t1_peer_calibration_valid && span > 0 && !physical_retransmit
+		&& !late_frame0
+		&& !l1_blockack_data_active()
+		&& rsp_prev_batch_seq_id != wire_bsi && fresh
+		&& lead != T1_LEAD_REACTIVE && t1_peer_keyup_ms >= 0
+		&& t1_peer_deaf_ms >= 0 && t1_peer_undeaf_ms >= 0
+		&& settle_need_ms <= tail_ms;
+	if(!eligible)
+	{
+		t1_schedkey_reject_count++;
+		return;
+	}
+	t1_schedkey.armed = true;
+	t1_schedkey.keyed = false;
+	t1_schedkey.bsi = wire_bsi;
+	t1_schedkey.expected_span = span;
+	t1_schedkey.epoch = lp_state.epoch;
+	t1_schedkey.config_gen = lp_config_gen;
+	t1_schedkey.key_target_ms = lp_state.owner_keydown_end_ms - tail_ms;
+	t1_schedkey.ack_audio_not_before_ms = lp_state.owner_keydown_end_ms;
+	t1_schedkey.clean_ack_authorized = false;
+	t1_schedkey_arm_count++;
+	mtl::log_event_kv("t1_schedkey_armed",
+		"path=new-d5-frame0 bsi=%d epoch=%u span=%d target_ms=%lld owner_end_ms=%lld lead_ms=%d peer_undeaf_ms=%d tail_ms=%d",
+		wire_bsi, t1_schedkey.epoch, span, t1_schedkey.key_target_ms,
+		lp_state.owner_keydown_end_ms, lead, t1_peer_undeaf_ms, tail_ms);
+}
+
+// PREKEY clean-complete authority.  This deliberately mirrors the production
+// ACK handler's vetoes without changing delivery state: a frame-complete batch
+// is not enough.  Byte authority, app-FIFO capacity, and the delivery
+// contiguity/recoverable-PREV gate must all agree before RECEIVING may key.
+bool cl_arq_controller::t1_clean_ack_gates_pass()
+{
+	if(!t1_data_phase_proven || !t1_schedkey.armed || t1_schedkey.keyed
+	   || !t1_schedkey_enabled() || role != RESPONDER
+	   || link_status != CONNECTED
+	   || !sack_v2_enabled || !header_carries_d5
+	   || l1_blockack_data_active() || repeating_last_ack != NO
+	   || rsp_current_expected_batch_seq_id < 0
+	   || t1_schedkey.bsi != (rsp_current_expected_batch_seq_id & 0xFF))
+		return false;
+
+	const int expected = t1_schedkey.expected_span;
+	if(expected <= 0 || expected > nMessages
+	   || rx_batch_total_frames != expected)
+		return false;
+	const int eff_window = rx_effective_window(rx_batch_total_frames);
+	int received = 0;
+	for(int i=0; i<eff_window && i<nMessages; i++)
+		if(messages_rx[i].status == RECEIVED) received++;
+	if(received != expected) return false;
+
+	bool batchsize_desync_defeat = false;
+	{ const char* e = std::getenv("MERCURY_BATCHSIZE_DESYNC_DEFEAT");
+	  if(e && *e && atoi(e)!=0) batchsize_desync_defeat = true; }
+	if(!batchsize_desync_defeat
+	   && batchsize_desync_detected(rx_batch_total_frames,
+	        bprime_defeat_active() ? data_batch_size : MAX_SACK_BATCH_SIZE,
+	        sack_v2_enabled))
+		return false;
+
+	bool bytegate_defeat = false;
+	{ const char* e = std::getenv("MERCURY_W_BYTEGATE_DEFEAT");
+	  if(e && *e && atoi(e)!=0) bytegate_defeat = true; }
+	if(!bytegate_defeat
+	   && w_bytegate_shortfall(rsp_current_expected_batch_seq_id & 0xFF))
+		return false;
+
+	bool bp_defeat = false;
+	{ const char* e = std::getenv("MERCURY_RXFIFO_BACKPRESSURE_DEFEAT");
+	  if(e && *e && atoi(e)!=0) bp_defeat = true; }
+	if(!bp_defeat && fifo_buffer_rx.get_free_size() < rx_fifo_batch_need())
+		return false;
+
+	bool gap_defeat = false;
+	{ const char* e = std::getenv("MERCURY_GAP_ABORT_DEFEAT");
+	  if(e && *e && atoi(e)!=0) gap_defeat = true; }
+	if(!gap_defeat
+	   && (rsp_stream_aborted
+	       || delivery_step_is_gap(rsp_current_expected_batch_seq_id,
+	                               rsp_last_delivered_batch_seq_id,
+	                               rsp_stream_origin_gen)))
+		return false;
+
+	return true;
+}
+
+void cl_arq_controller::t1_authorize_clean_ack_if_ready()
+{
+	if(passive_monitor || t1_schedkey.clean_ack_authorized
+	   || !t1_clean_ack_gates_pass()) return;
+	const long long observed_tail_ms = lp_now();
+	t1_schedkey.clean_ack_authorized = true;
+	// Complete D5 receipt is direct evidence that the data body is over and the
+	// commander's sacrificial tail is now on the wire.  Key at this observation,
+	// and let the reverse acquisition prefix occupy the remaining tail.  The ACK
+	// itself must never inherit a later predictive wait after RX timeout.
+	t1_schedkey.key_target_ms = observed_tail_ms;
+	t1_schedkey.ack_audio_not_before_ms = observed_tail_ms;
+	mtl::log_event_kv("t1_clean_ack_authorized",
+		"bsi=%d epoch=%u observed_tail_ms=%lld complete=%d/%d",
+		t1_schedkey.bsi, t1_schedkey.epoch, observed_tail_ms,
+		t1_schedkey.expected_span, t1_schedkey.expected_span);
+}
+
+void cl_arq_controller::t1_schedkey_poll()
+{
+	if(!t1_schedkey.armed || t1_schedkey.keyed) return;
+	if(!t1_schedkey_enabled() || role != RESPONDER || link_status != CONNECTED
+	   || lp_config_gen != t1_schedkey.config_gen
+	   || lp_state.epoch != t1_schedkey.epoch
+	   || lp_last_rx_bsi != t1_schedkey.bsi)
+	{
+		t1_cancel_schedkey("freshness");
+		return;
+	}
+	// Generic RECEIVING remains forbidden.  The only exception is the explicit
+	// clean-complete authority produced after every withhold gate has passed.
+	if(connection_status != ACKNOWLEDGING_DATA
+	   && !(connection_status == RECEIVING && t1_schedkey.clean_ack_authorized))
+		return;
+	if(!t1_schedkey.clean_ack_authorized) return;
+	// Re-read all gates at the last instant before physical keying.  This closes
+	// the small interval between authorization and the next update_status poll.
+	if(!passive_monitor && !t1_clean_ack_gates_pass())
+	{
+		t1_cancel_schedkey("clean-authorization-revoked");
+		return;
+	}
+	if(lp_now() < t1_schedkey.key_target_ms) return;
+	const int expected = t1_schedkey.expected_span;
+	if(expected <= 0 || rx_batch_total_frames != expected)
+	{
+		t1_cancel_schedkey("missing-span");
+		return;
+	}
+	int received = 0;
+	for(int i = 0; i < expected; i++)
+		if(messages_rx[i].status == RECEIVED) received++;
+	if(received != expected)
+	{
+		t1_cancel_schedkey("partial-at-target");
+		return;
+	}
+
+	t1_schedkey.armed = false;
+	t1_schedkey.keyed = true;
+	t1_schedkey_fire_count++;
+	mtl::log_event_kv("t1_schedkey_fired",
+		"bsi=%d epoch=%u now_ms=%lld target_ms=%lld complete=%d/%d",
+		t1_schedkey.bsi, t1_schedkey.epoch, lp_now(),
+		t1_schedkey.key_target_ms, received, expected);
+	if(telecom_system == NULL || passive_monitor) return;
+	telecom_system->data_container.rx_mute = 1;
+	ptt_on();
+	cl_timer keyup;
+	keyup.start();
+	ptt_busy_wait(keyup, ptt_on_delay_ms);
+	const int samples = telecom_system->prekey_prefix_unit_passband_samples
+		* T1_REVERSE_PREFIX_REPS;
+	if(samples > 0)
+	{
+		std::vector<double> prefix((size_t)samples, 0.0);
+		int written = telecom_system->generate_prekey_prefix_passband(
+			prefix.data(), T1_REVERSE_PREFIX_REPS);
+		if(written != samples)
+		{
+			t1_cancel_schedkey("prefix-generate-fail");
+			return;
+		}
+		tx_transfer(prefix.data(), (size_t)written);
+		if(!drain_playback_wait())
+		{
+			t1_cancel_schedkey("prefix-drain-fail");
+			return;
+		}
+	}
+}
+
+bool cl_arq_controller::t1_take_prekey_for_ack(int target_bsi)
+{
+	if(!t1_schedkey.keyed || !t1_schedkey_enabled()
+	   || t1_schedkey.bsi != (target_bsi & 0xFF)
+	   || t1_schedkey.config_gen != lp_config_gen)
+		return false;
+	if(lp_now() < t1_schedkey.ack_audio_not_before_ms)
+		pumped_settle_wait((int)(t1_schedkey.ack_audio_not_before_ms - lp_now()));
+	t1_schedkey = {false, false, -1, 0, 0, 0, 0, 0, false};
+	return true;
+}
+
+int cl_arq_controller::d2_listener_rearm_guard_ms() const
+{
+	return ptt_off_delay_ms + ptt_on_delay_ms;
+}
+// Forward decl: the shared link-phase turn-trace flag (its definition is later in this file),
+// used below only to gate the one-line calibration-seed witness print.
+bool arq_turn_trace_on();
+// CONNECT-TIME CALIBRATION BOOTSTRAP (SPEC T1 s2/s3): the missing producer that WARMS the
+// learned timing terms. Until this existed t1_note_term_sample had no production caller, so every
+// live link stayed COLD -> compute_pre_key_lead returned T1_LEAD_REACTIVE -> the scheduled pre-key
+// (MERCURY_T1_SCHEDKEY) was INERT. At the connect-accept (and opportunistically per turnaround) we
+// fold sane LOCAL priors into the per-direction term tracks THROUGH t1_note_term_sample (which
+// remains the only writer of t1_term_est): KEYUP <- ptt_on_delay_ms (the configured TX-delay, the
+// local prior for own/peer key-up), DEAF <- 0 (RX mute is near-instant on this class of link; the
+// measured baseline), UNDEAF <- ptt_off_delay_ms. Folding several identical samples converges
+// RTTVAR toward 0 so the conservative window settles at SRTT + clock-G and the pre-key lead settles
+// at max(txdelay_floor, keyup_win - deaf) -- i.e. the user's amp-safety floor, never below it (the
+// umbrella guarantee: degrade gracefully to today's timing, never below). This is PURELY LOCAL
+// arithmetic run AFTER link_status becomes CONNECTED. The separately CRC-protected handshake tuple
+// gates activation and supplies the peer receive-switch terms; this local seed supplies the keyer's
+// own configured relay/ALC prior. With the
+// MERCURY_T1_SCHEDKEY lever off the keying path reads none of these terms, so seeding is
+// wire-byte-identical when the lever is off.
+void cl_arq_controller::t1_seed_calibration_defaults()
+{
+	if(!t1_schedkey_enabled()) return;
+	static const int T1_SEED_FOLDS = 40;   // converge RTTVAR -> ~0 so the window settles at SRTT + clock-G
+	int keyup_prior  = ptt_on_delay_ms;    // local prior for key-cmd -> carrier radiating (the configured TX-delay)
+	int deaf_prior   = 0;                   // RX mute is near-instant on this class of link (anatomy baseline)
+	int undeaf_prior = ptt_off_delay_ms;   // unkey -> RX usable again (the configured PTT-off delay)
+	if(keyup_prior  < 0) keyup_prior  = 0;
+	if(undeaf_prior < 0) undeaf_prior = 0;
+	for(int d = 0; d < T1_NUM_DIR; d++)
+	{
+		for(int i = 0; i < T1_SEED_FOLDS; i++)
+		{
+			t1_note_term_sample(d, T1_KEYUP,  keyup_prior);
+			t1_note_term_sample(d, T1_DEAF,   deaf_prior);
+			t1_note_term_sample(d, T1_UNDEAF, undeaf_prior);
+		}
+	}
+	if(arq_turn_trace_on())
+	{
+		printf("[T1-CALIB-SEED] warmed learned terms: keyup_prior=%d deaf_prior=%d undeaf_prior=%d "
+			"floor=%d -> lead_rev=%d lead_fwd=%d (local seed; peer calibration negotiated separately)\n",
+			keyup_prior, deaf_prior, undeaf_prior, t1_txdelay_floor_ms,
+			compute_pre_key_lead(T1_DIR_REV), compute_pre_key_lead(T1_DIR_FWD));
+		fflush(stdout);
+	}
+}
+
+// ===================== end T1 ZERO-DEAD-TIME TURNAROUND MODEL =====================
 
 void cl_arq_controller::calculate_receiving_timeout()
 {
@@ -3806,6 +4299,7 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 
 	ptt_on_delay_ms=default_configuration_ARQ.ptt_on_delay_ms;
 	ptt_off_delay_ms=default_configuration_ARQ.ptt_off_delay_ms;
+	t1_txdelay_floor_ms = ptt_on_delay_ms;  // T1 amp-safety lead floor = the hot-switch TX-delay
 	pilot_tone_ms=default_configuration_ARQ.pilot_tone_ms;
 	pilot_tone_hz=default_configuration_ARQ.pilot_tone_hz;
 	switch_role_timeout=default_configuration_ARQ.switch_role_timeout_ms;
@@ -4063,6 +4557,21 @@ int cl_arq_controller::scream_rung_to_config(int current_cfg, int rung) const
 	return FULL_CONFIG_LADDER[dst];
 }
 
+int cl_arq_controller::scream_trigger_holdoff_for_timeout(int timeout_ms) const
+{
+	int holdoff = timeout_ms / 4;
+	if(holdoff < 1000) holdoff = 1000;
+	if(holdoff > 8000) holdoff = 8000;
+	return holdoff;
+}
+
+bool cl_arq_controller::scream_trigger_policy_ready(int delivered_batches,
+	bool holdoff_armed, int elapsed_ms, int holdoff_ms) const
+{
+	return delivered_batches >= 3 && holdoff_armed
+		&& holdoff_ms >= 1000 && elapsed_ms >= holdoff_ms;
+}
+
 int cl_arq_controller::scream_choose_rung() const
 {
 	// Deterministic fire-proof override; production normally derives the request
@@ -4116,6 +4625,37 @@ int cl_arq_controller::test_scream_rung_map()
 	printf("[TEST-SCREAM-MAP] %s invalid current fails closed\n",
 		invalid_pass ? "PASS" : "FAIL");
 	if(!invalid_pass) failures++;
+	struct policy_case {
+		int delivered; bool armed; int elapsed; int holdoff; bool emit;
+	} policy[] = {
+		{0, true, 60000, 6595, false},
+		{2, true, 60000, 6595, false},
+		{3, false, 60000, 6595, false},
+		{3, true, 6594, 6595, false},
+		{3, true, 6595, 6595, true}
+	};
+	for(size_t i=0; i<sizeof(policy)/sizeof(policy[0]); i++)
+	{
+		bool got = scream_trigger_policy_ready(policy[i].delivered,
+			policy[i].armed, policy[i].elapsed, policy[i].holdoff);
+		bool pass = got == policy[i].emit;
+		printf("[TEST-SCREAM-POLICY] %s delivered=%d armed=%d elapsed=%d holdoff=%d emit=%d\n",
+			pass ? "PASS" : "FAIL", policy[i].delivered,
+			policy[i].armed ? 1 : 0, policy[i].elapsed,
+			policy[i].holdoff, got ? 1 : 0);
+		if(!pass) failures++;
+	}
+	bool scaling_pass = scream_trigger_holdoff_for_timeout(2000) == 1000
+		&& scream_trigger_holdoff_for_timeout(26380) == 6595
+		&& scream_trigger_holdoff_for_timeout(50000) == 8000;
+	printf("[TEST-SCREAM-POLICY] %s hardware-scaled holdoff clamp\n",
+		scaling_pass ? "PASS" : "FAIL");
+	if(!scaling_pass) failures++;
+	bool rollback_pass = !scream_rollback_slot_eligible(PENDING_ACK, 12, -1)
+		&& scream_rollback_slot_eligible(PENDING_ACK, 12, 2);
+	printf("[TEST-SCREAM-RESUME] %s staged bsi=-1 ignored; aired bsi=2 eligible\n",
+		rollback_pass ? "PASS" : "FAIL");
+	if(!rollback_pass) failures++;
 	return failures;
 }
 
@@ -7822,6 +8362,10 @@ bool cl_arq_controller::rx_ctrl_received_watchdog_expired(int status, int counti
 
 void cl_arq_controller::update_status()
 {
+	// PREKEY is armed by a CRC-good new-D5 frame 0 and polled from the ordinary
+	// ARQ tick.  Keeping the timer here makes it independently cancellable; no
+	// post-receive ACK wait owns or creates the schedule.
+	t1_schedkey_poll();
 	for(int i=0;i<nMessages;i++)
 	{
 		if(messages_tx[i].status==PENDING_ACK && messages_tx[i].ack_timer.get_elapsed_time_ms()>=messages_tx[i].ack_timeout)
@@ -8286,11 +8830,12 @@ void cl_arq_controller::update_status()
 			fifo_buffer_backup.flush();
 
 		}
-		else if(original_role==RESPONDER)
-		{
-			set_role(RESPONDER);
-			link_status=CONNECTED;
-			connection_status=RECEIVING;
+			else if(original_role==RESPONDER)
+			{
+				set_role(RESPONDER);
+				link_status=CONNECTED;
+				t1_cancel_schedkey("responder-watchdog-transition");
+				connection_status=RECEIVING;
 
 			for(int i=0;i<nMessages;i++)
 			{
@@ -8385,15 +8930,16 @@ void cl_arq_controller::update_status()
 					connection_status=TRANSMITTING_DATA;
 				}
 			}
-			else if(this->role==RESPONDER)
-			{
-				for(int i=0;i<nMessages;i++)
+				else if(this->role==RESPONDER)
 				{
-					messages_rx[i].status=FREE;
-				}
+					for(int i=0;i<nMessages;i++)
+					{
+						messages_rx[i].status=FREE;
+					}
 
-				connection_status=RECEIVING;
-			}
+					t1_cancel_schedkey("responder-gearshift-transition");
+					connection_status=RECEIVING;
+				}
 
 		}
 		else if(gear_shift_algorithm==SUCCESS_BASED_LADDER)
@@ -8470,15 +9016,16 @@ void cl_arq_controller::update_status()
 
 				connection_status=TRANSMITTING_DATA;
 			}
-			else if(this->role==RESPONDER)
-			{
-				for(int i=0;i<nMessages;i++)
+				else if(this->role==RESPONDER)
 				{
-					messages_rx[i].status=FREE;
-				}
+					for(int i=0;i<nMessages;i++)
+					{
+						messages_rx[i].status=FREE;
+					}
 
-				connection_status=RECEIVING;
-			}
+					t1_cancel_schedkey("responder-gearshift-transition");
+					connection_status=RECEIVING;
+				}
 		}
 	}
 
@@ -8487,9 +9034,10 @@ void cl_arq_controller::update_status()
 		switch_role_test_timer.stop();
 		switch_role_test_timer.reset();
 
-		set_role(RESPONDER);
-		this->link_status=CONNECTED;
-		this->connection_status=RECEIVING;
+			set_role(RESPONDER);
+			this->link_status=CONNECTED;
+			t1_cancel_schedkey("responder-switch-role-test-transition");
+			this->connection_status=RECEIVING;
 
 		this->messages_control.ack_timeout=0;
 		this->messages_control.id=0;
@@ -8953,6 +9501,12 @@ void cl_arq_controller::process_user_command(std::string command)
 	}
 	else if(command.substr(0,8)=="CONNECT ")
 	{
+		// An explicit CONNECT starts a new commander session even when no teardown
+		// path ran first.  Drop peer-bound PREKEY authority before changing role or
+		// starting the handshake; session B must earn both its own clean-DATA proof
+		// and its own calibration tuple.  The later connect-accept block is not a
+		// second session boundary and must not erase evidence learned by this handshake.
+		t1_reset_fresh_session_state();
 		command=command.substr(8,std::string::npos);
 		this->my_call_sign=command.substr(0,command.find(" "));
 		this->destination_call_sign=command.substr(my_call_sign.length()+1);
@@ -9704,6 +10258,11 @@ void cl_arq_controller::reset_session_state()
 	scream_link_timeout_grace_used = false;
 	scream_reentry_listen_armed = false;
 	scream_reentry_recovery_pending = false;
+	scream_forward_batches_delivered = 0;
+	scream_empty_holdoff_armed = false;
+	scream_empty_holdoff_timer.stop();
+	scream_empty_holdoff_timer.reset();
+	scream_empty_holdoff_ms = 0;
 	if(l1_tx_journal.enabled() && !l1_terminalize_queued("session-teardown-cancel"))
 	{
 		fprintf(stderr, "[L1-JOURNAL] terminal owner refused reset transfer; aborting before discard\n");
@@ -10026,6 +10585,11 @@ void cl_arq_controller::reset_session_state()
 	commander_configured_nb = -1;
 	session_narrowband = false;
 	peer_capability = 0;
+	t1_reset_fresh_session_state();
+	t1_cmd_capture_hold_active = false;
+	t1_cmd_prefix_acquired = false;
+	t1_cmd_capture_hold_samples = 0;
+	t1_cmd_capture_hold_start_rwi = -1;
 	l1_blockack.reset_session();
 	wb_upgrade_pending = false;
 	handshake_confirmed = false;  // v9
@@ -13024,6 +13588,571 @@ int cl_arq_controller::test_measured_timers()
 	return pass ? 0 : 1;
 }
 
+// T1 ZERO-DEAD-TIME TURNAROUND learned-timing model regression (the turnaround-timing regression). Drives the REAL
+// t1_note_term_sample() + compute_pre_key_lead() + t1_scheduled_key_ms() on a throwaway
+// controller (no IONOS/RF/telecom_system). fail-before/pass-after: the calibrated pre-key lead
+// appears ONLY when the terms are WARM; under MERCURY_T1_CALIB_DEFEAT (or COLD) the model
+// yields the reactive sentinel (no pre-key) -> the §4c robust fallback. SIM proves the LOGIC
+// (convergence, lead arithmetic, amp-safety floor, >=0 clamp, fallback); the PHYSICAL keyup/
+// deaf magnitudes are bench-owed (a bench measurement).
+// CONNECT-TIME CALIBRATION BOOTSTRAP regression (the missing-producer fire-proof). Drives the
+// REAL t1_seed_calibration_defaults() -- the production connect-accept bootstrap -- on a throwaway
+// controller and proves the INERT->LIVE flip: BEFORE the bootstrap every term is COLD so
+// compute_pre_key_lead returns the reactive sentinel and t1_scheduled_keyup_wait_ms is INERT (the
+// pre-T1c state); AFTER the bootstrap the lead is warm (== the amp-safety floor window) and the
+// scheduled pre-key FIRES. A distinct defeat arm (MERCURY_T1_CALIB_DEFEAT) forces COLD even
+// post-seed. Expected values are re-derived from the SAME accessors (no magic numbers).
+int cl_arq_controller::test_t1_calib_bootstrap()
+{
+	printf("[TEST-T1-CALIB-BOOTSTRAP] start\n"); fflush(stdout);
+	int fails = 0;
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	unsetenv("MERCURY_T1_SCHEDKEY");
+
+	// Production-like config: the bootstrap reads ptt_on/off_delay_ms; the floor = ptt_on_delay_ms.
+	for(int d=0; d<T1_NUM_DIR; d++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d][t].srtt_ms = 0; t1_term_est[d][t].rttvar_ms = 0; t1_term_est[d][t].n = 0; }
+	ptt_on_delay_ms  = 100;
+	ptt_off_delay_ms = 200;
+	t1_txdelay_floor_ms = ptt_on_delay_ms;
+
+	// Arm A (FAIL-BEFORE = the pre-T1c inert state): no production caller -> every term COLD ->
+	// compute_pre_key_lead reactive AND the scheduled pre-key inert (the reactive wait is unchanged).
+	t1_seed_calibration_defaults();
+	long long end_ms = 100000, now_ms = 99000;
+	int lead_cold_rev = compute_pre_key_lead(T1_DIR_REV);
+	int lead_cold_fwd = compute_pre_key_lead(T1_DIR_FWD);
+	setenv("MERCURY_T1_SCHEDKEY", "1", 1);
+	long long sched_cold = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	unsetenv("MERCURY_T1_SCHEDKEY");
+	printf("[TEST-T1-CALIB-BOOTSTRAP] Arm A (cold/inert): lead_rev=%d lead_fwd=%d (want %d) sched=%lld (want %d reactive)\n",
+		lead_cold_rev, lead_cold_fwd, T1_LEAD_REACTIVE, sched_cold, T1_SCHED_REACTIVE);
+	if(lead_cold_rev != T1_LEAD_REACTIVE) { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm A FAIL (rev warm before bootstrap)\n"); fails++; }
+	if(lead_cold_fwd != T1_LEAD_REACTIVE) { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm A FAIL (fwd warm before bootstrap)\n"); fails++; }
+	if(sched_cold != T1_SCHED_REACTIVE)   { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm A FAIL (scheduled pre-key fired uncalibrated)\n"); fails++; }
+
+	// Arm B (PASS-AFTER): the PRODUCTION bootstrap warms both directions off the reactive sentinel.
+	setenv("MERCURY_T1_SCHEDKEY", "1", 1);
+	t1_seed_calibration_defaults();
+	int lead_warm_rev = compute_pre_key_lead(T1_DIR_REV);
+	int lead_warm_fwd = compute_pre_key_lead(T1_DIR_FWD);
+	int keyup_win = t1_term_ms(T1_DIR_REV, T1_KEYUP);
+	int deaf_mean = t1_term_srtt_ms(T1_DIR_REV, T1_DEAF);
+	int overlap   = keyup_win - deaf_mean;
+	int exp_lead  = (t1_txdelay_floor_ms > overlap) ? t1_txdelay_floor_ms : overlap; if(exp_lead < 0) exp_lead = 0;
+	printf("[TEST-T1-CALIB-BOOTSTRAP] Arm B (warm): lead_rev=%d lead_fwd=%d (want %d = max(floor %d, keyup_win %d - deaf %d))\n",
+		lead_warm_rev, lead_warm_fwd, exp_lead, t1_txdelay_floor_ms, keyup_win, deaf_mean);
+	if(lead_warm_rev == T1_LEAD_REACTIVE) { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm B FAIL (rev still reactive after bootstrap)\n"); fails++; }
+	if(lead_warm_fwd == T1_LEAD_REACTIVE) { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm B FAIL (fwd still reactive after bootstrap)\n"); fails++; }
+	if(lead_warm_rev != exp_lead)         { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm B FAIL (lead != re-derived expectation)\n"); fails++; }
+	if(lead_warm_rev <= 0)                { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm B FAIL (no calibrated lead)\n"); fails++; }
+
+	// Arm C (the INERT->LIVE flip, the whole point): lever armed + warm + D5 -> the scheduled
+	// pre-key NOW fires at exactly (end - lead) - now (it returned the reactive sentinel in Arm A).
+	long long want_wait = (end_ms - (long long)lead_warm_rev) - now_ms;
+	long long sched_warm = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	printf("[TEST-T1-CALIB-BOOTSTRAP] Arm C (fires): wait=%lld (want %lld = end-lead-now) [was %d reactive pre-bootstrap]\n",
+		sched_warm, want_wait, T1_SCHED_REACTIVE);
+	if(sched_warm == T1_SCHED_REACTIVE) { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm C FAIL (scheduled pre-key still inert after bootstrap)\n"); fails++; }
+	if(sched_warm != want_wait)         { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm C FAIL (wait != end-lead-now)\n"); fails++; }
+	unsetenv("MERCURY_T1_SCHEDKEY");
+
+	// Arm D (DEFEAT, distinct fail-before): MERCURY_T1_CALIB_DEFEAT forces every term COLD even
+	// after the bootstrap -> the calibrated lead DISAPPEARS -> reactive fallback; clearing it restores.
+	setenv("MERCURY_T1_CALIB_DEFEAT", "1", 1);
+	int lead_defeat = compute_pre_key_lead(T1_DIR_REV);
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	int lead_restored = compute_pre_key_lead(T1_DIR_REV);
+	printf("[TEST-T1-CALIB-BOOTSTRAP] Arm D (defeat): defeat=%d (want %d reactive) restored=%d (want ==warm %d)\n",
+		lead_defeat, T1_LEAD_REACTIVE, lead_restored, lead_warm_rev);
+	if(lead_defeat != T1_LEAD_REACTIVE) { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm D FAIL (defeat not reactive)\n"); fails++; }
+	if(lead_restored != lead_warm_rev)  { printf("[TEST-T1-CALIB-BOOTSTRAP] Arm D FAIL (lead not restored after defeat cleared)\n"); fails++; }
+
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	unsetenv("MERCURY_T1_SCHEDKEY");
+	bool pass = (fails == 0);
+	printf("[TEST-T1-CALIB-BOOTSTRAP] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+int cl_arq_controller::test_t1_calibration()
+{
+	printf("[TEST-T1-CALIB] start\n"); fflush(stdout);
+	int fails = 0;
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+
+	// Fresh model, amp-safety floor = 100 ms (the production default = ptt_on_delay_ms).
+	for(int d=0; d<T1_NUM_DIR; d++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d][t].srtt_ms = 0; t1_term_est[d][t].rttvar_ms = 0; t1_term_est[d][t].n = 0; }
+	t1_txdelay_floor_ms = 100;
+
+	// Arm A (COLD fallback): no samples => every needed term COLD => reactive sentinel.
+	int lead_cold = compute_pre_key_lead(T1_DIR_REV);
+	long long end_ms = 100000;
+	long long sched_cold = t1_scheduled_key_ms(T1_DIR_REV, end_ms);
+	printf("[TEST-T1-CALIB] Arm A (cold): lead=%d (want %d) sched=%lld (want %lld, no pre-key)\n",
+		lead_cold, T1_LEAD_REACTIVE, sched_cold, end_ms);
+	if(lead_cold != T1_LEAD_REACTIVE) { printf("[TEST-T1-CALIB] Arm A FAIL (cold not reactive)\n"); fails++; }
+	if(sched_cold != end_ms)          { printf("[TEST-T1-CALIB] Arm A FAIL (cold re-aimed the key)\n"); fails++; }
+
+	// Arm B (convergence to injected truth): fold KEYUP=150 (REV, peer-observed) and DEAF=40
+	// (REV, local). After the first sample srtt=R, rttvar=R/2 (RFC 6298 §2.2); repeated identical
+	// samples drive srtt to the injected value and rttvar -> 0 (§2.3). 41 folds each.
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 150);
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_DEAF,  40);
+	int keyup_srtt = t1_term_srtt_ms(T1_DIR_REV, T1_KEYUP);
+	int deaf_srtt  = t1_term_srtt_ms(T1_DIR_REV, T1_DEAF);
+	printf("[TEST-T1-CALIB] Arm B (converge): keyup_srtt=%d (want 150) deaf_srtt=%d (want 40)\n",
+		keyup_srtt, deaf_srtt);
+	if(keyup_srtt != 150) { printf("[TEST-T1-CALIB] Arm B FAIL (keyup !converge 150)\n"); fails++; }
+	if(deaf_srtt  != 40)  { printf("[TEST-T1-CALIB] Arm B FAIL (deaf !converge 40)\n"); fails++; }
+
+	// Arm C (conservative high-percentile window, the conservative-window discipline): the KEYUP term used for the lead
+	// is SRTT + max(G,K*RTTVAR) >= mean, never below the clock-G guard.
+	int keyup_win = t1_term_ms(T1_DIR_REV, T1_KEYUP);
+	printf("[TEST-T1-CALIB] Arm C (window): keyup_win=%d (want >=150 and win-srtt>=%d)\n",
+		keyup_win, TT_CLOCK_G_MS);
+	if(!(keyup_win >= keyup_srtt && (keyup_win - keyup_srtt) >= TT_CLOCK_G_MS))
+		{ printf("[TEST-T1-CALIB] Arm C FAIL (window not conservative)\n"); fails++; }
+
+	// Arm D (lead arithmetic + scheduled offset): lead = max(floor, keyup_win - deaf_srtt),
+	// clamped >=0; scheduled key = end - lead. Re-derive the expected value from the SAME
+	// accessors so the assertion is exact and not a fragile magic number.
+	int overlap   = keyup_win - deaf_srtt;
+	int exp_lead  = (100 > overlap) ? 100 : overlap; if(exp_lead < 0) exp_lead = 0;
+	int got_lead  = compute_pre_key_lead(T1_DIR_REV);
+	long long got_sched = t1_scheduled_key_ms(T1_DIR_REV, end_ms);
+	printf("[TEST-T1-CALIB] Arm D (lead): overlap=%d lead=%d (want %d) sched=%lld (want %lld)\n",
+		overlap, got_lead, exp_lead, got_sched, end_ms - (long long)exp_lead);
+	if(got_lead != exp_lead)                   { printf("[TEST-T1-CALIB] Arm D FAIL (lead arithmetic)\n"); fails++; }
+	if(got_sched != end_ms - (long long)exp_lead) { printf("[TEST-T1-CALIB] Arm D FAIL (scheduled offset)\n"); fails++; }
+	if(got_lead == T1_LEAD_REACTIVE)           { printf("[TEST-T1-CALIB] Arm D FAIL (warm still reactive)\n"); fails++; }
+
+	// Arm E (amp-safety floor dominates, §5h): a narrow overlap (keyup-deaf < floor) must be
+	// lifted to the user floor. KEYUP=110, DEAF=90 => overlap ~20 < 100 => lead == floor 100.
+	for(int d2=0; d2<T1_NUM_DIR; d2++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d2][t].srtt_ms = 0; t1_term_est[d2][t].rttvar_ms = 0; t1_term_est[d2][t].n = 0; }
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_FWD, T1_KEYUP, 110);
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_FWD, T1_DEAF,  90);
+	int lead_floor = compute_pre_key_lead(T1_DIR_FWD);
+	printf("[TEST-T1-CALIB] Arm E (floor): lead=%d (want 100, floor dominates)\n", lead_floor);
+	if(lead_floor != 100) { printf("[TEST-T1-CALIB] Arm E FAIL (floor not honored)\n"); fails++; }
+
+	// Arm F (>=0 clamp with floor 0): keyup < deaf must never yield a negative lead.
+	for(int d2=0; d2<T1_NUM_DIR; d2++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d2][t].srtt_ms = 0; t1_term_est[d2][t].rttvar_ms = 0; t1_term_est[d2][t].n = 0; }
+	t1_txdelay_floor_ms = 0;
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 30);
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_DEAF,  90);
+	int lead_clamp = compute_pre_key_lead(T1_DIR_REV);
+	printf("[TEST-T1-CALIB] Arm F (clamp): lead=%d (want 0, never negative)\n", lead_clamp);
+	if(lead_clamp != 0) { printf("[TEST-T1-CALIB] Arm F FAIL (negative lead not clamped)\n"); fails++; }
+
+	// Arm G (DEFEAT = fail-before): with warm terms AND floor 100, MERCURY_T1_CALIB_DEFEAT=1
+	// forces every term COLD, so the calibrated lead DISAPPEARS (reactive sentinel) and the key
+	// is NOT re-aimed. This is the fail-before arm: the calibrated pre-key only exists after
+	// calibration. pass-after (defeat cleared) restores the calibrated lead distinctly.
+	t1_txdelay_floor_ms = 100;
+	for(int d2=0; d2<T1_NUM_DIR; d2++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d2][t].srtt_ms = 0; t1_term_est[d2][t].rttvar_ms = 0; t1_term_est[d2][t].n = 0; }
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 150);
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_DEAF,  40);
+	int lead_warm2 = compute_pre_key_lead(T1_DIR_REV);
+	setenv("MERCURY_T1_CALIB_DEFEAT", "1", 1);
+	int lead_defeat = compute_pre_key_lead(T1_DIR_REV);
+	long long sched_defeat = t1_scheduled_key_ms(T1_DIR_REV, end_ms);
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	int lead_after = compute_pre_key_lead(T1_DIR_REV);
+	printf("[TEST-T1-CALIB] Arm G: warm=%d defeat=%d (want %d, reactive) sched_defeat=%lld (want %lld) after=%d (want ==warm)\n",
+		lead_warm2, lead_defeat, T1_LEAD_REACTIVE, sched_defeat, end_ms, lead_after);
+	if(lead_defeat != T1_LEAD_REACTIVE) { printf("[TEST-T1-CALIB] Arm G fail-before FAIL (defeat not reactive)\n"); fails++; }
+	if(lead_warm2 == T1_LEAD_REACTIVE || lead_warm2 <= 0) { printf("[TEST-T1-CALIB] Arm G FAIL (warm has no calibrated lead)\n"); fails++; }
+	if(sched_defeat != end_ms) { printf("[TEST-T1-CALIB] Arm G fail-before FAIL (defeat re-aimed the key)\n"); fails++; }
+	if(lead_after != lead_warm2) { printf("[TEST-T1-CALIB] Arm G pass-after FAIL (lead not restored)\n"); fails++; }
+
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	bool pass = (fails == 0);
+	printf("[TEST-T1-CALIB] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+// T1b SCHEDULED-KEYING regression (the scheduled-keying negative control + fail-before/pass-after).
+// Drives the REAL t1_scheduled_keyup_wait_ms() -- the SAME function the reverse-ACK keyup site in
+// send_ack_pattern calls -- on a throwaway controller (no IONOS/RF/telecom_system). Proves: the
+// scheduled pre-key re-aims the keyup to EXACTLY owner_keydown_end_ms-lead ONLY when the lever is
+// armed AND the batch end is predictively known (header_carries_d5) AND the terms are WARM; with
+// the lever off (the negative control), or no-D5, or COLD terms, or no predictive stamp, the
+// function yields the reactive sentinel and the keyup wait is UNCHANGED (the robust fallback,
+// never a hang, never worse than baseline). SIM proves the DECISION LOGIC; the PHYSICAL latency
+// win is bench-owed (the terms stay COLD on the full-duplex loopback path -- a bench measurement).
+int cl_arq_controller::test_t1_schedkey()
+{
+	printf("[TEST-T1-SCHEDKEY] start\n"); fflush(stdout);
+	int fails = 0;
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	unsetenv("MERCURY_T1_SCHEDKEY");
+
+	// Warm the REV terms: KEYUP=150 (peer-observed), DEAF=40 (local); amp-safety floor 100.
+	for(int d=0; d<T1_NUM_DIR; d++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d][t].srtt_ms = 0; t1_term_est[d][t].rttvar_ms = 0; t1_term_est[d][t].n = 0; }
+	t1_txdelay_floor_ms = 100;
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 150);
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_DEAF,  40);
+	int lead = compute_pre_key_lead(T1_DIR_REV);
+	long long end_ms = 100000, now_ms = 99000;   // "now" is 1000 ms before the predictive batch end
+
+	// Arm 1 (lever OFF = the negative control): warm + D5 but MERCURY_T1_SCHEDKEY unset =>
+	// reactive sentinel => the keyup wait is NOT re-aimed (the gate is honored).
+	long long off_d5 = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	printf("[TEST-T1-SCHEDKEY] Arm 1 (lever off): wait=%lld (want %d reactive)\n", off_d5, T1_SCHED_REACTIVE);
+	if(off_d5 != T1_SCHED_REACTIVE) { printf("[TEST-T1-SCHEDKEY] Arm 1 FAIL (fired with lever off)\n"); fails++; }
+
+	setenv("MERCURY_T1_SCHEDKEY", "1", 1);   // arm the lever for the remaining arms
+
+	// Arm 2 (armed + warm + D5): the re-aim fires at EXACTLY (end - lead) - now.
+	long long want2 = (end_ms - (long long)lead) - now_ms;
+	long long on_d5 = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	printf("[TEST-T1-SCHEDKEY] Arm 2 (armed warm D5): wait=%lld (want %lld = end-lead-now, lead=%d)\n", on_d5, want2, lead);
+	if(on_d5 != want2)             { printf("[TEST-T1-SCHEDKEY] Arm 2 FAIL (not end-lead-now)\n"); fails++; }
+	if(on_d5 == T1_SCHED_REACTIVE) { printf("[TEST-T1-SCHEDKEY] Arm 2 FAIL (armed still reactive)\n"); fails++; }
+
+	// Arm 3 (armed + warm + NO D5 = robust fallback, §4c): reactive sentinel (no pre-key on a no-D5 batch).
+	long long on_nod5 = t1_scheduled_keyup_wait_ms(T1_DIR_REV, false, end_ms, now_ms);
+	printf("[TEST-T1-SCHEDKEY] Arm 3 (no-D5 robust fallback): wait=%lld (want %d reactive)\n", on_nod5, T1_SCHED_REACTIVE);
+	if(on_nod5 != T1_SCHED_REACTIVE) { printf("[TEST-T1-SCHEDKEY] Arm 3 FAIL (pre-keyed a no-D5 batch)\n"); fails++; }
+
+	// Arm 4 (armed + D5 + COLD terms = uncalibrated fallback): reactive sentinel (never pre-key uncalibrated).
+	for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[T1_DIR_REV][t].srtt_ms = 0; t1_term_est[T1_DIR_REV][t].rttvar_ms = 0; t1_term_est[T1_DIR_REV][t].n = 0; }
+	long long on_cold = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	printf("[TEST-T1-SCHEDKEY] Arm 4 (cold uncalibrated): wait=%lld (want %d reactive)\n", on_cold, T1_SCHED_REACTIVE);
+	if(on_cold != T1_SCHED_REACTIVE) { printf("[TEST-T1-SCHEDKEY] Arm 4 FAIL (pre-keyed an uncalibrated link)\n"); fails++; }
+
+	// Re-warm for the clamp / invalid-stamp / defeat arms.
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 150);
+	for(int i=0;i<41;i++) t1_note_term_sample(T1_DIR_REV, T1_DEAF,  40);
+
+	// Arm 5 (just-missed target): clamp to key-now. The live caller separately proves that
+	// the predictive stamp belongs to the active received batch before accepting this value.
+	long long on_past = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, end_ms + 5000);
+	printf("[TEST-T1-SCHEDKEY] Arm 5 (past target clamp): wait=%lld (want 0 key-now)\n", on_past);
+	if(on_past != 0) { printf("[TEST-T1-SCHEDKEY] Arm 5 FAIL (past target did not clamp)\n"); fails++; }
+
+	// Arm 6 (invalid predictive stamp): owner_keydown_end_ms <= 0 => reactive sentinel.
+	long long on_nostamp = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, 0, now_ms);
+	printf("[TEST-T1-SCHEDKEY] Arm 6 (no stamp): wait=%lld (want %d reactive)\n", on_nostamp, T1_SCHED_REACTIVE);
+	if(on_nostamp != T1_SCHED_REACTIVE) { printf("[TEST-T1-SCHEDKEY] Arm 6 FAIL (pre-keyed with no stamp)\n"); fails++; }
+
+	// Arm 7 (DEFEAT = fail-before/pass-after): armed+warm fires; MERCURY_T1_CALIB_DEFEAT forces the
+	// terms COLD so the scheduled re-aim DISAPPEARS (reactive); cleared, it restores distinctly.
+	long long before = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	setenv("MERCURY_T1_CALIB_DEFEAT", "1", 1);
+	long long during = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	long long after = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, end_ms, now_ms);
+	printf("[TEST-T1-SCHEDKEY] Arm 7 (defeat): before=%lld during=%lld (want %d) after=%lld (want ==before)\n",
+		before, during, T1_SCHED_REACTIVE, after);
+	if(during != T1_SCHED_REACTIVE) { printf("[TEST-T1-SCHEDKEY] Arm 7 fail-before FAIL (defeat still fired)\n"); fails++; }
+	if(before == T1_SCHED_REACTIVE) { printf("[TEST-T1-SCHEDKEY] Arm 7 FAIL (warm not firing)\n"); fails++; }
+	if(after != before)             { printf("[TEST-T1-SCHEDKEY] Arm 7 pass-after FAIL (lead not restored)\n"); fails++; }
+
+	unsetenv("MERCURY_T1_SCHEDKEY");
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	bool pass = (fails == 0);
+	printf("[TEST-T1-SCHEDKEY] %s: fails=%d\n", pass ? "PASS" : "FAIL", fails);
+	fflush(stdout);
+	return pass ? 0 : 1;
+}
+
+int cl_arq_controller::test_t1_schedkey_lifecycle()
+{
+	printf("[TEST-T1-LIFECYCLE] start\n");
+	int fails = 0;
+	auto check = [&](bool ok, const char* name) {
+		printf("[TEST-T1-LIFECYCLE] %s: %s\n", ok ? "PASS" : "FAIL", name);
+		if(!ok) fails++;
+	};
+	setenv("MERCURY_T1_SCHEDKEY", "1", 1);
+	role = RESPONDER;
+	link_status = CONNECTED;
+	sack_v2_enabled = true;
+	header_carries_d5 = true;
+	t1_peer_calibration_valid = true;
+	t1_peer_keyup_ms = 100;
+	t1_peer_deaf_ms = 0;
+	t1_peer_undeaf_ms = 150;
+	t1_data_phase_proven = false;
+	rsp_prev_batch_seq_id = -1;
+	t1_txdelay_floor_ms = 100;
+	for(int d=0; d<T1_NUM_DIR; d++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d][t].srtt_ms=0; t1_term_est[d][t].rttvar_ms=0; t1_term_est[d][t].n=0; }
+	for(int i=0; i<41; i++) {
+		t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 100);
+		t1_note_term_sample(T1_DIR_REV, T1_DEAF, 0);
+	}
+
+	lp_last_rx_bsi = 7;
+	lp_state.owner = LP_CMD_KEYED;
+	lp_state.epoch = lp_make_epoch(7);
+	lp_state.owner_keydown_end_ms = lp_now() + 5000;
+	long a0=t1_schedkey_arm_count, r0=t1_schedkey_reject_count;
+	t1_arm_new_d5_frame0(7, 10, false);
+	check(!t1_schedkey.armed && t1_schedkey_arm_count == a0,
+		"establishment/first-turn gate arms 0 before clean DATA progress");
+	t1_data_phase_proven = true;
+	r0 = t1_schedkey_reject_count;
+	t1_arm_new_d5_frame0(7, 10, false);
+	check(t1_schedkey.armed && t1_schedkey_arm_count == a0+1,
+		"CRC-good NEW-D5 frame-0 arms on the production decision path (count > 0)");
+	t1_cancel_schedkey("unit-cleanup");
+
+	lp_last_rx_bsi = 8; lp_state.epoch = lp_make_epoch(7);
+	t1_arm_new_d5_frame0(8, 10, false);
+	check(!t1_schedkey.armed && t1_schedkey_reject_count == r0+1,
+		"wrong epoch arms 0");
+	lp_last_rx_bsi = 8; lp_state.epoch = lp_make_epoch(8);
+	t1_arm_new_d5_frame0(7, 10, false);
+	check(!t1_schedkey.armed, "wrong BSI arms 0");
+	lp_last_rx_bsi = 7; lp_state.epoch = lp_make_epoch(7);
+	t1_arm_new_d5_frame0(7, 10, true);
+	check(!t1_schedkey.armed, "physical retransmit arms 0 (reactive-only contract)");
+
+	// Drive the scheduler itself across its target with a complete authoritative span.
+	// Passive-monitor suppresses radio I/O; the state transition and freshness checks are
+	// the same production poll executed by update_status().
+	int saved_rx_span = rx_batch_total_frames;
+	bool saved_monitor = passive_monitor;
+	st_message* saved_messages_rx = messages_rx;
+	std::vector<st_message> complete_span(10);
+	for(int i=0; i<10; i++) complete_span[(size_t)i].status = FREE;
+	messages_rx = complete_span.data();
+	int saved_batch_size = data_batch_size;
+	rx_batch_total_frames = -1;
+	passive_monitor = true;
+	connection_status = ACKNOWLEDGING_DATA;
+	data_batch_size = 10;
+	rsp_current_expected_batch_seq_id = 7;
+	rsp_last_delivered_batch_seq_id = 6;
+	rsp_prev_batch_active = false;
+	rsp_stream_aborted = false;
+	rsp_stream_origin_gen = -1;
+	lp_last_rx_bsi=7; lp_state.owner=LP_CMD_KEYED;
+	lp_state.epoch=lp_make_epoch(7); lp_state.owner_keydown_end_ms=lp_now()+375;
+	long f0=t1_schedkey_fire_count;
+	t1_arm_new_d5_frame0(7, 10, false);
+	for(int i=0; i<10; i++) complete_span[(size_t)i].status = RECEIVED;
+	rx_batch_total_frames = 10;
+	// The scheduler must not treat generic RECEIVING/ACKNOWLEDGING state as
+	// authority.  This unit isolates the scheduler transition; the real-handler
+	// safety battery below drives the production clean-gate producer.
+	t1_schedkey.clean_ack_authorized = true;
+	t1_schedkey_poll();
+	check(t1_schedkey.keyed && t1_schedkey_fire_count==f0+1,
+		"complete clean span fires at the scheduled sacrificial-tail boundary");
+	t1_cancel_schedkey("unit-fire-cleanup");
+	passive_monitor = saved_monitor;
+	data_batch_size = saved_batch_size;
+	rx_batch_total_frames = saved_rx_span;
+	messages_rx = saved_messages_rx;
+
+	const char* reasons[] = {"crc-decode-fail", "partial-ack-gate", "config-change",
+		"break", "drop"};
+	for(const char* reason : reasons)
+	{
+		lp_last_rx_bsi=7; lp_state.owner=LP_CMD_KEYED;
+		lp_state.epoch=lp_make_epoch(7); lp_state.owner_keydown_end_ms=lp_now()+5000;
+		t1_arm_new_d5_frame0(7, 10, false);
+		long c0=t1_schedkey_cancel_count;
+		t1_cancel_schedkey(reason);
+		check(!t1_schedkey.armed && !t1_schedkey.keyed
+			&& t1_schedkey_cancel_count==c0+1, reason);
+	}
+
+	char cal[5]; int k=-1,d=-1,u=-1;
+	t1_calibration_encode(cal, 125, 35, 205);
+	check(t1_calibration_decode(cal, 5, &k, &d, &u)
+		&& k==125 && d==35 && u==205,
+		"CRC8-protected keyup/deaf/undeaf calibration exchange round-trips");
+	cal[2] ^= 1;
+	check(!t1_calibration_decode(cal, 5, &k, &d, &u),
+		"calibration CRC failure rejects negotiation");
+
+	uint64_t legacy_conn = 0, prekey_conn = 0;
+	pack_test_conn_payload(&legacy_conn, 9, 0x3f, 7);
+	prekey_conn = legacy_conn;
+	pack_t1_calibration_reserved(&prekey_conn, 25, 41);
+	uint8_t compact_k = 0, compact_u = 0;
+	check((legacy_conn & ((1ULL << 18) - 1ULL)) == 0
+		&& (legacy_conn >> 18) == (prekey_conn >> 18),
+		"default-off MFSK TEST payload is unchanged and PREKEY only uses reserved bits");
+	check(unpack_t1_calibration_reserved(prekey_conn, &compact_k, &compact_u)
+		&& compact_k == 25 && compact_u == 41
+		&& !unpack_t1_calibration_reserved(legacy_conn, &compact_k, &compact_u),
+		"CRC12-covered compact handshake calibration round-trips; zero is absent");
+
+	// D2 is a separate retransmit/listener safety floor.  PREKEY never accepts a
+	// retransmit above, and no lifecycle function is passed this value or may alter it.
+	int saved_ptt_on = ptt_on_delay_ms, saved_ptt_off = ptt_off_delay_ms;
+	ptt_on_delay_ms = 150; ptt_off_delay_ms = 150;
+	const int d2_guard_ms = d2_listener_rearm_guard_ms();
+	long long past = t1_scheduled_keyup_wait_ms(T1_DIR_REV, true, 1000, 2000);
+	const int d2_after_ms = d2_listener_rearm_guard_ms();
+	ptt_on_delay_ms = saved_ptt_on; ptt_off_delay_ms = saved_ptt_off;
+	check(past == 0 && d2_guard_ms == 300 && d2_after_ms == d2_guard_ms,
+		"past-target clamps to key-now without deleting the independent D2 300ms guard");
+
+	unsetenv("MERCURY_T1_SCHEDKEY");
+	printf("[TEST-T1-LIFECYCLE] %s: arms=%ld rejects=%ld cancels=%ld fails=%d\n",
+		fails ? "FAIL" : "PASS", t1_schedkey_arm_count,
+		t1_schedkey_reject_count, t1_schedkey_cancel_count, fails);
+	return fails ? 1 : 0;
+}
+
+// Regression for the explicit-CONNECT session boundary.  Session A has already
+// proved DATA and learned a peer tuple.  Starting session B through the real user
+// command path must revoke both before a legacy/zero-reserved peer can decline to
+// overwrite them.  Even after B's first ordinary clean turnaround publishes its
+// proof, absent calibration keeps the production arming predicate ineligible.
+int cl_arq_controller::test_t1_fresh_connect_reset()
+{
+	printf("[TEST-T1-FRESH-CONNECT] start\n");
+	int fails = 0;
+	auto check = [&](bool ok, const char* name) {
+		printf("[TEST-T1-FRESH-CONNECT] %s: %s\n", ok ? "PASS" : "FAIL", name);
+		if(!ok) fails++;
+	};
+
+	setenv("MERCURY_T1_SCHEDKEY", "1", 1);
+	// Session A: completed clean DATA and learned a usable calibration tuple.
+	t1_data_phase_proven = true;
+	t1_peer_calibration_valid = true;
+	t1_peer_keyup_ms = 100;
+	t1_peer_deaf_ms = 0;
+	t1_peer_undeaf_ms = 150;
+	// Keep the local predictor warm across CONNECT, as production does.  This
+	// isolates the regression to leaked peer authority: without the boundary
+	// reset, session B would have every other prerequisite needed to arm.
+	t1_txdelay_floor_ms = 100;
+	for(int d=0; d<T1_NUM_DIR; d++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d][t].srtt_ms=0; t1_term_est[d][t].rttvar_ms=0; t1_term_est[d][t].n=0; }
+	for(int i=0; i<41; i++)
+	{
+		t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 100);
+		t1_note_term_sample(T1_DIR_REV, T1_DEAF, 0);
+	}
+
+	// Production new-session entry.  This is the path which previously skipped
+	// reset_session_state() and leaked all five values into session B.
+	process_user_command("CONNECT TESTA TESTB");
+	check(link_status == CONNECTING,
+		"explicit CONNECT starts session B");
+	check(!t1_data_phase_proven && !t1_peer_calibration_valid
+		&& t1_peer_keyup_ms == -1 && t1_peer_deaf_ms == -1
+		&& t1_peer_undeaf_ms == -1,
+		"session B starts with no inherited proof or peer calibration tuple");
+
+	// Model the production strict-presence branch for a legacy/default-OFF peer:
+	// an all-zero reserved field is absent and therefore does not write a tuple.
+	uint64_t legacy = 0;
+	uint8_t keyup_q5 = 0, undeaf_q5 = 0;
+	bool calibration_present =
+		unpack_t1_calibration_reserved(legacy, &keyup_q5, &undeaf_q5);
+	if(calibration_present)
+	{
+		t1_peer_keyup_ms = 5 * (int)keyup_q5;
+		t1_peer_deaf_ms = 0;
+		t1_peer_undeaf_ms = 5 * (int)undeaf_q5;
+		t1_peer_calibration_valid = true;
+	}
+	check(!calibration_present && !t1_peer_calibration_valid,
+		"zero-reserved session-B handshake leaves calibration absent");
+
+	// The first ordinary clean turnaround may publish B's proof, but PREKEY must
+	// remain ineligible because B still has no peer tuple.
+	role = RESPONDER;
+	link_status = CONNECTED;
+	sack_v2_enabled = true;
+	header_carries_d5 = true;
+	t1_data_phase_proven = true;
+	rsp_prev_batch_seq_id = -1;
+	lp_last_rx_bsi = 9;
+	lp_state.owner = LP_CMD_KEYED;
+	lp_state.epoch = lp_make_epoch(9);
+	lp_state.owner_keydown_end_ms = lp_now() + 5000;
+	t1_arm_new_d5_frame0(9, 10, false);
+	check(!t1_schedkey.armed,
+		"first clean DATA turnaround cannot arm PREKEY without session-B calibration");
+
+	unsetenv("MERCURY_T1_SCHEDKEY");
+	printf("[TEST-T1-FRESH-CONNECT] %s: fails=%d\n",
+		fails ? "FAIL" : "PASS", fails);
+	return fails ? 1 : 0;
+}
+
+int cl_arq_controller::test_t1_repeating_prefix()
+{
+	printf("[TEST-T1-PREFIX] start\n");
+	int fails = 0;
+	cl_mfsk m;
+	m.init(16, 50, 1);
+	const int reps = 4, L = cl_mfsk::PREKEY_PREFIX_LEN;
+	std::vector<std::complex<double>> v((size_t)reps * L * 50);
+	m.generate_prekey_prefix(v.data(), reps);
+	for(int r=0; r<reps; r++) for(int s=0; s<L; s++)
+	{
+		int active=-1, count=0;
+		for(int k=0; k<50; k++) if(std::norm(v[(r*L+s)*50+k]) > 0.0)
+			{ active=k; count++; }
+		int want=m.stream_offsets[0]
+			+ (m.prekey_prefix_tones[s] + s*m.tone_hop_step) % m.M;
+		if(count != 1 || active != want) fails++;
+	}
+	int worst=0;
+	for(int rung=0; rung<cl_mfsk::SCREAM_NBASES; rung++) for(int shift=0; shift<8; shift++)
+	{
+		int same=0;
+		for(int s=0; s<L; s++)
+			if(m.prekey_prefix_tones[s] == m.scream_tones[rung][(s+shift)%8]) same++;
+		if(same>worst) worst=same;
+	}
+	if(worst >= 4) fails++;
+
+	// Exercise the production passband generator and the production commander
+	// discriminator, including a negative-control ACK waveform. CRC remains the
+	// final authority, but the prefix gate must acquire every repetition and must
+	// not fence an ordinary reactive ACK/SACK response.
+	cl_telecom_system ts;
+	ts.operation_mode = ARQ_MODE;
+	ts.load_configuration(CONFIG_9);
+	const int unit_samples = ts.prekey_prefix_unit_passband_samples;
+	std::vector<double> wire((size_t)unit_samples * reps, 0.0);
+	int written = ts.generate_prekey_prefix_passband(wire.data(), reps);
+	int detector_locks = 0;
+	for(int r=0; r<reps; r++)
+	{
+		int matched = 0;
+		double metric = ts.detect_prekey_prefix_from_passband(
+			&wire[(size_t)r * unit_samples], unit_samples, &matched);
+		if(matched == L && metric >= 3.0) detector_locks++;
+	}
+	int ack_samples = ts.ack_pattern_passband_samples;
+	std::vector<double> ack((size_t)ack_samples, 0.0);
+	ts.generate_ack_pattern_passband(ack.data());
+	int ack_matched = 0;
+	double ack_metric = ts.detect_prekey_prefix_from_passband(
+		ack.data(), ack_samples, &ack_matched);
+	if(written != unit_samples * reps || detector_locks != reps
+	   || (ack_matched == L && ack_metric >= 3.0)) fails++;
+	printf("[TEST-T1-PREFIX] %s: base={7,2,3,13,11} reps=%d tone_locks=%d/%d "
+		"passband_locks=%d/%d ack_false_lock=%d metric=%.3f "
+		"worst_scream_coincidence=%d/5 (<4 required)\n",
+		fails ? "FAIL" : "PASS", reps, reps, reps, detector_locks, reps,
+		(ack_matched == L && ack_metric >= 3.0) ? 1 : 0, ack_metric, worst);
+	return fails ? 1 : 0;
+}
+
 // KARN DISCRIMINATOR classifier A/B (MERCURY_KARN_RETX_ONLY). Drives the REAL production
 // gate tt_karn_sample_ok() + the REAL fold update_turnaround_estimate() — the SAME two
 // calls the reverse-ACK accept sites (arq_commander.cc) make. The classifier decoupling
@@ -13226,6 +14355,7 @@ uint32_t cl_arq_controller::lp_make_epoch(int bsi) const
 
 void cl_arq_controller::lp_reset()
 {
+	t1_cancel_schedkey("reset-drop");
 	lp_state.owner                = LP_NONE;
 	lp_state.owner_keydown_end_ms = 0;
 	lp_state.next_listen_open_ms  = 0;
@@ -13305,28 +14435,66 @@ void cl_arq_controller::lp_note_keydown_end(int bsi, int frames_region_len, int 
 	}
 }
 
-// RX frame-0 D5 acquire of a NEW bsi. owner -> CMD_KEYED; derive the CMD's keydown length
-// arithmetically from the wired batch geometry (rx_effective_window(D5) frames through the SAME
-// schedule the TX drives) — the RX has no samples. Logs the RX-derived keydown length per bsi
+// RX frame-0 D5 acquire of a NEW bsi. owner -> CMD_KEYED; derive the commander's remaining
+// keydown arithmetically from the wired span and the seated frame's live capture geometry. Logs it
 // for the shadow-agreement join. rx_effective_window returns data_batch_size on a short final
 // batch, so the RX derivation is the DESIGNED-conservative over-wait there (never SHORTER).
-void cl_arq_controller::lp_note_rx_frame0(int bsi, int d5_wire)
+void cl_arq_controller::lp_note_rx_frame0(int bsi, int d5_wire,
+	int remaining_frame_ms)
 {
+	// SPEC T1 s3 per-cycle EWMA refinement: every enabled batch<->ACK turnaround is a zero-cost timing
+	// sample. The RSP reverse-ACK keyer (T1_DIR_REV) re-folds its local PTT priors here so the
+	// learned terms stay WARM and track a mid-session change to the configured TX-delay. Physical
+	// ALC/relay drift remains bench-observable; the CRC-protected peer tuple gates activation.
+	// This is also the backstop that guarantees REV is warm before THIS cycle's send_ack_pattern
+	// pre-key decision, independent of which connect path established the link. Wire-byte-identical
+	// when MERCURY_T1_SCHEDKEY is unset (the keying path never reads these terms with the lever off).
+	if(t1_schedkey_enabled())
+	{
+		int keyup_prior = (ptt_on_delay_ms > 0) ? ptt_on_delay_ms : 0;
+		t1_note_term_sample(T1_DIR_REV, T1_KEYUP, keyup_prior);
+		t1_note_term_sample(T1_DIR_REV, T1_DEAF,  0);
+	}
 	int eff_window = rx_effective_window(d5_wire);
 	int rx_kd_ms   = derive_keydown_length_ms(eff_window, /*force_full=*/false);
+	// The production call is made after frame 0 has decoded. remaining_frame_ms is signed:
+	// positive means frame-0 audio is still arriving; negative means later batch audio is already
+	// in the capture window. Add that signed boundary distance to frames 1..N-1. Ignoring either
+	// the decoded frame or captured-ahead audio predicts past the sacrificial tail and silently
+	// turns scheduled keying back into reactive turnaround. Legacy callers and every default-off
+	// path retain the original full-span model.
+	if(t1_schedkey_enabled())
+	{
+		int future_ms = rx_kd_ms - message_transmission_time_ms;
+		if(future_ms < 0) future_ms = 0;
+		rx_kd_ms = remaining_frame_ms + future_ms;
+		if(rx_kd_ms < 0) rx_kd_ms = 0;
+	}
+	int t1_tail_ms = 0;
+	if(t1_schedkey_enabled() && t1_peer_calibration_valid && telecom_system != NULL)
+		t1_tail_ms = telecom_system->prekey_prefix_unit_passband_samples
+			* T1_FORWARD_TAIL_REPS * 1000 / 48000;
 	lp_state.owner                = LP_CMD_KEYED;
 	lp_keydown_start_ms           = 0;
 	lp_keydown_start_token        = 0;
 	lp_state.keydown_end_token    = 0;
-	lp_state.owner_keydown_end_ms = lp_now() + rx_kd_ms;
+	lp_state.owner_keydown_end_ms = lp_now() + rx_kd_ms + t1_tail_ms;
 	lp_state.next_listen_open_ms  = 0;
 	lp_state.epoch                = lp_make_epoch(bsi);
+	t1_arm_new_d5_frame0(bsi, d5_wire, rx_buffer_retx_turn_tail);
 	if(arq_turn_trace_on())
 	{
+		// The RSP pre-keys the reverse ACK, so the keyer direction is T1_DIR_REV. Trace the
+		// learned lead and the independently scheduled instant beside the predictive endpoint.
+		int t1_lead = compute_pre_key_lead(T1_DIR_REV);
+		long long t1_key_ms = t1_scheduled_key_ms(T1_DIR_REV, lp_state.owner_keydown_end_ms);
 		printf("[LP_SHADOW_RX] bsi=%d d5=%d eff_window=%d data_batch_size=%d "
-			"rx_kd_ms=%d owner_keydown_end_ms=%lld epoch=%u\n",
-			bsi, d5_wire, eff_window, data_batch_size, rx_kd_ms,
-			lp_state.owner_keydown_end_ms, lp_state.epoch);
+			"rx_kd_ms=%d frame0_remaining_ms=%d owner_keydown_end_ms=%lld epoch=%u "
+			"t1_keyup_rev=%d t1_deaf_rev=%d t1_lead_ms=%d t1_sched_key_ms=%lld t1_reactive=%d\n",
+			bsi, d5_wire, eff_window, data_batch_size, rx_kd_ms, remaining_frame_ms,
+			lp_state.owner_keydown_end_ms, lp_state.epoch,
+			t1_term_ms(T1_DIR_REV, T1_KEYUP), t1_term_ms(T1_DIR_REV, T1_DEAF),
+			t1_lead, t1_key_ms, (t1_lead == T1_LEAD_REACTIVE) ? 1 : 0);
 		fflush(stdout);
 	}
 }
@@ -13348,6 +14516,7 @@ void cl_arq_controller::lp_note_ack_decoded()
 
 void cl_arq_controller::lp_note_break(int bsi)
 {
+	t1_cancel_schedkey("break");
 	if(lp_keydown_generation != UINT64_MAX)
 		lp_keydown_generation++;
 	lp_state.owner = LP_CMD_KEYED;
@@ -13426,6 +14595,7 @@ bool cl_arq_controller::lp_note_break_recovery(int bsi)
 
 bool cl_arq_controller::lp_note_config_switch()
 {
+	t1_cancel_schedkey("config-change");
 	const uint32_t next_config_gen = lp_config_gen + 1u;
 	if(linkphase_config_contract_enabled_common()
 	   && !lp_config_contract.observe_transition(
@@ -15031,6 +16201,41 @@ void cl_arq_controller::send_batch()
 		tx_transfer(&batch_frames_output_data_filtered2[frame_pack_off[i]], frame_len[i]);
 	}
 
+	// Negotiated PREKEY wire tail.  It is emitted only after every original DATA
+	// sample and never on a selective retransmit.  The responder may therefore
+	// become deaf anywhere in this interval without losing a payload/codeword.
+	// Three independently acquirable five-symbol repetitions are the explicit
+	// sacrificial overlap contract; default-off and unnegotiated peers emit zero
+	// samples here.
+	int t1_forward_tail_samples = 0;
+	bool t1_data_batch = message_batch_counter_tx > 0;
+	for(int i=0; i<message_batch_counter_tx && t1_data_batch; i++)
+		t1_data_batch = messages_batch_tx[i].type == DATA_LONG
+			|| messages_batch_tx[i].type == DATA_SHORT;
+	if(t1_schedkey_enabled() && t1_data_phase_proven
+	   && t1_peer_calibration_valid && t1_data_batch
+	   && is_ofdm_config(current_configuration) && header_carries_d5
+	   && !sack_retransmit_active && !l1_blockack_data_active())
+	{
+		t1_forward_tail_samples = telecom_system->prekey_prefix_unit_passband_samples
+			* T1_FORWARD_TAIL_REPS;
+		if(t1_forward_tail_samples > 0)
+		{
+			std::vector<double> tail((size_t)t1_forward_tail_samples, 0.0);
+			int written = telecom_system->generate_prekey_prefix_passband(
+				tail.data(), T1_FORWARD_TAIL_REPS);
+			if(written == t1_forward_tail_samples)
+			{
+				tx_transfer(tail.data(), (size_t)written);
+				mtl::log_event_kv("t1_prefix_tail_tx",
+					"bsi=%d reps=%d samples=%d",
+					messages_batch_tx[0].batch_seq_id,
+					T1_FORWARD_TAIL_REPS, written);
+			}
+			else t1_forward_tail_samples = 0;
+		}
+	}
+
 	if(g_verbose) { printf("[TX] Waiting for playback buffer to drain...\n"); fflush(stdout); }
 	// wait buffer to be played
 	drain_playback_wait();
@@ -15051,7 +16256,8 @@ void cl_arq_controller::send_batch()
 	// return). frames_region_len is the sample-exact emitted-DATA length of this keydown.
 	lp_note_keydown_end(
 		message_batch_counter_tx > 0 ? messages_batch_tx[0].batch_seq_id : cmd_batch_seq_id,
-		frames_region_len, message_batch_counter_tx, batch_force_full);
+		frames_region_len + t1_forward_tail_samples,
+		message_batch_counter_tx, batch_force_full);
 
 	// MERCURY_TURN_TRACE (measure-only, off by default): snapshot the sample-exact
 	// self_keydown_end here — frames_region_len = Sum(frame_len[i]) is the exact
@@ -15061,12 +16267,13 @@ void cl_arq_controller::send_batch()
 	// unless MERCURY_TURN_TRACE=1. Reads only.
 	if(turn_trace_on())
 		arq_turn_trace_capture_keydown(
-			(long long)frames_region_len, message_batch_counter_tx,
+			(long long)(frames_region_len + t1_forward_tail_samples), message_batch_counter_tx,
 			(message_batch_counter_tx>0 ? messages_batch_tx[0].batch_seq_id : -1),
 			header_carries_d5 ? 1 : 0, sack_retransmit_active ? 1 : 0,
 			message_transmission_time_ms, time_left_to_send_last_frame,
 			ptt_off_delay_ms, RSP_DECODE_MARGIN_MS, ack_pattern_time_ms, ptt_on_delay_ms,
-			derive_keydown_length_ms(message_batch_counter_tx, batch_force_full));
+			derive_keydown_length_ms(message_batch_counter_tx, batch_force_full)
+				+ t1_forward_tail_samples * 1000 / 48000);
 
 	// Unmute + flush right after playback drain (before ptt_off_delay).
 	// During TX, rx_mute=1 kept self-echo out of the ring.
@@ -15085,6 +16292,43 @@ void cl_arq_controller::send_batch()
 		telecom_system->data_container.start_ack_causal_ring_generation = 0;
 		telecom_system->data_container.start_ack_causal_ring_samples = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
+	}
+	// The negotiated reverse prefix starts while this transmitter is still on
+	// its sacrificial forward tail. Arm a causal-ring prefix watch at the reset;
+	// exact acquisition selects the CRC-bearing compact decoder. The retained
+	// prefix+confirm budget is diagnostic only: a response with no prefix (the
+	// partial/retransmit case) remains immediately eligible for reactive OFDM.
+	t1_cmd_capture_hold_active = false;
+	t1_cmd_prefix_acquired = false;
+	t1_cmd_capture_hold_samples = 0;
+	t1_cmd_capture_hold_start_rwi = -1;
+	if(role == COMMANDER && t1_data_phase_proven && t1_forward_tail_samples > 0
+	   && !sack_retransmit_active && t1_peer_calibration_valid)
+	{
+		const int reverse_prefix_samples =
+			telecom_system->prekey_prefix_unit_passband_samples
+			* T1_REVERSE_PREFIX_REPS;
+		int ack_nsymb = telecom_system->ack_mfsk.compact_confirm_pattern_nsymb();
+		if(topgear_elect_feature_enabled()
+		   && (current_configuration == CONFIG_16
+		       || current_configuration == CONFIG_17))
+			ack_nsymb += telecom_system->ack_mfsk.compact_confirm_suffix_len();
+		const int symbol_samples = telecom_system->data_container.Nofdm
+			* telecom_system->data_container.interpolation_rate;
+		if(reverse_prefix_samples > 0 && ack_nsymb > 0 && symbol_samples > 0)
+		{
+			// Record the full post-reset prefix+confirm budget for trace review.
+			// At the shipped WB geometry this is 51 symbols, far below the retained
+			// 163-symbol ring. Decoder selection itself is driven only by exact
+			// prefix acquisition, never by expiration of this nominal budget.
+			t1_cmd_capture_hold_samples = reverse_prefix_samples
+				+ ack_nsymb * symbol_samples;
+			t1_cmd_capture_hold_active = true;
+			mtl::log_event_kv("t1_cmd_prefix_watch_armed",
+				"retained_budget=%d prefix=%d ack_nsymb=%d peer_keyup_ms=%d",
+				t1_cmd_capture_hold_samples, reverse_prefix_samples,
+				ack_nsymb, t1_peer_keyup_ms);
+		}
 	}
 	// M2 (SACK turnaround trace): post-TX capture ring reset complete, rx still
 	// muted. The M2 -> cmd_post_tx_unmute delta is the CMD-side dead window
@@ -15187,6 +16431,7 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 	if(passive_monitor) return;
 	cl_timer ack_turnaround_timer;
 	ack_turnaround_timer.start();
+	const bool t1_prekeyed = !control_ack && t1_take_prekey_for_ack(lp_last_rx_bsi);
 
 	// RECOVERY-ACK robustness (recovery-ack-robustness.md §4): for a BREAK-recovery
 	// / control-ACK turnaround, emit the ACK base block RECOVERY_ACK_REPS times so
@@ -15216,7 +16461,7 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 	// Total commander TX: ptt_on_delay + pilot + OFDM frame + ptt_off_delay.
 	// We see the preamble in audio (after ptt_on_delay + pilot), so remaining
 	// channel time = remaining OFDM symbols + ptt_off_delay + ptt_on_delay.
-	if(is_ofdm_config(current_configuration))
+	if(is_ofdm_config(current_configuration) && !t1_prekeyed)
 	{
 		int interp = telecom_system->data_container.interpolation_rate;
 		int sym_samples = telecom_system->data_container.Nofdm * interp;
@@ -15242,13 +16487,13 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 			pumped_settle_wait(wait_ms);  // §5.7-B1: virtual-clock-ify (same exit predicate); verbatim msleep on production
 		}
 	}
-	else
+	else if(!t1_prekeyed)
 	{
 		// MFSK: frame is fully captured before decode, but the commander's
 		// radio still needs PTT-off + TX→RX hardware switching time.
 		// Without this, the ACK fires ~10ms after decode — before the
 		// commander has switched to RX.
-		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
+		int wait_ms = d2_listener_rearm_guard_ms();
 		printf("[TX-ACK-PAT] MFSK guard %dms (ptt_off=%d, ptt_on=%d)\n",
 			wait_ms, ptt_off_delay_ms, ptt_on_delay_ms);
 		fflush(stdout);
@@ -15256,7 +16501,7 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 	}
 
 	printf("[TX-ACK-PAT] Guard done at t=%dms\n", (int)ack_turnaround_timer.get_elapsed_time_ms()); fflush(stdout);
-	ptt_on();
+	if(!t1_prekeyed) ptt_on();
 
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
 	ptt_on_delay_timer.start();
@@ -15288,10 +16533,10 @@ void cl_arq_controller::send_ack_pattern(bool control_ack)
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
 	// Wait PTT on delay
-	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
+	if(!t1_prekeyed) ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
 	// Pilot tone (if enabled)
-	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
+	if(!t1_prekeyed && pilot_tone_ms > 0 && pilot_tone_hz > 0)
 	{
 		const double SAMPLE_RATE = 48000.0;
 		const double PILOT_FREQ = (double)pilot_tone_hz;
@@ -15542,7 +16787,7 @@ void cl_arq_controller::send_ack_pattern_with_snr(float snr)
 	// Guard delay for MFSK modes (same as send_ack_pattern)
 	if(is_robust_config(current_configuration))
 	{
-		int wait_ms = ptt_off_delay_ms + ptt_on_delay_ms;
+		int wait_ms = d2_listener_rearm_guard_ms();
 		pumped_settle_wait(wait_ms);  // §5.7-B2: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
@@ -16516,10 +17761,6 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 	int nsymb = telecom_system->ack_mfsk.ack_sack_pattern_nsymb();
 	if(nsymb <= 0 || telecom_system->ack_sack_pattern_passband_samples <= 0)
 		return 0;
-	// LINK-PHASE PRIMITIVE (increment 1): the RSP is committing to key its reverse ACK here ->
-	// owner RSP_KEYED. Write-only; no consumer reads it.
-	lp_note_rsp_key();
-
 	auto t_start = std::chrono::steady_clock::now();
 
 	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
@@ -16545,6 +17786,8 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 	// shared-state discipline, same as ack_suffix_fec_coded).
 	bool this_ack_is_retx_turnaround = ack_tx_retx_turnaround;
 	ack_tx_retx_turnaround = false;
+	const bool t1_prekeyed = !this_ack_is_retx_turnaround
+		&& t1_take_prekey_for_ack(target_batch_seq_id);
 
 	// Guard delay for MFSK modes (same as send_ack_pattern_with_snr).
 	// WALL-B FIX-9 D2 (FIX9_ROOTCAUSE.md §4 D2, FIX9_D2_DESIGN.md §3.2): the pre-TX settle ALSO
@@ -16575,10 +17818,14 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 			wait_ms, is_robust_config(current_configuration) ? 1 : 0,
 			ofdm_settle ? 1 : 0, current_configuration);
 		fflush(stdout);
-		pumped_settle_wait(wait_ms);  // §5.7-B3: virtual-clock-ify (same exit predicate); verbatim msleep on production
+		if(wait_ms > 0)
+			pumped_settle_wait(wait_ms);  // §5.7-B3: virtual-clock-ify (same exit predicate); verbatim msleep on production
 	}
 
-	ptt_on();
+	// LINK-PHASE PRIMITIVE (increment 1): commit RSP ownership at the actual key site,
+	// after any freshness-gated pre-key wait calculation has consumed the CMD stamp.
+	lp_note_rsp_key();
+	if(!t1_prekeyed) ptt_on();
 
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
 	ptt_on_delay_timer.start();
@@ -16614,10 +17861,10 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
 	// Wait PTT on delay
-	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
+	if(!t1_prekeyed) ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
 	// Pilot tone (if enabled)
-	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
+	if(!t1_prekeyed && pilot_tone_ms > 0 && pilot_tone_hz > 0)
 	{
 		const double SAMPLE_RATE = 48000.0;
 		const double PILOT_FREQ  = (double)pilot_tone_hz;
@@ -17133,6 +18380,8 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	// so this is normally FALSE.
 	bool this_ack_is_retx_turnaround = ack_tx_retx_turnaround;
 	ack_tx_retx_turnaround = false;
+	const bool t1_prekeyed = !this_ack_is_retx_turnaround
+		&& t1_take_prekey_for_ack(target_batch_seq_id);
 
 	bool ofdm_settle = reverse_ack_uses_robust_geometry(current_configuration)
 #ifndef FIX9_D2REFINE_FAILBEFORE
@@ -17145,10 +18394,11 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 		printf("[TX-MFSK-COMPACT] D2 robust-geometry settle=%dms on CONFIG_%d\n",
 			wait_ms, current_configuration);
 		fflush(stdout);
-		pumped_settle_wait(wait_ms);
+		if(wait_ms > 0)
+			pumped_settle_wait(wait_ms);
 	}
 
-	ptt_on();
+	if(!t1_prekeyed) ptt_on();
 
 	cl_timer ptt_on_delay_timer, ptt_off_delay_timer;
 	ptt_on_delay_timer.start();
@@ -17179,9 +18429,9 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	telecom_system->ofdm.FIR_tx1.apply(raw_output, filtered1, padded_size);
 	telecom_system->ofdm.FIR_tx2.apply(filtered1, filtered2, padded_size);
 
-	ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
+	if(!t1_prekeyed) ptt_busy_wait(ptt_on_delay_timer, ptt_on_delay_ms);
 
-	if(pilot_tone_ms > 0 && pilot_tone_hz > 0)
+	if(!t1_prekeyed && pilot_tone_ms > 0 && pilot_tone_hz > 0)
 	{
 		const double SAMPLE_RATE = 48000.0;
 		const double PILOT_FREQ  = (double)pilot_tone_hz;
@@ -17489,6 +18739,360 @@ int cl_arq_controller::test_send_mfsk_compact_confirm_reset_failure()
 		failed == 0 ? "ALL PASS" : "FAILURES", failed, failed == 1 ? "" : "s");
 	fflush(stdout);
 	return failed;
+#endif
+}
+
+// PREKEY safety re-audit battery.  These are deliberately stateful production-path
+// tests: the withhold arms call the real ACK handler after a real scheduler fire;
+// the interleavings drive the real scheduler/adoption and lp_note_rx_frame0 gates.
+static int g_t1_safety_ptt_on_calls = 0;
+static int g_t1_safety_ptt_off_calls = 0;
+static bool g_t1_safety_ptt_keyed = false;
+
+static int t1_safety_transmit_hook(const char* buffer, int length)
+{
+	static const char on[] = "PTT ON\r";
+	static const char off[] = "PTT OFF\r";
+	if(length == (int)sizeof(on)-1 && memcmp(buffer, on, sizeof(on)-1) == 0)
+	{
+		g_t1_safety_ptt_on_calls++;
+		g_t1_safety_ptt_keyed = true;
+	}
+	else if(length == (int)sizeof(off)-1 && memcmp(buffer, off, sizeof(off)-1) == 0)
+	{
+		g_t1_safety_ptt_off_calls++;
+		g_t1_safety_ptt_keyed = false;
+	}
+	return length;
+}
+
+static void t1_safety_playback_pump(void*)
+{
+	if(playback_buffer != NULL) clear_buffer(playback_buffer);
+	sim_clock_add_samples(480); // deterministic 10 ms tick for D2/PTT waits
+}
+
+static rx_mute_capture_reset_result t1_safety_capture_ready()
+{
+	return rx_mute_capture_reset_result::Ready;
+}
+
+int cl_arq_controller::test_t1_schedkey_safety()
+{
+#if !MFSK_ACK_SACK_ENABLED
+	printf("[TEST-T1-SAFETY] SKIP: MFSK_ACK_SACK_ENABLED == 0\n");
+	return 0;
+#else
+	printf("[TEST-T1-SAFETY] start\n"); fflush(stdout);
+	int fails = 0;
+	auto check = [&](bool ok, const char* name) {
+		printf("[TEST-T1-SAFETY] %s: %s\n", ok ? "PASS" : "FAIL", name);
+		if(!ok) fails++;
+		fflush(stdout);
+	};
+
+	const int saved_sim_clock = sim_clock_enabled();
+	cbuf_handle_t saved_playback = playback_buffer;
+	cl_telecom_system* saved_telecom = telecom_system;
+	sim_inproc_pump_fn saved_pump = g_sim_inproc_pump;
+	void* saved_pump_ctx = g_sim_inproc_pump_ctx;
+	int (*saved_tx_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+	rx_mute_capture_reset_authority_fn saved_compact_reset =
+		g_compact_confirm_capture_reset_authority;
+	int saved_ptt_on = ptt_on_delay_ms, saved_ptt_off = ptt_off_delay_ms;
+	int saved_pilot_ms = pilot_tone_ms, saved_pilot_hz = pilot_tone_hz;
+
+	uint8_t* playback_storage = (uint8_t*)malloc(AUDIO_PAYLOAD_BUFFER_SIZE);
+	cbuf_handle_t test_playback = playback_storage != NULL
+		? circular_buf_init(playback_storage, AUDIO_PAYLOAD_BUFFER_SIZE) : NULL;
+	if(test_playback == NULL)
+	{
+		free(playback_storage);
+		printf("[TEST-T1-SAFETY] FAIL: playback ring allocation\n");
+		return 1;
+	}
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	if(test_telecom.load_configuration(CONFIG_0) != 0)
+	{
+		free(test_playback->buffer);
+		circular_buf_free(test_playback);
+		printf("[TEST-T1-SAFETY] FAIL: CONFIG_0 load\n");
+		return 1;
+	}
+
+	nMessages = 120;
+	max_data_length = 170;
+	max_message_length = 200;
+	max_header_length = 7;
+	if(init_messages_buffers() != SUCCESSFUL)
+	{
+		free(test_playback->buffer);
+		circular_buf_free(test_playback);
+		printf("[TEST-T1-SAFETY] FAIL: message buffer allocation\n");
+		return 1;
+	}
+
+	sim_clock_set_enabled(1);
+	// The controller's lp_clock was constructed on wall time. Rebase it after
+	// enabling the deterministic test clock so predictive endpoints stay positive.
+	lp_reset();
+	playback_buffer = test_playback;
+	telecom_system = &test_telecom;
+	arq_set_sim_inproc_pump(t1_safety_playback_pump, NULL);
+	cl_tcp_socket::g_test_transmit_hook = t1_safety_transmit_hook;
+	g_compact_confirm_capture_reset_authority = t1_safety_capture_ready;
+	setenv("MERCURY_T1_SCHEDKEY", "1", 1);
+	unsetenv("MERCURY_T1_CALIB_DEFEAT");
+	passive_monitor = false;
+	role = RESPONDER;
+	original_role = COMMANDER; // never attempt an application-socket drain in this rig
+	link_status = CONNECTED;
+	sack_v2_enabled = true;
+	sack_enabled = true;
+	header_carries_d5 = true;
+	compression_enabled = false;
+	encryption_enabled = false;
+	current_configuration = CONFIG_0;
+	ack_pattern_time_ms = 1;
+	pilot_tone_ms = pilot_tone_hz = 0;
+	t1_peer_calibration_valid = true;
+	t1_data_phase_proven = true; // safety battery starts after the baseline watermark
+	t1_peer_keyup_ms = 100;
+	t1_peer_deaf_ms = 0;
+	t1_peer_undeaf_ms = 100;
+	t1_txdelay_floor_ms = 100;
+	for(int d=0; d<T1_NUM_DIR; d++) for(int t=0; t<T1_NUM_TERM; t++)
+		{ t1_term_est[d][t].srtt_ms=0; t1_term_est[d][t].rttvar_ms=0; t1_term_est[d][t].n=0; }
+	for(int i=0; i<41; i++)
+	{
+		t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 100);
+		t1_note_term_sample(T1_DIR_REV, T1_DEAF, 0);
+	}
+
+	const int SPAN = 4, LEN = 10;
+	data_batch_size = SPAN;
+	auto clear_slots = [&]() {
+		for(int i=0; i<nMessages; i++)
+		{
+			messages_rx[i].status = FREE;
+			messages_rx[i].length = 0;
+			messages_rx[i].batch_seq_id = -1;
+		}
+	};
+	auto arm_then_complete = [&](int bsi) {
+		clear_slots();
+		rx_batch_total_frames = -1;
+		rsp_prev_batch_seq_id = -1;
+		rsp_prev_batch_active = false;
+		rsp_prev_batch_received_count = 0;
+		rsp_prev_batch_expected_count = 0;
+		rsp_current_expected_batch_seq_id = bsi;
+		rsp_last_delivered_batch_seq_id = (bsi - 1) & 0xFF;
+		rsp_stream_origin_gen = -1;
+		rsp_stream_aborted = false;
+		rsp_gap_recover_rounds = 0;
+		lp_last_rx_bsi = bsi;
+		lp_state.owner = LP_CMD_KEYED;
+		lp_state.epoch = lp_make_epoch(bsi);
+		const int tail_ms = test_telecom.prekey_prefix_unit_passband_samples
+			* T1_FORWARD_TAIL_REPS * 1000 / 48000;
+		lp_state.owner_keydown_end_ms = lp_now() + tail_ms;
+		connection_status = RECEIVING;
+		t1_arm_new_d5_frame0(bsi, SPAN, false);
+		for(int i=0; i<SPAN; i++)
+		{
+			messages_rx[i].status = RECEIVED;
+			messages_rx[i].length = LEN;
+			messages_rx[i].batch_seq_id = bsi;
+			memset(messages_rx[i].data, 0x20+i, LEN);
+		}
+		rx_batch_total_frames = SPAN;
+		batch_rx_frame_count = SPAN;
+		last_received_end_of_batch_seq = SPAN-1;
+		t1_authorize_clean_ack_if_ready();
+		t1_schedkey_poll();
+	};
+	auto reset_ptt_oracle = [&]() {
+		g_t1_safety_ptt_on_calls = g_t1_safety_ptt_off_calls = 0;
+		g_t1_safety_ptt_keyed = false;
+		test_telecom.data_container.rx_mute = 0;
+		test_telecom.data_container.rx_mute_samples = 0;
+	};
+
+	// 1a: fire from clean authority, then reproduce RX-FIFO back-pressure in the
+	// race window before the real handler.  The explicit withhold cancellation
+	// must physically unwind the already-fired key.
+	reset_ptt_oracle();
+	ptt_on_delay_ms = ptt_off_delay_ms = 0;
+	fifo_buffer_rx.set_size(4096);
+	fifo_buffer_rx.flush();
+	rx_stream_stamp[31].valid = false;
+	arm_then_complete(31);
+	check(t1_schedkey.keyed && g_t1_safety_ptt_keyed
+		&& test_telecom.data_container.rx_mute == 1,
+		"fire-then-BACKPRESSURE precondition is physically keyed and RX-muted");
+	fifo_buffer_rx.set_size(SPAN*LEN-1);
+	fifo_buffer_rx.flush();
+	connection_status = ACKNOWLEDGING_DATA;
+	process_messages_acknowledging_data();
+	check(connection_status == RECEIVING && !t1_schedkey.armed && !t1_schedkey.keyed
+		&& !g_t1_safety_ptt_keyed && g_t1_safety_ptt_off_calls == 1
+		&& test_telecom.data_container.rx_mute == 0,
+		"fire-then-BACKPRESSURE returns PTT off, RX unmuted, schedule cancelled");
+
+	// 1b: independently reproduce the Option-W byte-shortfall withhold after a
+	// clean-authorized fire (the stamp changes in the handler race window).
+	reset_ptt_oracle();
+	fifo_buffer_rx.set_size(4096);
+	fifo_buffer_rx.flush();
+	rx_stream_delivered = 0;
+	rx_stream_stamp[32].valid = false;
+	arm_then_complete(32);
+	rx_stream_stamp[32].valid = true;
+	rx_stream_stamp[32].start = 0;
+	rx_stream_stamp[32].length = SPAN*LEN + 1;
+	connection_status = ACKNOWLEDGING_DATA;
+	process_messages_acknowledging_data();
+	check(connection_status == RECEIVING && !t1_schedkey.armed && !t1_schedkey.keyed
+		&& !g_t1_safety_ptt_keyed && g_t1_safety_ptt_off_calls == 1
+		&& test_telecom.data_container.rx_mute == 0,
+		"fire-then-BYTE-SHORTFALL returns PTT off, RX unmuted, schedule cancelled");
+	rx_stream_stamp[32].valid = false;
+
+	// 1c: the missing third fired-key fixture.  First fire from a genuinely clean
+	// state, then expose the recoverable previous-batch hole before entering the
+	// REAL ACK handler.  passive_monitor is asserted only after physical keying so
+	// the branch's re-SACK transport is suppressed; therefore the sole PTT-OFF
+	// action is the safety cancellation being proved here.
+	reset_ptt_oracle();
+	fifo_buffer_rx.set_size(4096);
+	fifo_buffer_rx.flush();
+	const int GAP_LAST = 70, GAP_PREV = 71, GAP_CUR = 72;
+	rx_stream_stamp[GAP_CUR].valid = false;
+	arm_then_complete(GAP_CUR);
+	check(t1_schedkey.keyed && g_t1_safety_ptt_keyed
+		&& test_telecom.data_container.rx_mute == 1,
+		"fire-then-RECOVERABLE-PREV precondition is physically keyed and RX-muted");
+	rsp_last_delivered_batch_seq_id = GAP_LAST;
+	rsp_current_expected_batch_seq_id = GAP_CUR;
+	rsp_prev_batch_seq_id = GAP_PREV;
+	rsp_prev_batch_active = true;
+	rsp_prev_batch_received_count = SPAN-1;
+	rsp_prev_batch_expected_count = SPAN;
+	rsp_gap_recover_rounds = 0;
+	for(int i=0; i<SPAN; i++)
+	{
+		messages_rx_prev[i].status = (i < SPAN-1) ? RECEIVED : FREE;
+		messages_rx_prev[i].batch_seq_id = GAP_PREV;
+	}
+	passive_monitor = true;
+	connection_status = ACKNOWLEDGING_DATA;
+	process_messages_acknowledging_data();
+	check(connection_status == RECEIVING && !t1_schedkey.armed && !t1_schedkey.keyed
+		&& !g_t1_safety_ptt_keyed && g_t1_safety_ptt_off_calls == 1
+		&& test_telecom.data_container.rx_mute == 0
+		&& rsp_gap_recover_rounds == 1,
+		"fire-then-RECOVERABLE-PREV enters HOLD and returns PTT off exactly once, RX unmuted, schedule cancelled");
+	passive_monitor = false;
+
+	// 2: a PREV cross-storage confirm must run first, with its independent 300 ms
+	// D2 guard, while the current-BSI schedule remains armed but cannot fire in RECEIVING.
+	reset_ptt_oracle();
+	const int CUR = 41, PREV = 40;
+	clear_slots();
+	rsp_prev_batch_seq_id = PREV;
+	rsp_prev_batch_active = false;
+	rsp_current_expected_batch_seq_id = CUR;
+	rsp_last_delivered_batch_seq_id = PREV;
+	lp_last_rx_bsi = CUR;
+	lp_state.owner = LP_CMD_KEYED;
+	lp_state.epoch = lp_make_epoch(CUR);
+	lp_state.owner_keydown_end_ms = lp_now()
+		+ test_telecom.prekey_prefix_unit_passband_samples*T1_FORWARD_TAIL_REPS*1000/48000;
+	connection_status = RECEIVING;
+	t1_arm_new_d5_frame0(CUR, SPAN, false);
+	for(int i=0; i<SPAN; i++) messages_rx[i].status = RECEIVED;
+	rx_batch_total_frames = SPAN;
+	t1_schedkey_poll();
+	check(t1_schedkey.armed && !t1_schedkey.keyed,
+		"PREV cross-storage RECEIVING state cannot fire current-BSI schedule");
+	ptt_on_delay_ms = ptt_off_delay_ms = 150;
+	ack_tx_retx_turnaround = true;
+	const uint64_t prev_start_samples = sim_clock_now_samples();
+	const long long prev_ms = send_mfsk_compact_confirm((unsigned char)PREV);
+	const uint64_t prev_elapsed_samples = sim_clock_now_samples() - prev_start_samples;
+	check(prev_ms >= 0 && prev_elapsed_samples >= (uint64_t)600*48
+		&& t1_schedkey.armed && !t1_schedkey.keyed,
+		"PREV compact-confirm neither adopts current schedule nor skips 300 ms D2 guard");
+	connection_status = RECEIVING;
+	t1_authorize_clean_ack_if_ready();
+	t1_schedkey_poll();
+	check(t1_schedkey.keyed && g_t1_safety_ptt_keyed,
+		"current-BSI schedule fires only after PREV confirm completes");
+	ack_tx_retx_turnaround = false;
+	const long long cur_ms = send_mfsk_compact_confirm((unsigned char)CUR);
+	check(cur_ms >= 0 && !t1_schedkey.armed && !t1_schedkey.keyed
+		&& !g_t1_safety_ptt_keyed && test_telecom.data_container.rx_mute == 0
+		&& g_t1_safety_ptt_on_calls == 2 && g_t1_safety_ptt_off_calls == 2,
+		"exact current-BSI ACK adopts fired key; both transmissions return fully to RX");
+
+	// 3: frame 0 of a new BSI arrives last.  Supersede an older arm, then drive
+	// the real lp_note_rx_frame0 caller with later slots already seated.
+	t1_cancel_schedkey("test-interleave-b-reset");
+	clear_slots();
+	const int OLD = 50, NEW = 51;
+	rsp_prev_batch_seq_id = -1;
+	lp_last_rx_bsi = OLD;
+	lp_state.owner = LP_CMD_KEYED;
+	lp_state.epoch = lp_make_epoch(OLD);
+	lp_state.owner_keydown_end_ms = lp_now() + 5000;
+	connection_status = RECEIVING;
+	t1_arm_new_d5_frame0(OLD, SPAN, false);
+	check(t1_schedkey.armed, "interleaving-B precondition has an older live arm");
+	for(int i=1; i<SPAN; i++) messages_rx[i].status = RECEIVED;
+	lp_last_rx_bsi = NEW;
+	long c_before = t1_schedkey_cancel_count, r_before = t1_schedkey_reject_count;
+	lp_note_rx_frame0(NEW, SPAN, 0);
+	messages_rx[0].status = RECEIVED; // retransmitted frame 0 completes the EOB batch
+	connection_status = ACKNOWLEDGING_DATA;
+	t1_schedkey_poll();
+	check(t1_schedkey_cancel_count == c_before+1 && t1_schedkey_reject_count == r_before+1
+		&& !t1_schedkey.armed && !t1_schedkey.keyed && !g_t1_safety_ptt_keyed,
+		"late retransmitted frame-0 supersedes old arm, rejects new arm, never idle-keys");
+
+	// 4: drive the actual lp_note_rx_frame0 producer with prev==wire BSI.  This
+	// is the production freshness guard the earlier direct-arm test could not reach.
+	clear_slots();
+	const int FRESH = 61;
+	rsp_prev_batch_seq_id = FRESH;
+	lp_last_rx_bsi = FRESH;
+	long real_gate_before = t1_schedkey_reject_count;
+	lp_note_rx_frame0(FRESH, SPAN, 0);
+	check(t1_schedkey_reject_count == real_gate_before+1
+		&& !t1_schedkey.armed && !t1_schedkey.keyed,
+		"real lp_note_rx_frame0 freshness gate rejects rsp_prev_batch_seq_id==wire_bsi");
+
+	t1_cancel_schedkey("test-final-cleanup");
+	unsetenv("MERCURY_T1_SCHEDKEY");
+	cl_tcp_socket::g_test_transmit_hook = saved_tx_hook;
+	g_compact_confirm_capture_reset_authority = saved_compact_reset;
+	arq_set_sim_inproc_pump(saved_pump, saved_pump_ctx);
+	telecom_system = saved_telecom;
+	playback_buffer = saved_playback;
+	ptt_on_delay_ms = saved_ptt_on;
+	ptt_off_delay_ms = saved_ptt_off;
+	pilot_tone_ms = saved_pilot_ms;
+	pilot_tone_hz = saved_pilot_hz;
+	sim_clock_set_enabled(saved_sim_clock);
+	deinit_messages_buffers();
+	free(test_playback->buffer);
+	circular_buf_free(test_playback);
+
+	printf("[TEST-T1-SAFETY] %s: fails=%d\n", fails ? "FAIL" : "PASS", fails);
+	fflush(stdout);
+	return fails ? 1 : 0;
 #endif
 }
 
@@ -18367,6 +19971,12 @@ long long cl_arq_controller::send_mfsk_test_ack_phy(uint8_t echoed_cap,
 {
 	uint64_t p38 = 0;
 	pack_test_ack_payload(&p38, echoed_cap, own_cap, ssid);
+	if(t1_calibration_wire_enabled())
+	{
+		char cal[5];
+		t1_calibration_encode(cal, ptt_on_delay_ms, 0, ptt_off_delay_ms);
+		pack_t1_calibration_reserved(&p38, (uint8_t)cal[1], (uint8_t)cal[3]);
+	}
 	return send_mfsk_ctrl_suffix_phy_core(this, telecom_system,
 		MFSK_CTRL_TEST_ACK, p38, "CONNECT-ACK");
 }
@@ -18533,6 +20143,18 @@ bool cl_arq_controller::receive_mfsk_test_ack_phy(uint8_t* out_echoed_cap,
 		return false;
 	if(!unpack_test_ack_payload(p38, out_echoed_cap, out_own_cap, out_ssid))
 		return false;
+	uint8_t keyup_q5 = 0, undeaf_q5 = 0;
+	if(t1_calibration_wire_enabled()
+	   && unpack_t1_calibration_reserved(p38, &keyup_q5, &undeaf_q5))
+	{
+		t1_peer_keyup_ms = 5 * (int)keyup_q5;
+		t1_peer_deaf_ms = 0;
+		t1_peer_undeaf_ms = 5 * (int)undeaf_q5;
+		t1_peer_calibration_valid = true;
+		printf("[T1-CALIB-MFSK] peer keyup=%d deaf=0 undeaf=%d ms\n",
+			t1_peer_keyup_ms, t1_peer_undeaf_ms);
+		fflush(stdout);
+	}
 	printf("[RX-MFSK-CTRL-CONNECT-ACK] echoed_cap=0x%02X own_cap=0x%02X ssid=%u\n",
 		*out_echoed_cap, *out_own_cap, *out_ssid);
 	fflush(stdout);
@@ -18555,6 +20177,12 @@ long long cl_arq_controller::send_mfsk_test_conn_phy(float snr,
 	uint8_t snr_q = (uint8_t)(snr_tone & 0xF);
 	uint64_t p38 = 0;
 	pack_test_conn_payload(&p38, snr_q, local_cap, ssid);
+	if(t1_calibration_wire_enabled())
+	{
+		char cal[5];
+		t1_calibration_encode(cal, ptt_on_delay_ms, 0, ptt_off_delay_ms);
+		pack_t1_calibration_reserved(&p38, (uint8_t)cal[1], (uint8_t)cal[3]);
+	}
 	return send_mfsk_ctrl_suffix_phy_core(this, telecom_system,
 		MFSK_CTRL_TEST_CONN, p38, "CONNECT-TEST");
 }
@@ -18576,6 +20204,18 @@ bool cl_arq_controller::receive_mfsk_test_conn_phy(uint8_t* out_snr_q,
 		return false;
 	if(!unpack_test_conn_payload(p38, out_snr_q, out_local_cap, out_ssid))
 		return false;
+	uint8_t keyup_q5 = 0, undeaf_q5 = 0;
+	if(t1_calibration_wire_enabled()
+	   && unpack_t1_calibration_reserved(p38, &keyup_q5, &undeaf_q5))
+	{
+		t1_peer_keyup_ms = 5 * (int)keyup_q5;
+		t1_peer_deaf_ms = 0;
+		t1_peer_undeaf_ms = 5 * (int)undeaf_q5;
+		t1_peer_calibration_valid = true;
+		printf("[T1-CALIB-MFSK] peer keyup=%d deaf=0 undeaf=%d ms\n",
+			t1_peer_keyup_ms, t1_peer_undeaf_ms);
+		fflush(stdout);
+	}
 	printf("[RX-MFSK-CTRL-CONNECT-TEST] snr_q=%u (=%.1f dB) local_cap=0x%02X ssid=%u\n",
 		*out_snr_q, telecom_system->ack_mfsk.tone_to_snr((int)*out_snr_q),
 		*out_local_cap, *out_ssid);
@@ -21281,10 +22921,19 @@ void cl_arq_controller::receive()
 							// LINK-PHASE PRIMITIVE (increment 1): on the FIRST frame of a NEW bsi,
 							// log the RX-derived keydown length so the shadow-agreement reducer can
 							// compare it to the CMD-emitted length. Write-only; no consumer reads it.
-							if(bsi != lp_last_rx_bsi)
+							if(bsi != lp_last_rx_bsi
+							   && (!t1_schedkey_enabled()
+							       || ((unsigned char)messages_rx_buffer.sequence_number & 0x7F) == 0))
 							{
 								lp_last_rx_bsi = bsi;
-								lp_note_rx_frame0(bsi, btf);
+								int remaining_sym = end_of_current_message
+									- telecom_system->data_container.buffer_Nsymb.load();
+								long long remaining_num = (long long)remaining_sym
+									* telecom_system->data_container.Nofdm * 1000LL;
+								int remaining_ms = (remaining_num >= 0)
+									? (int)((remaining_num + 47999) / 48000)
+									: (int)(remaining_num / 48000); // truncate toward zero: conservative late
+								lp_note_rx_frame0(bsi, btf, remaining_ms);
 							}
 						}
 					}
@@ -21360,10 +23009,19 @@ void cl_arq_controller::receive()
 							// LINK-PHASE PRIMITIVE (increment 1): on the FIRST frame of a NEW bsi,
 							// log the RX-derived keydown length so the shadow-agreement reducer can
 							// compare it to the CMD-emitted length. Write-only; no consumer reads it.
-							if(bsi != lp_last_rx_bsi)
+							if(bsi != lp_last_rx_bsi
+							   && (!t1_schedkey_enabled()
+							       || ((unsigned char)messages_rx_buffer.sequence_number & 0x7F) == 0))
 							{
 								lp_last_rx_bsi = bsi;
-								lp_note_rx_frame0(bsi, btf);
+								int remaining_sym = end_of_current_message
+									- telecom_system->data_container.buffer_Nsymb.load();
+								long long remaining_num = (long long)remaining_sym
+									* telecom_system->data_container.Nofdm * 1000LL;
+								int remaining_ms = (remaining_num >= 0)
+									? (int)((remaining_num + 47999) / 48000)
+									: (int)(remaining_num / 48000); // truncate toward zero: conservative late
+								lp_note_rx_frame0(bsi, btf, remaining_ms);
 							}
 						}
 					}
@@ -21409,6 +23067,14 @@ void cl_arq_controller::receive()
 		}
 		else
 		{
+			// A seated OFDM candidate that reached a terminal decode failure is
+			// evidence that this batch is no longer the all-CRC-good original span.
+			// Incomplete captures retain the arm; their remaining symbols are still
+			// being acquired. Silence/no-preamble polls have delay < 0 and also retain it.
+			if(t1_schedkey.armed && is_ofdm_config(current_configuration)
+			   && received_message_stats.delay >= 0
+			   && received_message_stats.frame_overflow_symbols <= 0)
+				t1_cancel_schedkey("crc-decode-fail");
 			// MFSK frame completeness: if the frame extends beyond captured audio,
 			// capture the remaining symbols instead of wasting a full recapture cycle.
 			// The metric threshold in time_sync_mfsk already filters false preambles,
@@ -23359,7 +25025,15 @@ copy_data_done:
 	  if(e && *e && atoi(e)!=0) empty_flush_defeat = true; }
 	bool emitted_batch = copied > 0 || empty_flush_defeat;
 	if(emitted_batch && decrypt_delivered_bsi >= 0)
+	{
 		rx_stream_emitted_bsi_hw = decrypt_delivered_bsi & 0xFF;
+		// SCREAM's progress watermark is the same monotonic unique-delivery event
+		// as the application funnel: at least one byte was emitted, and the BSI
+		// high-water advanced.  Duplicate/rebase paths return above; recovered-PREV
+		// deliveries reach this common site.  Keep this as the sole counter writer.
+		if(total_bytes > 0 && scream_forward_batches_delivered < 1000000)
+			scream_forward_batches_delivered++;
+	}
 	// Option W CORE: consume this bsi's parsed stamp on delivery so a later 256-batch
 	// wraparound reuse of the same bsi with a LOST EOB frame reads INVALID (skip),
 	// never a STALE start (which would false-fire the BACKSTOP). A double-delivery of

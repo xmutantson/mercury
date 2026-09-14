@@ -687,6 +687,45 @@ public:
     return (e && e[0] && atoi(e) != 0);
   }
   void update_turnaround_estimate(int cfg, int batch_airtime_ms, int rtt_ms);
+  // ===== T1 (zero-dead-time turnaround) learned-timing model (defined in arq_common.cc) =====
+  // All methods are pure/read-only except t1_note_term_sample (the ONLY writer of t1_term_est,
+  // an RFC-6298 fold mirroring update_turnaround_estimate). the zero-dead-time turnaround design.
+  bool t1_calib_defeat() const;    // MERCURY_T1_CALIB_DEFEAT=1 -> force every term COLD (fail-before arm)
+  void t1_note_term_sample(int dir, int term, int sample_ms);  // fold one EWMA sample (RFC 6298 integer)
+  int  t1_term_srtt_ms(int dir, int term) const;               // raw SRTT (COLD/defeat => -1)
+  int  t1_term_ms(int dir, int term) const;                    // SRTT + max(G,K*RTTVAR) high-pct (COLD/defeat => -1)
+  int  compute_pre_key_lead(int keyer_dir) const;              // max(floor, KEYUP-DEAF) clamped >=0, or T1_LEAD_REACTIVE
+  long long t1_scheduled_key_ms(int keyer_dir, long long owner_keydown_end_ms) const;  // end - lead
+  int  test_t1_calibration();      // fail-before/pass-after unit test (throwaway controller)
+  // T1b (scheduled pre-key re-aim): the LIVE keyup hook + its DRIVEN A/B lever (default OFF on-air).
+  bool t1_schedkey_enabled() const;  // MERCURY_T1_SCHEDKEY gate for the scheduled pre-key re-aim
+  long long t1_scheduled_keyup_wait_ms(int keyer_dir, bool header_carries_d5,
+                                       long long owner_keydown_end_ms, long long now_ms) const;  // reverse-ACK keyup wait, or T1_SCHED_REACTIVE
+  void t1_arm_new_d5_frame0(int bsi, int d5_wire, bool physical_retransmit);
+  void t1_cancel_schedkey(const char* reason);
+  bool t1_clean_ack_gates_pass();
+  void t1_authorize_clean_ack_if_ready();
+  void t1_schedkey_poll();
+  bool t1_take_prekey_for_ack(int target_bsi);
+  bool t1_calibration_wire_enabled() const;
+  // Clear peer-bound PREKEY authority at every genuine fresh-session boundary.
+  // Deliberately not used for in-session role/config transitions.
+  void t1_reset_fresh_session_state();
+  bool t1_calibration_decode(const char* p, int n, int* keyup_ms,
+                             int* deaf_ms, int* undeaf_ms);
+  void t1_calibration_encode(char* p, int keyup_ms, int deaf_ms,
+                             int undeaf_ms);
+  int  test_t1_schedkey();         // fail-before/pass-after: the re-aim fires only when armed (the scheduled-keying negative control)
+  void t1_seed_calibration_defaults();  // connect-time calibration bootstrap (SPEC T1 s2/s3): warm the learned
+                                        // terms from local PTT priors so compute_pre_key_lead leaves the reactive
+                                        // sentinel; folds via t1_note_term_sample (still the only writer of t1_term_est)
+  int  test_t1_calib_bootstrap();  // fail-before/pass-after: the bootstrap moves compute_pre_key_lead off the reactive
+                                   // sentinel and makes t1_scheduled_keyup_wait_ms fire (the inert->live producer proof)
+  int  test_t1_schedkey_lifecycle();
+  int  test_t1_fresh_connect_reset();
+  int  test_t1_schedkey_safety();    // fired-withhold + PREV/new-BSI interleavings + real lp_note freshness
+  int  test_t1_repeating_prefix();
+  int  d2_listener_rearm_guard_ms() const;
   void recalculate_ack_timeout_for_batch();
   // SACK-negotiation batch recompute, shared by the CMD (TEST_CONNECTION_ACK)
   // and RSP (TEST_CONNECTION) handlers so the two sides run IDENTICAL code and
@@ -2964,6 +3003,10 @@ public:
   bool receive_scream_pattern(int* out_rung);
   bool apply_scream_wake(int rung);
   int  test_scream_rung_map();
+  int  scream_trigger_holdoff_for_timeout(int timeout_ms) const;
+  bool scream_trigger_policy_ready(int delivered_batches, bool holdoff_armed,
+                                    int elapsed_ms, int holdoff_ms) const;
+  bool scream_rollback_slot_eligible(int status, int length, int batch_seq_id) const;
 
   // Resolve + cache the MERCURY_SNR_TRACK env flag (default-off). When set, the
   // commander-side gearshift becomes SNR-SENSED fast fade-tracking: a fresh climb-grade
@@ -5342,6 +5385,10 @@ public:
   bool    scream_reentry_listen_armed;  // screamer awaits the next CONFIG_TAG
   cl_timer scream_reentry_listen_timer; // bounded across ordinary RX-window restarts
   bool    scream_reentry_recovery_pending; // accepted tag; suppress repeat scream until DATA
+  int     scream_forward_batches_delivered; // per-session in-order progress watermark
+  bool    scream_empty_holdoff_armed;       // first eligible empty window starts persistence test
+  cl_timer scream_empty_holdoff_timer;
+  int     scream_empty_holdoff_ms;          // scaled from live receive geometry
   long    scream_emit_count;
   long    scream_detect_count;
   long    scream_presence_trip_count;
@@ -6839,6 +6886,15 @@ public:
   // 1 per call, wasting ~12 polls on the same frame (v15 bug).
   int v2_dispatch_min_advance_syms;
 
+  // PREKEY commander prefix watch. An original negotiated D5 keydown arms
+  // this at the post-TX capture reset. Exact prefix acquisition selects the
+  // CRC-bearing compact decoder; without acquisition the ordinary reactive
+  // ACK/SACK path remains available. Physical retransmits never arm the watch.
+  bool t1_cmd_capture_hold_active;
+  bool t1_cmd_prefix_acquired;
+  int  t1_cmd_capture_hold_samples;
+  int  t1_cmd_capture_hold_start_rwi;
+
   // §7.13.29 (Option 2) — self-calibrating SACK_RSP arrival predictor.
   // Each successful SACK_RSP decode records the receiving_timer ms value
   // at which the cross-check returned RECEIVED. Future use: hint OFDM
@@ -6862,6 +6918,52 @@ public:
     int n;            // samples folded (0 => cold)
   };
   turnaround_rtt_est tt_rtt[TT_NUM_CLASS][TT_NUM_BATCHBK];
+
+  // ===== T1 (zero-dead-time turnaround): learned per-link timing terms =====
+  // Four learned timing terms (the learned-timing turnaround design), each an
+  // RFC-6298-class SRTT/RTTVAR track that REUSES turnaround_rtt_est (the same integer fold as
+  // the R6 estimator above). Tracked per DIRECTION so the CMD->RSP and RSP->CMD latches
+  // (different radios/amps) never share a bucket. A needed term with n==0 (COLD, ctor default)
+  // => UNCALIBRATED => compute_pre_key_lead() returns T1_LEAD_REACTIVE and the scheduler
+  // degrades to today's reactive turnaround (never worse than baseline; the robust fallback of
+  // the robust turnaround fallback). Observe-only in T1a: the model computes + traces the pre-key lead/offset but
+  // does NOT re-aim the live key (that is T1b). See fact-documents/data-flow-turnaround-timers.md.
+  enum t1_term_id { T1_KEYUP  = 0,   // key-cmd -> carrier radiating (peer-observed; belongs to the keyer)
+                    T1_DEAF   = 1,   // key-cmd -> own RX goes deaf (measured locally)
+                    T1_UNDEAF = 2,   // unkey -> own RX usable again (measured locally)
+                    T1_NUM_TERM = 3 };
+  enum t1_dir_id  { T1_DIR_FWD = 0,  // CMD -> RSP keyer (forward data batch)
+                    T1_DIR_REV = 1,  // RSP -> CMD keyer (reverse ACK)
+                    T1_NUM_DIR = 2 };
+  static const int T1_LEAD_REACTIVE = -1;  // sentinel: no calibration -> reactive fallback (never pre-key)
+  static const int T1_SCHED_REACTIVE = -1; // sentinel: keep the reactive keyup wait (lever-off / no-D5 / cold => fallback)
+  turnaround_rtt_est t1_term_est[T1_NUM_DIR][T1_NUM_TERM];  // ctor-reset {0,0,0} alongside tt_rtt
+  int t1_txdelay_floor_ms;   // user hot-switch TX-delay floor (max() floor on the lead); set from ptt_on_delay_ms
+  struct t1_schedkey_state {
+    bool armed;
+    bool keyed;
+    int bsi;
+    int expected_span;
+    uint32_t epoch;
+    uint32_t config_gen;
+    long long key_target_ms;
+    long long ack_audio_not_before_ms;
+    // This is the sole exception to the generic RECEIVING no-fire rule.  It is
+    // raised only after the complete current batch has passed every clean-ACK
+    // withhold gate, and is cleared with the schedule lifecycle.
+    bool clean_ack_authorized;
+  } t1_schedkey;
+  bool t1_peer_calibration_valid;
+  // Establishment is deliberately baseline-only. PREKEY becomes eligible only
+  // after this session has completed one ordinary clean DATA turnaround.
+  bool t1_data_phase_proven;
+  int t1_peer_keyup_ms;
+  int t1_peer_deaf_ms;
+  int t1_peer_undeaf_ms;
+  long t1_schedkey_arm_count;
+  long t1_schedkey_fire_count;
+  long t1_schedkey_cancel_count;
+  long t1_schedkey_reject_count;
 
   // Step 15: legacy SACK pattern detection diagnostics (sack_diag_*) removed —
   // the MFSK SACK correlator they tracked is gone.
@@ -7435,7 +7537,8 @@ private:
   void lp_reset();                                        // owner=NONE, instants=0, epoch=0, restart clock
   void lp_note_keydown_start(int bsi);                    // CMD PTT-on: owner=CMD_KEYED, latch START
   void lp_note_keydown_end(int bsi, int frames_region_len, int frames, bool force_full); // CMD END latch
-  void lp_note_rx_frame0(int bsi, int d5_wire);           // RX frame-0 D5 acquire: owner=CMD_KEYED, derive+log
+  void lp_note_rx_frame0(int bsi, int d5_wire,
+                         int remaining_frame_ms = -1);    // RX frame-0 D5 acquire: owner=CMD_KEYED, derive+log
   void lp_note_rsp_key();                                 // RSP keys reverse ACK: owner=RSP_KEYED
   void lp_note_ack_decoded();                             // CMD decodes reverse ACK: owner=TURNAROUND
   void lp_note_break(int bsi);                            // BREAK re-stage: owner=CMD_KEYED, epoch re-stamp

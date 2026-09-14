@@ -169,6 +169,16 @@ void pack_test_conn_payload(uint64_t* p38, uint8_t snr_q,
 bool unpack_test_conn_payload(uint64_t p38, uint8_t* snr_q,
                                uint8_t* local_cap, uint8_t* ssid);
 
+// Optional PREKEY calibration carried in the low 18 reserved bits of both
+// TEST_CONN and TEST_ACK.  The surrounding typed control frame's CRC-12
+// authenticates these bits.  Zero remains the legacy/default-off encoding.
+// keyup_q5 and undeaf_q5 use the datalink tuple's 5 ms quantization; DEAF is
+// intentionally omitted because the transmitted local measurement is zero.
+void pack_t1_calibration_reserved(uint64_t* p38, uint8_t keyup_q5,
+                                  uint8_t undeaf_q5);
+bool unpack_t1_calibration_reserved(uint64_t p38, uint8_t* keyup_q5,
+                                    uint8_t* undeaf_q5);
+
 // =============================================================================
 // CRC-aided soft list decode of the 13-symbol ctrl-suffix (Tier 1, ZERO airtime)
 // =============================================================================

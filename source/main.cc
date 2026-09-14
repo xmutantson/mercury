@@ -3790,6 +3790,43 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_mt;
                 failed += ARQ_mt.test_measured_timers();
             }
+            // T1 zero-dead-time turnaround learned-timing model (arq_common.cc): the four
+            // per-direction learned terms (key-up / ears-deaf / ears-back + peer terms) fold as
+            // RFC-6298 SRTT/RTTVAR tracks; the pre-key lead = max(txdelay_floor, keyup-deaf)
+            // clamped >=0 and the scheduled key instant = predictive keydown-end - lead. Drives
+            // the REAL t1_note_term_sample + compute_pre_key_lead + t1_scheduled_key_ms on a
+            // throwaway controller: convergence to the injected truth, the conservative window,
+            // the lead arithmetic + amp-safety floor + >=0 clamp, and the COLD/DEFEAT reactive
+            // fallback (fail-before under MERCURY_T1_CALIB_DEFEAT yields no calibrated lead).
+            {
+                cl_arq_controller ARQ_t1;
+                failed += ARQ_t1.test_t1_calibration();
+            }
+            // T1b scheduled pre-key re-aim (arq_common.cc): the reverse-ACK keyup is armed at
+            // owner_keydown_end_ms - lead ONLY when the MERCURY_T1_SCHEDKEY lever is on AND the
+            // batch end is predictively known AND the terms are calibrated; lever-off / no-D5 /
+            // cold / no-stamp keep the reactive keyup wait unchanged (the robust fallback). Drives
+            // the REAL t1_scheduled_keyup_wait_ms on a throwaway controller: the scheduled-vs-
+            // reactive negative control, the >=0 clamp, and the calibration-defeat fail-before/after.
+            {
+                cl_arq_controller ARQ_t1sk;
+                failed += ARQ_t1sk.test_t1_schedkey();
+            }
+            // T1c connect-time calibration bootstrap (arq_common.cc): the missing producer that
+            // warms the learned terms at connect-accept so compute_pre_key_lead leaves the reactive
+            // sentinel and the scheduled pre-key (MERCURY_T1_SCHEDKEY) fires on the live path.
+            // Drives the REAL t1_seed_calibration_defaults(): fail-before (cold/inert) -> pass-after
+            // (warm, fires) with a distinct calibration-defeat arm.
+            {
+                cl_arq_controller ARQ_t1cb;
+                failed += ARQ_t1cb.test_t1_calib_bootstrap();
+                failed += ARQ_t1cb.test_t1_schedkey_lifecycle();
+                failed += ARQ_t1cb.test_t1_repeating_prefix();
+            }
+			{
+				cl_arq_controller ARQ_t1safe;
+				failed += ARQ_t1safe.test_t1_schedkey_safety();
+			}
             // Karn discriminator decoupling (MERCURY_KARN_RETX_ONLY): the R6 estimator was
             // inert on the dominant clean OFDM path because the Karn gate read
             // data_ack_retx_turnaround (which the H1 widen arms on a CLEAN batch). Drives the
@@ -5133,6 +5170,9 @@ int main(int argc, char *argv[])
                                         // TURNAROUND_DEFEAT. One-shot, exits rc.
     bool test_measured_timers_cli = false; // --test-measured-timers: R6 SRTT/RTTVAR turnaround estimator +
                                         // ack_timeout_data >= receiving_timeout invariant regression (one-shot, exit rc).
+    bool test_t1_cli = false;           // --test-t1: T1 zero-dead-time turnaround suites (learned-timing
+                                        // calibration + scheduled pre-key re-aim;
+                                        // one-shot, exit rc) -- fast proof without the full-PHY --test sweep.
     bool test_arqsmalls_cli = false;    // --test-arqsmalls: Karn discriminator decoupling
                                         // (MERCURY_KARN_RETX_ONLY) + DUTY-R pin-respect seed
                                         // (MERCURY_DUTY_R_PIN_DEFEAT), fast one-shot, exit rc.
@@ -6112,6 +6152,16 @@ int main(int argc, char *argv[])
             // regression — one-shot at startup, exit rc.
             // See source/datalink_layer/arq_common.cc test_measured_timers.
             test_measured_timers_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-t1") == 0)
+        {
+            // T1 zero-dead-time turnaround unit suites (learned-timing calibration +
+            // scheduled pre-key re-aim negative control) — one-shot,
+            // exit rc. See source/datalink_layer/arq_common.cc test_t1_calibration /
+            // test_t1_schedkey.
+            test_t1_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -8524,6 +8574,23 @@ start_modem:
             cl_arq_controller ARQ_mt;
             int rc = ARQ_mt.test_measured_timers();
             printf("[FLAG] Measured-timers test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_t1_cli) {
+            // T1 zero-dead-time turnaround suites (calibration + scheduled pre-key re-aim) —
+            // fast one-shot, exit rc.
+            printf("[FLAG] --test-t1: invoking T1 zero-dead-time turnaround regressions\n");
+            fflush(stdout);
+            int rc = 0;
+            { cl_arq_controller ARQ_t1a;  rc += ARQ_t1a.test_t1_calibration(); }
+            { cl_arq_controller ARQ_t1sk; rc += ARQ_t1sk.test_t1_schedkey();   }
+            { cl_arq_controller ARQ_t1cb; rc += ARQ_t1cb.test_t1_calib_bootstrap(); }
+			{ cl_arq_controller ARQ_t1lc; rc += ARQ_t1lc.test_t1_schedkey_lifecycle(); }
+			{ cl_arq_controller ARQ_t1sr; rc += ARQ_t1sr.test_t1_fresh_connect_reset(); }
+			{ cl_arq_controller ARQ_t1sf; rc += ARQ_t1sf.test_t1_schedkey_safety(); }
+			{ cl_arq_controller ARQ_t1px; rc += ARQ_t1px.test_t1_repeating_prefix(); }
+            printf("[FLAG] T1 turnaround tests complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }
