@@ -2164,6 +2164,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 	}
 }
 
+void cl_arq_controller::rsp_reset_session_preserve_close_for_ack()
+{
+	// reset_session_state() correctly clears every control slot at a session
+	// boundary. This CLOSE is the sole exception: the responder still owes the
+	// peer the ACK that proves it consumed the integrity-checked terminal frame.
+	// Keep the received bytes and re-arm only the primary slot; the normal
+	// ACK-complete branch performs the final reset immediately after transmission.
+	reset_session_state();
+#ifndef RSP_CLOSE_ACK_REARM_FAILBEFORE
+	messages_control.status = RECEIVED;
+#endif
+}
+
 void cl_arq_controller::process_messages_acknowledging_control()
 {
 	message_batch_counter_tx=0;
@@ -5157,7 +5170,10 @@ void cl_arq_controller::process_control_responder()
 			if(passive_monitor)
 				gui_push_monitor_event("[DISCONNECT]", false);
 #endif
-			reset_session_state();
+			if(passive_monitor)
+				reset_session_state();
+			else
+				rsp_reset_session_preserve_close_for_ack();
 			// Reconnect-continuity fail-closed F2: on a PROVEN-CLEAN EOT only, clear the app-delivered
 			// high-water that reset_session_state() just re-snapshotted (monotonic-max), so the next
 			// transfer on this persistent socket starts a fresh un-armed byte boundary (no false refuse).

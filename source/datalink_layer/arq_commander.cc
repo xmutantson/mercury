@@ -29490,7 +29490,37 @@ int cl_arq_controller::test_terminal_settlement()
 		      "B7: invalid cache rejects even exact match");
 	}
 
-#if defined(TERMINAL_SETTLE_DEADLINE_FAILBEFORE)
+	// PART C: the first accepted terminal CLOSE survives the pre-ACK session
+	// reset. This drives the production wrapper used by the responder's CLOSE
+	// consumer; the defeated build leaves the slot FREE and must fail here.
+	{
+		cl_telecom_system ts;
+		telecom_system = &ts;
+		role = RESPONDER;
+		load_configuration(CONFIG_1, FULL, YES);
+		if(messages_control.data == NULL)
+			messages_control.data = new char[256];
+		messages_control.data[0] = CLOSE_CONNECTION;
+		messages_control.status = RECEIVED;
+		messages_control_bu.status = RECEIVED;
+
+		rsp_reset_session_preserve_close_for_ack();
+
+		CHECK(messages_control.status == RECEIVED,
+		      "C1: accepted CLOSE remains RECEIVED across pre-ACK reset");
+		CHECK(messages_control.data[0] == CLOSE_CONNECTION,
+		      "C2: accepted CLOSE command byte survives pre-ACK reset");
+		CHECK(messages_control_bu.status == FREE,
+		      "C3: backup control slot remains cleared at session boundary");
+	}
+
+#if defined(RSP_CLOSE_ACK_REARM_FAILBEFORE)
+	if (failures > 0)
+		printf("[TEST-TERMINAL-SETTLE] CLOSE-ACK-FAILBEFORE-DEMONSTRATED "
+		       "(pre-ACK reset cleared the accepted CLOSE; %d failures)\n", failures);
+	else
+		printf("[TEST-TERMINAL-SETTLE] CLOSE-ACK-FAILBEFORE-NOT-DEMONSTRATED\n");
+#elif defined(TERMINAL_SETTLE_DEADLINE_FAILBEFORE)
 	// Defeat build: the deadline is restored to the mis-scaled (nResends+2)*ack_timeout_control. The
 	// config-real PART A0 assertions MUST fail (computed deadline exceeds the cap at cfg16); the fast
 	// fire-spin still fires on the tiny test values, so this isolates the deadline-scale guard.

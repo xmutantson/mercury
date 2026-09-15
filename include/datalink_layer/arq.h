@@ -2693,6 +2693,10 @@ public:
   };
   void cmd_terminal_settle_converge(const char* reason);
   int terminal_settle_deadline_ms() const;
+  // CLOSE was already integrity-checked and consumed when this runs. Preserve
+  // that one control slot across the session reset long enough for the existing
+  // ACKNOWLEDGING_CONTROL path to emit its terminal ACK.
+  void rsp_reset_session_preserve_close_for_ack();
   int test_terminal_settlement();
 
   // RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md). PURE predicate: the
