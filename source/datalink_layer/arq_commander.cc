@@ -1524,8 +1524,9 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	// (13), so the existing ring is strictly safe (data-flow §6 I1/I4).
 	int ack_nsymb   = telecom_system->ack_mfsk.ack_pattern_nsymb;
 	int compact_suffix = telecom_system->ack_mfsk.compact_confirm_suffix_len();
-	// BLOCKER C — report-transport capture window. When the forward topgear report
-	// is armed the responder emits the TOPGEAR confirm (ack_nsymb + 2*compact_suffix
+	// Report-transport capture window. When either legacy topgear or Gearshift-v2
+	// quality telemetry can append a tail, the responder may emit a two-codeword
+	// confirm (ack_nsymb + 2*compact_suffix
 	// symbols) rather than the plain compact confirm (ack_nsymb + compact_suffix).
 	// Sizing the tail for the plain confirm leaves only 16-compact_suffix (=6) symbols
 	// of positioning margin for the longer topgear confirm, so whenever the detected
@@ -1535,7 +1536,7 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	// 16-symbol margin. Default-off feature => byte-identical unless MERCURY_TOPGEAR_ELECT.
 	bool tail_failbefore = false;
 	{ const char* e = std::getenv("MERCURY_TOPGEAR_TAIL_FAILBEFORE"); tail_failbefore = (e && *e && atoi(e) != 0); }
-	const int compact_span = (topgear_elect_feature_enabled() && !tail_failbefore) ? 2 * compact_suffix : compact_suffix;
+	const int compact_span = (gearshift_quality_report_transport_enabled() && !tail_failbefore) ? 2 * compact_suffix : compact_suffix;
 	const int mfsk_tail_nsymb = ack_nsymb + compact_span + 16;
 	int sym_samples = telecom_system->data_container.Nofdm
 	                * telecom_system->data_container.interpolation_rate;
@@ -1554,15 +1555,15 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 	MUTEX_UNLOCK(&capture_prep_mutex);
 
 	uint8_t rx_bsi = 0;
-	uint8_t topgear_report = 0;
-	bool    topgear_report_valid = false;
-	bool    want_topgear_report = topgear_elect_feature_enabled();
+	uint8_t quality_report = 0;
+	bool    quality_report_valid = false;
+	bool    want_quality_report = gearshift_quality_report_transport_enabled();
 	int     mfsk_matched = 0;
 	bool decoded = telecom_system->decode_compact_confirm_from_passband(
 		telecom_system->data_container.ready_to_process_passband_delayed_data,
 		tail_samples, cmd_compact_crc12_cb, this, &rx_bsi, &mfsk_matched,
-		want_topgear_report ? &topgear_report : nullptr,
-		want_topgear_report ? &topgear_report_valid : nullptr);
+		want_quality_report ? &quality_report : nullptr,
+		want_quality_report ? &quality_report_valid : nullptr);
 	if(!decoded)
 		return false;  // soft_decode_compact already gated CRC12-over-[bsi].
 
@@ -1583,14 +1584,18 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 		fflush(stdout);
 	}
 	cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
-	if(topgear_report_valid)
+	if(quality_report_valid)
 	{
-		topgear_apply_report(topgear_report, target);
+		if(gearshift_quality_report_v2_enabled())
+			gearshift_apply_quality_report(quality_report, target);
+		else
+			topgear_apply_report(quality_report, target);
 		// A consume-time report supersedes any older pending one (fresher evidence).
 		topgear_pending_report_clear("consume-time-report");
 	}
-	else if(want_topgear_report
-	        && (current_configuration == CONFIG_16 || current_configuration == CONFIG_17))
+	else if(want_quality_report
+	        && (gearshift_quality_report_v2_enabled()
+	            || current_configuration == CONFIG_16 || current_configuration == CONFIG_17))
 	{
 		// CONSUME-RACE fix: the confirm is being accepted at FIRST-codeword CRC
 		// validity, but on the live vehicle the trailing report codeword's audio has
@@ -1626,8 +1631,8 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 // whose audio provably had not arrived at consume time (audio-bracketed on the
 // live vehicle) — is decoded LATER from a dedicated tail stash that is
 // re-snapshotted each poll while the ring is live and frozen before any
-// ring-destroying event. All functions are dead unless MERCURY_TOPGEAR_ELECT
-// armed a pending (default path unmoved).
+// ring-destroying event. The same mechanism now also services the optional
+// Gearshift-v2 quality tail; it never delays acceptance of the ACK prefix.
 
 void cl_arq_controller::topgear_pending_report_arm(int bsi)
 {
@@ -1641,9 +1646,13 @@ void cl_arq_controller::topgear_pending_report_arm(int bsi)
 	topgear_pending_timer.stop();
 	topgear_pending_timer.reset();
 	topgear_pending_timer.start();
-	printf("[TOPGEAR-PENDING] arm bsi=%d cfg=%d (report codeword not yet in capture; deferring decode)\n",
-		topgear_pending_report_bsi, topgear_pending_cfg);
-	fflush(stdout);
+	const char* qtrace = std::getenv("MERCURY_GS2_QUALITY_TRACE");
+	if(!gearshift_quality_report_v2_enabled() || (qtrace && *qtrace && atoi(qtrace) != 0))
+	{
+		printf("[TOPGEAR-PENDING] arm bsi=%d cfg=%d (report codeword not yet in capture; deferring decode)\n",
+			topgear_pending_report_bsi, topgear_pending_cfg);
+		fflush(stdout);
+	}
 	// First snapshot right away — on a fast capture path the report may already be
 	// complete by the next poll, and the freshest-overwrite ticks only improve it.
 	topgear_pending_stash_refresh();
@@ -1657,8 +1666,12 @@ void cl_arq_controller::topgear_pending_report_clear(const char* reason)
 #if MFSK_ACK_SACK_ENABLED
 	if(topgear_pending_report_bsi < 0)
 		return;
-	printf("[TOPGEAR-PENDING] clear bsi=%d (%s)\n", topgear_pending_report_bsi, reason);
-	fflush(stdout);
+	const char* qtrace = std::getenv("MERCURY_GS2_QUALITY_TRACE");
+	if(!gearshift_quality_report_v2_enabled() || (qtrace && *qtrace && atoi(qtrace) != 0))
+	{
+		printf("[TOPGEAR-PENDING] clear bsi=%d (%s)\n", topgear_pending_report_bsi, reason);
+		fflush(stdout);
+	}
 	if(strcmp(reason, "applied") != 0)
 		topgear_clear_forward_verdict();
 	topgear_pending_report_bsi = -1;
@@ -1752,7 +1765,7 @@ void cl_arq_controller::topgear_pending_report_tick()
 #if MFSK_ACK_SACK_ENABLED
 	if(topgear_pending_report_bsi < 0)
 		return;
-	if(!topgear_elect_feature_enabled())
+	if(!gearshift_quality_report_transport_enabled())
 	{
 		topgear_pending_report_clear("feature-off");
 		return;
@@ -1776,7 +1789,10 @@ void cl_arq_controller::topgear_pending_report_tick()
 			rx_bsi, scalable_sack_on() && cumulative_ack_enabled);
 		if(decoded && resolved_target == topgear_pending_report_bsi && report_valid)
 		{
-			topgear_apply_report(report, resolved_target);
+			if(gearshift_quality_report_v2_enabled())
+				gearshift_apply_quality_report(report, resolved_target);
+			else
+				topgear_apply_report(report, resolved_target);
 			topgear_pending_report_clear("applied");
 			return;
 		}
@@ -2645,6 +2661,9 @@ int cl_arq_controller::connect_seed_target_core(double snr_uplink, int snr_mappe
 // the pure core. Returns the seed config or CONFIG_NONE (no seed -> start ROBUST_0).
 int cl_arq_controller::connect_seed_target()
 {
+	// Gearshift-v2 ACTIVE performs data-plane acquisition itself; do not let
+	// the legacy control-plane SNR seed become a second normal authority.
+	if(rate_opt.controls_link()) return CONFIG_NONE;
 #ifdef CONNECT_SEED_FAILBEFORE
 	// FAIL-BEFORE arm: the start is NEVER seeded (the pre-fix crawl-from-ROBUST_0
 	// behaviour). The directed test's pass-after (a clean channel seeds a WB start)
@@ -3451,7 +3470,8 @@ void cl_arq_controller::process_messages_commander()
 		// in-band CONFIG_TAG codec does not carry cfg17's synthetic ladder index; the legacy
 		// SET_CONFIG handshake packs the
 		// RAW config and negotiates cfg17 correctly - topgear-stack-productionize.md 5).
-		if (topgear_elect_feature_enabled()
+		if (!rate_opt.controls_link()
+		    && topgear_elect_feature_enabled()
 		    && !inband_rate_feature_enabled()   // structural refusal: cfg17 has no in-band CONFIG_TAG ladder index
 		    && !turboshift_active
 		    && emergency_break_active == 0
@@ -3476,6 +3496,8 @@ void cl_arq_controller::process_messages_commander()
 				// HELD at the top rung - OWN it: cancel any general optimizer proposal that
 				// would clamp to WB_CONFIG_MAX (16) and pull the top rung back down.
 				opt_pending_switch_cfg = -1;
+				opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+				opt_pending_switch_fallback = -1;
 			}
 			if (tg_target >= 0)
 			{
@@ -3497,56 +3519,71 @@ void cl_arq_controller::process_messages_commander()
 
 		if (opt_pending_switch_cfg >= 0
 		    && opt_pending_switch_cfg != current_configuration
-		    && !turboshift_active
+		    && (!turboshift_active || rate_opt.controls_link())
 		    && emergency_break_active == 0
 		    && link_status == CONNECTED
-		    && is_ofdm_config(current_configuration)
+		    && (is_ofdm_config(current_configuration) || rate_opt.controls_link())
 		    && block_under_tx == NO
 		    && messages_control.status == FREE)
 		{
+			const int from_cfg = current_configuration;
 			int target = opt_pending_switch_cfg;
-			// Clamp to mode-appropriate ceiling + max-config override.
-			const int mode_ceiling =
-				(narrowband_enabled == YES) ? NB_CONFIG_MAX : topgear_wb_ceiling();
-			if (target > mode_ceiling) target = mode_ceiling;
-			if (max_config_override >= 0 && target > max_config_override)
-				target = max_config_override;
-			// WALL-B FIX-5 hook (audit R7 — optimizer authority): the Q-table optimizer can
-			// independently propose CFG16 via opt_pending_switch_cfg WITHOUT flowing through
-			// the gearshift/turbo climb gates, so it is a FOURTH producer of a CFG16
-			// SET_CONFIG. AND the cooldown cap here too, else the cooldown leaks via the
-			// optimizer axis and the carve-dead rung is re-elected. Index-monotone never-raise;
-			// no-op off the cooldown (batches==0) so optimizer behavior is otherwise unchanged.
-			target = apply_bigblock_cooldown_cap(target);
-			// CFG16 decode-margin gate: the Q-table optimizer is a FOURTH CFG16 producer that
-			// bypasses the gearshift/turbo climb gates, so cap it at CFG15 too until the
-			// reverse-path SNR supports CFG16 (never-raise; identity at high SNR / WB-off).
-			target = apply_cfg16_margin_cap(target);
-			// Per-rung floor gate on the FOURTH (optimizer) producer: the Q-table bypasses the
-			// gearshift/turbo climb gates, so floor-cap its SET_CONFIG target too (never-raise).
-			target = rung_floor_cap_fire(target);
-			if (target != current_configuration && is_ofdm_config(target))
+			const int mode_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX :
+				(rate_opt.controls_link()
+				 ? (topgear_elect_feature_enabled() ? CONFIG_17 : WB_CONFIG_MAX)
+				 : topgear_wb_ceiling());
+			// ACTIVE v2 is the sole ordinary Axis-1 authority.  The legacy topgear
+			// election may not veto a cfg17 action that v2 has explicitly priced and
+			// admitted; only the administrative MERCURY_TOPGEAR_ELECT opt-in remains.
+			// OFDM admission ceilings are not numeric ceilings on the robust tier
+			// (ROBUST_* intentionally use IDs 100+).  Apply OFDM-only climb caps
+			// only to an OFDM destination; robust 0/1/2 retain ladder ordering.
+			if (is_ofdm_config(target))
 			{
-				printf("[OPT] queue SET_CONFIG: %d -> %d (effective-rate optimizer)\n",
-				       current_configuration, target);
+				if (target > mode_ceiling) target = mode_ceiling;
+				if (max_config_override >= 0 && target > max_config_override)
+					target = max_config_override;
+				target = apply_bigblock_cooldown_cap(target);
+				if (!rate_opt.controls_link())
+				{
+					// Legacy-only empirical SNR floors. ACTIVE v2 prices the
+					// uncertainty/goodput directly and must be able to disprove stale
+					// thresholds with bounded probes.
+					target = apply_cfg16_margin_cap(target);
+					target = rung_floor_cap_fire(target);
+				}
+			}
+			const bool v2_target_ok = is_ofdm_config(target) ||
+				(is_robust_config(target) && !is_robust3_config(target));
+			if (target != current_configuration && v2_target_ok)
+			{
+				const char* move_reason =
+					(opt_pending_switch_action == GEARSHIFT_ACTION_PROBE) ? "gearshift_v2_probe" :
+					(opt_pending_switch_action == GEARSHIFT_ACTION_ROLLBACK) ? "gearshift_v2_rollback" :
+					"gearshift_optimizer";
+				printf("[GEARSHIFT-V2] queue SET_CONFIG: %d -> %d action=%d fallback=%d\n",
+				       from_cfg, target, (int)opt_pending_switch_action,
+				       opt_pending_switch_fallback);
 				fflush(stdout);
+				policy_axis1_supremacy_on_move(from_cfg, target, move_reason);
 				negotiated_configuration = target;
-				// CLIMB-CHURN bsi rollback (data-flow-climb-up-bsi-rollback.md §5):
-				// the optimizer is the FOURTH SET_CONFIG climb-up producer. Capture+
-				// roll BEFORE cleanup() so any un-ACKed in-flight (partial-SACK)
-				// batch re-presents CONTIGUOUSLY at the new config (no >=2 gap-gate
-				// HOLD). No-op off the v2 in-order path / when nothing is in flight.
-				roll_back_cmd_bsi_to_inflight("OPT");
+				roll_back_cmd_bsi_to_inflight("GEARSHIFT-V2");
 				cleanup();
+				rate_opt.notify_switch_dispatched(from_cfg, target,
+					opt_pending_switch_action, opt_pending_switch_fallback, opt_now_ms(),
+					narrowband_enabled == YES);
 				add_message_control(SET_CONFIG);
 				opt_reset_window();
-				rate_opt.force_cooldown(5);
 				connection_status = TRANSMITTING_CONTROL;
 				opt_pending_switch_cfg = -1;
+				opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+				opt_pending_switch_fallback = -1;
 				return;
 			}
-			// Target became invalid between recording and dispatch — drop.
+			rate_opt.notify_switch_failed();
 			opt_pending_switch_cfg = -1;
+			opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+			opt_pending_switch_fallback = -1;
 		}
 
 		print_stats();
@@ -3768,6 +3805,37 @@ int cl_arq_controller::add_message_control(char code)
 			}
 
 			negotiated_configuration = forward_configuration;
+
+			// Universal Axis-1 transition contract.  A producer may have prepared
+			// the lower-axis invalidation already; if not, repair the omission here.
+			// The preparation token makes this exactly-once for a given move.
+			if(link_status == CONNECTED && forward_configuration != current_configuration)
+			{
+				const bool prepared = axis1_supremacy_prepared
+					&& axis1_supremacy_prepared_from == current_configuration
+					&& axis1_supremacy_prepared_to == forward_configuration;
+				if(!prepared)
+					policy_axis1_supremacy_on_move(current_configuration,
+						forward_configuration, "set-config-chokepoint");
+				axis1_supremacy_prepared = false;
+				axis1_supremacy_prepared_from = CONFIG_NONE;
+				axis1_supremacy_prepared_to = CONFIG_NONE;
+			}
+
+			// Gearshift-v2 transition synchronization chokepoint. Every on-wire
+			// SET_CONFIG producer (normal v2, implementation safety demote, BREAK
+			// recovery, etc.) passes through this builder. A matching v2-owned
+			// switch is recognized and ignored; any other connected-session move
+			// invalidates probe/context state so the selector cannot keep reasoning
+			// as though the old modulation were still in force.
+			if(rate_opt.controls_link() && link_status == CONNECTED
+			   && forward_configuration != current_configuration)
+			{
+				rate_opt.notify_external_axis1_transition(
+					current_configuration, forward_configuration,
+					"set-config-chokepoint", narrowband_enabled == YES);
+			}
+
 			messages_control.data[1] = forward_configuration;
 			messages_control.data[2] = reverse_configuration;
 			messages_control.length = 3;
@@ -5197,10 +5265,11 @@ void cl_arq_controller::process_messages_tx_data()
 		}
 		mtl::log_event_kv("cmd_batch_tx_start", "batch=%lld nframes=%d cfg=%d",
 		                  stats.nBatches_sent + 1, data_batch_size, current_configuration);
-		// Phase 3a (Effective-Rate Optimizer) — back-fill the prior batch slot's
-		// wire_ms with the cycle-time delta, and refresh the tx-start stamp for
-		// the batch about to leave. No decision logic here — pure measurement.
-		opt_on_batch_tx_start();
+		// Start one Gearshift-v2 transaction interval and capture its attempt
+		// lineage. The ACK/no-ACK close records the complete cycle directly, so
+		// terminal batches never depend on a later batch to supply elapsed time.
+		opt_on_batch_tx_start((unsigned int)message_batch_counter_tx,
+			(unsigned int)std::max(0, std::min(v2_retx_block_count, message_batch_counter_tx)));
 		if(sack_v2_enabled && batch_includes_new_data)
 		{
 			printf("[CMD-BATCH-SEQ] new-data batch_seq_id=%d (frames in batch=%d)\n",
@@ -6191,6 +6260,7 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				// Under slot-liveness, demote only after the real retry budget failed.
 				&& (!linkphase_slotliveness_on() || messages_control.nResends <= 1))
 			{
+				rate_opt.notify_switch_failed();
 				gear_shift_timer.stop();
 				gear_shift_timer.reset();
 
@@ -7950,7 +8020,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// actually got (the bitmap-true frames). Failed=false.
 				opt_record_batch((unsigned int)opt_sack_bytes_delivered,
 				                 /*sack_used=*/true,
-				                 /*failed=*/false);
+				                 /*failed=*/false,
+				                 /*frames_acked=*/rx_count);
 				// Phase 3c — ask the optimizer whether to switch. Defers the
 				// queued SET_CONFIG to the next TRANSMITTING_DATA tick (clean
 				// dispatch site) instead of mid-receive to avoid stepping on
@@ -8533,25 +8604,28 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// here, so the forward-loss and window-problem demote paths stay byte-identical.
 			ackfail_classifier_step(ack_pattern_time_ms, ack_diag_peak_metric, ack_diag_peak_matched, /*sack_this_round=*/false);
 
-			// Phase 3a — record this batch as failed (no ACK received before
-			// receiving_timeout). Whether or not BREAK fires below, the batch
-			// itself delivered no bytes; capture that here so each failed batch
-			// is recorded exactly once. Bytes delivered = 0, sack_used = false,
-			// failed = true. The wire_ms will be back-filled by the NEXT batch's
-			// opt_on_batch_tx_start() — or stay 0 if the link terminates here
-			// (in which case opt_reset_window() wipes the slot anyway).
+			// Record this completed no-ACK transaction as a known zero-delivery
+			// outcome.  opt_record_batch() closes its cycle immediately using the
+			// TX-start timestamp, so terminal failures remain in the goodput
+			// denominator even if no later DATA batch is ever started.
 			opt_record_batch(/*bytes_delivered=*/0,
 			                 /*sack_used=*/false,
 			                 /*failed=*/true);
-			// Phase 3c — drain the optimizer's cooldown on failure too so it
-			// doesn't get stuck after a transient channel hiccup. We do NOT
-			// run evaluate() here: failed batches feed noisy zero-rate
-			// samples into the window and a switch in the middle of BREAK
-			// triage would compete with the recovery logic below.
-			rate_opt.notify_cooldown_tick();
-			// Cancel any stale pending switch — BREAK / NACK handling owns
-			// the next config transition.
+			// ACTIVE v2 owns ordinary performance adaptation, including known-zero
+			// no-ACK outcomes. Evaluate the failed transaction now so repeated
+			// forward failures can select a safer evidenced action before BREAK is
+			// required. Emergency BREAK below still has precedence: if it fires it
+			// cancels this pending normal move. Legacy mode preserves the historical
+			// behavior of leaving failure triage to BREAK/ladder machinery.
 			opt_pending_switch_cfg = -1;
+			opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+			opt_pending_switch_fallback = -1;
+			if(rate_opt.controls_link())
+			{
+				int rec = current_configuration;
+				if(opt_evaluate_batch_end(&rec))
+					opt_pending_switch_cfg = rec;
+			}
 
 			// Frame gearshift just applied but data failed — BREAK immediately.
 			// §7.13.33 — retry once before BREAK: on a CFG7→CFG15 PHY-switch,
@@ -10007,7 +10081,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 		// engaged verdict HERE, at the clean-ACK seam, using the FRAME-UP promotion protocol
 		// VERBATIM (the modem's own proven mid-transfer switch, ~40 lines up). The idle producer
 		// STAYS (paced traffic + the HELD arm). No-op unless MERCURY_TOPGEAR_ELECT => byte-identical.
-		if(topgear_elect_feature_enabled() && data_ack_received == YES)
+		if(!rate_opt.controls_link() && topgear_elect_feature_enabled() && data_ack_received == YES)
 		{
 			// B1: count down clean batches since the last seam demote (once per clean seam).
 			if(last_batch_fully_acked && topgear_reengage_cooldown > 0)
@@ -11838,6 +11912,7 @@ void cl_arq_controller::process_control_commander()
 					messages_control_restore();
 					printf("[GEARSHIFT] SET_CONFIG ACKed, loaded config %d\n", data_configuration);
 					fflush(stdout);
+					rate_opt.notify_switch_confirmed(opt_now_ms());
 					// R1-rescope: a SET_CONFIG that CHANGED the geometry is a control
 					// turnaround preceding a new-geometry data batch — arm the post-control-
 					// turnaround wait so the first frame does not key inside the peer's
@@ -12228,7 +12303,8 @@ void cl_arq_controller::process_control_commander()
 					// fresh OFDM SNR is available. If it suggests we're far below optimal,
 					// re-enter turboshift to jump ahead (rise fast, fall slow).
 					bool retriggered = false;
-					if(turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
+					if(!rate_opt.controls_link() &&
+					   turboshift_phase == TURBO_DONE && gear_shift_on == YES &&
 					   is_ofdm_config(current_configuration) && measurements.SNR_uplink > -90)
 					{
 						// CONTROLLED ELEVATOR (fork (1), gearshift-climb-engine.md sec 13/14):
@@ -12364,13 +12440,9 @@ void cl_arq_controller::l1_gearfeed_replay_intermediate()
 	// 0..n-2. Each batch is credited clean/partial from its own acked/span (an
 	// applied aggregate is all-clean today, since a partial DROPs; carrying the
 	// per-batch truth keeps this correct if that policy ever changes).
-	// Per-batch delivered bytes and per-batch wire_ms do not ride the aggregate,
-	// so replayed optimizer-ring slots carry 0 for both: they advance the window
-	// sample count and the clean/no-SACK classification (what the effective-rate
-	// optimizer's climb gate reads) WITHOUT perturbing the throughput estimate,
-	// which excludes never-back-filled slots by construction (opt_record_batch).
-	// The bias is neutral on the climb gate; the optimizer is additionally inert
-	// unless a rate table is loaded.
+	// Per-batch bytes and elapsed cycle time do not ride the aggregate. Replay
+	// therefore contributes outcome-valid clean/partial frame evidence only; it
+	// never fabricates rate evidence or changes the application-goodput numerator.
 	const std::vector<l1_block::PerBatchAck>& batches =
 		l1_blockack.last_applied_batches();
 	int replayed = 0;
@@ -12381,7 +12453,10 @@ void cl_arq_controller::l1_gearfeed_replay_intermediate()
 		last_transmission_block_stats.nBatches_acked++;
 		if(clean)
 			last_transmission_block_stats.nBatches_fully_acked++;
-		opt_record_batch(0u, /*sack_used=*/!clean, /*failed=*/false);
+		opt_record_batch(0u, /*sack_used=*/!clean, /*failed=*/false,
+		                 /*frames_acked=*/(int)b.acked_slots,
+		                 /*frames_sent_override=*/(unsigned int)b.span_slots,
+		                 /*outcome_only=*/true);
 		{
 			int rec = current_configuration;
 			if(opt_evaluate_batch_end(&rec))
@@ -12418,11 +12493,28 @@ void cl_arq_controller::finalize_block_commander()
 	if(compressor.is_streaming())
 		compressor.commit_pending();
 
-#ifdef MERCURY_GUI_ENABLED
+	// Application-goodput objective: credit original useful bytes once, only
+	// after the atomic batch has been acknowledged/assembled. SACK-banked
+	// transport fragments remain a separate progress signal.
 	if(batch_uncompressed_size > 0)
-		gui_add_throughput_bytes_tx(batch_uncompressed_size);
-	batch_uncompressed_size = 0;
+	{
+		const int committed_application_bytes = batch_uncompressed_size;
+		opt_commit_application_bytes((unsigned int)committed_application_bytes);
+		// The atomic unit is now delivered.  Clear it before evaluating remaining
+		// work so a final transfer cannot justify a switch using bytes that have
+		// already reached the application.
+		batch_uncompressed_size = 0;
+		int rec = current_configuration;
+		if(opt_evaluate_batch_end(&rec))
+			opt_pending_switch_cfg = rec;
+#ifdef MERCURY_GUI_ENABLED
+		gui_add_throughput_bytes_tx(committed_application_bytes);
 #endif
+	}
+	else
+	{
+		batch_uncompressed_size = 0;
+	}
 
 	// Success rate: use batch-level metric for pattern ACK (all-or-nothing ACK).
 	// Frame-level nReSent/nSent is poisoned by ACK-loss retransmissions that aren't
@@ -12583,11 +12675,13 @@ void cl_arq_controller::finalize_block_commander()
 			// never reached ROBUST_0 floor. The original strict-reset is the
 			// right policy until the interaction with BREAK descent is
 			// understood and the cooldown is rethought.
-			if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
+			if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage
+			   || optimizer_owns_normal_downshift())
 				gear_shift_down_consecutive_fails = 0;
-			// Handoff: above the lowest calibrated Q-table cell, gearshift's
-			// LADDER UP must yield to the optimizer (which suggests targets
-			// via opt_pending_switch_cfg). Downward moves remain available.
+			// Handoff: upward moves retain the monitor branch's calibrated-band
+			// optimizer ownership. Ordinary success-rate LADDER DOWN yields only when
+			// optimizer_owns_normal_downshift() has enough aligned evidence; BREAK
+			// remains independent.
 			// CLEAN-BATCH VIABILITY (§9): the UP gate uses the CLEAN-only rate so a
 			// partial-only run (success_rate_data may read 100% from SACK recoveries)
 			// does NOT clear the 85% threshold and climb into a non-viable config.
@@ -12680,8 +12774,26 @@ void cl_arq_controller::finalize_block_commander()
 				}
 				}
 			}
-			else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage)
+			else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage
+				&& optimizer_owns_normal_downshift())
 			{
+				printf("[GEARSHIFT] LADDER DOWN deferred to effective-rate optimizer: "
+				       "success=%.0f%% cfg=%d eff=%.0f sack=%.3f partial_loss=%.3f\n",
+				       last_transmission_block_stats.success_rate_data, current_configuration,
+				       get_current_effective_rate_bps(), get_current_sack_rate(),
+				       get_current_partial_frame_loss_rate());
+				fflush(stdout);
+				this->connection_status=TRANSMITTING_DATA;
+			}
+			else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage
+				&& !optimizer_owns_normal_downshift())
+			{
+				// In the calibrated band, selective-repeat losses are priced by the
+				// effective-goodput optimizer.  Do not independently downshift just
+				// because a block's first-pass success percentage is low: the faster
+				// config may still deliver more new bytes/sec after repair. BREAK and
+				// below/out-of-calibration fallback remain untouched safety paths.
+				// Outside optimizer ownership retain the legacy 3-bad-block descent.
 				// Require 3 consecutive bad blocks before downshifting.
 				// A single ACK timeout on an otherwise good channel shouldn't
 				// trigger a config downshift (the retry will succeed).
@@ -12765,11 +12877,14 @@ void cl_arq_controller::policy_evaluate_axis1()
 	// SACK_DESIGN_A_PLAN §7.13.24 reverted — see comment on the parallel
 	// site in the legacy ladder above. Strict-reset is the right policy
 	// until the interaction with BREAK descent is understood.
-	if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage)
+	if(last_transmission_block_stats.success_rate_data >= gear_shift_down_success_rate_precentage
+	   || optimizer_owns_normal_downshift())
 		gear_shift_down_consecutive_fails = 0;
 
-	// Handoff: above the lowest calibrated Q-table cell, gearshift's
-	// LADDER UP must yield to the optimizer. See optimizer_is_in_control().
+	// Handoff: upward moves retain the monitor branch's calibrated-band
+	// optimizer ownership. Ordinary success-rate LADDER DOWN yields only when
+	// optimizer_owns_normal_downshift() has enough aligned evidence; emergency
+	// BREAK remains independent.
 	// CLEAN-BATCH VIABILITY (§9): UP gate uses the CLEAN-only rate (see the legacy
 	// ladder twin in finalize_block_commander) so partial-only runs don't promote.
 	if(success_rate_data_clean>gear_shift_up_success_rate_precentage
@@ -12866,8 +12981,25 @@ void cl_arq_controller::policy_evaluate_axis1()
 			this->connection_status=TRANSMITTING_DATA;
 		}
 	}
-	else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage)
+	else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage
+		&& optimizer_owns_normal_downshift())
 	{
+		printf("[GEARSHIFT] LADDER DOWN deferred to effective-rate optimizer: "
+		       "success=%.0f%% cfg=%d eff=%.0f sack=%.3f partial_loss=%.3f\n",
+		       last_transmission_block_stats.success_rate_data, current_configuration,
+		       get_current_effective_rate_bps(), get_current_sack_rate(),
+		       get_current_partial_frame_loss_rate());
+		fflush(stdout);
+		this->connection_status=TRANSMITTING_DATA;
+	}
+	else if(last_transmission_block_stats.success_rate_data<gear_shift_down_success_rate_precentage
+		&& !optimizer_owns_normal_downshift())
+	{
+		// In the calibrated band the effective-goodput optimizer owns normal
+		// performance downshifts as well as climbs. A low first-pass success
+		// percentage can still be optimal when SACK repair is cheap. BREAK is
+		// still independent, and this legacy descent remains the fallback while
+		// the optimizer is unready or outside its calibrated loss envelope.
 		// Require 3 consecutive bad blocks before downshifting.
 		// A single ACK timeout on an otherwise good channel shouldn't
 		// trigger a config downshift (the retry will succeed).
@@ -12954,8 +13086,16 @@ static const char* axis3_mode_str(int m);
 
 void cl_arq_controller::policy_axis1_supremacy_on_move(int from_cfg, int to_cfg, const char* reason)
 {
-	(void)from_cfg;
-	(void)to_cfg;
+	// A real Axis-1 move is prepared exactly once here and consumed by the
+	// universal SET_CONFIG/in-band executor.  Producers that already call this
+	// hook therefore do not get a second lower-axis reset at the chokepoint;
+	// producers that forgot it are repaired centrally there.
+	if(from_cfg != to_cfg)
+	{
+		axis1_supremacy_prepared = true;
+		axis1_supremacy_prepared_from = from_cfg;
+		axis1_supremacy_prepared_to = to_cfg;
+	}
 	// SACK Design A Step 10 — Axis 2 reset (§4.3.3 cross-axis cooldown).
 	//
 	// Axis 1's move changed the modulation, which invalidates the partial-rate

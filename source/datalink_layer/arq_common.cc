@@ -23,6 +23,7 @@
 #include "datalink_layer/arq.h"
 #include "common/snr_decision_grid.h"
 #include "datalink_layer/l1_block_codec.h"
+#include "datalink_layer/gearshift_quality_report.h"
 #include "audioio/audioio.h"
 #include "debug/canary_guard.h"
 #include "physical_layer/mfsk_ctrl_codec.h"  // Stage 2 in-band rate-adapt config tag
@@ -1196,6 +1197,9 @@ cl_arq_controller::cl_arq_controller()
 	axis2_consecutive_good_batches=0;
 	axis2_consecutive_bad_batches=0;
 	axis2_cooldown_batches=0;
+	axis1_supremacy_prepared=false;
+	axis1_supremacy_prepared_from=CONFIG_NONE;
+	axis1_supremacy_prepared_to=CONFIG_NONE;
 	// SACK Design A Step 12 — Axis-2 proven-ceiling state (§4.3.4 invariant #7).
 	// Default ceiling = -1 (no cap). Set on Axis-2 down-move; cleared on
 	// recovery (20 batches) or on any Axis-1 supremacy event.
@@ -1321,6 +1325,9 @@ cl_arq_controller::cl_arq_controller()
 	block_forward_air_ms=0;
 	emergency_ackmiss_defer_streak=0;
 	topgear_last_flat_state=8;
+	gearshift_quality_tx_valid=false;
+	gearshift_quality_tx_report=0;
+	gearshift_quality_tx_bsi=-1;
 	// Consume-race deferred report decode: nothing pending on a fresh controller.
 	topgear_pending_report_bsi=-1;
 	topgear_pending_cfg=CONFIG_NONE;
@@ -1409,8 +1416,10 @@ cl_arq_controller::cl_arq_controller()
 	frame_gearshift_just_applied=false;
 	frame_gearshift_retry_count=0;
 
-	turboshift_phase=TURBO_FORWARD;
-	turboshift_active=true;
+	// Gearshift-v2 ACTIVE owns normal acquisition after the robust/connection
+	// handshake.  Legacy/shadow preserve the historical turboshift machinery.
+	turboshift_phase = rate_opt.controls_link() ? TURBO_DONE : TURBO_FORWARD;
+	turboshift_active = !rate_opt.controls_link();
 	turboshift_last_good=-1;
 	turboshift_initiator=false;
 	turboshift_retries=1;
@@ -1578,21 +1587,16 @@ cl_arq_controller::cl_arq_controller()
 		exit(MEMORY_ERROR);
 	}
 
-	// Phase 3a (Effective-Rate Optimizer) — zero-init the rolling window.
-	// Same effect as opt_reset_window(), but called explicitly here so the
-	// invariant "ring arrays start zero" is enforced before any session.
-	for (int i = 0; i < OPTIMIZER_WINDOW_SIZE; i++) {
-		opt_batch_bytes_delivered[i] = 0;
-		opt_batch_wire_ms[i] = 0;
-		opt_batch_sack_count[i] = 0;
-		opt_batch_failed[i] = 0;
-		opt_batch_config[i] = 0;
-	}
-	opt_window_head = 0;
-	opt_window_count = 0;
-	opt_batch_tx_start_ms = 0;
-	opt_diag_emit_counter = 0;
-	opt_pending_switch_cfg = -1;  // Phase 3c — no pending optimizer switch
+	// Gearshift measurement/controller state starts empty. Record ids are
+	// process-lifetime monotonic so config/window resets cannot alias primitive
+	// calibration records. opt_reset_window() clears only the rolling evidence.
+	opt_record_sequence = 0;
+	opt_application_unit_sequence = 1;
+	opt_current_batch_repair_frames = 0;
+	opt_reset_window();
+	opt_pending_switch_cfg = -1;
+	opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+	opt_pending_switch_fallback = -1;
 
 }
 
@@ -2391,6 +2395,154 @@ int cl_arq_controller::derive_keydown_length_ms(int frame_count, bool force_full
 	int r = (int)(kd + 0.5);
 	if(r < 0) r = 0;
 	return r;
+}
+
+
+static st_bigblock_candidate_geometry gs2_predict_bigblock_bundle(
+    const st_config_bundle& g, double sampling_frequency)
+{
+    const char* e;
+    e = std::getenv("MERCURY_BIGBLOCK_NSYMB");
+    const int ngrid = (e && *e) ? std::atoi(e) : 60;
+    e = std::getenv("MERCURY_BIGBLOCK_CONT_COLS");
+    const int cont_cols = (e && *e) ? std::atoi(e) : 2;
+    e = std::getenv("MERCURY_BIGBLOCK_SCAT_DX");
+    const int scat_dx = (e && *e) ? std::atoi(e) : 3;
+    e = std::getenv("MERCURY_BIGBLOCK_SCAT_DY");
+    const int scat_dy = (e && *e) ? std::atoi(e) : 4;
+    e = std::getenv("MERCURY_BIGBLOCK_K");
+    const int kcap = (e && *e) ? std::atoi(e) : 0;
+    const int mod_order = g.M > 1 ? g.M : (int)std::llround(g.M_telecom);
+    return optimizer_predict_bigblock_geometry(
+        g.Nc, g.Nfft, g.Ngi, g.preamble_nSymb, g.interpolation_rate,
+        mod_order, g.ldpc.N, g.ldpc.K, sampling_frequency,
+        ngrid, cont_cols, scat_dx, scat_dy, kcap);
+}
+
+int cl_arq_controller::predict_keydown_length_ms_for_config(
+    int config, int frame_count, bool force_full) const
+{
+    if(frame_count < 1) return 0;
+    if(telecom_system == NULL ||
+       !(is_ofdm_config(config) || (is_robust_config(config) && !is_robust3_config(config)))) return 0;
+
+    const int band = (narrowband_enabled == YES) ? YES : NO;
+    const int idx = telecom_system->bundle_index(config, band);
+    if(idx < 0) return 0;
+    const std::vector<std::unique_ptr<st_config_bundle>>& set = telecom_system->bundle_set(band);
+    if(idx >= (int)set.size() || set[idx] == nullptr) return 0;
+    const st_config_bundle& g = *set[idx];
+
+    // CFG16 big-block is one thin-grid transmission, not K stock CFG16 frames.
+    // Price the same geometry transmit_bigblock() actually emits.
+    if(config == CONFIG_16 && telecom_system->bigblock_framing_enabled) {
+        const st_bigblock_candidate_geometry bg =
+            gs2_predict_bigblock_bundle(g, telecom_system->sampling_frequency);
+        if(bg.valid) return bg.keydown_ms;
+    }
+
+    if(config == current_configuration)
+        return derive_keydown_length_ms(frame_count, force_full);
+    int ns = g.Nsymb > 0 ? g.Nsymb : 1;
+    int fp = g.preamble_nSymb > 0 ? g.preamble_nSymb : 1;
+    const bool ff = force_full || !telecom_system->preamble_amortization_enabled;
+    double per_symbol_ms = 0.0;
+    if(g.Tf > 0.0) per_symbol_ms = 1000.0 * g.Tf / (double)(ns + fp);
+    else if(g.Ts > 0.0) per_symbol_ms = 1000.0 * g.Ts;
+    if(per_symbol_ms <= 0.0) return 0;
+    long total_symbols = 0;
+    for(int i=0; i<frame_count; ++i)
+        total_symbols += ns + cl_telecom_system::preamble_sched_nsymb(i, ff, fp);
+    const int ms = (int)(per_symbol_ms * (double)total_symbols + 0.5);
+    return ms > 0 ? ms : 0;
+}
+
+int cl_arq_controller::predict_payload_bytes_per_frame_for_config(int config) const
+{
+    if(telecom_system == NULL ||
+       !(is_ofdm_config(config) || (is_robust_config(config) && !is_robust3_config(config)))) return 0;
+    if(config == current_configuration)
+        return max_data_length > 0 ? max_data_length : 0;
+    const int band = (narrowband_enabled == YES) ? YES : NO;
+    const int idx = telecom_system->bundle_index(config, band);
+    if(idx < 0) return 0;
+    const std::vector<std::unique_ptr<st_config_bundle>>& set = telecom_system->bundle_set(band);
+    if(idx >= (int)set.size() || set[idx] == nullptr) return 0;
+    const st_config_bundle& g = *set[idx];
+    const int frame_bytes = (g.nBits - g.ldpc.P - g.outer_code_reserved_bits) / 8;
+    const int payload = frame_bytes - max_header_length;
+    return payload > 0 ? payload : 0;
+}
+
+
+int cl_arq_controller::predict_payload_bytes_per_batch_for_config(
+    int config, int frame_count) const
+{
+    if(frame_count < 1 || telecom_system == NULL) return 0;
+    const int band = (narrowband_enabled == YES) ? YES : NO;
+    const int idx = telecom_system->bundle_index(config, band);
+    if(idx >= 0) {
+        const std::vector<std::unique_ptr<st_config_bundle>>& set = telecom_system->bundle_set(band);
+        if(idx < (int)set.size() && set[idx] != nullptr &&
+           config == CONFIG_16 && telecom_system->bigblock_framing_enabled) {
+            const st_bigblock_candidate_geometry bg =
+                gs2_predict_bigblock_bundle(*set[idx], telecom_system->sampling_frequency);
+            if(bg.valid) {
+                // The initial/elected big-block batch is K. A shorter terminal
+                // block cannot exceed the same full-block application capacity;
+                // scale conservatively for candidate economics.
+                if(frame_count >= bg.codewords) return bg.full_batch_payload_bytes;
+                return (int)std::floor((double)bg.full_batch_payload_bytes *
+                                      (double)frame_count / (double)bg.codewords);
+            }
+        }
+    }
+    const int per = predict_payload_bytes_per_frame_for_config(config);
+    return per > 0 ? per * frame_count : 0;
+}
+
+
+int cl_arq_controller::predict_initial_batch_size_for_config(int config) const
+{
+    // Predict the first DATA batch after an Axis-1 move. load_configuration()
+    // resets robust modes to one frame and re-runs the OFDM 30-second geometry
+    // clamp before Axis-2 is allowed to adapt again.  Candidate economics must
+    // model THAT batch, not reuse the current config's possibly-grown batch.
+    if(config == current_configuration) return std::max(1, data_batch_size);
+    if(is_robust_config(config)) return 1;
+    if(telecom_system == NULL || !is_ofdm_config(config)) return 1;
+    const int band = (narrowband_enabled == YES) ? YES : NO;
+    const int idx = telecom_system->bundle_index(config, band);
+    if(idx < 0) return std::max(1, data_batch_size);
+    const std::vector<std::unique_ptr<st_config_bundle>>& set = telecom_system->bundle_set(band);
+    if(idx >= (int)set.size() || set[idx] == nullptr) return std::max(1, data_batch_size);
+    const st_config_bundle& g = *set[idx];
+    if(config == CONFIG_16 && telecom_system->bigblock_framing_enabled) {
+        const st_bigblock_candidate_geometry bg =
+            gs2_predict_bigblock_bundle(g, telecom_system->sampling_frequency);
+        if(bg.valid) {
+            int K = bg.codewords;
+            const int nmsg = default_configuration_ARQ.nMessages > 0
+                           ? default_configuration_ARQ.nMessages : MAX_SACK_BATCH_SIZE;
+            if(K > nmsg) K = nmsg;
+            if(K > MAX_SACK_BATCH_SIZE) K = MAX_SACK_BATCH_SIZE;
+            return std::max(1, K);
+        }
+    }
+    double frame_ms = g.Tf > 0.0 ? 1000.0 * g.Tf : 0.0;
+    if(frame_ms <= 0.0 && g.Ts > 0.0 && g.Nsymb > 0)
+        frame_ms = 1000.0 * g.Ts * (double)(g.Nsymb + std::max(1, g.preamble_nSymb));
+    if(frame_ms <= 0.0) return std::max(1, data_batch_size);
+    int max_batch = (int)(30000.0 / frame_ms + 0.5);
+    if(max_batch < 5) max_batch = 5;
+    const int nmsg = default_configuration_ARQ.nMessages > 0
+                   ? default_configuration_ARQ.nMessages : MAX_SACK_BATCH_SIZE;
+    if(max_batch > nmsg) max_batch = nmsg;
+    if(max_batch > MAX_SACK_BATCH_SIZE) max_batch = MAX_SACK_BATCH_SIZE;
+    int initial = sack_enabled ? radio_batch_size : 10;
+    if(initial < 1) initial = 1;
+    if(initial > max_batch) initial = max_batch;
+    return initial;
 }
 
 void cl_arq_controller::set_data_batch_size(int data_batch_size, bool from_link_params)
@@ -4504,6 +4656,10 @@ static uint16_t arq_inband_crc12_cb(void* ctx, const unsigned char* data, int n)
 
 bool cl_arq_controller::inband_rate_feature_enabled()
 {
+	// In Gearshift-v2 ACTIVE, CONFIG_TAG/Scream remains unavailable as an
+	// independent rate authority.  The active controller uses the proven
+	// SET_CONFIG executor so there is exactly one ordinary config producer.
+	if(rate_opt.controls_link()) return false;
 	if(inband_rate_enabled < 0)
 	{
 		const char* e = std::getenv("MERCURY_INBAND_RATE");
@@ -4696,11 +4852,112 @@ bool cl_arq_controller::inband_a3_decouple_enabled()
 // methods are all unreachable through election while the authority redesign is pending:
 // cfg17 never elects and the WB ceiling stays CONFIG_16.
 
-// cfg17 election is intentionally unavailable until its session authority is
-// redesigned. No environment setting may arm this path in the separable build.
+// cfg17 is opt-in because it remains the experimental 64-QAM rung, but the
+// authority redesign is now Gearshift-v2: when enabled, v2 owns the election
+// and the legacy topgear producers are gated off in ACTIVE mode.  Keep the
+// historical MERCURY_TOPGEAR_ELECT switch so deployments must explicitly
+// advertise their willingness to use CONFIG_17.
 bool cl_arq_controller::topgear_elect_feature_enabled()
 {
-	return false;
+	if(topgear_elect_enabled < 0)
+	{
+		const char* e = std::getenv("MERCURY_TOPGEAR_ELECT");
+		topgear_elect_enabled = (e && *e && atoi(e) != 0) ? 1 : 0;
+	}
+	return topgear_elect_enabled == 1;
+}
+
+// Gearshift-v2 quality telemetry is advisory and deliberately independent of
+// CONFIG_17 permission.  ACTIVE/SHADOW enable the existing optional compact
+// confirm tail by default; an explicit 0 disables it.  --no-optimizer remains
+// a hard fixed-mode/calibration kill and therefore suppresses this extra wire
+// work as well.
+bool cl_arq_controller::gearshift_quality_report_v2_enabled() const
+{
+	if(optimizer_disabled) return false;
+	if(rate_opt.get_mode() == GEARSHIFT_V2_LEGACY) return false;
+	const char* e = std::getenv("MERCURY_GS2_QUALITY_REPORT");
+	return !(e && *e && atoi(e) == 0);
+}
+
+bool cl_arq_controller::gearshift_quality_report_transport_enabled()
+{
+	return gearshift_quality_report_v2_enabled() || topgear_elect_feature_enabled();
+}
+
+unsigned char cl_arq_controller::gearshift_pack_quality_report(double snr, double selectivity) const
+{
+	return gearshift_quality_pack(snr, selectivity);
+}
+
+bool cl_arq_controller::gearshift_quality_report_due_for_tx(
+		unsigned char report, int batch_seq_id) const
+{
+	int refresh = GEARSHIFT_QUALITY_REFRESH_BATCHES_DEFAULT;
+	const char* e = std::getenv("MERCURY_GS2_QUALITY_REFRESH_BATCHES");
+	if(e && *e)
+	{
+		int v = atoi(e);
+		if(v > 0 && v < 256) refresh = v;
+	}
+	return gearshift_quality_report_due(gearshift_quality_tx_valid,
+		gearshift_quality_tx_report, gearshift_quality_tx_bsi, report,
+		batch_seq_id, refresh);
+}
+
+void cl_arq_controller::gearshift_quality_report_note_tx(
+		unsigned char report, int batch_seq_id)
+{
+	gearshift_quality_tx_valid = true;
+	gearshift_quality_tx_report = report;
+	gearshift_quality_tx_bsi = batch_seq_id & 0xFF;
+}
+
+void cl_arq_controller::gearshift_apply_quality_report(unsigned char report, int batch_seq_id)
+{
+	if(!gearshift_quality_report_v2_enabled()) return;
+	const int bsi = batch_seq_id & 0xFF;
+	if(topgear_last_report_bsi == bsi) return;
+	topgear_last_report_bsi = bsi;
+
+	const double snr = gearshift_quality_unpack_snr(report);
+	double selectivity = -1.0;
+	const bool have_selectivity = gearshift_quality_unpack_selectivity(report, &selectivity);
+	measurements.SNR_downlink = snr;
+	gearshift_note_forward_snr(snr);
+	if(have_selectivity)
+		gearshift_note_forward_selectivity(selectivity);
+
+	// Keep the legacy topgear observables coherent when that independent CFG17
+	// opt-in is also enabled.  The wire byte now carries real quantized
+	// selectivity; derive the old 8/9/10/11 internal state rather than using
+	// that state as the telemetry payload.  ACTIVE v2 does not consume this
+	// election as an authority, but SHADOW/legacy comparison remains meaningful.
+	topgear_channel_flatness = have_selectivity ? selectivity : -1.0;
+	if(topgear_elect_feature_enabled())
+	{
+		const char* fenv = std::getenv("MERCURY_CFG17_SNR_FLOOR");
+		const double floor_db = (fenv && *fenv) ? atof(fenv) : 0.0;
+		const bool guard_on = floor_db > 0.0;
+		const bool flat = have_selectivity && selectivity <= TOPGEAR_FLATNESS_MAX;
+		// Preserve the legacy guard-off semantics: state 9 means "flat, no
+		// explicit floor verdict". State 11 is earned only when the optional
+		// floor guard is actually armed and the quantized SNR clears it.
+		const bool floor_ok = guard_on && snr >= floor_db;
+		topgear_cfg17_floor_ok = flat && floor_ok;
+		topgear_cfg17_floor_bsi = topgear_cfg17_floor_ok ? bsi : -1;
+		topgear_last_flat_state = !have_selectivity ? 8 : (!flat ? 10 : (topgear_cfg17_floor_ok ? 11 : 9));
+		topgear_elect_evaluate();
+	}
+
+	const char* qtrace = std::getenv("MERCURY_GS2_QUALITY_TRACE");
+	if(qtrace && *qtrace && atoi(qtrace) != 0)
+	{
+		printf("[GEARSHIFT-QUALITY] bsi=%d snr=%.1f sel=%s%.3f report=0x%02x\n",
+			bsi, snr, have_selectivity ? "" : "unknown/",
+			have_selectivity ? selectivity : -1.0, (unsigned)report);
+		fflush(stdout);
+	}
 }
 
 // The channel-clean-AND-flat verdict for the 64-QAM top rung. cfg17 needs BOTH:
@@ -4851,10 +5108,12 @@ void cl_arq_controller::topgear_apply_report(unsigned char report, int batch_seq
 	topgear_last_report_bsi = bsi;
 	int snr_q = (report >> 4) & 0x0F;
 	measurements.SNR_downlink = (double)(snr_q * 2 - 5);
+	gearshift_note_forward_snr(measurements.SNR_downlink);
 	// 8=unmeasured (fail closed); 9=flat/below-cfg17-floor; 10=non-flat; 11=flat/above-cfg17-floor.
 	topgear_channel_flatness = (flat_state == 8)  ? -1.0
 	                         : (flat_state == 10) ? TOPGEAR_FLATNESS_MAX + 0.01   // non-flat
 	                         : 0.0;                                               // 9 or 11 => flat
+	gearshift_note_forward_selectivity(topgear_channel_flatness);
 	topgear_cfg17_floor_ok = (flat_state == 11);  // cfg17 floor verdict from the RSP report (RSP compares the quantized snr_q*2-5 by default; MERCURY_TOPGEAR_FLOOR_QUANTIZED=0 => legacy raw SNR)
 	topgear_cfg17_floor_bsi = topgear_cfg17_floor_ok ? bsi : -1;
 	topgear_last_flat_state = flat_state;   // B2: remember WHY (9 below-floor vs 10 non-flat)
@@ -5672,6 +5931,27 @@ bool cl_arq_controller::inband_unilateral_config_change(int target_cfg)
 	if(config_ladder_index(target_cfg) < 0)
 		return false;
 
+	// The in-band path is a real Axis-1 transition even though it emits no
+	// SET_CONFIG frame.  Enforce the same exactly-once lower-axis invalidation
+	// contract as the on-wire SET_CONFIG chokepoint, then synchronize an
+	// externally-forced move with Gearshift-v2.  A v2-owned transition has
+	// already called notify_switch_dispatched(), so the notifier recognizes it
+	// and leaves the probe/switch lifecycle intact.
+	{
+		const int from_cfg = current_configuration;
+		const bool prepared = axis1_supremacy_prepared
+			&& axis1_supremacy_prepared_from == from_cfg
+			&& axis1_supremacy_prepared_to == target_cfg;
+		if(!prepared)
+			policy_axis1_supremacy_on_move(from_cfg, target_cfg, "inband-chokepoint");
+		axis1_supremacy_prepared = false;
+		axis1_supremacy_prepared_from = CONFIG_NONE;
+		axis1_supremacy_prepared_to = CONFIG_NONE;
+		if(rate_opt.controls_link() && link_status == CONNECTED)
+			rate_opt.notify_external_axis1_transition(from_cfg, target_cfg,
+				"inband-chokepoint", narrowband_enabled == YES);
+	}
+
 	printf("[INBAND-TX] UNILATERAL CONFIG %d -> %d (no SET_CONFIG; next batch tags the "
 		"new config on the passband)\n", current_configuration, target_cfg);
 	fflush(stdout);
@@ -5702,6 +5982,14 @@ bool cl_arq_controller::inband_unilateral_config_change(int target_cfg)
 	// not torn down mid-flight. This writes BOTH the ARQ current_configuration AND the
 	// PHY twin coherently (the D1 coherent switch).
 	load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
+
+	// No dedicated SET_CONFIG ACK exists on this transport.  For a v2-owned
+	// unilateral move the physical switch has completed at this point, so close
+	// the switch transaction now (external moves have no v2 switch_inflight and
+	// this is a no-op).  Follow confirmation remains owned by the existing D1
+	// re-tag/SACK machinery; a failure there is an external regime transition.
+	if(rate_opt.controls_link())
+		rate_opt.notify_switch_confirmed(opt_now_ms());
 
 	// Re-fill TX messages for the new config's message sizes — VERBATIM from the
 	// SET_CONFIG ACK-apply refill (arq_commander.cc:5291-5309). Free all messages_tx[]
@@ -8717,8 +9005,9 @@ void cl_arq_controller::update_status()
 			link_status=CONNECTING;
 			connection_status=TRANSMITTING_CONTROL;
 
-			// Reset turboshift for fresh probe on reconnect
-			turboshift_active = true;
+			// Legacy reconnect re-arms turboshift.  In Gearshift-v2 ACTIVE the
+			// normal controller reacquires directly from delivered-data evidence.
+			turboshift_active = !rate_opt.controls_link();
 			turboshift_phase = TURBO_DONE;
 			turboshift_last_good = -1;
 			turbo_settle_pending = false;
@@ -10011,7 +10300,7 @@ void cl_arq_controller::commander_clean_reconnect(const char* reason)
 	load_configuration(init_configuration, FULL, YES);
 	link_status=CONNECTING;
 	connection_status=TRANSMITTING_CONTROL;
-	turboshift_active = true;
+	turboshift_active = !rate_opt.controls_link();
 	turboshift_phase = TURBO_DONE;
 	turboshift_last_good = -1;
 	turbo_settle_pending = false;
@@ -10410,9 +10699,10 @@ void cl_arq_controller::reset_session_state()
 	inband_nack_emitted_for_dead_streak = false;
 	inband_batches_since_announce = 0;
 
-	// Turboshift — fresh state for next connection
-	turboshift_phase = TURBO_FORWARD;
-	turboshift_active = true;
+	// Turboshift — legacy/shadow keep the historic probe state machine.
+	// ACTIVE mode deliberately has one normal authority: Gearshift-v2.
+	turboshift_phase = rate_opt.controls_link() ? TURBO_DONE : TURBO_FORWARD;
+	turboshift_active = !rate_opt.controls_link();
 	turboshift_last_good = -1;
 	turbo_settle_pending = false;
 	turboshift_initiator = false;
@@ -10472,6 +10762,7 @@ void cl_arq_controller::reset_session_state()
 	// floor_cap_fires is run-lifetime and intentionally NOT cleared here).
 	rung_floor_memory_reset();
 	rung_meter_reset();   // V3: session boundary re-arms the connect-regime latch + clears the snapshot
+	gearshift_reset_channel_reports();
 	break_detected = NO;
 	break_probe_consec_match = 0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	// fix/break-fh-gate: age the forward-health latch out on session reset so a stale
@@ -10542,6 +10833,9 @@ void cl_arq_controller::reset_session_state()
 	l1_aggregate_defer_streak = 0;
 	emergency_ackmiss_defer_streak = 0;
 	topgear_last_flat_state = 8;
+	gearshift_quality_tx_valid = false;
+	gearshift_quality_tx_report = 0;
+	gearshift_quality_tx_bsi = -1;
 	// A pending deferred report is prior-session channel evidence too.
 	topgear_pending_report_clear("session-reset");
 	connect_ack_cache.valid = false;
@@ -10613,6 +10907,8 @@ void cl_arq_controller::reset_session_state()
 	// session ended).
 	rate_opt.reset_session_state();
 	opt_pending_switch_cfg = -1;
+	opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+	opt_pending_switch_fallback = -1;
 
 	// SACK Design A — wipe axis-1/2/3 controller state. Prior session may
 	// have degraded into SACK_MODE_OFF or built up partial-rate-window
@@ -10627,6 +10923,9 @@ void cl_arq_controller::reset_session_state()
 	axis2_partial_rate_count       = 0;
 	axis2_partial_rate_pos         = 0;
 	axis2_cooldown_batches         = 0;
+	axis1_supremacy_prepared       = false;
+	axis1_supremacy_prepared_from  = CONFIG_NONE;
+	axis1_supremacy_prepared_to    = CONFIG_NONE;
 	axis3_sack_mode                = SACK_MODE_ON;
 	axis3_consecutive_sack_misses  = 0;
 	axis3_recent_sack_ok_count     = 0;
@@ -11713,94 +12012,184 @@ bool arq_turn_trace_on();
 bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 {
 	if (out_recommended_cfg) *out_recommended_cfg = current_configuration;
-	// --no-optimizer: hard short-circuit before any state mutation
-	// (including the cooldown tick) so the optimizer is fully inert under
-	// calibration. opt_load_rate_table() also no-ops when disabled.
-	if (optimizer_disabled)                return false;
+	// Calibration/fixed-mode runs rely on --no-optimizer as a hard kill even
+	// though Gearshift-v2 itself can operate without a calibration table.
+	if (optimizer_disabled) return false;
 
-	// MC-7 measured optimizer clock. send_batch() captured the exact emitted
-	// DATA-keydown shape (actual frame count plus whether every frame carried a
-	// full preamble), so derive_keydown_length_ms() reproduces its sample-truth
-	// airtime rather than assuming nominal batch_size * per-frame time. The
-	// fallback is defensive for a synthetic/direct caller with no captured
-	// keydown. No live SET_CONFIG RTT meter exists yet, so retain the honest
-	// documented fallback of 1800 ms while wiring it through the existing setter.
-	// With the flag OFF neither setter is called and the optimizer stays on its
-	// original frozen 1800 ms / 10-batch arithmetic path.
-	if (linkphase_optclock_enabled_common())
-	{
-		int batch_frames = linkphase_last_kd_frames;
-		bool force_full = linkphase_last_kd_force_full;
-		if (batch_frames <= 0)
-		{
-			batch_frames = data_batch_size;
-			force_full = false;
-		}
-		bool used_end_stamp = false;
-		const int measured_wire_ms =
-			lp_optclock_keydown_ms(batch_frames, force_full, &used_end_stamp);
-		rate_opt.set_switch_cost_ms(1800);
-		rate_opt.set_wire_ms_per_batch((double)measured_wire_ms);
-		// Fire-proof witness for the MC-7 END-stamp consumer (link-phase C7): emitted once per
-		// optimizer batch-end evaluation, gated by the shared link-phase turn-trace flag
-		// (MERCURY_TURN_TRACE) so OFF is byte-identical to stock. used_end_stamp=1 means the
-		// optimizer clock consumed the committed owner_keydown_end stamp instead of the live
-		// re-derivation; measured_wire_ms is the value fed to the optimizer and fallback_derive_ms
-		// is the derivation it replaced. Join to [LP_SHADOW_CMD] on epoch to confirm the stamp
-		// equals that keydown's committed length.
-		if(arq_turn_trace_on())
-		{
-			const int fallback_derive_ms =
-				derive_keydown_length_ms(batch_frames, force_full);
-			printf("[MC7-OPTCLOCK] used_end_stamp=%d measured_wire_ms=%d "
-				"fallback_derive_ms=%d batch_frames=%d ff=%d cfg=%d epoch=%u gen=%u\n",
-				used_end_stamp ? 1 : 0, measured_wire_ms, fallback_derive_ms,
-				batch_frames, force_full ? 1 : 0, current_configuration,
-				lp_state.epoch, lp_config_gen);
-			fflush(stdout);
-		}
-	}
-	// Always drain the cooldown counter regardless of gate outcome so the
-	// counter reflects elapsed batches, not "batches the optimizer actually
-	// looked at".
-	rate_opt.notify_cooldown_tick();
+	// Cooldowns are advanced at opt_record_batch(), exactly once per logical
+	// transaction. Evaluation is deliberately side-effect-free with respect to
+	// elapsed-batch accounting because one transaction can trigger >1 evaluate.
 
-	// Hard gates — caller may add more.
-	if (!rate_opt.is_enabled())            return false;
-	if (!sack_v2_enabled)                  return false;
-	if (turboshift_active)                 return false;
-	if (emergency_break_active != 0)       return false;
-	if (link_status != CONNECTED)          return false;
-	if (role != COMMANDER)                 return false;
-	// ROBUST_X is owned by the gearshift / break path. NB sessions are
-	// supported when the loaded table has a "table_nb" section; otherwise
-	// rate_opt.evaluate() short-circuits cleanly on NB.
-	if (!is_ofdm_config(current_configuration)) return false;
+	// Hard protocol/safety gates.  In ACTIVE mode Gearshift-v2 is the sole
+	// ordinary data-rate authority, including robust->OFDM acquisition. Legacy
+	// and shadow preserve the historic turboshift/SACK/OFDM handoff. BREAK stays
+	// independently authoritative in every mode.
+	if (!rate_opt.is_enabled())              return false;
+	if (emergency_break_active != 0)         return false;
+	if (link_status != CONNECTED)            return false;
+	if (role != COMMANDER)                   return false;
+	const bool v2_active = rate_opt.controls_link();
+	if (!v2_active && !sack_v2_enabled)      return false;
+	if (!v2_active && turboshift_active)     return false;
+	if (!v2_active && !is_ofdm_config(current_configuration)) return false;
 
 	const bool is_nb = (narrowband_enabled == YES);
+	const st_optimizer_window_metrics metrics = get_current_optimizer_metrics();
 
-	// Below-table-range gate: when gearshift/BREAK has dropped us below
-	// where the calibration table has data, OR when the observed channel
-	// is worse than anything we calibrated for, the optimizer goes silent
-	// and lets the dumber-but-safer gearshift/turboshift/BREAK system own
-	// the link entirely. Re-engages automatically when both conditions
-	// return to the calibrated region. min_cfg / max_sack are populated
-	// at load() time from the actual table contents. NB and WB have
-	// separate calibration ranges.
-	int    min_cfg  = rate_opt.min_calibrated_cfg(is_nb);
-	double max_sack = rate_opt.max_calibrated_sack_rate(is_nb);
-	if (min_cfg >= 0 && current_configuration < min_cfg) return false;
-	if (max_sack >= 0.0 && get_current_sack_rate() > max_sack) return false;
+	// The candidate ceiling limits destinations only.  It MUST NOT prevent a
+	// currently-higher mode from selecting a lower admissible mode.
+	int optimizer_ceiling = is_nb ? NB_CONFIG_MAX : WB_CONFIG_MAX;
+	if(!is_nb)
+	{
+		if(rate_opt.get_mode() == GEARSHIFT_V2_ACTIVE ||
+		   rate_opt.get_mode() == GEARSHIFT_V2_SHADOW)
+		{
+			// ACTIVE/SHADOW v2 replaces the separate top-gear election. When
+			// cfg17 is explicitly enabled, expose it as one more uncertain action
+			// for the same goodput controller rather than leaving a second normal
+			// authority in parallel. The legacy election remains authoritative in
+			// LEGACY mode only.
+			if(topgear_elect_feature_enabled()) optimizer_ceiling = CONFIG_17;
+		}
+		else
+		{
+			optimizer_ceiling = topgear_wb_ceiling();
+		}
+	}
+	if (max_config_override >= 0 && optimizer_ceiling > max_config_override)
+		optimizer_ceiling = max_config_override;
+	// A recent proven CFG16 implementation failure is a temporary, expiring
+	// feasibility restriction.  Legacy SNR/floor gates, however, are empirical
+	// performance heuristics: in v2 they are evidence, not hard vetoes. Keeping
+	// them as ceilings would recreate the stale-threshold adaptation cliff the
+	// goodput controller is intended to remove.
+	optimizer_ceiling = apply_bigblock_cooldown_cap(optimizer_ceiling);
+	if (rate_opt.get_mode() == GEARSHIFT_V2_LEGACY)
+	{
+		optimizer_ceiling = apply_cfg16_margin_cap(optimizer_ceiling);
+		optimizer_ceiling = apply_rung_floor_cap(optimizer_ceiling);
+	}
 
-	int target = rate_opt.evaluate(current_configuration,
-	                               get_current_effective_rate_bps(),
-	                               get_current_sack_rate(),
-	                               get_current_window_count(),
-	                               is_nb ? NB_CONFIG_MAX : WB_CONFIG_MAX,
-	                               is_nb);
+	// Preserve the original controller exactly in LEGACY mode.  SHADOW and
+	// ACTIVE consume the same structured observation; only ACTIVE may act.
+	if (rate_opt.get_mode() == GEARSHIFT_V2_LEGACY)
+	{
+		const int min_cfg = rate_opt.min_calibrated_cfg(is_nb);
+		const double max_partial = rate_opt.max_calibrated_partial_loss(is_nb);
+		if (min_cfg >= 0 && current_configuration < min_cfg) return false;
+		if (max_partial >= 0.0 && metrics.partial_frame_loss_rate > max_partial)
+			return false;
+		const int target = rate_opt.evaluate(current_configuration,
+			get_current_effective_rate_bps(), metrics.sack_batch_rate,
+			metrics.outcome_sample_count, optimizer_ceiling, is_nb,
+			metrics.partial_frame_loss_rate);
+		if (target == current_configuration) return false;
+		opt_pending_switch_action = GEARSHIFT_ACTION_SWITCH;
+		opt_pending_switch_fallback = current_configuration;
+		if (out_recommended_cfg) *out_recommended_cfg = target;
+		return true;
+	}
 
-	if (target == current_configuration) return false;
-	if (out_recommended_cfg) *out_recommended_cfg = target;
+	// An ACTIVE recommendation is a revocable snapshot, not a command that may
+	// survive contradictory newer evidence.  The same transaction can be
+	// evaluated at ACK close and again after atomic application commit; clear any
+	// undispatched older proposal before producing the newer verdict so a HOLD
+	// (especially known-zero remaining work) actually cancels it.
+	if (rate_opt.controls_link())
+	{
+		opt_pending_switch_cfg = -1;
+		opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+		opt_pending_switch_fallback = -1;
+	}
+
+	st_rate_observation obs;
+	obs.current_cfg = current_configuration;
+	obs.application_bps = metrics.application_bps;
+	obs.transport_bps = metrics.transport_bps;
+	obs.sack_batch_rate = metrics.sack_batch_rate;
+	obs.frame_success_rate = metrics.frame_success_rate;
+	obs.partial_frame_loss_rate = metrics.partial_frame_loss_rate;
+	obs.failed_batch_rate = metrics.failed_batch_rate;
+	obs.rate_samples = metrics.rate_sample_count;
+	obs.outcome_samples = metrics.outcome_sample_count;
+	obs.application_commits = metrics.application_commit_count;
+	// Direction-qualified channel reports.  Forward is peer-reported quality of
+	// our DATA; reverse is locally measured quality while receiving the peer.
+	// Never substitute the overloaded historical SNR_uplink field here.
+	obs.forward_snr_db = gearshift_forward_snr_age_batches <= rate_opt.get_policy().forward_quality_max_age_batches
+	                   ? gearshift_forward_snr_db : -99.9;
+	obs.forward_snr_age_batches = gearshift_forward_snr_age_batches;
+	obs.forward_selectivity = gearshift_forward_selectivity_age_batches <= rate_opt.get_policy().forward_quality_max_age_batches
+	                        ? gearshift_forward_selectivity : -1.0;
+	obs.forward_selectivity_age_batches = gearshift_forward_selectivity_age_batches;
+	obs.reverse_snr_db = gearshift_reverse_snr_age_batches <= rate_opt.get_policy().reverse_quality_max_age_batches
+	                   ? gearshift_reverse_snr_db : -99.9;
+	obs.reverse_snr_age_batches = gearshift_reverse_snr_age_batches;
+	obs.batch_size = data_batch_size;
+	// Probe economics must include the failure case's feedback/listen exposure,
+	// not only forward DATA keydown.  receiving_timeout is the live derived
+	// command-side ACK window and therefore a conservative causal budget.
+	obs.feedback_budget_ms = receiving_timeout > 0 ? (double)receiving_timeout : 0.0;
+	obs.queue_bytes = (long)(fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size())
+	                + (batch_uncompressed_size > 0 ? batch_uncompressed_size : 0);
+	// This controller owns the TX FIFO and current application unit, so zero is a
+	// real known-zero finite workload rather than the optimizer's legacy sentinel
+	// for an unknown/streaming horizon.  finalize_block_commander clears the just-
+	// committed unit before its post-commit evaluation.
+	obs.remaining_work_known = true;
+	obs.monotonic_ms = opt_now_ms();
+	obs.is_nb = is_nb;
+	obs.compression_enabled = compression_enabled;
+	if(metrics.application_commit_count > 0 && metrics.application_bps > 0.0 &&
+	   metrics.transport_bps > 0.0)
+	{
+		obs.application_transport_gain = metrics.application_bps / metrics.transport_bps;
+		obs.application_transport_gain_valid = std::isfinite(obs.application_transport_gain) &&
+		                                      obs.application_transport_gain > 0.05;
+	}
+
+	// Build the action set from the modem, not from whatever happens to exist in
+	// the calibration table. The analytical hints are weak priors only; empirical
+	// calibration/live measurements retain authority over actual channel success.
+	for(int li = 0; li < FULL_CONFIG_LADDER_SIZE; ++li)
+	{
+		const int cfg = FULL_CONFIG_LADDER[li];
+		// Respect session intent: robust-tier modes are part of the normal action
+		// set only for a -R/full-ladder session (or while already living there).
+		if(is_robust_config(cfg) && robust_enabled != YES && !is_robust_config(current_configuration))
+			continue;
+		if(is_ofdm_config(cfg) && cfg > optimizer_ceiling) continue;
+		obs.feasible_configs.push_back(cfg);
+		const int candidate_frames = predict_initial_batch_size_for_config(cfg);
+		obs.candidate_batch_size[cfg] = candidate_frames;
+		const int kd_ms = predict_keydown_length_ms_for_config(cfg, candidate_frames, false);
+		const int payload_per_batch = predict_payload_bytes_per_batch_for_config(cfg, candidate_frames);
+		if(kd_ms > 0) obs.tx_airtime_ms[cfg] = (double)kd_ms;
+		if(kd_ms > 0 && payload_per_batch > 0)
+			obs.nominal_bps[cfg] = (double)payload_per_batch * 8000.0 / (double)kd_ms;
+	}
+	// CONFIG_17 intentionally lives outside FULL_CONFIG_LADDER so legacy
+	// navigation stays byte-stable. In v2 it must still be a candidate when the
+	// explicit top-gear feature is enabled; otherwise disabling the old election
+	// would make the fastest modem unreachable.
+	if(!is_nb && optimizer_ceiling >= CONFIG_17 && topgear_elect_feature_enabled())
+	{
+		obs.feasible_configs.push_back(CONFIG_17);
+		const int candidate_frames = predict_initial_batch_size_for_config(CONFIG_17);
+		obs.candidate_batch_size[CONFIG_17] = candidate_frames;
+		const int kd_ms = predict_keydown_length_ms_for_config(CONFIG_17, candidate_frames, false);
+		const int payload_per_batch = predict_payload_bytes_per_batch_for_config(CONFIG_17, candidate_frames);
+		if(kd_ms > 0) obs.tx_airtime_ms[CONFIG_17] = (double)kd_ms;
+		if(kd_ms > 0 && payload_per_batch > 0)
+			obs.nominal_bps[CONFIG_17] = (double)payload_per_batch * 8000.0 / (double)kd_ms;
+	}
+
+	const st_rate_decision decision = rate_opt.evaluate_v2(obs, optimizer_ceiling);
+	if (rate_opt.shadow_only() || !decision.actionable) return false;
+
+	opt_pending_switch_action = decision.action;
+	opt_pending_switch_fallback = decision.fallback_cfg;
+	if (out_recommended_cfg) *out_recommended_cfg = decision.target_cfg;
 	return true;
 }
 
@@ -11842,6 +12231,8 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 	opt_reset_window();
 	rate_opt.reset_session_state();
 	opt_pending_switch_cfg = -1;
+	opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
+	opt_pending_switch_fallback = -1;
 }
 
 
@@ -18318,11 +18709,39 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 
 	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
 		target_batch_seq_id, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
-	bool append_topgear = topgear_elect_feature_enabled()
-	                   && (current_configuration == CONFIG_16
-	                       || current_configuration == CONFIG_17);
+	const bool v2_quality = gearshift_quality_report_v2_enabled();
+	const bool legacy_topgear = !v2_quality && topgear_elect_feature_enabled()
+	                         && (current_configuration == CONFIG_16
+	                             || current_configuration == CONFIG_17);
+	const bool shadow_topgear = v2_quality && rate_opt.get_mode() == GEARSHIFT_V2_SHADOW
+	                         && topgear_elect_feature_enabled()
+	                         && (current_configuration == CONFIG_16
+	                             || current_configuration == CONFIG_17);
+	unsigned char quality_report = 0;
+	uint16_t quality_crc12 = 0;
+	bool append_quality = false;
+
+	// The generic GS2 hint uses the same guarded last-GOOD-decode selectivity as
+	// the historical topgear report, but it is available at every WB gear.
+	// ACTIVE rate-limits it by quantized change/refresh. SHADOW+topgear keeps
+	// every cfg16/17 report so the legacy election being shadow-compared retains
+	// its historical evidence cadence. Legacy mode is byte-for-byte on its old
+	// topgear report format.
+	double flatness = v2_quality ? topgear_channel_flatness : topgear_pack_flatness_value();
+	if(v2_quality)
+	{
+		quality_report = gearshift_pack_quality_report(measurements.SNR_downlink, flatness);
+		append_quality = shadow_topgear
+		              || gearshift_quality_report_due_for_tx(quality_report, batch_seq_id);
+	}
+	else if(legacy_topgear)
+	{
+		quality_report = topgear_pack_report(measurements.SNR_downlink, flatness);
+		append_quality = true;
+	}
+
 	int nsymb = telecom_system->ack_mfsk.compact_confirm_pattern_nsymb();
-	if(append_topgear)
+	if(append_quality)
 		nsymb += telecom_system->ack_mfsk.compact_confirm_suffix_len();
 	int compact_samples = nsymb * telecom_system->data_container.Nofdm
 	                    * telecom_system->frequency_interpolation_rate;
@@ -18335,44 +18754,25 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	char crc_input[1];
 	crc_input[0] = (char)batch_seq_id;
 	uint16_t crc12 = CRC12_calc(crc_input, 1);
-	unsigned char topgear_report = 0;
-	uint16_t topgear_crc12 = 0;
-	if(append_topgear)
+	if(append_quality)
 	{
-		// Cross-layer data-flow audit fix: pack the guarded last-GOOD-decode selectivity
-		// (topgear_pack_flatness_value) instead of the raw last-ATTEMPT CV. DEFAULT-ON;
-		// MERCURY_TOPGEAR_PACK_GOODDECODE=0 restores the legacy last-ATTEMPT read.
-		double flatness = topgear_pack_flatness_value();
-		// Additive selection diagnostic (behind MERCURY_PACK_SEL_DIAG; no behavior change).
-		// lcs = the LAST-ATTEMPT selectivity actually packed; tgf = the last GOOD-decode
-		// selectivity (topgear_channel_flatness). A state-10 pack where lcs>0.15 while
-		// tgf<0.15 is the false-veto sampling defect (a transient/failed-attempt CV packed
-		// in place of the honest good-decode CV).
 		if(std::getenv("MERCURY_PACK_SEL_DIAG"))
 		{
 			double lcs = (telecom_system != NULL)
 			           ? telecom_system->last_channel_selectivity : -1.0;
-			fprintf(stderr, "[PACK-SEL] cfg=%d lcs=%.4f tgf=%.4f selected=%.4f snr_dl=%.2f\n",
-				current_configuration, lcs, topgear_channel_flatness,
-				flatness, measurements.SNR_downlink);
+			fprintf(stderr, "[PACK-SEL] cfg=%d lcs=%.4f tgf=%.4f selected=%.4f snr_dl=%.2f format=%s\n",
+				current_configuration, lcs, topgear_channel_flatness, flatness,
+				measurements.SNR_downlink, v2_quality ? "gs2" : "topgear");
 			fflush(stderr);
 		}
-		topgear_report = topgear_pack_report(measurements.SNR_downlink, flatness);
-		if(std::getenv("MERCURY_PACK_SEL_DIAG"))
-		{
-			int fs = topgear_report & 0x0F;
-			fprintf(stderr, "[PACK-SEL] packed cfg=%d flat_state=%d state10=%d\n",
-				current_configuration, fs, (fs == 10) ? 1 : 0);
-			fflush(stderr);
-		}
-		char report_byte[1]; report_byte[0] = (char)topgear_report;
-		topgear_crc12 = CRC12_calc(report_byte, 1);
+		char report_byte[1]; report_byte[0] = (char)quality_report;
+		quality_crc12 = CRC12_calc(report_byte, 1);
 	}
 
 	printf("[TX-MFSK-COMPACT] batch_seq_id=%u crc12=0x%03x nsymb=%d on CONFIG_%d"
 	       "%s\n",
 		(unsigned)batch_seq_id, (unsigned)crc12, nsymb, current_configuration,
-		append_topgear ? " +topgear-report" : "");
+		append_quality ? (v2_quality ? " +gs2-quality" : " +topgear-report") : "");
 	fflush(stdout);
 
 	// Read+clear the per-call retx-turnaround flag (clean confirm -> FALSE; same
@@ -18412,9 +18812,9 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	if(!raw_output || !filtered1 || !filtered2) exit(-37);
 	memset(raw_output, 0, padded_size * sizeof(double));
 
-	if(append_topgear)
+	if(append_quality)
 		telecom_system->generate_topgear_confirm_passband(&raw_output[symbol_period],
-			batch_seq_id, crc12, topgear_report, topgear_crc12);
+			batch_seq_id, crc12, quality_report, quality_crc12);
 	else
 		telecom_system->generate_compact_confirm_passband(&raw_output[symbol_period],
 			batch_seq_id, crc12);
@@ -18514,6 +18914,9 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	ptt_off_delay_timer.start();
 	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
 	ptt_off();
+
+	if(append_quality && v2_quality)
+		gearshift_quality_report_note_tx(quality_report, batch_seq_id);
 
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -19251,6 +19654,12 @@ void cl_arq_controller::send_scream_pattern(int rung)
 void cl_arq_controller::send_break_pattern()
 {
 	if(passive_monitor) return;
+	// BREAK is an external emergency authority by design.  Synchronize the
+	// adaptive controller before emitting it so an interrupted probe/switch
+	// cannot survive recovery and immediately re-elect the failed action.
+	rate_opt.notify_external_axis1_transition(
+		current_configuration, current_configuration, "emergency-break",
+		narrowband_enabled == YES);
 	l1_apply_reset_event(l1_tx_journal.recovery_open()
 		? mercury::L1ResetEvent::COLLISION
 		: mercury::L1ResetEvent::LOCAL_BREAK);
@@ -21247,6 +21656,7 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 					// suffix carries. Accepted tradeoff: the value goes stale after
 					// turbo (Option B's steady-state ACK suffix is NOT done here).
 					measurements.SNR_uplink = decision_snr;
+					gearshift_note_forward_snr(decision_snr);
 					// V3 climb-grade snapshot: qualify the pattern-ACK suffix read for the ELECTION
 					// gate. Data-batch confirms latch a fresh climb-grade sample; connect / BREAK-
 					// recovery ACKs (the garbage-high writer noted above) are rejected by
@@ -22742,6 +23152,8 @@ void cl_arq_controller::receive()
 			// With pattern ACK, the commander never decodes LDPC during ACK detection,
 			// so SNR_uplink only refreshes during SWITCH_ROLE when we receive data.
 			measurements.SNR_uplink = received_message_stats.SNR;
+			if(this->role == COMMANDER)
+				gearshift_note_reverse_snr(received_message_stats.SNR);
 			// V3 climb-grade snapshot: qualify this raw read for the ELECTION gate (COMMANDER + WB +
 			// in-transfer regime only). A CONNECT control-frame decode reaches here BEFORE any data
 			// batch (first-data latch off) and a recovery decode reaches here with
@@ -22752,16 +23164,17 @@ void cl_arq_controller::receive()
 			if(this->role == RESPONDER)
 			{
 				measurements.SNR_downlink = received_message_stats.SNR;
-				// Top-gear election (topgear-stack-productionize.md §3): the RSP just measured
-				// the FORWARD channel on a decoded data frame. Refresh the flatness feed from the
-				// modem's forward-channel selectivity (std|H|/mean|H|, -1 = not measured) and
-				// re-evaluate the engage verdict. No-op unless MERCURY_TOPGEAR_ELECT is set.
+				// The responder just measured the FORWARD DATA channel.  Capture the
+				// last-GOOD-decode selectivity whenever either GS2 telemetry or the
+				// legacy topgear election can consume it.  Measurement transport is
+				// therefore independent of permission to use CONFIG_17.
+				if((gearshift_quality_report_v2_enabled() || topgear_elect_feature_enabled())
+				   && telecom_system != NULL && telecom_system->last_channel_selectivity >= 0.0)
+					topgear_channel_flatness = telecom_system->last_channel_selectivity;
+				// The legacy election remains separately gated; ACTIVE Gearshift-v2
+				// treats the same measurement only as advisory predictive evidence.
 				if(topgear_elect_feature_enabled())
-				{
-					if(telecom_system != NULL && telecom_system->last_channel_selectivity >= 0.0)
-						topgear_channel_flatness = telecom_system->last_channel_selectivity;
 					topgear_elect_evaluate();
-				}
 			}
 
 			int byte_copy_len = this->max_data_length + this->max_header_length;
