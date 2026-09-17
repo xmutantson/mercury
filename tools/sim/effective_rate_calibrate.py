@@ -67,11 +67,11 @@ USAGE
 OUTPUT SCHEMA (effective_rate_table.json)
 -----------------------------------------
 {
-  "schema_version": 1,                       # bump on any breaking change
+  "schema_version": 2,                       # bump on any breaking change
   "calibration_date": "ISO8601 UTC",
   "mercury_head": "<git short sha>",
   "calibration_setup": {
-    "compress":     true,                   # PPMd+zstd ON (production)
+    "compress":     false,                  # raw PHY prior; runtime converts units
     "sack":         true,                   # --enable-sack on
     "sack_v2":      true,                   # --enable-sack-v2 on
     "gearshift":    false,                  # fixed config, no -g
@@ -185,7 +185,7 @@ tcp_recv_until    = SLA.tcp_recv_until
 receiver_thread   = SLA.receiver_thread
 sender_thread     = SLA.sender_thread
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Configs to sweep — WB only. Lower configs (<6) are too slow to be the
 # optimizer's pick under any realistic channel; high configs dominate the
@@ -212,153 +212,259 @@ def parse_opt_window_metrics(cmd_text):
     Returns a list of {eff_bps, sack_rate, window_n, cfg} dicts in order.
     """
     samples = []
-    for mo in re.finditer(
-            r'\[OPT-WINDOW\]\s+eff_bps=([\d.]+)\s+sack_rate=([\d.]+)\s+'
-            r'window_n=(\d+)\s+cfg=(\d+)',
-            cmd_text):
+    # New format adds frame_ok/partial_loss/fail_rate. Keep the legacy regex
+    # fallback so archived logs remain harvestable.
+    new_re = re.compile(
+        r'\[OPT-WINDOW\]\s+eff_bps=([\d.]+)\s+sack_rate=([\d.]+)\s+'
+        r'frame_ok=([\d.]+)\s+partial_loss=([\d.]+)\s+'
+        r'fail_rate=([\d.]+)\s+window_n=(\d+)\s+cfg=(\d+)')
+    for mo in new_re.finditer(cmd_text):
         samples.append({
-            'eff_bps':   float(mo.group(1)),
-            'sack_rate': float(mo.group(2)),
-            'window_n':  int(mo.group(3)),
-            'cfg':       int(mo.group(4)),
+            'eff_bps': float(mo.group(1)), 'sack_rate': float(mo.group(2)),
+            'frame_ok': float(mo.group(3)), 'partial_loss': float(mo.group(4)),
+            'fail_rate': float(mo.group(5)), 'window_n': int(mo.group(6)),
+            'cfg': int(mo.group(7)),
         })
+    if not samples:
+        for mo in re.finditer(
+                r'\[OPT-WINDOW\]\s+eff_bps=([\d.]+)\s+sack_rate=([\d.]+)\s+'
+                r'window_n=(\d+)\s+cfg=(\d+)', cmd_text):
+            samples.append({
+                'eff_bps': float(mo.group(1)), 'sack_rate': float(mo.group(2)),
+                'window_n': int(mo.group(3)), 'cfg': int(mo.group(4)),
+            })
     return samples
 
 
-def harvest_run(result, cmd_text, rsp_text):
-    """Pull eff_bps / sack_rate / batch_count / frame_loss from a run's logs.
 
-    Prefers [OPT-WINDOW] samples (Phase 3a) for eff_bps + sack_rate; falls
-    back to wire-byte / duration math if [OPT-WINDOW] is silent (which
-    means Phase 3a plumbing didn't fire — e.g. connection died before any
-    batch closed).
+def parse_opt_batch_records(cmd_text):
+    """Parse immutable Gearshift-v2 primitive batch records.
+
+    Returns one dict per [OPT-BATCH], with later [OPT-APP-COMMIT] credit
+    joined by record id.  These are non-overlapping transaction records, unlike
+    rolling [OPT-WINDOW] snapshots, so aggregate arithmetic is well defined.
     """
-    opt_samples = parse_opt_window_metrics(cmd_text)
+    batch_re = re.compile(
+        r'\[OPT-BATCH\]\s+id=(\d+)\s+cfg=(\d+)\s+rate_valid=(\d+)\s+'
+        r'outcome_valid=(\d+)\s+cycle_ms=(\d+)\s+app_bytes=(\d+)\s+'
+        r'transport_bytes=(\d+)\s+sent=(\d+)\s+acked=(\d+)\s+'
+        r'sack=(\d+)\s+failed=(\d+)\s+batch_size=(\d+)\s+'
+        r'snr=([-+\d.]+)\s+snr_age=(\d+)\s+sel=([-+\d.]+)'
+        r'(?:\s+lineage_valid=(\d+)\s+new_sent=(\d+)\s+repair_sent=(\d+)'
+        r'\s+cfg_gen=(\d+)\s+unit_id=(\d+)\s+dir=([A-Za-z0-9_-]+))?')
+    commit_re = re.compile(
+        r'\[OPT-APP-COMMIT\]\s+id=(\d+)\s+cfg=(\d+)\s+app_bytes=(\d+)'
+        r'(?:\s+unit_id=(\d+))?')
+    commits = {}
+    for m in commit_re.finditer(cmd_text):
+        commits[int(m.group(1))] = commits.get(int(m.group(1)), 0) + int(m.group(3))
+    out = []
+    for m in batch_re.finditer(cmd_text):
+        rid = int(m.group(1))
+        out.append({
+            'id': rid, 'cfg': int(m.group(2)), 'rate_valid': int(m.group(3)),
+            'outcome_valid': int(m.group(4)), 'cycle_ms': int(m.group(5)),
+            'app_bytes': int(m.group(6)) + commits.get(rid, 0),
+            'transport_bytes': int(m.group(7)), 'sent': int(m.group(8)),
+            'acked': int(m.group(9)), 'sack': int(m.group(10)),
+            'failed': int(m.group(11)), 'batch_size': int(m.group(12)),
+            'snr': float(m.group(13)), 'snr_age': int(m.group(14)),
+            'selectivity': float(m.group(15)),
+            # The suffix was added by Gearshift-v2 checkpoint 3.  Archived v2
+            # primitive logs without it remain parseable; unknown lineage is
+            # explicit rather than guessed from ACK/SACK outcome.
+            'lineage_valid': int(m.group(16)) if m.group(16) is not None else 0,
+            'new_sent': int(m.group(17)) if m.group(17) is not None else 0,
+            'repair_sent': int(m.group(18)) if m.group(18) is not None else 0,
+            'config_generation': int(m.group(19)) if m.group(19) is not None else None,
+            'application_unit_id': int(m.group(20)) if m.group(20) is not None else None,
+            'direction': m.group(21) if m.group(21) is not None else None,
+        })
+    return out
+
+def filter_primitive_records_for_config(records, target_cfg):
+    """Keep only records belonging to the fixed action being calibrated.
+
+    Emergency BREAK is allowed to recover the live link, but records emitted
+    after the modem has changed configuration are not counterfactual evidence
+    for the requested fixed action.
+    """
+    if target_cfg is None:
+        return list(records)
+    target_cfg = int(target_cfg)
+    return [r for r in records if int(r.get('cfg', -1)) == target_cfg]
+
+def harvest_run(result, cmd_text, rsp_text):
+    """Harvest one calibration run.
+
+    Gearshift-v2 primitive [OPT-BATCH] records are authoritative when present.
+    Legacy rolling-window/log parsers remain as backward-compatible fallback.
+    """
+    primitive_all = parse_opt_batch_records(cmd_text)
+    # A fixed-config calibration cell must never absorb bytes from an emergency
+    # demotion/recovery action.  BREAK is allowed to save the live link, but any
+    # later CONFIG_*/ROBUST_* transactions describe a different action.  Keep
+    # only primitive records emitted at the requested fixed configuration.
+    target_cfg = result.get('config_id')
+    primitive = filter_primitive_records_for_config(primitive_all, target_cfg)
     mech = SLA.parse_mercury_logs(cmd_text, rsp_text)
+    if primitive:
+        rate = [r for r in primitive if r['rate_valid'] and r['cycle_ms'] > 0]
+        outcome = [r for r in primitive if r['outcome_valid']]
+        cycle_ms = sum(r['cycle_ms'] for r in rate)
+        app_bytes = sum(r['app_bytes'] for r in rate)
+        transport_bytes = sum(r['transport_bytes'] for r in rate)
+        # Application bytes are the objective when commit records exist.  A
+        # fixed-mode calibration run with no app commit is a genuine 0-app-bps
+        # outcome rather than missing evidence.  Transport bps is retained for
+        # diagnosis/bootstrapping only.
+        app_bps = (app_bytes * 8000.0 / cycle_ms) if cycle_ms > 0 else 0.0
+        transport_bps = (transport_bytes * 8000.0 / cycle_ms) if cycle_ms > 0 else 0.0
+        sacks = sum(r['sack'] for r in outcome)
+        fails = sum(r['failed'] for r in outcome)
+        sent = sum(r['sent'] for r in outcome)
+        acked = sum(min(r['acked'], r['sent']) for r in outcome)
+        partial = [r for r in outcome if r['sack'] and r['sent'] > 0]
+        partial_sent = sum(r['sent'] for r in partial)
+        partial_missing = sum(r['sent'] - min(r['acked'], r['sent']) for r in partial)
+        sack_rate = sacks / len(outcome) if outcome else 0.0
+        failed_rate = fails / len(outcome) if outcome else 0.0
+        frame_success = acked / sent if sent else 1.0
+        frame_loss_pct = 100.0 * partial_missing / partial_sent if partial_sent else 0.0
+        sels = [r['selectivity'] for r in outcome if r['selectivity'] >= 0.0]
+        snrs = [r['snr'] for r in outcome if r['snr'] > -90.0 and r['snr_age'] <= 4]
+        batch_sizes = [r['batch_size'] for r in outcome if r['batch_size'] > 0]
+        lineage = [r for r in outcome if r.get('lineage_valid')]
+        lineage_sent = sum(r['new_sent'] + r['repair_sent'] for r in lineage)
+        repair_frames = sum(r['repair_sent'] for r in lineage)
+        return {
+            'eff_bps': round(app_bps, 1),
+            'transport_bps': round(transport_bps, 1),
+            'eff_bps_source': 'opt_batch_application',
+            'sack_rate': round(sack_rate, 4),
+            'failed_batch_rate': round(failed_rate, 4),
+            'frame_success': round(frame_success, 4),
+            'batch_count': len(outcome),
+            'batch_size': round(sum(batch_sizes)/len(batch_sizes), 3) if batch_sizes else None,
+            'frame_loss_pct': round(frame_loss_pct, 2),
+            'selectivity': round(sum(sels)/len(sels), 6) if sels else None,
+            'snr_db': round(sum(snrs)/len(snrs), 3) if snrs else None,
+            'break_fired': bool(re.search(r'\[TX-BREAK\] Sending BREAK pattern', cmd_text)) or
+                           bool(re.search(r'emergency.*nack.*threshold', cmd_text, re.I)),
+            'primitive_records': len(primitive),
+            'primitive_records_total': len(primitive_all),
+            'lineage_records': len(lineage),
+            'repair_frame_rate': round(repair_frames / lineage_sent, 6) if lineage_sent else None,
+            'mech_summary': {
+                'cmd_nSent_data': mech.get('cmd_nSent_data'),
+                'cmd_nReSent_data': mech.get('cmd_nReSent_data'),
+                'cmd_nLost_data': mech.get('cmd_nLost_data'),
+                'n_cmd_sack_events': mech.get('n_cmd_sack_events'),
+                'cmd_retx_frames_total': mech.get('cmd_retx_frames_total'),
+                'gearshift_lines': mech.get('gearshift_lines'),
+            },
+        }
 
-    # --- eff_bps: prefer steady-state [OPT-WINDOW] mean, else TCP bytes ---
-    # Drop the first sample (cold rolling-window: small N inflates variance).
-    eff_samples = [s['eff_bps'] for s in opt_samples[1:]] if len(opt_samples) > 1 \
-                  else [s['eff_bps'] for s in opt_samples]
+    # Legacy fallback for archived logs without primitive records.
+    opt_samples = parse_opt_window_metrics(cmd_text)
+    eff_samples = [s['eff_bps'] for s in opt_samples[1:]] if len(opt_samples)>1 else [s['eff_bps'] for s in opt_samples]
     if eff_samples:
-        eff_bps = sum(eff_samples) / len(eff_samples)
-        eff_source = 'opt_window'
+        eff_bps = sum(eff_samples)/len(eff_samples); eff_source='opt_window_legacy'
+    elif result.get('measured_s',0)>0:
+        eff_bps=(result.get('rx_bytes_measured',0)*8.0)/result['measured_s']; eff_source='tcp_bytes'
     else:
-        # Fallback: TCP receiver bytes / measured wall-clock.
-        if result.get('measured_s', 0) > 0:
-            eff_bps = (result.get('rx_bytes_measured', 0) * 8.0) / result['measured_s']
-        else:
-            eff_bps = 0.0
-        eff_source = 'tcp_bytes'
-
-    # --- sack_rate: mean of [OPT-WINDOW] samples (post-first) ---
-    sr_samples = [s['sack_rate'] for s in opt_samples[1:]] if len(opt_samples) > 1 \
-                 else [s['sack_rate'] for s in opt_samples]
-    if sr_samples:
-        sack_rate = sum(sr_samples) / len(sr_samples)
-    else:
-        # Fallback: ratio of [CMD-SACK] events to total batches.
-        nbatch = mech.get('n_batch_tx_start') or 0
-        nsack  = mech.get('n_cmd_sack_events') or 0
-        sack_rate = (nsack / nbatch) if nbatch > 0 else 0.0
-
-    # --- batch_count ---
-    batch_count = mech.get('n_batch_tx_start') or 0
-
-    # --- frame_loss_pct: from [CMD-SACK] partial-batch losses ---
-    frame_loss_pct = 0.0
-    if mech.get('sack_per_batch_loss_mean') is not None:
-        frame_loss_pct = mech['sack_per_batch_loss_mean'] * 100.0
-
-    # --- BREAK detection — should NOT fire (fixed config). If it does, the
-    # cell is broken-channel and the optimizer should avoid this config here.
-    # Match only the actual `[TX-BREAK] Sending BREAK pattern ...` line emitted
-    # by cl_arq_controller::send_break_pattern() (arq_common.cc:4376). The
-    # previous broad `\bBREAK\b` regex matched any literal "BREAK" anywhere
-    # — startup capability prints, BREAK-detector init messages, even
-    # comments rendered to stdout — flagging EVERY cell as break_fired and
-    # forcing the optimizer's load() to reject ALL 136 cells as invalid
-    # (which was actually masked until SACK was default-on and the optimizer
-    # gate started consulting break_fired). Now: only actual CMD-side BREAK
-    # transmissions count.
-    break_fired = bool(re.search(r'\[TX-BREAK\] Sending BREAK pattern', cmd_text)) or \
-                  bool(re.search(r'emergency.*nack.*threshold', cmd_text, re.I))
-
+        eff_bps=0.0; eff_source='none'
+    sr=[s['sack_rate'] for s in opt_samples[1:]] if len(opt_samples)>1 else [s['sack_rate'] for s in opt_samples]
+    sack_rate=sum(sr)/len(sr) if sr else 0.0
+    nbatch=mech.get('n_batch_tx_start') or 0
+    if not sr and nbatch>0: sack_rate=(mech.get('n_cmd_sack_events') or 0)/nbatch
+    pls=[s['partial_loss'] for s in opt_samples[1:] if 'partial_loss' in s] if len(opt_samples)>1 else [s['partial_loss'] for s in opt_samples if 'partial_loss' in s]
+    frame_loss_pct=(sum(pls)/len(pls))*100.0 if pls else ((mech.get('sack_per_batch_loss_mean') or 0.0)*100.0)
     return {
-        'eff_bps':        round(eff_bps, 1),
-        'eff_bps_source': eff_source,
-        'sack_rate':      round(sack_rate, 4),
-        'batch_count':    batch_count,
-        'frame_loss_pct': round(frame_loss_pct, 2),
-        'break_fired':    break_fired,
-        'opt_window_samples': len(opt_samples),
-        'mech_summary': {
-            'cmd_nSent_data':    mech.get('cmd_nSent_data'),
-            'cmd_nReSent_data':  mech.get('cmd_nReSent_data'),
-            'cmd_nLost_data':    mech.get('cmd_nLost_data'),
-            'n_cmd_sack_events': mech.get('n_cmd_sack_events'),
-            'cmd_retx_frames_total': mech.get('cmd_retx_frames_total'),
-            'gearshift_lines':   mech.get('gearshift_lines'),
-        },
+        'eff_bps':round(eff_bps,1),'eff_bps_source':eff_source,
+        'sack_rate':round(sack_rate,4),'batch_count':nbatch,'batch_size':None,
+        'frame_loss_pct':round(frame_loss_pct,2),
+        'failed_batch_rate':0.0,'frame_success':1.0,
+        'selectivity':None,'snr_db':None,
+        'break_fired':bool(re.search(r'\[TX-BREAK\] Sending BREAK pattern',cmd_text)) or bool(re.search(r'emergency.*nack.*threshold',cmd_text,re.I)),
+        'primitive_records':0,'mech_summary':{'cmd_nSent_data':mech.get('cmd_nSent_data'),'cmd_nReSent_data':mech.get('cmd_nReSent_data'),'cmd_nLost_data':mech.get('cmd_nLost_data'),'n_cmd_sack_events':mech.get('n_cmd_sack_events'),'cmd_retx_frames_total':mech.get('cmd_retx_frames_total'),'gearshift_lines':mech.get('gearshift_lines')},
     }
 
 
-def aggregate_cell(run_dicts):
-    """Roll up N runs of a single (config, channel) cell into the cell entry.
 
-    `run_dicts` is the list stored under table[cfg][channel]["runs"]. Each
-    is a dict with eff_bps / sack_rate / batch_count / frame_loss_pct /
-    connected / break_fired.
+def build_cell_run(raw, harvest, run_idx):
+    """Join one harness result with harvested Gearshift-v2 metrics.
 
-    A run is only a VALID effective-rate sample if it actually DELIVERED
-    bytes. A run that CONNECTed but delivered zero bytes (rx_bytes==0) is a
-    DEAD cell, not a "0 bps" measurement — recording it as a valid 0-rate is
-    the v13 corruption that produced the CFG11/12=0-everywhere + non-monotonic
-    table (connected=[T,T,T] but rx_bytes=[0,0,0] was scored as a valid
-    eff_bps_mean=0, failed=False cell, which the Phase-3c optimizer then
-    treated as a legitimately-pickable 0-bps config). Gate on delivered bytes:
-    prefer rx_bytes_measured (post-settle, the same quantity eff_bps is
-    derived from), fall back to rx_bytes.
+    Keep every v2 primitive field all the way into table[config][channel][runs];
+    dropping a field here would make aggregate_cell silently fall back to neutral
+    defaults even though the modem emitted the measurement.
     """
-    def _delivered(r):
-        return (r.get('rx_bytes_measured') or r.get('rx_bytes') or 0) > 0
-    ok = [r for r in run_dicts
-          if r.get('connected') and not r.get('error') and _delivered(r)]
-    failed = [r for r in run_dicts
-              if not r.get('connected') or r.get('error') or not _delivered(r)]
-
-    def stat_list(values):
-        if not values:
-            return (0.0, 0.0, 0.0, 0.0)
-        n = len(values)
-        m = sum(values) / n
-        s = (sum((v - m) ** 2 for v in values) / n) ** 0.5 if n > 1 else 0.0
-        return (round(m, 1), round(min(values), 1),
-                round(max(values), 1), round(s, 1))
-
-    eff_vals  = [r['eff_bps']        for r in ok]
-    sack_vals = [r['sack_rate']      for r in ok]
-    batch_vals= [r['batch_count']    for r in ok]
-    loss_vals = [r['frame_loss_pct'] for r in ok]
-
-    eff_mean, eff_min, eff_max, eff_sigma = stat_list(eff_vals)
-    sack_mean = round(sum(sack_vals)/len(sack_vals), 4) if sack_vals else 0.0
-    batch_mean= round(sum(batch_vals)/len(batch_vals), 2) if batch_vals else 0.0
-    loss_mean = round(sum(loss_vals)/len(loss_vals), 2)  if loss_vals  else 0.0
-
     return {
-        'eff_bps_mean':     eff_mean,
-        'eff_bps_min':      eff_min,
-        'eff_bps_max':      eff_max,
-        'eff_bps_sigma':    eff_sigma,
-        'sack_rate_mean':   sack_mean,
-        'batch_count_mean': batch_mean,
-        'frame_loss_pct':   loss_mean,
-        'n_runs':           len(ok),
-        'n_failed_runs':    len(failed),
-        'failed':           (len(ok) == 0 and len(run_dicts) > 0),
-        'break_fired':      any(r.get('break_fired') for r in run_dicts),
-        'runs':             run_dicts,
+        'eff_bps': harvest.get('eff_bps', 0.0),
+        'transport_bps': harvest.get('transport_bps', 0.0),
+        'eff_bps_source': harvest.get('eff_bps_source', 'none'),
+        'sack_rate': harvest.get('sack_rate', 0.0),
+        'failed_batch_rate': harvest.get('failed_batch_rate', 0.0),
+        'frame_success': harvest.get('frame_success', 1.0),
+        'batch_count': harvest.get('batch_count', 0),
+        'batch_size': harvest.get('batch_size'),
+        'frame_loss_pct': harvest.get('frame_loss_pct', 0.0),
+        'selectivity': harvest.get('selectivity'),
+        'snr_db': harvest.get('snr_db'),
+        'primitive_records': harvest.get('primitive_records', 0),
+        'primitive_records_total': harvest.get('primitive_records_total',
+                                                harvest.get('primitive_records', 0)),
+        'lineage_records': harvest.get('lineage_records', 0),
+        'repair_frame_rate': harvest.get('repair_frame_rate'),
+        'opt_window_samples': harvest.get('opt_window_samples', 0),
+        'break_fired': harvest.get('break_fired', False),
+        'rx_bytes': raw.get('rx_bytes', 0),
+        'rx_bytes_measured': raw.get('rx_bytes_measured', 0),
+        'tx_bytes': raw.get('tx_bytes', 0),
+        'duration_s': raw.get('duration_s', 0),
+        'measured_s': raw.get('measured_s', 0),
+        'connected': raw.get('connected', False),
+        'error': raw.get('error'),
+        'timestamp': raw.get('timestamp'),
+        'cmd_log': raw.get('cmd_log'),
+        'rsp_log': raw.get('rsp_log'),
+        'mech_summary': harvest.get('mech_summary', {}),
+        'run_idx': run_idx,
+    }
+
+def aggregate_cell(run_dicts):
+    """Aggregate a cell without survivor bias.
+
+    Every connected, instrument-valid run is a performance outcome, including
+    valid zero-delivery runs.  Infrastructure/launch failures are counted
+    separately and do not manufacture zero RF performance.
+    """
+    valid=[r for r in run_dicts if r.get('connected') and not r.get('error')]
+    invalid=[r for r in run_dicts if not r.get('connected') or r.get('error')]
+    def stat(values):
+        if not values:return (0.0,0.0,0.0,0.0)
+        n=len(values);m=sum(values)/n
+        sig=(sum((v-m)**2 for v in values)/n)**0.5 if n>1 else 0.0
+        return (round(m,1),round(min(values),1),round(max(values),1),round(sig,1))
+    eff=[float(r.get('eff_bps',0.0)) for r in valid]
+    emn,emin,emax,esig=stat(eff)
+    def mean(field,default=0.0):
+        vals=[r.get(field) for r in valid if r.get(field) is not None]
+        return round(sum(vals)/len(vals),6) if vals else default
+    return {
+        'eff_bps_mean':emn,'eff_bps_min':emin,'eff_bps_max':emax,'eff_bps_sigma':esig,
+        'sack_rate_mean':mean('sack_rate'),'batch_count_mean':mean('batch_count'),
+        'batch_size_mean':mean('batch_size',None),
+        'frame_loss_pct':mean('frame_loss_pct'),'failed_batch_rate_mean':mean('failed_batch_rate'),
+        'frame_success_mean':mean('frame_success',1.0),'selectivity_mean':mean('selectivity',None),
+        'repair_frame_rate_mean':mean('repair_frame_rate',None),
+        'snr_db':mean('snr_db',None),'n_runs':len(valid),'n_zero_delivery_runs':sum(1 for r in valid if float(r.get('eff_bps',0.0))<=0.0),
+        'n_invalid_runs':len(invalid),'n_failed_runs':len(invalid),
+        'failed':(len(valid)==0 and len(run_dicts)>0),
+        'break_fired':any(r.get('break_fired') for r in valid),
+        'break_run_rate':round(sum(1 for r in valid if r.get('break_fired')) / len(valid), 6) if valid else 0.0,
+        'outcome_semantics':'v2_all_valid_runs_including_zero',
+        'runs':run_dicts,
     }
 
 
@@ -375,6 +481,24 @@ def get_mercury_head():
         return 'unknown'
 
 
+def get_config_signature():
+    """Version the calibration against config/protocol geometry that changes
+    the action set or SACK semantics. Missing/old signatures remain readable
+    but Gearshift-v2 deliberately weakens those priors."""
+    path = os.path.join(MERCURY_ROOT, 'include', 'common', 'common_defines.h')
+    try:
+        text = open(path, 'r', encoding='utf-8', errors='ignore').read()
+        def val(name, default):
+            m = re.search(r'^\s*#define\s+' + re.escape(name) + r'\s+([^\s/]+)', text, re.M)
+            return m.group(1) if m else str(default)
+        return 'gs2-cfg%s-wb%s-nb%s-sack%s-bitmap%s' % (
+            val('NUMBER_OF_CONFIGS', 0), val('WB_CONFIG_MAX', 0).replace('CONFIG_', ''),
+            val('NB_CONFIG_MAX', 0).replace('CONFIG_', ''), val('MFSK_ACK_SACK_ENABLED', 0),
+            val('MFSK_SACK_BITMAP_BITS', 0))
+    except Exception:
+        return 'unknown'
+
+
 def load_existing(path):
     """Read a prior calibration JSON for --resume. Returns None if absent."""
     if not os.path.exists(path):
@@ -386,6 +510,28 @@ def load_existing(path):
         print(f'WARN: cannot read {path} for resume: {e}; ignoring')
         return None
 
+
+
+def resume_metadata_compatible(prior, mercury_head, config_signature):
+    """Return (ok, reason) for a safe --resume.
+
+    A table may only be resumed when every retained cell was produced by the
+    same source/config geometry.  Updating root metadata while silently keeping
+    old cells would make stale measurements look freshly calibrated.
+    """
+    if not prior:
+        return True, ''
+    old_sig = prior.get('config_signature')
+    old_head = prior.get('mercury_head')
+    if not old_sig:
+        return False, 'prior table has no config_signature'
+    if old_sig != config_signature:
+        return False, f'config_signature mismatch prior={old_sig} current={config_signature}'
+    if not old_head or old_head in ('unknown', 'nogit'):
+        return False, 'prior table has no trustworthy mercury_head'
+    if mercury_head not in ('unknown', 'nogit') and old_head != mercury_head:
+        return False, f'mercury_head mismatch prior={old_head} current={mercury_head}'
+    return True, ''
 
 def cell_already_done(prior, cfg_id, channel, required_runs, retry_failed=False,
                       is_nb=False):
@@ -586,6 +732,7 @@ def run_one_calibration_cell(bs, lid, cfg_id, channel, channel_cmds,
             optimizer_disabled=True,  # Phase 3c kill switch: calibration measures
                                       # each fixed (cfg, channel) cell without the
                                       # optimizer trying to switch configs mid-run.
+            runtime_env={'MERCURY_GS2_PRIMITIVE_TRACE': '1'},
         )
     except Exception as e:
         if time.time() >= deadline:
@@ -630,28 +777,7 @@ def run_one_calibration_cell(bs, lid, cfg_id, channel, channel_cmds,
 
     harvest = harvest_run(raw, cmd_text, rsp_text)
 
-    cell_run = {
-        'eff_bps':        harvest['eff_bps'],
-        'eff_bps_source': harvest['eff_bps_source'],
-        'sack_rate':      harvest['sack_rate'],
-        'batch_count':    harvest['batch_count'],
-        'frame_loss_pct': harvest['frame_loss_pct'],
-        'opt_window_samples': harvest['opt_window_samples'],
-        'break_fired':    harvest['break_fired'],
-        'rx_bytes':       raw.get('rx_bytes', 0),
-        'rx_bytes_measured': raw.get('rx_bytes_measured', 0),
-        'tx_bytes':       raw.get('tx_bytes', 0),
-        'duration_s':     raw.get('duration_s', 0),
-        'measured_s':     raw.get('measured_s', 0),
-        'connected':      raw.get('connected', False),
-        'error':          raw.get('error'),
-        'timestamp':      raw.get('timestamp'),
-        'cmd_log':        raw.get('cmd_log'),
-        'rsp_log':        raw.get('rsp_log'),
-        'mech_summary':   harvest['mech_summary'],
-        'run_idx':        run_idx,
-    }
-    return cell_run
+    return build_cell_run(raw, harvest, run_idx)
 
 
 def main():
@@ -740,8 +866,9 @@ def main():
     else:
         configs = list(DEFAULT_CONFIGS)
     for c in configs:
-        if not (0 <= c <= 16):
-            print(f'ERROR: config {c} out of range [0,16]', file=sys.stderr)
+        if not (0 <= c <= 17 or c in (100, 101, 102)):
+            print(f'ERROR: config {c} is not a runnable calibrated config '
+                  f'(allowed: 0..17,100..102)', file=sys.stderr)
             sys.exit(2)
 
     if args.points:
@@ -781,10 +908,19 @@ def main():
     payload = open(args.payload, 'rb').read()
 
     mercury_head = get_mercury_head()
+    config_signature = get_config_signature()
+    if prior and args.resume:
+        compatible, why = resume_metadata_compatible(prior, mercury_head, config_signature)
+        if not compatible:
+            print(f'ERROR: refusing unsafe --resume: {why}. Start a new output table '
+                  f'or rerun the old build instead of mixing calibration generations.',
+                  file=sys.stderr)
+            return 2
     print(f'[CAL] mode={mode_label} configs={configs} points={points}')
     print(f'[CAL] runs/cell={runs} duration/run={duration}s settle={args.settle_s}s')
     print(f'[CAL] payload={args.payload} ({len(payload)} bytes)')
     print(f'[CAL] mercury_head={mercury_head}')
+    print(f'[CAL] config_signature={config_signature}')
     print(f'[CAL] out={args.out}')
     print(f'[CAL] schedule: {total_cells} cells x {runs} runs '
           f'= {total_cells * runs} runs')
@@ -800,10 +936,10 @@ def main():
     # Initialize output document.
     if prior and args.resume:
         out = prior
-        # Update the schema/metadata for THIS sweep (the resumed
-        # mercury_head may differ — record the latest one and let the
-        # consumer notice the difference).
+        # Resume compatibility was verified above.  Root metadata can therefore
+        # be refreshed without relabelling old cells from a different build.
         out['mercury_head'] = mercury_head
+        out['config_signature'] = config_signature
         out['schema_version'] = SCHEMA_VERSION
         out.setdefault('calibration_setup', {})
         out.setdefault('configs_tested', [])
@@ -828,6 +964,7 @@ def main():
             'calibration_date':  time.strftime('%Y-%m-%dT%H:%M:%SZ',
                                                time.gmtime()),
             'mercury_head':      mercury_head,
+            'config_signature': config_signature,
             'calibration_setup': {
                 'compress':      False,
                 'sack':          True,
