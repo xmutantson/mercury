@@ -144,6 +144,7 @@ def has_build_id(pi, path):
 stage2_binary = STAGE2 + "/mercury"
 stage1_binary = STAGE1 + "/mercury"
 source_binary = SRC2 + "/mercury"
+NEW2 = SRC2 + ".new"
 
 s2_sha = remote_sha("rpi2", stage2_binary)
 s2_valid = bool(s2_sha and has_build_id("rpi2", stage2_binary))
@@ -171,35 +172,60 @@ mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
         )
         src_head = out.strip().splitlines()[-1] if out.strip() else ""
 
+        new_out, _ = run(
+            "rpi2",
+            f"if test -d {shlex.quote(NEW2 + '/.git')}; then "
+            f"git -C {shlex.quote(NEW2)} rev-parse HEAD; fi",
+            timeout=60,
+            check=False,
+        )
+        new_head = new_out.strip().splitlines()[-1] if new_out.strip() else ""
+
         if src_head == WANT:
             print("rpi2: source workspace already at target; resuming build/test")
             bash("rpi2", f"""
 set -Eeuo pipefail
 cd {shlex.quote(SRC2)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} ./build.sh o3 --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 --test
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 install -d {shlex.quote(STAGE2)}
 install -m 0755 ./mercury {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 """, timeout=3600)
-        else:
-            print("rpi2: creating clean source workspace for target commit")
+        elif new_head == WANT:
+            print("rpi2: reusing failed-at-build clone; resuming native build/test")
             bash("rpi2", f"""
 set -Eeuo pipefail
-rm -rf {shlex.quote(SRC2 + ".new")}
-git clone --no-tags --branch gearshift-v2 --single-branch \
-  https://github.com/xmutantson/mercury.git {shlex.quote(SRC2 + ".new")}
-cd {shlex.quote(SRC2 + ".new")}
-git checkout --detach {shlex.quote(WANT)}
+cd {shlex.quote(NEW2)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} ./build.sh o3 clean --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean --test
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 cd /
 rm -rf {shlex.quote(SRC2)}
-mv {shlex.quote(SRC2 + ".new")} {shlex.quote(SRC2)}
+mv {shlex.quote(NEW2)} {shlex.quote(SRC2)}
+install -d {shlex.quote(STAGE2)}
+install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
+mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
+""", timeout=3600)
+        else:
+            print("rpi2: creating clean source workspace for target commit")
+            bash("rpi2", f"""
+set -Eeuo pipefail
+rm -rf {shlex.quote(NEW2)}
+git clone --no-tags --branch gearshift-v2 --single-branch \
+  https://github.com/xmutantson/mercury.git {shlex.quote(NEW2)}
+cd {shlex.quote(NEW2)}
+git checkout --detach {shlex.quote(WANT)}
+test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean --test
+test -x ./mercury
+strings ./mercury | grep -Fq {shlex.quote(SHORT)}
+cd /
+rm -rf {shlex.quote(SRC2)}
+mv {shlex.quote(NEW2)} {shlex.quote(SRC2)}
 install -d {shlex.quote(STAGE2)}
 install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
@@ -429,7 +455,7 @@ mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 set -Eeuo pipefail
 cd {shlex.quote(SRC2)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} ./build.sh o3 --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 --test
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 install -d {shlex.quote(STAGE2)}
@@ -446,7 +472,7 @@ git clone --no-tags --branch gearshift-v2 --single-branch \
 cd {shlex.quote(SRC2 + ".new")}
 git checkout --detach {shlex.quote(WANT)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} ./build.sh o3 clean --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean --test
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 cd /
