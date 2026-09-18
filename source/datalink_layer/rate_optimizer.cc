@@ -2580,7 +2580,7 @@ void cl_rate_optimizer::notify_switch_failed()
 {
     if (!switch_inflight) return;
     if (switch_action == GEARSHIFT_ACTION_PROBE) {
-        // A SET_CONFIG failure is negative information about the probe itself.
+        // A transition-transport failure is negative information about the probe itself.
         // We do not have a fresh channel snapshot here, so use a context-free
         // block that expires only by transaction count (not by a guessed SNR).
         std::map<int, st_probe_memory>& pm = switch_is_nb ? probe_memory_nb : probe_memory_wb;
@@ -2592,7 +2592,7 @@ void cl_rate_optimizer::notify_switch_failed()
         m.failed_selectivity = -1.0;
         m.context_generation = context_generation;
         std::printf("[GEARSHIFT-V2] probe-memory target=%d strength=hard "
-                    "reason=set-config-failed backoff_batches=%d failures=%d generation=%d\n",
+                    "reason=switch-transport-failed backoff_batches=%d failures=%d generation=%d\n",
                     switch_to_cfg, backoff, m.failures, context_generation);
         std::fflush(stdout);
         probe_cooldown_remaining = std::max(probe_cooldown_remaining, policy.cooldown_batches);
@@ -2601,6 +2601,35 @@ void cl_rate_optimizer::notify_switch_failed()
     switch_inflight = false;
     switch_suppression_logged = false;
     cooldown_remaining = policy.cooldown_batches;
+}
+
+bool cl_rate_optimizer::notify_switch_confirmed_if_matches(
+        int from_cfg, int to_cfg, unsigned long long now_ms)
+{
+    if (!switch_inflight || switch_from_cfg != from_cfg || switch_to_cfg != to_cfg) {
+        if (switch_inflight) {
+            std::printf("[GEARSHIFT-V2] stale-switch-confirm-ignored live=%d->%d evidence=%d->%d\n",
+                        switch_from_cfg, switch_to_cfg, from_cfg, to_cfg);
+            std::fflush(stdout);
+        }
+        return false;
+    }
+    notify_switch_confirmed(now_ms);
+    return true;
+}
+
+bool cl_rate_optimizer::notify_switch_failed_if_matches(int from_cfg, int to_cfg)
+{
+    if (!switch_inflight || switch_from_cfg != from_cfg || switch_to_cfg != to_cfg) {
+        if (switch_inflight) {
+            std::printf("[GEARSHIFT-V2] stale-switch-failure-ignored live=%d->%d evidence=%d->%d\n",
+                        switch_from_cfg, switch_to_cfg, from_cfg, to_cfg);
+            std::fflush(stdout);
+        }
+        return false;
+    }
+    notify_switch_failed();
+    return true;
 }
 
 bool cl_rate_optimizer::notify_external_axis1_transition(

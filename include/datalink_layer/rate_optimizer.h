@@ -330,9 +330,11 @@ public:
                  bool is_nb = false,
                  double current_partial_loss_rate = -1.0);
 
-    // Switch/probe lifecycle.  The controller calls dispatched when SET_CONFIG
-    // is queued and confirmed when its ACK is accepted.  This gives the policy
-    // a measured transition cost and a multi-sample, channel-time-bounded probation/rollback path.
+    // Switch/probe lifecycle. The controller calls dispatched exactly once when
+    // an Axis-1 move is committed to a transport. Legacy SET_CONFIG closes from
+    // its ACK; CONFIG_TAG closes only from peer-follow evidence. The target-aware
+    // helpers reject stale/mismatched terminal evidence instead of accidentally
+    // closing whatever transaction happens to be live.
     void notify_switch_dispatched(int from_cfg,
                                   int to_cfg,
                                   e_gearshift_v2_action action,
@@ -341,6 +343,9 @@ public:
                                   bool is_nb = false);
     void notify_switch_confirmed(unsigned long long now_ms);
     void notify_switch_failed();
+    bool notify_switch_confirmed_if_matches(int from_cfg, int to_cfg,
+                                            unsigned long long now_ms);
+    bool notify_switch_failed_if_matches(int from_cfg, int to_cfg);
     // A config change initiated outside Gearshift-v2 (emergency recovery,
     // implementation safety demote, etc.) must invalidate any in-flight probe
     // and age the model context. Matching v2-dispatched SET_CONFIGs are ignored

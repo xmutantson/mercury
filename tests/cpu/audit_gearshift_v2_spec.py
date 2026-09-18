@@ -405,13 +405,20 @@ req("active-v2-uses-config-tag-transport-without-second-selector",
 req("active-v2-config-tag-transition-closes-from-peer-evidence",
     allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
           "config-discriminating SACK at/after the announce BSI",
-          "rate_opt.notify_switch_confirmed(opt_now_ms())",
+          "rate_opt.notify_switch_confirmed_if_matches",
           "No config-discriminating follow evidence arrived after the bounded re-tags",
-          "rate_opt.notify_switch_failed()") and
+          "rate_opt.notify_switch_failed_if_matches",
+          "inband_handle_nack(uint8_t rx_cfg_index",
+          "explicit evidence that this CONFIG_TAG transition failed") and
     allin(cmd, "bool tier_crossing = inband_config_change_is_tier_crossing(inband_target)",
           "else if(inband_unilateral_config_change(inband_target))",
-          "NO control frame on the wire"),
-    "ACTIVE intra-OFDM transitions such as CONFIG_0->CONFIG_16 remain in-flight until the peer proves follow or bounded CONFIG_TAG retries fail; no SET_CONFIG ACK or local-only confirmation is accepted")
+          "NO control frame on the wire") and
+    allin(text("tests/cpu/test_gearshift_v2.cc"),
+          "mismatched peer confirmation is ignored",
+          "matching peer confirmation closes the live transition",
+          "mismatched peer failure is ignored",
+          "matching peer failure closes the live transition"),
+    "ACTIVE intra-OFDM transitions remain in-flight until matching peer follow proves the selected target or matching CONFIG_TAG failure evidence terminates it; stale evidence cannot close another transaction")
 req("active-v2-owns-ordinary-ladder-down",
     "GEARSHIFT_V2_ACTIVE" in arqh and "optimizer_owns_normal_downshift" in arqh and
     "return true;  // v2 owns ordinary downshift" in arqh,

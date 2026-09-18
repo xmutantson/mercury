@@ -8185,6 +8185,54 @@ int cl_arq_controller::test_inband_retag()
 	const int CFG_HI  = CONFIG_11;  // ladder idx 14 (a 2-rung CLIMB above CFG_LO)
 
 	// ========================================================================
+	// PART A0 — ACTIVE-V2 PHYSICAL REGRESSION: CONFIG_0 -> CONFIG_16 is an
+	// intra-OFDM move. Gearshift-v2 owns the decision, CONFIG_TAG owns transport,
+	// local load_configuration is NOT confirmation, and only matching peer SACK
+	// evidence closes switch_inflight.
+	// ========================================================================
+	{
+		cl_telecom_system* ts_cmd = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts_cmd);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->rate_opt.notify_switch_dispatched(
+			CONFIG_0, CONFIG_16, GEARSHIFT_ACTION_PROBE, CONFIG_0, 1000, false);
+
+		cmd->negotiated_configuration = CONFIG_16;
+		cmd->add_message_control(SET_CONFIG);
+		check(cmd->current_configuration == CONFIG_16,
+			"A0.1 ACTIVE v2 locally moves CONFIG_0 -> CONFIG_16 via CONFIG_TAG transport",
+			cmd->current_configuration, CONFIG_16);
+		check(cmd->messages_control.status == FREE,
+			"A0.2 CONFIG_0 -> CONFIG_16 puts ZERO SET_CONFIG control frames on the wire",
+			cmd->messages_control.status, FREE);
+		check(cmd->rate_opt.switch_inflight_for_test(),
+			"A0.3 local PHY change does NOT confirm the v2 transaction",
+			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
+
+		const int announce_bsi = 7;
+		uint8_t parity = 0xFF;
+		bool emitted = cmd->inband_tag_firing_decision(CONFIG_16, announce_bsi, &parity);
+		check(emitted && cmd->inband_announce_bsi == announce_bsi,
+			"A0.4 CONFIG_16 announcement is emitted and anchored",
+			(emitted && cmd->inband_announce_bsi == announce_bsi) ? 1 : 0, 1);
+
+		bool stale = cmd->inband_retag_confirm_from_sack((announce_bsi - 1) & 0xFF);
+		check(!stale && cmd->rate_opt.switch_inflight_for_test(),
+			"A0.5 stale pre-announcement SACK cannot close the v2 transaction",
+			(!stale && cmd->rate_opt.switch_inflight_for_test()) ? 1 : 0, 1);
+
+		bool peer_confirmed = cmd->inband_retag_confirm_from_sack(announce_bsi);
+		check(peer_confirmed,
+			"A0.6 matching config-discriminating SACK confirms peer follow",
+			peer_confirmed ? 1 : 0, 1);
+		check(!cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active(),
+			"A0.7 peer follow closes switch_inflight and begins/retains probe probation",
+			(!cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active()) ? 1 : 0, 1);
+
+		delete cmd; delete ts_cmd;
+	}
+
+	// ========================================================================
 	// PART A — CLIMB-FOLLOWED: the chokepoint climbs CONFIG_9 -> CONFIG_11, the RX
 	// follows UP, both ends + the PHY twin track.
 	// ========================================================================
@@ -8371,6 +8419,9 @@ int cl_arq_controller::test_inband_retag()
 		// Establish a LAST-CONFIRMED floor at CONFIG_9 (the RX provably reached it) — model
 		// it as a confirmed change to the starting config so the demote has a real floor.
 		cmd->inband_last_confirmed_config = CFG_LO;
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->rate_opt.notify_switch_dispatched(
+			CFG_LO, CFG_HI, GEARSHIFT_ACTION_PROBE, CFG_LO, 1000, false);
 
 		// Arm a CLIMB to CONFIG_11 via the chokepoint.
 		cmd->negotiated_configuration = CFG_HI;
@@ -8413,6 +8464,12 @@ int cl_arq_controller::test_inband_retag()
 		check(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO,
 			"C5 a FRESH re-tag armed for the demote target CONFIG_9",
 			(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO) ? 1 : 0, 1);
+		check(!cmd->rate_opt.switch_inflight_for_test(),
+			"C6 bounded CONFIG_TAG failure terminates the v2 switch transaction",
+			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 0);
+		check(!cmd->rate_opt.probe_is_active(),
+			"C7 failed CONFIG_TAG climb terminates probe probation before fallback",
+			cmd->rate_opt.probe_is_active() ? 1 : 0, 0);
 		delete cmd; delete ts;
 	}
 
@@ -8832,6 +8889,9 @@ int cl_arq_controller::test_inband_nack()
 	{
 		cl_arq_controller* cmd = make_cmd(CFG_LO);
 		cmd->inband_last_confirmed_config = CFG_LO;   // RX provably reached CONFIG_9
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->rate_opt.notify_switch_dispatched(
+			CFG_LO, CFG_HI, GEARSHIFT_ACTION_PROBE, CFG_LO, 1000, false);
 
 		// Arm a CLIMB to CONFIG_11 via the chokepoint (announced, not yet confirmed).
 		cmd->negotiated_configuration = CFG_HI;
@@ -8872,6 +8932,12 @@ int cl_arq_controller::test_inband_nack()
 		check(cmd->inband_retag_count < R,
 			"B5 the demote fired BEFORE the R give-up floor (NACK beat the R-retry)",
 			cmd->inband_retag_count < R ? 1 : 0, 1);
+		check(!cmd->rate_opt.switch_inflight_for_test(),
+			"B5a matching NACK explicitly terminates the v2 switch transaction",
+			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 0);
+		check(!cmd->rate_opt.probe_is_active(),
+			"B5b matching NACK terminates failed probe probation before fallback",
+			cmd->rate_opt.probe_is_active() ? 1 : 0, 0);
 
 		// A stale-epoch NACK (echoed parity != current) is REJECTED (no spurious demote).
 		cl_arq_controller* cmd2 = make_cmd(CFG_LO);

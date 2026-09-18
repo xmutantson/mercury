@@ -417,6 +417,34 @@ int main() {
     ok("policy resumes after switch failure under failure memory",
        d.reason!="switch-inflight" && !(d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_16));
 
+    // CONFIG_TAG terminal evidence is target-qualified. A stale SACK/NACK from a
+    // previous announcement must not close whichever Axis-1 transaction is live now.
+    cl_rate_optimizer targetmatch; targetmatch.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+    p=targetmatch.get_policy(); p.confidence_z=0.0; p.direct_switch_margin=0.50;
+    p.probe_mean_margin=0.0; p.min_outcome_samples=1; p.cooldown_batches=0;
+    targetmatch.set_policy_for_test(p); targetmatch.set_switch_cost_ms(1);
+    d=targetmatch.evaluate_v2(tbase,CONFIG_16);
+    targetmatch.notify_switch_dispatched(CONFIG_14,CONFIG_16,d.action,CONFIG_14,1000,false);
+    ok("mismatched peer confirmation is ignored",
+       !targetmatch.notify_switch_confirmed_if_matches(CONFIG_14,CONFIG_15,1100) &&
+       targetmatch.switch_inflight_for_test());
+    ok("matching peer confirmation closes the live transition",
+       targetmatch.notify_switch_confirmed_if_matches(CONFIG_14,CONFIG_16,1200) &&
+       !targetmatch.switch_inflight_for_test() && targetmatch.probe_is_active());
+
+    cl_rate_optimizer targetfail; targetfail.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+    p=targetfail.get_policy(); p.confidence_z=0.0; p.direct_switch_margin=0.50;
+    p.probe_mean_margin=0.0; p.min_outcome_samples=1; p.cooldown_batches=0;
+    targetfail.set_policy_for_test(p); targetfail.set_switch_cost_ms(1);
+    d=targetfail.evaluate_v2(tbase,CONFIG_16);
+    targetfail.notify_switch_dispatched(CONFIG_14,CONFIG_16,d.action,CONFIG_14,1000,false);
+    ok("mismatched peer failure is ignored",
+       !targetfail.notify_switch_failed_if_matches(CONFIG_14,CONFIG_15) &&
+       targetfail.switch_inflight_for_test());
+    ok("matching peer failure closes the live transition",
+       targetfail.notify_switch_failed_if_matches(CONFIG_14,CONFIG_16) &&
+       !targetfail.switch_inflight_for_test() && !targetfail.probe_is_active());
+
     // Bench regression: Patch 2 physically showed an occasional unconfirmed
     // 0->16 SET_CONFIG followed by a successful retry about one control window
     // later. Patch 3 made switch_inflight exclusive but forgot a terminal

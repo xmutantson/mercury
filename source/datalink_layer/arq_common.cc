@@ -6322,7 +6322,8 @@ bool cl_arq_controller::inband_retag_confirm_from_sack(int rx_bsi)
 	// terminal confirmation event for a v2-owned transition.  External/non-v2
 	// moves have no matching switch_inflight, so the notifier is a no-op there.
 	if(rate_opt.controls_link())
-		rate_opt.notify_switch_confirmed(opt_now_ms());
+		rate_opt.notify_switch_confirmed_if_matches(
+			inband_pre_announce_config, confirmed_config, opt_now_ms());
 
 	inband_retag_armed   = false;
 	inband_retag_config  = CONFIG_NONE;
@@ -6477,7 +6478,8 @@ bool cl_arq_controller::inband_retag_escalate_if_climb_exhausted()
 	// where an ACK-fragile SET_CONFIG could grind the generic 20-control-retry
 	// budget for ~45 seconds.
 	if(rate_opt.controls_link())
-		rate_opt.notify_switch_failed();
+		rate_opt.notify_switch_failed_if_matches(
+			inband_pre_announce_config, inband_retag_config);
 
 	// Disarm the failed climb's re-tag BEFORE routing the demote: inband_route_failure_demote
 	// -> the chokepoint -> inband_unilateral_config_change ARMS a FRESH re-tag for
@@ -6630,11 +6632,19 @@ bool cl_arq_controller::inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason,
 		(unsigned)reason, rx_raw_cfg, rx_idx, announced_idx);
 	fflush(stdout);
 
-	// Record the provably-reachable floor + disarm the failed climb's re-tag BEFORE the
-	// demote (inband_route_failure_demote -> the chokepoint ARMS a FRESH re-tag for the RX
+	// Record the provably-reachable floor + terminate the matching v2 climb transaction
+	// BEFORE routing the demote. A fresh, in-epoch NACK from a peer below the announced
+	// target is explicit evidence that this CONFIG_TAG transition failed; do not rely on
+	// the fallback demote being noticed later as an indirect external-axis transition.
+	inband_last_confirmed_config = rx_raw_cfg;
+	if(rate_opt.controls_link() && inband_retag_armed)
+		rate_opt.notify_switch_failed_if_matches(
+			inband_pre_announce_config, inband_retag_config);
+
+	// Disarm the failed climb's re-tag BEFORE the demote
+	// (inband_route_failure_demote -> the chokepoint ARMS a FRESH re-tag for the RX
 	// config; leaving the climb armed would race the fresh arm — same discipline as the
 	// R-retry escalation).
-	inband_last_confirmed_config = rx_raw_cfg;
 	inband_retag_armed   = false;
 	inband_retag_config  = CONFIG_NONE;
 	inband_announce_bsi  = -1;
