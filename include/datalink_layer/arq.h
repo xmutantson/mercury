@@ -6570,9 +6570,9 @@ public:
   void set_optimizer_disabled(bool b) { optimizer_disabled = b; }
 
   // Gearshift authority boundary.  In Gearshift-v2 ACTIVE mode the v2
-  // controller is the sole ordinary OFDM authority after it has enough outcome
-  // evidence; SHADOW mode is observation-only.  LEGACY mode preserves the
-  // monitor branch's calibrated-band handoff.  BREAK remains independent.
+  // controller is the sole connected Axis-1 authority. SHADOW mode is
+  // observation-only. LEGACY mode preserves the monitor branch's calibrated-band
+  // handoff. In ACTIVE, BREAK is an owner-authorized actuator, never a peer controller.
   bool optimizer_is_in_control() const {
     if (optimizer_disabled || !rate_opt.is_enabled()) return false;
     if (rate_opt.get_mode() == GEARSHIFT_V2_SHADOW) return false;
@@ -6587,8 +6587,8 @@ public:
   // Ordinary downshift ownership is intentionally narrower than the broad
   // upward handoff.  The v2 controller may suppress the legacy ladder only when
   // it has actually evaluated the state (HOLD/SWITCH/PROBE/ROLLBACK), never when
-  // it abstained because evidence or calibration was unavailable.  Full batch
-  // failure remains an input to v2 and BREAK remains an independent last resort.
+  // it abstained because evidence or calibration was unavailable. Full-batch
+  // failure remains evidence for v2; ACTIVE hard recovery is owner-authorized.
   bool optimizer_owns_normal_downshift() const {
     if (!optimizer_is_in_control()) return false;
     if (rate_opt.get_mode() == GEARSHIFT_V2_ACTIVE)
