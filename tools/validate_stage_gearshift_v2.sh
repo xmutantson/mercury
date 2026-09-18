@@ -100,10 +100,17 @@ echo "(monolithic mercury --test is intentionally NOT run here)"
 
 WANT="$WANT" SHORT="$SHORT" python3 - <<'PY'
 import base64
+import hashlib
 import os
 import re
 import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
 import time
+import urllib.request
 
 import ionos_butler as B
 
@@ -113,6 +120,10 @@ SHORT = os.environ["SHORT"]
 SRC2 = f"/home/rpi2/quicksilver-gs2-build-{SHORT}"
 STAGE2 = "/home/rpi2/quicksilver-gs2-gearshift-v2"
 STAGE1 = "/home/rpi1/quicksilver-gs2-gearshift-v2"
+RPI1_ADDR = "192.168.2.217"
+RPI2_ADDR = "192.168.2.215"
+RPI2_HTTP_PORT = 18765
+LOCAL_HTTP_PORT = 18766
 
 FOCUSED_NATIVE_TESTS = [
     "--test-inband-retag",
@@ -160,86 +171,139 @@ def quiet_run(pi, cmd, timeout=60):
     return (out or ""), rc
 
 
-def relay_file_via_butler(src_pi, src_path, dst_pi, dst_path, chunk_bytes=786432):
-    """Relay a file through SpicyPancake using only Butler SSH calls.
+def relay_file_via_spicypancake_http(src_pi, src_path, dst_pi, dst_path, expected_sha):
+    """Relay src_pi -> SpicyPancake -> dst_pi using short Butler control calls.
 
-    No direct Pi-to-Pi connectivity is required. Each chunk is base64 on the
-    wire, decoded on the destination, and the final size/hash are verified.
+    The binary never rides inside an SSH exec request.  Each Pi is only told to
+    start/fetch HTTP; the actual 49 MB payload moves over ordinary TCP.
     """
-    size_out, rc = quiet_run(
-        src_pi,
-        f"stat -c %s {shlex.quote(src_path)}",
-        timeout=60,
-    )
-    if rc != 0:
-        raise RuntimeError(f"{src_pi}: cannot stat relay source {src_path}")
-    total = int(size_out.strip().splitlines()[-1])
+    local_dir = tempfile.mkdtemp(prefix=f"quicksilver-stage-{SHORT}-")
+    local_path = os.path.join(local_dir, "mercury")
+    remote_server_pid = None
+    local_server = None
 
-    bash(dst_pi, f"""
+    # Choose the SpicyPancake address used by the route to rpi1.
+    route_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        route_sock.connect((RPI1_ADDR, 9))
+        spicy_addr = route_sock.getsockname()[0]
+    finally:
+        route_sock.close()
+
+    try:
+        # Start rpi2 HTTP server and do not proceed until it is actually serving.
+        launch_out, rc = bash(src_pi, f"""
+set -Eeuo pipefail
+cd {shlex.quote(os.path.dirname(src_path))}
+log=/tmp/quicksilver-stage-http-{SHORT}.log
+nohup python3 -m http.server {RPI2_HTTP_PORT} --bind 0.0.0.0 >"$log" 2>&1 </dev/null &
+pid=$!
+for i in $(seq 1 50); do
+    if curl -fsSI http://127.0.0.1:{RPI2_HTTP_PORT}/{shlex.quote(os.path.basename(src_path))} >/dev/null 2>&1; then
+        echo "READY:$pid"
+        exit 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "temporary rpi2 HTTP server died:" >&2
+        cat "$log" >&2 || true
+        exit 1
+    fi
+    sleep 0.2
+done
+echo "temporary rpi2 HTTP server never became ready" >&2
+cat "$log" >&2 || true
+kill "$pid" 2>/dev/null || true
+exit 1
+""", timeout=30, check=False)
+        if rc != 0:
+            raise RuntimeError(f"{src_pi}: temporary HTTP server failed rc={rc}")
+        m = re.search(r"READY:(\d+)", launch_out)
+        if not m:
+            raise RuntimeError(f"{src_pi}: temporary HTTP server returned no READY pid")
+        remote_server_pid = m.group(1)
+
+        # Pull the staged binary onto SpicyPancake.
+        src_url = f"http://{RPI2_ADDR}:{RPI2_HTTP_PORT}/{os.path.basename(src_path)}"
+        print(f"relay {src_pi}->SpicyPancake: downloading staged binary", flush=True)
+        with urllib.request.urlopen(src_url, timeout=30) as response, open(local_path, "wb") as out:
+            while True:
+                block = response.read(1024 * 1024)
+                if not block:
+                    break
+                out.write(block)
+
+        h = hashlib.sha256()
+        with open(local_path, "rb") as inp:
+            for block in iter(lambda: inp.read(1024 * 1024), b""):
+                h.update(block)
+        local_sha = h.hexdigest()
+        local_size = os.path.getsize(local_path)
+        if local_sha != expected_sha:
+            raise RuntimeError(
+                f"SpicyPancake relay download hash mismatch: "
+                f"got={local_sha} want={expected_sha}"
+            )
+        print(
+            f"relay {src_pi}->SpicyPancake: {local_size} bytes sha256={local_sha}",
+            flush=True,
+        )
+
+        # Serve the verified local copy.  Wait for the socket to be listening.
+        local_server = subprocess.Popen(
+            [
+                sys.executable, "-m", "http.server", str(LOCAL_HTTP_PORT),
+                "--bind", "0.0.0.0",
+            ],
+            cwd=local_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(50):
+            if local_server.poll() is not None:
+                raise RuntimeError(
+                    f"SpicyPancake temporary HTTP server exited rc={local_server.returncode}"
+                )
+            try:
+                probe = socket.create_connection(("127.0.0.1", LOCAL_HTTP_PORT), timeout=0.2)
+                probe.close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("SpicyPancake temporary HTTP server never became ready")
+
+        # rpi1 fetches from SpicyPancake.  --retry-connrefused closes the startup
+        # race that broke the earlier direct rpi2->rpi1 HTTP attempt.
+        print(
+            f"relay SpicyPancake({spicy_addr})->{dst_pi}: fetching verified binary",
+            flush=True,
+        )
+        bash(dst_pi, f"""
 set -Eeuo pipefail
 install -d {shlex.quote(os.path.dirname(dst_path))}
 rm -f {shlex.quote(dst_path)}
-: > {shlex.quote(dst_path)}
-""", timeout=60)
+curl -fS --retry 20 --retry-connrefused --retry-delay 1 --connect-timeout 3 \
+  http://{spicy_addr}:{LOCAL_HTTP_PORT}/mercury \
+  -o {shlex.quote(dst_path)}
+got=$(sha256sum {shlex.quote(dst_path)} | awk '{{print $1}}')
+test "$got" = {shlex.quote(expected_sha)}
+""", timeout=300)
 
-    copied = 0
-    index = 0
-    while copied < total:
-        want = min(chunk_bytes, total - copied)
-        read_code = (
-            "import base64,sys; "
-            "f=open(sys.argv[1],'rb'); "
-            "f.seek(int(sys.argv[2])); "
-            "sys.stdout.write(base64.b64encode(f.read(int(sys.argv[3]))).decode('ascii'))"
-        )
-        b64, rc = quiet_run(
-            src_pi,
-            f"python3 -c {shlex.quote(read_code)} "
-            f"{shlex.quote(src_path)} {copied} {want}",
-            timeout=120,
-        )
-        if rc != 0:
-            raise RuntimeError(
-                f"{src_pi}: relay read failed at offset {copied} rc={rc}"
+    finally:
+        if local_server is not None:
+            local_server.terminate()
+            try:
+                local_server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                local_server.kill()
+                local_server.wait(timeout=5)
+        shutil.rmtree(local_dir, ignore_errors=True)
+        if remote_server_pid is not None:
+            quiet_run(
+                src_pi,
+                f"kill {shlex.quote(remote_server_pid)} 2>/dev/null || true",
+                timeout=30,
             )
-        b64 = b64.strip()
-        raw = base64.b64decode(b64, validate=True)
-        if len(raw) != want:
-            raise RuntimeError(
-                f"relay chunk length mismatch at offset {copied}: "
-                f"got={len(raw)} want={want}"
-            )
-
-        payload = base64.b64encode(raw).decode("ascii")
-        _, rc = quiet_run(
-            dst_pi,
-            f"printf %s {shlex.quote(payload)} | base64 -d >> "
-            f"{shlex.quote(dst_path)}",
-            timeout=120,
-        )
-        if rc != 0:
-            raise RuntimeError(
-                f"{dst_pi}: relay write failed at offset {copied} rc={rc}"
-            )
-
-        copied += want
-        index += 1
-        if copied == total or index % 8 == 0:
-            print(
-                f"relay {src_pi}->{dst_pi}: {copied}/{total} bytes "
-                f"({100.0 * copied / total:.1f}%)",
-                flush=True,
-            )
-
-    dst_size_out, rc = quiet_run(
-        dst_pi,
-        f"stat -c %s {shlex.quote(dst_path)}",
-        timeout=60,
-    )
-    if rc != 0 or int(dst_size_out.strip().splitlines()[-1]) != total:
-        raise RuntimeError(
-            f"{dst_pi}: relay size verification failed for {dst_path}"
-        )
 
 
 def detached_build(pi, script):
@@ -627,12 +691,14 @@ if s1_valid:
     print("rpi1: staged binary already byte-identical to rpi2; skipping transfer")
 else:
     print(
-        "rpi1: relaying tested staged binary through SpicyPancake/Butler "
-        "(no Pi-to-Pi connectivity required)",
+        "rpi1: relaying tested staged binary rpi2 -> SpicyPancake -> rpi1 "
+        "(Butler controls both Pis; payload uses temporary HTTP)",
         flush=True,
     )
     tmp1 = stage1_binary + ".new"
-    relay_file_via_butler("rpi2", stage2_binary, "rpi1", tmp1)
+    relay_file_via_spicypancake_http(
+        "rpi2", stage2_binary, "rpi1", tmp1, s2_sha
+    )
     bash("rpi1", f"""
 set -Eeuo pipefail
 chmod 0755 {shlex.quote(tmp1)}
