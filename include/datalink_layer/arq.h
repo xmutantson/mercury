@@ -1285,6 +1285,9 @@ public:
                                                uint8_t* out_ssid);
 
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
+  // ACTIVE-v2 hard recovery terminates at the robust floor; legacy BREAK
+  // ladder/probe policy is bypassed and Gearshift reacquires upward itself.
+  bool gearshift_v2_finish_break_at_floor();
   int test_send_break_drain_failure(); // drain failure must free buffers and unkey PTT
   int test_send_break_pattern_reset_failure(); // reset NotReady must unkey and clear RX mute
   int test_break_ack_set_config_failure(); // rejected recovery enqueue must not enter control TX
