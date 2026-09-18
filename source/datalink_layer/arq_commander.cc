@@ -3687,6 +3687,33 @@ int cl_arq_controller::add_message_control(char code)
 				messages_control.type = NONE;
 				return success;
 			}
+			// ACTIVE-v2 authority firewall. Determine the requested forward target once,
+			// then require Gearshift ownership before either CONFIG_TAG or legacy SET_CONFIG
+			// transport is allowed to move Axis-1. Normal v2 moves already carry a matching
+			// notify_switch_dispatched() transaction; legacy safety producers can only REQUEST
+			// a downward move, which authorize_external_transition() may own or reject.
+			int v2_owned_target = (gear_shift_algorithm==SNR_BASED)
+				? get_configuration(measurements.SNR_downlink)
+				: negotiated_configuration;
+			if(rate_opt.controls_link() && link_status == CONNECTED
+			   && v2_owned_target != current_configuration)
+			{
+				int authorized = rate_opt.authorize_external_transition(
+					current_configuration, v2_owned_target, "set-config-chokepoint",
+					opt_now_ms(), narrowband_enabled == YES);
+				if(authorized < 0)
+				{
+					printf("[GEARSHIFT-V2-AUTHORITY] BLOCK SET_CONFIG transport %d->%d: no owner\n",
+						current_configuration, v2_owned_target);
+					fflush(stdout);
+					messages_control.status = FREE;
+					messages_control.type = NONE;
+					return ERROR_;
+				}
+				v2_owned_target = authorized;
+				negotiated_configuration = authorized;
+			}
+
 			// STAGE 3b GEARSHIFT DRIVE (data-flow-perbatch-config.md §3.1 / §12 W3):
 			// Gearshift-v2 ACTIVE uses CONFIG_TAG transport by default; legacy selectors
 			// use it when MERCURY_INBAND_RATE is set. The selected rate change is
@@ -3704,9 +3731,11 @@ int cl_arq_controller::add_message_control(char code)
 			// (byte-identical). Placed AFTER the messages_control.data null-guard above.
 			if(inband_rate_feature_enabled())
 			{
-				int inband_target = (gear_shift_algorithm==SNR_BASED)
-					? get_configuration(measurements.SNR_downlink)
-					: negotiated_configuration;
+				int inband_target = rate_opt.controls_link()
+					? v2_owned_target
+					: ((gear_shift_algorithm==SNR_BASED)
+						? get_configuration(measurements.SNR_downlink)
+						: negotiated_configuration);
 				// HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §2):
 				// the in-band unilateral CONFIG_TAG is the wrong transport for a
 				// robust<->OFDM TIER CROSSING. The tag serializes each rung's confirm
@@ -3757,7 +3786,13 @@ int cl_arq_controller::add_message_control(char code)
 			messages_control.data[0]=code;
 			messages_control.id=0;
 
-			if(gear_shift_algorithm==SNR_BASED)
+			if(rate_opt.controls_link())
+			{
+				forward_configuration = v2_owned_target;
+				if(reverse_configuration == CONFIG_NONE)
+					reverse_configuration = forward_configuration;
+			}
+			else if(gear_shift_algorithm==SNR_BASED)
 			{
 				forward_configuration = get_configuration(measurements.SNR_downlink);
 				reverse_configuration = get_configuration(measurements.SNR_uplink);
@@ -6445,6 +6480,29 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	if(demote_target < 0 || demote_target == current_configuration)
 		return false;   // no lower rung / no-op — caller must route to the dead-batch floor
 
+	// ACTIVE-v2 single-owner contract: legacy recovery code is an event producer,
+	// not an Axis-1 authority. Ask Gearshift BEFORE touching FIFO/config/ceiling state.
+	// A live v2 experiment rejects the foreign request; confirmed probe probation
+	// converts it to the probe's own rollback target. Returning true on rejection
+	// consumes the legacy request so its caller cannot fall through to BREAK.
+	if(rate_opt.controls_link() && link_status == CONNECTED)
+	{
+		int owned_target = rate_opt.authorize_external_transition(
+			current_configuration, demote_target, reason, opt_now_ms(),
+			narrowband_enabled == YES);
+		if(owned_target < 0)
+		{
+			printf("[GEARSHIFT-V2-AUTHORITY] legacy demote request consumed without action: "
+				"%d->%d reason=%s\n", current_configuration, demote_target,
+				reason ? reason : "?");
+			fflush(stdout);
+			return true;
+		}
+		demote_target = owned_target;
+		if(demote_target == current_configuration)
+			return true;
+	}
+
 	printf("[INBAND-NOBREAK] Class-A degradation (%s): demoting %d -> %d via the CONFIG_TAG "
 		"(NOT the BREAK->ROBUST cascade); the RX down-ladder catches a missed tag\n",
 		reason ? reason : "?", current_configuration, demote_target);
@@ -6659,6 +6717,22 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	if(!inband_rate_feature_enabled())
 		return false;
 
+	// ACTIVE-v2 owns the complete experiment lifetime, not merely CONFIG_TAG dispatch.
+	// The generic poll-count watchdog is telemetry-only while a switch is in flight OR
+	// a confirmed probe remains in probation. It may not reinterpret Gearshift's own
+	// bounded zero-progress window as link death.
+	if(rate_opt.owns_link_experiment())
+	{
+		if(cmd_inband_liveness_no_progress_polls != 0)
+		{
+			printf("[GEARSHIFT-V2-AUTHORITY] liveness watchdog yielded to owned experiment "
+				"(streak=%d reset)\n", cmd_inband_liveness_no_progress_polls);
+			fflush(stdout);
+		}
+		cmd_inband_liveness_no_progress_polls = 0;
+		return false;
+	}
+
 #ifdef INBAND_LIVENESS_FAILBEFORE
 	// FAIL-BEFORE arm: the guard is INERT — it only tracks the streak (so the test can
 	// observe it growing unbounded) but NEVER fires a recovery. Rebuild with
@@ -6773,6 +6847,21 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 
 	// --- Stall confirmed: the connect/negotiate handshake is livelocked. ---
 	cmd_inband_liveness_no_progress_polls = 0;   // re-arm the window for any next stall
+
+	// Under ACTIVE this is a FAILURE SIGNAL, not an independent recovery decision.
+	// Ask Gearshift for a lower action while any lower rung exists. Only the actual
+	// ladder floor is eligible to continue to the hard-recovery path below.
+	if(rate_opt.controls_link())
+	{
+		int lower = config_ladder_down(current_configuration, robust_enabled);
+		if(lower != current_configuration)
+		{
+			printf("[GEARSHIFT-V2-AUTHORITY] liveness stall reports failure at cfg=%d; "
+				"requesting owner recovery toward %d\n", current_configuration, lower);
+			fflush(stdout);
+			return inband_route_failure_demote(lower, "liveness_stall");
+		}
+	}
 
 #ifdef INBAND_LIVENESS_FAILBEFORE
 	printf("[INBAND-LIVENESS] FAILBEFORE: stall detected but recovery DISABLED — livelock "
