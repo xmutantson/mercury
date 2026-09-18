@@ -103,6 +103,12 @@ req("BREAK hard recovery is owner-authorized before RF emission",
     h >= 0 and p >= 0 and h < p)
 req("above-floor BREAK is converted to owner-mediated demote",
     'inband_route_failure_demote(lower, "legacy_break_request")' in brk)
+
+req("liveness hard reset is owner-gated",
+    '"liveness-floor-recovery"' in CMD)
+req("pure-silence reconnect is owner-gated under ACTIVE",
+    "pure-silence reconnect request" in CMD
+    and 'inband_route_failure_demote(hint, "demote_silence_peer_unreachable")' in CMD)
 req("ACTIVE BREAK recovery settles at floor and returns authority to v2",
     "gearshift_v2_finish_break_at_floor()" in CMD
     and "legacy BREAK ladder disabled, v2 will reacquire upward" in CMD)
