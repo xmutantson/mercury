@@ -81,8 +81,11 @@ req("SET_CONFIG asks owner before selecting CONFIG_TAG transport",
 
 req("generic liveness yields for full v2 experiment lifetime",
     "rate_opt.owns_link_experiment(opt_now_ms())" in live)
-req("generic liveness reports a downshift request through owner",
-    'inband_route_failure_demote(lower, "liveness_stall")' in live)
+req("generic liveness is telemetry-only and full v2 evaluator selects destination",
+    "opt_record_batch(" in live
+    and "opt_evaluate_batch_end(&owner_target)" in live
+    and "generic BREAK suppressed" in live
+    and 'inband_route_failure_demote(lower, "liveness_stall")' not in live)
 
 req("direct CONFIG_TAG execution requires matching owner",
     "rate_opt.transition_matches(current_configuration, target_cfg)" in unilateral)
