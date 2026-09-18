@@ -2938,6 +2938,51 @@ int cl_arq_controller::test_break_ack_set_config_failure()
 	return fails;
 }
 
+bool cl_arq_controller::gearshift_v2_finish_break_at_floor()
+{
+	if(!rate_opt.controls_link()) return false;
+
+	// A v2-authorized hard recovery has exactly one policy outcome: re-synchronize
+	// both peers at the robust floor, preserve/re-stage application bytes, and let
+	// Gearshift-v2 perform every subsequent upward acquisition. The historical BREAK
+	// recovery ladder is transport policy from another controller and is not allowed
+	// to choose a target while ACTIVE owns Axis-1.
+	const int floor_cfg = robust_enabled ? ROBUST_0 : CONFIG_0;
+	printf("[GEARSHIFT-V2-AUTHORITY] BREAK transport complete: settling at floor CONFIG_%d; "
+		"legacy BREAK ladder disabled, v2 will reacquire upward\n", floor_cfg);
+	fflush(stdout);
+
+	emergency_break_active = 0;
+	emergency_nack_count = 0;
+	emergency_break_retries = 0;
+	break_recovery_phase = 0;
+	break_recovery_retries = 0;
+	break_drop_step = 0;
+
+	messages_control_backup();
+	data_configuration = floor_cfg;
+	negotiated_configuration = floor_cfg;
+	forward_configuration = floor_cfg;
+	reverse_configuration = floor_cfg;
+	load_configuration(floor_cfg, PHYSICAL_LAYER_ONLY, YES);
+	messages_control_restore();
+
+	if(compression_enabled)
+		restore_tx_from_compressed();
+	else
+	{
+		restage_requeue_tx_messages();
+		fifo_buffer_backup.flush();
+		clear_retx_queue();
+	}
+	block_under_tx = NO;
+	opt_reset_window();
+	connection_status = TRANSMITTING_DATA;
+	watchdog_timer.start();
+	link_timer.start();
+	return true;
+}
+
 void cl_arq_controller::process_messages_commander()
 {
 	// Topgear deferred-report driver (consume-race fix): drive any pending
@@ -2973,6 +3018,8 @@ void cl_arq_controller::process_messages_commander()
 		{
 			if(receive_ack_pattern())
 			{
+				if(gearshift_v2_finish_break_at_floor())
+					return;
 				// Use ROBUST_0 as coordination layer, then probe target config.
 				// Phase 1: send SET_CONFIG at ROBUST_0 (guaranteed delivery).
 				// Phase 2: send SET_CONFIG at target to verify it works (2 tries).
@@ -3086,6 +3133,8 @@ void cl_arq_controller::process_messages_commander()
 				printf("[BREAK] EXHAUSTED state: emergency_prev=%d break_drop=%d robust=%d\n",
 					emergency_previous_config, break_drop_step, robust_enabled);
 				fflush(stdout);
+				if(gearshift_v2_finish_break_at_floor())
+					return;
 				emergency_break_active = 0;
 				emergency_nack_count = 0;
 				break_recovery_phase = 1;
