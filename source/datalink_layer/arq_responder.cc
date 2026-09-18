@@ -7575,12 +7575,6 @@ int cl_arq_controller::test_inband_no_break()
 		cmd->narrowband_enabled = NO;
 		cmd->role = COMMANDER;
 		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
-		// cl_arq_controller starts with current_configuration=CONFIG_0. Without
-		// forcing a transition, make_cmd(CONFIG_0) would let load_configuration()
-		// short-circuit before init_messages_buffers(), and the A0 SET_CONFIG test
-		// would exercise the synthetic NULL-buffer guard instead of production.
-		cmd->current_configuration = CONFIG_NONE;
-		ts->current_configuration = CONFIG_NONE;
 		cmd->load_configuration(cfg, FULL, NO);
 		cmd->link_status = CONNECTED;
 		cmd->connection_status = TRANSMITTING_DATA;
@@ -8274,6 +8268,11 @@ int cl_arq_controller::test_inband_retag()
 		cmd->narrowband_enabled = NO;
 		cmd->role = COMMANDER;
 		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
+		// cl_arq_controller starts at CONFIG_0. Force a real FULL transition so
+		// make_cmd(CONFIG_0) initializes messages_control/messages_tx instead of
+		// short-circuiting into the synthetic NULL-buffer SET_CONFIG guard.
+		cmd->current_configuration = CONFIG_NONE;
+		ts->current_configuration = CONFIG_NONE;
 		cmd->load_configuration(cfg, FULL, NO);
 		cmd->link_status = CONNECTED;
 		cmd->connection_status = TRANSMITTING_DATA;
