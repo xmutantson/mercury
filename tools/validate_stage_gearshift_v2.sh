@@ -95,6 +95,7 @@ import base64
 import os
 import re
 import shlex
+import time
 
 import ionos_butler as B
 
@@ -120,6 +121,101 @@ def bash(pi, script, timeout=300, check=True):
     payload = base64.b64encode(script.encode()).decode()
     command = f"printf %s {shlex.quote(payload)} | base64 -d | bash"
     return run(pi, command, timeout=timeout, check=check)
+
+
+JOB_BASE = f"/tmp/quicksilver-gs2-build-{SHORT}"
+JOB_SCRIPT = JOB_BASE + ".sh"
+JOB_LOG = JOB_BASE + ".log"
+JOB_STATUS = JOB_BASE + ".status"
+JOB_PID = JOB_BASE + ".pid"
+
+
+def quiet_run(pi, cmd, timeout=60):
+    out, rc = B._ssh_run(pi, cmd, timeout=timeout)
+    return (out or ""), rc
+
+
+def detached_build(pi, script):
+    """Start or reattach to a durable remote build and stream its log."""
+    state_cmd = (
+        f"if test -f {shlex.quote(JOB_STATUS)}; then "
+        f"echo DONE:$(cat {shlex.quote(JOB_STATUS)}); "
+        f"elif test -f {shlex.quote(JOB_PID)} && "
+        f"kill -0 $(cat {shlex.quote(JOB_PID)}) 2>/dev/null; then "
+        f"echo RUNNING:$(cat {shlex.quote(JOB_PID)}); "
+        f"else echo ABSENT; fi"
+    )
+    state, _ = quiet_run(pi, state_cmd)
+    state = state.strip().splitlines()[-1] if state.strip() else "ABSENT"
+
+    if state == "ABSENT":
+        payload = base64.b64encode(script.encode()).decode()
+        launch = f"""
+set -Eeuo pipefail
+rm -f {shlex.quote(JOB_LOG)} {shlex.quote(JOB_STATUS)} {shlex.quote(JOB_PID)}
+printf %s {shlex.quote(payload)} | base64 -d > {shlex.quote(JOB_SCRIPT)}
+chmod 0700 {shlex.quote(JOB_SCRIPT)}
+nohup bash {shlex.quote(JOB_SCRIPT)} > {shlex.quote(JOB_LOG)} 2>&1 </dev/null &
+pid=$!
+echo "$pid" > {shlex.quote(JOB_PID)}
+echo "$pid"
+"""
+        out, _ = bash(pi, launch, timeout=30)
+        pid_lines = re.findall(r"(?m)^\s*(\d+)\s*$", out)
+        pid = pid_lines[-1] if pid_lines else "?"
+        print(f"{pi}: detached native build started pid={pid}")
+    elif state.startswith("RUNNING:"):
+        print(f"{pi}: reattaching to existing native build pid={state.split(':',1)[1]}")
+    elif state.startswith("DONE:"):
+        print(f"{pi}: native build already completed; consuming saved result")
+
+    # Stream only newly appended lines while polling with short Butler calls.
+    last_line = 0
+    while True:
+        count_out, _ = quiet_run(
+            pi,
+            f"test -f {shlex.quote(JOB_LOG)} && wc -l < {shlex.quote(JOB_LOG)} || echo 0",
+        )
+        try:
+            line_count = int(count_out.strip().splitlines()[-1])
+        except Exception:
+            line_count = last_line
+
+        if line_count > last_line:
+            chunk, _ = quiet_run(
+                pi,
+                f"sed -n '{last_line + 1},{line_count}p' {shlex.quote(JOB_LOG)}",
+            )
+            if chunk:
+                print(
+                    f"[{pi}:build] {chunk}",
+                    end="" if chunk.endswith("\n") else "\n",
+                    flush=True,
+                )
+            last_line = line_count
+
+        state, _ = quiet_run(pi, state_cmd)
+        state = state.strip().splitlines()[-1] if state.strip() else "ABSENT"
+
+        if state.startswith("DONE:"):
+            try:
+                rc = int(state.split(":", 1)[1])
+            except ValueError:
+                raise RuntimeError(f"{pi}: malformed build status: {state}")
+            if rc != 0:
+                raise RuntimeError(
+                    f"{pi}: detached native build/test failed rc={rc}; "
+                    f"log={JOB_LOG}"
+                )
+            print(f"{pi}: detached native build/test PASS", flush=True)
+            return
+
+        if state == "ABSENT":
+            raise RuntimeError(
+                f"{pi}: detached build disappeared without status; log={JOB_LOG}"
+            )
+
+        time.sleep(5)
 
 def remote_sha(pi, path):
     out, _ = run(
@@ -183,8 +279,9 @@ mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 
         if src_head == WANT:
             print("rpi2: source workspace already at target; resuming build/test")
-            bash("rpi2", f"""
+            detached_build("rpi2", f"""
 set -Eeuo pipefail
+trap 'rc=$?; echo "$rc" > {shlex.quote(JOB_STATUS)}' EXIT
 cd {shlex.quote(SRC2)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 --test
@@ -193,14 +290,15 @@ strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 install -d {shlex.quote(STAGE2)}
 install -m 0755 ./mercury {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""", timeout=3600)
+""")
         elif new_head:
             print(
                 "rpi2: reusing existing failed-at-build clone; "
                 "updating it to target and resuming native build/test"
             )
-            bash("rpi2", f"""
+            detached_build("rpi2", f"""
 set -Eeuo pipefail
+trap 'rc=$?; echo "$rc" > {shlex.quote(JOB_STATUS)}' EXIT
 cd {shlex.quote(NEW2)}
 git fetch origin gearshift-v2
 git checkout --detach {shlex.quote(WANT)}
@@ -214,11 +312,12 @@ mv {shlex.quote(NEW2)} {shlex.quote(SRC2)}
 install -d {shlex.quote(STAGE2)}
 install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""", timeout=3600)
+""")
         else:
             print("rpi2: creating clean source workspace for target commit")
-            bash("rpi2", f"""
+            detached_build("rpi2", f"""
 set -Eeuo pipefail
+trap 'rc=$?; echo "$rc" > {shlex.quote(JOB_STATUS)}' EXIT
 rm -rf {shlex.quote(NEW2)}
 git clone --no-tags --branch gearshift-v2 --single-branch \
   https://github.com/xmutantson/mercury.git {shlex.quote(NEW2)}
@@ -234,7 +333,7 @@ mv {shlex.quote(NEW2)} {shlex.quote(SRC2)}
 install -d {shlex.quote(STAGE2)}
 install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""", timeout=3600)
+""")
 
     s2_sha = remote_sha("rpi2", stage2_binary)
     if not s2_sha or not has_build_id("rpi2", stage2_binary):
@@ -466,7 +565,7 @@ strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 install -d {shlex.quote(STAGE2)}
 install -m 0755 ./mercury {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""", timeout=3600)
+""")
         else:
             print("rpi2: creating clean source workspace for target commit")
             bash("rpi2", f"""
@@ -486,7 +585,7 @@ mv {shlex.quote(SRC2 + ".new")} {shlex.quote(SRC2)}
 install -d {shlex.quote(STAGE2)}
 install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""", timeout=3600)
+""")
 
     s2_sha = remote_sha("rpi2", stage2_binary)
     if not s2_sha or not has_build_id("rpi2", stage2_binary):
