@@ -107,6 +107,18 @@ req("ACTIVE BREAK recovery settles at floor and returns authority to v2",
     "gearshift_v2_finish_break_at_floor()" in CMD
     and "legacy BREAK ladder disabled, v2 will reacquire upward" in CMD)
 
+req("legacy turboshift is retired on ACTIVE CONNECTED handoff",
+    "retiring legacy TURBOSHIFT controller" in CMD
+    and "rate_opt.controls_link() && link_status == CONNECTED && turboshift_active" in CMD)
+req("legacy ladder is structurally subordinate in ACTIVE",
+    "if (rate_opt.get_mode() == GEARSHIFT_V2_ACTIVE)" in (ROOT / "include/datalink_layer/arq.h").read_text()
+    and "return true;  // v2 owns every ordinary data-rate transition" in (ROOT / "include/datalink_layer/arq.h").read_text())
+req("legacy topgear selector cannot execute under ACTIVE",
+    "!rate_opt.controls_link()" in CMD and "topgear_elect_feature_enabled()" in CMD)
+req("legacy demote requests are telemetry-only outside owned fallback",
+    "telemetry failure reason=" in demote
+    and "opt_evaluate_batch_end(&owner_target)" in demote)
+
 if failed:
     print(f"[GS2-OWNER-AUDIT] FAILURES={len(failed)}")
     sys.exit(1)
