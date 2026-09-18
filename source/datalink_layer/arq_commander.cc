@@ -2985,6 +2985,51 @@ bool cl_arq_controller::gearshift_v2_finish_break_at_floor()
 
 void cl_arq_controller::process_messages_commander()
 {
+	// ACTIVE-v2 single-owner purge: turboshift is a legacy Axis-1 controller, not
+	// a sensor. It contains direct load_configuration() settle paths that can bypass
+	// SET_CONFIG/CONFIG_TAG entirely, so merely fencing the transport is insufficient.
+	// Once the session is CONNECTED, retire the legacy state machine completely.
+	// Connection/capability negotiation before CONNECTED is untouched.
+	if(rate_opt.controls_link() && link_status == CONNECTED && turboshift_active)
+	{
+		printf("[GEARSHIFT-V2-AUTHORITY] retiring legacy TURBOSHIFT controller; "
+			"ACTIVE owns all connected Axis-1 decisions\n");
+		fflush(stdout);
+		turboshift_active = false;
+		turbo_supershift_announce_pending = false;
+		turboshift_phase = TURBO_DONE;
+		turboshift_retries = 0;
+		turbo_switch_role_retries = 0;
+		gear_shift_timer.stop();
+		gear_shift_timer.reset();
+
+		// If turboshift had already staged an unowned SET_CONFIG at the exact
+		// CONNECTED boundary, cancel it. Never touch a matching v2-owned crossing.
+		if(messages_control.status != FREE && messages_control.data != NULL
+		   && messages_control.length > 0
+		   && (unsigned char)messages_control.data[0] == (unsigned char)SET_CONFIG)
+		{
+			const int staged_target = messages_control.length > 1
+				? (unsigned char)messages_control.data[1] : CONFIG_NONE;
+			if(!rate_opt.transition_matches(current_configuration, staged_target))
+			{
+				printf("[GEARSHIFT-V2-AUTHORITY] cancelling staged legacy TURBOSHIFT "
+					"SET_CONFIG %d->%d at ownership handoff\n",
+					current_configuration, staged_target);
+				fflush(stdout);
+				messages_control.ack_timeout = 0;
+				messages_control.id = 0;
+				messages_control.length = 0;
+				messages_control.nResends = 0;
+				messages_control.status = FREE;
+				messages_control.type = NONE;
+				if(connection_status == TRANSMITTING_CONTROL ||
+				   connection_status == RECEIVING_ACKS_CONTROL)
+					connection_status = TRANSMITTING_DATA;
+			}
+		}
+	}
+
 	// Topgear deferred-report driver (consume-race fix): drive any pending
 	// stashed-tail report decode once per poll. First-line early-return unless
 	// MERCURY_TOPGEAR_ELECT armed a pending — the default path does not move.
