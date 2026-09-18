@@ -6524,32 +6524,77 @@ bool cl_arq_controller::scream_rollback_slot_eligible(int status, int length,
 }
 
 bool cl_arq_controller::inband_route_failure_demote(int demote_target, const char* reason,
-	bool pin_ceiling)
+	bool pin_ceiling, bool gearshift_owned)
 {
 	if(demote_target < 0 || demote_target == current_configuration)
 		return false;   // no lower rung / no-op — caller must route to the dead-batch floor
 
-	// ACTIVE-v2 single-owner contract: legacy recovery code is an event producer,
-	// not an Axis-1 authority. Ask Gearshift BEFORE touching FIFO/config/ceiling state.
-	// A live v2 experiment rejects the foreign request; confirmed probe probation
-	// converts it to the probe's own rollback target. Returning true on rejection
-	// consumes the legacy request so its caller cannot fall through to BREAK.
+	// ACTIVE-v2 single-owner contract. Legacy recovery code supplies EVIDENCE,
+	// never a destination. There are only three ways an Axis-1 mutation may pass:
+	//   1) the normal v2 selector already owns a matching switch transaction;
+	//   2) a concrete failure during probe probation is converted by the owner to
+	//      that probe's own fallback;
+	//   3) a Gearshift transport-failure path explicitly marks this helper call as
+	//      gearshift_owned, in which case we create the rollback transaction here.
+	// All other legacy demote requests are consumed and the full v2 evaluator
+	// chooses (or HOLDs) from current evidence BEFORE any FIFO/config mutation.
 	if(rate_opt.controls_link() && link_status == CONNECTED)
 	{
-		int owned_target = rate_opt.authorize_external_transition(
-			current_configuration, demote_target, reason, opt_now_ms(),
-			narrowband_enabled == YES);
-		if(owned_target < 0)
+		const unsigned long long now_ms = opt_now_ms();
+		if(gearshift_owned)
 		{
-			printf("[GEARSHIFT-V2-AUTHORITY] legacy demote request consumed without action: "
-				"%d->%d reason=%s\n", current_configuration, demote_target,
-				reason ? reason : "?");
-			fflush(stdout);
+			if(!rate_opt.transition_matches(current_configuration, demote_target))
+			{
+				rate_opt.notify_switch_dispatched(
+					current_configuration, demote_target, GEARSHIFT_ACTION_ROLLBACK,
+					demote_target, now_ms, narrowband_enabled == YES);
+			}
+		}
+		else if(rate_opt.probe_is_active())
+		{
+			int owned_target = rate_opt.authorize_external_transition(
+				current_configuration, demote_target, reason, now_ms,
+				narrowband_enabled == YES);
+			if(owned_target < 0)
+			{
+				printf("[GEARSHIFT-V2-AUTHORITY] failure signal consumed during owned "
+					"experiment without Axis-1 mutation: hint=%d->%d reason=%s\n",
+					current_configuration, demote_target, reason ? reason : "?");
+				fflush(stdout);
+				return true;
+			}
+			demote_target = owned_target;
+		}
+		else if(rate_opt.owns_link_experiment(now_ms))
+		{
+			rate_opt.authorize_external_transition(
+				current_configuration, demote_target, reason, now_ms,
+				narrowband_enabled == YES);
 			return true;
 		}
-		demote_target = owned_target;
-		if(demote_target == current_configuration)
+		else
+		{
+			int owner_target = current_configuration;
+			if(opt_evaluate_batch_end(&owner_target)
+			   && owner_target != current_configuration)
+			{
+				opt_pending_switch_cfg = owner_target;
+				printf("[GEARSHIFT-V2-AUTHORITY] telemetry failure reason=%s requested "
+					"hint=%d->%d; owner selected %d->%d action=%d\n",
+					reason ? reason : "?", current_configuration, demote_target,
+					current_configuration, owner_target,
+					(int)opt_pending_switch_action);
+				fflush(stdout);
+			}
+			else
+			{
+				printf("[GEARSHIFT-V2-AUTHORITY] telemetry failure reason=%s requested "
+					"hint=%d->%d; owner verdict=HOLD/ABSTAIN (no foreign mutation)\n",
+					reason ? reason : "?", current_configuration, demote_target);
+				fflush(stdout);
+			}
 			return true;
+		}
 	}
 
 	printf("[INBAND-NOBREAK] Class-A degradation (%s): demoting %d -> %d via the CONFIG_TAG "
