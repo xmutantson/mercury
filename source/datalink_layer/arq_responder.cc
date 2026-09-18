@@ -7931,6 +7931,61 @@ int cl_arq_controller::test_inband_liveness()
 	}
 
 	// ========================================================================
+	// PART B5 — ACTIVE-v2 SINGLE OWNER: generic liveness cannot preempt either
+	// the CONFIG_TAG transition or the subsequent probe probation window.
+	// Reproduces the physical WGN25 failure where a ~37 s Gearshift zero-progress
+	// budget was killed by the 200-poll (~2 s) generic liveness watchdog.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->stats.nAcked_data = 6;
+		cmd->cmd_inband_liveness_last_acked = 6;
+		cmd->connection_status = TRANSMITTING_CONTROL;
+		cmd->rate_opt.notify_switch_dispatched(
+			CONFIG_10, CONFIG_11, GEARSHIFT_ACTION_PROBE, CONFIG_10, 1000, false);
+
+		bool fired_during_switch = false;
+		for(int p = 0; p < STALL_N * 3; p++)
+			if(cmd->inband_connect_liveness_guard()) fired_during_switch = true;
+		check(!fired_during_switch,
+			"B5.1 ACTIVE live switch owns liveness window (>3x legacy threshold, no recovery)",
+			fired_during_switch ? 1 : 0, 0);
+		check(cmd->send_break_pattern_count == 0,
+			"B5.2 ACTIVE live switch cannot be killed by generic BREAK",
+			cmd->send_break_pattern_count, 0);
+		check(cmd->rate_opt.switch_inflight_for_test(),
+			"B5.3 switch transaction remains owned after liveness polls",
+			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
+
+		int foreign = cmd->rate_opt.authorize_external_transition(
+			CONFIG_10, CONFIG_9, "test-competing-watchdog", 1100, false);
+		check(foreign < 0,
+			"B5.4 competing Axis-1 request is rejected while v2 transaction owns link",
+			foreign < 0 ? 1 : 0, 1);
+
+		cmd->rate_opt.notify_switch_confirmed(1200);
+		check(cmd->rate_opt.probe_is_active(),
+			"B5.5 peer-follow confirmation enters/retains owned probe probation",
+			cmd->rate_opt.probe_is_active() ? 1 : 0, 1);
+		bool fired_during_probation = false;
+		for(int p = 0; p < STALL_N * 3; p++)
+			if(cmd->inband_connect_liveness_guard()) fired_during_probation = true;
+		check(!fired_during_probation,
+			"B5.6 probe probation also owns liveness window (>3x legacy threshold)",
+			fired_during_probation ? 1 : 0, 0);
+		check(cmd->send_break_pattern_count == 0,
+			"B5.7 probation cannot be converted into fake hard failure by generic BREAK",
+			cmd->send_break_pattern_count, 0);
+		check(!cmd->rate_opt.authorize_hard_recovery(CONFIG_10, false,
+			"test-probation-break"),
+			"B5.8 hard recovery is refused while Gearshift owns probe probation",
+			0, 0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
 	// PART C — BOUNDED: repeated unrecovered stalls escalate to a hard reset
 	// ========================================================================
 	{
