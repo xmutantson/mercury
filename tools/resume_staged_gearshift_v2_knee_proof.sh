@@ -3,9 +3,13 @@ set -Eeuo pipefail
 
 HOME_K=/home/kameron
 export PYTHONPATH="$HOME_K${PYTHONPATH:+:$PYTHONPATH}"
-COMMIT="bc5cfd255cdd0b8059a59bd5386085e7de6bb6a5"
-EXPECTED_SHA256="8050b8bdaff45376ec03eca7da93bef4531fcdf40baec80b067e61ae80a340a2"
 ROOT="$(cat "$HOME_K/.quicksilver_gearshift_v2_knee_root")"
+IDENTITY="$ROOT/BRANCH_IDENTITY.txt"
+[[ -f "$IDENTITY" ]] || { echo "ERROR: missing $IDENTITY" >&2; exit 1; }
+COMMIT="$(sed -n 's/^commit=//p' "$IDENTITY" | head -1)"
+EXPECTED_SHA256="$(sed -n 's/^arm_sha256=//p' "$IDENTITY" | head -1)"
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: bad commit in $IDENTITY" >&2; exit 1; }
+[[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "ERROR: bad arm_sha256 in $IDENTITY" >&2; exit 1; }
 STATUS="$(ls "$ROOT"/runtime_status*.json 2>/dev/null | head -1 || true)"
 PID="$(cat "$ROOT/canary.pid" 2>/dev/null || true)"
 CHECKPOINT="$ROOT/checkpoints_quicksilver_gs2_canary/wgn25/window-01.json"
