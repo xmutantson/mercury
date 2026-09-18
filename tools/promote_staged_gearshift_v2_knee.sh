@@ -152,12 +152,6 @@ pids=\$(pgrep -f '[q]uicksilver-gs2-a01/mercury -m ARQ' || true)
         "$root"/PLAN.json
 }
 
-systemctl --user disable "$SERVICE" >/dev/null 2>&1 || true
-systemctl --user stop "$SERVICE" >/dev/null 2>&1 || true
-[[ "$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)" != active ]] || die "old overnight service is active"
-
-archive_and_stop_current_knee
-
 echo
 echo "============================================================"
 echo " PROMOTE ALREADY-VALIDATED GEARSHIFT-V2 STAGE"
@@ -188,6 +182,13 @@ md5sum \"\$P\"
 sha256sum \"\$P\"
 "
 done
+
+echo
+echo "=== stop old automation + preserve bad ACTIVE evidence ==="
+systemctl --user disable "$SERVICE" >/dev/null 2>&1 || true
+systemctl --user stop "$SERVICE" >/dev/null 2>&1 || true
+[[ "$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)" != active ]] || die "old overnight service is active"
+archive_and_stop_current_knee
 
 echo
 echo "=== install tested binary on both live runtime paths ==="
