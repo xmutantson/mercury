@@ -291,8 +291,8 @@ def remote_sha(pi, path):
 def has_build_id(pi, path):
     _, rc = run(
         pi,
-        f"test -x {shlex.quote(path)} && strings {shlex.quote(path)} | "
-        f"grep -Fq {shlex.quote(SHORT)}",
+        f"test -x {shlex.quote(path)} && "
+        f"grep -aFq {shlex.quote(SHORT)} {shlex.quote(path)}",
         timeout=60,
         check=False,
     )
@@ -714,8 +714,8 @@ def remote_sha(pi, path):
 def has_build_id(pi, path):
     _, rc = run(
         pi,
-        f"test -x {shlex.quote(path)} && strings {shlex.quote(path)} | "
-        f"grep -Fq {shlex.quote(SHORT)}",
+        f"test -x {shlex.quote(path)} && "
+        f"grep -aFq {shlex.quote(SHORT)} {shlex.quote(path)}",
         timeout=60,
         check=False,
     )
