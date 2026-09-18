@@ -4656,10 +4656,17 @@ static uint16_t arq_inband_crc12_cb(void* ctx, const unsigned char* data, int n)
 
 bool cl_arq_controller::inband_rate_feature_enabled()
 {
-	// In Gearshift-v2 ACTIVE, CONFIG_TAG/Scream remains unavailable as an
-	// independent rate authority.  The active controller uses the proven
-	// SET_CONFIG executor so there is exactly one ordinary config producer.
-	if(rate_opt.controls_link()) return false;
+	// CONFIG_TAG is transport/synchronization, not an independent rate selector.
+	// Gearshift-v2 ACTIVE remains the sole ordinary Axis-1 authority, but the
+	// config it chooses is carried by the production unilateral CONFIG_TAG path.
+	// In other words: ACTIVE decides *where* to go; CONFIG_TAG decides *how the
+	// peers move there*. Do not resurrect the legacy SET_CONFIG ACK handshake just
+	// because an experiment launcher omitted MERCURY_INBAND_RATE.
+	//
+	// Keep the historical env opt-in for legacy selectors until the remaining
+	// default-off feature inventory is audited individually. ACTIVE, however,
+	// always gets the production CONFIG_TAG transport.
+	if(rate_opt.controls_link()) return true;
 	if(inband_rate_enabled < 0)
 	{
 		const char* e = std::getenv("MERCURY_INBAND_RATE");
@@ -5903,8 +5910,9 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 // data-flow-perbatch-config.md §3.1 (the SET_CONFIG-deletion replacement) + §12.
 // inband-reliability-design.md §4.4 (the D4 rename: the primitive is DIRECTION-
 // AGNOSTIC — it carries both DROPS and CLIMBS — so "drop" was misleading).
-// When MERCURY_INBAND_RATE is set, the gearshift/optimizer/demote/climb decision
-// sets the next batch config DIRECTLY instead of queueing a SET_CONFIG handshake.
+// In Gearshift-v2 ACTIVE this transport is baseline; legacy selectors retain the
+// MERCURY_INBAND_RATE opt-in. The selector's decision sets the next batch config
+// DIRECTLY instead of queueing a SET_CONFIG handshake.
 // This loads `target_cfg` on the CMD (PHYSICAL_LAYER_ONLY) so the next send_batch
 // transmits at the new rung AND the W1 emit announces it via the passband tag, then
 // re-fills the TX messages for the new config's sizes — MIRRORING the SET_CONFIG

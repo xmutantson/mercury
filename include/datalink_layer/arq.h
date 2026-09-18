@@ -3002,7 +3002,10 @@ public:
   // default-off build is byte-identical to the SET_CONFIG baseline. The codec
   // primitives live in include/physical_layer/mfsk_ctrl_codec.h (Stage 1).
 
-  // Resolve + cache the MERCURY_INBAND_RATE env flag. Returns true iff the
+  // CONFIG_TAG transport gate. Gearshift-v2 ACTIVE returns true unconditionally
+// because CONFIG_TAG is its production transition transport, not a selector.
+// Legacy modes resolve/cache MERCURY_INBAND_RATE and retain the historical opt-in.
+// Returns true iff the in-band transport/recovery stack is active.
   // feature is enabled. Cheap after the first call (cached in inband_rate_enabled).
   bool inband_rate_feature_enabled();
 
@@ -5524,7 +5527,8 @@ public:
   // R floor (inband_retag_min, default 3, MERCURY_INBAND_RETAG_MIN) is the give-up
   // trigger: a CLIMB still un-confirmed after R re-tags AUTO-DEMOTES to the last-
   // confirmed config via the tag (NEVER a BREAK, design §4.3). All members ADDITIVE,
-  // gated by MERCURY_INBAND_RATE (default-off byte-identical). Init in arq_common.cc
+  // gated by the CONFIG_TAG transport gate (default-on for Gearshift-v2 ACTIVE;
+// legacy modes retain MERCURY_INBAND_RATE opt-in). Init in arq_common.cc
   // next to the other inband state + reset_session_state.
   bool inband_retag_armed   = false;        // a change announced but NOT yet confirmed -> re-emit
   int  inband_retag_config  = CONFIG_NONE;  // the announced config being repeated
@@ -5604,7 +5608,8 @@ public:
   // IMMEDIATELY to the RX config (reusing inband_route_failure_demote, BREAK-count==0)
   // — accelerating the Stage-4d R-retry give-up to a single batch. D2 is an
   // OPTIMIZATION: with NO NACK the Stage-4d R-retry auto-demote still fires.
-  // All members ADDITIVE, gated by MERCURY_INBAND_RATE (default-off byte-identical).
+  // All members ADDITIVE, gated by the CONFIG_TAG transport gate (ACTIVE baseline;
+// legacy MERCURY_INBAND_RATE opt-in).
 
   // The epoch parity the RX last SAW on an adopted/followed tag — echoed in the NACK so
   // the sender can reject a stale NACK that crosses a fresh change. Init 0.

@@ -389,9 +389,24 @@ req("active-v2-does-not-require-sack-v2",
 req("active-v2-disables-topgear-election",
     cmd.count("!rate_opt.controls_link()") >= 2 and "topgear_elect_feature_enabled()" in cmd,
     "both idle and ACK-seam topgear producers cannot independently move ACTIVE")
-req("active-v2-disables-inband-rate-authority",
-    allin(common, "if(rate_opt.controls_link()) return false", "inband_rate_feature_enabled"),
-    "CONFIG_TAG/Scream does not become a second ACTIVE selector")
+req("active-v2-uses-config-tag-transport-without-second-selector",
+    allin(common, "if(rate_opt.controls_link()) return true",
+          "CONFIG_TAG is transport/synchronization",
+          "ACTIVE decides *where* to go; CONFIG_TAG decides *how the") and
+    allin(cmd, "else if(inband_unilateral_config_change(inband_target))",
+          "NO control frame on the wire") and
+    allin(common, "inband_unilateral_config_change(int target_cfg)",
+          "load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES)",
+          "inband_retag_armed   = true",
+          "rate_opt.notify_switch_confirmed(opt_now_ms())"),
+    "Gearshift-v2 remains the sole ordinary Axis-1 selector while its chosen intra-tier moves use CONFIG_TAG/re-tag transport by default")
+req("active-v2-ofdm-to-ofdm-transition-never-needs-setconfig-ack",
+    allin(cmd, "bool tier_crossing = inband_config_change_is_tier_crossing(inband_target)",
+          "else if(inband_unilateral_config_change(inband_target))",
+          "NO control frame on the wire") and
+    allin(common, "No dedicated SET_CONFIG ACK exists on this transport",
+          "rate_opt.notify_switch_confirmed(opt_now_ms())"),
+    "an ACTIVE intra-OFDM move such as CONFIG_0->CONFIG_16 commits locally and synchronizes via CONFIG_TAG rather than waiting on the obsolete SET_CONFIG ACK handshake")
 req("active-v2-owns-ordinary-ladder-down",
     "GEARSHIFT_V2_ACTIVE" in arqh and "optimizer_owns_normal_downshift" in arqh and
     "return true;  // v2 owns ordinary downshift" in arqh,

@@ -3688,8 +3688,9 @@ int cl_arq_controller::add_message_control(char code)
 				return success;
 			}
 			// STAGE 3b GEARSHIFT DRIVE (data-flow-perbatch-config.md §3.1 / §12 W3):
-			// when MERCURY_INBAND_RATE is set, the rate change is announced by a
-			// passband CONFIG_TAG on the next batch (W1 emit) and followed unilaterally
+			// Gearshift-v2 ACTIVE uses CONFIG_TAG transport by default; legacy selectors
+			// use it when MERCURY_INBAND_RATE is set. The selected rate change is
+			// announced by a passband CONFIG_TAG on the next batch (W1 emit) and followed unilaterally
 			// (W2), NOT by a SET_CONFIG control handshake. EVERY gearshift/optimizer/
 			// demote/BREAK producer funnels through THIS builder (the §3.1 chokepoint),
 			// so intercepting here catches them all with one change. The target is the
