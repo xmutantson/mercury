@@ -287,6 +287,18 @@ public:
     bool shadow_only() const { return mode == GEARSHIFT_V2_SHADOW; }
     const char* mode_name() const;
 
+    // ACTIVE-v2 ownership firewall.  Legacy ARQ subsystems may detect and report
+    // failures, but they do not own Axis-1 or hard-recovery decisions.  A live
+    // switch/probe transaction is an exclusive experiment owned by Gearshift-v2.
+    bool owns_link_experiment() const;
+    bool transition_matches(int from_cfg, int to_cfg) const;
+    int authorize_external_transition(int from_cfg, int requested_to_cfg,
+                                      const char* reason,
+                                      unsigned long long now_ms,
+                                      bool is_nb = false);
+    bool authorize_hard_recovery(int current_cfg, bool at_bottom,
+                                 const char* reason) const;
+
     // Primitive, non-overlapping live evidence.  cycle_ms=0 means the outcome
     // is valid but no independent rate interval is available (e.g. L1 aggregate
     // replay).  application bytes may be credited later by
