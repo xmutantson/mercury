@@ -6006,7 +6006,8 @@ public:
   // not a pinned ceiling, is the over-climb guard there). All existing callers keep the
   // default => byte-identical.
   bool inband_route_failure_demote(int demote_target, const char* reason,
-                                   bool pin_ceiling = true);
+                                   bool pin_ceiling = true,
+                                   bool gearshift_owned = false);
   // roll_back_cmd_bsi_to_inflight: the CLIMB-UP counterpart of the demote bsi rollback
   // (data-flow-inband-frame0-rolling-partial.md §13). The demote/BREAK paths
   // (inband_route_failure_demote :3134, CFG16-HOLD :5037, M6 BREAK :5242) roll
