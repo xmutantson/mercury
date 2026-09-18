@@ -275,10 +275,24 @@ while True:
         f"test -f {shlex.quote(JOB_PID)} && cat {shlex.quote(JOB_PID)} || true",
     )
     own_pid = job_pid_out.strip()
-    legacy_lines = [
-        x for x in legacy_lines
-        if not own_pid or not x.startswith(own_pid + "|")
-    ]
+    own_running = False
+    if own_pid:
+        _, own_rc = quiet_run("rpi2", f"kill -0 {shlex.quote(own_pid)} 2>/dev/null")
+        own_running = own_rc == 0
+
+    if own_running:
+        # The durable job's shell and compiler children all share SRC2/NEW2.
+        # Exclude that whole workspace family from the legacy-build guard.
+        legacy_lines = [
+            x for x in legacy_lines
+            if f"|{SRC2}|" not in x and f"|{NEW2}|" not in x
+        ]
+    else:
+        legacy_lines = [
+            x for x in legacy_lines
+            if not own_pid or not x.startswith(own_pid + "|")
+        ]
+
     if not legacy_lines:
         break
     print("rpi2: older native build still active; waiting rather than starting another:", flush=True)
