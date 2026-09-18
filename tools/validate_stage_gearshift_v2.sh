@@ -175,53 +175,73 @@ echo "$pid"
     elif state.startswith("DONE:"):
         print(f"{pi}: native build already completed; consuming saved result")
 
-    # Stream only newly appended lines while polling with short Butler calls.
-    last_line = 0
-    while True:
+    # Stream newly appended lines while polling with short Butler calls. On an
+    # already-running/finished reattach, show only recent context instead of replaying
+    # the entire compiler/test log.
+    count_out, _ = quiet_run(
+        pi,
+        f"test -f {shlex.quote(JOB_LOG)} && wc -l < {shlex.quote(JOB_LOG)} || echo 0",
+    )
+    try:
+        existing_lines = int(count_out.strip().splitlines()[-1])
+    except Exception:
+        existing_lines = 0
+    last_line = max(0, existing_lines - 40) if state != "ABSENT" else 0
+
+    try:
+      while True:
         count_out, _ = quiet_run(
             pi,
             f"test -f {shlex.quote(JOB_LOG)} && wc -l < {shlex.quote(JOB_LOG)} || echo 0",
         )
-        try:
-            line_count = int(count_out.strip().splitlines()[-1])
-        except Exception:
-            line_count = last_line
+          try:
+              line_count = int(count_out.strip().splitlines()[-1])
+          except Exception:
+              line_count = last_line
+  
+          if line_count > last_line:
+              chunk, _ = quiet_run(
+                  pi,
+                  f"sed -n '{last_line + 1},{line_count}p' {shlex.quote(JOB_LOG)}",
+              )
+              if chunk:
+                  print(
+                      f"[{pi}:build] {chunk}",
+                      end="" if chunk.endswith("\n") else "\n",
+                      flush=True,
+                  )
+              last_line = line_count
+  
+          state, _ = quiet_run(pi, state_cmd)
+          state = state.strip().splitlines()[-1] if state.strip() else "ABSENT"
+  
+          if state.startswith("DONE:"):
+              try:
+                  rc = int(state.split(":", 1)[1])
+              except ValueError:
+                  raise RuntimeError(f"{pi}: malformed build status: {state}")
+              if rc != 0:
+                  raise RuntimeError(
+                      f"{pi}: detached native build/test failed rc={rc}; "
+                      f"log={JOB_LOG}"
+                  )
+              print(f"{pi}: detached native build/test PASS", flush=True)
+              return
+  
+          if state == "ABSENT":
+              raise RuntimeError(
+                  f"{pi}: detached build disappeared without status; log={JOB_LOG}"
+              )
+  
+          time.sleep(5)
 
-        if line_count > last_line:
-            chunk, _ = quiet_run(
-                pi,
-                f"sed -n '{last_line + 1},{line_count}p' {shlex.quote(JOB_LOG)}",
-            )
-            if chunk:
-                print(
-                    f"[{pi}:build] {chunk}",
-                    end="" if chunk.endswith("\n") else "\n",
-                    flush=True,
-                )
-            last_line = line_count
-
-        state, _ = quiet_run(pi, state_cmd)
-        state = state.strip().splitlines()[-1] if state.strip() else "ABSENT"
-
-        if state.startswith("DONE:"):
-            try:
-                rc = int(state.split(":", 1)[1])
-            except ValueError:
-                raise RuntimeError(f"{pi}: malformed build status: {state}")
-            if rc != 0:
-                raise RuntimeError(
-                    f"{pi}: detached native build/test failed rc={rc}; "
-                    f"log={JOB_LOG}"
-                )
-            print(f"{pi}: detached native build/test PASS", flush=True)
-            return
-
-        if state == "ABSENT":
-            raise RuntimeError(
-                f"{pi}: detached build disappeared without status; log={JOB_LOG}"
-            )
-
-        time.sleep(5)
+    except KeyboardInterrupt:
+        print(
+            "\nLocal watcher detached. The rpi2 native build was launched with nohup "
+            "and continues independently. Rerun this helper to reattach.",
+            flush=True,
+        )
+        raise SystemExit(130)
 
 def remote_sha(pi, path):
     out, _ = run(
