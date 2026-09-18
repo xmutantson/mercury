@@ -664,7 +664,7 @@ mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 set -Eeuo pipefail
 trap 'rc=$?; echo "$rc" > {shlex.quote(JOB_STATUS)}' EXIT
 rm -rf {shlex.quote(NEW2)}
-git clone --no-tags --branch gearshift-v2 --single-branch \
+git clone --no-tags --branch {shlex.quote(BRANCH)} --single-branch \
   https://github.com/xmutantson/mercury.git {shlex.quote(NEW2)}
 cd {shlex.quote(NEW2)}
 git checkout --detach {shlex.quote(WANT)}
