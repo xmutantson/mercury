@@ -290,7 +290,7 @@ public:
     // ACTIVE-v2 ownership firewall.  Legacy ARQ subsystems may detect and report
     // failures, but they do not own Axis-1 or hard-recovery decisions.  A live
     // switch/probe transaction is an exclusive experiment owned by Gearshift-v2.
-    bool owns_link_experiment() const;
+    bool owns_link_experiment(unsigned long long now_ms = 0) const;
     bool transition_matches(int from_cfg, int to_cfg) const;
     int authorize_external_transition(int from_cfg, int requested_to_cfg,
                                       const char* reason,
