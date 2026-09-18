@@ -147,11 +147,11 @@ static inline bool recovery_ack_robust_enabled_common()
 static const int RECOVERY_ACK_REPS = 4;
 
 // FORGIVING-ACK Tier 2 (fact-documents/data-flow-forgiving-ack.md §T2.1): the LOCAL
-// advertise gate. We ONLY set CAP_CUMULATIVE_ACK in local_capability when the env
-// opt-in MERCURY_CUMULATIVE_ACK is present. Default-off ⇒ the bit is never set ⇒
-// both_support is false on BOTH ends ⇒ the reshape never engages ⇒ byte-identical to
-// the Tier-1 base + interop-safe with any non-Tier-2 peer. Returns the cap bit to OR
-// into local_capability (0 when the env is unset). Cached like SACK_TRACE.
+// capability-advertise gate. This feature now ships DEFAULT-ON: unset advertises
+// CAP_CUMULATIVE_ACK, while MERCURY_CUMULATIVE_ACK=0 restores the stock non-cumulative
+// behavior. The wire behavior still engages only when BOTH peers advertise support,
+// preserving capability-negotiated interop with an older/non-supporting peer.
+// MERCURY_SCALABLE_SACK=1 also forces the capability on. Cached like SACK_TRACE.
 static inline uint8_t cumulative_ack_advertise_bit()
 {
 	static int cached = -1;
