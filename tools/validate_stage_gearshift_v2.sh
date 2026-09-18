@@ -113,8 +113,6 @@ SHORT = os.environ["SHORT"]
 SRC2 = f"/home/rpi2/quicksilver-gs2-build-{SHORT}"
 STAGE2 = "/home/rpi2/quicksilver-gs2-gearshift-v2"
 STAGE1 = "/home/rpi1/quicksilver-gs2-gearshift-v2"
-RPI2_ADDR = "192.168.2.215"
-HTTP_PORT = 18765
 
 FOCUSED_NATIVE_TESTS = [
     "--test-inband-retag",
@@ -160,6 +158,82 @@ JOB_PID = JOB_BASE + ".pid"
 def quiet_run(pi, cmd, timeout=60):
     out, rc = B._ssh_run(pi, cmd, timeout=timeout)
     return (out or ""), rc
+
+
+def relay_file_via_butler(src_pi, src_path, dst_pi, dst_path, chunk_bytes=393216):
+    """Relay a file through SpicyPancake using only Butler SSH calls.
+
+    No direct Pi-to-Pi connectivity is required. Each chunk is base64 on the
+    wire, decoded on the destination, and the final size/hash are verified.
+    """
+    size_out, rc = quiet_run(
+        src_pi,
+        f"stat -c %s {shlex.quote(src_path)}",
+        timeout=60,
+    )
+    if rc != 0:
+        raise RuntimeError(f"{src_pi}: cannot stat relay source {src_path}")
+    total = int(size_out.strip().splitlines()[-1])
+
+    bash(dst_pi, f"""
+set -Eeuo pipefail
+install -d {shlex.quote(os.path.dirname(dst_path))}
+rm -f {shlex.quote(dst_path)}
+: > {shlex.quote(dst_path)}
+""", timeout=60)
+
+    copied = 0
+    index = 0
+    while copied < total:
+        want = min(chunk_bytes, total - copied)
+        b64, rc = quiet_run(
+            src_pi,
+            f"dd if={shlex.quote(src_path)} bs=1 skip={copied} count={want} "
+            f"status=none | base64 -w0",
+            timeout=120,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"{src_pi}: relay read failed at offset {copied} rc={rc}"
+            )
+        b64 = b64.strip()
+        raw = base64.b64decode(b64, validate=True)
+        if len(raw) != want:
+            raise RuntimeError(
+                f"relay chunk length mismatch at offset {copied}: "
+                f"got={len(raw)} want={want}"
+            )
+
+        payload = base64.b64encode(raw).decode("ascii")
+        _, rc = quiet_run(
+            dst_pi,
+            f"printf %s {shlex.quote(payload)} | base64 -d >> "
+            f"{shlex.quote(dst_path)}",
+            timeout=120,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"{dst_pi}: relay write failed at offset {copied} rc={rc}"
+            )
+
+        copied += want
+        index += 1
+        if copied == total or index % 8 == 0:
+            print(
+                f"relay {src_pi}->{dst_pi}: {copied}/{total} bytes "
+                f"({100.0 * copied / total:.1f}%)",
+                flush=True,
+            )
+
+    dst_size_out, rc = quiet_run(
+        dst_pi,
+        f"stat -c %s {shlex.quote(dst_path)}",
+        timeout=60,
+    )
+    if rc != 0 or int(dst_size_out.strip().splitlines()[-1]) != total:
+        raise RuntimeError(
+            f"{dst_pi}: relay size verification failed for {dst_path}"
+        )
 
 
 def detached_build(pi, script):
@@ -546,37 +620,18 @@ s1_valid = bool(s1_sha and s1_sha == s2_sha and has_build_id("rpi1", stage1_bina
 if s1_valid:
     print("rpi1: staged binary already byte-identical to rpi2; skipping transfer")
 else:
-    print("rpi1: copying tested staged binary from rpi2")
-    out, _ = bash("rpi2", f"""
+    print(
+        "rpi1: relaying tested staged binary through SpicyPancake/Butler "
+        "(no Pi-to-Pi connectivity required)",
+        flush=True,
+    )
+    tmp1 = stage1_binary + ".new"
+    relay_file_via_butler("rpi2", stage2_binary, "rpi1", tmp1)
+    bash("rpi1", f"""
 set -Eeuo pipefail
-cd {shlex.quote(STAGE2)}
-nohup python3 -m http.server {HTTP_PORT} --bind 0.0.0.0 \
-  >/tmp/quicksilver-stage-http-{SHORT}.log 2>&1 </dev/null &
-echo $!
-""", timeout=30)
-
-    pids = re.findall(r"(?m)^\s*(\d+)\s*$", out)
-    if not pids:
-        raise RuntimeError("could not determine temporary rpi2 HTTP server PID")
-    server_pid = pids[-1]
-
-    try:
-        bash("rpi1", f"""
-set -Eeuo pipefail
-install -d {shlex.quote(STAGE1)}
-curl -fS --retry 5 --retry-delay 1 --connect-timeout 5 \
-  http://{RPI2_ADDR}:{HTTP_PORT}/mercury \
-  -o {shlex.quote(stage1_binary + ".new")}
-chmod 0755 {shlex.quote(stage1_binary + ".new")}
-mv {shlex.quote(stage1_binary + ".new")} {shlex.quote(stage1_binary)}
-""", timeout=300)
-    finally:
-        run(
-            "rpi2",
-            f"kill {shlex.quote(server_pid)} 2>/dev/null || true",
-            timeout=30,
-            check=False,
-        )
+chmod 0755 {shlex.quote(tmp1)}
+mv {shlex.quote(tmp1)} {shlex.quote(stage1_binary)}
+""", timeout=60)
 
 s1_sha = remote_sha("rpi1", stage1_binary)
 s2_sha = remote_sha("rpi2", stage2_binary)
@@ -622,260 +677,6 @@ PY
 
 echo
 echo "=== 6. Existing knee campaign — inspection only ==="
-if [ -f "$HOME/.quicksilver_gearshift_v2_knee_root" ]; then
-    ROOT="$(cat "$HOME/.quicksilver_gearshift_v2_knee_root")"
-    echo "KNEE_ROOT=$ROOT"
-    find "$ROOT" -maxdepth 4 -type f -printf '%T@ %p\n' 2>/dev/null \
-        | sort -nr | head -50 || true
-else
-    echo "No ~/.quicksilver_gearshift_v2_knee_root pointer found."
-fi
-
-echo
-echo "--- local campaign-related processes ---"
-ps -eo pid,lstart,args | grep -E '[q]uicksilver|[i]onos|[g]earshift|[k]nee' || true
-
-echo
-echo "============================================================"
-echo " VALIDATION_AND_STAGE_COMPLETE"
-echo " No running campaign or installed modem was modified."
-echo "============================================================"
- || true
-)"
-if [ -n "$unexpected_untracked" ]; then
-    echo "ERROR: unexpected untracked files present; refusing ambiguous source."
-    printf '%s\n' "$unexpected_untracked"
-    exit 1
-fi
-
-if [ -f GEARSHIFT_V2_SOURCE_IDENTITY.txt ]; then
-    echo "Preserving bootstrap identity marker: GEARSHIFT_V2_SOURCE_IDENTITY.txt"
-fi
-
-BRANCH="$(git branch --show-current)"
-if [ "$BRANCH" != "gearshift-v2" ]; then
-    echo "ERROR: expected branch gearshift-v2, got: ${BRANCH:-DETACHED}"
-    exit 1
-fi
-
-echo
-echo "=== 1. Local CPU validation ==="
-tests/cpu/run_gearshift_tests.sh
-
-echo
-echo "=== 2. Runtime feature-gate inventory ==="
-python3 tools/audit_default_off_features.py > "/tmp/quicksilver-default-off-${SHORT}.md"
-echo "saved /tmp/quicksilver-default-off-${SHORT}.md"
-
-echo
-echo "=== 3. Resume/build/stage on Pis ==="
-
-WANT="$WANT" SHORT="$SHORT" python3 - <<'PY'
-import base64
-import os
-import re
-import shlex
-
-import ionos_butler as B
-
-WANT = os.environ["WANT"]
-SHORT = os.environ["SHORT"]
-
-SRC2 = f"/home/rpi2/quicksilver-gs2-build-{SHORT}"
-STAGE2 = "/home/rpi2/quicksilver-gs2-gearshift-v2"
-STAGE1 = "/home/rpi1/quicksilver-gs2-gearshift-v2"
-RPI2_ADDR = "192.168.2.215"
-HTTP_PORT = 18765
-
-def run(pi, cmd, timeout=300, check=True):
-    out, rc = B._ssh_run(pi, cmd, timeout=timeout)
-    out = out or ""
-    if out:
-        print(f"[{pi}] {out}", end="" if out.endswith("\n") else "\n")
-    if check and rc != 0:
-        raise RuntimeError(f"{pi}: rc={rc}: {cmd}")
-    return out, rc
-
-def bash(pi, script, timeout=300, check=True):
-    payload = base64.b64encode(script.encode()).decode()
-    command = f"printf %s {shlex.quote(payload)} | base64 -d | bash"
-    return run(pi, command, timeout=timeout, check=check)
-
-def remote_sha(pi, path):
-    out, _ = run(
-        pi,
-        f"test -f {shlex.quote(path)} && sha256sum {shlex.quote(path)} || true",
-        timeout=60,
-        check=False,
-    )
-    m = re.search(r"\b([0-9a-f]{64})\b", out)
-    return m.group(1) if m else None
-
-def has_build_id(pi, path):
-    _, rc = run(
-        pi,
-        f"test -x {shlex.quote(path)} && "
-        f"grep -aFq {shlex.quote(SHORT)} {shlex.quote(path)}",
-        timeout=60,
-        check=False,
-    )
-    return rc == 0
-
-stage2_binary = STAGE2 + "/mercury"
-stage1_binary = STAGE1 + "/mercury"
-source_binary = SRC2 + "/mercury"
-
-s2_sha = remote_sha("rpi2", stage2_binary)
-s2_valid = bool(s2_sha and has_build_id("rpi2", stage2_binary))
-print(f"rpi2 initial staged valid={s2_valid} sha256={s2_sha}")
-
-if not s2_valid:
-    src_sha = remote_sha("rpi2", source_binary)
-    src_valid = bool(src_sha and has_build_id("rpi2", source_binary))
-
-    if src_valid:
-        print("rpi2: reusing already-built native binary; staging only")
-        bash("rpi2", f"""
-set -Eeuo pipefail
-install -d {shlex.quote(STAGE2)}
-install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
-mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""")
-    else:
-        out, _ = run(
-            "rpi2",
-            f"if test -d {shlex.quote(SRC2 + '/.git')}; then "
-            f"git -C {shlex.quote(SRC2)} rev-parse HEAD; fi",
-            timeout=60,
-            check=False,
-        )
-        src_head = out.strip().splitlines()[-1] if out.strip() else ""
-
-        if src_head == WANT:
-            print("rpi2: source workspace already at target; resuming build/test")
-            bash("rpi2", f"""
-set -Eeuo pipefail
-cd {shlex.quote(SRC2)}
-test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3
-{focused_native_test_script("./mercury")}
-test -x ./mercury
-grep -aFq {shlex.quote(SHORT)} ./mercury
-install -d {shlex.quote(STAGE2)}
-install -m 0755 ./mercury {shlex.quote(stage2_binary + ".new")}
-mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""")
-        else:
-            print("rpi2: creating clean source workspace for target commit")
-            bash("rpi2", f"""
-set -Eeuo pipefail
-rm -rf {shlex.quote(SRC2 + ".new")}
-git clone --no-tags --branch gearshift-v2 --single-branch \
-  https://github.com/xmutantson/mercury.git {shlex.quote(SRC2 + ".new")}
-cd {shlex.quote(SRC2 + ".new")}
-git checkout --detach {shlex.quote(WANT)}
-test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
-{focused_native_test_script("./mercury")}
-test -x ./mercury
-grep -aFq {shlex.quote(SHORT)} ./mercury
-cd /
-rm -rf {shlex.quote(SRC2)}
-mv {shlex.quote(SRC2 + ".new")} {shlex.quote(SRC2)}
-install -d {shlex.quote(STAGE2)}
-install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
-mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
-""")
-
-    s2_sha = remote_sha("rpi2", stage2_binary)
-    if not s2_sha or not has_build_id("rpi2", stage2_binary):
-        raise RuntimeError("rpi2 did not produce a valid staged target binary")
-else:
-    print("rpi2: matching staged binary already present; skipping rebuild")
-
-s2_sha = remote_sha("rpi2", stage2_binary)
-s1_sha = remote_sha("rpi1", stage1_binary)
-s1_valid = bool(s1_sha and s1_sha == s2_sha and has_build_id("rpi1", stage1_binary))
-
-if s1_valid:
-    print("rpi1: staged binary already byte-identical to rpi2; skipping transfer")
-else:
-    print("rpi1: copying tested staged binary from rpi2")
-    out, _ = bash("rpi2", f"""
-set -Eeuo pipefail
-cd {shlex.quote(STAGE2)}
-nohup python3 -m http.server {HTTP_PORT} --bind 0.0.0.0 \
-  >/tmp/quicksilver-stage-http-{SHORT}.log 2>&1 </dev/null &
-echo $!
-""", timeout=30)
-
-    pids = re.findall(r"(?m)^\s*(\d+)\s*$", out)
-    if not pids:
-        raise RuntimeError("could not determine temporary rpi2 HTTP server PID")
-    server_pid = pids[-1]
-
-    try:
-        bash("rpi1", f"""
-set -Eeuo pipefail
-install -d {shlex.quote(STAGE1)}
-curl -fS --retry 5 --retry-delay 1 --connect-timeout 5 \
-  http://{RPI2_ADDR}:{HTTP_PORT}/mercury \
-  -o {shlex.quote(stage1_binary + ".new")}
-chmod 0755 {shlex.quote(stage1_binary + ".new")}
-mv {shlex.quote(stage1_binary + ".new")} {shlex.quote(stage1_binary)}
-""", timeout=300)
-    finally:
-        run(
-            "rpi2",
-            f"kill {shlex.quote(server_pid)} 2>/dev/null || true",
-            timeout=30,
-            check=False,
-        )
-
-s1_sha = remote_sha("rpi1", stage1_binary)
-s2_sha = remote_sha("rpi2", stage2_binary)
-
-if not s1_sha or s1_sha != s2_sha:
-    raise RuntimeError(f"staged hash mismatch: rpi1={s1_sha} rpi2={s2_sha}")
-if not has_build_id("rpi1", stage1_binary) or not has_build_id("rpi2", stage2_binary):
-    raise RuntimeError("staged binary build-id check failed")
-
-print()
-print("============================================================")
-print(" STAGING PASS")
-print("============================================================")
-print("commit :", WANT)
-print("sha256 :", s1_sha)
-print("rpi1   :", stage1_binary)
-print("rpi2   :", stage2_binary)
-print()
-print("Installed/running binaries were NOT overwritten.")
-print("Existing knee campaign was NOT stopped.")
-PY
-
-echo
-echo "=== 4. Installed vs staged runtime inspection ==="
-python3 - <<'PY'
-import ionos_butler as B
-
-for pi in ("rpi1", "rpi2"):
-    installed = f"/home/{pi}/quicksilver-gs2-a01/mercury"
-    staged = f"/home/{pi}/quicksilver-gs2-gearshift-v2/mercury"
-    cmd = (
-        "echo INSTALLED; "
-        f"sha256sum {installed} 2>/dev/null || true; "
-        "echo STAGED; "
-        f"sha256sum {staged} 2>/dev/null || true; "
-        "echo PROCESSES; "
-        "ps -eo pid,lstart,args | grep '[m]ercury' || true"
-    )
-    out, _ = B._ssh_run(pi, cmd, timeout=60)
-    print(f"\n===== {pi} =====")
-    print(out or "", end="" if (out or "").endswith("\n") else "\n")
-PY
-
-echo
-echo "=== 5. Existing knee campaign — inspection only ==="
 if [ -f "$HOME/.quicksilver_gearshift_v2_knee_root" ]; then
     ROOT="$(cat "$HOME/.quicksilver_gearshift_v2_knee_root")"
     echo "KNEE_ROOT=$ROOT"
