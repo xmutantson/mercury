@@ -398,15 +398,20 @@ req("active-v2-uses-config-tag-transport-without-second-selector",
     allin(common, "inband_unilateral_config_change(int target_cfg)",
           "load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES)",
           "inband_retag_armed   = true",
-          "rate_opt.notify_switch_confirmed(opt_now_ms())"),
-    "Gearshift-v2 remains the sole ordinary Axis-1 selector while its chosen intra-tier moves use CONFIG_TAG/re-tag transport by default")
-req("active-v2-ofdm-to-ofdm-transition-never-needs-setconfig-ack",
+          "LOCAL load_configuration() is not peer-follow evidence") and
+    allin(cmd, "bool optimizer_owns_upward_frame = optimizer_is_in_control()",
+          "!optimizer_owns_upward_frame"),
+    "Gearshift-v2 remains the sole ordinary Axis-1 selector while CONFIG_TAG is its default transition transport")
+req("active-v2-config-tag-transition-closes-from-peer-evidence",
+    allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
+          "config-discriminating SACK at/after the announce BSI",
+          "rate_opt.notify_switch_confirmed(opt_now_ms())",
+          "No config-discriminating follow evidence arrived after the bounded re-tags",
+          "rate_opt.notify_switch_failed()") and
     allin(cmd, "bool tier_crossing = inband_config_change_is_tier_crossing(inband_target)",
           "else if(inband_unilateral_config_change(inband_target))",
-          "NO control frame on the wire") and
-    allin(common, "No dedicated SET_CONFIG ACK exists on this transport",
-          "rate_opt.notify_switch_confirmed(opt_now_ms())"),
-    "an ACTIVE intra-OFDM move such as CONFIG_0->CONFIG_16 commits locally and synchronizes via CONFIG_TAG rather than waiting on the obsolete SET_CONFIG ACK handshake")
+          "NO control frame on the wire"),
+    "ACTIVE intra-OFDM transitions such as CONFIG_0->CONFIG_16 remain in-flight until the peer proves follow or bounded CONFIG_TAG retries fail; no SET_CONFIG ACK or local-only confirmation is accepted")
 req("active-v2-owns-ordinary-ladder-down",
     "GEARSHIFT_V2_ACTIVE" in arqh and "optimizer_owns_normal_downshift" in arqh and
     "return true;  // v2 owns ordinary downshift" in arqh,

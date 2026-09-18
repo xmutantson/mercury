@@ -5991,14 +5991,12 @@ bool cl_arq_controller::inband_unilateral_config_change(int target_cfg)
 	// PHY twin coherently (the D1 coherent switch).
 	load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES);
 
-	// No dedicated SET_CONFIG ACK exists on this transport.  For a v2-owned
-	// unilateral move the physical switch has completed at this point, so close
-	// the switch transaction now (external moves have no v2 switch_inflight and
-	// this is a no-op).  Follow confirmation remains owned by the existing D1
-	// re-tag/SACK machinery; a failure there is an external regime transition.
-	if(rate_opt.controls_link())
-		rate_opt.notify_switch_confirmed(opt_now_ms());
-
+	// No dedicated SET_CONFIG ACK exists on this transport.  The commander's
+	// LOCAL load_configuration() is not peer-follow evidence: the responder may
+	// still be on the source config until it decodes the pre-frame CONFIG_TAG.
+	// Keep a v2-owned switch_inflight alive; the config-discriminating returning
+	// SACK closes it in inband_retag_confirm_from_sack().  This prevents a
+	// second Axis-1 decision until both ends are demonstrably coherent.
 	// Re-fill TX messages for the new config's message sizes — VERBATIM from the
 	// SET_CONFIG ACK-apply refill (arq_commander.cc:5291-5309). Free all messages_tx[]
 	// then restore any pending data from fifo_buffer_backup into fifo_buffer_tx so the
@@ -6316,7 +6314,16 @@ bool cl_arq_controller::inband_retag_confirm_from_sack(int rx_bsi)
 		inband_retag_config, rx_bsi & 0xFF, inband_announce_bsi, inband_retag_count);
 	fflush(stdout);
 
-	inband_last_confirmed_config = inband_retag_config;   // the D4 demote floor (provably reached)
+	const int confirmed_config = inband_retag_config;
+	inband_last_confirmed_config = confirmed_config;   // the D4 demote floor (provably reached)
+
+	// A config-discriminating SACK at/after the announce BSI proves the responder
+	// actually demodulated DATA after following the CONFIG_TAG.  This is the real
+	// terminal confirmation event for a v2-owned transition.  External/non-v2
+	// moves have no matching switch_inflight, so the notifier is a no-op there.
+	if(rate_opt.controls_link())
+		rate_opt.notify_switch_confirmed(opt_now_ms());
+
 	inband_retag_armed   = false;
 	inband_retag_config  = CONFIG_NONE;
 	inband_announce_bsi  = -1;
@@ -6449,17 +6456,28 @@ bool cl_arq_controller::inband_retag_escalate_if_climb_exhausted()
 	if(!climb_up)
 		return false;   // a DROP / lateral re-tag -> the down-ladder covers it, keep re-tagging
 
-	// Demote to the LAST-CONFIRMED config (the provably-reachable floor, design §4.2). If
-	// nothing was ever confirmed this session, fall back to ONE rung below the failed climb
-	// (config_ladder_down of the pre-announce config) so we never crater the link.
+	// Demote to the LAST-CONFIRMED config (the provably-reachable floor, design §4.2).
+	// For ACTIVE v2 with no newer confirmed floor, the PRE-ANNOUNCE/source config
+	// is itself the last proven coherent state: it carried the data that triggered
+	// the probe. Return there rather than stepping below it.
 	int demote_target = (inband_last_confirmed_config != CONFIG_NONE)
 		? inband_last_confirmed_config
-		: config_ladder_down(inband_pre_announce_config, robust_enabled);
+		: (rate_opt.controls_link()
+		   ? inband_pre_announce_config
+		   : config_ladder_down(inband_pre_announce_config, robust_enabled));
 
 	printf("[INBAND-TX] CLIMB to CONFIG_%d NOT followed after R=%d re-tags (RX cannot climb; "
 		"down-ladder is down-only) -> AUTO-DEMOTE to last-confirmed CONFIG_%d via the tag "
 		"(NOT a BREAK)\n", inband_retag_config, inband_retag_count, demote_target);
 	fflush(stdout);
+
+	// No config-discriminating follow evidence arrived after the bounded re-tags.
+	// This is the real terminal FAILURE event for a v2-owned transition. Close
+	// switch_inflight before routing the fallback; this replaces the old path
+	// where an ACK-fragile SET_CONFIG could grind the generic 20-control-retry
+	// budget for ~45 seconds.
+	if(rate_opt.controls_link())
+		rate_opt.notify_switch_failed();
 
 	// Disarm the failed climb's re-tag BEFORE routing the demote: inband_route_failure_demote
 	// -> the chokepoint -> inband_unilateral_config_change ARMS a FRESH re-tag for

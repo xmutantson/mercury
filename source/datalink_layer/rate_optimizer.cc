@@ -379,7 +379,7 @@ st_rate_policy::st_rate_policy()
       direct_switch_margin(0.03),
       probe_mean_margin(0.03), probe_rollback_ratio(0.97),
       probe_max_probation_ms(120000.0), probe_zero_progress_ms(12000.0),
-      probe_budget_safety_factor(1.35), switch_inflight_timeout_ms(60000.0),
+      probe_budget_safety_factor(1.35), switch_inflight_timeout_ms(300000.0),
       confidence_z(0.75),
       failure_direct_threshold(0.45), prior_default_rel_sigma(0.30),
       prior_min_sigma_bps(150.0), prior_run_weight_cap(5.0),
@@ -2026,6 +2026,9 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
         const unsigned long long now_ms = obs.monotonic_ms;
         const double feedback_guard_ms = std::max(0.0, obs.feedback_budget_ms) +
                                          2.0*switch_cost_ewma_ms + 5000.0;
+        // Last-resort corruption/wedge guard only. Normal ACTIVE CONFIG_TAG
+        // transitions terminate from peer-follow SACK confirmation or bounded
+        // D4 re-tag failure; wall-clock expiry is not the recovery mechanism.
         const double inflight_timeout_ms =
             std::max(policy.switch_inflight_timeout_ms, feedback_guard_ms);
         const bool clock_valid = now_ms > 0 && switch_started_ms > 0 &&
