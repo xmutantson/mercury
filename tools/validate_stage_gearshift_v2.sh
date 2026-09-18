@@ -100,7 +100,7 @@ echo "=== 4. Resume/build/stage on Pis ==="
 echo "Native validation policy: full ARM build + focused Gearshift-v2 integration tests"
 echo "(monolithic mercury --test is intentionally NOT run here)"
 
-WANT="$WANT" SHORT="$SHORT" python3 - <<'PY'
+WANT="$WANT" SHORT="$SHORT" BRANCH="$BRANCH" python3 - <<'PY'
 import base64
 import hashlib
 import os
@@ -118,6 +118,7 @@ import ionos_butler as B
 
 WANT = os.environ["WANT"]
 SHORT = os.environ["SHORT"]
+BRANCH = os.environ["BRANCH"]
 
 SRC2 = f"/home/rpi2/quicksilver-gs2-build-{SHORT}"
 STAGE2 = "/home/rpi2/quicksilver-gs2-gearshift-v2"
@@ -643,7 +644,7 @@ mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 set -Eeuo pipefail
 trap 'rc=$?; echo "$rc" > {shlex.quote(JOB_STATUS)}' EXIT
 cd {shlex.quote(NEW2)}
-git fetch origin {shlex.quote(WANT)}
+git fetch origin {shlex.quote(BRANCH)}
 git checkout --detach {shlex.quote(WANT)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
