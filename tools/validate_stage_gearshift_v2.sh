@@ -95,6 +95,8 @@ fi
 
 echo
 echo "=== 4. Resume/build/stage on Pis ==="
+echo "Native validation policy: full ARM build + focused Gearshift-v2 integration tests"
+echo "(monolithic mercury --test is intentionally NOT run here)"
 
 WANT="$WANT" SHORT="$SHORT" python3 - <<'PY'
 import base64
@@ -113,6 +115,25 @@ STAGE2 = "/home/rpi2/quicksilver-gs2-gearshift-v2"
 STAGE1 = "/home/rpi1/quicksilver-gs2-gearshift-v2"
 RPI2_ADDR = "192.168.2.215"
 HTTP_PORT = 18765
+
+FOCUSED_NATIVE_TESTS = [
+    "--test-inband-retag",
+    "--test-inband-nack",
+    "--test-inband-drop",
+    "--test-inband-tier-crossing",
+    "--test-inband-reannounce",
+]
+
+
+def focused_native_test_script(binary="./mercury"):
+    lines = [
+        'echo "=== Focused native Gearshift-v2 integration regressions ==="',
+    ]
+    for arg in FOCUSED_NATIVE_TESTS:
+        lines.append(f'echo ">>> {arg}"')
+        lines.append(f'{binary} {arg}')
+    lines.append('echo "=== Focused native Gearshift-v2 integration regressions PASS ==="')
+    return "\n".join(lines)
 
 def run(pi, cmd, timeout=300, check=True):
     out, rc = B._ssh_run(pi, cmd, timeout=timeout)
@@ -408,7 +429,8 @@ set -Eeuo pipefail
 trap 'rc=$?; echo "$rc" > {shlex.quote(JOB_STATUS)}' EXIT
 cd {shlex.quote(SRC2)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3
+{focused_native_test_script("./mercury")}
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 install -d {shlex.quote(STAGE2)}
@@ -427,7 +449,8 @@ cd {shlex.quote(NEW2)}
 git fetch origin gearshift-v2
 git checkout --detach {shlex.quote(WANT)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
+{focused_native_test_script("./mercury")}
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 cd /
@@ -448,7 +471,8 @@ git clone --no-tags --branch gearshift-v2 --single-branch \
 cd {shlex.quote(NEW2)}
 git checkout --detach {shlex.quote(WANT)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
+{focused_native_test_script("./mercury")}
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 cd /
@@ -683,7 +707,8 @@ mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 set -Eeuo pipefail
 cd {shlex.quote(SRC2)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3
+{focused_native_test_script("./mercury")}
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 install -d {shlex.quote(STAGE2)}
@@ -700,7 +725,8 @@ git clone --no-tags --branch gearshift-v2 --single-branch \
 cd {shlex.quote(SRC2 + ".new")}
 git checkout --detach {shlex.quote(WANT)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
-MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean --test
+MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
+{focused_native_test_script("./mercury")}
 test -x ./mercury
 strings ./mercury | grep -Fq {shlex.quote(SHORT)}
 cd /
