@@ -5939,6 +5939,18 @@ bool cl_arq_controller::inband_unilateral_config_change(int target_cfg)
 	if(config_ladder_index(target_cfg) < 0)
 		return false;
 
+	// Second-line ACTIVE-v2 authority firewall. add_message_control(SET_CONFIG)
+	// normally obtains/validates ownership before reaching here; this guard catches
+	// any direct unilateral caller that tries to bypass that chokepoint.
+	if(rate_opt.controls_link() && link_status == CONNECTED
+	   && !rate_opt.transition_matches(current_configuration, target_cfg))
+	{
+		printf("[GEARSHIFT-V2-AUTHORITY] BLOCK direct CONFIG_TAG transition %d->%d: "
+			"no matching Gearshift owner\n", current_configuration, target_cfg);
+		fflush(stdout);
+		return false;
+	}
+
 	// The in-band path is a real Axis-1 transition even though it emits no
 	// SET_CONFIG frame.  Enforce the same exactly-once lower-axis invalidation
 	// contract as the on-wire SET_CONFIG chokepoint, then synchronize an
@@ -19690,9 +19702,52 @@ void cl_arq_controller::send_scream_pattern(int rung)
 void cl_arq_controller::send_break_pattern()
 {
 	if(passive_monitor) return;
-	// BREAK is an external emergency authority by design.  Synchronize the
-	// adaptive controller before emitting it so an interrupted probe/switch
-	// cannot survive recovery and immediately re-elect the failed action.
+
+	// ACTIVE-v2 single-owner firewall. BREAK remains a transport/recovery primitive,
+	// never an independent policy decision. A legacy subsystem may REQUEST it, but:
+	//   * it cannot interrupt a live switch or probe probation;
+	//   * above the ladder floor the request is converted into a Gearshift-owned
+	//     downward Axis-1 transaction instead of a BREAK cascade;
+	//   * only at the floor, with no owned experiment, may Gearshift authorize BREAK.
+	if(rate_opt.controls_link() && link_status == CONNECTED)
+	{
+		const bool at_bottom = config_is_at_bottom(current_configuration, robust_enabled);
+		if(!at_bottom)
+		{
+			if(rate_opt.owns_link_experiment())
+			{
+				rate_opt.authorize_hard_recovery(current_configuration, false,
+					"legacy-break-request-during-owned-experiment");
+				emergency_break_active = 0;
+				emergency_break_retries = 0;
+				break_recovery_phase = 0;
+				return;
+			}
+			int lower = config_ladder_down(current_configuration, robust_enabled);
+			printf("[GEARSHIFT-V2-AUTHORITY] converting legacy BREAK request at cfg=%d "
+				"into owner-mediated downshift request -> %d\n",
+				current_configuration, lower);
+			fflush(stdout);
+			emergency_break_active = 0;
+			emergency_break_retries = 0;
+			break_recovery_phase = 0;
+			emergency_nack_count = 0;
+			if(lower != current_configuration)
+				inband_route_failure_demote(lower, "legacy_break_request");
+			return;
+		}
+		if(!rate_opt.authorize_hard_recovery(current_configuration, true,
+			"legacy-break-request-at-floor"))
+		{
+			emergency_break_active = 0;
+			emergency_break_retries = 0;
+			break_recovery_phase = 0;
+			return;
+		}
+	}
+	// Gearshift-v2 has already authorized ACTIVE hard recovery above. In legacy/
+	// shadow mode BREAK retains the historical behavior. Synchronize controller
+	// context before emission so recovery starts from a clean generation.
 	rate_opt.notify_external_axis1_transition(
 		current_configuration, current_configuration, "emergency-break",
 		narrowband_enabled == YES);
