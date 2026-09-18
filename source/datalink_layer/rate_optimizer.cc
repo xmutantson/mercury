@@ -2478,9 +2478,22 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
     return d;
 }
 
-bool cl_rate_optimizer::owns_link_experiment() const
+bool cl_rate_optimizer::owns_link_experiment(unsigned long long now_ms) const
 {
-    return mode == GEARSHIFT_V2_ACTIVE && (switch_inflight || probe_active);
+    if (mode != GEARSHIFT_V2_ACTIVE) return false;
+    if (switch_inflight) return true;
+    if (!probe_active) return false;
+
+    // Confirmed probe probation is still exclusive, but not immortal.  The
+    // generic liveness sensor may report a failure only after Gearshift's OWN
+    // zero-progress wall-clock budget has elapsed.  now_ms==0 keeps diagnostic
+    // and synthetic callers conservative (owned until an explicit time exists).
+    if (now_ms == 0 || switch_started_ms == 0 || now_ms < switch_started_ms)
+        return true;
+    const double budget_ms = probe_zero_progress_budget_ms > 0.0
+                           ? probe_zero_progress_budget_ms
+                           : policy.probe_zero_progress_ms;
+    return (double)(now_ms - switch_started_ms) < std::max(1000.0, budget_ms);
 }
 
 bool cl_rate_optimizer::transition_matches(int from_cfg, int to_cfg) const
@@ -2507,14 +2520,9 @@ int cl_rate_optimizer::authorize_external_transition(
         return -1;
     }
 
-    const int from_rank = gearshift_action_rank(from_cfg);
-    int target_cfg = requested_to_cfg;
-    e_gearshift_v2_action action = GEARSHIFT_ACTION_SWITCH;
-    int fallback_cfg = requested_to_cfg;
-
-    // During confirmed probe probation, a foreign failure signal may REQUEST a
-    // recovery, but Gearshift-v2 owns the answer: rollback to the probe's own
-    // fallback rather than accepting an arbitrary legacy target.
+    // A concrete failure during confirmed probe probation is useful evidence,
+    // but the foreign subsystem does NOT choose the destination. Gearshift owns
+    // the response and may only roll back to the probe's own fallback.
     if (probe_active) {
         if (probe_target_cfg != from_cfg || probe_fallback_cfg < 0) {
             std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK external Axis-1 request %d->%d "
@@ -2524,38 +2532,33 @@ int cl_rate_optimizer::authorize_external_transition(
             std::fflush(stdout);
             return -1;
         }
-        target_cfg = probe_fallback_cfg;
-        fallback_cfg = probe_fallback_cfg;
-        action = GEARSHIFT_ACTION_ROLLBACK;
-    } else {
-        // Legacy safety controllers are telemetry producers only under ACTIVE.
-        // They may request a downshift; they may never invent an upward move.
-        if (gearshift_action_rank(target_cfg) >= from_rank) {
-            std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK external non-downshift %d->%d "
-                        "reason=%s: ACTIVE owns all upward/hold decisions\n",
-                        from_cfg, target_cfg, why);
-            std::fflush(stdout);
-            return -1;
-        }
+        const int target_cfg = probe_fallback_cfg;
+        st_rate_decision d;
+        d.action = GEARSHIFT_ACTION_ROLLBACK;
+        d.current_cfg = from_cfg;
+        d.target_cfg = target_cfg;
+        d.fallback_cfg = target_cfg;
+        d.actionable = true;
+        d.reason = std::string("probe-failure-signal:") + why;
+        last_v2_decision = d;
+        notify_switch_dispatched(from_cfg, target_cfg, GEARSHIFT_ACTION_ROLLBACK,
+                                 target_cfg, now_ms, is_nb);
+        std::printf("[GEARSHIFT-V2-AUTHORITY] AUTH probe rollback reason=%s "
+                    "foreign_hint=%d->%d owner=%d->%d\n",
+                    why, from_cfg, requested_to_cfg, from_cfg, target_cfg);
+        std::fflush(stdout);
+        return target_cfg;
     }
 
-    st_rate_decision d;
-    d.action = action;
-    d.current_cfg = from_cfg;
-    d.target_cfg = target_cfg;
-    d.fallback_cfg = fallback_cfg;
-    d.actionable = true;
-    d.reason = std::string("external-failure-signal:") + why;
-    last_v2_decision = d;
-
-    notify_switch_dispatched(from_cfg, target_cfg, action, fallback_cfg,
-                             now_ms, is_nb);
-    std::printf("[GEARSHIFT-V2-AUTHORITY] AUTH external failure signal reason=%s "
-                "requested=%d->%d owned=%d->%d action=%s\n",
-                why, from_cfg, requested_to_cfg, from_cfg, target_cfg,
-                action_name(action));
+    // Outside an owned experiment, legacy safety/rate code is TELEMETRY ONLY.
+    // It may say "this failed"; it may not nominate CONFIG_N.  The caller must
+    // feed that evidence into opt_evaluate_batch_end()/evaluate_v2, whose action
+    // set and goodput model select the actual destination.
+    std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK foreign Axis-1 target %d->%d "
+                "reason=%s: telemetry-only; Gearshift must select destination\n",
+                from_cfg, requested_to_cfg, why);
     std::fflush(stdout);
-    return target_cfg;
+    return -1;
 }
 
 bool cl_rate_optimizer::authorize_hard_recovery(
@@ -2577,7 +2580,25 @@ bool cl_rate_optimizer::authorize_hard_recovery(
         std::fflush(stdout);
         return false;
     }
-    std::printf("[GEARSHIFT-V2-AUTHORITY] AUTH hard recovery at floor cfg=%d reason=%s\n",
+
+    // Floor BREAK is an actuator, not an independent detector.  It is legal only
+    // after evaluate_v2 itself has declared a hard departure with no admissible
+    // lower action.  A stale/default/HOLD verdict cannot authorize RF recovery.
+    const bool owner_declared_dead =
+        last_v2_decision.current_cfg == current_cfg &&
+        last_v2_decision.action == GEARSHIFT_ACTION_ABSTAIN &&
+        last_v2_decision.reason == "no-admissible-candidate";
+    if (!owner_declared_dead) {
+        std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK hard recovery at floor cfg=%d "
+                    "reason=%s: owner verdict action=%s verdict_reason=%s\n",
+                    current_cfg, why, action_name(last_v2_decision.action),
+                    last_v2_decision.reason.c_str());
+        std::fflush(stdout);
+        return false;
+    }
+
+    std::printf("[GEARSHIFT-V2-AUTHORITY] AUTH hard recovery at floor cfg=%d reason=%s "
+                "owner_verdict=no-admissible-candidate\n",
                 current_cfg, why);
     std::fflush(stdout);
     return true;
