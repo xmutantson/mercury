@@ -6505,7 +6505,7 @@ bool cl_arq_controller::inband_retag_escalate_if_climb_exhausted()
 	// A no-op demote (already at demote_target / invalid) leaves the link where it is —
 	// the climb simply stops being re-tagged (the RX stays at the lower config it never
 	// left, which is exactly the safe outcome of an unfollowable climb).
-	return inband_route_failure_demote(demote_target, "climb_unfollowable_autodemote");
+	return inband_route_failure_demote(demote_target, "climb_unfollowable_autodemote", true, true);
 }
 
 // ============================================================================
@@ -6665,7 +6665,7 @@ bool cl_arq_controller::inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason,
 	// Route the demote to the RX's ACTUAL config (we met it exactly where it told us it is).
 	// A no-op demote (already at rx_raw_cfg) returns false and leaves the link there — the
 	// climb simply stops being re-tagged, which is the correct outcome.
-	return inband_route_failure_demote(rx_raw_cfg, "nack_accelerated_demote");
+	return inband_route_failure_demote(rx_raw_cfg, "nack_accelerated_demote", true, true);
 }
 
 // Resolve+cache N (the periodic re-announce period, >=0; 0=disabled).
