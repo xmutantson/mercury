@@ -194,11 +194,16 @@ install -d {shlex.quote(STAGE2)}
 install -m 0755 ./mercury {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 """, timeout=3600)
-        elif new_head == WANT:
-            print("rpi2: reusing failed-at-build clone; resuming native build/test")
+        elif new_head:
+            print(
+                "rpi2: reusing existing failed-at-build clone; "
+                "updating it to target and resuming native build/test"
+            )
             bash("rpi2", f"""
 set -Eeuo pipefail
 cd {shlex.quote(NEW2)}
+git fetch origin gearshift-v2
+git checkout --detach {shlex.quote(WANT)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean --test
 test -x ./mercury
