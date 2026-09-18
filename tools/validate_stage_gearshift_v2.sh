@@ -160,7 +160,7 @@ def quiet_run(pi, cmd, timeout=60):
     return (out or ""), rc
 
 
-def relay_file_via_butler(src_pi, src_path, dst_pi, dst_path, chunk_bytes=393216):
+def relay_file_via_butler(src_pi, src_path, dst_pi, dst_path, chunk_bytes=786432):
     """Relay a file through SpicyPancake using only Butler SSH calls.
 
     No direct Pi-to-Pi connectivity is required. Each chunk is base64 on the
