@@ -186,10 +186,16 @@ rm -f {shlex.quote(dst_path)}
     index = 0
     while copied < total:
         want = min(chunk_bytes, total - copied)
+        read_code = (
+            "import base64,sys; "
+            "f=open(sys.argv[1],'rb'); "
+            "f.seek(int(sys.argv[2])); "
+            "sys.stdout.write(base64.b64encode(f.read(int(sys.argv[3]))).decode('ascii'))"
+        )
         b64, rc = quiet_run(
             src_pi,
-            f"dd if={shlex.quote(src_path)} bs=1 skip={copied} count={want} "
-            f"status=none | base64 -w0",
+            f"python3 -c {shlex.quote(read_code)} "
+            f"{shlex.quote(src_path)} {copied} {want}",
             timeout=120,
         )
         if rc != 0:
