@@ -12070,8 +12070,8 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 
 	// Hard protocol/safety gates.  In ACTIVE mode Gearshift-v2 is the sole
 	// ordinary data-rate authority, including robust->OFDM acquisition. Legacy
-	// and shadow preserve the historic turboshift/SACK/OFDM handoff. BREAK stays
-	// independently authoritative in every mode.
+	// and shadow preserve the historic turboshift/SACK/OFDM handoff. In ACTIVE,
+	// BREAK is only a transport primitive after Gearshift authorizes hard recovery.
 	if (!rate_opt.is_enabled())              return false;
 	if (emergency_break_active != 0)         return false;
 	if (link_status != CONNECTED)            return false;
