@@ -159,8 +159,8 @@ echo "============================================================"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-R2_MD5="$(remote_run rpi2 "md5sum '/home/rpi2/$STAGED_REL' | awk '{print \\$1}'" | tail -1)"
-R2_SHA="$(remote_run rpi2 "sha256sum '/home/rpi2/$STAGED_REL' | awk '{print \\$1}'" | tail -1)"
+R2_MD5="$(remote_run rpi2 "md5sum '/home/rpi2/$STAGED_REL' | cut -d ' ' -f1" | tail -1)"
+R2_SHA="$(remote_run rpi2 "sha256sum '/home/rpi2/$STAGED_REL' | cut -d ' ' -f1" | tail -1)"
 [[ "$R2_MD5" =~ ^[0-9a-f]{32}$ ]] || die "bad rpi2 MD5: $R2_MD5"
 [[ "$R2_SHA" =~ ^[0-9a-f]{64}$ ]] || die "bad rpi2 SHA256: $R2_SHA"
 [[ "$R2_SHA" == "$EXPECTED_SHA256" ]] || die "unexpected staged SHA256: $R2_SHA"
@@ -175,8 +175,8 @@ for pi in rpi1 rpi2; do
     remote_run "$pi" "
 set -e
 P='/home/$pi/$STAGED_REL'
-test \"\$(md5sum \"\$P\" | awk '{print \\$1}')\" = '$R2_MD5'
-test \"\$(sha256sum \"\$P\" | awk '{print \\$1}')\" = '$R2_SHA'
+test \"\$(md5sum \"\$P\" | cut -d ' ' -f1)\" = '$R2_MD5'
+test \"\$(sha256sum \"\$P\" | cut -d ' ' -f1)\" = '$R2_SHA'
 echo '$pi OK'
 md5sum \"\$P\"
 sha256sum \"\$P\"
@@ -197,10 +197,10 @@ for pi in rpi1 rpi2; do
 set -euo pipefail
 src='/home/$pi/$STAGED_REL'
 dst='/home/$pi/$RUNTIME_REL'
-test \"\$(md5sum \"\$src\" | awk '{print \\$1}')\" = '$R2_MD5'
+test \"\$(md5sum \"\$src\" | cut -d ' ' -f1)\" = '$R2_MD5'
 [ ! -f \"\$dst\" ] || cp -a \"\$dst\" \"\$dst.pre-${COMMIT:0:7}-$STAMP\"
 install -m 0755 \"\$src\" \"\$dst.new\"
-test \"\$(md5sum \"\$dst.new\" | awk '{print \\$1}')\" = '$R2_MD5'
+test \"\$(md5sum \"\$dst.new\" | cut -d ' ' -f1)\" = '$R2_MD5'
 mv -f \"\$dst.new\" \"\$dst\"
 echo '$pi runtime installed:'
 md5sum \"\$dst\"
@@ -308,7 +308,7 @@ for p in \$pids; do
        && tr '\\0' '\\n' < /proc/\$p/environ 2>/dev/null | grep -Fxq 'MERCURY_RATE_TABLE=/dev/null/gearshift-v2-knee-no-calibration.json'; then
         exe=\$(readlink -f /proc/\$p/exe)
         test \"\$exe\" = '/home/$pi/$RUNTIME_REL'
-        test \"\$(sha256sum /proc/\$p/exe | awk '{print \\$1}')\" = '$EXPECTED_SHA256'
+        test \"\$(sha256sum /proc/\$p/exe | cut -d ' ' -f1)\" = '$EXPECTED_SHA256'
         echo PID=\$p ACTIVE_ENV_PASS EXE=\$exe
         ok=1
     fi
