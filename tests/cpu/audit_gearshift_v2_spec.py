@@ -322,26 +322,32 @@ req("probe-probation-budget-prices-target-geometry",
     "CONFIG_16" in core_test,
     "long big-block/thin-grid targets get a channel-time budget scaled from their own airtime rather than raw batch count")
 req("axis1-dispatch-is-exclusive-until-terminal-event",
-    allin(ro, "if (switch_inflight)", "evaluation-suppressed", 'd.reason = "switch-inflight"') and
+    allin(ro, "if (switch_inflight)", "evaluation-suppressed", 'd.reason = "switch-inflight"',
+          "switch-inflight-expired", "acquisition=reopened") and
     allin(core_test, "in-flight evaluation is suppressed",
           "confirmation terminates exclusive transition",
-          "switch failure terminates exclusive transition"),
-    "an unresolved ordinary SET_CONFIG suppresses later SWITCH/PROBE/ROLLBACK decisions until confirm/fail/external override")
+          "switch failure terminates exclusive transition",
+          "expired in-flight transition reopens acquisition",
+          "unconfirmed transition expiry does not blacklist target"),
+    "an ordinary SET_CONFIG is exclusive while live, but a lost confirmation has a bounded terminal timeout that reopens acquisition without target-performance penalty")
 req("duplicate-dispatch-cannot-overwrite-live-transaction",
     allin(ro, "duplicate-dispatch-rejected", "live_source=%d", "new_source=%d") and
     allin(core_test, "duplicate dispatch preserves original transaction",
           "original switch transaction is live"),
     "defensive dispatch handling preserves the first transition identity instead of silently replacing it")
-req("probe-budget-is-population-reachable-and-cadence-adaptive",
+req("probe-budget-is-bounded-cadence-adaptive-and-does-not-pre-veto-acquisition",
     allin(roh, "probe_budget_extra_cycles", "probe_budget_safety_factor",
           "probe_cycle_ms_ewma") and
-    allin(ro, "required_population", "population_attainable",
+    allin(ro, "required_population", "desired_probation_ms",
+          "std::min(policy.probe_max_probation_ms",
           "maybe_extend_probe_budget", "probe-budget-extend",
           "observed-application-cadence") and
-    allin(core_test, "slow cfg16 survives beyond old 30-second ceiling",
+    "population_attainable" not in ro and
+    allin(core_test, "production-sized feedback budget still permits cold cfg16 probe",
+          "slow cfg16 survives beyond old 30-second ceiling",
           "observed cfg16 cadence extends probation budget",
           "healthy slow cfg16 accepted after requested population"),
-    "minimum requested evidence is reachable from target geometry and observed cadence, under a bounded ultimate ceiling")
+    "target geometry/cadence seed a bounded probation budget; an oversized conservative feedback window caps probation instead of deadlocking acquisition before the target is measured")
 req("generation-reset-excludes-triggering-transaction",
     allin(ro, "transaction_discovered_generation", "clean_probe_tx",
           "probe_pending_generation_contamination", "probe-generation-unit-excluded",

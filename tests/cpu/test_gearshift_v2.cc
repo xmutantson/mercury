@@ -417,6 +417,54 @@ int main() {
     ok("policy resumes after switch failure under failure memory",
        d.reason!="switch-inflight" && !(d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_16));
 
+    // Bench regression: Patch 2 physically showed an occasional unconfirmed
+    // 0->16 SET_CONFIG followed by a successful retry about one control window
+    // later. Patch 3 made switch_inflight exclusive but forgot a terminal
+    // timeout, turning that recoverable loss into an immortal source-config hold.
+    cl_rate_optimizer expired; expired.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+    p=expired.get_policy(); p.confidence_z=0.0; p.direct_switch_margin=0.50;
+    p.probe_mean_margin=0.0; p.min_outcome_samples=1; p.cooldown_batches=0;
+    p.switch_inflight_timeout_ms=5000;
+    expired.set_policy_for_test(p); expired.set_switch_cost_ms(1);
+    d=expired.evaluate_v2(tbase,CONFIG_16);
+    ok("expiry setup probes cfg16",
+       d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_16);
+    expired.notify_switch_dispatched(CONFIG_14,CONFIG_16,d.action,CONFIG_14,1000,false);
+    st_rate_observation expired_obs=tbase;
+    expired_obs.monotonic_ms=7001;
+    expired_obs.feedback_budget_ms=0;
+    d=expired.evaluate_v2(expired_obs,CONFIG_16);
+    ok("expired in-flight transition reopens acquisition",
+       !expired.switch_inflight_for_test() &&
+       d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_16 &&
+       d.reason!="switch-inflight");
+    ok("unconfirmed transition expiry does not blacklist target",
+       !expired.probe_blocked_for_test(CONFIG_16,expired_obs));
+
+    // Bench regression: production feeds the live receiving_timeout into probe
+    // economics. With the Patch-3 population-reachability veto, a realistic
+    // ~45 s feedback window made 3 samples + safety mathematically exceed the
+    // 120 s probation ceiling, so ACTIVE refused to probe at all. The hard
+    // ceiling should bound probation, not prevent cold acquisition.
+    cl_rate_optimizer livebudget; livebudget.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+    p=livebudget.get_policy(); p.confidence_z=0.0; p.direct_switch_margin=0.50;
+    p.probe_mean_margin=0.0; p.min_outcome_samples=4; p.min_rate_samples=1;
+    p.cooldown_batches=0; p.probe_min_application_samples=3;
+    p.probe_min_outcome_samples=3; p.probe_max_probation_ms=120000;
+    livebudget.set_policy_for_test(p); livebudget.set_switch_cost_ms(1800);
+    st_rate_observation physical=obs(CONFIG_0,23.1,1,0.0);
+    physical.outcome_samples=1; physical.rate_samples=1;
+    physical.feasible_configs={CONFIG_0,CONFIG_16};
+    physical.nominal_bps[CONFIG_0]=66.4;
+    physical.nominal_bps[CONFIG_16]=6743.5;
+    physical.tx_airtime_ms[CONFIG_16]=5572;
+    physical.feedback_budget_ms=45000;
+    physical.queue_bytes=200000;
+    d=livebudget.evaluate_v2(physical,CONFIG_16);
+    ok("production-sized feedback budget still permits cold cfg16 probe",
+       d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_16 &&
+       d.reason=="cold-start-bounded-probe");
+
     // Patch-3 C: replay the slow physical CONFIG_16 cadence. The old 30-second
     // ceiling would roll back after only two healthy completed target outcomes.
     // Geometry seeds a reachable budget; observed target cadence extends it so

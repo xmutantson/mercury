@@ -379,7 +379,8 @@ st_rate_policy::st_rate_policy()
       direct_switch_margin(0.03),
       probe_mean_margin(0.03), probe_rollback_ratio(0.97),
       probe_max_probation_ms(120000.0), probe_zero_progress_ms(12000.0),
-      probe_budget_safety_factor(1.35), confidence_z(0.75),
+      probe_budget_safety_factor(1.35), switch_inflight_timeout_ms(60000.0),
+      confidence_z(0.75),
       failure_direct_threshold(0.45), prior_default_rel_sigma(0.30),
       prior_min_sigma_bps(150.0), prior_run_weight_cap(5.0),
       live_weight_cap(12.0), live_stale_half_life_batches(24.0),
@@ -421,6 +422,8 @@ void st_rate_policy::load_env()
     probe_max_probation_ms = env_double("MERCURY_GS2_PROBE_MAX_MS", probe_max_probation_ms, 1000.0, 300000.0);
     probe_zero_progress_ms = env_double("MERCURY_GS2_PROBE_ZERO_PROGRESS_MS", probe_zero_progress_ms, 1000.0, 300000.0);
     probe_budget_safety_factor = env_double("MERCURY_GS2_PROBE_BUDGET_SAFETY", probe_budget_safety_factor, 1.0, 4.0);
+    switch_inflight_timeout_ms = env_double("MERCURY_GS2_SWITCH_INFLIGHT_MAX_MS",
+                                            switch_inflight_timeout_ms, 5000.0, 300000.0);
     confidence_z = env_double("MERCURY_GS2_CONFIDENCE_Z", confidence_z, 0.0, 4.0);
     failure_direct_threshold = env_double("MERCURY_GS2_FAILURE_THRESHOLD", failure_direct_threshold, 0.0, 1.0);
     calibration_snr_kernel_db = env_double("MERCURY_GS2_CAL_SNR_KERNEL_DB", calibration_snr_kernel_db, 0.25, 20.0);
@@ -2011,23 +2014,67 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
 
     // One ordinary Axis-1 SET_CONFIG owns the transition lifecycle until its
     // confirmation/failure (or an independent external/emergency authority)
-    // terminates it.  Do not let a later evaluation overwrite that transaction.
+    // terminates it. Do not let a later evaluation overwrite that transaction.
+    //
+    // Physical Patch-2 evidence also showed that a SET_CONFIG can be dispatched
+    // without ever reaching the confirmation callback. Exclusivity therefore
+    // needs a terminal timeout: otherwise one lost control transition becomes a
+    // permanent CONFIG_0 prison. Expiry is NOT target-performance evidence; the
+    // target was never confirmed, so clear the unfinished probe without adding
+    // failed-probe memory or cooldown and immediately reopen acquisition.
     if (switch_inflight) {
-        d.action = GEARSHIFT_ACTION_HOLD;
-        d.target_cfg = obs.current_cfg;
-        d.fallback_cfg = switch_fallback_cfg >= 0 ? switch_fallback_cfg : obs.current_cfg;
-        d.reason = "switch-inflight";
-        d.actionable = false;
-        if (!switch_suppression_logged) {
-            std::printf("[GEARSHIFT-V2] evaluation-suppressed switch_inflight=1 "
-                        "source=%d target=%d action=%s fallback=%d started_ms=%llu\n",
-                        switch_from_cfg, switch_to_cfg, action_name(switch_action),
-                        switch_fallback_cfg, switch_started_ms);
+        const unsigned long long now_ms = obs.monotonic_ms;
+        const double feedback_guard_ms = std::max(0.0, obs.feedback_budget_ms) +
+                                         2.0*switch_cost_ewma_ms + 5000.0;
+        const double inflight_timeout_ms =
+            std::max(policy.switch_inflight_timeout_ms, feedback_guard_ms);
+        const bool clock_valid = now_ms > 0 && switch_started_ms > 0 &&
+                                 now_ms >= switch_started_ms;
+        const double inflight_age_ms = clock_valid
+            ? (double)(now_ms - switch_started_ms) : 0.0;
+        const bool inflight_expired = clock_valid &&
+                                      inflight_age_ms >= inflight_timeout_ms;
+
+        if (inflight_expired) {
+            const int expired_from = switch_from_cfg;
+            const int expired_to = switch_to_cfg;
+            const int expired_fallback = switch_fallback_cfg;
+            const e_gearshift_v2_action expired_action = switch_action;
+            if (expired_action == GEARSHIFT_ACTION_PROBE)
+                clear_probe();
+            switch_inflight = false;
+            switch_suppression_logged = false;
+            switch_started_ms = 0;
+            switch_from_cfg = -1;
+            switch_to_cfg = -1;
+            switch_action = GEARSHIFT_ACTION_HOLD;
+            switch_fallback_cfg = -1;
+            switch_is_nb = false;
+            std::printf("[GEARSHIFT-V2] switch-inflight-expired source=%d target=%d "
+                        "action=%s fallback=%d age_ms=%.0f timeout_ms=%.0f "
+                        "target_penalty=0 acquisition=reopened\n",
+                        expired_from, expired_to, action_name(expired_action),
+                        expired_fallback, inflight_age_ms, inflight_timeout_ms);
             std::fflush(stdout);
-            switch_suppression_logged = true;
+            // Fall through and make a fresh decision from current observed state.
+        } else {
+            d.action = GEARSHIFT_ACTION_HOLD;
+            d.target_cfg = obs.current_cfg;
+            d.fallback_cfg = switch_fallback_cfg >= 0 ? switch_fallback_cfg : obs.current_cfg;
+            d.reason = "switch-inflight";
+            d.actionable = false;
+            if (!switch_suppression_logged) {
+                std::printf("[GEARSHIFT-V2] evaluation-suppressed switch_inflight=1 "
+                            "source=%d target=%d action=%s fallback=%d started_ms=%llu "
+                            "timeout_ms=%.0f\n",
+                            switch_from_cfg, switch_to_cfg, action_name(switch_action),
+                            switch_fallback_cfg, switch_started_ms, inflight_timeout_ms);
+                std::fflush(stdout);
+                switch_suppression_logged = true;
+            }
+            last_v2_decision = d;
+            return d;
         }
-        last_v2_decision = d;
-        return d;
     }
 
     // Upward probes have their own causal probation population. One decoded
@@ -2280,7 +2327,6 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
     st_action_proposal chosen;
     bool saw_candidate_prediction = false;
     bool saw_uneconomic_probe = false;
-    bool saw_unattainable_probe = false;
     const std::vector<int> candidates = candidate_configs(obs);
     const bool force_lower_for_failure =
         obs.failed_batch_rate >= policy.failure_direct_threshold;
@@ -2341,11 +2387,11 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
             const double feedback_ms = std::max(0.0, obs.feedback_budget_ms);
             const double probe_exposure_ms = 2.0*switch_cost_ewma_ms +
                                              probe_airtime_ms + feedback_ms;
-            // Probation is bounded in channel time, but its *minimum useful
-            // budget* must make the requested population physically attainable.
-            // Start from candidate transaction geometry, then extend from the
-            // target's measured cadence while probation runs. The configured
-            // maximum remains the ultimate fail-safe ceiling.
+            // Probation is bounded in channel time and seeded from target
+            // transaction geometry, then may extend from measured target cadence.
+            // A conservative listen timeout can make the *desired* population
+            // budget exceed the hard ceiling. That must cap the experiment, not
+            // veto acquisition before the target is ever measured.
             const double one_trial_ms = std::max(1000.0, probe_airtime_ms + feedback_ms);
             const int required_population = std::max(policy.probe_min_application_samples,
                                                      policy.probe_min_outcome_samples);
@@ -2355,8 +2401,6 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
                 policy.probe_zero_progress_ms,
                 one_trial_ms * (double)budget_cycles *
                 std::max(1.0, policy.probe_budget_safety_factor));
-            const bool population_attainable =
-                desired_probation_ms <= policy.probe_max_probation_ms;
             a.probe_trial_ms = one_trial_ms;
             a.probation_budget_ms = std::min(policy.probe_max_probation_ms,
                                               desired_probation_ms);
@@ -2366,9 +2410,7 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
             const double candidate_probe_factor = d.horizon_ms > 0.0
                 ? std::max(0.0, 1.0 - probe_exposure_ms/d.horizon_ms) : 0.0;
             const double probe_net = p.mean_bps * candidate_probe_factor;
-            if (!population_attainable) {
-                saw_unattainable_probe = true;
-            } else if (probe_net > current.mean_bps * (1.0 + policy.probe_mean_margin) &&
+            if (probe_net > current.mean_bps * (1.0 + policy.probe_mean_margin) &&
                 (p.mean_bps + policy.confidence_z*p.sigma_bps) * candidate_probe_factor > current_ucb) {
                 a.valid = true;
                 a.action = GEARSHIFT_ACTION_PROBE;
@@ -2395,7 +2437,6 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
     if (!chosen.valid) {
         d.action = hard_departure ? GEARSHIFT_ACTION_ABSTAIN : GEARSHIFT_ACTION_HOLD;
         if (hard_departure) d.reason = "no-admissible-candidate";
-        else if (saw_unattainable_probe) d.reason = "probe-population-exceeds-ceiling";
         else if (saw_uneconomic_probe) d.reason = "probe-cost-does-not-pay";
         else d.reason = saw_candidate_prediction ? "gain-does-not-pay" : "no-candidate-evidence";
         last_v2_decision = d;

@@ -186,6 +186,10 @@ struct st_rate_policy {
     double probe_max_probation_ms;
     double probe_zero_progress_ms;
     double probe_budget_safety_factor;
+    // An ordinary Axis-1 transition is exclusive, but never immortal. If the
+    // SET_CONFIG confirmation/failure callback is lost, ACTIVE must eventually
+    // reopen acquisition rather than strand the session at the source config.
+    double switch_inflight_timeout_ms;
     double confidence_z;
     double failure_direct_threshold;
     double prior_default_rel_sigma;
