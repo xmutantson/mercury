@@ -8276,6 +8276,12 @@ int cl_arq_controller::test_inband_retag()
 		cmd->robust_enabled = NO;
 		cmd->inband_rate_enabled = 1;       // force-resolve the cached flag ON
 		cmd->send_break_pattern_count = 0;  // zero the BREAK instrument
+		// This helper is the LEGACY/in-band transport baseline. ACTIVE-specific
+		// subcases below opt in explicitly with set_mode_for_test(ACTIVE). Do not
+		// inherit MERCURY_GEARSHIFT_V2 from the Pi/service environment: the
+		// single-owner firewall would correctly reject these synthetic unowned
+		// SET_CONFIGs and turn a transport regression into an environment test.
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_LEGACY);
 		*out_ts = ts;
 		return cmd;
 	};
@@ -8563,9 +8569,9 @@ int cl_arq_controller::test_inband_retag()
 		check(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO,
 			"C5 a FRESH re-tag armed for the demote target CONFIG_9",
 			(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO) ? 1 : 0, 1);
-		check(!cmd->rate_opt.switch_inflight_for_test(),
-			"C6 bounded CONFIG_TAG failure terminates the v2 switch transaction",
-			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 0);
+		check(cmd->rate_opt.transition_matches(CFG_HI, CFG_LO),
+			"C6 failed climb closes the probe switch and opens an owned rollback transition",
+			cmd->rate_opt.transition_matches(CFG_HI, CFG_LO) ? 1 : 0, 1);
 		check(!cmd->rate_opt.probe_is_active(),
 			"C7 failed CONFIG_TAG climb terminates probe probation before fallback",
 			cmd->rate_opt.probe_is_active() ? 1 : 0, 0);
@@ -8796,6 +8802,9 @@ int cl_arq_controller::test_inband_nack()
 		cmd->robust_enabled = NO;
 		cmd->inband_rate_enabled = 1;
 		cmd->send_break_pattern_count = 0;
+		// Keep legacy/in-band transport subcases independent of ambient runtime
+		// MERCURY_GEARSHIFT_V2. ACTIVE ownership is enabled explicitly in Part B.
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_LEGACY);
 		return cmd;
 	};
 
@@ -9031,9 +9040,9 @@ int cl_arq_controller::test_inband_nack()
 		check(cmd->inband_retag_count < R,
 			"B5 the demote fired BEFORE the R give-up floor (NACK beat the R-retry)",
 			cmd->inband_retag_count < R ? 1 : 0, 1);
-		check(!cmd->rate_opt.switch_inflight_for_test(),
-			"B5a matching NACK explicitly terminates the v2 switch transaction",
-			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 0);
+		check(cmd->rate_opt.transition_matches(CFG_HI, CFG_LO),
+			"B5a matching NACK terminates the failed probe and opens owned rollback",
+			cmd->rate_opt.transition_matches(CFG_HI, CFG_LO) ? 1 : 0, 1);
 		check(!cmd->rate_opt.probe_is_active(),
 			"B5b matching NACK terminates failed probe probation before fallback",
 			cmd->rate_opt.probe_is_active() ? 1 : 0, 0);
