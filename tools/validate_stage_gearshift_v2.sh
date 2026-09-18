@@ -168,7 +168,7 @@ echo "$pid" > {shlex.quote(JOB_PID)}
 echo "$pid"
 """
         out, _ = bash(pi, launch, timeout=30)
-        pid_lines = re.findall(r"(?m)^\\s*(\\d+)\\s*$", out)
+        pid_lines = re.findall(r"(?m)^\s*(\d+)\s*$", out)
         pid = pid_lines[-1] if pid_lines else "?"
         print(f"{pi}: detached native build started pid={pid}", flush=True)
         launched_now = True
@@ -219,7 +219,7 @@ echo "$pid"
                 if chunk:
                     print(
                         f"[{pi}:build] {chunk}",
-                        end="" if chunk.endswith("\\n") else "\\n",
+                        end="" if chunk.endswith("\n") else "\n",
                         flush=True,
                     )
                 last_line = line_count
@@ -250,7 +250,7 @@ echo "$pid"
 
     except KeyboardInterrupt:
         print(
-            "\\nLocal watcher detached. The rpi2 native build continues "
+            "\nLocal watcher detached. The rpi2 native build continues "
             "independently under nohup. Rerun this helper to reattach.",
             flush=True,
         )
