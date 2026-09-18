@@ -7124,6 +7124,17 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	}
 #endif // INBAND_DELIVER_FAILBEFORE
 
+	if(rate_opt.controls_link()
+	   && !rate_opt.authorize_hard_recovery(current_configuration,
+			config_is_at_bottom(current_configuration, robust_enabled),
+			"liveness-floor-recovery"))
+	{
+		printf("[GEARSHIFT-V2-AUTHORITY] liveness hard-recovery request denied by owner; "
+			"BREAK/reset budget not advanced\n");
+		fflush(stdout);
+		return true;
+	}
+
 	if(cmd_inband_liveness_breaks >= INBAND_LIVENESS_MAX_BREAKS)
 	{
 		// Bounded escalation: repeated liveness BREAKs did not recover the link -> it is
@@ -9346,6 +9357,33 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				       consec_pure_silent_rounds, current_configuration);
 				fflush(stdout);
 				consec_pure_silent_rounds = 0;
+				if(rate_opt.controls_link())
+				{
+					int hint = config_ladder_down(current_configuration, robust_enabled);
+					if(hint != current_configuration)
+					{
+						inband_route_failure_demote(hint, "demote_silence_peer_unreachable");
+					}
+					else if(rate_opt.authorize_hard_recovery(
+						current_configuration, true, "demote_silence_peer_unreachable"))
+					{
+						emergency_previous_config = current_configuration;
+						emergency_break_active = 1;
+						emergency_break_retries = 3;
+						emergency_nack_count = 0;
+						send_break_pattern();
+						telecom_system->data_container.frames_to_read = 4;
+						calculate_receiving_timeout();
+						receiving_timer.start();
+					}
+					else
+					{
+						printf("[GEARSHIFT-V2-AUTHORITY] pure-silence reconnect request "
+							"denied by owner at cfg=%d\n", current_configuration);
+						fflush(stdout);
+					}
+					return;
+				}
 				commander_clean_reconnect("demote_silence_peer_unreachable");
 				return;
 			}
