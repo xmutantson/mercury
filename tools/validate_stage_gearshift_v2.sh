@@ -302,6 +302,56 @@ stage2_binary = STAGE2 + "/mercury"
 stage1_binary = STAGE1 + "/mercury"
 source_binary = SRC2 + "/mercury"
 NEW2 = SRC2 + ".new"
+new_binary = NEW2 + "/mercury"
+
+# Recover the known false-negative from the old post-build identity pipeline:
+# under 'set -o pipefail', 'strings mercury | grep -q BUILDID' can return 141
+# after grep finds the ID and closes the pipe, SIGPIPEing strings.  If the old
+# detached job reached Build complete + L1 PASS at the exact runtime ref, the
+# binary is already fully validated (the old job also ran the monolithic
+# mercury --test before those markers).  Adopt/stage it instead of rebuilding.
+old_status_out, _ = quiet_run(
+    "rpi2",
+    f"test -f {shlex.quote(JOB_STATUS)} && cat {shlex.quote(JOB_STATUS)} || true",
+)
+old_status = old_status_out.strip()
+if old_status == "141":
+    old_new_head_out, _ = quiet_run(
+        "rpi2",
+        f"test -d {shlex.quote(NEW2 + '/.git')} && "
+        f"git -C {shlex.quote(NEW2)} rev-parse HEAD || true",
+    )
+    old_new_head = old_new_head_out.strip().splitlines()[-1] if old_new_head_out.strip() else ""
+    old_new_sha = remote_sha("rpi2", new_binary)
+    old_new_id_ok = bool(old_new_sha and has_build_id("rpi2", new_binary))
+    _, old_markers_rc = quiet_run(
+        "rpi2",
+        f"grep -Fq '=== Build complete: mercury ===' {shlex.quote(JOB_LOG)} && "
+        f"grep -Fq '[L1-JOURNAL-TEST] PASS failures=0' {shlex.quote(JOB_LOG)}",
+    )
+
+    if old_new_head == WANT and old_new_id_ok and old_markers_rc == 0:
+        print(
+            "rpi2: recovering completed native build from rc=141 "
+            "post-build SIGPIPE false-negative; NO rebuild needed",
+            flush=True,
+        )
+        bash("rpi2", f"""
+set -Eeuo pipefail
+rm -rf {shlex.quote(SRC2)}
+mv {shlex.quote(NEW2)} {shlex.quote(SRC2)}
+install -d {shlex.quote(STAGE2)}
+install -m 0755 {shlex.quote(source_binary)} {shlex.quote(stage2_binary + ".new")}
+mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
+rm -f {shlex.quote(JOB_STATUS)} {shlex.quote(JOB_PID)} {shlex.quote(JOB_SCRIPT)}
+""")
+        print(f"rpi2: recovered/staged sha256={old_new_sha}", flush=True)
+    else:
+        print(
+            "rpi2: rc=141 status exists but recovery proof is incomplete; "
+            "will not trust or stage it automatically",
+            flush=True,
+        )
 
 # A Ctrl-C against an older foreground helper may have left a native build
 # running on rpi2. Do not start a competing compiler storm. Wait for any build
@@ -432,7 +482,7 @@ test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3
 {focused_native_test_script("./mercury")}
 test -x ./mercury
-strings ./mercury | grep -Fq {shlex.quote(SHORT)}
+grep -aFq {shlex.quote(SHORT)} ./mercury
 install -d {shlex.quote(STAGE2)}
 install -m 0755 ./mercury {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
@@ -452,7 +502,7 @@ test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
 {focused_native_test_script("./mercury")}
 test -x ./mercury
-strings ./mercury | grep -Fq {shlex.quote(SHORT)}
+grep -aFq {shlex.quote(SHORT)} ./mercury
 cd /
 rm -rf {shlex.quote(SRC2)}
 mv {shlex.quote(NEW2)} {shlex.quote(SRC2)}
@@ -474,7 +524,7 @@ test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
 {focused_native_test_script("./mercury")}
 test -x ./mercury
-strings ./mercury | grep -Fq {shlex.quote(SHORT)}
+grep -aFq {shlex.quote(SHORT)} ./mercury
 cd /
 rm -rf {shlex.quote(SRC2)}
 mv {shlex.quote(NEW2)} {shlex.quote(SRC2)}
@@ -710,7 +760,7 @@ test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3
 {focused_native_test_script("./mercury")}
 test -x ./mercury
-strings ./mercury | grep -Fq {shlex.quote(SHORT)}
+grep -aFq {shlex.quote(SHORT)} ./mercury
 install -d {shlex.quote(STAGE2)}
 install -m 0755 ./mercury {shlex.quote(stage2_binary + ".new")}
 mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
@@ -728,7 +778,7 @@ test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
 {focused_native_test_script("./mercury")}
 test -x ./mercury
-strings ./mercury | grep -Fq {shlex.quote(SHORT)}
+grep -aFq {shlex.quote(SHORT)} ./mercury
 cd /
 rm -rf {shlex.quote(SRC2)}
 mv {shlex.quote(SRC2 + ".new")} {shlex.quote(SRC2)}
