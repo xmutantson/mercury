@@ -54,14 +54,14 @@ brk = between(
 
 req("owner API declared",
     all(x in OPT_H for x in (
-        "owns_link_experiment() const",
+        "owns_link_experiment(unsigned long long now_ms = 0) const",
         "transition_matches(int from_cfg, int to_cfg) const",
         "authorize_external_transition(",
         "authorize_hard_recovery(",
     )))
 req("owner API implemented",
     all(x in OPT_CC for x in (
-        "cl_rate_optimizer::owns_link_experiment() const",
+        "cl_rate_optimizer::owns_link_experiment(unsigned long long now_ms) const",
         "cl_rate_optimizer::authorize_external_transition(",
         "cl_rate_optimizer::authorize_hard_recovery(",
     )))
@@ -77,14 +77,14 @@ req("SET_CONFIG asks owner before selecting CONFIG_TAG transport",
     a >= 0 and t >= 0 and a < t)
 
 req("generic liveness yields for full v2 experiment lifetime",
-    "rate_opt.owns_link_experiment()" in live)
+    "rate_opt.owns_link_experiment(opt_now_ms())" in live)
 req("generic liveness reports a downshift request through owner",
     'inband_route_failure_demote(lower, "liveness_stall")' in live)
 
 req("direct CONFIG_TAG execution requires matching owner",
     "rate_opt.transition_matches(current_configuration, target_cfg)" in unilateral)
 
-a = brk.find("rate_opt.owns_link_experiment()")
+a = brk.find("rate_opt.owns_link_experiment(opt_now_ms())")
 h = brk.find("rate_opt.authorize_hard_recovery(")
 p = brk.find("ptt_on();")
 req("BREAK cannot preempt owned switch/probe", a >= 0)
