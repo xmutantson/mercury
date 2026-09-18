@@ -2478,6 +2478,111 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
     return d;
 }
 
+bool cl_rate_optimizer::owns_link_experiment() const
+{
+    return mode == GEARSHIFT_V2_ACTIVE && (switch_inflight || probe_active);
+}
+
+bool cl_rate_optimizer::transition_matches(int from_cfg, int to_cfg) const
+{
+    return mode == GEARSHIFT_V2_ACTIVE && switch_inflight &&
+           switch_from_cfg == from_cfg && switch_to_cfg == to_cfg;
+}
+
+int cl_rate_optimizer::authorize_external_transition(
+        int from_cfg, int requested_to_cfg, const char* reason,
+        unsigned long long now_ms, bool is_nb)
+{
+    if (mode != GEARSHIFT_V2_ACTIVE) return requested_to_cfg;
+    if (requested_to_cfg == from_cfg) return requested_to_cfg;
+    if (transition_matches(from_cfg, requested_to_cfg)) return requested_to_cfg;
+
+    const char* why = (reason && *reason) ? reason : "unspecified";
+    if (switch_inflight) {
+        std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK external Axis-1 request %d->%d "
+                    "reason=%s: live owner=%d->%d action=%s\n",
+                    from_cfg, requested_to_cfg, why,
+                    switch_from_cfg, switch_to_cfg, action_name(switch_action));
+        std::fflush(stdout);
+        return -1;
+    }
+
+    const int from_rank = gearshift_action_rank(from_cfg);
+    int target_cfg = requested_to_cfg;
+    e_gearshift_v2_action action = GEARSHIFT_ACTION_SWITCH;
+    int fallback_cfg = requested_to_cfg;
+
+    // During confirmed probe probation, a foreign failure signal may REQUEST a
+    // recovery, but Gearshift-v2 owns the answer: rollback to the probe's own
+    // fallback rather than accepting an arbitrary legacy target.
+    if (probe_active) {
+        if (probe_target_cfg != from_cfg || probe_fallback_cfg < 0) {
+            std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK external Axis-1 request %d->%d "
+                        "reason=%s: probe owner target=%d fallback=%d\n",
+                        from_cfg, requested_to_cfg, why,
+                        probe_target_cfg, probe_fallback_cfg);
+            std::fflush(stdout);
+            return -1;
+        }
+        target_cfg = probe_fallback_cfg;
+        fallback_cfg = probe_fallback_cfg;
+        action = GEARSHIFT_ACTION_ROLLBACK;
+    } else {
+        // Legacy safety controllers are telemetry producers only under ACTIVE.
+        // They may request a downshift; they may never invent an upward move.
+        if (gearshift_action_rank(target_cfg) >= from_rank) {
+            std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK external non-downshift %d->%d "
+                        "reason=%s: ACTIVE owns all upward/hold decisions\n",
+                        from_cfg, target_cfg, why);
+            std::fflush(stdout);
+            return -1;
+        }
+    }
+
+    st_rate_decision d;
+    d.action = action;
+    d.current_cfg = from_cfg;
+    d.target_cfg = target_cfg;
+    d.fallback_cfg = fallback_cfg;
+    d.actionable = true;
+    d.reason = std::string("external-failure-signal:") + why;
+    last_v2_decision = d;
+
+    notify_switch_dispatched(from_cfg, target_cfg, action, fallback_cfg,
+                             now_ms, is_nb);
+    std::printf("[GEARSHIFT-V2-AUTHORITY] AUTH external failure signal reason=%s "
+                "requested=%d->%d owned=%d->%d action=%s\n",
+                why, from_cfg, requested_to_cfg, from_cfg, target_cfg,
+                action_name(action));
+    std::fflush(stdout);
+    return target_cfg;
+}
+
+bool cl_rate_optimizer::authorize_hard_recovery(
+        int current_cfg, bool at_bottom, const char* reason) const
+{
+    if (mode != GEARSHIFT_V2_ACTIVE) return true;
+    const char* why = (reason && *reason) ? reason : "unspecified";
+    if (switch_inflight || probe_active) {
+        std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK hard recovery at cfg=%d reason=%s: "
+                    "Gearshift experiment owns link (switch=%d probe=%d)\n",
+                    current_cfg, why, switch_inflight ? 1 : 0, probe_active ? 1 : 0);
+        std::fflush(stdout);
+        return false;
+    }
+    if (!at_bottom) {
+        std::printf("[GEARSHIFT-V2-AUTHORITY] BLOCK hard recovery at cfg=%d reason=%s: "
+                    "lower Gearshift action remains available\n",
+                    current_cfg, why);
+        std::fflush(stdout);
+        return false;
+    }
+    std::printf("[GEARSHIFT-V2-AUTHORITY] AUTH hard recovery at floor cfg=%d reason=%s\n",
+                current_cfg, why);
+    std::fflush(stdout);
+    return true;
+}
+
 void cl_rate_optimizer::notify_switch_dispatched(
         int from_cfg, int to_cfg, e_gearshift_v2_action action,
         int fallback_cfg, unsigned long long now_ms, bool is_nb)
