@@ -6815,7 +6815,7 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	// The generic poll-count watchdog is telemetry-only while a switch is in flight OR
 	// a confirmed probe remains in probation. It may not reinterpret Gearshift's own
 	// bounded zero-progress window as link death.
-	if(rate_opt.owns_link_experiment())
+	if(rate_opt.owns_link_experiment(opt_now_ms()))
 	{
 		if(cmd_inband_liveness_no_progress_polls != 0)
 		{
@@ -6943,18 +6943,47 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	cmd_inband_liveness_no_progress_polls = 0;   // re-arm the window for any next stall
 
 	// Under ACTIVE this is a FAILURE SIGNAL, not an independent recovery decision.
-	// Ask Gearshift for a lower action while any lower rung exists. Only the actual
-	// ladder floor is eligible to continue to the hard-recovery path below.
+	// If probe probation has exhausted its OWN zero-progress deadline, route the
+	// signal to the probe owner, which may only choose its declared fallback.
+	// Otherwise record one outcome-only failed transaction and run the full v2
+	// selector. The watchdog never nominates a rung.
 	if(rate_opt.controls_link())
 	{
-		int lower = config_ladder_down(current_configuration, robust_enabled);
-		if(lower != current_configuration)
+		if(rate_opt.probe_is_active())
 		{
-			printf("[GEARSHIFT-V2-AUTHORITY] liveness stall reports failure at cfg=%d; "
-				"requesting owner recovery toward %d\n", current_configuration, lower);
+			int hint = config_ladder_down(current_configuration, robust_enabled);
+			printf("[GEARSHIFT-V2-AUTHORITY] liveness signal after owner probation deadline "
+				"at cfg=%d; requesting probe-owned resolution\n", current_configuration);
 			fflush(stdout);
-			return inband_route_failure_demote(lower, "liveness_stall");
+			if(hint != current_configuration)
+				return inband_route_failure_demote(hint, "liveness_stall_after_probe_budget");
 		}
+
+		opt_record_batch(/*transport_bytes_banked=*/0, /*sack_used=*/false,
+			/*failed=*/true, /*frames_acked=*/0, /*frames_sent_override=*/1,
+			/*outcome_only=*/true);
+		int owner_target = current_configuration;
+		if(opt_evaluate_batch_end(&owner_target)
+		   && owner_target != current_configuration)
+		{
+			opt_pending_switch_cfg = owner_target;
+			printf("[GEARSHIFT-V2-AUTHORITY] liveness telemetry -> owner selected "
+				"%d->%d action=%d; generic BREAK suppressed\n",
+				current_configuration, owner_target, (int)opt_pending_switch_action);
+			fflush(stdout);
+			return true;
+		}
+		if(!config_is_at_bottom(current_configuration, robust_enabled))
+		{
+			printf("[GEARSHIFT-V2-AUTHORITY] liveness telemetry -> owner HOLD/ABSTAIN "
+				"at cfg=%d above floor; generic BREAK suppressed\n",
+				current_configuration);
+			fflush(stdout);
+			return true;
+		}
+		// At the actual floor, fall through to the recovery actuator. The
+		// send_break_pattern() chokepoint still requires Gearshift's explicit
+		// no-admissible-candidate verdict before RF emission.
 	}
 
 #ifdef INBAND_LIVENESS_FAILBEFORE
