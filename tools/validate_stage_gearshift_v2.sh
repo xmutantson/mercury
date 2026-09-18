@@ -49,8 +49,9 @@ if [ -f GEARSHIFT_V2_SOURCE_IDENTITY.txt ]; then
 fi
 
 BRANCH="$(git branch --show-current)"
-if [ "$BRANCH" != "gearshift-v2" ]; then
-    echo "ERROR: expected branch gearshift-v2, got: ${BRANCH:-DETACHED}"
+EXPECTED_BRANCH="${QUICKSILVER_GS2_BRANCH:-gearshift-v2-single-owner}"
+if [ "$BRANCH" != "$EXPECTED_BRANCH" ]; then
+    echo "ERROR: expected branch $EXPECTED_BRANCH, got: ${BRANCH:-DETACHED}"
     exit 1
 fi
 
@@ -61,6 +62,7 @@ if [ "${QUICKSILVER_SKIP_LOCAL_TESTS:-0}" = "1" ]; then
 else
     tests/cpu/run_gearshift_tests.sh
 fi
+python3 tools/audit_gearshift_v2_single_owner.py
 
 echo
 echo "=== 2. Runtime feature-gate inventory ==="
@@ -131,6 +133,7 @@ FOCUSED_NATIVE_TESTS = [
     "--test-inband-drop",
     "--test-inband-tier-crossing",
     "--test-inband-reannounce",
+    "--test-inband-liveness",
 ]
 
 
@@ -640,7 +643,7 @@ mv {shlex.quote(stage2_binary + ".new")} {shlex.quote(stage2_binary)}
 set -Eeuo pipefail
 trap 'rc=$?; echo "$rc" > {shlex.quote(JOB_STATUS)}' EXIT
 cd {shlex.quote(NEW2)}
-git fetch origin gearshift-v2
+git fetch origin {shlex.quote(WANT)}
 git checkout --detach {shlex.quote(WANT)}
 test "$(git rev-parse HEAD)" = {shlex.quote(WANT)}
 MERCURY_BUILD_JOBS=4 MERCURY_BUILD_ID={shlex.quote(SHORT)} bash ./build.sh o3 clean
