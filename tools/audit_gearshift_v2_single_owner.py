@@ -70,6 +70,9 @@ a = demote.find("authorize_external_transition(")
 m = demote.find("restage_requeue_tx_messages()")
 req("failure demote asks owner before mutating payload/config state",
     a >= 0 and m >= 0 and a < m)
+req("foreign demote target is telemetry only; full v2 evaluator selects destination",
+    "opt_evaluate_batch_end(&owner_target)" in demote
+    and "owner selected %d->%d" in demote)
 
 a = setcfg.find("authorize_external_transition(")
 t = setcfg.find("inband_unilateral_config_change(")
@@ -83,11 +86,19 @@ req("generic liveness reports a downshift request through owner",
 
 req("direct CONFIG_TAG execution requires matching owner",
     "rate_opt.transition_matches(current_configuration, target_cfg)" in unilateral)
+req("foreign transition API refuses idle legacy-selected targets",
+    "telemetry-only; Gearshift must select destination" in OPT_CC)
+req("floor BREAK requires Gearshift no-admissible-candidate verdict",
+    'last_v2_decision.reason == "no-admissible-candidate"' in OPT_CC)
+req("owned CONFIG_TAG fallback is explicitly marked",
+    'climb_unfollowable_autodemote", true, true' in COMMON
+    and 'nack_accelerated_demote", true, true' in COMMON)
 
 a = brk.find("rate_opt.owns_link_experiment(opt_now_ms())")
 h = brk.find("rate_opt.authorize_hard_recovery(")
 p = brk.find("ptt_on();")
-req("BREAK cannot preempt owned switch/probe", a >= 0)
+req("BREAK cannot preempt owned switch/probe", a >= 0
+    and "rate_opt.owns_link_experiment(opt_now_ms())" in brk)
 req("BREAK hard recovery is owner-authorized before RF emission",
     h >= 0 and p >= 0 and h < p)
 req("above-floor BREAK is converted to owner-mediated demote",
