@@ -50,7 +50,11 @@ fi
 
 echo
 echo "=== 1. Local CPU validation ==="
-tests/cpu/run_gearshift_tests.sh
+if [ "${QUICKSILVER_SKIP_LOCAL_TESTS:-0}" = "1" ]; then
+    echo "SKIP: local CPU validation explicitly skipped for resume"
+else
+    tests/cpu/run_gearshift_tests.sh
+fi
 
 echo
 echo "=== 2. Runtime feature-gate inventory ==="
@@ -58,7 +62,33 @@ python3 tools/audit_default_off_features.py > "/tmp/quicksilver-default-off-${SH
 echo "saved /tmp/quicksilver-default-off-${SHORT}.md"
 
 echo
-echo "=== 3. Resume/build/stage on Pis ==="
+echo "=== 3. Locate ionos_butler ==="
+
+if python3 -c 'import ionos_butler' >/dev/null 2>&1; then
+    echo "ionos_butler already importable"
+else
+    IONOS_BUTLER_PY="${IONOS_BUTLER_PY:-}"
+    if [ -z "$IONOS_BUTLER_PY" ]; then
+        IONOS_BUTLER_PY="$(
+            find "$HOME" -maxdepth 7 -type f -name ionos_butler.py -print -quit 2>/dev/null || true
+        )"
+    fi
+
+    if [ -z "$IONOS_BUTLER_PY" ] || [ ! -f "$IONOS_BUTLER_PY" ]; then
+        echo "ERROR: ionos_butler.py not found under $HOME"
+        echo "Set IONOS_BUTLER_PY=/full/path/to/ionos_butler.py and rerun."
+        exit 1
+    fi
+
+    IONOS_BUTLER_DIR="$(dirname "$IONOS_BUTLER_PY")"
+    export PYTHONPATH="$IONOS_BUTLER_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    echo "ionos_butler: $IONOS_BUTLER_PY"
+
+    python3 -c 'import ionos_butler; print("ionos_butler import PASS")'
+fi
+
+echo
+echo "=== 4. Resume/build/stage on Pis ==="
 
 WANT="$WANT" SHORT="$SHORT" python3 - <<'PY'
 import base64
@@ -242,7 +272,7 @@ print("Existing knee campaign was NOT stopped.")
 PY
 
 echo
-echo "=== 4. Installed vs staged runtime inspection ==="
+echo "=== 5. Installed vs staged runtime inspection ==="
 python3 - <<'PY'
 import ionos_butler as B
 
@@ -263,7 +293,7 @@ for pi in ("rpi1", "rpi2"):
 PY
 
 echo
-echo "=== 5. Existing knee campaign — inspection only ==="
+echo "=== 6. Existing knee campaign — inspection only ==="
 if [ -f "$HOME/.quicksilver_gearshift_v2_knee_root" ]; then
     ROOT="$(cat "$HOME/.quicksilver_gearshift_v2_knee_root")"
     echo "KNEE_ROOT=$ROOT"
