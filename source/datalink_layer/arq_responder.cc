@@ -7575,6 +7575,12 @@ int cl_arq_controller::test_inband_no_break()
 		cmd->narrowband_enabled = NO;
 		cmd->role = COMMANDER;
 		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
+		// cl_arq_controller starts with current_configuration=CONFIG_0. Without
+		// forcing a transition, make_cmd(CONFIG_0) would let load_configuration()
+		// short-circuit before init_messages_buffers(), and the A0 SET_CONFIG test
+		// would exercise the synthetic NULL-buffer guard instead of production.
+		cmd->current_configuration = CONFIG_NONE;
+		ts->current_configuration = CONFIG_NONE;
 		cmd->load_configuration(cfg, FULL, NO);
 		cmd->link_status = CONNECTED;
 		cmd->connection_status = TRANSMITTING_DATA;
@@ -8396,6 +8402,11 @@ int cl_arq_controller::test_inband_retag()
 		rx->rsp_last_delivered_batch_seq_id = (climb_bsi - 1) & 0xFF;
 		check(rx->current_configuration == CFG_LO, "A7 RX starts at CONFIG_9",
 			rx->current_configuration, CFG_LO);
+		// This fixture injects ONLY the CONFIG_TAG burst, not a simultaneous OFDM
+		// frame/preamble. The production clean-lock adopt gate therefore has no
+		// OFDM acquisition to validate. Arm the existing one-shot synchronization
+		// bypass so this test remains scoped to CONFIG_TAG decode/follow coherence.
+		rx->scream_reentry_listen_armed = true;
 
 		// W1: build the climb tag (CONFIG_11) — the SAME tones+keyer the production emit
 		// produces. Parity 1 (the first change after a fresh ctor flips 0->1).
@@ -8955,6 +8966,10 @@ int cl_arq_controller::test_inband_nack()
 		cl_arq_controller* rx = make_rx(CFG_LO);
 		rx->rsp_current_expected_batch_seq_id = 9;
 		cl_telecom_system* ts_rx = rx->telecom_system;
+		// Tag-only synthetic fixture: no OFDM preamble exists in this snapshot.
+		// Use the production one-shot re-entry bypass so the assertion tests
+		// CONFIG_TAG follow/no-chatter rather than the independent clean-lock gate.
+		rx->scream_reentry_listen_armed = true;
 
 		// Build a NORMAL, adoptable CONFIG_11 tag (CONFIG_9 -> CONFIG_11 climb the RX CAN follow).
 		int tones[gf16ra::GF16RA_MAX_N]; int n_tones = 0; uint8_t bsi_lsb = 0;
