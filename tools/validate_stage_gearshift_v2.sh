@@ -31,9 +31,16 @@ if ! git diff --quiet -- || ! git diff --cached --quiet --; then
     exit 1
 fi
 
-unexpected_untracked="$(
-    git ls-files --others --exclude-standard |
-    grep -v '^GEARSHIFT_V2_SOURCE_IDENTITY\.txt
+unexpected_untracked="$(git ls-files --others --exclude-standard | grep -vF 'GEARSHIFT_V2_SOURCE_IDENTITY.txt' || true)"
+if [ -n "$unexpected_untracked" ]; then
+    echo "ERROR: unexpected untracked files present; refusing ambiguous source."
+    printf '%s\n' "$unexpected_untracked"
+    exit 1
+fi
+
+if [ -f GEARSHIFT_V2_SOURCE_IDENTITY.txt ]; then
+    echo "Preserving bootstrap identity marker: GEARSHIFT_V2_SOURCE_IDENTITY.txt"
+fi
 
 BRANCH="$(git branch --show-current)"
 if [ "$BRANCH" != "gearshift-v2" ]; then
