@@ -125,6 +125,15 @@ req("legacy demote requests are telemetry-only outside owned fallback",
     "telemetry failure reason=" in demote
     and "opt_evaluate_batch_end(&owner_target)" in demote)
 
+req("liveness hard reset consumes owner authorization before DROPPED",
+    '"liveness-floor-recovery"' in live
+    and "authorize_hard_recovery" in live
+    and live.find("authorize_hard_recovery") < live.find("link_status = DROPPED"))
+req("pure-silence reconnect is not an independent ACTIVE recovery authority",
+    '"demote_silence_peer_unreachable"' in CMD
+    and "pure-silence reconnect request" in CMD
+    and "rate_opt.authorize_hard_recovery" in CMD)
+
 if failed:
     print(f"[GS2-OWNER-AUDIT] FAILURES={len(failed)}")
     sys.exit(1)
