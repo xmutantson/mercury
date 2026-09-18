@@ -13,14 +13,20 @@ if [ -z "$REPO" ]; then
 fi
 cd "$REPO"
 
-WANT="$(git rev-parse HEAD)"
-SHORT="$(git rev-parse --short=8 HEAD)"
+CONTROL_HEAD="$(git rev-parse HEAD)"
+WANT="${QUICKSILVER_RUNTIME_REF:-$(git rev-list -1 HEAD -- source include build.sh tests/cpu)}"
+if [ -z "$WANT" ]; then
+    echo "ERROR: could not resolve runtime-relevant Gearshift-v2 commit."
+    exit 1
+fi
+SHORT="${WANT:0:8}"
 
 trap 'rc=$?; printf "\n[FAIL] line %s, rc=%s\n" "$LINENO" "$rc"; exit "$rc"' ERR
 
 echo "============================================================"
 echo " Quicksilver Gearshift-v2 validation/staging"
-echo " commit: $WANT"
+echo " helper head:  $CONTROL_HEAD"
+echo " runtime ref:  $WANT"
 echo "============================================================"
 
 # Reject tracked/staged source modifications, but preserve the bootstrap
@@ -241,6 +247,44 @@ stage2_binary = STAGE2 + "/mercury"
 stage1_binary = STAGE1 + "/mercury"
 source_binary = SRC2 + "/mercury"
 NEW2 = SRC2 + ".new"
+
+# A Ctrl-C against an older foreground helper may have left a native build
+# running on rpi2. Do not start a competing compiler storm. Wait for any build
+# whose cwd is one of our Gearshift-v2 build workspaces, with visible progress.
+legacy_cmd = r"""for p in /proc/[0-9]*; do
+    pid=${p##*/}
+    cwd=$(readlink "$p/cwd" 2>/dev/null || true)
+    case "$cwd" in
+      /home/rpi2/quicksilver-gs2-build-*)
+        cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+        case "$cmd" in
+          *build.sh*|*make*|*g++*|*gcc*|*clang*|*cmake*|*ninja*)
+            printf '%s|%s|%s\n' "$pid" "$cwd" "$cmd"
+            ;;
+        esac
+        ;;
+    esac
+done"""
+
+while True:
+    legacy_out, _ = quiet_run("rpi2", legacy_cmd)
+    legacy_lines = [x for x in legacy_out.splitlines() if x.strip()]
+    # Ignore our own durable job if this script is reattaching to it.
+    job_pid_out, _ = quiet_run(
+        "rpi2",
+        f"test -f {shlex.quote(JOB_PID)} && cat {shlex.quote(JOB_PID)} || true",
+    )
+    own_pid = job_pid_out.strip()
+    legacy_lines = [
+        x for x in legacy_lines
+        if not own_pid or not x.startswith(own_pid + "|")
+    ]
+    if not legacy_lines:
+        break
+    print("rpi2: older native build still active; waiting rather than starting another:", flush=True)
+    for line in legacy_lines[:8]:
+        print("  " + line, flush=True)
+    time.sleep(5)
 
 s2_sha = remote_sha("rpi2", stage2_binary)
 s2_valid = bool(s2_sha and has_build_id("rpi2", stage2_binary))
