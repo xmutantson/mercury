@@ -286,12 +286,18 @@ echo "=== launch fresh WGN25 window 1 ==="
 PID="$(cat "$ROOT/canary.pid")"
 
 # Hard gate: actual child processes must again prove ACTIVE env + new binary MD5.
-for _ in $(seq 1 120); do
+# Bench startup can legitimately take >3 minutes before the modem children exist,
+# so do not treat a 120 s preflight as a controller failure.
+for n in $(seq 1 420); do
     kill -0 "$PID" 2>/dev/null || { tail -150 "$ROOT/canary.log" || true; die "canary exited"; }
     [[ -f "$ROOT/ACTIVE_ENV_VERIFIED.json" ]] && break
+    if (( n % 15 == 0 )); then
+        echo "waiting for ACTIVE verifier... ${n}s"
+        tail -3 "$ROOT/canary.log" 2>/dev/null || true
+    fi
     sleep 1
 done
-[[ -f "$ROOT/ACTIVE_ENV_VERIFIED.json" ]] || die "ACTIVE environment never verified"
+[[ -f "$ROOT/ACTIVE_ENV_VERIFIED.json" ]] || die "ACTIVE environment never verified after 420s"
 jq -e --arg m "$R2_MD5" '.verified == true and .mode == "active" and .deploy_md5 == $m' \
     "$ROOT/ACTIVE_ENV_VERIFIED.json" >/dev/null || die "ACTIVE verifier identity mismatch"
 
@@ -318,10 +324,15 @@ test \"\$ok\" = 1
 done
 
 # Wait only until the first actual scored measurement phase is entered.
-for _ in $(seq 1 120); do
+for n in $(seq 1 300); do
     S="$(ls "$ROOT"/runtime_status*.json 2>/dev/null | head -1 || true)"
     if [[ -n "$S" ]] && jq -e '.phase=="measurement-window" and .profile=="WGN" and .dial==25 and .window==1' "$S" >/dev/null 2>&1; then
         break
+    fi
+    kill -0 "$PID" 2>/dev/null || { tail -150 "$ROOT/canary.log" || true; die "canary exited before WGN25 measurement"; }
+    if (( n % 15 == 0 )); then
+        echo "waiting for WGN25 measurement-window... ${n}s"
+        [[ -n "$S" ]] && jq '{phase,profile,dial,window,attempt}' "$S" 2>/dev/null || true
     fi
     sleep 1
 done
