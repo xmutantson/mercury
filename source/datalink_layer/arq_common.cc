@@ -19714,7 +19714,7 @@ void cl_arq_controller::send_break_pattern()
 		const bool at_bottom = config_is_at_bottom(current_configuration, robust_enabled);
 		if(!at_bottom)
 		{
-			if(rate_opt.owns_link_experiment())
+			if(rate_opt.owns_link_experiment(opt_now_ms()))
 			{
 				rate_opt.authorize_hard_recovery(current_configuration, false,
 					"legacy-break-request-during-owned-experiment");
