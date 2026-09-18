@@ -300,6 +300,38 @@ while True:
         print("  " + line, flush=True)
     time.sleep(5)
 
+# Adopt the newest inactive legacy clone if this runtime-ref workspace does not
+# exist yet. This avoids downloading the repository again after helper-only
+# revisions changed the old workspace suffix.
+adopt_script = f"""
+set -Eeuo pipefail
+if ! test -d {shlex.quote(SRC2 + '/.git')} && ! test -d {shlex.quote(NEW2 + '/.git')}; then
+    candidate=""
+    for d in $(ls -1dt /home/rpi2/quicksilver-gs2-build-* 2>/dev/null || true); do
+        test "$d" = {shlex.quote(SRC2)} && continue
+        test "$d" = {shlex.quote(NEW2)} && continue
+        if test -d "$d/.git"; then
+            candidate="$d"
+            break
+        fi
+    done
+    if test -n "$candidate"; then
+        echo "ADOPT:$candidate"
+        mv "$candidate" {shlex.quote(NEW2)}
+    fi
+fi
+"""
+adopt_out, adopt_rc = quiet_run("rpi2", adopt_script)
+if adopt_rc != 0:
+    raise RuntimeError(f"rpi2: legacy clone adoption failed rc={adopt_rc}")
+for line in adopt_out.splitlines():
+    if line.startswith("ADOPT:"):
+        print(
+            "rpi2: adopting existing clone into stable runtime workspace: "
+            + line.split(":", 1)[1],
+            flush=True,
+        )
+
 s2_sha = remote_sha("rpi2", stage2_binary)
 s2_valid = bool(s2_sha and has_build_id("rpi2", stage2_binary))
 print(f"rpi2 initial staged valid={s2_valid} sha256={s2_sha}")
