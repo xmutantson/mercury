@@ -7982,6 +7982,50 @@ int cl_arq_controller::test_inband_liveness()
 			"test-probation-break"),
 			"B5.8 hard recovery is refused while Gearshift owns probe probation",
 			0, 0);
+
+		const unsigned long long owner_deadline =
+			1000ULL + (unsigned long long)cmd->rate_opt.get_policy().probe_zero_progress_ms + 1001ULL;
+		check(!cmd->rate_opt.owns_link_experiment(owner_deadline),
+			"B5.9 probe ownership releases only after Gearshift's own zero-progress deadline",
+			cmd->rate_opt.owns_link_experiment(owner_deadline) ? 1 : 0, 0);
+		int rollback = cmd->rate_opt.authorize_external_transition(
+			CONFIG_11, CONFIG_9, "test-post-owner-deadline", owner_deadline, false);
+		check(rollback == CONFIG_10,
+			"B5.10 post-deadline failure signal rolls back to Gearshift fallback, not foreign hint",
+			rollback, CONFIG_10);
+		check(cmd->rate_opt.transition_matches(CONFIG_11, CONFIG_10),
+			"B5.11 rollback is a new Gearshift-owned transition",
+			cmd->rate_opt.transition_matches(CONFIG_11, CONFIG_10) ? 1 : 0, 1);
+		cmd->rate_opt.notify_switch_confirmed(owner_deadline + 1);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART B6 — FOREIGN TARGETS ARE TELEMETRY ONLY: with no live experiment,
+	// legacy code cannot nominate a rung or sneak one through SET_CONFIG.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+
+		int foreign = cmd->rate_opt.authorize_external_transition(
+			CONFIG_10, CONFIG_9, "test-foreign-target", 1000, false);
+		check(foreign < 0,
+			"B6.1 idle ACTIVE owner rejects a foreign-selected downshift target",
+			foreign < 0 ? 1 : 0, 1);
+
+		cmd->negotiated_configuration = CONFIG_9;
+		int rc = cmd->add_message_control(SET_CONFIG);
+		check(rc == ERROR_,
+			"B6.2 SET_CONFIG chokepoint rejects an unowned foreign transition",
+			rc, ERROR_);
+		check(cmd->current_configuration == CONFIG_10,
+			"B6.3 rejected foreign SET_CONFIG leaves live config unchanged",
+			cmd->current_configuration, CONFIG_10);
+		check(cmd->send_break_pattern_count == 0,
+			"B6.4 foreign target rejection emits no BREAK",
+			cmd->send_break_pattern_count, 0);
 		delete cmd; delete ts;
 	}
 
