@@ -7328,6 +7328,10 @@ public:
   bool passive_monitor;  // Third-party monitor mode: accept all frames, never TX
   bool monitor_stdout;   // Output decoded plaintext to stdout (headless monitor)
   int monitor_consec_ofdm_fail{0};  // Consecutive OFDM decode failures (for opportunistic scan)
+  // Keep an acquisition-failure episode observable without making diagnostic
+  // stdout a real-time workload. Reset by a CRC-good OFDM frame; the failure
+  // path reports only powers of two from a continuous episode.
+  unsigned long long ftr_fail_diag_run{0};
 
   // Parallel monitor decoders — one cl_telecom_system per OFDM config.
   // All share the same-sized audio buffer (buffer_Nsymb_min override).

@@ -23314,6 +23314,7 @@ void cl_arq_controller::receive()
 
 				// Opportunistic scan success: reset failure counter
 				if(passive_monitor) monitor_consec_ofdm_fail = 0;
+				ftr_fail_diag_run = 0;
 
 				if(g_verbose)
 				{
@@ -24205,14 +24206,19 @@ void cl_arq_controller::receive()
 				// Suppress during rapid same-mod opportunistic scan (ftr==0)
 				if(ftr > 0)
 				{
-					printf("[FTR-FAIL] CONFIG_%d ftr=%d delay=%d metric=%.3f batch=%d search_raw=%d consec_fail=%d\n",
-						current_configuration, ftr,
-						received_message_stats.delay,
-						telecom_system->receive_stats.coarse_metric,
-						telecom_system->receive_stats.ofdm_batch_active ? 1 : 0,
-						telecom_system->receive_stats.ofdm_search_raw,
-						passive_monitor ? monitor_consec_ofdm_fail : -1);
-					fflush(stdout);
+					const unsigned long long run_n = ++ftr_fail_diag_run;
+					if((run_n & (run_n - 1ULL)) == 0)
+					{
+						printf("[FTR-FAIL] CONFIG_%d ftr=%d delay=%d metric=%.3f batch=%d search_raw=%d consec_fail=%d run=%llu\n",
+							current_configuration, ftr,
+							received_message_stats.delay,
+							telecom_system->receive_stats.coarse_metric,
+							telecom_system->receive_stats.ofdm_batch_active ? 1 : 0,
+							telecom_system->receive_stats.ofdm_search_raw,
+							passive_monitor ? monitor_consec_ofdm_fail : -1,
+							run_n);
+						fflush(stdout);
+					}
 				}
 			}
 

@@ -2395,6 +2395,12 @@ ladder_probe_confirmed:
     const bool force_lower_for_failure =
         obs.failed_batch_rate >= policy.failure_direct_threshold &&
         obs.frame_success_rate <= 0.0;
+    const st_online_rate_model* current_regime_model =
+        online_model_const(obs.current_cfg, obs.is_nb);
+    const bool current_regime_mature = current_regime_model &&
+        current_regime_model->context_generation == context_generation &&
+        current_regime_model->application_samples >= policy.probe_min_application_samples &&
+        current_regime_model->outcome_samples >= policy.probe_min_outcome_samples;
     for (size_t i=0; i<candidates.size(); ++i) {
         const int cfg = candidates[i];
         if (cfg == obs.current_cfg || cfg < 0 ||
@@ -2418,8 +2424,7 @@ ladder_probe_confirmed:
         // application and outcome population. This absorbs a one-batch dropout
         // without making historical uncertainty a permanent veto on coasting.
         const bool lower_probe_ready = lower && cfg == next_feasible_lower_rung &&
-            current.live_samples >= policy.probe_min_application_samples &&
-            obs.outcome_samples >= policy.probe_min_outcome_samples;
+            current_regime_mature;
         if (upward && tick_counter < upward_probe_suppressed_until_tick &&
             !p.direct_evidence) continue;
 

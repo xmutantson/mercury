@@ -3064,9 +3064,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					pb_data += v*v;
 				}
 				pb_data = (d_count > 0) ? pb_data / d_count : 0.0;
-				printf("[ENERGY-DIAG] pream: pb=%.4e bb=%.4e | data: pb=%.4e bb=%.4e | delay=%d data_off=%d buf=%d\n",
-					pb_pream, bb_pream, pb_data, data_e, receive_stats.delay, data_offset, buf_samples_de);
-				fflush(stdout);
+				if(g_verbose)
+				{
+					printf("[ENERGY-DIAG] pream: pb=%.4e bb=%.4e | data: pb=%.4e bb=%.4e | delay=%d data_off=%d buf=%d\n",
+						pb_pream, bb_pream, pb_data, data_e, receive_stats.delay, data_offset, buf_samples_de);
+					fflush(stdout);
+				}
 
 				// A reverse MFSK control/BREAK burst can false-lock the forward
 				// OFDM detector. Reject its high in-band/passband preamble ratio
@@ -3555,10 +3558,13 @@ skip_h_retry_point:
 							if((force_test_shift && fwd == fine_energy_test_force_shift_symbols * sym_samples)
 							   || (emaxC > energy_gate_floor && eminC >= REL_ALPHA * emaxC))
 							{
-								printf("[FINE-ENERGY-REL] delay %d->%d (fwd %d sym, Emin/Emax=%.3f)\n",
-									orig_delay, candidate, fwd / sym_samples,
-									(emaxC > 0.0 ? eminC/emaxC : 0.0));
-								fflush(stdout);
+								if(g_verbose)
+								{
+									printf("[FINE-ENERGY-REL] delay %d->%d (fwd %d sym, Emin/Emax=%.3f)\n",
+										orig_delay, candidate, fwd / sym_samples,
+										(emaxC > 0.0 ? eminC/emaxC : 0.0));
+									fflush(stdout);
+								}
 								receive_stats.delay = candidate;
 								fine_energy_last_shift_symbols = fwd / sym_samples;
 								break;
@@ -4117,14 +4123,20 @@ skip_h_retry_point:
 							receive_stats.delay = best_delay;
 							goto ofdm_subpeak_retry_point;  // ONE re-decode at the refined delay
 						}
-						printf("[XCORR-RESCUE-FAIL] trial %d old=%d best=%d meanH %.3f->%.3f C %.3f->%.3f (below floor %.2f cohacc %.2f)\n",
-							receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, coh_C, best_C, subpeak_rescue_floor, subpeak_coh_accept);
-						fflush(stdout);
+						if(g_verbose)
+						{
+							printf("[XCORR-RESCUE-FAIL] trial %d old=%d best=%d meanH %.3f->%.3f C %.3f->%.3f (below floor %.2f cohacc %.2f)\n",
+								receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, coh_C, best_C, subpeak_rescue_floor, subpeak_coh_accept);
+							fflush(stdout);
+						}
 						receive_stats.delay = orig_delay;  // restore; fall through to the reject
 					}
-					printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
-						receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
-					fflush(stdout);
+					if(g_verbose)
+					{
+						printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
+							receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
+						fflush(stdout);
+					}
 					// P1 ACQ BAND-EXCLUSION (DEFAULT-ON, =0 disables). Record this rejected
 					// delay as a band center; if it lands inside an ALREADY-recorded
 					// band (a confirmed repeat re-pick — the storm's absorbing

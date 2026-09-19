@@ -19,6 +19,7 @@ arqh = text("include/datalink_layer/arq.h")
 cmd = text("source/datalink_layer/arq_commander.cc")
 rsp = text("source/datalink_layer/arq_responder.cc")
 common = text("source/datalink_layer/arq_common.cc")
+telecom = text("source/physical_layer/telecom_system.cc")
 defines = text("include/common/common_defines.h")
 roh = text("include/datalink_layer/rate_optimizer.h")
 ro = text("source/datalink_layer/rate_optimizer.cc")
@@ -60,6 +61,12 @@ req("primitive-trace-is-not-production-hot-path",
 req("active-production-window-trace-is-not-hot-path",
     allin(arqh, "rate_opt.get_mode() != GEARSHIFT_V2_ACTIVE", "[OPT-WINDOW]", "opt_primitive_trace_enabled"),
     "ACTIVE normal operation does not pay a printf+fflush every third batch; legacy/shadow/calibration retain diagnostics")
+req("receiver-failure-diagnostics-cannot-amplify-a-realtime-stall",
+    allin(arqh, "ftr_fail_diag_run", "reports only powers of two") and
+    allin(common, "ftr_fail_diag_run = 0", "run_n & (run_n - 1ULL)", "run=%llu") and
+    allin(telecom, "if(g_verbose)", "[ENERGY-DIAG]", "[FINE-ENERGY-REL]",
+          "[XCORR-RESCUE-FAIL]", "[SUBPEAK-REJECT]"),
+    "a continuous timing-recovery failure remains logarithmically observable while detailed per-attempt PHY diagnostics are opt-in, so stdout flushing cannot become a competing realtime workload")
 req("primitive-ledger-carries-attempt-lineage-and-generation",
     allin(arqh, "lineage_valid=%d", "new_sent=%u", "repair_sent=%u", "cfg_gen=%u", "unit_id=%llu", "dir=forward") and
     allin(cal, "lineage_valid", "new_sent", "repair_sent", "config_generation", "application_unit_id", "direction"),
@@ -298,8 +305,9 @@ req("ordinary-coast-is-risk-adjusted",
           "obs.frame_success_rate <= 0.0",
           "Partial/transient loss stays in the confidence/probation path",
           "lower_probe_ready", "lower-information-probe",
-          "current.live_samples >= policy.probe_min_application_samples",
-          "obs.outcome_samples >= policy.probe_min_outcome_samples") and
+          "current_regime_model->context_generation == context_generation",
+          "current_regime_model->application_samples >= policy.probe_min_application_samples",
+          "current_regime_model->outcome_samples >= policy.probe_min_outcome_samples") and
     "lower-mode-net-goodput" not in ro and
     allin(core_test,
           "uncertain optimistic lower rung cannot coast against punished current estimate",
