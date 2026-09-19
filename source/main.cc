@@ -2951,6 +2951,14 @@ int main(int argc, char *argv[])
             cl_arq_controller test_audio;
             return test_audio.test_audio_thread_create_fail_closed();
         }
+        if (strcmp(argv[i], "--test-sigterm-shutdown") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_audio_shutdown_join_bounded();
+        }
+        if (strcmp(argv[i], "--test-detach-leak") == 0) {
+            cl_arq_controller test_audio;
+            return test_audio.test_audio_detach_leak_closed();
+        }
         if (strcmp(argv[i], "--test-rt-priority") == 0) {
             cl_arq_controller test_audio;
             return test_audio.test_audio_rt_priority();
@@ -3135,6 +3143,8 @@ int main(int argc, char *argv[])
                 failed += test_audio.test_audio_open_fail_closed();
                 failed += test_audio.test_soundcard_list_alloc_fail_closed();
                 failed += test_audio.test_audio_thread_create_fail_closed();
+                failed += test_audio.test_audio_shutdown_join_bounded();
+                failed += test_audio.test_audio_detach_leak_closed();
                 failed += test_audio.test_audio_rt_priority();
                 failed += test_audio.test_capture_allocation_fail_closed();
                 failed += test_audio.test_audio_payload_allocation_fail_closed();

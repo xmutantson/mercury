@@ -530,6 +530,110 @@ int cl_arq_controller::test_audio_thread_create_fail_closed()
 	return passed ? 0 : 1;
 }
 
+static std::atomic<bool> audio_wedge_release{false};
+static std::atomic<int> audio_wedge_workers{0};
+
+// Models a device audio thread wedged inside a blocking backend call: it never
+// observes shutdown_, so an unbounded teardown join would hang forever. It
+// releases only when the test explicitly lets it go, so the detached thread is
+// reaped instead of leaked for the rest of the suite.
+static void *audio_wedged_worker(void *)
+{
+	audio_wedge_workers.fetch_add(1);
+	while(!audio_wedge_release.load(std::memory_order_acquire))
+	{
+		struct timespec ts = { 0, 20 * 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
+	audio_wedge_workers.fetch_sub(1);
+	return NULL;
+}
+
+// First create spawns a wedged worker (the started capture thread); the second
+// fails, which drives audioio_init_internal down its start-failure cleanup ->
+// audioio_join_started_threads on the wedged thread. That is the REAL bounded
+// teardown path under test.
+static int audio_wedged_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+									   void *(*)(void *), void *)
+{
+	static std::atomic<int> calls{0};
+	if(++calls == 2)
+		return EAGAIN;
+	return pthread_create(thread, attr, audio_wedged_worker, NULL);
+}
+
+int cl_arq_controller::test_audio_shutdown_join_bounded()
+{
+#if defined(_WIN32)
+	printf("[TEST-SIGTERM-SHUTDOWN] SKIP: bounded join is POSIX-only\n");
+	return 0;
+#else
+	pthread_t capture_thread, playback_thread, prep_thread;
+	cl_telecom_system test_telecom;
+	const bool saved_shutdown = shutdown_.exchange(false);
+	audio_wedge_release.store(false);
+
+	// Small grace so the regression is fast; production default is multi-second.
+	// This is the LIVE production knob read by the teardown path.
+	char saved_grace[32] = {0};
+	const char *g = getenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS");
+	const bool had_grace = g != NULL;
+	if(had_grace)
+		strncpy(saved_grace, g, sizeof(saved_grace) - 1);
+	setenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS", "400", 1);
+
+	// The start-failure cleanup inside init sets shutdown_ and bounded-joins the
+	// started (wedged) thread. Time the whole call: the wedged worker ignores
+	// shutdown_, so a pre-fix unbounded join would hang here forever.
+	audioio_set_thread_functions_for_test(audio_wedged_pthread_create, NULL);
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	const int result = audioio_init_internal(NULL, NULL, AUDIO_SUBSYSTEM_ALSA,
+	                                         &capture_thread, &playback_thread,
+	                                         &prep_thread, &test_telecom);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	audioio_set_thread_functions_for_test(NULL, NULL);
+	const double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+	                        + (t1.tv_nsec - t0.tv_nsec) / 1.0e6;
+
+	// Free the payload buffers init left allocated (join flags are already reset,
+	// so this join is a no-op; the wedged worker is detached and untouched).
+	audioio_deinit(&capture_thread, &playback_thread, &prep_thread);
+
+	// Let the detached wedged worker exit and reap it out of the suite.
+	audio_wedge_release.store(true);
+	for(int i = 0; i < 300 && audio_wedge_workers.load() != 0; ++i)
+	{
+		struct timespec ts = { 0, 10 * 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
+
+	if(had_grace)
+		setenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS", saved_grace, 1);
+	else
+		unsetenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS");
+	shutdown_ = saved_shutdown;
+
+	// PASS: init fails closed on the injected create failure (result != 0) and
+	// the bounded join FIRED (waited ~the 400 ms grace on the wedged thread)
+	// without hanging. The >300 ms lower bound proves the wedged thread was
+	// present and the bound engaged; the <3000 ms upper bound proves no hang.
+	const bool fired = elapsed_ms > 300.0;
+	const bool bounded = elapsed_ms < 3000.0;
+	const bool passed = result != 0 && fired && bounded;
+	printf("[TEST-SIGTERM-SHUTDOWN] wedged-thread teardown elapsed=%.0fms "
+	       "(grace=400ms) init=%d fired=%d bounded=%d: %s\n",
+	       elapsed_ms, result, fired ? 1 : 0, bounded ? 1 : 0,
+	       passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+#endif
+}
+
+int cl_arq_controller::test_audio_detach_leak_closed()
+{
+	return audioio_detach_leak_selftest();
+}
+
 int cl_arq_controller::test_audio_rt_priority()
 {
 	const int failed = audioio_rt_priority_selftest();
