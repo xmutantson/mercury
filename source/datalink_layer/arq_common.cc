@@ -8394,10 +8394,9 @@ void cl_arq_controller::update_status()
 	}
 	// Terminal-settlement convergence backstop (data-flow-stream-offset.md 8.6). Only the COMMANDER
 	// graceful-close path arms disconnecting_settle_timer (at CLOSE queue). If the reverse CLOSE-ACK is
-	// lost, the ACKed-CLOSE teardown (arq_commander.cc:11896) is never reached and the CMD re-sends
-	// CLOSE indefinitely (23k times observed, ~64 s) with the generic watchdog inert — a byte-complete
-	// transfer scored SETTLEMENT_DEADLINE. After a bounded deadline (retransmit budget honored) declare
-	// the session locally settled and emit the terminal DISCONNECTED.
+	// lost, the ACKed-CLOSE teardown is never reached. The terminal-specific short ARQ clock now
+	// re-solicits first; only after its bounded budget and this independent deadline are exhausted do
+	// we release as INCOMPLETE rather than hang to the process horizon.
 #ifndef TERMINAL_SETTLE_FAILBEFORE
 	if(role==COMMANDER && link_status==DISCONNECTING && disconnecting_settle_timer.counting)
 	{
@@ -8405,6 +8404,16 @@ void cl_arq_controller::update_status()
 			cmd_terminal_settle_converge("disconnecting_settle_deadline");
 	}
 #endif
+
+	// A responder that has emitted the terminal ACK remains on the settled
+	// session's PHY only for the commander's bounded fast-retry train. This is
+	// deliberately separate from reset_all_timers(): the first clean CLOSE resets
+	// the session before sending its ACK, but that reset must not cancel this
+	// post-ACK duplicate-CLOSE receive window.
+	if(role==RESPONDER && responder_terminal_hold_timer.counting
+	   && rsp_terminal_reack_hold_expired(
+		responder_terminal_hold_timer.get_elapsed_time_ms()))
+		rsp_finish_terminal_reack_hold("bounded_reack_window_complete");
 
 	// RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md §5 change A): RECEIVED-state
 	// watchdog force-FREE. The one-deep messages_control mailbox MUST return to FREE
@@ -9817,9 +9826,9 @@ void cl_arq_controller::process_messages()
 int cl_arq_controller::terminal_settle_deadline_ms() const
 {
 	// Terminal-settlement convergence wall bound (data-flow-stream-offset.md 8.6). The COMMANDER
-	// graceful-close path arms disconnecting_settle_timer when CLOSE is queued; full delivery + EOT are
-	// already ACKed at that point, so the reverse CLOSE-ACK is a courtesy handshake. If it is lost we
-	// converge after a BOUNDED wait rather than hang in DISCONNECTING to the process horizon.
+	// graceful-close path arms disconnecting_settle_timer when CLOSE is queued. DATA delivery is ACKed,
+	// but EOT rides this transmitted CLOSE and is not proven until the reverse terminal ACK arrives.
+	// Fast CLOSE+EOT ARQ runs first; this bounded timer is only the final peer-gone/incomplete release.
 	//
 	// The prior (nResends+2)*ack_timeout_control coupled the wait to the 20-deep DATA retransmit budget
 	// AND the WB control timeout: at connected cfg16 (nResends=20, ack_timeout_control~26.6 s) it
@@ -9846,6 +9855,19 @@ int cl_arq_controller::terminal_settle_deadline_ms() const
 	if(d > TERMINAL_SETTLE_CAP_MS)   d = TERMINAL_SETTLE_CAP_MS;
 	return d;
 #endif
+}
+
+int cl_arq_controller::terminal_eot_retry_window_ms(int receive_window_ms) const
+{
+	// The ordinary control ack_timeout is deliberately conservative and reaches
+	// ~26.6 s at cfg16. Terminal CLOSE has already drained and ACKed every DATA
+	// frame, so its retry clock follows the actual receive/turnaround window. The
+	// clamps keep tiny synthetic/default values safe and guarantee three retries
+	// fit ahead of the 17 s whole-transfer recovery bar.
+	int d = receive_window_ms;
+	if(d < TERMINAL_EOT_RETRY_FLOOR_MS) d = TERMINAL_EOT_RETRY_FLOOR_MS;
+	if(d > TERMINAL_EOT_RETRY_CAP_MS)   d = TERMINAL_EOT_RETRY_CAP_MS;
+	return d;
 }
 
 void cl_arq_controller::reset_all_timers()
