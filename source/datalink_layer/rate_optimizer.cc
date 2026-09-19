@@ -2271,7 +2271,8 @@ ladder_probe_confirmed:
     }
     const bool urgent_failure_evidence =
         obs.outcome_samples >= 2 &&
-        obs.failed_batch_rate >= policy.failure_direct_threshold;
+        obs.failed_batch_rate >= policy.failure_direct_threshold &&
+        obs.frame_success_rate <= 0.0;
 
     // ACTIVE v2 owns its own acquisition path.  A fresh link must not burn
     // four slow-mode outcomes merely to establish that a dramatically faster
@@ -2386,8 +2387,14 @@ ladder_probe_confirmed:
             break;
         }
     }
+    // The emergency shortcut is deliberately for a COMPLETE current-mode
+    // failure. A rolling window containing one miss and one recovered batch
+    // can exceed failure_direct_threshold while still reporting nonzero frame
+    // success; treating that as "full-failure" caused clean-channel coasts.
+    // Partial/transient loss stays in the confidence/probation path.
     const bool force_lower_for_failure =
-        obs.failed_batch_rate >= policy.failure_direct_threshold;
+        obs.failed_batch_rate >= policy.failure_direct_threshold &&
+        obs.frame_success_rate <= 0.0;
     for (size_t i=0; i<candidates.size(); ++i) {
         const int cfg = candidates[i];
         if (cfg == obs.current_cfg || cfg < 0 ||

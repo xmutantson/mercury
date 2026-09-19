@@ -295,12 +295,15 @@ req("cold-start-calibration-can-authorize-faster-direct-acquisition",
 req("ordinary-coast-is-risk-adjusted",
     allin(ro, "lcb > current_ucb * (1.0 + policy.direct_switch_margin)",
           "context_volatility", "context_volatility_alpha",
+          "obs.frame_success_rate <= 0.0",
+          "Partial/transient loss stays in the confidence/probation path",
           "lower_probe_ready", "lower-information-probe",
           "current.live_samples >= policy.probe_min_application_samples",
           "obs.outcome_samples >= policy.probe_min_outcome_samples") and
     "lower-mode-net-goodput" not in ro and
     allin(core_test,
           "uncertain optimistic lower rung cannot coast against punished current estimate",
+          "one failed and one recovered batch is not a full-failure coast",
           "confident lower rung still coasts when its LCB clears current UCB",
           "stable evidence decays transient volatility"),
     "ordinary economic coasts require target LCB to clear current UCB; after a full fresh-regime population, an uncertain safer rung may use the existing bounded probation lifecycle")

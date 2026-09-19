@@ -116,6 +116,11 @@ int main() {
     d=risk.evaluate_v2(risk_obs,16);
     ok("uncertain optimistic lower rung cannot coast against punished current estimate",
        d.action==GEARSHIFT_ACTION_HOLD && d.target_cfg==16);
+    risk_obs.failed_batch_rate=0.5; risk_obs.frame_success_rate=0.5;
+    risk_obs.outcome_samples=2; risk_obs.rate_samples=2;
+    d=risk.evaluate_v2(risk_obs,16);
+    ok("one failed and one recovered batch is not a full-failure coast",
+       d.reason!="full-failure-direct-downshift" && d.target_cfg==16);
 
     const char* clear_path = "/tmp/gs2_confident_coast.json";
     { std::ofstream f(clear_path); f << R"JSON({"calibration_setup":{"compress":false},"table":{
