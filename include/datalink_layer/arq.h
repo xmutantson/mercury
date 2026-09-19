@@ -893,6 +893,7 @@ public:
   // batch as post-control-turnaround. Called at a control-ACK -> data transition when the
   // ACKed op renegotiated the link geometry (batch size / config).
   void arm_control_turnaround_guard();
+  void arm_routine_turnaround_guard();
   int  test_turnaround_guard();
   int  test_measured_timers();  // R6 SRTT/RTTVAR estimator + ack-timeout invariant regression
   int  test_karn_retx_classify(); // Karn discriminator decoupling A/B (MERCURY_KARN_RETX_ONLY)
@@ -7299,15 +7300,13 @@ public:
   // ROBUST_DWELL_BATCH_OP batch-size change, SET_CONFIG config change), armed by
   // arm_control_turnaround_guard(). A routine data-SACK turnaround leaves
   // turnaround_clearance_from_control==false and is BYTE-IDENTICAL (no wait): those
-  // turnarounds already deliver slot 0 cleanly, so the original arm-on-every-reception R1
-  // only taxed throughput and risked the RSP's post-SACK reverse window. receive() still
-  // stamps the timer on every decoded reverse frame (routine arm) so the
-  // MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 A/B arm can restore the broad behaviour.
+  // receive() stamps every decoded reverse frame, and compact-confirm detection stamps
+  // its early-decode event explicitly. Production waits the remaining geometry-derived
+  // clearance; MERCURY_TURNAROUND_GUARD_SCOPE_ALL=0 is the control-only defeat arm.
   cl_timer turnaround_clearance_timer;
   bool     turnaround_clearance_armed = false;
-  // R1-rescope discriminant: set true ONLY at a CONTROL-ACK -> data transition
-  // (arm_control_turnaround_guard); a routine reverse reception leaves it false. Consumed
-  // one-shot by turnaround_clearance_wait() when it keys the guarded batch.
+  // Discriminant retained for the CONTROL-only defeat arm. Production guards both
+  // control and routine reverse turnarounds; false identifies a routine SACK/confirm.
   bool     turnaround_clearance_from_control = false;
   // Test-visible instrumentation for --test-turnaround-guard (set by
   // turnaround_clearance_wait): the ms the guard busy-waited this call (-1 = guard not

@@ -13788,21 +13788,33 @@ void cl_arq_controller::arm_control_turnaround_guard()
 	turnaround_clearance_from_control = true;
 }
 
+// Routine reverse SACK/confirm completion. Compact-confirm detection happens while
+// the responder may still be draining playback and before its capture path is re-armed;
+// stamp that causal event so the same geometry-derived clearance used after control
+// exchanges protects the next DATA keying.
+void cl_arq_controller::arm_routine_turnaround_guard()
+{
+	turnaround_clearance_timer.start();
+	turnaround_clearance_armed        = true;
+	turnaround_clearance_from_control = false;
+}
+
 // R1 turnaround-clearance guard (consumer). Called at the top of send_batch() before
 // rx_mute/ptt_on. If the batch about to be keyed follows a CONTROL turnaround (armed by
 // arm_control_turnaround_guard) and too little time has elapsed since the peer's audio ended,
 // busy-wait the remainder so the first data frame never keys inside the peer's TX->RX
-// mute/flush + demod re-arm window.
+// mute/flush + demod re-arm window. This applies to control ACKs and routine data
+// SACKs: clean cfg16 loopback proves a compact confirm can be accepted before the
+// peer finishes playback drain, so the old routine exemption could lose 89/90 frames.
 //   guard_ms = ptt_off_delay_ms (proxy for the peer's PTT tail; both sides share config)
 //            + margin (capture-flush + demod re-arm settle, default 150)
 //            - ptt_on_delay_ms (our own spin-up already covers this much of the wait)
 // Clamped to [0, 2000]. Env: MERCURY_TURNAROUND_GUARD_MARGIN_MS overrides the margin;
 // MERCURY_TURNAROUND_GUARD_DEFEAT=1 disables the wait (the A/B / fail-before arm; same
 // house pattern as MERCURY_GAP_ABORT_DEFEAT, read on this production path => LIVE);
-// MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 restores the pre-rescope broad behaviour (wait before
-// EVERY armed turnaround, incl. routine data-SACK) for A/B — the rescope fail-before arm.
-// Ships default-ON. Invariants: (a) a ROUTINE data-SACK turnaround (from_control==false) adds
-// ZERO wait => byte-identical; (b) elapsed >= guard at call time => ZERO added wait.
+// MERCURY_TURNAROUND_GUARD_SCOPE_ALL=0 restores the unsafe control-only rescope for an
+// A/B fail-before arm. Ships default-ON for every causally armed reverse turnaround.
+// Invariant: elapsed >= guard at call time => ZERO added wait.
 void cl_arq_controller::turnaround_clearance_wait()
 {
 	if(!turnaround_clearance_armed)
@@ -13813,14 +13825,13 @@ void cl_arq_controller::turnaround_clearance_wait()
 		return;
 	}
 
-	bool scope_all = false;
-	{ const char* e = std::getenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL"); if(e && e[0]=='1') scope_all = true; }
+	bool scope_all = true;
+	{ const char* e = std::getenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL"); if(e && e[0]=='0') scope_all = false; }
 
 	if(!turnaround_clearance_from_control && !scope_all)
 	{
-		// R1-rescope: a routine data-SACK turnaround. These deliver slot 0 cleanly, so
-		// the guard does NOT wait — byte-identical to the unguarded modem. (Distinct from
-		// never-armed: report 0, not -1, so the regression can tell the two apart.)
+		// Explicit fail-before arm: reproduce the old routine exemption. Distinct from
+		// never-armed: report 0, not -1, so the regression can tell the two apart.
 		tg_test_waited_ms         = 0;
 		tg_test_elapsed_at_key_ms = turnaround_clearance_timer.get_elapsed_time_ms();
 		return;
@@ -13854,9 +13865,8 @@ void cl_arq_controller::turnaround_clearance_wait()
 	}
 	tg_test_waited_ms         = applied;
 	tg_test_elapsed_at_key_ms = turnaround_clearance_timer.get_elapsed_time_ms();
-	// R1-rescope one-shot: the post-control-turnaround arm is consumed by this keying. The
-	// next batch is routine again unless another control turnaround re-arms it. (Under
-	// SCOPE_ALL the routine path was taken above, so this only clears the control arm.)
+	// The discriminant is one-shot; the timer remains causally stamped until a later
+	// reverse reception refreshes it. Once elapsed exceeds guard this path costs nothing.
 	turnaround_clearance_from_control = false;
 }
 
@@ -13912,30 +13922,22 @@ int cl_arq_controller::test_turnaround_guard()
 		this->tg_test_waited_ms);
 	if(this->tg_test_waited_ms != -1) { printf("[TEST-TURNGUARD] Arm D FAIL\n"); fails++; }
 
-	// Arm E — R1-RESCOPE PASS-AFTER: a ROUTINE data-SACK turnaround. The timer is armed
-	// (a reverse frame decoded, as receive() does) but from_control is FALSE, so the guard
-	// adds ZERO wait — byte-identical to the unguarded modem on the turnarounds that were
-	// never the problem. This is the whole point of the rescope.
-	this->turnaround_clearance_timer.start();       // routine arm (mirrors receive())
-	this->turnaround_clearance_armed        = true;
-	this->turnaround_clearance_from_control = false;
+	// Arm E — PASS-AFTER: a routine compact/SACK turnaround receives the same
+	// geometry-derived clearance because peer playback drain may outlive early decode.
+	this->arm_routine_turnaround_guard();
 	this->turnaround_clearance_wait();
-	printf("[TEST-TURNGUARD] Arm E (routine, scoped): waited=%lld (want 0, no wait)\n",
-		this->tg_test_waited_ms);
-	if(this->tg_test_waited_ms != 0) { printf("[TEST-TURNGUARD] Arm E FAIL\n"); fails++; }
-
-	// Arm F — R1-RESCOPE FAIL-BEFORE via the scope knob: the SAME routine arm as E, but
-	// MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 restores the pre-rescope broad behaviour, so the
-	// guard DOES wait >= 250 ms before a routine batch. Proves the scope discriminant is
-	// LIVE and is what suppresses the wait in E.
-	setenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL", "1", 1);
-	this->turnaround_clearance_timer.start();
-	this->turnaround_clearance_armed        = true;
-	this->turnaround_clearance_from_control = false;
-	this->turnaround_clearance_wait();
-	printf("[TEST-TURNGUARD] Arm F (routine, SCOPE_ALL=1): waited=%lld elapsed_at_key=%lld (want both>=250)\n",
+	printf("[TEST-TURNGUARD] Arm E (routine, default): waited=%lld elapsed_at_key=%lld (want both>=250)\n",
 		this->tg_test_waited_ms, this->tg_test_elapsed_at_key_ms);
-	if(!(this->tg_test_waited_ms >= 250 && this->tg_test_elapsed_at_key_ms >= 250)) { printf("[TEST-TURNGUARD] Arm F FAIL\n"); fails++; }
+	if(!(this->tg_test_waited_ms >= 250 && this->tg_test_elapsed_at_key_ms >= 250)) { printf("[TEST-TURNGUARD] Arm E FAIL\n"); fails++; }
+
+	// Arm F — FAIL-BEFORE via the scope knob: restore the unsafe control-only
+	// exemption and prove the routine arm adds no clearance.
+	setenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL", "0", 1);
+	this->arm_routine_turnaround_guard();
+	this->turnaround_clearance_wait();
+	printf("[TEST-TURNGUARD] Arm F (routine, SCOPE_ALL=0): waited=%lld (want 0, no wait)\n",
+		this->tg_test_waited_ms);
+	if(this->tg_test_waited_ms != 0) { printf("[TEST-TURNGUARD] Arm F FAIL\n"); fails++; }
 	unsetenv("MERCURY_TURNAROUND_GUARD_SCOPE_ALL");
 
 	unsetenv("MERCURY_TURNAROUND_GUARD_DEFEAT");
@@ -23165,14 +23167,12 @@ void cl_arq_controller::receive()
 			// decode completes AFTER the peer stops transmitting, so this stamp is
 			// conservatively LATE. Self-echo cannot stamp here: rx_mute=1 for the whole of
 			// our own send_batch TX.
-			// R1-rescope: this arms the ROUTINE timer only (from_control is NOT set here);
-			// turnaround_clearance_wait() waits before a routine batch ONLY under the
-			// MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 A/B arm. The post-control-turnaround wait
-			// is armed separately, with its own fresh stamp, by arm_control_turnaround_guard()
+			// This arms the routine clearance timer at a completed reverse decode. The
+			// post-control-turnaround wait is armed separately, with its own fresh stamp,
+			// by arm_control_turnaround_guard()
 			// (a control ACK is a short-tone pattern in an OFDM session and never reaches
 			// this LDPC decode gate).
-			turnaround_clearance_timer.start();
-			turnaround_clearance_armed = true;
+			arm_routine_turnaround_guard();
 			int rx_nsymb = telecom_system->get_active_nsymb();
 			// LEVER P: this frame's actual length is (eff preamble + data). For a
 			// MINI tail frame eff=1 (or eff=0 for MINI0), so rx_frame is shorter;

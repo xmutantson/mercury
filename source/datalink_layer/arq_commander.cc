@@ -1862,6 +1862,10 @@ bool cl_arq_controller::cmd_compact_confirm_sack_window_accept(bool compact_enab
 	// + bsi-in-window. The CRC12 (not the SACK window) is the false-confirm guard.
 	if(!cmd_compact_confirm_crc_valid(&cc_bsi))
 		return false;   // compact MISS -> fall through to the 13-uncoded decode.
+	// The CRC-valid compact codeword can be decoded while the peer is still
+	// draining its reverse playback. Causally arm routine turnaround clearance
+	// before any next DATA batch is allowed to key.
+	arm_routine_turnaround_guard();
 
 	// CLEAN confirmation — mirror the 13-uncoded CLEAN branch state-for-state.
 	// Split-dedupe: a CLEAN supersedes a partial for the same bsi (climb-engine Bug 1)

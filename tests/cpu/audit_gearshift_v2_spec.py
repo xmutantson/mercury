@@ -69,6 +69,13 @@ req("receiver-failure-diagnostics-cannot-amplify-a-realtime-stall",
     cmd.count("if(g_verbose) print_stats();") >= 2 and
     rsp.count("if(g_verbose) print_stats();") >= 2,
     "a continuous timing-recovery failure remains logarithmically observable while detailed per-attempt PHY and duplicate state-loop statistics are opt-in, so stdout flushing cannot become a competing realtime workload")
+req("routine-compact-confirm-clears-peer-turnaround-before-next-data",
+    allin(arqh, "arm_routine_turnaround_guard", "MERCURY_TURNAROUND_GUARD_SCOPE_ALL=0") and
+    allin(common, "bool scope_all = true", "arm_routine_turnaround_guard()",
+          "Arm E (routine, default)", "Arm F (routine, SCOPE_ALL=0)") and
+    allin(cmd, "cmd_compact_confirm_crc_valid", "draining its reverse playback",
+          "arm_routine_turnaround_guard();"),
+    "a CRC-valid routine confirm causally stamps the existing geometry-derived turnaround clearance; the next DATA burst cannot key while the peer is still draining and re-arming")
 req("primitive-ledger-carries-attempt-lineage-and-generation",
     allin(arqh, "lineage_valid=%d", "new_sent=%u", "repair_sent=%u", "cfg_gen=%u", "unit_id=%llu", "dir=forward") and
     allin(cal, "lineage_valid", "new_sent", "repair_sent", "config_generation", "application_unit_id", "direction"),
