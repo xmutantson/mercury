@@ -364,7 +364,9 @@ req("lost-tag-probe-is-bounded-by-wire-batch",
           "inband_down_probe_batch_seq_id = rsp_current_expected_batch_seq_id",
           "same-bsi fresh retry is bounded", "next bsi re-arms exactly one",
           "telecom_system->receive_stats.ofdm_preamble_detected",
-          "energy without a PHY-admitted OFDM preamble cannot fire") and
+          "telecom_system->receive_stats.iterations_done >= 0",
+          "energy without a PHY-admitted OFDM preamble cannot fire",
+          "preamble-only candidate without a payload FEC attempt cannot fire") and
     allin(telecom, "receive_stats.ofdm_preamble_detected=false",
           "receive_stats.ofdm_preamble_detected = true") and
     allin(common, "inband_down_probe_batch_seq_id = -1") and

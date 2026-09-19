@@ -868,6 +868,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   // steady-state frame; probing then delays capture and a false NACK collides
 		   // with the very block that would have decoded.
 		   && telecom_system->receive_stats.ofdm_preamble_detected
+		   // Correlation admission is still not a payload failure.  Require the
+		   // primary decoder to have reached an actual FEC attempt; iterations_done
+		   // remains -1 for leading edges, incomplete frames and SKIP-VAR candidates.
+		   // This is decoder provenance, not a controller threshold.
+		   && telecom_system->receive_stats.iterations_done >= 0
 		   // A located preamble whose DATA tail is not captured yet is timing
 		   // evidence, not lost-tag evidence. Let the short wait-for-tail path
 		   // complete the same snapshot before trying alternate configurations.
@@ -10063,6 +10068,7 @@ int cl_arq_controller::test_inband_downladder()
 		rx->messages_rx_buffer.status = FREE;         // != RECEIVED: no frame stored this pass
 		rx->rsp_current_expected_batch_seq_id = 4;    // IN-FLIGHT active batch
 		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
+		rx->telecom_system->receive_stats.iterations_done = 0;
 
 		// EXACT production firing predicate (mirror of arq_responder.cc:535-542, including the
 		// fail-before defeat knob). The ONLY variable across the arms is the fresh-window flag
@@ -10075,6 +10081,7 @@ int cl_arq_controller::test_inband_downladder()
 			    && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			    && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
 			    && rx->telecom_system->receive_stats.ofdm_preamble_detected
+			    && rx->telecom_system->receive_stats.iterations_done >= 0
 			    && !rx->telecom_system->receive_stats.frame_data_missing
 			    && rx->messages_rx_buffer.status != RECEIVED
 			    && is_ofdm_config(rx->current_configuration)
@@ -10139,6 +10146,14 @@ int cl_arq_controller::test_inband_downladder()
 			"C6 energy without a PHY-admitted OFDM preamble cannot fire lost-tag recovery",
 			would_fire() ? 1 : 0, 0);
 
+		// C7 — even an admitted correlation peak is not a failed payload.  Until
+		// the primary reaches FEC, lost-tag recovery must remain silent.
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
+		rx->telecom_system->receive_stats.iterations_done = -1;
+		check(would_fire() == false,
+			"C7 preamble-only candidate without a payload FEC attempt cannot fire recovery",
+			would_fire() ? 1 : 0, 0);
+
 		delete rx; delete ts_rx;
 	}
 
@@ -10166,6 +10181,7 @@ int cl_arq_controller::test_inband_downladder()
 		rx->rsp_current_expected_batch_seq_id = 4;
 		rx->rx_fresh_window_decoded_this_pass = false;   // STALE inter-frame pass
 		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
+		rx->telecom_system->receive_stats.iterations_done = 0;
 
 		bool fires_on_stale =
 			    rx->inband_rate_feature_enabled()
@@ -10175,6 +10191,7 @@ int cl_arq_controller::test_inband_downladder()
 			 && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			 && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
 			 && rx->telecom_system->receive_stats.ofdm_preamble_detected
+			 && rx->telecom_system->receive_stats.iterations_done >= 0
 			 && !rx->telecom_system->receive_stats.frame_data_missing
 			 && rx->messages_rx_buffer.status != RECEIVED
 			 && is_ofdm_config(rx->current_configuration)
