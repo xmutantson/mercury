@@ -481,10 +481,12 @@ req("active-v2-setconfig-special-cases-are-enumerated",
     "legacy SET_CONFIG is reserved for cross-tier acquisition and configurations without a tag carrier, each with its technical reason")
 req("preframe-config-tag-is-not-gated-on-old-phy-geometry",
     allin(common, "Do NOT publish", "pre-frame snapshot", "still-loaded OLD geometry",
-          "trailing/capture path continues to publish") and
+          "trailing/capture path continues to publish",
+          "POST-FOLLOW target-geometry gate", "CONFIG_TAG processing guard",
+          "larger of the emitted tag and one target", "acquisition_samples") and
     "inband_adopt_gate_snapshot     = snapshot" not in common and
     allin(rsp, "exact gapless", "with no synthetic", "A0 RX FOLLOWS the pre-frame tag"),
-    "a CRC-valid pre-frame transition is followed before target-frame decode; only trailing old-geometry captures retain the contamination gate")
+    "a CRC-valid transition is followed before target-frame decode; guard time is derived from wire/acquisition geometry and the saved snapshot is then judged only at the new geometry")
 req("active-v2-config-tag-transition-closes-from-peer-evidence",
     allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
           "config-discriminating SACK at/after the announce BSI",

@@ -5852,10 +5852,11 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 	// applies to an OFDM-target adopt (the contamination is an OFDM-acquisition problem); a
 	// robust/MFSK target is judged by its own machinery. Feature-gated (legacy byte-identical).
 	// The pre-frame tag is itself the protocol header for a PHY transition. Its snapshot
-	// contains a gapless frame in the ANNOUNCED geometry, so evaluating that snapshot
-	// using the still-loaded OLD geometry is circular and permanently deferred the clean
-	// 16->15 transition. CRC/binding authenticates the header; the target frame decoder
-	// and config-discriminating SACK confirm the follow.
+	// may contain a frame in the ANNOUNCED geometry, so evaluating that snapshot using
+	// the still-loaded OLD geometry is circular and permanently deferred the clean 16->15
+	// transition. CRC/binding authenticates the header; after following, the snapshot is
+	// judged at the newly loaded geometry. A clean target frame is re-staged; a tag-only
+	// or contaminated transition snapshot is retired so the fresh ring can acquire DATA.
 	// A validated scream explicitly opens a one-shot blind re-entry window. In
 	// that state the CRC/binding-valid CONFIG_TAG is the synchronization anchor;
 	// applying the ordinary old-config OFDM clean-lock gate would circularly
@@ -6874,11 +6875,26 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 	// this pre-frame snapshot to the legacy clean-lock gate: the target frame is in the
 	// announced geometry while the metric helper is necessarily still loaded for the old
 	// geometry. The trailing/capture path continues to publish its old-geometry snapshot
-	// and retains the contaminated re-air protection.
+	// and retains the contaminated re-air protection. After the follow, validate this
+	// saved snapshot using the NEW geometry to decide whether it contains a usable target
+	// frame or is only the tag-processing window.
 	int cfg_before = current_configuration;
 	int followed_cfg = current_configuration;
 	int followed = detect_and_follow_config_tag(energies.data(), chips, n_syms,
 		/*expect_bsi_lsb=*/0xFF, /*expect_parity=*/0xFF, &followed_cfg);
+	bool target_frame_ready = !scream_tag_only_follow;
+	if(followed == 1 && followed_cfg != cfg_before && target_frame_ready)
+	{
+		target_frame_ready = inband_adopt_metric_gate_ok(
+			frame0_capture.data(), len, followed_cfg);
+		if(!target_frame_ready)
+		{
+			printf("[INBAND-RX] POST-FOLLOW target-geometry gate: transition snapshot "
+				"contains no clean CONFIG_%d frame; retire it and await fresh DATA\n",
+				followed_cfg);
+			fflush(stdout);
+		}
+	}
 
 	// On a REAL switch, RE-STAGE the saved capture into the member buffer the follow
 	// just (re)allocated at the new config. NOTE: after the switch `snapshot` (the OLD
@@ -6900,7 +6916,7 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 		fflush(stdout);
 	}
 #else
-	if(followed == 1 && followed_cfg != cfg_before && !scream_tag_only_follow)
+	if(followed == 1 && followed_cfg != cfg_before && target_frame_ready)
 	{
 		double* member = telecom_system->data_container.ready_to_process_passband_delayed_data;
 		long new_len = (long)telecom_system->data_container.Nofdm
@@ -6921,11 +6937,10 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 #endif
 
 	if(out_followed_config) *out_followed_config = followed_cfg;
-	// Return 2 only for the scream tag-only handoff.  The sole production caller
+	// Return 2 for any tag-only/contaminated handoff. The sole production caller
 	// treats it as "followed, but do not demodulate this pre-guard snapshot" and
-	// lets the new-config ring collect the following frame.  Other callers retain
-	// the historical 0/1 contract.
-	return (followed == 1 && scream_tag_only_follow) ? 2 : followed;
+	// lets the new-config ring collect the following frame.
+	return (followed == 1 && !target_frame_ready) ? 2 : followed;
 }
 
 // ============================================================================
@@ -16663,14 +16678,37 @@ void cl_arq_controller::send_batch()
 		{
 			int tag_samples = emit_config_tag_passband(
 				current_configuration, (tag_bsi < 0) ? 0 : tag_bsi);
+			bool canonical_guard_applied = false;
+			// A GS2 CONFIG_TAG is ACK-less but its peer still needs one capture/processing
+			// window to decode the robust header, load the announced PHY, and re-arm its
+			// ring before target DATA arrives. Gapless delivery made the old-geometry tag
+			// scan overrun into frame 0 (false MOOSE/CFO and SKIP-VAR storms). Derive the
+			// guard from protocol geometry: the larger of the emitted tag and one target
+			// acquisition window. There is no SNR or mode-tuned threshold here.
+			if(tag_samples > 0 && rate_opt.controls_link() && inband_retag_armed)
+			{
+				long acquisition_samples = (long)telecom_system->data_container.Nofdm
+					* telecom_system->data_container.buffer_Nsymb.load()
+					* telecom_system->data_container.interpolation_rate;
+				long guard_samples = std::max((long)tag_samples, acquisition_samples);
+				int guard_ms = (int)ceil(1000.0 * (double)guard_samples /
+					telecom_system->sampling_frequency);
+				drain_playback_wait();
+				printf("[INBAND-TX] CONFIG_TAG processing guard=%dms "
+					"(tag_samples=%d acquisition_samples=%ld); peer follow window\n",
+					guard_ms, tag_samples, acquisition_samples);
+				fflush(stdout);
+				pumped_settle_wait(guard_ms);
+				canonical_guard_applied = true;
+			}
 			// A scream re-entry starts from a deliberately flushed capture ring and
 			// asks the peer to change PHY before frame 0.  Give that one-shot path a
 			// real processing gap after the robust CONFIG_TAG has left the playback
 			// ring.  Without it, host scheduling can let the lower-rung DATA train
 			// overtake the peer's tag decoder/config switch; repeat tags then reproduce
-			// the same race.  Ordinary in-band changes and the default-off path retain
-			// their existing gapless [tag][frame 0] wire order.
-			if(tag_samples > 0 && scream_resume_pending)
+			// the same race. GS2 changes use the geometry-derived guard above; this
+			// fixed fallback remains only for non-GS2 scream use.
+			if(tag_samples > 0 && scream_resume_pending && !canonical_guard_applied)
 			{
 				const int SCREAM_POST_TAG_GUARD_MS = 750;
 				drain_playback_wait();
@@ -16683,10 +16721,10 @@ void cl_arq_controller::send_batch()
 	}
 
 	// LEVER P: transmit each frame at its actual packed offset and actual length
-	// (variable: anchor FULL, tail MINI). The frames are contiguous, so the wire
+	// (variable: anchor FULL, tail MINI). The DATA frames are contiguous, so the wire
 	// sees one gapless waveform; per-frame tx_transfer granularity is preserved
 	// for the sim pacing / capture-prep symbol cadence. The CONFIG_TAG (if any) was
-	// keyed onto the wire JUST ABOVE, so it precedes frame 0 (§15 INV-3d-A).
+	// keyed above and GS2 allowed its derived processing guard to elapse before frame 0.
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
 		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, off=%d size=%d\n", i, message_batch_counter_tx, frame_pack_off[i], frame_len[i]); fflush(stdout); }
@@ -22699,14 +22737,13 @@ void cl_arq_controller::receive()
 				signal_period, &pre_followed_cfg);
 			if(pre_followed == 2)
 			{
-				// The validated scream CONFIG_TAG was captured before the sender's
-				// post-tag guard elapsed.  This snapshot is tag-only (and was taken
-				// with the old PHY); decoding it as a new-config DATA frame poisons
-				// acquisition with a false timing anchor.  The follow path already
-				// reinitialized/re-armed the live ring, so leave it untouched and
-				// wait for the first complete post-guard DATA window.
+				// The CONFIG_TAG was captured before the sender's processing guard
+				// elapsed, or the post-follow target-geometry check rejected the
+				// transition snapshot. Decoding it as DATA would poison acquisition
+				// with a false timing anchor. The follow path already re-armed the live
+				// ring, so wait for the first complete post-guard DATA window.
 				rx_fresh_window_decoded_this_pass = false;
-				printf("[SCREAM-REENTRY] tag-only snapshot retired; awaiting fresh CONFIG_%d DATA window\n",
+				printf("[INBAND-RX] transition snapshot retired; awaiting fresh CONFIG_%d DATA window\n",
 					pre_followed_cfg);
 				fflush(stdout);
 				return;
