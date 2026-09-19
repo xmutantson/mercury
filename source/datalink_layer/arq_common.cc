@@ -19039,6 +19039,17 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 		telecom_system->data_container.start_ack_causal_ring_samples = 0;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 	}
+	ptt_off_delay_timer.start();
+	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
+	ptt_off();
+
+	// PTT release precedes RX re-arm. The old order unmuted capture and armed the
+	// block-span counter BEFORE this known PTT-off interval, so 200 ms of silence
+	// consumed the fresh-symbol budget. With the commander's peer-clearance gap,
+	// the next CFG16 snapshot then fired at pream=128/upper=119: its block tail was
+	// not yet captured, 89/90 frames were lost, and a clean link looked dead.
+	// Keep capture muted through the drain and start the derived block-span budget
+	// only once the responder is actually ready to receive forward samples.
 	telecom_system->data_container.rx_mute = 0;
 	telecom_system->data_container.rx_mute_samples = 0;
 	telecom_system->data_container.nUnder_processing_events = 0;
@@ -19051,10 +19062,6 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 		             + telecom_system->data_container.Nsymb;
 		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
 	}
-
-	ptt_off_delay_timer.start();
-	ptt_busy_wait(ptt_off_delay_timer, ptt_off_delay_ms);
-	ptt_off();
 
 	if(append_quality && v2_quality)
 		gearshift_quality_report_note_tx(quality_report, batch_seq_id);

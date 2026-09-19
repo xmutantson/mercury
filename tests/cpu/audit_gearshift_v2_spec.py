@@ -76,6 +76,10 @@ req("routine-compact-confirm-clears-peer-turnaround-before-next-data",
     allin(cmd, "cmd_compact_confirm_crc_valid", "draining its reverse playback",
           "arm_routine_turnaround_guard();"),
     "a CRC-valid routine confirm causally stamps the existing geometry-derived turnaround clearance; the next DATA burst cannot key while the peer is still draining and re-arming")
+req("compact-confirm-rearms-rx-after-ptt-release",
+    allin(common, "PTT release precedes RX re-arm",
+          "start the derived block-span budget", "bigblock_block_ftr_or(rx_frame + 10)"),
+    "known PTT-off silence cannot consume the next cfg16 block acquisition budget; the responder begins counting only when forward capture is actually re-armed")
 req("primitive-ledger-carries-attempt-lineage-and-generation",
     allin(arqh, "lineage_valid=%d", "new_sent=%u", "repair_sent=%u", "cfg_gen=%u", "unit_id=%llu", "dir=forward") and
     allin(cal, "lineage_valid", "new_sent", "repair_sent", "config_generation", "application_unit_id", "direction"),
