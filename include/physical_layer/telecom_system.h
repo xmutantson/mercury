@@ -119,6 +119,7 @@ struct st_receive_stats{
 	bool ofdm_batch_active = false;  // true when consecutive OFDM frames expected (narrow BATCH window)
 	int frame_overflow_symbols = 0;  // >0: MFSK frame extends beyond captured audio by this many symbols
 	bool frame_data_missing = false;  // true: preamble found but data symbols are silence (incomplete capture)
+	bool ofdm_preamble_detected = false; // true: this receive admitted an OFDM preamble at the PHY's existing detector gate
 	bool frame_skip_var_aborted = false;  // true: trial loop aborted on consecutive SKIP-VAR — caller should zero false preamble and advance cursor past noise region
 	double coarse_metric = 0.0;  // Schmidl-Cox correlation metric from coarse time_sync (diagnostic)
 	double ofdm_drift_per_frame = 0.0;  // IIR-filtered prediction error (interp samples) for BATCH verify

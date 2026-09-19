@@ -1817,6 +1817,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.message_decoded=NO;
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.frame_data_missing=false;
+	receive_stats.ofdm_preamble_detected=false;
 	receive_stats.frame_skip_var_aborted=false;
 	fine_energy_last_shift_symbols=0;
 	receive_stats.sync_trials=0;
@@ -2602,6 +2603,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			} // end else (non-forced-delay detection)
 		}
+		// Reaching here on OFDM means the existing coarse detector admitted a
+		// preamble (or a test supplied an exact forced delay).  Publish that
+		// structural event so ARQ lost-tag recovery never treats mere buffer energy
+		// as permission to run alternate decoders or transmit a DECODE_FAIL NACK.
+		if(M != MOD_MFSK)
+			receive_stats.ofdm_preamble_detected = true;
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
 
@@ -12518,6 +12525,8 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	receive_stats.coarse_metric = 0.0;
 	receive_stats.mean_H = -1.0;
 	receive_stats.frame_overflow_symbols = 0;
+	receive_stats.frame_data_missing = false;
+	receive_stats.ofdm_preamble_detected = false;
 
 	// the captured passband buffer spans the same window the live capture loop hands
 	// receive_byte: Nofdm*buffer_Nsymb*interp samples.

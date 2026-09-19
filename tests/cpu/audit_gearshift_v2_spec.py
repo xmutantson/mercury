@@ -362,7 +362,11 @@ req("probe-probation-is-goodput-authoritative-and-channel-time-bounded",
 req("lost-tag-probe-is-bounded-by-wire-batch",
     allin(rsp, "inband_down_probe_batch_seq_id != rsp_current_expected_batch_seq_id",
           "inband_down_probe_batch_seq_id = rsp_current_expected_batch_seq_id",
-          "same-bsi fresh retry is bounded", "next bsi re-arms exactly one") and
+          "same-bsi fresh retry is bounded", "next bsi re-arms exactly one",
+          "telecom_system->receive_stats.ofdm_preamble_detected",
+          "energy without a PHY-admitted OFDM preamble cannot fire") and
+    allin(telecom, "receive_stats.ofdm_preamble_detected=false",
+          "receive_stats.ofdm_preamble_detected = true") and
     allin(common, "inband_down_probe_batch_seq_id = -1") and
     "inband_last_announced_config != current_configuration" not in rsp,
     "receiver lost-tag recovery may run one blind decoder-bank probe per active bsi; retransmission and repeated CONFIG_TAG own same-bsi recovery, and TX-only announcement state is never used as an RX predicate")

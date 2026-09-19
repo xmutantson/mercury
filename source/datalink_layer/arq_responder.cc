@@ -863,6 +863,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && inband_down_probe_batch_seq_id != rsp_current_expected_batch_seq_id
 		   && (rx_fresh_window_decoded_this_pass              // a FRESH window was staged+decoded this pass
 		       || inband_freshwin_gate_defeat())              // (A/B fail-before knob restores pre-fix firing)
+		   // The PHY must have admitted a real OFDM preamble using its existing
+		   // detector.  Buffer energy alone can be the leading edge of an arriving
+		   // steady-state frame; probing then delays capture and a false NACK collides
+		   // with the very block that would have decoded.
+		   && telecom_system->receive_stats.ofdm_preamble_detected
 		   // A located preamble whose DATA tail is not captured yet is timing
 		   // evidence, not lost-tag evidence. Let the short wait-for-tail path
 		   // complete the same snapshot before trying alternate configurations.
@@ -10057,6 +10062,7 @@ int cl_arq_controller::test_inband_downladder()
 		rx->passive_monitor      = false;
 		rx->messages_rx_buffer.status = FREE;         // != RECEIVED: no frame stored this pass
 		rx->rsp_current_expected_batch_seq_id = 4;    // IN-FLIGHT active batch
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
 
 		// EXACT production firing predicate (mirror of arq_responder.cc:535-542, including the
 		// fail-before defeat knob). The ONLY variable across the arms is the fresh-window flag
@@ -10068,6 +10074,7 @@ int cl_arq_controller::test_inband_downladder()
 			    && !rx->passive_monitor
 			    && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			    && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			    && rx->telecom_system->receive_stats.ofdm_preamble_detected
 			    && !rx->telecom_system->receive_stats.frame_data_missing
 			    && rx->messages_rx_buffer.status != RECEIVED
 			    && is_ofdm_config(rx->current_configuration)
@@ -10125,6 +10132,13 @@ int cl_arq_controller::test_inband_downladder()
 			"C5 next bsi re-arms exactly one blind lost-tag probe",
 			would_fire() ? 1 : 0, 1);
 
+		// C6 — fresh buffer energy without a PHY-admitted preamble is only an
+		// arriving/idle window.  It cannot authorize decoder work or a reverse NACK.
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = false;
+		check(would_fire() == false,
+			"C6 energy without a PHY-admitted OFDM preamble cannot fire lost-tag recovery",
+			would_fire() ? 1 : 0, 0);
+
 		delete rx; delete ts_rx;
 	}
 
@@ -10151,6 +10165,7 @@ int cl_arq_controller::test_inband_downladder()
 		rx->messages_rx_buffer.status = FREE;
 		rx->rsp_current_expected_batch_seq_id = 4;
 		rx->rx_fresh_window_decoded_this_pass = false;   // STALE inter-frame pass
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
 
 		bool fires_on_stale =
 			    rx->inband_rate_feature_enabled()
@@ -10159,6 +10174,7 @@ int cl_arq_controller::test_inband_downladder()
 			 && !rx->passive_monitor
 			 && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			 && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			 && rx->telecom_system->receive_stats.ofdm_preamble_detected
 			 && !rx->telecom_system->receive_stats.frame_data_missing
 			 && rx->messages_rx_buffer.status != RECEIVED
 			 && is_ofdm_config(rx->current_configuration)
