@@ -41,12 +41,12 @@ void cl_arq_controller::process_messages_responder()
 
 	if(this->connection_status==ACKNOWLEDGING_CONTROL)
 	{
-		print_stats();
+		if(g_verbose) print_stats();
 		process_messages_acknowledging_control();
 	}
 	else if(this->connection_status==ACKNOWLEDGING_DATA)
 	{
-		print_stats();
+		if(g_verbose) print_stats();
 		process_messages_acknowledging_data();
 	}
 	else if(this->connection_status==RECEIVING)

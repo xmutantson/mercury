@@ -65,8 +65,10 @@ req("receiver-failure-diagnostics-cannot-amplify-a-realtime-stall",
     allin(arqh, "ftr_fail_diag_run", "reports only powers of two") and
     allin(common, "ftr_fail_diag_run = 0", "run_n & (run_n - 1ULL)", "run=%llu") and
     allin(telecom, "if(g_verbose)", "[ENERGY-DIAG]", "[FINE-ENERGY-REL]",
-          "[XCORR-RESCUE-FAIL]", "[SUBPEAK-REJECT]"),
-    "a continuous timing-recovery failure remains logarithmically observable while detailed per-attempt PHY diagnostics are opt-in, so stdout flushing cannot become a competing realtime workload")
+          "[XCORR-RESCUE-FAIL]", "[SUBPEAK-REJECT]") and
+    cmd.count("if(g_verbose) print_stats();") >= 2 and
+    rsp.count("if(g_verbose) print_stats();") >= 2,
+    "a continuous timing-recovery failure remains logarithmically observable while detailed per-attempt PHY and duplicate state-loop statistics are opt-in, so stdout flushing cannot become a competing realtime workload")
 req("primitive-ledger-carries-attempt-lineage-and-generation",
     allin(arqh, "lineage_valid=%d", "new_sent=%u", "repair_sent=%u", "cfg_gen=%u", "unit_id=%llu", "dir=forward") and
     allin(cal, "lineage_valid", "new_sent", "repair_sent", "config_generation", "application_unit_id", "direction"),

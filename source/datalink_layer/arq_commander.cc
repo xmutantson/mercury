@@ -3488,7 +3488,7 @@ void cl_arq_controller::process_messages_commander()
 
 	if(this->connection_status==TRANSMITTING_CONTROL)
 	{
-		print_stats();
+		if(g_verbose) print_stats();
 		process_messages_tx_control();
 	}
 	else if(this->connection_status==RECEIVING_ACKS_CONTROL)
@@ -3697,7 +3697,7 @@ void cl_arq_controller::process_messages_commander()
 			opt_pending_switch_fallback = -1;
 		}
 
-		print_stats();
+		if(g_verbose) print_stats();
 		process_messages_tx_data();
 	}
 	else if(this->connection_status==RECEIVING_ACKS_DATA)
