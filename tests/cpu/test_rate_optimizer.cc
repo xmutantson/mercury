@@ -112,7 +112,42 @@ int main()
     t = stable_eval(legacy, 13, 2000.0, 0.1, 0.25, 14);
     expect_eq("legacy table still optimizes", t, 14);
 
+    // Emergency/NACK machinery is an evidence source, not a second Axis-1
+    // selector. ACTIVE consumes the signal, chooses its own canonical lower
+    // rung, and opens the authoritative rollback transaction.
+    cl_rate_optimizer coast;
+    coast.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+    int coast_target = coast.consume_failure_signal(
+        11, "test-emergency-nack", 1000, false, false);
+    expect_eq("GS2 failure signal chooses one lower rung", coast_target, 10);
+    expect_true("GS2 owns coast-down transaction",
+        coast.owns_coastdown_transition(11, 10));
+    expect_eq("GS2 coast-down action is rollback",
+        (int)coast.last_decision().action, (int)GEARSHIFT_ACTION_ROLLBACK);
+    expect_true("GS2 coast-down reason retains detector identity",
+        coast.last_decision().reason == "failure-coastdown:test-emergency-nack");
+    coast.notify_switch_confirmed(1100);
+
+    coast.notify_switch_dispatched(16, 15,
+        GEARSHIFT_ACTION_SWITCH, 16, 1500, false);
+    expect_true("ordinary GS2 downshift is coordinated coast-down",
+        coast.owns_coastdown_transition(16, 15));
+    coast.notify_switch_confirmed(1600);
+
+    // If the signal arrives while a prior probe transition is still live,
+    // the failed experiment is terminated and the coast-down becomes the sole
+    // owned Axis-1 transaction.
+    coast.notify_switch_dispatched(10, 11,
+        GEARSHIFT_ACTION_PROBE, 10, 2000, false);
+    coast_target = coast.consume_failure_signal(
+        11, "test-block-failure", 2100, false, false);
+    expect_eq("failure during probe returns to owner fallback",
+        coast_target, 10);
+    expect_true("coast-down replaces failed probe ownership",
+        coast.owns_coastdown_transition(11, 10));
+    coast.notify_switch_confirmed(2200);
+
     if (failures) return 1;
-    std::puts("PASS rate_optimizer: severity, economics, cooldown, legacy-table compatibility");
+    std::puts("PASS rate_optimizer: severity, economics, cooldown, legacy-table compatibility, owned coast-down");
     return 0;
 }

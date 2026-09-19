@@ -8046,6 +8046,46 @@ int cl_arq_controller::test_inband_liveness()
 	}
 
 	// ========================================================================
+	// PART B7 — EMERGENCY/NACK IS INPUT, NOT AUTHORITY: GS2 selects and owns
+	// the lower rung, then the preserved lossless demote path emits a real
+	// coordinated SET_CONFIG (not an external unilateral CONFIG_TAG move).
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->load_configuration(CONFIG_11, FULL, NO);
+		cmd->data_configuration = CONFIG_11;
+		cmd->negotiated_configuration = CONFIG_11;
+
+		int owner_target = cmd->rate_opt.consume_failure_signal(
+			CONFIG_11, "test-emergency-nack-threshold", 3000, false, false);
+		check(owner_target == CONFIG_10,
+			"B7.1 GS2 consumes failure input and selects the lower rung",
+			owner_target, CONFIG_10);
+		check(cmd->rate_opt.owns_coastdown_transition(CONFIG_11, CONFIG_10),
+			"B7.2 GS2 owns the coast-down transaction before ARQ mutation",
+			cmd->rate_opt.owns_coastdown_transition(CONFIG_11, CONFIG_10) ? 1 : 0, 1);
+
+		bool routed = cmd->inband_route_failure_demote(
+			owner_target, "test-emergency-nack-threshold", true, true);
+		check(routed,
+			"B7.3 preserved lossless demote machinery accepts the owned move",
+			routed ? 1 : 0, 1);
+		check(cmd->messages_control.status != FREE &&
+		      cmd->messages_control.data != NULL &&
+		      cmd->messages_control.data[0] == SET_CONFIG,
+			"B7.4 owned coast-down emits coordinated SET_CONFIG on the wire",
+			(cmd->messages_control.data != NULL)
+				? (int)(unsigned char)cmd->messages_control.data[0] : -1,
+			(int)(unsigned char)SET_CONFIG);
+		check(!cmd->inband_unilateral_armed,
+			"B7.5 owned coast-down does not yield to unilateral CONFIG_TAG",
+			cmd->inband_unilateral_armed ? 1 : 0, 0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
 	// PART C — BOUNDED: repeated unrecovered stalls escalate to a hard reset
 	// ========================================================================
 	{

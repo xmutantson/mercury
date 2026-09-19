@@ -3870,11 +3870,15 @@ int cl_arq_controller::add_message_control(char code)
 					&& rate_opt.transition_matches(current_configuration, inband_target)
 					&& config_ladder_index(inband_target)
 						> config_ladder_index(current_configuration);
+				bool coordinated_coastdown = rate_opt.controls_link()
+					&& rate_opt.owns_coastdown_transition(
+						current_configuration, inband_target);
 				bool tier_crossing = inband_config_change_is_tier_crossing(inband_target);
-				if(coordinated_probe)
+				if(coordinated_probe || coordinated_coastdown)
 				{
-					printf("[GEARSHIFT-V2] LADDER-PROBE %d -> %d: routing via "
+					printf("[GEARSHIFT-V2] %s %d -> %d: routing via "
 						"coordinated SET_CONFIG control handshake\n",
+						coordinated_coastdown ? "OWNER-COASTDOWN" : "LADDER-PROBE",
 						current_configuration, inband_target);
 					fflush(stdout);
 					// Fall through to the same ACKed SET_CONFIG builder used by the
@@ -9435,9 +9439,22 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				// unchanged). (data-flow-perbatch-config.md §S4C, design §5.3.)
 				if(inband_rate_feature_enabled())
 				{
-					int demote_target = config_ladder_down(current_configuration, robust_enabled);
-					if(inband_route_failure_demote(demote_target, "emergency_nack_threshold"))
-						return;
+					if(rate_opt.controls_link())
+					{
+						// Preserve the detector as a telemetry producer. It supplies no
+						// destination: GS2 consumes the threshold signal, selects the
+						// coast-down rung, opens its own rollback transaction, and the
+						// existing helper carries that owned move losslessly.
+						int owner_target = rate_opt.consume_failure_signal(
+							current_configuration, "emergency_nack_threshold",
+							opt_now_ms(), narrowband_enabled == YES,
+							robust_enabled == YES);
+						if(owner_target >= 0 && inband_route_failure_demote(owner_target,
+							"emergency_nack_threshold", true, true)) return;
+					}
+					else if(inband_route_failure_demote(
+						config_ladder_down(current_configuration, robust_enabled),
+						"emergency_nack_threshold")) return;
 					// Same-config / no-op (should not happen with the outer not-at-bottom
 					// guard) — fall through to the legacy BREAK as a safety net.
 				}

@@ -427,7 +427,32 @@ req("active-v2-uses-config-tag-transport-without-second-selector",
           "LOCAL load_configuration() is not peer-follow evidence") and
     allin(cmd, "bool optimizer_owns_upward_frame = optimizer_is_in_control()",
           "!optimizer_owns_upward_frame"),
-    "Gearshift-v2 remains the sole ordinary Axis-1 selector; its upward discovery probes use the proven ACKed SET_CONFIG transport and other intra-tier moves retain CONFIG_TAG")
+    "Gearshift-v2 remains the sole ordinary Axis-1 selector; upward discovery probes and every downward coast use proven ACKed SET_CONFIG while remaining intra-tier moves retain CONFIG_TAG")
+req("active-v2-absorbs-emergency-nack-as-controller-input",
+    allin(roh, "consume_failure_signal(int current_cfg", "owns_coastdown_transition") and
+    allin(ro, "cl_rate_optimizer::consume_failure_signal(",
+          "config_ladder_down(current_cfg, robust_enabled)",
+          "failure-coastdown:", "GEARSHIFT-V2-COASTDOWN") and
+    allin(cmd, "emergency_nack_threshold", "rate_opt.consume_failure_signal(",
+          "owner_target", '"emergency_nack_threshold", true, true') and
+    allin(text("tests/cpu/test_rate_optimizer.cc"),
+          "GS2 failure signal chooses one lower rung",
+          "GS2 owns coast-down transaction",
+          "failure during probe returns to owner fallback"),
+    "existing block-failure/NACK detection is telemetry input; ACTIVE GS2 chooses and owns the coast-down destination")
+req("active-v2-owned-coastdown-uses-acked-transport",
+    allin(cmd, "coordinated_coastdown", "owns_coastdown_transition",
+          'coordinated_coastdown ? "OWNER-COASTDOWN" : "LADDER-PROBE"',
+          "coordinated SET_CONFIG control handshake") and
+    "transport=ACKED_SET_CONFIG" in ro and
+    allin(rsp, "B7.4 owned coast-down emits coordinated SET_CONFIG on the wire",
+          "B7.5 owned coast-down does not yield to unilateral CONFIG_TAG") and
+    allin(text("tests/cpu/test_rate_optimizer.cc"),
+          "ordinary GS2 downshift is coordinated coast-down") and
+    allin(ro, "bool cl_rate_optimizer::owns_coastdown_transition",
+          "return transition_matches(from_cfg, to_cfg) &&",
+          "gearshift_action_rank(to_cfg) < gearshift_action_rank(from_cfg)"),
+    "every GS2-owned downward move, including emergency rollback, uses proven coordinated SET_CONFIG/ACK rather than CONFIG_TAG")
 req("active-v2-config-tag-transition-closes-from-peer-evidence",
     allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
           "config-discriminating SACK at/after the announce BSI",
@@ -437,7 +462,7 @@ req("active-v2-config-tag-transition-closes-from-peer-evidence",
           "inband_handle_nack(uint8_t rx_cfg_index",
           "explicit evidence that this CONFIG_TAG transition failed") and
     allin(cmd, "bool tier_crossing = inband_config_change_is_tier_crossing(inband_target)",
-          "if(coordinated_probe)",
+          "if(coordinated_probe || coordinated_coastdown)",
           "else if(inband_unilateral_config_change(inband_target))",
           "NO control frame on the wire") and
     allin(text("tests/cpu/test_gearshift_v2.cc"),

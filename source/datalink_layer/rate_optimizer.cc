@@ -2563,6 +2563,61 @@ bool cl_rate_optimizer::transition_matches(int from_cfg, int to_cfg) const
            switch_from_cfg == from_cfg && switch_to_cfg == to_cfg;
 }
 
+bool cl_rate_optimizer::owns_coastdown_transition(int from_cfg, int to_cfg) const
+{
+    return transition_matches(from_cfg, to_cfg) &&
+           gearshift_action_rank(to_cfg) < gearshift_action_rank(from_cfg);
+}
+
+int cl_rate_optimizer::consume_failure_signal(
+        int current_cfg, const char* reason, unsigned long long now_ms,
+        bool is_nb, bool robust_enabled)
+{
+    if (mode != GEARSHIFT_V2_ACTIVE) return -1;
+
+    const char* why = (reason && *reason) ? reason : "unspecified";
+    // The detector supplies only evidence. A failed owned probe returns to its
+    // controller-selected fallback; steady-state failure walks one rung down
+    // the canonical action ladder. No ARQ-selected target enters here.
+    int target_cfg = current_cfg;
+    if (probe_active && probe_target_cfg == current_cfg && probe_fallback_cfg >= 0)
+        target_cfg = probe_fallback_cfg;
+    else
+        target_cfg = config_ladder_down(current_cfg, robust_enabled);
+
+    if (target_cfg < 0 || target_cfg == current_cfg ||
+        gearshift_action_rank(target_cfg) >= gearshift_action_rank(current_cfg)) {
+        std::printf("[GEARSHIFT-V2-COASTDOWN] owner consumed failure signal=%s "
+                    "at cfg=%d but no lower action is available\n",
+                    why, current_cfg);
+        std::fflush(stdout);
+        return -1;
+    }
+
+    // A failure at the locally loaded configuration terminates any older
+    // unconfirmed transition before the owner opens the coast-down move.
+    // Probe transport failure retains its existing negative-memory behavior.
+    if (switch_inflight)
+        notify_switch_failed();
+
+    st_rate_decision d;
+    d.action = GEARSHIFT_ACTION_ROLLBACK;
+    d.current_cfg = current_cfg;
+    d.target_cfg = target_cfg;
+    d.fallback_cfg = target_cfg;
+    d.actionable = true;
+    d.reason = std::string("failure-coastdown:") + why;
+    last_v2_decision = d;
+    notify_switch_dispatched(current_cfg, target_cfg,
+                             GEARSHIFT_ACTION_ROLLBACK, target_cfg,
+                             now_ms, is_nb);
+    std::printf("[GEARSHIFT-V2-COASTDOWN] OWN signal=%s; controller issued "
+                "%d->%d action=ROLLBACK transport=ACKED_SET_CONFIG\n",
+                why, current_cfg, target_cfg);
+    std::fflush(stdout);
+    return target_cfg;
+}
+
 int cl_rate_optimizer::authorize_external_transition(
         int from_cfg, int requested_to_cfg, const char* reason,
         unsigned long long now_ms, bool is_nb)
@@ -2786,6 +2841,9 @@ void cl_rate_optimizer::notify_switch_failed()
                     switch_to_cfg, backoff, m.failures, context_generation);
         std::fflush(stdout);
         probe_cooldown_remaining = std::max(probe_cooldown_remaining, policy.cooldown_batches);
+        clear_probe();
+    }
+    else if (switch_action == GEARSHIFT_ACTION_ROLLBACK && probe_active) {
         clear_probe();
     }
     switch_inflight = false;

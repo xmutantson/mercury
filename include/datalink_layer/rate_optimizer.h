@@ -296,6 +296,15 @@ public:
                                       const char* reason,
                                       unsigned long long now_ms,
                                       bool is_nb = false);
+    // Consume a detector's failure signal without accepting its destination.
+    // ACTIVE chooses the coast-down rung and opens the authoritative rollback
+    // transaction that the ARQ layer transports losslessly.
+    int consume_failure_signal(int current_cfg, const char* reason,
+                               unsigned long long now_ms, bool is_nb,
+                               bool robust_enabled);
+    // Every ACTIVE downward transition is a coordinated coast-down, regardless
+    // of whether its policy action is SWITCH or ROLLBACK.
+    bool owns_coastdown_transition(int from_cfg, int to_cfg) const;
     bool authorize_hard_recovery(int current_cfg, bool at_bottom,
                                  const char* reason) const;
 

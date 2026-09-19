@@ -57,12 +57,16 @@ req("owner API declared",
         "owns_link_experiment(unsigned long long now_ms = 0) const",
         "transition_matches(int from_cfg, int to_cfg) const",
         "authorize_external_transition(",
+        "consume_failure_signal(",
+        "owns_coastdown_transition(",
         "authorize_hard_recovery(",
     )))
 req("owner API implemented",
     all(x in OPT_CC for x in (
         "cl_rate_optimizer::owns_link_experiment(unsigned long long now_ms) const",
         "cl_rate_optimizer::authorize_external_transition(",
+        "cl_rate_optimizer::consume_failure_signal(",
+        "cl_rate_optimizer::owns_coastdown_transition(",
         "cl_rate_optimizer::authorize_hard_recovery(",
     )))
 
@@ -73,6 +77,16 @@ req("failure demote asks owner before mutating payload/config state",
 req("foreign demote target is telemetry only; full v2 evaluator selects destination",
     "opt_evaluate_batch_end(&owner_target)" in demote
     and "owner selected %d->%d" in demote)
+
+req("emergency NACK is absorbed as input and GS2 issues the coast-down",
+    "rate_opt.consume_failure_signal(" in CMD
+    and '"emergency_nack_threshold", true, true' in CMD
+    and "config_ladder_down(current_cfg, robust_enabled)" in OPT_CC
+    and "controller issued" in OPT_CC)
+req("owned coast-down uses coordinated ACKed transport",
+    "coordinated_coastdown" in setcfg
+    and "owns_coastdown_transition" in setcfg
+    and "coordinated SET_CONFIG control handshake" in setcfg)
 
 a = setcfg.find("authorize_external_transition(")
 t = setcfg.find("inband_unilateral_config_change(")
