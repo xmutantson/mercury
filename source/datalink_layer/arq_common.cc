@@ -7666,6 +7666,14 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 	// NACK again (§S4E.4). Idempotent (no-op when the feature is off / flag already false).
 	inband_nack_emitted_for_dead_streak = false;
 
+	// CONFIG_TAG is the canonical peer transition, so its adopt must update every
+	// responder-side forward-geometry mirror that SET_CONFIG would have staged.
+	// `load_configuration` changes current_configuration and the PHY only.  Leaving
+	// data_configuration/forward_configuration stale lets the next unrelated control
+	// ACK restore the old geometry (observed: confirmed CONFIG_16 -> SET_LINK_PARAMS
+	// ACK -> silent CONFIG_0 reload), creating the late FTR storm.
+	data_configuration = followed_config;
+	forward_configuration = followed_config;
 	load_configuration(followed_config, PHYSICAL_LAYER_ONLY, NO);
 
 	// OFDM-ENTRY ADOPT SETUP (HINGE-1 flush/preserve + cursor re-anchor + FTR re-init +

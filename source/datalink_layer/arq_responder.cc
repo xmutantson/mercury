@@ -10360,8 +10360,25 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		check(peak_before >= 0.05, "A0 painted a LIVE burst on the ring (peak ≥ floor)",
 			(long)(peak_before * 1000), 50);
 
+		// Seed the mirrors stale to the source geometry: production CONFIG_TAG adopt
+		// must update them just as SET_CONFIG does, or a later unrelated control ACK
+		// reloads the source config after the tag follow.
+		rx->data_configuration = CONFIG_1;
+		rx->forward_configuration = CONFIG_1;
 		// THE PRODUCTION ADOPT (robust→OFDM crossing modelled as CONFIG_1→CONFIG_0, an OFDM target).
 		rx->inband_adopt_resynced_config(CONFIG_0);
+		check(rx->data_configuration == CONFIG_0,
+			"A0a CONFIG_TAG adopt updates data_configuration mirror",
+			rx->data_configuration, CONFIG_0);
+		check(rx->forward_configuration == CONFIG_0,
+			"A0b CONFIG_TAG adopt updates forward_configuration mirror",
+			rx->forward_configuration, CONFIG_0);
+		// Model the generic post-control-ACK restore that exposed the hardware bug.
+		if(rx->data_configuration != rx->current_configuration)
+			rx->load_configuration(rx->data_configuration, PHYSICAL_LAYER_ONLY, YES);
+		check(rx->current_configuration == CONFIG_0,
+			"A0c unrelated control ACK restore holds the followed CONFIG_0",
+			rx->current_configuration, CONFIG_0);
 
 		double peak_after = ring_peak(ts, sp);
 		int rwi_after = (int)ts->data_container.ring_write_index;

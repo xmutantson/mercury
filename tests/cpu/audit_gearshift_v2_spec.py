@@ -372,6 +372,14 @@ req("lost-tag-probe-is-bounded-by-wire-batch",
     allin(common, "inband_down_probe_batch_seq_id = -1") and
     "inband_last_announced_config != current_configuration" not in rsp,
     "receiver lost-tag recovery may run one blind decoder-bank probe per active bsi; retransmission and repeated CONFIG_TAG own same-bsi recovery, and TX-only announcement state is never used as an RX predicate")
+req("config-tag-adopt-updates-forward-geometry-mirrors",
+    allin(common, "data_configuration = followed_config",
+          "forward_configuration = followed_config",
+          "SET_LINK_PARAMS", "silent CONFIG_0 reload") and
+    allin(rsp, "CONFIG_TAG adopt updates data_configuration mirror",
+          "CONFIG_TAG adopt updates forward_configuration mirror",
+          "unrelated control ACK restore holds the followed CONFIG_0"),
+    "a canonical CONFIG_TAG follow updates current/PHY plus the responder data and forward mirrors, so any later control-ACK restore cannot resurrect the pre-tag geometry")
 req("probe-hard-failure-is-distinct-from-soft-underperformance",
     allin(ro, "repeated_whole_failures", "established_failure_fraction",
           "probe-hard-failure", "probe-soft-underperformance") and
