@@ -629,6 +629,11 @@ int cl_arq_controller::test_audio_shutdown_join_bounded()
 #endif
 }
 
+int cl_arq_controller::test_audio_detach_leak_closed()
+{
+	return audioio_detach_leak_selftest();
+}
+
 int cl_arq_controller::test_audio_rt_priority()
 {
 	const int failed = audioio_rt_priority_selftest();

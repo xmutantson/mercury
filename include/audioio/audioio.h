@@ -115,6 +115,7 @@ int capture_enqueue_backpressure_selftest(void);
 int rx_transfer_read_failure_selftest(void);
 int audioio_capture_allocation_failure_selftest(void);
 int audioio_payload_allocation_failure_selftest(void);
+int audioio_detach_leak_selftest(void);
 int sim_tx_bridge_allocation_failure_selftest(void);
 int sim_rx_bridge_allocation_failure_selftest(void);
 int sim_playback_connection_failure_selftest(void);

@@ -575,6 +575,7 @@ public:
   int test_soundcard_list_alloc_fail_closed();
   int test_audio_thread_create_fail_closed();
   int test_audio_shutdown_join_bounded();
+  int test_audio_detach_leak_closed();
   int test_audio_rt_priority();
   int test_capture_allocation_fail_closed();
   int test_audio_payload_allocation_fail_closed();

@@ -622,23 +622,26 @@ static int audioio_start_thread(pthread_t *thread, void *(*entry)(void *),
 // of the box. When the join exceeds the shared grace we detach the thread and
 // continue teardown so the process still exits; card release then falls to
 // process exit. A test-injected join is honored verbatim (its worker observes
-// shutdown_ and exits promptly).
-static void audioio_join_one_bounded(pthread_t thread,
+// shutdown_ and exits promptly). Returns true iff the join TIMED OUT and the
+// thread had to be DETACHED, so the caller can skip freeing shared state (the
+// ring buffers) that the detached thread may still touch after teardown.
+static bool audioio_join_one_bounded(pthread_t thread,
                                      const struct timespec *deadline,
                                      const char *name)
 {
 #if defined(_WIN32)
 	(void)deadline; (void)name;
 	audioio_pthread_join(thread, NULL);
+	return false;
 #else
 	if(audioio_pthread_join_overridden)
 	{
 		audioio_pthread_join(thread, NULL);
-		return;
+		return false;
 	}
 	int rc = pthread_timedjoin_np(thread, NULL, deadline);
 	if(rc == 0)
-		return;
+		return false;
 	if(rc == ETIMEDOUT)
 		fprintf(stderr,
 			"[AUDIO-SHUTDOWN-TIMEOUT] %s thread did not release its card within the "
@@ -650,10 +653,11 @@ static void audioio_join_one_bounded(pthread_t thread,
 			"continuing teardown\n", name, rc);
 	fflush(stderr);
 	pthread_detach(thread);
+	return true;
 #endif
 }
 
-static void audioio_join_started_threads(pthread_t *radio_capture,
+static bool audioio_join_started_threads(pthread_t *radio_capture,
 										 pthread_t *radio_playback,
 										 pthread_t *radio_capture_prep)
 {
@@ -673,15 +677,20 @@ static void audioio_join_started_threads(pthread_t *radio_capture,
 #else
 	memset(&deadline, 0, sizeof(deadline));
 #endif
-	if(capture_prep_thread_started)
-		audioio_join_one_bounded(*radio_capture_prep, &deadline, "capture_prep");
-	if(capture_thread_started)
-		audioio_join_one_bounded(*radio_capture, &deadline, "capture");
-	if(playback_thread_started)
-		audioio_join_one_bounded(*radio_playback, &deadline, "playback");
+	bool detached = false;
+	if(capture_prep_thread_started &&
+	   audioio_join_one_bounded(*radio_capture_prep, &deadline, "capture_prep"))
+		detached = true;
+	if(capture_thread_started &&
+	   audioio_join_one_bounded(*radio_capture, &deadline, "capture"))
+		detached = true;
+	if(playback_thread_started &&
+	   audioio_join_one_bounded(*radio_playback, &deadline, "playback"))
+		detached = true;
 	capture_prep_thread_started = false;
 	capture_thread_started = false;
 	playback_thread_started = false;
+	return detached;
 }
 
 static void publish_audio_startup(bool capture, int status)
@@ -3696,15 +3705,29 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 		return 0;
 	}
 
-	audioio_join_started_threads(radio_capture, radio_playback, radio_capture_prep);
+	const bool audio_thread_detached =
+		audioio_join_started_threads(radio_capture, radio_playback, radio_capture_prep);
 
 #if ENABLE_FLOAT64_TAP_BEFORE == 1
-	fclose(tap_play);
+	if(!audio_thread_detached)
+		fclose(tap_play);
 #endif
 
 	if(capture_telecom_system != NULL)
 		capture_telecom_system->data_container
 			.start_ack_causal_tracking_available = 0;
+
+	// The bounded shutdown join had to DETACH a still-wedged device thread: it
+	// is parked inside a vendored blocking backend call and, if that call ever
+	// returns, will write capture_buffer / capture_causal_tag_buffer or read
+	// playback_buffer. Freeing those rings here would be a use-after-free. The
+	// process is already exiting, so LEAK the rings instead (a one-shot leak on
+	// a terminating process is safe) and leave the globals valid + non-NULL so
+	// any late access lands in live memory. On the clean path every thread
+	// joined, audio_thread_detached is false, and the frees below run exactly
+	// as before.
+	if(audio_thread_detached)
+		return 0;
 	if(capture_causal_tag_buffer != NULL)
 	{
 		free(capture_causal_tag_buffer->buffer);
@@ -3743,6 +3766,135 @@ int audioio_deinit(pthread_t *radio_capture, pthread_t *radio_playback, pthread_
 	audioio_payload_buffers_heap_backed = false;
     return 0;
 }
+
+#if !defined(_WIN32)
+// --- detach-leak regression (use-after-free hardening) ------------------------
+// Proves audioio_deinit SKIPS the payload-ring frees when the bounded shutdown
+// join had to DETACH a still-wedged device thread. Such a thread is parked in a
+// vendored blocking backend call; if it ever returns it writes capture_buffer,
+// so freeing that ring during teardown is a use-after-free. The hardening leaks
+// the rings instead (safe on an exiting process). The wedged worker below
+// captures the live ring at start and writes into it AFTER teardown: safe with
+// the hardening (ring still live), a heap-use-after-free without it (ASAN traps).
+static std::atomic<bool> audioio_detach_uaf_release{false};
+static std::atomic<int> audioio_detach_uaf_workers{0};
+static cbuf_handle_t audioio_detach_uaf_ring = NULL;
+
+static void *audioio_detach_uaf_worker(void *)
+{
+	// Capture the live capture ring now, while init has it allocated and valid.
+	audioio_detach_uaf_ring = capture_buffer;
+	audioio_detach_uaf_workers.fetch_add(1);
+	// Ignore shutdown_ so the bounded teardown join times out and detaches us.
+	while(!audioio_detach_uaf_release.load(std::memory_order_acquire))
+	{
+		struct timespec ts = { 0, 5 * 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
+	// Released only AFTER audioio_deinit has run. One small write into the ring we
+	// captured: with the leak-on-detach hardening this lands in live memory; on a
+	// tree that freed the ring it is a use-after-free.
+	if(audioio_detach_uaf_ring != NULL)
+	{
+		uint8_t sample[64];
+		memset(sample, 0, sizeof(sample));
+		write_buffer(audioio_detach_uaf_ring, sample, sizeof(sample));
+	}
+	audioio_detach_uaf_workers.fetch_sub(1);
+	return NULL;
+}
+
+static int audioio_detach_uaf_create(pthread_t *thread, const pthread_attr_t *attr,
+                                     void *(*)(void *), void *)
+{
+	return pthread_create(thread, attr, audioio_detach_uaf_worker, NULL);
+}
+
+int audioio_detach_leak_selftest(void)
+{
+	if(capture_buffer != NULL || playback_buffer != NULL)
+		return 1;  // audio active / dirty state: do not run
+
+	// Heap-backed rings: device-free, and a stray free becomes a clean
+	// heap-use-after-free (ASAN-visible) instead of an munmap SIGSEGV.
+	const bool saved_override = audioio_payload_malloc_overridden;
+	audioio_payload_malloc_overridden = true;
+	const int saved_guard = g_sim_audio_guard_active;
+
+	char saved_grace[32] = {0};
+	const char *g = getenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS");
+	const bool had_grace = g != NULL;
+	if(had_grace)
+		strncpy(saved_grace, g, sizeof(saved_grace) - 1);
+	setenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS", "300", 1);
+
+	const bool saved_shutdown = shutdown_.exchange(false);
+	audioio_detach_uaf_release.store(false);
+	audioio_detach_uaf_workers.store(0);
+	audioio_detach_uaf_ring = NULL;
+
+	// Start three wedged device threads via the SIM backend; the join is NOT
+	// overridden, so audioio_deinit's bounded join runs and detaches them.
+	audioio_pthread_create_fn saved_create = audioio_pthread_create;
+	audioio_pthread_create = audioio_detach_uaf_create;
+	audioio_pthread_join_overridden = false;
+
+	pthread_t cap, play, prep;
+	cl_telecom_system telecom;
+	const int rc = audioio_init_internal(NULL, NULL, AUDIO_SUBSYSTEM_SIM,
+	                                     &cap, &play, &prep, &telecom);
+	audioio_pthread_create = saved_create;
+	const bool init_ok = (rc == 0 && capture_buffer != NULL);
+
+	// Real teardown path: the bounded join detaches the wedged workers; the
+	// hardening must SKIP the ring frees, leaving capture_buffer valid + non-NULL.
+	audioio_deinit(&cap, &play, &prep);
+	const bool leaked_valid = (capture_buffer != NULL);
+
+	// Let the detached workers write their captured ring, then exit.
+	audioio_detach_uaf_release.store(true);
+	for(int i = 0; i < 500 && audioio_detach_uaf_workers.load() != 0; ++i)
+	{
+		struct timespec ts = { 0, 10 * 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
+	const bool reaped = (audioio_detach_uaf_workers.load() == 0);
+
+	// Clean up the intentionally-leaked rings now that no thread touches them, so
+	// the rest of the suite sees pristine audio state.
+	bool cleaned = true;
+	if(reaped && capture_buffer != NULL)
+	{
+		audioio_deinit(&cap, &play, &prep);
+		cleaned = (capture_buffer == NULL && playback_buffer == NULL);
+	}
+	else if(!reaped)
+	{
+		cleaned = false;  // never free a ring a live worker may still touch
+	}
+
+	if(had_grace)
+		setenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS", saved_grace, 1);
+	else
+		unsetenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS");
+	shutdown_ = saved_shutdown;
+	audioio_payload_malloc_overridden = saved_override;
+	g_sim_audio_guard_active = saved_guard;
+
+	const bool passed = init_ok && leaked_valid && reaped && cleaned;
+	printf("[TEST-DETACH-LEAK] init_ok=%d detach_skipped_free=%d reaped=%d "
+	       "cleaned=%d: %s\n",
+	       init_ok ? 1 : 0, leaked_valid ? 1 : 0, reaped ? 1 : 0, cleaned ? 1 : 0,
+	       passed ? "PASS" : "FAIL");
+	return passed ? 0 : 1;
+}
+#else
+int audioio_detach_leak_selftest(void)
+{
+	printf("[TEST-DETACH-LEAK] SKIP: bounded-join/detach is POSIX-only\n");
+	return 0;
+}
+#endif
 
 int audioio_payload_allocation_failure_selftest(void)
 {
