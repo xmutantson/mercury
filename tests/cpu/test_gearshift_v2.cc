@@ -95,6 +95,41 @@ int main() {
     d = r.evaluate_v2(o, 16);
     ok("full failure downshift", d.target_cfg < 16 && d.action == GEARSHIFT_ACTION_SWITCH);
 
+    // A transient may punish the measured current rung while an unvisited lower
+    // rung still has a wide optimistic prior.  The lower rung's mean alone must
+    // not authorize a coast: its lower confidence bound has to clear the current
+    // rung's upper confidence bound.  These values mirror the observed 16->15
+    // failure shape (roughly 2.0+/-1.2 kbps versus 4.5+/-3.6 kbps).
+    const char* risk_path = "/tmp/gs2_risk_adjusted_coast.json";
+    { std::ofstream f(risk_path); f << R"JSON({"calibration_setup":{"compress":false},"table":{
+      "15":{"wgn20":{"snr_db":20,"eff_bps_mean":4500,"eff_bps_sigma":3600,"n_runs":1}},
+      "16":{"wgn20":{"snr_db":20,"eff_bps_mean":2000,"eff_bps_sigma":1200,"n_runs":5}}
+    }})JSON"; }
+    cl_rate_optimizer risk; ok("risk-adjusted coast table load", risk.load(risk_path));
+    risk.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+    p = risk.get_policy(); p.confidence_z=1.0; p.direct_switch_margin=0.0;
+    p.default_switch_cost_ms=0.0; p.min_outcome_samples=1; p.cooldown_batches=0;
+    risk.set_policy_for_test(p); risk.set_switch_cost_ms(0.0);
+    st_rate_observation risk_obs=obs(16,2000,1,0.0);
+    risk_obs.outcome_samples=1; risk_obs.rate_samples=1;
+    risk_obs.feasible_configs={15,16};
+    d=risk.evaluate_v2(risk_obs,16);
+    ok("uncertain optimistic lower rung cannot coast against punished current estimate",
+       d.action==GEARSHIFT_ACTION_HOLD && d.target_cfg==16);
+
+    const char* clear_path = "/tmp/gs2_confident_coast.json";
+    { std::ofstream f(clear_path); f << R"JSON({"calibration_setup":{"compress":false},"table":{
+      "15":{"wgn20":{"snr_db":20,"eff_bps_mean":4500,"eff_bps_sigma":100,"n_runs":8}},
+      "16":{"wgn20":{"snr_db":20,"eff_bps_mean":2000,"eff_bps_sigma":100,"n_runs":8}}
+    }})JSON"; }
+    cl_rate_optimizer clear; ok("confident coast table load", clear.load(clear_path));
+    clear.set_mode_for_test(GEARSHIFT_V2_ACTIVE); clear.set_policy_for_test(p);
+    clear.set_switch_cost_ms(0.0);
+    d=clear.evaluate_v2(risk_obs,16);
+    ok("confident lower rung still coasts when its LCB clears current UCB",
+       d.action==GEARSHIFT_ACTION_SWITCH && d.target_cfg==15 &&
+       d.reason=="confidence-clears-switch-cost");
+
     // Shadow computes decisions but must never be actionable.
     r.reset_session_state(); r.set_mode_for_test(GEARSHIFT_V2_SHADOW);
     o = obs(13, 1800, 4, 0); d = r.evaluate_v2(o, 16);
@@ -681,7 +716,12 @@ int main() {
     dir.reset_session_state();
     dir.observe_transaction(13, 200, 200, 1000, 30, 30, false, false, 18, 0, 0.02, 30, false);
     dir.observe_transaction(13, 200, 200, 1000, 30, 30, false, false, 28, 0, 0.15, 30, false);
-    ok("channel step raises context volatility", dir.context_volatility_for_test() > 0.0);
+    double peak_volatility=dir.context_volatility_for_test();
+    ok("channel step raises context volatility", peak_volatility > 0.0);
+    for(int i=0;i<20;++i)
+        dir.observe_transaction(13,200,200,1000,30,30,false,false,28,0,0.15,30,false);
+    ok("stable evidence decays transient volatility",
+       dir.context_volatility_for_test() < peak_volatility);
 
     // The universal SET_CONFIG chokepoint may see both v2-owned and external
     // safety transitions. Matching v2 transitions must not self-cancel; a later
@@ -708,8 +748,8 @@ int main() {
     st_rate_prediction ext_after=ext.predict_for_test(14,extobs);
     ok("external safety move ages prior live context", ext_after.live_weight < ext_before.live_weight);
 
-    // A probe whose SET_CONFIG itself fails is negative evidence too. It must
-    // not be immediately attempted again just because no DATA probation ran.
+    // A probe whose transition transport fails is negative evidence too. It
+    // must not be immediately attempted again just because no DATA probation ran.
     cl_rate_optimizer sf; ok("switch-fail table load", sf.load(table().c_str()));
     sf.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
     p = sf.get_policy(); p.confidence_z=1.0; p.direct_switch_margin=0.03;
@@ -720,7 +760,7 @@ int main() {
     sf.notify_switch_dispatched(13,14,d.action,13,1000,false);
     sf.notify_switch_failed();
     d=sf.evaluate_v2(base,14);
-    ok("failed probe SET_CONFIG is remembered", !(d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==14));
+    ok("failed probe transport is remembered", !(d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==14));
 
     // A configured top-gear action must stay reachable after the legacy topgear
     // election is disabled.  CONFIG_17 is intentionally outside FULL_CONFIG_LADDER,

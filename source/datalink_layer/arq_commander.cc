@@ -3826,7 +3826,7 @@ int cl_arq_controller::add_message_control(char code)
 			}
 
 			// STAGE 3b GEARSHIFT DRIVE (data-flow-perbatch-config.md §3.1 / §12 W3):
-			// Gearshift-v2 ACTIVE uses CONFIG_TAG transport by default; legacy selectors
+			// Gearshift-v2 ACTIVE uses CONFIG_TAG transport canonically; legacy selectors
 			// use it when MERCURY_INBAND_RATE is set. The selected rate change is
 			// announced by a passband CONFIG_TAG on the next batch (W1 emit) and followed unilaterally
 			// (W2), NOT by a SET_CONFIG control handshake. EVERY gearshift/optimizer/
@@ -3847,57 +3847,30 @@ int cl_arq_controller::add_message_control(char code)
 					: ((gear_shift_algorithm==SNR_BASED)
 						? get_configuration(measurements.SNR_downlink)
 						: negotiated_configuration);
-				// HYBRID TIER-CROSSING ROUTING (data-flow-inband-tier-crossing.md §2):
-				// the in-band unilateral CONFIG_TAG is the wrong transport for a
-				// robust<->OFDM TIER CROSSING. The tag serializes each rung's confirm
-				// behind the slow data-SACK turnaround (~12.4s/rung), so the
-				// robust->OFDM cross slips past the test budget (VERIFIED: redesign
-				// capped at ROBUST_2/53B vs legacy CONFIG_4/101B). Legacy's SET_CONFIG
-				// control handshake has a FAST DEDICATED ACK (decoupled from the
-				// data-SACK), crossing ~3s earlier. So: when the change CROSSES the
-				// tier boundary in EITHER direction (is_robust_config differs between
-				// the live config and the target), FALL THROUGH to the legacy SET_CONFIG
-				// builder (the proven fast cross). For INTRA-tier rate adapts (both
-				// robust, or both OFDM 0-16) keep the in-band tag (it works there, and
-				// the D1/D4/down-ladder/A3 machinery is all intra-tier). Strictly
-				// scoped to inband_rate_feature_enabled() -> flag-off byte-identical.
-				// A no-op/invalid target (same config, off-ladder) is NOT a crossing
-				// (inband_unilateral_config_change rejects it) and falls through too.
-				// The predicate is factored into inband_config_change_is_tier_crossing
-				// so the directed regression drives the EXACT production decision.
-				bool coordinated_probe = rate_opt.controls_link()
-					&& rate_opt.probe_is_active()
-					&& rate_opt.transition_matches(current_configuration, inband_target)
-					&& config_ladder_index(inband_target)
-						> config_ladder_index(current_configuration);
-				bool coordinated_coastdown = rate_opt.controls_link()
-					&& rate_opt.owns_coastdown_transition(
-						current_configuration, inband_target);
+				// SET_CONFIG is legacy and is reserved here for two transport exceptions:
+				//   1. CROSS_TIER: robust<->OFDM cannot use a common data/SACK PHY while
+				//      changing tiers; its dedicated ACK provides the acquisition bridge.
+				//   2. TAG_UNAVAILABLE: NB/M<16 has no robust M=16 CONFIG_TAG carrier.
+				// Every ordinary intra-tier GS2 probe, switch, rollback, and coast-down
+				// takes the unilateral CONFIG_TAG path below. Its transition remains live
+				// until config-discriminating peer evidence confirms or rejects it.
 				bool tier_crossing = inband_config_change_is_tier_crossing(inband_target);
-				if(coordinated_probe || coordinated_coastdown)
+				bool tag_transport_unavailable = narrowband_enabled == YES
+					|| telecom_system == NULL
+					|| telecom_system->ack_mfsk.ack_sack_suffix_len() <= 0;
+				if(tier_crossing)
 				{
-					printf("[GEARSHIFT-V2] %s %d -> %d: routing via "
-						"coordinated SET_CONFIG control handshake\n",
-						coordinated_coastdown ? "OWNER-COASTDOWN" : "LADDER-PROBE",
+					printf("[GEARSHIFT-V2] SET_CONFIG SPECIAL_CASE=CROSS_TIER %d -> %d: "
+						"dedicated ACK bridges robust<->OFDM acquisition\n",
 						current_configuration, inband_target);
 					fflush(stdout);
-					// Fall through to the same ACKed SET_CONFIG builder used by the
-					// proven legacy climb. The pending-transition dispatcher retains
-					// the Axis-3 slot guard before every control dispatch.
 				}
-				else if(tier_crossing)
+				else if(tag_transport_unavailable)
 				{
-					printf("[INBAND-TX] TIER-CROSSING %d -> %d (robust<->OFDM): routing "
-						"via legacy SET_CONFIG control handshake (fast dedicated ACK), "
-						"NOT the in-band tag (which serializes behind the data-SACK)\n",
+					printf("[GEARSHIFT-V2] SET_CONFIG SPECIAL_CASE=TAG_UNAVAILABLE %d -> %d: "
+						"NB/M<16 exposes no CONFIG_TAG carrier\n",
 						current_configuration, inband_target);
 					fflush(stdout);
-					// Fall through to the legacy SET_CONFIG builder below. Mirror the
-					// SUCCESS_BASED_LADDER target the builder expects: the producers
-					// already set negotiated_configuration (LADDER) or the builder
-					// recomputes get_configuration(SNR) (SNR_BASED) — either way the
-					// builder's forward_configuration matches inband_target, so no
-					// member needs adjusting here.
 				}
 				else if(inband_unilateral_config_change(inband_target))
 				{
@@ -3908,9 +3881,8 @@ int cl_arq_controller::add_message_control(char code)
 					success = SUCCESSFUL;
 					return success;
 				}
-				// No-op drop (same config / invalid target) OR tier-crossing: fall
-				// through to the legacy builder so behaviour matches the flag-off path
-				// for the crossing (fast SET_CONFIG ACK) and the degenerate case.
+				// The two enumerated exceptions fall through to the legacy builder.
+				// A no-op/invalid request also falls through but is not an Axis-1 move.
 			}
 
 			messages_control.data[0]=code;

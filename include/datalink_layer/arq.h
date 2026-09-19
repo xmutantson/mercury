@@ -5585,9 +5585,9 @@ public:
   // inband_last_confirmed_config, and STOP re-emitting. No-op when not armed / stale bsi.
   // Returns true if it disarmed (confirmed). Called from every SACK accept site.
   bool inband_retag_confirm_from_sack(int rx_bsi);
-  // A coordinated SET_CONFIG ACK already proves both peers agreed on the new
-  // geometry. Seed the in-band tracker at that config so the first DATA batch
-  // does not carry a redundant unilateral CONFIG_TAG.
+  // An enumerated-special-case SET_CONFIG ACK already proves both peers agreed
+  // on the new geometry. Seed the in-band tracker at that config so the first
+  // DATA batch does not carry a redundant unilateral CONFIG_TAG.
   void inband_confirm_coordinated_config(int config);
   // KEYSTONE (data-flow-inband-tier-crossing.md §6): DATA-DECOUPLED intra-tier CLIMB confirm.
   // When an EMITTED CLIMB re-tag is armed and the robust BASE ACK pattern matched

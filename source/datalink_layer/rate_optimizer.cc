@@ -2366,8 +2366,14 @@ ladder_probe_confirmed:
     const std::vector<int> candidates = candidate_configs(obs);
     const int preferred_probe_rung = config_probe_ladder_up(obs.current_cfg, obs.is_nb);
     int next_feasible_probe_rung = -1;
+    int next_feasible_lower_rung = -1;
     for (size_t i=0; i<candidates.size(); ++i) {
         const int cfg = candidates[i];
+        if (gearshift_action_rank(cfg) < gearshift_action_rank(obs.current_cfg) &&
+            gearshift_destination_within_ofdm_ceiling(cfg, config_ceiling) &&
+            (next_feasible_lower_rung < 0 ||
+             gearshift_action_rank(cfg) > gearshift_action_rank(next_feasible_lower_rung)))
+            next_feasible_lower_rung = cfg;
         if (gearshift_action_rank(cfg) <= gearshift_action_rank(obs.current_cfg) ||
             !gearshift_destination_within_ofdm_ceiling(cfg, config_ceiling) ||
             probe_target_blocked(cfg, obs))
@@ -2399,6 +2405,14 @@ ladder_probe_confirmed:
         saw_candidate_prediction = true;
         const bool upward = gearshift_action_rank(cfg) > gearshift_action_rank(obs.current_cfg);
         const bool lower = gearshift_action_rank(cfg) < gearshift_action_rank(obs.current_cfg);
+        // An uncertain safer candidate may be measured through the same bounded
+        // probation lifecycle used for upward discovery, but only after the
+        // post-change current regime has supplied the policy's required fresh
+        // application and outcome population. This absorbs a one-batch dropout
+        // without making historical uncertainty a permanent veto on coasting.
+        const bool lower_probe_ready = lower && cfg == next_feasible_lower_rung &&
+            current.live_samples >= policy.probe_min_application_samples &&
+            obs.outcome_samples >= policy.probe_min_outcome_samples;
         if (upward && tick_counter < upward_probe_suppressed_until_tick &&
             !p.direct_evidence) continue;
 
@@ -2430,13 +2444,13 @@ ladder_probe_confirmed:
             a.reason = (cold_start_acquisition && upward && p.direct_evidence)
                      ? "cold-start-calibrated-direct"
                      : "confidence-clears-switch-cost";
-        } else if (upward && probe_cooldown_remaining == 0 &&
+        } else if ((upward || lower_probe_ready) && probe_cooldown_remaining == 0 &&
                    !probe_target_blocked(cfg, obs)) {
             // Discovery advances only to the next feasible probe rung.  The
             // complete production action set therefore walks the explicit
             // compatibility ladder; sparse synthetic callers use their next
             // feasible action rather than making a hidden target unreachable.
-            if (cfg != next_feasible_probe_rung) continue;
+            if (upward && cfg != next_feasible_probe_rung) continue;
             double probe_airtime_ms = 0.0;
             std::map<int,double>::const_iterator ti = obs.tx_airtime_ms.find(cfg);
             if (ti != obs.tx_airtime_ms.end() && ti->second > 0.0)
@@ -2478,18 +2492,14 @@ ladder_probe_confirmed:
                 a.utility_bps = probe_net;
                 a.net_bps = probe_net;
                 a.ladder_step = compatibility_ladder_acquisition;
-                a.reason = cold_start_acquisition
-                         ? "cold-start-ladder-probe"
-                         : "ladder-information-probe";
+                a.reason = lower
+                         ? "lower-information-probe"
+                         : (cold_start_acquisition
+                            ? "cold-start-ladder-probe"
+                            : "ladder-information-probe");
             } else {
                 saw_uneconomic_probe = true;
             }
-        } else if (lower &&
-                   net > current.mean_bps * (1.0 + policy.direct_switch_margin)) {
-            a.valid = true;
-            a.action = GEARSHIFT_ACTION_SWITCH;
-            a.utility_bps = net;
-            a.reason = "lower-mode-net-goodput";
         }
 
         if (a.valid && (!chosen.valid || a.utility_bps > chosen.utility_bps))
@@ -2612,7 +2622,7 @@ int cl_rate_optimizer::consume_failure_signal(
                              GEARSHIFT_ACTION_ROLLBACK, target_cfg,
                              now_ms, is_nb);
     std::printf("[GEARSHIFT-V2-COASTDOWN] OWN signal=%s; controller issued "
-                "%d->%d action=ROLLBACK transport=ACKED_SET_CONFIG\n",
+                "%d->%d action=ROLLBACK transport=CONFIG_TAG_CANONICAL\n",
                 why, current_cfg, target_cfg);
     std::fflush(stdout);
     return target_cfg;

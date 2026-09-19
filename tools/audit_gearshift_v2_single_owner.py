@@ -83,10 +83,17 @@ req("emergency NACK is absorbed as input and GS2 issues the coast-down",
     and '"emergency_nack_threshold", true, true' in CMD
     and "config_ladder_down(current_cfg, robust_enabled)" in OPT_CC
     and "controller issued" in OPT_CC)
-req("owned coast-down uses coordinated ACKed transport",
-    "coordinated_coastdown" in setcfg
-    and "owns_coastdown_transition" in setcfg
-    and "coordinated SET_CONFIG control handshake" in setcfg)
+req("owned ordinary coast-down uses canonical CONFIG_TAG transport",
+    "Every ordinary intra-tier GS2 probe, switch, rollback, and coast-down" in setcfg
+    and "inband_unilateral_config_change(inband_target)" in setcfg
+    and "coordinated_coastdown" not in setcfg)
+req("legacy SET_CONFIG exceptions are enumerated with transport reasons",
+    all(x in setcfg for x in (
+        "SPECIAL_CASE=CROSS_TIER",
+        "dedicated ACK bridges robust<->OFDM acquisition",
+        "SPECIAL_CASE=TAG_UNAVAILABLE",
+        "NB/M<16 exposes no CONFIG_TAG carrier",
+    )))
 
 a = setcfg.find("authorize_external_transition(")
 t = setcfg.find("inband_unilateral_config_change(")

@@ -2330,13 +2330,11 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		}
 		else if(ack_pattern_time_ms > 0)
 		{
-			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT
-			// ACTIVE-v2 upward probes deliberately reuse the ACKed SET_CONFIG
-			// transport, but ACTIVE disables the legacy turboshift state machine.
-			// The commander already arms the extended ACK decoder for an upward
-			// gearshift SET_CONFIG; sending a bare ACK here strands the commander at
-			// the source after this responder adopts the target. Use the same
-			// ACK+SNR control response as the proven legacy climb. The SNR payload is
+			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT.
+			// ACTIVE-v2 reaches SET_CONFIG only for the enumerated cross-tier or
+			// tag-carrier-unavailable exceptions. Those dedicated-ACK transitions
+			// still need the extended response; sending a bare ACK would strand the
+			// commander after this responder adopts the target. The SNR payload is
 			// advisory telemetry; it is not an admission gate for the v2 policy.
 			bool is_coordinated_setconfig =
 				(turboshift_active || turboshift_phase != TURBO_DONE ||
@@ -8047,8 +8045,8 @@ int cl_arq_controller::test_inband_liveness()
 
 	// ========================================================================
 	// PART B7 — EMERGENCY/NACK IS INPUT, NOT AUTHORITY: GS2 selects and owns
-	// the lower rung, then the preserved lossless demote path emits a real
-	// coordinated SET_CONFIG (not an external unilateral CONFIG_TAG move).
+	// the lower rung, then the preserved lossless demote path commits the canonical
+	// CONFIG_TAG transition. It remains owner-controlled and peer-confirmed.
 	// ========================================================================
 	{
 		cl_telecom_system* ts = nullptr;
@@ -8072,16 +8070,16 @@ int cl_arq_controller::test_inband_liveness()
 		check(routed,
 			"B7.3 preserved lossless demote machinery accepts the owned move",
 			routed ? 1 : 0, 1);
-		check(cmd->messages_control.status != FREE &&
-		      cmd->messages_control.data != NULL &&
-		      cmd->messages_control.data[0] == SET_CONFIG,
-			"B7.4 owned coast-down emits coordinated SET_CONFIG on the wire",
-			(cmd->messages_control.data != NULL)
-				? (int)(unsigned char)cmd->messages_control.data[0] : -1,
-			(int)(unsigned char)SET_CONFIG);
-		check(!cmd->inband_unilateral_armed,
-			"B7.5 owned coast-down does not yield to unilateral CONFIG_TAG",
-			cmd->inband_unilateral_armed ? 1 : 0, 0);
+		check(cmd->messages_control.status == FREE,
+			"B7.4 ordinary owned coast-down emits no legacy SET_CONFIG control frame",
+			cmd->messages_control.status, FREE);
+		check(cmd->inband_unilateral_armed,
+			"B7.5 ordinary owned coast-down arms canonical CONFIG_TAG transport",
+			cmd->inband_unilateral_armed ? 1 : 0, 1);
+		check(cmd->current_configuration == CONFIG_10 &&
+		      cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_10,
+			"B7.6 CONFIG_TAG coast commits locally and repeats until peer confirmation",
+			cmd->current_configuration, CONFIG_10);
 		delete cmd; delete ts;
 	}
 
@@ -8351,10 +8349,10 @@ int cl_arq_controller::test_inband_retag()
 	const int CFG_HI  = CONFIG_11;  // ladder idx 14 (a 2-rung CLIMB above CFG_LO)
 
 	// ========================================================================
-	// PART A0 — ACTIVE-V2 PROBE TRANSPORT REGRESSION: an upward discovery probe
-	// uses the coordinated SET_CONFIG path. The commander stays at the source
-	// until the existing SET_CONFIG ACK apply path loads the target and closes
-	// switch_inflight; no CONFIG_TAG/re-tag state is armed for the probe.
+	// PART A0 — ACTIVE-V2 PROBE TRANSPORT REGRESSION: an ordinary upward discovery
+	// probe uses canonical CONFIG_TAG. The commander commits locally, queues no
+	// SET_CONFIG frame, repeats the tag, and keeps switch_inflight open until a
+	// config-discriminating SACK proves that the peer followed.
 	// ========================================================================
 	{
 		cl_telecom_system* ts_cmd = nullptr;
@@ -8365,31 +8363,29 @@ int cl_arq_controller::test_inband_retag()
 
 		cmd->negotiated_configuration = CONFIG_16;
 		cmd->add_message_control(SET_CONFIG);
-		check(cmd->current_configuration == CONFIG_0,
-			"A0.1 ACTIVE probe stays at CONFIG_0 until the SET_CONFIG ACK",
-			cmd->current_configuration, CONFIG_0);
-		check(cmd->messages_control.status != FREE && cmd->messages_control.data != NULL
-			&& cmd->messages_control.data[0] == SET_CONFIG,
-			"A0.2 ACTIVE probe queues the coordinated SET_CONFIG control frame",
-			(cmd->messages_control.status != FREE && cmd->messages_control.data != NULL
-			 && cmd->messages_control.data[0] == SET_CONFIG) ? 1 : 0, 1);
-		check(cmd->rate_opt.switch_inflight_for_test(),
-			"A0.3 queued control frame does NOT confirm the v2 transaction",
-			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
-		check(!cmd->inband_retag_armed,
-			"A0.4 coordinated probe arms no CONFIG_TAG re-tag state",
-			cmd->inband_retag_armed ? 1 : 0, 0);
-
-		// Mirror the production SET_CONFIG-ACK apply body.
-		cmd->messages_control_backup();
-		cmd->load_configuration(CONFIG_16, PHYSICAL_LAYER_ONLY, YES);
-		cmd->messages_control_restore();
-		cmd->rate_opt.notify_switch_confirmed(1200);
 		check(cmd->current_configuration == CONFIG_16,
-			"A0.5 SET_CONFIG ACK apply loads the probe target",
+			"A0.1 ACTIVE probe commits locally through canonical CONFIG_TAG",
 			cmd->current_configuration, CONFIG_16);
-		check(!cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active(),
-			"A0.6 SET_CONFIG ACK closes switch_inflight and begins probe probation",
+		check(cmd->messages_control.status == FREE,
+			"A0.2 ACTIVE probe queues no legacy SET_CONFIG control frame",
+			cmd->messages_control.status, FREE);
+		check(cmd->rate_opt.switch_inflight_for_test(),
+			"A0.3 local CONFIG_TAG commit does NOT confirm peer follow",
+			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
+		check(cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_16,
+			"A0.4 canonical probe arms repeat-until-confirmed CONFIG_TAG state",
+			(cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_16) ? 1 : 0, 1);
+
+		uint8_t probe_parity = 0;
+		const int PROBE_BSI = 7;
+		bool emitted = cmd->inband_tag_firing_decision(CONFIG_16, PROBE_BSI, &probe_parity);
+		check(emitted && cmd->inband_announce_bsi == PROBE_BSI,
+			"A0.5 first probe batch emits CONFIG_TAG and latches its BSI",
+			(emitted && cmd->inband_announce_bsi == PROBE_BSI) ? 1 : 0, 1);
+		bool confirmed = cmd->inband_retag_confirm_from_sack(PROBE_BSI);
+		check(confirmed && !cmd->inband_retag_armed &&
+		      !cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active(),
+			"A0.6 config-discriminating SACK closes tag transition and begins probation",
 			(!cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active()) ? 1 : 0, 1);
 
 		delete cmd; delete ts_cmd;
@@ -9057,9 +9053,9 @@ int cl_arq_controller::test_inband_nack()
 		cl_arq_controller* cmd = make_cmd(CFG_LO);
 		cmd->inband_last_confirmed_config = CFG_LO;   // RX provably reached CONFIG_9
 
-		// Arm a legacy/non-probe CONFIG_TAG climb. ACTIVE upward discovery probes
-		// use coordinated SET_CONFIG and are covered by PART A0 above; this part
-		// remains the transport-level NACK/accelerated-demote regression.
+		// Arm a legacy/non-probe CONFIG_TAG climb. PART A0 separately proves the
+		// ACTIVE canonical-probe lifecycle; this part remains the transport-level
+		// NACK/accelerated-demote regression.
 		cmd->negotiated_configuration = CFG_HI;
 		cmd->add_message_control(SET_CONFIG);
 		cmd->process_messages_tx_control();
@@ -9446,10 +9442,10 @@ int cl_arq_controller::test_inband_seamless()
 			tag_written = ts->generate_config_tag_pattern_passband(tag_burst.data(), tones, n_tones);
 		}
 
-		// Lead margin: leave room for the tag burst (if any) + a few symbols, then place
-		// the frame preamble. forced_delay is measured from window start to the preamble.
-		int lead_syms = with_tag ? ((tag_written + sym_samples - 1) / sym_samples + 4) : 8;
-		int forced_delay = (lead_syms * Nofdm + 2 * Nofdm) * interp;  // preamble start
+		// Production keys frame 0 immediately after the tag. Reproduce that exact gapless
+		// boundary: with a tag, the OFDM waveform begins at tag_written, with no synthetic
+		// clean-lock guard. A no-tag fixture retains ordinary receiver lead-in.
+		int forced_delay = with_tag ? tag_written : (10 * sym_samples);
 		float sigma = 1e-3f;
 		int n_frame = (Nofdm * (Nsymb + preN)) * interp;
 		ts->awgn_channel.apply_with_delay(

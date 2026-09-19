@@ -5847,10 +5847,15 @@ int cl_arq_controller::detect_and_follow_config_tag(const double* energies,
 	// adopt on the snapshot's NORMALIZED SC metric (>= 0.9, the "prominent peak" discriminant the
 	// codebase already cites at arq_common.cc:12586): a contaminated lock is REJECTED here (no
 	// follow) so the RX retries next pass on a fresher (clean single-burst) window. The snapshot
-	// context is set by the snapshot/capture callers; if absent (e.g. the down-ladder adopt,
-	// which already self-gates on a CRC/LDPC decode — INV-C) the gate passes through. Only
+	// context is set only by the trailing/capture caller; if absent (the pre-frame header
+	// path or down-ladder) the gate passes through. Only
 	// applies to an OFDM-target adopt (the contamination is an OFDM-acquisition problem); a
 	// robust/MFSK target is judged by its own machinery. Feature-gated (legacy byte-identical).
+	// The pre-frame tag is itself the protocol header for a PHY transition. Its snapshot
+	// contains a gapless frame in the ANNOUNCED geometry, so evaluating that snapshot
+	// using the still-loaded OLD geometry is circular and permanently deferred the clean
+	// 16->15 transition. CRC/binding authenticates the header; the target frame decoder
+	// and config-discriminating SACK confirm the follow.
 	// A validated scream explicitly opens a one-shot blind re-entry window. In
 	// that state the CRC/binding-valid CONFIG_TAG is the synchronization anchor;
 	// applying the ordinary old-config OFDM clean-lock gate would circularly
@@ -6865,18 +6870,15 @@ int cl_arq_controller::inband_detect_follow_from_snapshot(double* snapshot, int 
 
 	// Wrap-decode (bsi + parity UNBOUND) + FOLLOW (load_configuration both copies + the
 	// HINGE port). detect_and_follow_config_tag no-ops if the decoded cfg == current
-	// (a stale re-detect of the previous tag), so a no-change is safe.
-	// CLEAN-LOCK ADOPT GATE (data-flow-inband-adopt-metric-gate.md §2): publish the SAME
-	// snapshot the OFDM acquisition is about to consume so the adopt-commit point can judge
-	// the OFDM lock quality and reject a contaminated re-air window. Cleared after the follow.
+	// (a stale re-detect of the previous tag), so a no-change is safe. Do NOT publish
+	// this pre-frame snapshot to the legacy clean-lock gate: the target frame is in the
+	// announced geometry while the metric helper is necessarily still loaded for the old
+	// geometry. The trailing/capture path continues to publish its old-geometry snapshot
+	// and retains the contaminated re-air protection.
 	int cfg_before = current_configuration;
 	int followed_cfg = current_configuration;
-	inband_adopt_gate_snapshot     = snapshot;
-	inband_adopt_gate_snapshot_len = len;
 	int followed = detect_and_follow_config_tag(energies.data(), chips, n_syms,
 		/*expect_bsi_lsb=*/0xFF, /*expect_parity=*/0xFF, &followed_cfg);
-	inband_adopt_gate_snapshot     = NULL;
-	inband_adopt_gate_snapshot_len = 0;
 
 	// On a REAL switch, RE-STAGE the saved capture into the member buffer the follow
 	// just (re)allocated at the new config. NOTE: after the switch `snapshot` (the OLD

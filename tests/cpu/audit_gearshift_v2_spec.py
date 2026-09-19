@@ -292,6 +292,18 @@ req("cold-start-calibration-can-authorize-faster-direct-acquisition",
     "cold-start-calibrated-direct" in ro and
     "calibrated fast action can direct-switch on cold start" in core_test,
     "in-support empirical calibration remains first-class and can clear direct-switch confidence before no-table discovery")
+req("ordinary-coast-is-risk-adjusted",
+    allin(ro, "lcb > current_ucb * (1.0 + policy.direct_switch_margin)",
+          "context_volatility", "context_volatility_alpha",
+          "lower_probe_ready", "lower-information-probe",
+          "current.live_samples >= policy.probe_min_application_samples",
+          "obs.outcome_samples >= policy.probe_min_outcome_samples") and
+    "lower-mode-net-goodput" not in ro and
+    allin(core_test,
+          "uncertain optimistic lower rung cannot coast against punished current estimate",
+          "confident lower rung still coasts when its LCB clears current UCB",
+          "stable evidence decays transient volatility"),
+    "ordinary economic coasts require target LCB to clear current UCB; after a full fresh-regime population, an uncertain safer rung may use the existing bounded probation lifecycle")
 req("probe-probation-is-goodput-authoritative-and-channel-time-bounded",
     allin(roh, "probe_min_application_samples", "probe_min_outcome_samples",
           "probe_max_probation_ms", "probe_zero_progress_ms", "probe_ladder_step") and
@@ -414,20 +426,19 @@ req("active-v2-uses-config-tag-transport-without-second-selector",
     allin(common, "if(rate_opt.controls_link()) return true",
           "CONFIG_TAG is transport/synchronization",
           "ACTIVE decides *where* to go; CONFIG_TAG decides *how the") and
-    allin(cmd, "bool coordinated_probe = rate_opt.controls_link()",
-          "LADDER-PROBE", "coordinated SET_CONFIG control handshake",
+    allin(cmd, "SET_CONFIG is legacy and is reserved here for two transport exceptions",
+          "SPECIAL_CASE=CROSS_TIER", "SPECIAL_CASE=TAG_UNAVAILABLE",
+          "Every ordinary intra-tier GS2 probe, switch, rollback, and coast-down",
           "else if(inband_unilateral_config_change(inband_target))",
           "NO control frame on the wire") and
-    allin(rsp, "is_coordinated_setconfig", "rate_opt.controls_link()",
-          "ACK+SNR control response as the proven legacy climb",
-          "advisory telemetry; it is not an admission gate") and
+    "coordinated_probe" not in cmd and "coordinated_coastdown" not in cmd and
     allin(common, "inband_unilateral_config_change(int target_cfg)",
           "load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES)",
           "inband_retag_armed   = true",
           "LOCAL load_configuration() is not peer-follow evidence") and
     allin(cmd, "bool optimizer_owns_upward_frame = optimizer_is_in_control()",
           "!optimizer_owns_upward_frame"),
-    "Gearshift-v2 remains the sole ordinary Axis-1 selector; upward discovery probes and every downward coast use proven ACKed SET_CONFIG while remaining intra-tier moves retain CONFIG_TAG")
+    "Gearshift-v2 remains the sole ordinary Axis-1 selector and CONFIG_TAG is the canonical transport for ordinary intra-tier upward probes and downward coasts")
 req("active-v2-absorbs-emergency-nack-as-controller-input",
     allin(roh, "consume_failure_signal(int current_cfg", "owns_coastdown_transition") and
     allin(ro, "cl_rate_optimizer::consume_failure_signal(",
@@ -440,19 +451,37 @@ req("active-v2-absorbs-emergency-nack-as-controller-input",
           "GS2 owns coast-down transaction",
           "failure during probe returns to owner fallback"),
     "existing block-failure/NACK detection is telemetry input; ACTIVE GS2 chooses and owns the coast-down destination")
-req("active-v2-owned-coastdown-uses-acked-transport",
-    allin(cmd, "coordinated_coastdown", "owns_coastdown_transition",
-          'coordinated_coastdown ? "OWNER-COASTDOWN" : "LADDER-PROBE"',
-          "coordinated SET_CONFIG control handshake") and
-    "transport=ACKED_SET_CONFIG" in ro and
-    allin(rsp, "B7.4 owned coast-down emits coordinated SET_CONFIG on the wire",
-          "B7.5 owned coast-down does not yield to unilateral CONFIG_TAG") and
+req("active-v2-owned-coastdown-uses-canonical-config-tag",
+    allin(cmd, "Every ordinary intra-tier GS2 probe, switch, rollback, and coast-down",
+          "else if(inband_unilateral_config_change(inband_target))") and
+    "transport=CONFIG_TAG_CANONICAL" in ro and
+    allin(rsp, "B7.4 ordinary owned coast-down emits no legacy SET_CONFIG control frame",
+          "B7.5 ordinary owned coast-down arms canonical CONFIG_TAG transport",
+          "B7.6 CONFIG_TAG coast commits locally and repeats until peer confirmation") and
     allin(text("tests/cpu/test_rate_optimizer.cc"),
-          "ordinary GS2 downshift is coordinated coast-down") and
+          "ordinary GS2 downshift is an owned canonical-tag coast-down") and
     allin(ro, "bool cl_rate_optimizer::owns_coastdown_transition",
           "return transition_matches(from_cfg, to_cfg) &&",
           "gearshift_action_rank(to_cfg) < gearshift_action_rank(from_cfg)"),
-    "every GS2-owned downward move, including emergency rollback, uses proven coordinated SET_CONFIG/ACK rather than CONFIG_TAG")
+    "every ordinary GS2-owned downward move, including emergency rollback, uses canonical repeat-until-confirmed CONFIG_TAG")
+req("active-v2-upward-probe-uses-canonical-config-tag",
+    allin(rsp,
+          "A0.1 ACTIVE probe commits locally through canonical CONFIG_TAG",
+          "A0.2 ACTIVE probe queues no legacy SET_CONFIG control frame",
+          "A0.4 canonical probe arms repeat-until-confirmed CONFIG_TAG state",
+          "A0.6 config-discriminating SACK closes tag transition and begins probation"),
+    "ordinary upward discovery uses CONFIG_TAG and cannot be locally mistaken for peer confirmation")
+req("active-v2-setconfig-special-cases-are-enumerated",
+    allin(cmd, "SPECIAL_CASE=CROSS_TIER", "dedicated ACK bridges robust<->OFDM acquisition",
+          "SPECIAL_CASE=TAG_UNAVAILABLE", "NB/M<16 exposes no CONFIG_TAG carrier") and
+    "coordinated_probe" not in cmd and "coordinated_coastdown" not in cmd,
+    "legacy SET_CONFIG is reserved for cross-tier acquisition and configurations without a tag carrier, each with its technical reason")
+req("preframe-config-tag-is-not-gated-on-old-phy-geometry",
+    allin(common, "Do NOT publish", "pre-frame snapshot", "still-loaded OLD geometry",
+          "trailing/capture path continues to publish") and
+    "inband_adopt_gate_snapshot     = snapshot" not in common and
+    allin(rsp, "exact gapless", "with no synthetic", "A0 RX FOLLOWS the pre-frame tag"),
+    "a CRC-valid pre-frame transition is followed before target-frame decode; only trailing old-geometry captures retain the contamination gate")
 req("active-v2-config-tag-transition-closes-from-peer-evidence",
     allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
           "config-discriminating SACK at/after the announce BSI",
@@ -462,7 +491,7 @@ req("active-v2-config-tag-transition-closes-from-peer-evidence",
           "inband_handle_nack(uint8_t rx_cfg_index",
           "explicit evidence that this CONFIG_TAG transition failed") and
     allin(cmd, "bool tier_crossing = inband_config_change_is_tier_crossing(inband_target)",
-          "if(coordinated_probe || coordinated_coastdown)",
+          "if(tier_crossing)", "else if(tag_transport_unavailable)",
           "else if(inband_unilateral_config_change(inband_target))",
           "NO control frame on the wire") and
     allin(text("tests/cpu/test_gearshift_v2.cc"),
@@ -470,7 +499,7 @@ req("active-v2-config-tag-transition-closes-from-peer-evidence",
           "matching peer confirmation closes the live transition",
           "mismatched peer failure is ignored",
           "matching peer failure closes the live transition"),
-    "ACTIVE non-probe intra-OFDM CONFIG_TAG transitions remain in-flight until matching peer follow proves the selected target or matching failure evidence terminates it; coordinated probes close through the existing SET_CONFIG ACK path")
+    "ACTIVE ordinary intra-tier CONFIG_TAG transitions remain in-flight until matching peer follow proves the selected target or matching failure evidence terminates it; only enumerated transport exceptions close through SET_CONFIG ACK")
 req("active-v2-owns-ordinary-ladder-down",
     "GEARSHIFT_V2_ACTIVE" in arqh and "optimizer_owns_normal_downshift" in arqh and
     "return true;  // v2 owns ordinary downshift" in arqh,
@@ -497,10 +526,10 @@ req("emergency-break-synchronizes-v2",
     allin(common, "void cl_arq_controller::send_break_pattern()",
           "notify_external_axis1_transition", "emergency-break"),
     "BREAK cannot leave a v2 probe/switch context alive across emergency recovery")
-req("probe-setconfig-failure-has-negative-memory",
+req("probe-transport-failure-has-negative-memory",
     allin(ro, "notify_switch_failed", "blocked_until_tick", "probe_cooldown_remaining") and
-    "failed probe SET_CONFIG is remembered" in text("tests/cpu/test_gearshift_v2.cc"),
-    "an undecodable probe transition cannot be re-attempted immediately")
+    "failed probe transport is remembered" in text("tests/cpu/test_gearshift_v2.cc"),
+    "an unconfirmed probe transition cannot be re-attempted immediately")
 req("break-remains-independent-emergency",
     allin(common, "emergency_break_active", "BREAK") and
     "if (emergency_break_active != 0)" in common,

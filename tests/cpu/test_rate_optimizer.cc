@@ -130,7 +130,7 @@ int main()
 
     coast.notify_switch_dispatched(16, 15,
         GEARSHIFT_ACTION_SWITCH, 16, 1500, false);
-    expect_true("ordinary GS2 downshift is coordinated coast-down",
+    expect_true("ordinary GS2 downshift is an owned canonical-tag coast-down",
         coast.owns_coastdown_transition(16, 15));
     coast.notify_switch_confirmed(1600);
 
