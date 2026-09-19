@@ -8,6 +8,7 @@
  */
 
 
+#define _GNU_SOURCE 1  /* expose pthread_timedjoin_np for bounded shutdown joins */
 #include <stdint.h>
 #include <stdbool.h>
 /* R006: shutdown_ is an atomic flag shared with main.cc (std::atomic<bool>).
@@ -404,6 +405,33 @@ static bool playback_thread_started = false;
 static bool capture_prep_thread_started = false;
 static audioio_pthread_create_fn audioio_pthread_create = pthread_create;
 static audioio_pthread_join_fn audioio_pthread_join = pthread_join;
+// A test may inject the join primitive (audioio_set_thread_functions_for_test);
+// when it does, teardown honors it verbatim. On the PRODUCTION path no join is
+// injected and audioio_join_started_threads() uses a BOUNDED join instead, so a
+// device thread wedged inside a blocking backend call can never hang process
+// exit past the grace (a hang holds the sound card open and locks the box for
+// every other user).
+static bool audioio_pthread_join_overridden = false;
+
+// Upper bound on how long shutdown waits for ALL device threads to unwind and
+// release their sound cards. Sized under the >=10 s teardown grace the
+// supervisor allows on SIGTERM, so a wedged thread becomes a bounded self-
+// limited exit rather than a permanent hang. Env override lets a deployment
+// match its own grace; clamped to a sane range.
+#define AUDIOIO_SHUTDOWN_JOIN_GRACE_MS 8000u
+static unsigned audioio_shutdown_join_grace_ms(void)
+{
+	const char *e = getenv("MERCURY_AUDIO_SHUTDOWN_GRACE_MS");
+	if(e == NULL || e[0] == '\0')
+		return AUDIOIO_SHUTDOWN_JOIN_GRACE_MS;
+	char *end = NULL;
+	unsigned long v = strtoul(e, &end, 10);
+	if(end == e)
+		return AUDIOIO_SHUTDOWN_JOIN_GRACE_MS;
+	if(v < 200ul) v = 200ul;      // floor: always give a healthy thread time to close
+	if(v > 60000ul) v = 60000ul;  // ceiling: never wait longer than a minute
+	return (unsigned)v;
+}
 typedef void *(*audioio_malloc_fn)(size_t);
 static audioio_malloc_fn audioio_capture_malloc = malloc;
 static audioio_malloc_fn audioio_payload_malloc = malloc;
@@ -462,6 +490,7 @@ void audioio_set_thread_functions_for_test(audioio_pthread_create_fn create_fn,
 {
 	audioio_pthread_create = create_fn != NULL ? create_fn : pthread_create;
 	audioio_pthread_join = join_fn != NULL ? join_fn : pthread_join;
+	audioio_pthread_join_overridden = join_fn != NULL;
 }
 
 struct rt_priority_test_args {
@@ -582,16 +611,74 @@ static int audioio_start_thread(pthread_t *thread, void *(*entry)(void *),
 	return result;
 }
 
+// Join one shutting-down device thread with a hard upper bound. Device threads
+// run while(!shutdown_) loops and release their sound card in their own cleanup
+// (audio->free -> snd_pcm_close) once the loop observes the flag; on a healthy
+// card that is within one period, so the common case joins almost immediately.
+// But the backend read/write path can block indefinitely (a stalled stream
+// never completes another period) and the vendored backend retries EINTR
+// internally, so a thread can fail to observe shutdown_ at all. An UNBOUNDED
+// join there hangs process exit forever, holding the card open for every user
+// of the box. When the join exceeds the shared grace we detach the thread and
+// continue teardown so the process still exits; card release then falls to
+// process exit. A test-injected join is honored verbatim (its worker observes
+// shutdown_ and exits promptly).
+static void audioio_join_one_bounded(pthread_t thread,
+                                     const struct timespec *deadline,
+                                     const char *name)
+{
+#if defined(_WIN32)
+	(void)deadline; (void)name;
+	audioio_pthread_join(thread, NULL);
+#else
+	if(audioio_pthread_join_overridden)
+	{
+		audioio_pthread_join(thread, NULL);
+		return;
+	}
+	int rc = pthread_timedjoin_np(thread, NULL, deadline);
+	if(rc == 0)
+		return;
+	if(rc == ETIMEDOUT)
+		fprintf(stderr,
+			"[AUDIO-SHUTDOWN-TIMEOUT] %s thread did not release its card within the "
+			"shutdown grace; detaching and continuing teardown so the process still "
+			"exits (card release falls to process exit)\n", name);
+	else
+		fprintf(stderr,
+			"[AUDIO-SHUTDOWN-TIMEOUT] %s thread join failed (%d); detaching and "
+			"continuing teardown\n", name, rc);
+	fflush(stderr);
+	pthread_detach(thread);
+#endif
+}
+
 static void audioio_join_started_threads(pthread_t *radio_capture,
 										 pthread_t *radio_playback,
 										 pthread_t *radio_capture_prep)
 {
+	// One shared deadline across all three joins, so TOTAL teardown is bounded by
+	// the grace rather than grace-per-thread.
+	struct timespec deadline;
+#if !defined(_WIN32)
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	const unsigned grace_ms = audioio_shutdown_join_grace_ms();
+	deadline.tv_sec  += (time_t)(grace_ms / 1000u);
+	deadline.tv_nsec += (long)((grace_ms % 1000u) * 1000000ul);
+	if(deadline.tv_nsec >= 1000000000L)
+	{
+		deadline.tv_sec  += 1;
+		deadline.tv_nsec -= 1000000000L;
+	}
+#else
+	memset(&deadline, 0, sizeof(deadline));
+#endif
 	if(capture_prep_thread_started)
-		audioio_pthread_join(*radio_capture_prep, NULL);
+		audioio_join_one_bounded(*radio_capture_prep, &deadline, "capture_prep");
 	if(capture_thread_started)
-		audioio_pthread_join(*radio_capture, NULL);
+		audioio_join_one_bounded(*radio_capture, &deadline, "capture");
 	if(playback_thread_started)
-		audioio_pthread_join(*radio_playback, NULL);
+		audioio_join_one_bounded(*radio_playback, &deadline, "playback");
 	capture_prep_thread_started = false;
 	capture_thread_started = false;
 	playback_thread_started = false;
@@ -1477,9 +1564,19 @@ void *radio_playback_thread(void *device_ptr)
 	fclose(tap);
 #endif
 
-    r = audio->drain(b);
-    if (r < 0)
-        printf("ffaudio.drain: %s", audio->error(b));
+    // Shutdown skips the blocking backend drain: this cleanup only runs after
+    // the while(!shutdown_) loop has already exited, i.e. we are tearing down.
+    // The drain waits for the ALSA ring to play out and can spin indefinitely on
+    // a stalled DAC, which would push this thread past the shutdown grace and
+    // strand its card. audio->free() below (snd_pcm_close) stops the stream and
+    // releases the substream; the un-played tail (~one buffer) is discarded,
+    // which is the correct trade for a bounded, reliable teardown.
+    if(!shutdown_.load(std::memory_order_acquire))
+    {
+        r = audio->drain(b);
+        if (r < 0)
+            printf("ffaudio.drain: %s", audio->error(b));
+    }
 
     r = audio->stop(b);
     if (r != 0)
