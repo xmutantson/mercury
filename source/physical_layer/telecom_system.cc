@@ -1928,7 +1928,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			static int pb_diag_last_key = -1;
 			int pb_key = current_configuration * 10 + narrowband_enabled;
 			if(pb_key != pb_diag_last_key) { pb_diag_count = 0; pb_diag_last_key = pb_key; }
-			if(pb_diag_count < 3)
+			if(g_verbose && pb_diag_count < 3)
 			{
 				pb_diag_count++;
 				int pb_total = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
@@ -3092,9 +3092,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// SGTL5000 signals at -40 dBFS.
 			if(data_e < energy_gate_floor || (pream_mean_energy > energy_gate_floor && data_e < pream_mean_energy * 0.1))
 			{
-				printf("[OFDM-SYNC] data_energy=%.2e pream_energy=%.2e at pream=%d delay=%d — frame incomplete, skipping decode\n",
-					data_e, pream_mean_energy, pream_symb_loc, receive_stats.delay);
-				fflush(stdout);
+				if(g_verbose)
+				{
+					printf("[OFDM-SYNC] data_energy=%.2e pream_energy=%.2e at pream=%d delay=%d — frame incomplete, skipping decode\n",
+						data_e, pream_mean_energy, pream_symb_loc, receive_stats.delay);
+					fflush(stdout);
+				}
 				energy_ok = false;
 				receive_stats.frame_data_missing = true;
 			}

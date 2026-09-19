@@ -78,8 +78,15 @@ req("routine-compact-confirm-clears-peer-turnaround-before-next-data",
     "a CRC-valid routine confirm causally stamps the existing geometry-derived turnaround clearance; the next DATA burst cannot key while the peer is still draining and re-arming")
 req("compact-confirm-rearms-rx-after-ptt-release",
     allin(common, "PTT release precedes RX re-arm",
-          "start the derived block-span budget", "bigblock_block_ftr_or(rx_frame + 10)"),
+          "start the derived block-span budget", "settle_symbols",
+          "ptt_on_delay_ms + ptt_off_delay_ms"),
     "known PTT-off silence cannot consume the next cfg16 block acquisition budget; the responder begins counting only when forward capture is actually re-armed")
+req("incomplete-active-block-waits-for-tail-without-lost-tag-probing",
+    allin(common, "in_forward_active_batch", "!received_message_stats.frame_data_missing",
+          "Expanding that wait to a full block scrolls", "forward_batch=%d") and
+    allin(rsp, "!telecom_system->receive_stats.frame_data_missing",
+          "not lost-tag evidence"),
+    "an active-batch preamble with a not-yet-captured tail is preserved and retried after a short wait; it cannot launch alternate-config decode or a full-block scroll")
 req("primitive-ledger-carries-attempt-lineage-and-generation",
     allin(arqh, "lineage_valid=%d", "new_sent=%u", "repair_sent=%u", "cfg_gen=%u", "unit_id=%llu", "dir=forward") and
     allin(cal, "lineage_valid", "new_sent", "repair_sent", "config_generation", "application_unit_id", "direction"),

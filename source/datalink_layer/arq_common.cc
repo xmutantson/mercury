@@ -19060,7 +19060,20 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	{
 		int rx_frame = telecom_system->data_container.preamble_nSymb
 		             + telecom_system->data_container.Nsymb;
-		telecom_system->data_container.frames_to_read = bigblock_block_ftr_or(rx_frame + 10);
+		int symbol_samples = telecom_system->data_container.Nofdm
+		                   * telecom_system->data_container.interpolation_rate;
+		const double settle_samples = telecom_system->sampling_frequency
+			* (double)(ptt_on_delay_ms + ptt_off_delay_ms) / 1000.0;
+		int settle_symbols = symbol_samples > 0
+			? (int)std::ceil(settle_samples / (double)symbol_samples) : 1;
+		if(settle_symbols < 1) settle_symbols = 1;
+		telecom_system->data_container.frames_to_read =
+			bigblock_block_ftr_or(rx_frame + settle_symbols);
+		printf("[TX-MFSK-COMPACT] post-release RX re-arm ftr=%d settle_symbols=%d "
+		       "(ptt_on=%dms ptt_off=%dms)\n",
+			telecom_system->data_container.frames_to_read.load(), settle_symbols,
+			ptt_on_delay_ms, ptt_off_delay_ms);
+		fflush(stdout);
 	}
 
 	if(append_quality && v2_quality)
@@ -23956,8 +23969,13 @@ void cl_arq_controller::receive()
 							&& role == COMMANDER
 							&& data_ack_received == NO
 							&& telecom_system->receive_stats.coarse_metric >= 0.5;
+						bool in_forward_active_batch = inband_rate_feature_enabled()
+							&& role == RESPONDER
+							&& link_status == CONNECTED
+							&& connection_status == RECEIVING
+							&& rsp_current_expected_batch_seq_id >= 0;
 
-						if(!in_v2_sack_dispatch)
+						if(!in_v2_sack_dispatch && !in_forward_active_batch)
 						{
 							// Preamble detected but data symbols are silence.
 							// Zero the stale preamble in the ring to prevent
@@ -23983,10 +24001,11 @@ void cl_arq_controller::receive()
 						ftr = 8;
 						telecom_system->receive_stats.ofdm_search_raw = 0;
 						telecom_system->receive_stats.ofdm_batch_active = false;
-						printf("[FTR-INCOMPLETE] pream=%d ftr=%d metric=%.3f v2_sack=%d\n",
+						printf("[FTR-INCOMPLETE] pream=%d ftr=%d metric=%.3f v2_sack=%d forward_batch=%d\n",
 							pream_symb, ftr,
 							telecom_system->receive_stats.coarse_metric,
-							in_v2_sack_dispatch ? 1 : 0);
+							in_v2_sack_dispatch ? 1 : 0,
+							in_forward_active_batch ? 1 : 0);
 						fflush(stdout);
 						SACK_TRACE("anti-spin INCOMPLETE: pream=%d ftr=%d metric=%.3f delay=%d — ring will shift by 8 syms (preserve preamble=%d)",
 							pream_symb, ftr,
@@ -24206,7 +24225,11 @@ void cl_arq_controller::receive()
 				// already handle stale preambles, so a longer wait is safe). NO-OP off-rung.
 				// Skip when ftr==0 (the same-mod opportunistic-scan immediate-rescan path,
 				// passive_monitor only) so that fast-scan semantics are unchanged.
-				if(ftr > 0) ftr = bigblock_block_ftr_or(ftr);
+				// An explicitly incomplete snapshot needs only a short wait for its
+				// already-located tail. Expanding that wait to a full block scrolls the
+				// one transmitted copy out of the ring before it can be retried.
+				if(ftr > 0 && !received_message_stats.frame_data_missing)
+					ftr = bigblock_block_ftr_or(ftr);
 				telecom_system->data_container.frames_to_read = ftr;
 				telecom_system->data_container.nUnder_processing_events = 0;
 				// === DIAG: OFDM anti-spin ftr trace ===

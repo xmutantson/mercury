@@ -862,6 +862,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && inband_last_announced_config != current_configuration
 		   && (rx_fresh_window_decoded_this_pass              // a FRESH window was staged+decoded this pass
 		       || inband_freshwin_gate_defeat())              // (A/B fail-before knob restores pre-fix firing)
+		   // A located preamble whose DATA tail is not captured yet is timing
+		   // evidence, not lost-tag evidence. Let the short wait-for-tail path
+		   // complete the same snapshot before trying alternate configurations.
+		   && !telecom_system->receive_stats.frame_data_missing
 		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
 		   && is_ofdm_config(current_configuration)           // tag only rides OFDM batches
 		   && rsp_current_expected_batch_seq_id >= 0)         // IN-FLIGHT active batch only
