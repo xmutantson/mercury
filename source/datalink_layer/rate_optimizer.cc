@@ -475,7 +475,8 @@ cl_rate_optimizer::cl_rate_optimizer()
       switch_inflight(false), switch_suppression_logged(false), switch_started_ms(0), switch_from_cfg(-1),
       switch_to_cfg(-1), switch_action(GEARSHIFT_ACTION_HOLD),
       switch_fallback_cfg(-1), switch_is_nb(false), probe_active(false), probe_confirmed(false),
-      probe_result_ready(false), probe_target_cfg(-1), probe_fallback_cfg(-1),
+      probe_result_ready(false), probe_ladder_step(false), ladder_probe_accepted_now(false),
+      probe_target_cfg(-1), probe_fallback_cfg(-1),
       probe_baseline_bps(0.0), probe_start_application_samples(0),
       probe_start_outcome_samples(0), probe_context_generation(0),
       probe_baseline_generation(0), probe_application_samples(0),
@@ -487,6 +488,7 @@ cl_rate_optimizer::cl_rate_optimizer()
       probe_initial_channel_ms(0.0), probe_max_channel_ms(0.0),
       probe_zero_progress_budget_ms(0.0), next_probe_trial_ms(0.0),
       next_probe_max_channel_ms(0.0), next_probe_zero_progress_budget_ms(0.0),
+      next_probe_ladder_step(false),
       atomic_application_transport_gain(1.0),
       atomic_application_transport_gain_valid(false), atomic_application_transport_gain_samples(0),
       context_generation(0),
@@ -1041,6 +1043,7 @@ void cl_rate_optimizer::reset_probe_evidence_for_generation(
     probe_max_channel_ms = probe_initial_channel_ms > 0.0
                          ? probe_initial_channel_ms : policy.probe_max_probation_ms;
     probe_result_ready = false;
+    probe_ladder_step = false;
     probe_start_application_samples = to ? to->application_samples : 0;
     probe_start_outcome_samples = to ? to->outcome_samples : 0;
     std::printf("[GEARSHIFT-V2] probe-generation-reset target=%d generation=%d reason=%s "
@@ -1986,12 +1989,14 @@ void cl_rate_optimizer::clear_probe()
     next_probe_trial_ms = 0.0;
     next_probe_max_channel_ms = 0.0;
     next_probe_zero_progress_budget_ms = 0.0;
+    next_probe_ladder_step = false;
 }
 
 st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
                                                  int config_ceiling)
 {
     st_rate_decision d;
+    ladder_probe_accepted_now = false;
     d.current_cfg = obs.current_cfg;
     d.target_cfg = obs.current_cfg;
     d.fallback_cfg = obs.current_cfg;
@@ -2139,6 +2144,16 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
         const double rollback_factor = d.horizon_ms > 0.0
             ? std::max(0.0, 1.0 - switch_cost_ewma_ms/d.horizon_ms) : 0.0;
         const double fallback_after_rollback = probe_baseline_bps * rollback_factor;
+        // A compatibility-safe ladder step may continue after the first clean,
+        // completed application unit.  This is still a measured-goodput/SACK
+        // verdict: zero/failed progress cannot pass, and a slower target stays
+        // in the ordinary multi-sample probation path.  The short confirmation
+        // keeps a clean 0->7->13->16 climb within the legacy time envelope.
+        const bool ladder_goodput_confirm =
+            probe_ladder_step && probe_application_samples >= 1 &&
+            probe_outcome_samples >= 1 && probe_failed_outcomes == 0 &&
+            probe_progress_events >= 1 &&
+            probe_mean >= fallback_after_rollback * policy.probe_rollback_ratio;
 
         if (hard_probe_failure) {
             remember_failed_probe(probe_target_cfg, obs, true,
@@ -2160,7 +2175,7 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
             return d;
         }
 
-        if (enough_probation) {
+        if (enough_probation || ladder_goodput_confirm) {
             const bool economically_bad =
                 probe_mean < fallback_after_rollback * policy.probe_rollback_ratio;
             if (economically_bad) {
@@ -2184,14 +2199,29 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
 
             std::printf("[GEARSHIFT-V2] probe-accept source=%d target=%d fallback=%d "
                         "app_n=%d outcome_n=%d fail_n=%d mean=%.1f ewma=%.1f "
-                        "age_ms=%.0f generation=%d\n",
+                        "age_ms=%.0f generation=%d ladder_confirm=%d\n",
                         switch_from_cfg, probe_target_cfg, probe_fallback_cfg,
                         probe_application_samples, probe_outcome_samples,
                         probe_failed_outcomes, probe_mean, probe_application_bps_ewma,
-                        probe_channel_ms, probe_context_generation);
+                        probe_channel_ms, probe_context_generation,
+                        ladder_goodput_confirm ? 1 : 0);
             std::fflush(stdout);
+            const bool accepted_ladder_step = probe_ladder_step;
             clear_probe();
-            cooldown_remaining = policy.cooldown_batches;
+            cooldown_remaining = accepted_ladder_step ? 0 : policy.cooldown_batches;
+            if (accepted_ladder_step) {
+                ladder_probe_accepted_now = true;
+                // Re-evaluate immediately from this confirmed rung. Returning
+                // HOLD here would key one extra full batch before the next
+                // decision point, defeating the bounded staged-climb cadence.
+                const int next_rung = config_probe_ladder_up(obs.current_cfg, obs.is_nb);
+                if (next_rung != obs.current_cfg && next_rung <= config_ceiling)
+                    goto ladder_probe_confirmed;
+                d.reason = "probe-accepted";
+                last_v2_decision = d;
+                emit_decision(obs, d);
+                return d;
+            }
             d.reason = "probe-accepted";
             last_v2_decision = d;
             emit_decision(obs, d);
@@ -2230,6 +2260,7 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
         return d;
     }
 
+ladder_probe_confirmed:
     const bool hard_departure =
         (obs.current_cfg >= CONFIG_0 && obs.current_cfg <= CONFIG_17 &&
          obs.current_cfg > config_ceiling);
@@ -2320,17 +2351,35 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
         double probe_trial_ms;
         double probation_budget_ms;
         double zero_progress_budget_ms;
+        bool ladder_step;
         std::string reason;
         st_action_proposal()
             : valid(false), cfg(-1), action(GEARSHIFT_ACTION_HOLD), fallback_cfg(-1),
               net_bps(0.0), utility_bps(-1.0), probe_trial_ms(0.0),
-              probation_budget_ms(0.0), zero_progress_budget_ms(0.0) {}
+              probation_budget_ms(0.0), zero_progress_budget_ms(0.0),
+              ladder_step(false) {}
     };
 
     st_action_proposal chosen;
     bool saw_candidate_prediction = false;
     bool saw_uneconomic_probe = false;
     const std::vector<int> candidates = candidate_configs(obs);
+    const int preferred_probe_rung = config_probe_ladder_up(obs.current_cfg, obs.is_nb);
+    int next_feasible_probe_rung = -1;
+    for (size_t i=0; i<candidates.size(); ++i) {
+        const int cfg = candidates[i];
+        if (gearshift_action_rank(cfg) <= gearshift_action_rank(obs.current_cfg) ||
+            !gearshift_destination_within_ofdm_ceiling(cfg, config_ceiling) ||
+            probe_target_blocked(cfg, obs))
+            continue;
+        if (next_feasible_probe_rung < 0 ||
+            gearshift_action_rank(cfg) < gearshift_action_rank(next_feasible_probe_rung))
+            next_feasible_probe_rung = cfg;
+        if (cfg == preferred_probe_rung) {
+            next_feasible_probe_rung = cfg;
+            break;
+        }
+    }
     const bool force_lower_for_failure =
         obs.failed_batch_rate >= policy.failure_direct_threshold;
     for (size_t i=0; i<candidates.size(); ++i) {
@@ -2383,6 +2432,11 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
                      : "confidence-clears-switch-cost";
         } else if (upward && probe_cooldown_remaining == 0 &&
                    !probe_target_blocked(cfg, obs)) {
+            // Discovery advances only to the next feasible probe rung.  The
+            // complete production action set therefore walks the explicit
+            // compatibility ladder; sparse synthetic callers use their next
+            // feasible action rather than making a hidden target unreachable.
+            if (cfg != next_feasible_probe_rung) continue;
             double probe_airtime_ms = 0.0;
             std::map<int,double>::const_iterator ti = obs.tx_airtime_ms.find(cfg);
             if (ti != obs.tx_airtime_ms.end() && ti->second > 0.0)
@@ -2413,15 +2467,20 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
             const double candidate_probe_factor = d.horizon_ms > 0.0
                 ? std::max(0.0, 1.0 - probe_exposure_ms/d.horizon_ms) : 0.0;
             const double probe_net = p.mean_bps * candidate_probe_factor;
+            const bool compatibility_ladder_acquisition =
+                cold_start_acquisition && cfg == preferred_probe_rung;
             if (probe_net > current.mean_bps * (1.0 + policy.probe_mean_margin) &&
-                (p.mean_bps + policy.confidence_z*p.sigma_bps) * candidate_probe_factor > current_ucb) {
+                (compatibility_ladder_acquisition ||
+                 (p.mean_bps + policy.confidence_z*p.sigma_bps) *
+                     candidate_probe_factor > current_ucb)) {
                 a.valid = true;
                 a.action = GEARSHIFT_ACTION_PROBE;
                 a.utility_bps = probe_net;
                 a.net_bps = probe_net;
+                a.ladder_step = compatibility_ladder_acquisition;
                 a.reason = cold_start_acquisition
-                         ? "cold-start-bounded-probe"
-                         : "bounded-information-probe";
+                         ? "cold-start-ladder-probe"
+                         : "ladder-information-probe";
             } else {
                 saw_uneconomic_probe = true;
             }
@@ -2458,10 +2517,12 @@ st_rate_decision cl_rate_optimizer::evaluate_v2(const st_rate_observation& obs,
         next_probe_trial_ms = chosen.probe_trial_ms;
         next_probe_max_channel_ms = chosen.probation_budget_ms;
         next_probe_zero_progress_budget_ms = chosen.zero_progress_budget_ms;
+        next_probe_ladder_step = chosen.ladder_step;
     } else {
         next_probe_trial_ms = 0.0;
         next_probe_max_channel_ms = 0.0;
         next_probe_zero_progress_budget_ms = 0.0;
+        next_probe_ladder_step = false;
     }
 
     if (d.reason == "full-failure-direct-downshift") {
@@ -2631,6 +2692,7 @@ void cl_rate_optimizer::notify_switch_dispatched(
         probe_active = true;
         probe_confirmed = false;
         probe_result_ready = false;
+        probe_ladder_step = next_probe_ladder_step;
         probe_target_cfg = to_cfg;
         probe_fallback_cfg = fallback_cfg;
         probe_context_generation = context_generation;
@@ -2657,6 +2719,7 @@ void cl_rate_optimizer::notify_switch_dispatched(
         next_probe_trial_ms = 0.0;
         next_probe_max_channel_ms = 0.0;
         next_probe_zero_progress_budget_ms = 0.0;
+        next_probe_ladder_step = false;
         const st_online_rate_model* from = online_model_const(from_cfg, switch_is_nb);
         probe_baseline_bps = from && from->initialized
                            ? from->ewma_application_bps
@@ -2668,14 +2731,15 @@ void cl_rate_optimizer::notify_switch_dispatched(
                     "reason=%s fallback_pred=%.1f target_pred=%.1f+/-%.1f "
                     "net=%.1f trial_ms=%.0f max_ms=%.0f zero_ms=%.0f "
                     "required_app=%d required_outcome=%d safety=%.2f ceiling_ms=%.0f "
-                    "generation=%d budget_source=target-geometry\n",
+                    "generation=%d ladder_step=%d budget_source=target-geometry\n",
                     from_cfg, to_cfg, fallback_cfg, last_v2_decision.reason.c_str(),
                     probe_baseline_bps, last_v2_decision.target_mean_bps,
                     last_v2_decision.target_sigma_bps, last_v2_decision.net_target_bps,
                     probe_geometry_trial_ms, probe_max_channel_ms,
                     probe_zero_progress_budget_ms, policy.probe_min_application_samples,
                     policy.probe_min_outcome_samples, policy.probe_budget_safety_factor,
-                    policy.probe_max_probation_ms, context_generation);
+                    policy.probe_max_probation_ms, context_generation,
+                    probe_ladder_step ? 1 : 0);
         std::fflush(stdout);
     }
 }

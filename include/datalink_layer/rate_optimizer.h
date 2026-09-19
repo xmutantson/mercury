@@ -388,6 +388,10 @@ public:
     st_rate_prediction predict_for_test(int cfg,
                                         const st_rate_observation& obs) const;
     bool probe_is_active() const { return probe_active; }
+    bool probe_is_ladder_step() const { return probe_active && probe_ladder_step; }
+    bool ladder_probe_accepted_this_evaluation() const {
+        return ladder_probe_accepted_now;
+    }
     int probe_application_samples_for_test() const { return probe_application_samples; }
     int probe_outcome_samples_for_test() const { return probe_outcome_samples; }
     double probe_mean_bps_for_test() const {
@@ -453,6 +457,8 @@ private:
     bool probe_active;
     bool probe_confirmed;
     bool probe_result_ready;
+    bool probe_ladder_step;
+    bool ladder_probe_accepted_now;
     int probe_target_cfg;
     int probe_fallback_cfg;
     double probe_baseline_bps;
@@ -478,6 +484,7 @@ private:
     double next_probe_trial_ms;
     double next_probe_max_channel_ms;
     double next_probe_zero_progress_budget_ms;
+    bool next_probe_ladder_step;
 
     // Application/transport unit conversion is learned from complete atomic
     // application units, not from a rolling window that can straddle SET_CONFIG.

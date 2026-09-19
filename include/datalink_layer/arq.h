@@ -1161,7 +1161,8 @@ public:
   // Returns 0 when no trustworthy geometry exists for that candidate.
   int  predict_keydown_length_ms_for_config(int config, int frame_count, bool force_full) const;
   int  predict_payload_bytes_per_frame_for_config(int config) const;
-  int  predict_initial_batch_size_for_config(int config) const;
+  int  predict_initial_batch_size_for_config(int config,
+                                              bool use_live_current = true) const;
   int  predict_payload_bytes_per_batch_for_config(int config, int frame_count) const;
   // LINK-PHASE STEP 4 (MC-6) — MERCURY_LINKPHASE_RETXSLOT (default OFF). When ON, the RSP
   // derives its post-SACK retx-turn listen window from the popcount of the SACK it just
@@ -5584,6 +5585,10 @@ public:
   // inband_last_confirmed_config, and STOP re-emitting. No-op when not armed / stale bsi.
   // Returns true if it disarmed (confirmed). Called from every SACK accept site.
   bool inband_retag_confirm_from_sack(int rx_bsi);
+  // A coordinated SET_CONFIG ACK already proves both peers agreed on the new
+  // geometry. Seed the in-band tracker at that config so the first DATA batch
+  // does not carry a redundant unilateral CONFIG_TAG.
+  void inband_confirm_coordinated_config(int config);
   // KEYSTONE (data-flow-inband-tier-crossing.md §6): DATA-DECOUPLED intra-tier CLIMB confirm.
   // When an EMITTED CLIMB re-tag is armed and the robust BASE ACK pattern matched
   // (mfsk_matched >= ack_match_threshold), CONFIRM the climb even if the bsi-bearing SACK

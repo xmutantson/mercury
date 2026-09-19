@@ -3865,8 +3865,23 @@ int cl_arq_controller::add_message_control(char code)
 				// (inband_unilateral_config_change rejects it) and falls through too.
 				// The predicate is factored into inband_config_change_is_tier_crossing
 				// so the directed regression drives the EXACT production decision.
+				bool coordinated_probe = rate_opt.controls_link()
+					&& rate_opt.probe_is_active()
+					&& rate_opt.transition_matches(current_configuration, inband_target)
+					&& config_ladder_index(inband_target)
+						> config_ladder_index(current_configuration);
 				bool tier_crossing = inband_config_change_is_tier_crossing(inband_target);
-				if(tier_crossing)
+				if(coordinated_probe)
+				{
+					printf("[GEARSHIFT-V2] LADDER-PROBE %d -> %d: routing via "
+						"coordinated SET_CONFIG control handshake\n",
+						current_configuration, inband_target);
+					fflush(stdout);
+					// Fall through to the same ACKed SET_CONFIG builder used by the
+					// proven legacy climb. The pending-transition dispatcher retains
+					// the Axis-3 slot guard before every control dispatch.
+				}
+				else if(tier_crossing)
 				{
 					printf("[INBAND-TX] TIER-CROSSING %d -> %d (robust<->OFDM): routing "
 						"via legacy SET_CONFIG control handshake (fast dedicated ACK), "
@@ -12226,6 +12241,27 @@ void cl_arq_controller::process_control_commander()
 					printf("[GEARSHIFT] SET_CONFIG ACKed, loaded config %d\n", data_configuration);
 					fflush(stdout);
 					rate_opt.notify_switch_confirmed(opt_now_ms());
+					if(rate_opt.controls_link())
+						inband_confirm_coordinated_config(current_configuration);
+					if(rate_opt.probe_is_ladder_step() && is_ofdm_config(current_configuration))
+					{
+						// Intermediate compatibility rungs need only one ordinary
+						// DATA/SACK transaction. CONFIG_16 big-block framing is atomic at
+						// its native K; truncating it to one frame leaves the following
+						// full block in a stale decoder epoch.
+						if(current_configuration == CONFIG_16)
+						{
+							printf("[GEARSHIFT-V2] ladder probe target=%d: native big-block goodput/SACK confirmation armed\n",
+								current_configuration);
+						}
+						else
+						{
+							set_data_batch_size(1);
+							printf("[GEARSHIFT-V2] ladder probe target=%d: one-frame goodput/SACK confirmation batch armed\n",
+								current_configuration);
+						}
+						fflush(stdout);
+					}
 					// R1-rescope: a SET_CONFIG that CHANGED the geometry is a control
 					// turnaround preceding a new-geometry data batch — arm the post-control-
 					// turnaround wait so the first frame does not key inside the peer's
@@ -12925,7 +12961,17 @@ void cl_arq_controller::finalize_block_commander()
 
 	if(gear_shift_on==YES)
 	{
-		if(gear_shift_algorithm==SNR_BASED)
+		// An ACTIVE-v2 evaluation may have queued an Axis-2 confirmation
+		// while finalizing the just-ACKed application unit. Preserve that
+		// control transaction; the legacy post-block policy must not overwrite
+		// TRANSMITTING_CONTROL with TRANSMITTING_DATA before it reaches the peer.
+		if(rate_opt.controls_link() && messages_control.status != FREE)
+		{
+			printf("[GEARSHIFT-V2] preserving queued control code=%d across post-block policy\n",
+				(int)(unsigned char)messages_control.data[0]);
+			fflush(stdout);
+		}
+		else if(gear_shift_algorithm==SNR_BASED)
 		{
 			cleanup();
 			add_message_control(TEST_CONNECTION);

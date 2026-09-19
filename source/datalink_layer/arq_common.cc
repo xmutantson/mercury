@@ -2502,13 +2502,15 @@ int cl_arq_controller::predict_payload_bytes_per_batch_for_config(
 }
 
 
-int cl_arq_controller::predict_initial_batch_size_for_config(int config) const
+int cl_arq_controller::predict_initial_batch_size_for_config(int config,
+                                                              bool use_live_current) const
 {
     // Predict the first DATA batch after an Axis-1 move. load_configuration()
     // resets robust modes to one frame and re-runs the OFDM 30-second geometry
     // clamp before Axis-2 is allowed to adapt again.  Candidate economics must
     // model THAT batch, not reuse the current config's possibly-grown batch.
-    if(config == current_configuration) return std::max(1, data_batch_size);
+    if(use_live_current && config == current_configuration)
+        return std::max(1, data_batch_size);
     if(is_robust_config(config)) return 1;
     if(telecom_system == NULL || !is_ofdm_config(config)) return 1;
     const int band = (narrowband_enabled == YES) ? YES : NO;
@@ -5572,6 +5574,27 @@ bool cl_arq_controller::inband_tag_firing_decision(int batch_cfg, int batch_seq_
 	// batch prevents the periodic clause from ALSO firing (it shares this single exit).
 	inband_batches_since_announce = 0;
 	return true;
+}
+
+void cl_arq_controller::inband_confirm_coordinated_config(int config)
+{
+	if(!inband_rate_feature_enabled())
+		return;
+
+	// SET_CONFIG's dedicated ACK is the peer-confirmation event. Treat this as
+	// already announced and followed; emitting the unilateral tag after it would
+	// add a second transition protocol to the first DATA batch.
+	inband_last_announced_config = config;
+	inband_last_confirmed_config = config;
+	inband_pre_announce_config = config;
+	inband_retag_armed = false;
+	inband_retag_config = CONFIG_NONE;
+	inband_announce_bsi = -1;
+	inband_retag_count = 0;
+	inband_batches_since_announce = 0;
+	printf("[INBAND-TX] coordinated SET_CONFIG confirmed CONFIG_%d; redundant CONFIG_TAG suppressed\n",
+		config);
+	fflush(stdout);
 }
 
 // In-band rate adaptation (Stage 3b W1): EMIT the CONFIG_TAG onto the REAL passband.
@@ -12233,6 +12256,34 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 	}
 
 	const st_rate_decision decision = rate_opt.evaluate_v2(obs, optimizer_ceiling);
+	if(rate_opt.ladder_probe_accepted_this_evaluation() &&
+	   decision.action != GEARSHIFT_ACTION_PROBE &&
+	   !rate_opt.probe_is_active() && data_batch_size == 1 &&
+	   is_ofdm_config(current_configuration))
+	{
+		const int normal_batch = predict_initial_batch_size_for_config(current_configuration, false);
+		if(normal_batch > 1)
+		{
+			set_data_batch_size(normal_batch);
+			printf("[GEARSHIFT-V2] ladder confirmation complete at cfg=%d: "
+				"restored normal batch=%d\n", current_configuration, normal_batch);
+			fflush(stdout);
+			// The one-frame probe changed only the commander's live Axis-2
+			// geometry. Re-converge the responder through the existing ACKed
+			// SET_LINK_PARAMS transport before the first normal-size batch.
+			pending_link_params_batch_size = normal_batch;
+			pending_link_params_sack_mode = axis3_sack_mode;
+			recalculate_ack_timeout_for_batch();
+			if(messages_control.status == FREE)
+				add_message_control(SET_LINK_PARAMS);
+			else
+			{
+				printf("[GEARSHIFT-V2] normal-batch SET_LINK_PARAMS deferred: control status=%d\n",
+					messages_control.status);
+				fflush(stdout);
+			}
+		}
+	}
 	if (rate_opt.shadow_only() || !decision.actionable) return false;
 
 	opt_pending_switch_action = decision.action;

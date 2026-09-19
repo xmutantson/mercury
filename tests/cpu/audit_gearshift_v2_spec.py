@@ -17,6 +17,7 @@ def text(rel):
 
 arqh = text("include/datalink_layer/arq.h")
 cmd = text("source/datalink_layer/arq_commander.cc")
+rsp = text("source/datalink_layer/arq_responder.cc")
 common = text("source/datalink_layer/arq_common.cc")
 defines = text("include/common/common_defines.h")
 roh = text("include/datalink_layer/rate_optimizer.h")
@@ -280,22 +281,42 @@ req("bounded-probe-has-explicit-fallback",
     "one bounded experiment + known rollback")
 req("active-cold-start-acquisition-bypasses-four-outcome-gate",
     allin(ro, "cold_start_acquisition", "trustworthy_current_observation",
-          "cold-start-bounded-probe") and
-    "cold start probes before four outcomes" in core_test,
-    "ACTIVE GS2 may start a bounded full-action-set experiment after one trustworthy timed observation")
+          "cold-start-ladder-probe", "preferred_probe_rung",
+          "config_probe_ladder_up", "compatibility_ladder_acquisition") and
+    allin(defines, "config_probe_ladder_up", "config == CONFIG_0", "return CONFIG_7",
+          "config == CONFIG_7", "return CONFIG_13", "config == CONFIG_13",
+          "return CONFIG_16") and
+    "cold start probes next ladder rung before four outcomes" in core_test,
+    "ACTIVE GS2 may start a bounded next-rung experiment after one trustworthy timed observation; the staging rung cannot be vetoed by uncertainty that only the experiment can resolve, and uncalibrated discovery cannot jump over the compatibility ladder")
 req("cold-start-calibration-can-authorize-faster-direct-acquisition",
     "cold-start-calibrated-direct" in ro and
     "calibrated fast action can direct-switch on cold start" in core_test,
     "in-support empirical calibration remains first-class and can clear direct-switch confidence before no-table discovery")
-req("probe-probation-is-multi-sample-and-channel-time-bounded",
+req("probe-probation-is-goodput-authoritative-and-channel-time-bounded",
     allin(roh, "probe_min_application_samples", "probe_min_outcome_samples",
-          "probe_max_probation_ms", "probe_zero_progress_ms") and
+          "probe_max_probation_ms", "probe_zero_progress_ms", "probe_ladder_step") and
     allin(ro, "probe_application_samples >= policy.probe_min_application_samples",
           "probe_outcome_samples >= policy.probe_min_outcome_samples",
-          "probation_timed_out") and
+          "ladder_goodput_confirm", "probe_failed_outcomes == 0",
+          "fallback_after_rollback * policy.probe_rollback_ratio",
+          "probation_timed_out", "goto ladder_probe_confirmed") and
+    allin(cmd, "one-frame goodput/SACK confirmation batch armed",
+          "native big-block goodput/SACK confirmation armed",
+          "rate_opt.probe_is_ladder_step()", "set_data_batch_size(1)",
+          "inband_confirm_coordinated_config(current_configuration)",
+          "preserving queued control code=%d across post-block policy") and
+    allin(common, "restored normal batch=%d",
+          "ladder_probe_accepted_this_evaluation()",
+          "normal-batch SET_LINK_PARAMS deferred",
+          "add_message_control(SET_LINK_PARAMS)",
+          "void cl_arq_controller::inband_confirm_coordinated_config",
+          "redundant CONFIG_TAG suppressed") and
+    allin(rsp, "inband_confirm_coordinated_config(current_configuration)",
+          "inband_last_announced_config != current_configuration") and
     allin(core_test, "bad first cfg16 sample does not rollback",
-          "recovered cfg16 probe is accepted"),
-    "one successful target unit cannot decide an upward probe; aggregate evidence or a bounded channel-time deadline does")
+          "recovered cfg16 probe is accepted",
+          "one clean goodput and SACK sample confirms a compatibility rung"),
+    "a clean measured-goodput/SACK result may promptly confirm an explicit compatibility rung; all other probes retain aggregate evidence and every probe retains hard-failure/channel-time bounds")
 req("probe-hard-failure-is-distinct-from-soft-underperformance",
     allin(ro, "repeated_whole_failures", "established_failure_fraction",
           "probe-hard-failure", "probe-soft-underperformance") and
@@ -343,7 +364,7 @@ req("probe-budget-is-bounded-cadence-adaptive-and-does-not-pre-veto-acquisition"
           "maybe_extend_probe_budget", "probe-budget-extend",
           "observed-application-cadence") and
     "population_attainable" not in ro and
-    allin(core_test, "production-sized feedback budget still permits cold cfg16 probe",
+    allin(core_test, "production-sized feedback budget permits first cold ladder probe",
           "slow cfg16 survives beyond old 30-second ceiling",
           "observed cfg16 cadence extends probation budget",
           "healthy slow cfg16 accepted after requested population"),
@@ -393,15 +414,20 @@ req("active-v2-uses-config-tag-transport-without-second-selector",
     allin(common, "if(rate_opt.controls_link()) return true",
           "CONFIG_TAG is transport/synchronization",
           "ACTIVE decides *where* to go; CONFIG_TAG decides *how the") and
-    allin(cmd, "else if(inband_unilateral_config_change(inband_target))",
+    allin(cmd, "bool coordinated_probe = rate_opt.controls_link()",
+          "LADDER-PROBE", "coordinated SET_CONFIG control handshake",
+          "else if(inband_unilateral_config_change(inband_target))",
           "NO control frame on the wire") and
+    allin(rsp, "is_coordinated_setconfig", "rate_opt.controls_link()",
+          "ACK+SNR control response as the proven legacy climb",
+          "advisory telemetry; it is not an admission gate") and
     allin(common, "inband_unilateral_config_change(int target_cfg)",
           "load_configuration(data_configuration, PHYSICAL_LAYER_ONLY, YES)",
           "inband_retag_armed   = true",
           "LOCAL load_configuration() is not peer-follow evidence") and
     allin(cmd, "bool optimizer_owns_upward_frame = optimizer_is_in_control()",
           "!optimizer_owns_upward_frame"),
-    "Gearshift-v2 remains the sole ordinary Axis-1 selector while CONFIG_TAG is its default transition transport")
+    "Gearshift-v2 remains the sole ordinary Axis-1 selector; its upward discovery probes use the proven ACKed SET_CONFIG transport and other intra-tier moves retain CONFIG_TAG")
 req("active-v2-config-tag-transition-closes-from-peer-evidence",
     allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
           "config-discriminating SACK at/after the announce BSI",
@@ -411,6 +437,7 @@ req("active-v2-config-tag-transition-closes-from-peer-evidence",
           "inband_handle_nack(uint8_t rx_cfg_index",
           "explicit evidence that this CONFIG_TAG transition failed") and
     allin(cmd, "bool tier_crossing = inband_config_change_is_tier_crossing(inband_target)",
+          "if(coordinated_probe)",
           "else if(inband_unilateral_config_change(inband_target))",
           "NO control frame on the wire") and
     allin(text("tests/cpu/test_gearshift_v2.cc"),
@@ -418,7 +445,7 @@ req("active-v2-config-tag-transition-closes-from-peer-evidence",
           "matching peer confirmation closes the live transition",
           "mismatched peer failure is ignored",
           "matching peer failure closes the live transition"),
-    "ACTIVE intra-OFDM transitions remain in-flight until matching peer follow proves the selected target or matching CONFIG_TAG failure evidence terminates it; stale evidence cannot close another transaction")
+    "ACTIVE non-probe intra-OFDM CONFIG_TAG transitions remain in-flight until matching peer follow proves the selected target or matching failure evidence terminates it; coordinated probes close through the existing SET_CONFIG ACK path")
 req("active-v2-owns-ordinary-ladder-down",
     "GEARSHIFT_V2_ACTIVE" in arqh and "optimizer_owns_normal_downshift" in arqh and
     "return true;  // v2 owns ordinary downshift" in arqh,
@@ -481,7 +508,7 @@ req("no-snr-outcome-change-test",
     "no-SNR" in closed and "outcome-driven regime change" in closed,
     "fading/change detection is not dependent on SNR telemetry")
 req("uncalibrated-upward-actions-are-probe-only-until-directly-evidenced",
-    allin(ro, "direct_evidence", "analytic-uncalibrated-prior", "bounded-information-probe") and
+    allin(ro, "direct_evidence", "analytic-uncalibrated-prior", "ladder-information-probe") and
     "No-calibration + no-channel-telemetry closed loop" in closed,
     "analytical capacity discovers faster actions without being mistaken for measured channel performance")
 req("negative-regime-change-suppresses-immediate-upward-experiment",

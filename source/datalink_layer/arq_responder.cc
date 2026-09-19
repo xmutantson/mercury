@@ -855,6 +855,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && link_status == CONNECTED
 		   && connection_status == RECEIVING
 		   && !passive_monitor
+		   // An ACKed SET_CONFIG already synchronized this receiver. Lost-tag
+		   // recovery is only meaningful while the in-band announcement state
+		   // does not describe the live geometry; probing alternate decoders
+		   // between ordinary frames otherwise destroys a healthy timing latch.
+		   && inband_last_announced_config != current_configuration
 		   && (rx_fresh_window_decoded_this_pass              // a FRESH window was staged+decoded this pass
 		       || inband_freshwin_gate_defeat())              // (A/B fail-before knob restores pre-fix firing)
 		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
@@ -2326,10 +2331,19 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		else if(ack_pattern_time_ms > 0)
 		{
 			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT
-			bool is_turbo_setconfig = (turboshift_active || turboshift_phase != TURBO_DONE) &&
+			// ACTIVE-v2 upward probes deliberately reuse the ACKed SET_CONFIG
+			// transport, but ACTIVE disables the legacy turboshift state machine.
+			// The commander already arms the extended ACK decoder for an upward
+			// gearshift SET_CONFIG; sending a bare ACK here strands the commander at
+			// the source after this responder adopts the target. Use the same
+			// ACK+SNR control response as the proven legacy climb. The SNR payload is
+			// advisory telemetry; it is not an admission gate for the v2 policy.
+			bool is_coordinated_setconfig =
+				(turboshift_active || turboshift_phase != TURBO_DONE ||
+				 rate_opt.controls_link()) &&
 				messages_control.data[0] == SET_CONFIG &&
 				measurements.SNR_uplink > -90;
-			if(is_turbo_setconfig)
+			if(is_coordinated_setconfig)
 			{
 				// POLLUTION GUARD (default-off): encode the honest forward-DATA-frame SNR instead of
 				// measurements.SNR_uplink, which the immediately-preceding SET_CONFIG control-frame
@@ -2365,6 +2379,8 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				// so a robust->OFDM cross is not stranded with an oversized acquisition ring.
 				if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
 					inband_finalize_ofdm_adopt_ring(data_configuration);
+				if(rate_opt.controls_link() && messages_control.data[0] == SET_CONFIG)
+					inband_confirm_coordinated_config(current_configuration);
 			}
 		}
 		else
@@ -8295,10 +8311,10 @@ int cl_arq_controller::test_inband_retag()
 	const int CFG_HI  = CONFIG_11;  // ladder idx 14 (a 2-rung CLIMB above CFG_LO)
 
 	// ========================================================================
-	// PART A0 — ACTIVE-V2 PHYSICAL REGRESSION: CONFIG_0 -> CONFIG_16 is an
-	// intra-OFDM move. Gearshift-v2 owns the decision, CONFIG_TAG owns transport,
-	// local load_configuration is NOT confirmation, and only matching peer SACK
-	// evidence closes switch_inflight.
+	// PART A0 — ACTIVE-V2 PROBE TRANSPORT REGRESSION: an upward discovery probe
+	// uses the coordinated SET_CONFIG path. The commander stays at the source
+	// until the existing SET_CONFIG ACK apply path loads the target and closes
+	// switch_inflight; no CONFIG_TAG/re-tag state is armed for the probe.
 	// ========================================================================
 	{
 		cl_telecom_system* ts_cmd = nullptr;
@@ -8309,34 +8325,31 @@ int cl_arq_controller::test_inband_retag()
 
 		cmd->negotiated_configuration = CONFIG_16;
 		cmd->add_message_control(SET_CONFIG);
-		check(cmd->current_configuration == CONFIG_16,
-			"A0.1 ACTIVE v2 locally moves CONFIG_0 -> CONFIG_16 via CONFIG_TAG transport",
-			cmd->current_configuration, CONFIG_16);
-		check(cmd->messages_control.status == FREE,
-			"A0.2 CONFIG_0 -> CONFIG_16 puts ZERO SET_CONFIG control frames on the wire",
-			cmd->messages_control.status, FREE);
+		check(cmd->current_configuration == CONFIG_0,
+			"A0.1 ACTIVE probe stays at CONFIG_0 until the SET_CONFIG ACK",
+			cmd->current_configuration, CONFIG_0);
+		check(cmd->messages_control.status != FREE && cmd->messages_control.data != NULL
+			&& cmd->messages_control.data[0] == SET_CONFIG,
+			"A0.2 ACTIVE probe queues the coordinated SET_CONFIG control frame",
+			(cmd->messages_control.status != FREE && cmd->messages_control.data != NULL
+			 && cmd->messages_control.data[0] == SET_CONFIG) ? 1 : 0, 1);
 		check(cmd->rate_opt.switch_inflight_for_test(),
-			"A0.3 local PHY change does NOT confirm the v2 transaction",
+			"A0.3 queued control frame does NOT confirm the v2 transaction",
 			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
+		check(!cmd->inband_retag_armed,
+			"A0.4 coordinated probe arms no CONFIG_TAG re-tag state",
+			cmd->inband_retag_armed ? 1 : 0, 0);
 
-		const int announce_bsi = 7;
-		uint8_t parity = 0xFF;
-		bool emitted = cmd->inband_tag_firing_decision(CONFIG_16, announce_bsi, &parity);
-		check(emitted && cmd->inband_announce_bsi == announce_bsi,
-			"A0.4 CONFIG_16 announcement is emitted and anchored",
-			(emitted && cmd->inband_announce_bsi == announce_bsi) ? 1 : 0, 1);
-
-		bool stale = cmd->inband_retag_confirm_from_sack((announce_bsi - 1) & 0xFF);
-		check(!stale && cmd->rate_opt.switch_inflight_for_test(),
-			"A0.5 stale pre-announcement SACK cannot close the v2 transaction",
-			(!stale && cmd->rate_opt.switch_inflight_for_test()) ? 1 : 0, 1);
-
-		bool peer_confirmed = cmd->inband_retag_confirm_from_sack(announce_bsi);
-		check(peer_confirmed,
-			"A0.6 matching config-discriminating SACK confirms peer follow",
-			peer_confirmed ? 1 : 0, 1);
+		// Mirror the production SET_CONFIG-ACK apply body.
+		cmd->messages_control_backup();
+		cmd->load_configuration(CONFIG_16, PHYSICAL_LAYER_ONLY, YES);
+		cmd->messages_control_restore();
+		cmd->rate_opt.notify_switch_confirmed(1200);
+		check(cmd->current_configuration == CONFIG_16,
+			"A0.5 SET_CONFIG ACK apply loads the probe target",
+			cmd->current_configuration, CONFIG_16);
 		check(!cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active(),
-			"A0.7 peer follow closes switch_inflight and begins/retains probe probation",
+			"A0.6 SET_CONFIG ACK closes switch_inflight and begins probe probation",
 			(!cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active()) ? 1 : 0, 1);
 
 		delete cmd; delete ts_cmd;
@@ -8534,11 +8547,9 @@ int cl_arq_controller::test_inband_retag()
 		// Establish a LAST-CONFIRMED floor at CONFIG_9 (the RX provably reached it) — model
 		// it as a confirmed change to the starting config so the demote has a real floor.
 		cmd->inband_last_confirmed_config = CFG_LO;
-		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
-		cmd->rate_opt.notify_switch_dispatched(
-			CFG_LO, CFG_HI, GEARSHIFT_ACTION_PROBE, CFG_LO, 1000, false);
 
-		// Arm a CLIMB to CONFIG_11 via the chokepoint.
+		// Arm a legacy/non-probe CONFIG_TAG climb. ACTIVE probe transport is
+		// exercised by PART A0; this part isolates re-tag exhaustion/demotion.
 		cmd->negotiated_configuration = CFG_HI;
 		cmd->add_message_control(SET_CONFIG);
 		cmd->process_messages_tx_control();
@@ -8579,12 +8590,6 @@ int cl_arq_controller::test_inband_retag()
 		check(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO,
 			"C5 a FRESH re-tag armed for the demote target CONFIG_9",
 			(cmd->inband_retag_armed && cmd->inband_retag_config == CFG_LO) ? 1 : 0, 1);
-		check(cmd->rate_opt.transition_matches(CFG_HI, CFG_LO),
-			"C6 failed climb closes the probe switch and opens an owned rollback transition",
-			cmd->rate_opt.transition_matches(CFG_HI, CFG_LO) ? 1 : 0, 1);
-		check(!cmd->rate_opt.probe_is_active(),
-			"C7 failed CONFIG_TAG climb terminates probe probation before fallback",
-			cmd->rate_opt.probe_is_active() ? 1 : 0, 0);
 		delete cmd; delete ts;
 	}
 
@@ -9011,11 +9016,10 @@ int cl_arq_controller::test_inband_nack()
 	{
 		cl_arq_controller* cmd = make_cmd(CFG_LO);
 		cmd->inband_last_confirmed_config = CFG_LO;   // RX provably reached CONFIG_9
-		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
-		cmd->rate_opt.notify_switch_dispatched(
-			CFG_LO, CFG_HI, GEARSHIFT_ACTION_PROBE, CFG_LO, 1000, false);
 
-		// Arm a CLIMB to CONFIG_11 via the chokepoint (announced, not yet confirmed).
+		// Arm a legacy/non-probe CONFIG_TAG climb. ACTIVE upward discovery probes
+		// use coordinated SET_CONFIG and are covered by PART A0 above; this part
+		// remains the transport-level NACK/accelerated-demote regression.
 		cmd->negotiated_configuration = CFG_HI;
 		cmd->add_message_control(SET_CONFIG);
 		cmd->process_messages_tx_control();
@@ -9054,12 +9058,6 @@ int cl_arq_controller::test_inband_nack()
 		check(cmd->inband_retag_count < R,
 			"B5 the demote fired BEFORE the R give-up floor (NACK beat the R-retry)",
 			cmd->inband_retag_count < R ? 1 : 0, 1);
-		check(cmd->rate_opt.transition_matches(CFG_HI, CFG_LO),
-			"B5a matching NACK terminates the failed probe and opens owned rollback",
-			cmd->rate_opt.transition_matches(CFG_HI, CFG_LO) ? 1 : 0, 1);
-		check(!cmd->rate_opt.probe_is_active(),
-			"B5b matching NACK terminates failed probe probation before fallback",
-			cmd->rate_opt.probe_is_active() ? 1 : 0, 0);
 
 		// A stale-epoch NACK (echoed parity != current) is REJECTED (no spurious demote).
 		cl_arq_controller* cmd2 = make_cmd(CFG_LO);

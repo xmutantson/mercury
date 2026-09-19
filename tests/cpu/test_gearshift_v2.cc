@@ -62,6 +62,11 @@ static st_rate_policy permissive(cl_rate_optimizer& r) {
 }
 
 int main() {
+    eqi("probe ladder stages cfg0 to cfg7", config_probe_ladder_up(CONFIG_0), CONFIG_7);
+    eqi("probe ladder stages cfg7 to cfg13", config_probe_ladder_up(CONFIG_7), CONFIG_13);
+    eqi("probe ladder stages cfg13 to cfg16", config_probe_ladder_up(CONFIG_13), CONFIG_16);
+    eqi("probe ladder uses adjacent fallback", config_probe_ladder_up(CONFIG_14), CONFIG_15);
+
     cl_rate_optimizer r;
     ok("load", r.load(table().c_str()));
     r.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
@@ -191,7 +196,7 @@ int main() {
 
     // Cold ACTIVE acquisition is deliberately faster than the ordinary four-
     // outcome steady-state gate. One trustworthy timed observation plus a long
-    // queue is enough to try the best faster feasible action directly as a
+    // queue is enough to try the next compatibility-safe ladder action as a
     // bounded probe; the no-table analytical prior never becomes blind acceptance.
     cl_rate_optimizer cold;
     cold.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
@@ -212,8 +217,8 @@ int main() {
     coldobs.tx_airtime_ms[CONFIG_15]=3000; coldobs.tx_airtime_ms[CONFIG_16]=5572;
     coldobs.feedback_budget_ms=1000;
     d=cold.evaluate_v2(coldobs,CONFIG_16);
-    ok("cold start probes before four outcomes", d.action==GEARSHIFT_ACTION_PROBE &&
-       d.target_cfg==CONFIG_16 && d.reason=="cold-start-bounded-probe");
+    ok("cold start probes next ladder rung before four outcomes", d.action==GEARSHIFT_ACTION_PROBE &&
+       d.target_cfg==CONFIG_15 && d.reason=="cold-start-ladder-probe");
     st_rate_observation coldshort=coldobs; coldshort.queue_bytes=1000;
     d=cold.evaluate_v2(coldshort,CONFIG_16);
     ok("cold start still respects short-transfer economics",
@@ -475,23 +480,42 @@ int main() {
     // 120 s probation ceiling, so ACTIVE refused to probe at all. The hard
     // ceiling should bound probation, not prevent cold acquisition.
     cl_rate_optimizer livebudget; livebudget.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
-    p=livebudget.get_policy(); p.confidence_z=0.0; p.direct_switch_margin=0.50;
+    p=livebudget.get_policy(); p.confidence_z=2.0; p.direct_switch_margin=0.50;
     p.probe_mean_margin=0.0; p.min_outcome_samples=4; p.min_rate_samples=1;
     p.cooldown_batches=0; p.probe_min_application_samples=3;
     p.probe_min_outcome_samples=3; p.probe_max_probation_ms=120000;
     livebudget.set_policy_for_test(p); livebudget.set_switch_cost_ms(1800);
     st_rate_observation physical=obs(CONFIG_0,23.1,1,0.0);
     physical.outcome_samples=1; physical.rate_samples=1;
-    physical.feasible_configs={CONFIG_0,CONFIG_16};
+    physical.feasible_configs={CONFIG_0,CONFIG_7,CONFIG_16};
     physical.nominal_bps[CONFIG_0]=66.4;
+    physical.nominal_bps[CONFIG_7]=2400.0;
     physical.nominal_bps[CONFIG_16]=6743.5;
+    physical.tx_airtime_ms[CONFIG_7]=1200;
     physical.tx_airtime_ms[CONFIG_16]=5572;
     physical.feedback_budget_ms=45000;
     physical.queue_bytes=200000;
     d=livebudget.evaluate_v2(physical,CONFIG_16);
-    ok("production-sized feedback budget still permits cold cfg16 probe",
-       d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_16 &&
-       d.reason=="cold-start-bounded-probe");
+    ok("production-sized feedback budget permits first cold ladder probe",
+       d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_7 &&
+       d.reason=="cold-start-ladder-probe");
+    livebudget.notify_switch_dispatched(CONFIG_0,CONFIG_7,d.action,CONFIG_0,1000,false);
+    livebudget.notify_switch_confirmed(2000);
+    livebudget.observe_transaction(CONFIG_7,300,300,1000,30,30,false,false,
+                                   20,0,0.02,30,false);
+    st_rate_observation rung7=physical;
+    rung7.current_cfg=CONFIG_7; rung7.application_bps=2400;
+    rung7.transport_bps=2400; rung7.application_commits=1;
+    rung7.rate_samples=1; rung7.outcome_samples=1;
+    rung7.feasible_configs={CONFIG_7,CONFIG_13,CONFIG_16};
+    rung7.nominal_bps[CONFIG_7]=2400;
+    rung7.nominal_bps[CONFIG_13]=5200;
+    rung7.nominal_bps[CONFIG_16]=6743.5;
+    rung7.tx_airtime_ms[CONFIG_13]=2200;
+    d=livebudget.evaluate_v2(rung7,CONFIG_16);
+    ok("one clean goodput and SACK sample confirms a compatibility rung",
+       d.action==GEARSHIFT_ACTION_PROBE && d.target_cfg==CONFIG_13 &&
+       d.reason=="cold-start-ladder-probe" && !livebudget.probe_is_active());
 
     // Patch-3 C: replay the slow physical CONFIG_16 cadence. The old 30-second
     // ceiling would roll back after only two healthy completed target outcomes.
