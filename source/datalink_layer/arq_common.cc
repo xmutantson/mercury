@@ -1352,6 +1352,7 @@ cl_arq_controller::cl_arq_controller()
 	inband_nack_emitted_for_dead_streak=false;
 	inband_batches_since_announce=0;
 	inband_reannounce_n_cached=-1;  // unresolved; inband_reannounce_n() caches it
+	inband_down_probe_batch_seq_id=-1;
 
 	gear_shift_on=NO;
 	robust_enabled=NO;
@@ -10786,6 +10787,7 @@ void cl_arq_controller::reset_session_state()
 	inband_rx_seen_parity = 0;
 	inband_nack_emitted_for_dead_streak = false;
 	inband_batches_since_announce = 0;
+	inband_down_probe_batch_seq_id = -1;
 
 	// Turboshift — legacy/shadow keep the historic probe state machine.
 	// ACTIVE mode deliberately has one normal authority: Gearshift-v2.

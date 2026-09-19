@@ -5687,6 +5687,11 @@ public:
   bool inband_down_decoders_built = false;    // any slot allocated yet?
   int  inband_down_buffer_nsymb = 0;          // common buffer_Nsymb for the bank (largest window cfg)
   int  inband_down_d = -1;                    // cached MERCURY_INBAND_DOWN_D (-1=unresolved)
+  // A blind lost-tag search is expensive and has no authenticated evidence that the
+  // sender changed geometry.  Bind it to the active wire batch: one fresh failed
+  // snapshot may probe, while later failures for the same bsi wait for the sender's
+  // retransmission/re-tag instead of repeatedly running the decoder bank.
+  int  inband_down_probe_batch_seq_id = -1;   // last active bsi given one blind probe
   int  inband_session_dead_batches = 0;       // consecutive ZERO-PROGRESS REAL-batch-period total losses -> terminal BREAK
   int  inband_dead_batches_limit = -1;        // cached MERCURY_INBAND_DEAD_BATCHES (-1=unresolved)
   // §19 dead-batch tick guard: a session-monotonic forward-DATA-frame counter + the snapshot at the

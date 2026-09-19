@@ -855,11 +855,12 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && link_status == CONNECTED
 		   && connection_status == RECEIVING
 		   && !passive_monitor
-		   // An ACKed SET_CONFIG already synchronized this receiver. Lost-tag
-		   // recovery is only meaningful while the in-band announcement state
-		   // does not describe the live geometry; probing alternate decoders
-		   // between ordinary frames otherwise destroys a healthy timing latch.
-		   && inband_last_announced_config != current_configuration
+		   // A receiver cannot know that a tag was lost: inband_last_announced_config
+		   // is TX-only state and is never a valid RX transition predicate.  Permit
+		   // one blind decoder-bank search for this active wire batch; any later
+		   // failure at the same bsi waits for retransmission/the canonical re-tag.
+		   // This bounds work by a protocol generation, not by a timing threshold.
+		   && inband_down_probe_batch_seq_id != rsp_current_expected_batch_seq_id
 		   && (rx_fresh_window_decoded_this_pass              // a FRESH window was staged+decoded this pass
 		       || inband_freshwin_gate_defeat())              // (A/B fail-before knob restores pre-fix firing)
 		   // A located preamble whose DATA tail is not captured yet is timing
@@ -870,8 +871,12 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && is_ofdm_config(current_configuration)           // tag only rides OFDM batches
 		   && rsp_current_expected_batch_seq_id >= 0)         // IN-FLIGHT active batch only
 		{
+			// Consume this batch's single blind-probe allowance before entering the
+			// decoder bank.  Even a silent/malformed snapshot must not spin another
+			// five decoders on every fresh capture for the same outstanding batch.
+			inband_down_probe_batch_seq_id = rsp_current_expected_batch_seq_id;
 			// FIRING GATE (data-flow-inband-downladder.md §2/§5.2, defect #2 + §2.1 the
-			// fresh-window term). TWO terms guard the firing frequency:
+			// fresh-window term). THREE terms guard the firing frequency:
 			//   (a) rx_fresh_window_decoded_this_pass — receive() actually re-staged a
 			//       FRESH capture window and attempted a primary decode THIS pass
 			//       (arq_common.cc:10624 frames_to_read==0 branch). Without it the gate
@@ -889,6 +894,9 @@ void cl_arq_controller::process_messages_rx_data_control()
 			//       CONFIG_TAG can only happen WITHIN a batch we are tracking. The
 			//       window-level + per-decoder energy prescans inside the resync remain the
 			//       signal-present-but-silent-snapshot backstop.
+			//   (c) inband_down_probe_batch_seq_id binds blind work to the active wire
+			//       generation.  A retry at the same bsi is handled by retransmission and
+			//       the sender's repeated CONFIG_TAG, not another decoder-bank scan.
 			inband_try_down_ladder_on_decode_fail();
 
 			// TERMINAL BREAK (design §7): the dead-batch streak reached
@@ -10015,7 +10023,7 @@ int cl_arq_controller::test_inband_downladder()
 	}
 
 	// ========================================================================
-	// PART C — THE FRESH-WINDOW FIRING GATE (data-flow-inband-downladder.md §2.1)
+	// PART C — FRESH-WINDOW + ONE-PROBE-PER-BATCH FIRING GATE
 	// ========================================================================
 	// The HW 3127 "all silent" down-ladder firings were the caller firing on EVERY benign
 	// inter-frame receive() pass during an active batch: receive() took the
@@ -10025,7 +10033,9 @@ int cl_arq_controller::test_inband_downladder()
 	// rx_fresh_window_decoded_this_pass — receive() only sets it on the frames_to_read==0
 	// branch that actually re-stages+decodes a fresh window.
 	//
-	// This drives the EXACT production gate predicate (the && chain at arq_responder.cc:535).
+	// This drives the EXACT production gate predicate.  TX-only announcement state cannot
+	// tell an RX that a tag was lost, so the blind search is instead bounded to one attempt
+	// per active wire batch; subsequent same-bsi failures await retransmission/re-tag.
 	// FAIL-BEFORE (the bug): on a STALE inter-frame pass (flag=false) the OLD gate (without
 	// the flag term) was TRUE -> the down-ladder fired on silence. PASS-AFTER: the gate is
 	// FALSE on a stale pass and TRUE only on a fresh-window decode-FAIL — so a GENUINE
@@ -10056,7 +10066,9 @@ int cl_arq_controller::test_inband_downladder()
 			    && rx->link_status == CONNECTED
 			    && rx->connection_status == RECEIVING
 			    && !rx->passive_monitor
+			    && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			    && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			    && !rx->telecom_system->receive_stats.frame_data_missing
 			    && rx->messages_rx_buffer.status != RECEIVED
 			    && is_ofdm_config(rx->current_configuration)
 			    && rx->rsp_current_expected_batch_seq_id >= 0;
@@ -10099,6 +10111,20 @@ int cl_arq_controller::test_inband_downladder()
 			"C3 the fresh-window flag alone toggles the gate (false->no-fire, true->fire)",
 			(off ? 2 : 0) + (on ? 1 : 0), 1);
 
+		// C4 — consume the allowance exactly where production does, then prove a
+		// second fresh failure for the SAME outstanding bsi cannot rescan the bank.
+		rx->inband_down_probe_batch_seq_id = rx->rsp_current_expected_batch_seq_id;
+		check(would_fire() == false,
+			"C4 same-bsi fresh retry is bounded: no second blind decoder-bank probe",
+			would_fire() ? 1 : 0, 0);
+
+		// C5 — a new active wire generation re-arms one probe without any timer or
+		// channel threshold.  This preserves genuine lost-tag recovery per batch.
+		rx->rsp_current_expected_batch_seq_id = 5;
+		check(would_fire() == true,
+			"C5 next bsi re-arms exactly one blind lost-tag probe",
+			would_fire() ? 1 : 0, 1);
+
 		delete rx; delete ts_rx;
 	}
 
@@ -10131,7 +10157,9 @@ int cl_arq_controller::test_inband_downladder()
 			 && rx->link_status == CONNECTED
 			 && rx->connection_status == RECEIVING
 			 && !rx->passive_monitor
+			 && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			 && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			 && !rx->telecom_system->receive_stats.frame_data_missing
 			 && rx->messages_rx_buffer.status != RECEIVED
 			 && is_ofdm_config(rx->current_configuration)
 			 && rx->rsp_current_expected_batch_seq_id >= 0;

@@ -354,12 +354,18 @@ req("probe-probation-is-goodput-authoritative-and-channel-time-bounded",
           "add_message_control(SET_LINK_PARAMS)",
           "void cl_arq_controller::inband_confirm_coordinated_config",
           "redundant CONFIG_TAG suppressed") and
-    allin(rsp, "inband_confirm_coordinated_config(current_configuration)",
-          "inband_last_announced_config != current_configuration") and
+    allin(rsp, "inband_confirm_coordinated_config(current_configuration)") and
     allin(core_test, "bad first cfg16 sample does not rollback",
           "recovered cfg16 probe is accepted",
           "one clean goodput and SACK sample confirms a compatibility rung"),
     "a clean measured-goodput/SACK result may promptly confirm an explicit compatibility rung; all other probes retain aggregate evidence and every probe retains hard-failure/channel-time bounds")
+req("lost-tag-probe-is-bounded-by-wire-batch",
+    allin(rsp, "inband_down_probe_batch_seq_id != rsp_current_expected_batch_seq_id",
+          "inband_down_probe_batch_seq_id = rsp_current_expected_batch_seq_id",
+          "same-bsi fresh retry is bounded", "next bsi re-arms exactly one") and
+    allin(common, "inband_down_probe_batch_seq_id = -1") and
+    "inband_last_announced_config != current_configuration" not in rsp,
+    "receiver lost-tag recovery may run one blind decoder-bank probe per active bsi; retransmission and repeated CONFIG_TAG own same-bsi recovery, and TX-only announcement state is never used as an RX predicate")
 req("probe-hard-failure-is-distinct-from-soft-underperformance",
     allin(ro, "repeated_whole_failures", "established_failure_fraction",
           "probe-hard-failure", "probe-soft-underperformance") and
