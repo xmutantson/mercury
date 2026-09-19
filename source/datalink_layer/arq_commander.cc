@@ -3663,6 +3663,23 @@ void cl_arq_controller::process_messages_commander()
 				negotiated_configuration = target;
 				roll_back_cmd_bsi_to_inflight("GEARSHIFT-V2");
 				cleanup();
+				// Cross-axis control-slot arbitration (per-batch config data-flow audit):
+				// policy_axis1_supremacy_on_move() above transitions Axis-3 ON/OFF -> PROBE and
+				// queues a best-effort SET_LINK_PARAMS into the single control slot. cleanup()
+				// does not free an ADDED_TO_LIST frame, so add_message_control(SET_CONFIG) below
+				// would find the slot busy and silently return ERROR_ -- leaving switch_inflight
+				// set with NO Axis-1 transition on the wire (the cold-start climb then hangs the
+				// full switch-inflight timeout and demotes to robust). The Axis-1 transition is
+				// load-bearing and takes the slot; the SET_LINK_PARAMS is recovered by the next
+				// SET_LINK_PARAMS cycle / the EOB-self-correct safety net. Same arbitration as
+				// inband_route_failure_demote().
+				if(messages_control.status != FREE && messages_control.data != NULL
+				   && messages_control.length > 0
+				   && messages_control.data[0] == SET_LINK_PARAMS)
+				{
+					messages_control.status = FREE;
+					messages_control.type   = NONE;
+				}
 				rate_opt.notify_switch_dispatched(from_cfg, target,
 					opt_pending_switch_action, opt_pending_switch_fallback, opt_now_ms(),
 					narrowband_enabled == YES);
