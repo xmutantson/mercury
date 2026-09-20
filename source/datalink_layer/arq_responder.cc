@@ -8072,8 +8072,10 @@ int cl_arq_controller::test_inband_liveness()
 		cmd->stats.nAcked_data = 6;
 		cmd->cmd_inband_liveness_last_acked = 6;
 		cmd->connection_status = TRANSMITTING_CONTROL;
+		const unsigned long long owner_start_ms = cmd->opt_now_ms();
 		cmd->rate_opt.notify_switch_dispatched(
-			CONFIG_10, CONFIG_11, GEARSHIFT_ACTION_PROBE, CONFIG_10, 1000, false);
+			CONFIG_10, CONFIG_11, GEARSHIFT_ACTION_PROBE, CONFIG_10,
+			owner_start_ms, false);
 
 		bool fired_during_switch = false;
 		for(int p = 0; p < STALL_N * 3; p++)
@@ -8089,12 +8091,12 @@ int cl_arq_controller::test_inband_liveness()
 			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
 
 		int foreign = cmd->rate_opt.authorize_external_transition(
-			CONFIG_10, CONFIG_9, "test-competing-watchdog", 1100, false);
+			CONFIG_10, CONFIG_9, "test-competing-watchdog", owner_start_ms + 100, false);
 		check(foreign < 0,
 			"B5.4 competing Axis-1 request is rejected while v2 transaction owns link",
 			foreign < 0 ? 1 : 0, 1);
 
-		cmd->rate_opt.notify_switch_confirmed(1200);
+		cmd->rate_opt.notify_switch_confirmed(owner_start_ms + 200);
 		check(cmd->rate_opt.probe_is_active(),
 			"B5.5 peer-follow confirmation enters/retains owned probe probation",
 			cmd->rate_opt.probe_is_active() ? 1 : 0, 1);
@@ -8113,7 +8115,9 @@ int cl_arq_controller::test_inband_liveness()
 			0, 0);
 
 		const unsigned long long owner_deadline =
-			1000ULL + (unsigned long long)cmd->rate_opt.get_policy().probe_zero_progress_ms + 1001ULL;
+			owner_start_ms
+			+ (unsigned long long)cmd->rate_opt.get_policy().probe_zero_progress_ms
+			+ 1001ULL;
 		check(!cmd->rate_opt.owns_link_experiment(owner_deadline),
 			"B5.9 probe ownership releases only after Gearshift's own zero-progress deadline",
 			cmd->rate_opt.owns_link_experiment(owner_deadline) ? 1 : 0, 0);
