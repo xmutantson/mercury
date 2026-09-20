@@ -1375,6 +1375,13 @@ void cl_arq_controller::process_messages_rx_data_control()
 					}
 					else if(match_prev && !match_current)
 					{
+						// A previous-generation retransmission is still the commander's
+						// active physical keydown. Keep the deferred-confirm boundary
+						// timer aligned with every decoded frame in that turn.
+						linkphase_rearm_prev_boundary_timer(
+							messages_rx_buffer.sequence_number,
+							rx_buffer_batch_total_frames,
+							rx_buffer_eob_seq >= 0);
 						// Step 8a: route to messages_rx_prev[] if the prev
 						// buffer is live. If a Step 4 ACK-GATE-PASS bump
 						// (clean batch path) advanced prev without
@@ -16962,6 +16969,10 @@ int cl_arq_controller::test_linkphase_pending_confirm_fire()
 	this->cumulative_ack_enabled = true;   // negotiated cap: cumulative-n_r confirm semantics live
 	this->rx_buffer_retx_turn_tail = false; // UNMARKED prev: no proven selective-retry tail (seed106)
 	this->telecom_system         = NULL;   // ARM + COVERED legs are telecom-free (as the shrink test)
+	this->message_transmission_time_ms = 292;
+	this->time_left_to_send_last_frame = 0;
+	this->ptt_on_delay_ms = 100;
+	this->ptt_off_delay_ms = 200;
 
 	const int WND = 6, L = 16;
 	this->data_batch_size = WND;
@@ -17018,6 +17029,29 @@ int cl_arq_controller::test_linkphase_pending_confirm_fire()
 	};
 
 	long flushed0 = this->linkphase_pending_prev_flushed;
+
+	// ====== LEG 0: ACK-miss retained-prev timer boundary ======
+	// Seed-2 geometry: batch 11 was partially retained, its reverse ACK was
+	// missed, and the full 95-frame retry completed storage at frame 56 because
+	// 41 slots were already present. The old prev route did not re-arm the
+	// receive timer, so its unrelated 41.76 s window expired at frame 85 while
+	// the commander remained keyed through frame 94. The deferred compact
+	// confirm was therefore transmitted into the commander's mute window.
+	this->receiving_timeout = 41760;
+	int mid_retry_timeout = linkphase_rearm_prev_boundary_timer(
+		/*sequence_number=*/56, /*sender_total_frames=*/95,
+		/*end_of_batch=*/false);
+	ck(mid_retry_timeout > 11000 && mid_retry_timeout < 12000,
+		"LEG0 missed-ACK recovery: frame 56/95 refreshes the boundary beyond the remaining keydown");
+	int tail_timeout = linkphase_rearm_prev_boundary_timer(
+		/*sequence_number=*/94, /*sender_total_frames=*/95,
+		/*end_of_batch=*/true);
+	ck(tail_timeout == this->ptt_on_delay_ms + this->ptt_off_delay_ms,
+		"LEG0 retry tail: EOB arms the ordinary post-keydown turnaround boundary");
+	ck(cumulative_ack_bsi_field(/*target=*/11, /*legacy_high_water=*/11,
+		/*cap_on=*/true) == 10
+		&& generation_ack_resolve_target(/*wire=*/10, /*cap_on=*/true) == 11,
+		"LEG0 identity control: canonical wire 10 resolves to delivered target 11");
 
 	// ====== LEG 1: ARM + FLUSH-A (covering cumulative n_r) ======
 	const int BSI1 = 7;

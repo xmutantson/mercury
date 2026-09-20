@@ -2220,6 +2220,19 @@ void cl_arq_controller::linkphase_arm_pending_prev_confirm(unsigned char prev_ac
 	}
 }
 
+int cl_arq_controller::linkphase_rearm_prev_boundary_timer(int sequence_number,
+		int sender_total_frames, bool end_of_batch)
+{
+	// Regression scaffold: the pre-fix previous-generation route left the
+	// current-generation receive timer untouched. The fix is applied in the
+	// following commit so this checkpoint remains behavior-identical to its
+	// parent while the directed test exposes the stale boundary.
+	(void)sequence_number;
+	(void)sender_total_frames;
+	(void)end_of_batch;
+	return receiving_timeout;
+}
+
 void cl_arq_controller::linkphase_flush_pending_prev_confirm()
 {
 	unsigned char flush_target = (unsigned char)(

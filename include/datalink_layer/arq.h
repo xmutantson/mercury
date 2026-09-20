@@ -1130,6 +1130,9 @@ public:
   bool linkphase_pending_confirm_covers(int emitted_n_r) const;
   // SEAM-2 emit-path members (factored out of the RSP pump for the in-process fire proof).
   void linkphase_arm_pending_prev_confirm(unsigned char prev_ack_bsi, int prev_eff_window);
+  int  linkphase_rearm_prev_boundary_timer(int sequence_number,
+                                           int sender_total_frames,
+                                           bool end_of_batch);
   void linkphase_flush_pending_prev_confirm();
   void linkphase_clear_pending_if_covered(unsigned char emitted_n_r);
   // LINK-PHASE STEP 5 / MC-3 — slot-qualified commander liveness. Default OFF;
