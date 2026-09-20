@@ -51,6 +51,16 @@ brk = between(
     "void cl_arq_controller::send_break_pattern()",
     "void cl_arq_controller::",
 )
+turbo = between(
+    CMD,
+    "void cl_arq_controller::finish_turbo_direction()",
+    "void cl_arq_controller::cmd_arm_terminal_eot_arq()",
+)
+disconnect = between(
+    CMD,
+    "void cl_arq_controller::commander_handle_connected_disconnect()",
+    "void cl_arq_controller::process_messages_commander()",
+)
 
 req("owner API declared",
     all(x in OPT_H for x in (
@@ -157,6 +167,29 @@ req("pure-silence reconnect is not an independent ACTIVE recovery authority",
     '"demote_silence_peer_unreachable"' in CMD
     and "pure-silence reconnect request" in CMD
     and "rate_opt.authorize_hard_recovery" in CMD)
+
+# Role transfer is another ownership boundary on the combined release tree.
+# Timers and probe completion may schedule an already-earned transfer, but no
+# turboshift, KX, idle, or DISCONNECT site may manufacture code 57 without an
+# integrity-validated D=1 record.
+req("turboshift cannot trigger speculative SWITCH_ROLE",
+    "|| !reverse_data_demand_acknowledged" in turbo
+    and "if(!reverse_data_demand_acknowledged)" in turbo
+    and turbo.count("add_message_control(SWITCH_ROLE)") == 2)
+req("KX role swaps require acknowledged reverse demand",
+    CMD.count("&& reverse_data_demand_acknowledged)") >= 2
+    and "forward pk delivered -> SWITCH_ROLE" in CMD
+    and "reverse ct delivered -> SWITCH_ROLE" in CMD)
+req("generic idle role transfer requires acknowledged reverse demand",
+    "Demand-driven role-transfer trigger" in CMD
+    and "if(reverse_data_demand_acknowledged)" in CMD
+    and "ROLE_DEMAND_FAILBEFORE" in CMD)
+req("DISCONNECT preserves demand precedence and control-mailbox ownership",
+    "role_demand_switch_owns_precedence()" in disconnect
+    and "role_demand_control_slot_safe()" in disconnect
+    and "add_message_control(CLOSE_CONNECTION)" in disconnect
+    and "messages_control.status=FREE" not in disconnect
+    and "messages_control.status = FREE" not in disconnect)
 
 if failed:
     print(f"[GS2-OWNER-AUDIT] FAILURES={len(failed)}")
