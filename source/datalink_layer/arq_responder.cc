@@ -8102,6 +8102,12 @@ int cl_arq_controller::test_inband_liveness()
 		      cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_10,
 			"B7.6 CONFIG_TAG coast commits locally and repeats until peer confirmation",
 			cmd->current_configuration, CONFIG_10);
+		bool deferred = cmd->inband_route_failure_demote(
+			CONFIG_9, "test-second-degradation-before-tag-confirm", true, true);
+		check(deferred && cmd->current_configuration == CONFIG_10 &&
+		      cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_10,
+			"B7.7 second degradation cannot replace an unconfirmed CONFIG_TAG transition",
+			cmd->current_configuration, CONFIG_10);
 		delete cmd; delete ts;
 	}
 

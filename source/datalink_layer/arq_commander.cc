@@ -6598,6 +6598,19 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	if(rate_opt.controls_link() && link_status == CONNECTED)
 	{
 		const unsigned long long now_ms = opt_now_ms();
+		// A canonical transition is not committed until peer evidence closes its armed
+		// re-tag state.  Do not replace a lost-tag transaction with another demotion:
+		// keep the current target, let the ordinary retransmission re-emit its tag, and
+		// treat this degradation only as evidence.  Chaining 13->12->11 after the first
+		// tag was lost guarantees PHY desynchronization because the peer is still at 13.
+		if(inband_retag_armed && rate_opt.owns_link_experiment(now_ms))
+		{
+			printf("[GEARSHIFT-V2-AUTHORITY] degradation deferred while CONFIG_TAG "
+				"transition %d->%d awaits peer evidence; retransmission will re-tag target\n",
+				inband_pre_announce_config, inband_retag_config);
+			fflush(stdout);
+			return true;
+		}
 		if(gearshift_owned)
 		{
 			if(!rate_opt.transition_matches(current_configuration, demote_target))

@@ -540,6 +540,11 @@ req("canonical-config-tag-repeats-on-data-retransmission",
           "an unconfirmed change MUST re-tag",
           "losing the first tag strands the receiver on the old PHY"),
     "an unconfirmed canonical CONFIG_TAG is re-emitted before retransmitted DATA so a lost first tag cannot permanently desynchronize the peer")
+req("canonical-config-tag-transition-is-serialized-until-confirmed",
+    allin(cmd, "inband_retag_armed && rate_opt.owns_link_experiment(now_ms)",
+          "degradation deferred while CONFIG_TAG",
+          "retransmission will re-tag target"),
+    "a second degradation cannot replace an unconfirmed CONFIG_TAG move and strand the peer two rungs behind")
 req("active-v2-config-tag-transition-closes-from-peer-evidence",
     allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
           "config-discriminating SACK at/after the announce BSI",
