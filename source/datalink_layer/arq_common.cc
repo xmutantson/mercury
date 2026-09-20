@@ -16672,13 +16672,16 @@ void cl_arq_controller::send_batch()
 	// batch's config differs from the last-announced config (NO-CHANGE => the emit
 	// returns 0: nothing on the wire, no slot, no silence — zero steady-state overhead).
 	// Gated to DATA batches (the tag announces the DATA config) and the OFDM tier (the
-	// robust suffix layer is M=16; emit_config_tag_passband no-ops on NB/M<16 and on
-	// retx batches, which carry no fresh config). The bsi binding comes from the FIRST
+	// robust suffix layer is M=16; emit_config_tag_passband no-ops on NB/M<16. A normal
+	// retransmit carries no fresh tag, but an unconfirmed change MUST re-tag: otherwise
+	// losing the first tag strands the receiver on the old PHY and every retransmission
+	// is undecodable. The bsi binding comes from the FIRST
 	// data frame in the batch (computed before the loop so the tag announces the bsi the
 	// RX will see on frame 0). CORRECT-CODE (§15 INV-3d-C): the tag is built for
 	// current_configuration — the EXACT config the following frames below are modulated
 	// at (transmit_byte already encoded them at current_configuration above).
-	if(inband_rate_feature_enabled() && !sack_retransmit_active)
+	if(inband_rate_feature_enabled()
+		&& (!sack_retransmit_active || inband_retag_armed))
 	{
 		int tag_bsi = -1;
 		for(int i=0;i<message_batch_counter_tx;i++)

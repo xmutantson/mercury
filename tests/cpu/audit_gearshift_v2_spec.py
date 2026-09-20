@@ -535,6 +535,11 @@ req("preframe-config-tag-is-not-gated-on-old-phy-geometry",
     "inband_adopt_gate_snapshot     = snapshot" not in common and
     allin(rsp, "exact gapless", "with no synthetic", "A0 RX FOLLOWS the pre-frame tag"),
     "a CRC-valid transition is followed before target-frame decode; guard time is derived from wire/acquisition geometry and the saved snapshot is then judged only at the new geometry")
+req("canonical-config-tag-repeats-on-data-retransmission",
+    allin(common, "(!sack_retransmit_active || inband_retag_armed)",
+          "an unconfirmed change MUST re-tag",
+          "losing the first tag strands the receiver on the old PHY"),
+    "an unconfirmed canonical CONFIG_TAG is re-emitted before retransmitted DATA so a lost first tag cannot permanently desynchronize the peer")
 req("active-v2-config-tag-transition-closes-from-peer-evidence",
     allin(common, "inband_retag_confirm_from_sack(int rx_bsi)",
           "config-discriminating SACK at/after the announce BSI",
