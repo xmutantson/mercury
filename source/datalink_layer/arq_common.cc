@@ -2223,14 +2223,47 @@ void cl_arq_controller::linkphase_arm_pending_prev_confirm(unsigned char prev_ac
 int cl_arq_controller::linkphase_rearm_prev_boundary_timer(int sequence_number,
 		int sender_total_frames, bool end_of_batch)
 {
-	// Regression scaffold: the pre-fix previous-generation route left the
-	// current-generation receive timer untouched. The fix is applied in the
-	// following commit so this checkpoint remains behavior-identical to its
-	// parent while the directed test exposes the stale boundary.
-	(void)sequence_number;
-	(void)sender_total_frames;
-	(void)end_of_batch;
-	return receiving_timeout;
+	// A retained-previous retry is still the commander's active physical
+	// keydown.  FLUSH-B treats expiry of receiving_timer as proof that keydown
+	// ended, so every decoded previous-generation frame must move that same
+	// physical boundary just as a current-generation frame does.  Storage and
+	// generation ownership remain independent; only the channel-idle proof is
+	// shared.
+	if(!linkphase_ackslot_on())
+		return receiving_timeout;
+	const char* defeat = std::getenv("MERCURY_DEFERRED_PREV_ACK_BOUNDARY_DEFEAT");
+	if(defeat && *defeat && atoi(defeat) != 0)
+		return receiving_timeout;
+
+	int total = sender_total_frames;
+	if(total < 1)
+		total = data_batch_size;
+	if(total < 1)
+		total = 1;
+	int seq = ((int)(unsigned char)sequence_number) & 0x7F;
+	if(seq >= total)
+		seq = total - 1;
+
+	int rx_timeout;
+	if(end_of_batch || seq + 1 >= total)
+	{
+		// Same positive end-of-keydown proof used by the current route.
+		rx_timeout = ptt_on_delay_ms + ptt_off_delay_ms;
+	}
+	else
+	{
+		int remaining = total - seq - 1;
+		rx_timeout = remaining * message_transmission_time_ms
+			+ time_left_to_send_last_frame + ptt_on_delay_ms
+			+ message_transmission_time_ms;
+	}
+
+	printf("[LINKPHASE-PREV-BOUNDARY] seq=%d total=%d eob=%d rx_t=%d old_t=%d\n",
+		seq, total, end_of_batch ? 1 : 0, rx_timeout, receiving_timeout);
+	fflush(stdout);
+	set_receiving_timeout(rx_timeout);
+	receiving_timer.start();
+	return rx_timeout;
 }
 
 void cl_arq_controller::linkphase_flush_pending_prev_confirm()

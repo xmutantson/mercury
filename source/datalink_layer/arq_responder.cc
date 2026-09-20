@@ -1409,9 +1409,9 @@ void cl_arq_controller::process_messages_rx_data_control()
 				}
 
 				// SACK Design A Step 8a — match-prev branch: store the frame
-				// into messages_rx_prev[] without touching messages_rx[] or
-				// the current-batch receive timer. The prev path runs to
-				// completion independently from the current-batch ACK-GATE.
+				// into messages_rx_prev[] without touching messages_rx[]. The
+				// generation pipeline remains independent, while the shared
+				// physical receive-boundary timer above follows the active keydown.
 				if(v2_route_to_prev)
 				{
 					if(store_prev_match_frame())
