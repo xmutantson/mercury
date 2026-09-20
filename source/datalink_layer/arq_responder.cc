@@ -41,12 +41,12 @@ void cl_arq_controller::process_messages_responder()
 
 	if(this->connection_status==ACKNOWLEDGING_CONTROL)
 	{
-		print_stats();
+		if(g_verbose) print_stats();
 		process_messages_acknowledging_control();
 	}
 	else if(this->connection_status==ACKNOWLEDGING_DATA)
 	{
-		print_stats();
+		if(g_verbose) print_stats();
 		process_messages_acknowledging_data();
 	}
 	else if(this->connection_status==RECEIVING)
@@ -855,14 +855,38 @@ void cl_arq_controller::process_messages_rx_data_control()
 		   && link_status == CONNECTED
 		   && connection_status == RECEIVING
 		   && !passive_monitor
+		   // A receiver cannot know that a tag was lost: inband_last_announced_config
+		   // is TX-only state and is never a valid RX transition predicate.  Permit
+		   // one blind decoder-bank search for this active wire batch; any later
+		   // failure at the same bsi waits for retransmission/the canonical re-tag.
+		   // This bounds work by a protocol generation, not by a timing threshold.
+		   && inband_down_probe_batch_seq_id != rsp_current_expected_batch_seq_id
 		   && (rx_fresh_window_decoded_this_pass              // a FRESH window was staged+decoded this pass
 		       || inband_freshwin_gate_defeat())              // (A/B fail-before knob restores pre-fix firing)
+		   // The PHY must have admitted a real OFDM preamble using its existing
+		   // detector.  Buffer energy alone can be the leading edge of an arriving
+		   // steady-state frame; probing then delays capture and a false NACK collides
+		   // with the very block that would have decoded.
+		   && telecom_system->receive_stats.ofdm_preamble_detected
+		   // Correlation admission is still not a payload failure.  Require the
+		   // primary decoder to have reached an actual FEC attempt; iterations_done
+		   // remains -1 for leading edges, incomplete frames and SKIP-VAR candidates.
+		   // This is decoder provenance, not a controller threshold.
+		   && telecom_system->receive_stats.iterations_done >= 0
+		   // A located preamble whose DATA tail is not captured yet is timing
+		   // evidence, not lost-tag evidence. Let the short wait-for-tail path
+		   // complete the same snapshot before trying alternate configurations.
+		   && !telecom_system->receive_stats.frame_data_missing
 		   && messages_rx_buffer.status != RECEIVED          // no frame decoded this pass
 		   && is_ofdm_config(current_configuration)           // tag only rides OFDM batches
 		   && rsp_current_expected_batch_seq_id >= 0)         // IN-FLIGHT active batch only
 		{
+			// Consume this batch's single blind-probe allowance before entering the
+			// decoder bank.  Even a silent/malformed snapshot must not spin another
+			// five decoders on every fresh capture for the same outstanding batch.
+			inband_down_probe_batch_seq_id = rsp_current_expected_batch_seq_id;
 			// FIRING GATE (data-flow-inband-downladder.md §2/§5.2, defect #2 + §2.1 the
-			// fresh-window term). TWO terms guard the firing frequency:
+			// fresh-window term). THREE terms guard the firing frequency:
 			//   (a) rx_fresh_window_decoded_this_pass — receive() actually re-staged a
 			//       FRESH capture window and attempted a primary decode THIS pass
 			//       (arq_common.cc:10624 frames_to_read==0 branch). Without it the gate
@@ -880,6 +904,9 @@ void cl_arq_controller::process_messages_rx_data_control()
 			//       CONFIG_TAG can only happen WITHIN a batch we are tracking. The
 			//       window-level + per-decoder energy prescans inside the resync remain the
 			//       signal-present-but-silent-snapshot backstop.
+			//   (c) inband_down_probe_batch_seq_id binds blind work to the active wire
+			//       generation.  A retry at the same bsi is handled by retransmission and
+			//       the sender's repeated CONFIG_TAG, not another decoder-bank scan.
 			inband_try_down_ladder_on_decode_fail();
 
 			// TERMINAL BREAK (design §7): the dead-batch streak reached
@@ -2391,11 +2418,18 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		}
 		else if(ack_pattern_time_ms > 0)
 		{
-			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT
-			bool is_turbo_setconfig = (turboshift_active || turboshift_phase != TURBO_DONE) &&
+			// During turboshift: send ACK + SNR suffix so commander can SUPERSHIFT.
+			// ACTIVE-v2 reaches SET_CONFIG only for the enumerated cross-tier or
+			// tag-carrier-unavailable exceptions. Those dedicated-ACK transitions
+			// still need the extended response; sending a bare ACK would strand the
+			// commander after this responder adopts the target. The SNR payload is
+			// advisory telemetry; it is not an admission gate for the v2 policy.
+			bool is_coordinated_setconfig =
+				(turboshift_active || turboshift_phase != TURBO_DONE ||
+				 rate_opt.controls_link()) &&
 				messages_control.data[0] == SET_CONFIG &&
 				measurements.SNR_uplink > -90;
-			if(is_turbo_setconfig)
+			if(is_coordinated_setconfig)
 			{
 				// POLLUTION GUARD (default-off): encode the honest forward-DATA-frame SNR instead of
 				// measurements.SNR_uplink, which the immediately-preceding SET_CONFIG control-frame
@@ -2431,6 +2465,8 @@ void cl_arq_controller::process_messages_acknowledging_control()
 				// so a robust->OFDM cross is not stranded with an oversized acquisition ring.
 				if(inband_rate_feature_enabled() && is_ofdm_config(data_configuration))
 					inband_finalize_ofdm_adopt_ring(data_configuration);
+				if(rate_opt.controls_link() && messages_control.data[0] == SET_CONFIG)
+					inband_confirm_coordinated_config(current_configuration);
 			}
 		}
 		else
@@ -8024,6 +8060,161 @@ int cl_arq_controller::test_inband_liveness()
 	}
 
 	// ========================================================================
+	// PART B5 — ACTIVE-v2 SINGLE OWNER: generic liveness cannot preempt either
+	// the CONFIG_TAG transition or the subsequent probe probation window.
+	// Reproduces the physical WGN25 failure where a ~37 s Gearshift zero-progress
+	// budget was killed by the 200-poll (~2 s) generic liveness watchdog.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->stats.nAcked_data = 6;
+		cmd->cmd_inband_liveness_last_acked = 6;
+		cmd->connection_status = TRANSMITTING_CONTROL;
+		cmd->rate_opt.notify_switch_dispatched(
+			CONFIG_10, CONFIG_11, GEARSHIFT_ACTION_PROBE, CONFIG_10, 1000, false);
+
+		bool fired_during_switch = false;
+		for(int p = 0; p < STALL_N * 3; p++)
+			if(cmd->inband_connect_liveness_guard()) fired_during_switch = true;
+		check(!fired_during_switch,
+			"B5.1 ACTIVE live switch owns liveness window (>3x legacy threshold, no recovery)",
+			fired_during_switch ? 1 : 0, 0);
+		check(cmd->send_break_pattern_count == 0,
+			"B5.2 ACTIVE live switch cannot be killed by generic BREAK",
+			cmd->send_break_pattern_count, 0);
+		check(cmd->rate_opt.switch_inflight_for_test(),
+			"B5.3 switch transaction remains owned after liveness polls",
+			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
+
+		int foreign = cmd->rate_opt.authorize_external_transition(
+			CONFIG_10, CONFIG_9, "test-competing-watchdog", 1100, false);
+		check(foreign < 0,
+			"B5.4 competing Axis-1 request is rejected while v2 transaction owns link",
+			foreign < 0 ? 1 : 0, 1);
+
+		cmd->rate_opt.notify_switch_confirmed(1200);
+		check(cmd->rate_opt.probe_is_active(),
+			"B5.5 peer-follow confirmation enters/retains owned probe probation",
+			cmd->rate_opt.probe_is_active() ? 1 : 0, 1);
+		bool fired_during_probation = false;
+		for(int p = 0; p < STALL_N * 3; p++)
+			if(cmd->inband_connect_liveness_guard()) fired_during_probation = true;
+		check(!fired_during_probation,
+			"B5.6 probe probation also owns liveness window (>3x legacy threshold)",
+			fired_during_probation ? 1 : 0, 0);
+		check(cmd->send_break_pattern_count == 0,
+			"B5.7 probation cannot be converted into fake hard failure by generic BREAK",
+			cmd->send_break_pattern_count, 0);
+		check(!cmd->rate_opt.authorize_hard_recovery(CONFIG_10, false,
+			"test-probation-break"),
+			"B5.8 hard recovery is refused while Gearshift owns probe probation",
+			0, 0);
+
+		const unsigned long long owner_deadline =
+			1000ULL + (unsigned long long)cmd->rate_opt.get_policy().probe_zero_progress_ms + 1001ULL;
+		check(!cmd->rate_opt.owns_link_experiment(owner_deadline),
+			"B5.9 probe ownership releases only after Gearshift's own zero-progress deadline",
+			cmd->rate_opt.owns_link_experiment(owner_deadline) ? 1 : 0, 0);
+		int rollback = cmd->rate_opt.authorize_external_transition(
+			CONFIG_11, CONFIG_9, "test-post-owner-deadline", owner_deadline, false);
+		check(rollback == CONFIG_10,
+			"B5.10 post-deadline failure signal rolls back to Gearshift fallback, not foreign hint",
+			rollback, CONFIG_10);
+		check(cmd->rate_opt.transition_matches(CONFIG_11, CONFIG_10),
+			"B5.11 rollback is a new Gearshift-owned transition",
+			cmd->rate_opt.transition_matches(CONFIG_11, CONFIG_10) ? 1 : 0, 1);
+		cmd->rate_opt.notify_switch_confirmed(owner_deadline + 1);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART B6 — FOREIGN TARGETS ARE TELEMETRY ONLY: with no live experiment,
+	// legacy code cannot nominate a rung or sneak one through SET_CONFIG.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+
+		int foreign = cmd->rate_opt.authorize_external_transition(
+			CONFIG_10, CONFIG_9, "test-foreign-target", 1000, false);
+		check(foreign < 0,
+			"B6.1 idle ACTIVE owner rejects a foreign-selected downshift target",
+			foreign < 0 ? 1 : 0, 1);
+
+		cmd->negotiated_configuration = CONFIG_9;
+		int rc = cmd->add_message_control(SET_CONFIG);
+		check(rc == ERROR_,
+			"B6.2 SET_CONFIG chokepoint rejects an unowned foreign transition",
+			rc, ERROR_);
+		check(cmd->current_configuration == CONFIG_10,
+			"B6.3 rejected foreign SET_CONFIG leaves live config unchanged",
+			cmd->current_configuration, CONFIG_10);
+		check(cmd->send_break_pattern_count == 0,
+			"B6.4 foreign target rejection emits no BREAK",
+			cmd->send_break_pattern_count, 0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
+	// PART B7 — EMERGENCY/NACK IS INPUT, NOT AUTHORITY: GS2 selects and owns
+	// the lower rung, then the preserved lossless demote path commits the canonical
+	// CONFIG_TAG transition. It remains owner-controlled and peer-confirmed.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->load_configuration(CONFIG_11, FULL, NO);
+		cmd->data_configuration = CONFIG_11;
+		cmd->negotiated_configuration = CONFIG_11;
+
+		int owner_target = cmd->rate_opt.consume_failure_signal(
+			CONFIG_11, "test-emergency-nack-threshold", 3000, false, false);
+		check(owner_target == CONFIG_10,
+			"B7.1 GS2 consumes failure input and selects the lower rung",
+			owner_target, CONFIG_10);
+		check(cmd->rate_opt.owns_coastdown_transition(CONFIG_11, CONFIG_10),
+			"B7.2 GS2 owns the coast-down transaction before ARQ mutation",
+			cmd->rate_opt.owns_coastdown_transition(CONFIG_11, CONFIG_10) ? 1 : 0, 1);
+
+		bool routed = cmd->inband_route_failure_demote(
+			owner_target, "test-emergency-nack-threshold", true, true);
+		check(routed,
+			"B7.3 preserved lossless demote machinery accepts the owned move",
+			routed ? 1 : 0, 1);
+		check(cmd->messages_control.status == FREE,
+			"B7.4 ordinary owned coast-down emits no legacy SET_CONFIG control frame",
+			cmd->messages_control.status, FREE);
+		check(cmd->inband_unilateral_armed,
+			"B7.5 ordinary owned coast-down arms canonical CONFIG_TAG transport",
+			cmd->inband_unilateral_armed ? 1 : 0, 1);
+		check(cmd->current_configuration == CONFIG_10 &&
+		      cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_10,
+			"B7.6 CONFIG_TAG coast commits locally and repeats until peer confirmation",
+			cmd->current_configuration, CONFIG_10);
+		// Keep the synthetic transition live on the controller's real monotonic clock.
+		// The earlier selector call intentionally used the fixed test timestamp 3000.
+		cmd->rate_opt.notify_switch_dispatched(
+			CONFIG_11, CONFIG_10, GEARSHIFT_ACTION_ROLLBACK, CONFIG_10,
+			cmd->opt_now_ms(), false);
+		cmd->link_status = CONNECTED;
+		bool deferred = cmd->inband_route_failure_demote(
+			CONFIG_9, "test-second-degradation-before-tag-confirm", true, true);
+		check(deferred && cmd->current_configuration == CONFIG_10 &&
+		      cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_10,
+			"B7.7 second degradation cannot replace an unconfirmed CONFIG_TAG transition",
+			cmd->current_configuration, CONFIG_10);
+		check(cmd->emergency_nack_count == 0 &&
+		      cmd->connection_status == TRANSMITTING_DATA,
+			"B7.8 consumed degradation resumes the retransmit path instead of spinning",
+			cmd->emergency_nack_count, 0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
 	// PART C — BOUNDED: repeated unrecovered stalls escalate to a hard reset
 	// ========================================================================
 	{
@@ -8262,6 +8453,11 @@ int cl_arq_controller::test_inband_retag()
 		cmd->narrowband_enabled = NO;
 		cmd->role = COMMANDER;
 		cmd->gear_shift_algorithm = SUCCESS_BASED_LADDER;  // ladder path: target=negotiated
+		// cl_arq_controller starts at CONFIG_0. Force a real FULL transition so
+		// make_cmd(CONFIG_0) initializes messages_control/messages_tx instead of
+		// short-circuiting into the synthetic NULL-buffer SET_CONFIG guard.
+		cmd->current_configuration = CONFIG_NONE;
+		ts->current_configuration = CONFIG_NONE;
 		cmd->load_configuration(cfg, FULL, NO);
 		cmd->link_status = CONNECTED;
 		cmd->connection_status = TRANSMITTING_DATA;
@@ -8270,12 +8466,61 @@ int cl_arq_controller::test_inband_retag()
 		cmd->robust_enabled = NO;
 		cmd->inband_rate_enabled = 1;       // force-resolve the cached flag ON
 		cmd->send_break_pattern_count = 0;  // zero the BREAK instrument
+		// This helper is the LEGACY/in-band transport baseline. ACTIVE-specific
+		// subcases below opt in explicitly with set_mode_for_test(ACTIVE). Do not
+		// inherit MERCURY_GEARSHIFT_V2 from the Pi/service environment: the
+		// single-owner firewall would correctly reject these synthetic unowned
+		// SET_CONFIGs and turn a transport regression into an environment test.
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_LEGACY);
 		*out_ts = ts;
 		return cmd;
 	};
 
 	const int CFG_LO  = CONFIG_9;   // ladder idx 12
 	const int CFG_HI  = CONFIG_11;  // ladder idx 14 (a 2-rung CLIMB above CFG_LO)
+
+	// ========================================================================
+	// PART A0 — ACTIVE-V2 PROBE TRANSPORT REGRESSION: an ordinary upward discovery
+	// probe uses canonical CONFIG_TAG. The commander commits locally, queues no
+	// SET_CONFIG frame, repeats the tag, and keeps switch_inflight open until a
+	// config-discriminating SACK proves that the peer followed.
+	// ========================================================================
+	{
+		cl_telecom_system* ts_cmd = nullptr;
+		cl_arq_controller* cmd = make_cmd(CONFIG_0, &ts_cmd);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->rate_opt.notify_switch_dispatched(
+			CONFIG_0, CONFIG_16, GEARSHIFT_ACTION_PROBE, CONFIG_0, 1000, false);
+
+		cmd->negotiated_configuration = CONFIG_16;
+		cmd->add_message_control(SET_CONFIG);
+		check(cmd->current_configuration == CONFIG_16,
+			"A0.1 ACTIVE probe commits locally through canonical CONFIG_TAG",
+			cmd->current_configuration, CONFIG_16);
+		check(cmd->messages_control.status == FREE,
+			"A0.2 ACTIVE probe queues no legacy SET_CONFIG control frame",
+			cmd->messages_control.status, FREE);
+		check(cmd->rate_opt.switch_inflight_for_test(),
+			"A0.3 local CONFIG_TAG commit does NOT confirm peer follow",
+			cmd->rate_opt.switch_inflight_for_test() ? 1 : 0, 1);
+		check(cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_16,
+			"A0.4 canonical probe arms repeat-until-confirmed CONFIG_TAG state",
+			(cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_16) ? 1 : 0, 1);
+
+		uint8_t probe_parity = 0;
+		const int PROBE_BSI = 7;
+		bool emitted = cmd->inband_tag_firing_decision(CONFIG_16, PROBE_BSI, &probe_parity);
+		check(emitted && cmd->inband_announce_bsi == PROBE_BSI,
+			"A0.5 first probe batch emits CONFIG_TAG and latches its BSI",
+			(emitted && cmd->inband_announce_bsi == PROBE_BSI) ? 1 : 0, 1);
+		bool confirmed = cmd->inband_retag_confirm_from_sack(PROBE_BSI);
+		check(confirmed && !cmd->inband_retag_armed &&
+		      !cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active(),
+			"A0.6 config-discriminating SACK closes tag transition and begins probation",
+			(!cmd->rate_opt.switch_inflight_for_test() && cmd->rate_opt.probe_is_active()) ? 1 : 0, 1);
+
+		delete cmd; delete ts_cmd;
+	}
 
 	// ========================================================================
 	// PART A — CLIMB-FOLLOWED: the chokepoint climbs CONFIG_9 -> CONFIG_11, the RX
@@ -8336,6 +8581,11 @@ int cl_arq_controller::test_inband_retag()
 		rx->rsp_last_delivered_batch_seq_id = (climb_bsi - 1) & 0xFF;
 		check(rx->current_configuration == CFG_LO, "A7 RX starts at CONFIG_9",
 			rx->current_configuration, CFG_LO);
+		// This fixture injects ONLY the CONFIG_TAG burst, not a simultaneous OFDM
+		// frame/preamble. The production clean-lock adopt gate therefore has no
+		// OFDM acquisition to validate. Arm the existing one-shot synchronization
+		// bypass so this test remains scoped to CONFIG_TAG decode/follow coherence.
+		rx->scream_reentry_listen_armed = true;
 
 		// W1: build the climb tag (CONFIG_11) — the SAME tones+keyer the production emit
 		// produces. Parity 1 (the first change after a fresh ctor flips 0->1).
@@ -8465,7 +8715,8 @@ int cl_arq_controller::test_inband_retag()
 		// it as a confirmed change to the starting config so the demote has a real floor.
 		cmd->inband_last_confirmed_config = CFG_LO;
 
-		// Arm a CLIMB to CONFIG_11 via the chokepoint.
+		// Arm a legacy/non-probe CONFIG_TAG climb. ACTIVE probe transport is
+		// exercised by PART A0; this part isolates re-tag exhaustion/demotion.
 		cmd->negotiated_configuration = CFG_HI;
 		cmd->add_message_control(SET_CONFIG);
 		cmd->process_messages_tx_control();
@@ -8733,6 +8984,9 @@ int cl_arq_controller::test_inband_nack()
 		cmd->robust_enabled = NO;
 		cmd->inband_rate_enabled = 1;
 		cmd->send_break_pattern_count = 0;
+		// Keep legacy/in-band transport subcases independent of ambient runtime
+		// MERCURY_GEARSHIFT_V2. ACTIVE ownership is enabled explicitly in Part B.
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_LEGACY);
 		return cmd;
 	};
 
@@ -8883,6 +9137,10 @@ int cl_arq_controller::test_inband_nack()
 		cl_arq_controller* rx = make_rx(CFG_LO);
 		rx->rsp_current_expected_batch_seq_id = 9;
 		cl_telecom_system* ts_rx = rx->telecom_system;
+		// Tag-only synthetic fixture: no OFDM preamble exists in this snapshot.
+		// Use the production one-shot re-entry bypass so the assertion tests
+		// CONFIG_TAG follow/no-chatter rather than the independent clean-lock gate.
+		rx->scream_reentry_listen_armed = true;
 
 		// Build a NORMAL, adoptable CONFIG_11 tag (CONFIG_9 -> CONFIG_11 climb the RX CAN follow).
 		int tones[gf16ra::GF16RA_MAX_N]; int n_tones = 0; uint8_t bsi_lsb = 0;
@@ -8926,7 +9184,9 @@ int cl_arq_controller::test_inband_nack()
 		cl_arq_controller* cmd = make_cmd(CFG_LO);
 		cmd->inband_last_confirmed_config = CFG_LO;   // RX provably reached CONFIG_9
 
-		// Arm a CLIMB to CONFIG_11 via the chokepoint (announced, not yet confirmed).
+		// Arm a legacy/non-probe CONFIG_TAG climb. PART A0 separately proves the
+		// ACTIVE canonical-probe lifecycle; this part remains the transport-level
+		// NACK/accelerated-demote regression.
 		cmd->negotiated_configuration = CFG_HI;
 		cmd->add_message_control(SET_CONFIG);
 		cmd->process_messages_tx_control();
@@ -9313,10 +9573,10 @@ int cl_arq_controller::test_inband_seamless()
 			tag_written = ts->generate_config_tag_pattern_passband(tag_burst.data(), tones, n_tones);
 		}
 
-		// Lead margin: leave room for the tag burst (if any) + a few symbols, then place
-		// the frame preamble. forced_delay is measured from window start to the preamble.
-		int lead_syms = with_tag ? ((tag_written + sym_samples - 1) / sym_samples + 4) : 8;
-		int forced_delay = (lead_syms * Nofdm + 2 * Nofdm) * interp;  // preamble start
+		// Production keys frame 0 immediately after the tag. Reproduce that exact gapless
+		// boundary: with a tag, the OFDM waveform begins at tag_written, with no synthetic
+		// clean-lock guard. A no-tag fixture retains ordinary receiver lead-in.
+		int forced_delay = with_tag ? tag_written : (10 * sym_samples);
 		float sigma = 1e-3f;
 		int n_frame = (Nofdm * (Nsymb + preN)) * interp;
 		ts->awgn_channel.apply_with_delay(
@@ -9882,7 +10142,7 @@ int cl_arq_controller::test_inband_downladder()
 	}
 
 	// ========================================================================
-	// PART C — THE FRESH-WINDOW FIRING GATE (data-flow-inband-downladder.md §2.1)
+	// PART C — FRESH-WINDOW + ONE-PROBE-PER-BATCH FIRING GATE
 	// ========================================================================
 	// The HW 3127 "all silent" down-ladder firings were the caller firing on EVERY benign
 	// inter-frame receive() pass during an active batch: receive() took the
@@ -9892,7 +10152,9 @@ int cl_arq_controller::test_inband_downladder()
 	// rx_fresh_window_decoded_this_pass — receive() only sets it on the frames_to_read==0
 	// branch that actually re-stages+decodes a fresh window.
 	//
-	// This drives the EXACT production gate predicate (the && chain at arq_responder.cc:535).
+	// This drives the EXACT production gate predicate.  TX-only announcement state cannot
+	// tell an RX that a tag was lost, so the blind search is instead bounded to one attempt
+	// per active wire batch; subsequent same-bsi failures await retransmission/re-tag.
 	// FAIL-BEFORE (the bug): on a STALE inter-frame pass (flag=false) the OLD gate (without
 	// the flag term) was TRUE -> the down-ladder fired on silence. PASS-AFTER: the gate is
 	// FALSE on a stale pass and TRUE only on a fresh-window decode-FAIL — so a GENUINE
@@ -9914,6 +10176,8 @@ int cl_arq_controller::test_inband_downladder()
 		rx->passive_monitor      = false;
 		rx->messages_rx_buffer.status = FREE;         // != RECEIVED: no frame stored this pass
 		rx->rsp_current_expected_batch_seq_id = 4;    // IN-FLIGHT active batch
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
+		rx->telecom_system->receive_stats.iterations_done = 0;
 
 		// EXACT production firing predicate (mirror of arq_responder.cc:535-542, including the
 		// fail-before defeat knob). The ONLY variable across the arms is the fresh-window flag
@@ -9923,7 +10187,11 @@ int cl_arq_controller::test_inband_downladder()
 			    && rx->link_status == CONNECTED
 			    && rx->connection_status == RECEIVING
 			    && !rx->passive_monitor
+			    && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			    && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			    && rx->telecom_system->receive_stats.ofdm_preamble_detected
+			    && rx->telecom_system->receive_stats.iterations_done >= 0
+			    && !rx->telecom_system->receive_stats.frame_data_missing
 			    && rx->messages_rx_buffer.status != RECEIVED
 			    && is_ofdm_config(rx->current_configuration)
 			    && rx->rsp_current_expected_batch_seq_id >= 0;
@@ -9966,6 +10234,35 @@ int cl_arq_controller::test_inband_downladder()
 			"C3 the fresh-window flag alone toggles the gate (false->no-fire, true->fire)",
 			(off ? 2 : 0) + (on ? 1 : 0), 1);
 
+		// C4 — consume the allowance exactly where production does, then prove a
+		// second fresh failure for the SAME outstanding bsi cannot rescan the bank.
+		rx->inband_down_probe_batch_seq_id = rx->rsp_current_expected_batch_seq_id;
+		check(would_fire() == false,
+			"C4 same-bsi fresh retry is bounded: no second blind decoder-bank probe",
+			would_fire() ? 1 : 0, 0);
+
+		// C5 — a new active wire generation re-arms one probe without any timer or
+		// channel threshold.  This preserves genuine lost-tag recovery per batch.
+		rx->rsp_current_expected_batch_seq_id = 5;
+		check(would_fire() == true,
+			"C5 next bsi re-arms exactly one blind lost-tag probe",
+			would_fire() ? 1 : 0, 1);
+
+		// C6 — fresh buffer energy without a PHY-admitted preamble is only an
+		// arriving/idle window.  It cannot authorize decoder work or a reverse NACK.
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = false;
+		check(would_fire() == false,
+			"C6 energy without a PHY-admitted OFDM preamble cannot fire lost-tag recovery",
+			would_fire() ? 1 : 0, 0);
+
+		// C7 — even an admitted correlation peak is not a failed payload.  Until
+		// the primary reaches FEC, lost-tag recovery must remain silent.
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
+		rx->telecom_system->receive_stats.iterations_done = -1;
+		check(would_fire() == false,
+			"C7 preamble-only candidate without a payload FEC attempt cannot fire recovery",
+			would_fire() ? 1 : 0, 0);
+
 		delete rx; delete ts_rx;
 	}
 
@@ -9992,13 +10289,19 @@ int cl_arq_controller::test_inband_downladder()
 		rx->messages_rx_buffer.status = FREE;
 		rx->rsp_current_expected_batch_seq_id = 4;
 		rx->rx_fresh_window_decoded_this_pass = false;   // STALE inter-frame pass
+		rx->telecom_system->receive_stats.ofdm_preamble_detected = true;
+		rx->telecom_system->receive_stats.iterations_done = 0;
 
 		bool fires_on_stale =
 			    rx->inband_rate_feature_enabled()
 			 && rx->link_status == CONNECTED
 			 && rx->connection_status == RECEIVING
 			 && !rx->passive_monitor
+			 && rx->inband_down_probe_batch_seq_id != rx->rsp_current_expected_batch_seq_id
 			 && (rx->rx_fresh_window_decoded_this_pass || rx->inband_freshwin_gate_defeat())
+			 && rx->telecom_system->receive_stats.ofdm_preamble_detected
+			 && rx->telecom_system->receive_stats.iterations_done >= 0
+			 && !rx->telecom_system->receive_stats.frame_data_missing
 			 && rx->messages_rx_buffer.status != RECEIVED
 			 && is_ofdm_config(rx->current_configuration)
 			 && rx->rsp_current_expected_batch_seq_id >= 0;
@@ -10166,8 +10469,25 @@ int cl_arq_controller::test_inband_adopt_preserve_live_burst()
 		check(peak_before >= 0.05, "A0 painted a LIVE burst on the ring (peak ≥ floor)",
 			(long)(peak_before * 1000), 50);
 
+		// Seed the mirrors stale to the source geometry: production CONFIG_TAG adopt
+		// must update them just as SET_CONFIG does, or a later unrelated control ACK
+		// reloads the source config after the tag follow.
+		rx->data_configuration = CONFIG_1;
+		rx->forward_configuration = CONFIG_1;
 		// THE PRODUCTION ADOPT (robust→OFDM crossing modelled as CONFIG_1→CONFIG_0, an OFDM target).
 		rx->inband_adopt_resynced_config(CONFIG_0);
+		check(rx->data_configuration == CONFIG_0,
+			"A0a CONFIG_TAG adopt updates data_configuration mirror",
+			rx->data_configuration, CONFIG_0);
+		check(rx->forward_configuration == CONFIG_0,
+			"A0b CONFIG_TAG adopt updates forward_configuration mirror",
+			rx->forward_configuration, CONFIG_0);
+		// Model the generic post-control-ACK restore that exposed the hardware bug.
+		if(rx->data_configuration != rx->current_configuration)
+			rx->load_configuration(rx->data_configuration, PHYSICAL_LAYER_ONLY, YES);
+		check(rx->current_configuration == CONFIG_0,
+			"A0c unrelated control ACK restore holds the followed CONFIG_0",
+			rx->current_configuration, CONFIG_0);
 
 		double peak_after = ring_peak(ts, sp);
 		int rwi_after = (int)ts->data_container.ring_write_index;

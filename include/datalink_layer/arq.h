@@ -40,6 +40,8 @@
 #include "compression/mercury_compress.h"
 #include "datalink_layer/b2f_handler.h"
 #include "datalink_layer/rate_optimizer.h"
+#include "datalink_layer/optimizer_metrics.h"
+#include "datalink_layer/optimizer_geometry.h"
 #include "datalink_layer/channel_state_lookup.h"
 #include "datalink_layer/l1_tx_journal.h"
 #include "datalink_layer/l1_block_ack.h"
@@ -893,6 +895,7 @@ public:
   // batch as post-control-turnaround. Called at a control-ACK -> data transition when the
   // ACKed op renegotiated the link geometry (batch size / config).
   void arm_control_turnaround_guard();
+  void arm_routine_turnaround_guard();
   int  test_turnaround_guard();
   int  test_measured_timers();  // R6 SRTT/RTTVAR estimator + ack-timeout invariant regression
   int  test_karn_retx_classify(); // Karn discriminator decoupling A/B (MERCURY_KARN_RETX_ONLY)
@@ -1156,6 +1159,14 @@ public:
   // frame_count*message_transmission_time_ms model (the LEVER-P desync). force_full mirrors
   // the retx re-anchor (every frame full preamble). Amortization-OFF => full every frame.
   int  derive_keydown_length_ms(int frame_count, bool force_full) const;
+  // Gearshift-v2 counterfactual airtime: same LEVER-P schedule, but for an
+  // arbitrary feasible OFDM config using the precooked immutable geometry.
+  // Returns 0 when no trustworthy geometry exists for that candidate.
+  int  predict_keydown_length_ms_for_config(int config, int frame_count, bool force_full) const;
+  int  predict_payload_bytes_per_frame_for_config(int config) const;
+  int  predict_initial_batch_size_for_config(int config,
+                                              bool use_live_current = true) const;
+  int  predict_payload_bytes_per_batch_for_config(int config, int frame_count) const;
   // LINK-PHASE STEP 4 (MC-6) — MERCURY_LINKPHASE_RETXSLOT (default OFF). When ON, the RSP
   // derives its post-SACK retx-turn listen window from the popcount of the SACK it just
   // authored (see linkphase_derive_retx_slot) instead of the hardcoded 1.5x cadence. OFF =>
@@ -1228,10 +1239,10 @@ public:
   // 13-uncoded ACK suffix AND ~4 dB more robust (cliff measured -4.2 dB deeper).
   // Returns wall-clock TX ms, or 0 if unsupported (NB / compiled out). CRC12 is
   // over the single [bsi] byte. CLEAN-batch only — partial loss uses send_sack.
-  // With topgear opt-in, this preserves the original compact-confirm prefix and
-  // appends an independently CRC12-protected forward SNR/flatness codeword.
-  // Peers without topgear still decode the unchanged prefix; default-off wire
-  // remains exactly the existing compact confirm.
+  // With Gearshift-v2 telemetry or legacy topgear opt-in, this preserves the
+  // original compact-confirm prefix and may append one independently CRC12-
+  // protected forward-quality codeword. Peers that ignore the optional tail
+  // still decode the unchanged prefix. Gearshift-v2 rate-limits unchanged hints.
   long long send_mfsk_compact_confirm(unsigned char target_batch_seq_id);
   int test_send_mfsk_compact_confirm_reset_failure();
 
@@ -1278,6 +1289,9 @@ public:
                                                uint8_t* out_ssid);
 
   void send_break_pattern(); // Emergency BREAK: TX "drop to ROBUST_0" tone pattern
+  // ACTIVE-v2 hard recovery terminates at the robust floor; legacy BREAK
+  // ladder/probe policy is bypassed and Gearshift reacquires upward itself.
+  bool gearshift_v2_finish_break_at_floor();
   int test_send_break_drain_failure(); // drain failure must free buffers and unkey PTT
   int test_send_break_pattern_reset_failure(); // reset NotReady must unkey and clear RX mute
   int test_break_ack_set_config_failure(); // rejected recovery enqueue must not enter control TX
@@ -3005,7 +3019,10 @@ public:
   // default-off build is byte-identical to the SET_CONFIG baseline. The codec
   // primitives live in include/physical_layer/mfsk_ctrl_codec.h (Stage 1).
 
-  // Resolve + cache the MERCURY_INBAND_RATE env flag. Returns true iff the
+  // CONFIG_TAG transport gate. Gearshift-v2 ACTIVE returns true unconditionally
+// because CONFIG_TAG is its production transition transport, not a selector.
+// Legacy modes resolve/cache MERCURY_INBAND_RATE and retain the historical opt-in.
+// Returns true iff the in-band transport/recovery stack is active.
   // feature is enabled. Cheap after the first call (cached in inband_rate_enabled).
   bool inband_rate_feature_enabled();
 
@@ -3073,6 +3090,19 @@ public:
   bool topgear_channel_clean();
   void topgear_elect_evaluate();
   int  topgear_wb_ceiling();
+
+  // Gearshift-v2 advisory forward-quality telemetry.  This reuses the existing
+  // optional second compact-confirm codeword but is independent of CONFIG_17
+  // permission/election.  Actual delivered application goodput remains the
+  // authority; this report only improves counterfactual prediction/convergence.
+  // ACTIVE/SHADOW enable it by default (MERCURY_GS2_QUALITY_REPORT=0 opts out).
+  // Legacy topgear retains its historical report path unchanged.
+  bool gearshift_quality_report_v2_enabled() const;
+  bool gearshift_quality_report_transport_enabled();
+  unsigned char gearshift_pack_quality_report(double snr, double selectivity) const;
+  void gearshift_apply_quality_report(unsigned char report, int batch_seq_id);
+  bool gearshift_quality_report_due_for_tx(unsigned char report, int batch_seq_id) const;
+  void gearshift_quality_report_note_tx(unsigned char report, int batch_seq_id);
   // ACK-seam BREAK temporal-validity classifier (MERCURY_DEMOTE_TEMPORAL_HYSTERESIS=1,
   // default-off). Called at the emergency-BREAK miss increment. Returns true if this
   // receive timeout falls in an L1 aggregate-outstanding window and is being HELD (not
@@ -5065,6 +5095,14 @@ public:
   int   axis2_cooldown_batches;          // §4.3.3 Axis-1 supremacy cooldown — Axis-2
                                          //      skips evaluation while >0; decremented
                                          //      per evaluation call.
+  // Axis-1 transition preparation token.  policy_axis1_supremacy_on_move()
+  // arms this for a real config change; the universal SET_CONFIG / in-band
+  // executor consumes it.  This makes the lower-axis reset contract exactly-once
+  // even when a legacy producer already invoked the hook before reaching the
+  // common transition chokepoint.
+  bool axis1_supremacy_prepared;
+  int  axis1_supremacy_prepared_from;
+  int  axis1_supremacy_prepared_to;
   // §4.3.4 invariant #7 — proven-ceiling state (Step 12).
   //  ceiling == -1 ⇒ no cap (default; either no prior failure or already recovered).
   //  ceiling >=  0 ⇒ Axis-2 may NOT propose to > ceiling until recovery_remaining == 0.
@@ -5451,9 +5489,17 @@ public:
   int     topgear_reengage_cooldown;    // B1: clean batches a seam DEMOTE bars the next seam CLIMB; 0 = free
   int     topgear_below_floor_streak;   // B2: consecutive flat-but-below-floor (state 9) reports; drop at STREAK
   int     topgear_drop_streak;          // default-off temporal gate: consecutive bad reports while engaged
-  int     topgear_last_flat_state;      // B2: last decoded forward-report flat_state marker (8/9/10/11)
+  int     topgear_last_flat_state;      // B2: derived legacy flat/floor state (8/9/10/11)
 
-  // ── Topgear report CONSUME-RACE fix: deferred stashed-tail report decode ──
+  // Gearshift-v2 quality-report TX rate limiter.  The responder emits the
+  // optional compact tail immediately when the quantized SNR/selectivity byte
+  // changes, otherwise only at a bounded refresh interval.  BSI arithmetic is
+  // modulo-256.  These are session-scoped and reset with the ARQ session.
+  bool          gearshift_quality_tx_valid;
+  unsigned char gearshift_quality_tx_report;
+  int           gearshift_quality_tx_bsi;
+
+  // ── Topgear/GS2 report CONSUME-RACE fix: deferred stashed-tail report decode ──
   // Live-vehicle finding (real-loopback, both peers armed, audio-bracketed twice):
   // the commander's compact-confirm poll accepts the confirm as soon as the FIRST
   // (bsi) codeword is CRC-valid — ~2.1-2.5 symbols of the trailing REPORT codeword
@@ -5474,7 +5520,8 @@ public:
   // from the frozen stash only. Late apply is safe: topgear_apply_report de-dupes
   // per-bsi and validates the marker nibble, and a replaced/expired pending self-heals
   // on the next confirm's fresh report. ALL of this state is dead (never armed)
-  // unless MERCURY_TOPGEAR_ELECT=1 — the default path does not move.
+  // unless either legacy MERCURY_TOPGEAR_ELECT or Gearshift-v2 quality telemetry
+  // has armed a pending tail. The compact-confirm ACK itself is never delayed.
   int      topgear_pending_report_bsi;     // -1 = no pending deferred report
   int      topgear_pending_cfg;            // config at arm time; any change clears pending
   bool     topgear_pending_stash_frozen;   // a ring wipe happened -> stop refreshing
@@ -5499,7 +5546,8 @@ public:
   // R floor (inband_retag_min, default 3, MERCURY_INBAND_RETAG_MIN) is the give-up
   // trigger: a CLIMB still un-confirmed after R re-tags AUTO-DEMOTES to the last-
   // confirmed config via the tag (NEVER a BREAK, design §4.3). All members ADDITIVE,
-  // gated by MERCURY_INBAND_RATE (default-off byte-identical). Init in arq_common.cc
+  // gated by the CONFIG_TAG transport gate (default-on for Gearshift-v2 ACTIVE;
+// legacy modes retain MERCURY_INBAND_RATE opt-in). Init in arq_common.cc
   // next to the other inband state + reset_session_state.
   bool inband_retag_armed   = false;        // a change announced but NOT yet confirmed -> re-emit
   int  inband_retag_config  = CONFIG_NONE;  // the announced config being repeated
@@ -5552,6 +5600,10 @@ public:
   // inband_last_confirmed_config, and STOP re-emitting. No-op when not armed / stale bsi.
   // Returns true if it disarmed (confirmed). Called from every SACK accept site.
   bool inband_retag_confirm_from_sack(int rx_bsi);
+  // An enumerated-special-case SET_CONFIG ACK already proves both peers agreed
+  // on the new geometry. Seed the in-band tracker at that config so the first
+  // DATA batch does not carry a redundant unilateral CONFIG_TAG.
+  void inband_confirm_coordinated_config(int config);
   // KEYSTONE (data-flow-inband-tier-crossing.md §6): DATA-DECOUPLED intra-tier CLIMB confirm.
   // When an EMITTED CLIMB re-tag is armed and the robust BASE ACK pattern matched
   // (mfsk_matched >= ack_match_threshold), CONFIRM the climb even if the bsi-bearing SACK
@@ -5579,7 +5631,8 @@ public:
   // IMMEDIATELY to the RX config (reusing inband_route_failure_demote, BREAK-count==0)
   // — accelerating the Stage-4d R-retry give-up to a single batch. D2 is an
   // OPTIMIZATION: with NO NACK the Stage-4d R-retry auto-demote still fires.
-  // All members ADDITIVE, gated by MERCURY_INBAND_RATE (default-off byte-identical).
+  // All members ADDITIVE, gated by the CONFIG_TAG transport gate (ACTIVE baseline;
+// legacy MERCURY_INBAND_RATE opt-in).
 
   // The epoch parity the RX last SAW on an adopted/followed tag — echoed in the NACK so
   // the sender can reject a stale NACK that crosses a fresh change. Init 0.
@@ -5648,6 +5701,11 @@ public:
   bool inband_down_decoders_built = false;    // any slot allocated yet?
   int  inband_down_buffer_nsymb = 0;          // common buffer_Nsymb for the bank (largest window cfg)
   int  inband_down_d = -1;                    // cached MERCURY_INBAND_DOWN_D (-1=unresolved)
+  // A blind lost-tag search is expensive and has no authenticated evidence that the
+  // sender changed geometry.  Bind it to the active wire batch: one fresh failed
+  // snapshot may probe, while later failures for the same bsi wait for the sender's
+  // retransmission/re-tag instead of repeatedly running the decoder bank.
+  int  inband_down_probe_batch_seq_id = -1;   // last active bsi given one blind probe
   int  inband_session_dead_batches = 0;       // consecutive ZERO-PROGRESS REAL-batch-period total losses -> terminal BREAK
   int  inband_dead_batches_limit = -1;        // cached MERCURY_INBAND_DEAD_BATCHES (-1=unresolved)
   // §19 dead-batch tick guard: a session-monotonic forward-DATA-frame counter + the snapshot at the
@@ -5973,7 +6031,8 @@ public:
   // not a pinned ceiling, is the over-climb guard there). All existing callers keep the
   // default => byte-identical.
   bool inband_route_failure_demote(int demote_target, const char* reason,
-                                   bool pin_ceiling = true);
+                                   bool pin_ceiling = true,
+                                   bool gearshift_owned = false);
   // roll_back_cmd_bsi_to_inflight: the CLIMB-UP counterpart of the demote bsi rollback
   // (data-flow-inband-frame0-rolling-partial.md §13). The demote/BREAK paths
   // (inband_route_failure_demote :3134, CFG16-HOLD :5037, M6 BREAK :5242) roll
@@ -6535,18 +6594,35 @@ public:
   bool optimizer_disabled;         // CLI --no-optimizer: disable Phase 3c effective-rate optimizer (calibration runs)
   void set_optimizer_disabled(bool b) { optimizer_disabled = b; }
 
-  // Gearshift ↔ Q-table optimizer handoff. Above the lowest calibrated
-  // config in the Q-table, the optimizer is the sole authority for upward
-  // config changes — gearshift's FRAME UP / LADDER UP must yield. Below
-  // that, the optimizer has no data and gearshift's SNR-based ladder runs.
-  // BREAK fallback (downward to ROBUST_0) stays available to both bands as
-  // the safety net. Returns false if optimizer is disabled, table is unloaded,
-  // or current_configuration is below the calibrated band.
+  // Gearshift authority boundary.  In Gearshift-v2 ACTIVE mode the v2
+  // controller is the sole connected Axis-1 authority. SHADOW mode is
+  // observation-only. LEGACY mode preserves the monitor branch's calibrated-band
+  // handoff. In ACTIVE, BREAK is an owner-authorized actuator, never a peer controller.
   bool optimizer_is_in_control() const {
     if (optimizer_disabled || !rate_opt.is_enabled()) return false;
-    int handoff = rate_opt.min_calibrated_cfg(narrowband_enabled == YES);
+    if (rate_opt.get_mode() == GEARSHIFT_V2_SHADOW) return false;
+    if (rate_opt.get_mode() == GEARSHIFT_V2_ACTIVE)
+      return true;  // v2 owns every ordinary data-rate transition, incl. robust exit
+    const bool is_nb = (narrowband_enabled == YES);
+    const int handoff = rate_opt.min_calibrated_cfg(is_nb);
     if (handoff <= 0) return false;
     return config_ladder_index(current_configuration) >= config_ladder_index(handoff);
+  }
+
+  // Ordinary downshift ownership is intentionally narrower than the broad
+  // upward handoff.  The v2 controller may suppress the legacy ladder only when
+  // it has actually evaluated the state (HOLD/SWITCH/PROBE/ROLLBACK), never when
+  // it abstained because evidence or calibration was unavailable. Full-batch
+  // failure remains evidence for v2; ACTIVE hard recovery is owner-authorized.
+  bool optimizer_owns_normal_downshift() const {
+    if (!optimizer_is_in_control()) return false;
+    if (rate_opt.get_mode() == GEARSHIFT_V2_ACTIVE)
+      return true;  // v2 owns ordinary downshift; BREAK remains independent
+    if (rate_opt.cooldown_active()) return true;
+    if (get_current_window_count() < rate_opt.min_window_samples()) return false;
+    const double max_partial = rate_opt.max_calibrated_partial_loss(
+        narrowband_enabled == YES);
+    return max_partial < 0.0 || get_current_partial_frame_loss_rate() <= max_partial;
   }
 
   // Cap a turboshift SNR-derived target at the handoff config so the
@@ -7109,6 +7185,17 @@ public:
   // regime. Reset per session (rung_meter_reset at init() + reset_session_state()).
   double    rung_meter_db{-99.9};
   int       rung_meter_age_batches{1000000000};
+  // Gearshift-v2 keeps channel-quality provenance explicit.  Never infer the
+  // forward path from the historically overloaded SNR_uplink field.  Forward
+  // is peer-reported quality of our DATA; reverse is quality measured locally
+  // while receiving the peer.  Selectivity is forward-only when actually
+  // reported by the peer.
+  double    gearshift_forward_snr_db{-99.9};
+  int       gearshift_forward_snr_age_batches{1000000000};
+  double    gearshift_reverse_snr_db{-99.9};
+  int       gearshift_reverse_snr_age_batches{1000000000};
+  double    gearshift_forward_selectivity{-1.0};
+  int       gearshift_forward_selectivity_age_batches{1000000000};
   long long rung_meter_wall_ms{0};
   bool      rung_meter_data_latched{false};
   // B2 (default-off): steady-state health clocks for the MERCURY_RUNG_STEADY_REFRESH healthy-hold
@@ -7232,15 +7319,13 @@ public:
   // ROBUST_DWELL_BATCH_OP batch-size change, SET_CONFIG config change), armed by
   // arm_control_turnaround_guard(). A routine data-SACK turnaround leaves
   // turnaround_clearance_from_control==false and is BYTE-IDENTICAL (no wait): those
-  // turnarounds already deliver slot 0 cleanly, so the original arm-on-every-reception R1
-  // only taxed throughput and risked the RSP's post-SACK reverse window. receive() still
-  // stamps the timer on every decoded reverse frame (routine arm) so the
-  // MERCURY_TURNAROUND_GUARD_SCOPE_ALL=1 A/B arm can restore the broad behaviour.
+  // receive() stamps every decoded reverse frame, and compact-confirm detection stamps
+  // its early-decode event explicitly. Production waits the remaining geometry-derived
+  // clearance; MERCURY_TURNAROUND_GUARD_SCOPE_ALL=0 is the control-only defeat arm.
   cl_timer turnaround_clearance_timer;
   bool     turnaround_clearance_armed = false;
-  // R1-rescope discriminant: set true ONLY at a CONTROL-ACK -> data transition
-  // (arm_control_turnaround_guard); a routine reverse reception leaves it false. Consumed
-  // one-shot by turnaround_clearance_wait() when it keys the guarded batch.
+  // Discriminant retained for the CONTROL-only defeat arm. Production guards both
+  // control and routine reverse turnarounds; false identifies a routine SACK/confirm.
   bool     turnaround_clearance_from_control = false;
   // Test-visible instrumentation for --test-turnaround-guard (set by
   // turnaround_clearance_wait): the ms the guard busy-waited this call (-1 = guard not
@@ -7261,6 +7346,10 @@ public:
   bool passive_monitor;  // Third-party monitor mode: accept all frames, never TX
   bool monitor_stdout;   // Output decoded plaintext to stdout (headless monitor)
   int monitor_consec_ofdm_fail{0};  // Consecutive OFDM decode failures (for opportunistic scan)
+  // Keep an acquisition-failure episode observable without making diagnostic
+  // stdout a real-time workload. Reset by a CRC-good OFDM frame; the failure
+  // path reports only powers of two from a continuous episode.
+  unsigned long long ftr_fail_diag_run{0};
 
   // Parallel monitor decoders — one cl_telecom_system per OFDM config.
   // All share the same-sized audio buffer (buffer_Nsymb_min override).
@@ -7279,107 +7368,236 @@ public:
   double get_snr_uplink() const { return measurements.SNR_uplink; }
   double get_snr_downlink() const { return measurements.SNR_downlink; }
 
-  // Phase 3a (Effective-Rate Optimizer) — measurement plumbing.
-  // Rolling window of last OPTIMIZER_WINDOW_SIZE batches' per-batch stats.
-  // CMD-side only; populated by arq_commander.cc. Decision logic (Phase 3c)
-  // reads via these public getters — no policy lives here.
-  //
-  // See: mercury/fact-documents/EFFECTIVE_RATE_OPTIMIZER_DESIGN.md §4.1
+  // Gearshift-v2 channel-quality ingress is direction-qualified.  The historic
+  // measurements.SNR_uplink field has mixed provenance, so v2 never consumes it
+  // directly.  Peer-reported SNR of OUR transmissions is FORWARD; SNR measured
+  // locally while COMMANDER receives the peer is REVERSE.  Both carry a batch age.
+  void gearshift_note_forward_snr(double v) {
+      if (std::isfinite(v) && v > -90.0) { gearshift_forward_snr_db=v; gearshift_forward_snr_age_batches=0; }
+  }
+  void gearshift_note_reverse_snr(double v) {
+      if (std::isfinite(v) && v > -90.0) { gearshift_reverse_snr_db=v; gearshift_reverse_snr_age_batches=0; }
+  }
+  void gearshift_note_forward_selectivity(double v) {
+      if (std::isfinite(v) && v >= 0.0) {
+          gearshift_forward_selectivity=v;
+          gearshift_forward_selectivity_age_batches=0;
+      }
+  }
+  void gearshift_age_channel_reports() {
+      if (gearshift_forward_snr_age_batches < 1000000000) ++gearshift_forward_snr_age_batches;
+      if (gearshift_reverse_snr_age_batches < 1000000000) ++gearshift_reverse_snr_age_batches;
+      if (gearshift_forward_selectivity_age_batches < 1000000000) ++gearshift_forward_selectivity_age_batches;
+  }
+  void gearshift_reset_channel_reports() {
+      gearshift_forward_snr_db=-99.9; gearshift_forward_snr_age_batches=1000000000;
+      gearshift_reverse_snr_db=-99.9; gearshift_reverse_snr_age_batches=1000000000;
+      gearshift_forward_selectivity=-1.0; gearshift_forward_selectivity_age_batches=1000000000;
+  }
+
+  // Gearshift v2 measurement plumbing.  The ring stores immutable transaction
+  // outcomes.  Outcome evidence and rate evidence are independent: aggregate
+  // L1 replay can contribute clean/partial truth without inventing a duration.
+  // Application bytes are committed only when the corresponding atomic unit
+  // completes; banked transport bytes remain a separate fast progress signal.
   static const int OPTIMIZER_WINDOW_SIZE = 50;
 
+  st_optimizer_window_metrics get_current_optimizer_metrics() const {
+      return optimizer_reduce_window(
+          opt_batch_app_bytes, opt_batch_transport_bytes, opt_batch_cycle_ms,
+          opt_batch_rate_valid, opt_batch_outcome_valid,
+          opt_batch_application_committed, opt_batch_sack_count,
+          opt_batch_failed, opt_batch_frames_acked, opt_batch_frames_sent,
+          opt_window_head, opt_window_count, OPTIMIZER_WINDOW_SIZE);
+  }
+  double get_current_application_rate_bps() const {
+      return get_current_optimizer_metrics().application_bps;
+  }
+  double get_current_transport_rate_bps() const {
+      return get_current_optimizer_metrics().transport_bps;
+  }
   double get_current_effective_rate_bps() const {
-      if (opt_window_count == 0) return 0.0;
-      unsigned long long total_bytes = 0;
-      unsigned long long total_ms = 0;
-      for (int i = 0; i < opt_window_count; i++) {
-          int idx = (opt_window_head - 1 - i + OPTIMIZER_WINDOW_SIZE) % OPTIMIZER_WINDOW_SIZE;
-          total_bytes += opt_batch_bytes_delivered[idx];
-          total_ms += opt_batch_wire_ms[idx];
-      }
-      if (total_ms == 0) return 0.0;
-      return (double)total_bytes * 8000.0 / (double)total_ms;
+      const st_optimizer_window_metrics m = get_current_optimizer_metrics();
+      return m.application_commit_count > 0 ? m.application_bps : m.transport_bps;
   }
   double get_current_sack_rate() const {
-      if (opt_window_count == 0) return 0.0;
-      int sack_count = 0;
-      for (int i = 0; i < opt_window_count; i++) {
-          int idx = (opt_window_head - 1 - i + OPTIMIZER_WINDOW_SIZE) % OPTIMIZER_WINDOW_SIZE;
-          sack_count += opt_batch_sack_count[idx];
-      }
-      return (double)sack_count / (double)opt_window_count;
+      return get_current_optimizer_metrics().sack_batch_rate;
   }
-  int get_current_window_count() const { return opt_window_count; }
+  double get_current_frame_success_rate() const {
+      return get_current_optimizer_metrics().frame_success_rate;
+  }
+  double get_current_partial_frame_loss_rate() const {
+      return get_current_optimizer_metrics().partial_frame_loss_rate;
+  }
+  double get_current_failed_batch_rate() const {
+      return get_current_optimizer_metrics().failed_batch_rate;
+  }
+  int get_current_window_count() const {
+      return get_current_optimizer_metrics().outcome_sample_count;
+  }
+  int get_current_rate_window_count() const {
+      return get_current_optimizer_metrics().rate_sample_count;
+  }
+  int get_current_application_commit_count() const {
+      return get_current_optimizer_metrics().application_commit_count;
+  }
 
-  // Phase 3a helpers — invoked from CMD-side TX/ACK/BREAK sites in
-  // arq_commander.cc. Defined inline to avoid an extra .o churn for what is
-  // a thin instrumentation layer; no decision logic lives in any of them.
   unsigned long long opt_now_ms() const {
-      // §5 LANDMINE (sim-arq-channel.md): the Q-table effective-rate optimizer
-      // measures bytes/time using THIS clock (opt_on_batch_tx_start ->
-      // opt_batch_wire_ms -> get_current_effective_rate_bps). Under -x sim the
-      // channel runs faster than wall-clock, so reading the wall-clock here
-      // would make the optimizer see bytes/wall-time and report a rate ~50x
-      // too high -> garbage config selection. Route it through the SAME virtual
-      // clock the cl_timers use so the optimizer measures bytes/CHANNEL-time.
-      // sim_clock_now_ns() falls back to steady_clock when sim is disabled, so
-      // production is byte-identical to the previous steady_clock read.
       return (unsigned long long)(sim_clock_now_ns() / 1000000ULL);
   }
-  // Called at the cmd_batch_tx_start instrumentation point. If a previous
-  // batch already published its slot, back-fill its wire_ms with the cycle
-  // delta. Always refresh opt_batch_tx_start_ms to the current wall-clock so
-  // the next batch can do the same.
-  void opt_on_batch_tx_start() {
-      unsigned long long now = opt_now_ms();
-      if (opt_batch_tx_start_ms != 0 && opt_window_count > 0) {
-          int prior = (opt_window_head - 1 + OPTIMIZER_WINDOW_SIZE) % OPTIMIZER_WINDOW_SIZE;
-          unsigned long long delta = now - opt_batch_tx_start_ms;
-          opt_batch_wire_ms[prior] = (unsigned int)delta;
+
+  bool opt_primitive_trace_enabled() const {
+      // Primitive per-transaction logs are calibration/debug evidence, not a
+      // free part of the modem.  Keep them off the production hot path unless
+      // explicitly requested; the calibration harness enables this variable.
+      static int cached = -1;
+      if (cached < 0) {
+          const char* e = std::getenv("MERCURY_GS2_PRIMITIVE_TRACE");
+          cached = (e && *e && std::atoi(e) != 0) ? 1 : 0;
       }
-      opt_batch_tx_start_ms = now;
+      return cached != 0;
   }
-  // Advance the ring head with one slot describing the just-finished batch.
-  // bytes_delivered is the number of payload bytes the receiver actually got
-  // (zero for failed batches). sack_used = 1 iff this batch closed via
-  // SACK_RSP (partial recovery), 0 if via OFDM_ACK_CLEAN / ACK_PAT / fallback
-  // ACK / failure. failed = 1 iff the batch dropped without any ACK / BREAK
-  // fired against it.
-  void opt_record_batch(unsigned int bytes_delivered,
+
+  void opt_on_batch_tx_start(unsigned int frames_sent,
+                             unsigned int repair_frames = 0) {
+      gearshift_age_channel_reports();
+      opt_batch_tx_start_ms = opt_now_ms();
+      opt_current_batch_frames_sent = frames_sent;
+      opt_current_batch_repair_frames = repair_frames > frames_sent
+                                      ? frames_sent : repair_frames;
+  }
+
+  // Record one completed DATA/feedback transaction. transport_bytes_banked is
+  // the newly banked link payload (duplicates/retries already banked are not
+  // credited). outcome_only is used by L1 aggregate replay: it contributes
+  // frame/SACK evidence but no fabricated rate interval.
+  void opt_record_batch(unsigned int transport_bytes_banked,
                         bool sack_used,
-                        bool failed) {
-      int slot = opt_window_head;
-      opt_batch_bytes_delivered[slot] = bytes_delivered;
-      // wire_ms is not known yet — the NEXT batch's tx_start back-fills it.
-      // Seed with 0 so a never-back-filled trailing slot contributes nothing
-      // to the rate sum (defensive: get_current_effective_rate_bps() also
-      // checks total_ms == 0).
-      opt_batch_wire_ms[slot] = 0;
+                        bool failed,
+                        int frames_acked = -1,
+                        unsigned int frames_sent_override = 0,
+                        bool outcome_only = false) {
+      const unsigned long long now = opt_now_ms();
+      const unsigned int sent = frames_sent_override ? frames_sent_override
+                                                     : opt_current_batch_frames_sent;
+      unsigned int acked;
+      if (frames_acked >= 0) acked = (unsigned int)frames_acked;
+      else if (failed) acked = 0;
+      else acked = sent;
+      if (acked > sent) acked = sent;
+
+      unsigned int cycle = 0;
+      if (!outcome_only && opt_batch_tx_start_ms != 0 && now >= opt_batch_tx_start_ms)
+          cycle = (unsigned int)(now - opt_batch_tx_start_ms);
+
+      const int slot = opt_window_head;
+      const unsigned long long record_id = ++opt_record_sequence;
+      opt_batch_record_id[slot] = record_id;
+      opt_batch_app_bytes[slot] = 0;
+      opt_batch_transport_bytes[slot] = transport_bytes_banked;
+      opt_batch_cycle_ms[slot] = cycle;
+      opt_batch_rate_valid[slot] = cycle > 0 ? 1 : 0;
+      opt_batch_outcome_valid[slot] = 1;
+      opt_batch_application_committed[slot] = 0;
       opt_batch_sack_count[slot] = sack_used ? 1 : 0;
       opt_batch_failed[slot] = failed ? 1 : 0;
+      opt_batch_frames_acked[slot] = acked;
+      opt_batch_frames_sent[slot] = sent;
       opt_batch_config[slot] = (unsigned char)current_configuration;
+      opt_batch_size[slot] = sent;
+
       opt_window_head = (opt_window_head + 1) % OPTIMIZER_WINDOW_SIZE;
-      if (opt_window_count < OPTIMIZER_WINDOW_SIZE) opt_window_count++;
-      opt_diag_emit_counter++;
-      // Emit every 3 batches (was 10) so short or lossy sessions still produce
-      // wire-bps samples for downstream harnesses. The previous threshold of
-      // 10 meant sessions that hit BREAK or ended <10 batches in produced
-      // ZERO [OPT-WINDOW] lines, forcing the harness to fall back to TCP
-      // rx_bytes — which is the SAME counter the harness uses for the
-      // user-facing throughput field, making the wire-vs-user ratio always
-      // 1.00× by construction. See Phase 4 v1 wgn18/mpp18/mpm18 false-alarm.
-      if (opt_diag_emit_counter >= 3 && opt_window_count > 0) {
+      if (opt_window_count < OPTIMIZER_WINDOW_SIZE) ++opt_window_count;
+      if (!outcome_only) {
+          opt_last_real_slot = slot;
+          opt_batch_tx_start_ms = 0;
+      }
+
+      const double forward_snr = gearshift_forward_snr_age_batches <= rate_opt.get_policy().forward_quality_max_age_batches
+                               ? gearshift_forward_snr_db : -99.9;
+      const double forward_sel = gearshift_forward_selectivity_age_batches <= rate_opt.get_policy().forward_quality_max_age_batches
+                               ? gearshift_forward_selectivity : -1.0;
+      rate_opt.observe_transaction(current_configuration, 0,
+          transport_bytes_banked, cycle, acked, sent, sack_used, failed,
+          forward_snr, gearshift_forward_snr_age_batches, forward_sel,
+          (int)sent, narrowband_enabled == YES,
+          gearshift_forward_selectivity_age_batches, opt_now_ms());
+      // Cooldowns are transaction-counted state. Advance them exactly once for
+      // each logical batch outcome here, never once-per evaluate() call (a
+      // transaction may be evaluated both at ACK close and app-unit commit).
+      rate_opt.notify_cooldown_tick();
+
+      if (opt_primitive_trace_enabled()) {
+        const bool lineage_valid = !outcome_only;
+        const unsigned int repair_sent = lineage_valid
+                                       ? std::min(opt_current_batch_repair_frames, sent) : 0u;
+        const unsigned int new_sent = lineage_valid ? (sent - repair_sent) : 0u;
+        printf("[OPT-BATCH] id=%llu cfg=%d rate_valid=%d outcome_valid=1 "
+               "cycle_ms=%u app_bytes=0 transport_bytes=%u sent=%u acked=%u "
+               "sack=%d failed=%d batch_size=%u snr=%.2f snr_age=%d sel=%.4f "
+               "lineage_valid=%d new_sent=%u repair_sent=%u cfg_gen=%u unit_id=%llu dir=forward\n",
+            record_id, current_configuration, cycle > 0 ? 1 : 0, cycle,
+            transport_bytes_banked, sent, acked, sack_used ? 1 : 0,
+            failed ? 1 : 0, sent, forward_snr, gearshift_forward_snr_age_batches,
+            forward_sel, lineage_valid ? 1 : 0, new_sent, repair_sent,
+            lp_config_gen, opt_application_unit_sequence);
+        fflush(stdout);
+
+      }
+
+      ++opt_diag_emit_counter;
+      if (opt_diag_emit_counter >= 3) {
           opt_diag_emit_counter = 0;
-          printf("[OPT-WINDOW] eff_bps=%.0f sack_rate=%.2f window_n=%d cfg=%d\n",
-              get_current_effective_rate_bps(),
-              get_current_sack_rate(),
-              opt_window_count,
-              current_configuration);
-          fflush(stdout);
+          // Preserve the historical rolling diagnostic in LEGACY/SHADOW and
+          // calibration traces, but keep ACTIVE production goodput free of a
+          // printf+fflush every third batch. State-changing v2 decisions remain
+          // independently logged by emit_decision().
+          if (rate_opt.get_mode() != GEARSHIFT_V2_ACTIVE || opt_primitive_trace_enabled()) {
+              const st_optimizer_window_metrics m = get_current_optimizer_metrics();
+              printf("[OPT-WINDOW] app_bps=%.0f transport_bps=%.0f sack_rate=%.3f "
+                     "frame_ok=%.3f partial_loss=%.3f fail_rate=%.3f "
+                     "rate_n=%d outcome_n=%d app_n=%d cfg=%d\n",
+                  m.application_bps, m.transport_bps, m.sack_batch_rate,
+                  m.frame_success_rate, m.partial_frame_loss_rate,
+                  m.failed_batch_rate, m.rate_sample_count,
+                  m.outcome_sample_count, m.application_commit_count,
+                  current_configuration);
+              fflush(stdout);
+          }
       }
   }
-  // Phase 3c (Effective-Rate Optimizer) — decision logic owner. The class
-  // is self-contained; cl_arq_controller holds it as a member and queries
-  // `evaluate()` once per batch-end on CMD. Inert until load() succeeds.
+
+  // Credit an atomic application unit exactly once after the ACK/SACK machinery
+  // has completed it.  The credit is attached to the exact most-recent REAL
+  // transaction record; outcome-only L1 replay cannot steal/misassociate it.
+  // Earlier repair/failure cycles remain in the rate denominator separately.
+  void opt_commit_application_bytes(unsigned int application_bytes) {
+      if (application_bytes == 0 || opt_last_real_slot < 0) return;
+      const int slot = opt_last_real_slot;
+      if (!optimizer_commit_application_to_slot(
+              opt_batch_app_bytes, opt_batch_application_committed,
+              opt_batch_rate_valid, OPTIMIZER_WINDOW_SIZE, slot,
+              application_bytes))
+          return;
+      const int cfg = (int)opt_batch_config[slot];
+      // The application unit can span multiple configurations (e.g. repair or
+      // an in-flight unit crossing SET_CONFIG).  Let the per-action model
+      // distribute this one committed application unit over every contributing
+      // transaction instead of assigning all reward to the final configuration.
+      rate_opt.commit_application_unit(cfg, application_bytes,
+                                       narrowband_enabled == YES);
+      if (opt_primitive_trace_enabled()) {
+          printf("[OPT-APP-COMMIT] id=%llu cfg=%d app_bytes=%u unit_id=%llu\n",
+                 opt_batch_record_id[slot], cfg, application_bytes,
+                 opt_application_unit_sequence);
+          fflush(stdout);
+      }
+      ++opt_application_unit_sequence;
+  }
+
+  // Gearshift-v2 decision logic owner. The class is self-contained; the
+  // controller feeds completed transaction/application evidence and asks it
+  // for one normal Axis-1 action. Calibration is optional prior evidence.
   // See: include/datalink_layer/rate_optimizer.h
   //      mercury/fact-documents/EFFECTIVE_RATE_OPTIMIZER_DESIGN.md §4.3
   cl_rate_optimizer rate_opt;
@@ -7394,26 +7612,17 @@ public:
   //      mercury/fact-documents/channel-state-2d-lookup.md §8 Step 5
   cl_channel_state_lookup channel_lookup;
 
-  // Called once at mercury startup (from main.cc / cl_arq_controller::init
-  // wherever capabilities are negotiated) to load the calibration table.
-  // Path is `mercury/effective_rate_table.json` relative to the working dir;
-  // override via MERCURY_RATE_TABLE env var. Optimizer auto-disables on miss.
+  // Called once at startup to load optional calibration-prior data. Path is
+  // `effective_rate_table.json` relative to the working dir unless overridden
+  // with MERCURY_RATE_TABLE. ACTIVE v2 remains usable without a table by
+  // combining analytical PHY geometry with bounded live probing.
   void opt_load_rate_table();
 
-  // Called at every batch-end tick on CMD (from the three opt_record_batch
-  // success sites in arq_commander.cc). Runs the gate check + lookup; if
-  // the optimizer wants to switch, sets `*out_recommended_cfg` to the new
-  // config and returns true. Caller queues SET_CONFIG via the standard path.
-  // Returns false otherwise (and out param is left at current cfg).
-  //
-  // Gating (per §4.3 + spec):
-  //   - sack_v2_enabled must be true (caller may double-gate)
-  //   - turboshift_active must be false
-  //   - emergency_break_active must be 0
-  //   - link_status must be CONNECTED (caller's responsibility)
-  //
-  // Cooldown ticking happens HERE, regardless of decision — so the counter
-  // drains on every batch.
+  // Evaluate the current structured evidence at a transaction/app-commit
+  // seam. ACTIVE mode owns ordinary connected Axis-1 adaptation; SHADOW is
+  // observation-only and LEGACY retains the historical controller. BREAK is
+  // always independent. Cooldowns are advanced exactly once by the completed
+  // transaction recorder, not by repeated evaluate() calls.
   bool opt_evaluate_batch_end(int* out_recommended_cfg);
 
   // Zero the rolling window. Called from reset_session_state() on link
@@ -7421,15 +7630,29 @@ public:
   // mislead the optimizer.
   void opt_reset_window() {
       for (int i = 0; i < OPTIMIZER_WINDOW_SIZE; i++) {
-          opt_batch_bytes_delivered[i] = 0;
-          opt_batch_wire_ms[i] = 0;
+          opt_batch_app_bytes[i] = 0;
+          opt_batch_transport_bytes[i] = 0;
+          opt_batch_cycle_ms[i] = 0;
+          opt_batch_rate_valid[i] = 0;
+          opt_batch_outcome_valid[i] = 0;
+          opt_batch_application_committed[i] = 0;
           opt_batch_sack_count[i] = 0;
           opt_batch_failed[i] = 0;
+          opt_batch_frames_acked[i] = 0;
+          opt_batch_frames_sent[i] = 0;
           opt_batch_config[i] = 0;
+          opt_batch_size[i] = 0;
+          opt_batch_record_id[i] = 0;
       }
       opt_window_head = 0;
       opt_window_count = 0;
       opt_batch_tx_start_ms = 0;
+      opt_current_batch_frames_sent = 0;
+      opt_current_batch_repair_frames = 0;
+      // opt_record_sequence is process-lifetime monotonic.  Resetting it on a
+      // config/window change would create duplicate [OPT-BATCH] ids and make a
+      // later [OPT-APP-COMMIT] ambiguous in calibration logs.
+      opt_last_real_slot = -1;
       opt_diag_emit_counter = 0;
   }
 
@@ -7621,14 +7844,27 @@ private:
   // Phase 3a (Effective-Rate Optimizer) — rolling-window storage. CMD-side
   // only; RSP never touches these. Sized at OPTIMIZER_WINDOW_SIZE (=50).
   // All values initialized in cl_arq_controller() / opt_reset_window().
-  unsigned int  opt_batch_bytes_delivered[OPTIMIZER_WINDOW_SIZE];
-  unsigned int  opt_batch_wire_ms[OPTIMIZER_WINDOW_SIZE];
+  unsigned int  opt_batch_app_bytes[OPTIMIZER_WINDOW_SIZE];
+  unsigned int  opt_batch_transport_bytes[OPTIMIZER_WINDOW_SIZE];
+  unsigned int  opt_batch_cycle_ms[OPTIMIZER_WINDOW_SIZE];
+  unsigned char opt_batch_rate_valid[OPTIMIZER_WINDOW_SIZE];
+  unsigned char opt_batch_outcome_valid[OPTIMIZER_WINDOW_SIZE];
+  unsigned char opt_batch_application_committed[OPTIMIZER_WINDOW_SIZE];
   unsigned char opt_batch_sack_count[OPTIMIZER_WINDOW_SIZE];
   unsigned char opt_batch_failed[OPTIMIZER_WINDOW_SIZE];
+  unsigned int  opt_batch_frames_acked[OPTIMIZER_WINDOW_SIZE];
+  unsigned int  opt_batch_frames_sent[OPTIMIZER_WINDOW_SIZE];
   unsigned char opt_batch_config[OPTIMIZER_WINDOW_SIZE];
+  unsigned int  opt_batch_size[OPTIMIZER_WINDOW_SIZE];
+  unsigned long long opt_batch_record_id[OPTIMIZER_WINDOW_SIZE];
   int opt_window_head;
   int opt_window_count;
   unsigned long long opt_batch_tx_start_ms;
+  unsigned int opt_current_batch_frames_sent;
+  unsigned int opt_current_batch_repair_frames;
+  unsigned long long opt_record_sequence;
+  unsigned long long opt_application_unit_sequence;
+  int opt_last_real_slot;
   int opt_diag_emit_counter;
 
   // Phase 3c — deferred optimizer-recommended config switch. Set by
@@ -7639,6 +7875,8 @@ private:
   // request is enqueued OR if the link becomes ineligible (BREAK fires,
   // turboshift resumes, session ends).
   int opt_pending_switch_cfg;
+  e_gearshift_v2_action opt_pending_switch_action;
+  int opt_pending_switch_fallback;
 
 };
 

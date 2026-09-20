@@ -358,6 +358,19 @@ inline int config_ladder_up_n(int config, int steps, bool robust_enabled, bool n
 	return next;
 }
 
+// Gearshift-v2 discovery ladder.  The wideband OFDM staging rungs are the
+// compatibility-safe strides exercised by the ACKed legacy climb; every other
+// start advances by exactly one ordinary ladder rung.  Narrowband and robust
+// transitions never take an OFDM staging stride.
+inline int config_probe_ladder_up(int config, bool narrowband = false) {
+	const int adjacent = config_ladder_up(config, is_robust_config(config), narrowband);
+	if (narrowband || is_robust_config(config)) return adjacent;
+	if (config == CONFIG_0) return CONFIG_7;
+	if (config == CONFIG_7) return CONFIG_13;
+	if (config == CONFIG_13) return CONFIG_16;
+	return adjacent;
+}
+
 inline int config_ladder_down(int config, bool robust_enabled) {
 	if (is_robust3_config(config)) return config;  // ROBUST_3: ladder fixed point (off-ladder pinned-only)
 	if (!robust_enabled && !is_robust_config(config)) {   // §19: robust LIVE config ⇒ full ladder

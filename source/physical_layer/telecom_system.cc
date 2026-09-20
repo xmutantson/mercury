@@ -1817,6 +1817,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.message_decoded=NO;
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.frame_data_missing=false;
+	receive_stats.ofdm_preamble_detected=false;
 	receive_stats.frame_skip_var_aborted=false;
 	fine_energy_last_shift_symbols=0;
 	receive_stats.sync_trials=0;
@@ -1928,7 +1929,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			static int pb_diag_last_key = -1;
 			int pb_key = current_configuration * 10 + narrowband_enabled;
 			if(pb_key != pb_diag_last_key) { pb_diag_count = 0; pb_diag_last_key = pb_key; }
-			if(pb_diag_count < 3)
+			if(g_verbose && pb_diag_count < 3)
 			{
 				pb_diag_count++;
 				int pb_total = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
@@ -2602,6 +2603,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 			} // end else (non-forced-delay detection)
 		}
+		// Reaching here on OFDM means the existing coarse detector admitted a
+		// preamble (or a test supplied an exact forced delay).  Publish that
+		// structural event so ARQ lost-tag recovery never treats mere buffer energy
+		// as permission to run alternate decoders or transmit a DECODE_FAIL NACK.
+		if(M != MOD_MFSK)
+			receive_stats.ofdm_preamble_detected = true;
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
 
@@ -3064,9 +3071,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					pb_data += v*v;
 				}
 				pb_data = (d_count > 0) ? pb_data / d_count : 0.0;
-				printf("[ENERGY-DIAG] pream: pb=%.4e bb=%.4e | data: pb=%.4e bb=%.4e | delay=%d data_off=%d buf=%d\n",
-					pb_pream, bb_pream, pb_data, data_e, receive_stats.delay, data_offset, buf_samples_de);
-				fflush(stdout);
+				if(g_verbose)
+				{
+					printf("[ENERGY-DIAG] pream: pb=%.4e bb=%.4e | data: pb=%.4e bb=%.4e | delay=%d data_off=%d buf=%d\n",
+						pb_pream, bb_pream, pb_data, data_e, receive_stats.delay, data_offset, buf_samples_de);
+					fflush(stdout);
+				}
 
 				// A reverse MFSK control/BREAK burst can false-lock the forward
 				// OFDM detector. Reject its high in-band/passband preamble ratio
@@ -3089,9 +3099,12 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// SGTL5000 signals at -40 dBFS.
 			if(data_e < energy_gate_floor || (pream_mean_energy > energy_gate_floor && data_e < pream_mean_energy * 0.1))
 			{
-				printf("[OFDM-SYNC] data_energy=%.2e pream_energy=%.2e at pream=%d delay=%d — frame incomplete, skipping decode\n",
-					data_e, pream_mean_energy, pream_symb_loc, receive_stats.delay);
-				fflush(stdout);
+				if(g_verbose)
+				{
+					printf("[OFDM-SYNC] data_energy=%.2e pream_energy=%.2e at pream=%d delay=%d — frame incomplete, skipping decode\n",
+						data_e, pream_mean_energy, pream_symb_loc, receive_stats.delay);
+					fflush(stdout);
+				}
 				energy_ok = false;
 				receive_stats.frame_data_missing = true;
 			}
@@ -3555,10 +3568,13 @@ skip_h_retry_point:
 							if((force_test_shift && fwd == fine_energy_test_force_shift_symbols * sym_samples)
 							   || (emaxC > energy_gate_floor && eminC >= REL_ALPHA * emaxC))
 							{
-								printf("[FINE-ENERGY-REL] delay %d->%d (fwd %d sym, Emin/Emax=%.3f)\n",
-									orig_delay, candidate, fwd / sym_samples,
-									(emaxC > 0.0 ? eminC/emaxC : 0.0));
-								fflush(stdout);
+								if(g_verbose)
+								{
+									printf("[FINE-ENERGY-REL] delay %d->%d (fwd %d sym, Emin/Emax=%.3f)\n",
+										orig_delay, candidate, fwd / sym_samples,
+										(emaxC > 0.0 ? eminC/emaxC : 0.0));
+									fflush(stdout);
+								}
 								receive_stats.delay = candidate;
 								fine_energy_last_shift_symbols = fwd / sym_samples;
 								break;
@@ -4117,14 +4133,20 @@ skip_h_retry_point:
 							receive_stats.delay = best_delay;
 							goto ofdm_subpeak_retry_point;  // ONE re-decode at the refined delay
 						}
-						printf("[XCORR-RESCUE-FAIL] trial %d old=%d best=%d meanH %.3f->%.3f C %.3f->%.3f (below floor %.2f cohacc %.2f)\n",
-							receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, coh_C, best_C, subpeak_rescue_floor, subpeak_coh_accept);
-						fflush(stdout);
+						if(g_verbose)
+						{
+							printf("[XCORR-RESCUE-FAIL] trial %d old=%d best=%d meanH %.3f->%.3f C %.3f->%.3f (below floor %.2f cohacc %.2f)\n",
+								receive_stats.sync_trials, orig_delay, best_delay, mean_H, best_mH, coh_C, best_C, subpeak_rescue_floor, subpeak_coh_accept);
+							fflush(stdout);
+						}
 						receive_stats.delay = orig_delay;  // restore; fall through to the reject
 					}
-					printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
-						receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
-					fflush(stdout);
+					if(g_verbose)
+					{
+						printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
+							receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
+						fflush(stdout);
+					}
 					// P1 ACQ BAND-EXCLUSION (DEFAULT-ON, =0 disables). Record this rejected
 					// delay as a band center; if it lands inside an ALREADY-recorded
 					// band (a confirmed repeat re-pick — the storm's absorbing
@@ -12503,6 +12525,8 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	receive_stats.coarse_metric = 0.0;
 	receive_stats.mean_H = -1.0;
 	receive_stats.frame_overflow_symbols = 0;
+	receive_stats.frame_data_missing = false;
+	receive_stats.ofdm_preamble_detected = false;
 
 	// the captured passband buffer spans the same window the live capture loop hands
 	// receive_byte: Nofdm*buffer_Nsymb*interp samples.
