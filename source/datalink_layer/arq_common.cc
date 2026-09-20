@@ -1351,13 +1351,10 @@ cl_arq_controller::cl_arq_controller()
 	inband_last_confirmed_config=CONFIG_NONE;
 	inband_pre_announce_config=CONFIG_NONE;
 
-	// STAGE 4e — D2 NACK first-class + D3 periodic re-announce (design §2/§3). A fresh
-	// session has seen no tag (parity echo 0), no dead-streak NACK emitted, and the
-	// re-announce clock at 0.
+	// STAGE 4e — D2 NACK first-class. A fresh session has seen no tag (parity echo 0)
+	// and has emitted no dead-streak NACK.
 	inband_rx_seen_parity=0;
 	inband_nack_emitted_for_dead_streak=false;
-	inband_batches_since_announce=0;
-	inband_reannounce_n_cached=-1;  // unresolved; inband_reannounce_n() caches it
 	inband_down_probe_batch_seq_id=-1;
 
 	gear_shift_on=NO;
@@ -5569,42 +5566,22 @@ int cl_arq_controller::inband_emit_nack(uint8_t reason)
 //   - On the FIRST armed emit at this config, latch inband_announce_bsi (the implicit-
 //     confirm anchor). Every armed emit increments inband_retag_count (the R counter).
 //
-// STAGE 4e (D3 PERIODIC RE-ANNOUNCE, OD-3): a THIRD emit clause (c) re-emits the
-// CURRENT-config tag every N DATA batches INDEPENDENT of change, so a desynced/late-
-// joining peer re-syncs without waiting for the next config change. The counter
-// inband_batches_since_announce increments once per CALL (one call == one DATA batch's
-// firing decision) and RESETS to 0 on ANY emit (change/repeat/periodic) — so a
-// change/repeat that fires the tag also resets the periodic clock and the periodic clause
-// NEVER double-emits (single early-out per call). The re-announce HOLDS the epoch parity
-// (it is NOT a change, INV-E5) — IDENTICAL to a D1 repeat. N = inband_reannounce_n()
-// (MERCURY_INBAND_REANNOUNCE_N, default 8; 0 = disabled).
+// OWNER LAW: a tag announces a CHANGE. A same-config emit is forbidden after the
+// transition has config-discriminating confirmation. The only same-config production
+// emission is an ARMED repeat of that still-unconfirmed change. The test-only force flag
+// exercises the downstream safety rule without reopening a production producer.
 bool cl_arq_controller::inband_tag_firing_decision(int batch_cfg, int batch_seq_id,
                                                    uint8_t* out_parity)
 {
-	// One CALL == one DATA-batch firing decision (single call site, arq_common.cc emit).
-	// Tick the periodic re-announce clock BEFORE deciding so a reset-on-emit lands at 0.
-	inband_batches_since_announce++;
-
 	bool is_change = (batch_cfg != inband_last_announced_config);
 	bool is_repeat = (inband_retag_armed && batch_cfg == inband_retag_config && !is_change);
+	bool is_forced_same = (inband_test_force_same_config_tag && !is_change && !is_repeat);
 
-	// Clause (c) PERIODIC RE-ANNOUNCE: fires ONLY when neither a change nor a repeat is
-	// already emitting (the OR precedence — change/repeat carry fresh-epoch/armed
-	// semantics; the periodic is the fallback) AND N batches have elapsed with no emit AND
-	// there IS a config to re-announce (inband_last_announced_config set). It re-announces
-	// the CURRENT batch config; it holds parity (not a change).
-	int N = inband_reannounce_n();
-	bool is_reannounce = (!is_change && !is_repeat
-		&& N > 0 && inband_batches_since_announce >= N
-		&& inband_last_announced_config != CONFIG_NONE
-		&& batch_cfg == inband_last_announced_config);
+	if(!is_change && !is_repeat && !is_forced_same)
+		return false;   // confirmed steady state -> no tag
 
-	if(!is_change && !is_repeat && !is_reannounce)
-		return false;   // steady state / already-followed -> nothing to emit (clock keeps ticking)
-
-	// PARITY: toggles + latches ONLY on a CHANGE. A REPEAT and a PERIODIC RE-ANNOUNCE both
-	// HOLD the epoch (INV-E5 — a re-flipped parity would look like a fresh change to the RX
-	// and needlessly re-run the HINGE re-baseline).
+	// PARITY toggles + latches ONLY on a CHANGE. A repeat (and the test-only forced
+	// same-config emission) holds the epoch; re-flipping would look like a fresh change.
 	if(is_change)
 	{
 		inband_tx_epoch_parity ^= 1;
@@ -5622,20 +5599,26 @@ bool cl_arq_controller::inband_tag_firing_decision(int batch_cfg, int batch_seq_
 			is_change ? "fresh change" : "repeat-until-followed");
 		fflush(stdout);
 	}
-	else if(is_reannounce)
+	else if(is_forced_same)
 	{
-		printf("[INBAND-TX] PERIODIC RE-ANNOUNCE of CONFIG_%d after %d batches (parity HELD "
-			"%u; no change — late-joiner/desync backstop)\n",
-			batch_cfg, inband_batches_since_announce, (unsigned)inband_tx_epoch_parity);
+		printf("[INBAND-TX] TEST forced same-config tag for CONFIG_%d (parity HELD %u)\n",
+			batch_cfg, (unsigned)inband_tx_epoch_parity);
 		fflush(stdout);
+		inband_test_force_same_config_tag = false;  // one exceptional wire event only
 	}
-
-	// RESET the periodic clock on ANY emit (change/repeat/periodic) — the no-double-emit
-	// guarantee (INV-E6/E7): a change at batch k resets the clock so the next periodic is at
-	// k+N, not the absolute Nth batch; and a change/repeat that already fired the tag this
-	// batch prevents the periodic clause from ALSO firing (it shares this single exit).
-	inband_batches_since_announce = 0;
 	return true;
+}
+
+bool cl_arq_controller::inband_config_tag_guard_required(int tag_samples) const
+{
+#ifdef INBAND_SAMETAG_FAILBEFORE
+	// Reproduce the candidate predicate: same-config/non-armed tags skipped the guard.
+	return tag_samples > 0 && inband_retag_armed;
+#else
+	// The guard follows the wire event, not the transition-state classification. This keeps
+	// any exceptional same-config tag from letting DATA overtake the peer's tag scan.
+	return tag_samples > 0;
+#endif
 }
 
 void cl_arq_controller::inband_confirm_coordinated_config(int config)
@@ -5653,7 +5636,6 @@ void cl_arq_controller::inband_confirm_coordinated_config(int config)
 	inband_retag_config = CONFIG_NONE;
 	inband_announce_bsi = -1;
 	inband_retag_count = 0;
-	inband_batches_since_announce = 0;
 	printf("[INBAND-TX] coordinated SET_CONFIG confirmed CONFIG_%d; redundant CONFIG_TAG suppressed\n",
 		config);
 	fflush(stdout);
@@ -5729,7 +5711,7 @@ int cl_arq_controller::emit_config_tag_passband(int batch_cfg, int batch_seq_id)
 		return written;
 	}
 
-	// Transmit the burst on the wire, right after frame 0 (deterministic offset).
+	// Transmit the burst on the wire immediately before target DATA frame 0.
 	tx_transfer(burst.data(), (size_t)written);
 
 	printf("[INBAND-TX] CONFIG_TAG passband emit cfg=%d (ladder_idx=%d) bsi_lsb=%u "
@@ -6757,21 +6739,6 @@ bool cl_arq_controller::inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason,
 	// A no-op demote (already at rx_raw_cfg) returns false and leaves the link there — the
 	// climb simply stops being re-tagged, which is the correct outcome.
 	return inband_route_failure_demote(rx_raw_cfg, "nack_accelerated_demote", true, true);
-}
-
-// Resolve+cache N (the periodic re-announce period, >=0; 0=disabled).
-// MERCURY_INBAND_REANNOUNCE_N, default 8 (design §3.2). A negative env is treated as the
-// default; 0 disables the periodic backstop.
-int cl_arq_controller::inband_reannounce_n()
-{
-	if(inband_reannounce_n_cached < 0)
-	{
-		int n = 8;  // owner default (design §3.2 / OD-3)
-		const char* e = std::getenv("MERCURY_INBAND_REANNOUNCE_N");
-		if(e && *e) { int v = atoi(e); if(v >= 0) n = v; }
-		inband_reannounce_n_cached = n;
-	}
-	return inband_reannounce_n_cached;
 }
 
 // ============================================================================
@@ -10874,12 +10841,11 @@ void cl_arq_controller::reset_session_state()
 	inband_retag_count = 0;
 	inband_last_confirmed_config = CONFIG_NONE;
 	inband_pre_announce_config = CONFIG_NONE;
-	// STAGE 4e: a fresh session has seen no tag (parity echo 0), no dead-streak NACK
-	// emitted, and the periodic re-announce clock at 0. The N cache is env-keyed (resolved
-	// once + cached), so NOT reset here — same discipline as inband_retag_min.
+	inband_test_force_same_config_tag = false;
+	// STAGE 4e: a fresh session has seen no tag (parity echo 0) and has emitted no
+	// dead-streak NACK.
 	inband_rx_seen_parity = 0;
 	inband_nack_emitted_for_dead_streak = false;
-	inband_batches_since_announce = 0;
 	inband_down_probe_batch_seq_id = -1;
 
 	// Turboshift — legacy/shadow keep the historic probe state machine.
@@ -16783,13 +16749,13 @@ void cl_arq_controller::send_batch()
 			int tag_samples = emit_config_tag_passband(
 				current_configuration, (tag_bsi < 0) ? 0 : tag_bsi);
 			bool canonical_guard_applied = false;
-			// A GS2 CONFIG_TAG is ACK-less but its peer still needs one capture/processing
+			// A CONFIG_TAG is ACK-less but its peer still needs one capture/processing
 			// window to decode the robust header, load the announced PHY, and re-arm its
 			// ring before target DATA arrives. Gapless delivery made the old-geometry tag
 			// scan overrun into frame 0 (false MOOSE/CFO and SKIP-VAR storms). Derive the
 			// guard from protocol geometry: the larger of the emitted tag and one target
 			// acquisition window. There is no SNR or mode-tuned threshold here.
-			if(tag_samples > 0 && rate_opt.controls_link() && inband_retag_armed)
+			if(inband_config_tag_guard_required(tag_samples))
 			{
 				long acquisition_samples = (long)telecom_system->data_container.Nofdm
 					* telecom_system->data_container.buffer_Nsymb.load()
@@ -16810,8 +16776,8 @@ void cl_arq_controller::send_batch()
 			// real processing gap after the robust CONFIG_TAG has left the playback
 			// ring.  Without it, host scheduling can let the lower-rung DATA train
 			// overtake the peer's tag decoder/config switch; repeat tags then reproduce
-			// the same race. GS2 changes use the geometry-derived guard above; this
-			// fixed fallback remains only for non-GS2 scream use.
+			// the same race. Every in-band CONFIG_TAG uses the geometry-derived guard
+			// above; this fixed fallback remains only for non-in-band scream use.
 			if(tag_samples > 0 && scream_resume_pending && !canonical_guard_applied)
 			{
 				const int SCREAM_POST_TAG_GUARD_MS = 750;
@@ -16828,7 +16794,7 @@ void cl_arq_controller::send_batch()
 	// (variable: anchor FULL, tail MINI). The DATA frames are contiguous, so the wire
 	// sees one gapless waveform; per-frame tx_transfer granularity is preserved
 	// for the sim pacing / capture-prep symbol cadence. The CONFIG_TAG (if any) was
-	// keyed above and GS2 allowed its derived processing guard to elapse before frame 0.
+	// keyed above and its derived processing guard elapsed before frame 0.
 	for(int i=0;i<message_batch_counter_tx;i++)
 	{
 		if(g_verbose) { printf("[TX] tx_transfer frame %d/%d, off=%d size=%d\n", i, message_batch_counter_tx, frame_pack_off[i], frame_len[i]); fflush(stdout); }

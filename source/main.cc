@@ -5233,7 +5233,7 @@ int main(int argc, char *argv[])
     bool test_inband_no_break_cli = false;  // --test-inband-no-break: in-band Stage 4c — D5 BREAK-OBSOLETE.
     bool test_inband_retag_cli = false;  // --test-inband-retag: in-band Stage 4d — D1 repeat + D4 climb/auto-demote.
     bool test_inband_nack_cli = false;  // --test-inband-nack: in-band Stage 4e — D2 NACK first-class.
-    bool test_inband_reannounce_cli = false;  // --test-inband-reannounce: in-band Stage 4e — D3 periodic re-announce.
+    bool test_inband_reannounce_cli = false;  // --test-inband-reannounce: same-config tag owner-law regression.
                                         // Gearshift-driven unilateral drop (W3), tag on the real passband (W1),
                                         // RX follows from the passband tag (W2 + HINGE), SACK confirms (bsi),
                                         // ZERO SET_CONFIG on the wire, both ends config-track, PHY-twin coherent,
@@ -6462,11 +6462,9 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "--test-inband-reannounce") == 0)
         {
-            // In-band rate adaptation Stage 4e — D3 periodic re-announce (one-shot at startup,
-            // exit rc). With no change for N=8 batches the tag re-emits holding the SAME epoch
-            // parity (the late-joiner/desync backstop); the counter resets on any emit (no
-            // double-emit). See arq_responder.cc test_inband_reannounce +
-            // inband-reliability-design.md §3.
+            // Same-config tag owner-law regression (one-shot at startup, exit rc). Proves
+            // confirmed steady state emits no tag, forced same-config tags receive the
+            // production processing guard, and unconfirmed-change repeats disarm on SACK.
             test_inband_reannounce_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
@@ -8913,10 +8911,10 @@ start_modem:
             exit(rc);
         }
         if (test_inband_reannounce_cli) {
-            // In-band rate adaptation Stage 4e — D3 periodic re-announce TEST (one-shot, exit rc).
+            // Same-config tag owner-law + processing-guard TEST (one-shot, exit rc).
             // Builds its own CMD/telecom_system instances internally.
             printf("[FLAG] --test-inband-reannounce: invoking in-band rate-adapt Stage-4e "
-                   "D3 periodic re-announce regression\n");
+                   "same-config owner-law regression\n");
             fflush(stdout);
             int rc = ARQ.test_inband_reannounce();
             printf("[FLAG] Inband-reannounce test complete (rc=%d) — exiting.\n", rc);

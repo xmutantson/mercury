@@ -3561,13 +3561,14 @@ public:
   // inband-reliability-design.md §2.6.
   int test_inband_nack();
 
-  // STAGE 4e D3 PERIODIC RE-ANNOUNCE TEST (CLI --test-inband-reannounce). Run N+1
-  // PRODUCTION firing decisions at a STEADY config with no change -> assert the tag is
-  // SILENT for batches 1..N-1 and FIRES on batch N (periodic), parity HELD across the
-  // re-announce, the counter resets. Inject a change at batch 3 -> assert the periodic
-  // clock resets (next periodic at 3+N). fail-before (-DINBAND_REANNOUNCE_FAILBEFORE):
-  // force N=0 -> the periodic never fires -> the FIRES-on-N assert FAILS. Returns
-  // 0=PASS, 1=FAIL. inband-reliability-design.md §3.6.
+  // SAME-CONFIG TAG OWNER-LAW TEST (CLI name retained as --test-inband-reannounce for
+  // baseline compatibility). Drives the production firing decision at a confirmed steady
+  // config and requires zero emissions; then forces one same-config emission through the
+  // test-only hook and requires the production processing guard even though no re-tag is
+  // armed. Finally proves repeat-until-confirmed still emits while armed and disarms only
+  // on config-discriminating SACK evidence. fail-before (-DINBAND_SAMETAG_FAILBEFORE)
+  // restores the candidate's steady emission + armed-only guard predicates, making both
+  // defect assertions fail. Returns 0=PASS, 1=FAIL.
   int test_inband_reannounce();
 
   // LEVER #2 — SPECULATIVE / PROMPT SACK (env MERCURY_SPEC_SACK).
@@ -5704,17 +5705,13 @@ public:
   // true if it routed the accelerated demote. COMMANDER-only (uses the demote helper).
   bool inband_handle_nack(uint8_t rx_cfg_index, uint8_t reason, uint8_t epoch_parity);
 
-  // ── STAGE 4e — D3 periodic re-announce backstop (inband-reliability-design.md §3,
-  //    OD-3) ── Re-emit the CURRENT-config tag every N DATA batches independent of
-  // change, HOLDING the epoch parity (NOT a change), so a desynced/late-joining peer
-  // re-syncs without waiting for the next config change. The counter increments per
-  // DATA-batch firing decision and resets to 0 on ANY emit (change/repeat/periodic) so
-  // the periodic clause never double-emits. N is MERCURY_INBAND_REANNOUNCE_N (default 8,
-  // 0=disabled). Init 0 (ctor + reset_session_state).
-  int  inband_batches_since_announce = 0;
-  int  inband_reannounce_n_cached    = -1;   // cached MERCURY_INBAND_REANNOUNCE_N (-1=unresolved)
-  // Resolve+cache N (>=0; 0=disabled). MERCURY_INBAND_REANNOUNCE_N, default 8.
-  int  inband_reannounce_n();
+  // TEST-ONLY: force one same-config firing-decision emission. Production never writes
+  // this flag. The directed regression uses it to prove that even an exceptional same-
+  // config tag receives the same derived peer-processing guard as a real change.
+  bool inband_test_force_same_config_tag = false;
+  // True for every emitted CONFIG_TAG. Keeping the predicate separate makes the production
+  // send_batch gate directly testable and prevents tag type/state from bypassing the guard.
+  bool inband_config_tag_guard_required(int tag_samples) const;
 
   // ── STAGE 4 — the bounded down-ladder lost-tag resync state (design §4/§7) ──
   // The down-window depth D is owner-tunable via MERCURY_INBAND_DOWN_D (default 4,

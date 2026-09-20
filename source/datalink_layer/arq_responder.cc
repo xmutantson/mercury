@@ -9326,26 +9326,23 @@ int cl_arq_controller::test_inband_nack()
 }
 
 // ============================================================================
-// In-band rate adaptation — STAGE 4e D3 PERIODIC RE-ANNOUNCE TEST
+// CONFIG_TAG owner law + same-config safety regression
 // ============================================================================
 //
-// CLI: --test-inband-reannounce  (inband-reliability-design.md §3.6 / data-flow-perbatch-config.md §S4E)
+// CLI name retained as --test-inband-reannounce so the established in-band gate row is
+// stable. The asserted contract is now the owner law: tags announce changes, with an armed
+// repeat allowed only until config-discriminating confirmation. PART A proves a confirmed
+// steady config stays silent. PART B uses the test-only hook to force one exceptional same-
+// config tag and proves the production send_batch guard predicate still opens the derived
+// peer-processing window. PART C proves the real retry remains armed through repeats, then
+// disarms on matching SACK evidence and returns to silence.
 //
-// Drives the PRODUCTION firing decision (inband_tag_firing_decision) per DATA batch at a
-// STEADY config and asserts the D3 periodic re-announce:
-//   PART A — with no change for N batches the tag is SILENT for batches 1..N-1 and FIRES
-//     on batch N (periodic), HOLDING the same epoch parity (no spurious RX HINGE), then
-//     the counter resets (the next periodic at 2N).
-//   PART B — a CHANGE at batch k resets the periodic clock: the next periodic fires at
-//     k+N, not the absolute Nth batch (INV-E7), and the change/repeat path does NOT
-//     double-emit with the periodic on the same batch (INV-E6).
-//
-// fail-before (-DINBAND_REANNOUNCE_FAILBEFORE): N is forced to 0 (disabled) -> the
-// periodic NEVER fires -> a desynced/late-joiner never re-syncs -> the FIRES-on-N assert
-// FAILS. Returns 0=PASS, 1=FAIL.
+// -DINBAND_SAMETAG_FAILBEFORE reproduces both candidate defects in this deterministic
+// regression: the eighth steady decision emits, and an unarmed same-config tag bypasses
+// the processing guard. The normal build must pass both assertions.
 int cl_arq_controller::test_inband_reannounce()
 {
-	const char* TAG = "[TEST-INBAND-REANNOUNCE]";
+	const char* TAG = "[TEST-INBAND-SAMETAG]";
 	int failed = 0;
 	auto check = [&](bool cond, const char* what, long got, long want) {
 		if(cond) { printf("%s PASS: %s (got=%ld want=%ld)\n", TAG, what, got, want); }
@@ -9353,43 +9350,26 @@ int cl_arq_controller::test_inband_reannounce()
 		fflush(stdout);
 	};
 
-	// Force MERCURY_INBAND_RATE on + pin N=8 (save + restore BOTH). fail-before forces N=0.
+	// Force the transport on, preserving the caller's environment.
 	const char* prev_env = std::getenv("MERCURY_INBAND_RATE");
 	std::string prev_saved = prev_env ? std::string(prev_env) : std::string();
 	bool had_prev = (prev_env != NULL);
-	const char* prev_n = std::getenv("MERCURY_INBAND_REANNOUNCE_N");
-	std::string prev_n_saved = prev_n ? std::string(prev_n) : std::string();
-	bool had_prev_n = (prev_n != NULL);
 	auto restore_env = [&]() {
 #if defined(_WIN32)
-		if(had_prev)   _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
-		else           _putenv_s("MERCURY_INBAND_RATE", "");
-		if(had_prev_n) _putenv_s("MERCURY_INBAND_REANNOUNCE_N", prev_n_saved.c_str());
-		else           _putenv_s("MERCURY_INBAND_REANNOUNCE_N", "");
+		if(had_prev) _putenv_s("MERCURY_INBAND_RATE", prev_saved.c_str());
+		else         _putenv_s("MERCURY_INBAND_RATE", "");
 #else
-		if(had_prev)   setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
-		else           unsetenv("MERCURY_INBAND_RATE");
-		if(had_prev_n) setenv("MERCURY_INBAND_REANNOUNCE_N", prev_n_saved.c_str(), 1);
-		else           unsetenv("MERCURY_INBAND_REANNOUNCE_N");
+		if(had_prev) setenv("MERCURY_INBAND_RATE", prev_saved.c_str(), 1);
+		else         unsetenv("MERCURY_INBAND_RATE");
 #endif
 	};
 #if defined(_WIN32)
 	_putenv_s("MERCURY_INBAND_RATE", "1");
-#  ifdef INBAND_REANNOUNCE_FAILBEFORE
-	_putenv_s("MERCURY_INBAND_REANNOUNCE_N", "0");   // FAIL-BEFORE: periodic disabled
-#  else
-	_putenv_s("MERCURY_INBAND_REANNOUNCE_N", "8");
-#  endif
 #else
 	setenv("MERCURY_INBAND_RATE", "1", 1);
-#  ifdef INBAND_REANNOUNCE_FAILBEFORE
-	setenv("MERCURY_INBAND_REANNOUNCE_N", "0", 1);
-#  else
-	setenv("MERCURY_INBAND_REANNOUNCE_N", "8", 1);
-#  endif
 #endif
 
-	const int CFG = CONFIG_9;
+	const int CFG = CONFIG_16;
 	auto make_cmd = [&](int cfg) -> cl_arq_controller* {
 		cl_telecom_system* ts = new cl_telecom_system();
 		cl_arq_controller* cmd = new cl_arq_controller();
@@ -9402,112 +9382,93 @@ int cl_arq_controller::test_inband_reannounce()
 		cmd->connection_status = TRANSMITTING_DATA;
 		cmd->sack_v2_enabled = true;
 		cmd->inband_rate_enabled = 1;
-		cmd->inband_reannounce_n_cached = -1;   // force re-resolve from the pinned env
 		return cmd;
 	};
 
-	// ========================================================================
-	// PART A — STEADY config: SILENT 1..N-1, FIRES on N (periodic), parity HELD, resets.
-	// ========================================================================
+	// PART A — after the initial change announcement, every ordinary same-config batch is
+	// silent. The fail-before arm injects the candidate's eighth-batch re-announce.
 	{
 		cl_arq_controller* cmd = make_cmd(CFG);
-		int N = cmd->inband_reannounce_n();
-#ifdef INBAND_REANNOUNCE_FAILBEFORE
-		check(N == 0, "A0 (fail-before) N forced to 0 (periodic disabled)", N, 0);
-		// Use the nominal 8 for the loop bound so the FIRES-on-N assert below runs + FAILS.
-		N = 8;
-#else
-		check(N == 8, "A0 N resolves to the default 8", N, 8);
-#endif
-
-		// First, establish the announced config WITHOUT arming a re-tag: a fresh ctor has
-		// inband_last_announced_config == CONFIG_NONE, so the FIRST firing decision at CFG is
-		// a CHANGE (it emits + latches + resets the clock). That is batch 0 (the announce).
 		uint8_t p_announce = 0xFF;
 		bool e_announce = cmd->inband_tag_firing_decision(CFG, 0, &p_announce);
-		check(e_announce, "A1 batch 0 emits (the initial announce/change)", e_announce ? 1 : 0, 1);
-		check(cmd->inband_batches_since_announce == 0,
-			"A2 the periodic clock reset to 0 after the announce",
-			cmd->inband_batches_since_announce, 0);
-		uint8_t announce_parity = p_announce;
+		check(e_announce, "A0 initial config change emits exactly one tag", e_announce ? 1 : 0, 1);
 
-		// Batches 1..N-1 at the SAME config with NO change and NO armed re-tag: SILENT.
-		bool any_early_emit = false;
-		for(int b = 1; b <= N - 1; b++)
+		int steady_emits = 0;
+		for(int b = 1; b <= 32; b++)
 		{
+#ifdef INBAND_SAMETAG_FAILBEFORE
+			// Candidate behavior: the periodic producer fired on the eighth steady batch.
+			cmd->inband_test_force_same_config_tag = (b == 8);
+#endif
 			uint8_t pp = 0xFF;
 			bool e = cmd->inband_tag_firing_decision(CFG, b, &pp);
-			if(e) any_early_emit = true;
+			if(e) steady_emits++;
 		}
-		check(!any_early_emit,
-			"A3 batches 1..N-1 are SILENT (no periodic before N)", any_early_emit ? 1 : 0, 0);
-		check(cmd->inband_batches_since_announce == N - 1,
-			"A4 the periodic clock reached N-1 with no emit",
-			cmd->inband_batches_since_announce, N - 1);
-
-		// Batch N: the periodic re-announce FIRES (pass-after) / stays SILENT (fail-before).
-		uint8_t pN = 0xFF;
-		bool eN = cmd->inband_tag_firing_decision(CFG, N, &pN);
-		check(eN, "A5 batch N FIRES the periodic re-announce (steady-state backstop)",
-			eN ? 1 : 0, 1);
-		check(pN == announce_parity,
-			"A6 the re-announce HOLDS the epoch parity (no spurious RX HINGE)",
-			(pN == announce_parity) ? 1 : 0, 1);
-		check(cmd->inband_batches_since_announce == 0,
-			"A7 the periodic clock reset after the re-announce", cmd->inband_batches_since_announce, 0);
-		check(cmd->inband_last_announced_config == CFG,
-			"A8 the announced config is UNCHANGED by the re-announce (same config, same epoch)",
-			cmd->inband_last_announced_config, CFG);
+		check(steady_emits == 0,
+			"A1 confirmed unchanged config emits ZERO steady-state tags",
+			steady_emits, 0);
+		check(!cmd->inband_retag_armed,
+			"A2 steady state remains disarmed after confirmation", cmd->inband_retag_armed ? 1 : 0, 0);
 
 		delete cmd->telecom_system; delete cmd;
 	}
 
-	// ========================================================================
-	// PART B — a CHANGE resets the periodic clock (next periodic at k+N, no double-emit).
-	// ========================================================================
-#ifndef INBAND_REANNOUNCE_FAILBEFORE
+	// PART B — force the exceptional same-config wire event. It holds parity and does not
+	// arm retry state, but the production send_batch guard predicate MUST still accept it.
 	{
 		cl_arq_controller* cmd = make_cmd(CFG);
-		int N = cmd->inband_reannounce_n();
-
-		// batch 0: announce CFG (change).
-		uint8_t p0 = 0xFF; cmd->inband_tag_firing_decision(CFG, 0, &p0);
-		// batches 1,2: silent.
-		uint8_t pp = 0xFF;
-		cmd->inband_tag_firing_decision(CFG, 1, &pp);
-		cmd->inband_tag_firing_decision(CFG, 2, &pp);
-		check(cmd->inband_batches_since_announce == 2,
-			"B0 clock at 2 after two silent batches", cmd->inband_batches_since_announce, 2);
-
-		// batch 3: a CHANGE to CONFIG_11 — emits (change) AND resets the clock; it must NOT
-		// ALSO fire a periodic on the same batch (INV-E6 no double-emit). One emit, clock=0.
-		uint8_t p3 = 0xFF;
-		bool e3 = cmd->inband_tag_firing_decision(CONFIG_11, 3, &p3);
-		check(e3, "B1 batch 3 emits (the change to CONFIG_11)", e3 ? 1 : 0, 1);
-		check(p3 != p0, "B2 the change TOGGLED the epoch parity (a real change, not a re-announce)",
-			(p3 != p0) ? 1 : 0, 1);
-		check(cmd->inband_batches_since_announce == 0,
-			"B3 the change RESET the periodic clock (INV-E7)", cmd->inband_batches_since_announce, 0);
-
-		// From batch 4: the next periodic must be at 3+N, i.e. after N more silent batches.
-		bool any_early = false;
-		for(int b = 4; b <= 3 + N - 1; b++)
-		{
-			uint8_t q = 0xFF;
-			bool e = cmd->inband_tag_firing_decision(CONFIG_11, b, &q);
-			if(e) any_early = true;
-		}
-		check(!any_early, "B4 no periodic before 3+N (clock was reset by the change)",
-			any_early ? 1 : 0, 0);
-		uint8_t pK = 0xFF;
-		bool eK = cmd->inband_tag_firing_decision(CONFIG_11, 3 + N, &pK);
-		check(eK, "B5 the next periodic fires at 3+N (reset relative to the change)", eK ? 1 : 0, 1);
-		check(pK == p3, "B6 that periodic HOLDS the post-change epoch parity",
-			(pK == p3) ? 1 : 0, 1);
+		uint8_t p0 = 0xFF;
+		cmd->inband_tag_firing_decision(CFG, 0, &p0);
+		cmd->inband_test_force_same_config_tag = true;
+		uint8_t forced_parity = 0xFF;
+		bool forced = cmd->inband_tag_firing_decision(CFG, 33, &forced_parity);
+		check(forced, "B0 test hook forced one same-config tag", forced ? 1 : 0, 1);
+		check(!cmd->inband_test_force_same_config_tag,
+			"B1 forced same-config hook is one-shot", cmd->inband_test_force_same_config_tag ? 1 : 0, 0);
+		check(forced_parity == p0,
+			"B2 forced same-config tag holds epoch parity", forced_parity, p0);
+		check(!cmd->inband_retag_armed,
+			"B3 forced tag is not disguised as an unconfirmed change", cmd->inband_retag_armed ? 1 : 0, 0);
+		bool guard = cmd->inband_config_tag_guard_required(/*tag_samples=*/75920);
+		check(guard,
+			"B4 every emitted tag receives the peer-processing guard, even while disarmed",
+			guard ? 1 : 0, 1);
+		uint8_t p_after = 0xFF;
+		bool after = cmd->inband_tag_firing_decision(CFG, 34, &p_after);
+		check(!after, "B5 ordinary steady state is silent immediately after forced tag",
+			after ? 1 : 0, 0);
 
 		delete cmd->telecom_system; delete cmd;
 	}
-#endif
+
+	// PART C — preserve repeat-until-confirmed: an armed same-config tag repeats, then a
+	// config-discriminating SACK disarms it and the following steady decision is silent.
+	{
+		cl_arq_controller* cmd = make_cmd(CFG);
+		uint8_t p0 = 0xFF;
+		cmd->inband_tag_firing_decision(CFG, 0, &p0);
+		cmd->inband_pre_announce_config = CONFIG_13;
+		cmd->inband_retag_config = CFG;
+		cmd->inband_retag_armed = true;
+		cmd->inband_announce_bsi = -1;
+		cmd->inband_retag_count = 0;
+
+		uint8_t p1 = 0xFF, p2 = 0xFF;
+		bool r1 = cmd->inband_tag_firing_decision(CFG, 41, &p1);
+		bool r2 = cmd->inband_tag_firing_decision(CFG, 42, &p2);
+		check(r1 && r2 && cmd->inband_retag_count == 2,
+			"C0 unconfirmed change stays armed and repeats", cmd->inband_retag_count, 2);
+		check(p1 == p0 && p2 == p0,
+			"C1 repeats hold the original change epoch", (p1 == p0 && p2 == p0) ? 1 : 0, 1);
+		bool confirmed = cmd->inband_retag_confirm_from_sack(41);
+		check(confirmed && !cmd->inband_retag_armed,
+			"C2 matching SACK confirmation DISARMS the retry", confirmed && !cmd->inband_retag_armed ? 1 : 0, 1);
+		uint8_t p3 = 0xFF;
+		bool e3 = cmd->inband_tag_firing_decision(CFG, 43, &p3);
+		check(!e3, "C3 confirmed unchanged config returns to zero-tag steady state", e3 ? 1 : 0, 0);
+
+		delete cmd->telecom_system; delete cmd;
+	}
 
 	restore_env();
 	printf("%s %s (failed=%d)\n", TAG, failed == 0 ? "ALL PASS" : "FAILURES", failed);

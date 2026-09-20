@@ -531,10 +531,17 @@ req("preframe-config-tag-is-not-gated-on-old-phy-geometry",
     allin(common, "Do NOT publish", "pre-frame snapshot", "still-loaded OLD geometry",
           "trailing/capture path continues to publish",
           "POST-FOLLOW target-geometry gate", "CONFIG_TAG processing guard",
-          "larger of the emitted tag and one target", "acquisition_samples") and
+          "larger of the emitted tag and one target", "acquisition_samples",
+          "inband_config_tag_guard_required(tag_samples)",
+          "any exceptional same-config tag", "confirmed steady state -> no tag") and
+    "MERCURY_INBAND_REANNOUNCE_N" not in common and
+    "PERIODIC RE-ANNOUNCE" not in common and
     "inband_adopt_gate_snapshot     = snapshot" not in common and
-    allin(rsp, "exact gapless", "with no synthetic", "A0 RX FOLLOWS the pre-frame tag"),
-    "a CRC-valid transition is followed before target-frame decode; guard time is derived from wire/acquisition geometry and the saved snapshot is then judged only at the new geometry")
+    allin(rsp, "exact gapless", "with no synthetic", "A0 RX FOLLOWS the pre-frame tag",
+          "confirmed unchanged config emits ZERO steady-state tags",
+          "every emitted tag receives the peer-processing guard, even while disarmed",
+          "matching SACK confirmation DISARMS the retry"),
+    "a CRC-valid transition is followed before target-frame decode; confirmed steady state emits no tag, repeat-until-confirmed disarms on evidence, and every emitted tag receives a geometry-derived processing guard")
 req("canonical-config-tag-repeats-on-data-retransmission",
     allin(common, "(!sack_retransmit_active || inband_retag_armed)",
           "an unconfirmed change MUST re-tag",
