@@ -8107,6 +8107,7 @@ int cl_arq_controller::test_inband_liveness()
 		cmd->rate_opt.notify_switch_dispatched(
 			CONFIG_11, CONFIG_10, GEARSHIFT_ACTION_ROLLBACK, CONFIG_10,
 			cmd->opt_now_ms(), false);
+		cmd->link_status = CONNECTED;
 		bool deferred = cmd->inband_route_failure_demote(
 			CONFIG_9, "test-second-degradation-before-tag-confirm", true, true);
 		check(deferred && cmd->current_configuration == CONFIG_10 &&
