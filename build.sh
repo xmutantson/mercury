@@ -178,10 +178,17 @@ if [ "${TERMINAL_SETTLE_DEADLINE_FAILBEFORE:-0}" = "1" ]; then
     TRACE_CFLAGS="$TRACE_CFLAGS -DTERMINAL_SETTLE_DEADLINE_FAILBEFORE"
     echo "  (TERMINAL_SETTLE_DEADLINE_FAILBEFORE defeat build - terminal-settlement deadline mis-scaled)"
 fi
+# Optional: TERMINAL_EOT_RETRY_FAILBEFORE=1 ./build.sh o3 -- test-only defeat
+# for the fast terminal CLOSE+EOT ARQ regression. It retains the slow generic
+# control timeout and immediate responder teardown while keeping the CLOSE-ACK
+# ordering repair enabled. Never set in a production build.
+if [ "${TERMINAL_EOT_RETRY_FAILBEFORE:-0}" = "1" ]; then
+    TRACE_CFLAGS="$TRACE_CFLAGS -DTERMINAL_EOT_RETRY_FAILBEFORE"
+    echo "  (TERMINAL_EOT_RETRY_FAILBEFORE defeat build - fast terminal EOT ARQ disabled)"
+fi
 # Optional: RSP_CLOSE_ACK_REARM_FAILBEFORE=1 ./build.sh o3 -- test-only defeat
-# build for the responder terminal-CLOSE ordering regression. It leaves the
-# accepted CLOSE slot FREE after reset_session_state(), reproducing the missing
-# first CLOSE ACK. Never set in a production build.
+# for the responder terminal-CLOSE ordering regression. It leaves the accepted
+# CLOSE slot FREE after reset_session_state(), reproducing the missing first ACK.
 if [ "${RSP_CLOSE_ACK_REARM_FAILBEFORE:-0}" = "1" ]; then
     TRACE_CFLAGS="$TRACE_CFLAGS -DRSP_CLOSE_ACK_REARM_FAILBEFORE"
     echo "  (RSP_CLOSE_ACK_REARM_FAILBEFORE defeat build - accepted CLOSE cleared before ACK)"

@@ -3431,10 +3431,9 @@ void cl_arq_controller::process_messages_commander()
 				disconnect_requested=NO;
 				this->link_status=DISCONNECTING;
 			// Terminal-settlement convergence (data-flow-stream-offset.md 8.6): arm the bounded
-			// settle deadline. TX FIFO is drained + every data batch + the EOT is ACKed by the time
-			// CLOSE is queued (arq_commander.cc:3234), so full delivery is already assured; the reverse
-			// CLOSE-ACK is a courtesy handshake. If it is lost, update_status() converges after the
-			// deadline instead of hanging in DISCONNECTING to the process horizon.
+			// settle deadline. TX FIFO is drained and every DATA batch is ACKed, but EOT is carried
+			// by the CLOSE frame itself and is not proven until its reverse ACK arrives. Fast terminal
+			// ARQ retries that frame first; this timer remains the final peer-gone/incomplete backstop.
 			disconnecting_settle_timer.stop();
 			disconnecting_settle_timer.reset();
 			disconnecting_settle_timer.start();
@@ -4117,6 +4116,14 @@ int cl_arq_controller::add_message_control(char code)
 				(char)CRC8_calc((char*)&messages_control.data[1], W_EOT_PAYLOAD_BYTES - 1);
 			messages_control.length = W_EOT_FRAME_LENGTH;
 			messages_control.id = 0;
+#ifndef TERMINAL_EOT_RETRY_FAILBEFORE
+			// Initial transmission plus a small, terminal-specific retry train.
+			// The ordinary nResends=20 data budget is inappropriate here: coupled
+			// to the long control timeout it produced only one retry before the
+			// 45 s final backstop. CLOSE+EOT is immutable, so every retry is the
+			// exact same committed-length/CRC descriptor.
+			messages_control.nResends = TERMINAL_EOT_RETRIES + 1;
+#endif
 			printf("[CMD-EOT] CLOSE_CONNECTION+EOT TX: committed=%llu crc=0x%08x crc8=0x%02x\n",
 				(unsigned long long)eot_committed, eot_crc,
 				(unsigned char)messages_control.data[W_EOT_PAYLOAD_BYTES]);
@@ -4179,6 +4186,14 @@ void cl_arq_controller::process_messages_tx_control()
 	{
 		if(--messages_control.nResends>0&&message_batch_counter_tx<control_batch_size)
 		{
+			if(link_status==DISCONNECTING && messages_control.data!=NULL
+			   && (unsigned char)messages_control.data[0]==CLOSE_CONNECTION)
+			{
+				int ordinal = stats.nReSent_control + 1;
+				printf("[CMD-EOT-RETRY] retransmitting identical CLOSE+EOT retry=%d/%d\n",
+					ordinal, (int)TERMINAL_EOT_RETRIES);
+				fflush(stdout);
+			}
 			// A final-connect retry is a new causal attempt, just like a
 			// START_CONNECTION retry.  Without this re-anchor, the fixed phase
 			// watchdog can expire while the retry's ACK is already on the wire.
@@ -4256,14 +4271,13 @@ void cl_arq_controller::process_messages_tx_control()
 			stats.nLost_control++;
 			messages_control.status=FAILED_;
 #ifndef TERMINAL_SETTLE_FAILBEFORE
-				// A graceful CLOSE that exhausted its retransmits with no reverse ACK: converge rather
-				// than leave the session FAILED_ + hung. (Observed bug never reaches here — the timer
-				// deadline in update_status is the primary path — but a peer whose retransmits DO exhaust
-				// cleanly converges here immediately.)
+				// A graceful CLOSE that exhausted its fast retry train must remain
+				// receptive to a late terminal ACK until the independent 45 s final
+				// backstop. Do not turn retry-budget exhaustion into early give-up.
 				if(link_status==DISCONNECTING && messages_control.data!=NULL
 				   && (unsigned char)messages_control.data[0]==CLOSE_CONNECTION)
 				{
-					cmd_terminal_settle_converge("close_retransmits_exhausted");
+					cmd_terminal_eot_wait_for_backstop();
 					return;
 				}
 #endif
@@ -4442,6 +4456,9 @@ void cl_arq_controller::process_messages_tx_control()
 		// Recalculate timeout: guard delays from prior ACK detection can leave
 		// receiving_timeout stale (e.g. 900ms), too short for the control round-trip.
 		calculate_receiving_timeout();
+		if(link_status==DISCONNECTING && messages_control.data!=NULL
+		   && (unsigned char)messages_control.data[0]==CLOSE_CONNECTION)
+			cmd_arm_terminal_eot_arq();
 		receiving_timer.start();
 		if(g_verbose) { printf("[CMD-RX] Entering receive mode: ack_cfg=%d recv_timeout=%d msg_tx_time=%d ctrl_tx_time=%d ack_batch=%d ftr=%d\n", ack_configuration, receiving_timeout, message_transmission_time_ms, ctrl_transmission_time_ms, ack_batch_size, telecom_system->data_container.frames_to_read.load()); fflush(stdout); }
 
@@ -10858,17 +10875,65 @@ void cl_arq_controller::finish_turbo_direction()
 	}
 }
 
+void cl_arq_controller::cmd_arm_terminal_eot_arq()
+{
+#ifdef TERMINAL_EOT_RETRY_FAILBEFORE
+	// Exact pre-fix timing: the generic cfg-dependent ack_timeout_control stays
+	// in force, so cfg16 cannot re-solicit within the short receive window.
+	return;
+#else
+	if(link_status!=DISCONNECTING || messages_control.data==NULL
+	   || (unsigned char)messages_control.data[0]!=CLOSE_CONNECTION)
+		return;
+	const int retry_ms = terminal_eot_retry_window_ms(receiving_timeout);
+	messages_control.ack_timeout = retry_ms;
+	printf("[CMD-EOT-ARQ] armed retry window=%dms remaining_retries=%d/%d "
+	       "(final_backstop=%dms)\n",
+		retry_ms, messages_control.nResends > 0 ? messages_control.nResends - 1 : 0,
+		(int)TERMINAL_EOT_RETRIES, terminal_settle_deadline_ms());
+	fflush(stdout);
+#endif
+}
+
+void cl_arq_controller::cmd_terminal_eot_wait_for_backstop()
+{
+	int elapsed = disconnecting_settle_timer.counting
+		? disconnecting_settle_timer.get_elapsed_time_ms() : 0;
+	int remaining = terminal_settle_deadline_ms() - elapsed;
+	if(remaining < 1) remaining = 1;
+
+	// Keep the immutable CLOSE descriptor and the ACK detector live, but arm no
+	// more transmissions. update_status() owns the independent 45 s give-up.
+	messages_control.nResends = 0;
+	messages_control.status = PENDING_ACK;
+	messages_control.ack_timeout = remaining;
+	messages_control.ack_timer.stop();
+	messages_control.ack_timer.reset();
+	messages_control.ack_timer.start();
+	receiving_timeout = remaining;
+	receiving_timer.stop();
+	receiving_timer.reset();
+	receiving_timer.start();
+	if(telecom_system != NULL)
+		telecom_system->data_container.frames_to_read = 2;
+	connection_status = RECEIVING_ACKS_CONTROL;
+	printf("[CMD-EOT-ARQ] fast retry budget exhausted after %d retransmits; "
+	       "listening %dms for late ACK before 45s final backstop\n",
+		(int)TERMINAL_EOT_RETRIES, remaining);
+	fflush(stdout);
+}
+
 void cl_arq_controller::cmd_terminal_settle_converge(const char* reason)
 {
-	// See data-flow-stream-offset.md 8.6. Reached only on the COMMANDER graceful-close path when the
-	// reverse CLOSE-ACK never arrived. Full delivery + EOT were assured before CLOSE was queued, so the
-	// sender declares the session locally settled (Two-Generals: a final ACK can always be lost) and runs
-	// the SAME terminal teardown the ACKed-CLOSE path runs.
+	// See data-flow-stream-offset.md 8.6. Reached only after the fast bounded
+	// CLOSE+EOT retry train and the independent 45 s peer-gone backstop both
+	// expire. DATA frames were ACKed, but terminal EOT delivery is unconfirmed;
+	// release fail-closed rather than claiming successful terminal settlement.
 	disconnecting_settle_timer.stop();
 	disconnecting_settle_timer.reset();
 	cmd_terminal_converge_events++;
-	printf("[CMD-EOT-CONVERGE] CLOSE ACK not received after bounded retransmits; all data ACKed "
-		"— session settled (%s); emitting terminal DISCONNECTED (converge #%d)\n",
+	printf("[CMD-EOT-CONVERGE] terminal EOT/ACK unconfirmed after fast bounded retransmits "
+		"and final backstop (%s); releasing INCOMPLETE via DISCONNECTED (converge #%d)\n",
 		reason, cmd_terminal_converge_events);
 	fflush(stdout);
 
@@ -29571,10 +29636,14 @@ int cl_arq_controller::test_terminal_settlement()
 		settled_close_cache.peer_committed = 151194;
 		settled_close_cache.peer_crc = 0xef7c51cb;
 		settled_close_cache.replays = 0;
-		nResends = 3;
+		nResends = 20;
 		passive_monitor = false;
+		responder_terminal_hold_timer.stop();
+		responder_terminal_hold_timer.reset();
+		responder_terminal_hold_timer.start();
 
-		CHECK(settled_reack_window_open(), "B1: window open (valid + replays < nResends)");
+		CHECK(settled_reack_window_open(),
+		      "B1: window open (active hold + valid + replays < TERMINAL_EOT_RETRIES)");
 		CHECK(settled_close_duplicate_matches(151194, 0xef7c51cb),
 		      "B2: exact match accepted");
 		CHECK(!settled_close_duplicate_matches(151195, 0xef7c51cb),
@@ -29583,15 +29652,23 @@ int cl_arq_controller::test_terminal_settlement()
 		      "B4: different crc rejected");
 
 		// Exhaust replays -> window closes
-		settled_close_cache.replays = nResends;
-		CHECK(!settled_reack_window_open(), "B5: window closed when replays == nResends");
+		settled_close_cache.replays = TERMINAL_EOT_RETRIES;
+		CHECK(!settled_reack_window_open(),
+		      "B5: window closed when replays == TERMINAL_EOT_RETRIES despite generic nResends=20");
+
+		// Expiry is an admission bound, not merely a PHY-state transition.
+		settled_close_cache.replays = 0;
+		responder_terminal_hold_timer.stop();
+		responder_terminal_hold_timer.reset();
+		CHECK(!settled_reack_window_open(),
+		      "B6: window closed when responder terminal hold timer is not counting");
 
 		// Invalidation
 		settled_close_cache.valid = false;
 		settled_close_cache.replays = 0;
-		CHECK(!settled_reack_window_open(), "B6: window closed when invalid");
+		CHECK(!settled_reack_window_open(), "B7: window closed when invalid");
 		CHECK(!settled_close_duplicate_matches(151194, 0xef7c51cb),
-		      "B7: invalid cache rejects even exact match");
+		      "B8: invalid cache rejects even exact match");
 	}
 
 	// PART C: the first accepted terminal CLOSE survives the pre-ACK session
@@ -29618,7 +29695,206 @@ int cl_arq_controller::test_terminal_settlement()
 		      "C3: backup control slot remains cleared at session boundary");
 	}
 
-#if defined(RSP_CLOSE_ACK_REARM_FAILBEFORE)
+	// PART D: drive the same CLOSE builder and post-TX ARQ armer as production.
+	// cfg16 is the real failure regime: generic control timeout ~=26.6 s while
+	// the actual ACK receive window is only a few seconds.
+	{
+		cl_telecom_system ts;
+		telecom_system = &ts;
+		role = COMMANDER;
+		load_configuration(CONFIG_16, FULL, YES);
+		const int generic_ack_to = ack_timeout_control;
+		link_status = DISCONNECTING;
+		messages_control.status = FREE;
+		if(messages_control.data == NULL)
+			messages_control.data = new char[256];
+		CHECK(add_message_control(CLOSE_CONNECTION) == SUCCESSFUL,
+		      "D1: production CLOSE builder queues terminal EOT");
+		char terminal_wire_before_arm[W_EOT_PAYLOAD_BYTES + 1];
+		memcpy(terminal_wire_before_arm, messages_control.data,
+		       sizeof(terminal_wire_before_arm));
+		receiving_timeout = 3666;
+		cmd_arm_terminal_eot_arq();
+		printf("[TEST-TERMINAL-EOT-ARQ] cfg16 generic_ack_to=%d retry_window=%d "
+		       "nResends=%d retry_budget=%d\n",
+			generic_ack_to, messages_control.ack_timeout,
+			messages_control.nResends, (int)TERMINAL_EOT_RETRIES);
+		CHECK(messages_control.ack_timeout == terminal_eot_retry_window_ms(3666),
+		      "D2: terminal EOT uses short turnaround-derived retry window");
+		CHECK(messages_control.ack_timeout < generic_ack_to,
+		      "D3: terminal EOT retry is strictly faster than generic cfg16 control timeout");
+		CHECK(messages_control.nResends == TERMINAL_EOT_RETRIES + 1,
+		      "D4: CLOSE has bounded initial-plus-retry transmission budget");
+		CHECK((long long)(TERMINAL_EOT_RETRIES + 1) * ctrl_transmission_time_ms
+		      + (long long)TERMINAL_EOT_RETRIES * messages_control.ack_timeout < 17000,
+		      "D5: complete fast retry train fits below 17 s recovery bar");
+		CHECK(memcmp(terminal_wire_before_arm, messages_control.data,
+		             sizeof(terminal_wire_before_arm)) == 0,
+		      "D6: terminal retry arming changes metadata only; CLOSE+EOT wire bytes are identical");
+	}
+
+	// PART E: after sending an ACK, the responder is receptive on the settled
+	// PHY for the entire fast train while both control mailboxes are FREE.
+	{
+		role = RESPONDER;
+		settled_close_cache.valid = true;
+		settled_close_cache.replays = 0;
+		messages_control.status = RECEIVED;
+		messages_control_bu.status = RECEIVED;
+		responder_terminal_hold_timer.stop();
+		responder_terminal_hold_timer.reset();
+		rsp_enter_terminal_reack_hold();
+		CHECK(responder_terminal_hold_timer.counting == YES,
+		      "E1: responder bounded terminal re-ACK hold is armed");
+		CHECK(link_status == DISCONNECTING && connection_status == RECEIVING,
+		      "E2: responder remains receptive without reopening settled session");
+		CHECK(messages_control.status == FREE && messages_control_bu.status == FREE,
+		      "E3: terminal hold preserves next-session FREE mailbox invariant");
+		CHECK(!rsp_terminal_reack_hold_expired(TERMINAL_EOT_RSP_HOLD_MS - 1),
+		      "E4: responder hold covers every fast retry");
+		CHECK(rsp_terminal_reack_hold_expired(TERMINAL_EOT_RSP_HOLD_MS),
+		      "E5: responder hold has an absolute bounded end");
+		responder_terminal_hold_timer.stop();
+		responder_terminal_hold_timer.reset();
+	}
+
+	// PART F: production responder CLOSE consumption owns the complete bounded
+	// duplicate-ACK contract.  A lost first ACK is recovered while the hold is
+	// active, no more than the commander's terminal retry budget is answered,
+	// and an exact cached CLOSE delivered after forced hold expiry is freed
+	// without arming another ACK.  This is deliberately a production-path
+	// regression (not only a replay-predicate test): it catches stale-cache
+	// fall-through into the ordinary first-CLOSE teardown as well as stale-cache
+	// duplicate admission.
+	{
+		cl_telecom_system rsp_ts;
+		cl_arq_controller rsp;
+		rsp.telecom_system = &rsp_ts;
+		rsp.role = RESPONDER;
+		rsp.load_configuration(CONFIG_16, FULL, YES);
+		rsp.link_status = CONNECTED;
+		rsp.connection_status = RECEIVING;
+		rsp.passive_monitor = false;
+		rsp.rx_stream_delivered = 0;
+		rsp.rx_stream_crc = CRC32_INIT;
+		if(rsp.messages_control.data == NULL)
+			rsp.messages_control.data = new char[256];
+
+		auto deliver_exact_empty_close = [&rsp]() {
+			rsp.messages_control.data[0] = CLOSE_CONNECTION;
+			for(int j=0;j<8;j++) rsp.messages_control.data[1+j] = 0;
+			for(int j=0;j<4;j++)
+				rsp.messages_control.data[9+j] =
+					(char)((CRC32_INIT >> (8*j)) & 0xffu);
+			rsp.messages_control.data[W_EOT_PAYLOAD_BYTES] = (char)rsp.CRC8_calc(
+				&rsp.messages_control.data[1], W_EOT_PAYLOAD_BYTES - 1);
+			rsp.messages_control.status = RECEIVED;
+			rsp.process_control_responder();
+		};
+
+		// First EOT is verified and its first ACK is armed by the normal path.
+		deliver_exact_empty_close();
+		CHECK(rsp.settled_close_cache.valid,
+		      "F1: first CLOSE reaches verified [RSP-V2-EOT-OK] settlement");
+		CHECK(rsp.messages_control.status == RECEIVED
+		      && rsp.connection_status == ACKNOWLEDGING_CONTROL,
+		      "F2: first terminal ACK is armed normally");
+
+		// Lose that ACK, enter the production hold, and re-solicit it with the
+		// commander's first identical retry.
+		rsp.messages_control.status = FREE;
+		rsp.rsp_enter_terminal_reack_hold();
+		deliver_exact_empty_close();
+		CHECK(rsp.settled_close_cache.replays == 1
+		      && rsp.connection_status == ACKNOWLEDGING_CONTROL,
+		      "F3: lost first ACK is re-solicited and re-ACKed within the hold");
+
+		// Consume the remaining responder replay budget.  The next exact retry
+		// is still inside the hold but must be freed: responder airtime can never
+		// exceed the commander's TERMINAL_EOT_RETRIES budget.
+		for(int replay=2; replay<=TERMINAL_EOT_RETRIES; replay++) {
+			rsp.messages_control.status = FREE;
+			rsp.connection_status = RECEIVING;
+			rsp.rsp_enter_terminal_reack_hold();
+			deliver_exact_empty_close();
+		}
+		CHECK(rsp.settled_close_cache.replays == TERMINAL_EOT_RETRIES,
+		      "F4: responder re-ACK count reaches exactly TERMINAL_EOT_RETRIES");
+		rsp.messages_control.status = FREE;
+		rsp.connection_status = RECEIVING;
+		rsp.rsp_enter_terminal_reack_hold();
+		deliver_exact_empty_close();
+		CHECK(rsp.settled_close_cache.replays == TERMINAL_EOT_RETRIES
+		      && rsp.messages_control.status == FREE
+		      && rsp.connection_status != ACKNOWLEDGING_CONTROL,
+		      "F5: exact in-window CLOSE beyond terminal replay budget is freed without ACK");
+
+		// Re-open a non-exhausted cached state solely to isolate the time bound,
+		// force the production hold-finisher, then replay the exact descriptor.
+		rsp.settled_close_cache.valid = true;
+		rsp.settled_close_cache.peer_committed = 0;
+		rsp.settled_close_cache.peer_crc = CRC32_INIT;
+		rsp.settled_close_cache.replays = 1;
+		rsp.messages_control.status = FREE;
+		rsp.connection_status = RECEIVING;
+		if(!rsp.responder_terminal_hold_timer.counting)
+			rsp.rsp_enter_terminal_reack_hold();
+		const int replays_before_expiry = rsp.settled_close_cache.replays;
+		rsp.rsp_finish_terminal_reack_hold("forced_expiry_regression");
+		deliver_exact_empty_close();
+		const int post_expiry_replays =
+			rsp.settled_close_cache.replays - replays_before_expiry;
+		printf("[TEST-TERMINAL-EOT-EXPIRY] post_expiry_replays=%d status=%d "
+		       "hold_counting=%d cache_valid=%d\n",
+			post_expiry_replays, rsp.messages_control.status,
+			rsp.responder_terminal_hold_timer.counting,
+			rsp.settled_close_cache.valid ? 1 : 0);
+		CHECK(post_expiry_replays == 0,
+		      "F6: forced-expiry exact CLOSE causes zero post-expiry replays");
+		CHECK(rsp.messages_control.status == FREE
+		      && rsp.connection_status != ACKNOWLEDGING_CONTROL,
+		      "F7: forced-expiry exact CLOSE is freed without ACK");
+		CHECK(!rsp.settled_close_cache.valid
+		      && !rsp.responder_terminal_hold_timer.counting,
+		      "F8: hold completion invalidates settled CLOSE cache and timer");
+	}
+
+	// PART G: healthy first-ACK control.  Deliver the ACK directly to the same
+	// production commander consumer used after recovery.  With no timeout event,
+	// teardown completes and the retransmit counter remains exactly zero.
+	{
+		cl_telecom_system cmd_ts;
+		cl_arq_controller cmd;
+		cmd.telecom_system = &cmd_ts;
+		cmd.role = COMMANDER;
+		cmd.load_configuration(CONFIG_16, FULL, YES);
+		cmd.link_status = DISCONNECTING;
+		cmd.connection_status = TRANSMITTING_CONTROL;
+		cmd.messages_control.status = FREE;
+		CHECK(cmd.add_message_control(CLOSE_CONNECTION) == SUCCESSFUL,
+		      "G1: normal-case production CLOSE builder accepted");
+		cmd.receiving_timeout = 3666;
+		cmd.cmd_arm_terminal_eot_arq();
+		cmd.disconnecting_settle_timer.start();
+		const int retries_before_ack = cmd.stats.nReSent_control;
+		cmd.messages_control.status = ACKED;
+		cmd.connection_status = RECEIVING_ACKS_CONTROL;
+		cmd.process_control_commander();
+		CHECK(cmd.link_status == LISTENING && cmd.role == RESPONDER
+		      && !cmd.disconnecting_settle_timer.counting,
+		      "G2: first terminal ACK completes ordinary clean teardown");
+		CHECK(cmd.stats.nReSent_control == retries_before_ack
+		      && retries_before_ack == 0,
+		      "G3: healthy first-ACK path adds zero retries and zero retry airtime");
+	}
+
+#if defined(TERMINAL_EOT_RETRY_FAILBEFORE)
+	if (failures > 0)
+		printf("[TEST-TERMINAL-SETTLE] EOT-RETRY-FAILBEFORE-DEMONSTRATED "
+		       "(generic slow timeout / unbounded data retry budget caught, %d failures)\n", failures);
+	else
+		printf("[TEST-TERMINAL-SETTLE] EOT-RETRY-FAILBEFORE-NOT-DEMONSTRATED\n");
+#elif defined(RSP_CLOSE_ACK_REARM_FAILBEFORE)
 	if (failures > 0)
 		printf("[TEST-TERMINAL-SETTLE] CLOSE-ACK-FAILBEFORE-DEMONSTRATED "
 		       "(pre-ACK reset cleared the accepted CLOSE; %d failures)\n", failures);

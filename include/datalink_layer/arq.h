@@ -2691,14 +2691,24 @@ public:
   enum {
     TERMINAL_SETTLE_FLOOR_MS    = 3000,   // never converge sooner than 3 s (tiny-timeout configs / cfg0 test)
     TERMINAL_SETTLE_CAP_MS      = 45000,  // hard ceiling: >> a healthy CLOSE-ACK RTT, << field horizon (~560 s)
-    TERMINAL_SETTLE_RTT_WINDOWS = 3       // <= a few control-ACK windows below the cap
+    TERMINAL_SETTLE_RTT_WINDOWS = 3,      // <= a few control-ACK windows below the cap
+    TERMINAL_EOT_RETRIES        = 3,      // retransmissions after the first CLOSE+EOT transmission
+    TERMINAL_EOT_RETRY_FLOOR_MS = 2500,   // do not collide with a healthy first ACK turnaround
+    TERMINAL_EOT_RETRY_CAP_MS   = 4000,   // fast enough for all retries to precede the 17 s recovery bar
+    TERMINAL_EOT_RSP_HOLD_MS    = 17000   // keep the terminal PHY receptive across the complete retry train
   };
   void cmd_terminal_settle_converge(const char* reason);
   int terminal_settle_deadline_ms() const;
+  int terminal_eot_retry_window_ms(int receive_window_ms) const;
+  void cmd_arm_terminal_eot_arq();
+  void cmd_terminal_eot_wait_for_backstop();
   // CLOSE was already integrity-checked and consumed when this runs. Preserve
   // that one control slot across the session reset long enough for the existing
   // ACKNOWLEDGING_CONTROL path to emit its terminal ACK.
   void rsp_reset_session_preserve_close_for_ack();
+  void rsp_enter_terminal_reack_hold();
+  void rsp_finish_terminal_reack_hold(const char* reason);
+  bool rsp_terminal_reack_hold_expired(int elapsed_ms) const;
   int test_terminal_settlement();
 
   // RX-CTRL-DROP fix (data-flow-control-slot-lifecycle.md). PURE predicate: the
@@ -5181,6 +5191,7 @@ public:
   cl_timer watchdog_timer;
   cl_timer link_timer;
   cl_timer disconnecting_settle_timer;   // COMMANDER graceful-close settle deadline (armed when CLOSE queued)
+  cl_timer responder_terminal_hold_timer; // RSP remains on the settled session's PHY for duplicate CLOSE re-ACKs
   // Terminal-settlement convergence meters (data-flow-stream-offset.md 8.6 teardown). MONOTONIC per run.
   int cmd_terminal_converge_events;      // CMD declared session locally settled + emitted terminal DISCONNECTED
   int rsp_terminal_reack_replays;        // RSP replayed its cached settlement ACK on a duplicate CLOSE
@@ -5266,7 +5277,7 @@ public:
   // On a clean EOT-verified CLOSE the RSP resets to LISTENING with no re-ACK-able settled state, so a
   // reverse CLOSE-ACK lost to a fade cannot be re-solicited (mirror of the connect_ack_cache gap on the
   // session-END side). Retain the settled identity so a DUPLICATE CLOSE matching it can be re-ACKed
-  // idempotently, bounded by nResends, without re-running teardown or touching capture ownership /
+  // idempotently, bounded by TERMINAL_EOT_RETRIES, without re-running teardown or touching capture ownership /
   // the fade-core origin gate.
   struct {
     bool valid;
@@ -5277,8 +5288,9 @@ public:
 
   inline bool settled_reack_window_open() const
   {
-    return settled_close_cache.valid
-        && settled_close_cache.replays < nResends
+    return responder_terminal_hold_timer.counting
+        && settled_close_cache.valid
+        && settled_close_cache.replays < TERMINAL_EOT_RETRIES
         && !passive_monitor;
   }
   inline bool settled_close_duplicate_matches(uint64_t committed, uint32_t crc) const

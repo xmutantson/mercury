@@ -2133,6 +2133,19 @@ void cl_arq_controller::process_messages_rx_data_control()
 			}
 			receiving_timer.start();
 		}
+		else if(responder_terminal_hold_timer.counting)
+		{
+			// A settled responder is deliberately not CONNECTED, but it must
+			// continue opening receive windows until the bounded duplicate-CLOSE
+			// hold expires. Without this branch the first empty window stops the
+			// timer at zero and a later decoded duplicate is never consumed.
+			calculate_receiving_timeout();
+			int remaining = TERMINAL_EOT_RSP_HOLD_MS
+				- responder_terminal_hold_timer.get_elapsed_time_ms();
+			if(remaining < 1) remaining = 1;
+			if(receiving_timeout > remaining) receiving_timeout = remaining;
+			receiving_timer.start();
+		}
 
 		// If we responded to HAIL but START_CONNECTION never arrived,
 		// go back to HAIL scanning for the next beacon.
@@ -2168,13 +2181,66 @@ void cl_arq_controller::rsp_reset_session_preserve_close_for_ack()
 {
 	// reset_session_state() correctly clears every control slot at a session
 	// boundary. This CLOSE is the sole exception: the responder still owes the
-	// peer the ACK that proves it consumed the integrity-checked terminal frame.
-	// Keep the received bytes and re-arm only the primary slot; the normal
-	// ACK-complete branch performs the final reset immediately after transmission.
+	// peer the ACK proving it consumed the integrity-checked terminal frame.
+	// Keep the received bytes and re-arm only the primary slot; the ACK-complete
+	// branch frees it before entering the bounded duplicate-CLOSE receive hold.
 	reset_session_state();
 #ifndef RSP_CLOSE_ACK_REARM_FAILBEFORE
 	messages_control.status = RECEIVED;
 #endif
+}
+
+bool cl_arq_controller::rsp_terminal_reack_hold_expired(int elapsed_ms) const
+{
+	return elapsed_ms >= TERMINAL_EOT_RSP_HOLD_MS;
+}
+
+void cl_arq_controller::rsp_enter_terminal_reack_hold()
+{
+	// The session state and application boundary were already finalized before
+	// the terminal ACK. Keep only the receive PHY at the just-settled data config
+	// long enough to decode the commander's bounded identical CLOSE retries.
+	// The mailbox is FREE, so the next-session invariant remains true.
+	link_status = DISCONNECTING;
+	connection_status = RECEIVING;
+	messages_control.status = FREE;
+	messages_control_bu.status = FREE;
+	receiving_timer.stop();
+	receiving_timer.reset();
+	receiving_timer.start();
+	if(!responder_terminal_hold_timer.counting)
+	{
+		responder_terminal_hold_timer.reset();
+		responder_terminal_hold_timer.start();
+	}
+	printf("[RSP-EOT-HOLD] terminal ACK sent; retaining settled PHY for %dms "
+	       "(replays=%d/%d, mailbox=FREE)\n",
+		(int)TERMINAL_EOT_RSP_HOLD_MS, settled_close_cache.replays,
+		(int)TERMINAL_EOT_RETRIES);
+	fflush(stdout);
+}
+
+void cl_arq_controller::rsp_finish_terminal_reack_hold(const char* reason)
+{
+	responder_terminal_hold_timer.stop();
+	responder_terminal_hold_timer.reset();
+	settled_close_cache.valid = false;
+	load_configuration(init_configuration,FULL,YES);
+	link_status = LISTENING;
+	connection_status = RECEIVING;
+	reset_all_timers();
+	telecom_system->data_container.frames_to_read =
+		telecom_system->data_container.preamble_nSymb +
+		telecom_system->data_container.Nsymb;
+	telecom_system->data_container.nUnder_processing_events = 0;
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+	fifo_buffer_rx.flush();
+	messages_control.status = FREE;
+	messages_control_bu.status = FREE;
+	printf("[RSP-EOT-HOLD] settled PHY hold complete (%s); LISTENING on init config, mailbox=FREE\n",
+		reason != NULL ? reason : "bounded");
+	fflush(stdout);
 }
 
 void cl_arq_controller::process_messages_acknowledging_control()
@@ -2657,6 +2723,9 @@ void cl_arq_controller::process_messages_acknowledging_control()
 		}
 		else if(ack_command==CLOSE_CONNECTION)
 		{
+#ifdef TERMINAL_EOT_RETRY_FAILBEFORE
+			// Exact pre-retry teardown: move immediately to the initial PHY, so
+			// a lost ACK cannot be re-solicited at the settled data config.
 			reset_session_state();
 			load_configuration(init_configuration,FULL,YES);
 			this->link_status=LISTENING;
@@ -2673,6 +2742,9 @@ void cl_arq_controller::process_messages_acknowledging_control()
 			fifo_buffer_backup.flush();
 			fifo_buffer_rx.flush();
 			messages_control.status=FREE;
+#else
+			rsp_enter_terminal_reack_hold();
+#endif
 		}
 	}
 }
@@ -4216,6 +4288,8 @@ void cl_arq_controller::process_control_responder()
 		// MERCURY_T1_SCHEDKEY lever off. The peer-measured keyup refinement is the HELD wire exchange.
 		t1_seed_calibration_defaults();
 				settled_close_cache.valid = false;  // session-start disarm (never re-ACK a stale descriptor)
+				responder_terminal_hold_timer.stop();
+				responder_terminal_hold_timer.reset();
 		if(connect_fast_active)
 		{
 			robust_enabled = connect_fast_fallback_robust;
@@ -5069,30 +5143,37 @@ void cl_arq_controller::process_control_responder()
 		{
 				// Terminal-settlement re-ACK (idempotent settlement; mirror of connect_ack_cache). A
 				// duplicate CLOSE+EOT matching the cached settled descriptor means our reverse CLOSE-ACK was
-				// lost and the CMD is re-soliciting. Replay the terminal ACK, bounded by nResends, WITHOUT
+				// lost and the CMD is re-soliciting. Replay the terminal ACK, bounded by
+				// TERMINAL_EOT_RETRIES and the active hold timer, WITHOUT
 				// re-running teardown / EOT-verify (rx_stream_delivered is 0 post-reset) and WITHOUT taking
 				// capture-countdown ownership or re-arming the origin gate. Requires the EOT payload present.
-				if(link_status != CONNECTED && settled_reack_window_open())
+				// This branch owns the complete post-settlement lifetime: the valid cache
+				// identifies the active/just-settled session, and LISTENING identifies a
+				// frame decoded after bounded hold expiry (when the cache is invalidated).
+				// Keep a first CLOSE received while DROPPED on the ordinary teardown path.
+				if(link_status != CONNECTED
+				   && (settled_close_cache.valid || link_status == LISTENING))
 				{
 					unsigned char dup_crc8 = (unsigned char)CRC8_calc(
 						(char*)&messages_control.data[1], W_EOT_PAYLOAD_BYTES - 1);
 					bool dup_eot_present =
 						((unsigned char)messages_control.data[W_EOT_PAYLOAD_BYTES] == dup_crc8);
+					uint64_t dup_committed = 0;
+					uint32_t dup_crc = 0;
 					if(dup_eot_present)
 					{
-						uint64_t dup_committed = 0;
 						for(int i=0;i<8;i++)
 							dup_committed |= ((uint64_t)(unsigned char)messages_control.data[1+i]) << (8*i);
-						uint32_t dup_crc = 0;
 						for(int i=0;i<4;i++)
 							dup_crc |= ((uint32_t)(unsigned char)messages_control.data[9+i]) << (8*i);
-						if(settled_close_duplicate_matches(dup_committed, dup_crc))
+						if(settled_reack_window_open()
+						   && settled_close_duplicate_matches(dup_committed, dup_crc))
 						{
 							settled_close_cache.replays++;
 							rsp_terminal_reack_replays++;
 							printf("[RSP-EOT-REACK] duplicate CLOSE -> cached terminal ACK replay=%d/%d "
 								"committed=%llu crc=0x%08x\n",
-								settled_close_cache.replays, nResends,
+								settled_close_cache.replays, (int)TERMINAL_EOT_RETRIES,
 								(unsigned long long)dup_committed, dup_crc);
 							fflush(stdout);
 							// Re-ACK via the existing control-ACK builder without re-running teardown:
@@ -5103,6 +5184,18 @@ void cl_arq_controller::process_control_responder()
 							return;
 						}
 					}
+					// Once a session is settled, a malformed, mismatched, passive,
+					// or replay-budget-exhausted CLOSE must never fall through and
+					// re-run EOT verification against the reset byte/CRC cursors.
+					printf("[RSP-EOT-REACK] rejected post-settlement CLOSE "
+					       "(present=%d match=%d replays=%d/%d passive=%d); mailbox=FREE\n",
+						dup_eot_present ? 1 : 0,
+						dup_eot_present && settled_close_duplicate_matches(dup_committed, dup_crc) ? 1 : 0,
+						settled_close_cache.replays, (int)TERMINAL_EOT_RETRIES,
+						passive_monitor ? 1 : 0);
+					fflush(stdout);
+					messages_control.status = FREE;
+					return;
 				}
 
 			// Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b): a PROVEN-CLEAN
