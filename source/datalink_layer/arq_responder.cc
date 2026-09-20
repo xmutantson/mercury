@@ -56,6 +56,43 @@ void cl_arq_controller::process_messages_responder()
 
 }
 
+void cl_arq_controller::responder_maybe_advertise_late_role_demand()
+{
+	if(!local_reverse_data_demand())
+	{
+		reverse_data_demand_last_advertised = false;
+		role_demand_refresh_timer.stop();
+		role_demand_refresh_timer.reset();
+		return;
+	}
+	if(role != RESPONDER || link_status != CONNECTED
+	   || connection_status != RECEIVING || passive_monitor
+	   || messages_control.status != FREE || messages_rx_buffer.status == RECEIVED
+	   || batch_rx_frame_count != 0)
+		return;
+	if(role_demand_refresh_timer.counting == NO)
+	{
+		role_demand_refresh_timer.reset();
+		role_demand_refresh_timer.start();
+		return;
+	}
+	if(role_demand_refresh_timer.get_elapsed_time_ms() < ROLE_DEMAND_REFRESH_MS)
+		return;
+
+	int span = data_batch_size;
+	if(span < 1) span = 1;
+	if(span > MAX_SACK_BATCH_SIZE) span = MAX_SACK_BATCH_SIZE;
+	bool clean_bitmap[MAX_SACK_BATCH_SIZE];
+	for(int i=0; i<span; i++) clean_bitmap[i] = true;
+	unsigned char target = (unsigned char)(
+		rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id
+		: (rsp_last_delivered_batch_seq_id >= 0 ? rsp_last_delivered_batch_seq_id : 0));
+	printf("[ROLE-DEMAND-TX] late/refresh target_bsi=%u span=%d count=%lld\n",
+		(unsigned)target, span, reverse_data_demand_tx_count + 1);
+	fflush(stdout);
+	send_sack_v2_frame(clean_bitmap, span, target);
+}
+
 int cl_arq_controller::add_message_rx_data(char type, char id, int length, char* data)
 {
 	int success=ERROR_;
@@ -301,6 +338,10 @@ bool cl_arq_controller::store_prev_match_frame()
 
 void cl_arq_controller::process_messages_rx_data_control()
 {
+	long long demand_tx_before = reverse_data_demand_tx_count;
+	responder_maybe_advertise_late_role_demand();
+	if(reverse_data_demand_tx_count != demand_tx_before)
+		return;
 	// Fast HAIL scanning while LISTENING: use receive_hail_pattern() (~32ms cycles)
 	// instead of slow receive() (multi-second LDPC frame captures).
 	// Directed HAIL: only respond to beacons targeting our callsign (CRC suffix match).
@@ -3754,8 +3795,19 @@ void cl_arq_controller::process_messages_acknowledging_data()
 			}
 			if (!used_mfsk_path)
 			{
-				// NB or MFSK-suffix unavailable: legacy MFSK pattern.
-				send_ack_pattern();
+				// NB has no content-bearing bare ACK.  A queued reverse stream therefore
+				// upgrades this clean response to the CRC/LDPC-protected full-SACK
+				// format, whose flags octet carries D=1.  With D=0 the legacy bare ACK
+				// remains unchanged.
+				if(local_reverse_data_demand())
+				{
+					bool clean_bitmap[MAX_SACK_BATCH_SIZE];
+					for(int i=0; i<eff_window && i<MAX_SACK_BATCH_SIZE; i++)
+						clean_bitmap[i] = true;
+					send_sack_v2_frame(clean_bitmap, eff_window, ack_bsi);
+				}
+				else
+					send_ack_pattern();
 			}
 			// SEAM-2 FLUSH-A: a deferred prev clean-confirm rides for free if this
 			// bsi-carrying clean/current ACK we just emitted cumulatively covers it.
@@ -3772,9 +3824,19 @@ void cl_arq_controller::process_messages_acknowledging_data()
 		}
 		else
 		{
-			// Legacy MFSK ACK (M=16, nStreams=1) — dedicated ack_mfsk
-			// path, no config switch needed.
-			send_ack_pattern();
+			// Legacy/NB bare ACK carries D=0 only.  D=1 uses the same singleton
+			// full-SACK demand record as negotiated SACK sessions.
+			if(local_reverse_data_demand())
+			{
+				bool clean_bitmap[MAX_SACK_BATCH_SIZE];
+				for(int i=0; i<eff_window && i<MAX_SACK_BATCH_SIZE; i++)
+					clean_bitmap[i] = true;
+				unsigned char ack_bsi = (unsigned char)(
+					rsp_prev_batch_seq_id >= 0 ? rsp_prev_batch_seq_id : 0);
+				send_sack_v2_frame(clean_bitmap, eff_window, ack_bsi);
+			}
+			else
+				send_ack_pattern();
 		}
 
 		// The first clean turnaround is intentionally baseline-only.  Publish
@@ -6904,20 +6966,21 @@ int cl_arq_controller::test_inband_drop()
 	// ========================================================================
 	// PART C — SACK CONFIRM (the implicit confirmation, design §5.2)
 	// ========================================================================
-	// Build the dropped batch's SACK_RSP payload [bsi | bitmap | CRC8] and run the
+	// Build the dropped batch's SACK_RSP payload [bsi | flags | bitmap | CRC8] and run the
 	// CMD's REAL decode_sack_v2_frame. A SACK whose bsi matches the dropped batch IS
 	// proof the RX decoded at the announced config.
 	{
 		const int NF = 4;                 // small batch for the SACK
 		int bitmap_bytes = (NF + 7) / 8;  // 1
-		unsigned char payload[1 + 1 + 1];
+		unsigned char payload[1 + 1 + 1 + 1];
 		payload[0] = (unsigned char)(dropped_bsi & 0xFF);
-		payload[1] = 0x0F;                // all 4 frames RECEIVED (bits 0..3)
-		payload[1 + bitmap_bytes] = cmd->CRC8_calc((char*)payload, 1 + bitmap_bytes);
+		payload[1] = 0;                   // flags: no reverse demand in this fixture
+		payload[2] = 0x0F;                // all 4 frames RECEIVED (bits 0..3)
+		payload[2 + bitmap_bytes] = cmd->CRC8_calc((char*)payload, 2 + bitmap_bytes);
 		// Stage it into the CMD's messages_rx_buffer the way receive() would (SACK_RSP).
 		cmd->messages_rx_buffer.type = SACK_RSP;
 		cmd->messages_rx_buffer.status = RECEIVED;
-		for(int b = 0; b < 1 + bitmap_bytes + 1; b++)
+		for(int b = 0; b < 1 + 1 + bitmap_bytes + 1; b++)
 			cmd->messages_rx_buffer.data[b] = (char)payload[b];
 
 		bool out_bm[MAX_SACK_BATCH_SIZE] = {false};
@@ -16038,7 +16101,7 @@ int cl_arq_controller::test_sack_oow_reject()
 	// Helper: write a CRC8-valid SACK_RSP payload into messages_rx_buffer and
 	// drive the REAL decode + REAL window predicate. Returns decode result via
 	// out-param; the window verdict is computed by the production helper.
-	// Payload layout (decode_sack_v2_frame): [bsi][bitmap ceil(N/8)][CRC8].
+	// Payload layout: [bsi][flags][bitmap ceil(N/8)][CRC8].
 	int bitmap_bytes = (nframes + 7) / 8;
 	unsigned char tmp_bitmap_byte[16];
 
@@ -16062,13 +16125,14 @@ int cl_arq_controller::test_sack_oow_reject()
 		tmp_bitmap_byte[wide_slot / 8] =
 			(unsigned char)(1u << (wide_slot % 8));
 
-		int payload_len = 1 + bitmap_bytes + 1;
-		// Compose into a local buffer to compute CRC8 over [bsi][bitmap].
-		char payload[1 + 16 + 1];
+		int payload_len = 1 + 1 + bitmap_bytes + 1;
+		// Compose into a local buffer to compute CRC8 over [bsi][flags][bitmap].
+		char payload[1 + 1 + 16 + 1];
 		payload[0] = (char)(unsigned char)cases[c].bsi;
-		for(int b = 0; b < bitmap_bytes; b++) payload[1 + b] = (char)tmp_bitmap_byte[b];
-		unsigned char crc = CRC8_calc(payload, 1 + bitmap_bytes);
-		payload[1 + bitmap_bytes] = (char)crc;
+		payload[1] = 0; // flags: no reverse demand in this fixture
+		for(int b = 0; b < bitmap_bytes; b++) payload[2 + b] = (char)tmp_bitmap_byte[b];
+		unsigned char crc = CRC8_calc(payload, 2 + bitmap_bytes);
+		payload[2 + bitmap_bytes] = (char)crc;
 
 		// Stage it in messages_rx_buffer exactly as the OFDM RX path would.
 		for(int b = 0; b < payload_len; b++)

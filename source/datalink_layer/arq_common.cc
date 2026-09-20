@@ -1011,6 +1011,12 @@ cl_arq_controller::cl_arq_controller()
 	// Commander connect-accept (CONNECT skips reset_session_state).
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
+	reverse_data_demand_acknowledged = false;
+	reverse_data_demand_last_advertised = false;
+	reverse_data_demand_tx_count = 0;
+	reverse_data_demand_rx_count = 0;
+	role_demand_refresh_timer.stop();
+	role_demand_refresh_timer.reset();
 	connect_ack_cache.valid = false;
 	connect_ack_cache.echoed_cap = 0;
 	connect_ack_cache.own_cap = 0;
@@ -2716,11 +2722,20 @@ void cl_arq_controller::set_role(int role)
 #ifndef SWITCHROLE_RERIDE_FAILBEFORE
 			session_data_frame_sent = false;
 #endif
+			reverse_data_demand_acknowledged = false;
+			role_demand_refresh_timer.stop();
+			role_demand_refresh_timer.reset();
 		}
 		this->role=COMMANDER;
 	}
 	else
 	{
+		if(this->role != RESPONDER)
+		{
+			reverse_data_demand_acknowledged = false;
+			role_demand_refresh_timer.stop();
+			role_demand_refresh_timer.reset();
+		}
 		this->role=RESPONDER;
 	}
 	calculate_receiving_timeout();
@@ -10270,6 +10285,8 @@ void cl_arq_controller::reset_all_timers()
 	receiving_timer.reset();
 	switch_role_timer.stop();
 	switch_role_timer.reset();
+	role_demand_refresh_timer.stop();
+	role_demand_refresh_timer.reset();
 }
 
 // ============================================================================
@@ -10938,6 +10955,10 @@ void cl_arq_controller::reset_session_state()
 	// reset_session_state, arq_common.cc:801.)
 	session_data_frame_sent = false;
 	session_data_frame_received = false;
+	reverse_data_demand_acknowledged = false;
+	reverse_data_demand_last_advertised = false;
+	role_demand_refresh_timer.stop();
+	role_demand_refresh_timer.reset();
 	// Topgear is per-session channel evidence. Never carry a prior peer/channel's
 	// verdict or report de-dup identity into a fresh session.
 	telecom_system->invalidate_channel_selectivity();
@@ -18009,6 +18030,81 @@ void cl_arq_controller::rsp_seam_clear_on_clean_eot()
 	rsp_cross_session_seam_armed   = false;
 }
 
+bool cl_arq_controller::local_reverse_data_demand()
+{
+	if(role != RESPONDER || link_status != CONNECTED)
+		return false;
+	if(fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size() > 0)
+		return true;
+	// Protocol-owned KX bytes use a dedicated stream instead of fifo_buffer_tx.
+	// Advertise only after those bytes (or the post-reverse activation action)
+	// actually exist.  Turboshift bookkeeping is deliberately excluded: a
+	// reverse-channel probe is speculative work, not reverse-data demand.
+	return encryption_enabled && !cipher_suite.is_active() && kx_as_data_path()
+		&& (kx_stream_tx_active || (kx_reverse_consumed && !kx_key_activate_sent));
+}
+
+unsigned char cl_arq_controller::role_demand_pack_ack_bsi(unsigned char bsi)
+{
+	const bool demand = local_reverse_data_demand();
+	return (unsigned char)((bsi & ROLE_DEMAND_BSI_MASK)
+		| (demand ? ROLE_DEMAND_BSI_FLAG : 0));
+}
+
+unsigned char cl_arq_controller::role_demand_restore_ack_bsi(
+	unsigned char wire_bsi, bool* out_demand) const
+{
+	if(out_demand != NULL)
+		*out_demand = (wire_bsi & ROLE_DEMAND_BSI_FLAG) != 0;
+	const unsigned char low = wire_bsi & ROLE_DEMAND_BSI_MASK;
+	const unsigned char candidates[2] = { low, (unsigned char)(low | 0x80u) };
+	const int current = cmd_batch_seq_id & 0xff;
+	const int previous = (current - 1) & 0xff;
+	const bool cumulative = scalable_sack_on() && cumulative_ack_enabled;
+	for(int pass=0; pass<2; pass++)
+	{
+		for(int i=0; i<2; i++)
+		{
+			const int target = (int)generation_ack_resolve_target(candidates[i], cumulative);
+			if((pass == 0 && target == current)
+			   || (pass == 1 && target == previous))
+				return candidates[i];
+		}
+	}
+	// No owned generation is visible (for example a standalone late-demand
+	// refresh after the last batch was retired).  Reconstruct in the commander's
+	// current modulo-128 epoch; the demand bit remains independently valid.
+	return (unsigned char)((current & 0x80) | low);
+}
+
+void cl_arq_controller::role_demand_note_acknowledged(bool demanded,
+	const char* substrate)
+{
+	if(!demanded || role != COMMANDER || link_status != CONNECTED)
+		return;
+	if(!reverse_data_demand_acknowledged)
+	{
+		reverse_data_demand_acknowledged = true;
+		reverse_data_demand_rx_count++;
+		printf("[ROLE-DEMAND-ACKED] substrate=%s count=%lld -- SWITCH_ROLE eligible\n",
+			substrate != NULL ? substrate : "unknown", reverse_data_demand_rx_count);
+		fflush(stdout);
+	}
+}
+
+bool cl_arq_controller::role_demand_control_slot_safe() const
+{
+	return messages_control.status == FREE;
+}
+
+bool cl_arq_controller::role_demand_switch_owns_precedence() const
+{
+	if(reverse_data_demand_acknowledged)
+		return true;
+	return messages_control.status != FREE && messages_control.data != NULL
+		&& (unsigned char)messages_control.data[0] == SWITCH_ROLE;
+}
+
 long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
                                                 unsigned char target_batch_seq_id)
 {
@@ -18032,20 +18128,24 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 
 	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
 		target_batch_seq_id, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+	const unsigned char flags = local_reverse_data_demand()
+		? ROLE_DEMAND_SACK_FLAG : 0;
 	int bitmap_bytes = (nframes + 7) / 8;
-	int payload_len  = 1 /*batch_seq_id*/ + bitmap_bytes + 1 /*CRC8*/;
+	int payload_len  = 1 /*batch_seq_id*/ + 1 /*flags*/
+	                 + bitmap_bytes + 1 /*CRC8*/;
 
 	// Build the payload directly into a scratch buffer first so we can
 	// CRC-cover the (batch_seq_id || bitmap) prefix before writing CRC8.
-	unsigned char payload[1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
+	unsigned char payload[1 + 1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
 	payload[0] = batch_seq_id;
-	for(int b = 0; b < bitmap_bytes; b++) payload[1 + b] = 0;
+	payload[1] = flags;
+	for(int b = 0; b < bitmap_bytes; b++) payload[2 + b] = 0;
 	for(int i = 0; i < nframes; i++)
 	{
 		if(bitmap[i])
-			payload[1 + (i / 8)] |= (unsigned char)(1u << (i % 8));
+			payload[2 + (i / 8)] |= (unsigned char)(1u << (i % 8));
 	}
-	unsigned char crc = CRC8_calc((char*)payload, 1 + bitmap_bytes);
+	unsigned char crc = CRC8_calc((char*)payload, 2 + bitmap_bytes);
 
 	// Optional CRC8 fault injection (CLI --test-rsp-sack-rsp-crc-corrupt).
 	// One-shot: clears the armed flag after firing exactly once.
@@ -18071,7 +18171,7 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 		crc = corrupted;
 		test_rsp_sack_rsp_crc_corrupt_count--;
 	}
-	payload[1 + bitmap_bytes] = crc;
+	payload[2 + bitmap_bytes] = crc;
 
 	// Log the ground-truth TX bitmap byte-for-byte so the loopback test can
 	// assert byte-identity with the CMD-side decoded bitmap.
@@ -18080,8 +18180,9 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 		for(int b = 0; b < payload_len; b++)
 			snprintf(&hex[2*b], 3, "%02x", payload[b]);
 		hex[2*payload_len] = '\0';
-		printf("[TX-SACK-V2] batch_seq_id=%u nframes=%d bitmap_bytes=%d payload=%s crc8=0x%02x\n",
-			(unsigned)batch_seq_id, nframes, bitmap_bytes, hex, (unsigned)crc);
+		printf("[TX-SACK-V2] batch_seq_id=%u demand=%d nframes=%d bitmap_bytes=%d payload=%s crc8=0x%02x\n",
+			(unsigned)batch_seq_id, (flags & ROLE_DEMAND_SACK_FLAG) ? 1 : 0,
+			nframes, bitmap_bytes, hex, (unsigned)crc);
 		fflush(stdout);
 	}
 
@@ -18168,6 +18269,14 @@ long long cl_arq_controller::send_sack_v2_frame(const bool* bitmap, int nframes,
 	messages_control.status = FREE;
 
 	rsp_sack_v2_tx_count++;
+	if((flags & ROLE_DEMAND_SACK_FLAG) != 0)
+	{
+		reverse_data_demand_last_advertised = true;
+		reverse_data_demand_tx_count++;
+		role_demand_refresh_timer.stop();
+		role_demand_refresh_timer.reset();
+		role_demand_refresh_timer.start();
+	}
 	printf("[TX-SACK-V2] send_batch() wire_ms=%lld ctrl_tx_time_ms=%d (legacy MFSK SACK ~1168 ms baseline)\n",
 		elapsed_ms, ctrl_transmission_time_ms);
 	fflush(stdout);
@@ -18330,8 +18439,9 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 		return 0;
 	auto t_start = std::chrono::steady_clock::now();
 
-	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
+	const unsigned char ack_batch_seq_id = cumulative_ack_bsi_field(
 		target_batch_seq_id, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+	const unsigned char batch_seq_id = role_demand_pack_ack_bsi(ack_batch_seq_id);
 	// Compute CRC12 over the 40-bit [bsi || bitmap] payload (big-endian).
 	// CRC12 protects against false-accept after correlator lock — see
 	// mercury/fact-documents/mfsk-robust-ack.md §3.2.
@@ -18343,8 +18453,10 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 	crc_input[4] = (char)( bitmap        & 0xFF);
 	uint16_t crc12 = CRC12_calc(crc_input, 5);
 
-	printf("[TX-MFSK-ACK-SACK] batch_seq_id=%u bitmap=0x%08x crc12=0x%03x nsymb=%d on CONFIG_%d\n",
-		(unsigned)batch_seq_id, (unsigned)bitmap, (unsigned)crc12, nsymb, current_configuration);
+	printf("[TX-MFSK-ACK-SACK] batch_seq_id=%u wire_bsi=%u demand=%d bitmap=0x%08x crc12=0x%03x nsymb=%d on CONFIG_%d\n",
+		(unsigned)ack_batch_seq_id, (unsigned)batch_seq_id,
+		(batch_seq_id & ROLE_DEMAND_BSI_FLAG) ? 1 : 0,
+		(unsigned)bitmap, (unsigned)crc12, nsymb, current_configuration);
 	fflush(stdout);
 
 	// WALL-B FIX-9 D2 REFINE (_fix9/d2refine/D2_REFINE_DESIGN.md §2.1): read+clear the per-call
@@ -18526,6 +18638,14 @@ long long cl_arq_controller::send_mfsk_ack_sack(unsigned char target_batch_seq_i
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		t_end - t_start).count();
+	if((batch_seq_id & ROLE_DEMAND_BSI_FLAG) != 0)
+	{
+		reverse_data_demand_last_advertised = true;
+		reverse_data_demand_tx_count++;
+		role_demand_refresh_timer.stop();
+		role_demand_refresh_timer.reset();
+		role_demand_refresh_timer.start();
+	}
 	return elapsed_ms;
 #endif  // MFSK_ACK_SACK_ENABLED
 }
@@ -18883,8 +19003,9 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	if(telecom_system->ack_mfsk.compact_confirm_suffix_len() <= 0)
 		return 0;  // NB / unsupported
 
-	const unsigned char batch_seq_id = cumulative_ack_bsi_field(
+	const unsigned char ack_batch_seq_id = cumulative_ack_bsi_field(
 		target_batch_seq_id, rsp_last_delivered_batch_seq_id, cumulative_ack_enabled);
+	const unsigned char batch_seq_id = role_demand_pack_ack_bsi(ack_batch_seq_id);
 	const bool v2_quality = gearshift_quality_report_v2_enabled();
 	const bool legacy_topgear = !v2_quality && topgear_elect_feature_enabled()
 	                         && (current_configuration == CONFIG_16
@@ -18908,14 +19029,13 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	{
 		quality_report = gearshift_pack_quality_report(measurements.SNR_downlink, flatness);
 		append_quality = shadow_topgear
-		              || gearshift_quality_report_due_for_tx(quality_report, batch_seq_id);
+		              || gearshift_quality_report_due_for_tx(quality_report, ack_batch_seq_id);
 	}
 	else if(legacy_topgear)
 	{
 		quality_report = topgear_pack_report(measurements.SNR_downlink, flatness);
 		append_quality = true;
 	}
-
 	int nsymb = telecom_system->ack_mfsk.compact_confirm_pattern_nsymb();
 	if(append_quality)
 		nsymb += telecom_system->ack_mfsk.compact_confirm_suffix_len();
@@ -18945,9 +19065,11 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 		quality_crc12 = CRC12_calc(report_byte, 1);
 	}
 
-	printf("[TX-MFSK-COMPACT] batch_seq_id=%u crc12=0x%03x nsymb=%d on CONFIG_%d"
+	printf("[TX-MFSK-COMPACT] batch_seq_id=%u wire_bsi=%u demand=%d crc12=0x%03x nsymb=%d on CONFIG_%d"
 	       "%s\n",
-		(unsigned)batch_seq_id, (unsigned)crc12, nsymb, current_configuration,
+		(unsigned)ack_batch_seq_id, (unsigned)batch_seq_id,
+		(batch_seq_id & ROLE_DEMAND_BSI_FLAG) ? 1 : 0,
+		(unsigned)crc12, nsymb, current_configuration,
 		append_quality ? (v2_quality ? " +gs2-quality" : " +topgear-report") : "");
 	fflush(stdout);
 
@@ -19117,6 +19239,14 @@ long long cl_arq_controller::send_mfsk_compact_confirm(unsigned char target_batc
 	auto t_end = std::chrono::steady_clock::now();
 	long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		t_end - t_start).count();
+	if((batch_seq_id & ROLE_DEMAND_BSI_FLAG) != 0)
+	{
+		reverse_data_demand_last_advertised = true;
+		reverse_data_demand_tx_count++;
+		role_demand_refresh_timer.stop();
+		role_demand_refresh_timer.reset();
+		role_demand_refresh_timer.start();
+	}
 	return elapsed_ms;
 #endif  // MFSK_ACK_SACK_ENABLED
 }
@@ -19696,12 +19826,13 @@ int cl_arq_controller::test_t1_schedkey_safety()
 }
 
 bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
-                                             unsigned char* out_batch_seq_id)
+                                             unsigned char* out_batch_seq_id,
+                                             bool* out_reverse_demand)
 {
 	// Caller has verified messages_rx_buffer.type == SACK_RSP and
 	// messages_rx_buffer.status == RECEIVED. Payload bytes live in
 	// messages_rx_buffer.data[0..]. Expected layout:
-	//   [batch_seq_id : u8][bitmap : ceil(N/8) bytes][CRC8 : u8]
+	//   [batch_seq_id : u8][flags : u8][bitmap : ceil(N/8) bytes][CRC8 : u8]
 	if(nframes <= 0 || nframes > MAX_SACK_BATCH_SIZE)
 	{
 		printf("[CMD-SACK-V2-DECODE] ERROR: nframes=%d out of range\n", nframes);
@@ -19709,14 +19840,14 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 		return false;
 	}
 	int bitmap_bytes = (nframes + 7) / 8;
-	int payload_len  = 1 + bitmap_bytes + 1;
+	int payload_len  = 1 + 1 + bitmap_bytes + 1;
 
-	unsigned char payload[1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
+	unsigned char payload[1 + 1 + (MAX_SACK_BATCH_SIZE + 7) / 8 + 1];
 	for(int b = 0; b < payload_len; b++)
 		payload[b] = (unsigned char)messages_rx_buffer.data[b];
 
-	unsigned char rx_crc       = payload[1 + bitmap_bytes];
-	unsigned char computed_crc = CRC8_calc((char*)payload, 1 + bitmap_bytes);
+	unsigned char rx_crc       = payload[2 + bitmap_bytes];
+	unsigned char computed_crc = CRC8_calc((char*)payload, 2 + bitmap_bytes);
 
 	if(rx_crc != computed_crc)
 	{
@@ -19738,9 +19869,11 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 
 	// CRC pass — write out the bitmap.
 	*out_batch_seq_id = payload[0];
+	const bool reverse_demand = (payload[1] & ROLE_DEMAND_SACK_FLAG) != 0;
+	if(out_reverse_demand != NULL) *out_reverse_demand = reverse_demand;
 	for(int i = 0; i < nframes; i++)
 	{
-		out_bitmap[i] = (payload[1 + (i / 8)] & (1u << (i % 8))) != 0;
+		out_bitmap[i] = (payload[2 + (i / 8)] & (1u << (i % 8))) != 0;
 	}
 
 	// Update CMD-side observability state (for tests).
@@ -19751,15 +19884,15 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 	if(copy_n > (int)sizeof(cmd_sack_v2_last_rx_bitmap))
 		copy_n = (int)sizeof(cmd_sack_v2_last_rx_bitmap);
 	for(int b = 0; b < copy_n; b++)
-		cmd_sack_v2_last_rx_bitmap[b] = payload[1 + b];
+		cmd_sack_v2_last_rx_bitmap[b] = payload[2 + b];
 
 	// Log decoded bitmap byte-for-byte for the v2<->v2 byte-identity test.
 	char hex[2 * sizeof(payload) + 1];
 	for(int b = 0; b < payload_len; b++)
 		snprintf(&hex[2*b], 3, "%02x", payload[b]);
 	hex[2*payload_len] = '\0';
-	printf("[CMD-SACK-V2] batch_seq_id=%u nframes=%d bitmap_bytes=%d payload=%s crc8_ok=0x%02x rx_count=%lld\n",
-		(unsigned)payload[0], nframes, bitmap_bytes, hex,
+	printf("[CMD-SACK-V2] batch_seq_id=%u demand=%d nframes=%d bitmap_bytes=%d payload=%s crc8_ok=0x%02x rx_count=%lld\n",
+		(unsigned)payload[0], reverse_demand ? 1 : 0, nframes, bitmap_bytes, hex,
 		(unsigned)rx_crc, cmd_sack_v2_rx_count);
 	fflush(stdout);
 	return true;

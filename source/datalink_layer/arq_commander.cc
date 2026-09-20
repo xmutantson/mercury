@@ -1420,16 +1420,19 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 		tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
 	if(!decoded)
 		return false;
+	const uint8_t wire_bsi = rx_bsi;
 
 	// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
 	char crc_input[5];
-	crc_input[0] = (char)rx_bsi;
+	crc_input[0] = (char)wire_bsi;
 	crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
 	crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
 	crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
 	crc_input[4] = (char)( rx_bitmap        & 0xFF);
 	if(rx_crc12 != CRC12_calc(crc_input, 5))
 		return false;
+	bool reverse_demand = false;
+	rx_bsi = role_demand_restore_ack_bsi(wire_bsi, &reverse_demand);
 
 	const int target = (int)generation_ack_resolve_target(
 		rx_bsi, cumulative_ack_enabled);
@@ -1446,6 +1449,7 @@ bool cl_arq_controller::cmd_clean_data_ack_crc_valid()
 	if(clean)
 	{
 		cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
+		role_demand_note_acknowledged(reverse_demand, "mfsk-ack-sack-clean");
 		if(std::getenv("MERCURY_GEN_CANON_WITNESS"))
 			printf("[GEN-CANON-RESOLVE] transport=MFSK-CLEAN wire=%u target=%u "
 			       "canon=%d cumulative=%d clean=1 span=%d owner=live\n",
@@ -1565,14 +1569,17 @@ bool cl_arq_controller::cmd_data_ack_anchored_rescan_accept()
 				tail_samples, &rx_bsi, &rx_bitmap, &rx_crc12, &mfsk_matched);
 			if(!decoded)
 				continue;
+			const uint8_t wire_bsi = rx_bsi;
 			char crc_input[5];
-			crc_input[0] = (char)rx_bsi;
+			crc_input[0] = (char)wire_bsi;
 			crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
 			crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
 			crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
 			crc_input[4] = (char)( rx_bitmap        & 0xFF);
 			if(rx_crc12 != CRC12_calc(crc_input, 5))
 				continue;
+			bool reverse_demand = false;
+			rx_bsi = role_demand_restore_ack_bsi(wire_bsi, &reverse_demand);
 			const int target = (int)generation_ack_resolve_target(
 				rx_bsi, cumulative_ack_enabled);
 			const int inflight = current_inflight_bsi();
@@ -1583,6 +1590,7 @@ bool cl_arq_controller::cmd_data_ack_anchored_rescan_accept()
 			if(!mfsk_sack_bitmap_is_clean(rx_bitmap, data_batch_size))
 				continue;
 			cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
+			role_demand_note_acknowledged(reverse_demand, "mfsk-ack-sack-rescan");
 #else
 			continue;   // suffix-capable but SACK decode unavailable -> cannot validate; do not credit
 #endif
@@ -1670,6 +1678,8 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 		want_quality_report ? &quality_report_valid : nullptr);
 	if(!decoded)
 		return false;  // soft_decode_compact already gated CRC12-over-[bsi].
+	bool reverse_demand = false;
+	rx_bsi = role_demand_restore_ack_bsi(rx_bsi, &reverse_demand);
 
 	bool cumulative = scalable_sack_on() && cumulative_ack_enabled;
 	const int target = (int)generation_ack_resolve_target(rx_bsi, cumulative);
@@ -1688,6 +1698,7 @@ bool cl_arq_controller::cmd_compact_confirm_crc_valid(uint8_t* out_bsi)
 		fflush(stdout);
 	}
 	cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
+	role_demand_note_acknowledged(reverse_demand, "compact-ack");
 	if(quality_report_valid)
 	{
 		if(gearshift_quality_report_v2_enabled())
@@ -3091,6 +3102,57 @@ bool cl_arq_controller::gearshift_v2_finish_break_at_floor()
 	return true;
 }
 
+void cl_arq_controller::commander_handle_connected_disconnect()
+{
+	// Graceful disconnect (VARA-compatible): wait for TX FIFO to drain before
+	// closing the link. Winlink sends FQ data then DISCONNECT; deliver FQ first.
+	int fifo_pending = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	if(role_demand_switch_owns_precedence())
+	{
+		// A validated demand is older causal authority than this request. Complete
+		// the already-earned transfer; the promoted peer becomes sole commander.
+		static int demand_disconnect_wait_prints = 0;
+		if(demand_disconnect_wait_prints++ % 50 == 0)
+		{
+			printf("[DISCONNECT] acknowledged reverse demand owns precedence; completing SWITCH_ROLE\n");
+			fflush(stdout);
+		}
+	}
+	else if(fifo_pending > 0 || block_under_tx == YES)
+	{
+		static int disconnect_wait_prints = 0;
+		if(disconnect_wait_prints++ % 50 == 0)
+		{
+			printf("[DISCONNECT] Waiting for TX drain: FIFO=%d bytes, block_under_tx=%d\n",
+				fifo_pending, block_under_tx);
+			fflush(stdout);
+		}
+	}
+	else if(!role_demand_control_slot_safe())
+	{
+		// Never overwrite a sent or ACK-pending control record. The request stays
+		// latched and is retried after the one-deep mailbox becomes FREE.
+		printf("[DISCONNECT] control mailbox busy status=%d code=%u; CLOSE deferred\n",
+			messages_control.status,
+			messages_control.data != NULL
+				? (unsigned)(unsigned char)messages_control.data[0] : 0u);
+		fflush(stdout);
+	}
+	else
+	{
+		printf("[DISCONNECT] TX drained, sending CLOSE_CONNECTION\n");
+		fflush(stdout);
+		disconnect_requested=NO;
+		this->link_status=DISCONNECTING;
+		// Terminal-settlement convergence: arm the bounded settle deadline. The
+		// retry train composes here and owns lost/duplicate CLOSE behavior.
+		disconnecting_settle_timer.stop();
+		disconnecting_settle_timer.reset();
+		disconnecting_settle_timer.start();
+		add_message_control(CLOSE_CONNECTION);
+	}
+}
+
 void cl_arq_controller::process_messages_commander()
 {
 	// ACTIVE-v2 single-owner purge: turboshift is a legacy Axis-1 controller, not
@@ -3525,38 +3587,7 @@ void cl_arq_controller::process_messages_commander()
 	{
 		if(this->link_status==CONNECTED)
 		{
-			// Graceful disconnect (VARA-compatible): wait for TX FIFO to drain
-			// before closing the link. Winlink sends FQ data then DISCONNECT;
-			// we must deliver the FQ before tearing down the ARQ session.
-			int fifo_pending = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
-			if(fifo_pending > 0 || block_under_tx == YES)
-			{
-				// Data still pending — let normal data exchange drain it.
-				// disconnect_requested stays YES, re-checked next cycle.
-				static int disconnect_wait_prints = 0;
-				if(disconnect_wait_prints++ % 50 == 0)
-				{
-					printf("[DISCONNECT] Waiting for TX drain: FIFO=%d bytes, block_under_tx=%d\n",
-						fifo_pending, block_under_tx);
-					fflush(stdout);
-				}
-			}
-			else
-			{
-				printf("[DISCONNECT] TX drained, sending CLOSE_CONNECTION\n");
-				fflush(stdout);
-				disconnect_requested=NO;
-				this->link_status=DISCONNECTING;
-			// Terminal-settlement convergence (data-flow-stream-offset.md 8.6): arm the bounded
-			// settle deadline. TX FIFO is drained and every DATA batch is ACKed, but EOT is carried
-			// by the CLOSE frame itself and is not proven until its reverse ACK arrives. Fast terminal
-			// ARQ retries that frame first; this timer remains the final peer-gone/incomplete backstop.
-			disconnecting_settle_timer.stop();
-			disconnecting_settle_timer.reset();
-			disconnecting_settle_timer.start();
-				messages_control.status=FREE;
-				add_message_control(CLOSE_CONNECTION);
-			}
+			commander_handle_connected_disconnect();
 		}
 		else
 		{
@@ -4916,6 +4947,35 @@ int cl_arq_controller::cmd_rebase_newdata_slots()
 	return moved;
 }
 
+void cl_arq_controller::commander_poll_late_role_demand()
+{
+	if(role != COMMANDER || link_status != CONNECTED
+	   || connection_status != TRANSMITTING_DATA
+	   || reverse_data_demand_acknowledged
+	   || block_under_tx == YES || get_nOccupied_messages() != 0
+	   || retransmit_count != 0 || messages_control.status != FREE
+	   || fifo_buffer_tx.get_size() != fifo_buffer_tx.get_free_size()
+	   || messages_rx_buffer.status == RECEIVED)
+		return;
+	if(telecom_system->data_container.frames_to_read > 0)
+		return;
+
+	this->receive();
+	if(messages_rx_buffer.status == RECEIVED
+	   && messages_rx_buffer.type == SACK_RSP)
+	{
+		int span = data_batch_size;
+		if(span < 1) span = 1;
+		if(span > MAX_SACK_BATCH_SIZE) span = MAX_SACK_BATCH_SIZE;
+		bool bitmap[MAX_SACK_BATCH_SIZE] = {};
+		unsigned char bsi = 0;
+		bool demand = false;
+		if(decode_sack_v2_frame(bitmap, span, &bsi, &demand) && demand)
+			role_demand_note_acknowledged(true, "late-full-sack");
+		messages_rx_buffer.status = FREE;
+	}
+}
+
 void cl_arq_controller::process_messages_tx_data()
 {
 	// Phase D timing — entry to the batch builder. The gap between
@@ -4925,6 +4985,7 @@ void cl_arq_controller::process_messages_tx_data()
 	// batch-prep work (retx prefix, compression of new-data frames,
 	// pad to size, etc.).
 	mtl::log_event("cmd_tx_data_entry");
+	commander_poll_late_role_demand();
 
 	// STAGE 4d (D4 ESCALATION): before building the next batch, check whether an armed
 	// CLIMB re-tag has exhausted its R floor with NO returning SACK confirm. The previous
@@ -7440,7 +7501,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			// the RSP has time to send its response. Step 15: the legacy
 			// receive_sack_pattern() correlator is gone — SACK detection is
 			// now exclusively the OFDM SACK_RSP decode in the v2 branch below.
-			bool sack_window_open = (sack_enabled || l1_blockack_data_active())
+			bool sack_window_open = (sack_enabled || l1_blockack_data_active()
+				|| link_status == CONNECTED)
 				&& data_ack_received == NO
 				&& receiving_timer.get_elapsed_time_ms() > (unsigned int)(ack_pattern_time_ms);
 
@@ -7464,7 +7526,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 			{
 				memset(sack_bitmap, 0, sizeof(sack_bitmap));
 				if(l1_blockack_data_active()
-				   || (sack_v2_enabled && axis3_sack_mode != SACK_MODE_OFF))
+				   || (sack_v2_enabled && axis3_sack_mode != SACK_MODE_OFF)
+				   || !sack_v2_enabled)
 				{
 					// Step 6 of MFSK-suffix ACK+SACK redesign — CMD-side MFSK probe.
 					// Before the OFDM dispatch below, sniff the passband tail for an
@@ -7629,6 +7692,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 							}
 						}
 						const bool ack_frame_seen = decoded;
+						const uint8_t wire_bsi = rx_bsi;
 
 						// CRC12 verification (mercury/fact-documents/mfsk-robust-ack.md §3.2).
 						// On mismatch, treat as no-ACK — the timeout-retransmit path
@@ -7640,10 +7704,11 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						bool bitmap_all = false;
 						bool target_is_shadow = false;
 						bool target_owned = false;
+						bool reverse_demand = false;
 						if(decoded)
 						{
 							char crc_input[5];
-							crc_input[0] = (char)rx_bsi;
+							crc_input[0] = (char)wire_bsi;
 							crc_input[1] = (char)((rx_bitmap >> 24) & 0xFF);
 							crc_input[2] = (char)((rx_bitmap >> 16) & 0xFF);
 							crc_input[3] = (char)((rx_bitmap >>  8) & 0xFF);
@@ -7660,6 +7725,8 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								fflush(stdout);
 								decoded = false;
 							}
+							else
+								rx_bsi = role_demand_restore_ack_bsi(wire_bsi, &reverse_demand);
 						}
 						if(decoded)
 						{
@@ -7700,6 +7767,9 @@ void cl_arq_controller::process_messages_rx_acks_data()
 									target_is_shadow ? "shadow" : "live/journal");
 								fflush(stdout);
 							}
+							if(decoded && target_owned)
+								role_demand_note_acknowledged(reverse_demand,
+									"mfsk-ack-sack");
 						}
 
 						// RETIRED §6 base-pattern climb-confirm (data-flow-inband-basepattern-
@@ -8076,8 +8146,10 @@ void cl_arq_controller::process_messages_rx_acks_data()
 					{
 						// Partial-batch SACK_RSP path — decode the bitmap.
 						unsigned char rx_bsi = 0;
+						bool reverse_demand = false;
 						bool decoded = decode_sack_v2_frame(
-							sack_bitmap, data_batch_size, &rx_bsi);
+							sack_bitmap, data_batch_size, &rx_bsi,
+							&reverse_demand);
 						int guard_ref_bsi = partial_guard_reference_bsi();
 						bool bitmap_any = false;
 						bool bitmap_clean = data_batch_size > 0;
@@ -8089,7 +8161,7 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						st_resolved_generation_ack resolved = {};
 						bool target_owned = decoded && resolve_and_validate_generation_ack(
 							rx_bsi, data_batch_size, /*integrity_ok=*/true,
-							/*clean=*/false,
+							/*clean=*/bitmap_clean,
 							bitmap_any, bitmap_clean, &resolved);
 						const int resolved_target = resolved.target;
 						const bool target_is_shadow = resolved.shadow_owned;
@@ -8108,12 +8180,25 @@ void cl_arq_controller::process_messages_rx_acks_data()
 						if(decoded && std::getenv("MERCURY_GEN_CANON_WITNESS"))
 						{
 							printf("[GEN-CANON-RESOLVE] transport=OFDM wire=%u target=%u "
-							       "canon=%d cumulative=%d clean=0 span=%d owner=%s\n",
+							       "canon=%d cumulative=%d clean=%d span=%d owner=%s\n",
 								(unsigned)rx_bsi, (unsigned)resolved_target,
 								generation_canon_enabled() ? 1 : 0,
-								cumulative_ack_enabled ? 1 : 0, data_batch_size,
+								cumulative_ack_enabled ? 1 : 0, bitmap_clean ? 1 : 0,
+								data_batch_size,
 								target_is_shadow ? "shadow" : "live/journal");
 							fflush(stdout);
+						}
+						if(decoded && target_owned)
+							role_demand_note_acknowledged(reverse_demand, "full-sack");
+						if(decoded && target_owned && bitmap_clean)
+						{
+							cmd_rxwindow_note_delivered((int)rx_bsi, /*clean=*/true);
+							v2_ack_pat_pre_detected = true;
+							cmd_last_applied_clean_bsi = resolved_target;
+							printf("[CMD-SACK-V2] CLEAN demand record batch_seq_id=%u demand=%d\n",
+								(unsigned)resolved_target, reverse_demand ? 1 : 0);
+							fflush(stdout);
+							decoded = false; // clean funnel owns settlement; never enter partial apply
 						}
 						// R2c — RECOVERABLE PREV-BATCH re-SACK (data-flow-recoverable-gap-abort.md
 						// §5). If the decoded SACK's bsi is NOT the in-flight batch (the case the
@@ -11156,7 +11241,9 @@ void cl_arq_controller::finish_turbo_direction()
 	// path as --skip-turbo-reverse so the climbed config SETTLES and the KX handshake owns the
 	// role swaps; the forward stream still DROVE the climb off robust (that win is preserved).
 	// Env off / post-activation -> kx_stream_epoch() false -> byte-identical.
-	if(turboshift_phase == TURBO_FORWARD && (skip_turbo_reverse || kx_stream_epoch()))
+	if(turboshift_phase == TURBO_FORWARD
+	   && (skip_turbo_reverse || kx_stream_epoch()
+	       || !reverse_data_demand_acknowledged))
 	{
 		// Forward direction probed. Skip REVERSE probe (--skip-turbo-reverse).
 		// Reverse path only needs MFSK ACKs on asymmetric channels.
@@ -11263,6 +11350,8 @@ void cl_arq_controller::finish_turbo_direction()
 	else if(turboshift_phase == TURBO_FORWARD)
 	{
 		// Forward direction probed. Advance to REVERSE (other side will probe).
+		// Reaching this branch proves a reverse demand was already acknowledged;
+		// the no-demand case settled through the skip-reverse branch above.
 		turboshift_phase = TURBO_REVERSE;
 		printf("[TURBO] FORWARD complete: ceiling=%d, switching roles for REVERSE\n",
 			turboshift_last_good);
@@ -11273,6 +11362,17 @@ void cl_arq_controller::finish_turbo_direction()
 	}
 	else if(turboshift_phase == TURBO_REVERSE)
 	{
+		if(!reverse_data_demand_acknowledged)
+		{
+			// The reverse sender retains terminal authority unless its receiver has
+			// independently advertised queued data.  A completed probe alone is not
+			// permission for a speculative handback.
+			printf("[ROLE-DEMAND] turbo reverse complete with no demand; retaining commander authority\n");
+			fflush(stdout);
+			turboshift_phase = TURBO_DONE;
+			connection_status = TRANSMITTING_DATA;
+			return;
+		}
 		// Reverse direction probed. Switch back to original roles.
 		printf("[TURBO] REVERSE complete: ceiling=%d, switching back\n",
 			turboshift_last_good);
@@ -11396,6 +11496,10 @@ void cl_arq_controller::process_control_commander()
 			// fresh connection, and a stale break_noprogress_cycles would mis-count.
 			session_data_frame_sent = false;
 			session_data_frame_received = false;
+			reverse_data_demand_acknowledged = false;
+			reverse_data_demand_last_advertised = false;
+			role_demand_refresh_timer.stop();
+			role_demand_refresh_timer.reset();
 			break_noprogress_cycles = 0;
 			// CONNECT does not call reset_session_state(): clear all per-session
 			// topgear evidence here as well, so a prior peer/channel cannot leave
@@ -12307,6 +12411,12 @@ void cl_arq_controller::process_control_commander()
 			else if (messages_control.data[0]==SWITCH_ROLE)
 			{
 				turbo_switch_role_retries = 0;  // Reset on success
+				if(disconnect_requested==YES)
+				{
+					printf("[DISCONNECT] role transfer acknowledged; terminal authority ceded to new commander\n");
+					fflush(stdout);
+					disconnect_requested=NO;
+				}
 				// Asymmetric gearshift: swap forward/reverse for the return path.
 				// KX-as-data: SKIP the swap in the pre-activation epoch — the reverse ct rides
 				// the CURRENT settled config on BOTH peers (the RSP transmits it there too,
@@ -24368,19 +24478,15 @@ int cl_arq_controller::test_backup_confirm_flush()
 }
 
 // ===========================================================================
-// Idle SWITCH_ROLE race regression — FAILS-BEFORE evidence for the
-// connected-but-0-deliver bench bug.
+// Demand-driven SWITCH_ROLE and terminal-race regression.
 //
-// THE BUG (channel-free, pure ARQ state): in process_buffer_data_commander()'s
-// idle branch (arq_commander.cc:15238-15251), when role==COMMANDER &&
-// link_status==CONNECTED && connection_status==TRANSMITTING_DATA, with an EMPTY
-// tx FIFO (block_under_tx==NO, no occupied messages, no pending control), the
-// Commander arms switch_role_timer; once it exceeds switch_role_timeout (1000ms
-// on WB, ~200ms robust), it queues a SWITCH_ROLE control frame. So if the
-// application withholds its FIRST data write past switch_role_timeout (the bench
-// opens an 8s gap via --no-warmup --settle 8), the freshly-connected Commander
-// hands its role to a peer with an empty tx FIFO -> that peer sends SET_CONFIG,
-// gets no data reply, BREAKs -> BREAK/CONFIG_0 churn that never delivers.
+// The pre-contract trigger was speculative: once any data had been sent, an
+// empty commander armed a timer and emitted SWITCH_ROLE without evidence that
+// its receiver had reverse bytes. At cfg103 the 5.56 s control frame makes the
+// terminal overlap especially wide: DISCONNECT may arrive while code 57 is on
+// air, then the historical force-clear overwrote its PENDING_ACK mailbox with
+// CLOSE. The receiver had accepted 57 and could no longer receive CLOSE as a
+// responder.
 //
 // This test drives the REAL idle branch in-process, no PHY/audio/TCP. We prime
 // a CONNECTED+TRANSMITTING_DATA Commander with an EMPTY tx FIFO and pin
@@ -24388,11 +24494,10 @@ int cl_arq_controller::test_backup_confirm_flush()
 // threshold deterministically (the production threshold is wall-time; the
 // failing condition is "timer armed at connect, no data write before timeout").
 //
-// THE load-bearing assertion: after two idle-branch invocations on a freshly
-// connected empty-tx Commander, messages_control carries SWITCH_ROLE — i.e. the
-// Commander gives away its role with ZERO bytes pending. FAIL-BEFORE on monitor
-// (this is the bug). A fix that withholds SWITCH_ROLE until the first data write
-// (or a grace window) would make it PASS. One-shot, exits rc.
+// The post-contract assertions are: neither a never-fed nor a previously-fed
+// commander may arm without a validated D=1 reverse ACK; a CRC-valid full SACK
+// demand does arm and emit 57 through the retained timer machinery; no-demand
+// DISCONNECT emits CLOSE; and a busy control mailbox is never overwritten.
 int cl_arq_controller::test_idle_switch_role_race()
 {
 	int failed = 0;
@@ -24426,6 +24531,7 @@ int cl_arq_controller::test_idle_switch_role_race()
 	// while this is false -> B1 passes (no spurious handoff). B2 below flips it
 	// true to prove the legitimate end-of-data handoff still fires.
 	session_data_frame_sent  = false;
+	reverse_data_demand_acknowledged = false;
 
 	// dimensions so init_messages_buffers + get_nOccupied_messages are sane
 	max_data_length   = 6;
@@ -24445,6 +24551,15 @@ int cl_arq_controller::test_idle_switch_role_race()
 	// the else-if chain and reaches the idle SWITCH_ROLE branch.
 	int fifo_occupied = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
 	check(fifo_occupied == 0, "S1 tx FIFO is EMPTY (no data written yet)", fifo_occupied, 0);
+	role = RESPONDER;
+	turboshift_active = true;
+	turboshift_phase = TURBO_FORWARD;
+	check(!local_reverse_data_demand(),
+		"S1b turboshift probe state is NOT reverse-data demand",
+		local_reverse_data_demand() ? 1 : 0, 0);
+	turboshift_active = false;
+	turboshift_phase = TURBO_DONE;
+	role = COMMANDER;
 
 	// messages_control must start FREE (15238 condition) — fresh after alloc.
 	messages_control.status = FREE;
@@ -24498,50 +24613,108 @@ int cl_arq_controller::test_idle_switch_role_race()
 		switch_role_fired ? 1 : 0);
 	fflush(stdout);
 
-	// === DIAGNOSIS EVIDENCE (the bug — logs whether the race reproduced) ===
-	// On the PRE-FIX tree (bug present), an empty-tx freshly-connected Commander
-	// queues SWITCH_ROLE (code 57); POST-FIX the trigger-gate suppresses it. This
-	// is INFORMATIONAL only (no counted assertion) so the test is green post-fix;
-	// the regression invariant is B1 below.
-	printf("[TEST-IDLESR] B0 EVIDENCE: race reproduced=%d (1=pre-fix bug, 0=post-fix suppressed)\n",
+	// This never-fed guard predates the demand contract.  It is retained as a
+	// negative control; the contract's actual fd6 fail-before is B2 below, where
+	// prior forward data alone armed and emitted code 57.
+	printf("[TEST-IDLESR] B0 EVIDENCE: never-fed speculative switch=%d (must remain 0)\n",
 		switch_role_fired ? 1 : 0);
 	fflush(stdout);
 
-	// === THE regression gate (the correct invariant — FAILS-BEFORE/PASS-AFTER) ===
+	// === Existing never-fed negative control ===
 	// A freshly-CONNECTED Commander that has not yet sent its first data frame
-	// must NOT hand its role away. The trigger-gate (session_data_frame_sent)
-	// withholds SWITCH_ROLE until the app has written at least once. This assertion
-	// FAILS on monitor (switch_role_fired==true) and PASSES once the empty-tx-no
-	// -data race is closed.
+	// must not hand its role away.
 	check(!switch_role_fired,
-		"B1 REGRESSION GATE: empty-tx never-fed Commander must NOT give away its role "
-		"(FAILS-BEFORE on monitor; PASSES-AFTER the fix)",
+		"B1 NEGATIVE CONTROL: empty-tx never-fed Commander does not give away its role",
 		switch_role_fired ? 1 : 0, 0);
 
-	// === B2: the LEGITIMATE end-of-data handoff must STILL fire ===
-	// Same primed idle Commander, but now session_data_frame_sent=true (a batch
-	// WAS sent and the FIFO drained to empty — the "done, hand off" state §2). The
-	// trigger-gate must be transparent here: arm on call1, fire SWITCH_ROLE on
-	// call2. Guards against an over-broad gate that would break the real handoff.
+	// === B2: prior forward data is not reverse demand ===
+	// This is the load-bearing fail-before/pass-after assertion.  fd6 armed and
+	// emitted SWITCH_ROLE here solely because session_data_frame_sent was true.
 	messages_control.status = FREE;            // clear the (possibly-set) control slot
-	session_data_frame_sent = true;            // a batch was sent this session
+	session_data_frame_sent = true;
+	reverse_data_demand_acknowledged = false;
 	switch_role_timer.stop();
 	switch_role_timer.reset();
 	switch_role_timeout = 0;
-	process_buffer_data_commander();           // call1: ARMs the timer
-	int b2_armed = switch_role_timer.counting; // expect YES
+	process_buffer_data_commander();
+	int b2_armed = switch_role_timer.counting;
 	usleep(5000);
-	process_buffer_data_commander();           // call2: elapsed>0 -> SWITCH_ROLE
+	process_buffer_data_commander();
 	int b2_code  = (messages_control.status != FREE && messages_control.data != NULL)
 	               ? (int)(unsigned char)messages_control.data[0] : -1;
 	bool b2_fired = (b2_code == (int)SWITCH_ROLE);
-	printf("[TEST-IDLESR] B2 end-of-data handoff: armed=%d fired=%d (code=%d SWITCH_ROLE=%d)\n",
+	printf("[TEST-IDLESR] B2 no-demand after-data: armed=%d fired=%d (code=%d SWITCH_ROLE=%d)\n",
 		b2_armed, b2_fired ? 1 : 0, b2_code, (int)SWITCH_ROLE);
 	fflush(stdout);
-	check(b2_fired,
-		"B2 LEGIT HANDOFF: after data WAS sent, idle Commander STILL hands off "
-		"(end-of-data SWITCH_ROLE preserved)",
-		b2_fired ? 1 : 0, 1);
+	check(b2_armed == NO && !b2_fired,
+		"B2 CONTRACT: prior forward data alone cannot arm or emit SWITCH_ROLE "
+		"(FAILS-BEFORE on fd6)",
+		(b2_armed == NO && !b2_fired) ? 1 : 0, 1);
+
+	// === B3: integrity-valid full-SACK D=1 authorizes retained handoff ===
+	// Stage the exact full-SACK wire layout and drive the production decoder.
+	const int demand_span = 1;
+	char demand_payload[4];
+	demand_payload[0] = (char)(unsigned char)cmd_batch_seq_id;
+	demand_payload[1] = (char)ROLE_DEMAND_SACK_FLAG;
+	demand_payload[2] = 0x01;
+	demand_payload[3] = (char)CRC8_calc(demand_payload, 3);
+	for(int i=0; i<4; i++) messages_rx_buffer.data[i] = demand_payload[i];
+	messages_rx_buffer.type = SACK_RSP;
+	messages_rx_buffer.status = RECEIVED;
+	messages_rx_buffer.length = 4;
+	bool demand_bitmap[MAX_SACK_BATCH_SIZE] = {};
+	unsigned char demand_bsi = 0;
+	bool demand_bit = false;
+	bool demand_decoded = decode_sack_v2_frame(
+		demand_bitmap, demand_span, &demand_bsi, &demand_bit);
+	role_demand_note_acknowledged(demand_decoded && demand_bit, "test-full-sack");
+	messages_rx_buffer.status = FREE;
+	check(demand_decoded && demand_bit && reverse_data_demand_acknowledged,
+		"B3 DEMAND ACK: CRC-valid full SACK D=1 latches authority",
+		(demand_decoded && demand_bit && reverse_data_demand_acknowledged) ? 1 : 0, 1);
+
+	messages_control.status = FREE;
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+	process_buffer_data_commander();
+	int b3_armed = switch_role_timer.counting;
+	usleep(5000);
+	process_buffer_data_commander();
+	int b3_code = (messages_control.status != FREE && messages_control.data != NULL)
+		? (int)(unsigned char)messages_control.data[0] : -1;
+	check(b3_armed == YES && b3_code == (int)SWITCH_ROLE,
+		"B3 SWITCH: acknowledged demand arms timer and emits SWITCH_ROLE",
+		(b3_armed == YES && b3_code == (int)SWITCH_ROLE) ? 1 : 0, 1);
+
+	// === B4: no-demand DISCONNECT deterministically queues CLOSE ===
+	messages_control.status = FREE;
+	reverse_data_demand_acknowledged = false;
+	disconnect_requested = YES;
+	link_status = CONNECTED;
+	connection_status = TRANSMITTING_DATA;
+	commander_handle_connected_disconnect();
+	int b4_code = (messages_control.status != FREE && messages_control.data != NULL)
+		? (int)(unsigned char)messages_control.data[0] : -1;
+	check(b4_code == (int)CLOSE_CONNECTION && link_status == DISCONNECTING,
+		"B4 TERMINAL: no-demand DISCONNECT queues CLOSE, never SWITCH_ROLE",
+		(b4_code == (int)CLOSE_CONNECTION && link_status == DISCONNECTING) ? 1 : 0, 1);
+
+	// === B5: PENDING_ACK mailbox ownership is structural ===
+	link_status = CONNECTED;
+	connection_status = TRANSMITTING_CONTROL;
+	disconnect_requested = YES;
+	messages_control.status = PENDING_ACK;
+	messages_control.data[0] = SET_CONFIG;
+	commander_handle_connected_disconnect();
+	bool b5_preserved = messages_control.status == PENDING_ACK
+		&& (unsigned char)messages_control.data[0] == (unsigned char)SET_CONFIG
+		&& disconnect_requested == YES;
+	check(b5_preserved,
+		"B5 MAILBOX: DISCONNECT cannot overwrite a sent/PENDING_ACK control",
+		b5_preserved ? 1 : 0, 1);
+	disconnect_requested = NO;
+	messages_control.status = FREE;
 
 	// === C: an empty SWITCH_ROLE/FILE_END flush is not a batch delivery ===
 	// The control handlers set decrypt_delivered_bsi to the next expected bsi and
@@ -24596,6 +24769,170 @@ int cl_arq_controller::test_idle_switch_role_race()
 	check(rx_stream_emitted_bsi_hw == 1 && !rx_stream_stamp[1].valid,
 		"C5 NEXT BSI: delivery commits high-water and consumes stamp",
 		rx_stream_emitted_bsi_hw, 1);
+
+	// === D: queued reverse data completes the demanded handoff end to end ===
+	// Use a second controller as the receiver/new commander.  The test deliberately
+	// crosses the compact ACK's 0x80 epoch so D:1|BSI:7 is proved independently of
+	// the full-SACK D=1 decoder exercised by B3.
+	cl_arq_controller* reverse_peer = new cl_arq_controller();
+	reverse_peer->max_data_length   = 16;
+	reverse_peer->max_header_length = 6;
+	reverse_peer->nMessages         = 32;
+	reverse_peer->set_data_batch_size(1);
+	int reverse_alloc_rc = reverse_peer->init_messages_buffers();
+	check(reverse_alloc_rc == SUCCESSFUL,
+		"D0 reverse peer message buffers allocated", reverse_alloc_rc, SUCCESSFUL);
+	reverse_peer->fifo_buffer_tx.set_size(
+		reverse_peer->default_configuration_ARQ.fifo_buffer_tx_size);
+	reverse_peer->fifo_buffer_rx.set_size(
+		reverse_peer->default_configuration_ARQ.fifo_buffer_rx_size);
+
+	const char reverse_payload[] = {'R','E','V','E','R','S','E'};
+	reverse_peer->set_role(RESPONDER);
+	reverse_peer->original_role = RESPONDER;
+	reverse_peer->link_status = CONNECTED;
+	int reverse_pushed = reverse_peer->fifo_buffer_tx.push(
+		(char*)reverse_payload, (int)sizeof(reverse_payload));
+	check(reverse_pushed == (int)sizeof(reverse_payload)
+	      && reverse_peer->local_reverse_data_demand(),
+		"D1 queued reverse bytes create receiver demand",
+		reverse_pushed, (int)sizeof(reverse_payload));
+
+	set_role(COMMANDER);
+	original_role = COMMANDER;
+	link_status = CONNECTED;
+	connection_status = TRANSMITTING_DATA;
+	cmd_batch_seq_id = 0xc8;
+	reverse_data_demand_acknowledged = false;
+	unsigned char compact_wire_bsi = reverse_peer->role_demand_pack_ack_bsi(0xc8);
+	bool compact_demand = false;
+	unsigned char compact_restored = role_demand_restore_ack_bsi(
+		compact_wire_bsi, &compact_demand);
+	role_demand_note_acknowledged(compact_demand, "test-compact-ack");
+	check(compact_demand && compact_restored == 0xc8
+	      && reverse_data_demand_acknowledged,
+		"D2 compact ACK D=1 survives BSI epoch restore and latches",
+		(compact_demand && compact_restored == 0xc8
+		 && reverse_data_demand_acknowledged) ? 1 : 0, 1);
+
+	messages_control.status = FREE;
+	block_under_tx = NO;
+	retransmit_count = 0;
+	message_batch_counter_tx = 0;
+	switch_role_timeout = 0;
+	switch_role_timer.stop();
+	switch_role_timer.reset();
+	process_buffer_data_commander();
+	usleep(5000);
+	process_buffer_data_commander();
+	int d_switch_code = (messages_control.status != FREE && messages_control.data != NULL)
+		? (int)(unsigned char)messages_control.data[0] : -1;
+	check(d_switch_code == (int)SWITCH_ROLE,
+		"D3 acknowledged compact demand emits retained SWITCH_ROLE",
+		d_switch_code, (int)SWITCH_ROLE);
+
+	// Model the already-validated SWITCH_ROLE ACK boundary with the same role
+	// acquisition primitives used by both production ACK handlers.  There is no
+	// interval after this boundary in which both endpoints are commander.
+	set_role(RESPONDER);
+	reverse_peer->set_role(COMMANDER);
+	connection_status = RECEIVING;
+	reverse_peer->connection_status = TRANSMITTING_DATA;
+	bool exactly_one_commander = (role == COMMANDER)
+		!= (reverse_peer->role == COMMANDER);
+	check(exactly_one_commander && role == RESPONDER
+	      && reverse_peer->role == COMMANDER,
+		"D4 SWITCH_ROLE ACK boundary leaves exactly one commander",
+		(exactly_one_commander && reverse_peer->role == COMMANDER) ? 1 : 0, 1);
+
+	// Carve the queued reverse bytes at the new commander and deliver them through
+	// the old commander's real receiver funnel.  That funnel owns the EOT byte/CRC
+	// accounting used by the production CLOSE verifier.
+	char reverse_tx[sizeof(reverse_payload)] = {};
+	int reverse_tx_n = reverse_peer->fifo_buffer_tx.pop(
+		reverse_tx, (int)sizeof(reverse_tx));
+	reverse_peer->tx_stream_committed = (uint64_t)reverse_tx_n;
+	reverse_peer->tx_stream_crc = crc32_update(
+		CRC32_INIT, reverse_tx, reverse_tx_n);
+
+	for(int i=0; i<nMessages; i++) {
+		messages_rx[i].status = FREE;
+		messages_rx[i].length = 0;
+		messages_rx[i].batch_seq_id = -1;
+	}
+	fifo_buffer_rx.flush();
+	set_data_batch_size(1);
+	rx_stream_delivered = 0;
+	rx_stream_crc = CRC32_INIT;
+	rx_stream_emitted_bsi_hw = -1;
+	rsp_cross_session_seam_armed = false;
+	rsp_rebase_seam_armed = false;
+	for(int s=0; s<256; s++) rx_stream_stamp[s].valid = false;
+	memcpy(messages_rx[0].data, reverse_tx, (size_t)reverse_tx_n);
+	messages_rx[0].length = reverse_tx_n;
+	messages_rx[0].status = ACKED;
+	messages_rx[0].batch_seq_id = 2;
+	decrypt_delivered_bsi = 2;
+	rx_stream_stamp[2].start = 0;
+	rx_stream_stamp[2].length = (uint32_t)reverse_tx_n;
+	rx_stream_stamp[2].crc = reverse_peer->tx_stream_crc;
+	rx_stream_stamp[2].valid = true;
+	copy_data_to_buffer();
+	char reverse_rx[sizeof(reverse_payload)] = {};
+	int reverse_rx_n = fifo_buffer_rx.pop(reverse_rx, (int)sizeof(reverse_rx));
+	bool reverse_flow_ok = reverse_tx_n == (int)sizeof(reverse_payload)
+		&& reverse_rx_n == reverse_tx_n
+		&& memcmp(reverse_rx, reverse_payload, sizeof(reverse_payload)) == 0
+		&& rx_stream_delivered == reverse_peer->tx_stream_committed
+		&& rx_stream_crc == reverse_peer->tx_stream_crc;
+	check(reverse_flow_ok,
+		"D5 new commander reverse data flows byte-exact with matching EOT state",
+		reverse_flow_ok ? 1 : 0, 1);
+
+	// A subsequent application DISCONNECT belongs to the NEW commander.  With no
+	// new acknowledged demand it must queue CLOSE; parse its wire EOT and run the
+	// production receiver predicate against the bytes just delivered.
+	reverse_peer->messages_control.status = FREE;
+	reverse_peer->reverse_data_demand_acknowledged = false;
+	reverse_peer->disconnect_requested = YES;
+	reverse_peer->link_status = CONNECTED;
+	reverse_peer->connection_status = TRANSMITTING_DATA;
+	reverse_peer->block_under_tx = NO;
+	reverse_peer->commander_handle_connected_disconnect();
+	bool close_queued = reverse_peer->messages_control.status != FREE
+		&& reverse_peer->messages_control.data != NULL
+		&& (unsigned char)reverse_peer->messages_control.data[0] == CLOSE_CONNECTION
+		&& reverse_peer->messages_control.length == W_EOT_FRAME_LENGTH;
+	uint64_t peer_committed = 0;
+	uint32_t peer_crc = 0;
+	bool eot_present = false;
+	if(close_queued) {
+		for(int i=0; i<8; i++)
+			peer_committed |= ((uint64_t)(unsigned char)
+				reverse_peer->messages_control.data[1+i]) << (8*i);
+		for(int i=0; i<4; i++)
+			peer_crc |= ((uint32_t)(unsigned char)
+				reverse_peer->messages_control.data[9+i]) << (8*i);
+		unsigned char eot_crc8 = (unsigned char)CRC8_calc(
+			(char*)&reverse_peer->messages_control.data[1],
+			W_EOT_PAYLOAD_BYTES - 1);
+		eot_present = (unsigned char)reverse_peer->messages_control.data[
+			W_EOT_PAYLOAD_BYTES] == eot_crc8;
+	}
+	bool eot_verified = close_queued && eot_present
+		&& !w_eot_mismatch(peer_committed, peer_crc);
+	check(eot_verified,
+		"D6 new commander DISCONNECT queues CLOSE and old commander verifies EOT",
+		eot_verified ? 1 : 0, 1);
+	printf("[TEST-IDLESR] D6 EOT: present=%d verified=%d committed=%llu delivered=%llu "
+	       "tx_crc=0x%08x rx_crc=0x%08x\n",
+		eot_present ? 1 : 0, eot_verified ? 1 : 0,
+		(unsigned long long)peer_committed,
+		(unsigned long long)rx_stream_delivered, peer_crc, rx_stream_crc);
+	fflush(stdout);
+
+	reverse_peer->deinit_messages_buffers();
+	delete reverse_peer;
 
 	deinit_messages_buffers();
 
@@ -24702,12 +25039,12 @@ int cl_arq_controller::test_switch_role_reride_race()
 		"(FAILS-BEFORE; PASSES-AFTER the swap-in reset)",
 		reride_fired ? 1 : 0, 0);
 
-	// === POSITIVE CONTROL: once the re-acquired Commander actually SENDS its
-	//     reverse stream (sdfs set true, as the batch build does at
-	//     arq_commander.cc:2627), the LEGITIMATE end-of-data handback (the SECOND
-	//     SWITCH_ROLE in R1) STILL fires. Guards against over-suppression. ===
+	// === POSITIVE CONTROL: a fresh acknowledged demand from the other receiver
+	//     authorizes the second SWITCH_ROLE. Prior transmitted data remains
+	//     irrelevant under the demand-driven contract. ===
 	messages_control.status = FREE;
-	session_data_frame_sent = true;                  // reverse stream WAS sent
+	session_data_frame_sent = true;
+	reverse_data_demand_acknowledged = true;
 	switch_role_timer.stop();
 	switch_role_timer.reset();
 	switch_role_timeout = 0;
@@ -24721,8 +25058,8 @@ int cl_arq_controller::test_switch_role_reride_race()
 		hb_code, handback_fired ? 1 : 0, (int)SWITCH_ROLE);
 	fflush(stdout);
 	check(handback_fired,
-		"R1 HANDBACK: after the reverse stream WAS sent, the Commander STILL hands "
-		"back (second SWITCH_ROLE preserved)",
+		"R1 HANDBACK: a fresh acknowledged receiver demand authorizes the second "
+		"SWITCH_ROLE",
 		handback_fired ? 1 : 0, 1);
 
 	deinit_messages_buffers();
@@ -29759,14 +30096,16 @@ void cl_arq_controller::process_buffer_data_commander()
 			if(encryption_enabled && !cipher_suite.is_active() && kx_as_data_path())
 			{
 				int ph = cipher_suite.get_kx_phase();
-				if(ph == KX_MLKEM_PK_SENT && !kx_role_swap_sent)
+				if(ph == KX_MLKEM_PK_SENT && !kx_role_swap_sent
+				   && reverse_data_demand_acknowledged)
 				{
 					kx_role_swap_sent = true;
 					printf("[CRYPTO] KX-as-data: forward pk delivered -> SWITCH_ROLE (RSP streams reverse ct)\n");
 					fflush(stdout);
 					add_message_control(SWITCH_ROLE);
 				}
-				else if(ph == KX_HYBRID_DONE && !kx_reverse_consumed && !kx_role_swap_sent)
+				else if(ph == KX_HYBRID_DONE && !kx_reverse_consumed && !kx_role_swap_sent
+				   && reverse_data_demand_acknowledged)
 				{
 					kx_role_swap_sent = true;
 					printf("[CRYPTO] KX-as-data: reverse ct delivered -> SWITCH_ROLE (hand role back to CMD)\n");
@@ -29783,20 +30122,15 @@ void cl_arq_controller::process_buffer_data_commander()
 			}
 			else
 			{
-			// IDLE-SWITCHROLE-RACE TRIGGER-GATE (Part B, idle-switchrole-race.md
-			// §2/§5.2): only arm/fire the idle SWITCH_ROLE handoff if this session
-			// has actually SENT a data frame. A freshly-connected Commander that
-			// has emitted ZERO data frames (session_data_frame_sent==false) must
-			// NOT hand its role away to an equally-empty peer — that is the
-			// connected-but-0-deliver race. The LEGITIMATE end-of-data handoff is
-			// preserved: once any batch is sent the flag is true (set at :1744),
-			// the TX FIFO drains to empty, and this branch fires exactly as before.
-#ifdef IDLE_SWITCHROLE_GATE_FAILBEFORE
-			// FAIL-BEFORE harness: emulate the pre-fix tree (no gate) so the
-			// idle handoff fires on a never-fed Commander -> B1/S4' FAIL.
-			if(true)
-#else
+			// Demand-driven role-transfer trigger.  The existing timer/send/ACK/
+			// promotion machinery is retained, but it may arm only after a reverse
+			// ACK/control record has passed its integrity and ownership checks with
+			// D=1.  The timer controls latency only; it creates no authority.
+#ifdef ROLE_DEMAND_FAILBEFORE
+			// Directed fail-before arm: restore the speculative post-data trigger.
 			if(session_data_frame_sent)
+#else
+			if(reverse_data_demand_acknowledged)
 #endif
 			{
 				if(switch_role_timer.counting==NO)
