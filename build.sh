@@ -202,6 +202,13 @@ if [ "${CTRL_ACK_FLOOR_FAILBEFORE:-0}" = "1" ]; then
     TRACE_CFLAGS="$TRACE_CFLAGS -DCTRL_ACK_FLOOR_FAILBEFORE"
     echo "  (CTRL_ACK_FLOOR_FAILBEFORE defeat build - CLOSE control-ACK reverted to the loose data floor)"
 fi
+# Optional: RESTORE_BACKUP_BOUNDS_FAILBEFORE=1 ./build.sh o3 -- test-only
+# defeat that retains the former 4 KiB stack restore buffer. The directed
+# backup-bounds regression then reproduces the rollback stack overflow.
+if [ "${RESTORE_BACKUP_BOUNDS_FAILBEFORE:-0}" = "1" ]; then
+    TRACE_CFLAGS="$TRACE_CFLAGS -DRESTORE_BACKUP_BOUNDS_FAILBEFORE"
+    echo "  (RESTORE_BACKUP_BOUNDS_FAILBEFORE defeat build - 4 KiB stack restore buffer retained)"
+fi
 
 # --- Deterministic git build-id baked into the binary banner ---------------
 # Writes include/common/build_id.h with #define MERCURY_BUILD_ID "<shortrev>[-dirty]".

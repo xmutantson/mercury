@@ -3031,6 +3031,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_crb;
                 failed += ARQ_crb.test_compress_reassembly_bounds();
             }
+            // Compression rollback backup restore must handle a full large
+            // in-flight batch without overflowing a fixed local buffer.
+            {
+                cl_arq_controller ARQ_rbb;
+                failed += ARQ_rbb.test_restore_backup_bounds();
+            }
             {
                 cl_arq_controller test_arq;
                 failed += test_arq.test_ssid_bounds();
@@ -5150,6 +5156,7 @@ int main(int argc, char *argv[])
                                         // cleared on recovery. Drives the REAL clear_retx_queue(); asserts the queue empties
                                         // of pre-recovery bsi, is idempotent, and repeatable. One-shot, exits rc.
     bool test_restage_requeue_orphan_cli = false; // --test-restage-requeue-orphan: §12 re-stage re-queue orphan/reorder
+    bool test_restore_backup_bounds_cli = false; // --test-restore-backup-bounds: large streaming rollback backup restore
     bool test_stream_offset_cli = false; // --test-stream-offset: Option W FOUNDATION — absolute-byte-stream cursor ground-truth
     bool test_l1_stage2_ownership_cli = false;
     bool test_rx_drain_backpressure_cli = false; // --test-rx-drain-backpressure: FIX-6 — RX-delivery drain
@@ -6081,6 +6088,13 @@ int main(int argc, char *argv[])
             // source/datalink_layer/test_restage_requeue.cc +
             // fact-documents/silent-corruption-residual.md §12/§13.
             test_restage_requeue_orphan_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-restore-backup-bounds") == 0)
+        {
+            // Large streaming rollback backup restore — one-shot at startup.
+            test_restore_backup_bounds_cli = true;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -8489,6 +8503,15 @@ start_modem:
             fflush(stdout);
             int rc = ARQ.test_restage_requeue_orphan();
             printf("[FLAG] restage-requeue-orphan test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_restore_backup_bounds_cli) {
+            printf("[FLAG] --test-restore-backup-bounds: invoking large rollback "
+                   "backup restore regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_restore_backup_bounds();
+            printf("[FLAG] restore-backup-bounds test complete (rc=%d) — exiting.\n", rc);
             fflush(stdout);
             exit(rc);
         }

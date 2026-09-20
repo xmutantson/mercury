@@ -4193,6 +4193,11 @@ public:
   // of the newer data with NO loss. FAIL-BEFORE (MERCURY_RESTAGE_ORPHAN_DEFEAT=1):
   // the pre-fix push()-to-BACK reorders (and drops when full) -> shift -> FAIL.
   int test_restage_requeue_orphan();
+  // Compression rollback backup bounds regression. Restores a 44 KiB raw
+  // backup through the production helper and requires byte-exact front insertion.
+  // -DRESTORE_BACKUP_BOUNDS_FAILBEFORE retains the former 4 KiB stack buffer and
+  // crashes under the same overflow. CLI: --test-restore-backup-bounds.
+  int test_restore_backup_bounds();
   // Option W FOUNDATION regression (--test-stream-offset): drives the cursor
   // helpers + the production re-stage funnel through every transition, asserting
   // the latched per-bsi stamp == the true cumulative transported origin offset.

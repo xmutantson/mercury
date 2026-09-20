@@ -26019,6 +26019,7 @@ void cl_arq_controller::restore_backup_buffer_data()
 	{
 		nMessages=nBackedup_bytes/(max_data_length+max_header_length-eff_long_hdr);
 
+#ifdef RESTORE_BACKUP_BOUNDS_FAILBEFORE
 		char restore_buf[N_MAX/8 * 20];
 		int total_restore = 0;
 		for(int i=0;i<nMessages+1;i++)
@@ -26029,6 +26030,25 @@ void cl_arq_controller::restore_backup_buffer_data()
 		}
 		if(total_restore > 0)
 			fifo_buffer_tx.push_front(restore_buf, total_restore);
+#else
+		// A compressed in-flight batch can back up far more than the historic
+		// N_MAX/8*20 (4,000-byte) local array: normal large batches reach tens of
+		// kilobytes. Size the temporary to the FIFO occupancy and bound every pop
+		// by the remaining allocation. One final push_front preserves byte order.
+		std::vector<char> restore_buf((size_t)nBackedup_bytes);
+		int total_restore = 0;
+		for(int i=0;i<nMessages+1 && total_restore<nBackedup_bytes;i++)
+		{
+			int remaining = nBackedup_bytes-total_restore;
+			int request = max_data_length+max_header_length-eff_long_hdr;
+			if(request > remaining) request = remaining;
+			data_read_size=fifo_buffer_backup.pop(restore_buf.data()+total_restore,request);
+			if(data_read_size <= 0) break;
+			total_restore += data_read_size;
+		}
+		if(total_restore > 0)
+			fifo_buffer_tx.push_front(restore_buf.data(), total_restore);
+#endif
 	}
 }
 
