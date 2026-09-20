@@ -1202,7 +1202,29 @@ public:
   //   - On CRC pass: writes the bitmap (true = RECEIVED) into out_bitmap[0..nframes-1],
   //     out_batch_seq_id, increments cmd_sack_v2_rx_count, returns true.
   bool decode_sack_v2_frame(bool* out_bitmap, int nframes,
-                            unsigned char* out_batch_seq_id);
+                            unsigned char* out_batch_seq_id,
+                            bool* out_reverse_demand = nullptr);
+
+  // Demand-driven role transfer.  A reverse-data demand is accepted only from
+  // an integrity-validated reverse ACK.  Compact and MFSK ACK/SACK frames use
+  // D:1|BSI:7 in the ACK identity octet; full SACK uses flags bit 0 under CRC8.
+  // NB/legacy sends a singleton full-SACK demand record because its bare ACK has
+  // no content bits.  The 7-bit ACK identity is restored against the live
+  // two-generation ownership window before normal ACK validation.
+  static const unsigned char ROLE_DEMAND_BSI_FLAG = 0x80;
+  static const unsigned char ROLE_DEMAND_BSI_MASK = 0x7f;
+  static const unsigned char ROLE_DEMAND_SACK_FLAG = 0x01;
+  static const int ROLE_DEMAND_REFRESH_MS = 1000;
+  bool local_reverse_data_demand();
+  unsigned char role_demand_pack_ack_bsi(unsigned char bsi);
+  unsigned char role_demand_restore_ack_bsi(unsigned char wire_bsi,
+                                             bool* out_demand) const;
+  void role_demand_note_acknowledged(bool demanded, const char* substrate);
+  bool role_demand_switch_owns_precedence() const;
+  bool role_demand_control_slot_safe() const;
+  void commander_handle_connected_disconnect();
+  void responder_maybe_advertise_late_role_demand();
+  void commander_poll_late_role_demand();
 
   // RSP-side TX wrapper. Send the MFSK ACK+SACK pattern (16 base +
   // 13 suffix = 29 symbols on WB) carrying [bsi:8 | bitmap:30 | crc12:12].
@@ -2654,15 +2676,11 @@ public:
   int test_mixbatch_fill_overpop();  // --test-mixbatch-fill-overpop: mixbatch fill over-pop reorder regression
   int test_mixbatch_fill_overpop_compressed();  // --test-mixbatch-fill-overpop-compressed: comp-leg over-pop + force-FREE data-loss regression
 
-  // Idle SWITCH_ROLE race regression (FAILS-BEFORE evidence for the
-  // connected-but-0-deliver bench bug). Drives the REAL
-  // process_buffer_data_commander() idle branch (arq_commander.cc:15238-15251)
-  // with a freshly-CONNECTED COMMANDER, EMPTY tx FIFO, block_under_tx==NO. Two
-  // calls advance past switch_role_timeout; asserts SWITCH_ROLE is queued on an
-  // empty-tx Commander BEFORE any data frame. Demonstrates the channel-free
-  // root cause: if the app withholds its first data write past
-  // switch_role_timeout, the Commander hands its role away with an empty FIFO.
-  // One-shot, exits rc.
+  // Demand-driven role-transfer / terminal-race regression. Drives the real
+  // idle trigger and proves: no-demand after prior data cannot arm code 57
+  // (the fd6 fail-before); CRC-valid D=1 does arm it; no-demand DISCONNECT emits
+  // CLOSE without overwriting PENDING_ACK; and a queued reverse stream completes
+  // role swap, byte delivery, and new-commander CLOSE with verified EOT.
   int test_idle_switch_role_race();
 
   // SWITCH_ROLE re-ride race (idle-switchrole-race.md §6) — a peer re-acquiring
@@ -5189,6 +5207,7 @@ public:
   cl_timer gear_shift_timer;
   cl_timer switch_role_timer;
   cl_timer switch_role_test_timer;
+  cl_timer role_demand_refresh_timer;
   cl_timer connection_attempt_timer;
 
   float print_stats_frequency_hz;
@@ -5251,6 +5270,12 @@ public:
   // delivery commit (arq_responder.cc:101, beside nReceived_data++); RESET with
   // the other session flags.
   bool session_data_frame_received;
+  // Latched only by a CRC/FEC-validated demand-bearing reverse ACK.  It is
+  // cleared at session/role boundaries, never by a later duplicate D=0 ACK.
+  bool reverse_data_demand_acknowledged;
+  bool reverse_data_demand_last_advertised;
+  long long reverse_data_demand_tx_count;
+  long long reverse_data_demand_rx_count;
 
   // The responder can commit locally before the commander receives the final
   // connect ACK.  Retain exactly the ACK identity for this session so a decoded
