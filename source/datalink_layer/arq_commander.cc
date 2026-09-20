@@ -6609,6 +6609,13 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 				"transition %d->%d awaits peer evidence; retransmission will re-tag target\n",
 				inband_pre_announce_config, inband_retag_config);
 			fflush(stdout);
+			// This threshold episode has been consumed.  Leaving either the counter or
+			// expired receive timer latched re-enters this branch every poll and starves
+			// the very DATA retransmission that carries the repeat tag.
+			emergency_nack_count = 0;
+			receiving_timer.stop();
+			receiving_timer.reset();
+			connection_status = TRANSMITTING_DATA;
 			return true;
 		}
 		if(gearshift_owned)

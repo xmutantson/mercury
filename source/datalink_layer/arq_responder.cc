@@ -8108,6 +8108,10 @@ int cl_arq_controller::test_inband_liveness()
 		      cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_10,
 			"B7.7 second degradation cannot replace an unconfirmed CONFIG_TAG transition",
 			cmd->current_configuration, CONFIG_10);
+		check(cmd->emergency_nack_count == 0 &&
+		      cmd->connection_status == TRANSMITTING_DATA,
+			"B7.8 consumed degradation resumes the retransmit path instead of spinning",
+			cmd->emergency_nack_count, 0);
 		delete cmd; delete ts;
 	}
 
