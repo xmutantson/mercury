@@ -1078,8 +1078,9 @@ int cl_arq_controller::test_stream_offset()
 
 	// ---------------------------------------------------------------------------
 	// PART Y -- compression recovery must restore BOTH coupled identities: the
-	// transported-byte cursor and cmd_batch_seq_id. restore_tx_from_compressed()
-	// is the one production funnel shared by BREAK, demote, climb, and CFG16-HOLD.
+	// transported-byte cursor and cmd_batch_seq_id, including an older predecessor
+	// retained only by the retransmit queue. restore_tx_from_compressed() is the one
+	// production funnel shared by BREAK, demote, climb, and CFG16-HOLD.
 	// A sent batch B has already advanced cmd_batch_seq_id to B+1 while its frames
 	// remain PENDING_ACK. If recovery restores B's plaintext but leaves that counter
 	// at B+1, the receiver sees the same bytes as a fresh successor instead of a
@@ -1094,6 +1095,9 @@ int cl_arq_controller::test_stream_offset()
 		bool bsi_defeat = false;
 		{ const char* e = std::getenv("MERCURY_COMPRESS_RECOVERY_BSI_DEFEAT");
 		  if(e && *e && atoi(e)!=0) bsi_defeat = true; }
+		bool retx_bsi_defeat = false;
+		{ const char* e = std::getenv("MERCURY_COMPRESS_RECOVERY_RETX_BSI_DEFEAT");
+		  if(e && *e && atoi(e)!=0) retx_bsi_defeat = true; }
 
 		if(fifo_buffer_backup.set_size(65536) != SUCCESSFUL)
 		{
@@ -1113,6 +1117,7 @@ int cl_arq_controller::test_stream_offset()
 			fifo_buffer_tx.flush();
 			fifo_buffer_backup.flush();
 			fifo_buffer_rx.flush();
+			retransmit_count=0;
 			for(int i=0;i<nMessages;i++)
 			{
 				messages_tx[i].status=FREE; messages_tx[i].length=0;
@@ -1178,6 +1183,122 @@ int cl_arq_controller::test_stream_offset()
 		recovery_case(41, "ordinary");
 		recovery_case(255, "wrap-255-to-0");
 
+		// Y2 -- the field wedge: BSI 2 is incomplete and retained only in the
+		// retransmit queue; BSI 3 is live; the next-new-data counter is 4. A
+		// compressed downgrade rebuilds all raw backup bytes and clears the stale
+		// encoded retransmit queue. The restart identity and Option-W cursor must
+		// therefore roll to 2 BEFORE that clear. Rolling only to live BSI 3 makes
+		// the responder (last_delivered=1) reject the first reacquired payload as a
+		// non-contiguous gap, exactly reproducing the post-downgrade wedge.
+		{
+			const int PREV=2, LIVE=3, LAST_DELIVERED=1;
+			const int PREV_RAW=73, LIVE_RAW=89, TOTAL=PREV_RAW+LIVE_RAW;
+			unsigned char raw[TOTAL];
+			for(int i=0;i<TOTAL;i++) raw[i]=(unsigned char)((i*31+17)&0xFF);
+
+			fifo_buffer_tx.flush(); fifo_buffer_backup.flush(); fifo_buffer_rx.flush();
+			for(int i=0;i<nMessages;i++)
+			{
+				messages_tx[i].status=FREE; messages_tx[i].length=0;
+				messages_rx[i].status=FREE; messages_rx[i].length=0;
+			}
+			for(int i=0;i<256;i++) tx_stream_stamp[i].valid=false;
+			retransmit_count=0;
+
+			tx_stream_committed=37;
+			tx_stream_crc=0x13579BDFu;
+			stream_tx_latch(PREV, PREV_RAW);
+			tx_stream_crc=0x2468ACE0u;
+			stream_tx_latch(LIVE, LIVE_RAW);
+			tx_stream_crc=0xDEADBEEFu;
+			messages_tx[0].status=PENDING_ACK;
+			messages_tx[0].length=LIVE_RAW;
+			messages_tx[0].batch_seq_id=LIVE;
+			retransmit_count=1;
+			retransmit_frame_lengths[0]=PREV_RAW;
+			retransmit_frame_batch_seq_ids[0]=PREV;
+			cmd_batch_seq_id=4;
+			fifo_buffer_backup.push((char*)raw, TOTAL);
+
+			restore_tx_from_compressed();
+			char restored[TOTAL+8];
+			int restored_n=fifo_buffer_tx.pop(restored, (int)sizeof(restored));
+			bool restored_exact=(restored_n==TOTAL && memcmp(restored, raw, TOTAL)==0);
+			bool payload_reacquired=!sack_v2_readopt_has_gap(cmd_batch_seq_id,
+				LAST_DELIVERED);
+			CHECK((cmd_batch_seq_id&0xFF)==PREV,
+				"Y2: retained predecessor owns compressed-recovery restart identity",
+				cmd_batch_seq_id&0xFF, PREV);
+			CHECK(tx_stream_committed==37,
+				"Y2: byte cursor rolls to retained predecessor stamp",
+				(long long)tx_stream_committed, 37);
+			CHECK(tx_stream_crc==0x13579BDFu,
+				"Y2: CRC state rolls to retained predecessor stamp",
+				(long long)tx_stream_crc, (long long)0x13579BDFu);
+			CHECK(retransmit_count==0,
+				"Y2: stale encoded retransmit queue is still cleared", retransmit_count, 0);
+			CHECK(payload_reacquired,
+				"Y2: responder last=1 accepts reacquired payload at contiguous bsi=2",
+				payload_reacquired?1:0, 1);
+			CHECK(restored_exact && payload_reacquired,
+				"Y2: forced rollback+downgrade resumes and completes byte-exact transfer",
+				restored_n, TOTAL);
+		}
+
+		// Y3 -- the second half of the field wedge. Compression shrank the failed
+		// 1,720-byte plaintext batch to a 580-byte wire image. The socket-ingress
+		// gate used to reserve only those 580 live bytes, allowing newer app data to
+		// refill the raw batch's FIFO space. At downgrade, push_front(raw=1720)
+		// therefore returned zero (all-or-nothing) and its unchecked return silently
+		// deleted the predecessor. Drive that exact near-full geometry through the
+		// production reserve calculator and restore funnel. The same-binary defeat
+		// knob restores the 580-byte reserve + ignored failed prepend.
+		{
+			const int PREV=2, RAW=1720, WIRE=580;
+			std::vector<char> raw((size_t)RAW), fill((size_t)65536, (char)0xA5);
+			for(int i=0;i<RAW;i++) raw[(size_t)i]=(char)((i*37+11)&0xFF);
+
+			fifo_buffer_tx.flush(); fifo_buffer_backup.flush();
+			for(int i=0;i<nMessages;i++)
+			{
+				messages_tx[i].status=FREE; messages_tx[i].length=0;
+			}
+			for(int i=0;i<256;i++) tx_stream_stamp[i].valid=false;
+			retransmit_count=0;
+			tx_stream_committed=543;
+			stream_tx_latch(PREV, WIRE);
+			messages_tx[0].status=PENDING_ACK;
+			messages_tx[0].length=WIRE;
+			messages_tx[0].batch_seq_id=PREV;
+			cmd_batch_seq_id=3;
+			fifo_buffer_backup.push(raw.data(), RAW);
+
+			int reserve=tx_restage_reserve_bytes();
+			int target_free=MAX_BUFFER_SIZE+reserve;
+			int initial_fill=fifo_buffer_tx.get_size()-target_free;
+			int filled=fifo_buffer_tx.push(fill.data(), initial_fill);
+			int ingress=fifo_buffer_tx.push(fill.data(), MAX_BUFFER_SIZE);
+			CHECK(filled==initial_fill && ingress==MAX_BUFFER_SIZE,
+				"Y3: ingress fills FIFO down to the production re-stage reserve",
+				fifo_buffer_tx.get_free_size(), reserve);
+			CHECK(reserve==RAW,
+				"Y3: compression reserve uses raw backup, not smaller wire image",
+				reserve, RAW);
+
+			link_status=CONNECTED;
+			restore_tx_from_compressed();
+			std::vector<char> restored((size_t)RAW);
+			int restored_n=fifo_buffer_tx.pop(restored.data(), RAW);
+			bool exact=(restored_n==RAW
+				&& memcmp(restored.data(), raw.data(), (size_t)RAW)==0);
+			CHECK(exact,
+				"Y3: near-full rollback prepends all 1720 predecessor bytes byte-exact",
+				exact?RAW:0, RAW);
+			CHECK(link_status==CONNECTED,
+				"Y3: capacity-safe rollback resumes instead of dropping the link",
+				link_status, CONNECTED);
+		}
+
 		// No assigned in-flight batch is a strict no-op for the sequence identity.
 		fifo_buffer_tx.flush(); fifo_buffer_backup.flush();
 		for(int i=0;i<nMessages;i++){ messages_tx[i].status=FREE; messages_tx[i].length=0; }
@@ -1209,7 +1330,8 @@ int cl_arq_controller::test_stream_offset()
 		compressor.streaming_disable();
 		compressor.deinit();
 		this->compression_enabled=false;
-		printf("[TEST-STREAM-OFFSET] Part Y bsi_defeat=%d\n", (int)bsi_defeat);
+		printf("[TEST-STREAM-OFFSET] Part Y bsi_defeat=%d retx_bsi_defeat=%d\n",
+			(int)bsi_defeat, (int)retx_bsi_defeat);
 	}
 	// PART V — REBASE-SEAM FAIL-CLOSED: the byte-offset STREAM-SPLICE escape
 	// (data-flow-stream-offset.md §11). After a DEMOTE-REBASE re-baselines the bsi window

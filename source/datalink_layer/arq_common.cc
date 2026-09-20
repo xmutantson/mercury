@@ -7685,6 +7685,13 @@ int cl_arq_controller::inband_down_ladder_resync(const double* audio, int audio_
 // copies (ARQ + PHY twin) and runs the SET_CONFIG HINGE side-effects.
 void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 {
+	// Capture the fact that this config change is re-framing an established byte
+	// stream before HINGE-2 clears the generation window. The absolute Option-W
+	// range then owns overlap trim across the seam (including an exact-BSI replay
+	// whose rebuilt low-rate batch also contains a new suffix).
+	bool reframe_seam = sack_v2_enabled
+		&& rsp_current_expected_batch_seq_id >= 0
+		&& rx_stream_delivered > 0;
 	printf("[INBAND-RX] DOWN-LADDER adopt: CONFIG_%d (was %d)\n",
 		followed_config, current_configuration);
 	fflush(stdout);
@@ -7723,6 +7730,8 @@ void cl_arq_controller::inband_adopt_resynced_config(int followed_config)
 		for(int i=0; i<this->nMessages; i++)
 			messages_rx_prev[i].status = FREE;
 	}
+	if(reframe_seam)
+		rsp_rebase_seam_armed = true;
 }
 
 // SHARED OFDM-ENTRY ADOPT SETUP — see arq.h. Body is the VERBATIM capture-ring block
@@ -9653,30 +9662,21 @@ void cl_arq_controller::process_main()
 		//
 		// §12/§13 RE-STAGE RESERVE (silent-corruption-residual.md, the ROOT fix
 		// for the residual WGN:25 silent byte-corruption): ALSO reserve headroom
-		// equal to the bytes currently IN FLIGHT (non-FREE messages_tx[]). A
+		// equal to the bytes recovery must prepend. For raw traffic that is the
+		// bytes currently IN FLIGHT (non-FREE messages_tx[]); for compressed
+		// traffic it is the larger of that wire image and fifo_buffer_backup's
+		// raw plaintext occupancy. A
 		// demote/BREAK re-stage must re-queue exactly those bytes back into
 		// fifo_buffer_tx (restage_requeue_tx_messages); if the app has refilled
 		// the space the in-flight block vacated when it was popped, push_front
 		// drops them -> the block is ORPHANED -> the delivered stream shifts ->
-		// silent corruption. Gating ingestion on free >= MAX_BUFFER_SIZE +
-		// in_flight provably keeps free >= in_flight at every re-stage (the pop-
-		// to-build step grows free and in_flight equally, so the margin holds),
+		// silent corruption. Gating ingestion on free >= MAX_BUFFER_SIZE + reserve
+		// provably keeps free >= the complete recovery image at every re-stage (the
+		// pop-to-build step grows free and the raw backup equally, so the margin holds),
 		// so the re-queue is ALWAYS lossless. Backpressure to the app is
 		// unchanged in kind, just a few KB earlier. MERCURY_RESTAGE_ORPHAN_DEFEAT=1
 		// restores the pre-fix (unreserved) gate for the fail-before arm.
-		int restage_reserve = 0;
-		{
-			static int s_defeat = -1;
-			if(s_defeat < 0)
-			{
-				const char* e = std::getenv("MERCURY_RESTAGE_ORPHAN_DEFEAT");
-				s_defeat = (e && *e && atoi(e)!=0) ? 1 : 0;
-			}
-			if(s_defeat == 0 && messages_tx != NULL)
-				for(int i=0;i<nMessages;i++)
-					if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
-						restage_reserve += messages_tx[i].length;
-		}
+		int restage_reserve = tx_restage_reserve_bytes();
 		// Drain handler-owned transform output before another socket receive.
 		// Later application bytes must not overtake a completed B2F record.
 		if(b2f_handler.is_initialized() && b2f_handler.has_pending_tx_work())
@@ -24770,15 +24770,50 @@ bool cl_arq_controller::w_eot_mismatch(uint64_t peer_committed, uint32_t peer_cr
 	return false;
 }
 
+// Resolve the earliest wire identity whose plaintext will be rebuilt by a recovery. Most
+// recoveries have one live messages_tx[] batch. A partial SACK is different: the missing
+// predecessor can live ONLY in retransmit_frames[] while a newer batch remains live in
+// messages_tx[]. restore_tx_from_compressed() clears both collections after restoring the
+// raw-backup FIFO, so it must snapshot the union before either owner is cleared.
+int cl_arq_controller::earliest_tx_recovery_bsi() const
+{
+	int min_bsi = -1;
+	auto include_bsi = [&](int raw) {
+		if(raw < 0) return;
+		int b = raw & 0xFF;
+		if(min_bsi < 0) min_bsi = b;
+		else
+		{
+			unsigned fwd = ((unsigned)(min_bsi - b)) & 0xFFu;
+			if(fwd >= 1u && fwd <= 128u) min_bsi = b;
+		}
+	};
+
+	for(int i=0; i<nMessages; i++)
+		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+			include_bsi(messages_tx[i].batch_seq_id);
+
+	// Same-binary fail-before arm for test_stream_offset Part Y2. Ignoring this
+	// retained predecessor exactly recreates 4b2757aa's post-rollback wedge.
+	bool ignore_retx = false;
+	{ const char* e = std::getenv("MERCURY_COMPRESS_RECOVERY_RETX_BSI_DEFEAT");
+	  if(e && *e && atoi(e)!=0) ignore_retx = true; }
+	if(!ignore_retx)
+	{
+		for(int i=0; i<retransmit_count; i++)
+			if(retransmit_frame_lengths[i] > 0)
+				include_bsi(retransmit_frame_batch_seq_ids[i]);
+	}
+	return min_bsi;
+}
+
 // The re-stage un-commit (§2.2 / INV3). On a demote / BREAK / CFG16-HOLD re-stage the
-// in-flight batch's bytes are re-queued to fifo_buffer_tx for rebuild; the cursor must roll
-// back to that batch's latched start so the rebuild carries the SAME start offset the
-// receiver anchored delivery at (INV4). The rolled-back batch is always the single in-flight
-// one (Mercury builds one batch at a time; "one batch is in flight on the per-frame path",
-// arq_commander.cc:5488), so the target = the min in-flight batch_seq_id (the SAME mod-256
-// scan the demote sites use, arq_commander.cc:3490-3503). Idempotent + guarded: a no-op when
-// nothing is in flight or the stamp was never latched; safe to call redundantly.
-void cl_arq_controller::stream_tx_rollback_inflight()
+// outstanding bytes are re-queued to fifo_buffer_tx for rebuild; the cursor must roll back
+// to the earliest outstanding batch's latched start so the rebuild carries the SAME start
+// offset the receiver anchored delivery at (INV4). This includes a predecessor retained
+// only by the retransmit queue. Idempotent + guarded: a no-op when nothing is outstanding
+// or the stamp was never latched; safe to call redundantly.
+void cl_arq_controller::stream_tx_rollback_inflight(int recovery_bsi)
 {
 	// FAIL-BEFORE arm (F1/F4.1, silent-corruption-residual.md §16/§17.4): the pre-fix
 	// open-coded raw re-stage legs (arq_commander.cc BREAK-EXHAUSTED :807, GEARSHIFT
@@ -24791,16 +24826,17 @@ void cl_arq_controller::stream_tx_rollback_inflight()
 	{ const char* e = std::getenv("MERCURY_W_RESTAGE_ROLLBACK_DEFEAT");
 	  if(e && *e && atoi(e)!=0) return; }
 
-	int  min_bsi    = -1;
+	int  min_bsi    = recovery_bsi >= 0 ? (recovery_bsi & 0xFF) : -1;
 	bool any_staged = false;
 	for(int i=0;i<nMessages;i++)
 	{
 		if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
 		{
 			any_staged = true;
-			int raw = messages_tx[i].batch_seq_id;
-			if(raw < 0) continue;   // staged-but-not-yet-assigned (bsi set in process_messages_tx_data)
-			int b = raw & 0xFF;
+			// The compressed restore funnel supplies the union target explicitly.
+			// Every other caller retains the original live-messages-only behavior.
+			if(recovery_bsi >= 0 || messages_tx[i].batch_seq_id < 0) continue;
+			int b = messages_tx[i].batch_seq_id & 0xFF;
 			if(min_bsi < 0) min_bsi = b;
 			else
 			{
@@ -25100,13 +25136,36 @@ void cl_arq_controller::copy_data_to_buffer()
 	// the abort latch on disjoint triggers (see the cross-layer guard-composition
 	// audit). MERCURY_STREAM_DEDUP_DEFEAT=1 restores the pre-fix re-emit (the
 	// fail-before arm on the SAME binary; reproduces the splice deterministically).
+	// A config reframe can make the rebuilt batch carrying the duplicate wire BSI
+	// larger than the batch previously emitted under that BSI. In that one case
+	// the absolute stamp range straddles rx_stream_delivered: the prefix is a
+	// duplicate, but the suffix is new data. Do not let the identity-only gate
+	// discard the suffix; the Option-W overlap path below trims the proven prefix.
+	// Transformed data remains exact-BSI fail-closed because transported offsets
+	// cannot select a plaintext suffix safely.
+	bool duplicate_reframe_straddles = false;
+	if(rsp_rebase_seam_armed && decrypt_delivered_bsi >= 0
+	   && !compression_viable_for_batch() && !cipher_suite.is_active()
+	   && !kx_stream_epoch())
+	{
+		int wbsi = decrypt_delivered_bsi & 0xFF;
+		if(rx_stream_stamp[wbsi].valid)
+		{
+			uint64_t start = rx_stream_stamp[wbsi].start;
+			uint64_t end = start + (uint64_t)rx_stream_stamp[wbsi].length;
+			duplicate_reframe_straddles = start < rx_stream_delivered
+				&& end > rx_stream_delivered;
+		}
+		{ const char* e = std::getenv("MERCURY_REFRAME_STRADDLE_DEFEAT");
+		  if(e && *e && atoi(e)!=0) duplicate_reframe_straddles = false; }
+	}
 	if(decrypt_delivered_bsi >= 0 && rx_stream_emitted_bsi_hw >= 0
 	   && (((decrypt_delivered_bsi - rx_stream_emitted_bsi_hw) & 0xFF) == 0))
 	{
 		bool dedup_defeat = false;
 		{ const char* e = std::getenv("MERCURY_STREAM_DEDUP_DEFEAT");
 		  if(e && *e && atoi(e)!=0) dedup_defeat = true; }
-		if(!dedup_defeat)
+		if(!dedup_defeat && !duplicate_reframe_straddles)
 		{
 			printf("[RSP-V2-DEDUP-DROP] bsi=%d already emitted (emit_hw=%d) -- skipping "
 				"re-emit (no double-delivery); rx_stream_delivered held at %llu\n",
@@ -25238,11 +25297,12 @@ void cl_arq_controller::copy_data_to_buffer()
 	// orphan, and bigblock delivery). The compression leg validates this total against
 	// the same workspace limit as the sender before it copies or counts any bytes.
 	int delivered_transported = 0;
-	// A lost reverse ACK followed by a SCREAM demote can re-frame one already-
-	// delivered high-rate batch into several smaller low-rate batches.  The first
-	// rebuilt piece retains the old bsi and is caught by INV-DEDUP above; later
-	// pieces have fresh bsi values, but their absolute Option-W ranges still lie
-	// wholly or partly behind rx_stream_delivered.  Preserve that byte cursor as
+	// A lost reverse ACK followed by an in-band demote can re-frame one already-
+	// delivered high-rate batch into differently sized low-rate batches. The first
+	// rebuilt piece retains the old bsi: INV-DEDUP handles a wholly duplicated
+	// range, while a straddling range bypasses that identity gate and reaches this
+	// absolute trim. Later pieces have fresh bsi values, but their Option-W ranges
+	// can still lie wholly or partly behind rx_stream_delivered. Preserve that cursor as
 	// the authority across the rebase seam: discard a wholly overlapped raw piece,
 	// or skip the already-delivered prefix of a straddling raw piece.  This is
 	// deliberately limited to the untransformed byte path; compressed/encrypted/KX
@@ -25285,8 +25345,7 @@ void cl_arq_controller::copy_data_to_buffer()
 		return;   // do NOT deliver the positionally-unprovable cross-session batch
 	}
 
-	if(scream_wake_feature_enabled()
-	   && rsp_rebase_seam_armed && decrypt_delivered_bsi >= 0
+	if(rsp_rebase_seam_armed && decrypt_delivered_bsi >= 0
 	   && !compression_viable_for_batch() && !cipher_suite.is_active()
 	   && !kx_stream_epoch())
 	{
@@ -25866,40 +25925,47 @@ void cl_arq_controller::restore_tx_from_compressed()
 	// already restore this identity before freeing messages_tx[]. Do the same at
 	// the single compression funnel, while the original batch_seq_id still exists.
 	// Gated like the raw rollback: v1 never carries or consumes this field.
-	int min_inflight_bsi = -1;
-	if(sack_v2_enabled)
-	{
-		for(int i=0; i<nMessages; i++)
-		{
-			if(messages_tx[i].status == FREE || messages_tx[i].length <= 0
-			   || messages_tx[i].batch_seq_id < 0)
-				continue;
-			int b = messages_tx[i].batch_seq_id & 0xFF;
-			if(min_inflight_bsi < 0)
-				min_inflight_bsi = b;
-			else
-			{
-				unsigned fwd = ((unsigned)(min_inflight_bsi - b)) & 0xFFu;
-				if(fwd >= 1u && fwd <= 128u) min_inflight_bsi = b;
-			}
-		}
-	}
+	int min_inflight_bsi = sack_v2_enabled ? earliest_tx_recovery_bsi() : -1;
 	bool bsi_rollback_defeat = false;
 	{ const char* e = std::getenv("MERCURY_COMPRESS_RECOVERY_BSI_DEFEAT");
 	  if(e && *e && atoi(e)!=0) bsi_rollback_defeat = true; }
+	// The compressed wire image may be much smaller than its raw backup.  App
+	// ingestion historically reserved only messages_tx[] bytes, so at high FIFO
+	// occupancy a 580-byte compressed batch could own 1,720 raw backup bytes while
+	// fewer than 1,720 bytes remained free. restore_backup_buffer_data() then made
+	// an all-or-nothing push_front(), ignored its zero return, and the recovery
+	// path freed both owners: a silent head deletion.  The ingestion reserve below
+	// prevents this state; keep this preflight as the fail-closed backstop before
+	// any identity/cursor/queue owner is mutated.
+	bool capacity_defeat = false;
+	{ const char* e = std::getenv("MERCURY_COMPRESS_RESTORE_CAPACITY_DEFEAT");
+	  if(e && *e && atoi(e)!=0) capacity_defeat = true; }
+	int backup_occupancy = fifo_buffer_backup.get_size()-fifo_buffer_backup.get_free_size();
+	if(!capacity_defeat && backup_occupancy > fifo_buffer_tx.get_free_size())
+	{
+		printf("[RESTORE_TX-CAPACITY] REFUSED before mutation: raw backup needs %d "
+			"bytes, TX FIFO has %d free -- preserving backup/live owners and dropping "
+			"the link for a clean restart\n",
+			backup_occupancy, fifo_buffer_tx.get_free_size());
+		fflush(stdout);
+		link_status = DROPPED;
+		return;
+	}
+
 	if(min_inflight_bsi >= 0 && !bsi_rollback_defeat)
 	{
 		printf("[RESTORE_TX] Rolling cmd_batch_seq_id %d -> %d for compressed "
-			"in-flight replay continuity\n", cmd_batch_seq_id & 0xFF, min_inflight_bsi);
+			"outstanding replay continuity (live+retx)\n", cmd_batch_seq_id & 0xFF,
+			min_inflight_bsi);
 		fflush(stdout);
 		cmd_batch_seq_id = min_inflight_bsi;
 	}
 
-	// Option W (§2.2): un-commit the in-flight batch's transported bytes BEFORE this
+	// Option W (§2.2): un-commit the earliest outstanding batch's transported bytes BEFORE this
 	// funnel frees messages_tx[] and re-queues plaintext (the compressed/streaming/
-	// encrypted twin of restage_requeue_tx_messages). Runs while messages_tx[] still
-	// holds the in-flight frames so the mod-256 in-flight scan can find the bsi.
-	stream_tx_rollback_inflight();
+	// encrypted twin of restage_requeue_tx_messages). Runs while messages_tx[] AND the
+	// retransmit queue still expose their identities so the union scan can find the bsi.
+	stream_tx_rollback_inflight(min_inflight_bsi);
 
 	// R029: every caller of this helper is a recovery/config-change path that
 	// frees messages_tx[] and re-queues plaintext to fifo_buffer_tx for re-send
@@ -25982,7 +26048,15 @@ void cl_arq_controller::restore_tx_from_compressed()
 			decomp_buf, (int)sizeof(decomp_buf));
 		if(dec_size > 0)
 		{
-			fifo_buffer_tx.push_front(decomp_buf, dec_size);
+			int restored = fifo_buffer_tx.push_front(decomp_buf, dec_size);
+			if(!capacity_defeat && restored != dec_size)
+			{
+				printf("[RESTORE_TX-CAPACITY] FATAL: decompressed prepend stored "
+					"%d/%d bytes -- dropping link\n", restored, dec_size);
+				fflush(stdout);
+				link_status = DROPPED;
+				return;
+			}
 			printf("[RESTORE_TX] Decompressed %d -> %d bytes, pushed to FIFO\n",
 				assembled_size, dec_size);
 		}
@@ -25998,13 +26072,44 @@ void cl_arq_controller::restore_tx_from_compressed()
 	else if(assembled_size > 0)
 	{
 		// Too small for header — push raw assembled data
-		fifo_buffer_tx.push_front(assembled, assembled_size);
+		int restored = fifo_buffer_tx.push_front(assembled, assembled_size);
+		if(!capacity_defeat && restored != assembled_size)
+		{
+			printf("[RESTORE_TX-CAPACITY] FATAL: raw prepend stored %d/%d bytes "
+				"-- dropping link\n", restored, assembled_size);
+			fflush(stdout);
+			link_status = DROPPED;
+			return;
+		}
 		printf("[RESTORE_TX] No header (%d bytes), pushed raw\n", assembled_size);
 	}
 
 	// Flush backup — no longer needed, we recovered from messages_tx
 	fifo_buffer_backup.flush();
 	fflush(stdout);
+}
+
+int cl_arq_controller::tx_restage_reserve_bytes()
+{
+	int framed = 0;
+	bool raw_restage_defeat = false;
+	{ const char* e = std::getenv("MERCURY_RESTAGE_ORPHAN_DEFEAT");
+	  if(e && *e && atoi(e)!=0) raw_restage_defeat = true; }
+	if(raw_restage_defeat)
+		return 0;  // preserve the existing raw re-stage fail-before contract
+	if(messages_tx != NULL)
+		for(int i=0;i<nMessages;i++)
+			if(messages_tx[i].status != FREE && messages_tx[i].length > 0)
+				framed += messages_tx[i].length;
+
+	bool capacity_defeat = false;
+	{ const char* e = std::getenv("MERCURY_COMPRESS_RESTORE_CAPACITY_DEFEAT");
+	  if(e && *e && atoi(e)!=0) capacity_defeat = true; }
+	if(capacity_defeat)
+		return framed;  // fail-before: compressed bytes were the only reserve
+
+	int raw = fifo_buffer_backup.get_size()-fifo_buffer_backup.get_free_size();
+	return raw > framed ? raw : framed;
 }
 
 void cl_arq_controller::restore_backup_buffer_data()
@@ -26017,6 +26122,18 @@ void cl_arq_controller::restore_backup_buffer_data()
 	nBackedup_bytes=fifo_buffer_backup.get_size()-fifo_buffer_backup.get_free_size();
 	if(nBackedup_bytes!=0 && (max_data_length+max_header_length-eff_long_hdr)!=0)
 	{
+		bool capacity_defeat = false;
+		{ const char* e = std::getenv("MERCURY_COMPRESS_RESTORE_CAPACITY_DEFEAT");
+		  if(e && *e && atoi(e)!=0) capacity_defeat = true; }
+		if(!capacity_defeat && nBackedup_bytes > fifo_buffer_tx.get_free_size())
+		{
+			printf("[RESTORE_TX-CAPACITY] REFUSED: raw backup needs %d bytes, TX FIFO "
+				"has %d free -- backup retained, no partial prepend\n",
+				nBackedup_bytes, fifo_buffer_tx.get_free_size());
+			fflush(stdout);
+			link_status = DROPPED;
+			return;
+		}
 		nMessages=nBackedup_bytes/(max_data_length+max_header_length-eff_long_hdr);
 
 #ifdef RESTORE_BACKUP_BOUNDS_FAILBEFORE
@@ -26047,7 +26164,16 @@ void cl_arq_controller::restore_backup_buffer_data()
 			total_restore += data_read_size;
 		}
 		if(total_restore > 0)
-			fifo_buffer_tx.push_front(restore_buf.data(), total_restore);
+		{
+			int restored = fifo_buffer_tx.push_front(restore_buf.data(), total_restore);
+			if(!capacity_defeat && restored != total_restore)
+			{
+				printf("[RESTORE_TX-CAPACITY] FATAL: preflight passed but prepend "
+					"stored %d/%d bytes -- dropping link\n", restored, total_restore);
+				fflush(stdout);
+				link_status = DROPPED;
+			}
+		}
 #endif
 	}
 }

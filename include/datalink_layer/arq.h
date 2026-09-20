@@ -4369,6 +4369,11 @@ public:
   // RECEIVED slot lengths in [0,data_batch_size).
   int rx_fifo_batch_need();
   int test_rxfifo_backpressure_hold();  // --test-rxfifo-backpressure-hold: Fix H#3 post-ACK loss regression
+  // Amount of fifo_buffer_tx headroom that must survive app ingestion so any
+  // config-change recovery can prepend the complete outstanding plaintext.
+  // Compression can make messages_tx[] much smaller than its raw backup, so the
+  // reserve is max(live framed bytes, fifo_buffer_backup occupancy).
+  int tx_restage_reserve_bytes();
   void restore_backup_buffer_data();
   void restore_tx_from_compressed();  // Decompress messages_tx back to raw in fifo_buffer_tx
   // RE-STAGE re-queue (silent-corruption-residual.md §12): re-queue every
@@ -4387,10 +4392,14 @@ public:
   //   transported_len} and advance the cursor. Called once per new-data batch build
   //   from the ONE pop funnel process_buffer_data_commander().
   // stream_tx_rollback_inflight: the re-stage un-commit — reset tx_stream_committed to
-  //   the in-flight batch's latched start (LIFO, idempotent, guarded). Called at every
-  //   re-stage byte-restore point (the two funnels + the open-coded BREAK legs).
+  //   the earliest outstanding batch's latched start, including a predecessor retained
+  //   only in the retransmit queue (LIFO, idempotent, guarded). Called at every re-stage
+  //   byte-restore point (the two funnels + the open-coded BREAK legs).
+  // earliest_tx_recovery_bsi: resolve that compressed-recovery restart identity before
+  //   restore_tx_from_compressed clears either messages_tx[] or the retransmit queue.
   void stream_tx_latch(int bsi, uint32_t transported_len);
-  void stream_tx_rollback_inflight();
+  int earliest_tx_recovery_bsi() const;
+  void stream_tx_rollback_inflight(int recovery_bsi = -1);
 
   // Option W STEP 3 (data-flow-stream-offset.md §8.6): portable reflected CRC-32 (IEEE
   // 802.3, poly 0xEDB88320) byte-fold. Pure/static; both peers fold identically so the

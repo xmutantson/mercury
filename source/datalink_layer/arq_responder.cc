@@ -17867,6 +17867,58 @@ int cl_arq_controller::test_dedup_rebase()
 		if(!pass) fails++;
 	}
 
+	// ================= CASE D -- duplicate-BSI reframe straddles cursor =====
+	// The field topology is a short BSI B delivered through held-current, followed
+	// by a config demote whose rebuilt BSI B is larger: [0,165) is duplicate while
+	// [165,540) is the first still-undelivered suffix. Identity-only de-dup used to
+	// drop all 540 bytes, so the next batch's stamp was 165 bytes behind the RX
+	// cursor and Option W tore the link down. The stamp-authoritative overlap path
+	// must instead trim exactly 165 and append the 375-byte suffix.
+	{
+		const int TOTAL=540, PREFIX=165, F=180;
+		char oracle[TOTAL];
+		for(int i=0;i<TOTAL;i++) oracle[i]=(char)(unsigned char)((i*23+9)&0xFF);
+		for(int i=0;i<this->nMessages;i++)
+		{
+			messages_rx[i].status=FREE; messages_rx[i].length=0;
+			messages_rx[i].batch_seq_id=-1;
+		}
+		for(int i=0;i<3;i++)
+		{
+			messages_rx[i].type=DATA_LONG;
+			messages_rx[i].id=(char)i;
+			messages_rx[i].length=F;
+			memcpy(messages_rx[i].data, oracle+i*F, F);
+			messages_rx[i].status=ACKED;
+			messages_rx[i].batch_seq_id=B;
+		}
+		this->data_batch_size=3;
+		this->rx_copy_window=-1;
+		this->rx_stream_emitted_bsi_hw=B;
+		this->rx_stream_delivered=PREFIX;
+		this->decrypt_delivered_bsi=B;
+		this->rsp_rebase_seam_armed=true;
+		this->rsp_cross_session_seam_armed=false;
+		this->rsp_stream_aborted=false;
+		this->rx_stream_stamp[B].start=0;
+		this->rx_stream_stamp[B].length=TOTAL;
+		this->rx_stream_stamp[B].valid=true;
+		this->fifo_buffer_rx.flush();
+		copy_data_to_buffer();
+		char suffix[TOTAL];
+		int n=this->fifo_buffer_rx.pop(suffix,(int)sizeof(suffix));
+		bool case_d=(n==TOTAL-PREFIX)
+			&& memcmp(suffix,oracle+PREFIX,(size_t)(TOTAL-PREFIX))==0
+			&& this->rx_stream_delivered==(uint64_t)TOTAL
+			&& !this->rsp_rebase_seam_armed;
+		printf("[TEST-DEDUP-REBASE] %s CASE-D straddling duplicate reframe: "
+			"trim=%d delivered=%d cursor=%llu seam=%d\n",
+			case_d?"PASS":"FAIL", PREFIX, n,
+			(unsigned long long)this->rx_stream_delivered,
+			this->rsp_rebase_seam_armed?1:0);
+		if(!case_d) fails++;
+	}
+
 	bool pass=(fails==0);
 	printf("[TEST-DEDUP-REBASE] %s: fails=%d (defeat=%d)\n", pass?"PASS":"FAIL", fails, defeat?1:0);
 	fflush(stdout);
