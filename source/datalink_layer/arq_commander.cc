@@ -6762,6 +6762,14 @@ bool cl_arq_controller::scream_rollback_slot_eligible(int status, int length,
 	return status != FREE && length > 0 && batch_seq_id >= 0;
 }
 
+// Default-on defeat gate for the deterministic fail-before arm.  Read fresh so
+// a single test binary can exercise either side in separate invocations.
+static bool probe_full_failure_coastdown_on()
+{
+	const char* e = std::getenv("MERCURY_PROBE_FULL_FAILURE_COASTDOWN_DEFEAT");
+	return !(e && *e && atoi(e) != 0);
+}
+
 bool cl_arq_controller::inband_route_failure_demote(int demote_target, const char* reason,
 	bool pin_ceiling, bool gearshift_owned)
 {
@@ -6780,12 +6788,16 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 	if(rate_opt.controls_link() && link_status == CONNECTED)
 	{
 		const unsigned long long now_ms = opt_now_ms();
+		const bool owned_probe_failure_coastdown =
+			probe_full_failure_coastdown_on() && gearshift_owned
+			&& rate_opt.owns_coastdown_transition(current_configuration, demote_target);
 		// A canonical transition is not committed until peer evidence closes its armed
 		// re-tag state.  Do not replace a lost-tag transaction with another demotion:
 		// keep the current target, let the ordinary retransmission re-emit its tag, and
 		// treat this degradation only as evidence.  Chaining 13->12->11 after the first
 		// tag was lost guarantees PHY desynchronization because the peer is still at 13.
-		if(inband_retag_armed && rate_opt.owns_link_experiment(now_ms))
+		if(inband_retag_armed && rate_opt.owns_link_experiment(now_ms)
+		   && !owned_probe_failure_coastdown)
 		{
 			printf("[GEARSHIFT-V2-AUTHORITY] degradation deferred while CONFIG_TAG "
 				"transition %d->%d awaits peer evidence; retransmission will re-tag target\n",
@@ -6799,6 +6811,24 @@ bool cl_arq_controller::inband_route_failure_demote(int demote_target, const cha
 			receiving_timer.reset();
 			connection_status = TRANSMITTING_DATA;
 			return true;
+		}
+		// A concrete full-batch failure at an unconfirmed probe target is the
+		// terminal result of that experiment, not a second competing detector.
+		// consume_failure_signal() has already closed the probe and opened this
+		// exact owner-selected rollback.  Retire the old climb tag before the
+		// chokepoint below arms the fallback tag; otherwise the generic deferral
+		// above preserves the failed target until the link timer tears down.
+		if(inband_retag_armed && owned_probe_failure_coastdown)
+		{
+			printf("[GEARSHIFT-V2-PROBE-FAILFAST] retire failed probe tag %d->%d; "
+			       "owner coast-down %d->%d proceeds\n",
+				inband_pre_announce_config, inband_retag_config,
+				current_configuration, demote_target);
+			fflush(stdout);
+			inband_retag_armed = false;
+			inband_retag_config = CONFIG_NONE;
+			inband_announce_bsi = -1;
+			inband_retag_count = 0;
 		}
 		if(gearshift_owned)
 		{
@@ -9132,6 +9162,25 @@ void cl_arq_controller::process_messages_rx_acks_data()
 				int rec = current_configuration;
 				if(opt_evaluate_batch_end(&rec))
 					opt_pending_switch_cfg = rec;
+			}
+
+			// An upward Gearshift probe that has not produced even one
+			// config-discriminating response has now completed a full batch with
+			// zero ACK.  Feed that concrete failure to the existing single owner
+			// immediately: it closes the failed probe, selects its recorded
+			// fallback, and the lossless CONFIG_TAG coast-down below preserves the
+			// batch.  Waiting for the generic NACK threshold can take longer than
+			// the link horizon at cfg16 (two 90-frame attempts), which is the
+			// observed +10 teardown.  No timer or failure threshold is changed.
+			if(probe_full_failure_coastdown_on()
+			   && rate_opt.owns_unconfirmed_upward_probe_at(current_configuration))
+			{
+				int owner_target = rate_opt.consume_failure_signal(
+					current_configuration, "unconfirmed_probe_full_batch_failure",
+					opt_now_ms(), narrowband_enabled == YES, robust_enabled == YES);
+				if(owner_target >= 0 && inband_route_failure_demote(owner_target,
+					"unconfirmed_probe_full_batch_failure", true, true))
+					return;
 			}
 
 			// Frame gearshift just applied but data failed — BREAK immediately.

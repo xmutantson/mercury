@@ -2579,6 +2579,15 @@ bool cl_rate_optimizer::owns_link_experiment(unsigned long long now_ms) const
     return (double)(now_ms - switch_started_ms) < std::max(1000.0, budget_ms);
 }
 
+bool cl_rate_optimizer::owns_unconfirmed_upward_probe_at(int current_cfg) const
+{
+    return mode == GEARSHIFT_V2_ACTIVE
+        && switch_inflight
+        && switch_action == GEARSHIFT_ACTION_PROBE
+        && switch_to_cfg == current_cfg
+        && gearshift_action_rank(switch_to_cfg) > gearshift_action_rank(switch_from_cfg);
+}
+
 bool cl_rate_optimizer::transition_matches(int from_cfg, int to_cfg) const
 {
     return mode == GEARSHIFT_V2_ACTIVE && switch_inflight &&
