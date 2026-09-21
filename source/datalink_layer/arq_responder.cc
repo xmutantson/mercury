@@ -8289,6 +8289,54 @@ int cl_arq_controller::test_inband_liveness()
 	}
 
 	// ========================================================================
+	// PART B8 — UNCONFIRMED PROBE FULL FAILURE: the first complete no-ACK
+	// result terminates the failed upward experiment and replaces its stale
+	// climb tag with the owner-selected fallback tag.  The defeat gate restores
+	// the old generic deferral, leaving current_configuration at CONFIG_11.
+	// ========================================================================
+	{
+		cl_telecom_system* ts = nullptr;
+		cl_arq_controller* cmd = make_cmd(/*inband_on=*/true, &ts);
+		cmd->rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		cmd->load_configuration(CONFIG_11, FULL, NO);
+		cmd->data_configuration = CONFIG_11;
+		cmd->negotiated_configuration = CONFIG_11;
+		const unsigned long long start_ms = cmd->opt_now_ms();
+		cmd->rate_opt.notify_switch_dispatched(
+			CONFIG_10, CONFIG_11, GEARSHIFT_ACTION_PROBE, CONFIG_10,
+			start_ms, false);
+		cmd->inband_retag_armed = true;
+		cmd->inband_pre_announce_config = CONFIG_10;
+		cmd->inband_retag_config = CONFIG_11;
+		cmd->inband_announce_bsi = 7;
+		cmd->inband_retag_count = 1;
+
+		check(cmd->rate_opt.owns_unconfirmed_upward_probe_at(CONFIG_11),
+			"B8.1 exact unconfirmed upward probe owns the failed target",
+			cmd->rate_opt.owns_unconfirmed_upward_probe_at(CONFIG_11) ? 1 : 0, 1);
+		int owner_target = cmd->rate_opt.consume_failure_signal(
+			CONFIG_11, "test-unconfirmed-probe-full-failure",
+			start_ms + 1000, false, false);
+		check(owner_target == CONFIG_10,
+			"B8.2 probe failure selects its recorded fallback",
+			owner_target, CONFIG_10);
+		bool routed = cmd->inband_route_failure_demote(
+			owner_target, "test-unconfirmed-probe-full-failure", true, true);
+		check(routed, "B8.3 owner rollback is consumed by the lossless route",
+			routed ? 1 : 0, 1);
+		check(cmd->current_configuration == CONFIG_10,
+			"B8.4 first full failure coast-down commits before another target batch",
+			cmd->current_configuration, CONFIG_10);
+		check(cmd->inband_retag_armed && cmd->inband_retag_config == CONFIG_10,
+			"B8.5 stale climb tag is replaced by fallback confirmation tag",
+			cmd->inband_retag_config, CONFIG_10);
+		check(cmd->send_break_pattern_count == 0,
+			"B8.6 probe failure recovery emits no BREAK",
+			cmd->send_break_pattern_count, 0);
+		delete cmd; delete ts;
+	}
+
+	// ========================================================================
 	// PART C — BOUNDED: repeated unrecovered stalls escalate to a hard reset
 	// ========================================================================
 	{

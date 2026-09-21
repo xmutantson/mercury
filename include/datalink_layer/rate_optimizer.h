@@ -291,6 +291,9 @@ public:
     // failures, but they do not own Axis-1 or hard-recovery decisions.  A live
     // switch/probe transaction is an exclusive experiment owned by Gearshift-v2.
     bool owns_link_experiment(unsigned long long now_ms = 0) const;
+    // True only while an upward PROBE transition is still awaiting peer
+    // confirmation at the locally loaded target configuration.
+    bool owns_unconfirmed_upward_probe_at(int current_cfg) const;
     bool transition_matches(int from_cfg, int to_cfg) const;
     int authorize_external_transition(int from_cfg, int requested_to_cfg,
                                       const char* reason,
