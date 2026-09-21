@@ -374,15 +374,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 			printf("[HAIL] 'I am Mercury' beacon detected!\n");
 			fflush(stdout);
 
-			if(!passive_monitor)
-			{
-				// Notify Winlink/trimode that incoming traffic detected
-				std::string pending_str = "PENDING\r";
-				tcp_socket_control.message->length = pending_str.length();
-				for(int i = 0; i < (int)pending_str.length(); i++)
-					tcp_socket_control.message->buffer[i] = pending_str[i];
-				tcp_socket_control.transmit();
-			}
+			// NOTE: no PENDING is emitted here. The HAIL beacon is generic and
+			// unaddressed, so at HAIL-detect the target callsign is not yet known.
+			// A scanner-control host is told to HOLD only once we have decoded a
+			// START_CONNECTION addressed to MYCALL (process_control_responder
+			// crc-match), matching the observed VARA cadence.
 
 			// Wait for commander to finish TX before responding.
 			// We detected HAIL mid-TX — remaining CMD symbols + flush could
@@ -2229,6 +2225,10 @@ void cl_arq_controller::process_messages_rx_data_control()
 			printf("[HAIL] Timeout waiting for START_CONNECTION, resuming HAIL scan\n");
 			fflush(stdout);
 			hail_detected = NO;
+			// Defensive: release any outstanding for-us PENDING (no-op in the common
+			// case -- PENDING now fires at START_CONNECTION decode, not at HAIL, so a
+			// bare-HAIL timeout has nothing to cancel).
+			rsp_emit_release();
 			// CONNECT-FAST-CONFIG revert (RESPONDER): we HAILed back but the fast-config
 			// START_CONNECTION never decoded on this channel. Revert the listen config to the
 			// incumbent ROBUST_0 so the reverted commander's ROBUST_0 HAIL + START_CONNECTION
@@ -4145,15 +4145,22 @@ void cl_arq_controller::process_control_responder()
 				fflush(stdout);
 			}
 
-			// Send PENDING to Winlink to notify incoming connection
-			// This allows Winlink to stop scanning and prepare PTT
-			std::string pending_str="PENDING "+destination_call_sign+"\r";
-			tcp_socket_control.message->length=pending_str.length();
-			for(int i=0;i<(int)pending_str.length();i++)
+			// PENDING: a connect addressed to MYCALL is being received. Bare token
+			// (the callsign is delivered on CONNECTED), emitted only now that the
+			// START_CONNECTION CRC has resolved to our callsign, and exactly once
+			// per inbound attempt (latched). Lets a scanner-control host hold and
+			// prepare PTT.
+			if(!pending_emitted)
 			{
-				tcp_socket_control.message->buffer[i]=pending_str[i];
+				std::string pending_str="PENDING\r";
+				tcp_socket_control.message->length=pending_str.length();
+				for(int i=0;i<(int)pending_str.length();i++)
+				{
+					tcp_socket_control.message->buffer[i]=pending_str[i];
+				}
+				tcp_socket_control.transmit();
+				pending_emitted=true;
 			}
-			tcp_socket_control.transmit();
 
 			// Genuine new session: clear the gap-abort data-integrity latch (the SOLE
 			// clear point, mirroring the passive-monitor accept above). A prior
@@ -4375,6 +4382,9 @@ void cl_arq_controller::process_control_responder()
 				tcp_socket_control.message->buffer[i]=str[i];
 			}
 			tcp_socket_control.transmit();
+			// Session established and announced (CONNECTED): no scanner-release is
+			// owed; clear the latch so a later teardown emits DISCONNECTED only.
+			pending_emitted=false;
 		}
 
 		link_status=CONNECTED;

@@ -4348,6 +4348,11 @@ public:
 	   */
   void process_messages_acknowledging_data();
   void process_control_responder();
+  // VARA scanner-control release: a for-us bare PENDING that never reached
+  // CONNECTED is released to a scanning host (CANCELPENDING+DISCONNECTED),
+  // idempotently via the pending_emitted latch. Returns true iff a hold was
+  // outstanding (so a caller owning its own DISCONNECTED can suppress it).
+  bool rsp_emit_release();
   void process_buffer_data_responder();
   // FIX-6: non-lossy RX-delivery send (handles non-blocking-socket back-pressure
   // by stashing the unsent tail in rx_deliver_pending). Returns false when the
@@ -7344,6 +7349,9 @@ public:
   // exactly -> the receive() BREAK gate is bit-identical to 48103fa.
   bool break_fh_carve_lift();
   int hail_detected;              // YES if HAIL beacon detected (responder LISTENING)
+  bool pending_emitted;           // RSP: a bare PENDING (for-MYCALL START_CONNECTION) was
+                                  // announced to the host and the session has not yet reached
+                                  // CONNECTED; single-shots PENDING and gates the release
   int hail_sent;                  // YES if commander has sent HAIL in current CONNECTING phase
 
   int ptt_on_delay_ms;

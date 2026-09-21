@@ -1528,6 +1528,7 @@ cl_arq_controller::cl_arq_controller()
 	break_detected=NO;
 	break_probe_consec_match=0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	hail_detected=NO;
+	pending_emitted=false;
 	hail_sent=NO;
 
 	ptt_on_delay_ms=0;
@@ -8949,6 +8950,9 @@ void cl_arq_controller::update_status()
 			hail_detected = NO;
 			connect_fast_timer.stop();
 			connect_fast_timer.reset();
+			// Release a scanner-control host we told to HOLD (bare PENDING) for a
+			// for-us connect that never reached CONNECTED (peer reverted mid-handshake).
+			rsp_emit_release();
 			this->link_status = DROPPED;
 			reset_session_state();
 			reset_all_timers();
@@ -9115,6 +9119,9 @@ void cl_arq_controller::update_status()
 	}
 	else if(link_timer.get_elapsed_time_ms()>=link_timeout)
 	{
+		// A for-us PENDING that never reached CONNECTED releases the scanner with
+		// CANCELPENDING+DISCONNECTED; otherwise the plain DISCONNECTED below.
+		bool rsp_released = rsp_emit_release();
 		this->link_status=DROPPED;
 		reset_session_state();
 		reset_all_timers();
@@ -9124,7 +9131,7 @@ void cl_arq_controller::update_status()
 		fifo_buffer_rx.flush();
 
 		// Notify Winlink of disconnect
-		if(tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
+		if(!rsp_released && tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
 		{
 			std::string str="DISCONNECTED\r";
 			tcp_socket_control.message->length=str.length();
@@ -10691,8 +10698,41 @@ void cl_arq_controller::abort_b2f_transfer(const char* reason)
 	reset_all_timers();
 }
 
+// VARA scanner-control release (session-connect-handshake data-flow). A bare
+// PENDING (process_control_responder crc-match) tells a scanning host to HOLD;
+// if that for-us connect never reaches CONNECTED, the host must be released so
+// it resumes scanning. The observed peer release is DISCONNECTED; the spec-
+// authority release for a pending-but-never-connected attempt is CANCELPENDING.
+// Emit BOTH, exactly once per pending attempt (the pending_emitted latch), only
+// on the RESPONDER inbound path. Returns true iff a hold was outstanding so a
+// caller that already owns a DISCONNECTED emit can suppress it (no duplicate).
+bool cl_arq_controller::rsp_emit_release()
+{
+	if(!pending_emitted)
+		return false;
+	pending_emitted = false;
+	if(tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
+	{
+		std::string cp="CANCELPENDING\r";
+		tcp_socket_control.message->length=cp.length();
+		for(int i=0;i<(int)cp.length();i++)
+			tcp_socket_control.message->buffer[i]=cp[i];
+		tcp_socket_control.transmit();
+
+		std::string dc="DISCONNECTED\r";
+		tcp_socket_control.message->length=dc.length();
+		for(int i=0;i<(int)dc.length();i++)
+			tcp_socket_control.message->buffer[i]=dc[i];
+		tcp_socket_control.transmit();
+	}
+	return true;
+}
+
 void cl_arq_controller::reset_session_state()
 {
+	// Leak-guard: a session boundary clears the scanner-hold latch so no stale
+	// PENDING state can trigger a spurious release in a later session.
+	pending_emitted = false;
 	scream_link_timeout_grace_used = false;
 	scream_reentry_listen_armed = false;
 	scream_reentry_recovery_pending = false;
