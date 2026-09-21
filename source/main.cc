@@ -3864,6 +3864,16 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_rtf;
                 failed += ARQ_rtf.test_rsp_timeout_format();
             }
+            // [PENDING-CONF] scanner-control PENDING conformance (session-connect-handshake.md):
+            // PENDING is bare + address-filtered (only a for-MYCALL START_CONNECTION emits it,
+            // the callsign rides on CONNECTED), and a for-us PENDING that never reaches CONNECTED
+            // releases the host once via CANCELPENDING+DISCONNECTED. Drives the REAL
+            // process_control_responder() and rsp_emit_release() and captures the control-socket
+            // bytes off the transmit seam. Deterministic, no RF.
+            {
+                cl_arq_controller ARQ_pc;
+                failed += ARQ_pc.test_pending_conformance();
+            }
             // R4 LINK-PARAMS quiesce gate (arq_commander.cc): an Axis-2 batch-size
             // renegotiation must not fire while the boundary is unclean (retx pending / last
             // batch partial), which would mix old-bsi retransmits into the first batch of the

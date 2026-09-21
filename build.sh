@@ -513,6 +513,7 @@ source/datalink_layer/arq_common.cc
 source/datalink_layer/l1_tx_journal.cc
 source/datalink_layer/l1_block_ack.cc
 source/datalink_layer/arq_responder.cc
+source/datalink_layer/test_pending_conformance.cc
 source/datalink_layer/l1_block_codec.cc
 source/datalink_layer/lp_transition_harness.cc
 source/datalink_layer/test_bigblock_arq_unit.cc
