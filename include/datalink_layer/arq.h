@@ -4349,6 +4349,13 @@ public:
 	   */
   void process_messages_acknowledging_data();
   void process_control_responder();
+  // VARA scanner-control hold: announce a bare PENDING to a scanning host at the
+  // EARLIEST address-matched inbound detection (a directed HAIL suffix-matched to
+  // MYCALL) and, failing that, at the START_CONNECTION crc-match. Single-shots on
+  // the pending_emitted latch so the HAIL site and the crc-match site are mutually
+  // exclusive -- exactly one PENDING per inbound attempt, whichever fires first.
+  // Returns true iff this call actually emitted (the latch was clear).
+  bool rsp_emit_pending();
   // VARA scanner-control release: a for-us bare PENDING that never reached
   // CONNECTED is released to a scanning host (CANCELPENDING+DISCONNECTED),
   // idempotently via the pending_emitted latch. Returns true iff a hold was

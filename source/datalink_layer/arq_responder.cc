@@ -374,11 +374,18 @@ void cl_arq_controller::process_messages_rx_data_control()
 			printf("[HAIL] 'I am Mercury' beacon detected!\n");
 			fflush(stdout);
 
-			// NOTE: no PENDING is emitted here. The HAIL beacon is generic and
-			// unaddressed, so at HAIL-detect the target callsign is not yet known.
-			// A scanner-control host is told to HOLD only once we have decoded a
-			// START_CONNECTION addressed to MYCALL (process_control_responder
-			// crc-match), matching the observed VARA cadence.
+			// PENDING at the EARLIEST address-matched detection. This HAIL was
+			// suffix-matched to MYCALL (set_hail_target(my_call_sign) above, so a
+			// beacon for anyone else never reaches this branch -- a non-MYCALL
+			// hail is silence, not a false hold). Tell a scanner-control host to
+			// stop scanning and prepare PTT now -- one control-frame ahead of the
+			// START_CONNECTION decode -- so the scan-stop window matches the
+			// address-directed HAIL, a token-timing the peer's undirected beacon
+			// cannot express. Latched: single-shots PENDING and makes this site and
+			// the START_CONNECTION crc-match site mutually exclusive (first wins).
+			// A monitor uses an undirected target and never announces.
+			if(!passive_monitor)
+				rsp_emit_pending();
 
 			// Wait for commander to finish TX before responding.
 			// We detected HAIL mid-TX — remaining CMD symbols + flush could
@@ -2225,9 +2232,11 @@ void cl_arq_controller::process_messages_rx_data_control()
 			printf("[HAIL] Timeout waiting for START_CONNECTION, resuming HAIL scan\n");
 			fflush(stdout);
 			hail_detected = NO;
-			// Defensive: release any outstanding for-us PENDING (no-op in the common
-			// case -- PENDING now fires at START_CONNECTION decode, not at HAIL, so a
-			// bare-HAIL timeout has nothing to cancel).
+			// Release the scanner: we announced a bare PENDING when the directed
+			// HAIL suffix-matched MYCALL, but the START_CONNECTION never decoded
+			// (a genuine turnaround miss, or a false-positive suffix match). Emit
+			// CANCELPENDING+DISCONNECTED once (idempotent, latched) so the host
+			// resumes scanning -- a HAIL-accept that never connects self-heals.
 			rsp_emit_release();
 			// CONNECT-FAST-CONFIG revert (RESPONDER): we HAILed back but the fast-config
 			// START_CONNECTION never decoded on this channel. Revert the listen config to the
@@ -4146,21 +4155,12 @@ void cl_arq_controller::process_control_responder()
 			}
 
 			// PENDING: a connect addressed to MYCALL is being received. Bare token
-			// (the callsign is delivered on CONNECTED), emitted only now that the
-			// START_CONNECTION CRC has resolved to our callsign, and exactly once
-			// per inbound attempt (latched). Lets a scanner-control host hold and
-			// prepare PTT.
-			if(!pending_emitted)
-			{
-				std::string pending_str="PENDING\r";
-				tcp_socket_control.message->length=pending_str.length();
-				for(int i=0;i<(int)pending_str.length();i++)
-				{
-					tcp_socket_control.message->buffer[i]=pending_str[i];
-				}
-				tcp_socket_control.transmit();
-				pending_emitted=true;
-			}
+			// (the callsign is delivered on CONNECTED), emitted here at the
+			// START_CONNECTION crc-match unless the directed-HAIL site already
+			// announced this attempt (the shared rsp_emit_pending latch keeps the
+			// two sites mutually exclusive -- exactly one PENDING per inbound
+			// attempt). Lets a scanner-control host hold and prepare PTT.
+			rsp_emit_pending();
 
 			// Genuine new session: clear the gap-abort data-integrity latch (the SOLE
 			// clear point, mirroring the passive-monitor accept above). A prior

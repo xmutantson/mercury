@@ -5,22 +5,35 @@
 // Pairs with mercury/fact-documents/session-connect-handshake.md. Verifies the
 // responder's scanner-control TCP status emissions against the observed peer
 // (VARA HF) cadence:
-//   1. PENDING is a BARE token (no callsign argument) and is emitted only once
-//      the inbound START_CONNECTION CRC resolves to MYCALL. The callsign rides
-//      on CONNECTED, never on PENDING.
+//   1. PENDING is a BARE token (no callsign argument). It is announced at the
+//      EARLIEST address-matched inbound detection -- a directed HAIL beacon
+//      suffix-matched to MYCALL -- and otherwise at the START_CONNECTION crc
+//      match. The two sites share one latch (rsp_emit_pending): exactly one bare
+//      PENDING rides per inbound attempt, whichever fires first. The callsign
+//      rides on CONNECTED, never on PENDING.
 //   2. A START_CONNECTION addressed to a callsign that is NOT MYCALL emits
-//      NOTHING (no PENDING) -- the address-filtered silence.
+//      NOTHING (no PENDING) -- the address-filtered silence. (The HAIL beacon is
+//      address-filtered one layer up by set_hail_target()/suffix match, so a
+//      non-MYCALL beacon never reaches the HAIL emit site either.)
 //   3. A for-us PENDING that never reaches CONNECTED releases the scanning host
-//      exactly once with CANCELPENDING + DISCONNECTED (single-owner, latched).
+//      exactly once with CANCELPENDING + DISCONNECTED (single-owner, latched) --
+//      from the crc-match PENDING state AND from the HAIL-PENDING state (a
+//      false-positive suffix match therefore self-heals at the hail timeout).
 //   4. A session with no outstanding PENDING (already CONNECTED / never pending)
 //      emits no release.
 //
-// The tests drive the PRODUCTION emit path -- process_control_responder() for
-// the crc-match branch and rsp_emit_release() for the teardown release -- and
-// capture the exact bytes written to tcp_socket_control via the existing test
-// transmit seam (cl_tcp_socket::g_test_transmit_hook). The release state used in
-// T3 is the latch SET by the real process_control_responder() in T1, so the
-// release is exercised from a production-derived state, not a hand poke.
+// The tests drive the PRODUCTION emit path -- rsp_emit_pending() (the shared
+// HAIL / crc-match emit helper), process_control_responder() for the crc-match
+// branch, and rsp_emit_release() for the teardown release -- and capture the
+// exact bytes written to tcp_socket_control via the existing test transmit seam
+// (cl_tcp_socket::g_test_transmit_hook). The release state used in T3/T7 is the
+// latch SET by the real emit path in the same test, not a hand poke. The HAIL
+// address filter itself (receive_hail_pattern / set_hail_target) needs RF audio
+// and is fire-proofed on the wire (the two-instance battery), not in-process.
+//
+// Sub-tests: T1/T1b crc-match bare PENDING + single-shot; T2 non-MYCALL silence;
+// T3 crc-match release; T4 negative-control release; T5 HAIL-PENDING latch +
+// single-shot; T6 HAIL/crc-match mutual exclusivity; T7 HAIL-timeout release.
 //
 // FAIL-BEFORE / PASS-AFTER: with the pre-fix parameterized "PENDING <caller>\r"
 // at the crc-match branch, T1 captures "PENDING TESTB\r" -> bare-token and
@@ -198,6 +211,75 @@ int cl_arq_controller::test_pending_conformance()
 	bool released3 = rsp_emit_release();
 	check(!released3 && strstr(g_pconf_cap, "CANCELPENDING") == NULL,
 		"no CANCELPENDING when nothing is pending (connected/idle)");
+
+	// ===================================================================== T5 =
+	// HAIL-PENDING: the directed-HAIL accept site announces via the production
+	// emit helper rsp_emit_pending() (the address filter -- set_hail_target(MYCALL)
+	// + suffix match -- lives one layer up in receive_hail_pattern(); a non-MYCALL
+	// beacon never reaches the helper, so it needs no callsign check of its own).
+	// A suffix-matched HAIL emits exactly one bare PENDING and latches; a re-detect
+	// on the same attempt emits nothing (single-shot).
+	pconf_reset();
+	link_status        = LISTENING;
+	connection_status  = RECEIVING;
+	pending_emitted    = false;
+	bool hp1 = rsp_emit_pending();            // production HAIL-site emit
+	check(hp1, "HAIL rsp_emit_pending emits on a clear latch");
+	check(strcmp(g_pconf_cap, "PENDING\r") == 0,
+		"HAIL-detect emits exactly one BARE PENDING\\r");
+	check(pconf_count_token("PENDING") == 1, "exactly one PENDING token (HAIL)");
+	check(strstr(g_pconf_cap, "PENDING TEST") == NULL, "no callsign arg on HAIL PENDING");
+	check(pending_emitted == true, "HAIL PENDING sets the latch");
+	pconf_reset();
+	bool hp2 = rsp_emit_pending();            // re-detect, same attempt
+	check(!hp2 && g_pconf_len == 0,
+		"second HAIL detect emits no second PENDING (single-shot)");
+
+	// ===================================================================== T6 =
+	// EXCLUSIVITY: once the HAIL site has announced PENDING, the later
+	// START_CONNECTION crc-match must NOT emit a second PENDING (shared latch),
+	// yet the session still advances to CONNECTION_RECEIVED. This exercises the
+	// REAL crc-match consumer (process_control_responder) with the latch pre-set
+	// by the REAL HAIL-site helper -- first-emit-wins, exactly one PENDING.
+	pconf_reset();
+	link_status        = LISTENING;
+	connection_status  = RECEIVING;
+	pending_emitted    = false;
+	rsp_emit_pending();                       // HAIL site fires first (latch set)
+	pconf_reset();                            // discard the HAIL PENDING bytes
+	messages_control.data[0] = (char)START_CONNECTION;
+	messages_control.data[1] = (char)my_crc;                       // addressed to us
+	callsign_pack("TESTB", 5, &messages_control.data[2], 0);
+	messages_control.length  = 7;
+	messages_control.status  = RECEIVED;
+	process_control_responder();              // crc-match consumer of the latch
+	check(pconf_count_token("PENDING") == 0,
+		"crc-match emits NO second PENDING when HAIL already announced");
+	check(g_pconf_len == 0, "crc-match emits nothing on the control socket (latch held)");
+	check(pending_emitted == true, "latch stays set through crc-match");
+	check(link_status == CONNECTION_RECEIVED, "session still advances to CONNECTION_RECEIVED");
+
+	// ===================================================================== T7 =
+	// SELF-HEAL: a HAIL-accept that never reaches CONNECTED (START_CONNECTION
+	// never decodes -> the E1 hail-timeout branch) releases the scanner from the
+	// HAIL-PENDING state, so a genuine turnaround miss OR a false-positive suffix
+	// match resumes scanning. Same single-owner release, idempotent.
+	pconf_reset();
+	link_status        = LISTENING;
+	connection_status  = RECEIVING;
+	pending_emitted    = false;
+	rsp_emit_pending();                       // HAIL site announced PENDING (latch set)
+	pconf_reset();
+	bool hrel = rsp_emit_release();           // the E1 hail-timeout release owner
+	check(hrel, "release fires for a HAIL-PENDING that never connected");
+	check(strcmp(g_pconf_cap, "CANCELPENDING\rDISCONNECTED\r") == 0,
+		"HAIL-timeout release = CANCELPENDING then DISCONNECTED");
+	check(pending_emitted == false, "latch cleared after HAIL-timeout release");
+	check(pconf_count_token("CANCELPENDING") == 1 && pconf_count_token("DISCONNECTED") == 1,
+		"exactly one CANCELPENDING and one DISCONNECTED (HAIL path)");
+	pconf_reset();
+	bool hrel2 = rsp_emit_release();
+	check(!hrel2 && g_pconf_len == 0, "HAIL-timeout release is idempotent");
 
 	// --- restore --------------------------------------------------------------
 	cl_tcp_socket::g_test_transmit_hook = saved_hook;

@@ -10698,6 +10698,27 @@ void cl_arq_controller::abort_b2f_transfer(const char* reason)
 	reset_all_timers();
 }
 
+// VARA scanner-control hold (session-connect-handshake data-flow). Announce a
+// bare PENDING so a scanning host stops scanning and prepares PTT. It is emitted
+// at the EARLIEST inbound event that is already address-matched to MYCALL -- a
+// directed HAIL beacon whose suffix resolved to our callsign -- and otherwise at
+// the START_CONNECTION crc-match. Single-owner: the pending_emitted latch makes
+// the two emit sites mutually exclusive, so exactly one bare PENDING rides per
+// inbound attempt (whichever site fires first wins). The callsign is delivered on
+// CONNECTED, never on PENDING. Returns true iff this call emitted (latch clear).
+bool cl_arq_controller::rsp_emit_pending()
+{
+	if(pending_emitted)
+		return false;
+	pending_emitted = true;
+	std::string pending_str="PENDING\r";
+	tcp_socket_control.message->length=pending_str.length();
+	for(int i=0;i<(int)pending_str.length();i++)
+		tcp_socket_control.message->buffer[i]=pending_str[i];
+	tcp_socket_control.transmit();
+	return true;
+}
+
 // VARA scanner-control release (session-connect-handshake data-flow). A bare
 // PENDING (process_control_responder crc-match) tells a scanning host to HOLD;
 // if that for-us connect never reaches CONNECTED, the host must be released so
