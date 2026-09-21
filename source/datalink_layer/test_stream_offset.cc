@@ -1029,10 +1029,17 @@ int cl_arq_controller::test_stream_offset()
 
 		// (1) A transfer delivers 240 app bytes and completes CLEANLY (peer CLOSE / EOT verified).
 		decrypt_delivered_bsi = 210;
-		this->data_batch_size = 1;
+		// 240 app bytes exceed one frame's payload capacity (messages_rx[].data holds N_MAX/8 =
+		// 200 usable bytes before its 16-byte overflow canary), so -- exactly as on the wire --
+		// the transfer arrives as TWO production-sized frames (200 + 40). Filling a single frame
+		// buffer with all 240 bytes overran it into the next allocation; split it across the
+		// batch, preserving the same 240-byte delivered stream (frame1 continues frame0's fill).
+		this->data_batch_size = 2;
 		for(int f=0;f<nMessages;f++){ messages_rx[f].status=FREE; messages_rx[f].length=0; }
-		for(int j=0;j<240;j++) messages_rx[0].data[j]=(char)((j*3+7)&0x7F);
-		messages_rx[0].length=240; messages_rx[0].id=(char)0; messages_rx[0].status=ACKED;
+		for(int j=0;j<200;j++) messages_rx[0].data[j]=(char)((j*3+7)&0x7F);
+		messages_rx[0].length=200; messages_rx[0].id=(char)0; messages_rx[0].status=ACKED;
+		for(int j=0;j<40;j++)  messages_rx[1].data[j]=(char)(((200+j)*3+7)&0x7F);
+		messages_rx[1].length=40;  messages_rx[1].id=(char)1; messages_rx[1].status=ACKED;
 		copy_data_to_buffer();
 		{ char tmp[65536]; (void)fifo_buffer_rx.pop(tmp,(int)sizeof(tmp)); }
 		CHECK(rx_stream_delivered==240, "X3: transfer delivered 240 app bytes", (long long)rx_stream_delivered, 240);
