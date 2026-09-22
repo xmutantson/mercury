@@ -15517,7 +15517,9 @@ bool cl_arq_controller::gs2_liveness_control_exchange_exempt() const
 {
 	const char* ev = std::getenv("MERCURY_GS2_LIVENESS_CTRL_EXEMPT");
 	if(ev && *ev && atoi(ev) == 0) return false;
-	if(connection_status != TRANSMITTING_CONTROL && connection_status != RECEIVING_ACKS_CONTROL)
+	// Only the ACK wait itself is exempt (bounded by receiving_timeout and the retry budget);
+	// a commander parked in TRANSMITTING_CONTROL is exactly what the guard must still catch.
+	if(connection_status != RECEIVING_ACKS_CONTROL)
 		return false;
 	if(messages_control.status == FREE || messages_control.length <= 0 || messages_control.data == NULL)
 		return false;
