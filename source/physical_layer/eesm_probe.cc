@@ -597,6 +597,31 @@ void demod_grid(const st_geometry& g, const cplx* bb, int n0, double cfo_hz, cpl
 
 int frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max, bool sharp)
 {
+	if(!sharp)
+	{
+		// Demodulation front end = the WB data receive filter's own design, so the probe
+		// sees exactly the per-carrier impairments (edge roll-off, residual 2 fc image,
+		// added delay spread) that WB data cells see, whatever geometry the station is in:
+		// telecom_system init sets FIR_rx_data cut = bw/2 and transition = 3000 Hz at WB,
+		// and cl_FIR::design builds nTaps = 4 / (transition / (fs/2)) (odd), a sin(x)/x
+		// kernel normalised to unit sum, then a Hamming window.
+		const double fcut = 0.5 * g.Nc * g.fs / (double)g.Nfft;
+		const double trans = 3000.0;
+		int n = (int)(4.0 / (trans / (fs_pass / 2.0)));
+		if(n % 2 == 0) n++;
+		if(n > max || n < 3 || fs_pass <= 0.0) return 0;
+		const int h = n / 2;
+		double sum = 0.0;
+		for(int i = 0; i < n; i++)
+		{
+			const double t = 2.0 * M_PI * fcut * (double)(h - i) / fs_pass;
+			taps[i] = (i == h) ? 1.0 : std::sin(t) / t;
+			sum += taps[i];
+		}
+		for(int i = 0; i < n; i++)
+			taps[i] = taps[i] / sum * (0.54 - 0.46 * std::cos(2.0 * M_PI * (double)i / (double)(n - 1)));
+		return n;
+	}
 	// Windowed-sinc low-pass (Hamming). Pass edge: the outermost probe carrier plus one
 	// carrier spacing. Stop edge: the first frequency the decimation folds onto a probe
 	// carrier (decimated rate minus the pass edge). Nothing between the edges reaches a
