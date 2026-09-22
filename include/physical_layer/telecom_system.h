@@ -32,6 +32,7 @@
 #include "ofdm.h"
 #include "ldpc.h"
 #include "interleaver.h"
+#include "eesm_probe.h"
 // LEVER C (feat/decode-marathon): forward-declare the big-block multi-core decode
 // pool so the threading headers stay out of this widely-included header. The pool
 // is heap-owned + lazily constructed ONLY when MERCURY_LDPC_MULTICORE is set; the
@@ -880,6 +881,25 @@ public:
 	// ESN0) to verify noise_variance_estimate does NOT collapse (E1/cfg16-nvfix). Knobs:
 	// CONT_COLS, SCAT_DX, SCAT_DY. See fact-doc §13.
 	void sfo_grid_test();
+
+	// Link-quality sounding probe (physical_layer/eesm_probe.h). Both calls need the
+	// WB OFDM geometry loaded (Nc 50, not narrowband) and use this geometry's TX/RX
+	// filters, so probe cells see exactly the shaping data cells see. Neither is
+	// called from a production path; the handshake wires them.
+	//   generate: the probe passband at the data level (same scaling chain as
+	//     transmit_bit), returns samples written (0 = geometry/size refused).
+	//   measure: down-convert + filter with the data RX filter, timing search over
+	//     baseband starts [search_start_bb, +search_len_bb), estimate per carrier.
+	eesm_probe::st_geometry eesm_probe_geometry() const;
+	int  eesm_probe_nsymb = 0;   // 0 = library default; the harness varies it for the length sweep
+	int  generate_eesm_probe_passband(double* out, int max_samples);
+	bool measure_eesm_probe(double* passband, int n, double cfo_hint_hz,
+		int search_start_bb, int search_len_bb, eesm_probe::st_measurement* m);
+	// PLOT_PASSBAND harness (MERCURY_EESM_PROBE_SIM=1): estimator vs genie truth and
+	// the election vs per-config frame error rate on the same channel realization.
+	void eesm_probe_sim();
+	// Real TX/RX chain loopback for --test-eesm-probe. Returns the failure count.
+	int  eesm_probe_chain_selftest();
 
 	// CFG17 composition self-test result snapshot (--test-cfg17 / run_cfg17_selftest).
 	// Populated at the end of sfo_grid_test()'s coded block (additive — does NOT alter

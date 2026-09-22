@@ -2991,6 +2991,16 @@ int main(int argc, char *argv[])
             cl_arq_controller test_audio;
             return test_audio.test_capture_prep_geometry_change();
         }
+        if (strcmp(argv[i], "--test-eesm-probe") == 0) {
+            // Link-quality sounding probe: library tests + real TX/RX chain loopback.
+            int failed = eesm_probe::run_unit_tests();
+            cl_telecom_system ts;
+            ts.operation_mode = BER_PLOT_passband;
+            ts.load_configuration(CONFIG_0);
+            failed += ts.eesm_probe_chain_selftest();
+            printf("[EESM-TEST] %s (%d failure(s))\n", failed == 0 ? "ALL PASS" : "FAILED", failed);
+            return failed == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--test-snr-decision-grid") == 0) {
             int failed = run_snr_decision_grid_selftest();
             return (failed == 0) ? 0 : 1;
