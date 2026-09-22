@@ -257,9 +257,11 @@ static void t_baseband_path()
 	const double e3 = eesm_db(m.sinr_lin, g.Nc, 3.0) - eesm_db(gt, g.Nc, 3.0);
 	EP_CHECK(ok && std::fabs(e3) < 0.8, "eesm(beta 3) error %+.3f dB", e3);
 	// timing search must not lock two symbols early/late (distinct Chu roots per pair)
-	// expected metric ~ S/(S+N) in the time domain: per-sample SNR = carrier SNR * Nc/Nfft
+	// expected metric: the matched filter collects the strongest path coherently, so
+	// ~ (|g0|^2/(|g0|^2+|g1|^2)) * S/(S+N) with per-sample SNR = carrier SNR * Nc/Nfft
 	const double snr_t = std::pow(10.0, snr_db / 10.0) * g.Nc / g.Nfft;
-	EP_CHECK(ok && m.timing_metric > 0.8 * snr_t / (1.0 + snr_t), "detection metric %.3f (S/(S+N) %.3f)", m.timing_metric, snr_t / (1.0 + snr_t));
+	const double expm = (1.0 / (1.0 + std::norm(g1))) * snr_t / (1.0 + snr_t);
+	EP_CHECK(ok && m.timing_metric > 0.8 * expm, "detection metric %.3f (expected ~%.3f)", m.timing_metric, expm);
 }
 
 static st_measurement flat_measurement(double snr_db, double var_scale)

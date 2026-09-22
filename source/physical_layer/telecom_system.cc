@@ -15606,10 +15606,12 @@ void cl_telecom_system::eesm_probe_sim()
 	if(generate_eesm_probe_passband(probe.data(), np) != np) { printf("[EP-SIM] probe generation failed\n"); return; }
 
 	// Level and crest factor of the probe against a data frame of this configuration.
+	double probe_rms = 0.0;
 	{
 		double pr = 0.0, pp = 0.0;
 		for(int i = 0; i < np; i++) { pr += probe[(size_t)i] * probe[(size_t)i]; pp = std::max(pp, std::fabs(probe[(size_t)i])); }
 		pr = std::sqrt(pr / np);
+		probe_rms = pr;
 		const int nReal = data_container.nBits - ldpc.P;
 		const int nbytes = (nReal - outer_code_reserved_bits) / 8;
 		std::vector<int> bytes((size_t)std::max(1, nbytes));
@@ -15714,12 +15716,16 @@ void cl_telecom_system::eesm_probe_sim()
 				st_noise nzc(seed ^ (0xC0FFEEULL + (uint64_t)c * 7919ULL));
 				cl_sim_xoshiro drng(seed ^ (0xDA7AULL + (uint64_t)c));
 				int frames = 0, okf = 0;
+				double lvl = 0.0; long lvl_n = 0;
 				long t = t_data0;
 				const long t_end = t_data0 + (long)llround(win_s * sampling_frequency);
 				while(t < t_end)
 				{
 					for(int i = 0; i < nbytes; i++) bytes[(size_t)i] = (int)(drng.u64() & 0xFF);
 					transmit_byte(bytes.data(), nbytes, data_container.passband_data, SINGLE_MESSAGE);
+					if(frames == 0)
+						for(int i = data_container.Nofdm * data_container.preamble_nSymb * Mi; i < fl; i++)
+						{ lvl += data_container.passband_data[i] * data_container.passband_data[i]; lvl_n++; }
 					std::fill(x.begin(), x.end(), 0.0);
 					for(int i = 0; i < fl; i++) x[(size_t)(pad + i)] = data_container.passband_data[i];
 					ch.apply(x.data(), fl + 2 * pad, t - pad, y.data());
@@ -15741,8 +15747,9 @@ void cl_telecom_system::eesm_probe_sim()
 				const double gp = rbc * (frames > 0 ? (double)okf / frames : 0.0);
 				gp_of[(size_t)c] = gp; fer_of[(size_t)c] = frames > 0 ? 1.0 - (double)okf / frames : 1.0;
 				if(gp > best_gp + 1e-9) { best_gp = gp; best_cfg = c; }
-				printf("[EP-CAND] chan=%s esn0=%.2f seed=%d cfg=%d frames=%d ok=%d rbc=%.1f gp=%.1f\n",
-					ch.name(), esn0, sd, c, frames, okf, rbc, gp);
+				printf("[EP-CAND] chan=%s esn0=%.2f seed=%d cfg=%d frames=%d ok=%d rbc=%.1f gp=%.1f data_rms_vs_probe_db=%+.2f\n",
+					ch.name(), esn0, sd, c, frames, okf, rbc, gp,
+					(lvl_n > 0 && probe_rms > 0.0) ? 10 * std::log10(lvl / lvl_n) - 20 * std::log10(probe_rms) : 0.0);
 			}
 			load_configuration(probe_cfg);
 			const int rc = (d.rung >= 0 && d.rung < 64) ? d.rung : -1;
