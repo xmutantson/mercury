@@ -5520,6 +5520,7 @@ public:
   // Receive-frame period (+10 symbol settle margin, samples) and config of the last
   // OFDM batch this side keyed: sizes the next CONFIG_TAG processing guard.
   long    gs2_prev_tx_frame_samples = 0;
+  long long gs2_frames_start_ms = 0;   // lp_now() at frame 0 of the last keydown
   int     gs2_prev_tx_config = -1;
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
@@ -7886,7 +7887,7 @@ private:
   // source. Selects the epoch-guarded primitive owner_keydown_end, else the private latch;
   // applies it RAISE-ONLY. The private latch and its other readers stay in place.
   int  mc2_slot_floor_kd_ms(int& kd_src_out) const;
-  int  linkphase_slot_kd_remaining_ms(int kd_ms) const;  // keydown term after the timer origin
+  int  linkphase_slot_kd_remaining_ms(int kd_ms);  // keydown term after the timer origin
   bool gs2_coordinated_wb_entry(int config);              // ACKed SWITCH_BANDWIDTH = coordinated change
   long gs2_tag_guard_samples(long window_guard_samples);  // CONFIG_TAG guard = peer frame period
   bool inband_ctrl_miss_resumes_data(int control_code) const;

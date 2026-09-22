@@ -15411,13 +15411,24 @@ int cl_arq_controller::test_lp_break_recovery_fail_closed()
 // 90-frame CONFIG_16 batch) after every missed ACK although reverse ACKs arrive
 // within the turnaround.  While the keydown has not ended for the current token the
 // full term is kept.  MERCURY_LINKPHASE_SLOT_ORIGIN=0 restores the old arithmetic.
-int cl_arq_controller::linkphase_slot_kd_remaining_ms(int kd_ms) const
+int cl_arq_controller::linkphase_slot_kd_remaining_ms(int kd_ms)
 {
 	const char* ev = std::getenv("MERCURY_LINKPHASE_SLOT_ORIGIN");
 	if(ev && *ev && atoi(ev) == 0) return kd_ms;
+	// kd_ms is the arithmetic keydown the responder itself derives from frame 0 (its
+	// conservative end-of-batch estimate, after which it sends the SACK even when tail
+	// frames were lost).  The slot therefore closes at frame0_start + kd_ms + turnaround +
+	// slot_width.  Once this keydown has drained, express that deadline from the timer
+	// origin: only the part of kd_ms not yet elapsed since frame 0 remains.
 	if(lp_state.owner == LP_TURNAROUND && lp_keydown_start_token != 0
-	   && lp_state.keydown_end_token == lp_keydown_start_token)
-		return 0;
+	   && lp_state.keydown_end_token == lp_keydown_start_token
+	   && gs2_frames_start_ms >= lp_keydown_start_ms && gs2_frames_start_ms > 0)
+	{
+		long long elapsed = lp_now() - gs2_frames_start_ms;
+		if(elapsed < 0) elapsed = 0;
+		long long rem = (long long)kd_ms - elapsed;
+		return rem > 0 ? (int)rem : 0;
+	}
 	return kd_ms;
 }
 
@@ -15518,22 +15529,29 @@ int cl_arq_controller::test_gs2_spec_conformance()
 	telecom_system = NULL;
 	message_transmission_time_ms = 292;
 	lp_config_gen = 0;
+	const int prior_sim_clock = sim_clock_enabled();
+	sim_clock_set_enabled(1);
 	lp_reset();
 	lp_note_keydown_start(/*bsi=*/3);
-	int kd_ms = 21082;
+	sim_clock_add_samples(48 * 2200);               // CONFIG_TAG + guard before frame 0
+	gs2_frames_start_ms = lp_now();
+	int kd_ms = 21082;                               // arithmetic 90-frame keydown (responder view)
 	int keyed_term = linkphase_slot_kd_remaining_ms(kd_ms);        // keydown still running
-	lp_note_keydown_end(/*bsi=*/3, /*frames_region_len=*/(int)(kd_ms * 48LL),
+	sim_clock_add_samples(48 * 18100);              // the frames actually drained in 18.1 s
+	lp_note_keydown_end(/*bsi=*/3, /*frames_region_len=*/48 * 18100,
 		/*frames=*/90, /*force_full=*/false);
 	gs2sc_setenv("MERCURY_LINKPHASE_SLOT_ORIGIN", NULL);
 	int drained_term = linkphase_slot_kd_remaining_ms(kd_ms);      // timer starts post-drain
 	gs2sc_setenv("MERCURY_LINKPHASE_SLOT_ORIGIN", "0");
 	int old_term = linkphase_slot_kd_remaining_ms(kd_ms);
 	gs2sc_setenv("MERCURY_LINKPHASE_SLOT_ORIGIN", NULL);
+	sim_clock_set_enabled(prior_sim_clock);
+	gs2_frames_start_ms = 0;
 	if(keyed_term != kd_ms) { printf("[TEST-GS2SC] FAIL R1: keyed term %d != %d\n", keyed_term, kd_ms); fails++; }
-	else if(drained_term != 0) { printf("[TEST-GS2SC] FAIL R1: post-drain keydown counted again (%d ms)\n", drained_term); fails++; }
+	else if(drained_term != kd_ms - 18100) { printf("[TEST-GS2SC] FAIL R1: post-drain remaining keydown %d != %d\n", drained_term, kd_ms - 18100); fails++; }
 	else if(old_term != kd_ms) { printf("[TEST-GS2SC] FAIL R1: knob-off arm did not reproduce the double count (%d)\n", old_term); fails++; }
-	else printf("[TEST-GS2SC] PASS R1: post-drain slot floor keydown term 0 ms (knob-off arm "
-		"double-counts %d ms)\n", old_term);
+	else printf("[TEST-GS2SC] PASS R1: post-drain slot floor keeps only the unelapsed responder "
+		"keydown %d ms (knob-off arm double-counts %d ms)\n", drained_term, old_term);
 
 	// ---- R2: CONFIG_TAG guard = peer receive-frame period, never above the window guard -----
 	gs2_prev_tx_frame_samples = (20 + 10) * 1168L;   // CONFIG_13: preamble 4 + Nsymb 16, +10 margin
@@ -17072,6 +17090,9 @@ void cl_arq_controller::send_batch()
 
 	// Remember this batch's receive geometry: the next CONFIG_TAG's processing guard is
 	// sized by the frame period the peer uses while it is still in this configuration.
+	// Frame-0 instant of this keydown (after any CONFIG_TAG and its guard): the responder
+	// anchors its end-of-batch estimate here, so the ACK slot is anchored here as well.
+	gs2_frames_start_ms = lp_now();
 	if(telecom_system != NULL && is_ofdm_config(current_configuration))
 	{
 		gs2_prev_tx_frame_samples = (long)(telecom_system->data_container.preamble_nSymb

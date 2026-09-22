@@ -771,7 +771,8 @@ req("config-tag-guard-is-the-peer-frame-period",
     "the tag guard covers the peer's old-geometry snapshot period, not a whole acquisition window")
 req("ack-slot-floor-counts-keydown-in-timer-clock",
     common.count("linkphase_slot_kd_remaining_ms(kd_ms) + turnaround + slot_width") == 2 and
-    allin(common, "MERCURY_LINKPHASE_SLOT_ORIGIN", "PASS R1: post-drain slot floor"),
+    allin(common, "MERCURY_LINKPHASE_SLOT_ORIGIN", "gs2_frames_start_ms = lp_now();",
+          "PASS R1: post-drain slot floor keeps only the unelapsed responder"),
     "a missed ACK costs the turnaround, not one more keydown, because the receive timer starts post-drain")
 req("unacknowledged-batch-geometry-control-resumes-data",
     "inband_ctrl_miss_resumes_data(miss_code)" in cmd and
