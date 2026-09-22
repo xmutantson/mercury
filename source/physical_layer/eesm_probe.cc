@@ -598,13 +598,17 @@ void demod_grid(const st_geometry& g, const cplx* bb, int n0, double cfo_hz, cpl
 int frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max)
 {
 	// Windowed-sinc low-pass (Hamming). Pass edge: the outermost probe carrier plus one
-	// carrier spacing. Stop edge: the lower edge of the image the real-to-complex mix
-	// leaves at 2 fc (2 fc minus the same half-band). Length from the Hamming transition
-	// width, ~3.3 fs / transition (Oppenheim & Schafer, Discrete-Time Signal Processing,
-	// 7.5.1), odd so the filter is centred (zero delay).
+	// carrier spacing. Stop edge: the first frequency the decimation folds onto a probe
+	// carrier (decimated rate minus the pass edge). Nothing between the edges reaches a
+	// probe carrier bin: the 2 fc image of the real-to-complex mix lands on bins
+	// 2 fc / dF - q (an integer shift, orthogonal to the carriers inside the FFT window).
+	// A gentle transition keeps the filter short (little added delay spread). Length
+	// from the Hamming transition width, ~3.3 fs / transition (Oppenheim & Schafer,
+	// Discrete-Time Signal Processing, 7.5.1), odd so the filter is centred (zero delay).
+	(void)fc;
 	const double df = g.fs / (double)g.Nfft;
 	const double f_pass = (g.Nc / 2 + 1) * df;
-	const double f_stop = 2.0 * fc - f_pass;
+	const double f_stop = g.fs - f_pass;
 	if(fs_pass <= 0.0 || f_stop <= f_pass) return 0;
 	const double fcut = 0.5 * (f_pass + f_stop);
 	int n = (int)std::ceil(3.3 * fs_pass / (f_stop - f_pass));

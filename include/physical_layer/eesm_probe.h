@@ -133,7 +133,7 @@ void demod_grid(const st_geometry& g, const std::complex<double>* bb, int n0, do
 // be in the narrowband discovery geometry when the probe arrives): mix the real passband
 // (modem convention: passband = Re{x e^{-i w t}}) down by fc, low-pass with the library's
 // own windowed-sinc filter (pass edge = outermost probe carrier + one spacing, stop edge =
-// the lower edge of the 2 fc mixing image), decimate to g.fs. Returns the number of
+// first frequency the decimation folds onto a probe carrier), decimate to g.fs. Returns the number of
 // baseband samples written. frontend_noise_shape gives |H(f_k)|^2 of that filter at the
 // probe carriers (the noise shape the estimator whitens by).
 int  frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max);
