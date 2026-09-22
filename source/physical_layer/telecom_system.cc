@@ -15413,21 +15413,8 @@ bool cl_telecom_system::measure_eesm_probe(double* passband, int n, double cfo_h
 	const eesm_probe::st_geometry g = eesm_probe_geometry();
 	std::memset(m, 0, sizeof(*m));
 	if(!eesm_probe_geometry_ok(g)) return false;
-	const int Mi = frequency_interpolation_rate;
-	const int nbb = n / Mi;
-	if(nbb <= 0) return false;
-	std::vector<std::complex<double>> bb((size_t)nbb), bbs((size_t)nbb);
-	if(eesm_probe::passband_to_probe_baseband(g, passband, nbb * Mi, sampling_frequency,
-	       carrier_frequency + cfo_hint_hz, bb.data(), nbb, false) != nbb
-	   || eesm_probe::passband_to_probe_baseband(g, passband, nbb * Mi, sampling_frequency,
-	       carrier_frequency + cfo_hint_hz, bbs.data(), nbb, true) != nbb)
-		return false;
-	double shape[eesm_probe::kMaxNc];
-	eesm_probe::frontend_noise_shape(g, sampling_frequency, carrier_frequency + cfo_hint_hz, shape);
-	const bool ok = eesm_probe::estimate_from_baseband(g, bb.data(), nbb, search_start_bb,
-		search_len_bb, m, shape, bbs.data());
-	if(ok) m->cfo_hz += cfo_hint_hz;
-	return ok;
+	return eesm_probe::estimate_from_passband(g, passband, n, sampling_frequency, carrier_frequency,
+		cfo_hint_hz, search_start_bb, search_len_bb, m);
 }
 
 namespace ep_sim {
@@ -15540,9 +15527,10 @@ static void ep_truth(cl_telecom_system* ts, const eesm_probe::st_geometry& g,
 	const int Mi = ts->frequency_interpolation_rate;
 	const int nbb = (int)clean_rx.size() / Mi;
 	std::vector<std::complex<double>> bb((size_t)nbb), Y((size_t)g.n_symb * g.Nc), X((size_t)g.Nc);
+	// mix with the true offset removed (as the estimator's second pass does)
 	eesm_probe::passband_to_probe_baseband(g, clean_rx.data(), nbb * Mi, ts->sampling_frequency,
-		ts->carrier_frequency, bb.data(), nbb);
-	eesm_probe::demod_grid(g, bb.data(), n0, cfo_true, Y.data());
+		ts->carrier_frequency - cfo_true, bb.data(), nbb);
+	eesm_probe::demod_grid(g, bb.data(), n0, 0.0, Y.data());
 	// Signal: mean power of the known cells (per unit data cell). Distortion: what the
 	// noise-free reception leaves in the silent cells (inter-symbol / inter-carrier
 	// leakage from paths outside the prefix window and from time variation), which a
@@ -15913,6 +15901,11 @@ int cl_telecom_system::eesm_probe_chain_selftest()
 		check(ok && std::fabs(e3) < 3.0 * eesm_probe::eesm_sigma_db(m, 3.0) + 0.3, "EESM(beta 3) within 3 sigma + 0.3 dB", e3, eesm_probe::eesm_sigma_db(m, 3.0));
 		const eesm_probe::st_decision d = eesm_probe::decide(m, eesm_probe::default_policy());
 		check(d.valid && d.rung != eesm_probe::kRungNone, "election produced a rung", d.rung, 0);
+		// the same reception with a frequency hint close to the truth (baseband units)
+		eesm_probe::st_measurement mh;
+		const bool okh = measure_eesm_probe(rx.data(), rxlen, ch.baseband_cfo() + 1.5, 0, 2 * lead_bb, &mh);
+		check(okh && std::fabs(mh.cfo_hz - ch.baseband_cfo()) < 0.5 && std::fabs(mh.mean_snr_db - m.mean_snr_db) < 0.5,
+			"frequency hint honoured (total offset, band SNR vs unhinted)", mh.cfo_hz, mh.mean_snr_db - m.mean_snr_db);
 	}
 	printf("[EESM-TEST] modem chain: %d failure(s)\n", fails);
 	return fails;

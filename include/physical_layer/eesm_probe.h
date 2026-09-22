@@ -153,6 +153,15 @@ bool estimate_from_baseband(const st_geometry& g, const std::complex<double>* bb
 	int search_start, int search_len, st_measurement* m, const double* noise_shape = nullptr,
 	const std::complex<double>* bb_sync = nullptr);
 
+// Complete receive path on the real passband (the call the handshake makes): pass 1
+// mixes at fc - cfo_hint_hz through the image-rejecting front end for timing + coarse
+// frequency; pass 2 re-mixes with that offset removed through the short front end and
+// demodulates. cfo_hint_hz is the expected BASEBAND offset (units of m->cfo_hz), e.g.
+// the connect-stage estimate; 0 if unknown (capture range +-fs/Nfft = +-46.9 Hz).
+// search_start/search_len are in baseband samples (g.fs) of this buffer.
+bool estimate_from_passband(const st_geometry& g, const double* pb, int n, double fs_pass,
+	double fc, double cfo_hint_hz, int search_start, int search_len, st_measurement* m);
+
 // ---- EESM and election ---------------------------------------------------------
 // Numerically stable EESM (log-sum-exp), result in dB; -99 when n <= 0.
 double eesm_db(const double* sinr_lin, int n, double beta);

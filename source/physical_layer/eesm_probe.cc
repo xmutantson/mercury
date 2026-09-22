@@ -678,12 +678,10 @@ void frontend_noise_shape(const st_geometry& g, double fs_pass, double fc, doubl
 	}
 }
 
-bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
-	int search_start, int search_len, st_measurement* m, const double* noise_shape, const cplx* bb_sync)
+// Timing and coarse frequency of the probe in a baseband buffer (see estimate_from_baseband).
+static bool sync_probe(const st_geometry& g, const cplx* sy, int n, int search_start, int search_len,
+	int* out_n0, double* out_metric, double* out_fco)
 {
-	const cplx* sy = bb_sync ? bb_sync : bb;
-	std::memset(m, 0, sizeof(*m));
-	m->valid = false;
 	const int ns = symbol_samples(g);
 	const int total = probe_samples(g);
 	if(search_start < 0 || search_len <= 0 || search_start + search_len - 1 + total > n) return false;
@@ -721,12 +719,11 @@ bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 		const double met = (den > 0.0) ? num / den : 0.0;
 		if(met > best) { best = met; best_n = n0; }
 	}
-	m->timing_metric = best;
-	const int backoff = fft_backoff(g);
 
 	// Coarse frequency estimate from the half-symbol repetition (even-bin symbols repeat
 	// every Nfft/2 samples, odd-bin symbols repeat with a sign flip): Moose estimator,
 	// unambiguous over +-fs/Nfft.
+	const int backoff = fft_backoff(g);
 	cplx A(0.0, 0.0);
 	for(int s = 0; s < g.n_symb; s++)
 	{
@@ -736,15 +733,53 @@ bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 		for(int mm = 0; mm < h; mm++) a += r[mm + h] * std::conj(r[mm]);
 		A += sg * a;
 	}
-	const double fco = (std::abs(A) > 0.0) ? std::arg(A) / (2.0 * M_PI) * g.fs / (double)h : 0.0;
+	*out_n0 = best_n;
+	*out_metric = best;
+	*out_fco = (std::abs(A) > 0.0) ? std::arg(A) / (2.0 * M_PI) * g.fs / (double)h : 0.0;
+	return true;
+}
 
+bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
+	int search_start, int search_len, st_measurement* m, const double* noise_shape, const cplx* bb_sync)
+{
+	std::memset(m, 0, sizeof(*m));
+	m->valid = false;
+	int n0 = 0; double met = 0.0, fco = 0.0;
+	if(!sync_probe(g, bb_sync ? bb_sync : bb, n, search_start, search_len, &n0, &met, &fco)) return false;
 	std::vector<cplx> Y((size_t)g.n_symb * g.Nc);
-	demod_grid(g, bb, best_n, fco, Y.data());
-	const double tm = m->timing_metric;
+	demod_grid(g, bb, n0, fco, Y.data());
 	if(!estimate_from_grid(g, Y.data(), m, noise_shape)) return false;
-	m->timing_metric = tm;
-	m->timing_offset = best_n;
+	m->timing_metric = met;
+	m->timing_offset = n0;
 	m->cfo_hz += fco;
+	return true;
+}
+
+bool estimate_from_passband(const st_geometry& g, const double* pb, int n, double fs_pass, double fc,
+	double cfo_hint_hz, int search_start, int search_len, st_measurement* m)
+{
+	std::memset(m, 0, sizeof(*m));
+	m->valid = false;
+	const int D = (int)std::lround(fs_pass / g.fs);
+	if(D < 1) return false;
+	const int nbb = n / D;
+	// Pass 1: image-rejecting copy, mixed at the hinted frequency -> timing + coarse offset.
+	std::vector<cplx> bs((size_t)nbb), bb((size_t)nbb);
+	if(passband_to_probe_baseband(g, pb, nbb * D, fs_pass, fc - cfo_hint_hz, bs.data(), nbb, true) != nbb) return false;
+	int n0 = 0; double met = 0.0, fco = 0.0;
+	if(!sync_probe(g, bs.data(), nbb, search_start, search_len, &n0, &met, &fco)) return false;
+	// Pass 2: short-filter copy re-mixed with the estimated offset removed, so the 2 fc
+	// image stays on whole bins (orthogonal to the carriers) and nothing leaks.
+	const double fmix = fc - cfo_hint_hz - fco;
+	if(passband_to_probe_baseband(g, pb, nbb * D, fs_pass, fmix, bb.data(), nbb, false) != nbb) return false;
+	std::vector<cplx> Y((size_t)g.n_symb * g.Nc);
+	demod_grid(g, bb.data(), n0, 0.0, Y.data());
+	double shape[kMaxNc];
+	frontend_noise_shape(g, fs_pass, fmix, shape);
+	if(!estimate_from_grid(g, Y.data(), m, shape)) return false;
+	m->timing_metric = met;
+	m->timing_offset = n0;
+	m->cfo_hz += cfo_hint_hz + fco;
 	return true;
 }
 
