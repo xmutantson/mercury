@@ -5816,9 +5816,10 @@ int cl_telecom_system::generate_topgear_confirm_passband(double* out,
 // RX: Detect ACK pattern and decode SNR suffix tones.
 // Returns decoded SNR (dB). Sets *out_snr_valid = true if suffix decoded reliably.
 float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
-	int* out_matched, bool* out_snr_valid)
+	int* out_matched, bool* out_snr_valid, double* out_metric)
 {
 	*out_snr_valid = false;
+	if(out_metric) *out_metric = 0.0;
 	if(ack_pattern_passband_samples <= 0) return -99.0f;
 
 	// Polyphase decimated path: mix + FIR + decimate fused.
@@ -5842,6 +5843,9 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 		ack_mfsk.nStreams, ack_mfsk.stream_offsets,
 		out_matched, 0, nullptr, &best_offset,
 		cl_mfsk::SNR_SUFFIX_LEN);
+	// The control-ACK accept gate (arq_common.cc control_ack_gate) needs the base
+	// detection metric even when the suffix path below rejects it.
+	if(out_metric) *out_metric = metric;
 
 	if(*out_matched < ack_mfsk.ack_match_threshold ||
 	   metric < cl_mfsk::CTRL_DETECT_METRIC_MIN || best_offset < 0)
@@ -5908,6 +5912,7 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 		    remetric >= cl_mfsk::CTRL_DETECT_METRIC_MIN && rebest_offset >= 0)
 		{
 			*out_matched = rematched;
+			if(out_metric) *out_metric = remetric;
 			best_offset = rebest_offset;
 		}
 		// else: keep the original best_offset; corrected baseband still

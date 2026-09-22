@@ -3018,6 +3018,11 @@ int main(int argc, char *argv[])
             // process is only implicitly seed-1; making it explicit also clears
             // any RNG consumption from earlier static initialization.
             srand(1u);
+            if (const char* mc = getenv("MERCURY_CTRL_ACK_MC")) {
+                // Control-ACK gate measurement only (floor derivation); no other test runs.
+                cl_arq_controller ctrl_ack_mc;
+                return ctrl_ack_mc.measure_ctrl_ack_gate(mc);
+            }
             int failed = run_mfsk_ctrl_codec_tests();
             failed += run_snr_decision_grid_selftest();
             if (getenv("MERCURY_CAP_CODEC_ONLY") != NULL)

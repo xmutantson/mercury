@@ -68,6 +68,7 @@ cl_mfsk::cl_mfsk()
 	ack_pattern_len = 0;
 	ack_pattern_nsymb = 0;
 	ack_match_threshold = 0;
+	ack_conc_floor = 0.0;
 	break_match_threshold = 0;
 	break_metric_threshold = 0.0;
 	hail_match_threshold = 0;
@@ -90,6 +91,42 @@ cl_mfsk::cl_mfsk()
 cl_mfsk::~cl_mfsk()
 {
 	deinit();
+}
+
+// Control-ACK concentration floor per ACK geometry (conc = metric / matched, the mean
+// per-symbol share of in-band energy in the expected tone). The bare control ACK has
+// no CRC, so this floor and ack_match_threshold are its whole false-accept defence.
+// Derivation (measure_ctrl_ack_gate, --test with MERCURY_CTRL_ACK_MC=wb|nb; plain and
+// SNR-suffix detector paths pooled, both run the same pattern statistic):
+//   B      = P(Bin(16, 1/16) >= 7) = 2.57e-5 per poll: the false-accept rate the 7/16
+//            match threshold was designed to (see ack_match_threshold below); used as
+//            the control-plane budget for every geometry.
+//   c_FAR  = lowest floor whose pure-WGN rate P(matched >= thr, conc >= c) has a
+//            one-sided 95% upper bound <= B.
+//   S_edge = lowest ACK SNR (ACK power over noise in 3 kHz) at which the match count
+//            alone detects a complete tone in >= 90% of polls; c_edge = 1st percentile
+//            of genuine conc there (the floor may hold at most 1% of those polls).
+//   floor  = max(c_FAR, c_edge).
+// WB (M=16, Nc=50, 16 symbols, thr 7), N = 2.4e6 noise polls, 4080 tones per SNR:
+//   matched >= 7 alone on noise: 16.6% of polls (the match threshold is not a guard
+//   here); noise conc p50 0.105, max 0.18. c_FAR = 0.1625 (48 events, up95 2.5e-5);
+//   S_edge = -10 dB, c_edge = 0.1275 -> floor 0.1625 (budget-bound). The floor holds
+//   8.4% of match-detected tones at -10 dB, 1.1% at -9, < 1% from -8 dB up. The
+//   previous 0.35 floor held every tone at or below -7 dB and 91% at -6 dB.
+// NB (M=8, Nc=10, 32 symbols, thr 24), N = 6e5 noise polls: matched >= 24 alone on
+//   noise 9/6e5 = 1.5e-5 (up95 2.6e-5 > B), every one with conc 0.37-0.41 (ten bins
+//   make a chance-matched tone hold ~1/3 of the band), so the previous 0.35 floor did
+//   not act on NB. c_FAR = 0.3575; S_edge = -11 dB, c_edge = 0.46 -> floor 0.46
+//   (0/6e5 noise at or above it, up95 5e-6; holds 1% of match-detected tones at
+//   -11 dB, 0.1% at -10 dB, none above).
+// The floors are measured at the default match thresholds (wb_match_threshold_bias=0).
+// Other M values are not ACK geometries (ack_mfsk is M=16 WB / M=8 NB); they keep the
+// previous 0.35.
+double cl_mfsk::ack_conc_floor_for(int M)
+{
+	if (M == 16) return 0.1625;
+	if (M == 8)  return 0.46;
+	return 0.35;
 }
 
 void cl_mfsk::init(int _M, int _Nc, int _nStreams)
@@ -405,6 +442,7 @@ void cl_mfsk::init(int _M, int _Nc, int _nStreams)
 		for (int i = 0; i < ack_pattern_len; i++)
 			ack_tones[i] = (i * M / ack_pattern_len + 1) % M;
 	}
+	ack_conc_floor = ack_conc_floor_for(M);
 
 	// BREAK pattern tones.
 	// WB: Welch-Costas (p=17, g=7) — different generator from ACK (g=5).

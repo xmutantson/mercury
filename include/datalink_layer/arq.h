@@ -917,6 +917,23 @@ public:
   // force) for the regression test only.
   bool control_ack_strict_for(unsigned char code);
   int  ctrl_ack_strict_force = -1;
+  // True unless MERCURY_CTRL_ACK_STRICT=0 (or the test override forces it off).
+  bool ctrl_ack_strict_enabled();
+  // The one control-ACK accept decision (arq_common.cc). suffix_branch = the
+  // SNR-suffix branch of receive_ack_pattern (turbo / upward SET_CONFIG).
+  bool control_ack_gate(int matched, double metric, bool control_ack_strict,
+                        bool suffix_branch);
+  // Previous CLOSE-only concentration floor, kept for the MERCURY_CTRL_ACK_STRICT=0
+  // arm (byte-identical previous behaviour); the enabled gate uses the derived
+  // per-geometry ack_mfsk.ack_conc_floor.
+  static constexpr double CTRL_ACK_LEGACY_CLOSE_CONC_MIN = 0.35;
+  // The BREAK-ACK poll of the emergency-BREAK state machine (the responder's
+  // BREAK confirmation is the same bare ACK tone), routed through the control gate.
+  bool break_ack_poll();
+  // Offline measurement of the control-ACK gate statistics (noise-only and
+  // genuine-tone concentration per ACK geometry); --test with
+  // MERCURY_CTRL_ACK_MC=wb|nb runs only this and exits.
+  int  measure_ctrl_ack_gate(const char* geometry);
   // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
   // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
   // opts into the robust noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST

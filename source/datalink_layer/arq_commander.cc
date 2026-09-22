@@ -3231,7 +3231,7 @@ void cl_arq_controller::process_messages_commander()
 		set_recovery_ack_reps_for_wait(/*control_ack=*/true);
 		if(receiving_timer.get_elapsed_time_ms() < receiving_timeout)
 		{
-			if(receive_ack_pattern())
+			if(break_ack_poll())
 			{
 				if(gearshift_v2_finish_break_at_floor())
 					return;
@@ -5891,10 +5891,8 @@ bool cl_arq_controller::v2_rotate_retx_behind_lead()
 // the wait keeps polling until receiving_timeout, and a timed-out wait takes the
 // normal control resend path (process_messages_tx_control ACK_TIMED_OUT branch).
 // MERCURY_CTRL_ACK_STRICT=0 restores the CLOSE-only gate (byte-identical accept).
-bool cl_arq_controller::control_ack_strict_for(unsigned char code)
+bool cl_arq_controller::ctrl_ack_strict_enabled()
 {
-	if(code == CLOSE_CONNECTION)
-		return true;
 	if(ctrl_ack_strict_force >= 0)
 		return ctrl_ack_strict_force != 0;
 	static int cached = -1;
@@ -5902,8 +5900,33 @@ bool cl_arq_controller::control_ack_strict_for(unsigned char code)
 	{
 		const char* e = std::getenv("MERCURY_CTRL_ACK_STRICT");
 		cached = (e && *e && *e == '0') ? 0 : 1;
+		// One-time arm attestation for run logs.
+		printf("[CTRL-ACK-GATE] enabled=%d conc_floor=%.4f match_thr=%d (MERCURY_CTRL_ACK_STRICT=%s)\n",
+			cached, telecom_system ? telecom_system->ack_mfsk.ack_conc_floor : -1.0,
+			telecom_system ? telecom_system->ack_mfsk.ack_match_threshold : -1,
+			e ? e : "unset");
+		fflush(stdout);
 	}
 	return cached != 0;
+}
+
+bool cl_arq_controller::control_ack_strict_for(unsigned char code)
+{
+	if(code == CLOSE_CONNECTION)
+		return true;
+	return ctrl_ack_strict_enabled();
+}
+
+// BREAK-ACK poll. The responder confirms a BREAK with the same bare ACK tone every
+// control wait listens for, and a false accept here is as harmful as a false
+// SET_CONFIG accept: the commander settles at the recovery rung alone (or, under
+// GS2, at the floor) while the responder never heard the BREAK. Previously this
+// poll used the data floor. MERCURY_CTRL_ACK_STRICT=0 restores that
+// (receive_ack_pattern() with default arguments).
+bool cl_arq_controller::break_ack_poll()
+{
+	return receive_ack_pattern(false, false, -1,
+		/*control_ack_strict=*/ctrl_ack_strict_enabled());
 }
 
 void cl_arq_controller::process_messages_rx_acks_control()

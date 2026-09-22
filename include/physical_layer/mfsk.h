@@ -206,6 +206,14 @@ public:
 	int ack_pattern_len;    // Base tone sequence length (8 for WB, 32/48 for NB)
 	int ack_pattern_nsymb;  // Total symbols transmitted (16 for WB, 32/48 for NB)
 	int ack_match_threshold;   // Min matched symbols for ACK detection
+	// Control-ACK energy-concentration floor (metric / matched) for this ACK
+	// geometry. The bare control ACK carries no CRC, so the accept is a pure
+	// detection test; this floor is the noise-only false-accept guard that the
+	// match count alone does not provide at this geometry. Derivation per M in
+	// cl_mfsk::init (ack_* block). 0 = the match threshold alone meets the
+	// false-accept budget, no concentration floor applies.
+	double ack_conc_floor;
+	static double ack_conc_floor_for(int M);
 
 	// Scream correlation-token family (turnaround control). Four orthogonal
 	// 8-tone Welch-Costas bases on the unused primitive roots {10,11,12,14}
