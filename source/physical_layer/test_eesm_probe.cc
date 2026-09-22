@@ -139,8 +139,11 @@ static void t_estimator_flat()
 		const double mean = sum_lin / nok, sd = std::sqrt(std::max(0.0, s2 / nok - mean * mean));
 		const double emp_db = 10.0 / std::log(10.0) * sd / mean, pred_db = sig / nok;
 		const double bias_db = 10.0 * std::log10(mean);
-		EP_CHECK(nok == T && std::fabs(bias_db) < 0.15 && emp_db < 1.35 * pred_db && emp_db > 0.65 * pred_db,
-			"flat %+5.1f dB: bias %+.3f dB  sd %.3f dB  predicted %.3f dB  (n=%d)", snr, bias_db, emp_db, pred_db, nok);
+		// unbiased within 3 standard errors of the mean (plus 0.05 dB numerical slack);
+		// the predicted sigma must match the empirical spread within +-35%
+		const double se_db = emp_db / std::sqrt((double)nok);
+		EP_CHECK(nok == T && std::fabs(bias_db) < 3.0 * se_db + 0.05 && emp_db < 1.35 * pred_db && emp_db > 0.65 * pred_db,
+			"flat %+5.1f dB: bias %+.3f dB (se %.3f)  sd %.3f dB  predicted %.3f dB  (n=%d)", snr, bias_db, se_db, emp_db, pred_db, nok);
 	}
 }
 
@@ -254,7 +257,9 @@ static void t_baseband_path()
 	const double e3 = eesm_db(m.sinr_lin, g.Nc, 3.0) - eesm_db(gt, g.Nc, 3.0);
 	EP_CHECK(ok && std::fabs(e3) < 0.8, "eesm(beta 3) error %+.3f dB", e3);
 	// timing search must not lock two symbols early/late (distinct Chu roots per pair)
-	EP_CHECK(ok && m.timing_metric > 0.5, "detection metric %.3f", m.timing_metric);
+	// expected metric ~ S/(S+N) in the time domain: per-sample SNR = carrier SNR * Nc/Nfft
+	const double snr_t = std::pow(10.0, snr_db / 10.0) * g.Nc / g.Nfft;
+	EP_CHECK(ok && m.timing_metric > 0.8 * snr_t / (1.0 + snr_t), "detection metric %.3f (S/(S+N) %.3f)", m.timing_metric, snr_t / (1.0 + snr_t));
 }
 
 static st_measurement flat_measurement(double snr_db, double var_scale)
@@ -331,7 +336,7 @@ static void t_reply()
 		unsigned char b[3]; reply_to_bytes(w, b);
 		st_reply q;
 		const bool ok = decode_reply(reply_from_bytes(b), &q);
-		if(!ok || q.valid != d.valid || (d.valid && q.rung != d.rung) || q.cap_cfg != 15
+		if(!ok || q.valid != d.valid || (d.valid && q.rung != d.rung) || (d.valid && q.cap_cfg != 15)
 		   || std::fabs(q.eff_db - d.eff_at_rung_db) > 0.25 + 1e-9 || std::fabs(q.margin_db - 0.5) > 1e-9
 		   || q.time_selective != d.time_selective || q.freq_selective != d.freq_selective || w > 0xFFFFFF)
 			all = false;

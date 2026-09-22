@@ -15472,8 +15472,7 @@ struct st_chan {
 		}
 		else if(kind == 3)
 		{
-			double aa = 1.0 - std::pow(10.0, -depth_db / 20.0);
-			if(aa < 0.0) aa = 0.0; if(aa > 0.99) aa = 0.99;
+			const double aa = std::min(0.99, std::max(0.0, 1.0 - std::pow(10.0, -depth_db / 20.0)));
 			const double c0 = 1.0 / std::sqrt(1.0 + aa * aa), c1 = aa / std::sqrt(1.0 + aa * aa);
 			mfsk_watt::cl_doppler_scatter s1(seed ^ 0xBF58476D1CE4E5B9ULL, fd, Fs);
 			for(long i = 0; i < nsamp; i++) { g0[(size_t)i] = cplx(c0, 0.0); g1[(size_t)i] = c1 * s1.current(); s1.advance(1); }
@@ -15495,6 +15494,9 @@ struct st_chan {
 		}
 	}
 	const char* name() const { return kind == 0 ? "awgn" : kind == 1 ? "tworay" : kind == 2 ? "ccir" : "rician"; }
+	// The modem's passband is Re{x e^{-i w t}} (cl_ofdm::baseband_to_passband: Re x cos +
+	// Im x sin), so a +f passband shift appears as -f in the receiver's baseband.
+	double baseband_cfo() const { return -cfo_hz; }
 };
 
 struct st_noise {
@@ -15656,7 +15658,7 @@ void cl_telecom_system::eesm_probe_sim()
 			double gt[eesm_probe::kMaxNc];
 			std::vector<double> Nk((size_t)g.Nc);
 			for(int k = 0; k < g.Nc; k++) Nk[(size_t)k] = Nk_unit[(size_t)k] * sigma * sigma;
-			ep_truth(this, g, clean, ok ? m.timing_offset : lead_bb, ch.cfo_hz, Nk, gt);
+			ep_truth(this, g, clean, ok ? m.timing_offset : lead_bb, ch.baseband_cfo(), Nk, gt);
 			double gtm = 0.0; for(int k = 0; k < g.Nc; k++) gtm += gt[k]; gtm /= g.Nc;
 			// per-carrier error (dB) over carriers whose true SINR is above 0.1 x mean
 			double pe = 0.0, pe2 = 0.0; int pn = 0;
@@ -15676,7 +15678,7 @@ void cl_telecom_system::eesm_probe_sim()
 			printf("[EP-EST] chan=%s esn0=%.2f seed=%d ok=%d tmet=%.3f toff=%d(lead %d) cfo=%.3f(true %.2f) "
 				"mean_est=%.3f mean_true=%.3f sig_mean=%.3f carr_err_mean=%.3f carr_err_rms=%.3f n=%d "
 				"smooth=%d sratio=%.2f colored=%d tvar=%.5f fd_rms=%.3f fsel=%.3f dspread=%.3f cpu_ms=%.2f",
-				ch.name(), esn0, sd, (int)ok, m.timing_metric, m.timing_offset, lead_bb, m.cfo_hz, ch.cfo_hz,
+				ch.name(), esn0, sd, (int)ok, m.timing_metric, m.timing_offset, lead_bb, m.cfo_hz, ch.baseband_cfo(),
 				m.mean_snr_db, 10 * std::log10(std::max(1e-12, gtm)), m.sigma_mean_db,
 				pn ? pe / pn : 0.0, pn ? std::sqrt(pe2 / pn) : 0.0, pn, (int)m.smoothed, m.smooth_ratio,
 				(int)m.noise_colored, m.time_var_frac, m.fd_rms_hz, m.freq_sel_db, m.delay_spread_ms, cpu_ms);
@@ -15816,13 +15818,13 @@ int cl_telecom_system::eesm_probe_chain_selftest()
 		std::vector<double> Nk((size_t)g.Nc);
 		for(int k = 0; k < g.Nc; k++) Nk[(size_t)k] = Nk_unit[(size_t)k] * sigma * sigma;
 		double gt[eesm_probe::kMaxNc];
-		ep_truth(this, g, clean, ok ? m.timing_offset : lead_bb, ch.cfo_hz, Nk, gt);
+		ep_truth(this, g, clean, ok ? m.timing_offset : lead_bb, ch.baseband_cfo(), Nk, gt);
 		double gtm = 0.0; for(int k = 0; k < g.Nc; k++) gtm += gt[k]; gtm /= g.Nc;
 		printf("  esn0 %.1f dB: ok=%d timing %d (lead %d) cfo %.3f mean %.3f dB (truth %.3f, sigma %.3f) eesm3 %.3f (truth %.3f)\n",
 			esn0, (int)ok, m.timing_offset, lead_bb, m.cfo_hz, m.mean_snr_db, 10 * std::log10(gtm), m.sigma_mean_db,
 			eesm_probe::eesm_db(m.sinr_lin, g.Nc, 3.0), eesm_probe::eesm_db(gt, g.Nc, 3.0));
 		check(ok && std::abs(m.timing_offset - lead_bb) <= g.Ngi / 2, "timing within half the prefix of the true start", m.timing_offset, lead_bb);
-		check(ok && std::fabs(m.cfo_hz - ch.cfo_hz) < 0.5, "frequency offset recovered (Hz)", m.cfo_hz, ch.cfo_hz);
+		check(ok && std::fabs(m.cfo_hz - ch.baseband_cfo()) < 0.5, "frequency offset recovered (Hz)", m.cfo_hz, ch.baseband_cfo());
 		check(ok && std::fabs(m.mean_snr_db - 10 * std::log10(gtm)) < 3.0 * m.sigma_mean_db + 0.2,
 			"band SNR within 3 sigma + 0.2 dB of the genie truth", m.mean_snr_db, 10 * std::log10(gtm));
 		const double e3 = eesm_probe::eesm_db(m.sinr_lin, g.Nc, 3.0) - eesm_probe::eesm_db(gt, g.Nc, 3.0);

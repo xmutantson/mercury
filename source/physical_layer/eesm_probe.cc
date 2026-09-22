@@ -374,8 +374,7 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
 
 	// Per-carrier least-squares channel and the residual (time-variation) power.
 	std::vector<cplx> H((size_t)Nc);
-	std::vector<double> v((size_t)Nc), x2((size_t)Nc);
-	double res_sum = 0.0; int res_dof = 0;
+	std::vector<double> v((size_t)Nc), x2((size_t)Nc), resz((size_t)Nc, 0.0);
 	for(int k = 0; k < Nc; k++)
 	{
 		cplx acc(0.0, 0.0); int na = 0; double xx = 0.0;
@@ -383,14 +382,14 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
 			if(cell_active(g, s, k)) { acc += Z[(size_t)s * Nc + k]; na++; xx = std::norm(X[(size_t)s * Nc + k]); }
 		H[(size_t)k] = (na > 0) ? acc / (double)na : cplx(0.0, 0.0);
 		x2[(size_t)k] = xx;
+		// unbiased cell-to-cell variance of Z (channel units): E = var_channel + N/|X|^2
+		double r = 0.0;
 		for(int s = 0; s < S; s++)
-			if(cell_active(g, s, k))
-				res_sum += std::norm(Z[(size_t)s * Nc + k] - H[(size_t)k]) * xx;
-		res_dof += std::max(0, na - 1);
+			if(cell_active(g, s, k)) r += std::norm(Z[(size_t)s * Nc + k] - H[(size_t)k]);
+		resz[(size_t)k] = (na > 1) ? r / (double)(na - 1) : 0.0;
 		// variance of H_k from white noise of power N per received cell: N / (na |X|^2)
 		v[(size_t)k] = (na > 0 && xx > 0.0) ? 1.0 / ((double)na * xx) : 0.0;   // times N later
 	}
-	const double Nres = (res_dof > 0) ? res_sum / (double)res_dof : Nw;
 
 	// White-floor homogeneity test over five sub-bands (Bonferroni family-wise 1%).
 	// Under a white floor each sub-band mean of n_b exponential cells has relative
@@ -433,17 +432,24 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
 	const double vf = m->smoothed ? frac : 1.0;
 
 	// Per-carrier SINR (bias-corrected power over noise) and its variance.
+	// var_sinr is the per-carrier variance to be used in sums over carriers treated as
+	// independent. Unsmoothed estimates are independent across carriers:
+	// var|h|^2 = 2 P v + v^2. Smoothing projects the noise onto a fraction `frac` of
+	// the delay taps: each carrier's error shrinks (cross term 2 P frac v, quadratic
+	// (frac v)^2) but becomes correlated over ~1/frac carriers, so any smooth weighted
+	// sum over carriers keeps the cross term 2 P v and the quadratic term frac v^2.
 	double gsum = 0.0, gvar = 0.0, psum = 0.0;
 	for(int k = 0; k < Nc; k++)
 	{
 		const cplx h = m->smoothed ? Hs[(size_t)k] : H[(size_t)k];
-		const double vk = vf * v[(size_t)k] * Nk[(size_t)k];     // estimation variance of h
+		const double vraw = v[(size_t)k] * Nk[(size_t)k];        // unsmoothed variance of h
+		const double vk = vf * vraw;                              // variance of the h used
 		const double P = std::norm(h) - vk;                      // unbiased |H|^2
 		const double g_ = P / Nk[(size_t)k];
 		m->sinr_lin[k] = g_;
 		m->noise[k] = Nk[(size_t)k];
 		const double Pp = std::max(0.0, P);
-		m->var_sinr[k] = (2.0 * Pp * vk + vk * vk) / (Nk[(size_t)k] * Nk[(size_t)k]);
+		m->var_sinr[k] = (2.0 * Pp * vraw + vf * vraw * vraw) / (Nk[(size_t)k] * Nk[(size_t)k]);
 		gsum += g_;
 		gvar += m->var_sinr[k];
 		psum += P;
@@ -461,7 +467,11 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
 	// symbols) is (n/(n-1)) * 2 pi^2 sigma_f^2 * mean_ij (t_i-t_j)^2 * P for small
 	// sigma_f*T, and mean_ij (t_i-t_j)^2 = 2 var(t).
 	const double Pmean = psum / Nc;
-	m->time_var_frac = (Pmean > 0.0) ? std::max(0.0, Nres - Nw) / Pmean : 0.0;
+	double exc = 0.0;
+	for(int k = 0; k < Nc; k++)
+		exc += resz[(size_t)k] - (x2[(size_t)k] > 0.0 ? Nk[(size_t)k] / x2[(size_t)k] : 0.0);
+	exc /= Nc;
+	m->time_var_frac = (Pmean > 0.0) ? std::max(0.0, exc) / Pmean : 0.0;
 	{
 		const int n = S / 2;
 		const double T = (double)symbol_samples(g) / g.fs;
@@ -563,13 +573,13 @@ bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 	// combined noncoherently (tolerates a frequency offset up to ~fs/Nfft), normalised
 	// by the template and window energies (Cauchy-Schwarz bound -> metric in [0,1]).
 	const int h = g.Nfft / 2;
-	double tref = 0.0;
+	std::vector<double> th((size_t)g.n_symb * 2, 0.0);   // template energy per half symbol
 	for(int s = 0; s < g.n_symb; s++)
-		for(int mm = 0; mm < g.Nfft; mm++) tref += std::norm(ref[(size_t)s * ns + g.Ngi + mm]);
+		for(int mm = 0; mm < g.Nfft; mm++) th[(size_t)(2 * s + mm / h)] += std::norm(ref[(size_t)s * ns + g.Ngi + mm]);
 	double best = -1.0; int best_n = search_start;
 	for(int n0 = search_start; n0 < search_start + search_len; n0++)
 	{
-		double num = 0.0, en = 0.0;
+		double num = 0.0, den = 0.0;
 		for(int s = 0; s < g.n_symb; s++)
 		{
 			const cplx* r = bb + (size_t)n0 + (size_t)s * ns + g.Ngi;
@@ -577,15 +587,17 @@ bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 			for(int hh = 0; hh < 2; hh++)
 			{
 				cplx c(0.0, 0.0);
+				double en = 0.0;
 				for(int mm = hh * h; mm < (hh + 1) * h; mm++)
 				{
 					c += r[mm] * std::conj(t[mm]);
 					en += std::norm(r[mm]);
 				}
 				num += std::norm(c);
+				den += en * th[(size_t)(2 * s + hh)];
 			}
 		}
-		const double met = (en > 0.0 && tref > 0.0) ? num / (en * tref) * 2.0 : 0.0;
+		const double met = (den > 0.0) ? num / den : 0.0;
 		if(met > best) { best = met; best_n = n0; }
 	}
 	m->timing_metric = best;
@@ -697,11 +709,9 @@ uint32_t encode_reply(const st_decision& d)
 {
 	uint32_t w = 0;
 	const int rc = d.valid ? rung_code(d.rung) : 31;
-	long e = std::lround((d.eff_at_rung_db + 20.0) * 2.0);
-	if(e < 0) e = 0; if(e > 127) e = 127;
+	const long e = std::min(127L, std::max(0L, std::lround((d.eff_at_rung_db + 20.0) * 2.0)));
 	const int cc = d.valid ? rung_code(d.cap_cfg) : 31;
-	long mg = std::lround(d.margin_db * 4.0);
-	if(mg < 0) mg = 0; if(mg > 7) mg = 7;
+	const long mg = std::min(7L, std::max(0L, std::lround(d.margin_db * 4.0)));
 	w |= (uint32_t)(rc & 31) << 19;
 	w |= (uint32_t)(e & 127) << 12;
 	w |= (uint32_t)(cc & 31) << 7;
