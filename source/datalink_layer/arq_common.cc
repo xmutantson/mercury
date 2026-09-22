@@ -15519,7 +15519,13 @@ bool cl_arq_controller::gs2_liveness_control_exchange_exempt() const
 	if(ev && *ev && atoi(ev) == 0) return false;
 	if(connection_status != TRANSMITTING_CONTROL && connection_status != RECEIVING_ACKS_CONTROL)
 		return false;
-	return messages_control.status != FREE && messages_control.length > 0;
+	if(messages_control.status == FREE || messages_control.length <= 0 || messages_control.data == NULL)
+		return false;
+	// Only batch-geometry exchanges are exempt: their ACK wait is bounded by the control
+	// retry budget and an unacknowledged one resumes the data plane
+	// (inband_ctrl_miss_resumes_data), so they cannot livelock.  Every other control
+	// exchange keeps the guard as the backstop for a genuine control-plane livelock.
+	return inband_ctrl_miss_resumes_data((int)(unsigned char)messages_control.data[0]);
 }
 
 int cl_arq_controller::test_gs2_spec_conformance()
@@ -15606,13 +15612,24 @@ int cl_arq_controller::test_gs2_spec_conformance()
 		messages_control.status = ADDED_TO_LIST;
 		int saved_len = messages_control.length;
 		messages_control.length = 4;
-		bool live_on = gs2_liveness_control_exchange_exempt();
+		char r5_buf[8] = {0};
+		bool r5_null = (messages_control.data == NULL);
+		if(r5_null) messages_control.data = r5_buf;
+		char saved_code = messages_control.data ? messages_control.data[0] : 0;
+		bool other_exempt = true;
+		if(messages_control.data) { messages_control.data[0] = (char)SET_CONFIG;
+			other_exempt = gs2_liveness_control_exchange_exempt();
+			messages_control.data[0] = (char)SET_LINK_PARAMS; }
+		bool live_on = messages_control.data ? gs2_liveness_control_exchange_exempt() : true;
+		if(other_exempt) { printf("[TEST-GS2SC] FAIL R5: SET_CONFIG exchange exempted from the livelock guard\n"); fails++; }
 		gs2sc_setenv("MERCURY_GS2_LIVENESS_CTRL_EXEMPT", "0");
 		bool live_off = gs2_liveness_control_exchange_exempt();
 		gs2sc_setenv("MERCURY_GS2_LIVENESS_CTRL_EXEMPT", NULL);
 		messages_control.status = FREE;
 		bool freed = gs2_liveness_control_exchange_exempt();
 		messages_control.length = saved_len;
+		if(messages_control.data) messages_control.data[0] = saved_code;
+		if(r5_null) messages_control.data = NULL;
 		connection_status = IDLE;
 		if(!live_on || live_off || freed)
 		{ printf("[TEST-GS2SC] FAIL R5: live=%d off=%d freed=%d\n", live_on, live_off, freed); fails++; }
