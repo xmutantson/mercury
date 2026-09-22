@@ -2330,6 +2330,24 @@ bool cl_arq_controller::entry_leap_report_wait_hold()
 	return true;
 }
 
+// Commander poll gate for the entry-leap report hold. Same preconditions as the
+// config-switch dispatch it defers (a pending switch, idle control slot, no batch
+// under TX, connected, no BREAK). A hold granted here is poll-scoped: it suppresses
+// the dispatch, the data send AND the staging of the next batch on this poll, so the
+// link stays idle while the report tail decodes and the hold is re-entered (and its
+// deadline re-checked) on every following poll.
+bool cl_arq_controller::entry_leap_poll_gate()
+{
+	entry_leap_hold_this_poll = false;
+	if (opt_pending_switch_cfg >= 0
+	    && opt_pending_switch_cfg != current_configuration
+	    && messages_control.status == FREE && block_under_tx == NO
+	    && link_status == CONNECTED && emergency_break_active == 0
+	    && entry_leap_report_wait_hold())
+		entry_leap_hold_this_poll = true;
+	return entry_leap_hold_this_poll;
+}
+
 // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.4): apply the CFG16 big-block carve COOLDOWN as an
 // additional index-cap. When the cooldown is armed (bigblock_carve_cooldown_batches > 0)
 // and `proposed` is ABOVE the cooldown ceiling (CFG15), clamp DOWN to CFG15 (the rung
@@ -3277,6 +3295,9 @@ void cl_arq_controller::commander_handle_connected_disconnect()
 
 void cl_arq_controller::process_messages_commander()
 {
+	// Poll-scoped: only a hold granted by entry_leap_poll_gate() on THIS poll may
+	// suppress new-batch staging in process_buffer_data_commander().
+	entry_leap_hold_this_poll = false;
 	// ACTIVE-v2 single-owner purge: turboshift is a legacy Axis-1 controller, not
 	// a sensor. It contains direct load_configuration() settle paths that can bypass
 	// SET_CONFIG/CONFIG_TAG entirely, so merely fencing the transport is insufficient.
@@ -3871,11 +3892,7 @@ void cl_arq_controller::process_messages_commander()
 			}
 		}
 
-		if (opt_pending_switch_cfg >= 0
-		    && opt_pending_switch_cfg != current_configuration
-		    && messages_control.status == FREE && block_under_tx == NO
-		    && link_status == CONNECTED && emergency_break_active == 0
-		    && entry_leap_report_wait_hold())
+		if (entry_leap_poll_gate())
 			return;   // hold this poll; the deferred report tick runs first next poll
 		if (opt_pending_switch_cfg >= 0
 		    && opt_pending_switch_cfg != current_configuration
@@ -29569,6 +29586,13 @@ void cl_arq_controller::process_buffer_data_commander()
 		// MC-4 gates only this NEW-data admission edge. process_messages_tx_data()
 		// has already had its chance to drain a pending pure-retx turn, and a hold
 		// leaves every existing timeout/BREAK/recovery path untouched.
+		// Entry-leap report hold: while the commander holds the first wideband probe
+		// dispatch for the peer's forward report (entry_leap_poll_gate on this poll), do
+		// not stage the next batch either. A batch staged here would key on top of the
+		// report tail being waited for, and block_under_tx=YES would stop the hold and
+		// its deadline from being re-checked until that whole batch completed.
+		if(have_new_tx && stage_ok && entry_leap_hold_this_poll)
+			return;
 		bool rxwindow_hold = have_new_tx && stage_ok && cmd_rxwindow_hold_new_batch();
 		if( have_new_tx && stage_ok && !rxwindow_hold)
 		{
@@ -31026,6 +31050,135 @@ int cl_arq_controller::test_entry_leap_fwd()
 	check(!ro.entry_leap_dispatched(), "organic dispatch (no redirect staged) does not latch", ro.entry_leap_dispatched() ? 1 : 0, 0);
 	ro.reset_session_state();
 	check(!ro.entry_leap_dispatched(), "session reset clears latch", ro.entry_leap_dispatched() ? 1 : 0, 0);
+	fflush(stdout);
+	return fails;
+}
+
+// ---- directed test: the entry-leap report hold keeps the link idle and is bounded ----
+// Drives the REAL commander poll gate (entry_leap_poll_gate) and the REAL new-batch
+// staging path (process_buffer_data_commander) poll by poll, at the first wideband clean
+// ACK: a probe is pending, the confirm's report tail is still in flight, data is queued.
+//   G1  the first poll holds and stages NO new batch
+//   G2  every following poll re-enters the hold until the deadline; nothing is staged
+//       while held, and the hold itself releases (wait_done) within the deadline
+//   G3  a forward report decoded while holding releases the hold on the next poll
+int cl_arq_controller::test_entry_leap_hold_gate()
+{
+	int fails = 0;
+	auto check = [&](bool c, const char* what, long long got, long long want) {
+		printf("[TEST-ENTRY-LEAP-GATE] %s: %s (got %lld want %lld)\n",
+			c ? "PASS" : "FAIL", what, got, want);
+		if(!c) fails++;
+	};
+	std::string saved_wait;
+	{ const char* e = std::getenv("MERCURY_ENTRY_LEAP_WAIT_MS"); if(e) saved_wait = e; }
+	const bool had_wait = std::getenv("MERCURY_ENTRY_LEAP_WAIT_MS") != NULL;
+
+	max_data_length   = 6;
+	max_header_length = 6;
+	sack_v2_enabled   = true;
+	header_carries_d5 = false;
+	robust_enabled    = YES;
+	narrowband_enabled= NO;
+	compression_enabled = false;
+	role          = COMMANDER;
+	original_role = COMMANDER;
+	nMessages = 32;
+	set_data_batch_size(6);
+	deinit_messages_buffers();
+	if(init_messages_buffers() != SUCCESSFUL)
+	{
+		printf("[TEST-ENTRY-LEAP-GATE] FAIL: buffers\n");
+		return 1;
+	}
+	fifo_buffer_tx.set_size(default_configuration_ARQ.fifo_buffer_tx_size);
+	fifo_buffer_backup.set_size(default_configuration_ARQ.fifo_buffer_backup_size);
+	rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+
+	char payload[512];
+	for(int i = 0; i < (int)sizeof(payload); i++) payload[i] = (char)(i * 37 + 11);
+
+	// State at the first wideband clean ACK, after the batch was finalized.
+	auto first_wb_ack = [&]() {
+		for(int i = 0; i < nMessages; i++) { messages_tx[i].status = FREE; messages_tx[i].length = 0; }
+		fifo_buffer_tx.flush();
+		fifo_buffer_backup.flush();
+		fifo_buffer_tx.push(payload, (int)sizeof(payload));
+		link_status = CONNECTED;
+		connection_status = TRANSMITTING_DATA;
+		block_under_tx = NO;
+		retransmit_count = 0;
+		message_batch_counter_tx = 0;
+		emergency_break_active = 0;
+		messages_control.status = FREE;
+		current_configuration = CONFIG_0;
+		gearshift_reset_channel_reports();
+		rate_opt.reset_session_state();
+		opt_pending_switch_cfg = CONFIG_7;
+		opt_pending_switch_action = GEARSHIFT_ACTION_PROBE;
+		opt_pending_switch_fallback = CONFIG_0;
+		topgear_pending_report_bsi = 0;          // the confirm's report tail is in flight
+		entry_leap_wait_done = false;
+		entry_leap_wait_start_ms = 0;
+		entry_leap_hold_this_poll = false;
+	};
+	auto staged = [&]() { return block_under_tx == YES || get_nOccupied_messages() > 0; };
+
+	// ---- G1 + G2: bounded hold, link idle ----
+	const int WAIT_MS = 60;
+	setenv("MERCURY_ENTRY_LEAP_WAIT_MS", std::to_string(WAIT_MS).c_str(), 1);
+	first_wb_ack();
+	bool held = entry_leap_poll_gate();
+	process_buffer_data_commander();
+	check(held, "G1 first WB probe dispatch is held for the in-flight report", held, 1);
+	check(!staged(), "G1 next batch NOT staged on the held poll", staged() ? 1 : 0, 0);
+	{
+		cl_timer t; t.start();
+		int polls = 1, staged_while_held = staged() ? 1 : 0;
+		long long released_ms = -1;
+		while(t.get_elapsed_time_ms() < 2000)
+		{
+			held = entry_leap_poll_gate();
+			if(!held) { released_ms = t.get_elapsed_time_ms(); break; }
+			process_buffer_data_commander();
+			if(staged()) staged_while_held++;
+			polls++;
+			msleep(5);
+		}
+		printf("[TEST-ENTRY-LEAP-GATE] polls_held=%d released_ms=%lld wait_done=%d\n",
+			polls, released_ms, entry_leap_wait_done ? 1 : 0);
+		check(staged_while_held == 0, "G2 no batch staged on any held poll", staged_while_held, 0);
+		check(polls >= 3, "G2 the hold is re-entered poll after poll", polls, 3);
+		check(entry_leap_wait_done, "G2 the hold itself releases (wait_done)", entry_leap_wait_done ? 1 : 0, 1);
+		check(released_ms >= WAIT_MS - 10 && released_ms <= WAIT_MS + 150,
+			"G2 release honours the deadline", released_ms, WAIT_MS);
+		check(opt_pending_switch_cfg == CONFIG_7, "G2 organic probe target kept at expiry (anti-strand)",
+			opt_pending_switch_cfg, CONFIG_7);
+	}
+
+	// ---- G3: release on the decoded forward report ----
+	setenv("MERCURY_ENTRY_LEAP_WAIT_MS", "5000", 1);
+	first_wb_ack();
+	held = entry_leap_poll_gate();
+	process_buffer_data_commander();
+	check(held && !staged(), "G3 held, nothing staged, before the report", (held && !staged()) ? 1 : 0, 1);
+	// the deferred tick applies the report codeword (fwd grid -5+2q)
+	gearshift_apply_quality_report(gearshift_pack_quality_report(23.0, 0.5), 0);
+	check(gearshift_forward_snr_db > -90.0, "G3 precondition: forward report applied",
+		(long long)gearshift_forward_snr_db, 23);
+	{
+		cl_timer t; t.start();
+		held = entry_leap_poll_gate();
+		long long ms = t.get_elapsed_time_ms();
+		check(!held, "G3 hold released on the poll after the report decoded", held, 0);
+		check(ms < 1000, "G3 release is immediate (not the deadline)", ms, 0);
+		check(entry_leap_wait_done, "G3 one-shot latch set", entry_leap_wait_done ? 1 : 0, 1);
+	}
+
+	if(had_wait) setenv("MERCURY_ENTRY_LEAP_WAIT_MS", saved_wait.c_str(), 1);
+	else unsetenv("MERCURY_ENTRY_LEAP_WAIT_MS");
+	topgear_pending_report_bsi = -1;
+	deinit_messages_buffers();
 	fflush(stdout);
 	return fails;
 }

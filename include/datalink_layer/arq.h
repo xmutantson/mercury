@@ -2127,6 +2127,11 @@ public:
   bool entry_leap_report_wait_hold();   // true => hold this poll's dispatch
   bool entry_leap_wait_done;           // one-shot per WB session
   unsigned long long entry_leap_wait_start_ms;
+  // Set by entry_leap_poll_gate() when this commander poll is held for the forward
+  // report; process_buffer_data_commander() then stages no new batch on the same poll.
+  bool entry_leap_hold_this_poll;
+  bool entry_leap_poll_gate();          // true => hold this poll (no dispatch, no send)
+  int  test_entry_leap_hold_gate();
   int  test_nb_prior_guard();
   int  test_entry_leap_fwd();
 

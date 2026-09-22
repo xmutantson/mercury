@@ -1067,6 +1067,7 @@ cl_arq_controller::cl_arq_controller()
 	measurements.SNR_uplink=-99.9;
 	entry_leap_wait_done = false;
 	entry_leap_wait_start_ms = 0;
+	entry_leap_hold_this_poll = false;
 	measurements.SNR_downlink=-99.9;
 	measurements.SNR_uplink_data=-99.9;   // pollution guard: no forward-DATA frame decoded yet
 	measurements.signal_stregth_dbm=-99.9;
