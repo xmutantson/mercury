@@ -15600,6 +15600,11 @@ void cl_telecom_system::eesm_probe_sim()
 	using namespace ep_sim;
 	const int probe_cfg = current_configuration;
 	eesm_probe_nsymb = envi("MERCURY_EP_NSYMB", 0);
+	// Same transmit power as the passband BER sweep (BER_PLOT_passband_process_main sets
+	// 1 W before passband_test_EsN0) so this harness's Es/N0 axis IS the axis of the
+	// in-tree knee/beta calibration. Probe and data frames share it, so the probe's
+	// SINR-to-config relation does not depend on the value.
+	output_power_Watt = 1;
 	const eesm_probe::st_geometry g = eesm_probe_geometry();
 	if(!eesm_probe_geometry_ok(g, narrowband_enabled) || M == MOD_MFSK)
 	{
@@ -15756,6 +15761,7 @@ void cl_telecom_system::eesm_probe_sim()
 			{
 				const int c = (int)cd;
 				load_configuration(c);
+				output_power_Watt = 1;   // load_configuration restores the default; keep the sweep axis
 				if(M == MOD_MFSK || narrowband_enabled) continue;
 				const int nReal = data_container.nBits - ldpc.P;
 				const int nbytes = (nReal - outer_code_reserved_bits) / 8;
@@ -15805,6 +15811,7 @@ void cl_telecom_system::eesm_probe_sim()
 					(lvl_n > 0 && probe_rms > 0.0) ? 10 * std::log10(lvl / lvl_n) - 20 * std::log10(probe_rms) : 0.0);
 			}
 			load_configuration(probe_cfg);
+			output_power_Watt = 1;
 			const int rc = (d.rung >= 0 && d.rung < 64) ? d.rung : -1;
 			const double gp_ch = (rc >= 0) ? gp_of[(size_t)rc] : -1.0;
 			// the highest candidate that decoded at least half its frames (stranding reference)
