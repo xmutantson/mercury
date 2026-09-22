@@ -15627,6 +15627,12 @@ void cl_telecom_system::eesm_probe_sim()
 			20 * std::log10(dp / dr), 20 * std::log10(pr / dr), 20 * std::log10(pp / dp));
 	}
 	const std::vector<double> Nk_unit = ep_noise_profile(this, g, 424242ULL, 40);
+	{
+		double nm = 0.0; for(int k = 0; k < g.Nc; k++) nm += Nk_unit[(size_t)k]; nm /= g.Nc;
+		printf("[EP-NOISE] per-carrier RX noise profile (dB re mean):");
+		for(int k = 0; k < g.Nc; k++) printf(" %.2f", 10 * std::log10(Nk_unit[(size_t)k] / nm));
+		printf("\n");
+	}
 	printf("[EP-SIM] chan=%s fd=%.3f dtau_ms=%.3f depth_db=%.1f a=%.2f cfo=%.2f seeds=%d seed0=%d probe_cfg=%d n_symb=%d search_ms=%.0f dec=%d win_s=%.1f gap_s=%.2f\n",
 		ch.name(), ch.fd, ch.dtau_ms, ch.depth_db, ch.a, ch.cfo_hz, nseeds, seed0, probe_cfg, g.n_symb, search_ms,
 		(int)do_dec, win_s, gap_s);
