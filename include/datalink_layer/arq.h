@@ -909,6 +909,14 @@ public:
   // use the control energy floor (CTRL_DETECT_METRIC_MIN), not the lax data floor,
   // so a low-energy noise correlation cannot complete a spurious teardown.
   int  test_ctrl_ack_noise_rejection();
+  // Control-ACK gate selection. Every control-ACK wait on the commander polls the
+  // same bare, content-free MFSK base tone, so every control code gets the control
+  // floor + energy-concentration gate, not only CLOSE_CONNECTION. Returns true when
+  // the strict gate applies to `code`. MERCURY_CTRL_ACK_STRICT=0 restores the
+  // CLOSE-only gate. ctrl_ack_strict_force overrides the env (-1 follow env, 0/1
+  // force) for the regression test only.
+  bool control_ack_strict_for(unsigned char code);
+  int  ctrl_ack_strict_force = -1;
   // Level 3: TX short tone pattern instead of LDPC ACK. control_ack=true marks a
   // BREAK-recovery / SET_CONFIG control-ACK turnaround — the ONLY caller that
   // opts into the robust noncoherent-repeat ACK when MERCURY_RECOVERY_ACK_ROBUST

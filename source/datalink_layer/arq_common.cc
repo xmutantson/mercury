@@ -22264,6 +22264,21 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			bool base_accept = (matched_count >= telecom_system->ack_mfsk.ack_match_threshold
 			                    && metric >= ctrl_ack_metric_floor
 			                    && ctrl_ack_concentration_ok);
+			if(control_ack_strict
+			   && matched_count >= telecom_system->ack_mfsk.ack_match_threshold
+			   && metric >= ack_metric_threshold
+			   && !(metric >= ctrl_ack_metric_floor && ctrl_ack_concentration_ok))
+			{
+				// Would have been accepted on the data floor; the control gate holds
+				// it. The wait keeps polling (a real tone that is still arriving
+				// clears the gate on a later poll).
+				printf("[CTRL-ACK-STRICT] reject matched=%d metric=%.2f conc=%.3f "
+					"(floor %.2f, conc_min %.2f)\n",
+					matched_count, metric,
+					matched_count > 0 ? metric / (double)matched_count : 0.0,
+					ctrl_ack_metric_floor, CTRL_ACK_CONCENTRATION_MIN);
+				fflush(stdout);
+			}
 			// recovery-ack-capture LEVER 2 RELAXED accept (data-flow-recovery-ack-
 			// capture.md §6): when the fine pass is engaged on the recovery control-ACK
 			// poll, the weak 7/16 + 0.5 base bar is NOT enough (the ~311 sub-window MAX

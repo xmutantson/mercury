@@ -5879,6 +5879,33 @@ bool cl_arq_controller::v2_rotate_retx_behind_lead()
 	return true;
 }
 
+// Control-ACK gate selection (cross-layer control-ACK audit, extension to every
+// control code). The responder answers every control frame routed through the
+// pattern wait below (SET_CONFIG, SWITCH_BANDWIDTH, SET_LINK_PARAMS, START_CONNECTION,
+// CLOSE_CONNECTION, ...) with the same content-free MFSK base tone, so the accept has
+// no content check behind it. Only CLOSE used the control floor + concentration gate;
+// the other codes accepted on the data floor (metric >= 0.5), which white noise clears
+// by matching many weak symbols (per-symbol concentration ~0.1 against ~1.0 for a
+// real tone). A false SET_CONFIG accept moves the commander to the new configuration
+// alone and desyncs the link until link_timeout. A rejected poll is not a failure:
+// the wait keeps polling until receiving_timeout, and a timed-out wait takes the
+// normal control resend path (process_messages_tx_control ACK_TIMED_OUT branch).
+// MERCURY_CTRL_ACK_STRICT=0 restores the CLOSE-only gate (byte-identical accept).
+bool cl_arq_controller::control_ack_strict_for(unsigned char code)
+{
+	if(code == CLOSE_CONNECTION)
+		return true;
+	if(ctrl_ack_strict_force >= 0)
+		return ctrl_ack_strict_force != 0;
+	static int cached = -1;
+	if(cached < 0)
+	{
+		const char* e = std::getenv("MERCURY_CTRL_ACK_STRICT");
+		cached = (e && *e && *e == '0') ? 0 : 1;
+	}
+	return cached != 0;
+}
+
 void cl_arq_controller::process_messages_rx_acks_control()
 {
 	if (receiving_timer.get_elapsed_time_ms()<receiving_timeout)
@@ -5973,7 +6000,8 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				}
 				if(receive_ack_pattern(
 					false, mw_scan, causal_ring_samples,
-					/*control_ack_strict=*/messages_control.data[0]==CLOSE_CONNECTION))
+					/*control_ack_strict=*/control_ack_strict_for(
+						(unsigned char)messages_control.data[0])))
 				{
 					printf("[CMD-ACK-PAT] Control ACK for code=%d detected! elapsed=%dms link=%d status=%d\n",
 					(int)messages_control.data[0], (int)receiving_timer.get_elapsed_time_ms(), (int)link_status, (int)messages_control.status);

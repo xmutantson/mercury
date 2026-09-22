@@ -23,6 +23,13 @@
 //      new-rejects fail-before/pass-after on real noise. Under CTRL_ACK_FLOOR_FAILBEFORE
 //      the control path reverts to the data floor and this SAME noise buffer is accepted
 //      => FAILBEFORE-DEMONSTRATED (the spurious-teardown admission path);
+//   F  every control code (not only CLOSE) routes through the strict gate: the same
+//      gray-band noise buffer is REJECTED for SET_CONFIG / SWITCH_BANDWIDTH /
+//      SET_LINK_PARAMS / START_CONNECTION with the gate on, and ACCEPTED for SET_CONFIG
+//      with MERCURY_CTRL_ACK_STRICT=0 semantics (fail-before). A strong clean ACK is
+//      still accepted for every code. The commander's production control-ACK wait
+//      (process_messages_rx_acks_control) is driven once on the noise buffer for
+//      SET_CONFIG and must NOT mark the control frame ACKED.
 //   E  a large-n pure-WGN margin measurement: P(matched>=7 && metric>=1.2) and the noise
 //      metric tail + the energy-concentration separation (noise vs a real ACK), to
 //      quantify the floor margin rather than assert it.
@@ -156,6 +163,8 @@ int cl_arq_controller::test_ctrl_ack_noise_rejection()
 	// Search noise seeds for a buffer whose production detection has matched>=match_thr
 	// and metric in [DATA_FLOOR, CTRL_FLOOR): the old data floor admits it (false-ACK),
 	// the control floor rejects it. This is the direct fail-before/pass-after on real noise.
+	bool gray_found = false;
+	unsigned gray_seed = 0;
 	{
 		const double noise_amp = 0.05;
 		bool found = false;
@@ -168,6 +177,7 @@ int cl_arq_controller::test_ctrl_ack_noise_rejection()
 			accept(/*strict=*/true, &m, &met); // read the production peak matched/metric
 			if (m >= match_thr && met >= DATA_FLOOR && met < CTRL_FLOOR) {
 				found = true; wseed = seed; band_m = m; band_met = met;
+				gray_found = true; gray_seed = seed;
 			}
 		}
 		if (!found) {
@@ -204,6 +214,72 @@ int cl_arq_controller::test_ctrl_ack_noise_rejection()
 #endif
 		}
 	}
+
+	// ---- F: every control code routes through the strict gate. ----
+#ifndef CTRL_ACK_FLOOR_FAILBEFORE
+	if (!gray_found) {
+		printf("[%s] WARN F: no gray-band noise buffer from D; F skipped\n", NM);
+	} else {
+		const double noise_amp = 0.05;
+		const unsigned char codes[] = { SET_CONFIG, SWITCH_BANDWIDTH, SET_LINK_PARAMS,
+		                                START_CONNECTION, CLOSE_CONNECTION };
+		for (int force = 1; force >= 0; force--) {
+			cmd->ctrl_ack_strict_force = force;
+			for (unsigned char code : codes) {
+				const bool strict = cmd->control_ack_strict_for(code);
+				int m = 0; double met = 0.0;
+				std::mt19937 rn(SEED_BASE + gray_seed); stage(0.0, noise_amp, rn);
+				const bool acc_noise = accept(strict, &m, &met);
+				std::mt19937 rs(0xB0u); stage(1.0, 0.0008, rs);
+				const bool acc_real = accept(strict, nullptr, nullptr);
+				const bool want_strict = (force == 1) || (code == CLOSE_CONNECTION);
+				printf("[%s] F gate=%s code=0x%02X strict=%d noise(matched=%d metric=%.3f) accept=%d real_accept=%d\n",
+				       NM, force ? "on" : "off", (unsigned)code, strict ? 1 : 0, m, met,
+				       acc_noise ? 1 : 0, acc_real ? 1 : 0);
+				if (strict != want_strict) {
+					printf("[%s] FAIL F: code=0x%02X strict=%d want %d\n", NM, (unsigned)code, strict ? 1 : 0, want_strict ? 1 : 0);
+					fails++;
+				}
+				if (want_strict && acc_noise) {
+					printf("[%s] FAIL F: code=0x%02X accepted a pure-WGN gray-band buffer with the strict gate\n", NM, (unsigned)code);
+					fails++;
+				}
+				if (!acc_real) {
+					printf("[%s] FAIL F: code=0x%02X rejected a strong clean ACK\n", NM, (unsigned)code);
+					fails++;
+				}
+				if (force == 0 && code == SET_CONFIG) {
+					if (acc_noise)
+						printf("[%s] F FAILBEFORE-DEMONSTRATED: gate off, SET_CONFIG accepted the pure-WGN buffer\n", NM);
+					else {
+						printf("[%s] FAIL F: gate off did not reproduce the SET_CONFIG noise accept\n", NM);
+						fails++;
+					}
+				}
+			}
+		}
+		// Production control-ACK wait, gate on: a SET_CONFIG wait polled on the noise
+		// buffer must not mark the control frame ACKED.
+		cmd->ctrl_ack_strict_force = 1;
+		cmd->messages_control.data[0] = SET_CONFIG;
+		cmd->messages_control.status = PENDING_ACK;
+		cmd->ack_pattern_time_ms = 400;
+		cmd->receiving_timeout = 60000;
+		cmd->receiving_timer.reset();
+		cmd->receiving_timer.start();
+		{
+			std::mt19937 rn(SEED_BASE + gray_seed); stage(0.0, noise_amp, rn);
+			cmd->ack_diag_peak_matched = 0; cmd->ack_diag_peak_metric = 0.0; cmd->ack_diag_poll_count = 0;
+			cmd->process_messages_rx_acks_control();
+			const bool acked = (cmd->messages_control.status == ACKED);
+			printf("[%s] F production SET_CONFIG wait on noise: peak matched=%d metric=%.3f acked=%d (want 0)\n",
+			       NM, cmd->ack_diag_peak_matched, cmd->ack_diag_peak_metric, acked ? 1 : 0);
+			if (acked) { printf("[%s] FAIL F: production SET_CONFIG wait ACKED on noise\n", NM); fails++; }
+		}
+		cmd->ctrl_ack_strict_force = -1;
+		cmd->messages_control.data[0] = CLOSE_CONNECTION;
+	}
+#endif
 
 	// ---- E: large-n pure-WGN margin measurement (energy-concentration separation). ----
 	// Use the detector directly on independent noise windows (same metric receive_ack_pattern
