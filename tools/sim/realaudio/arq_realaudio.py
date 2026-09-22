@@ -50,6 +50,9 @@ from sim_axis import (AXIS_CHOICES, AXIS_V0, AXIS_V2, DEFAULT_AXIS, AxisError,
                       load_and_select_calibration, resolve_axis, sha256_file,
                       sha256_json, validate_attestation)
 from sim_channel_relay import parse_cell
+import harness_attestation as HA
+
+HARNESS_LINEAGE = "mercury"
 
 CONNECT_RE = re.compile(r"link_status:Connected to")
 DISC_RE = re.compile(r"link_status:Disconnected|DISCONNECTED")
@@ -638,6 +641,12 @@ def build_arg_parser():
                          "omit for plaintext")
     ap.add_argument("--psk", default=None,
                     help="pre-shared key hex passed to BOTH mercury via -K (required with --encrypt)")
+    ap.add_argument("--tx-gain-ini", default=None,
+                    help="INI whose [TxGain] section (the bench Pi transmit calibration, "
+                         "plan 7.13.21) each sim modem loads from a private HOME; the run "
+                         "fails closed unless both peers log [TX-GAIN-OVERRIDE] at the "
+                         "requested gains. Default: env " + HA.TX_GAIN_ENV + ", else unset "
+                         "(modems run exactly as before)")
     return ap
 
 
@@ -677,6 +686,24 @@ def main(argv=None):
         binary_sha256 = sha256_file(args.bin)
     except OSError as exc:
         ap.error("cannot hash --bin: %s" % exc)
+
+    # Identity attestation: the bridge echoes these into axis_attestation.
+    try:
+        harness_ident = HA.identity(args.bridge, __file__, HARNESS_LINEAGE)
+    except (OSError, ValueError) as exc:
+        ap.error("cannot attest bridge/harness identity: %s" % exc)
+    # Identity options go only to the native bridge (a .py bridge rejects them).
+    bridge_ident_argv = (HA.bridge_identity_argv(harness_ident)
+                         if HA.bridge_accepts_identity(args.bridge) else [])
+    # Bench transmit calibration (case B): unset => nothing changes.
+    tx_gain_ini, tx_gain_ini_source = HA.resolve_tx_gain_ini(
+        args.tx_gain_ini, os.environ)
+    tx_gain_values = {}
+    if tx_gain_ini:
+        try:
+            tx_gain_values = HA.read_tx_gain_ini(tx_gain_ini)
+        except (OSError, HA.TxGainError) as exc:
+            ap.error("--tx-gain-ini: %s" % exc)
 
     calibration = None
     if args.axis == AXIS_V2:
@@ -737,6 +764,18 @@ def main(argv=None):
         if "=" in kv:
             k, v = kv.split("=", 1)
             cell_env[k] = v
+    # Case B: each modem reads $HOME/.config/mercury/mercury.ini at start, so a
+    # private HOME holding only the [TxGain] keys applies the bench calibration
+    # to that modem and nothing else. Unset => both peers keep cell_env as is.
+    peer_env = {"RSP": cell_env, "CMD": cell_env}
+    tx_gain_settings = {}
+    if tx_gain_values:
+        for peer in ("RSP", "CMD"):
+            peer_home = os.path.abspath(os.path.join(
+                args.logdir, "txgain_home_%s_%s" % (args.tag, peer)))
+            tx_gain_settings[peer] = HA.write_modem_settings(
+                peer_home, tx_gain_values)
+            peer_env[peer] = dict(cell_env, HOME=peer_home)
     use_robust = args.start_cfg >= 100
     rsp_port = args.rsp_port
     cmd_port = args.cmd_port
@@ -804,7 +843,7 @@ def main(argv=None):
     def launch(port, in_dev, out_dev, label):
         p = subprocess.Popen(mercury_cmd(port, in_dev, out_dev),
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             env=cell_env)
+                             env=peer_env[label])
         threading.Thread(target=log_output,
                          args=(p, label, logfile, t0, st, integrity, stop),
                          daemon=True).start()
@@ -831,7 +870,7 @@ def main(argv=None):
                 "--binary-sha256", binary_sha256,
                 "--recipe-sha256", recipe_sha256,
                 "--s32-mode", args.s32_mode,
-                "--statsfile", bridge_stats_path] + bridge_ref_argv
+                "--statsfile", bridge_stats_path] + bridge_ident_argv + bridge_ref_argv
         input_coordinate = resolved_axis["input_coordinate"]
         if input_coordinate == "snr":
             bcmd += ["--snr", str(resolved_axis["snr3k_db"])]
@@ -1064,8 +1103,31 @@ def main(argv=None):
             raise AxisError("bridge noise reference not applied: "
                             + ",".join(bridge_ref_check["reasons"]))
         axis_attestation["bridge_reference"] = bridge_ref_check
+        # Identity: the native bridge must echo the bridge/harness hashes we sent.
+        if bridge_ident_argv:
+            ident_reasons = HA.verify_identity(axis_attestation, harness_ident)
+            if ident_reasons:
+                raise AxisError("bridge/harness identity not attested: "
+                                + ",".join(ident_reasons))
     except (OSError, KeyError, ValueError, TypeError, AxisError) as exc:
         sys.stderr.write("[harness] FATAL bridge attestation rejected: %s\n" % exc)
+        return 2
+    harness_attestation = dict(harness_ident,
+                               echoed_by_bridge=bool(bridge_ident_argv))
+    # Transmit calibration: attest what the modems actually applied. Case B
+    # fails closed; the default path only records (it never changes a run).
+    try:
+        with open(logpath, "r", encoding="utf-8", errors="replace") as fh:
+            tx_gain_attestation = HA.check_tx_gain_log(fh.read(), tx_gain_values)
+    except OSError as exc:
+        tx_gain_attestation = {"mode": "ini" if tx_gain_values else "default",
+                               "ok": False, "reasons": ["log_unreadable:%s" % exc]}
+    tx_gain_attestation["ini_path"] = tx_gain_ini
+    tx_gain_attestation["ini_source"] = tx_gain_ini_source
+    tx_gain_attestation["settings_files"] = tx_gain_settings
+    if tx_gain_values and not tx_gain_attestation["ok"]:
+        sys.stderr.write("[harness] FATAL tx gain override not applied: %s\n"
+                         % ",".join(tx_gain_attestation["reasons"]))
         return 2
 
     result = {
@@ -1144,6 +1206,8 @@ def main(argv=None):
         "wall_secs_cold": round(dwell_cold, 1),
     }
     result.update(axis_attestation)
+    result["harness_attestation"] = harness_attestation
+    result["tx_gain_attestation"] = tx_gain_attestation
     print(json.dumps(result))
     if args.json:
         with open(args.json, "w") as f:
