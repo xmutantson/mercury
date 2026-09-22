@@ -34,42 +34,42 @@ typedef std::complex<double> cplx;
 // ---------------------------------------------------------------------------
 // Configuration table.
 //
-// knee01/knee05: AWGN Es/N0 (dB) at BLER 0.1 / 0.5 from the in-tree passband BER
-// calibration (mercury -m PLOT_PASSBAND --ber-esn0, 600 frames per point, 0.5 dB grid
-// -8..+26 dB; c2 tables c2_cliffs_full_cfg0_17.csv, awgn rows). cfg0-3 never reached
-// BLER 0.1 inside the grid, so their knee lies below -8 dB: `measured=false` rows
-// carry the low-SNR extension measured by this lane (eesm_probe_estimator VERDICT
-// table K) and are replaced there; until then they hold the grid floor (-8 dB), an
-// UPPER bound of the true knee (conservative: it can only under-elect).
+// knee01/knee05: AWGN Es/N0 (dB) at BLER 0.1 / 0.5 on the in-tree passband BER sweep
+// axis (mercury -m PLOT_PASSBAND --ber-esn0; 1 W transmit power). cfg4-17: c2 tables
+// (600 frames per point, 0.5 dB grid -8..+26 dB, c2_cliffs_full_cfg0_17.csv awgn
+// rows). cfg0-3 lie below that grid: measured on a -18..-6 dB, 0.5 dB, 400-frame
+// extension (same binary family; its cfg4 knee01 -7.56 reproduces c2's -7.55).
 // beta: EESM beta fitted on the fadeA ensemble (fd 0.5 Hz, 1 ms, 10 dB), the column
-// the calibration VERDICT recommends as the least model-contaminated per-config
-// constant. cfg0-3 had no usable fit (their waterfall lies below the grid); they take
-// cfg4's value (0.2), the nearest measured BPSK row.
-// awgn_offset_db: effective SNR the estimator reports on AWGN minus the commanded
-// Es/N0 (the probe measures the per-carrier profile after the TX/RX filters while the
-// knee axis is the nominal Es/N0). Measured by the lane's AWGN calibration (VERDICT
-// table C); 0 until filled.
+// the calibration recommends as the least model-contaminated per-config constant.
+// cfg0-3 had no usable fit (their waterfall lies below the c2 grid); they take cfg4's
+// value (0.2), the nearest measured BPSK row.
+// awgn_offset_db: mean effective SNR this estimator reports on AWGN minus the sweep
+// Es/N0, measured at Es/N0 = knee01 of that configuration (32 probes per point). It
+// carries (a) the axis offset: probe per-carrier SINR = sweep Es/N0 + ~5.3 dB, and
+// (b) the per-beta compression of the fixed carrier profile left by the TX filter and
+// of the estimation noise, so a measured effective SNR is compared to the knee on the
+// estimator's own scale.
 // ---------------------------------------------------------------------------
 static st_cfg_row g_cfg[kNumOfdmCfg] = {
 	//  cfg  beta    knee01   knee05  awgn_off measured
-	{   0, 0.200,  -8.00,   -8.00,   0.0,  false },
-	{   1, 0.200,  -8.00,   -8.00,   0.0,  false },
-	{   2, 0.200,  -8.00,   -8.00,   0.0,  false },
-	{   3, 0.200,  -8.00,   -8.00,   0.0,  false },
-	{   4, 0.200,  -7.55,   -8.00,   0.0,  true  },
-	{   5, 0.300,  -7.01,   -7.38,   0.0,  true  },
-	{   6, 0.300,  -5.65,   -6.16,   0.0,  true  },
-	{   7, 1.400,  -3.29,   -3.86,   0.0,  true  },
-	{   8, 0.900,  -3.29,   -3.84,   0.0,  true  },
-	{   9, 0.500,  -2.67,   -3.19,   0.0,  true  },
-	{  10, 0.800,  -1.13,   -1.76,   0.0,  true  },
-	{  11, 1.000,   0.61,    0.04,   0.0,  true  },
-	{  12, 0.600,   1.81,    1.28,   0.0,  true  },
-	{  13, 1.500,   4.03,    3.58,   0.0,  true  },
-	{  14, 1.800,   6.46,    5.94,   0.0,  true  },
-	{  15, 3.009,   8.46,    7.96,   0.0,  true  },
-	{  16, 6.245,  12.54,   11.81,   0.0,  true  },
-	{  17, 8.673,  15.51,   14.54,   0.0,  true  },
+	{   0, 0.200, -12.15,  -12.89,   4.37,  true  },
+	{   1, 0.200, -10.62,  -11.19,   4.35,  true  },
+	{   2, 0.200,  -9.51,  -10.05,   4.38,  true  },
+	{   3, 0.200,  -8.54,   -8.97,   4.52,  true  },
+	{   4, 0.200,  -7.55,   -8.00,   4.48,  true  },
+	{   5, 0.300,  -7.01,   -7.38,   4.68,  true  },
+	{   6, 0.300,  -5.65,   -6.16,   4.57,  true  },
+	{   7, 1.400,  -3.29,   -3.86,   5.21,  true  },
+	{   8, 0.900,  -3.29,   -3.84,   5.08,  true  },
+	{   9, 0.500,  -2.67,   -3.19,   4.72,  true  },
+	{  10, 0.800,  -1.13,   -1.76,   4.84,  true  },
+	{  11, 1.000,   0.61,    0.04,   4.85,  true  },
+	{  12, 0.600,   1.81,    1.28,   4.42,  true  },
+	{  13, 1.500,   4.03,    3.58,   4.78,  true  },
+	{  14, 1.800,   6.46,    5.94,   4.56,  true  },
+	{  15, 3.009,   8.46,    7.96,   4.67,  true  },
+	{  16, 6.245,  12.54,   11.81,   4.71,  true  },
+	{  17, 8.673,  15.51,   14.54,   4.46,  true  },
 };
 
 const st_cfg_row* cfg_table() { return g_cfg; }
