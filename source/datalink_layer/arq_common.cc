@@ -15500,6 +15500,17 @@ static void gs2sc_setenv(const char* k, const char* v)
 #endif
 }
 
+// Liveness exemption for a live control exchange (see inband_connect_liveness_guard): the
+// exchange is live while its control message is queued or awaiting its ACK.
+bool cl_arq_controller::gs2_liveness_control_exchange_exempt() const
+{
+	const char* ev = std::getenv("MERCURY_GS2_LIVENESS_CTRL_EXEMPT");
+	if(ev && *ev && atoi(ev) == 0) return false;
+	if(connection_status != TRANSMITTING_CONTROL && connection_status != RECEIVING_ACKS_CONTROL)
+		return false;
+	return messages_control.status != FREE && messages_control.length > 0;
+}
+
 int cl_arq_controller::test_gs2_spec_conformance()
 {
 	int fails = 0;
@@ -15570,6 +15581,26 @@ int cl_arq_controller::test_gs2_spec_conformance()
 	{ printf("[TEST-GS2SC] FAIL R4: lp=%d dwell=%d set_config=%d off=%d\n", r4_lp, r4_dw, r4_sc, r4_off); fails++; }
 	else printf("[TEST-GS2SC] PASS R4: SET_LINK_PARAMS/dwell miss resumes DATA; SET_CONFIG unchanged; "
 		"knob-off arm keeps the stranded control state\n");
+
+	// ---- R5: a live control exchange is not a liveness stall ----------------------------
+	{
+		connection_status = RECEIVING_ACKS_CONTROL;
+		messages_control.status = ADDED_TO_LIST;
+		int saved_len = messages_control.length;
+		messages_control.length = 4;
+		bool live_on = gs2_liveness_control_exchange_exempt();
+		gs2sc_setenv("MERCURY_GS2_LIVENESS_CTRL_EXEMPT", "0");
+		bool live_off = gs2_liveness_control_exchange_exempt();
+		gs2sc_setenv("MERCURY_GS2_LIVENESS_CTRL_EXEMPT", NULL);
+		messages_control.status = FREE;
+		bool freed = gs2_liveness_control_exchange_exempt();
+		messages_control.length = saved_len;
+		connection_status = IDLE;
+		if(!live_on || live_off || freed)
+		{ printf("[TEST-GS2SC] FAIL R5: live=%d off=%d freed=%d\n", live_on, live_off, freed); fails++; }
+		else printf("[TEST-GS2SC] PASS R5: queued control exchange exempt from the liveness stall; "
+			"freed slot is not (knob-off arm accrues and fabricates a failure)\n");
+	}
 
 	printf("[TEST-GS2SC] %s (failures=%d)\n", fails == 0 ? "ALL PASS" : "FAIL", fails);
 	return fails;

@@ -754,6 +754,37 @@ req("quality-report-diagnostics-are-opt-in",
     cmd.count("MERCURY_GS2_QUALITY_TRACE") >= 2,
     "rate-limited telemetry and deferred-tail handling do not add unconditional per-batch printf/fflush overhead")
 
+# Transition-airtime requirements.  CONFIG_TAG is the canonical mode change and costs about
+# one tag of airtime; control-plane waits are priced by the quantity they actually wait for.
+main_src = text("source/main.cc")
+req("coordinated-wb-entry-is-not-re-announced",
+    allin(common, "bool cl_arq_controller::gs2_coordinated_wb_entry(int config)",
+          "inband_confirm_coordinated_config(config)", "MERCURY_GS2_COORD_WB_ENTRY") and
+    cmd.count("gs2_coordinated_wb_entry(current_configuration)") >= 2 and
+    "PASS R3: ACKed SWITCH_BANDWIDTH" in common,
+    "an ACKed SWITCH_BANDWIDTH (plain or seed-fused) is the coordinated change; the first WB batch carries no tag + guard")
+req("config-tag-guard-is-the-peer-frame-period",
+    allin(common, "long cl_arq_controller::gs2_tag_guard_samples(long window_guard_samples)",
+          "gs2_prev_tx_frame_samples", "guard_samples = gs2_tag_guard_samples(guard_samples);",
+          "MERCURY_GS2_TAG_GUARD") and
+    "PASS R2: 13->16 guard" in common,
+    "the tag guard covers the peer's old-geometry snapshot period, not a whole acquisition window")
+req("ack-slot-floor-counts-keydown-in-timer-clock",
+    common.count("linkphase_slot_kd_remaining_ms(kd_ms) + turnaround + slot_width") == 2 and
+    allin(common, "MERCURY_LINKPHASE_SLOT_ORIGIN", "PASS R1: post-drain slot floor"),
+    "a missed ACK costs the turnaround, not one more keydown, because the receive timer starts post-drain")
+req("unacknowledged-batch-geometry-control-resumes-data",
+    "inband_ctrl_miss_resumes_data(miss_code)" in cmd and
+    allin(common, "MERCURY_INBAND_CTRL_MISS_RESUME", "PASS R4:"),
+    "a lost SET_LINK_PARAMS ACK cannot strand the commander in TRANSMITTING_CONTROL with an empty slot")
+req("live-control-exchange-is-not-a-liveness-failure",
+    "if(gs2_liveness_control_exchange_exempt())" in cmd and
+    allin(common, "MERCURY_GS2_LIVENESS_CTRL_EXEMPT", "PASS R5:"),
+    "an ordinary control round trip does not feed Gearshift a fabricated whole-transaction failure")
+req("transition-cost-directed-unit-runs-in-test",
+    "failed += test_arq.test_gs2_spec_conformance();" in main_src,
+    "the knob-off arms reproduce each defect inside --test")
+
 external_only = [
     ("held-out-IONOS/RF-superiority", "requires the occupied physical IONOS/RF bench"),
     ("true-remote-per-subcarrier-temporal-coherence", "requires negotiated remote CSI telemetry not present on the current wire; code uses available SNR/selectivity/outcome dynamics instead"),

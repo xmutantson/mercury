@@ -7409,6 +7409,18 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	}
 #endif
 
+	// A live control exchange (a queued control message awaiting its ACK within its own
+	// timeout and retry budget) is not a livelock: its ACK wait, retries and terminal
+	// miss handling own it.  Counting its polls fired this guard ~1.3 s into every
+	// ordinary SET_LINK_PARAMS round trip (200 polls at the few-ms control-poll cadence)
+	// and fed Gearshift a fabricated whole-transaction failure, which it correctly read
+	// as a worse regime and so suppressed upward probes after each batch-size change.
+	// MERCURY_GS2_LIVENESS_CTRL_EXEMPT=0 restores the previous accrual.
+	if(gs2_liveness_control_exchange_exempt())
+	{
+		cmd_inband_liveness_no_progress_polls = 0;
+		return false;
+	}
 	// Control-TX / Idle / control-ACK-wait with NO forward DATA progress: accrue.
 	cmd_inband_liveness_no_progress_polls++;
 	if(cmd_inband_liveness_no_progress_polls < inband_liveness_stall_polls_count())
@@ -12551,6 +12563,10 @@ void cl_arq_controller::process_control_commander()
 				int seed = connect_fuse_seed_tx;
 				connect_fuse_seed_tx = CONFIG_NONE;
 				apply_connect_seed_cross(seed);
+				// The responder loaded the same seed on the ACKed switch: a coordinated change,
+				// not one to re-announce with a CONFIG_TAG on the first batch.
+				if(current_configuration == seed)
+					gs2_coordinated_wb_entry(current_configuration);
 			}
 			else
 			{

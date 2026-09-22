@@ -7890,6 +7890,7 @@ private:
   bool gs2_coordinated_wb_entry(int config);              // ACKed SWITCH_BANDWIDTH = coordinated change
   long gs2_tag_guard_samples(long window_guard_samples);  // CONFIG_TAG guard = peer frame period
   bool inband_ctrl_miss_resumes_data(int control_code) const;
+  bool gs2_liveness_control_exchange_exempt() const;
   int  mc2_apply_slot_floor(int timeout, int& kd_src_out);
   int  lp_optclock_keydown_ms(int fallback_frames, bool fallback_force_full,
                               bool* used_end_stamp = NULL) const;
