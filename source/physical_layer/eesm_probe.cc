@@ -595,6 +595,84 @@ void demod_grid(const st_geometry& g, const cplx* bb, int n0, double cfo_hz, cpl
 	}
 }
 
+int frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max)
+{
+	// Windowed-sinc low-pass (Hamming). Pass edge: the outermost probe carrier plus one
+	// carrier spacing. Stop edge: the lower edge of the image the real-to-complex mix
+	// leaves at 2 fc (2 fc minus the same half-band). Length from the Hamming transition
+	// width, ~3.3 fs / transition (Oppenheim & Schafer, Discrete-Time Signal Processing,
+	// 7.5.1), odd so the filter is centred (zero delay).
+	const double df = g.fs / (double)g.Nfft;
+	const double f_pass = (g.Nc / 2 + 1) * df;
+	const double f_stop = 2.0 * fc - f_pass;
+	if(fs_pass <= 0.0 || f_stop <= f_pass) return 0;
+	const double fcut = 0.5 * (f_pass + f_stop);
+	int n = (int)std::ceil(3.3 * fs_pass / (f_stop - f_pass));
+	if(!(n & 1)) n++;
+	if(n > max || n < 3) return 0;
+	const int h = n / 2;
+	double sum = 0.0;
+	for(int i = 0; i < n; i++)
+	{
+		const int k = i - h;
+		const double x = (k == 0) ? 2.0 * fcut / fs_pass
+		                          : std::sin(2.0 * M_PI * fcut * k / fs_pass) / (M_PI * k);
+		taps[i] = x * (0.54 - 0.46 * std::cos(2.0 * M_PI * i / (double)(n - 1)));
+		sum += taps[i];
+	}
+	for(int i = 0; i < n; i++) taps[i] /= sum;
+	return n;
+}
+
+int passband_to_probe_baseband(const st_geometry& g, const double* pb, int n, double fs_pass,
+	double fc, cplx* out, int max)
+{
+	const int D = (int)std::lround(fs_pass / g.fs);
+	if(D < 1 || std::fabs(D * g.fs - fs_pass) > 1e-6 * fs_pass) return 0;
+	std::vector<double> taps(4096);
+	const int nt = frontend_taps(g, fs_pass, fc, taps.data(), (int)taps.size());
+	if(nt <= 0) return 0;
+	const int nout = n / D;
+	if(nout > max) return 0;
+	// mix down with e^{+i w t} (the modem's passband_to_baseband convention)
+	std::vector<cplx> z((size_t)n);
+	const double w = 2.0 * M_PI * fc / fs_pass;
+	const cplx step(std::cos(w), std::sin(w));
+	cplx ph(1.0, 0.0);
+	for(int i = 0; i < n; i++)
+	{
+		z[(size_t)i] = pb[i] * ph;
+		ph *= step;
+		if((i & 1023) == 1023) ph /= std::abs(ph);
+	}
+	const int h = nt / 2;
+	for(int m = 0; m < nout; m++)
+	{
+		const int t = m * D;
+		cplx acc(0.0, 0.0);
+		const int i0 = std::max(0, t - h), i1 = std::min(n - 1, t + h);
+		for(int i = i0; i <= i1; i++) acc += taps[(size_t)(t - i + h)] * z[(size_t)i];
+		out[m] = acc;
+	}
+	return nout;
+}
+
+void frontend_noise_shape(const st_geometry& g, double fs_pass, double fc, double* shape)
+{
+	std::vector<double> taps(4096);
+	const int nt = frontend_taps(g, fs_pass, fc, taps.data(), (int)taps.size());
+	const int h = nt / 2;
+	for(int k = 0; k < g.Nc; k++)
+	{
+		const int b = bin_of_carrier(g, k);
+		const int q = (b >= g.Nfft / 2) ? b - g.Nfft : b;
+		const double f = q * g.fs / (double)g.Nfft;
+		cplx H(0.0, 0.0);
+		for(int i = 0; i < nt; i++) H += taps[(size_t)i] * std::polar(1.0, -2.0 * M_PI * f * (i - h) / fs_pass);
+		shape[k] = (nt > 0) ? std::norm(H) : 1.0;
+	}
+}
+
 bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 	int search_start, int search_len, st_measurement* m, const double* noise_shape)
 {

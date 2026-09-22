@@ -15353,28 +15353,32 @@ int cl_telecom_system::test_subpeak_gate()
 // handshake once it is wired, the harness only under MERCURY_EESM_PROBE_SIM=1 and the
 // self-test only under --test-eesm-probe.
 
+// The probe always uses the WB numerology (library constants); only the sample rate
+// comes from the running modem (48 kHz passband / interpolation 4 in both bandwidths).
 eesm_probe::st_geometry cl_telecom_system::eesm_probe_geometry() const
 {
 	eesm_probe::st_geometry g = eesm_probe::wb_geometry();
-	g.Nfft = ofdm.Nfft;
-	g.Ngi = data_container.Nofdm - ofdm.Nfft;
-	g.Nc = ofdm.Nc;
-	g.start_shift = ofdm.start_shift;
 	g.fs = (frequency_interpolation_rate > 0) ? sampling_frequency / (double)frequency_interpolation_rate : 0.0;
 	if(eesm_probe_nsymb > 0) g.n_symb = eesm_probe_nsymb;
 	return g;
 }
 
-static bool eesm_probe_geometry_ok(const eesm_probe::st_geometry& g, int narrowband)
+static bool eesm_probe_geometry_ok(const eesm_probe::st_geometry& g)
 {
-	return narrowband == 0 && g.Nc == 50 && g.Ngi > 0 && g.Nfft == 256 && g.fs > 0.0
+	return g.Nc == 50 && g.Ngi > 0 && g.Nfft == 256 && g.fs > 0.0
 	    && g.n_symb >= 4 && g.n_symb <= eesm_probe::kMaxSymb && (g.n_symb % 2) == 0;
 }
 
+// TX needs the WB OFDM geometry loaded (it reuses this geometry's modulator, TX gain
+// chain and TX band filters so probe cells are shaped exactly like data cells). The
+// waveform is fixed, so a station can generate it once while WB is loaded and cache it
+// for use from any state (e.g. keyed right behind a narrowband START).
 int cl_telecom_system::generate_eesm_probe_passband(double* out, int max_samples)
 {
 	const eesm_probe::st_geometry g = eesm_probe_geometry();
-	if(!eesm_probe_geometry_ok(g, narrowband_enabled) || M == MOD_MFSK) return 0;
+	if(!eesm_probe_geometry_ok(g) || narrowband_enabled || M == MOD_MFSK || ofdm.Nc != g.Nc
+	   || ofdm.Nfft != g.Nfft || data_container.Nofdm != g.Nfft + g.Ngi || ofdm.start_shift != g.start_shift)
+		return 0;
 	const int ns = data_container.Nofdm;
 	const int nbb = g.n_symb * ns;
 	const int npass = nbb * frequency_interpolation_rate;
@@ -15401,43 +15405,23 @@ int cl_telecom_system::generate_eesm_probe_passband(double* out, int max_samples
 	return npass;
 }
 
-// Relative noise power per probe carrier after the data receive filter: |H_rx(f_k)|^2
-// of FIR_rx_data (it runs on the mixed-down signal at the passband rate, before the
-// decimation), read off its impulse response. White channel noise leaves the filter
-// with exactly this shape, so the estimator pools noise after dividing by it.
-static void ep_rx_noise_shape(cl_telecom_system* ts, const eesm_probe::st_geometry& g, double* shape)
-{
-	cl_FIR& f = ts->ofdm.FIR_rx_data;
-	const int L = 2 * std::max(1, f.filter_nTaps) + 1;
-	std::vector<std::complex<double>> in((size_t)L, std::complex<double>(0.0, 0.0)), out((size_t)L);
-	in[(size_t)(L / 2)] = std::complex<double>(1.0, 0.0);
-	f.apply(in.data(), out.data(), L);
-	for(int k = 0; k < g.Nc; k++)
-	{
-		const int b = eesm_probe::bin_of_carrier(g, k);
-		const int q = (b >= g.Nfft / 2) ? b - g.Nfft : b;
-		const double fk = q * g.fs / (double)g.Nfft;
-		std::complex<double> H(0.0, 0.0);
-		for(int n = 0; n < L; n++)
-			H += out[(size_t)n] * std::polar(1.0, -2.0 * M_PI * fk * (double)n / ts->sampling_frequency);
-		shape[k] = std::norm(H);
-	}
-}
-
+// RX runs the library's own front end (mix + low-pass + decimate), so it works in any
+// modem state, narrowband discovery included; noise is whitened by that filter's shape.
 bool cl_telecom_system::measure_eesm_probe(double* passband, int n, double cfo_hint_hz,
 	int search_start_bb, int search_len_bb, eesm_probe::st_measurement* m)
 {
 	const eesm_probe::st_geometry g = eesm_probe_geometry();
 	std::memset(m, 0, sizeof(*m));
-	if(!eesm_probe_geometry_ok(g, narrowband_enabled)) return false;
+	if(!eesm_probe_geometry_ok(g)) return false;
 	const int Mi = frequency_interpolation_rate;
 	const int nbb = n / Mi;
 	if(nbb <= 0) return false;
 	std::vector<std::complex<double>> bb((size_t)nbb);
-	ofdm.passband_to_baseband_decimated(passband, nbb * Mi, bb.data(), sampling_frequency,
-		carrier_frequency + cfo_hint_hz, carrier_amplitude, Mi, &ofdm.FIR_rx_data);
+	if(eesm_probe::passband_to_probe_baseband(g, passband, nbb * Mi, sampling_frequency,
+	       carrier_frequency + cfo_hint_hz, bb.data(), nbb) != nbb)
+		return false;
 	double shape[eesm_probe::kMaxNc];
-	ep_rx_noise_shape(this, g, shape);
+	eesm_probe::frontend_noise_shape(g, sampling_frequency, carrier_frequency + cfo_hint_hz, shape);
 	const bool ok = eesm_probe::estimate_from_baseband(g, bb.data(), nbb, search_start_bb,
 		search_len_bb, m, shape);
 	if(ok) m->cfo_hz += cfo_hint_hz;
@@ -15554,8 +15538,8 @@ static void ep_truth(cl_telecom_system* ts, const eesm_probe::st_geometry& g,
 	const int Mi = ts->frequency_interpolation_rate;
 	const int nbb = (int)clean_rx.size() / Mi;
 	std::vector<std::complex<double>> bb((size_t)nbb), Y((size_t)g.n_symb * g.Nc), X((size_t)g.Nc);
-	ts->ofdm.passband_to_baseband_decimated(const_cast<double*>(clean_rx.data()), nbb * Mi, bb.data(),
-		ts->sampling_frequency, ts->carrier_frequency, ts->carrier_amplitude, Mi, &ts->ofdm.FIR_rx_data);
+	eesm_probe::passband_to_probe_baseband(g, clean_rx.data(), nbb * Mi, ts->sampling_frequency,
+		ts->carrier_frequency, bb.data(), nbb);
 	eesm_probe::demod_grid(g, bb.data(), n0, cfo_true, Y.data());
 	// Signal: mean power of the known cells (per unit data cell). Distortion: what the
 	// noise-free reception leaves in the silent cells (inter-symbol / inter-carrier
@@ -15591,8 +15575,8 @@ static std::vector<double> ep_noise_profile(cl_telecom_system* ts, const eesm_pr
 	ep_sim::st_noise nz(seed);
 	nz.add(pn.data(), (int)pn.size(), 1.0);
 	std::vector<std::complex<double>> bb((size_t)lenbb), Y((size_t)g.n_symb * g.Nc);
-	ts->ofdm.passband_to_baseband_decimated(pn.data(), lenbb * Mi, bb.data(), ts->sampling_frequency,
-		ts->carrier_frequency, ts->carrier_amplitude, Mi, &ts->ofdm.FIR_rx_data);
+	eesm_probe::passband_to_probe_baseband(g, pn.data(), lenbb * Mi, ts->sampling_frequency,
+		ts->carrier_frequency, bb.data(), lenbb);
 	std::vector<double> Nk((size_t)g.Nc, 0.0);
 	int cnt = 0;
 	for(int w = 0; w < nwin; w++)
@@ -15617,7 +15601,7 @@ void cl_telecom_system::eesm_probe_sim()
 	// SINR-to-config relation does not depend on the value.
 	output_power_Watt = 1;
 	const eesm_probe::st_geometry g = eesm_probe_geometry();
-	if(!eesm_probe_geometry_ok(g, narrowband_enabled) || M == MOD_MFSK)
+	if(!eesm_probe_geometry_ok(g) || narrowband_enabled || ofdm.Nc != g.Nc || M == MOD_MFSK)
 	{
 		printf("[EP-SIM] refused: needs a WB OFDM configuration (-s 0..17), got cfg%d Nc=%d nb=%d\n",
 			probe_cfg, ofdm.Nc, narrowband_enabled);
@@ -15684,7 +15668,7 @@ void cl_telecom_system::eesm_probe_sim()
 		for(int k = 0; k < g.Nc; k++) printf(" %.2f", 10 * std::log10(Nk_unit[(size_t)k] / nm));
 		printf("\n");
 		double sh[eesm_probe::kMaxNc], sm = 0.0;
-		ep_rx_noise_shape(this, g, sh);
+		eesm_probe::frontend_noise_shape(g, sampling_frequency, carrier_frequency, sh);
 		for(int k = 0; k < g.Nc; k++) sm += sh[k];
 		sm /= g.Nc;
 		double worst = 0.0;
