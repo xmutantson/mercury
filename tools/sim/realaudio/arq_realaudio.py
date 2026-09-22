@@ -44,6 +44,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.dirname(_HERE))
 from ra_cleanup import scoped_cleanup  # concurrency-safe per-run cleanup
+import bridge_reference
 from sim_axis import (AXIS_CHOICES, AXIS_V0, AXIS_V2, DEFAULT_AXIS, AxisError,
                       calibration_key, infer_bandwidth,
                       load_and_select_calibration, resolve_axis, sha256_file,
@@ -651,6 +652,12 @@ def main(argv=None):
         bridge_prefix = bridge_command_prefix(args.bridge)
     except BridgeCommandError as exc:
         ap.error(str(exc))
+    # The noise reference goes to the bridge as options: the native bridge runs
+    # under sudo, which does not pass MERCURY_SIM_PSIG_* through.
+    try:
+        bridge_ref_argv, bridge_ref_requested = bridge_reference.resolve(os.environ)
+    except (bridge_reference.BridgeReferenceError, ValueError) as exc:
+        ap.error(str(exc))
 
     configured_bandwidth_hz = (
         args.configured_bandwidth_hz
@@ -824,7 +831,7 @@ def main(argv=None):
                 "--binary-sha256", binary_sha256,
                 "--recipe-sha256", recipe_sha256,
                 "--s32-mode", args.s32_mode,
-                "--statsfile", bridge_stats_path]
+                "--statsfile", bridge_stats_path] + bridge_ref_argv
         input_coordinate = resolved_axis["input_coordinate"]
         if input_coordinate == "snr":
             bcmd += ["--snr", str(resolved_axis["snr3k_db"])]
@@ -1050,6 +1057,13 @@ def main(argv=None):
             bridge_stats = json.load(stream)
         axis_attestation = validate_attestation(
             bridge_stats["axis_attestation"])
+        # Fail closed when the bridge did not run the requested noise reference.
+        bridge_ref_check = bridge_reference.verify(
+            bridge_stats_path, bridge_ref_requested, passthrough=args.passthrough)
+        if not bridge_ref_check["ok"]:
+            raise AxisError("bridge noise reference not applied: "
+                            + ",".join(bridge_ref_check["reasons"]))
+        axis_attestation["bridge_reference"] = bridge_ref_check
     except (OSError, KeyError, ValueError, TypeError, AxisError) as exc:
         sys.stderr.write("[harness] FATAL bridge attestation rejected: %s\n" % exc)
         return 2

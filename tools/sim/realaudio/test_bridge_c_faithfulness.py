@@ -248,11 +248,16 @@ def args(profile="wgn", snr=30.0, sig_ref=0.15):
     )
 
 
+# The Python port implements the legacy channel model (full-band noise, running
+# median reference); the C bridge default is the bench-mirror reference with
+# receiver-passband noise, so the comparison runs the C bridge in that model.
+LEGACY_MODEL = ("--legacy-fullband", "--reference-mode", "legacy-median")
+
 def run_c_double(x, *opts):
     with tempfile.TemporaryDirectory(prefix="bridge_c_test_") as td:
         pi, po = Path(td) / "in.f64", Path(td) / "out.f64"
         np.asarray(x, dtype="<f8").tofile(pi)
-        subprocess.run([str(BIN), "--double-in", str(pi), "--double-out", str(po), *opts],
+        subprocess.run([str(BIN), "--double-in", str(pi), "--double-out", str(po), *opts, *LEGACY_MODEL],
                        check=True, stdout=subprocess.DEVNULL)
         return np.fromfile(po, dtype="<f8")
 
@@ -261,7 +266,7 @@ def run_c_vector(stereo, *opts):
     with tempfile.TemporaryDirectory(prefix="bridge_c_test_") as td:
         pi, po = Path(td) / "in.s32", Path(td) / "out.s32"
         np.asarray(stereo, dtype="<i4").tofile(pi)
-        subprocess.run([str(BIN), "--vector-in", str(pi), "--vector-out", str(po), *opts],
+        subprocess.run([str(BIN), "--vector-in", str(pi), "--vector-out", str(po), *opts, *LEGACY_MODEL],
                        check=True, stdout=subprocess.DEVNULL)
         return np.fromfile(po, dtype="<i4")
 
@@ -436,7 +441,7 @@ def attestation_gate(report):
     with tempfile.TemporaryDirectory(prefix="bridge_c_attest_") as td:
         p = Path(td) / "stats.json"
         subprocess.run([str(BIN), "--dry-run", "--cell", "WGN:40", "--profile", "wgn",
-                        "--seed", "7", "--statsfile", str(p)], check=True)
+                        "--seed", "7", "--statsfile", str(p), *LEGACY_MODEL], check=True)
         obj = json.loads(p.read_text())
     att = obj["channel_attestation"]
     required = {"cell", "profile", "commanded_snr", "realized_snr3k",

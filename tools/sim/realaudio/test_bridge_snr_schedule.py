@@ -45,11 +45,21 @@ SNR_TOL_DB = 0.5           # realized-vs-scheduled tolerance per region
 REALIZED_TOL_DB = 0.1      # applied-vs-realized consistency inside the log
 
 
+# The baseline bridge and the schedule contract use the legacy channel model (full-band noise, running
+# median reference); the C bridge default is the bench-mirror reference with
+# receiver-passband noise, so the comparison runs the C bridge in that model.
+LEGACY_MODEL = ("--legacy-fullband", "--reference-mode", "legacy-median")
+
+
+def model_opts(binary):
+    """Legacy-model options for the bridge under test (a baseline build predates them)."""
+    return LEGACY_MODEL if Path(binary).resolve() == Path(BIN).resolve() else ()
+
 def run_double(binary, x, *opts, statsfile=None):
     with tempfile.TemporaryDirectory(prefix="snr_sched_") as td:
         pi, po = Path(td) / "in.f64", Path(td) / "out.f64"
         np.asarray(x, dtype="<f8").tofile(pi)
-        argv = [str(binary), "--double-in", str(pi), "--double-out", str(po), *opts]
+        argv = [str(binary), "--double-in", str(pi), "--double-out", str(po), *opts, *model_opts(binary)]
         cp = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if cp.returncode != 0:
             raise RuntimeError(f"{binary} exited {cp.returncode}: "
@@ -63,7 +73,7 @@ def run_vector_md5(binary, stereo, *opts):
     with tempfile.TemporaryDirectory(prefix="snr_sched_") as td:
         pi, po = Path(td) / "in.s32", Path(td) / "out.s32"
         np.asarray(stereo, dtype="<i4").tofile(pi)
-        argv = [str(binary), "--vector-in", str(pi), "--vector-out", str(po), *opts]
+        argv = [str(binary), "--vector-in", str(pi), "--vector-out", str(po), *opts, *model_opts(binary)]
         subprocess.run(argv, check=True, stdout=subprocess.DEVNULL)
         return hashlib.md5(Path(po).read_bytes()).hexdigest()
 

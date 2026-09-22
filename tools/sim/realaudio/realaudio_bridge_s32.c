@@ -48,7 +48,29 @@
 static volatile sig_atomic_t stop_requested;
 
 typedef enum { PROF_WGN, PROF_FLAT, PROF_MPG, PROF_MPM, PROF_MPP, PROF_MPD } profile_t;
-typedef enum { PSIG_STEADY, PSIG_FIX, PSIG_PEAK } psig_mode_t;
+typedef enum { PSIG_STEADY, PSIG_FIX, PSIG_PEAK, PSIG_GEOMETRY, PSIG_BENCH } psig_mode_t;
+/* Waveform kinds recognised in the per-transmission record (see geo_kind()). */
+enum { KIND_OFDM_WB, KIND_OFDM_NB, KIND_OFDM_PREAMBLE, KIND_MFSK_CTL, KIND_MFSK_DATA, KIND_SHORT, KIND_N };
+static const char*const kind_name[KIND_N]={"ofdm-wb","ofdm-nb","ofdm-preamble","mfsk-ctl","mfsk-data","short"};
+/* Mercury OFDM WB data power on this bridge (mean square of the S32 input,
+ * full scale = 1), the reference the bench-mirror noise level is set from.
+ * Measured on this bridge: airtime-weighted forward OFDM WB data power of
+ * pinned configs 0/7/8/13/14/15/16 at SNR3k 30 was 0.02030 / 0.02038 /
+ * 0.02038 / 0.02048 / 0.02044 / 0.02053 / 0.01864 (config 16, thinned
+ * pilots, sits 0.39 dB lower); the reference is their median, 0.0204
+ * (-16.90 dBFS rms). */
+#define BENCH_OFDM_REF_DEFAULT 0.0204
+#define BENCH_OFDM_REF_DERIVATION "median forward OFDM WB data power of pinned cfgs 0/7/8/13/14/15/16 at snr3k 30 (0.02030/0.02038/0.02038/0.02048/0.02044/0.02053/0.01864), bridge calibration 2026-09-22"
+#define GEO_MAX_CLASSES 16
+#define GEO_SEG_MAX 16
+/* A transmission ends after this many consecutive samples below GEO_ACTIVE. */
+#define GEO_QUIET_RUN 256
+#define GEO_ACTIVE 1e-6
+#define GEO_SHIFT_CHUNKS 3
+#define GEO_SHIFT_MIN_SAMPLES 512
+/* Periodogram frame for the waveform-kind record: 93.75 Hz bins, so the NB
+ * OFDM band (468.75 Hz) spans 5 bins and the WB band 25. */
+#define SPEC_N 512
 
 typedef struct {
     char fwd_cap[256], fwd_play[256], rev_cap[256], rev_play[256];
@@ -60,6 +82,17 @@ typedef struct {
     double fade_depth_db, loss, sig_ref, bp_lo, bp_hi;
     double configured_bandwidth_hz, cn_config_db;
     int seed, cap_periods, play_periods, prime_periods, bp_taps;
+    int erase_a2b_burst, erase_b2a_burst;
+    /* Receiver-passband noise model (see noise_lpf_init / composite_scale). */
+    double noise_lpf_hz, headroom_rms;
+    int noise_lpf_taps;
+    bool noise_lpf_set, headroom_set;
+    /* Noise reference (see "Noise reference modes" below). */
+    char reference_mode[24], reference_mode_source[16], burst_log[1100];
+    double psig_fix, floor_ref, class_tol_db, shift_db;
+    double ofdm_ref, kind_kurt_thr, kind_bw_thr_hz;
+    char ofdm_ref_source[16];
+    bool psig_fix_set;
     bool passthrough, burst, dry_run, self_test, format_only;
     char vector_in[1024], vector_out[1024], double_in[1024], double_out[1024];
     char tap_out[1024];
@@ -180,6 +213,21 @@ static void doppler_skip(doppler_t *d,size_t n) {
 }
 
 typedef struct {
+    double onset_pow;      /* running geometric mean of onset estimates */
+    double ref_pow;        /* airtime-weighted mean power of completed transmissions */
+    double ss,n;           /* accumulated sum of squares / samples */
+    uint64_t bursts;
+    double snr_sum,snr_min,snr_max;  /* realized SNR3k over completed transmissions */
+} geo_class_t;
+/* Per-kind totals of the per-transmission record (all accounting modes). */
+typedef struct {
+    uint64_t tx;
+    double ss,n;                     /* signal sum of squares / samples (airtime) */
+    double nv;                       /* applied noise variance, summed per sample */
+    double snr_sum,snr_min,snr_max;  /* realized SNR3k per transmission */
+} geo_kind_t;
+
+typedef struct {
     options_t opt;
     rng_t noise_rng, pn_rng;
     doppler_t tap0,tap1;
@@ -195,10 +243,34 @@ typedef struct {
     int ge_state;
     double *bp_h,*bp_hist;
     int bp_n,bp_pos;
+    /* Noise low-pass: unit-DC-gain FIR applied to the unit Gaussian draw, so the
+     * noise PSD inside the passband is exactly the white-noise PSD that the
+     * SNR3k axis defines; only the out-of-passband noise is removed. */
+    double *nf_h,*nf_hist,nf_gain2;
+    int nf_n,nf_pos;
+    /* Fixed per-session gain applied to (signal+noise) before S32 quantization. */
+    double composite_scale,scale_min;
     uint64_t sample_clock;
     double sched_last_snr;
     bool sched_valid,sched_offline;
     char sched_tag[8];
+    /* Geometry mode: one reference per transmission class, see geo_*(). */
+    char name[8];
+    geo_class_t cls[GEO_MAX_CLASSES];
+    int ncls,cur_cls,rec_cls,shift_run;
+    bool in_burst,cur_first,rec_first;
+    size_t quiet_run,pend_quiet;
+    double b_ss_d,b_n_d;                     /* decision-side running power of the current transmission */
+    double b_ss,b_nv,b_nm,pend_nv,pend_nm;   /* record-side accumulators of the current transmission */
+    double b_onset,cur_ref,floor_ref,noise_rms_max;
+    uint64_t b_n,b_start,bursts_done,class_switches;
+    double worst_snr_err_db;
+    /* Waveform features of the current transmission (clean input): active
+     * samples, sum x^4, and the averaged periodogram of the active samples. */
+    double b_na,b_x4;
+    double spec_buf[SPEC_N],spec_acc[SPEC_N/2+1];
+    int spec_fill;uint64_t spec_frames;
+    geo_kind_t kind[KIND_N];
 } channel_t;
 
 static double ionos_wgn_to_snr3k(double label) {
@@ -409,6 +481,64 @@ static double bandpass_one(channel_t*c,double x){
     for(int k=0;k<c->bp_n;k++){int idx=c->bp_pos-(c->bp_n-1-k);while(idx<0)idx+=c->bp_n;y+=c->bp_h[k]*c->bp_hist[idx];}
     c->bp_pos=(c->bp_pos+1)%c->bp_n;return y;
 }
+/*
+ * The SNR3k axis defines a white noise PSD N0 = noise_std^2 / F_NYQUIST.  The
+ * legacy path injected that PSD over the whole 0-24 kHz Nyquist band, so the
+ * total noise power was 8x the 3 kHz reference power and, at low SNR3k, the
+ * sum ran past S32 full scale (about half of all samples clip at -10 dB).  A
+ * receiver never delivers noise outside its audio passband, so the noise is
+ * low-passed here.  The FIR is a Blackman-windowed sinc normalised to unit DC
+ * gain: its passband ripple is far below 0.001 dB, so the in-band PSD (and the
+ * realized SNR3k) is unchanged.
+ */
+static int noise_lpf_init(channel_t*c,uint64_t prime_seed){
+    if(!(c->opt.noise_lpf_hz>0)) return 0;
+    int nt=c->opt.noise_lpf_taps; if(nt<3) nt=3; if(!(nt&1)) nt++; c->nf_n=nt;
+    c->nf_h=calloc((size_t)nt,sizeof(double));c->nf_hist=calloc((size_t)nt,sizeof(double));
+    if(!c->nf_h||!c->nf_hist)return -1;
+    int m=(nt-1)/2;double wc=2*c->opt.noise_lpf_hz/RATE,sum=0;
+    for(int k=0;k<nt;k++){
+        double black=.42-.5*cos(2*PI*k/(nt-1))+.08*cos(4*PI*k/(nt-1));
+        c->nf_h[k]=wc*sinc_np(wc*(k-m))*black;sum+=c->nf_h[k];
+    }
+    c->nf_gain2=0;for(int k=0;k<nt;k++){c->nf_h[k]/=sum;c->nf_gain2+=c->nf_h[k]*c->nf_h[k];}
+    /* Pre-fill the history so the first output samples already carry the
+     * steady-state noise power.  A separate generator keeps the main noise
+     * sequence identical to the legacy draw order. */
+    rng_t r;rng_init(&r,prime_seed);for(int k=0;k<nt;k++)c->nf_hist[k]=rng_gauss(&r);
+    return 0;
+}
+static double noise_lpf_one(channel_t*c,double x){
+    c->nf_hist[c->nf_pos]=x;double y=0;
+    for(int k=0;k<c->nf_n;k++){int idx=c->nf_pos-(c->nf_n-1-k);while(idx<0)idx+=c->nf_n;y+=c->nf_h[k]*c->nf_hist[idx];}
+    c->nf_pos=(c->nf_pos+1)%c->nf_n;return y;
+}
+/* Delivered noise power relative to the 3 kHz reference noise power. */
+static double noise_power_ratio(const channel_t*c){
+    return (F_NYQUIST/BW_NOISE)*(c->nf_n?c->nf_gain2:1.0);
+}
+/*
+ * Receiver gain ahead of the S32 stage.  When the delivered noise RMS exceeds
+ * headroom_rms the composite (signal and noise together, so every SNR is
+ * unchanged) is scaled so the delivered noise RMS equals headroom_rms, the way
+ * a receiver's AGC is noise-driven at low SNR.  The gain follows the noise
+ * level (in geometry mode, the loudest noise level the direction has carried),
+ * so it only moves when the noise level itself moves.  It is exactly 1
+ * whenever the delivered noise RMS is at or below headroom_rms, so those
+ * outputs are unchanged.  Sizing of the 0.12 default: the hottest Mercury
+ * waveform is the MFSK robust/connect class at about 5-6x the OFDM WB power of
+ * 0.0206, i.e. up to about 0.11-0.12.  Referenced to its own power at +10 dB
+ * SNR3k its delivered noise RMS is sqrt(0.12 * 1.30 / 10) = 0.125, so +10 dB
+ * keeps a gain of 0.96 or above for that class and exactly 1 for OFDM
+ * (sqrt(0.0206 * 1.30 / 10) = 0.052).  The input signal is bounded by full
+ * scale, so with the noise held at headroom_rms the composite essentially
+ * never reaches full scale.
+ */
+static double composite_scale_for(const channel_t*c){
+    if(!(c->opt.headroom_rms>0)||c->opt.passthrough)return 1.0;
+    double sn=c->noise_std*(c->nf_n?sqrt(c->nf_gain2):1.0);
+    return sn>c->opt.headroom_rms?c->opt.headroom_rms/sn:1.0;
+}
 static int channel_init(channel_t*c,const options_t*o,uint32_t seed){
     memset(c,0,sizeof(*c));c->opt=*o;
     rng_init(&c->noise_rng,seed);
@@ -416,10 +546,16 @@ static int channel_init(channel_t*c,const options_t*o,uint32_t seed){
     rng_init(&c->pn_rng,tap_seed^UINT64_C(0xD1B54A32D192ED03));
     c->snr_lin=pow(10.0,o->snr/10.0);c->p_sig=pow(fmax(o->sig_ref,1e-6),2);
     c->noise_std=noise_std(c,c->p_sig);
-    const char*mode=getenv("MERCURY_SIM_PSIG_MODE");
-    c->psig_mode=mode&&!strcasecmp(mode,"fix")?PSIG_FIX:mode&&!strcasecmp(mode,"peak")?PSIG_PEAK:PSIG_STEADY;
-    const char*fix=getenv("MERCURY_SIM_PSIG_FIX");c->psig_fix=fix?strtod(fix,NULL):0;
+    const char*mode=o->reference_mode;
+    c->psig_mode=!strcmp(mode,"bench")?PSIG_BENCH:!strcmp(mode,"fix")?PSIG_FIX:!strcmp(mode,"peak")?PSIG_PEAK:!strcmp(mode,"geometry")?PSIG_GEOMETRY:PSIG_STEADY;
+    c->psig_fix=o->psig_fix;
     if(c->psig_mode==PSIG_FIX&&c->psig_fix>0){c->p_sig=c->psig_fix;c->noise_std=noise_std(c,c->p_sig);}
+    if(c->psig_mode==PSIG_GEOMETRY){c->floor_ref=c->cur_ref=c->p_sig=o->floor_ref;c->noise_std=noise_std(c,c->p_sig);c->cur_cls=c->rec_cls=-1;c->worst_snr_err_db=0;}
+    /* Bench mirror: one noise level, fixed from the first sample, set from the
+     * OFDM WB data power.  The transmission classes are kept for the record
+     * only; they never change the noise. */
+    if(c->psig_mode==PSIG_BENCH){c->floor_ref=c->cur_ref=c->p_sig=o->ofdm_ref;c->noise_std=noise_std(c,c->p_sig);c->cur_cls=c->rec_cls=-1;c->worst_snr_err_db=0;}
+    for(int k=0;k<KIND_N;k++){c->kind[k].snr_min=1e9;c->kind[k].snr_max=-1e9;}
     if(c->psig_mode==PSIG_STEADY){c->heap_cap=16384;c->heap_lo=malloc(c->heap_cap*sizeof(double));c->heap_hi=malloc(c->heap_cap*sizeof(double));if(!c->heap_lo||!c->heap_hi)return -1;}
     double dtau,fd;profile_params(o->profile,&dtau,&fd);c->fading=dtau>0;
     if(c->fading){
@@ -427,9 +563,26 @@ static int channel_init(channel_t*c,const options_t*o,uint32_t seed){
         hilbert_init(c);doppler_init(&c->tap0,fd,tap_seed^UINT64_C(0x9E3779B97F4A7C15));
         doppler_init(&c->tap1,fd,tap_seed^UINT64_C(0xBF58476D1CE4E5B9));
     }
-    return bandpass_init(c);
+    if(bandpass_init(c))return -1;
+    if(noise_lpf_init(c,tap_seed^UINT64_C(0x632BE59BD9B4E019)))return -1;
+    c->composite_scale=c->scale_min=composite_scale_for(c);
+    c->noise_rms_max=c->noise_std;
+    return 0;
 }
-static void channel_free(channel_t*c){free(c->heap_lo);free(c->heap_hi);free(c->bp_h);free(c->bp_hist);}
+static void channel_free(channel_t*c){free(c->heap_lo);free(c->heap_hi);free(c->bp_h);free(c->bp_hist);free(c->nf_h);free(c->nf_hist);}
+/* Scale by the session gain, clamp to S32 full scale, truncate toward zero.
+ * pre_peak/over_unscaled describe the composite before the gain (what the
+ * legacy path would have clipped); hard counts samples that actually clip. */
+static void emit_s32(const channel_t*c,const double*out,int32_t*ob,size_t n,
+                     double*pre_peak,uint64_t*hard,uint64_t*over_unscaled){
+    const double g=c->composite_scale>0?c->composite_scale:1.0;
+    for(size_t i=0;i<n;i++){
+        double a=fabs(out[i]);if(a>*pre_peak)*pre_peak=a;if(a>1.0)(*over_unscaled)++;
+        double s=out[i]*g;if(fabs(s)>1.0)(*hard)++;
+        double v=s*INT_MAX_D;if(v>INT_MAX_D)v=INT_MAX_D;if(v< -INT_MAX_D)v=-INT_MAX_D;
+        int32_t q=(int32_t)v;ob[2*i]=ob[2*i+1]=q;
+    }
+}
 
 static int append_active(channel_t*c,double ms){
     if(c->heap_lo_n+c->heap_hi_n>=c->heap_cap){size_t cap=c->heap_cap*2;double*lo=realloc(c->heap_lo,cap*sizeof(double));if(!lo)return-1;c->heap_lo=lo;double*hi=realloc(c->heap_hi,cap*sizeof(double));if(!hi)return-1;c->heap_hi=hi;c->heap_cap=cap;}
@@ -438,13 +591,224 @@ static int append_active(channel_t*c,double ms){
     else if(c->heap_hi_n>c->heap_lo_n){double v=min_pop(c->heap_hi,&c->heap_hi_n);max_push(c->heap_lo,&c->heap_lo_n,v);}
     c->active_n++;return 0;
 }
+/*
+ * Noise reference modes.
+ *
+ * The SNR3k axis is a statement about the signal a receiver is trying to
+ * decode: signal power over the noise power in 3 kHz.  Mercury transmits
+ * several waveforms at different power (OFDM data, MFSK robust data, the MFSK
+ * connect and acknowledgement bursts run about 5-6x the OFDM mean power).
+ *
+ *   bench (default): mirrors the IONOS channel simulator, which adds one fixed
+ *     noise level per S:N setting and never measures its input.  The noise
+ *     power is set once, from the first sample, from the OFDM WB data power
+ *     (ofdm_ref), and is the same on both directions.  "--snr3k N" is then the
+ *     SNR3k that Mercury's OFDM WB data realizes; any other waveform realizes
+ *     N + 10*log10(P_waveform / ofdm_ref), as it does on the bench.  Every
+ *     transmission is recorded with its measured power, the applied noise, the
+ *     realized SNR3k, its level offset from ofdm_ref and its waveform kind.
+ *   per-class (alias geometry): every transmission is referenced to its own waveform
+ *     class.  A transmission starts at the first active sample after silence
+ *     and ends after GEO_QUIET_RUN quiet samples.  Its onset power (the rest of
+ *     the chunk it starts in) picks a class within class_tol_db of the class
+ *     onset power, or opens a new class.  The noise inside the transmission is
+ *     set from the class reference (the mean power of its completed
+ *     transmissions); for the first transmission of a class, from its own
+ *     running mean.  A sustained power step inside one transmission
+ *     (shift_db for GEO_SHIFT_CHUNKS chunks) starts a new class segment.
+ *     Silence carries the floor noise, referenced to floor_ref (default: the
+ *     measured Mercury OFDM WB transmit power), so the noise a receiver sees
+ *     ahead of an OFDM data block already matches the commanded level.  Each
+ *     direction keeps its own classes.
+ *   steady (legacy): running median of all active chunk powers since start.
+ *   fix: fixed reference power (--psig-fix).
+ *   peak: highest chunk power seen.
+ */
+static void geo_open(channel_t*c,double est,bool*first){
+    int best=-1;double bd=1e9;
+    for(int k=0;k<c->ncls;k++){double d=fabs(10.0*log10(est/c->cls[k].onset_pow));if(d<bd){bd=d;best=k;}}
+    if(best<0||(bd>c->opt.class_tol_db&&c->ncls<GEO_MAX_CLASSES)){
+        best=c->ncls++;memset(&c->cls[best],0,sizeof(c->cls[best]));
+        c->cls[best].onset_pow=c->cls[best].ref_pow=est;c->cls[best].snr_min=1e9;c->cls[best].snr_max=-1e9;
+    }else if(c->cls[best].bursts>0){
+        c->cls[best].onset_pow=exp(0.8*log(c->cls[best].onset_pow)+0.2*log(est));
+    }
+    c->cur_cls=best;*first=c->cls[best].bursts==0;
+}
+typedef struct { size_t a,b; bool burst,onset,offset,split,first; int cls; double ns; } geo_seg_t;
+static FILE*g_burst_log;static pthread_mutex_t g_burst_log_lock=PTHREAD_MUTEX_INITIALIZER;
+/*
+ * Waveform features of one transmission, from the clean input:
+ *   kurtosis E[x^4]/E[x^2]^2: a constant-envelope tone is 1.5, two equal tones
+ *     2.25 (Mercury's MFSK sends at most two tones at once), a band-limited
+ *     Gaussian-like multicarrier signal 3 (OFDM, slightly lower after its
+ *     10 dB PAPR clip);
+ *   occupied band from the averaged periodogram (Hann-windowed SPEC_N-point
+ *     frames of the active samples): the equivalent width
+ *     (sum P)^2 / sum P^2 * bin width, which is the width of a flat band, and
+ *     the power-weighted centre.
+ * Kind (thresholds are the midpoints between the feature ranges measured on
+ * this bridge for every Mercury waveform, pinned configs 0/7/8/13-16 and
+ * 100-103):
+ *   kurtosis >= kind_kurt_thr (2.6): OFDM data (measured 2.87-3.03), wide band
+ *     (ofdm-wb, measured 2342-2397 Hz) when the width is above kind_bw_thr_hz,
+ *     else ofdm-nb;
+ *   otherwise width >= 1800 Hz: the OFDM block preamble segment (kurtosis
+ *     2.29-2.35, width 2000-2024 Hz, about 0.05 s at -4 dB);
+ *   otherwise MFSK: width below 1200 Hz is the connect / acknowledgement /
+ *     control MFSK (kurtosis 1.51, width 729-854 Hz), wider is robust data
+ *     (config 100: kurtosis 1.52, width 1549-1586 Hz; configs 101-103 key two
+ *     tones: kurtosis 2.26-2.27, width 1519-1595 Hz).
+ * Transmissions shorter than 20 ms are "short" (too few samples).
+ */
+#define KIND_PREAMBLE_BW_HZ 1800.0
+#define KIND_MFSK_DATA_BW_HZ 1200.0
+static void fft_inplace(double complex*a,int n){
+    for(int i=1,j=0;i<n;i++){int bit=n>>1;for(;j&bit;bit>>=1)j^=bit;j^=bit;if(i<j){double complex t=a[i];a[i]=a[j];a[j]=t;}}
+    for(int len=2;len<=n;len<<=1){double complex w=cexp(-2.0*PI*I/len);
+        for(int i=0;i<n;i+=len){double complex wk=1;for(int k=0;k<len/2;k++){double complex u=a[i+k],v=a[i+k+len/2]*wk;a[i+k]=u+v;a[i+k+len/2]=u-v;wk*=w;}}}
+}
+static void spec_frame(channel_t*c){
+    double complex a[SPEC_N];
+    for(int i=0;i<SPEC_N;i++)a[i]=c->spec_buf[i]*(0.5-0.5*cos(2.0*PI*i/SPEC_N));
+    fft_inplace(a,SPEC_N);
+    for(int k=0;k<=SPEC_N/2;k++){double p=creal(a[k])*creal(a[k])+cimag(a[k])*cimag(a[k]);c->spec_acc[k]+=p;}
+    c->spec_frames++;c->spec_fill=0;
+}
+static int geo_kind(const channel_t*c,double dur_s,double*kurt,double*bw_hz,double*fc_hz){
+    *kurt=*bw_hz=*fc_hz=0;
+    if(c->b_na<1||!(c->b_ss>0))return KIND_SHORT;
+    double m2x=c->b_ss/c->b_na;*kurt=(c->b_x4/c->b_na)/(m2x*m2x);
+    if(c->spec_frames>0){
+        double s1=0,s2=0,sf=0;const double df=(double)RATE/SPEC_N;
+        for(int k=0;k<=SPEC_N/2;k++){double p=c->spec_acc[k];s1+=p;s2+=p*p;sf+=p*k*df;}
+        if(s2>0){*bw_hz=s1*s1/s2*df;*fc_hz=sf/s1;}
+    }
+    if(dur_s<0.02)return KIND_SHORT;
+    if(*kurt>=c->opt.kind_kurt_thr)return *bw_hz>c->opt.kind_bw_thr_hz?KIND_OFDM_WB:KIND_OFDM_NB;
+    if(*bw_hz>=KIND_PREAMBLE_BW_HZ)return KIND_OFDM_PREAMBLE;
+    return *bw_hz<KIND_MFSK_DATA_BW_HZ?KIND_MFSK_CTL:KIND_MFSK_DATA;
+}
+static void geo_finalize(channel_t*c,bool split){
+    if(!c->b_n){c->b_ss=c->b_nv=c->b_nm=0;c->b_na=c->b_x4=0;c->spec_fill=0;c->spec_frames=0;memset(c->spec_acc,0,sizeof(c->spec_acc));return;}
+    double n=(double)c->b_n,p=c->b_ss/n,nv=c->b_nv/n;
+    double g2=c->nf_n?c->nf_gain2:1.0,inband=BW_NOISE/F_NYQUIST;
+    double snr_nom=nv>0?10.0*log10(p/(nv*inband)):INFINITY;
+    double nm=c->b_nm/n/g2;double snr_meas=nm>0?10.0*log10(p/(nm*inband)):INFINITY;
+    int k=c->rec_cls;
+    if(k>=0){
+        geo_class_t*q=&c->cls[k];q->ss+=c->b_ss;q->n+=n;q->ref_pow=q->ss/q->n;q->bursts++;
+        if(isfinite(snr_nom)){q->snr_sum+=snr_nom;if(snr_nom<q->snr_min)q->snr_min=snr_nom;if(snr_nom>q->snr_max)q->snr_max=snr_nom;
+            if(c->psig_mode==PSIG_GEOMETRY){double e=fabs(snr_nom-c->opt.snr);if(e>c->worst_snr_err_db)c->worst_snr_err_db=e;}}
+    }
+    double kurt,bw,fc;int kd=geo_kind(c,n/RATE,&kurt,&bw,&fc);
+    geo_kind_t*gk=&c->kind[kd];gk->tx++;gk->ss+=c->b_ss;gk->n+=n;gk->nv+=c->b_nv;
+    if(isfinite(snr_nom)){gk->snr_sum+=snr_nom;if(snr_nom<gk->snr_min)gk->snr_min=snr_nom;if(snr_nom>gk->snr_max)gk->snr_max=snr_nom;}
+    /* Bench mode: the level offset from the OFDM WB reference is the realized
+     * SNR3k minus the label, by construction of the fixed noise. */
+    double level_db=10.0*log10(p/c->opt.ofdm_ref);
+    if(g_burst_log){
+        pthread_mutex_lock(&g_burst_log_lock);
+        fprintf(g_burst_log,"{\"dir\":\"%s\",\"i\":%"PRIu64",\"t0_s\":%.6f,\"dur_s\":%.6f,\"cls\":%d,\"cls_first\":%s,\"split\":%s,\"p_sig\":%.9g,\"noise_var\":%.9g,\"snr3k_nominal_db\":%.4f,\"snr3k_measured_db\":%.4f,\"commanded_snr3k_db\":%.4f,\"composite_scale\":%.9g,\"kind\":\"%s\",\"kurtosis\":%.4f,\"band_hz\":%.1f,\"centre_hz\":%.1f,\"level_vs_ofdm_ref_db\":%.4f,\"reference_mode\":\"%s\"}\n",
+                c->name,c->bursts_done,(double)c->b_start/RATE,n/RATE,k,c->rec_first?"true":"false",split?"true":"false",p,nv,snr_nom,snr_meas,c->opt.snr,c->composite_scale,
+                kind_name[kd],kurt,bw,fc,level_db,c->opt.reference_mode);
+        fflush(g_burst_log);
+        pthread_mutex_unlock(&g_burst_log_lock);
+    }
+    c->bursts_done++;c->b_ss=c->b_nv=c->b_nm=0;c->b_n=0;c->b_na=c->b_x4=0;c->spec_fill=0;c->spec_frames=0;memset(c->spec_acc,0,sizeof(c->spec_acc));
+}
+/* Split one chunk into silence / transmission segments and choose the noise
+ * level of each.  Returns the segment count. */
+static int geo_plan(channel_t*c,const double*x,size_t n,geo_seg_t*seg){
+    int ns=0;size_t i=0;
+    double seg_ss=0;size_t seg_act=0,pend=0;
+    geo_seg_t cur={.a=0,.burst=c->in_burst,.cls=c->cur_cls};
+    for(i=0;i<n;i++){
+        bool a=fabs(x[i])>GEO_ACTIVE;
+        if(!c->in_burst){
+            if(a){
+                if(i>cur.a){cur.b=i;seg[ns++]=cur;}
+                cur=(geo_seg_t){.a=i,.burst=true,.onset=true,.cls=-1};
+                c->in_burst=true;c->quiet_run=0;seg_ss=x[i]*x[i];seg_act=1;pend=0;
+            }
+        }else if(a){c->quiet_run=0;seg_act+=pend+1;pend=0;seg_ss+=x[i]*x[i];}
+        else if(++c->quiet_run>=GEO_QUIET_RUN){
+            cur.offset=true;cur.b=i+1;cur.ns=seg_act?seg_ss/(double)seg_act:0;
+            seg[ns++]=cur;
+            cur=(geo_seg_t){.a=i+1,.cls=-1};c->in_burst=false;seg_ss=0;seg_act=0;pend=0;
+        }else pend++;
+    }
+    cur.b=n;if(cur.burst)cur.ns=seg_act?seg_ss/(double)seg_act:0;
+    if(cur.b>cur.a||ns==0)seg[ns++]=cur;
+    /* Decide the reference of each segment (ns field: power in, noise std out). */
+    for(int s=0;s<ns;s++){
+        geo_seg_t*g=&seg[s];
+        if(!g->burst){g->ns=noise_std(c,c->floor_ref);continue;}
+        double pw=g->ns;size_t len=g->b-g->a;
+        if(g->onset){
+            geo_open(c,pw>0?pw:c->floor_ref,&c->cur_first);c->shift_run=0;
+            c->b_onset=pw;c->b_ss_d=0;c->b_n_d=0;
+        }else if(!c->cur_first&&len>=GEO_SHIFT_MIN_SAMPLES&&pw>0&&fabs(10.0*log10(pw/c->cur_ref))>c->opt.shift_db){
+            if(++c->shift_run>=GEO_SHIFT_CHUNKS){
+                g->split=true;geo_open(c,pw,&c->cur_first);c->shift_run=0;c->b_ss_d=0;c->b_n_d=0;c->class_switches++;
+            }
+        }else c->shift_run=0;
+        c->b_ss_d+=pw*(double)len;c->b_n_d+=(double)len;
+        geo_class_t*q=&c->cls[c->cur_cls];
+        c->cur_ref=c->cur_first?(c->b_n_d>0?c->b_ss_d/c->b_n_d:pw):q->ref_pow;
+        if(!(c->cur_ref>0))c->cur_ref=c->floor_ref;
+        g->cls=c->cur_cls;g->first=c->cur_first;g->ns=noise_std(c,c->cur_ref);
+    }
+    return ns;
+}
+/* Account one chunk's segments after impairment: per-transmission signal and
+ * noise power (nominal from the applied level, measured from the injected
+ * noise), and the per-transmission record. */
+static void geo_account(channel_t*c,const double*x,const double*ninj,const geo_seg_t*seg,int ns,const double*nstd,size_t n){
+    (void)n;
+    for(int s=0;s<ns;s++){
+        const geo_seg_t*g=&seg[s];
+        if(!g->burst)continue;
+        if(g->onset||g->split){
+            if(g->split)geo_finalize(c,true);
+            c->rec_cls=g->cls;c->rec_first=g->first;
+            c->b_start=c->sample_clock+g->a;c->b_ss=c->b_nv=c->b_nm=0;c->b_n=0;c->pend_quiet=0;c->pend_nv=c->pend_nm=0;
+            c->b_na=c->b_x4=0;c->spec_fill=0;c->spec_frames=0;memset(c->spec_acc,0,sizeof(c->spec_acc));
+        }
+        for(size_t i=g->a;i<g->b;i++){
+            double nv=nstd[i]*nstd[i],nm=ninj[i]*ninj[i];
+            if(fabs(x[i])>GEO_ACTIVE){c->b_n+=c->pend_quiet+1;c->b_nv+=c->pend_nv+nv;c->b_nm+=c->pend_nm+nm;c->b_ss+=x[i]*x[i];c->pend_quiet=0;c->pend_nv=c->pend_nm=0;
+                double x2=x[i]*x[i];c->b_na+=1;c->b_x4+=x2*x2;
+                c->spec_buf[c->spec_fill++]=x[i];if(c->spec_fill==SPEC_N)spec_frame(c);}
+            else{c->pend_quiet++;c->pend_nv+=nv;c->pend_nm+=nm;}
+        }
+        if(g->offset)geo_finalize(c,false);
+    }
+}
 static void channel_process(channel_t*c,const double*x,double*out,size_t n){
     if(g_schedule.loaded)schedule_apply(c);
+    double nstd[PERIOD],ninj[PERIOD];geo_seg_t seg[GEO_SEG_MAX];int nseg=0;
+    const bool geo=c->psig_mode==PSIG_GEOMETRY,bench=c->psig_mode==PSIG_BENCH;
     double ms=0;for(size_t i=0;i<n;i++)ms+=x[i]*x[i];if(n)ms/=n;
     bool peak=ms>c->peak_ms;if(peak)c->peak_ms=ms;
     if(c->psig_mode==PSIG_STEADY&&ms>1e-7){
         if(!append_active(c,ms)&&++c->active_since>=8){c->active_since=0;c->p_sig=median_active(c);c->noise_std=noise_std(c,c->p_sig);}
     }else if(c->psig_mode==PSIG_PEAK&&peak){c->p_sig=c->peak_ms;c->noise_std=noise_std(c,c->p_sig);}
+    if(bench){
+        /* Record-only segmentation; the noise stays at the one fixed level. */
+        nseg=geo_plan(c,x,n,seg);
+        for(size_t i=0;i<n;i++)nstd[i]=c->noise_std;
+        c->composite_scale=composite_scale_for(c);
+    }else if(geo){
+        nseg=geo_plan(c,x,n,seg);
+        for(int s=0;s<nseg;s++){for(size_t i=seg[s].a;i<seg[s].b;i++)nstd[i]=seg[s].ns;if(seg[s].ns>c->noise_rms_max)c->noise_rms_max=seg[s].ns;}
+        /* The receiver gain follows the loudest noise level this direction has
+         * carried, so it is constant inside a transmission and only ever steps
+         * down, when a louder class first appears. */
+        double sn=c->noise_rms_max*(c->nf_n?sqrt(c->nf_gain2):1.0);
+        c->composite_scale=(!(c->opt.headroom_rms>0)||c->opt.passthrough||sn<=c->opt.headroom_rms)?1.0:c->opt.headroom_rms/sn;
+    }else c->composite_scale=composite_scale_for(c);
+    if(c->composite_scale<c->scale_min)c->scale_min=c->composite_scale;
 
     double complex z[PERIOD],g0[PERIOD],g1[PERIOD];
     if(c->fading){analytic_process(c,x,n,z);doppler_advance(&c->tap0,n,g0);doppler_advance(&c->tap1,n,g1);}
@@ -460,25 +824,31 @@ static void channel_process(channel_t*c,const double*x,double*out,size_t n){
             y*=cexp(I*ph);if(c->phase>=2*PI||c->phase<=-2*PI)c->phase=fmod(c->phase,2*PI);
         }
         double v=creal(y);if(c->bp_n)v=bandpass_one(c,v);
-        if(c->noise_std>0)v+=c->noise_std*rng_gauss(&c->noise_rng);
+        const double nsd=(geo||bench)?nstd[i]:c->noise_std;
+        if(nsd>0){double w=rng_gauss(&c->noise_rng);if(c->nf_n)w=noise_lpf_one(c,w);v+=nsd*w;if(geo||bench)ninj[i]=nsd*w;}
+        else if(geo||bench)ninj[i]=0;
         if(c->opt.burst&&c->opt.loss>0){
             if(!c->ge_state){if(rng_uniform(&c->noise_rng)<c->opt.loss*.05)c->ge_state=1;}
             else{v=0;if(rng_uniform(&c->noise_rng)<.03)c->ge_state=0;}
         }else if(c->opt.loss>0&&rng_uniform(&c->noise_rng)<c->opt.loss)v=0;
         out[i]=v;
     }
+    if(geo||bench)geo_account(c,x,ninj,seg,nseg,nstd,n);
     c->sample_clock+=n;
 }
 
 typedef struct {
     uint64_t frames,sig_frames,underruns,hard_clips,s32_saturations;
-    uint64_t clip_denominator;
-    double sig_sumsq,pre_scale_peak,reference_power,noise_variance;
+    uint64_t clip_denominator,over_unscaled,input_fs;
+    double sig_sumsq,pre_scale_peak,reference_power,noise_variance,scale,scale_min;
     pthread_mutex_t lock;
 } pump_stats_t;
 typedef struct {
     char name[8],cap_dev[256],play_dev[256];
     channel_t channel;const options_t*opt;pump_stats_t stats;
+    int erase_target_burst;
+    bool erase_prev_silent;
+    uint64_t signal_bursts_seen,erased_chunks;
     snd_pcm_t *cap_shared,*play_shared;
     pthread_mutex_t pcm_lock;
 } pump_t;
@@ -501,13 +871,27 @@ static int write_frames(snd_pcm_t*p,const int32_t*buf,size_t frames,int*xruns){
     size_t off=0;while(off<frames&&!stop_requested){snd_pcm_sframes_t n=snd_pcm_writei(p,buf+2*off,frames-off);if(n<0){(*xruns)++;int e=snd_pcm_recover(p,(int)n,1);if(e<0)return e;continue;}off+=(size_t)n;}return 0;
 }
 static void stats_add(pump_t*p,size_t n,bool signal,double ss,int underrun,
-                      double peak,uint64_t hard,uint64_t saturation,size_t clip_n){
+                      double peak,uint64_t hard,uint64_t saturation,size_t clip_n,
+                      uint64_t over_unscaled,uint64_t input_fs){
     pthread_mutex_lock(&p->stats.lock);p->stats.frames+=n;if(signal){p->stats.sig_frames+=n;p->stats.sig_sumsq+=ss;}p->stats.underruns+=underrun;
     if(peak>p->stats.pre_scale_peak)p->stats.pre_scale_peak=peak;
-    p->stats.hard_clips+=hard;p->stats.s32_saturations+=saturation;
+    p->stats.hard_clips+=hard;p->stats.s32_saturations+=saturation;p->stats.over_unscaled+=over_unscaled;p->stats.input_fs+=input_fs;
     p->stats.clip_denominator+=clip_n;p->stats.reference_power=p->channel.p_sig;
     p->stats.noise_variance=p->channel.noise_std*p->channel.noise_std;
+    p->stats.scale=p->channel.composite_scale;p->stats.scale_min=p->channel.scale_min;
     pthread_mutex_unlock(&p->stats.lock);
+}
+static void maybe_erase_burst(pump_t*p,double*x,size_t n,bool signal){
+    bool erase=false;
+    pthread_mutex_lock(&p->stats.lock);
+    if(p->erase_target_burst>0){
+        if(signal&&p->erase_prev_silent)p->signal_bursts_seen++;
+        p->erase_prev_silent=!signal;
+        erase=signal&&p->signal_bursts_seen==(uint64_t)p->erase_target_burst;
+        if(erase)p->erased_chunks++;
+    }
+    pthread_mutex_unlock(&p->stats.lock);
+    if(erase)memset(x,0,n*sizeof(*x));
 }
 static void *pump_main(void*arg){
     pump_t*p=arg;snd_pcm_t *cap=NULL,*play=NULL;
@@ -518,20 +902,21 @@ static void *pump_main(void*arg){
     if(e<0){fprintf(stderr,"[bridge_s32_c] %s playback %s: %s\n",p->name,p->play_dev,snd_strerror(e));pthread_mutex_lock(&p->pcm_lock);p->cap_shared=NULL;snd_pcm_close(cap);pthread_mutex_unlock(&p->pcm_lock);stop_requested=1;return NULL;}
     pthread_mutex_lock(&p->pcm_lock);p->play_shared=play;pthread_mutex_unlock(&p->pcm_lock);
     int32_t in[PERIOD*2],ob[PERIOD*2]={0};double x[PERIOD],out[PERIOD];
-    for(int i=0;i<p->opt->prime_periods;i++){int xruns=0;if(write_frames(play,ob,PERIOD,&xruns)<0)xruns++;if(xruns)stats_add(p,0,false,0,xruns,0,0,0,0);}
+    for(int i=0;i<p->opt->prime_periods;i++){int xruns=0;if(write_frames(play,ob,PERIOD,&xruns)<0)xruns++;if(xruns)stats_add(p,0,false,0,xruns,0,0,0,0,0,0);}
     while(!stop_requested){
         snd_pcm_sframes_t nr=snd_pcm_readi(cap,in,PERIOD);
-        if(nr<0){stats_add(p,0,false,0,1,0,0,0,0);if(stop_requested||snd_pcm_recover(cap,(int)nr,1)<0)break;continue;}
-        size_t n=(size_t)nr;bool signal=false;double ss=0;
-        for(size_t i=0;i<n;i++){if(in[2*i])signal=true;x[i]=(double)in[2*i]/INT_MAX_D;ss+=x[i]*x[i];}
-        double peak=0;uint64_t hard=0,saturation=0;
+        if(nr<0){stats_add(p,0,false,0,1,0,0,0,0,0,0);if(stop_requested||snd_pcm_recover(cap,(int)nr,1)<0)break;continue;}
+        size_t n=(size_t)nr;bool signal=false;double ss=0;uint64_t infs=0;
+        for(size_t i=0;i<n;i++){if(in[2*i])signal=true;if(in[2*i]>=INT32_MAX||in[2*i]<=-INT32_MAX)infs++;x[i]=(double)in[2*i]/INT_MAX_D;ss+=x[i]*x[i];}
+        maybe_erase_burst(p,x,n,signal);
+        double peak=0;uint64_t hard=0,over=0;
         if(p->opt->passthrough){for(size_t i=0;i<n;i++)ob[2*i]=ob[2*i+1]=in[2*i];}
         else{
             channel_process(&p->channel,x,out,n);
-            for(size_t i=0;i<n;i++){double a=fabs(out[i]);if(a>peak)peak=a;if(a>1.0){hard++;saturation++;}double v=out[i]*INT_MAX_D;if(v>INT_MAX_D)v=INT_MAX_D;if(v< -INT_MAX_D)v=-INT_MAX_D;int32_t q=(int32_t)v;ob[2*i]=ob[2*i+1]=q;}
+            emit_s32(&p->channel,out,ob,n,&peak,&hard,&over);
         }
         int xruns=0;int wr=write_frames(play,ob,n,&xruns);if(wr<0)xruns++;
-        stats_add(p,n,signal,ss,xruns,peak,hard,saturation,p->opt->passthrough?0:n);if(wr<0&&!stop_requested)snd_pcm_prepare(play);
+        stats_add(p,n,signal,ss,xruns,peak,hard,hard,p->opt->passthrough?0:n,over,infs);if(wr<0&&!stop_requested)snd_pcm_prepare(play);
     }
     pthread_mutex_lock(&p->pcm_lock);p->cap_shared=p->play_shared=NULL;
     snd_pcm_close(cap);snd_pcm_close(play);pthread_mutex_unlock(&p->pcm_lock);
@@ -573,23 +958,62 @@ static int write_schedule_statsfile(const options_t*o){
 }
 static void stat_snapshot(pump_t*p,uint64_t*fr,uint64_t*sf,double*ss,uint64_t*ur,
                           double*peak,uint64_t*hard,uint64_t*sat,uint64_t*den,
-                          double*reference_power,double*noise_variance){
-    pthread_mutex_lock(&p->stats.lock);*fr=p->stats.frames;*sf=p->stats.sig_frames;*ss=p->stats.sig_sumsq;*ur=p->stats.underruns;*peak=p->stats.pre_scale_peak;*hard=p->stats.hard_clips;*sat=p->stats.s32_saturations;*den=p->stats.clip_denominator;*reference_power=p->stats.reference_power;*noise_variance=p->stats.noise_variance;pthread_mutex_unlock(&p->stats.lock);
+                          double*reference_power,double*noise_variance,
+                          uint64_t*bursts,uint64_t*erased,uint64_t*over,uint64_t*infs,double*scale,double*scale_min){
+    pthread_mutex_lock(&p->stats.lock);*over=p->stats.over_unscaled;*infs=p->stats.input_fs;*scale=p->stats.scale;*scale_min=p->stats.scale_min;*fr=p->stats.frames;*sf=p->stats.sig_frames;*ss=p->stats.sig_sumsq;*ur=p->stats.underruns;*peak=p->stats.pre_scale_peak;*hard=p->stats.hard_clips;*sat=p->stats.s32_saturations;*den=p->stats.clip_denominator;*reference_power=p->stats.reference_power;*noise_variance=p->stats.noise_variance;*bursts=p->signal_bursts_seen;*erased=p->erased_chunks;pthread_mutex_unlock(&p->stats.lock);
+}
+/* Per-direction class table (geometry mode).  Read without the pump lock:
+ * each field is an aligned double/integer written by one pump thread. */
+static void geo_json(FILE*f,const channel_t*c){
+    fprintf(f,"{\"transmissions\": %"PRIu64", \"class_switches\": %"PRIu64", \"worst_snr3k_error_db\": %.6g, \"classes\": [",c->bursts_done,c->class_switches,c->worst_snr_err_db);
+    int n=c->ncls;if(n>GEO_MAX_CLASSES)n=GEO_MAX_CLASSES;
+    for(int k=0;k<n;k++){const geo_class_t*q=&c->cls[k];
+        fprintf(f,"%s{\"id\": %d, \"onset_power\": %.9g, \"reference_power\": %.9g, \"transmissions\": %"PRIu64", \"airtime_s\": %.6f, \"snr3k_mean_db\": %.4f, \"snr3k_min_db\": %.4f, \"snr3k_max_db\": %.4f}",
+                k?", ":"",k,q->onset_pow,q->ref_pow,q->bursts,q->n/RATE,q->bursts?q->snr_sum/(double)q->bursts:0.0,q->bursts?q->snr_min:0.0,q->bursts?q->snr_max:0.0);}
+    fprintf(f,"]}");
+}
+/* Per-direction, per-waveform-kind attestation: transmissions, airtime, mean
+ * signal power, its offset from the OFDM WB reference, the applied noise and
+ * the realized SNR3k. */
+static void kinds_json(FILE*f,const channel_t*c){
+    const double inband=BW_NOISE/F_NYQUIST;fprintf(f,"{");
+    for(int k=0;k<KIND_N;k++){const geo_kind_t*q=&c->kind[k];
+        double p=q->n>0?q->ss/q->n:0,nv=q->n>0?q->nv/q->n:0;
+        fprintf(f,"%s\"%s\": {\"transmissions\": %"PRIu64", \"airtime_s\": %.6f, \"signal_power\": %.9g, \"level_vs_ofdm_ref_db\": %.4f, \"noise_var\": %.9g, \"snr3k_airtime_db\": %.4f, \"snr3k_mean_db\": %.4f, \"snr3k_min_db\": %.4f, \"snr3k_max_db\": %.4f}",
+                k?", ":"",kind_name[k],q->tx,q->n/RATE,p,p>0?10.0*log10(p/c->opt.ofdm_ref):0.0,nv,(p>0&&nv>0)?10.0*log10(p/(nv*inband)):0.0,
+                q->tx?q->snr_sum/(double)q->tx:0.0,q->tx?q->snr_min:0.0,q->tx?q->snr_max:0.0);}
+    fprintf(f,"}");
+}
+static const char*reference_mode_label(const char*m){
+    return !strcmp(m,"bench")?"bench-fixed-ofdm-wb":!strcmp(m,"geometry")?"geometry-class":!strcmp(m,"fix")?"fixed":!strcmp(m,"peak")?"peak":"steady-active-chunk-median";
+}
+static const char*reference_id_label(const char*m){
+    return !strcmp(m,"bench")?"bench-ofdm-wb-v1":!strcmp(m,"geometry")?"geometry-class-v1":!strcmp(m,"fix")?"fixed-cli":!strcmp(m,"peak")?"peak":"traffic-steady-v1";
 }
 static int flush_stats(const options_t*o,pump_t*fwd,pump_t*rev){
     if(!o->statsfile[0]) return 0;
     char tmp[1200];snprintf(tmp,sizeof(tmp),"%s.tmp.%ld",o->statsfile,(long)getpid());FILE*f=fopen(tmp,"w");if(!f)return-1;
-    uint64_t ff,fs,fu,fh,fx,fd,rf,rs,ru,rh,rx,rd;double fss,rss,fp,rp,fref,fnoise,rref,rnoise;
-    stat_snapshot(fwd,&ff,&fs,&fss,&fu,&fp,&fh,&fx,&fd,&fref,&fnoise);stat_snapshot(rev,&rf,&rs,&rss,&ru,&rp,&rh,&rx,&rd,&rref,&rnoise);(void)rref;(void)rnoise;
-    fprintf(f,"{\n  \"fwd\": {\"frames\": %"PRIu64", \"sig_frames\": %"PRIu64", \"sig_sumsq\": %.17g, \"underruns\": %"PRIu64"},\n",ff,fs,fss,fu);
-    fprintf(f,"  \"rev\": {\"frames\": %"PRIu64", \"sig_frames\": %"PRIu64", \"sig_sumsq\": %.17g, \"underruns\": %"PRIu64"},\n",rf,rs,rss,ru);
+    uint64_t ff,fs,fu,fh,fx,fd,fb,fe,fo,fi,rf,rs,ru,rh,rx,rd,rb,re,ro,ri;double fss,rss,fp,rp,fref,fnoise,rref,rnoise,fg,fgm,rg,rgm;
+    stat_snapshot(fwd,&ff,&fs,&fss,&fu,&fp,&fh,&fx,&fd,&fref,&fnoise,&fb,&fe,&fo,&fi,&fg,&fgm);stat_snapshot(rev,&rf,&rs,&rss,&ru,&rp,&rh,&rx,&rd,&rref,&rnoise,&rb,&re,&ro,&ri,&rg,&rgm);
+    fprintf(f,"{\n  \"fwd\": {\"frames\": %"PRIu64", \"sig_frames\": %"PRIu64", \"sig_sumsq\": %.17g, \"underruns\": %"PRIu64", \"erase_target_burst\": %d, \"signal_bursts_seen\": %"PRIu64", \"erased_chunks\": %"PRIu64", \"hard_clips\": %"PRIu64", \"clip_den\": %"PRIu64", \"over_fs_unscaled\": %"PRIu64", \"input_at_fs\": %"PRIu64", \"composite_scale\": %.17g, \"composite_scale_min\": %.17g},\n",ff,fs,fss,fu,fwd->erase_target_burst,fb,fe,fh,fd,fo,fi,fg,fgm);
+    fprintf(f,"  \"rev\": {\"frames\": %"PRIu64", \"sig_frames\": %"PRIu64", \"sig_sumsq\": %.17g, \"underruns\": %"PRIu64", \"erase_target_burst\": %d, \"signal_bursts_seen\": %"PRIu64", \"erased_chunks\": %"PRIu64", \"hard_clips\": %"PRIu64", \"clip_den\": %"PRIu64", \"over_fs_unscaled\": %"PRIu64", \"input_at_fs\": %"PRIu64", \"composite_scale\": %.17g, \"composite_scale_min\": %.17g},\n",rf,rs,rss,ru,rev->erase_target_burst,rb,re,rh,rd,ro,ri,rg,rgm);
+    fprintf(f,"  \"psig_mode\": ");json_string(f,o->reference_mode);fprintf(f,", \"psig_mode_source\": ");json_string(f,o->reference_mode_source);fprintf(f,",\n");
+    if(fwd->channel.psig_mode==PSIG_GEOMETRY||fwd->channel.psig_mode==PSIG_BENCH){fprintf(f,"  \"geometry\": {\"fwd\": ");geo_json(f,&fwd->channel);fprintf(f,", \"rev\": ");geo_json(f,&rev->channel);fprintf(f,"},\n");
+        fprintf(f,"  \"waveform_kinds\": {\"fwd\": ");kinds_json(f,&fwd->channel);fprintf(f,", \"rev\": ");kinds_json(f,&rev->channel);fprintf(f,"},\n");}
+    fprintf(f,"  \"bench\": {\"ofdm_reference_power\": %.17g, \"ofdm_reference_source\": ",o->ofdm_ref);json_string(f,o->ofdm_ref_source);
+    fprintf(f,", \"ofdm_reference_derivation\": ");json_string(f,BENCH_OFDM_REF_DERIVATION);
+    fprintf(f,", \"fwd_noise_variance\": %.17g, \"rev_noise_variance\": %.17g, \"kind_kurtosis_threshold\": %.17g, \"kind_band_threshold_hz\": %.17g},\n",fnoise,rnoise,o->kind_kurt_thr,o->kind_bw_thr_hz);
     fprintf(f,"  \"channel_attestation\": {\"cell\": ");json_string(f,o->cell);fprintf(f,", \"profile\": ");
     char up[16];size_t i;for(i=0;i<sizeof(up)-1&&o->profile_name[i];i++)up[i]=(char)toupper((unsigned char)o->profile_name[i]);up[i]=0;json_string(f,up);
     fprintf(f,", \"commanded_snr\": %.17g, \"realized_snr3k\": %.17g, \"realized_snr_offset_db\": %.17g, \"seed\": %d, \"passthrough\": %s, \"realized_p_sig\": %.17g},\n",o->commanded_snr,o->snr,o->snr_offset,o->seed,o->passthrough?"true":"false",fs?fss/fs:0.0);
     fprintf(f,"  \"axis_attestation\": {\"axis_version\": ");json_string(f,o->axis);fprintf(f,", \"input_coordinate\": ");json_string(f,o->input_coordinate);
-    fprintf(f,", \"reference_mode\": \"steady-active-chunk-median\", \"reference_id\": \"traffic-steady-v1\", \"reference_power\": %.17g, \"reference_n_samples\": 0",fref);
+    fprintf(f,", \"reference_mode\": ");json_string(f,reference_mode_label(o->reference_mode));fprintf(f,", \"reference_id\": ");json_string(f,reference_id_label(o->reference_mode));
+    fprintf(f,", \"reference_power\": %.17g, \"reference_n_samples\": 0",fref);
+    fprintf(f,", \"psig_mode\": ");json_string(f,o->reference_mode);fprintf(f,", \"psig_mode_source\": ");json_string(f,o->reference_mode_source);
+    fprintf(f,", \"psig_fix\": %.17g, \"floor_reference_power\": %.17g, \"class_tol_db\": %.17g, \"shift_db\": %.17g, \"reverse_reference_power\": %.17g, \"reverse_noise_variance\": %.17g",o->psig_fix,o->floor_ref,o->class_tol_db,o->shift_db,rref,rnoise);
+    fprintf(f,", \"burst_log\": ");json_string(f,o->burst_log);
     fprintf(f,", \"configured_bandwidth_hz\": %.17g, \"snr3k_db\": %.17g, \"cn_config_db\": %.17g, \"noise_variance\": %.17g",o->configured_bandwidth_hz,o->snr,o->cn_config_db,fnoise);
-    fprintf(f,", \"seed\": %d, \"composite_scale\": 1.0, \"pre_scale_peak\": %.17g, \"hard_clip_count\": %"PRIu64", \"s32_saturation_count\": %"PRIu64", \"clip_event_denominator\": %"PRIu64", \"s32_mode\": ",o->seed,fmax(fp,rp),fh+rh,fx+rx,fd+rd);json_string(f,!strcmp(o->s32_mode,"auto")?"s32-hardclip":o->s32_mode);
+    fprintf(f,", \"seed\": %d, \"composite_scale\": %.17g, \"pre_scale_peak\": %.17g, \"hard_clip_count\": %"PRIu64", \"s32_saturation_count\": %"PRIu64", \"clip_event_denominator\": %"PRIu64", \"over_fs_unscaled_count\": %"PRIu64", \"noise_lpf_hz\": %.17g, \"noise_lpf_taps\": %d, \"noise_power_ratio_vs_3k\": %.17g, \"headroom_rms\": %.17g, \"s32_mode\": ",o->seed,fmin(fgm,rgm),fmax(fp,rp),fh+rh,fx+rx,fd+rd,fo+ro,fwd->channel.nf_n?o->noise_lpf_hz:0.0,fwd->channel.nf_n,noise_power_ratio(&fwd->channel),o->headroom_rms);json_string(f,!strcmp(o->s32_mode,"auto")?"s32-hardclip":o->s32_mode);
     fprintf(f,", \"binary_sha256\": ");json_string(f,o->binary_sha256);fprintf(f,", \"recipe_sha256\": ");json_string(f,o->recipe_sha256);fprintf(f,"}");
     if(g_schedule.loaded){fputc(',',f);schedule_emit_json(f);}
     fprintf(f,"\n}\n");
@@ -600,11 +1024,27 @@ static void signal_handler(int sig){(void)sig;stop_requested=1;}
 static void defaults(options_t*o){
     memset(o,0,sizeof(*o));strcpy(o->fwd_cap,"hw:Loopback,1,0");strcpy(o->fwd_play,"hw:Loopback,0,1");strcpy(o->rev_cap,"hw:Loopback,1,2");strcpy(o->rev_play,"hw:Loopback,0,3");strcpy(o->profile_name,"wgn");o->profile=PROF_WGN;o->snr=30;o->sig_ref=.15;o->seed=1;o->cap_periods=4;o->play_periods=5;o->prime_periods=2;o->bp_taps=511;
     strcpy(o->axis,"v1-steady-snr3k");strcpy(o->input_coordinate,"default_snr3k_db");strcpy(o->s32_mode,"auto");memset(o->binary_sha256,'0',64);o->binary_sha256[64]=0;memset(o->recipe_sha256,'0',64);o->recipe_sha256[64]=0;o->configured_bandwidth_hz=2343.75;
+    o->noise_lpf_hz=4000;o->noise_lpf_taps=255;o->headroom_rms=0.12;
+    /* Mercury OFDM WB transmit power on this bridge (a fixed-reference cfg13
+     * run held 0.0206 and the settled legacy median read 0.0207-0.0227). */
+    o->floor_ref=0.0206;o->class_tol_db=2.0;o->shift_db=3.0;
+    o->ofdm_ref=BENCH_OFDM_REF_DEFAULT;strcpy(o->ofdm_ref_source,"default");
+    /* Kind thresholds (record only, see geo_kind()): kurtosis midway between
+     * the highest non-OFDM-data waveform (2.35) and the lowest OFDM data
+     * (2.87); band threshold at the geometric mean of the WB (2343.75 Hz) and
+     * NB (one fifth of the WB carriers, 468.75 Hz) OFDM widths. */
+    o->kind_kurt_thr=2.6;o->kind_bw_thr_hz=sqrt(2343.75*468.75);
+    strcpy(o->reference_mode,"bench");strcpy(o->reference_mode_source,"default");
+    /* Environment fallback only; the harness passes --reference-mode, because
+     * a privileged launcher (sudo) does not carry the environment through. */
+    const char*em=getenv("MERCURY_SIM_PSIG_MODE"),*ef=getenv("MERCURY_SIM_PSIG_FIX");
+    if(em&&*em){snprintf(o->reference_mode,sizeof(o->reference_mode),"%s",em);strcpy(o->reference_mode_source,"env");}
+    if(ef&&*ef){o->psig_fix=strtod(ef,NULL);o->psig_fix_set=true;}
     const char *bp=getenv("IRIS_AUDIO_BANDPASS");
     if(bp&&!strcmp(bp,"narrow")){o->bp_lo=300;o->bp_hi=2900;}
     else if(bp&&!strcmp(bp,"wide")){o->bp_lo=300;o->bp_hi=6300;}
 }
-static void usage(FILE*f){fprintf(f,"usage: realaudio_bridge_s32_c [Python-compatible bridge options]\n       test modes: --vector-in F --vector-out F [--format-only|--passthrough]\n                   --double-in F --double-out F | --tap-out F --tap-count N\n");}
+static void usage(FILE*f){fprintf(f,"usage: realaudio_bridge_s32_c [Python-compatible bridge options]\n       channel: --noise-lpf-hz HZ (default 4000, 0=full band) --headroom-rms R (default 0.12, 0=off) --legacy-fullband\n       reference: --reference-mode bench|per-class|legacy-median|fix|peak (default bench)\n                  --ofdm-ref P (bench: OFDM WB data power the noise is set from) --psig-fix P (fix)\n                  --floor-ref P (per-class silence, default 0.0206) --kind-kurtosis-thr K --kind-band-thr-hz B\n                  --class-tol-db D --shift-db D --burst-log F (default <statsfile>.bursts.jsonl)\n       test modes: --vector-in F --vector-out F [--format-only|--passthrough]\n                   --double-in F --double-out F | --tap-out F --tap-count N\n");}
 static int val(int argc,char**argv,int*i,const char**v){if(*i+1>=argc)return-1;*v=argv[++*i];return 0;}
 static int parse_profile(options_t*o,const char*s){
     snprintf(o->profile_name,sizeof(o->profile_name),"%s",s);for(char*p=o->profile_name;*p;p++)*p=(char)tolower((unsigned char)*p);
@@ -613,16 +1053,40 @@ static int parse_profile(options_t*o,const char*s){
 static int parse_args(int argc,char**argv,options_t*o){
     defaults(o);for(int i=1;i<argc;i++){const char*a=argv[i],*v=NULL;
         if(!strcmp(a,"--help")||!strcmp(a,"-h")){usage(stdout);exit(0);}else if(!strcmp(a,"--passthrough"))o->passthrough=true;else if(!strcmp(a,"--burst"))o->burst=true;else if(!strcmp(a,"--dry-run"))o->dry_run=true;else if(!strcmp(a,"--self-test"))o->self_test=true;else if(!strcmp(a,"--format-only"))o->format_only=true;
+        else if(!strcmp(a,"--legacy-fullband")){o->noise_lpf_hz=0;o->headroom_rms=0;o->noise_lpf_set=o->headroom_set=true;}
         else if(val(argc,argv,&i,&v)<0)return-1;
         else if(!strcmp(a,"--fwd-cap"))snprintf(o->fwd_cap,sizeof(o->fwd_cap),"%s",v);else if(!strcmp(a,"--fwd-play"))snprintf(o->fwd_play,sizeof(o->fwd_play),"%s",v);else if(!strcmp(a,"--rev-cap"))snprintf(o->rev_cap,sizeof(o->rev_cap),"%s",v);else if(!strcmp(a,"--rev-play"))snprintf(o->rev_play,sizeof(o->rev_play),"%s",v);
-        else if(!strcmp(a,"--profile")){if(parse_profile(o,v))return-1;}else if(!strcmp(a,"--snr")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr");}else if(!strcmp(a,"--snr3k")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k");}else if(!strcmp(a,"--snr3k-db")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k_db");}else if(!strcmp(a,"--cn-config-db")){o->cn_config_db=strtod(v,NULL);strcpy(o->input_coordinate,"cn_config_db");}else if(!strcmp(a,"--cell")){snprintf(o->cell,sizeof(o->cell),"%s",v);strcpy(o->input_coordinate,"cell");}else if(!strcmp(a,"--axis"))snprintf(o->axis,sizeof(o->axis),"%s",v);else if(!strcmp(a,"--configured-bandwidth-hz"))o->configured_bandwidth_hz=strtod(v,NULL);else if(!strcmp(a,"--binary-sha256"))snprintf(o->binary_sha256,sizeof(o->binary_sha256),"%s",v);else if(!strcmp(a,"--recipe-sha256"))snprintf(o->recipe_sha256,sizeof(o->recipe_sha256),"%s",v);else if(!strcmp(a,"--s32-mode"))snprintf(o->s32_mode,sizeof(o->s32_mode),"%s",v);else if(!strcmp(a,"--cfo-hz"))o->cfo_hz=strtod(v,NULL);else if(!strcmp(a,"--phase-noise-deg"))o->phase_noise_deg=strtod(v,NULL);else if(!strcmp(a,"--fade-depth-db"))o->fade_depth_db=strtod(v,NULL);else if(!strcmp(a,"--loss"))o->loss=strtod(v,NULL);else if(!strcmp(a,"--sig-ref"))o->sig_ref=strtod(v,NULL);else if(!strcmp(a,"--seed"))o->seed=(int)strtol(v,NULL,10);else if(!strcmp(a,"--cap-periods"))o->cap_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--play-periods"))o->play_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--prime-periods"))o->prime_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--statsfile"))snprintf(o->statsfile,sizeof(o->statsfile),"%s",v);else if(!strcmp(a,"--snr-schedule"))snprintf(o->snr_schedule,sizeof(o->snr_schedule),"%s",v);
+        else if(!strcmp(a,"--profile")){if(parse_profile(o,v))return-1;}else if(!strcmp(a,"--snr")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr");}else if(!strcmp(a,"--snr3k")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k");}else if(!strcmp(a,"--snr3k-db")){o->snr=strtod(v,NULL);strcpy(o->input_coordinate,"snr3k_db");}else if(!strcmp(a,"--cn-config-db")){o->cn_config_db=strtod(v,NULL);strcpy(o->input_coordinate,"cn_config_db");}else if(!strcmp(a,"--cell")){snprintf(o->cell,sizeof(o->cell),"%s",v);strcpy(o->input_coordinate,"cell");}else if(!strcmp(a,"--axis"))snprintf(o->axis,sizeof(o->axis),"%s",v);else if(!strcmp(a,"--configured-bandwidth-hz"))o->configured_bandwidth_hz=strtod(v,NULL);else if(!strcmp(a,"--binary-sha256"))snprintf(o->binary_sha256,sizeof(o->binary_sha256),"%s",v);else if(!strcmp(a,"--recipe-sha256"))snprintf(o->recipe_sha256,sizeof(o->recipe_sha256),"%s",v);else if(!strcmp(a,"--s32-mode"))snprintf(o->s32_mode,sizeof(o->s32_mode),"%s",v);else if(!strcmp(a,"--cfo-hz"))o->cfo_hz=strtod(v,NULL);else if(!strcmp(a,"--phase-noise-deg"))o->phase_noise_deg=strtod(v,NULL);else if(!strcmp(a,"--fade-depth-db"))o->fade_depth_db=strtod(v,NULL);else if(!strcmp(a,"--erase-a2b-burst"))o->erase_a2b_burst=(int)strtol(v,NULL,10);else if(!strcmp(a,"--erase-b2a-burst"))o->erase_b2a_burst=(int)strtol(v,NULL,10);else if(!strcmp(a,"--loss"))o->loss=strtod(v,NULL);else if(!strcmp(a,"--sig-ref"))o->sig_ref=strtod(v,NULL);else if(!strcmp(a,"--seed"))o->seed=(int)strtol(v,NULL,10);else if(!strcmp(a,"--cap-periods"))o->cap_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--play-periods"))o->play_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--prime-periods"))o->prime_periods=(int)strtol(v,NULL,10);else if(!strcmp(a,"--statsfile"))snprintf(o->statsfile,sizeof(o->statsfile),"%s",v);else if(!strcmp(a,"--snr-schedule"))snprintf(o->snr_schedule,sizeof(o->snr_schedule),"%s",v);
         else if(!strcmp(a,"--audio-bandpass")){if(!strcmp(v,"narrow")){o->bp_lo=300;o->bp_hi=2900;}else if(!strcmp(v,"wide")){o->bp_lo=300;o->bp_hi=6300;}else if(strcmp(v,"off"))return-1;}else if(!strcmp(a,"--bandpass-lo-hz"))o->bp_lo=strtod(v,NULL);else if(!strcmp(a,"--bandpass-hi-hz"))o->bp_hi=strtod(v,NULL);else if(!strcmp(a,"--bandpass-taps"))o->bp_taps=(int)strtol(v,NULL,10);
+        else if(!strcmp(a,"--reference-mode")){snprintf(o->reference_mode,sizeof(o->reference_mode),"%s",v);strcpy(o->reference_mode_source,"cli");}
+        else if(!strcmp(a,"--psig-fix")){o->psig_fix=strtod(v,NULL);o->psig_fix_set=true;}
+        else if(!strcmp(a,"--ofdm-ref")){o->ofdm_ref=strtod(v,NULL);strcpy(o->ofdm_ref_source,"cli");}
+        else if(!strcmp(a,"--kind-kurtosis-thr"))o->kind_kurt_thr=strtod(v,NULL);else if(!strcmp(a,"--kind-band-thr-hz"))o->kind_bw_thr_hz=strtod(v,NULL);
+        else if(!strcmp(a,"--floor-ref"))o->floor_ref=strtod(v,NULL);else if(!strcmp(a,"--class-tol-db"))o->class_tol_db=strtod(v,NULL);else if(!strcmp(a,"--shift-db"))o->shift_db=strtod(v,NULL);
+        else if(!strcmp(a,"--burst-log"))snprintf(o->burst_log,sizeof(o->burst_log),"%s",v);
+        else if(!strcmp(a,"--noise-lpf-hz")){o->noise_lpf_hz=strtod(v,NULL);o->noise_lpf_set=true;}else if(!strcmp(a,"--noise-lpf-taps"))o->noise_lpf_taps=(int)strtol(v,NULL,10);else if(!strcmp(a,"--headroom-rms")){o->headroom_rms=strtod(v,NULL);o->headroom_set=true;}
         else if(!strcmp(a,"--vector-in"))snprintf(o->vector_in,sizeof(o->vector_in),"%s",v);else if(!strcmp(a,"--vector-out"))snprintf(o->vector_out,sizeof(o->vector_out),"%s",v);else if(!strcmp(a,"--double-in"))snprintf(o->double_in,sizeof(o->double_in),"%s",v);else if(!strcmp(a,"--double-out"))snprintf(o->double_out,sizeof(o->double_out),"%s",v);else if(!strcmp(a,"--tap-out"))snprintf(o->tap_out,sizeof(o->tap_out),"%s",v);else if(!strcmp(a,"--tap-count"))o->tap_count=(size_t)strtoull(v,NULL,10);else if(!strcmp(a,"--tap-stride"))o->tap_stride=(size_t)strtoull(v,NULL,10);else return-1;
     }
     if(strcmp(o->axis,"v1-steady-snr3k")||!strcmp(o->s32_mode,"prescaled")){
         fprintf(stderr,"native bridge currently requires --axis v1-steady-snr3k and a hard-clip S32 mode\n");return-1;
     }
     if(o->configured_bandwidth_hz<=0)return-1;
+    /* Reference mode names.  "steady" (the name every campaign environment
+     * used for "the default reference") selects the default, bench.  The
+     * per-waveform-class reference is per-class (old name geometry); the old
+     * running median of all active chunks is kept, byte-for-byte, as
+     * legacy-median. */
+    for(char*p=o->reference_mode;*p;p++)*p=(char)tolower((unsigned char)*p);
+    if(!strcmp(o->reference_mode,"steady")||!strcmp(o->reference_mode,"bench"))strcpy(o->reference_mode,"bench");
+    else if(!strcmp(o->reference_mode,"per-class")||!strcmp(o->reference_mode,"geometry"))strcpy(o->reference_mode,"geometry");
+    else if(!strcmp(o->reference_mode,"legacy-median")||!strcmp(o->reference_mode,"legacy"))strcpy(o->reference_mode,"legacy-median");
+    else if(strcmp(o->reference_mode,"fix")&&strcmp(o->reference_mode,"peak")){fprintf(stderr,"unknown --reference-mode %s\n",o->reference_mode);return-1;}
+    if(!strcmp(o->reference_mode,"fix")&&!(o->psig_fix>0)){fprintf(stderr,"--reference-mode fix needs --psig-fix > 0\n");return-1;}
+    if(!(o->floor_ref>0)||!(o->class_tol_db>0)||!(o->shift_db>0)||!(o->ofdm_ref>0)||!(o->kind_kurt_thr>0)||!(o->kind_bw_thr_hz>0))return-1;
+    /* A configured audio bandpass (the FM-modem path) keeps the legacy noise
+     * model unless the receiver-passband options are given explicitly. */
+    if(o->bp_hi>o->bp_lo&&o->bp_lo>0){if(!o->noise_lpf_set)o->noise_lpf_hz=0;if(!o->headroom_set)o->headroom_rms=0;}
+    if(o->noise_lpf_hz<0||o->noise_lpf_hz>=RATE/2.0||o->headroom_rms<0)return-1;
     if(!strcmp(o->input_coordinate,"cn_config_db"))o->snr=o->cn_config_db-10.0*log10(3000.0/o->configured_bandwidth_hz);
     o->commanded_snr=o->snr;o->snr_offset=0;
     if(o->cell[0]){char*colon=strchr(o->cell,':');if(!colon||strncasecmp(o->cell,"WGN:",4))return-1;o->commanded_snr=strtod(colon+1,NULL);o->snr=ionos_wgn_to_snr3k(o->commanded_snr);o->snr_offset=o->snr-o->commanded_snr;}
@@ -637,14 +1101,20 @@ static int parse_args(int argc,char**argv,options_t*o){
 }
 
 static int vector_mode(const options_t*o){
-    FILE*fi=fopen(o->vector_in,"rb"),*fo=fopen(o->vector_out,"wb");if(!fi||!fo){perror("vector file");return 2;}channel_t c;if(channel_init(&c,o,(uint32_t)(o->seed*UINT32_C(2654435761))))return 2;
+    FILE*fi=fopen(o->vector_in,"rb"),*fo=fopen(o->vector_out,"wb");if(!fi||!fo){perror("vector file");return 2;}channel_t c;if(channel_init(&c,o,(uint32_t)(o->seed*UINT32_C(2654435761))))return 2;strcpy(c.name,"vec");
     c.sched_offline=true;strcpy(c.sched_tag,"vec");
-    int32_t ib[PERIOD*2],ob[PERIOD*2];double x[PERIOD],y[PERIOD];size_t words;
+    if((c.psig_mode==PSIG_GEOMETRY||c.psig_mode==PSIG_BENCH)&&o->burst_log[0]&&strcmp(o->burst_log,"-")){g_burst_log=fopen(o->burst_log,"w");if(!g_burst_log){perror("burst log");return 2;}}
+    int32_t ib[PERIOD*2],ob[PERIOD*2];double x[PERIOD],y[PERIOD],vpk=0;size_t words;uint64_t vhard=0,vover=0,vden=0;
     while((words=fread(ib,sizeof(int32_t),PERIOD*2,fi))){size_t n=words/2;for(size_t i=0;i<n;i++)x[i]=(double)ib[2*i]/INT_MAX_D;
         if(o->passthrough){for(size_t i=0;i<n;i++)ob[2*i]=ob[2*i+1]=ib[2*i];}
-        else {if(o->format_only)memcpy(y,x,n*sizeof(double));else channel_process(&c,x,y,n);for(size_t i=0;i<n;i++){double v=y[i]*INT_MAX_D;if(v>INT_MAX_D)v=INT_MAX_D;if(v< -INT_MAX_D)v=-INT_MAX_D;ob[2*i]=ob[2*i+1]=(int32_t)v;}}
+        else {if(o->format_only)memcpy(y,x,n*sizeof(double));else channel_process(&c,x,y,n);emit_s32(&c,y,ob,n,&vpk,&vhard,&vover);vden+=n;}
         if(fwrite(ob,sizeof(int32_t),n*2,fo)!=n*2){perror("write");return 2;}if(words%2)break;
-    }schedule_finalize();write_schedule_statsfile(o);channel_free(&c);fclose(fi);fclose(fo);return 0;
+    }
+    fprintf(stderr,"[bridge_s32_c] vector clip hard=%"PRIu64" over_fs_unscaled=%"PRIu64" den=%"PRIu64" composite_scale=%.9g noise_lpf_hz=%g pre_scale_peak=%.6g\n",vhard,vover,vden,c.composite_scale,c.nf_n?o->noise_lpf_hz:0.0,vpk);
+    if(c.psig_mode==PSIG_GEOMETRY||c.psig_mode==PSIG_BENCH){if(c.in_burst)geo_finalize(&c,false);fprintf(stderr,"[bridge_s32_c] vector geometry reference_mode=%s transmissions=%"PRIu64" classes=%d worst_snr3k_error_db=%.4f\n",o->reference_mode,c.bursts_done,c.ncls,c.worst_snr_err_db);}
+    else fprintf(stderr,"[bridge_s32_c] vector reference_mode=%s reference_power=%.9g\n",o->reference_mode,c.p_sig);
+    if(g_burst_log){fclose(g_burst_log);g_burst_log=NULL;}
+    schedule_finalize();write_schedule_statsfile(o);channel_free(&c);fclose(fi);fclose(fo);return 0;
 }
 static int double_mode(const options_t*o){
     FILE*fi=fopen(o->double_in,"rb"),*fo=fopen(o->double_out,"wb");if(!fi||!fo){perror("double file");return 2;}channel_t c;if(channel_init(&c,o,(uint32_t)(o->seed*UINT32_C(2654435761))))return 2;c.sched_offline=true;strcpy(c.sched_tag,"dbl");double x[PERIOD],y[PERIOD];size_t n;while((n=fread(x,sizeof(double),PERIOD,fi))){channel_process(&c,x,y,n);if(fwrite(y,sizeof(double),n,fo)!=n)return 2;}schedule_finalize();write_schedule_statsfile(o);channel_free(&c);fclose(fi);fclose(fo);return 0;
@@ -653,22 +1123,27 @@ static int tap_mode(const options_t*o){
     double dt,fd;profile_params(o->profile,&dt,&fd);if(fd<=0){fprintf(stderr,"tap mode needs fading profile\n");return 2;}FILE*f=fopen(o->tap_out,"wb");if(!f){perror("tap-out");return 2;}doppler_t d;doppler_init(&d,fd,(uint64_t)o->seed);size_t stride=o->tap_stride?o->tap_stride:d.update;for(size_t i=0;i<o->tap_count;i++){double pair[2]={creal(d.hold),cimag(d.hold)};if(fwrite(pair,sizeof(double),2,f)!=2){fclose(f);return 2;}doppler_skip(&d,stride);}fclose(f);return 0;
 }
 static void dry_stats(pump_t*p,const options_t*o,uint32_t seed){
-    channel_init(&p->channel,o,seed);double x[PERIOD],y[PERIOD],ss=0;for(int i=0;i<PERIOD;i++)x[i]=o->sig_ref*sqrt(2.0)*sin(2*PI*1500*i/RATE);for(int k=0;k<8;k++){if(!o->passthrough)channel_process(&p->channel,x,y,PERIOD);for(int i=0;i<PERIOD;i++)ss+=x[i]*x[i];p->stats.frames+=PERIOD;p->stats.sig_frames+=PERIOD;}p->stats.sig_sumsq=ss;p->stats.reference_power=p->channel.p_sig;p->stats.noise_variance=p->channel.noise_std*p->channel.noise_std;
+    channel_init(&p->channel,o,seed);double x[PERIOD],y[PERIOD],ss=0;for(int k=0;k<8;k++){for(int i=0;i<PERIOD;i++){x[i]=o->sig_ref*sqrt(2.0)*sin(2*PI*1500*i/RATE);ss+=x[i]*x[i];}maybe_erase_burst(p,x,PERIOD,true);if(!o->passthrough)channel_process(&p->channel,x,y,PERIOD);p->stats.frames+=PERIOD;p->stats.sig_frames+=PERIOD;}p->stats.sig_sumsq=ss;p->stats.reference_power=p->channel.p_sig;p->stats.noise_variance=p->channel.noise_std*p->channel.noise_std;p->stats.scale=p->channel.composite_scale;p->stats.scale_min=p->channel.scale_min;
 }
 int main(int argc,char**argv){
     options_t o;if(parse_args(argc,argv,&o)){usage(stderr);return 2;}
     if(o.vector_in[0]||o.vector_out[0])return(o.vector_in[0]&&o.vector_out[0])?vector_mode(&o):2;
     if(o.double_in[0]||o.double_out[0])return(o.double_in[0]&&o.double_out[0])?double_mode(&o):2;
     if(o.tap_out[0])return tap_mode(&o);
-    pump_t fwd={.opt=&o},rev={.opt=&o};strcpy(fwd.name,"fwd");strcpy(rev.name,"rev");strcpy(fwd.cap_dev,o.fwd_cap);strcpy(fwd.play_dev,o.fwd_play);strcpy(rev.cap_dev,o.rev_cap);strcpy(rev.play_dev,o.rev_play);pthread_mutex_init(&fwd.stats.lock,NULL);pthread_mutex_init(&rev.stats.lock,NULL);pthread_mutex_init(&fwd.pcm_lock,NULL);pthread_mutex_init(&rev.pcm_lock,NULL);
+    pump_t fwd={.opt=&o,.erase_target_burst=o.erase_a2b_burst,.erase_prev_silent=true},rev={.opt=&o,.erase_target_burst=o.erase_b2a_burst,.erase_prev_silent=true};strcpy(fwd.name,"fwd");strcpy(rev.name,"rev");strcpy(fwd.cap_dev,o.fwd_cap);strcpy(fwd.play_dev,o.fwd_play);strcpy(rev.cap_dev,o.rev_cap);strcpy(rev.play_dev,o.rev_play);pthread_mutex_init(&fwd.stats.lock,NULL);pthread_mutex_init(&rev.stats.lock,NULL);pthread_mutex_init(&fwd.pcm_lock,NULL);pthread_mutex_init(&rev.pcm_lock,NULL);
     if(o.dry_run||o.self_test){dry_stats(&fwd,&o,(uint32_t)(o.seed*UINT32_C(2654435761)));dry_stats(&rev,&o,(uint32_t)(o.seed*UINT32_C(40503)+7));if(!o.statsfile[0])snprintf(o.statsfile,sizeof(o.statsfile),"/tmp/bridge_c_dry_%ld.json",(long)getpid());int e=flush_stats(&o,&fwd,&rev);fprintf(stderr,"[bridge_s32_c] %s wrote %s\n",e?"DRY-RUN FAIL":"DRY-RUN PASS",o.statsfile);channel_free(&fwd.channel);channel_free(&rev.channel);return e?1:0;}
     if(channel_init(&fwd.channel,&o,(uint32_t)(o.seed*UINT32_C(2654435761)))||channel_init(&rev.channel,&o,(uint32_t)(o.seed*UINT32_C(40503)+7))){fprintf(stderr,"channel init failed\n");return 2;}
     strcpy(fwd.channel.sched_tag,"fwd");strcpy(rev.channel.sched_tag,"rev");
-    fprintf(stderr,"[bridge_s32_c] %s SNR3k=%.3f profile=%s seed=%d rings cap=%d play=%d prime=%d cables fwd[%s->%s] rev[%s->%s]\n",o.passthrough?"PASSTHROUGH":"CHANNEL",o.snr,o.profile_name,o.seed,o.cap_periods,o.play_periods,o.prime_periods,o.fwd_cap,o.fwd_play,o.rev_cap,o.rev_play);
+    strcpy(fwd.channel.name,"fwd");strcpy(rev.channel.name,"rev");
+    if(!o.burst_log[0]&&o.statsfile[0])snprintf(o.burst_log,sizeof(o.burst_log),"%s.bursts.jsonl",o.statsfile);
+    if((fwd.channel.psig_mode==PSIG_GEOMETRY||fwd.channel.psig_mode==PSIG_BENCH)&&o.burst_log[0]&&strcmp(o.burst_log,"-")){g_burst_log=fopen(o.burst_log,"w");if(!g_burst_log){fprintf(stderr,"[bridge_s32_c] burst log %s: %s\n",o.burst_log,strerror(errno));return 2;}}
+    fwd.stats.scale=fwd.stats.scale_min=fwd.channel.composite_scale;rev.stats.scale=rev.stats.scale_min=rev.channel.composite_scale;
+    fprintf(stderr,"[bridge_s32_c] reference_mode=%s source=%s psig_fix=%.9g floor_ref=%.9g ofdm_ref=%.9g ofdm_ref_source=%s fwd_noise_var=%.9g rev_noise_var=%.9g\n",o.reference_mode,o.reference_mode_source,o.psig_fix,o.floor_ref,o.ofdm_ref,o.ofdm_ref_source,fwd.channel.noise_std*fwd.channel.noise_std,rev.channel.noise_std*rev.channel.noise_std);
+    fprintf(stderr,"[bridge_s32_c] %s SNR3k=%.3f noise_lpf_hz=%g composite_scale=%.6f profile=%s seed=%d rings cap=%d play=%d prime=%d cables fwd[%s->%s] rev[%s->%s]\n",o.passthrough?"PASSTHROUGH":"CHANNEL",o.snr,fwd.channel.nf_n?o.noise_lpf_hz:0.0,fwd.channel.composite_scale,o.profile_name,o.seed,o.cap_periods,o.play_periods,o.prime_periods,o.fwd_cap,o.fwd_play,o.rev_cap,o.rev_play);
     struct sigaction sa={0};sa.sa_handler=signal_handler;sigaction(SIGINT,&sa,NULL);sigaction(SIGTERM,&sa,NULL);
     pthread_t tf,tr;if(pthread_create(&tf,NULL,pump_main,&fwd)||pthread_create(&tr,NULL,pump_main,&rev)){fprintf(stderr,"pthread_create failed\n");return 2;}
     while(!stop_requested){struct timespec ts={.tv_sec=0,.tv_nsec=500000000};nanosleep(&ts,NULL);flush_stats(&o,&fwd,&rev);}
     pthread_mutex_lock(&fwd.pcm_lock);if(fwd.cap_shared)snd_pcm_drop(fwd.cap_shared);if(fwd.play_shared)snd_pcm_drop(fwd.play_shared);pthread_mutex_unlock(&fwd.pcm_lock);
     pthread_mutex_lock(&rev.pcm_lock);if(rev.cap_shared)snd_pcm_drop(rev.cap_shared);if(rev.play_shared)snd_pcm_drop(rev.play_shared);pthread_mutex_unlock(&rev.pcm_lock);
-    pthread_join(tf,NULL);pthread_join(tr,NULL);schedule_finalize();flush_stats(&o,&fwd,&rev);channel_free(&fwd.channel);channel_free(&rev.channel);return 0;
+    pthread_join(tf,NULL);pthread_join(tr,NULL);schedule_finalize();flush_stats(&o,&fwd,&rev);if(g_burst_log){fclose(g_burst_log);g_burst_log=NULL;}channel_free(&fwd.channel);channel_free(&rev.channel);return 0;
 }
