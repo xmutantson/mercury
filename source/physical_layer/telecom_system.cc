@@ -15416,14 +15416,16 @@ bool cl_telecom_system::measure_eesm_probe(double* passband, int n, double cfo_h
 	const int Mi = frequency_interpolation_rate;
 	const int nbb = n / Mi;
 	if(nbb <= 0) return false;
-	std::vector<std::complex<double>> bb((size_t)nbb);
+	std::vector<std::complex<double>> bb((size_t)nbb), bbs((size_t)nbb);
 	if(eesm_probe::passband_to_probe_baseband(g, passband, nbb * Mi, sampling_frequency,
-	       carrier_frequency + cfo_hint_hz, bb.data(), nbb) != nbb)
+	       carrier_frequency + cfo_hint_hz, bb.data(), nbb, false) != nbb
+	   || eesm_probe::passband_to_probe_baseband(g, passband, nbb * Mi, sampling_frequency,
+	       carrier_frequency + cfo_hint_hz, bbs.data(), nbb, true) != nbb)
 		return false;
 	double shape[eesm_probe::kMaxNc];
 	eesm_probe::frontend_noise_shape(g, sampling_frequency, carrier_frequency + cfo_hint_hz, shape);
 	const bool ok = eesm_probe::estimate_from_baseband(g, bb.data(), nbb, search_start_bb,
-		search_len_bb, m, shape);
+		search_len_bb, m, shape, bbs.data());
 	if(ok) m->cfo_hz += cfo_hint_hz;
 	return ok;
 }

@@ -595,7 +595,7 @@ void demod_grid(const st_geometry& g, const cplx* bb, int n0, double cfo_hz, cpl
 	}
 }
 
-int frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max)
+int frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max, bool sharp)
 {
 	// Windowed-sinc low-pass (Hamming). Pass edge: the outermost probe carrier plus one
 	// carrier spacing. Stop edge: the first frequency the decimation folds onto a probe
@@ -605,10 +605,11 @@ int frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps,
 	// A gentle transition keeps the filter short (little added delay spread). Length
 	// from the Hamming transition width, ~3.3 fs / transition (Oppenheim & Schafer,
 	// Discrete-Time Signal Processing, 7.5.1), odd so the filter is centred (zero delay).
-	(void)fc;
+	// sharp = true: stop edge at the lower edge of that 2 fc image instead (for the
+	// time-domain timing / frequency statistics, which the image would bias).
 	const double df = g.fs / (double)g.Nfft;
 	const double f_pass = (g.Nc / 2 + 1) * df;
-	const double f_stop = g.fs - f_pass;
+	const double f_stop = sharp ? 2.0 * fc - f_pass : g.fs - f_pass;
 	if(fs_pass <= 0.0 || f_stop <= f_pass) return 0;
 	const double fcut = 0.5 * (f_pass + f_stop);
 	int n = (int)std::ceil(3.3 * fs_pass / (f_stop - f_pass));
@@ -629,12 +630,12 @@ int frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps,
 }
 
 int passband_to_probe_baseband(const st_geometry& g, const double* pb, int n, double fs_pass,
-	double fc, cplx* out, int max)
+	double fc, cplx* out, int max, bool sharp)
 {
 	const int D = (int)std::lround(fs_pass / g.fs);
 	if(D < 1 || std::fabs(D * g.fs - fs_pass) > 1e-6 * fs_pass) return 0;
 	std::vector<double> taps(4096);
-	const int nt = frontend_taps(g, fs_pass, fc, taps.data(), (int)taps.size());
+	const int nt = frontend_taps(g, fs_pass, fc, taps.data(), (int)taps.size(), sharp);
 	if(nt <= 0) return 0;
 	const int nout = n / D;
 	if(nout > max) return 0;
@@ -664,7 +665,7 @@ int passband_to_probe_baseband(const st_geometry& g, const double* pb, int n, do
 void frontend_noise_shape(const st_geometry& g, double fs_pass, double fc, double* shape)
 {
 	std::vector<double> taps(4096);
-	const int nt = frontend_taps(g, fs_pass, fc, taps.data(), (int)taps.size());
+	const int nt = frontend_taps(g, fs_pass, fc, taps.data(), (int)taps.size(), false);
 	const int h = nt / 2;
 	for(int k = 0; k < g.Nc; k++)
 	{
@@ -678,8 +679,9 @@ void frontend_noise_shape(const st_geometry& g, double fs_pass, double fc, doubl
 }
 
 bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
-	int search_start, int search_len, st_measurement* m, const double* noise_shape)
+	int search_start, int search_len, st_measurement* m, const double* noise_shape, const cplx* bb_sync)
 {
+	const cplx* sy = bb_sync ? bb_sync : bb;
 	std::memset(m, 0, sizeof(*m));
 	m->valid = false;
 	const int ns = symbol_samples(g);
@@ -701,7 +703,7 @@ bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 		double num = 0.0, den = 0.0;
 		for(int s = 0; s < g.n_symb; s++)
 		{
-			const cplx* r = bb + (size_t)n0 + (size_t)s * ns + g.Ngi;
+			const cplx* r = sy + (size_t)n0 + (size_t)s * ns + g.Ngi;
 			const cplx* t = &ref[(size_t)s * ns + g.Ngi];
 			for(int hh = 0; hh < 2; hh++)
 			{
@@ -728,7 +730,7 @@ bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 	cplx A(0.0, 0.0);
 	for(int s = 0; s < g.n_symb; s++)
 	{
-		const cplx* r = bb + (size_t)best_n + (size_t)s * ns + g.Ngi - backoff;
+		const cplx* r = sy + (size_t)best_n + (size_t)s * ns + g.Ngi - backoff;
 		const double sg = (s & 1) ? -1.0 : 1.0;
 		cplx a(0.0, 0.0);
 		for(int mm = 0; mm < h; mm++) a += r[mm + h] * std::conj(r[mm]);

@@ -136,17 +136,22 @@ void demod_grid(const st_geometry& g, const std::complex<double>* bb, int n0, do
 // first frequency the decimation folds onto a probe carrier), decimate to g.fs. Returns the number of
 // baseband samples written. frontend_noise_shape gives |H(f_k)|^2 of that filter at the
 // probe carriers (the noise shape the estimator whitens by).
-int  frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max);
+int  frontend_taps(const st_geometry& g, double fs_pass, double fc, double* taps, int max,
+	bool sharp = false);
 int  passband_to_probe_baseband(const st_geometry& g, const double* pb, int n, double fs_pass,
-	double fc, std::complex<double>* out, int max);
+	double fc, std::complex<double>* out, int max, bool sharp = false);
 void frontend_noise_shape(const st_geometry& g, double fs_pass, double fc, double* shape);
 
+// bb_sync (optional, same length/timing as bb): the same reception through the sharp
+// (image-rejecting) front end; the timing search and the coarse frequency estimate run on
+// it, the FFT demodulation on bb (short filter, least added delay spread).
 // Full receive path on a baseband buffer at g.fs: timing search over probe starts in
 // [search_start, search_start + search_len), coarse frequency estimate from the in-
 // symbol repetition, demodulation, then estimate_from_grid. `bb` must hold at least
 // search_start + search_len + probe_samples(g) samples.
 bool estimate_from_baseband(const st_geometry& g, const std::complex<double>* bb, int n,
-	int search_start, int search_len, st_measurement* m, const double* noise_shape = nullptr);
+	int search_start, int search_len, st_measurement* m, const double* noise_shape = nullptr,
+	const std::complex<double>* bb_sync = nullptr);
 
 // ---- EESM and election ---------------------------------------------------------
 // Numerically stable EESM (log-sum-exp), result in dB; -99 when n <= 0.
