@@ -15530,6 +15530,21 @@ bool cl_arq_controller::gs2_liveness_control_exchange_exempt() const
 	return inband_ctrl_miss_resumes_data((int)(unsigned char)messages_control.data[0]);
 }
 
+// A commander in TRANSMITTING_CONTROL whose control slot is empty has nothing to send (see
+// inband_connect_liveness_guard).  Under ACTIVE Gearshift it must return to the data plane.
+bool cl_arq_controller::gs2_empty_control_state_resumes_data()
+{
+	const char* ev = std::getenv("MERCURY_GS2_EMPTY_CTRL_RESUME");
+	if(ev && *ev && atoi(ev) == 0) return false;
+	if(!rate_opt.controls_link() || link_status != CONNECTED) return false;
+	if(connection_status != TRANSMITTING_CONTROL) return false;
+	if(messages_control.status != FREE && messages_control.length > 0) return false;
+	printf("[GS2-EMPTY-CTRL-RESUME] TRANSMITTING_CONTROL with an empty control slot at config %d: "
+		"returning to DATA so the owner decision is dispatched\n", current_configuration);
+	fflush(stdout);
+	return true;
+}
+
 int cl_arq_controller::test_gs2_spec_conformance()
 {
 	int fails = 0;
@@ -15637,6 +15652,27 @@ int cl_arq_controller::test_gs2_spec_conformance()
 		{ printf("[TEST-GS2SC] FAIL R5: live=%d off=%d freed=%d\n", live_on, live_off, freed); fails++; }
 		else printf("[TEST-GS2SC] PASS R5: queued control exchange exempt from the liveness stall; "
 			"freed slot is not (knob-off arm accrues and fabricates a failure)\n");
+	}
+
+	// ---- R6: an empty control state under ACTIVE returns to the data plane ------------------
+	{
+		rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+		int saved_link = link_status;
+		link_status = CONNECTED; connection_status = TRANSMITTING_CONTROL;
+		messages_control.status = FREE;
+		bool r6_on = gs2_empty_control_state_resumes_data();
+		gs2sc_setenv("MERCURY_GS2_EMPTY_CTRL_RESUME", "0");
+		bool r6_off = gs2_empty_control_state_resumes_data();
+		gs2sc_setenv("MERCURY_GS2_EMPTY_CTRL_RESUME", NULL);
+		messages_control.status = ADDED_TO_LIST; int sl = messages_control.length; messages_control.length = 4;
+		bool r6_live = gs2_empty_control_state_resumes_data();
+		messages_control.status = FREE; messages_control.length = sl;
+		link_status = saved_link; connection_status = IDLE;
+		rate_opt.set_mode_for_test(GEARSHIFT_V2_LEGACY);
+		if(!r6_on || r6_off || r6_live)
+		{ printf("[TEST-GS2SC] FAIL R6: on=%d off=%d live=%d\n", r6_on, r6_off, r6_live); fails++; }
+		else printf("[TEST-GS2SC] PASS R6: empty TRANSMITTING_CONTROL returns to DATA under ACTIVE; "
+			"a live control exchange does not (knob-off arm stays stranded)\n");
 	}
 
 	printf("[TEST-GS2SC] %s (failures=%d)\n", fails == 0 ? "ALL PASS" : "FAIL", fails);

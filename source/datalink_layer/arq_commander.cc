@@ -7450,9 +7450,18 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 			/*failed=*/true, /*frames_acked=*/0, /*frames_sent_override=*/1,
 			/*outcome_only=*/true);
 		int owner_target = current_configuration;
+		// Gearshift decisions are actuated at a data-batch boundary.  A commander parked in
+		// TRANSMITTING_CONTROL with an EMPTY control slot (a control exchange that was
+		// abandoned, or a legacy SET_CONFIG request the ownership firewall refused) has
+		// nothing to send and never reaches that boundary, so every owner decision below
+		// would be stranded until the link timer expires.  Return such a commander to the
+		// data plane so the owner's action is actually dispatched.
+		// MERCURY_GS2_EMPTY_CTRL_RESUME=0 restores the previous behaviour.
+		const bool empty_ctrl_resume = gs2_empty_control_state_resumes_data();
 		if(opt_evaluate_batch_end(&owner_target)
 		   && owner_target != current_configuration)
 		{
+			if(empty_ctrl_resume) this->connection_status = TRANSMITTING_DATA;
 			opt_pending_switch_cfg = owner_target;
 			printf("[GEARSHIFT-V2-AUTHORITY] liveness telemetry -> owner selected "
 				"%d->%d action=%d; generic BREAK suppressed\n",
@@ -7462,6 +7471,7 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 		}
 		if(!config_is_at_bottom(current_configuration, robust_enabled))
 		{
+			if(empty_ctrl_resume) this->connection_status = TRANSMITTING_DATA;
 			printf("[GEARSHIFT-V2-AUTHORITY] liveness telemetry -> owner HOLD/ABSTAIN "
 				"at cfg=%d above floor; generic BREAK suppressed\n",
 				current_configuration);

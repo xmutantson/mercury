@@ -782,6 +782,10 @@ req("live-control-exchange-is-not-a-liveness-failure",
     "if(gs2_liveness_control_exchange_exempt())" in cmd and
     allin(common, "MERCURY_GS2_LIVENESS_CTRL_EXEMPT", "PASS R5:"),
     "an ordinary control round trip does not feed Gearshift a fabricated whole-transaction failure")
+req("owner-decision-is-actuated-from-an-empty-control-state",
+    "const bool empty_ctrl_resume = gs2_empty_control_state_resumes_data();" in cmd and
+    allin(common, "MERCURY_GS2_EMPTY_CTRL_RESUME", "PASS R6:"),
+    "a refused/abandoned control exchange cannot strand Gearshift's decision outside the data plane")
 req("transition-cost-directed-unit-runs-in-test",
     "failed += test_arq.test_gs2_spec_conformance();" in main_src,
     "the knob-off arms reproduce each defect inside --test")
