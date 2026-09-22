@@ -15400,6 +15400,29 @@ int cl_telecom_system::generate_eesm_probe_passband(double* out, int max_samples
 	return npass;
 }
 
+// Relative noise power per probe carrier after the data receive filter: |H_rx(f_k)|^2
+// of FIR_rx_data (it runs on the mixed-down signal at the passband rate, before the
+// decimation), read off its impulse response. White channel noise leaves the filter
+// with exactly this shape, so the estimator pools noise after dividing by it.
+static void ep_rx_noise_shape(cl_telecom_system* ts, const eesm_probe::st_geometry& g, double* shape)
+{
+	cl_FIR& f = ts->ofdm.FIR_rx_data;
+	const int L = 2 * std::max(1, f.filter_nTaps) + 1;
+	std::vector<std::complex<double>> in((size_t)L, std::complex<double>(0.0, 0.0)), out((size_t)L);
+	in[(size_t)(L / 2)] = std::complex<double>(1.0, 0.0);
+	f.apply(in.data(), out.data(), L);
+	for(int k = 0; k < g.Nc; k++)
+	{
+		const int b = eesm_probe::bin_of_carrier(g, k);
+		const int q = (b >= g.Nfft / 2) ? b - g.Nfft : b;
+		const double fk = q * g.fs / (double)g.Nfft;
+		std::complex<double> H(0.0, 0.0);
+		for(int n = 0; n < L; n++)
+			H += out[(size_t)n] * std::polar(1.0, -2.0 * M_PI * fk * (double)n / ts->sampling_frequency);
+		shape[k] = std::norm(H);
+	}
+}
+
 bool cl_telecom_system::measure_eesm_probe(double* passband, int n, double cfo_hint_hz,
 	int search_start_bb, int search_len_bb, eesm_probe::st_measurement* m)
 {
@@ -15412,8 +15435,10 @@ bool cl_telecom_system::measure_eesm_probe(double* passband, int n, double cfo_h
 	std::vector<std::complex<double>> bb((size_t)nbb);
 	ofdm.passband_to_baseband_decimated(passband, nbb * Mi, bb.data(), sampling_frequency,
 		carrier_frequency + cfo_hint_hz, carrier_amplitude, Mi, &ofdm.FIR_rx_data);
+	double shape[eesm_probe::kMaxNc];
+	ep_rx_noise_shape(this, g, shape);
 	const bool ok = eesm_probe::estimate_from_baseband(g, bb.data(), nbb, search_start_bb,
-		search_len_bb, m);
+		search_len_bb, m, shape);
 	if(ok) m->cfo_hz += cfo_hint_hz;
 	return ok;
 }
@@ -15632,6 +15657,19 @@ void cl_telecom_system::eesm_probe_sim()
 		printf("[EP-NOISE] per-carrier RX noise profile (dB re mean):");
 		for(int k = 0; k < g.Nc; k++) printf(" %.2f", 10 * std::log10(Nk_unit[(size_t)k] / nm));
 		printf("\n");
+		double sh[eesm_probe::kMaxNc], sm = 0.0;
+		ep_rx_noise_shape(this, g, sh);
+		for(int k = 0; k < g.Nc; k++) sm += sh[k];
+		sm /= g.Nc;
+		double worst = 0.0;
+		printf("[EP-NOISE] receive-filter shape |H_rx|^2 (dB re mean):");
+		for(int k = 0; k < g.Nc; k++)
+		{
+			printf(" %.2f", 10 * std::log10(sh[k] / sm));
+			worst = std::max(worst, std::fabs(10 * std::log10(sh[k] / sm) - 10 * std::log10(Nk_unit[(size_t)k] / nm)));
+		}
+		printf("\n[EP-NOISE] max |shape - measured| = %.3f dB (40-window measurement, sd ~%.2f dB per carrier)\n",
+			worst, 10.0 / std::log(10.0) / std::sqrt(40.0 * g.n_symb));
 	}
 	printf("[EP-SIM] chan=%s fd=%.3f dtau_ms=%.3f depth_db=%.1f a=%.2f cfo=%.2f seeds=%d seed0=%d probe_cfg=%d n_symb=%d search_ms=%.0f dec=%d win_s=%.1f gap_s=%.2f\n",
 		ch.name(), ch.fd, ch.dtau_ms, ch.depth_db, ch.a, ch.cfo_hz, nseeds, seed0, probe_cfg, g.n_symb, search_ms,

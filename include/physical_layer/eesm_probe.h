@@ -115,8 +115,12 @@ struct st_measurement {
 
 // Estimate from the demodulated grid Y[s*Nc + k] (FFT outputs at the carriers, any
 // consistent scale). Applies the residual common frequency slope removal itself.
+// noise_shape (optional, Nc entries, mean 1): the known relative noise power per
+// carrier of the receive chain (|H_rx(f_k)|^2 of the digital receive filter). Noise is
+// pooled after dividing by it, so a shaped-but-otherwise-white floor keeps the full
+// pooled accuracy; NULL = white.
 bool estimate_from_grid(const st_geometry& g, const std::complex<double>* Y,
-	st_measurement* m);
+	st_measurement* m, const double* noise_shape = nullptr);
 
 // Demodulate the probe grid at a known start n0 (probe's first sample) after removing
 // cfo_hz: FFT window centred in the cyclic prefix (fft_backoff samples early), the
@@ -130,7 +134,7 @@ void demod_grid(const st_geometry& g, const std::complex<double>* bb, int n0, do
 // symbol repetition, demodulation, then estimate_from_grid. `bb` must hold at least
 // search_start + search_len + probe_samples(g) samples.
 bool estimate_from_baseband(const st_geometry& g, const std::complex<double>* bb, int n,
-	int search_start, int search_len, st_measurement* m);
+	int search_start, int search_len, st_measurement* m, const double* noise_shape = nullptr);
 
 // ---- EESM and election ---------------------------------------------------------
 // Numerically stable EESM (log-sum-exp), result in dB; -99 when n <= 0.

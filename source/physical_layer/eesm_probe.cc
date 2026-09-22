@@ -328,7 +328,7 @@ static double z_upper(double alpha, int n)
 	return 0.5 * (lo + hi);
 }
 
-bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
+bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m, const double* noise_shape)
 {
 	std::memset(m, 0, sizeof(*m));
 	m->valid = false;
@@ -338,7 +338,15 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
 	std::vector<cplx> X((size_t)S * Nc), Z((size_t)S * Nc);
 	for(int s = 0; s < S; s++) symbol_cells(g, s, &X[(size_t)s * Nc]);
 
-	// Silent cells: noise reference.
+	// Silent cells: noise reference, whitened by the known receive-chain shape.
+	std::vector<double> shape((size_t)Nc, 1.0);
+	if(noise_shape)
+	{
+		double sm = 0.0;
+		for(int k = 0; k < Nc; k++) sm += noise_shape[k];
+		sm /= Nc;
+		for(int k = 0; k < Nc; k++) shape[(size_t)k] = (sm > 0.0 && noise_shape[k] > 0.0) ? noise_shape[k] / sm : 1.0;
+	}
 	double nsum = 0.0; int ncount = 0;
 	std::vector<double> nk((size_t)Nc, 0.0);
 	std::vector<int> nkc((size_t)Nc, 0);
@@ -346,7 +354,7 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
 		for(int k = 0; k < Nc; k++)
 		{
 			if(cell_active(g, s, k)) continue;
-			const double p = std::norm(Y[(size_t)s * Nc + k]);
+			const double p = std::norm(Y[(size_t)s * Nc + k]) / shape[(size_t)k];
 			nsum += p; ncount++;
 			nk[(size_t)k] += p; nkc[(size_t)k]++;
 		}
@@ -408,9 +416,12 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m)
 		if(std::fabs(r - 1.0) > zq * sd) colored = true;
 	}
 	m->noise_colored = colored;
-	std::vector<double> Nk((size_t)Nc, Nw);
-	if(colored)
-		for(int k = 0; k < Nc; k++) { int q = k * Q / Nc; Nk[(size_t)k] = qn[(size_t)q] / std::max(1, qc[(size_t)q]); }
+	std::vector<double> Nk((size_t)Nc);
+	for(int k = 0; k < Nc; k++)
+	{
+		const int q = k * Q / Nc;
+		Nk[(size_t)k] = shape[(size_t)k] * (colored ? qn[(size_t)q] / std::max(1, qc[(size_t)q]) : Nw);
+	}
 	m->noise_cells = colored ? (ncount / Q) : ncount;
 	m->noise_rel_var = 1.0 / (double)std::max(1, m->noise_cells);
 
@@ -559,7 +570,7 @@ void demod_grid(const st_geometry& g, const cplx* bb, int n0, double cfo_hz, cpl
 }
 
 bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
-	int search_start, int search_len, st_measurement* m)
+	int search_start, int search_len, st_measurement* m, const double* noise_shape)
 {
 	std::memset(m, 0, sizeof(*m));
 	m->valid = false;
@@ -620,7 +631,7 @@ bool estimate_from_baseband(const st_geometry& g, const cplx* bb, int n,
 	std::vector<cplx> Y((size_t)g.n_symb * g.Nc);
 	demod_grid(g, bb, best_n, fco, Y.data());
 	const double tm = m->timing_metric;
-	if(!estimate_from_grid(g, Y.data(), m)) return false;
+	if(!estimate_from_grid(g, Y.data(), m, noise_shape)) return false;
 	m->timing_metric = tm;
 	m->timing_offset = best_n;
 	m->cfo_hz += fco;
