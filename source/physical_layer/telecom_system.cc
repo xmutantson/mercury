@@ -15345,6 +15345,7 @@ int cl_telecom_system::test_subpeak_gate()
 }
 
 #include <chrono>
+#include <cstdarg>
 
 // ===================== Link-quality sounding probe (eesm_probe) =====================
 // Modem-chain glue for physical_layer/eesm_probe.h plus its PLOT_PASSBAND harness.
@@ -15446,6 +15447,16 @@ bool cl_telecom_system::measure_eesm_probe(double* passband, int n, double cfo_h
 namespace ep_sim {
 
 typedef std::complex<double> cplx;
+
+static void appendf(std::string& s, const char* fmt, ...)
+{
+	char buf[4096];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	s += buf;
+}
 
 static double envd(const char* k, double d) { const char* e = std::getenv(k); return (e && *e) ? atof(e) : d; }
 static int envi(const char* k, int d) { const char* e = std::getenv(k); return (e && *e) ? atoi(e) : d; }
@@ -15735,7 +15746,8 @@ void cl_telecom_system::eesm_probe_sim()
 			mt.noise_rel_var = 0.0; mt.valid = true; mt.sigma_mean_db = 0.0;
 			mt.mean_snr_db = 10 * std::log10(std::max(1e-12, gtm));
 			const eesm_probe::st_decision dg = eesm_probe::decide(mt, pol);
-			printf("[EP-EST] chan=%s esn0=%.2f seed=%d ok=%d tmet=%.3f toff=%d(lead %d) cfo=%.3f(true %.2f) "
+			std::string estl, candl;
+			appendf(estl, "[EP-EST] chan=%s esn0=%.2f seed=%d ok=%d tmet=%.3f toff=%d(lead %d) cfo=%.3f(true %.2f) "
 				"mean_est=%.3f mean_true=%.3f sig_mean=%.3f carr_err_mean=%.3f carr_err_rms=%.3f n=%d "
 				"smooth=%d sratio=%.2f colored=%d tvar=%.5f fd_rms=%.3f fsel=%.3f dspread=%.3f cpu_ms=%.2f",
 				ch.name(), esn0, sd, (int)ok, m.timing_metric, m.timing_offset, lead_bb, m.cfo_hz, ch.baseband_cfo(),
@@ -15745,10 +15757,17 @@ void cl_telecom_system::eesm_probe_sim()
 			for(int c = 0; c < eesm_probe::kNumOfdmCfg; c++)
 			{
 				const double et = eesm_probe::eesm_db(gt, g.Nc, tab[c].beta);
-				printf(" e%d=%.2f/%.2f/%.2f", c, d.eff_db[c], et, d.sigma_db[c]);
+				appendf(estl, " e%d=%.2f/%.2f/%.2f", c, d.eff_db[c], et, d.sigma_db[c]);
 			}
-			printf(" rung=%d genie_rung=%d cap=%d fsel_flag=%d tsel_flag=%d\n", d.rung, dg.rung, d.cap_cfg,
+			appendf(estl, " rung=%d genie_rung=%d cap=%d fsel_flag=%d tsel_flag=%d", d.rung, dg.rung, d.cap_cfg,
 				(int)d.freq_selective, (int)d.time_selective);
+			// per-carrier SINR vectors (dB, estimate then genie truth) for offline EESM fitting
+			appendf(estl, " gv=");
+			for(int k = 0; k < g.Nc; k++) appendf(estl, "%s%.2f", k ? "," : "", m.sinr_lin[k] > 1e-6 ? 10 * std::log10(m.sinr_lin[k]) : -60.0);
+			appendf(estl, " gtv=");
+			for(int k = 0; k < g.Nc; k++) appendf(estl, "%s%.2f", k ? "," : "", gt[k] > 1e-6 ? 10 * std::log10(gt[k]) : -60.0);
+			appendf(estl, "\n");
+			printf("%s", estl.c_str());
 			fflush(stdout);
 
 			if(!do_dec) continue;
@@ -15806,7 +15825,7 @@ void cl_telecom_system::eesm_probe_sim()
 				const double gp = rbc * (frames > 0 ? (double)okf / frames : 0.0);
 				gp_of[(size_t)c] = gp; fer_of[(size_t)c] = frames > 0 ? 1.0 - (double)okf / frames : 1.0;
 				if(gp > best_gp + 1e-9) { best_gp = gp; best_cfg = c; }
-				printf("[EP-CAND] chan=%s esn0=%.2f seed=%d cfg=%d frames=%d ok=%d rbc=%.1f gp=%.1f data_rms_vs_probe_db=%+.2f\n",
+				appendf(candl, "[EP-CAND] chan=%s esn0=%.2f seed=%d cfg=%d frames=%d ok=%d rbc=%.1f gp=%.1f data_rms_vs_probe_db=%+.2f\n",
 					ch.name(), esn0, sd, c, frames, okf, rbc, gp,
 					(lvl_n > 0 && probe_rms > 0.0) ? 10 * std::log10(lvl / lvl_n) - 20 * std::log10(probe_rms) : 0.0);
 			}
@@ -15817,6 +15836,9 @@ void cl_telecom_system::eesm_probe_sim()
 			// the highest candidate that decoded at least half its frames (stranding reference)
 			int top_ok = -1;
 			for(double cd : cands_d) { const int c = (int)cd; if(c >= 0 && c < 64 && fer_of[(size_t)c] >= 0.0 && fer_of[(size_t)c] <= 0.5) top_ok = std::max(top_ok, c); }
+			// Re-emit the realization summary as one block at its end so a capped log tail
+			// always holds the estimate, every candidate and the verdict together.
+			printf("%s%s", estl.c_str(), candl.c_str());
 			printf("[EP-DEC] chan=%s esn0=%.2f seed=%d rung=%d genie_rung=%d best_cfg=%d gp_chosen=%.1f gp_best=%.1f regret=%.3f "
 				"fer_chosen=%.3f top_ok=%d strand=%d\n",
 				ch.name(), esn0, sd, d.rung, dg.rung, best_cfg, gp_ch, best_gp,
