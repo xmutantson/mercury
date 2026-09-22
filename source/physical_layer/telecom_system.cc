@@ -15546,17 +15546,26 @@ static void ep_truth(cl_telecom_system* ts, const eesm_probe::st_geometry& g,
 	ts->ofdm.passband_to_baseband_decimated(const_cast<double*>(clean_rx.data()), nbb * Mi, bb.data(),
 		ts->sampling_frequency, ts->carrier_frequency, ts->carrier_amplitude, Mi, &ts->ofdm.FIR_rx_data);
 	eesm_probe::demod_grid(g, bb.data(), n0, cfo_true, Y.data());
+	// Signal: mean power of the known cells (per unit data cell). Distortion: what the
+	// noise-free reception leaves in the silent cells (inter-symbol / inter-carrier
+	// leakage from paths outside the prefix window and from time variation), which a
+	// receiver cannot tell from noise. Truth SINR = signal / (noise + distortion).
 	for(int k = 0; k < g.Nc; k++)
 	{
-		double p = 0.0; int na = 0;
+		double p = 0.0, dsum = 0.0; int na = 0, nd = 0;
 		for(int s = 0; s < g.n_symb; s++)
 		{
-			if(!eesm_probe::cell_active(g, s, k)) continue;
+			if(!eesm_probe::cell_active(g, s, k)) { dsum += std::norm(Y[(size_t)s * g.Nc + k]); nd++; continue; }
 			eesm_probe::symbol_cells(g, s, X.data());
 			p += std::norm(Y[(size_t)s * g.Nc + k] / X[(size_t)k]);
 			na++;
 		}
-		gamma_true[k] = (na > 0 && Nk[(size_t)k] > 0.0) ? (p / na) / Nk[(size_t)k] : 0.0;
+		const double D = nd > 0 ? dsum / nd : 0.0;
+		double xx = 0.0;
+		for(int s = 0; s < g.n_symb; s++)
+			if(eesm_probe::cell_active(g, s, k)) { eesm_probe::symbol_cells(g, s, X.data()); xx = std::norm(X[(size_t)k]); break; }
+		const double sig = (na > 0 && xx > 0.0) ? std::max(0.0, p / na - D / xx) : 0.0;
+		gamma_true[k] = (Nk[(size_t)k] + D > 0.0) ? sig / (Nk[(size_t)k] + D) : 0.0;
 	}
 }
 
