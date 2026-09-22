@@ -2998,6 +2998,17 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "--test-fade-core") == 0) {
             return mercury::fade::run_fade_core_tests();
         }
+        if (strcmp(argv[i], "--test-entry-leap") == 0) {
+            int failed = 0;
+            {
+                cl_telecom_system ts_el;
+                cl_arq_controller ARQ_el;
+                ARQ_el.telecom_system = &ts_el;
+                failed += ARQ_el.test_nb_prior_guard();
+                failed += ARQ_el.test_entry_leap_fwd();
+            }
+            return failed == 0 ? 0 : 1;
+        }
         if (strcmp(argv[i], "--test-scream-wake") == 0) {
             arm_test_watchdog();
             if (getenv("MERCURY_SCREAM_SWEEP") == NULL) {
@@ -3932,6 +3943,14 @@ int main(int argc, char *argv[])
             {
                 cl_arq_controller ARQ_dsil;
                 failed += ARQ_dsil.test_demote_silence();
+            }
+            // NB connect-reply prior guard + forward-report entry leap (directed).
+            {
+                cl_telecom_system ts_el;
+                cl_arq_controller ARQ_el;
+                ARQ_el.telecom_system = &ts_el;
+                failed += ARQ_el.test_nb_prior_guard();
+                failed += ARQ_el.test_entry_leap_fwd();
             }
             // GAP-ABORT stream-backstop companion (data-flow-rsp-contiguity-ruler.md §7):
             // the REAL teardown must ALSO preserve the Option W byte cursor + stamp validity

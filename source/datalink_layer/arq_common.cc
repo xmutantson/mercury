@@ -1065,6 +1065,8 @@ cl_arq_controller::cl_arq_controller()
 	last_transmission_block_stats.success_rate_data=0;
 
 	measurements.SNR_uplink=-99.9;
+	entry_leap_wait_done = false;
+	entry_leap_wait_start_ms = 0;
 	measurements.SNR_downlink=-99.9;
 	measurements.SNR_uplink_data=-99.9;   // pollution guard: no forward-DATA frame decoded yet
 	measurements.signal_stregth_dbm=-99.9;
@@ -12398,6 +12400,13 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 			obs.nominal_bps[CONFIG_17] = (double)payload_per_batch * 8000.0 / (double)kd_ms;
 	}
 
+	// Forward-report entry leap: inject the gated elevator target elected from the peer's
+	// forward SNR report (obs.forward_snr_db) as the cold-start probe redirect. WB ACTIVE
+	// only; the optimizer consumes it at most once per session.
+	if(entry_leap_fwd_enabled() && rate_opt.get_mode() == GEARSHIFT_V2_ACTIVE && !is_nb
+	   && !rate_opt.entry_leap_dispatched())
+		rate_opt.set_entry_leap_target(obs.forward_snr_db > -90.0
+			? entry_leap_target_from_fwd(obs.forward_snr_db) : CONFIG_NONE);
 	const st_rate_decision decision = rate_opt.evaluate_v2(obs, optimizer_ceiling);
 	if(rate_opt.ladder_probe_accepted_this_evaluation() &&
 	   decision.action != GEARSHIFT_ACTION_PROBE &&
@@ -12472,6 +12481,8 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 
 	opt_reset_window();
 	rate_opt.reset_session_state();
+	if(nb_enabled == NO)
+		nb_prior_guard_on_wb_switch();
 	opt_pending_switch_cfg = -1;
 	opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
 	opt_pending_switch_fallback = -1;

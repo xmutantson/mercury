@@ -382,6 +382,12 @@ public:
     bool cooldown_active() const { return cooldown_remaining > 0; }
     int min_window_samples() const { return policy.min_outcome_samples; }
     void reset_session_state();
+    // Cold-entry leap target (ARQ controller computed it from the peer's forward
+    // SNR report through the gated elevator). CONFIG_NONE clears it. Consumed only
+    // as the redirected first cold-start probe rung inside evaluate_v2; one-shot per
+    // session (latched at dispatch).
+    void set_entry_leap_target(int cfg) { entry_leap_target_ = cfg; }
+    bool entry_leap_dispatched() const { return entry_leap_dispatched_; }
 
     void set_hysteresis_ratio(double r) { legacy_hysteresis_ratio = r; }
     void set_cooldown_batches(int n) { policy.cooldown_batches = n; }
@@ -465,6 +471,10 @@ private:
     e_gearshift_v2_action switch_action;
     int switch_fallback_cfg;
     bool switch_is_nb;
+
+    int entry_leap_target_;          // injected leap target; CONFIG_NONE => none
+    int entry_leap_pending_target_;  // redirected target awaiting dispatch (-1 none)
+    bool entry_leap_dispatched_;     // one-shot latch, set when the leap dispatches
 
     bool probe_active;
     bool probe_confirmed;

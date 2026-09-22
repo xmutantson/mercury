@@ -2112,6 +2112,23 @@ public:
   // RAISES it (SAFETY #3). Defined in arq_commander.cc next to both call sites.
   // See §14.
   int elevator_target_from_snr();
+  // Same cap chain parameterized on the SNR it elects from. reverse_meter_caps=true is
+  // the legacy elevator (reverse suffix meter floor + SNR-track caps); false omits those
+  // reverse-path meters for a FORWARD-report election. The CFG16 decode-margin gate is
+  // always evaluated on `snr` itself.
+  int elevator_target_from_snr_value(double snr, bool reverse_meter_caps);
+  // NB connect-reply prior guard (MERCURY_NB_PRIOR_GUARD, default on): on the switch to
+  // wideband the narrowband-geometry SNR must not seed the WB reverse prior / elevator.
+  void nb_prior_guard_on_wb_switch();
+  static bool nb_prior_guard_enabled();
+  // Forward-report entry leap (MERCURY_ENTRY_LEAP_FWD, default on).
+  static bool entry_leap_fwd_enabled();
+  int entry_leap_target_from_fwd(double fwd_snr_db);
+  bool entry_leap_report_wait_hold();   // true => hold this poll's dispatch
+  bool entry_leap_wait_done;           // one-shot per WB session
+  unsigned long long entry_leap_wait_start_ms;
+  int  test_nb_prior_guard();
+  int  test_entry_leap_fwd();
 
   // CONNECT-SEED of the START config (gearshift-start-and-recovery.md §10.2). PURE
   // core: from the connect-time control-plane SNR choose a WB OFDM start config

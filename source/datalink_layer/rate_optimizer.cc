@@ -499,7 +499,9 @@ cl_rate_optimizer::cl_rate_optimizer()
       legacy_optclock_measured(false), label_streak_count(0),
       min_cfg_calibrated(-1), max_sack_calibrated(-1.0),
       max_partial_loss_calibrated(-1.0), min_cfg_calibrated_nb(-1),
-      max_sack_calibrated_nb(-1.0), max_partial_loss_calibrated_nb(-1.0)
+      max_sack_calibrated_nb(-1.0), max_partial_loss_calibrated_nb(-1.0),
+      entry_leap_target_(CONFIG_NONE), entry_leap_pending_target_(-1),
+      entry_leap_dispatched_(false)
 {
     policy.load_env();
     switch_cost_ewma_ms = policy.default_switch_cost_ms;
@@ -2365,7 +2367,29 @@ ladder_probe_confirmed:
     bool saw_candidate_prediction = false;
     bool saw_uneconomic_probe = false;
     const std::vector<int> candidates = candidate_configs(obs);
-    const int preferred_probe_rung = config_probe_ladder_up(obs.current_cfg, obs.is_nb);
+    int preferred_probe_rung = config_probe_ladder_up(obs.current_cfg, obs.is_nb);
+    // COLD-ENTRY LEAP: redirect the first cold-start probe rung to the injected
+    // forward-SNR elevator target so it rides the proven ladder-probe dispatch path
+    // (PROBE, fallback=current; a miss rolls back and the organic ladder resumes).
+    // ACTIVE cold start only; the target must be a feasible, unblocked, higher
+    // candidate inside the ceiling. Held consistent across repeated evaluates and
+    // latched only at dispatch. No injected target => byte-identical.
+    if (mode == GEARSHIFT_V2_ACTIVE && cold_start_acquisition &&
+        !entry_leap_dispatched_ && entry_leap_target_ != CONFIG_NONE) {
+        const int ej = entry_leap_target_;
+        if (ej != obs.current_cfg && ej != preferred_probe_rung &&
+            gearshift_action_rank(ej) > gearshift_action_rank(preferred_probe_rung) &&
+            gearshift_destination_within_ofdm_ceiling(ej, config_ceiling) &&
+            !probe_target_blocked(ej, obs) &&
+            std::find(candidates.begin(), candidates.end(), ej) != candidates.end()) {
+            std::printf("[ENTRY-LEAP] cold-start probe rung redirected %d -> %d "
+                        "(fsnr=%.1f age=%d)\n", preferred_probe_rung, ej,
+                        obs.forward_snr_db, obs.forward_snr_age_batches);
+            std::fflush(stdout);
+            preferred_probe_rung = ej;
+            entry_leap_pending_target_ = ej;
+        }
+    }
     int next_feasible_probe_rung = -1;
     int next_feasible_lower_rung = -1;
     for (size_t i=0; i<candidates.size(); ++i) {
@@ -2763,6 +2787,13 @@ void cl_rate_optimizer::notify_switch_dispatched(
         std::fflush(stdout);
         return;
     }
+    if (entry_leap_pending_target_ >= 0 && to_cfg == entry_leap_pending_target_ &&
+        action == GEARSHIFT_ACTION_PROBE) {
+        entry_leap_dispatched_ = true;
+        std::printf("[ENTRY-LEAP] dispatched %d -> %d (PROBE fallback=%d)\n",
+                    from_cfg, to_cfg, fallback_cfg);
+        std::fflush(stdout);
+    }
     switch_inflight = true;
     switch_suppression_logged = false;
     switch_started_ms = now_ms;
@@ -2980,6 +3011,9 @@ void cl_rate_optimizer::reset_session_state()
     last_context_snr_db = -99.9;
     last_context_selectivity = -1.0;
     context_volatility = 0.0;
+    entry_leap_target_ = CONFIG_NONE;
+    entry_leap_pending_target_ = -1;
+    entry_leap_dispatched_ = false;
     upward_probe_suppressed_until_tick = 0;
     cooldown_remaining = 0;
     probe_cooldown_remaining = 0;

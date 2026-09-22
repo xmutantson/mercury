@@ -2181,7 +2181,27 @@ static inline bool break_anchor_floor_log_needed(int raw_target, int clamped_tar
 // non-const). See §13/§14.
 int cl_arq_controller::elevator_target_from_snr()
 {
-	int snr_ideal = get_configuration(measurements.SNR_uplink - SUPERSHIFT_MARGIN_DB);
+	return elevator_target_from_snr_value(measurements.SNR_uplink, true);
+}
+
+int cl_arq_controller::elevator_target_from_snr_value(double snr, bool reverse_meter_caps)
+{
+	if(!reverse_meter_caps)
+	{
+		// FORWARD-report election: same map, NB/proven-ceiling/retrigger/cooldown caps, and the
+		// CFG16 decode-margin gate evaluated on the forward value (never-raise).
+		int t = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
+		if(narrowband_enabled == YES && t > NB_CONFIG_MAX)
+			t = NB_CONFIG_MAX;
+		if(supershift_proven_ceiling >= 0 && t > supershift_proven_ceiling)
+			t = supershift_proven_ceiling;
+		t = apply_bigblock_cooldown_cap(t);
+		if(narrowband_enabled != YES && !(snr > CFG16_MIN_SNR_DB)
+		   && config_ladder_index(t) > config_ladder_index(CONFIG_15))
+			t = CONFIG_15;
+		return t;
+	}
+	int snr_ideal = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
 	if(narrowband_enabled == YES && snr_ideal > NB_CONFIG_MAX)
 		snr_ideal = NB_CONFIG_MAX;
 	// Enforce proven ceiling from prior BREAK failures.
@@ -2206,6 +2226,108 @@ int cl_arq_controller::elevator_target_from_snr()
 	if(snr_track_feature_enabled())
 		snr_ideal = snr_track_apply_climb_cap(snr_ideal);
 	return snr_ideal;
+}
+
+
+// ---- NB connect-reply prior guard + forward-report entry leap ----
+bool cl_arq_controller::nb_prior_guard_enabled()
+{
+	const char* e = std::getenv("MERCURY_NB_PRIOR_GUARD");
+	return !(e && *e && atoi(e) == 0);
+}
+
+// The commander's cold-start SNR_uplink / reverse prior comes from the single narrowband
+// cfg0 connect reply. That reading does not track the channel (NB receive-chain ceiling,
+// bimodal ~4/~12 dB at every true SNR) and describes a different geometry than the WB
+// session about to run. On the switch to wideband it is invalidated: SNR_uplink returns to
+// the unmeasured sentinel and the Gearshift-v2 channel reports are cleared, so the WB prior
+// and the elevator wait for a WB-geometry measurement.
+void cl_arq_controller::nb_prior_guard_on_wb_switch()
+{
+	entry_leap_wait_done = false;
+	entry_leap_wait_start_ms = 0;
+	if(!nb_prior_guard_enabled() || role != COMMANDER)
+		return;
+	printf("[NB-PRIOR-GUARD] WB switch: drop NB prior SNR_uplink=%.1f rsnr=%.1f fsnr=%.1f\n",
+		measurements.SNR_uplink, gearshift_reverse_snr_db, gearshift_forward_snr_db);
+	fflush(stdout);
+	measurements.SNR_uplink = -99.9;
+	gearshift_reset_channel_reports();
+}
+
+bool cl_arq_controller::entry_leap_fwd_enabled()
+{
+	const char* e = std::getenv("MERCURY_ENTRY_LEAP_FWD");
+	return !(e && *e && atoi(e) == 0);
+}
+
+int cl_arq_controller::entry_leap_target_from_fwd(double fwd_snr_db)
+{
+	if(!(fwd_snr_db > -90.0) || !std::isfinite(fwd_snr_db))
+		return CONFIG_NONE;
+	int t = elevator_target_from_snr_value(fwd_snr_db, false);
+	if(!is_ofdm_config(t))
+		return CONFIG_NONE;
+	return t;
+}
+
+// Hold the FIRST wideband cold-start probe dispatch until the peer's forward quality report
+// riding that confirm has been decoded (the confirm is accepted at first-codeword CRC while
+// the report tail is still in flight; dispatching immediately changes config and discards
+// it). Bounded by MERCURY_ENTRY_LEAP_WAIT_MS (default 1500 ms), once per WB session.
+bool cl_arq_controller::entry_leap_report_wait_hold()
+{
+	if(entry_leap_wait_done || !entry_leap_fwd_enabled())
+		return false;
+	if(!rate_opt.controls_link() || narrowband_enabled == YES || role != COMMANDER)
+		return false;
+	if(rate_opt.entry_leap_dispatched() || opt_pending_switch_action != GEARSHIFT_ACTION_PROBE)
+		return false;
+	const bool fwd_fresh = gearshift_forward_snr_db > -90.0 &&
+		gearshift_forward_snr_age_batches <= rate_opt.get_policy().forward_quality_max_age_batches;
+	const unsigned long long now = opt_now_ms();
+	if(fwd_fresh)
+	{
+		entry_leap_wait_done = true;
+		int rec = current_configuration;
+		const int before = opt_pending_switch_cfg;
+		if(opt_evaluate_batch_end(&rec))
+			opt_pending_switch_cfg = rec;
+		printf("[ENTRY-LEAP] report in: fsnr=%.1f waited=%llums pending %d -> %d\n",
+			gearshift_forward_snr_db,
+			entry_leap_wait_start_ms ? (now - entry_leap_wait_start_ms) : 0ULL,
+			before, opt_pending_switch_cfg);
+		fflush(stdout);
+		return false;
+	}
+	if(topgear_pending_report_bsi < 0)
+	{
+		entry_leap_wait_done = true;
+		printf("[ENTRY-LEAP] no pending report at first dispatch; organic target %d\n",
+			opt_pending_switch_cfg);
+		fflush(stdout);
+		return false;
+	}
+	int wait_ms = 1500;
+	{
+		const char* e = std::getenv("MERCURY_ENTRY_LEAP_WAIT_MS");
+		if(e && *e && atoi(e) > 0) wait_ms = atoi(e);
+	}
+	if(entry_leap_wait_start_ms == 0)
+	{
+		entry_leap_wait_start_ms = now;
+		printf("[ENTRY-LEAP] holding cold-start dispatch %d -> %d for forward report (<=%dms)\n",
+			current_configuration, opt_pending_switch_cfg, wait_ms);
+		fflush(stdout);
+	}
+	if(now - entry_leap_wait_start_ms > (unsigned long long)wait_ms)
+	{
+		entry_leap_wait_done = true;
+		printf("[ENTRY-LEAP] report wait expired; organic target %d\n", opt_pending_switch_cfg);
+		fflush(stdout);
+		return false;
+	}
+	return true;
 }
 
 // WALL-B FIX-5 (fix5/FIX5_DESIGN.md §4.4): apply the CFG16 big-block carve COOLDOWN as an
@@ -3749,6 +3871,12 @@ void cl_arq_controller::process_messages_commander()
 			}
 		}
 
+		if (opt_pending_switch_cfg >= 0
+		    && opt_pending_switch_cfg != current_configuration
+		    && messages_control.status == FREE && block_under_tx == NO
+		    && link_status == CONNECTED && emergency_break_active == 0
+		    && entry_leap_report_wait_hold())
+			return;   // hold this poll; the deferred report tick runs first next poll
 		if (opt_pending_switch_cfg >= 0
 		    && opt_pending_switch_cfg != current_configuration
 		    && (!turboshift_active || rate_opt.controls_link())
@@ -30823,4 +30951,81 @@ int cl_arq_controller::test_terminal_settlement()
 #endif
 
 	return failures;
+}
+
+// ---- directed tests: NB prior guard + forward-report entry leap election ----
+// Run under the AMBIENT environment: MERCURY_NB_PRIOR_GUARD=0 / MERCURY_ENTRY_LEAP_FWD=0
+// reproduce the pre-fix behavior and make the corresponding assertions FAIL (fail-before).
+int cl_arq_controller::test_nb_prior_guard()
+{
+	int fails = 0;
+	auto check = [&](bool c, const char* what) {
+		printf("[TEST-NB-PRIOR-GUARD] %s: %s\n", c ? "PASS" : "FAIL", what);
+		if(!c) fails++;
+	};
+	role = COMMANDER;
+	narrowband_enabled = NO;
+	measurements.SNR_uplink = 3.8;             // the NB cfg0 connect-reply reading
+	gearshift_note_reverse_snr(3.8);           // ... seeded into the GS2 reverse prior
+	check(gearshift_reverse_snr_db > -90.0, "precondition: NB reading seeded the reverse prior");
+	nb_prior_guard_on_wb_switch();             // the production switch_narrowband_mode(NO) hook
+	check(measurements.SNR_uplink <= -90.0, "SNR_uplink is the unmeasured sentinel after the WB switch");
+	check(!(gearshift_reverse_snr_db > -90.0), "GS2 reverse prior is empty after the WB switch");
+	check(!(gearshift_forward_snr_db > -90.0), "GS2 forward report is empty after the WB switch");
+	fflush(stdout);
+	return fails;
+}
+
+int cl_arq_controller::test_entry_leap_fwd()
+{
+	int fails = 0;
+	auto check = [&](bool c, const char* what, int got, int want) {
+		printf("[TEST-ENTRY-LEAP] %s: %s (got %d want %d)\n", c ? "PASS" : "FAIL", what, got, want);
+		if(!c) fails++;
+	};
+	if(telecom_system == NULL)
+	{
+		printf("[TEST-ENTRY-LEAP] FAIL: no telecom_system\n");
+		return 1;
+	}
+	check(entry_leap_fwd_enabled(), "leap enabled by default", entry_leap_fwd_enabled() ? 1 : 0, 1);
+	narrowband_enabled = NO;
+	supershift_proven_ceiling = -1;
+	bigblock_carve_cooldown_batches = 0;
+	robust_enabled = YES;
+	current_configuration = CONFIG_0;
+	// forward report grid is -5+2q (2 dB, rounded down, capped 25)
+	struct { double fwd; int want; const char* what; } rows[] = {
+		{ -99.9, CONFIG_NONE, "no fresh forward report -> no leap" },
+		{ 13.0, CONFIG_13, "fwd 13 (phys~15) -> cfg13" },
+		{ 15.0, CONFIG_13, "fwd 15 -> cfg13" },
+		{ 17.0, CONFIG_14, "fwd 17 (phys~18) -> cfg14" },
+		{ 19.0, CONFIG_15, "fwd 19 (phys~20) -> cfg15" },
+		{ 21.0, CONFIG_15, "fwd 21: map says cfg16, CFG16 margin gate (<=22) holds cfg15" },
+		{ 23.0, CONFIG_16, "fwd 23 (phys~24.8) -> cfg16 (gate open)" },
+		{ 25.0, CONFIG_16, "fwd 25 (cap; +30/+40) -> cfg16" },
+	};
+	for(auto& r : rows)
+	{
+		int got = entry_leap_target_from_fwd(r.fwd);
+		check(got == r.want, r.what, got, r.want);
+	}
+	// proven-ceiling never-raise
+	supershift_proven_ceiling = CONFIG_13;
+	{ int got = entry_leap_target_from_fwd(25.0); check(got == CONFIG_13, "proven ceiling 13 caps the leap", got, CONFIG_13); }
+	supershift_proven_ceiling = -1;
+	// the legacy elevator is unchanged: elevator_target_from_snr() == value(SNR_uplink, true)
+	measurements.SNR_uplink = 23.0;
+	{ int a = elevator_target_from_snr(); int b = elevator_target_from_snr_value(23.0, true);
+	  check(a == b, "legacy elevator delegates byte-identically", a, b); }
+	// GS2 cold-start redirect + one-shot latch in the optimizer
+	cl_rate_optimizer ro;
+	check(!ro.entry_leap_dispatched(), "optimizer latch starts clear", ro.entry_leap_dispatched() ? 1 : 0, 0);
+	ro.set_entry_leap_target(CONFIG_16);
+	ro.notify_switch_dispatched(CONFIG_0, CONFIG_7, GEARSHIFT_ACTION_PROBE, CONFIG_0, 1000ULL, false);
+	check(!ro.entry_leap_dispatched(), "organic dispatch (no redirect staged) does not latch", ro.entry_leap_dispatched() ? 1 : 0, 0);
+	ro.reset_session_state();
+	check(!ro.entry_leap_dispatched(), "session reset clears latch", ro.entry_leap_dispatched() ? 1 : 0, 0);
+	fflush(stdout);
+	return fails;
 }
