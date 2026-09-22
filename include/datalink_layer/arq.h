@@ -2132,6 +2132,9 @@ public:
   bool entry_leap_hold_this_poll;
   bool entry_leap_poll_gate();          // true => hold this poll (no dispatch, no send)
   int  test_entry_leap_hold_gate();
+  // Deferred compact-confirm report: wire bsi -> batch target (see the tick).
+  int  topgear_pending_resolve_target(unsigned char wire_bsi);
+  int  test_pending_report_bsi_restore();
   int  test_nb_prior_guard();
   int  test_entry_leap_fwd();
 

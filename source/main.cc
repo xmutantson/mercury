@@ -3013,6 +3013,12 @@ int main(int argc, char *argv[])
                 ARQ_eg.telecom_system = &ts_eg;
                 failed += ARQ_eg.test_entry_leap_hold_gate();
             }
+            {
+                cl_telecom_system ts_pb;
+                cl_arq_controller ARQ_pb;
+                ARQ_pb.telecom_system = &ts_pb;
+                failed += ARQ_pb.test_pending_report_bsi_restore();
+            }
             return failed == 0 ? 0 : 1;
         }
         if (strcmp(argv[i], "--test-scream-wake") == 0) {
@@ -3963,6 +3969,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller ARQ_eg;
                 ARQ_eg.telecom_system = &ts_eg;
                 failed += ARQ_eg.test_entry_leap_hold_gate();
+            }
+            {
+                cl_telecom_system ts_pb;
+                cl_arq_controller ARQ_pb;
+                ARQ_pb.telecom_system = &ts_pb;
+                failed += ARQ_pb.test_pending_report_bsi_restore();
             }
             // GAP-ABORT stream-backstop companion (data-flow-rsp-contiguity-ruler.md §7):
             // the REAL teardown must ALSO preserve the Option W byte cursor + stamp validity

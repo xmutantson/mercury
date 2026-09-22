@@ -1865,6 +1865,18 @@ void cl_arq_controller::topgear_pending_stash_freeze()
 #endif
 }
 
+// The compact confirm's bsi byte carries the reverse-demand flag in its top bit
+// (ROLE_DEMAND_BSI_FLAG; the generation bit is masked off the wire). The consume-time
+// accept restores the generation before resolving the batch target; the deferred
+// report decode must do the same, or its target never equals the pending bsi and
+// every deferred report is dropped at the deadline. The demand bit itself was
+// already noted by the consume-time accept of the same confirm.
+int cl_arq_controller::topgear_pending_resolve_target(unsigned char wire_bsi)
+{
+	const unsigned char rx = role_demand_restore_ack_bsi(wire_bsi, NULL);
+	return (int)generation_ack_resolve_target(rx, scalable_sack_on() && cumulative_ack_enabled);
+}
+
 // Per-poll deferred decode driver (top of process_messages_commander). While a
 // pending report is armed: refresh the stash from the live ring, and whenever the
 // stash changed, re-attempt the FULL confirm decode ON THE STASH. On a decode whose
@@ -1900,8 +1912,7 @@ void cl_arq_controller::topgear_pending_report_tick()
 		bool decoded = telecom_system->decode_compact_confirm_from_passband(
 			topgear_pending_stash.data(), topgear_pending_stash_samples,
 			cmd_compact_crc12_cb, this, &rx_bsi, &matched, &report, &report_valid);
-		int resolved_target = (int)generation_ack_resolve_target(
-			rx_bsi, scalable_sack_on() && cumulative_ack_enabled);
+		int resolved_target = topgear_pending_resolve_target(rx_bsi);
 		if(decoded && resolved_target == topgear_pending_report_bsi && report_valid)
 		{
 			if(gearshift_quality_report_v2_enabled())
@@ -31179,6 +31190,38 @@ int cl_arq_controller::test_entry_leap_hold_gate()
 	else unsetenv("MERCURY_ENTRY_LEAP_WAIT_MS");
 	topgear_pending_report_bsi = -1;
 	deinit_messages_buffers();
+	fflush(stdout);
+	return fails;
+}
+
+// ---- directed test: deferred report bsi restore ----
+// The responder encodes batch 0 of a session as wire bsi 0x7F (generation bit masked,
+// demand flag clear): logged live as "batch_seq_id=255 wire_bsi=127". After the commander
+// accepted that confirm (cmd_batch_seq_id already 1), the deferred report decode must
+// resolve the same wire byte back to the pending target 0.
+int cl_arq_controller::test_pending_report_bsi_restore()
+{
+	int fails = 0;
+	auto check = [&](bool c, const char* what, int got, int want) {
+		printf("[TEST-PENDING-BSI] %s: %s (got %d want %d)\n", c ? "PASS" : "FAIL", what, got, want);
+		if(!c) fails++;
+	};
+	role = COMMANDER;
+	link_status = CONNECTED;
+	cumulative_ack_enabled = true;
+	cmd_batch_seq_id = 1;
+	const int consume_target = (int)generation_ack_resolve_target(
+		role_demand_restore_ack_bsi(0x7F, NULL), scalable_sack_on() && cumulative_ack_enabled);
+	check(consume_target == 0, "precondition: the consume-time accept resolves wire 0x7F to batch 0",
+		consume_target, 0);
+	const int deferred_target = topgear_pending_resolve_target(0x7F);
+	check(deferred_target == consume_target,
+		"the deferred report decode resolves the same wire bsi to the same batch",
+		deferred_target, consume_target);
+	// demand flag set on the wire (0x80 | low) resolves to the same batch
+	const int with_demand = topgear_pending_resolve_target((unsigned char)(0x7F | ROLE_DEMAND_BSI_FLAG));
+	check(with_demand == consume_target, "demand-flagged wire bsi resolves to the same batch",
+		with_demand, consume_target);
 	fflush(stdout);
 	return fails;
 }
