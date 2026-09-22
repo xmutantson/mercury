@@ -449,18 +449,44 @@ bool estimate_from_grid(const st_geometry& g, const cplx* Y, st_measurement* m, 
 	// the delay taps: each carrier's error shrinks (cross term 2 P frac v, quadratic
 	// (frac v)^2) but becomes correlated over ~1/frac carriers, so any smooth weighted
 	// sum over carriers keeps the cross term 2 P v and the quadratic term frac v^2.
+	// Time variation inside the probe: the coherent mean |mean_s H(s)|^2 misses the
+	// power of the part of H that changes across the active symbols, which the data
+	// receiver (pilots every few symbols) does see. Per carrier that power is the
+	// unbiased cell-to-cell variance minus the noise share, times (n-1)/n (so that
+	// |mean|^2 + it = mean |H(s)|^2). It is added only when the pooled excess is
+	// significant (> 3 standard errors; on a static channel it is pure noise).
+	std::vector<double> tv((size_t)Nc, 0.0), tvvar((size_t)Nc, 0.0);
+	{
+		double ex = 0.0, se2 = 0.0;
+		for(int k = 0; k < Nc; k++)
+		{
+			const int na = (x2[(size_t)k] > 0.0) ? (int)std::lround(1.0 / (v[(size_t)k] * x2[(size_t)k])) : 0;
+			if(na < 2) continue;
+			const double vc = Nk[(size_t)k] / x2[(size_t)k];     // noise variance of one Z cell
+			ex += resz[(size_t)k] - vc;
+			se2 += vc * vc / (double)(na - 1);                    // var of a (na-1)-dof variance estimate ~ vc^2/(na-1)
+			const double c = (double)(na - 1) / na;
+			tv[(size_t)k] = c * (resz[(size_t)k] - vc);
+			// chi-square variance of an (na-1)-dof complex variance estimate: E^2/(na-1)
+			const double e = std::max(vc, resz[(size_t)k]);
+			tvvar[(size_t)k] = c * c * e * e / (double)(na - 1);
+		}
+		const bool sig = (se2 > 0.0 && ex > 3.0 * std::sqrt(se2));
+		if(!sig) { std::fill(tv.begin(), tv.end(), 0.0); std::fill(tvvar.begin(), tvvar.end(), 0.0); }
+	}
+
 	double gsum = 0.0, gvar = 0.0, psum = 0.0;
 	for(int k = 0; k < Nc; k++)
 	{
 		const cplx h = m->smoothed ? Hs[(size_t)k] : H[(size_t)k];
 		const double vraw = v[(size_t)k] * Nk[(size_t)k];        // unsmoothed variance of h
 		const double vk = vf * vraw;                              // variance of the h used
-		const double P = std::norm(h) - vk;                      // unbiased |H|^2
+		const double P = std::norm(h) - vk + tv[(size_t)k];      // unbiased mean |H(s)|^2
 		const double g_ = P / Nk[(size_t)k];
 		m->sinr_lin[k] = g_;
 		m->noise[k] = Nk[(size_t)k];
 		const double Pp = std::max(0.0, P);
-		m->var_sinr[k] = (2.0 * Pp * vraw + vf * vraw * vraw) / (Nk[(size_t)k] * Nk[(size_t)k]);
+		m->var_sinr[k] = (2.0 * Pp * vraw + vf * vraw * vraw + tvvar[(size_t)k]) / (Nk[(size_t)k] * Nk[(size_t)k]);
 		gsum += g_;
 		gvar += m->var_sinr[k];
 		psum += P;
