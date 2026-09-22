@@ -3341,6 +3341,12 @@ int main(int argc, char *argv[])
                 cl_arq_controller test_arq;
                 failed += test_arq.test_linkphase_mc2_slotfloor();
             }
+            // Gearshift-v2 transition-cost helpers: ACK slot floor clock origin, CONFIG_TAG
+            // guard, coordinated WB entry, unacknowledged batch-geometry control resume.
+            {
+                cl_arq_controller test_arq;
+                failed += test_arq.test_gs2_spec_conformance();
+            }
             // LINK-PHASE STEP 3 (increment 3) sample-anchored reverse-ACK detection window:
             // the gate predicate + the sub-class-b beyond-ring rescue predicate + the
             // byte-identical-OFF / WIDEN-only invariant. In-process, no IONOS/RF.

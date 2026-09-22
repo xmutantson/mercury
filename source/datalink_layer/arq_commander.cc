@@ -6828,6 +6828,27 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					"(inband owns rate/loss via tag-demote + down-ladder + dead-batch floor)\n",
 					current_configuration);
 				fflush(stdout);
+				// A batch-geometry control (Axis-2 SET_LINK_PARAMS / robust dwell batch) whose
+				// reverse ACK was never heard has no successor message: freeing its slot below
+				// and then parking in TRANSMITTING_CONTROL leaves nothing to send, so the data
+				// plane never resumes and every later rate decision (which is actuated at a
+				// data-batch boundary) is stranded until the link timer expires.  The commander
+				// already applied the new batch geometry locally at decision time, exactly as on
+				// the ACKed path, so resume DATA with it; the data batches carry their own window
+				// and the next ACK re-establishes agreement.  MERCURY_INBAND_CTRL_MISS_RESUME=0
+				// restores the previous behaviour.
+				bool ctrl_miss_resume = false;
+				{
+					int miss_code = (messages_control.length > 0) ? (int)(unsigned char)messages_control.data[0] : -1;
+					ctrl_miss_resume = link_status == CONNECTED && inband_ctrl_miss_resumes_data(miss_code);
+					if(ctrl_miss_resume)
+					{
+						printf("[INBAND-CTRL-MISS-RESUME] control code=%d unacknowledged after its retry "
+							"budget at config %d: resuming DATA with local batch=%d\n",
+							miss_code, current_configuration, data_batch_size);
+						fflush(stdout);
+					}
+				}
 				messages_control.ack_timeout = 0;
 				messages_control.id          = 0;
 				messages_control.length      = 0;
@@ -6836,6 +6857,15 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				messages_control.type        = NONE;
 				// Do NOT bump emergency_nack_count, do NOT send_break_pattern. Fall through to
 				// the normal cleanup at the end of this handler (receiving_timer stop/reset).
+				if(ctrl_miss_resume)
+				{
+					arm_control_turnaround_guard();
+					this->connection_status = TRANSMITTING_DATA;
+					receiving_timer.stop();
+					receiving_timer.reset();
+					this->cleanup();
+					return;
+				}
 			}
 			// Track control failures toward BREAK threshold.
 			// Only during connected data exchange (not connection setup or turboshift).
@@ -12554,6 +12584,9 @@ void cl_arq_controller::process_control_commander()
 				}
 				else
 				{
+					// The ACKed SWITCH_BANDWIDTH is itself the coordinated config change (see
+					// gs2_coordinated_wb_entry): do not repeat it as a CONFIG_TAG on the first batch.
+					gs2_coordinated_wb_entry(current_configuration);
 					this->connection_status=TRANSMITTING_DATA;
 				}
 			}

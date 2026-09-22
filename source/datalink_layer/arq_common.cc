@@ -3519,7 +3519,7 @@ void cl_arq_controller::calculate_receiving_timeout()
 					if(turnaround < 0) turnaround = 0;
 					int slot_width = 2*message_transmission_time_ms + ptt_off_delay_ms
 					               + ptt_on_delay_ms + 500;                     // derived guard, not a constant
-					int slot_close = kd_ms + turnaround + slot_width;
+					int slot_close = linkphase_slot_kd_remaining_ms(kd_ms) + turnaround + slot_width;
 					if(slot_close > timeout)
 					{
 						printf("[LINKPHASE-CMD-SLOT-FLOOR] receiving_timeout %d -> %d ms "
@@ -15402,6 +15402,179 @@ int cl_arq_controller::test_lp_break_recovery_fail_closed()
 	return fails;
 }
 
+// ACK_SLOT floor, keydown term expressed in the receive timer's own clock.
+// The slot closes at keydown_start + keydown + turnaround + slot_width.  The data-ACK
+// receive timer, however, is started only after the keydown has drained
+// (lp_note_keydown_end has moved the owner to TURNAROUND for this keydown's token), so
+// by the timer origin the keydown has already elapsed and must not be counted again.
+// Counting it twice kept the commander listening one full keydown (~21 s at a
+// 90-frame CONFIG_16 batch) after every missed ACK although reverse ACKs arrive
+// within the turnaround.  While the keydown has not ended for the current token the
+// full term is kept.  MERCURY_LINKPHASE_SLOT_ORIGIN=0 restores the old arithmetic.
+int cl_arq_controller::linkphase_slot_kd_remaining_ms(int kd_ms) const
+{
+	const char* ev = std::getenv("MERCURY_LINKPHASE_SLOT_ORIGIN");
+	if(ev && *ev && atoi(ev) == 0) return kd_ms;
+	if(lp_state.owner == LP_TURNAROUND && lp_keydown_start_token != 0
+	   && lp_state.keydown_end_token == lp_keydown_start_token)
+		return 0;
+	return kd_ms;
+}
+
+// ---------------------------------------------------------------------------------------
+// Gearshift-v2 transition-cost helpers (CONFIG_TAG is the canonical mode change and must
+// cost about one tag of airtime; see the requirement bodies in
+// tests/cpu/audit_gearshift_v2_spec.py "transition-airtime" group).
+// ---------------------------------------------------------------------------------------
+
+// An ACKed SWITCH_BANDWIDTH is a coordinated configuration change: the responder loaded the
+// wideband configuration when it sent the ACK.  Record it as announced and followed, exactly
+// as an ACKed SET_CONFIG does (inband_confirm_coordinated_config), so the first wideband DATA
+// batch does not repeat the change as a CONFIG_TAG plus its processing guard.
+// MERCURY_GS2_COORD_WB_ENTRY=0 restores the tagged entry.  Returns true when it suppressed.
+bool cl_arq_controller::gs2_coordinated_wb_entry(int config)
+{
+	const char* ev = std::getenv("MERCURY_GS2_COORD_WB_ENTRY");
+	if(ev && *ev && atoi(ev) == 0) return false;
+	if(!inband_rate_feature_enabled()) return false;
+	if(inband_last_announced_config == config) return false;
+	printf("[GS2-COORD-WB-ENTRY] SWITCH_BANDWIDTH ACK coordinated CONFIG_%d; "
+		"entry CONFIG_TAG not re-announced\n", config);
+	fflush(stdout);
+	inband_confirm_coordinated_config(config);
+	return true;
+}
+
+// CONFIG_TAG processing guard.  The peer is still receiving with the geometry of the previous
+// batch when the tag arrives; its receiver snapshots the capture ring once per frame period of
+// that geometry (frames_to_read = preamble_nSymb + Nsymb, re-armed with the same +10 symbol
+// settle margin the follow path uses), so the first snapshot holding the complete tag is taken
+// within one such period of the tag's end.  Frame 0 must start after that snapshot; a whole
+// acquisition window is not required (that sizing kept 3.2-5.3 s of dead air on every rung
+// change although peers follow within 0.23-0.64 s), and a frame arriving later is still
+// covered by the follow path's live-burst preserve.  The period comes from the previous batch
+// this side keyed (the geometry the peer is known to be in); before any batch it falls back to
+// the current geometry.  Never longer than the window guard it replaces.
+// MERCURY_GS2_TAG_GUARD=window restores the acquisition-window guard.
+long cl_arq_controller::gs2_tag_guard_samples(long window_guard_samples)
+{
+	const char* gm = std::getenv("MERCURY_GS2_TAG_GUARD");
+	if(gm && strcmp(gm, "window") == 0) return window_guard_samples;
+	long own_frame = 0;
+	if(telecom_system != NULL)
+		own_frame = (long)(telecom_system->data_container.preamble_nSymb
+			+ telecom_system->data_container.Nsymb + 10)
+			* telecom_system->data_container.Nofdm
+			* telecom_system->data_container.interpolation_rate;
+	long peer_frame = (gs2_prev_tx_frame_samples > 0) ? gs2_prev_tx_frame_samples : own_frame;
+	if(peer_frame <= 0 || peer_frame >= window_guard_samples) return window_guard_samples;
+	printf("[GS2-TAG-GUARD] peer-frame guard %ld samples (prev_cfg=%d) replaces window guard "
+		"%ld samples\n", peer_frame, gs2_prev_tx_config, window_guard_samples);
+	fflush(stdout);
+	return peer_frame;
+}
+
+// A batch-geometry control (Axis-2 SET_LINK_PARAMS, robust dwell batch) whose reverse ACK was
+// never heard has no successor message.  The in-band control-ACK-miss path frees its slot; if
+// the commander then stays in TRANSMITTING_CONTROL nothing is ever sent again, the data plane
+// never resumes and every later rate decision (actuated at a data-batch boundary) is stranded
+// until the link timer expires.  The commander applied the new batch geometry locally at
+// decision time, as on the ACKed path, so DATA resumes with it.
+// MERCURY_INBAND_CTRL_MISS_RESUME=0 restores the previous behaviour.
+bool cl_arq_controller::inband_ctrl_miss_resumes_data(int control_code) const
+{
+	const char* ev = std::getenv("MERCURY_INBAND_CTRL_MISS_RESUME");
+	if(ev && *ev && atoi(ev) == 0) return false;
+	return control_code == SET_LINK_PARAMS || control_code == ROBUST_DWELL_BATCH_OP;
+}
+
+// Directed unit for the helpers above (production helpers on a throwaway controller).  Each
+// check runs the default (fixed) arm and the knob-off arm; the knob-off arm must reproduce the
+// defect (fail-before) and the default arm must meet the requirement (pass-after).
+static void gs2sc_setenv(const char* k, const char* v)
+{
+#if defined(_WIN32)
+	_putenv_s(k, v ? v : "");
+#else
+	if(v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
+
+int cl_arq_controller::test_gs2_spec_conformance()
+{
+	int fails = 0;
+	// ---- R1: ACK slot floor in the receive timer's own clock --------------------------
+	telecom_system = NULL;
+	message_transmission_time_ms = 292;
+	lp_config_gen = 0;
+	lp_reset();
+	lp_note_keydown_start(/*bsi=*/3);
+	int kd_ms = 21082;
+	int keyed_term = linkphase_slot_kd_remaining_ms(kd_ms);        // keydown still running
+	lp_note_keydown_end(/*bsi=*/3, /*frames_region_len=*/(int)(kd_ms * 48LL),
+		/*frames=*/90, /*force_full=*/false);
+	gs2sc_setenv("MERCURY_LINKPHASE_SLOT_ORIGIN", NULL);
+	int drained_term = linkphase_slot_kd_remaining_ms(kd_ms);      // timer starts post-drain
+	gs2sc_setenv("MERCURY_LINKPHASE_SLOT_ORIGIN", "0");
+	int old_term = linkphase_slot_kd_remaining_ms(kd_ms);
+	gs2sc_setenv("MERCURY_LINKPHASE_SLOT_ORIGIN", NULL);
+	if(keyed_term != kd_ms) { printf("[TEST-GS2SC] FAIL R1: keyed term %d != %d\n", keyed_term, kd_ms); fails++; }
+	else if(drained_term != 0) { printf("[TEST-GS2SC] FAIL R1: post-drain keydown counted again (%d ms)\n", drained_term); fails++; }
+	else if(old_term != kd_ms) { printf("[TEST-GS2SC] FAIL R1: knob-off arm did not reproduce the double count (%d)\n", old_term); fails++; }
+	else printf("[TEST-GS2SC] PASS R1: post-drain slot floor keydown term 0 ms (knob-off arm "
+		"double-counts %d ms)\n", old_term);
+
+	// ---- R2: CONFIG_TAG guard = peer receive-frame period, never above the window guard -----
+	gs2_prev_tx_frame_samples = (20 + 10) * 1168L;   // CONFIG_13: preamble 4 + Nsymb 16, +10 margin
+	gs2_prev_tx_config = 13;
+	long window = 153008;                               // CONFIG_16 acquisition window (log)
+	long g_new = gs2_tag_guard_samples(window);
+	gs2sc_setenv("MERCURY_GS2_TAG_GUARD", "window");
+	long g_old = gs2_tag_guard_samples(window);
+	gs2sc_setenv("MERCURY_GS2_TAG_GUARD", NULL);
+	gs2_prev_tx_frame_samples = 400000;                 // larger than the window: never raised
+	long g_cap = gs2_tag_guard_samples(window);
+	gs2_prev_tx_frame_samples = 0; gs2_prev_tx_config = -1;
+	if(g_new != 35040) { printf("[TEST-GS2SC] FAIL R2: guard %ld != peer frame 35040\n", g_new); fails++; }
+	else if(g_old != window) { printf("[TEST-GS2SC] FAIL R2: window arm %ld != %ld\n", g_old, window); fails++; }
+	else if(g_cap != window) { printf("[TEST-GS2SC] FAIL R2: guard raised above window (%ld)\n", g_cap); fails++; }
+	else printf("[TEST-GS2SC] PASS R2: 13->16 guard %.0f ms (window arm %.0f ms)\n",
+		1000.0 * g_new / 48000.0, 1000.0 * g_old / 48000.0);
+
+	// ---- R3: ACKed SWITCH_BANDWIDTH is a coordinated change (no entry tag) -----------------
+	rate_opt.set_mode_for_test(GEARSHIFT_V2_ACTIVE);
+	inband_last_announced_config = CONFIG_NONE;
+	inband_last_confirmed_config = CONFIG_NONE;
+	gs2sc_setenv("MERCURY_GS2_COORD_WB_ENTRY", "0");
+	bool off_arm = gs2_coordinated_wb_entry(CONFIG_0);
+	int off_announced = inband_last_announced_config;
+	gs2sc_setenv("MERCURY_GS2_COORD_WB_ENTRY", NULL);
+	bool on_arm = gs2_coordinated_wb_entry(CONFIG_0);
+	if(off_arm || off_announced != CONFIG_NONE) { printf("[TEST-GS2SC] FAIL R3: knob-off arm changed state\n"); fails++; }
+	else if(!on_arm || inband_last_announced_config != CONFIG_0 || inband_last_confirmed_config != CONFIG_0
+	        || inband_retag_armed)
+	{ printf("[TEST-GS2SC] FAIL R3: coordinated WB entry not recorded (announced=%d confirmed=%d armed=%d)\n",
+		inband_last_announced_config, inband_last_confirmed_config, inband_retag_armed ? 1 : 0); fails++; }
+	else printf("[TEST-GS2SC] PASS R3: ACKed SWITCH_BANDWIDTH records CONFIG_0 as announced+followed "
+		"(knob-off arm leaves it unannounced -> tagged entry)\n");
+	rate_opt.set_mode_for_test(GEARSHIFT_V2_LEGACY);
+
+	// ---- R4: unacknowledged batch-geometry control resumes the data plane ------------------
+	bool r4_lp = inband_ctrl_miss_resumes_data(SET_LINK_PARAMS);
+	bool r4_dw = inband_ctrl_miss_resumes_data(ROBUST_DWELL_BATCH_OP);
+	bool r4_sc = inband_ctrl_miss_resumes_data(SET_CONFIG);
+	gs2sc_setenv("MERCURY_INBAND_CTRL_MISS_RESUME", "0");
+	bool r4_off = inband_ctrl_miss_resumes_data(SET_LINK_PARAMS);
+	gs2sc_setenv("MERCURY_INBAND_CTRL_MISS_RESUME", NULL);
+	if(!r4_lp || !r4_dw || r4_sc || r4_off)
+	{ printf("[TEST-GS2SC] FAIL R4: lp=%d dwell=%d set_config=%d off=%d\n", r4_lp, r4_dw, r4_sc, r4_off); fails++; }
+	else printf("[TEST-GS2SC] PASS R4: SET_LINK_PARAMS/dwell miss resumes DATA; SET_CONFIG unchanged; "
+		"knob-off arm keeps the stranded control state\n");
+
+	printf("[TEST-GS2SC] %s (failures=%d)\n", fails == 0 ? "ALL PASS" : "FAIL", fails);
+	return fails;
+}
+
 int cl_arq_controller::mc2_slot_floor_kd_ms(int& kd_src_out) const
 {
 	bool lp_primitive_current =
@@ -15441,7 +15614,7 @@ int cl_arq_controller::mc2_apply_slot_floor(int timeout, int& kd_src_out)
 	if(turnaround < 0) turnaround = 0;
 	int slot_width = 2*message_transmission_time_ms + ptt_off_delay_ms
 	               + ptt_on_delay_ms + 500;                       // derived guard, not a constant
-	int slot_close = kd_ms + turnaround + slot_width;
+	int slot_close = linkphase_slot_kd_remaining_ms(kd_ms) + turnaround + slot_width;
 	if(slot_close > timeout)
 	{
 		printf("[LINKPHASE-CMD-SLOT-FLOOR] receiving_timeout %d -> %d ms "
@@ -16834,6 +17007,9 @@ void cl_arq_controller::send_batch()
 					* telecom_system->data_container.buffer_Nsymb.load()
 					* telecom_system->data_container.interpolation_rate;
 				long guard_samples = std::max((long)tag_samples, acquisition_samples);
+				// Size the guard by the peer's receive-frame period, not a whole acquisition
+				// window (see gs2_tag_guard_samples).
+				guard_samples = gs2_tag_guard_samples(guard_samples);
 				int guard_ms = (int)ceil(1000.0 * (double)guard_samples /
 					telecom_system->sampling_frequency);
 				drain_playback_wait();
@@ -16863,6 +17039,16 @@ void cl_arq_controller::send_batch()
 		}
 	}
 
+	// Remember this batch's receive geometry: the next CONFIG_TAG's processing guard is
+	// sized by the frame period the peer uses while it is still in this configuration.
+	if(telecom_system != NULL && is_ofdm_config(current_configuration))
+	{
+		gs2_prev_tx_frame_samples = (long)(telecom_system->data_container.preamble_nSymb
+			+ telecom_system->data_container.Nsymb + 10)
+			* telecom_system->data_container.Nofdm
+			* telecom_system->data_container.interpolation_rate;
+		gs2_prev_tx_config = current_configuration;
+	}
 	// LEVER P: transmit each frame at its actual packed offset and actual length
 	// (variable: anchor FULL, tail MINI). The DATA frames are contiguous, so the wire
 	// sees one gapless waveform; per-frame tx_transfer granularity is preserved
