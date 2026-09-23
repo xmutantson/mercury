@@ -35,6 +35,16 @@ int main() {
     telemetry.record_acquisition_coarse_metric(0.75);
     telemetry.record_ldpc_iterations(12);
     telemetry.record_crc_result(false);
+    {
+        rro::CorrelatorWindow ack(1);
+        telemetry.record_correlator_invocation(true);
+        telemetry.record_correlator_memo_reuses(6);
+        telemetry.record_correlator_invocation(true);
+    }
+    {
+        rro::CorrelatorWindow hail(2);
+        telemetry.record_correlator_invocation(false);
+    }
     telemetry.record_gearshift({2, 2, 0, 16, 9, 15, 16, 2, 3, 2,
         true, 1400, true, 9, false, 2});
     const std::string after = telemetry.snapshot_json();
@@ -43,6 +53,14 @@ int main() {
     assert(after.find("\"decode.ldpc_iterations\":{\"available\":true")
            != std::string::npos);
     assert(after.find("\"decode.crc_ok\":{\"available\":true")
+           != std::string::npos);
+    assert(after.find("\"correlator.ack_invocations_total\":{\"available\":true,\"quality\":\"measured\",\"type\":\"counter\",\"unit\":\"invocation\",\"value\":\"2\"")
+           != std::string::npos);
+    assert(after.find("\"correlator.ack_distinct_windows_total\":{\"available\":true,\"quality\":\"measured\",\"type\":\"counter\",\"unit\":\"window\",\"value\":\"1\"")
+           != std::string::npos);
+    assert(after.find("\"correlator.ack_memo_reuses_total\":{\"available\":true,\"quality\":\"measured\",\"type\":\"counter\",\"unit\":\"reuse\",\"value\":\"6\"")
+           != std::string::npos);
+    assert(after.find("\"correlator.hail_memo_enabled\":{\"available\":true,\"quality\":\"configured\",\"type\":\"flag\",\"unit\":\"1\",\"value\":false")
            != std::string::npos);
     assert(after.find("\"decode.frames_total\":{\"available\":true,\"quality\":\"measured\",\"type\":\"counter\",\"unit\":\"frame\",\"value\":\"1\"")
            != std::string::npos);
@@ -117,6 +135,8 @@ int main() {
     assert(stale.find("\"ofdm.active_carriers\":{\"available\":false")
            != std::string::npos);
     assert(stale.find("\"decode.frames_total\":{\"available\":true")
+           != std::string::npos);
+    assert(stale.find("\"correlator.ack_invocations_total\":{\"available\":true")
            != std::string::npos);
     std::cout << stale << '\n';
     telemetry.stop();

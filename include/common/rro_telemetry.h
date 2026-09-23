@@ -11,6 +11,18 @@
 
 namespace rro {
 
+// Marks one submitted passband window. Nested scopes restore the caller's lane;
+// only ACK and HAIL searches are counted, never the shared detector's other uses.
+class CorrelatorWindow final {
+public:
+    explicit CorrelatorWindow(int lane);
+    ~CorrelatorWindow();
+    CorrelatorWindow(const CorrelatorWindow&) = delete;
+    CorrelatorWindow& operator=(const CorrelatorWindow&) = delete;
+private:
+    int previous_lane_;
+};
+
 struct GearshiftObservation {
     int lifecycle;
     int activity;
@@ -55,6 +67,9 @@ public:
     void record_ldpc_iterations(int iterations);
     void record_crc_result(bool passed);
     void record_gearshift(const GearshiftObservation& observation);
+    void record_correlator_window(int lane);
+    void record_correlator_invocation(bool memo_enabled);
+    void record_correlator_memo_reuses(std::uint64_t reuses);
 
     // Also used by the cross-repository schema test. It does not send traffic.
     std::string snapshot_json();
@@ -115,6 +130,12 @@ private:
     std::atomic<bool> gear_break_active_{false};
     std::atomic<unsigned long long> gear_break_count_total_{0};
     std::atomic<std::uint64_t> gear_sample_ns_{0};
+    std::atomic<std::uint64_t> correlator_invocations_[2]{};
+    std::atomic<std::uint64_t> correlator_windows_[2]{};
+    std::atomic<std::uint64_t> correlator_reuses_[2]{};
+    std::atomic<bool> correlator_memo_enabled_[2]{};
+    std::atomic<std::uint64_t> correlator_observed_[2]{};
+    std::atomic<std::uint64_t> correlator_snapshot_invocations_[2]{};
     std::atomic<std::uint64_t> sequence_{0};
     std::string session_id_;
     std::thread sender_;

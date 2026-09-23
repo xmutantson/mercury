@@ -8,12 +8,12 @@ Serialization and UDP I/O run on a dedicated thread. The receive and ARQ paths
 only publish bounded atomic observations.
 
 The v1 envelope always includes all 43 established RRO metrics so an absent
-measurement cannot silently become zero. This patch sources 33: capture-buffer
+measurement cannot silently become zero. This patch sources all 43 v1 fields: capture-buffer
 occupancy/fill, processing load, four acquisition observations, configured FFT size,
 four selected OFDM carrier-lattice fields,
 LDPC iteration count and limit, an actually evaluated CRC result, two lifetime
-CRC check/reject counters, and all sixteen existing Gearshift controller states.
-The remaining ten correlator fields report `not_instrumented`.
+CRC check/reject counters, ten ACK/HAIL control-correlator fields, and all
+sixteen existing Gearshift controller states.
 Source-backed event-like values expire to `inactive` after two seconds without
 a new source write. This distinguishes an idle or stopped receive path from a
 fresh measured zero. The receiver separately handles transport staleness and
@@ -61,7 +61,24 @@ estimate, or a claim about total RF offset. `coarse_metric` is emitted only
 from actual correlator results, not the forced-delay/prediction sentinels in
 `receive_stats`. These values expire independently after two seconds.
 
-This is not full visible-machine coverage. In particular, RRO's Channel
+The control-correlator window counter counts passband submissions to the ACK
+and HAIL detector entry points, not every distinct FFT symbol window inside a
+submission. Its invocation counter counts actual calls to the common sliding
+detector within those submissions, including CFO refinement and diagnostic
+re-search on the same submitted input. Prekey, connect, configuration-tag and
+BREAK uses of that common detector are excluded. The invocation delta is the
+publisher's eight-Hz interval difference, never a second lifetime counter.
+Memo reuses count coarse symbol-power cache reads after the first use of each
+cached symbol in that invocation; the fine search and non-memoized combining
+path are not counted as reuses. `memo_enabled` reports the detector's effective
+configuration (environment setting or test override), even when a particular
+repetition-combining invocation cannot use the cache. Cumulative counts remain
+available across idle intervals, while the interval delta correctly falls to
+zero. These fields do not measure FFT execution time, queue depth, or signal
+match quality.
+
+All 43 existing wire fields being sourced is not full visible-machine coverage.
+In particular, RRO's Channel
 Estimator, Demapper, and ARQ modules still have no v1 wire bindings, and the
 remaining stateful cues require source and scene-contract extensions. Do not
 replace their `NOT INSTRUMENTED` indication with illustrative motion or assume

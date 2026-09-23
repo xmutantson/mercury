@@ -5466,6 +5466,7 @@ static inline bool recovery_ack_diag_enabled()
 double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int size, int* out_matched, uint32_t* out_match_mask, bool use_fine)
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	// Fused mix + polyphase FIR + decimate: only the kept samples are computed,
 	// dropping the FIR portion ~M× vs the prior mix → FIR-at-high-rate → pick-every-Mth
@@ -5872,6 +5873,7 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 {
 	*out_snr_valid = false;
 	if(ack_pattern_passband_samples <= 0) return -99.0f;
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	// Polyphase decimated path: mix + FIR + decimate fused.
 	int M = data_container.interpolation_rate;
@@ -6765,6 +6767,7 @@ bool cl_telecom_system::decode_ack_sack_from_passband_soft(double* data, int siz
 	if (out_flips) *out_flips = -1;
 	if (!out_bsi || !out_bitmap || !crc12_fn) return false;
 	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;       // NB
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	int M = data_container.interpolation_rate;
 	int dec_size = size / M;
@@ -6860,6 +6863,7 @@ bool cl_telecom_system::decode_compact_confirm_from_passband(double* data, int s
 	if (!out_bsi || !crc12_fn) return false;
 	int suffix_n = ack_mfsk.compact_confirm_suffix_len();
 	if (suffix_n <= 0) return false;                              // NB
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	int M = data_container.interpolation_rate;
 	int dec_size = size / M;
@@ -7097,6 +7101,7 @@ double cl_telecom_system::detect_hail_pattern_from_passband(double* data, int si
                                                             int suffix_start, int* out_suffix_matched)
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
+	rro::CorrelatorWindow rro_hail_window(2);
 
 	int M = data_container.interpolation_rate;
 	double effective_carrier = carrier_frequency + last_coarse_freq_offset;

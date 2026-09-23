@@ -34,6 +34,8 @@
 namespace rro {
 namespace {
 
+thread_local int current_correlator_lane = 0;
+
 struct MetricSpec {
     const char* name;
     const char* type;
@@ -177,6 +179,16 @@ const char* batch_classification_state(int value) {
 }
 
 } // namespace
+
+CorrelatorWindow::CorrelatorWindow(int lane)
+    : previous_lane_(current_correlator_lane) {
+    current_correlator_lane = lane >= 1 && lane <= 2 ? lane : 0;
+    Telemetry::instance().record_correlator_window(current_correlator_lane);
+}
+
+CorrelatorWindow::~CorrelatorWindow() {
+    current_correlator_lane = previous_lane_;
+}
 
 Telemetry& Telemetry::instance() {
     static Telemetry value;
@@ -344,6 +356,25 @@ void Telemetry::record_gearshift(const GearshiftObservation& state) {
     gear_generation_.fetch_add(1);
 }
 
+void Telemetry::record_correlator_window(int lane) {
+    if (!enabled() || lane < 1 || lane > 2) return;
+    correlator_windows_[lane - 1].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Telemetry::record_correlator_invocation(bool memo_enabled) {
+    if (!enabled() || current_correlator_lane == 0) return;
+    const int index = current_correlator_lane - 1;
+    correlator_memo_enabled_[index].store(memo_enabled, std::memory_order_relaxed);
+    correlator_invocations_[index].fetch_add(1, std::memory_order_relaxed);
+    correlator_observed_[index].store(1, std::memory_order_release);
+}
+
+void Telemetry::record_correlator_memo_reuses(std::uint64_t reuses) {
+    if (!enabled() || current_correlator_lane == 0 || reuses == 0) return;
+    correlator_reuses_[current_correlator_lane - 1].fetch_add(reuses,
+                                                             std::memory_order_relaxed);
+}
+
 std::string Telemetry::snapshot_json() {
     const auto seq = sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
     const auto now_ns = monotonic_ns();
@@ -436,6 +467,27 @@ std::string Telemetry::snapshot_json() {
     const bool gear_ready = gear_coherent && gear_sample_ns != 0 && now_ns >= gear_sample_ns
         && now_ns - gear_sample_ns <= kMetricFreshnessNs;
 
+    std::uint64_t correlator_calls[2]{};
+    std::uint64_t correlator_delta[2]{};
+    std::uint64_t correlator_windows[2]{};
+    std::uint64_t correlator_reuses[2]{};
+    bool correlator_memo[2]{};
+    bool correlator_ready[2]{};
+    for (int lane = 0; lane < 2; ++lane) {
+        correlator_calls[lane] = correlator_invocations_[lane].load(std::memory_order_relaxed);
+        const auto previous = correlator_snapshot_invocations_[lane].exchange(
+            correlator_calls[lane], std::memory_order_relaxed);
+        correlator_delta[lane] = correlator_calls[lane] >= previous
+            ? correlator_calls[lane] - previous : 0;
+        correlator_windows[lane] = correlator_windows_[lane].load(std::memory_order_relaxed);
+        correlator_reuses[lane] = correlator_reuses_[lane].load(std::memory_order_relaxed);
+        correlator_memo[lane] = correlator_memo_enabled_[lane].load(std::memory_order_relaxed);
+        correlator_ready[lane] = correlator_observed_[lane].load(std::memory_order_acquire) != 0
+            && correlator_calls[lane] <= 9007199254740991ULL
+            && correlator_windows[lane] <= correlator_calls[lane]
+            && correlator_reuses[lane] <= 9007199254740991ULL;
+    }
+
     std::ostringstream out;
     out.imbue(std::locale::classic());
     out << std::setprecision(17);
@@ -461,13 +513,13 @@ std::string Telemetry::snapshot_json() {
             || (i == 13 && configuration_ready)
             || (i == 14 && crc_ready)
             || ((i == 15 || i == 16) && crc_counts_ready)
+            || (i >= 17 && i <= 21 && correlator_ready[0])
+            || (i >= 22 && i <= 26 && correlator_ready[1])
             || (i >= 27 && gear_ready);
         if (!available) {
             out << "false,\"quality\":\"unavailable\",\"type\":\"" << spec.type
                 << "\",\"unit\":\"" << spec.unit << "\",\"reason\":\""
-                << ((i <= 16
-                    || i >= 27)
-                    ? "inactive" : "not_instrumented") << "\"}";
+                << "inactive\"}";
             continue;
         }
         out << "true,\"quality\":\"" << spec.quality << "\",\"type\":\""
@@ -488,6 +540,16 @@ std::string Telemetry::snapshot_json() {
         else if (i == 14) out << (crc_passed ? "true" : "false");
         else if (i == 15) out << '\"' << crc_total << '\"';
         else if (i == 16) out << '\"' << crc_failed << '\"';
+        else if (i >= 17 && i <= 26) {
+            const int lane = i < 22 ? 0 : 1;
+            switch ((i - 17) % 5) {
+                case 0: out << '\"' << correlator_calls[lane] << '\"'; break;
+                case 1: out << '\"' << correlator_delta[lane] << '\"'; break;
+                case 2: out << '\"' << correlator_windows[lane] << '\"'; break;
+                case 3: out << '\"' << correlator_reuses[lane] << '\"'; break;
+                default: out << (correlator_memo[lane] ? "true" : "false"); break;
+            }
+        }
         else if (i == 27) out << '\"' << lifecycle_state(gear.lifecycle) << '\"';
         else if (i == 28) out << '\"' << activity_state(gear.activity) << '\"';
         else if (i == 29) out << '\"' << role_state(gear.role) << '\"';
