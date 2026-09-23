@@ -44,6 +44,141 @@ struct MetricSpec {
     const char* quality;
 };
 
+enum DetailIndex {
+    AudioInputAvailable, AudioSimulated, AudioArrivals, AudioArrivalSamples,
+    AudioInterarrivalMs, AudioRingWrites, AudioRingReads, AudioRingResets,
+    OfdmSymbolDemodExecutions, OfdmSymbolDemodDuration,
+    ChannelPilotObservations, ChannelPilotCoherence, ChannelPilotSelectivity,
+    ChannelNoiseVariance, ChannelModelCells, ChannelMeanMagnitude,
+    ChannelEstimatorKind, ChannelModelPublished,
+    DemapperModulation, DemapperSoftBits, DemapperMeanAbsLlr,
+    DemapperNearZeroFraction, DemapperSoftBitsPublished,
+    LdpcConverged, LdpcDuration,
+    AckFftExecutions, AckDetectorDuration, AckBestMetric, AckMatchedSymbols,
+    AckExpectedSymbols, HailFftExecutions, HailDetectorDuration, HailBestMetric,
+    HailMatchedSymbols, HailExpectedSymbols,
+    ArqDecision, ArqRetryOccupancy, ArqNextBatchSequence, ArqBatchWidth,
+    ArqSackWindowWidth, ArqSackAckCount, ArqSackMask, ArqSackBatchSequence,
+    ArqRetryTimeout,
+    GearForwardSnr, GearForwardSnrAge, GearReverseSnr, GearReverseSnrAge,
+    GearDecisionAction, GearDecisionTarget, GearDecisionReason,
+    AudioRingWriteIndex, AudioRingReadIndex, AudioRingCapacity, AudioRingFull,
+    AudioWindowHandoffs, AudioWindowSamples,
+    AcquisitionTransition, AcquisitionTransitionDelay, AcquisitionTransitionConfig,
+    CarrierDataMask, CarrierPilotMask, CarrierWidth, CarrierDataCells,
+    CarrierPilotCells,
+    LdpcCodewordHandoffs, LdpcCodewordBits, LdpcCodewordIterations,
+    CrcFrameOutcome, CrcFrameRejectReason, CrcRecentChecked,
+    CrcRecentRejected, CrcRecentWindow,
+    AckPatternOutcome, AckMetricThreshold, AckMatchedThreshold,
+    HailPatternOutcome, HailMetricThreshold, HailMatchedThreshold,
+    GearLocalFrom, GearLocalTo, GearEngagementPhase, GearEngagementFrom,
+    GearEngagementTo, GearEngagementAction, GearEngagementSelectionReason,
+    GearEngagementConfirmationReason, GearProbeActive,
+    DetailIndexCount
+};
+static_assert(DetailIndexCount == 88, "RRO v2 detail count");
+
+struct DetailSpec {
+    const char* name;
+    const char* type;
+    const char* unit;
+    const char* quality;
+    bool persistent;
+};
+const DetailSpec kDetailMetrics[] = {
+    {"audio.capture_input_available", "flag", "1", "measured", true},
+    {"audio.capture_simulated", "flag", "1", "measured", true},
+    {"audio.capture_arrivals_total", "counter", "chunk", "measured", true},
+    {"audio.capture_arrival_samples_total", "counter", "sample", "measured", true},
+    {"audio.capture_interarrival_ms", "gauge", "ms", "measured", false},
+    {"audio.capture_ring_written_samples_total", "counter", "sample", "measured", true},
+    {"audio.capture_ring_read_samples_total", "counter", "sample", "measured", true},
+    {"audio.capture_ring_resets_total", "counter", "reset", "measured", true},
+    {"ofdm.symbol_demod_executions_total", "counter", "execution", "measured", true},
+    {"ofdm.symbol_demod_duration_ms", "gauge", "ms", "measured", false},
+    {"channel.pilot_observations_count", "gauge", "pilot", "measured", false},
+    {"channel.pilot_coherence", "gauge", "1", "measured", false},
+    {"channel.pilot_selectivity", "gauge", "1", "measured", false},
+    {"channel.noise_variance", "gauge", "power", "measured", false},
+    {"channel.model_cells_count", "gauge", "cell", "measured", false},
+    {"channel.mean_channel_magnitude", "gauge", "1", "measured", false},
+    {"channel.estimator_kind", "state", "method", "configured", false},
+    {"channel.model_built", "flag", "1", "measured", false},
+    {"demapper.modulation", "state", "mode", "configured", false},
+    {"demapper.soft_bits_count", "gauge", "bit", "measured", false},
+    {"demapper.llr_mean_abs", "gauge", "LLR", "derived", false},
+    {"demapper.llr_near_zero_fraction", "gauge", "1", "derived", false},
+    {"demapper.soft_bits_published", "flag", "1", "measured", false},
+    {"decode.ldpc_converged", "flag", "1", "measured", false},
+    {"decode.ldpc_duration_ms", "gauge", "ms", "measured", false},
+    {"correlator.ack_fft_executions_total", "counter", "FFT", "measured", true},
+    {"correlator.ack_detector_duration_ms", "gauge", "ms", "measured", false},
+    {"correlator.ack_best_metric", "gauge", "score", "measured", false},
+    {"correlator.ack_matched_symbols", "gauge", "symbol", "measured", false},
+    {"correlator.ack_expected_symbols", "gauge", "symbol", "configured", false},
+    {"correlator.hail_fft_executions_total", "counter", "FFT", "measured", true},
+    {"correlator.hail_detector_duration_ms", "gauge", "ms", "measured", false},
+    {"correlator.hail_best_metric", "gauge", "score", "measured", false},
+    {"correlator.hail_matched_symbols", "gauge", "symbol", "measured", false},
+    {"correlator.hail_expected_symbols", "gauge", "symbol", "configured", false},
+    {"arq.decision", "state", "state", "measured", false},
+    {"arq.retry_occupancy", "gauge", "frame", "measured", false},
+    {"arq.next_batch_sequence", "gauge", "sequence", "measured", false},
+    {"arq.batch_width", "gauge", "frame", "configured", false},
+    {"arq.sack_window_width", "gauge", "bit", "measured", false},
+    {"arq.sack_ack_count", "gauge", "bit", "measured", false},
+    {"arq.sack_mask", "state", "mask", "measured", false},
+    {"arq.sack_batch_sequence", "gauge", "sequence", "measured", false},
+    {"arq.retry_timeout_remaining_ms", "gauge", "ms", "derived", false},
+    {"gearshift.forward_snr_db", "gauge", "dB", "measured", false},
+    {"gearshift.forward_snr_age_batches", "gauge", "batch", "derived", false},
+    {"gearshift.reverse_snr_db", "gauge", "dB", "measured", false},
+    {"gearshift.reverse_snr_age_batches", "gauge", "batch", "derived", false},
+    {"gearshift.decision_action", "state", "state", "measured", false},
+    {"gearshift.decision_target_config", "state", "config", "derived", false},
+    {"gearshift.decision_reason", "state", "reason", "measured", false},
+    {"audio.capture_ring_write_index_samples", "gauge", "sample", "measured", false},
+    {"audio.capture_ring_read_index_samples", "gauge", "sample", "measured", false},
+    {"audio.capture_ring_capacity_samples", "gauge", "sample", "configured", false},
+    {"audio.capture_ring_full", "flag", "1", "measured", false},
+    {"audio.capture_window_handoffs_total", "counter", "window", "measured", true},
+    {"audio.capture_window_samples", "gauge", "sample", "measured", false},
+    {"acquisition.transition", "state", "event", "measured", false},
+    {"acquisition.transition_delay_samples", "gauge", "sample", "measured", false},
+    {"acquisition.transition_config", "state", "config", "configured", false},
+    {"ofdm.carrier_data_mask", "state", "mask", "measured", false},
+    {"ofdm.carrier_pilot_mask", "state", "mask", "measured", false},
+    {"ofdm.carrier_width", "gauge", "carrier", "configured", false},
+    {"ofdm.carrier_data_cells", "gauge", "cell", "measured", false},
+    {"ofdm.carrier_pilot_cells", "gauge", "cell", "measured", false},
+    {"decode.ldpc_codeword_handoffs_total", "counter", "codeword", "measured", true},
+    {"decode.ldpc_codeword_bits", "gauge", "bit", "measured", false},
+    {"decode.ldpc_codeword_iterations", "gauge", "iteration", "measured", false},
+    {"crc.frame_outcome", "state", "outcome", "measured", false},
+    {"crc.frame_reject_reason", "state", "reason", "measured", false},
+    {"crc.recent_checked_frames", "gauge", "frame", "derived", false},
+    {"crc.recent_rejected_frames", "gauge", "frame", "derived", false},
+    {"crc.recent_window_frames", "gauge", "frame", "configured", false},
+    {"correlator.ack_pattern_outcome", "state", "outcome", "measured", false},
+    {"correlator.ack_metric_threshold", "gauge", "score", "configured", false},
+    {"correlator.ack_matched_threshold", "gauge", "symbol", "configured", false},
+    {"correlator.hail_pattern_outcome", "state", "outcome", "measured", false},
+    {"correlator.hail_metric_threshold", "gauge", "score", "configured", false},
+    {"correlator.hail_matched_threshold", "gauge", "symbol", "configured", false},
+    {"gearshift.local_from_config", "state", "config", "measured", false},
+    {"gearshift.local_to_config", "state", "config", "measured", false},
+    {"gearshift.engagement_phase", "state", "phase", "measured", false},
+    {"gearshift.engagement_from_config", "state", "config", "measured", false},
+    {"gearshift.engagement_to_config", "state", "config", "measured", false},
+    {"gearshift.engagement_action", "state", "state", "measured", false},
+    {"gearshift.engagement_selection_reason", "state", "reason", "measured", false},
+    {"gearshift.engagement_confirmation_reason", "state", "reason", "measured", false},
+    {"gearshift.probe_active", "flag", "1", "measured", false},
+};
+static_assert(sizeof(kDetailMetrics) / sizeof(kDetailMetrics[0]) == DetailIndexCount,
+              "RRO v2 detail registry must be complete");
+
 // Wire order is frozen by RRO's KNOWN_METRICS registry. Future source-backed
 // fields must change from unavailable only after the actual producer hook is
 // reviewed. The complete inventory keeps old receivers strict and safe.
@@ -208,6 +343,14 @@ Telemetry::~Telemetry() { stop(); }
 void Telemetry::start_from_environment() {
     const char* enabled = std::getenv("MERCURY_RRO_TELEMETRY");
     if (enabled == nullptr || std::string(enabled) != "1") return;
+    const char* version = std::getenv("MERCURY_RRO_TELEMETRY_VERSION");
+    if (version != nullptr && *version != '\0'
+        && std::string(version) != "1" && std::string(version) != "2") {
+        std::fprintf(stderr, "[RRO] invalid MERCURY_RRO_TELEMETRY_VERSION; telemetry disabled\n");
+        return;
+    }
+    packet_version_.store(version != nullptr && std::string(version) == "2" ? 2 : 1,
+                          std::memory_order_release);
     unsigned short port = 0;
     if (!configured_port(port)) {
         std::fprintf(stderr, "[RRO] invalid MERCURY_RRO_UDP_PORT; telemetry disabled\n");
@@ -282,6 +425,14 @@ void Telemetry::record_ofdm_lattice(int active, int pilots, int data, int config
 void Telemetry::clear_ofdm_lattice() {
     if (!enabled()) return;
     lattice_sample_ns_.store(0, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> guard(carrier_write_mutex_);
+        carrier_generation_.fetch_add(1, std::memory_order_acq_rel);
+        for (int i = CarrierDataMask; i <= CarrierPilotCells; ++i) clear_detail(i);
+        carrier_generation_.fetch_add(1, std::memory_order_release);
+    }
+    for (int i = ChannelPilotObservations; i <= ChannelModelPublished; ++i) clear_detail(i);
+    for (int i = DemapperModulation; i <= DemapperSoftBitsPublished; ++i) clear_detail(i);
 }
 
 void Telemetry::record_ofdm_candidate(bool admitted) {
@@ -382,6 +533,446 @@ void Telemetry::record_correlator_memo_reuses(std::uint64_t reuses) {
     if (!enabled() || current_correlator_lane == 0 || reuses == 0) return;
     correlator_reuses_[current_correlator_lane - 1].fetch_add(reuses,
                                                              std::memory_order_relaxed);
+}
+
+void Telemetry::set_detail_number(std::size_t index, double value, std::uint64_t sample_ns) {
+    if (index >= kDetailCount || !std::isfinite(value)) return;
+    detail_[index].number.store(value, std::memory_order_relaxed);
+    detail_[index].sample_ns.store(sample_ns ? sample_ns : monotonic_ns(),
+                                   std::memory_order_release);
+}
+
+void Telemetry::set_detail_integer(std::size_t index, std::uint64_t value,
+                                   std::uint64_t sample_ns) {
+    if (index >= kDetailCount) return;
+    detail_[index].integer.store(value, std::memory_order_relaxed);
+    detail_[index].sample_ns.store(sample_ns ? sample_ns : monotonic_ns(),
+                                   std::memory_order_release);
+}
+
+void Telemetry::increment_detail(std::size_t index, std::uint64_t amount,
+                                 std::uint64_t sample_ns) {
+    if (index >= kDetailCount || amount == 0) return;
+    detail_[index].integer.fetch_add(amount, std::memory_order_relaxed);
+    detail_[index].sample_ns.store(sample_ns ? sample_ns : monotonic_ns(),
+                                   std::memory_order_release);
+}
+
+void Telemetry::clear_detail(std::size_t index) {
+    if (index < kDetailCount)
+        detail_[index].sample_ns.store(0, std::memory_order_release);
+}
+
+void Telemetry::record_audio_capture_arrived(std::uint64_t samples, std::uint64_t sample_ns) {
+    if (!enabled() || samples == 0) return;
+    if (sample_ns == 0) sample_ns = monotonic_ns();
+    increment_detail(AudioArrivals, 1, sample_ns);
+    increment_detail(AudioArrivalSamples, samples, sample_ns);
+    const auto previous = capture_previous_arrival_ns_.exchange(sample_ns);
+    if (previous != 0 && sample_ns > previous)
+        set_detail_number(AudioInterarrivalMs, (sample_ns - previous) / 1000000.0,
+                          sample_ns);
+}
+
+void Telemetry::record_audio_capture_written(std::uint64_t samples, std::uint64_t sample_ns) {
+    if (enabled()) increment_detail(AudioRingWrites, samples, sample_ns);
+}
+
+void Telemetry::record_audio_capture_read(std::uint64_t samples, std::uint64_t sample_ns) {
+    if (enabled()) increment_detail(AudioRingReads, samples, sample_ns);
+}
+
+void Telemetry::record_audio_capture_reset(std::uint64_t sample_ns) {
+    if (enabled()) increment_detail(AudioRingResets, 1, sample_ns);
+}
+
+void Telemetry::record_audio_input_state(bool available, bool simulated,
+                                         std::uint64_t sample_ns) {
+    if (!enabled()) return;
+    set_detail_integer(AudioInputAvailable, available ? 1 : 0, sample_ns);
+    set_detail_integer(AudioSimulated, simulated ? 1 : 0, sample_ns);
+    capture_previous_arrival_ns_.store(0, std::memory_order_release);
+    clear_detail(AudioInterarrivalMs);
+    if (!available) {
+        bool expected = false;
+        if (ring_cursor_writer_.compare_exchange_strong(expected, true,
+                std::memory_order_acquire)) {
+            ring_cursor_generation_.fetch_add(1, std::memory_order_acq_rel);
+            for (int i = AudioRingWriteIndex; i <= AudioRingFull; ++i) clear_detail(i);
+            ring_cursor_generation_.fetch_add(1, std::memory_order_release);
+            ring_cursor_writer_.store(false, std::memory_order_release);
+        }
+    }
+}
+
+void Telemetry::record_audio_capture_cursor(std::uint64_t head, std::uint64_t tail,
+    std::uint64_t capacity, bool full, std::uint64_t sample_ns) {
+    if (!enabled() || capacity == 0 || head >= capacity || tail >= capacity
+        || capacity > 9007199254740991ULL) return;
+    if (sample_ns == 0) sample_ns = monotonic_ns();
+    // Producer/consumer callbacks can race. Drop a collided callback instead
+    // of blocking the audio path; the sender accepts only a complete bracket.
+    bool expected = false;
+    if (!ring_cursor_writer_.compare_exchange_strong(expected, true,
+            std::memory_order_acquire)) return;
+    const auto previous = ring_cursor_callback_ns_.load(std::memory_order_acquire);
+    if (sample_ns >= previous) {
+        ring_cursor_generation_.fetch_add(1, std::memory_order_acq_rel);
+        set_detail_integer(AudioRingWriteIndex, head, sample_ns);
+        set_detail_integer(AudioRingReadIndex, tail, sample_ns);
+        set_detail_integer(AudioRingCapacity, capacity, sample_ns);
+        set_detail_integer(AudioRingFull, full ? 1 : 0, sample_ns);
+        ring_cursor_callback_ns_.store(sample_ns, std::memory_order_release);
+        ring_cursor_generation_.fetch_add(1, std::memory_order_release);
+    }
+    ring_cursor_writer_.store(false, std::memory_order_release);
+}
+
+void Telemetry::record_capture_window_handoff(int samples) {
+    if (!enabled() || samples <= 0) return;
+    const auto now = monotonic_ns();
+    increment_detail(AudioWindowHandoffs, 1, now);
+    set_detail_integer(AudioWindowSamples, static_cast<std::uint64_t>(samples), now);
+}
+
+void Telemetry::record_ofdm_fft_execution(int symbols, double duration_ms) {
+    if (!enabled() || symbols <= 0 || !std::isfinite(duration_ms)
+        || duration_ms < 0.0) return;
+    const auto now = monotonic_ns();
+    increment_detail(OfdmSymbolDemodExecutions, static_cast<std::uint64_t>(symbols), now);
+    set_detail_number(OfdmSymbolDemodDuration, duration_ms, now);
+}
+
+void Telemetry::record_channel_estimate(int model_cells, int pilots,
+    double coherence, double selectivity, double noise, double mean_h,
+    int estimator_kind, bool model_built) {
+    if (!enabled() || model_cells < 0 || pilots < 0) return;
+    const auto now = monotonic_ns();
+    set_detail_integer(ChannelPilotObservations, static_cast<std::uint64_t>(pilots), now);
+    set_detail_integer(ChannelModelCells, static_cast<std::uint64_t>(model_cells), now);
+    set_detail_integer(ChannelModelPublished, model_built ? 1 : 0, now);
+    if (estimator_kind >= 1 && estimator_kind <= 3)
+        set_detail_integer(ChannelEstimatorKind, estimator_kind, now);
+    else clear_detail(ChannelEstimatorKind);
+    if (pilots > 0 && std::isfinite(coherence) && coherence >= 0.0 && coherence <= 1.0)
+        set_detail_number(ChannelPilotCoherence, coherence, now);
+    else clear_detail(ChannelPilotCoherence);
+    if (pilots > 0 && std::isfinite(selectivity) && selectivity >= 0.0)
+        set_detail_number(ChannelPilotSelectivity, selectivity, now);
+    else clear_detail(ChannelPilotSelectivity);
+    if (pilots > 0 && std::isfinite(noise) && noise >= 0.0)
+        set_detail_number(ChannelNoiseVariance, noise, now);
+    else clear_detail(ChannelNoiseVariance);
+    if (model_cells > 0 && std::isfinite(mean_h) && mean_h >= 0.0)
+        set_detail_number(ChannelMeanMagnitude, mean_h, now);
+    else clear_detail(ChannelMeanMagnitude);
+}
+
+void Telemetry::record_demapper_output(int family, int order, int bits,
+    double mean_abs_llr, double weak_fraction, bool published) {
+    if (!enabled() || (family != 1 && family != 2) || order <= 0 || order > 4096
+        || bits < 0) return;
+    const auto now = monotonic_ns();
+    set_detail_integer(DemapperModulation,
+        static_cast<std::uint64_t>(family * 10000 + order), now);
+    set_detail_integer(DemapperSoftBits, static_cast<std::uint64_t>(bits), now);
+    set_detail_integer(DemapperSoftBitsPublished, published ? 1 : 0, now);
+    if (bits > 0 && std::isfinite(mean_abs_llr) && mean_abs_llr >= 0.0)
+        set_detail_number(DemapperMeanAbsLlr, mean_abs_llr, now);
+    else clear_detail(DemapperMeanAbsLlr);
+    if (bits > 0 && std::isfinite(weak_fraction) && weak_fraction >= 0.0
+        && weak_fraction <= 1.0)
+        set_detail_number(DemapperNearZeroFraction, weak_fraction, now);
+    else clear_detail(DemapperNearZeroFraction);
+}
+
+void Telemetry::record_ldpc_decode_result(int iterations, int limit,
+    bool converged, double duration_ms) {
+    if (!enabled() || iterations < 0 || limit <= 0 || iterations > limit + 1
+        || !std::isfinite(duration_ms) || duration_ms < 0.0) return;
+    const auto now = monotonic_ns();
+    set_detail_integer(LdpcConverged, converged ? 1 : 0, now);
+    set_detail_number(LdpcDuration, duration_ms, now);
+}
+
+void Telemetry::record_correlator_detection(std::uint64_t ffts,
+    std::uint64_t duration_ns, double best_metric, int matched,
+    int expected, bool evaluated) {
+    if (!enabled() || current_correlator_lane == 0) return;
+    const int lane = current_correlator_lane - 1;
+    const auto now = monotonic_ns();
+    increment_detail(lane ? HailFftExecutions : AckFftExecutions, ffts, now);
+    set_detail_number(lane ? HailDetectorDuration : AckDetectorDuration,
+        duration_ns / 1000000.0, now);
+    if (expected > 0) set_detail_integer(lane ? HailExpectedSymbols : AckExpectedSymbols,
+        static_cast<std::uint64_t>(expected), now);
+    if (evaluated && std::isfinite(best_metric) && best_metric >= 0.0
+        && matched >= 0 && matched <= expected) {
+        set_detail_number(lane ? HailBestMetric : AckBestMetric, best_metric, now);
+        set_detail_integer(lane ? HailMatchedSymbols : AckMatchedSymbols,
+            static_cast<std::uint64_t>(matched), now);
+    } else {
+        clear_detail(lane ? HailBestMetric : AckBestMetric);
+        clear_detail(lane ? HailMatchedSymbols : AckMatchedSymbols);
+    }
+}
+
+void Telemetry::record_arq_state(int role, int decision, int batch_seq,
+    int retry_frames, int batch_frames, bool sack_enabled, int sack_width,
+    int sack_acks, int timeout_ms) {
+    if (!enabled()) return;
+    if (decision >= 1 && decision <= 3) record_arq_decision(decision);
+    // These are commander-owned cursors. On responder, suppress them instead
+    // of presenting uninitialized or historical commander values as zeros.
+    if (role != 0) {
+        clear_detail(ArqRetryOccupancy);
+        clear_detail(ArqNextBatchSequence);
+        clear_detail(ArqBatchWidth);
+        clear_detail(ArqRetryTimeout);
+        return;
+    }
+    const auto now = monotonic_ns();
+    if (retry_frames >= 0) set_detail_integer(ArqRetryOccupancy,
+        static_cast<std::uint64_t>(retry_frames), now);
+    else clear_detail(ArqRetryOccupancy);
+    if (batch_seq >= 0 && batch_seq <= 255) set_detail_integer(ArqNextBatchSequence,
+        static_cast<std::uint64_t>(batch_seq), now);
+    else clear_detail(ArqNextBatchSequence);
+    if (batch_frames > 0) set_detail_integer(ArqBatchWidth,
+        static_cast<std::uint64_t>(batch_frames), now);
+    else clear_detail(ArqBatchWidth);
+    if (timeout_ms >= 0) set_detail_integer(ArqRetryTimeout,
+        static_cast<std::uint64_t>(timeout_ms), now);
+    else clear_detail(ArqRetryTimeout);
+    // The exact CRC-valid SACK event owns width and bitmap together. A
+    // periodic controller summary must not splice a different window into it.
+    (void)sack_enabled;
+    (void)sack_width;
+    (void)sack_acks;
+}
+
+void Telemetry::record_arq_sack_window(int batch_seq, int nbits,
+    const unsigned char* bitmap, int nbytes) {
+    if (!enabled()) return;
+    bool expected = false;
+    if (!sack_writer_.compare_exchange_strong(expected, true,
+            std::memory_order_acquire)) return;
+    sack_generation_.fetch_add(1, std::memory_order_acq_rel);
+    if (nbits <= 0 || bitmap == nullptr) {
+        clear_detail(ArqSackMask);
+        clear_detail(ArqSackBatchSequence);
+        clear_detail(ArqSackWindowWidth);
+        clear_detail(ArqSackAckCount);
+    } else if (batch_seq >= 0 && batch_seq <= 255 && nbits <= 96
+        && nbytes == (nbits + 7) / 8) {
+        const auto now = monotonic_ns();
+        int ack_count = 0;
+        for (int i = 0; i < 12; ++i) {
+            unsigned char value = i < nbytes ? bitmap[i] : 0;
+            if (i == nbytes - 1 && (nbits & 7))
+                value &= static_cast<unsigned char>((1u << (nbits & 7)) - 1u);
+            sack_bytes_[i].store(value, std::memory_order_relaxed);
+            for (int bit = 0; bit < 8; ++bit) ack_count += (value >> bit) & 1u;
+        }
+        set_detail_integer(ArqSackMask, 1, now);
+        set_detail_integer(ArqSackBatchSequence, batch_seq, now);
+        set_detail_integer(ArqSackWindowWidth, nbits, now);
+        set_detail_integer(ArqSackAckCount, ack_count, now);
+    }
+    sack_generation_.fetch_add(1, std::memory_order_release);
+    sack_writer_.store(false, std::memory_order_release);
+}
+
+void Telemetry::record_arq_decision(int decision) {
+    if (!enabled()) return;
+    if (decision == 0) { clear_detail(ArqDecision); return; }
+    if (decision >= 1 && decision <= 3)
+        set_detail_integer(ArqDecision, decision);
+}
+
+void Telemetry::record_gearshift_decision(double forward_snr, bool forward_valid,
+    int forward_age, double reverse_snr, bool reverse_valid, int reverse_age,
+    int action, int target_config, const char* reason) {
+    if (!enabled()) return;
+    std::lock_guard<std::mutex> guard(gear_decision_write_mutex_);
+    const auto now = monotonic_ns();
+    gear_decision_generation_.fetch_add(1, std::memory_order_acq_rel);
+    if (forward_valid && std::isfinite(forward_snr)) {
+        set_detail_number(GearForwardSnr, forward_snr, now);
+        if (forward_age >= 0) set_detail_integer(GearForwardSnrAge, forward_age, now);
+        else clear_detail(GearForwardSnrAge);
+    } else { clear_detail(GearForwardSnr); clear_detail(GearForwardSnrAge); }
+    if (reverse_valid && std::isfinite(reverse_snr)) {
+        set_detail_number(GearReverseSnr, reverse_snr, now);
+        if (reverse_age >= 0) set_detail_integer(GearReverseSnrAge, reverse_age, now);
+        else clear_detail(GearReverseSnrAge);
+    } else { clear_detail(GearReverseSnr); clear_detail(GearReverseSnrAge); }
+    if (action >= 0 && action <= 4) set_detail_integer(GearDecisionAction, action, now);
+    else clear_detail(GearDecisionAction);
+    if (target_config >= -1 && target_config <= 105)
+        set_detail_integer(GearDecisionTarget,
+            static_cast<std::uint64_t>(target_config + 1), now);
+    else clear_detail(GearDecisionTarget);
+    bool valid_reason = reason != nullptr;
+    std::size_t len = 0;
+    if (valid_reason) {
+        while (len < 63 && reason[len] != '\0') {
+            const char ch = reason[len];
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-'))
+                valid_reason = false;
+            ++len;
+        }
+        if (len == 0 || reason[len] != '\0') valid_reason = false;
+    }
+    if (valid_reason) {
+        for (std::size_t i = 0; i < 64; ++i)
+            gear_reason_[i].store(i < len ? reason[i] : '\0', std::memory_order_relaxed);
+        set_detail_integer(GearDecisionReason, 1, now);
+    } else clear_detail(GearDecisionReason);
+    gear_decision_generation_.fetch_add(1, std::memory_order_release);
+}
+
+void Telemetry::record_acquisition_transition(int event, int delay_samples,
+    double metric, int config) {
+    if (!enabled() || event < 1 || event > 4) return;
+    const auto now = monotonic_ns();
+    set_detail_integer(AcquisitionTransition, event, now);
+    set_detail_number(AcquisitionTransitionDelay, delay_samples, now);
+    if (config >= -1 && config <= 105)
+        set_detail_integer(AcquisitionTransitionConfig, config + 1, now);
+    else clear_detail(AcquisitionTransitionConfig);
+    (void)metric;  // v1 coarse metric retains its separate, qualified source.
+}
+
+void Telemetry::record_carrier_bin_handoff(std::uint64_t data_mask,
+    std::uint64_t pilot_mask, int width, int data_cells, int pilot_cells, int config) {
+    if (!enabled()) return;
+    std::lock_guard<std::mutex> guard(carrier_write_mutex_);
+    carrier_generation_.fetch_add(1, std::memory_order_acq_rel);
+    if (width <= 0 || width > 64 || data_cells < 0 || pilot_cells < 0) {
+        for (int i = CarrierDataMask; i <= CarrierPilotCells; ++i) clear_detail(i);
+        carrier_generation_.fetch_add(1, std::memory_order_release);
+        return;
+    }
+    const std::uint64_t valid_mask = width == 64 ? ~std::uint64_t{0}
+        : ((std::uint64_t{1} << width) - 1u);
+    if ((data_mask & ~valid_mask) != 0 || (pilot_mask & ~valid_mask) != 0) {
+        for (int i = CarrierDataMask; i <= CarrierPilotCells; ++i) clear_detail(i);
+        carrier_generation_.fetch_add(1, std::memory_order_release);
+        return;
+    }
+    const auto now = monotonic_ns();
+    carrier_data_mask_.store(data_mask, std::memory_order_relaxed);
+    carrier_pilot_mask_.store(pilot_mask, std::memory_order_relaxed);
+    set_detail_integer(CarrierDataMask, 1, now);
+    set_detail_integer(CarrierPilotMask, 1, now);
+    set_detail_integer(CarrierWidth, width, now);
+    set_detail_integer(CarrierDataCells, data_cells, now);
+    set_detail_integer(CarrierPilotCells, pilot_cells, now);
+    (void)config;
+    carrier_generation_.fetch_add(1, std::memory_order_release);
+}
+
+void Telemetry::record_ldpc_codeword_handoff(bool converged, int bits, int iterations) {
+    if (!enabled() || !converged || bits <= 0 || iterations < 0) return;
+    const auto now = monotonic_ns();
+    increment_detail(LdpcCodewordHandoffs, 1, now);
+    set_detail_integer(LdpcCodewordBits, bits, now);
+    set_detail_integer(LdpcCodewordIterations, iterations, now);
+}
+
+void Telemetry::record_crc_frame_outcome(bool accepted, int reason) {
+    if (!enabled() || reason < 0 || reason > 3
+        || (accepted && reason != 0) || (!accepted && reason == 0)) return;
+    const auto now = monotonic_ns();
+    const auto seq = crc_outcome_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const auto slot = (seq - 1) % 32;
+    crc_recent_sample_ns_[slot].store(now, std::memory_order_relaxed);
+    crc_recent_outcomes_[slot].store((seq << 3) | (static_cast<std::uint64_t>(reason) << 1)
+        | (accepted ? 1u : 0u), std::memory_order_release);
+    set_detail_integer(CrcFrameOutcome, accepted ? 1 : 2, now);
+    set_detail_integer(CrcFrameRejectReason, accepted ? 0 : reason, now);
+    set_detail_integer(CrcRecentWindow, 32, now);
+}
+
+void Telemetry::record_correlator_outcome(int lane, bool accepted,
+    double metric_threshold, int matched_threshold) {
+    if (!enabled() || (lane != 1 && lane != 2)) return;
+    const auto now = monotonic_ns();
+    set_detail_integer(lane == 1 ? AckPatternOutcome : HailPatternOutcome,
+        accepted ? 1 : 2, now);
+    if (std::isfinite(metric_threshold) && metric_threshold >= 0.0)
+        set_detail_number(lane == 1 ? AckMetricThreshold : HailMetricThreshold,
+            metric_threshold, now);
+    else clear_detail(lane == 1 ? AckMetricThreshold : HailMetricThreshold);
+    if (matched_threshold >= 0)
+        set_detail_integer(lane == 1 ? AckMatchedThreshold : HailMatchedThreshold,
+            matched_threshold, now);
+    else clear_detail(lane == 1 ? AckMatchedThreshold : HailMatchedThreshold);
+}
+
+void Telemetry::record_gearshift_local_config(int from, int to, int role) {
+    if (!enabled() || from < -1 || from > 105 || to < -1 || to > 105) return;
+    const auto now = monotonic_ns();
+    set_detail_integer(GearLocalFrom, from + 1, now);
+    set_detail_integer(GearLocalTo, to + 1, now);
+    (void)role;
+}
+
+void Telemetry::record_gearshift_engagement(int from, int to, int action,
+    int phase, const char* selection_reason, const char* confirmation_reason) {
+    if (!enabled() || from < -1 || from > 105 || to < -1 || to > 105
+        || action < -1 || action > 4 || phase < 1 || phase > 3) return;
+    std::lock_guard<std::mutex> guard(engagement_write_mutex_);
+    const auto now = monotonic_ns();
+    engagement_generation_.fetch_add(1, std::memory_order_acq_rel);
+    set_detail_integer(GearEngagementFrom, from + 1, now);
+    set_detail_integer(GearEngagementTo, to + 1, now);
+    set_detail_integer(GearEngagementAction, action + 1, now);
+    set_detail_integer(GearEngagementPhase, phase, now);
+    auto write_reason = [&](const char* source, std::atomic<char>* target,
+                            DetailIndex index) {
+        if (source == nullptr) { clear_detail(index); return; }
+        std::size_t len = 0;
+        bool valid = true;
+        while (len < 63 && source[len] != '\0') {
+            const char ch = source[len];
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-'))
+                valid = false;
+            ++len;
+        }
+        if (len == 0 || source[len] != '\0' || !valid) {
+            clear_detail(index); return;
+        }
+        for (std::size_t i = 0; i < 64; ++i)
+            target[i].store(i < len ? source[i] : '\0', std::memory_order_relaxed);
+        set_detail_integer(index, 1, now);
+    };
+    write_reason(selection_reason, engagement_selection_reason_,
+                 GearEngagementSelectionReason);
+    write_reason(confirmation_reason, engagement_confirmation_reason_,
+                 GearEngagementConfirmationReason);
+    engagement_generation_.fetch_add(1, std::memory_order_release);
+}
+
+void Telemetry::record_gearshift_probe_state(bool active) {
+    if (enabled()) set_detail_integer(GearProbeActive, active ? 1 : 0);
+}
+
+void Telemetry::record_gearshift_session_reset() {
+    if (!enabled()) return;
+    {
+        std::lock_guard<std::mutex> guard(gear_decision_write_mutex_);
+        gear_decision_generation_.fetch_add(1, std::memory_order_acq_rel);
+        for (int i = GearForwardSnr; i <= GearDecisionReason; ++i) clear_detail(i);
+        gear_decision_generation_.fetch_add(1, std::memory_order_release);
+    }
+    {
+        std::lock_guard<std::mutex> guard(engagement_write_mutex_);
+        engagement_generation_.fetch_add(1, std::memory_order_acq_rel);
+        for (int i = GearEngagementPhase; i <= GearProbeActive; ++i) clear_detail(i);
+        engagement_generation_.fetch_add(1, std::memory_order_release);
+    }
 }
 
 std::string Telemetry::snapshot_json() {
@@ -596,6 +1187,259 @@ std::string Telemetry::snapshot_json() {
     return out.str();
 }
 
+std::string Telemetry::snapshot_json_v2() {
+    std::string packet = snapshot_json();
+    const auto now = monotonic_ns();
+    const std::string version_one = "\"version\":1";
+    const auto version_at = packet.find(version_one);
+    if (version_at != std::string::npos)
+        packet.replace(version_at, version_one.size(), "\"version\":2");
+    const std::string clock_key = "\"monotonic_ns\":\"";
+    const auto clock_at = packet.find(clock_key);
+    if (clock_at != std::string::npos) {
+        const auto first = clock_at + clock_key.size();
+        const auto end = packet.find('"', first);
+        if (end != std::string::npos)
+            packet.replace(first, end - first, std::to_string(now));
+    }
+
+    struct ReadCell { double number; std::uint64_t integer, sample_ns; };
+    ReadCell values[kDetailCount]{};
+    for (std::size_t i = 0; i < kDetailCount; ++i) {
+        values[i].number = detail_[i].number.load(std::memory_order_relaxed);
+        values[i].integer = detail_[i].integer.load(std::memory_order_relaxed);
+        values[i].sample_ns = detail_[i].sample_ns.load(std::memory_order_acquire);
+    }
+    // Four cursor values represent one mutex-coherent source snapshot. A
+    // collided sender read drops all four, never a partly newer head/tail.
+    bool cursor_coherent = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = ring_cursor_generation_.load(std::memory_order_acquire);
+        if (before & 1u) continue;
+        for (int i = AudioRingWriteIndex; i <= AudioRingFull; ++i) {
+            values[i].integer = detail_[i].integer.load(std::memory_order_relaxed);
+            values[i].sample_ns = detail_[i].sample_ns.load(std::memory_order_acquire);
+        }
+        if (ring_cursor_generation_.load(std::memory_order_acquire) == before) {
+            cursor_coherent = true;
+            break;
+        }
+    }
+    if (!cursor_coherent || (values[AudioInputAvailable].sample_ns != 0
+        && values[AudioInputAvailable].integer == 0)
+        || values[AudioRingCapacity].integer == 0
+        || values[AudioRingWriteIndex].integer >= values[AudioRingCapacity].integer
+        || values[AudioRingReadIndex].integer >= values[AudioRingCapacity].integer) {
+        for (int i = AudioRingWriteIndex; i <= AudioRingFull; ++i)
+            values[i].sample_ns = 0;
+    }
+    std::uint64_t carrier_data_mask = 0, carrier_pilot_mask = 0;
+    bool carrier_coherent = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = carrier_generation_.load(std::memory_order_acquire);
+        if (before & 1u) continue;
+        carrier_data_mask = carrier_data_mask_.load(std::memory_order_relaxed);
+        carrier_pilot_mask = carrier_pilot_mask_.load(std::memory_order_relaxed);
+        for (int i = CarrierDataMask; i <= CarrierPilotCells; ++i) {
+            values[i].integer = detail_[i].integer.load(std::memory_order_relaxed);
+            values[i].sample_ns = detail_[i].sample_ns.load(std::memory_order_acquire);
+        }
+        if (carrier_generation_.load(std::memory_order_acquire) == before) {
+            carrier_coherent = true;
+            break;
+        }
+    }
+    if (!carrier_coherent || values[CarrierWidth].integer == 0
+        || values[CarrierWidth].integer > 64
+        || (values[CarrierWidth].integer < 64
+            && ((carrier_data_mask | carrier_pilot_mask)
+                >> values[CarrierWidth].integer) != 0)) {
+        for (int i = CarrierDataMask; i <= CarrierPilotCells; ++i)
+            values[i].sample_ns = 0;
+    }
+    unsigned char sack[12]{};
+    bool sack_coherent = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = sack_generation_.load(std::memory_order_acquire);
+        if (before & 1u) continue;
+        for (int i = 0; i < 12; ++i)
+            sack[i] = sack_bytes_[i].load(std::memory_order_relaxed);
+        for (int i = ArqSackWindowWidth; i <= ArqSackBatchSequence; ++i) {
+            values[i].integer = detail_[i].integer.load(std::memory_order_relaxed);
+            values[i].sample_ns = detail_[i].sample_ns.load(std::memory_order_acquire);
+        }
+        if (sack_generation_.load(std::memory_order_acquire) == before) {
+            sack_coherent = true;
+            break;
+        }
+    }
+    if (!sack_coherent) {
+        for (int i = ArqSackWindowWidth; i <= ArqSackBatchSequence; ++i)
+            values[i].sample_ns = 0;
+    }
+    char gear_reason[64]{}, selection_reason[64]{}, confirmation_reason[64]{};
+    auto copy_reason = [](std::atomic<char>* source, char* target) {
+        for (int i = 0; i < 64; ++i) target[i] = source[i].load(std::memory_order_relaxed);
+        target[63] = '\0';
+    };
+    bool decision_coherent = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = gear_decision_generation_.load(std::memory_order_acquire);
+        if (before & 1u) continue;
+        copy_reason(gear_reason_, gear_reason);
+        for (int i = GearForwardSnr; i <= GearDecisionReason; ++i) {
+            values[i].number = detail_[i].number.load(std::memory_order_relaxed);
+            values[i].integer = detail_[i].integer.load(std::memory_order_relaxed);
+            values[i].sample_ns = detail_[i].sample_ns.load(std::memory_order_acquire);
+        }
+        if (gear_decision_generation_.load(std::memory_order_acquire) == before) {
+            decision_coherent = true;
+            break;
+        }
+    }
+    if (!decision_coherent)
+        for (int i = GearForwardSnr; i <= GearDecisionReason; ++i)
+            values[i].sample_ns = 0;
+    bool engagement_coherent = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = engagement_generation_.load(std::memory_order_acquire);
+        if (before & 1u) continue;
+        copy_reason(engagement_selection_reason_, selection_reason);
+        copy_reason(engagement_confirmation_reason_, confirmation_reason);
+        for (int i = GearEngagementPhase; i <= GearEngagementConfirmationReason; ++i) {
+            values[i].integer = detail_[i].integer.load(std::memory_order_relaxed);
+            values[i].sample_ns = detail_[i].sample_ns.load(std::memory_order_acquire);
+        }
+        if (engagement_generation_.load(std::memory_order_acquire) == before) {
+            engagement_coherent = true;
+            break;
+        }
+    }
+    if (!engagement_coherent)
+        for (int i = GearEngagementPhase; i <= GearEngagementConfirmationReason; ++i)
+            values[i].sample_ns = 0;
+
+    // A ring slot is a single atomic event (sequence, reason, accepted). The
+    // latest display event is a sample, while the last-32 counts preserve
+    // outcomes that happen between eight-Hz publisher frames.
+    const auto crc_seq = crc_outcome_sequence_.load(std::memory_order_acquire);
+    std::uint64_t crc_checked = 0, crc_rejected = 0, crc_latest = 0;
+    int crc_latest_reason = 0;
+    bool crc_latest_accepted = false;
+    std::uint64_t crc_latest_sample_ns = 0;
+    for (int slot = 0; slot < 32; ++slot) {
+        const auto word = crc_recent_outcomes_[slot].load(std::memory_order_acquire);
+        const auto sequence = word >> 3;
+        if (sequence == 0 || sequence > crc_seq || crc_seq - sequence >= 32) continue;
+        ++crc_checked;
+        if ((word & 1u) == 0) ++crc_rejected;
+        if (sequence > crc_latest) {
+            crc_latest = sequence;
+            crc_latest_accepted = (word & 1u) != 0;
+            crc_latest_reason = static_cast<int>((word >> 1) & 3u);
+            crc_latest_sample_ns = crc_recent_sample_ns_[slot].load(std::memory_order_relaxed);
+        }
+    }
+    if (crc_latest != 0) {
+        values[CrcFrameOutcome].integer = crc_latest_accepted ? 1 : 2;
+        values[CrcFrameRejectReason].integer = crc_latest_reason;
+        values[CrcFrameOutcome].sample_ns = crc_latest_sample_ns;
+        values[CrcFrameRejectReason].sample_ns = crc_latest_sample_ns;
+        values[CrcRecentChecked].integer = crc_checked;
+        values[CrcRecentRejected].integer = crc_rejected;
+        values[CrcRecentWindow].integer = 32;
+        for (int i = CrcRecentChecked; i <= CrcRecentWindow; ++i)
+            values[i].sample_ns = crc_latest_sample_ns;
+    }
+
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(17);
+    for (std::size_t i = 0; i < kDetailCount; ++i) {
+        const auto& spec = kDetailMetrics[i];
+        const auto& cell = values[i];
+        if (i != 0) out << ',';
+        out << '"' << spec.name << "\":{\"available\":";
+        const bool fresh = cell.sample_ns != 0 && now >= cell.sample_ns
+            && (spec.persistent || now - cell.sample_ns <= kMetricFreshnessNs);
+        if (!fresh) {
+            out << "false,\"quality\":\"unavailable\",\"type\":\""
+                << spec.type << "\",\"unit\":\"" << spec.unit
+                << "\",\"reason\":\"inactive\"}";
+            continue;
+        }
+        out << "true,\"quality\":\"" << spec.quality << "\",\"type\":\""
+            << spec.type << "\",\"unit\":\"" << spec.unit
+            << "\",\"age_ns\":\"" << now - cell.sample_ns << "\",\"value\":";
+        if (i == ChannelEstimatorKind) {
+            const char* names[] = {"UNKNOWN", "ZF", "LS", "LS_TIME_INTERP"};
+            out << '"' << names[cell.integer <= 3 ? cell.integer : 0] << '"';
+        } else if (i == DemapperModulation) {
+            const auto family = cell.integer / 10000;
+            const auto order = cell.integer % 10000;
+            out << '"' << (family == 2 ? "MFSK_" : "PSK_QAM_") << order << '"';
+        } else if (i == ArqDecision) {
+            const char* names[] = {"UNKNOWN", "ACCEPT", "RETRY", "HOLD"};
+            out << '"' << names[cell.integer <= 3 ? cell.integer : 0] << '"';
+        } else if (i == AcquisitionTransition) {
+            const char* names[] = {"UNKNOWN", "CANDIDATE_ADMITTED",
+                "TIMING_HANDED_TO_OFDM", "FRAME_ACCEPTED", "ATTEMPT_REJECTED"};
+            out << '"' << names[cell.integer <= 4 ? cell.integer : 0] << '"';
+        } else if (i == AcquisitionTransitionConfig || i == GearDecisionTarget
+            || i == GearLocalFrom || i == GearLocalTo || i == GearEngagementFrom
+            || i == GearEngagementTo) {
+            out << '"' << config_state(static_cast<int>(cell.integer) - 1) << '"';
+        } else if (i == GearDecisionAction || i == GearEngagementAction) {
+            const char* names[] = {"HOLD", "SWITCH", "PROBE", "ROLLBACK", "ABSTAIN"};
+            const int action = i == GearEngagementAction
+                ? static_cast<int>(cell.integer) - 1 : static_cast<int>(cell.integer);
+            out << '"' << (action >= 0 && action <= 4 ? names[action] : "UNKNOWN") << '"';
+        } else if (i == GearEngagementPhase) {
+            const char* names[] = {"UNKNOWN", "CONFIRMED_PROBE",
+                "CONFIRMED_STABLE", "PROBE_ACCEPTED"};
+            out << '"' << names[cell.integer <= 3 ? cell.integer : 0] << '"';
+        } else if (i == GearDecisionReason) out << '"' << gear_reason << '"';
+        else if (i == GearEngagementSelectionReason) out << '"' << selection_reason << '"';
+        else if (i == GearEngagementConfirmationReason) out << '"' << confirmation_reason << '"';
+        else if (i == CrcFrameOutcome || i == AckPatternOutcome || i == HailPatternOutcome)
+            out << '"' << (cell.integer == 1 ? "ACCEPT" : "REJECT") << '"';
+        else if (i == CrcFrameRejectReason) {
+            const char* names[] = {"NONE", "CRC_RESIDUAL", "LDPC_NONCONVERGED",
+                "OTHER_REJECT"};
+            out << '"' << names[cell.integer <= 3 ? cell.integer : 3] << '"';
+        } else if (i == CarrierDataMask || i == CarrierPilotMask) {
+            const auto mask = i == CarrierDataMask
+                ? carrier_data_mask : carrier_pilot_mask;
+            out << "\"0x" << std::uppercase << std::hex << std::setw(16)
+                << std::setfill('0') << mask << std::dec << std::nouppercase
+                << std::setfill(' ') << '"';
+        } else if (i == ArqSackMask) {
+            out << "\"0x" << std::uppercase << std::hex << std::setfill('0');
+            for (int byte = 0; byte < 12; ++byte) out << std::setw(2)
+                << static_cast<unsigned int>(sack[byte]);
+            out << std::dec << std::nouppercase << std::setfill(' ') << '"';
+        } else if (std::string(spec.type) == "flag")
+            out << (cell.integer ? "true" : "false");
+        else if (std::string(spec.type) == "counter")
+            out << '"' << cell.integer << '"';
+        else if (i == AudioInterarrivalMs || i == OfdmSymbolDemodDuration
+            || i == ChannelPilotCoherence || i == ChannelPilotSelectivity
+            || i == ChannelNoiseVariance || i == ChannelMeanMagnitude
+            || i == DemapperMeanAbsLlr || i == DemapperNearZeroFraction
+            || i == LdpcDuration || i == AckDetectorDuration
+            || i == AckBestMetric || i == HailDetectorDuration
+            || i == HailBestMetric || i == GearForwardSnr || i == GearReverseSnr
+            || i == AcquisitionTransitionDelay || i == AckMetricThreshold
+            || i == HailMetricThreshold)
+            out << cell.number;
+        else out << cell.integer;
+        out << '}';
+    }
+    if (!packet.empty() && packet.back() == '}') packet.pop_back();
+    packet += ",\"detail_metrics\":{" + out.str() + "}}";
+    return packet;
+}
+
 void Telemetry::sender_loop(unsigned short port) {
 #if defined(_WIN32)
     WSADATA winsock;
@@ -622,7 +1466,8 @@ void Telemetry::sender_loop(unsigned short port) {
     destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     while (running_.load(std::memory_order_acquire)) {
         const auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(125);
-        const std::string payload = snapshot_json();
+        const std::string payload = packet_version_.load(std::memory_order_acquire) == 2
+            ? snapshot_json_v2() : snapshot_json();
         if (payload.size() <= 32768) {
             sendto(socket_fd, payload.data(), static_cast<int>(payload.size()), 0,
                    reinterpret_cast<const sockaddr*>(&destination), sizeof(destination));
@@ -638,3 +1483,39 @@ void Telemetry::sender_loop(unsigned short port) {
 }
 
 } // namespace rro
+
+extern "C" int mercury_rro_telemetry_enabled(void) {
+    return rro::Telemetry::instance().enabled() ? 1 : 0;
+}
+
+extern "C" void mercury_rro_audio_capture_arrived(std::uint64_t samples,
+                                                     std::uint64_t sample_ns) {
+    rro::Telemetry::instance().record_audio_capture_arrived(samples, sample_ns);
+}
+
+extern "C" void mercury_rro_audio_capture_written(std::uint64_t samples,
+                                                     std::uint64_t sample_ns) {
+    rro::Telemetry::instance().record_audio_capture_written(samples, sample_ns);
+}
+
+extern "C" void mercury_rro_audio_capture_read(std::uint64_t samples,
+                                                  std::uint64_t sample_ns) {
+    rro::Telemetry::instance().record_audio_capture_read(samples, sample_ns);
+}
+
+extern "C" void mercury_rro_audio_capture_reset(std::uint64_t sample_ns) {
+    rro::Telemetry::instance().record_audio_capture_reset(sample_ns);
+}
+
+extern "C" void mercury_rro_audio_input_state(int available, int simulated,
+                                                std::uint64_t sample_ns) {
+    rro::Telemetry::instance().record_audio_input_state(available != 0,
+        simulated != 0, sample_ns);
+}
+
+extern "C" void mercury_rro_audio_capture_cursor(std::uint64_t head_samples,
+    std::uint64_t tail_samples, std::uint64_t capacity_samples, int full,
+    std::uint64_t sample_ns) {
+    rro::Telemetry::instance().record_audio_capture_cursor(head_samples,
+        tail_samples, capacity_samples, full != 0, sample_ns);
+}

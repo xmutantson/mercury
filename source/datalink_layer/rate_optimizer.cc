@@ -2769,6 +2769,13 @@ void cl_rate_optimizer::notify_switch_dispatched(
     switch_from_cfg = from_cfg;
     switch_to_cfg = to_cfg;
     switch_action = action;
+    // A later in-flight HOLD evaluation may replace last_v2_decision. Retain
+    // the decision that actually launched this matching transport transaction;
+    // an external/clipped move has no falsely attributed selector reason.
+    switch_selection_reason = last_v2_decision.current_cfg == from_cfg
+        && last_v2_decision.target_cfg == to_cfg
+        && last_v2_decision.action == action
+        ? last_v2_decision.reason : std::string();
     switch_fallback_cfg = fallback_cfg;
     switch_is_nb = is_nb;
     // Do NOT clear pending application-unit evidence here.  An atomic unit can
@@ -2985,6 +2992,7 @@ void cl_rate_optimizer::reset_session_state()
     probe_cooldown_remaining = 0;
     switch_inflight = false;
     switch_suppression_logged = false;
+    switch_selection_reason.clear();
     label_streak_value.clear(); label_streak_count = 0;
     clear_probe();
     last_v2_decision = st_rate_decision();

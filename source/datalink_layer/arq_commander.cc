@@ -25,6 +25,7 @@
 #include "common/shm_posix.h"
 #include "common/timing_log.h"
 #include "common/sim_channel.h"   // §10.6 in-process scalar-AWGN channel (2-instance SIM_INPROC)
+#include "common/rro_telemetry.h"
 #include "physical_layer/mfsk_ctrl_codec.h"  // §10.2 gf16ra reconcile
 #include <cerrno>
 #include <climits>
@@ -1083,6 +1084,7 @@ bool cl_arq_controller::cmd_rxwindow_hold_new_batch()
 			cmd_batch_seq_id & 0xFF, (cmd_batch_seq_id - 1) & 0xFF,
 			cmd_rxwindow_delivered_high_water, outstanding, depth);
 		fflush(stdout);
+		rro::Telemetry::instance().record_arq_decision(3);  // HOLD: admission actually gated.
 		return true;
 	}
 
@@ -1326,6 +1328,8 @@ bool cl_arq_controller::register_acks(const std::vector<int>& message_ids,
 		messages_tx[message_id].status=ACKED;
 		stats.nAcked_data++;
 	}
+	if(!accepted.empty())
+		rro::Telemetry::instance().record_arq_decision(1);  // ACCEPT: positive ACK committed.
 	// Fix C / H#1: if this ACK completed the block (no un-confirmed data left), flush
 	// the delivered raw from fifo_buffer_backup now, before any config-change re-stage
 	// (finalize may be pre-empted by a queued SET_CONFIG / relaxed-mixbatch staging).
@@ -1550,8 +1554,14 @@ bool cl_arq_controller::cmd_data_ack_anchored_rescan_accept()
 		double metric = telecom_system->detect_ack_pattern_from_passband(
 			telecom_system->data_container.ready_to_process_passband_delayed_data,
 			tail_samples, &matched, &mask, /*use_fine=*/false);
-		if(!(matched >= telecom_system->ack_mfsk.ack_match_threshold
-		     && metric >= ack_metric_threshold))
+		const bool ack_pattern_accepted =
+			matched >= telecom_system->ack_mfsk.ack_match_threshold
+			&& metric >= ack_metric_threshold;
+		if (rro::Telemetry::instance().enabled())
+			rro::Telemetry::instance().record_correlator_outcome(
+				1, ack_pattern_accepted, ack_metric_threshold,
+				telecom_system->ack_mfsk.ack_match_threshold);
+		if(!ack_pattern_accepted)
 			continue;
 
 		if(suffix_capable)
@@ -5069,6 +5079,7 @@ void cl_arq_controller::process_messages_tx_data()
 			message_batch_counter_tx++;
 			stats.nReSent_data++;
 			last_transmission_block_stats.nReSent_data++;
+			rro::Telemetry::instance().record_arq_decision(2);  // RETRY: frame committed to TX batch.
 		}
 		if(sack_v2_enabled)
 		{
@@ -5349,6 +5360,7 @@ void cl_arq_controller::process_messages_tx_data()
 			message_batch_counter_tx++;
 			stats.nReSent_data++;
 			last_transmission_block_stats.nReSent_data++;
+			rro::Telemetry::instance().record_arq_decision(2);  // RETRY: frame committed to TX batch.
 		}
 		// Retx block occupies the LEADING R slots at fill time. If the batch also
 		// carries >=2 new-data frames, v2_rotate_retx_behind_lead() (after the
@@ -5483,6 +5495,7 @@ void cl_arq_controller::process_messages_tx_data()
 					messages_tx[i].status=ADDED_TO_BATCH_BUFFER;
 					stats.nReSent_data++;
 					last_transmission_block_stats.nReSent_data++;
+					rro::Telemetry::instance().record_arq_decision(2);  // RETRY: frame committed to TX batch.
 				}
 			}
 			else
@@ -12581,7 +12594,22 @@ void cl_arq_controller::process_control_commander()
 					messages_control_restore();
 					printf("[GEARSHIFT] SET_CONFIG ACKed, loaded config %d\n", data_configuration);
 					fflush(stdout);
+					const int rro_engagement_action = rate_opt.inflight_action_if_matches(
+						prev_configuration, data_configuration);
+					const char* rro_selection_reason =
+						rate_opt.inflight_selection_reason_if_matches(
+							prev_configuration, data_configuration);
 					rate_opt.notify_switch_confirmed(opt_now_ms());
+					// The control ACK closes the transport transaction after the local
+					// ARQ+PHY load. A PROBE is confirmed but still in goodput probation.
+					if (rro::Telemetry::instance().enabled()
+						&& current_configuration == data_configuration
+						&& telecom_system->current_configuration == data_configuration)
+						rro::Telemetry::instance().record_gearshift_engagement(
+							prev_configuration, data_configuration,
+							rro_engagement_action,
+							rro_engagement_action == GEARSHIFT_ACTION_PROBE ? 1 : 2,
+							rro_selection_reason, "set-config-ack-peer-confirmed");
 					if(rate_opt.controls_link())
 						inband_confirm_coordinated_config(current_configuration);
 					if(rate_opt.probe_is_ladder_step() && is_ofdm_config(current_configuration))

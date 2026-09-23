@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -71,8 +72,56 @@ public:
     void record_correlator_invocation(bool memo_enabled);
     void record_correlator_memo_reuses(std::uint64_t reuses);
 
+    // v2 detail observations. Every method is a no-op unless telemetry is on;
+    // the v1 packet remains the default wire format.
+    void record_ofdm_fft_execution(int symbols, double duration_ms);
+    void record_channel_estimate(int model_cells_count, int pilot_observations_count,
+        double pilot_coherence, double pilot_selectivity, double noise_variance,
+        double mean_h, int estimator_kind, bool model_published);
+    void record_demapper_output(int modulation_family, int modulation_order,
+        int llr_count, double mean_abs_llr, double weak_fraction,
+        bool soft_bits_published);
+    void record_ldpc_decode_result(int iterations, int iteration_limit,
+        bool converged, double duration_ms);
+    void record_correlator_detection(std::uint64_t fft_executions,
+        std::uint64_t duration_ns, double best_metric, int best_matched,
+        int expected_symbols, bool evaluated);
+    void record_arq_state(int role, int decision, int batch_seq_id,
+        int retransmit_frames, int batch_frames, bool sack_enabled,
+        int sack_window_bits, int sack_ack_bits, int timeout_remaining_ms);
+    void record_arq_sack_window(int rx_batch_seq_id, int nbits,
+        const unsigned char* bitmap, int nbytes);
+    void record_arq_decision(int decision);
+    void record_gearshift_decision(double forward_snr_db, bool forward_snr_valid,
+        int forward_snr_age_batches, double reverse_snr_db, bool reverse_snr_valid,
+        int reverse_snr_age_batches, int action, int recommended_config,
+        const char* reason);
+    void record_capture_window_handoff(int samples);
+    void record_audio_capture_arrived(std::uint64_t samples, std::uint64_t sample_ns);
+    void record_audio_capture_written(std::uint64_t samples, std::uint64_t sample_ns);
+    void record_audio_capture_read(std::uint64_t samples, std::uint64_t sample_ns);
+    void record_audio_capture_reset(std::uint64_t sample_ns);
+    void record_audio_input_state(bool available, bool simulated, std::uint64_t sample_ns);
+    void record_audio_capture_cursor(std::uint64_t head_samples,
+        std::uint64_t tail_samples, std::uint64_t capacity_samples,
+        bool full, std::uint64_t sample_ns);
+    void record_acquisition_transition(int event, int delay_samples, double metric,
+                                       int current_config);
+    void record_carrier_bin_handoff(std::uint64_t data_mask, std::uint64_t pilot_mask,
+        int carrier_count, int data_cells, int pilot_cells, int current_config);
+    void record_ldpc_codeword_handoff(bool converged, int decoded_bits, int iterations);
+    void record_crc_frame_outcome(bool accepted, int reject_reason);
+    void record_correlator_outcome(int lane, bool accepted, double metric_threshold,
+                                   int matched_threshold);
+    void record_gearshift_local_config(int from, int to, int role);
+    void record_gearshift_engagement(int from, int to, int action, int phase,
+        const char* selection_reason, const char* confirmation_reason);
+    void record_gearshift_probe_state(bool active);
+    void record_gearshift_session_reset();
+
     // Also used by the cross-repository schema test. It does not send traffic.
     std::string snapshot_json();
+    std::string snapshot_json_v2();
 
 private:
     Telemetry();
@@ -81,6 +130,12 @@ private:
     Telemetry& operator=(const Telemetry&) = delete;
 
     void sender_loop(unsigned short port);
+    void set_detail_number(std::size_t index, double value, std::uint64_t sample_ns = 0);
+    void set_detail_integer(std::size_t index, std::uint64_t value,
+                            std::uint64_t sample_ns = 0);
+    void increment_detail(std::size_t index, std::uint64_t amount,
+                          std::uint64_t sample_ns = 0);
+    void clear_detail(std::size_t index);
     std::atomic<bool> running_{false};
     std::atomic<bool> load_available_{false};
     std::atomic<double> processing_load_{0.0};
@@ -138,6 +193,35 @@ private:
     std::atomic<std::uint64_t> correlator_generation_[2]{};
     std::atomic<unsigned int> correlator_writers_[2]{};
     std::atomic<std::uint64_t> correlator_snapshot_invocations_[2]{};
+    static constexpr std::size_t kDetailCount = 88;
+    struct DetailCell {
+        std::atomic<double> number{0.0};
+        std::atomic<std::uint64_t> integer{0};
+        std::atomic<std::uint64_t> sample_ns{0};
+    };
+    DetailCell detail_[kDetailCount]{};
+    std::atomic<std::uint64_t> capture_previous_arrival_ns_{0};
+    std::atomic<unsigned char> sack_bytes_[12]{};
+    std::atomic<std::uint64_t> sack_generation_{0};
+    std::atomic<bool> sack_writer_{false};
+    std::atomic<char> gear_reason_[64]{};
+    std::atomic<std::uint64_t> gear_decision_generation_{0};
+    std::mutex gear_decision_write_mutex_;
+    std::atomic<char> engagement_selection_reason_[64]{};
+    std::atomic<char> engagement_confirmation_reason_[64]{};
+    std::atomic<std::uint64_t> engagement_generation_{0};
+    std::mutex engagement_write_mutex_;
+    std::atomic<std::uint64_t> ring_cursor_generation_{0};
+    std::atomic<bool> ring_cursor_writer_{false};
+    std::atomic<std::uint64_t> ring_cursor_callback_ns_{0};
+    std::atomic<std::uint64_t> carrier_data_mask_{0};
+    std::atomic<std::uint64_t> carrier_pilot_mask_{0};
+    std::atomic<std::uint64_t> carrier_generation_{0};
+    std::mutex carrier_write_mutex_;
+    std::atomic<std::uint64_t> crc_outcome_sequence_{0};
+    std::atomic<std::uint64_t> crc_recent_outcomes_[32]{};
+    std::atomic<std::uint64_t> crc_recent_sample_ns_[32]{};
+    std::atomic<int> packet_version_{1};
     std::atomic<std::uint64_t> sequence_{0};
     std::string session_id_;
     std::thread sender_;

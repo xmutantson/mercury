@@ -25,6 +25,7 @@
 #include "common/rro_telemetry.h"
 #include "debug/canary_guard.h"
 #include <algorithm>  // for std::swap in optimized FFT
+#include <chrono>   // opt-in RRO detector execution duration
 #include <vector>   // SPARSE-OFDM decimation overlay (env-gated)
 #include <cstdlib>  // SPARSE-OFDM: std::getenv/atoi
 
@@ -5295,6 +5296,13 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
                                    uint32_t* out_match_mask,
                                    bool always_fine, int combine_reps)
 {
+	// The same detector serves ACK, HAIL, and other control searches. The
+	// CorrelatorWindow at the call site selects the ACK/HAIL telemetry lane;
+	// this scope only reports what the detector actually executed and scored.
+	const bool rro_enabled = rro::Telemetry::instance().enabled();
+	const auto rro_started = rro_enabled ? std::chrono::steady_clock::now()
+	                                    : std::chrono::steady_clock::time_point{};
+	std::uint64_t rro_fft_executions = 0;
 	int Nofdm = Nfft + Ngi;
 	int sym_period_interp = Nofdm * interpolation_rate;
 	int buffer_nsymb = buffer_size_interp / sym_period_interp;
@@ -5311,7 +5319,18 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	rro::Telemetry::instance().record_correlator_invocation(memo_configured);
 	int rep_stride_sym = ack_nsymb;                 // one base block, in symbols
 	int total_needed = combine_reps * ack_nsymb + reserve_after;
-	if (buffer_nsymb < total_needed) return 0.0;
+	if (buffer_nsymb < total_needed)
+	{
+		if (rro_enabled)
+		{
+			const auto elapsed = std::chrono::steady_clock::now() - rro_started;
+			rro::Telemetry::instance().record_correlator_detection(
+				0, static_cast<std::uint64_t>(
+					std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+				0.0, 0, ack_nsymb, false);
+		}
+		return 0.0;
+	}
 
 	std::complex<double>* decimated_sym = work_buf_a;
 	std::complex<double>* fft_out = work_buf_b;
@@ -5337,6 +5356,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			for (int i = 0; i < Nfft; i++)
 				decimated_sym[i] = baseband_interp[off + i * interpolation_rate];
 			fft(decimated_sym, fft_out, Nfft);
+			++rro_fft_executions;
 			for (int b = 0; b < Nfft; b++)
 				pow[b] += fft_out[b].real() * fft_out[b].real() +
 				          fft_out[b].imag() * fft_out[b].imag();
@@ -5396,6 +5416,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			for (int i = 0; i < Nfft; i++)
 				decimated_sym[i] = baseband_interp[off + i * interpolation_rate];
 			fft(decimated_sym, fft_out, Nfft);
+			++rro_fft_executions;
 			detect_ack_fft_count++;
 			double* row = detect_memo_pow + (size_t)j * Nfft;
 			for (int b = 0; b < Nfft; b++)
@@ -5438,6 +5459,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 				for (int i = 0; i < Nfft; i++)
 					decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 				fft(decimated_sym, fft_out, Nfft);
+				++rro_fft_executions;
 				detect_ack_fft_count++;
 			}
 			auto psp = [&](int b) -> double {
@@ -5608,6 +5630,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 					for (int i = 0; i < Nfft; i++)
 						decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 					fft(decimated_sym, fft_out, Nfft);
+					++rro_fft_executions;
 				}
 				auto psp = [&](int b) -> double {
 					if (combine_reps > 1) return pow_accum[b];
@@ -5701,6 +5724,14 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 		*out_best_offset = best_pos;  // interpolated sample offset (-1 if not found)
 	if (out_match_mask)
 		*out_match_mask = best_match_mask;
+	if (rro_enabled)
+	{
+		const auto elapsed = std::chrono::steady_clock::now() - rro_started;
+		rro::Telemetry::instance().record_correlator_detection(
+			rro_fft_executions, static_cast<std::uint64_t>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+			best_metric, best_matched, ack_nsymb, true);
+	}
 
 	return best_metric;
 }

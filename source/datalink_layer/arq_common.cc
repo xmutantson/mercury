@@ -4221,6 +4221,7 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 		printf("[CFG] Already on config %d, skipping\n", configuration);
 		return;
 	}
+	const int rro_previous_configuration = this->current_configuration;
 	// Option W CORE (F4.2, silent-corruption-residual.md §16/§17.5): a real config change
 	// re-stages the sender's in-flight batch, so every parsed-undelivered RX wire stamp is
 	// stale — invalidate them here (RX-side; a harmless no-op on the CMD). Placed AFTER the
@@ -4689,6 +4690,13 @@ void cl_arq_controller::load_configuration(int configuration, int level, int bac
 			fflush(stdout);
 		}
 	}
+	// This reports only a coherent LOCAL ARQ+PHY load. Peer adoption and probe
+	// success are separate later events; neither is inferred from this function.
+	if (rro::Telemetry::instance().enabled()
+		&& this->current_configuration == configuration
+		&& telecom_system->current_configuration == configuration)
+		rro::Telemetry::instance().record_gearshift_local_config(
+			rro_previous_configuration, configuration, role);
 }
 
 // =============================================================================
@@ -6408,9 +6416,21 @@ bool cl_arq_controller::inband_retag_confirm_from_sack(int rx_bsi)
 	// actually demodulated DATA after following the CONFIG_TAG.  This is the real
 	// terminal confirmation event for a v2-owned transition.  External/non-v2
 	// moves have no matching switch_inflight, so the notifier is a no-op there.
+	const int engagement_action = rate_opt.inflight_action_if_matches(
+		inband_pre_announce_config, confirmed_config);
+	const char* engagement_selection_reason =
+		rate_opt.inflight_selection_reason_if_matches(
+			inband_pre_announce_config, confirmed_config);
 	if(rate_opt.controls_link())
 		rate_opt.notify_switch_confirmed_if_matches(
 			inband_pre_announce_config, confirmed_config, opt_now_ms());
+	// The SACK's batch identity is peer-follow evidence, unlike a local config
+	// load or a content-free ACK base pattern. A probe remains on probation here.
+	if (rro::Telemetry::instance().enabled())
+		rro::Telemetry::instance().record_gearshift_engagement(
+			inband_pre_announce_config, confirmed_config, engagement_action,
+			engagement_action == GEARSHIFT_ACTION_PROBE ? 1 : 2,
+			engagement_selection_reason, "inband-sack-peer-confirmed");
 
 	inband_retag_armed   = false;
 	inband_retag_config  = CONFIG_NONE;
@@ -9894,6 +9914,35 @@ void cl_arq_controller::process_main()
 					backoff_remaining_ms = std::max(
 						backoff_remaining_ms, deadline - policy_now_ms);
 			}
+			// These are controller-owned observations, not deductions from display
+			// geometry. A missing SACK or unarmed DATA ACK timeout stays unavailable.
+			int sack_window_bits = -1;
+			int sack_ack_bits = -1;
+			if (sack_v2_enabled && cmd_sack_v2_last_rx_nbits > 0 &&
+				cmd_sack_v2_last_rx_nbits <= MAX_SACK_BATCH_SIZE)
+			{
+				sack_window_bits = cmd_sack_v2_last_rx_nbits;
+				sack_ack_bits = 0;
+				for (int bit = 0; bit < sack_window_bits; ++bit)
+					if ((cmd_sack_v2_last_rx_bitmap[bit / 8] & (1u << (bit % 8))) != 0)
+						++sack_ack_bits;
+			}
+			int timeout_remaining_ms = -1;
+			for (int i = 0; i < nMessages; ++i)
+			{
+				if (messages_tx[i].status != PENDING_ACK ||
+					(messages_tx[i].type != DATA_LONG && messages_tx[i].type != DATA_SHORT) ||
+					messages_tx[i].ack_timeout <= 0)
+					continue;
+				const int elapsed_ms = messages_tx[i].ack_timer.get_elapsed_time_ms();
+				const int remaining_ms = std::max(0, messages_tx[i].ack_timeout - elapsed_ms);
+				if (timeout_remaining_ms < 0 || remaining_ms < timeout_remaining_ms)
+					timeout_remaining_ms = remaining_ms;
+			}
+			rro_gearshift.record_arq_state(
+				role, 0, cmd_batch_seq_id & 0xff, retransmit_count,
+				data_batch_size, sack_enabled, sack_window_bits,
+				sack_ack_bits, timeout_remaining_ms);
 			rro_gearshift.record_gearshift({
 				link_status, connection_status, role, current_configuration,
 				negotiated_configuration,
@@ -9906,6 +9955,7 @@ void cl_arq_controller::process_main()
 				emergency_break_active != 0,
 				static_cast<unsigned long long>(send_break_pattern_count),
 			});
+			rro_gearshift.record_gearshift_probe_state(rate_opt.probe_is_active());
 		}
 	}
 	if (arq_shutdown_requested())
@@ -11097,6 +11147,17 @@ void cl_arq_controller::reset_session_state()
 	data_ack_received = NO;
 	last_batch_fully_acked = false;  // CLEAN-BATCH VIABILITY (§9) — clear per session
 	repeating_last_ack = NO;
+	// The last CRC-valid SACK belongs to the old session; neither a new peer nor
+	// the RRO detail view may inherit its old receipt pattern.
+	cmd_sack_v2_last_rx_batch_seq_id = -1;
+	cmd_sack_v2_last_rx_nbits = -1;
+	for (int i = 0; i < (int)sizeof(cmd_sack_v2_last_rx_bitmap); ++i)
+		cmd_sack_v2_last_rx_bitmap[i] = 0;
+	if (rro::Telemetry::instance().enabled())
+	{
+		rro::Telemetry::instance().record_arq_sack_window(-1, 0, nullptr, 0);
+		rro::Telemetry::instance().record_arq_decision(0);
+	}
 
 	// Message tracking
 	last_message_sent_type = NONE;
@@ -11156,6 +11217,8 @@ void cl_arq_controller::reset_session_state()
 	// starts each session fresh (channel may have changed since last
 	// session ended).
 	rate_opt.reset_session_state();
+	if (rro::Telemetry::instance().enabled())
+		rro::Telemetry::instance().record_gearshift_session_reset();
 	opt_pending_switch_cfg = -1;
 	opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
 	opt_pending_switch_fallback = -1;
@@ -11560,6 +11623,14 @@ void cl_arq_controller::kx_stream_reanchor()
 	captured_batch_seq_id_for_retransmit = -1;
 	last_received_batch_seq_id           = -1;
 	cmd_sack_v2_last_rx_batch_seq_id     = -1;
+	cmd_sack_v2_last_rx_nbits            = -1;
+	for (int i = 0; i < (int)sizeof(cmd_sack_v2_last_rx_bitmap); ++i)
+		cmd_sack_v2_last_rx_bitmap[i] = 0;
+	if (rro::Telemetry::instance().enabled())
+	{
+		rro::Telemetry::instance().record_arq_sack_window(-1, 0, nullptr, 0);
+		rro::Telemetry::instance().record_arq_decision(0);
+	}
 	rsp_prev_batch_active                = false;
 	cmd_prev_retain_count                = 0;
 	cmd_last_applied_sack_bsi            = -1;
@@ -12434,7 +12505,37 @@ bool cl_arq_controller::opt_evaluate_batch_end(int* out_recommended_cfg)
 			obs.nominal_bps[CONFIG_17] = (double)payload_per_batch * 8000.0 / (double)kd_ms;
 	}
 
+	const int rro_probe_origin = rate_opt.active_probe_origin();
+	const int rro_probe_target = rate_opt.active_probe_target();
+	const char* rro_probe_selection_reason = rate_opt.active_probe_selection_reason();
 	const st_rate_decision decision = rate_opt.evaluate_v2(obs, optimizer_ceiling);
+	// Publish the actual policy input and verdict at the evaluation point. The
+	// source reason is preserved verbatim; the consumer must not invent a cause
+	// from a nearby config counter or SNR alone.
+	{
+		rro::Telemetry& telemetry = rro::Telemetry::instance();
+		if (telemetry.enabled())
+		{
+			telemetry.record_gearshift_decision(
+				obs.forward_snr_db,
+				std::isfinite(obs.forward_snr_db) && obs.forward_snr_db > -90.0,
+				obs.forward_snr_age_batches,
+				obs.reverse_snr_db,
+				std::isfinite(obs.reverse_snr_db) && obs.reverse_snr_db > -90.0,
+				obs.reverse_snr_age_batches,
+				decision.action, decision.target_cfg, decision.reason.c_str());
+			if (rro_probe_origin >= 0 && rro_probe_target >= 0
+				&& !rate_opt.probe_is_active()
+				&& (decision.reason == "probe-accepted"
+					|| rate_opt.ladder_probe_accepted_this_evaluation()))
+				telemetry.record_gearshift_engagement(
+					rro_probe_origin, rro_probe_target,
+					GEARSHIFT_ACTION_PROBE, 3, rro_probe_selection_reason,
+					rate_opt.ladder_probe_accepted_this_evaluation()
+						? "ladder-probe-goodput-accepted"
+						: "probe-goodput-accepted");
+		}
+	}
 	if(rate_opt.ladder_probe_accepted_this_evaluation() &&
 	   decision.action != GEARSHIFT_ACTION_PROBE &&
 	   !rate_opt.probe_is_active() && data_batch_size == 1 &&
@@ -12508,6 +12609,8 @@ void cl_arq_controller::switch_narrowband_mode(int nb_enabled)
 
 	opt_reset_window();
 	rate_opt.reset_session_state();
+	if (rro::Telemetry::instance().enabled())
+		rro::Telemetry::instance().record_gearshift_session_reset();
 	opt_pending_switch_cfg = -1;
 	opt_pending_switch_action = GEARSHIFT_ACTION_HOLD;
 	opt_pending_switch_fallback = -1;
@@ -19994,6 +20097,15 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 		copy_n = (int)sizeof(cmd_sack_v2_last_rx_bitmap);
 	for(int b = 0; b < copy_n; b++)
 		cmd_sack_v2_last_rx_bitmap[b] = payload[2 + b];
+	// The exact window is only published after CRC validation. Bit i is the
+	// frame-i receipt bit (LSB-first within each byte), not a synthetic fill
+	// derived from ACK counts or queue occupancy.
+	{
+		rro::Telemetry& telemetry = rro::Telemetry::instance();
+		if (telemetry.enabled())
+			telemetry.record_arq_sack_window(
+				(int)payload[0], nframes, &payload[2], bitmap_bytes);
+	}
 
 	// Log decoded bitmap byte-for-byte for the v2<->v2 byte-identity test.
 	char hex[2 * sizeof(payload) + 1];
@@ -21473,7 +21585,14 @@ bool cl_arq_controller::receive_hail_pattern()
 		// ROBUST_0, telecom_system.cc:5505-5510) — NOT the old hardcoded 3.0.
 		// The old metric>=3.0 && quality>=0.3 soft gates cost ~8 dB of
 		// establishment reach for ≈0 FAR benefit (HAIL-detection-floor §4/§5/§9).
-		if(base_ok && suffix_ok && metric >= telecom_system->ack_pattern_detection_threshold)
+		const bool hail_pattern_accepted = base_ok && suffix_ok
+			&& metric >= telecom_system->ack_pattern_detection_threshold;
+		if (rro::Telemetry::instance().enabled())
+			rro::Telemetry::instance().record_correlator_outcome(
+				2, hail_pattern_accepted,
+				telecom_system->ack_pattern_detection_threshold,
+				telecom_system->ack_mfsk.hail_match_threshold);
+		if(hail_pattern_accepted)
 		{
 			printf("[HAIL] Detected: base=%d/%d suffix=%d/%d metric=%.1f quality=%.2f%s\n",
 				base_matched, telecom_system->ack_mfsk.hail_match_threshold,
@@ -22108,6 +22227,13 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			float decoded_snr = telecom_system->detect_ack_snr_from_passband(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
 				tail_samples, &matched_count, &snr_valid);
+			// The turbo branch's pattern gate is count-only. Its SNR suffix can
+			// remain pending after a positive pattern match; that is not a
+			// protocol ACK commit or a negative correlator verdict.
+			if (rro::Telemetry::instance().enabled())
+				rro::Telemetry::instance().record_correlator_outcome(
+					1, matched_count >= telecom_system->ack_mfsk.ack_match_threshold,
+					-1.0, telecom_system->ack_mfsk.ack_match_threshold);
 
 			if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold)
 			{
@@ -22336,6 +22462,14 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 					fflush(stdout);
 				}
 			}
+			// Final ACK PATTERN gate for this evaluated capture. The caller may
+			// impose a separate CRC-bearing DATA-ACK content gate afterward; this
+			// event never claims that the protocol ACK was committed. Recovery-fine
+			// has a compound two-arm threshold, so one scalar metric floor is N/A.
+			if (rro::Telemetry::instance().enabled())
+				rro::Telemetry::instance().record_correlator_outcome(
+					1, accept, recovery_fine ? -1.0 : ctrl_ack_metric_floor,
+					telecom_system->ack_mfsk.ack_match_threshold);
 			if(accept)
 			{
 				// Step 15: legacy MFSK SACK-before-ACK guard removed —
@@ -23407,6 +23541,19 @@ void cl_arq_controller::receive()
 				rro_telemetry.record_crc_result(received_message_stats.crc == 0);
 		}
 #endif
+		// Unlike the legacy CRC residual counter above, this is the terminal
+		// per-frame decode outcome after any in-call rescue/retry. A big-block
+		// carve is not one stock frame and has its own codeword/whole-block checks.
+		if (rro_telemetry.enabled() && received_message_stats.crc_checked
+			&& !bigblock_rx_handled)
+		{
+			const bool accepted = received_message_stats.message_decoded == YES;
+			const int reason = accepted ? 0
+				: received_message_stats.crc != 0 ? 1
+				: received_message_stats.iterations_done > telecom_system->ldpc.nIteration_max ? 2
+				: 3;
+			rro_telemetry.record_crc_frame_outcome(accepted, reason);
+		}
 
 		measurements.signal_stregth_dbm = received_message_stats.signal_stregth_dbm;
 
@@ -24167,9 +24314,16 @@ void cl_arq_controller::receive()
 					telecom_system->data_container.ready_to_process_passband_delayed_data,
 					signal_period, &matched);
 				double hail_quality = (matched > 0) ? metric / matched : 0.0;
-				if(metric >= telecom_system->ack_pattern_detection_threshold
-				   && matched >= telecom_system->ack_mfsk.hail_match_threshold
-				   && hail_quality >= 0.3)
+				const bool hail_pattern_accepted =
+					metric >= telecom_system->ack_pattern_detection_threshold
+					&& matched >= telecom_system->ack_mfsk.hail_match_threshold
+					&& hail_quality >= 0.3;
+				if (rro::Telemetry::instance().enabled())
+					rro::Telemetry::instance().record_correlator_outcome(
+						2, hail_pattern_accepted,
+						telecom_system->ack_pattern_detection_threshold,
+						telecom_system->ack_mfsk.hail_match_threshold);
+				if(hail_pattern_accepted)
 				{
 					printf("[HAIL] 'I am Mercury' beacon detected! metric=%.2f matched=%d/%d quality=%.2f\n",
 						metric, matched, telecom_system->ack_mfsk.ack_pattern_nsymb, hail_quality);
