@@ -57,6 +57,7 @@
 #include "audioio/audioio.h"
 #include "common/sim_clock.h"
 #include "common/build_id.h"
+#include "common/rro_telemetry.h"
 
 int run_b2f_bounded_output_test();
 int run_fft_scratch_tests();
@@ -2901,6 +2902,10 @@ int main(int argc, char *argv[])
         std::printf("%s\n", MERCURY_BUILD_ID);
         return 0;
     }
+
+    // Opt-in loopback publisher. Audio/decode paths only update atomics; the
+    // snapshot serializer and UDP sender live on its bounded 8 Hz thread.
+    rro::Telemetry::instance().start_from_environment();
 
     int main_exit_status = EXIT_SUCCESS;
 

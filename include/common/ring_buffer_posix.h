@@ -43,6 +43,21 @@ struct circular_buf_t {
 /// Handle type, the way users interact with the API
 typedef struct circular_buf_t* cbuf_handle_t;
 
+// Coherent physical FIFO cursor snapshot. Indices and capacity are bytes,
+// modulo capacity; full distinguishes a full ring from an empty one when
+// head == tail. The try accessor never waits for the ring mutex.
+struct circular_buf_cursor_snapshot {
+    size_t head_bytes;
+    size_t tail_bytes;
+    size_t capacity_bytes;
+    bool full;
+};
+
+// Returns 0 with a coherent snapshot, -1 if the mutex is busy or invalid.
+// Requires the caller to keep cbuf alive for the duration of the call.
+int circular_buf_try_cursor_snapshot(cbuf_handle_t cbuf,
+                                    struct circular_buf_cursor_snapshot *out);
+
 // +++ The next 8 functions should be enough to do everything +++
 
 // Shared memory init (create) function: 2 shared memory objects are created: base_name-1 and basename-2.

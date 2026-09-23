@@ -315,6 +315,35 @@ void circular_buf_reset(cbuf_handle_t cbuf)
     MUTEX_UNLOCK( &cbuf->internal->mutex );
 }
 
+int circular_buf_try_cursor_snapshot(cbuf_handle_t cbuf,
+                                    struct circular_buf_cursor_snapshot *out)
+{
+    if(cbuf == NULL || cbuf->internal == NULL || out == NULL)
+        return -1;
+
+#if defined(_WIN32)
+    const DWORD acquired = WaitForSingleObject(cbuf->internal->mutex, 0);
+    if(acquired == WAIT_ABANDONED) {
+        // Ownership was acquired, but an abandoned mutex cannot certify a
+        // coherent producer state. Release it and report unavailable.
+        ReleaseMutex(cbuf->internal->mutex);
+        return -1;
+    }
+    if(acquired != WAIT_OBJECT_0)
+        return -1;
+#else
+    if(pthread_mutex_trylock(&cbuf->internal->mutex) != 0)
+        return -1;
+#endif
+
+    out->head_bytes = cbuf->internal->head;
+    out->tail_bytes = cbuf->internal->tail;
+    out->capacity_bytes = cbuf->internal->max;
+    out->full = cbuf->internal->full;
+    MUTEX_UNLOCK(&cbuf->internal->mutex);
+    return 0;
+}
+
 size_t size_buffer(cbuf_handle_t cbuf)
 {
     assert(cbuf && cbuf->internal);

@@ -7541,6 +7541,17 @@ public:
       else acked = sent;
       if (acked > sent) acked = sent;
 
+      // RRO observes the completed transaction's actual feedback category,
+      // not a guess from the rolling optimizer's partial-loss percentage.
+      rro_last_batch_classification = failed ? 3
+          : sent == 0 ? 4
+          : (sack_used || acked < sent) ? 2 : 1;
+      if (rro_last_batch_classification == 2) {
+          if (rro_partial_streak < 9007199254740991ULL) ++rro_partial_streak;
+      } else {
+          rro_partial_streak = 0;
+      }
+
       unsigned int cycle = 0;
       if (!outcome_only && opt_batch_tx_start_ms != 0 && now >= opt_batch_tx_start_ms)
           cycle = (unsigned int)(now - opt_batch_tx_start_ms);
@@ -7684,6 +7695,8 @@ public:
   // disconnect — prior-session stats describe a different channel and would
   // mislead the optimizer.
   void opt_reset_window() {
+      rro_last_batch_classification = 0;  // NONE: no batch in this session
+      rro_partial_streak = 0;
       for (int i = 0; i < OPTIMIZER_WINDOW_SIZE; i++) {
           opt_batch_app_bytes[i] = 0;
           opt_batch_transport_bytes[i] = 0;
@@ -7918,6 +7931,8 @@ private:
   unsigned int opt_current_batch_frames_sent;
   unsigned int opt_current_batch_repair_frames;
   unsigned long long opt_record_sequence;
+  int rro_last_batch_classification;
+  unsigned long long rro_partial_streak;
   unsigned long long opt_application_unit_sequence;
   int opt_last_real_slot;
   int opt_diag_emit_counter;
