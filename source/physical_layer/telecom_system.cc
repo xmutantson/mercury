@@ -12946,11 +12946,16 @@ void cl_telecom_system::rebuild_mfsk_preamble_runtime()
 			ofdm.mfsk_preamble_tones[s] = mfsk.preamble_tones[s];
 		ofdm.mfsk_preamble_match_threshold = mfsk.preamble_match_threshold;
 
-		// Alternate-set mirror (detect-both): on negotiable NB robust configs
-		// the detector also searches the NON-active sequence, so the RX
-		// acquires a peer on either side of the negotiation (including a
-		// transition build transmitting sidelnikov without advertising it).
-		if(mfsk.robust_preamble_detect_both())
+		// Detect-both is a handshake transition aid, not a permanent second
+		// wire format. Once both peers have negotiated sidelnikov, legacy is
+		// no longer a legal TX choice. Leaving its short detector armed lets a
+		// chance legacy match shadow a weak but valid sidelnikov primary.
+		// MERCURY_NB_POSTNEG_ALT_CLOSE=0 restores the old decision exactly.
+		const char* postneg_alt_close_env = std::getenv("MERCURY_NB_POSTNEG_ALT_CLOSE");
+		const bool postneg_alt_close = !postneg_alt_close_env
+			|| atoi(postneg_alt_close_env) != 0;
+		if(mfsk.robust_preamble_detect_both()
+			&& (!robust_preamble_negotiated || !postneg_alt_close))
 		{
 			bool sid_act = mfsk.robust_preamble_sid_active;
 			ofdm.mfsk_alt_preamble_nsymb  = sid_act ? mfsk.preamble_nSymb_legacy : mfsk.preamble_nSymb_sid;
@@ -13108,8 +13113,9 @@ void cl_telecom_system::rebuild_mfsk_preamble_runtime()
 // support => sidelnikov) and at session reset (=> legacy). The flag persists
 // across load_configuration; when the current config is NB MFSK the active
 // set + detector mirrors are re-installed immediately so the very next frame
-// TX/RX uses the negotiated preamble. RX detect-both makes the flip instant
-// safe against in-flight frames from either set.
+// TX/RX uses the negotiated preamble. Detect-both is armed only before the
+// symmetric both-capable verdict; after it, the negotiated primary is the sole
+// legal wire preamble and the short legacy false-match surface is closed.
 void cl_telecom_system::set_robust_preamble_negotiated(bool on)
 {
 	if(robust_preamble_negotiated == on) return;

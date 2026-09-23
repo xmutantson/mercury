@@ -8835,9 +8835,9 @@ int run_recovery_ack_tests() {
 //   (b) detect-both: a sidelnikov frame is acquired via the ALTERNATE
 //       detector arm while legacy is active (retro-covers a transition build
 //       that transmits sidelnikov without advertising it);
-//   (c) the negotiation flip installs sidelnikov as ACTIVE (TX + primary
-//       detector) and keeps legacy as the alternate (reconnect cover), and a
-//       session reset restores the floor;
+//   (c) the negotiation flip installs sidelnikov as ACTIVE (TX + sole detector),
+//       closing the short legacy false-match surface; a session reset restores
+//       the legacy floor and re-arms detect-both;
 //   (d) the handshake-echo compatibility + bare-ACK inference rules never
 //       infer the capability from a peer that did not advertise it.
 static void test_nb_robust_preamble_capneg() {
@@ -8968,11 +8968,13 @@ static void test_nb_robust_preamble_capneg() {
 		test_fail(name, buf);
 		return;
 	}
-	// (c) the production negotiation flip.
+	// (c) The production negotiation flip. Running this same test with
+	// MERCURY_NB_POSTNEG_ALT_CLOSE=0 is the fail-before arm: it restores the
+	// old permanent detect-both decision and must fail the sole-detector check.
 	ts.set_robust_preamble_negotiated(true);
 	if (ts.mfsk.preamble_nSymb != 32 || ts.ofdm.mfsk_preamble_nsymb != 32
-		|| ts.ofdm.mfsk_alt_preamble_nsymb != 8) {
-		test_fail(name, "negotiated flip must install sidelnikov active + legacy alternate");
+		|| ts.ofdm.mfsk_alt_preamble_nsymb != 0) {
+		test_fail(name, "negotiated flip must install sidelnikov as the sole detector");
 		return;
 	}
 	d = synth_detect(&mn, &ma);
@@ -8980,16 +8982,18 @@ static void test_nb_robust_preamble_capneg() {
 		test_fail(name, "post-negotiation sidelnikov frame must acquire via the primary arm");
 		return;
 	}
-	ts.mfsk.set_robust_preamble_sidelnikov(false);   // a peer that reset mid-session
+	// A both-capable peer cannot legally transmit legacy. Rejecting this event
+	// is the directed form of the low-SNR alt8-at-active48 switch-stall signature.
+	ts.mfsk.set_robust_preamble_sidelnikov(false);
 	d = synth_detect(&mn, &ma);
 	ts.mfsk.set_robust_preamble_sidelnikov(true);
-	if (d < 0 || mn != 8 || !ma) {
-		test_fail(name, "post-negotiation legacy frame must acquire via the alternate arm");
+	if (d >= 0 || mn != 0 || ma) {
+		test_fail(name, "post-negotiation legacy-shaped event must not shadow the sidelnikov primary");
 		return;
 	}
 	ts.set_robust_preamble_negotiated(false);
-	if (ts.mfsk.preamble_nSymb != 8) {
-		test_fail(name, "session reset must restore the legacy interop floor");
+	if (ts.mfsk.preamble_nSymb != 8 || ts.ofdm.mfsk_alt_preamble_nsymb != 32) {
+		test_fail(name, "session reset must restore legacy primary and pre-negotiation detect-both");
 		return;
 	}
 
