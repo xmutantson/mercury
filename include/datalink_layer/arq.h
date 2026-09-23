@@ -3558,6 +3558,7 @@ public:
   // stale-generation config-switch fallback (fail-before via -DLINKPHASE_MC2_NOGUARD /
   // pass-after), and the RAISE-ONLY invariant. Returns 0=PASS. In-process, no IONOS/RF.
   int test_linkphase_mc2_slotfloor();
+  int test_gs2_spec_conformance();
   int test_linkphase_optclock_end_stamp();
   // BREAK recovery contract regression: a rejected BreakObserved transition
   // must stop before ListenerReady and before the recovery caller continues.
@@ -5541,6 +5542,11 @@ public:
   // inband_rate_enabled: cached MERCURY_INBAND_RATE flag (resolved once via
   //   inband_rate_feature_enabled()).
   int     inband_last_announced_config; // CONFIG_NONE until the first tag
+  // Receive-frame period (+10 symbol settle margin, samples) and config of the last
+  // OFDM batch this side keyed: sizes the next CONFIG_TAG processing guard.
+  long    gs2_prev_tx_frame_samples = 0;
+  long long gs2_frames_start_ms = 0;   // lp_now() at frame 0 of the last keydown
+  int     gs2_prev_tx_config = -1;
   uint8_t inband_tx_epoch_parity;       // 0/1, toggles per committed change
   int     inband_rate_enabled;          // -1 = unresolved, 0 = off, 1 = on
   int     scream_wake_enabled;          // MERCURY_SCREAM_WAKE, default off
@@ -7906,6 +7912,12 @@ private:
   // source. Selects the epoch-guarded primitive owner_keydown_end, else the private latch;
   // applies it RAISE-ONLY. The private latch and its other readers stay in place.
   int  mc2_slot_floor_kd_ms(int& kd_src_out) const;
+  int  linkphase_slot_kd_remaining_ms(int kd_ms);  // keydown term after the timer origin
+  bool gs2_coordinated_wb_entry(int config);              // ACKed SWITCH_BANDWIDTH = coordinated change
+  long gs2_tag_guard_samples(long window_guard_samples);  // CONFIG_TAG guard = peer frame period
+  bool inband_ctrl_miss_resumes_data(int control_code) const;
+  bool gs2_liveness_control_exchange_exempt() const;
+  bool gs2_empty_control_state_resumes_data();
   int  mc2_apply_slot_floor(int timeout, int& kd_src_out);
   int  lp_optclock_keydown_ms(int fallback_frames, bool fallback_force_full,
                               bool* used_end_stamp = NULL) const;

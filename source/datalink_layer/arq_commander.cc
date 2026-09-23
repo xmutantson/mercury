@@ -6879,6 +6879,27 @@ void cl_arq_controller::process_messages_rx_acks_control()
 					"(inband owns rate/loss via tag-demote + down-ladder + dead-batch floor)\n",
 					current_configuration);
 				fflush(stdout);
+				// A batch-geometry control (Axis-2 SET_LINK_PARAMS / robust dwell batch) whose
+				// reverse ACK was never heard has no successor message: freeing its slot below
+				// and then parking in TRANSMITTING_CONTROL leaves nothing to send, so the data
+				// plane never resumes and every later rate decision (which is actuated at a
+				// data-batch boundary) is stranded until the link timer expires.  The commander
+				// already applied the new batch geometry locally at decision time, exactly as on
+				// the ACKed path, so resume DATA with it; the data batches carry their own window
+				// and the next ACK re-establishes agreement.  MERCURY_INBAND_CTRL_MISS_RESUME=0
+				// restores the previous behaviour.
+				bool ctrl_miss_resume = false;
+				{
+					int miss_code = (messages_control.length > 0) ? (int)(unsigned char)messages_control.data[0] : -1;
+					ctrl_miss_resume = link_status == CONNECTED && inband_ctrl_miss_resumes_data(miss_code);
+					if(ctrl_miss_resume)
+					{
+						printf("[INBAND-CTRL-MISS-RESUME] control code=%d unacknowledged after its retry "
+							"budget at config %d: resuming DATA with local batch=%d\n",
+							miss_code, current_configuration, data_batch_size);
+						fflush(stdout);
+					}
+				}
 				messages_control.ack_timeout = 0;
 				messages_control.id          = 0;
 				messages_control.length      = 0;
@@ -6887,6 +6908,15 @@ void cl_arq_controller::process_messages_rx_acks_control()
 				messages_control.type        = NONE;
 				// Do NOT bump emergency_nack_count, do NOT send_break_pattern. Fall through to
 				// the normal cleanup at the end of this handler (receiving_timer stop/reset).
+				if(ctrl_miss_resume)
+				{
+					arm_control_turnaround_guard();
+					this->connection_status = TRANSMITTING_DATA;
+					receiving_timer.stop();
+					receiving_timer.reset();
+					this->cleanup();
+					return;
+				}
 			}
 			// Track control failures toward BREAK threshold.
 			// Only during connected data exchange (not connection setup or turboshift).
@@ -7430,6 +7460,18 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 	}
 #endif
 
+	// A live control exchange (a queued control message awaiting its ACK within its own
+	// timeout and retry budget) is not a livelock: its ACK wait, retries and terminal
+	// miss handling own it.  Counting its polls fired this guard ~1.3 s into every
+	// ordinary SET_LINK_PARAMS round trip (200 polls at the few-ms control-poll cadence)
+	// and fed Gearshift a fabricated whole-transaction failure, which it correctly read
+	// as a worse regime and so suppressed upward probes after each batch-size change.
+	// MERCURY_GS2_LIVENESS_CTRL_EXEMPT=0 restores the previous accrual.
+	if(gs2_liveness_control_exchange_exempt())
+	{
+		cmd_inband_liveness_no_progress_polls = 0;
+		return false;
+	}
 	// Control-TX / Idle / control-ACK-wait with NO forward DATA progress: accrue.
 	cmd_inband_liveness_no_progress_polls++;
 	if(cmd_inband_liveness_no_progress_polls < inband_liveness_stall_polls_count())
@@ -7459,9 +7501,18 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 			/*failed=*/true, /*frames_acked=*/0, /*frames_sent_override=*/1,
 			/*outcome_only=*/true);
 		int owner_target = current_configuration;
+		// Gearshift decisions are actuated at a data-batch boundary.  A commander parked in
+		// TRANSMITTING_CONTROL with an EMPTY control slot (a control exchange that was
+		// abandoned, or a legacy SET_CONFIG request the ownership firewall refused) has
+		// nothing to send and never reaches that boundary, so every owner decision below
+		// would be stranded until the link timer expires.  Return such a commander to the
+		// data plane so the owner's action is actually dispatched.
+		// MERCURY_GS2_EMPTY_CTRL_RESUME=0 restores the previous behaviour.
+		const bool empty_ctrl_resume = gs2_empty_control_state_resumes_data();
 		if(opt_evaluate_batch_end(&owner_target)
 		   && owner_target != current_configuration)
 		{
+			if(empty_ctrl_resume) this->connection_status = TRANSMITTING_DATA;
 			opt_pending_switch_cfg = owner_target;
 			printf("[GEARSHIFT-V2-AUTHORITY] liveness telemetry -> owner selected "
 				"%d->%d action=%d; generic BREAK suppressed\n",
@@ -7471,6 +7522,7 @@ bool cl_arq_controller::inband_connect_liveness_guard()
 		}
 		if(!config_is_at_bottom(current_configuration, robust_enabled))
 		{
+			if(empty_ctrl_resume) this->connection_status = TRANSMITTING_DATA;
 			printf("[GEARSHIFT-V2-AUTHORITY] liveness telemetry -> owner HOLD/ABSTAIN "
 				"at cfg=%d above floor; generic BREAK suppressed\n",
 				current_configuration);
@@ -12572,6 +12624,10 @@ void cl_arq_controller::process_control_commander()
 				int seed = connect_fuse_seed_tx;
 				connect_fuse_seed_tx = CONFIG_NONE;
 				apply_connect_seed_cross(seed);
+				// The responder loaded the same seed on the ACKed switch: a coordinated change,
+				// not one to re-announce with a CONFIG_TAG on the first batch.
+				if(current_configuration == seed)
+					gs2_coordinated_wb_entry(current_configuration);
 			}
 			else
 			{
@@ -12605,6 +12661,9 @@ void cl_arq_controller::process_control_commander()
 				}
 				else
 				{
+					// The ACKed SWITCH_BANDWIDTH is itself the coordinated config change (see
+					// gs2_coordinated_wb_entry): do not repeat it as a CONFIG_TAG on the first batch.
+					gs2_coordinated_wb_entry(current_configuration);
 					this->connection_status=TRANSMITTING_DATA;
 				}
 			}

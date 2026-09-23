@@ -390,7 +390,8 @@ st_rate_policy::st_rate_policy()
       calibration_context_distance_sigma_gain(0.35), compression_gain_rel_sigma(0.25),
       batch_context_half_width(0.55), uncalibrated_prior_rel_sigma(0.80),
       uncalibrated_prior_weight(0.20), probe_reopen_snr_db(2.0),
-      probe_reopen_selectivity(0.06), channel_change_snr_db(4.0),
+      probe_reopen_selectivity(0.06), evidence_gated_hold(0),
+      channel_change_snr_db(4.0),
       channel_change_selectivity(0.10), reverse_snr_prior_weight_scale(0.25),
       reverse_snr_sigma_gain(2.0), context_volatility_alpha(0.25),
       context_volatility_live_gain(1.5), context_volatility_horizon_gain(2.0),
@@ -435,6 +436,7 @@ void st_rate_policy::load_env()
     uncalibrated_prior_weight = env_double("MERCURY_GS2_UNCAL_WEIGHT", uncalibrated_prior_weight, 0.01, 2.0);
     probe_reopen_snr_db = env_double("MERCURY_GS2_PROBE_REOPEN_SNR", probe_reopen_snr_db, 0.0, 20.0);
     probe_reopen_selectivity = env_double("MERCURY_GS2_PROBE_REOPEN_SEL", probe_reopen_selectivity, 0.0, 1.0);
+    evidence_gated_hold = env_int("MERCURY_GS2_EVIDENCE_HOLD", evidence_gated_hold, 0, 1);
     channel_change_snr_db = env_double("MERCURY_GS2_CHANGE_SNR", channel_change_snr_db, 0.5, 30.0);
     channel_change_selectivity = env_double("MERCURY_GS2_CHANGE_SEL", channel_change_selectivity, 0.01, 1.0);
     reverse_snr_prior_weight_scale = env_double("MERCURY_GS2_REVERSE_SNR_WEIGHT", reverse_snr_prior_weight_scale, 0.0, 1.0);
@@ -985,8 +987,29 @@ bool cl_rate_optimizer::probe_target_blocked(int cfg, const st_rate_observation&
 {
     const std::map<int, st_probe_memory>& pm = obs.is_nb ? probe_memory_nb : probe_memory_wb;
     std::map<int, st_probe_memory>::const_iterator it = pm.find(cfg);
-    if (it == pm.end() || tick_counter >= it->second.blocked_until_tick) return false;
-    if (it->second.context_generation != context_generation) return false;
+    if (it == pm.end()) return false;
+    // EVIDENCE-GATED HOLD: a rung that failed a probe repeatedly (>= the hard
+    // failure streak) while a valid forward-channel snapshot was recorded is held
+    // on EVIDENCE, not on a batch-count timer or a regime label. Re-probing a rung
+    // whose recorded failure conditions have NOT improved re-pays a probe against
+    // standing evidence -- a paid probe that spends airtime to re-learn what is
+    // already known. So for such a rung BOTH legacy reopen shortcuts are bypassed:
+    //   (1) the backoff tick expiry (a timer, not evidence), and
+    //   (2) the context-generation turnover (a coarse "regime changed -> reopen
+    //       everything" proxy that a steady channel churns spuriously off probe
+    //       goodput volatility -- so it must NOT reopen a still-dead rung).
+    // The rung reopens only when the forward SNR/selectivity has materially
+    // improved (the fine-grained evidence gate below), which subsumes a genuine
+    // regime improvement. Legacy tick + generation reopen still govern the
+    // transient (single-fail) and no-snapshot (cold-start sentinel) cases; with the
+    // gate off this is byte-identical to the original tick-then-generation block.
+    const bool evidence_hold = policy.evidence_gated_hold != 0 &&
+        it->second.failed_snr_db > -90.0 &&
+        it->second.failures >= policy.probe_hard_failure_streak;
+    if (!evidence_hold) {
+        if (tick_counter >= it->second.blocked_until_tick) return false;
+        if (it->second.context_generation != context_generation) return false;
+    }
     const bool snr_improved = obs.forward_snr_db > -90.0 && it->second.failed_snr_db > -90.0 &&
         obs.forward_snr_db >= it->second.failed_snr_db + policy.probe_reopen_snr_db;
     const bool sel_improved = obs.forward_selectivity >= 0.0 &&
@@ -2888,20 +2911,38 @@ void cl_rate_optimizer::notify_switch_failed()
     if (!switch_inflight) return;
     if (switch_action == GEARSHIFT_ACTION_PROBE) {
         // A transition-transport failure is negative information about the probe itself.
-        // We do not have a fresh channel snapshot here, so use a context-free
-        // block that expires only by transaction count (not by a guessed SNR).
+        // The full-batch failure carries no fresh IN-PROBE channel snapshot, but the
+        // last observed forward-channel context IS the regime in which this rung just
+        // failed to carry data. Record it (evidence-gated hold) so the block can be
+        // reopened by an evidence improvement rather than a batch-count timer; fall
+        // back to the -99.9 sentinel (legacy tick-only expiry) when no valid context
+        // has been observed yet (cold-start) or the gate is off.
         std::map<int, st_probe_memory>& pm = switch_is_nb ? probe_memory_nb : probe_memory_wb;
         st_probe_memory& m = pm[switch_to_cfg];
         ++m.failures;
         const int backoff = policy.probe_cooldown_batches * std::min(4, m.failures);
         m.blocked_until_tick = tick_counter + backoff;
-        m.failed_snr_db = -99.9;
-        m.failed_selectivity = -1.0;
+        if (policy.evidence_gated_hold != 0 && last_context_snr_db > -90.0) {
+            m.failed_snr_db = last_context_snr_db;
+            m.failed_selectivity = last_context_selectivity;
+        } else {
+            m.failed_snr_db = -99.9;
+            m.failed_selectivity = -1.0;
+        }
         m.context_generation = context_generation;
         std::printf("[GEARSHIFT-V2] probe-memory target=%d strength=hard "
                     "reason=switch-transport-failed backoff_batches=%d failures=%d generation=%d\n",
                     switch_to_cfg, backoff, m.failures, context_generation);
         std::fflush(stdout);
+        if (policy.evidence_gated_hold != 0 && m.failed_snr_db > -90.0 &&
+            m.failures >= policy.probe_hard_failure_streak) {
+            std::printf("[GEARSHIFT-V2] probe-evidence-hold target=%d failed_snr=%.2f "
+                        "reopen_snr>=%.2f failures=%d generation=%d\n",
+                        switch_to_cfg, m.failed_snr_db,
+                        m.failed_snr_db + policy.probe_reopen_snr_db,
+                        m.failures, context_generation);
+            std::fflush(stdout);
+        }
         probe_cooldown_remaining = std::max(probe_cooldown_remaining, policy.cooldown_batches);
         clear_probe();
     }
@@ -2959,14 +3000,31 @@ bool cl_rate_optimizer::notify_external_axis1_transition(
         ++m.failures;
         const int backoff = policy.probe_cooldown_batches * std::min(4, m.failures);
         m.blocked_until_tick = tick_counter + backoff;
-        m.failed_snr_db = -99.9;
-        m.failed_selectivity = -1.0;
+        // Record the last observed forward-channel context so the evidence-gated
+        // hold can reopen on evidence, not a timer (sentinel fallback when the gate
+        // is off or no valid context has been observed yet).
+        if (policy.evidence_gated_hold != 0 && last_context_snr_db > -90.0) {
+            m.failed_snr_db = last_context_snr_db;
+            m.failed_selectivity = last_context_selectivity;
+        } else {
+            m.failed_snr_db = -99.9;
+            m.failed_selectivity = -1.0;
+        }
         m.context_generation = context_generation;
         std::printf("[GEARSHIFT-V2] probe-memory target=%d strength=hard "
                     "reason=%s backoff_batches=%d failures=%d generation=%d\n",
                     probe_target_cfg, reason ? reason : "external-axis1",
                     backoff, m.failures, context_generation);
         std::fflush(stdout);
+        if (policy.evidence_gated_hold != 0 && m.failed_snr_db > -90.0 &&
+            m.failures >= policy.probe_hard_failure_streak) {
+            std::printf("[GEARSHIFT-V2] probe-evidence-hold target=%d failed_snr=%.2f "
+                        "reopen_snr>=%.2f failures=%d generation=%d\n",
+                        probe_target_cfg, m.failed_snr_db,
+                        m.failed_snr_db + policy.probe_reopen_snr_db,
+                        m.failures, context_generation);
+            std::fflush(stdout);
+        }
         probe_cooldown_remaining = std::max(probe_cooldown_remaining, policy.cooldown_batches);
     }
     clear_probe();

@@ -212,6 +212,14 @@ struct st_rate_policy {
     double uncalibrated_prior_weight;
     double probe_reopen_snr_db;
     double probe_reopen_selectivity;
+    // EVIDENCE-GATED PROBE HOLD (MERCURY_GS2_EVIDENCE_HOLD, default 0 = off; 1 = on): when a
+    // probe target has failed >= probe_hard_failure_streak times in the current
+    // context generation with a valid recorded forward-channel snapshot, hold the
+    // rung on EVIDENCE (reopen only on a forward-SNR/selectivity improvement or a
+    // context-generation turnover) instead of letting a bounded batch-count backoff
+    // expire and re-probe a rung that is still structurally dead. 0 = legacy
+    // tick-only behaviour (byte-identical fail-before arm).
+    int evidence_gated_hold;
     double channel_change_snr_db;
     double channel_change_selectivity;
     double reverse_snr_prior_weight_scale;
