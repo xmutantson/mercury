@@ -26,6 +26,7 @@
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
 #include "common/snr_decision_grid.h"
+#include "common/rro_telemetry.h"
 #include "physical_layer/dist_matcher.h" // PAS/PCS distribution matcher (lever #2, feat/pcs)
 #include "physical_layer/ldpc_decode_pool.h" // LEVER C: multi-core big-block decode pool (feat/decode-marathon)
 #include <thread> // LEVER C: std::thread::hardware_concurrency() for the pool clamp
@@ -1823,6 +1824,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.sync_trials=0;
 	receive_stats.iterations_done = -1;
 	receive_stats.crc = 0;
+	receive_stats.crc_checked = false;
 	receive_stats.SNR = -99.9;
 	receive_stats.all_zeros = NO;
 	receive_stats.coarse_metric = 0.0;
@@ -4514,6 +4516,7 @@ skip_h_retry_point:
 			receive_stats.crc=0;
 			if(outer_code == CRC16_MODBUS_RTU && receive_stats.all_zeros == NO)
 			{
+				receive_stats.crc_checked = true;
 				receive_stats.crc=CRC16_MODBUS_RTU_calc(data_container.hd_decoded_data_byte, nReal_data/8);
 			}
 
@@ -8103,12 +8106,42 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 		double frame_samples = (double)(data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb) * data_container.interpolation_rate);
 		double frame_ms = (frame_samples / 48000.0) * 1000.0;
 		float load = (frame_ms > 0) ? (float)(proc_ms / frame_ms) : 0.0f;
+		rro::Telemetry& rro_telemetry = rro::Telemetry::instance();
 
 #ifdef MERCURY_GUI_ENABLED
+		const size_t rro_buf_used = size_buffer(capture_buffer);
+		const size_t rro_buf_cap = circular_buf_capacity(capture_buffer);
 		g_gui_state.processing_load.store(load);
-		size_t buf_used = size_buffer(capture_buffer);
-		size_t buf_cap = circular_buf_capacity(capture_buffer);
-		g_gui_state.buffer_fill_pct.store(buf_cap > 0 ? 100.0f * (float)buf_used / (float)buf_cap : 0.0f);
+		g_gui_state.buffer_fill_pct.store(rro_buf_cap > 0
+			? 100.0f * (float)rro_buf_used / (float)rro_buf_cap : 0.0f);
+		if (rro_telemetry.enabled()) {
+			rro_telemetry.record_processing_load(load);
+			rro_telemetry.record_capture_ring(rro_buf_used, rro_buf_cap);
+			rro_telemetry.record_receive_configuration(ofdm.Nfft, ldpc.nIteration_max);
+			if (M != MOD_MFSK)
+				rro_telemetry.record_ofdm_candidate(
+					received_message_stats.ofdm_preamble_detected);
+			if (received_message_stats.iterations_done >= 0)
+				rro_telemetry.record_ldpc_iterations(
+					received_message_stats.iterations_done);
+			if (received_message_stats.crc_checked)
+				rro_telemetry.record_crc_result(received_message_stats.crc == 0);
+		}
+#else
+		if (rro_telemetry.enabled()) {
+			rro_telemetry.record_processing_load(load);
+			rro_telemetry.record_capture_ring(size_buffer(capture_buffer),
+				circular_buf_capacity(capture_buffer));
+			rro_telemetry.record_receive_configuration(ofdm.Nfft, ldpc.nIteration_max);
+			if (M != MOD_MFSK)
+				rro_telemetry.record_ofdm_candidate(
+					received_message_stats.ofdm_preamble_detected);
+			if (received_message_stats.iterations_done >= 0)
+				rro_telemetry.record_ldpc_iterations(
+					received_message_stats.iterations_done);
+			if (received_message_stats.crc_checked)
+				rro_telemetry.record_crc_result(received_message_stats.crc == 0);
+		}
 #endif
 
 		if(received_message_stats.message_decoded == YES)

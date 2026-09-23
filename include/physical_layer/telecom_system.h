@@ -113,6 +113,7 @@ struct st_receive_stats{
 	double signal_stregth_dbm = 0.0;
 	st_power_measurment power_measurment = {};
 	int crc = 0;
+	bool crc_checked = false;  // true only when the outer CRC was actually evaluated
 	int all_zeros = 0;
 	int mfsk_search_raw = 0;  // MFSK anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
 	int ofdm_search_raw = 0;  // OFDM anti-re-decode: base search position (symbol units, pre-nUnder adjustment)

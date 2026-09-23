@@ -33,6 +33,7 @@
 #include <malloc.h>
 #endif
 #include "common/timing_log.h"
+#include "common/rro_telemetry.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -9872,6 +9873,38 @@ void cl_arq_controller::process_main()
 	}
 
 	process_messages();
+	// Sample controller-owned state on its own thread. The publisher only reads
+	// atomics; it never races the ARQ state machine or serializes here.
+	rro::Telemetry& rro_gearshift = rro::Telemetry::instance();
+	if (rro_gearshift.enabled() && !arq_sim_inproc_skip_tcp())
+	{
+		static thread_local auto last_rro_gearshift =
+			std::chrono::steady_clock::time_point::min();
+		const auto now = std::chrono::steady_clock::now();
+		if (last_rro_gearshift == std::chrono::steady_clock::time_point::min()
+			|| now - last_rro_gearshift >= std::chrono::milliseconds(125))
+		{
+			last_rro_gearshift = now;
+			const unsigned long long policy_now_ms = opt_now_ms();
+			unsigned long long backoff_remaining_ms = 0;
+			for (int rung = 0; rung < FULL_CONFIG_LADDER_SIZE; ++rung)
+			{
+				const auto deadline = probe_backoff_until_ms[rung];
+				if (deadline > policy_now_ms)
+					backoff_remaining_ms = std::max(
+						backoff_remaining_ms, deadline - policy_now_ms);
+			}
+			rro_gearshift.record_gearshift({
+				link_status, connection_status, role, current_configuration,
+				last_data_viable_config, supershift_proven_ceiling,
+				clean_batches_at_current_config, backoff_remaining_ms != 0,
+				backoff_remaining_ms,
+				!optimizer_disabled && rate_opt.is_enabled() && gear_shift_on == YES,
+				emergency_break_active != 0,
+				static_cast<unsigned long long>(send_break_pattern_count),
+			});
+		}
+	}
 	if (arq_shutdown_requested())
 		return;
 	// ARQ main-loop pacing floor. In production this 2 ms sleep caps the poll
@@ -23330,13 +23363,43 @@ void cl_arq_controller::receive()
 			telecom_system->data_container.interpolation_rate);
 		double frame_ms = (frame_samples / 48000.0) * 1000.0;
 		float load = (frame_ms > 0) ? (float)(proc_ms / frame_ms) : 0.0f;
+		rro::Telemetry& rro_telemetry = rro::Telemetry::instance();
 
 #ifdef MERCURY_GUI_ENABLED
+		const size_t rro_buf_used = size_buffer(capture_buffer);
+		const size_t rro_buf_cap = circular_buf_capacity(capture_buffer);
 		g_gui_state.processing_load.store(load);
-		{
-			size_t buf_used = size_buffer(capture_buffer);
-			size_t buf_cap = circular_buf_capacity(capture_buffer);
-			g_gui_state.buffer_fill_pct.store(buf_cap > 0 ? 100.0f * (float)buf_used / (float)buf_cap : 0.0f);
+		g_gui_state.buffer_fill_pct.store(rro_buf_cap > 0
+			? 100.0f * (float)rro_buf_used / (float)rro_buf_cap : 0.0f);
+		if (rro_telemetry.enabled()) {
+			rro_telemetry.record_processing_load(load);
+			rro_telemetry.record_capture_ring(rro_buf_used, rro_buf_cap);
+			rro_telemetry.record_receive_configuration(
+				telecom_system->ofdm.Nfft, telecom_system->ldpc.nIteration_max);
+			if (telecom_system->M != MOD_MFSK)
+				rro_telemetry.record_ofdm_candidate(
+					received_message_stats.ofdm_preamble_detected);
+			if (received_message_stats.iterations_done >= 0)
+				rro_telemetry.record_ldpc_iterations(
+					received_message_stats.iterations_done);
+			if (received_message_stats.crc_checked)
+				rro_telemetry.record_crc_result(received_message_stats.crc == 0);
+		}
+#else
+		if (rro_telemetry.enabled()) {
+			rro_telemetry.record_processing_load(load);
+			rro_telemetry.record_capture_ring(size_buffer(capture_buffer),
+				circular_buf_capacity(capture_buffer));
+			rro_telemetry.record_receive_configuration(
+				telecom_system->ofdm.Nfft, telecom_system->ldpc.nIteration_max);
+			if (telecom_system->M != MOD_MFSK)
+				rro_telemetry.record_ofdm_candidate(
+					received_message_stats.ofdm_preamble_detected);
+			if (received_message_stats.iterations_done >= 0)
+				rro_telemetry.record_ldpc_iterations(
+					received_message_stats.iterations_done);
+			if (received_message_stats.crc_checked)
+				rro_telemetry.record_crc_result(received_message_stats.crc == 0);
 		}
 #endif
 
