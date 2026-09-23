@@ -15614,6 +15614,7 @@ void cl_telecom_system::eesm_probe_sim()
 	const int nseeds = envi("MERCURY_EP_SEEDS", 8);
 	const int seed0 = envi("MERCURY_EP_SEED0", 1);
 	const bool do_dec = envi("MERCURY_EP_DEC", 0) != 0;
+	const bool real_acq = envi("MERCURY_EP_REAL_ACQ", 0) != 0;
 	const double win_s = envd("MERCURY_EP_WIN_S", 6.0);
 	const double gap_s = envd("MERCURY_EP_GAP_S", 1.0);
 	const double search_ms = envd("MERCURY_EP_SEARCH_MS", 100.0);
@@ -15671,9 +15672,9 @@ void cl_telecom_system::eesm_probe_sim()
 		printf("\n[EP-NOISE] max |shape - measured| = %.3f dB (40-window measurement, sd ~%.2f dB per carrier)\n",
 			worst, 10.0 / std::log(10.0) / std::sqrt(40.0 * g.n_symb));
 	}
-	printf("[EP-SIM] chan=%s fd=%.3f dtau_ms=%.3f depth_db=%.1f a=%.2f cfo=%.2f seeds=%d seed0=%d probe_cfg=%d n_symb=%d search_ms=%.0f dec=%d win_s=%.1f gap_s=%.2f\n",
+	printf("[EP-SIM] chan=%s fd=%.3f dtau_ms=%.3f depth_db=%.1f a=%.2f cfo=%.2f seeds=%d seed0=%d probe_cfg=%d n_symb=%d search_ms=%.0f dec=%d real_acq=%d win_s=%.1f gap_s=%.2f\n",
 		ch.name(), ch.fd, ch.dtau_ms, ch.depth_db, ch.a, ch.cfo_hz, nseeds, seed0, probe_cfg, g.n_symb, search_ms,
-		(int)do_dec, win_s, gap_s);
+		(int)do_dec, (int)real_acq, win_s, gap_s);
 	fflush(stdout);
 
 	const eesm_probe::st_policy pol = eesm_probe::default_policy();
@@ -15774,7 +15775,7 @@ void cl_telecom_system::eesm_probe_sim()
 				std::vector<double> x((size_t)(fl + 2 * pad)), y((size_t)(fl + 2 * pad)), rbuf((size_t)bufn);
 				st_noise nzc(seed ^ (0xC0FFEEULL + (uint64_t)c * 7919ULL));
 				cl_sim_xoshiro drng(seed ^ (0xDA7AULL + (uint64_t)c));
-				int frames = 0, okf = 0;
+				int frames = 0, okf = 0, first_ok = 0;
 				double lvl = 0.0; long lvl_n = 0;
 				long t = t_data0;
 				const long t_end = t_data0 + (long)llround(win_s * sampling_frequency);
@@ -15795,19 +15796,20 @@ void cl_telecom_system::eesm_probe_sim()
 						const int j = fdel - pad + i;
 						if(j >= 0 && j < bufn) rbuf[(size_t)j] += y[(size_t)i];
 					}
-					ofdm_forced_delay = fdel;
+					ofdm_forced_delay = real_acq ? -1 : fdel;
 					receive_byte(rbuf.data(), dec.data());
 					ofdm_forced_delay = -1;
 					bool good = true;
 					for(int i = 0; i < nbytes; i++) if((dec[(size_t)i] & 0xFF) != bytes[(size_t)i]) { good = false; break; }
+					if(frames == 0) first_ok = good ? 1 : 0;
 					frames++; if(good) okf++;
 					t += fl;
 				}
 				const double gp = rbc * (frames > 0 ? (double)okf / frames : 0.0);
 				gp_of[(size_t)c] = gp; fer_of[(size_t)c] = frames > 0 ? 1.0 - (double)okf / frames : 1.0;
 				if(gp > best_gp + 1e-9) { best_gp = gp; best_cfg = c; }
-				appendf(candl, "[EP-CAND] chan=%s esn0=%.2f seed=%d cfg=%d frames=%d ok=%d rbc=%.1f gp=%.1f data_rms_vs_probe_db=%+.2f\n",
-					ch.name(), esn0, sd, c, frames, okf, rbc, gp,
+				appendf(candl, "[EP-CAND] chan=%s esn0=%.2f seed=%d cfg=%d frames=%d ok=%d first_ok=%d real_acq=%d rbc=%.1f gp=%.1f data_rms_vs_probe_db=%+.2f\n",
+					ch.name(), esn0, sd, c, frames, okf, first_ok, (int)real_acq, rbc, gp,
 					(lvl_n > 0 && probe_rms > 0.0) ? 10 * std::log10(lvl / lvl_n) - 20 * std::log10(probe_rms) : 0.0);
 			}
 			load_configuration(probe_cfg);

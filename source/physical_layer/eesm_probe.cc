@@ -39,10 +39,12 @@ typedef std::complex<double> cplx;
 // (600 frames per point, 0.5 dB grid -8..+26 dB, c2_cliffs_full_cfg0_17.csv awgn
 // rows). cfg0-3 lie below that grid: measured on a -18..-6 dB, 0.5 dB, 400-frame
 // extension (same binary family; its cfg4 knee01 -7.56 reproduces c2's -7.55).
-// beta: EESM beta fitted on the fadeA ensemble (fd 0.5 Hz, 1 ms, 10 dB), the column
-// the calibration recommends as the least model-contaminated per-config constant.
-// cfg0-3 had no usable fit (their waterfall lies below the c2 grid); they take cfg4's
-// value (0.2), the nearest measured BPSK row.
+// beta: anchored-logistic fit on the multi-profile eesm-fit-02 ensemble. Seed 1 is
+// the training half and seed 2 is untouched validation.  Each beta's AWGN offset is
+// recalibrated before its likelihood is evaluated, so changing beta cannot move the
+// independently measured AWGN knee.  The selected value is the conservative lower
+// edge of the one-parameter Delta-NLL=0.5 interval. cfg7/8 are lower bounds toward
+// the arithmetic-mean limit; cfg17 has no new candidate frames and retains c2.
 // awgn_offset_db: mean effective SNR this estimator reports on AWGN minus the sweep
 // Es/N0, measured at Es/N0 = knee01 of that configuration (32 probes per point). It
 // carries (a) the axis offset: probe per-carrier SINR = sweep Es/N0 + ~5.3 dB, and
@@ -52,27 +54,47 @@ typedef std::complex<double> cplx;
 // ---------------------------------------------------------------------------
 static st_cfg_row g_cfg[kNumOfdmCfg] = {
 	//  cfg  beta    knee01   knee05  awgn_off measured
-	{   0, 0.200, -12.15,  -12.89,   4.37,  true  },
-	{   1, 0.200, -10.62,  -11.19,   4.35,  true  },
-	{   2, 0.200,  -9.51,  -10.05,   4.38,  true  },
-	{   3, 0.200,  -8.54,   -8.97,   4.52,  true  },
-	{   4, 0.200,  -7.55,   -8.00,   4.48,  true  },
-	{   5, 0.300,  -7.01,   -7.38,   4.68,  true  },
-	{   6, 0.300,  -5.65,   -6.16,   4.57,  true  },
-	{   7, 1.400,  -3.29,   -3.86,   5.21,  true  },
-	{   8, 0.900,  -3.29,   -3.84,   5.08,  true  },
-	{   9, 0.500,  -2.67,   -3.19,   4.72,  true  },
-	{  10, 0.800,  -1.13,   -1.76,   4.84,  true  },
-	{  11, 1.000,   0.61,    0.04,   4.85,  true  },
-	{  12, 0.600,   1.81,    1.28,   4.42,  true  },
-	{  13, 1.500,   4.03,    3.58,   4.78,  true  },
-	{  14, 1.800,   6.46,    5.94,   4.56,  true  },
-	{  15, 3.009,   8.46,    7.96,   4.67,  true  },
-	{  16, 6.245,  12.54,   11.81,   4.71,  true  },
+	{   0,   9.9102, -12.15, -12.89, 5.2770, true  },
+	{   1,   0.6863, -10.62, -11.19, 4.9316, true  },
+	{   2,   0.6863,  -9.51, -10.05, 4.9349, true  },
+	{   3,   0.6522,  -8.54,  -8.97, 5.3020, true  },
+	{   4,   1.2959,  -7.55,  -8.00, 5.5200, true  },
+	{   5,   0.7221,  -7.01,  -7.38, 5.1233, true  },
+	{   6,   1.3293,  -5.65,  -6.16, 5.2067, true  },
+	{   7, 988.5828,  -3.29,  -3.86, 5.4252, true  },
+	{   8, 609.7905,  -3.29,  -3.84, 5.4008, true  },
+	{   9,   2.8506,  -2.67,  -3.19, 5.1357, true  },
+	{  10,   7.4921,  -1.13,  -1.76, 5.1965, true  },
+	{  11,   8.5079,   0.61,   0.04, 5.2764, true  },
+	{  12,   2.2105,   1.81,   1.28, 4.8564, true  },
+	{  13,   7.6850,   4.03,   3.58, 5.1814, true  },
+	{  14,   8.2942,   6.46,   5.94, 4.9716, true  },
+	{  15,  15.6629,   8.46,   7.96, 5.1259, true  },
+	{  16,  41.1658,  12.54,  11.81, 5.2260, true  },
 	{  17, 8.673,  15.51,   14.54,   4.46,  true  },
 };
 
 const st_cfg_row* cfg_table() { return g_cfg; }
+
+// production receive_byte, full search, no forced delay, P(decode)>=10/12;
+// bottom_anchor_rate frame-0 vehicle on 310fad44ff.  Its snr3k values are mapped
+// to this probe's mean-SINR axis by +10log10(3000/2343.75)-1.0 = +0.07 dB.
+// Unswept rungs inherit the next directly measured floor. cfg16/17 are explicit
+// conservative extrapolations from cfg15 by their decode-knee spacing.
+static const st_acq_row g_acq[kNumOfdmCfg] = {
+	{ 0,  6.07, true,   0 }, { 1,  6.07, false,  7 },
+	{ 2,  6.07, false,  7 }, { 3,  6.07, false,  7 },
+	{ 4,  6.07, false,  7 }, { 5,  6.07, false,  7 },
+	{ 6,  6.07, false,  7 }, { 7,  6.07, true,   7 },
+	{ 8,  6.07, true,   8 }, { 9,  9.07, false, 13 },
+	{10,  9.07, false, 13 }, {11,  9.07, false, 13 },
+	{12,  9.07, false, 13 }, {13,  9.07, true,  13 },
+	{14, 12.07, true,  14 }, {15, 14.07, true,  15 },
+	{16, 18.15, false, 15 }, {17, 21.12, false, 16 },
+};
+
+const st_acq_row* acquisition_table() { return g_acq; }
+const char* acquisition_table_build() { return "310fad44ff"; }
 
 st_geometry wb_geometry()
 {
@@ -824,6 +846,9 @@ st_policy default_policy()
 	// below BLER 0.1.
 	p.guard.max_time_var_frac = 1e9;
 	p.guard.max_freq_sel_db = 1e9;
+	const char* e = std::getenv("MERCURY_EESM_ACQ_FLOOR");
+	p.use_acq_floor = !(e && e[0] && std::atoi(e) == 0);
+	for(int c = 0; c < kNumOfdmCfg; c++) p.acq_floor_db[c] = g_acq[c].floor_probe_db;
 	return p;
 }
 
@@ -851,7 +876,8 @@ st_decision decide(const st_measurement& m, const st_policy& p)
 		d.eff_db[c] = eesm_db(m.sinr_lin, m.Nc, g_cfg[c].beta);
 		d.sigma_db[c] = eesm_sigma_db(m, g_cfg[c].beta);
 		d.thr_db[c] = g_cfg[c].knee01_db + g_cfg[c].awgn_offset_db;
-		if(c <= top && d.eff_db[c] - p.z * d.sigma_db[c] >= d.thr_db[c]) best = c;
+		const bool acq_ok = !p.use_acq_floor || m.mean_snr_db - p.z * m.sigma_mean_db >= p.acq_floor_db[c];
+		if(c <= top && acq_ok && d.eff_db[c] - p.z * d.sigma_db[c] >= d.thr_db[c]) best = c;
 	}
 	if(best < 0 || !p.wb_possible)
 	{

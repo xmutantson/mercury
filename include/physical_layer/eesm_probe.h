@@ -178,6 +178,18 @@ struct st_cfg_row {
 };
 const st_cfg_row* cfg_table();            // kNumOfdmCfg rows, index == cfg
 
+// Frame-0 acquisition threshold paired with cfg_table().  These are versioned
+// receiver measurements, not modem constants: detector changes must replace the
+// whole table and its build stamp after a new frame-0 vehicle sweep.
+struct st_acq_row {
+	int    cfg;
+	double floor_probe_db; // probe mean-SINR lower bound required for frame-0 acquisition
+	bool   measured;       // true when this configuration was swept directly
+	int    source_cfg;     // cfg whose measured floor is inherited, or cfg for extrapolation
+};
+const st_acq_row* acquisition_table();    // kNumOfdmCfg rows, index == cfg
+const char* acquisition_table_build();
+
 // Guard for the high-order rungs (32/64-QAM floor on selective or time-varying
 // channels, calibration VERDICT eesm_cfg11_17 sections 4-6).
 struct st_guard {
@@ -191,6 +203,13 @@ struct st_policy {
 	int    top_cfg;       // highest OFDM rung the link may run (WB_CONFIG_MAX = 16)
 	bool   wb_possible;   // both ends WB capable and not NB-only
 	st_guard guard;
+	// Live frame-0 acquisition floor per config (probe mean SINR, dB): the decode knee
+	// assumes a found frame; the production receiver finds frame 0 reliably only above
+	// this. A config is elected only if the band SINR lower bound also clears it.
+	// Values: acquisition_table(). MERCURY_EESM_ACQ_FLOOR=0 is a diagnostic override;
+	// detector work must update the versioned table before production disables a floor.
+	bool   use_acq_floor;
+	double acq_floor_db[kNumOfdmCfg];
 };
 st_policy default_policy();
 

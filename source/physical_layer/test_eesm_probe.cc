@@ -281,6 +281,26 @@ static void t_decide()
 {
 	std::printf("[EESM-TEST] election\n");
 	st_policy p = default_policy();
+	{
+		const st_acq_row* a = acquisition_table();
+		bool indexed = std::strcmp(acquisition_table_build(), "310fad44ff") == 0;
+		for(int c = 0; c < kNumOfdmCfg; c++)
+			indexed = indexed && a[c].cfg == c && p.acq_floor_db[c] == a[c].floor_probe_db;
+		EP_CHECK(indexed && a[0].measured && a[7].measured && a[15].measured && !a[16].measured,
+			"versioned frame-0 acquisition ladder is indexed and marks measured/extrapolated rows");
+	}
+	{
+		// acquisition floor: a config whose decode threshold is met but whose frame-0
+		// floor is not must not be elected
+		const st_cfg_row* t = cfg_table();
+		st_measurement m = flat_measurement(t[15].knee01_db + t[15].awgn_offset_db + 0.3, 1e-8);
+		st_decision d = decide(m, p);
+		const bool floor_on = p.use_acq_floor;
+		EP_CHECK(!floor_on || (d.rung < 15 && m.mean_snr_db < p.acq_floor_db[15]),
+			"acquisition floor holds cfg15 back below its frame-0 floor (rung %d, floor %.2f, snr %.2f)",
+			d.rung, p.acq_floor_db[15], m.mean_snr_db);
+	}
+	p.use_acq_floor = false;   // the remaining cases test the EESM election itself
 	const st_cfg_row* t = cfg_table();
 	const int targets[] = { 5, 10, 13, 15, 16 };
 	for(int c : targets)
