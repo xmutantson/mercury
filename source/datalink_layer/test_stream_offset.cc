@@ -36,6 +36,31 @@ static int accept_test_socket_write(const char*, int length)
 	return length;
 }
 
+static char g_reconnect_r2_control[4096];
+static int  g_reconnect_r2_control_len = 0;
+
+static void reconnect_r2_control_reset()
+{
+	g_reconnect_r2_control_len = 0;
+	g_reconnect_r2_control[0] = '\0';
+}
+
+static int reconnect_r2_control_capture(const char* buf, int length)
+{
+	for(int i=0; i<length && g_reconnect_r2_control_len<(int)sizeof(g_reconnect_r2_control)-1; i++)
+		g_reconnect_r2_control[g_reconnect_r2_control_len++] = buf[i];
+	g_reconnect_r2_control[g_reconnect_r2_control_len] = '\0';
+	return length;
+}
+
+static int reconnect_r2_control_count(const char* token)
+{
+	int count = 0;
+	const char* p = g_reconnect_r2_control;
+	while((p = strstr(p, token)) != NULL) { count++; p++; }
+	return count;
+}
+
 static void CHECK(bool cond, const char* what, long long got, long long want)
 {
 	if(cond)
@@ -731,10 +756,11 @@ int cl_arq_controller::test_stream_offset()
 
 	// ---------------------------------------------------------------------------
 	// PART W0 — APPLICATION-OWNED RESUME at prior-session delivered high-water ZERO.
-	// This is the measured fade failure shape: the commander accepted application bytes far ahead
-	// of RF confirmation, the link tore down before the responder delivered even one byte, and an
-	// implicit reconnect consumed a suffix from the still-open DATA transaction. The radio-session
-	// reset is the production teardown funnel on both peers.
+		// This reproduces the measured fade failure CLASS: the commander accepted application bytes far
+		// ahead of RF confirmation, the link tore down before the responder delivered even one byte, and
+		// an implicit reconnect consumed a suffix from the still-open DATA transaction. This synthetic
+		// suffix starts at offset 4,096; the measured MPG seed-3 head-drop started at offset 124,928.
+		// The radio-session reset is the production teardown funnel on both peers.
 	//
 	// PASS-AFTER: teardown closes the accepted DATA peer (host-visible EOF/reset), purges the
 	// commander TX/backup queues and responder RX/pending-delivery queues, and a fresh DATA
@@ -833,6 +859,143 @@ int cl_arq_controller::test_stream_offset()
 			fresh_n==64 ? (unsigned char)fresh_read[0] : -1, 0);
 		printf("[TEST-STREAM-OFFSET] Part W0 epoch_defeat=%d (0=terminal+purge, 1=old suffix survives)\n",
 			(int)epoch_defeat);
+	}
+
+	// ---------------------------------------------------------------------------
+	// PART W1 — reconnect owner-law round 2. Five production-path cases run in
+	// one binary. MERCURY_RECONNECT_R2_DEFEAT=1 restores round-1 behavior so the
+	// same cases turn red: active LISTEN ON/OFF and CONNECT retain the old DATA
+	// peer, hard reconnect omits DISCONNECTED, and a fresh sender retains bsi=2.
+	printf("[TEST-STREAM-OFFSET] Part W1 — every teardown path + fresh bsi=0 session\n");
+	{
+		bool r2_defeat = false;
+		{ const char* e = std::getenv("MERCURY_RECONNECT_R2_DEFEAT");
+		  if(e && *e && atoi(e)!=0) r2_defeat = true; }
+		int saved_control_status = tcp_socket_control.status;
+		int saved_data_status = tcp_socket_data.status;
+		int saved_max_data_length = max_data_length;
+		int saved_max_message_length = max_message_length;
+		int saved_max_header_length = max_header_length;
+		int saved_current_configuration = current_configuration;
+		int saved_data_batch_size = data_batch_size;
+		bool saved_sack_v2_enabled = sack_v2_enabled;
+		bool saved_header_carries_d5 = header_carries_d5;
+		uint64_t saved_data_peer_accept_epoch = data_peer_accept_epoch;
+		uint64_t saved_prev_data_peer_accept_epoch = rsp_prev_session_data_peer_accept_epoch;
+		int (*saved_hook)(const char*, int) = cl_tcp_socket::g_test_transmit_hook;
+		cl_tcp_socket::g_test_transmit_hook = reconnect_r2_control_capture;
+		tcp_socket_control.status = TCP_STATUS_ACCEPTED;
+
+		auto prime_active = [&]() {
+			fifo_buffer_tx.flush(); fifo_buffer_backup.flush(); fifo_buffer_rx.flush();
+			char old_bytes[8] = { 'o','l','d','-','d','a','t','a' };
+			fifo_buffer_tx.push(old_bytes, (int)sizeof(old_bytes));
+			tcp_socket_data.status = TCP_STATUS_ACCEPTED;
+			data_peer_accept_epoch++;
+			link_status = CONNECTED;
+			connection_status = TRANSMITTING_DATA;
+			begin_radio_session_attempt();
+			reconnect_r2_control_reset();
+		};
+
+		// W1.1: active LISTEN ON is a teardown; idle LISTEN ON remains a positive
+		// control that preserves an empty pre-opened DATA connection.
+		prime_active();
+		process_user_command("LISTEN ON");
+		CHECK(tcp_socket_data.get_status()!=TCP_STATUS_ACCEPTED,
+			"W1.1 active LISTEN ON closes old DATA peer", tcp_socket_data.get_status(), TCP_STATUS_LISTENING);
+		CHECK(reconnect_r2_control_count("DISCONNECTED\r")==1,
+			"W1.1 active LISTEN ON emits one DISCONNECTED", reconnect_r2_control_count("DISCONNECTED\r"), 1);
+		begin_radio_session_attempt();
+		tcp_socket_data.status = TCP_STATUS_ACCEPTED;
+		link_status = IDLE;
+		fifo_buffer_tx.flush(); fifo_buffer_backup.flush(); fifo_buffer_rx.flush();
+		reconnect_r2_control_reset();
+		process_user_command("LISTEN ON");
+		CHECK(tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED,
+			"W1.1 idle LISTEN ON preserves empty pre-opened DATA peer", tcp_socket_data.get_status(), TCP_STATUS_ACCEPTED);
+		CHECK(reconnect_r2_control_count("DISCONNECTED\r")==0,
+			"W1.1 idle LISTEN ON emits no terminal token", reconnect_r2_control_count("DISCONNECTED\r"), 0);
+
+		// W1.2: LISTEN OFF has the same active-link teardown contract.
+		prime_active();
+		process_user_command("LISTEN OFF");
+		CHECK(tcp_socket_data.get_status()!=TCP_STATUS_ACCEPTED,
+			"W1.2 active LISTEN OFF closes old DATA peer", tcp_socket_data.get_status(), TCP_STATUS_LISTENING);
+		CHECK(reconnect_r2_control_count("DISCONNECTED\r")==1,
+			"W1.2 active LISTEN OFF emits one DISCONNECTED", reconnect_r2_control_count("DISCONNECTED\r"), 1);
+
+		// W1.3: an explicit CONNECT cannot replace a live radio session on the
+		// old application's DATA transaction.
+		prime_active();
+		process_user_command("CONNECT TESTA TESTB");
+		CHECK(tcp_socket_data.get_status()!=TCP_STATUS_ACCEPTED,
+			"W1.3 active CONNECT closes old DATA peer before replacement", tcp_socket_data.get_status(), TCP_STATUS_LISTENING);
+		CHECK(reconnect_r2_control_count("DISCONNECTED\r")==1 && link_status==CONNECTING,
+			"W1.3 old DISCONNECTED emitted exactly once before new CONNECTING", reconnect_r2_control_count("DISCONNECTED\r"), 1);
+
+		// W1.4: the implicit clean-reconnect path uses the same command-token
+		// owner and therefore cannot silently jump straight to CONNECTING.
+		prime_active();
+		commander_clean_reconnect("test_reconnect_r2");
+		CHECK(reconnect_r2_control_count("DISCONNECTED\r")==1,
+			"W1.4 clean reconnect emits exactly one DISCONNECTED", reconnect_r2_control_count("DISCONNECTED\r"), 1);
+		CHECK(link_status==CONNECTING,
+			"W1.4 replacement session enters CONNECTING only after terminal token", link_status, CONNECTING);
+
+		// W1.5: reproduce the live N>0 second-session signature. The first
+		// session left the commander at bsi=2 and every ACK/routing consumer at
+		// a non-origin value. A genuine teardown must reset the complete family,
+		// making the new offset-zero write eligible at bsi=0.
+		prime_active();
+		cmd_batch_seq_id = 2;
+		cmd_last_applied_sack_bsi = 1;
+		cmd_last_applied_clean_bsi = 1;
+		cmd_sack_v2_last_rx_batch_seq_id = 1;
+		rsp_current_expected_batch_seq_id = 2;
+		rsp_prev_batch_seq_id = 1;
+		rsp_prev_batch_active = true;
+		rsp_last_delivered_batch_seq_id = 1;
+		reset_session_state();
+		CHECK(cmd_batch_seq_id==0 && rsp_current_expected_batch_seq_id==-1
+		      && rsp_last_delivered_batch_seq_id==-1,
+			"W1.5 teardown re-anchors sender and receiver at fresh bsi=0", cmd_batch_seq_id, 0);
+		CHECK(cmd_last_applied_sack_bsi==-1 && cmd_last_applied_clean_bsi==-1
+		      && cmd_sack_v2_last_rx_batch_seq_id==-1 && !rsp_prev_batch_active,
+			"W1.5 teardown clears stale ACK/routing BSI consumers", cmd_last_applied_clean_bsi, -1);
+		// The host pre-opens a replacement DATA peer before CONNECT. Its new
+		// accept epoch must not be mistaken for the old peer persisting across
+		// teardown (the live N>0 false-refusal root).
+		tcp_socket_data.status = TCP_STATUS_ACCEPTED;
+		data_peer_accept_epoch++;
+		bool first_is_gap = delivery_step_is_gap(cmd_batch_seq_id,
+			rsp_last_delivered_batch_seq_id, /*origin_gen=*/0)
+			|| rsp_data_peer_persisted_across_teardown(true);
+		CHECK(!first_is_gap,
+			"W1.5 fresh session accepts commander bsi=0 as offset-zero origin", first_is_gap ? 1 : 0, 0);
+		fifo_buffer_tx.flush();
+		char fresh_write[64];
+		for(int i=0;i<64;i++) fresh_write[i]=(char)((i*29+7)&0xff);
+		char fresh_read[64];
+		int pushed=fifo_buffer_tx.push(fresh_write,64);
+		int popped=fifo_buffer_tx.pop(fresh_read,64);
+		CHECK(pushed==64 && popped==64 && memcmp(fresh_write,fresh_read,64)==0,
+			"W1.5 new offset-zero application write survives byte-exactly", popped, 64);
+
+		printf("[TEST-STREAM-OFFSET] Part W1 r2_defeat=%d (0=all green, 1=five round-1 failures reproduced)\n",
+			(int)r2_defeat);
+		cl_tcp_socket::g_test_transmit_hook = saved_hook;
+		tcp_socket_control.status = saved_control_status;
+		tcp_socket_data.status = saved_data_status;
+		max_data_length = saved_max_data_length;
+		max_message_length = saved_max_message_length;
+		max_header_length = saved_max_header_length;
+		current_configuration = saved_current_configuration;
+		data_batch_size = saved_data_batch_size;
+		sack_v2_enabled = saved_sack_v2_enabled;
+		header_carries_d5 = saved_header_carries_d5;
+		data_peer_accept_epoch = saved_data_peer_accept_epoch;
+		rsp_prev_session_data_peer_accept_epoch = saved_prev_data_peer_accept_epoch;
 	}
 
 	// ---------------------------------------------------------------------------

@@ -1168,6 +1168,8 @@ cl_arq_controller::cl_arq_controller()
 	// on a production path.
 	rsp_prev_session_app_delivered=0;
 	rsp_cross_session_seam_armed=false;
+	data_peer_accept_epoch=0;
+	rsp_prev_session_data_peer_accept_epoch=0;
 	rsp_test_force_app_persistent=false;
 	rsp_v2_drop_count=0;
 	test_rsp_bsi_corrupt_at=0;
@@ -1532,6 +1534,7 @@ cl_arq_controller::cl_arq_controller()
 	break_probe_consec_match=0;   // fix/break-fh-gate: fresh K-of-N streak (no-op read when env off)
 	hail_detected=NO;
 	pending_emitted=false;
+	disconnected_emitted=false;
 	hail_sent=NO;
 
 	ptt_on_delay_ms=0;
@@ -9018,13 +9021,6 @@ void cl_arq_controller::update_status()
 			}
 			tcp_socket_control.transmit();
 
-			str="DISCONNECTED\r";
-			tcp_socket_control.message->length=str.length();
-			for(int i=0;i<tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
 		}
 
 		this->link_status=DROPPED;
@@ -9066,13 +9062,6 @@ void cl_arq_controller::update_status()
 			}
 			tcp_socket_control.transmit();
 
-			str="DISCONNECTED\r";
-			tcp_socket_control.message->length=str.length();
-			for(int i=0;i<tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
 		}
 
 		this->link_status=DROPPED;
@@ -9134,16 +9123,8 @@ void cl_arq_controller::update_status()
 		fifo_buffer_rx.flush();
 
 		// Notify Winlink of disconnect
-		if(!rsp_released && tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
-		{
-			std::string str="DISCONNECTED\r";
-			tcp_socket_control.message->length=str.length();
-			for(int i=0;i<(int)tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
-		}
+		if(!rsp_released)
+			emit_disconnected_once();
 
 		if(this->role==COMMANDER)
 		{
@@ -9155,6 +9136,7 @@ void cl_arq_controller::update_status()
 			// Re-save NB preference (reset_session_state cleared it)
 			commander_configured_nb = narrowband_enabled;
 			load_configuration(init_configuration, FULL, YES);
+			begin_radio_session_attempt();
 			link_status=CONNECTING;
 			connection_status=TRANSMITTING_CONTROL;
 
@@ -9754,15 +9736,15 @@ void cl_arq_controller::process_main()
 			}
 			else if(nBytes_received==0)
 			{
-				// TCP connection closed (FIN received) — flush and re-accept
-				fifo_buffer_tx.flush();
-				fifo_buffer_backup.flush();
-				fifo_buffer_rx.flush();
+				// One accepted DATA connection is one transaction. A FIN ends all
+				// of its ownership even when the radio session remains active.
+				purge_data_transaction_state("DATA TCP FIN");
 
 				tcp_socket_data.check_incomming_connection();
 
 				if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
 				{
+					data_peer_accept_epoch++;
 					tcp_socket_data.timer.start();
 				}
 			}
@@ -9775,14 +9757,13 @@ void cl_arq_controller::process_main()
 				// so recv() always returns EWOULDBLOCK. The old code treated this as
 				// a disconnect, flushing buffers and dropping the connection every
 				// 1 second. (Bug #61: responder data delivery)
-				fifo_buffer_tx.flush();
-				fifo_buffer_backup.flush();
-				fifo_buffer_rx.flush();
+				purge_data_transaction_state("DATA TCP timeout");
 
 				tcp_socket_data.check_incomming_connection();
 
 				if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
 				{
+					data_peer_accept_epoch++;
 					tcp_socket_data.timer.start();
 				}
 			}
@@ -9794,6 +9775,7 @@ void cl_arq_controller::process_main()
 		tcp_socket_data.check_incomming_connection();
 		if (tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED)
 		{
+			data_peer_accept_epoch++;
 			tcp_socket_data.timer.start();
 		}
 	}
@@ -9920,6 +9902,12 @@ void cl_arq_controller::process_main()
 	}
 }
 
+static bool reconnect_r2_fix_enabled()
+{
+	const char* e = std::getenv("MERCURY_RECONNECT_R2_DEFEAT");
+	return !(e && *e && atoi(e) != 0);
+}
+
 void cl_arq_controller::process_user_command(std::string command)
 {
 
@@ -9934,6 +9922,13 @@ void cl_arq_controller::process_user_command(std::string command)
 	}
 	else if(command.substr(0,8)=="CONNECT ")
 	{
+		bool replacing_active_session =
+			link_status==CONNECTING || link_status==NEGOTIATING ||
+			link_status==CONNECTION_ACCEPTED || link_status==CONNECTION_RECEIVED ||
+			link_status==CONNECTED || link_status==DISCONNECTING;
+		if(reconnect_r2_fix_enabled() && replacing_active_session)
+			reset_session_state();
+		begin_radio_session_attempt();
 		// An explicit CONNECT starts a new commander session even when no teardown
 		// path ran first.  Drop peer-bound PREKEY authority before changing role or
 		// starting the handshake; session B must earn both its own clean-DATA proof
@@ -9951,6 +9946,15 @@ void cl_arq_controller::process_user_command(std::string command)
 		compression_enabled = false;
 		original_role=COMMANDER;
 		set_role(COMMANDER);
+		// reset_session_state() deliberately deinitializes the session PHY. A
+		// replacement CONNECT (including one issued after LISTEN OFF) must reload
+		// the robust connect configuration before its first HAIL; otherwise the
+		// UI reports CONFIG_NONE and every beacon is transmitted from an
+		// uninitialized session configuration. The in-process command harness
+		// substitutes the TCP transmit hook and does not run an RF handshake.
+		if(reconnect_r2_fix_enabled() && current_configuration==CONFIG_NONE
+		   && cl_tcp_socket::g_test_transmit_hook==nullptr)
+			load_configuration(init_configuration, FULL, YES);
 		link_status=CONNECTING;
 		reset_all_timers();
 
@@ -10000,10 +10004,20 @@ void cl_arq_controller::process_user_command(std::string command)
 	{
 		// Abort connection attempt or active session - immediate teardown
 		if(link_status==CONNECTING || link_status==NEGOTIATING || link_status==CONNECTION_ACCEPTED
-			|| link_status==CONNECTED || link_status==DISCONNECTING)
+			|| link_status==CONNECTION_RECEIVED || link_status==CONNECTED || link_status==DISCONNECTING)
 		{
 			printf("[ABORT] Aborting session (link_status=%d)\n", link_status);
 			fflush(stdout);
+			// A pending attempt is canceled before its terminal link token. The
+			// common reset owns the exactly-once DISCONNECTED emission.
+			if(!pending_emitted)
+			{
+				std::string str="CANCELPENDING\r";
+				tcp_socket_control.message->length=str.length();
+				for(int i=0;i<tcp_socket_control.message->length;i++)
+					tcp_socket_control.message->buffer[i]=str[i];
+				tcp_socket_control.transmit();
+			}
 
 			// Immediate teardown — no CLOSE_CONNECTION negotiation
 			reset_session_state();
@@ -10022,23 +10036,7 @@ void cl_arq_controller::process_user_command(std::string command)
 			// Reset messages_control so new CONNECT commands can work
 			messages_control.status=FREE;
 
-			// Send CANCELPENDING to cancel the connection attempt
-			std::string str="CANCELPENDING\r";
-			tcp_socket_control.message->length=str.length();
-			for(int i=0;i<tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
-
-			// Send DISCONNECTED to fully clear Winlink's state and show we're free
-			str="DISCONNECTED\r";
-			tcp_socket_control.message->length=str.length();
-			for(int i=0;i<tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
+			// reset_session_state() emitted the exactly-once DISCONNECTED token.
 		}
 
 		// Send OK acknowledgement
@@ -10049,6 +10047,12 @@ void cl_arq_controller::process_user_command(std::string command)
 	}
 	else if(command=="LISTEN ON")
 	{
+		bool replacing_active_session =
+			link_status==CONNECTING || link_status==NEGOTIATING ||
+			link_status==CONNECTION_ACCEPTED || link_status==CONNECTION_RECEIVED ||
+			link_status==CONNECTED || link_status==DISCONNECTING;
+		if(reconnect_r2_fix_enabled() && replacing_active_session)
+			reset_session_state();
 		original_role=RESPONDER;
 		set_role(RESPONDER);
 		local_capability = ((bandwidth_mode == BW_AUTO) ? CAP_WB_CAPABLE : 0) | ((encryption_mode != ENCRYPT_OFF) ? CAP_ENCRYPTION : 0) | cumulative_ack_advertise_bit() | CAP_RETX_TURN_TAIL | robust_preamble_nb_advertise_bit() | l1_block::capability_advertise_bit();
@@ -10058,7 +10062,8 @@ void cl_arq_controller::process_user_command(std::string command)
 		compression_enabled = false;
 		link_status=LISTENING;
 		connection_status=RECEIVING;
-		reset_session_state();
+		if(!reconnect_r2_fix_enabled() || !replacing_active_session)
+			reset_session_state();
 		reset_all_timers();
 
 		// Load init_configuration so we can hear incoming START_CONNECTION messages
@@ -10071,6 +10076,12 @@ void cl_arq_controller::process_user_command(std::string command)
 	}
 	else if(command=="LISTEN OFF")
 	{
+		bool replacing_active_session =
+			link_status==CONNECTING || link_status==NEGOTIATING ||
+			link_status==CONNECTION_ACCEPTED || link_status==CONNECTION_RECEIVED ||
+			link_status==CONNECTED || link_status==DISCONNECTING;
+		if(reconnect_r2_fix_enabled() && replacing_active_session)
+			reset_session_state();
 		original_role=RESPONDER;
 		set_role(RESPONDER);
 		link_status=IDLE;
@@ -10445,6 +10456,7 @@ void cl_arq_controller::commander_clean_reconnect(const char* reason)
 
 	commander_configured_nb = narrowband_enabled;
 	load_configuration(init_configuration, FULL, YES);
+	begin_radio_session_attempt();
 	link_status=CONNECTING;
 	connection_status=TRANSMITTING_CONTROL;
 	turboshift_active = !rate_opt.controls_link();
@@ -10671,14 +10683,6 @@ void cl_arq_controller::abort_b2f_transfer(const char* reason)
 	printf("[B2F] FATAL: %s -- dropping transfer for clean application retry\n",
 		reason ? reason : "unspecified transform failure");
 	fflush(stdout);
-	if(tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
-	{
-		const char* disc = "DISCONNECTED\r";
-		tcp_socket_control.message->length = (int)strlen(disc);
-		memcpy(tcp_socket_control.message->buffer, disc,
-			tcp_socket_control.message->length);
-		tcp_socket_control.transmit();
-	}
 	link_status = DROPPED;
 	reset_session_state();
 	fifo_buffer_tx.flush();
@@ -10701,6 +10705,7 @@ bool cl_arq_controller::rsp_emit_pending()
 {
 	if(pending_emitted)
 		return false;
+	begin_radio_session_attempt();
 	pending_emitted = true;
 	std::string pending_str="PENDING\r";
 	tcp_socket_control.message->length=pending_str.length();
@@ -10731,10 +10736,27 @@ bool cl_arq_controller::rsp_emit_release()
 			tcp_socket_control.message->buffer[i]=cp[i];
 		tcp_socket_control.transmit();
 
-		std::string dc="DISCONNECTED\r";
-		tcp_socket_control.message->length=dc.length();
-		for(int i=0;i<(int)dc.length();i++)
-			tcp_socket_control.message->buffer[i]=dc[i];
+	}
+	emit_disconnected_once();
+	return true;
+}
+
+void cl_arq_controller::begin_radio_session_attempt()
+{
+	disconnected_emitted = false;
+}
+
+bool cl_arq_controller::emit_disconnected_once()
+{
+	if(disconnected_emitted)
+		return false;
+	disconnected_emitted = true;
+	if(tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
+	{
+		const char* dc="DISCONNECTED\r";
+		tcp_socket_control.message->length=(int)strlen(dc);
+		memcpy(tcp_socket_control.message->buffer, dc,
+			tcp_socket_control.message->length);
 		tcp_socket_control.transmit();
 	}
 	return true;
@@ -10762,13 +10784,27 @@ void cl_arq_controller::terminalize_data_transaction_on_radio_teardown()
 	// accept a replacement DATA connection on the still-open server listener.
 	tcp_socket_data.close_connection();
 
-	// Bytes in all four stores belong to the terminated transaction. This includes
-	// data accepted ahead of RF transmission, an in-flight backup image, received
-	// bytes awaiting host drain, and a short-send tail behind socket backpressure.
+	purge_data_transaction_state("radio teardown");
+	printf("[DATA-EPOCH-END] radio teardown closed DATA peer=%d; purged tx=%d backup=%d rx=%d pending=%d\n",
+		had_peer ? 1 : 0, tx_bytes, backup_bytes, rx_bytes, pending_bytes);
+	fflush(stdout);
+}
+
+void cl_arq_controller::purge_data_transaction_state(const char* reason)
+{
+	const int tx_bytes = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	const int backup_bytes = fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	const int rx_bytes = fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size();
+	const int pending_bytes = rx_deliver_pending_len;
+
+	// These stores and transforms are owned by one accepted DATA connection.
+	// Purge them as a unit so neither TCP reaccept nor radio reconnect can expose
+	// a head, suffix, encoded tail, or retransmit from the ended transaction.
 	fifo_buffer_tx.flush();
 	fifo_buffer_backup.flush();
 	fifo_buffer_rx.flush();
 	rx_deliver_pending_len = 0;
+	b2f_handler.reset();
 	for(int i=0; i<nMessages; i++)
 	{
 		if(messages_tx != NULL) messages_tx[i].status = FREE;
@@ -10777,16 +10813,53 @@ void cl_arq_controller::terminalize_data_transaction_on_radio_teardown()
 	}
 	clear_retx_queue();
 
-	printf("[DATA-EPOCH-END] radio teardown closed DATA peer=%d; purged tx=%d backup=%d rx=%d pending=%d\n",
-		had_peer ? 1 : 0, tx_bytes, backup_bytes, rx_bytes, pending_bytes);
-	fflush(stdout);
+	if(!reason || strcmp(reason, "radio teardown") != 0)
+	{
+		printf("[DATA-TRANSACTION-PURGE] reason=%s tx=%d backup=%d rx=%d pending=%d\n",
+			reason ? reason : "unspecified", tx_bytes, backup_bytes, rx_bytes, pending_bytes);
+		fflush(stdout);
+	}
+}
+
+void cl_arq_controller::reset_fresh_session_bsi_state()
+{
+	// The sender, receiver routing window, and ACK de-dup consumers are one
+	// session epoch. Reset them together so no second session can start at the
+	// old sender's bsi while the receiver has returned to its -1 origin ruler.
+	cmd_batch_seq_id = 0;
+	cmd_rxwindow_delivered_high_water = -1;
+	cmd_rxwindow_hold_timer.stop();
+	cmd_rxwindow_hold_timer.reset();
+	captured_batch_seq_id_for_retransmit = -1;
+	last_received_batch_seq_id = -1;
+	cmd_sack_v2_last_rx_batch_seq_id = -1;
+	cmd_last_applied_sack_bsi = -1;
+	cmd_last_applied_clean_bsi = -1;
+	cmd_prev_retain_count = 0;
+
+	rsp_current_expected_batch_seq_id = -1;
+	rsp_prev_batch_seq_id = -1;
+	rsp_prev_batch_active = false;
+	rsp_prev_batch_received_count = 0;
+	rsp_prev_batch_expected_count = 0;
+	rsp_prev_batch_delivered_count = 0;
+	rsp_prev_batch_stale_count = 0;
+	rsp_last_delivered_batch_seq_id = -1;
+	rx_batch_total_frames = -1;
+	last_received_end_of_batch_seq = -1;
+	decrypt_delivered_bsi = -1;
 }
 
 void cl_arq_controller::reset_session_state()
 {
-	// Leak-guard: a session boundary clears the scanner-hold latch so no stale
-	// PENDING state can trigger a spurious release in a later session.
-	pending_emitted = false;
+	bool teardown = link_status != IDLE && link_status != LISTENING;
+	// Snapshot the identity of the DATA peer owned by the ending radio session
+	// before terminalization closes it. A replacement peer accepted afterward
+	// gets a new epoch and is therefore a fresh transaction, even though its TCP
+	// status is already ACCEPTED by the time the next START arrives.
+	if(teardown)
+		rsp_prev_session_data_peer_accept_epoch =
+			tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED ? data_peer_accept_epoch : 0;
 	scream_link_timeout_grace_used = false;
 	scream_reentry_listen_armed = false;
 	scream_reentry_recovery_pending = false;
@@ -10805,8 +10878,19 @@ void cl_arq_controller::reset_session_state()
 	// other non-idle/non-listening caller is a radio attempt/session teardown
 	// (including CONNECTING failures, BREAK exhaustion, peer disconnect, clean
 	// CLOSE, and implicit commander reconnect) and owns a terminal DATA boundary.
-	if(link_status != IDLE && link_status != LISTENING)
+	if(teardown)
 		terminalize_data_transaction_on_radio_teardown();
+	// The command socket is the link-lifecycle channel. Every real teardown owns
+	// exactly one terminal token, including implicit reconnects and fatal resets.
+	// A pending inbound attempt is released in CANCELPENDING/DISCONNECTED order.
+	if(teardown && reconnect_r2_fix_enabled())
+	{
+		if(!rsp_emit_release())
+			emit_disconnected_once();
+	}
+	// Leak-guard: no scanner-hold state crosses the boundary. rsp_emit_release()
+	// already cleared it when a pending attempt existed.
+	pending_emitted = false;
 	printf("RX-OVERRUN-TOTAL n=%ld\n",
 		telecom_system->data_container.nUnder_processing_events_total.exchange(0));
 	fflush(stdout);
@@ -10843,14 +10927,19 @@ void cl_arq_controller::reset_session_state()
 	// authenticated session re-arms it at its KEY_ACTIVATE re-anchor.
 	rsp_stream_origin_gen = -1;
 	cmd_prev_retain_count  = 0;
-	// MC-4: reset to the virtual predecessor of the next wire bsi. cmd_batch_seq_id
-	// is intentionally not reset at every session boundary, so using its predecessor
-	// (rather than a hardcoded -1) represents zero outstanding batches after reset.
-	if(linkphase_rxwindow_on())
+	if(reconnect_r2_fix_enabled())
+		reset_fresh_session_bsi_state();
+	else
 	{
-		cmd_rxwindow_delivered_high_water = (cmd_batch_seq_id - 1) & 0xFF;
-		cmd_rxwindow_hold_timer.stop();
-		cmd_rxwindow_hold_timer.reset();
+		// Same-binary fail-before arm: round 1 left the sender at its prior bsi
+		// while clearing the responder ruler. Preserve that mismatch here.
+		if(linkphase_rxwindow_on())
+		{
+			cmd_rxwindow_delivered_high_water = (cmd_batch_seq_id - 1) & 0xFF;
+			cmd_rxwindow_hold_timer.stop();
+			cmd_rxwindow_hold_timer.reset();
+		}
+		rsp_last_delivered_batch_seq_id = -1;
 	}
 
 	// Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b): SNAPSHOT the
@@ -11185,14 +11274,6 @@ void cl_arq_controller::reset_session_state()
 	axis3_recent_sack_ok_count     = 0;
 	axis3_recent_sack_ok_pos       = 0;
 	axis3_batches_since_off        = 0;
-
-	// FIX-8 (data-integrity): a true session boundary (CONNECT / disconnect /
-	// role-switch — R4/R029) starts a fresh transfer, so the delivery high-water
-	// mark must be cleared. This is the ONLY production clear besides the ctor;
-	// it is deliberately NOT cleared on the BREAK reset (arq_responder.cc:474)
-	// nor the FULL load_configuration, so it SURVIVES the mid-transfer reset that
-	// produces the dropped-batch gap. See bigblock_p3_hw/_fix8/FIX8_DESIGN.md §4.2.
-	rsp_last_delivered_batch_seq_id = -1;
 
 	// R029: a session reset (FORCED_ROLE_SWITCH, disconnect, role-switch) abandons
 	// the entire in-flight TX state. The retransmit queue's frames belong to the
@@ -11535,15 +11616,7 @@ void cl_arq_controller::kx_stream_reanchor()
 	// cmd_batch_seq_id) and the receiver re-adopts (current_expected=-1). Combined with
 	// the Option-W cursor reset above and the AEAD nonce-epoch reset in the KEY_ACTIVATE
 	// handler, the post-activation data path is byte-identical to a normal session start.
-	cmd_batch_seq_id                  = 0;
-	if(linkphase_rxwindow_on())
-	{
-		cmd_rxwindow_delivered_high_water = -1;
-		cmd_rxwindow_hold_timer.stop();
-		cmd_rxwindow_hold_timer.reset();
-	}
-	rsp_current_expected_batch_seq_id = -1;
-	rsp_prev_batch_seq_id             = -1;
+	reset_fresh_session_bsi_state();
 	// Arm the authenticated stream ORIGIN generation (data-flow-rx-fadecore-
 	// adoption.md): the KX-authenticated fresh baseline places the FIRST user-data
 	// batch at wire bsi 0 on both peers (cmd_batch_seq_id=0 above), so the offset-0
@@ -11561,13 +11634,6 @@ void cl_arq_controller::kx_stream_reanchor()
 	// starts from (reset_session_state) so the post-activation data path truly matches
 	// a normal session start. The AEAD nonce epoch is reset separately in the
 	// KEY_ACTIVATE handler; the feature-gated inband-rate announce bsi is untouched.
-	captured_batch_seq_id_for_retransmit = -1;
-	last_received_batch_seq_id           = -1;
-	cmd_sack_v2_last_rx_batch_seq_id     = -1;
-	rsp_prev_batch_active                = false;
-	cmd_prev_retain_count                = 0;
-	cmd_last_applied_sack_bsi            = -1;
-	cmd_last_applied_clean_bsi           = -1;
 	printf("[CRYPTO] KX-as-data re-anchor: Option-W cursors/stamps/CRC + wire bsi + ACK-credit de-dup reset to fresh bsi=0 baseline\n");
 	fflush(stdout);
 }
@@ -18286,15 +18352,6 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 	// the link-timeout teardown DISCONNECTED surface (arq_common.cc ~6035). Guarded on an ACCEPTED
 	// control socket so the in-process test harness (no real socket) is unaffected; idempotent on
 	// an already-dropping channel.
-	if(tcp_socket_control.get_status()==TCP_STATUS_ACCEPTED)
-	{
-		std::string disc_str="DISCONNECTED\r";
-		tcp_socket_control.message->length=disc_str.length();
-		for(int di=0; di<(int)tcp_socket_control.message->length; di++)
-			tcp_socket_control.message->buffer[di]=disc_str[di];
-		tcp_socket_control.transmit();
-	}
-
 	// Clear the bsi family + in-flight prev-buffer + carve-arm so a stale prev /
 	// cur cannot misroute the next session's first frame (FIX8_AUDIT §7 R8).
 	rsp_current_expected_batch_seq_id = -1;
@@ -18396,8 +18453,8 @@ void cl_arq_controller::rsp_reconnect_seam_arm_on_accept()
 	// App DATA socket persistence: the socket the RSP drains delivered bytes into is still
 	// ACCEPTED (a client is attached across the modem reconnect). The in-process test has no real
 	// socket, so it forces this signal; no production path sets rsp_test_force_app_persistent.
-	bool app_data_persistent = (tcp_socket_data.get_status() == TCP_STATUS_ACCEPTED)
-	                           || rsp_test_force_app_persistent;
+	bool app_data_persistent = rsp_data_peer_persisted_across_teardown(
+		tcp_socket_data.get_status() == TCP_STATUS_ACCEPTED);
 
 	// Half A (lossless modem resume) is a separately-scoped project; no capability negotiates a
 	// byte-continuity proof today, so a resume is never proven and the seam is fail-closed.
@@ -18426,6 +18483,20 @@ void cl_arq_controller::rsp_reconnect_seam_arm_on_accept()
 			(unsigned long long)rsp_prev_session_app_delivered);
 		fflush(stdout);
 	}
+}
+
+bool cl_arq_controller::rsp_data_peer_persisted_across_teardown(bool app_data_attached)
+{
+	if(rsp_test_force_app_persistent)
+		return true;
+	if(!app_data_attached)
+		return false;
+	// The defeat arm reproduces the old status-only inference: any accepted
+	// socket at START was misclassified as the old persistent peer.
+	if(!reconnect_r2_fix_enabled())
+		return true;
+	return data_peer_accept_epoch != 0
+		&& data_peer_accept_epoch == rsp_prev_session_data_peer_accept_epoch;
 }
 
 void cl_arq_controller::rsp_seam_clear_on_clean_eot()

@@ -1199,6 +1199,7 @@ void cl_arq_controller::process_messages_rx_data_control()
 				{
 					printf("[MONITOR] Data frame received while LISTENING — adopting session mid-stream\n");
 					fflush(stdout);
+					begin_radio_session_attempt();
 					link_status = CONNECTED;
 					connection_status = RECEIVING;
 					compression_enabled = true;
@@ -4093,6 +4094,7 @@ void cl_arq_controller::process_control_responder()
 
 		if(passive_monitor)
 		{
+			begin_radio_session_attempt();
 			// Monitor mode: accept ANY START_CONNECTION, extract callsigns, fast-track to CONNECTED
 			int peer_flags = 0;
 			destination_call_sign = callsign_unpack(&messages_control.data[2], &peer_flags);
@@ -5406,14 +5408,7 @@ void cl_arq_controller::process_control_responder()
 			fifo_buffer_backup.flush();
 			fifo_buffer_rx.flush();
 
-			std::string str="DISCONNECTED\r";
-			tcp_socket_control.message->length=str.length();
-
-			for(int i=0;i<tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
+			emit_disconnected_once();
 		}
 		else
 		{

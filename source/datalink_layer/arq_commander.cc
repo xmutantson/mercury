@@ -3766,14 +3766,7 @@ void cl_arq_controller::process_messages_commander()
 			// Reset messages_control so new CONNECT commands can work
 			messages_control.status=FREE;
 
-			std::string str="DISCONNECTED\r";
-			tcp_socket_control.message->length=str.length();
-
-			for(int i=0;i<tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
+			emit_disconnected_once();
 		}
 	}
 
@@ -11774,11 +11767,7 @@ void cl_arq_controller::cmd_terminal_settle_converge(const char* reason)
 	messages_control.status=FREE;
 	set_role(RESPONDER);
 
-	std::string str="DISCONNECTED\r";
-	tcp_socket_control.message->length=str.length();
-	for(int i=0;i<tcp_socket_control.message->length;i++)
-		tcp_socket_control.message->buffer[i]=str[i];
-	tcp_socket_control.transmit();
+	emit_disconnected_once();
 }
 
 void cl_arq_controller::process_control_commander()
@@ -13336,14 +13325,7 @@ void cl_arq_controller::process_control_commander()
 
 			set_role(RESPONDER);
 
-			std::string str="DISCONNECTED\r";
-			tcp_socket_control.message->length=str.length();
-
-			for(int i=0;i<tcp_socket_control.message->length;i++)
-			{
-				tcp_socket_control.message->buffer[i]=str[i];
-			}
-			tcp_socket_control.transmit();
+			emit_disconnected_once();
 		}
 
 		// Bug #41: After processing any ACKed control message, free the slot so

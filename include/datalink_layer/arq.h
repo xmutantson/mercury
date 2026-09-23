@@ -1222,6 +1222,7 @@ public:
   // delivered N>0 and refuse the first byte-unprovable delivery. The test-force flag keeps the
   // established N>0 splice regression independently covered.
   void rsp_reconnect_seam_arm_on_accept();
+  bool rsp_data_peer_persisted_across_teardown(bool app_data_attached);
 
   // Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b). Called ONLY on a
   // PROVEN-CLEAN end-of-transfer (the CLOSE_CONNECTION EOT-verified branch), AFTER reset_session_
@@ -4408,8 +4409,13 @@ public:
   // VARA scanner-control release: a for-us bare PENDING that never reached
   // CONNECTED is released to a scanning host (CANCELPENDING+DISCONNECTED),
   // idempotently via the pending_emitted latch. Returns true iff a hold was
-  // outstanding (so a caller owning its own DISCONNECTED can suppress it).
+  // outstanding; the release itself owns the exactly-once DISCONNECTED token.
   bool rsp_emit_release();
+  // Host-side radio-session lifecycle. DISCONNECTED is single-owned here so
+  // every teardown reports the link end exactly once, while replacement
+  // sessions explicitly re-arm the token before entering CONNECTING/PENDING.
+  void begin_radio_session_attempt();
+  bool emit_disconnected_once();
   void process_buffer_data_responder();
   // FIX-6: non-lossy RX-delivery send (handles non-blocking-socket back-pressure
   // by stashing the unsent tail in rx_deliver_pending). Returns false when the
@@ -4520,7 +4526,11 @@ public:
   // application byte owned by that radio session is discarded. A new radio
   // session therefore requires a fresh DATA connection and fresh application
   // write; no byte accepted by the old transaction can cross the boundary.
+  void purge_data_transaction_state(const char* reason);
   void terminalize_data_transaction_on_radio_teardown();
+  // Reset every wire-BSI producer/consumer to the same origin. A fresh session
+  // must start at bsi=0 on the commander and expect bsi=0 on the responder.
+  void reset_fresh_session_bsi_state();
   void reset_session_state();
   // NB robust-preamble capability negotiation (CAP_ROBUST_PREAMBLE_NB):
   // derive the session verdict from local/peer capability bytes and push it
@@ -4911,9 +4921,14 @@ public:
   //     which REFUSES it (loud clean drop via rsp_gap_abort_teardown + DISCONNECTED) rather
   //     than splice. Disarmed at every session boundary (reset_session_state). ctor-init false.
   // The primary application-owned-resume path closes DATA and therefore never arms this guard.
+  // A monotonically increasing accept epoch distinguishes that required replacement peer from
+  // the old peer actually surviving a teardown; TCP_STATUS_ACCEPTED alone cannot distinguish
+  // them because applications normally pre-open the replacement DATA socket before CONNECT.
   // MERCURY_RECONNECT_FAILCLOSED_DEFEAT=1 keeps the defense disarmed for its fail-before arm.
   uint64_t rsp_prev_session_app_delivered;
   bool     rsp_cross_session_seam_armed;
+  uint64_t data_peer_accept_epoch;
+  uint64_t rsp_prev_session_data_peer_accept_epoch;
   // Test-only harness input (in-process --test-stream-offset has no real TCP socket): forces the
   // legacy "app DATA socket is persistent" signal so the N>0 defense remains testable after the
   // primary teardown contract closes production DATA peers. ctor-init false; never production-set.
@@ -7414,6 +7429,7 @@ public:
   bool pending_emitted;           // RSP: a bare PENDING (for-MYCALL START_CONNECTION) was
                                   // announced to the host and the session has not yet reached
                                   // CONNECTED; single-shots PENDING and gates the release
+  bool disconnected_emitted;      // exactly-once host link-end token for the current attempt/session
   int hail_sent;                  // YES if commander has sent HAIL in current CONNECTING phase
 
   int ptt_on_delay_ms;

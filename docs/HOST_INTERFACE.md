@@ -6,17 +6,19 @@ Mercury exposes two TCP sockets. The base port is the command socket and the nex
 
 One accepted DATA connection is one application transaction. Its lifetime is bounded by one radio session.
 
-Every radio-session teardown terminates that transaction, including a clean peer disconnect, link timeout, exhausted recovery, local abort, failed handshake after data was accepted, and an automatic reconnect. Mercury performs these actions before a later session may use application data:
+Every radio-session teardown terminates that transaction, including a clean peer disconnect, link timeout, exhausted recovery, local abort, failed handshake after data was accepted, an automatic reconnect, or an active-session `LISTEN ON`, `LISTEN OFF`, or replacement `CONNECT` command. Mercury performs these actions before a later session may use application data:
 
 1. Close the accepted DATA connection. The host observes EOF or a connection-reset error. Mercury keeps the DATA listening socket open.
 2. Discard application bytes queued for transmit, in-flight backup bytes, received bytes not yet delivered, and a pending short-write tail.
-3. Report the existing `DISCONNECTED` status on the command socket. A failed pending inbound or outbound attempt may report `CANCELPENDING` first.
+3. Report exactly one `DISCONNECTED` status on the command socket. A failed pending inbound or outbound attempt may report `CANCELPENDING` first. A replacement session does not enter `CONNECTING` until this link-end token has been emitted.
 
 EOF/reset on DATA is the terminal DATA signal. Mercury does not put a text event into the DATA byte stream because such an event would be indistinguishable from application content.
 
 The application owns resume. After the terminal signal, it opens a new DATA connection and writes again from an offset established by its application protocol. Mercury does not preserve or replay accepted-but-unconfirmed bytes across the radio teardown. A fresh radio session cannot deliver bytes to the old DATA connection.
 
 This rule applies even when the previous session delivered zero bytes. Keeping the old connection and later delivering a suffix is forbidden.
+
+`LISTEN ON` while already idle is initialization, not a teardown. It may preserve an empty DATA connection opened in advance for the next session. The same command received while a link or connection attempt is active first applies the teardown rule above.
 
 ## Relationship to the VARA host convention
 
@@ -26,4 +28,4 @@ Reference: [VARA Protocol Native TNC Commands, 13 February 2022](https://github.
 
 ## Opening the next transaction
 
-After DATA EOF/reset and command `DISCONNECTED`, connect a fresh DATA socket. A listener may accept that socket while Mercury is idle or reconnecting, but bytes on it belong only to the next radio session. Send a new `CONNECT` command when the application is the caller, or leave `LISTEN ON` active when it is the receiver. Do not continue writing through a socket that belonged to the ended session.
+After DATA EOF/reset and command `DISCONNECTED`, connect a fresh DATA socket. A listener may accept that socket while Mercury is idle or reconnecting, but bytes on it belong only to the next radio session. Send a new `CONNECT` command when the application is the caller, or leave `LISTEN ON` active when it is the receiver. The new session starts at Mercury's fresh wire-batch origin, so the application's new offset-zero write is eligible for delivery. Do not continue writing through a socket that belonged to the ended session.
