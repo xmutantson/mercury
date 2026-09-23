@@ -150,8 +150,9 @@ the standard broker configuration before applying the derived cap.
 
 ## Landmine preflight
 
-Before a launch review, run the mechanical gate under
-`/mnt/c/mercury_codex_stage/cohort_preflight/`. The driver emits the gate's exact
+Before a launch review, run the mechanical gate under the landmine root
+(`--landmine-root`, or `MERCURY_LANDMINE_ROOT`; default `~/mercury_stage/cohort_preflight/`).
+The driver emits the gate's exact
 experiment spec and invokes `preflight.py <spec>`. That gate queries live broker
 caps and runs the one-cell exact-recipe smoke, so it is intentionally part of
 launch preflight rather than offline package verification. Any nonzero result is

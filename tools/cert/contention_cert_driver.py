@@ -46,7 +46,8 @@ DEFAULT_SPAWNER = (
     DEFAULT_ROOT / "stage" / "harness" / "sim" / "realaudio" /
     "parallel_spawner.py"
 )
-DEFAULT_LANDMINE_ROOT = Path("/mnt/c/mercury_codex_stage/cohort_preflight")
+DEFAULT_LANDMINE_ROOT = Path(os.environ.get(
+    "MERCURY_LANDMINE_ROOT", str(Path.home() / "mercury_stage" / "cohort_preflight")))
 
 # This object is hashed into preflight and result artifacts.  Changing any value
 # creates a different contract and invalidates an earlier preflight record.
