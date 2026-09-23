@@ -35,6 +35,7 @@ namespace rro {
 namespace {
 
 thread_local int current_correlator_lane = 0;
+thread_local bool current_correlator_window_pending = false;
 
 struct MetricSpec {
     const char* name;
@@ -181,13 +182,15 @@ const char* batch_classification_state(int value) {
 } // namespace
 
 CorrelatorWindow::CorrelatorWindow(int lane)
-    : previous_lane_(current_correlator_lane) {
+    : previous_lane_(current_correlator_lane),
+      previous_pending_(current_correlator_window_pending) {
     current_correlator_lane = lane >= 1 && lane <= 2 ? lane : 0;
-    Telemetry::instance().record_correlator_window(current_correlator_lane);
+    current_correlator_window_pending = current_correlator_lane != 0;
 }
 
 CorrelatorWindow::~CorrelatorWindow() {
     current_correlator_lane = previous_lane_;
+    current_correlator_window_pending = previous_pending_;
 }
 
 Telemetry& Telemetry::instance() {
@@ -356,17 +359,23 @@ void Telemetry::record_gearshift(const GearshiftObservation& state) {
     gear_generation_.fetch_add(1);
 }
 
-void Telemetry::record_correlator_window(int lane) {
-    if (!enabled() || lane < 1 || lane > 2) return;
-    correlator_windows_[lane - 1].fetch_add(1, std::memory_order_relaxed);
-}
-
 void Telemetry::record_correlator_invocation(bool memo_enabled) {
     if (!enabled() || current_correlator_lane == 0) return;
     const int index = current_correlator_lane - 1;
+    // ACK/HAIL can be submitted from more than one processing path. Bracket
+    // the paired counters without a hot-path mutex so the sender can reject a
+    // torn interval rather than inventing a calls/window ratio.
+    correlator_writers_[index].fetch_add(1, std::memory_order_acq_rel);
+    correlator_generation_[index].fetch_add(1, std::memory_order_acq_rel);
     correlator_memo_enabled_[index].store(memo_enabled, std::memory_order_relaxed);
     correlator_invocations_[index].fetch_add(1, std::memory_order_relaxed);
-    correlator_observed_[index].store(1, std::memory_order_release);
+    if (current_correlator_window_pending) {
+        correlator_windows_[index].fetch_add(1, std::memory_order_relaxed);
+        current_correlator_window_pending = false;
+    }
+    correlator_observed_[index].store(1, std::memory_order_relaxed);
+    correlator_generation_[index].fetch_add(1, std::memory_order_release);
+    correlator_writers_[index].fetch_sub(1, std::memory_order_release);
 }
 
 void Telemetry::record_correlator_memo_reuses(std::uint64_t reuses) {
@@ -474,18 +483,32 @@ std::string Telemetry::snapshot_json() {
     bool correlator_memo[2]{};
     bool correlator_ready[2]{};
     for (int lane = 0; lane < 2; ++lane) {
-        correlator_calls[lane] = correlator_invocations_[lane].load(std::memory_order_relaxed);
-        const auto previous = correlator_snapshot_invocations_[lane].exchange(
-            correlator_calls[lane], std::memory_order_relaxed);
-        correlator_delta[lane] = correlator_calls[lane] >= previous
-            ? correlator_calls[lane] - previous : 0;
-        correlator_windows[lane] = correlator_windows_[lane].load(std::memory_order_relaxed);
+        bool coherent = false;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (correlator_writers_[lane].load(std::memory_order_acquire) != 0) continue;
+            const auto before = correlator_generation_[lane].load(std::memory_order_acquire);
+            correlator_windows[lane] = correlator_windows_[lane].load(std::memory_order_relaxed);
+            correlator_calls[lane] = correlator_invocations_[lane].load(std::memory_order_relaxed);
+            correlator_memo[lane] = correlator_memo_enabled_[lane].load(std::memory_order_relaxed);
+            const auto after = correlator_generation_[lane].load(std::memory_order_acquire);
+            if (before == after
+                && correlator_writers_[lane].load(std::memory_order_acquire) == 0) {
+                coherent = true;
+                break;
+            }
+        }
         correlator_reuses[lane] = correlator_reuses_[lane].load(std::memory_order_relaxed);
-        correlator_memo[lane] = correlator_memo_enabled_[lane].load(std::memory_order_relaxed);
-        correlator_ready[lane] = correlator_observed_[lane].load(std::memory_order_acquire) != 0
+        correlator_ready[lane] = coherent
+            && correlator_observed_[lane].load(std::memory_order_acquire) != 0
             && correlator_calls[lane] <= 9007199254740991ULL
             && correlator_windows[lane] <= correlator_calls[lane]
             && correlator_reuses[lane] <= 9007199254740991ULL;
+        if (correlator_ready[lane]) {
+            const auto previous = correlator_snapshot_invocations_[lane].exchange(
+                correlator_calls[lane], std::memory_order_relaxed);
+            correlator_delta[lane] = correlator_calls[lane] >= previous
+                ? correlator_calls[lane] - previous : 0;
+        }
     }
 
     std::ostringstream out;

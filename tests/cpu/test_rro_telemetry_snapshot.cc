@@ -124,6 +124,35 @@ int main() {
         }
     } while (writing.load());
     writer.join();
+    // A snapshot that overlaps the first detector call of a new submission
+    // must never expose its invocation without the paired window, or vice versa.
+    std::atomic<bool> correlating{true};
+    std::thread correlator([&] {
+        for (int i = 0; i < 1000; ++i) {
+            rro::CorrelatorWindow ack(1);
+            telemetry.record_correlator_invocation(true);
+            telemetry.record_correlator_invocation(true);
+            std::this_thread::yield();
+        }
+        correlating.store(false);
+    });
+    do {
+        const std::string sample = telemetry.snapshot_json();
+        auto count = [&](const char* name) -> unsigned long long {
+            const auto at = sample.find(name);
+            assert(at != std::string::npos);
+            const auto end = sample.find('}', at);
+            const auto field = sample.substr(at, end - at);
+            if (field.find("\"available\":false") != std::string::npos) return 0;
+            const auto value = field.find("\"value\":\"");
+            assert(value != std::string::npos);
+            return std::stoull(field.substr(value + 9));
+        };
+        const auto calls = count("\"correlator.ack_invocations_total\":");
+        const auto windows = count("\"correlator.ack_distinct_windows_total\":");
+        assert(windows <= calls);
+    } while (correlating.load());
+    correlator.join();
     std::this_thread::sleep_for(std::chrono::milliseconds(2100));
     const std::string stale = telemetry.snapshot_json();
     assert(stale.find("\"audio.capture_buffered_samples\":{\"available\":false")

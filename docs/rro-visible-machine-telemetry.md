@@ -74,7 +74,9 @@ path are not counted as reuses. `memo_enabled` reports the detector's effective
 configuration (environment setting or test override), even when a particular
 repetition-combining invocation cannot use the cache. Cumulative counts remain
 available across idle intervals, while the interval delta correctly falls to
-zero. These fields do not measure FFT execution time, queue depth, or signal
+zero. The source snapshots submission and invocation counters as one stable
+observation, so an in-flight first call cannot fabricate a calls/window spike.
+These fields do not measure FFT execution time, queue depth, or signal
 match quality.
 
 All 43 existing wire fields being sourced is not full visible-machine coverage.

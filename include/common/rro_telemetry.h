@@ -21,6 +21,7 @@ public:
     CorrelatorWindow& operator=(const CorrelatorWindow&) = delete;
 private:
     int previous_lane_;
+    bool previous_pending_;
 };
 
 struct GearshiftObservation {
@@ -67,7 +68,6 @@ public:
     void record_ldpc_iterations(int iterations);
     void record_crc_result(bool passed);
     void record_gearshift(const GearshiftObservation& observation);
-    void record_correlator_window(int lane);
     void record_correlator_invocation(bool memo_enabled);
     void record_correlator_memo_reuses(std::uint64_t reuses);
 
@@ -135,6 +135,8 @@ private:
     std::atomic<std::uint64_t> correlator_reuses_[2]{};
     std::atomic<bool> correlator_memo_enabled_[2]{};
     std::atomic<std::uint64_t> correlator_observed_[2]{};
+    std::atomic<std::uint64_t> correlator_generation_[2]{};
+    std::atomic<unsigned int> correlator_writers_[2]{};
     std::atomic<std::uint64_t> correlator_snapshot_invocations_[2]{};
     std::atomic<std::uint64_t> sequence_{0};
     std::string session_id_;
