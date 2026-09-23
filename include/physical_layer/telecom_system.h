@@ -331,7 +331,7 @@ public:
 	                                      int* out_prefix_matched = nullptr,
 	                                      int* out_full_matched = nullptr,
 	                                      double* out_full_metric = nullptr);
-	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid);  // RX: detect ACK + decode SNR
+	float detect_ack_snr_from_passband(double* data, int size, int* out_matched, bool* out_snr_valid, double* out_metric = nullptr);  // RX: detect ACK + decode SNR; out_metric = base-pattern detection metric
 	// RX: detect ACK pattern and decode the 40-bit ACK+SACK suffix (WB M>=16
 	// only). Runs detector + ofdm.decode_suffix_tones + unpack in one call —
 	// also useful as a unit-test entry point. Returns true on clean decode

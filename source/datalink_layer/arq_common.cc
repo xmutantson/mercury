@@ -21683,6 +21683,74 @@ bool cl_arq_controller::mw_find_ack_sack_phase(int rwi, int tail_offset,
 #endif
 }
 
+// Control-ACK accept gate: the ONE decision every commander control-ACK wait uses
+// (process_messages_rx_acks_control, both the plain and the SNR-suffix branch of
+// receive_ack_pattern, and the BREAK-ACK poll). The responder answers each of these
+// with the bare, content-free M-ary ACK tone pattern: there is no CRC behind the
+// accept, so the accept is a pure detection test and its false-alarm rate is set
+// here and nowhere else.
+//   matched  = pattern symbols whose peak bin is the expected tone (or its mirror);
+//   metric   = sum over matched symbols of target-tone energy / in-band energy;
+//   conc     = metric / matched (per-symbol energy concentration, 0..1).
+// Three regimes:
+//   data wait (control_ack_strict=false): matched >= ack_match_threshold and
+//     metric >= ack_metric_threshold (0.5) on the plain branch; matched alone on the
+//     SNR-suffix branch (unchanged).
+//   control wait, gate enabled (default): matched >= ack_match_threshold and
+//     conc >= ack_mfsk.ack_conc_floor, the per-geometry floor derived in
+//     cl_mfsk::ack_conc_floor_for (noise-only false-accept budget per poll = the
+//     pattern-length binomial the match threshold was designed to). No separate
+//     summed-metric floor: metric >= matched * conc_floor is implied.
+//   control wait, MERCURY_CTRL_ACK_STRICT=0: the previous behaviour. Only CLOSE
+//     reaches here strict; it keeps the previous CLOSE gate (metric >= 1.2 and
+//     conc >= 0.35); the SNR-suffix branch stays matched-only.
+// A held poll is not a failure: the wait keeps polling until receiving_timeout
+// (a real tone that is still arriving clears the gate on a later poll), and a
+// timed-out wait takes the normal control resend path.
+bool cl_arq_controller::control_ack_gate(int matched, double metric,
+                                         bool control_ack_strict, bool suffix_branch)
+{
+#ifdef CTRL_ACK_FLOOR_FAILBEFORE
+	control_ack_strict = false;   // defeat build: previous data floor on every wait
+#endif
+	const cl_mfsk& am = telecom_system->ack_mfsk;
+	const bool pattern = (matched >= am.ack_match_threshold);
+	const double conc = (matched > 0) ? metric / (double)matched : 0.0;
+	const bool derived = control_ack_strict && ctrl_ack_strict_enabled();
+	bool accept;
+	bool prior_accept;   // what the previous gate would have decided on this poll
+	if(suffix_branch)
+		prior_accept = pattern;
+	else if(control_ack_strict)
+		prior_accept = pattern && metric >= (double)cl_mfsk::CTRL_DETECT_METRIC_MIN
+		               && conc >= CTRL_ACK_LEGACY_CLOSE_CONC_MIN;
+	else
+		prior_accept = pattern && metric >= ack_metric_threshold;
+	if(derived)
+		accept = pattern && conc >= am.ack_conc_floor;
+	else if(control_ack_strict && !suffix_branch)
+		accept = prior_accept;                              // previous CLOSE gate
+	else if(suffix_branch)
+		accept = pattern;
+	else
+		accept = pattern && metric >= ack_metric_threshold;
+	// Witness: a poll the data floor (or the matched-only suffix branch) would
+	// have accepted and the control gate holds.
+	const bool data_floor_accept = suffix_branch ? pattern
+		: (pattern && metric >= ack_metric_threshold);
+	if(control_ack_strict && data_floor_accept && !accept)
+	{
+		printf("[CTRL-ACK-STRICT] reject matched=%d metric=%.2f conc=%.3f floor=%.3f "
+			"path=%s code=%d prior=%d\n",
+			matched, metric, conc, derived ? am.ack_conc_floor : CTRL_ACK_LEGACY_CLOSE_CONC_MIN,
+			suffix_branch ? "suffix" : (emergency_break_active ? "break" : "plain"),
+			(messages_control.data != NULL) ? (int)(unsigned char)messages_control.data[0] : -1,
+			prior_accept ? 1 : 0);
+		fflush(stdout);
+	}
+	return accept;
+}
+
 bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
                                             bool multiwindow_scan,
                                             int causal_ring_samples,
@@ -22081,11 +22149,19 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			// When ACK is found but suffix is unreadable, defer and keep
 			// polling until the suffix arrives (up to 500ms timeout).
 			bool snr_valid = false;
+			double suffix_metric = 0.0;
 			float decoded_snr = telecom_system->detect_ack_snr_from_passband(
 				telecom_system->data_container.ready_to_process_passband_delayed_data,
-				tail_samples, &matched_count, &snr_valid);
+				tail_samples, &matched_count, &snr_valid, &suffix_metric);
+			if(matched_count > ack_diag_peak_matched) ack_diag_peak_matched = matched_count;
+			if(suffix_metric > ack_diag_peak_metric) ack_diag_peak_metric = suffix_metric;
 
-			if(matched_count >= telecom_system->ack_mfsk.ack_match_threshold)
+			// Same control-ACK gate as the plain branch (control_ack_gate). Both
+			// accepts below (suffix decoded, and the 500 ms suffix-timeout accept)
+			// and the suffix-wait timer start require it, so a noise poll can
+			// neither accept nor arm the timeout that a later noise poll completes.
+			if(control_ack_gate(matched_count, suffix_metric, control_ack_strict,
+			                    /*suffix_branch=*/true))
 			{
 				// Step 15: legacy MFSK SACK-before-ACK guard removed —
 				// OFDM SACK_RSP cannot false-trigger the MFSK ACK correlator
@@ -22235,47 +22311,17 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			if(metric > ack_diag_peak_metric) ack_diag_peak_metric = metric;
 			ack_diag_poll_count++;
 
-			// Base accept: For WB M=16, matched>=8/16 has P(false)~5.6e-5/pos.
-			// Random noise has metric≈8/Nc=0.16 at 8 matches. metric>=0.5 rejects
-			// noise while accepting marginal signals (was 3.0, caused ~50% timeouts).
-			// Phase-2: --ack-metric-threshold=F overrides.
-			// Control-ACK acceptance hardening (cross-layer control-ACK audit):
-			// a CLOSE/control reverse-ACK is a bare content-free MFSK base tone, so
-			// the only content-free discriminator between a real (even weak) control
-			// tone burst and a pure-noise correlation is the in-band energy
-			// concentration. The control-ACK accept previously used the lax DATA-ACK
-			// metric floor (ack_metric_threshold, 0.5); every other control-frame
-			// detector (detect_ack_snr_from_passband, decode_ctrl_suffix_from_passband,
-			// the CONNECT path) uses the control floor CTRL_DETECT_METRIC_MIN. When
-			// control_ack_strict is set (the CLOSE control-ACK wait only), apply the
-			// control-detection floor so a low-energy noise correlation cannot be
-			// promoted to an ACKed CLOSE and complete a spurious teardown. Default-false
-			// for every data/BREAK/HAIL/turbo/non-CLOSE caller -> byte-identical.
-			// Second, anti-forge condition (control_ack_strict only): the PER-SYMBOL
-			// in-band energy concentration (metric / matched) must also clear
-			// CTRL_ACK_CONCENTRATION_MIN. The summed-metric floor alone can be cleared by
-			// noise that accumulates many low-concentration matched symbols (measured: a
-			// small tail of pure-WGN windows reaches summed metric >= the control floor via
-			// matched COUNT, not tone energy). A real tone burst concentrates its energy in
-			// the expected tones (concentration ~1.0); white noise spreads it across all
-			// bins (~0.1), so noise cannot forge BOTH the summed floor AND the concentration.
-			// All non-control callers skip this (byte-identical).
-			const double CTRL_ACK_CONCENTRATION_MIN = 0.35;
-#ifdef CTRL_ACK_FLOOR_FAILBEFORE
-			const double ctrl_ack_metric_floor = ack_metric_threshold;
-			const bool   ctrl_ack_concentration_ok = true;   // defeat: pre-fix, no concentration gate
-#else
-			const double ctrl_ack_metric_floor = control_ack_strict
-				? (double)cl_mfsk::CTRL_DETECT_METRIC_MIN
-				: ack_metric_threshold;
-			const bool   ctrl_ack_concentration_ok =
-				(!control_ack_strict)
-				|| (matched_count > 0
-				    && (metric / (double)matched_count) >= CTRL_ACK_CONCENTRATION_MIN);
-#endif
-			bool base_accept = (matched_count >= telecom_system->ack_mfsk.ack_match_threshold
-			                    && metric >= ctrl_ack_metric_floor
-			                    && ctrl_ack_concentration_ok);
+			// Data-ACK accept: matched >= ack_match_threshold and metric >= 0.5
+			// (--ack-metric-threshold overrides). The binomial per-position estimate
+			// behind the match threshold does not hold per poll: the search over start
+			// positions and sub-symbol offsets lets pure WGN reach matched >= 7/16 in
+			// 16.6% of WB polls, nearly all above metric 0.5 (measure_ctrl_ack_gate).
+			// Data ACKs on WB are content-gated downstream (CRC); the bare control ACK is
+			// not, so control waits use the concentration gate in control_ack_gate().
+			// Control-ACK waits (control_ack_strict) take the derived control gate;
+			// data waits keep the data floor. See control_ack_gate().
+			bool base_accept = control_ack_gate(matched_count, metric,
+				control_ack_strict, /*suffix_branch=*/false);
 			// recovery-ack-capture LEVER 2 RELAXED accept (data-flow-recovery-ack-
 			// capture.md §6): when the fine pass is engaged on the recovery control-ACK
 			// poll, the weak 7/16 + 0.5 base bar is NOT enough (the ~311 sub-window MAX
