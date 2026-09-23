@@ -291,6 +291,9 @@ static void t_decide()
 			indexed = indexed && a[c].cfg == c && p.acq_floor_db[c] == a[c].floor_probe_db;
 		EP_CHECK(indexed && a[0].measured && a[7].measured && a[15].measured && !a[16].measured,
 			"versioned frame-0 acquisition ladder is indexed and marks measured/extrapolated rows");
+		EP_CHECK(std::fabs(a[0].floor_probe_db - 12.39) < 1e-12 &&
+			std::fabs(a[15].floor_probe_db - 20.39) < 1e-12,
+			"receiver snr3k floors include the measured +6.39 dB probe-axis conversion");
 	}
 	{
 		// acquisition floor: a config whose decode threshold is met but whose frame-0

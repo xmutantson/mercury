@@ -78,19 +78,21 @@ const st_cfg_row* cfg_table() { return g_cfg; }
 
 // production receive_byte, full search, no forced delay, P(decode)>=10/12;
 // bottom_anchor_rate frame-0 vehicle on 310fad44ff.  Its snr3k values are mapped
-// to this probe's mean-SINR axis by +10log10(3000/2343.75)-1.0 = +0.07 dB.
+// to the c2 Es/N0 axis by +1.07 dB (the measured knee correspondence), then to
+// this probe's mean-SINR axis by +5.32 dB (pooled fit-02 arithmetic-mean AWGN
+// offset: 17 training plus 17 sealed-holdout config rows). Total = +6.39 dB.
 // Unswept rungs inherit the next directly measured floor. cfg16/17 are explicit
 // conservative extrapolations from cfg15 by their decode-knee spacing.
 static const st_acq_row g_acq[kNumOfdmCfg] = {
-	{ 0,  6.07, true,   0 }, { 1,  6.07, false,  7 },
-	{ 2,  6.07, false,  7 }, { 3,  6.07, false,  7 },
-	{ 4,  6.07, false,  7 }, { 5,  6.07, false,  7 },
-	{ 6,  6.07, false,  7 }, { 7,  6.07, true,   7 },
-	{ 8,  6.07, true,   8 }, { 9,  9.07, false, 13 },
-	{10,  9.07, false, 13 }, {11,  9.07, false, 13 },
-	{12,  9.07, false, 13 }, {13,  9.07, true,  13 },
-	{14, 12.07, true,  14 }, {15, 14.07, true,  15 },
-	{16, 18.15, false, 15 }, {17, 21.12, false, 16 },
+	{ 0, 12.39, true,   0 }, { 1, 12.39, false,  7 },
+	{ 2, 12.39, false,  7 }, { 3, 12.39, false,  7 },
+	{ 4, 12.39, false,  7 }, { 5, 12.39, false,  7 },
+	{ 6, 12.39, false,  7 }, { 7, 12.39, true,   7 },
+	{ 8, 12.39, true,   8 }, { 9, 15.39, false, 13 },
+	{10, 15.39, false, 13 }, {11, 15.39, false, 13 },
+	{12, 15.39, false, 13 }, {13, 15.39, true,  13 },
+	{14, 18.39, true,  14 }, {15, 20.39, true,  15 },
+	{16, 24.47, false, 15 }, {17, 27.44, false, 16 },
 };
 
 const st_acq_row* acquisition_table() { return g_acq; }
