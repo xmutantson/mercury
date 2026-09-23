@@ -1,6 +1,7 @@
 #include "common/rro_telemetry.h"
 
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -39,6 +40,10 @@ int main() {
            != std::string::npos);
     assert(after.find("\"decode.crc_ok\":{\"available\":true")
            != std::string::npos);
+    assert(after.find("\"decode.frames_total\":{\"available\":true,\"quality\":\"measured\",\"type\":\"counter\",\"unit\":\"frame\",\"value\":\"1\"")
+           != std::string::npos);
+    assert(after.find("\"decode.frames_failed\":{\"available\":true,\"quality\":\"measured\",\"type\":\"counter\",\"unit\":\"frame\",\"value\":\"1\"")
+           != std::string::npos);
     assert(after.find("\"gearshift.lifecycle\":{\"available\":true")
            != std::string::npos);
     assert(after.find("\"gearshift.break_count_total\":{\"available\":true")
@@ -50,6 +55,34 @@ int main() {
     assert(after.find("\"decode.ldpc_max_iterations\":{\"available\":true")
            != std::string::npos);
     std::cout << before << '\n' << after << '\n';
+    // The sender must never splice one controller update's configuration onto
+    // another update's streak, even while source and snapshot race.
+    std::atomic<bool> writing{true};
+    std::thread writer([&] {
+        for (int i = 0; i < 10000; ++i) {
+            const bool first = (i & 1) == 0;
+            telemetry.record_gearshift({2, 2, 0, first ? 16 : 5, 15, 16,
+                first ? 3 : 8, true, 1400, true, false, 2});
+            std::this_thread::yield();
+        }
+        writing.store(false);
+    });
+    do {
+        const std::string sample = telemetry.snapshot_json();
+        const auto config_at = sample.find("\"gearshift.current_config\":");
+        const auto streak_at = sample.find("\"gearshift.clean_streak\":");
+        assert(config_at != std::string::npos && streak_at != std::string::npos);
+        const auto config = sample.substr(config_at, sample.find('}', config_at) - config_at);
+        const auto streak = sample.substr(streak_at, sample.find('}', streak_at) - streak_at);
+        if (config.find("\"available\":true") != std::string::npos) {
+            const bool first = config.find("\"value\":\"CONFIG_16\"") != std::string::npos;
+            const bool second = config.find("\"value\":\"CONFIG_5\"") != std::string::npos;
+            assert(first || second);
+            assert(streak.find(first ? "\"value\":3" : "\"value\":8")
+                   != std::string::npos);
+        }
+    } while (writing.load());
+    writer.join();
     std::this_thread::sleep_for(std::chrono::milliseconds(2100));
     const std::string stale = telemetry.snapshot_json();
     assert(stale.find("\"audio.capture_buffered_samples\":{\"available\":false")
@@ -57,6 +90,8 @@ int main() {
     assert(stale.find("\"audio.processing_load_ratio\":{\"available\":false")
            != std::string::npos);
     assert(stale.find("\"ofdm.fft_size\":{\"available\":false")
+           != std::string::npos);
+    assert(stale.find("\"decode.frames_total\":{\"available\":true")
            != std::string::npos);
     std::cout << stale << '\n';
     telemetry.stop();

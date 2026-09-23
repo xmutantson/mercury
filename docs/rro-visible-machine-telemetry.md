@@ -8,14 +8,23 @@ Serialization and UDP I/O run on a dedicated thread. The receive and ARQ paths
 only publish bounded atomic observations.
 
 The v1 envelope always includes all 43 established RRO metrics so an absent
-measurement cannot silently become zero. This patch sources 20: capture-buffer
+measurement cannot silently become zero. This patch sources 22: capture-buffer
 occupancy/fill, processing load, OFDM candidate admission, configured FFT size,
-LDPC iteration count and limit, an actually evaluated CRC result, and twelve
-Gearshift controller states. The remaining 23 report `not_instrumented`.
+LDPC iteration count and limit, an actually evaluated CRC result, two lifetime
+CRC check/reject counters, and twelve Gearshift controller states. The remaining
+21 report `not_instrumented`.
 Source-backed event-like values expire to `inactive` after two seconds without
 a new source write. This distinguishes an idle or stopped receive path from a
 fresh measured zero. The receiver separately handles transport staleness and
 disconnection.
+
+The CRC counters increment only when the outer CRC was actually evaluated;
+they are not a count of all receive attempts or a recent fault rate. They stay
+available after the receive path becomes idle because they are lifetime counts
+for this modem process. The paired FFT-size/LDPC-limit publication and the
+multi-field Gearshift publication are read coherently by the sender; the
+Gearshift check is bounded and emits `inactive` for a collided sample rather
+than mixing controller moments.
 
 The Gearshift snapshot is taken from `cl_arq_controller::process_main()` on
 the controller's own thread at most eight times per second. Backoff remaining

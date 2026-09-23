@@ -64,15 +64,21 @@ private:
     // One atomic pair makes occupancy and its derived fraction one observation.
     std::atomic<std::uint64_t> ring_used_capacity_{0};
     std::atomic<std::uint64_t> ring_sample_ns_{0};
-    std::atomic<int> fft_size_{0};
-    std::atomic<int> ldpc_iteration_limit_{0};
+    // Both configured values are observed together by the receive path.
+    std::atomic<std::uint64_t> receive_configuration_{0};
     std::atomic<std::uint64_t> configuration_sample_ns_{0};
     std::atomic<bool> candidate_admitted_{false};
     std::atomic<std::uint64_t> candidate_sample_ns_{0};
     std::atomic<int> ldpc_iterations_{0};
     std::atomic<std::uint64_t> ldpc_sample_ns_{0};
-    std::atomic<bool> crc_passed_{false};
-    std::atomic<std::uint64_t> crc_sample_ns_{0};
+    // One word pairs the verdict with its timestamp even if both receive loops
+    // publish concurrently; low bit is pass, upper bits monotonic nanoseconds.
+    std::atomic<std::uint64_t> crc_verdict_sample_{0};
+    std::atomic<std::uint64_t> crc_frames_total_{0};
+    std::atomic<std::uint64_t> crc_frames_failed_{0};
+    // One controller writer, one sender reader. A bounded version check keeps
+    // the twelve related controller values in one observation without locks.
+    std::atomic<std::uint64_t> gear_generation_{0};
     std::atomic<int> gear_lifecycle_{0};
     std::atomic<int> gear_activity_{0};
     std::atomic<int> gear_role_{0};

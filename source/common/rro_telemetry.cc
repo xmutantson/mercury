@@ -234,8 +234,10 @@ void Telemetry::record_receive_configuration(int fft_size, int ldpc_iteration_li
         configuration_sample_ns_.store(0, std::memory_order_release);
         return;
     }
-    fft_size_.store(fft_size, std::memory_order_relaxed);
-    ldpc_iteration_limit_.store(ldpc_iteration_limit, std::memory_order_relaxed);
+    const std::uint64_t pair =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(fft_size)) << 32)
+        | static_cast<std::uint32_t>(ldpc_iteration_limit);
+    receive_configuration_.store(pair, std::memory_order_relaxed);
     configuration_sample_ns_.store(monotonic_ns(), std::memory_order_release);
 }
 
@@ -254,8 +256,12 @@ void Telemetry::record_ldpc_iterations(int iterations) {
 
 void Telemetry::record_crc_result(bool passed) {
     if (!enabled()) return;
-    crc_passed_.store(passed, std::memory_order_relaxed);
-    crc_sample_ns_.store(monotonic_ns(), std::memory_order_release);
+    // The two receive loops can publish concurrently. The cumulative counts
+    // are atomic; there is no lock, allocation or serialization on either path.
+    crc_frames_total_.fetch_add(1);
+    if (!passed) crc_frames_failed_.fetch_add(1);
+    crc_verdict_sample_.store((monotonic_ns() << 1) | (passed ? 1u : 0u),
+                              std::memory_order_release);
 }
 
 void Telemetry::record_gearshift(const GearshiftObservation& state) {
@@ -265,19 +271,23 @@ void Telemetry::record_gearshift(const GearshiftObservation& state) {
         gear_sample_ns_.store(0, std::memory_order_release);
         return;
     }
-    gear_lifecycle_.store(state.lifecycle, std::memory_order_relaxed);
-    gear_activity_.store(state.activity, std::memory_order_relaxed);
-    gear_role_.store(state.role, std::memory_order_relaxed);
-    gear_current_config_.store(state.current_config, std::memory_order_relaxed);
-    gear_anchor_config_.store(state.anchor_config, std::memory_order_relaxed);
-    gear_ceiling_config_.store(state.ceiling_config, std::memory_order_relaxed);
-    gear_clean_streak_.store(state.clean_streak, std::memory_order_relaxed);
-    gear_backoff_active_.store(state.backoff_active, std::memory_order_relaxed);
-    gear_backoff_remaining_ms_.store(state.backoff_remaining_ms, std::memory_order_relaxed);
-    gear_optimizer_enabled_.store(state.optimizer_enabled, std::memory_order_relaxed);
-    gear_break_active_.store(state.break_active, std::memory_order_relaxed);
-    gear_break_count_total_.store(state.break_count_total, std::memory_order_relaxed);
-    gear_sample_ns_.store(monotonic_ns(), std::memory_order_release);
+    // A single controller thread writes these fields. The sequence bracket is
+    // intentionally seq_cst: the sender accepts only a fully stable reading.
+    gear_generation_.fetch_add(1);
+    gear_lifecycle_.store(state.lifecycle);
+    gear_activity_.store(state.activity);
+    gear_role_.store(state.role);
+    gear_current_config_.store(state.current_config);
+    gear_anchor_config_.store(state.anchor_config);
+    gear_ceiling_config_.store(state.ceiling_config);
+    gear_clean_streak_.store(state.clean_streak);
+    gear_backoff_active_.store(state.backoff_active);
+    gear_backoff_remaining_ms_.store(state.backoff_remaining_ms);
+    gear_optimizer_enabled_.store(state.optimizer_enabled);
+    gear_break_active_.store(state.break_active);
+    gear_break_count_total_.store(state.break_count_total);
+    gear_sample_ns_.store(monotonic_ns());
+    gear_generation_.fetch_add(1);
 }
 
 std::string Telemetry::snapshot_json() {
@@ -301,19 +311,50 @@ std::string Telemetry::snapshot_json() {
     const bool candidate_ready = candidate_sample_ns != 0
         && now_ns >= candidate_sample_ns
         && now_ns - candidate_sample_ns <= kMetricFreshnessNs;
-    const int fft_size = fft_size_.load(std::memory_order_relaxed);
-    const int ldpc_limit = ldpc_iteration_limit_.load(std::memory_order_relaxed);
+    const std::uint64_t configuration = receive_configuration_.load(std::memory_order_relaxed);
+    const int fft_size = static_cast<int>(configuration >> 32);
+    const int ldpc_limit = static_cast<int>(configuration & 0xffffffffu);
     const bool candidate_admitted = candidate_admitted_.load(std::memory_order_relaxed);
     const auto ldpc_sample_ns = ldpc_sample_ns_.load(std::memory_order_acquire);
     const bool ldpc_ready = ldpc_sample_ns != 0 && now_ns >= ldpc_sample_ns
         && now_ns - ldpc_sample_ns <= kMetricFreshnessNs;
-    const auto crc_sample_ns = crc_sample_ns_.load(std::memory_order_acquire);
-    const bool crc_ready = crc_sample_ns != 0 && now_ns >= crc_sample_ns
-        && now_ns - crc_sample_ns <= kMetricFreshnessNs;
     const int ldpc_iterations = ldpc_iterations_.load(std::memory_order_relaxed);
-    const bool crc_passed = crc_passed_.load(std::memory_order_relaxed);
-    const auto gear_sample_ns = gear_sample_ns_.load(std::memory_order_acquire);
-    const bool gear_ready = gear_sample_ns != 0 && now_ns >= gear_sample_ns
+    const auto crc_sample = crc_verdict_sample_.load(std::memory_order_acquire);
+    const auto crc_sample_ns = crc_sample >> 1;
+    // Read failed before total. Writers advance total first, so the strict
+    // receiver never sees more failed checks than total checks.
+    const auto crc_failed = crc_frames_failed_.load();
+    const auto crc_total = crc_frames_total_.load();
+    const bool crc_passed = (crc_sample & 1u) != 0;
+    const bool crc_ready = crc_sample_ns != 0
+        && now_ns >= crc_sample_ns && now_ns - crc_sample_ns <= kMetricFreshnessNs;
+    const bool crc_counts_ready = crc_sample_ns != 0
+        && crc_total <= 9007199254740991ULL;
+    GearshiftObservation gear{};
+    std::uint64_t gear_sample_ns = 0;
+    bool gear_coherent = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = gear_generation_.load();
+        if (before & 1u) continue;
+        gear.lifecycle = gear_lifecycle_.load();
+        gear.activity = gear_activity_.load();
+        gear.role = gear_role_.load();
+        gear.current_config = gear_current_config_.load();
+        gear.anchor_config = gear_anchor_config_.load();
+        gear.ceiling_config = gear_ceiling_config_.load();
+        gear.clean_streak = gear_clean_streak_.load();
+        gear.backoff_active = gear_backoff_active_.load();
+        gear.backoff_remaining_ms = gear_backoff_remaining_ms_.load();
+        gear.optimizer_enabled = gear_optimizer_enabled_.load();
+        gear.break_active = gear_break_active_.load();
+        gear.break_count_total = gear_break_count_total_.load();
+        gear_sample_ns = gear_sample_ns_.load();
+        if (gear_generation_.load() == before) {
+            gear_coherent = true;
+            break;
+        }
+    }
+    const bool gear_ready = gear_coherent && gear_sample_ns != 0 && now_ns >= gear_sample_ns
         && now_ns - gear_sample_ns <= kMetricFreshnessNs;
 
     std::ostringstream out;
@@ -336,11 +377,12 @@ std::string Telemetry::snapshot_json() {
             || (i == 12 && ldpc_ready)
             || (i == 13 && configuration_ready)
             || (i == 14 && crc_ready)
+            || ((i == 15 || i == 16) && crc_counts_ready)
             || (i >= 27 && gear_ready && i != 31 && i != 34 && i != 36 && i != 40);
         if (!available) {
             out << "false,\"quality\":\"unavailable\",\"type\":\"" << spec.type
                 << "\",\"unit\":\"" << spec.unit << "\",\"reason\":\""
-                << ((i <= 3 || i == 7 || (i >= 12 && i <= 14)
+                << ((i <= 3 || i == 7 || (i >= 12 && i <= 16)
                     || (i >= 27 && i != 31 && i != 34 && i != 36 && i != 40))
                     ? "inactive" : "not_instrumented") << "\"}";
             continue;
@@ -354,18 +396,20 @@ std::string Telemetry::snapshot_json() {
         else if (i == 7) out << fft_size;
         else if (i == 12) out << ldpc_iterations;
         else if (i == 14) out << (crc_passed ? "true" : "false");
-        else if (i == 27) out << '\"' << lifecycle_state(gear_lifecycle_.load()) << '\"';
-        else if (i == 28) out << '\"' << activity_state(gear_activity_.load()) << '\"';
-        else if (i == 29) out << '\"' << role_state(gear_role_.load()) << '\"';
-        else if (i == 30) out << '\"' << config_state(gear_current_config_.load()) << '\"';
-        else if (i == 32) out << '\"' << config_state(gear_anchor_config_.load()) << '\"';
-        else if (i == 33) out << '\"' << config_state(gear_ceiling_config_.load()) << '\"';
-        else if (i == 35) out << gear_clean_streak_.load();
-        else if (i == 37) out << (gear_backoff_active_.load() ? "true" : "false");
-        else if (i == 38) out << gear_backoff_remaining_ms_.load();
-        else if (i == 39) out << (gear_optimizer_enabled_.load() ? "true" : "false");
-        else if (i == 41) out << (gear_break_active_.load() ? "true" : "false");
-        else if (i == 42) out << '\"' << gear_break_count_total_.load() << '\"';
+        else if (i == 15) out << '\"' << crc_total << '\"';
+        else if (i == 16) out << '\"' << crc_failed << '\"';
+        else if (i == 27) out << '\"' << lifecycle_state(gear.lifecycle) << '\"';
+        else if (i == 28) out << '\"' << activity_state(gear.activity) << '\"';
+        else if (i == 29) out << '\"' << role_state(gear.role) << '\"';
+        else if (i == 30) out << '\"' << config_state(gear.current_config) << '\"';
+        else if (i == 32) out << '\"' << config_state(gear.anchor_config) << '\"';
+        else if (i == 33) out << '\"' << config_state(gear.ceiling_config) << '\"';
+        else if (i == 35) out << gear.clean_streak;
+        else if (i == 37) out << (gear.backoff_active ? "true" : "false");
+        else if (i == 38) out << gear.backoff_remaining_ms;
+        else if (i == 39) out << (gear.optimizer_enabled ? "true" : "false");
+        else if (i == 41) out << (gear.break_active ? "true" : "false");
+        else if (i == 42) out << '\"' << gear.break_count_total << '\"';
         else out << ldpc_limit;
         out << '}';
     }
