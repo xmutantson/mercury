@@ -281,6 +281,9 @@ static void t_decide()
 {
 	std::printf("[EESM-TEST] election\n");
 	st_policy p = default_policy();
+	EP_CHECK(std::fabs(p.guard.max_time_var_frac - 0.000255) < 1e-12 && p.guard.safe_top_cfg == 15,
+		"registered cfg16 guard split is installed (tvar %.6f, safe cfg%d)",
+		p.guard.max_time_var_frac, p.guard.safe_top_cfg);
 	{
 		const st_acq_row* a = acquisition_table();
 		bool indexed = std::strcmp(acquisition_table_build(), "310fad44ff") == 0;

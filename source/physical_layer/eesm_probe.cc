@@ -840,11 +840,12 @@ st_policy default_policy()
 	p.top_cfg = 16;           // WB_CONFIG_MAX
 	p.wb_possible = true;
 	p.guard.safe_top_cfg = 15;
-	// Guard bounds: see VERDICT table G (derived from the cfg16 floor-vs-channel
-	// sweep). Until calibrated they are set to the values measured on the
-	// calibration's fadeA-class channel, the one on which cfg16 held its floor
-	// below BLER 0.1.
-	p.guard.max_time_var_frac = 1e9;
+	// Guard bounds: exhaustive goodput split on the registered 480-cell guard-02
+	// cohort. Seeds 1..4 selected tvar<=0.000255; sealed seeds 5..8 had 0/168
+	// avoidable strands, selected cfg16 in 32/168 rows, and beat always-cfg15 by
+	// 6.29%. No frequency-selectivity split improved the zero-strand objective;
+	// per-carrier EESM itself carries that evidence.
+	p.guard.max_time_var_frac = 0.000255;
 	p.guard.max_freq_sel_db = 1e9;
 	const char* e = std::getenv("MERCURY_EESM_ACQ_FLOOR");
 	p.use_acq_floor = !(e && e[0] && std::atoi(e) == 0);
