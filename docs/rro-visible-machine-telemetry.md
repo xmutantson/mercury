@@ -8,11 +8,12 @@ Serialization and UDP I/O run on a dedicated thread. The receive and ARQ paths
 only publish bounded atomic observations.
 
 The v1 envelope always includes all 43 established RRO metrics so an absent
-measurement cannot silently become zero. This patch sources 22: capture-buffer
-occupancy/fill, processing load, OFDM candidate admission, configured FFT size,
+measurement cannot silently become zero. This patch sources 33: capture-buffer
+occupancy/fill, processing load, four acquisition observations, configured FFT size,
+four selected OFDM carrier-lattice fields,
 LDPC iteration count and limit, an actually evaluated CRC result, two lifetime
-CRC check/reject counters, and twelve Gearshift controller states. The remaining
-21 report `not_instrumented`.
+CRC check/reject counters, and all sixteen existing Gearshift controller states.
+The remaining ten correlator fields report `not_instrumented`.
 Source-backed event-like values expire to `inactive` after two seconds without
 a new source write. This distinguishes an idle or stopped receive path from a
 fresh measured zero. The receiver separately handles transport staleness and
@@ -26,16 +27,39 @@ multi-field Gearshift publication are read coherently by the sender; the
 Gearshift check is bounded and emits `inactive` for a collided sample rather
 than mixing controller moments.
 
-The Gearshift snapshot is taken from `cl_arq_controller::process_main()` on
+Gearshift's last-batch classification and partial streak are updated once per
+completed optimizer transaction from the actual clean/SACK/failed outcome;
+`UNKNOWN` is reserved for a transaction with no sent-frame count. The streak
+counts consecutive partial transactions and resets on any other outcome or
+session reset. Neither value is inferred from the rolling optimizer rate.
+`gearshift.target_config` is the controller's negotiated configuration, not an
+inferred optimizer proposal. `gearshift.optimizer_target_config` is the
+currently pending actionable optimizer switch; `NONE` is a real no-pending
+state, not an extrapolation from the last decision. The Gearshift snapshot is
+taken from `cl_arq_controller::process_main()` on
 the controller's own thread at most eight times per second. Backoff remaining
 is the largest unexpired floor-probe deadline, in the policy clock's
 milliseconds; BREAK total counts actually emitted `send_break_pattern()`
 bursts. `gearshift.optimizer_enabled` means the optimizer is enabled and
 gearshifting is on, not that the optimizer currently owns the link. The
-currently omitted target, batch classification, partial streak, and optimizer
-target are **not** inferred from neighboring states. In-process two-peer sim
+target values are not inferred from neighboring states. In-process two-peer sim
 is intentionally excluded from the Gearshift hook because this v1 envelope
 identifies one modem process, not two controllers.
+
+Carrier geometry counts unique columns that carry at least one DATA or PILOT
+cell in the selected OFDM grid. A column can appear in both category counts if
+its role changes between symbols; the active count is their union. These are
+configured carrier roles, **not** `nData`/`nPilots` cell totals or evidence that
+the FFT, channel estimator, or demapper executed. MFSK and invalid grids clear
+the observation, rather than reusing a stale OFDM lattice.
+
+Acquisition's `timing_offset_samples` is the signed observed preamble-versus-
+prediction residual on a verified batch/re-pin; initial full searches without a
+prediction leave it unavailable. `frequency_offset_hz` is the accepted raw
+OFDM fine-residual estimator output, not a reused last-good value, MFSK
+estimate, or a claim about total RF offset. `coarse_metric` is emitted only
+from actual correlator results, not the forced-delay/prediction sentinels in
+`receive_stats`. These values expire independently after two seconds.
 
 This is not full visible-machine coverage. In particular, RRO's Channel
 Estimator, Demapper, and ARQ modules still have no v1 wire bindings, and the

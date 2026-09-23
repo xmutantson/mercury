@@ -169,6 +169,13 @@ const char* role_state(int value) {
     return value == 0 ? "COMMANDER" : value == 1 ? "RESPONDER" : "UNKNOWN";
 }
 
+const char* batch_classification_state(int value) {
+    static const char* const states[] = {
+        "NONE", "CLEAN", "PARTIAL", "FAILED", "UNKNOWN",
+    };
+    return value >= 0 && value < 5 ? states[value] : "UNKNOWN";
+}
+
 } // namespace
 
 Telemetry& Telemetry::instance() {
@@ -241,10 +248,52 @@ void Telemetry::record_receive_configuration(int fft_size, int ldpc_iteration_li
     configuration_sample_ns_.store(monotonic_ns(), std::memory_order_release);
 }
 
+void Telemetry::record_ofdm_lattice(int active, int pilots, int data, int config) {
+    if (!enabled()) return;
+    if (active < 0 || active > 65535 || pilots < 0 || pilots > active
+        || data < 0 || data > active || active > pilots + data
+        || config < -1 || config > 65534) {
+        clear_ofdm_lattice();
+        return;
+    }
+    const std::uint64_t packed = (static_cast<std::uint64_t>(active) << 48)
+        | (static_cast<std::uint64_t>(pilots) << 32)
+        | (static_cast<std::uint64_t>(data) << 16)
+        | static_cast<std::uint16_t>(config + 1);
+    ofdm_lattice_.store(packed, std::memory_order_relaxed);
+    lattice_sample_ns_.store(monotonic_ns(), std::memory_order_release);
+}
+
+void Telemetry::clear_ofdm_lattice() {
+    if (!enabled()) return;
+    lattice_sample_ns_.store(0, std::memory_order_release);
+}
+
 void Telemetry::record_ofdm_candidate(bool admitted) {
     if (!enabled()) return;
     candidate_admitted_.store(admitted, std::memory_order_relaxed);
     candidate_sample_ns_.store(monotonic_ns(), std::memory_order_release);
+}
+
+void Telemetry::record_acquisition_timing_residual(int samples) {
+    if (!enabled()) return;
+    timing_residual_samples_.store(samples, std::memory_order_relaxed);
+    timing_sample_ns_.store(monotonic_ns(), std::memory_order_release);
+}
+
+void Telemetry::record_acquisition_frequency_offset(double hertz) {
+    if (!enabled()) return;
+    if (!std::isfinite(hertz) || std::fabs(hertz) > 1000000000.0) return;
+    frequency_offset_hz_.store(hertz, std::memory_order_relaxed);
+    frequency_sample_ns_.store(monotonic_ns(), std::memory_order_release);
+}
+
+void Telemetry::record_acquisition_coarse_metric(double correlation) {
+    if (!enabled()) return;
+    if (!std::isfinite(correlation) || correlation < 0.0 || correlation > 1.0)
+        return;
+    coarse_metric_.store(correlation, std::memory_order_relaxed);
+    coarse_sample_ns_.store(monotonic_ns(), std::memory_order_release);
 }
 
 void Telemetry::record_ldpc_iterations(int iterations) {
@@ -266,7 +315,8 @@ void Telemetry::record_crc_result(bool passed) {
 
 void Telemetry::record_gearshift(const GearshiftObservation& state) {
     if (!enabled()) return;
-    if (state.clean_streak < 0 || state.backoff_remaining_ms > 86400000ULL
+    if (state.clean_streak < 0 || state.partial_streak > 9007199254740991ULL
+        || state.backoff_remaining_ms > 86400000ULL
         || state.break_count_total > 9007199254740991ULL) {
         gear_sample_ns_.store(0, std::memory_order_release);
         return;
@@ -278,12 +328,16 @@ void Telemetry::record_gearshift(const GearshiftObservation& state) {
     gear_activity_.store(state.activity);
     gear_role_.store(state.role);
     gear_current_config_.store(state.current_config);
+    gear_target_config_.store(state.target_config);
     gear_anchor_config_.store(state.anchor_config);
     gear_ceiling_config_.store(state.ceiling_config);
+    gear_last_batch_classification_.store(state.last_batch_classification);
     gear_clean_streak_.store(state.clean_streak);
+    gear_partial_streak_.store(state.partial_streak);
     gear_backoff_active_.store(state.backoff_active);
     gear_backoff_remaining_ms_.store(state.backoff_remaining_ms);
     gear_optimizer_enabled_.store(state.optimizer_enabled);
+    gear_optimizer_target_config_.store(state.optimizer_target_config);
     gear_break_active_.store(state.break_active);
     gear_break_count_total_.store(state.break_count_total);
     gear_sample_ns_.store(monotonic_ns());
@@ -311,9 +365,30 @@ std::string Telemetry::snapshot_json() {
     const bool candidate_ready = candidate_sample_ns != 0
         && now_ns >= candidate_sample_ns
         && now_ns - candidate_sample_ns <= kMetricFreshnessNs;
+    const auto timing_sample_ns = timing_sample_ns_.load(std::memory_order_acquire);
+    const auto frequency_sample_ns = frequency_sample_ns_.load(std::memory_order_acquire);
+    const auto coarse_sample_ns = coarse_sample_ns_.load(std::memory_order_acquire);
+    const bool timing_ready = timing_sample_ns != 0 && now_ns >= timing_sample_ns
+        && now_ns - timing_sample_ns <= kMetricFreshnessNs;
+    const bool frequency_ready = frequency_sample_ns != 0 && now_ns >= frequency_sample_ns
+        && now_ns - frequency_sample_ns <= kMetricFreshnessNs;
+    const bool coarse_ready = coarse_sample_ns != 0 && now_ns >= coarse_sample_ns
+        && now_ns - coarse_sample_ns <= kMetricFreshnessNs;
+    const int timing_residual = timing_residual_samples_.load(std::memory_order_relaxed);
+    const double frequency_offset = frequency_offset_hz_.load(std::memory_order_relaxed);
+    const double coarse_metric = coarse_metric_.load(std::memory_order_relaxed);
     const std::uint64_t configuration = receive_configuration_.load(std::memory_order_relaxed);
     const int fft_size = static_cast<int>(configuration >> 32);
     const int ldpc_limit = static_cast<int>(configuration & 0xffffffffu);
+    const auto lattice_sample_ns = lattice_sample_ns_.load(std::memory_order_acquire);
+    const auto lattice = ofdm_lattice_.load(std::memory_order_relaxed);
+    const int active_carriers = static_cast<int>((lattice >> 48) & 0xffffu);
+    const int pilot_carriers = static_cast<int>((lattice >> 32) & 0xffffu);
+    const int data_carriers = static_cast<int>((lattice >> 16) & 0xffffu);
+    const int lattice_config = static_cast<int>(lattice & 0xffffu) - 1;
+    const bool lattice_ready = lattice_sample_ns != 0
+        && now_ns >= lattice_sample_ns
+        && now_ns - lattice_sample_ns <= kMetricFreshnessNs;
     const bool candidate_admitted = candidate_admitted_.load(std::memory_order_relaxed);
     const auto ldpc_sample_ns = ldpc_sample_ns_.load(std::memory_order_acquire);
     const bool ldpc_ready = ldpc_sample_ns != 0 && now_ns >= ldpc_sample_ns
@@ -340,12 +415,16 @@ std::string Telemetry::snapshot_json() {
         gear.activity = gear_activity_.load();
         gear.role = gear_role_.load();
         gear.current_config = gear_current_config_.load();
+        gear.target_config = gear_target_config_.load();
         gear.anchor_config = gear_anchor_config_.load();
         gear.ceiling_config = gear_ceiling_config_.load();
+        gear.last_batch_classification = gear_last_batch_classification_.load();
         gear.clean_streak = gear_clean_streak_.load();
+        gear.partial_streak = gear_partial_streak_.load();
         gear.backoff_active = gear_backoff_active_.load();
         gear.backoff_remaining_ms = gear_backoff_remaining_ms_.load();
         gear.optimizer_enabled = gear_optimizer_enabled_.load();
+        gear.optimizer_target_config = gear_optimizer_target_config_.load();
         gear.break_active = gear_break_active_.load();
         gear.break_count_total = gear_break_count_total_.load();
         gear_sample_ns = gear_sample_ns_.load();
@@ -373,17 +452,21 @@ std::string Telemetry::snapshot_json() {
         const bool available = (i <= 1 && ring_ready && capacity > 0)
             || (i == 2 && load_ready)
             || (i == 3 && candidate_ready)
+            || (i == 4 && timing_ready)
+            || (i == 5 && frequency_ready)
+            || (i == 6 && coarse_ready)
             || (i == 7 && configuration_ready)
+            || (i >= 8 && i <= 11 && lattice_ready)
             || (i == 12 && ldpc_ready)
             || (i == 13 && configuration_ready)
             || (i == 14 && crc_ready)
             || ((i == 15 || i == 16) && crc_counts_ready)
-            || (i >= 27 && gear_ready && i != 31 && i != 34 && i != 36 && i != 40);
+            || (i >= 27 && gear_ready);
         if (!available) {
             out << "false,\"quality\":\"unavailable\",\"type\":\"" << spec.type
                 << "\",\"unit\":\"" << spec.unit << "\",\"reason\":\""
-                << ((i <= 3 || i == 7 || (i >= 12 && i <= 16)
-                    || (i >= 27 && i != 31 && i != 34 && i != 36 && i != 40))
+                << ((i <= 16
+                    || i >= 27)
                     ? "inactive" : "not_instrumented") << "\"}";
             continue;
         }
@@ -393,7 +476,14 @@ std::string Telemetry::snapshot_json() {
         else if (i == 1) out << used;
         else if (i == 2) out << load;
         else if (i == 3) out << (candidate_admitted ? "true" : "false");
+        else if (i == 4) out << timing_residual;
+        else if (i == 5) out << frequency_offset;
+        else if (i == 6) out << coarse_metric;
         else if (i == 7) out << fft_size;
+        else if (i == 8) out << active_carriers;
+        else if (i == 9) out << pilot_carriers;
+        else if (i == 10) out << data_carriers;
+        else if (i == 11) out << '\"' << config_state(lattice_config) << '\"';
         else if (i == 12) out << ldpc_iterations;
         else if (i == 14) out << (crc_passed ? "true" : "false");
         else if (i == 15) out << '\"' << crc_total << '\"';
@@ -402,12 +492,16 @@ std::string Telemetry::snapshot_json() {
         else if (i == 28) out << '\"' << activity_state(gear.activity) << '\"';
         else if (i == 29) out << '\"' << role_state(gear.role) << '\"';
         else if (i == 30) out << '\"' << config_state(gear.current_config) << '\"';
+        else if (i == 31) out << '\"' << config_state(gear.target_config) << '\"';
         else if (i == 32) out << '\"' << config_state(gear.anchor_config) << '\"';
         else if (i == 33) out << '\"' << config_state(gear.ceiling_config) << '\"';
+        else if (i == 34) out << '\"' << batch_classification_state(gear.last_batch_classification) << '\"';
         else if (i == 35) out << gear.clean_streak;
+        else if (i == 36) out << gear.partial_streak;
         else if (i == 37) out << (gear.backoff_active ? "true" : "false");
         else if (i == 38) out << gear.backoff_remaining_ms;
         else if (i == 39) out << (gear.optimizer_enabled ? "true" : "false");
+        else if (i == 40) out << '\"' << config_state(gear.optimizer_target_config) << '\"';
         else if (i == 41) out << (gear.break_active ? "true" : "false");
         else if (i == 42) out << '\"' << gear.break_count_total << '\"';
         else out << ldpc_limit;

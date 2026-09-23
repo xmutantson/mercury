@@ -56,6 +56,37 @@ extern "C" { extern std::atomic<bool> shutdown_; }
 // Test mode: artificial TX carrier offset in Hz (for testing frequency sync)
 extern "C" double test_tx_carrier_offset;
 
+void cl_telecom_system::publish_rro_lattice_geometry() const
+{
+	rro::Telemetry& telemetry = rro::Telemetry::instance();
+	if (!telemetry.enabled()) return;
+	if (M == MOD_MFSK) {
+		telemetry.clear_ofdm_lattice();
+		return;
+	}
+	const int columns = ofdm.Nc;
+	const int rows = ofdm.Nsymb;
+	if (ofdm.ofdm_frame == nullptr || columns <= 0 || columns > 65535
+		|| rows <= 0 || rows > 65535
+		|| static_cast<long long>(columns) * rows > 1048576) {
+		telemetry.clear_ofdm_lattice();
+		return;
+	}
+	int active = 0, pilots = 0, data = 0;
+	for (int column = 0; column < columns; ++column) {
+		bool has_pilot = false, has_data = false;
+		for (int row = 0; row < rows; ++row) {
+			const int type = ofdm.ofdm_frame[row * columns + column].type;
+			has_pilot |= type == PILOT;
+			has_data |= type == DATA;
+		}
+		pilots += has_pilot;
+		data += has_data;
+		active += has_pilot || has_data;
+	}
+	telemetry.record_ofdm_lattice(active, pilots, data, current_configuration);
+}
+
 
 
 cl_telecom_system::cl_telecom_system()
@@ -1815,6 +1846,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	int nVirtual_data=ldpc.N-data_container.nBits;
 	int nReal_data=data_container.nBits-ldpc.P;
 	double freq_offset_measured=0;
+	bool rro_fresh_frequency_estimate = false;
 	receive_stats.message_decoded=NO;
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.frame_data_missing=false;
@@ -2319,6 +2351,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						// Prediction verified — use directly, skip wider search
 						receive_stats.coarse_metric = verify.correlation;
 						int raw_resid = (int)verify.delay - predicted_pos;
+						rro::Telemetry::instance().record_acquisition_coarse_metric(verify.correlation);
+						rro::Telemetry::instance().record_acquisition_timing_residual(raw_resid);
 						if(keydown_track_timing_enabled && raw_resid <= gi_interp && raw_resid >= -gi_interp)
 						{
 							// NOISE regime: sub-guard residual = the ICI-injecting fine-timing
@@ -2376,6 +2410,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						{
 							receive_stats.coarse_metric = repin.correlation;
 							int raw_resid = (int)repin.delay - predicted_pos;
+							rro::Telemetry::instance().record_acquisition_coarse_metric(repin.correlation);
+							rro::Telemetry::instance().record_acquisition_timing_residual(raw_resid);
 							if(keydown_track_timing_enabled && raw_resid <= gi_interp && raw_resid >= -gi_interp)
 							{
 								receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * (double)raw_resid;
@@ -2574,6 +2610,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 				receive_stats.delay = matched.delay;
 				receive_stats.coarse_metric = matched.correlation;
+				rro::Telemetry::instance().record_acquisition_coarse_metric(matched.correlation);
 				{ static const int f0v_tr = []{ const char* e=std::getenv("MERCURY_F0V_TRACE"); return (e&&*e)?atoi(e):0; }();
 				  if(f0v_tr){ int sy=data_container.Nofdm*frequency_interpolation_rate;
 				    printf("[F0V-TRACE] stage=coarse delay=%d metric=%.4f (~%.2f sym)\n",
@@ -2824,6 +2861,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				{
 					receive_stats.delay = retry.delay;
 					receive_stats.coarse_metric = retry.correlation;
+					rro::Telemetry::instance().record_acquisition_coarse_metric(retry.correlation);
 					pream_symb_loc = retry_symb;
 				}
 			}
@@ -3000,6 +3038,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						{
 							receive_stats.delay = retry.delay;
 							receive_stats.coarse_metric = retry.correlation;
+							rro::Telemetry::instance().record_acquisition_coarse_metric(retry.correlation);
 							pream_symb_loc = retry_symb;
 							energy_ok = true;
 						}
@@ -3680,6 +3719,7 @@ skip_h_retry_point:
 			auto t3_pb = std::chrono::steady_clock::now();
 			timing_pb_data_ms += std::chrono::duration<double, std::milli>(t3_pb - t2_pb).count();
 
+			rro_fresh_frequency_estimate = false;
 			if(ofdm_forced_delay >= 0)
 			{
 				// BER test: true freq offset is 0, skip estimation
@@ -3705,9 +3745,12 @@ skip_h_retry_point:
 				// freq_offset_measured, so negate it. Gated to CONFIG_0 with a valid
 				// multi-symbol preamble (the estimator needs >=2 preamble symbols).
 				if(current_configuration == CONFIG_0 && rx_eff_preamble >= 2)
+				{
 					freq_offset_measured = -ofdm.carrier_frequency_sync_nb(
 						&data_container.baseband_data[data_container.Ngi],
 						bandwidth/(double)data_container.Nc, rx_eff_preamble);
+					rro_fresh_frequency_estimate = true;
+				}
 				if(g_verbose)
 					printf("[NB-FREQ] skipped (relying on coarse sync + ZF)\n");
 			}
@@ -3732,6 +3775,7 @@ skip_h_retry_point:
 				// so guard interval skip is Ngi samples, NOT Ngi*interpolation_rate.
 				// The old code skipped Ngi*4=256=Nfft samples, reading across symbol boundaries.
 				freq_offset_measured=ofdm.carrier_sampling_frequency_sync(&data_container.baseband_data[data_container.Ngi],bandwidth/(double)data_container.Nc,rx_eff_preamble, sampling_frequency);
+				rro_fresh_frequency_estimate = true;
 				if(g_verbose)
 					printf("[WB-FREQ] Moose=%.4f Hz\n", freq_offset_measured);
 			}
@@ -3784,6 +3828,7 @@ skip_h_retry_point:
 				// (SKIP-VAR -> FTR-FAIL). Closing this dead zone [1x,2x] is the fix —
 				// see cl_telecom_system::moose_clamp_decision() for the root-cause note.
 				bool can_advance = (receive_stats.sync_trials < effective_trials_max);
+				const double rro_raw_frequency_estimate = freq_offset_measured;
 				if(g_verbose)
 					printf("[MOOSE-RAW] unclamped=%.4f Hz, clamp_ceiling=%.1f Hz\n",
 						freq_offset_measured, subcarrier_spacing);
@@ -3800,6 +3845,9 @@ skip_h_retry_point:
 					continue;
 				}
 				freq_offset_measured = clamped;  // accepted small residual, clamped to +-1 subcarrier
+				if (M != MOD_MFSK && rro_fresh_frequency_estimate)
+					rro::Telemetry::instance().record_acquisition_frequency_offset(
+						rro_raw_frequency_estimate);
 			}
 
 			// Pre-fix this branch had `if(M == MOD_MFSK) { /* skip */ }`
@@ -4971,6 +5019,7 @@ skip_h_retry_point:
 				{
 					receive_stats.delay = retry.delay;
 					receive_stats.coarse_metric = retry.correlation;
+					rro::Telemetry::instance().record_acquisition_coarse_metric(retry.correlation);
 					pream_symb_loc = retry_symb;
 					receive_stats.sync_trials = 0;
 					skip_h_count = 0;
@@ -8117,6 +8166,7 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 		if (rro_telemetry.enabled()) {
 			rro_telemetry.record_processing_load(load);
 			rro_telemetry.record_capture_ring(rro_buf_used, rro_buf_cap);
+			publish_rro_lattice_geometry();
 			rro_telemetry.record_receive_configuration(ofdm.Nfft, ldpc.nIteration_max);
 			if (M != MOD_MFSK)
 				rro_telemetry.record_ofdm_candidate(
@@ -8132,6 +8182,7 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 			rro_telemetry.record_processing_load(load);
 			rro_telemetry.record_capture_ring(size_buffer(capture_buffer),
 				circular_buf_capacity(capture_buffer));
+			publish_rro_lattice_geometry();
 			rro_telemetry.record_receive_configuration(ofdm.Nfft, ldpc.nIteration_max);
 			if (M != MOD_MFSK)
 				rro_telemetry.record_ofdm_candidate(
@@ -12647,6 +12698,7 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	                                       cw_ok, &acq_metric, ref);
 
 	receive_stats.coarse_metric = acq_metric;
+	rro::Telemetry::instance().record_acquisition_coarse_metric(acq_metric);
 	receive_stats.delay = 0;
 	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): the decode already landed in the
 	// dedicated bigblock_rx_infobits member (the ARQ carve reads from THERE, not `out`).
@@ -12682,6 +12734,7 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	// ACK whose bitmap = cw_ok (one bad codeword does NOT fail the block).
 	receive_stats.message_decoded = (Kout>0 && cw_ok_count==Kout) ? YES : NO;
 	receive_stats.coarse_metric = acq_metric;
+	rro::Telemetry::instance().record_acquisition_coarse_metric(acq_metric);
 	receive_stats.iterations_done = -1;
 	return receive_stats;
 }

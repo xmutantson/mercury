@@ -637,6 +637,9 @@ public:
 
 	void transmit_byte(int* data, int nBytes, double *out, int message_location);
 	st_receive_stats receive_byte(double *data, int* out);
+	// Publish the selected OFDM grid's unique carrier-column roles to RRO.
+	// This is configured geometry, never a claim that a transform executed.
+	void publish_rro_lattice_geometry() const;
 
 	// P1 ACQ BAND-EXCLUSION decision (data-flow-linkphase-break-storm.md §5 P1).
 	// Extracted from receive_byte()'s sub-peak reject branch so the deterministic

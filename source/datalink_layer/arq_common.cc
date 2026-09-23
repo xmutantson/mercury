@@ -9896,10 +9896,13 @@ void cl_arq_controller::process_main()
 			}
 			rro_gearshift.record_gearshift({
 				link_status, connection_status, role, current_configuration,
+				negotiated_configuration,
 				last_data_viable_config, supershift_proven_ceiling,
-				clean_batches_at_current_config, backoff_remaining_ms != 0,
+				rro_last_batch_classification, clean_batches_at_current_config,
+				rro_partial_streak, backoff_remaining_ms != 0,
 				backoff_remaining_ms,
 				!optimizer_disabled && rate_opt.is_enabled() && gear_shift_on == YES,
+				opt_pending_switch_cfg,
 				emergency_break_active != 0,
 				static_cast<unsigned long long>(send_break_pattern_count),
 			});
@@ -23374,6 +23377,7 @@ void cl_arq_controller::receive()
 		if (rro_telemetry.enabled()) {
 			rro_telemetry.record_processing_load(load);
 			rro_telemetry.record_capture_ring(rro_buf_used, rro_buf_cap);
+			telecom_system->publish_rro_lattice_geometry();
 			rro_telemetry.record_receive_configuration(
 				telecom_system->ofdm.Nfft, telecom_system->ldpc.nIteration_max);
 			if (telecom_system->M != MOD_MFSK)
@@ -23390,6 +23394,7 @@ void cl_arq_controller::receive()
 			rro_telemetry.record_processing_load(load);
 			rro_telemetry.record_capture_ring(size_buffer(capture_buffer),
 				circular_buf_capacity(capture_buffer));
+			telecom_system->publish_rro_lattice_geometry();
 			rro_telemetry.record_receive_configuration(
 				telecom_system->ofdm.Nfft, telecom_system->ldpc.nIteration_max);
 			if (telecom_system->M != MOD_MFSK)

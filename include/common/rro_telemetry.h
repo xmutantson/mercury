@@ -16,12 +16,16 @@ struct GearshiftObservation {
     int activity;
     int role;
     int current_config;
+    int target_config;
     int anchor_config;
     int ceiling_config;
+    int last_batch_classification;
     int clean_streak;
+    unsigned long long partial_streak;
     bool backoff_active;
     unsigned long long backoff_remaining_ms;
     bool optimizer_enabled;
+    int optimizer_target_config;
     bool break_active;
     unsigned long long break_count_total;
 };
@@ -41,7 +45,13 @@ public:
     void record_processing_load(double processing_time_over_frame_period);
     void record_capture_ring(std::size_t buffered_samples, std::size_t capacity_samples);
     void record_receive_configuration(int fft_size, int ldpc_iteration_limit);
+    void record_ofdm_lattice(int active_carriers, int pilot_carriers,
+                             int data_carriers, int current_config);
+    void clear_ofdm_lattice();
     void record_ofdm_candidate(bool admitted);
+    void record_acquisition_timing_residual(int samples);
+    void record_acquisition_frequency_offset(double hertz);
+    void record_acquisition_coarse_metric(double correlation);
     void record_ldpc_iterations(int iterations);
     void record_crc_result(bool passed);
     void record_gearshift(const GearshiftObservation& observation);
@@ -67,8 +77,17 @@ private:
     // Both configured values are observed together by the receive path.
     std::atomic<std::uint64_t> receive_configuration_{0};
     std::atomic<std::uint64_t> configuration_sample_ns_{0};
+    // Four 16-bit fields form one configured carrier-geometry observation.
+    std::atomic<std::uint64_t> ofdm_lattice_{0};
+    std::atomic<std::uint64_t> lattice_sample_ns_{0};
     std::atomic<bool> candidate_admitted_{false};
     std::atomic<std::uint64_t> candidate_sample_ns_{0};
+    std::atomic<int> timing_residual_samples_{0};
+    std::atomic<std::uint64_t> timing_sample_ns_{0};
+    std::atomic<double> frequency_offset_hz_{0.0};
+    std::atomic<std::uint64_t> frequency_sample_ns_{0};
+    std::atomic<double> coarse_metric_{0.0};
+    std::atomic<std::uint64_t> coarse_sample_ns_{0};
     std::atomic<int> ldpc_iterations_{0};
     std::atomic<std::uint64_t> ldpc_sample_ns_{0};
     // One word pairs the verdict with its timestamp even if both receive loops
@@ -77,18 +96,22 @@ private:
     std::atomic<std::uint64_t> crc_frames_total_{0};
     std::atomic<std::uint64_t> crc_frames_failed_{0};
     // One controller writer, one sender reader. A bounded version check keeps
-    // the twelve related controller values in one observation without locks.
+    // the related controller values in one observation without locks.
     std::atomic<std::uint64_t> gear_generation_{0};
     std::atomic<int> gear_lifecycle_{0};
     std::atomic<int> gear_activity_{0};
     std::atomic<int> gear_role_{0};
     std::atomic<int> gear_current_config_{-1};
+    std::atomic<int> gear_target_config_{-1};
     std::atomic<int> gear_anchor_config_{-1};
     std::atomic<int> gear_ceiling_config_{-1};
+    std::atomic<int> gear_last_batch_classification_{0};
     std::atomic<int> gear_clean_streak_{0};
+    std::atomic<unsigned long long> gear_partial_streak_{0};
     std::atomic<bool> gear_backoff_active_{false};
     std::atomic<unsigned long long> gear_backoff_remaining_ms_{0};
     std::atomic<bool> gear_optimizer_enabled_{false};
+    std::atomic<int> gear_optimizer_target_config_{-1};
     std::atomic<bool> gear_break_active_{false};
     std::atomic<unsigned long long> gear_break_count_total_{0};
     std::atomic<std::uint64_t> gear_sample_ns_{0};

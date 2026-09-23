@@ -28,11 +28,15 @@ int main() {
     telemetry.record_processing_load(0.375);
     telemetry.record_capture_ring(128, 512);
     telemetry.record_receive_configuration(1024, 80);
+    telemetry.record_ofdm_lattice(30, 10, 20, 105);
     telemetry.record_ofdm_candidate(true);
+    telemetry.record_acquisition_timing_residual(-12);
+    telemetry.record_acquisition_frequency_offset(3.25);
+    telemetry.record_acquisition_coarse_metric(0.75);
     telemetry.record_ldpc_iterations(12);
     telemetry.record_crc_result(false);
-    telemetry.record_gearshift({2, 2, 0, 16, 15, 16, 3,
-        true, 1400, true, false, 2});
+    telemetry.record_gearshift({2, 2, 0, 16, 9, 15, 16, 2, 3, 2,
+        true, 1400, true, 9, false, 2});
     const std::string after = telemetry.snapshot_json();
     assert(after.find("\"audio.capture_buffered_samples\":{\"available\":true")
            != std::string::npos);
@@ -46,11 +50,29 @@ int main() {
            != std::string::npos);
     assert(after.find("\"gearshift.lifecycle\":{\"available\":true")
            != std::string::npos);
+    assert(after.find("\"gearshift.last_batch_classification\":{\"available\":true,\"quality\":\"measured\",\"type\":\"state\",\"unit\":\"state\",\"value\":\"PARTIAL\"")
+           != std::string::npos);
+    assert(after.find("\"gearshift.partial_streak\":{\"available\":true,\"quality\":\"measured\",\"type\":\"gauge\",\"unit\":\"batch\",\"value\":2")
+           != std::string::npos);
+    assert(after.find("\"gearshift.target_config\":{\"available\":true,\"quality\":\"configured\",\"type\":\"state\",\"unit\":\"config\",\"value\":\"CONFIG_9\"")
+           != std::string::npos);
+    assert(after.find("\"gearshift.optimizer_target_config\":{\"available\":true,\"quality\":\"configured\",\"type\":\"state\",\"unit\":\"config\",\"value\":\"CONFIG_9\"")
+           != std::string::npos);
     assert(after.find("\"gearshift.break_count_total\":{\"available\":true")
            != std::string::npos);
     assert(after.find("\"acquisition.active\":{\"available\":true")
            != std::string::npos);
+    assert(after.find("\"acquisition.timing_offset_samples\":{\"available\":true,\"quality\":\"measured\",\"type\":\"gauge\",\"unit\":\"sample\",\"value\":-12")
+           != std::string::npos);
+    assert(after.find("\"acquisition.frequency_offset_hz\":{\"available\":true,\"quality\":\"measured\",\"type\":\"gauge\",\"unit\":\"Hz\",\"value\":3.25")
+           != std::string::npos);
+    assert(after.find("\"acquisition.coarse_metric\":{\"available\":true,\"quality\":\"measured\",\"type\":\"gauge\",\"unit\":\"1\",\"value\":0.75")
+           != std::string::npos);
     assert(after.find("\"ofdm.fft_size\":{\"available\":true")
+           != std::string::npos);
+    assert(after.find("\"ofdm.active_carriers\":{\"available\":true,\"quality\":\"configured\",\"type\":\"gauge\",\"unit\":\"carrier\",\"value\":30")
+           != std::string::npos);
+    assert(after.find("\"ofdm.current_config\":{\"available\":true,\"quality\":\"configured\",\"type\":\"state\",\"unit\":\"config\",\"value\":\"LOW48_ANCHOR_S20_R6\"")
            != std::string::npos);
     assert(after.find("\"decode.ldpc_max_iterations\":{\"available\":true")
            != std::string::npos);
@@ -61,8 +83,9 @@ int main() {
     std::thread writer([&] {
         for (int i = 0; i < 10000; ++i) {
             const bool first = (i & 1) == 0;
-            telemetry.record_gearshift({2, 2, 0, first ? 16 : 5, 15, 16,
-                first ? 3 : 8, true, 1400, true, false, 2});
+            telemetry.record_gearshift({2, 2, 0, first ? 16 : 5, first ? 16 : 5, 15, 16,
+                first ? 1 : 2, first ? 3 : 8, first ? 0ULL : 2ULL,
+                true, 1400, true, first ? 16 : 5, false, 2});
             std::this_thread::yield();
         }
         writing.store(false);
@@ -90,6 +113,8 @@ int main() {
     assert(stale.find("\"audio.processing_load_ratio\":{\"available\":false")
            != std::string::npos);
     assert(stale.find("\"ofdm.fft_size\":{\"available\":false")
+           != std::string::npos);
+    assert(stale.find("\"ofdm.active_carriers\":{\"available\":false")
            != std::string::npos);
     assert(stale.find("\"decode.frames_total\":{\"available\":true")
            != std::string::npos);
