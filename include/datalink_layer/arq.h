@@ -1216,20 +1216,18 @@ public:
   // See bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md §2.
   void rsp_gap_abort_teardown(const char* reason);
 
-  // Reconnect-continuity fail-closed arm (data-flow-reconnect-continuity.md §5b). Called at the
-  // fresh RSP START_CONNECTION accept (both the callsign-matched and passive-monitor sites). Arms
-  // rsp_cross_session_seam_armed iff the app DATA socket is persistent (tcp_socket_data ACCEPTED,
-  // or the test-forced signal), the prior session delivered app bytes (rsp_prev_session_app_
-  // delivered > 0), and no negotiated resume proved byte-continuity. MERCURY_RECONNECT_FAILCLOSED_
-  // DEFEAT=1 leaves it disarmed (the pre-fix silent splice). No effect on a fresh transfer / a
-  // continuous session (prev-delivered 0 -> stays disarmed).
+  // Defense-in-depth for a legacy/mixed path that reaches a fresh RSP accept with an old DATA
+  // peer still attached. The application-owned-resume contract normally closes that peer in
+  // reset_session_state(). If persistence is nevertheless observed, arm when the prior session
+  // delivered N>0 and refuse the first byte-unprovable delivery. The test-force flag keeps the
+  // established N>0 splice regression independently covered.
   void rsp_reconnect_seam_arm_on_accept();
 
   // Reconnect-continuity fail-closed F2 (data-flow-reconnect-continuity.md 5b). Called ONLY on a
   // PROVEN-CLEAN end-of-transfer (the CLOSE_CONNECTION EOT-verified branch), AFTER reset_session_
   // state() has re-snapshotted the app-delivered high-water. Clears rsp_prev_session_app_delivered
-  // (and any stale arm) so a legitimate back-to-back transfer on the SAME persistent app socket is
-  // byte-identical. An abort / short / absent-EOT close does NOT call this (fail-closed default).
+  // (and any stale defense arm) at a proven-clean boundary. An abort / short / absent-EOT close
+  // does NOT call this (fail-closed default).
   void rsp_seam_clear_on_clean_eot();
 
   // SACK Design A Step 7 — OFDM SACK_RSP RX decode (CMD side). Called when
@@ -4517,6 +4515,12 @@ public:
   void print_stats();
 
   void reset_all_timers();
+  // End the host DATA transaction at a radio-session boundary. The accepted
+  // peer is closed (the server listener remains available), and every queued
+  // application byte owned by that radio session is discarded. A new radio
+  // session therefore requires a fresh DATA connection and fresh application
+  // write; no byte accepted by the old transaction can cross the boundary.
+  void terminalize_data_transaction_on_radio_teardown();
   void reset_session_state();
   // NB robust-preamble capability negotiation (CAP_ROBUST_PREAMBLE_NB):
   // derive the session verdict from local/peer capability bytes and push it
@@ -4894,14 +4898,10 @@ public:
   // prev flush (arq_common.cc). ctor-init false. See the cross-layer data-flow audit
   // for the delivery contiguity ruler.
   bool rsp_stream_aborted;
-  // Reconnect-continuity fail-closed (data-flow-reconnect-continuity.md §5b). A fresh
-  // START_CONNECTION re-anchors both absolute-byte cursors at 0 (reset_session_state), but
-  // the RSP app DATA socket is PERSISTENT across the modem-link reconnect (the FIX-6 note at
-  // reset_session_state: "A fresh session must not re-emit bytes from the previous
-  // connection's stream"). So if the prior session delivered N>0 app bytes to that socket and
-  // a fresh session then streams the sender's CURRENT position onto it, those bytes land at
-  // app position N with NO proof they equal corpus[N] — a SILENT cross-session skip that every
-  // per-session guard misses (each session's cursor is self-consistent). Two fields close it:
+  // Reconnect-continuity defense for a legacy/mixed path that violates the primary DATA-close
+  // contract. If the prior session delivered N>0 app bytes to a still-attached DATA peer and a
+  // fresh session streams the sender's current position, those bytes would land at app position
+  // N with no proof they equal corpus[N]. Two fields fail closed if that state is observed:
   //   rsp_prev_session_app_delivered — the app-delivered high-water of the PRIOR session.
   //     Snapshotted from rx_stream_delivered inside reset_session_state() BEFORE it zeroes the
   //     cursor, and SURVIVES that reset (never re-zeroed there). ctor-init 0.
@@ -4910,15 +4910,13 @@ public:
   //     proved continuity; consumed (and cleared) at the first delivery in copy_data_to_buffer,
   //     which REFUSES it (loud clean drop via rsp_gap_abort_teardown + DISCONNECTED) rather
   //     than splice. Disarmed at every session boundary (reset_session_state). ctor-init false.
-  // Byte-identical when not armed: a continuous session never crosses reset (prev stays 0); a
-  // fresh transfer has prev 0. MERCURY_RECONNECT_FAILCLOSED_DEFEAT=1 keeps it disarmed (the
-  // pre-fix silent splice — the fail-before A/B arm). See the cross-layer data-flow audit.
+  // The primary application-owned-resume path closes DATA and therefore never arms this guard.
+  // MERCURY_RECONNECT_FAILCLOSED_DEFEAT=1 keeps the defense disarmed for its fail-before arm.
   uint64_t rsp_prev_session_app_delivered;
   bool     rsp_cross_session_seam_armed;
   // Test-only harness input (in-process --test-stream-offset has no real TCP socket): forces the
-  // "app DATA socket is persistent" signal the production arm reads from tcp_socket_data status,
-  // so the test can drive the REAL reset-snapshot -> arm -> refuse path. ctor-init false; never
-  // set on any production path.
+  // legacy "app DATA socket is persistent" signal so the N>0 defense remains testable after the
+  // primary teardown contract closes production DATA peers. ctor-init false; never production-set.
   bool     rsp_test_force_app_persistent;
   long long rsp_v2_drop_count;           // RSP: counter of [RSP-V2-DROP] events
                                          //      (frames discarded for unknown

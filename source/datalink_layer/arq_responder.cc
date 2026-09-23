@@ -13716,8 +13716,8 @@ int cl_arq_controller::test_gap_abort_on_readopt()
 // silently concatenated onto the app FIFO across the dropped batch.
 //
 // The chain (mirrors _research/precook_ab_v2 cell A_C2_s1):
-//   1. deliver a contiguous prefix (batches 0..10) -> high-water=10, PREFIX bytes
-//      in fifo_buffer_rx.
+//   1. queue a contiguous prefix (batches 0..10) -> high-water=10, PREFIX bytes
+//      still undelivered in fifo_buffer_rx.
 //   2. batch 11 LOST (high-water stays 10).
 //   3. present batch 12 at the REAL delivery-time gate: delivery_step_is_gap(12,10)
 //      = true -> call the REAL rsp_gap_abort_teardown(). The gate fired correctly.
@@ -13726,14 +13726,12 @@ int cl_arq_controller::test_gap_abort_on_readopt()
 //   5. the CMD re-drives the same stream: present batch 14 at the cur<0 re-adopt.
 //      The REAL sack_v2_readopt_has_gap(14, ruler) is consulted. Had the ruler
 //      survived (=10) it would be true (a hole, refuse); blinded (=-1) it is
-//      false, so the batch is adopted and delivered.
+//      false, so the batch is adopted and enqueued.
 //
-// ORACLE — the hard invariant: NO byte may be delivered at the post-hole stream
-// offset (= PREFIX_BYTES). On the current tree the byte IS delivered (silent
-// concatenation) -> this test FAILS. The fix (ruler survives the gap-abort, OR the
-// teardown is terminal for the stream) makes it PASS. This is a pure state-
-// discipline test: no MERCURY_GAP_ABORT_DEFEAT env, no wire change — it exercises
-// the plain production binary and must fail on it today.
+// ORACLE — the hard invariant: NO byte from the old DATA transaction may remain
+// deliverable after the gap teardown. Application-owned resume makes the teardown
+// terminal, so the undrained contiguous prefix and any post-hole suffix must both
+// be absent. This is a pure state-discipline test: no wire change.
 //
 // Returns 0=PASS, 1=FAIL. Default builds never call this.
 int cl_arq_controller::test_gap_abort_readopt_blind()
@@ -13781,12 +13779,11 @@ int cl_arq_controller::test_gap_abort_readopt_blind()
 			out[j] = (char)(unsigned char)((bsi & 0xFF) * BATCH_BYTES + j);
 	};
 
-	// --- Step 1: deliver a contiguous prefix, batches 0..10 -----------------
+	// --- Step 1: queue a contiguous prefix, batches 0..10 -------------------
 	// Each batch is a BATCH-DONE commit: advance the reset-surviving high-water
-	// with the PRE-bump bsi, push the batch bytes to the app FIFO, bump cur.
+	// with the PRE-bump bsi, push the batch bytes to the host-delivery FIFO, bump cur.
 	const int PREFIX_BATCHES = 11;                     // bsi 0..10
 	const int PREFIX_BYTES    = PREFIX_BATCHES * BATCH_BYTES;
-	char src_prefix[PREFIX_BATCHES * BATCH_BYTES];
 	this->fifo_buffer_rx.flush();
 	this->rsp_current_expected_batch_seq_id = 0;
 	this->rsp_prev_batch_seq_id             = -1;
@@ -13796,14 +13793,13 @@ int cl_arq_controller::test_gap_abort_readopt_blind()
 	for(int b=0; b<PREFIX_BATCHES; b++)
 	{
 		char p[BATCH_BYTES]; batch_payload(b, p);
-		memcpy(&src_prefix[b*BATCH_BYTES], p, BATCH_BYTES);
 		advance_last_delivered(this->rsp_current_expected_batch_seq_id);   // REAL producer
-		this->fifo_buffer_rx.push(p, BATCH_BYTES);                         // REAL app delivery
+		this->fifo_buffer_rx.push(p, BATCH_BYTES);                         // REAL host-delivery queue
 		this->rsp_prev_batch_seq_id = this->rsp_current_expected_batch_seq_id;
 		this->rsp_current_expected_batch_seq_id =
 			(this->rsp_current_expected_batch_seq_id + 1) & 0xFF;
 	}
-	printf("[TEST-GAP-ABORT-BLIND] delivered contiguous prefix bsi 0..%d "
+	printf("[TEST-GAP-ABORT-BLIND] queued undelivered prefix bsi 0..%d "
 		"(%d bytes), last_delivered=%d cur=%d\n",
 		PREFIX_BATCHES-1, PREFIX_BYTES,
 		this->rsp_last_delivered_batch_seq_id, this->rsp_current_expected_batch_seq_id);
@@ -13884,46 +13880,36 @@ int cl_arq_controller::test_gap_abort_readopt_blind()
 	}
 	if(!gap_now)
 	{
-		// Production would take the else-branch at arq_responder.cc:1004 and DELIVER.
-		// Model that delivery through the REAL producer + REAL app FIFO.
+		// Production would take the else-branch at arq_responder.cc:1004 and enqueue.
+		// Model that through the REAL producer + REAL host-delivery queue.
 		this->rsp_current_expected_batch_seq_id = READOPT_BSI;
 		char p[BATCH_BYTES]; batch_payload(READOPT_BSI, p);
 		advance_last_delivered(READOPT_BSI);
 		this->fifo_buffer_rx.push(p, BATCH_BYTES);
-		printf("[TEST-GAP-ABORT-BLIND] blinded re-adopt DELIVERED batch %d after the hole\n",
+		printf("[TEST-GAP-ABORT-BLIND] blinded re-adopt ENQUEUED batch %d after the hole\n",
 			READOPT_BSI);
 		fflush(stdout);
 	}
 
-	// --- Step 5: ORACLE — no byte may sit at the post-hole stream offset -----
+	// --- Step 5: ORACLE — the old transaction has no deliverable byte --------
 	char drained[(PREFIX_BATCHES + 4) * BATCH_BYTES];
 	int popped = this->fifo_buffer_rx.pop(drained, (int)sizeof(drained));
-	bool prefix_ok = (popped >= PREFIX_BYTES)
-		&& (memcmp(drained, src_prefix, PREFIX_BYTES) == 0);
-	bool exactly_prefix = (popped == PREFIX_BYTES);
-	if(!prefix_ok)
-	{
-		printf("[TEST-GAP-ABORT-BLIND] FAIL: contiguous prefix corrupted before the seam\n");
-		fails++;
-	}
-	if(!exactly_prefix)
+	if(popped != 0)
 	{
 		unsigned char seam = (popped > PREFIX_BYTES)
 			? (unsigned char)drained[PREFIX_BYTES] : 0;
 		unsigned char b14_first = (unsigned char)(READOPT_BSI * BATCH_BYTES + 0);
-		printf("[TEST-GAP-ABORT-BLIND] FAIL: SILENT CONCATENATION — %d bytes delivered "
-			"(prefix is %d); byte at post-hole offset %d = 0x%02x (batch-%d first byte "
-			"= 0x%02x). A non-contiguous batch was delivered as if contiguous across "
-			"the dropped batch %d.\n",
+		printf("[TEST-GAP-ABORT-BLIND] FAIL: old DATA transaction retained %d byte(s) "
+			"after terminal teardown (prior prefix=%d); byte at the former seam offset "
+			"%d = 0x%02x (batch-%d first byte = 0x%02x, dropped batch %d).\n",
 			popped, PREFIX_BYTES, PREFIX_BYTES, (unsigned)seam,
 			READOPT_BSI, (unsigned)b14_first, LOST_BSI);
 		fails++;
 	}
 	else
 	{
-		printf("[TEST-GAP-ABORT-BLIND] PASS: delivered EXACTLY the contiguous prefix "
-			"(%d bytes), no byte at the post-hole offset — silent concatenation refused\n",
-			popped);
+		printf("[TEST-GAP-ABORT-BLIND] PASS: terminal teardown purged the %d-byte "
+			"undelivered prefix and retained no post-hole suffix\n", PREFIX_BYTES);
 	}
 	fflush(stdout);
 

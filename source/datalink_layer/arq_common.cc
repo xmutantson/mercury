@@ -10431,29 +10431,17 @@ void cl_arq_controller::watchdog_probe_clear_on_liveness()
 	watchdog_probe_rx_index_snap     = rx_receive_frame_index;
 }
 
-// Clean COMMANDER reconnect at the init config, factored VERBATIM from the watchdog WD_RECONNECT
-// body so the watchdog dead-peer path and the R5 pure-silence reroute share ONE proven implementation
-// (crypto/bsi re-baseline via a real session boundary; pending TX preserved through the backup
-// re-stage; reset_session_state does not flush fifo_buffer_tx). Cross-layer data-flow audit: the
-// producers/consumers of fifo_buffer_tx / fifo_buffer_backup / the turbo state are unchanged -- this
-// only relocates the shipped mechanics behind one entry point.
+// Clean COMMANDER reconnect at the init config, shared by the watchdog dead-peer path and the R5
+// pure-silence reroute. The reconnect is a real radio-session boundary: reset_session_state()
+// terminalizes the old host DATA transaction and purges all accepted-but-unconfirmed bytes. The
+// application owns resume and must open a fresh DATA connection and write from its acknowledged
+// offset; restoring fifo_buffer_backup here would recreate the forbidden old-transaction suffix.
 void cl_arq_controller::commander_clean_reconnect(const char* reason)
 {
 	printf("[CLEAN-RECONNECT] %s -- dropping link + reconnecting at init config (no in-place teleport)\n", reason);
 	fflush(stdout);
 
-	char wd_restore_buf[N_MAX/8 * 20];
-	int wd_total_restore = 0;
-	int wd_data_read_size;
-	for(int i=0;i<get_nTotal_messages();i++)
-	{
-		wd_data_read_size=fifo_buffer_backup.pop(wd_restore_buf + wd_total_restore,max_data_length+max_header_length);
-		if(wd_data_read_size!=0) wd_total_restore += wd_data_read_size; else break;
-	}
 	reset_session_state();   // safe: a real session boundary; crypto re-handshakes on reconnect
-	if(wd_total_restore > 0)
-		fifo_buffer_tx.push_front(wd_restore_buf, wd_total_restore);   // reset_session_state does not flush tx
-	fifo_buffer_backup.flush();
 
 	commander_configured_nb = narrowband_enabled;
 	load_configuration(init_configuration, FULL, YES);
@@ -10752,6 +10740,48 @@ bool cl_arq_controller::rsp_emit_release()
 	return true;
 }
 
+void cl_arq_controller::terminalize_data_transaction_on_radio_teardown()
+{
+	bool defeat = false;
+	{ const char* e = std::getenv("MERCURY_DATA_EPOCH_CLOSE_DEFEAT");
+	  if(e && *e && atoi(e)!=0) defeat = true; }
+	if(defeat)
+	{
+		printf("[DATA-EPOCH-END/DEFEAT] radio teardown left the old DATA transaction open\n");
+		fflush(stdout);
+		return;
+	}
+
+	const int tx_bytes = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+	const int backup_bytes = fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+	const int rx_bytes = fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size();
+	const int pending_bytes = rx_deliver_pending_len;
+	const bool had_peer = tcp_socket_data.get_status() == TCP_STATUS_ACCEPTED;
+
+	// Close first. The host sees EOF/reset before a later process_main() poll can
+	// accept a replacement DATA connection on the still-open server listener.
+	tcp_socket_data.close_connection();
+
+	// Bytes in all four stores belong to the terminated transaction. This includes
+	// data accepted ahead of RF transmission, an in-flight backup image, received
+	// bytes awaiting host drain, and a short-send tail behind socket backpressure.
+	fifo_buffer_tx.flush();
+	fifo_buffer_backup.flush();
+	fifo_buffer_rx.flush();
+	rx_deliver_pending_len = 0;
+	for(int i=0; i<nMessages; i++)
+	{
+		if(messages_tx != NULL) messages_tx[i].status = FREE;
+		if(messages_rx != NULL) messages_rx[i].status = FREE;
+		if(messages_rx_prev != NULL) messages_rx_prev[i].status = FREE;
+	}
+	clear_retx_queue();
+
+	printf("[DATA-EPOCH-END] radio teardown closed DATA peer=%d; purged tx=%d backup=%d rx=%d pending=%d\n",
+		had_peer ? 1 : 0, tx_bytes, backup_bytes, rx_bytes, pending_bytes);
+	fflush(stdout);
+}
+
 void cl_arq_controller::reset_session_state()
 {
 	// Leak-guard: a session boundary clears the scanner-hold latch so no stale
@@ -10770,6 +10800,13 @@ void cl_arq_controller::reset_session_state()
 		fprintf(stderr, "[L1-JOURNAL] terminal owner refused reset transfer; aborting before discard\n");
 		std::abort();
 	}
+	// LISTEN ON uses reset_session_state() as idle initialization after setting
+	// link_status=LISTENING; it must leave a pre-opened DATA socket alone. Every
+	// other non-idle/non-listening caller is a radio attempt/session teardown
+	// (including CONNECTING failures, BREAK exhaustion, peer disconnect, clean
+	// CLOSE, and implicit commander reconnect) and owns a terminal DATA boundary.
+	if(link_status != IDLE && link_status != LISTENING)
+		terminalize_data_transaction_on_radio_teardown();
 	printf("RX-OVERRUN-TOTAL n=%ld\n",
 		telecom_system->data_container.nUnder_processing_events_total.exchange(0));
 	fflush(stdout);
@@ -10830,9 +10867,9 @@ void cl_arq_controller::reset_session_state()
 	//     high-water across every teardown ordering (the gap-abort's own restore leaves
 	//     rx_stream_delivered intact; the later link-timeout reset re-captures the same max, then
 	//     zeroes the cursor) so the fresh accept arms with prev>0.
-	// A proven-clean EOT clears prev (arq_responder.cc CLOSE path -> rsp_seam_clear_on_clean_eot) so
-	// a legitimate back-to-back transfer on a persistent socket is byte-identical; a taken refusal
-	// clears it. This is the ONLY high-water producer; the fresh accept consumes it to arm the seam.
+	// A proven-clean EOT clears prev (arq_responder.cc CLOSE path -> rsp_seam_clear_on_clean_eot).
+	// The primary DATA-close contract normally makes the defense inert; retaining the high-water
+	// keeps legacy/mixed paths fail-closed. This is the ONLY high-water producer.
 	if(rx_stream_delivered > rsp_prev_session_app_delivered)
 		rsp_prev_session_app_delivered = rx_stream_delivered;
 	// Disarm any stale cross-session seam at the session boundary; the fresh accept re-arms it.
@@ -18348,14 +18385,10 @@ void cl_arq_controller::rsp_gap_abort_teardown(const char* reason)
 
 void cl_arq_controller::rsp_reconnect_seam_arm_on_accept()
 {
-	// Reconnect-continuity fail-closed ARM (data-flow-reconnect-continuity.md §5b). Runs at the
-	// fresh RSP START_CONNECTION accept — the sole arm point, co-located with the sole clear of
-	// rsp_stream_aborted. A fresh session has re-anchored rx_stream_delivered at 0, but the app
-	// DATA socket persisted across the reconnect. If the PRIOR session delivered N>0 app bytes to
-	// that persistent socket, this session's first delivery would land at app position N with no
-	// proof it is corpus[N] (the silent cross-session skip). Arm so copy_data_to_buffer refuses
-	// that first delivery — UNLESS a negotiated resume proved byte-continuity (a separate, not-yet-
-	// implemented application-resume capability; continuity is therefore never proven here today).
+	// Defense-in-depth for a legacy/mixed path that reaches a fresh START_CONNECTION accept with
+	// the old DATA peer still attached. The primary application-owned-resume path closes that peer
+	// during reset_session_state(), so production normally leaves this guard inert. If persistence
+	// is nevertheless observed after N>0 prior delivery, refuse the first byte-unprovable delivery.
 	bool failclosed_defeat = false;
 	{ const char* e = std::getenv("MERCURY_RECONNECT_FAILCLOSED_DEFEAT");
 	  if(e && *e && atoi(e)!=0) failclosed_defeat = true; }

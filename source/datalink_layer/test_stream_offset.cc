@@ -730,6 +730,112 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
+	// PART W0 — APPLICATION-OWNED RESUME at prior-session delivered high-water ZERO.
+	// This is the measured fade failure shape: the commander accepted application bytes far ahead
+	// of RF confirmation, the link tore down before the responder delivered even one byte, and an
+	// implicit reconnect consumed a suffix from the still-open DATA transaction. The radio-session
+	// reset is the production teardown funnel on both peers.
+	//
+	// PASS-AFTER: teardown closes the accepted DATA peer (host-visible EOF/reset), purges the
+	// commander TX/backup queues and responder RX/pending-delivery queues, and a fresh DATA
+	// connection begins with the application's new offset-zero write.
+	// FAIL-BEFORE (MERCURY_DATA_EPOCH_CLOSE_DEFEAT=1): the old socket and queued suffix survive;
+	// the terminal/purge assertions turn RED on the same binary.
+	printf("[TEST-STREAM-OFFSET] Part W0 — zero-high-water DATA transaction terminal at reconnect\n");
+	{
+		bool epoch_defeat = false;
+		{ const char* e = std::getenv("MERCURY_DATA_EPOCH_CLOSE_DEFEAT");
+		  if(e && *e && atoi(e)!=0) epoch_defeat = true; }
+		const int SOURCE_SKIP = 4096;
+		const int OLD_LEN = 256;
+		char old_suffix[OLD_LEN];
+		for(int i=0; i<OLD_LEN; i++) old_suffix[i] = (char)((SOURCE_SKIP + i) & 0x7f);
+
+		fifo_buffer_tx.flush();
+		fifo_buffer_backup.flush();
+		fifo_buffer_rx.flush();
+		// The stream-offset harness historically initializes only TX and RX; production initializes
+		// the backup FIFO before a commander transfer. Initialize it here so this directed case can
+		// stage the exact accepted/in-flight state that reset_session_state() must discard.
+		if(fifo_buffer_backup.get_size() < OLD_LEN)
+		{
+			int backup_init = fifo_buffer_backup.set_size(65536);
+			CHECK(backup_init==SUCCESSFUL,
+				"W0: initialized commander backup FIFO", backup_init, SUCCESSFUL);
+		}
+		int tx_staged = fifo_buffer_tx.push(old_suffix, OLD_LEN);
+		int backup_staged = fifo_buffer_backup.push(old_suffix, OLD_LEN);
+		int rx_staged = fifo_buffer_rx.push(old_suffix, OLD_LEN);
+		CHECK(tx_staged==OLD_LEN,
+			"W0: staged old commander suffix at source offset 4096", tx_staged, OLD_LEN);
+		CHECK(backup_staged==OLD_LEN,
+			"W0: staged old in-flight backup suffix", backup_staged, OLD_LEN);
+		CHECK(rx_staged==OLD_LEN,
+			"W0: staged old responder delivery suffix", rx_staged, OLD_LEN);
+		rx_deliver_pending_len = 73;
+		for(int i=0; i<73; i++) rx_deliver_pending[i] = old_suffix[i];
+		messages_tx[0].status = PENDING_ACK;
+		messages_rx[0].status = ACKED;
+		messages_rx_prev[0].status = ACKED;
+
+		rsp_prev_session_app_delivered = 0;
+		rx_stream_delivered = 0;              // the measured zero-prior-delivery case
+		tcp_socket_data.status = TCP_STATUS_ACCEPTED;
+		this->role = COMMANDER;
+		this->link_status = CONNECTED;
+		reset_session_state();                // production radio-teardown funnel
+
+		int tx_left = fifo_buffer_tx.get_size() - fifo_buffer_tx.get_free_size();
+		int backup_left = fifo_buffer_backup.get_size() - fifo_buffer_backup.get_free_size();
+		int rx_left = fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size();
+		CHECK(rsp_prev_session_app_delivered==0,
+			"W0: teardown case has prior-session delivered high-water exactly zero",
+			(long long)rsp_prev_session_app_delivered, 0);
+		CHECK(tcp_socket_data.get_status()!=TCP_STATUS_ACCEPTED,
+			"W0: DATA transaction emitted terminal EOF/reset (accepted peer closed)",
+			tcp_socket_data.get_status()==TCP_STATUS_ACCEPTED ? 1 : 0, 0);
+		CHECK(tx_left==0 && backup_left==0,
+			"W0: commander purged every accepted-but-unconfirmed old byte",
+			tx_left + backup_left, 0);
+		CHECK(rx_left==0 && rx_deliver_pending_len==0,
+			"W0: responder purged every undelivered old byte/tail",
+			rx_left + rx_deliver_pending_len, 0);
+		CHECK(messages_tx[0].status==FREE && messages_rx[0].status==FREE
+		      && messages_rx_prev[0].status==FREE,
+			"W0: no old radio frame remains eligible after teardown",
+			(messages_tx[0].status==FREE && messages_rx[0].status==FREE
+			 && messages_rx_prev[0].status==FREE) ? 0 : 1, 0);
+
+		if(epoch_defeat)
+			printf("[TEST-STREAM-OFFSET]   (defeat) old transaction survived: tx=%d backup=%d rx=%d socket=%d\n",
+				tx_left, backup_left, rx_left, tcp_socket_data.get_status());
+
+		// Normalize after a fail-before run, then model the application's required fresh
+		// connection + retransmit from its own acknowledged offset (zero here).
+		tcp_socket_data.close_connection();
+		fifo_buffer_tx.flush(); fifo_buffer_backup.flush(); fifo_buffer_rx.flush();
+		rx_deliver_pending_len = 0;
+		for(int i=0; i<nMessages; i++)
+		{
+			messages_tx[i].status = FREE;
+			messages_rx[i].status = FREE;
+			messages_rx_prev[i].status = FREE;
+		}
+		tcp_socket_data.status = TCP_STATUS_ACCEPTED;
+		char fresh_write[64];
+		for(int i=0; i<64; i++) fresh_write[i] = (char)(i & 0x7f);
+		CHECK(fifo_buffer_tx.push(fresh_write, 64)==64,
+			"W0: fresh DATA connection accepts application's new offset-zero write", 64, 64);
+		char fresh_read[64];
+		int fresh_n = fifo_buffer_tx.pop(fresh_read, 64);
+		CHECK(fresh_n==64 && memcmp(fresh_read, fresh_write, 64)==0,
+			"W0: fresh session starts from new write, never old offset-4096 suffix",
+			fresh_n==64 ? (unsigned char)fresh_read[0] : -1, 0);
+		printf("[TEST-STREAM-OFFSET] Part W0 epoch_defeat=%d (0=terminal+purge, 1=old suffix survives)\n",
+			(int)epoch_defeat);
+	}
+
+	// ---------------------------------------------------------------------------
 	// PART X — RECONNECT-CONTINUITY fail-closed (data-flow-reconnect-continuity.md §5b). The
 	// cross-session splice: a low-SNR transfer delivers only N=101 app bytes while the sender's
 	// app-read has raced far ahead (~122 KB); the link tears fully down and makes a FRESH
@@ -782,7 +888,10 @@ int cl_arq_controller::test_stream_offset()
 		rsp_stream_aborted             = false;
 		rsp_cross_session_seam_armed   = false;
 		rsp_prev_session_app_delivered = 0;
-		rsp_test_force_app_persistent  = false;
+		// Defense-in-depth test: force the historical persistent-socket signal even though
+		// application-owned resume now closes the real DATA peer at reset. This keeps the
+		// established N>0 seam guard covered independently of the new zero-high-water contract.
+		rsp_test_force_app_persistent  = true;
 
 		// --- X0: NO false-refuse — a persistent socket with NOTHING delivered before (a fresh
 		// transfer) must NOT arm the seam, and the batch delivers fully. ---
@@ -935,7 +1044,7 @@ int cl_arq_controller::test_stream_offset()
 		rsp_stream_aborted             = false;
 		rsp_cross_session_seam_armed   = false;
 		rsp_prev_session_app_delivered = 0;
-		rsp_test_force_app_persistent  = false;    // use the production ACCEPTED-socket predicate
+		rsp_test_force_app_persistent  = true;     // defense-in-depth: exercise the N>0 seam after terminal close
 
 		// (1) Session 1 delivers 185 app bytes through the PRODUCTION funnel while the sender's
 		// committed cursor raced far ahead (the low-SNR thrash).
@@ -1025,7 +1134,7 @@ int cl_arq_controller::test_stream_offset()
 		rsp_stream_aborted             = false;
 		rsp_cross_session_seam_armed   = false;
 		rsp_prev_session_app_delivered = 0;
-		rsp_test_force_app_persistent  = false;
+		rsp_test_force_app_persistent  = true;     // defense-in-depth: persistent N>0 seam remains covered
 
 		// (1) A transfer delivers 240 app bytes and completes CLEANLY (peer CLOSE / EOT verified).
 		decrypt_delivered_bsi = 210;
@@ -1081,6 +1190,7 @@ int cl_arq_controller::test_stream_offset()
 		CHECK(x3popped==200,
 			"X3: back-to-back transfer after a clean EOT delivers fully (byte-identical)", x3popped, 200);
 	}
+	rsp_test_force_app_persistent = false;
 	tcp_socket_data.status = saved_data_socket_status;
 
 	// ---------------------------------------------------------------------------
