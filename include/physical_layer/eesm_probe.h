@@ -193,9 +193,9 @@ const char* acquisition_table_build();
 // Guard for the high-order rungs (32/64-QAM floor on selective or time-varying
 // channels, calibration VERDICT eesm_cfg11_17 sections 4-6).
 struct st_guard {
-	int    safe_top_cfg;        // top rung allowed when the guard trips (CONFIG_15)
-	double max_time_var_frac;   // time selectivity above which cfg16+ is not elected
-	double max_freq_sel_db;     // frequency selectivity above which cfg16+ is not elected
+	int    safe_top_cfg;        // current receiver's acquisition-safe top when guard trips
+	double max_time_var_frac;   // time selectivity above which the safe top is applied
+	double max_freq_sel_db;     // frequency selectivity above which the safe top is applied
 };
 
 struct st_policy {
