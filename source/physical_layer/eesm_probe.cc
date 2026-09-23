@@ -841,14 +841,16 @@ st_policy default_policy()
 	p.z = 1.645;              // one-sided 95% lower confidence bound
 	p.top_cfg = 16;           // WB_CONFIG_MAX
 	p.wb_possible = true;
-	p.guard.safe_top_cfg = 15;
-	// Guard bounds: exhaustive goodput split on the registered 480-cell guard-02
-	// cohort. Seeds 1..4 selected tvar<=0.000255; sealed seeds 5..8 had 0/168
-	// avoidable strands, selected cfg16 in 32/168 rows, and beat always-cfg15 by
-	// 6.29%. No frequency-selectivity split improved the zero-strand objective;
-	// per-carrier EESM itself carries that evidence.
+	p.guard.safe_top_cfg = 11;
+	// Current-receiver frame-zero safety guard.  The time split was independently
+	// frozen on guard-02 (sealed seeds 5..8: 0/168 avoidable cfg16 strands).  The
+	// frequency split and safe top were then exhaustively calibrated on the
+	// 288-cell real-acquisition anchor: cfg11 is the highest zero-first-frame-fail
+	// top, and 1.232 dB is the goodput-optimal zero-fail selectivity split.  This
+	// conservative cap is retired/recalibrated when the acquisition detector
+	// changes; the decode-only cfg15/cfg16 guard remains tvar<=0.000255, safe cfg15.
 	p.guard.max_time_var_frac = 0.000255;
-	p.guard.max_freq_sel_db = 1e9;
+	p.guard.max_freq_sel_db = 1.232;
 	const char* e = std::getenv("MERCURY_EESM_ACQ_FLOOR");
 	p.use_acq_floor = !(e && e[0] && std::atoi(e) == 0);
 	for(int c = 0; c < kNumOfdmCfg; c++) p.acq_floor_db[c] = g_acq[c].floor_probe_db;

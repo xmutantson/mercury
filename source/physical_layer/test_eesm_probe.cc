@@ -281,9 +281,10 @@ static void t_decide()
 {
 	std::printf("[EESM-TEST] election\n");
 	st_policy p = default_policy();
-	EP_CHECK(std::fabs(p.guard.max_time_var_frac - 0.000255) < 1e-12 && p.guard.safe_top_cfg == 15,
-		"registered cfg16 guard split is installed (tvar %.6f, safe cfg%d)",
-		p.guard.max_time_var_frac, p.guard.safe_top_cfg);
+	EP_CHECK(std::fabs(p.guard.max_time_var_frac - 0.000255) < 1e-12 &&
+		std::fabs(p.guard.max_freq_sel_db - 1.232) < 1e-12 && p.guard.safe_top_cfg == 11,
+		"registered acquisition guard is installed (tvar %.6f, fsel %.3f, safe cfg%d)",
+		p.guard.max_time_var_frac, p.guard.max_freq_sel_db, p.guard.safe_top_cfg);
 	{
 		const st_acq_row* a = acquisition_table();
 		bool indexed = std::strcmp(acquisition_table_build(), "310fad44ff") == 0;
@@ -330,10 +331,10 @@ static void t_decide()
 		EP_CHECK(d.rung == 16 && d.cap_cfg == 16, "40 dB flat elects the top rung 16 (cfg17 not above WB_CONFIG_MAX)");
 		st_policy pg = p; pg.guard.max_time_var_frac = 0.01; m.time_var_frac = 0.02;
 		d = decide(m, pg);
-		EP_CHECK(d.rung == 15 && d.cap_cfg == 15 && d.time_selective, "time-selective channel caps at cfg15 (rung %d)", d.rung);
+		EP_CHECK(d.rung == 11 && d.cap_cfg == 11 && d.time_selective, "time-selective channel caps at cfg11 (rung %d)", d.rung);
 		m.time_var_frac = 0.0; pg = p; pg.guard.max_freq_sel_db = 1.0; m.freq_sel_db = 2.0;
 		d = decide(m, pg);
-		EP_CHECK(d.rung == 15 && d.freq_selective, "frequency-selective channel caps at cfg15 (rung %d)", d.rung);
+		EP_CHECK(d.rung == 11 && d.freq_selective, "frequency-selective channel caps at cfg11 (rung %d)", d.rung);
 	}
 	{
 		st_measurement m = flat_measurement(-20.0, 1e-8);
