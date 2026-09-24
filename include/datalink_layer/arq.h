@@ -940,6 +940,9 @@ public:
   // is set (recovery-ack-robustness.md §4). Data-ACK callers pass false (default)
   // → single block, no airtime change. Default false → byte-identical.
   void send_ack_pattern(bool control_ack = false);
+  // Directed reproduction of the CONFIG_NONE control-level defect (part 1:
+  // the geometry-true TX gain selector). Fail-before/pass-after on one binary.
+  int test_control_frame_gain_and_undefined_state();
 
   // RECOVERY-ACK robustness (recovery-ack-robustness.md §4/§6.2): set the RX
   // combine_reps the next ACK-pattern wait will correlate with. control_ack=true

@@ -3124,6 +3124,7 @@ int main(int argc, char *argv[])
             }
             {
                 cl_arq_controller test_mfsk_ack_sack;
+                failed += test_mfsk_ack_sack.test_control_frame_gain_and_undefined_state();
                 failed += test_mfsk_ack_sack.test_send_mfsk_ack_sack_fec_state_cleanup();
                 failed += test_mfsk_ack_sack.test_send_mfsk_ack_sack_drain_failure();
                 cl_arq_controller test_ack;

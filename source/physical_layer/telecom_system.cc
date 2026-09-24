@@ -302,6 +302,23 @@ double cl_telecom_system::get_tx_gain(tx_signal_type sig) const
 	return tx_gain[sig][nb][nb];  // mod and FIR always match currently
 }
 
+double cl_telecom_system::get_ack_geometry_tx_gain(tx_signal_type sig) const
+{
+	// Quarantined regression seam. Unset in production; --test toggles it to
+	// prove the former mode-flag selector on the same binary.
+	const char* defeat = std::getenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT");
+	if(defeat != NULL && *defeat != '\0' && std::atoi(defeat) != 0)
+		return get_tx_gain(sig);
+
+	// load_configuration() constructs ACK geometry with M=8 for NB and M=16
+	// for WB, from the same mode as the OFDM/MFSK geometry. Select from what
+	// this frame will actually render, not from the independently mutable
+	// session mode flag (which the session reset flips before the terminal
+	// ACK is keyed while the previous geometry is still loaded).
+	const int nb = (ack_mfsk.M == 8) ? 1 : 0;
+	return tx_gain[sig][nb][nb];
+}
+
 void cl_telecom_system::set_tx_gain(tx_signal_type sig, int nb_mode, double value)
 {
 	if(sig < 0 || sig >= TX_SIG_COUNT || nb_mode < 0 || nb_mode > 1)
@@ -1280,11 +1297,11 @@ void cl_telecom_system::transmit_bit(int* data, double* out, int message_locatio
 	if(M == MOD_MFSK)
 	{
 		tx_signal_type sig = (mfsk.nStreams == 1) ? TX_SIG_MFSK_1S : TX_SIG_MFSK_2S;
-		mfsk_boost = get_tx_gain(sig);
+		mfsk_boost = get_ack_geometry_tx_gain(sig);
 	}
 	else
 	{
-		mfsk_boost = get_tx_gain(TX_SIG_OFDM);
+		mfsk_boost = get_ack_geometry_tx_gain(TX_SIG_OFDM);
 	}
 
 	// Preamble boost: OFDM uses sqrt(2) boost for detection headroom;
@@ -5222,7 +5239,7 @@ int cl_telecom_system::generate_ack_pattern_passband(double* out)
 	}
 
 	// TX gain from calibration table
-	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	double ack_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -5252,7 +5269,7 @@ int cl_telecom_system::generate_scream_pattern_passband(double* out, int rung)
 	for(int i = 0; i < nsymb; i++)
 		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
 			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
-	const double boost = get_tx_gain(TX_SIG_BREAK);
+	const double boost = get_ack_geometry_tx_gain(TX_SIG_BREAK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -5275,7 +5292,7 @@ int cl_telecom_system::generate_prekey_prefix_passband(double* out, int reps)
 	for(int i = 0; i < nsymb; i++)
 		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
 			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
-	const double boost = get_tx_gain(TX_SIG_ACK);
+	const double boost = get_ack_geometry_tx_gain(TX_SIG_ACK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -5678,7 +5695,7 @@ int cl_telecom_system::generate_ack_snr_pattern_passband(double* out, float snr)
 			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
 	}
 
-	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	double ack_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -5723,7 +5740,7 @@ int cl_telecom_system::generate_ack_sack_pattern_passband(double* out,
 	}
 
 	// TX gain from calibration table (reuse ACK channel — same MFSK pattern family)
-	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	double ack_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -5765,7 +5782,7 @@ int cl_telecom_system::generate_compact_confirm_passband(double* out,
 		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
 			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
 
-	double ack_boost = get_tx_gain(TX_SIG_ACK);   // reuse ACK channel — same MFSK family
+	double ack_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);   // reuse ACK channel — same MFSK family
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -5800,7 +5817,7 @@ int cl_telecom_system::generate_topgear_confirm_passband(double* out,
 		ofdm.symbol_mod(&data_container.ofdm_framed_data[i * data_container.Nc],
 			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
 
-	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	double ack_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -6127,7 +6144,7 @@ int cl_telecom_system::generate_ctrl_suffix_pattern_passband(double* out,
 	}
 
 	// Reuse the ACK gain channel — same MFSK pattern family on the wire.
-	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	double ack_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -6183,7 +6200,7 @@ int cl_telecom_system::generate_config_tag_pattern_passband(double* out,
 
 	// Reuse the ACK gain channel — same MFSK pattern family on the wire as the
 	// ctrl-suffix (so the tag rides the SAME robust layer, design §2.2/§3.1).
-	double ack_boost = get_tx_gain(TX_SIG_ACK);
+	double ack_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -6958,7 +6975,7 @@ int cl_telecom_system::generate_break_pattern_passband(double* out)
 	}
 
 	// TX gain from calibration table
-	double brk_boost = get_tx_gain(TX_SIG_BREAK);
+	double brk_boost = get_ack_geometry_tx_gain(TX_SIG_BREAK);
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -7028,7 +7045,7 @@ int cl_telecom_system::generate_hail_pattern_passband(double* out)
 			&data_container.ofdm_symbol_modulated_data[i * data_container.Nofdm]);
 	}
 
-	double hail_boost = get_tx_gain(TX_SIG_ACK);  // same gain as ACK
+	double hail_boost = get_ack_geometry_tx_gain(TX_SIG_ACK);  // same gain as ACK
 	for(int j = 0; j < data_container.Nofdm * nsymb; j++)
 	{
 		data_container.ofdm_symbol_modulated_data[j] /= power_normalization;
@@ -10868,7 +10885,7 @@ int cl_telecom_system::bigblock_tx_passband(double* out_pb, int& nSamples_out,
 	float power_normalization = sqrt((double)(ofdm.Nfft*interp));
 	double preamble_boost = ofdm.preamble_configurator.boost;
 	// TX_SIG_OFDM calibration gain (stock applies it to BOTH preamble and data, :860/:866).
-	double ofdm_tx_gain = get_tx_gain(TX_SIG_OFDM);
+	double ofdm_tx_gain = get_ack_geometry_tx_gain(TX_SIG_OFDM);
 	double tx_carrier = carrier_frequency + test_tx_carrier_offset;
 
 	// --- PASSBAND BRIDGE (mirrors transmit_byte:781-836) ----------------------
@@ -15400,7 +15417,7 @@ int cl_telecom_system::generate_eesm_probe_passband(double* out, int max_samples
 	}
 	// transmit_bit's data scaling: 1/sqrt(Nfft*interp) * sqrt(P) * OFDM TX gain.
 	const double power_normalization = std::sqrt((double)(ofdm.Nfft * frequency_interpolation_rate));
-	const double scale = std::sqrt(output_power_Watt) * get_tx_gain(TX_SIG_OFDM) / power_normalization;
+	const double scale = std::sqrt(output_power_Watt) * get_ack_geometry_tx_gain(TX_SIG_OFDM) / power_normalization;
 	for(int i = 0; i < nbb; i++) bb[(size_t)i] *= scale;
 	std::vector<double> pb((size_t)npass), f1((size_t)npass);
 	ofdm.baseband_to_passband(bb.data(), nbb, pb.data(), sampling_frequency, carrier_frequency,

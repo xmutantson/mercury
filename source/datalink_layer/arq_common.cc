@@ -19197,6 +19197,137 @@ int cl_arq_controller::test_send_mfsk_ack_sack_fec_state_cleanup()
 #endif
 }
 
+// Directed reproduction of the CONFIG_NONE control-level defect (part 1: the
+// geometry-true TX gain selector). One binary exercises the quarantined former
+// mode-flag selector and the default repair. The WB ACK/OFDM geometry stays
+// cached while the session flag and both config owners are reset to NB/NONE,
+// exactly as reset_session_state() leaves them after a verified CLOSE+EOT.
+int cl_arq_controller::test_control_frame_gain_and_undefined_state()
+{
+	int bad = 0;
+	auto check = [&](bool condition, const char* name) {
+		printf("[TEST-CTL-GAIN] %s: %s\n", condition ? "PASS" : "BAD", name);
+		if(!condition) bad++;
+	};
+
+	cl_telecom_system test_telecom;
+	test_telecom.operation_mode = ARQ_MODE;
+	if(test_telecom.load_configuration(CONFIG_0) != 0
+	   || test_telecom.ack_mfsk.M != 16
+	   || test_telecom.ack_mfsk.ack_sack_suffix_len() <= 0)
+	{
+		printf("[TEST-CTL-GAIN] BAD: could not load WB ACK+SACK geometry\n");
+		return 1;
+	}
+	// Panel-INI control levels (WB vs NB diagonal); distinct so a wrong witness
+	// shows as a wrong value. ACK 3.655/15.61; OFDM 0.976/2.15.
+	test_telecom.set_tx_gain(TX_SIG_ACK, 0, 3.655);
+	test_telecom.set_tx_gain(TX_SIG_ACK, 1, 15.61);
+	test_telecom.set_tx_gain(TX_SIG_OFDM, 0, 0.976);
+	test_telecom.set_tx_gain(TX_SIG_OFDM, 1, 2.15);
+
+	// Valid-state parity (flag == geometry): while the loaded WB config is
+	// intact, the geometry-true selector must return exactly what the flag-based
+	// selector returns, for every converted signal type. This is the guarantee
+	// that the fix changes nothing outside the reset split.
+	check(test_telecom.get_ack_geometry_tx_gain(TX_SIG_ACK)
+	          == test_telecom.get_tx_gain(TX_SIG_ACK)
+	      && test_telecom.get_ack_geometry_tx_gain(TX_SIG_OFDM)
+	          == test_telecom.get_tx_gain(TX_SIG_OFDM),
+		"valid WB state: geometry selector matches flag selector");
+
+	cl_telecom_system* saved_telecom = telecom_system;
+	const bool saved_passive_monitor = passive_monitor;
+	const int saved_configuration = current_configuration;
+	const char* saved_gain_env = std::getenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT");
+	const bool had_gain_env = saved_gain_env != NULL;
+	const std::string gain_env_value = had_gain_env ? saved_gain_env : "";
+
+	telecom_system = &test_telecom;
+	passive_monitor = false;
+	current_configuration = CONFIG_NONE;
+	test_telecom.current_configuration = CONFIG_NONE;
+	test_telecom.narrowband_enabled = YES;  // the reset split: flag NB, geometry WB
+
+	setenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT", "1", 1);
+	const double legacy_ack = test_telecom.get_ack_geometry_tx_gain(TX_SIG_ACK);
+	const double legacy_ofdm = test_telecom.get_ack_geometry_tx_gain(TX_SIG_OFDM);
+	unsetenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT");
+	const double fixed_ack = test_telecom.get_ack_geometry_tx_gain(TX_SIG_ACK);
+	const double fixed_ofdm = test_telecom.get_ack_geometry_tx_gain(TX_SIG_OFDM);
+	const double ack_excess_db = 20.0 * std::log10(legacy_ack / fixed_ack);
+	const double ofdm_excess_db = 20.0 * std::log10(legacy_ofdm / fixed_ofdm);
+	check(std::fabs(legacy_ack - 15.61) < 1e-9,
+		"D0 former selector chooses ACK-NB for cached WB geometry");
+	check(std::fabs(fixed_ack - 3.655) < 1e-9,
+		"default selector chooses ACK-WB from the rendered geometry");
+	check(ack_excess_db > 10.0 && std::fabs(ack_excess_db - 12.6103) < 0.01,
+		"D0 ACK gain excess is greater than 10 dB and matches the panel arithmetic");
+	check(std::fabs(legacy_ofdm - 2.15) < 1e-9,
+		"D0 former selector chooses OFDM-NB for cached WB geometry");
+	check(std::fabs(fixed_ofdm - 0.976) < 1e-9,
+		"default selector chooses OFDM-WB from the rendered geometry");
+	check(ofdm_excess_db > 5.0 && ofdm_excess_db < 8.0,
+		"D0 OFDM gain excess is between 5 and 8 dB (panel arithmetic)");
+
+	auto render_post_fir = [&](bool defeat, long long* clips, double* peak) {
+		if(defeat) setenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT", "1", 1);
+		else unsetenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT");
+		const int pattern_samples = test_telecom.ack_sack_pattern_passband_samples;
+		const int symbol_period = test_telecom.data_container.Nofdm
+			* test_telecom.data_container.interpolation_rate;
+		const int padded_size = pattern_samples + 2 * symbol_period;
+		std::vector<double> raw((size_t)padded_size, 0.0);
+		std::vector<double> filtered1((size_t)padded_size, 0.0);
+		std::vector<double> filtered2((size_t)padded_size, 0.0);
+		const int generated = test_telecom.generate_ack_sack_pattern_passband(
+			&raw[(size_t)symbol_period], 6, 0x155u, 0x321u);
+		if(generated != pattern_samples)
+			return false;
+		std::memcpy(&raw[0], &raw[(size_t)symbol_period],
+			(size_t)symbol_period * sizeof(double));
+		std::memcpy(&raw[(size_t)symbol_period + (size_t)pattern_samples],
+			&raw[(size_t)pattern_samples], (size_t)symbol_period * sizeof(double));
+		test_telecom.ofdm.FIR_tx1.apply(raw.data(), filtered1.data(), padded_size);
+		test_telecom.ofdm.FIR_tx2.apply(filtered1.data(), filtered2.data(), padded_size);
+		*clips = 0;
+		*peak = 0.0;
+		for(int i = 0; i < pattern_samples; i++)
+		{
+			const double a = std::fabs(filtered2[(size_t)symbol_period + (size_t)i]);
+			if(a > *peak) *peak = a;
+			if(a > 1.0) (*clips)++;
+		}
+		return true;
+	};
+
+	long long legacy_clips = 0, fixed_clips = 0;
+	double legacy_peak = 0.0, fixed_peak = 0.0;
+	check(render_post_fir(true, &legacy_clips, &legacy_peak),
+		"D0 production renderer completes with the former selector");
+	check(render_post_fir(false, &fixed_clips, &fixed_peak),
+		"default production renderer completes with geometry-directed gain");
+	check(legacy_clips > 0 && legacy_peak > 1.0,
+		"D0 former selector produces source-clipped post-FIR samples");
+	check(fixed_clips == 0 && fixed_peak < 1.0,
+		"default geometry-directed renderer has zero source clips");
+	check(fixed_peak > 0.0,
+		"terminal ACK renders non-zero samples in the dual-CONFIG_NONE state");
+
+	if(had_gain_env) setenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT", gain_env_value.c_str(), 1);
+	else unsetenv("MERCURY_CTL_GAIN_SELECTOR_DEFEAT");
+	telecom_system = saved_telecom;
+	passive_monitor = saved_passive_monitor;
+	current_configuration = saved_configuration;
+
+	printf("[TEST-CTL-GAIN] %s (%d issue%s; legacy_ack_peak=%.6f legacy_clips=%lld "
+	       "fixed_ack_peak=%.6f fixed_clips=%lld ack_excess_db=%.4f ofdm_excess_db=%.4f)\n",
+		bad == 0 ? "ALL PASS" : "ISSUES", bad, bad == 1 ? "" : "s",
+		legacy_peak, legacy_clips, fixed_peak, fixed_clips, ack_excess_db, ofdm_excess_db);
+	fflush(stdout);
+	return bad;
+}
+
 static int g_mfsk_ack_sack_test_freed_buffers = 0;
 static int g_mfsk_ack_sack_test_ptt_off_calls = 0;
 

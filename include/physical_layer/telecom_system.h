@@ -1329,6 +1329,10 @@ public:
 	// TX gain table: per signal-type × NB/WB mode amplitude scalars
 	double tx_gain[TX_SIG_COUNT][2][2];  // [signal_type][nb_mod][nb_fir]
 	double get_tx_gain(tx_signal_type sig) const;
+	// Control/OFDM patterns are rendered by the already-loaded geometry. That
+	// geometry may briefly outlive a session-mode flag change during teardown,
+	// so its level selector must follow ack_mfsk.M rather than the flag.
+	double get_ack_geometry_tx_gain(tx_signal_type sig) const;
 	void init_tx_gain_defaults();
 	void print_tx_gain_table() const;
 	// Calibration override (plan §7.13.21). Sets both [sig][nb_mode][0] and
