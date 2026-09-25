@@ -50,8 +50,8 @@ modeled_wire_capacity_Bmin for capacity-model audit.
 
 AXIS + WIDTH GUARDRAIL (the vs-bar / scoreboard gate): a cell that carries a
 VARA bar is a vs-bar row, and a vs-bar comparison is only meaningful on the
-honest (steady) P_sig axis at a cohort width the high-SNR break/storm fraction
-is not perturbed by. Two confirmed poisons are refused before any scoreboard is
+honest P_sig axis (steady, or the bench axis the twin runs) at a cohort width
+the high-SNR break/storm fraction is not perturbed by. Two confirmed poisons are refused before any scoreboard is
 emitted: a hot/unknown P_sig axis (instrument #16) and an over-wide / unrecorded
 cohort width (candidate instrument #17). Refusal is LOUD and lists every
 offending cell. Legitimate exceptions get an explicit escape (--axis-override
@@ -113,13 +113,14 @@ def load_cells(paths):
 # AXIS + WIDTH GUARDRAIL (the vs-bar / scoreboard gate)
 # --------------------------------------------------------------------------
 # A vs-bar row compares a cell's MEASURED rate to the VARA bar. That comparison
-# is only meaningful on the honest (steady) P_sig axis and at a cohort width the
+# is only meaningful on an honest P_sig axis and at a cohort width the
 # high-SNR link-phase break/storm fraction is not perturbed by. Two confirmed
 # poisons must never silently reach the scoreboard:
 #   * instrument #16 -- a hot 'peak' P_sig axis (or an unknown/missing one)
 #     hot-labels the delivered SNR, so the cell sits at a DIFFERENT true
 #     coordinate than its label claims when scored against the bar;
-#   * candidate instrument #17 -- a scoreboard scored at a cohort width > 8
+#   * candidate instrument #17 -- a scoreboard scored at a cohort width above
+#     the certified per-box width
 #     (a single over-wide spawner) OR with a sibling cohort overlapping on the
 #     box (the 8+2 confound) perturbs the break/storm fraction, and an
 #     unrecorded width hides it.
@@ -127,6 +128,16 @@ def load_cells(paths):
 # reduction with no bar (or run with --no-vs-bar) stays byte-identical to the
 # legacy reducer.
 _AXIS_OVERRIDES = ("peak-control", "hwcal")
+# Honest axes: "steady" (the sim P_sig reference) and "bench" (fixed noise per
+# dial from the IONOS front-panel calibration; the twin bridge resolves an
+# unset/steady/bench request to bench, bridge_reference.py). "peak" and a
+# missing/unknown axis stay refused.
+_HONEST_AXES = ("steady", "bench")
+# Certified load-invariant scoring width per box (width doctrine 2026-09-07:
+# breaks at 24-wide equal breaks idle on the native C bridge). A cohort above
+# it needs its own certification; --width-limit changes it and the value used
+# is written into the reduction.
+WIDTH_LIMIT_CERTIFIED = 24
 
 
 def _int_or_none(x):
@@ -136,7 +147,7 @@ def _int_or_none(x):
         return None
 
 
-def _axis_width_offense(d, override=None):
+def _axis_width_offense(d, override=None, width_limit=WIDTH_LIMIT_CERTIFIED):
     """Return the list of axis/width offense reasons for a vs-bar cell.
 
     Empty list == the cell is clean and may be scored against the bar.
@@ -154,16 +165,16 @@ def _axis_width_offense(d, override=None):
     mode_s = mode.strip().lower() if isinstance(mode, str) else mode
     # ---- axis (P_sig mode; instrument #16) ----
     if override == "peak-control":
-        if mode_s not in ("steady", "peak"):
+        if mode_s not in _HONEST_AXES + ("peak",):
             reasons.append(
-                "psig_mode=%r (peak-control override admits only steady/peak)"
-                % (mode,))
+                "psig_mode=%r (peak-control override admits only "
+                "steady/bench/peak)" % (mode,))
     elif mode_s is None:
         reasons.append("psig_mode MISSING (axis provenance unknown; "
                        "instrument #16 -- pass --axis-override if legitimate)")
-    elif mode_s != "steady":
-        reasons.append("psig_mode=%r != 'steady' (hot axis, instrument #16)"
-                       % (mode,))
+    elif mode_s not in _HONEST_AXES:
+        reasons.append("psig_mode=%r not an honest axis (steady|bench; hot or "
+                       "unknown axis, instrument #16)" % (mode,))
     # ---- width (cohort concurrency; candidate instrument #17) ----
     sw = d.get("spawner_width")
     if sw is None:
@@ -175,16 +186,16 @@ def _axis_width_offense(d, override=None):
         swi = _int_or_none(sw)
         if swi is None:
             reasons.append("spawner_width=%r not an integer" % (sw,))
-        elif swi > 8:
-            reasons.append("spawner_width=%d > 8 (over-wide cohort, "
-                           "candidate instrument #17)" % (swi,))
+        elif swi > width_limit:
+            reasons.append("spawner_width=%d > %d (over-wide cohort, "
+                           "candidate instrument #17)" % (swi, width_limit))
     # Box concurrency catches the 8+2 sibling-overlap that spawner_width alone
     # misses (spawner_width=8 but two sibling cells ran on the box == width 10).
     bce = _int_or_none(d.get("box_concurrent_estimate"))
-    if bce is not None and bce > 8:
-        reasons.append("box_concurrent_estimate=%d > 8 (a scoreboard+sibling "
-                       "overlap ran on the box; the 8+2 concurrency confound)"
-                       % (bce,))
+    if bce is not None and bce > width_limit:
+        reasons.append("box_concurrent_estimate=%d > %d (a scoreboard+sibling "
+                       "overlap ran on the box; the concurrency confound)"
+                       % (bce, width_limit))
     return reasons
 
 
@@ -420,6 +431,10 @@ def main(argv=None):
                          "'hwcal' (a CAL-measured hardware row). Without it the "
                          "scoreboard refuses any non-steady / over-wide vs-bar "
                          "row.")
+    ap.add_argument("--width-limit", type=int, default=WIDTH_LIMIT_CERTIFIED,
+                    help="per-box cohort width above which a vs-bar row is "
+                         "refused (default: the certified %d)"
+                         % WIDTH_LIMIT_CERTIFIED)
     ap.add_argument("--no-vs-bar", action="store_true",
                     help="reduce WITHOUT the vs-bar axis/width gate (the "
                          "non-vs-bar reduction path; output is byte-identical to "
@@ -457,7 +472,8 @@ def main(argv=None):
                 continue
             if _f(c.get("vara_bar_Bmin")) is None:
                 continue           # not a vs-bar row -> not gated
-            reasons = _axis_width_offense(c, args.axis_override)
+            reasons = _axis_width_offense(c, args.axis_override,
+                                          args.width_limit)
             if reasons:
                 offenders.append((os.path.basename(c.get("_file") or ""),
                                   c.get("tag"), reasons))
@@ -469,10 +485,11 @@ def main(argv=None):
                 print("  - %s (tag=%s): %s"
                       % (fname, tag, "; ".join(reasons)), file=sys.stderr)
             print("[ra_reduce] a vs-bar row is comparable to the VARA bar ONLY "
-                  "on a steady P_sig axis at cohort width <= 8. Fix the cohort, "
+                  "on an honest P_sig axis (steady|bench) at cohort width <= %d. "
+                  "Fix the cohort, "
                   "OR pass --axis-override {peak-control|hwcal} for a legitimate "
                   "control / HW-cal row, OR --no-vs-bar to reduce without the "
-                  "bar comparison.", file=sys.stderr)
+                  "bar comparison." % args.width_limit, file=sys.stderr)
             return 2
 
     rows = [reduce_cell(c, recon_tol=args.recon_tol) for c in cells]
@@ -484,6 +501,14 @@ def main(argv=None):
                      if r.get("completion_field_disagrees")]
     reduced = {
         "reducer": "ra_reduce.py",
+        "axis_width_gate": {
+            "honest_axes": list(_HONEST_AXES),
+            "width_limit": args.width_limit,
+            "axis_override": args.axis_override,
+            "widths": sorted({(str(c.get("spawner_width")),
+                               str(c.get("box_concurrent_estimate")))
+                              for c in cells if "_load_error" not in c}),
+        },
         "spec": "_research/CANONICAL_METRICS.md (2026-07-31)",
         "n_cells": n_ok,
         "n_load_errors": n_err,
