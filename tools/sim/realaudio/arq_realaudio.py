@@ -643,6 +643,26 @@ def delivery_endpoint_times(events):
             "delivery_event_count": len(events)}
 
 
+def modem_bandwidth_args(mode, skip_nb_probe):
+    """Bandwidth-entry flags for one modem.
+
+    In ARQ mode -W only sets the value that ARQ start-up overwrites: the session
+    starts narrowband unless the NB probe count is 0 with automatic bandwidth
+    (mercury source/main.cc -W at 7310-7312, overwrite at 9840, condition at
+    9808-9811). So the wb arm passes -Q 0 as well; without it a wb cell entered
+    exactly like an auto cell."""
+    c = []
+    if mode == "wb":
+        c += ["-W"]
+    elif mode == "auto":
+        c += ["-M", "auto"]
+    elif mode == "nb":
+        c += ["-M", "nb"]
+    if skip_nb_probe or mode == "wb":
+        c += ["-Q", "0"]
+    return c
+
+
 def dev(card, devno, sub):
     return f"hw:{card},{devno},{sub}"
 
@@ -1069,22 +1089,15 @@ def main():
         c += ["-p", str(port), "-x", "alsa", "-i", in_dev, "-o", out_dev,
               "-n", "-F", force_compress_flag,
               "--wire-stamp", str(args.wire_stamp)]
-        # bandwidth election (capstone STEP 3 FLOOR cell). wb forces WB (-W, the
-        # original harness default); auto/nb enable the NB/WB election so the
-        # low-SNR floor is not understated (forcing -W would block NB election).
-        if args.mode == "wb":
-            c += ["-W"]
-        elif args.mode == "auto":
-            c += ["-M", "auto"]
-        elif args.mode == "nb":
-            c += ["-M", "nb"]
+        # bandwidth election (capstone STEP 3 FLOOR cell): wb starts direct-WB
+        # (-W -Q 0, see modem_bandwidth_args); auto/nb enable the NB/WB election so
+        # the low-SNR floor is not understated.
         # -g (gearshift) and -Q 0 (skip the NB probe, start direct-WB) are INDEPENDENT
         # knobs. Welding them together meant a pinned-vs-climbing comparison silently
         # differed by TWO flags, so no single-variable A/B on the gearshift was possible.
+        c += modem_bandwidth_args(args.mode, args.skip_nb_probe)
         if not args.no_gearshift:
             c += ["-g"]
-        if args.skip_nb_probe:
-            c += ["-Q", "0"]
         if use_robust:
             c += ["-R"]
         # Encryption: -E <mode> + matching -K <psk-hex> on BOTH peers. The PSK is
