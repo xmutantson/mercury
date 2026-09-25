@@ -2261,6 +2261,9 @@ def main():
         "content_md5_ok": content_md5_ok,
         # completion_at_s = GOOD-PREFIX crossing (honest); the legacy count
         # crossing is retained separately for audit.
+        # the harness clock origin on CLOCK_MONOTONIC (time.monotonic on Linux), so
+        # bridge clip-log times (mono_s) can be placed on the [T+] clock
+        "harness_t0_monotonic_s": t0,
         "completion_at_s": completion["at_s"],
         "completion_count_at_s": completion["count_at_s"],
         # last delivered byte (endpoint of an incomplete cell, D84) and the last

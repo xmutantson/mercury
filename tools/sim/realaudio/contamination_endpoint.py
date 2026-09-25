@@ -15,8 +15,13 @@ What is time-located and what is not:
     harness reads the line after it is printed, so its window is taken as
     [T - WINDOW_S, T] and a window that starts at or before the endpoint counts as
     BEFORE the endpoint.
-  * Bridge input_at_fs / hard_clips are per-direction CELL TOTALS; bursts.jsonl has no
-    per-burst clip count. They are placed in time only by ACCOUNTING IDENTITY:
+  * Bridge input_at_fs / hard_clips: when the cell carries the bridge clip log
+    (<stats>.clips.jsonl, one line per chunk that clipped, CLOCK_MONOTONIC time) and the
+    result carries harness_t0_monotonic_s, each clipped chunk is placed on the harness
+    clock; a chunk counts as BEFORE the endpoint when its earliest capture time
+    (mono_s - lat_s - t0) is at or before the endpoint. The clip-log counts must add up
+    to the stats totals, else the cell falls back to the identity below.
+    Otherwise they are per-direction CELL TOTALS, placed in time only by ACCOUNTING IDENTITY:
       - input_at_fs(dir) is explained when it is <= the summed sample counts of the
         post-endpoint [TX-CLIP] lines of the peer transmitting in that direction
         (fwd = CMD -> RSP, rev = RSP -> CMD). The modem clamps at full scale, so each
@@ -59,6 +64,35 @@ def tx_clip_events(arq_log):
     return events, raw_mentions
 
 
+def located_bridge_clips(cell_dir, result, stats, endpoint):
+    """Per-direction pre/post-endpoint bridge clip counts from the clip log, or None when
+    the cell cannot be time-located (no log, no harness t0, totals disagree)."""
+    paths = list((cell_dir / "logs").glob("bridge_*_stats.json.clips.jsonl"))
+    t0 = result.get("harness_t0_monotonic_s")
+    if len(paths) != 1 or t0 is None or endpoint is None:
+        return None
+    out = {d: {"hard_pre": 0, "hard_post": 0, "infs_pre": 0, "infs_post": 0, "hard": 0, "infs": 0}
+           for d in ("fwd", "rev")}
+    for line in paths[0].read_text().splitlines():
+        if not line.strip():
+            continue
+        ev = json.loads(line)
+        if ev.get("event") != "clip" or ev.get("dir") not in out:
+            continue
+        o = out[ev["dir"]]
+        start = float(ev["mono_s"]) - float(ev.get("lat_s", 0.0)) - float(t0)
+        side = "pre" if start <= endpoint else "post"
+        o["hard_" + side] += int(ev.get("hard_clips", 0))
+        o["infs_" + side] += int(ev.get("input_at_fs", 0))
+        o["hard"] += int(ev.get("hard_clips", 0))
+        o["infs"] += int(ev.get("input_at_fs", 0))
+    for d, o in out.items():
+        if (o["hard"] != int(stats.get(d, {}).get("hard_clips", 0))
+                or o["infs"] != int(stats.get(d, {}).get("input_at_fs", 0))):
+            return None
+    return out
+
+
 def classify(cell_dir):
     result = json.loads((cell_dir / "result.json").read_text())
     stats_paths = list((cell_dir / "logs").glob("bridge_*_stats.json"))
@@ -88,6 +122,8 @@ def classify(cell_dir):
     row["tx_clip_post_endpoint"] = len(post)
     reasons = []
     flagged = bool(events)
+    located = located_bridge_clips(cell_dir, result, stats, endpoint)
+    row["bridge_clip_attribution"] = "time-located" if located else "screen"
     for d in ("fwd", "rev"):
         infs = int(stats.get(d, {}).get("input_at_fs", 0))
         hard = int(stats.get(d, {}).get("hard_clips", 0))
@@ -96,6 +132,13 @@ def classify(cell_dir):
         if infs or hard:
             flagged = True
         if endpoint is None:
+            continue
+        if located:
+            row[d]["located"] = located[d]
+            if located[d]["infs_pre"]:
+                reasons.append("%s-input_at_fs-before-endpoint" % d)
+            if located[d]["hard_pre"]:
+                reasons.append("%s-hard_clips-before-endpoint" % d)
             continue
         infs_explained = infs <= post_sum
         if infs and not infs_explained:
@@ -109,7 +152,7 @@ def classify(cell_dir):
     row["flagged_any"] = flagged
     row["endpoint_bounded_contaminated"] = bool(reasons)
     row["endpoint_bounded_reasons"] = sorted(set(reasons))
-    row["hard_clip_attribution"] = "screen"
+    row["hard_clip_attribution"] = "time-located" if located else "screen"
     return row
 
 

@@ -89,7 +89,7 @@ typedef struct {
     int noise_lpf_taps;
     bool noise_lpf_set, headroom_set;
     /* Noise reference (see "Noise reference modes" below). */
-    char reference_mode[24], reference_mode_source[16], burst_log[1100];
+    char reference_mode[24], reference_mode_source[16], burst_log[1100], clip_log[1100];
     double psig_fix, floor_ref, class_tol_db, shift_db;
     double ofdm_ref, kind_kurt_thr, kind_bw_thr_hz;
     char ofdm_ref_source[16];
@@ -535,10 +535,21 @@ static double noise_power_ratio(const channel_t*c){
  * scale, so with the noise held at headroom_rms the composite essentially
  * never reaches full scale.
  */
+/* Fading profiles: the two-path sum (g0*z + g1*zd)/sqrt(2) lifts a transmission
+ * above its unfaded level whenever the taps add up, and the noise law above only
+ * scales for the noise. On a fading channel the receiver gain is therefore capped
+ * at 1/2 (6 dB of fade headroom): a transmission whose peaks sit near full scale
+ * then clips only where the instantaneous fade gain exceeds 2, i.e. the tap power
+ * exceeds 4x its mean (Rayleigh: exp(-4) of the time) AND the waveform is at a
+ * peak. The scale multiplies signal and noise together, so SNR is unchanged. */
+#define FADE_HEADROOM_SCALE 0.5
+static double fade_capped(const channel_t*c,double s){
+    return (c->fading&&c->opt.headroom_rms>0&&!c->opt.passthrough&&s>FADE_HEADROOM_SCALE)?FADE_HEADROOM_SCALE:s;
+}
 static double composite_scale_for(const channel_t*c){
     if(!(c->opt.headroom_rms>0)||c->opt.passthrough)return 1.0;
     double sn=c->noise_std*(c->nf_n?sqrt(c->nf_gain2):1.0);
-    return sn>c->opt.headroom_rms?c->opt.headroom_rms/sn:1.0;
+    return fade_capped(c,sn>c->opt.headroom_rms?c->opt.headroom_rms/sn:1.0);
 }
 static int channel_init(channel_t*c,const options_t*o,uint32_t seed){
     memset(c,0,sizeof(*c));c->opt=*o;
@@ -638,6 +649,21 @@ static void geo_open(channel_t*c,double est,bool*first){
 }
 typedef struct { size_t a,b; bool burst,onset,offset,split,first; int cls; double ns; } geo_seg_t;
 static FILE*g_burst_log;static pthread_mutex_t g_burst_log_lock=PTHREAD_MUTEX_INITIALIZER;
+/* Clip log: one JSON line per processed chunk that carried a clipped sample, with the
+ * chunk's position on the bridge sample clock and the CLOCK_MONOTONIC time it was
+ * emitted, so a clip can be placed against the harness clock (same clock on Linux).
+ * lat_s bounds how long before mono_s the chunk's samples entered the capture ring. */
+static FILE*g_clip_log;static pthread_mutex_t g_clip_log_lock=PTHREAD_MUTEX_INITIALIZER;
+static void clip_event(const char*dir,uint64_t chunk_start,size_t n,double lat_s,
+                       uint64_t hard,uint64_t over,uint64_t infs,double scale){
+    if(!g_clip_log||!(hard||over||infs))return;
+    struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
+    pthread_mutex_lock(&g_clip_log_lock);
+    fprintf(g_clip_log,"{\"dir\":\"%s\",\"event\":\"clip\",\"t_s\":%.6f,\"dur_s\":%.6f,\"mono_s\":%.6f,\"lat_s\":%.6f,\"hard_clips\":%"PRIu64",\"over_fs_unscaled\":%"PRIu64",\"input_at_fs\":%"PRIu64",\"composite_scale\":%.9g}\n",
+            dir,(double)chunk_start/RATE,(double)n/RATE,(double)now.tv_sec+now.tv_nsec*1e-9,lat_s,hard,over,infs,scale);
+    fflush(g_clip_log);
+    pthread_mutex_unlock(&g_clip_log_lock);
+}
 /*
  * Waveform features of one transmission, from the clean input:
  *   kurtosis E[x^4]/E[x^2]^2: a constant-envelope tone is 1.5, two equal tones
@@ -807,7 +833,7 @@ static void channel_process(channel_t*c,const double*x,double*out,size_t n){
          * carried, so it is constant inside a transmission and only ever steps
          * down, when a louder class first appears. */
         double sn=c->noise_rms_max*(c->nf_n?sqrt(c->nf_gain2):1.0);
-        c->composite_scale=(!(c->opt.headroom_rms>0)||c->opt.passthrough||sn<=c->opt.headroom_rms)?1.0:c->opt.headroom_rms/sn;
+        c->composite_scale=fade_capped(c,(!(c->opt.headroom_rms>0)||c->opt.passthrough||sn<=c->opt.headroom_rms)?1.0:c->opt.headroom_rms/sn);
     }else c->composite_scale=composite_scale_for(c);
     if(c->composite_scale<c->scale_min)c->scale_min=c->composite_scale;
 
@@ -910,12 +936,13 @@ static void *pump_main(void*arg){
         size_t n=(size_t)nr;bool signal=false;double ss=0;uint64_t infs=0;
         for(size_t i=0;i<n;i++){if(in[2*i])signal=true;if(in[2*i]>=INT32_MAX||in[2*i]<=-INT32_MAX)infs++;x[i]=(double)in[2*i]/INT_MAX_D;ss+=x[i]*x[i];}
         maybe_erase_burst(p,x,n,signal);
-        double peak=0;uint64_t hard=0,over=0;
+        double peak=0;uint64_t hard=0,over=0;const uint64_t chunk_start=p->channel.sample_clock;
         if(p->opt->passthrough){for(size_t i=0;i<n;i++)ob[2*i]=ob[2*i+1]=in[2*i];}
         else{
             channel_process(&p->channel,x,out,n);
             emit_s32(&p->channel,out,ob,n,&peak,&hard,&over);
         }
+        clip_event(p->name,chunk_start,n,(double)(n+(size_t)p->opt->cap_periods*PERIOD)/RATE,hard,over,infs,p->channel.composite_scale);
         int xruns=0;int wr=write_frames(play,ob,n,&xruns);if(wr<0)xruns++;
         stats_add(p,n,signal,ss,xruns,peak,hard,hard,p->opt->passthrough?0:n,over,infs);if(wr<0&&!stop_requested)snd_pcm_prepare(play);
     }
@@ -1045,7 +1072,7 @@ static void defaults(options_t*o){
     if(bp&&!strcmp(bp,"narrow")){o->bp_lo=300;o->bp_hi=2900;}
     else if(bp&&!strcmp(bp,"wide")){o->bp_lo=300;o->bp_hi=6300;}
 }
-static void usage(FILE*f){fprintf(f,"usage: realaudio_bridge_s32_c [Python-compatible bridge options]\n       channel: --noise-lpf-hz HZ (default 4000, 0=full band) --headroom-rms R (default 0.12, 0=off) --legacy-fullband\n       reference: --reference-mode bench|per-class|legacy-median|fix|peak (default bench)\n                  --ofdm-ref P (bench: OFDM WB data power the noise is set from) --psig-fix P (fix)\n                  --floor-ref P (per-class silence, default 0.0206) --kind-kurtosis-thr K --kind-band-thr-hz B\n                  --class-tol-db D --shift-db D --burst-log F (default <statsfile>.bursts.jsonl)\n       test modes: --vector-in F --vector-out F [--format-only|--passthrough]\n                   --double-in F --double-out F | --tap-out F --tap-count N\n");}
+static void usage(FILE*f){fprintf(f,"usage: realaudio_bridge_s32_c [Python-compatible bridge options]\n       channel: --noise-lpf-hz HZ (default 4000, 0=full band) --headroom-rms R (default 0.12, 0=off) --legacy-fullband\n       reference: --reference-mode bench|per-class|legacy-median|fix|peak (default bench)\n                  --ofdm-ref P (bench: OFDM WB data power the noise is set from) --psig-fix P (fix)\n                  --floor-ref P (per-class silence, default 0.0206) --kind-kurtosis-thr K --kind-band-thr-hz B\n                  --class-tol-db D --shift-db D --burst-log F (default <statsfile>.bursts.jsonl)\n                  --clip-log F (default <statsfile>.clips.jsonl; one line per chunk that clipped)\n       test modes: --vector-in F --vector-out F [--format-only|--passthrough]\n                   --double-in F --double-out F | --tap-out F --tap-count N\n");}
 static int val(int argc,char**argv,int*i,const char**v){if(*i+1>=argc)return-1;*v=argv[++*i];return 0;}
 static int parse_profile(options_t*o,const char*s){
     snprintf(o->profile_name,sizeof(o->profile_name),"%s",s);for(char*p=o->profile_name;*p;p++)*p=(char)tolower((unsigned char)*p);
@@ -1065,6 +1092,7 @@ static int parse_args(int argc,char**argv,options_t*o){
         else if(!strcmp(a,"--kind-kurtosis-thr"))o->kind_kurt_thr=strtod(v,NULL);else if(!strcmp(a,"--kind-band-thr-hz"))o->kind_bw_thr_hz=strtod(v,NULL);
         else if(!strcmp(a,"--floor-ref"))o->floor_ref=strtod(v,NULL);else if(!strcmp(a,"--class-tol-db"))o->class_tol_db=strtod(v,NULL);else if(!strcmp(a,"--shift-db"))o->shift_db=strtod(v,NULL);
         else if(!strcmp(a,"--burst-log"))snprintf(o->burst_log,sizeof(o->burst_log),"%s",v);
+        else if(!strcmp(a,"--clip-log"))snprintf(o->clip_log,sizeof(o->clip_log),"%s",v);
         else if(!strcmp(a,"--noise-lpf-hz")){o->noise_lpf_hz=strtod(v,NULL);o->noise_lpf_set=true;}else if(!strcmp(a,"--noise-lpf-taps"))o->noise_lpf_taps=(int)strtol(v,NULL,10);else if(!strcmp(a,"--headroom-rms")){o->headroom_rms=strtod(v,NULL);o->headroom_set=true;}
         else if(!strcmp(a,"--vector-in"))snprintf(o->vector_in,sizeof(o->vector_in),"%s",v);else if(!strcmp(a,"--vector-out"))snprintf(o->vector_out,sizeof(o->vector_out),"%s",v);else if(!strcmp(a,"--double-in"))snprintf(o->double_in,sizeof(o->double_in),"%s",v);else if(!strcmp(a,"--double-out"))snprintf(o->double_out,sizeof(o->double_out),"%s",v);else if(!strcmp(a,"--tap-out"))snprintf(o->tap_out,sizeof(o->tap_out),"%s",v);else if(!strcmp(a,"--tap-count"))o->tap_count=(size_t)strtoull(v,NULL,10);else if(!strcmp(a,"--tap-stride"))o->tap_stride=(size_t)strtoull(v,NULL,10);else return-1;
     }
@@ -1105,16 +1133,19 @@ static int vector_mode(const options_t*o){
     FILE*fi=fopen(o->vector_in,"rb"),*fo=fopen(o->vector_out,"wb");if(!fi||!fo){perror("vector file");return 2;}channel_t c;if(channel_init(&c,o,(uint32_t)(o->seed*UINT32_C(2654435761))))return 2;strcpy(c.name,"vec");
     c.sched_offline=true;strcpy(c.sched_tag,"vec");
     if((c.psig_mode==PSIG_GEOMETRY||c.psig_mode==PSIG_BENCH)&&o->burst_log[0]&&strcmp(o->burst_log,"-")){g_burst_log=fopen(o->burst_log,"w");if(!g_burst_log){perror("burst log");return 2;}}
+    if(o->clip_log[0]&&strcmp(o->clip_log,"-")){g_clip_log=fopen(o->clip_log,"w");if(!g_clip_log){perror("clip log");return 2;}}
     int32_t ib[PERIOD*2],ob[PERIOD*2];double x[PERIOD],y[PERIOD],vpk=0;size_t words;uint64_t vhard=0,vover=0,vden=0;
     while((words=fread(ib,sizeof(int32_t),PERIOD*2,fi))){size_t n=words/2;for(size_t i=0;i<n;i++)x[i]=(double)ib[2*i]/INT_MAX_D;
         if(o->passthrough){for(size_t i=0;i<n;i++)ob[2*i]=ob[2*i+1]=ib[2*i];}
-        else {if(o->format_only)memcpy(y,x,n*sizeof(double));else channel_process(&c,x,y,n);emit_s32(&c,y,ob,n,&vpk,&vhard,&vover);vden+=n;}
+        else {const uint64_t h0=vhard,o0=vover,cs=c.sample_clock;if(o->format_only)memcpy(y,x,n*sizeof(double));else channel_process(&c,x,y,n);emit_s32(&c,y,ob,n,&vpk,&vhard,&vover);vden+=n;
+            clip_event("vec",cs,n,0.0,vhard-h0,vover-o0,0,c.composite_scale);}
         if(fwrite(ob,sizeof(int32_t),n*2,fo)!=n*2){perror("write");return 2;}if(words%2)break;
     }
     fprintf(stderr,"[bridge_s32_c] vector clip hard=%"PRIu64" over_fs_unscaled=%"PRIu64" den=%"PRIu64" composite_scale=%.9g noise_lpf_hz=%g pre_scale_peak=%.6g\n",vhard,vover,vden,c.composite_scale,c.nf_n?o->noise_lpf_hz:0.0,vpk);
     if(c.psig_mode==PSIG_GEOMETRY||c.psig_mode==PSIG_BENCH){if(c.in_burst)geo_finalize(&c,false);fprintf(stderr,"[bridge_s32_c] vector geometry reference_mode=%s transmissions=%"PRIu64" classes=%d worst_snr3k_error_db=%.4f\n",o->reference_mode,c.bursts_done,c.ncls,c.worst_snr_err_db);}
     else fprintf(stderr,"[bridge_s32_c] vector reference_mode=%s reference_power=%.9g\n",o->reference_mode,c.p_sig);
     if(g_burst_log){fclose(g_burst_log);g_burst_log=NULL;}
+    if(g_clip_log){fclose(g_clip_log);g_clip_log=NULL;}
     schedule_finalize();write_schedule_statsfile(o);channel_free(&c);fclose(fi);fclose(fo);return 0;
 }
 static int double_mode(const options_t*o){
@@ -1137,6 +1168,8 @@ int main(int argc,char**argv){
     strcpy(fwd.channel.sched_tag,"fwd");strcpy(rev.channel.sched_tag,"rev");
     strcpy(fwd.channel.name,"fwd");strcpy(rev.channel.name,"rev");
     if(!o.burst_log[0]&&o.statsfile[0])snprintf(o.burst_log,sizeof(o.burst_log),"%s.bursts.jsonl",o.statsfile);
+    if(!o.clip_log[0]&&o.statsfile[0])snprintf(o.clip_log,sizeof(o.clip_log),"%s.clips.jsonl",o.statsfile);
+    if(o.clip_log[0]&&strcmp(o.clip_log,"-")){g_clip_log=fopen(o.clip_log,"w");if(!g_clip_log){fprintf(stderr,"[bridge_s32_c] clip log %s: %s\n",o.clip_log,strerror(errno));return 2;}}
     if((fwd.channel.psig_mode==PSIG_GEOMETRY||fwd.channel.psig_mode==PSIG_BENCH)&&o.burst_log[0]&&strcmp(o.burst_log,"-")){g_burst_log=fopen(o.burst_log,"w");if(!g_burst_log){fprintf(stderr,"[bridge_s32_c] burst log %s: %s\n",o.burst_log,strerror(errno));return 2;}}
     fwd.stats.scale=fwd.stats.scale_min=fwd.channel.composite_scale;rev.stats.scale=rev.stats.scale_min=rev.channel.composite_scale;
     fprintf(stderr,"[bridge_s32_c] reference_mode=%s source=%s psig_fix=%.9g floor_ref=%.9g ofdm_ref=%.9g ofdm_ref_source=%s fwd_noise_var=%.9g rev_noise_var=%.9g\n",o.reference_mode,o.reference_mode_source,o.psig_fix,o.floor_ref,o.ofdm_ref,o.ofdm_ref_source,fwd.channel.noise_std*fwd.channel.noise_std,rev.channel.noise_std*rev.channel.noise_std);
@@ -1146,5 +1179,5 @@ int main(int argc,char**argv){
     while(!stop_requested){struct timespec ts={.tv_sec=0,.tv_nsec=500000000};nanosleep(&ts,NULL);flush_stats(&o,&fwd,&rev);}
     pthread_mutex_lock(&fwd.pcm_lock);if(fwd.cap_shared)snd_pcm_drop(fwd.cap_shared);if(fwd.play_shared)snd_pcm_drop(fwd.play_shared);pthread_mutex_unlock(&fwd.pcm_lock);
     pthread_mutex_lock(&rev.pcm_lock);if(rev.cap_shared)snd_pcm_drop(rev.cap_shared);if(rev.play_shared)snd_pcm_drop(rev.play_shared);pthread_mutex_unlock(&rev.pcm_lock);
-    pthread_join(tf,NULL);pthread_join(tr,NULL);schedule_finalize();flush_stats(&o,&fwd,&rev);if(g_burst_log){fclose(g_burst_log);g_burst_log=NULL;}channel_free(&fwd.channel);channel_free(&rev.channel);return 0;
+    pthread_join(tf,NULL);pthread_join(tr,NULL);schedule_finalize();flush_stats(&o,&fwd,&rev);if(g_burst_log){fclose(g_burst_log);g_burst_log=NULL;}if(g_clip_log){fclose(g_clip_log);g_clip_log=NULL;}channel_free(&fwd.channel);channel_free(&rev.channel);return 0;
 }

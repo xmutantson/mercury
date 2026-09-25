@@ -80,5 +80,51 @@ class EndpointOfIncompleteCell(unittest.TestCase):
             self.assertIn("tx_clip-before-endpoint", row["endpoint_bounded_reasons"])
 
 
+class ClipLogTimeLocation(unittest.TestCase):
+    """Bridge clips placed by the clip log against the harness clock."""
+
+    def cell(self, d, events, hard, t0=1000.0, completion=50.0):
+        cell = pathlib.Path(d) / "mpg_p40_s4"
+        (cell / "logs").mkdir(parents=True)
+        (cell / "logs" / "arq_mpg_p40_s4.log").write_text("[T+0001.000] [CMD] hello\n")
+        stats = {"fwd": {"input_at_fs": 0, "hard_clips": 0}, "rev": {"input_at_fs": 0, "hard_clips": hard}}
+        (cell / "logs" / "bridge_mpg_p40_s4_stats.json").write_text(json.dumps(stats))
+        (cell / "logs" / "bridge_mpg_p40_s4_stats.json.clips.jsonl").write_text(
+            "".join(json.dumps(e) + "\n" for e in events))
+        (cell / "result.json").write_text(json.dumps({
+            "whole_session_status": "COMPLETE", "completion_at_s": completion,
+            "harness_t0_monotonic_s": t0}))
+        return cell
+
+    def ev(self, mono, n):
+        return {"dir": "rev", "event": "clip", "t_s": 0, "dur_s": 0.01, "mono_s": mono, "lat_s": 0.05,
+                "hard_clips": n, "over_fs_unscaled": n, "input_at_fs": 0, "composite_scale": 0.5}
+
+    def test_clip_before_completion_is_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            row = CE.classify(self.cell(d, [self.ev(1030.0, 7)], 7))
+            self.assertTrue(row["endpoint_bounded_contaminated"])
+            self.assertIn("rev-hard_clips-before-endpoint", row["endpoint_bounded_reasons"])
+            self.assertEqual(row["hard_clip_attribution"], "time-located")
+
+    def test_clip_after_completion_is_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            row = CE.classify(self.cell(d, [self.ev(1052.0, 7)], 7))
+            self.assertFalse(row["endpoint_bounded_contaminated"])
+            self.assertEqual(row["rev"]["located"]["hard_post"], 7)
+
+    def test_capture_latency_counts_toward_before(self):
+        with tempfile.TemporaryDirectory() as d:
+            # emitted 0.03 s after completion, but its samples could be 0.05 s older
+            row = CE.classify(self.cell(d, [self.ev(1050.03, 3)], 3))
+            self.assertTrue(row["endpoint_bounded_contaminated"])
+
+    def test_totals_disagree_falls_back_to_screen(self):
+        with tempfile.TemporaryDirectory() as d:
+            row = CE.classify(self.cell(d, [self.ev(1052.0, 7)], 9))
+            self.assertEqual(row["hard_clip_attribution"], "screen")
+            self.assertTrue(row["endpoint_bounded_contaminated"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
