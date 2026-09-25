@@ -9852,6 +9852,9 @@ start_modem:
             ARQ.local_capability |= CAP_ENCRYPTION;
 #endif
         telecom_system.narrowband_enabled = ARQ.narrowband_enabled;
+        if (narrowband_mode != -1)
+            printf("[FLAG] -%c ignored in ARQ mode: entry bandwidth follows the BW host "
+                   "command and -Q (nb_probe_max)\n", narrowband_mode == 1 ? 'N' : 'W');
         // ROBUST_3 (cfg103) is a pinned-only, off-ladder low-band rung. When it is
         // explicitly pinned in ARQ mode, force the gearshift OFF so no climb / optimizer /
         // SNR producer can negotiate the session off the pinned rung; it is held for the
