@@ -1,0 +1,13 @@
+{
+ "agent": "fade_arq_final_smoke",
+ "box": 21,
+ "bin": "/dev/shm/fade_arq_final/mercury_final",
+ "source_commit": "e6c09618baae0e0e8e8ab68de78e3d12b9cc25cd",
+ "source_tree": "6cdcdb8d2c05fc293ae52fbf850fa67be770ee9a",
+ "port_base": 9600,
+ "secs": 90,
+ "payload": 4096,
+ "waves": [[
+  {"label": "smoke_mpg_d40e_s1", "profile": "mpg", "seed": 1}
+ ]]
+}

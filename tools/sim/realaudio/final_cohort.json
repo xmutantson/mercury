@@ -1,0 +1,48 @@
+{
+ "agent": "fade_arq_final",
+ "box": 21,
+ "bin": "/dev/shm/fade_arq_final/mercury_final",
+ "source_commit": "e6c09618baae0e0e8e8ab68de78e3d12b9cc25cd",
+ "source_tree": "6cdcdb8d2c05fc293ae52fbf850fa67be770ee9a",
+ "port_base": 9200,
+ "recipe": {
+  "dial_db": 40.0,
+  "column": "E",
+  "snr3k_db": 37.3,
+  "mode": "auto",
+  "start_cfg": -1,
+  "payload_bytes": 183717,
+  "deadline_s": 560,
+  "traffic": "random-binary",
+  "force_compress": "off",
+  "wire_stamp": 0,
+  "noise_reference": "bench",
+  "tx_gain": "txgain_bench_calibrated.ini"
+ },
+ "waves": [
+  [
+   {"label": "final_mpg_d40e_s1", "profile": "mpg", "seed": 1},
+   {"label": "final_mpg_d40e_s2", "profile": "mpg", "seed": 2},
+   {"label": "final_mpg_d40e_s3", "profile": "mpg", "seed": 3},
+   {"label": "final_mpg_d40e_s4", "profile": "mpg", "seed": 4}
+  ],
+  [
+   {"label": "final_mpg_d40e_s5", "profile": "mpg", "seed": 5},
+   {"label": "final_mpg_d40e_s6", "profile": "mpg", "seed": 6},
+   {"label": "final_mpg_d40e_s7", "profile": "mpg", "seed": 7},
+   {"label": "final_mpg_d40e_s8", "profile": "mpg", "seed": 8}
+  ],
+  [
+   {"label": "final_mpm_d40e_s1", "profile": "mpm", "seed": 1},
+   {"label": "final_mpm_d40e_s2", "profile": "mpm", "seed": 2},
+   {"label": "final_mpm_d40e_s3", "profile": "mpm", "seed": 3},
+   {"label": "final_mpm_d40e_s4", "profile": "mpm", "seed": 4}
+  ],
+  [
+   {"label": "final_mpm_d40e_s5", "profile": "mpm", "seed": 5},
+   {"label": "final_mpm_d40e_s6", "profile": "mpm", "seed": 6},
+   {"label": "final_mpm_d40e_s7", "profile": "mpm", "seed": 7},
+   {"label": "final_mpm_d40e_s8", "profile": "mpm", "seed": 8}
+  ]
+ ]
+}

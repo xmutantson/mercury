@@ -29,9 +29,10 @@ the same samples Mercury's tx_transfer/rx_transfer move (audioio.c).
      with a Gaussian Doppler power spectrum (Watterson, ITU-R F.1487). Profiles
      (delay spread / Doppler) follow the ITU/ARSFI standard "mid-latitude"
      classes:
-        MPG  GOOD     dtau=0.5 ms  fd=0.1 Hz
-        MPM  MODERATE dtau=1.0 ms  fd=0.5 Hz
-        MPP  POOR     dtau=2.0 ms  fd=1.0 Hz
+        MPG  GOOD      dtau=0.5 ms  fd=0.1 Hz
+        MPM  MODERATE  dtau=1.0 ms  fd=0.5 Hz
+        MPP  POOR      dtau=2.0 ms  fd=1.0 Hz
+        MPD  DISTURBED dtau=4.0 ms  fd=2.0 Hz
      The "wgn" profile disables fading (single unit tap, no Doppler) for a pure
      AWGN reference channel. Collapse on a fading channel now emerges from the
      Rayleigh nulls (the multipath the modem actually sees on HF), NOT from a
@@ -113,9 +114,6 @@ import time
 
 import numpy as np
 
-from sim_axis import (AXIS_CHOICES, AXIS_V0, AXIS_V1, AXIS_V2, DEFAULT_AXIS,
-                      AxisError, cn_from_snr3k, infer_bandwidth, resolve_axis)
-
 CHUNK_SAMPLES = 1024          # MUST match SIM_CHUNK_SAMPLES in audioio.c
 CHUNK_BYTES = CHUNK_SAMPLES * 8
 STAMP_BYTES = 8               # <Q LE uint64 relay-stamped virtual clock (opt-in)
@@ -156,10 +154,12 @@ IONOS_ENDPOINT_SNR3K_CEILING = 49.7  # independently added endpoint self-noise
 def ionos_wgn_to_snr3k(label_db):
     """Map an IONOS WGN dial label to measured external SNR3k.
 
-    The physical 2026-07-21 gate found an approximately unit-slope low/mid
-    mapping with a 4.8 dB intercept and 43.53 dB at WGN:40. Independent noise
-    powers give the 49.7 dB endpoint term below. Direct ``--snr`` remains a
-    literal SNR3k coordinate.
+    Four physical sweeps (both directions) found an approximately unit-slope
+    low/mid-region map with a 4.8 dB intercept.  Fifteen-second captures then
+    measured 43.53 dB at WGN:40, explained by an independent 49.7 dB endpoint
+    self-noise ceiling.  Noise powers add, so the mapping is intentionally
+    nonlinear only near the clean end.  Direct ``--snr`` remains an exact
+    SNR3k coordinate and does not use this compatibility mapping.
     """
     requested = float(label_db) + WGN_TO_SNR3K
     endpoint = IONOS_ENDPOINT_SNR3K_CEILING
@@ -170,9 +170,18 @@ def ionos_wgn_to_snr3k(label_db):
 #   delay spread dtau (s), Doppler spread fd (Hz, 2-sigma Gaussian).
 PROFILES = {
     "wgn": None,                              # no fading (pure AWGN reference)
+    "flat": None,                             # alias of wgn (the legacy flat
+                                              # bench; regression control for
+                                              # the fm_* profile family)
     "mpg": {"dtau": 0.5e-3, "fd": 0.1},       # GOOD
     "mpm": {"dtau": 1.0e-3, "fd": 0.5},       # MODERATE
     "mpp": {"dtau": 2.0e-3, "fd": 1.0},       # POOR
+    "mpd": {"dtau": 4.0e-3, "fd": 2.0},       # DISTURBED (firmware MPD,
+                                              # intMode=4: 4.0 ms delay ->
+                                              # D=192 samples @48 kHz; fd=2.0 Hz
+                                              # -> update=375 samples exact,
+                                              # 7.8125 ms = 64x fd, matches
+                                              # HFSim_BFD_2_03.ino:2269).
 }
 
 
@@ -266,118 +275,145 @@ class AnalyticFilter:
         return i_chunk + 1j * q_chunk
 
 
-# IONOS firmware 128-tap Gaussian Doppler FIR. It is designed for a 64 Hz
-# update rate, Fc=0.5856 Hz, and a Gaussian shape (-9.1 dB at 1 Hz, -37.1 dB
-# at 2 Hz). The coefficients are DC-normalized.
+# ---------------------------------------------------------------------------
+# IONOS firmware 128-tap Gaussian Doppler FIR (ARSFI HFSim_BFD_2_03.ino.src:497-540).
+# Designed for a 64 Hz update rate, Fc=0.5856 Hz, ~Gaussian shape (-9.1 dB @ 1 Hz,
+# -37.1 dB @ 2 Hz). DC-normalized (sum h = 1.0). Lifted verbatim from the firmware
+# (extracted programmatically, NOT hand-transcribed) so the relay's Doppler power
+# spectrum is the SAME Gaussian PSD the bench hardware produced. See the firmware
+# comment block: "File: 128 Tap Adj Gauss LPF Rev2.ih_fir / Sample Freq 64 Hz,
+# Fc=.5856 Hz, Window Off, Num Taps 128, ~Gauss -.900, N Poles=9".
 GAUS_FIR_COEFFS = np.array([
-    1.1755592671332046e-11, 2.0188004956137427e-10, 1.7236333623946176e-09,
-    9.815423109243151e-09, 4.219820040519088e-08, 1.4693429486234634e-07,
-    4.338503956649552e-07, 1.122118806000393e-06, 2.604091536729611e-06,
-    5.522713327023963e-06, 1.0857390465642334e-05, 2.0011412649247494e-05,
-    3.4893068706162795e-05, 5.7982477259392286e-05, 9.237678934582388e-05,
-    0.00014180767284007714, 0.00021062669000635658, 0.0003037561533907518,
-    0.0004266051229102419, 0.000584952237938201, 0.0007847989367901134,
-    0.001032198204838678, 0.001333065243166745, 0.001692977321877409,
-    0.002116970561258896, 0.002609341477645015, 0.003173460865247882,
-    0.00381160700116864, 0.004524824309342139, 0.005312812558055807,
-    0.006173850455688009, 0.007104756211217515, 0.008100886298035966,
-    0.00915617235512072, 0.010263194925878348, 0.01141329161173599,
-    0.012596696236577472, 0.013802704802828978, 0.015019863385625786,
-    0.016236172665450826, 0.01743930354214716, 0.01861681819809535,
-    0.019756391073966928, 0.020846024470695095, 0.021874253876569306,
-    0.02283033861665188, 0.023704434009553566, 0.02448774186995001,
-    0.02517263689027796, 0.025752767148979578, 0.026223127704178725,
-    0.026580106921515002, 0.02682150583616039, 0.026946531447567135,
-    0.026955765379786157, 0.02685110980161695, 0.026635712883536795,
-    0.026313876369100774, 0.025890948056565766, 0.025373202123371387,
-    0.024767710285281262, 0.024082206768594926, 0.02332494999439922,
-    0.022504583735910823, 0.02163000032189053, 0.020710208229666707,
-    0.019754206149457228, 0.018770865316331563, 0.01776882160593159,
-    0.016756378583127243, 0.01574142238665159, 0.01473134903422507,
-    0.013733004447687326, 0.012752637231260112, 0.011795863992392318,
-    0.010867646776884902, 0.009972282000446704, 0.009113400098909145,
-    0.008293974989634013, 0.007516342337046732, 0.006782225544921226,
-    0.006092768355660706, 0.005448572920512081, 0.004849742212182516,
-    0.004295925680163602, 0.003786367096475506, 0.003319953602663025,
-    0.002895265044807468, 0.002510622769190125, 0.002164137144270543,
-    0.0018537531721837, 0.001577293652557459, 0.001332499460868328,
-    0.001117066600796574, 0.0009286797833839573, 0.0007650423737761393,
-    0.0006239026277671727, 0.0005030762143350815, 0.0004004650862100223,
-    0.0003140728178353742, 0.00024201657867910556, 0.00018253594974316996,
-    0.00013399882249807025, 9.49046426887381e-05, 6.388527699708468e-05,
-    3.970378899074398e-05, 2.1251412801076355e-05, 7.543009276742865e-06,
-    -2.2887192936932196e-06, -8.999992637884094e-06,
-    -1.3243447148502327e-05, -1.557613368708468e-05,
-    -1.6467811426850445e-05, -1.63093528492861e-05,
-    -1.5421097939455242e-05, -1.4061018704922785e-05,
-    -1.243257788819571e-05, -1.0692187735418308e-05,
-    -8.956195575428226e-06, -7.3073424710351094e-06,
-    -5.8006591112396305e-06, -4.468779263172823e-06,
-    -3.326665397016021e-06, -2.3757534892377295e-06,
-    -1.6075344987453848e-06, -1.0065986371058506e-06,
-    -5.531753923550552e-07, -2.252074190014706e-07,
+    1.1755592671332046e-11, 2.0188004956137427e-10, 1.7236333623946176e-09, 9.815423109243151e-09,
+    4.219820040519088e-08, 1.4693429486234634e-07, 4.338503956649552e-07, 1.122118806000393e-06,
+    2.604091536729611e-06, 5.522713327023963e-06, 1.0857390465642334e-05, 2.0011412649247494e-05,
+    3.4893068706162795e-05, 5.7982477259392286e-05, 9.237678934582388e-05, 0.00014180767284007714,
+    0.00021062669000635658, 0.0003037561533907518, 0.0004266051229102419, 0.000584952237938201,
+    0.0007847989367901134, 0.001032198204838678, 0.001333065243166745, 0.001692977321877409,
+    0.002116970561258896, 0.002609341477645015, 0.003173460865247882, 0.00381160700116864,
+    0.004524824309342139, 0.005312812558055807, 0.006173850455688009, 0.007104756211217515,
+    0.008100886298035966, 0.00915617235512072, 0.010263194925878348, 0.01141329161173599,
+    0.012596696236577472, 0.013802704802828978, 0.015019863385625786, 0.016236172665450826,
+    0.01743930354214716, 0.01861681819809535, 0.019756391073966928, 0.020846024470695095,
+    0.021874253876569306, 0.02283033861665188, 0.023704434009553566, 0.02448774186995001,
+    0.02517263689027796, 0.025752767148979578, 0.026223127704178725, 0.026580106921515002,
+    0.02682150583616039, 0.026946531447567135, 0.026955765379786157, 0.02685110980161695,
+    0.026635712883536795, 0.026313876369100774, 0.025890948056565766, 0.025373202123371387,
+    0.024767710285281262, 0.024082206768594926, 0.02332494999439922, 0.022504583735910823,
+    0.02163000032189053, 0.020710208229666707, 0.019754206149457228, 0.018770865316331563,
+    0.01776882160593159, 0.016756378583127243, 0.01574142238665159, 0.01473134903422507,
+    0.013733004447687326, 0.012752637231260112, 0.011795863992392318, 0.010867646776884902,
+    0.009972282000446704, 0.009113400098909145, 0.008293974989634013, 0.007516342337046732,
+    0.006782225544921226, 0.006092768355660706, 0.005448572920512081, 0.004849742212182516,
+    0.004295925680163602, 0.003786367096475506, 0.003319953602663025, 0.002895265044807468,
+    0.002510622769190125, 0.002164137144270543, 0.0018537531721837, 0.001577293652557479,
+    0.001332499460868328, 0.001117066600796574, 0.0009286797833839573, 0.0007650423737761393,
+    0.0006239026277671727, 0.0005030762143350815, 0.0004004650862100223, 0.0003140728178353742,
+    0.00024201657867910556, 0.00018253594974316996, 0.00013399882249807025, 9.49046426887381e-05,
+    6.388527699708468e-05, 3.970378899074398e-05, 2.1251412801076355e-05, 7.5430092767428655e-06,
+    -2.2887192936932196e-06, -8.999992637884094e-06, -1.3243447148502327e-05, -1.557613368708468e-05,
+    -1.6467811426850445e-05, -1.63093528492861e-05, -1.5421097939455242e-05, -1.4061018704922785e-05,
+    -1.243257788819571e-05, -1.0692187735418308e-05, -8.956195575428226e-06, -7.3073424710351094e-06,
+    -5.8006591112396305e-06, -4.468779263172823e-06, -3.3266653970160216e-06, -2.3757534892377295e-06,
+    -1.6075344987453848e-06, -1.0065986371058506e-06, -5.531753923550552e-07, -2.252074190014706e-07,
 ], dtype=np.float64)
 
-_FIR_SUMSQ = float(np.sum(GAUS_FIR_COEFFS * GAUS_FIR_COEFFS))
-_FIR_NH = GAUS_FIR_COEFFS.size
-
 
 # ---------------------------------------------------------------------------
-# Gaussian-Doppler tap generator (Watterson). A complex-Gaussian innovation is
-# drawn at 64 times the Doppler rate, shaped through the firmware FIR, and held
-# constant until the next update.
+# Gaussian-Doppler tap generator (Watterson). Produces a complex Gaussian
+# process with a Gaussian-shaped Doppler power spectrum, FAITHFUL to the IONOS
+# firmware: a fresh complex-Gaussian innovation is drawn every UPDATE samples
+# (UPDATE = FS / (64*fd), the firmware's "64x the Doppler rate" cadence —
+# MPG 156.25ms / MPM 31.25ms / MPP 15.625ms / MPD 7.812ms), pushed through the
+# 128-tap GAUS_FIR_COEFFS (per I and Q rail), and HELD CONSTANT (zero-order hold)
+# between updates — exactly as the firmware holds mixIQ.gain() until the next
+# QuadGauss12FIR128() update (HFSim_BFD_2_03.ino.src:2260-2276, :668). The earlier
+# Lorentzian (1st-order IIR) PSD had heavy tails that mis-shaped the deep fast-fade
+# nulls; the Gaussian FIR matches the bench hardware's null statistics, which is
+# what the live SKIP-VAR / FTR pilot-residual gate actually reads.
+#
+# UNIT TAP POWER (INV-4): the FIR steady-state output power per rail =
+# innovation_var_per_rail * sum(h^2). To get a unit-power complex tap
+# (E[|g|^2] = E[g_I^2] + E[g_Q^2] = 1), each rail's innovation variance is set to
+# 0.5 / sum(h^2) so each rail FIR output has variance 0.5. This keeps mean|h|^2 = 1
+# so the AWGN SNR3k calibration is undisturbed.
 # ---------------------------------------------------------------------------
+_FIR_SUMSQ = float(np.sum(GAUS_FIR_COEFFS * GAUS_FIR_COEFFS))   # ~0.019412
+_FIR_NH = GAUS_FIR_COEFFS.size                                  # 128
+
+
 class DopplerTap:
     def __init__(self, fd_hz, rng_np, update=None):
         self.fd = fd_hz
         self.rng = rng_np
+        # update interval: 64x the Doppler rate (firmware cadence). NOT capped to
+        # a chunk — the slow profiles' true update spans MANY chunks (MPG 7500
+        # samples / 156ms, MPM 1500 / 31ms), and the advance() ZOH loop tracks the
+        # span across chunk boundaries via self.pos. (The old code clamped this to
+        # CHUNK_SAMPLES=1024, which ran MPG ~7x and MPM ~1.5x too fast = a too-wide
+        # Doppler bandwidth on the slow profiles — a latent fidelity bug.)
+        # fd<=0 -> static unit tap.
         if update is None:
             if fd_hz > 0:
                 update = max(1, int(round(FS / (fd_hz * 64.0))))
             else:
                 update = CHUNK_SAMPLES
         self.update = update
+        # per-rail innovation std so the FIR output is unit-power complex.
         if fd_hz > 0:
             self.inno_std = math.sqrt(0.5 / _FIR_SUMSQ)
         else:
             self.inno_std = 0.0
+        # FIR delay lines for the I and Q rails (most-recent-first, like the
+        # firmware fir_float: delayx[0] = newest innovation).
         self.fir_i = np.zeros(_FIR_NH, dtype=np.float64)
         self.fir_q = np.zeros(_FIR_NH, dtype=np.float64)
         if fd_hz > 0:
+            # prime the FIR with `_FIR_NH` updates so the very first emitted gain
+            # is already steady-state (no startup transient of zero gains).
             for _ in range(_FIR_NH):
                 self._fir_update()
             self.g_hold = self._fir_output()
         else:
             self.g_hold = self._static_white()
-        self.pos = 0
+        self.pos = 0          # sample position within the current update span
 
     def _static_white(self):
+        # unit-variance complex Gaussian (var(real)=var(imag)=1/2) for fd<=0.
         r = self.rng.standard_normal()
         i = self.rng.standard_normal()
         return (r + 1j * i) / math.sqrt(2.0)
 
     def _fir_update(self):
+        """Push one fresh Gaussian innovation into the I and Q FIR delay lines
+        (firmware QuadGauss12FIR128 -> fir_float: shift, insert newest at [0])."""
         self.fir_i = np.roll(self.fir_i, 1)
         self.fir_q = np.roll(self.fir_q, 1)
         self.fir_i[0] = self.rng.standard_normal() * self.inno_std
         self.fir_q[0] = self.rng.standard_normal() * self.inno_std
 
     def _fir_output(self):
-        return (float(np.dot(GAUS_FIR_COEFFS, self.fir_i)) +
-                1j * float(np.dot(GAUS_FIR_COEFFS, self.fir_q)))
+        """Current shaped complex tap gain = (h . delay_i) + j (h . delay_q)."""
+        gi = float(np.dot(GAUS_FIR_COEFFS, self.fir_i))
+        gq = float(np.dot(GAUS_FIR_COEFFS, self.fir_q))
+        return gi + 1j * gq
 
     def advance(self, n):
-        """Return an array of n complex tap gains, advancing internal state."""
+        """Return an array of n complex tap gains, advancing internal state.
+        Zero-order hold: the shaped gain is constant within an update span and
+        steps to a new shaped value at each 64x-fd update boundary (firmware
+        behavior — no per-sample interpolation)."""
         out = np.empty(n, dtype=np.complex128)
         k = 0
         while k < n:
             if self.fd <= 0:
+                # static tap (no Doppler): constant unit gain
                 out[k:] = self.g_hold
                 self.pos = (self.pos + (n - k)) % self.update
                 break
             span = self.update - self.pos
             take = min(span, n - k)
-            out[k:k + take] = self.g_hold
+            out[k:k + take] = self.g_hold          # ZOH within the update span
             k += take
             self.pos += take
             if self.pos >= self.update:
@@ -797,23 +833,607 @@ class TurnaroundDrift:
 
 
 # ---------------------------------------------------------------------------
+# Narrow-FM audio-passband bandpass (radio audio filter the bidirectional
+# passband_probe is meant to DISCOVER).
+#
+# WHY (sim-fidelity): a real narrow-FM data link is the radio's mic/speaker
+# AUDIO path, band-limited by the rig's audio filters to ~300-2900 Hz (VARA FM
+# narrow occupies 2580 Hz, 300-2880 Hz). The raw relay Channel had NO
+# band-limiting, so Iris's chirp passband_probe (200-4600 Hz) saw the whole band
+# flat. Config-selectable edges (narrow 300-2900 / wide 300-6300 / off) so the
+# 6 kHz direct-discriminator lane can reuse the SAME mechanism.
+#
+# NOTE (probe interaction, verified 2026-07-04): band-limiting the SIGNAL is the
+# physically-correct radio-audio-filter model, but it does NOT by itself change
+# what Iris's CURRENT passband_probe discovers, because that probe estimates its
+# noise floor from the out-of-CHIRP-band deconvolution bins (>4700/<150 Hz) where
+# the reference chirp has ~zero energy -> the floor is a deconvolution artifact
+# (~-170 dB) and the dual-threshold OR-branch (tone >= floor+10) re-detects every
+# attenuated tone. See the return report / fact doc: the true root of the 4150 Hz
+# over-discovery is in iris passband_probe.cc, not the channel. This filter is
+# still the correct sim-fidelity model of the radio audio path (band-limits the
+# real OFDM signal) and is a prerequisite for the fair comparison.
+#
+# HOW: linear-phase windowed-sinc (Blackman) FIR bandpass applied to the SIGNAL
+# only (before the broadband AWGN), streaming with a persistent history tail
+# (overlap-save, same pattern as AnalyticFilter) so it is continuous across the
+# 1024-sample chunks. Passband gain normalized to 1.0 at band center so the SNR3k
+# calibration is undisturbed. numpy-only. Default OFF -> the Mercury HF paths
+# that share this Channel are byte-identical unless a caller opts in.
+# ---------------------------------------------------------------------------
+BANDPASS_PRESETS = {
+    "off":    (0.0, 0.0),
+    "narrow": (300.0, 2900.0),   # narrow-FM audio path (VARA FM narrow occupancy)
+    "wide":   (300.0, 6300.0),   # 6 kHz direct-discriminator (9600 data-port) lane
+}
+BANDPASS_DEFAULT_TAPS = 511
+
+
+def resolve_bandpass(mode, lo_override=None, hi_override=None, taps=None):
+    """Resolve an audio-bandpass spec to (lo_hz, hi_hz, taps). `mode` is a
+    BANDPASS_PRESETS key (off/narrow/wide); explicit lo/hi override (>0) wins."""
+    lo, hi = BANDPASS_PRESETS.get((mode or "off").lower(), (0.0, 0.0))
+    if lo_override is not None and lo_override > 0.0:
+        lo = float(lo_override)
+    if hi_override is not None and hi_override > 0.0:
+        hi = float(hi_override)
+    return lo, hi, int(taps if taps else BANDPASS_DEFAULT_TAPS)
+
+
+def _fir_bandpass_taps(numtaps, flo, fhi, fs):
+    """Linear-phase windowed-sinc bandpass FIR (Type-I, odd length, Blackman),
+    gain-normalized to 1.0 at band center. Returns (h, group_delay)."""
+    if numtaps % 2 == 0:
+        numtaps += 1
+    m = (numtaps - 1) // 2
+    n = np.arange(numtaps) - m
+
+    def ideal_lp(fc_hz):
+        wc = 2.0 * fc_hz / fs
+        return wc * np.sinc(wc * n)
+
+    h = (ideal_lp(fhi) - ideal_lp(flo)) * np.blackman(numtaps)
+    fc = 0.5 * (flo + fhi)
+    gain = float(np.sum(h * np.cos(2.0 * math.pi * fc / fs * n)))
+    if abs(gain) > 1e-12:
+        h = h / gain
+    return h, m
+
+
+class StreamingFIR:
+    """Streaming FIR with a persistent input-history tail (overlap-save) so the
+    output is continuous across chunks. Group delay = (ntaps-1)/2 samples."""
+    def __init__(self, h):
+        self.h = np.asarray(h, dtype=np.float64)
+        self.ntaps = len(self.h)
+        self.hist = np.zeros(self.ntaps - 1)
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.float64)
+        buf = np.concatenate((self.hist, x))
+        y = np.convolve(buf, self.h, mode="full")
+        start = self.ntaps - 1
+        out = y[start:start + len(x)]
+        self.hist = buf[-(self.ntaps - 1):]
+        return out
+
+
+# ===========================================================================
+# FM RADIO CHANNEL (the fm_* profile family) — REAL modulate/demodulate chain.
+# ===========================================================================
+# WHY (sim-fidelity, 2026-07-09): the flat bench profile ("wgn"/"flat") adds
+# WHITE noise to AUDIO and never touches an FM modulator. A real FM data link
+# is audio -> [radio TX: pre-emphasis? limiter] -> FM modulator -> RF (AWGN at
+# a CARRIER-to-noise ratio) -> discriminator -> [radio RX: de-emphasis?] ->
+# audio. Three physical effects follow that the flat profile CANNOT produce:
+#
+#   1. TRIANGULAR NOISE. An FM discriminator operating above threshold with
+#      white RF noise at its input produces output noise whose power spectral
+#      density rises as f^2 (+6 dB/octave). Textbook result (Haykin,
+#      "Communication Systems"; Carlson, "Communication Systems"; measured on
+#      any discriminator with no carrier modulation). So on the flat "9600"
+#      data port (no de-emphasis) the HIGH audio frequencies are the noisy
+#      ones — the flat-white bench INVERTS the per-carrier reliability
+#      ranking. De-emphasis (a matched RX 1/f roll-off) flattens it back and
+#      buys real SNR — that is the entire purpose of the emphasis pair.
+#   2. THE FM THRESHOLD / CLICK KNEE. Below ~10 dB CNR the discriminator
+#      emits impulsive 2*pi phase-slip "clicks" (Rice 1948, "Statistical
+#      Properties of a Sine Wave Plus Random Noise"; Taub & Schilling ch. FM
+#      threshold): audio SNR collapses much faster than CNR. The flat bench
+#      has no knee at all.
+#   3. THE DEVIATION LIMITER. Every FM transmitter hard-limits peak deviation
+#      (FCC/TIA-603 occupied-bandwidth rules; the limiter sits AFTER
+#      pre-emphasis, before a splatter LPF — Sexauer K3VIX,
+#      repeater-builder.com/tech-info/fm-theory-discussion.html). A
+#      high-PAPR OFDM signal clips in it; DFT-spread (SC-FDMA) exists
+#      precisely to survive it. The flat bench never engages a limiter.
+#
+# EMPHASIS STANDARD (researched 2026-07-09, do not "fix" to 75 us): land-
+# mobile / amateur NBFM uses a +6 dB/octave TX pre-emphasis rising from a
+# ~300 Hz corner across 300-3000 Hz with matched RX de-emphasis (TIA-603;
+# FCC commercial practice per K3VIX: "the FCC specifies that the pre-emphasis
+# be a 6 dB per octave rising response beginning at 300 Hz", most rigs start
+# 200-300 Hz). 75 us / 50 us corners (2122 / 3183 Hz) are BROADCAST FM
+# (ITU-R BS.450) and are the WRONG constants for a voice-band NBFM rig: a
+# 75 us corner would leave 300-2000 Hz un-emphasized. Default corner here is
+# 300 Hz (tau ~= 531 us) — which is also the corner Iris's TX pre-compensation
+# assumes (iris/source/ofdm/ofdm_mod.cc fm_tx_deemph_gain, ofdm_config
+# fm_preemph_corner_hz = 300).
+#
+# FILTER DESIGN: the pre/de-emphasis pair is the bilinear-transform design of
+# GNU Radio gr-analog fm_emph.py (fm_preemph / fm_deemph): de-emphasis
+# H(s) = (1/tau)/(s + 1/tau); pre-emphasis H(s) = (s + w_cl)/(s + w_ch) with
+# the upper flatten pole w_ch (default 0.925*fs/2), gain-normalized to 0 dB
+# at DC. A matched pair is transparent end-to-end up to f_ch (validated in
+# tools/sim/test_fm_channel_sim.py V3).
+#
+# WHY REAL MOD/DEMOD, NOT AN ANALYTICAL NOISE MODEL: modulating
+# s[n] = exp(j*2*pi*kf*cumsum(m)/fs), adding complex AWGN at the target CNR,
+# band-limiting to the Carson IF bandwidth, and discriminating
+# mhat[n] = arg(s[n]*conj(s[n-1]))*fs/(2*pi*kf) produces the triangular
+# noise, the threshold clicks, the capture behavior, and the limiter
+# distortion FOR FREE with the right cross-terms. (iris/tools/
+# fm_channel_relay.py models these analytically — injected f^2-shaped noise +
+# a Rice click generator; this chain SUPERSEDES that approach for FM cells.)
+#
+# === CNR / SNR UNITS — READ BEFORE USING (do NOT reuse the WGN label) ======
+# "WGN:40"/--snr is an AUDIO-domain SNR3k and is REFUSED for fm_* profiles.
+# The honest knob for an FM channel is the RF CARRIER-to-NOISE ratio at the
+# discriminator input:
+#
+#     CNR_dB = 10*log10( P_carrier / (N0 * B_if) )
+#
+# with P_carrier = 1 (constant envelope), N0 the complex-baseband noise PSD,
+# and B_if the IF (Carson) bandwidth B = 2*(dev_hz + audio_hi_hz). The
+# resulting AUDIO SNR is a DERIVED quantity that depends on deviation,
+# emphasis, and bandwidth (above threshold it tracks CNR dB-for-dB; the
+# mapping is characterized in test_fm_channel_sim.py V2). Select with
+# --profile fm_dataport --fm-cnr-db 20   (spelled "fm_dataport:cnr20" in
+# harness cell strings). Passing --cell/--snr-schedule with an fm_* profile
+# is a hard argparse error, so the old audio label can never be silently
+# reinterpreted as a CNR.
+#
+# PROFILES (the three real radio paths + the legacy control):
+#   fm_mic             mic/speaker path: pre-emph + limiter + splatter LPF ->
+#                      FM -> AWGN(CNR) -> IF BPF -> discriminator -> de-emph
+#                      -> 300-3000 Hz audio. Emphasis pair MATCHED (net ~flat,
+#                      noise ~flat after de-emphasis).
+#   fm_dataport        flat "9600" data port: TX injects AFTER pre-emphasis,
+#                      RX taps the discriminator BEFORE de-emphasis. Amplitude
+#                      response flat, but the noise is STILL TRIANGULAR (+6
+#                      dB/oct): HIGH carriers are the weak ones. Limiter still
+#                      present (deviation limiting is a transmitter law, not a
+#                      courtesy of the mic path). DC passes (discriminator
+#                      taps are DC-coupled; radio CFO appears as an audio DC
+#                      offset = cfo_hz/dev_hz — a REAL effect Iris must eat).
+#   fm_dataport_deemph data port where the radio DOES de-emphasize its RX
+#                      audio out (some rigs do): flat-injected TX, de-emph RX.
+#   flat               alias of "wgn": TODAY'S bench, unchanged — kept as the
+#                      regression control (V5 byte-identity).
+#
+# UNKEYED-CARRIER GAPS (--fm-unkeyed-blast, default ON): the modem TX bridge
+# fills inter-frame gaps with exact zeros (mean-square < SILENCE_EPS — same
+# convention as the reader's silent flag). A real half-duplex peer UNKEYS
+# there: the receiving discriminator loses the carrier and outputs the full
+# no-quieting noise blast (squelch-open roar), NOT silence. That blast is
+# what a real acquisition correlator has to reject. --fm-keyup-hang-chunks
+# keeps the carrier up briefly across intra-burst pauses (PTT hang).
+#
+# All state is streaming (persistent FIR/IIR history, phase accumulator,
+# discriminator sample memory) so the chain is continuous across the
+# 1024-sample wire chunks — same pattern as AnalyticFilter/StreamingFIR.
+# ===========================================================================
+FM_PROFILES = {
+    #                  TX emph  RX de-emph  dev(Hz)  audio lo-hi (Hz)  TX splatter LPF
+    "fm_mic":             {"preemph": True,  "deemph": True,  "dev_hz": 2500.0,
+                           "audio_lo_hz": 300.0, "audio_hi_hz": 3000.0, "tx_splatter": True},
+    "fm_dataport":        {"preemph": False, "deemph": False, "dev_hz": 5000.0,
+                           "audio_lo_hz": 0.0, "audio_hi_hz": 6000.0, "tx_splatter": False},
+    "fm_dataport_deemph": {"preemph": False, "deemph": True,  "dev_hz": 5000.0,
+                           "audio_lo_hz": 0.0, "audio_hi_hz": 6000.0, "tx_splatter": False},
+}
+
+FM_EMPH_CORNER_HZ_DEFAULT = 300.0    # TIA-603 / LMR practice; == Iris pre-comp corner
+FM_IF_TAPS_DEFAULT = 257
+FM_AUDIO_TAPS_DEFAULT = 1201
+
+
+def _fm_audio_fir(numtaps, flo, fhi, fs):
+    """Audio-path FIR for the FM chain whose SPEC edges are FLAT-passband
+    points. The raw windowed-sinc design (_fir_bandpass_taps) places its
+    -6 dB cutoff exactly AT the requested edges, which droops a data carrier
+    sitting near a spec edge (a 300-3000 Hz radio audio path is FLAT at
+    300/3000 and rolls off OUTSIDE the band). Widen the design edges by half
+    the Blackman transition width (~5.98*fs/N) so the requested band is all
+    passband. Validated by test_fm_channel_sim.py V3a (400/2800 Hz tones)."""
+    tw = 5.98 * fs / numtaps
+    lo_d = max(0.0, flo - tw / 2.0) if flo > 0.0 else 0.0
+    hi_d = min(0.98 * fs / 2.0, fhi + tw / 2.0)
+    h, gd = _fir_bandpass_taps(numtaps, lo_d, hi_d, fs)
+    return StreamingFIR(h)
+
+
+class OnePoleIIR:
+    """Streaming 1st-order IIR  y[n] = b0*x[n] + b1*x[n-1] + p1*y[n-1].
+    Coefficient design below follows gr-analog fm_emph.py (bilinear transform,
+    prewarped corners)."""
+
+    def __init__(self, b0, b1, p1):
+        self.b0, self.b1, self.p1 = float(b0), float(b1), float(p1)
+        self.x1 = 0.0
+        self.y1 = 0.0
+
+    def process(self, x):
+        # scipy-free streaming DF1; chunk sizes are small (1024) and this is
+        # a 1st-order loop, so a Python loop over numpy would dominate — use
+        # lfilter-style recursion via numpy where possible. The recursion on
+        # y forces a sequential loop; keep it in C-speed via list/float ops.
+        out = np.empty(len(x), dtype=np.float64)
+        b0, b1, p1 = self.b0, self.b1, self.p1
+        x1, y1 = self.x1, self.y1
+        for i, xi in enumerate(x):
+            y = b0 * xi + b1 * x1 + p1 * y1
+            out[i] = y
+            x1 = xi
+            y1 = y
+        self.x1, self.y1 = x1, y1
+        return out
+
+
+def design_deemph(fs, corner_hz):
+    """gr-analog fm_deemph: bilinear transform of H(s) = w_c/(s + w_c),
+    w_c = 2*pi*corner_hz (tau = 1/w_c). 0 dB at DC, -6 dB/octave above."""
+    w_c = 2.0 * math.pi * corner_hz
+    w_ca = 2.0 * fs * math.tan(w_c / (2.0 * fs))     # prewarp
+    k = -w_ca / (2.0 * fs)
+    p1 = (1.0 + k) / (1.0 - k)
+    b0 = -k / (1.0 - k)
+    return OnePoleIIR(b0, b0, p1)                    # zero at z=-1
+
+
+def design_preemph(fs, corner_hz, fh=-1.0):
+    """gr-analog fm_preemph: bilinear transform of H(s) = (s+w_cl)/(s+w_ch),
+    w_cl = 2*pi*corner_hz, upper flatten pole w_ch = 2*pi*fh (default
+    0.925*fs/2). Gain-normalized to 0 dB at DC."""
+    if fh <= 0.0 or fh >= fs / 2.0:
+        fh = 0.925 * fs / 2.0
+    w_cl = 2.0 * math.pi * corner_hz
+    w_ch = 2.0 * math.pi * fh
+    w_cla = 2.0 * fs * math.tan(w_cl / (2.0 * fs))
+    w_cha = 2.0 * fs * math.tan(w_ch / (2.0 * fs))
+    kl = -w_cla / (2.0 * fs)
+    kh = -w_cha / (2.0 * fs)
+    z1 = (1.0 + kl) / (1.0 - kl)
+    p1 = (1.0 + kh) / (1.0 - kh)
+    b0 = (1.0 - kl) / (1.0 - kh)
+    # normalize to 0 dB at DC (H(z=1) = 1)
+    g = abs(1.0 - p1) / (b0 * abs(1.0 - z1))
+    return OnePoleIIR(g * b0, g * b0 * -z1, p1)
+
+
+class StreamingFIRC:
+    """Complex-capable streaming FIR (overlap-save history), same pattern as
+    StreamingFIR but with complex128 state for the IF filter."""
+
+    def __init__(self, h):
+        self.h = np.asarray(h, dtype=np.float64)
+        self.ntaps = len(self.h)
+        self.hist = np.zeros(self.ntaps - 1, dtype=np.complex128)
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.complex128)
+        buf = np.concatenate((self.hist, x))
+        y = np.convolve(buf, self.h, mode="full")
+        start = self.ntaps - 1
+        out = y[start:start + len(x)]
+        self.hist = buf[-(self.ntaps - 1):]
+        return out
+
+
+class FmRadioChannel:
+    """Streaming FM radio link: audio in -> TX radio -> RF AWGN at CNR ->
+    discriminator RX -> audio out. One instance per direction. See the block
+    comment above for the physics and the CNR unit definition."""
+
+    def __init__(self, prof, args, np_rng):
+        self.rng = np_rng
+        self.drive = float(getattr(args, "fm_drive", 1.0) or 1.0)
+        self.preemph_on = bool(prof["preemph"])
+        self.deemph_on = bool(prof["deemph"])
+        self.limiter_on = int(getattr(args, "fm_limiter", 1)) != 0
+        dev = float(getattr(args, "fm_dev_hz", 0.0) or 0.0)
+        self.dev_hz = dev if dev > 0.0 else prof["dev_hz"]
+        lo = float(getattr(args, "fm_audio_lo_hz", 0.0) or 0.0)
+        hi = float(getattr(args, "fm_audio_hi_hz", 0.0) or 0.0)
+        self.audio_lo = lo if lo > 0.0 else prof["audio_lo_hz"]
+        self.audio_hi = hi if hi > 0.0 else prof["audio_hi_hz"]
+        # IF (Carson) bandwidth: B = 2*(dev + f_max). CNR is referenced to it.
+        ifbw = float(getattr(args, "fm_if_bw_hz", 0.0) or 0.0)
+        self.if_bw_hz = ifbw if ifbw > 0.0 else 2.0 * (self.dev_hz + self.audio_hi)
+        cnr_db = getattr(args, "fm_cnr_db", None)
+        if cnr_db is None:
+            raise ValueError("fm_* profile requires --fm-cnr-db (RF CNR in the "
+                             "IF bandwidth; NOT the audio SNR3k / WGN label)")
+        self.cnr_db = float(cnr_db)
+        cnr_lin = 10.0 ** (self.cnr_db / 10.0)
+        # complex AWGN per-sample variance: carrier power = 1 (constant
+        # envelope), CNR = 1/(N0*B_if), N0 = sigma^2/fs
+        #   => sigma^2 = fs / (cnr_lin * B_if)
+        self.noise_var = FS / (cnr_lin * self.if_bw_hz)
+        self.noise_std_rail = math.sqrt(self.noise_var / 2.0)   # per I/Q rail
+
+        corner = float(getattr(args, "fm_emph_corner_hz", 0.0) or 0.0)
+        self.emph_corner_hz = corner if corner > 0.0 else FM_EMPH_CORNER_HZ_DEFAULT
+        self.pre = design_preemph(FS, self.emph_corner_hz) if self.preemph_on else None
+        self.de = design_deemph(FS, self.emph_corner_hz) if self.deemph_on else None
+
+        # TX splatter LPF (post-limiter, FCC >=12 dB/oct above ~3 kHz; we use
+        # the same windowed-sinc as the audio filters — steeper, documented).
+        atap = int(getattr(args, "fm_audio_taps", FM_AUDIO_TAPS_DEFAULT)
+                   or FM_AUDIO_TAPS_DEFAULT)
+        self.tx_splatter = None
+        if prof["tx_splatter"]:
+            self.tx_splatter = _fm_audio_fir(atap, self.audio_lo, self.audio_hi, FS)
+        # RX audio filter (radio audio path / data-port LPF). lo=0 -> lowpass.
+        self.rx_audio = _fm_audio_fir(atap, self.audio_lo, self.audio_hi, FS)
+        # IF bandpass at Carson bandwidth: symmetric complex lowpass +-B/2.
+        itap = int(getattr(args, "fm_if_taps", FM_IF_TAPS_DEFAULT)
+                   or FM_IF_TAPS_DEFAULT)
+        hif, _gd = _fir_bandpass_taps(itap, 0.0, self.if_bw_hz / 2.0, FS)
+        self.if_fir = StreamingFIRC(hif)
+
+        # FM modulator / discriminator state
+        self.kf_w = 2.0 * math.pi * self.dev_hz / FS   # rad/sample per unit m
+        self.phase = 0.0
+        self.prev_s = 1.0 + 0.0j          # discriminator one-sample memory
+        # CFO (RF) — reuse the relay-wide --cfo-hz; discriminator turns it
+        # into an audio DC offset of cfo_hz/dev_hz (a real radio-netting
+        # error). Applied as an RF rotation, so capture/clicks see it too.
+        self.cfo_w = 2.0 * math.pi * float(getattr(args, "cfo_hz", 0.0)) / FS
+        self.cfo_phase = 0.0
+
+        # optional flat Rayleigh fading of the RF envelope (VHF mobile):
+        # reuses the validated IONOS Gaussian-FIR Doppler tap (155fdc1).
+        fd = float(getattr(args, "fm_fade_doppler_hz", 0.0) or 0.0)
+        self.fade_tap = DopplerTap(fd, np_rng) if fd > 0.0 else None
+
+        # unkeyed-carrier gap model (squelch-open blast) + PTT hang
+        self.unkeyed_blast = int(getattr(args, "fm_unkeyed_blast", 1)) != 0
+        self.hang_chunks = max(0, int(getattr(args, "fm_keyup_hang_chunks", 2)))
+        self.hang_left = 0                # chunks of carrier-hold remaining
+        # final audio rail clip (sound-card / radio audio stage rail). The
+        # no-carrier blast swings ~fs/(2*pi*dev) >> 1; a real audio output
+        # rails instead. 0 = off.
+        self.audio_clip = float(getattr(args, "fm_audio_clip", 2.0))
+        # diagnostics
+        self.n_clipped = 0                # limiter-clipped samples (TX)
+        self.n_unkeyed_chunks = 0
+
+    def describe(self):
+        return (f"dev={self.dev_hz:.0f}Hz audio={self.audio_lo:.0f}-"
+                f"{self.audio_hi:.0f}Hz B_if={self.if_bw_hz:.0f}Hz "
+                f"CNR={self.cnr_db:.1f}dB preemph={self.preemph_on} "
+                f"deemph={self.deemph_on} corner={self.emph_corner_hz:.0f}Hz "
+                f"limiter={self.limiter_on} drive={self.drive} "
+                f"unkeyed_blast={self.unkeyed_blast}(hang={self.hang_chunks})")
+
+    def process(self, x):
+        """One CHUNK of TX audio in -> channel-impaired RX audio out (same
+        length). All filters/accumulators are streaming across chunks."""
+        x = np.asarray(x, dtype=np.float64)
+        n = x.size
+
+        # --- keyed-carrier detection (modem idle gaps are exact zeros) -----
+        ms = float(np.mean(x * x)) if n else 0.0
+        silent = ms < 1e-12               # same convention as reader SILENCE_EPS
+        if not silent:
+            self.hang_left = self.hang_chunks
+            keyed = True
+        elif self.hang_left > 0:
+            self.hang_left -= 1
+            keyed = True                  # PTT hang: carrier up, no modulation
+        else:
+            keyed = not self.unkeyed_blast   # blast mode: carrier truly drops
+
+        # --- TX radio: [pre-emph] -> limiter -> [splatter LPF] -------------
+        a = x * self.drive
+        if self.pre is not None:
+            a = self.pre.process(a)
+        if self.limiter_on:
+            clipped = np.abs(a) > 1.0
+            self.n_clipped += int(np.count_nonzero(clipped))
+            a = np.clip(a, -1.0, 1.0)
+        if self.tx_splatter is not None:
+            a = self.tx_splatter.process(a)
+
+        # --- FM modulate: s = exp(j*2*pi*kf*cumsum(m)/fs) -------------------
+        ph = self.phase + np.cumsum(a) * self.kf_w
+        self.phase = float(ph[-1]) % (2.0 * math.pi)
+        if keyed:
+            s = np.exp(1j * ph)
+        else:
+            self.n_unkeyed_chunks += 1
+            s = np.zeros(n, dtype=np.complex128)   # carrier unkeyed: no signal
+
+        # --- RF: [fading] -> CFO -> complex AWGN at CNR -> IF bandpass ------
+        if self.fade_tap is not None:
+            s = s * self.fade_tap.advance(n)
+        if self.cfo_w != 0.0:
+            idx = np.arange(1, n + 1)
+            cph = self.cfo_phase + self.cfo_w * idx
+            s = s * np.exp(1j * cph)
+            self.cfo_phase = float(cph[-1]) % (2.0 * math.pi)
+        noise = (self.rng.standard_normal(n) + 1j * self.rng.standard_normal(n)) \
+            * self.noise_std_rail
+        s = s + noise
+        s = self.if_fir.process(s)
+
+        # --- discriminator: mhat = arg(s[n] conj(s[n-1])) * fs/(2 pi kf) ----
+        sprev = np.concatenate(([self.prev_s], s[:-1]))
+        self.prev_s = complex(s[-1])
+        d = np.angle(s * np.conj(sprev))
+        audio = d / self.kf_w             # back to modulation units
+
+        # --- RX radio: [de-emph] -> audio filter -> rail clip ---------------
+        if self.de is not None:
+            audio = self.de.process(audio)
+        audio = self.rx_audio.process(audio)
+        out = audio / self.drive
+        if self.audio_clip > 0.0:
+            out = np.clip(out, -self.audio_clip, self.audio_clip)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Per-direction channel.
 # ---------------------------------------------------------------------------
+# ===========================================================================
+# Deterministic scripted CHANNEL-OUTAGE vehicle (P0 cross-session reconnect seam).
+#
+# WHY: the P0 silent-corruption reconnect-splice only reproduces when the modem
+# tears an ESTABLISHED session down (a fat prefix already delivered onto the
+# persistent app socket) and then RE-CONNECTS cross-session. A natural WGN draw
+# either delivers-but-never-reconnects (clean SNR) or thrashes-but-never-delivers
+# (low SNR), so neither reliably manufactures a CROSS-SESSION splice on a FAT
+# prefix. This vehicle forces one deterministically: after the transfer has run
+# for MERCURY_SIM_OUTAGE_AFTER_S virtual seconds (a fat prefix is on the socket),
+# the channel goes SILENT (pure zeros, both directions) for
+# MERCURY_SIM_OUTAGE_DUR_S seconds. The modem sees a real loss of signal ->
+# link-timeout (arq_common.cc:6024, effective ~30 s) -> teardown -> a FRESH
+# START_CONNECTION reconnect. DUR_S MUST EXCEED the modem link-timeout so the
+# reconnect is a NEW cross-session session (a short outage = within-session
+# recovery = the WRONG bug). After DUR_S the channel restores and the resumed
+# transfer's first delivery lands far-forward -> the reconnect splice, if the bug
+# is live, is exercised on a fat prefix.
+#
+# FAITHFULNESS: this is a pure CHANNEL event -- the relay/bridge zeroes what the
+# far modem HEARS. No modem code path is bypassed or poked; the modem runs its
+# real carrier-loss / BREAK / link-timeout / reconnect logic. It lives inside
+# Channel.process(), so BOTH the TCP relay (-x sim) AND the real-audio snd-aloop
+# bridge (realaudio_bridge_s32.py, which imports Channel) pick it up, and a single
+# process-wide controller shared by the two per-direction Channel objects keeps
+# the outage window synchronized across the forward + reverse directions.
+#
+# ENV KNOBS (all default OFF; fully inert / byte-identical when none is set):
+#   MERCURY_SIM_OUTAGE_AFTER_S      PRIMARY trigger: virtual seconds of transfer
+#                                   before the 1st outage (target ~180-220 so a
+#                                   fat >=~50 KB prefix is delivered at a
+#                                   delivering SNR). Fires synchronously in both
+#                                   directions (both clocks advance together).
+#   MERCURY_SIM_OUTAGE_DUR_S        outage length in seconds (MUST exceed the
+#                                   modem link-timeout ~30 s; target 40-60).
+#   MERCURY_SIM_OUTAGE_AFTER_BYTES  alternative trigger: cumulative SIGNAL wire
+#                                   bytes (float64 samples x8) across both
+#                                   directions before the 1st outage. A coarse
+#                                   progress proxy (NOT decoded payload); prefer
+#                                   AFTER_S. 0 = unused.
+#   MERCURY_SIM_OUTAGE_COUNT        number of outages (default 1). Outage k>=2
+#                                   re-arms at k x threshold.
+# ===========================================================================
+_OUTAGE_SIG_EPS_MS = 1e-9   # inbound mean-square above this == signal-bearing chunk
+
+
+class _OutageController:
+    """Process-wide scripted channel-outage state, shared by both per-direction
+    Channel objects (forward + reverse) so the black-out window is synchronized.
+    Thread-safe: gate() is called from the two reader/pump threads."""
+
+    def __init__(self, after_s, after_bytes, dur_s, count, log=None):
+        self.after_s = float(after_s)
+        self.after_bytes = int(after_bytes)
+        self.dur_s = float(dur_s)
+        self.count = max(1, int(count))
+        self.fired = 0
+        self.active = False
+        self.start_samp = 0
+        self.clock_samp = 0          # shared virtual clock (max over directions)
+        self.sig_bytes = 0           # cumulative signal wire bytes (both dirs)
+        self._lock = threading.Lock()
+        self._log = log
+
+    def _emit(self, msg):
+        if self._log:
+            try:
+                self._log(msg)
+                return
+            except Exception:
+                pass
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+
+    def gate(self, n, is_signal, dir_samp):
+        """Advance the shared clock + progress accumulator; return True iff the
+        channel is CURRENTLY blacked out (the caller must mute this chunk to
+        silence). Time-based so both directions black out together."""
+        with self._lock:
+            if dir_samp > self.clock_samp:
+                self.clock_samp = dir_samp
+            if is_signal:
+                self.sig_bytes += n * 8
+            vs = self.clock_samp / FS
+            if self.active:
+                if (self.clock_samp - self.start_samp) / FS >= self.dur_s:
+                    self.active = False
+                    self.fired += 1
+                    self._emit("[OUTAGE] END #%d at t=%.2fs (dur=%.2fs sig_bytes=%d)"
+                               % (self.fired, vs,
+                                  (self.clock_samp - self.start_samp) / FS,
+                                  self.sig_bytes))
+                    return False
+                return True
+            if self.fired >= self.count:
+                return False
+            k = self.fired + 1
+            trig = ((self.after_s > 0.0 and vs >= self.after_s * k + self.dur_s * self.fired)
+                    or (self.after_bytes > 0 and self.sig_bytes >= self.after_bytes * k))
+            if trig:
+                self.active = True
+                self.start_samp = self.clock_samp
+                self._emit("[OUTAGE] START #%d at t=%.2fs (sig_bytes=%d dur_s=%.1f "
+                           "after_s=%s after_bytes=%s)"
+                           % (k, vs, self.sig_bytes, self.dur_s,
+                              self.after_s, self.after_bytes))
+                return True
+            return False
+
+
+_outage_singleton = None
+_outage_built = False
+_outage_build_lock = threading.Lock()
+
+
+def _get_outage_controller():
+    """Lazily build the process-wide outage controller from MERCURY_SIM_OUTAGE_*.
+    Returns None (FULLY INERT -- Channel.process is byte-identical) unless BOTH a
+    trigger (AFTER_S or AFTER_BYTES) AND DUR_S are set. The two per-direction
+    Channel objects in a process share the one controller so the outage is
+    synchronized across directions."""
+    global _outage_singleton, _outage_built
+    if _outage_built:
+        return _outage_singleton
+    with _outage_build_lock:
+        if _outage_built:
+            return _outage_singleton
+        after_s = float(os.environ.get("MERCURY_SIM_OUTAGE_AFTER_S", "0") or 0)
+        after_bytes = int(float(os.environ.get("MERCURY_SIM_OUTAGE_AFTER_BYTES", "0") or 0))
+        dur_s = float(os.environ.get("MERCURY_SIM_OUTAGE_DUR_S", "0") or 0)
+        count = int(float(os.environ.get("MERCURY_SIM_OUTAGE_COUNT", "1") or 1))
+        if dur_s > 0.0 and (after_s > 0.0 or after_bytes > 0):
+            _outage_singleton = _OutageController(after_s, after_bytes, dur_s, count)
+            sys.stderr.write("[OUTAGE] armed: after_s=%s after_bytes=%s dur_s=%s count=%d\n"
+                             % (after_s, after_bytes, dur_s, count))
+            sys.stderr.flush()
+        else:
+            _outage_singleton = None      # inert
+        _outage_built = True
+        return _outage_singleton
+
+
 class Channel:
     """Per-direction channel state (independent noise/fade per link)."""
 
     def __init__(self, args, rng_seed):
-        self.axis_version = getattr(args, "axis", DEFAULT_AXIS)
-        if self.axis_version not in AXIS_CHOICES:
-            raise AxisError("unknown axis_version %r" % self.axis_version)
-        self.snr_db = float(getattr(args, "snr3k_db", args.snr))
-        self.cn_config_db = float(getattr(
-            args, "cn_config_db",
-            cn_from_snr3k(self.snr_db, getattr(
-                args, "configured_bandwidth_hz", 2343.75))))
-        self.configured_bandwidth_hz = float(getattr(
-            args, "configured_bandwidth_hz", 2343.75))
-        self.input_coordinate = getattr(args, "input_coordinate", "snr")
+        self.snr_db = args.snr            # SNR3k in dB
         # ---- OPT-IN time-varying SNR schedule -------------------------
         # Parse '<virt_s>:<WGN_label>' edges keyed to the per-direction
         # virtual clock (sample_clock/FS). Sorted ascending by time. The
@@ -843,52 +1463,70 @@ class Channel:
         self.rng = Xoshiro(rng_seed)       # Python RNG for AWGN + burst
         np_rng = self.rng.seed_np()        # numpy RNG for taps + phase noise
 
-        # ---- Inc 3 / SIMAXIS noise calibration ------------------------
+        # ---- FM radio profile family (fm_*) ----------------------------
+        # Real modulate/demodulate chain (see FM RADIO CHANNEL block above).
+        # For every NON-fm profile this is None and NOTHING below changes:
+        # no extra RNG draws, no state, no code-path difference (V5
+        # byte-identity: tools/sim/test_fm_channel_sim.py).
+        self.fm = None
+        if self.profile in FM_PROFILES:
+            self.fm = FmRadioChannel(FM_PROFILES[self.profile], args, np_rng)
+
+        # ---- Inc 3 noise calibration ----------------------------------
         # P_sig is measured live (mean-square of TX passband). Start from a
         # sticky reference until real TX power is seen so the handshake's
         # first frames already sit in the calibrated noise floor.
         self.snr_lin = 10.0 ** (self.snr_db / 10.0)
-        if self.axis_version == AXIS_V2:
-            self.p_sig = float(args.reference_power)
-            if self.p_sig <= 0.0:
-                raise AxisError("v2 reference_power must be positive")
-            self.p_sig_measured = True
-            self.reference_mode = "fixed-archived-pcal"
-            self.reference_id = str(args.reference_id)
-            self.reference_n_samples = int(args.reference_n_samples)
-        else:
-            self.p_sig = max(args.sig_ref, 1e-6) ** 2
-            self.p_sig_measured = False
-            if self.axis_version == AXIS_V1:
-                self.reference_mode = "steady-active-chunk-median"
-                self.reference_id = "traffic-steady-v1"
-            else:
-                self.reference_mode = "peak-chunk-mean-square"
-                self.reference_id = "traffic-peak-v0"
-            self.reference_n_samples = 0
+        self.p_sig = max(args.sig_ref, 1e-6) ** 2   # sig_ref is an RMS; P=RMS^2
+        self.p_sig_measured = False
         self.noise_std = self._noise_std_from_psig(self.p_sig)
 
         self.peak_diag = 0.0
         self.peak_ms = 0.0                 # sticky peak mean-square (power)
 
-        # v1 is the deployed steady meter, preserved exactly: median of all
-        # active 1024-sample chunk powers, refreshed after every eight active
-        # chunks.  v0 is the audited peak hold.  v2 never observes traffic when
-        # choosing its fixed noise floor.
-        self.psig_mode = {
-            AXIS_V0: "peak", AXIS_V1: "steady", AXIS_V2: "fixed",
-        }[self.axis_version]
-        self._active_ms = []
-        self._psig_active_floor = 1e-7
-        self._psig_recompute_every = 8
+        # ---- HONEST-AXIS P_sig meter (default: steady) -------------------------
+        # 'steady' (the DEFAULT) references the AWGN to the STEADY data-burst power:
+        # P_sig = running median of active-chunk mean-squares, so a cell's SNR label
+        # == the true in-band snr3k of the OFDM/MFSK DATA payload. The minority
+        # (boosted) connect burst is a small fraction of active chunks and cannot
+        # dominate a median, so it is ignored.
+        #   MERCURY_SIM_PSIG_MODE=fix + MERCURY_SIM_PSIG_FIX=<power> -> hard-pin
+        #        P_sig to a commanded value.
+        # 'peak' is the LEGACY meter: it latches P_sig to the loudest chunk -- the
+        # boosted connect burst -- so every subsequent DATA frame is measured
+        # ~8-9 dB BELOW the label. That is a meter artifact, not a receiver loss; it
+        # silently poisons the axis of any cohort that runs it. It is retained ONLY
+        # as an explicit opt-in (MERCURY_SIM_PSIG_MODE=peak) for deliberate control
+        # arms; it is no longer the default.
+        self.psig_mode = os.environ.get("MERCURY_SIM_PSIG_MODE", "steady").strip().lower()
+        try:
+            self.psig_fix = float(os.environ.get("MERCURY_SIM_PSIG_FIX", "0") or 0.0)
+        except ValueError:
+            self.psig_fix = 0.0
+        self._active_ms = []               # mean-square of every signal-bearing chunk
+        self._psig_active_floor = 1e-7     # below this a chunk is treated as silence
+        self._psig_recompute_every = 8     # median refresh cadence (active chunks)
         self._psig_since_recompute = 0
         self._psig_diag_samples = 0
         self._psig_diag_next = 0
-        self.noise_n_samples = 0
-        self.last_signal_component = np.empty(0, dtype=np.float64)
-        self.last_noise_component = np.empty(0, dtype=np.float64)
-        self.binary_sha256 = getattr(args, "binary_sha256", None)
-        self.recipe_sha256 = getattr(args, "recipe_sha256", None)
+        if self.psig_mode == "fix" and self.psig_fix > 0.0:
+            self.p_sig = self.psig_fix
+            self.p_sig_measured = True
+            self.noise_std = self._noise_std_from_psig(self.p_sig)
+
+        # ---- narrow-FM audio bandpass (radio audio filter) ------------
+        # Default OFF -> the Mercury HF paths that share this Channel are
+        # byte-identical. Enabled (narrow/wide) by the Iris real-audio matrix.
+        bp_lo = float(getattr(args, "bandpass_lo_hz", 0.0) or 0.0)
+        bp_hi = float(getattr(args, "bandpass_hi_hz", 0.0) or 0.0)
+        bp_taps = int(getattr(args, "bandpass_taps", BANDPASS_DEFAULT_TAPS) or BANDPASS_DEFAULT_TAPS)
+        self.bandpass_lo_hz = bp_lo
+        self.bandpass_hi_hz = bp_hi
+        if bp_hi > bp_lo > 0.0:
+            h, _gd = _fir_bandpass_taps(bp_taps, bp_lo, bp_hi, FS)
+            self.bandpass = StreamingFIR(h)
+        else:
+            self.bandpass = None
 
         # ---- Inc 4 Watterson taps -------------------------------------
         prof = PROFILES.get(self.profile)
@@ -915,6 +1553,10 @@ class Channel:
         # Gilbert-Elliott burst (orthogonal impulse knob)
         self.ge_state = 0
         self.sample_clock = 0
+        # Deterministic scripted channel-outage vehicle (P0 cross-session
+        # reconnect seam). Shared process-wide controller (None unless armed
+        # via MERCURY_SIM_OUTAGE_*); inert when unset.
+        self._outage = _get_outage_controller()
 
     def _noise_std_from_psig(self, p_sig):
         # per-sample real-noise stddev matching the BER harness (see header).
@@ -922,70 +1564,63 @@ class Channel:
         var = p_sig * F_NYQUIST / (self.snr_lin * BW_NOISE)
         return math.sqrt(max(var, 0.0))
 
-    @property
-    def applied_noise_variance(self):
-        return self.noise_std * self.noise_std
-
-    def attestation(self):
-        """Applied channel values; callers add transport/headroom counters."""
-        return {
-            "axis_version": self.axis_version,
-            "input_coordinate": self.input_coordinate,
-            "reference_mode": self.reference_mode,
-            "reference_id": self.reference_id,
-            "reference_power": self.p_sig,
-            "reference_n_samples": self.reference_n_samples,
-            "configured_bandwidth_hz": self.configured_bandwidth_hz,
-            "snr3k_db": self.snr_db,
-            "cn_config_db": self.cn_config_db,
-            "noise_variance": self.applied_noise_variance,
-            "noise_n_samples": self.noise_n_samples,
-            "binary_sha256": self.binary_sha256,
-            "recipe_sha256": self.recipe_sha256,
-        }
-
     def process(self, samples):
         x = np.asarray(samples, dtype=np.float64)
         n = x.size
+
+        # --- FM radio profile family: the WHOLE channel is the FM chain ----
+        # (audio -> TX radio -> RF AWGN at CNR -> discriminator -> audio).
+        # The HF stages below (P_sig-calibrated audio AWGN, Watterson taps,
+        # audio bandpass, burst/loss) do not apply to an RF FM link and are
+        # bypassed. Non-fm profiles take the unchanged path below.
+        if self.fm is not None:
+            out = self.fm.process(x)
+            self.sample_clock += n
+            return out.tolist()
 
         # diag: track peak |signal| and update sticky TX power (mean-square).
         amax = float(np.max(np.abs(x))) if n else 0.0
         if amax > self.peak_diag:
             self.peak_diag = amax
         ms = float(np.mean(x * x)) if n else 0.0
+        # peak_ms is ALWAYS tracked (diagnostic: the latched connect-burst power),
+        # but whether it drives the noise floor depends on the meter mode.
         peak_advanced = ms > self.peak_ms
         if peak_advanced:
             self.peak_ms = ms
         if self.psig_mode == "steady":
+            # STEADY axis: P_sig = median of active-chunk power. The connect burst is
+            # a small minority of active chunks, so the median settles on the DATA
+            # power and the data frames are measured AT the label.
             if ms > self._psig_active_floor:
                 self._active_ms.append(ms)
-                self.reference_n_samples += n
                 self._psig_since_recompute += 1
                 if self._psig_since_recompute >= self._psig_recompute_every:
                     self._psig_since_recompute = 0
                     self.p_sig = float(np.median(self._active_ms))
                     self.p_sig_measured = True
                     self.noise_std = self._noise_std_from_psig(self.p_sig)
-        elif self.psig_mode == "peak" and peak_advanced:
-            # Byte-identical v0 law: sticky maximum chunk mean-square.
+        elif self.psig_mode == "fix":
+            pass  # hard-pinned in __init__; never track the peak
+        elif peak_advanced:
+            # legacy 'peak' mode: sticky peak-hold, byte-identical to the old path so
+            # only update from chunks with real signal energy (silent gaps don't drag
+            # P_sig -- and thus the noise floor -- toward 0).
             self.p_sig = self.peak_ms
             self.p_sig_measured = True
-            self.reference_n_samples = n
             self.noise_std = self._noise_std_from_psig(self.p_sig)
-
+        # periodic clean-axis diagnostic (stdout -> bridge log): proves the meter is
+        # pinned to the DATA power and is ignoring the connect-burst peak.
         self._psig_diag_samples += n
         if self._psig_diag_samples >= self._psig_diag_next:
             self._psig_diag_next = self._psig_diag_samples + 5 * 48000
-            active_median = (float(np.median(self._active_ms))
-                             if self._active_ms else 0.0)
-            active_mean = (float(np.mean(self._active_ms))
-                           if self._active_ms else 0.0)
-            print("[PSIG_DIAG] mode=%s p_sig_used=%.6f peak_ms_seen=%.6f "
-                  "active_median_ms=%.6f active_mean_ms=%.6f n_active=%d "
-                  "noise_std=%.6f snr_label=%.1f" %
-                  (self.psig_mode, self.p_sig, self.peak_ms, active_median,
-                   active_mean, len(self._active_ms), self.noise_std,
-                   self.snr_db), flush=True)
+            _med = float(np.median(self._active_ms)) if self._active_ms else 0.0
+            _mean = float(np.mean(self._active_ms)) if self._active_ms else 0.0
+            print(f"[PSIG_DIAG] mode={self.psig_mode} p_sig_used={self.p_sig:.6f} "
+                  f"peak_ms_seen={self.peak_ms:.6f} active_median_ms={_med:.6f} "
+                  f"active_mean_ms={_mean:.6f} n_active={len(self._active_ms)} "
+                  f"noise_std={self.noise_std:.6f} snr_label={self.snr_db:.1f}",
+                  flush=True)
 
         # --- 1. Watterson multipath fading (complex baseband) ----------
         if self.fading:
@@ -1031,18 +1666,19 @@ class Channel:
         # back to real passband
         out = np.real(y)
 
+        # --- 1b. narrow-FM audio bandpass (radio audio filter) ----------
+        # Band-limit the SIGNAL only (before broadband receiver noise). Models
+        # the radio's audio filter on the real OFDM signal. Off unless a caller
+        # opts in (Mercury HF paths unaffected).
+        if self.bandpass is not None:
+            out = self.bandpass.process(out)
+
         # --- 2. AWGN at calibrated SNR3k (matches BER harness) ----------
         if self.noise_std > 0.0:
             # use the deterministic Xoshiro stream for reproducibility
             noise = np.fromiter((self.rng.gauss() for _ in range(n)),
                                 dtype=np.float64, count=n)
-            noise_component = self.noise_std * noise
-            out = out + noise_component
-        else:
-            noise_component = np.zeros(n, dtype=np.float64)
-        self.last_signal_component = np.real(y).copy()
-        self.last_noise_component = noise_component
-        self.noise_n_samples += n
+            out = out + self.noise_std * noise
 
         # --- 3. orthogonal impulse / burst erasure (NOT multipath) ------
         if self.burst and self.loss > 0.0:
@@ -1079,6 +1715,16 @@ class Channel:
             if fired:
                 self.snr_lin = 10.0 ** (self.snr_db / 10.0)
                 self.noise_std = self._noise_std_from_psig(self.p_sig)
+
+        # --- Deterministic scripted channel outage (P0 cross-session seam) ---
+        # If armed (MERCURY_SIM_OUTAGE_*), the shared controller decides whether
+        # the channel is currently blacked out; if so the forwarded output is
+        # muted to pure silence so the far modem sees a real loss of signal ->
+        # BREAK / link-timeout -> cross-session reconnect. No-op unless armed.
+        # Placed AFTER the channel math so the RNG/tap state still advances.
+        if self._outage is not None and self._outage.gate(
+                n, ms > _OUTAGE_SIG_EPS_MS, self.sample_clock):
+            out = np.zeros(n, dtype=np.float64)
 
         return out.tolist()
 
@@ -1128,23 +1774,9 @@ def parse_cell(cell):
 def main():
     ap = argparse.ArgumentParser(description="SIM ARQ channel relay (Watterson + SNR3k)")
     ap.add_argument("--port", type=int, default=52100)
-    ap.add_argument("--axis", choices=AXIS_CHOICES, default=DEFAULT_AXIS,
-                    help="versioned channel axis (default: %(default)s)")
-    ap.add_argument("--snr", type=float, default=None,
-                    help="ambiguous historical dial; accepted only with "
-                         "--axis %s" % AXIS_V0)
-    ap.add_argument("--snr3k-db", type=float, default=None,
-                    help="controlling SNR in the 3000 Hz reference bandwidth")
-    ap.add_argument("--snr3k", type=float, default=None,
-                    help="DEPRECATED controlling alias for --snr3k-db")
-    ap.add_argument("--cn-config-db", type=float, default=None,
-                    help="controlling C/N in --configured-bandwidth-hz")
-    ap.add_argument("--configured-bandwidth-hz", type=float, default=None)
-    ap.add_argument("--band-family", choices=("WB", "NB"), default=None)
-    ap.add_argument("--reference-power", type=float, default=None,
-                    help="archived Pcal power; required by v2")
-    ap.add_argument("--reference-id", default=None)
-    ap.add_argument("--reference-n-samples", type=int, default=None)
+    ap.add_argument("--snr", type=float, default=12.0,
+                    help="channel SNR in dB referenced to 3 kHz (SNR3k). "
+                         "Overridden by --cell.")
     ap.add_argument("--cell", default=None,
                     help="IONOS-compatible WGN label, e.g. WGN:-12; mapped "
                          "to measured external SNR3k (direct --snr is literal)")
@@ -1159,12 +1791,78 @@ def main():
     ap.add_argument("--sig-ref", type=float, default=0.15,
                     help="initial TX passband RMS reference for the noise floor "
                          "before live TX power is measured (default 0.15)")
-    ap.add_argument("--profile", choices=list(PROFILES.keys()), default="wgn",
-                    help="fading profile: wgn (none), mpg/mpm/mpp (ITU HF)")
+    ap.add_argument("--profile",
+                    choices=list(PROFILES.keys()) + list(FM_PROFILES.keys()),
+                    default="wgn",
+                    help="channel profile: wgn/flat (none), mpg/mpm/mpp (ITU "
+                         "HF Watterson), or the FM radio family fm_mic / "
+                         "fm_dataport / fm_dataport_deemph (REAL FM mod/demod "
+                         "chain; requires --fm-cnr-db, refuses --cell/--snr "
+                         "audio labels — see the FM RADIO CHANNEL block)")
+    # ---- FM radio profile family (fm_*) knobs --------------------------
+    # ALL default-inert for non-fm profiles (only read when an fm_* profile
+    # is selected). CNR is the RF carrier-to-noise ratio in the IF (Carson)
+    # bandwidth — an RF axis, deliberately NOT the audio SNR3k/WGN label.
+    ap.add_argument("--fm-cnr-db", type=float, default=None,
+                    help="RF carrier-to-noise ratio (dB) in the IF bandwidth "
+                         "at the discriminator input. REQUIRED for fm_* "
+                         "profiles; an error for others.")
+    ap.add_argument("--fm-dev-hz", type=float, default=0.0,
+                    help="peak FM deviation (Hz); 0 = profile default "
+                         "(fm_mic 2500, fm_dataport* 5000)")
+    ap.add_argument("--fm-drive", type=float, default=1.0,
+                    help="TX audio drive: linear gain ahead of the radio; "
+                         "|drive*audio| = 1.0 hits rated deviation / the "
+                         "limiter (default 1.0)")
+    ap.add_argument("--fm-limiter", type=int, default=1, choices=(0, 1),
+                    help="deviation limiter (clip at rated deviation, "
+                         "post-pre-emphasis). Real radios ALWAYS have one; "
+                         "0 is a diagnostics-only bypass (default 1)")
+    ap.add_argument("--fm-emph-corner-hz", type=float, default=0.0,
+                    help="pre/de-emphasis corner Hz; 0 = default 300 "
+                         "(TIA-603 LMR practice, tau~531us; 75us/2122Hz is "
+                         "BROADCAST FM and wrong for NBFM)")
+    ap.add_argument("--fm-if-bw-hz", type=float, default=0.0,
+                    help="IF bandwidth Hz for the CNR reference + IF filter; "
+                         "0 = Carson auto: 2*(dev + audio_hi)")
+    ap.add_argument("--fm-audio-lo-hz", type=float, default=0.0,
+                    help="radio audio path low edge Hz (0 = profile default)")
+    ap.add_argument("--fm-audio-hi-hz", type=float, default=0.0,
+                    help="radio audio path high edge Hz (0 = profile default)")
+    ap.add_argument("--fm-if-taps", type=int, default=FM_IF_TAPS_DEFAULT,
+                    help=f"IF complex FIR taps (default {FM_IF_TAPS_DEFAULT})")
+    ap.add_argument("--fm-audio-taps", type=int, default=FM_AUDIO_TAPS_DEFAULT,
+                    help=f"audio FIR taps (default {FM_AUDIO_TAPS_DEFAULT})")
+    ap.add_argument("--fm-fade-doppler-hz", type=float, default=0.0,
+                    help="optional flat Rayleigh RF fading Doppler spread Hz "
+                         "(Gaussian PSD, the validated IONOS FIR tap); 0=off")
+    ap.add_argument("--fm-unkeyed-blast", type=int, default=1, choices=(0, 1),
+                    help="1 (default): carrier UNKEYS in modem idle gaps -> "
+                         "squelch-open discriminator noise blast (the real "
+                         "half-duplex acquisition environment). 0: carrier "
+                         "always keyed (quiet gaps).")
+    ap.add_argument("--fm-keyup-hang-chunks", type=int, default=2,
+                    help="PTT hang: chunks (~21ms each) the carrier stays "
+                         "keyed after the last signal chunk (default 2)")
+    ap.add_argument("--fm-audio-clip", type=float, default=2.0,
+                    help="RX audio rail clip (sound-card/audio-stage rail; "
+                         "bounds the unkeyed blast). 0 = off. Default 2.0")
     ap.add_argument("--cfo-hz", type=float, default=0.0,
                     help="carrier frequency offset in Hz (default 0)")
     ap.add_argument("--phase-noise-deg", type=float, default=0.2,
                     help="per-sample phase-noise stddev in degrees (default 0.2)")
+    ap.add_argument("--audio-bandpass", choices=list(BANDPASS_PRESETS.keys()),
+                    default="off",
+                    help="narrow-FM audio bandpass (radio audio filter): off "
+                         "(default, full band -- Mercury HF), narrow (300-2900 Hz, "
+                         "VARA FM narrow), wide (300-6300 Hz). Band-limits the "
+                         "SIGNAL only. Applied to BOTH directions.")
+    ap.add_argument("--bandpass-lo-hz", type=float, default=0.0,
+                    help="explicit bandpass low edge Hz (>0 overrides preset)")
+    ap.add_argument("--bandpass-hi-hz", type=float, default=0.0,
+                    help="explicit bandpass high edge Hz (>0 overrides preset)")
+    ap.add_argument("--bandpass-taps", type=int, default=BANDPASS_DEFAULT_TAPS,
+                    help=f"FIR bandpass taps (default {BANDPASS_DEFAULT_TAPS})")
     ap.add_argument("--loss", type=float, default=0.0,
                     help="impulse/burst erasure fraction (0..1); orthogonal to "
                          "fading (NOT the multipath proxy)")
@@ -1177,14 +1875,7 @@ def main():
     ap.add_argument("--fade-depth", type=float, default=0.0,
                     help="(DEPRECATED) old flat-fade depth; use --profile instead")
     ap.add_argument("--seed", type=int, default=1)
-    # ---- Deterministic single-burst loss (test-only) -------------------------
-    # The A->B arm is the forward-data twin used by re-entry validation: erase
-    # one selected commander burst after the connection and first delivered
-    # batch, forcing a real empty responder window without mutating modem state.
-    # DEFAULT 0 is inert.
-    ap.add_argument("--erase-a2b-burst", type=int, default=0,
-                    help="TEST-ONLY: zero the Nth CMD->RSP signal burst (1-based). "
-                         "DEFAULT 0 (disabled).")
+    # ---- CONNECT-REACK T1: deterministic single-ACK loss (test-only) ---------
     # Erase (zero the channel input of) the Nth SIGNAL BURST on the b2a
     # (RSP->CMD) direction, 1-based. Burst #1 is the START_CONNECTION ACK,
     # burst #2 is the FIRST TEST_CONNECTION_ACK. --erase-b2a-burst 2 thus
@@ -1293,6 +1984,35 @@ def main():
     if args.barrier_k < 1:
         ap.error("--barrier-k must be >= 1")
 
+    # ---- fm_* profile argument hygiene (the CNR/SNR units firewall) ------
+    # The WGN/SNR3k label is an AUDIO-domain axis; fm_* profiles are driven
+    # by RF CNR. Refuse every combination that could silently reinterpret
+    # one as the other (this project has produced an 8.4x metric error from
+    # exactly such a silent unit reuse).
+    fm_on = args.profile in FM_PROFILES
+    if fm_on:
+        if args.fm_cnr_db is None:
+            ap.error(f"--profile {args.profile} requires --fm-cnr-db (RF CNR "
+                     "in the IF bandwidth). --cell/--snr audio labels are NOT "
+                     "accepted for FM profiles.")
+        if args.cell:
+            ap.error("--cell (audio SNR3k/WGN label) cannot be combined with "
+                     "an fm_* profile. Use --fm-cnr-db (RF CNR).")
+        if getattr(args, "snr_schedule", None):
+            ap.error("--snr-schedule is an audio-SNR3k axis and is not "
+                     "supported for fm_* profiles (Phase 1).")
+        if args.audio_bandpass != "off" or args.bandpass_lo_hz > 0.0 \
+                or args.bandpass_hi_hz > 0.0:
+            ap.error("--audio-bandpass is the flat-bench radio-audio-filter "
+                     "model; fm_* profiles own their audio filters "
+                     "(--fm-audio-lo-hz/--fm-audio-hi-hz). Use those.")
+        if args.burst or args.loss > 0.0:
+            ap.error("--burst/--loss (audio-domain erasure) are not wired "
+                     "into fm_* profiles (Phase 1).")
+    elif args.fm_cnr_db is not None:
+        ap.error("--fm-cnr-db only applies to fm_* profiles (got --profile "
+                 f"{args.profile}). For flat profiles use --snr/--cell.")
+
     drift_on = (args.drift_ppm_a2b != 0.0 or args.drift_ppm_b2a != 0.0)
     ptt_on = (args.ptt_latency_ms > 0.0)
     turn_on = bool(args.turnaround_drift)
@@ -1338,29 +2058,15 @@ def main():
                  "stamp, lurching the relay-stamped virtual clock forward across "
                  "the handshake (overshoots connect windows). Use --idle-bigstep 1.")
 
-    bandwidth = (args.configured_bandwidth_hz
-                 if args.configured_bandwidth_hz is not None
-                 else infer_bandwidth(None, args.band_family))
-    try:
-        resolved = resolve_axis(
-            args.axis, snr=args.snr, snr3k=args.snr3k,
-            snr3k_db=args.snr3k_db, cn_config_db=args.cn_config_db,
-            cell_snr3k_db=(parse_cell(args.cell) if args.cell else None),
-            configured_bandwidth_hz=bandwidth, default_snr3k_db=12.0)
-    except (AxisError, ValueError) as exc:
-        ap.error(str(exc))
-    if args.axis == AXIS_V2:
-        if args.reference_power is None or not args.reference_id:
-            ap.error("v2 requires --reference-power and --reference-id")
-        if args.reference_n_samples is None or args.reference_n_samples <= 0:
-            ap.error("v2 requires positive --reference-n-samples")
-        if args.snr_schedule:
-            ap.error("v2 fixed-config does not permit --snr-schedule")
-    args.snr = resolved["snr3k_db"]
-    args.snr3k_db = resolved["snr3k_db"]
-    args.cn_config_db = resolved["cn_config_db"]
-    args.configured_bandwidth_hz = resolved["configured_bandwidth_hz"]
-    args.input_coordinate = resolved["input_coordinate"]
+    if args.cell:
+        args.snr = parse_cell(args.cell)
+
+    # Resolve the audio-bandpass preset into the numeric edges the Channel reads.
+    bp_lo, bp_hi, bp_taps = resolve_bandpass(
+        args.audio_bandpass, args.bandpass_lo_hz, args.bandpass_hi_hz, args.bandpass_taps)
+    args.bandpass_lo_hz = bp_lo
+    args.bandpass_hi_hz = bp_hi
+    args.bandpass_taps = bp_taps
 
     logf = open(args.log, "w") if args.log else sys.stdout
 
@@ -1378,11 +2084,12 @@ def main():
     srv.bind(("127.0.0.1", args.port))
     srv.listen(4)
     prof = PROFILES.get(args.profile)
-    prof_s = "none" if prof is None else f"dtau={prof['dtau']*1e3:.1f}ms fd={prof['fd']}Hz"
+    if fm_on:
+        prof_s = "FM radio chain (see FM RADIO CHANNEL header)"
+    else:
+        prof_s = "none" if prof is None else f"dtau={prof['dtau']*1e3:.1f}ms fd={prof['fd']}Hz"
     log(f"relay listening on 127.0.0.1:{args.port} "
-        f"axis={args.axis} SNR3k={args.snr3k_db:.2f}dB "
-        f"C/N(Bcfg)={args.cn_config_db:.2f}dB Bcfg={args.configured_bandwidth_hz:g}Hz "
-        f"(input={args.input_coordinate}) "
+        f"SNR3k={args.snr:.2f}dB ({'cell '+args.cell if args.cell else 'snr'}) "
         f"profile={args.profile} ({prof_s}) cfo={args.cfo_hz}Hz "
         f"phase_noise={args.phase_noise_deg}deg "
         f"burst={args.burst} loss={args.loss} seed={args.seed} "
@@ -1445,6 +2152,14 @@ def main():
     # not sample-wise).
     ch_a2b = Channel(args, args.seed * 2654435761 & 0xFFFFFFFF)
     ch_b2a = Channel(args, args.seed * 40503 + 7 & 0xFFFFFFFF)
+    if ch_a2b.fm is not None:
+        log(f"NOTE: FM RADIO profile '{args.profile}' ENABLED — real "
+            f"mod/demod chain per direction: {ch_a2b.fm.describe()}. The "
+            f"SNR3k number in the line above is IGNORED for this profile; "
+            f"the operating point is --fm-cnr-db={args.fm_cnr_db} (RF CNR "
+            f"in B_if). Expect triangular discriminator noise, the ~10dB "
+            f"CNR threshold knee, deviation limiting, and squelch-open "
+            f"noise blasts in unkeyed gaps (--fm-unkeyed-blast).")
 
     # Per-direction drift resampler + PTT-latency model (OPT-IN; identity/inert
     # when the ppm / latency are 0 -> byte-identical default). Applied AFTER
@@ -1458,7 +2173,7 @@ def main():
                                   Xoshiro(args.seed * 3266489917 & 0xFFFFFFFF))}
     # CONNECT-REACK T1 single-burst eraser (TEST-ONLY). Only the b2a (RSP->CMD)
     # direction can carry a TEST_ACK; a2b is disabled (target 0 = inert).
-    eraser = {"a2b": BurstEraser(args.erase_a2b_burst),
+    eraser = {"a2b": BurstEraser(0),
               "b2a": BurstEraser(args.erase_b2a_burst)}
     # FAITHFUL turnaround-timing model (M1-M3; SIMFIDELITY_ROOTCAUSE §3.2). Per
     # direction: ±ppm crystal slip + seeded per-key-up jitter realized as integer

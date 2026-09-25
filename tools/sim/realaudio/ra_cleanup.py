@@ -11,10 +11,10 @@ do an UNCONDITIONAL, GLOBAL:
     pkill -9 -f 'mercury -m ARQ'
 
 at startup. That reaps EVERY mercury on the box, including ones belonging to a
-DIFFERENT agent's concurrent A/B cell on a DISJOINT card. Card/substream
+DIFFERENT concurrent A/B cell on a DISJOINT card. Card/substream
 isolation does NOT protect against a global pkill - the kill matches by argv
 substring, not by audio device. This is the contamination source proven by
-diagnostic wf_18b9f890 (a sibling's cohort got SIGKILLed mid-run, producing
+an earlier diagnostic (a sibling's cohort got SIGKILLed mid-run, producing
 0-delivery cells that looked like a modem regression).
 
 The fix
@@ -27,7 +27,7 @@ on its two mercury -x alsa processes AND its bridge. Those device strings appear
 VERBATIM in the target's /proc/<pid>/cmdline. A run also owns its rsp/cmd TCP
 ports (and port+1 data sockets), which appear as "-p <port>" in mercury argv.
 
-scoped_cleanup() scans /proc and SIGTERMs only processes whose cmdline contains
+scoped_cleanup() scans /proc and sends SIGTERM only to processes whose cmdline contains
 one of THIS owner's device strings or "-p <port>" tokens. A sibling on a disjoint
 card/subs/port set can never match, so it is never reaped. The caller's own
 process tree (self + descendants) is excluded as a belt-and-braces guard.
@@ -38,7 +38,11 @@ without touching anyone else.
 """
 import os
 import signal
+import subprocess
 import time
+
+
+GRACEFUL_SHUTDOWN_SECONDS = 10.0
 
 
 def _own_pids():
@@ -114,53 +118,111 @@ def own_tokens(card, subs, ports):
     return toks
 
 
-def scoped_cleanup(card, subs, ports, settle=10.0, verbose=False):
-    """SIGTERM only the mercury / realaudio_bridge processes that OWN one of this
+def _pid_exists(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return os.path.exists(f"/proc/{pid}")
+
+
+def _wait_for_pids(pids, timeout=10.0, poll=0.1):
+    """Wait a bounded interval and return PIDs still alive."""
+    remaining = set(pids)
+    deadline = time.monotonic() + timeout
+    while remaining and time.monotonic() < deadline:
+        remaining = {pid for pid in remaining if _pid_exists(pid)}
+        if remaining:
+            time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+    return sorted(pid for pid in remaining if _pid_exists(pid))
+
+
+def terminate_popen_processes(
+        processes, grace_seconds=GRACEFUL_SHUTDOWN_SECONDS):
+    """SIGTERM owned ``Popen`` children and return any that miss the grace.
+
+    This helper deliberately has no SIGKILL path.  A surviving card holder makes
+    the run invalid and requires explicit card recovery; silently escalating can
+    wedge ALSA or kill a process from another workload.
+    """
+    if float(grace_seconds) < GRACEFUL_SHUTDOWN_SECONDS:
+        raise ValueError("real-audio process grace must be at least 10 seconds")
+    active = [proc for proc in processes if proc is not None and proc.poll() is None]
+    for proc in active:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    deadline = time.monotonic() + float(grace_seconds)
+    survivors = []
+    for proc in active:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except (OSError, TimeoutError, subprocess.TimeoutExpired):
+            survivors.append(proc)
+    return survivors
+
+
+def terminate_processes_gracefully(processes, timeout=GRACEFUL_SHUTDOWN_SECONDS):
+    """Backward-compatible name for the TERM-only child teardown helper."""
+    return terminate_popen_processes(processes, grace_seconds=timeout)
+
+
+def scoped_cleanup(card, subs, ports, settle=1.0, verbose=False,
+                   grace=GRACEFUL_SHUTDOWN_SECONDS):
+    """SIGTERM only mercury / realaudio_bridge processes that OWN one of this
     run's ALSA cables or TCP ports. Never touches a sibling on disjoint cables.
 
-    Returns the list of (pid, cmdline) actually killed (for logging / proof).
+    Returns the list of (pid, cmdline) signalled. If an owned process remains
+    after at least ten seconds, fail closed instead of escalating to SIGKILL.
     """
     toks = own_tokens(card, subs, ports)
     keep = _own_pids()
-    killed = []
+    signalled = []
     for pid in list(_iter_pids()):
         if pid in keep:
             continue
         cl = _cmdline(pid)
         if not cl:
             continue
-        is_target = ("mercury -m ARQ" in cl) or ("realaudio_bridge_s32.py" in cl)
+        is_target = ("mercury -m ARQ" in cl) or ("realaudio_bridge_s32" in cl)
         if not is_target:
             continue
         if any(tok in cl for tok in toks):
             try:
                 os.kill(pid, signal.SIGTERM)
-                killed.append((pid, cl))
+                signalled.append((pid, cl))
                 if verbose:
                     print(f"[ra_cleanup] SIGTERM {pid}: {cl[:120]}")
             except OSError:
                 pass
-    if killed:
-        deadline = time.monotonic() + max(10.0, float(settle))
-        while time.monotonic() < deadline:
-            if all(not os.path.exists(f"/proc/{pid}") for pid, _ in killed):
-                break
-            time.sleep(0.1)
-    return killed
+    survivors = _wait_for_pids(
+        [pid for pid, _ in signalled], timeout=max(10.0, float(grace)))
+    if survivors:
+        raise RuntimeError(
+            "owned real-audio process(es) survived graceful cleanup: %s" %
+            ",".join(str(pid) for pid in survivors))
+    if signalled and settle:
+        time.sleep(settle)
+    return signalled
 
 
-def scoped_cleanup_cells(cells, settle=10.0, verbose=False):
+def scoped_cleanup_cells(cells, settle=1.0, verbose=False):
     """Cohort-level cleanup for a spawner: clear stale leftovers for EVERY cell
     THIS spawner is about to launch (its own plan), and nothing else.
 
     `cells` is an iterable of dicts each with keys: card, subs, rsp_port,
     cmd_port (the same per-cell plan dicts the spawners already build).
     """
-    all_killed = []
+    all_signalled = []
     for c in cells:
         ports = [c["rsp_port"], c["cmd_port"]]
-        all_killed += scoped_cleanup(c["card"], c["subs"], ports,
-                                     settle=0.0, verbose=verbose)
-    if all_killed and settle > 10.0:
-        time.sleep(settle - 10.0)
-    return all_killed
+        all_signalled += scoped_cleanup(c["card"], c["subs"], ports,
+                                        settle=0.0, verbose=verbose)
+    if all_signalled:
+        time.sleep(settle)
+    return all_signalled

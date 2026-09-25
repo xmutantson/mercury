@@ -715,7 +715,11 @@ def main():
         # concrete WB starting config.  Robust cfg100+ must retain that probe.
         # This has to follow the per-cell plan rather than the cohort default
         # because W48 deliberately alternates cfg16 and cfg100.
-        if p.get("start_cfg", args.start_cfg) < 100:
+        # Pinned ROBUST_3 is a WB payload rung even though its numeric ID is in
+        # the robust family. Preserve robust MFSK hailing (-R, selected by the
+        # child harness from start_cfg>=100) but bypass the NB payload probe so
+        # cfg103 is seated in its designed WB M16x2 geometry on both peers.
+        if p.get("start_cfg", args.start_cfg) < 100 or p.get("start_cfg", args.start_cfg) == 103:
             cmd += ["--skip-nb-probe"]
         if args.fixed_window_score:
             cmd += [
