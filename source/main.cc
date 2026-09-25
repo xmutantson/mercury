@@ -7352,6 +7352,12 @@ int main(int argc, char *argv[])
             if (optarg)
             {
                 audio_channel_override = atoi(optarg);
+                // A multichannel device opens 16 channels, so 0..15 are the
+                // only channel indices audioio can address.
+                if (audio_channel_override < 0 || audio_channel_override > 15) {
+                    fprintf(stderr, "ERROR: -A channel must be 0..15, got %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
                 multichannel_mode = 1;
                 printf("Audio channel override: %d (multichannel mode)\n", audio_channel_override);
             }
@@ -7467,6 +7473,12 @@ start_modem:
             // Apply channel configuration from settings
             configured_input_channel = g_settings.input_channel;
             configured_output_channel = g_settings.output_channel;
+            if (g_settings.input_channel < 0 || g_settings.input_channel > 15
+                || g_settings.output_channel < 0 || g_settings.output_channel > 15) {
+                fprintf(stderr, "ERROR: INI [Audio] InputChannel/OutputChannel must be 0..15, "
+                        "got %d/%d\n", g_settings.input_channel, g_settings.output_channel);
+                return EXIT_FAILURE;
+            }
             // Override with -A flag if specified (sets both to same channel)
             if (audio_channel_override >= 0) {
                 configured_input_channel = audio_channel_override;
