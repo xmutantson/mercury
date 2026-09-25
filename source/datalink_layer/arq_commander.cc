@@ -31140,6 +31140,12 @@ int cl_arq_controller::test_entry_leap_fwd()
 	// proven-ceiling never-raise
 	supershift_proven_ceiling = CONFIG_13;
 	{ int got = entry_leap_target_from_fwd(25.0); check(got == CONFIG_13, "proven ceiling 13 caps the leap", got, CONFIG_13); }
+	// A robust proven ceiling (ROBUST_2 = 102 as an id, but below every OFDM rung on the ladder)
+	// must cap an OFDM leap by ladder position: the capped target is robust, so no OFDM leap.
+	supershift_proven_ceiling = ROBUST_2;
+	{ int got = entry_leap_target_from_fwd(25.0); check(got == CONFIG_NONE, "robust proven ceiling (ROBUST_2) caps the leap by ladder position", got, CONFIG_NONE); }
+	supershift_proven_ceiling = ROBUST_0;
+	{ int got = entry_leap_target_from_fwd(19.0); check(got == CONFIG_NONE, "robust proven ceiling (ROBUST_0) caps a mid-SNR leap", got, CONFIG_NONE); }
 	supershift_proven_ceiling = -1;
 	// the legacy elevator is unchanged: elevator_target_from_snr() == value(SNR_uplink, true)
 	measurements.SNR_uplink = 23.0;
