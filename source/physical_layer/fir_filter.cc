@@ -378,7 +378,9 @@ void cl_FIR::apply(std::complex <double>* in, std::complex <double>* out, int nI
 	{
 		double acc_r = 0.0, acc_i = 0.0;
 		int j_start = half - k;
-		for (int j = j_start; j < N; j++)
+		int j_end = nItems - (k - half);
+		if (j_end > N) j_end = N;
+		for (int j = j_start; j < j_end; j++)
 		{
 			int in_idx = k - half + j;
 			acc_r += in[in_idx].real() * coef[N - 1 - j];
