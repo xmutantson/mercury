@@ -1736,6 +1736,10 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	// An inactive OFDM grid starts a fresh capture/batch acquisition epoch.
 	// Rejected offsets are buffer-relative and must not escape that scope.
 	// Retry trials and calls in an active batch retain the ring and can fire P1.
+	// The speculative early-termination mode belongs to one sub-peak probe decode
+	// only (armed at the probe, cleared after its decode); a probe that a later gate
+	// stops must not leak it into the next call or into receive_bigblock.
+	ldpc.early_term_speculative = false;
 	if(!receive_stats.ofdm_batch_active)
 		acq_band_excl_begin_epoch();
 
@@ -7818,6 +7822,8 @@ void cl_telecom_system::RX_RAND_process_main()
 				data_container.frames_to_read = data_container.Nsymb + data_container.preamble_nSymb - frames_left_in_buffer;
 
 			receive_stats.delay_of_last_decoded_message += (data_container.Nsymb + data_container.preamble_nSymb - data_container.frames_to_read) * symbol_period;
+			if(data_container.frames_to_read < 0)
+				data_container.frames_to_read = 0;
 
 			data_container.nUnder_processing_events = 0;
 		}
@@ -7931,6 +7937,8 @@ void cl_telecom_system::RX_TEST_process_main()
 				data_container.frames_to_read = data_container.Nsymb + data_container.preamble_nSymb - frames_left_in_buffer;
 
 			receive_stats.delay_of_last_decoded_message += (data_container.Nsymb + data_container.preamble_nSymb - data_container.frames_to_read) * symbol_period;
+			if(data_container.frames_to_read < 0)
+				data_container.frames_to_read = 0;
 
 			data_container.nUnder_processing_events = 0;
 		}
@@ -8170,6 +8178,8 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 				data_container.frames_to_read = data_container.Nsymb + data_container.preamble_nSymb - frames_left_in_buffer;
 
 			receive_stats.delay_of_last_decoded_message += (data_container.Nsymb + data_container.preamble_nSymb - data_container.frames_to_read) * symbol_period;
+			if(data_container.frames_to_read < 0)
+				data_container.frames_to_read = 0;
 
 			data_container.nUnder_processing_events = 0;
 		}
@@ -13021,6 +13031,7 @@ void cl_telecom_system::rebuild_mfsk_preamble_runtime()
 		if(ofdm.ofdm_corr_template != NULL) { delete[] ofdm.ofdm_corr_template; ofdm.ofdm_corr_template = NULL; }
 
 		int template_nsymb = data_container.preamble_nSymb;
+		if(template_nsymb > 16) template_nsymb = 16;  // ofdm_corr_template_sym_energy has 16 slots
 		int Nofdm = data_container.Nofdm;
 		int bb_len = template_nsymb * Nofdm;
 		std::complex<double>* bb_template = new std::complex<double>[bb_len];
