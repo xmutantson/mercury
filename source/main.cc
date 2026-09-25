@@ -2903,6 +2903,7 @@ int main(int argc, char *argv[])
     }
 
     int main_exit_status = EXIT_SUCCESS;
+    bool gui_thread_abandoned = false;
 
 #if defined(_WIN32)
     SetUnhandledExceptionFilter(crash_handler);
@@ -9957,7 +9958,7 @@ start_modem:
         bool gui_thread_created = false;
         bool gui_startup_failed = false;
         gui_thread_context gui_context;
-        if (main_exit_status == EXIT_SUCCESS && !nogui) {
+        if (main_exit_status == EXIT_SUCCESS && !nogui && !shutdown_.load()) {
             printf("Starting GUI...\n");
             int thread_result = pthread_create(&gui_thread, NULL, gui_thread_func,
                                                &gui_context);
@@ -9968,13 +9969,28 @@ start_modem:
             } else {
                 gui_thread_created = true;
                 int startup_status;
+                // No numeric deadline: gui_init has no bounded call to derive one
+                // from, so the bound is the operator's or supervisor's SIGTERM /
+                // SIGINT (which store shutdown_). The 10 ms poll period is far
+                // below the 10 s termination grace harnesses give.
                 do {
                     startup_status = gui_context.status.load(std::memory_order_acquire);
-                    if (startup_status == GUI_STARTUP_PENDING)
-                        std::this_thread::yield();
+                    if (startup_status == GUI_STARTUP_PENDING) {
+                        if (shutdown_.load())
+                            break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
                 } while (startup_status == GUI_STARTUP_PENDING);
 
-                if (gui_validate_startup(startup_status, stderr) != 0) {
+                if (startup_status == GUI_STARTUP_PENDING) {
+                    // gui_init is still blocked inside a display call; joining it
+                    // would hang teardown, so the thread is left to process exit.
+                    fprintf(stderr, "[GUI-START] abandoned: GUI init still pending at shutdown\n");
+                    gui_startup_failed = true;
+                    pthread_detach(gui_thread);
+                    gui_thread_created = false;
+                    gui_thread_abandoned = true;
+                } else if (gui_validate_startup(startup_status, stderr) != 0) {
                     gui_startup_failed = true;
                     pthread_join(gui_thread, NULL);
                     gui_thread_created = false;
@@ -10340,6 +10356,14 @@ start_modem:
     audioio_deinit(&radio_capture, &radio_playback, &radio_capture_prep);
 
     shutdown_tee_logging();
+
+    if (gui_thread_abandoned) {
+        // A GUI thread left inside gui_init must not race the static
+        // destructors a normal return runs, so the process ends here.
+        fflush(stdout);
+        fflush(stderr);
+        _exit(main_exit_status);
+    }
 
     return main_exit_status;
 }
