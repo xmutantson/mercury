@@ -2204,7 +2204,8 @@ int cl_arq_controller::elevator_target_from_snr_value(double snr, bool reverse_m
 		int t = get_configuration(snr - SUPERSHIFT_MARGIN_DB);
 		if(narrowband_enabled == YES && t > NB_CONFIG_MAX)
 			t = NB_CONFIG_MAX;
-		if(supershift_proven_ceiling >= 0 && t > supershift_proven_ceiling)
+		if(supershift_proven_ceiling >= 0
+		   && config_ladder_index(t) > config_ladder_index(supershift_proven_ceiling))
 			t = supershift_proven_ceiling;
 		t = apply_bigblock_cooldown_cap(t);
 		if(narrowband_enabled != YES && !(snr > CFG16_MIN_SNR_DB)
@@ -2216,7 +2217,8 @@ int cl_arq_controller::elevator_target_from_snr_value(double snr, bool reverse_m
 	if(narrowband_enabled == YES && snr_ideal > NB_CONFIG_MAX)
 		snr_ideal = NB_CONFIG_MAX;
 	// Enforce proven ceiling from prior BREAK failures.
-	if(supershift_proven_ceiling >= 0 && snr_ideal > supershift_proven_ceiling)
+	if(supershift_proven_ceiling >= 0
+	   && config_ladder_index(snr_ideal) > config_ladder_index(supershift_proven_ceiling))
 		snr_ideal = supershift_proven_ceiling;
 	snr_ideal = supershift_retrigger_target(snr_ideal, measurements.SNR_uplink,
 		last_data_viable_config, optimizer_is_in_control(),
@@ -13018,7 +13020,8 @@ void cl_arq_controller::process_control_commander()
 							int cfg_ceiling = (narrowband_enabled == YES) ? NB_CONFIG_MAX : topgear_wb_ceiling();
 							if(snr_target > cfg_ceiling)
 								snr_target = cfg_ceiling;
-							if(supershift_proven_ceiling >= 0 && snr_target > supershift_proven_ceiling)
+							if(supershift_proven_ceiling >= 0
+							   && config_ladder_index(snr_target) > config_ladder_index(supershift_proven_ceiling))
 								snr_target = supershift_proven_ceiling;
 							if(max_config_override >= 0 && snr_target > max_config_override)
 								snr_target = max_config_override;
