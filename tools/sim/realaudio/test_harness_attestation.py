@@ -89,6 +89,75 @@ class TestIdentity(unittest.TestCase):
         self.assertTrue(HA.bridge_accepts_identity("/x/realaudio_bridge_s32_c"))
 
 
+class TestBridgeProgramAndBlobs(unittest.TestCase):
+    """The attested bridge hash names the program a wrapper executes (#42)."""
+
+    def _dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        native = os.path.join(d, "realaudio_bridge_s32_c")
+        with open(native, "wb") as handle:
+            handle.write(b"\x7fELF-native-bridge")
+        return d, native
+
+    def _wrapper(self, d, body):
+        w = os.path.join(d, "bridge_wrap")
+        with open(w, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        return w
+
+    def test_relative_exec_wrapper_hashes_the_native_program(self):
+        d, native = self._dir()
+        w = self._wrapper(d, '#!/bin/bash\nset -eu\necho "[bridge_wrap] x" >&2\n'
+                             'exec "$(dirname "$0")/realaudio_bridge_s32_c" "$@"\n')
+        ident = HA.identity(w, __file__, "mercury")
+        self.assertTrue(ident["bridge_program_resolved"])
+        self.assertEqual(ident["bridge_sha256"], HA.sha256_file(native))
+        self.assertEqual(ident["bridge_wrapper_sha256"], HA.sha256_file(w))
+        self.assertNotEqual(ident["bridge_sha256"], ident["bridge_wrapper_sha256"])
+
+    @unittest.skipUnless(os.name == "posix", "an absolute exec path is a POSIX path")
+    def test_absolute_exec_wrapper(self):
+        d, native = self._dir()
+        w = self._wrapper(d, "#!/bin/sh\nexec %s \"$@\"\n" % native)
+        self.assertEqual(HA.identity(w, __file__, "mercury")["bridge_sha256"], HA.sha256_file(native))
+
+    def test_unresolvable_wrapper_is_reported(self):
+        d, native = self._dir()
+        w = self._wrapper(d, "#!/bin/sh\n/usr/bin/env something \"$@\"\n")
+        ident = HA.identity(w, __file__, "mercury")
+        self.assertFalse(ident["bridge_program_resolved"])
+        self.assertEqual(ident["bridge_sha256"], HA.sha256_file(w))
+
+    def test_missing_wrapper_target_is_unresolved(self):
+        d, native = self._dir()
+        w = self._wrapper(d, '#!/bin/bash\nexec "$(dirname "$0")/absent_bridge" "$@"\n')
+        self.assertFalse(HA.identity(w, __file__, "mercury")["bridge_program_resolved"])
+
+    def test_plain_binary_runs_itself(self):
+        d, native = self._dir()
+        ident = HA.identity(native, __file__, "mercury")
+        self.assertTrue(ident["bridge_program_resolved"])
+        self.assertIsNone(ident["bridge_wrapper_path"])
+        self.assertEqual(ident["bridge_sha256"], HA.sha256_file(native))
+
+    def test_git_blob_id_matches_git(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"hello\n")
+        try:
+            # git hash-object of "hello\n"
+            self.assertEqual(HA.git_blob_id(handle.name), "ce013625030ba8dba906f756967f9e9ca394464a")
+        finally:
+            os.unlink(handle.name)
+
+    def test_harness_file_blobs_cover_this_directory(self):
+        blobs = HA.identity(BRIDGE_BIN if os.path.isfile(BRIDGE_BIN) else __file__,
+                            os.path.join(HERE, "arq_realaudio.py"), "mercury")["harness_file_blobs"]
+        self.assertEqual(blobs["arq_realaudio.py"], HA.git_blob_id(os.path.join(HERE, "arq_realaudio.py")))
+        self.assertIn("harness_attestation.py", blobs)
+        self.assertIn("../sim_channel_relay.py", blobs)
+
+
 class TestTxGainIni(unittest.TestCase):
     def write(self, text):
         handle = tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False)

@@ -1107,6 +1107,11 @@ def main():
         harness_ident = HA.identity(args.bridge, __file__, HARNESS_LINEAGE)
     except (OSError, ValueError) as exc:
         ap.error("cannot attest bridge/harness identity: %s" % exc)
+    if not harness_ident["bridge_program_resolved"]:
+        # A wrapper whose program cannot be named: the result could not say which
+        # bridge binary ran.
+        instrument_invalid = True
+        instrument_invalid_reasons.append("bridge_program_unresolved")
     bridge_ident_argv = (HA.bridge_identity_argv(harness_ident)
                          if HA.bridge_accepts_identity(args.bridge) else [])
     tx_gain_ini, tx_gain_ini_source = HA.resolve_tx_gain_ini(

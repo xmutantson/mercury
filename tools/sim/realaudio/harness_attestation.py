@@ -68,14 +68,74 @@ def sha256_file(path, block_size=1 << 20):
 
 # ---------------------------------------------------------------- identity
 
+# A wrapper script's last exec line names the program that actually runs, either
+# next to the wrapper ("$(dirname "$0")/NAME") or by absolute path.
+WRAPPER_EXEC_RE = re.compile(
+    r'^\s*exec\s+(?:"\$\(dirname\s+"\$0"\)/(?P<rel>[^"]+)"|"?(?P<abs>/[^"\s]+)"?)', re.M)
+
+
+def git_blob_id(path):
+    """The git object id of ``path`` as a blob (what ``git hash-object`` prints)."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def bridge_program(bridge_path):
+    """Resolve the program a --bridge path runs.
+
+    A regular binary or a .py bridge runs itself. A '#!' script is a wrapper: the
+    program is the target of its last exec line. Returns (program_path or None,
+    wrapper_path or None)."""
+    with open(bridge_path, "rb") as handle:
+        head = handle.read(2)
+    if head != b"#!" or bridge_path.endswith(".py"):
+        return bridge_path, None
+    with open(bridge_path, "r", encoding="utf-8", errors="replace") as handle:
+        matches = list(WRAPPER_EXEC_RE.finditer(handle.read()))
+    if not matches:
+        return None, bridge_path
+    m = matches[-1]
+    target = (os.path.join(os.path.dirname(os.path.abspath(bridge_path)), m.group("rel"))
+              if m.group("rel") else m.group("abs"))
+    return (target if os.path.isfile(target) else None), bridge_path
+
+
+def harness_file_blobs(harness_path):
+    """Git blob ids of every Python file of the harness directory and of the channel
+    relay it imports from the parent directory, so a result maps to a commit."""
+    here = os.path.dirname(os.path.abspath(harness_path))
+    out = {}
+    for name in sorted(os.listdir(here)):
+        if name.endswith(".py") and os.path.isfile(os.path.join(here, name)):
+            out[name] = git_blob_id(os.path.join(here, name))
+    relay = os.path.join(os.path.dirname(here), "sim_channel_relay.py")
+    if "sim_channel_relay.py" not in out and os.path.isfile(relay):
+        out["../sim_channel_relay.py"] = git_blob_id(relay)
+    return out
+
+
 def identity(bridge_path, harness_path, lineage):
-    """Hash the bridge program and the harness file for the attestation."""
+    """Hash the bridge program and the harness file for the attestation.
+
+    bridge_sha256 is the hash of the program that runs: for a wrapper script, the
+    program its exec line names (the wrapper's own hash is kept separately). When
+    a wrapper's program cannot be resolved, bridge_program_resolved is False and
+    bridge_sha256 falls back to the wrapper's hash."""
     if not lineage or len(lineage) >= 32:
         raise ValueError("harness lineage must be 1..31 characters")
+    program, wrapper = bridge_program(bridge_path)
+    harness_file = os.path.abspath(harness_path)
     return {
-        "bridge_sha256": sha256_file(bridge_path),
+        "bridge_sha256": sha256_file(program if program else bridge_path),
         "harness_lineage": lineage,
-        "harness_sha256": sha256_file(os.path.abspath(harness_path)),
+        "harness_sha256": sha256_file(harness_file),
+        "bridge_program_path": program,
+        "bridge_program_resolved": program is not None,
+        "bridge_wrapper_path": wrapper,
+        "bridge_wrapper_sha256": sha256_file(wrapper) if wrapper else None,
+        "harness_git_blob": git_blob_id(harness_file),
+        "harness_file_blobs": harness_file_blobs(harness_file),
     }
 
 
