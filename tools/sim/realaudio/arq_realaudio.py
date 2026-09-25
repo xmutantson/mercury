@@ -643,6 +643,56 @@ def delivery_endpoint_times(events):
             "delivery_event_count": len(events)}
 
 
+OPT_NOT_FOUND_RE = re.compile(r"\[(CMD|RSP)\] \[OPT\] table not found \(path=([^)]*)\)")
+OPT_LOADED_RE = re.compile(r"\[(CMD|RSP)\] \[OPT\] (?:WB|NB) calibration loaded: .*path=([^)]*)\)")
+OPT_OTHER_RE = re.compile(r"\[(CMD|RSP)\] \[OPT\] (?:table empty|calibration metadata lacks|"
+                          r"WARNING calibration config signature mismatch|calibration build differs|"
+                          r"calibration contains no valid)")
+# The modem's search order when MERCURY_RATE_TABLE is unset (mercury
+# source/datalink_layer/arq_common.cc:12318-12325 @95723953): table-free = all four absent.
+OPT_TABLE_FREE_PATHS = ("mercury/effective_rate_table.json", "effective_rate_table.json",
+                        "mercury/effective_rate_table.synthetic.json",
+                        "effective_rate_table.synthetic.json")
+
+
+def rate_table_attestation(log_path, expect_path=None):
+    """Per-peer check that the gearshift ran on the rate table the recipe names.
+
+    Table-free (the product configuration): each peer prints exactly the four
+    '[OPT] table not found' lines of the default search order and nothing else from
+    the loader. With expect_path, each peer must print a calibration-loaded line for
+    exactly that path. Anything else (a planted table in the cell directory, a set
+    MERCURY_RATE_TABLE, an empty or mismatched table) fails the cell."""
+    peers = {p: {"not_found": [], "loaded": [], "other": 0} for p in ("CMD", "RSP")}
+    try:
+        with open(log_path, "r", errors="replace") as fh:
+            for line in fh:
+                if "[OPT]" not in line:
+                    continue
+                m = OPT_NOT_FOUND_RE.search(line)
+                if m:
+                    peers[m.group(1)]["not_found"].append(m.group(2))
+                    continue
+                m = OPT_LOADED_RE.search(line)
+                if m:
+                    peers[m.group(1)]["loaded"].append(m.group(2))
+                    continue
+                m = OPT_OTHER_RE.search(line)
+                if m:
+                    peers[m.group(1)]["other"] += 1
+    except OSError as exc:
+        return {"ok": False, "reasons": ["log_unreadable:%s" % exc], "per_peer": peers,
+                "expect_path": expect_path}
+    reasons = []
+    for p, v in peers.items():
+        if expect_path is None:
+            if tuple(v["not_found"]) != OPT_TABLE_FREE_PATHS or v["loaded"] or v["other"]:
+                reasons.append("%s_not_table_free" % p)
+        elif not v["loaded"] or any(x != expect_path for x in v["loaded"]) or v["other"]:
+            reasons.append("%s_not_expected_table" % p)
+    return {"ok": not reasons, "reasons": reasons, "per_peer": peers, "expect_path": expect_path}
+
+
 def modem_bandwidth_args(mode, skip_nb_probe):
     """Bandwidth-entry flags for one modem.
 
@@ -768,6 +818,10 @@ def main():
                          "(compressible=on so the compressor arms; incompressible=off); "
                          "on/off pins it (e.g. to A/B compression itself on one corpus)")
     ap.add_argument("--logdir", default="/tmp/raionos2/logs")
+    ap.add_argument("--expect-rate-table", default=None,
+                    help="path of the rate table the recipe runs with; omitted = the "
+                         "product configuration, table-free (every peer must report the "
+                         "four default paths absent)")
     ap.add_argument("--negative-control", default=None,
                     help="declare ONE registered behaviour-restoring switch as this run's "
                          "negative control (see _research/PREFLIGHT_OVERRIDES.json); without "
@@ -1481,6 +1535,10 @@ def main():
     dwell = max(1.0, dwell_cold - warm_offset)
     oracle_snapshot = delivery_oracle.snapshot()
     delivery_times = delivery_endpoint_times(oracle_snapshot["events"])
+    rate_table = rate_table_attestation(logpath, args.expect_rate_table)
+    if not rate_table["ok"]:
+        instrument_invalid = True
+        instrument_invalid_reasons.append("rate_table_attestation")
     # SECONDARY-only post-warm suffix.  These values are retained for engineering
     # diagnosis, but are never the primary score and never affect eligibility.
     steady_rx_bytes = scored_delta(res["rx"], warm_rx_bytes, under_warmed)
@@ -2205,6 +2263,7 @@ def main():
         "last_rx_at_s": delivery_times["last_rx_at_s"],
         "last_good_prefix_advance_at_s": delivery_times["last_good_prefix_advance_at_s"],
         "delivery_event_count": delivery_times["delivery_event_count"],
+        "rate_table_attestation": rate_table,
         "disconnect_issued_at_s": disconnect_issued_at_s,
         "terminal_settlement_s": terminal_settlement_s,
         "terminal_release_at_by_peer_s": dict(st.disconnected_at_by_peer),
