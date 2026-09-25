@@ -2946,7 +2946,7 @@ int main(int argc, char *argv[])
         }
         if (strcmp(argv[i], "--test-b2f-bounded-output") == 0) {
             arm_test_watchdog();
-            return run_b2f_bounded_output_test();
+            return run_b2f_bounded_output_test() == 0 ? 0 : 1;
         }
         if (strcmp(argv[i], "--test-audio-thread-create") == 0) {
             cl_arq_controller test_audio;
@@ -3007,7 +3007,7 @@ int main(int argc, char *argv[])
             return (failed == 0) ? 0 : 1;
         }
         if (strcmp(argv[i], "--test-fade-core") == 0) {
-            return mercury::fade::run_fade_core_tests();
+            return mercury::fade::run_fade_core_tests() == 0 ? 0 : 1;
         }
         if (strcmp(argv[i], "--test-entry-leap") == 0) {
             int failed = 0;
