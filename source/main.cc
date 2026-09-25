@@ -9703,17 +9703,16 @@ start_modem:
         telecom_system.coarse_freq_sync_enabled = g_settings.coarse_freq_sync_enabled;
         g_gui_state.coarse_freq_sync_enabled.store(g_settings.coarse_freq_sync_enabled);
         // Robust mode: CLI -R overrides INI setting
-        if (robust_mode)
-            g_settings.robust_mode_enabled = true;
-        g_gui_state.robust_mode_enabled.store(g_settings.robust_mode_enabled);
+        // CLI values are run-only: they go to g_gui_state and ARQ, never into
+        // g_settings, which holds only what the user saved.
+        g_gui_state.robust_mode_enabled.store(g_settings.robust_mode_enabled || robust_mode);
         // All stations always start NB — bandwidth_mode controls WB upgrade.
         // CLI -N/-W still available for BER testing but ignored for ARQ.
-        g_settings.narrowband_enabled = true;
         g_gui_state.narrowband_enabled.store(true);
         // Bandwidth mode: CLI -M overrides INI setting
-        if (bandwidth_mode_cli >= 0)
-            g_settings.bandwidth_mode = bandwidth_mode_cli;
-        g_gui_state.bandwidth_mode.store(g_settings.bandwidth_mode);
+        const int bandwidth_setting = (bandwidth_mode_cli >= 0) ? bandwidth_mode_cli
+                                                                : g_settings.bandwidth_mode;
+        g_gui_state.bandwidth_mode.store(bandwidth_setting);
         // Initialize GUI gain state from INI (needed even with -n nogui,
         // since gui_apply_tx_gain/rx_gain read from g_gui_state always)
         g_gui_state.tx_gain_db.store(g_settings.tx_gain_db);
@@ -9806,7 +9805,7 @@ start_modem:
         // Robust mode: CLI -R or INI setting enables MFSK hailing
 #ifdef MERCURY_GUI_ENABLED
         ARQ.robust_enabled = (g_settings.robust_mode_enabled || robust_mode) ? YES : NO;
-        ARQ.bandwidth_mode = g_settings.bandwidth_mode;
+        ARQ.bandwidth_mode = bandwidth_setting;
         // -Q 0 with auto mode: skip NB start, go directly to WB.
         // Both sides are controlled (benchmark/test), no NB probe needed.
         if (nb_probe_max == 0 && ARQ.bandwidth_mode == BW_AUTO)
