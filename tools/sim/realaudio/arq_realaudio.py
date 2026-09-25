@@ -62,6 +62,22 @@ import harness_attestation as HA
 
 HARNESS_LINEAGE = "mercury"
 import capstone_arms as CA             # arm-spec + anatomy + VARA (capstone ext)
+from raw_evidence import RawEvidence   # per-attempt delivered/sent byte retention
+import override_guard                  # registered behaviour-restoring switches
+
+# Set by main(): retains the exact delivered and sent bytes of this attempt on disk
+# as they happen, so failed and timed-out attempts keep their raw evidence.
+_RAW_EVIDENCE = None
+
+
+def _raw_rx(data):
+    if _RAW_EVIDENCE is not None:
+        _RAW_EVIDENCE.rx(data)
+
+
+def _raw_tx(data):
+    if _RAW_EVIDENCE is not None:
+        _RAW_EVIDENCE.tx(data)
 from canonical_window_scorer import (
     DeliveryOracle,
     LinkEventTracker,
@@ -517,6 +533,7 @@ def tx_thread_fn(sock, stop, res, tx_control, traffic, t0, res_lock,
             traffic, offset, chunk_len)
         try:
             sock.sendall(chunk)
+            _raw_tx(chunk)
             with res_lock:
                 res["tx"] += len(chunk)
                 if (res["tx"] >= payload_total
@@ -543,6 +560,7 @@ def rx_thread_fn(sock, stop, res, integ, traffic, oracle, t0, res_lock,
             d = sock.recv(8192)
             if not d:
                 break
+            _raw_rx(d)
             event_at = time.monotonic() - t0
             with res_lock:
                 row = oracle.feed(event_at, d)
@@ -708,6 +726,10 @@ def main():
                          "(compressible=on so the compressor arms; incompressible=off); "
                          "on/off pins it (e.g. to A/B compression itself on one corpus)")
     ap.add_argument("--logdir", default="/tmp/raionos2/logs")
+    ap.add_argument("--negative-control", default=None,
+                    help="declare ONE registered behaviour-restoring switch as this run's "
+                         "negative control (see _research/PREFLIGHT_OVERRIDES.json); without "
+                         "it any active registered switch refuses the launch")
     ap.add_argument("--json", default=None)
     ap.add_argument("--replay-result", default=None,
                     help="CPU-only trust replay: production result JSON to re-evaluate")
@@ -880,6 +902,22 @@ def main():
         # run's mercury (an earlier diagnostic). See ra_cleanup.py.
         scoped_cleanup(args.card, subs, [rsp_port, cmd_port], settle=1.5)
 
+    # OVERRIDE PREFLIGHT: an efficacy/normal run refuses to launch with a registered
+    # behaviour-restoring switch active; a negative control must be declared.
+    override_preflight = override_guard.check(cell_env, args.negative_control)
+    if override_preflight.get("status") == "REJECT":
+        msg = "[PREFLIGHT-OVERRIDE] REJECT: " + "; ".join(override_preflight.get("reasons", []))
+        sys.stderr.write(msg + "\n")
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump({"tag": args.tag, "verdict": "PREFLIGHT_REJECT",
+                           "instrument_invalid": True,
+                           "instrument_invalid_reasons": ["override_preflight_reject"],
+                           "override_preflight": override_preflight}, f, indent=1)
+        raise SystemExit(3)
+    global _RAW_EVIDENCE
+    _RAW_EVIDENCE = RawEvidence(args.logdir, args.tag, args.traffic, CA.traffic_slice)
+    raw_evidence_record = {"status": "NOT-FINALIZED"}
     logpath = os.path.join(args.logdir, f"arq_{args.tag}.log")
     logfile = open(logpath, "w")
     st = State()
@@ -1396,6 +1434,11 @@ def main():
         except (NameError, OSError):
             pass
         logfile.close()
+        # Raw bytes are on disk already (streamed); hash + independent compare now.
+        try:
+            raw_evidence_record = _RAW_EVIDENCE.finalize(res["rx"], res["tx"])
+        except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+            raw_evidence_record = {"status": "FINALIZE-FAILED", "error": repr(exc)}
 
     dwell_cold = max(1.0, time.monotonic() - t0)
     # Legacy launch/warm dwell views remain diagnostic-only. Primary score and
@@ -2359,6 +2402,8 @@ def main():
                     else "INSTRUMENT_INVALID" if instrument_invalid else "OK"),
     }
     result = apply_terminal_eot_gate(result, logpath)
+    result["raw_evidence"] = raw_evidence_record
+    result["override_preflight"] = override_preflight
     print(json.dumps(result))
     if args.json:
         with open(args.json, "w") as f:

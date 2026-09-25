@@ -1,0 +1,2240 @@
+{
+ "schema": "preflight-overrides/1",
+ "generated_utc": "2026-09-25T08:20:56Z",
+ "census": {
+  "ref": "f42c9d1a7aa560ad2a8d4ff2243a4a881e665cce",
+  "pattern": "MERCURY_[A-Z0-9_]*(_DEFEAT|DEFEAT_|_OLDGATE|_LEGACY|SEL_LEGACY|_DISABLE)[A-Z0-9_]*",
+  "names": 109,
+  "method": "git grep -nE <pattern> <ref> -- source include"
+ },
+ "rule": "An efficacy/normal run REJECTS if any registered name is present in its environment with a value outside inert_values ([?] entries have no inert value: presence rejects). A negative-control run must declare NEGATIVE_CONTROL=<name>; exactly the declared switch may be set and the evidence manifest records it. Default-ON levers (kind default-on-lever) carry active_values [\"0\"], read with the modem rule e && *e && atoi(e) == 0: any non-empty value whose C atoi() is 0 overrides them (0, 00, -0, false, off, yes); unset or empty keeps the default (tools/preflight_overrides.py lever_off, ph_fix2).",
+ "overrides": [
+  {
+   "name": "MERCURY_ACK_TIMEOUT_FLOOR_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3561"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_ADOPT_FLUSH_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7808"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_ADOPT_FTR_REARM_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7873"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_ADOPT_NOFDM_PRESERVE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/physical_layer/telecom_system.cc:14764",
+    "source/physical_layer/telecom_system.cc:14849"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_ADOPT_RING_DURABILITY_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7199"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_ADOPT_RING_SHRINK_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7923"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_AUDIO_RING_ALIAS_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/audioio/audioio.c:209"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_AXIS2_FASTDOWN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:970"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_AXIS2_QUIESCE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:14368"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BACKUP_CONFIRMFLUSH_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:1354",
+    "source/datalink_layer/arq_commander.cc:24689"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BATCHSHRINK_ORPHAN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:1931",
+    "source/datalink_layer/arq_responder.cc:12286",
+    "source/datalink_layer/arq_responder.cc:16521",
+    "source/datalink_layer/arq_responder.cc:16628",
+    "source/datalink_layer/arq_responder.cc:16747"
+   ],
+   "mentions": 16,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BATCHSIZE_DESYNC_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3141",
+    "source/datalink_layer/arq_responder.cc:3117",
+    "source/datalink_layer/arq_responder.cc:17999"
+   ],
+   "mentions": 11,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BATCH_COAST_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:955"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_AFCTRACK",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_BIGBLOCK_AFCTRACK\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_AFC_STAGE2",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_BIGBLOCK_AFC_STAGE2\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_ACQGUARD",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:23733"
+   ],
+   "mentions": 13,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_BLOCKCRC",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:13506"
+   ],
+   "mentions": 10,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_C6RESIDUAL",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:13691",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:4327",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:4354"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_CAPFIX",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:12670",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:3813"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:13072"
+   ],
+   "mentions": 14,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_D2",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/test_bigblock_arq_unit.cc:381"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_ELECTION",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:4680",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:672",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:686",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:687"
+   ],
+   "mentions": 15,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_FIX",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:13052",
+    "source/datalink_layer/arq_responder.cc:2585"
+   ],
+   "mentions": 28,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_FIX_UAF",
+   "kind": "defeat",
+   "reads": [
+    "source/physical_layer/telecom_system.cc:12595"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_NDATA",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:13772",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:4275",
+    "source/datalink_layer/test_bigblock_arq_unit.cc:4282"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_DEFEAT_PARTIALCRC",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_responder.cc:1451"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_OLDGATE",
+   "kind": "old-gate",
+   "reads": [
+    "source/datalink_layer/test_bigblock_arq_unit.cc:3547",
+    "source/physical_layer/telecom_system.cc:1090",
+    "source/physical_layer/telecom_system.cc:12659"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_SPARSE2D",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_BIGBLOCK_SPARSE2D\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_TFILV",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_BIGBLOCK_TFILV\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_TRACK",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_BIGBLOCK_TRACK\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_BIGBLOCK_TSEARCH",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_BIGBLOCK_TSEARCH\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_BPRIME_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2066"
+   ],
+   "mentions": 13,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BREAK_DROPPED_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:10358",
+    "source/datalink_layer/arq_common.cc:10490",
+    "source/datalink_layer/arq_common.cc:10503",
+    "source/datalink_layer/arq_common.cc:10506"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BREAK_FH_GATE_DISABLE",
+   "kind": "disable",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:13095",
+    "source/main.cc:7512"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BREAK_LOSSLESS_REQUEUE_DISABLE",
+   "kind": "disable",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:961",
+    "source/datalink_layer/arq_responder.cc:15441"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_BURST_COALESCE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:948"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CEILING_PIN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:910"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CFG17_GI_INVARIANT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/physical_layer/telecom_system.cc:13709"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CHASE",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/main.cc:2021"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "{ const char* e = std::getenv(\"MERCURY_CHASE\"); if(e && strcmp(e,\"0\")==0) env_off = true; }"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "strcmp",
+   "off_values": [
+    "0"
+   ],
+   "off_rule_source": "if(e && strcmp(e,\"0\")==0) env_off = true"
+  },
+  {
+   "name": "MERCURY_CLIMB_ACCEL_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:903"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CLIMB_BSI_ROLLBACK_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:11277"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CMD_IDSKEW_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:5040"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CMD_PREV_RETAIN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:1121",
+    "source/datalink_layer/arq_commander.cc:1228",
+    "source/datalink_layer/arq_commander.cc:1287",
+    "source/datalink_layer/arq_responder.cc:14408",
+    "source/datalink_layer/arq_responder.cc:14413"
+   ],
+   "mentions": 11,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_COMPRESS_REASSEMBLY_BOUNDS_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:26182",
+    "source/datalink_layer/test_compress_reassembly_bounds.cc:21"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_COMPRESS_RECOVERY_BSI_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:26577",
+    "source/datalink_layer/test_stream_offset.cc:1376"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_COMPRESS_RECOVERY_RETX_BSI_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25446",
+    "source/datalink_layer/test_stream_offset.cc:1379"
+   ],
+   "mentions": 2,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_COMPRESS_RESTORE_CAPACITY_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:26588",
+    "source/datalink_layer/arq_common.cc:26753",
+    "source/datalink_layer/arq_common.cc:26773"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_COMPRESS_RETRY_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/compression/mercury_compress.cc:37",
+    "source/datalink_layer/arq_commander.cc:23599",
+    "source/datalink_layer/arq_commander.cc:29872"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CONFIG0_RING_GUARD_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7328",
+    "source/datalink_layer/arq_responder.cc:10466",
+    "source/datalink_layer/arq_responder.cc:12750",
+    "source/datalink_layer/arq_responder.cc:12793",
+    "source/datalink_layer/arq_responder.cc:12817",
+    "source/datalink_layer/arq_responder.cc:12826",
+    "source/datalink_layer/arq_responder.cc:12860"
+   ],
+   "mentions": 17,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CONNECT_FAST_DEFEAT_RESEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:12169",
+    "source/datalink_layer/arq_commander.cc:26977",
+    "source/datalink_layer/arq_commander.cc:26978",
+    "source/datalink_layer/arq_responder.cc:2465"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CONNECT_FUSE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:982"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_CTL_GAIN_SELECTOR_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:19242",
+    "source/datalink_layer/arq_common.cc:19317",
+    "source/physical_layer/telecom_system.cc:309"
+   ],
+   "mentions": 8,
+   "status": "verified",
+   "inert_values": [
+    "",
+    "0"
+   ],
+   "policy": "reject-unless-negative-control",
+   "effect": "restores the former narrowband_enabled-keyed control-frame TX gain selector (telecom_system.cc get_ack_geometry_tx_gain) on candidate f42c9d1a",
+   "restoration": "test_control_frame_gain_and_undefined_state saves the variable, sets/unsets it, and restores it (arq_common.cc:19242-19244 save, 19317-19318 restore on f42c9d1a); setenv/unsetenv Windows shim os_interop.h:26-35",
+   "requested_by": "own_telecom_system (ticket #70, 2026-09-23T22:18 comment): add to the preflight denylist",
+   "caveat": "an externally set value survives the test: the test restores it after its own arms, so the remaining --test cases and a live run execute with the former selector"
+  },
+  {
+   "name": "MERCURY_D5_INFER_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:18052",
+    "source/datalink_layer/arq_responder.cc:280",
+    "source/datalink_layer/arq_responder.cc:1955",
+    "source/datalink_layer/arq_responder.cc:3030",
+    "source/datalink_layer/arq_responder.cc:17453"
+   ],
+   "mentions": 14,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DATA_ACK_MULTIWINDOW",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:21952"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "cached = (e && *e && atoi(e) == 0) ? 0 : 1;"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_DATA_EPOCH_CLOSE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:10768",
+    "source/datalink_layer/test_stream_offset.cc:773"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DECODE_MARGIN_GATE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:2391"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DECODE_POOL_DEFEAT_SHARE",
+   "kind": "defeat",
+   "reads": [
+    "source/physical_layer/ldpc_decode_pool.cc:53"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DECOMPRESS_RAWPUSH_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:26363",
+    "source/datalink_layer/test_decompress_false_accept.cc:56"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DEFERRED_PREV_ACK_BOUNDARY_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2238"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DEMOTE_SILENCE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:10430",
+    "source/datalink_layer/arq_common.cc:10543",
+    "source/datalink_layer/arq_common.cc:10587",
+    "source/datalink_layer/arq_common.cc:10589"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DESCRAMBLER_REGEN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/physical_layer/telecom_system.cc:14447",
+    "source/physical_layer/telecom_system.cc:14932"
+   ],
+   "mentions": 11,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DETECT_FFT_MEMO",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/physical_layer/ofdm.cc:99"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(e && *e && atoi(e) == 0);   // DEFAULT-ON: explicit =0 restores stock"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_DFTSMOOTH",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/physical_layer/ofdm.cc:3221"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(strcmp(e, \"legacy\") == 0 || strcmp(e, \"0\") == 0) return 0;"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "strcmp",
+   "off_values": [
+    "legacy",
+    "0"
+   ],
+   "off_rule_source": "strcmp(e,\"legacy\")==0 || strcmp(e,\"0\")==0 -> 0"
+  },
+  {
+   "name": "MERCURY_DUTY_ELEV_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:976"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DUTY_FASTSTART_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:920"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DUTY_PALT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:941"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DUTY_R_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:922"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_DUTY_R_PIN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:929"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_EESM_ACQ_FLOOR",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/physical_layer/eesm_probe.cc:854"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "p.use_acq_floor = !(e && e[0] && std::atoi(e) == 0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_EESM_PROBE",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/physical_layer/eesm_probe.cc:115"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(e && e[0] && std::atoi(e) == 0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_ELECT_VALID_METERS",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:935"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "elect_valid_meters = !(evm && *evm && atoi(evm) == 0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_ENTRY_LEAP_FWD",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:2271"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(e && *e && atoi(e) == 0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_FINE_ENERGY_CARRIED_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/physical_layer/telecom_system.cc:81"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_FIR_AVX2_EXACT",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/physical_layer/fir_filter.cc:56"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(e && *e && atoi(e)==0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_GAP_ABORT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3163",
+    "source/datalink_layer/arq_common.cc:8027",
+    "source/datalink_layer/arq_responder.cc:1283",
+    "source/datalink_layer/arq_responder.cc:1494",
+    "source/datalink_layer/arq_responder.cc:3572",
+    "source/datalink_layer/arq_responder.cc:13463",
+    "source/datalink_layer/arq_responder.cc:15416"
+   ],
+   "mentions": 25,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_GAP_RECOVER_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_responder.cc:3598",
+    "source/datalink_layer/arq_responder.cc:14127"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_GAP_RECOVER_TURNAROUND_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:8145",
+    "source/datalink_layer/arq_commander.cc:8528",
+    "source/datalink_layer/arq_responder.cc:14764",
+    "source/datalink_layer/arq_responder.cc:14778",
+    "source/datalink_layer/arq_responder.cc:14787"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_GEARSHIFT_V2",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/rate_optimizer.cc:515"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if (!raw || !*raw || std::strcmp(raw, \"legacy\") == 0 || std::strcmp(raw, \"0\") == 0) {"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "not_in",
+   "on_values": [
+    "active",
+    "1"
+   ],
+   "off_rule_source": "unset/empty/\"legacy\"/\"0\"/unknown -> LEGACY, \"shadow\" -> SHADOW, only \"active\"/\"1\" -> ACTIVE (rate_optimizer.cc:515-525)"
+  },
+  {
+   "name": "MERCURY_GEN_CANON",
+   "kind": "default-on-lever",
+   "reads": [
+    "include/common/common_defines.h:794"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(value && value[0] && std::atoi(value) == 0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_GROWTH_DELIVER_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:8054",
+    "source/datalink_layer/arq_responder.cc:1554",
+    "source/datalink_layer/arq_responder.cc:2879",
+    "source/datalink_layer/arq_responder.cc:18483"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_GS2_COORD_WB_ENTRY",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:15551"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(ev && *ev && atoi(ev) == 0) return false;"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_GS2_EMPTY_CTRL_RESUME",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:15640"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(ev && *ev && atoi(ev) == 0) return false;"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_GS2_LIVENESS_CTRL_EXEMPT",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:15621"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(ev && *ev && atoi(ev) == 0) return false;"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_GS2_QUALITY_REPORT",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:4954"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(e && *e && atoi(e) == 0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_GUARD_REANCHOR_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:11070",
+    "source/datalink_layer/arq_commander.cc:11192"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_HELD_CUR_DELIVER_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_responder.cc:1722",
+    "source/datalink_layer/arq_responder.cc:14679",
+    "source/datalink_layer/arq_responder.cc:14707",
+    "source/datalink_layer/arq_responder.cc:14718"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_INBAND_ADOPT_METRIC_GATE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7223"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_INBAND_CTRL_MISS_RESUME",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:15600"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(ev && *ev && atoi(ev) == 0) return false;"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_INBAND_DEADBATCH_RATELIMIT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:8142"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_INBAND_DOWN_DEFEAT_SNAPFIX",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7129"
+   ],
+   "mentions": 12,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_INBAND_FRESHWIN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7146"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_INBAND_GI_INHERIT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:7414"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_KEYDOWN_MINI0",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/main.cc:2281"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(!mini0 || atoi(mini0) != 0) {"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_set",
+   "off_rule_source": "if(!mini0 || atoi(mini0) != 0) -> enabled; set with atoi()==0 (empty included) disables"
+  },
+  {
+   "name": "MERCURY_KEYDOWN_TRACK",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/main.cc:8034"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(const char* kt_e=std::getenv(\"MERCURY_KEYDOWN_TRACK\")) { if(atoi(kt_e)==0) { telecom_system.keydown_track_timing_enabled = false; printf(\"[FLAG] MERCURY_KEYD"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_set",
+   "off_rule_source": "if(getenv) { if(atoi(e)==0) disabled } (empty included)"
+  },
+  {
+   "name": "MERCURY_LINKPHASE_ACKSLOT",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2121"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "state = (e && *e && atoi(e) == 0) ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_LINKPHASE_CMD_FLOOR_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3499"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_LINKPHASE_OPTCLOCK",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:91"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "cached = (e && *e && atoi(e) == 0) ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_LINKPHASE_SLOTLIVENESS",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2342"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "state = ((d && *d && atoi(d) != 0) || (e && *e && atoi(e) == 0)) ? 0 : 1;  // DEFAULT-ON: DEFEAT or =0 restores stock"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_LINKPHASE_SLOTLIVENESS_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2343"
+   ],
+   "mentions": 2,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_LINKPHASE_SLOT_ORIGIN",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:15519"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(ev && *ev && atoi(ev) == 0) return kd_ms;"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_LS_HOLD_SINGLE_PILOT",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/physical_layer/ofdm.cc:177"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "{ const char* _e=std::getenv(\"MERCURY_LS_HOLD_SINGLE_PILOT\"); ls_hold_single_pilot=!(_e && *_e && atoi(_e)==0); }"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_MEASURED_TIMERS_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3384"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_MFSK_NOMIRROR",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/physical_layer/mfsk.cc:368",
+    "source/physical_layer/ofdm.cc:4952"
+   ],
+   "mentions": 2,
+   "status": "[?]",
+   "evidence": [
+    "bool _nomirror = (_nm == NULL) ? true : (atoi(_nm) != 0);  // default-ON; MERCURY_MFSK_NOMIRROR=0 disables",
+    "{ const char* _nm = std::getenv(\"MERCURY_MFSK_NOMIRROR\"); if (_nm != NULL && atoi(_nm) == 0) acq_nomirror = false; }"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_set",
+   "off_rule_source": "(_nm == NULL) ? true : (atoi(_nm) != 0) (empty included)"
+  },
+  {
+   "name": "MERCURY_MIXBATCH_OVERPOP_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:23937",
+    "source/datalink_layer/arq_commander.cc:24207",
+    "source/datalink_layer/arq_commander.cc:29772",
+    "source/datalink_layer/arq_commander.cc:30235"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_MIXBATCH_SLOTCAP_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:23940",
+    "source/datalink_layer/arq_commander.cc:30230"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_NB_PRIOR_GUARD",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:2246"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(e && *e && atoi(e) == 0);"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_ORIGIN_BACKSTOP_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25853"
+   ],
+   "mentions": 2,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_PENDING_CONFIRM_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2212",
+    "source/datalink_layer/arq_responder.cc:16934"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_PREAMBLE_AMORT",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/main.cc:8032"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(const char* kd_e=std::getenv(\"MERCURY_PREAMBLE_AMORT\")) { if(atoi(kd_e)==0) { telecom_system.preamble_amortization_enabled = false; printf(\"[FLAG] MERCURY_PR"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_set",
+   "off_rule_source": "if(getenv) { if(atoi(e)==0) disabled } (empty included)"
+  },
+  {
+   "name": "MERCURY_PREBREAK_DELIVER_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:8012"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_PRECOOK_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/main.cc:4080",
+    "source/main.cc:4365",
+    "source/main.cc:4505",
+    "source/physical_layer/telecom_system.cc:14327"
+   ],
+   "mentions": 17,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_PREV_ACK_DEFER_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2184",
+    "source/datalink_layer/arq_responder.cc:14900",
+    "source/datalink_layer/arq_responder.cc:14903"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_PROBE_FULL_FAILURE_COASTDOWN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:6999"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_RECONNECT_FAILCLOSED_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:18450",
+    "source/datalink_layer/test_stream_offset.cc:1042"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_RECONNECT_R2_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:9907",
+    "source/datalink_layer/test_stream_offset.cc:872"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_REFRAME_STRADDLE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25806"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_RESTAGE_ORPHAN_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25540",
+    "source/datalink_layer/arq_common.cc:26743",
+    "source/datalink_layer/test_restage_requeue.cc:46"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_RETAIN_SHADOW_FIX",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:1004",
+    "source/datalink_layer/arq_responder.cc:14505"
+   ],
+   "mentions": 2,
+   "status": "[?]",
+   "evidence": [
+    "cached = (e && *e && atoi(e) == 0) ? 0 : 1;  // DEFAULT-ON: explicit =0 restores stock",
+    "fix_on = !(e && *e && atoi(e) == 0); }  // mirror retain_shadow_fix_on() DEFAULT-ON"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_RETX_SLOT0_ROTATE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:6018"
+   ],
+   "mentions": 3,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_ROBUST_DWELL_KEEPALIVE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:10372",
+    "source/datalink_layer/arq_common.cc:10491",
+    "source/datalink_layer/arq_common.cc:10511",
+    "source/datalink_layer/arq_common.cc:10513"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_RUNG_FLOOR_GATE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:2672",
+    "source/datalink_layer/arq_commander.cc:2824",
+    "source/datalink_layer/arq_commander.cc:2852"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_RXFIFO_BACKPRESSURE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3157",
+    "source/datalink_layer/arq_common.cc:25250",
+    "source/datalink_layer/arq_responder.cc:3513"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_RX_STORE_FAIL_CLOSED",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_responder.cc:1910 (candidate own_arq_responder/stack1 89de4bdde0, ticket #35)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "bool enforce_store_verdict = true; { const char* e = std::getenv(\"MERCURY_RX_STORE_FAIL_CLOSED\"); if(e && *e && atoi(e) == 0) enforce_store_verdict = false; }",
+    "on base 95723953fb the same name is an opt-in (atoi != 0 enables); =0 and unset are both the legacy fail-open there"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 restores the legacy fail-open store verdict)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_SCALABLE_SACK",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2080"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "return !(e && *e && atoi(e) == 0);   // ON unless explicitly disabled with =0"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_SEL_LEGACY",
+   "kind": "legacy-selector",
+   "reads": [
+    "source/main.cc:849",
+    "source/main.cc:872",
+    "source/physical_layer/telecom_system.cc:15205"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_SFO_GRID_CPE",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_SFO_GRID_CPE\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_SFO_GRID_CSI",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_SFO_GRID_CSI\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_SFO_GRID_POLAR",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_SFO_GRID_POLAR\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_SFO_GRID_TIME_POLAR",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_SFO_GRID_TIME_POLAR\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_SFO_GRID_TURBO_ITERS",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_SFO_GRID_TURBO_ITERS\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_SFO_GRID_WIENER",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_SFO_GRID_WIENER\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_SIM2_CAPTURE_MUTEX_RESET_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:26774",
+    "source/datalink_layer/arq_commander.cc:27816"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_SIM2_DEFEAT_FIRSTBLOCK_FIX",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:26869"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_SIM2_DEFEAT_SIMFTR_FIX",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_commander.cc:27209"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_SIM2_ROBUST",
+   "kind": "default-on-lever",
+   "reads": [
+    "env_i(\"MERCURY_SIM2_ROBUST\", 1) (helper read, default 1)"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "helper read with default 1; whether 0 disables is not verified"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 overrides the default 1)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "env_i helper (e && *e) ? atoi(e) : 1 (telecom_system.cc:8419 form); use as a flag unverified [?]"
+  },
+  {
+   "name": "MERCURY_STREAM_DEDUP_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25813",
+    "source/datalink_layer/arq_responder.cc:17704"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_STREAM_SEAM_FAILCLOSED",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25981"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(e && *e && atoi(e)==0) seam_failclosed = false; }"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_SUBPEAK_RESCUE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/physical_layer/telecom_system.cc:3221"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_SWITCHROLE_EMPTY_FLUSH_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:26540"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_T1_CALIB_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:2876"
+   ],
+   "mentions": 21,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_TOPGEAR_DEFEAT_CLEAN",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:5057"
+   ],
+   "mentions": 9,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_TOPGEAR_FLOOR_QUANTIZED",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:5132"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(qenv && *qenv && atoi(qenv) == 0)"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_TOPGEAR_PACK_GOODDECODE",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:5161"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "if(e && *e && atoi(e) == 0)"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "atoi0_nonempty",
+   "off_rule_source": "e && *e && atoi(e) == 0"
+  },
+  {
+   "name": "MERCURY_TOPGEAR_PORT_DEFEAT",
+   "kind": "defeat",
+   "reads": [],
+   "mentions": 2,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_TURNAROUND_GUARD_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:14082"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_TURNAROUND_GUARD_SCOPE_ALL",
+   "kind": "default-on-lever",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:14070"
+   ],
+   "mentions": 1,
+   "status": "[?]",
+   "evidence": [
+    "{ const char* e = std::getenv(\"MERCURY_TURNAROUND_GUARD_SCOPE_ALL\"); if(e && e[0]=='0') scope_all = false; }"
+   ],
+   "inert_values": [],
+   "active_values": [
+    "0"
+   ],
+   "policy": "reject-unless-negative-control (=0 switches the default-ON lever off)",
+   "off_rule": "first_char_0",
+   "off_rule_source": "if(e && e[0]=='0') scope_all = false"
+  },
+  {
+   "name": "MERCURY_WATCHDOG_FLOOR_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3588"
+   ],
+   "mentions": 6,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_WATCHDOG_PROBE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:10383",
+    "source/datalink_layer/arq_common.cc:10492",
+    "source/datalink_layer/arq_common.cc:10524",
+    "source/datalink_layer/arq_common.cc:10529"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_W_BYTEGATE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:3150",
+    "source/datalink_layer/arq_responder.cc:3470",
+    "source/datalink_layer/test_stream_offset.cc:254"
+   ],
+   "mentions": 5,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_W_EOT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_responder.cc:5340",
+    "source/datalink_layer/test_stream_offset.cc:660"
+   ],
+   "mentions": 7,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_W_PREVCOUNT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:8072",
+    "source/datalink_layer/arq_common.cc:18166",
+    "source/datalink_layer/arq_common.cc:18247",
+    "source/datalink_layer/arq_responder.cc:320",
+    "source/datalink_layer/arq_responder.cc:1595"
+   ],
+   "mentions": 15,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_W_PREV_BYTEGATE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_responder.cc:1565",
+    "source/datalink_layer/test_stream_offset.cc:576"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_W_RESTAGE_ROLLBACK_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25473",
+    "source/datalink_layer/test_stream_offset.cc:477"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_W_SPANGATE_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:25707",
+    "source/datalink_layer/arq_common.cc:25914"
+   ],
+   "mentions": 8,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  },
+  {
+   "name": "MERCURY_W_STREAM_SHIFT_DEFEAT",
+   "kind": "defeat",
+   "reads": [
+    "source/datalink_layer/arq_common.cc:26047",
+    "source/datalink_layer/test_stream_offset.cc:251"
+   ],
+   "mentions": 4,
+   "status": "[?]",
+   "inert_values": [],
+   "policy": "reject-unless-negative-control"
+  }
+ ],
+ "zero_disable_census": {
+  "ref": "95723953fb",
+  "utc": "2026-09-25T09:45:39Z",
+  "method": "git grep of getenv(\"MERCURY_*\") in non-test source/include files whose read variable is compared as zero-means-off (atoi(v)==0, v[0]=='0', strcmp(v,\"0\")==0, NULL ? true : atoi(v)!=0, !v || atoi(v)!=0) on the read line or the next 3; plus env_i(\"MERCURY_*\", 1) helper reads (default 1). Script: _scratch/jobs/phfix_zero_levers.py; census: _research/archive/maintenance_20260925/ph_fix/zero_levers_census.json",
+  "getenv_levers": 32,
+  "helper_default_one": 13,
+  "limits": "helper reads with other defaults and levers parsed through other wrappers are not in the census; every entry is [?]"
+ },
+ "revisions": [
+  {
+   "utc": "2026-09-25",
+   "by": "ph_fix2",
+   "change": "default-ON lever values read with C atoi()==0 (was string equality with '0'); previous rule text: Default-ON levers (kind default-on-lever) carry active_values [\"0\"]: only =0 overrides them."
+  },
+  {
+   "utc": "2026-09-25",
+   "by": "own_arq_responder",
+   "change": "added MERCURY_RX_STORE_FAIL_CLOSED as a default-on lever (=0 restores the legacy fail-open RX store verdict), ticket #35"
+  }
+ ]
+}
