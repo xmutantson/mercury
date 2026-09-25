@@ -1138,6 +1138,12 @@ void cl_ofdm::framer(std::complex <double>* in, std::complex <double>* out)
 				out[j*Nc+k]=pilot_configurator.sequence[pilot_index];
 				pilot_index++;
 			}
+			else
+			{
+				// ZERO and CONFIG cells carry nothing; the caller's buffer may still hold an
+				// earlier frame (for example an MFSK control render at the same stride).
+				out[j*Nc+k]=std::complex <double>(0,0);
+			}
 		}
 	}
 
