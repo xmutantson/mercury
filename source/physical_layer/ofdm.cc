@@ -699,6 +699,9 @@ double cl_ofdm::carrier_frequency_sync_nb(std::complex<double>* in, double carri
 	 */
 
 	int Nofdm = Nfft + Ngi;
+	// The work arrays below hold 256 entries; a larger geometry gets no estimate.
+	if (Nfft > 256 || Nc > 256)
+		return 0.0;
 	std::complex<double> fft_in[256];
 	std::complex<double> fft_out[256];
 	std::complex<double> depadded[256];
@@ -4472,6 +4475,8 @@ TimeSyncResult cl_ofdm::time_sync_preamble_matched(
 	int gi_interp = Ngi * interpolation_rate;
 	int template_nsymb = ofdm_corr_template_nsymb;
 	if (template_nsymb > preamble_nSymb) template_nsymb = preamble_nSymb;
+	// ofdm_corr_template_sym_energy holds 16 entries.
+	if (template_nsymb > 16) template_nsymb = 16;
 
 	// ---- Coarse search: GI-period stride, ALL symbols ----
 	// Uses all preamble symbols for discrimination. Single-symbol coarse
@@ -4711,7 +4716,7 @@ TimeSyncResult cl_ofdm::time_sync_preamble_matched_local(
 		return result;
 
 	const int Nofdm = Nfft + Ngi;
-	const int template_nsymb = std::min(ofdm_corr_template_nsymb, preamble_nSymb);
+	const int template_nsymb = std::min(std::min(ofdm_corr_template_nsymb, preamble_nSymb), 16);
 	const int preamble_interp = template_nsymb * Nofdm * interpolation_rate;
 	int first = std::max(0, center - half_window);
 	int last = std::min(center + half_window, buffer_size_interp - preamble_interp);
@@ -4767,6 +4772,12 @@ int cl_ofdm::time_sync_mfsk(std::complex<double>* baseband_interp, int buffer_si
 	std::complex<double>* fft_out = work_buf_b;
 
 	// Map preamble tone indices to FFT bin indices for each stream
+	// preamble_bins below holds 48 symbols x 4 streams.
+	if (preamble_nSymb <= 0 || preamble_nSymb > 48 || nStreams <= 0 || nStreams > 4)
+	{
+		if (out_metric) *out_metric = 0.0;
+		return -1;
+	}
 	int preamble_bins[48][4]; // [MAX_PREAMBLE_SYMB][MAX_STREAMS] — sized for the 48-symbol robust preamble
 	int half = Nc / 2;
 	for (int p = 0; p < preamble_nSymb; p++)
@@ -5829,6 +5840,12 @@ void cl_ofdm::decode_suffix_candidates(std::complex<double>* baseband_interp,
 	int sym_period_interp = Nofdm_local * interpolation_rate;
 	int half = Nc / 2;
 	if (K < 1) K = 1;
+	// e_tone and taken below hold 64 tones.
+	if (mfsk_M <= 0 || mfsk_M > 64)
+	{
+		for (int i = 0; i < suffix_len * K; i++) { out_cand[i] = -1; out_cost[i] = 1.0e300; }
+		return;
+	}
 	if (K > mfsk_M) K = mfsk_M;
 
 	std::complex<double>* decimated_sym = work_buf_a;
