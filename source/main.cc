@@ -10397,13 +10397,16 @@ start_modem:
     // Contract with audioio: shutdown_ is set before audioio_deinit on every
     // path, so the joins below never wait on threads that were not told to stop.
     shutdown_.store(true);
-    audioio_deinit(&radio_capture, &radio_playback, &radio_capture_prep);
+    const bool audio_thread_detached =
+        audioio_deinit(&radio_capture, &radio_playback, &radio_capture_prep) > 0;
 
     shutdown_tee_logging();
 
-    if (gui_thread_abandoned) {
-        // A GUI thread left inside gui_init must not race the static
-        // destructors a normal return runs, so the process ends here.
+    if (gui_thread_abandoned || audio_thread_detached) {
+        // A GUI thread left inside gui_init, or an audio thread audioio_deinit
+        // had to detach (it may still use telecom_system), must not race the
+        // unwinding of main's locals or the static destructors of a normal
+        // return, so the process ends here.
         fflush(stdout);
         fflush(stderr);
         _exit(main_exit_status);
