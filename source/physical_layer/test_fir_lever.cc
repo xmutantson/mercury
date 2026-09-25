@@ -130,6 +130,51 @@ bool check_exact(double transition)
 
 // Exposed to main.cc (declared `extern int test_fir_lever_run();` there).
 // Returns 0 on success.
+// Short-input contract: the complex apply returns the zero-padded linear convolution truncated to
+// [0, nItems) for every nItems >= 1, including nItems < nTaps, and never reads past the input. The input
+// sits at the front of a larger buffer whose tail holds a large sentinel, so an unbounded read shows as a
+// large error. The reference is the same filter run on the input zero-extended past nTaps.
+static bool check_short_input()
+{
+	cl_FIR fir;
+	fir.sampling_frequency = 48000.0;
+	fir.filter_transition_bandwidth = 3000.0;
+	fir.lpf_filter_cut_frequency = 0.5 * (48000.0 * 50.0 / 256.0 / 4.0);
+	fir.type = LPF;
+	fir.filter_window = HAMMING;
+	fir.design();
+	const int N = fir.filter_nTaps;
+	const int sizes[] = {1, 2, N / 2, N - 2, N - 1, N};
+	bool pass = true;
+	for(int s : sizes)
+	{
+		if(s < 1) continue;
+		const int L = s + 2 * N;
+		std::vector<std::complex<double>> in((std::size_t)(s + 4 * N), std::complex<double>(1.0e6, -1.0e6));
+		std::vector<std::complex<double>> ext((std::size_t)L, std::complex<double>(0.0, 0.0));
+		for(int i = 0; i < s; i++)
+		{
+			const std::complex<double> v(std::sin(0.1 * i + 1.0), std::cos(0.07 * i));
+			in[(std::size_t)i] = v;
+			ext[(std::size_t)i] = v;
+		}
+		std::vector<std::complex<double>> out((std::size_t)s), ref((std::size_t)L);
+		fir.apply(in.data(), out.data(), s);
+		fir.apply(ext.data(), ref.data(), L);
+		double err = 0.0;
+		for(int k = 0; k < s; k++)
+		{
+			const double e = std::abs(out[(std::size_t)k] - ref[(std::size_t)k]);
+			if(!(e <= err)) err = e;
+		}
+		const bool ok = err <= 1e-12;
+		printf("[TEST-FIR-LEVER] short-input nTaps=%d nItems=%d maxerr=%.3e %s\n",
+		       N, s, err, ok ? "PASS" : "FAIL");
+		pass &= ok;
+	}
+	return pass;
+}
+
 int test_fir_lever_run()
 {
 	printf("[TEST-FIR-LEVER] exact-AVX2 FIR lever law + production-entry exactness gate\n");
@@ -150,6 +195,7 @@ int test_fir_lever_run()
 	all_pass &= check_exact(6000.0);   // 17 taps
 	all_pass &= check_exact(3000.0);   // 33 taps
 	all_pass &= check_exact(1000.0);   // 97 taps
+	all_pass &= check_short_input();
 
 	saved.restore();
 	printf("[TEST-FIR-LEVER] %s\n", all_pass ? "ALL PASS" : "FAILURES PRESENT");
