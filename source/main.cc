@@ -8013,6 +8013,10 @@ start_modem:
         {
             fprintf(stderr, "ERROR: audio device startup failed; modem startup aborted\n");
             main_exit_status = EXIT_FAILURE;
+            // Not every init failure path stops the audio threads itself (the
+            // payload-ring failures return without it). Every mode loop tests
+            // shutdown_ before its first pass, so no loop body runs after this.
+            shutdown_.store(true);
         }
     };
 
@@ -9976,8 +9980,12 @@ start_modem:
                     gui_thread_created = false;
                 }
             }
-            if (gui_startup_failed)
+            if (gui_startup_failed) {
                 main_exit_status = EXIT_FAILURE;
+                // Audio is already running here: tell its threads to stop now so
+                // audioio_deinit joins them instead of waiting out its grace.
+                shutdown_.store(true);
+            }
         }
 #endif
 
@@ -10326,6 +10334,9 @@ start_modem:
     if (output_dev)
         free(output_dev);
 
+    // Contract with audioio: shutdown_ is set before audioio_deinit on every
+    // path, so the joins below never wait on threads that were not told to stop.
+    shutdown_.store(true);
     audioio_deinit(&radio_capture, &radio_playback, &radio_capture_prep);
 
     shutdown_tee_logging();
