@@ -3057,8 +3057,14 @@ void cl_ofdm::automatic_gain_control(std::complex <double>*in)
 			}
 		}
 	}
+	// No pilot energy (an all-zero frame, or a geometry without pilot cells): leave the
+	// input unscaled instead of applying an infinite or NaN gain.
+	if(pilot_index<=0 || !(pilot_amp>1e-12) || !std::isfinite(pilot_amp))
+		return;
 	pilot_amp/=pilot_index;
 	agc=pilot_configurator.boost/pilot_amp;
+	if(!std::isfinite(agc))
+		return;
 
 	for(int i=0;i<Nsymb;i++)
 	{
