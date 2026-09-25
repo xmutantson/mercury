@@ -5103,6 +5103,7 @@ int main(int argc, char *argv[])
     int connection_timeout_ms = 15000;
     int max_connection_attempts = 15;
     int link_timeout_ms = 30000;
+    bool link_timeout_cli_given = false;
     int exit_on_disconnect = 0;
     int ldpc_iterations = 0;  // 0 = use default (50 or from INI)
     int puncture_nBits = 0;  // 0 = disabled; >0 = punctured LDPC BER test
@@ -7266,8 +7267,10 @@ int main(int argc, char *argv[])
                 max_connection_attempts = atoi(optarg);
             break;
         case 'k':
-            if (optarg)
+            if (optarg) {
                 link_timeout_ms = atoi(optarg);
+                link_timeout_cli_given = true;
+            }
             break;
         case 'e':
             exit_on_disconnect = 1;
@@ -9633,6 +9636,11 @@ start_modem:
 #endif
 
         // CLI --ptt-delay overrides INI PTT timing
+        // -k takes the same pre-init channel as the INI value, so init and the
+        // per-configuration floor in load_configuration both see it.
+        if (link_timeout_cli_given)
+            ARQ.default_configuration_ARQ.link_timeout = link_timeout_ms;
+
         if (ptt_delay_cli >= 0)
         {
             ARQ.default_configuration_ARQ.ptt_on_delay_ms = ptt_delay_cli;
@@ -9881,7 +9889,6 @@ start_modem:
 
         // Apply command-line arguments
         ARQ.connection_timeout = connection_timeout_ms;
-        ARQ.link_timeout = link_timeout_ms;
         ARQ.max_connection_attempts = max_connection_attempts;
         ARQ.exit_on_disconnect = exit_on_disconnect;
         if (nb_probe_max >= 0)
@@ -9891,6 +9898,7 @@ start_modem:
             ARQ.psk_hex[sizeof(ARQ.psk_hex) - 1] = '\0';
         }
 
+        const int link_timeout_after_init = ARQ.link_timeout;
         // Ensure timeouts are adequate for MFSK frame durations
         {
             int min_ct = 2 * (ARQ.control_batch_size + ARQ.ack_batch_size)
@@ -9911,6 +9919,9 @@ start_modem:
                 ARQ.link_timeout = min_lt;
             }
         }
+        printf("[ARQ-TIMEOUTS] init_config=%d connection_timeout=%d ms link_timeout=%d ms "
+               "(after init %d ms)\n", mod_config, ARQ.connection_timeout, ARQ.link_timeout,
+               link_timeout_after_init);
 
         if (connection_timeout_ms != 15000 || max_connection_attempts != 15 || link_timeout_ms != 30000 || exit_on_disconnect) {
             printf("ARQ config: connection_timeout=%dms, link_timeout=%dms, max_attempts=%d, exit_on_disconnect=%s\n",
