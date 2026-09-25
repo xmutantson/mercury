@@ -7826,6 +7826,12 @@ start_modem:
             if (guard_interval_ms_cli > 0)
                 gi_ms = guard_interval_ms_cli;
 #endif
+            if (!(gi_ms >= 1.0 && gi_ms <= 8.0)) {
+                // The INI value is not range-checked by the parser; keep every
+                // path inside the range the --gi parser enforces.
+                printf("[GI] %.2f ms outside the 1.0-8.0 ms range, clamped\n", gi_ms);
+                gi_ms = (gi_ms > 8.0) ? 8.0 : 1.0;
+            }
             int ngi = (int)(gi_ms * 12.0 + 0.5);  // 12kHz OFDM rate
             telecom_system.default_configurations_telecom_system.ofdm_gi = (float)ngi / 256.0f;
         }
@@ -7900,6 +7906,13 @@ start_modem:
                "Nfft=%d Ngi=%d Nc=%d pre=%d Nsymb=%d mfsk_M=%d nStreams=%d\n",
                file_Nofdm, file_Nsymb, file_interp, file_nb, file_cfg, file_dlen,
                file_Nfft, file_Ngi, file_Nc, file_pre, file_frmNsymb, file_mM, file_mStreams);
+        if (file_Nfft <= 0 || file_Nfft > 256 || (file_Nfft % 4) != 0
+            || file_Ngi < 1 || file_Ngi > file_Nfft) {
+            // The OFDM layer needs 1 <= Ngi <= Nfft, Nfft a multiple of 4, <= 256.
+            fprintf(stderr, "[DRX] FATAL: capture geometry out of range (Nfft=%d Ngi=%d)\n",
+                    file_Nfft, file_Ngi);
+            fclose(df); return 2;
+        }
         // Reproduce the EXACT capture geometry. The live RSP's ROBUST_0 MFSK uses
         // gi=Ngi/Nfft (e.g. 36/256) which differs from the standalone default
         // (54/256). Force the default ofdm geometry to the captured values BEFORE
@@ -9741,6 +9754,12 @@ start_modem:
             if (guard_interval_ms_cli > 0)
                 gi_ms = guard_interval_ms_cli;
 #endif
+            if (!(gi_ms >= 1.0 && gi_ms <= 8.0)) {
+                // The INI value is not range-checked by the parser; keep every
+                // path inside the range the --gi parser enforces.
+                printf("[GI] %.2f ms outside the 1.0-8.0 ms range, clamped\n", gi_ms);
+                gi_ms = (gi_ms > 8.0) ? 8.0 : 1.0;
+            }
             int ngi = (int)(gi_ms * 12.0 + 0.5);  // 12kHz OFDM rate
             telecom_system.default_configurations_telecom_system.ofdm_gi = (float)ngi / 256.0f;
             printf("Guard interval: %.2f ms (Ngi=%d, gi=%.4f)\n", gi_ms, ngi,
