@@ -8066,6 +8066,9 @@ start_modem:
         if(const char* kd_e=std::getenv("MERCURY_PREAMBLE_AMORT")) { if(atoi(kd_e)==0) { telecom_system.preamble_amortization_enabled = false; printf("[FLAG] MERCURY_PREAMBLE_AMORT=0: preamble amortization DISABLED\n"); fflush(stdout); } }
         telecom_system.keydown_track_timing_enabled = true;   // DEFAULT-ON: continuous-keydown carried timing
         if(const char* kt_e=std::getenv("MERCURY_KEYDOWN_TRACK")) { if(atoi(kt_e)==0) { telecom_system.keydown_track_timing_enabled = false; printf("[FLAG] MERCURY_KEYDOWN_TRACK=0: continuous-keydown carried-timing DISABLED\n"); fflush(stdout); } }
+        printf("[FLAG] preamble_amortization=%s keydown_track=%s (link-wide: both peers must match)\n",
+               telecom_system.preamble_amortization_enabled ? "on" : "off",
+               telecom_system.keydown_track_timing_enabled ? "on" : "off");
         ARQ.passive_monitor = is_monitor_mode;
         ARQ.monitor_stdout = is_monitor_mode && monitor_stdout;
         if (phy_reinit_settle_ms_cli != -1) {
