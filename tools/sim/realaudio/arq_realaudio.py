@@ -621,6 +621,28 @@ def _bin_fingerprint(path):
         return {"bin_path": path, "bin_md5": None, "bin_error": str(e)}
 
 
+def delivery_endpoint_times(events):
+    """Delivery instants of this attempt, on the harness clock (seconds since t0,
+    the clock of the [T+] log lines and of completion_at_s).
+
+    last_rx_at_s is the arrival of the last delivered byte: the endpoint of an
+    incomplete cell under the endpoint-bounded contamination rule. For a complete
+    cell it is the arrival of the segment that finished the payload or a later one.
+    last_good_prefix_advance_at_s is the last instant the byte-exact prefix grew;
+    it equals last_rx_at_s whenever delivery stayed byte-exact."""
+    last_rx_at_s = None
+    last_good_at_s = None
+    good = 0
+    for ev in events:
+        last_rx_at_s = ev["at_s"]
+        if ev["good_prefix_bytes"] > good:
+            good = ev["good_prefix_bytes"]
+            last_good_at_s = ev["at_s"]
+    return {"last_rx_at_s": last_rx_at_s,
+            "last_good_prefix_advance_at_s": last_good_at_s,
+            "delivery_event_count": len(events)}
+
+
 def dev(card, devno, sub):
     return f"hw:{card},{devno},{sub}"
 
@@ -1445,6 +1467,7 @@ def main():
     # duty denominators below use the explicit CONNECT-issued whole-session clock.
     dwell = max(1.0, dwell_cold - warm_offset)
     oracle_snapshot = delivery_oracle.snapshot()
+    delivery_times = delivery_endpoint_times(oracle_snapshot["events"])
     # SECONDARY-only post-warm suffix.  These values are retained for engineering
     # diagnosis, but are never the primary score and never affect eligibility.
     steady_rx_bytes = scored_delta(res["rx"], warm_rx_bytes, under_warmed)
@@ -2164,6 +2187,11 @@ def main():
         # crossing is retained separately for audit.
         "completion_at_s": completion["at_s"],
         "completion_count_at_s": completion["count_at_s"],
+        # last delivered byte (endpoint of an incomplete cell, D84) and the last
+        # instant the byte-exact prefix grew; harness clock, like completion_at_s.
+        "last_rx_at_s": delivery_times["last_rx_at_s"],
+        "last_good_prefix_advance_at_s": delivery_times["last_good_prefix_advance_at_s"],
+        "delivery_event_count": delivery_times["delivery_event_count"],
         "disconnect_issued_at_s": disconnect_issued_at_s,
         "terminal_settlement_s": terminal_settlement_s,
         "terminal_release_at_by_peer_s": dict(st.disconnected_at_by_peer),
