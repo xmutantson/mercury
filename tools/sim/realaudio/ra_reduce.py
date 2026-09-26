@@ -133,11 +133,41 @@ _AXIS_OVERRIDES = ("peak-control", "hwcal")
 # unset/steady/bench request to bench, bridge_reference.py). "peak" and a
 # missing/unknown axis stay refused.
 _HONEST_AXES = ("steady", "bench")
-# Certified load-invariant scoring width per box (width doctrine 2026-09-07:
-# breaks at 24-wide equal breaks idle on the native C bridge). A cohort above
-# it needs its own certification; --width-limit changes it and the value used
-# is written into the reduction.
-WIDTH_LIMIT_CERTIFIED = 24
+# Frozen per-box width for bookable and bulk rows (RECIPE_FREEZE_20260923
+# sections 3 and 8: width <= 8 per box; reversible only by the owner). The
+# 24-wide certification of 2026-09-07 predates the freeze; a reduction that
+# wants it passes --width-limit 24 and the value used is written into the
+# reduction.
+WIDTH_LIMIT_FROZEN = 8
+
+# RECIPE_FREEZE_20260923 section 2: VARA bar (B/min) by channel profile and
+# IONOS dial. The twin runs the bench axis, whose WB OFDM coordinate is
+# snr3k = dial - 0.35 (column P, section 1). A bench-axis cell is compared with
+# this frozen bar, derived here from its own profile and snr3k, never with the
+# bar the harness stamped (which uses an older dial remap and no profile).
+FROZEN_BAR_ID = "RECIPE_FREEZE_20260923 s2"
+FROZEN_BAR_BMIN = {
+    "WGN": {-10: 1070, 0: 3008, 10: 18232, 20: 38425, 30: 44964, 40: 46809},
+    "MPG": {-10: 324, 0: 1752, 10: 5973, 20: 23142, 30: 27385, 40: 28120},
+    "MPM": {-10: 383, 0: 1700, 10: 7447, 20: 23711, 30: 26617, 40: 27208},
+    "MPP": {-10: 439, 0: 1740, 10: 7703, 20: 16592, 30: 16603, 40: 17519},
+}
+COLUMN_P_OFDM_WB_OFFSET_DB = 0.35
+DIAL_MATCH_TOLERANCE_DB = 0.05
+
+
+def frozen_bar(profile, snr3k):
+    """(bar_Bmin, dial) for a bench-axis cell, or (None, None) when its
+    coordinate is not a frozen dial of a frozen profile."""
+    table = FROZEN_BAR_BMIN.get(str(profile or "").strip().upper())
+    value = _f(snr3k)
+    if table is None or value is None:
+        return None, None
+    dial_f = value + COLUMN_P_OFDM_WB_OFFSET_DB
+    dial = int(round(dial_f))
+    if abs(dial_f - dial) > DIAL_MATCH_TOLERANCE_DB or dial not in table:
+        return None, None
+    return float(table[dial]), dial
 
 
 def _int_or_none(x):
@@ -147,7 +177,7 @@ def _int_or_none(x):
         return None
 
 
-def _axis_width_offense(d, override=None, width_limit=WIDTH_LIMIT_CERTIFIED):
+def _axis_width_offense(d, override=None, width_limit=WIDTH_LIMIT_FROZEN):
     """Return the list of axis/width offense reasons for a vs-bar cell.
 
     Empty list == the cell is clean and may be scored against the bar.
@@ -297,7 +327,15 @@ def reduce_cell(d, recon_tol=RECON_TOL_DEFAULT):
                if d.get("modeled_wire_capacity_Bmin") is not None
                else d.get("true_wire_keyed_Bmin"))   # legacy name (#13, retired)
 
-    vara_bar = _f(d.get("vara_bar_Bmin"))
+    vara_bar_stamped = _f(d.get("vara_bar_Bmin"))
+    vara_bar = vara_bar_stamped
+    vara_bar_source = "stamped" if vara_bar_stamped is not None else None
+    frozen_dial = None
+    mode = d.get("psig_mode")
+    if isinstance(mode, str) and mode.strip().lower() == "bench":
+        snr_coordinate = d.get("snr3k_controlled", d.get("snr3k"))
+        vara_bar, frozen_dial = frozen_bar(d.get("profile"), snr_coordinate)
+        vara_bar_source = FROZEN_BAR_ID if vara_bar is not None else None
     vs_vara_whole = (round(whole * 60.0 / vara_bar, 4)
                      if (whole and vara_bar) else None)
 
@@ -353,6 +391,9 @@ def reduce_cell(d, recon_tol=RECON_TOL_DEFAULT):
         # model passthrough (audit only) + bar
         "modeled_wire_capacity_Bmin": modeled,
         "vara_bar_Bmin": vara_bar,
+        "vara_bar_source": vara_bar_source,
+        "vara_bar_stamped_Bmin": vara_bar_stamped,
+        "frozen_dial": frozen_dial,
         "vs_vara_whole": vs_vara_whole,
     }
 
@@ -431,10 +472,11 @@ def main(argv=None):
                          "'hwcal' (a CAL-measured hardware row). Without it the "
                          "scoreboard refuses any non-steady / over-wide vs-bar "
                          "row.")
-    ap.add_argument("--width-limit", type=int, default=WIDTH_LIMIT_CERTIFIED,
+    ap.add_argument("--width-limit", type=int, default=WIDTH_LIMIT_FROZEN,
                     help="per-box cohort width above which a vs-bar row is "
-                         "refused (default: the certified %d)"
-                         % WIDTH_LIMIT_CERTIFIED)
+                         "refused (default: the frozen %d; 24 only for a "
+                         "reduction that states the 2026-09-07 certification)"
+                         % WIDTH_LIMIT_FROZEN)
     ap.add_argument("--no-vs-bar", action="store_true",
                     help="reduce WITHOUT the vs-bar axis/width gate (the "
                          "non-vs-bar reduction path; output is byte-identical to "

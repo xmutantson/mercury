@@ -328,8 +328,8 @@ class TestAxisWidthOffenseHelper(unittest.TestCase):
 
     def test_width_over_8_flagged_instrument17(self):
         r = ra_reduce._axis_width_offense(
-            {"psig_mode": "steady", "spawner_width": 25})
-        self.assertTrue(any("spawner_width=25 > 24" in x for x in r))
+            {"psig_mode": "steady", "spawner_width": 12})
+        self.assertTrue(any("spawner_width=12 > 8" in x for x in r))
 
     def test_missing_width_flagged(self):
         r = ra_reduce._axis_width_offense({"psig_mode": "steady"})
@@ -342,8 +342,8 @@ class TestAxisWidthOffenseHelper(unittest.TestCase):
         # the 8+2 confound: a single 8-wide spawner, but 10 cells on the box.
         r = ra_reduce._axis_width_offense(
             {"psig_mode": "steady", "spawner_width": 8,
-             "box_concurrent_estimate": 30})
-        self.assertTrue(any("box_concurrent_estimate=30 > 24" in x for x in r))
+             "box_concurrent_estimate": 10})
+        self.assertTrue(any("box_concurrent_estimate=10 > 8" in x for x in r))
 
     def test_hwcal_override_waives_everything(self):
         self.assertEqual(ra_reduce._axis_width_offense({}, "hwcal"), [])
@@ -352,8 +352,8 @@ class TestAxisWidthOffenseHelper(unittest.TestCase):
         self.assertEqual(ra_reduce._axis_width_offense(
             {"psig_mode": "peak", "spawner_width": 8}, "peak-control"), [])
         r = ra_reduce._axis_width_offense(
-            {"psig_mode": "peak", "spawner_width": 25}, "peak-control")
-        self.assertTrue(any("spawner_width=25 > 24" in x for x in r))
+            {"psig_mode": "peak", "spawner_width": 12}, "peak-control")
+        self.assertTrue(any("spawner_width=12 > 8" in x for x in r))
 
 
 class TestAxisWidthGate(unittest.TestCase):
@@ -403,13 +403,13 @@ class TestAxisWidthGate(unittest.TestCase):
 
     def test_width10_row_refused(self):
         cells = [_bar_cell(seed=i) for i in range(1, 8)]
-        cells.append(_bar_cell(seed=8, spawner_width=25, box=None,
+        cells.append(_bar_cell(seed=8, spawner_width=10, box=None,
                                tag="widecell"))
         rc, out, err = self._run([self._write(cells)])
         self.assertEqual(rc, 2)
         self.assertEqual(out, "")
         self.assertIn("widecell", err)
-        self.assertIn("spawner_width=25 > 24", err)
+        self.assertIn("spawner_width=10 > 8", err)
 
     def test_missing_fields_refused(self):
         cells = [_bar_cell(seed=i) for i in range(1, 8)]
@@ -424,10 +424,10 @@ class TestAxisWidthGate(unittest.TestCase):
     def test_box_overlap_refused(self):
         # spawner_width=8 passes the width gate, but 10 cells ran on the box.
         cells = [_bar_cell(seed=i) for i in range(1, 8)]
-        cells.append(_bar_cell(seed=8, spawner_width=8, box=30, tag="overlap"))
+        cells.append(_bar_cell(seed=8, spawner_width=8, box=10, tag="overlap"))
         rc, out, err = self._run([self._write(cells)])
         self.assertEqual(rc, 2)
-        self.assertIn("box_concurrent_estimate=30 > 24", err)
+        self.assertIn("box_concurrent_estimate=10 > 8", err)
 
     def test_override_admits_peak_control(self):
         d = self._write([_bar_cell(seed=i, psig_mode="peak")
