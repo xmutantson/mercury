@@ -135,6 +135,32 @@ class BridgeCommandError(ValueError):
     """Raised when --bridge does not identify a supported bridge program."""
 
 
+class HarnessPreflightError(RuntimeError):
+    """A cell precondition the harness checks before it launches anything."""
+
+
+def unavailable_ports(ports, host="0.0.0.0"):
+    """Return [(port, reason)] for each TCP port a modem could not bind.
+
+    Mirrors the modem's own server socket on Linux (AF_INET, INADDR_ANY,
+    SO_REUSEADDR, bind, listen): a port held by any other socket, including a
+    client in CLOSE-WAIT that took it from the ephemeral range, fails here the
+    same way it would fail the modem's startup."""
+    busy = []
+    for port in sorted(set(int(p) for p in ports)):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name != "nt":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, port))
+            probe.listen(1)
+        except OSError as exc:
+            busy.append((port, exc.__class__.__name__ + ":" + str(exc.errno)))
+        finally:
+            probe.close()
+    return busy
+
+
 def bridge_command_prefix(bridge_path):
     """Return a fail-closed interpreter/scheduler argv for ``bridge_path``."""
     if not os.path.isfile(bridge_path):
@@ -889,6 +915,7 @@ def main():
             with open(args.json, "w", encoding="utf-8") as stream:
                 json.dump(replayed, stream, indent=1)
         return 3 if replayed.get("whole_session_status") == "VOID" else 0
+    harness_exception = None
     try:
         bridge_prefix = bridge_command_prefix(args.bridge)
     except BridgeCommandError as exc:
@@ -1184,6 +1211,13 @@ def main():
 
     try:
         # 1. bridge first (opens the 4 loopback subdevices for THIS run).
+        busy_ports = unavailable_ports(sorted(rsp_ports | cmd_ports))
+        if busy_ports:
+            instrument_invalid = True
+            instrument_invalid_reasons.extend(
+                "port_unavailable:%d" % port for port, _ in busy_ports)
+            raise HarnessPreflightError(
+                "modem port(s) not bindable before launch: %s" % busy_ports)
         bcmd = bridge_prefix + [
                 "--fwd-cap", fwd_cap, "--fwd-play", fwd_play,
                 "--rev-cap", rev_cap, "--rev-play", rev_play,
@@ -1486,8 +1520,19 @@ def main():
                     f"sources={dict(st.disconnect_source_by_peer)}\n")
                 logfile.flush()
         observed_until_s = time.monotonic() - t0
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 -- recorded as instrument-invalid
         sys.stderr.write(f"[harness] {e}\n")
+        instrument_invalid = True
+        instrument_invalid_reasons.append(
+            "harness_exception:%s" % type(e).__name__)
+        harness_exception = {"type": type(e).__name__, "message": str(e)[:500],
+                             "at_s": round(time.monotonic() - t0, 3)}
+        try:
+            logfile.write("[T+%08.3f] [HARNESS-EXCEPTION] %s: %s\n" % (
+                time.monotonic() - t0, type(e).__name__, str(e)[:500]))
+            logfile.flush()
+        except (OSError, ValueError):
+            pass
     finally:
         # End of the measurement observation interval. Teardown time must never
         # make an early-ended fixed window look complete.
@@ -2171,6 +2216,7 @@ def main():
         "last_ToSend_data": st.last_ToSend_data,
         "instrument_invalid": instrument_invalid,
         "instrument_invalid_reasons": sorted(set(instrument_invalid_reasons)),
+        "harness_exception": harness_exception,
         "teardown_survivor_pids": teardown_survivor_pids,
         "teardown_post_grace_reap_required": bool(teardown_survivor_pids),
         "cmd_connected": st.cmd_connected, "rsp_connected": st.rsp_connected,
