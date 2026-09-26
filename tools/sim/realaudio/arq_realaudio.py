@@ -161,6 +161,24 @@ def unavailable_ports(ports, host="0.0.0.0"):
     return busy
 
 
+def vara_scoring_gate(channel_attestation, instrument_invalid, override_preflight):
+    """True when the cell may be compared with the VARA bar.
+
+    A cell that ran with a declared negative-control switch measures the
+    control, not the product: it is never a vs-bar row, whatever its transfer
+    outcome. The channel attestation records why scoring was disabled."""
+    scorable = bool(channel_attestation.get("vara_scorable")
+                    and not instrument_invalid)
+    if (scorable and isinstance(override_preflight, dict)
+            and override_preflight.get("status") == "NEGATIVE-CONTROL"):
+        channel_attestation["vara_scorable"] = False
+        channel_attestation["vara_scoring_disabled_reason"] = (
+            "negative_control:%s"
+            % override_preflight.get("declared_negative_control"))
+        scorable = False
+    return scorable
+
+
 def _write_fatal_result(args, fatal_reason, detail, reasons, harness_exception):
     """A fail-closed exit still leaves a typed result: INSTRUMENT_INVALID with
     every reason the run recorded, so a runner never has to infer the outcome
@@ -1802,8 +1820,10 @@ def main():
         channel_attestation["reasons"].append("runner_precondition_invalid")
         snr3k = None
     compressible = CA.is_compressible_traffic(args.traffic)
-    scoring_attested = bool(
-        channel_attestation["vara_scorable"] and not instrument_invalid)
+    scoring_attested = vara_scoring_gate(
+        channel_attestation, instrument_invalid, override_preflight)
+    negative_control_cell = (
+        override_preflight.get("status") == "NEGATIVE-CONTROL")
     if scoring_attested:
         vara_bar_Bmin, vara_bar_kind, corpus_lzhuf = CA.vara_bar_for_traffic(
             snr3k, args.traffic)
@@ -2500,6 +2520,7 @@ def main():
         "snr3k": snr3k,
         "requested_snr3k": args.snr3k,
         "snr3k_attested": scoring_attested,
+        "negative_control_cell": negative_control_cell,
         "vara_scoring_enabled": scoring_attested,
         "channel_attestation": channel_attestation,
         "traffic_compressible": compressible,
