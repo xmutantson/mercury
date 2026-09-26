@@ -1149,7 +1149,10 @@ def ack_arrival_stats(arrivals_ms):
 #                               `SNR=<f> dB` decode print = 10log10(1/variance),
 #                               telecom_system.cc:3433,5976; and any `nv=` diag).
 # ==========================================================================
-_LOADCFG_RE = re.compile(r"load_configuration\((\d+)\)\s+current=(\d+)")
+# The modem prints "[CFG] load_configuration(N) current=M" BEFORE it assigns N
+# (arq_common.cc load_configuration): N is the config being loaded, M the one it
+# leaves (-1 before the first load). The timeline keys on N.
+_LOADCFG_RE = re.compile(r"load_configuration\((-?\d+)\)\s+current=(-?\d+)")
 # measure_variance readouts: recovered SNR (` SNR=<f> dB`, on every decoded frame)
 # and the raw noise-variance estimate (`nv=<f>`, printed by the SFO-GRID/DIAG/
 # BIGBLOCK-WAV decode diagnostics). Either populates the field.
@@ -1158,9 +1161,10 @@ _NV_RE = re.compile(r"\bnv=(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
 
 
 def parse_config_timeline(logpath):
-    """List of (t_wall_s, current_config) from every `load_configuration(x) current=y`
+    """List of (t_wall_s, config) from every `load_configuration(N) current=M`
     line (config transitions), using the harness T+ prefix as the clock. Returns []
-    on error/empty. current_config = the config the modem transitioned INTO."""
+    on error/empty. config = N, the config the modem transitioned INTO (M is the
+    config it left)."""
     out = []
     try:
         with open(logpath, "r", errors="replace") as f:
@@ -1171,7 +1175,7 @@ def parse_config_timeline(logpath):
                 t = float(m.group(1))
                 mc = _LOADCFG_RE.search(m.group(3))
                 if mc:
-                    out.append((t, int(mc.group(2))))
+                    out.append((t, int(mc.group(1))))
     except OSError:
         return []
     return out
