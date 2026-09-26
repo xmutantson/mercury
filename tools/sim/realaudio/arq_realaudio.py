@@ -161,6 +161,31 @@ def unavailable_ports(ports, host="0.0.0.0"):
     return busy
 
 
+def _write_fatal_result(args, fatal_reason, detail, reasons, harness_exception):
+    """A fail-closed exit still leaves a typed result: INSTRUMENT_INVALID with
+    every reason the run recorded, so a runner never has to infer the outcome
+    from a missing file."""
+    if not args.json:
+        return
+    all_reasons = sorted(set(list(reasons) + [fatal_reason]))
+    with open(args.json, "w", encoding="utf-8") as stream:
+        json.dump({
+            "tag": args.tag, "arm": args.arm, "mode": args.mode,
+            "profile": args.profile, "seed": args.seed,
+            "snr3k_controlled": args.snr3k, "start_cfg": args.start_cfg,
+            "traffic": args.traffic,
+            "verdict": "INSTRUMENT_INVALID",
+            "whole_session_status": "INSTRUMENT_INVALID",
+            "whole_session_scorable": False,
+            "instrument_invalid": True,
+            "instrument_invalid_reasons": all_reasons,
+            "fatal_reason": fatal_reason,
+            "fatal_detail": detail[:500],
+            "harness_exception": harness_exception,
+            "rsp_port": args.rsp_port, "cmd_port": args.cmd_port,
+        }, stream, indent=1)
+
+
 def bridge_command_prefix(bridge_path):
     """Return a fail-closed interpreter/scheduler argv for ``bridge_path``."""
     if not os.path.isfile(bridge_path):
@@ -2158,6 +2183,8 @@ def main():
                                  + ",".join(ident_reasons))
     except (OSError, ValueError, TypeError) as exc:
         sys.stderr.write("[harness] FATAL bench-twin attestation rejected: %s\n" % exc)
+        _write_fatal_result(args, "bench_twin_attestation_rejected", str(exc),
+                            instrument_invalid_reasons, harness_exception)
         return 2
     harness_attestation = dict(
         harness_ident, echoed_by_bridge=bool(bridge_ident_argv))
@@ -2178,6 +2205,9 @@ def main():
     if tx_gain_values and not tx_gain_attestation["ok"]:
         sys.stderr.write("[harness] FATAL tx gain override not applied: %s\n"
                          % ",".join(tx_gain_attestation["reasons"]))
+        _write_fatal_result(args, "tx_gain_override_not_applied",
+                            ",".join(tx_gain_attestation["reasons"]),
+                            instrument_invalid_reasons, harness_exception)
         return 2
 
     result = {
