@@ -1160,17 +1160,20 @@ _SNR_RE = re.compile(r"\bSNR=(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*dB")
 _NV_RE = re.compile(r"\bnv=(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
 
 
-def parse_config_timeline(logpath):
+def parse_config_timeline(logpath, peer=None):
     """List of (t_wall_s, config) from every `load_configuration(N) current=M`
     line (config transitions), using the harness T+ prefix as the clock. Returns []
     on error/empty. config = N, the config the modem transitioned INTO (M is the
-    config it left)."""
+    config it left). The cell log interleaves both modems; ``peer`` ("RSP" or
+    "CMD") keeps one modem's transitions, None keeps both."""
     out = []
     try:
         with open(logpath, "r", errors="replace") as f:
             for raw in f:
                 m = _TS_RE.match(raw.rstrip("\n"))
                 if not m:
+                    continue
+                if peer is not None and m.group(2) != peer:
                     continue
                 t = float(m.group(1))
                 mc = _LOADCFG_RE.search(m.group(3))
@@ -1188,7 +1191,8 @@ def _config_rank(c):
     return c if c < 100 else (c - 1000)
 
 
-def config_held_verdict(timeline, target_config, connected_at_s=None, pinned=False):
+def config_held_verdict(timeline, target_config, connected_at_s=None, pinned=False,
+                        until_s=None):
     """C5: did a PINNED cell HOLD its target WB config, or DEMOTE below it? This is
     the durable decode17-vs-decode16 signal the endpoint-floor sweep lacked.
 
@@ -1225,7 +1229,8 @@ def config_held_verdict(timeline, target_config, connected_at_s=None, pinned=Fal
     # so it must be visible to reached_target; drop the connect floor for pinned cells.
     floor_s = None if pinned else connected_at_s
     seen_after = [(t, c) for (t, c) in timeline
-                  if floor_s is None or t >= floor_s]
+                  if (floor_s is None or t >= floor_s)
+                  and (until_s is None or t <= until_s)]
     wb_after = sorted({c for (_t, c) in seen_after if c < 100})
     res = {
         "target_config": tc,
@@ -1237,6 +1242,7 @@ def config_held_verdict(timeline, target_config, connected_at_s=None, pinned=Fal
         "wb_configs_after": wb_after,
         "floor_s": floor_s,
         "pinned": bool(pinned),
+        "until_s": until_s,
     }
     if not applicable:
         return res
@@ -1256,6 +1262,33 @@ def config_held_verdict(timeline, target_config, connected_at_s=None, pinned=Fal
         res["demoted_to"] = max(demotes, key=_config_rank)   # closest fallback (e.g. cfg16)
     else:
         res["config_held"] = True
+    return res
+
+
+def config_held_both_peers(logpath, target_config, connected_at_s=None,
+                           pinned=False, until_s=None):
+    """config_held over each modem's own transitions (the cell log interleaves
+    both, and merging them reads one peer's start-up loads as the other's
+    demotes). ``until_s`` ends the window at the last delivered good-prefix
+    byte, so the post-transfer idle drop is not a demote of the transfer.
+    Held iff every peer that reached the target held it; demoted_to is the
+    fastest fallback either peer took."""
+    per_peer = {}
+    for peer in ("RSP", "CMD"):
+        per_peer[peer] = config_held_verdict(
+            parse_config_timeline(logpath, peer), target_config,
+            connected_at_s, pinned=pinned, until_s=until_s)
+    rsp, cmd = per_peer["RSP"], per_peer["CMD"]
+    res = dict(rsp)
+    res["per_peer"] = per_peer
+    if not rsp["applicable"]:
+        return res
+    held = [v["config_held"] for v in (rsp, cmd)]
+    res["reached_target"] = rsp["reached_target"] and cmd["reached_target"]
+    res["config_held"] = all(h is True for h in held)
+    demoted = [v["demoted_to"] for v in (rsp, cmd) if v["demoted_to"] is not None]
+    res["demoted_to"] = (max(demoted, key=_config_rank) if demoted and not res["config_held"]
+                         else None)
     return res
 
 

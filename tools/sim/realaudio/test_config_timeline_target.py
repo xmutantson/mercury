@@ -52,5 +52,52 @@ class ConfigTimelineTarget(unittest.TestCase):
         self.assertTrue(v["config_held"])
 
 
+# Retained-cell shape (frontA floor cells): each modem loads 0 then the target at
+# start-up, a few seconds apart, and the cell log interleaves them.
+INTERLEAVED = (
+    "[T+0002.274] [RSP] [CFG] load_configuration(0) current=-1 level=FULL backup=NO\n"
+    "[T+0002.500] [RSP] [CFG] load_configuration(10) current=0 level=FULL backup=NO\n"
+    "[T+0005.275] [CMD] [CFG] load_configuration(0) current=-1 level=FULL backup=NO\n"
+    "[T+0005.499] [CMD] [CFG] load_configuration(10) current=0 level=FULL backup=NO\n"
+)
+POST_TRANSFER_DROP = (
+    "[T+0400.000] [RSP] [CFG] load_configuration(0) current=10 level=FULL backup=NO\n"
+    "[T+0400.100] [CMD] [CFG] load_configuration(0) current=10 level=FULL backup=NO\n"
+)
+MID_TRANSFER_DEMOTE = (
+    "[T+0200.000] [RSP] [CFG] load_configuration(9) current=10 level=FULL backup=NO\n"
+)
+
+
+class PerPeerTimeline(unittest.TestCase):
+    def _log(self, text):
+        fd, path = tempfile.mkstemp(suffix=".log")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_interleaved_start_up_is_not_a_demote(self):
+        path = self._log(INTERLEAVED)
+        self.assertEqual([c for _t, c in CA.parse_config_timeline(path, "RSP")], [0, 10])
+        v = CA.config_held_both_peers(path, 10, None, pinned=True)
+        self.assertTrue(v["config_held"])
+        self.assertIsNone(v["demoted_to"])
+
+    def test_post_transfer_drop_is_outside_the_window(self):
+        path = self._log(INTERLEAVED + POST_TRANSFER_DROP)
+        self.assertTrue(CA.config_held_both_peers(path, 10, None, pinned=True,
+                                                  until_s=300.0)["config_held"])
+        self.assertFalse(CA.config_held_both_peers(path, 10, None, pinned=True)["config_held"])
+
+    def test_mid_transfer_demote_of_one_peer_is_seen(self):
+        path = self._log(INTERLEAVED + MID_TRANSFER_DEMOTE + POST_TRANSFER_DROP)
+        v = CA.config_held_both_peers(path, 10, None, pinned=True, until_s=300.0)
+        self.assertFalse(v["config_held"])
+        self.assertEqual(v["demoted_to"], 9)
+        self.assertFalse(v["per_peer"]["RSP"]["config_held"])
+        self.assertTrue(v["per_peer"]["CMD"]["config_held"])
+
+
 if __name__ == "__main__":
     unittest.main()

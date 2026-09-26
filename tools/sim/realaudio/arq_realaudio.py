@@ -1908,8 +1908,9 @@ def main():
     # cell (it rejected 18/18 byte-exact cells). pinned drops the floor for pinned cells;
     # a real demote after reaching target still fails held, and gearshift is untouched.
     pinned = bool(args.no_gearshift) and (target_config is not None)
-    config_held = CA.config_held_verdict(config_timeline, target_config,
-                                         connected_at_cold, pinned=pinned)
+    config_held = CA.config_held_both_peers(
+        logpath, target_config, connected_at_cold, pinned=pinned,
+        until_s=delivery_times["last_good_prefix_advance_at_s"])
     # -- GEOMETRY + ELECTION FIRE-PROOF (records the RUNTIME pilot lattice + cfg17
     #    election so a silently-STOCK / silently-cfg16 cell is detectable in audit) --
     pilot_geometry = CA.parse_pilot_geometry(logpath)
