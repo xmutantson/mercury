@@ -20104,7 +20104,8 @@ bool cl_arq_controller::decode_sack_v2_frame(bool* out_bitmap, int nframes,
 		rro::Telemetry& telemetry = rro::Telemetry::instance();
 		if (telemetry.enabled())
 			telemetry.record_arq_sack_window(
-				(int)payload[0], nframes, &payload[2], bitmap_bytes);
+				(int)generation_ack_resolve_target(payload[0], cumulative_ack_enabled),
+				nframes, &payload[2], bitmap_bytes);
 	}
 
 	// Log decoded bitmap byte-for-byte for the v2<->v2 byte-identity test.

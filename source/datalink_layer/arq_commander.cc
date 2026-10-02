@@ -7811,8 +7811,27 @@ void cl_arq_controller::process_messages_rx_acks_data()
 								fflush(stdout);
 							}
 							if(decoded && target_owned)
+							{
 								role_demand_note_acknowledged(reverse_demand,
 									"mfsk-ack-sack");
+								// Publish only received selective bits for this accepted target.
+								// Compact CLEAN confirms carry no bitmap; wider spans contain
+								// unobserved slots beyond this suffix's fixed 30-bit domain.
+								if(data_batch_size > 0
+								   && data_batch_size <= MFSK_SACK_BITMAP_BITS
+								   && rro::Telemetry::instance().enabled())
+								{
+									const unsigned char rro_sack_bitmap[4] = {
+										static_cast<unsigned char>(rx_bitmap & 0xFFu),
+										static_cast<unsigned char>((rx_bitmap >> 8) & 0xFFu),
+										static_cast<unsigned char>((rx_bitmap >> 16) & 0xFFu),
+										static_cast<unsigned char>((rx_bitmap >> 24) & 0xFFu)
+									};
+									rro::Telemetry::instance().record_arq_sack_window(
+										resolved_target, data_batch_size, rro_sack_bitmap,
+										(data_batch_size + 7) / 8);
+								}
+							}
 						}
 
 						// RETIRED §6 base-pattern climb-confirm (data-flow-inband-basepattern-
