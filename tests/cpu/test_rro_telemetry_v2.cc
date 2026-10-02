@@ -81,6 +81,15 @@ int main() {
     t.record_crc_frame_outcome(true, 0);
     t.record_crc_frame_outcome(false, 1);
     const std::string json = t.snapshot_json_v2();
+    auto metric_object = [](const std::string& packet, const char* name) {
+        const auto at = packet.find(name);
+        assert(at != std::string::npos);
+        return packet.substr(at, packet.find('}', at) - at);
+    };
+    assert(metric_object(json, "\"audio.capture_window_handoffs_total\":")
+        .find("\"value\":\"1\"") != std::string::npos);
+    assert(metric_object(json, "\"audio.capture_window_samples\":")
+        .find("\"value\":1024") != std::string::npos);
     assert(json.find("\"version\":2") != std::string::npos);
     assert(json.find("\"detail_metrics\":{") != std::string::npos);
     assert(json.find("\"crc.recent_checked_frames\":{\"available\":true")
@@ -160,6 +169,12 @@ int main() {
     carrier_writer.join();
     mode_switcher.join();
     t.stop();
+    // Disabled hooks cannot manufacture another extraction. This unit check
+    // validates hook semantics; the source-contract test owns ARQ placement.
+    t.record_capture_window_handoff(2048);
+    const std::string disabled = t.snapshot_json_v2();
+    assert(metric_object(disabled, "\"audio.capture_window_handoffs_total\":")
+        .find("\"value\":\"1\"") != std::string::npos);
     const auto disabled_begin = std::chrono::steady_clock::now();
     for (int i = 0; i < hotpath_calls; ++i)
         t.record_audio_capture_written(1, 0);

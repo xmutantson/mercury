@@ -23097,6 +23097,12 @@ void cl_arq_controller::receive()
 
 		MUTEX_UNLOCK(&capture_prep_mutex);
 
+		// One handoff for the fresh window copied above, in samples (not bytes).
+		// Publish after releasing capture_prep_mutex; stale-window re-probes and
+		// any alternate decoders below reuse this extraction, not new handoffs.
+		if(signal_period > 0 && rro::Telemetry::instance().enabled())
+			rro::Telemetry::instance().record_capture_window_handoff(signal_period);
+
 		if(telecom_system->M != MOD_MFSK && g_verbose)
 		{
 			int sym_samples = telecom_system->data_container.Nofdm * telecom_system->data_container.interpolation_rate;

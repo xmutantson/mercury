@@ -570,6 +570,7 @@ source/physical_layer/mfsk_ctrl_codec_tests.cc
 source/physical_layer/nb_cfo_correction_test.cc
 source/physical_layer/telecom_system.cc
 source/common/os_interop.cc
+source/common/rro_telemetry.cc
 source/common/ring_buffer_posix.cc
 source/common/shm_posix.cc
 source/common/sim_clock.cc
