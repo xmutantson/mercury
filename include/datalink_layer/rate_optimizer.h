@@ -370,6 +370,23 @@ public:
     bool notify_switch_confirmed_if_matches(int from_cfg, int to_cfg,
                                             unsigned long long now_ms);
     bool notify_switch_failed_if_matches(int from_cfg, int to_cfg);
+    // Read-only telemetry accessors. Never use an old recommendation to label
+    // the action of a different or already closed transport transaction.
+    int inflight_action_if_matches(int from_cfg, int to_cfg) const {
+        return switch_inflight && switch_from_cfg == from_cfg
+            && switch_to_cfg == to_cfg ? (int)switch_action : -1;
+    }
+    const char* inflight_selection_reason_if_matches(int from_cfg, int to_cfg) const {
+        return switch_inflight && switch_from_cfg == from_cfg
+            && switch_to_cfg == to_cfg && !switch_selection_reason.empty()
+            ? switch_selection_reason.c_str() : nullptr;
+    }
+    int active_probe_origin() const { return probe_active ? switch_from_cfg : -1; }
+    int active_probe_target() const { return probe_active ? probe_target_cfg : -1; }
+    const char* active_probe_selection_reason() const {
+        return probe_active && !switch_selection_reason.empty()
+            ? switch_selection_reason.c_str() : nullptr;
+    }
     // A config change initiated outside Gearshift-v2 (emergency recovery,
     // implementation safety demote, etc.) must invalidate any in-flight probe
     // and age the model context. Matching v2-dispatched SET_CONFIGs are ignored
@@ -463,6 +480,7 @@ private:
     int switch_from_cfg;
     int switch_to_cfg;
     e_gearshift_v2_action switch_action;
+    std::string switch_selection_reason;
     int switch_fallback_cfg;
     bool switch_is_nb;
 

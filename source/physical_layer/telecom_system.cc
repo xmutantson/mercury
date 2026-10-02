@@ -26,6 +26,7 @@
 #include "debug/canary_guard.h"
 #include "common/sim_channel.h" // cl_sim_sfo — long-block timing-acquisition-under-SFO harness
 #include "common/snr_decision_grid.h"
+#include "common/rro_telemetry.h"
 #include "physical_layer/dist_matcher.h" // PAS/PCS distribution matcher (lever #2, feat/pcs)
 #include "physical_layer/ldpc_decode_pool.h" // LEVER C: multi-core big-block decode pool (feat/decode-marathon)
 #include <thread> // LEVER C: std::thread::hardware_concurrency() for the pool clamp
@@ -54,6 +55,37 @@ extern "C" { extern std::atomic<bool> shutdown_; }
 
 // Test mode: artificial TX carrier offset in Hz (for testing frequency sync)
 extern "C" double test_tx_carrier_offset;
+
+void cl_telecom_system::publish_rro_lattice_geometry() const
+{
+	rro::Telemetry& telemetry = rro::Telemetry::instance();
+	if (!telemetry.enabled()) return;
+	if (M == MOD_MFSK) {
+		telemetry.clear_ofdm_lattice();
+		return;
+	}
+	const int columns = ofdm.Nc;
+	const int rows = ofdm.Nsymb;
+	if (ofdm.ofdm_frame == nullptr || columns <= 0 || columns > 65535
+		|| rows <= 0 || rows > 65535
+		|| static_cast<long long>(columns) * rows > 1048576) {
+		telemetry.clear_ofdm_lattice();
+		return;
+	}
+	int active = 0, pilots = 0, data = 0;
+	for (int column = 0; column < columns; ++column) {
+		bool has_pilot = false, has_data = false;
+		for (int row = 0; row < rows; ++row) {
+			const int type = ofdm.ofdm_frame[row * columns + column].type;
+			has_pilot |= type == PILOT;
+			has_data |= type == DATA;
+		}
+		pilots += has_pilot;
+		data += has_data;
+		active += has_pilot || has_data;
+	}
+	telemetry.record_ofdm_lattice(active, pilots, data, current_configuration);
+}
 
 
 
@@ -1814,6 +1846,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	int nVirtual_data=ldpc.N-data_container.nBits;
 	int nReal_data=data_container.nBits-ldpc.P;
 	double freq_offset_measured=0;
+	bool rro_fresh_frequency_estimate = false;
 	receive_stats.message_decoded=NO;
 	receive_stats.frame_overflow_symbols=0;
 	receive_stats.frame_data_missing=false;
@@ -1823,6 +1856,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	receive_stats.sync_trials=0;
 	receive_stats.iterations_done = -1;
 	receive_stats.crc = 0;
+	receive_stats.crc_checked = false;
 	receive_stats.SNR = -99.9;
 	receive_stats.all_zeros = NO;
 	receive_stats.coarse_metric = 0.0;
@@ -2317,6 +2351,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						// Prediction verified — use directly, skip wider search
 						receive_stats.coarse_metric = verify.correlation;
 						int raw_resid = (int)verify.delay - predicted_pos;
+						rro::Telemetry::instance().record_acquisition_coarse_metric(verify.correlation);
+						rro::Telemetry::instance().record_acquisition_timing_residual(raw_resid);
 						if(keydown_track_timing_enabled && raw_resid <= gi_interp && raw_resid >= -gi_interp)
 						{
 							// NOISE regime: sub-guard residual = the ICI-injecting fine-timing
@@ -2374,6 +2410,8 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						{
 							receive_stats.coarse_metric = repin.correlation;
 							int raw_resid = (int)repin.delay - predicted_pos;
+							rro::Telemetry::instance().record_acquisition_coarse_metric(repin.correlation);
+							rro::Telemetry::instance().record_acquisition_timing_residual(raw_resid);
 							if(keydown_track_timing_enabled && raw_resid <= gi_interp && raw_resid >= -gi_interp)
 							{
 								receive_stats.ofdm_drift_per_frame = 0.8 * receive_stats.ofdm_drift_per_frame + 0.2 * (double)raw_resid;
@@ -2572,6 +2610,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 
 				receive_stats.delay = matched.delay;
 				receive_stats.coarse_metric = matched.correlation;
+				rro::Telemetry::instance().record_acquisition_coarse_metric(matched.correlation);
 				{ static const int f0v_tr = []{ const char* e=std::getenv("MERCURY_F0V_TRACE"); return (e&&*e)?atoi(e):0; }();
 				  if(f0v_tr){ int sy=data_container.Nofdm*frequency_interpolation_rate;
 				    printf("[F0V-TRACE] stage=coarse delay=%d metric=%.4f (~%.2f sym)\n",
@@ -2608,7 +2647,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 		// structural event so ARQ lost-tag recovery never treats mere buffer energy
 		// as permission to run alternate decoders or transmit a DECODE_FAIL NACK.
 		if(M != MOD_MFSK)
+		{
 			receive_stats.ofdm_preamble_detected = true;
+			if(ofdm_forced_delay < 0 && rro::Telemetry::instance().enabled())
+				rro::Telemetry::instance().record_acquisition_transition(
+					1, (int)receive_stats.delay,
+					position_from_batch_predictor ? -1.0 : receive_stats.coarse_metric,
+					current_configuration);
+		}
 		pream_symb_loc=receive_stats.delay/(data_container.Nofdm*data_container.interpolation_rate);
 		if(pream_symb_loc<1){pream_symb_loc=1;}
 
@@ -2822,6 +2868,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 				{
 					receive_stats.delay = retry.delay;
 					receive_stats.coarse_metric = retry.correlation;
+					rro::Telemetry::instance().record_acquisition_coarse_metric(retry.correlation);
 					pream_symb_loc = retry_symb;
 				}
 			}
@@ -2998,6 +3045,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 						{
 							receive_stats.delay = retry.delay;
 							receive_stats.coarse_metric = retry.correlation;
+							rro::Telemetry::instance().record_acquisition_coarse_metric(retry.correlation);
 							pream_symb_loc = retry_symb;
 							energy_ok = true;
 						}
@@ -3678,6 +3726,7 @@ skip_h_retry_point:
 			auto t3_pb = std::chrono::steady_clock::now();
 			timing_pb_data_ms += std::chrono::duration<double, std::milli>(t3_pb - t2_pb).count();
 
+			rro_fresh_frequency_estimate = false;
 			if(ofdm_forced_delay >= 0)
 			{
 				// BER test: true freq offset is 0, skip estimation
@@ -3703,9 +3752,12 @@ skip_h_retry_point:
 				// freq_offset_measured, so negate it. Gated to CONFIG_0 with a valid
 				// multi-symbol preamble (the estimator needs >=2 preamble symbols).
 				if(current_configuration == CONFIG_0 && rx_eff_preamble >= 2)
+				{
 					freq_offset_measured = -ofdm.carrier_frequency_sync_nb(
 						&data_container.baseband_data[data_container.Ngi],
 						bandwidth/(double)data_container.Nc, rx_eff_preamble);
+					rro_fresh_frequency_estimate = true;
+				}
 				if(g_verbose)
 					printf("[NB-FREQ] skipped (relying on coarse sync + ZF)\n");
 			}
@@ -3730,6 +3782,7 @@ skip_h_retry_point:
 				// so guard interval skip is Ngi samples, NOT Ngi*interpolation_rate.
 				// The old code skipped Ngi*4=256=Nfft samples, reading across symbol boundaries.
 				freq_offset_measured=ofdm.carrier_sampling_frequency_sync(&data_container.baseband_data[data_container.Ngi],bandwidth/(double)data_container.Nc,rx_eff_preamble, sampling_frequency);
+				rro_fresh_frequency_estimate = true;
 				if(g_verbose)
 					printf("[WB-FREQ] Moose=%.4f Hz\n", freq_offset_measured);
 			}
@@ -3782,6 +3835,7 @@ skip_h_retry_point:
 				// (SKIP-VAR -> FTR-FAIL). Closing this dead zone [1x,2x] is the fix —
 				// see cl_telecom_system::moose_clamp_decision() for the root-cause note.
 				bool can_advance = (receive_stats.sync_trials < effective_trials_max);
+				const double rro_raw_frequency_estimate = freq_offset_measured;
 				if(g_verbose)
 					printf("[MOOSE-RAW] unclamped=%.4f Hz, clamp_ceiling=%.1f Hz\n",
 						freq_offset_measured, subcarrier_spacing);
@@ -3798,6 +3852,9 @@ skip_h_retry_point:
 					continue;
 				}
 				freq_offset_measured = clamped;  // accepted small residual, clamped to +-1 subcarrier
+				if (M != MOD_MFSK && rro_fresh_frequency_estimate)
+					rro::Telemetry::instance().record_acquisition_frequency_offset(
+						rro_raw_frequency_estimate);
 			}
 
 			// Pre-fix this branch had `if(M == MOD_MFSK) { /* skip */ }`
@@ -3845,14 +3902,32 @@ skip_h_retry_point:
 			}
 			{
 				int rx_nsymb = get_active_nsymb();
+				// The same call removes the guard interval, executes one FFT, and
+				// depads the bins. Time that whole observed operation, not the FFT
+				// kernel alone. Leave the disabled receive path unmeasured.
+				const bool rro_measure_symbol_demod = rro::Telemetry::instance().enabled();
+				if(rro_measure_symbol_demod && M != MOD_MFSK && ofdm_forced_delay < 0)
+					rro::Telemetry::instance().record_acquisition_transition(
+						2, (int)receive_stats.delay,
+						position_from_batch_predictor ? -1.0 : receive_stats.coarse_metric,
+						current_configuration);
+				std::chrono::steady_clock::time_point rro_symbol_demod_start;
+				if(rro_measure_symbol_demod)
+					rro_symbol_demod_start = std::chrono::steady_clock::now();
 				// LEVER P: data symbols begin right after the (possibly MINI)
 				// preamble — offset Nofdm*rx_eff_preamble, not Nofdm*preamble_nSymb.
 				for(int i=0;i<rx_nsymb;i++)
 				{
 					ofdm.symbol_demod(&data_container.baseband_data[i*data_container.Nofdm+data_container.Nofdm*rx_eff_preamble],&data_container.ofdm_symbol_demodulated_data[i*data_container.Nc]);
 				}
+				if(rro_measure_symbol_demod && rx_nsymb > 0)
+					rro::Telemetry::instance().record_ofdm_fft_execution(
+						rx_nsymb,
+						std::chrono::duration<double, std::milli>(
+							std::chrono::steady_clock::now() - rro_symbol_demod_start).count());
 			}
 
+			int rro_demapper_llr_count = data_container.nBits;
 			if(M == MOD_MFSK)
 			{
 				// MFSK: non-coherent energy detection on FFT output → soft LLRs
@@ -3900,6 +3975,7 @@ skip_h_retry_point:
 				int puncture_from = rx_nbits;
 				if(test_puncture_nBits > 0 && test_puncture_nBits < puncture_from)
 					puncture_from = test_puncture_nBits;
+				rro_demapper_llr_count = puncture_from;
 				for(int i = puncture_from; i < data_container.nBits; i++)
 				{
 					data_container.demodulated_data[i] = 0.0f;
@@ -3947,6 +4023,41 @@ skip_h_retry_point:
 					// See data-flow-noise_variance_estimate.md.
 					ofdm.LS_channel_estimator_tinterp(data_container.ofdm_symbol_demodulated_data);
 				}
+				// Count actual finite, nonzero raw pilot observations while the
+				// test-only pilot override is still in force. The model's later
+				// MEASURED count includes interpolated cells and is a different thing.
+				int rro_raw_pilot_observations = 0;
+				int rro_valid_pilot_pairs = 0;
+				const bool rro_estimator_observed = rro::Telemetry::instance().enabled();
+				if(rro_estimator_observed && ofdm.ofdm_frame != nullptr
+				   && ofdm.pilot_configurator.sequence != nullptr
+				   && ofdm.Nc > 0 && ofdm.Nsymb > 0)
+				{
+					std::vector<int> previous_pilot_row((size_t)ofdm.Nc, -1);
+					int pilot_index = 0;
+					for(int row=0; row<ofdm.Nsymb; ++row)
+						for(int column=0; column<ofdm.Nc; ++column)
+							if((ofdm.ofdm_frame + row*ofdm.Nc + column)->type == PILOT)
+							{
+								if(pilot_index < ofdm.pilot_configurator.nPilots)
+								{
+									const std::complex<double> pilot = ofdm.pilot_configurator.sequence[pilot_index];
+									const std::complex<double> received = data_container.ofdm_symbol_demodulated_data[row*ofdm.Nc + column];
+									if(std::isfinite(pilot.real()) && std::isfinite(pilot.imag())
+									   && std::norm(pilot) > 1e-24
+									   && std::isfinite(received.real()) && std::isfinite(received.imag()))
+									{
+										++rro_raw_pilot_observations;
+										if(ofdm.pilot_configurator.Dy > 0
+										   && previous_pilot_row[(size_t)column] >= 0
+										   && row - previous_pilot_row[(size_t)column] == ofdm.pilot_configurator.Dy)
+											++rro_valid_pilot_pairs;
+										previous_pilot_row[(size_t)column] = row;
+									}
+								}
+								++pilot_index;
+							}
+				}
 				if(!selectivity_test_saved_pilots.empty())
 					for(size_t p=0; p<selectivity_test_saved_pilots.size(); p++)
 						ofdm.pilot_configurator.sequence[p] = selectivity_test_saved_pilots[p];
@@ -3970,6 +4081,30 @@ skip_h_retry_point:
 				// Used by the thinned-pilot sub-peak gate below where mean|H| loses
 				// its wrong-lock margin (see the SUBPEAK-REJECT block).
 				coh_C = ofdm.last_pilot_coherence;
+				if(rro_estimator_observed)
+				{
+					const int estimator_kind = ofdm.channel_estimator == ZERO_FORCE ? 1
+						: ofdm.channel_estimator == LEAST_SQUARE ? 2
+						: ofdm.channel_estimator == TIME_INTERP ? 3 : 0;
+					const bool model_built = estimator_kind != 0
+						&& rro_raw_pilot_observations > 0
+						&& h_count > 0 && std::isfinite(mean_H);
+					const double coherence = rro_raw_pilot_observations > 0
+						&& std::isfinite(coh_C) && coh_C >= 0.0 ? coh_C : -1.0;
+					const double selectivity = rro_raw_pilot_observations >= 2
+						&& std::isfinite(ofdm.last_pilot_selectivity)
+						&& ofdm.last_pilot_selectivity >= 0.0 ? ofdm.last_pilot_selectivity : -1.0;
+					// Estimators may otherwise retain their 0.01 fallback. At least
+					// one valid same-column pilot pair proves a measured noise floor.
+					const double noise = rro_valid_pilot_pairs > 0
+						&& std::isfinite(ofdm.noise_variance_estimate)
+						&& ofdm.noise_variance_estimate > 0.0 ? ofdm.noise_variance_estimate : -1.0;
+					rro::Telemetry::instance().record_channel_estimate(
+						model_built ? h_count : 0, rro_raw_pilot_observations,
+						coherence, selectivity, noise,
+						model_built ? mean_H : -1.0,
+						estimator_kind, model_built);
+				}
 				// Test-observability: expose the per-trial mean(|H|) the SKIP-H
 				// gate keys on. Write-once-per-trial, read by unit tests only
 				// (ofdm-fine-timing-magnitude.md §3.5). No control-flow effect.
@@ -4355,6 +4490,60 @@ skip_h_retry_point:
 			}
 
 			deinterleaver(data_container.demodulated_data,data_container.deinterleaved_data,data_container.nBits,bit_interleaver_block_size);
+			// The configured lattice is not itself engagement. Emit the indexed
+			// bins only after this frame's DATA cells were actually deframed,
+			// deinterleaved, demapped, and handed toward LDPC. Masks are unions
+			// by column across the frame: one bin may carry DATA in one row and
+			// a PILOT in another, so the two masks can legitimately overlap.
+			// A >64-bin lattice is absent until the wire contract supports it.
+			if(rro::Telemetry::instance().enabled() && M != MOD_MFSK
+			   && ofdm.ofdm_frame != nullptr && ofdm.Nc > 0 && ofdm.Nc <= 64
+			   && ofdm.Nsymb > 0 && data_container.nData > 0)
+			{
+				std::uint64_t data_bin_mask = 0;
+				std::uint64_t pilot_bin_mask = 0;
+				int data_cells = 0;
+				int pilot_cells = 0;
+				for(int row=0; row<ofdm.Nsymb; ++row)
+					for(int column=0; column<ofdm.Nc; ++column)
+					{
+						const int type = (ofdm.ofdm_frame + row*ofdm.Nc + column)->type;
+						if(type == DATA) { data_bin_mask |= std::uint64_t{1} << column; ++data_cells; }
+						else if(type == PILOT) { pilot_bin_mask |= std::uint64_t{1} << column; ++pilot_cells; }
+					}
+				if(data_cells == data_container.nData
+				   && pilot_cells == ofdm.pilot_configurator.nPilots)
+					rro::Telemetry::instance().record_carrier_bin_handoff(
+						data_bin_mask, pilot_bin_mask, ofdm.Nc,
+						data_cells, pilot_cells, current_configuration);
+			}
+			// These are the actual final soft bits handed toward LDPC. Measure
+			// the demapper-order input after CSI weighting, once deinterleaving
+			// has completed; its active prefix excludes the MFSK puncture tail.
+			// Deinterleaving reorders values but does not change this summary.
+			if(rro::Telemetry::instance().enabled() && rro_demapper_llr_count > 0
+			   && rro_demapper_llr_count <= data_container.nBits
+			   && data_container.demodulated_data != nullptr)
+			{
+				double absolute_sum = 0.0;
+				int weak_count = 0;
+				bool all_finite = true;
+				for(int bit=0; bit<rro_demapper_llr_count; ++bit)
+				{
+					const double llr = data_container.demodulated_data[bit];
+					if(!std::isfinite(llr)) { all_finite = false; break; }
+					const double magnitude = std::abs(llr);
+					absolute_sum += magnitude;
+					weak_count += magnitude < 1.0;
+				}
+				const int modulation_family = M == MOD_MFSK ? 2 : 1;
+				const int modulation_order = M == MOD_MFSK ? mfsk.M : M;
+				rro::Telemetry::instance().record_demapper_output(
+					modulation_family, modulation_order, rro_demapper_llr_count,
+					all_finite ? absolute_sum / rro_demapper_llr_count : -1.0,
+					all_finite ? (double)weak_count / rro_demapper_llr_count : -1.0,
+					true);
+			}
 
 			for(int i=ldpc.P-1;i>=0;i--)
 			{
@@ -4406,7 +4595,14 @@ skip_h_retry_point:
 			// EARLYTERM is independent and stays in effect for the primary decode.)
 			ldpc.early_term_speculative = false;
 			auto t5_ldpc = std::chrono::steady_clock::now();
-			timing_ldpc_ms += std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
+			const double initial_ldpc_duration_ms = std::chrono::duration<double, std::milli>(t5_ldpc - t4_ldpc).count();
+			timing_ldpc_ms += initial_ldpc_duration_ms;
+			if(rro::Telemetry::instance().enabled())
+				rro::Telemetry::instance().record_ldpc_decode_result(
+					receive_stats.iterations_done, ldpc.nIteration_max,
+					receive_stats.iterations_done >= 0
+						&& receive_stats.iterations_done < ldpc.nIteration_max,
+						initial_ldpc_duration_ms);
 
 			// ---- TURBO-EQ production refinement (RESEARCH_turbo-eq.md §4) ----------
 			// SIM-FIRST BOUNDARY: the MECHANISM (data-aided CE breaks the Dy=3 pilot
@@ -4514,6 +4710,15 @@ skip_h_retry_point:
 			receive_stats.crc=0;
 			if(outer_code == CRC16_MODBUS_RTU && receive_stats.all_zeros == NO)
 			{
+				receive_stats.crc_checked = true;
+				// A converged LDPC result reaches the CRC verifier even when its
+				// residual later fails. This is the LDPC -> CRC handoff, not the
+				// eventual frame-acceptance gate.
+				if(rro::Telemetry::instance().enabled()
+				   && receive_stats.iterations_done >= 0
+				   && receive_stats.iterations_done < ldpc.nIteration_max)
+					rro::Telemetry::instance().record_ldpc_codeword_handoff(
+						true, nReal_data, receive_stats.iterations_done);
 				receive_stats.crc=CRC16_MODBUS_RTU_calc(data_container.hd_decoded_data_byte, nReal_data/8);
 			}
 
@@ -4570,8 +4775,11 @@ skip_h_retry_point:
 						bit_to_byte(chase_rescue_bits.data(), chase_rescue_bytes.data(), nReal_data);
 						bool c_allzero = true;
 						for(int i=0;i<nReal_data/8;i++) if(chase_rescue_bytes[i]!=0){ c_allzero=false; break; }
-						int  c_crc = c_allzero ? 1 : (int)CRC16_MODBUS_RTU_calc(chase_rescue_bytes.data(), nReal_data/8);
 						bool c_converged = (c_iters <= (ldpc.nIteration_max - 1));
+						if(!c_allzero && c_converged && rro::Telemetry::instance().enabled())
+							rro::Telemetry::instance().record_ldpc_codeword_handoff(
+								true, nReal_data, c_iters);
+						int  c_crc = c_allzero ? 1 : (int)CRC16_MODBUS_RTU_calc(chase_rescue_bytes.data(), nReal_data/8);
 						if(!c_allzero && c_crc == 0 && c_converged)
 						{
 							// ADOPT: publish the rescued frame's bytes exactly as a native
@@ -4968,6 +5176,7 @@ skip_h_retry_point:
 				{
 					receive_stats.delay = retry.delay;
 					receive_stats.coarse_metric = retry.correlation;
+					rro::Telemetry::instance().record_acquisition_coarse_metric(retry.correlation);
 					pream_symb_loc = retry_symb;
 					receive_stats.sync_trials = 0;
 					skip_h_count = 0;
@@ -5087,6 +5296,18 @@ skip_h_retry_point:
 	// Update GUI with receive statistics
 	gui_update_receive_stats(receive_stats.SNR, receive_stats.signal_stregth_dbm, receive_stats.freq_offset);
 #endif
+	if(rro::Telemetry::instance().enabled())
+	{
+		if(M != MOD_MFSK && ofdm_forced_delay < 0
+		   && receive_stats.ofdm_preamble_detected
+		   && (receive_stats.message_decoded == YES
+		       || !receive_stats.frame_data_missing))
+			rro::Telemetry::instance().record_acquisition_transition(
+				receive_stats.message_decoded == YES ? 3 : 4,
+				(int)receive_stats.delay,
+				position_from_batch_predictor ? -1.0 : receive_stats.coarse_metric,
+				current_configuration);
+	}
 
 	return receive_stats;
 }
@@ -5414,6 +5635,7 @@ static inline bool recovery_ack_diag_enabled()
 double cl_telecom_system::detect_ack_pattern_from_passband(double* data, int size, int* out_matched, uint32_t* out_match_mask, bool use_fine)
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	// Fused mix + polyphase FIR + decimate: only the kept samples are computed,
 	// dropping the FIR portion ~M× vs the prior mix → FIR-at-high-rate → pick-every-Mth
@@ -5820,6 +6042,7 @@ float cl_telecom_system::detect_ack_snr_from_passband(double* data, int size,
 {
 	*out_snr_valid = false;
 	if(ack_pattern_passband_samples <= 0) return -99.0f;
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	// Polyphase decimated path: mix + FIR + decimate fused.
 	int M = data_container.interpolation_rate;
@@ -6713,6 +6936,7 @@ bool cl_telecom_system::decode_ack_sack_from_passband_soft(double* data, int siz
 	if (out_flips) *out_flips = -1;
 	if (!out_bsi || !out_bitmap || !crc12_fn) return false;
 	if (ack_mfsk.ack_sack_suffix_len() <= 0) return false;       // NB
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	int M = data_container.interpolation_rate;
 	int dec_size = size / M;
@@ -6808,6 +7032,7 @@ bool cl_telecom_system::decode_compact_confirm_from_passband(double* data, int s
 	if (!out_bsi || !crc12_fn) return false;
 	int suffix_n = ack_mfsk.compact_confirm_suffix_len();
 	if (suffix_n <= 0) return false;                              // NB
+	rro::CorrelatorWindow rro_ack_window(1);
 
 	int M = data_container.interpolation_rate;
 	int dec_size = size / M;
@@ -7045,6 +7270,7 @@ double cl_telecom_system::detect_hail_pattern_from_passband(double* data, int si
                                                             int suffix_start, int* out_suffix_matched)
 {
 	if(ack_pattern_passband_samples <= 0) return 0.0;
+	rro::CorrelatorWindow rro_hail_window(2);
 
 	int M = data_container.interpolation_rate;
 	double effective_carrier = carrier_frequency + last_coarse_freq_offset;
@@ -7765,6 +7991,8 @@ void cl_telecom_system::RX_RAND_process_main()
 
 		int rwi = data_container.ring_write_index;
 		memcpy(data_container.ready_to_process_passband_delayed_data, &data_container.passband_delayed_data[rwi], signal_period * sizeof(double));
+		if(signal_period > 0 && rro::Telemetry::instance().enabled())
+			rro::Telemetry::instance().record_capture_window_handoff(signal_period);
 
 		st_receive_stats received_message_stats = receive_byte(data_container.ready_to_process_passband_delayed_data, out_data);
 
@@ -7878,6 +8106,8 @@ void cl_telecom_system::RX_TEST_process_main()
 
 		int rwi = data_container.ring_write_index;
 		memcpy(data_container.ready_to_process_passband_delayed_data, &data_container.passband_delayed_data[rwi], signal_period * sizeof(double));
+		if(signal_period > 0 && rro::Telemetry::instance().enabled())
+			rro::Telemetry::instance().record_capture_window_handoff(signal_period);
 
 		st_receive_stats received_message_stats = receive_byte(data_container.ready_to_process_passband_delayed_data, out_data);
 
@@ -8092,6 +8322,8 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 
 		int rwi = data_container.ring_write_index;
 		memcpy(data_container.ready_to_process_passband_delayed_data, &data_container.passband_delayed_data[rwi], signal_period * sizeof(double));
+		if(signal_period > 0 && rro::Telemetry::instance().enabled())
+			rro::Telemetry::instance().record_capture_window_handoff(signal_period);
 
 		auto proc_start = std::chrono::steady_clock::now();
 		st_receive_stats received_message_stats = receive_byte(data_container.ready_to_process_passband_delayed_data, out_data);
@@ -8103,13 +8335,58 @@ void cl_telecom_system::RX_SHM_process_main(cbuf_handle_t buffer)
 		double frame_samples = (double)(data_container.Nofdm * (data_container.Nsymb + data_container.preamble_nSymb) * data_container.interpolation_rate);
 		double frame_ms = (frame_samples / 48000.0) * 1000.0;
 		float load = (frame_ms > 0) ? (float)(proc_ms / frame_ms) : 0.0f;
+		rro::Telemetry& rro_telemetry = rro::Telemetry::instance();
 
 #ifdef MERCURY_GUI_ENABLED
+		const size_t rro_buf_used = size_buffer(capture_buffer);
+		const size_t rro_buf_cap = circular_buf_capacity(capture_buffer);
 		g_gui_state.processing_load.store(load);
-		size_t buf_used = size_buffer(capture_buffer);
-		size_t buf_cap = circular_buf_capacity(capture_buffer);
-		g_gui_state.buffer_fill_pct.store(buf_cap > 0 ? 100.0f * (float)buf_used / (float)buf_cap : 0.0f);
+		g_gui_state.buffer_fill_pct.store(rro_buf_cap > 0
+			? 100.0f * (float)rro_buf_used / (float)rro_buf_cap : 0.0f);
+		if (rro_telemetry.enabled()) {
+			rro_telemetry.record_processing_load(load);
+			rro_telemetry.record_capture_ring(rro_buf_used, rro_buf_cap);
+			publish_rro_lattice_geometry();
+			rro_telemetry.record_receive_configuration(ofdm.Nfft, ldpc.nIteration_max);
+			if (M != MOD_MFSK)
+				rro_telemetry.record_ofdm_candidate(
+					received_message_stats.ofdm_preamble_detected);
+			if (received_message_stats.iterations_done >= 0)
+				rro_telemetry.record_ldpc_iterations(
+					received_message_stats.iterations_done);
+			if (received_message_stats.crc_checked)
+				rro_telemetry.record_crc_result(received_message_stats.crc == 0);
+		}
+#else
+		if (rro_telemetry.enabled()) {
+			rro_telemetry.record_processing_load(load);
+			rro_telemetry.record_capture_ring(size_buffer(capture_buffer),
+				circular_buf_capacity(capture_buffer));
+			publish_rro_lattice_geometry();
+			rro_telemetry.record_receive_configuration(ofdm.Nfft, ldpc.nIteration_max);
+			if (M != MOD_MFSK)
+				rro_telemetry.record_ofdm_candidate(
+					received_message_stats.ofdm_preamble_detected);
+			if (received_message_stats.iterations_done >= 0)
+				rro_telemetry.record_ldpc_iterations(
+					received_message_stats.iterations_done);
+			if (received_message_stats.crc_checked)
+				rro_telemetry.record_crc_result(received_message_stats.crc == 0);
+		}
 #endif
+
+		// This is the final outcome after all receive_byte timing, Turbo, and
+		// Chase rescue attempts. The v1 hook above remains the raw CRC check;
+		// this event is a distinct checked-frame acceptance decision.
+		if(rro_telemetry.enabled() && outer_code == CRC16_MODBUS_RTU
+		   && received_message_stats.crc_checked)
+		{
+			const bool accepted = received_message_stats.message_decoded == YES;
+			const int reason = accepted ? 0
+				: received_message_stats.crc != 0 ? 1
+				: received_message_stats.iterations_done > ldpc.nIteration_max ? 2 : 3;
+			rro_telemetry.record_crc_frame_outcome(accepted, reason);
+		}
 
 		if(received_message_stats.message_decoded == YES)
 		{
@@ -12614,6 +12891,7 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	                                       cw_ok, &acq_metric, ref);
 
 	receive_stats.coarse_metric = acq_metric;
+	rro::Telemetry::instance().record_acquisition_coarse_metric(acq_metric);
 	receive_stats.delay = 0;
 	// HEAP-OVERRUN ROOT-CAUSE FIX (fact-doc §13): the decode already landed in the
 	// dedicated bigblock_rx_infobits member (the ARQ carve reads from THERE, not `out`).
@@ -12649,6 +12927,7 @@ st_receive_stats cl_telecom_system::receive_bigblock(double* data, int* out)
 	// ACK whose bitmap = cw_ok (one bad codeword does NOT fail the block).
 	receive_stats.message_decoded = (Kout>0 && cw_ok_count==Kout) ? YES : NO;
 	receive_stats.coarse_metric = acq_metric;
+	rro::Telemetry::instance().record_acquisition_coarse_metric(acq_metric);
 	receive_stats.iterations_done = -1;
 	return receive_stats;
 }

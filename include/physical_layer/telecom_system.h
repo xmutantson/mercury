@@ -113,6 +113,7 @@ struct st_receive_stats{
 	double signal_stregth_dbm = 0.0;
 	st_power_measurment power_measurment = {};
 	int crc = 0;
+	bool crc_checked = false;  // true only when the outer CRC was actually evaluated
 	int all_zeros = 0;
 	int mfsk_search_raw = 0;  // MFSK anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
 	int ofdm_search_raw = 0;  // OFDM anti-re-decode: base search position (symbol units, pre-nUnder adjustment)
@@ -636,6 +637,9 @@ public:
 
 	void transmit_byte(int* data, int nBytes, double *out, int message_location);
 	st_receive_stats receive_byte(double *data, int* out);
+	// Publish the selected OFDM grid's unique carrier-column roles to RRO.
+	// This is configured geometry, never a claim that a transform executed.
+	void publish_rro_lattice_geometry() const;
 
 	// P1 ACQ BAND-EXCLUSION decision (data-flow-linkphase-break-storm.md §5 P1).
 	// Extracted from receive_byte()'s sub-peak reject branch so the deterministic

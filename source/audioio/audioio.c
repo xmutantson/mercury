@@ -51,6 +51,28 @@
 #include "common/os_interop.h"
 #include "common/sim_clock.h"
 
+// Opt-in RRO capture observations. These C-linkage hooks only update the
+// telemetry producer's atomics; they must never serialize or perform I/O on
+// the audio threads. Arrival is deliberately separate from FIFO admission:
+// a backpressured ring can delay admission without delaying device arrival.
+extern "C" {
+int mercury_rro_telemetry_enabled(void);
+void mercury_rro_audio_capture_arrived(uint64_t sample_count, uint64_t monotonic_ns);
+void mercury_rro_audio_capture_written(uint64_t sample_count, uint64_t monotonic_ns);
+void mercury_rro_audio_capture_read(uint64_t sample_count, uint64_t monotonic_ns);
+void mercury_rro_audio_capture_reset(uint64_t monotonic_ns);
+void mercury_rro_audio_capture_cursor(uint64_t head_samples,
+	uint64_t tail_samples, uint64_t capacity_samples, int full,
+	uint64_t monotonic_ns);
+void mercury_rro_audio_input_state(int available, int simulated, uint64_t monotonic_ns);
+}
+
+static uint64_t audioio_rro_monotonic_ns(void)
+{
+	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // SIM channel backend (-x sim) socket headers. winsock2.h is pulled in by
 // os_interop.h on Windows; POSIX sockets on everything else.
 #if !defined(_WIN32)
@@ -167,6 +189,26 @@ static long tune_sample_index = 0;
 
 cbuf_handle_t capture_buffer;
 cbuf_handle_t playback_buffer;
+
+static void audioio_rro_capture_cursor_snapshot(void)
+{
+	// Called only by a thread that owns a live capture_buffer reference and
+	// only when RRO telemetry is enabled. The try-lock avoids introducing a
+	// new wait on the audio path. A busy ring simply leaves the last sample
+	// stale until the next successful write/read/reset observation.
+	struct circular_buf_cursor_snapshot cursor;
+	if(circular_buf_try_cursor_snapshot(capture_buffer, &cursor) != 0
+	   || cursor.capacity_bytes == 0
+	   || cursor.head_bytes % sizeof(double) != 0
+	   || cursor.tail_bytes % sizeof(double) != 0
+	   || cursor.capacity_bytes % sizeof(double) != 0)
+		return;
+	mercury_rro_audio_capture_cursor(
+		(uint64_t)(cursor.head_bytes / sizeof(double)),
+		(uint64_t)(cursor.tail_bytes / sizeof(double)),
+		(uint64_t)(cursor.capacity_bytes / sizeof(double)),
+		cursor.full ? 1 : 0, audioio_rro_monotonic_ns());
+}
 
 #if !defined(_WIN32)
 // Per-process-unique POSIX shared-memory base names for the audio rings.
@@ -1909,8 +1951,17 @@ int capture_causal_tag_guard_selftest(cl_telecom_system *telecom_system)
 int capture_write_samples(double *buffer, size_t len)
 {
 	if(capture_causal_tag_buffer == NULL || capture_telecom_system == NULL)
-		return write_buffer(capture_buffer, (uint8_t *)buffer,
+	{
+		const int result = write_buffer(capture_buffer, (uint8_t *)buffer,
 			len * sizeof(double));
+		if(result == 0 && len != 0 && mercury_rro_telemetry_enabled())
+		{
+			mercury_rro_audio_capture_written((uint64_t)len,
+				audioio_rro_monotonic_ns());
+			audioio_rro_capture_cursor_snapshot();
+		}
+		return result;
+	}
 
 	cl_data_container *dc = &capture_telecom_system->data_container;
 	const uint32_t generation = dc->start_ack_causal_generation.load();
@@ -1951,6 +2002,12 @@ int capture_write_samples(double *buffer, size_t len)
 			generation, deadline_ns, now_ns, source_guard_ns,
 			&capture_writer_seen_generation,
 			&capture_writer_causal_ready);
+	}
+	if(result == 0 && len != 0 && mercury_rro_telemetry_enabled())
+	{
+		mercury_rro_audio_capture_written((uint64_t)len,
+			audioio_rro_monotonic_ns());
+		audioio_rro_capture_cursor_snapshot();
 	}
 	return result;
 }
@@ -2131,6 +2188,14 @@ void capture_reset_samples(void)
 	circular_buf_reset(capture_buffer);
 	if(capture_causal_tag_buffer != NULL)
 		circular_buf_reset(capture_causal_tag_buffer);
+	// A reset discards unread samples and rebases the physical FIFO cursors.
+	// It is not a read advance; consumers must not infer occupancy by simply
+	// subtracting cumulative successful writes and reads across this boundary.
+	if(mercury_rro_telemetry_enabled())
+	{
+		mercury_rro_audio_capture_reset(audioio_rro_monotonic_ns());
+		audioio_rro_capture_cursor_snapshot();
+	}
 	if(capture_telecom_system != NULL)
 	{
 		cl_data_container& dc = capture_telecom_system->data_container;
@@ -2314,6 +2379,8 @@ void *radio_capture_thread(void *device_ptr)
 	if(allocate_capture_internal_buffer(&buffer_internal) != 0)
 		goto cleanup_cap;
 	publish_audio_startup(true, AUDIO_START_READY);
+	if(mercury_rro_telemetry_enabled())
+		mercury_rro_audio_input_state(1, 0, audioio_rro_monotonic_ns());
 
 	// Determine input channel index (0-based)
 	// For multi-channel devices (>2ch), configured_input_channel is used directly as index.
@@ -2362,6 +2429,9 @@ void *radio_capture_thread(void *device_ptr)
 
 		int frames_read = r / frame_size;
 		int frames_to_write = frames_read;
+		if(frames_read > 0 && mercury_rro_telemetry_enabled())
+			mercury_rro_audio_capture_arrived((uint64_t)frames_read,
+					audioio_rro_monotonic_ns());
 
 		// Deliver-rate: accumulate frames and periodically report rate.
 		// Tag is [RX-DELIVER-RATE] — consumer-deliver-rate vs wall, NOT the
@@ -2561,6 +2631,8 @@ cleanup_cap:
     audio->uninit();
 
 finish_cap:
+	if(mercury_rro_telemetry_enabled())
+		mercury_rro_audio_input_state(0, 0, audioio_rro_monotonic_ns());
 
 #if defined(_WIN32)
 	// Free DirectSound GUID if allocated
@@ -3303,6 +3375,7 @@ void *sim_rx_bridge_thread(void *unused)
 	// the whole run — a mid-run flip would desync the 8-byte framing.
 	const int wire_stamp = sim_clock_wire_stamp();
 	int       first_chunk = 1;
+	bool      rro_first_chunk = true;
 	const char *backpressure_env =
 		getenv("MERCURY_SIM_RX_BACKPRESSURE");
 	const int lossless_backpressure = backpressure_env != NULL
@@ -3325,6 +3398,14 @@ void *sim_rx_bridge_thread(void *unused)
 			printf("[SIM] RX bridge recv failed (relay closed?)\n");
 			break;
 		}
+		if(rro_first_chunk) {
+			if(mercury_rro_telemetry_enabled())
+				mercury_rro_audio_input_state(1, 1, audioio_rro_monotonic_ns());
+			rro_first_chunk = false;
+		}
+		if(mercury_rro_telemetry_enabled())
+			mercury_rro_audio_capture_arrived((uint64_t)SIM_CHUNK_SAMPLES,
+				audioio_rro_monotonic_ns());
 		if (wire_stamp) {
 			stamp = (uint64_t)stamp_buf[0]        | ((uint64_t)stamp_buf[1] << 8)
 			      | ((uint64_t)stamp_buf[2] << 16) | ((uint64_t)stamp_buf[3] << 24)
@@ -3372,6 +3453,8 @@ void *sim_rx_bridge_thread(void *unused)
 					lossless_backpressure)) != 0)
 			break;
 	}
+	if(mercury_rro_telemetry_enabled())
+		mercury_rro_audio_input_state(0, 1, audioio_rro_monotonic_ns());
 	free(chunk);
 	return NULL;
 }
@@ -3444,6 +3527,12 @@ int rx_transfer_with_causal_tags(double *buffer, uint32_t *tags, size_t len)
 			return -1;
 		if(tags != NULL)
 			memset(tags, 0, len * sizeof(uint32_t));
+	}
+	if(len != 0 && mercury_rro_telemetry_enabled())
+	{
+		mercury_rro_audio_capture_read((uint64_t)len,
+			audioio_rro_monotonic_ns());
+		audioio_rro_capture_cursor_snapshot();
 	}
 
 	// SIM virtual clock: every double the modem pulls off the RX boundary is

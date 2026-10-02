@@ -68,6 +68,7 @@ Options:
   --robust          pass -R (start in robust tier; default on for start-cfg>=100)
   --compress on|off (default off, so we read RAW PHY gearshift behavior)
   --payload PATH    TX payload file (default payload_incompressible_64k.bin)
+  --log PATH        UTF-8 modem source log (default <mercury-repo>/sim_arq_channel.log)
   --json PATH       write a machine-readable result summary
 
 NOTE: ports are AUTO-PICKED at startup (a free control/data quad {base, base+1,
@@ -324,6 +325,26 @@ def pick_free_ports(ctrl_base=None, relay_pref=None, tries=PORT_PICK_TRIES):
     return (*quad, relay_port)
 
 
+def require_free_ports(ports):
+    """Reject occupied QA ports without discovering or terminating their owners."""
+    for port in ports:
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"QA port is outside 1..65535: {port}")
+        if not _port_free(port):
+            raise RuntimeError(f"QA port {port} is occupied; refusing to clear it")
+
+
+def pick_owned_run_ports(ctrl_base=None, relay_pref=None):
+    """Use exactly the requested QA ports, never auto-advance or pre-kill."""
+    base = DEFAULT_CTRL_BASE if ctrl_base is None else ctrl_base
+    relay = DEFAULT_RELAY_PORT if relay_pref is None else relay_pref
+    ports = (base, base + 1, base + 4, base + 5, relay)
+    if len(set(ports)) != len(ports):
+        raise RuntimeError("QA relay and control/data ports overlap")
+    require_free_ports(ports)
+    return ports
+
+
 def _pids_on_ports(ports):
     """Return the set of PIDs holding (LISTENING/ESTABLISHED on) any of `ports`,
     parsed from `netstat -ano` (Windows). Used for PORT-SCOPED teardown so we
@@ -362,6 +383,79 @@ def kill_port_scoped(ports, my_pids):
             pass
 
 
+class WallTimeout(TimeoutError):
+    pass
+
+
+class WallDeadline:
+    """Optional monotonic QA deadline, including startup and socket retries."""
+    def __init__(self, seconds=None):
+        self.expires_at = (None if seconds is None
+                           else time.monotonic() + seconds)
+
+    def remaining(self):
+        if self.expires_at is None:
+            return None
+        remaining = self.expires_at - time.monotonic()
+        if remaining <= 0:
+            raise WallTimeout("QA wall-time deadline reached")
+        return remaining
+
+    def socket_timeout(self, maximum):
+        remaining = self.remaining()
+        return maximum if remaining is None else min(maximum, remaining)
+
+    def connect(self, sock, address):
+        sock.settimeout(self.socket_timeout(CONNECT_TIMEOUT_S))
+        try:
+            sock.connect(address)
+        except OSError:
+            self.remaining()
+            raise
+
+    def pause(self, seconds):
+        time.sleep(self.socket_timeout(seconds))
+        self.remaining()
+
+
+class OwnedProcessHandles:
+    """Retain actual Popen handles; no port discovery or PID-based termination."""
+    def __init__(self, stop):
+        self.stop = stop
+        self.lock = threading.Lock()
+        self.processes = []
+        self.expired = False
+
+    def retain(self, process):
+        with self.lock:
+            self.processes.append(process)
+            expired = self.expired
+        if expired:
+            self._kill(process)
+            raise WallTimeout("QA wall-time deadline reached during launch")
+        return process
+
+    @staticmethod
+    def _kill(process):
+        try:
+            if process.poll() is None:
+                process.kill()
+        except OSError:
+            pass
+
+    def kill_all(self):
+        with self.lock:
+            processes = tuple(self.processes)
+        for process in processes:
+            self._kill(process)
+
+    def expire(self):
+        with self.lock:
+            self.expired = True
+        self.stop.set()
+        self.kill_all()
+
+
 class State:
     def __init__(self):
         self.switch_seq = []      # list of config ids in order
@@ -382,6 +476,20 @@ class State:
         # peer adopted; both must be set (and near 0) under --wire-stamp 1, else
         # the modem never parsed a stamp (stale/non-stamp binary vs stamped relay).
         self.first_vstamp = {"CMD": None, "RSP": None}
+
+
+def print_log_diagnostic(message):
+    """A restricted or closed terminal must not abandon a modem's stdout pipe."""
+    try:
+        print(message, flush=True)
+    except UnicodeError:
+        try:
+            print(message.encode("ascii", "backslashreplace").decode("ascii"),
+                  flush=True)
+        except (ValueError, OSError):
+            pass
+    except (ValueError, OSError):
+        pass
 
 
 def log_output(proc, label, logfile, t0, st):
@@ -415,8 +523,8 @@ def log_output(proc, label, logfile, t0, st):
                     with st.lock:
                         if not st.switch_seq or st.switch_seq[-1] != cid:
                             st.switch_seq.append(cid)
-                            print(f"[T+{time.time()-t0:7.1f}] CONFIG -> {cfg_name(cid)}")
-                            sys.stdout.flush()
+                            print_log_diagnostic(
+                                f"[T+{time.time()-t0:7.1f}] CONFIG -> {cfg_name(cid)}")
                 mr = CMD_RETX_RE.search(text)
                 if mr:
                     with st.lock:
@@ -458,24 +566,34 @@ CONNECT_TIMEOUT_S = 30.0          # startup connect (retry loop also present)
 TX_SOCK_TIMEOUT_S = 120.0         # TX-FIFO push: generous; timeout -> RETRY not die
 
 
-def tcp_send(port, commands, label, retries=20, delay=1.0):
+def tcp_send(port, commands, label, retries=20, delay=1.0, deadline=None):
+    deadline = deadline or WallDeadline()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(CONNECT_TIMEOUT_S)
-    for attempt in range(retries):
-        try:
-            sock.connect(("127.0.0.1", port))
-            break
-        except (ConnectionRefusedError, OSError):
-            if attempt == retries - 1:
+    try:
+        for attempt in range(retries):
+            sock.settimeout(deadline.socket_timeout(CONNECT_TIMEOUT_S))
+            try:
+                sock.connect(("127.0.0.1", port))
+                break
+            except (ConnectionRefusedError, OSError):
+                deadline.remaining()
+                if attempt == retries - 1:
+                    raise
+                deadline.pause(delay)
+                sock.close()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        for c in commands:
+            sock.settimeout(deadline.socket_timeout(CONNECT_TIMEOUT_S))
+            try:
+                sock.sendall(c.encode())
+            except OSError:
+                deadline.remaining()
                 raise
-            time.sleep(delay)
-            sock.close()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(CONNECT_TIMEOUT_S)
-    for c in commands:
-        sock.sendall(c.encode())
-        time.sleep(0.3)
-    return sock
+            deadline.pause(0.3)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
 
 
 def tx_thread_fn(sock, stop, res, payload, st):
@@ -569,9 +687,77 @@ def resolve_connect_policy(start_cfg, no_gearshift, wire_stamp):
     effective_wire_stamp = int(pinned) if wire_stamp is None else int(wire_stamp)
     return connect_fast_config, effective_wire_stamp, wire_stamp_auto
 
+
+def rro_telemetry_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "RRO telemetry port must be an integer from 1 to 65535")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            "RRO telemetry port must be an integer from 1 to 65535")
+    return port
+
+
+def add_rro_telemetry_arguments(parser):
+    parser.add_argument(
+        "--rro-telemetry-peer", choices=("A", "B"), default=None,
+        help="enable RRO only for A (commander) or B (responder), explicitly "
+             "disabling the other peer. Unset preserves inherited settings.")
+    parser.add_argument(
+        "--rro-telemetry-port", type=rro_telemetry_port, default=38429,
+        help="selected peer's loopback RRO UDP port (1..65535; default 38429)")
+    parser.add_argument(
+        "--rro-telemetry-version", type=int, choices=(1, 2), default=2,
+        help="selected peer's RRO schema version (default 2)")
+
+
+def wall_timeout_seconds(value):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("QA wall timeout must be >0 and <=600 seconds")
+    if not 0 < seconds <= 600:
+        raise argparse.ArgumentTypeError("QA wall timeout must be >0 and <=600 seconds")
+    return seconds
+
+
+def add_qa_safety_arguments(parser):
+    parser.add_argument(
+        "--owned-process-cleanup-only", action="store_true",
+        help="QA-only: reject occupied requested ports and terminate only the "
+             "Popen handles created by this run, never discovered port owners")
+    parser.add_argument(
+        "--wall-timeout-secs", type=wall_timeout_seconds, default=None,
+        help="QA-only monotonic wall deadline including process startup (>0..600); "
+             "requires --owned-process-cleanup-only. Unset preserves virtual scheduling.")
+
+
+def peer_telemetry_environment(inherited, role, selected_peer=None,
+                               port=38429, version=2):
+    """Copy the launch environment without mixing the two telemetry sources."""
+    if role not in ("A", "B") or selected_peer not in (None, "A", "B"):
+        raise ValueError("RRO telemetry peer must be A or B")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("RRO telemetry port must be an integer from 1 to 65535")
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("RRO telemetry version must be 1 or 2")
+    env = dict(inherited)
+    if selected_peer is None:
+        return env
+    env["MERCURY_RRO_TELEMETRY"] = "1" if role == selected_peer else "0"
+    if role == selected_peer:
+        env["MERCURY_RRO_TELEMETRY_VERSION"] = str(version)
+        env["MERCURY_RRO_UDP_PORT"] = str(port)
+    return env
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=DEFAULT_BIN)
+    add_rro_telemetry_arguments(ap)
+    add_qa_safety_arguments(ap)
     ap.add_argument("--snr", type=float, default=12.0,
                     help="channel SNR3k in dB (referenced to 3 kHz). "
                          "Overridden by --cell.")
@@ -713,8 +899,12 @@ def main():
                          "--no-gearshift pinned session (shared-clock CONNECT "
                          "correctness), otherwise 0 (historical bare wire). "
                          "Explicit 0 retains the diagnostic/compatibility path.")
+    ap.add_argument("--log", default=os.path.join(MERCURY_ROOT, "sim_arq_channel.log"),
+                    help="UTF-8 modem source log path (parent directory must exist)")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
+    if args.wall_timeout_secs is not None and not args.owned_process_cleanup_only:
+        ap.error("--wall-timeout-secs requires --owned-process-cleanup-only")
 
     (pin_connect_fast_config,
      args.wire_stamp,
@@ -732,7 +922,9 @@ def main():
     # --ctrl-base pins it for deterministic re-runs.
     global RSP_PORT, CMD_PORT
     try:
-        RSP_PORT, _rsp_data, CMD_PORT, _cmd_data, relay_port = pick_free_ports(
+        port_picker = (pick_owned_run_ports if args.owned_process_cleanup_only
+                       else pick_free_ports)
+        RSP_PORT, _rsp_data, CMD_PORT, _cmd_data, relay_port = port_picker(
             ctrl_base=args.ctrl_base, relay_pref=args.port)
     except RuntimeError as e:
         print(f"FATAL: {e}", file=sys.stderr)
@@ -778,6 +970,11 @@ def main():
               f"CONNECT_FAST=CONFIG_{pin_connect_fast_config} "
               f"wire_stamp={args.wire_stamp}"
               f"{' (auto)' if wire_stamp_auto else ' (explicit)'}")
+    if args.rro_telemetry_peer is not None:
+        print(f"RRO telemetry     : peer={args.rro_telemetry_peer} "
+              f"version={args.rro_telemetry_version} "
+              f"destination=127.0.0.1:{args.rro_telemetry_port}; "
+              "other peer disabled")
     print(f"payload={args.payload} ({len(payload)} bytes, md5={payload_md5})\n")
 
     # PORT-SCOPED pre-clean: kill only whatever lingers on OUR auto-picked ports
@@ -785,10 +982,13 @@ def main():
     # — a concurrent bench experiment on different ports must survive. The picker
     # already verified the quad was free, so this is normally a no-op; it catches
     # a TIME_WAIT/zombie that grabbed a port between probe and launch.
-    kill_port_scoped(my_ports, [])
-    time.sleep(1)
+    if args.owned_process_cleanup_only:
+        require_free_ports(my_ports)
+    else:
+        kill_port_scoped(my_ports, [])
+        time.sleep(1)
 
-    logfile = open(os.path.join(MERCURY_ROOT, "sim_arq_channel.log"), "w")
+    logfile = open(args.log, "w", encoding="utf-8")
     # CONNECT-DWELL FIX (CONNECT_UNDER_RT_ROOTCAUSE §6.1): the relay log is the
     # SOLE virtual-clock source (read_relay_virtual_seconds). It was a FIXED shared
     # path with NO pre-clean, so:
@@ -820,6 +1020,12 @@ def main():
     st = State()
     procs, sockets = [], []
     stop = threading.Event()
+    owned = OwnedProcessHandles(stop)
+    deadline = WallDeadline(args.wall_timeout_secs)
+    watchdog = (None if args.wall_timeout_secs is None else threading.Timer(
+        deadline.remaining(), owned.expire))
+    if watchdog is not None:
+        watchdog.daemon = True
     t0 = time.time()
     relay = None
     # Run-bound bookkeeping (hoisted so they exist even if launch raises before
@@ -867,18 +1073,26 @@ def main():
         return c
 
     def launch(port, role):
-        env = dict(os.environ)
+        deadline.remaining()
+        if args.owned_process_cleanup_only:
+            require_free_ports((port, port + 1))
+        env = peer_telemetry_environment(
+            os.environ, role, args.rro_telemetry_peer,
+            args.rro_telemetry_port, args.rro_telemetry_version)
         env["MERCURY_SIM_PORT"] = str(args.port)
         env["MERCURY_SIM_ROLE"] = role
         if pin_connect_fast_config is not None:
             # THE PIN RULE: do not inherit CONFIG_0 (or a stale ambient value)
             # as a second controlling coordinate for a fixed-config session.
             env["MERCURY_CONNECT_FAST_CONFIG"] = str(pin_connect_fast_config)
-        return subprocess.Popen(base_cmd(port, role), env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        return owned.retain(subprocess.Popen(
+            base_cmd(port, role), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT))
 
     res = {"tx": 0, "rx": 0, "tx_md5_hex": "", "recv_md5_hex": ""}
     try:
+        if watchdog is not None:
+            watchdog.start()
         # 1. relay first so the peers can connect immediately.
         relay_cmd = [sys.executable, RELAY, "--port", str(args.port),
                      # --seed and --relay-seed are unified onto args.relay_seed
@@ -910,41 +1124,44 @@ def main():
             relay_cmd += ["--snr-schedule", args.snr_schedule]
         if args.burst:
             relay_cmd.append("--burst")
-        relay = subprocess.Popen(relay_cmd)
-        time.sleep(1.0)
+        deadline.remaining()
+        if args.owned_process_cleanup_only:
+            require_free_ports((args.port,))
+        relay = owned.retain(subprocess.Popen(relay_cmd))
+        deadline.pause(1.0)
 
         # 2. responder (role B), then commander (role A).
         rsp = launch(RSP_PORT, "B")
         procs.append(rsp)
         threading.Thread(target=log_output, args=(rsp, "RSP", logfile, t0, st),
                          daemon=True).start()
-        time.sleep(3)
+        deadline.pause(3)
         cmd = launch(CMD_PORT, "A")
         procs.append(cmd)
         threading.Thread(target=log_output, args=(cmd, "CMD", logfile, t0, st),
                          daemon=True).start()
-        time.sleep(3)
+        deadline.pause(3)
 
         # 3. control + data sockets.
-        rsp_ctrl = tcp_send(RSP_PORT, ["MYCALL TESTB\r\n", "LISTEN ON\r\n"], "RSP")
+        rsp_ctrl = tcp_send(RSP_PORT, ["MYCALL TESTB\r\n", "LISTEN ON\r\n"],
+                            "RSP", deadline=deadline)
         sockets.append(rsp_ctrl)
-        time.sleep(1)
+        deadline.pause(1)
 
         cmd_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        cmd_data.settimeout(CONNECT_TIMEOUT_S)   # load-tolerant connect
-        cmd_data.connect(("127.0.0.1", CMD_PORT + 1))
         sockets.append(cmd_data)
+        deadline.connect(cmd_data, ("127.0.0.1", CMD_PORT + 1))
         rsp_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        rsp_data.settimeout(CONNECT_TIMEOUT_S)   # load-tolerant connect
-        rsp_data.connect(("127.0.0.1", RSP_PORT + 1))
         sockets.append(rsp_data)
+        deadline.connect(rsp_data, ("127.0.0.1", RSP_PORT + 1))
         threading.Thread(target=tx_thread_fn, args=(cmd_data, stop, res, payload, st),
                          daemon=True).start()
-        time.sleep(1)
+        deadline.pause(1)
         threading.Thread(target=rx_thread_fn, args=(rsp_data, stop, res),
                          daemon=True).start()
 
-        cmd_ctrl = tcp_send(CMD_PORT, ["MYCALL TESTA\r\n", "CONNECT TESTA TESTB\r\n"], "CMD")
+        cmd_ctrl = tcp_send(CMD_PORT, ["MYCALL TESTA\r\n", "CONNECT TESTA TESTB\r\n"],
+                            "CMD", deadline=deadline)
         sockets.append(cmd_ctrl)
 
         # ============================================================
@@ -988,7 +1205,7 @@ def main():
         last_vadvance_real = time.time()
         last_report_v = 0.0
         while not dead:
-            time.sleep(1)
+            deadline.pause(1)
             now = time.time()
             real_elapsed = now - start
 
@@ -1076,41 +1293,47 @@ def main():
                       f"rx={res['rx']}B cfg={cfg_name(st.switch_seq[-1]) if st.switch_seq else '-'} "
                       f"{phase}")
                 sys.stdout.flush()
+    except WallTimeout:
+        bounded_by = "wall_timeout"
+        print(f"[BOUND][QA] wall deadline {args.wall_timeout_secs}s reached")
     except KeyboardInterrupt:
         pass
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         stop.set()
         for s in sockets:
             try:
                 s.close()
             except OSError:
                 pass
-        spawned_pids = []
-        for p in procs:
-            spawned_pids.append(p.pid)
-            try:
-                p.kill()
-            except OSError:
-                pass
-        if relay:
-            spawned_pids.append(relay.pid)
-            # GAP #1: give the relay a moment to notice its peer sockets closed
-            # (its readers hit "source closed" -> stop.set() -> graceful shutdown,
-            # which writes the airtime-json + 'relay done' line) BEFORE the hard
-            # terminate(), which would skip that emit. The mercury procs were just
-            # killed above, so the relay's source is already gone.
-            try:
-                relay.wait(timeout=3)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            try:
-                relay.terminate()
-            except OSError:
-                pass
-        # PORT-SCOPED teardown: kill our spawned PIDs + anything still holding our
-        # auto-picked ports. NEVER a /IM mercury.exe sweep — the BK8/sibling bench
-        # run shares this machine on different ports and must not be touched.
-        kill_port_scoped(my_ports, spawned_pids)
+        if args.owned_process_cleanup_only:
+            owned.kill_all()
+        else:
+            spawned_pids = []
+            for p in procs:
+                spawned_pids.append(p.pid)
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+            if relay:
+                spawned_pids.append(relay.pid)
+                # GAP #1: give the relay a moment to notice its peer sockets closed
+                # (its readers hit "source closed" -> stop.set() -> graceful shutdown,
+                # which writes the airtime-json + 'relay done' line) BEFORE the hard
+                # terminate(), which would skip that emit. The mercury procs were just
+                # killed above, so the relay's source is already gone.
+                try:
+                    relay.wait(timeout=3)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                try:
+                    relay.terminate()
+                except OSError:
+                    pass
+            # Legacy PORT-SCOPED teardown remains unchanged unless QA mode is chosen.
+            kill_port_scoped(my_ports, spawned_pids)
         logfile.close()
 
     # ---- delivered-byte md5 (I7) ----
@@ -1341,6 +1564,13 @@ def main():
                 "wire_stamp_auto": wire_stamp_auto,
                 "no_gearshift": args.no_gearshift,
                 "pin_connect_fast_config": pin_connect_fast_config,
+                **({"rro_telemetry_peer": args.rro_telemetry_peer,
+                    "rro_telemetry_port": args.rro_telemetry_port,
+                    "rro_telemetry_version": args.rro_telemetry_version}
+                   if args.rro_telemetry_peer else {}),
+                **({"owned_process_cleanup_only": True,
+                    "wall_timeout_secs": args.wall_timeout_secs}
+                   if args.owned_process_cleanup_only else {}),
                 # GAP #1: HW-representative per-frame CHANNEL wire rate (rx*8 /
                 # delivering-direction frame-airtime). Undiluted by climb ramp /
                 # idle / setup. Reconciles with the modem rbc + HW. None if the

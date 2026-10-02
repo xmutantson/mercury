@@ -470,6 +470,8 @@ needs_rebuild() {
         # .d file lists obj: src header1 header2 ...
         # Check if any dependency is newer than obj
         while IFS= read -r line; do
+            # MinGW dependency files may be CRLF; normalize before token parsing.
+            line="${line%$'\r'}"
             # Remove backslash continuations and the target prefix
             line="${line%\\}"
             line="${line#*: }"
@@ -570,6 +572,7 @@ source/physical_layer/mfsk_ctrl_codec_tests.cc
 source/physical_layer/nb_cfo_correction_test.cc
 source/physical_layer/telecom_system.cc
 source/common/os_interop.cc
+source/common/rro_telemetry.cc
 source/common/ring_buffer_posix.cc
 source/common/shm_posix.cc
 source/common/sim_clock.cc

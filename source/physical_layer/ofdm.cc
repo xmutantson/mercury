@@ -22,8 +22,10 @@
 
 #include "common/os_interop.h"
 #include "physical_layer/ofdm.h"
+#include "common/rro_telemetry.h"
 #include "debug/canary_guard.h"
 #include <algorithm>  // for std::swap in optimized FFT
+#include <chrono>   // opt-in RRO detector execution duration
 #include <vector>   // SPARSE-OFDM decimation overlay (env-gated)
 #include <cstdlib>  // SPARSE-OFDM: std::getenv/atoi
 
@@ -5294,6 +5296,13 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
                                    uint32_t* out_match_mask,
                                    bool always_fine, int combine_reps)
 {
+	// The same detector serves ACK, HAIL, and other control searches. The
+	// CorrelatorWindow at the call site selects the ACK/HAIL telemetry lane;
+	// this scope only reports what the detector actually executed and scored.
+	const bool rro_enabled = rro::Telemetry::instance().enabled();
+	const auto rro_started = rro_enabled ? std::chrono::steady_clock::now()
+	                                    : std::chrono::steady_clock::time_point{};
+	std::uint64_t rro_fft_executions = 0;
 	int Nofdm = Nfft + Ngi;
 	int sym_period_interp = Nofdm * interpolation_rate;
 	int buffer_nsymb = buffer_size_interp / sym_period_interp;
@@ -5304,9 +5313,24 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	// reps=1 is the byte-identical single-block path. The window must hold all R
 	// reps + reserve_after.
 	if (combine_reps < 1) combine_reps = 1;
+	const bool memo_configured =
+		(detect_memo_force >= 0 ? (detect_memo_force != 0) : detect_fft_memo_enabled());
+	const bool memo_on = combine_reps == 1 && memo_configured;
+	rro::Telemetry::instance().record_correlator_invocation(memo_configured);
 	int rep_stride_sym = ack_nsymb;                 // one base block, in symbols
 	int total_needed = combine_reps * ack_nsymb + reserve_after;
-	if (buffer_nsymb < total_needed) return 0.0;
+	if (buffer_nsymb < total_needed)
+	{
+		if (rro_enabled)
+		{
+			const auto elapsed = std::chrono::steady_clock::now() - rro_started;
+			rro::Telemetry::instance().record_correlator_detection(
+				0, static_cast<std::uint64_t>(
+					std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+				0.0, 0, ack_nsymb, false);
+		}
+		return 0.0;
+	}
 
 	std::complex<double>* decimated_sym = work_buf_a;
 	std::complex<double>* fft_out = work_buf_b;
@@ -5332,6 +5356,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			for (int i = 0; i < Nfft; i++)
 				decimated_sym[i] = baseband_interp[off + i * interpolation_rate];
 			fft(decimated_sym, fft_out, Nfft);
+			++rro_fft_executions;
 			for (int b = 0; b < Nfft; b++)
 				pow[b] += fft_out[b].real() * fft_out[b].real() +
 				          fft_out[b].imag() * fft_out[b].imag();
@@ -5369,9 +5394,8 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 	// matched-count / metric / best_offset and the detect decision are unchanged.
 	// Only the reps==1 path is memoized (the default ACK/HAIL/BREAK poll); the
 	// reps>1 recovery-combining path and the fine (sub-symbol) pass are untouched.
-	const bool memo_on = (combine_reps == 1) &&
-		(detect_memo_force >= 0 ? (detect_memo_force != 0) : detect_fft_memo_enabled());
 	int memo_max_sym = -1;
+	std::uint64_t memo_reads = 0;
 	if (memo_on)
 	{
 		// Highest absolute symbol index the coarse loop can reach whose full FFT
@@ -5392,6 +5416,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			for (int i = 0; i < Nfft; i++)
 				decimated_sym[i] = baseband_interp[off + i * interpolation_rate];
 			fft(decimated_sym, fft_out, Nfft);
+			++rro_fft_executions;
 			detect_ack_fft_count++;
 			double* row = detect_memo_pow + (size_t)j * Nfft;
 			for (int b = 0; b < Nfft; b++)
@@ -5427,12 +5452,14 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			{
 				// per-symbol |FFT|^2 already cached in detect_memo_pow above
 				// (byte-identical to the inline FFT); psp() reads the cache row.
+				++memo_reads;
 			}
 			else
 			{
 				for (int i = 0; i < Nfft; i++)
 					decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 				fft(decimated_sym, fft_out, Nfft);
+				++rro_fft_executions;
 				detect_ack_fft_count++;
 			}
 			auto psp = [&](int b) -> double {
@@ -5532,6 +5559,9 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 			best_match_mask = match_mask;
 		}
 	}
+	if (memo_on && memo_reads > static_cast<std::uint64_t>(memo_max_sym + 1))
+		rro::Telemetry::instance().record_correlator_memo_reuses(
+			memo_reads - static_cast<std::uint64_t>(memo_max_sym + 1));
 
 	// Phase 2: Fine timing refinement (Bug #39).
 	// The coarse search at symbol-period steps can be off by up to ±Nofdm/2
@@ -5600,6 +5630,7 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 					for (int i = 0; i < Nfft; i++)
 						decimated_sym[i] = baseband_interp[offset + i * interpolation_rate];
 					fft(decimated_sym, fft_out, Nfft);
+					++rro_fft_executions;
 				}
 				auto psp = [&](int b) -> double {
 					if (combine_reps > 1) return pow_accum[b];
@@ -5693,6 +5724,14 @@ double cl_ofdm::detect_ack_pattern(std::complex<double>* baseband_interp, int bu
 		*out_best_offset = best_pos;  // interpolated sample offset (-1 if not found)
 	if (out_match_mask)
 		*out_match_mask = best_match_mask;
+	if (rro_enabled)
+	{
+		const auto elapsed = std::chrono::steady_clock::now() - rro_started;
+		rro::Telemetry::instance().record_correlator_detection(
+			rro_fft_executions, static_cast<std::uint64_t>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+			best_metric, best_matched, ack_nsymb, true);
+	}
 
 	return best_metric;
 }
