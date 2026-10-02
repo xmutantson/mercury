@@ -470,6 +470,8 @@ needs_rebuild() {
         # .d file lists obj: src header1 header2 ...
         # Check if any dependency is newer than obj
         while IFS= read -r line; do
+            # MinGW dependency files may be CRLF; normalize before token parsing.
+            line="${line%$'\r'}"
             # Remove backslash continuations and the target prefix
             line="${line%\\}"
             line="${line#*: }"
