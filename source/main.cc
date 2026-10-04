@@ -177,6 +177,8 @@ static void* tee_thread_func(void* arg) {
 #endif
 }
 
+static void shutdown_tee_logging();
+
 static void setup_tee_logging(const char* path, int argc, char* argv[]) {
     g_log_file = fopen(path, "w");
     if (!g_log_file) {
@@ -216,24 +218,58 @@ static void setup_tee_logging(const char* path, int argc, char* argv[]) {
 #ifdef _WIN32
     g_tee_thread = CreateThread(NULL, 0, tee_thread_func, NULL, 0, NULL);
 #else
-    pthread_create(&g_tee_thread, NULL, tee_thread_func, NULL);
-    g_tee_thread_created = true;
+    g_tee_thread_created = pthread_create(&g_tee_thread, NULL, tee_thread_func, NULL) == 0;
 #endif
+    // exit() and a return from main skip the explicit shutdown on most paths;
+    // drain the pipe into the log on every one of them (the call is idempotent).
+    static bool drain_registered = false;
+    if (!drain_registered) {
+        atexit(shutdown_tee_logging);
+        drain_registered = true;
+    }
 }
 
 static void shutdown_tee_logging() {
     if (g_saved_stdout_fd < 0) return;
+    const int saved_fd = g_saved_stdout_fd;
     fflush(stdout);
-    // Restore original stdout — closes pipe write end, reader gets EOF
-    DUP2_FD(g_saved_stdout_fd, 1);
-    CLOSE_FD(g_saved_stdout_fd);
-    g_saved_stdout_fd = -1;
-    // Wait for reader thread to finish
+    // Restore original stdout: this closes the last pipe write end, so the
+    // reader drains what is left and then sees EOF. The reader writes its
+    // console copy through saved_fd, so that descriptor stays open until the
+    // reader is done.
+    DUP2_FD(saved_fd, 1);
+    bool reader_done = true;
 #ifdef _WIN32
-    if (g_tee_thread) { WaitForSingleObject(g_tee_thread, 5000); CloseHandle(g_tee_thread); g_tee_thread = NULL; }
+    if (g_tee_thread) {
+        reader_done = WaitForSingleObject(g_tee_thread, 5000) == WAIT_OBJECT_0;
+        CloseHandle(g_tee_thread);
+        g_tee_thread = NULL;
+    }
 #else
-    if (g_tee_thread_created) { pthread_join(g_tee_thread, NULL); g_tee_thread_created = false; }
+    if (g_tee_thread_created) {
+#if defined(__GLIBC__)
+        // Bounded like the Windows wait: a child process holding the pipe
+        // write end open must not hold process exit open.
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 5;
+        if (pthread_timedjoin_np(g_tee_thread, NULL, &deadline) != 0) {
+            pthread_detach(g_tee_thread);
+            reader_done = false;
+        }
+#else
+        pthread_join(g_tee_thread, NULL);
 #endif
+        g_tee_thread_created = false;
+    }
+#endif
+    g_saved_stdout_fd = -1;
+    if (!reader_done) {
+        // The reader still owns its descriptors and the log file; the
+        // process is ending, so leave them to it.
+        return;
+    }
+    CLOSE_FD(saved_fd);
     if (g_pipe_read_fd >= 0) { CLOSE_FD(g_pipe_read_fd); g_pipe_read_fd = -1; }
     if (g_log_file) { fclose(g_log_file); g_log_file = NULL; }
 }
