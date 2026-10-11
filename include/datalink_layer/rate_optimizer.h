@@ -283,13 +283,13 @@ public:
     // naturally becomes inert when there are no calibrated cells.
     bool is_enabled() const { return enabled; }
     bool has_calibration() const { return calibration_loaded; }
-    int context_generation_for_test() const { return context_generation; }
-    double atomic_application_transport_gain_for_test() const { return atomic_application_transport_gain; }
-    bool atomic_application_transport_gain_valid_for_test() const { return atomic_application_transport_gain_valid; }
+    int context_generation_for_test() const;
+    double atomic_application_transport_gain_for_test() const;
+    bool atomic_application_transport_gain_valid_for_test() const;
 
     // Mode control.  MERCURY_GEARSHIFT_V2 accepts legacy, shadow, or active.
     void configure_mode_from_env();
-    void set_mode_for_test(e_gearshift_v2_mode m) { mode = m; }
+    void set_mode_for_test(e_gearshift_v2_mode m);
     e_gearshift_v2_mode get_mode() const { return mode; }
     bool controls_link() const { return mode == GEARSHIFT_V2_ACTIVE; }
     bool shadow_only() const { return mode == GEARSHIFT_V2_SHADOW; }
@@ -401,7 +401,7 @@ public:
     void set_cooldown_batches(int n) { policy.cooldown_batches = n; }
     void set_switch_cost_ms(int ms);
     void set_wire_ms_per_batch(double ms);
-    void set_policy_for_test(const st_rate_policy& p) { policy = p; }
+    void set_policy_for_test(const st_rate_policy& p);
     const st_rate_policy& get_policy() const { return policy; }
 
     void force_cooldown(int batches);
@@ -418,23 +418,18 @@ public:
     bool ladder_probe_accepted_this_evaluation() const {
         return ladder_probe_accepted_now;
     }
-    int probe_application_samples_for_test() const { return probe_application_samples; }
-    int probe_outcome_samples_for_test() const { return probe_outcome_samples; }
-    double probe_mean_bps_for_test() const {
-        return probe_application_samples > 0
-            ? probe_application_bps_sum / (double)probe_application_samples : 0.0;
-    }
-    double probe_channel_ms_for_test() const { return probe_channel_ms; }
-    double probe_max_channel_ms_for_test() const { return probe_max_channel_ms; }
-    bool switch_inflight_for_test() const { return switch_inflight; }
-    int switch_from_cfg_for_test() const { return switch_from_cfg; }
-    int switch_to_cfg_for_test() const { return switch_to_cfg; }
-    e_gearshift_v2_action switch_action_for_test() const { return switch_action; }
-    bool probe_blocked_for_test(int cfg, const st_rate_observation& obs) const {
-        return probe_target_blocked(cfg, obs);
-    }
+    int probe_application_samples_for_test() const;
+    int probe_outcome_samples_for_test() const;
+    double probe_mean_bps_for_test() const;
+    double probe_channel_ms_for_test() const;
+    double probe_max_channel_ms_for_test() const;
+    bool switch_inflight_for_test() const;
+    int switch_from_cfg_for_test() const;
+    int switch_to_cfg_for_test() const;
+    e_gearshift_v2_action switch_action_for_test() const;
+    bool probe_blocked_for_test(int cfg, const st_rate_observation& obs) const;
     int measured_switch_cost_ms() const;
-    double context_volatility_for_test() const { return context_volatility; }
+    double context_volatility_for_test() const;
 
 private:
     bool enabled;
@@ -609,5 +604,7 @@ private:
                        const st_rate_decision& d) const;
     void clear_probe();
 };
+
+#include "datalink_layer/test_rate_optimizer.h"
 
 #endif // RATE_OPTIMIZER_H_
