@@ -55,6 +55,8 @@ LDFLAGS="-L./third_party/glfw/lib -lglfw3 -lopengl32 -lgdi32 -lole32 -ldsound -l
 
 CPP_SOURCES="
 source/main.cc
+source/test_main.cc
+source/audioio/test_audioio.cc
 source/datalink_layer/arq_commander.cc
 source/datalink_layer/arq_common.cc
 source/datalink_layer/arq_responder.cc
@@ -93,21 +95,37 @@ source/physical_layer/plot.cc
 source/physical_layer/psk.cc
 source/physical_layer/mfsk.cc
 source/physical_layer/mfsk_ctrl_codec.cc
-source/physical_layer/mfsk_ctrl_codec_tests.cc
+source/physical_layer/test_mfsk_ctrl_codec_tests.cc
 source/physical_layer/telecom_system.cc
 source/common/os_interop.cc
 source/common/ring_buffer_posix.cc
 source/common/shm_posix.cc
 source/common/sim_clock.cc
-source/common/sim_clock_tests.cc
+source/common/test_sim_clock.cc
 source/gui/gui_main.cc
 source/gui/ini_parser.cc
 source/gui/widgets/waterfall.cc
 source/gui/dialogs/setup_dialog.cc
 source/gui/dialogs/soundcard_dialog.cc
+source/gui/dialogs/test_soundcard_dialog.cc
 source/compression/mercury_compress.cc
 source/compression/lzhuf_buffer.cc
 source/crypto/mercury_crypto.cc
+source/datalink_layer/test_arq_commander.cc
+source/datalink_layer/test_arq_common.cc
+source/datalink_layer/test_arq_responder.cc
+source/datalink_layer/test_channel_state_lookup.cc
+source/datalink_layer/test_fade_core.cc
+source/datalink_layer/test_fade_core_cases.cc
+source/datalink_layer/test_lp_transition_harness.cc
+source/physical_layer/test_awgn.cc
+source/physical_layer/test_dist_matcher.cc
+source/physical_layer/test_error_rate.cc
+source/physical_layer/test_mfsk.cc
+source/physical_layer/test_nb_cfo_correction_test.cc
+source/physical_layer/test_precook_copy_from.cc
+source/physical_layer/test_psk.cc
+source/physical_layer/test_telecom_system.cc
 "
 
 # Optional: a test_*.cc file may exist for in-process bigblock; include if present.
