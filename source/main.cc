@@ -761,9 +761,6 @@ int main(int argc, char *argv[])
     bool enable_sack_v2_cli = false;   // --enable-sack-v2: no-op (default ON since SACK Design A Step 14)
     bool disable_sack_v2_cli = false;  // --disable-sack-v2: SACK Design A Step 14 opt-out (forces CAP_SACK_V2 off)
     MainTestOptions test_opts;
-    int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
-    bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
-    int  test_rsp_sack_rsp_crc_corrupt_count_cli = 0; // --test-rsp-sack-rsp-crc-corrupt-count=N: SACK Design A Step 11 N-shot CRC8 fault injection
     int test_force_sack_mode_cli = -1;  // --force-sack-mode={off,on,probe}: SACK Design A Step 11 — set Axis-3 mode at startup
                                         // (after init, before CONNECTED). Used for Gate 4 (SACK_OFF graceful fallback in
                                         // live session) and Gate 7 (SET_LINK_PARAMS sack_mode round-trip). -1 = unset.
@@ -1166,44 +1163,6 @@ int main(int argc, char *argv[])
             // for v1/v2 interop testing or to roll back to v1 ACK behavior
             // on a per-instance basis without rebuilding.
             disable_sack_v2_cli = true;
-            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-            argc--; i--;
-        }
-        else if (strncmp(argv[i], "--test-rsp-bsi-corrupt-at=", 26) == 0)
-        {
-            // SACK Design A Step 4 — synthetic discard test fault injection.
-            // On the Nth v2 DATA frame received by RSP, corrupt its parsed
-            // batch_seq_id by adding 7 (mod 256). Falls outside both
-            // current_expected and prev — must trigger the [RSP-V2-DROP]
-            // branch exactly once. Default 0 = off; production builds never
-            // pass this flag.
-            test_rsp_bsi_corrupt_at_cli = atoi(argv[i] + 26);
-            if (test_rsp_bsi_corrupt_at_cli < 0) test_rsp_bsi_corrupt_at_cli = 0;
-            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-            argc--; i--;
-        }
-        else if (strcmp(argv[i], "--test-rsp-sack-rsp-crc-corrupt") == 0)
-        {
-            // SACK Design A Step 7 — synthetic CRC8 corruption test (one-shot).
-            // On the first SACK_RSP OFDM frame the RSP transmits after this
-            // flag is set, the trailing CRC8 byte is XOR'd with 0xFF, causing
-            // the CMD-side decoder to fail the CRC check. The CMD then logs
-            // [CMD-SACK-V2-CRC-FAIL] and DISCARDS the bitmap (no fabrication
-            // per §9.4/A2). Default off; production builds never pass this
-            // flag. The corruption clears itself after firing exactly once.
-            test_rsp_sack_rsp_crc_corrupt_cli = true;
-            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-            argc--; i--;
-        }
-        else if (strncmp(argv[i], "--test-rsp-sack-rsp-crc-corrupt-count=", 38) == 0)
-        {
-            // SACK Design A Step 11 — N-shot CRC8 fault injection. Corrupts
-            // the next N SACK_RSP frames the RSP transmits (vs the one-shot
-            // version above). Used by Gate 3 (drive 3 misses → ON→PROBE, then
-            // 2 more → PROBE→OFF) and Gate 5 (set to small N, then let SACK
-            // recover → PROBE→ON).
-            test_rsp_sack_rsp_crc_corrupt_count_cli = atoi(argv[i] + 38);
-            if (test_rsp_sack_rsp_crc_corrupt_count_cli < 0) test_rsp_sack_rsp_crc_corrupt_count_cli = 0;
             for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
             argc--; i--;
         }
@@ -2315,20 +2274,8 @@ start_modem:
             printf("[FLAG] --disable-sack-v2: SACK disabled locally "
                    "(CAP_SACK_V2 removed; behaves like --no-sack)\n");
         }
-        if (test_rsp_bsi_corrupt_at_cli > 0) {
-            ARQ.test_rsp_bsi_corrupt_at = test_rsp_bsi_corrupt_at_cli;
-            printf("[FLAG] --test-rsp-bsi-corrupt-at=%d: will corrupt the %dth v2 "
-                   "DATA frame's batch_seq_id by +7 mod 256 (SACK Design A Step 4 "
-                   "synthetic discard test — one-shot)\n",
-                   test_rsp_bsi_corrupt_at_cli, test_rsp_bsi_corrupt_at_cli);
-        }
-        if (test_rsp_sack_rsp_crc_corrupt_cli) {
-            ARQ.test_rsp_sack_rsp_crc_corrupt = true;
-            ARQ.test_rsp_sack_rsp_crc_corrupt_armed = true;
-            printf("[FLAG] --test-rsp-sack-rsp-crc-corrupt: next SACK_RSP TX will have "
-                   "CRC8 XOR'd with 0xFF (SACK Design A Step 7 synthetic CRC8 fault "
-                   "injection — one-shot)\n");
-        }
+        if (test_opts.test_rsp_bsi_corrupt_at_cli > 0 || test_opts.test_rsp_sack_rsp_crc_corrupt_cli)
+            apply_main_test_faults(ARQ, test_opts);
         if (test_force_sack_mode_cli >= 0) {
             // SACK Design A Step 11 — pre-CONNECTED override of axis3_sack_mode.
             // Used by Gates 4 (SACK_OFF graceful fallback) and 7 (SET_LINK_PARAMS
@@ -2344,14 +2291,8 @@ start_modem:
                    : test_force_sack_mode_cli == 1 ? "ON"
                    : "PROBE");
         }
-        if (test_rsp_sack_rsp_crc_corrupt_count_cli > 0) {
-            ARQ.test_rsp_sack_rsp_crc_corrupt_count = test_rsp_sack_rsp_crc_corrupt_count_cli;
-            printf("[FLAG] --test-rsp-sack-rsp-crc-corrupt-count=%d: next %d SACK_RSP TXs "
-                   "will have CRC8 XOR'd with 0xFF (SACK Design A Step 11 N-shot CRC8 "
-                   "fault injection)\n",
-                   test_rsp_sack_rsp_crc_corrupt_count_cli,
-                   test_rsp_sack_rsp_crc_corrupt_count_cli);
-        }
+        if (test_opts.test_rsp_sack_rsp_crc_corrupt_count_cli > 0)
+            apply_main_test_fault_count(ARQ, test_opts);
         run_main_post_tests(ARQ, telecom_system, test_opts);
 
         // Monitor mode: force monitor on, disable TX

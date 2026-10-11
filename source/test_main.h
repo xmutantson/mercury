@@ -29,6 +29,9 @@ class cl_arq_controller;
 class cl_telecom_system;
 
 struct MainTestOptions {
+    int  test_rsp_bsi_corrupt_at_cli = 0; // --test-rsp-bsi-corrupt-at=N: SACK Design A Step 4 synthetic discard test
+    bool test_rsp_sack_rsp_crc_corrupt_cli = false; // --test-rsp-sack-rsp-crc-corrupt: SACK Design A Step 7 CRC8 fault injection (one-shot)
+    int  test_rsp_sack_rsp_crc_corrupt_count_cli = 0; // --test-rsp-sack-rsp-crc-corrupt-count=N: SACK Design A Step 11 N-shot CRC8 fault injection
     int test_policy_axis1_fire_cli = 0; // --test-policy-axis1-fire=up|down: SACK Design A Step 9 — synthetic Axis-1 trigger.
                                         // 0=off, 1=up (success=100%), 2=down (success=0%). One-shot at startup, then exit.
                                         // Forces sack_v2_enabled=true so policy_evaluate_axis1() is taken.
@@ -346,5 +349,8 @@ int run_main_test_bandpass_cli_validation(bool (*parse_bandpass_cli)(const char*
 int run_main_test_audio_device_path_bounds(void (*copy_audio_device_path)(char* destination, const char* source));
 int run_main_test_agw_server_start_fail_closed(int (*validate_modem_server_startup)(int result, FILE* diagnostic));
 int run_main_test_encryption_cli_validation(bool (*parse_encryption_mode_cli)(const char* value, int& mode, std::string& error));
+
+void apply_main_test_faults(cl_arq_controller& ARQ, const MainTestOptions& test_opts);
+void apply_main_test_fault_count(cl_arq_controller& ARQ, const MainTestOptions& test_opts);
 
 #endif
