@@ -47,7 +47,7 @@
 #include "physical_layer/telecom_system.h"
 #include "physical_layer/dist_matcher.h"   // --test-pas PAS/PCS DM bijection self-test
 #include "physical_layer/mfsk_ctrl_codec_tests.h"
-#include "common/sim_clock_tests.h"
+#include "common/test_sim_clock.h"
 #include "compression/test_winlink_dict.h"
 #include "crypto/test_aead_nonce.h"   // AEAD bsi-bound nonce regression suite
 #include "crypto/test_mlkem_hybrid.h" // ML-KEM-768 hybrid KEX regression suite

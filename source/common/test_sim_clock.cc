@@ -1,7 +1,7 @@
 /*
  * Mercury: A configurable open-source software-defined modem.
  *
- * sim_clock_tests.cc — unit tests for the -x sim virtual clock (Inc 1+2 of
+ * test_sim_clock.cc — unit tests for the -x sim virtual clock (Inc 1+2 of
  * the sim-arq-channel design). Wired via `mercury.exe --test`.
  *
  * Test (a) of the design's §3 acceptance criteria: PROVE cl_timer's elapsed
@@ -12,7 +12,7 @@
  * Each test prints "  [OK] name" on pass or "  [FAIL] name: reason" on
  * failure. The function returns the total number of failed tests.
  */
-#include "common/sim_clock_tests.h"
+#include "common/test_sim_clock.h"
 #include "common/sim_clock.h"
 #include "datalink_layer/timer.h"
 #include "datalink_layer/arq.h"   // pumped_settle_wait
