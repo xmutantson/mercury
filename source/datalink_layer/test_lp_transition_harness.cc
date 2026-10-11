@@ -5,7 +5,7 @@
  * link-phase producer entry points. It is test infrastructure only: no live
  * controller path calls this file.
  */
-#include "datalink_layer/lp_transition_harness.h"
+#include "datalink_layer/test_lp_transition_harness.h"
 
 #include <algorithm>
 #include <cstdio>

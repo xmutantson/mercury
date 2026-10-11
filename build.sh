@@ -518,7 +518,7 @@ source/datalink_layer/arq_responder.cc
 source/datalink_layer/test_arq_responder.cc
 source/datalink_layer/test_pending_conformance.cc
 source/datalink_layer/l1_block_codec.cc
-source/datalink_layer/lp_transition_harness.cc
+source/datalink_layer/test_lp_transition_harness.cc
 source/datalink_layer/test_bigblock_arq_unit.cc
 source/datalink_layer/test_rx_drain.cc
 source/datalink_layer/test_restage_requeue.cc
