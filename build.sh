@@ -536,7 +536,7 @@ source/datalink_layer/timer.cc
 source/physical_layer/awgn.cc
 source/physical_layer/crc16_modbus_rtu.cc
 source/physical_layer/data_container.cc
-source/physical_layer/dist_matcher.cc
+source/physical_layer/test_dist_matcher.cc
 source/physical_layer/error_rate.cc
 source/physical_layer/fir_filter.cc
 source/physical_layer/interleaver.cc
@@ -564,6 +564,7 @@ source/physical_layer/precook_copy_from.cc
 source/physical_layer/physical_config.cc
 source/physical_layer/plot.cc
 source/physical_layer/psk.cc
+source/physical_layer/test_psk.cc
 source/physical_layer/mfsk.cc
 source/physical_layer/test_mfsk.cc
 source/physical_layer/mfsk_ctrl_codec.cc
@@ -571,6 +572,7 @@ source/physical_layer/eesm_probe.cc
 source/physical_layer/test_mfsk_ctrl_codec_tests.cc
 source/physical_layer/test_nb_cfo_correction_test.cc
 source/physical_layer/telecom_system.cc
+source/physical_layer/test_telecom_system.cc
 source/common/os_interop.cc
 source/common/ring_buffer_posix.cc
 source/common/shm_posix.cc
