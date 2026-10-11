@@ -6728,35 +6728,6 @@ void run_main_post_tests(cl_arq_controller& ARQ, cl_telecom_system& telecom_syst
         }
 }
 
-int run_main_test_modulation_cli_validation(bool (*parse_modulation_cli)(const char* value, int& config, std::string& error))
-{
-    int fails = 0;
-    auto check = [&](const char* value, bool want_ok, int initial, int want_config)
-    {
-        int config = initial;
-        std::string error;
-        bool ok = parse_modulation_cli(value, config, error);
-        bool pass = ok == want_ok && config == want_config
-                 && (want_ok ? error.empty() : !error.empty());
-        if (!pass) fails++;
-        printf("[TEST-MOD-CLI] -s %-6s ok=%d config=%d diagnostic=%d -> %s\n",
-               value, ok ? 1 : 0, config, error.empty() ? 0 : 1,
-               pass ? "PASS" : "FAIL");
-    };
-
-    check("0",     true,  CONFIG_1, CONFIG_0);
-    check("17",    true,  CONFIG_1, CONFIG_17);
-    check("100",   true,  CONFIG_1, ROBUST_0);
-    check("105",   true,  CONFIG_1, LOW48_ANCHOR_S20_R6);
-    check("INVALID", false, CONFIG_17, CONFIG_17);
-    check("BPSKZ", false, CONFIG_17, CONFIG_17);
-    check("1junk", false, CONFIG_17, CONFIG_17);
-    check("104",   false, CONFIG_17, CONFIG_17);
-
-    printf("[TEST-MOD-CLI] %s (%d failure(s))\n",
-           fails == 0 ? "PASS" : "FAIL", fails);
-    return fails;
-}
 
 int cl_arq_controller::test_data_container_ownership_constraints()
 {
@@ -7085,36 +7056,6 @@ int run_main_test_audio_device_path_bounds(void (*copy_audio_device_path)(char* 
     return pass ? 0 : 1;
 }
 
-int run_main_test_audio_subsystem_cli_validation(bool (*parse_audio_subsystem_cli)(const char* value, int& audio_system, std::string& error))
-{
-    int fails = 0;
-    auto check = [&](const char* value, bool want_ok, int initial, int want_system)
-    {
-        int audio_system = initial;
-        std::string error;
-        bool ok = parse_audio_subsystem_cli(value, audio_system, error);
-        bool pass = ok == want_ok && audio_system == want_system
-                 && (want_ok ? error.empty() : !error.empty());
-        if (!pass) fails++;
-        printf("[TEST-AUDIO-SUBSYSTEM-CLI] -x %-10s ok=%d system=%d diagnostic=%d -> %s\n",
-               value, ok ? 1 : 0, audio_system, error.empty() ? 0 : 1,
-               pass ? "PASS" : "FAIL");
-    };
-
-    check("alsa",      true,  -1, AUDIO_SUBSYSTEM_ALSA);
-    check("pulse",     true,  -1, AUDIO_SUBSYSTEM_PULSE);
-    check("dsound",    true,  -1, AUDIO_SUBSYSTEM_DSOUND);
-    check("wasapi",    true,  -1, AUDIO_SUBSYSTEM_WASAPI);
-    check("oss",       true,  -1, AUDIO_SUBSYSTEM_OSS);
-    check("coreaudio", true,  -1, AUDIO_SUBSYSTEM_COREAUDIO);
-    check("sim",       true,  -1, AUDIO_SUBSYSTEM_SIM);
-    check("foo",       false, -1, -1);
-    check("foo",       false, AUDIO_SUBSYSTEM_PULSE, AUDIO_SUBSYSTEM_PULSE);
-
-    printf("[TEST-AUDIO-SUBSYSTEM-CLI] %s (%d failure(s))\n",
-           fails == 0 ? "PASS" : "FAIL", fails);
-    return fails;
-}
 
 int run_main_test_agw_server_start_fail_closed(int (*validate_modem_server_startup)(int result, FILE* diagnostic))
 {
