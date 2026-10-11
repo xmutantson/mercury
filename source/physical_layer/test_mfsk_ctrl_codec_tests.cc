@@ -53,7 +53,7 @@
 // All test trials use a deterministic std::mt19937 seed so failures are
 // reproducible.
 
-#include "physical_layer/mfsk_ctrl_codec_tests.h"
+#include "physical_layer/test_mfsk_ctrl_codec_tests.h"
 #include "physical_layer/mfsk_ctrl_codec.h"
 #include "physical_layer/mfsk.h"
 #include "physical_layer/telecom_system.h"
@@ -3853,7 +3853,7 @@ int cl_arq_controller::test_suffix_soft_nb_unsupported_fail_closed() {
 // toward). Prints the headline acquisition-gain dB. Deterministic seed.
 //
 // SNR3k is calibrated: the base-detect cliff lands at ≈ −14.7 dB here, matching
-// the data-preamble floor the cliff agent measured (−14.6 dB) — so the absolute
+// the data-preamble floor the cliff sweep measured (−14.6 dB) — so the absolute
 // axis is comparable to that prior work, and the HARD suffix cliff reproduces
 // their −8.6 dB suffix figure.
 static void suffix_cliff_one(const char* label, bool ack_path) {

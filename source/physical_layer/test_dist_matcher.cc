@@ -6,7 +6,7 @@
  * fact-documents/data-flow-pas-shaping.md for the construction + citations.
  */
 
-#include "physical_layer/dist_matcher.h"
+#include "physical_layer/test_dist_matcher.h"
 #include <cmath>
 #include <algorithm>
 
