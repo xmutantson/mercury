@@ -469,390 +469,37 @@ static void copy_audio_device_path(char* destination, const char* source)
 
 int cl_arq_controller::test_modulation_cli_validation()
 {
-    int fails = 0;
-    auto check = [&](const char* value, bool want_ok, int initial, int want_config)
-    {
-        int config = initial;
-        std::string error;
-        bool ok = parse_modulation_cli(value, config, error);
-        bool pass = ok == want_ok && config == want_config
-                 && (want_ok ? error.empty() : !error.empty());
-        if (!pass) fails++;
-        printf("[TEST-MOD-CLI] -s %-6s ok=%d config=%d diagnostic=%d -> %s\n",
-               value, ok ? 1 : 0, config, error.empty() ? 0 : 1,
-               pass ? "PASS" : "FAIL");
-    };
-
-    check("0",     true,  CONFIG_1, CONFIG_0);
-    check("17",    true,  CONFIG_1, CONFIG_17);
-    check("100",   true,  CONFIG_1, ROBUST_0);
-    check("105",   true,  CONFIG_1, LOW48_ANCHOR_S20_R6);
-    check("INVALID", false, CONFIG_17, CONFIG_17);
-    check("BPSKZ", false, CONFIG_17, CONFIG_17);
-    check("1junk", false, CONFIG_17, CONFIG_17);
-    check("104",   false, CONFIG_17, CONFIG_17);
-
-    printf("[TEST-MOD-CLI] %s (%d failure(s))\n",
-           fails == 0 ? "PASS" : "FAIL", fails);
-    return fails;
-}
-
-int cl_arq_controller::test_data_container_ownership_constraints()
-{
-    const bool copy_constructible =
-        std::is_copy_constructible<cl_data_container>::value;
-    const bool copy_assignable =
-        std::is_copy_assignable<cl_data_container>::value;
-    const bool pass = !copy_constructible && !copy_assignable;
-
-    printf("[TEST-DATA-CONTAINER-OWNERSHIP] copy-constructible=%d "
-           "copy-assignable=%d -> %s\n",
-           copy_constructible ? 1 : 0, copy_assignable ? 1 : 0,
-           pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
-}
-
-int cl_arq_controller::test_data_container_deinit_resets_pinning()
-{
-    cl_data_container data;
-    data.alloc_shared_buffers(256, 50, 4, 112, 128, 8, 4, 1, 1200);
-
-    const bool pin_precondition = data.precook_ring_pinned
-        && data.pinned_capacity_buffer_Nsymb == 1200
-        && data.pinned_capacity_samples == 128 * 1200
-        && data.pinned_capacity_Nc == 50
-        && data.pinned_capacity_nsymb_nc > 0
-        && data.pinned_capacity_nData == 256
-        && data.pinned_capacity_total_frame_size > 0
-        && data.pinned_capacity_preamble == 4
-        && data.pinned_capacity_fine_slice > 0;
-
-    data.deinit();
-    const bool metadata_reset = !data.precook_ring_pinned
-        && data.pinned_capacity_buffer_Nsymb == 0
-        && data.pinned_capacity_samples == 0
-        && data.pinned_capacity_Nc == 0
-        && data.pinned_capacity_nsymb_nc == 0
-        && data.pinned_capacity_nData == 0
-        && data.pinned_capacity_total_frame_size == 0
-        && data.pinned_capacity_preamble == 0
-        && data.pinned_capacity_fine_slice == 0;
-
-    // A different, smaller geometry must take set_size()'s allocation path again.
-    data.set_size(128, 50, 2, 80, 96, 4, 2, 1);
-    const bool reallocated = data.data_bit != nullptr
-        && data.modulated_data != nullptr
-        && data.passband_delayed_data != nullptr
-        && data.ready_to_process_passband_delayed_data != nullptr
-        && data.baseband_data != nullptr
-        && data.passband_data_tx != nullptr
-        && data.bit_energy_dispersal_sequence != nullptr;
-
-    const bool pass = pin_precondition && metadata_reset && reallocated;
-    printf("[TEST-DATA-CONTAINER-DEINIT] pin-precondition=%d metadata-reset=%d "
-           "reallocated=%d -> %s\n",
-           pin_precondition ? 1 : 0, metadata_reset ? 1 : 0,
-           reallocated ? 1 : 0, pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
-}
-
-int cl_arq_controller::test_gbf_decoder_constraints()
-{
-    const float llr[2] = {1.0f, 1.0f};
-    const int checks[2] = {0, 1};
-    const int iteration_limit = 4;
-    const int untouched = 0x5a5a5a5a;
-    int fails = 0;
-
-    int valid_output[1] = {untouched};
-    const int valid_result = decode_GBF(
-        llr, valid_output, checks, 2, 2, 2, 1, 1, iteration_limit, 0.5f);
-    const bool valid_ok = valid_result == 0 && valid_output[0] == 0;
-    if (!valid_ok) fails++;
-
-    int inconsistent_output[2] = {untouched, untouched};
-    const int inconsistent_result = decode_GBF(
-        llr, inconsistent_output, checks, 2, 2, 2, 2, 1,
-        iteration_limit, 0.5f);
-    const bool inconsistent_ok = inconsistent_result == iteration_limit + 1
-        && inconsistent_output[0] == untouched
-        && inconsistent_output[1] == untouched;
-    if (!inconsistent_ok) fails++;
-
-    int width_output[1] = {untouched};
-    const int width_result = decode_GBF(
-        llr, width_output, checks, 2, 1, 2, 1, 1,
-        iteration_limit, 0.5f);
-    const bool width_ok = width_result == iteration_limit + 1
-        && width_output[0] == untouched;
-    if (!width_ok) fails++;
-
-    const int invalid_checks[2] = {0, 2};
-    int index_output[1] = {untouched};
-    const int index_result = decode_GBF(
-        llr, index_output, invalid_checks, 2, 2, 2, 1, 1,
-        iteration_limit, 0.5f);
-    const bool index_ok = index_result == iteration_limit + 1
-        && index_output[0] == untouched;
-    if (!index_ok) fails++;
-
-    printf("[TEST-GBF-CONSTRAINTS] valid=%s inconsistent-NKP=%s width=%s index=%s -> %s\n",
-           valid_ok ? "PASS" : "FAIL",
-           inconsistent_ok ? "PASS" : "FAIL",
-           width_ok ? "PASS" : "FAIL",
-           index_ok ? "PASS" : "FAIL",
-           fails == 0 ? "PASS" : "FAIL");
-    return fails;
-}
-
-int cl_arq_controller::test_gbf_final_iteration_sentinel()
-{
-    // One parity check over two bits. With eta=0.5, bit 0 reaches zero after
-    // two flips, so the syndrome first clears at the iteration-3 check.
-    const float llr[2] = {-1.0f, 10.0f};
-    const int checks[2] = {0, 1};
-    const int iteration_limit = 3;
-    const int failure = iteration_limit + 1;
-    int decoded[1] = {-1};
-    int fails = 0;
-
-    const int result = decode_GBF(
-        llr, decoded, checks, 2, 2, 2, 1, 1,
-        iteration_limit, 0.5f);
-
-    cl_telecom_system telecom;
-    telecom.ldpc.nIteration_max = iteration_limit;
-    st_receive_stats rs{};
-    rs.all_zeros = NO;
-    rs.crc = 0;
-
-    // Fail-before: the former boundary result looked converged to the real CRC
-    // admission predicate, so a CRC-colliding frame was accepted.
-    rs.iterations_done = iteration_limit;
-    const bool legacy_rejected = telecom.frame_decode_rejected(
-        rs, CRC16_MODBUS_RTU);
-    if(legacy_rejected) fails++;
-
-    // Pass-after: the decoder publishes the canonical failure sentinel and the
-    // production admission predicate rejects the same CRC-good hard bits.
-    rs.iterations_done = result;
-    const bool fixed_rejected = telecom.frame_decode_rejected(
-        rs, CRC16_MODBUS_RTU);
-    if(result != failure || decoded[0] != 0 || !fixed_rejected) fails++;
-
-    // The boundary alone is rejected: with one more allowed iteration, the
-    // identical convergence at iteration 3 remains an ordinary success.
-    int control_decoded[1] = {-1};
-    const int control_result = decode_GBF(
-        llr, control_decoded, checks, 2, 2, 2, 1, 1,
-        iteration_limit + 1, 0.5f);
-    telecom.ldpc.nIteration_max = iteration_limit + 1;
-    rs.iterations_done = control_result;
-    const bool control_rejected = telecom.frame_decode_rejected(
-        rs, CRC16_MODBUS_RTU);
-    if(control_result != iteration_limit || control_decoded[0] != 0
-       || control_rejected) fails++;
-
-    printf("[TEST-GBF-FINAL-ITERATION] legacy=%s result=%d sentinel=%d rejected=%d "
-           "control-result=%d control-rejected=%d -> %s\n",
-           legacy_rejected ? "REJECT" : "ACCEPT", result, failure,
-           fixed_rejected ? 1 : 0, control_result,
-           control_rejected ? 1 : 0, fails == 0 ? "PASS" : "FAIL");
-    return fails;
+    return run_main_test_modulation_cli_validation(+[](const char* value, int& config, std::string& error) -> bool {
+        return parse_modulation_cli(value, config, error);
+    });
 }
 
 int cl_arq_controller::test_tx_level_cli_validation()
 {
-    int fails = 0;
-    auto check = [&](const char* value, bool want_ok, double initial, double want_level)
-    {
-        double level = initial;
-        std::string error;
-        bool ok = parse_tx_level_cli(value, level, error);
-        bool pass = ok == want_ok && level == want_level
-                 && (want_ok ? error.empty() : !error.empty());
-        if (!pass) fails++;
-        printf("[TEST-TX-LEVEL-CLI] --tx-level %-8s ok=%d level=%.3f diagnostic=%d -> %s\n",
-               value, ok ? 1 : 0, level, error.empty() ? 0 : 1,
-               pass ? "PASS" : "FAIL");
-    };
-
-    check("0.0",  true,  0.25, 0.0);
-    check("0.5",  true,  0.25, 0.5);
-    check("1.0",  true,  0.25, 1.0);
-    check("-0.1", false, 0.25, 0.25);
-    check("5.0",  false, 0.25, 0.25);
-    check("nan",  false, 0.25, 0.25);
-    check("0.5x", false, 0.25, 0.25);
-
-    printf("[TEST-TX-LEVEL-CLI] %s (%d failure(s))\n",
-           fails == 0 ? "PASS" : "FAIL", fails);
-    return fails;
-}
-
-int cl_arq_controller::test_tx_level_concurrent_sync()
-{
-    const double saved = audioio_get_tx_level();
-    int fails = 0;
-
-    // Fail closed: a malformed runtime parameter must not replace the last
-    // valid value. These are the same bounds enforced by --tx-level parsing.
-    if (!audioio_set_tx_level(0.25))
-        fails++;
-    const double before_invalid = audioio_get_tx_level();
-    const bool rejected = !audioio_set_tx_level(
-        std::numeric_limits<double>::quiet_NaN());
-    const bool unchanged = audioio_get_tx_level() == before_invalid;
-    if (!rejected || !unchanged)
-        fails++;
-
-    // Model a parameter callback publishing updates while the playback/main
-    // consumer snapshots the active level. The pre-fix global double makes
-    // this access a C++ data race; the accessor pair makes every publication
-    // atomic, and a consumer can use one coherent snapshot for a whole block.
-    std::atomic<bool> start{false};
-    std::atomic<bool> done{false};
-    std::atomic<int> writer_failures{0};
-    std::thread writer([&]() {
-        while (!start.load(std::memory_order_acquire))
-            std::this_thread::yield();
-        for (int i = 0; i < 200000; ++i) {
-            const double value = (i & 1) ? 0.75 : 0.25;
-            if (!audioio_set_tx_level(value))
-                writer_failures.fetch_add(1, std::memory_order_relaxed);
-        }
-        done.store(true, std::memory_order_release);
+    return run_main_test_tx_level_cli_validation(+[](const char* value, double& level, std::string& error) -> bool {
+        return parse_tx_level_cli(value, level, error);
     });
-
-    start.store(true, std::memory_order_release);
-    int invalid_reads = 0;
-    do {
-        const double value = audioio_get_tx_level();
-        if (value != 0.25 && value != 0.75)
-            invalid_reads++;
-    } while (!done.load(std::memory_order_acquire));
-    writer.join();
-
-    const double final_value = audioio_get_tx_level();
-    if (writer_failures.load(std::memory_order_relaxed) != 0 ||
-        invalid_reads != 0 || final_value != 0.75)
-        fails++;
-
-    // Avoid leaking test state into later --test cases; the saved value came
-    // from the validated production store and therefore must restore cleanly.
-    const bool restored = audioio_set_tx_level(saved);
-    if (!restored)
-        fails++;
-
-    printf("[TEST-TX-LEVEL-SYNC] rejected-invalid=%d unchanged=%d "
-           "writer-failures=%d invalid-reads=%d final=%.2f restored=%d -> %s\n",
-           rejected ? 1 : 0, unchanged ? 1 : 0,
-           writer_failures.load(std::memory_order_relaxed), invalid_reads,
-           final_value, restored ? 1 : 0, fails == 0 ? "PASS" : "FAIL");
-    return fails;
 }
 
 int cl_arq_controller::test_bandpass_cli_validation()
 {
-    int fails = 0;
-    auto check = [&](char* value, bool want_ok, double want_low, double want_high)
-    {
-        const std::string original(value);
-        double low = 123.0;
-        double high = 456.0;
-        std::string error;
-        const bool ok = parse_bandpass_cli(value, low, high, error);
-        const bool unchanged = original == value;
-        const bool pass = ok == want_ok && unchanged
-            && low == (want_ok ? want_low : 123.0)
-            && high == (want_ok ? want_high : 456.0)
-            && (want_ok ? error.empty() : !error.empty());
-        if (!pass) fails++;
-        printf("[TEST-BANDPASS-CLI] --bandpass %-18s ok=%d low=%.1f high=%.1f "
-               "argv-unchanged=%d diagnostic=%d -> %s\n",
-               value, ok ? 1 : 0, low, high, unchanged ? 1 : 0,
-               error.empty() ? 0 : 1, pass ? "PASS" : "FAIL");
-    };
-
-    char valid[] = "300-3000";
-    char boundaries[] = "0-24000";
-    char invalid_format[] = "invalid-format";
-    char missing_high[] = "300-";
-    char trailing_junk[] = "300-3000Hz";
-    char reversed[] = "3000-300";
-    char out_of_range[] = "300-24001";
-    char non_finite[] = "300-inf";
-    check(valid, true, 300.0, 3000.0);
-    check(boundaries, true, 0.0, 24000.0);
-    check(invalid_format, false, 0.0, 0.0);
-    check(missing_high, false, 0.0, 0.0);
-    check(trailing_junk, false, 0.0, 0.0);
-    check(reversed, false, 0.0, 0.0);
-    check(out_of_range, false, 0.0, 0.0);
-    check(non_finite, false, 0.0, 0.0);
-
-    printf("[TEST-BANDPASS-CLI] %s (%d failure(s))\n",
-           fails == 0 ? "PASS" : "FAIL", fails);
-    return fails;
+    return run_main_test_bandpass_cli_validation(+[](const char* value, double& low_hz, double& high_hz, std::string& error) -> bool {
+        return parse_bandpass_cli(value, low_hz, high_hz, error);
+    });
 }
 
 int cl_arq_controller::test_audio_device_path_bounds()
 {
-    char input[ALSA_MAX_PATH + 1];
-    char output[ALSA_MAX_PATH + 1];
-    memset(input, 0xa5, sizeof(input));
-    memset(output, 0xa5, sizeof(output));
-    input[ALSA_MAX_PATH] = 'I';
-    output[ALSA_MAX_PATH] = 'O';
-
-    const std::string overlong(ALSA_MAX_PATH + 72, 'i');
-    const std::string boundary(ALSA_MAX_PATH - 1, 'o');
-    copy_audio_device_path(input, overlong.c_str());
-    copy_audio_device_path(output, boundary.c_str());
-
-    const bool input_ok = input[ALSA_MAX_PATH - 1] == '\0'
-        && input[ALSA_MAX_PATH] == 'I'
-        && memcmp(input, overlong.data(), ALSA_MAX_PATH - 1) == 0;
-    const bool output_ok = output[ALSA_MAX_PATH - 1] == '\0'
-        && output[ALSA_MAX_PATH] == 'O'
-        && memcmp(output, boundary.data(), ALSA_MAX_PATH - 1) == 0;
-    const bool pass = input_ok && output_ok;
-
-    printf("[TEST-AUDIO-DEVICE-PATH] overlong-input=%s boundary-output=%s -> %s\n",
-           input_ok ? "PASS" : "FAIL", output_ok ? "PASS" : "FAIL",
-           pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
+    return run_main_test_audio_device_path_bounds(+[](char* destination, const char* source) -> void {
+        return copy_audio_device_path(destination, source);
+    });
 }
 
 int cl_arq_controller::test_audio_subsystem_cli_validation()
 {
-    int fails = 0;
-    auto check = [&](const char* value, bool want_ok, int initial, int want_system)
-    {
-        int audio_system = initial;
-        std::string error;
-        bool ok = parse_audio_subsystem_cli(value, audio_system, error);
-        bool pass = ok == want_ok && audio_system == want_system
-                 && (want_ok ? error.empty() : !error.empty());
-        if (!pass) fails++;
-        printf("[TEST-AUDIO-SUBSYSTEM-CLI] -x %-10s ok=%d system=%d diagnostic=%d -> %s\n",
-               value, ok ? 1 : 0, audio_system, error.empty() ? 0 : 1,
-               pass ? "PASS" : "FAIL");
-    };
-
-    check("alsa",      true,  -1, AUDIO_SUBSYSTEM_ALSA);
-    check("pulse",     true,  -1, AUDIO_SUBSYSTEM_PULSE);
-    check("dsound",    true,  -1, AUDIO_SUBSYSTEM_DSOUND);
-    check("wasapi",    true,  -1, AUDIO_SUBSYSTEM_WASAPI);
-    check("oss",       true,  -1, AUDIO_SUBSYSTEM_OSS);
-    check("coreaudio", true,  -1, AUDIO_SUBSYSTEM_COREAUDIO);
-    check("sim",       true,  -1, AUDIO_SUBSYSTEM_SIM);
-    check("foo",       false, -1, -1);
-    check("foo",       false, AUDIO_SUBSYSTEM_PULSE, AUDIO_SUBSYSTEM_PULSE);
-
-    printf("[TEST-AUDIO-SUBSYSTEM-CLI] %s (%d failure(s))\n",
-           fails == 0 ? "PASS" : "FAIL", fails);
-    return fails;
+    return run_main_test_audio_subsystem_cli_validation(+[](const char* value, int& audio_system, std::string& error) -> bool {
+        return parse_audio_subsystem_cli(value, audio_system, error);
+    });
 }
 
 static int validate_modem_server_startup(int result, FILE* diagnostic)
@@ -866,64 +513,18 @@ static int validate_modem_server_startup(int result, FILE* diagnostic)
 
 int cl_arq_controller::test_agw_server_start_fail_closed()
 {
-    FILE* diagnostic = tmpfile();
-    if (diagnostic == NULL)
-    {
-        printf("[TEST-AGW-START] FAIL: could not create diagnostic capture\n");
-        return 1;
-    }
-    const int accepted = validate_modem_server_startup(SUCCESSFUL, diagnostic);
-    const int rejected = validate_modem_server_startup(ERROR_, diagnostic);
-    fflush(diagnostic);
-    rewind(diagnostic);
-    char message[160] = {0};
-    const size_t message_length = fread(message, 1, sizeof(message) - 1, diagnostic);
-    fclose(diagnostic);
-
-    const bool passed = accepted == EXIT_SUCCESS
-        && rejected == EXIT_FAILURE
-        && message_length > 0
-        && strstr(message, "server startup failed") != NULL;
-    printf("[TEST-AGW-START] success=%d bind-failure=%d diagnostic=%d: %s\n",
-           accepted, rejected, message_length > 0, passed ? "PASS" : "FAIL");
-    return passed ? 0 : 1;
+    return run_main_test_agw_server_start_fail_closed(+[](int result, FILE* diagnostic) -> int {
+        return validate_modem_server_startup(result, diagnostic);
+    });
 }
 
 int cl_arq_controller::test_encryption_cli_validation()
 {
-    int fails = 0;
-    auto check = [&](const char* value, bool want_ok, int initial_mode, int want_mode)
-    {
-        int mode = initial_mode;
-        std::string error;
-        bool ok = parse_encryption_mode_cli(value, mode, error);
-        const int resolved_mode = (mode >= 0) ? mode : ENCRYPT_OFF;
-        const bool plaintext_fallback = ok && resolved_mode == ENCRYPT_OFF;
-        bool pass = ok == want_ok && mode == want_mode
-                 && (want_ok ? error.empty() : !error.empty())
-                 && (want_ok || !plaintext_fallback);
-        if (!pass) fails++;
-        printf("[TEST-ENC-CLI] --encrypt %-7s startup=%s cli-mode=%d resolved-mode=%d "
-               "plaintext-fallback=%d "
-               "diagnostic=%d -> %s\n",
-               value, ok ? "continue" : "abort", mode, resolved_mode,
-               plaintext_fallback ? 1 : 0,
-               error.empty() ? 0 : 1,
-               pass ? "PASS" : "FAIL");
-    };
-
-    check("strict",  true,  -1,          ENCRYPT_STRICT);
-    check("1",       true,  -1,          ENCRYPT_STRICT);
-    check("fast",    true,  -1,          ENCRYPT_FAST);
-    check("2",       true,  -1,          ENCRYPT_FAST);
-    // Reproduce the dangerous fallback path: the untouched -1 sentinel would
-    // resolve to ENCRYPT_OFF, so an unknown explicit request must abort startup.
-    check("strictt", false, -1, -1);
-
-    printf("[TEST-ENC-CLI] %s (%d failure(s))\n",
-           fails == 0 ? "PASS" : "FAIL", fails);
-    return fails;
+    return run_main_test_encryption_cli_validation(+[](const char* value, int& mode, std::string& error) -> bool {
+        return parse_encryption_mode_cli(value, mode, error);
+    });
 }
+
 
 int main(int argc, char *argv[])
 {

@@ -2,6 +2,8 @@
 #define MERCURY_TEST_MAIN_H
 
 #include <cstddef>
+#include <cstdio>
+#include <string>
 
 int test_shutdown_atomic();
 int run_pas_selftest();
@@ -338,5 +340,13 @@ struct MainTestOptions {
 bool parse_main_test_option(int& argc, char* argv[], int& i, MainTestOptions& test_opts);
 void run_main_post_tests(cl_arq_controller& ARQ, cl_telecom_system& telecom_system,
     const MainTestOptions& test_opts);
+
+int run_main_test_modulation_cli_validation(bool (*parse_modulation_cli)(const char* value, int& config, std::string& error));
+int run_main_test_tx_level_cli_validation(bool (*parse_tx_level_cli)(const char* value, double& level, std::string& error));
+int run_main_test_bandpass_cli_validation(bool (*parse_bandpass_cli)(const char* value, double& low_hz, double& high_hz, std::string& error));
+int run_main_test_audio_device_path_bounds(void (*copy_audio_device_path)(char* destination, const char* source));
+int run_main_test_audio_subsystem_cli_validation(bool (*parse_audio_subsystem_cli)(const char* value, int& audio_system, std::string& error));
+int run_main_test_agw_server_start_fail_closed(int (*validate_modem_server_startup)(int result, FILE* diagnostic));
+int run_main_test_encryption_cli_validation(bool (*parse_encryption_mode_cli)(const char* value, int& mode, std::string& error));
 
 #endif
