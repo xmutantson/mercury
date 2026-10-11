@@ -565,10 +565,11 @@ source/physical_layer/physical_config.cc
 source/physical_layer/plot.cc
 source/physical_layer/psk.cc
 source/physical_layer/mfsk.cc
+source/physical_layer/test_mfsk.cc
 source/physical_layer/mfsk_ctrl_codec.cc
 source/physical_layer/eesm_probe.cc
-source/physical_layer/mfsk_ctrl_codec_tests.cc
-source/physical_layer/nb_cfo_correction_test.cc
+source/physical_layer/test_mfsk_ctrl_codec_tests.cc
+source/physical_layer/test_nb_cfo_correction_test.cc
 source/physical_layer/telecom_system.cc
 source/common/os_interop.cc
 source/common/ring_buffer_posix.cc

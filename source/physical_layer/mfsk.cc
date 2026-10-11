@@ -1128,26 +1128,6 @@ bool cl_mfsk::decode_ack_sack_from_last_capture(uint8_t* out_bsi,
 	                               out_bsi, out_bitmap, out_crc12);
 }
 
-// Test-only injection point: stuff de-hopped payload tones directly into
-// last_ack_sack_suffix_tones[] and flag the capture as valid, bypassing
-// the RF path. The symbol-domain round-trip test uses this so it can
-// validate the decode primitive without setting up FFT plumbing.
-void cl_mfsk::test_inject_ack_sack_capture(const int* tones, int count)
-{
-	int n = ack_sack_suffix_len();
-	if (n == 0 || tones == nullptr) {
-		last_ack_sack_capture_valid = false;
-		return;
-	}
-	if (count > n) count = n;
-	if (count > MAX_ACK_SACK_SUFFIX) count = MAX_ACK_SACK_SUFFIX;
-	for (int i = 0; i < count; i++)
-		last_ack_sack_suffix_tones[i] = tones[i] & (M - 1);
-	for (int i = count; i < MAX_ACK_SACK_SUFFIX; i++)
-		last_ack_sack_suffix_tones[i] = -1;
-	last_ack_sack_capture_valid = (count == n);
-}
-
 // Decode the most-recent CONNECT-suffix capture into (type, payload, crc12).
 // Mirror of decode_ack_sack_from_last_capture, but draws from
 // last_connect_suffix_tones[] (populated by the CONNECT-detector hook in
@@ -1161,24 +1141,6 @@ bool cl_mfsk::decode_ctrl_suffix_from_last_capture(
 	if (!out_type || !out_payload38 || !out_crc12) return false;
 	return unpack_ctrl_suffix(last_connect_suffix_tones,
 	                          out_type, out_payload38, out_crc12);
-}
-
-// Test-only: stuff CONNECT-suffix payload tones directly into the capture
-// buffer (bypasses RF). Mirror of test_inject_ack_sack_capture.
-void cl_mfsk::test_inject_connect_capture(const int* tones, int count)
-{
-	int n = ack_sack_suffix_len();
-	if (n == 0 || tones == nullptr) {
-		last_connect_capture_valid = false;
-		return;
-	}
-	if (count > n) count = n;
-	if (count > MAX_ACK_SACK_SUFFIX) count = MAX_ACK_SACK_SUFFIX;
-	for (int i = 0; i < count; i++)
-		last_connect_suffix_tones[i] = tones[i] & (M - 1);
-	for (int i = count; i < MAX_ACK_SACK_SUFFIX; i++)
-		last_connect_suffix_tones[i] = -1;
-	last_connect_capture_valid = (count == n);
 }
 
 // Generate ACK base + ack_sack_suffix_len() ACK+SACK suffix symbols.
