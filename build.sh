@@ -506,6 +506,7 @@ obj_path() {
 # Source files
 CPP_SOURCES="
 source/main.cc
+source/test_main.cc
 source/datalink_layer/fade_core.cc
 source/datalink_layer/test_fade_core.cc
 source/datalink_layer/arq_commander.cc
