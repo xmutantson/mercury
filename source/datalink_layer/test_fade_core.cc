@@ -1,843 +1,829 @@
-#include "datalink_layer/fade_core.h"
+#include "datalink_layer/test_fade_core.h"
 
+#include "../crypto/monocypher.h"
+
+#include <algorithm>
 #include <atomic>
-#include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <limits>
-#include <thread>
+#include <set>
+#include <string>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <bcrypt.h>
+#else
+#include <sys/random.h>
+#endif
 
 namespace mercury {
 namespace fade {
-namespace {
 
-struct TestLog {
-  int failures = 0;
-  void check(bool condition, const char* suite, const char* name) {
-    std::printf("[TEST-FADE-CORE/%s] %s %s\n", suite,
-                condition ? "PASS" : "FAIL", name);
-    if(!condition) ++failures;
-  }
+class RevocationState {
+ public:
+  RevocationState() : active(false) {}
+  std::atomic<bool> active;
 };
 
-Address address(std::uint64_t sender, std::uint64_t receiver,
-                std::uint32_t connection, std::uint32_t stream,
-                Direction direction) {
-  Address value;
-  value.sender = sender;
-  value.receiver = receiver;
-  value.connection = connection;
-  value.stream = stream;
-  value.direction = direction;
-  return value;
+namespace {
+
+std::mutex g_origin_mutex;
+std::set<std::array<std::uint8_t, ORIGIN_BYTES> > g_process_origins;
+
+bool os_random(std::uint8_t* out, std::size_t size) {
+  if(!out || size == 0) return false;
+#ifdef _WIN32
+  return BCryptGenRandom(NULL, out, static_cast<ULONG>(size),
+                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+#else
+  std::size_t offset = 0;
+  while(offset < size) {
+    const ssize_t got = getrandom(out + offset, size - offset, 0);
+    if(got > 0) {
+      offset += static_cast<std::size_t>(got);
+      continue;
+    }
+    if(got < 0 && errno == EINTR) continue;
+    return false;
+  }
+  return true;
+#endif
 }
 
-bool make_descriptor(OriginFactory* factory, const Address& route,
-                     std::uint64_t session, std::uint64_t first,
-                     StreamDescriptor* out) {
-  return StreamDescriptor::create_local(route, session, first, factory, out);
+void put_u32(std::vector<std::uint8_t>* out, std::uint32_t value) {
+  for(int shift = 24; shift >= 0; shift -= 8)
+    out->push_back(static_cast<std::uint8_t>(value >> shift));
 }
 
-std::vector<std::uint8_t> bytes(std::uint8_t seed, std::size_t count) {
-  std::vector<std::uint8_t> out(count);
-  for(std::size_t i = 0; i < count; ++i)
-    out[i] = static_cast<std::uint8_t>(seed + i * 37u + i * i * 11u);
-  return out;
+void put_u64(std::vector<std::uint8_t>* out, std::uint64_t value) {
+  for(int shift = 56; shift >= 0; shift -= 8)
+    out->push_back(static_cast<std::uint8_t>(value >> shift));
 }
 
-std::vector<std::uint8_t> block(std::uint8_t seed) {
-  std::vector<std::uint8_t> out(24);
-  for(std::size_t i = 0; i < out.size(); ++i)
-    out[i] = static_cast<std::uint8_t>(seed + 13 * i);
-  return out;
+bool all_zero(const std::array<std::uint8_t, ORIGIN_BYTES>& bytes) {
+  std::uint8_t folded = 0;
+  for(std::uint8_t byte : bytes) folded |= byte;
+  return folded == 0;
 }
 
-Receiver::Clock::time_point future_ms(int milliseconds) {
-  return Receiver::Clock::now() + std::chrono::milliseconds(milliseconds);
+std::uint64_t instance_from_origin(const Origin& origin) {
+  std::uint64_t value = 0;
+  for(std::size_t i = 0; i < sizeof(value); ++i)
+    value = (value << 8) | origin.bytes()[i];
+  if(value == 0) {
+    for(std::size_t i = sizeof(value); i < 2 * sizeof(value); ++i)
+      value = (value << 8) | origin.bytes()[i];
+  }
+  return value == 0 ? 1 : value;
 }
 
-Receiver::Clock::time_point after_ms(int ms) {
-  return Receiver::Clock::now() + std::chrono::milliseconds(ms);
-}
-
-DataRecord fabricate(const StreamDescriptor& descriptor,
-                     std::uint64_t generation,
-                     const std::vector<std::uint8_t>& value,
-                     Protection protection) {
-  DataRecord record;
-  record.identity.stream = descriptor;
-  record.identity.generation = generation;
-  record.identity.application_bytes = value.size();
-  record.identity.application_digest = digest_bytes(value.data(), value.size());
-  record.protection = protection;
-  record.transported = value;
-  record.transported_digest = digest_bytes(value.data(), value.size());
-  return record;
+bool digest_equal(const Digest& lhs, const Digest& rhs) {
+  std::uint8_t difference = 0;
+  for(std::size_t i = 0; i < DIGEST_BYTES; ++i)
+    difference |= static_cast<std::uint8_t>(lhs[i] ^ rhs[i]);
+  return difference == 0;
 }
 
 /*
- * The tests model the transport's single wire-authentication boundary: each
- * admission or feedback application first mints the attestation over exactly
- * the bytes the scenario's authenticator saw, then hands it to the core.
+ * Attestation preimages are domain-separated from every canonical encoding
+ * and from each other, so a data attestation can never satisfy a feedback
+ * check or the reverse.
  */
-AdmitResult admit_verified(Receiver* receiver, const DataRecord& record,
-                           Verification verification, Feedback* receipt) {
-  return receiver->admit(
-      record, WireAttestation::attest_data(record, verification), receipt);
+std::vector<std::uint8_t> attestation_preimage(
+    std::uint8_t domain, const std::vector<std::uint8_t>& canonical) {
+  std::vector<std::uint8_t> out;
+  if(canonical.empty()) return out;
+  static const std::uint8_t tag[] = {
+      'M','E','R','C','U','R','Y','-','F','A','D','E','-','A','T'};
+  out.reserve(sizeof(tag) + 1 + canonical.size());
+  out.insert(out.end(), tag, tag + sizeof(tag));
+  out.push_back(domain);
+  out.insert(out.end(), canonical.begin(), canonical.end());
+  return out;
 }
 
-bool apply_verified(SourceRetainer* source, const Feedback& feedback,
-                    Verification verification) {
-  return source->apply_feedback(
-      feedback, WireAttestation::attest_feedback(feedback, verification));
+std::vector<std::uint8_t> data_attestation_bytes(const DataRecord& record) {
+  std::vector<std::uint8_t> canonical =
+      canonical_identity_bytes(record.identity);
+  if(canonical.empty()) return canonical;
+  canonical.push_back(static_cast<std::uint8_t>(record.protection));
+  canonical.insert(canonical.end(), record.transported_digest.begin(),
+                   record.transported_digest.end());
+  return attestation_preimage(1, canonical);
+}
+
+std::vector<std::uint8_t> feedback_attestation_bytes(const Feedback& feedback) {
+  return attestation_preimage(2, canonical_feedback_bytes(feedback));
 }
 
 }  // namespace
 
-int run_fade_core_tests() {
-  TestLog log;
-  OriginFactory factory;
-  const Address forward = address(0x414c504841ULL, 0x425241564fULL,
-                                  71, 9, Direction::A_TO_B);
-  const Address reverse = address(0x425241564fULL, 0x414c504841ULL,
-                                  71, 9, Direction::B_TO_A);
-  StreamDescriptor fwd;
-  StreamDescriptor rev;
-  log.check(make_descriptor(&factory, forward, 7001, 0, &fwd),
-            "ORIGIN", "fresh forward directional descriptor");
-  log.check(make_descriptor(&factory, reverse, 7001, 0, &rev),
-            "ORIGIN", "fresh reverse directional descriptor");
-  log.check(fwd.origin() != rev.origin() && fwd.instance() != rev.instance(),
-            "ORIGIN", "session directions have distinct immutable origins");
+bool Address::valid() const {
+  return sender != 0 && receiver != 0 && sender != receiver
+      && (direction == Direction::A_TO_B || direction == Direction::B_TO_A);
+}
 
-  bool origin_set_unique = true;
-  std::vector<Origin> minted;
-  for(unsigned i = 0; i < 256; ++i) {
-    Origin origin;
-    if(!factory.fresh(&origin)) { origin_set_unique = false; break; }
-    for(const Origin& prior : minted)
-      if(prior == origin) origin_set_unique = false;
-    minted.push_back(origin);
-  }
-  log.check(origin_set_unique, "ORIGIN",
-            "256 additional origins contain no process-local repeat");
+bool Address::operator==(const Address& rhs) const {
+  return sender == rhs.sender && receiver == rhs.receiver
+      && connection == rhs.connection && stream == rhs.stream
+      && direction == rhs.direction;
+}
 
-  // Exact S1b descriptor-forgery reproduction: authenticate generation 1 under
-  // baseline 0, then relabel only the stream's first generation to 1.  The
-  // relabel must change both canonical encodings, so it cannot reuse either
-  // the DATA authenticator or a feedback authenticator.
-  const Address forged_address = address(0x1111111111111111ULL,
-                                         0x2222222222222222ULL,
-                                         77, 9, Direction::A_TO_B);
-  std::uint8_t origin_bytes[ORIGIN_BYTES];
-  for(std::size_t i = 0; i < ORIGIN_BYTES; ++i)
-    origin_bytes[i] = static_cast<std::uint8_t>(0x41 + i);
-  Origin origin;
-  const bool origin_created =
-      Origin::from_wire(origin_bytes, sizeof(origin_bytes), &origin);
-  StreamDescriptor baseline0;
-  StreamDescriptor baseline1;
-  const bool baselines_created = origin_created
-      && StreamDescriptor::from_wire(
-          forged_address, 9001, origin, 0x4142434445464748ULL, 0, &baseline0)
-      && StreamDescriptor::from_wire(
-          forged_address, 9001, origin, 0x4142434445464748ULL, 1, &baseline1);
+Origin::Origin() : bytes_{} {}
 
-  const std::vector<std::uint8_t> b1 = block(0x83);
-  DataRecord genuine1 = fabricate(baseline0, 1, b1,
-                                  Protection::AEAD_COVERED);
-  DataRecord relabelled1 = genuine1;
-  relabelled1.identity.stream = baseline1;
-  const bool unequal_descriptors = baseline0 != baseline1;
-  const bool canonical_collision =
-      canonical_identity_bytes(genuine1.identity)
-          == canonical_identity_bytes(relabelled1.identity);
-  Feedback genuine_feedback;
-  genuine_feedback.kind = FeedbackKind::COMMIT;
-  genuine_feedback.identity = genuine1.identity;
-  genuine_feedback.transported_digest = genuine1.transported_digest;
-  genuine_feedback.committed_application_bytes = b1.size();
-  Feedback relabelled_feedback = genuine_feedback;
-  relabelled_feedback.identity = relabelled1.identity;
-  const bool feedback_collision =
-      canonical_feedback_bytes(genuine_feedback)
-          == canonical_feedback_bytes(relabelled_feedback);
-  std::vector<std::uint8_t> forged_sink;
-  Receiver forged_receiver(forged_address, 9001, [&](const CommitView& view) {
-    forged_sink.insert(forged_sink.end(), view.application_bytes,
-                       view.application_bytes + view.application_size);
-    return true;
-  });
-  Feedback forged_receipt;
-  CommitTicket forged_ticket;
-  Feedback forged_commit;
-  const bool forged_published = baselines_created
-      && forged_receiver.publish_once(baseline1, after_ms(2000))
-          == PublishResult::PUBLISHED;
-  const bool forged_admitted = forged_published
-      && admit_verified(&forged_receiver, relabelled1,
-                        Verification::AEAD_VERIFIED,
-                        &forged_receipt) == AdmitResult::ACCEPTED;
-  const bool forged_committed = forged_admitted
-      && forged_receiver.prepare_commit(relabelled1.identity, &forged_ticket)
-      && forged_receiver.commit(std::move(forged_ticket), b1.data(), b1.size(),
-                                &forged_commit);
-  const bool descriptor_secure = !(unequal_descriptors && canonical_collision
-      && feedback_collision
-      && forged_published && forged_admitted && forged_committed
-      && forged_sink == b1);
-  log.check(baselines_created && unequal_descriptors
-            && !canonical_collision && !feedback_collision
-            && descriptor_secure,
-            "DESCRIPTOR-FORGERY",
-            "first_generation relabel cannot reuse canonical DATA or feedback "
-            "bytes to commit generation 1 as the first 24-byte block");
+Origin::Origin(const std::array<std::uint8_t, ORIGIN_BYTES>& bytes)
+    : bytes_(bytes) {}
 
-  // Cover the whole identity class, not one example descriptor. Every field
-  // consulted by Address, StreamDescriptor, or RecordIdentity equality must
-  // independently perturb DATA identity bytes and inherited feedback bytes.
-  std::uint8_t alternate_origin_bytes[ORIGIN_BYTES];
-  std::memcpy(alternate_origin_bytes, origin_bytes,
-              sizeof(alternate_origin_bytes));
-  alternate_origin_bytes[0] ^= 0x80;
-  Origin alternate_origin;
-  const bool alternate_origin_created = Origin::from_wire(
-      alternate_origin_bytes, sizeof(alternate_origin_bytes),
-      &alternate_origin);
-  struct IdentityVariant {
-    const char* field;
-    RecordIdentity identity;
-  };
-  std::vector<IdentityVariant> identity_variants;
-  const auto add_stream_variant = [&](const char* field,
-                                      const Address& variant_address,
-                                      std::uint64_t session,
-                                      const Origin& variant_origin,
-                                      std::uint64_t instance,
-                                      std::uint64_t first_generation) {
-    StreamDescriptor descriptor;
-    if(!StreamDescriptor::from_wire(variant_address, session, variant_origin,
-                                    instance, first_generation, &descriptor))
-      return false;
-    RecordIdentity identity = genuine1.identity;
-    identity.stream = descriptor;
-    identity_variants.push_back(IdentityVariant{field, identity});
-    return true;
-  };
-  Address changed_address = forged_address;
-  changed_address.sender += 1;
-  bool coverage_setup = alternate_origin_created
-      && add_stream_variant("sender is canonically bound", changed_address,
-                            9001, origin, 0x4142434445464748ULL, 0);
-  changed_address = forged_address;
-  changed_address.receiver += 1;
-  coverage_setup = add_stream_variant(
-      "receiver is canonically bound", changed_address, 9001, origin,
-      0x4142434445464748ULL, 0) && coverage_setup;
-  changed_address = forged_address;
-  changed_address.connection += 1;
-  coverage_setup = add_stream_variant(
-      "connection is canonically bound", changed_address, 9001, origin,
-      0x4142434445464748ULL, 0) && coverage_setup;
-  changed_address = forged_address;
-  changed_address.stream += 1;
-  coverage_setup = add_stream_variant(
-      "stream is canonically bound", changed_address, 9001, origin,
-      0x4142434445464748ULL, 0) && coverage_setup;
-  changed_address = forged_address;
-  changed_address.direction = Direction::B_TO_A;
-  coverage_setup = add_stream_variant(
-      "direction is canonically bound", changed_address, 9001, origin,
-      0x4142434445464748ULL, 0) && coverage_setup;
-  coverage_setup = add_stream_variant(
-      "session is canonically bound", forged_address, 9002, origin,
-      0x4142434445464748ULL, 0) && coverage_setup;
-  coverage_setup = add_stream_variant(
-      "origin is canonically bound", forged_address, 9001, alternate_origin,
-      0x4142434445464748ULL, 0) && coverage_setup;
-  coverage_setup = add_stream_variant(
-      "instance is canonically bound", forged_address, 9001, origin,
-      0x4142434445464749ULL, 0) && coverage_setup;
-  coverage_setup = add_stream_variant(
-      "first_generation is canonically bound", forged_address, 9001, origin,
-      0x4142434445464748ULL, 1) && coverage_setup;
+bool Origin::from_wire(const std::uint8_t* bytes, std::size_t size,
+                       Origin* out) {
+  if(!bytes || size != ORIGIN_BYTES || !out) return false;
+  std::array<std::uint8_t, ORIGIN_BYTES> candidate{};
+  std::copy(bytes, bytes + size, candidate.begin());
+  if(all_zero(candidate)) return false;
+  *out = Origin(candidate);
+  return true;
+}
 
-  RecordIdentity changed_identity = genuine1.identity;
-  changed_identity.generation += 1;
-  identity_variants.push_back(
-      IdentityVariant{"generation is canonically bound", changed_identity});
-  changed_identity = genuine1.identity;
-  changed_identity.application_bytes += 1;
-  identity_variants.push_back(IdentityVariant{
-      "application_bytes is canonically bound", changed_identity});
-  changed_identity = genuine1.identity;
-  changed_identity.application_digest[0] ^= 0x01;
-  identity_variants.push_back(IdentityVariant{
-      "application_digest is canonically bound", changed_identity});
+bool Origin::valid() const { return !all_zero(bytes_); }
 
-  log.check(coverage_setup && identity_variants.size() == 12,
-            "IDENTITY-COVERAGE", "all identity-field variants constructed");
-  for(const IdentityVariant& variant : identity_variants) {
-    Feedback variant_feedback = genuine_feedback;
-    variant_feedback.identity = variant.identity;
-    log.check(variant.identity != genuine1.identity
-              && canonical_identity_bytes(variant.identity)
-                  != canonical_identity_bytes(genuine1.identity)
-              && canonical_feedback_bytes(variant_feedback)
-                  != canonical_feedback_bytes(genuine_feedback),
-              "IDENTITY-COVERAGE", variant.field);
-  }
-
-  Receiver newer_session(forward, 7002, [](const CommitView&) {
-    return true;
-  });
-  log.check(newer_session.publish_once(fwd, future_ms(5000))
-                == PublishResult::INVALID
-            && !newer_session.pinned(),
-            "REFUTE3", "prior-session offer cannot establish a new receiver");
-
-  std::vector<std::uint8_t> app_sink;
-  int sink_calls = 0;
-  Receiver receiver(forward, 7001, [&](const CommitView& view) {
-    ++sink_calls;
-    app_sink.insert(app_sink.end(), view.application_bytes,
-                    view.application_bytes + view.application_size);
-    return true;
-  });
-
-  SourceRetainer source(forward.sender, fwd,
-                        Protection::AUTHENTICATED_FRAME);
-  const std::vector<std::uint8_t> block0 = bytes(7, 24);
-  const std::vector<std::uint8_t> block1 = bytes(0x91, 24);
-  DataRecord data0;
-  DataRecord data1;
-  log.check(source.valid()
-            && source.stage(block0.data(), block0.size(), block0.data(),
-                            block0.size(), &data0)
-            && source.stage(block1.data(), block1.size(), block1.data(),
-                            block1.size(), &data1),
-            "RETENTION", "two source batches staged with full ownership");
-
-  Feedback receipt;
-  Feedback discard;
-  log.check(admit_verified(&receiver, data0, Verification::FRAME_VERIFIED,
-                           &receipt)
-                == AdmitResult::REFUSED
-            && receiver.stored_count() == 0,
-            "REFUTE3", "pre-publication DATA refused before storage");
-
-  const Receiver::Clock::time_point main_deadline = future_ms(5000);
-  log.check(receiver.publish_once(fwd, main_deadline)
-                == PublishResult::PUBLISHED,
-            "LIFECYCLE", "one live descriptor published");
-  log.check(receiver.publish_once(fwd, main_deadline)
-                == PublishResult::EXACT_DUPLICATE,
-            "LIFECYCLE", "exact control retry is idempotent");
-  log.check(receiver.publish_once(rev, main_deadline)
-                == PublishResult::INVALID
-            && receiver.pinned(),
-            "REFUTE3", "conflicting stale offer cannot repin live receiver");
-
-  DataRecord wrong = data0;
-  wrong.identity.stream = rev;
-  const std::size_t before_bad = receiver.stored_count();
-  log.check(admit_verified(&receiver, wrong, Verification::FRAME_VERIFIED,
-                           &discard)
-                == AdmitResult::REFUSED
-            && receiver.stored_count() == before_bad,
-            "ADMISSION", "wrong origin/address rejected before storage");
-  log.check(admit_verified(&receiver, data0, Verification::AEAD_VERIFIED,
-                           &discard)
-                == AdmitResult::REFUSED
-            && receiver.stored_count() == before_bad,
-            "ADMISSION", "verification mode cannot be relabelled");
-  wrong = data0;
-  wrong.transported[0] ^= 0x80;
-  log.check(admit_verified(&receiver, wrong, Verification::FRAME_VERIFIED,
-                           &discard)
-                == AdmitResult::REFUSED
-            && receiver.stored_count() == before_bad,
-            "ADMISSION", "sender digest mismatch rejected before storage");
-  wrong = data0;
-  wrong.identity.generation = 1000;
-  log.check(admit_verified(&receiver, wrong, Verification::FRAME_VERIFIED,
-                           &discard)
-                == AdmitResult::REFUSED
-            && receiver.stored_count() == before_bad,
-            "REFUTE5", "fast/out-of-window path cannot bypass generation gate");
-
-  Feedback receipt1;
-  log.check(admit_verified(&receiver, data1, Verification::FRAME_VERIFIED,
-                           &receipt1)
-                == AdmitResult::ACCEPTED
-            && receipt1.kind == FeedbackKind::RECEIPT
-            && receipt1.identity == data1.identity,
-            "INTEGRITY24", "successor may be received but keeps sender identity");
-  log.check(apply_verified(&source, receipt1, Verification::FRAME_VERIFIED)
-            && source.retained_count() == 2
-            && source.retained_source_bytes() == 48,
-            "RETENTION", "RECEIPT does not release either source batch");
-  CommitTicket early;
-  log.check(!receiver.prepare_commit(data1.identity, &early)
-            && app_sink.empty() && sink_calls == 0,
-            "INTEGRITY24", "missing 24-byte generation blocks successor commit");
-
-  Feedback receipt0;
-  log.check(admit_verified(&receiver, data0, Verification::FRAME_VERIFIED,
-                           &receipt0)
-                == AdmitResult::ACCEPTED
-            && apply_verified(&source, receipt0, Verification::FRAME_VERIFIED)
-            && source.retained_count() == 2,
-            "REFUTE1", "late predecessor received without releasing source");
-  CommitTicket ticket0;
-  CommitTicket duplicate_ticket0;
-  Feedback commit0;
-  log.check(receiver.prepare_commit(data0.identity, &ticket0)
-            && receiver.prepare_commit(data0.identity, &duplicate_ticket0),
-            "SINK", "tickets bind one ordered generation and lifetime");
-  log.check(receiver.commit(std::move(ticket0), block0.data(), block0.size(),
-                            &commit0)
-            && commit0.kind == FeedbackKind::COMMIT
-            && commit0.identity == data0.identity
-            && commit0.committed_application_bytes == 24,
-            "COMMIT", "sink acceptance creates distinct COMMIT feedback");
-  Feedback replayed_commit0;
-  log.check(admit_verified(&receiver, data0, Verification::FRAME_VERIFIED,
-                           &replayed_commit0)
-                == AdmitResult::EXACT_DUPLICATE
-            && replayed_commit0.kind == FeedbackKind::COMMIT
-            && replayed_commit0.identity == data0.identity
-            && replayed_commit0.committed_application_bytes == block0.size()
-            && sink_calls == 1,
-            "REFUTE5", "lost COMMIT is replayed without a second sink append");
-  Feedback unused;
-  log.check(!receiver.commit(std::move(duplicate_ticket0), block0.data(),
-                             block0.size(), &unused)
-            && sink_calls == 1,
-            "SINK", "second consumer cannot append the committed generation");
-  log.check(apply_verified(&source, commit0, Verification::FRAME_VERIFIED)
-            && apply_verified(&source, replayed_commit0,
-                              Verification::FRAME_VERIFIED)
-            && source.retained_count() == 1
-            && !source.retained(data0.identity.generation),
-            "RETENTION", "matching and duplicate COMMIT are idempotent release");
-
-  CommitTicket ticket1;
-  Feedback commit1;
-  Feedback wrong_length_commit;
-  wrong_length_commit.kind = FeedbackKind::COMMIT;
-  wrong_length_commit.identity = data1.identity;
-  wrong_length_commit.transported_digest = data1.transported_digest;
-  wrong_length_commit.committed_application_bytes = block1.size() - 1;
-  log.check(!apply_verified(&source, wrong_length_commit,
-                            Verification::FRAME_VERIFIED)
-            && source.retained_count() == 1,
-            "RETENTION", "COMMIT length must match retained source authority");
-  std::vector<std::uint8_t> corrupt_application = block1;
-  corrupt_application[0] ^= 0x40;
-  CommitTicket corrupt_ticket;
-  log.check(receiver.prepare_commit(data1.identity, &corrupt_ticket)
-            && !receiver.commit(std::move(corrupt_ticket),
-                                corrupt_application.data(),
-                                corrupt_application.size(), nullptr)
-            && receiver.stored_count() == 1
-            && receiver.next_generation() == data1.identity.generation
-            && sink_calls == 1,
-            "COMMIT", "post-decompression bytes must match sender commitment");
-  log.check(receiver.prepare_commit(data1.identity, &ticket1)
-            && receiver.commit(std::move(ticket1), block1.data(), block1.size(),
-                               &commit1)
-            && apply_verified(&source, commit1, Verification::FRAME_VERIFIED)
-            && source.retained_count() == 0,
-            "INTEGRITY24", "predecessor then successor commit byte-exactly");
-  std::vector<std::uint8_t> expected = block0;
-  expected.insert(expected.end(), block1.begin(), block1.end());
-  log.check(app_sink == expected && sink_calls == 2,
-            "INTEGRITY24", "ordered sink contains all 48 bytes with no deletion");
-  log.check(canonical_feedback_bytes(receipt0)
-                != canonical_feedback_bytes(commit0),
-            "FEEDBACK", "RECEIPT and COMMIT have distinct authenticated encodings");
-
-  // A commit acknowledgement with any relabelled address is powerless.
-  SourceRetainer address_source(forward.sender, fwd,
-                                Protection::AUTHENTICATED_FRAME);
-  DataRecord address_record;
-  address_source.stage(block0.data(), block0.size(), block0.data(),
-                       block0.size(), &address_record);
-  Feedback relabelled;
-  relabelled.kind = FeedbackKind::COMMIT;
-  relabelled.identity = address_record.identity;
-  relabelled.identity.stream = rev;
-  relabelled.transported_digest = address_record.transported_digest;
-  relabelled.committed_application_bytes = block0.size();
-  log.check(!apply_verified(&address_source, relabelled,
-                            Verification::FRAME_VERIFIED)
-            && address_source.retained_count() == 1,
-            "ADDRESS", "feedback cannot erase source after address relabelling");
-  log.check(canonical_identity_bytes(address_record.identity)
-                != canonical_identity_bytes(relabelled.identity),
-            "ADDRESS", "canonical binding preserves endpoints and direction");
-
-  // Reconnect is an explicit new origin/instance; old feedback cannot cross it.
-  StreamDescriptor reconnect;
-  log.check(make_descriptor(&factory, forward, 7002, 7, &reconnect)
-            && address_source.rebind(reconnect),
-            "REFUTE2", "retained source explicitly rebound to a fresh reconnect origin");
-  DataRecord rebound;
-  log.check(address_source.record(7, &rebound)
-            && rebound.identity.stream == reconnect
-            && rebound.identity.stream.origin() != fwd.origin(),
-            "REFUTE2", "rebound DATA carries new sender-owned instance");
-  Feedback stale_feedback;
-  stale_feedback.kind = FeedbackKind::COMMIT;
-  stale_feedback.identity = address_record.identity;
-  stale_feedback.transported_digest = address_record.transported_digest;
-  log.check(!apply_verified(&address_source, stale_feedback,
-                            Verification::FRAME_VERIFIED)
-            && address_source.retained_count() == 1,
-            "REFUTE2", "prior-session COMMIT cannot release rebound source");
-
-  // A ticket minted before reset is revoked under the same serialization lock.
-  std::vector<std::uint8_t> revoked_sink;
-  Receiver revoked_receiver(forward, 7002, [&](const CommitView& view) {
-    revoked_sink.insert(revoked_sink.end(), view.application_bytes,
-                        view.application_bytes + view.application_size);
-    return true;
-  });
-  revoked_receiver.publish_once(reconnect, future_ms(5000));
-  Feedback rebound_receipt;
-  admit_verified(&revoked_receiver, rebound, Verification::FRAME_VERIFIED,
-                 &rebound_receipt);
-  CommitTicket revoked_ticket;
-  const bool ticket_minted =
-      revoked_receiver.prepare_commit(rebound.identity, &revoked_ticket);
-  revoked_receiver.revoke();
-  Feedback should_not_commit;
-  log.check(ticket_minted
-            && !revoked_ticket.valid()
-            && !revoked_receiver.commit(std::move(revoked_ticket),
-                                        block0.data(), block0.size(),
-                                        &should_not_commit)
-            && revoked_sink.empty() && revoked_receiver.stored_count() == 0,
-            "REVOCATION", "revoke invalidates ticket, storage, and sink consumer");
-
-  // Revoke serializes with an already-running append. Once revoke returns,
-  // the sole consumer has finished and cannot be orphaned in the background.
-  std::atomic<bool> sink_entered(false);
-  std::atomic<bool> release_sink(false);
-  std::atomic<bool> revoke_returned(false);
-  bool concurrent_commit = false;
-  Receiver serial_receiver(forward, 7002, [&](const CommitView&) {
-    sink_entered.store(true);
-    while(!release_sink.load()) std::this_thread::yield();
-    return true;
-  });
-  serial_receiver.publish_once(reconnect, future_ms(5000));
-  admit_verified(&serial_receiver, rebound, Verification::FRAME_VERIFIED,
-                 &discard);
-  CommitTicket serial_ticket;
-  serial_receiver.prepare_commit(rebound.identity, &serial_ticket);
-  std::thread commit_thread([&] {
-    concurrent_commit = serial_receiver.commit(
-        std::move(serial_ticket), block0.data(), block0.size(), nullptr);
-  });
-  for(int i = 0; i < 1000 && !sink_entered.load(); ++i)
-    std::this_thread::yield();
-  std::thread revoke_thread([&] {
-    serial_receiver.revoke();
-    revoke_returned.store(true);
-  });
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  const bool revoke_waited = sink_entered.load() && !revoke_returned.load();
-  release_sink.store(true);
-  commit_thread.join();
-  revoke_thread.join();
-  log.check(revoke_waited && concurrent_commit && revoke_returned.load()
-            && serial_receiver.revoked(),
-            "REVOCATION", "revoke return is a complete consumer barrier");
-
-  // Sink failure is not commit and leaves the receiver-owned record retryable.
-  int failed_sink_calls = 0;
-  Receiver backpressure(forward, 7001, [&](const CommitView&) {
-    ++failed_sink_calls;
-    return false;
-  });
-  backpressure.publish_once(fwd, future_ms(5000));
-  admit_verified(&backpressure, data0, Verification::FRAME_VERIFIED, &discard);
-  CommitTicket backpressure_ticket;
-  backpressure.prepare_commit(data0.identity, &backpressure_ticket);
-  log.check(!backpressure.commit(std::move(backpressure_ticket), block0.data(),
-                                 block0.size(), nullptr)
-            && failed_sink_calls == 1 && backpressure.stored_count() == 1
-            && backpressure.next_generation() == 0,
-            "COMMIT", "sink refusal creates no commit and advances no cursor");
-
-  // Deadline is active: duplicate progress cannot re-arm it, and no later API
-  // call is required to perform the expiry/revocation.
-  std::atomic<int> deadline_sink_calls(0);
-  Receiver deadline_receiver(forward, 7001, [&](const CommitView&) {
-    ++deadline_sink_calls;
-    return true;
-  });
-  const Receiver::Clock::time_point absolute = future_ms(90);
-  deadline_receiver.publish_once(fwd, absolute);
-  Feedback deadline_receipt;
-  const AdmitResult first_deadline_admit = admit_verified(
-      &deadline_receiver, data0, Verification::FRAME_VERIFIED,
-      &deadline_receipt);
-  bool duplicate_progress = first_deadline_admit == AdmitResult::ACCEPTED;
-  for(int i = 0; i < 5; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    const AdmitResult result = admit_verified(
-        &deadline_receiver, data0, Verification::FRAME_VERIFIED, &discard);
-    duplicate_progress = duplicate_progress
-        && (result == AdmitResult::EXACT_DUPLICATE
-            || result == AdmitResult::REFUSED);
-  }
-  const bool unchanged_deadline = deadline_receiver.deadline() == absolute;
-  for(int i = 0; i < 100 && !deadline_receiver.expired(); ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  log.check(duplicate_progress && unchanged_deadline
-            && deadline_receiver.expired() && deadline_receiver.revoked()
-            && deadline_receiver.stored_count() == 0
-            && deadline_sink_calls.load() == 0,
-            "REFUTE4", "active absolute deadline expires despite progress drip");
-
-  // No modulo alias exists at the end of the full generation space.
-  StreamDescriptor near_wrap;
-  const std::uint64_t penultimate =
-      std::numeric_limits<std::uint64_t>::max() - 1u;
-  log.check(make_descriptor(&factory, forward, 7003, penultimate, &near_wrap),
-            "GENERATION", "full-width near-wrap descriptor created");
-  SourceRetainer wrap_source(forward.sender, near_wrap,
-                             Protection::AEAD_COVERED);
-  DataRecord wrap0;
-  DataRecord wrap1;
-  DataRecord wrap2;
-  const bool two_staged =
-      wrap_source.stage(block0.data(), block0.size(), block0.data(),
-                        block0.size(), &wrap0)
-      && wrap_source.stage(block1.data(), block1.size(), block1.data(),
-                           block1.size(), &wrap1);
-  const bool third_refused =
-      !wrap_source.stage(block0.data(), block0.size(), block0.data(),
-                         block0.size(), &wrap2);
-  log.check(two_staged && third_refused
-            && wrap0.identity.generation == penultimate
-            && wrap1.identity.generation
-                == std::numeric_limits<std::uint64_t>::max(),
-            "GENERATION", "generation exhaustion refuses rather than wrapping");
-
-  // Exact duplicate DATA yields another receipt only; it never appends.
-  std::vector<std::uint8_t> duplicate_sink;
-  Receiver duplicate_receiver(forward, 7003, [&](const CommitView& view) {
-    duplicate_sink.insert(duplicate_sink.end(), view.application_bytes,
-                          view.application_bytes + view.application_size);
-    return true;
-  });
-  duplicate_receiver.publish_once(near_wrap, future_ms(5000));
-  Feedback wrap_receipt_a;
-  Feedback wrap_receipt_b;
-  log.check(admit_verified(&duplicate_receiver, wrap0,
-                           Verification::AEAD_VERIFIED, &wrap_receipt_a)
-                == AdmitResult::ACCEPTED
-            && admit_verified(&duplicate_receiver, wrap0,
-                              Verification::AEAD_VERIFIED, &wrap_receipt_b)
-                == AdmitResult::EXACT_DUPLICATE
-            && duplicate_sink.empty()
-            && wrap_receipt_a.kind == FeedbackKind::RECEIPT
-            && wrap_receipt_b.kind == FeedbackKind::RECEIPT,
-            "FEEDBACK", "duplicate receipt is idempotent and not a commit");
-
-  // The admission boundary is object-bound.  The attestation minted at the
-  // wire-authentication boundary is the only admissible witness, it binds
-  // every authenticated byte, it is spent by first use, and a RECEIPT output
-  // is mandatory.  Each refusal below reproduces one previously accepted
-  // misuse of the old bare-enum boundary.
-  StreamDescriptor bound_stream;
-  log.check(make_descriptor(&factory, forward, 7004, 0, &bound_stream),
-            "APIBOUND", "bound stream descriptor created");
-  std::vector<std::uint8_t> bound_sink;
-  Receiver bound_receiver(forward, 7004, [&](const CommitView& view) {
-    bound_sink.insert(bound_sink.end(), view.application_bytes,
-                      view.application_bytes + view.application_size);
-    return true;
-  });
-  log.check(bound_receiver.publish_once(bound_stream, future_ms(5000))
-                == PublishResult::PUBLISHED,
-            "APIBOUND", "bound receiver published");
-  SourceRetainer bound_source(forward.sender, bound_stream,
-                              Protection::AUTHENTICATED_FRAME);
-  DataRecord bound0;
-  log.check(bound_source.stage(block0.data(), block0.size(), block0.data(),
-                               block0.size(), &bound0),
-            "APIBOUND", "bound record staged");
-
-  log.check(bound_receiver.admit(
-                bound0,
-                WireAttestation::attest_data(bound0,
-                                             Verification::FRAME_VERIFIED),
-                nullptr) == AdmitResult::REFUSED
-            && bound_receiver.stored_count() == 0,
-            "APIBOUND", "null receipt output refused before storage");
-
-  WireAttestation attested_before_mutation =
-      WireAttestation::attest_data(bound0, Verification::FRAME_VERIFIED);
-  DataRecord moved_generation = bound0;
-  moved_generation.identity.generation += 1;
-  Feedback bound_scratch;
-  log.check(bound_receiver.admit(moved_generation,
-                                 std::move(attested_before_mutation),
-                                 &bound_scratch) == AdmitResult::REFUSED
-            && bound_receiver.stored_count() == 0,
-            "APIBOUND", "record mutated after attestation refused before storage");
-
-  WireAttestation attested_frame =
-      WireAttestation::attest_data(bound0, Verification::FRAME_VERIFIED);
-  DataRecord relabelled_protection = bound0;
-  relabelled_protection.protection = Protection::AEAD_COVERED;
-  log.check(bound_receiver.admit(relabelled_protection,
-                                 std::move(attested_frame),
-                                 &bound_scratch) == AdmitResult::REFUSED
-            && bound_receiver.stored_count() == 0,
-            "APIBOUND", "protection relabel after attestation refused");
-
-  WireAttestation absent;
-  log.check(bound_receiver.admit(bound0, std::move(absent), &bound_scratch)
-                == AdmitResult::REFUSED
-            && bound_receiver.stored_count() == 0,
-            "APIBOUND", "an absent attestation admits nothing");
-
-  Feedback bound_receipt;
-  log.check(admit_verified(&bound_receiver, bound0,
-                           Verification::FRAME_VERIFIED, &bound_receipt)
-                == AdmitResult::ACCEPTED
-            && bound_receipt.kind == FeedbackKind::RECEIPT,
-            "APIBOUND", "attested admission still yields a receipt");
-  log.check(!WireAttestation::attest_data(bound0,
-                                          Verification::FAILED).valid()
-            && !WireAttestation::attest_feedback(
-                    bound_receipt, Verification::FAILED).valid(),
-            "APIBOUND", "a failed verification mints no attestation");
-  log.check(apply_verified(&bound_source, bound_receipt,
-                           Verification::FRAME_VERIFIED)
-            && bound_source.retained_count() == 1,
-            "APIBOUND", "attested receipt is applied and retains source");
-
-  // The S1b receipt-promotion reproduction: the attestation was minted over
-  // the RECEIPT bytes, then the feedback is relabelled to COMMIT afterwards.
-  // The relabelled bytes no longer match the attested bytes, so the retained
-  // source survives.
-  WireAttestation receipt_attestation = WireAttestation::attest_feedback(
-      bound_receipt, Verification::FRAME_VERIFIED);
-  Feedback promoted = bound_receipt;
-  promoted.kind = FeedbackKind::COMMIT;
-  promoted.committed_application_bytes = block0.size();
-  log.check(!bound_source.apply_feedback(promoted,
-                                         std::move(receipt_attestation))
-            && bound_source.retained_count() == 1,
-            "APIBOUND", "receipt relabelled to commit cannot release source");
-
-  WireAttestation single_use =
-      WireAttestation::attest_data(bound0, Verification::FRAME_VERIFIED);
-  log.check(bound_receiver.admit(bound0, std::move(single_use), &bound_scratch)
-                == AdmitResult::EXACT_DUPLICATE
-            && bound_scratch.kind == FeedbackKind::RECEIPT,
-            "APIBOUND", "fresh attestation covers an exact duplicate");
-  // Deliberately present the spent witness a second time.
-  log.check(bound_receiver.admit(bound0, std::move(single_use), &bound_scratch)
-                == AdmitResult::REFUSED,
-            "APIBOUND", "an attestation is spent by its first use");
-
-  CommitTicket bound_ticket;
-  Feedback bound_commit;
-  log.check(bound_receiver.prepare_commit(bound0.identity, &bound_ticket)
-            && bound_receiver.commit(std::move(bound_ticket), block0.data(),
-                                     block0.size(), &bound_commit)
-            && bound_commit.kind == FeedbackKind::COMMIT
-            && apply_verified(&bound_source, bound_commit,
-                              Verification::FRAME_VERIFIED)
-            && bound_source.retained_count() == 0
-            && bound_sink == block0,
-            "APIBOUND", "attested commit round trip releases source");
-
-  // CI replay of the frozen six-run clean-WGN class.  The observed cohort used
-  // 18 timed RF batches per 262144-byte transfer and had mean CONNECT-to-settle
-  // occupancy 349.56232966449915 s, of which 319.033 s was forward emission.
-  // The core operates at batch ownership boundaries; it must preserve all six
-  // byte-exact completions without splitting or otherwise changing RF batches.
-  int wgn_completions = 0;
-  bool wgn_batch_geometry = true;
-  const std::size_t wgn_payload_bytes = 262144;
-  const int wgn_batches = 18;
-  for(int sample = 0; sample < 6; ++sample) {
-    const std::vector<std::uint8_t> payload = bytes(
-        static_cast<std::uint8_t>(31 + sample * 19), wgn_payload_bytes);
-    std::vector<std::uint8_t> delivered;
-    int delivered_batches = 0;
-    Receiver wgn_receiver(forward, 8000 + sample,
-                          [&](const CommitView& view) {
-                            ++delivered_batches;
-                            delivered.insert(
-                                delivered.end(), view.application_bytes,
-                                view.application_bytes + view.application_size);
-                            return true;
-                          }, wgn_batches);
-    StreamDescriptor wgn_stream;
-    bool complete = make_descriptor(&factory, forward, 8000 + sample, 0,
-                                    &wgn_stream)
-        && wgn_receiver.publish_once(wgn_stream, future_ms(5000))
-               == PublishResult::PUBLISHED;
-    SourceRetainer wgn_source(forward.sender, wgn_stream,
-                              Protection::AUTHENTICATED_FRAME);
-    std::size_t offset = 0;
-    for(int batch = 0; complete && batch < wgn_batches; ++batch) {
-      const std::size_t remaining = payload.size() - offset;
-      const std::size_t chunks_left =
-          static_cast<std::size_t>(wgn_batches - batch);
-      const std::size_t chunk = (remaining + chunks_left - 1) / chunks_left;
-      DataRecord record;
-      Feedback got;
-      Feedback put;
-      CommitTicket ticket;
-      complete = wgn_source.stage(payload.data() + offset, chunk,
-                                  payload.data() + offset, chunk, &record)
-          && admit_verified(&wgn_receiver, record,
-                            Verification::FRAME_VERIFIED, &got)
-                 == AdmitResult::ACCEPTED
-          && got.kind == FeedbackKind::RECEIPT
-          && apply_verified(&wgn_source, got, Verification::FRAME_VERIFIED)
-          && wgn_receiver.prepare_commit(record.identity, &ticket)
-          && wgn_receiver.commit(std::move(ticket), payload.data() + offset,
-                                 chunk, &put)
-          && put.kind == FeedbackKind::COMMIT
-          && apply_verified(&wgn_source, put, Verification::FRAME_VERIFIED);
-      offset += chunk;
+bool OriginFactory::fresh(Origin* out) {
+  if(!out) return false;
+  for(unsigned attempt = 0; attempt < 16; ++attempt) {
+    std::array<std::uint8_t, ORIGIN_BYTES> bytes{};
+    if(!os_random(bytes.data(), bytes.size())) return false;
+    if(all_zero(bytes)) continue;
+    std::lock_guard<std::mutex> lock(g_origin_mutex);
+    if(g_process_origins.insert(bytes).second) {
+      *out = Origin(bytes);
+      return true;
     }
-    complete = complete && offset == payload.size() && delivered == payload
-        && delivered_batches == wgn_batches
-        && wgn_source.retained_count() == 0;
-    if(complete) ++wgn_completions;
-    wgn_batch_geometry = wgn_batch_geometry
-        && delivered_batches == wgn_batches;
   }
-  const double frozen_forward_occupancy = 319.033 / 349.56232966449915;
-  log.check(wgn_completions == 6 && wgn_batch_geometry
-            && frozen_forward_occupancy > 0.91
-            && frozen_forward_occupancy < 0.915,
-            "WGN-GATE", "six clean transfers preserve timed RF batch boundaries");
-  std::printf("[TEST-FADE-CORE/WGN-GATE] completions=%d/6 "
-              "forward_occupancy=%.3f%% batches_per_transfer=%d\n",
-              wgn_completions, 100.0 * frozen_forward_occupancy, wgn_batches);
+  return false;
+}
 
-  std::printf("[TEST-FADE-CORE] %s failures=%d suites=6 integrity24=%s\n",
-              log.failures ? "FAIL" : "PASS", log.failures,
-              log.failures ? "FAIL" : "PASS");
-  return log.failures ? 1 : 0;
+StreamDescriptor::StreamDescriptor()
+    : session_(0), instance_(0), first_generation_(0) {}
+
+bool StreamDescriptor::create_local(const Address& address,
+                                    std::uint64_t session,
+                                    std::uint64_t first_generation,
+                                    OriginFactory* factory,
+                                    StreamDescriptor* out) {
+  if(!factory || !out || !address.valid() || session == 0) return false;
+  Origin origin;
+  if(!factory->fresh(&origin)) return false;
+  return from_wire(address, session, origin, instance_from_origin(origin),
+                   first_generation, out);
+}
+
+bool StreamDescriptor::from_wire(const Address& address, std::uint64_t session,
+                                 const Origin& origin, std::uint64_t instance,
+                                 std::uint64_t first_generation,
+                                 StreamDescriptor* out) {
+  if(!out || !address.valid() || session == 0 || !origin.valid()
+     || instance == 0) return false;
+  StreamDescriptor candidate;
+  candidate.address_ = address;
+  candidate.session_ = session;
+  candidate.origin_ = origin;
+  candidate.instance_ = instance;
+  candidate.first_generation_ = first_generation;
+  *out = candidate;
+  return true;
+}
+
+bool StreamDescriptor::valid() const {
+  return address_.valid() && session_ != 0 && origin_.valid()
+      && instance_ != 0;
+}
+
+bool StreamDescriptor::operator==(const StreamDescriptor& rhs) const {
+  return address_ == rhs.address_ && session_ == rhs.session_
+      && origin_ == rhs.origin_ && instance_ == rhs.instance_
+      && first_generation_ == rhs.first_generation_;
+}
+
+bool RecordIdentity::operator==(const RecordIdentity& rhs) const {
+  return generation == rhs.generation
+      && application_bytes == rhs.application_bytes
+      && digest_equal(application_digest, rhs.application_digest)
+      && stream == rhs.stream;
+}
+
+std::vector<std::uint8_t> canonical_identity_bytes(
+    const RecordIdentity& identity) {
+  std::vector<std::uint8_t> out;
+  if(!identity.valid()) return out;
+  static const std::uint8_t domain[] = {
+      'M','E','R','C','U','R','Y','-','F','A','D','E','-','C','1',2};
+  out.insert(out.end(), domain, domain + sizeof(domain));
+  const Address& address = identity.stream.address();
+  put_u64(&out, address.sender);
+  put_u64(&out, address.receiver);
+  put_u32(&out, address.connection);
+  put_u32(&out, address.stream);
+  out.push_back(static_cast<std::uint8_t>(address.direction));
+  put_u64(&out, identity.stream.session());
+  out.insert(out.end(), identity.stream.origin().bytes().begin(),
+             identity.stream.origin().bytes().end());
+  put_u64(&out, identity.stream.instance());
+  put_u64(&out, identity.stream.first_generation());
+  put_u64(&out, identity.generation);
+  put_u64(&out, identity.application_bytes);
+  out.insert(out.end(), identity.application_digest.begin(),
+             identity.application_digest.end());
+  return out;
+}
+
+std::vector<std::uint8_t> canonical_feedback_bytes(const Feedback& feedback) {
+  std::vector<std::uint8_t> out = canonical_identity_bytes(feedback.identity);
+  if(out.empty()) return out;
+  out.push_back(static_cast<std::uint8_t>(feedback.kind));
+  out.insert(out.end(), feedback.transported_digest.begin(),
+             feedback.transported_digest.end());
+  put_u64(&out, feedback.committed_application_bytes);
+  return out;
+}
+
+Digest digest_bytes(const std::uint8_t* bytes, std::size_t size) {
+  Digest digest{};
+  if(size != 0 && !bytes) return digest;
+  crypto_blake2b(digest.data(), digest.size(), bytes, size);
+  return digest;
+}
+
+WireAttestation::WireAttestation()
+    : kind_(Kind::ABSENT), verification_(Verification::FAILED), binding_{} {}
+
+WireAttestation::WireAttestation(WireAttestation&& rhs) noexcept
+    : kind_(rhs.kind_), verification_(rhs.verification_),
+      binding_(rhs.binding_) {
+  rhs.consume();
+}
+
+WireAttestation& WireAttestation::operator=(WireAttestation&& rhs) noexcept {
+  if(this == &rhs) return *this;
+  kind_ = rhs.kind_;
+  verification_ = rhs.verification_;
+  binding_ = rhs.binding_;
+  rhs.consume();
+  return *this;
+}
+
+WireAttestation WireAttestation::attest_data(const DataRecord& record,
+                                             Verification verification) {
+  WireAttestation out;
+  if(verification != Verification::AEAD_VERIFIED
+     && verification != Verification::FRAME_VERIFIED) return out;
+  const std::vector<std::uint8_t> preimage = data_attestation_bytes(record);
+  if(preimage.empty()) return out;
+  out.kind_ = Kind::DATA_RECORD;
+  out.verification_ = verification;
+  out.binding_ = digest_bytes(preimage.data(), preimage.size());
+  return out;
+}
+
+WireAttestation WireAttestation::attest_feedback(const Feedback& feedback,
+                                                 Verification verification) {
+  WireAttestation out;
+  if(verification != Verification::AEAD_VERIFIED
+     && verification != Verification::FRAME_VERIFIED) return out;
+  const std::vector<std::uint8_t> preimage = feedback_attestation_bytes(feedback);
+  if(preimage.empty()) return out;
+  out.kind_ = Kind::FEEDBACK_RECORD;
+  out.verification_ = verification;
+  out.binding_ = digest_bytes(preimage.data(), preimage.size());
+  return out;
+}
+
+bool WireAttestation::valid() const { return kind_ != Kind::ABSENT; }
+
+bool WireAttestation::covers_data(const DataRecord& record) const {
+  if(kind_ != Kind::DATA_RECORD) return false;
+  const std::vector<std::uint8_t> preimage = data_attestation_bytes(record);
+  if(preimage.empty()) return false;
+  return digest_equal(binding_, digest_bytes(preimage.data(), preimage.size()));
+}
+
+bool WireAttestation::covers_feedback(const Feedback& feedback) const {
+  if(kind_ != Kind::FEEDBACK_RECORD) return false;
+  const std::vector<std::uint8_t> preimage = feedback_attestation_bytes(feedback);
+  if(preimage.empty()) return false;
+  return digest_equal(binding_, digest_bytes(preimage.data(), preimage.size()));
+}
+
+void WireAttestation::consume() {
+  kind_ = Kind::ABSENT;
+  verification_ = Verification::FAILED;
+  binding_ = Digest{};
+}
+
+SourceRetainer::SourceRetainer(std::uint64_t local_endpoint,
+                               const StreamDescriptor& descriptor,
+                               Protection protection)
+    : local_endpoint_(local_endpoint), descriptor_(descriptor),
+      protection_(protection), next_generation_(descriptor.first_generation()),
+      exhausted_(false) {}
+
+bool SourceRetainer::valid() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return descriptor_.valid()
+      && descriptor_.address().sender == local_endpoint_
+      && protection_ != Protection::INVALID;
+}
+
+bool SourceRetainer::stage(const std::uint8_t* source,
+                           std::size_t source_size,
+                           const std::uint8_t* transported,
+                           std::size_t transported_size, DataRecord* out) {
+  if(!source || source_size == 0 || !transported || transported_size == 0
+     || !out) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(!descriptor_.valid() || descriptor_.address().sender != local_endpoint_
+     || protection_ == Protection::INVALID || exhausted_) return false;
+
+  Entry entry;
+  entry.record.identity.stream = descriptor_;
+  entry.record.identity.generation = next_generation_;
+  entry.record.identity.application_bytes = source_size;
+  entry.record.identity.application_digest = digest_bytes(source, source_size);
+  entry.record.protection = protection_;
+  entry.record.transported.assign(transported, transported + transported_size);
+  entry.record.transported_digest =
+      digest_bytes(entry.record.transported.data(), entry.record.transported.size());
+  entry.source.assign(source, source + source_size);
+  entry.state = SourceState::SOURCE_STAGED;
+  try {
+    entries_.emplace(next_generation_, entry);
+  } catch (...) {
+    return false;
+  }
+  *out = entry.record;
+  if(next_generation_ == std::numeric_limits<std::uint64_t>::max())
+    exhausted_ = true;
+  else
+    ++next_generation_;
+  return true;
+}
+
+bool SourceRetainer::mark_sent(std::uint64_t generation) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = entries_.find(generation);
+  if(it == entries_.end()) return false;
+  if(it->second.state == SourceState::SOURCE_STAGED)
+    it->second.state = SourceState::SOURCE_SENT;
+  return true;
+}
+
+bool SourceRetainer::verification_matches(Verification verification) const {
+  return (protection_ == Protection::AEAD_COVERED
+          && verification == Verification::AEAD_VERIFIED)
+      || (protection_ == Protection::AUTHENTICATED_FRAME
+          && verification == Verification::FRAME_VERIFIED);
+}
+
+bool SourceRetainer::apply_feedback(const Feedback& feedback,
+                                    WireAttestation&& attestation) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // The attestation must have been minted over exactly these feedback bytes;
+  // it is spent by this application attempt whatever the outcome, and any
+  // field changed after the wire-authentication boundary fails the binding.
+  const bool attested = attestation.valid()
+      && attestation.covers_feedback(feedback);
+  const Verification verification = attestation.verification();
+  attestation.consume();
+  if(!attested || !verification_matches(verification)
+     || feedback.identity.stream != descriptor_) return false;
+  auto it = entries_.find(feedback.identity.generation);
+  if(it == entries_.end()) {
+    const auto released = released_.find(feedback.identity.generation);
+    return feedback.kind == FeedbackKind::COMMIT
+        && released != released_.end()
+        && feedback.identity == released->second.identity
+        && digest_equal(feedback.transported_digest, released->second.digest)
+        && feedback.committed_application_bytes
+            == released->second.application_bytes;
+  }
+  if(feedback.identity != it->second.record.identity
+     || !digest_equal(feedback.transported_digest,
+                   it->second.record.transported_digest)) return false;
+  if(feedback.kind == FeedbackKind::RECEIPT) {
+    if(feedback.committed_application_bytes != 0) return false;
+    it->second.state = SourceState::RECEIPT_OBSERVED;
+    return true;  // The source remains retained.
+  }
+  if(feedback.kind != FeedbackKind::COMMIT) return false;
+  if(feedback.committed_application_bytes != it->second.source.size())
+    return false;
+  Released released;
+  released.identity = it->second.record.identity;
+  released.digest = it->second.record.transported_digest;
+  released.application_bytes = it->second.source.size();
+  try {
+    if(!released_.emplace(feedback.identity.generation, released).second)
+      return false;
+  } catch (...) {
+    return false;
+  }
+  entries_.erase(it);  // COMMIT is the sole ordinary release operation.
+  return true;
+}
+
+bool SourceRetainer::rebind(const StreamDescriptor& replacement) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(!replacement.valid()
+     || replacement.address().sender != local_endpoint_
+     || replacement.address().sender != descriptor_.address().sender
+     || replacement.address().receiver != descriptor_.address().receiver
+     || replacement.address().stream != descriptor_.address().stream
+     || replacement.address().direction != descriptor_.address().direction
+     || replacement.origin() == descriptor_.origin()
+     || replacement.instance() == descriptor_.instance()) return false;
+
+  std::map<std::uint64_t, Entry> rebound;
+  std::uint64_t generation = replacement.first_generation();
+  bool exhausted = false;
+  for(const auto& old : entries_) {
+    if(exhausted) return false;
+    Entry next = old.second;
+    next.record.identity.stream = replacement;
+    next.record.identity.generation = generation;
+    next.state = SourceState::SOURCE_STAGED;
+    rebound.emplace(generation, std::move(next));
+    if(generation == std::numeric_limits<std::uint64_t>::max())
+      exhausted = true;
+    else
+      ++generation;
+  }
+  descriptor_ = replacement;
+  entries_.swap(rebound);
+  released_.clear();
+  next_generation_ = generation;
+  exhausted_ = exhausted;
+  return true;
+}
+
+std::size_t SourceRetainer::retained_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return entries_.size();
+}
+
+std::size_t SourceRetainer::retained_source_bytes() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t total = 0;
+  for(const auto& entry : entries_) total += entry.second.source.size();
+  return total;
+}
+
+bool SourceRetainer::retained(std::uint64_t generation,
+                              SourceState* state) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = entries_.find(generation);
+  if(it == entries_.end()) return false;
+  if(state) *state = it->second.state;
+  return true;
+}
+
+bool SourceRetainer::record(std::uint64_t generation, DataRecord* out) const {
+  if(!out) return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = entries_.find(generation);
+  if(it == entries_.end()) return false;
+  *out = it->second.record;
+  return true;
+}
+
+CommitTicket::CommitTicket()
+    : receiver_(nullptr), lifetime_(0), unused_(false) {}
+
+CommitTicket::CommitTicket(CommitTicket&& rhs) noexcept
+    : receiver_(rhs.receiver_), lifetime_(rhs.lifetime_),
+      identity_(rhs.identity_), digest_(rhs.digest_), unused_(rhs.unused_),
+      revocation_state_(std::move(rhs.revocation_state_)) {
+  rhs.receiver_ = nullptr;
+  rhs.unused_ = false;
+}
+
+CommitTicket& CommitTicket::operator=(CommitTicket&& rhs) noexcept {
+  if(this == &rhs) return *this;
+  receiver_ = rhs.receiver_;
+  lifetime_ = rhs.lifetime_;
+  identity_ = rhs.identity_;
+  digest_ = rhs.digest_;
+  unused_ = rhs.unused_;
+  revocation_state_ = std::move(rhs.revocation_state_);
+  rhs.receiver_ = nullptr;
+  rhs.unused_ = false;
+  return *this;
+}
+
+CommitTicket::~CommitTicket() {
+  receiver_ = nullptr;
+  unused_ = false;
+}
+
+bool CommitTicket::valid() const {
+  const std::shared_ptr<RevocationState> state = revocation_state_.lock();
+  return receiver_ != nullptr && unused_ && state
+      && state->active.load(std::memory_order_acquire);
+}
+
+Receiver::Receiver(const Address& expected_address,
+                   std::uint64_t expected_session, OrderedSink sink,
+                   std::size_t max_pending)
+    : expected_address_(expected_address), expected_session_(expected_session),
+      sink_(std::move(sink)), max_pending_(max_pending), next_generation_(0),
+      lifetime_(1), published_(false), revoked_(false), expired_(false),
+      stop_worker_(false), exhausted_(false),
+      revocation_state_(std::make_shared<RevocationState>()),
+      deadline_thread_(&Receiver::deadline_worker, this) {}
+
+Receiver::~Receiver() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    revoke_locked(false);
+    stop_worker_ = true;
+    deadline_cv_.notify_all();
+  }
+  if(deadline_thread_.joinable()) deadline_thread_.join();
+}
+
+PublishResult Receiver::publish_once(
+    const StreamDescriptor& descriptor, Clock::time_point absolute_deadline) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(!descriptor.valid() || !expected_address_.valid()
+     || descriptor.address() != expected_address_
+     || descriptor.session() != expected_session_
+     || expected_session_ == 0 || !sink_ || max_pending_ == 0
+     || absolute_deadline <= Clock::now()) return PublishResult::INVALID;
+  if(published_) {
+    if(!revoked_ && descriptor == descriptor_
+       && absolute_deadline == deadline_) return PublishResult::EXACT_DUPLICATE;
+    return PublishResult::CONFLICT_REFUSED;
+  }
+  descriptor_ = descriptor;
+  next_generation_ = descriptor.first_generation();
+  deadline_ = absolute_deadline;
+  published_ = true;
+  revoked_ = false;
+  expired_ = false;
+  revocation_state_->active.store(true, std::memory_order_release);
+  deadline_cv_.notify_all();
+  return PublishResult::PUBLISHED;
+}
+
+bool Receiver::verification_matches(Protection protection,
+                                    Verification verification) const {
+  return (protection == Protection::AEAD_COVERED
+          && verification == Verification::AEAD_VERIFIED)
+      || (protection == Protection::AUTHENTICATED_FRAME
+          && verification == Verification::FRAME_VERIFIED);
+}
+
+bool Receiver::same_stream(const RecordIdentity& identity) const {
+  return identity.stream == descriptor_;
+}
+
+AdmitResult Receiver::admit(const DataRecord& record,
+                            WireAttestation&& attestation, Feedback* receipt) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // One wire event authorizes one admission attempt: the attestation is
+  // spent here whatever the outcome, and its binding is judged against the
+  // record as presented, so nothing can change after authentication.
+  const bool attested = attestation.valid() && attestation.covers_data(record);
+  const Verification verification = attestation.verification();
+  attestation.consume();
+  // The RECEIPT output is mandatory.  Without it a record could reach COMMIT
+  // with no RECEIPT ever produced, collapsing the receipt/commit split, so a
+  // null output refuses admission before any storage mutation.
+  if(!receipt) return AdmitResult::REFUSED;
+  *receipt = Feedback();
+  if(!published_ || revoked_) return AdmitResult::REFUSED;
+  if(Clock::now() >= deadline_) {
+    revoke_locked(true);
+    return AdmitResult::REFUSED;
+  }
+  // This check is unconditional and precedes every parser/storage mutation.
+  if(!attested || !record.identity.valid() || !same_stream(record.identity)
+     || !verification_matches(record.protection, verification)
+     || record.transported.empty()) return AdmitResult::REFUSED;
+  const Digest actual = digest_bytes(record.transported.data(),
+                                     record.transported.size());
+  if(!digest_equal(actual, record.transported_digest))
+    return AdmitResult::REFUSED;
+
+  // A retransmission after lost COMMIT feedback is acknowledged as COMMIT
+  // again, without re-entering the sink. Keep this check behind every normal
+  // identity/authentication/digest gate so old-generation is never a bypass.
+  auto prior = committed_.find(record.identity.generation);
+  if(prior != committed_.end()) {
+    if(prior->second.identity != record.identity
+       || prior->second.protection != record.protection
+       || !digest_equal(prior->second.digest, record.transported_digest)) {
+      revoke_locked(false);
+      return AdmitResult::CONFLICT_REVOKED;
+    }
+    receipt->kind = FeedbackKind::COMMIT;
+    receipt->identity = record.identity;
+    receipt->transported_digest = record.transported_digest;
+    receipt->committed_application_bytes = prior->second.application_bytes;
+    return AdmitResult::EXACT_DUPLICATE;
+  }
+  if(exhausted_ || record.identity.generation < next_generation_)
+    return AdmitResult::REFUSED;
+  const std::uint64_t distance = record.identity.generation - next_generation_;
+  if(distance >= max_pending_) return AdmitResult::REFUSED;
+
+  auto present = stored_.find(record.identity.generation);
+  if(present != stored_.end()) {
+    if(present->second.identity == record.identity
+       && present->second.protection == record.protection
+       && digest_equal(present->second.transported_digest,
+                       record.transported_digest)
+       && present->second.transported == record.transported) {
+      receipt->kind = FeedbackKind::RECEIPT;
+      receipt->identity = record.identity;
+      receipt->transported_digest = record.transported_digest;
+      return AdmitResult::EXACT_DUPLICATE;
+    }
+    revoke_locked(false);
+    return AdmitResult::CONFLICT_REVOKED;
+  }
+  try {
+    stored_.emplace(record.identity.generation, record);
+  } catch (...) {
+    return AdmitResult::REFUSED;
+  }
+  receipt->kind = FeedbackKind::RECEIPT;
+  receipt->identity = record.identity;
+  receipt->transported_digest = record.transported_digest;
+  return AdmitResult::ACCEPTED;
+}
+
+bool Receiver::prepare_commit(const RecordIdentity& identity,
+                              CommitTicket* out) {
+  if(!out) return false;
+  *out = CommitTicket();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if(!published_ || revoked_ || exhausted_ || Clock::now() >= deadline_) {
+    if(published_ && !revoked_ && Clock::now() >= deadline_)
+      revoke_locked(true);
+    return false;
+  }
+  if(!same_stream(identity) || identity.generation != next_generation_)
+    return false;
+  auto stored = stored_.find(next_generation_);
+  if(stored == stored_.end() || stored->second.identity != identity)
+    return false;
+  out->receiver_ = this;
+  out->lifetime_ = lifetime_;
+  out->identity_ = identity;
+  out->digest_ = stored->second.transported_digest;
+  out->unused_ = true;
+  out->revocation_state_ = revocation_state_;
+  return true;
+}
+
+bool Receiver::commit(CommitTicket&& ticket,
+                      const std::uint8_t* application_bytes,
+                      std::size_t application_size, Feedback* committed) {
+  if(committed) *committed = Feedback();
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::shared_ptr<RevocationState> ticket_state =
+      ticket.revocation_state_.lock();
+  const bool ticket_valid = ticket.receiver_ == this && ticket.unused_
+      && ticket_state == revocation_state_
+      && ticket_state->active.load(std::memory_order_acquire);
+  ticket.unused_ = false;
+  ticket.receiver_ = nullptr;
+  if(!ticket_valid || !application_bytes || application_size == 0
+     || !published_ || revoked_ || exhausted_ || ticket.lifetime_ != lifetime_)
+    return false;
+  if(Clock::now() >= deadline_) {
+    revoke_locked(true);
+    return false;
+  }
+  if(!same_stream(ticket.identity_)
+     || ticket.identity_.generation != next_generation_) return false;
+  if(application_size != ticket.identity_.application_bytes
+     || !digest_equal(digest_bytes(application_bytes, application_size),
+                      ticket.identity_.application_digest)) return false;
+  auto stored = stored_.find(next_generation_);
+  if(stored == stored_.end() || stored->second.identity != ticket.identity_
+     || !digest_equal(stored->second.transported_digest, ticket.digest_))
+    return false;
+
+  CommittedRecord commitment;
+  commitment.identity = ticket.identity_;
+  commitment.protection = stored->second.protection;
+  commitment.digest = ticket.digest_;
+  commitment.application_bytes = application_size;
+  std::map<std::uint64_t, CommittedRecord>::iterator commitment_it;
+  try {
+    const auto inserted = committed_.emplace(
+        ticket.identity_.generation, commitment);
+    if(!inserted.second) return false;
+    commitment_it = inserted.first;
+  } catch (...) {
+    return false;
+  }
+
+  CommitView view;
+  view.identity = ticket.identity_;
+  view.transported_digest = ticket.digest_;
+  view.application_bytes = application_bytes;
+  view.application_size = application_size;
+  bool accepted = false;
+  try {
+    accepted = sink_(view);
+  } catch (...) {
+    accepted = false;
+  }
+  if(!accepted) {
+    committed_.erase(commitment_it);
+    return false;
+  }
+
+  if(committed) {
+    committed->kind = FeedbackKind::COMMIT;
+    committed->identity = ticket.identity_;
+    committed->transported_digest = ticket.digest_;
+    committed->committed_application_bytes = application_size;
+  }
+  stored_.erase(stored);
+  if(next_generation_ == std::numeric_limits<std::uint64_t>::max())
+    exhausted_ = true;
+  else
+    ++next_generation_;
+  return true;
+}
+
+void Receiver::revoke_locked(bool expired) {
+  if(revoked_) {
+    if(expired) expired_ = true;
+    return;
+  }
+  revoked_ = true;
+  expired_ = expired;
+  revocation_state_->active.store(false, std::memory_order_release);
+  stored_.clear();
+  committed_.clear();
+  if(lifetime_ != std::numeric_limits<std::uint64_t>::max()) ++lifetime_;
+  else lifetime_ = 0;  // No ticket can equal an exhausted prior lifetime.
+  deadline_cv_.notify_all();
+}
+
+void Receiver::revoke() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  revoke_locked(false);
+}
+
+void Receiver::deadline_worker() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  deadline_cv_.wait(lock, [this] { return stop_worker_ || published_; });
+  if(stop_worker_) return;
+  while(!stop_worker_ && published_ && !revoked_) {
+    if(deadline_cv_.wait_until(lock, deadline_,
+        [this] { return stop_worker_ || revoked_; })) break;
+    if(!stop_worker_ && !revoked_ && Clock::now() >= deadline_) {
+      revoke_locked(true);
+      break;
+    }
+  }
+}
+
+bool Receiver::pinned() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return published_ && !revoked_;
+}
+
+bool Receiver::revoked() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return revoked_;
+}
+
+bool Receiver::expired() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return expired_;
+}
+
+std::uint64_t Receiver::next_generation() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return next_generation_;
+}
+
+std::size_t Receiver::stored_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return stored_.size();
+}
+
+Receiver::Clock::time_point Receiver::deadline() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return deadline_;
 }
 
 }  // namespace fade
 }  // namespace mercury
-
-#ifdef MERCURY_FADE_CORE_STANDALONE
-int main() { return mercury::fade::run_fade_core_tests(); }
-#endif

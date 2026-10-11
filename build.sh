@@ -506,8 +506,8 @@ obj_path() {
 # Source files
 CPP_SOURCES="
 source/main.cc
-source/datalink_layer/fade_core.cc
 source/datalink_layer/test_fade_core.cc
+source/datalink_layer/test_fade_core_cases.cc
 source/datalink_layer/arq_commander.cc
 source/datalink_layer/test_arq_commander.cc
 source/datalink_layer/arq_common.cc
@@ -777,8 +777,8 @@ run_l1_stage3_test
 
 run_fade_core_test() {
     local test_bin="${BUILDDIR}/test_fade_core"
-    local core_header="include/datalink_layer/fade_core.h"
-    local core_source="source/datalink_layer/fade_core.cc"
+    local core_header="include/datalink_layer/test_fade_core.h"
+    local core_source="source/datalink_layer/test_fade_core.cc"
     echo "Auditing and running shared delivery-correctness core test..."
     # Structural production isolation: the production core contains no runtime
     # fault switch and no compile-time defect hook. Tests inject only malformed
@@ -789,8 +789,8 @@ run_fade_core_test() {
         return 1
     fi
     $CXX $CXXFLAGS -DMERCURY_FADE_CORE_STANDALONE \
-        source/datalink_layer/test_fade_core.cc \
-        "${BUILDDIR}/source/datalink_layer/fade_core.o" \
+        source/datalink_layer/test_fade_core_cases.cc \
+        "${BUILDDIR}/source/datalink_layer/test_fade_core.o" \
         "${BUILDDIR}/source/crypto/monocypher.o" \
         -o "$test_bin" -pthread ${TEST_LDFLAGS:-}
     "$test_bin"
