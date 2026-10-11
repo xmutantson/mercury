@@ -14,7 +14,6 @@ int run_acq_bounds_selftest();
 int run_subpeak_rescue_selftest();
 int run_chase_ab_selftest();
 int run_frame0_vehicle_selftest();
-int run_frame0_mf_selftest();
 int run_frame0_replay_selftest(const char* path);
 int run_crc_escape_selftest();
 int run_chase_selftest();
@@ -23,7 +22,7 @@ int run_mini0_carried_timing_test();
 int run_mini1_carried_timing_test();
 
 int run_main_test_dispatch(int argc, char* argv[], int i,
-    void (*install_termination_handlers)(), bool& handled);
+    void (*install_termination_handlers)(), int (*run_frame0_mf_selftest)(), bool& handled);
 
 class cl_arq_controller;
 class cl_telecom_system;

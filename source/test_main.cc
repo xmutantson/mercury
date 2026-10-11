@@ -1352,62 +1352,7 @@ int run_frame0_vehicle_selftest()
 //     -> candidate (c) is a viable winner.
 //   - MF corr stays ~0.15 / peak not at TRUE -> MF is DEAD (cannot beat the plateau) ->
 //     drop it, do NOT wire a dead detector into the shared path.
-int run_frame0_mf_selftest()
-{
-    setenv("MERCURY_F0V_MF_TEMPLATE", "1", 1);   // build the MF template during load
-    printf("[TEST-FRAME0-MF] matched-filter plateau-tiebreak VIABILITY measurement\n");
-    const char* cfg_env = std::getenv("MERCURY_F0V_CONFIG");
-    int cfg = cfg_env ? atoi(cfg_env) : CONFIG_16;
 
-    cl_telecom_system ts;
-    ts.operation_mode = BER_PLOT_passband;
-    ts.load_configuration(cfg);
-    cl_data_container& dc = ts.data_container;
-    int interp       = ts.frequency_interpolation_rate;
-    int sym_samples  = dc.Nofdm * interp;
-    int frame_symb   = dc.Nsymb + dc.preamble_nSymb;
-    int frame_samp   = frame_symb * sym_samples;
-    int buf_samp     = dc.buffer_Nsymb * sym_samples;
-    int max_delay    = buf_samp - frame_samp;
-
-    printf("[TEST-FRAME0-MF] config=%d template_len=%d energy=%.4f nsymb=%d sym_samples=%d (len=0 => revive FAILED)\n",
-           cfg, ts.ofdm.ofdm_corr_template_len, ts.ofdm.ofdm_corr_template_energy,
-           ts.ofdm.ofdm_corr_template_nsymb, sym_samples);
-
-    int nReal_data = dc.nBits - ts.ldpc.P;
-    int frame_size = (nReal_data - ts.outer_code_reserved_bits) / 8; if (frame_size < 1) frame_size = 1;
-    std::vector<int> payload(frame_size, 0); for (int i=0;i<frame_size;i++) payload[i]=(i*53+7)&0xff;
-    std::vector<double> frame(frame_samp, 0.0);
-    ts.transmit_byte(payload.data(), frame_size, frame.data(), SINGLE_MESSAGE);
-    double e=0; for(double v:frame) e+=v*v; double frame_rms=(frame.size()>0)?sqrt(e/(double)frame.size()):0.0;
-
-    std::vector<std::complex<double>> bb(buf_samp);
-    printf("[TEST-FRAME0-MF] %-6s %-8s %-6s %-11s %-11s %-11s %-9s\n",
-           "onset","snr_dB","seed","true_D","mf_delay","mf-D(sym)","mf_corr");
-    double snrs[]={200.0,30.0}; int onsets[]={60,100}; unsigned seeds[]={1u,2u};
-    int n_true=0,n_total=0;
-    for (double snr:snrs) for (int onset:onsets) for (unsigned sd:seeds) {
-        int D=onset*sym_samples; if(D>max_delay)D=max_delay; if(D<0)D=0;
-        std::mt19937 rng(sd);
-        double sigma=(snr<200.0)?frame_rms/pow(10.0,snr/20.0):0.0;
-        std::normal_distribution<double> nd(0.0,sigma);
-        std::vector<double> rx(buf_samp);
-        for(int i=0;i<buf_samp;i++) rx[i]=(sigma>0.0)?nd(rng):0.0;
-        int cn=frame_samp; if(D+cn>buf_samp)cn=buf_samp-D;
-        for(int i=0;i<cn;i++) rx[D+i]+=frame[i];
-        ts.ofdm.passband_to_baseband(rx.data(), buf_samp, bb.data(),
-            ts.sampling_frequency, ts.carrier_frequency, ts.carrier_amplitude, 1, &ts.ofdm.FIR_rx_time_sync);
-        TimeSyncResult mf = ts.ofdm.time_sync_preamble_matched(bb.data(), buf_samp, interp, dc.preamble_nSymb);
-        double mfdsym=(sym_samples>0)?(double)(mf.delay-D)/sym_samples:0.0;
-        bool at_true = (sym_samples>0) && (std::abs(mf.delay-D) < sym_samples/2);
-        n_total++; if(at_true) n_true++;
-        printf("[TEST-FRAME0-MF] %-6d %-8.0f %-6u %-11d %-11d %-+11.2f %-9.4f%s\n",
-            onset, snr, sd, D, mf.delay, mfdsym, mf.correlation, at_true?"  TRUE":"  OFF");
-    }
-    printf("[TEST-FRAME0-MF] SUMMARY cells=%d mf_at_true=%d  VIABLE=%s\n",
-        n_total, n_true, (n_true==n_total && n_total>0)?"YES":"NO");
-    return 0;
-}
 
 // --test-frame0-replay <capture>: feed a raw passband ring captured at the
 // field SUBPEAK-REJECT (MERCURY_F0_RINGDUMP) through the PRODUCTION acquisition
@@ -2039,7 +1984,7 @@ static int test_sigterm_handler(void (*install_termination_handlers)())
 
 
 int run_main_test_dispatch(int argc, char* argv[], int i,
-    void (*install_termination_handlers)(), bool& handled)
+    void (*install_termination_handlers)(), int (*run_frame0_mf_selftest)(), bool& handled)
 {
     handled = true;
         if (strcmp(argv[i], "--test-lp-timeline-harness") == 0) {
