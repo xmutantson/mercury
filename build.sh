@@ -509,6 +509,7 @@ source/main.cc
 source/datalink_layer/fade_core.cc
 source/datalink_layer/test_fade_core.cc
 source/datalink_layer/arq_commander.cc
+source/datalink_layer/test_arq_commander.cc
 source/datalink_layer/arq_common.cc
 source/datalink_layer/l1_tx_journal.cc
 source/datalink_layer/l1_block_ack.cc
