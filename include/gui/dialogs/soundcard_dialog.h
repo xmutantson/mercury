@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+struct ffaudio_interface;
+
 /**
  * @struct AudioDeviceInfo
  * @brief Information about an audio device
@@ -67,6 +69,8 @@ public:
 private:
     bool acceptAndRestart(const std::string& config_path);
 
+    friend int soundcard_dialog_restart_fail_closed_case(bool (*&restart_mercury_for_test)(const std::string&));
+    friend int soundcard_dialog_audio_init_fail_closed_case(const ffaudio_interface*& audio_interface_for_test);
     friend int soundcard_dialog_restart_fail_closed_selftest();
     friend int soundcard_dialog_audio_init_fail_closed_selftest();
 
