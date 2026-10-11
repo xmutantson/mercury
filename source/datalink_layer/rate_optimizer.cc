@@ -1909,12 +1909,6 @@ st_rate_prediction cl_rate_optimizer::predict_config(
     return out;
 }
 
-st_rate_prediction cl_rate_optimizer::predict_for_test(
-        int cfg, const st_rate_observation& obs) const
-{
-    return predict_config(cfg, obs);
-}
-
 std::vector<int> cl_rate_optimizer::candidate_configs(const st_rate_observation& obs) const
 {
     if (!obs.feasible_configs.empty()) {
