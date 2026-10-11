@@ -125,27 +125,46 @@ int cl_arq_controller::test_stream_offset()
 	}
 
 	// ---------------------------------------------------------------------------
-	// PART B — retx / mixbatch re-emit: reading a latched stamp does NOT double-commit;
+	// PART B — retx / mixbatch re-emit: emitting a latched stamp does NOT double-commit;
 	// the next new-data batch starts contiguously after the retx'd one.
 	// ---------------------------------------------------------------------------
 	printf("[TEST-STREAM-OFFSET] Part B — retx re-emit (no double-commit) + mixbatch\n");
 	uint64_t cursor_before = tx_stream_committed;
 	StreamStamp saved5 = tx_stream_stamp[5];
-	// simulate N re-emits of bsi 5 (retx) — the wire re-sends the LATCHED stamp; the
-	// cursor/latch are untouched (only reads).
-	for(int r=0;r<4;r++)
 	{
-		volatile uint64_t re_start = tx_stream_stamp[5].start;   // read-only re-emit
-		(void)re_start;
+		const bool saved_d5 = header_carries_d5;
+		header_carries_d5 = true;
+		CHECK(w_stamp_rides(), "B: stamp rides for production re-emit", w_stamp_rides()?1:0, 1);
+		const int stamp_off = effective_data_short_header_length(true, true);
+		// Independent LE wire oracle from Part A's lengths: batch 5 starts at
+		// 84+4175+3850+154+5665=13928, length 231; batch 6 starts at 14159.
+		const unsigned char wire5[W_EOB_STAMP_BYTES] = {0x68, 0x36, 0, 0, 0xe7, 0};
+		const unsigned char wire6[W_EOB_STAMP_BYTES] = {0x4f, 0x37, 0, 0, 0x2c, 0x01};
+		auto check_emit = [&](int bsi, const StreamStamp& saved, uint64_t cursor,
+		                      const unsigned char* expected) {
+			memset(message_TxRx_byte_buffer + stamp_off, 0xa5, W_EOB_STAMP_BYTES);
+			const int emitted = w_emit_eob_stamp(stamp_off, bsi);
+			CHECK(emitted == W_EOB_STAMP_BYTES, "B: re-emit wrote all stamp bytes", emitted, W_EOB_STAMP_BYTES);
+			const bool wire_ok = memcmp(message_TxRx_byte_buffer + stamp_off, expected, W_EOB_STAMP_BYTES) == 0;
+			CHECK(wire_ok, "B: re-emit matches independent wire bytes", wire_ok?1:0, 1);
+			CHECK(tx_stream_committed == cursor, "B: retx re-emit did NOT move cursor", (long long)tx_stream_committed, (long long)cursor);
+			const StreamStamp& actual = tx_stream_stamp[bsi];
+			CHECK(actual.start == saved.start && actual.length == saved.length &&
+			      actual.valid == saved.valid && actual.crc == saved.crc,
+				"B: re-emit preserved start/length/valid/crc", (long long)actual.start, (long long)saved.start);
+		};
+		for(int r=0;r<4;r++) check_emit(5, saved5, cursor_before, wire5);
+		// A later new-data latch must not change the old batch's wire origin.
+		stream_tx_latch(6, 300);
+		CHECK(tx_stream_stamp[6].start == saved5.start + saved5.length, "B: mixbatch start[6]==start[5]+len[5]",
+			(long long)tx_stream_stamp[6].start, (long long)(saved5.start + saved5.length));
+		CHECK(tx_stream_committed == cursor_before + 300, "B: new batch advanced cursor exactly once",
+			(long long)tx_stream_committed, (long long)(cursor_before + 300));
+		const StreamStamp saved6 = tx_stream_stamp[6];
+		check_emit(5, saved5, cursor_before + 300, wire5);
+		check_emit(6, saved6, cursor_before + 300, wire6);
+		header_carries_d5 = saved_d5;
 	}
-	CHECK(tx_stream_committed == cursor_before, "B: retx re-emit did NOT move cursor", (long long)tx_stream_committed, (long long)cursor_before);
-	CHECK(tx_stream_stamp[5].start == saved5.start && tx_stream_stamp[5].length == saved5.length,
-		"B: retx re-emit did NOT mutate stamp[5]", (long long)tx_stream_stamp[5].start, (long long)saved5.start);
-	// mixbatch: bsi 6 (new) prepends bsi 5 (retx) in one TX. Latch of 6 is unaffected by
-	// the retx prefix — start[6] == start[5] + len[5].
-	stream_tx_latch(6, 300);
-	CHECK(tx_stream_stamp[6].start == saved5.start + saved5.length, "B: mixbatch start[6]==start[5]+len[5]",
-		(long long)tx_stream_stamp[6].start, (long long)(saved5.start + saved5.length));
 	cum = tx_stream_committed;
 
 	// ---------------------------------------------------------------------------
