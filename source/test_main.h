@@ -18,4 +18,7 @@ void arm_test_watchdog();
 int run_mini0_carried_timing_test();
 int run_mini1_carried_timing_test();
 
+int run_main_test_dispatch(int argc, char* argv[], int i,
+    void (*install_termination_handlers)(), bool& handled);
+
 #endif
