@@ -4116,3 +4116,2614 @@ int run_main_test_dispatch(int argc, char* argv[], int i,
     handled = false;
     return 0;
 }
+
+bool parse_main_test_option(int& argc, char* argv[], int& i, MainTestOptions& test_opts)
+{
+        if (strncmp(argv[i], "--test-policy-axis1-fire=", 25) == 0)
+        {
+            // SACK Design A Step 9 — synthetic Axis-1 trigger (one-shot at startup).
+            //
+            // Primes the LADDER state and calls policy_evaluate_axis1() once,
+            // then exits. Demonstrates that the multi-axis-policy entry point
+            // is wired correctly and the [POLICY-MOVE] / [POLICY-SUPREMACY]
+            // log surface (§4.3.4 invariants 5/6) fires on a real Axis-1 move.
+            //
+            // Values:
+            //   up   — success_rate=100%, block-counter at threshold → LADDER UP
+            //   down — success_rate=0%, consecutive_fails forced to threshold → LADDER DOWN
+            //
+            // Default off; production builds never pass this flag. The mercury
+            // process exits with code 0 after the single synthetic evaluation.
+            const char* arg = argv[i] + 25;
+            if (strcmp(arg, "up") == 0)        test_opts.test_policy_axis1_fire_cli = 1;
+            else if (strcmp(arg, "down") == 0) test_opts.test_policy_axis1_fire_cli = 2;
+            else { fprintf(stderr, "--test-policy-axis1-fire: expected 'up' or 'down'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis2-fire=", 25) == 0)
+        {
+            // SACK Design A Step 10 — synthetic Axis-2 trigger (one-shot at startup).
+            //
+            // Primes the partial-rate ring + hysteresis counters and calls
+            // policy_evaluate_axis2() once, then exits. Demonstrates that the
+            // Axis-2 entry point is wired and the [POLICY-MOVE] axis=2 log
+            // surface (§4.3.4 invariant 5) plus SET_LINK_PARAMS TX wire path
+            // fire on a real Axis-2 move.
+            //
+            // Values:
+            //   up   — ring primed clean (mean=0), good_run at threshold → UP
+            //   down — ring primed lossy (mean=0.4), bad_run at threshold → DOWN
+            //
+            // Default off; production builds never pass this flag. The mercury
+            // process exits with code 0 after the single synthetic evaluation.
+            const char* arg = argv[i] + 25;
+            if (strcmp(arg, "up") == 0)        test_opts.test_policy_axis2_fire_cli = 1;
+            else if (strcmp(arg, "down") == 0) test_opts.test_policy_axis2_fire_cli = 2;
+            else { fprintf(stderr, "--test-policy-axis2-fire: expected 'up' or 'down'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-partial-bsi-advance=", 27) == 0)
+        {
+            // SACK partial-path BSI non-advance reproducer (one-shot at startup, then exit).
+            // See fact-documents/sack_partial_bsi_advance.md §5.3 / §5.4. The 'mfsk'
+            // variant exercises the bug (MFSK suffix bypass of send_sack_v2_frame's
+            // Step 8a bump); the 'ofdm' variant exercises the working OFDM path
+            // (regression guard).
+            const char* arg = argv[i] + 27;
+            if (strcmp(arg, "mfsk") == 0 || strcmp(arg, "ofdm") == 0)
+                test_opts.test_partial_bsi_advance_cli = arg;
+            else { fprintf(stderr, "--test-partial-bsi-advance: expected 'mfsk' or 'ofdm'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-arq-unit") == 0)
+        {
+            // P2 big-block ARQ-granularization regression — one-shot at startup,
+            // then exit with the test's rc. See
+            // fact-documents/data-flow-bigblock-arq-unit.md §6. FAILS before P2
+            // wiring (the bigblock_block_to_arq stub), PASSES after.
+            test_opts.test_bigblock_arq_unit_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sim-inproc-bigblock") == 0)
+        {
+            // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
+            // One-shot at startup, then exit rc.
+            test_opts.test_sim_inproc_bigblock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-fullpath") == 0)
+        {
+            // FULL-PATH REGRESSION (bigblock-whiten-align): the LIVE 2-instance CFG16
+            // big-block transfer through the REAL receive_bigblock+carve+whiten+FIFO
+            // deliver path, with fail-before/pass-after on the same binary. One-shot, exit rc.
+            test_opts.test_bigblock_fullpath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cfg103-gate") == 0)
+        {
+            test_opts.test_cfg103_gate_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sim-sustain") == 0)
+        {
+            // SIM_INPROC SUSTAIN BATTERY (runs BOTH durable sustain regressions, OR of their rc):
+            //  (1) STEPPER-WEDGE (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): a PINNED-CFG15 clean
+            //      sustained-delivery transfer for payloads 600/2000/4000/8000, asserting each
+            //      terminates byte-correct via the genuine delivery break (not the post-transfer
+            //      keepalive spin), with fail-before/pass-after on the same binary.
+            //  (2) STEPPER-CORE REWRITE Phase b: the OUTER-loop stepper drives a live
+            //      ROBUST_0->CFG16 OFDM big-block transfer; asserts the (iii) DATA-path wedge is
+            //      gone (ZERO [SIM2-DEADLOCK-BREAK]) + the K=8 block carves clean 8/8 + C0-a
+            //      full byte-correct sustain.
+            // One-shot at startup, then exit rc.
+            test_opts.test_sim_sustain_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-multicw") == 0)
+        {
+            // MULTI-CW WINDOW REGRESSION (data-flow-bigblock-arq-unit.md §17): a FULL K=8
+            // block (all 8 codewords) through the LIVE receive_bigblock+de-whiten+per-cw-CRC
+            // carve; three arms prove the root cause is the RX capture WINDOW (cw1..cw7
+            // stale-ring corruption on a stock-frame window), NOT whiten/offset. One-shot.
+            test_opts.test_bigblock_multicw_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-down-resync") == 0)
+        {
+            // IN-BAND DOWN-LADDER RESYNC REGRESSION (data-flow-inband-ondemote-zerobyte.md §6):
+            // a CMD demote-to-ROBUST_0 with the announce CONFIG_TAG SUPPRESSED forces the RSP's
+            // production inband_try_down_ladder_on_decode_fail to resync from a PRIMARY-derived
+            // snapshot over a window spanning the MFSK ROBUST rung. FAIL-BEFORE truncates the
+            // ROBUST_0 frame -> 0-byte delivery (the HW defect); PASS-AFTER (Rank-1 snapshot+ring
+            // sizing fix) decodes ROBUST_0 + delivers byte-faithful. One-shot, then exit rc.
+            test_opts.test_inband_down_resync_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-chanest") == 0)
+        {
+            // GENUINE channel-estimation regression (fix/bigblock-chanest): the 2-instance
+            // CFG16 big-block decode (ref==NULL) under a CFO/SFO-impaired channel. Reproduces
+            // the HW [RXACQ] meanH collapse OFF-BENCH (clean default passes; CFO/SFO collapses
+            // the block-wide estimate -> 0-delivery). One-shot.
+            test_opts.test_bigblock_chanest_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-nb-cfo-correction") == 0)
+        {
+            // Narrowband CONFIG_0 residual carrier-offset correction regression: a genuine
+            // CONFIG_0 narrowband frame through the in-process sim channel with an exact,
+            // fixed, in-window SSB offset; control 0 Hz + offset arm, fail-before/pass-after.
+            test_opts.test_nb_cfo_correction_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-acqwindow") == 0)
+        {
+            // §19 acquisition-window POSITION guard regression (fix/bigblock-chanest): drive ONE
+            // genuine K=8 CFG16 block at several in-window preamble offsets in a FIXED production-
+            // sized capture window; assert the near-end (tail-past-window) block DEFERS (guard ON)
+            // / carves a truncated bytes_ok=0 block (DEFEAT_ACQGUARD). Reproduces the HW ~5.6%
+            // acquisition-fraction defect off-bench. One-shot.
+            test_opts.test_bigblock_acqwindow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-txlevel") == 0)
+        {
+            // TX-LEVEL parity diag: measure CFG16 big-block vs stock-OFDM TX peak+RMS
+            // to localize the bench-observed +3.2 dB big-block over-level (gain vs PAPR).
+            test_opts.test_bigblock_txlevel_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-climb-election") == 0)
+        {
+            // CLIMB-ELECTION (data-flow-bigblock-arq-unit.md §16): prove the big-block
+            // rung is ELECTED by the gearshift CFG16 transition (load_configuration tail),
+            // symmetric on both peers, and the elected rung emits + delivers byte-faithful.
+            // fail-before/pass-after on the same binary. One-shot at startup, then exit rc.
+            test_opts.test_bigblock_climb_election_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-topgear-clean-election") == 0)
+        {
+            // TOP-GEAR CONFIG_17 channel-clean election (topgear-stack-productionize.md §4):
+            // prove the 64-QAM top-gear election verdict + hysteresis + electability ceiling +
+            // demote primitives + net-PHY ~1.073x R7-64 rate. fail-before/pass-after, one-shot, exit rc.
+            test_opts.test_topgear_clean_election_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-carve-suspend-unit") == 0)
+        {
+            // WALL-B FIX-3: RSP carve-suspend watchdog unit test — the streak state machine
+            // (bigblock_note_carve_reject/_accept) + the three consumers + a real receive_byte
+            // cw0-reject loopback. fail-before via MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND.
+            // One-shot at startup, then exit rc.
+            test_opts.test_bigblock_carve_suspend_unit_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-sack-oow-reject") == 0)
+        {
+            // R039 — OFDM SACK_RSP out-of-window reject regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.5 / §5.4.
+            test_opts.test_sack_oow_reject_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-eob-poison-prev-retx") == 0)
+        {
+            // R038 — prev-retransmit EOB poison regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.4 / §5.3.
+            test_opts.test_eob_poison_prev_retx_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batch-shrink-strands-prev") == 0)
+        {
+            // R035 — data_batch_size shrink strands active prev regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.3 / §5.2.
+            test_opts.test_batch_shrink_strands_prev_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batch-shrink-orphan-defer") == 0)
+        {
+            // Fix A — mid-flight data_batch_size shrink must not orphan RECEIVED
+            // prev frames (baseline-double-delivery.md). One-shot, exit rc.
+            test_opts.test_batch_shrink_orphan_defer_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-backup-confirm-flush") == 0)
+        {
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery
+            // (data-flow-fifo-backup.md §6.1). One-shot, exit rc.
+            test_opts.test_backup_confirm_flush_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rxfifo-backpressure-hold") == 0)
+        {
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss
+            // (delivery-integrity-audit-monitor.md §3). One-shot, exit rc.
+            test_opts.test_rxfifo_backpressure_hold_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-retx-clear-on-recovery") == 0)
+        {
+            // R029 — stale retx queue cleared on recovery regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.1 / §5.1.
+            test_opts.test_retx_clear_on_recovery_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-restage-requeue-orphan") == 0)
+        {
+            // §12 — re-stage re-queue orphan/reorder regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // source/datalink_layer/test_restage_requeue.cc +
+            // fact-documents/silent-corruption-residual.md §12/§13.
+            test_opts.test_restage_requeue_orphan_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-restore-backup-bounds") == 0)
+        {
+            // Large streaming rollback backup restore — one-shot at startup.
+            test_opts.test_restore_backup_bounds_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-stream-offset") == 0)
+        {
+            // Option W FOUNDATION — absolute-byte-stream cursor ground-truth regression.
+            // One-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/test_stream_offset.cc +
+            // fact-documents/data-flow-stream-offset.md.
+            test_opts.test_stream_offset_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-l1-stage2-ownership") == 0)
+        {
+            test_opts.test_l1_stage2_ownership_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rx-drain-backpressure") == 0)
+        {
+            // FIX-6 — RX-delivery drain backpressure regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // source/datalink_layer/test_rx_drain.cc + fix6/STALL_ROOTCAUSE.md.
+            test_opts.test_rx_drain_backpressure_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-kx-data-tamper") == 0)
+        {
+            // Mid-stream AEAD ciphertext tamper fail-secure fire proof — one-shot
+            // at startup, then exit with the test rc. See
+            // source/datalink_layer/test_kx_data_tamper.cc.
+            test_opts.test_kx_data_tamper_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-decompress-false-accept") == 0)
+        {
+            // Streaming decompress-failure silent-false-accept regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // source/datalink_layer/test_decompress_false_accept.cc +
+            // fact-documents/residual-silent-corruption-wgn25.md.
+            test_opts.test_decompress_false_accept_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-compact-confirm-rx") == 0)
+        {
+            // Option B compact confirm LIVE RX-PATH regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // source/datalink_layer/test_compact_confirm_rx.cc +
+            // fact-documents/data-flow-compact-confirm.md §9.
+            test_opts.test_compact_confirm_rx_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-abort") == 0)
+        {
+            // FIX-8 — silent lost-batch GAP on post-reset re-adopt regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_gap_abort_on_readopt
+            // + bigblock_p3_hw/_fix8/FIX8_DESIGN.md.
+            test_opts.test_gap_abort_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-turnaround-guard") == 0)
+        {
+            // R1 turnaround-clearance guard regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_common.cc test_turnaround_guard.
+            test_opts.test_turnaround_guard_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-measured-timers") == 0)
+        {
+            // R6 measured-turnaround (SRTT/RTTVAR) estimator + ack-timeout invariant
+            // regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_common.cc test_measured_timers.
+            test_opts.test_measured_timers_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-t1") == 0)
+        {
+            // T1 zero-dead-time turnaround unit suites (learned-timing calibration +
+            // scheduled pre-key re-aim negative control) — one-shot,
+            // exit rc. See source/datalink_layer/arq_common.cc test_t1_calibration /
+            // test_t1_schedkey.
+            test_opts.test_t1_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-arqsmalls") == 0)
+        {
+            // Karn discriminator decoupling + DUTY-R pin-respect seed regression —
+            // fast one-shot at startup, exit rc (avoids the full --test acquisition
+            // trims + watchdog). See arq_common.cc test_karn_retx_classify and
+            // arq_commander.cc test_robust_connect_exit.
+            test_opts.test_arqsmalls_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-recovery-ack-capture-exercise") == 0)
+        {
+            // Set before modem initialization so the production gate's cached
+            // first read observes the exercise arm.
+            setenv("MERCURY_RECOVERY_ACK_REPHASE", "1", 1);
+            test_opts.test_recovery_ack_capture_exercise_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-axis2-quiesce-gate") == 0)
+        {
+            // R4 LINK-PARAMS quiesce-gate regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_commander.cc test_axis2_quiesce_gate.
+            test_opts.test_axis2_quiesce_gate_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-abort-blind") == 0)
+        {
+            // GAP-ABORT ruler-blinding regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_responder.cc test_gap_abort_readopt_blind
+            // + fact-documents/data-flow-rsp-contiguity-ruler.md.
+            test_opts.test_gap_abort_blind_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-abort-stream-blind") == 0)
+        {
+            // GAP-ABORT stream-backstop-blinding regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_responder.cc test_gap_abort_stream_backstop_blind
+            // + fact-documents/data-flow-rsp-contiguity-ruler.md §7.
+            test_opts.test_gap_abort_stream_blind_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-recover") == 0)
+        {
+            // RECOVERABLE delivery-time GAP-ABORT regression — one-shot at startup, exit rc.
+            // See source/datalink_layer/arq_responder.cc test_recoverable_gap_abort
+            // + fact-documents/data-flow-recoverable-gap-abort.md.
+            test_opts.test_gap_recover_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-gap-recover-fire") == 0)
+        {
+            // W1 — CMD refill fire proof for the recoverable HOLD (one-shot, exit rc).
+            // See source/datalink_layer/arq_responder.cc test_recover_fire
+            // + fact-documents/data-flow-recoverable-gap-abort.md 5.1.
+            test_opts.test_recover_fire_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-retain-shadow-overflow") == 0)
+        {
+            // Deterministic fail-before/pass-after for the retention-shadow repair:
+            // capture 19 holes (> the pre-fix 8-slot cap), re-SACK, assert requeue
+            // re-drives all 19 (fix ON) vs < 19 (fix OFF, the rq0 deadlock root).
+            // See source/datalink_layer/arq_responder.cc test_retain_shadow_overflow.
+            test_opts.test_retain_overflow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-held-cur-deliver-fire") == 0)
+        {
+            // R2b — RSP deliver-held-cur + CMD recovery-turnaround credit fire proof
+            // (one-shot, exit rc). See source/datalink_layer/arq_responder.cc
+            // test_held_cur_deliver_fire + fact-documents/data-flow-recoverable-gap-abort.md §5.5.
+            test_opts.test_held_cur_fire_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-config-tag-follow") == 0)
+        {
+            // In-band rate adaptation Stage 2 — emit/detect/FOLLOW directed
+            // loopback (one-shot at startup, exit rc). See
+            // source/datalink_layer/arq_responder.cc test_config_tag_follow
+            // + mercury/fact-documents/unilateral-config-tag-design.md §11.
+            test_opts.test_config_tag_follow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-config-tag-passband") == 0)
+        {
+            // In-band rate adaptation Stage 3a — PASSBAND ROUND-TRIP (one-shot at
+            // startup, exit rc). See arq_responder.cc test_config_tag_passband_
+            // roundtrip + unilateral-config-tag-design.md §11 Stage 3.
+            test_opts.test_config_tag_passband_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-drop") == 0)
+        {
+            // In-band rate adaptation Stage 3b — LOOPBACK DROP TEST (one-shot at
+            // startup, exit rc). Gearshift-driven unilateral drop + tag on the real
+            // passband + RX follow + SACK confirm + ZERO SET_CONFIG. See
+            // arq_responder.cc test_inband_drop + data-flow-perbatch-config.md §12.
+            test_opts.test_inband_drop_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-fallback") == 0)
+        {
+            // In-band rate adaptation Stage 4 — LOST-TAG DOWN-LADDER TEST (one-shot at
+            // startup, exit rc). Forces a tag-loss on a drop batch; asserts the bounded
+            // down-ladder resyncs within D rungs on a real CRC/LDPC pass, the SACK
+            // confirms, BREAK-count==0, decode attempts<=D+1 (RPi bound), and sweeps D /
+            // SESSION_DEAD_BATCHES. See arq_responder.cc test_inband_fallback +
+            // data-flow-perbatch-config.md §13.
+            test_opts.test_inband_fallback_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-seamless") == 0)
+        {
+            // In-band rate adaptation Stage 3d — PRE-FRAME SEAMLESS TEST (one-shot at
+            // startup, exit rc). Builds the [tag burst][OFDM frame] wire window (the
+            // DVB-S2 PLHEADER pre-frame order) and drives the production RX pre-frame
+            // detect + receive_byte; asserts seamless first-frame decode at the new
+            // config, no-dead-time on a no-change batch, correct-code, and lost-tag ->
+            // down-ladder. See arq_responder.cc test_inband_seamless +
+            // data-flow-perbatch-config.md §15.
+            test_opts.test_inband_seamless_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-downladder") == 0)
+        {
+            // In-band down-ladder DELIVERY regression (one-shot at startup, exit rc).
+            // PART A: a COMPLETE in-flight prev batch survives a TERMINAL-BREAK -> ROBUST_0
+            // reshrink (fail-before MERCURY_PREBREAK_DELIVER_DEFEAT=1 orphans -> 0 bytes;
+            // pass-after flushes via deliver_complete_inflight_before_break -> N*SUB_LEN
+            // bytes). PART B: a silent (0-peak) snapshot does NOT tick the dead-batch streak.
+            // See arq_responder.cc test_inband_downladder + data-flow-inband-downladder.md.
+            test_opts.test_inband_downladder_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-reseat-span") == 0)
+        {
+            // Reseat span integrity (one-shot at startup, exit rc): the prev-batch
+            // cross-storage index-skew 332-byte deletion. Drives the PRODUCTION store ->
+            // seal -> copy_data_to_buffer across STOCK (both keystones defeated -> 5969/
+            // deficit 332) and fixed arms (seal-count + funnel byte-span -> 0 short bytes),
+            // plus healthy + res_c3100-widen no-false-fire controls. See arq_responder.cc
+            // test_reseat_span + data-flow-messages_rx_prev.md §4.5.
+            test_opts.test_reseat_span_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cmd-idskew") == 0)
+        {
+            // CMD-side id-skew ROOT (one-shot at startup, exit rc): the correct-by-construction
+            // TX counterpart to the reseat keystones. Drives the PRODUCTION add_message_tx_data
+            // staging of two consecutive new-data batches (the second skewed to slots [PRIOR,..)),
+            // then the PRODUCTION rebase — STOCK (MERCURY_CMD_IDSKEW_DEFEAT=1) reproduces the
+            // first-tx id=seq+PRIOR skew, FIX rebases v1/v2 to id=seq — plus a §87-geometry arm where
+            // id=seq now DELIVERS IN PLACE (full 6301 B) through the production receiver. See
+            // arq_commander.cc test_cmd_idskew + CANONICAL_NUMBERS.md §87.
+            test_opts.test_cmd_idskew_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-deliver") == 0)
+        {
+            // In-band FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER regression
+            // (one-shot at startup, exit rc). Drives the production connect-liveness guard
+            // discriminator: a forward-healthy miss (in-flight DATA batch + a lower rung)
+            // routes to the NO-BREAK re-present (partial prev preserved + contiguous bsi),
+            // while a genuine dead/livelock STILL BREAKs and a genuine config-change STILL
+            // clears/epochs. fail-before: rebuild with -DINBAND_DELIVER_FAILBEFORE (the
+            // discriminator is removed -> the forward-healthy miss BREAKs -> 0 deliver).
+            // See arq_responder.cc test_inband_deliver + data-flow-inband-retx-epoch.md §5.
+            test_opts.test_inband_deliver_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-shadow") == 0)
+        {
+            // LINK-PHASE PRIMITIVE (increment 1) shadow-agreement directed unit (one-shot at
+            // startup, exit rc). Synthetic-fires the production producers; asserts the pre-init
+            // owner==NONE guard, the owner ordering, the DIRECTIONAL over-wait/under-estimate
+            // meter (incl. the intended short-batch clamp + a fail-before shortening), and the
+            // epoch bump on config-switch/BREAK. See data-flow-linkphase-primitive.md.
+            test_opts.test_linkphase_shadow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-mc2") == 0)
+        {
+            // LINK-PHASE PRIMITIVE (increment 2 / MC-2) slot-floor directed unit (one-shot at
+            // startup, exit rc). Drives the production selection/apply helpers; asserts the
+            // pre-init latch fallback, the clean-path byte-identity of the primitive vs the latch,
+            // the stale-generation config-switch fallback (fail-before/pass-after), and RAISE-ONLY.
+            test_opts.test_linkphase_mc2_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-optclock") == 0)
+        {
+            // MC-7 END-stamp ownership/freshness regression (one-shot at startup, exit rc).
+            test_opts.test_linkphase_optclock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-ackwin") == 0)
+        {
+            // LINK-PHASE STEP 3 (increment 3) reverse-ACK detection-window directed unit (one-shot
+            // at startup, exit rc). Drives the production gate + sub-b rescue predicates and the
+            // WIDEN-only / byte-identical-OFF invariant.
+            test_opts.test_linkphase_ackwin_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-ring-floor") == 0)
+        {
+            // In-band capture-ring ROBUST-floor OVER-SEAT regression (one-shot at startup,
+            // exit rc). Drives inband_seat_robust_ring_floor() at CONFIG_8 (a climbed OFDM
+            // rung holding its natural ring, no adopt) + ROBUST_0; asserts the OFDM-rung seat
+            // is SUPPRESSED (ring stays natural) while ROBUST still seats the floor. fail-before
+            // is the in-process A1-FB sub-case via MERCURY_CONFIG0_RING_GUARD_DEFEAT=1 (the
+            // existing §21 knob now disables the generalized guard -> the over-seat reproduces).
+            // See arq_responder.cc test_inband_ring_floor_overseat +
+            // data-flow-inband-ring-floor-overseat.md §5.
+            test_opts.test_inband_ring_floor_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-liveness") == 0)
+        {
+            // In-band CONNECT-LIVENESS GUARD regression (one-shot at startup, exit rc).
+            // Drives the production guard into a control-plane livelock (control-TX, no
+            // forward-DATA progress) and asserts it fires the retained true-loss BREAK
+            // within the bound. fail-before: rebuild with -DINBAND_LIVENESS_FAILBEFORE (the
+            // guard tracks but never recovers -> the livelock is unbounded -> asserts FAIL).
+            // See arq_responder.cc test_inband_liveness + data-flow-inband-connect-liveness.md.
+            test_opts.test_inband_liveness_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-no-break") == 0)
+        {
+            // In-band rate adaptation Stage 4c — D5 BREAK-OBSOLETE TEST (one-shot at
+            // startup, exit rc). Drives the COMMANDER Class-A degradation routing: a
+            // degradation that today BREAKs routes to a TAG-DEMOTE (BREAK-count==0, link
+            // alive at a lower config) under inband, while a GENUINE total loss STILL
+            // reaches the SESSION_DEAD_BATCHES BREAK. See arq_responder.cc
+            // test_inband_no_break + data-flow-perbatch-config.md §S4C.
+            test_opts.test_inband_no_break_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-retag") == 0)
+        {
+            // In-band rate adaptation Stage 4d — D1 repeat-until-followed + D4 climb/
+            // auto-demote (one-shot at startup, exit rc). Drives the production firing
+            // decision + the chokepoint climb-follow + the auto-demote: a lost climb is
+            // re-tagged until a SACK confirms (then STOPS), a hopeless climb auto-demotes
+            // to last-confirmed (BREAK-count==0), a turbo-climb-fail routes to a tag-demote.
+            // See arq_responder.cc test_inband_retag + inband-reliability-design.md §1/§4.
+            test_opts.test_inband_retag_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-nack") == 0)
+        {
+            // In-band rate adaptation Stage 4e — D2 NACK first-class (one-shot at startup,
+            // exit rc). The RX FAST-signals a genuine cannot-follow (an un-adoptable climb /
+            // a down-ladder total-loss) with a NACK; the sender auto-demotes to the RX config
+            // IMMEDIATELY (BREAK-count==0), faster than the R-retry give-up. See
+            // arq_responder.cc test_inband_nack + inband-reliability-design.md §2.
+            test_opts.test_inband_nack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inband-reannounce") == 0)
+        {
+            // Same-config tag owner-law regression (one-shot at startup, exit rc). Proves
+            // confirmed steady state emits no tag, forced same-config tags receive the
+            // production processing guard, and unconfirmed-change repeats disarm on SACK.
+            test_opts.test_inband_reannounce_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-data-ack-multiwindow") == 0)
+        {
+            // Track A — multi-window DATA-ACK/SACK correlator regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_data_ack_multiwindow
+            // + fact-documents/data-flow-data-ack-sack-correlator.md §7.
+            test_opts.test_data_ack_multiwindow_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cumulative-ack") == 0)
+        {
+            // FORGIVING-ACK Tier-2 cumulative-n_r regression (feat/forgiving-ack-tier1,
+            // failing-first under -DCUMULATIVE_ACK_FAILBEFORE). Drives the SELF-HEAL
+            // (a lost report recovered by the next n_r), the contiguous-high-water
+            // GAP-INVARIANT (n_r NEVER ACKs a gap — via the REAL advance_last_delivered
+            // + delivery_step_is_gap producers), the CAPABILITY GATE (cap-off ->
+            // per-batch fallback), and COMPOSITION with Tier-1. See
+            // fact-documents/data-flow-forgiving-ack.md §T2.6.
+            test_opts.test_cumulative_ack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-enc-failclosed") == 0)
+        {
+            // Encryption negotiation FAIL-CLOSED regression (one-shot, then exit rc).
+            // Opt-in (-E) against a peer without CAP_ENCRYPTION (unsupported, or a
+            // MITM that stripped the cap bit) -> REFUSE for BOTH strict AND fast;
+            // default-off (ENCRYPT_OFF) -> legal plaintext. Drives the shared
+            // production predicate decide_encryption_negotiation(). Fails-before
+            // under -DENC_FAILOPEN_FAILBEFORE (which recompiles the historical
+            // opportunistic-plaintext fast downgrade). Isolated one-shot so it does
+            // not depend on the full --test suite's wall-clock watchdog.
+            test_opts.test_enc_failclosed_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-a3-decouple-safety") == 0)
+        {
+            // T5 — the §2 DECOUPLE-SAFETY CHECKPOINT. With A3 ENABLED and the
+            // demote UNTOUCHED, prove (T5a) a SINGLE forward-healthy reverse-ACK
+            // miss is NON-LOAD-BEARING — delivery advances, the multi-batch
+            // transfer completes byte-faithful via the next turn's cumulative n_r
+            // (the explicit anti-0-bytes proof; FAIL-BEFORE -DCUMULATIVE_ACK_FAILBEFORE
+            // STALLS) — and (T5b) SUSTAINED loss STILL exhausts nResends -> BREAK
+            // (the genuine-death net is intact). Gate that MUST be GREEN before the
+            // Phase-2 demote-decouple. See data-flow-forgiving-ack.md §T2.2/§6.
+            test_opts.test_a3_decouple_safety_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-recovery-ack-capture") == 0)
+        {
+            // recovery-ack-capture LEVER 1 focused capture-window regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_recovery_ack_capture
+            // + fact-documents/data-flow-recovery-ack-capture.md §7.
+            test_opts.test_recovery_ack_capture_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-pas") == 0)
+        {
+            // PAS/PCS distribution-matcher bijection + histogram self-test (feat/pcs).
+            // Pure cl_dist_matcher check, no Mercury/ARQ state needed. See
+            // fact-documents/data-flow-pas-shaping.md §6 + tools/test_pas_shaping.py.
+            test_opts.test_pas_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-tinterp-seed") == 0)
+        {
+            // TINTERP-SEED production estimator self-test (staging/tinterp-seed,
+            // failing-first): drives the SFO-GRID CODED harness in-process on the
+            // GOOD Watterson fade and asserts LS-seed floors 0/K while the it=0
+            // TIME_INTERP seed crosses K/K, plus a clean-channel no-op. The exact
+            // estimator the MERCURY_TINTERP_SEED receive_byte rescue selects.
+            test_opts.test_tinterp_seed_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-tinterp-receive") == 0)
+        {
+            test_opts.test_tinterp_receive_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-cfg17") == 0)
+        {
+            // CFG17 shaped-64-QAM COMPOSITION self-test (feat/cfg17, failing-first):
+            // drives the SFO-GRID harness in-process for three cells and asserts the
+            // composed stack (PAS + TINTERP-seed turbo + ratio-nvfix) decodes where a
+            // bare arm fails. See fact-documents/data-flow-cfg17-shaped-64qam.md §3.
+            test_opts.test_cfg17_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-inorder-demote") == 0)
+        {
+            // D3.1 — UNIFIED in-order delivery across EVERY demote case —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_inorder_demote
+            // + bigblock_p3_hw/_d31_fade/D31_INORDER_DESIGN.md.
+            test_opts.test_inorder_demote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-climb-bsi-rollback") == 0)
+        {
+            // CLIMB-CHURN — commander-side bsi rollback on a climb-UP promote —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_commander.cc test_climb_bsi_rollback
+            // + fact-documents/data-flow-climb-up-bsi-rollback.md.
+            test_opts.test_climb_bsi_rollback_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-guard-reanchor") == 0)
+        {
+            // Reverse-SACK partial-target guard live-state reference regression.
+            test_opts.test_guard_reanchor_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-spec-sack") == 0)
+        {
+            // LEVER #2 — speculative/prompt SACK — one-shot at startup, then exit
+            // with the test's rc. fail-before (env off) / pass-after
+            // (MERCURY_SPEC_SACK=1). See source/datalink_layer/arq_responder.cc
+            // test_spec_sack + fact-documents/turnaround-eff.md §8/§9.
+            test_opts.test_spec_sack_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batchsize-desync") == 0)
+        {
+            // res_c3100 — CMD>RSP batch-size desync silent-corruption regression —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_batchsize_desync_delivery
+            // + silent-corruption-residual.md §8. fail-before: MERCURY_BATCHSIZE_DESYNC_DEFEAT=1.
+            test_opts.test_batchsize_desync_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-batch-shrink-orphan-current") == 0)
+        {
+            // rx_btf=-1 current-batch shrink tail-drop (marginal-SNR silent corruption) —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_batch_shrink_orphan_current
+            // + fact-documents/silent-corruption-marginal-snr.md.
+            test_opts.test_batch_shrink_orphan_current_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-linkphase-pending-confirm") == 0)
+        {
+            // SEAM-2 deferred prev-confirm ARM/FLUSH fire proof (one-shot at startup, exit rc).
+            test_opts.test_linkphase_pending_confirm_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-eob-loss-batch-truncation") == 0)
+        {
+            // D5 — EOB-inference batch truncation (lost-EOB tail silent skip) —
+            // one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_eob_loss_batch_truncation
+            // + TRACK_C_D2D3D5_DESIGN.md §5.3.
+            test_opts.test_eob_loss_batch_truncation_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-dedup-rebase") == 0)
+        {
+            // In-band demote-rebase double-delivery (byte-stream corruption) regression
+            // -- one-shot at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_responder.cc test_dedup_rebase.
+            test_opts.test_dedup_rebase_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-v2-pendingack-flip-alias") == 0)
+        {
+            // R030 — v2 PENDING_ACK flip aliasing regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §4.2 / §5.5.
+            test_opts.test_v2_pendingack_flip_alias_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-retx-slot-order") == 0)
+        {
+            // Timing redesign — retx never rides wire slot 0 regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // source/datalink_layer/arq_commander.cc test_retx_slot_order.
+            test_opts.test_retx_slot_order_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-bigblock-livepath") == 0)
+        {
+            // GAP-2 LIVE-PATH (diag/livepath-sim): real CONNECT at the robust start, then
+            // ONE real SET_CONFIG handshake robust->CFG16 over the live wire (NO pin), then
+            // a 1374B K=8 transfer through the REAL send_batch->bigblock_send_one_block emit
+            // + receive_byte cw0-CRC gate + carve + FIFO. Key question: does the in-sim live
+            // path reproduce the HW cw0-CRC reject? One-shot at startup, then exit rc.
+            test_opts.test_bigblock_livepath_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-data-anchored-promote") == 0)
+        {
+            // Option B (data-anchored gearshift promotion) regression — one-shot
+            // at startup, then exit with the test's rc. See
+            // fact-documents/gearshift-start-and-recovery.md §6.4.
+            test_opts.test_data_anchored_promote_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-shutdown-atomic") == 0)
+        {
+            // R006 — shutdown_ atomicity regression — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/data-flow-arq-recovery-cluster.md §7.
+            test_opts.test_shutdown_atomic_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-probe-backoff") == 0)
+        {
+            // FIX-B floor-probe back-off regression — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/gearshift-floor-probe-backoff.md §7.
+            test_opts.test_probe_backoff_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-phantom-ack-gate") == 0)
+        {
+            // Phantom-ACK content-gate regression — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/gearshift-start-and-recovery.md §8.
+            test_opts.test_phantom_ack_gate_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-clean-batch-viability") == 0)
+        {
+            // CLEAN-BATCH VIABILITY regression (§9) — one-shot at startup, then
+            // exit with the test's rc. See
+            // fact-documents/gearshift-start-and-recovery.md §9.8.
+            test_opts.test_clean_batch_viability_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-decode-marathon") == 0)
+        {
+            // LEVER C (feat/decode-marathon) §3 integrity gate: parallel big-block
+            // decode == serial, byte-faithful + in-order + no cross-frame corruption,
+            // with a shared-workspace fail-before. One-shot at startup, then exit rc.
+            // See fact-documents/decode-marathon-C.md §8.
+            test_opts.test_decode_marathon_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-fir-lever") == 0)
+        {
+            // Exact-AVX2 FIR lever gate: unset means default-on (on capable
+            // hosts), `0` restores the scalar authority, and the exact kernels
+            // must stay byte-identical to scalar at the production entry
+            // points. One-shot at startup, then exit rc.
+            test_opts.test_fir_lever_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-climb-engine") == 0)
+        {
+            // Integrated 3-bug climb regression — one-shot at startup, then exit
+            // with the test's rc. See fact-documents/gearshift-climb-engine.md §7.
+            test_opts.test_climb_engine_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-break-weld") == 0)
+        {
+            test_opts.test_break_weld_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-robust0-compress-deadlock") == 0)
+        {
+            // ROBUST_0 + streaming-compression deadlock regression — one-shot at
+            // startup, then exit with the test's rc. See
+            // fact-documents/data-flow-compress-frame-fill.md §5.
+            test_opts.test_robust0_compress_deadlock_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rung-floor") == 0)
+        {
+            // Per-rung MEASURED election floor gate + failure memory regression — one-shot at
+            // startup, then exit with the test's rc. See DATAFLOW_AUDIT_rung_floor.md §7.
+            test_opts.test_rung_floor_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-acksuffix") == 0)
+        {
+            // ACK-suffix pollution guard fail-before/pass-after — one-shot at startup, then exit rc.
+            test_opts.test_acksuffix_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-streaming-compress-overshoot") == 0)
+        {
+            // Streaming-compression stale-EMA overshoot regression (one-shot,
+            // exit rc). MERCURY_COMPRESS_RETRY_DEFEAT=1 restores the RAW trap.
+            test_opts.test_streaming_compress_overshoot_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-mixbatch-fill-overpop") == 0)
+        {
+            // Mixbatch fill over-pop reorder regression (one-shot, exit rc).
+            // See fact-documents/data-flow-mixbatch-fill.md.
+            test_opts.test_mixbatch_fill_overpop_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-mixbatch-fill-overpop-compressed") == 0)
+        {
+            // Mixbatch fill COMPRESSION-leg over-pop + force-FREE data-loss
+            // regression (one-shot, exit rc). data-flow-mixbatch-fill.md ss9.
+            test_opts.test_mixbatch_fill_overpop_compressed_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-idle-switch-role-race") == 0)
+        {
+            // Idle SWITCH_ROLE race regression — one-shot at startup, then exit
+            // with the test's rc. FAILS-BEFORE evidence for the
+            // connected-but-0-deliver bench bug (empty-tx Commander gives its
+            // role away before the app's first data write).
+            test_opts.test_idle_switch_role_race_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-break-noprogress-teardown") == 0)
+        {
+            // BREAK no-progress teardown regression — one-shot at startup, then
+            // exit with the test's rc. Part C of the idle-switchrole-race fix:
+            // a never-fed BREAK spiral must reach a graceful teardown at K dead
+            // cycles instead of re-arming the watchdog forever. FAILS-BEFORE with
+            // -DBREAK_NOPROGRESS_FAILBEFORE (the kernel never escalates).
+            test_opts.test_break_noprogress_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strcmp(argv[i], "--test-rx-ctrl-drop") == 0)
+        {
+            // RX-CTRL-DROP regression — one-shot at startup, then exit with the
+            // test's rc. The messages_control one-deep mailbox had no escape out of
+            // RECEIVED, so a stranded slot silently dropped every later control
+            // frame and killed the reverse control plane. FAILS-BEFORE with
+            // -DRX_CTRL_DROP_FAILBEFORE (the watchdog never fires). See
+            // fact-documents/data-flow-control-slot-lifecycle.md.
+            test_opts.test_rx_ctrl_drop_cli = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis2-ceiling-fire=", 33) == 0)
+        {
+            // SACK Design A Step 12 — synthetic Axis-2 proven-ceiling fire
+            // (§4.3.4 invariant #7). Drives a synthetic Axis-2 down-move (which
+            // sets batch_size_proven_ceiling) then attempts an up-move that
+            // MUST be VETOED by the ceiling check. One-shot at startup, then
+            // exit. Default off; production builds never pass this flag.
+            const char* arg = argv[i] + 33;
+            if (strcmp(arg, "1") == 0) test_opts.test_policy_axis2_ceiling_fire_cli = 1;
+            else { fprintf(stderr, "--test-policy-axis2-ceiling-fire: expected '1'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-break-supremacy=", 30) == 0)
+        {
+            // SACK Design A Step 12 — synthetic BREAK supremacy fire
+            // (§4.3.4 invariant #6, BREAK integration). Invokes the supremacy
+            // hook with a synthetic BREAK reason tag and confirms Axis-2 +
+            // Axis-3 reset + 3 evaluations suppressed by the cooldown.
+            // One-shot at startup, then exit. Default off.
+            const char* arg = argv[i] + 30;
+            if (strcmp(arg, "1") == 0) test_opts.test_policy_break_supremacy_cli = 1;
+            else { fprintf(stderr, "--test-policy-break-supremacy: expected '1'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis1-then-axis2=", 31) == 0)
+        {
+            // SACK Design A Step 10 — composite synthetic fire demonstrating
+            // §4.3.4 invariant #6 (Axis-1 supremacy → Axis-2 3-batch cooldown).
+            // Fires Axis-1 first (sets axis2_cooldown_batches=3 via the supremacy
+            // hook), then immediately attempts an Axis-2 fire that SHOULD BE
+            // SUPPRESSED because the cooldown is engaged. The fire then evaluates
+            // 3 more synthetic batches to drain the cooldown and demonstrate
+            // Axis-2 fires once cooldown reaches 0.
+            const char* arg = argv[i] + 31;
+            if (strcmp(arg, "up") == 0)        test_opts.test_policy_axis1_then_axis2_cli = 1;
+            else if (strcmp(arg, "down") == 0) test_opts.test_policy_axis1_then_axis2_cli = 2;
+            else { fprintf(stderr, "--test-policy-axis1-then-axis2: expected 'up' or 'down'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-fire=", 25) == 0)
+        {
+            // SACK Design A Step 11 — synthetic Axis-3 fire (single event or walk).
+            const char* arg = argv[i] + 25;
+            if (strcmp(arg, "ok") == 0)        test_opts.test_policy_axis3_fire_cli = 1;
+            else if (strcmp(arg, "miss") == 0) test_opts.test_policy_axis3_fire_cli = 2;
+            else if (strcmp(arg, "walk") == 0) test_opts.test_policy_axis3_fire_cli = 3;
+            else { fprintf(stderr, "--test-policy-axis3-fire: expected 'ok' or 'miss' or 'walk'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis1-then-axis3=", 31) == 0)
+        {
+            // SACK Design A Step 11 — composite synthetic fire demonstrating
+            // §4.3.4 invariant #6 (Axis-1 supremacy → Axis-3 cooldown).
+            const char* arg = argv[i] + 31;
+            if (strcmp(arg, "miss") == 0)      test_opts.test_policy_axis1_then_axis3_cli = 1;
+            else { fprintf(stderr, "--test-policy-axis1-then-axis3: expected 'miss'\n"); exit(1); }
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-miss-burst=", 31) == 0)
+        {
+            test_opts.test_policy_axis3_miss_burst_cli = atoi(argv[i] + 31);
+            if (test_opts.test_policy_axis3_miss_burst_cli < 1) test_opts.test_policy_axis3_miss_burst_cli = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-recover=", 28) == 0)
+        {
+            test_opts.test_policy_axis3_recover_cli = atoi(argv[i] + 28);
+            if (test_opts.test_policy_axis3_recover_cli < 1) test_opts.test_policy_axis3_recover_cli = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+        else if (strncmp(argv[i], "--test-policy-axis3-offperiodic=", 32) == 0)
+        {
+            test_opts.test_policy_axis3_offperiodic_cli = atoi(argv[i] + 32);
+            if (test_opts.test_policy_axis3_offperiodic_cli < 1) test_opts.test_policy_axis3_offperiodic_cli = 1;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+    else return false;
+    return true;
+}
+
+void run_main_post_tests(cl_arq_controller& ARQ, cl_telecom_system& telecom_system,
+    const MainTestOptions& test_opts)
+{
+        if (test_opts.test_policy_axis1_fire_cli != 0) {
+            // SACK Design A Step 9 — synthetic Axis-1 fire (one-shot, then exit).
+            // Calls the public test helper on cl_arq_controller which primes
+            // the LADDER state with a synthetic observable + counters, then
+            // calls policy_evaluate_axis1() once. The [POLICY-MOVE] and
+            // [POLICY-SUPREMACY] log lines should appear on stdout.
+            printf("[FLAG] --test-policy-axis1-fire=%s: invoking synthetic Axis-1 fire\n",
+                   test_opts.test_policy_axis1_fire_cli == 1 ? "up" : "down");
+            fflush(stdout);
+            ARQ.test_fire_policy_axis1(test_opts.test_policy_axis1_fire_cli);
+            printf("[FLAG] Synthetic fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis2_fire_cli != 0) {
+            // SACK Design A Step 10 — synthetic Axis-2 fire (one-shot, then exit).
+            printf("[FLAG] --test-policy-axis2-fire=%s: invoking synthetic Axis-2 fire\n",
+                   test_opts.test_policy_axis2_fire_cli == 1 ? "up" : "down");
+            fflush(stdout);
+            ARQ.test_fire_policy_axis2(test_opts.test_policy_axis2_fire_cli);
+            printf("[FLAG] Synthetic fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis2_ceiling_fire_cli != 0) {
+            // SACK Design A Step 12 — Axis-2 proven-ceiling fire (one-shot, then exit).
+            printf("[FLAG] --test-policy-axis2-ceiling-fire=1: invoking synthetic "
+                   "Axis-2 ceiling enforcement demo (§4.3.4 invariant #7)\n");
+            fflush(stdout);
+            ARQ.test_fire_policy_axis2_ceiling();
+            printf("[FLAG] Ceiling fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_shutdown_atomic_cli) {
+            // R006 — shutdown_ atomicity regression (one-shot, then exit rc).
+            // Free function on the main.cc global; no ARQ/telecom_system state.
+            printf("[FLAG] --test-shutdown-atomic: invoking R006 shutdown_ "
+                   "atomicity regression\n");
+            fflush(stdout);
+            int rc = test_shutdown_atomic();
+            printf("[FLAG] Shutdown-atomic test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_partial_bsi_advance_cli != NULL) {
+            // SACK partial-path BSI non-advance reproducer (one-shot, then exit).
+            // Returns 0 on PASS, 1 on FAIL. Exit code propagates so test
+            // harnesses can assert via shell.
+            printf("[FLAG] --test-partial-bsi-advance=%s: invoking synthetic "
+                   "partial-path BSI advance reproducer\n", test_opts.test_partial_bsi_advance_cli);
+            fflush(stdout);
+            int rc = ARQ.test_partial_bsi_advance(test_opts.test_partial_bsi_advance_cli);
+            printf("[FLAG] Partial-bsi-advance test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_arq_unit_cli) {
+            // P2 big-block ARQ-granularization regression (one-shot, then exit rc).
+            // Drives bigblock_block_to_arq() through 3 cases (clean K=8 / one-bad-cw
+            // / lost-EOB) + asserts RX delivered == TX at every transition. FAILS
+            // before P2 wiring (the stub), PASSES after. See
+            // fact-documents/data-flow-bigblock-arq-unit.md §6.
+            printf("[FLAG] --test-bigblock-arq-unit: invoking big-block "
+                   "ARQ-granularization regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_bigblock_arq_unit();
+            printf("[FLAG] Bigblock-arq-unit test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_sim_inproc_bigblock_cli) {
+            // STEP 3 — single-block end-to-end in the in-process 2-instance sim.
+            // Drives the production transmit_bigblock/receive_bigblock/
+            // bigblock_block_to_arq path: a single big-block ARQ-drives
+            // CMD->RSP->ACK->CMD byte-faithful + a one-bad-codeword partial ->
+            // selective-repeat completes. One-shot at startup, then exit rc.
+            printf("[FLAG] --test-sim-inproc-bigblock: invoking single-block "
+                   "end-to-end in-process sim\n");
+            fflush(stdout);
+            int rc = ARQ.test_sim_inproc_bigblock();
+            printf("[FLAG] Sim-inproc-bigblock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_fullpath_cli) {
+            // FULL-PATH REGRESSION (bigblock-whiten-align): the LIVE 2-instance CFG16
+            // big-block transfer through the REAL TX-encode->whiten->PHY->receive_bigblock
+            // de-whiten->arq carve->copy_data_to_buffer FIFO deliver path. Asserts the full
+            // message is delivered byte-faithful, with fail-before (DEFEAT_FIX=1) / pass-after
+            // on the SAME binary. Closes the cross-layer gap the CASE A-D synthetic carve
+            // tests bypassed (caller-owned RX vector / direct receive_bigblock / messages_rx[]
+            // assertions never exercised the live UAF, per-block wait, or FIFO delivery).
+            printf("[FLAG] --test-bigblock-fullpath: invoking LIVE 2-instance big-block "
+                   "full-path delivery regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_fullpath();
+            printf("[FLAG] Bigblock-fullpath test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_cfg103_gate_cli) {
+            // ROBUST_3 (cfg103) wiring guard unit. Pure header-inline decisions: the ladder
+            // fixed point and the fail-closed negotiation gate. Each guard is asserted
+            // fail-before (base arithmetic reconstructed inline = the exact hazard) AND
+            // pass-after (the live guarded function), so one binary shows both. Exit rc.
+            printf("[FLAG] --test-cfg103-gate: ROBUST_3 wiring guards "
+                   "(fail-before base arithmetic vs pass-after live)\n");
+            fflush(stdout);
+            int gfails = 0;
+            auto gck = [&](bool cond, const char* name){
+                printf("[CFG103-GATE] %s: %s\n", cond ? "PASS" : "FAIL", name);
+                if(!cond) gfails++;
+            };
+            const int R3 = ROBUST_3;   // 103
+            // --- Classification witnesses ---
+            gck(is_robust_config(R3) == true,  "widen: is_robust_config(103)=true (MFSK robust rung)");
+            gck(is_robust3_config(R3) == true, "predicate: is_robust3_config(103)=true");
+            gck(is_ofdm_config(R3) == false,   "is_ofdm_config(103)=false (not an OFDM rung)");
+            gck(config_ladder_index(R3) == -1, "off-ladder: config_ladder_index(103) = -1");
+            // --- Ladder fixed point ---
+            {
+                // fail-before: the BASE down_n arithmetic (no guard) drops cfg103 to ROBUST_0.
+                int idx = config_ladder_index(R3); idx -= 3; if(idx<0) idx=0;
+                int base_downn = FULL_CONFIG_LADDER[idx];
+                gck(base_downn == ROBUST_0, "fail-before: base ladder_down_n(103,3) = ROBUST_0 (silent demote hazard)");
+            }
+            gck(config_ladder_down_n(R3, 3, true)  == R3, "pass-after: ladder_down_n(103,3,r1) holds 103");
+            gck(config_ladder_down_n(R3, 3, false) == R3, "pass-after: ladder_down_n(103,3,r0) holds 103");
+            gck(config_ladder_down(R3, false) == R3, "pass-after: ladder_down(103,r0) holds 103");
+            gck(config_ladder_down(R3, true)  == R3, "pass-after: ladder_down(103,r1) holds 103");
+            gck(config_ladder_up(R3, false, false) == R3, "pass-after: ladder_up(103) holds 103");
+            gck(config_ladder_up_n(R3, 5, false, false) == R3, "pass-after: ladder_up_n(103,5) holds 103");
+            gck(config_ladder_down(CONFIG_12, false) == CONFIG_11, "unchanged: ladder_down(12)=11");
+            gck(config_ladder_up(CONFIG_12, false, false) == CONFIG_13, "unchanged: ladder_up(12)=13");
+            gck(config_ladder_down(ROBUST_2, true) == ROBUST_1, "unchanged: ladder_down(ROBUST_2)=ROBUST_1");
+            gck(config_ladder_down_n(ROBUST_2, 3, true) == ROBUST_0, "unchanged: ladder_down_n(ROBUST_2,3)=ROBUST_0");
+            // --- Fail-closed negotiation gate ---
+            gck((is_ofdm_config(R3) || is_robust_config(R3)) == true,
+                "fail-before: base plain gate WOULD accept cfg103 (is_robust widened) = the leak");
+            gck(config_negotiable_to(R3, false) == false,
+                "pass-after: NON-pinned peer REFUSES cfg103 (fail-closed)");
+            gck(config_negotiable_to(R3, true) == true,
+                "pass-after: cfg103-PINNED peer ACCEPTS cfg103");
+            gck(config_negotiable_to(CONFIG_16, false) == true, "unchanged: cfg16 negotiable");
+            gck(config_negotiable_to(ROBUST_0, false) == true, "unchanged: ROBUST_0 negotiable");
+            gck(config_negotiable_to(ROBUST_2, false) == true, "unchanged: ROBUST_2 negotiable");
+            gck(config_negotiable_to(LOW48_ANCHOR_S20_R6, false) == true, "note: cfg105 plain-negotiable here (its own gate lives elsewhere)");
+            gck(config_negotiable_to(104, false) == false, "unchanged: reserved id 104 not negotiable");
+            int grc = gfails ? 1 : 0;
+            printf("[FLAG] --test-cfg103-gate complete: %d failures (rc=%d) -- exiting.\n", gfails, grc);
+            fflush(stdout);
+            exit(grc);
+        }
+        if (test_opts.test_sim_sustain_cli) {
+            // SIM_INPROC SUSTAIN BATTERY — runs BOTH durable sustain regressions back-to-back on
+            // the SAME binary and exits with the OR of their return codes (any failure -> nonzero):
+            //  (1) STEPPER-WEDGE (SIMFTR_ROOTCAUSE.md §7/§8 fix #1): PINNED-CFG15 clean transfers
+            //      (payloads 600/2000/4000/8000), each must terminate byte-correct via the genuine
+            //      delivery break (NOT the post-transfer keepalive <-> pumped-wait spin), with
+            //      fail-before (MERCURY_SIM2_DEFEAT_SIMFTR_FIX=1 -> wedge -> watchdog-stalled).
+            //  (2) STEPPER-CORE REWRITE Phase b: OUTER-loop stepper, live ROBUST_0->CFG16 OFDM
+            //      big-block transfer; asserts the (iii) data-path wedge is gone (ZERO
+            //      [SIM2-DEADLOCK-BREAK]) + clean K=8 carve + C0-a full byte-correct sustain.
+            printf("[FLAG] --test-sim-sustain: invoking SIM_INPROC sustain battery — "
+                   "(1) PINNED-CFG15 stepper-wedge regression, then "
+                   "(2) OUTER-stepper OFDM big-block no-wedge + clean-carve (Phase b)\n");
+            fflush(stdout);
+            int rc1 = cl_arq_controller::test_sim_inproc_sustain();
+            printf("[FLAG] --test-sim-sustain (1) PINNED-CFG15 stepper-wedge: rc=%d\n", rc1);
+            fflush(stdout);
+            int rc2 = cl_arq_controller::test_sim_inproc_sustain_outer();
+            printf("[FLAG] --test-sim-sustain (2) OUTER-stepper big-block: rc=%d\n", rc2);
+            fflush(stdout);
+            int rc = (rc1 != 0 || rc2 != 0) ? 1 : 0;
+            printf("[FLAG] Sim-sustain battery complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_multicw_cli) {
+            // MULTI-CW WINDOW REGRESSION (data-flow-bigblock-arq-unit.md §17): a FULL K=8
+            // block (all 8 codewords) through the LIVE receive_bigblock+de-whiten+per-cw-CRC
+            // carve. Three arms (CRC-on block-window byte-faithful + clean=8/8; NOCRC
+            // stock-window corruption-repro; NOCRC block-window byte-faithful) prove the root
+            // cause is the RX capture WINDOW, NOT whiten/offset. The K>1 test the 622-byte
+            // cases could not catch. One-shot at startup, then exit rc.
+            printf("[FLAG] --test-bigblock-multicw: invoking FULL K=8 multi-codeword "
+                   "byte-faithfulness regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_multicw();
+            printf("[FLAG] Bigblock-multicw test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_down_resync_cli) {
+            // IN-BAND DOWN-LADDER RESYNC REGRESSION (data-flow-inband-ondemote-zerobyte.md §6):
+            // CMD demote-to-ROBUST_0 with announce SUPPRESSED -> RSP down-ladder must resync from
+            // a primary-derived snapshot over a ROBUST-spanning window. Fail-before (truncation ->
+            // 0 bytes) -> pass-after (Rank-1 fix -> ROBUST_0 decodes, byte-faithful). One-shot.
+            printf("[FLAG] --test-inband-down-resync: invoking in-band down-ladder ROBUST "
+                   "resync regression (fail-before 0-byte -> pass-after byte-faithful)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_inband_down_resync();
+            printf("[FLAG] Inband-down-resync test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_nb_cfo_correction_cli) {
+            // Narrowband CONFIG_0 residual carrier-offset correction regression: assert a genuine
+            // narrowband CONFIG_0 frame decodes under an exact in-window carrier offset injected by
+            // the in-process sim channel (fail-before absent/wrong-sign -> pass-after correct sign).
+            extern int nb_cfo_correction_test();
+            printf("[FLAG] --test-nb-cfo-correction: invoking narrowband CONFIG_0 residual "
+                   "carrier-offset correction regression\n");
+            fflush(stdout);
+            int rc = nb_cfo_correction_test();
+            printf("[FLAG] NB-CFO-correction test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_chanest_cli) {
+            // GENUINE channel-estimation regression (fix/bigblock-chanest): drive the 2-instance
+            // CFG16 big-block decode (ref==NULL) under a CFO/SFO-impaired channel; assert the
+            // block-wide estimate collapses (fail-before) and recovers byte-faithful (pass-after).
+            // Reproduces the HW [RXACQ] meanH~0.005 collapse off-bench. One-shot, then exit rc.
+            printf("[FLAG] --test-bigblock-chanest: invoking GENUINE big-block channel-estimation "
+                   "regression (CFO/SFO-impaired 2-instance decode)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_chanest();
+            printf("[FLAG] Bigblock-chanest test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_acqwindow_cli) {
+            // §19 acquisition-window POSITION guard regression: drive ONE genuine K=8 CFG16 block
+            // at several in-window preamble offsets in a FIXED production-sized window; assert the
+            // near-end block (tail past window) DEFERS (guard ON) and carves a truncated bytes_ok=0
+            // block under DEFEAT_ACQGUARD. Off-bench reproduction of the HW ~5.6% defect. One-shot.
+            printf("[FLAG] --test-bigblock-acqwindow: invoking §19 acquisition-window POSITION guard "
+                   "regression (in-window preamble offsets, fixed capture window)\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_acqwindow();
+            printf("[FLAG] Bigblock-acqwindow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_txlevel_cli) {
+            printf("[FLAG] --test-bigblock-txlevel: measuring CFG16 big-block vs "
+                   "stock-OFDM TX peak/RMS\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_txlevel();
+            printf("[FLAG] Bigblock-txlevel test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_topgear_clean_election_cli) {
+            // TOP-GEAR CONFIG_17 channel-clean election regression (topgear-stack-productionize.md
+            // §4): the 64-QAM top rung ELECTS only on a clean+FLAT forward channel (SNR margin +
+            // selectivity gate), engages after hysteresis, demotes IMMEDIATELY on marginal/non-flat
+            // (2-path anti-thrash), and delivers ~1.073x cfg16 net-PHY (R7-64 diet). fail-before/pass-after on
+            // the same binary via MERCURY_TOPGEAR_PORT_DEFEAT=1 (broad port defeat).
+            // MERCURY_TOPGEAR_DEFEAT_CLEAN remains the focused verdict-only negative control.
+            // One-shot at startup, then exit rc.
+            printf("[FLAG] --test-topgear-clean-election: invoking CONFIG_17 top-gear "
+                   "channel-clean election regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_topgear_clean_election();
+            printf("[FLAG] Topgear-clean-election test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_climb_election_cli) {
+            // CLIMB-ELECTION regression (data-flow-bigblock-arq-unit.md §16): the big-block
+            // rung is ELECTED by the gearshift CFG16 transition (load_configuration tail),
+            // not only at connect. Asserts the transition elects K==8 symmetrically on both
+            // peers (all_ones==0xFF) and the elected rung emits + delivers byte-faithful.
+            // fail-before/pass-after on the same binary via MERCURY_BIGBLOCK_DEFEAT_ELECTION.
+            printf("[FLAG] --test-bigblock-climb-election: invoking gearshift CFG16 "
+                   "rung-election regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_climb_election();
+            printf("[FLAG] Bigblock-climb-election test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_carve_suspend_unit_cli) {
+            // WALL-B FIX-3: RSP carve-suspend watchdog unit test (one-shot, then exit rc).
+            // The streak state machine + the three consumers + a real receive_byte cw0-reject
+            // loopback; fail-before via MERCURY_BIGBLOCK_DEFEAT_CARVESUSPEND.
+            printf("[FLAG] --test-bigblock-carve-suspend-unit: invoking WALL-B FIX-3 RSP "
+                   "carve-suspend watchdog unit test\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_bigblock_carve_suspend_unit();
+            printf("[FLAG] Bigblock-carve-suspend-unit test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_sack_oow_reject_cli) {
+            // R039 — OFDM SACK_RSP out-of-window reject (one-shot, then exit rc).
+            printf("[FLAG] --test-sack-oow-reject: invoking R039 OFDM SACK_RSP "
+                   "out-of-window reject regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_sack_oow_reject();
+            printf("[FLAG] Sack-oow-reject test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_eob_poison_prev_retx_cli) {
+            // R038 — prev-retransmit EOB poison (one-shot, then exit rc).
+            printf("[FLAG] --test-eob-poison-prev-retx: invoking R038 EOB-poison "
+                   "regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_eob_poison_prev_retx();
+            printf("[FLAG] Eob-poison test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_batch_shrink_strands_prev_cli) {
+            // R035 — data_batch_size shrink strands prev (one-shot, then exit rc).
+            printf("[FLAG] --test-batch-shrink-strands-prev: invoking R035 "
+                   "batch-shrink-strands-prev regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_strands_prev();
+            printf("[FLAG] Batch-shrink-strands-prev test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_batch_shrink_orphan_defer_cli) {
+            // Fix A — mid-flight shrink orphan-defer (one-shot, then exit rc).
+            printf("[FLAG] --test-batch-shrink-orphan-defer: invoking Fix A "
+                   "batch-shrink orphan zero-loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_orphan_defer();
+            printf("[FLAG] Batch-shrink-orphan-defer test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_backup_confirm_flush_cli) {
+            // Fix C / H#1 — fifo_buffer_backup re-stage double-delivery (one-shot, exit rc).
+            printf("[FLAG] --test-backup-confirm-flush: invoking Fix C/H#1 backup "
+                   "ACK-confirm-flush re-stage double-delivery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_backup_confirm_flush();
+            printf("[FLAG] Backup-confirm-flush test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_rxfifo_backpressure_hold_cli) {
+            // Fix H#3 — RX-FIFO back-pressure post-ACK data loss (one-shot, exit rc).
+            printf("[FLAG] --test-rxfifo-backpressure-hold: invoking Fix H#3 RX-FIFO "
+                   "back-pressure post-ACK loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rxfifo_backpressure_hold();
+            printf("[FLAG] Rxfifo-backpressure-hold test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_retx_clear_on_recovery_cli) {
+            // R029 — stale retx queue cleared on recovery (one-shot, then exit rc).
+            printf("[FLAG] --test-retx-clear-on-recovery: invoking R029 "
+                   "retx-clear-on-recovery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_retx_clear_on_recovery();
+            printf("[FLAG] Retx-clear-on-recovery test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_enc_failclosed_cli) {
+            // Encryption negotiation FAIL-CLOSED regression (one-shot, then exit rc).
+            // Drives the shared production predicate decide_encryption_negotiation()
+            // across the operator/peer capability matrix: default-off -> plaintext,
+            // opted-in + both-cap -> encrypt, opted-in + peer-no-cap (or MITM strip)
+            // -> REFUSE for both strict and fast. Fails-before: -DENC_FAILOPEN_FAILBEFORE.
+            printf("[FLAG] --test-enc-failclosed: invoking the encryption fail-closed "
+                   "negotiation regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_encryption_fail_closed();
+            rc += ARQ.test_encryption_cli_validation();
+            printf("[FLAG] Encryption fail-closed test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_cumulative_ack_cli) {
+            // FORGIVING-ACK Tier-2 cumulative-n_r regression (one-shot, then exit rc).
+            // Drives the self-heal (a lost report recovered by the next n_r), the
+            // contiguous-high-water gap-invariant (n_r never ACKs a gap), the
+            // capability gate (cap-off -> per-batch fallback), and composition with
+            // Tier-1. See fact-documents/data-flow-forgiving-ack.md §T2.6.
+            printf("[FLAG] --test-cumulative-ack: invoking Tier-2 cumulative-n_r "
+                   "self-heal regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_cumulative_ack();
+            printf("[FLAG] Cumulative-ACK test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_a3_decouple_safety_cli) {
+            // T5 — the §2 DECOUPLE-SAFETY CHECKPOINT (one-shot, then exit rc).
+            // With A3 enabled + the demote in place, proves a single reverse-ACK
+            // miss is non-load-bearing (delivery advances, byte-faithful — the
+            // anti-0-bytes proof) AND sustained loss still BREAKs (genuine-death
+            // net intact). Drives the REAL advance_last_delivered/delivery_step_is_gap
+            // producers + the REAL cumulative_ack_covers consumer apply.
+            printf("[FLAG] --test-a3-decouple-safety: invoking the §2 decouple-safety "
+                   "checkpoint (single-miss non-load-bearing + genuine-death net)\n");
+            fflush(stdout);
+            int rc = ARQ.test_a3_decouple_safety();
+            printf("[FLAG] A3 decouple-safety checkpoint complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_pas_cli) {
+            // PAS/PCS distribution-matcher bijection + composition self-test
+            // (one-shot, then exit rc). No Mercury/ARQ state needed.
+            printf("[FLAG] --test-pas: invoking PAS/PCS distribution-matcher "
+                   "bijection self-test\n");
+            fflush(stdout);
+            int rc = run_pas_selftest();
+            printf("[FLAG] PAS self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_tinterp_seed_cli) {
+            // TINTERP-SEED production estimator self-test (one-shot, then exit rc).
+            printf("[FLAG] --test-tinterp-seed: invoking TINTERP-SEED production "
+                   "it=0 estimator seed-swap self-test\n");
+            fflush(stdout);
+            int rc = run_tinterp_seed_selftest();
+            printf("[FLAG] TINTERP-SEED self-test complete (rc=%d) - exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_tinterp_receive_cli) {
+            printf("[FLAG] --test-tinterp-receive: invoking receive_byte selectivity transition self-test\n");
+            fflush(stdout);
+            int rc = run_tinterp_receive_path_selftest();
+            printf("[FLAG] TINTERP receive-path self-test complete (rc=%d) - exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_cfg17_cli) {
+            // CFG17 shaped-64-QAM composition self-test (one-shot, then exit rc).
+            // Constructs cl_telecom_system instances in-process and drives the
+            // SFO-GRID harness — no ARQ/audio/TCP state needed.
+            printf("[FLAG] --test-cfg17: invoking CFG17 shaped-64-QAM composition "
+                   "self-test (PAS + TINTERP-seed turbo + ratio-nvfix)\n");
+            fflush(stdout);
+            int rc = run_cfg17_selftest();
+            printf("[FLAG] CFG17 composition self-test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_restage_requeue_orphan_cli) {
+            // §12 — re-stage re-queue orphan/reorder (one-shot, then exit rc).
+            printf("[FLAG] --test-restage-requeue-orphan: invoking §12 re-stage "
+                   "re-queue orphan/reorder regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_restage_requeue_orphan();
+            printf("[FLAG] restage-requeue-orphan test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_restore_backup_bounds_cli) {
+            printf("[FLAG] --test-restore-backup-bounds: invoking large rollback "
+                   "backup restore regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_restore_backup_bounds();
+            printf("[FLAG] restore-backup-bounds test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_stream_offset_cli) {
+            // Option W FOUNDATION — cursor ground-truth (one-shot, then exit rc).
+            printf("[FLAG] --test-stream-offset: invoking Option W FOUNDATION "
+                   "absolute-byte-stream cursor ground-truth regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_stream_offset();
+            printf("[FLAG] stream-offset test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_l1_stage2_ownership_cli) {
+            int rc = ARQ.test_l1_stage2_ownership();
+            printf("[FLAG] L1 stage-2 ownership test complete (rc=%d)\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_rx_drain_backpressure_cli) {
+            // FIX-6 — RX-delivery drain backpressure (one-shot, then exit rc).
+            printf("[FLAG] --test-rx-drain-backpressure: invoking FIX-6 "
+                   "RX-delivery drain backpressure regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rx_drain_backpressure();
+            printf("[FLAG] RX-drain-backpressure test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_kx_data_tamper_cli) {
+            // Mid-stream AEAD ciphertext tamper fail-secure fire proof (one-shot, then exit rc).
+            printf("[FLAG] --test-kx-data-tamper: invoking mid-stream AEAD ciphertext tamper fail-secure fire proof\n");
+            fflush(stdout);
+            cl_arq_controller test_arq;
+            int rc = test_arq.test_kx_data_tamper();
+            printf("[FLAG] kx-data-tamper test complete (rc=%d) - exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_decompress_false_accept_cli) {
+            // Streaming decompress-failure silent-false-accept (one-shot, then exit rc).
+            printf("[FLAG] --test-decompress-false-accept: invoking streaming decompress-"
+                   "failure silent-false-accept regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_decompress_false_accept();
+            printf("[FLAG] Decompress-false-accept test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_compact_confirm_rx_cli) {
+            // Option B compact confirm LIVE RX-PATH regression (one-shot, then exit rc).
+            printf("[FLAG] --test-compact-confirm-rx: invoking Option B compact "
+                   "confirm live RX-path regression\n");
+            fflush(stdout);
+            cl_arq_controller test_arq;
+            int rc = test_arq.test_compact_confirm_live_rx_path();
+            cl_arq_controller test_arq2;
+            rc += test_arq2.test_compact_confirm_sack_window_rx_path();
+            printf("[FLAG] compact-confirm-rx test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_gap_abort_cli) {
+            // FIX-8 — silent lost-batch GAP on post-reset re-adopt (one-shot, exit rc).
+            printf("[FLAG] --test-gap-abort: invoking FIX-8 post-reset re-adopt "
+                   "gap-abort regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_gap_abort_on_readopt();
+            printf("[FLAG] Gap-abort test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_turnaround_guard_cli) {
+            // R1 turnaround-clearance guard — the guard waits out the peer's TX->RX
+            // mute/flush window before keying a data batch (one-shot, exit rc).
+            printf("[FLAG] --test-turnaround-guard: invoking turnaround-clearance guard "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_tg;
+            int rc = ARQ_tg.test_turnaround_guard();
+            printf("[FLAG] Turnaround-guard test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_measured_timers_cli) {
+            // R6 measured turnaround (SRTT/RTTVAR) estimator + ack-timeout invariant
+            // (one-shot, exit rc).
+            printf("[FLAG] --test-measured-timers: invoking measured-turnaround estimator "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_mt;
+            int rc = ARQ_mt.test_measured_timers();
+            printf("[FLAG] Measured-timers test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_t1_cli) {
+            // T1 zero-dead-time turnaround suites (calibration + scheduled pre-key re-aim) —
+            // fast one-shot, exit rc.
+            printf("[FLAG] --test-t1: invoking T1 zero-dead-time turnaround regressions\n");
+            fflush(stdout);
+            int rc = 0;
+            { cl_arq_controller ARQ_t1a;  rc += ARQ_t1a.test_t1_calibration(); }
+            { cl_arq_controller ARQ_t1sk; rc += ARQ_t1sk.test_t1_schedkey();   }
+            { cl_arq_controller ARQ_t1cb; rc += ARQ_t1cb.test_t1_calib_bootstrap(); }
+			{ cl_arq_controller ARQ_t1lc; rc += ARQ_t1lc.test_t1_schedkey_lifecycle(); }
+			{ cl_arq_controller ARQ_t1sr; rc += ARQ_t1sr.test_t1_fresh_connect_reset(); }
+			{ cl_arq_controller ARQ_t1sf; rc += ARQ_t1sf.test_t1_schedkey_safety(); }
+			{ cl_arq_controller ARQ_t1px; rc += ARQ_t1px.test_t1_repeating_prefix(); }
+            printf("[FLAG] T1 turnaround tests complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_arqsmalls_cli) {
+            // Karn discriminator decoupling (MERCURY_KARN_RETX_ONLY) + DUTY-R
+            // pin-respect seed (MERCURY_DUTY_R_PIN_DEFEAT) — fast one-shot, exit rc.
+            printf("[FLAG] --test-arqsmalls: Karn discriminator + DUTY-R pin-respect regression\n");
+            fflush(stdout);
+            int rc = 0;
+            { cl_arq_controller ARQ_kn; rc += ARQ_kn.test_karn_retx_classify(); }
+            { cl_arq_controller ARQ_dr; rc += ARQ_dr.test_robust_connect_exit(); }
+            printf("[FLAG] arq-smalls test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_recovery_ack_capture_exercise_cli) {
+            printf("[FLAG] --test-recovery-ack-capture-exercise: forcing late "
+                   "recovery ACK capture\n");
+            fflush(stdout);
+            int rc = ARQ.test_recovery_ack_capture_exercise();
+            printf("[FLAG] Recovery-ACK capture exercise complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_axis2_quiesce_gate_cli) {
+            // R4 LINK-PARAMS quiesce gate — an Axis-2 move defers while the batch boundary
+            // is unclean and fires when clean (one-shot, exit rc).
+            printf("[FLAG] --test-axis2-quiesce-gate: invoking R4 LINK-PARAMS quiesce-gate "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_q2;
+            int rc = ARQ_q2.test_axis2_quiesce_gate();
+            printf("[FLAG] Axis-2 quiesce-gate test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_gap_abort_blind_cli) {
+            // GAP-ABORT ruler-blinding — the REAL teardown blinds its own contiguity
+            // ruler and the CMD re-drives the same stream (one-shot, exit rc).
+            printf("[FLAG] --test-gap-abort-blind: invoking gap-abort ruler-blinding "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_gab;
+            int rc = ARQ_gab.test_gap_abort_readopt_blind();
+            printf("[FLAG] Gap-abort-blind test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_gap_abort_stream_blind_cli) {
+            // GAP-ABORT stream-BACKSTOP-blinding — the REAL teardown must preserve the
+            // Option W byte cursor + stamp validity + set the sticky abort latch
+            // (one-shot, exit rc).
+            printf("[FLAG] --test-gap-abort-stream-blind: invoking gap-abort stream-backstop "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_gas;
+            int rc = ARQ_gas.test_gap_abort_stream_backstop_blind();
+            printf("[FLAG] Gap-abort-stream-blind test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_gap_recover_cli) {
+            // RECOVERABLE delivery-time GAP-ABORT — HOLD + re-request converts the
+            // terminal abort on a recoverable one-frame prev hole into an in-order
+            // recovery; the high-water never advances while the hole exists
+            // (one-shot, exit rc).
+            printf("[FLAG] --test-gap-recover: invoking recoverable gap-abort "
+                   "regression\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_grc;
+            int rc = ARQ_grc.test_recoverable_gap_abort();
+            printf("[FLAG] Gap-recover test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_recover_fire_cli) {
+            // W1 — the CMD-side refill decision that makes the recoverable HOLD
+            // actually re-drive the armed-prev hole (one-shot, exit rc).
+            printf("[FLAG] --test-gap-recover-fire: invoking W1 CMD refill "
+                   "fire proof\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_rf;
+            int rc = ARQ_rf.test_recover_fire();
+            printf("[FLAG] Recover-fire test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_retain_overflow_cli) {
+            // Deterministic retention-shadow overflow proof: 19 holes > pre-fix cap 8
+            // (one-shot, exit rc). Run OFF and ON as separate processes.
+            printf("[FLAG] --test-retain-shadow-overflow: invoking retention-shadow "
+                   "overflow proof\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_ro;
+            int rc = ARQ_ro.test_retain_shadow_overflow();
+            printf("[FLAG] Retain-overflow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_held_cur_fire_cli) {
+            // R2b — RSP deliver-held-cur (bytes to the app FIFO via the production
+            // copy_data_to_buffer) + CMD recovery-turnaround credit (one-shot, exit rc).
+            printf("[FLAG] --test-held-cur-deliver-fire: invoking R2b deliver-held-cur "
+                   "fire proof\n");
+            fflush(stdout);
+            cl_arq_controller ARQ_hcf;
+            int rc = ARQ_hcf.test_held_cur_deliver_fire();
+            printf("[FLAG] Held-cur-deliver-fire test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_config_tag_follow_cli) {
+            // In-band rate adaptation Stage 2 — emit/detect/FOLLOW directed loopback
+            // (one-shot, exit rc). Builds its own CMD/RSP + telecom_system internally.
+            printf("[FLAG] --test-config-tag-follow: invoking in-band rate-adapt "
+                   "Stage-2 emit/detect/FOLLOW regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_config_tag_follow();
+            printf("[FLAG] Config-tag-follow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_config_tag_passband_cli) {
+            // In-band rate adaptation Stage 3a — PASSBAND ROUND-TRIP (one-shot, exit rc).
+            printf("[FLAG] --test-config-tag-passband: invoking in-band rate-adapt "
+                   "Stage-3a passband round-trip regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_config_tag_passband_roundtrip();
+            printf("[FLAG] Config-tag-passband test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_drop_cli) {
+            // In-band rate adaptation Stage 3b — LOOPBACK DROP TEST (one-shot, exit rc).
+            // Builds its own CMD/RSP + telecom_system internally.
+            printf("[FLAG] --test-inband-drop: invoking in-band rate-adapt Stage-3b "
+                   "loopback drop regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_drop();
+            printf("[FLAG] Inband-drop test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_fallback_cli) {
+            // In-band rate adaptation Stage 4 — LOST-TAG DOWN-LADDER TEST (one-shot, exit rc).
+            // Builds its own telecom_system instances internally.
+            printf("[FLAG] --test-inband-fallback: invoking in-band rate-adapt Stage-4 "
+                   "lost-tag down-ladder regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_fallback();
+            printf("[FLAG] Inband-fallback test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_seamless_cli) {
+            // In-band rate adaptation Stage 3d — PRE-FRAME SEAMLESS TEST (one-shot, exit rc).
+            // Builds its own telecom_system instances internally.
+            printf("[FLAG] --test-inband-seamless: invoking in-band rate-adapt Stage-3d "
+                   "pre-frame seamless regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_seamless();
+            printf("[FLAG] Inband-seamless test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_downladder_cli) {
+            // In-band down-ladder DELIVERY regression (one-shot, exit rc). PART A drives the
+            // BREAK-orphan defect on synthetic ARQ buffers; PART B builds its own minimal
+            // telecom_system internally for the silent-snapshot directed pass.
+            printf("[FLAG] --test-inband-downladder: invoking in-band down-ladder "
+                   "BREAK-orphan + silent-snapshot regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_downladder();
+            printf("[FLAG] Inband-downladder test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_reseat_span_cli) {
+            // Reseat span integrity (one-shot, exit rc). Drives the PRODUCTION store -> seal
+            // -> copy_data_to_buffer; STOCK reproduces the 332-byte deletion, the fixed arms
+            // hold/refuse, healthy + widen stay byte-identical.
+            printf("[FLAG] --test-reseat-span: invoking prev-batch cross-storage span "
+                   "integrity regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_reseat_span();
+            printf("[FLAG] Reseat-span test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_cmd_idskew_cli) {
+            // CMD id-skew root (one-shot, exit rc). Drives the PRODUCTION staging + rebase;
+            // STOCK reproduces the id=seq+prior skew, FIX rebases to id=seq, and the §87
+            // geometry with id=seq DELIVERS IN PLACE (6301 B) through the production receiver.
+            printf("[FLAG] --test-cmd-idskew: invoking CMD-side new-data slot-rebase regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_cmd_idskew();
+            printf("[FLAG] CMD-idskew test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_deliver_cli) {
+            // In-band FORWARD-HEALTHY REVERSE-ACK MISS -> NO-BREAK DELIVER regression (one-shot,
+            // exit rc). Builds its own CMD/telecom_system instances per case internally.
+            printf("[FLAG] --test-inband-deliver: invoking in-band forward-healthy reverse-ACK "
+                   "miss -> NO-BREAK deliver regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_deliver();
+            printf("[FLAG] Inband-deliver test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_linkphase_mc2_cli) {
+            // LINK-PHASE PRIMITIVE (increment 2 / MC-2) slot-floor directed unit (one-shot,
+            // exit rc). Drives the production selection/apply helpers on a throwaway controller.
+            printf("[FLAG] --test-linkphase-mc2: invoking increment-2 MC-2 slot-floor "
+                   "directed unit\n");
+            fflush(stdout);
+            cl_arq_controller LP_TEST;
+            int rc = LP_TEST.test_linkphase_mc2_slotfloor();
+            printf("[FLAG] Linkphase-mc2 test complete (rc=%d) exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_linkphase_ackwin_cli) {
+            // LINK-PHASE STEP 3 (increment 3) reverse-ACK detection-window directed unit (one-shot,
+            // exit rc). Drives the production gate + sub-b rescue predicates on a throwaway controller.
+            printf("[FLAG] --test-linkphase-ackwin: invoking increment-3 reverse-ACK "
+                   "detection-window directed unit\n");
+            fflush(stdout);
+            cl_arq_controller LP_TEST;
+            int rc = LP_TEST.test_linkphase_ackwin();
+            printf("[FLAG] Linkphase-ackwin test complete (rc=%d) exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_linkphase_shadow_cli) {
+            // LINK-PHASE PRIMITIVE (increment 1) shadow-agreement directed unit (one-shot,
+            // exit rc). Synthetic-fires the production producers on a throwaway controller.
+            printf("[FLAG] --test-linkphase-shadow: invoking increment-1 shadow-agreement "
+                   "directed unit\n");
+            fflush(stdout);
+            cl_arq_controller LP_TEST;
+            int rc = LP_TEST.test_linkphase_shadow();
+            printf("[FLAG] Linkphase-shadow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_linkphase_optclock_cli) {
+            printf("[FLAG] --test-linkphase-optclock: invoking END-stamp freshness directed unit\n");
+            fflush(stdout);
+            cl_arq_controller LP_TEST;
+            int rc = LP_TEST.test_linkphase_optclock_end_stamp();
+            printf("[FLAG] Linkphase-optclock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_ring_floor_cli) {
+            // In-band capture-ring ROBUST-floor OVER-SEAT regression (one-shot, exit rc).
+            // Builds its own RESPONDER/telecom_system instances per case internally.
+            printf("[FLAG] --test-inband-ring-floor: invoking in-band capture-ring "
+                   "ROBUST-floor over-seat regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_ring_floor_overseat();
+            printf("[FLAG] Inband-ring-floor test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_liveness_cli) {
+            // In-band CONNECT-LIVENESS GUARD regression (one-shot, exit rc). Builds its own
+            // CMD/telecom_system instances internally.
+            printf("[FLAG] --test-inband-liveness: invoking in-band connect-liveness guard "
+                   "(control-plane livelock backstop) regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_liveness();
+            printf("[FLAG] Inband-liveness test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_no_break_cli) {
+            // In-band rate adaptation Stage 4c — D5 BREAK-OBSOLETE TEST (one-shot, exit rc).
+            // Builds its own CMD/telecom_system instances internally.
+            printf("[FLAG] --test-inband-no-break: invoking in-band rate-adapt Stage-4c "
+                   "D5 BREAK-obsolete regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_no_break();
+            printf("[FLAG] Inband-no-break test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_retag_cli) {
+            // In-band rate adaptation Stage 4d — D1 repeat + D4 climb/auto-demote TEST
+            // (one-shot, exit rc). Builds its own CMD/RX/telecom_system instances internally.
+            printf("[FLAG] --test-inband-retag: invoking in-band rate-adapt Stage-4d "
+                   "D1 repeat-until-followed + D4 climb/auto-demote regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_retag();
+            printf("[FLAG] Inband-retag test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_nack_cli) {
+            // In-band rate adaptation Stage 4e — D2 NACK first-class TEST (one-shot, exit rc).
+            // Builds its own CMD/RX/telecom_system instances internally.
+            printf("[FLAG] --test-inband-nack: invoking in-band rate-adapt Stage-4e "
+                   "D2 NACK first-class regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_nack();
+            printf("[FLAG] Inband-nack test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inband_reannounce_cli) {
+            // Same-config tag owner-law + processing-guard TEST (one-shot, exit rc).
+            // Builds its own CMD/telecom_system instances internally.
+            printf("[FLAG] --test-inband-reannounce: invoking in-band rate-adapt Stage-4e "
+                   "same-config owner-law regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_inband_reannounce();
+            printf("[FLAG] Inband-reannounce test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_data_ack_multiwindow_cli) {
+            // Track A — multi-window DATA-ACK/SACK correlator (one-shot, exit rc).
+            printf("[FLAG] --test-data-ack-multiwindow: invoking multi-window "
+                   "DATA-ACK/SACK correlator regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_data_ack_multiwindow();
+            printf("[FLAG] Data-ACK-multiwindow test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_recovery_ack_capture_cli) {
+            // recovery-ack-capture LEVER 1 focused capture-window test (one-shot, exit rc).
+            printf("[FLAG] --test-recovery-ack-capture: invoking recovery-ACK "
+                   "capture-window regression (LEVER 1)\n");
+            fflush(stdout);
+            int rc = ARQ.test_recovery_ack_capture();
+            printf("[FLAG] Recovery-ACK-capture test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_inorder_demote_cli) {
+            // D3.1 — UNIFIED in-order delivery across EVERY demote case (one-shot, exit rc).
+            printf("[FLAG] --test-inorder-demote: invoking D3.1 unified in-order "
+                   "delivery regression across all demote cases\n");
+            fflush(stdout);
+            int rc = ARQ.test_inorder_demote();
+            printf("[FLAG] In-order-demote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_climb_bsi_rollback_cli) {
+            // CLIMB-CHURN — commander-side bsi rollback on a climb-UP promote (one-shot, exit rc).
+            printf("[FLAG] --test-climb-bsi-rollback: invoking CLIMB-CHURN "
+                   "commander-side bsi rollback regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_climb_bsi_rollback();
+            printf("[FLAG] Climb-bsi-rollback test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_guard_reanchor_cli) {
+            printf("[FLAG] --test-guard-reanchor: invoking reverse-SACK guard "
+                   "reference regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_guard_reanchor();
+            printf("[FLAG] Guard-reanchor test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_spec_sack_cli) {
+            // LEVER #2 — speculative/prompt SACK (one-shot, exit rc).
+            printf("[FLAG] --test-spec-sack: invoking LEVER #2 speculative-SACK "
+                   "regression (window-fraction deadline -> partial SACK -> retx)\n");
+            fflush(stdout);
+            int rc = ARQ.test_spec_sack();
+            printf("[FLAG] Spec-SACK test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_batchsize_desync_cli) {
+            // res_c3100 — CMD>RSP batch-size desync silent-corruption (one-shot, exit rc).
+            printf("[FLAG] --test-batchsize-desync: invoking CMD>RSP batch-size desync "
+                   "silent-corruption regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batchsize_desync_delivery();
+            printf("[FLAG] batchsize-desync test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_batch_shrink_orphan_current_cli) {
+            // rx_btf=-1 current-batch shrink tail-drop (marginal-SNR silent corruption) (one-shot, exit rc).
+            printf("[FLAG] --test-batch-shrink-orphan-current: invoking rx_btf=-1 "
+                   "current-batch shrink tail-drop regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_batch_shrink_orphan_current();
+            printf("[FLAG] batch-shrink-orphan-current test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_linkphase_pending_confirm_cli) {
+            // SEAM-2 deferred prev-confirm ARM/FLUSH fire proof (one-shot, exit rc).
+            printf("[FLAG] --test-linkphase-pending-confirm: driving the SEAM-2 deferred "
+                   "prev-confirm ARM/FLUSH emit path\n");
+            fflush(stdout);
+            int rc = ARQ.test_linkphase_pending_confirm_fire();
+            printf("[FLAG] linkphase-pending-confirm test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_eob_loss_batch_truncation_cli) {
+            // D5 — EOB-inference batch truncation (lost-EOB tail silent skip) (one-shot, exit rc).
+            printf("[FLAG] --test-eob-loss-batch-truncation: invoking D5 lost-EOB "
+                   "batch-truncation regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_eob_loss_batch_truncation();
+            printf("[FLAG] EOB-loss-batch-truncation test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_dedup_rebase_cli) {
+            // In-band demote-rebase double-delivery corruption fix (one-shot, exit rc).
+            printf("[FLAG] --test-dedup-rebase: invoking in-band demote-rebase "
+                   "double-delivery de-dup regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_dedup_rebase();
+            printf("[FLAG] dedup-rebase test complete (rc=%d) -- exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_v2_pendingack_flip_alias_cli) {
+            // R030 — v2 PENDING_ACK flip aliasing (one-shot, then exit rc).
+            printf("[FLAG] --test-v2-pendingack-flip-alias: invoking R030 "
+                   "PENDING_ACK flip aliasing regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_v2_pendingack_flip_alias();
+            printf("[FLAG] V2-pendingack-flip-alias test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_retx_slot_order_cli) {
+            // Timing redesign — retx never rides wire slot 0 (one-shot, then exit rc).
+            printf("[FLAG] --test-retx-slot-order: invoking retx-slot-order "
+                   "(retx never rides wire slot 0) regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_retx_slot_order();
+            printf("[FLAG] Retx-slot-order test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_bigblock_livepath_cli) {
+            // GAP-2 LIVE-PATH regression (diag/livepath-sim): real CONNECT at the robust
+            // start + ONE real SET_CONFIG handshake robust->CFG16 (NO pin), then a 1374B K=8
+            // transfer through the REAL send_batch->bigblock_send_one_block emit + the
+            // receive_byte cw0-CRC gate + carve + FIFO. Answers the key question whether the
+            // in-sim live path reproduces the HW cw0-CRC reject. One-shot, then exit rc.
+            printf("[FLAG] --test-bigblock-livepath: invoking GAP-2 live-path "
+                   "(real SET_CONFIG -> CFG16, no pin) big-block regression\n");
+            fflush(stdout);
+            int rc = cl_arq_controller::test_sim_inproc_bigblock_livepath();
+            printf("[FLAG] Bigblock-livepath test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_data_anchored_promote_cli) {
+            // Option B (data-anchored gearshift promotion) regression (one-shot,
+            // then exit rc). Drives break_target_with_anchor() + the real
+            // policy_evaluate_axis1() up-shifter with last_data_viable_config
+            // primed. See fact-documents/gearshift-start-and-recovery.md §6.4.
+            printf("[FLAG] --test-data-anchored-promote: invoking Option B "
+                   "promotion/recovery regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_data_anchored_promote();
+            printf("[FLAG] Data-anchored-promote test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_probe_backoff_cli) {
+            // FIX-B floor-probe back-off regression (one-shot, then exit rc).
+            // Drives the REAL arm/gate/reset/predicate machinery + the v2
+            // policy_evaluate_axis1 UP gate over the SIM virtual clock (PB1-PB5).
+            // See fact-documents/gearshift-floor-probe-backoff.md §7.
+            printf("[FLAG] --test-probe-backoff: invoking FIX-B floor-probe "
+                   "back-off regression (PB1-PB5)\n");
+            fflush(stdout);
+            int rc = ARQ.test_probe_backoff();
+            printf("[FLAG] Probe-backoff test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_phantom_ack_gate_cli) {
+            // Phantom-ACK content-gate regression (one-shot, then exit rc).
+            // Drives the pure acceptance policy + the cross-layer anchor/panic/
+            // BREAK invariant. See fact-documents/gearshift-start-and-recovery.md §8.
+            printf("[FLAG] --test-phantom-ack-gate: invoking phantom-ACK "
+                   "content-gate regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_phantom_ack_gate();
+            printf("[FLAG] Phantom-ack-gate test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_clean_batch_viability_cli) {
+            // CLEAN-BATCH VIABILITY regression (one-shot, then exit rc). Drives the
+            // pure promotion predicate + replays the four gated gearshift consumers
+            // for a partial vs a clean batch. See
+            // fact-documents/gearshift-start-and-recovery.md §9.8.
+            printf("[FLAG] --test-clean-batch-viability: invoking CLEAN-BATCH "
+                   "VIABILITY regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_clean_batch_viability();
+            printf("[FLAG] Clean-batch-viability test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_climb_engine_cli) {
+            // Integrated climb regression (one-shot, then exit rc). Drives the
+            // split SACK dedupe (Bug 1, Part A), the REAL Axis-2 robust guard
+            // (Bug 2/3, Part B), the end-to-end multi-rung climb (Bug 3, Part C —
+            // the assertion the C1/C2/C3 singles lacked), and the connect-path
+            // CMD/RSP batch symmetry (the 4th wire failure, Part D — the
+            // negotiated_configuration-vs-current_configuration default-init).
+            // See fact-documents/gearshift-climb-engine.md §7 +
+            // data-flow-batch-size.md §6.
+            printf("[FLAG] --test-climb-engine: invoking integrated climb "
+                   "regression (Parts A-D)\n");
+            fflush(stdout);
+            int rc = ARQ.test_climb_engine();
+            printf("[FLAG] Climb-engine test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_break_weld_cli) {
+            printf("[FLAG] --test-break-weld: invoking BREAK recovery pin regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_break_weld();
+            printf("[FLAG] BREAK recovery pin test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_rung_floor_cli) {
+            // Per-rung MEASURED election floor gate + failure memory (one-shot, then exit rc).
+            // Drives the REAL apply_rung_floor_cap / rung_floor_note_* decisions: the wb13
+            // fail-before/pass-after election cap, never-raise, the failure-memory
+            // arm/survive/decay/reset, and the defeat knob. See DATAFLOW_AUDIT_rung_floor.md §7.
+            printf("[FLAG] --test-rung-floor: invoking per-rung election floor gate regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rung_floor_gate();
+            printf("[FLAG] Rung-floor test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_acksuffix_cli) {
+            // ACK-suffix pollution guard regression (one-shot, then exit rc). Drives the production
+            // rsp_note_data_frame_snr + rsp_suffix_snr_value: a payload decode captures the forward-
+            // DATA SNR, a control decode does not overwrite it, and the suffix encodes the honest data
+            // read with the guard on vs the polluted control read with it off.
+            printf("[FLAG] --test-acksuffix: invoking ACK-suffix pollution guard regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_ack_suffix_pollution_guard();
+            printf("[FLAG] ACK-suffix test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_decode_marathon_cli) {
+            // LEVER C (feat/decode-marathon) §3: prove the multi-core big-block
+            // codeword decode is byte-identical to serial (out_infobits + cw_ok),
+            // in-order, with NO cross-frame corruption, and that a shared-workspace
+            // pool DIVERGES (fail-before). One-shot, then exit rc.
+            extern int test_decode_marathon_run();
+            printf("[FLAG] --test-decode-marathon: invoking LEVER C parallel==serial "
+                   "big-block decode integrity gate\n");
+            fflush(stdout);
+            int rc = test_decode_marathon_run();
+            printf("[FLAG] Decode-marathon test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_fir_lever_cli) {
+            // Exact-AVX2 FIR lever law (unset=default-on, `0`=scalar) plus a
+            // byte-exactness re-proof at the production FIR entry points.
+            // One-shot, then exit rc.
+            extern int test_fir_lever_run();
+            printf("[FLAG] --test-fir-lever: invoking exact-FIR lever law + "
+                   "exactness gate\n");
+            fflush(stdout);
+            int rc = test_fir_lever_run();
+            printf("[FLAG] FIR-lever test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_robust0_compress_deadlock_cli) {
+            // ROBUST_0 + streaming-compression deadlock regression (one-shot,
+            // then exit rc). Drives the REAL process_buffer_data_commander()
+            // data-fill at ROBUST_0 frame dimensions with streaming compression
+            // enabled + a real compressible payload; asserts the staged batch
+            // carries >0 application bytes. See
+            // fact-documents/data-flow-compress-frame-fill.md §5.
+            printf("[FLAG] --test-robust0-compress-deadlock: invoking ROBUST_0 "
+                   "compression-deadlock regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_robust0_compress_deadlock();
+            printf("[FLAG] Robust0-compress-deadlock test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_streaming_compress_overshoot_cli) {
+            printf("[FLAG] --test-streaming-compress-overshoot: invoking stale-EMA "
+                   "streaming compression retry regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_streaming_compress_overshoot();
+            printf("[FLAG] Streaming-compress-overshoot test complete (rc=%d) -- exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_mixbatch_fill_overpop_cli) {
+            printf("[FLAG] --test-mixbatch-fill-overpop: invoking mixbatch fill\n"
+                   "       over-pop reorder regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_mixbatch_fill_overpop();
+            printf("[FLAG] Mixbatch-fill-overpop test complete (rc=%d) -- exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_mixbatch_fill_overpop_compressed_cli) {
+            printf("[FLAG] --test-mixbatch-fill-overpop-compressed: invoking\n"
+                   "       compression-leg over-pop + force-FREE data-loss regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_mixbatch_fill_overpop_compressed();
+            printf("[FLAG] Mixbatch-fill-overpop-compressed test complete (rc=%d) -- exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_idle_switch_role_race_cli) {
+            // Idle SWITCH_ROLE race regression (one-shot, then exit rc). Drives
+            // the REAL process_buffer_data_commander() idle branch with a
+            // freshly-CONNECTED empty-tx Commander; asserts SWITCH_ROLE is queued
+            // before any data write — the connected-but-0-deliver root cause.
+            printf("[FLAG] --test-idle-switch-role-race: invoking idle SWITCH_ROLE "
+                   "race regression (FAILS-BEFORE evidence)\n");
+            fflush(stdout);
+            int rc = ARQ.test_idle_switch_role_race();
+            printf("[FLAG] Idle-switch-role-race test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_break_noprogress_cli) {
+            // BREAK no-progress teardown regression (one-shot, then exit rc).
+            // Replays the shared break_noprogress_step kernel that the EXHAUSTED
+            // re-arm site uses; asserts teardown at exactly K dead cycles and the
+            // negative control (progress resets the streak). Part C of the
+            // connected-but-0-deliver fix. See fact-documents/idle-switchrole-race.md.
+            printf("[FLAG] --test-break-noprogress-teardown: invoking BREAK no-progress "
+                   "teardown regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_break_noprogress_teardown();
+            printf("[FLAG] Break-noprogress-teardown test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_rx_ctrl_drop_cli) {
+            // RX-CTRL-DROP regression (one-shot, then exit rc). Drives the shared
+            // RECEIVED-state watchdog predicate + produce-gate replication: a
+            // stranded RECEIVED control slot is freed and a later control frame
+            // lands. FAILS-BEFORE with -DRX_CTRL_DROP_FAILBEFORE (watchdog never
+            // fires -> slot stays stuck -> later frame dropped). See
+            // fact-documents/data-flow-control-slot-lifecycle.md.
+            printf("[FLAG] --test-rx-ctrl-drop: invoking RECEIVED control-slot "
+                   "watchdog regression\n");
+            fflush(stdout);
+            int rc = ARQ.test_rx_ctrl_drop();
+            printf("[FLAG] Rx-ctrl-drop test complete (rc=%d) — exiting.\n", rc);
+            fflush(stdout);
+            exit(rc);
+        }
+        if (test_opts.test_policy_break_supremacy_cli != 0) {
+            // SACK Design A Step 12 — synthetic BREAK supremacy fire (one-shot, then exit).
+            printf("[FLAG] --test-policy-break-supremacy=1: invoking synthetic "
+                   "BREAK supremacy demo (§4.3.4 invariant #6 — BREAK integration)\n");
+            fflush(stdout);
+            ARQ.test_fire_policy_break_supremacy();
+            printf("[FLAG] BREAK supremacy fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis1_then_axis2_cli != 0) {
+            // SACK Design A Step 10 — Axis-1-then-Axis-2 supremacy demo
+            // (one-shot, then exit). Demonstrates §4.3.4 invariant #6 + §4.3.3.
+            //
+            // We CANNOT call add_message_control() in this synthetic test
+            // (messages_control.data is null in pre-init mode) — so we avoid
+            // the test_fire_policy_axis1 path (which calls cleanup() +
+            // add_message_control on a real move). Instead we directly call
+            // policy_axis1_supremacy_on_move() to engage the cooldown, then
+            // attempt Axis-2 fires which DO route to add_message_control
+            // (SET_LINK_PARAMS) if the cooldown is drained — but only the
+            // suppression-path eval calls run here, so messages_control is
+            // never touched.
+            const char* dir_str = (test_opts.test_policy_axis1_then_axis2_cli == 1 ? "up" : "down");
+            int dir = test_opts.test_policy_axis1_then_axis2_cli;
+            printf("[FLAG] --test-policy-axis1-then-axis2=%s: invoking composite "
+                   "Axis-1-then-Axis-2 supremacy demo\n", dir_str);
+            fflush(stdout);
+
+            // Mark v2 enabled (gate for all Axis-2 paths).
+            ARQ.sack_v2_enabled = true;
+
+            // Step A: directly engage the supremacy hook (sets cooldown=3 + resets ring/counters).
+            printf("[DEMO-STEP-A] firing supremacy hook directly to engage Axis-2 "
+                   "cooldown (skipping full Axis-1 fire to avoid messages_control "
+                   "init dependency)...\n");
+            fflush(stdout);
+            ARQ.policy_axis1_supremacy_on_move(4, dir == 1 ? 5 : 3,
+                                               dir == 1 ? "ladder_up_synthetic"
+                                                        : "ladder_down_synthetic");
+
+            // Set a starting batch (bypass clamp since max_*_length=0).
+            int batch_for_demo = 25;
+            if (batch_for_demo < ARQ.AXIS2_BATCH_FLOOR) batch_for_demo = ARQ.AXIS2_BATCH_FLOOR;
+            if (batch_for_demo > ARQ.AXIS2_BATCH_CEIL)  batch_for_demo = ARQ.AXIS2_BATCH_CEIL;
+            ARQ.data_batch_size = batch_for_demo;
+
+            int synth_rx;
+            if (dir == 1) {
+                // UP attempt: would normally fire if not for cooldown.
+                ARQ.axis2_consecutive_good_batches = ARQ.AXIS2_UP_GOOD_RUN - 1;
+                for (int i = 0; i < ARQ.AXIS2_RING_DEPTH; i++)
+                    ARQ.axis2_partial_rate_ring[i] = 0.0f;
+                ARQ.axis2_partial_rate_count = ARQ.AXIS2_RING_DEPTH;
+                synth_rx = batch_for_demo;  // partial_rate = 0
+            } else {
+                ARQ.axis2_consecutive_bad_batches = ARQ.AXIS2_DOWN_BAD_RUN - 1;
+                for (int i = 0; i < ARQ.AXIS2_RING_DEPTH; i++)
+                    ARQ.axis2_partial_rate_ring[i] = 0.4f;
+                ARQ.axis2_partial_rate_count = ARQ.AXIS2_RING_DEPTH;
+                synth_rx = (int)(batch_for_demo * 0.6f);  // partial_rate = 0.4
+            }
+
+            // Step B: 3 attempted fires while cooldown active (MUST be suppressed).
+            // The controller's cooldown-gate path emits [POLICY-AXIS2] eval ...
+            // COOLDOWN_REMAINING=N — never [POLICY-MOVE] axis=2. We do NOT
+            // expect any add_message_control(SET_LINK_PARAMS) call in this branch.
+            for (int b = 1; b <= 3; b++) {
+                printf("[DEMO-STEP-B%d] attempt Axis-2 fire while cooldown active "
+                       "(expect SUPPRESSED, cooldown_remaining=%d after)...\n",
+                       b, 3 - b);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis2(synth_rx, batch_for_demo);
+            }
+
+            // The cooldown is now 0. To demonstrate that a 4th eval WOULD now
+            // fire, we'd call policy_evaluate_axis2 once more — but that path
+            // calls add_message_control(SET_LINK_PARAMS) which crashes on
+            // uninitialized messages_control.data. Instead we just print the
+            // post-state for visibility — the [POLICY-AXIS2] log line on the
+            // 3rd suppressed call already showed COOLDOWN_REMAINING=0 → next
+            // eval will fire.
+            printf("[DEMO-STEP-C] cooldown drained. The 4th evaluation WOULD fire "
+                   "[POLICY-MOVE] axis=2 direction=%s (skipped here to avoid the "
+                   "messages_control.data == NULL crash in pre-init synthetic "
+                   "mode; the suppression behavior is the load-bearing demo and "
+                   "is fully demonstrated by Steps B1..B3 above).\n", dir_str);
+            fflush(stdout);
+
+            printf("[FLAG] Composite fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis3_fire_cli != 0) {
+            // SACK Design A Step 11 — synthetic Axis-3 fire (one-shot, then exit).
+            const char* kind_str =
+                (test_opts.test_policy_axis3_fire_cli == 1) ? "ok"
+              : (test_opts.test_policy_axis3_fire_cli == 2) ? "miss"
+              : (test_opts.test_policy_axis3_fire_cli == 3) ? "walk" : "?";
+            printf("[FLAG] --test-policy-axis3-fire=%s: invoking synthetic Axis-3 fire\n",
+                   kind_str);
+            fflush(stdout);
+            ARQ.test_fire_policy_axis3(test_opts.test_policy_axis3_fire_cli);
+            printf("[FLAG] Synthetic fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis1_then_axis3_cli != 0) {
+            // SACK Design A Step 11 — Axis-1-then-Axis-3 supremacy demo (one-shot, exit).
+            // Fires Axis-1 supremacy hook directly (engages axis3_cooldown_batches=3)
+            // then attempts 3 Axis-3 fires that MUST be suppressed (cooldown 3→2→1→0).
+            printf("[FLAG] --test-policy-axis1-then-axis3=miss: invoking composite "
+                   "Axis-1-then-Axis-3 supremacy demo\n");
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            // Start in ON to make the supremacy hook transition observable.
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            printf("[DEMO-AXIS3-STEP-A] firing supremacy hook directly to engage "
+                   "Axis-3 cooldown ...\n");
+            fflush(stdout);
+            ARQ.policy_axis1_supremacy_on_move(4, 3, "ladder_down_synthetic");
+            // Three attempted Axis-3 misses while cooldown active.
+            for (int b = 1; b <= 3; b++) {
+                printf("[DEMO-AXIS3-STEP-B%d] attempt Axis-3 miss while cooldown "
+                       "active (expect SUPPRESSED, cooldown drains by 1 in "
+                       "batch_tick afterwards)...\n", b);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+                // The Axis-3 cooldown is decremented by axis3_batch_tick()
+                // (not by policy_evaluate_axis3 itself), so we tick once per
+                // attempt to mirror the per-batch drain pattern used in
+                // production.
+                ARQ.axis3_batch_tick();
+            }
+            printf("[DEMO-AXIS3-STEP-C] cooldown drained. Subsequent Axis-3 "
+                   "evaluations are free to move (skipped here to avoid the "
+                   "messages_control.data == NULL crash in pre-init synthetic "
+                   "mode; the suppression behavior is the load-bearing demo).\n");
+            fflush(stdout);
+            printf("[FLAG] Composite fire complete — exiting.\n");
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis3_miss_burst_cli > 0) {
+            // SACK Design A Step 11 — drive N consecutive synthetic miss events
+            // into policy_evaluate_axis3() to demonstrate Gate 3 ON→PROBE→OFF.
+            printf("[FLAG] --test-policy-axis3-miss-burst=%d: driving %d consecutive miss events into Axis-3 controller\n",
+                   test_opts.test_policy_axis3_miss_burst_cli, test_opts.test_policy_axis3_miss_burst_cli);
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            for (int i = 1; i <= test_opts.test_policy_axis3_miss_burst_cli; i++) {
+                printf("[TEST-AXIS3-BURST] miss #%d/%d (mode before=%s consec=%d)\n",
+                       i, test_opts.test_policy_axis3_miss_burst_cli,
+                       (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                       : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                       ARQ.axis3_consecutive_sack_misses);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+            }
+            printf("[FLAG] miss-burst complete. final mode=%s consec=%d "
+                   "on_to_probe=%lld probe_to_off=%lld\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_consecutive_sack_misses,
+                   ARQ.axis3_move_on_to_probe_count,
+                   ARQ.axis3_move_probe_to_off_count);
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis3_recover_cli > 0) {
+            // SACK Design A Step 11 — Gate 5: N misses then a single ok → PROBE→ON.
+            int n = test_opts.test_policy_axis3_recover_cli;
+            printf("[FLAG] --test-policy-axis3-recover=%d: driving %d miss events then a single ok event (expect PROBE→ON on the ok)\n", n, n);
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            for (int i = 1; i <= n; i++) {
+                printf("[TEST-AXIS3-RECOVER] miss #%d/%d (mode before=%s consec=%d)\n",
+                       i, n,
+                       (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                       : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                       ARQ.axis3_consecutive_sack_misses);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+            }
+            printf("[TEST-AXIS3-RECOVER] feeding single ok event (mode before=%s consec=%d) — expect PROBE→ON if currently PROBE\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_consecutive_sack_misses);
+            fflush(stdout);
+            ARQ.policy_evaluate_axis3(true);
+            printf("[FLAG] recover demo complete. final mode=%s probe_to_on=%lld\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_move_probe_to_on_count);
+            fflush(stdout);
+            exit(0);
+        }
+        if (test_opts.test_policy_axis3_offperiodic_cli > 0) {
+            // SACK Design A Step 11 — Gate 6: drive to OFF then tick N batches
+            // (expect OFF→PROBE on the 20th tick).
+            int n = test_opts.test_policy_axis3_offperiodic_cli;
+            printf("[FLAG] --test-policy-axis3-offperiodic=%d: driving 5 misses (to OFF) then ticking %d batches "
+                   "(OFF→PROBE expected on the 20th)\n", n, n);
+            fflush(stdout);
+            ARQ.sack_v2_enabled = true;
+            ARQ.axis3_sack_mode = ARQ.SACK_MODE_ON;
+            for (int i = 1; i <= 5; i++) {
+                printf("[TEST-AXIS3-OFFP] miss #%d/5\n", i);
+                fflush(stdout);
+                ARQ.policy_evaluate_axis3(false);
+            }
+            printf("[TEST-AXIS3-OFFP] now in mode=%s; ticking %d batches\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   n);
+            fflush(stdout);
+            for (int b = 1; b <= n; b++) {
+                printf("[TEST-AXIS3-OFFP] tick %d/%d (mode=%s batches_since_off=%d)\n",
+                       b, n,
+                       (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                       : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                       ARQ.axis3_batches_since_off);
+                fflush(stdout);
+                ARQ.axis3_batch_tick();
+            }
+            printf("[FLAG] offperiodic demo complete. final mode=%s off_to_probe=%lld\n",
+                   (ARQ.axis3_sack_mode == ARQ.SACK_MODE_OFF) ? "OFF"
+                   : (ARQ.axis3_sack_mode == ARQ.SACK_MODE_PROBE) ? "PROBE" : "ON",
+                   ARQ.axis3_move_off_to_probe_count);
+            fflush(stdout);
+            exit(0);
+        }
+}
