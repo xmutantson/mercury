@@ -534,10 +534,12 @@ source/datalink_layer/rate_optimizer.cc
 source/datalink_layer/tcp_socket.cc
 source/datalink_layer/timer.cc
 source/physical_layer/awgn.cc
+source/physical_layer/test_awgn.cc
 source/physical_layer/crc16_modbus_rtu.cc
 source/physical_layer/data_container.cc
 source/physical_layer/test_dist_matcher.cc
 source/physical_layer/error_rate.cc
+source/physical_layer/test_error_rate.cc
 source/physical_layer/fir_filter.cc
 source/physical_layer/interleaver.cc
 source/physical_layer/interpolator.cc

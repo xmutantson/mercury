@@ -37,45 +37,6 @@ void cl_awgn::set_seed(long seed)
 		srand(seed);
 	}
 }
-
-void cl_awgn::apply(std::complex <double> *in,std::complex <double> *out,float ampl,int nItems)
-{
-
-	float ampl_val=(ampl/sqrtf(2.0f));
-	for(int i=0;i<nItems;i++)
-	{
-		out[i]=in[i]+ std::complex <double> ( ampl_val * awgn_value_generator(), ampl_val * awgn_value_generator());
-	}
-}
-
-void cl_awgn::apply_with_delay(std::complex <double> *in,std::complex <double> *out,float ampl,int nItems, int delay)
-{
-
-	float ampl_val=(ampl/sqrtf(2.0f));
-	for(int i=0;i<delay;i++)
-	{
-		out[i]=in[rand()%nItems]+ std::complex <double> ( ampl_val * awgn_value_generator(), ampl_val * awgn_value_generator());
-	}
-	for(int i=0;i<nItems;i++)
-	{
-		out[i+delay]=in[i]+ std::complex <double> ( ampl_val * awgn_value_generator(), ampl_val * awgn_value_generator());
-	}
-}
-
-void cl_awgn::apply_with_delay(double *in,double *out,float ampl,int nItems, int delay)
-{
-
-	float ampl_val=(ampl/sqrtf(2.0f));
-	for(int i=0;i<delay;i++)
-	{
-		out[i]=in[rand()%nItems]+ (double)(ampl_val * awgn_value_generator());
-	}
-	for(int i=0;i<nItems;i++)
-	{
-		out[i+delay]=in[i]+ (double)(ampl_val * awgn_value_generator());
-	}
-}
-
 double  cl_awgn::awgn_value_generator()
 {
 	double x1;

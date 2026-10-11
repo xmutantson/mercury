@@ -36,36 +36,3 @@ cl_error_rate::cl_error_rate()
 cl_error_rate::~cl_error_rate()
 {
 }
-
-void cl_error_rate::reset()
-{
-	BER=0;
-	FER=0;
-	Bits_total=0;
-	Error_bits_total=0;
-	Frames_total=0;
-	Error_frames_total=0;
-}
-
-void cl_error_rate::check(const int *in1,const int *in2,int nItems)
-{
-	int frame_error=0;
-	for(int i=0;i<nItems;i++)
-	{
-		if(*(in1+i)!=*(in2+i))
-		{
-			Error_bits_total++;
-			frame_error=1;
-		}
-		Bits_total++;
-	}
-	Frames_total++;
-	if(frame_error==1)
-	{
-		Error_frames_total++;
-	}
-	BER=Error_bits_total/Bits_total;
-	FER=Error_frames_total/Frames_total;
-}
-
-
