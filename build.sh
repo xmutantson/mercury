@@ -531,6 +531,7 @@ source/datalink_layer/test_ctrl_ack_noise_rejection.cc
 source/datalink_layer/test_rsp_timeout_format.cc
 source/datalink_layer/b2f_handler.cc
 source/datalink_layer/channel_state_lookup.cc
+source/datalink_layer/test_channel_state_lookup.cc
 source/datalink_layer/datalink_config.cc
 source/datalink_layer/fifo_buffer.cc
 source/datalink_layer/rate_optimizer.cc
