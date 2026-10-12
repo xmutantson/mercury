@@ -690,7 +690,7 @@
    "policy": "reject-unless-negative-control",
    "effect": "restores the former narrowband_enabled-keyed control-frame TX gain selector (telecom_system.cc get_ack_geometry_tx_gain) on candidate f42c9d1a",
    "restoration": "test_control_frame_gain_and_undefined_state saves the variable, sets/unsets it, and restores it (arq_common.cc:19242-19244 save, 19317-19318 restore on f42c9d1a); setenv/unsetenv Windows shim os_interop.h:26-35",
-   "requested_by": "own_telecom_system (ticket #70, 2026-09-23T22:18 comment): add to the preflight denylist",
+   "requested_by": "telecom-system maintainer (2026-09-23 review): add to the preflight denylist",
    "caveat": "an externally set value survives the test: the test restores it after its own arms, so the remaining --test cases and a live run execute with the former selector"
   },
   {
@@ -1736,7 +1736,7 @@
    "name": "MERCURY_RX_STORE_FAIL_CLOSED",
    "kind": "default-on-lever",
    "reads": [
-    "source/datalink_layer/arq_responder.cc:1910 (candidate own_arq_responder/stack1 89de4bdde0, ticket #35)"
+    "source/datalink_layer/arq_responder.cc:1910 (responder candidate 89de4bdde0)"
    ],
    "mentions": 1,
    "status": "[?]",
@@ -2233,8 +2233,8 @@
   },
   {
    "utc": "2026-09-25",
-   "by": "own_arq_responder",
-   "change": "added MERCURY_RX_STORE_FAIL_CLOSED as a default-on lever (=0 restores the legacy fail-open RX store verdict), ticket #35"
+   "by": "responder maintainer",
+   "change": "added MERCURY_RX_STORE_FAIL_CLOSED as a default-on lever (=0 restores the legacy fail-open RX store verdict)"
   }
  ]
 }
