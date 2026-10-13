@@ -3243,6 +3243,11 @@ int run_main_test_dispatch(int argc, char* argv[], int i,
                 failed += dfail;
             }
 
+            // Run-scoped CLI settings survive cached configuration copies.
+            {
+                extern int precook_runscoped_selftest();
+                failed += precook_runscoped_selftest();
+            }
             // PRECOOK M3 copy_from BYTE-IDENTICAL completeness gate (STEP 1 GATE 2,
             // BUNDLE_FIELD_CHECKLIST PART 6). For every config in the full gearshift
             // ladder (ROBUST_0/1/2 + CONFIG_0..16): build a telecom_system via the

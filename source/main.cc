@@ -1960,9 +1960,8 @@ start_modem:
                telecom_system.csi_llr_enabled ? "on" : "off");
     }
     if (ls_nv_debug_cli != -1) {
-        // fix/cfg16-nv-restore: ofdm is a plain member of telecom_system and is
-        // never reconstructed on config switch, so this persists across PHY
-        // reinit. Prints [LS-NV-DBG] residual_nv vs cross-pilot_nv per LS frame.
+        // Run-scoped production setting; configuration copies must preserve it.
+        // Prints [LS-NV-DBG] residual_nv vs cross-pilot_nv per LS frame.
         telecom_system.ofdm.ls_nv_debug_enabled = (ls_nv_debug_cli == 1);
         printf("[FLAG] --ls-nv-debug=%s\n",
                telecom_system.ofdm.ls_nv_debug_enabled ? "on" : "off");
