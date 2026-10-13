@@ -187,3 +187,79 @@ const char* cl_ofdm::precook_deep_equal(const cl_ofdm& o) const
 
 	return NULL;
 }
+
+// Exercise independent run settings with initialized geometry at the copy boundary.
+int precook_runscoped_selftest()
+{
+	const char* tag = "[TEST-PRECOOK-RUNSCOPED]";
+	int failed = 0;
+	cl_ofdm fresh;
+	if(fresh.ls_nv_debug_enabled || fresh.ls_use_crosspilot_nv) failed++;
+	cl_ofdm bundle;
+	// Configure the nested grids before init, as configuration loading does.
+	// Wideband preambles use four symbols; the high-density pilot grid uses Dy=3.
+	bundle.preamble_configurator.Nsymb = 4;
+	bundle.pilot_configurator.Dx = 1;
+	bundle.pilot_configurator.Dy = 3;
+	bundle.init(256, 50, 8, 36.0f / 256.0f);
+	const bool fixture_ok = bundle.preamble_configurator.Nsymb == 4
+		&& bundle.preamble_configurator.nPreamble > 0
+		&& bundle.preamble_configurator.sequence != NULL
+		&& bundle.pilot_configurator.Dx == 1 && bundle.pilot_configurator.Dy == 3
+		&& bundle.pilot_configurator.nPilots > 0 && bundle.pilot_configurator.nData > 0
+		&& bundle.pilot_configurator.sequence != NULL;
+	printf("%s fixture preamble_symbols=%d preamble_bins=%d Dx=%d Dy=%d pilots=%d data=%d %s\n",
+		tag, bundle.preamble_configurator.Nsymb, bundle.preamble_configurator.nPreamble,
+		bundle.pilot_configurator.Dx, bundle.pilot_configurator.Dy,
+		bundle.pilot_configurator.nPilots, bundle.pilot_configurator.nData,
+		fixture_ok ? "PASS" : "INVALID");
+	if(!fixture_ok) return 1;
+	for(int source_flags = 0; source_flags < 4; ++source_flags)
+	{
+		bundle.ls_nv_debug_enabled = (source_flags & 1) != 0;
+		bundle.ls_use_crosspilot_nv = (source_flags & 2) != 0;
+		for(int destination_flags = 0; destination_flags < 4; ++destination_flags)
+		{
+			cl_ofdm live;
+			live.ls_nv_debug_enabled = (destination_flags & 1) != 0;
+			live.ls_use_crosspilot_nv = (destination_flags & 2) != 0;
+			for(int repetition = 0; repetition < 2; ++repetition)
+			{
+				live.copy_from(bundle);
+				const bool flags_ok = live.ls_nv_debug_enabled == ((destination_flags & 1) != 0)
+					&& live.ls_use_crosspilot_nv == ((destination_flags & 2) != 0);
+				const bool source_ok = bundle.ls_nv_debug_enabled == ((source_flags & 1) != 0)
+					&& bundle.ls_use_crosspilot_nv == ((source_flags & 2) != 0);
+				const bool geometry_ok = live.Nfft == bundle.Nfft && live.Nc == bundle.Nc
+					&& live.Nsymb == bundle.Nsymb && live.gi == bundle.gi
+					&& live.precook_deep_equal(bundle) == NULL
+					&& live.preamble_configurator.Nsymb == 4
+					&& live.preamble_configurator.nPreamble == bundle.preamble_configurator.nPreamble
+					&& live.pilot_configurator.Dx == 1 && live.pilot_configurator.Dy == 3
+					&& live.pilot_configurator.nPilots == bundle.pilot_configurator.nPilots
+					&& live.pilot_configurator.nData == bundle.pilot_configurator.nData
+					&& live.ofdm_frame != bundle.ofdm_frame
+					&& live.pilot_configurator.carrier == live.ofdm_frame
+					&& live.preamble_configurator.carrier == live.ofdm_preamble;
+				const bool ok = flags_ok && source_ok && geometry_ok;
+				printf("%s source=%d destination=%d repetition=%d flags=%d source_unchanged=%d geometry=%d %s\n",
+					tag, source_flags, destination_flags, repetition, (int)flags_ok,
+					(int)source_ok, (int)geometry_ok, ok ? "PASS" : "FAIL");
+				if(!ok) failed++;
+			}
+			// Self-copy must leave both the run settings and owned geometry intact.
+			live.ls_nv_debug_enabled = (destination_flags & 1) != 0;
+			live.ls_use_crosspilot_nv = (destination_flags & 2) != 0;
+			const st_carrier* frame = live.ofdm_frame;
+			live.copy_from(live);
+			const bool self_ok = live.ofdm_frame == frame
+				&& live.ls_nv_debug_enabled == ((destination_flags & 1) != 0)
+				&& live.ls_use_crosspilot_nv == ((destination_flags & 2) != 0);
+			if(!self_ok) failed++;
+		}
+	}
+	printf("%s %s (failed=%d)\n", tag, failed == 0 ? "ALL PASS" : "FAILURES", failed);
+	fflush(stdout);
+	return failed;
+}
+
