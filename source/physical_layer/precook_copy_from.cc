@@ -304,8 +304,7 @@ void cl_ofdm::copy_from(const cl_ofdm& s)
 	tinterp_smooth_halfwin = s.tinterp_smooth_halfwin;
 	dd_data_conf_thresh    = s.dd_data_conf_thresh;
 	dd_seed_floor          = s.dd_seed_floor;
-	ls_nv_debug_enabled    = s.ls_nv_debug_enabled;
-	ls_use_crosspilot_nv   = s.ls_use_crosspilot_nv;
+	// LS switches are run-scoped CLI settings; preserve the destination values.
 	fft_twiddle_size       = s.fft_twiddle_size;   // private
 
 	// MFSK mirror scalars + fixed arrays.
