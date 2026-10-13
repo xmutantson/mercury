@@ -262,4 +262,3 @@ int precook_runscoped_selftest()
 	fflush(stdout);
 	return failed;
 }
-
