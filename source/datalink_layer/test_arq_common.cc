@@ -3240,7 +3240,7 @@ int cl_arq_controller::test_rxfifo_backpressure_hold()
 // The optional observer is supplied by a link-wrapped detector in the directed
 // fixture. It probes the real publication mutex at every detector entry; normal
 // builds need no wrapper and still exercise the waveform and pacing controls.
-int cl_arq_controller::test_ack_capture_snapshot(int (*locked_detector_calls)())
+int cl_arq_controller::test_ack_capture_snapshot(int (*locked_detector_calls)(), bool narrow)
 {
  int fails = 0;
  auto check = [&](bool ok, const char* name) {
@@ -3248,8 +3248,8 @@ int cl_arq_controller::test_ack_capture_snapshot(int (*locked_detector_calls)())
   if(!ok) ++fails;
  };
  if(!telecom_system) return 1;
- telecom_system->narrowband_enabled = NO;
- narrowband_enabled = NO;
+ telecom_system->narrowband_enabled = narrow ? YES : NO;
+ narrowband_enabled = narrow ? YES : NO;
  telecom_system->load_configuration(CONFIG_0);
  telecom_system->set_recovery_ack_reps(1);
  turbo_snr_ack_enabled = false;
@@ -3261,6 +3261,9 @@ int cl_arq_controller::test_ack_capture_snapshot(int (*locked_detector_calls)())
  const int off = sp - tail;
  const int stride = pattern * sym;
  const int burst_n = telecom_system->ack_pattern_passband_samples;
+ const int oldest_phase = std::min(24, off / stride);
+ printf("[SNAPSHOT-GEOMETRY] narrow=%d sym=%d period=%d tail=%d oldest_phase=%d burst=%d\n",
+        narrow?1:0, sym, sp, tail, oldest_phase, burst_n);
  if(sym <= 0 || burst_n <= 0 || burst_n > tail || off < 3 * stride) return 1;
  std::vector<double> burst((size_t)burst_n);
  check(telecom_system->generate_ack_pattern_passband(burst.data()) == burst_n,
@@ -3272,7 +3275,7 @@ int cl_arq_controller::test_ack_capture_snapshot(int (*locked_detector_calls)())
    dc.passband_delayed_data[i] = dc.passband_delayed_data[i+sp] = v;
   }
   if(phase >= 0) {
-   const int start = off - phase * stride + tail - burst_n;
+   const int start = off - phase * stride + (phase == 0 ? tail - burst_n : 0);
    for(int i=0; i<burst_n; ++i) {
     const int ring = (cursor + start + i) % sp;
     dc.passband_delayed_data[ring] = dc.passband_delayed_data[ring+sp] = burst[i];
@@ -3289,17 +3292,17 @@ int cl_arq_controller::test_ack_capture_snapshot(int (*locked_detector_calls)())
  stage(0, 0, false);
  check(receive_ack_pattern(false, false) && dc.frames_to_read == 4,
        "newest ACK accepted with ordinary audio advance");
- stage(3, sp-7, false);
+ stage(oldest_phase, sp-7, false);
  check(receive_ack_pattern(true, true) && dc.frames_to_read == 0,
        "older ACK across mirrored wrap accepted with deferred advance");
  stage(-1, sp-7, true);
  check(!receive_ack_pattern(false, true) && dc.frames_to_read == 2,
        "energetic non-ACK scans phases without false acceptance");
- stage(3, 0, false);
+ stage(oldest_phase, 0, false);
  check(!receive_ack_pattern(false, true, burst_n),
        "causal mask excludes retained pre-epoch ACK");
- stage(3, sp-7, false);
- check(receive_ack_pattern(false, true, tail + 3 * stride),
+ stage(oldest_phase, sp-7, false);
+ check(receive_ack_pattern(false, true, tail + oldest_phase * stride),
        "eligible older ACK survives causal masking");
  stage(0, 0, false);
  dc.frames_to_read = 1;

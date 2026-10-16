@@ -997,7 +997,8 @@ public:
   // byte-identical.
   // ARQ-thread-owned search copy; capture publication never writes this storage.
   std::vector<double> ack_pattern_capture_snapshot;
-  int test_ack_capture_snapshot(int (*locked_detector_calls)() = nullptr);
+  int test_ack_capture_snapshot(int (*locked_detector_calls)() = nullptr,
+                                bool narrow = false);
   bool receive_ack_pattern(bool defer_audio_advance = false,
                            bool multiwindow_scan = false,
                            int causal_ring_samples = -1,
