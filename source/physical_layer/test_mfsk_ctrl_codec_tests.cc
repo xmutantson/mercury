@@ -70,6 +70,13 @@
 #include <random>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#else
+#include <unistd.h>
+#endif
 
 // §22 OFDM fine-timing test injects a residual TX carrier offset via the
 // production test hook (global, defined in main.cc, consumed in
@@ -9392,33 +9399,116 @@ R"QJSON({
 )QJSON";
 static const int k_qtable_n_cells = 66;  // populated (incl dead)
 
-// Portable writable temp-file path for the loader unit check (removed after use).
-static std::string qtable_test_temp_path() {
-	const char* envs[3] = {"TMPDIR", "TMP", "TEMP"};
-	for (int i = 0; i < 3; i++) {
-		const char* d = std::getenv(envs[i]);
-		if (d != NULL && d[0] != '\0')
-			return std::string(d) + "/_channel_state_lookup_canon_test.json";
-	}
+// Each loader invocation owns an exclusively created file until scope exit.
+// A shared pathname lets another invocation truncate or remove our input.
+struct qtable_test_temp_file {
+	std::string path;
+	FILE* fp;
+	qtable_test_temp_file() : fp(NULL) {
+		std::string dir;
+		const char* envs[3] = {"TMPDIR", "TMP", "TEMP"};
+		for (int i = 0; i < 3; i++) {
+			const char* d = std::getenv(envs[i]);
+			if (d != NULL && d[0] != '\0') { dir = d; break; }
+		}
 #if defined(_WIN32)
-	return std::string(".\\_channel_state_lookup_canon_test.json");
+		if (dir.empty()) dir = ".";
 #else
-	return std::string("/tmp/_channel_state_lookup_canon_test.json");
+		if (dir.empty()) dir = "/tmp";
 #endif
+		std::string pattern = dir + "/_channel_state_lookup_canon_test_XXXXXX";
+		std::vector<char> buf(pattern.begin(), pattern.end());
+		buf.push_back('\0');
+#if defined(_WIN32)
+		if (_mktemp_s(buf.data(), buf.size()) != 0) return;
+		int fd = _open(buf.data(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
+			_S_IREAD | _S_IWRITE);
+#else
+		int fd = mkstemp(buf.data());
+#endif
+		if (fd < 0) return;
+		path = buf.data();
+#if defined(_WIN32)
+		fp = _fdopen(fd, "wb");
+		if (fp == NULL) _close(fd);
+#else
+		fp = fdopen(fd, "wb");
+		if (fp == NULL) close(fd);
+#endif
+	}
+	bool write_and_close(const char* text) {
+		if (fp == NULL) return false;
+		bool ok = std::fputs(text, fp) >= 0;
+		ok = std::fclose(fp) == 0 && ok;
+		fp = NULL;
+		return ok;
+	}
+	~qtable_test_temp_file() {
+		if (fp != NULL) std::fclose(fp);
+		if (!path.empty()) std::remove(path.c_str());
+	}
+	qtable_test_temp_file(const qtable_test_temp_file&) = delete;
+	qtable_test_temp_file& operator=(const qtable_test_temp_file&) = delete;
+};
+
+// Deliberately return with an open stream: cleanup must cover this path too.
+static bool qtable_test_early_return(std::string& path) {
+	qtable_test_temp_file file;
+	path = file.path;
+	return file.fp != NULL;
+}
+
+static void test_channel_state_lookup_temp_files() {
+	const char* name = "channel_state_lookup_temp_files";
+	std::string survivor_path, early_path;
+	{
+		qtable_test_temp_file survivor;
+		survivor_path = survivor.path;
+		if (!survivor.write_and_close(k_qtable_json)) {
+			test_fail(name, "cannot write survivor"); return;
+		}
+		{
+			qtable_test_temp_file other;
+			if (!other.write_and_close(k_qtable_json) || other.path == survivor.path) {
+				test_fail(name, "simultaneous files alias or cannot be written"); return;
+			}
+		}
+		FILE* fp = std::fopen(survivor.path.c_str(), "rb");
+		if (fp == NULL) { test_fail(name, "peer cleanup removed survivor"); return; }
+		std::vector<char> bytes(sizeof(k_qtable_json));
+		size_t count = std::fread(bytes.data(), 1, bytes.size(), fp);
+		bool exact = count == sizeof(k_qtable_json) - 1 &&
+			std::memcmp(bytes.data(), k_qtable_json, count) == 0 && !std::ferror(fp);
+		std::fclose(fp);
+		cl_channel_state_lookup tbl;
+		if (!exact || !tbl.init_from_json(survivor.path.c_str()) ||
+			tbl.n_cells() != k_qtable_n_cells || tbl.lookup(30.0, 0.0) != 16 ||
+			tbl.lookup(12.0, 0.0) != 10 || tbl.lookup(0.0, 0.0) != 100) {
+			test_fail(name, "survivor bytes or lookups changed"); return;
+		}
+		if (!qtable_test_early_return(early_path)) {
+			test_fail(name, "cannot create early-return file"); return;
+		}
+	}
+	const std::string removed[] = {survivor_path, early_path};
+	for (int i = 0; i < 2; i++) {
+		FILE* fp = std::fopen(removed[i].c_str(), "rb");
+		if (fp != NULL) {
+			std::fclose(fp);
+			test_fail(name, "scope exit left a temporary file"); return;
+		}
+	}
+	test_pass(name);
 }
 
 static void test_channel_state_lookup_canonical_table() {
 	const char* name = "channel_state_lookup_canonical_table";
-	std::string path = qtable_test_temp_path();
-	{
-		FILE* fp = std::fopen(path.c_str(), "w");
-		if (fp == NULL) { test_fail(name, "cannot open temp file"); return; }
-		std::fputs(k_qtable_json, fp);
-		std::fclose(fp);
+	qtable_test_temp_file file;
+	if (!file.write_and_close(k_qtable_json)) {
+		test_fail(name, "cannot create/write temp file"); return;
 	}
 	cl_channel_state_lookup tbl;
-	bool ok = tbl.init_from_json(path.c_str());
-	std::remove(path.c_str());
+	bool ok = tbl.init_from_json(file.path.c_str());
 	if (!ok || !tbl.is_loaded()) {
 		char buf[220];
 		snprintf(buf, sizeof(buf), "init_from_json/is_loaded failed: %s", tbl.last_error());
@@ -9961,6 +10051,7 @@ int run_mfsk_ctrl_codec_tests() {
 	test_ack_sack_bitmap_30bit_cap();
 
 	// Turnaround control additions (outside the frozen ARQ region):
+	test_channel_state_lookup_temp_files();       // overlapping lifetimes and cleanup
 	test_channel_state_lookup_canonical_table();   // Q-table loader canonical-table check
 	test_scream_base_patterns_detect_clean();       // WB scream family clean-channel detect sanity
 	test_scream_production_roundtrip_clean();        // actual emitter -> joint detector, all rungs
