@@ -630,6 +630,32 @@ public:
 	// symbols, with the sequence restored before downstream processing.
 	int selectivity_test_valid_pilots = -1;
 
+	// Fixed, call-scoped receive-entry observations. No environment activation;
+	// ordinary calls keep the pointer null and never scan or alter stage data.
+	struct agc_receive_observation {
+		bool inject_zero = false;
+		unsigned calls = 0, agc = 0, zf = 0, equalizer = 0;
+		unsigned subpeak_reject = 0, skip_h_reject = 0;
+		unsigned output_writes = 0, accepted = 0;
+		uint64_t cells[3] = {}, nonfinite[3] = {}, nonzero[3] = {};
+		int nsymb = 0, nc = 0, modulation = -1, estimator = -1;
+	};
+	class agc_receive_scope {
+		cl_telecom_system& owner;
+		agc_receive_observation* previous;
+	public:
+		agc_receive_scope(cl_telecom_system& ts, agc_receive_observation& row)
+			: owner(ts), previous(ts.agc_receive_test_) { ts.agc_receive_test_ = &row; }
+		~agc_receive_scope() { owner.agc_receive_test_ = previous; }
+		agc_receive_scope(const agc_receive_scope&) = delete;
+		agc_receive_scope& operator=(const agc_receive_scope&) = delete;
+	};
+private:
+	agc_receive_observation* agc_receive_test_ = nullptr;
+	void observe_agc_receive_stage(int stage);
+public:
+	int test_agc_receive_entry();
+
 	double output_power_Watt;
 
 	void transmit_bit(int *data, double *out, int message_location);

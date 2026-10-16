@@ -1530,8 +1530,25 @@ void cl_telecom_system::acq_band_excl_begin_epoch()
 	acq_excl_head = 0;
 }
 
+void cl_telecom_system::observe_agc_receive_stage(int stage)
+{
+	if(!agc_receive_test_) return;
+	auto& row = *agc_receive_test_;
+	row.nsymb = ofdm.Nsymb; row.nc = ofdm.Nc;
+	row.modulation = M; row.estimator = ofdm.channel_estimator;
+	for(int i = 0; i < ofdm.Nsymb * ofdm.Nc; ++i) {
+		const std::complex<double> value = stage == 1 ? ofdm.estimated_channel[i].value
+			: (stage == 2 ? data_container.equalized_data[i]
+			: data_container.ofdm_symbol_demodulated_data[i]);
+		++row.cells[stage];
+		if(!std::isfinite(value.real()) || !std::isfinite(value.imag())) ++row.nonfinite[stage];
+		if(value != std::complex<double>(0.0, 0.0)) ++row.nonzero[stage];
+	}
+}
+
 st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 {
+	if(agc_receive_test_) ++agc_receive_test_->calls;
 	// An inactive OFDM grid starts a fresh capture/batch acquisition epoch.
 	// Rejected offsets are buffer-relative and must not escape that scope.
 	// Retry trials and calls in an active batch retain the ring and can fire P1.
@@ -3741,7 +3758,11 @@ skip_h_retry_point:
 			else
 			{
 				ofdm.last_pilot_selectivity = -1.0;   // fresh per attempt; both OFDM estimators re-measure it
+				if(agc_receive_test_ && agc_receive_test_->inject_zero)
+					for(int i = 0; i < ofdm.Nsymb * ofdm.Nc; ++i)
+						data_container.ofdm_symbol_demodulated_data[i] = std::complex<double>(0.0, 0.0);
 				ofdm.automatic_gain_control(data_container.ofdm_symbol_demodulated_data);
+				if(agc_receive_test_) { ++agc_receive_test_->agc; observe_agc_receive_stage(0); }
 				// CPE correction: remove residual freq offset before channel estimation.
 				// Previously NB-only, but WB also benefits (reduces pilot residuals).
 				ofdm.CPE_correction(data_container.ofdm_symbol_demodulated_data);
@@ -3762,6 +3783,7 @@ skip_h_retry_point:
 				if(ofdm.channel_estimator==ZERO_FORCE)
 				{
 					ofdm.ZF_channel_estimator(data_container.ofdm_symbol_demodulated_data);
+					if(agc_receive_test_) { ++agc_receive_test_->zf; observe_agc_receive_stage(1); }
 				}
 				else if (ofdm.channel_estimator==LEAST_SQUARE)
 				{
@@ -3886,6 +3908,7 @@ skip_h_retry_point:
 				if(subpeak_gate_has_authority && receive_stats.coarse_metric >= 0.97
 					&& ((!thin_pilot_cfg && mean_H < 0.5) || coh_flags_subpeak))
 				{
+					if(agc_receive_test_) ++agc_receive_test_->subpeak_reject;
 					// F0-RINGDUMP (capture-replay fixture): at the SUBPEAK-REJECT trigger dump the
 					// raw passband ring + wrong-lock metadata for --test-frame0-replay. Faithful by
 					// construction (it IS the field waveform). Gated by MERCURY_F0_RINGDUMP=<dir>;
@@ -4030,6 +4053,7 @@ skip_h_retry_point:
 				double mean_H_threshold = mean_h_gate_threshold;
 					if(mean_H < mean_H_threshold)
 					{
+						if(agc_receive_test_) ++agc_receive_test_->skip_h_reject;
 						skip_h_count++;
 						{
 							printf("[OFDM-SYNC] trial %d SKIP-H: mean_H=%.4f too low (threshold=%.2f), skipping LDPC\n",
@@ -4109,6 +4133,7 @@ skip_h_retry_point:
 				}
 
 				ofdm.channel_equalizer(data_container.ofdm_symbol_demodulated_data,data_container.equalized_data);
+				if(agc_receive_test_) { ++agc_receive_test_->equalizer; observe_agc_receive_stage(2); }
 				double measure_var=ofdm.measure_variance(data_container.equalized_data);
 				// CSI-weighted LLR for ZF equalization.
 				// ZF amplifies noise by 1/|H_k|² per subcarrier. Using a single
@@ -4338,6 +4363,7 @@ skip_h_retry_point:
 			for(int i=0;i<(nReal_data-outer_code_reserved_bits)/8;i++)
 			{
 				*(out+i)=data_container.hd_decoded_data_byte[i];
+				if(agc_receive_test_) ++agc_receive_test_->output_writes;
 			}
 
 			// CRC16 self-check: compute CRC over [data + CRC_LSB + CRC_MSB] = nReal_data/8 bytes.
@@ -4605,6 +4631,7 @@ skip_h_retry_point:
 				// and logs all make decisions from the same control-plane value.
 				receive_stats.SNR = quantize_snr_decision_db(receive_stats.SNR);
 				receive_stats.message_decoded=YES;
+				if(agc_receive_test_) ++agc_receive_test_->accepted;
 				if(tinterp_rescue_in_flight)
 					receive_stats.tinterp_rescue_succeeded = true;
 				// P1 ACQ BAND-EXCLUSION: a successful decode is the re-anchor — the

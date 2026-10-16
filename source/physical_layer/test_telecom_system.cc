@@ -234,6 +234,7 @@ int cl_telecom_system::test_acq_band_excl()
 	// This acquisition entry is already invoked by the aggregate test dispatcher.
 	cl_telecom_system contracts;
 	failed += contracts.test_rx_contracts();
+	failed += contracts.test_agc_receive_entry();
 	return failed == 0 ? 0 : 1;
 }
 
@@ -766,6 +767,105 @@ int cl_telecom_system::test_rx_contracts()
 		}
 	}
 	printf("[TEST-RX-CONTRACTS] %s (%d failures)\n", failed ? "FAILURES" : "ALL PASS", failed);
+	fflush(stdout);
+	return failed ? 1 : 0;
+}
+
+// Ticket 95: real acquisition followed by explicit post-demodulation state injection.
+// Each row owns its counters and payload; no receiver-state reset between calls.
+int cl_telecom_system::test_agc_receive_entry()
+{
+	int failed = 0;
+	auto check = [&](bool ok, const char* name) {
+		printf("[TEST-AGC-ENTRY] %s: %s\n", ok ? "PASS" : "FAIL", name);
+		if(!ok) ++failed;
+	};
+	cl_telecom_system tx, rx;
+	tx.operation_mode = rx.operation_mode = BER_PLOT_passband;
+	tx.narrowband_enabled = rx.narrowband_enabled = YES;
+	const bool initialized = tx.load_configuration(CONFIG_0) == 0
+		&& rx.load_configuration(CONFIG_0) == 0;
+	check(initialized, "fresh NB CONFIG_0 initializes both real instances");
+	if(!initialized) return 1;
+	const int sym = rx.data_container.Nofdm * rx.frequency_interpolation_rate;
+	const int frame_size = (tx.data_container.Nsymb + tx.data_container.preamble_nSymb) * sym;
+	const int window_size = rx.data_container.buffer_Nsymb * sym;
+	const int bytes = (tx.data_container.nBits - tx.ldpc.P - tx.outer_code_reserved_bits) / 8;
+	const int onset = sym;
+	const bool geometry = rx.M != MOD_MFSK && rx.ofdm.channel_estimator == ZERO_FORCE
+		&& rx.ofdm.Nsymb == rx.data_container.Nsymb && rx.ofdm.Nc == rx.data_container.Nc
+		&& rx.ofdm.Nsymb > 0 && rx.ofdm.Nc > 0 && rx.ofdm.pilot_configurator.nPilots > 0
+		&& bytes > 0 && bytes <= N_MAX && frame_size > 0 && onset > 0
+		&& frame_size + onset <= window_size && rx.ofdm_forced_delay < 0 && rx.mfsk_fixed_delay < 0
+		&& !rx.preamble_amortization_enabled && !tx.preamble_amortization_enabled;
+	check(geometry, "initialized OFDM/ZF/pilots/full-anchor geometry and unforced acquisition");
+	if(!geometry) return 1;
+	std::vector<int> payload((size_t)bytes), output((size_t)N_MAX, -777);
+	std::vector<double> frame((size_t)frame_size), window((size_t)window_size);
+	// Ordinary control, observed control, isolated invalid, recovery, repeated
+	// invalids, recovery, ordinary control. Every call uses the same RX instance.
+	for(int row_id = 0; row_id < 8; ++row_id) {
+		const bool invalid = row_id == 2 || row_id == 4 || row_id == 5;
+		const bool observed = row_id != 0 && row_id != 7;
+		for(int i = 0; i < bytes; ++i) payload[(size_t)i] = (11 + row_id * 53 + i * 37) & 255;
+		std::fill(frame.begin(), frame.end(), 0.0);
+		std::fill(window.begin(), window.end(), 0.0);
+		std::fill(output.begin(), output.end(), -777);
+		tx.transmit_byte(payload.data(), bytes, frame.data(), SINGLE_MESSAGE);
+		std::copy(frame.begin(), frame.end(), window.begin() + onset);
+		const std::vector<double> original(window);
+		agc_receive_observation obs;
+		obs.inject_zero = invalid;
+		st_receive_stats result;
+		if(observed) {
+			agc_receive_scope scope(rx, obs);
+			result = rx.receive_byte(window.data(), output.data());
+		} else result = rx.receive_byte(window.data(), output.data());
+		const bool keyed = std::equal(payload.begin(), payload.end(), output.begin());
+		const bool untouched = std::all_of(output.begin(), output.end(), [](int v) { return v == -777; });
+		printf("[AGC-ENTRY-v1] row=%d sequence=%d inject=%d observed=%d calls=%u agc=%u zf=%u equalizer=%u "
+			"nsymb=%d nc=%d modulation=%d estimator=%d cells=%llu,%llu,%llu nonfinite=%llu,%llu,%llu "
+			"nonzero=%llu,%llu,%llu subpeak=%u skip_h=%u writes=%u accepted=%u decoded=%d full=%d "
+			"delay=%d cursor=%d overflow=%d forced=%d,%d bytes=%d keyed=%d untouched=%d expected=",
+			row_id, row_id, invalid, observed, obs.calls, obs.agc, obs.zf, obs.equalizer,
+			obs.nsymb, obs.nc, obs.modulation, obs.estimator,
+			(unsigned long long)obs.cells[0], (unsigned long long)obs.cells[1], (unsigned long long)obs.cells[2],
+			(unsigned long long)obs.nonfinite[0], (unsigned long long)obs.nonfinite[1], (unsigned long long)obs.nonfinite[2],
+			(unsigned long long)obs.nonzero[0], (unsigned long long)obs.nonzero[1], (unsigned long long)obs.nonzero[2],
+			obs.subpeak_reject, obs.skip_h_reject, obs.output_writes, obs.accepted, result.message_decoded,
+			rx.receive_stats.last_eff_preamble_nsymb, (int)result.delay, rx.receive_stats.ofdm_search_raw,
+			result.frame_overflow_symbols, rx.ofdm_forced_delay, rx.mfsk_fixed_delay, bytes, keyed, untouched);
+		for(int value : payload) printf("%02x", value);
+		printf(" actual="); for(int i = 0; i < bytes; ++i) printf("%03x", output[(size_t)i] & 0xfff);
+		printf("\n");
+		check(rx.agc_receive_test_ == nullptr, "call scope disarms after receive");
+		check(window == original, "receive preserves caller snapshot bytes");
+		check(rx.ofdm_forced_delay < 0 && rx.mfsk_fixed_delay < 0
+			&& rx.receive_stats.last_eff_preamble_nsymb == rx.data_container.preamble_nSymb,
+			"call retains unforced full-anchor acquisition");
+		if(observed) {
+			const uint64_t cells = (uint64_t)rx.ofdm.Nsymb * rx.ofdm.Nc;
+			check(obs.calls == 1 && obs.agc > 0 && obs.zf > 0
+				&& obs.cells[0] == cells * obs.agc && obs.cells[1] == cells * obs.zf,
+				"row independently reaches actual AGC and initialized ZF");
+			check(obs.nonfinite[0] == 0 && obs.nonfinite[1] == 0 && obs.nonfinite[2] == 0,
+				"observed AGC, ZF and reached equalizer outputs are finite");
+		}
+		if(invalid) {
+			check(obs.nonzero[0] == 0 && obs.nonzero[1] == 0,
+				"whole initialized matrix stays exact zero through guarded AGC and ZF");
+			check(result.message_decoded != YES && obs.accepted == 0 && obs.output_writes == 0
+				&& untouched && obs.subpeak_reject + obs.skip_h_reject > 0,
+				"invalid row follows real rejection with no decoded or output publication");
+		} else {
+			check(result.message_decoded == YES && keyed, "valid or recovery payload is byte-exact for its row key");
+			if(observed) check(obs.equalizer > 0 && obs.accepted == 1
+				&& obs.cells[2] == (uint64_t)rx.ofdm.Nsymb * rx.ofdm.Nc * obs.equalizer,
+				"valid or recovery row independently reaches actual equalizer and acceptance");
+		}
+	}
+	printf("[TEST-AGC-ENTRY] %s (%d failures; rows=8 invalid=3 observed_valid=3 disabled_valid=2)\n",
+		failed ? "FAILURES" : "ALL PASS", failed);
 	fflush(stdout);
 	return failed ? 1 : 0;
 }
