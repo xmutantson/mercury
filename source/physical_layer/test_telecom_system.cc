@@ -791,7 +791,10 @@ int cl_telecom_system::test_agc_receive_entry()
 	const int frame_size = (tx.data_container.Nsymb + tx.data_container.preamble_nSymb) * sym;
 	const int window_size = rx.data_container.buffer_Nsymb * sym;
 	const int bytes = (tx.data_container.nBits - tx.ldpc.P - tx.outer_code_reserved_bits) / 8;
-	const int onset = sym;
+	// receive_byte admits pream_symb_loc strictly above its configured preamble
+	// bound. Place the emitted full anchor at the first legal symbol, rather
+	// than inside the caller window prefix that production deliberately skips.
+	const int onset = (rx.data_container.preamble_nSymb + 1) * sym;
 	const bool geometry = rx.M != MOD_MFSK && rx.ofdm.channel_estimator == ZERO_FORCE
 		&& rx.ofdm.Nsymb == rx.data_container.Nsymb && rx.ofdm.Nc == rx.data_container.Nc
 		&& rx.ofdm.Nsymb > 0 && rx.ofdm.Nc > 0 && rx.ofdm.pilot_configurator.nPilots > 0
@@ -839,7 +842,8 @@ int cl_telecom_system::test_agc_receive_entry()
 		printf(" actual="); for(int i = 0; i < bytes; ++i) printf("%03x", output[(size_t)i] & 0xfff);
 		printf("\n");
 		check(rx.agc_receive_test_ == nullptr, "call scope disarms after receive");
-		check(window == original, "receive preserves caller snapshot bytes");
+		check(memcmp(window.data(), original.data(), window.size() * sizeof(double)) == 0,
+			"receive preserves caller snapshot bytes");
 		check(rx.ofdm_forced_delay < 0 && rx.mfsk_fixed_delay < 0
 			&& rx.receive_stats.last_eff_preamble_nsymb == rx.data_container.preamble_nSymb,
 			"call retains unforced full-anchor acquisition");

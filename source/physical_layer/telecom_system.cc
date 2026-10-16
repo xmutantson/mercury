@@ -3908,7 +3908,6 @@ skip_h_retry_point:
 				if(subpeak_gate_has_authority && receive_stats.coarse_metric >= 0.97
 					&& ((!thin_pilot_cfg && mean_H < 0.5) || coh_flags_subpeak))
 				{
-					if(agc_receive_test_) ++agc_receive_test_->subpeak_reject;
 					// F0-RINGDUMP (capture-replay fixture): at the SUBPEAK-REJECT trigger dump the
 					// raw passband ring + wrong-lock metadata for --test-frame0-replay. Faithful by
 					// construction (it IS the field waveform). Gated by MERCURY_F0_RINGDUMP=<dir>;
@@ -3998,6 +3997,7 @@ skip_h_retry_point:
 					}
 					if(g_verbose)
 					{
+						if(agc_receive_test_) ++agc_receive_test_->subpeak_reject;
 						printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
 							receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
 						fflush(stdout);
