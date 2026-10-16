@@ -1542,14 +1542,7 @@ int gui_main_loop() {
 }
 
 void gui_shutdown() {
-    // Save settings before exit
-    std::string config_path = getDefaultConfigPath();
-    g_settings.tx_gain_db = g_gui_state.tx_gain_db.load();
-    g_settings.rx_gain_db = g_gui_state.rx_gain_db.load();
-    g_settings.gains_locked = g_gui_state.gains_locked.load();
-    g_settings.monitor_enabled = g_gui_state.monitor_enabled.load();
-    g_settings.save(config_path);
-
+    // Persist settings only at explicit user change points.
     // Shutdown waterfall
     g_waterfall.shutdown();
 
