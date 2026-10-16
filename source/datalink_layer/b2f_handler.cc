@@ -580,11 +580,12 @@ int cl_b2f_handler::process_tx_payload(const char* in, int in_len, char* out, in
 				}
 				else
 				{
-					printf("[B2F-TX] LZHUF decode FAILED for %s (rc=%d), passthrough\n",
+					printf("[B2F-TX] LZHUF decode FAILED for %s (rc=%d), refusing transfer\n",
 						proposals[current_payload_idx].mid, rc);
 					fflush(stdout);
-					tx_pending_output_pos = 0;
-					tx_pending_output_len = payload_buf_pos;
+					fatal_error = true;
+					*in_consumed = in_pos;
+					return -1;
 				}
 
 				current_payload_idx = find_next_accepted(current_payload_idx + 1);
@@ -736,12 +737,12 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 				}
 				else
 				{
-					printf("[B2F-RX] LZHUF encode FAILED for %s (rc=%d), passthrough\n",
+					printf("[B2F-RX] LZHUF encode FAILED for %s (rc=%d), refusing transfer\n",
 						proposals[current_payload_idx].mid, rc);
 					fflush(stdout);
-					memcpy(rx_pending_buf, payload_buf, payload_buf_pos);
-					rx_pending_output_pos = 0;
-					rx_pending_output_len = payload_buf_pos;
+					fatal_error = true;
+					*in_consumed = in_pos;
+					return -1;
 				}
 
 				current_payload_idx = find_next_accepted(current_payload_idx + 1);
