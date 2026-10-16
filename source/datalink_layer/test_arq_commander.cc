@@ -5268,6 +5268,253 @@ int cl_arq_controller::test_connect_fuse()
 	measurements.SNR_uplink = saved_snr_cf;
 	gear_shift_on           = saved_gs_cf;
 	duty_r_pin_defeat       = saved_pd_cf;
+
+	// Established TEST replies must complete the existing transaction without
+	// replaying connect negotiation. Stage decoded wire bytes before the real
+	// pending-control admission, then drive its ordinary completion tick.
+	const char* block_env = std::getenv("MERCURY_L1_BLOCKACK");
+	const bool had_block_env = block_env != nullptr;
+	const std::string saved_block_env = block_env ? block_env : "";
+	setenv("MERCURY_L1_BLOCKACK", "1", 1);
+	const char* timing_env = std::getenv("MERCURY_T1_SCHEDKEY");
+	const bool had_timing_env = timing_env != nullptr;
+	const std::string saved_timing_env = timing_env ? timing_env : "";
+	setenv("MERCURY_T1_SCHEDKEY", "1", 1);
+	// The ordinary control-ACK admission clears playback. Isolate its real
+	// ring storage from other self-tests; no audio device or thread is started.
+	const auto saved_established_playback = playback_buffer;
+	std::vector<uint8_t> established_play_memory(AUDIO_PAYLOAD_BUFFER_SIZE);
+	playback_buffer = circular_buf_init(established_play_memory.data(), established_play_memory.size());
+	int established_failed = 0;
+	for(int row=0; row<12; ++row)
+	{
+		const bool explicit_ack = row % 3 != 0;
+		const int extension = row % 3; // legacy, valid extension, malformed extension
+		const bool snr_policy = row >= 6;
+		const bool synthesized = row % 2 != 0;
+		// A nine-byte timing extension must fit the decoded control payload.
+		const int established_config = explicit_ack && !synthesized ? CONFIG_1 : CONFIG_0;
+		cl_telecom_system ts;
+		cl_arq_controller cmd;
+		cmd.telecom_system = &ts;
+		cmd.role = COMMANDER;
+		// A new controller reports CONFIG_0 before its message storage exists.
+		// Force the real initial load rather than taking the same-config no-op.
+		cmd.current_configuration = CONFIG_NONE;
+		cmd.load_configuration(established_config, FULL, YES);
+		if(cmd.messages_control.data == nullptr || cmd.messages_rx_buffer.data == nullptr)
+		{
+			printf("[TEST-ESTABLISHED-TEST] row=%d FAIL: production storage initialized\n", row);
+			++established_failed;
+			continue;
+		}
+		cmd.fifo_buffer_tx.set_size(8192);
+		cmd.fifo_buffer_backup.set_size(8192);
+		cmd.fifo_buffer_rx.set_size(8192);
+		auto verify = [&](bool ok, const char* what) {
+			printf("[TEST-ESTABLISHED-TEST] row=%d %s: %s\n",
+				row, ok ? "PASS" : "FAIL", what);
+			if(!ok) ++established_failed;
+		};
+		cmd.link_status = CONNECTED;
+		cmd.connection_status = TRANSMITTING_DATA;
+		cmd.connection_id = 37;
+		cmd.assigned_connection_id = 37;
+		cmd.local_capability = CAP_WB_CAPABLE | CAP_CUMULATIVE_ACK | CAP_L1_BLOCKACK;
+		cmd.peer_capability = cmd.local_capability;
+		cmd.handshake_confirmed = true;
+		cmd.l1_blockack.begin_session(37, 413, 2, 9);
+		cmd.l1_blockack.complete_handshake(cmd.local_capability, cmd.peer_capability, true);
+		cmd.l1_blockack.note_transmitted_batch(93);
+		cmd.sack_enabled = cmd.sack_v2_enabled = true;
+		cmd.cumulative_ack_enabled = true;
+		cmd.data_batch_size = 7;
+		cmd.nominal_batch_size = 7;
+		cmd.rsp_stream_origin_gen = 91;
+		cmd.cmd_batch_seq_id = 93;
+		cmd.settled_close_cache.valid = true;
+		cmd.settled_close_cache.replays = 2;
+		cmd.settled_close_cache.peer_committed = 601;
+		cmd.session_data_frame_sent = true;
+		cmd.t1_peer_calibration_valid = true;
+		cmd.t1_peer_keyup_ms = 41;
+		cmd.t1_peer_deaf_ms = 52;
+		cmd.t1_peer_undeaf_ms = 63;
+		cmd.t1_data_phase_proven = true;
+		cmd.t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 77);
+		const auto warm_term = cmd.t1_term_est[T1_DIR_REV][T1_KEYUP];
+		cmd.measurements.SNR_downlink = 19;
+		cmd.gear_shift_on = snr_policy ? YES : NO;
+		cmd.gear_shift_algorithm = SNR_BASED;
+		cmd.data_configuration = established_config;
+		cmd.ack_configuration = established_config;
+		cmd.switch_role_test_timer.start();
+		cmd.compressor.set_dict_priming(false);
+		cmd.compressor.init();
+		cmd.compressor.streaming_enable();
+		cl_compressor decoder;
+		decoder.set_dict_priming(false);
+		decoder.init();
+		decoder.streaming_enable();
+		cmd.compression_enabled = true;
+		cmd.b2f_handler.init();
+		cmd.b2f_handler.unroll_enabled = false;
+		char b2f_out[512];
+		const char* sid = "[PAT-12.18.0-B2FHQEHX$]\r";
+		cmd.b2f_handler.filter_tx(sid, (int)strlen(sid), b2f_out, sizeof(b2f_out));
+		std::vector<char> raw(2048), encoded(8192), decoded(8192);
+		for(int i=0; i<(int)raw.size(); ++i)
+			raw[i] = (char)('A' + ((i * 17 + row * 13 + i / 29) % 23));
+		auto continuation = [&]() {
+			int n = cmd.compressor.compress_block(raw.data(), raw.size(), encoded.data(), encoded.size());
+			int k = n > 0 ? decoder.decompress_block(encoded.data(), n, decoded.data(), decoded.size()) : -1;
+			bool exact = k == (int)raw.size() && memcmp(raw.data(), decoded.data(), raw.size()) == 0;
+			if(exact) cmd.compressor.commit_pending();
+			return exact;
+		};
+		verify(continuation(), "keyed warm block is byte exact");
+		cmd.messages_control.status = FREE;
+		if(snr_policy)
+			cmd.finalize_block_commander(); // intentional production post-block request
+		else
+			cmd.add_message_control(TEST_CONNECTION);
+		verify(cmd.messages_control.status != FREE && cmd.messages_control.data[0] == TEST_CONNECTION,
+			"production request queued, including SNR post-block route");
+		cmd.messages_control.status = PENDING_ACK;
+		cmd.connection_status = RECEIVING_ACKS_CONTROL;
+		cmd.receiving_timeout = 100000;
+		cmd.receiving_timer.stop();
+		cmd.receiving_timer.reset();
+		cmd.receiving_timer.start();
+		ts.ack_mfsk.connect_pattern_nsymb = 0; // drive decoded LDPC admission without audio
+		ts.data_container.frames_to_read = 1;
+		cmd.ack_pattern_time_ms = 1;
+		// Establish the existing outer-handler geometry floor before taking a
+		// deadline snapshot; a stale arbitrary timeout is not a valid baseline.
+		cmd.calculate_receiving_timeout();
+		const int warm_ack_timeout = cmd.ack_timeout_data;
+		memset(cmd.messages_rx_buffer.data, 0, N_MAX/8);
+		char* reply = cmd.messages_rx_buffer.data;
+		reply[0] = explicit_ack ? TEST_CONNECTION_ACK : TEST_CONNECTION;
+		if(explicit_ack)
+		{
+			reply[1] = (char)cmd.local_capability;
+			reply[2] = CAP_WB_CAPABLE; // valid reply differs from established negotiation
+			reply[3] = (char)cmd.CRC8_calc(&reply[1], 2);
+			cmd.t1_calibration_encode(&reply[4], 80, 90, 100);
+			if(extension == 2) reply[4] = 0;
+		}
+		else
+		{
+			u_SNR snr; snr.f_SNR = 11;
+			memcpy(&reply[1], snr.char4_SNR, 4);
+			reply[5] = 0;
+		}
+		cmd.messages_control.length = explicit_ack ? 9 : 7;
+		const int wire_capacity = cmd.max_data_length + cmd.max_header_length
+			- CONTROL_ACK_CONTROL_HEADER_LENGTH;
+		verify(wire_capacity >= (explicit_ack && !synthesized ? 9 : 7),
+			"wire geometry carries the complete staged reply");
+		cmd.messages_rx_buffer.status = RECEIVED;
+		cmd.messages_rx_buffer.type = ACK_CONTROL;
+		if(synthesized && explicit_ack)
+		{
+			// MFSK suffix decoding synthesizes this exact seven-byte mailbox.
+			memcpy(cmd.messages_control.data, reply, 7);
+			cmd.messages_control.length = 7;
+			cmd.messages_control.status = ACKED;
+		}
+		else
+		{
+			cmd.process_messages_rx_acks_control();
+			verify(cmd.messages_control.status == ACKED, "pending request admits matching decoded reply");
+		}
+		cmd.receiving_timeout = 0;
+		cmd.process_messages_rx_acks_control();
+		verify(cmd.messages_control.status == FREE, "outer completion frees only acknowledged control");
+		verify(cmd.link_status == (snr_policy ? NEGOTIATING : CONNECTED)
+			&& cmd.connection_status == (snr_policy ? TRANSMITTING_CONTROL : TRANSMITTING_DATA),
+			"ordinary and SNR negotiation continuations survive");
+		verify(!cmd.switch_role_test_timer.counting && cmd.link_timer.counting
+			&& cmd.watchdog_timer.counting && (!snr_policy || cmd.gear_shift_timer.counting),
+			"matching activity timers complete");
+		verify(cmd.peer_capability == cmd.local_capability && cmd.cumulative_ack_enabled
+			&& cmd.handshake_confirmed && cmd.sack_enabled && cmd.sack_v2_enabled,
+			"established capability and SACK negotiation preserved");
+		verify(cmd.l1_blockack.enabled() && cmd.l1_blockack.intermediate_silence_expected(),
+			"live BlockACK pending group preserved");
+		printf("[TEST-ESTABLISHED-STATE] row=%d config=%d capacity=%d batch=%d ack_before=%d ack_after=%d peer_cal=%d/%d/%d\n",
+			row, established_config, wire_capacity, cmd.data_batch_size, warm_ack_timeout,
+			cmd.ack_timeout_data, cmd.t1_peer_keyup_ms, cmd.t1_peer_deaf_ms, cmd.t1_peer_undeaf_ms);
+		verify(cmd.data_batch_size == 7 && cmd.ack_timeout_data == warm_ack_timeout,
+			"established batch and data ACK deadline preserved");
+		verify(cmd.rsp_stream_origin_gen == 91 && cmd.cmd_batch_seq_id == 93
+			&& cmd.connection_id == 37 && cmd.assigned_connection_id == 37
+			&& cmd.settled_close_cache.valid && cmd.settled_close_cache.replays == 2
+			&& cmd.settled_close_cache.peer_committed == 601 && cmd.session_data_frame_sent,
+			"origin, session identity and terminal cache preserved");
+		const bool refreshed = explicit_ack && extension == 1 && !synthesized;
+		verify(cmd.t1_peer_keyup_ms == (refreshed ? 80 : 41)
+			&& cmd.t1_peer_deaf_ms == (refreshed ? 90 : 52)
+			&& cmd.t1_peer_undeaf_ms == (refreshed ? 100 : 63)
+			&& cmd.t1_data_phase_proven
+			&& cmd.t1_term_est[T1_DIR_REV][T1_KEYUP].n == warm_term.n
+			&& cmd.t1_term_est[T1_DIR_REV][T1_KEYUP].srtt_ms == warm_term.srtt_ms,
+			"only valid measured calibration refreshes, without bootstrap");
+		verify(cmd.measurements.SNR_downlink == (explicit_ack ? 19 : 11),
+			"explicit ACK preserves SNR and legacy reply measures it");
+		verify(!cmd.b2f_handler.unroll_enabled && continuation(),
+			"B2F policy and keyed warm compressor continuation preserved");
+		// Unrelated pending requests must reject either TEST reply at admission.
+		cmd.messages_control.status = FREE;
+		cmd.add_message_control(SET_CONFIG);
+		cmd.messages_control.status = PENDING_ACK;
+		cmd.connection_status = RECEIVING_ACKS_CONTROL;
+		cmd.receiving_timeout = 100000;
+		cmd.ack_pattern_time_ms = 0;
+		cmd.messages_rx_buffer.status = RECEIVED;
+		cmd.messages_rx_buffer.type = ACK_CONTROL;
+		ts.data_container.frames_to_read = 1;
+		cmd.process_messages_rx_acks_control();
+		verify(cmd.messages_control.status == PENDING_ACK && cmd.messages_control.data[0] == SET_CONFIG,
+			"unrelated pending control rejects TEST reply");
+		cmd.messages_control.status = FREE;
+		// CRC-invalid explicit replies retain the existing bounded retry path.
+		cmd.link_status = CONNECTED;
+		cmd.connection_status = RECEIVING_ACKS_CONTROL;
+		cmd.messages_control.status = ACKED;
+		cmd.messages_control.data[0] = TEST_CONNECTION_ACK;
+		cmd.messages_control.data[1] = (char)cmd.local_capability;
+		cmd.messages_control.data[2] = CAP_WB_CAPABLE;
+		cmd.messages_control.data[3] = (char)(cmd.CRC8_calc(&cmd.messages_control.data[1], 2) ^ 1);
+		cmd.handshake_retries_left = 1;
+		cmd.process_control_commander();
+		verify(cmd.handshake_retries_left == 0 && cmd.messages_control.status == FREE
+			&& cmd.link_status == CONNECTED && cmd.rsp_stream_origin_gen == 91,
+			"malformed explicit echo takes existing retry before established completion");
+		if(row == 0)
+		{
+			// A fresh accepted handshake must still perform its negotiation.
+			cmd.link_status = CONNECTION_ACCEPTED;
+			cmd.connection_status = RECEIVING_ACKS_CONTROL;
+			cmd.gear_shift_on = YES;
+			cmd.gear_shift_algorithm = SNR_BASED;
+			cmd.messages_control.status = ACKED;
+			cmd.messages_control.data[3] = (char)cmd.CRC8_calc(&cmd.messages_control.data[1], 2);
+			cmd.process_control_commander();
+			verify(cmd.link_status == NEGOTIATING && cmd.peer_capability == CAP_WB_CAPABLE
+				&& cmd.b2f_handler.unroll_enabled && cmd.messages_control.status == FREE,
+				"fresh handshake still negotiates and completes normally");
+		}
+	}
+	circular_buf_free(playback_buffer);
+	playback_buffer = saved_established_playback;
+	if(had_block_env) setenv("MERCURY_L1_BLOCKACK", saved_block_env.c_str(), 1);
+	else unsetenv("MERCURY_L1_BLOCKACK");
+	if(had_timing_env) setenv("MERCURY_T1_SCHEDKEY", saved_timing_env.c_str(), 1);
+	else unsetenv("MERCURY_T1_SCHEDKEY");
+	printf("[TEST-ESTABLISHED-TEST] rows=12 failures=%d\n", established_failed);
+	failed += established_failed;
 	printf("[TEST-CONNECT-FUSE] %s (%d failures)\n", failed==0 ? "ALL PASS" : "FAILURES PRESENT", failed);
 	fflush(stdout);
 	return failed == 0 ? 0 : 1;

@@ -10532,6 +10532,24 @@ void cl_arq_controller::process_control_commander()
 			// - TEST_CONNECTION: legacy ACK-pattern emulation. peer_capability
 			//   comes from data[5] = our own TX content (symmetric assumption).
 			bool is_ack = (messages_control.data[0]==TEST_CONNECTION_ACK);
+			auto complete_established_test = [&]() {
+				switch_role_test_timer.stop();
+				switch_role_test_timer.reset();
+				// Match the ordinary consumer tail: release ACKED, preserve a
+				// separately queued control transaction before selecting the next step.
+				cleanup();
+				link_timer.start();
+				watchdog_timer.start();
+				if(gear_shift_on == YES && gear_shift_algorithm == SNR_BASED)
+				{
+					link_status = NEGOTIATING;
+					connection_status = TRANSMITTING_CONTROL;
+					gear_shift_timer.start();
+				}
+				else
+					connection_status = messages_control.status == FREE
+						? TRANSMITTING_DATA : TRANSMITTING_CONTROL;
+			};
 			if(is_ack)
 			{
 				unsigned char echoed_cap = (unsigned char)messages_control.data[1];
@@ -10589,6 +10607,20 @@ void cl_arq_controller::process_control_commander()
 						echoed_cap, (unsigned char)local_capability, rsp_own);
 					fflush(stdout);
 				}
+				if(link_status == CONNECTED)
+				{
+					int pk = -1, pd = -1, pu = -1;
+					if(messages_control.length >= 9 && t1_calibration_decode(
+						&messages_control.data[4], 5, &pk, &pd, &pu))
+					{
+						t1_peer_calibration_valid = true;
+						t1_peer_keyup_ms = pk;
+						t1_peer_deaf_ms = pd;
+						t1_peer_undeaf_ms = pu;
+					}
+					complete_established_test();
+					return;
+				}
 				handshake_confirmed = true;
 				peer_capability = rsp_own;
 				int pk = -1, pd = -1, pu = -1;
@@ -10622,6 +10654,11 @@ void cl_arq_controller::process_control_commander()
 					tmp_SNR.char4_SNR[i]=messages_control.data[i+1];
 				}
 				measurements.SNR_downlink=quantize_snr_decision_db((double)tmp_SNR.f_SNR);
+				if(link_status == CONNECTED)
+				{
+					complete_established_test();
+					return;
+				}
 				// Read responder's capability from byte 5.
 				// With LDPC ACK: this is the responder's reply (correct).
 				// With ACK pattern: no data payload, so this is our own TX data (assumes
