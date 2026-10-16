@@ -8327,13 +8327,19 @@ static void test_break_fh_gate() {
 			float sigma = 1.0f / sqrtf(powf(10.0f, (float)esn0 / 10.0f));
 			float ampl  = sigma / sqrtf(2.0f);
 			int hits = 0, trials = 8, bestm = 0; double bestmet = 0;
+			// Own generator: the channel generator draws from the process-global
+			// rand() stream, so D2's noise used to depend on which tests ran
+			// before it (and on the C library). Fixed seed, N(0,1) per sample,
+			// the same distribution as the channel's Box-Muller draw.
+			std::mt19937 d2_rng(0xB2EA4D02u);
+			std::normal_distribution<double> d2_n01(0.0, 1.0);
 			for (int t = 0; t < trials; t++) {
 				for (int i = 0; i < buf_samp; i++) rx[i] = 0.0;
 				int onset = 5 * sym_samples, copy_n = written;
 				if (onset + copy_n > buf_samp) copy_n = buf_samp - onset;
 				for (int i = 0; i < copy_n; i++) rx[onset + i] = brk[i];
 				for (int i = 0; i < buf_samp; i++)
-					rx[i] += (double)(ampl * ts.awgn_channel.awgn_value_generator());
+					rx[i] += (double)ampl * d2_n01(d2_rng);
 				int m = 0;
 				double met = ts.detect_break_pattern_from_passband(rx, buf_samp, &m);
 				if (met >= floor && m >= thr) hits++;
