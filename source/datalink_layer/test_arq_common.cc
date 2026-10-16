@@ -3235,3 +3235,79 @@ int cl_arq_controller::test_rxfifo_backpressure_hold()
 	fflush(stdout);
 	return failed==0 ? 0 : 1;
 }
+
+
+// The optional observer is supplied by a link-wrapped detector in the directed
+// fixture. It probes the real publication mutex at every detector entry; normal
+// builds need no wrapper and still exercise the waveform and pacing controls.
+int cl_arq_controller::test_ack_capture_snapshot(int (*locked_detector_calls)())
+{
+ int fails = 0;
+ auto check = [&](bool ok, const char* name) {
+  printf("[TEST-ACK-SNAPSHOT] %s %s\n", ok ? "PASS" : "FAIL", name);
+  if(!ok) ++fails;
+ };
+ if(!telecom_system) return 1;
+ telecom_system->narrowband_enabled = NO;
+ narrowband_enabled = NO;
+ telecom_system->load_configuration(CONFIG_0);
+ telecom_system->set_recovery_ack_reps(1);
+ turbo_snr_ack_enabled = false;
+ cl_data_container& dc = telecom_system->data_container;
+ const int sym = dc.Nofdm * dc.interpolation_rate;
+ const int pattern = telecom_system->ack_mfsk.ack_base_total_nsymb();
+ const int sp = sym * dc.buffer_Nsymb.load();
+ const int tail = std::min(sp, (2 * pattern + 16) * sym);
+ const int off = sp - tail;
+ const int stride = pattern * sym;
+ const int burst_n = telecom_system->ack_pattern_passband_samples;
+ if(sym <= 0 || burst_n <= 0 || burst_n > tail || off < 3 * stride) return 1;
+ std::vector<double> burst((size_t)burst_n);
+ check(telecom_system->generate_ack_pattern_passband(burst.data()) == burst_n,
+       "real generated ACK has expected sample length");
+ auto stage = [&](int phase, int cursor, bool noise) {
+  memset(dc.passband_delayed_data, 0, (size_t)(2 * sp) * sizeof(double));
+  for(int i=0; i<sp; ++i) {
+   double v = noise ? ((i & 1) ? 0.01 : -0.01) : 0.0;
+   dc.passband_delayed_data[i] = dc.passband_delayed_data[i+sp] = v;
+  }
+  if(phase >= 0) {
+   const int start = off - phase * stride + tail - burst_n;
+   for(int i=0; i<burst_n; ++i) {
+    const int ring = (cursor + start + i) % sp;
+    dc.passband_delayed_data[ring] = dc.passband_delayed_data[ring+sp] = burst[i];
+   }
+  }
+  dc.ring_write_index = cursor;
+  dc.frames_to_read = 0;
+  dc.nUnder_processing_events = 0;
+  dc.data_ready = 1;
+ };
+ stage(-1, 0, false);
+ check(!receive_ack_pattern(false, true) && dc.frames_to_read == 2,
+       "silent multiwindow miss retains two-symbol repoll");
+ stage(0, 0, false);
+ check(receive_ack_pattern(false, false) && dc.frames_to_read == 4,
+       "newest ACK accepted with ordinary audio advance");
+ stage(3, sp-7, false);
+ check(receive_ack_pattern(true, true) && dc.frames_to_read == 0,
+       "older ACK across mirrored wrap accepted with deferred advance");
+ stage(-1, sp-7, true);
+ check(!receive_ack_pattern(false, true) && dc.frames_to_read == 2,
+       "energetic non-ACK scans phases without false acceptance");
+ stage(3, 0, false);
+ check(!receive_ack_pattern(false, true, burst_n),
+       "causal mask excludes retained pre-epoch ACK");
+ stage(3, sp-7, false);
+ check(receive_ack_pattern(false, true, tail + 3 * stride),
+       "eligible older ACK survives causal masking");
+ stage(0, 0, false);
+ dc.frames_to_read = 1;
+ check(!receive_ack_pattern(false, true) && dc.frames_to_read == 1 && dc.data_ready == 0,
+       "busy capture poll clears readiness without consuming a phase");
+ if(locked_detector_calls)
+  check(locked_detector_calls() == 0,
+        "every real detector entry leaves publication mutex available");
+ printf("[TEST-ACK-SNAPSHOT] failures=%d\n", fails);
+ return fails;
+}

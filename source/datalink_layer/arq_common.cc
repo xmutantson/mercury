@@ -19540,6 +19540,17 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 	if(tail_samples > signal_period)
 		tail_samples = signal_period;
 	int tail_offset = signal_period - tail_samples;
+	// The retained search covers at most 24 older ACK strides. Allocate on
+	// the decoder thread before acquiring the publication mutex, then take one
+	// coherent chronological copy. No live-ring pointer survives that lock.
+	const int MW_MAX_PHASES = 24;
+	int stride = pattern_len * sym_samples;
+	if(stride < sym_samples) stride = sym_samples;
+	if(sym_samples <= 0 || signal_period <= 0 || tail_samples <= 0) return false;
+	const int snapshot_offset = multiwindow_scan_eff
+		? std::max(0, tail_offset - MW_MAX_PHASES * stride) : tail_offset;
+	const int snapshot_samples = signal_period - snapshot_offset;
+	ack_pattern_capture_snapshot.resize((size_t)snapshot_samples);
 	const int causal_history_samples =
 		(causal_ring_samples >= 0)
 		? start_ack_causal_eligible_tail_samples(
@@ -19617,19 +19628,28 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 		while(elapsed_ms < window_ms)
 		{
 			bool scannable = false;
+			bool copied = false;
 			MUTEX_LOCK(&capture_prep_mutex);
-			if(telecom_system->data_container.frames_to_read == 0)
+			const cl_data_container& dc = telecom_system->data_container;
+			const int rwi = dc.ring_write_index;
+			if(dc.frames_to_read == 0 && rwi >= 0 && rwi < signal_period
+			   && dc.Nofdm * dc.interpolation_rate == sym_samples
+			   && sym_samples * dc.buffer_Nsymb.load() == signal_period
+			   && dc.passband_delayed_data != nullptr)
 			{
-				int rwi = telecom_system->data_container.ring_write_index;
-				double* tp = &telecom_system->data_container
-					.passband_delayed_data[rwi + tail_offset];
-				double sumsq = 0.0;
-				for(int i = 0; i < tail_samples; i++) sumsq += tp[i] * tp[i];
-				double rms = std::sqrt(sumsq / tail_samples);
-				if(rms >= SIM_ACK_PROBE_GATE_RMS)
-					scannable = true;   // ACK energy is in the tail NOW — scan it
+				memcpy(ack_pattern_capture_snapshot.data(),
+					&dc.passband_delayed_data[rwi + tail_offset],
+					(size_t)tail_samples * sizeof(double));
+				copied = true;
 			}
 			MUTEX_UNLOCK(&capture_prep_mutex);
+			if(copied)
+			{
+				const double* tp = ack_pattern_capture_snapshot.data();
+				double sumsq = 0.0;
+				for(int i = 0; i < tail_samples; i++) sumsq += tp[i] * tp[i];
+				scannable = std::sqrt(sumsq / tail_samples) >= SIM_ACK_PROBE_GATE_RMS;
+			}
 			if(scannable)
 				break;                  // run the UNCHANGED detection body below
 			pumped_settle_wait(slice_ms);   // advance shared clock + deliver reply
@@ -19639,8 +19659,22 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 
 	MUTEX_LOCK(&capture_prep_mutex);
 
-	if(telecom_system->data_container.frames_to_read == 0)
+	cl_data_container& capture_dc = telecom_system->data_container;
+	const int snapshot_rwi = capture_dc.ring_write_index;
+	if(capture_dc.frames_to_read == 0
+	   && capture_dc.Nofdm * capture_dc.interpolation_rate == sym_samples
+	   && sym_samples * capture_dc.buffer_Nsymb.load() == signal_period
+	   && snapshot_rwi >= 0 && snapshot_rwi < signal_period
+	   && snapshot_offset >= 0 && snapshot_samples >= tail_samples
+	   && (size_t)snapshot_samples <= ack_pattern_capture_snapshot.size()
+	   && capture_dc.passband_delayed_data != nullptr)
 	{
+		memcpy(ack_pattern_capture_snapshot.data(),
+			&capture_dc.passband_delayed_data[snapshot_rwi + snapshot_offset],
+			(size_t)snapshot_samples * sizeof(double));
+		capture_dc.data_ready = 0;
+		MUTEX_UNLOCK(&capture_prep_mutex);
+
 		// mw_hit: the multi-window scan validated a real ACK at an older phase
 		// (full correlator >= thresholds). When set, the body's 8-symbol energy
 		// pre-gate (probe_n) MUST be bypassed: under the paced two-process sim
@@ -19683,7 +19717,6 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 		// contiguous, in-bounds tail via the mirror copy.
 		if(multiwindow_scan_eff && tail_offset > 0)
 		{
-			const int rwi_mw = telecom_system->data_container.ring_write_index;
 			const double MW_GATE_RMS = 0.001; // == ACK_ENERGY_GATE_RMS below
 			// recovery-ack-capture LEVER 1(b): on the recovery control-ACK poll use the
 			// fine pass for the older-phase correlator (consistent with the recovery-fine
@@ -19698,9 +19731,6 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 			// between two phases). Bound the number of older phases to the ACK
 			// round-trip neighbourhood (not the whole 1301-symbol ring) to keep
 			// the per-poll correlator cost modest.
-			int stride = pattern_len * sym_samples;
-			if(stride < sym_samples) stride = sym_samples;
-			const int MW_MAX_PHASES = 24; // ~24*pattern_len symbols of look-back
 			int chosen_off = -1;
 			for(int ph = 1; ph <= MW_MAX_PHASES; ph++)
 			{
@@ -19708,8 +19738,8 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 				if(off < 0) break;
 				const int phase_shift_samples = ph * stride;
 				// Energy pre-gate (cheap): only correlate phases that hold signal.
-				const double* pp = &telecom_system->data_container
-					.passband_delayed_data[rwi_mw + off];
+				const double* pp = ack_pattern_capture_snapshot.data()
+					+ off - snapshot_offset;
 				double sumsq = 0.0;
 				if(causal_history_samples >= 0)
 				{
@@ -19734,7 +19764,7 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 				else
 				{
 					// Preserve the original age-disabled path exactly: score
-					// the ring in place, and copy only an energetic phase.
+					// the immutable copy, and select only an energetic phase.
 					for(int i = 0; i < tail_samples; i++) sumsq += pp[i] * pp[i];
 				}
 				double rms = std::sqrt(sumsq / tail_samples);
@@ -19769,11 +19799,10 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 				mw_hit = true;            // bypass the 8-symbol energy pre-gate
 			}
 		}
-		// Snapshot only the tail (newest audio) — smaller copy, shorter mutex hold
-		int rwi = telecom_system->data_container.ring_write_index;
+		// Select the chosen phase from the same immutable publication snapshot.
 		memcpy(telecom_system->data_container.ready_to_process_passband_delayed_data,
-			&telecom_system->data_container.passband_delayed_data[rwi + tail_offset],
-			tail_samples * sizeof(double));
+			ack_pattern_capture_snapshot.data() + tail_offset - snapshot_offset,
+			(size_t)tail_samples * sizeof(double));
 		if(causal_history_samples >= 0)
 		{
 			const int eligible_samples =
@@ -19784,9 +19813,6 @@ bool cl_arq_controller::receive_ack_pattern(bool defer_audio_advance,
 					.ready_to_process_passband_delayed_data,
 					0, (tail_samples - eligible_samples) * sizeof(double));
 		}
-
-		telecom_system->data_container.data_ready = 0;
-		MUTEX_UNLOCK(&capture_prep_mutex);
 
 		int matched_count = 0;
 

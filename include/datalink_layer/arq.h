@@ -995,6 +995,9 @@ public:
   // edge of the capture-prep ring. Older samples are zero-masked in both
   // newest and multiwindow snapshots. Other callers keep -1 and are
   // byte-identical.
+  // ARQ-thread-owned search copy; capture publication never writes this storage.
+  std::vector<double> ack_pattern_capture_snapshot;
+  int test_ack_capture_snapshot(int (*locked_detector_calls)() = nullptr);
   bool receive_ack_pattern(bool defer_audio_advance = false,
                            bool multiwindow_scan = false,
                            int causal_ring_samples = -1,
