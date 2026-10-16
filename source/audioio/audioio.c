@@ -2004,6 +2004,37 @@ void capture_reset_samples(void)
 	}
 }
 
+static double audioio_stereo_int32_average(int32_t left, int32_t right)
+{
+	return ((double)left + (double)right) / (2.0 * (double)INT_MAX);
+}
+
+int audioio_stereo_int32_average_selftest(void)
+{
+	static const int32_t pairs[][2] = {
+		{0, 0}, {1, 0}, {-1, 0}, {INT_MAX, INT_MAX},
+		{INT_MIN, INT_MIN}, {INT_MAX, INT_MIN},
+		{INT_MAX / 2, INT_MAX / 2},
+		{INT_MAX / 2 + 1, INT_MAX / 2 + 1},
+		{(int32_t)(0.6 * INT_MAX), (int32_t)(0.6 * INT_MAX)},
+		{(int32_t)(-0.6 * INT_MAX), (int32_t)(-0.6 * INT_MAX)},
+		{INT_MAX, 0}, {INT_MIN, 0}
+	};
+	int failed = 0;
+	for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); ++i) {
+		const int64_t sum = (int64_t)pairs[i][0] + pairs[i][1];
+		const double expected = (double)sum / (2.0 * (double)INT_MAX);
+		const double actual = audioio_stereo_int32_average(pairs[i][0], pairs[i][1]);
+		const double swapped = audioio_stereo_int32_average(pairs[i][1], pairs[i][0]);
+		const int ok = actual == expected && swapped == expected;
+		printf("[TEST-STEREO-INT32-AVERAGE] case=%zu L=%d R=%d expected=%.17g actual=%.17g swapped=%.17g: %s\n",
+			i, (int)pairs[i][0], (int)pairs[i][1], expected, actual, swapped,
+			ok ? "PASS" : "FAIL");
+		failed += !ok;
+	}
+	return failed;
+}
+
 void *radio_capture_thread(void *device_ptr)
 {
 	audioio_apply_rt_priority("audio-capture", true, stderr);
@@ -2288,7 +2319,7 @@ void *radio_capture_thread(void *device_ptr)
 				else if (is_int16)
 					buffer_internal[i] = (double) ((buffer_int16[i*2] + buffer_int16[i*2 + 1]) / 2.0) / 32768.0;
 				else
-					buffer_internal[i] = (double) ((buffer[i*2] + buffer[i*2 + 1]) / 2.0) / (double) INT_MAX;
+					buffer_internal[i] = audioio_stereo_int32_average(buffer[i*2], buffer[i*2 + 1]);
 			}
 			else
 			{

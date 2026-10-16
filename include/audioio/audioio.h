@@ -120,6 +120,7 @@ int sim_tx_bridge_allocation_failure_selftest(void);
 int sim_rx_bridge_allocation_failure_selftest(void);
 int sim_playback_connection_failure_selftest(void);
 int audioio_rt_priority_selftest(void);
+int audioio_stereo_int32_average_selftest(void);
 // Conservative time from queued passband samples to physical/simulated output
 // egress, including the opened playback backend's retained-device bound.
 uint64_t playback_causal_egress_bound_ns(size_t queued_samples);
