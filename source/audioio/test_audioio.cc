@@ -2,6 +2,7 @@
 #include "test_audioio.h"
 #include <cstdlib>
 #include "common/sim_clock.h"
+#include "datalink_layer/timer.h"
 #include <cstring>
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -420,19 +421,38 @@ int sim_playback_connection_failure_case(int& sim_port_for_test, int& sim_connec
 	const int saved_clock_enabled = sim_clock_enabled();
 	const int saved_wire_stamp = sim_clock_wire_stamp();
 
-	// Port zero cannot have a listening TCP relay.  Limit the real localhost
-	// connect path to one attempt so the regression has no wall-clock retry.
-	sim_port_for_test = 0;
-	sim_connect_attempt_limit_for_test = 0;
-	sim_clock_set_enabled(1);
-	sim_clock_set_wire_stamp(1);
-	void *result = sim_tx_bridge_thread(NULL);
-	sim_connect_attempt_limit_for_test = -1;
-	sim_port_for_test = -1;
-
-	const bool passed = result == NULL && shutdown_.load()
-		&& !sim_clock_enabled() && !sim_clock_wire_stamp()
-		&& !sim_connection_dirty();
+	const int saved_port = sim_port_for_test;
+	const int saved_limit = sim_connect_attempt_limit_for_test;
+	bool passed = true;
+	// Exercise both virtual wire formats and the disabled-clock control.
+	for (int mode = 0; mode < 3; ++mode) {
+		const int enabled = mode != 0;
+		const int stamped = mode == 2;
+		shutdown_ = false;
+		// Port zero cannot have a listening relay; no retry or sleep is needed.
+		sim_port_for_test = 0;
+		sim_connect_attempt_limit_for_test = 0;
+		sim_clock_set_enabled(enabled);
+		sim_clock_set_wire_stamp(stamped);
+		const uint64_t samples_before = sim_clock_now_samples();
+		cl_timer timer;
+		timer.start();
+		void *result = sim_tx_bridge_thread(NULL);
+		const bool stable = sim_clock_enabled() == enabled
+			&& sim_clock_wire_stamp() == stamped
+			&& sim_clock_now_samples() == samples_before;
+		const int elapsed = timer.get_elapsed_time_ms();
+		const bool case_passed = result == NULL && shutdown_.load()
+			&& stable && !sim_connection_dirty()
+			&& (!enabled || elapsed == 0);
+		printf("[SIM-CONNECT-CLOCK] mode=%d stable=%d elapsed_ms=%d shutdown=%d clean=%d: %s\n",
+			mode, stable, elapsed, (int)shutdown_.load(),
+			!sim_connection_dirty(), case_passed ? "PASS" : "FAIL");
+		passed = passed && case_passed;
+		timer.stop();
+	}
+	sim_connect_attempt_limit_for_test = saved_limit;
+	sim_port_for_test = saved_port;
 	sim_close_connection();
 	sim_clock_set_wire_stamp(saved_wire_stamp);
 	sim_clock_set_enabled(saved_clock_enabled);

@@ -3028,11 +3028,8 @@ void *sim_tx_bridge_thread(void *unused)
 {
 	(void)unused;
 	if (sim_connect_once() != 0) {
-		// main.cc opens the process-wide virtual sample clock before starting
-		// this worker.  A rejected relay connection is terminal, so close that
-		// clock here as part of the same failed-startup transaction.
-		sim_clock_set_wire_stamp(0);
-		sim_clock_set_enabled(0);
+		// Timers may already be armed on the virtual clock. Keep the startup
+		// clock and wire format fixed until shutdown completes.
 		shutdown_ = true;
 		return NULL;
 	}
