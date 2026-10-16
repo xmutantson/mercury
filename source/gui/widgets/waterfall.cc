@@ -85,14 +85,40 @@ void WaterfallDisplay::shutdown() {
     initialized_ = false;
 }
 
+// Capture thread: hand the samples over and return. It never waits for the GUI
+// (display samples are dropped if the GUI thread holds the lock or has not
+// drained the queue) and never runs an FFT; render does that on the GUI thread.
 void WaterfallDisplay::pushSamples(const double* samples, int count) {
     // Skip all processing when waterfall is disabled (major CPU savings)
-    if (!enabled_) return;
+    if (!enabled_.load(std::memory_order_relaxed) || count <= 0) return;
 
-    GuiLockGuard lock(waterfall_mutex);
+    if (!waterfall_mutex.try_lock()) {
+        return;
+    }
+    const int capacity = WATERFALL_FFT_SIZE * 2;
+    const int room = capacity - pending_count_;
+    const int n = count < room ? count : room;
+    if (n > 0) {
+        memcpy(pending_ + pending_count_, samples, (size_t)n * sizeof(double));
+        pending_count_ += n;
+    }
+    waterfall_mutex.unlock();
+}
 
-    for (int i = 0; i < count; i++) {
-        sample_buffer_[sample_index_] = samples[i];
+// GUI thread: take the queued samples under the lock (a copy only), then run
+// the FFTs and update the history outside it. sample_buffer_ and history_ are
+// touched only by the GUI thread.
+void WaterfallDisplay::drainPending() {
+    int n;
+    {
+        GuiLockGuard lock(waterfall_mutex);
+        n = pending_count_;
+        if (n > 0)
+            memcpy(drain_scratch_, pending_, (size_t)n * sizeof(double));
+        pending_count_ = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        sample_buffer_[sample_index_] = drain_scratch_[i];
         sample_index_++;
 
         // When buffer is full, process FFT
@@ -205,9 +231,10 @@ void WaterfallDisplay::render(float width, float height) {
     int tex_width = WATERFALL_DISPLAY_BINS;
     int tex_height = WATERFALL_HISTORY_LINES;
 
-    // Update texture data from history
+    drainPending();
+
+    // History and FFT state belong to the GUI thread.
     {
-        GuiLockGuard lock(waterfall_mutex);
 
         for (int y = 0; y < tex_height; y++) {
             // Map y to history index (scroll effect)
@@ -259,10 +286,75 @@ void WaterfallDisplay::setRange(float min_db, float max_db) {
 }
 
 void WaterfallDisplay::setEnabled(bool enabled) {
-    enabled_ = enabled;
+    enabled_.store(enabled, std::memory_order_relaxed);
 }
 
 // Thread-safe wrapper for pushing samples (extern "C" for C linkage)
 extern "C" void waterfall_push_samples(const double* samples, int count) {
     g_waterfall.pushSamples(samples, count);
+}
+
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+int waterfall_nonblocking_case() {
+#ifdef _WIN32
+    printf("[TEST-WATERFALL-NONBLOCKING] SKIP: POSIX process backstop\n");
+    return 0;
+#else
+    int failures = 0;
+    for (int mode = 0; mode < 2; ++mode) {
+        fflush(stdout);
+        const pid_t pid = fork();
+        if (pid == 0) {
+            alarm(5); // Deadlock backstop, never a latency acceptance threshold.
+            WaterfallDisplay display;
+            double samples[WATERFALL_FFT_SIZE * 3];
+            for (int i = 0; i < WATERFALL_FFT_SIZE * 3; ++i)
+                samples[i] = 0.1 * sin(0.05 * i);
+            if (mode == 0) {
+                waterfall_mutex.lock();
+                display.pushSamples(samples, WATERFALL_FFT_SIZE);
+                waterfall_mutex.unlock();
+                // A contended display update must leave capture free to proceed.
+                _exit(display.history_index_ == 0 ? 0 : 11);
+            }
+            display.pushSamples(samples, WATERFALL_FFT_SIZE * 3);
+            if (display.history_index_ != 0 || display.sample_index_ != 0)
+                _exit(12); // The producer performed FFT work.
+            if (display.pending_count_ != WATERFALL_FFT_SIZE * 2
+                || memcmp(display.pending_, samples, sizeof(display.pending_)) != 0)
+                _exit(13); // Handoff exceeds capacity or changes accepted samples.
+            display.drainPending();
+            if (display.history_index_ != 2 || display.pending_count_ != 0)
+                _exit(14);
+            // Recover from contention/full queue, preserving a partial FFT frame.
+            display.pushSamples(samples, 17);
+            display.drainPending();
+            display.setEnabled(false);
+            display.pushSamples(samples, WATERFALL_FFT_SIZE);
+            display.drainPending();
+            if (display.history_index_ != 2 || display.sample_index_ != 17)
+                _exit(15);
+            display.setEnabled(true);
+            display.pushSamples(samples + 17, WATERFALL_FFT_SIZE - 17);
+            display.drainPending();
+            if (display.history_index_ != 3 || display.sample_index_ != 0)
+                _exit(16);
+            _exit(0);
+        }
+        int status = 0;
+        const bool waited = pid > 0 && waitpid(pid, &status, 0) == pid;
+        const bool passed = waited && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        printf("[TEST-WATERFALL-NONBLOCKING] mode=%d signal=%d exit=%d: %s\n",
+            mode, waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0,
+            waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+            passed ? "PASS" : "FAIL");
+        if (!passed) ++failures;
+    }
+    return failures;
+#endif
 }

@@ -6,6 +6,7 @@
 #ifndef WATERFALL_H_
 #define WATERFALL_H_
 
+#include <atomic>
 #include <complex>
 
 #define WATERFALL_FFT_SIZE 4096
@@ -58,16 +59,24 @@ public:
 
     /**
      * @brief Enable/disable waterfall processing
-     * @param enabled When false, pushSamples() skips FFT computation entirely
+     * @param enabled When false, pushSamples() skips the display handoff
      */
     void setEnabled(bool enabled);
 
     /**
      * @brief Check if waterfall processing is enabled
      */
-    bool isEnabled() const { return enabled_; }
+    bool isEnabled() const { return enabled_.load(std::memory_order_relaxed); }
+
+    // GUI thread: consume the bounded sample handoff and update the history.
+    void drainPending();
 
 private:
+    friend int waterfall_nonblocking_case();
+    double pending_[WATERFALL_FFT_SIZE * 2];
+    int pending_count_{0};
+    double drain_scratch_[WATERFALL_FFT_SIZE * 2];
+
     // FFT processing
     void processFFT();
     void fft(std::complex<double>* v, int n);
@@ -90,9 +99,11 @@ private:
     unsigned char* texture_data_;
     bool initialized_;
 
-    // Processing enabled flag (when false, pushSamples skips FFT)
-    bool enabled_;
+    // Processing enabled flag (when false, pushSamples skips the handoff)
+    std::atomic<bool> enabled_;
 };
+
+int waterfall_nonblocking_case();
 
 // Global waterfall - Meyer's Singleton to avoid static init order fiasco
 WaterfallDisplay& get_waterfall();

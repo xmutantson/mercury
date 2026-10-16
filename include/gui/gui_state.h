@@ -33,6 +33,7 @@ public:
     GuiMutex() { InitializeCriticalSection(&cs_); }
     ~GuiMutex() { DeleteCriticalSection(&cs_); }
     void lock() { EnterCriticalSection(&cs_); }
+    bool try_lock() { return TryEnterCriticalSection(&cs_) != 0; }
     void unlock() { LeaveCriticalSection(&cs_); }
 private:
     CRITICAL_SECTION cs_;
@@ -40,6 +41,7 @@ private:
     GuiMutex() { pthread_mutex_init(&mutex_, NULL); }
     ~GuiMutex() { pthread_mutex_destroy(&mutex_); }
     void lock() { pthread_mutex_lock(&mutex_); }
+    bool try_lock() { return pthread_mutex_trylock(&mutex_) == 0; }
     void unlock() { pthread_mutex_unlock(&mutex_); }
 private:
     pthread_mutex_t mutex_;
