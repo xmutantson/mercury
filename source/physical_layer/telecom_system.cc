@@ -1706,6 +1706,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 	                    : (preamble_amortization_enabled
 	                        ? rx_effective_preamble_nsymb()
 	                        : data_container.preamble_nSymb);
+	receive_stats.last_eff_preamble_nsymb = rx_eff_preamble;
 	// CONTINUOUS-KEYDOWN carried-timing tracker state (per receive() call). When
 	// keydown_track_timing_enabled, a tail (MINI) frame whose predict-residual is
 	// SUB-GUARD (noise regime) does NOT re-pin the FFT window to the short-preamble
@@ -1791,6 +1792,14 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			// big-block RX path (receive_bigblock) runs the SAME normalization +
 			// impulse-blanking before its estimator. Behavior here is unchanged.
 			int pb_samples = data_container.Nofdm * data_container.buffer_Nsymb * frequency_interpolation_rate;
+			// The caller's window is shared with later detectors on the same capture
+			// (BREAK/HAIL); scale and clip a private copy and decode from that copy.
+			if(pb_samples > 0 && data != NULL)
+			{
+				if((int)rx_window_scratch.size() < pb_samples) rx_window_scratch.resize((size_t)pb_samples);
+				memcpy(rx_window_scratch.data(), data, sizeof(double) * (size_t)pb_samples);
+				data = rx_window_scratch.data();
+			}
 			rx_passband_normalize_and_blank((double*)data, pb_samples);
 		}
 		// Plan-B Step 6c: the eager full-rate time_sync FIR over the WHOLE
@@ -1955,6 +1964,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					fflush(stdout);
 				}
 				rx_eff_preamble = ofdm.mfsk_matched_preamble_nsymb;
+				receive_stats.last_eff_preamble_nsymb = rx_eff_preamble;
 			}
 
 		}
@@ -2058,6 +2068,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 			if(rx_batch_predict_mode) rx_eff_preamble = 1;
 			static const int keydown_mini0_rx = []() { const char* e=std::getenv("MERCURY_KEYDOWN_MINI0"); return (e&&*e)?atoi(e):1; }();  // DEFAULT-ON: explicit =0 restores stock
 			if(rx_batch_predict_mode && keydown_mini0_rx) rx_eff_preamble = 0;   // MINI=0: zero-preamble tail frame
+			receive_stats.last_eff_preamble_nsymb = rx_eff_preamble;
 
 			if(receive_stats.ofdm_batch_active && receive_stats.ofdm_search_raw > 0)
 			{
@@ -2259,6 +2270,7 @@ st_receive_stats cl_telecom_system::receive_byte(double *data, int* out)
 					// frame it lands on is a re-anchor (TX forces FULL after any
 					// gap / loss), so expect a FULL preamble again.
 					rx_eff_preamble = data_container.preamble_nSymb;
+					receive_stats.last_eff_preamble_nsymb = rx_eff_preamble;
 					int effective_start = (ofdm_skip > signal_start_symb) ? ofdm_skip : signal_start_symb;
 					search_offset = effective_start * sym_samples;
 					search_size = buf_interp - search_offset;
@@ -14516,6 +14528,11 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 			data_container.M, data_container.Nfft, data_container.Nofdm, data_container.Nsymb,
 			data_container.preamble_nSymb, data_container.interpolation_rate);
 		data_container.publish_active_ring();   // LEAF: publishes floored buffer_Nsymb + cursor reset
+		receive_stats.ofdm_search_raw = 0;
+		receive_stats.mfsk_search_raw = 0;
+		receive_stats.ofdm_batch_active = false;
+		receive_stats.ofdm_drift_per_frame = 0.0;
+		receive_stats.delay_of_last_decoded_message = -1;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 		return;
 	}
@@ -14556,6 +14573,11 @@ void cl_telecom_system::force_resize_capture_ring(int min_nsymb)
 	regenerate_bit_energy_dispersal_sequence();
 	data_container.ring_write_index = 0;
 	data_container.data_ready = 0;
+	receive_stats.ofdm_search_raw = 0;
+	receive_stats.mfsk_search_raw = 0;
+	receive_stats.ofdm_batch_active = false;
+	receive_stats.ofdm_drift_per_frame = 0.0;
+	receive_stats.delay_of_last_decoded_message = -1;
 	MUTEX_UNLOCK(&capture_prep_mutex);
 }
 
@@ -14598,6 +14620,11 @@ void cl_telecom_system::force_set_capture_ring_natural()
 			data_container.M, data_container.Nfft, data_container.Nofdm, data_container.Nsymb,
 			data_container.preamble_nSymb, data_container.interpolation_rate);
 		data_container.publish_active_ring();   // LEAF: publishes natural buffer_Nsymb + cursor reset
+		receive_stats.ofdm_search_raw = 0;
+		receive_stats.mfsk_search_raw = 0;
+		receive_stats.ofdm_batch_active = false;
+		receive_stats.ofdm_drift_per_frame = 0.0;
+		receive_stats.delay_of_last_decoded_message = -1;
 		MUTEX_UNLOCK(&capture_prep_mutex);
 		return;
 	}
@@ -14672,6 +14699,11 @@ void cl_telecom_system::force_set_capture_ring_natural()
 	  } }
 	data_container.ring_write_index = 0;
 	data_container.data_ready = 0;
+	receive_stats.ofdm_search_raw = 0;
+	receive_stats.mfsk_search_raw = 0;
+	receive_stats.ofdm_batch_active = false;
+	receive_stats.ofdm_drift_per_frame = 0.0;
+	receive_stats.delay_of_last_decoded_message = -1;
 	MUTEX_UNLOCK(&capture_prep_mutex);
 }
 
