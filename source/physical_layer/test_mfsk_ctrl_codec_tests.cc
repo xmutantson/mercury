@@ -3123,9 +3123,14 @@ static void test_mfsk_ctrl_suffix_mini_moose_recovers_cfo() {
 	double sigma_pb = 0.5 * rms;
 	const double cfo_inject = 7.0; // Hz, inside capture range
 
+	// detected = seeds whose capture the initial detector found; hits = seeds
+	// whose estimate is within tolerance. Both are printed with their
+	// denominators: a detector miss used to be skipped without a count.
+	const int n_seeds = 5;
+	int detected = 0;
 	int hits = 0;
 	double last_est = 0.0;
-	for (int seed = 1; seed <= 5; seed++) {
+	for (int seed = 1; seed <= n_seeds; seed++) {
 		cl_telecom_system ts;
 		std::mt19937 rng((uint32_t)(0x10580001u + seed));
 		std::vector<double> pb;
@@ -3141,9 +3146,12 @@ static void test_mfsk_ctrl_suffix_mini_moose_recovers_cfo() {
 		double metric = 0.0;
 		std::vector<std::complex<double> > bb;
 		if (!run_initial_ack_detect(ts, pb, best_offset, matched, metric, bb)) {
-			// Detector miss — skip this seed (not testing detector robustness).
+			// Detector miss: counted, and a miss fails the test below. At
+			// sigma = 0.5*rms every seed must be detected; a miss here is a
+			// detector finding, not an estimator one.
 			continue;
 		}
+		detected++;
 		double carrier_freq_width = ts.bandwidth / (double)ts.data_container.Nc;
 		double est = ts.ofdm.carrier_frequency_sync_wb_ctrl(
 			bb.data(),
@@ -3159,12 +3167,23 @@ static void test_mfsk_ctrl_suffix_mini_moose_recovers_cfo() {
 		// (§23.11.1). So for cfo_inject = +7 Hz, expected est ≈ -7 Hz.
 		if (std::fabs(est - (-cfo_inject)) < 1.5) hits++;
 	}
+	printf("    %s: detect=%d/%d est_ok=%d/%d last_est=%.3f Hz\n",
+		name, detected, n_seeds, hits, detected, last_est);
+	if (detected < n_seeds) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf),
+			"detect=%d/%d: the initial detector missed a capture at sigma=0.5*rms "
+			"(a detector finding; the estimator was not exercised on the missed seeds)",
+			detected, n_seeds);
+		test_fail(name, buf);
+		return;
+	}
 	if (hits < 3) {
 		char buf[256];
 		std::snprintf(buf, sizeof(buf),
-			"hits=%d/5 last_est=%.3f Hz expected≈%.1f Hz (±1.5; "
+			"est_ok=%d/%d last_est=%.3f Hz expected≈%.1f Hz (±1.5; "
 			"sign-flipped per §23.11.1)",
-			hits, last_est, -cfo_inject);
+			hits, detected, last_est, -cfo_inject);
 		test_fail(name, buf);
 		return;
 	}
