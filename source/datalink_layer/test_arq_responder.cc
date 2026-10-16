@@ -7355,6 +7355,160 @@ int cl_arq_controller::test_connect_reack()
 	CHECK("C9 replay budget bounds an unconfirmed peer",
 		!connect_reack_pre_data_window());
 
+	// Drive the production request consumer with a live, post-data session.
+	const char* old_block = std::getenv("MERCURY_L1_BLOCKACK");
+	const bool had_block = old_block != nullptr;
+	const std::string saved_block = old_block ? old_block : "";
+	setenv("MERCURY_L1_BLOCKACK", "1", 1);
+	const char* old_timing = std::getenv("MERCURY_T1_SCHEDKEY");
+	const bool had_timing = old_timing != nullptr;
+	const std::string saved_timing = old_timing ? old_timing : "";
+	for(int row=0; row<12; ++row)
+	{
+		setenv("MERCURY_T1_SCHEDKEY", row < 6 ? "1" : "0", 1);
+		cl_telecom_system wire;
+		cl_arq_controller rsp;
+		rsp.telecom_system = &wire;
+		rsp.current_configuration = CONFIG_NONE;
+		rsp.load_configuration(CONFIG_1, FULL, YES);
+		rsp.fifo_buffer_rx.set_size(8192);
+		rsp.fifo_buffer_tx.set_size(8192);
+		rsp.fifo_buffer_backup.set_size(8192);
+		rsp.role = RESPONDER;
+		rsp.link_status = CONNECTED;
+		rsp.connection_status = RECEIVING;
+		rsp.passive_monitor = row % 6 >= 3;
+		rsp.local_capability = CAP_WB_CAPABLE | CAP_CUMULATIVE_ACK | CAP_L1_BLOCKACK;
+		rsp.peer_capability = rsp.local_capability;
+		rsp.l1_blockack.begin_session(37, 413, 2, 9);
+		rsp.l1_blockack.complete_handshake(rsp.local_capability, rsp.peer_capability, true);
+		rsp.l1_blockack.note_transmitted_batch(93);
+		rsp.connection_id = rsp.assigned_connection_id = 37;
+		rsp.session_data_frame_received = true;
+		rsp.rsp_stream_origin_gen = 91;
+		rsp.settled_close_cache.valid = true;
+		rsp.settled_close_cache.replays = 2;
+		rsp.responder_terminal_hold_timer.start();
+		rsp.connect_ack_cache.valid = true;
+		rsp.connect_ack_cache.replays = 2;
+		rsp.connect_ack_cache.echoed_cap = 19;
+		rsp.connect_ack_cache.own_cap = 23;
+		rsp.sack_enabled = rsp.sack_v2_enabled = true;
+		rsp.cumulative_ack_enabled = true;
+		rsp.data_batch_size = 7;
+		rsp.ack_timeout_data = 12345;
+		rsp.t1_peer_calibration_valid = true;
+		rsp.t1_peer_keyup_ms = 41;
+		rsp.t1_peer_deaf_ms = 52;
+		rsp.t1_peer_undeaf_ms = 63;
+		rsp.t1_data_phase_proven = true;
+		rsp.t1_note_term_sample(T1_DIR_REV, T1_KEYUP, 77);
+		const auto term = rsp.t1_term_est[T1_DIR_REV][T1_KEYUP];
+		rsp.b2f_handler.init();
+		rsp.b2f_handler.unroll_enabled = false;
+		rsp.compressor.set_dict_priming(false);
+		rsp.compressor.init();
+		rsp.compressor.streaming_enable();
+		cl_compressor encoder;
+		encoder.set_dict_priming(false);
+		encoder.init();
+		encoder.streaming_enable();
+		std::vector<char> raw(2048), packed(8192), unpacked(8192);
+		for(int i=0; i<(int)raw.size(); ++i)
+			raw[i] = (char)('A' + ((i * 17 + row * 13 + i / 29) % 23));
+		auto exact_block = [&]() {
+			int n = encoder.compress_block(raw.data(), raw.size(), packed.data(), packed.size());
+			int k = n > 0 ? rsp.compressor.decompress_block(packed.data(), n, unpacked.data(), unpacked.size()) : -1;
+			bool exact = k == (int)raw.size() && memcmp(raw.data(), unpacked.data(), raw.size()) == 0;
+			if(exact) encoder.commit_pending();
+			return exact;
+		};
+		auto verify = [&](bool ok, const char* name) {
+			printf("[TEST-ESTABLISHED-REQUEST] row=%d %s: %s\n", row, ok ? "PASS" : "FAIL", name);
+			if(!ok) ++failed;
+		};
+		static std::vector<char> delivered;
+		delivered.clear();
+		auto saved_hook = cl_tcp_socket::g_test_transmit_hook;
+		cl_tcp_socket::g_test_transmit_hook = [](const char* data, int size) -> int {
+			delivered.insert(delivered.end(), data, data + size);
+			return size;
+		};
+		verify(exact_block(), "keyed warm decoder block is exact");
+		verify(rsp.rx_deliver_send(unpacked.data(), raw.size()), "warm block reaches application handoff");
+		rsp.messages_control.status = RECEIVED;
+		memset(rsp.messages_control.data, 0, N_MAX/8);
+		rsp.messages_control.data[0] = TEST_CONNECTION;
+		u_SNR measured; measured.f_SNR = 11;
+		memcpy(&rsp.messages_control.data[1], measured.char4_SNR, 4);
+		rsp.messages_control.data[5] = 0;
+		rsp.messages_control.data[6] = SSID_NONE;
+		rsp.messages_control.length = row % 3 == 0 ? 7 : 12;
+		rsp.t1_calibration_encode(&rsp.messages_control.data[7], 80, 90, 100);
+		if(row % 3 == 2) rsp.messages_control.data[7] = 0;
+		rsp.process_control_responder();
+		verify(rsp.link_status == CONNECTED && rsp.connection_status ==
+			(rsp.passive_monitor ? RECEIVING : ACKNOWLEDGING_CONTROL), "existing request completion selected");
+		verify(rsp.peer_capability == rsp.local_capability && rsp.cumulative_ack_enabled
+			&& rsp.sack_enabled && rsp.sack_v2_enabled, "established negotiation preserved");
+		verify(rsp.l1_blockack.enabled() && rsp.l1_blockack.intermediate_silence_expected(), "pending BlockACK group preserved");
+		verify(rsp.rsp_stream_origin_gen == 91 && rsp.connection_id == 37
+			&& rsp.assigned_connection_id == 37 && rsp.session_data_frame_received,
+			"stream origin and session identity preserved");
+		verify(rsp.settled_close_cache.valid && rsp.settled_close_cache.replays == 2
+			&& rsp.responder_terminal_hold_timer.counting, "terminal hold preserved");
+		verify(rsp.connect_ack_cache.valid && rsp.connect_ack_cache.replays == 2
+			&& rsp.connect_ack_cache.echoed_cap == 19 && rsp.connect_ack_cache.own_cap == 23
+			&& !rsp.connect_reack_pre_data_window(), "post-data receipt cannot rearm replay budget");
+		verify(rsp.data_batch_size == 7 && rsp.ack_timeout_data == 12345, "batch and recovery deadline preserved");
+		const bool refreshed = row < 6 && row % 3 == 1;
+		printf("[TEST-ESTABLISHED-REQUEST-STATE] row=%d wire=%d peer=%d/%d/%d term_n=%d/%d\n",
+			row, row < 6, rsp.t1_peer_keyup_ms, rsp.t1_peer_deaf_ms,
+			rsp.t1_peer_undeaf_ms, rsp.t1_term_est[T1_DIR_REV][T1_KEYUP].n, term.n);
+		verify(rsp.t1_peer_keyup_ms == (refreshed ? 80 : 41)
+			&& rsp.t1_peer_deaf_ms == (refreshed ? 90 : 52)
+			&& rsp.t1_peer_undeaf_ms == (refreshed ? 100 : 63)
+			&& rsp.t1_term_est[T1_DIR_REV][T1_KEYUP].n == term.n
+			&& rsp.t1_term_est[T1_DIR_REV][T1_KEYUP].srtt_ms == term.srtt_ms
+			&& rsp.t1_data_phase_proven, "only valid measured timing refreshes");
+		verify(rsp.measurements.SNR_uplink == 11 && rsp.link_timer.counting
+			&& rsp.watchdog_timer.counting, "ordinary measurement and activity retained");
+		const bool continued = exact_block();
+		verify(continued, "keyed decoder continuation remains exact");
+		verify(rsp.rx_deliver_send(unpacked.data(), raw.size()) && delivered.size() == 2 * raw.size()
+			&& memcmp(delivered.data(), raw.data(), raw.size()) == 0
+			&& memcmp(delivered.data() + raw.size(), raw.data(), raw.size()) == 0,
+			"keyed application handoff is byte exact across request");
+		cl_tcp_socket::g_test_transmit_hook = saved_hook;
+		verify(!rsp.b2f_handler.unroll_enabled, "established B2F policy preserved");
+		verify(rsp.passive_monitor ? rsp.messages_control.status == FREE
+			: rsp.messages_control.data[0] == TEST_CONNECTION_ACK
+			&& (uint8_t)rsp.messages_control.data[1] == rsp.peer_capability
+			&& (uint8_t)rsp.messages_control.data[2] == rsp.local_capability,
+			"passive suppression or established-capability reply retained");
+		if(row == 0)
+		{
+			// The new-session arm must still initialize origin, negotiation and caches.
+			rsp.link_status = CONNECTION_RECEIVED;
+			rsp.messages_control.status = RECEIVED;
+			memset(rsp.messages_control.data, 0, N_MAX/8);
+			rsp.messages_control.data[0] = TEST_CONNECTION;
+			rsp.messages_control.data[6] = SSID_NONE;
+			rsp.messages_control.length = 7;
+			rsp.process_control_responder();
+			verify(rsp.link_status == CONNECTED && rsp.rsp_stream_origin_gen == 0
+				&& !rsp.settled_close_cache.valid && !rsp.responder_terminal_hold_timer.counting
+				&& rsp.peer_capability == 0 && rsp.b2f_handler.unroll_enabled
+				&& rsp.connect_ack_cache.valid && rsp.connect_ack_cache.replays == 0,
+				"first handshake still initializes the new session");
+		}
+
+	}
+	if(had_timing) setenv("MERCURY_T1_SCHEDKEY", saved_timing.c_str(), 1);
+	else unsetenv("MERCURY_T1_SCHEDKEY");
+	if(had_block) setenv("MERCURY_L1_BLOCKACK", saved_block.c_str(), 1);
+	else unsetenv("MERCURY_L1_BLOCKACK");
+
 	telecom_system = NULL;
 
 	printf("[TEST-REACK] %s (%d failures)\n",

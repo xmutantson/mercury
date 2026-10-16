@@ -4218,6 +4218,7 @@ void cl_arq_controller::process_control_responder()
 	}
 	else if((link_status==CONNECTION_RECEIVED || link_status==CONNECTED) && code==TEST_CONNECTION)
 	{
+		const bool established = link_status == CONNECTED;
 		u_SNR tmp_SNR;
 		for(int i=0;i<4;i++)
 		{
@@ -4225,10 +4226,6 @@ void cl_arq_controller::process_control_responder()
 		}
 		measurements.SNR_uplink=quantize_snr_decision_db((double)tmp_SNR.f_SNR);
 
-		// Read commander's capability from byte 5 of decoded LDPC frame.
-		// Always present (LDPC decodes full block; unused bytes are zero-padded).
-		// Backwards-compatible: old firmware doesn't fill byte 5 → decodes as 0 = no WB.
-		peer_capability = (uint8_t)messages_control.data[5];
 		int t1_pk = -1, t1_pd = -1, t1_pu = -1;
 		bool t1_ldpc_calibration = messages_control.length >= 12
 			&& t1_calibration_decode(
@@ -4243,146 +4240,155 @@ void cl_arq_controller::process_control_responder()
 				t1_pk, t1_pd, t1_pu);
 			fflush(stdout);
 		}
-		printf("[BW-NEG] Commander capability: 0x%02X (WB=%s, ENCRYPT=%s)\n",
-			peer_capability,
-			(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",
-			(peer_capability & CAP_ENCRYPTION) ? "yes" : "no");
-		fflush(stdout);
-		// NB robust-preamble negotiation: the commander's advertise just arrived.
-		// From here on this responder may emit the sidelnikov robust preamble
-		// (both-support), starting with the TEST_CONNECTION_ACK it queues below
-		// on robust configs — the commander's RX runs detect-both either way.
-		update_robust_preamble_negotiation();
-		// The decoded TEST_CONNECTION is the authenticated peer capability
-		// proof on the responder. Stage-3 still requires both advertised bits.
-		l1_complete_blockack_handshake(true);
-
-		// Read commander's SSID from byte 6 (sent separately from packed callsign)
+		// Established control refreshes measurements without negotiating a new session.
+		if(!established)
 		{
-			int peer_ssid = (uint8_t)messages_control.data[6];
-			if(peer_ssid != SSID_NONE)
+			// Read commander's capability from byte 5 of decoded LDPC frame.
+			// Always present (LDPC decodes full block; unused bytes are zero-padded).
+			// Backwards-compatible: old firmware doesn't fill byte 5 → decodes as 0 = no WB.
+			peer_capability = (uint8_t)messages_control.data[5];
+			printf("[BW-NEG] Commander capability: 0x%02X (WB=%s, ENCRYPT=%s)\n",
+				peer_capability,
+				(peer_capability & CAP_WB_CAPABLE) ? "yes" : "no",
+				(peer_capability & CAP_ENCRYPTION) ? "yes" : "no");
+			fflush(stdout);
+			// NB robust-preamble negotiation: the commander's advertise just arrived.
+			// From here on this responder may emit the sidelnikov robust preamble
+			// (both-support), starting with the TEST_CONNECTION_ACK it queues below
+			// on robust configs — the commander's RX runs detect-both either way.
+			update_robust_preamble_negotiation();
+			// The decoded TEST_CONNECTION is the authenticated peer capability
+			// proof on the responder. Stage-3 still requires both advertised bits.
+			l1_complete_blockack_handshake(true);
+
+			// Read commander's SSID from byte 6 (sent separately from packed callsign)
 			{
-				destination_call_sign = callsign_format_ssid(destination_call_sign, peer_ssid);
-				printf("[SSID] Commander SSID=%d, full callsign: '%s'\n", peer_ssid, destination_call_sign.c_str());
+				int peer_ssid = (uint8_t)messages_control.data[6];
+				if(peer_ssid != SSID_NONE)
+				{
+					destination_call_sign = callsign_format_ssid(destination_call_sign, peer_ssid);
+					printf("[SSID] Commander SSID=%d, full callsign: '%s'\n", peer_ssid, destination_call_sign.c_str());
+				}
+				else
+				{
+					printf("[SSID] Commander has no SSID, callsign: '%s'\n", destination_call_sign.c_str());
+				}
+				fflush(stdout);
+			}
+
+			// Compression is unconditional (CAP_COMPRESSION removed; -F off opts out).
+			if(force_compress)
+			{
+				compression_enabled = true;
+				compressor.init();
+				printf("[COMPRESS] Force-enabled (--compress flag)\n");
+				fflush(stdout);
 			}
 			else
 			{
-				printf("[SSID] Commander has no SSID, callsign: '%s'\n", destination_call_sign.c_str());
-			}
-			fflush(stdout);
-		}
-
-		// Compression is unconditional (CAP_COMPRESSION removed; -F off opts out).
-		if(force_compress)
-		{
-			compression_enabled = true;
-			compressor.init();
-			printf("[COMPRESS] Force-enabled (--compress flag)\n");
-			fflush(stdout);
-		}
-		else
-		{
-			compressor.init();  // Pre-init contexts, arm later on B2F detection
-			printf("[COMPRESS] Deferred (waiting for B2F detection)\n");
-			fflush(stdout);
-		}
-
-		// B2F handler: init for Winlink LZHUF unroll/reroll.
-		// CAP_B2F_UNROLL removed — always on.
-		b2f_handler.init();
-		b2f_handler.unroll_enabled = true;
-
-		// Encryption negotiation (FAIL-CLOSED; single source of truth in
-		// decide_encryption_negotiation()). DEFAULT-OFF is preserved: when the
-		// operator did not opt in the decision is PLAINTEXT_OK and this block is a
-		// no-op, so legal Part-97 plaintext operation is unchanged.
-		{
-			enc_negotiation_outcome_t enc_dec = decide_encryption_negotiation(
-				encryption_mode, local_capability, peer_capability);
-			if (enc_dec == ENC_NEG_ENABLED)
-			{
-				encryption_enabled = true;
-				// Encryption requires batch-level assembly (compression path)
-				if (!compression_enabled)
-				{
-					compression_enabled = true;
-					printf("[CRYPTO] Forced compression ON (required for batch encryption)\n");
-				}
-				printf("[CRYPTO] Encryption negotiated (%s mode), key exchange after turboshift\n",
-					encryption_mode == ENCRYPT_STRICT ? "SNDL-safe" : "classical-first");
-			}
-			else if (enc_dec == ENC_NEG_REFUSE)
-			{
-				// Commander opted into -E but this responder does not advertise
-				// CAP_ENCRYPTION to it (unsupported, or a MITM stripped the cap bit
-				// to force a plaintext downgrade). Fail closed for BOTH strict and
-				// fast: refuse rather than deliver plaintext under an -E opt-in.
-				printf("[CRYPTO] %s mode: peer lacks encryption — refusing connection (fail-closed, no plaintext downgrade)\n",
-					encryption_mode == ENCRYPT_STRICT ? "STRICT" : "FAST");
+				compressor.init();  // Pre-init contexts, arm later on B2F detection
+				printf("[COMPRESS] Deferred (waiting for B2F detection)\n");
 				fflush(stdout);
-				const char* err_msg = "ENCRYPTION FAILURE PEER UNSUPPORTED\r";
-				int elen = (int)strlen(err_msg);
-				for(int e=0; e<elen; e++)
-					tcp_socket_control.message->buffer[e] = err_msg[e];
-				tcp_socket_control.message->length = elen;
-				tcp_socket_control.transmit();
-				this->link_status = DROPPED;
-				reset_session_state();
-				return;
 			}
-			// ENC_NEG_PLAINTEXT_OK: operator did not opt in — plaintext ops (legal default-off).
-		}
 
-		// FORGIVING-ACK Tier 2 negotiation (fact-documents/data-flow-forgiving-ack.md
-		// §T2.1): the cumulative-n_r SACK reshape engages ONLY when BOTH ends advertise
-		// CAP_CUMULATIVE_ACK (the local advertise is itself env-gated by
-		// MERCURY_CUMULATIVE_ACK, so default-off ≡ both_support false ≡ per-batch +
-		// byte-identical). SAME both_support pattern as encryption above. Interop-safe:
-		// a non-Tier-2 commander leaves bit 2 clear → cumulative_ack_enabled false →
-		// per-batch fallback on the RSP send AND the CMD apply.
-		cumulative_ack_enabled = (local_capability & CAP_CUMULATIVE_ACK)
-		                      && (peer_capability  & CAP_CUMULATIVE_ACK);
-		printf("[FORGIVING-ACK-T2] cumulative-n_r SACK %s (local_cap=0x%02X peer_cap=0x%02X)\n",
-			cumulative_ack_enabled ? "NEGOTIATED" : "off",
-			(unsigned)local_capability, (unsigned)peer_capability);
-		fflush(stdout);
+			// B2F handler: init for Winlink LZHUF unroll/reroll.
+			// CAP_B2F_UNROLL removed — always on.
+			b2f_handler.init();
+			b2f_handler.unroll_enabled = true;
 
-		// Streaming compression is unconditional (CAP_STREAMING removed).
-		// Still requires compression to be on; -F off disables both.
-		if(compression_enabled)
-		{
-			compressor.streaming_enable();
-		}
+			// Encryption negotiation (FAIL-CLOSED; single source of truth in
+			// decide_encryption_negotiation()). DEFAULT-OFF is preserved: when the
+			// operator did not opt in the decision is PLAINTEXT_OK and this block is a
+			// no-op, so legal Part-97 plaintext operation is unchanged.
+			{
+				enc_negotiation_outcome_t enc_dec = decide_encryption_negotiation(
+					encryption_mode, local_capability, peer_capability);
+				if (enc_dec == ENC_NEG_ENABLED)
+				{
+					encryption_enabled = true;
+					// Encryption requires batch-level assembly (compression path)
+					if (!compression_enabled)
+					{
+						compression_enabled = true;
+						printf("[CRYPTO] Forced compression ON (required for batch encryption)\n");
+					}
+					printf("[CRYPTO] Encryption negotiated (%s mode), key exchange after turboshift\n",
+						encryption_mode == ENCRYPT_STRICT ? "SNDL-safe" : "classical-first");
+				}
+				else if (enc_dec == ENC_NEG_REFUSE)
+				{
+					// Commander opted into -E but this responder does not advertise
+					// CAP_ENCRYPTION to it (unsupported, or a MITM stripped the cap bit
+					// to force a plaintext downgrade). Fail closed for BOTH strict and
+					// fast: refuse rather than deliver plaintext under an -E opt-in.
+					printf("[CRYPTO] %s mode: peer lacks encryption — refusing connection (fail-closed, no plaintext downgrade)\n",
+						encryption_mode == ENCRYPT_STRICT ? "STRICT" : "FAST");
+					fflush(stdout);
+					const char* err_msg = "ENCRYPTION FAILURE PEER UNSUPPORTED\r";
+					int elen = (int)strlen(err_msg);
+					for(int e=0; e<elen; e++)
+						tcp_socket_control.message->buffer[e] = err_msg[e];
+					tcp_socket_control.message->length = elen;
+					tcp_socket_control.transmit();
+					this->link_status = DROPPED;
+					reset_session_state();
+					return;
+				}
+				// ENC_NEG_PLAINTEXT_OK: operator did not opt in — plaintext ops (legal default-off).
+			}
 
-		// SACK / SACK_V2 are unconditional (CAP_SACK + CAP_SACK_V2 removed).
-		// --no-sack still flips disable_sack which takes sack_enabled offline.
-		sack_enabled = !disable_sack;
-		sack_v2_enabled = sack_enabled;
-		if(sack_enabled)
-		{
-			// Update batch size now that SACK is negotiated. 30s target
-			// matches the formula in arq_common.cc + arq_commander.cc.
-			//
-			// climb-engine Bug 2 (gearshift-climb-engine.md §3): MUST mirror the
-			// commander gate (arq_commander.cc SACK block) so CMD and RSP agree on
-			// data_batch_size for the negotiated config. ROBUST/MFSK configs are
-			// EXCLUDED from the >=5 floor — load_configuration() (arq_common.cc:
-			// 1229-1234) pins data_batch_size=1 for robust; re-applying the floor
-			// here would force RSP to batch>=5 while CMD stays at 1, a CMD/RSP
-			// batch mismatch. The responder gates on current_configuration (== the
-			// established connect config at TEST_CONNECTION time, == ROBUST_0 for a
-			// robust connect, < 100 for OFDM). OFDM keeps the >=5 floor unchanged.
-			// Shared with the CMD TEST_CONNECTION_ACK handler so both sides run
-			// IDENTICAL code and cannot diverge on data_batch_size (the 4-time
-			// wire-failure mode). Gates on current_configuration. See
-			// data-flow-batch-size.md §5 and the helper in arq_common.cc.
-			sack_negotiated_recompute_batch("RSP");
+			// FORGIVING-ACK Tier 2 negotiation (fact-documents/data-flow-forgiving-ack.md
+			// §T2.1): the cumulative-n_r SACK reshape engages ONLY when BOTH ends advertise
+			// CAP_CUMULATIVE_ACK (the local advertise is itself env-gated by
+			// MERCURY_CUMULATIVE_ACK, so default-off ≡ both_support false ≡ per-batch +
+			// byte-identical). SAME both_support pattern as encryption above. Interop-safe:
+			// a non-Tier-2 commander leaves bit 2 clear → cumulative_ack_enabled false →
+			// per-batch fallback on the RSP send AND the CMD apply.
+			cumulative_ack_enabled = (local_capability & CAP_CUMULATIVE_ACK)
+			                      && (peer_capability  & CAP_CUMULATIVE_ACK);
+			printf("[FORGIVING-ACK-T2] cumulative-n_r SACK %s (local_cap=0x%02X peer_cap=0x%02X)\n",
+				cumulative_ack_enabled ? "NEGOTIATED" : "off",
+				(unsigned)local_capability, (unsigned)peer_capability);
+			fflush(stdout);
+
+			// Streaming compression is unconditional (CAP_STREAMING removed).
+			// Still requires compression to be on; -F off disables both.
+			if(compression_enabled)
+			{
+				compressor.streaming_enable();
+			}
+
+			// SACK / SACK_V2 are unconditional (CAP_SACK + CAP_SACK_V2 removed).
+			// --no-sack still flips disable_sack which takes sack_enabled offline.
+			sack_enabled = !disable_sack;
+			sack_v2_enabled = sack_enabled;
+			if(sack_enabled)
+			{
+				// Update batch size now that SACK is negotiated. 30s target
+				// matches the formula in arq_common.cc + arq_commander.cc.
+				//
+				// climb-engine Bug 2 (gearshift-climb-engine.md §3): MUST mirror the
+				// commander gate (arq_commander.cc SACK block) so CMD and RSP agree on
+				// data_batch_size for the negotiated config. ROBUST/MFSK configs are
+				// EXCLUDED from the >=5 floor — load_configuration() (arq_common.cc:
+				// 1229-1234) pins data_batch_size=1 for robust; re-applying the floor
+				// here would force RSP to batch>=5 while CMD stays at 1, a CMD/RSP
+				// batch mismatch. The responder gates on current_configuration (== the
+				// established connect config at TEST_CONNECTION time, == ROBUST_0 for a
+				// robust connect, < 100 for OFDM). OFDM keeps the >=5 floor unchanged.
+				// Shared with the CMD TEST_CONNECTION_ACK handler so both sides run
+				// IDENTICAL code and cannot diverge on data_batch_size (the 4-time
+				// wire-failure mode). Gates on current_configuration. See
+				// data-flow-batch-size.md §5 and the helper in arq_common.cc.
+				sack_negotiated_recompute_batch("RSP");
+			}
+			else
+			{
+				printf("[SACK] Disabled by --no-sack\n");
+			}
+			fflush(stdout);
+
 		}
-		else
-		{
-			printf("[SACK] Disabled by --no-sack\n");
-		}
-		fflush(stdout);
 
 		tmp_SNR.f_SNR=(float)measurements.SNR_downlink;
 		for(int i=0;i<4;i++)
@@ -4408,61 +4414,65 @@ void cl_arq_controller::process_control_responder()
 			pending_emitted=false;
 		}
 
-		link_status=CONNECTED;
-		// Arm the authenticated stream ORIGIN generation at the RSP connect-accept
-		// (data-flow-rx-fadecore-adoption.md). A freshly accepted session begins its
-		// first user-data batch at wire bsi 0, so the offset-0 delivery gate now
-		// admits ONLY bsi 0 as the legal stream origin on this session (plaintext and
-		// the universal case). kx_stream_reanchor re-arms on an authenticated re-key;
-		// reset_session_state disarms on a session boundary, so unconnected / direct
-		// funnel-poke states keep legacy (unarmed, byte-identical) behavior.
-		rsp_stream_origin_gen = 0;
-		// T1c CONNECT-TIME CALIBRATION BOOTSTRAP (SPEC T1 s2): warm the learned turnaround timing
-		// terms at the RSP connect-accept so the reverse-ACK scheduled pre-key is not inert on the
-		// live path. Local-only (no wire frame, no added round-trip) and run AFTER the session is
-		// accepted, so it can never delay or fail a connect; wire-byte-identical with the
-		// MERCURY_T1_SCHEDKEY lever off. The peer-measured keyup refinement is the HELD wire exchange.
-		t1_seed_calibration_defaults();
-				settled_close_cache.valid = false;  // session-start disarm (never re-ACK a stale descriptor)
-				responder_terminal_hold_timer.stop();
-				responder_terminal_hold_timer.reset();
-		if(connect_fast_active)
+		if(!established)
 		{
-			robust_enabled = connect_fast_fallback_robust;
-			init_configuration = connect_fast_fallback_config;
-			data_configuration = connect_fast_fallback_config;
-			ack_configuration  = connect_fast_fallback_config;
-			last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
-			connect_fast_active = false;
-			connect_fast_timer.stop();
-			connect_fast_timer.reset();
-		}
-#ifdef MERCURY_GUI_ENABLED
-		if(passive_monitor)
-		{
-			// Monitor: don't use my_call_sign as responder (it's the monitor's own)
-			// Keep "???" from START_CONNECTION, just log the event
-			gui_push_monitor_event("[TEST_CONNECTION observed]", false);
-		}
-		else
-		{
-			gui_set_monitor_callsigns(this->destination_call_sign.c_str(),
-			                          this->my_call_sign.c_str());
+			link_status=CONNECTED;
+			// Arm the authenticated stream ORIGIN generation at the RSP connect-accept
+			// (data-flow-rx-fadecore-adoption.md). A freshly accepted session begins its
+			// first user-data batch at wire bsi 0, so the offset-0 delivery gate now
+			// admits ONLY bsi 0 as the legal stream origin on this session (plaintext and
+			// the universal case). kx_stream_reanchor re-arms on an authenticated re-key;
+			// reset_session_state disarms on a session boundary, so unconnected / direct
+			// funnel-poke states keep legacy (unarmed, byte-identical) behavior.
+			rsp_stream_origin_gen = 0;
+			// T1c CONNECT-TIME CALIBRATION BOOTSTRAP (SPEC T1 s2): warm the learned turnaround timing
+			// terms at the RSP connect-accept so the reverse-ACK scheduled pre-key is not inert on the
+			// live path. Local-only (no wire frame, no added round-trip) and run AFTER the session is
+			// accepted, so it can never delay or fail a connect; wire-byte-identical with the
+			// MERCURY_T1_SCHEDKEY lever off. The peer-measured keyup refinement is the HELD wire exchange.
+			t1_seed_calibration_defaults();
+					settled_close_cache.valid = false;  // session-start disarm (never re-ACK a stale descriptor)
+					responder_terminal_hold_timer.stop();
+					responder_terminal_hold_timer.reset();
+			if(connect_fast_active)
 			{
-				char buf[128];
-				snprintf(buf, sizeof(buf), "[CONNECTED %s <-> %s]",
-				         this->destination_call_sign.c_str(),
-				         this->my_call_sign.c_str());
-				gui_push_monitor_event(buf, false);
+				robust_enabled = connect_fast_fallback_robust;
+				init_configuration = connect_fast_fallback_config;
+				data_configuration = connect_fast_fallback_config;
+				ack_configuration  = connect_fast_fallback_config;
+				last_data_viable_config = session_floor_anchor(robust_enabled, init_configuration);
+				connect_fast_active = false;
+				connect_fast_timer.stop();
+				connect_fast_timer.reset();
 			}
-		}
+#ifdef MERCURY_GUI_ENABLED
+			if(passive_monitor)
+			{
+				// Monitor: don't use my_call_sign as responder (it's the monitor's own)
+				// Keep "???" from START_CONNECTION, just log the event
+				gui_push_monitor_event("[TEST_CONNECTION observed]", false);
+			}
+			else
+			{
+				gui_set_monitor_callsigns(this->destination_call_sign.c_str(),
+				                          this->my_call_sign.c_str());
+				{
+					char buf[128];
+					snprintf(buf, sizeof(buf), "[CONNECTED %s <-> %s]",
+					         this->destination_call_sign.c_str(),
+					         this->my_call_sign.c_str());
+					gui_push_monitor_event(buf, false);
+				}
+			}
 #endif
+		}
+
 		if(passive_monitor)
 		{
 			// Monitor: skip ACK, go directly to RECEIVING
 			messages_control.status = FREE;
 			connection_status = RECEIVING;
-			calculate_receiving_timeout();
+			if(!established) calculate_receiving_timeout();
 			receiving_timer.start();
 		}
 		else
@@ -4491,11 +4501,15 @@ void cl_arq_controller::process_control_responder()
 				(unsigned char)local_capability,
 				(unsigned char)messages_control.data[3]);
 			fflush(stdout);
-			connect_ack_cache.valid = true;
-			connect_ack_cache.echoed_cap = (uint8_t)peer_capability;
-			connect_ack_cache.own_cap = (uint8_t)local_capability;
-			connect_ack_cache.ssid = (uint8_t)callsign_get_ssid(my_call_sign);
-			connect_ack_cache.replays = 0;
+			if(!established)
+			{
+				connect_ack_cache.valid = true;
+				connect_ack_cache.echoed_cap = (uint8_t)peer_capability;
+				connect_ack_cache.own_cap = (uint8_t)local_capability;
+				connect_ack_cache.ssid = (uint8_t)callsign_get_ssid(my_call_sign);
+				connect_ack_cache.replays = 0;
+			}
+
 		}
 		watchdog_timer.start();
 		link_timer.start();
