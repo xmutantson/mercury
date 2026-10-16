@@ -8318,9 +8318,14 @@ static void test_break_fh_gate() {
 			return;
 		}
 
-		// D1: the measured ALIAS metric ceiling (~1.23, two independent reproductions) must
-		//     fall BELOW the floor (alias rejected); the CLEAN real BREAK must stay ABOVE it.
-		const double ALIAS_METRIC_CEILING = 1.23;   // worst gated alias metric observed
+		// D1: the measured ALIAS metric ceiling must fall BELOW the floor (alias rejected);
+		//     the CLEAN real BREAK must stay ABOVE it. The constant is a recorded
+		//     measurement, not derived here: --test-break-alias on 95723953fb (build
+		//     9572395, bin md5 ab4c2f7a8a61cc9eaa3c90ad36ace2f7, 2026-09-25; 10 WB
+		//     configs x 21 Es/N0 points x 80 trials, 16800 polls) reported
+		//     alias_metric_ceiling=1.370 with det_new=0. Only the full alias sweep owns
+		//     this measurement; a short CONFIG_0 sample does not reproduce its ceiling.
+		const double ALIAS_METRIC_CEILING = 1.370;   // recorded worst gated alias metric
 		if (!(ALIAS_METRIC_CEILING < floor)) {
 			test_fail(name, "D1: floor does not clear the measured alias metric ceiling (alias would still detonate)");
 			return;
