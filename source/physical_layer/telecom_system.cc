@@ -3995,9 +3995,9 @@ skip_h_retry_point:
 						}
 						receive_stats.delay = orig_delay;  // restore; fall through to the reject
 					}
+					if(agc_receive_test_) ++agc_receive_test_->subpeak_reject;
 					if(g_verbose)
 					{
-						if(agc_receive_test_) ++agc_receive_test_->subpeak_reject;
 						printf("[SUBPEAK-REJECT] trial %d metric=%.3f mean_H=%.3f delay=%d — Schmidl-Cox sub-peak rejected\n",
 							receive_stats.sync_trials, receive_stats.coarse_metric, mean_H, receive_stats.delay);
 						fflush(stdout);
