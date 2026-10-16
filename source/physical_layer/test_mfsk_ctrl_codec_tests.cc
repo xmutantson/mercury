@@ -9475,9 +9475,10 @@ static void test_channel_state_lookup_temp_files() {
 		}
 		FILE* fp = std::fopen(survivor.path.c_str(), "rb");
 		if (fp == NULL) { test_fail(name, "peer cleanup removed survivor"); return; }
-		std::vector<char> bytes(sizeof(k_qtable_json));
+		const size_t expected_size = std::strlen(k_qtable_json);
+		std::vector<char> bytes(expected_size + 1);
 		size_t count = std::fread(bytes.data(), 1, bytes.size(), fp);
-		bool exact = count == sizeof(k_qtable_json) - 1 &&
+		bool exact = count == expected_size &&
 			std::memcmp(bytes.data(), k_qtable_json, count) == 0 && !std::ferror(fp);
 		std::fclose(fp);
 		cl_channel_state_lookup tbl;
