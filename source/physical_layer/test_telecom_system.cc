@@ -231,6 +231,9 @@ int cl_telecom_system::test_acq_band_excl()
 
 	printf("[TEST-ACQ-EXCL] %s (%d failure%s)\n", failed==0?"ALL PASS":"FAILURES", failed, failed==1?"":"s");
 	fflush(stdout);
+	// This acquisition entry is already invoked by the aggregate test dispatcher.
+	cl_telecom_system contracts;
+	failed += contracts.test_rx_contracts();
 	return failed == 0 ? 0 : 1;
 }
 
@@ -549,4 +552,220 @@ int cl_telecom_system::test_subpeak_gate()
 	delete[] sig;
 	printf("[TEST-SUBPEAK] %s (%d failure%s)\n", fails==0?"ALL PASS":"FAILED", fails, fails==1?"":"s");
 	return fails==0 ? 0 : 1;
+}
+
+// Receiver contracts use production publication/acquisition/detector paths.
+// Run MINI and MINI0 in separate processes: their receiver selector is cached.
+int cl_telecom_system::test_rx_contracts()
+{
+	int failed = 0;
+	auto check = [&](bool ok, const char* name) {
+		printf("[TEST-RX-CONTRACTS] %s: %s\n", ok ? "PASS" : "FAIL", name);
+		fflush(stdout);
+		if(!ok) ++failed;
+	};
+	auto seed = [](cl_telecom_system& ts) {
+		ts.receive_stats.ofdm_search_raw = 7;
+		ts.receive_stats.mfsk_search_raw = 3;
+		ts.receive_stats.ofdm_batch_active = true;
+		ts.receive_stats.ofdm_drift_per_frame = 2.5;
+		ts.receive_stats.delay_of_last_decoded_message = 1234;
+	};
+	auto reset = [](const cl_telecom_system& ts) {
+		const auto& r = ts.receive_stats;
+		return r.ofdm_search_raw == 0 && r.mfsk_search_raw == 0
+			&& !r.ofdm_batch_active && r.ofdm_drift_per_frame == 0.0
+			&& r.delay_of_last_decoded_message == -1;
+	};
+	auto seeded = [](const cl_telecom_system& ts) {
+		const auto& r = ts.receive_stats;
+		return r.ofdm_search_raw == 7 && r.mfsk_search_raw == 3
+			&& r.ofdm_batch_active && r.ofdm_drift_per_frame == 2.5
+			&& r.delay_of_last_decoded_message == 1234;
+	};
+	auto next_full = [&](cl_telecom_system& ts) {
+		int pb = ts.data_container.Nofdm * ts.frequency_interpolation_rate
+			* ts.data_container.buffer_Nsymb;
+		std::vector<double> silence((size_t)pb, 0.0);
+		std::vector<int> out((size_t)N_MAX, 0);
+		auto r = ts.receive_byte(silence.data(), out.data());
+		check(r.message_decoded != YES && reset(ts)
+			&& ts.receive_stats.last_eff_preamble_nsymb == ts.data_container.preamble_nSymb,
+			"next receive after actual reset searches FULL without stale grid");
+	};
+
+	// Both branches must come from real initialization, including storage/capacity.
+	const char* old_defeat = std::getenv("MERCURY_PRECOOK_DEFEAT");
+	const bool had_defeat = old_defeat != nullptr;
+	const std::string saved_defeat = old_defeat ? old_defeat : "";
+	for(int pinned = 0; pinned <= 1; ++pinned)
+	{
+		setenv("MERCURY_PRECOOK_DEFEAT", pinned ? "0" : "1", 1);
+		cl_telecom_system ts;
+		ts.operation_mode = BER_PLOT_passband;
+		check(ts.load_configuration(CONFIG_15) == 0, "publication fixture loads cfg15");
+		ts.precook_pin_shared_ring();
+		check(ts.data_container.precook_ring_pinned == (pinned != 0),
+			"requested pinned/unpinned publication branch is installed");
+		if(ts.data_container.precook_ring_pinned != (pinned != 0)) continue;
+		const int natural = ts.data_container.buffer_Nsymb;
+		const int floor = natural + 8;
+		printf("[TEST-RX-CONTRACTS] ROUTE publication pinned=%d natural=%d floor=%d cap=%d\n",
+			pinned, natural, floor, ts.data_container.pinned_capacity_buffer_Nsymb);
+		seed(ts);
+		ts.data_container.ring_write_index = 2;
+		ts.data_container.nUnder_processing_events = 4;
+		ts.force_resize_capture_ring(floor);
+		check(ts.data_container.buffer_Nsymb == floor
+			&& ts.data_container.buffer_Nsymb_min == floor
+			&& ts.data_container.ring_write_index == 0,
+			"seat witness: active window/floor raised and ring cursor reset");
+		check(reset(ts), "seat resets both cursors, active batch, drift and decoded delay");
+		next_full(ts);
+
+		// A repeat seat must return before publication, preserving all coordinates.
+		seed(ts);
+		ts.data_container.ring_write_index = 2;
+		ts.data_container.nUnder_processing_events = 4;
+		ts.data_container.passband_delayed_data[0] = 0.125;
+		ts.data_container.passband_delayed_data[1] = -0.375;
+		ts.force_resize_capture_ring(floor);
+		check(seeded(ts) && ts.data_container.ring_write_index == 2
+			&& ts.data_container.nUnder_processing_events == 4
+			&& ts.data_container.buffer_Nsymb == floor
+			&& ts.data_container.passband_delayed_data[0] == 0.125
+			&& ts.data_container.passband_delayed_data[1] == -0.375,
+			"already-seated no-op preserves grid, ring cursor, samples and window");
+
+		seed(ts);
+		ts.force_set_capture_ring_natural();
+		check(ts.data_container.buffer_Nsymb == natural
+			&& ts.data_container.buffer_Nsymb_min == 0
+			&& ts.data_container.ring_write_index == 0,
+			"unseat witness: natural active window and reset ring cursor");
+		check(reset(ts), "unseat resets all five receiver-grid fields");
+		next_full(ts);
+
+		seed(ts);
+		check(ts.load_configuration(CONFIG_15) == 0 && seeded(ts),
+			"same-configuration load is a grid-preserving no-op");
+		check(ts.load_configuration(CONFIG_0) == 0 && reset(ts),
+			"actual configuration transition resets all five receiver-grid fields");
+		next_full(ts);
+	}
+	if(had_defeat) setenv("MERCURY_PRECOOK_DEFEAT", saved_defeat.c_str(), 1);
+	else unsetenv("MERCURY_PRECOOK_DEFEAT");
+
+	operation_mode = BER_PLOT_passband;
+	check(load_configuration(CONFIG_15) == 0, "receive fixture loads cfg15");
+	const int sym = data_container.Nofdm * frequency_interpolation_rate;
+	const int pb = sym * data_container.buffer_Nsymb;
+	if(sym <= 0 || pb <= 0) return 1;
+	std::vector<int> out((size_t)N_MAX, 0);
+	std::vector<double> win((size_t)pb, 0.0);
+	for(int i = 0; i < pb; ++i) win[(size_t)i] = 1e-3 * sin(0.37 * i);
+	win[(size_t)(pb / 2)] = 5.0;
+	const std::vector<double> original(win);
+	receive_stats.ofdm_batch_active = false;
+	receive_stats.ofdm_search_raw = 0;
+	receive_byte(win.data(), out.data());
+	check(memcmp(win.data(), original.data(), sizeof(double) * (size_t)pb) == 0,
+		"caller snapshot remains byte-exact after scaling and impulse clipping");
+
+	// Use the edge-defer route for MINI; silence alone can re-anchor to FULL.
+	preamble_amortization_enabled = true;
+	ofdm_defer_overflow_enabled = true;
+	std::fill(win.begin(), win.end(), 0.0);
+	receive_stats.ofdm_batch_active = true;
+	receive_stats.ofdm_search_raw = data_container.buffer_Nsymb - 1;
+	receive_stats.ofdm_drift_per_frame = 0.0;
+	data_container.nUnder_processing_events = 0;
+	const char* mini_env = std::getenv("MERCURY_KEYDOWN_MINI0");
+	const int expected = (!mini_env || !*mini_env || atoi(mini_env) != 0) ? 0 : 1;
+	// MINI0 bypasses verification; use a complete predicted span so its silence
+	// rejection is reached. MINI requires a frame extending beyond the snapshot.
+	if(expected == 0) receive_stats.ofdm_search_raw = data_container.preamble_nSymb + 6;
+	auto rejected = receive_byte(win.data(), out.data());
+	printf("[TEST-RX-CONTRACTS] ROUTE reject mini=%d overflow=%d decoded=%d reported=%d\n",
+		expected, rejected.frame_overflow_symbols, rejected.message_decoded,
+		receive_stats.last_eff_preamble_nsymb);
+	check(rejected.message_decoded != YES && (expected == 0 || rejected.frame_overflow_symbols > 0),
+		"MINI early-defer or MINI0 silence-rejection route witnessed");
+	check(receive_stats.last_eff_preamble_nsymb == expected,
+		"early rejection publishes the actual MINI/MINI0 searched geometry");
+	load_configuration(CONFIG_0);
+	check(reset(*this), "config reset clears prior reject grid");
+	next_full(*this);
+
+	// Real control emitters are positive controls; pristine/post-receive parity
+	// compares the same detector state, including its CFO correction.
+	last_coarse_freq_offset = 0.0;
+	const int ctrl_pb = data_container.Nofdm * frequency_interpolation_rate * data_container.buffer_Nsymb;
+	for(int hail = 0; hail <= 1; ++hail)
+	{
+		std::vector<double> control((size_t)ctrl_pb, 0.0);
+		int emitted = hail ? generate_hail_pattern_passband(control.data())
+			: generate_break_pattern_passband(control.data());
+		check(emitted > 0 && emitted <= ctrl_pb, "real control emitter fits detector snapshot");
+		if(emitted <= 0 || emitted > ctrl_pb) continue;
+		const std::vector<double> pristine(control);
+		int before_count = 0, after_count = 0;
+		double before = hail ? detect_hail_pattern_from_passband(control.data(), ctrl_pb, &before_count)
+			: detect_break_pattern_from_passband(control.data(), ctrl_pb, &before_count);
+		receive_stats.ofdm_batch_active = false;
+		receive_stats.ofdm_search_raw = 0;
+		receive_byte(control.data(), out.data());
+		last_coarse_freq_offset = 0.0;
+		double after = hail ? detect_hail_pattern_from_passband(control.data(), ctrl_pb, &after_count)
+			: detect_break_pattern_from_passband(control.data(), ctrl_pb, &after_count);
+		printf("[TEST-RX-CONTRACTS] ROUTE detector hail=%d emitted=%d matches=%d/%d metric=%.17g/%.17g\n",
+			hail, emitted, before_count, after_count, before, after);
+		check(before_count > 0 && before > 0.0, "emitted control is detected by production detector");
+		check(before_count == after_count && before == after
+			&& memcmp(control.data(), pristine.data(), sizeof(double) * (size_t)ctrl_pb) == 0,
+			"BREAK/HAIL detector parity and byte-exact snapshot after actual receive");
+	}
+
+	// The alternate NB preamble must be selected by the production correlator.
+	{
+		cl_telecom_system tx, rx;
+		tx.operation_mode = rx.operation_mode = BER_PLOT_passband;
+		tx.narrowband_enabled = rx.narrowband_enabled = YES;
+		check(tx.load_configuration(ROBUST_0) == 0 && rx.load_configuration(ROBUST_0) == 0,
+			"NB matched-preamble fixtures initialize");
+		tx.set_robust_preamble_negotiated(true);
+		const int local = rx.mfsk.preamble_nSymb;
+		const int alternate = tx.mfsk.preamble_nSymb;
+		check(alternate != local && rx.ofdm.mfsk_corr_template != nullptr,
+			"alternate preamble differs from local active template");
+		const int msym = tx.data_container.Nofdm * tx.frequency_interpolation_rate;
+		const int frame_samples = (tx.data_container.Nsymb + alternate) * msym;
+		const int rx_samples = rx.data_container.buffer_Nsymb * msym;
+		std::vector<double> frame((size_t)frame_samples, 0.0), window((size_t)rx_samples, 0.0);
+		const int bytes = (tx.data_container.nBits - tx.ldpc.P - tx.outer_code_reserved_bits) / 8;
+		std::vector<int> payload((size_t)std::max(bytes, 1), 0);
+		for(int i = 0; i < bytes; ++i) payload[(size_t)i] = (i * 37 + 11) & 255;
+		tx.transmit_byte(payload.data(), bytes, frame.data(), SINGLE_MESSAGE);
+		const int onset = rx_samples - (alternate + 2) * msym;
+		check(onset > 0, "alternate preamble fits at incomplete-frame onset");
+		if(onset > 0)
+		{
+			std::copy(frame.begin(), frame.begin() + std::min(frame_samples, rx_samples - onset),
+				window.begin() + onset);
+			rx.mfsk_fixed_delay = -1;
+			auto r = rx.receive_byte(window.data(), out.data());
+			printf("[TEST-RX-CONTRACTS] ROUTE matched local=%d alternate=%d actual=%d delay=%d overflow=%d\n",
+				local, alternate, rx.ofdm.mfsk_matched_preamble_nsymb, (int)r.delay, r.frame_overflow_symbols);
+			check(rx.ofdm.mfsk_matched_preamble_nsymb == alternate && r.delay >= 0
+				&& r.message_decoded != YES, "real correlator selects alternate on an incomplete frame");
+			check(rx.receive_stats.last_eff_preamble_nsymb == alternate,
+				"matched MFSK rejection publishes alternate searched geometry");
+			rx.load_configuration(CONFIG_0);
+			check(reset(rx), "config change clears matched MFSK reject state");
+			next_full(rx);
+		}
+	}
+	printf("[TEST-RX-CONTRACTS] %s (%d failures)\n", failed ? "FAILURES" : "ALL PASS", failed);
+	fflush(stdout);
+	return failed ? 1 : 0;
 }

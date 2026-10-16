@@ -650,6 +650,8 @@ public:
 	bool acq_band_excl_hit(int delay, int radius, int* matched_center);
 	void acq_band_excl_begin_epoch();
 	int test_acq_band_excl();
+	int test_rx_contracts();
+	std::vector<double> rx_window_scratch;  // Caller snapshot shared with control detectors.
 
 	// Default-off rejection of reverse-direction narrowband MFSK bursts that
 	// Schmidl-Cox can admit as forward OFDM preambles. The discriminator is the
