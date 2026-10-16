@@ -11735,7 +11735,7 @@ void cl_arq_controller::process_control_commander()
 						// Enforce WB/NB ceiling on turboshift probe target
 						{
 							int turbo_cap = (narrowband_enabled == YES) ? NB_CONFIG_MAX : topgear_wb_ceiling();
-							if(negotiated_configuration > turbo_cap)
+							if(config_ladder_index(negotiated_configuration) > config_ladder_index(turbo_cap))
 								negotiated_configuration = turbo_cap;
 							if(max_config_override >= 0 && negotiated_configuration > max_config_override)
 								negotiated_configuration = max_config_override;

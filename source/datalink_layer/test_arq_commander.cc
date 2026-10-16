@@ -5082,13 +5082,55 @@ int cl_arq_controller::test_robust_connect_exit()
 
 int cl_arq_controller::test_connect_fuse()
 {
+	// Exercise the real SET_CONFIG-ACK continuation. A retained higher data
+	// anchor permits the raw-id ceiling error to survive the later anchor cap.
+	int ceiling_failures = 0;
+	for(int nb = 0; nb < 2; ++nb)
+	{
+		for(int row = 0; row < 4; ++row)
+		{
+			cl_telecom_system ts;
+			cl_arq_controller cmd;
+			cmd.telecom_system = &ts;
+			cmd.role = COMMANDER;
+			cmd.narrowband_enabled = nb ? YES : NO;
+			cmd.robust_enabled = YES;
+			cmd.optimizer_disabled = true;
+			const int current = row == 1 ? ROBUST_1 : ROBUST_0;
+			cmd.load_configuration(current, FULL, YES);
+			cmd.data_configuration = current;
+			cmd.link_status = CONNECTED;
+			cmd.connection_status = RECEIVING_ACKS_CONTROL;
+			cmd.turboshift_active = true;
+			cmd.turboshift_phase = TURBO_FORWARD;
+			cmd.break_recovery_phase = 0;
+			cmd.max_config_override = -1; // Explicit override ordering belongs to #210.
+			cmd.turbo_received_snr = -99.0;
+			cmd.measurements.SNR_uplink = row == 3 ? 15.0 : -99.0;
+			cmd.sack_v2_enabled = true;
+			cmd.last_data_viable_config = row == 2 ? current : ROBUST_2;
+			cmd.supershift_proven_ceiling = -1;
+			cmd.messages_control.status = ACKED;
+			cmd.messages_control.data[0] = SET_CONFIG;
+			cmd.process_control_commander();
+			const int expected = row == 1 ? ROBUST_2 : ROBUST_1;
+			const bool pass = cmd.negotiated_configuration == expected
+				&& cmd.messages_control.status == ADDED_TO_LIST
+				&& cmd.messages_control.data[0] == SET_CONFIG
+				&& cmd.connection_status == TRANSMITTING_CONTROL;
+			printf("[TEST-TURBO-CEILING] %s: nb=%d row=%d current=%d target=%d expected=%d status=%d\n",
+				pass ? "PASS" : "FAIL", nb, row, current,
+				cmd.negotiated_configuration, expected, cmd.messages_control.status);
+			if(!pass) ++ceiling_failures;
+		}
+	}
 	// CONNECT-SEED FUSION - drives the REAL pure selector connect_fuse_seed_select() (the
 	// SAME method the WB-upgrade queue calls to embed the seed in SWITCH_BANDWIDTH).
 	// PASS-AFTER (fusion live): at the robust connect floor it returns CONFIG_0 -> the seed
 	// is carried by the switch frame and the separate SET_CONFIG cross is collapsed.
 	// FAIL-BEFORE (connect_fuse_defeat / MERCURY_CONNECT_FUSE_DEFEAT): CONFIG_NONE -> the
 	// two-frame cross is retained (BASE). GUARDS: R defeated / already-OFDM -> CONFIG_NONE.
-	int failed = 0;
+	int failed = ceiling_failures;
 	auto check = [&](bool cond, const char* name, int got, int want) {
 		if(cond) { printf("[TEST-CONNECT-FUSE] PASS: %s (got=%d want=%d)\n", name, got, want); }
 		else { printf("[TEST-CONNECT-FUSE] FAIL: %s (got=%d want=%d)\n", name, got, want); failed++; }
