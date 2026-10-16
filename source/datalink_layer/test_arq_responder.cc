@@ -10461,6 +10461,89 @@ int cl_arq_controller::test_rx_store_verdict_fail_closed()
 		"dispatcher test uses deterministic virtual time",
 		this->receiving_timer.get_elapsed_time_ms(), 0);
 
+	// Clean ACK gate range: a RECEIVED slot outside the effective window is
+	// neither ACKed nor counted. Driven through process_messages_acknowledging_data
+	// into the recoverable prev-hole hold (returns before any emission).
+	// Repeat after clearing both stores, then widen via sender count: an old
+	// out-of-window slot must become eligible when the effective window grows.
+	for(int scenario = 0; scenario < 3; scenario++)
+	{
+		printf("[TEST-CLEAN-ACK-SCENARIO] scenario=%d\n", scenario);
+		fflush(stdout);
+		const int LAST = 70, PREV = 71, CUR = 72;
+		const int window = scenario == 2 ? 3 : 2;
+		const int stored = scenario == 1 ? 2 : 3;
+		for(int i = 0; i < this->nMessages; i++)
+		{
+			this->messages_rx[i].status = FREE;
+			this->messages_rx_prev[i].status = FREE;
+		}
+		this->data_batch_size = 2;
+		this->rx_batch_total_frames = scenario == 2 ? 3 : -1;
+		this->last_received_end_of_batch_seq = -1;
+		this->ack_pattern_time_ms = 1;
+		this->repeating_last_ack = NO;
+		// passive_monitor keeps the re-advertised prev SACK off the air
+		// (send_sack_v2_frame returns at passive_monitor) and skips the byte
+		// and backpressure gates, which need a stream stamp and a FIFO.
+		this->passive_monitor = true;
+		this->rsp_current_expected_batch_seq_id = CUR;
+		this->rsp_prev_batch_seq_id = PREV;
+		this->rsp_last_delivered_batch_seq_id = LAST;
+		this->rsp_stream_origin_gen = -1;
+		this->rsp_stream_aborted = false;
+		this->rsp_gap_recover_rounds = 0;
+		this->rsp_prev_batch_active = true;
+		this->rsp_prev_batch_received_count = 1;
+		this->rsp_prev_batch_expected_count = 2;
+		this->messages_rx_prev[0].status = RECEIVED;
+		this->messages_rx_prev[0].batch_seq_id = PREV;
+		for(int i = 0; i < stored; i++)
+		{
+			this->messages_rx[i].status = RECEIVED;
+			this->messages_rx[i].batch_seq_id = CUR;
+			this->messages_rx[i].length = 8;
+		}
+		this->batch_rx_frame_count = stored;
+		const long acks_before = (long)this->stats.nAcks_sent_data;
+		check(rx_effective_window(rx_batch_total_frames) == window,
+			"clean gate fixture has the intended effective window",
+			rx_effective_window(rx_batch_total_frames), window);
+		this->connection_status = ACKNOWLEDGING_DATA;
+		process_messages_acknowledging_data();
+		const long acks_delta = (long)this->stats.nAcks_sent_data - acks_before;
+		check(this->rsp_gap_recover_rounds == 1,
+			"ACK-gate drive reached the recoverable prev-hole hold",
+			this->rsp_gap_recover_rounds, 1);
+		check(acks_delta == window,
+			"clean gate counts only the effective-window slots", acks_delta, window);
+		const int tail_status = scenario == 2 ? RECEIVED : FREE;
+		check(this->messages_rx[2].status == tail_status,
+			"tail is freed outside window and retained inside widened window",
+			this->messages_rx[2].status, tail_status);
+		check(this->messages_rx[0].status == RECEIVED
+			&& this->messages_rx[1].status == RECEIVED,
+			"hold keeps the effective-window slots RECEIVED",
+			this->messages_rx[1].status, RECEIVED);
+		this->passive_monitor = false;
+		for(int i = 0; i < this->nMessages; i++)
+		{
+			this->messages_rx[i].status = FREE;
+			this->messages_rx_prev[i].status = FREE;
+		}
+		this->rsp_prev_batch_active = false;
+		this->rsp_prev_batch_received_count = 0;
+		this->rsp_prev_batch_expected_count = 0;
+		this->batch_rx_frame_count = 0;
+		this->connection_status = RECEIVING;
+		check(this->messages_rx[2].status == FREE
+			&& this->messages_rx_prev[0].status == FREE
+			&& !this->rsp_prev_batch_active,
+			"fixture clears both stores and prev-active state before repeat",
+			this->messages_rx[2].status, FREE);
+	}
+
+
 	this->telecom_system = NULL;
 	set_gate_env(had_previous_gate_env ? previous_gate_value.c_str() : NULL);
 	sim_clock_set_enabled(previous_sim_clock_enabled);

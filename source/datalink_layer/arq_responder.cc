@@ -36,6 +36,10 @@
 #include "gui/gui_state.h"
 #endif
 
+// RECEIVED slots found outside the clean ACK gate's effective window (freed,
+// never ACKed); printed with every [RSP-ACK-OOW-SLOT] line.
+static long long g_rsp_ack_oow_slot_count = 0;
+
 void cl_arq_controller::process_messages_responder()
 {
 
@@ -3537,13 +3541,28 @@ void cl_arq_controller::process_messages_acknowledging_data()
 				}
 			}
 
-			// Mark all received messages as ACKED and count for stats
+			// Mark the received messages inside the effective window as ACKED and
+			// count them. The hold revert and the commit below use the same range;
+			// a RECEIVED slot outside it can never be delivered (the copy frees it
+			// without delivery), so it is freed here, loudly, and not counted.
 			for(int i=0; i<this->nMessages; i++)
 			{
-				if(messages_rx[i].status==RECEIVED)
+				if(messages_rx[i].status!=RECEIVED)
+					continue;
+				if(i < eff_window)
 				{
 					messages_rx[i].status=ACKED;
 					nAck_messages++;
+				}
+				else
+				{
+					messages_rx[i].status=FREE;
+					g_rsp_ack_oow_slot_count++;
+					printf("[RSP-ACK-OOW-SLOT] slot=%d outside eff_window=%d "
+						"(bsi=%d batch=%d) freed, not ACKed (count=%lld)\n",
+						i, eff_window, rsp_current_expected_batch_seq_id,
+						data_batch_size, g_rsp_ack_oow_slot_count);
+					fflush(stdout);
 				}
 			}
 			stats.nAcks_sent_data += nAck_messages;
