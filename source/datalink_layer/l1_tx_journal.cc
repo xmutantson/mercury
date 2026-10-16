@@ -81,12 +81,14 @@ L1TxJournal::L1TxJournal(L1TerminalQueue* terminal_owner)
       block_ack_mode_(env_exact_one("MERCURY_L1_BLOCKACK")),
       terminal_owner_(terminal_owner) {
   const char* marker = std::getenv("MERCURY_L1_JOURNAL_STATE");
-  marker_path_ = marker && marker[0] ? marker : ".mercury_l1_journal.pending";
+  // Persistence requires a caller-selected instance identity. An implicit
+  // CWD path cannot attribute restart loss to this journal.
+  marker_path_ = marker && marker[0] ? marker : "";
   if (enabled_ && terminal_owner_) recover_restart_marker();
 }
 
 void L1TxJournal::recover_restart_marker() {
-  if (!enabled_ || !terminal_owner_) return;
+  if (!enabled_ || !terminal_owner_ || marker_path_.empty()) return;
   std::ifstream in(marker_path_.c_str());
   if (!in.good()) return;
   L1TerminalReport report;
@@ -335,7 +337,7 @@ bool L1TxJournal::terminalize(const char* reason,
 }
 
 bool L1TxJournal::write_marker() {
-  if (!enabled_ || entries_.empty()) return true;
+  if (!enabled_ || entries_.empty() || marker_path_.empty()) return true;
   const std::string temporary = marker_path_ + ".tmp";
   {
     std::ofstream out(temporary.c_str(), std::ios::trunc);
@@ -354,6 +356,7 @@ bool L1TxJournal::write_marker() {
 }
 
 void L1TxJournal::clear_marker() {
+  if (marker_path_.empty()) return;
   std::remove(marker_path_.c_str());
   std::remove((marker_path_ + ".tmp").c_str());
 }
