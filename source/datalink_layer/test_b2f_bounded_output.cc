@@ -274,12 +274,107 @@ static bool first_payload_sizes()
 	return all;
 }
 
+
+// A batch changes representation per accepted proposal, including after a
+// resumed or oversized passthrough. Check each body and the next protocol round
+// independently so correct prefix bytes cannot hide a retained payload state.
+static bool post_passthrough_payloads()
+{
+	struct Case { size_t size; bool random; unsigned resume; bool enabled; };
+	const Case cases[] = {
+		{5000, false, 7, true},
+		{B2F_PLAIN_BUF_SIZE + 1, false, 0, true},
+		{B2F_PLAIN_BUF_SIZE - 1, true, 0, true},
+		{5000, false, 0, true}, // two-unrolled control
+		{5000, false, 7, false} // disabled control
+	};
+	bool all = true;
+	for (size_t id = 0; id < sizeof(cases) / sizeof(cases[0]); ++id)
+	for (int split : {173, 8192})
+	{
+		const Case& c = cases[id];
+		std::string plain[2] = {std::string(c.size, ' '), std::string(5000, ' ')};
+		std::string encoded[2];
+		uint32_t x = 0x2468ace1u;
+		for (int body = 0; body < 2; ++body)
+		{
+			const char text[] = "Keyed shelter status and resource requests.\n";
+			for (size_t i = 0; i < plain[body].size(); ++i)
+			{
+				x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+				plain[body][i] = c.random && body == 0 ? (char)(x & 255) :
+					text[(i + id + body * 7) % (sizeof(text) - 1)];
+			}
+			std::vector<uint8_t> buf(plain[body].size() * 2 + 65536);
+			size_t count = 0;
+			if (lzhuf_encode_buffer((const uint8_t*)plain[body].data(), plain[body].size(),
+				buf.data(), buf.size(), &count) != 0 || count <= c.resume) return false;
+			encoded[body].assign((const char*)buf.data(), count);
+		}
+		if ((id == 1 && encoded[0].size() > B2F_PLAIN_BUF_SIZE) ||
+			(id == 2 && encoded[0].size() <= B2F_PLAIN_BUF_SIZE) ||
+			encoded[1].size() >= plain[1].size()) return false;
+
+		cl_b2f_handler sender, receiver;
+		sender.init(); receiver.init();
+		sender.unroll_enabled = receiver.unroll_enabled = c.enabled;
+		for (int repeat = 0; repeat < 2; ++repeat)
+		{
+			sender.reset(); receiver.reset();
+			std::string delivered;
+			const std::string sid = cr("[PAT-12.18.0-B2FHQEHX$]");
+			bool setup = forward(sender, receiver, true, sid, delivered, split) && delivered == sid;
+			delivered.clear();
+			setup = setup && forward(receiver, sender, true, sid, delivered, split) && delivered == sid;
+			char fc[256];
+			std::snprintf(fc, sizeof(fc),
+				"FC EM FIRST %zu %zu\rFC EM SKIP 10 10\rFC EM SECOND %zu %zu\rF>\r",
+				plain[0].size(), encoded[0].size(), plain[1].size(), encoded[1].size());
+			delivered.clear();
+			setup = setup && forward(sender, receiver, true, fc, delivered, split) && delivered == fc;
+			char fs[64];
+			if (c.resume) std::snprintf(fs, sizeof(fs), "FS !%u-+\r", c.resume);
+			else std::snprintf(fs, sizeof(fs), "FS +-+\r");
+			delivered.clear();
+			setup = setup && forward(receiver, sender, true, fs, delivered, split) && delivered == fs;
+			bool bodies[2] = {false, false};
+			for (int body = 0; body < 2; ++body)
+			{
+				unsigned resume = body == 0 ? c.resume : 0;
+				const bool transform = c.enabled && !resume &&
+					plain[body].size() <= B2F_PLAIN_BUF_SIZE && encoded[body].size() <= B2F_PLAIN_BUF_SIZE;
+				const std::string original = encoded[body].substr(resume);
+				std::string wire;
+				delivered.clear();
+				bool sent = setup && feed(sender, true, original, wire, split);
+				bool received = sent && feed(receiver, false, wire, delivered, split);
+				bodies[body] = received && wire == (transform ? plain[body] : original) &&
+					delivered == original && !receiver.is_reroll_poisoned();
+				std::printf("B2F_POST_BODY case=%zu split=%d repeat=%d body=%d transform=%d plain=%zu comp=%zu wire=%zu delivered=%zu exact=%d poisoned=%d\n",
+					id, split, repeat, body, transform, plain[body].size(), encoded[body].size(),
+					wire.size(), delivered.size(), bodies[body], receiver.is_reroll_poisoned());
+			}
+			delivered.clear();
+			bool tail = forward(sender, receiver, true, "FF\r", delivered, split) && delivered == "FF\r";
+			bool next = tail && payload_round(sender, receiver, 5000, false, c.enabled, 0, false, split, false);
+			bool ok = setup && bodies[0] && bodies[1] && tail && next &&
+				!sender.has_fatal_error() && !receiver.has_fatal_error();
+			std::printf("B2F_POST_PAYLOAD case=%zu split=%d repeat=%d setup=%d first=%d second=%d tail=%d next=%d exact=%d\n",
+				id, split, repeat, setup, bodies[0], bodies[1], tail, next, ok);
+			all = all && ok;
+		}
+	}
+	return all;
+}
+
 int run_b2f_bounded_output_test()
 {
 	bool tx_ok = tx_large_body();
 	bool rx_ok = rx_large_body();
 	bool first_ok = first_payload_sizes();
+	bool post_ok = post_passthrough_payloads();
+	std::printf("B2F_POST_PAYLOAD_RESULT exact=%d\n", post_ok);
 	std::printf("B2F_FIRST_PAYLOAD_RESULT exact=%d\n", first_ok);
 	std::printf("B2F_BOUNDED_OUTPUT tx=%d rx=%d\n", tx_ok ? 1 : 0, rx_ok ? 1 : 0);
-	return tx_ok && rx_ok && first_ok ? 0 : 1;
+	return tx_ok && rx_ok && first_ok && post_ok ? 0 : 1;
 }

@@ -782,7 +782,7 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 				if (current_payload_idx >= 0)
 				{
 					auto& np = proposals[current_payload_idx];
-					payload_bytes_remaining = np.comp_size - np.resume_offset;
+					payload_bytes_remaining = rx_payload_size(np);
 				}
 				else
 					state = B2F_CHECKSUM;
