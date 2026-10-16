@@ -100,6 +100,34 @@ static void test_fail(const char* name, const char* reason) {
 	g_failures++;
 }
 
+// An inapplicable assertion is a skip and never adds a pass.
+static void test_skip(const char* name, const char* why) {
+	printf("  [SKIP] %s: %s\n", name, why);
+}
+
+// gf16ra keeps its repfact in process-global state. set_suffix_fec(true, r)
+// calls gf16ra::configure(r) and the off branch does not reconfigure, so a test
+// that returns early after enabling the coded path leaves every later test at
+// repfact r. The guard restores the default (repfact 2) on every exit path of
+// the scope it lives in; expect_gf16ra_default() is the runner's check that no
+// test left the codec reconfigured.
+struct gf16ra_default_guard {
+	gf16ra_default_guard() {}
+	~gf16ra_default_guard() { gf16ra::configure(2); gf16ra::init(); }
+	gf16ra_default_guard(const gf16ra_default_guard&) = delete;
+	gf16ra_default_guard& operator=(const gf16ra_default_guard&) = delete;
+};
+
+static void expect_gf16ra_default(const char* after) {
+	const int rf = gf16ra::current_repfact();
+	if (rf != 2) {
+		char b[160];
+		snprintf(b, sizeof(b), "%s left gf16ra repfact=%d (default 2)", after, rf);
+		test_fail("gf16ra_default_after_test", b);
+		gf16ra::configure(2); gf16ra::init();
+	}
+}
+
 // Minimal CRC12 helper for the tests — mirrors cl_arq_controller::CRC12_calc
 // (arq_common.cc:6784) bit-exact INCLUDING init=0xFFF. v1 bug #1 (fact-doc
 // §13.5 / phase-a-to-b-workplan §10) was an inline RX-side helper that
@@ -888,18 +916,34 @@ static void test_v3_test_conn_snr_quantization_roundtrip() {
 		{-5.0f, 0,  -5.0f},
 		{-3.0f, 1,  -3.0f},
 		{ 1.0f, 3,   1.0f},
-		{12.0f, 8,  11.0f},   // 12 quantizes to 8 (rounds up: (12+5)/2=8.5 → 9), so rebuild...
-		// snr_to_tone uses int truncation after +0.5 (banker's rounding equivalent)
-		// (12+5)/2 + 0.5 = 9 → tone 9, snr_out = 13.0
+		// Mid-step tie: (12+5)/2 + 0.5 = 9.0 exactly -> tone 9 -> 13.0 dB
+		{12.0f, 9,  13.0f},
 		{25.0f, 15, 25.0f},
 		// Saturating at the top end
 		{30.0f, 15, 25.0f},
 		// Saturating at the bottom end
 		{-10.0f, 0, -5.0f},
 	};
-	(void)cases;  // The hard-coded mid-step cases are documentation-only
-	// since the rounding rules depend on float precision; the per-tone
-	// fixed-point check above is the real assertion.
+	// Reference for the rows (#101). The wire contract of the 4-bit snr_q
+	// field (TEST_CONN bits 37..34, decoded by the responder with
+	// tone_to_snr) is snr = 2*tone - 5 dB over tones 0..15, i.e. -5..+25 dB
+	// at M >= 16; that fixes the snr_out column and both saturation rows.
+	// No requirement states how a mid-step input rounds, so for the
+	// snr_in -> tone column the production quantizer is the reference
+	// (nearest step, ties up): the 12 dB row is a change detector, not a
+	// requirement check. Every value in the table is exact in float.
+	for (const auto& c : cases) {
+		int tone = m.snr_to_tone(c.snr_in);
+		float back = m.tone_to_snr(tone);
+		if (tone != c.expected_tone || back != c.snr_out) {
+			char buf[160];
+			snprintf(buf, sizeof(buf),
+				"snr_in=%.1f -> tone=%d snr=%.1f (expected tone=%d snr=%.1f)",
+				c.snr_in, tone, back, c.expected_tone, c.snr_out);
+			test_fail(name, buf);
+			return;
+		}
+	}
 
 	test_pass(name);
 }
@@ -1142,7 +1186,10 @@ static void test_v2_cmd_loop_no_refire() {
 		return;
 	}
 
-	test_pass(name);
+	// Local predicate model only: no production call, so this line documents
+	// the rule and carries no coverage (#101; production coverage is owed
+	// by the owners of the predicate sites).
+	printf("  [DOC]  %s: local predicate model, no production call\n", name);
 }
 
 // §3.3 — v1 bug #3 prevention: Site B must override frames_to_read to 2
@@ -1197,7 +1244,10 @@ static void test_v2_rsp_frames_to_read_override() {
 		}
 	}
 
-	test_pass(name);
+	// Local predicate model only: no production call, so this line documents
+	// the rule and carries no coverage (#101; production coverage is owed
+	// by the owners of the predicate sites).
+	printf("  [DOC]  %s: local predicate model, no production call\n", name);
 }
 
 // =============================================================================
@@ -1435,13 +1485,14 @@ static void test_mfsk_data_preamble_passband_roundtrip_clean() {
 		test_fail(name, buf);
 		return;
 	}
-	// Production threshold is 0.5 (ofdm.cc:3217). Clean round-trip
-	// typically yields metric ~0.9-1.0.
-	if (sync_metric < 0.5) {
+	// The metric is the matched preamble-symbol count (a delay is returned
+	// only at count >= pre_threshold, checked above). A noiseless buffer must
+	// match every preamble symbol.
+	if (sync_metric < (double)preamble_nSymb) {
 		char buf[160];
 		snprintf(buf, sizeof(buf),
-			"sync_metric=%.4f below production threshold 0.5",
-			sync_metric);
+			"sync_metric=%.1f matched of %d preamble symbols on a noiseless buffer",
+			sync_metric, preamble_nSymb);
 		test_fail(name, buf);
 		return;
 	}
@@ -4771,9 +4822,11 @@ static void test_config_tag_pure_noise_far() {
 		double soft[16];
 		for (int i = 0; i < 16; i++) soft[i] = ed(rng) - ed(rng);  // signed chip noise
 
-		// Bare FWHT always returns SOME index (no reject region).
-		double rp = 0.0; (void)cfg_tag_rm_fwht_decode(soft, &rp);
-		bare_fwht_accept++;                            // every frame "accepts" a cfg
+		// Bare FWHT has no reject region: every frame decodes to SOME index in
+		// 0..31. Count what the decoder returns, so the baseline check below
+		// reads the decoder instead of a constant.
+		double rp = 0.0; const int bare_c = cfg_tag_rm_fwht_decode(soft, &rp);
+		if (bare_c >= 0 && bare_c < 32) bare_fwht_accept++;
 		if (rp >= CFG_TAG_PEAK_GATE) fwht_gate_only++;
 
 		// CRC-only: GF16 RA + CRC-12 (no FWHT/binding).
@@ -5366,6 +5419,7 @@ static void test_gf16_ra_cliff_sweep() {
 // noise through the FEC path (CRC12 + 2-bit-type backstop, §17.2) = 0.
 static void test_gf16_ra_production_path_cliff_sweep() {
 	const char* name = "gf16_ra_production_path_cliff_sweep";
+	gf16ra_default_guard repfact_guard;
 	printf("  [MEASURE] PRODUCTION CONNECT decode with GF(16) RA FEC wired in (§19 INCREMENT 1):\n");
 
 	cl_telecom_system ts;
@@ -6392,6 +6446,7 @@ static void test_ctrl_suffix_metric_gate_cliff_sweep() {
 // comparable to the −14.68 base floor.
 static void test_connect_preamble_combining_cliff_sweep() {
 	const char* name = "connect_preamble_combining_cliff_sweep";
+	gf16ra_default_guard repfact_guard;
 	printf("  [MEASURE] base-pattern noncoherent COMBINING on the production CONNECT detector (§20 INCREMENT 2):\n");
 
 	cl_telecom_system ts;
@@ -7544,6 +7599,7 @@ static void test_ack_suffix_eligible_robust_tier_only() {
 // byte-identical in 100% of cases.
 static void test_ack_suffix_throughput_neutral() {
 	const char* name = "ack_suffix_throughput_neutral";
+	gf16ra_default_guard repfact_guard;
 	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
 	if (ts.ack_mfsk.ack_sack_suffix_len() != 13) { test_fail(name, "expected 13-tone ACK suffix at M=16"); return; }
 
@@ -8925,9 +8981,11 @@ static void test_nb_robust_preamble_capneg() {
 	if (ts.mfsk.robust_preamble_mode != 0) {
 		// Env-forced build (MERCURY_MFSK_ROBUST_PREAMBLE set): the negotiable
 		// contract is deliberately inactive; nothing further to assert.
-		printf("  [SKIP-NEG] %s: MERCURY_MFSK_ROBUST_PREAMBLE forces mode %d\n",
-			name, ts.mfsk.robust_preamble_mode);
-		test_pass(name);
+		char why[128];
+		snprintf(why, sizeof(why),
+			"MERCURY_MFSK_ROBUST_PREAMBLE forces mode %d; the negotiation contract is inactive",
+			ts.mfsk.robust_preamble_mode);
+		test_skip(name, why);
 		return;
 	}
 
@@ -9520,24 +9578,67 @@ static void test_channel_state_lookup_canonical_table() {
 		snprintf(buf, sizeof(buf), "init_from_json/is_loaded failed: %s", tbl.last_error());
 		test_fail(name, buf); return;
 	}
-	struct { double snr; double sel; int want; const char* tag; } cases[3] = {
-		{30.0, 0.0,  16, "(30,0.0)->16"},
-		{12.0, 0.0,  10, "(12,0.0)->10"},
-		{ 0.0, 0.0, 100, "(0,0.0)->100"}
-	};
-	for (int i = 0; i < 3; i++) {
-		int got = tbl.lookup(cases[i].snr, cases[i].sel);
-		if (got != cases[i].want) {
-			char buf[200];
-			snprintf(buf, sizeof(buf), "lookup %s got %d", cases[i].tag, got);
-			test_fail(name, buf); return;
+	// Anchors and cell count, checked on the embedded fixture (the loader unit
+	// check) and on the shipped file (the table production reads).
+	auto table_ok = [&](const cl_channel_state_lookup& t, const char* which) -> bool {
+		struct { double snr; double sel; int want; const char* tag; } cases[3] = {
+			{30.0, 0.0,  16, "(30,0.0)->16"},
+			{12.0, 0.0,  10, "(12,0.0)->10"},
+			{ 0.0, 0.0, 100, "(0,0.0)->100"}
+		};
+		for (int i = 0; i < 3; i++) {
+			int got = t.lookup(cases[i].snr, cases[i].sel);
+			if (got != cases[i].want) {
+				char buf[220];
+				snprintf(buf, sizeof(buf), "%s: lookup %s got %d", which, cases[i].tag, got);
+				test_fail(name, buf); return false;
+			}
 		}
+		if (t.n_cells() != k_qtable_n_cells) {
+			char buf[180];
+			snprintf(buf, sizeof(buf), "%s: n_cells=%d want %d", which, t.n_cells(), k_qtable_n_cells);
+			test_fail(name, buf); return false;
+		}
+		return true;
+	};
+	if (!table_ok(tbl, "embedded fixture")) return;
+
+	// The shipped table: production loads channel_state_lookup.json from the
+	// working directory by default (arq_common.cc, MERCURY_SCREAM_QTABLE unset).
+	// It must exist, match the embedded copy byte for byte, and load to the same
+	// anchors. A missing file fails: --test runs where the binary is built,
+	// next to the file. A deliberate table change edits both copies in one
+	// commit (the channel-state Q-table contract, clauses C1-C3).
+	const char* shipped = "channel_state_lookup.json";
+	std::string bytes;
+	{
+		FILE* fp = std::fopen(shipped, "rb");
+		if (fp == NULL) {
+			test_fail(name, "shipped channel_state_lookup.json not found in the working directory "
+				"(the production default path)");
+			return;
+		}
+		char chunk[4096]; size_t n;
+		while ((n = std::fread(chunk, 1, sizeof(chunk), fp)) > 0) bytes.append(chunk, n);
+		std::fclose(fp);
 	}
-	if (tbl.n_cells() != k_qtable_n_cells) {
-		char buf[160];
-		snprintf(buf, sizeof(buf), "n_cells=%d want %d", tbl.n_cells(), k_qtable_n_cells);
+	const std::string fixture(k_qtable_json);
+	if (bytes != fixture) {
+		size_t off = 0;
+		while (off < bytes.size() && off < fixture.size() && bytes[off] == fixture[off]) off++;
+		char buf[220];
+		snprintf(buf, sizeof(buf),
+			"shipped %s (%zu bytes) differs from the embedded table (%zu bytes) at byte offset %zu",
+			shipped, bytes.size(), fixture.size(), off);
 		test_fail(name, buf); return;
 	}
+	cl_channel_state_lookup shipped_tbl;
+	if (!shipped_tbl.init_from_json(shipped) || !shipped_tbl.is_loaded()) {
+		char buf[220];
+		snprintf(buf, sizeof(buf), "shipped %s did not load: %s", shipped, shipped_tbl.last_error());
+		test_fail(name, buf); return;
+	}
+	if (!table_ok(shipped_tbl, "shipped file")) return;
 	test_pass(name);
 }
 
@@ -9975,6 +10076,36 @@ static void test_scream_detection_sweep() {
 	test_pass(name);
 }
 
+// The repfact guard restores the default after an early return that follows
+// the production enable. set_suffix_fec(true, 3) is the real setter the cliff
+// sweeps use; the lambda returns before any restore, the way their failure
+// paths do.
+static void test_gf16ra_guard_restores_on_early_return() {
+	const char* name = "gf16ra_guard_restores_on_early_return";
+	cl_telecom_system ts; ts.operation_mode = ARQ_MODE; ts.load_configuration(ROBUST_0);
+	int seen_inside = -1;
+	auto early_return_body = [&]() {
+		gf16ra_default_guard repfact_guard;
+		ts.set_suffix_fec(true, 3);
+		seen_inside = gf16ra::current_repfact();
+		if (seen_inside == 3) return;
+		ts.set_suffix_fec(false);
+	};
+	early_return_body();
+	const int after = gf16ra::current_repfact();
+	if (seen_inside != 3) {
+		char b[160];
+		snprintf(b, sizeof(b), "set_suffix_fec(true,3) configured repfact=%d, expected 3", seen_inside);
+		test_fail(name, b); gf16ra::configure(2); gf16ra::init(); return;
+	}
+	if (after != 2) {
+		char b[160];
+		snprintf(b, sizeof(b), "repfact=%d after an early return inside the guarded scope (expected 2)", after);
+		test_fail(name, b); gf16ra::configure(2); gf16ra::init(); return;
+	}
+	test_pass(name);
+}
+
 int run_mfsk_ctrl_codec_tests() {
 	g_failures = 0;
 	g_passes   = 0;
@@ -10127,7 +10258,10 @@ int run_mfsk_ctrl_codec_tests() {
 	test_gf16_ra_pure_noise_far();
 	if (heavy_sweep) test_gf16_ra_cliff_sweep();      // [MEASURE] GF(16) cliff + gain dB (heavy)
 	// §19 INCREMENT 1: the PRODUCTION CONNECT decode (FEC wired in) reaching ~-14.
-	if (heavy_sweep) test_gf16_ra_production_path_cliff_sweep();   // heavy cliff sweep
+	if (heavy_sweep) {
+		test_gf16_ra_production_path_cliff_sweep();   // heavy cliff sweep
+		expect_gf16ra_default("gf16_ra_production_path_cliff_sweep");
+	}
 
 	// Option B: compact coded reverse-confirm suffix (K=5, N=10).
 	// data-flow-compact-confirm.md. The cliff sweep is the FALSIFIABLE gate (the
@@ -10161,7 +10295,10 @@ int run_mfsk_ctrl_codec_tests() {
 	// (+2.2-2.5 dB/doubling expected) + the full establishment cliff; ASSERT
 	// R=4 deepens the matched-count materially vs R=1, byte-identical-when-off,
 	// FAR=0 on the combined path.
-	if (heavy_sweep) test_connect_preamble_combining_cliff_sweep();   // heavy MEASURE+ASSERT sweep
+	if (heavy_sweep) {
+		test_connect_preamble_combining_cliff_sweep();   // heavy MEASURE+ASSERT sweep
+		expect_gf16ra_default("connect_preamble_combining_cliff_sweep");
+	}
 
 	// RECOVERY-ACK robustness (recovery-ack-robustness.md §7): the BREAK-recovery
 	// reverse control-ACK noncoherent-repeat fix. Fail-before/pass-after on the
@@ -10205,6 +10342,8 @@ int run_mfsk_ctrl_codec_tests() {
 	// enhanced CONNECT encode+try-both-decode.
 	test_ack_suffix_eligible_robust_tier_only();
 	test_ack_suffix_throughput_neutral();
+	expect_gf16ra_default("ack_suffix_throughput_neutral");
+	test_gf16ra_guard_restores_on_early_return();
 	test_connect_suffix_byte_identical_when_off();
 	test_production_enhanced_connect_decodes();
 
@@ -10254,6 +10393,7 @@ int run_mfsk_ctrl_codec_tests() {
 	// holds >=99% detect+accept, confirms the FAR is held, and asserts the shipping
 	// default is a genuine trim. unilateral-config-tag-design.md §11 Stage 3c.
 	test_config_tag_sync_trim_sweep();
+	expect_gf16ra_default("the last test of the run");
 
 	printf("=== Tests done: %d passed, %d failed ===\n", g_passes, g_failures);
 	return g_failures;
@@ -10280,12 +10420,27 @@ int run_ofdm_fine_timing_tests() {
 // fact-documents/data-flow-preamble-amortization.md §1.
 // =============================================================================
 
+// Expected tail-frame preamble length for the current environment. Mirrors the
+// two env reads of cl_telecom_system::preamble_sched_nsymb exactly:
+// MERCURY_KEYDOWN_MINI0 unset or empty -> 1 (keydown on), else atoi();
+// MERCURY_SIM2_MINI_NSYM unset -> 1, else atoi() clamped to >= 1; the tail is
+// 0 while keydown is on, otherwise min(mini, full).
+static int expected_preamble_tail_nsymb(int full_n) {
+	const char* km0 = std::getenv("MERCURY_KEYDOWN_MINI0");
+	const int keydown = (km0 && *km0) ? atoi(km0) : 1;
+	if (keydown) return 0;
+	const char* mn = std::getenv("MERCURY_SIM2_MINI_NSYM");
+	int mini = mn ? atoi(mn) : 1;
+	if (mini < 1) mini = 1;
+	if (full_n < 1) full_n = 1;
+	return mini < full_n ? mini : full_n;
+}
+
 // §P.1 schedule predicate: anchor=FULL, tail=MINI, force_full=FULL.
 static void test_preamble_sched_predicate() {
 	const char* name = "preamble_sched_predicate";
 	const int full_n = 4;
-	const char* km0 = std::getenv("MERCURY_KEYDOWN_MINI0");
-	const int tail_n = (!km0 || atoi(km0) != 0) ? 0 : 1;
+	const int tail_n = expected_preamble_tail_nsymb(full_n);
 	// frame 0 -> FULL (anchor)
 	if (cl_telecom_system::preamble_sched_nsymb(0, false, full_n) != full_n) {
 		test_fail(name, "frame 0 (anchor) must be FULL"); return; }
@@ -10311,8 +10466,7 @@ static void test_preamble_sched_predicate() {
 // guarantee — both sides call the identical predicate).
 static void test_preamble_sched_tx_rx_symmetry() {
 	const char* name = "preamble_sched_tx_rx_symmetry";
-	const char* km0 = std::getenv("MERCURY_KEYDOWN_MINI0");
-	const int minimum = (!km0 || atoi(km0) != 0) ? 0 : 1;
+	const int minimum = expected_preamble_tail_nsymb(1);   // 0 with keydown on, else 1
 	for (int full = 1; full <= 16; full++) {
 		for (int idx = 0; idx < 30; idx++) {
 			for (int ff = 0; ff <= 1; ff++) {
@@ -10334,8 +10488,7 @@ static void test_preamble_sched_tx_rx_symmetry() {
 static void test_preamble_sched_batch_accounting() {
 	const char* name = "preamble_sched_batch_accounting";
 	const int full_n = 4, nframes = 25;
-	const char* km0 = std::getenv("MERCURY_KEYDOWN_MINI0");
-	const int tail_n = (!km0 || atoi(km0) != 0) ? 0 : 1;
+	const int tail_n = expected_preamble_tail_nsymb(full_n);
 	int amortized = 0, legacy = 0;
 	for (int i = 0; i < nframes; i++) {
 		amortized += cl_telecom_system::preamble_sched_nsymb(i, false, full_n);
@@ -10637,6 +10790,7 @@ int run_pilot_thin_nv_tests()
 	set_pilot_nv_test_env("MERCURY_PILOT_NSYMB", nullptr);
 
 	int failures = 0;
+	int platform_skips = 0;
 	cl_telecom_system ts;
 	ts.operation_mode = BER_PLOT_passband;
 	ts.load_configuration(CONFIG_16);
@@ -10671,6 +10825,7 @@ int run_pilot_thin_nv_tests()
 				"measured_nv=%.6e ratio=%.3f outside [0.5,2.0]; "
 				"Windows CRT rand() finite-sample variation is the documented reason.\n",
 				db, expected, measured, ratio);
+			platform_skips++;
 #else
 			printf("  [FAIL] thin EsN0=%d expected_nv=%.6e measured_nv=%.6e ratio=%.3f\n",
 				db, expected, measured, ratio);
@@ -10852,7 +11007,10 @@ int run_pilot_thin_nv_tests()
 		set_pilot_nv_test_env(saved[i].key,
 			saved[i].present ? saved[i].value.c_str() : nullptr);
 
+	if (platform_skips > 0)
+		printf("  [DIAG] pilot_thin_nv: %d thin ratio row(s) skipped on this platform, not verified\n",
+			platform_skips);
 	printf("=== Thin-pilot noise-variance tests: %s ===\n",
-		failures == 0 ? "PASS" : "FAIL");
+		failures != 0 ? "FAIL" : (platform_skips != 0 ? "INCOMPLETE" : "PASS"));
 	return failures;
 }
