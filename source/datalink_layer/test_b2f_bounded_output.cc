@@ -150,10 +150,136 @@ static bool rx_large_body()
 	return exact && !handler.has_pending_rx_work();
 }
 
+// Feed bounded receives and drain retained output before accepting more input.
+static bool feed(cl_b2f_handler& handler, bool tx, const std::string& input,
+	std::string& output, int split)
+{
+	char out[8192];
+	for (size_t off = 0; off < input.size();)
+	{
+		int count = (int)(input.size() - off);
+		if (count > split) count = split;
+		int n = tx ? handler.filter_tx(input.data() + off, count, out, sizeof(out)) :
+			handler.filter_rx(input.data() + off, count, out, sizeof(out));
+		if (n < 0) return false;
+		output.append(out, n);
+		off += count;
+		for (int i = 0; tx ? handler.has_pending_tx_work() : handler.has_pending_rx_work(); ++i)
+		{
+			if (i == 1024) return false;
+			n = tx ? handler.filter_tx(nullptr, 0, out, sizeof(out)) :
+				handler.filter_rx(nullptr, 0, out, sizeof(out));
+			if (n < 0) return false;
+			output.append(out, n);
+		}
+	}
+	return true;
+}
+
+static bool forward(cl_b2f_handler& sender, cl_b2f_handler& receiver,
+	bool forward_direction, const std::string& input, std::string& delivered, int split)
+{
+	std::string wire;
+	return feed(sender, forward_direction, input, wire, split) &&
+		feed(receiver, !forward_direction, wire, delivered, split);
+}
+
+static bool payload_round(cl_b2f_handler& sender, cl_b2f_handler& receiver,
+	size_t size, bool random, bool enabled, unsigned resume, bool rejected, int split,
+	bool check_size)
+{
+	std::string plain(size, ' ');
+	uint32_t x = 0x2468ace1u;
+	const char text[] = "Emergency shelter status and resource requests.\n";
+	for (size_t i = 0; i < size; ++i)
+	{
+		x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+		plain[i] = random ? (char)(x & 255) : text[i % (sizeof(text) - 1)];
+	}
+	std::vector<uint8_t> encoded(size * 2 + 65536);
+	size_t count = 0;
+	if (lzhuf_encode_buffer((const uint8_t*)plain.data(), size,
+		encoded.data(), encoded.size(), &count) != 0 || count <= resume) return false;
+	bool fixture = !check_size || (random ? count > B2F_PLAIN_BUF_SIZE :
+		count < B2F_PLAIN_BUF_SIZE);
+	if (!fixture) return false;
+
+	char fc[256];
+	std::snprintf(fc, sizeof(fc), "FC EM BODY %zu %zu\rF>\r", size, count);
+	std::string proposal = rejected ? "FC EM REJECT 10 10\r" : "";
+	proposal += fc;
+	std::string delivered;
+	if (!forward(sender, receiver, true, proposal, delivered, split) || delivered != proposal)
+		return false;
+	char fs[64];
+	if (resume) std::snprintf(fs, sizeof(fs), "FS %s!%u\r", rejected ? "-" : "", resume);
+	else std::snprintf(fs, sizeof(fs), "FS %s+\r", rejected ? "-" : "");
+	delivered.clear();
+	if (!forward(receiver, sender, true, fs, delivered, split) || delivered != fs) return false;
+
+	std::string original((const char*)encoded.data() + resume, count - resume);
+	std::string wire;
+	// Keep the control receive independent of transform drain capacity.
+	if (!feed(sender, true, original, wire, split) ||
+		!feed(sender, true, "FF\r", wire, split)) return false;
+	const bool transform = enabled && !resume && size <= B2F_PLAIN_BUF_SIZE &&
+		count <= B2F_PLAIN_BUF_SIZE;
+	const std::string expected_wire = (transform ? plain : original) + "FF\r";
+	delivered.clear();
+	bool ok = wire == expected_wire && feed(receiver, false, wire, delivered, split) &&
+		delivered == original + "FF\r" && !receiver.is_reroll_poisoned();
+	std::printf("B2F_FIRST_ROUND size=%zu comp=%zu enabled=%d resume=%u rejected=%d split=%d transform=%d wire=%zu delivered=%zu exact=%d\n",
+		size, count, enabled, resume, rejected, split, transform,
+		wire.size(), delivered.size(), ok);
+	return ok;
+}
+
+static bool first_payload_sizes()
+{
+	struct Case { size_t size; bool random; bool enabled; unsigned resume; bool rejected; int split; };
+	const Case cases[] = {
+		{B2F_PLAIN_BUF_SIZE - 1, false, true, 0, false, 173},
+		{B2F_PLAIN_BUF_SIZE, false, true, 0, false, 8192},
+		{B2F_PLAIN_BUF_SIZE + 1, false, true, 0, false, 173},
+		{B2F_PLAIN_BUF_SIZE - 1, true, true, 0, false, 8192},
+		{B2F_PLAIN_BUF_SIZE + 1, false, false, 0, false, 8192},
+		{B2F_PLAIN_BUF_SIZE + 1, false, true, 7, false, 173},
+		{B2F_PLAIN_BUF_SIZE + 1, false, true, 0, true, 8192},
+		{B2F_PLAIN_BUF_SIZE + 1, false, true, 0, false, 8192}
+	};
+	bool all = true;
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+	{
+		cl_b2f_handler sender, receiver;
+		sender.init(); receiver.init();
+		const Case& c = cases[i];
+		sender.unroll_enabled = receiver.unroll_enabled = c.enabled;
+		for (int repeat = 0; repeat < 2; ++repeat)
+		{
+			sender.reset(); receiver.reset();
+			std::string delivered;
+			const std::string sid = cr("[PAT-12.18.0-B2FHQEHX$]");
+			bool ok = forward(sender, receiver, true, sid, delivered, c.split) && delivered == sid;
+			delivered.clear();
+			ok = ok && forward(receiver, sender, true, sid, delivered, c.split) && delivered == sid;
+			const bool first = ok && payload_round(sender, receiver, c.size, c.random,
+				c.enabled, c.resume, c.rejected, c.split, true);
+			// A byte-exact first body alone can hide RX still being in payload state.
+			const bool next = first && payload_round(sender, receiver, 5000, false,
+				c.enabled, 0, false, c.split, false);
+			std::printf("B2F_FIRST_PAYLOAD case=%zu repeat=%d first=%d next=%d\n", i, repeat, first, next);
+			all = all && first && next;
+		}
+	}
+	return all;
+}
+
 int run_b2f_bounded_output_test()
 {
 	bool tx_ok = tx_large_body();
 	bool rx_ok = rx_large_body();
+	bool first_ok = first_payload_sizes();
+	std::printf("B2F_FIRST_PAYLOAD_RESULT exact=%d\n", first_ok);
 	std::printf("B2F_BOUNDED_OUTPUT tx=%d rx=%d\n", tx_ok ? 1 : 0, rx_ok ? 1 : 0);
-	return tx_ok && rx_ok ? 0 : 1;
+	return tx_ok && rx_ok && first_ok ? 0 : 1;
 }

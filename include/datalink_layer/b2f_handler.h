@@ -185,6 +185,8 @@ private:
 	bool initialized;
 
 	// Internal helpers
+	bool can_unroll(const st_b2f_proposal& prop) const;
+	uint32_t rx_payload_size(const st_b2f_proposal& prop) const;
 	bool parse_sid_line(const char* line, int len);
 	bool parse_fc_line(const char* line, int len, st_b2f_proposal* prop);
 	bool parse_fs_line(const char* line, int len);

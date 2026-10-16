@@ -373,15 +373,13 @@ int cl_b2f_handler::process_tx_line(const char* line, int len, char* out, int ou
 					// RX side will receive plaintext (if unroll) or LZHUF (if not)
 					// Resume transfers send partial LZHUF — can't unroll
 					auto& prop = proposals[current_payload_idx];
-					bool can_unroll = unroll_enabled && prop.resume_offset == 0;
-					payload_bytes_remaining = can_unroll ?
-						prop.uncomp_size :
-						(prop.comp_size - prop.resume_offset);
+					bool unroll = can_unroll(prop);
+					payload_bytes_remaining = rx_payload_size(prop);
 					state = B2F_PAYLOAD_TRANSFER;
 					payload_buf_pos = 0;
 					printf("[B2F] Remote payloads expected via RX (%u bytes %s)\n",
 						payload_bytes_remaining,
-						can_unroll ? "plaintext" : "LZHUF");
+						unroll ? "plaintext" : "LZHUF");
 					fflush(stdout);
 				}
 				else
@@ -516,6 +514,18 @@ passthrough:
 	return len + 1;
 }
 
+bool cl_b2f_handler::can_unroll(const st_b2f_proposal& prop) const
+{
+	return unroll_enabled && initialized && prop.resume_offset == 0 &&
+		prop.comp_size <= B2F_PLAIN_BUF_SIZE &&
+		prop.uncomp_size <= B2F_PLAIN_BUF_SIZE;
+}
+
+uint32_t cl_b2f_handler::rx_payload_size(const st_b2f_proposal& prop) const
+{
+	return can_unroll(prop) ? prop.uncomp_size : prop.comp_size - prop.resume_offset;
+}
+
 // ---- TX payload handling ----
 
 int cl_b2f_handler::process_tx_payload(const char* in, int in_len, char* out, int out_cap, int* in_consumed)
@@ -538,11 +548,7 @@ int cl_b2f_handler::process_tx_payload(const char* in, int in_len, char* out, in
 			chunk = payload_bytes_remaining;
 
 		// Can only unroll full transfers — resume sends partial LZHUF
-		bool can_unroll = unroll_enabled && initialized &&
-		                  proposals[current_payload_idx].resume_offset == 0 &&
-		                  proposals[current_payload_idx].comp_size <= B2F_PLAIN_BUF_SIZE &&
-		                  proposals[current_payload_idx].uncomp_size <= B2F_PLAIN_BUF_SIZE;
-		if (can_unroll)
+		if (can_unroll(proposals[current_payload_idx]))
 		{
 			if (payload_buf_pos + chunk <= B2F_PAYLOAD_BUF_SIZE)
 			{
@@ -655,11 +661,7 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 			chunk = payload_bytes_remaining;
 
 		// Can only reroll full transfers — resume sends partial LZHUF
-		bool can_unroll = unroll_enabled && initialized &&
-		                  proposals[current_payload_idx].resume_offset == 0 &&
-		                  proposals[current_payload_idx].comp_size <= B2F_PLAIN_BUF_SIZE &&
-		                  proposals[current_payload_idx].uncomp_size <= B2F_PLAIN_BUF_SIZE;
-		if (can_unroll)
+		if (can_unroll(proposals[current_payload_idx]))
 		{
 			if (payload_buf_pos + chunk <= B2F_PAYLOAD_BUF_SIZE)
 			{
@@ -746,13 +748,7 @@ int cl_b2f_handler::process_rx_payload(const char* in, int in_len, char* out, in
 				if (current_payload_idx >= 0)
 				{
 					auto& np = proposals[current_payload_idx];
-					bool next_can_unroll = unroll_enabled && initialized &&
-						np.resume_offset == 0 &&
-						np.comp_size <= B2F_PLAIN_BUF_SIZE &&
-						np.uncomp_size <= B2F_PLAIN_BUF_SIZE;
-					payload_bytes_remaining = next_can_unroll ?
-						np.uncomp_size :
-						(np.comp_size - np.resume_offset);
+					payload_bytes_remaining = rx_payload_size(np);
 					printf("[B2F-RX] Next payload: %s (%u bytes%s)\n",
 						np.mid, payload_bytes_remaining,
 						np.resume_offset > 0 ? " resume" : "");
