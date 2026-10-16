@@ -21,6 +21,7 @@
  */
 
 #include "datalink_layer/fifo_buffer.h"
+#include <new>
 
 
 
@@ -49,18 +50,14 @@ void cl_fifo_buffer::flush()
 
 int cl_fifo_buffer::set_size(int size)
 {
-	int success=ERROR_;
-	data= new char[size];
-	if(data!=NULL)
-	{
-		this->size=size;
-		for(int i=0;i<this->size;i++)
-		{
-			this->data[i]=0;
-		}
-		success=SUCCESSFUL;
-	}
-	return success;
+    if(size < 2) return ERROR_;
+    char* replacement = new (std::nothrow) char[size]();
+    if(replacement == nullptr) return ERROR_;
+    delete[] data;
+    data = replacement;
+    this->size = size;
+    flush();
+    return SUCCESSFUL;
 }
 
 int cl_fifo_buffer::get_size()
