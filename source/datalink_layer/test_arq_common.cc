@@ -1533,6 +1533,101 @@ int cl_arq_controller::test_t1_fresh_connect_reset()
 	check(!t1_schedkey.armed,
 		"first clean DATA turnaround cannot arm PREKEY without session-B calibration");
 
+	// Receiver coordinates belong to the loaded capture geometry. Session
+	// teardown and idle CONNECT retain it; only a real configuration load
+	// publishes a fresh coordinate system. Exercise the production entry points.
+	{
+		cl_telecom_system ts;
+		ts.operation_mode = BER_PLOT_passband;
+		ts.narrowband_enabled = NO;
+		check(ts.load_configuration(CONFIG_15) == 0, "receiver lifecycle loads cfg15");
+		cl_telecom_system* saved_telecom = telecom_system;
+		telecom_system = &ts;
+		current_configuration = CONFIG_15;
+		init_configuration = CONFIG_15;
+		narrowband_enabled = NO;
+		nb_probe_max = 0;
+		ts.preamble_amortization_enabled = true;
+		ts.ofdm_defer_overflow_enabled = true;
+		const char* mini_env = std::getenv("MERCURY_KEYDOWN_MINI0");
+		const int mini = (!mini_env || !*mini_env || atoi(mini_env) != 0) ? 0 : 1;
+		const int search = mini == 0 ? ts.data_container.preamble_nSymb + 6
+			: ts.data_container.buffer_Nsymb - 1;
+		auto seed = [&]() {
+			ts.receive_stats.ofdm_search_raw = search;
+			ts.receive_stats.mfsk_search_raw = 3;
+			ts.receive_stats.ofdm_batch_active = true;
+			ts.receive_stats.ofdm_drift_per_frame = 2.5;
+			ts.receive_stats.delay_of_last_decoded_message = 1234;
+			ts.data_container.nUnder_processing_events = 0;
+		};
+		auto grid_check = [&](const char* stage, bool reset) {
+			const auto& r = ts.receive_stats;
+			auto field = [&](bool ok, const char* name) {
+				char label[160];
+				snprintf(label, sizeof(label), "RX lifecycle %s: %s", stage, name);
+				check(ok, label);
+			};
+			field(r.ofdm_search_raw == (reset ? 0 : search), "OFDM cursor");
+			field(r.mfsk_search_raw == (reset ? 0 : 3), "MFSK cursor");
+			field(r.ofdm_batch_active == !reset, "batch activity");
+			field(r.ofdm_drift_per_frame == (reset ? 0.0 : 2.5), "drift");
+			field(r.delay_of_last_decoded_message == (reset ? -1 : 1234), "decoded delay");
+		};
+		auto next_receive = [&](const char* stage, bool reset) {
+			const int pb = ts.data_container.Nofdm * ts.frequency_interpolation_rate
+				* ts.data_container.buffer_Nsymb;
+			std::vector<double> silence((size_t)pb, 0.0);
+			std::vector<int> out((size_t)N_MAX, 0);
+			ts.receive_stats.last_eff_preamble_nsymb = -99;
+			auto r = ts.receive_byte(silence.data(), out.data());
+			const int expected = reset ? ts.data_container.preamble_nSymb : mini;
+			printf("[TEST-RX-LIFECYCLE] ROUTE stage=%s mini=%d config=%d overflow=%d decoded=%d reported=%d expected=%d\n",
+				stage, mini, ts.current_configuration, r.frame_overflow_symbols,
+				r.message_decoded, ts.receive_stats.last_eff_preamble_nsymb, expected);
+			check(r.message_decoded != YES && (reset || mini == 0 || r.frame_overflow_symbols > 0),
+				"RX lifecycle next receive witnesses rejection/defer route");
+			check(ts.receive_stats.last_eff_preamble_nsymb == expected,
+				"RX lifecycle next receive reports searched geometry");
+		};
+
+		seed();
+		load_configuration(CONFIG_15, FULL, YES);
+		grid_check("same-config", false);
+		next_receive("same-config", false);
+
+		seed();
+		link_status = IDLE;
+		process_user_command("CONNECT TESTA TESTB");
+		check(link_status == CONNECTING && current_configuration == CONFIG_15,
+			"RX lifecycle idle CONNECT retains loaded configuration");
+		grid_check("idle-CONNECT", false);
+		next_receive("idle-CONNECT", false);
+
+		seed();
+		link_status = CONNECTED;
+		reset_session_state();
+		check(current_configuration == CONFIG_NONE && ts.current_configuration == CONFIG_NONE,
+			"RX lifecycle actual teardown invalidates configuration");
+		grid_check("teardown", false);
+		next_receive("teardown", false);
+
+		// Keep the command transmit hook absent for this entry: production
+		// CONNECT must actually reload the PHY after teardown, not skip it as
+		// the socket-only command harness does.
+		seed();
+		auto saved_hook = cl_tcp_socket::g_test_transmit_hook;
+		cl_tcp_socket::g_test_transmit_hook = nullptr;
+		process_user_command("CONNECT TESTA TESTB");
+		cl_tcp_socket::g_test_transmit_hook = saved_hook;
+		check(link_status == CONNECTING && current_configuration == CONFIG_15
+			&& ts.current_configuration == CONFIG_15,
+			"RX lifecycle reconnect actually reloads cfg15");
+		grid_check("reconnect-load", true);
+		next_receive("reconnect-load", true);
+		telecom_system = saved_telecom;
+	}
+
 	unsetenv("MERCURY_T1_SCHEDKEY");
 	printf("[TEST-T1-FRESH-CONNECT] %s: fails=%d\n",
 		fails ? "FAIL" : "PASS", fails);
