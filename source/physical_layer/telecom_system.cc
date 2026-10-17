@@ -14707,15 +14707,6 @@ void cl_telecom_system::force_set_capture_ring_natural()
 	MUTEX_UNLOCK(&capture_prep_mutex);
 }
 
-void cl_telecom_system::return_to_last_configuration()
-{
-	int tmp;
-	this->load_configuration(last_configuration);
-	tmp= last_configuration;
-	last_configuration=current_configuration;
-	current_configuration=tmp;
-}
-
 // SNR-to-config mapping for supershift (BER waterfall + 2 dB margin).
 // Callers apply SUPERSHIFT_MARGIN_DB on top (the asserted value is 6.0 dB —
 // arq_commander.cc J0 unit assert). These thresholds are 100-frame passband BER waterfalls,

@@ -1283,7 +1283,6 @@ public:
 	void regenerate_bit_energy_dispersal_sequence();
 	int last_configuration;
 	int current_configuration;
-	void return_to_last_configuration();
 	int get_configuration(double SNR);  // returns CONFIG_0..16 (never CONFIG_NONE)
 
 	int get_frame_size_bytes();
