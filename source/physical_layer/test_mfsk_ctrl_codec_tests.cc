@@ -4019,7 +4019,7 @@ static void test_suffix_fec_cliff_sweep() {
 	printf("  [MEASURE] suffix-FEC acquisition cliff (hard vs soft CRC-list decode):\n");
 	suffix_cliff_one("CONNECT", /*ack_path=*/false);
 	suffix_cliff_one("ACK    ", /*ack_path=*/true);
-	test_pass(name);  // infra ran; dB verdict is in the log
+	printf("  [DIAG] %s: measurement only, no verdict\n", name);
 }
 
 // =============================================================================
@@ -4281,7 +4281,7 @@ static void test_gf16_ra_correction_capability() {
 		printf("\n");
 	}
 	gf16ra::configure(2);  // restore default
-	test_pass(name);
+	printf("  [DIAG] %s: measurement only, no verdict\n", name);
 }
 
 // tone gets all the energy). Exercises encode + BP + CRC gate without DSP.
@@ -5390,7 +5390,7 @@ static void test_gf16_ra_cliff_sweep() {
 	gf16ra_cliff_one(1); gf16ra_cliff_one(2); gf16ra_cliff_one(3);
 	g_gf16_skip_moose = true; g_gf16_relax_metric_gate = false;
 	gf16ra::configure(2);  // restore default
-	test_pass(name);  // infra ran; dB verdict is in the log
+	printf("  [DIAG] %s: measurement only, no verdict\n", name);
 }
 
 // §19 (INCREMENT 1) — THE GATE FOR THIS INCREMENT: the PRODUCTION CONNECT decode
@@ -7540,8 +7540,8 @@ static void test_recovery_ack_cfo_gate() {
 			"base-pattern combining already addresses it); a CFO refine is held default-off. Do NOT proceed to HW on "
 			"DELTA-2.\n", (double)msum_comb/NT, (double)msum_ref/NT);
 	}
-	// The gate RAN and produced a verdict — that is a successful diagnostic. PASS.
-	test_pass(name);
+	// GO and STOP describe the measured decision; completion adds no test pass.
+	printf("  [DIAG] %s: measurement only, no verdict\n", name);
 }
 
 // =============================================================================
@@ -10073,7 +10073,7 @@ static void test_scream_detection_sweep() {
 		printf("    NOTE: smoke-only trial count; use >=100 trials for reportable floors.\n");
 	else
 		printf("    NOTE: reportable Monte Carlo trial count; compare confidence and detector gates explicitly.\n");
-	test_pass(name);
+	printf("  [DIAG] %s: measurement only, no verdict\n", name);
 }
 
 // The repfact guard restores the default after an early return that follows
