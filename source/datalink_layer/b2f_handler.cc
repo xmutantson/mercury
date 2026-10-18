@@ -33,6 +33,8 @@ cl_b2f_handler::cl_b2f_handler()
 	rx_pending_buf = nullptr;
 	initialized = false;
 	unroll_enabled = true;
+	tx_pending_line_pos = tx_pending_line_len = 0;
+	rx_pending_line_pos = rx_pending_line_len = 0;
 	tx_pending_output_pos = 0;
 	tx_pending_output_len = 0;
 	tx_deferred_input_len = 0;
@@ -73,6 +75,8 @@ void cl_b2f_handler::deinit()
 	if (payload_buf) { free(payload_buf); payload_buf = nullptr; }
 	if (plain_buf) { free(plain_buf); plain_buf = nullptr; }
 	if (rx_pending_buf) { free(rx_pending_buf); rx_pending_buf = nullptr; }
+	tx_pending_line_pos = tx_pending_line_len = 0;
+	rx_pending_line_pos = rx_pending_line_len = 0;
 	tx_pending_output_pos = 0;
 	tx_pending_output_len = 0;
 	tx_deferred_input_len = 0;
@@ -85,6 +89,8 @@ void cl_b2f_handler::deinit()
 
 void cl_b2f_handler::reset()
 {
+	tx_pending_line_pos = tx_pending_line_len = 0;
+	rx_pending_line_pos = rx_pending_line_len = 0;
 	tx_pending_output_pos = 0;
 	tx_pending_output_len = 0;
 	tx_deferred_input_len = 0;
@@ -108,13 +114,13 @@ void cl_b2f_handler::reset()
 bool cl_b2f_handler::has_pending_tx_work() const
 {
 	return tx_pending_output_pos < tx_pending_output_len ||
-		tx_deferred_input_len > 0;
+		tx_deferred_input_len > 0 || tx_pending_line_pos < tx_pending_line_len;
 }
 
 bool cl_b2f_handler::has_pending_rx_work() const
 {
 	return rx_pending_output_pos < rx_pending_output_len ||
-		rx_deferred_input_len > 0;
+		rx_deferred_input_len > 0 || rx_pending_line_pos < rx_pending_line_len;
 }
 
 bool cl_b2f_handler::requeue_tx_output(const char* data, int len)
@@ -143,36 +149,60 @@ bool cl_b2f_handler::requeue_tx_output(const char* data, int len)
 
 int cl_b2f_handler::drain_tx_pending(char* out, int out_cap)
 {
-	if (out_cap <= 0 || tx_pending_output_pos >= tx_pending_output_len)
-		return 0;
+	int copied = 0;
 	int remaining = tx_pending_output_len - tx_pending_output_pos;
-	int copy = remaining < out_cap ? remaining : out_cap;
-	memcpy(out, payload_buf + tx_pending_output_pos, copy);
-	tx_pending_output_pos += copy;
-	if (tx_pending_output_pos == tx_pending_output_len)
+	if (out_cap > 0 && remaining > 0)
 	{
-		tx_pending_output_pos = 0;
-		tx_pending_output_len = 0;
-		payload_buf_pos = 0;
+		copied = remaining < out_cap ? remaining : out_cap;
+		memcpy(out, payload_buf + tx_pending_output_pos, copied);
+		tx_pending_output_pos += copied;
+		if (tx_pending_output_pos == tx_pending_output_len)
+		{
+			tx_pending_output_pos = tx_pending_output_len = 0;
+			payload_buf_pos = 0;
+		}
 	}
-	return copy;
+	remaining = tx_pending_line_len - tx_pending_line_pos;
+	int room = out_cap - copied;
+	if (room > 0 && remaining > 0)
+	{
+		int count = remaining < room ? remaining : room;
+		memcpy(out + copied, tx_line_buf + tx_pending_line_pos, count);
+		tx_pending_line_pos += count;
+		copied += count;
+		if (tx_pending_line_pos == tx_pending_line_len)
+			tx_pending_line_pos = tx_pending_line_len = 0;
+	}
+	return copied;
 }
 
 int cl_b2f_handler::drain_rx_pending(char* out, int out_cap)
 {
-	if (out_cap <= 0 || rx_pending_output_pos >= rx_pending_output_len)
-		return 0;
+	int copied = 0;
 	int remaining = rx_pending_output_len - rx_pending_output_pos;
-	int copy = remaining < out_cap ? remaining : out_cap;
-	memcpy(out, rx_pending_buf + rx_pending_output_pos, copy);
-	rx_pending_output_pos += copy;
-	if (rx_pending_output_pos == rx_pending_output_len)
+	if (out_cap > 0 && remaining > 0)
 	{
-		rx_pending_output_pos = 0;
-		rx_pending_output_len = 0;
-		payload_buf_pos = 0;
+		copied = remaining < out_cap ? remaining : out_cap;
+		memcpy(out, rx_pending_buf + rx_pending_output_pos, copied);
+		rx_pending_output_pos += copied;
+		if (rx_pending_output_pos == rx_pending_output_len)
+		{
+			rx_pending_output_pos = rx_pending_output_len = 0;
+			payload_buf_pos = 0;
+		}
 	}
-	return copy;
+	remaining = rx_pending_line_len - rx_pending_line_pos;
+	int room = out_cap - copied;
+	if (room > 0 && remaining > 0)
+	{
+		int count = remaining < room ? remaining : room;
+		memcpy(out + copied, rx_line_buf + rx_pending_line_pos, count);
+		rx_pending_line_pos += count;
+		copied += count;
+		if (rx_pending_line_pos == rx_pending_line_len)
+			rx_pending_line_pos = rx_pending_line_len = 0;
+	}
+	return copied;
 }
 
 // ---- B2F Line Parsers ----
@@ -921,10 +951,27 @@ int cl_b2f_handler::filter_tx_input(const char* in, int in_len, char* out, int o
 			if (c == '\r')
 			{
 				tx_line_buf[tx_line_pos] = '\0';
-				int written = process_tx_line(tx_line_buf, tx_line_pos, out + out_pos, out_cap - out_pos);
+				char line_output[B2F_LINE_BUF_SIZE];
+				int written = process_tx_line(tx_line_buf, tx_line_pos,
+					line_output, sizeof(line_output));
 				if (written < 0) return -1;
-				out_pos += written;
+				memcpy(tx_line_buf, line_output, written);
 				tx_line_pos = 0;
+				tx_pending_line_pos = 0;
+				tx_pending_line_len = written;
+				out_pos += drain_tx_pending(out + out_pos, out_cap - out_pos);
+				if (tx_pending_line_pos < tx_pending_line_len)
+				{
+					int remaining = in_len - in_pos;
+					if (remaining > B2F_DEFERRED_INPUT_SIZE || tx_deferred_input_len != 0)
+					{
+						fatal_error = true;
+						return -1;
+					}
+					memcpy(tx_deferred_input, in + in_pos, remaining);
+					tx_deferred_input_len = remaining;
+					break;
+				}
 			}
 			else if (c != '\n')
 			{
@@ -945,7 +992,8 @@ int cl_b2f_handler::filter_tx(const char* in, int in_len, char* out, int out_cap
 		return -1;
 
 	int out_pos = drain_tx_pending(out, out_cap);
-	if (tx_pending_output_pos < tx_pending_output_len)
+	if (tx_pending_output_pos < tx_pending_output_len ||
+		tx_pending_line_pos < tx_pending_line_len)
 		return in_len == 0 ? out_pos : -1;
 
 	if (tx_deferred_input_len > 0)
@@ -1098,10 +1146,27 @@ int cl_b2f_handler::filter_rx_input(const char* in, int in_len, char* out, int o
 			if (c == '\r')
 			{
 				rx_line_buf[rx_line_pos] = '\0';
-				int written = process_rx_line(rx_line_buf, rx_line_pos, out + out_pos, out_cap - out_pos);
+				char line_output[B2F_LINE_BUF_SIZE];
+				int written = process_rx_line(rx_line_buf, rx_line_pos,
+					line_output, sizeof(line_output));
 				if (written < 0) return -1;
-				out_pos += written;
+				memcpy(rx_line_buf, line_output, written);
 				rx_line_pos = 0;
+				rx_pending_line_pos = 0;
+				rx_pending_line_len = written;
+				out_pos += drain_rx_pending(out + out_pos, out_cap - out_pos);
+				if (rx_pending_line_pos < rx_pending_line_len)
+				{
+					int remaining = in_len - in_pos;
+					if (remaining > B2F_DEFERRED_INPUT_SIZE || rx_deferred_input_len != 0)
+					{
+						fatal_error = true;
+						return -1;
+					}
+					memcpy(rx_deferred_input, in + in_pos, remaining);
+					rx_deferred_input_len = remaining;
+					break;
+				}
 			}
 			else if (c != '\n')
 			{
@@ -1122,7 +1187,8 @@ int cl_b2f_handler::filter_rx(const char* in, int in_len, char* out, int out_cap
 		return -1;
 
 	int out_pos = drain_rx_pending(out, out_cap);
-	if (rx_pending_output_pos < rx_pending_output_len)
+	if (rx_pending_output_pos < rx_pending_output_len ||
+		rx_pending_line_pos < rx_pending_line_len)
 		return in_len == 0 ? out_pos : -1;
 
 	if (rx_deferred_input_len > 0)

@@ -156,6 +156,9 @@ private:
 	int tx_line_pos;
 	char rx_line_buf[B2F_LINE_BUF_SIZE];
 	int rx_line_pos;
+	// Completed control framing drains independently of payload capture.
+	int tx_pending_line_pos, tx_pending_line_len;
+	int rx_pending_line_pos, rx_pending_line_len;
 
 	// C3 reroll-divergence guard state (cleared by reset()).
 	long long reroll_divergence;   // count of size-mismatched (divergent) rerolls

@@ -186,7 +186,7 @@ static bool forward(cl_b2f_handler& sender, cl_b2f_handler& receiver,
 
 static bool payload_round(cl_b2f_handler& sender, cl_b2f_handler& receiver,
 	size_t size, bool random, bool enabled, unsigned resume, bool rejected, int split,
-	bool check_size)
+	bool check_size, bool same_receive = false)
 {
 	std::string plain(size, ' ');
 	uint32_t x = 0x2468ace1u;
@@ -219,8 +219,11 @@ static bool payload_round(cl_b2f_handler& sender, cl_b2f_handler& receiver,
 
 	std::string original((const char*)encoded.data() + resume, count - resume);
 	std::string wire;
-	// Keep the control receive independent of transform drain capacity.
-	if (!feed(sender, true, original, wire, split) ||
+	if (same_receive)
+	{
+		if (!feed(sender, true, original + "FF\r", wire, split)) return false;
+	}
+	else if (!feed(sender, true, original, wire, split) ||
 		!feed(sender, true, "FF\r", wire, split)) return false;
 	const bool transform = enabled && !resume && size <= B2F_PLAIN_BUF_SIZE &&
 		count <= B2F_PLAIN_BUF_SIZE;
@@ -254,6 +257,7 @@ static bool first_payload_sizes()
 		sender.init(); receiver.init();
 		const Case& c = cases[i];
 		sender.unroll_enabled = receiver.unroll_enabled = c.enabled;
+		for (bool same_receive : {false, true})
 		for (int repeat = 0; repeat < 2; ++repeat)
 		{
 			sender.reset(); receiver.reset();
@@ -263,11 +267,11 @@ static bool first_payload_sizes()
 			delivered.clear();
 			ok = ok && forward(receiver, sender, true, sid, delivered, c.split) && delivered == sid;
 			const bool first = ok && payload_round(sender, receiver, c.size, c.random,
-				c.enabled, c.resume, c.rejected, c.split, true);
+				c.enabled, c.resume, c.rejected, c.split, true, same_receive);
 			// A byte-exact first body alone can hide RX still being in payload state.
 			const bool next = first && payload_round(sender, receiver, 5000, false,
 				c.enabled, 0, false, c.split, false);
-			std::printf("B2F_FIRST_PAYLOAD case=%zu repeat=%d first=%d next=%d\n", i, repeat, first, next);
+			std::printf("B2F_FIRST_PAYLOAD case=%zu same_receive=%d repeat=%d first=%d next=%d\n", i, same_receive, repeat, first, next);
 			all = all && first && next;
 		}
 	}
@@ -367,8 +371,153 @@ static bool post_passthrough_payloads()
 	return all;
 }
 
+// The receive ending a body also contains control framing. Choose the final
+// drain's capacity from the known remaining byte count, so every output seam
+// (exact fill, one byte free, two bytes free) is exercised in both directions.
+static bool control_tail_case(bool tx, bool retained_body, int gap, bool requeue)
+{
+	std::string plain(5000, ' ');
+	const char key[] = "TAIL-327 keyed application body\n";
+	for (size_t i = 0; i < plain.size(); ++i)
+		plain[i] = key[i % (sizeof(key) - 1)];
+	std::vector<uint8_t> encoded(plain.size() * 2 + 65536);
+	size_t count = 0;
+	if (lzhuf_encode_buffer((const uint8_t*)plain.data(), plain.size(),
+		encoded.data(), encoded.size(), &count) != 0) return false;
+	cl_b2f_handler handler;
+	handler.init();
+	char out[8192];
+	sid_exchange(handler, out, sizeof(out));
+	auto filter = [&](const char* data, int len, int cap) {
+		return tx ? handler.filter_tx(data, len, out, cap) :
+			handler.filter_rx(data, len, out, cap);
+	};
+	auto pending = [&]() {
+		return tx ? handler.has_pending_tx_work() : handler.has_pending_rx_work();
+	};
+	char fc[128];
+	std::snprintf(fc, sizeof(fc), "FC EM TAIL327 %zu %zu\rF>\r", plain.size(), count);
+	if (filter(fc, std::strlen(fc), sizeof(out)) != (int)std::strlen(fc)) return false;
+	const std::string fs = "FS +\r";
+	int n = tx ? handler.filter_rx(fs.data(), fs.size(), out, sizeof(out)) :
+		handler.filter_tx(fs.data(), fs.size(), out, sizeof(out));
+	if (n != (int)fs.size()) return false;
+	const std::string body = tx ? plain : std::string((const char*)encoded.data(), count);
+	const std::string input = (tx ? std::string((const char*)encoded.data(), count) : plain) + "FF\r";
+	std::string delivered;
+	int cap = retained_body ? 1 : (int)body.size() + gap;
+	n = filter(input.data(), input.size(), cap);
+	bool ok = n >= 0;
+	if (n > 0)
+	{
+		if (requeue) ok = handler.requeue_tx_output(out, n);
+		else delivered.append(out, n);
+	}
+	if (retained_body && ok)
+	{
+		// Restored bytes also remain before the retained body and control line.
+		cap = (int)body.size() - (int)delivered.size() + gap;
+		n = filter(nullptr, 0, cap);
+		ok = n >= 0;
+		if (n > 0) delivered.append(out, n);
+	}
+	// Capacity 0 preserves custody. Capacity 1 must make bounded progress even
+	// when the remaining control record is longer than the caller's buffer.
+	if (ok && pending()) ok = filter(nullptr, 0, 0) == 0 && pending();
+	for (int i = 0; ok && pending() && i < 8192; ++i)
+	{
+		n = filter(nullptr, 0, 1);
+		ok = n > 0;
+		if (n > 0) delivered.append(out, n);
+	}
+	ok = ok && !pending() && delivered == body + "FF\r" && !handler.has_fatal_error();
+	// A second proposal/response/body proves the control transition completed.
+	if (ok)
+	{
+		if (filter(fc, std::strlen(fc), sizeof(out)) != (int)std::strlen(fc)) ok = false;
+		n = tx ? handler.filter_rx(fs.data(), fs.size(), out, sizeof(out)) :
+			handler.filter_tx(fs.data(), fs.size(), out, sizeof(out));
+		if (n != (int)fs.size()) ok = false;
+		n = filter(input.data(), input.size(), sizeof(out));
+		ok = ok && n == (int)body.size() + 3 && std::string(out, n) == body + "FF\r";
+	}
+	std::printf("B2F_CONTROL_TAIL tx=%d retained=%d gap=%d requeue=%d exact=%d\n",
+		tx, retained_body, gap, requeue, ok);
+	return ok;
+}
+
+static bool small_control_lines(bool tx)
+{
+	cl_b2f_handler handler;
+	handler.init();
+	char out[8192];
+	sid_exchange(handler, out, sizeof(out));
+	auto filter = [&](const char* data, int len, int cap) {
+		return tx ? handler.filter_tx(data, len, out, cap) :
+			handler.filter_rx(data, len, out, cap);
+	};
+	auto pending = [&]() {
+		return tx ? handler.has_pending_tx_work() : handler.has_pending_rx_work();
+	};
+	// A split accumulator, multiple complete lines and an empty line exercise
+	// state transitions exactly once without using payload capture as scratch.
+	bool ok = filter("F", 1, 1) == 0;
+	std::string rest = "F\rFQ\r\r";
+	int n = filter(rest.data(), rest.size(), 1);
+	ok = ok && n == 1;
+	std::string got;
+	if (n > 0) got.append(out, n);
+	for (int i = 0; ok && pending() && i < 32; ++i)
+	{
+		n = filter(nullptr, 0, 1);
+		ok = n > 0;
+		if (n > 0) got.append(out, n);
+	}
+	ok = ok && got == "FF\rFQ\r\r" && !pending();
+	// Reset discards retained framing and its same-receive tail. A fresh
+	// session must deliver only its new keyed data, in either direction.
+	n = filter("FF\rFQ\r", 6, 1);
+	ok = ok && n == 1 && pending();
+	if (pending())
+	{
+		int opposite = tx ? handler.filter_rx("X", 1, out, sizeof(out)) :
+			handler.filter_tx("X", 1, out, sizeof(out));
+		ok = ok && opposite < 0 && !handler.has_fatal_error();
+	}
+	handler.reset();
+	ok = ok && !pending() && filter(nullptr, 0, 1) == 0;
+	sid_exchange(handler, out, sizeof(out));
+	n = filter("NEW327\r", 7, sizeof(out));
+	ok = ok && n == 7 && std::string(out, n) == "NEW327\r";
+	std::printf("B2F_SMALL_CONTROL tx=%d exact=%d\n", tx, ok);
+	return ok;
+}
+
+static bool control_tail_boundaries()
+{
+	bool all = true;
+	for (bool tx : {false, true})
+	{
+		bool small = small_control_lines(tx);
+		all = small && all;
+		for (bool retained : {false, true})
+		for (int gap : {0, 1, 2})
+		{
+			bool ok = control_tail_case(tx, retained, gap, false);
+			all = ok && all;
+			if (tx)
+			{
+				ok = control_tail_case(tx, retained, gap, true);
+				all = ok && all;
+			}
+		}
+	}
+	return all;
+}
+
 int run_b2f_bounded_output_test()
 {
+	bool tail_ok = control_tail_boundaries();
 	bool tx_ok = tx_large_body();
 	bool rx_ok = rx_large_body();
 	bool first_ok = first_payload_sizes();
@@ -376,5 +525,6 @@ int run_b2f_bounded_output_test()
 	std::printf("B2F_POST_PAYLOAD_RESULT exact=%d\n", post_ok);
 	std::printf("B2F_FIRST_PAYLOAD_RESULT exact=%d\n", first_ok);
 	std::printf("B2F_BOUNDED_OUTPUT tx=%d rx=%d\n", tx_ok ? 1 : 0, rx_ok ? 1 : 0);
-	return tx_ok && rx_ok && first_ok && post_ok ? 0 : 1;
+	std::printf("B2F_CONTROL_TAIL_RESULT exact=%d\n", tail_ok);
+	return tail_ok && tx_ok && rx_ok && first_ok && post_ok ? 0 : 1;
 }
