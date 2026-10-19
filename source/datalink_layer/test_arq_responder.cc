@@ -9678,8 +9678,9 @@ int cl_arq_controller::test_recovery_ack_capture()
 		fflush(stdout); return 1;
 	}
 
+	int fails = 0;
 	std::vector<std::complex<double> > bb;
-	auto score_at = [&](int off, int& out_matched, double& out_metric) {
+	auto score_at = [&](int off, int reps, bool partial, int& out_matched, double& out_metric) {
 		std::vector<double> snap((size_t)tail_samples, 0.0);
 		for(int i = 0; i < tail_samples; i++)
 			snap[(size_t)i] = dc.passband_delayed_data[off + i];
@@ -9688,21 +9689,32 @@ int cl_arq_controller::test_recovery_ack_capture()
 		telecom_system->ofdm.passband_to_baseband_decimated(snap.data(), tail_samples,
 			bb.data(), fs, eff_carrier, telecom_system->carrier_amplitude, Mdec,
 			&telecom_system->ofdm.FIR_rx_data);
-		int matched = 0; int bo = -1; uint32_t mask = 0;
-		telecom_system->ofdm.ack_allow_partial_tail = true;
-		double met = telecom_system->ofdm.detect_ack_pattern(
-			bb.data(), dec, 1,
-			telecom_system->ack_mfsk.ack_pattern_nsymb,
-			telecom_system->ack_mfsk.ack_tones, telecom_system->ack_mfsk.ack_pattern_len,
-			telecom_system->ack_mfsk.tone_hop_step, telecom_system->ack_mfsk.M,
-			telecom_system->ack_mfsk.nStreams, telecom_system->ack_mfsk.stream_offsets,
-			&matched, 0, nullptr, &bo, 0, &mask,
-			/*always_fine=*/true, /*combine_reps=*/1);
-		telecom_system->ofdm.ack_allow_partial_tail = false;
-		out_matched = matched; out_metric = met;
+		const bool outer_partial = telecom_system->ofdm.ack_allow_partial_tail;
+		for(int prior = 0; prior <= 1; prior++)
+		{
+			telecom_system->ofdm.ack_allow_partial_tail = (prior != 0);
+			int matched = 0; int bo = -1; uint32_t mask = 0;
+			const bool saved_partial = telecom_system->ofdm.ack_allow_partial_tail;
+			telecom_system->ofdm.ack_allow_partial_tail = partial;
+			double met = telecom_system->ofdm.detect_ack_pattern(
+				bb.data(), dec, 1,
+				telecom_system->ack_mfsk.ack_pattern_nsymb,
+				telecom_system->ack_mfsk.ack_tones, telecom_system->ack_mfsk.ack_pattern_len,
+				telecom_system->ack_mfsk.tone_hop_step, telecom_system->ack_mfsk.M,
+				telecom_system->ack_mfsk.nStreams, telecom_system->ack_mfsk.stream_offsets,
+				&matched, 0, nullptr, &bo, 0, &mask,
+				/*always_fine=*/true, /*combine_reps=*/reps);
+			telecom_system->ofdm.ack_allow_partial_tail = saved_partial;
+			const bool preserved = (telecom_system->ofdm.ack_allow_partial_tail == (prior != 0));
+			printf("[%s] RESTORE prior=%d reps=%d partial=%d actual=%d %s\n",
+				NM, prior, reps, partial, telecom_system->ofdm.ack_allow_partial_tail ? 1 : 0,
+				preserved ? "PASS" : "FAIL");
+			if(!preserved) fails++;
+			out_matched = matched; out_metric = met;
+		}
+		telecom_system->ofdm.ack_allow_partial_tail = outer_partial;
 	};
 
-	int fails = 0;
 	int total = 2 * signal_period;
 	int stride = pattern_len * sym_samples;
 
@@ -9721,7 +9733,7 @@ int cl_arq_controller::test_recovery_ack_capture()
 		}
 
 		int m_nt = 0; double met_nt = 0.0;
-		score_at(tail_offset, m_nt, met_nt);
+		score_at(tail_offset, 1, true, m_nt, met_nt);
 		printf("[%s] ARM1 newest-tail: matched=%d/16 metric=%.2f (placed present~%d) -> %s\n",
 			NM, m_nt, met_nt, partial_present, (m_nt < thr) ? "MISS (expected)" : "UNEXPECTED HIT");
 		if(m_nt >= thr)
@@ -9745,7 +9757,7 @@ int cl_arq_controller::test_recovery_ack_capture()
 			double rms = std::sqrt(sumsq / tail_samples);
 			if(rms < MW_GATE_RMS) continue;
 			int mm = 0; double mmet = 0.0;
-			score_at(off, mm, mmet);
+			score_at(off, 1, true, mm, mmet);
 			if(mm >= thr)
 			{
 				chosen_off = off; m_mw = mm; met_mw = mmet; break;
@@ -9789,6 +9801,40 @@ int cl_arq_controller::test_recovery_ack_capture()
 		{
 			printf("[%s] ARM3b FAIL: a written (noisy) ring was wrongly flagged unfilled\n", NM);
 			fails++;
+		}
+	}
+
+
+	// Full blocks and a right-edge truncation exercise both repetition gates.
+	// Reuse the generated single-block waveform; keep channel and thresholds fixed.
+	if(ack_base_total != ack_nsymb || ack_samples != ack_nsymb * sym_samples ||
+	   tail_samples < (2 * ack_nsymb + 4) * sym_samples)
+	{
+		printf("[%s] GATE fixture geometry FAIL\n", NM);
+		fails++;
+	}
+	else
+	{
+		for(int truncated = 0; truncated <= 1; truncated++)
+		{
+			memset(dc.passband_delayed_data, 0, (size_t)total * sizeof(double));
+			const int present = ack_nsymb - 4;
+			const int begin = tail_offset + (truncated ? tail_samples - present * sym_samples : 2 * sym_samples);
+			for(int i = 0; i < 2 * ack_samples && begin + i < signal_period; i++)
+				dc.passband_delayed_data[begin + i] = ack_pb[(size_t)(i % ack_samples)];
+			for(int reps = 1; reps <= 2; reps++)
+			{
+				int strict_m = 0, partial_m = 0;
+				double strict_met = 0.0, partial_met = 0.0;
+				score_at(tail_offset, reps, false, strict_m, strict_met);
+				score_at(tail_offset, reps, true, partial_m, partial_met);
+				const bool ok = !truncated ? (strict_m >= thr && partial_m >= thr) :
+					(reps == 1 ? (strict_m < thr && partial_m >= thr) :
+					 (strict_m == partial_m && strict_met == partial_met && strict_m < thr));
+				printf("[%s] GATE truncated=%d reps=%d strict=%d/%.9g partial=%d/%.9g %s\n",
+					NM, truncated, reps, strict_m, strict_met, partial_m, partial_met, ok ? "PASS" : "FAIL");
+				if(!ok) fails++;
+			}
 		}
 	}
 
