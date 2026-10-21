@@ -754,11 +754,140 @@ int test_high_water_guard_backstop()
 
 } // namespace
 
+int run_installed_key_identity_tests()
+{
+    int failed = 0, checks = 0;
+    auto check = [&](bool ok, const char* what) {
+        ++checks;
+        if (!ok) failed += fail(what);
+    };
+    cl_cipher_suite suite;
+    check(suite.installed_key_identity() == 0, "identity before installation");
+    suite.activate();
+    check(suite.installed_key_identity() == 0, "activation cannot install a key");
+    suite.wipe();
+    check(suite.installed_key_identity() == 0, "wipe before installation");
+
+    // Exact byte controls cover every position, including an installed zero key.
+    uint8_t material[SESSION_KEY_SIZE] = {};
+    suite.install_session_key(material);
+    check(suite.installed_key_identity() != 0, "zero key is an installed key");
+    for (size_t i = 0; i < SESSION_KEY_SIZE; ++i)
+    {
+        uint64_t before = suite.installed_key_identity();
+        suite.install_session_key(material);
+        check(suite.installed_key_identity() == before, "identical install identity");
+        material[i] ^= 0x80;
+        suite.install_session_key(material);
+        uint64_t changed = suite.installed_key_identity();
+        check(changed != 0 && changed != before, "single-byte key change identity");
+        suite.install_session_key(material);
+        check(suite.installed_key_identity() == changed, "identical changed-key identity");
+        material[i] ^= 0x80;
+        suite.install_session_key(material);
+        check(suite.installed_key_identity() != 0 &&
+              suite.installed_key_identity() != changed, "restored current-key identity");
+    }
+    // Exercise defined unsigned wrap without assigning historical authority.
+    suite.session_key_identity = UINT64_MAX;
+    material[SESSION_KEY_SIZE - 1] ^= 1;
+    suite.install_session_key(material);
+    check(suite.installed_key_identity() != 0 &&
+          suite.installed_key_identity() != UINT64_MAX, "identity wrap skips zero");
+    suite.wipe();
+    check(suite.installed_key_identity() == 0, "wipe invalidates installed identity");
+
+    cl_cipher_suite peer;
+    uint8_t local_pub[X25519_KEY_SIZE], peer_pub[X25519_KEY_SIZE];
+    if (suite.generate_x25519_keypair(local_pub) != 0 ||
+        peer.generate_x25519_keypair(peer_pub) != 0 ||
+        suite.compute_x25519_shared(peer_pub) != 0 ||
+        peer.compute_x25519_shared(local_pub) != 0)
+        return failed + fail("identity real X25519 setup");
+    check(suite.installed_key_identity() == 0, "shared secret is not installation");
+    suite.derive_session_key("C", "R", nullptr, 0, false);
+    peer.derive_session_key("C", "R", nullptr, 0, false);
+    uint8_t original[SESSION_KEY_SIZE], other[SESSION_KEY_SIZE];
+    suite.copy_session_key_for_test(original);
+    peer.copy_session_key_for_test(other);
+    check(memcmp(original, other, sizeof(original)) == 0, "paired actual derived keys");
+    uint64_t first = suite.installed_key_identity();
+    check(first != 0, "actual derivation installs identity");
+    suite.activate();
+    suite.activate();
+    check(suite.installed_key_identity() == first, "repeated activation identity");
+    suite.set_kx_phase(KX_IDLE);
+    check(suite.installed_key_identity() == first, "phase bookkeeping identity");
+    suite.derive_session_key("C", "R", nullptr, 0, false);
+    suite.copy_session_key_for_test(other);
+    check(memcmp(original, other, sizeof(original)) == 0 &&
+          suite.installed_key_identity() == first, "actual identical rederivation identity");
+    suite.derive_session_key("D", "R", nullptr, 0, false);
+    suite.copy_session_key_for_test(other);
+    check(memcmp(original, other, sizeof(original)) != 0 &&
+          suite.installed_key_identity() != 0 &&
+          suite.installed_key_identity() != first, "actual different derivation identity");
+    uint64_t second = suite.installed_key_identity();
+    suite.derive_session_key("C", "R", nullptr, 0, false);
+    suite.copy_session_key_for_test(other);
+    check(memcmp(original, other, sizeof(original)) == 0 &&
+          suite.installed_key_identity() != second, "actual A/B/A current transition");
+
+    // The existing alternate producer must obey the same installation invariant.
+    uint64_t before_legacy = suite.installed_key_identity();
+    suite.copy_session_key_for_test(other);
+    suite.derive_session_key_legacy_order_for_test("C", "R", nullptr, 0,
+                                                  nullptr, nullptr, nullptr, nullptr);
+    suite.copy_session_key_for_test(original);
+    uint64_t legacy = suite.installed_key_identity();
+    check(legacy != 0 && legacy != before_legacy &&
+          memcmp(original, other, sizeof(original)) != 0, "legacy producer installed identity");
+    suite.derive_session_key_legacy_order_for_test("C", "R", nullptr, 0,
+                                                  nullptr, nullptr, nullptr, nullptr);
+    suite.copy_session_key_for_test(other);
+    check(memcmp(original, other, sizeof(original)) == 0 &&
+          suite.installed_key_identity() == legacy, "legacy identical rederivation identity");
+    suite.derive_session_key_legacy_order_for_test("D", "R", nullptr, 0,
+                                                  nullptr, nullptr, nullptr, nullptr);
+    suite.copy_session_key_for_test(other);
+    check(memcmp(original, other, sizeof(original)) != 0 &&
+          suite.installed_key_identity() != legacy, "legacy different derivation identity");
+
+    // Return to matching actual peer keys and verify exact authenticated payload.
+    suite.derive_session_key("C", "R", nullptr, 0, false);
+    suite.activate();
+    peer.activate();
+    uint8_t plain[37], cipher[37 + AUTH_TAG_SIZE], decoded[37];
+    for (size_t i = 0; i < sizeof(plain); ++i) plain[i] = (uint8_t)(i * 19 + 7);
+    uint64_t active = suite.installed_key_identity();
+    for (uint32_t direction = 0; direction != 2; ++direction)
+    {
+        int n = suite.encrypt(plain, sizeof(plain), cipher, sizeof(cipher),
+                              382, direction, AUTH_TAG_SIZE);
+        int m = n > 0 ? peer.decrypt(cipher, n, decoded, sizeof(decoded),
+                                     382, direction, AUTH_TAG_SIZE) : -1;
+        check(m == (int)sizeof(plain) && memcmp(plain, decoded, sizeof(plain)) == 0,
+              "identity bookkeeping preserves authenticated exact bytes");
+    }
+    check(suite.installed_key_identity() == active, "seal/open preserves identity");
+    suite.wipe();
+    suite.copy_session_key_for_test(other);
+    uint8_t zero[SESSION_KEY_SIZE] = {};
+    check(suite.installed_key_identity() == 0 && memcmp(other, zero, sizeof(zero)) == 0,
+          "actual wipe clears identity and key");
+    suite.activate();
+    check(suite.installed_key_identity() == 0, "post-wipe activation cannot restore identity");
+    printf("[TEST-INSTALLED-KEY] checks=%d failed=%d\n", checks, failed);
+    fflush(stdout);
+    return failed;
+}
+
 int run_aead_nonce_tests()
 {
     printf("[TEST-AEAD-NONCE] === AEAD bsi-bound nonce regression suite ===\n");
     fflush(stdout);
     int failed = 0;
+    failed += run_installed_key_identity_tests();
     failed += test_unwrap_monotone_wrap();
     failed += test_nonce_uniqueness();
     failed += test_direction_disjoint();

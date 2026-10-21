@@ -282,6 +282,11 @@ public:
     static uint8_t kx_crc8(const uint8_t* data, int n);
 
     // --- State Queries ---
+    // Equality token scoped to this suite's current installed key. Zero means
+    // no installed key. Same current material and activation preserve it.
+    // This is neither exchange provenance nor historical replay protection;
+    // tokens must not be compared across suite instances or wipe boundaries.
+    uint64_t installed_key_identity() const { return session_key_identity; }
     bool is_active() const { return encryption_active; }
     bool is_pq_upgraded() const { return pq_active; }
     int  get_kx_phase() const { return kx_phase; }
@@ -334,6 +339,9 @@ public:
     void wipe();
 
 private:
+    void install_session_key(const uint8_t key[SESSION_KEY_SIZE]);
+    friend int run_installed_key_identity_tests();
+
     // X25519 state
     uint8_t x25519_sk[X25519_KEY_SIZE];
     uint8_t x25519_pk[X25519_KEY_SIZE];
@@ -348,6 +356,7 @@ private:
 
     // Session key
     uint8_t session_key[SESSION_KEY_SIZE];
+    uint64_t session_key_identity;
     bool encryption_active;
     bool pq_active;
     int  kx_phase;

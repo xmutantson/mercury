@@ -90,6 +90,7 @@ cl_cipher_suite::cl_cipher_suite()
     mlkem_ready = false;
 
     memset(session_key, 0, sizeof(session_key));
+    session_key_identity = 0;
     encryption_active = false;
     pq_active = false;
     kx_phase = KX_IDLE;
@@ -122,9 +123,24 @@ void cl_cipher_suite::wipe()
     mlkem_ready = false;
 
     crypto_wipe(session_key, sizeof(session_key));
+    session_key_identity = 0;
     encryption_active = false;
     pq_active = false;
     kx_phase = KX_IDLE;
+}
+
+// Both derivation producers install through this complete-key comparison.
+// The token contains no key-derived bits and only identifies the current key
+// within this suite. Nonzero wrap deliberately gives no historical authority.
+void cl_cipher_suite::install_session_key(const uint8_t key[SESSION_KEY_SIZE])
+{
+    static_assert(SESSION_KEY_SIZE == 32, "complete-key comparison width");
+    if (session_key_identity == 0 || crypto_verify32(session_key, key) != 0)
+    {
+        ++session_key_identity;
+        if (session_key_identity == 0) ++session_key_identity;
+    }
+    memcpy(session_key, key, SESSION_KEY_SIZE);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +379,10 @@ void cl_cipher_suite::derive_session_key(const char* commander_call,
 
     // Expand: session_key = HKDF-Expand(PRK, "data-encryption", 32)
     const char* info = "data-encryption";
-    hkdf_expand(prk, (const uint8_t*)info, strlen(info), session_key);
+    uint8_t derived_key[SESSION_KEY_SIZE];
+    hkdf_expand(prk, (const uint8_t*)info, strlen(info), derived_key);
+    install_session_key(derived_key);
+    crypto_wipe(derived_key, sizeof(derived_key));
 
     // Wipe intermediates
     crypto_wipe(ikm, sizeof(ikm));
@@ -475,7 +494,10 @@ void cl_cipher_suite::derive_session_key_legacy_order_for_test(
     uint8_t prk[32];
     hkdf_extract(salt, salt_len, ikm, ikm_len, prk);
     const char* info = "data-encryption";
-    hkdf_expand(prk, (const uint8_t*)info, strlen(info), session_key);
+    uint8_t derived_key[SESSION_KEY_SIZE];
+    hkdf_expand(prk, (const uint8_t*)info, strlen(info), derived_key);
+    install_session_key(derived_key);
+    crypto_wipe(derived_key, sizeof(derived_key));
 
     crypto_wipe(ikm, sizeof(ikm));
     crypto_wipe(prk, sizeof(prk));

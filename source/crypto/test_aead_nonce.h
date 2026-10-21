@@ -9,4 +9,7 @@
 // (0 = all pass). Self-contained: no IONOS / RF / telecom_system.
 int run_aead_nonce_tests();
 
+// Current complete-key equality, actual derivation/activation/wipe and byte controls.
+int run_installed_key_identity_tests();
+
 #endif
