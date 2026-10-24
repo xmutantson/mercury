@@ -36,9 +36,10 @@
 //     to the app FIFO (fifo_buffer_rx, the byte oracle) byte-identical; a
 //     TAMPERED batch is REJECTED: the production decrypt returns <= 0 -> the
 //     funnel prints [CRYPTO] Decrypt FAILED, tears the link (link_status=DROPPED),
-//     bumps consecutive_auth_failures, delivers ZERO bytes to the app, and NEVER
-//     falls back to plaintext (the auth-fail path goto's PAST every delivery
-//     branch — there is no plaintext-fallback edge). Positions cover the forward
+//     clears reset-owned state, delivers ZERO bytes to the app, and NEVER
+//     falls back to plaintext. The failed call must preserve entry readiness
+//     and must not publish successful delivery after teardown. Positions cover
+//     the forward
 //     (CMD->RSP, the core gap) direction and the reverse (RSP->CMD) direction:
 //     mid-payload flip, AEAD tag flip, an 8-byte run, and a header/nonce flip.
 //
@@ -61,6 +62,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 
 // Bring two cipher suites to the SAME active session key via a REAL 2-party
 // X25519 exchange + derive from the shared secret + a fixed PSK + fixed callsigns
@@ -236,9 +238,16 @@ int cl_arq_controller::test_kx_data_tamper()
 	//                 4 header/nonce (wrong bsi, ct intact) · 5 first byte
 	auto run_arm = [&](int role_for_rx, int kind,
 	                   int* out_occ, bool* out_dropped, int* out_authfail,
-	                   bool* out_match)->void
+	                   bool* out_match, bool continuation = false,
+	                   int entry_ready = 0, uint64_t prior = 0)->void
 	{
-		// --- fresh fixture (a fail arm's reset_session_state wipes cipher+compressor) ---
+		// Independent arms begin at a genuine session boundary. Continuation arms
+		// retain every reset-owned delivery field and the surviving prior watermark.
+		if(!continuation){
+			reset_session_state();
+			rsp_prev_session_app_delivered = prior; // initial prior-session fixture only
+		}
+		// --- normal session configuration and fresh real key exchange ---
 		this->original_role          = role_for_rx;
 		this->role                   = role_for_rx;
 		this->narrowband_enabled     = NO;    // WB (config 0); a prior arm's auth-fail
@@ -306,14 +315,13 @@ int cl_arq_controller::test_kx_data_tamper()
 			}
 		}
 
-		// --- reset RX delivery + nonce state so the funnel-top guards are inert ---
-		rx_stream_emitted_bsi_hw     = -1;
-		rx_stream_delivered          = 0;
-		rsp_cross_session_seam_armed = false;
-		for(int s=0;s<256;s++) rx_stream_stamp[s].valid = false;
-		rx_nonce_epoch    = 0;
-		rx_nonce_last_bsi = -1;
-		rx_nonce_gen      = 0;
+		if(kind != 0){
+			// A non-target stamp must be invalidated by the failure's reset.
+			rx_stream_stamp[42].valid = true;
+			rx_stream_stamp[42].start = 123;
+			rx_stream_crc = 0x12345678u;
+		}
+		block_ready = entry_ready;
 		// header/nonce flip: the RX reconstructs the nonce from a DIFFERENT wire bsi
 		decrypt_delivered_bsi     = wrong_bsi ? 1 : 0;
 		consecutive_auth_failures = 0;
@@ -331,6 +339,27 @@ int cl_arq_controller::test_kx_data_tamper()
 
 		// --- drive the REAL production delivery funnel (decrypt lives here) ---
 		copy_data_to_buffer();
+
+		if(kind != 0){
+			check(link_status == DROPPED && !cipher_suite.is_active(),
+				"RESET: authentication rejection tears down the active session");
+			check(rx_stream_delivered == 0 && rx_stream_crc == CRC32_INIT
+				&& rx_stream_emitted_bsi_hw == -1,
+				"RESET: rejected ciphertext leaves cursor, CRC and high-water reset");
+			bool stamps_clear = true;
+			for(int i=0;i<256;i++) stamps_clear &= !rx_stream_stamp[i].valid;
+			check(stamps_clear, "RESET: all RX stamps invalid, including seeded non-target");
+			check(block_ready == entry_ready,
+				"RESET: failure preserves entry block_ready");
+			check(consecutive_auth_failures == 0,
+				"RESET: genuine teardown clears the authentication counter");
+			check(rsp_prev_session_app_delivered == prior,
+				"RESET: rejection preserves legitimate prior-session watermark");
+		}else{
+			check(rx_stream_delivered == (uint64_t)wlen && block_ready == 1,
+				continuation ? "REJOIN: clean delivery commits only its transported bytes"
+				             : "CONTROL: clean delivery commits its transported bytes");
+		}
 
 		int occ = fifo_buffer_rx.get_size() - fifo_buffer_rx.get_free_size();
 		if(out_occ)      *out_occ      = occ;
@@ -353,6 +382,10 @@ int cl_arq_controller::test_kx_data_tamper()
 	check(occ == APP && !dropped && af == 0 && match,
 		"PROD CONTROL (RSP->CMD): clean batch DELIVERS full payload byte-identical, link up, 0 authfail");
 
+	run_arm(RESPONDER, 0, &occ, &dropped, &af, &match);
+	check(occ == APP && !dropped && af == 0 && match,
+		"PROD CONTROL (CMD->RSP): clean batch DELIVERS full payload byte-identical, link up, 0 authfail");
+
 	// ---- reverse-ct (RSP->CMD) reject positions ----
 	run_arm(COMMANDER, 1, &occ, &dropped, &af, nullptr);
 	check(occ == 0 && dropped,
@@ -374,6 +407,34 @@ int cl_arq_controller::test_kx_data_tamper()
 	run_arm(RESPONDER, 2, &occ, &dropped, &af, nullptr);
 	check(occ == 0 && dropped,
 		"PROD forward AEAD TAG flip (CMD->RSP): 0 bytes to app, link DROPPED, authfail fired");
+
+	// Both directions, both entry readiness values and fresh/positive surviving
+	// watermarks. Each tamper is followed by another genuine teardown and a
+	// separate fresh-key offset-zero delivery with no delivery-state repair.
+	for(int rx_role : {COMMANDER, RESPONDER}){
+		for(int ready=0; ready<=1; ready++){
+			for(uint64_t prior : {uint64_t(0), uint64_t(7)}){
+				for(int kind : {1, 2, 4}){
+					printf("[TEST-KX-DATA-TAMPER] RESET CASE role=%d ready=%d prior=%llu kind=%d\n",
+						rx_role, ready, (unsigned long long)prior, kind);
+					run_arm(rx_role, kind, &occ, &dropped, &af, nullptr, false, ready, prior);
+					check(occ == 0 && dropped,
+						"RESET CASE: rejected batch emits zero application bytes");
+					reset_session_state();
+					check(rsp_prev_session_app_delivered == prior,
+						"REPEAT RESET: rejected ciphertext never becomes prior-session progress");
+					check(rx_stream_delivered == 0 && rx_stream_crc == CRC32_INIT
+						&& rx_stream_emitted_bsi_hw == -1,
+						"REPEAT RESET: delivery state remains at the session origin");
+					run_arm(rx_role, 0, &occ, &dropped, &af, &match, true);
+					check(occ == APP && !dropped && af == 0 && match,
+						"REJOIN: fresh-key clean offset-zero bytes delivered exactly once");
+					check(rsp_prev_session_app_delivered == prior,
+						"REJOIN: normal configuration and delivery preserve prior watermark");
+				}
+			}
+		}
+	}
 
 	// Detach the stack telecom_system before it (and this frame) unwind, so the
 	// controller's destructor in the caller never dereferences a dangling pointer.
