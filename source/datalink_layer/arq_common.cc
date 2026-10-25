@@ -23222,7 +23222,7 @@ void cl_arq_controller::copy_data_to_buffer()
 					fflush(stdout);
 					this->link_status = DROPPED;
 					reset_session_state();
-					goto copy_data_done;
+					return;
 				}
 			}
 
@@ -23448,7 +23448,6 @@ void cl_arq_controller::copy_data_to_buffer()
 				messages_rx[i].status=FREE;
 		}
 	}
-copy_data_done:
 #ifdef MERCURY_GUI_ENABLED
 	if(total_bytes > 0)
 		gui_add_throughput_bytes_rx(total_bytes);
